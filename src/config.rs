@@ -268,6 +268,9 @@ impl Config {
     /// 加载配置,合并所有层级
     ///
     /// `project_dir` 是项目根目录,会在该目录下查找 `evo-agent.toml`。
+    ///
+    /// 此方法为严格模式:LLM API key 必须存在,否则报错。
+    /// 适用于 `run` 命令(实际需要调用 LLM)。
     pub fn load(project_dir: &Path) -> Result<Self, ConfigError> {
         let mut config = Config::default();
 
@@ -292,6 +295,39 @@ impl Config {
 
         // 验证
         config.validate()?;
+
+        Ok(config)
+    }
+
+    /// 加载配置(宽松模式,用于 list/tools/config 等只读命令)
+    ///
+    /// 与 [`load`](Self::load) 的区别:
+    /// - `${ENV:VAR}` 占位符未设置时替换为空字符串(不报错)
+    /// - 跳过 LLM API key 非空验证
+    ///
+    /// 这样 `list`/`tools list`/`config` 等只读命令不依赖 LLM API key,
+    /// 用户可以在未配置 LLM 的情况下浏览 agents 和工具。
+    pub fn load_lenient(project_dir: &Path) -> Result<Self, ConfigError> {
+        let mut config = Config::default();
+
+        if let Some(user_path) = user_config_path() {
+            if user_path.exists() {
+                config.merge_from_file(&user_path)?;
+            }
+        }
+
+        let project_path = project_dir.join("evo-agent.toml");
+        if project_path.exists() {
+            config.merge_from_file(&project_path)?;
+        }
+
+        config.apply_env_overrides();
+
+        // 宽松解析:占位符未设置时替换为空字符串
+        config.resolve_env_placeholders_lenient();
+
+        // 宽松验证:跳过 LLM API key 非空检查
+        config.validate_lenient()?;
 
         Ok(config)
     }
@@ -393,6 +429,18 @@ impl Config {
         Ok(())
     }
 
+    /// 宽松解析 `${ENV:VAR_NAME}` 占位符
+    ///
+    /// 与 [`resolve_env_placeholders`](Self::resolve_env_placeholders) 的区别:
+    /// 环境变量未设置时替换为空字符串,不报错。
+    fn resolve_env_placeholders_lenient(&mut self) {
+        self.llm.api_key = resolve_env_placeholder_lenient(&self.llm.api_key);
+        if !self.evorule.api_key.is_empty() {
+            self.evorule.api_key =
+                resolve_env_placeholder_lenient(&self.evorule.api_key);
+        }
+    }
+
     /// 验证配置值的合法性
     fn validate(&self) -> Result<(), ConfigError> {
         // LLM provider 必须是已知值
@@ -460,6 +508,72 @@ impl Config {
 
         Ok(())
     }
+
+    /// 宽松验证(用于 list/tools/config 等只读命令)
+    ///
+    /// 与 [`validate`](Self::validate) 的区别:
+    /// - 跳过 LLM API key 非空验证
+    /// - 仍然验证 provider/base_url/logging 等非 LLM 字段
+    fn validate_lenient(&self) -> Result<(), ConfigError> {
+        // LLM provider 必须是已知值
+        match self.llm.provider.as_str() {
+            "minimax" | "deepseek" | "openai" => {}
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "llm.provider".to_string(),
+                    reason: format!(
+                        "unknown provider '{}', expected one of: minimax, deepseek, openai",
+                        other
+                    ),
+                });
+            }
+        }
+
+        // 注意:宽松模式跳过 LLM API key 非空检查
+
+        // evorule base_url 必须是 http:// 或 https:// 开头
+        if !self.evorule.base_url.starts_with("http://")
+            && !self.evorule.base_url.starts_with("https://")
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "evorule.base_url".to_string(),
+                reason: format!(
+                    "must start with http:// or https://, got '{}'",
+                    self.evorule.base_url
+                ),
+            });
+        }
+
+        // logging.level 必须是已知值
+        match self.logging.level.as_str() {
+            "trace" | "debug" | "info" | "warn" | "error" => {}
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "logging.level".to_string(),
+                    reason: format!(
+                        "unknown level '{}', expected one of: trace, debug, info, warn, error",
+                        other
+                    ),
+                });
+            }
+        }
+
+        // logging.format 必须是已知值
+        match self.logging.format.as_str() {
+            "json" | "pretty" => {}
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "logging.format".to_string(),
+                    reason: format!(
+                        "unknown format '{}', expected one of: json, pretty",
+                        other
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// 解析 `${ENV:VAR_NAME}` 占位符
@@ -471,6 +585,18 @@ fn resolve_env_placeholder(s: &str) -> Result<String, ConfigError> {
         std::env::var(var_name).map_err(|_| ConfigError::EnvVarNotFound(var_name.to_string()))
     } else {
         Ok(s.to_string())
+    }
+}
+
+/// 宽松解析 `${ENV:VAR_NAME}` 占位符
+///
+/// 与 [`resolve_env_placeholder`] 的区别:
+/// 环境变量未设置时返回空字符串,不报错。
+fn resolve_env_placeholder_lenient(s: &str) -> String {
+    if let Some(var_name) = s.strip_prefix("${ENV:").and_then(|s| s.strip_suffix('}')) {
+        std::env::var(var_name).unwrap_or_default()
+    } else {
+        s.to_string()
     }
 }
 

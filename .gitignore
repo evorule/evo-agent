@@ -12,3 +12,6 @@ Cargo.lock
 .env
 .env.*
 !.env.example
+
+# 运行时数据（evorule-server 数据库等）
+data/

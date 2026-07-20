@@ -339,11 +339,14 @@ impl AgentRunner {
             info!(%session_id, cluster_id, "Joined cluster");
         }
 
+        // 注意:必须先订阅 SSE 事件,再提交命令。
+        // tokio broadcast 通道只接收订阅之后发出的消息,不重放历史。
+        // 如果先 submit_command 再 subscribe,会错过 io_request 事件,导致 ReAct 循环无法启动。
+        let mut event_stream = self.evorule_client.subscribe_events(&session_id).await?;
+
         let command = self.build_call_external_command(&system_prompt, goal);
         self.evorule_client.submit_command(&session_id, &command).await?;
         info!(%session_id, "Submitted call_external command");
-
-        let mut event_stream = self.evorule_client.subscribe_events(&session_id).await?;
         let mut step_count = 0;
         let mut tool_calls: Vec<String> = Vec::new();
         let mut messages: Vec<Message> = Vec::new();
@@ -353,9 +356,11 @@ impl AgentRunner {
         }
         messages.push(Message::User { content: goal.to_string() });
 
+        info!(%session_id, "Starting SSE event loop");
         while let Some(event) = event_stream.next().await {
+            info!(%session_id, event_type = %event.event_type, "Received event");
             match event.event_type.as_str() {
-                "io_request" => {
+                "IoRequest" => {
                     step_count += 1;
                     if step_count > self.config.max_steps {
                         let duration = start_time.elapsed().as_millis() as u64;
@@ -366,7 +371,7 @@ impl AgentRunner {
                         ));
                     }
 
-                    info!(%session_id, step = step_count, "Received io_request event");
+                    info!(%session_id, step = step_count, "Received IoRequest event");
                     let result = self.handle_io_request(&event.payload, &mut messages, &mut tool_calls).await?;
 
                     if let Some(request_id) = event.payload.get("id").and_then(|v| v.as_u64()) {
@@ -376,37 +381,38 @@ impl AgentRunner {
                         info!(%session_id, request_id, "Submitted io_response");
                     }
                 }
-                "stable" => {
+                "Stable" => {
                     let duration = start_time.elapsed().as_millis() as u64;
                     let state = self.evorule_client.get_state(&session_id).await?;
-                    let content = state["payload"]
+                    // payload 结构取决于 evorule 规则如何存储 io_response 结果。
+                    // 默认规则将 call_external 的 io_response result 存储在
+                    // payload.llm_response.content,因此优先读该路径;
+                    // 若规则将结果直接放在 payload.content / payload.result,
+                    // 或 payload 本身是字符串,则依次 fallback。
+                    let content = state["payload"]["llm_response"]["content"]
                         .as_str()
+                        .or_else(|| state["payload"]["content"].as_str())
+                        .or_else(|| state["payload"]["result"].as_str())
+                        .or_else(|| state["payload"].as_str())
                         .unwrap_or_default()
                         .to_string();
 
-                    info!(%session_id, "Received stable event, execution complete");
+                    info!(%session_id, content_len = content.len(), "Received Stable event, execution complete");
                     return Ok(AgentResult::success(content, step_count, duration, tool_calls));
                 }
-                "phase_change" => {
-                    let phase = event.payload.get("phase").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    info!(%session_id, %phase, "Phase changed");
-                }
-                "state_transition" => {
+                "StateTransition" => {
                     info!(%session_id, "State transition occurred");
                 }
-                "error" => {
+                "Error" => {
                     let error_msg = event.payload.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
                     let duration = start_time.elapsed().as_millis() as u64;
-                    
+
                     if let Ok(rewind_result) = self.auto_rewind(&session_id).await {
                         info!(%session_id, "Auto-rewind successful, retrying from version {}", rewind_result);
                         continue;
                     }
-                    
+
                     return Ok(AgentResult::error(error_msg.to_string(), step_count, duration));
-                }
-                "invariant_violation" => {
-                    info!(%session_id, "Invariant violation detected");
                 }
                 _ => {
                     info!(%session_id, event_type = %event.event_type, "Unknown event type");
@@ -415,6 +421,7 @@ impl AgentRunner {
         }
 
         let duration = start_time.elapsed().as_millis() as u64;
+        info!(%session_id, step_count, duration_ms = duration, "SSE event loop ended (stream closed)");
         Ok(AgentResult::error("Event stream closed".to_string(), step_count, duration))
     }
 
@@ -714,6 +721,15 @@ impl AgentRunner {
 
             yield Ok(format!("Session created: {}", session_id));
 
+            // 先订阅 SSE 事件,再提交命令(避免错过 io_request)
+            let mut event_stream = match evorule_client.subscribe_events(&session_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    yield Err(AgentError::EvoruleError(e.to_string()));
+                    return;
+                }
+            };
+
             let command = serde_json::json!({
                 "type": "call_external",
                 "params": {
@@ -732,21 +748,13 @@ impl AgentRunner {
 
             yield Ok("Command submitted, waiting for events...".to_string());
 
-            let mut event_stream = match evorule_client.subscribe_events(&session_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    yield Err(AgentError::EvoruleError(e.to_string()));
-                    return;
-                }
-            };
-
             let mut step_count = 0;
 
             while let Some(event) = event_stream.next().await {
                 match event.event_type.as_str() {
-                    "io_request" => {
+                    "IoRequest" => {
                         step_count += 1;
-                        yield Ok(format!("Step {}: Received io_request", step_count));
+                        yield Ok(format!("Step {}: Received IoRequest", step_count));
 
                         let io_type = event.payload.get("io_type").and_then(|v| v.as_str()).unwrap_or("unknown");
                         yield Ok(format!("Executing {}...", io_type));
@@ -760,12 +768,12 @@ impl AgentRunner {
                             yield Ok(format!("Submitted io_response for request {}", request_id));
                         }
                     }
-                    "stable" => {
+                    "Stable" => {
                         let duration = start_time.elapsed().as_millis() as u64;
                         yield Ok(format!("Done in {}ms after {} steps", duration, step_count));
                         return;
                     }
-                    "error" => {
+                    "Error" => {
                         let msg = event.payload.get("message").and_then(|v| v.as_str()).unwrap_or("unknown");
                         yield Err(AgentError::EvoruleError(msg.to_string()));
                         return;

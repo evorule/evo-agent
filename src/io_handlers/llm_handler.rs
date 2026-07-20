@@ -39,7 +39,7 @@ impl LlmHandler {
         if let Ok(api_key) = std::env::var("MINIMAX_API_KEY") {
             Self {
                 default_model: std::env::var("MINIMAX_MODEL").unwrap_or_else(|_| "MiniMax-M2.5".to_string()),
-                api_base: std::env::var("MINIMAX_API_BASE").unwrap_or_else(|_| "https://api.minimax.io/v1/text/chatcompletion_v2".to_string()),
+                api_base: std::env::var("MINIMAX_API_BASE").unwrap_or_else(|_| "https://api.minimaxi.com/v1/text/chatcompletion_v2".to_string()),
                 api_key: Some(api_key),
                 mock_content: None,
             }
@@ -60,7 +60,7 @@ impl LlmHandler {
         } else {
             Self {
                 default_model: "MiniMax-M2.5".to_string(),
-                api_base: "https://api.minimax.io/v1/text/chatcompletion_v2".to_string(),
+                api_base: "https://api.minimaxi.com/v1/text/chatcompletion_v2".to_string(),
                 api_key: None,
                 mock_content: None,
             }
@@ -200,24 +200,44 @@ impl IoHandler for LlmHandler {
                         .await
                         .map_err(|e| format!("LLM API response parse error: {}", e))?;
 
-                    let _content = json
+                    // 将 OpenAI 兼容的响应格式转换为 LlmResponse 结构:
+                    //   choices[0].message.content   → content
+                    //   choices[0].message.tool_calls → tool_calls
+                    //   choices[0].finish_reason     → finish_reason
+                    //   usage                        → token_usage
+                    let choice = json
                         .get("choices")
                         .and_then(|c| c.as_array())
-                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get(0));
+
+                    let content = choice
                         .and_then(|c| c.get("message"))
                         .and_then(|m| m.get("content"))
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
 
-                    let _finish_reason = json
-                        .get("choices")
-                        .and_then(|c| c.as_array())
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("finish_reason"))
-                        .and_then(|r| r.as_str());
+                    let tool_calls = choice
+                        .and_then(|c| c.get("message"))
+                        .and_then(|m| m.get("tool_calls"))
+                        .cloned();
 
-                    let response_val = serde_to_tcb(&json);
+                    let finish_reason = choice
+                        .and_then(|c| c.get("finish_reason"))
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string());
+
+                    let token_usage = json.get("usage").cloned();
+
+                    let response_json = serde_json::json!({
+                        "content": content,
+                        "tool_calls": tool_calls,
+                        "finish_reason": finish_reason,
+                        "token_usage": token_usage,
+                    });
+
+                    debug!(content_len = content.len(), finish_reason = ?finish_reason, "LLM API response parsed");
+                    let response_val = serde_to_tcb(&response_json);
                     Ok(response_val)
                 } else {
                     let error_text = resp.text().await.unwrap_or_default();
@@ -251,7 +271,7 @@ mod tests {
         assert_eq!(handler.default_model, "MiniMax-M2.5");
         assert_eq!(
             handler.api_base,
-            "https://api.minimax.io/v1/text/chatcompletion_v2"
+            "https://api.minimaxi.com/v1/text/chatcompletion_v2"
         );
         assert!(!handler.is_mock());
     }

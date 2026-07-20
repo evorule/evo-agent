@@ -277,7 +277,7 @@ fn cmd_run(
 fn cmd_list(workdir: &Path, dir: Option<&Path>) -> ExitCode {
     let agents_dir = match dir {
         Some(d) => d.to_path_buf(),
-        None => match evo_agent::config::Config::load(workdir) {
+        None => match evo_agent::config::Config::load_lenient(workdir) {
             Ok(c) => c.agents.dir,
             Err(e) => {
                 eprintln!("config error: {}", e);
@@ -405,7 +405,7 @@ fn print_spec(spec: ToolSpec, layer: &str) {
 // =============================================================================
 
 fn cmd_validate(workdir: &Path, agent: &str) -> ExitCode {
-    let agents_dir = match evo_agent::config::Config::load(workdir) {
+    let agents_dir = match evo_agent::config::Config::load_lenient(workdir) {
         Ok(c) => c.agents.dir,
         Err(e) => {
             eprintln!("config error: {}", e);
@@ -435,7 +435,7 @@ fn cmd_validate(workdir: &Path, agent: &str) -> ExitCode {
 // =============================================================================
 
 fn cmd_config(workdir: &Path) -> ExitCode {
-    match evo_agent::config::Config::load(workdir) {
+    match evo_agent::config::Config::load_lenient(workdir) {
         Ok(c) => match serde_json::to_string_pretty(&c) {
             Ok(s) => {
                 println!("{}", s);

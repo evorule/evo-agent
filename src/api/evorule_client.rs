@@ -499,7 +499,11 @@ pub struct EvoruleEvent {
     #[serde(rename = "type")]
     /// TODO: doc
     pub event_type: String,
-    /// TODO: doc
+    /// 事件的其余字段(id/cause/io_type/params/message 等),通过 flatten 捕获为 JSON 对象。
+    /// 服务器(evorule-server)发送的 SSE 事件格式为扁平结构:
+    /// `{"type":"IoRequest","id":2,"cause":1,"io_type":"call_external","params":{...}}`
+    /// 而非嵌套的 `{"type":"io_request","payload":{...}}`,因此使用 flatten 适配。
+    #[serde(flatten)]
     pub payload: Value,
 }
 
@@ -509,9 +513,21 @@ impl EvoruleEventStream {
         let mut data = String::new();
 
         loop {
-            while let Some(line_end) = self.buffer.windows(2).position(|w| w == b"\r\n") {
-                let line = String::from_utf8_lossy(&self.buffer[..line_end]).to_string();
-                self.buffer.drain(..line_end + 2);
+            // 处理缓冲区中所有完整的行,兼容 \r\n (CRLF) 和 \n (LF) 两种行结尾。
+            // axum 的 SSE 实现使用 \n,而某些 HTTP 客户端/代理可能使用 \r\n。
+            loop {
+                let (line_end, line_len) = if let Some(pos) = self.buffer.windows(2).position(|w| w == b"\r\n") {
+                    (pos, 2)
+                } else if let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
+                    (pos, 1)
+                } else {
+                    break; // 没有完整的行,退出内层循环等待更多数据
+                };
+
+                let line = String::from_utf8_lossy(&self.buffer[..line_end])
+                    .trim_end_matches('\r')
+                    .to_string();
+                self.buffer.drain(..line_end + line_len);
 
                 if line.starts_with("data: ") {
                     let json_part = line.strip_prefix("data: ").unwrap_or(&line);
@@ -575,21 +591,27 @@ mod tests {
 
     #[test]
     fn test_evorule_event_deserialize() {
-        let json = r#"{"type":"io_request","payload":{"io_type":"call_external","id":1,"params":{"model":"test"}}}"#;
+        // 服务器(evorule-server)发送的 IoRequest 事件格式(扁平结构,PascalCase):
+        // {"type":"IoRequest","id":2,"cause":1,"io_type":"call_external","params":{...}}
+        let json = r#"{"type":"IoRequest","id":2,"cause":1,"io_type":"call_external","params":{"model":"test"}}"#;
         let event: EvoruleEvent = serde_json::from_str(json).unwrap();
 
-        assert_eq!(event.event_type, "io_request");
+        assert_eq!(event.event_type, "IoRequest");
         assert_eq!(event.payload["io_type"], "call_external");
-        assert_eq!(event.payload["id"], 1);
+        assert_eq!(event.payload["id"], 2);
+        assert_eq!(event.payload["params"]["model"], "test");
     }
 
     #[test]
     fn test_evorule_event_deserialize_stable() {
-        let json = r#"{"type":"stable","payload":"task completed"}"#;
+        // 服务器发送的 Stable 事件格式:
+        // {"type":"Stable","id":3,"final_snapshot":{...}}
+        let json = r#"{"type":"Stable","id":3,"final_snapshot":{"payload":"task completed"}}"#;
         let event: EvoruleEvent = serde_json::from_str(json).unwrap();
 
-        assert_eq!(event.event_type, "stable");
-        assert_eq!(event.payload, "task completed");
+        assert_eq!(event.event_type, "Stable");
+        assert_eq!(event.payload["id"], 3);
+        assert_eq!(event.payload["final_snapshot"]["payload"], "task completed");
     }
 
     #[tokio::test]
