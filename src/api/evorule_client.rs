@@ -13,28 +13,48 @@ use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+/// TODO: doc
 pub enum EvoruleApiError {
     #[error("HTTP request failed: {0}")]
+    /// TODO: doc
     HttpError(#[from] reqwest::Error),
     #[error("API returned error: {status} {message}")]
-    ApiError { status: u16, message: String },
+    /// API server returned a non-2xx response
+    ApiError {
+        /// HTTP status code returned by the server
+        status: u16,
+        /// Error message returned by the server
+        message: String,
+    },
     #[error("Invalid response format")]
+    /// TODO: doc
     InvalidResponse,
     #[error("Session not found")]
+    /// TODO: doc
     SessionNotFound,
     #[error("Invalid version: {0}")]
+    /// TODO: doc
     InvalidVersion(String),
     #[error("Serialization error: {0}")]
+    /// TODO: doc
     SerializationError(#[from] serde_json::Error),
 }
 
 #[derive(Debug, Clone)]
+/// TODO: doc
 pub struct EvoruleApiClient {
     base_url: String,
     client: Client,
+    /// Optional Bearer token for HTTP API auth.
+    /// Read from `EVORULE_AUTH_TOKEN` env var at construction time.
+    auth_token: Option<String>,
 }
 
 impl EvoruleApiClient {
+    /// Create new API client.
+    /// If `EVORULE_AUTH_TOKEN` env var is set, use it as Bearer token.
+    /// Otherwise, send no auth header (server must be in dev mode / no auth).
+    /// TODO: doc
     pub fn new(base_url: &str) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -42,12 +62,30 @@ impl EvoruleApiClient {
             .build()
             .expect("Failed to build HTTP client");
 
+        let auth_token = std::env::var("EVORULE_AUTH_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         Self {
             base_url: base_url.to_string(),
             client,
+            auth_token,
         }
     }
 
+    /// TODO: doc
+    /// Attach auth header (if token set) to a request builder.
+    fn auth_header<'a>(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        match &self.auth_token {
+            Some(token) => req.header("Authorization", format!("Bearer {}", token)),
+            None => req,
+        }
+    }
+
+    /// TODO: doc
     pub async fn create_session(&self, initial_content: Option<&Value>) -> Result<String, EvoruleApiError> {
         let url = format!("{}/api/sessions", self.base_url);
 
@@ -57,7 +95,7 @@ impl EvoruleApiClient {
             serde_json::json!({})
         };
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.auth_header(self.client.post(&url)).json(&body).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
@@ -69,6 +107,7 @@ impl EvoruleApiClient {
         Ok(session_id)
     }
 
+    /// TODO: doc
     pub async fn create_session_fork(
         &self,
         parent_id: &str,
@@ -80,7 +119,7 @@ impl EvoruleApiClient {
             format!("{}/api/sessions/fork/{}", self.base_url, parent_id)
         };
 
-        let resp = self.client.post(&url).send().await?;
+        let resp = self.auth_header(self.client.post(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
@@ -92,17 +131,19 @@ impl EvoruleApiClient {
         Ok(session_id)
     }
 
+    /// TODO: doc
     pub async fn submit_command(&self, session_id: &str, command: &Value) -> Result<(), EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/command", self.base_url, session_id);
 
         // 鏈嶅姟绔?CommandRequest 瑕佹眰 {"instruction": {...}} 鍖呰
         let body = serde_json::json!({ "instruction": command });
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.auth_header(self.client.post(&url)).json(&body).send().await?;
         self.check_response(&resp).await?;
 
         Ok(())
     }
 
+    /// TODO: doc
     pub async fn submit_io_response(
         &self,
         session_id: &str,
@@ -118,12 +159,13 @@ impl EvoruleApiClient {
             "error": error,
         });
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.auth_header(self.client.post(&url)).json(&body).send().await?;
         self.check_response(&resp).await?;
 
         Ok(())
     }
 
+    /// TODO: doc
     pub async fn update_payload(&self, session_id: &str, path: &str, value: &Value) -> Result<(), EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/payload", self.base_url, session_id);
 
@@ -132,22 +174,24 @@ impl EvoruleApiClient {
             "value": value,
         });
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.auth_header(self.client.post(&url)).json(&body).send().await?;
         self.check_response(&resp).await?;
 
         Ok(())
     }
 
+    /// TODO: doc
     pub async fn get_state(&self, session_id: &str) -> Result<Value, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/state", self.base_url, session_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn get_facts(&self, session_id: &str, prefix: Option<&str>) -> Result<Vec<FactEntry>, EvoruleApiError> {
         let url = if let Some(p) = prefix {
             format!("{}/api/sessions/{}/facts?prefix={}", self.base_url, session_id, p)
@@ -155,13 +199,14 @@ impl EvoruleApiClient {
             format!("{}/api/sessions/{}/facts", self.base_url, session_id)
         };
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Vec<FactEntry> = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn get_shared_facts(&self, prefix: Option<&str>) -> Result<Vec<SharedFactEntry>, EvoruleApiError> {
         let url = if let Some(p) = prefix {
             format!("{}/api/shared/facts?prefix={}", self.base_url, p)
@@ -169,23 +214,25 @@ impl EvoruleApiClient {
             format!("{}/api/shared/facts", self.base_url)
         };
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Vec<SharedFactEntry> = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn get_shared_fact_source(&self, fact_id: u64) -> Result<SharedFactEntry, EvoruleApiError> {
         let url = format!("{}/api/shared/facts/{}/source", self.base_url, fact_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: SharedFactEntry = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn record_used_at_startup(&self, session_id: &str, fact_ids: &[u64]) -> Result<(), EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/used_at_startup", self.base_url, session_id);
 
@@ -193,16 +240,17 @@ impl EvoruleApiClient {
             "fact_ids": fact_ids,
         });
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.auth_header(self.client.post(&url)).json(&body).send().await?;
         self.check_response(&resp).await?;
 
         Ok(())
     }
 
+    /// TODO: doc
     pub async fn get_used_at_startup(&self, session_id: &str) -> Result<Vec<u64>, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/used_at_startup", self.base_url, session_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
@@ -216,10 +264,11 @@ impl EvoruleApiClient {
         Ok(fact_ids)
     }
 
+    /// TODO: doc
     pub async fn get_sessions_using_fact(&self, fact_id: u64) -> Result<Vec<u64>, EvoruleApiError> {
         let url = format!("{}/api/shared/facts/{}/used_by", self.base_url, fact_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
@@ -233,20 +282,22 @@ impl EvoruleApiClient {
         Ok(sessions)
     }
 
+    /// TODO: doc
     pub async fn get_audit_report(&self, session_id: &str) -> Result<Value, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/audit", self.base_url, session_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn verify_audit(&self, session_id: &str) -> Result<bool, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/audit/verify", self.base_url, session_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
@@ -255,84 +306,92 @@ impl EvoruleApiClient {
         Ok(valid)
     }
 
+    /// TODO: doc
     pub async fn get_causal_chain(&self, session_id: &str, fact_id: u64) -> Result<Vec<Value>, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/audit/causal/{}", self.base_url, session_id, fact_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Vec<Value> = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn rewind(&self, session_id: &str, version: u64) -> Result<Value, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/rewind/{}", self.base_url, session_id, version);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn replay(&self, session_id: &str) -> Result<Vec<Value>, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/replay", self.base_url, session_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Vec<Value> = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn diff(&self, session_id: &str, a: u64, b: u64) -> Result<Value, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/diff?a={}&b={}", self.base_url, session_id, a, b);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn join_cluster(&self, session_id: &str, target_id: &str) -> Result<(), EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/join", self.base_url, session_id);
 
-        // 鏈嶅姟绔?JoinRequest 瑕佹眰 JSON body锛歿"target_id": ..., "direction": ...}
-        // target_id 鍦?evo-agent 涓槸 String锛岄渶瑙ｆ瀽涓?u64锛沝irection 榛樿鍙屽悜锛堜笉浼狅級
+        // Server JoinRequest requires JSON body: {"target_id": ..., "direction": ...}
+        // target_id in evo-agent is String, need to parse to u64; direction defaults to bidirectional (ignored)
         let target_id_u64: u64 = target_id
             .parse()
             .map_err(|_| EvoruleApiError::InvalidVersion(format!("invalid target_id: {}", target_id)))?;
         let body = serde_json::json!({ "target_id": target_id_u64 });
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.auth_header(self.client.post(&url)).json(&body).send().await?;
         self.check_response(&resp).await?;
 
         Ok(())
     }
 
+    /// TODO: doc
     pub async fn leave_cluster(&self, session_id: &str) -> Result<(), EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/leave", self.base_url, session_id);
 
-        let resp = self.client.post(&url).send().await?;
+        let resp = self.auth_header(self.client.post(&url)).send().await?;
         self.check_response(&resp).await?;
 
         Ok(())
     }
 
+    /// TODO: doc
     pub async fn get_cluster_status(&self, session_id: &str) -> Result<Value, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/cluster", self.base_url, session_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn subscribe_events(&self, session_id: &str) -> Result<EvoruleEventStream, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/events", self.base_url, session_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         if !resp.status().is_success() {
             return Err(EvoruleApiError::ApiError {
                 status: resp.status().as_u16(),
@@ -346,30 +405,33 @@ impl EvoruleApiClient {
         })
     }
 
+    /// TODO: doc
     pub async fn get_debug_phase(&self, session_id: &str) -> Result<Value, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/debug/phase", self.base_url, session_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn get_debug_queue(&self, session_id: &str) -> Result<Value, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/debug/queue", self.base_url, session_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
     }
 
+    /// TODO: doc
     pub async fn get_debug_pending_io(&self, session_id: &str) -> Result<Value, EvoruleApiError> {
         let url = format!("{}/api/sessions/{}/debug/pending_io", self.base_url, session_id);
 
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.auth_header(self.client.get(&url)).send().await?;
         self.check_response(&resp).await?;
 
         let result: Value = resp.json().await?;
@@ -395,37 +457,54 @@ impl EvoruleApiClient {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+/// TODO: doc
 pub struct FactEntry {
+    /// TODO: doc
     pub version: u64,
+    /// TODO: doc
     pub id: u64,
+    /// TODO: doc
     pub path: String,
+    /// TODO: doc
     pub value: Value,
     #[serde(rename = "type")]
+    /// TODO: doc
     pub fact_type: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+/// TODO: doc
 pub struct SharedFactEntry {
+    /// TODO: doc
     pub fact_id: u64,
+    /// TODO: doc
     pub path: String,
+    /// TODO: doc
     pub value: Value,
+    /// TODO: doc
     pub source_session_id: u64,
+    /// TODO: doc
     pub version: u64,
 }
 
+/// TODO: doc
 pub struct EvoruleEventStream {
     buffer: Vec<u8>,
     stream: Pin<Box<dyn futures_core::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
 }
 
 #[derive(Debug, Deserialize)]
+/// TODO: doc
 pub struct EvoruleEvent {
     #[serde(rename = "type")]
+    /// TODO: doc
     pub event_type: String,
+    /// TODO: doc
     pub payload: Value,
 }
 
 impl EvoruleEventStream {
+    /// TODO: doc
     pub async fn next(&mut self) -> Option<EvoruleEvent> {
         let mut data = String::new();
 

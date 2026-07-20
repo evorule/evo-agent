@@ -5,12 +5,12 @@
 
 use tier0_tcb::JsonValue;
 
-/// I/O 鎿嶄綔缁撴灉绫诲瀷
+/// I/O operation result type
 pub type IoResult = Result<JsonValue, String>;
 
-/// I/O Handler trait 鈥斺€?瀹氫箟 I/O 鎵ц鎺ュ彛
+/// I/O Handler trait -- defines I/O execution interface
 #[async_trait::async_trait]
 pub trait IoHandler: Send + Sync {
-    /// 鎵ц I/O 鎿嶄綔
+    /// Execute I/O operation
     async fn execute(&self, params: &JsonValue) -> IoResult;
 }

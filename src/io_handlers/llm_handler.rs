@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! LLM I/O Handler 鈥斺€?璋冪敤澶栭儴 LLM API
+//! LLM I/O Handler -- invokes external LLM API
 
 use serde_json;
 use tier0_tcb::JsonValue;
@@ -10,60 +10,101 @@ use tracing::{debug, warn};
 use crate::io_handler::{IoHandler, IoResult};
 use crate::json_convert::serde_to_tcb;
 
-/// LLM I/O Handler 鈥斺€?璋冪敤澶栭儴 LLM API
+/// LLM I/O Handler -- invokes external LLM API
 #[derive(Debug, Clone)]
 pub struct LlmHandler {
     default_model: String,
     api_base: String,
     api_key: Option<String>,
+    /// If set, skip HTTP and return a canned LlmResponse-format JSON.
+    /// Used by tests to avoid hitting a real LLM API.
+    mock_content: Option<String>,
 }
 
 impl LlmHandler {
-    /// 鍒涘缓鏂扮殑 LLM Handler
+    /// Create new LLM handler
     pub fn new(default_model: &str, api_base: &str, api_key: Option<String>) -> Self {
         Self {
             default_model: default_model.to_string(),
             api_base: api_base.to_string(),
             api_key,
+            mock_content: None,
         }
     }
 
-    /// 浣跨敤榛樿閰嶇疆鍒涘缓 LLM Handler
-    /// 
-    /// 浼樺厛绾э細MiniMax > DeepSeek > OpenAI
+    /// Create LLM handler with default config
+    ///
+    /// Priority: MiniMax > DeepSeek > OpenAI
     pub fn with_defaults() -> Self {
         if let Ok(api_key) = std::env::var("MINIMAX_API_KEY") {
             Self {
                 default_model: std::env::var("MINIMAX_MODEL").unwrap_or_else(|_| "MiniMax-M2.5".to_string()),
                 api_base: std::env::var("MINIMAX_API_BASE").unwrap_or_else(|_| "https://api.minimax.io/v1/text/chatcompletion_v2".to_string()),
                 api_key: Some(api_key),
+                mock_content: None,
             }
         } else if let Ok(api_key) = std::env::var("DEEPSEEK_API_KEY") {
             Self {
                 default_model: std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string()),
                 api_base: std::env::var("DEEPSEEK_API_BASE").unwrap_or_else(|_| "https://api.deepseek.com/v1/chat/completions".to_string()),
                 api_key: Some(api_key),
+                mock_content: None,
             }
         } else if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
             Self {
                 default_model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
                 api_base: std::env::var("OPENAI_API_BASE").unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string()),
                 api_key: Some(api_key),
+                mock_content: None,
             }
         } else {
             Self {
                 default_model: "MiniMax-M2.5".to_string(),
                 api_base: "https://api.minimax.io/v1/text/chatcompletion_v2".to_string(),
                 api_key: None,
+                mock_content: None,
             }
         }
+    }
+
+    /// Create a mock LLM handler for tests.
+    ///
+    /// Returns a deterministic `LlmResponse`-shaped JSON regardless of input.
+    /// No HTTP call is made, no API key is needed.
+    /// Wire into `AgentRunner` via `with_llm_handler` to test the full
+    /// io_request -> io_response -> stable loop without a real LLM.
+    pub fn mock(content: &str) -> Self {
+        Self {
+            default_model: "mock".to_string(),
+            api_base: "mock://".to_string(),
+            api_key: None,
+            mock_content: Some(content.to_string()),
+        }
+    }
+
+    /// Returns true if this handler is a mock (skips HTTP).
+    pub fn is_mock(&self) -> bool {
+        self.mock_content.is_some()
     }
 }
 
 #[async_trait::async_trait]
 impl IoHandler for LlmHandler {
-    /// 鎵ц LLM API 璋冪敤
+    /// Execute LLM API invocation
     async fn execute(&self, params: &JsonValue) -> IoResult {
+        // Mock LLM short-circuit (used by tests).
+        // Return a canned LlmResponse-shaped JSON so handle_call_external
+        // can parse it without making a real HTTP call.
+        if let Some(content) = &self.mock_content {
+            let response = serde_json::json!({
+                "content": content,
+                "tool_calls": null,
+                "finish_reason": "stop",
+                "token_usage": null,
+            });
+            return Ok(serde_to_tcb(&response));
+        }
+
         let params_str = params.to_string();
         let api_base = self.api_base.clone();
         let api_key = self.api_key.clone();
@@ -137,7 +178,7 @@ impl IoHandler for LlmHandler {
             );
         }
 
-        debug!(model = model, "鍑嗗璋冪敤 LLM API");
+        debug!(model = model, "ready to invoke LLM API");
 
         let client = reqwest::Client::new();
         let mut request = client
@@ -212,5 +253,29 @@ mod tests {
             handler.api_base,
             "https://api.minimax.io/v1/text/chatcompletion_v2"
         );
+        assert!(!handler.is_mock());
+    }
+
+    #[tokio::test]
+    async fn test_llm_handler_mock_returns_canned_response() {
+        use crate::io_handler::IoHandler;
+        let handler = LlmHandler::mock("hello from mock");
+        assert!(handler.is_mock());
+
+        let params = tier0_tcb::JsonValue::empty_object();
+        let result = handler.execute(&params).await.expect("mock execute");
+        let s = result.to_string();
+        // Must be parseable as LlmResponse (handle_call_external parses it this way)
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("mock response is valid JSON");
+        assert_eq!(parsed["content"], "hello from mock");
+        assert_eq!(parsed["finish_reason"], "stop");
+        assert!(parsed["tool_calls"].is_null());
+    }
+
+    #[test]
+    fn test_llm_handler_mock_does_not_require_api_key() {
+        let handler = LlmHandler::mock("anything");
+        assert!(handler.api_key.is_none());
+        assert_eq!(handler.api_base, "mock://");
     }
 }

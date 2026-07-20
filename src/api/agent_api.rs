@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! Agent API 鈥斺€?HTTP 鎺ュ彛绠＄悊 Agent 鎵ц
+//! Agent API -- HTTP interface for managing Agent execution
 
 use axum::{extract::State, http::StatusCode, Json, Router};
 
@@ -11,80 +11,80 @@ use tracing::{info, warn};
 use crate::agent::{AgentDefinitionManager, AgentRunner};
 use crate::api::evorule_client::EvoruleApiClient;
 
-/// Agent 杩愯璇锋眰
+/// Agent run request
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentRunRequest {
-    /// Agent 绫诲瀷
+    /// Agent type
     pub agent_type: String,
-    /// 鐩爣
+    /// Goal
     pub goal: String,
-    /// 鏈€澶ф楠わ紙鍙€夛級
+    /// Max steps (optional)
     pub max_steps: Option<usize>,
-    /// 娓╁害鍙傛暟锛堝彲閫夛級
+    /// Temperature parameter (optional)
     pub temperature: Option<f32>,
-    /// 妯″瀷鍚嶇О锛堝彲閫夛級
+    /// Model name (optional)
     pub model: Option<String>,
 }
 
-/// Agent 杩愯鍝嶅簲
+/// Agent run response
 #[derive(Debug, Serialize)]
 pub struct AgentRunResponse {
-    /// 鏄惁鎴愬姛
+    /// Whether successful
     pub success: bool,
-    /// 缁撴灉鍐呭
+    /// Result content
     pub content: String,
-    /// 鎵ц姝ラ鏁
+    /// Number of steps executed
     pub steps: usize,
-    /// 鎵ц鑰楁椂锛堟绉掞級
+    /// Execution duration (milliseconds)
     pub duration_ms: u64,
-    /// 閿欒淇℃伅锛堝鏋滃け璐ワ級
+    /// Error message (if failed)
     pub error: Option<String>,
 }
 
-/// Agent 鍒楄〃鍝嶅簲
+/// Agent list response
 #[derive(Debug, Serialize)]
 pub struct AgentListResponse {
-    /// Agent 鍒楄〃
+    /// Agent list
     pub agents: Vec<AgentInfo>,
 }
 
-/// Agent 淇℃伅
+/// Agent info
 #[derive(Debug, Serialize)]
 pub struct AgentInfo {
-    /// Agent 绫诲瀷
+    /// Agent type
     pub agent_type: String,
-    /// 鐗堟湰鍙
+    /// Version number
     pub version: String,
-    /// 鎻忚堪
+    /// Description
     pub description: String,
-    /// 宸ュ叿鍒楄〃
+    /// Tool list
     pub tools: Vec<String>,
 }
 
-/// Agent 瀹氫箟鍝嶅簲
+/// Agent definition response
 #[derive(Debug, Serialize)]
 pub struct AgentDefinitionResponse {
-    /// Agent 绫诲瀷
+    /// Agent type
     pub agent_type: String,
-    /// 鐗堟湰鍙
+    /// Version number
     pub version: String,
-    /// 鎻忚堪
+    /// Description
     pub description: String,
-    /// 绯荤粺鎻愮ず璇
+    /// System prompt
     pub system_prompt: String,
-    /// 妯″瀷鍚嶇О
+    /// Model name
     pub model: String,
-    /// 娓╁害鍙傛暟
+    /// Temperature parameter
     pub temperature: f32,
-    /// 鏈€澶ф楠
+    /// Max steps
     pub max_steps: usize,
-    /// 宸ュ叿鍒楄〃
+    /// Tool list
     pub tools: Vec<String>,
-    /// 鍐呭瓨閰嶇疆
+    /// Memory config
     pub memory_config: Option<crate::agent::MemoryConfig>,
 }
 
-/// Agent API 鐘舵€
+/// Agent API state
 #[derive(Debug, Clone)]
 pub struct AgentApiState {
     definitions: AgentDefinitionManager,
@@ -92,7 +92,7 @@ pub struct AgentApiState {
 }
 
 impl AgentApiState {
-    /// 鍒涘缓鏂扮殑 Agent API 鐘舵€
+    /// Create new Agent API state
     pub fn new(definitions: AgentDefinitionManager, evorule_client: EvoruleApiClient) -> Self {
         Self {
             definitions,
@@ -101,7 +101,7 @@ impl AgentApiState {
     }
 }
 
-/// 鍒涘缓 Agent API 璺敱
+/// Create Agent API routes
 pub fn router(state: AgentApiState) -> Router {
     Router::new()
         .route("/agents", axum::routing::get(list_agents))

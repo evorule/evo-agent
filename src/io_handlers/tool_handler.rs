@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! Tool I/O Handler 鈥斺€?璋冪敤娉ㄥ唽鐨勫伐鍏峰嚱鏁?
+//! Tool I/O Handler -- invokes registered tool functions
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,9 @@ use tracing::debug;
 
 use crate::io_handler::{IoHandler, IoResult};
 
+/// TODO: doc
 pub trait ToolFunction: Send + Sync {
+    /// TODO: doc
     fn call(&self, args: &JsonValue) -> IoResult;
 }
 
@@ -26,7 +28,7 @@ where
 
 const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Tool I/O Handler 鈥斺€?璋冪敤娉ㄥ唽鐨勫伐鍏峰嚱鏁
+/// Tool I/O Handler -- invokes registered tool functions
 #[derive(Clone)]
 pub struct ToolHandler {
     tools: Arc<BTreeMap<String, Arc<dyn ToolFunction>>>,
@@ -41,26 +43,26 @@ impl std::fmt::Debug for ToolHandler {
 }
 
 impl ToolHandler {
-    /// 鍒涘缓鏂扮殑宸ュ叿 Handler
+    /// Create new tool handler
     pub fn new() -> Self {
         Self {
             tools: Arc::new(BTreeMap::new()),
         }
     }
 
-    /// 浣跨敤宸叉湁宸ュ叿鍒涘缓 Handler
+    /// Create handler with existing tools
     pub fn with_tools(tools: BTreeMap<String, Arc<dyn ToolFunction>>) -> Self {
         Self {
             tools: Arc::new(tools),
         }
     }
 
-    /// 娉ㄥ唽宸ュ叿鍑芥暟
+    /// Register tool function
     pub fn register_tool(&mut self, name: &str, func: Arc<dyn ToolFunction>) {
         Arc::make_mut(&mut self.tools).insert(name.to_string(), func);
     }
 
-    /// 妫€鏌ュ伐鍏锋槸鍚﹀凡娉ㄥ唽
+    /// Check whether tool is registered
     pub fn has_tool(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
@@ -68,7 +70,7 @@ impl ToolHandler {
 
 #[async_trait::async_trait]
 impl IoHandler for ToolHandler {
-    /// 鎵ц宸ュ叿璋冪敤
+    /// Execute tool invocation
     async fn execute(&self, params: &JsonValue) -> IoResult {
         let tool_name = params
             .get("tool_name")
@@ -82,7 +84,7 @@ impl IoHandler for ToolHandler {
             .get(tool_name)
             .ok_or_else(|| format!("tool not found: {tool_name}"))?;
 
-        debug!(tool_name = tool_name, "鍑嗗璋冪敤宸ュ叿");
+        debug!(tool_name = tool_name, "ready to invoke tool");
 
         tokio::time::timeout(TOOL_TIMEOUT, async move { func.call(&args) })
             .await

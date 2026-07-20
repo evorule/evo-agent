@@ -10,6 +10,8 @@
 
 pub mod agent;
 pub mod api;
+pub mod builtin_tools;
+pub mod config;
 pub mod io_dispatcher;
 pub mod io_handler;
 pub mod io_handlers;

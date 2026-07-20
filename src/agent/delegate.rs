@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! Agent 濮旀墭 鈥斺€?瀛?Agent 璋冪敤
+//! Agent delegate - sub-agent invocation
 
 use std::future::Future;
 use std::pin::Pin;
@@ -9,21 +9,21 @@ use std::pin::Pin;
 use crate::agent::definition::AgentDefinitionManager;
 use crate::api::evorule_client::EvoruleApiClient;
 
-/// 濮旀墭涓婁笅鏂
+/// Delegate context
 #[derive(Debug, Clone)]
 pub struct DelegateContext {
-    /// 褰撳墠濮旀墭娣卞害
+    /// Current delegate depth
     pub current_depth: usize,
-    /// 鐖?Agent 绫诲瀷
+    /// Parent agent type
     pub parent_agent_type: String,
-    /// Agent 瀹氫箟绠＄悊鍣
+    /// Agent definition manager
     pub definitions: AgentDefinitionManager,
-    /// Evorule API 瀹㈡埛绔
+    /// Evorule API client
     pub evorule_client: EvoruleApiClient,
 }
 
 impl DelegateContext {
-    /// 鍒涘缓鏂扮殑濮旀墭涓婁笅鏂
+    /// Create new delegate context
     pub fn new(parent_agent_type: &str, definitions: AgentDefinitionManager, evorule_client: EvoruleApiClient) -> Self {
         Self {
             current_depth: 0,
@@ -33,23 +33,23 @@ impl DelegateContext {
         }
     }
 
-    /// 璁剧疆濮旀墭娣卞害
+    /// Set delegate depth
     pub fn with_depth(mut self, depth: usize) -> Self {
         self.current_depth = depth;
         self
     }
 
-    /// 澧炲姞濮旀墭娣卞害
+    /// Increment delegate depth
     pub fn increment_depth(&self) -> Self {
         self.clone().with_depth(self.current_depth + 1)
     }
 
-    /// 鍒ゆ柇鏄惁鍙互缁х画濮旀墭
+    /// Check if can continue delegating
     pub fn can_delegate(&self, max_depth: usize) -> bool {
         self.current_depth < max_depth
     }
 
-    /// 濮旀墭鎵ц瀛?Agent
+    /// Delegate execution to sub-agent
     pub fn delegate<'a>(
         &'a self,
         agent_type: &'a str,
@@ -60,13 +60,13 @@ impl DelegateContext {
                 agent_type,
                 task = %task,
                 depth = self.current_depth,
-                "寮€濮嬪鎵樻墽琛屽瓙 Agent"
+                "Starting delegated sub-agent execution"
             );
 
             let def = self
                 .definitions
                 .load(agent_type)
-                .map_err(|e| format!("鍔犺浇瀛?Agent 瀹氫箟澶辫触 ({}): {}", agent_type, e))?;
+                .map_err(|e| format!("Failed to load sub-agent definition ({}): {}", agent_type, e))?;
 
             let config = def.to_agent_config();
 
@@ -77,21 +77,21 @@ impl DelegateContext {
             match result {
                 Ok(r) => {
                     if r.success {
-                        tracing::info!(agent_type, depth = self.current_depth, "瀛?Agent 鎵ц鎴愬姛");
+                        tracing::info!(agent_type, depth = self.current_depth, "Sub-agent execution succeeded");
                         Ok(r.content)
                     } else {
                         let err = r.error.unwrap_or_default();
                         tracing::warn!(
                             agent_type,
                             depth = self.current_depth,
-                            "瀛?Agent 鎵ц澶辫触: {}",
+                            "Sub-agent execution failed: {}",
                             err
                         );
                         Err(err)
                     }
                 }
                 Err(e) => {
-                    let err = format!("瀛?Agent 杩愯閿欒: {}", e);
+                    let err = format!("Sub-agent runtime error: {}", e);
                     tracing::error!(agent_type, depth = self.current_depth, "{}", err);
                     Err(err)
                 }

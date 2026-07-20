@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! Agent 璁板繂绠＄悊鍣?鈥斺€?閫氳繃 evorule payload API 绠＄悊璁板繂
+//! Agent memory manager -- manages memory via evorule payload API
 //!
-//! # 鍛藉悕绌洪棿绾﹀畾锛堢敤浜庡璁¤矾寰勶級
-//! - 鍏变韩璁板繂锛歚__memory__.agent_{type}.shared.{key}`
-//! - 浼氳瘽璁板繂锛歚__memory__.agent_{type}.session_{id}.{key}`
-//! - 鐭湡璁板繂锛歚__memory__.agent_{type}.session_{id}.messages.{idx}`
+//! # Namespace convention (used for accounting paths)
+//! - shared memory: `__memory__.agent_{type}.shared.{key}`
+//! - session memory: `__memory__.agent_{type}.session_{id}.{key}`
+//! - short-term memory: `__memory__.agent_{type}.session_{id}.messages.{idx}`
 //!
-//! # 鏋舵瀯鍙樻洿锛圥1-1锛?//! 璁板繂涓嶅啀瀛樺偍鍦ㄦ湰鍦版枃浠讹紝鑰屾槸閫氳繃 evorule 鐨?`POST /api/sessions/{id}/payload` API
-//! 鍐欏叆鍒颁細璇濈殑 payload 涓紝瀹炵幇璺ㄤ細璇濆叡浜拰瀹¤杩芥函銆?
+//! # Architecture change (P1-1):
+//! Memory is no longer stored in local files, but written to the session payload
+//! via evorule's `POST /api/sessions/{id}/payload` API, enabling cross-session
+//! sharing and audit chain continuity.
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -19,11 +21,17 @@ use crate::api::evorule_client::EvoruleApiClient;
 /// 鍐呭瓨鎿嶄綔閿欒
 #[derive(Debug)]
 pub enum MemoryError {
+    /// TODO: doc
     Io(std::io::Error),
+    /// TODO: doc
     Json(serde_json::Error),
+    /// TODO: doc
     EmptyKey,
+    /// TODO: doc
     KeyTooLong(usize),
+    /// TODO: doc
     EvoruleError(String),
+    /// TODO: doc
     SessionNotSet,
 }
 
@@ -63,8 +71,11 @@ impl From<crate::api::evorule_client::EvoruleApiError> for MemoryError {
 /// 鍐呭瓨璁板綍
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryRecord {
+    /// TODO: doc
     pub key: String,
+    /// TODO: doc
     pub value: String,
+    /// TODO: doc
     pub timestamp: u64,
 }
 
@@ -78,6 +89,7 @@ pub struct MemoryManager {
 }
 
 impl MemoryManager {
+    /// TODO: doc
     pub fn new(namespace: &str, evorule_client: EvoruleApiClient) -> Self {
         Self {
             namespace: namespace.to_string(),
@@ -87,15 +99,18 @@ impl MemoryManager {
         }
     }
 
+    /// TODO: doc
     pub fn with_session_id(mut self, session_id: &str) -> Self {
         self.session_id = Some(session_id.to_string());
         self
     }
 
+    /// TODO: doc
     pub fn set_session_id(&mut self, session_id: &str) {
         self.session_id = Some(session_id.to_string());
     }
 
+    /// TODO: doc
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
@@ -104,6 +119,7 @@ impl MemoryManager {
         format!("__memory__.{}.{}", self.namespace, key)
     }
 
+    /// TODO: doc
     pub async fn set(&mut self, key: &str, value: &str) -> Result<(), MemoryError> {
         if key.is_empty() {
             return Err(MemoryError::EmptyKey);
@@ -134,6 +150,7 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// TODO: doc
     pub async fn get(&mut self, key: &str) -> Result<Option<MemoryRecord>, MemoryError> {
         if let Some(record) = self.cache.get(key) {
             return Ok(Some(record.clone()));
@@ -157,6 +174,7 @@ impl MemoryManager {
         Ok(None)
     }
 
+    /// TODO: doc
     pub async fn remove(&mut self, key: &str) -> Result<Option<MemoryRecord>, MemoryError> {
         let removed = self.cache.remove(key);
 
@@ -169,6 +187,7 @@ impl MemoryManager {
         Ok(removed)
     }
 
+    /// TODO: doc
     pub async fn clear(&mut self) -> Result<(), MemoryError> {
         let keys: Vec<String> = self.cache.keys().cloned().collect();
         for key in keys {
@@ -178,10 +197,12 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// TODO: doc
     pub fn keys(&self) -> impl Iterator<Item = &String> {
         self.cache.keys()
     }
 
+    /// TODO: doc
     pub async fn sync_from_evorule(&mut self) -> Result<(), MemoryError> {
         if let Some(session_id) = &self.session_id {
             let prefix = format!("__memory__.{}", self.namespace);
@@ -199,6 +220,7 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// TODO: doc
     pub fn build_system_prompt(&self, base_prompt: &str) -> String {
         if self.cache.is_empty() {
             return base_prompt.to_string();
@@ -220,12 +242,14 @@ impl MemoryManager {
         format!("{}\n\n{}", base_prompt, memory_lines.join("\n"))
     }
 
+    /// TODO: doc
     pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), MemoryError> {
         let content = serde_json::to_string_pretty(&self.cache)?;
         std::fs::write(path, content)?;
         Ok(())
     }
 
+    /// TODO: doc
     pub fn load_from_file(path: &std::path::Path, namespace: &str, evorule_client: EvoruleApiClient) -> Result<Self, MemoryError> {
         let mut manager = Self::new(namespace, evorule_client);
         if path.exists() {
@@ -235,10 +259,12 @@ impl MemoryManager {
         Ok(manager)
     }
 
+    /// TODO: doc
     pub fn len(&self) -> usize {
         self.cache.len()
     }
 
+    /// TODO: doc
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }

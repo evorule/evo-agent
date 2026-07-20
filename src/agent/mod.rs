@@ -2,7 +2,7 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! Agent 缂栨帓灞?鈥斺€?AI Agent 鎵ц寰幆銆佸伐鍏锋敞鍐屻€佽蹇嗙鐞嗐€?
+//! Agent orchestration layer -- AI Agent run loop, tool registry, and memory manager.
 pub mod definition;
 pub mod delegate;
 pub mod memory;

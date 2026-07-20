@@ -1,46 +1,46 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! LLM 鍝嶅簲瑙ｆ瀽 鈥斺€?灏?LLM 杩斿洖鐨?JSON 瑙ｆ瀽涓哄伐鍏疯皟鐢?
+//! LLM response parser -- parses LLM-returned JSON into tool calls
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// 娑堟伅绫诲瀷
+/// Message type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role")]
 pub enum Message {
     #[serde(rename = "system")]
-    /// 绯荤粺娑堟伅
+    /// System message
     System {
-        /// 娑堟伅鍐呭
+        /// Message content
         content: String,
     },
     #[serde(rename = "user")]
-    /// 鐢ㄦ埛娑堟伅
+    /// User message
     User {
-        /// 娑堟伅鍐呭
+        /// Message content
         content: String,
     },
     #[serde(rename = "assistant")]
-    /// 鍔╂墜娑堟伅
+    /// Assistant message
     Assistant {
-        /// 娑堟伅鍐呭
+        /// Message content
         content: String,
-        /// 宸ュ叿璋冪敤鍒楄〃
+        /// Tool call list
         tool_calls: Option<Vec<ToolCall>>,
     },
     #[serde(rename = "tool")]
-    /// 宸ュ叿娑堟伅
+    /// Tool message
     Tool {
-        /// 宸ュ叿杩斿洖鍐呭
+        /// Tool return content
         content: String,
-        /// 宸ュ叿鍚嶇О
+        /// Tool name
         tool_name: String,
     },
 }
 
 impl Message {
-    /// 鑾峰彇娑堟伅鍐呭
+    /// Get message content
     pub fn content(&self) -> &str {
         match self {
             Message::System { content } => content,
@@ -51,48 +51,48 @@ impl Message {
     }
 }
 
-/// 宸ュ叿璋冪敤
+/// Tool call
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     #[serde(rename = "tool_name")]
-    /// 宸ュ叿鍚嶇О
+    /// Tool name
     pub name: String,
     #[serde(rename = "args")]
-    /// 宸ュ叿鍙傛暟
+    /// Tool arguments
     pub arguments: Value,
 }
 
-/// LLM 鍝嶅簲
+/// LLM response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
-    /// 鍝嶅簲鍐呭
+    /// Response content
     pub content: String,
-    /// 宸ュ叿璋冪敤鍒楄〃
+    /// Tool call list
     pub tool_calls: Option<Vec<ToolCall>>,
-    /// 缁撴潫鍘熷洜
+    /// Finish reason
     pub finish_reason: Option<String>,
-    /// Token 浣跨敤鎯呭喌
+    /// Token usage
     pub token_usage: Option<TokenUsage>,
 }
 
-/// Token 浣跨敤鎯呭喌
+/// Token usage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {
-    /// 鎻愮ず璇?Token 鏁
+    /// Prompt token count
     pub prompt_tokens: usize,
-    /// 瀹屾垚 Token 鏁
+    /// Completion token count
     pub completion_tokens: usize,
-    /// 鎬?Token 鏁
+    /// Total token count
     pub total_tokens: usize,
 }
 
 impl LlmResponse {
-    /// 鍒ゆ柇鏄惁鍖呭惈宸ュ叿璋冪敤
+    /// Check whether contains tool calls
     pub fn is_tool_call(&self) -> bool {
         self.tool_calls.is_some() && !self.tool_calls.as_ref().unwrap().is_empty()
     }
 
-    /// 鍒ゆ柇鏄惁宸插畬鎴
+    /// Check whether finished
     pub fn is_finished(&self) -> bool {
         match self.finish_reason.as_deref() {
             Some("stop") | Some("end_turn") => true,
@@ -100,18 +100,18 @@ impl LlmResponse {
         }
     }
 
-    /// 鎻愬彇鍝嶅簲鍐呭
+    /// Extract response content
     pub fn extract_content(&self) -> String {
         self.content.clone()
     }
 }
 
-/// 瑙ｆ瀽 LLM 鍝嶅簲
+/// Parse LLM response
 pub fn parse_llm_response(json: &str) -> Result<LlmResponse, serde_json::Error> {
     serde_json::from_str(json)
 }
 
-/// 鎻愬彇宸ュ叿璋冪敤鍒楄〃
+/// Extract tool call list
 pub fn extract_tool_calls(json: &str) -> Result<Vec<ToolCall>, serde_json::Error> {
     let response: LlmResponse = serde_json::from_str(json)?;
     Ok(response.tool_calls.unwrap_or_default())

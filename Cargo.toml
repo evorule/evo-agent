@@ -44,6 +44,9 @@ async-trait = "0.1"
 
 clap = { version = "4", features = ["derive", "env"] }
 
+# Config loading
+toml = "0.8"
+
 [dependencies.serde_with]
 version = "3"
 features = ["json"]

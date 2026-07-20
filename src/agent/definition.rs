@@ -61,46 +61,46 @@ impl Default for MemoryConfig {
     }
 }
 
-/// 杈撳嚭鏍煎紡閰嶇疆
+/// Output format configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutputFormat {
     #[serde(rename = "type")]
-    /// 鏍煎紡绫诲瀷锛堝 "json", "text"锛
+    /// Format type (e.g. "json", "text")
     pub format_type: String,
-    /// 杈撳嚭 schema锛堝彲閫夛級
+    /// Output schema (optional)
     pub schema: Option<serde_json::Value>,
 }
 
-/// Agent 瀹氫箟
+/// Agent definition
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentDefinition {
-    /// Agent 绫诲瀷鏍囪瘑
+    /// Agent type identifier
     pub agent_type: String,
-    /// 鐗堟湰鍙
+    /// Version number
     pub version: String,
-    /// 鎻忚堪淇℃伅
+    /// Description
     pub description: String,
-    /// 绯荤粺鎻愮ず璇
+    /// System prompt
     pub system_prompt: String,
-    /// 浣跨敤鐨勬ā鍨嬪悕绉
+    /// Model name to use
     pub model: String,
-    /// 娓╁害鍙傛暟
+    /// Temperature parameter
     pub temperature: f32,
-    /// 鏈€澶ф墽琛屾楠
+    /// Max execution steps
     pub max_steps: usize,
-    /// 鍗曟瓒呮椂鏃堕棿锛堢锛
+    /// Step timeout in seconds
     pub step_timeout_secs: u64,
-    /// 鍙敤宸ュ叿鍒楄〃
+    /// Available tool list
     pub tools: Vec<String>,
     #[serde(default)]
-    /// 鍐呭瓨閰嶇疆
+    /// Memory configuration
     pub memory: MemoryConfig,
-    /// 杈撳嚭鏍煎紡閰嶇疆锛堝彲閫夛級
+    /// Output format configuration (optional)
     pub output_format: Option<OutputFormat>,
 }
 
 impl AgentDefinition {
-    /// 浠庣洰褰曞姞杞?Agent 瀹氫箟
+    /// Load Agent definition from directory
     pub fn load_from_dir(dir: &Path, agent_type: &str) -> Result<Self, AgentDefinitionError> {
         let path = dir.join(format!("{}.json", agent_type));
         if !path.exists() {
@@ -111,7 +111,7 @@ impl AgentDefinition {
         Ok(def)
     }
 
-    /// 鍒楀嚭鐩綍涓墍鏈夊彲鐢ㄧ殑 Agent 绫诲瀷
+    /// List all available Agent types in directory
     pub fn list_available(dir: &Path) -> Result<Vec<String>, AgentDefinitionError> {
         if !dir.exists() {
             return Ok(Vec::new());
@@ -130,7 +130,7 @@ impl AgentDefinition {
         Ok(types)
     }
 
-    /// 杞崲涓?AgentConfig
+    /// Convert to AgentConfig
     pub fn to_agent_config(&self) -> AgentConfig {
         AgentConfig {
             agent_type: self.agent_type.clone(),
@@ -153,28 +153,28 @@ pub struct AgentDefinitionManager {
 }
 
 impl AgentDefinitionManager {
-    /// 鍒涘缓鏂扮殑绠＄悊鍣
+    /// Create new manager
     pub fn new(agents_dir: PathBuf) -> Self {
         Self { agents_dir }
     }
 
-    /// 浣跨敤榛樿鐩綍鍒涘缓绠＄悊鍣紙rules/agents锛
+    /// Create manager with default directory (rules/agents)
     pub fn with_default_dir() -> Self {
         let dir = PathBuf::from("rules/agents");
         Self::new(dir)
     }
 
-    /// 鑾峰彇 agents 鐩綍璺緞
+    /// Get agents directory path
     pub fn agents_dir(&self) -> &Path {
         &self.agents_dir
     }
 
-    /// 鍔犺浇鎸囧畾绫诲瀷鐨?Agent 瀹氫箟
+    /// Load Agent definition of specified type
     pub fn load(&self, agent_type: &str) -> Result<AgentDefinition, AgentDefinitionError> {
         AgentDefinition::load_from_dir(&self.agents_dir, agent_type)
     }
 
-    /// 鍒楀嚭鎵€鏈夊彲鐢ㄧ殑 Agent 绫诲瀷
+    /// List all available Agent types
     pub fn list_types(&self) -> Result<Vec<String>, AgentDefinitionError> {
         AgentDefinition::list_available(&self.agents_dir)
     }
@@ -200,8 +200,8 @@ mod tests {
         let json = r#"{
             "agent_type": "researcher",
             "version": "1.0.0",
-            "description": "鐮旂┒鍨?Agent",
-            "system_prompt": "浣犳槸涓€涓爺绌跺瀷 Agent",
+            "description": "Research agent",
+            "system_prompt": "You are a research agent",
             "model": "gpt-4o-mini",
             "temperature": 0.3,
             "max_steps": 20,
@@ -312,8 +312,8 @@ mod tests {
         let def = AgentDefinition {
             agent_type: "writer".to_string(),
             version: "1.0.0".to_string(),
-            description: "鍐欎綔 Agent".to_string(),
-            system_prompt: "浣犳槸鍐欎綔鍔╂墜".to_string(),
+            description: "Writer agent".to_string(),
+            system_prompt: "You are a writing assistant".to_string(),
             model: "gpt-4o".to_string(),
             temperature: 0.8,
             max_steps: 15,
@@ -324,7 +324,7 @@ mod tests {
         };
         let config = def.to_agent_config();
         assert_eq!(config.agent_type, "writer");
-        assert_eq!(config.system_prompt, "浣犳槸鍐欎綔鍔╂墜");
+        assert_eq!(config.system_prompt, "You are a writing assistant");
         assert_eq!(config.model, "gpt-4o");
         assert!((config.temperature - 0.8).abs() < 0.01);
         assert_eq!(config.max_steps, 15);

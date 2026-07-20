@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! 宸ュ叿娉ㄥ唽涓績 鈥斺€?绠＄悊 Agent 鍙敤鐨勫伐鍏?
+//! Tool registry center -- manages tools available to Agent
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -10,37 +10,39 @@ use tier0_tcb::JsonValue;
 use tokio::sync::RwLock;
 
 #[async_trait]
+/// TODO: doc
 pub trait ToolFunction: Send + Sync + 'static {
+    /// TODO: doc
     async fn call(&self, args: &JsonValue) -> Result<JsonValue, String>;
 }
 
-/// 宸ュ叿瑙勬牸
+/// Tool spec
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
-    /// 宸ュ叿鍚嶇О
+    /// Tool name
     pub name: String,
-    /// 宸ュ叿鎻忚堪
+    /// Tool description
     pub description: String,
-    /// 鍙傛暟瑙勬牸鍒楄〃
+    /// Parameter spec list
     pub parameters: Vec<ParameterSpec>,
-    /// 蹇呭～鍙傛暟鍚嶇О鍒楄〃
+    /// Required parameter name list
     pub required: Vec<String>,
 }
 
-/// 鍙傛暟瑙勬牸
+/// Parameter spec
 #[derive(Debug, Clone)]
 pub struct ParameterSpec {
-    /// 鍙傛暟鍚嶇О
+    /// Parameter name
     pub name: String,
-    /// 鍙傛暟绫诲瀷
+    /// Parameter type
     pub r#type: String,
-    /// 鍙傛暟鎻忚堪
+    /// Parameter description
     pub description: String,
-    /// 鏄惁蹇呭～
+    /// Whether required
     pub required: bool,
 }
 
-/// 宸ュ叿娉ㄥ唽涓績
+/// Tool registry
 pub struct ToolRegistry {
     tools: RwLock<BTreeMap<String, ToolEntry>>,
 }
@@ -51,14 +53,14 @@ struct ToolEntry {
 }
 
 impl ToolRegistry {
-    /// 鍒涘缓鏂扮殑宸ュ叿娉ㄥ唽涓績
+    /// Create new tool registry
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(BTreeMap::new()),
         }
     }
 
-    /// 娉ㄥ唽宸ュ叿
+    /// Register tool
     pub async fn register(
         &self,
         name: &str,
@@ -85,12 +87,12 @@ impl ToolRegistry {
             .insert(name.to_string(), ToolEntry { func, spec });
     }
 
-    /// 娉ㄩ攢宸ュ叿
+    /// Unregister tool
     pub async fn unregister(&self, name: &str) -> bool {
         self.tools.write().await.remove(name).is_some()
     }
 
-    /// 鑾峰彇宸ュ叿鍑芥暟
+    /// Get tool function
     pub async fn get(&self, name: &str) -> Option<Arc<dyn ToolFunction>> {
         self.tools
             .read()
@@ -99,7 +101,7 @@ impl ToolRegistry {
             .map(|entry| entry.func.clone())
     }
 
-    /// 鑾峰彇宸ュ叿瑙勬牸
+    /// Get tool spec
     pub async fn get_spec(&self, name: &str) -> Option<ToolSpec> {
         self.tools
             .read()
@@ -108,7 +110,7 @@ impl ToolRegistry {
             .map(|entry| entry.spec.clone())
     }
 
-    /// 鍒楀嚭鎵€鏈夊伐鍏疯鏍
+    /// List all tool specs
     pub async fn list_tools(&self) -> Vec<ToolSpec> {
         self.tools
             .read()
@@ -118,17 +120,17 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// 鑾峰彇宸ュ叿鏁伴噺
+    /// Get tool count
     pub async fn len(&self) -> usize {
         self.tools.read().await.len()
     }
 
-    /// 鍒ゆ柇鏄惁涓虹┖
+    /// Check whether empty
     pub async fn is_empty(&self) -> bool {
         self.tools.read().await.is_empty()
     }
 
-    /// 杞崲涓?OpenAI 宸ュ叿 schema 鏍煎紡
+    /// Convert to OpenAI tool schema format
     pub async fn to_openai_schema(&self) -> Vec<JsonValue> {
         let mut schema = Vec::new();
         for spec in self.list_tools().await {
@@ -204,12 +206,12 @@ mod tests {
         let params = vec![ParameterSpec {
             name: "text".to_string(),
             r#type: "string".to_string(),
-            description: "杈撳叆鏂囨湰".to_string(),
+            description: "input text".to_string(),
             required: true,
         }];
 
         registry
-            .register("echo", "杩斿洖杈撳叆鏂囨湰", params, Arc::new(EchoTool))
+            .register("echo", "echo input text", params, Arc::new(EchoTool))
             .await;
 
         assert!(!registry.is_empty().await);
@@ -220,7 +222,7 @@ mod tests {
 
         let spec = registry.get_spec("echo").await.unwrap();
         assert_eq!(spec.name, "echo");
-        assert_eq!(spec.description, "杩斿洖杈撳叆鏂囨湰");
+        assert_eq!(spec.description, "echo input text");
     }
 
     #[tokio::test]
@@ -229,12 +231,12 @@ mod tests {
         let params = vec![ParameterSpec {
             name: "text".to_string(),
             r#type: "string".to_string(),
-            description: "杈撳叆".to_string(),
+            description: "input".to_string(),
             required: true,
         }];
 
         registry
-            .register("test", "娴嬭瘯宸ュ叿", params, Arc::new(EchoTool))
+            .register("test", "test tool", params, Arc::new(EchoTool))
             .await;
         assert_eq!(registry.len().await, 1);
 
@@ -253,21 +255,21 @@ mod tests {
         let params1 = vec![ParameterSpec {
             name: "q".to_string(),
             r#type: "string".to_string(),
-            description: "鏌ヨ".to_string(),
+            description: "query".to_string(),
             required: true,
         }];
         registry
-            .register("search", "鎼滅储", params1, Arc::new(EchoTool))
+            .register("search", "search", params1, Arc::new(EchoTool))
             .await;
 
         let params2 = vec![ParameterSpec {
             name: "file".to_string(),
             r#type: "string".to_string(),
-            description: "鏂囦欢鍚".to_string(),
+            description: "file path".to_string(),
             required: true,
         }];
         registry
-            .register("read_file", "璇诲彇鏂囦欢", params2, Arc::new(EchoTool))
+            .register("read_file", "read file", params2, Arc::new(EchoTool))
             .await;
 
         let tools = registry.list_tools().await;
@@ -286,19 +288,19 @@ mod tests {
             ParameterSpec {
                 name: "query".to_string(),
                 r#type: "string".to_string(),
-                description: "鎼滅储鏌ヨ".to_string(),
+                description: "search query".to_string(),
                 required: true,
             },
             ParameterSpec {
                 name: "limit".to_string(),
                 r#type: "integer".to_string(),
-                description: "缁撴灉鏁伴噺".to_string(),
+                description: "result count".to_string(),
                 required: false,
             },
         ];
 
         registry
-            .register("web_search", "缃戠粶鎼滅储", params, Arc::new(EchoTool))
+            .register("web_search", "web search", params, Arc::new(EchoTool))
             .await;
 
         let schema = registry.to_openai_schema().await;
@@ -322,12 +324,12 @@ mod tests {
         let params = vec![ParameterSpec {
             name: "text".to_string(),
             r#type: "string".to_string(),
-            description: "杈撳叆".to_string(),
+            description: "input".to_string(),
             required: true,
         }];
 
         registry
-            .register("echo", "鍥炴樉", params, Arc::new(EchoTool))
+            .register("echo", "echo", params, Arc::new(EchoTool))
             .await;
 
         let func = registry.get("echo").await.unwrap();

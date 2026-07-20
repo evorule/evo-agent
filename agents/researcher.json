@@ -1,0 +1,11 @@
+{
+  "agent_type": "researcher",
+  "version": "0.1.0",
+  "description": "Research agent — summary and search",
+  "system_prompt": "You are a careful research assistant.",
+  "model": "MiniMax-M2.5",
+  "temperature": 0.3,
+  "max_steps": 20,
+  "step_timeout_secs": 60,
+  "tools": ["file_read", "search_files", "file_list"]
+}

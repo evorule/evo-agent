@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! Agent 杩愯鍣?鈥斺€?ReAct 寰幆鎵ц鏍稿績锛堜簨浠堕┍鍔ㄦ灦鏋勶級
+//! Agent runner -- ReAct loop execution core (event-driven framework)
 //!
-//! 瀹屾暣 Fact 闂幆娴佺▼锛?//! AgentRunner 鎻愪氦 Command 鈫?POST /api/sessions/{id}/command 鈫?evorule 浜х敓 IoRequest 鈫?//! SSE 鎺ㄩ€?io_request 浜嬩欢 鈫?AgentRunner 鎵ц澶栭儴璋冪敤 鈫?POST /api/sessions/{id}/io_response 鈫?//! evorule 浜х敓 IoResponse + StateTransition 鈫?SSE 鎺ㄩ€?stable 浜嬩欢 鈫?AgentRunner 杩斿洖缁撴灉
+//! Full Fact loop flow:
+//! AgentRunner submits Command -> POST /api/sessions/{id}/command -> evorule produces IoRequest ->
+//! SSE pushes io_request event -> AgentRunner executes external call -> POST /api/sessions/{id}/io_response ->
+//! evorule produces IoResponse + StateTransition -> SSE pushes stable event -> AgentRunner returns result
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -16,23 +19,34 @@ use tracing::info;
 
 use crate::agent::delegate::DelegateContext;
 use crate::agent::memory::MemoryManager;
+use crate::agent::definition::AgentDefinition;
 use crate::agent::translator::{LlmResponse, Message};
 use crate::api::evorule_client::{EvoruleApiClient, EvoruleApiError};
 use crate::io_handler::IoHandler;
 use crate::io_handlers::{LlmHandler, ToolHandler};
 use crate::json_convert::serde_to_tcb;
 
+/// TODO: doc
 pub const DEFAULT_MAX_DELEGATE_DEPTH: usize = 3;
 
 #[derive(Debug, Clone)]
+/// TODO: doc
 pub struct AgentConfig {
+    /// TODO: doc
     pub agent_type: String,
+    /// TODO: doc
     pub system_prompt: String,
+    /// TODO: doc
     pub model: String,
+    /// TODO: doc
     pub temperature: f32,
+    /// TODO: doc
     pub max_steps: usize,
+    /// TODO: doc
     pub step_timeout: Duration,
+    /// TODO: doc
     pub tool_names: Vec<String>,
+    /// TODO: doc
     pub llm_retry_count: usize,
 }
 
@@ -40,7 +54,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             agent_type: "default".to_string(),
-            system_prompt: "浣犳槸涓€涓府鍔╂€у姪鎵".to_string(),
+            system_prompt: "You are a helpful assistant".to_string(),
             model: "gpt-4o-mini".to_string(),
             temperature: 0.7,
             max_steps: 10,
@@ -52,14 +66,23 @@ impl Default for AgentConfig {
 }
 
 #[derive(Debug)]
+/// TODO: doc
 pub enum AgentError {
+    /// TODO: doc
     LlmError(String),
+    /// TODO: doc
     ToolError(String),
+    /// TODO: doc
     Timeout(String),
+    /// TODO: doc
     MaxStepsExceeded(usize),
+    /// TODO: doc
     DelegateError(String),
+    /// TODO: doc
     MemoryError(String),
+    /// TODO: doc
     Internal(String),
+    /// TODO: doc
     EvoruleError(String),
 }
 
@@ -93,16 +116,24 @@ impl From<crate::agent::memory::MemoryError> for AgentError {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+/// TODO: doc
 pub struct AgentResult {
+    /// TODO: doc
     pub success: bool,
+    /// TODO: doc
     pub content: String,
+    /// TODO: doc
     pub steps: usize,
+    /// TODO: doc
     pub duration_ms: u64,
+    /// TODO: doc
     pub tool_calls: Vec<String>,
+    /// TODO: doc
     pub error: Option<String>,
 }
 
 impl AgentResult {
+    /// TODO: doc
     pub fn success(
         content: String,
         steps: usize,
@@ -119,6 +150,7 @@ impl AgentResult {
         }
     }
 
+    /// TODO: doc
     pub fn error(error: String, steps: usize, duration_ms: u64) -> Self {
         Self {
             success: false,
@@ -131,6 +163,7 @@ impl AgentResult {
     }
 }
 
+/// TODO: doc
 pub struct AgentRunner {
     config: AgentConfig,
     evorule_client: EvoruleApiClient,
@@ -143,6 +176,7 @@ pub struct AgentRunner {
 }
 
 impl AgentRunner {
+    /// TODO: doc
     pub fn new(config: AgentConfig, evorule_client: EvoruleApiClient) -> Self {
         Self {
             config,
@@ -156,32 +190,135 @@ impl AgentRunner {
         }
     }
 
-    /// 鏇挎崲榛樿鐨?LLM Handler(鐢ㄤ簬鐪熷疄鎺ュ叆鐗瑰畾 provider)
+    /// 当前 agent 类型(读访问 — 5 原则:**透明**)
+    pub fn agent_type(&self) -> &str {
+        &self.config.agent_type
+    }
+
+    /// 当前 agent 配置的只读快照(读访问 — **透明**)
+    pub fn config(&self) -> &AgentConfig {
+        &self.config
+    }
+
+    /// 从 `AgentDefinition` + 预组装的组件构造一个**完整可跑**的 AgentRunner
+    ///
+    /// 责任:
+    /// 1. 把 `AgentDefinition` 字段映射到 `AgentConfig`(已经由 `to_agent_config()` 做好)
+    /// 2. 校验 `def.tools` 全部已在 `tool_handler` 注册(早失败,**可控**)
+    /// 3. 根据 `def.memory.memory_type` 决定是否装 MemoryManager
+    /// 4. 把所有部件组装成 AgentRunner
+    ///
+    /// # 参数
+    /// - `def`:AgentDefinition(从 `agent.json` 加载)
+    /// - `client`:evorule HTTP 客户端
+    /// - `tool_handler`:**已经组装好**的 ToolHandler(用 `builtin_tools::default_safe_toolkit(workdir)` 或自己组)
+    /// - `llm_handler`:可选 LLM handler,None 时从 env 自动读
+    ///
+    /// # 错误
+    /// - `def.tools` 里有名字在 `tool_handler` 中**没注册**:返回 `AgentError::Internal`
+    /// - `def.memory.memory_type == "persistent"` 但 evorule 拉取失败:返回 `AgentError::MemoryError`
+    ///
+    /// # 示例
+    /// ```ignore
+    /// use evo_agent::builtin_tools::default_safe_toolkit;
+    /// use evo_agent::config::Config;
+    /// use evo_agent::agent::definition::AgentDefinitionManager;
+    ///
+    /// let config = Config::load(Path::new("."))?;
+    /// let def_mgr = AgentDefinitionManager::new(config.agents.dir);
+    /// let def = def_mgr.load("general")?;
+    ///
+    /// let client = EvoruleApiClient::new(&config.evorule.base_url);
+    /// let tool_handler = default_safe_toolkit(Path::new("."));
+    ///
+    /// let mut runner = AgentRunner::from_definition(def, client, tool_handler, None).await?;
+    /// let result = runner.run("hello world").await?;
+    /// ```
+    pub async fn from_definition(
+        def: AgentDefinition,
+        client: EvoruleApiClient,
+        tool_handler: ToolHandler,
+        llm_handler: Option<LlmHandler>,
+    ) -> Result<Self, AgentError> {
+        // 1. 配置
+        let config = def.to_agent_config();
+
+        // 2. 校验:def.tools 全部已在 tool_handler 注册
+        // (早失败:用户能在跑之前就发现配错,而不是跑一半才挂)
+        for tool_name in &config.tool_names {
+            if !tool_handler.has_tool(tool_name) {
+                return Err(AgentError::Internal(format!(
+                    "agent '{}' requires tool '{}' but it is NOT registered in tool_handler; \
+                     check your agent.json 'tools' list vs the tool_handler you passed",
+                    def.agent_type, tool_name
+                )));
+            }
+        }
+
+        // 3. Memory(按 spec 决定要不要)
+        let memory = if def.memory.memory_type == "none" || def.memory.memory_type.is_empty() {
+            None
+        } else {
+            // 0.1.0 简化:只支持 "persistent" 模式("none" 已处理)
+            // 其他 memory_type 未来加
+            if def.memory.memory_type != "persistent" {
+                return Err(AgentError::Internal(format!(
+                    "agent '{}' has unsupported memory.type '{}'; \
+                     0.1.0 supports 'none' and 'persistent'",
+                    def.agent_type, def.memory.memory_type
+                )));
+            }
+            let mut mem = MemoryManager::new(&def.memory.namespace, client.clone());
+            // 同步:从 evorule 把 namespace 下的 facts 拉下来
+            mem.sync_from_evorule().await?;
+            Some(mem)
+        };
+
+        // 4. LLM handler(默认从 env 读)
+        let llm = llm_handler.unwrap_or_else(LlmHandler::with_defaults);
+
+        // 5. 组装
+        let mut runner = Self::new(config, client)
+            .with_llm_handler(llm)
+            .with_tool_handler(tool_handler);
+        if let Some(mem) = memory {
+            runner = runner.with_memory(mem);
+        }
+        Ok(runner)
+    }
+
+
+    /// Replace default LLM Handler (used to actually wire up specific provider)
     pub fn with_llm_handler(mut self, llm_handler: LlmHandler) -> Self {
         self.llm_handler = llm_handler;
         self
     }
 
+    /// TODO: doc
     pub fn with_tool_handler(mut self, tool_handler: ToolHandler) -> Self {
         self.tool_handler = tool_handler;
         self
     }
 
+    /// TODO: doc
     pub fn with_memory(mut self, memory: MemoryManager) -> Self {
         self.memory = Some(memory);
         self
     }
 
+    /// TODO: doc
     pub fn with_delegate_context(mut self, ctx: DelegateContext) -> Self {
         self.delegate_context = Some(ctx);
         self
     }
 
+    /// TODO: doc
     pub fn with_join_cluster(mut self, cluster_id: &str) -> Self {
         self.join_cluster_id = Some(cluster_id.to_string());
         self
     }
 
+    /// TODO: doc
     pub async fn run(&mut self, goal: &str) -> Result<AgentResult, AgentError> {
         let start_time = std::time::Instant::now();
 
@@ -404,10 +541,10 @@ impl AgentRunner {
     }
 
     async fn execute_llm_request(&self, params: &JsonValue) -> Result<JsonValue, AgentError> {
-        // 鐪熷疄璋冪敤 LlmHandler(宸茬敤 reqwest 瀹炵幇鐪熷疄 HTTP API)
-        // - 璇?MINIMAX_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY 鐜鍙橀噺
-        // - 鏀寔 messages / tools / temperature / max_tokens
-        // - 杩斿洖瀹屾暣鐨?OpenAI 鍏煎 JSON 鍝嶅簲
+        // Actually invoke LlmHandler (uses reqwest to call real HTTP API)
+        // - Read MINIMAX_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY env vars
+        // - Supports messages / tools / temperature / max_tokens
+        // - Returns full OpenAI-compatible JSON response
         self.llm_handler
             .execute(params)
             .await
@@ -474,6 +611,7 @@ impl AgentRunner {
         Ok(rewind_version)
     }
 
+    /// TODO: doc
     pub async fn join_cluster(&mut self, cluster_id: &str) -> Result<(), AgentError> {
         if let Some(session_id) = &self.session_id {
             self.evorule_client.join_cluster(session_id, cluster_id).await?;
@@ -483,6 +621,7 @@ impl AgentRunner {
         Ok(())
     }
 
+    /// TODO: doc
     pub async fn leave_cluster(&mut self) -> Result<(), AgentError> {
         if let Some(session_id) = &self.session_id {
             self.evorule_client.leave_cluster(session_id).await?;
@@ -492,6 +631,7 @@ impl AgentRunner {
         Ok(())
     }
 
+    /// TODO: doc
     pub async fn get_cluster_status(&self) -> Result<Value, AgentError> {
         if let Some(session_id) = &self.session_id {
             self.evorule_client.get_cluster_status(session_id).await.map_err(|e| e.into())
@@ -500,14 +640,17 @@ impl AgentRunner {
         }
     }
 
+    /// TODO: doc
     pub async fn replay_session(&self, session_id: &str) -> Result<Vec<Value>, AgentError> {
         self.evorule_client.replay(session_id).await.map_err(|e| e.into())
     }
 
+    /// TODO: doc
     pub async fn diff_session(&self, session_id: &str, version_a: u64, version_b: u64) -> Result<Value, AgentError> {
         self.evorule_client.diff(session_id, version_a, version_b).await.map_err(|e| e.into())
     }
 
+    /// TODO: doc
     pub async fn compare_strategies(
         &self,
         session_a: &str,
@@ -543,6 +686,7 @@ impl AgentRunner {
         }))
     }
 
+    /// TODO: doc
     pub fn run_streaming(
         self,
         goal: String,
@@ -635,6 +779,7 @@ impl AgentRunner {
     }
 }
 
+/// TODO: doc
 pub fn merge_delegate_tool(
     _tool_name: &str,
     args: &JsonValue,
@@ -1050,5 +1195,108 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 12);
+    }
+
+    // === AgentRunner::from_definition 测试 ===
+
+    use crate::agent::definition::MemoryConfig;
+
+    fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
+        AgentDefinition {
+            agent_type: "test".to_string(),
+            version: "0.1.0".to_string(),
+            description: "test agent".to_string(),
+            system_prompt: "you are a test agent".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            temperature: 0.5,
+            max_steps: 5,
+            step_timeout_secs: 30,
+            tools,
+            memory: MemoryConfig::default(), // type = "none"
+            output_format: None,
+        }
+    }
+
+    fn make_handler_with(tool_names: &[&str]) -> ToolHandler {
+        use crate::io_handlers::tool_handler::ToolFunction;
+        use std::sync::Arc;
+
+        struct EchoTool;
+        impl ToolFunction for EchoTool {
+            fn call(&self, _args: &tier0_tcb::JsonValue) -> crate::io_handler::IoResult {
+                Ok(tier0_tcb::JsonValue::string("echo"))
+            }
+        }
+
+        let mut h = ToolHandler::new();
+        for name in tool_names {
+            h.register_tool(name, Arc::new(EchoTool));
+        }
+        h
+    }
+
+    #[tokio::test]
+    async fn test_from_definition_success() {
+        let def = make_def_with_tools(vec!["echo".to_string()]);
+        let client = make_test_client();
+        let handler = make_handler_with(&["echo"]);
+
+        let result = AgentRunner::from_definition(def, client, handler, None).await;
+        assert!(result.is_ok(), "expected Ok");
+        let runner = result.unwrap();
+        assert_eq!(runner.config.agent_type, "test");
+        assert_eq!(runner.config.model, "gpt-4o-mini");
+        assert_eq!(runner.config.tool_names, vec!["echo".to_string()]);
+        assert!(runner.tool_handler.has_tool("echo"));
+        // "none" memory → None
+        assert!(runner.memory.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_from_definition_rejects_unregistered_tool() {
+        // def 想用 "magic" 但 handler 没注册 → 应早失败(可控)
+        let def = make_def_with_tools(vec!["echo".to_string(), "magic".to_string()]);
+        let client = make_test_client();
+        let handler = make_handler_with(&["echo"]); // 没注册 "magic"
+
+        let result = AgentRunner::from_definition(def, client, handler, None).await;
+        let err = match result {
+            Ok(_) => panic!("expected Err but got Ok"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("magic"), "error should mention missing tool, got: {}", msg);
+        assert!(msg.contains("not registered") || msg.contains("NOT registered"),
+            "got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_from_definition_rejects_unknown_memory_type() {
+        let mut def = make_def_with_tools(vec!["echo".to_string()]);
+        def.memory.memory_type = "redis".to_string(); // 0.1.0 不支持
+        let client = make_test_client();
+        let handler = make_handler_with(&["echo"]);
+
+        let result = AgentRunner::from_definition(def, client, handler, None).await;
+        let err = match result {
+            Ok(_) => panic!("expected Err but got Ok"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("redis") || msg.contains("unsupported memory"),
+            "got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_from_definition_empty_tools_succeeds() {
+        // 0 tools is valid(read-only agent)
+        let def = make_def_with_tools(vec![]);
+        let client = make_test_client();
+        let handler = make_handler_with(&[]);
+
+        let result = AgentRunner::from_definition(def, client, handler, None).await;
+        assert!(result.is_ok());
+        let runner = result.unwrap();
+        assert!(runner.config.tool_names.is_empty());
     }
 }

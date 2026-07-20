@@ -1,7 +1,19 @@
-use mockito::{Server, ServerGuard};
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 EvoRule Project
+// Integration tests for evo-agent run loop against a mock evorule server.
+//
+// Notes:
+// - mockito mocks the evorule HTTP API (create_session / events / io_response / state / etc.)
+// - LlmHandler::mock() short-circuits the LLM HTTP call so tests stay deterministic
+//   and don't require a real MiniMax / DeepSeek / OpenAI API key.
+// - The final AgentResult.content comes from the stable SSE event's payload
+//   (forwarded to get_state on the mock server), NOT from the LLM response.
+
+use mockito::Server;
 use serde_json::json;
 use evo_agent::agent::runner::{AgentConfig, AgentRunner};
 use evo_agent::api::evorule_client::EvoruleApiClient;
+use evo_agent::io_handlers::LlmHandler;
 
 #[tokio::test]
 async fn test_auto_recall_with_mock_server() {
@@ -69,7 +81,8 @@ async fn test_auto_recall_with_mock_server() {
 
     let client = EvoruleApiClient::new(&server_url);
     let config = AgentConfig::default();
-    let mut runner = AgentRunner::new(config, client);
+    let mut runner = AgentRunner::new(config, client)
+        .with_llm_handler(LlmHandler::mock("Mock LLM response"));
 
     let result = runner.run("Summarize research notes").await;
 
@@ -182,7 +195,8 @@ async fn test_auto_recall_no_shared_facts() {
 
     let client = EvoruleApiClient::new(&server_url);
     let config = AgentConfig::default();
-    let mut runner = AgentRunner::new(config, client);
+    let mut runner = AgentRunner::new(config, client)
+        .with_llm_handler(LlmHandler::mock("Mock LLM response"));
 
     let result = runner.run("Simple task").await;
 
@@ -254,7 +268,8 @@ async fn test_full_workflow_with_all_features() {
     config.system_prompt = "Safety first assistant".to_string();
     config.tool_names = vec!["safety_check".to_string()];
 
-    let mut runner = AgentRunner::new(config, client);
+    let mut runner = AgentRunner::new(config, client)
+        .with_llm_handler(LlmHandler::mock("Mock LLM response"));
 
     let result = runner.run("Analyze safety protocols").await;
 

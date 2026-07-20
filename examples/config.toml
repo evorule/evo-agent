@@ -1,0 +1,35 @@
+# evo-agent 示例配置
+#
+# 复制到 ./evo-agent.toml(项目级)或
+# ~/.config/evo-agent/config.toml(用户级)
+# 然后按需修改。
+
+[llm]
+# provider: minimax | deepseek | openai
+provider = "minimax"
+# api_key 支持 ${ENV:VAR_NAME} 占位符,加载时展开为环境变量值
+api_key = "${ENV:MINIMAX_API_KEY}"
+model = "MiniMax-M2.5"
+api_base = "https://api.minimax.io/v1/text/chatcompletion_v2"
+timeout_secs = 60
+max_retries = 3
+
+[evorule]
+# evorule HTTP 服务地址
+base_url = "http://localhost:8080"
+# evorule API key(留空 = evorule 本身无鉴权)
+api_key = ""
+timeout_secs = 30
+
+[logging]
+# trace | debug | info | warn | error
+level = "info"
+# json | pretty
+format = "pretty"
+
+[agents]
+# AgentDefinition 文件目录
+# 启动时扫描 <dir>/*.json
+dir = "./agents"
+# 不指定 --agent 时使用的 agent
+default = "general"

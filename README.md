@@ -4,7 +4,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.74%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.1.0-green.svg)](Cargo.toml)
 
 ---
 
@@ -117,6 +117,117 @@ curl -X POST http://127.0.0.1:18081/api/agent/run \
 ```bash
 curl http://127.0.0.1:18081/api/agent/list
 ```
+
+---
+
+## CLI 用法
+
+evo-agent 自带一个独立 CLI,适合**单次跑任务**或**人工审计工具安全模型**。先 build:
+
+```bash
+cargo build --release --bin evo-agent
+# 或在 D:\evo-agent\ 下:
+#   target\release\evo-agent.exe
+```
+
+### 5 个子命令
+
+```text
+evo-agent run <goal>           # 跑 agent(给一个 goal + 可选 agent 类型)
+evo-agent list                  # 列出 agents/ 目录下的所有 agent
+evo-agent tools list            # 列出 6 个工具(active/candidate/blocked 3 层)
+evo-agent tools show <name>     # 显示单个工具的 active/candidate/blocked 详情
+evo-agent validate <agent>      # 校验 agent.json 是否合法
+evo-agent config                # 显示合并后的配置(default + user + project + env)
+```
+
+### 示例:跑一个 agent
+
+```bash
+# 准备 agent.json
+mkdir -p agents
+cat > agents/researcher.json <<'JSON'
+{
+  "agent_type": "researcher",
+  "version": "0.1.0",
+  "description": "Research agent",
+  "system_prompt": "You are a careful research assistant.",
+  "model": "MiniMax-M2.5",
+  "temperature": 0.3,
+  "max_steps": 20,
+  "step_timeout_secs": 60,
+  "tools": ["file_read", "search_files"]
+}
+JSON
+
+# 跑
+MINIMAX_API_KEY=sk-... \
+  ./target/release/evo-agent run "总结一下 README" -a researcher
+```
+
+> **5 原则落地**(详见 [`DESIGN_PRINCIPLES.md`](DESIGN_PRINCIPLES.md)):
+> - **透明**:`config` 输出完整合并后配置;`tools list/show` 把 active/candidate/blocked 全列出来
+> - **可选**:用户能选 active(白名单)/candidate(待批)/blocked(永不)三档
+> - **可控**:candidate 工具默认拒绝;带 `--auto-approve-candidates` 才放行
+> - **可回放**:每次 run 输出结构化 JSON 结果,后续 0.2.0 接 evorule fact log
+> - **可审计**:`run` 结果(成功/失败/步骤数/工具调用列表)是 JSON,适合归档
+
+### 示例:看 3 层安全模型
+
+```bash
+$ evo-agent tools list
+=== 6 Built-in Tools (3-layer security model) ===
+
+[ACTIVE] 直接执行(无需请示):
+  - file_read
+  - file_list
+  - file_write
+  - search_files
+  - shell_exec
+  - http_get
+
+[CANDIDATE] 备选(LLM 想用 → 摊开 proposal 给你看 → 你批 → 再执行):
+  - rm — 删除文件或目录 (risk: 误删不可逆;rm -rf 没有提示)
+  - mv — 移动/重命名文件 (risk: 覆盖现有文件无提示;...)
+  ...
+
+[BLOCKED] 永不批准(逃逸出口 / 不可逆破坏):
+  - sudo — 权限提升 — 跨安全边界
+  - python — Turing-complete — 任何操作都可做
+  - bash — shell 逃逸 — 绕过白名单
+  ...
+```
+
+### `run` 完整参数
+
+```text
+Usage: evo-agent run [OPTIONS] <GOAL>
+
+Arguments:
+  <GOAL>    任务描述(给 agent 的指令)
+
+Options:
+  -a, --agent <AGENT>              agent 类型名(默认 config.agents.default)
+      --auto-approve-candidates    自动批准 candidate 工具(0.1.0 默认拒绝,带此 flag 则放行)
+  -v, --verbose                    详细输出(debug logging)
+      --workdir <WORKDIR>          工作目录(默认当前目录)
+  -h, --help                       Print help
+```
+
+### Windows PowerShell 注意
+
+PowerShell 5.1 用 `''` 单引号传 JSON 会吃掉 `"`,所以 CLI 的 payload 参数用 `--payload-file` 而不是 inline:
+
+```powershell
+# ❌ 不行(单引号会吃掉 ")
+evo-agent run '{\"x\":10}'
+
+# ✅ 用文件
+'{"x":10}' | Set-Content -Encoding utf8 payload.json
+evo-agent run --payload-file payload.json ...
+```
+
+> **0.1.0 状态**:`run` 命令已能跑通 agent 桥接(可跑全栈:`Config::load` → `default_safe_toolkit` → `AgentRunner::from_definition`),但**真实 LLM 调用 + SSE 事件循环**还在等 evorule-server 端到端测试。`list` / `tools list` / `tools show` / `config` / `validate` 5 个命令**完全可用**。
 
 ---
 
@@ -318,24 +429,42 @@ cargo test --test integration_test
 
 ## 已知限制 & 路线图
 
-### v1.0 限制
+### v0.1.0 状态(2026-07-20)
 
-- ⚠️ **LLM Handler 是 stub**(返回 `"Simulated LLM response"`)
-- ⚠️ **Tool Handler 是 stub**(返回 `"Tool execution result: ..."`)
-- ⚠️ **0 errors / 124 warnings**(主要是 `missing_docs`,`cargo fix --lib` 可一键补)
-- ⚠️ **LICENSE 文件待写**(战略:AGPL-3.0)
+**已完成 ✅:**
+
+- ✅ **LLM Handler 真实集成**(reqwest 调用 OpenAI 兼容 API,支持 minimax / DeepSeek / OpenAI)
+- ✅ **6 个内置工具**:`file_read` / `file_list` / `file_write` / `search_files` / `shell_exec` / `http_get`
+- ✅ **3 层安全模型**:active(8 shell 命令 + 6 http 主机) / candidate(20 shell + 任意公开 host) / blocked(28 shell + SSRF 黑名单)
+- ✅ **propose 协议**:candidate 工具返回 `{status: "needs_approval", description, risk, alternative}`
+- ✅ **SSRF 防护**:硬编码 IP 段黑名单(127/8, 10/8, 172.16/12, 192.168/16, 169.254/16)
+- ✅ **工作目录沙箱**:file_* / search_files 拒绝绝对路径 + `..` + symlink 逃逸
+- ✅ **P0 #1 Bridge**:`AgentRunner::from_definition` 把 agent.json + 6 工具 → 可跑 Runner
+- ✅ **P0 #2 CLI**:`run` / `list` / `tools list` / `tools show` / `validate` / `config` 6 个子命令
+- ✅ **P0 #3 Config**:4 子结构 + 3 层加载 + `${ENV:VAR}` 占位符
+- ✅ **AGPL-3.0 + CC0-1.0** 双协议(代码 + core_eval.json)
+- ✅ **158/158 unit tests** pass
+
+**已知限制 ⚠️:**
+
+- ⚠️ **168 warnings**(主要是 pre-existing `missing_docs`,不影响运行,`cargo fix --lib` 可一键补)
+- ⚠️ **3 pre-existing integration tests fail**(缺 LLM mock,跟踪到 0.2.0)
+- ⚠️ **17 文件中文注释乱码**(PowerShell 5.1 GBK 误读,跟踪到 0.2.0 重写)
+- ⚠️ **runner.run 遇到 candidate 工具 proposal 会 error out**(0.1.0:未实现 propose 暂停;0.2.0:加 `auto_approve` 路径 + fact log)
+- ⚠️ **CLI `run` 命令需要 evorule-server 在线**(桥接通,需要 server 跑起来才能完整跑通)
 
 ### 路线图
 
 | 阶段 | 目标 | 预计 |
 |---|---|---|
-| v1.0.1 | LLM 真实集成(OpenAI 兼容协议) | 1-2 天 |
-| v1.0.1 | Tool 真实集成(至少 1 个示例) | 1 天 |
-| v1.0.1 | 124 warnings 清零 | 30 分钟 |
-| v1.0.1 | LICENSE / README / 1 个 example | 1 天 |
-| v1.1 | Agent 流式输出(SSE) | 1 周 |
-| v1.1 | Tool 调用错误重试 / 退避 | 3 天 |
-| v1.2 | 嵌套 Agent 之间的 Fact 链可视化 | 2 周 |
+| v0.2.0 | runner.run 处理 candidate 工具 proposal(暂停 → user 批 → 再执行) | 1 周 |
+| v0.2.0 | 168 warnings 清零(补 `///` doc) | 2 天 |
+| v0.2.0 | 17 文件中文注释重写(走 [System.IO.File]::WriteAllText,UTF-8 no BOM) | 1 天 |
+| v0.2.0 | 3 integration test mock LLM(用 wiremock-rs 替换真实 HTTP) | 1 周 |
+| v0.2.0 | Gitee push(0.1.0 → 0.2.0 后) | TBD |
+| v0.3.0 | time-travel-debugger 应用层接入(用 evorule fact log 做 replay/diff/rewind) | 3 周 |
+| v0.4.0 | audit-inspector(blake3 哈希链验证 UI) | 2 周 |
+| v0.5.0 | live-monitor(实时 fact 流) | 2 周 |
 
 ---
 
