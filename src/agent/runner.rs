@@ -18,7 +18,7 @@ use tier0_tcb::JsonValue;
 use tracing::info;
 
 use crate::agent::delegate::DelegateContext;
-use crate::agent::memory::MemoryManager;
+use crate::agent::memory::{MemoryManager, MessagePersistMode};
 use crate::agent::definition::AgentDefinition;
 use crate::agent::translator::{LlmResponse, Message};
 use crate::api::evorule_client::{EvoruleApiClient, EvoruleApiError};
@@ -173,6 +173,20 @@ pub struct AgentRunner {
     delegate_context: Option<DelegateContext>,
     session_id: Option<String>,
     join_cluster_id: Option<String>,
+    /// 消息持久化模式（用户决策 2：可选开关）
+    ///
+    /// 控制 messages 何时写入 evorule payload。默认 `EveryMessage`。
+    /// 由 `AgentDefinition.memory.message_persist` 配置解析而来。
+    message_persist_mode: MessagePersistMode,
+    /// 待刷写的消息缓冲区（用于 `EveryN` / `PerReactRound` 模式）
+    ///
+    /// 元组 `(idx, Message)` 中 idx 是消息在 `messages` 数组中的索引，
+    /// 也是 evorule payload path 的最后一段（`messages.{idx}`）。
+    pending_messages: Vec<(usize, Message)>,
+    /// 摘要模型名称（用户决策 3：单独配置 summary_model）
+    ///
+    /// P4 阶段用于记忆压缩。P0+P1 阶段仅存储不使用。
+    summary_model: Option<String>,
 }
 
 impl AgentRunner {
@@ -187,6 +201,9 @@ impl AgentRunner {
             delegate_context: None,
             session_id: None,
             join_cluster_id: None,
+            message_persist_mode: MessagePersistMode::default(),
+            pending_messages: Vec::new(),
+            summary_model: None,
         }
     }
 
@@ -269,10 +286,17 @@ impl AgentRunner {
                 )));
             }
             let mut mem = MemoryManager::new(&def.memory.namespace, client.clone());
+            // 用户决策 5：TTL 配置传递给 MemoryManager
+            if let Some(ttl) = def.memory.ttl_secs {
+                mem = mem.with_ttl_secs(ttl);
+            }
             // 同步:从 evorule 把 namespace 下的 facts 拉下来
             mem.sync_from_evorule().await?;
             Some(mem)
         };
+
+        // 用户决策 2：解析 message_persist 配置为 MessagePersistMode
+        let persist_mode = def.memory.message_persist.to_mode().map_err(AgentError::Internal)?;
 
         // 4. LLM handler(默认从 env 读)
         let llm = llm_handler.unwrap_or_else(LlmHandler::with_defaults);
@@ -280,9 +304,14 @@ impl AgentRunner {
         // 5. 组装
         let mut runner = Self::new(config, client)
             .with_llm_handler(llm)
-            .with_tool_handler(tool_handler);
+            .with_tool_handler(tool_handler)
+            .with_message_persist_mode(persist_mode);
         if let Some(mem) = memory {
             runner = runner.with_memory(mem);
+        }
+        // 用户决策 3：summary_model 单独配置
+        if let Some(sm) = def.memory.summary_model {
+            runner = runner.with_summary_model(&sm);
         }
         Ok(runner)
     }
@@ -316,6 +345,83 @@ impl AgentRunner {
     pub fn with_join_cluster(mut self, cluster_id: &str) -> Self {
         self.join_cluster_id = Some(cluster_id.to_string());
         self
+    }
+
+    /// 设置消息持久化模式（用户决策 2：可选开关）
+    ///
+    /// 由 `from_definition` 自动从 `agent.json` 解析，通常不需要手动调用。
+    pub fn with_message_persist_mode(mut self, mode: MessagePersistMode) -> Self {
+        self.message_persist_mode = mode;
+        self
+    }
+
+    /// 设置摘要模型（用户决策 3：单独配置 summary_model）
+    ///
+    /// P4 阶段用于记忆压缩。P0+P1 阶段仅存储不使用。
+    pub fn with_summary_model(mut self, model: &str) -> Self {
+        self.summary_model = Some(model.to_string());
+        self
+    }
+
+    /// 持久化单条消息（按 `message_persist_mode` 决定立即写或缓冲）
+    ///
+    /// 在 `messages.push(...)` 之后调用。行为：
+    /// - `EveryMessage`: 立即调用 `memory.append_message()` 写入 evorule
+    /// - `EveryN(n)`: 加入 `pending_messages` 缓冲，达到 n 条时自动 flush
+    /// - `PerReactRound`: 加入缓冲，等 IoRequest 处理前由 `flush_messages` 刷写
+    /// - `Disabled`: 不做任何事
+    ///
+    /// 如果 `memory` 为 `None`（agent.json 配置 `memory.type = "none"`），
+    /// 此方法是 no-op。
+    async fn persist_message(
+        &mut self,
+        session_id: &str,
+        idx: usize,
+        message: Message,
+    ) -> Result<(), AgentError> {
+        if self.message_persist_mode.is_disabled() || self.memory.is_none() {
+            return Ok(());
+        }
+        match self.message_persist_mode {
+            MessagePersistMode::EveryMessage => {
+                if let Some(memory) = self.memory.as_mut() {
+                    memory.append_message(session_id, idx, &message).await?;
+                }
+                Ok(())
+            }
+            MessagePersistMode::EveryN(n) => {
+                self.pending_messages.push((idx, message));
+                if self.pending_messages.len() >= n {
+                    self.flush_messages(session_id).await?;
+                }
+                Ok(())
+            }
+            MessagePersistMode::PerReactRound => {
+                self.pending_messages.push((idx, message));
+                Ok(())
+            }
+            MessagePersistMode::Disabled => Ok(()),
+        }
+    }
+
+    /// 刷写所有缓冲的消息到 evorule payload
+    ///
+    /// 在以下场景被调用：
+    /// - `EveryN` 模式达到阈值时（`persist_message` 内部触发）
+    /// - `PerReactRound` 模式下 IoRequest 处理前（`run()` 显式调用）
+    /// - `run()` 结束前（确保所有缓冲消息都写入）
+    ///
+    /// 如果没有缓冲消息或 `memory` 为 `None`，此方法是 no-op。
+    async fn flush_messages(&mut self, session_id: &str) -> Result<(), AgentError> {
+        if self.pending_messages.is_empty() || self.memory.is_none() {
+            return Ok(());
+        }
+        let drained: Vec<(usize, Message)> = self.pending_messages.drain(..).collect();
+        if let Some(memory) = self.memory.as_mut() {
+            // &Vec<T> 自动 coercion 为 &[T]
+            memory.append_messages_batch(session_id, &drained).await?;
+        }
+        Ok(())
     }
 
     /// TODO: doc
@@ -352,9 +458,14 @@ impl AgentRunner {
         let mut messages: Vec<Message> = Vec::new();
 
         if !system_prompt.is_empty() {
-            messages.push(Message::System { content: system_prompt });
+            messages.push(Message::System { content: system_prompt.clone() });
+            // P0: 持久化 system 消息（idx = 0）
+            self.persist_message(&session_id, 0, Message::System { content: system_prompt }).await?;
         }
+        let user_idx = messages.len();
         messages.push(Message::User { content: goal.to_string() });
+        // P0: 持久化 user 消息
+        self.persist_message(&session_id, user_idx, Message::User { content: goal.to_string() }).await?;
 
         info!(%session_id, "Starting SSE event loop");
         while let Some(event) = event_stream.next().await {
@@ -371,8 +482,13 @@ impl AgentRunner {
                         ));
                     }
 
+                    // PerReactRound 模式：IoRequest 处理前刷写上一轮缓冲的消息
+                    if matches!(self.message_persist_mode, MessagePersistMode::PerReactRound) {
+                        self.flush_messages(&session_id).await?;
+                    }
+
                     info!(%session_id, step = step_count, "Received IoRequest event");
-                    let result = self.handle_io_request(&event.payload, &mut messages, &mut tool_calls).await?;
+                    let result = self.handle_io_request(&session_id, &event.payload, &mut messages, &mut tool_calls).await?;
 
                     if let Some(request_id) = event.payload.get("id").and_then(|v| v.as_u64()) {
                         self.evorule_client
@@ -383,6 +499,8 @@ impl AgentRunner {
                 }
                 "Stable" => {
                     let duration = start_time.elapsed().as_millis() as u64;
+                    // 确保所有缓冲的消息都写入 evorule（EveryN/PerReactRound 模式）
+                    self.flush_messages(&session_id).await?;
                     let state = self.evorule_client.get_state(&session_id).await?;
                     // payload 结构取决于 evorule 规则如何存储 io_response 结果。
                     // 默认规则将 call_external 的 io_response result 存储在
@@ -412,6 +530,8 @@ impl AgentRunner {
                         continue;
                     }
 
+                    // 错误返回前尝试刷写缓冲消息（best-effort，忽略 flush 错误）
+                    let _ = self.flush_messages(&session_id).await;
                     return Ok(AgentResult::error(error_msg.to_string(), step_count, duration));
                 }
                 _ => {
@@ -422,6 +542,8 @@ impl AgentRunner {
 
         let duration = start_time.elapsed().as_millis() as u64;
         info!(%session_id, step_count, duration_ms = duration, "SSE event loop ended (stream closed)");
+        // 流关闭前也尝试刷写
+        let _ = self.flush_messages(&session_id).await;
         Ok(AgentResult::error("Event stream closed".to_string(), step_count, duration))
     }
 
@@ -439,7 +561,8 @@ impl AgentRunner {
     }
 
     async fn handle_io_request(
-        &self,
+        &mut self,
+        session_id: &str,
         payload: &Value,
         messages: &mut Vec<Message>,
         tool_calls: &mut Vec<String>,
@@ -452,13 +575,18 @@ impl AgentRunner {
         let params = payload.get("params").cloned().unwrap_or(Value::Null);
 
         match io_type {
-            "call_external" => self.handle_call_external(&params, messages).await,
-            "call_service" => self.handle_call_service(&params, messages, tool_calls).await,
+            "call_external" => self.handle_call_external(session_id, &params, messages).await,
+            "call_service" => self.handle_call_service(session_id, &params, messages, tool_calls).await,
             _ => Err(AgentError::Internal(format!("unsupported io_type: {}", io_type))),
         }
     }
 
-    async fn handle_call_external(&self, params: &Value, messages: &mut Vec<Message>) -> Result<Value, AgentError> {
+    async fn handle_call_external(
+        &mut self,
+        session_id: &str,
+        params: &Value,
+        messages: &mut Vec<Message>,
+    ) -> Result<Value, AgentError> {
         let model = params.get("model").and_then(|v| v.as_str()).unwrap_or(&self.config.model);
         let temperature = params.get("temperature").and_then(|v| v.as_f64()).unwrap_or(self.config.temperature as f64);
 
@@ -476,10 +604,14 @@ impl AgentRunner {
         let llm_response: LlmResponse = serde_json::from_str(&llm_result.to_string())
             .map_err(|e| AgentError::Internal(format!("parse LLM response: {}", e)))?;
 
-        messages.push(Message::Assistant {
+        let assistant_idx = messages.len();
+        let assistant_msg = Message::Assistant {
             content: llm_response.content.clone(),
             tool_calls: llm_response.tool_calls.clone(),
-        });
+        };
+        messages.push(assistant_msg.clone());
+        // P0: 持久化 assistant 消息
+        self.persist_message(session_id, assistant_idx, assistant_msg).await?;
 
         Ok(serde_json::json!({
             "content": llm_response.content,
@@ -489,7 +621,8 @@ impl AgentRunner {
     }
 
     async fn handle_call_service(
-        &self,
+        &mut self,
+        session_id: &str,
         params: &Value,
         messages: &mut Vec<Message>,
         tool_calls: &mut Vec<String>,
@@ -508,10 +641,14 @@ impl AgentRunner {
         let tool_result = self.execute_external("call_service", &JsonValue::Object(call_params)).await?;
 
         tool_calls.push(tool_name.to_string());
-        messages.push(Message::Tool {
+        let tool_idx = messages.len();
+        let tool_msg = Message::Tool {
             content: tool_result.to_string(),
             tool_name: tool_name.to_string(),
-        });
+        };
+        messages.push(tool_msg.clone());
+        // P0: 持久化 tool 消息
+        self.persist_message(session_id, tool_idx, tool_msg).await?;
 
         Ok(serde_json::json!({
             "tool_name": tool_name,
