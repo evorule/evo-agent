@@ -6,8 +6,8 @@ description = "Evo-Agent - AI Agent orchestration layer using evorule HTTP API"
 license = "AGPL-3.0"
 
 [dependencies]
-tier0-tcb = { path = "../evorule/tier0-tcb" }
-tier1-reactor = { path = "../evorule/tier1-reactor" }
+evorule-tcb = { path = "../evorule/evorule-tcb", version = "0.3.1" }
+evorule-reactor = { path = "../evorule/evorule-reactor", version = "0.3.1" }
 
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -15,10 +15,17 @@ tokio = { version = "1", features = [
     "sync",
     "fs",
     "time",
+    "signal",
+    # G12:MCP stdio 传输 —— spawn 子进程 + 读写 stdin/stdout
+    "process",
+    "io-util",
 ] }
 async-stream = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"
+
+# G6: CancellationToken — 外部可触发的取消信号(run/select!/Ctrl+C/HTTP cancel)
+tokio-util = { version = "0.7", features = ["rt"] }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -30,7 +37,17 @@ bytes = "1"
 
 blake3 = "1"
 
-axum = "0.8"
+# G3: LLM 重试退避抖动所需
+rand = "0.8"
+
+# G7: 恒定时间比较(防时序攻击)
+subtle = "2"
+
+# G11: JSON Schema 校验(结构化输出)
+jsonschema = "0.18"
+
+# G16:WebSocket 双向流 —— 需要 axum 的 ws feature
+axum = { version = "0.8", features = ["ws"] }
 http = "1"
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
@@ -47,6 +64,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # Config loading
 toml = "0.8"
 
+# G15: REPL 行编辑(跨平台,支持 Windows)
+rustyline = "14"
+
 [dependencies.serde_with]
 version = "3"
 features = ["json"]
@@ -55,3 +75,5 @@ features = ["json"]
 tempfile = "3"
 mockito = "1"
 tokio-test = "0.4"
+# G16:WebSocket 单元测试客户端
+tokio-tungstenite = "0.24"

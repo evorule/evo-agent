@@ -4,7 +4,7 @@
 //! Agent memory manager -- manages memory via evorule payload API
 //!
 //! # Namespace convention (three-layer, P1 分层设计)
-//! - shared memory:  `__memory__.agent_{type}.shared.{key}`
+//! - shared memory:  `shared.{ns}.{key}`
 //! - session memory: `__memory__.agent_{type}.session_{session_id}.{key}`
 //! - short-term messages: `__memory__.agent_{type}.session_{session_id}.messages.{idx}`
 //! - session summary:    `__memory__.agent_{type}.session_{session_id}.summary`
@@ -18,8 +18,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::evorule_client::EvoruleApiClient;
+use crate::agent::memory_event::evidence::{BatchVerifyReport, MemoryEvidence};
 use crate::agent::translator::Message;
+use crate::api::evorule_client::EvoruleApiClient;
 
 /// 内存操作错误
 #[derive(Debug)]
@@ -65,8 +66,8 @@ impl From<serde_json::Error> for MemoryError {
     }
 }
 
-impl From<crate::api::evorule_client::EvoruleApiError> for MemoryError {
-    fn from(e: crate::api::evorule_client::EvoruleApiError) -> Self {
+impl From<crate::api::api_core::ApiError> for MemoryError {
+    fn from(e: crate::api::api_core::ApiError) -> Self {
         MemoryError::EvoruleError(e.to_string())
     }
 }
@@ -79,7 +80,7 @@ impl From<crate::api::evorule_client::EvoruleApiError> for MemoryError {
 /// - `Messages` 短期对话历史（按 idx 索引）
 #[derive(Debug, Clone)]
 pub enum MemoryScope {
-    /// 跨会话共享：`__memory__.agent_{ns}.shared.{key}`
+    /// 跨会话共享：`shared.{ns}.{key}`
     Shared,
     /// 会话级：`__memory__.agent_{ns}.session_{sid}.{key}`
     Session(String),
@@ -101,8 +102,10 @@ impl MemoryScope {
 ///
 /// 控制 `AgentRunner` 何时把 messages 写入 evorule payload。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum MessagePersistMode {
     /// 每条消息立即写入（默认，最安全）
+    #[default]
     EveryMessage,
     /// 每 N 条消息批量写入（性能优先）
     EveryN(usize),
@@ -112,16 +115,14 @@ pub enum MessagePersistMode {
     Disabled,
 }
 
-impl Default for MessagePersistMode {
-    fn default() -> Self {
-        MessagePersistMode::EveryMessage
-    }
-}
 
 impl MessagePersistMode {
     /// 是否需要缓冲
     pub fn needs_buffer(&self) -> bool {
-        matches!(self, MessagePersistMode::EveryN(_) | MessagePersistMode::PerReactRound)
+        matches!(
+            self,
+            MessagePersistMode::EveryN(_) | MessagePersistMode::PerReactRound
+        )
     }
 
     /// 是否完全禁用持久化
@@ -148,6 +149,16 @@ pub struct MemoryRecord {
     /// 标签（可选）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// 投影来源的 evorule FactId（B4 证据链使用；旧数据反序列化时缺省）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact_id: Option<u64>,
+    /// 因果锚点（B4 证据链使用）：事件记录指向的源 FactId（KV/根事件为 None）。
+    /// 来自 C1 事件投影（07d D-C1-3）；与 `fact_id`（身份锚点）共同支撑"三段式证明"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause_fact_id: Option<u64>,
+    /// 证据（B4 记忆证据伴随，07c 定义）。**存储时恒 None**，仅展示/审计时按需填充（attach_evidence）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::agent::memory_event::evidence::MemoryEvidence>,
 }
 
 impl MemoryRecord {
@@ -160,7 +171,134 @@ impl MemoryRecord {
             source: None,
             confidence: None,
             tags: Vec::new(),
+            fact_id: None,
+            cause_fact_id: None,
+            evidence: None,
         }
+    }
+}
+
+/// C2: 召回上下文（三层召回结果）
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct RecallContext {
+    /// L2 稳定事实（硬注入，紧凑）
+    pub stable: Vec<MemoryRecord>,
+    /// L1 会话摘要（按时间倒序，取最近 N）
+    pub summaries: Vec<MemoryRecord>,
+    /// L2 事件投影（按相关度 top-K）
+    pub events: Vec<MemoryRecord>,
+}
+
+/// C3: 记忆预算控制器
+#[derive(Debug, Clone)]
+pub struct ContextBudget {
+    /// 总窗口 token
+    pub total_window: usize,
+    /// 记忆区占比（默认 0.25，clamp 0.1-0.5）
+    pub memory_budget_ratio: f32,
+}
+
+impl Default for ContextBudget {
+    fn default() -> Self {
+        Self {
+            total_window: 0,
+            memory_budget_ratio: 0.25,
+        }
+    }
+}
+
+impl ContextBudget {
+    pub fn new(total_window: usize, memory_budget_ratio: f32) -> Self {
+        Self {
+            total_window,
+            memory_budget_ratio: memory_budget_ratio.clamp(0.1, 0.5),
+        }
+    }
+
+    /// 记忆区硬上限
+    pub fn memory_cap(&self) -> usize {
+        (self.total_window as f32 * self.memory_budget_ratio) as usize
+    }
+
+    /// messages 区上限（ContextWindowManager 的 max_tokens 用它构造）
+    pub fn messages_max(&self) -> usize {
+        self.total_window.saturating_sub(self.memory_cap())
+    }
+
+    /// 简单 token 估算（4 chars ≈ 1 token）
+    fn estimate_tokens(text: &str) -> usize {
+        text.len() / 4
+    }
+
+    /// C3: 在 memory_cap 内组装记忆块；超限按降级顺序截断。
+    /// 降级顺序：L2 稳定事实 > L1 摘要 > L2 事件
+    pub fn fit_recall(&self, recall: &mut RecallContext) {
+        if self.total_window == 0 {
+            return; // 不限制
+        }
+        let budget = self.memory_cap();
+        let mut used = 0;
+
+        // L2 稳定事实优先（硬注入）
+        let cut_stable = recall
+            .stable
+            .iter()
+            .position(|r| {
+                used += Self::estimate_tokens(&r.value);
+                used > budget
+            })
+            .unwrap_or(recall.stable.len());
+        recall.stable.truncate(cut_stable);
+
+        if used > budget {
+            recall.summaries.clear();
+            recall.events.clear();
+            return;
+        }
+
+        // L1 摘要
+        let cut_summaries = recall
+            .summaries
+            .iter()
+            .position(|r| {
+                used += Self::estimate_tokens(&r.value);
+                used > budget
+            })
+            .unwrap_or(recall.summaries.len());
+        recall.summaries.truncate(cut_summaries);
+
+        if used > budget {
+            recall.events.clear();
+            return;
+        }
+
+        // L2 事件（最低优先级）
+        let cut_events = recall
+            .events
+            .iter()
+            .position(|r| {
+                used += Self::estimate_tokens(&r.value);
+                used > budget
+            })
+            .unwrap_or(recall.events.len());
+        recall.events.truncate(cut_events);
+    }
+
+    /// C3: 弹性预算 —— 记忆区未用满时，剩余还给 messages
+    pub fn elastic_messages_max(&self, recall: &RecallContext) -> usize {
+        if self.total_window == 0 {
+            return 0; // 不限制
+        }
+        let cap = self.memory_cap();
+        let used: usize = recall
+            .stable
+            .iter()
+            .chain(recall.summaries.iter())
+            .chain(recall.events.iter())
+            .map(|r| Self::estimate_tokens(&r.value))
+            .sum();
+        let unused = cap.saturating_sub(used);
+        self.messages_max() + unused
     }
 }
 
@@ -210,11 +348,16 @@ impl MessageRecord {
                 timestamp,
                 fact_id: None,
             },
-            Message::Assistant { content, tool_calls } => Self {
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => Self {
                 idx,
                 role: "assistant".to_string(),
                 content: content.clone(),
-                tool_calls: tool_calls.as_ref().map(|tc| serde_json::to_value(tc).ok()).flatten(),
+                tool_calls: tool_calls
+                    .as_ref()
+                    .and_then(|tc| serde_json::to_value(tc).ok()),
                 tool_name: None,
                 timestamp,
                 fact_id: None,
@@ -249,7 +392,8 @@ fn now_secs() -> u64 {
 #[derive(Clone)]
 pub struct MemoryManager {
     namespace: String,
-    evorule_client: EvoruleApiClient,
+    /// C4: pub(crate) 以便 sediment 模块直接读取共享账本做 rollup
+    pub(crate) evorule_client: EvoruleApiClient,
     session_id: Option<String>,
     cache: BTreeMap<String, MemoryRecord>,
     /// 记忆过期时间（秒，用户决策 5：TTL）
@@ -354,20 +498,23 @@ impl MemoryManager {
     /// 分层路径构建（P1 三层 namespace）
     ///
     /// 根据 scope 生成完整的 evorule payload 路径。
-    /// - `Shared`: `__memory__.{ns}.shared.{key}`
+    /// - `Shared`: `shared.{ns}.{key}`
     /// - `Session(sid)`: `__memory__.{ns}.session_{sid}.{key}`
     /// - `Messages(sid, idx)`: `__memory__.{ns}.session_{sid}.messages.{idx}`（忽略 key，idx 即 key）
     pub fn build_path_scoped(&self, scope: &MemoryScope, key: &str) -> String {
         match scope {
             MemoryScope::Shared => {
-                format!("__memory__.{}.shared.{}", self.namespace, key)
+                format!("shared.{}.{}", self.namespace, key)
             }
             MemoryScope::Session(sid) => {
                 format!("__memory__.{}.session_{}.{}", self.namespace, sid, key)
             }
             MemoryScope::Messages(sid, idx) => {
                 // Messages scope 中 idx 即 key，忽略传入的 key 参数
-                format!("__memory__.{}.session_{}.messages.{}", self.namespace, sid, idx)
+                format!(
+                    "__memory__.{}.session_{}.messages.{}",
+                    self.namespace, sid, idx
+                )
             }
         }
     }
@@ -419,15 +566,41 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// C1:写入共享空间会话摘要
+    ///
+    /// 把整会话摘要写入共享空间（跨会话可见），供后续会话召回。
+    /// 内部调用 `set_scoped(Shared, key, summary)`，路径为
+    /// `shared.{ns}.sessions.{sid}.summary`。
+    ///
+    /// # 参数
+    ///
+    /// - `session_id`:会话 ID
+    /// - `summary`:摘要文本
+    ///
+    /// # 返回值
+    ///
+    /// - `Ok(None)`:`set_scoped` 是 best-effort 持久化，不返回 fact_id
+    /// - `Err(e)`:键校验失败（空键/超长）或 session 未设置
+    pub async fn write_shared_summary(
+        &mut self,
+        session_id: &str,
+        summary: &str,
+    ) -> Result<Option<u64>, MemoryError> {
+        let key = format!("sessions.{}.summary", session_id);
+        self.set_scoped(MemoryScope::Shared, &key, summary).await?;
+        Ok(None)
+    }
+
     /// 旧版 get（向后兼容，默认 Session scope）
     pub async fn get(&mut self, key: &str) -> Result<Option<MemoryRecord>, MemoryError> {
         let scope = MemoryScope::session_from_opt(&self.session_id)?;
         self.get_scoped(scope, key).await
     }
 
-    /// 分层 get（P1）
+    /// 分层 get（P1）— B1 修正版
     ///
-    /// 如果配置了 TTL 且 cache 中的记录已过期，会惰性移除并返回 `None`。
+    /// cache 优先（性能）；cache miss 时从 evorule 投影拉取**最新版本**并回填 cache。
+    /// fail-open（D-B1-5）：投影失败视为"无记忆" Ok(None)，不阻断 agent。
     pub async fn get_scoped(
         &mut self,
         scope: MemoryScope,
@@ -443,25 +616,102 @@ impl MemoryManager {
             return Ok(Some(record.clone()));
         }
 
-        let session_id = self.session_id_for_scope(&scope)?;
-        let path = self.build_path_scoped(&scope, key);
-        match self.evorule_client.get_facts(&session_id, Some(&path)).await {
-            Ok(facts) => {
-                for fact in facts {
-                    if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
-                        // 从 evorule 拉取的记录也要检查 TTL
-                        if self.is_expired(&record) {
-                            continue;
-                        }
-                        self.cache.insert(cache_key.clone(), record.clone());
-                        return Ok(Some(record));
-                    }
-                }
+        // 投影真相源兜底：修复后能正确拉取并取最新版本
+        match self.project_scoped(&scope, key).await {
+            Ok(Some(record)) => {
+                // 回填 cache 加速后续读取
+                self.cache.insert(cache_key, record.clone());
+                Ok(Some(record))
             }
-            Err(_) => {}
+            _ => Ok(None), // fail-open：读取/解析失败视为无记忆（D-B1-5）
+        }
+    }
+
+    /// 投影读取（B1 新增）：从 evorule Fact 流投影指定 path 的**最新** PayloadUpdate 值。
+    ///
+    /// 返回值携带源 FactId（`MemoryRecord.fact_id`），供证据链使用。
+    /// 这是"审计即记忆"的权威读取路径：真相在 evorule，非 cache。
+    /// fail-open（D-B1-5）：get_facts 失败或 value 非 MemoryRecord 均返回 Ok(None)；
+    /// 仅 `session_id_for_scope` 的 SessionNotSet（不变量违例）传播。
+    pub async fn project_scoped(
+        &self,
+        scope: &MemoryScope,
+        key: &str,
+    ) -> Result<Option<MemoryRecord>, MemoryError> {
+        let session_id = self.session_id_for_scope(scope)?;
+        let path = self.build_path_scoped(scope, key);
+        let Ok(facts) = self
+            .evorule_client
+            .get_facts(&session_id, Some(&path))
+            .await
+        else {
+            return Ok(None); // fail-open
+        };
+
+        // facts_by_path_prefix 按版本升序返回 → 最后一个即最新版本
+        let Some(fact) = facts.last() else {
+            return Ok(None);
+        };
+
+        // value 非 MemoryRecord → 该 key 非本 agent 记忆（fail-open，不阻断）
+        let Ok(mut record) = serde_json::from_value::<MemoryRecord>(fact.value.clone()) else {
+            return Ok(None);
+        };
+        // 携带源 FactId（若 value 内未覆盖）
+        if fact.id != 0 {
+            record.fact_id.get_or_insert(fact.id);
+        }
+        // TTL 检查
+        if self.is_expired(&record) {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
+    /// 投影前缀扫描（B1 新增，B4/06 分层召回使用）：
+    /// 按 path 前缀返回最新版本记录集合。
+    pub async fn project_prefix(
+        &self,
+        scope: &MemoryScope,
+        prefix: &str,
+    ) -> Result<Vec<MemoryRecord>, MemoryError> {
+        // Messages 是短期消息，不做投影
+        if matches!(scope, MemoryScope::Messages(..)) {
+            return Ok(Vec::new());
+        }
+        let session_id = self.session_id_for_scope(scope)?;
+        // 复用 build_path_scoped（单一路径事实源，D-B1-6）：
+        // 前缀经同一函数产出前缀路径 → 07d0 契约统一只改 build_path_scoped，此处自动跟随。
+        let base = self.build_path_scoped(scope, prefix);
+        let Ok(facts) = self
+            .evorule_client
+            .get_facts(&session_id, Some(&base))
+            .await
+        else {
+            return Ok(Vec::new()); // fail-open（D-B1-5）
+        };
+
+        // 按 path 分组，每组取最新版本（后插入的覆盖旧的 = last-write-wins）
+        let mut latest_by_path: std::collections::BTreeMap<
+            String,
+            crate::api::evorule_client::FactEntry,
+        > = Default::default();
+        for fact in facts {
+            latest_by_path.insert(fact.path.clone(), fact);
         }
 
-        Ok(None)
+        let mut out = Vec::new();
+        for fact in latest_by_path.into_values() {
+            if let Ok(mut record) = serde_json::from_value::<MemoryRecord>(fact.value) {
+                if !self.is_expired(&record) {
+                    if fact.id != 0 {
+                        record.fact_id.get_or_insert(fact.id);
+                    }
+                    out.push(record);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// 旧版 remove（向后兼容，默认 Session scope）
@@ -510,15 +760,15 @@ impl MemoryManager {
     pub async fn sync_from_evorule(&mut self) -> Result<(), MemoryError> {
         if let Some(session_id) = &self.session_id {
             let prefix = format!("__memory__.{}", self.namespace);
-            match self.evorule_client.get_facts(session_id, Some(&prefix)).await {
-                Ok(facts) => {
-                    for fact in facts {
-                        if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
-                            self.cache.insert(record.key.clone(), record);
-                        }
+            if let Ok(facts) = self
+                .evorule_client
+                .get_facts(session_id, Some(&prefix))
+                .await {
+                for fact in facts {
+                    if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
+                        self.cache.insert(record.key.clone(), record);
                     }
                 }
-                Err(_) => {}
             }
         }
         Ok(())
@@ -588,6 +838,146 @@ impl MemoryManager {
         format!("{}\n\n{}", base_prompt, memory_lines.join("\n"))
     }
 
+    /// C2: 从共享账本做三层召回。
+    /// 依赖共享账本写入路径（07d0）就绪；否则返回空（fail-open，不报错）。
+    pub async fn recall_context(
+        &self,
+        goal: &str,
+        max_summaries: usize,
+        max_events: usize,
+    ) -> RecallContext {
+        let ns = &self.namespace;
+        let mut ctx = RecallContext::default();
+
+        // 1. stable: get_shared_facts(Some("shared.{ns}.stable."))
+        let stable_prefix = format!("shared.{}.stable.", ns);
+        if let Ok(facts) = self
+            .evorule_client
+            .get_shared_facts(Some(&stable_prefix))
+            .await
+        {
+            for fact in facts {
+                if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
+                    let mut record = record;
+                    record.fact_id = Some(fact.fact_id);
+                    ctx.stable.push(record);
+                }
+            }
+        }
+
+        // 2. summaries: get_shared_facts(Some("shared.{ns}.sessions."))
+        //    排除 sessions.rollup. 路径（C4 rollup 不占普通摘要名额）
+        let sessions_prefix = format!("shared.{}.sessions.", ns);
+        if let Ok(facts) = self
+            .evorule_client
+            .get_shared_facts(Some(&sessions_prefix))
+            .await
+        {
+            let mut summaries: Vec<MemoryRecord> = facts
+                .into_iter()
+                .filter(|f| !f.path.contains(".rollup."))
+                .filter_map(|f| {
+                    serde_json::from_value::<MemoryRecord>(f.value)
+                        .ok()
+                        .map(|mut r| {
+                            r.fact_id = Some(f.fact_id);
+                            r
+                        })
+                })
+                .collect();
+            // 时间倒序 → 取最近 max_summaries
+            summaries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            ctx.summaries = summaries.into_iter().take(max_summaries).collect();
+        }
+
+        // 3. events: get_shared_facts(Some("shared.{ns}.events."))
+        //    按 goal 关键词重叠分 + 时间倒序 → 取 max_events
+        let events_prefix = format!("shared.{}.events.", ns);
+        if let Ok(facts) = self
+            .evorule_client
+            .get_shared_facts(Some(&events_prefix))
+            .await
+        {
+            let mut events: Vec<(MemoryRecord, usize)> = facts
+                .into_iter()
+                .filter_map(|f| {
+                    serde_json::from_value::<MemoryRecord>(f.value)
+                        .ok()
+                        .map(|mut r| {
+                            r.fact_id = Some(f.fact_id);
+                            // 简单关键词重叠评分：goal 中的词在 value 中出现的次数
+                            let score = goal
+                                .split_whitespace()
+                                .filter(|kw| !kw.is_empty())
+                                .filter(|kw| r.value.to_lowercase().contains(&kw.to_lowercase()))
+                                .count();
+                            (r, score)
+                        })
+                })
+                .collect();
+            // 按 score 降序，同分按时间倒序
+            events.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.timestamp.cmp(&a.0.timestamp)));
+            ctx.events = events
+                .into_iter()
+                .take(max_events)
+                .map(|(r, _)| r)
+                .collect();
+        }
+
+        ctx
+    }
+
+    /// C2（B4 调用入口 1）: 带证据的召回 = recall_context + attach_evidence。
+    pub async fn recall_context_with_evidence(
+        &self,
+        goal: &str,
+        max_summaries: usize,
+        max_events: usize,
+    ) -> Result<RecallContext, crate::agent::runner::AgentError> {
+        let mut ctx = self.recall_context(goal, max_summaries, max_events).await;
+        self.attach_evidence(&mut ctx.stable).await?;
+        self.attach_evidence(&mut ctx.events).await?;
+        Ok(ctx)
+    }
+
+    /// C2: 带召回的 system prompt 构建
+    /// 记忆区内容受 ContextBudget 约束（C3），超限按降级顺序截断。
+    pub fn build_system_prompt_with_recall(
+        &self,
+        base_prompt: &str,
+        recall: &RecallContext,
+        budget: &ContextBudget,
+    ) -> String {
+        // 预算截断
+        let mut recall = recall.clone();
+        budget.fit_recall(&mut recall);
+
+        let mut prompt = base_prompt.to_string();
+
+        if !recall.stable.is_empty() {
+            prompt.push_str("\n\n## Stable Facts\n");
+            for record in &recall.stable {
+                prompt.push_str(&format!("- {}: {}\n", record.key, record.value));
+            }
+        }
+
+        if !recall.summaries.is_empty() {
+            prompt.push_str("\n## Previous Sessions\n");
+            for record in &recall.summaries {
+                prompt.push_str(&format!("- {}\n", record.value));
+            }
+        }
+
+        if !recall.events.is_empty() {
+            prompt.push_str("\n## Relevant Events\n");
+            for record in &recall.events {
+                prompt.push_str(&format!("- {}: {}\n", record.key, record.value));
+            }
+        }
+
+        prompt
+    }
+
     /// 保存到本地文件（备份用，不常用）
     pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), MemoryError> {
         let content = serde_json::to_string_pretty(&self.cache)?;
@@ -642,6 +1032,205 @@ impl MemoryManager {
             MemoryScope::Session(sid) => Ok(sid.clone()),
             MemoryScope::Messages(sid, _) => Ok(sid.clone()),
         }
+    }
+
+    /// 获取 session_id（&str），未设置时返回 SessionNotSet
+    fn session_id_str(&self) -> Result<&str, MemoryError> {
+        self.session_id.as_deref().ok_or(MemoryError::SessionNotSet)
+    }
+
+    // ===== B4：记忆证据伴随 =====
+
+    /// B4：对某 KV 记忆出示证据
+    ///
+    /// 三段式证明：源 FactId + 整链 verify + 因果链（KV 无 cause，chain 为空）。
+    /// server 不可用时 fail-open：返回带 error 的证据（verified=false）。
+    pub async fn evidence_for(
+        &self,
+        scope: &MemoryScope,
+        key: &str,
+    ) -> Result<Option<MemoryEvidence>, MemoryError> {
+        // 1. project_scoped → record（含 fact_id）
+        let record = match self.project_scoped(scope, key).await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let fact_id = match record.fact_id {
+            Some(fid) if fid != 0 => fid,
+            _ => return Ok(None), // 无 fact_id，无法出示证据
+        };
+        let session_id = self.session_id_str()?.to_string();
+
+        let mut evidence = MemoryEvidence {
+            session_id: session_id.clone(),
+            fact_id,
+            path: Some(key.to_string()),
+            ..Default::default()
+        };
+
+        // 2. verify_audit_typed → 整链 verified
+        match self.evorule_client.verify_audit_typed(&session_id).await {
+            Ok(verify) => {
+                evidence.verified = verify.verified;
+                evidence.last_hash = verify.last_hash;
+            }
+            Err(e) => {
+                evidence.error = Some(format!("audit verify failed: {}", e));
+                return Ok(Some(evidence)); // fail-open
+            }
+        }
+
+        // 3. KV 无 cause → engine chain 为空
+        Ok(Some(evidence))
+    }
+
+    /// B4：批量验证
+    ///
+    /// 对一组 fact_id 做整链验证。verify_audit_typed 是会话级，一次验证即覆盖所有 fact。
+    pub async fn verify_batch(&self, fact_ids: &[u64]) -> Result<BatchVerifyReport, MemoryError> {
+        let session_id = self.session_id_str()?;
+        let mut report = BatchVerifyReport {
+            fact_count: fact_ids.len(),
+            ..Default::default()
+        };
+        match self.evorule_client.verify_audit_typed(session_id).await {
+            Ok(verify) => {
+                report.verified = verify.verified;
+                if verify.verified {
+                    report.verified_facts = fact_ids.to_vec();
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "verify_batch: audit verify failed");
+            }
+        }
+        Ok(report)
+    }
+
+    /// B4（C-4b 入口 1）：批量给召回记录附加证据
+    ///
+    /// 遍历 records，对有 fact_id 的记录调用 shared_evidence 溯源验证。
+    /// 无 fact_id 的记录跳过。server 不可用时 fail-open（设置 verified=false 证据）。
+    pub async fn attach_evidence(&self, records: &mut [MemoryRecord]) -> Result<(), MemoryError> {
+        for record in records.iter_mut() {
+            // 无 fact_id 的记录跳过
+            if record.fact_id.is_none() || record.fact_id == Some(0) {
+                continue;
+            }
+            match self.shared_evidence(record).await {
+                Ok(Some(ev)) => {
+                    record.evidence = Some(ev);
+                }
+                Ok(None) => {} // 无溯源信息，跳过
+                Err(e) => {
+                    // fail-open：设置 verified=false 证据
+                    record.evidence = Some(MemoryEvidence {
+                        fact_id: record.fact_id.unwrap_or(0),
+                        verified: false,
+                        error: Some(format!("attach_evidence failed: {}", e)),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// B4（C-4b）：共享事实证据——溯源回源会话验证
+    ///
+    /// 1. get_shared_fact_source → {source_session_id, path}
+    /// 2. get_facts(source_session, Some(path)) → 精确匹配 = 源会话侧 identity fact_id
+    /// 3. verify_audit_typed(source_session) → 整链 verified
+    /// 4. cause 存在 → get_causal_chain_typed(source_session, cause)
+    pub async fn shared_evidence(
+        &self,
+        record: &MemoryRecord,
+    ) -> Result<Option<MemoryEvidence>, MemoryError> {
+        let shared_fact_id = match record.fact_id {
+            Some(fid) if fid != 0 => fid,
+            _ => return Ok(None),
+        };
+
+        // 1. get_shared_fact_source → {source_session_id, path}
+        let source = match self
+            .evorule_client
+            .get_shared_fact_source(shared_fact_id)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // fail-open
+                return Ok(Some(MemoryEvidence {
+                    fact_id: shared_fact_id,
+                    verified: false,
+                    error: Some(format!("get_shared_fact_source failed: {}", e)),
+                    ..Default::default()
+                }));
+            }
+        };
+
+        let source_session = source.source_session_id.to_string();
+        let path = source.path.clone();
+
+        // 2. get_facts(source_session, Some(path)) → 首个精确匹配 = 源会话侧 identity fact_id
+        let identity_fact_id = match self
+            .evorule_client
+            .get_facts(&source_session, Some(&path))
+            .await
+        {
+            Ok(facts) => facts
+                .into_iter()
+                .find(|f| f.path == path)
+                .map(|f| f.id)
+                .unwrap_or(0),
+            Err(e) => {
+                return Ok(Some(MemoryEvidence {
+                    session_id: source_session,
+                    fact_id: shared_fact_id,
+                    path: Some(path),
+                    verified: false,
+                    error: Some(format!("get_facts failed: {}", e)),
+                    ..Default::default()
+                }));
+            }
+        };
+
+        let mut evidence = MemoryEvidence {
+            session_id: source_session.clone(),
+            fact_id: identity_fact_id,
+            path: Some(path),
+            cause_fact_id: record.cause_fact_id,
+            ..Default::default()
+        };
+
+        // 3. verify_audit_typed(source_session) → 整链 verified
+        match self
+            .evorule_client
+            .verify_audit_typed(&source_session)
+            .await
+        {
+            Ok(verify) => {
+                evidence.verified = verify.verified;
+                evidence.last_hash = verify.last_hash;
+            }
+            Err(e) => {
+                evidence.error = Some(format!("verify_audit_typed failed: {}", e));
+                return Ok(Some(evidence)); // fail-open
+            }
+        }
+
+        // 4. cause 存在 → get_causal_chain_typed(source_session, cause)
+        if let Some(cause_fid) = record.cause_fact_id {
+            if let Ok(chain) = self
+                .evorule_client
+                .get_causal_chain_typed(&source_session, cause_fid)
+                .await
+            {
+                evidence.chain = chain.chain;
+            }
+        }
+
+        Ok(Some(evidence))
     }
 }
 
@@ -849,6 +1438,101 @@ mod tests {
         assert!(format!("{}", err).contains("session not set"));
     }
 
+    // ===== B1 投影优先读取测试 =====
+
+    #[test]
+    fn test_memory_record_backward_compatible_no_fact_id() {
+        // 旧数据无 fact_id/cause_fact_id/evidence 字段，serde(default) 兜底
+        let json = r#"{"key":"k","value":"v","timestamp":1700000000}"#;
+        let record: MemoryRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.key, "k");
+        assert_eq!(record.value, "v");
+        assert!(record.fact_id.is_none());
+        assert!(record.cause_fact_id.is_none());
+        assert!(record.evidence.is_none());
+    }
+
+    #[test]
+    fn test_memory_record_new_has_none_fields() {
+        let record = MemoryRecord::new("key", "val", 100);
+        assert!(record.fact_id.is_none());
+        assert!(record.cause_fact_id.is_none());
+        assert!(record.evidence.is_none());
+        assert!(record.source.is_none());
+        assert!(record.confidence.is_none());
+        assert!(record.tags.is_empty());
+    }
+
+    #[test]
+    fn test_memory_record_with_fact_id_serialize_deserialize() {
+        let mut record = MemoryRecord::new("key", "val", 100);
+        record.fact_id = Some(42);
+        record.cause_fact_id = Some(10);
+
+        let json = serde_json::to_string(&record).unwrap();
+        let restored: MemoryRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.fact_id, Some(42));
+        assert_eq!(restored.cause_fact_id, Some(10));
+        // evidence 仍为 None
+        assert!(restored.evidence.is_none());
+    }
+
+    #[test]
+    fn test_memory_record_skip_serializing_none_fields() {
+        let record = MemoryRecord::new("key", "val", 100);
+        let json = serde_json::to_string(&record).unwrap();
+        // fact_id/cause_fact_id/evidence 为 None 时不应出现在 JSON 中
+        assert!(!json.contains("fact_id"));
+        assert!(!json.contains("cause_fact_id"));
+        assert!(!json.contains("evidence"));
+    }
+
+    #[test]
+    fn test_memory_record_with_evidence_roundtrip() {
+        use crate::agent::memory_event::evidence::MemoryEvidence;
+
+        let mut record = MemoryRecord::new("key", "val", 100);
+        record.fact_id = Some(7);
+        record.evidence = Some(MemoryEvidence {
+            session_id: "s1".to_string(),
+            fact_id: 7,
+            path: Some("__memory__.test.session_s1.key".to_string()),
+            verified: true,
+            last_hash: Some("abc123".to_string()),
+            cause_fact_id: None,
+            chain: vec![],
+            error: None,
+        });
+
+        let json = serde_json::to_string(&record).unwrap();
+        let restored: MemoryRecord = serde_json::from_str(&json).unwrap();
+        assert!(restored.evidence.is_some());
+        let ev = restored.evidence.unwrap();
+        assert_eq!(ev.fact_id, 7);
+        assert!(ev.verified);
+        assert_eq!(ev.last_hash.unwrap(), "abc123");
+    }
+
+    #[test]
+    fn test_project_scoped_session_not_set_returns_error() {
+        let mgr = MemoryManager::new("test", make_test_client());
+        // session_id 未设置 → SessionNotSet 传播（唯一不 fail-open 的错误）
+        let result =
+            tokio_test::block_on(async { mgr.project_scoped(&MemoryScope::Shared, "key").await });
+        assert!(matches!(result, Err(MemoryError::SessionNotSet)));
+    }
+
+    #[test]
+    fn test_project_prefix_messages_returns_empty() {
+        let mgr = MemoryManager::new("test", make_test_client()).with_session_id("s1");
+        // Messages scope 不做投影，直接返回空
+        let result = tokio_test::block_on(async {
+            mgr.project_prefix(&MemoryScope::Messages("s1".to_string(), 0), "prefix")
+                .await
+        });
+        assert!(result.unwrap().is_empty());
+    }
+
     #[test]
     fn test_memory_manager_debug_format() {
         let mgr = MemoryManager::new("test", make_test_client());
@@ -873,7 +1557,7 @@ mod tests {
         let scope = MemoryScope::Shared;
         assert_eq!(
             mgr.build_path_scoped(&scope, "topic"),
-            "__memory__.researcher.shared.topic"
+            "shared.researcher.topic"
         );
     }
 
@@ -902,8 +1586,7 @@ mod tests {
         let mgr = MemoryManager::new("test", make_test_client());
         let shared_key = mgr.cache_key_for(&MemoryScope::Shared, "topic");
         let session_key = mgr.cache_key_for(&MemoryScope::Session("s1".to_string()), "topic");
-        let messages_key =
-            mgr.cache_key_for(&MemoryScope::Messages("s1".to_string(), 0), "");
+        let messages_key = mgr.cache_key_for(&MemoryScope::Messages("s1".to_string(), 0), "");
 
         assert_ne!(shared_key, session_key);
         assert_ne!(session_key, messages_key);
@@ -1084,7 +1767,10 @@ mod tests {
             session_id,
             idx
         );
-        assert_eq!(expected_path, "__memory__.researcher.session_s123.messages.5");
+        assert_eq!(
+            expected_path,
+            "__memory__.researcher.session_s123.messages.5"
+        );
     }
 
     // ===== P0: TTL 测试（用户决策 5）=====
@@ -1166,11 +1852,13 @@ mod tests {
         // 手动插入一个过期的记录到 cache
         let old_timestamp = now_secs().saturating_sub(200);
         let expired_record = MemoryRecord::new("old_key", "old_val", old_timestamp);
-        mgr.cache.insert("session_s1::old_key".to_string(), expired_record);
+        mgr.cache
+            .insert("session_s1::old_key".to_string(), expired_record);
 
         // 手动插入一个未过期的记录
         let recent_record = MemoryRecord::new("new_key", "new_val", now_secs());
-        mgr.cache.insert("session_s1::new_key".to_string(), recent_record);
+        mgr.cache
+            .insert("session_s1::new_key".to_string(), recent_record);
 
         assert_eq!(mgr.len(), 2);
         let count = mgr.cleanup_expired();
@@ -1226,5 +1914,395 @@ mod tests {
         assert_eq!(mgr.ttl_secs(), Some(60));
         // append_message 需要 HTTP 调用，这里只验证方法存在
         let _ = mgr.namespace();
+    }
+
+    // ===== C1: write_shared_summary 测试 =====
+
+    #[test]
+    fn test_write_shared_summary_writes_to_cache() {
+        let mut mgr = MemoryManager::new("researcher", make_test_client()).with_session_id("s1");
+        tokio_test::block_on(async {
+            let result = mgr.write_shared_summary("s1", "会话摘要内容").await;
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), None);
+            // 验证 cache 中有对应记录
+            // cache_key_for(Shared, key) = "shared::sessions.{sid}.summary"
+            let expected_cache_key = "shared::sessions.s1.summary";
+            assert!(mgr.cache.contains_key(expected_cache_key));
+        });
+    }
+
+    #[test]
+    fn test_write_shared_summary_without_session_errors() {
+        // Shared scope 需要 manager 的 session_id（用于 evorule payload 写入）
+        let mut mgr = MemoryManager::new("test", make_test_client());
+        tokio_test::block_on(async {
+            let result = mgr.write_shared_summary("s1", "summary").await;
+            // set_scoped -> session_id_for_scope(Shared) -> SessionNotSet
+            assert!(matches!(result, Err(MemoryError::SessionNotSet)));
+        });
+    }
+
+    #[test]
+    fn test_write_shared_summary_returns_none_fact_id() {
+        let mut mgr = MemoryManager::new("ns", make_test_client()).with_session_id("s1");
+        tokio_test::block_on(async {
+            let result = mgr.write_shared_summary("s1", "摘要").await.unwrap();
+            // set_scoped 不返回 fact_id，所以 write_shared_summary 返回 None
+            assert_eq!(result, None);
+        });
+    }
+
+    // ===== B4：记忆证据伴随测试 =====
+
+    #[tokio::test]
+    async fn test_evidence_for_degraded_no_server() {
+        // server 不可用（localhost:9999 无监听）
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client).with_session_id("s1");
+
+        // project_scoped fail-open → Ok(None)
+        let result = mgr.evidence_for(&MemoryScope::Shared, "key").await.unwrap();
+        assert!(
+            result.is_none(),
+            "evidence_for should return None when project_scoped returns None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evidence_for_no_session_returns_error() {
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client);
+        // session 未设置 + Shared scope → SessionNotSet
+        let result = mgr.evidence_for(&MemoryScope::Shared, "key").await;
+        assert!(matches!(result, Err(MemoryError::SessionNotSet)));
+    }
+
+    #[tokio::test]
+    async fn test_verify_batch_degraded() {
+        // server 不可用 → verify_batch 降级（verified=false, verified_facts 空）
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client).with_session_id("s1");
+
+        let report = mgr.verify_batch(&[1, 2, 3]).await.unwrap();
+        assert_eq!(report.fact_count, 3);
+        assert!(!report.verified, "degraded mode should have verified=false");
+        assert!(
+            report.verified_facts.is_empty(),
+            "degraded mode should have empty verified_facts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_batch_no_session_returns_error() {
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client);
+        let result = mgr.verify_batch(&[1, 2, 3]).await;
+        assert!(matches!(result, Err(MemoryError::SessionNotSet)));
+    }
+
+    #[tokio::test]
+    async fn test_attach_evidence_no_fact_id_skipped() {
+        // 无 fact_id 的记录应被跳过（evidence 保持 None）
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client).with_session_id("s1");
+
+        let mut records = vec![
+            MemoryRecord::new("key1", "val1", 1000),
+            MemoryRecord::new("key2", "val2", 2000),
+        ];
+        // 所有记录均无 fact_id
+        assert!(records[0].fact_id.is_none());
+        assert!(records[1].fact_id.is_none());
+
+        mgr.attach_evidence(&mut records).await.unwrap();
+        // evidence 仍为 None（跳过）
+        assert!(records[0].evidence.is_none());
+        assert!(records[1].evidence.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_attach_evidence_zero_fact_id_skipped() {
+        // fact_id == Some(0) 的记录也应被跳过
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client).with_session_id("s1");
+
+        let mut record = MemoryRecord::new("key1", "val1", 1000);
+        record.fact_id = Some(0);
+        let mut records = vec![record];
+
+        mgr.attach_evidence(&mut records).await.unwrap();
+        assert!(records[0].evidence.is_none(), "fact_id=0 should be skipped");
+    }
+
+    #[tokio::test]
+    async fn test_attach_evidence_degraded() {
+        // 有 fact_id 但 server 不可用 → fail-open（设置 verified=false 证据）
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client).with_session_id("s1");
+
+        let mut record = MemoryRecord::new("key1", "val1", 1000);
+        record.fact_id = Some(42);
+        let mut records = vec![record];
+
+        mgr.attach_evidence(&mut records).await.unwrap();
+        // server 不可用 → shared_evidence fail-open → evidence 被设置（verified=false）
+        let ev = records[0]
+            .evidence
+            .as_ref()
+            .expect("evidence should be set (fail-open)");
+        assert!(!ev.verified, "degraded mode should have verified=false");
+        assert!(
+            ev.error.is_some(),
+            "degraded mode should have error message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shared_evidence_no_fact_id_returns_none() {
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client).with_session_id("s1");
+
+        let record = MemoryRecord::new("key1", "val1", 1000);
+        // 无 fact_id
+        let result = mgr.shared_evidence(&record).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    // ===== C2: RecallContext / ContextBudget / build_system_prompt_with_recall 测试 =====
+
+    #[test]
+    fn test_recall_context_default() {
+        // RecallContext::default() 全空
+        let ctx = RecallContext::default();
+        assert!(ctx.stable.is_empty());
+        assert!(ctx.summaries.is_empty());
+        assert!(ctx.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_recall_context_degraded_no_server() {
+        // server 不可用时返回空（fail-open，不报错）
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client);
+
+        let ctx = mgr.recall_context("test goal", 3, 5).await;
+        assert!(ctx.stable.is_empty(), "degraded: stable should be empty");
+        assert!(
+            ctx.summaries.is_empty(),
+            "degraded: summaries should be empty"
+        );
+        assert!(ctx.events.is_empty(), "degraded: events should be empty");
+    }
+
+    #[test]
+    fn test_build_system_prompt_with_recall_empty() {
+        // 空召回 → 返回原 prompt
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client);
+        let recall = RecallContext::default();
+        let budget = ContextBudget::default();
+
+        let prompt = mgr.build_system_prompt_with_recall("base prompt", &recall, &budget);
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[test]
+    fn test_build_system_prompt_with_recall_stable() {
+        // 有 stable facts → prompt 包含 "Stable Facts"
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client);
+        let mut recall = RecallContext::default();
+        recall
+            .stable
+            .push(MemoryRecord::new("rule1", "do good", 1000));
+        let budget = ContextBudget::default();
+
+        let prompt = mgr.build_system_prompt_with_recall("base prompt", &recall, &budget);
+        assert!(
+            prompt.contains("## Stable Facts"),
+            "prompt should contain Stable Facts section"
+        );
+        assert!(
+            prompt.contains("rule1"),
+            "prompt should contain stable fact key"
+        );
+        assert!(
+            prompt.contains("do good"),
+            "prompt should contain stable fact value"
+        );
+    }
+
+    #[test]
+    fn test_context_budget_fit_recall() {
+        // 预算截断逻辑：budget=0 不限制
+        let mut recall = RecallContext::default();
+        recall
+            .stable
+            .push(MemoryRecord::new("k1", &"x".repeat(100), 1000));
+        recall
+            .summaries
+            .push(MemoryRecord::new("k2", &"y".repeat(100), 2000));
+        recall
+            .events
+            .push(MemoryRecord::new("k3", &"z".repeat(100), 3000));
+
+        // memory_cap=0 → 不限制
+        let budget_unlimited = ContextBudget::default();
+        budget_unlimited.fit_recall(&mut recall);
+        assert_eq!(recall.stable.len(), 1);
+        assert_eq!(recall.summaries.len(), 1);
+        assert_eq!(recall.events.len(), 1);
+
+        // memory_cap 很小 → 截断 stable，清空 summaries/events
+        let mut recall2 = RecallContext::default();
+        recall2
+            .stable
+            .push(MemoryRecord::new("k1", &"x".repeat(100), 1000));
+        recall2
+            .summaries
+            .push(MemoryRecord::new("k2", &"y".repeat(100), 2000));
+        recall2
+            .events
+            .push(MemoryRecord::new("k3", &"z".repeat(100), 3000));
+
+        // total_window=20, ratio=0.25 → memory_cap=5 tokens
+        let budget_small = ContextBudget::new(20, 0.25);
+        assert_eq!(budget_small.memory_cap(), 5);
+        budget_small.fit_recall(&mut recall2);
+        // stable 的 value 是 100 chars ≈ 25 tokens > 5 → 截断 stable
+        assert!(
+            recall2.stable.is_empty(),
+            "stable should be truncated to fit small budget"
+        );
+        assert!(
+            recall2.summaries.is_empty(),
+            "summaries should be cleared when budget exhausted"
+        );
+        assert!(
+            recall2.events.is_empty(),
+            "events should be cleared when budget exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_context_with_evidence_degraded() {
+        // server 不可用时返回空 ctx（不 panic）
+        let client = EvoruleApiClient::new("http://localhost:9999");
+        let mgr = MemoryManager::new("test", client);
+
+        let result = mgr.recall_context_with_evidence("test goal", 3, 5).await;
+        assert!(result.is_ok(), "degraded mode should return Ok (fail-open)");
+        let ctx = result.unwrap();
+        assert!(ctx.stable.is_empty());
+        assert!(ctx.summaries.is_empty());
+        assert!(ctx.events.is_empty());
+    }
+
+    // ===== C3: ContextBudget 完善测试 =====
+
+    #[test]
+    fn test_context_budget_new() {
+        let b = ContextBudget::new(128000, 0.25);
+        assert_eq!(b.total_window, 128000);
+        assert!((b.memory_budget_ratio - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_context_budget_clamp() {
+        // ratio < 0.1 → clamp 到 0.1
+        let b_lo = ContextBudget::new(1000, 0.01);
+        assert!((b_lo.memory_budget_ratio - 0.1).abs() < 1e-6);
+        // ratio > 0.5 → clamp 到 0.5
+        let b_hi = ContextBudget::new(1000, 0.9);
+        assert!((b_hi.memory_budget_ratio - 0.5).abs() < 1e-6);
+        // ratio 在 [0.1, 0.5] 内不变
+        let b_ok = ContextBudget::new(1000, 0.3);
+        assert!((b_ok.memory_budget_ratio - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_context_budget_memory_cap() {
+        let b = ContextBudget::new(128000, 0.25);
+        assert_eq!(b.memory_cap(), 32000);
+        // total_window=0 → cap=0（不限制）
+        let b0 = ContextBudget::default();
+        assert_eq!(b0.memory_cap(), 0);
+    }
+
+    #[test]
+    fn test_context_budget_messages_max() {
+        let b = ContextBudget::new(128000, 0.25);
+        assert_eq!(b.messages_max(), 96000); // 128000 - 32000
+                                             // total_window=0 → messages_max=0
+        let b0 = ContextBudget::default();
+        assert_eq!(b0.messages_max(), 0);
+    }
+
+    #[test]
+    fn test_context_budget_fit_recall_truncate() {
+        // 构造预算：cap=10 tokens。stable 一条占 25 tokens → 截断
+        let mut recall = RecallContext::default();
+        recall
+            .stable
+            .push(MemoryRecord::new("k1", &"x".repeat(100), 1000));
+        recall
+            .summaries
+            .push(MemoryRecord::new("k2", &"y".repeat(100), 2000));
+        recall
+            .events
+            .push(MemoryRecord::new("k3", &"z".repeat(100), 3000));
+
+        // total_window=40, ratio=0.25 → cap=10
+        let budget = ContextBudget::new(40, 0.25);
+        assert_eq!(budget.memory_cap(), 10);
+        budget.fit_recall(&mut recall);
+        assert!(recall.stable.is_empty(), "stable truncated (25 > 10)");
+        assert!(recall.summaries.is_empty(), "summaries cleared");
+        assert!(recall.events.is_empty(), "events cleared");
+
+        // 预算充足 → 全部保留
+        let mut recall2 = RecallContext::default();
+        recall2.stable.push(MemoryRecord::new("k1", "small", 1000));
+        recall2
+            .summaries
+            .push(MemoryRecord::new("k2", "small", 2000));
+        recall2.events.push(MemoryRecord::new("k3", "small", 3000));
+        let budget_big = ContextBudget::new(128000, 0.25);
+        budget_big.fit_recall(&mut recall2);
+        assert_eq!(recall2.stable.len(), 1);
+        assert_eq!(recall2.summaries.len(), 1);
+        assert_eq!(recall2.events.len(), 1);
+
+        // total_window=0 → 不限制
+        let mut recall3 = RecallContext::default();
+        recall3
+            .stable
+            .push(MemoryRecord::new("k1", &"x".repeat(1000), 1000));
+        let budget_unlimited = ContextBudget::default();
+        budget_unlimited.fit_recall(&mut recall3);
+        assert_eq!(recall3.stable.len(), 1, "total_window=0 means no limit");
+    }
+
+    #[test]
+    fn test_context_budget_elastic() {
+        // 记忆区未用满 → 剩余还给 messages
+        let b = ContextBudget::new(128000, 0.25);
+        // cap=32000, messages_max=96000
+        let recall = RecallContext::default();
+        // 空召回 → used=0 → elastic = 96000 + 32000 = 128000
+        assert_eq!(b.elastic_messages_max(&recall), 128000);
+
+        // 有少量召回 → unused 退还一部分
+        let mut recall2 = RecallContext::default();
+        recall2
+            .stable
+            .push(MemoryRecord::new("k1", &"x".repeat(40), 1000)); // 10 tokens
+                                                                   // used=10, unused=32000-10=31990, elastic = 96000 + 31990 = 127990
+        assert_eq!(b.elastic_messages_max(&recall2), 127990);
+
+        // total_window=0 → elastic=0（不限制由调用方处理）
+        let b0 = ContextBudget::default();
+        assert_eq!(b0.elastic_messages_max(&recall), 0);
     }
 }

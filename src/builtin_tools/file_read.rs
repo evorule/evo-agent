@@ -12,7 +12,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use tier0_tcb::JsonValue;
+use evorule_tcb::JsonValue;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -23,6 +23,7 @@ pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// `file_read` 工具
 ///
 /// 通过 `new()` 构造时绑定工作目录,实例化后**只能读取 workdir 内的文件**。
+#[derive(Clone)]
 pub struct FileReadTool {
     workdir: PathBuf,
     max_bytes: u64,
@@ -86,8 +87,21 @@ impl FileReadTool {
     }
 }
 
+#[async_trait::async_trait]
 impl ToolFunction for FileReadTool {
-    fn call(&self, args: &JsonValue) -> IoResult {
+    /// G13:async 入口 — 用 spawn_blocking 包装同步 fs 操作
+    async fn call(&self, args: &JsonValue) -> IoResult {
+        let tool = self.clone();
+        let args = args.clone();
+        tokio::task::spawn_blocking(move || tool.call_sync(&args))
+            .await
+            .map_err(|e| format!("file_read tool panicked: {}", e))?
+    }
+}
+
+impl FileReadTool {
+    /// 同步实现(供 spawn_blocking 调用)
+    fn call_sync(&self, args: &JsonValue) -> IoResult {
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -95,8 +109,7 @@ impl ToolFunction for FileReadTool {
 
         let safe_path = self.resolve_safe_path(path)?;
 
-        let metadata = std::fs::metadata(&safe_path)
-            .map_err(|e| format!("stat failed: {}", e))?;
+        let metadata = std::fs::metadata(&safe_path).map_err(|e| format!("stat failed: {}", e))?;
 
         if !metadata.is_file() {
             return Err(format!("not a regular file: '{}'", path));
@@ -118,7 +131,10 @@ impl ToolFunction for FileReadTool {
             "path".to_string(),
             JsonValue::string(safe_path.display().to_string()),
         );
-        map.insert("size".to_string(), JsonValue::Integer(metadata.len() as i64));
+        map.insert(
+            "size".to_string(),
+            JsonValue::Integer(metadata.len() as i64),
+        );
         map.insert("content".to_string(), JsonValue::string(content));
         Ok(JsonValue::object(map))
     }
@@ -146,7 +162,7 @@ mod tests {
         std::fs::write(&file, b"hello, world").unwrap();
 
         let tool = make_tool(dir.path());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("hello.txt"));
             m
@@ -161,9 +177,12 @@ mod tests {
     fn test_reject_absolute_path() {
         let dir = temp_workdir();
         let tool = make_tool(dir.path());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("C:\\Windows\\System32"));
+            m.insert(
+                "path".to_string(),
+                JsonValue::string("C:\\Windows\\System32"),
+            );
             m
         }));
         assert!(result.is_err());
@@ -175,7 +194,7 @@ mod tests {
     fn test_reject_parent_dir_traversal() {
         let dir = temp_workdir();
         let tool = make_tool(dir.path());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("../etc/passwd"));
             m
@@ -199,7 +218,7 @@ mod tests {
         std::os::windows::fs::symlink_file(&outside_file, &link_path).unwrap();
 
         let tool = make_tool(dir.path());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("link.txt"));
             m
@@ -211,7 +230,7 @@ mod tests {
     fn test_missing_path_arg() {
         let dir = temp_workdir();
         let tool = make_tool(dir.path());
-        let result = tool.call(&JsonValue::object(std::collections::BTreeMap::new()));
+        let result = tool.call_sync(&JsonValue::object(std::collections::BTreeMap::new()));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing required arg"));
     }
@@ -220,7 +239,7 @@ mod tests {
     fn test_reject_nonexistent() {
         let dir = temp_workdir();
         let tool = make_tool(dir.path());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("does_not_exist.txt"));
             m
@@ -238,7 +257,7 @@ mod tests {
         drop(f);
 
         let tool = make_tool(dir.path()).with_max_bytes(1024 * 1024); // 1 MB limit
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("big.txt"));
             m
@@ -255,7 +274,7 @@ mod tests {
         std::fs::create_dir(&subdir).unwrap();
 
         let tool = make_tool(dir.path());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("subdir"));
             m

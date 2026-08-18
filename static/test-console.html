@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Evo-Agent 前端测试控制台</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f7fa; color: #333; }
+        
+        .container { max-width: 1200px; margin: 20px auto; padding: 20px; }
+        h1 { text-align: center; margin-bottom: 20px; color: #2c3e50; }
+        
+        .config-bar {
+            background: #fff;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .config-bar label { font-weight: 500; color: #555; }
+        .config-bar input, .config-bar select {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            min-width: 150px;
+        }
+        .config-bar input[type="text"] { flex: 1; min-width: 200px; }
+        
+        .tabs { display: flex; border-bottom: 2px solid #ddd; margin-bottom: 20px; }
+        .tab {
+            padding: 12px 24px;
+            cursor: pointer;
+            border: none;
+            background: transparent;
+            font-size: 16px;
+            font-weight: 500;
+            color: #666;
+            border-bottom: 3px solid transparent;
+            transition: all 0.2s;
+        }
+        .tab.active { color: #3498db; border-bottom-color: #3498db; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        
+        .panel {
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .input-area { margin-bottom: 20px; }
+        .input-area label { display: block; margin-bottom: 8px; font-weight: 500; }
+        .input-area textarea {
+            width: 100%;
+            min-height: 80px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 14px;
+            resize: vertical;
+        }
+        .input-area select { width: 200px; }
+        
+        .btn-group { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn-primary { background: #3498db; color: #fff; }
+        .btn-primary:hover { background: #2980b9; }
+        .btn-success { background: #27ae60; color: #fff; }
+        .btn-success:hover { background: #229954; }
+        .btn-danger { background: #e74c3c; color: #fff; }
+        .btn-danger:hover { background: #c0392b; }
+        .btn-secondary { background: #95a5a6; color: #fff; }
+        .btn-secondary:hover { background: #7f8c8d; }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        
+        .event-log {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            border-radius: 6px;
+            padding: 15px;
+            height: 500px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        .event-entry {
+            margin-bottom: 12px;
+            padding: 8px;
+            border-radius: 4px;
+            background: #252525;
+            border-left: 3px solid #555;
+        }
+        .event-meta { display: flex; justify-content: space-between; color: #999; margin-bottom: 5px; font-size: 12px; }
+        .event-type { font-weight: bold; }
+        .event-type.session_created { color: #569cd6; border-color: #569cd6; }
+        .event-type.step { color: #ce9178; border-color: #ce9178; }
+        .event-type.llm_delta { color: #dcdcaa; border-color: #dcdcaa; }
+        .event-type.llm_done { color: #6a9955; border-color: #6a9955; }
+        .event-type.tool_call { color: #4ec9b0; border-color: #4ec9b0; }
+        .event-type.tool_result { color: #c586c0; border-color: #c586c0; }
+        .event-type.approval_required { color: #d7ba7d; border-color: #d7ba7d; }
+        .event-type.approval_result { color: #808080; border-color: #808080; }
+        .event-type.done { color: #4ec9b0; border-color: #4ec9b0; font-size: 16px; }
+        .event-type.error { color: #f44747; border-color: #f44747; }
+        .event-type.info { color: #9cdcfe; border-color: #9cdcfe; }
+        
+        .approval-dialog {
+            position: fixed;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            background: #fff;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+            z-index: 1000;
+            display: none;
+            min-width: 400px;
+        }
+        .approval-dialog.active { display: block; }
+        .approval-dialog h3 { margin-bottom: 15px; color: #e67e22; }
+        .approval-dialog .detail { background: #f8f9fa; padding: 10px; border-radius: 4px; margin: 10px 0; font-family: monospace; }
+        .approval-dialog .actions { display: flex; gap: 10px; margin-top: 20px; justify-content: flex-end; }
+        .dialog-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.5); z-index: 999; display: none;
+        }
+        .dialog-overlay.active { display: block; }
+        
+        .status {
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+            display: inline-block;
+        }
+        .status.disconnected { background: #e74c3c; color: #fff; }
+        .status.connecting { background: #f39c12; color: #fff; }
+        .status.connected { background: #27ae60; color: #fff; }
+        .status.streaming { background: #3498db; color: #fff; }
+        
+        .ws-controls { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; }
+        .ws-message-input { display: flex; gap: 10px; margin-bottom: 15px; }
+        .ws-message-input input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
+        
+        .debug-panel {
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-top: 20px;
+            overflow: hidden;
+        }
+        .debug-panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 15px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+            cursor: pointer;
+            user-select: none;
+        }
+        .debug-panel-header h3 { margin: 0; font-size: 14px; color: #495057; }
+        .debug-panel-actions { display: flex; gap: 8px; }
+        .debug-panel-actions button {
+            padding: 4px 10px;
+            font-size: 12px;
+            cursor: pointer;
+            border: 1px solid #ced4da;
+            background: #fff;
+            border-radius: 3px;
+        }
+        .debug-panel-actions button:hover { background: #e9ecef; }
+        .debug-panel-body {
+            display: none;
+            max-height: 300px;
+            overflow-y: auto;
+            padding: 10px 15px;
+            background: #1a1a2e;
+            color: #a0a0b0;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 11px;
+            line-height: 1.5;
+        }
+        .debug-panel.open .debug-panel-body { display: block; }
+        .debug-entry {
+            padding: 4px 0;
+            border-bottom: 1px solid #2a2a4a;
+            display: flex;
+            gap: 8px;
+        }
+        .debug-entry:last-child { border-bottom: none; }
+        .debug-time { color: #6c6c8a; flex-shrink: 0; }
+        .debug-tag { 
+            flex-shrink: 0; 
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: bold;
+        }
+        .debug-tag.INFO { background: #1e3a5f; color: #7db8ff; }
+        .debug-tag.DEBUG { background: #2a2a4a; color: #a0a0b0; }
+        .debug-tag.ACTION { background: #3d5a3d; color: #7dff7d; }
+        .debug-tag.WARN { background: #5a4a1e; color: #ffd67d; }
+        .debug-tag.ERROR { background: #5a1e1e; color: #ff7d7d; }
+        .debug-tag.NETWORK { background: #3d2a5a; color: #c77dff; }
+        .debug-msg { word-break: break-all; flex: 1; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 Evo-Agent 前端测试控制台</h1>
+        
+        <!-- 全局配置 -->
+        <div class="config-bar">
+            <label>服务器地址:</label>
+            <input type="text" id="baseUrl" value="http://127.0.0.1:8081" placeholder="http://host:port">
+            <label>Agent 类型:</label>
+            <select id="agentType">
+                <option value="general">general</option>
+                <option value="researcher">researcher</option>
+                <option value="rule-copilot">rule-copilot</option>
+                <option value="custom">自定义...</option>
+            </select>
+            <input type="text" id="customAgentType" placeholder="自定义类型" style="display:none; min-width: 100px;">
+            <label>Token:</label>
+            <input type="text" id="authToken" placeholder="可选，鉴权 token">
+        </div>
+
+        <!-- Tab 切换 -->
+        <div class="tabs">
+            <button class="tab active" data-tab="sse">SSE 流式执行</button>
+            <button class="tab" data-tab="ws">WebSocket 双向流</button>
+        </div>
+
+        <!-- SSE 标签页 -->
+        <div id="sse" class="tab-content active">
+            <div class="panel">
+                <div class="input-area">
+                    <label>任务描述 (Goal):</label>
+                    <textarea id="sseGoal" placeholder="输入 agent 要完成的任务...">分析当前目录下的代码结构</textarea>
+                </div>
+                <div class="input-area" style="display: flex; gap: 15px; align-items: center;">
+                    <label>最大步数:</label>
+                    <input type="number" id="sseMaxSteps" value="20" min="1" max="100" style="width: 80px;">
+                    <label>温度:</label>
+                    <input type="number" id="sseTemperature" value="0.3" min="0" max="2" step="0.1" style="width: 80px;">
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-primary" id="sseStart">▶ 开始执行</button>
+                    <button class="btn btn-danger" id="sseCancel" disabled>⏹ 取消</button>
+                    <span class="status disconnected" id="sseStatus">● 未连接</span>
+                </div>
+                <div class="event-log" id="sseLog"></div>
+            </div>
+        </div>
+
+        <!-- WebSocket 标签页 -->
+        <div id="ws" class="tab-content">
+            <div class="panel">
+                <div class="ws-controls">
+                    <label>Session ID:</label>
+                    <input type="text" id="wsSessionId" value="new" placeholder="new 或具体 ID" style="width: 150px;">
+                    <button class="btn btn-success" id="wsConnect">🔌 连接</button>
+                    <button class="btn btn-danger" id="wsDisconnect" disabled>✖ 断开</button>
+                    <span class="status disconnected" id="wsStatus">● 未连接</span>
+                </div>
+                <div class="ws-message-input">
+                    <input type="text" id="wsMessage" placeholder="输入消息... (Enter 发送)" disabled>
+                    <button class="btn btn-primary" id="wsSend" disabled>💬 发送</button>
+                    <button class="btn btn-secondary" id="wsInterrupt" disabled>⏸ 中断</button>
+                    <button class="btn btn-secondary" id="wsRewind" disabled>↩ 回滚</button>
+                </div>
+                <div class="event-log" id="wsLog"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Debug 日志面板 -->
+        <div class="debug-panel" id="debugPanel">
+            <div class="debug-panel-header" id="debugPanelHeader">
+                <h3>🐛 调试日志 <span id="debugCount" style="font-weight: normal; color: #6c757d; font-size: 12px;">(0)</span></h3>
+                <div class="debug-panel-actions">
+                    <button id="debugExport">导出</button>
+                    <button id="debugClear">清空</button>
+                    <button id="debugToggle">展开</button>
+                </div>
+            </div>
+            <div class="debug-panel-body" id="debugBody"></div>
+        </div>
+    </div>
+
+    <!-- 审批对话框 -->
+    <div class="dialog-overlay" id="dialogOverlay"></div>
+    <div class="approval-dialog" id="approvalDialog">
+        <h3>⚠️ 需要审批</h3>
+        <div class="detail" id="approvalDetail"></div>
+        <div class="actions">
+            <button class="btn btn-danger" id="approvalReject">❌ 拒绝</button>
+            <button class="btn btn-success" id="approvalApprove">✅ 批准</button>
+        </div>
+    </div>
+
+    <!-- 回滚版本输入对话框 -->
+    <div class="dialog-overlay" id="rewindOverlay"></div>
+    <div class="approval-dialog" id="rewindDialog">
+        <h3>↩ 回滚到版本</h3>
+        <div class="detail">
+            <label>输入目标版本号:</label>
+            <input type="number" id="rewindVersionInput" placeholder="例如: 5" min="0" style="width: 100%; padding: 8px; margin-top: 5px; border: 1px solid #ddd; border-radius: 4px;">
+        </div>
+        <div class="actions">
+            <button class="btn btn-secondary" id="rewindCancel">取消</button>
+            <button class="btn btn-primary" id="rewindConfirm">确认回滚</button>
+        </div>
+    </div>
+
+    <script>
+        // ============ 全局状态 ============
+        const state = {
+            currentSessionId: null,
+            pendingApproval: null,
+            sseController: null,
+            ws: null,
+            debugLogs: []
+        };
+
+        // ============ Debug 日志系统 ============
+        function debugLog(tag, message, data) {
+            const entry = {
+                time: new Date().toISOString(),
+                tag,
+                message,
+                data: data !== undefined ? (typeof data === 'object' ? JSON.parse(JSON.stringify(data)) : data) : null
+            };
+            state.debugLogs.push(entry);
+            
+            // 写入页面
+            const body = document.getElementById('debugBody');
+            const count = document.getElementById('debugCount');
+            const timeStr = new Date().toLocaleTimeString() + '.' + String(new Date().getMilliseconds()).padStart(3, '0');
+            const dataStr = data !== undefined ? ` ${typeof data === 'object' ? JSON.stringify(data) : data}` : '';
+            const line = document.createElement('div');
+            line.className = 'debug-entry';
+            line.innerHTML = `
+                <span class="debug-time">${timeStr}</span>
+                <span class="debug-tag ${tag}">${tag}</span>
+                <span class="debug-msg">${message}${dataStr}</span>
+            `;
+            body.appendChild(line);
+            body.scrollTop = body.scrollHeight;
+            count.textContent = `(${state.debugLogs.length})`;
+            
+            // 同时输出到浏览器 Console
+            const consoleArgs = [timeStr, `[${tag}]`, message];
+            if (data !== undefined) consoleArgs.push(data);
+            switch (tag) {
+                case 'ERROR': console.error(...consoleArgs); break;
+                case 'WARN': console.warn(...consoleArgs); break;
+                default: console.log(...consoleArgs);
+            }
+        }
+
+        function clearDebugLogs() {
+            state.debugLogs = [];
+            document.getElementById('debugBody').innerHTML = '';
+            document.getElementById('debugCount').textContent = '(0)';
+            debugLog('INFO', '调试日志已清空');
+        }
+
+        function exportDebugLogs() {
+            const blob = new Blob([JSON.stringify(state.debugLogs, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `evo-agent-debug-${Date.now()}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+            debugLog('INFO', `调试日志已导出 (${state.debugLogs.length} 条)`);
+        }
+
+        // ============ 工具函数 ============
+        function getBaseUrl() { return document.getElementById('baseUrl').value.replace(/\/$/, ''); }
+        function getAgentType() {
+            const select = document.getElementById('agentType');
+            if (select.value === 'custom') return document.getElementById('customAgentType').value;
+            return select.value;
+        }
+        function getToken() { return document.getElementById('authToken').value; }
+
+        function appendSSELog(event, data) {
+            const log = document.getElementById('sseLog');
+            const time = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = `event-entry event-type ${event}`;
+            
+            let dataStr = '';
+            if (typeof data === 'object') {
+                if (event === 'llm_delta') {
+                    dataStr = data.text || '';
+                    entry.innerHTML = `<div class="event-meta"><span class="event-type">${event}</span><span>${time}</span></div><div>${dataStr}</div>`;
+                    // 流式文本追加到上一个 llm_delta
+                    const lastDelta = log.querySelector('.event-entry:last-child.llm_delta');
+                    if (lastDelta && log.lastElementChild === entry.previousElementSibling) {
+                        // 不创建新节点，而是追加到已有
+                    } else {
+                        log.appendChild(entry);
+                    }
+                } else {
+                    dataStr = JSON.stringify(data, null, 2);
+                    entry.innerHTML = `<div class="event-meta"><span class="event-type">${event}</span><span>${time}</span></div><pre style="white-space: pre-wrap; margin: 0;">${dataStr}</pre>`;
+                    log.appendChild(entry);
+                }
+            } else {
+                dataStr = String(data);
+                entry.innerHTML = `<div class="event-meta"><span class="event-type">${event}</span><span>${time}</span></div><div>${dataStr}</div>`;
+                log.appendChild(entry);
+            }
+            
+            log.scrollTop = log.scrollHeight;
+        }
+
+        function appendWSLog(type, data) {
+            const log = document.getElementById('wsLog');
+            const time = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = `event-entry event-type ${type.toLowerCase()}`;
+            
+            let dataStr = typeof data === 'object' ? JSON.stringify(data, null, 2) : String(data);
+            entry.innerHTML = `<div class="event-meta"><span class="event-type">${type}</span><span>${time}</span></div><pre style="white-space: pre-wrap; margin: 0;">${dataStr}</pre>`;
+            log.appendChild(entry);
+            log.scrollTop = log.scrollHeight;
+        }
+
+        // ============ Tab 切换 ============
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById(tab.dataset.tab).classList.add('active');
+            });
+        });
+
+        // ============ Agent 类型自定义 ============
+        document.getElementById('agentType').addEventListener('change', (e) => {
+            const customInput = document.getElementById('customAgentType');
+            customInput.style.display = e.target.value === 'custom' ? 'inline-block' : 'none';
+        });
+
+        // ============ SSE 实现 ============
+        async function startSSE() {
+            const goal = document.getElementById('sseGoal').value;
+            const maxSteps = parseInt(document.getElementById('sseMaxSteps').value);
+            const temperature = parseFloat(document.getElementById('sseTemperature').value);
+            const agentType = getAgentType();
+            const baseUrl = getBaseUrl();
+            const token = getToken();
+
+            if (!goal || !agentType) { 
+                debugLog('WARN', 'SSE 启动被阻止: 缺少必要参数', { goal: !!goal, agentType });
+                alert('请输入任务描述和 Agent 类型'); 
+                return; 
+            }
+
+            const status = document.getElementById('sseStatus');
+            const startBtn = document.getElementById('sseStart');
+            const cancelBtn = document.getElementById('sseCancel');
+            
+            status.className = 'status connecting';
+            status.textContent = '● 连接中...';
+            startBtn.disabled = true;
+            cancelBtn.disabled = false;
+
+            const url = `${baseUrl}/agents/${encodeURIComponent(agentType)}/run/stream`;
+            debugLog('ACTION', 'SSE 启动', { url, agent_type: agentType, goal, max_steps: maxSteps, temperature });
+
+            try {
+                const headers = { 'Content-Type': 'application/json' };
+                if (token) headers['Authorization'] = `Bearer ${token}`;
+
+                debugLog('NETWORK', '发送 SSE POST 请求', { url, headers: Object.keys(headers), body: { agent_type: agentType, goal, max_steps: maxSteps, temperature } });
+
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({
+                        agent_type: agentType,
+                        goal,
+                        max_steps: maxSteps,
+                        temperature
+                    })
+                });
+
+                debugLog('NETWORK', `SSE 响应: HTTP ${response.status}`, { status: response.status, ok: response.ok, contentType: response.headers.get('content-type') });
+
+                if (!response.ok) {
+                    const errText = await response.text();
+                    debugLog('ERROR', 'SSE 启动失败', { status: response.status, body: errText });
+                    throw new Error(`HTTP ${response.status}: ${errText}`);
+                }
+
+                status.className = 'status streaming';
+                status.textContent = '● 执行中';
+                debugLog('INFO', 'SSE 连接成功，开始接收事件流');
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let frameCount = 0;
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        debugLog('INFO', `SSE 流结束，共接收 ${frameCount} 个事件帧`);
+                        break;
+                    }
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+
+                    let currentEvent = null;
+                    let currentData = [];
+
+                    for (const line of lines) {
+                        if (line.startsWith('event:')) {
+                            currentEvent = line.slice(6).trim();
+                        } else if (line.startsWith('data:')) {
+                            currentData.push(line.slice(5).trim());
+                        } else if (line === '' && currentEvent) {
+                            const dataStr = currentData.join('\n');
+                            let parsedData = dataStr;
+                            try { parsedData = JSON.parse(dataStr); } catch (e) {}
+                            
+                            frameCount++;
+                            appendSSELog(currentEvent, parsedData);
+                            
+                            // 关键事件详细日志
+                            if (currentEvent === 'session_created' && typeof parsedData === 'object') {
+                                state.currentSessionId = parsedData.session_id;
+                                debugLog('INFO', 'Session 已创建', { session_id: parsedData.session_id });
+                            } else if (currentEvent === 'step') {
+                                debugLog('DEBUG', 'ReAct 步数更新', { step: parsedData.step });
+                            } else if (currentEvent === 'tool_call') {
+                                debugLog('ACTION', '工具调用开始', { tool: parsedData.name, args: parsedData.args });
+                            } else if (currentEvent === 'tool_result') {
+                                debugLog('DEBUG', '工具调用完成', { tool: parsedData.name });
+                            } else if (currentEvent === 'approval_required') {
+                                debugLog('WARN', '收到审批请求', { tool: parsedData.tool_name, risk: parsedData.risk });
+                                showApprovalDialog(parsedData);
+                            } else if (currentEvent === 'approval_result') {
+                                debugLog('INFO', '审批结果已送达', { approved: parsedData.approved });
+                            } else if (currentEvent === 'done') {
+                                debugLog('INFO', 'Agent 执行完成', { success: parsedData.success, steps: parsedData.steps, duration_ms: parsedData.duration_ms });
+                            } else if (currentEvent === 'error') {
+                                debugLog('ERROR', 'Agent 执行错误', { error: parsedData.error || parsedData });
+                            }
+                            
+                            currentEvent = null;
+                            currentData = [];
+                        }
+                    }
+                }
+
+                if (status.classList.contains('streaming')) {
+                    status.className = 'status disconnected';
+                    status.textContent = '● 连接关闭';
+                    startBtn.disabled = false;
+                    cancelBtn.disabled = true;
+                    debugLog('INFO', 'SSE 连接已关闭（正常结束）');
+                }
+
+            } catch (err) {
+                debugLog('ERROR', 'SSE 执行异常', { error: err.message, stack: err.stack });
+                appendSSELog('error', { error: err.message });
+                status.className = 'status disconnected';
+                status.textContent = '● 错误';
+                startBtn.disabled = false;
+                cancelBtn.disabled = true;
+            }
+        }
+
+        function cancelSSE() {
+            const agentType = getAgentType();
+            const baseUrl = getBaseUrl();
+            const token = getToken();
+            
+            if (!state.currentSessionId) {
+                debugLog('WARN', '取消被阻止: 无活跃 session');
+                return;
+            }
+
+            const url = `${baseUrl}/agents/${encodeURIComponent(agentType)}/cancel?session_id=${state.currentSessionId}`;
+            const headers = {};
+            if (token) headers['Authorization'] = `Bearer ${token}`;
+
+            debugLog('ACTION', '发送取消请求', { session_id: state.currentSessionId, url });
+
+            fetch(url, { method: 'POST', headers })
+                .then(r => {
+                    debugLog('NETWORK', `取消响应: HTTP ${r.status}`);
+                    return r.json();
+                })
+                .then(data => { 
+                    debugLog('INFO', '取消成功', data);
+                    appendSSELog('info', { message: '已发送取消请求' });
+                })
+                .catch(err => { 
+                    debugLog('ERROR', '取消请求失败', { error: err.message });
+                    console.error('Cancel failed:', err);
+                });
+        }
+
+        // ============ WebSocket 实现 ============
+        function connectWS() {
+            const sessionId = document.getElementById('wsSessionId').value || 'new';
+            const agentType = getAgentType();
+            const token = getToken();
+            const baseUrl = getBaseUrl();
+
+            if (!agentType) { 
+                debugLog('WARN', 'WebSocket 连接被阻止: 无 Agent 类型');
+                alert('请选择 Agent 类型'); 
+                return; 
+            }
+
+            const wsProtocol = baseUrl.startsWith('https') ? 'wss:' : 'ws:';
+            const wsUrl = `${wsProtocol}//${baseUrl.replace(/^https?:/, '')}/api/sessions/${sessionId}/ws?agent_type=${encodeURIComponent(agentType)}${token ? '&token=' + encodeURIComponent(token) : ''}`;
+
+            debugLog('ACTION', 'WebSocket 连接', { session_id: sessionId, agent_type: agentType, url: wsUrl });
+
+            try {
+                state.ws = new WebSocket(wsUrl);
+            } catch (err) {
+                debugLog('ERROR', 'WebSocket 创建失败', { error: err.message });
+                appendWSLog('Error', { error: err.message });
+                return;
+            }
+
+            const status = document.getElementById('wsStatus');
+            const connectBtn = document.getElementById('wsConnect');
+            const disconnectBtn = document.getElementById('wsDisconnect');
+            const sendInput = document.getElementById('wsMessage');
+            const sendBtn = document.getElementById('wsSend');
+            const interruptBtn = document.getElementById('wsInterrupt');
+            const rewindBtn = document.getElementById('wsRewind');
+
+            status.className = 'status connecting';
+            status.textContent = '● 连接中...';
+
+            state.ws.onopen = () => {
+                status.className = 'status connected';
+                status.textContent = '● 已连接';
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+                sendInput.disabled = false;
+                sendBtn.disabled = false;
+                interruptBtn.disabled = false;
+                rewindBtn.disabled = false;
+                appendWSLog('Info', { message: 'WebSocket 连接已建立' });
+                debugLog('INFO', 'WebSocket 连接成功', { readyState: state.ws.readyState });
+            };
+
+            state.ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    const type = data.type || 'Unknown';
+                    
+                    debugLog('DEBUG', 'WS 接收消息', { type, size: event.data.length });
+                    appendWSLog(type, data);
+                    
+                    if (type === 'SessionCreated') {
+                        state.currentSessionId = data.session_id;
+                        debugLog('INFO', 'WS Session 已创建', { session_id: data.session_id });
+                    } else if (type === 'ApprovalRequired') {
+                        debugLog('WARN', 'WS 收到审批请求', { tool: data.tool_name, risk: data.risk });
+                        showApprovalDialog(data);
+                    } else if (type === 'ApprovalResult') {
+                        debugLog('INFO', 'WS 审批结果', { approved: data.approved });
+                    } else if (type === 'Done') {
+                        debugLog('INFO', 'WS Agent 完成', { success: data.success, steps: data.steps });
+                    } else if (type === 'Error') {
+                        debugLog('ERROR', 'WS Agent 错误', { error: data.error });
+                    } else if (type === 'ToolCall') {
+                        debugLog('ACTION', 'WS 工具调用', { tool: data.name });
+                    } else if (type === 'ToolResult') {
+                        debugLog('DEBUG', 'WS 工具结果', { tool: data.name });
+                    } else if (type === 'LlmDelta') {
+                        // 不逐帧记录，避免日志过多
+                    } else if (type === 'LlmDone') {
+                        debugLog('INFO', 'WS LLM 输出完成', { finish_reason: data.finish_reason });
+                    }
+                } catch (e) {
+                    debugLog('WARN', 'WS 消息解析失败', { raw: event.data.substring(0, 200) });
+                    appendWSLog('Raw', { data: event.data });
+                }
+            };
+
+            state.ws.onerror = (err) => {
+                debugLog('ERROR', 'WebSocket 错误', { error: 'error event' });
+                appendWSLog('Error', { error: 'WebSocket error' });
+            };
+
+            state.ws.onclose = (event) => {
+                status.className = 'status disconnected';
+                status.textContent = '● 已断开';
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+                sendInput.disabled = true;
+                sendBtn.disabled = true;
+                interruptBtn.disabled = true;
+                rewindBtn.disabled = true;
+                appendWSLog('Info', { message: 'WebSocket 连接已关闭' });
+                debugLog('INFO', 'WebSocket 关闭', { code: event.code, reason: event.reason, wasClean: event.wasClean });
+                state.ws = null;
+            };
+        }
+
+        function disconnectWS() {
+            if (state.ws) {
+                debugLog('ACTION', '主动关闭 WebSocket');
+                state.ws.close(1000, 'client disconnect');
+                state.ws = null;
+            }
+        }
+
+        function sendWSMessage(type, extra = {}) {
+            if (!state.ws || state.ws.readyState !== 1) {
+                debugLog('WARN', `WS 消息发送失败: 未连接 (readyState=${state.ws?.readyState})`);
+                return;
+            }
+            const msg = { type, ...extra };
+            debugLog('ACTION', `WS 发送消息: ${type}`, { payload: msg });
+            state.ws.send(JSON.stringify(msg));
+        }
+
+        function sendWSUserMessage() {
+            const input = document.getElementById('wsMessage');
+            const content = input.value.trim();
+            if (!content) return;
+            debugLog('ACTION', '用户发送 WS 消息', { content_length: content.length, session_id: state.currentSessionId });
+            sendWSMessage('message', { content });
+            input.value = '';
+        }
+
+        function interruptWS() {
+            debugLog('ACTION', '用户触发 WS 中断', { session_id: state.currentSessionId });
+            sendWSMessage('interrupt');
+        }
+
+        function rewindWS() {
+            // 使用 inline 对话框替代 prompt()，兼容所有浏览器环境
+            const overlay = document.getElementById('rewindOverlay');
+            const dialog = document.getElementById('rewindDialog');
+            const input = document.getElementById('rewindVersionInput');
+            const confirmBtn = document.getElementById('rewindConfirm');
+            const cancelBtn = document.getElementById('rewindCancel');
+
+            input.value = '';
+            overlay.classList.add('active');
+            dialog.classList.add('active');
+            input.focus();
+
+            const cleanup = () => {
+                overlay.classList.remove('active');
+                dialog.classList.remove('active');
+                confirmBtn.onclick = null;
+                cancelBtn.onclick = null;
+                input.onkeypress = null;
+            };
+
+            const doRewind = () => {
+                const version = parseInt(input.value);
+                cleanup();
+                if (!isNaN(version)) {
+                    debugLog('ACTION', '用户触发 WS 回滚', { version, session_id: state.currentSessionId });
+                    sendWSMessage('rewind', { version });
+                } else {
+                    debugLog('WARN', '回滚版本号无效', { input: input.value });
+                }
+            };
+
+            confirmBtn.onclick = doRewind;
+            cancelBtn.onclick = () => {
+                cleanup();
+                debugLog('DEBUG', '用户取消回滚操作');
+            };
+            input.onkeypress = (e) => {
+                if (e.key === 'Enter') doRewind();
+            };
+        }
+
+        // ============ 审批对话框 ============
+        function showApprovalDialog(data) {
+            state.pendingApproval = {
+                tool_name: data.tool_name,
+                command: data.command,
+                risk: data.risk,
+                alternative: data.alternative
+            };
+            
+            debugLog('ACTION', '审批对话框打开', {
+                tool: data.tool_name,
+                command: data.command,
+                risk: data.risk,
+                alternative: data.alternative,
+                session_id: state.currentSessionId
+            });
+            
+            const detail = document.getElementById('approvalDetail');
+            detail.innerHTML = `
+                <div><strong>工具:</strong> ${data.tool_name}</div>
+                <div><strong>命令:</strong> <code>${data.command}</code></div>
+                <div><strong>风险:</strong> <span style="color: ${data.risk === 'high' ? '#e74c3c' : '#f39c12'}">${data.risk}</span></div>
+                <div><strong>替代方案:</strong> ${data.alternative || '无'}</div>
+                <div style="margin-top: 10px; font-size: 11px; color: #999;">超时: 60秒未响应将自动拒绝</div>
+            `;
+            
+            document.getElementById('dialogOverlay').classList.add('active');
+            document.getElementById('approvalDialog').classList.add('active');
+            
+            // 超时自动拒绝
+            state._approvalTimer = setTimeout(() => {
+                debugLog('WARN', '审批超时，自动拒绝', { tool: data.tool_name });
+                hideApprovalDialog();
+                submitApproval(false, true);
+            }, 60000);
+        }
+
+        function hideApprovalDialog() {
+            if (state._approvalTimer) {
+                clearTimeout(state._approvalTimer);
+                state._approvalTimer = null;
+            }
+            document.getElementById('dialogOverlay').classList.remove('active');
+            document.getElementById('approvalDialog').classList.remove('active');
+            state.pendingApproval = null;
+            debugLog('DEBUG', '审批对话框关闭');
+        }
+
+        function submitApproval(approved, autoTimeout) {
+            if (!state.pendingApproval) return;
+            
+            const agentType = getAgentType();
+            const baseUrl = getBaseUrl();
+            const token = getToken();
+            const sessionId = state.currentSessionId;
+            const pendingTool = state.pendingApproval.tool_name;
+            
+            debugLog('ACTION', `提交审批: ${approved ? '批准' : '拒绝'}${autoTimeout ? ' (超时自动)' : ''}`, {
+                session_id: sessionId,
+                tool: pendingTool,
+                risk: state.pendingApproval.risk
+            });
+            
+            if (!sessionId) { 
+                debugLog('ERROR', '审批提交失败: 无活跃 session');
+                alert('没有活跃的 session'); 
+                return; 
+            }
+
+            const url = `${baseUrl}/agents/${encodeURIComponent(agentType)}/approve`;
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) headers['Authorization'] = `Bearer ${token}`;
+
+            debugLog('NETWORK', '发送审批 HTTP 请求', { url, method: 'POST', body: { session_id: sessionId, approved } });
+
+            fetch(url, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ session_id: sessionId, approved })
+            })
+            .then(r => {
+                debugLog('NETWORK', `审批响应: HTTP ${r.status}`, { status: r.status });
+                return r.json();
+            })
+            .then(data => { 
+                debugLog('INFO', '审批结果送达成功', data);
+                appendSSELog('approval_result', data);
+            })
+            .catch(err => { 
+                debugLog('ERROR', '审批请求失败', { error: err.message, stack: err.stack }); 
+                console.error('Approval failed:', err);
+            });
+
+            if (!autoTimeout) hideApprovalDialog();
+        }
+
+        // ============ 事件绑定 ============
+        document.getElementById('sseStart').addEventListener('click', startSSE);
+        document.getElementById('sseCancel').addEventListener('click', cancelSSE);
+        document.getElementById('wsConnect').addEventListener('click', connectWS);
+        document.getElementById('wsDisconnect').addEventListener('click', disconnectWS);
+        document.getElementById('wsSend').addEventListener('click', sendWSUserMessage);
+        document.getElementById('wsInterrupt').addEventListener('click', interruptWS);
+        document.getElementById('wsRewind').addEventListener('click', rewindWS);
+        document.getElementById('wsMessage').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendWSUserMessage();
+        });
+        document.getElementById('approvalApprove').addEventListener('click', () => submitApproval(true));
+        document.getElementById('approvalReject').addEventListener('click', () => submitApproval(false));
+        document.getElementById('dialogOverlay').addEventListener('click', hideApprovalDialog);
+        
+        // Debug 面板事件
+        document.getElementById('debugPanelHeader').addEventListener('click', () => {
+            const panel = document.getElementById('debugPanel');
+            const btn = document.getElementById('debugToggle');
+            panel.classList.toggle('open');
+            btn.textContent = panel.classList.contains('open') ? '收起' : '展开';
+        });
+        document.getElementById('debugExport').addEventListener('click', (e) => {
+            e.stopPropagation();
+            exportDebugLogs();
+        });
+        document.getElementById('debugClear').addEventListener('click', (e) => {
+            e.stopPropagation();
+            clearDebugLogs();
+        });
+        document.getElementById('debugToggle').addEventListener('click', (e) => {
+            e.stopPropagation();
+            const panel = document.getElementById('debugPanel');
+            panel.classList.toggle('open');
+            document.getElementById('debugToggle').textContent = panel.classList.contains('open') ? '收起' : '展开';
+        });
+
+        // 启动日志
+        debugLog('INFO', 'Evo-Agent 测试控制台已启动', { 
+            version: '1.1.0',
+            url: getBaseUrl(),
+            userAgent: navigator.userAgent
+        });
+        debugLog('DEBUG', '配置参数', {
+            agent_type: getAgentType(),
+            has_token: !!getToken()
+        });
+    </script>
+</body>
+</html>

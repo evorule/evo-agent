@@ -55,7 +55,10 @@ async fn main() {
     // 3. 用 AgentDefinitionManager 加载
     let mgr = AgentDefinitionManager::new(agents_dir.clone());
     let def = mgr.load("researcher").expect("load researcher.json");
-    println!("Loaded agent: type={}, version={}", def.agent_type, def.version);
+    println!(
+        "Loaded agent: type={}, version={}",
+        def.agent_type, def.version
+    );
     println!("  model: {}", def.model);
     println!("  tools: {:?}", def.tools);
     println!("  memory.type: {}", def.memory.memory_type);
@@ -68,7 +71,14 @@ async fn main() {
     println!("\nTool handler registered {} tools", {
         // 用 has_tool 测试每个,或干脆只确认这几个在
         let mut count = 0;
-        for n in &["file_read", "file_list", "file_write", "search_files", "shell_exec", "http_get"] {
+        for n in &[
+            "file_read",
+            "file_list",
+            "file_write",
+            "search_files",
+            "shell_exec",
+            "http_get",
+        ] {
             if tool_handler.has_tool(n) {
                 count += 1;
             } else {

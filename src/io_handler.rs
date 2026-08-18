@@ -3,7 +3,7 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! I/O Handler trait
 
-use tier0_tcb::JsonValue;
+use evorule_tcb::JsonValue;
 
 /// I/O operation result type
 pub type IoResult = Result<JsonValue, String>;

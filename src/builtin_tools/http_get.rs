@@ -34,7 +34,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use tier0_tcb::JsonValue;
+use evorule_tcb::JsonValue;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -90,6 +90,7 @@ pub enum HostCategory {
 }
 
 /// `http_get` 工具
+#[derive(Clone)]
 pub struct HttpGetTool {
     timeout: Duration,
     max_bytes: u64,
@@ -213,81 +214,68 @@ impl HttpGetTool {
         }
     }
 
-    /// 实际 HTTP GET(同步包装,内部用 tokio current_thread runtime)
-    fn fetch_sync(&self, url: &str) -> IoResult {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+    /// 实际 HTTP GET(G13:原生 async,不再创建独立 runtime)
+    async fn fetch(&self, url: &str) -> IoResult {
+        let client = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS as usize))
+            .user_agent("evo-agent/0.1.0")
             .build()
-            .map_err(|e| format!("failed to build tokio runtime: {}", e))?;
+            .map_err(|e| format!("client build: {}", e))?;
 
-        let url_owned = url.to_string();
-        let max_bytes = self.max_bytes;
-        let timeout = self.timeout;
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("request: {}", e))?;
 
-        rt.block_on(async move {
-            let client = reqwest::Client::builder()
-                .timeout(timeout)
-                .connect_timeout(Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS as usize))
-                .user_agent("evo-agent/0.1.0")
-                .build()
-                .map_err(|e| format!("client build: {}", e))?;
+        let status = resp.status();
+        let final_url = resp.url().to_string();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
 
-            let resp = client
-                .get(&url_owned)
-                .send()
-                .await
-                .map_err(|e| format!("request: {}", e))?;
-
-            let status = resp.status();
-            let final_url = resp.url().to_string();
-            let content_type = resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-
-            if let Some(len) = resp.content_length() {
-                if len > max_bytes {
-                    return Err(format!(
-                        "response too large: {} bytes (max {})",
-                        len, max_bytes
-                    ));
-                }
-            }
-
-            let body_bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| format!("body: {}", e))?;
-
-            if body_bytes.len() as u64 > max_bytes {
+        if let Some(len) = resp.content_length() {
+            if len > self.max_bytes {
                 return Err(format!(
                     "response too large: {} bytes (max {})",
-                    body_bytes.len(),
-                    max_bytes
+                    len, self.max_bytes
                 ));
             }
+        }
 
-            let body_text = String::from_utf8_lossy(&body_bytes).to_string();
+        let body_bytes = resp.bytes().await.map_err(|e| format!("body: {}", e))?;
 
-            let mut map = std::collections::BTreeMap::new();
-            map.insert("status".to_string(), JsonValue::string("ok"));
-            map.insert("url".to_string(), JsonValue::string(url_owned));
-            map.insert("final_url".to_string(), JsonValue::string(final_url));
-            map.insert(
-                "http_status".to_string(),
-                JsonValue::Integer(status.as_u16() as i64),
-            );
-            map.insert("content_type".to_string(), JsonValue::string(content_type));
-            map.insert(
-                "body_size".to_string(),
-                JsonValue::Integer(body_bytes.len() as i64),
-            );
-            map.insert("body".to_string(), JsonValue::string(body_text));
-            Ok(JsonValue::object(map))
-        })
+        if body_bytes.len() as u64 > self.max_bytes {
+            return Err(format!(
+                "response too large: {} bytes (max {})",
+                body_bytes.len(),
+                self.max_bytes
+            ));
+        }
+
+        let body_text = String::from_utf8_lossy(&body_bytes).to_string();
+        let url_owned = url.to_string();
+
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("status".to_string(), JsonValue::string("ok"));
+        map.insert("url".to_string(), JsonValue::string(url_owned));
+        map.insert("final_url".to_string(), JsonValue::string(final_url));
+        map.insert(
+            "http_status".to_string(),
+            JsonValue::Integer(status.as_u16() as i64),
+        );
+        map.insert("content_type".to_string(), JsonValue::string(content_type));
+        map.insert(
+            "body_size".to_string(),
+            JsonValue::Integer(body_bytes.len() as i64),
+        );
+        map.insert("body".to_string(), JsonValue::string(body_text));
+        Ok(JsonValue::object(map))
     }
 
     /// 构造 proposal
@@ -327,8 +315,10 @@ impl Default for HttpGetTool {
     }
 }
 
+#[async_trait::async_trait]
 impl ToolFunction for HttpGetTool {
-    fn call(&self, args: &JsonValue) -> IoResult {
+    /// G13:async 入口 — 直接 await reqwest(无需 spawn_blocking)
+    async fn call(&self, args: &JsonValue) -> IoResult {
         let url = args
             .get("url")
             .and_then(|v| v.as_str())
@@ -340,18 +330,17 @@ impl ToolFunction for HttpGetTool {
             .unwrap_or(false);
 
         match Self::classify(url) {
-            HostCategory::Active => self.fetch_sync(url),
+            HostCategory::Active => self.fetch(url).await,
             HostCategory::Candidate { host } => {
                 if approved {
-                    self.fetch_sync(url)
+                    self.fetch(url).await
                 } else {
                     Self::make_proposal(url, &host)
                 }
             }
-            HostCategory::Blocked { reason } => Err(format!(
-                "host BLOCKED: {} (reason: {})",
-                url, reason
-            )),
+            HostCategory::Blocked { reason } => {
+                Err(format!("host BLOCKED: {} (reason: {})", url, reason))
+            }
             HostCategory::Invalid => Err(format!("invalid URL: '{}'", url)),
         }
     }
@@ -496,14 +485,19 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_candidate_returns_proposal_without_approval() {
+    #[tokio::test]
+    async fn test_candidate_returns_proposal_without_approval() {
         let tool = HttpGetTool::new();
-        let result = tool.call(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("url".to_string(), JsonValue::string("https://example.com/foo"));
-            m
-        }));
+        let result = tool
+            .call(&JsonValue::object({
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "url".to_string(),
+                    JsonValue::string("https://example.com/foo"),
+                );
+                m
+            }))
+            .await;
         let v = result.expect("should return proposal, not error");
         assert_eq!(v.get("status").unwrap().as_str().unwrap(), "needs_approval");
         assert!(v.get("description").is_some());
@@ -511,24 +505,29 @@ mod tests {
         assert!(v.get("alternative").is_some());
     }
 
-    #[test]
-    fn test_blocked_host_always_rejected() {
+    #[tokio::test]
+    async fn test_blocked_host_always_rejected() {
         let tool = HttpGetTool::new();
-        let result = tool.call(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("url".to_string(), JsonValue::string("https://192.168.1.1/admin"));
-            m.insert("approved".to_string(), JsonValue::Bool(true));
-            m
-        }));
+        let result = tool
+            .call(&JsonValue::object({
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "url".to_string(),
+                    JsonValue::string("https://192.168.1.1/admin"),
+                );
+                m.insert("approved".to_string(), JsonValue::Bool(true));
+                m
+            }))
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("BLOCKED"), "got: {}", err);
     }
 
-    #[test]
-    fn test_missing_url_arg() {
+    #[tokio::test]
+    async fn test_missing_url_arg() {
         let tool = HttpGetTool::new();
-        let result = tool.call(&JsonValue::object(Default::default()));
+        let result = tool.call(&JsonValue::object(Default::default())).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing required arg"));
     }

@@ -28,6 +28,7 @@
 //! default = "general"
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,12 @@ pub struct LlmConfig {
     /// 失败重试次数
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
+    /// G2:上下文窗口 token 数(默认 8192,按模型调整)
+    ///
+    /// `AgentRunner` 用此值构造 `ContextWindowManager`,
+    /// 在发给 LLM 前裁剪历史消息,保留 system + 最近若干轮。
+    #[serde(default = "default_context_window_tokens")]
+    pub context_window_tokens: usize,
 }
 
 impl LlmConfig {
@@ -82,6 +89,11 @@ fn default_max_retries() -> usize {
     3
 }
 
+/// G2:默认上下文窗口 token 数
+fn default_context_window_tokens() -> usize {
+    8192
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -91,6 +103,7 @@ impl Default for LlmConfig {
             api_base: Self::default_api_base(),
             timeout_secs: default_llm_timeout(),
             max_retries: default_max_retries(),
+            context_window_tokens: default_context_window_tokens(),
         }
     }
 }
@@ -165,6 +178,34 @@ impl Default for LoggingConfig {
     }
 }
 
+/// G7:HTTP API 鉴权配置
+///
+/// ```toml
+/// [auth]
+/// enabled = true
+/// tokens = ["secret-token-1", "secret-token-2"]
+/// ```
+///
+/// 环境变量:`EVO_AGENT_AUTH__ENABLED=true`、`EVO_AGENT_AUTH__TOKENS=t1,t2`
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default)]
+pub struct AuthConfigFile {
+    /// 是否启用鉴权(默认 false,开发模式)
+    #[serde(default)]
+    pub enabled: bool,
+    /// 合法 token 列表
+    #[serde(default)]
+    pub tokens: Vec<String>,
+}
+
+
+impl AuthConfigFile {
+    /// 转换为 API 层的 `AuthConfig`
+    pub fn to_auth_config(&self) -> crate::api::auth::AuthConfig {
+        crate::api::auth::AuthConfig::new(self.tokens.clone(), self.enabled)
+    }
+}
+
 /// AgentDefinition 配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentsConfig {
@@ -196,6 +237,37 @@ impl Default for AgentsConfig {
     }
 }
 
+/// G12:MCP server 配置(单个 server)
+///
+/// ```toml
+/// [[mcp.servers]]
+/// name = "filesystem"
+/// command = "npx"
+/// args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+/// env = { GITHUB_TOKEN = "ghp_..." }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpServerConfig {
+    /// server 名称(用于工具名前缀 `mcp_{name}_{tool}`)
+    pub name: String,
+    /// 启动命令(如 `npx` / `node` / `python`)
+    pub command: String,
+    /// 命令参数
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 环境变量(注入子进程,用于 token 等)
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+/// G12:MCP 配置(包含多个 server)
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct McpConfig {
+    /// MCP server 列表
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
 /// 完整配置
 ///
 /// 任何字段都可缺失(用 `#[serde(default)]`),分层合并时只覆盖有值的字段。
@@ -213,6 +285,12 @@ pub struct Config {
     #[serde(default)]
     /// TODO: doc
     pub agents: AgentsConfig,
+    #[serde(default)]
+    /// G7:HTTP API 鉴权配置
+    pub auth: AuthConfigFile,
+    #[serde(default)]
+    /// G12:MCP server 配置(可配置多个 stdio MCP server)
+    pub mcp: McpConfig,
 }
 
 /// 配置加载/解析错误
@@ -338,28 +416,22 @@ impl Config {
         let value: toml::Value = content.parse().map_err(ConfigError::Parse)?;
 
         if let Some(table) = value.get("llm") {
-            self.llm = table
-                .clone()
-                .try_into()
-                .map_err(ConfigError::Parse)?;
+            self.llm = table.clone().try_into().map_err(ConfigError::Parse)?;
         }
         if let Some(table) = value.get("evorule") {
-            self.evorule = table
-                .clone()
-                .try_into()
-                .map_err(ConfigError::Parse)?;
+            self.evorule = table.clone().try_into().map_err(ConfigError::Parse)?;
         }
         if let Some(table) = value.get("logging") {
-            self.logging = table
-                .clone()
-                .try_into()
-                .map_err(ConfigError::Parse)?;
+            self.logging = table.clone().try_into().map_err(ConfigError::Parse)?;
         }
         if let Some(table) = value.get("agents") {
-            self.agents = table
-                .clone()
-                .try_into()
-                .map_err(ConfigError::Parse)?;
+            self.agents = table.clone().try_into().map_err(ConfigError::Parse)?;
+        }
+        if let Some(table) = value.get("auth") {
+            self.auth = table.clone().try_into().map_err(ConfigError::Parse)?;
+        }
+        if let Some(table) = value.get("mcp") {
+            self.mcp = table.clone().try_into().map_err(ConfigError::Parse)?;
         }
 
         Ok(())
@@ -392,6 +464,11 @@ impl Config {
                 self.llm.max_retries = n;
             }
         }
+        if let Ok(v) = std::env::var("EVO_AGENT_LLM__CONTEXT_WINDOW_TOKENS") {
+            if let Ok(n) = v.parse() {
+                self.llm.context_window_tokens = n;
+            }
+        }
 
         if let Ok(v) = std::env::var("EVO_AGENT_EVORULE__BASE_URL") {
             self.evorule.base_url = v;
@@ -418,6 +495,14 @@ impl Config {
         if let Ok(v) = std::env::var("EVO_AGENT_AGENTS__DEFAULT") {
             self.agents.default = v;
         }
+
+        // G7:鉴权配置
+        if let Ok(v) = std::env::var("EVO_AGENT_AUTH__ENABLED") {
+            self.auth.enabled = v == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("EVO_AGENT_AUTH__TOKENS") {
+            self.auth.tokens = v.split(',').map(|s| s.trim().to_string()).collect();
+        }
     }
 
     /// 解析 `${ENV:VAR_NAME}` 占位符
@@ -436,8 +521,7 @@ impl Config {
     fn resolve_env_placeholders_lenient(&mut self) {
         self.llm.api_key = resolve_env_placeholder_lenient(&self.llm.api_key);
         if !self.evorule.api_key.is_empty() {
-            self.evorule.api_key =
-                resolve_env_placeholder_lenient(&self.evorule.api_key);
+            self.evorule.api_key = resolve_env_placeholder_lenient(&self.evorule.api_key);
         }
     }
 
@@ -498,10 +582,7 @@ impl Config {
             other => {
                 return Err(ConfigError::InvalidValue {
                     field: "logging.format".to_string(),
-                    reason: format!(
-                        "unknown format '{}', expected one of: json, pretty",
-                        other
-                    ),
+                    reason: format!("unknown format '{}', expected one of: json, pretty", other),
                 });
             }
         }
@@ -564,10 +645,7 @@ impl Config {
             other => {
                 return Err(ConfigError::InvalidValue {
                     field: "logging.format".to_string(),
-                    reason: format!(
-                        "unknown format '{}', expected one of: json, pretty",
-                        other
-                    ),
+                    reason: format!("unknown format '{}', expected one of: json, pretty", other),
                 });
             }
         }
@@ -797,9 +875,21 @@ default = "coder"
         let cfg = Config::load(project_dir).expect("load should succeed");
 
         // 还原
-        if let Some(h) = saved_home { std::env::set_var("HOME", h); } else { std::env::remove_var("HOME"); }
-        if let Some(a) = saved_appdata { std::env::set_var("APPDATA", a); } else { std::env::remove_var("APPDATA"); }
-        if let Some(x) = saved_xdg { std::env::set_var("XDG_CONFIG_HOME", x); } else { std::env::remove_var("XDG_CONFIG_HOME"); }
+        if let Some(h) = saved_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(a) = saved_appdata {
+            std::env::set_var("APPDATA", a);
+        } else {
+            std::env::remove_var("APPDATA");
+        }
+        if let Some(x) = saved_xdg {
+            std::env::set_var("XDG_CONFIG_HOME", x);
+        } else {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
 
         assert_eq!(cfg.llm.provider, "openai");
         assert_eq!(cfg.llm.api_key, "literal-key-123");
@@ -832,9 +922,89 @@ api_key = "${ENV:TEST_EVO_API_KEY_99}"
 
         let cfg = Config::load(tmp.path()).expect("load should succeed");
 
-        if let Some(h) = saved_home { std::env::set_var("HOME", h); } else { std::env::remove_var("HOME"); }
+        if let Some(h) = saved_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
         std::env::remove_var("TEST_EVO_API_KEY_99");
 
         assert_eq!(cfg.llm.api_key, "real-secret-from-env");
+    }
+
+    #[test]
+    fn test_mcp_config_default_empty() {
+        let cfg = Config::default();
+        assert!(cfg.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_config_merge_from_file() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("evo-agent.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[llm]
+api_key = "literal"
+
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[[mcp.servers]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "ghp_secret" }
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.merge_from_file(&toml_path).unwrap();
+
+        assert_eq!(cfg.mcp.servers.len(), 2);
+        assert_eq!(cfg.mcp.servers[0].name, "filesystem");
+        assert_eq!(cfg.mcp.servers[0].command, "npx");
+        assert_eq!(cfg.mcp.servers[0].args.len(), 3);
+        assert!(cfg.mcp.servers[0].env.is_empty());
+
+        assert_eq!(cfg.mcp.servers[1].name, "github");
+        assert_eq!(
+            cfg.mcp.servers[1].env.get("GITHUB_TOKEN"),
+            Some(&"ghp_secret".to_string())
+        );
+    }
+
+    #[test]
+    fn test_mcp_config_optional_fields_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("evo-agent.toml");
+        // 只给 name + command,args/env 应默认为空
+        std::fs::write(
+            &toml_path,
+            r#"
+[llm]
+api_key = "k"
+
+[[mcp.servers]]
+name = "minimal"
+command = "echo"
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.merge_from_file(&toml_path).unwrap();
+
+        assert_eq!(cfg.mcp.servers.len(), 1);
+        assert_eq!(cfg.mcp.servers[0].name, "minimal");
+        assert_eq!(cfg.mcp.servers[0].command, "echo");
+        assert!(cfg.mcp.servers[0].args.is_empty());
+        assert!(cfg.mcp.servers[0].env.is_empty());
     }
 }

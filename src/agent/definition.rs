@@ -87,9 +87,7 @@ impl MessagePersistConfig {
             "every_n" => {
                 let n = self.n.unwrap_or(0);
                 if n == 0 {
-                    return Err(
-                        "message_persist.n must be > 0 when mode == 'every_n'".to_string(),
-                    );
+                    return Err("message_persist.n must be > 0 when mode == 'every_n'".to_string());
                 }
                 Ok(crate::agent::memory::MessagePersistMode::EveryN(n))
             }
@@ -123,6 +121,43 @@ pub struct MemoryConfig {
     /// P0+P1 阶段不使用此字段，仅占位。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_model: Option<String>,
+    /// G14/Q18:事件提取模型名称（可选，单独配置 `extraction_model`）
+    ///
+    /// 设置后 032 EventExtractor 使用此模型从对话中提取结构化事件字段，
+    /// 否则 fallback 到主 `model`。可用便宜模型(如 GPT-4o-mini)降低成本。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_model: Option<String>,
+    /// C3: 记忆区占窗口的比例（默认 0.25）
+    #[serde(default = "default_memory_budget_ratio")]
+    pub memory_budget_ratio: f32,
+    /// C2: 最近 N 个会话摘要（默认 3）
+    #[serde(default = "default_max_session_summaries")]
+    pub max_session_summaries: usize,
+    /// C2: top-K 事件（默认 5）
+    #[serde(default = "default_max_injected_events")]
+    pub max_injected_events: usize,
+    /// C4: L1 摘要 rollup 阈值（默认 10）
+    #[serde(default = "default_summary_rollup_threshold")]
+    pub summary_rollup_threshold: usize,
+    /// C1: 是否启用事件提取（默认 true）
+    #[serde(default = "default_true")]
+    pub enable_event_extraction: bool,
+}
+
+fn default_memory_budget_ratio() -> f32 {
+    0.25
+}
+fn default_max_session_summaries() -> usize {
+    3
+}
+fn default_max_injected_events() -> usize {
+    5
+}
+fn default_summary_rollup_threshold() -> usize {
+    10
+}
+fn default_true() -> bool {
+    true
 }
 
 impl Default for MemoryConfig {
@@ -133,6 +168,12 @@ impl Default for MemoryConfig {
             message_persist: MessagePersistConfig::default(),
             ttl_secs: None,
             summary_model: None,
+            extraction_model: None,
+            memory_budget_ratio: default_memory_budget_ratio(),
+            max_session_summaries: default_max_session_summaries(),
+            max_injected_events: default_max_injected_events(),
+            summary_rollup_threshold: default_summary_rollup_threshold(),
+            enable_event_extraction: default_true(),
         }
     }
 }
@@ -145,6 +186,13 @@ pub struct OutputFormat {
     pub format_type: String,
     /// Output schema (optional)
     pub schema: Option<serde_json::Value>,
+    /// G11:校验失败时的最大重试次数(可选,默认 2)
+    ///
+    /// LLM 输出不符合 schema 时,runner 注入校正消息让 LLM 重试。
+    /// 超过 `max_retries` 次后降级为接受原输出(避免死循环)。
+    /// 设为 `Some(0)` 表示不重试,首次失败即降级接受。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<usize>,
 }
 
 /// Agent definition
@@ -173,6 +221,35 @@ pub struct AgentDefinition {
     pub memory: MemoryConfig,
     /// Output format configuration (optional)
     pub output_format: Option<OutputFormat>,
+    /// G2:上下文窗口 token 数(可选,默认 8192)
+    ///
+    /// 设为 `None` 时使用 `AgentConfig` 默认值。设为 `Some(n)` 时,
+    /// `ContextWindowManager` 会按 `n` 裁剪历史消息,保留 system + 最近若干轮。
+    /// 预留 1/4 给响应,实际可用输入 = `n - n/4`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<usize>,
+    /// G13:单轮内并行工具调用上限(可选,默认 1 = 串行)
+    ///
+    /// - `1`(默认):工具按顺序串行执行(向后兼容旧行为)
+    /// - `>1`:同一 ReAct 步骤中多个 active 工具调用并行执行(用 `futures::future::join_all`)
+    ///
+    /// candidate 工具(需审批)始终串行执行,不受此参数影响。
+    /// 设为 `0` 视为 `1`(防御性)。
+    #[serde(
+        default = "default_max_parallel_tools",
+        skip_serializing_if = "is_max_parallel_tools_default"
+    )]
+    pub max_parallel_tools: usize,
+}
+
+/// G13:`max_parallel_tools` 的默认值(串行)
+fn default_max_parallel_tools() -> usize {
+    1
+}
+
+/// G13:序列化时若为默认值(1)则跳过
+fn is_max_parallel_tools_default(v: &usize) -> bool {
+    *v == 1
 }
 
 impl AgentDefinition {
@@ -217,6 +294,13 @@ impl AgentDefinition {
             step_timeout: std::time::Duration::from_secs(self.step_timeout_secs),
             tool_names: self.tools.clone(),
             llm_retry_count: AgentConfig::default().llm_retry_count,
+            output_format: self.output_format.clone(),
+            // G13:0 视为 1(防御性);None 时用 AgentConfig 默认值
+            max_parallel_tools: if self.max_parallel_tools == 0 {
+                1
+            } else {
+                self.max_parallel_tools
+            },
         }
     }
 }
@@ -397,6 +481,8 @@ mod tests {
             tools: vec!["write_file".to_string()],
             memory: MemoryConfig::default(),
             output_format: None,
+            context_window_tokens: None,
+            max_parallel_tools: 1,
         };
         let config = def.to_agent_config();
         assert_eq!(config.agent_type, "writer");
@@ -406,6 +492,7 @@ mod tests {
         assert_eq!(config.max_steps, 15);
         assert_eq!(config.step_timeout, std::time::Duration::from_secs(45));
         assert_eq!(config.tool_names, vec!["write_file"]);
+        assert_eq!(config.max_parallel_tools, 1);
     }
 
     #[test]
@@ -473,7 +560,10 @@ mod tests {
             n: None,
         };
         let mode = cfg.to_mode().expect("per_react_round");
-        assert_eq!(mode, crate::agent::memory::MessagePersistMode::PerReactRound);
+        assert_eq!(
+            mode,
+            crate::agent::memory::MessagePersistMode::PerReactRound
+        );
     }
 
     #[test]
@@ -653,6 +743,124 @@ mod tests {
         assert_eq!(def.memory.summary_model, Some("gpt-4o-mini".to_string()));
 
         let mode = def.memory.message_persist.to_mode().expect("to_mode");
-        assert_eq!(mode, crate::agent::memory::MessagePersistMode::PerReactRound);
+        assert_eq!(
+            mode,
+            crate::agent::memory::MessagePersistMode::PerReactRound
+        );
+    }
+
+    // ===== G13: max_parallel_tools 测试 =====
+
+    #[test]
+    fn test_max_parallel_tools_defaults_to_1() {
+        // 旧版 agent.json 不含 max_parallel_tools,应默认 1(串行)
+        let json = r#"{
+            "agent_type": "simple",
+            "version": "1.0.0",
+            "description": "",
+            "system_prompt": "",
+            "model": "gpt-4o-mini",
+            "temperature": 0.5,
+            "max_steps": 10,
+            "step_timeout_secs": 30,
+            "tools": [],
+            "output_format": null
+        }"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert_eq!(def.max_parallel_tools, 1, "default should be 1 (serial)");
+    }
+
+    #[test]
+    fn test_max_parallel_tools_custom_value() {
+        let json = r#"{
+            "agent_type": "parallel",
+            "version": "1.0.0",
+            "description": "",
+            "system_prompt": "",
+            "model": "gpt-4o-mini",
+            "temperature": 0.5,
+            "max_steps": 10,
+            "step_timeout_secs": 30,
+            "tools": [],
+            "output_format": null,
+            "max_parallel_tools": 4
+        }"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert_eq!(def.max_parallel_tools, 4);
+
+        let config = def.to_agent_config();
+        assert_eq!(config.max_parallel_tools, 4);
+    }
+
+    #[test]
+    fn test_max_parallel_tools_zero_treated_as_one() {
+        // 0 视为 1(防御性)
+        let json = r#"{
+            "agent_type": "zero",
+            "version": "1.0.0",
+            "description": "",
+            "system_prompt": "",
+            "model": "gpt-4o-mini",
+            "temperature": 0.5,
+            "max_steps": 10,
+            "step_timeout_secs": 30,
+            "tools": [],
+            "output_format": null,
+            "max_parallel_tools": 0
+        }"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert_eq!(def.max_parallel_tools, 0, "raw value preserved as 0");
+        // to_agent_config 应把 0 规范化为 1
+        let config = def.to_agent_config();
+        assert_eq!(config.max_parallel_tools, 1, "0 should be normalized to 1");
+    }
+
+    #[test]
+    fn test_max_parallel_tools_skipped_when_default_in_serialization() {
+        let def = AgentDefinition {
+            agent_type: "x".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            system_prompt: String::new(),
+            model: "m".to_string(),
+            temperature: 0.5,
+            max_steps: 1,
+            step_timeout_secs: 1,
+            tools: vec![],
+            memory: MemoryConfig::default(),
+            output_format: None,
+            context_window_tokens: None,
+            max_parallel_tools: 1,
+        };
+        let json = serde_json::to_string(&def).expect("serialize");
+        assert!(
+            !json.contains("max_parallel_tools"),
+            "default value should be skipped: {}",
+            json
+        );
+    }
+
+    // ===== C3/C4: MemoryConfig 新增字段默认值测试 =====
+
+    #[test]
+    fn test_memory_config_defaults() {
+        let cfg = MemoryConfig::default();
+        assert!((cfg.memory_budget_ratio - 0.25).abs() < 1e-6);
+        assert_eq!(cfg.max_session_summaries, 3);
+        assert_eq!(cfg.max_injected_events, 5);
+        assert_eq!(cfg.summary_rollup_threshold, 10);
+        assert!(cfg.enable_event_extraction);
+    }
+
+    #[test]
+    fn test_memory_config_c3_c4_fields_backward_compat() {
+        // 旧版 agent.json 不含 C3/C4 字段，反序列化应使用默认值
+        let json = r#"{"type":"persistent","namespace":"researcher"}"#;
+        let cfg: MemoryConfig = serde_json::from_str(json).expect("parse");
+        assert!((cfg.memory_budget_ratio - 0.25).abs() < 1e-6);
+        assert_eq!(cfg.max_session_summaries, 3);
+        assert_eq!(cfg.max_injected_events, 5);
+        assert_eq!(cfg.summary_rollup_threshold, 10);
+        assert!(cfg.enable_event_extraction);
     }
 }

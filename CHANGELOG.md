@@ -47,7 +47,7 @@
 
 - **协议统一为 AGPL-3.0-or-later**
 - **.gitee/PULL_REQUEST_TEMPLATE.md** — 复用 evorule 的人类审查 checklist
-- **65 个 .rs 文件 SPDX header** — 含 evo-agent 全部 17 个 + tier1-reactor/src/ffi.rs
+- **65 个 .rs 文件 SPDX header** — 含 evo-agent 全部 17 个 + evorule-reactor/src/ffi.rs
 
 ### 🐛 修复
 
@@ -147,13 +147,13 @@
 
 - **`io_dispatcher`**(~80 行) — I/O 派发
 - **`io_handler`**(~15 行) — `IoHandler` trait + `IoResult`
-- **`json_convert`**(~110 行) — `serde_json::Value` ↔ `tier0_tcb::JsonValue` 转换
+- **`json_convert`**(~110 行) — `serde_json::Value` ↔ `evorule_tcb::JsonValue` 转换
 
 ### 🔄 变更
 
 - **依赖**:
-  - `tier0-tcb` (path: `../evorule/tier0-tcb`)
-  - `tier1-reactor` (path: `../evorule/tier1-reactor`)
+  - `evorule-tcb` (path: `../evorule/evorule-tcb`)
+  - `evorule-reactor` (path: `../evorule/evorule-reactor`)
   - `tokio` (full features)
   - `reqwest` 0.12(异步 HTTP 客户端)
   - `axum` 0.8(HTTP 服务)
@@ -255,9 +255,9 @@ cargo update evo-agent
 ┌────────────────┴───────────────────────┐
 │  机制层:evorule (独立仓库)              │
 │  https://gitee.com/evorulelab/evorule  │
-│  - tier0-tcb (核心)                    │
-│  - tier1-reactor (反应器)              │
-│  - tier2-governance (HTTP/SSE)         │
+│  - evorule-tcb (核心)                    │
+│  - evorule-reactor (反应器)              │
+│  - evorule-governance (HTTP/SSE)         │
 └────────────────────────────────────────┘
 ```
 
@@ -287,7 +287,7 @@ cargo update evo-agent
 
 ## 历史背景
 
-`evo-agent` 早期是 evorule 项目内部的一部分(在 `evorule/tier2-governance/` 中),后因 v4 教训("机制 vs 应用分离")被拆出到独立仓库。
+`evo-agent` 早期是 evorule 项目内部的一部分(在 `evorule/evorule-governance/` 中),后因 v4 教训("机制 vs 应用分离")被拆出到独立仓库。
 
 **为什么拆出**:
 - 机制层(确定性 / 可审计 / 可形式化验证)应独立
@@ -295,7 +295,7 @@ cargo update evo-agent
 - 边界清晰 = 各自可独立测试
 
 **拆出后**:
-- `tier2-governance` 只剩纯机制(无 agent 逻辑)
+- `evorule-governance` 只剩纯机制(无 agent 逻辑)
 - `evo-agent` 自成项目,通过 HTTP API 与 evorule 通信
 - 各自的测试 / CI / 发布独立
 

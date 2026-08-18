@@ -1,0 +1,26 @@
+{
+  "workflow_id": "research_and_write",
+  "description": "并行调研两个技术生态,再串行写作对比报告",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "research_rust",
+      "agent_type": "researcher",
+      "task": "调研 Rust 异步生态的最新进展,重点关注 tokio/async-trait/异步运行时演进",
+      "depends_on": []
+    },
+    {
+      "id": "research_python",
+      "agent_type": "researcher",
+      "task": "调研 Python 异步生态的最新进展,重点关注 asyncio/anyio/异步框架演进",
+      "depends_on": []
+    },
+    {
+      "id": "write_report",
+      "agent_type": "writer",
+      "task_template": "基于以下两份调研结果,写一份 Rust 与 Python 异步生态的对比报告:\n\n=== Rust 调研 ===\n{research_rust}\n\n=== Python 调研 ===\n{research_python}\n\n要求:结构化对比(运行时模型/语法/性能/生态),给出选型建议。",
+      "depends_on": ["research_rust", "research_python"]
+    }
+  ],
+  "output_node": "write_report"
+}

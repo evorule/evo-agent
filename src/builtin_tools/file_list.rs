@@ -13,7 +13,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use tier0_tcb::JsonValue;
+use evorule_tcb::JsonValue;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -22,6 +22,7 @@ use crate::io_handlers::tool_handler::ToolFunction;
 pub const DEFAULT_MAX_ENTRIES: usize = 1000;
 
 /// `file_list` 工具
+#[derive(Clone)]
 pub struct FileListTool {
     workdir: PathBuf,
     max_entries: usize,
@@ -67,12 +68,22 @@ impl FileListTool {
     }
 }
 
+#[async_trait::async_trait]
 impl ToolFunction for FileListTool {
-    fn call(&self, args: &JsonValue) -> IoResult {
-        let dir = args
-            .get("dir")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+    /// G13:async 入口 — 用 spawn_blocking 包装同步 fs 操作
+    async fn call(&self, args: &JsonValue) -> IoResult {
+        let tool = self.clone();
+        let args = args.clone();
+        tokio::task::spawn_blocking(move || tool.call_sync(&args))
+            .await
+            .map_err(|e| format!("file_list tool panicked: {}", e))?
+    }
+}
+
+impl FileListTool {
+    /// 同步实现(供 spawn_blocking 调用)
+    fn call_sync(&self, args: &JsonValue) -> IoResult {
+        let dir = args.get("dir").and_then(|v| v.as_str()).unwrap_or(".");
 
         let include_hidden = args
             .get("include_hidden")
@@ -91,8 +102,8 @@ impl ToolFunction for FileListTool {
 
         let safe_dir = self.resolve_safe_dir(dir)?;
 
-        let entries = std::fs::read_dir(&safe_dir)
-            .map_err(|e| format!("read_dir failed: {}", e))?;
+        let entries =
+            std::fs::read_dir(&safe_dir).map_err(|e| format!("read_dir failed: {}", e))?;
 
         let mut items: Vec<JsonValue> = Vec::new();
         let mut total_seen = 0;
@@ -146,10 +157,7 @@ impl ToolFunction for FileListTool {
             "dir".to_string(),
             JsonValue::string(safe_dir.display().to_string()),
         );
-        map.insert(
-            "count".to_string(),
-            JsonValue::Integer(items.len() as i64),
-        );
+        map.insert("count".to_string(), JsonValue::Integer(items.len() as i64));
         map.insert("truncated".to_string(), JsonValue::Bool(truncated));
         map.insert("entries".to_string(), JsonValue::array(items));
 
@@ -165,7 +173,7 @@ mod tests {
     fn test_reject_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
         let tool = FileListTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("dir".to_string(), JsonValue::string("C:\\Windows"));
             m
@@ -177,7 +185,7 @@ mod tests {
     fn test_reject_parent_dir() {
         let dir = tempfile::tempdir().unwrap();
         let tool = FileListTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("dir".to_string(), JsonValue::string("../etc"));
             m
@@ -192,12 +200,11 @@ mod tests {
         std::fs::create_dir(dir.path().join(".git")).unwrap();
 
         let tool = FileListTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object(Default::default())).unwrap();
+        let result = tool
+            .call_sync(&JsonValue::object(Default::default()))
+            .unwrap();
         let entries = result.get("entries").unwrap();
-        let count = entries
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0);
+        let count = entries.as_array().map(|a| a.len()).unwrap_or(0);
         assert_eq!(count, 1, "should only show visible.txt");
     }
 
@@ -208,12 +215,13 @@ mod tests {
         std::fs::create_dir(dir.path().join(".git")).unwrap();
 
         let tool = FileListTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("include_hidden".to_string(), JsonValue::Bool(true));
-            m
-        }))
-        .unwrap();
+        let result = tool
+            .call_sync(&JsonValue::object({
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("include_hidden".to_string(), JsonValue::Bool(true));
+                m
+            }))
+            .unwrap();
         let count = result.get("count").unwrap().as_i64().unwrap();
         assert_eq!(count, 2, "should show both visible.txt and .git");
     }
@@ -225,7 +233,9 @@ mod tests {
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
 
         let tool = FileListTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object(Default::default())).unwrap();
+        let result = tool
+            .call_sync(&JsonValue::object(Default::default()))
+            .unwrap();
         let entries = result.get("entries").unwrap().as_array().unwrap();
         let mut by_name: std::collections::HashMap<String, String> = Default::default();
         for e in entries {
@@ -241,7 +251,7 @@ mod tests {
     fn test_list_nonexistent_dir() {
         let dir = tempfile::tempdir().unwrap();
         let tool = FileListTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("dir".to_string(), JsonValue::string("does_not_exist"));
             m
@@ -256,7 +266,9 @@ mod tests {
             std::fs::write(dir.path().join(format!("f{}.txt", i)), b"x").unwrap();
         }
         let tool = FileListTool::new(dir.path().to_path_buf()).with_max_entries(3);
-        let result = tool.call(&JsonValue::object(Default::default())).unwrap();
+        let result = tool
+            .call_sync(&JsonValue::object(Default::default()))
+            .unwrap();
         let count = result.get("count").unwrap().as_i64().unwrap();
         let truncated = result.get("truncated").unwrap().as_bool().unwrap();
         assert_eq!(count, 3);

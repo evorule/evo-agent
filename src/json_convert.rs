@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! JSON value conversion -- between serde_json::Value and tier0_tcb::JsonValue
+//! JSON value conversion -- between serde_json::Value and evorule_tcb::JsonValue
 
+use evorule_tcb::JsonValue;
 use serde_json;
-use tier0_tcb::JsonValue;
 
-/// Convert serde_json::Value to tier0_tcb::JsonValue
+/// Convert serde_json::Value to evorule_tcb::JsonValue
 pub fn serde_to_tcb(value: &serde_json::Value) -> JsonValue {
     match value {
         serde_json::Value::Null => JsonValue::Null,
@@ -40,13 +40,13 @@ pub fn serde_to_tcb(value: &serde_json::Value) -> JsonValue {
     }
 }
 
-/// Convert tier0_tcb::JsonValue to serde_json::Value
+/// Convert evorule_tcb::JsonValue to serde_json::Value
 pub fn tcb_to_serde(value: &JsonValue) -> serde_json::Value {
     match value {
         JsonValue::Null => serde_json::Value::Null,
         JsonValue::Bool(b) => serde_json::Value::Bool(*b),
         JsonValue::Integer(i) => serde_json::Value::Number((*i).into()),
-        JsonValue::String(s) => serde_json::Value::String(s.clone()),
+        JsonValue::String(s) => serde_json::Value::String(s.to_string()),
         JsonValue::Array(arr) => {
             let mut result = Vec::new();
             for v in arr {

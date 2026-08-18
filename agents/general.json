@@ -2,6 +2,7 @@
   "agent_type": "general",
   "version": "0.1.0",
   "description": "General-purpose agent — file ops, shell commands, and web fetch",
+  "license": "AGPL-3.0-or-later",
   "system_prompt": "You are a helpful general-purpose assistant. Use tools to accomplish tasks. Be concise and direct.",
   "model": "MiniMax-M2.5",
   "temperature": 0.3,

@@ -36,6 +36,7 @@
 //!
 //! 默认是"宁可功能少,也不可被滥用"。
 
+pub mod delegate_tool;
 pub mod file_list;
 pub mod file_read;
 pub mod file_write;

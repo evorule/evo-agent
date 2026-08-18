@@ -1,0 +1,29 @@
+{
+  "name": "evo-agent-node",
+  "version": "0.1.0",
+  "description": "Zero-dependency Node.js client for evo-agent HTTP API (SSE streaming + cancel)",
+  "license": "AGPL-3.0-or-later",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "lib/",
+    "README.md"
+  ],
+  "scripts": {
+    "example:quickstart": "node examples/quickstart.js",
+    "example:stream": "node examples/stream-cancel.js",
+    "example:events": "node examples/event-driven.js",
+    "test": "node -e \"const {EvoAgentClient} = require('./'); console.log('EvoAgentClient loaded OK')\""
+  },
+  "keywords": [
+    "evorule",
+    "evo-agent",
+    "sse",
+    "streaming",
+    "llm",
+    "agent"
+  ],
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

@@ -48,7 +48,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use tier0_tcb::JsonValue;
+use evorule_tcb::JsonValue;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -215,7 +215,10 @@ pub const BLOCKED_COMMANDS: &[(&str, &str)] = &[
     ("node", "Turing-complete"),
     ("ruby", "Turing-complete"),
     ("perl", "Turing-complete"),
-    ("curl", "网络外联 — 泄露数据 + 下载恶意内容。用 http_get 工具"),
+    (
+        "curl",
+        "网络外联 — 泄露数据 + 下载恶意内容。用 http_get 工具",
+    ),
     ("wget", "同上"),
     ("nc", "网络原始 socket — 反向 shell"),
     ("ncat", "同上"),
@@ -273,6 +276,7 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MB
 
 /// `shell_exec` 工具
+#[derive(Clone)]
 pub struct ShellExecTool {
     timeout: Duration,
     max_output_bytes: usize,
@@ -338,7 +342,9 @@ impl ShellExecTool {
             CommandCategory::Active
         } else if let Some(&c) = CANDIDATE_COMMANDS.iter().find(|c| c.name == program) {
             CommandCategory::Candidate(c)
-        } else if let Some(&(_, reason)) = BLOCKED_COMMANDS.iter().find(|(name, _)| *name == program) {
+        } else if let Some(&(_, reason)) =
+            BLOCKED_COMMANDS.iter().find(|(name, _)| *name == program)
+        {
             CommandCategory::Blocked(reason)
         } else {
             CommandCategory::Unknown
@@ -379,8 +385,14 @@ impl ShellExecTool {
 
         let mut map = std::collections::BTreeMap::new();
         map.insert("status".to_string(), JsonValue::string("ok"));
-        map.insert("command".to_string(), JsonValue::string(original_cmd.to_string()));
-        map.insert("program".to_string(), JsonValue::string(program.to_string()));
+        map.insert(
+            "command".to_string(),
+            JsonValue::string(original_cmd.to_string()),
+        );
+        map.insert(
+            "program".to_string(),
+            JsonValue::string(program.to_string()),
+        );
         map.insert(
             "exit_code".to_string(),
             JsonValue::Integer(output.status.code().unwrap_or(-1) as i64),
@@ -401,18 +413,17 @@ impl ShellExecTool {
     }
 
     /// 构造一个 proposal(给 agent/CLI 用于问用户)
-    fn make_proposal(
-        program: &str,
-        original_cmd: &str,
-        candidate: CandidateCommand,
-    ) -> IoResult {
+    fn make_proposal(program: &str, original_cmd: &str, candidate: CandidateCommand) -> IoResult {
         let mut map = std::collections::BTreeMap::new();
+        map.insert("status".to_string(), JsonValue::string("needs_approval"));
         map.insert(
-            "status".to_string(),
-            JsonValue::string("needs_approval"),
+            "command".to_string(),
+            JsonValue::string(original_cmd.to_string()),
         );
-        map.insert("command".to_string(), JsonValue::string(original_cmd.to_string()));
-        map.insert("program".to_string(), JsonValue::string(program.to_string()));
+        map.insert(
+            "program".to_string(),
+            JsonValue::string(program.to_string()),
+        );
         map.insert("category".to_string(), JsonValue::string("candidate"));
         map.insert(
             "description".to_string(),
@@ -439,8 +450,21 @@ impl Default for ShellExecTool {
     }
 }
 
+#[async_trait::async_trait]
 impl ToolFunction for ShellExecTool {
-    fn call(&self, args: &JsonValue) -> IoResult {
+    /// G13:async 入口 — 用 spawn_blocking 包装同步 std::process::Command 操作
+    async fn call(&self, args: &JsonValue) -> IoResult {
+        let tool = self.clone();
+        let args = args.clone();
+        tokio::task::spawn_blocking(move || tool.call_sync(&args))
+            .await
+            .map_err(|e| format!("shell_exec tool panicked: {}", e))?
+    }
+}
+
+impl ShellExecTool {
+    /// 同步实现(供 spawn_blocking 调用)
+    fn call_sync(&self, args: &JsonValue) -> IoResult {
         let cmd_str = args
             .get("command")
             .and_then(|v| v.as_str())
@@ -487,7 +511,11 @@ impl ToolFunction for ShellExecTool {
                  candidates: {}; see builtin_tools::shell_exec)",
                 program,
                 ACTIVE_COMMANDS.join(", "),
-                CANDIDATE_COMMANDS.iter().map(|c| c.name).collect::<Vec<_>>().join(", ")
+                CANDIDATE_COMMANDS
+                    .iter()
+                    .map(|c| c.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         }
     }
@@ -568,7 +596,7 @@ mod tests {
         // 用 ls 替代
         let tmp = tempfile::tempdir().unwrap();
         let tool = ShellExecTool::new().with_workdir(tmp.path());
-        let result = tool.call(&arg("ls"));
+        let result = tool.call_sync(&arg("ls"));
         #[cfg(unix)]
         assert!(result.is_ok(), "ls should run on unix");
         #[cfg(windows)]
@@ -581,12 +609,9 @@ mod tests {
     #[test]
     fn test_candidate_command_returns_proposal_without_approval() {
         let tool = ShellExecTool::new();
-        let result = tool.call(&arg("rm -rf /tmp/something"));
+        let result = tool.call_sync(&arg("rm -rf /tmp/something"));
         let v = result.expect("should not error, should return proposal");
-        assert_eq!(
-            v.get("status").unwrap().as_str().unwrap(),
-            "needs_approval"
-        );
+        assert_eq!(v.get("status").unwrap().as_str().unwrap(), "needs_approval");
         assert_eq!(v.get("program").unwrap().as_str().unwrap(), "rm");
         assert_eq!(v.get("category").unwrap().as_str().unwrap(), "candidate");
         assert!(v.get("description").is_some());
@@ -600,7 +625,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tool = ShellExecTool::new().with_workdir(tmp.path());
         // mkdir 是 candidate 命令,加 approved=true 应该执行
-        let result = tool.call(&arg_with("mkdir test_dir_42", true));
+        let result = tool.call_sync(&arg_with("mkdir test_dir_42", true));
         // mkdir 可能成功或失败(取决于系统),但不会是 proposal
         if result.is_ok() {
             let v = result.unwrap();
@@ -615,7 +640,7 @@ mod tests {
     fn test_blocked_command_always_rejected() {
         let tool = ShellExecTool::new();
         // sudo 即使加 approved=true 也应该被拒
-        let result = tool.call(&arg_with("sudo apt install something", true));
+        let result = tool.call_sync(&arg_with("sudo apt install something", true));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("BLOCKED"), "got: {}", err);
@@ -624,7 +649,7 @@ mod tests {
     #[test]
     fn test_unknown_command_rejected() {
         let tool = ShellExecTool::new();
-        let result = tool.call(&arg("nonexistent_xyz --foo"));
+        let result = tool.call_sync(&arg("nonexistent_xyz --foo"));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("NOT in active or candidate"), "got: {}", err);
@@ -634,7 +659,7 @@ mod tests {
     fn test_metacharacter_rejected_even_for_candidate() {
         let tool = ShellExecTool::new();
         // `;` 在 candidate 命令里也拒
-        let result = tool.call(&arg("rm foo; rm bar"));
+        let result = tool.call_sync(&arg("rm foo; rm bar"));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("metacharacter"), "got: {}", err);
@@ -643,14 +668,14 @@ mod tests {
     #[test]
     fn test_empty_command() {
         let tool = ShellExecTool::new();
-        let result = tool.call(&arg(""));
+        let result = tool.call_sync(&arg(""));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_missing_command_arg() {
         let tool = ShellExecTool::new();
-        let result = tool.call(&JsonValue::object(std::collections::BTreeMap::new()));
+        let result = tool.call_sync(&JsonValue::object(std::collections::BTreeMap::new()));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing required arg"));
     }
@@ -669,7 +694,7 @@ mod tests {
         let tool = ShellExecTool::new().with_workdir(tmp.path());
         #[cfg(unix)]
         {
-            let result = tool.call(&arg("ls"));
+            let result = tool.call_sync(&arg("ls"));
             let v = result.unwrap();
             assert_eq!(v.get("status").unwrap().as_str().unwrap(), "ok");
             let stdout = v.get("stdout").unwrap().as_str().unwrap();
@@ -677,7 +702,7 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            let _ = tool.call(&arg("ls"));
+            let _ = tool.call_sync(&arg("ls"));
         }
     }
 }

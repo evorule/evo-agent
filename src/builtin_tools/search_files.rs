@@ -19,7 +19,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use tier0_tcb::JsonValue;
+use evorule_tcb::JsonValue;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -28,6 +28,7 @@ use crate::io_handlers::tool_handler::ToolFunction;
 pub const DEFAULT_MAX_RESULTS: usize = 1000;
 
 /// `search_files` 工具
+#[derive(Clone)]
 pub struct SearchFilesTool {
     workdir: PathBuf,
     max_results: usize,
@@ -129,13 +130,7 @@ impl SearchFilesTool {
         Self::glob_match(pattern, name)
     }
 
-    fn walk(
-        root: &Path,
-        dir: &Path,
-        pattern: &str,
-        max: usize,
-        results: &mut Vec<PathBuf>,
-    ) {
+    fn walk(root: &Path, dir: &Path, pattern: &str, max: usize, results: &mut Vec<PathBuf>) {
         if results.len() >= max {
             return;
         }
@@ -168,17 +163,27 @@ impl SearchFilesTool {
     }
 }
 
+#[async_trait::async_trait]
 impl ToolFunction for SearchFilesTool {
-    fn call(&self, args: &JsonValue) -> IoResult {
+    /// G13:async 入口 — 用 spawn_blocking 包装同步 fs 操作
+    async fn call(&self, args: &JsonValue) -> IoResult {
+        let tool = self.clone();
+        let args = args.clone();
+        tokio::task::spawn_blocking(move || tool.call_sync(&args))
+            .await
+            .map_err(|e| format!("search_files tool panicked: {}", e))?
+    }
+}
+
+impl SearchFilesTool {
+    /// 同步实现(供 spawn_blocking 调用)
+    fn call_sync(&self, args: &JsonValue) -> IoResult {
         let pattern = args
             .get("pattern")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required arg: pattern (string)".to_string())?;
 
-        let dir = args
-            .get("dir")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let dir = args.get("dir").and_then(|v| v.as_str()).unwrap_or(".");
 
         let max = args
             .get("max_results")
@@ -202,7 +207,10 @@ impl ToolFunction for SearchFilesTool {
 
         let truncated = results.len() >= max;
         let mut map = std::collections::BTreeMap::new();
-        map.insert("pattern".to_string(), JsonValue::string(pattern.to_string()));
+        map.insert(
+            "pattern".to_string(),
+            JsonValue::string(pattern.to_string()),
+        );
         map.insert(
             "dir".to_string(),
             JsonValue::string(safe_dir.display().to_string()),
@@ -241,7 +249,7 @@ mod tests {
         assert!(SearchFilesTool::glob_match("hello*", "hello"));
         assert!(SearchFilesTool::glob_match("a*b", "ab"));
         assert!(SearchFilesTool::glob_match("a*b", "axxxb"));
-        assert!(!SearchFilesTool::glob_match("a*b", "axxx"));  // 没有 trailing b
+        assert!(!SearchFilesTool::glob_match("a*b", "axxx")); // 没有 trailing b
         assert!(!SearchFilesTool::glob_match("a*b", "yxxx"));
         assert!(SearchFilesTool::glob_match("a*c", "abc"));
         assert!(SearchFilesTool::glob_match("*.test.*", "main.test.rs"));
@@ -271,7 +279,7 @@ mod tests {
     fn test_reject_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
         let tool = SearchFilesTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("pattern".to_string(), JsonValue::string("*.txt"));
             m.insert("dir".to_string(), JsonValue::string("C:\\Windows"));
@@ -284,7 +292,7 @@ mod tests {
     fn test_reject_parent_dir() {
         let dir = tempfile::tempdir().unwrap();
         let tool = SearchFilesTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("pattern".to_string(), JsonValue::string("*"));
             m.insert("dir".to_string(), JsonValue::string("../etc"));
@@ -302,15 +310,20 @@ mod tests {
         std::fs::write(dir.path().join("sub/baz.txt"), b"").unwrap();
 
         let tool = SearchFilesTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("pattern".to_string(), JsonValue::string("*.txt"));
-            m
-        }))
-        .expect("should succeed");
+        let result = tool
+            .call_sync(&JsonValue::object({
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("pattern".to_string(), JsonValue::string("*.txt"));
+                m
+            }))
+            .expect("should succeed");
 
         let count = result.get("count").unwrap().as_i64().unwrap();
-        assert_eq!(count, 2, "should find foo.txt and sub/baz.txt, got: {:?}", result);
+        assert_eq!(
+            count, 2,
+            "should find foo.txt and sub/baz.txt, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -321,15 +334,19 @@ mod tests {
         std::fs::write(dir.path().join(".git/secret.txt"), b"").unwrap();
 
         let tool = SearchFilesTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("pattern".to_string(), JsonValue::string("*.txt"));
-            m
-        }))
-        .unwrap();
+        let result = tool
+            .call_sync(&JsonValue::object({
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("pattern".to_string(), JsonValue::string("*.txt"));
+                m
+            }))
+            .unwrap();
 
         let count = result.get("count").unwrap().as_i64().unwrap();
-        assert_eq!(count, 1, "should only find visible.txt, not .git/secret.txt");
+        assert_eq!(
+            count, 1,
+            "should only find visible.txt, not .git/secret.txt"
+        );
     }
 
     #[test]
@@ -339,12 +356,13 @@ mod tests {
             std::fs::write(dir.path().join(format!("f{}.txt", i)), b"").unwrap();
         }
         let tool = SearchFilesTool::new(dir.path().to_path_buf()).with_max_results(3);
-        let result = tool.call(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("pattern".to_string(), JsonValue::string("*.txt"));
-            m
-        }))
-        .unwrap();
+        let result = tool
+            .call_sync(&JsonValue::object({
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("pattern".to_string(), JsonValue::string("*.txt"));
+                m
+            }))
+            .unwrap();
         let count = result.get("count").unwrap().as_i64().unwrap();
         let truncated = result.get("truncated").unwrap().as_bool().unwrap();
         assert_eq!(count, 3);

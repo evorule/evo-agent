@@ -3,7 +3,7 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! I/O Dispatcher - dispatches based on IoType to corresponding handler
 
-use tier0_tcb::JsonValue;
+use evorule_tcb::JsonValue;
 
 use crate::io_handler::{IoHandler, IoResult};
 use crate::io_handlers::{llm_handler::LlmHandler, tool_handler::ToolHandler};
@@ -63,8 +63,8 @@ impl IoDispatcherBuilder {
     pub fn build(self) -> IoDispatcher {
         IoDispatcher::new(
             self.llm_handler
-                .unwrap_or_else(|| LlmHandler::with_defaults()),
-            self.tool_handler.unwrap_or_else(|| ToolHandler::new()),
+                .unwrap_or_else(LlmHandler::with_defaults),
+            self.tool_handler.unwrap_or_else(ToolHandler::new),
         )
     }
 }

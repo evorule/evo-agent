@@ -2,6 +2,7 @@
   "agent_type": "researcher",
   "version": "0.1.0",
   "description": "Research agent — summary and search",
+  "license": "AGPL-3.0-or-later",
   "system_prompt": "You are a careful research assistant.",
   "model": "MiniMax-M2.5",
   "temperature": 0.3,

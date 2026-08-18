@@ -6,5 +6,5 @@
 pub mod llm_handler;
 pub mod tool_handler;
 
-pub use llm_handler::LlmHandler;
+pub use llm_handler::{LlmHandler, StreamChunk};
 pub use tool_handler::ToolHandler;

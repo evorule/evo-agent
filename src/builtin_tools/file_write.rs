@@ -22,7 +22,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use tier0_tcb::JsonValue;
+use evorule_tcb::JsonValue;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -34,6 +34,7 @@ pub const DEFAULT_WRITABLE_DIR: &str = "workspace";
 pub const DEFAULT_MAX_BYTES: u64 = 1024 * 1024; // 1 MB
 
 /// `file_write` 工具
+#[derive(Clone)]
 pub struct FileWriteTool {
     workdir: PathBuf,
     writable_dir: PathBuf, // workdir 下的子目录
@@ -69,10 +70,7 @@ impl FileWriteTool {
     /// 返回 `(target_path, canonical_or_logical_path)`:
     /// - 存在路径:返回 canonical(用于 symlink 校验)
     /// - 不存在路径:返回 logical target + writable_canonical(用于 containment 校验)
-    fn resolve_safe_path(
-        &self,
-        raw: &str,
-    ) -> Result<(PathBuf, PathBuf), String> {
+    fn resolve_safe_path(&self, raw: &str) -> Result<(PathBuf, PathBuf), String> {
         let path = Path::new(raw);
         if path.is_absolute() {
             return Err(format!("absolute path not allowed: '{}'", raw));
@@ -94,9 +92,13 @@ impl FileWriteTool {
 
         // 2. writable_dir 也必须存在(否则无法写入)
         let writable_abs = self.workdir.join(&self.writable_dir);
-        let writable_canonical = writable_abs
-            .canonicalize()
-            .map_err(|e| format!("writable_dir does not exist: {} ({})", writable_abs.display(), e))?;
+        let writable_canonical = writable_abs.canonicalize().map_err(|e| {
+            format!(
+                "writable_dir does not exist: {} ({})",
+                writable_abs.display(),
+                e
+            )
+        })?;
 
         // 3. 目标路径 = workdir + path(逻辑路径,不一定存在)
         let target = self.workdir.join(path);
@@ -135,8 +137,21 @@ impl FileWriteTool {
     }
 }
 
+#[async_trait::async_trait]
 impl ToolFunction for FileWriteTool {
-    fn call(&self, args: &JsonValue) -> IoResult {
+    /// G13:async 入口 — 用 spawn_blocking 包装同步 fs 操作
+    async fn call(&self, args: &JsonValue) -> IoResult {
+        let tool = self.clone();
+        let args = args.clone();
+        tokio::task::spawn_blocking(move || tool.call_sync(&args))
+            .await
+            .map_err(|e| format!("file_write tool panicked: {}", e))?
+    }
+}
+
+impl FileWriteTool {
+    /// 同步实现(供 spawn_blocking 调用)
+    fn call_sync(&self, args: &JsonValue) -> IoResult {
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -187,17 +202,15 @@ impl ToolFunction for FileWriteTool {
                             parent.display()
                         ));
                     }
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        format!("failed to create parent dir: {}", e)
-                    })?;
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("failed to create parent dir: {}", e))?;
                 }
             }
         }
 
         // 写入
-        std::fs::write(&target, content.as_bytes())
-            .map_err(|e| format!("write failed: {}", e))?;
-        let bytes_written = content.as_bytes().len();
+        std::fs::write(&target, content.as_bytes()).map_err(|e| format!("write failed: {}", e))?;
+        let bytes_written = content.len();
 
         let mut map = std::collections::BTreeMap::new();
         map.insert(
@@ -208,10 +221,7 @@ impl ToolFunction for FileWriteTool {
             "bytes_written".to_string(),
             JsonValue::Integer(bytes_written as i64),
         );
-        map.insert(
-            "created".to_string(),
-            JsonValue::Bool(!overwrite),
-        );
+        map.insert("created".to_string(), JsonValue::Bool(!overwrite));
         map.insert(
             "writable_dir".to_string(),
             JsonValue::string(self.writable_dir.display().to_string()),
@@ -237,7 +247,7 @@ mod tests {
     fn test_reject_absolute_path() {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("C:\\evil.txt"));
             m.insert("content".to_string(), JsonValue::string("x"));
@@ -250,7 +260,7 @@ mod tests {
     fn test_reject_parent_dir() {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("../evil.txt"));
             m.insert("content".to_string(), JsonValue::string("x"));
@@ -265,7 +275,7 @@ mod tests {
         // 想写 workdir 根(不在 workspace/ 里)
         std::fs::write(dir.path().join("config.toml"), b"").unwrap();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("config.toml"));
             m.insert("content".to_string(), JsonValue::string("x"));
@@ -273,15 +283,18 @@ mod tests {
         }));
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("outside writable_dir") || err.contains("path escapes"),
-            "got: {}", err);
+        assert!(
+            err.contains("outside writable_dir") || err.contains("path escapes"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
     fn test_write_new_file_in_workspace() {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("workspace/new.txt"));
             m.insert("content".to_string(), JsonValue::string("hello"));
@@ -300,16 +313,22 @@ mod tests {
         std::fs::write(dir.path().join("workspace/exists.txt"), b"old").unwrap();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
         // 试图覆盖(没带 overwrite=true)
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("workspace/exists.txt"));
+            m.insert(
+                "path".to_string(),
+                JsonValue::string("workspace/exists.txt"),
+            );
             m.insert("content".to_string(), JsonValue::string("new"));
             m
         }));
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("already exists") || err.contains("overwrite=true"),
-            "got: {}", err);
+        assert!(
+            err.contains("already exists") || err.contains("overwrite=true"),
+            "got: {}",
+            err
+        );
         // 内容应未变
         let content = std::fs::read_to_string(dir.path().join("workspace/exists.txt")).unwrap();
         assert_eq!(content, "old");
@@ -320,7 +339,7 @@ mod tests {
         let dir = temp_workdir_with_workspace();
         std::fs::write(dir.path().join("workspace/x.txt"), b"old").unwrap();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("workspace/x.txt"));
             m.insert("content".to_string(), JsonValue::string("new content"));
@@ -337,9 +356,12 @@ mod tests {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
         // 写 workspace/sub/deep/file.txt,父目录不存在
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("workspace/sub/deep/file.txt"));
+            m.insert(
+                "path".to_string(),
+                JsonValue::string("workspace/sub/deep/file.txt"),
+            );
             m.insert("content".to_string(), JsonValue::string("x"));
             m.insert("create_parents".to_string(), JsonValue::Bool(true));
             m
@@ -351,9 +373,12 @@ mod tests {
     fn test_no_create_parents_fails() {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("workspace/sub/deep/file.txt"));
+            m.insert(
+                "path".to_string(),
+                JsonValue::string("workspace/sub/deep/file.txt"),
+            );
             m.insert("content".to_string(), JsonValue::string("x"));
             // 没有 create_parents
             m
@@ -366,7 +391,7 @@ mod tests {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf()).with_max_bytes(100);
         let big = "x".repeat(200);
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("workspace/big.txt"));
             m.insert("content".to_string(), JsonValue::string(big));
@@ -381,14 +406,14 @@ mod tests {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
         // no path
-        let r1 = tool.call(&JsonValue::object({
+        let r1 = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("content".to_string(), JsonValue::string("x"));
             m
         }));
         assert!(r1.is_err());
         // no content
-        let r2 = tool.call(&JsonValue::object({
+        let r2 = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("workspace/x"));
             m
@@ -410,7 +435,7 @@ mod tests {
         std::os::windows::fs::symlink_file(&outside_file, &link_path).unwrap();
 
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call(&JsonValue::object({
+        let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
             m.insert("path".to_string(), JsonValue::string("workspace/link.txt"));
             m.insert("content".to_string(), JsonValue::string("overwrite"));

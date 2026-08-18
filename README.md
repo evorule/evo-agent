@@ -1,6 +1,6 @@
 # Evo-Agent
 
-> AI Agent 编排层 —— 在 evorule 反应式执行引擎之上,实现 LLM + 工具 + 记忆的完整 ReAct 闭环。
+> 可信 AI 工作站 —— 在 evorule 确定性执行引擎之上，为开发者和企业提供基于规则约束的 AI Agent 编排层。
 
 [![Rust](https://img.shields.io/badge/rust-1.74%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
@@ -8,37 +8,52 @@
 
 ---
 
-## 一句话定位
+## 定位
 
-**Evo-Agent = LLM 大脑 + 工具手脚 + 持久记忆,执行过程通过 evorule 引擎留下可审计的 Fact 链。**
+**Evo-Agent = LLM 大脑 + 工具手脚 + 持久记忆 + 规则约束，执行过程通过 evorule 引擎留下可审计的 Fact 链。**
 
-它不重新发明状态机,也不内嵌 LLM 客户端,而是把 LLM 调用 / 工具调用 / 记忆读写都转成 evorule 的 `IoRequest` 事件,
-由 evorule 反应器负责执行、回滚、审计 —— Agent 层只关心"下一步该干什么"。
+它不重新发明状态机，也不内嵌 LLM 客户端。所有 LLM 调用、工具调用、记忆读写都转成 evorule 的 `IoRequest` 事件，由 evorule 反应器负责执行、回滚、审计 —— Agent 层只关心"下一步该干什么"。
+
+### 三种 AI 角色
+
+| 角色 | 说明 | 对应 Agent |
+|------|------|------------|
+| **规则创建助手** | 自然语言 → JSON 规则（LLM 生成 + G1-G7 校验 + 热重载） | `rule-copilot` |
+| **AI 执行器** | 通过 `call_external` 执行 LLM/工具调用，受规则约束 | `general` / `researcher` |
+| **对话管理入口** | 自然语言管理规则生命周期（创建/提交/激活/归档） | `rule-copilot` |
 
 ---
 
 ## 核心特性
 
 | 特性 | 说明 |
-|---|---|
-| 🔁 **完整 Fact 闭环** | 每次 LLM 调用、工具调用、记忆读写都生成可审计 Fact,支持 rewind / replay / diff |
-| 🧠 **三层记忆** | 共享记忆 / 会话记忆 / 短期消息,通过 evorule payload API 持久化,跨会话可追溯 |
-| 🛠 **工具注册中心** | `ToolRegistry` + `ToolFunction` trait,任何 `async fn(JsonValue) -> Result<JsonValue, String>` 都能注册 |
-| 🔌 **可插拔 LLM/工具** | `LlmHandler` / `ToolHandler` 接口,实现后即可接入 OpenAI / Anthropic / DeepSeek / 自定义工具 |
-| 📡 **HTTP + SSE 通信** | 与 evorule-server 通过标准 REST + SSE 通信,不共享内存、不嵌入进程 —— **机制层与应用层彻底解耦** |
-| 🌐 **自带 HTTP API** | `POST /api/agent/run` 启动一个 Agent 运行,`GET /api/agent/list` 列出已注册 Agent 类型 |
-| 🪆 **Agent 嵌套 (Delegate)** | Agent 可调用其他 Agent,最大嵌套深度通过 `DEFAULT_MAX_DELEGATE_DEPTH = 3` 限制 |
-| 🔒 **零 unsafe** | `#![forbid(unsafe_code)]` 全栈适用 |
+|------|------|
+| **完整 Fact 闭环** | 每次 LLM 调用、工具调用、记忆读写都生成可审计 Fact，支持 rewind / replay / diff |
+| **三层记忆** | 共享记忆（`shared.{ns}.{key}`）/ 会话记忆 / 短期消息，跨会话可追溯 |
+| **跨会话共享事实** | `SharedFactsLog` WAL 持久化 + rollup 标记 + 按 ID 审计回溯 |
+| **记忆事件链** | 结构化事件提取 + 因果链 + 确定性回放（`replay` 命令） |
+| **会话沉淀** | 会话结束时自动写入摘要 + 稳定事实到共享空间 |
+| **工具注册中心** | `ToolRegistry` + `ToolFunction` trait，任何 `async fn(JsonValue) -> Result<JsonValue, String>` 都能注册 |
+| **3 层安全模型** | active（白名单）/ candidate（待批）/ blocked（永不），含 SSRF 防护 + 工作目录沙箱 |
+| **规则管理工具集** | 34 个工具：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 6 + dataset 4 + publish 4 |
+| **工作流引擎** | DAG 拓扑编排多 Agent，同层并行 + 跨层串行 + 模板渲染 |
+| **MCP 客户端** | 接入 Model Context Protocol 工具生态（stdio 传输） |
+| **上下文窗口管理** | 按 token 数裁剪历史消息，保留 system + 最近若干轮 |
+| **审批系统** | CLI 交互审批 / HTTP 回调审批 / 自动批准三种模式 |
+| **HTTP + WebSocket + SSE** | REST API 启动 Agent，SSE 流式输出，WebSocket 双向通信 |
+| **REPL 交互模式** | 对话式复用同一 session，支持 `/rewind` 回滚 |
+| **可插拔 LLM/工具** | `LlmHandler` / `ToolHandler` trait，接入 OpenAI / MiniMax / DeepSeek 等 |
+| **零 unsafe** | `#![forbid(unsafe_code)]` 全栈适用 |
 
 ---
 
-## 架构:2-Loop 解耦
+## 架构：2-Loop 解耦
 
-Evo-Agent 不是 evorule 的"插件",而是一个**独立的应用层**,通过 HTTP API 与 evorule 引擎对话:
+Evo-Agent 是独立的应用层，通过 HTTP API 与 evorule 引擎对话：
 
 ```
 ┌──────────────────────────────┐         ┌──────────────────────────────┐
-│  Evo-Agent (应用层)            │         │  evorule-server (机制层)      │
+│  Evo-Agent (应用层)           │         │  evorule-server (机制层)      │
 │                              │         │                              │
 │  ┌──────────────────────┐    │         │  ┌──────────────────────┐    │
 │  │  Application Loop    │    │         │  │  Reactor Loop        │    │
@@ -52,17 +67,18 @@ Evo-Agent 不是 evorule 的"插件",而是一个**独立的应用层**,通过 H
 │  └──────────────────────┘    │         │  └──────────────────────┘    │
 │           ▲                  │         │           │                  │
 │           │                  │         │           ▼                  │
-│  ┌──────────────────────┐    │         │  ┌──────────────────────┐    │
-│  │  MemoryManager       │    │         │  │  FactsLog (append)   │    │
-│  │  ToolRegistry        │    │         │  │  + causal chain      │    │
-│  │  AgentDefinition     │    │         │  │  + WAL               │    │
-│  └──────────────────────┘    │         │  └──────────────────────┘    │
+│  ┌────────┴─────────┐        │         │  ┌──────────────────────┐    │
+│  │ MemoryManager    │        │         │  │ FactsLog (append)    │    │
+│  │ ToolRegistry     │        │         │  │ + causal chain       │    │
+│  │ AgentDefinition  │        │         │  │ + WAL + SharedFacts  │    │
+│  │ ContextWindow    │        │         │  └──────────────────────┘    │
+│  │ WorkflowEngine   │        │         │                              │
+│  │ McpClient        │        │         │                              │
+│  └──────────────────┘        │         │                              │
 └──────────────────────────────┘         └──────────────────────────────┘
 ```
 
-**为什么分开?** 因为 v4 教训过我们:把"机制"和"应用"塞进同一个进程,会导致确定性 / 可审计性 / 可形式化验证的边界污染。
-EvoRule 的 TCB (tier0-tcb) 永远只做加减与因果链,EvoAgent 的所有"业务逻辑"都在它之外。
-HTTP 是它们的**唯一契约**。
+**为什么分开？** 把"机制"和"应用"塞进同一个进程，会导致确定性、可审计性、可形式化验证的边界污染。EvoRule 的 TCB 永远只做加减与因果链，EvoAgent 的所有业务逻辑都在它之外。HTTP 是它们的唯一契约。
 
 ---
 
@@ -71,298 +87,296 @@ HTTP 是它们的**唯一契约**。
 ### 前置条件
 
 - Rust 1.74+
-- 一个跑起来的 evorule-server(默认 `http://127.0.0.1:18080`)
-- 一个 LLM provider 的 API key(下面会讲怎么接入)
+- 运行中的 evorule-server（默认 `http://127.0.0.1:18080`）
+- LLM provider 的 API key
 
 ### 启动 evorule-server
 
 ```bash
-cd ../evorule
-cargo build --bin evorule-server
-./target/debug/evorule_server --addr 127.0.0.1:18080
+cd ../evorule-server
+cargo build --release
+./target/release/evorule-server --addr 127.0.0.1:18080 --wal-dir ./data/wal
 ```
 
 ### 启动 Evo-Agent HTTP API
 
 ```bash
-cargo run --release
-# 默认监听 127.0.0.1:18081
+cargo run --release -- serve --port 8081
 ```
 
 ### 跑一个 Agent
 
 ```bash
-curl -X POST http://127.0.0.1:18081/api/agent/run \
+curl -X POST http://127.0.0.1:8081/api/agent/run \
   -H "Content-Type: application/json" \
-  -d '{
-    "agent_type": "researcher",
-    "goal": "总结 EvoRule 的 4 个核心特性"
-  }'
-```
-
-返回:
-
-```json
-{
-  "success": true,
-  "content": "...",
-  "steps": 3,
-  "duration_ms": 4521,
-  "error": null
-}
-```
-
-### 列出所有可用 Agent
-
-```bash
-curl http://127.0.0.1:18081/api/agent/list
+  -d '{"agent_type": "researcher", "goal": "总结当前目录的 README"}'
 ```
 
 ---
 
 ## CLI 用法
 
-evo-agent 自带一个独立 CLI,适合**单次跑任务**或**人工审计工具安全模型**。先 build:
-
-```bash
-cargo build --release --bin evo-agent
-# 或在 D:\evo-agent\ 下:
-#   target\release\evo-agent.exe
-```
-
-### 5 个子命令
-
 ```text
-evo-agent run <goal>           # 跑 agent(给一个 goal + 可选 agent 类型)
-evo-agent list                  # 列出 agents/ 目录下的所有 agent
-evo-agent tools list            # 列出 6 个工具(active/candidate/blocked 3 层)
-evo-agent tools show <name>     # 显示单个工具的 active/candidate/blocked 详情
-evo-agent validate <agent>      # 校验 agent.json 是否合法
-evo-agent config                # 显示合并后的配置(default + user + project + env)
+evo-agent run <goal>                    # 跑 agent（给一个 goal + 可选 agent 类型）
+evo-agent list                           # 列出 agents/ 目录下的所有 agent
+evo-agent tools list                     # 列出 6 个内置工具（3 层安全模型）
+evo-agent tools show <name>              # 显示单个工具的 active/candidate/blocked 详情
+evo-agent validate <agent>               # 校验 agent.json 是否合法
+evo-agent config                         # 显示合并后的配置
+evo-agent serve --port 8081              # 启动 HTTP server
+evo-agent workflow <workflow_id>         # 执行多 agent DAG 工作流
+evo-agent repl                           # REPL 交互模式（复用同一 session）
+evo-agent replay --session <id>          # 回放 session 的记忆事件链
 ```
 
-### 示例:跑一个 agent
+### run
 
 ```bash
-# 准备 agent.json
-mkdir -p agents
-cat > agents/researcher.json <<'JSON'
+# 用 researcher agent 跑任务
+MINIMAX_API_KEY=sk-... \
+  evo-agent run "总结一下 README" -a researcher
+
+# 流式输出（token-by-token）
+evo-agent run "分析代码结构" -a researcher --stream
+
+# 自动批准 candidate 工具
+evo-agent run "执行构建脚本" -a general --auto-approve-candidates
+```
+
+### repl
+
+```bash
+evo-agent repl -a general
+# > 帮我查看当前目录结构
+# > /session        # 显示当前 session ID
+# > /rewind 3       # 回滚到版本 3
+# > /exit
+```
+
+### replay
+
+```bash
+# 回放全部事件（按时间线）
+evo-agent replay --session 123
+
+# 从 E005 沿因果链回溯
+evo-agent replay --session 123 --event E005
+
+# 回放某实体的所有事件
+evo-agent replay --session 123 --entity pet_doudou
+
+# LLM 自然语言叙述（temperature=0，事实不变）
+evo-agent replay --session 123 --narrate
+```
+
+### workflow
+
+```json
+// rules/workflows/research_and_write.json
+{
+  "workflow_id": "research_and_write",
+  "nodes": [
+    { "id": "research", "agent_type": "researcher", "task": "调研 Rust 异步生态", "depends_on": [] },
+    { "id": "write", "agent_type": "general", "task_template": "基于调研结果写报告：\n{research}", "depends_on": ["research"] }
+  ],
+  "output_node": "write"
+}
+```
+
+```bash
+evo-agent workflow research_and_write
+```
+
+---
+
+## Agent 定义
+
+Agent 配置从 `agents/{type}.json` 加载：
+
+```json
 {
   "agent_type": "researcher",
   "version": "0.1.0",
-  "description": "Research agent",
+  "description": "研究型 Agent",
   "system_prompt": "You are a careful research assistant.",
   "model": "MiniMax-M2.5",
   "temperature": 0.3,
   "max_steps": 20,
   "step_timeout_secs": 60,
-  "tools": ["file_read", "search_files"]
-}
-JSON
-
-# 跑
-MINIMAX_API_KEY=sk-... \
-  ./target/release/evo-agent run "总结一下 README" -a researcher
-```
-
-> **5 原则落地**(详见 [`DESIGN_PRINCIPLES.md`](DESIGN_PRINCIPLES.md)):
-> - **透明**:`config` 输出完整合并后配置;`tools list/show` 把 active/candidate/blocked 全列出来
-> - **可选**:用户能选 active(白名单)/candidate(待批)/blocked(永不)三档
-> - **可控**:candidate 工具默认拒绝;带 `--auto-approve-candidates` 才放行
-> - **可回放**:每次 run 输出结构化 JSON 结果,后续 0.2.0 接 evorule fact log
-> - **可审计**:`run` 结果(成功/失败/步骤数/工具调用列表)是 JSON,适合归档
-
-### 示例:看 3 层安全模型
-
-```bash
-$ evo-agent tools list
-=== 6 Built-in Tools (3-layer security model) ===
-
-[ACTIVE] 直接执行(无需请示):
-  - file_read
-  - file_list
-  - file_write
-  - search_files
-  - shell_exec
-  - http_get
-
-[CANDIDATE] 备选(LLM 想用 → 摊开 proposal 给你看 → 你批 → 再执行):
-  - rm — 删除文件或目录 (risk: 误删不可逆;rm -rf 没有提示)
-  - mv — 移动/重命名文件 (risk: 覆盖现有文件无提示;...)
-  ...
-
-[BLOCKED] 永不批准(逃逸出口 / 不可逆破坏):
-  - sudo — 权限提升 — 跨安全边界
-  - python — Turing-complete — 任何操作都可做
-  - bash — shell 逃逸 — 绕过白名单
-  ...
-```
-
-### `run` 完整参数
-
-```text
-Usage: evo-agent run [OPTIONS] <GOAL>
-
-Arguments:
-  <GOAL>    任务描述(给 agent 的指令)
-
-Options:
-  -a, --agent <AGENT>              agent 类型名(默认 config.agents.default)
-      --auto-approve-candidates    自动批准 candidate 工具(0.1.0 默认拒绝,带此 flag 则放行)
-  -v, --verbose                    详细输出(debug logging)
-      --workdir <WORKDIR>          工作目录(默认当前目录)
-  -h, --help                       Print help
-```
-
-### Windows PowerShell 注意
-
-PowerShell 5.1 用 `''` 单引号传 JSON 会吃掉 `"`,所以 CLI 的 payload 参数用 `--payload-file` 而不是 inline:
-
-```powershell
-# ❌ 不行(单引号会吃掉 ")
-evo-agent run '{\"x\":10}'
-
-# ✅ 用文件
-'{"x":10}' | Set-Content -Encoding utf8 payload.json
-evo-agent run --payload-file payload.json ...
-```
-
-> **0.1.0 状态**:`run` 命令已能跑通 agent 桥接(可跑全栈:`Config::load` → `default_safe_toolkit` → `AgentRunner::from_definition`),但**真实 LLM 调用 + SSE 事件循环**还在等 evorule-server 端到端测试。`list` / `tools list` / `tools show` / `config` / `validate` 5 个命令**完全可用**。
-
----
-
-## 核心组件
-
-### `AgentRunner` —— ReAct 循环
-
-文件:`src/agent/runner.rs` (~1040 行)
-
-事件驱动的 ReAct 主循环:
-
-```rust
-for step in 0..max_steps {
-    // 1. 读 session state
-    // 2. 调用 LLM(io_request: call_external)
-    // 3. 解析 LLM 响应(content 或 tool_calls)
-    // 4. 如果是 tool_call: 执行工具(io_request: call_service)
-    // 5. 写回消息历史到 session payload
-    // 6. 等待 stable 事件
-    // 7. 返回 AgentResult
-}
-```
-
-**关键设计:**
-- **不内嵌 LLM SDK** —— 通过 `LlmHandler` trait 注入
-- **不直接调工具** —— 通过 `ToolHandler` trait 注入
-- **不本地存记忆** —— 全部走 evorule `payload` API
-
-### `MemoryManager` —— 三层记忆
-
-文件:`src/agent/memory.rs` (~460 行)
-
-| 命名空间 | 用途 | 生命周期 |
-|---|---|---|
-| `__memory__.agent_{type}.shared.{key}` | 跨会话共享知识 | 永久 |
-| `__memory__.agent_{type}.session_{id}.{key}` | 单会话私有状态 | 会话期间 |
-| `__memory__.agent_{type}.session_{id}.messages.{idx}` | 短期消息历史 | 会话期间 |
-
-**所有记忆通过 `POST /api/sessions/{id}/payload` 写入**,所以:
-- 记忆本身就是 Fact,可回放、可审计
-- `used_at_startup` 记录启动时引用了哪些 shared fact
-- `facts_by_prefix` 支持路径前缀查询
-
-### `ToolRegistry` —— 工具注册
-
-文件:`src/agent/tool_registry.rs` (~280 行)
-
-```rust
-use async_trait::async_trait;
-use evo_agent::agent::{ToolSpec, ParameterSpec, ToolRegistry};
-use tier0_tcb::JsonValue;
-
-struct WebSearchTool;
-
-#[async_trait]
-impl ToolFunction for WebSearchTool {
-    async fn call(&self, args: &JsonValue) -> Result<JsonValue, String> {
-        let query = args["query"].as_str().ok_or("missing query")?;
-        // ... 实际搜索逻辑
-        Ok(json!({"results": [...]}))
-    }
-}
-
-// 注册
-let mut registry = ToolRegistry::new();
-registry.register(
-    ToolSpec {
-        name: "web_search".into(),
-        description: "在 Web 上搜索关键词".into(),
-        parameters: vec![ParameterSpec {
-            name: "query".into(),
-            r#type: "string".into(),
-            description: "搜索关键词".into(),
-            required: true,
-        }],
-        required: vec!["query".into()],
-    },
-    Arc::new(WebSearchTool),
-);
-```
-
-### `AgentDefinitionManager` —— Agent 配置加载
-
-文件:`src/agent/definition.rs` (~365 行)
-
-从 `agents/{type}/agent.json` 加载 Agent 定义:
-
-```json
-{
-  "agent_type": "researcher",
-  "version": "1.0.0",
-  "description": "研究型 Agent,擅长信息搜集与综合",
-  "system_prompt": "你是一个严谨的研究助手...",
-  "model": "gpt-4o-mini",
-  "temperature": 0.3,
-  "max_steps": 15,
-  "tools": ["web_search", "fetch_url"],
+  "tools": ["file_read", "search_files", "file_list"],
   "memory": {
-    "shared_keys": ["user.profile", "research.preferences"]
-  }
+    "type": "persistent",
+    "namespace": "researcher",
+    "message_persist": { "mode": "every_message" },
+    "max_session_summaries": 3,
+    "max_injected_events": 5,
+    "enable_event_extraction": true
+  },
+  "context_window_tokens": 8192,
+  "parallel_tools": 1
 }
 ```
 
+### 内置 Agent
+
+| Agent | 说明 | 工具 |
+|-------|------|------|
+| `general` | 通用 Agent — 文件操作 + Shell + Web | file_read, file_list, file_write, search_files, shell_exec, http_get |
+| `researcher` | 研究 Agent — 只读搜索 | file_read, search_files, file_list |
+| `rule-copilot` | 规则协作 Agent — 34 个规则管理工具 | ws_*, rule_*, audit_*, translate_*, sandbox_*, dataset_*, publish_* |
+
 ---
 
-## API 概览
+## 记忆系统
+
+### 三层记忆
+
+| 层级 | 路径格式 | 用途 | 生命周期 |
+|------|----------|------|----------|
+| 共享记忆 | `shared.{ns}.{key}` | 跨会话共享知识 | 永久（WAL 持久化） |
+| 会话记忆 | `{ns}.sessions.{sid}.{key}` | 单会话私有状态 | 会话期间 |
+| 短期消息 | `{ns}.sessions.{sid}.messages.{idx}` | 对话历史 | 会话期间 |
+
+所有记忆通过 `POST /api/sessions/{id}/payload` 写入 evorule，记忆本身就是 Fact，可回放、可审计。
+
+### 跨会话共享事实
+
+当 session 写入 `shared.*` 路径的 PayloadUpdate 时，evorule-server 同步广播到 `SharedFactsLog`：
+
+- **WAL 持久化**：重启后自动恢复历史共享事实 + 元数据
+- **Rollup 标记**：已合并的旧事实从 prefix 查询中过滤，但 `fact_by_id` 仍可访问（审计可追溯）
+- **来源追踪**：每条共享事实记录 `source_session_id`
+
+### 记忆事件链
+
+会话运行期间，`EventExtractor` 从对话中提取结构化事件：
+
+- 实体（Entity）：人物、地点、物品等
+- 事件（Event）：带因果链的 `cause_fact_id` 锚点
+- 叙事（Narrative）：LLM 生成的自然语言描述
+
+会话结束时通过 `replay` 命令回放，支持按事件 ID、实体、方向（backward/forward）筛选。
+
+### 会话沉淀
+
+会话结束（Stable/Error 分支）时自动完成三级沉淀：
+
+1. **当前级**：messages 已由 `MessagePersistMode` 在运行时逐条写入
+2. **中期级**：整会话摘要写入 `shared.{ns}.sessions.{sid}.summary`
+3. **长期级**：稳定事实写入 `shared.{ns}.stable.{key}`
+
+---
+
+## 工具系统
+
+### 3 层安全模型
+
+| 层级 | 行为 | 示例 |
+|------|------|------|
+| **ACTIVE** | 直接执行，无需审批 | file_read, file_list, file_write, search_files, shell_exec（8 命令白名单）, http_get（6 主机白名单） |
+| **CANDIDATE** | LLM 想用 → 返回 proposal → 用户审批 → 执行 | rm, mv, curl 等 20+ shell 命令，任意公开 HTTP host |
+| **BLOCKED** | 永不批准 | sudo, python, bash 等 28+ 逃逸命令，SSRF 黑名单 IP 段 |
+
+### 内置工具（6 个）
+
+| 工具 | 说明 |
+|------|------|
+| `file_read` | 读取文件（工作目录沙箱，拒绝 `..` / 绝对路径 / symlink 逃逸） |
+| `file_list` | 列出目录内容 |
+| `file_write` | 写入文件 |
+| `search_files` | 按内容搜索文件 |
+| `shell_exec` | 执行 Shell 命令（白名单 + candidate 审批） |
+| `http_get` | HTTP GET 请求（主机白名单 + SSRF 防护） |
+
+### 规则管理工具集（34 个）
+
+通过 `rule_management_toolkit` / `full_rule_toolkit` 组装，用于 `rule-copilot` Agent：
+
+| 类别 | 工具数 | 说明 |
+|------|--------|------|
+| workspace | 2 | ws_list, ws_create |
+| rule | 12 | rule_list, rule_get, rule_create, rule_update, rule_versions, rule_version_get, rule_submit, rule_activate, rule_block, rule_archive, rule_fork, rule_reload |
+| translate | 3 | rule_to_transform, rule_to_conditional, rule_validate |
+| audit | 3 | audit_get, audit_verify, session_rewind |
+| sandbox | 6 | 沙盒编排（fork + 合成数据 + 测试报告） |
+| dataset | 4 | 数据集管理 |
+| publish | 4 | 发布队列 + 三级权限 |
+| production | 4 | 生产环境管理 |
+
+### MCP 工具接入
+
+通过 MCP 客户端接入外部工具生态：
+
+```toml
+# evo-agent.toml
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+```
+
+MCP 工具自动注册为 `mcp_{server}_{tool}` 前缀，纳入 ToolHandler 统一管理。
+
+---
+
+## 配置
+
+4 层配置加载（优先级低 → 高，后者覆盖前者）：
+
+1. **默认值** — 代码中 `Config::default()`
+2. **用户配置** — `~/.config/evo-agent/config.toml`（Linux/macOS）或 `%APPDATA%\evo-agent\config.toml`（Windows）
+3. **项目配置** — `./evo-agent.toml`
+4. **环境变量** — `EVO_AGENT_*` 前缀，`__` 分隔 section/field
+
+```toml
+# evo-agent.toml 示例
+[llm]
+provider = "minimax"
+api_key = "${ENV:MINIMAX_API_KEY}"
+model = "MiniMax-M2.5"
+api_base = "https://api.minimax.io/v1/text/chatcompletion_v2"
+timeout_secs = 30
+max_retries = 3
+context_window_tokens = 8192
+
+[evorule]
+base_url = "http://127.0.0.1:18080"
+
+[agents]
+dir = "./agents"
+default = "general"
+
+[serve]
+host = "127.0.0.1"
+port = 8081
+```
+
+`api_key` 字段支持 `${ENV:VAR_NAME}` 占位符，加载时展开为环境变量值。
+
+---
+
+## HTTP API
 
 ### Evo-Agent 自有 API
 
 | 方法 | 路径 | 说明 |
-|---|---|---|
+|------|------|------|
 | `GET` | `/api/agent/list` | 列出所有已注册 Agent 类型 |
 | `GET` | `/api/agent/{type}` | 查看指定 Agent 详细定义 |
 | `POST` | `/api/agent/run` | 启动一个 Agent 运行 |
+| `GET` | `/api/health` | 健康检查 |
 
-### 通过 `EvoruleApiClient` 透传到 evorule-server
+### 通过 ApiCore 透传到 evorule-server
 
-19 个端点(2026-07-19 实测),包括:
-- `create_session` / `fork_session` / `list_sessions`
-- `command` / `update_payload` / `state`
-- `replay` / `rewind` / `diff` / `history`
-- `audit` / `audit_verify`
-- `shared_facts` / `shared_fact_source` / `shared_fact_used_by`
-- `join` / `leave` / `cluster_status`
-- `submit_io_response` / `record_used_at_startup`
+两个 client（`EvoruleApiClient` + `WorkspaceApiClient`）共享 `ApiCore`（base_url + reqwest Client + Bearer auth），统一错误为 `ApiError`。
 
-详细方法签名见 [`src/api/evorule_client.rs`](src/api/evorule_client.rs)。
+认证使用 `EVORULE_AUTH_TOKEN` 环境变量，构造时读取；开发模式下（token 缺失）不发 auth header。
 
 ---
 
 ## 接入真实 LLM
 
-**当前状态:** `LlmHandler::call()` 返回模拟响应,`ToolHandler::call()` 同理 —— 这是 v1.0 的占位实现。
-
-要接入真实 LLM,实现 `LlmHandler` trait 即可:
+实现 `LlmHandler` trait 即可接入任意 LLM provider：
 
 ```rust
 use evo_agent::io_handlers::LlmHandler;
@@ -392,16 +406,22 @@ impl LlmHandler for OpenAIHandler {
             ],
             "tools": tools,
         });
-        // ... POST 到 OpenAI API
-        todo!("实现真实调用")
+        let resp = client
+            .post(&format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json::<Value>()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(resp)
     }
 }
 ```
 
-然后在 `main.rs` 里替换默认 handler。
-
-> ⚠️ **本仓库不会替你写 OpenAI/Anthropic/DeepSeek 的具体调用** —— 这是用户自行扩展的部分。
-> 我们提供的只是抽象,目的是把"机制"(evorule)和"应用"(具体 LLM)彻底分开。
+内置支持 OpenAI 兼容 API（MiniMax / DeepSeek / OpenAI），通过 `LlmConfig` 配置 provider / api_key / model / api_base。
 
 ---
 
@@ -411,60 +431,19 @@ impl LlmHandler for OpenAIHandler {
 # 单元 + 集成测试
 cargo test --workspace
 
-# 只跑集成(mock evorule-server)
+# 只跑集成（mockito mock evorule-server）
 cargo test --test integration_test
 
-# 跑 evorule-server 真实端到端
+# 真实 evorule-server 端到端
 # 1. 启动 evorule-server
 # 2. cargo test -- --ignored --test-threads=1
 ```
 
-集成测试用 `mockito` mock evorule-server,覆盖:
-- `auto_recall`(启动时拉取 shared facts)
+集成测试用 `mockito` mock evorule-server，覆盖：
+- `auto_recall`（启动时拉取 shared facts）
 - ReAct 主循环的 SSE 事件驱动
 - 工具调用闭环
 - 错误处理路径
-
----
-
-## 已知限制 & 路线图
-
-### v0.1.0 状态(2026-07-20)
-
-**已完成 ✅:**
-
-- ✅ **LLM Handler 真实集成**(reqwest 调用 OpenAI 兼容 API,支持 minimax / DeepSeek / OpenAI)
-- ✅ **6 个内置工具**:`file_read` / `file_list` / `file_write` / `search_files` / `shell_exec` / `http_get`
-- ✅ **3 层安全模型**:active(8 shell 命令 + 6 http 主机) / candidate(20 shell + 任意公开 host) / blocked(28 shell + SSRF 黑名单)
-- ✅ **propose 协议**:candidate 工具返回 `{status: "needs_approval", description, risk, alternative}`
-- ✅ **SSRF 防护**:硬编码 IP 段黑名单(127/8, 10/8, 172.16/12, 192.168/16, 169.254/16)
-- ✅ **工作目录沙箱**:file_* / search_files 拒绝绝对路径 + `..` + symlink 逃逸
-- ✅ **P0 #1 Bridge**:`AgentRunner::from_definition` 把 agent.json + 6 工具 → 可跑 Runner
-- ✅ **P0 #2 CLI**:`run` / `list` / `tools list` / `tools show` / `validate` / `config` 6 个子命令
-- ✅ **P0 #3 Config**:4 子结构 + 3 层加载 + `${ENV:VAR}` 占位符
-- ✅ **AGPL-3.0 + CC0-1.0** 双协议(代码 + core_eval.json)
-- ✅ **158/158 unit tests** pass
-
-**已知限制 ⚠️:**
-
-- ⚠️ **168 warnings**(主要是 pre-existing `missing_docs`,不影响运行,`cargo fix --lib` 可一键补)
-- ⚠️ **3 pre-existing integration tests fail**(缺 LLM mock,跟踪到 0.2.0)
-- ⚠️ **17 文件中文注释乱码**(PowerShell 5.1 GBK 误读,跟踪到 0.2.0 重写)
-- ⚠️ **runner.run 遇到 candidate 工具 proposal 会 error out**(0.1.0:未实现 propose 暂停;0.2.0:加 `auto_approve` 路径 + fact log)
-- ⚠️ **CLI `run` 命令需要 evorule-server 在线**(桥接通,需要 server 跑起来才能完整跑通)
-
-### 路线图
-
-| 阶段 | 目标 | 预计 |
-|---|---|---|
-| v0.2.0 | runner.run 处理 candidate 工具 proposal(暂停 → user 批 → 再执行) | 1 周 |
-| v0.2.0 | 168 warnings 清零(补 `///` doc) | 2 天 |
-| v0.2.0 | 17 文件中文注释重写(走 [System.IO.File]::WriteAllText,UTF-8 no BOM) | 1 天 |
-| v0.2.0 | 3 integration test mock LLM(用 wiremock-rs 替换真实 HTTP) | 1 周 |
-| v0.2.0 | Gitee push(0.1.0 → 0.2.0 后) | TBD |
-| v0.3.0 | time-travel-debugger 应用层接入(用 evorule fact log 做 replay/diff/rewind) | 3 周 |
-| v0.4.0 | audit-inspector(blake3 哈希链验证 UI) | 2 周 |
-| v0.5.0 | live-monitor(实时 fact 流) | 2 周 |
 
 ---
 
@@ -472,31 +451,84 @@ cargo test --test integration_test
 
 ```
 evo-agent/
-├── Cargo.toml                        # 依赖 + path references
-├── README.md                         # 本文件
+├── Cargo.toml
+├── README.md
+├── CHANGELOG.md
+├── LICENSE
+├── agents/                          # Agent 定义
+│   ├── general.json
+│   ├── researcher.json
+│   └── rule-copilot.json
 ├── src/
-│   ├── lib.rs                        # 入口 + 公共导出
+│   ├── lib.rs                       # 入口 + 公共导出
+│   ├── config.rs                    # 4 层配置加载
+│   ├── json_convert.rs              # serde ↔ tcb::JsonValue 转换
+│   ├── io_handler.rs                # I/O handler 基类 trait
+│   ├── io_dispatcher.rs             # I/O 分发器
 │   ├── agent/
-│   │   ├── runner.rs                 # ⭐ ReAct 主循环 (~1040 行)
-│   │   ├── memory.rs                 # ⭐ 三层记忆管理 (~460 行)
-│   │   ├── definition.rs             # Agent 配置加载 (~365 行)
-│   │   ├── tool_registry.rs          # 工具注册中心 (~280 行)
-│   │   ├── translator.rs             # LLM 响应解析 (~175 行)
-│   │   ├── delegate.rs               # Agent 嵌套上下文 (~135 行)
+│   │   ├── runner.rs                # ReAct 主循环
+│   │   ├── memory.rs                # 三层记忆管理
+│   │   ├── memory_event/            # 结构化记忆事件 + 因果链 + 回放
+│   │   │   ├── entity.rs            #   实体定义
+│   │   │   ├── event.rs             #   事件定义
+│   │   │   ├── evidence.rs          #   证据伴随
+│   │   │   ├── extraction.rs        #   事件提取
+│   │   │   ├── replay.rs            #   确定性回放
+│   │   │   └── store.rs             #   事件存储
+│   │   ├── definition.rs            # Agent 配置加载
+│   │   ├── tool_registry.rs         # 工具注册中心
+│   │   ├── translator.rs            # LLM 响应解析
+│   │   ├── delegate.rs              # Agent 嵌套上下文
+│   │   ├── workflow.rs              # DAG 工作流引擎
+│   │   ├── context_window.rs        # 上下文窗口裁剪
+│   │   ├── summarizer.rs            # 会话摘要
+│   │   ├── sediment.rs              # 会话沉淀通道
+│   │   ├── approval.rs              # 工具审批系统
+│   │   ├── callback.rs              # 事件回调链
+│   │   ├── output_validator.rs      # JSON Schema 输出校验
 │   │   └── mod.rs
 │   ├── api/
-│   │   ├── evorule_client.rs         # ⭐ 19 个 evorule 端点 (~530 行)
-│   │   ├── agent_api.rs              # ⭐ /api/agent/* 路由 (~240 行)
+│   │   ├── api_core.rs              # 共享 HTTP 基建（ApiCore + ApiError）
+│   │   ├── evorule_client.rs        # evorule-server 端点客户端
+│   │   ├── workspace_client.rs      # workspace 服务客户端
+│   │   ├── agent_api.rs             # /api/agent/* 路由
+│   │   ├── serve_tools.rs           # serve 模式工具注册
+│   │   ├── ws_handler.rs            # WebSocket 双向流
+│   │   ├── auth.rs                  # Bearer 认证
+│   │   ├── metrics.rs               # Prometheus 指标
 │   │   └── mod.rs
-│   ├── io_handlers/                  # LLM/Tool 抽象层(stub)
-│   │   ├── llm_handler.rs            #   LlmHandler trait
-│   │   ├── tool_handler.rs           #   ToolHandler trait
+│   ├── builtin_tools/               # 6 个内置工具
+│   │   ├── file_read.rs
+│   │   ├── file_list.rs
+│   │   ├── file_write.rs
+│   │   ├── search_files.rs
+│   │   ├── shell_exec.rs
+│   │   ├── http_get.rs
+│   │   ├── delegate_tool.rs         # Agent 委托工具
 │   │   └── mod.rs
-│   ├── io_dispatcher.rs              # I/O 分发器(预留扩展)
-│   ├── io_handler.rs                 # I/O handler 基类 trait
-│   └── json_convert.rs               # serde ↔ tcb::JsonValue 转换
+│   ├── rule_tools/                  # 34 个规则管理工具
+│   │   ├── workspace_tools.rs       #   workspace 2 个
+│   │   ├── rule_tools.rs            #   rule CRUD 12 个
+│   │   ├── translate_tools.rs       #   规则转换 3 个
+│   │   ├── audit_tools.rs           #   审计 3 个
+│   │   ├── sandbox_tools.rs         #   沙盒 6 个
+│   │   ├── dataset_tools.rs         #   数据集 4 个
+│   │   ├── publish_tools.rs         #   发布 4 个
+│   │   ├── production_tools.rs      #   生产 4 个
+│   │   └── mod.rs
+│   ├── mcp/                         # MCP 客户端
+│   │   ├── client.rs                #   JSON-RPC 2.0 客户端
+│   │   ├── transport.rs             #   stdio 传输
+│   │   ├── tool_adapter.rs          #   MCP → ToolFunction 适配
+│   │   └── mod.rs
+│   ├── io_handlers/                 # LLM/Tool 抽象层
+│   │   ├── llm_handler.rs
+│   │   ├── tool_handler.rs
+│   │   └── mod.rs
+│   └── bin/
+│       └── evo-agent.rs             # CLI 入口
 └── tests/
-    └── integration_test.rs           # mockito 端到端测试
+    └── integration_test.rs          # mockito 端到端测试
 ```
 
 ---
@@ -504,34 +536,33 @@ evo-agent/
 ## 依赖关系
 
 ```toml
-# Cargo.toml 关键依赖
-tier0-tcb = { path = "../evorule/tier0-tcb" }        # 反应式执行内核
-tier1-reactor = { path = "../evorule/tier1-reactor" } # 反应器 + FactsLog
+evorule-tcb = "0.2"           # 反应式执行内核（JsonValue / Fact / 因果链）
+evorule-reactor = "0.2"       # 反应器 + FactsLog + WAL
 
-reqwest = { version = "0.12", features = ["json", "stream"] }  # HTTP 客户端
-axum = "0.8"                                            # 自有 HTTP 服务
-tokio = { version = "1", features = ["full"] }          # 异步运行时
-serde / serde_json = "1"                                # JSON 序列化
-prometheus = "0.13"                                     # 指标
-tracing = "0.1"                                         # 结构化日志
+reqwest = "0.12"              # HTTP 客户端
+axum = "0.8"                  # HTTP 服务（含 WebSocket）
+tokio = "1"                   # 异步运行时
+serde / serde_json = "1"      # JSON 序列化
+clap = "4"                    # CLI 参数解析
+tracing = "0.1"               # 结构化日志
+prometheus = "0.13"           # 指标
+jsonschema = "0.18"           # JSON Schema 校验
+rustyline = "14"              # REPL 行编辑
 ```
 
-**零 unsafe**:`#![forbid(unsafe_code)]` 在所有 module 强制。
+**零 unsafe**：`#![forbid(unsafe_code)]` 在所有 module 强制。
 
 ---
 
 ## 相关项目
 
-- [evorule](../evorule) — 反应式执行引擎(tier0/tier1/tier2)
-- [evorule/sdk/typescript](../evorule/sdk/typescript) — TypeScript SDK
-- [evorule/sdk/python](../evorule/sdk/python) — Python SDK(规划中)
+- [evorule](https://gitee.com/evo-rule-lab/evorule) — 反应式执行引擎（tier0/tier1/tier2）
+- [evorule-server](https://gitee.com/evo-rule-lab/evorule-server) — HTTP 服务 + Workspace + 沙盒 + 发布队列
 
 ---
 
 ## License
 
-[AGPL-3.0](LICENSE) —— 详见 `oss_strategy.md` 中的协议决策记录。
+[AGPL-3.0](LICENSE)
 
-> 这是**整个 EvoRule 生态**的协议,不只是 evo-agent 单独的协议。
-> 我们的立场是"不白送":大厂 fork 之后想"卖闭源 SaaS"也得开源他们的服务。
-> 内部用 AGPL 管不到(也没必要),但 fork 这个行为本身 = 我们的胜利。
+
