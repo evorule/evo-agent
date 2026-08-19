@@ -18,6 +18,9 @@ data/
 # 内部设计文档（不跟踪 git，仅供本地参考）
 _design_docs/
 
+# 内部验证报告（不跟踪 git，仅供本地参考）
+文档/
+
 # 本地工作/临时目录
 .build/
 .workbuddy/
