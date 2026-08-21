@@ -8,6 +8,7 @@ pub mod agent_api;
 pub mod api_core;
 pub mod auth;
 pub mod evorule_client;
+pub mod llm_ops;
 pub mod metrics;
 pub mod serve_tools;
 pub mod workspace_client;
