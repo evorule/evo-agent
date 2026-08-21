@@ -175,8 +175,12 @@ async fn run_llm_op(op: &Operation, req: &LlmOpRequest, model: &str) -> Result<V
     let payload = serde_json::to_string(&req.params).unwrap_or_else(|_| "{}".to_string());
     let user_prompt = format!("{}\n\n入参 JSON：\n{}", op.prompt_instruction(), payload);
 
-    // LlmHandler 从环境自动读 API key / model（serve 模式约定，同 run_agent 的 None 传参）
-    let llm = LlmHandler::with_defaults();
+    // 冒烟/离线测试开关：`EVO_AGENT_LLM_MOCK_CONTENT` 非空时用 mock handler，
+    // 不访问外部 LLM（供端到端契约验证；未设置时走真实 `with_defaults`）。
+    let llm = match std::env::var("EVO_AGENT_LLM_MOCK_CONTENT") {
+        Ok(mock) => LlmHandler::mock(&mock),
+        Err(_) => LlmHandler::with_defaults(),
+    };
     let params = json!({
         "model": model,
         "prompt": user_prompt,
