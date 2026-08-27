@@ -49,6 +49,16 @@ evo-agent 与 evorule-server 通过 HTTP + SSE 通讯,不共享内存、不嵌�
 
 ---
 
+## 2.1 运行宪法归属（T8 迁出，2026-08-27）
+
+evorule 引擎执行规则前必须加载一份 rule_set 作为运行宪法。**该资产自本版起由本仓自持,不再依赖核心仓的 `evorule-tcb/core_eval.json`**(后者已回归最小引擎自评集):
+
+- **文件**: [`assets/agent_constitution.json`](assets/agent_constitution.json) — `app.evoagent.agent` v0.4.0,包含完整的 ReAct 循环规则(call_external → tool_calls → collect → call_service → merge),源自 org.evorule.core.eval v0.3.1 整体迁出,经宪法 `rule_set v1.0` 门禁校验;
+- **部署**: 启动 evorule-server 时通过 CLI 参数 `--core_eval <路径>` 或 config `paths.core_eval` 指向本文件;未指定时 server 默认用其自带的最小评估集,那样 ReAct 循环将不可用(命令会被兜底规则吞掉并产生 Error 事实);
+- **边界**: 协议层(`IoRequest`/`io_response`/`call_external` io 类型/审计桥流程)属于 evorule 指令语言层,不在本资产管辖内——本资产只负责"循环怎么转"的剧本。
+
+---
+
 ## 3. 核心模块
 
 | 模块 | 文件 | 职责 |
