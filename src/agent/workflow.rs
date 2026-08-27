@@ -177,6 +177,27 @@ impl WorkflowEngine {
 
         let mut id_set: HashSet<&str> = HashSet::new();
         for n in &wf.nodes {
+            // 门卫(P2-M7 前置补丁):node id 必须是标识符 [A-Za-z0-9_-]+——
+            // id 会被拼进 task_template 占位符 `{id}`,含 {} / 空格等字符会
+            // 污染模板机制;强制白名单消除该隐性边角。
+            if n.id.is_empty()
+                || !n
+                    .id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(format!(
+                    "workflow '{}': node id '{}' is not a valid identifier ([A-Za-z0-9_-]+)",
+                    wf.workflow_id, n.id
+                ));
+            }
+            // 门卫(路径穿越防护):agent_type 最终会进入 AgentDefinition 加载器,
+            // 此处提前拦截并给出工作流上下文的可读错误。
+            if let Err(e) =
+                crate::agent::definition::AgentDefinition::validate_agent_type(&n.agent_type)
+            {
+                return Err(format!("workflow '{}': {}", wf.workflow_id, e));
+            }
             if !id_set.insert(n.id.as_str()) {
                 return Err(format!(
                     "workflow '{}' has duplicate node id: '{}'",
@@ -368,6 +389,81 @@ mod tests {
         let err = engine.validate(&wf).unwrap_err();
         assert!(err.contains("duplicate node id"));
         assert!(err.contains("'a'"));
+    }
+
+    // ===== 门卫负向用例(P2-M7 前置补丁,2026-08-27) =====
+
+    #[test]
+    fn test_validate_node_id_rejects_non_identifier() {
+        let ctx = make_ctx();
+        let engine = WorkflowEngine::new(ctx);
+        // 含花括号的 id 会污染 task_template 占位符机制
+        let wf = Workflow {
+            workflow_id: "w".to_string(),
+            description: String::new(),
+            nodes: vec![node("bad{id}", "worker", &[])],
+            output_node: "bad{id}".to_string(),
+        };
+        let err = engine.validate(&wf).unwrap_err();
+        assert!(err.contains("not a valid identifier"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_node_id_rejects_empty_and_space() {
+        let ctx = make_ctx();
+        let engine = WorkflowEngine::new(ctx);
+        for bad_id in ["", "has space", "dot.dot"] {
+            let wf = Workflow {
+                workflow_id: "w".to_string(),
+                description: String::new(),
+                nodes: vec![node(bad_id, "worker", &[])],
+                output_node: bad_id.to_string(),
+            };
+            let err = engine.validate(&wf).unwrap_err();
+            assert!(
+                err.contains("not a valid identifier"),
+                "id {:?} not rejected, got: {}",
+                bad_id,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_agent_type_rejects_path_traversal() {
+        let ctx = make_ctx();
+        let engine = WorkflowEngine::new(ctx);
+        for bad in ["../researcher", "a/b", "a\\b", ".."] {
+            let wf = Workflow {
+                workflow_id: "w".to_string(),
+                description: String::new(),
+                nodes: vec![node("n1", bad, &[])],
+                output_node: "n1".to_string(),
+            };
+            let err = engine.validate(&wf).unwrap_err();
+            assert!(
+                err.contains("invalid agent_type") || err.contains("path traversal"),
+                "agent_type {:?} not rejected, got: {}",
+                bad,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_identifiers() {
+        let ctx = make_ctx();
+        let engine = WorkflowEngine::new(ctx);
+        let wf = Workflow {
+            workflow_id: "w".to_string(),
+            description: String::new(),
+            nodes: vec![
+                node("alpha_1-beta", "general-2_x", &[]),
+                node("n2", "researcher", &["alpha_1-beta"]),
+            ],
+            output_node: "n2".to_string(),
+        };
+        assert!(engine.validate(&wf).is_ok());
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub enum AgentDefinitionError {
     Json(serde_json::Error),
     /// Agent 绫诲瀷鏈壘鍒
     NotFound(String),
+    /// 定义非法(门卫:取值越界/标识符不合法)
+    InvalidDefinition(String),
 }
 
 impl std::fmt::Display for AgentDefinitionError {
@@ -24,6 +26,9 @@ impl std::fmt::Display for AgentDefinitionError {
             AgentDefinitionError::Io(e) => write!(f, "IO error: {}", e),
             AgentDefinitionError::Json(e) => write!(f, "JSON parse error: {}", e),
             AgentDefinitionError::NotFound(t) => write!(f, "Agent type not found: {}", t),
+            AgentDefinitionError::InvalidDefinition(msg) => {
+                write!(f, "Invalid agent definition: {}", msg)
+            }
         }
     }
 }
@@ -253,14 +258,72 @@ fn is_max_parallel_tools_default(v: &usize) -> bool {
 }
 
 impl AgentDefinition {
+    /// agent_type 标识符白名单:`[A-Za-z0-9_-]+`
+    ///
+    /// 门卫(P2-M7 前置补丁,2026-08-27):workflow JSON 等外部输入会以
+    /// `agent_type` 拼接文件路径加载——含 `/` `\` `..` 的值构成路径穿越,
+    /// 可读取盘上任意 .json。加载侧统一在此拒绝。
+    pub fn validate_agent_type(agent_type: &str) -> Result<(), AgentDefinitionError> {
+        if agent_type.is_empty()
+            || !agent_type
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(AgentDefinitionError::InvalidDefinition(format!(
+                "invalid agent_type '{}': must match [A-Za-z0-9_-]+ (path traversal guard)",
+                agent_type
+            )));
+        }
+        Ok(())
+    }
+
+    /// 定义级语义校验(反序列化后的第二道门卫)
+    ///
+    /// serde 只保证类型正确,不保证取值合理。此处拦截会在 LLM 调用时才爆出的
+    /// 错配(如 temperature 越界、max_steps=0),加载期即失败并给出可读原因。
+    pub fn validate(&self) -> Result<(), AgentDefinitionError> {
+        Self::validate_agent_type(&self.agent_type)?;
+        if !(0.0..=2.0).contains(&self.temperature) {
+            return Err(AgentDefinitionError::InvalidDefinition(format!(
+                "temperature {} out of range [0.0, 2.0]",
+                self.temperature
+            )));
+        }
+        if self.max_steps == 0 {
+            return Err(AgentDefinitionError::InvalidDefinition(
+                "max_steps must be >= 1".to_string(),
+            ));
+        }
+        if self.step_timeout_secs == 0 {
+            return Err(AgentDefinitionError::InvalidDefinition(
+                "step_timeout_secs must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Load Agent definition from directory
     pub fn load_from_dir(dir: &Path, agent_type: &str) -> Result<Self, AgentDefinitionError> {
+        // 门卫 1:agent_type 标识符白名单(路径穿越防护)
+        Self::validate_agent_type(agent_type)?;
         let path = dir.join(format!("{}.json", agent_type));
         if !path.exists() {
             return Err(AgentDefinitionError::NotFound(agent_type.to_string()));
         }
         let content = std::fs::read_to_string(&path)?;
-        let def: AgentDefinition = serde_json::from_str(&content)?;
+        let value: serde_json::Value = serde_json::from_str(&content)
+            .map_err(AgentDefinitionError::Json)?;
+        // 门卫 2:宪法 jsonschema 全量校验(找不到 schema 时降级为仅门卫 3,tracing 留痕)
+        crate::agent::constitution::validate_agent_def(&value).map_err(|errs| {
+            AgentDefinitionError::InvalidDefinition(format!(
+                "constitution schema violations: {}",
+                errs.join("; ")
+            ))
+        })?;
+        // 门卫 3:定义级语义校验(取值范围)
+        let def: AgentDefinition = serde_json::from_value(value.clone())
+            .map_err(AgentDefinitionError::Json)?;
+        def.validate()?;
         Ok(def)
     }
 
@@ -432,6 +495,76 @@ mod tests {
         assert!(matches!(result, Err(AgentDefinitionError::NotFound(_))));
     }
 
+    // ===== 门卫负向用例(P2-M7 前置补丁,2026-08-27) =====
+
+    #[test]
+    fn test_load_rejects_path_traversal_agent_type() {
+        let dir = make_tmp_dir();
+        for bad in ["../general", "a/b", "a\\b", "..", ""] {
+            let result = AgentDefinition::load_from_dir(dir.path(), bad);
+            match result {
+                Err(AgentDefinitionError::InvalidDefinition(msg)) => {
+                    assert!(msg.contains("path traversal") || msg.contains("invalid agent_type"));
+                }
+                other => panic!("agent_type {:?} not rejected as InvalidDefinition: {:?}", bad, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_temperature_out_of_range() {
+        let mk = |t: f32| {
+            r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":"#
+                .to_string()
+                + &t.to_string()
+                + r#","max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null}"#
+        };
+        for t in [-0.5_f32, 2.5_f32] {
+            let def: AgentDefinition = serde_json::from_str(&mk(t)).expect("parse");
+            let err = def.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("temperature"),
+                "temperature {} not rejected: {}",
+                t,
+                err
+            );
+        }
+        // 边界值合法
+        for t in [0.0_f32, 2.0_f32] {
+            let def: AgentDefinition = serde_json::from_str(&mk(t)).expect("parse");
+            assert!(def.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_max_steps_and_timeout() {
+        let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":0,"step_timeout_secs":1,"tools":[],"output_format":null}"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert!(def.validate().unwrap_err().to_string().contains("max_steps"));
+
+        let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":0,"tools":[],"output_format":null}"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert!(def
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("step_timeout_secs"));
+    }
+
+    #[test]
+    fn test_validate_accepts_production_agents() {
+        // 三个生产 agent 定义必须通过门卫(防门卫误伤真资产)
+        let dir = PathBuf::from("agents");
+        if !dir.exists() {
+            return; // 非仓根运行时跳过
+        }
+        for name in ["general", "researcher", "rule-copilot"] {
+            let def = AgentDefinition::load_from_dir(&dir, name)
+                .unwrap_or_else(|e| panic!("production agent '{}' rejected: {}", name, e));
+            assert!(def.validate().is_ok());
+        }
+    }
+
     #[test]
     fn test_list_available() {
         let dir = make_tmp_dir();
@@ -501,7 +634,7 @@ mod tests {
         write_json(
             dir.path(),
             "researcher",
-            r#"{"agent_type":"researcher","version":"1","description":"","system_prompt":"test","model":"gpt-4","temperature":0.3,"max_steps":10,"step_timeout_secs":30,"tools":[],"output_format":null}"#,
+            r#"{"agent_type":"researcher","version":"1.0.0","description":"test researcher","system_prompt":"test","model":"gpt-4","temperature":0.3,"max_steps":10,"step_timeout_secs":30,"tools":[],"output_format":null}"#,
         );
         let mgr = AgentDefinitionManager::new(dir.path().to_path_buf());
         let types = mgr.list_types().expect("list");

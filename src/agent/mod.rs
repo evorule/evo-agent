@@ -4,7 +4,9 @@
 #![forbid(unsafe_code)]
 //! Agent orchestration layer -- AI Agent run loop, tool registry, and memory manager.
 pub mod approval;
+pub mod audited_llm;
 pub mod callback;
+pub mod constitution;
 pub mod context_window;
 pub mod definition;
 pub mod delegate;
@@ -12,6 +14,7 @@ pub mod memory;
 pub mod memory_event;
 pub mod output_validator;
 pub mod runner;
+pub mod safety_auditor;
 pub mod sediment;
 pub mod summarizer;
 pub mod tool_registry;
@@ -22,6 +25,7 @@ pub use approval::{
     ApprovalCallback, ApprovalRequest, AutoApprove, CliApproval, DenyAll, HttpApproval,
     HTTP_APPROVAL_TIMEOUT_SECS,
 };
+pub use audited_llm::{AuditedLlm, DEFAULT_AUDITED_CALL_TIMEOUT_SECS};
 pub use callback::{CallbackChain, EventCallback, LoggingCallback, MetricsCallback};
 pub use context_window::{
     ApproxTokenCounter, ContextWindowManager, TokenCounter, TrimResult, TrimStrategy,

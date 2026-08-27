@@ -62,9 +62,7 @@ use evo_agent::agent::workflow::WorkflowEngine;
 use evo_agent::api::agent_api::AgentApiState;
 use evo_agent::api::evorule_client::EvoruleApiClient;
 use evo_agent::api::workspace_client::WorkspaceApiClient;
-use evo_agent::builtin_tools::{
-    default_safe_toolkit, default_tool_specs, http_get, shell_exec, ToolSpec,
-};
+use evo_agent::builtin_tools::{default_tool_specs, http_get, shell_exec, ToolSpec};
 use evo_agent::io_handlers::LlmHandler;
 use evo_agent::Workflow;
 
@@ -233,6 +231,10 @@ enum Command {
         #[arg(long)]
         narrate: bool,
 
+        /// 改进3：结构化时间线开启哈希链验证(默认关闭,逐事件 evidence_for_event 输出 ✓/✗)
+        #[arg(long)]
+        verify: bool,
+
         /// agent 类型(对应 `agents/<name>.json`,narrate 时用于 LLM 配置)
         #[arg(long, short = 'a')]
         agent: Option<String>,
@@ -311,6 +313,7 @@ fn main() -> ExitCode {
             entity,
             direction,
             narrate,
+            verify,
             agent,
         } => cmd_replay(
             &cli.workdir,
@@ -319,6 +322,7 @@ fn main() -> ExitCode {
             entity.as_deref(),
             &direction,
             narrate,
+            verify,
             agent.as_deref(),
         ),
     }
@@ -371,11 +375,14 @@ fn cmd_run(
         }
     };
 
-    // 3. evorule 客户端
+    // 3. evorule + workspace 客户端(规则管理工具依赖 workspace API)
     let client = EvoruleApiClient::new(&config.evorule.base_url);
+    let ws_client = WorkspaceApiClient::new(&config.evorule.base_url);
 
-    // 4. 6 个安全工具
-    let mut tool_handler = default_safe_toolkit(workdir);
+    // 4. 工具 handler:内置安全工具(6) + 规则管理工具(20) 的 union
+    //    修复:rule-copilot 等规则角色在 run 路径也能使用 ws_*/rule_*/audit_* 工具
+    let mut tool_handler =
+        evo_agent::api::serve_tools::build_union_toolkit(workdir, &ws_client, &client);
 
     // 5. 桥接
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -871,6 +878,20 @@ fn cmd_serve(
             return ExitCode::from(1);
         }
     };
+    // P2-V3 止血:安装审计链旁路调用的指标回调(Summarizer 影子调用可见化)
+    {
+        let m = metrics.clone();
+        let _ = evo_agent::metrics::set_bypass_audit_hook(move |purpose| {
+            evo_agent::Metrics::inc_llm_bypass_audit(&m, purpose);
+        });
+    }
+    // P5-A3 指标:安装 L2 SafetyAuditor 命中上报回调(召回污染态势可见化)
+    {
+        let m = metrics.clone();
+        let _ = evo_agent::metrics::set_safety_hit_hook(move |rule| {
+            evo_agent::Metrics::inc_safety_audit_hit(&m, rule);
+        });
+    }
     let state = AgentApiState::new_with_metrics(
         definitions,
         evorule_client,
@@ -1036,7 +1057,25 @@ fn cmd_workflow(
     };
 
     // 3. 解析 workflow JSON
-    let wf: Workflow = match serde_json::from_str(&wf_content) {
+    let wf_value: serde_json::Value = match serde_json::from_str(&wf_content) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to parse workflow '{}': {}", workflow_id, e);
+            return ExitCode::from(1);
+        }
+    };
+
+    // 3.5 宪法 jsonschema 全量校验(M7-B2;找不到 schema 时降级为仅结构门卫,tracing 留痕)
+    if let Err(violations) = evo_agent::agent::constitution::validate_workflow_dag(&wf_value) {
+        eprintln!(
+            "workflow '{}' violates constitution schema (workflow_dag/v1.0): {}",
+            workflow_id,
+            violations.join("; ")
+        );
+        return ExitCode::from(1);
+    }
+
+    let wf: Workflow = match serde_json::from_value(wf_value) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("failed to parse workflow '{}': {}", workflow_id, e);
@@ -1336,7 +1375,11 @@ fn run_repl_turn(
     use std::io::Write;
 
     // 构造 tool_handler + llm_handler + runner(每轮重建,因为 run_streaming/run_continuation 消费 self)
-    let mut tool_handler = evo_agent::builtin_tools::default_safe_toolkit(workdir);
+    // 与 cmd_run 一致:内置安全工具 + 规则管理工具 union,保证 rule-copilot 可用
+    let ws_client =
+        evo_agent::api::workspace_client::WorkspaceApiClient::new(&config.evorule.base_url);
+    let mut tool_handler =
+        evo_agent::api::serve_tools::build_union_toolkit(workdir, &ws_client, client);
 
     let runner_result = runtime.block_on(async {
         let llm_handler = evo_agent::io_handlers::LlmHandler::from_config(&config.llm);
@@ -1503,6 +1546,7 @@ fn cmd_replay(
     entity: Option<&str>,
     direction: &str,
     narrate: bool,
+    verify: bool,
     agent: Option<&str>,
 ) -> ExitCode {
     use evo_agent::{MemoryEventStore, ReplayDirection, ReplayEngine};
@@ -1617,11 +1661,18 @@ fn cmd_replay(
 
     // 6. 输出
     if narrate {
-        // LLM 自然语言叙述(temperature=0,事实不变)
-        let narrative = runtime.block_on(async { engine.narrate(&events).await });
+        // 改进3：narrate_with_evidence — 叙述 + 逐事件证据标记
+        let narrative = runtime.block_on(async { engine.narrate_with_evidence(&events).await });
         match narrative {
             Ok(n) => {
                 println!("{}", n.text);
+                // 改进3：打印逐事件证据标记
+                if !n.evidence.is_empty() {
+                    println!("\n[本回放的证据标记]");
+                    for (event_id, mark) in &n.evidence {
+                        println!("  {}  {}", event_id, mark);
+                    }
+                }
                 eprintln!(
                     "\n[cited {} events, {} facts]",
                     n.cited_events.len(),
@@ -1633,18 +1684,51 @@ fn cmd_replay(
                     "[replay] narration failed: {}, falling back to structured output",
                     e
                 );
-                print_structured_timeline(&events);
+                // 改进3：fallback 到结构化时间线时,verify 语义保留
+                let evidence_map = if verify {
+                    runtime.block_on(build_evidence_map(engine.store_mut(), &events))
+                } else {
+                    std::collections::BTreeMap::new()
+                };
+                print_structured_timeline(&events, &evidence_map);
             }
         }
     } else {
-        print_structured_timeline(&events);
+        // 改进3：结构化时间线 — 源锚点 [fact#N] 恒显示;--verify 时附加 ✓/✗
+        let evidence_map = if verify {
+            runtime.block_on(build_evidence_map(engine.store_mut(), &events))
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        print_structured_timeline(&events, &evidence_map);
     }
 
     ExitCode::from(0)
 }
 
+/// 改进3：逐事件构建 event_id → 紧凑证据标记 映射（`render_compact`）。
+/// server 不可用/无 fact_id 的事件自动跳过（fail-open,不影响时间线输出）。
+async fn build_evidence_map(
+    store: &mut evo_agent::MemoryEventStore,
+    events: &[evo_agent::MemoryEvent],
+) -> std::collections::BTreeMap<String, String> {
+    let mut m = std::collections::BTreeMap::new();
+    for ev in events {
+        if let Ok(Some(evid)) = store.evidence_for_event(&ev.event_id).await {
+            m.insert(ev.event_id.clone(), evid.render_compact());
+        }
+    }
+    m
+}
+
 /// 打印结构化事件时间线(确定性,无 LLM)
-fn print_structured_timeline(events: &[evo_agent::MemoryEvent]) {
+///
+/// 改进3：`evidence_map`（event_id → 紧凑证据标记）非空时在每行附加验证标记 `[fact#N ✓ chain=K]`；
+/// 为空时仍显示本地源锚点 `[fact#N]`（event.fact_id，零依赖）。
+fn print_structured_timeline(
+    events: &[evo_agent::MemoryEvent],
+    evidence_map: &std::collections::BTreeMap<String, String>,
+) {
     use evo_agent::EventType;
 
     for event in events {
@@ -1699,14 +1783,27 @@ fn print_structured_timeline(events: &[evo_agent::MemoryEvent]) {
         let effects_str = if event.effects.is_empty() {
             String::new()
         } else {
-            format!(" →effects={:?}", event.effects)
+            // 改进2：effects 为 EventRef（event_id + 引擎级 FactId），格式化展示
+            let refs: Vec<String> = event
+                .effects
+                .iter()
+                .map(|r| match r.fact_id {
+                    Some(fid) => format!("{} (fact#{})", r.event_id, fid),
+                    None => r.event_id.clone(),
+                })
+                .collect();
+            format!(" →effects=[{}]", refs.join(", "))
         };
 
+        // 改进3：证据标记（--verify 提供完整 render_compact；否则本地源锚点 [fact#N]）
+        let evidence_mark = evidence_mark(event, evidence_map);
+
         println!(
-            "[{}] {} {}{}{}{} — {}",
+            "[{}] {} {}{}{}{}{} — {}",
             event.timestamp,
             type_str,
             event.event_id,
+            evidence_mark,
             emotion_str,
             entities_str,
             cause_str,
@@ -1719,4 +1816,68 @@ fn print_structured_timeline(events: &[evo_agent::MemoryEvent]) {
     }
 
     eprintln!("\n[{} events]", events.len());
+}
+
+/// 改进3：计算单事件的证据标记字符串。
+///
+/// - `evidence_map` 命中（`--verify`）→ `" [fact#N ✓ chain=K]"`（render_compact 原文）
+/// - 否则本地源锚点 → `" [fact#N]"`（零依赖，离线可用）；无 fact_id → 空串
+fn evidence_mark(
+    event: &evo_agent::MemoryEvent,
+    evidence_map: &std::collections::BTreeMap<String, String>,
+) -> String {
+    match evidence_map.get(&event.event_id) {
+        Some(mark) => format!(" {}", mark),
+        None => event
+            .fact_id
+            .filter(|&f| f > 0)
+            .map(|f| format!(" [fact#{}]", f))
+            .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evo_agent::{EventSource, EventType, MemoryEvent};
+
+    fn make_event(id: &str, fact_id: Option<u64>) -> MemoryEvent {
+        let mut e = MemoryEvent::new_root(id, EventType::EmotionEvent, 1000, EventSource::UserInput)
+            .with_content(serde_json::json!({"summary": "t"}));
+        e.fact_id = fact_id;
+        e
+    }
+
+    /// 改进3：无 --verify 时,本地源锚点 [fact#N] 恒显示(零依赖)
+    #[test]
+    fn test_evidence_mark_local_anchor() {
+        let e = make_event("E001", Some(42));
+        let map = std::collections::BTreeMap::new();
+        assert_eq!(evidence_mark(&e, &map), " [fact#42]");
+    }
+
+    /// 改进3：无 fact_id → 无锚点
+    #[test]
+    fn test_evidence_mark_no_fact_id() {
+        let e = make_event("E001", None);
+        let map = std::collections::BTreeMap::new();
+        assert_eq!(evidence_mark(&e, &map), "");
+    }
+
+    /// 改进3：--verify 时,evidence_map 命中优先于本地锚点(完整 render_compact)
+    #[test]
+    fn test_evidence_mark_verify_precedence() {
+        let e = make_event("E001", Some(42));
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("E001".to_string(), "[fact#42 ✓ chain=3]".to_string());
+        assert_eq!(evidence_mark(&e, &map), " [fact#42 ✓ chain=3]");
+    }
+
+    /// 改进3：--verify 未命中(离线/无 fact_id)→ 回退本地锚点
+    #[test]
+    fn test_evidence_mark_verify_miss_falls_back() {
+        let e = make_event("E002", Some(7));
+        let map = std::collections::BTreeMap::new();
+        assert_eq!(evidence_mark(&e, &map), " [fact#7]");
+    }
 }
