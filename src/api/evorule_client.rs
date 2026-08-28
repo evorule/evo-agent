@@ -546,59 +546,6 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
-    /// E2: POST /api/sessions/{id}/join — 对齐 04b JoinRequest
-    /// cluster_id=None → 创建新集群；Some(id) → 加入指定集群
-    pub async fn join_cluster(
-        &self,
-        session_id: &str,
-        cluster_id: Option<u64>,
-    ) -> Result<JoinResponse, ApiError> {
-        let url = format!("{}/api/sessions/{}/join", self.core.base_url(), session_id);
-        let body = serde_json::json!({
-            "cluster_id": cluster_id,
-            "direction": "bidirectional"
-        });
-        let resp = self
-            .core
-            .auth_header(self.core.client().post(&url))
-            .json(&body)
-            .send()
-            .await?;
-        self.core.check_response(&resp).await?;
-        Ok(resp.json().await?)
-    }
-
-    pub async fn leave_cluster(&self, session_id: &str) -> Result<(), ApiError> {
-        let url = format!("{}/api/sessions/{}/leave", self.core.base_url(), session_id);
-
-        let resp = self
-            .core
-            .auth_header(self.core.client().post(&url))
-            .send()
-            .await?;
-        self.core.check_response(&resp).await?;
-
-        Ok(())
-    }
-
-    pub async fn get_cluster_status(&self, session_id: &str) -> Result<Value, ApiError> {
-        let url = format!(
-            "{}/api/sessions/{}/cluster",
-            self.core.base_url(),
-            session_id
-        );
-
-        let resp = self
-            .core
-            .auth_header(self.core.client().get(&url))
-            .send()
-            .await?;
-        self.core.check_response(&resp).await?;
-
-        let result: Value = resp.json().await?;
-        Ok(result)
-    }
-
     pub async fn subscribe_events(&self, session_id: &str) -> Result<EvoruleEventStream, ApiError> {
         let url = format!(
             "{}/api/sessions/{}/events",
@@ -677,14 +624,6 @@ impl EvoruleApiClient {
         let result: Value = resp.json().await?;
         Ok(result)
     }
-}
-
-/// 04b JoinResponse — join_cluster 接口返回体
-#[derive(Debug, Clone, Deserialize)]
-pub struct JoinResponse {
-    pub cluster_id: u64,
-    #[serde(default)]
-    pub members: Vec<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -966,46 +905,5 @@ mod tests {
         assert_eq!(io_response_body["request_id"], request_id);
         assert_eq!(io_response_body["content"], content);
         assert_eq!(io_response_body["used_facts"].as_array().unwrap().len(), 2);
-    }
-
-    // ===== E2 join_cluster body / JoinResponse 反序列化测试 =====
-
-    #[test]
-    fn test_join_cluster_body_create() {
-        // cluster_id=None → 创建新集群
-        let body = serde_json::json!({
-            "cluster_id": Option::<u64>::None,
-            "direction": "bidirectional"
-        });
-        assert_eq!(body["cluster_id"], serde_json::Value::Null);
-        assert_eq!(body["direction"], "bidirectional");
-    }
-
-    #[test]
-    fn test_join_cluster_body_join() {
-        // cluster_id=Some(42) → 加入已有集群
-        let body = serde_json::json!({
-            "cluster_id": Some(42u64),
-            "direction": "bidirectional"
-        });
-        assert_eq!(body["cluster_id"], 42);
-        assert_eq!(body["direction"], "bidirectional");
-    }
-
-    #[test]
-    fn test_join_response_deserialize() {
-        let json = r#"{"cluster_id": 42, "members": [1, 2, 3]}"#;
-        let resp: JoinResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.cluster_id, 42);
-        assert_eq!(resp.members, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn test_join_response_deserialize_empty_members() {
-        // members 缺失时 default 兜底为空数组
-        let json = r#"{"cluster_id": 7}"#;
-        let resp: JoinResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.cluster_id, 7);
-        assert!(resp.members.is_empty());
     }
 }

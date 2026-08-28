@@ -749,7 +749,13 @@ async fn list_session_events(
     store.set_session_id(&session_id);
 
     // best-effort 同步(HTTP 失败返回空列表)
-    let _ = store.sync_from_evorule().await;
+    if let Err(e) = store.sync_from_evorule().await {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "memory event sync failed before list; serving possibly stale local data"
+        );
+    }
 
     let events = if let Some(entity_id) = &params.entity {
         store.events_for_entity(entity_id)
@@ -803,7 +809,13 @@ async fn replay_session_events(
     store.set_session_id(&session_id);
 
     // best-effort 同步
-    let _ = store.sync_from_evorule().await;
+    if let Err(e) = store.sync_from_evorule().await {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "memory event sync failed before replay; replaying possibly stale local data"
+        );
+    }
 
     if store.event_count() == 0 {
         return Ok(Json(serde_json::json!({

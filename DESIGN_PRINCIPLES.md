@@ -2,8 +2,6 @@
 
 > 这是**整个 EvoRule 生态**的宪法级原则。
 > 任何新功能 / 新工具 / 新 API / 新应用,都必须用这 5 条作为 review checklist。
->
-> 起源:**EvoRule 作者 × Mavis**,2026-07-20,review evo-agent P0 #2 的 6 工具 3 层安全模型时确立。
 
 ---
 
@@ -98,8 +96,6 @@
 - **diff**:对比两个版本的 fact,看哪一步改变
 - **rewind**:回退到某个 version,从那里继续
 - agent 的每次 `run` 输出结构化 JSON(success / steps / tool_calls / duration_ms / error)
-
-**对应杀手锏应用:** [`D:\evorule-application\time-travel-debugger`](../evorule-application/) —— 用 evorule 的 fact log 做出"时间旅行调试器",**唯一能做到**这个能力的产品。
 
 **反例:**
 
@@ -249,8 +245,6 @@ const BLOCKED_IP_RANGES: &[&str] = &[
 - `src/builtin_tools/mod.rs` — 6 工具的 3 层分类代码
 - `src/builtin_tools/shell_exec.rs` — 8 active + 20 candidate + 28 blocked
 - `src/builtin_tools/http_get.rs` — 6 active hosts + SSRF 防护
-- 起源对话:**Mavis × EvoRule 作者,2026-07-20**
-
 ---
 
 > "人类很乐意让 LLM 帮他们做所有事,但担心**不透明、失控、不可预测**。

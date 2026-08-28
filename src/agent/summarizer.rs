@@ -26,11 +26,10 @@
 //! 摘要可以用与主对话不同的(更便宜的)模型,通过 `summary_model` 配置。
 //! 如果未配置,fallback 到 `LlmHandler` 的 `default_model`。
 
-use std::collections::BTreeMap;
-
 use evorule_tcb::JsonValue;
 use tracing::warn;
 
+use crate::agent::audited_llm::AuditedLlm;
 use crate::agent::translator::{LlmResponse, Message};
 use crate::io_handler::IoHandler;
 use crate::io_handlers::LlmHandler;
@@ -105,6 +104,12 @@ const DEFAULT_SUMMARY_PROMPT: &str = "\
 pub struct ContextSummarizer {
     /// 摘要用的 LLM handler(从主 handler clone 而来)
     llm: LlmHandler,
+    /// P2-V3 结构性修复：审计链执行器（None = 直连，仅供测试/独立用途）
+    ///
+    /// 挂载后所有摘要类 LLM 调用经一次性 sidecar 会话走完整
+    /// call_external 审计协议（prompt/response 均为事实）；
+    /// 生产构造点 `AgentRunner::from_definition` 必挂。
+    audited: Option<AuditedLlm>,
     /// 摘要模型名称(None = fallback 到 llm.default_model)
     summary_model: Option<String>,
     /// 摘要系统提示
@@ -121,10 +126,20 @@ impl ContextSummarizer {
     pub fn new(llm: LlmHandler, summary_model: Option<String>) -> Self {
         Self {
             llm,
+            audited: None,
             summary_model,
             summary_prompt: DEFAULT_SUMMARY_PROMPT.to_string(),
             summary_threshold: DEFAULT_SUMMARY_THRESHOLD,
         }
+    }
+
+    /// 挂载审计链执行器（P2-V3 结构性修复）
+    ///
+    /// 挂载后 LLM 调用经 evorule 审计链（sidecar 会话），
+    /// 未挂载时保持直连（旁路计数器留痕）。
+    pub fn with_auditor(mut self, audited: AuditedLlm) -> Self {
+        self.audited = Some(audited);
+        self
     }
 
     /// 自定义摘要阈值(Q9 Strategy B,测试用)
@@ -142,6 +157,22 @@ impl ContextSummarizer {
     /// 当前摘要阈值(只读访问)
     pub fn threshold(&self) -> usize {
         self.summary_threshold
+    }
+
+    /// LLM 调用分流：有审计执行器走 sidecar 审计链，否则直连 + 旁路计数
+    ///
+    /// P2-V3 结构性修复后，生产路径（from_definition 构造）恒走审计分支；
+    /// 直连分支仅存在于未挂载 auditor 的场景（单元测试/独立使用），
+    /// 属显式配置而非静默兜底。
+    async fn call_llm(&self, purpose: &str, params: &JsonValue) -> Result<JsonValue, String> {
+        match &self.audited {
+            Some(audited) => audited.execute(purpose, params).await,
+            None => {
+                // P2-V3 止血指标：此调用不经审计链，计数留痕
+                crate::metrics::bypass_audit(purpose);
+                self.llm.execute(params).await
+            }
+        }
     }
 
     /// 摘要模型名称(只读访问)
@@ -218,8 +249,8 @@ impl ContextSummarizer {
         let params_json = serde_json::Value::Object(params_map);
         let params = serde_to_tcb(&params_json);
 
-        // 调用 LLM
-        let result = self.llm.execute(&params).await?;
+        // 调用 LLM（经审计链或直连，见 call_llm 分流说明）
+        let result = self.call_llm("summarize", &params).await?;
 
         // 解析响应为 LlmResponse
         let response: LlmResponse = serde_json::from_str(&result.to_string())
@@ -291,8 +322,8 @@ impl ContextSummarizer {
         let params_json = serde_json::Value::Object(params_map);
         let params = serde_to_tcb(&params_json);
 
-        // 调用 LLM
-        let result = self.llm.execute(&params).await?;
+        // 调用 LLM（经审计链或直连，见 call_llm 分流说明）
+        let result = self.call_llm("session_summary", &params).await?;
 
         // 解析响应为 LlmResponse
         let response: LlmResponse = serde_json::from_str(&result.to_string())
@@ -366,63 +397,12 @@ impl ContextSummarizer {
         let params_json = serde_json::Value::Object(params_map);
         let params = serde_to_tcb(&params_json);
 
-        let result = self.llm.execute(&params).await?;
+        // 调用 LLM（经审计链或直连，见 call_llm 分流说明）
+        let result = self.call_llm("rollup", &params).await?;
         let response: LlmResponse = serde_json::from_str(&result.to_string())
             .map_err(|e| format!("parse rollup summary LLM response: {}", e))?;
 
         Ok(response.content)
-    }
-
-    /// G10:对被裁剪的消息生成摘要(BTreeMap 参数版,内部测试用)
-    ///
-    /// 与 `summarize_dropped` 相同,但直接用 `BTreeMap<String, JsonValue>` 构造参数。
-    /// 保留此方法是为了与 runner.rs 中其他 LLM 调用风格一致。
-    #[allow(dead_code)]
-    async fn summarize_dropped_btree(&self, dropped: &[Message]) -> Result<String, String> {
-        if dropped.is_empty() || dropped.len() < self.summary_threshold {
-            return Ok(String::new());
-        }
-
-        // 序列化 dropped messages
-        let mut messages_vec: Vec<serde_json::Value> = Vec::with_capacity(dropped.len() + 1);
-        messages_vec.push(serde_json::json!({
-            "role": "system",
-            "content": self.summary_prompt,
-        }));
-        for msg in dropped {
-            let serialized = serde_json::to_value(msg)
-                .map_err(|e| format!("serialize dropped message: {}", e))?;
-            messages_vec.push(serialized);
-        }
-        let messages_json = serde_json::Value::Array(messages_vec);
-        let tcb_messages = serde_to_tcb(&messages_json);
-
-        // 用 BTreeMap 构造(与 runner.rs 中 call_external 风格一致)
-        let mut call_params = BTreeMap::new();
-        if let Some(model) = &self.summary_model {
-            call_params.insert("model".to_string(), JsonValue::string(model.clone()));
-        }
-        call_params.insert(
-            "temperature".to_string(),
-            JsonValue::string("0".to_string()),
-        );
-        call_params.insert(
-            "max_tokens".to_string(),
-            JsonValue::string(SUMMARY_MAX_TOKENS.to_string()),
-        );
-        call_params.insert("messages".to_string(), tcb_messages);
-        let params = JsonValue::Object(call_params);
-
-        let result = self.llm.execute(&params).await?;
-        let response: LlmResponse = serde_json::from_str(&result.to_string())
-            .map_err(|e| format!("parse summary LLM response: {}", e))?;
-
-        let summary = response.content.trim();
-        if summary.is_empty() {
-            return Ok(String::new());
-        }
-
-        Ok(format!("[earlier conversation summary]\n{}", summary))
     }
 }
 
@@ -816,6 +796,77 @@ mod tests {
     }
 
     // ========== C4: rollup_summaries 测试 ==========
+
+    // ========== P2-V3 结构性修复：with_auditor 分流验证 ==========
+
+    #[tokio::test]
+    async fn test_summarize_dropped_routes_through_audited_llm() {
+        // 挂载 auditor 后走 sidecar 审计链：LLM 结果来自审计路径的独立 mock，
+        // 直连 handler 的返回内容不应出现
+        let mut server = mockito::Server::new_async().await;
+        let create_mock = server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"session_id":31}"#)
+            .create_async()
+            .await;
+        let sse = concat!(
+            "data: {\"type\":\"IoRequest\",\"id\":7}\n\n",
+            "data: {\"type\":\"Stable\"}\n\n"
+        );
+        let events_mock = server
+            .mock("GET", "/api/sessions/31/events")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create_async()
+            .await;
+        let command_mock = server
+            .mock("POST", "/api/sessions/31/command")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({
+                    "instruction": {
+                        "params": {"audit_purpose": "summarize"}
+                    }
+                }),
+            ))
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        let io_response_mock = server
+            .mock("POST", "/api/sessions/31/io_response")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let direct = LlmHandler::mock("DIRECT-PATH-MARKER");
+        let audited = crate::agent::audited_llm::AuditedLlm::new(
+            crate::api::evorule_client::EvoruleApiClient::new(&server.url()),
+            LlmHandler::mock(r#"{"content":"audited summary content"}"#),
+        );
+        let s = ContextSummarizer::new(direct, None)
+            .with_auditor(audited)
+            .with_threshold(2);
+        let dropped = vec![user("a"), user("b"), user("c")];
+        let result = s.summarize_dropped(&dropped).await.unwrap();
+        assert!(
+            result.contains("audited summary content"),
+            "should use audited path, got: {result}"
+        );
+        assert!(
+            !result.contains("DIRECT-PATH-MARKER"),
+            "direct path must not be hit when auditor attached"
+        );
+        // 协议四端点全部被调用 → 证明走了完整 sidecar 审计回路
+        create_mock.assert_async().await;
+        events_mock.assert_async().await;
+        command_mock.assert_async().await;
+        io_response_mock.assert_async().await;
+    }
+
 
     #[tokio::test]
     async fn test_rollup_summaries_empty() {

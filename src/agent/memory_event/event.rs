@@ -14,12 +14,76 @@
 //! - `content` 是开放式 JSON,每种 event_type 有约定 schema(由应用层校验)
 //! - `emotion` 是一等公民,事件发生时定型,回放时不允许 LLM 重新生成
 //! - `cause: Option<u64>` 指向触发本事件的源 FactId(应用层因果,不改 Fact 枚举)
-//! - `effects: Vec<String>` 反向链,记录本事件触发的下游事件 ID
+//! - `effects: Vec<EventRef>` 反向链,记录本事件触发的下游事件(**引擎级引用**:event_id + fact_id)
+//!
+//! ## 改进2(2026-08-21)
+//!
+//! `effects` 由 `Vec<String>`(应用层 event_id)重构为 `Vec<EventRef>`(event_id + 引擎级 FactId),
+//! 使正向因果(effects)与反向因果(cause)统一走引擎级 FactId,可经 evorule 审计链验证。
+//! 反序列化兼容旧数据(字符串数组),序列化为对象数组。
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// FactId 类型别名(evo-agent 侧用 u64,与 evorule 的 FactId 对应)
 pub type FactId = u64;
+
+/// 正向因果链条目:下游事件的引擎级引用(改进2)
+///
+/// 同时携带:
+/// - `event_id`:应用层事件 ID(定位用)
+/// - `fact_id`:下游事件的身份锚点(写入它的 PayloadUpdate FactId;离线/失败时为 None)
+///
+/// 反序列化兼容两种形态:
+/// - 旧数据:`"E002"`(字符串)→ `{event_id, fact_id: None}`
+/// - 新格式:`{"event_id":"E002","fact_id":20}`
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventRef {
+    /// 下游事件 ID(应用层定位)
+    pub event_id: String,
+    /// 下游事件身份锚点(写入它的 PayloadUpdate FactId;离线/失败时为 None)
+    pub fact_id: Option<FactId>,
+}
+
+impl Serialize for EventRef {
+    /// 序列化为对象:`{"event_id":"E002","fact_id":20}`(fact_id None 时省略)
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "event_id".to_string(),
+            serde_json::Value::String(self.event_id.clone()),
+        );
+        if let Some(fid) = self.fact_id {
+            m.insert("fact_id".to_string(), serde_json::Value::from(fid));
+        }
+        serde_json::Value::Object(m).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EventRef {
+    /// 兼容旧(字符串)与新(对象)两种数据形态
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Legacy(String),
+            New {
+                event_id: String,
+                #[serde(default)]
+                fact_id: Option<FactId>,
+            },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Legacy(s) => Ok(EventRef {
+                event_id: s,
+                fact_id: None,
+            }),
+            Raw::New { event_id, fact_id } => Ok(EventRef {
+                event_id,
+                fact_id,
+            }),
+        }
+    }
+}
 
 /// 记忆事件 —— 032 的核心数据单元
 ///
@@ -56,9 +120,9 @@ pub struct MemoryEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<FactId>,
 
-    /// 派生事件:本事件触发的下游事件 ID 列表(反向链)
+    /// 派生事件:本事件触发的下游事件引用列表(反向链,引擎级引用见 [`EventRef`])
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub effects: Vec<String>,
+    pub effects: Vec<EventRef>,
 
     /// 来源(见 [`EventSource`])
     pub source: EventSource,
@@ -422,6 +486,38 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: MemoryEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, deserialized);
+    }
+
+    /// 改进2：EventRef 向后兼容（旧字符串数组 / 新对象数组）
+    #[test]
+    fn test_eventref_backward_compat() {
+        // 旧数据形态：字符串数组 → EventRef{event_id, fact_id: None}
+        let old_json = r#"{
+            "event_id":"E001","event_type":{"kind":"EmotionEvent"},
+            "timestamp":1000,"source":"UserInput",
+            "content":{"summary":"legacy event"},
+            "effects":["E002","E003"]
+        }"#;
+        let old: MemoryEvent = serde_json::from_str(old_json).unwrap();
+        assert_eq!(old.effects.len(), 2);
+        assert_eq!(old.effects[0].event_id, "E002");
+        assert_eq!(old.effects[0].fact_id, None);
+        assert_eq!(old.effects[1].event_id, "E003");
+
+        // 新数据形态：对象数组往返一致
+        let mut ev = MemoryEvent::new_root("E001", EventType::EmotionEvent, 1000, EventSource::UserInput);
+        ev.effects = vec![
+            EventRef { event_id: "E002".to_string(), fact_id: Some(20) },
+            EventRef { event_id: "E003".to_string(), fact_id: None },
+        ];
+        let json = serde_json::to_string(&ev).unwrap();
+        // fact_id Some → 输出对象含 fact_id；None → 省略
+        assert!(json.contains(r#"{"event_id":"E002","fact_id":20}"#));
+        assert!(json.contains(r#"{"event_id":"E003"}"#));
+        // effects 数组不再以裸字符串开头（旧形态）
+        assert!(!json.contains(r#""effects":["E002""#));
+        let de: MemoryEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, de);
     }
 
     #[test]

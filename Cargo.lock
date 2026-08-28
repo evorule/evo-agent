@@ -585,6 +585,7 @@ dependencies = [
  "mockito",
  "prometheus",
  "rand 0.8.7",
+ "regex",
  "reqwest",
  "rustyline",
  "serde",
@@ -606,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "evorule-reactor"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -618,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "evorule-tcb"
-version = "0.3.1"
+version = "0.3.2"
 
 [[package]]
 name = "fancy-regex"

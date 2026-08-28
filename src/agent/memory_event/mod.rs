@@ -38,9 +38,9 @@ pub mod store;
 // 核心类型 re-export
 pub use entity::{Entity, EntityIndex, EntityRef, EntityStatus, EntityType};
 pub use event::{
-    ConversationSubtype, Emotion, EmotionSubject, EventSource, EventType, FactId, HabitSubtype,
-    HealthSubtype, IOTriggerSubtype, ItemSubtype, LocationSubtype, MemoryEvent, MilestoneSubtype,
-    RelationshipSubtype,
+    ConversationSubtype, Emotion, EmotionSubject, EventRef, EventSource, EventType, FactId,
+    HabitSubtype, HealthSubtype, IOTriggerSubtype, ItemSubtype, LocationSubtype, MemoryEvent,
+    MilestoneSubtype, RelationshipSubtype,
 };
 pub use extraction::{EventExtractor, ExtractionConfig, ExtractionTrigger};
 pub use replay::{Narrative, ReplayDirection, ReplayEngine};

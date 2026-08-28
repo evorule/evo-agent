@@ -215,7 +215,18 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside_file, &link_path).unwrap();
         #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&outside_file, &link_path).unwrap();
+        {
+            // Windows 创建符号链接需要 SeCreateSymbolicLinkPrivilege 特权
+            // （管理员或开发者模式），无特权环境错误码 1314，直接跳过
+            match std::os::windows::fs::symlink_file(&outside_file, &link_path) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(1314) => {
+                    eprintln!("skip: no symlink privilege on this Windows env");
+                    return;
+                }
+                Err(e) => panic!("unexpected symlink error: {e}"),
+            }
+        }
 
         let tool = make_tool(dir.path());
         let result = tool.call_sync(&JsonValue::object({

@@ -48,11 +48,11 @@ EvoRule 的设计原则继承自早期 Python 版本 **evorule-core v0.2.0-beta*
 ## 联系信息
 
 - **项目**: EvoRule — 反应式执行引擎
-- **作者**: EvoRule Project
+- **作者**: DAMU ZHENG
 - **邮箱**: evorulelab@gmail.com
 - **组织**: [EvoRule Lab](https://gitee.com/evorulelab)
 - **Gitee**: https://gitee.com/evorulelab/evorule
 
 ---
 
-本声明遵循 evorule-core-backup 的发布原则。
+

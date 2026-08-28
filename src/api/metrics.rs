@@ -79,6 +79,15 @@ pub struct Metrics {
     tool_duration_seconds: HistogramVec,
     steps_total: IntCounter,
     sse_connections: IntGauge,
+    /// P2-V3 止血（2026-08-27）：Summarizer 等直连 LLM 绕过审计链的调用计数
+    ///
+    /// prompt/response 不经 evorule fact 流程的"影子调用"被指标化，
+    /// 使审计盲区的大小可量化。按用途打标签（如 summarize/rollup）。
+    llm_bypass_audit_total: IntCounterVec,
+    /// P5-A3 指标（2026-08-27）：L2 SafetyAuditor 召回内容审计命中计数
+    ///
+    /// 按命中规则打标签，使召回污染态势可告警（此前仅 tracing::warn 单通道）。
+    safety_audit_hits_total: IntCounterVec,
 }
 
 impl fmt::Debug for Metrics {
@@ -145,6 +154,26 @@ impl Metrics {
             "Current active SSE connections",
         )
         .map_err(|_| MetricsError::GaugeCreationFailed("evo_agent_sse_connections".into()))?;
+        let llm_bypass_audit_total = IntCounterVec::new(
+            Opts::new(
+                "evo_agent_llm_bypass_audit_total",
+                "LLM calls bypassing the audit chain (shadow calls), by purpose",
+            ),
+            &["purpose"],
+        )
+        .map_err(|_| {
+            MetricsError::CounterCreationFailed("evo_agent_llm_bypass_audit_total".into())
+        })?;
+        let safety_audit_hits_total = IntCounterVec::new(
+            Opts::new(
+                "evo_agent_safety_audit_hits_total",
+                "L2 SafetyAuditor hits on recalled memory content, by rule",
+            ),
+            &["rule"],
+        )
+        .map_err(|_| {
+            MetricsError::CounterCreationFailed("evo_agent_safety_audit_hits_total".into())
+        })?;
 
         registry
             .register(Box::new(sessions_total.clone()))
@@ -186,6 +215,16 @@ impl Metrics {
             .map_err(|_| {
                 MetricsError::RegistryRegistrationFailed("evo_agent_sse_connections".into())
             })?;
+        registry
+            .register(Box::new(llm_bypass_audit_total.clone()))
+            .map_err(|_| {
+                MetricsError::RegistryRegistrationFailed("evo_agent_llm_bypass_audit_total".into())
+            })?;
+        registry
+            .register(Box::new(safety_audit_hits_total.clone()))
+            .map_err(|_| {
+                MetricsError::RegistryRegistrationFailed("evo_agent_safety_audit_hits_total".into())
+            })?;
 
         Ok(Self {
             registry,
@@ -197,6 +236,8 @@ impl Metrics {
             tool_duration_seconds,
             steps_total,
             sse_connections,
+            llm_bypass_audit_total,
+            safety_audit_hits_total,
         })
     }
 
@@ -277,6 +318,23 @@ impl Metrics {
     /// SSE 连接 -1
     pub fn dec_sse_connections(&self) {
         self.sse_connections.dec();
+    }
+
+    /// 绕过审计链的 LLM 影子调用计数 +1（P2-V3 止血，2026-08-27）
+    ///
+    /// - `purpose`：调用用途（如 "summarize"、"rollup"、"session_summary"）
+    ///
+    /// Summarizer 直连 LLM 不经 evorule fact 流程，本指标使这一审计盲区
+    /// 的大小可量化、可告警。
+    pub fn inc_llm_bypass_audit(&self, purpose: &str) {
+        self.llm_bypass_audit_total
+            .with_label_values(&[purpose])
+            .inc();
+    }
+
+    /// L2 SafetyAuditor 命中 +1（P5-A3 指标，按命中规则分桶）
+    pub fn inc_safety_audit_hit(&self, rule: &str) {
+        self.safety_audit_hits_total.with_label_values(&[rule]).inc();
     }
 }
 
@@ -397,6 +455,23 @@ mod tests {
         let output = m.render();
         assert!(output.contains("evo_agent_llm_calls_total{status=\"ok\"} 2"));
         assert!(output.contains("evo_agent_llm_calls_total{status=\"error\"} 1"));
+    }
+
+    /// P2-V3 止血 + P5-A3 指标：旁路调用按 purpose 分桶、L2 审计命中按 rule 分桶
+    #[test]
+    fn test_bypass_and_safety_audit_counters() {
+        let m = make_metrics();
+        m.inc_llm_bypass_audit("summarize");
+        m.inc_llm_bypass_audit("summarize");
+        m.inc_llm_bypass_audit("rollup");
+        m.inc_safety_audit_hit("instruction_override");
+        let output = m.render();
+        assert!(output.contains(
+            "evo_agent_llm_bypass_audit_total{purpose=\"summarize\"} 2"
+        ));
+        assert!(output.contains("evo_agent_llm_bypass_audit_total{purpose=\"rollup\"} 1"));
+        assert!(output
+            .contains("evo_agent_safety_audit_hits_total{rule=\"instruction_override\"} 1"));
     }
 
     #[test]

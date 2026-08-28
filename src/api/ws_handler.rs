@@ -57,7 +57,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent::{AgentError, AgentEvent, AgentRunner};
 use crate::api::agent_api::AgentApiState;
@@ -216,13 +216,15 @@ async fn handle_ws(
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(ClientMessage::Message { content }) => {
                                 if turn_active {
-                                    let _ = send_ws_json(
+                                    if let Err(e) = send_ws_json(
                                         &mut sender,
                                         serde_json::json!({
                                             "type": "Error",
                                             "error": "a turn is already active; send interrupt first"
                                         }),
-                                    ).await;
+                                    ).await {
+                                        debug!(error = %e, "ws send Error(turn_active) failed; client likely disconnected");
+                                    }
                                     continue;
                                 }
                                 // 构造 fresh AgentRunner(run_streaming/run_continuation 消费 self)
@@ -265,7 +267,9 @@ async fn handle_ws(
                                         }
                                     }
                                     // 事件流结束 → 发 TurnEnd 信号
-                                    let _ = tx.send(WsEvent::TurnEnd).await;
+                                    if let Err(e) = tx.send(WsEvent::TurnEnd).await {
+                                        debug!(error = %e, "TurnEnd send failed; main ws loop already exited");
+                                    }
                                 });
                             }
                             Ok(ClientMessage::Interrupt) => {

@@ -75,9 +75,9 @@ impl LlmConfig {
     pub fn default_model() -> String {
         "MiniMax-M2.5".to_string()
     }
-    /// 默认 api_base
+    /// 默认 api_base(国际版;api.minimax.io 为国内版域名,sk-cp- 国际版 key 无效)
     pub fn default_api_base() -> String {
-        "https://api.minimax.io/v1/text/chatcompletion_v2".to_string()
+        "https://api.minimaxi.com/v1/text/chatcompletion_v2".to_string()
     }
 }
 

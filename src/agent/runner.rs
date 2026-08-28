@@ -417,7 +417,6 @@ pub struct AgentRunner {
     memory: Option<MemoryManager>,
     delegate_context: Option<DelegateContext>,
     session_id: Option<String>,
-    join_cluster_id: Option<u64>,
     /// 消息持久化模式（用户决策 2：可选开关）
     ///
     /// 控制 messages 何时写入 evorule payload。默认 `EveryMessage`。
@@ -517,7 +516,6 @@ impl AgentRunner {
             memory: None,
             delegate_context: None,
             session_id: None,
-            join_cluster_id: None,
             message_persist_mode: MessagePersistMode::default(),
             pending_messages: Vec::new(),
             summary_model: None,
@@ -696,7 +694,14 @@ impl AgentRunner {
             runner = runner.with_summary_model(&sm);
             // G10:clone 主 LlmHandler 给摘要器(共享 API key/配置,独立调用)
             // summary_model 指定后,摘要调用使用该模型;否则 fallback 到主 model
-            let summarizer = ContextSummarizer::new(runner.llm_handler.clone(), Some(sm));
+            // P2-V3 结构性修复(2026-08-27)：必挂审计链执行器,
+            // 摘要类 LLM 调用经 sidecar 会话入审计链,影子调用归零
+            let audited = crate::agent::audited_llm::AuditedLlm::new(
+                runner.evorule_client.clone(),
+                runner.llm_handler.clone(),
+            );
+            let summarizer =
+                ContextSummarizer::new(runner.llm_handler.clone(), Some(sm)).with_auditor(audited);
             runner = runner.with_summarizer(summarizer);
         }
         // G2:自动构造 ContextWindowManager(默认 8192 token,reserve 1/4)
@@ -787,12 +792,6 @@ impl AgentRunner {
         ));
         self.tool_handler.register_tool("delegate", delegate_tool);
         self.delegate_context = Some(ctx);
-        self
-    }
-
-    /// TODO: doc
-    pub fn with_join_cluster(mut self, cluster_id: &str) -> Self {
-        self.join_cluster_id = cluster_id.parse().ok();
         self
     }
 
@@ -1032,13 +1031,6 @@ impl AgentRunner {
 
         let _recalled_fact_ids = self.auto_recall(&session_id).await?;
 
-        if let Some(cluster_id) = self.join_cluster_id {
-            self.evorule_client
-                .join_cluster(&session_id, Some(cluster_id))
-                .await?;
-            info!(%session_id, cluster_id, "Joined cluster");
-        }
-
         // 注意:必须先订阅 SSE 事件,再提交命令。
         // tokio broadcast 通道只接收订阅之后发出的消息,不重放历史。
         // 如果先 submit_command 再 subscribe,会错过 io_request 事件,导致 ReAct 循环无法启动。
@@ -1220,14 +1212,19 @@ impl AgentRunner {
     }
 
     fn build_call_external_command(&self, system_prompt: &str, goal: &str) -> Value {
+        // core_eval v0.3.1 合约:call_external 指令仅使用 messages(LLM 消息历史数组)
+        // 与可选 tools;prompt/system/goal/tool_names 不再是指令参数。
+        // core_eval 的 io_request 规则引用 __exec__.instruction.params.messages,
+        // 缺失会导致 "path resolution failed"。
         serde_json::json!({
             "type": "call_external",
             "params": {
                 "model": self.config.model,
                 "temperature": self.config.temperature,
-                "system_prompt": system_prompt,
-                "goal": goal,
-                "tool_names": self.config.tool_names,
+                "messages": [
+                    { "role": "system", "content": system_prompt },
+                    { "role": "user", "content": goal },
+                ],
             }
         })
     }
@@ -1494,10 +1491,17 @@ impl AgentRunner {
             }
         }
 
+        // core_eval v0.3.1:merge 规则引用 __exec__.payload.llm_response.messages
+        // 作为下一轮 call_external 的消息历史,缺失会导致 "path resolution failed"。
+        // 返回完整消息历史(含本轮 assistant 回复),保持 TCB 侧历史连续。
+        let result_messages = serde_json::to_value(messages)
+            .map_err(|e| AgentError::Internal(format!("serialize result messages: {}", e)))?;
+
         Ok(serde_json::json!({
             "content": final_content,
             "tool_calls": effective_tool_calls,
             "is_finished": llm_response.is_finished(),
+            "messages": result_messages,
         }))
     }
 
@@ -1905,43 +1909,6 @@ impl AgentRunner {
     }
 
     /// TODO: doc
-    pub async fn join_cluster(&mut self, cluster_id: &str) -> Result<(), AgentError> {
-        let cid: u64 = cluster_id.parse().map_err(|_| {
-            AgentError::Internal(format!("invalid cluster_id (expected u64): {}", cluster_id))
-        })?;
-        if let Some(session_id) = &self.session_id {
-            self.evorule_client
-                .join_cluster(session_id, Some(cid))
-                .await?;
-            self.join_cluster_id = Some(cid);
-            info!(%session_id, cluster_id, "Joined cluster");
-        }
-        Ok(())
-    }
-
-    /// TODO: doc
-    pub async fn leave_cluster(&mut self) -> Result<(), AgentError> {
-        if let Some(session_id) = &self.session_id {
-            self.evorule_client.leave_cluster(session_id).await?;
-            self.join_cluster_id = None;
-            info!(%session_id, "Left cluster");
-        }
-        Ok(())
-    }
-
-    /// TODO: doc
-    pub async fn get_cluster_status(&self) -> Result<Value, AgentError> {
-        if let Some(session_id) = &self.session_id {
-            self.evorule_client
-                .get_cluster_status(session_id)
-                .await
-                .map_err(|e| e.into())
-        } else {
-            Err(AgentError::Internal("No active session".to_string()))
-        }
-    }
-
-    /// TODO: doc
     pub async fn replay_session(&self, session_id: &str) -> Result<Vec<Value>, AgentError> {
         self.evorule_client
             .replay(session_id)
@@ -2131,7 +2098,7 @@ impl AgentRunner {
             let _session_guard = SessionActiveGuard::new(runner.metrics.clone());
 
             if existing_session_id.is_none() {
-                // 新建 session 才计 sessions_total + yield SessionCreated + auto_recall + join_cluster
+                // 新建 session 才计 sessions_total + yield SessionCreated + auto_recall
                 if let Some(m) = &runner.metrics {
                     m.inc_sessions_total();
                 }
@@ -2139,11 +2106,6 @@ impl AgentRunner {
 
                 // 3. auto_recall(best-effort,不阻塞流)
                 let _ = runner.auto_recall(&session_id).await;
-
-                // 4. join cluster(如果配置了)
-                if let Some(cluster_id) = runner.join_cluster_id {
-                    let _ = runner.evorule_client.join_cluster(&session_id, Some(cluster_id)).await;
-                }
             }
 
             // 5. 订阅 SSE(必须在 submit_command 之前,否则错过 io_request)
@@ -2493,6 +2455,9 @@ impl AgentRunner {
                                         "content": full_content,
                                         "tool_calls": tool_calls_json,
                                         "is_finished": is_finished,
+                                        // core_eval v0.3.1:merge 规则引用 llm_response.messages
+                                        "messages": serde_json::to_value(&messages)
+                                            .unwrap_or_else(|_| serde_json::Value::Null),
                                     });
                                     if let Err(e) = runner.evorule_client
                                         .submit_io_response(&session_id, rid, &resp, None)

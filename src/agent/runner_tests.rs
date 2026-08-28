@@ -91,8 +91,10 @@ fn test_build_call_external_command() {
     let command = runner.build_call_external_command("system prompt", "test goal");
     assert_eq!(command["type"], "call_external");
     assert_eq!(command["params"]["model"], "gpt-4o-mini");
-    assert_eq!(command["params"]["goal"], "test goal");
-    assert_eq!(command["params"]["system_prompt"], "system prompt");
+    assert_eq!(command["params"]["messages"][0]["role"], "system");
+    assert_eq!(command["params"]["messages"][0]["content"], "system prompt");
+    assert_eq!(command["params"]["messages"][1]["role"], "user");
+    assert_eq!(command["params"]["messages"][1]["content"], "test goal");
 }
 
 #[test]
@@ -1693,31 +1695,4 @@ async fn test_run_recall_before_prompt() {
 
     // 验证 command 请求体包含 recalled content（证明 recall 在 build_system_prompt 之前）
     command_mock.assert_async().await;
-}
-
-// ===== E2: with_join_cluster u64 解析测试 =====
-
-#[test]
-fn test_with_join_cluster_valid() {
-    let config = AgentConfig::default();
-    let runner = AgentRunner::new(config, make_test_client());
-    assert!(runner.join_cluster_id.is_none());
-
-    let runner = runner.with_join_cluster("42");
-    assert_eq!(runner.join_cluster_id, Some(42));
-}
-
-#[test]
-fn test_with_join_cluster_invalid() {
-    let config = AgentConfig::default();
-    let runner = AgentRunner::new(config, make_test_client());
-    assert!(runner.join_cluster_id.is_none());
-
-    // 非法字符串 → None（静默忽略，不 panic）
-    let runner = runner.with_join_cluster("not-a-number");
-    assert!(runner.join_cluster_id.is_none());
-
-    // 空串 → None
-    let runner = runner.with_join_cluster("");
-    assert!(runner.join_cluster_id.is_none());
 }

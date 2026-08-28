@@ -32,7 +32,7 @@ use tracing::warn;
 use crate::api::evorule_client::EvoruleApiClient;
 
 use super::entity::{Entity, EntityIndex, EntityType};
-use super::event::{EventType, FactId, MemoryEvent};
+use super::event::{EventRef, EventType, FactId, MemoryEvent};
 use super::evidence::MemoryEvidence;
 
 /// 存储错误
@@ -81,6 +81,8 @@ pub struct CauseBindingReport {
     pub engine_chain_len: usize,
     /// 应用层链与引擎链是否对齐（链长一致 + 末端一致）
     pub aligned: bool,
+    /// 改进2：effects 中每个引擎级 FactId 是否真实存在于 Fact 流（全部命中 → true；离线/缺 fact_id → false 降级）
+    pub effects_verified: bool,
 }
 
 impl From<serde_json::Error> for StoreError {
@@ -388,14 +390,14 @@ impl MemoryEventStore {
 
     // ===== 因果链维护 =====
 
-    /// 写入带因果的事件(032 设计文档 §6.4 + gap §14.3.3)
+    /// 写入带因果的事件(032 设计文档 §6.4 + gap §14.3.3 + 改进2)
     ///
     /// 1. 写入 E2(cause = cause_fact_id)
     /// 2. 找到源事件 E1(其 fact_id == cause_fact_id)
-    /// 3. 更新 E1.effects,追加 E2.event_id
+    /// 3. 更新 E1.effects,追加 E2 的**引擎级引用**(改进2:event_id + E2 的 FactId)
     ///
     /// 两次 PayloadUpdate 保证因果链双向可走:
-    /// - E1.effects → E2(正向)
+    /// - E1.effects → E2(正向,改进2 起引用引擎级 FactId)
     /// - E2.cause → F1 → E1(反向)
     pub async fn write_event_with_cause(
         &mut self,
@@ -410,10 +412,23 @@ impl MemoryEventStore {
         if let Some(source_event_id) = self.fact_to_event.get(&cause_fact_id).cloned() {
             // clone 源事件,避免在持有 get_mut 借用时调 self 方法
             if let Some(source_event) = self.event_cache.get(&source_event_id).cloned() {
-                // 追加新事件 ID 到 effects(去重)
-                if !source_event.effects.contains(&new_event_id) {
+                // 追加新事件引用到 effects(去重;改进2 携带引擎级 FactId)
+                let has_ref = source_event
+                    .effects
+                    .iter()
+                    .any(|r| r.event_id == new_event_id);
+                if !has_ref {
                     let mut updated = source_event.clone();
-                    updated.effects.push(new_event_id.clone());
+                    // 引擎级锚点:E2 的 FactId(best-effort,离线/失败时 new_fact_id=0 → None 降级)
+                    let fact_id = if new_fact_id > 0 {
+                        Some(new_fact_id)
+                    } else {
+                        None
+                    };
+                    updated.effects.push(EventRef {
+                        event_id: new_event_id.clone(),
+                        fact_id,
+                    });
 
                     // 更新 cache
                     self.event_cache
@@ -544,7 +559,54 @@ impl MemoryEventStore {
             && report.app_chain_len > 0
             && report.engine_chain_len >= report.app_chain_len;
 
+        // 5. 改进2：effects 引擎级 FactId 真实性校验
+        //    对每个 effect 的 fact_id，拉取该事件 path 的 Fact 流，校验身份锚点一致。
+        //    server 不可用 / 缺 fact_id（离线降级）→ false；全命中 → true。
+        report.effects_verified = self.verify_effects_binding(&event, &session_id).await;
+
         Ok(report)
+    }
+
+    /// 改进2：校验事件 effects 中每个引擎级 FactId 是否真实存在于 Fact 流
+    ///
+    /// 对每个 effect 的 `fact_id`，用 `get_facts(path)` 反向验证——该 path 的 Fact 流中
+    /// 身份锚点（首个精确匹配的 FactId）与 effect.fact_id 一致。
+    /// - 全命中 → `true`（真实存在）
+    /// - 无 effects / server 不可用 / 某 effect 缺 fact_id → `false`（降级，不阻断）
+    async fn verify_effects_binding(
+        &self,
+        event: &MemoryEvent,
+        session_id: &str,
+    ) -> bool {
+        if event.effects.is_empty() {
+            return false; // 无正向因果可校验
+        }
+        let mut all_hit = true;
+        for r in &event.effects {
+            let Some(fid) = r.fact_id else {
+                all_hit = false; // 离线/失败时未写入引擎级锚点 → 不可验证
+                continue;
+            };
+            // 拉取该 effect 事件 path 的 Fact 流
+            let path = self.event_path(&r.event_id);
+            match self.evorule_client.get_facts(session_id, Some(&path)).await {
+                Ok(facts) => {
+                    // 身份锚点 = 首个精确匹配该 path 的 FactId（与 fetch_identity_fact_id 同语义）
+                    let identity = facts
+                        .into_iter()
+                        .find(|f| f.path == path)
+                        .map(|f| f.id)
+                        .unwrap_or(0);
+                    if identity == 0 || identity != fid {
+                        all_hit = false; // 目标事件不存在或 FactId 漂移
+                    }
+                }
+                Err(_) => {
+                    all_hit = false; // server 不可用 → 降级
+                }
+            }
+        }
+        all_hit
     }
 
     /// B4：对某事件出示证据
@@ -752,7 +814,7 @@ impl MemoryEventStore {
 #[cfg(test)]
 mod tests {
     use super::super::event::{
-        ConversationSubtype, Emotion, EmotionSubject, EventSource, EventType, MilestoneSubtype,
+        ConversationSubtype, EventSource, EventType, MilestoneSubtype,
     };
     use super::*;
     use crate::api::evorule_client::EvoruleApiClient;
@@ -823,10 +885,13 @@ mod tests {
         let e2 = make_test_event("E002", EventType::EmotionEvent, 2000);
         let _ = store.write_event_with_cause(e2, e1_fact_id).await;
 
-        // E1.effects 应包含 E002
+        // E1.effects 应包含指向 E002 的 EventRef（改进2：引擎级引用）
         let e1_after = store.event_cache.get("E001").unwrap();
         assert!(
-            e1_after.effects.contains(&"E002".to_string()),
+            e1_after
+                .effects
+                .iter()
+                .any(|r| r.event_id == "E002"),
             "E1.effects should contain E002, got: {:?}",
             e1_after.effects
         );

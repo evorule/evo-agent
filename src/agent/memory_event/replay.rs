@@ -24,7 +24,7 @@ use crate::io_handler::IoHandler;
 use crate::io_handlers::LlmHandler;
 use crate::json_convert::serde_to_tcb;
 
-use super::event::MemoryEvent;
+use super::event::{EventRef, MemoryEvent};
 use super::evidence::NarrativeWithEvidence;
 use super::store::{MemoryEventStore, StoreError};
 
@@ -142,7 +142,7 @@ impl ReplayEngine {
                     let event = self.store.read_event(&eid).await?;
                     match event {
                         Some(ev) => {
-                            current_id = ev.effects.last().cloned();
+                            current_id = ev.effects.last().map(|r| r.event_id.clone());
                             chain.push(ev);
                         }
                         None => break,
@@ -693,9 +693,15 @@ mod tests {
         let mut engine = ReplayEngine::new(store);
 
         let mut e1 = make_event("E001", EventType::EmotionEvent, 1000);
-        e1.effects = vec!["E002".to_string()];
+        e1.effects = vec![EventRef {
+            event_id: "E002".to_string(),
+            fact_id: Some(20),
+        }];
         let mut e2 = make_event("E002", EventType::EmotionEvent, 2000);
-        e2.effects = vec!["E003".to_string()];
+        e2.effects = vec![EventRef {
+            event_id: "E003".to_string(),
+            fact_id: Some(30),
+        }];
         let e3 = make_event("E003", EventType::EmotionEvent, 3000);
 
         let store = engine.store_mut();
