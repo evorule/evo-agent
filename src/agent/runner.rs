@@ -688,6 +688,12 @@ impl AgentRunner {
             max_session_summaries: def.memory.max_session_summaries,
             max_injected_events: def.memory.max_injected_events,
             summary_rollup_threshold: def.memory.summary_rollup_threshold,
+            // B5：stable 事实由摘要管道产出 → 域段记摘要模型（缺省回退主模型）
+            llm_model_id: def
+                .memory
+                .summary_model
+                .clone()
+                .unwrap_or_else(|| def.model.clone()),
         };
         // 用户决策 3 + G10：summary_model 单独配置,同时构造 ContextSummarizer
         if let Some(sm) = def.memory.summary_model {
@@ -1808,10 +1814,9 @@ impl AgentRunner {
     }
 
     async fn auto_recall(&self, session_id: &str) -> Result<Vec<u64>, AgentError> {
-        let shared_facts = self
-            .evorule_client
-            .get_shared_facts(Some("shared."))
-            .await?;
+        // B5/D3：限定本 namespace（旧实现 `shared.` 跨 namespace 越权读）
+        let prefix = format!("shared.{}.", self.sediment_config.namespace);
+        let shared_facts = self.evorule_client.get_shared_facts(Some(&prefix)).await?;
 
         if shared_facts.is_empty() {
             info!(%session_id, "No shared facts to recall");

@@ -37,6 +37,8 @@ pub enum MemoryError {
     EvoruleError(String),
     /// session 未设置
     SessionNotSet,
+    /// B5 域准入拒绝：外部通道禁止写入受保护域
+    DomainForbidden(String),
 }
 
 impl std::fmt::Display for MemoryError {
@@ -48,11 +50,28 @@ impl std::fmt::Display for MemoryError {
             MemoryError::KeyTooLong(len) => write!(f, "memory key too long ({} chars)", len),
             MemoryError::EvoruleError(e) => write!(f, "Evorule API error: {}", e),
             MemoryError::SessionNotSet => write!(f, "session not set"),
+            MemoryError::DomainForbidden(key) => write!(
+                f,
+                "domain forbidden: '{key}' (stable.llm.*/stable.system.* 仅限内部受信管道写入, B5 域准入)"
+            ),
         }
     }
 }
 
 impl std::error::Error for MemoryError {}
+
+/// B5：stable 事实来源域（由 key 路径前缀判定，见 [`MemoryManager::stable_domain_of`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StableDomain {
+    /// LLM 提取（sediment 管道专属，幻觉隔离域）
+    Llm,
+    /// 用户/程序经外部通道写入
+    User,
+    /// 内部机制写入（rollup 等）
+    System,
+    /// 无域段旧数据或未归类
+    Unclassified,
+}
 
 impl From<std::io::Error> for MemoryError {
     fn from(e: std::io::Error) -> Self {
@@ -607,8 +626,18 @@ impl MemoryManager {
             return Err(MemoryError::KeyTooLong(key.len()));
         }
 
+        // B5 域准入：外部通道禁止写入受保护域（llm/system），防来源伪造
+        if key.starts_with("stable.llm.") || key.starts_with("stable.system.") {
+            return Err(MemoryError::DomainForbidden(key.to_string()));
+        }
+
         let timestamp = now_secs();
-        let record = MemoryRecord::new(key, value, timestamp);
+        let mut record = MemoryRecord::new(key, value, timestamp);
+        // B5：stable.* 键经外部通道写入 → source 标记为 user（其余域不标，
+        // 避免对 events/sessions 等既有语义域引入未约定含义）
+        if key.starts_with("stable.") {
+            record.source = Some("user".to_string());
+        }
         let cache_key = self.cache_key_for(&scope, key);
         self.cache.insert(cache_key, record.clone());
 
@@ -632,6 +661,70 @@ impl MemoryManager {
         }
 
         Ok(())
+    }
+
+    /// B5：受信内部通道写入（绕过域准入，source 由系统自动填充）
+    ///
+    /// 供 sediment（LLM 提取 → `stable.llm.*`）与内部机制（rollup →
+    /// `sessions.rollup.*`）使用。与 [`Self::set_scoped`] 的差异：
+    /// - 不做域准入拒绝（调用方即受信管道，域由调用方构造的 key 声明）；
+    /// - `source` 必填，由系统按通道生成（如 `llm:{model}` / `system:rollup`），
+    ///   **不接受调用方之外的来源声明**。
+    pub(crate) async fn set_scoped_with_source(
+        &mut self,
+        scope: MemoryScope,
+        key: &str,
+        value: &str,
+        source: &str,
+    ) -> Result<(), MemoryError> {
+        if key.is_empty() {
+            return Err(MemoryError::EmptyKey);
+        }
+        if key.len() > 256 {
+            return Err(MemoryError::KeyTooLong(key.len()));
+        }
+
+        let timestamp = now_secs();
+        let mut record = MemoryRecord::new(key, value, timestamp);
+        record.source = Some(source.to_string());
+        let cache_key = self.cache_key_for(&scope, key);
+        self.cache.insert(cache_key, record.clone());
+
+        // best-effort 持久化（与 set_scoped 同语义）
+        let session_id = self.session_id_for_scope(&scope)?;
+        let path = self.build_path_scoped(&scope, key);
+        let payload_value = serde_json::to_value(&record)?;
+        if let Err(e) = self
+            .evorule_client
+            .update_payload(&session_id, &path, &payload_value)
+            .await
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                path = %path,
+                error = %e,
+                "memory persist to evorule failed; cache may drift from source of truth"
+            );
+        }
+        Ok(())
+    }
+
+    /// B5：stable key 的来源域判定（召回标注用）
+    ///
+    /// - `stable.llm.*` → Llm
+    /// - `stable.user.*` → User
+    /// - `stable.system.*` → System
+    /// - 其余（含无域段旧数据 `stable.{key}`）→ Unclassified
+    pub(crate) fn stable_domain_of(key: &str) -> StableDomain {
+        if key.starts_with("stable.llm.") {
+            StableDomain::Llm
+        } else if key.starts_with("stable.user.") {
+            StableDomain::User
+        } else if key.starts_with("stable.system.") {
+            StableDomain::System
+        } else {
+            StableDomain::Unclassified
+        }
     }
 
     /// C1:写入共享空间会话摘要
@@ -1226,6 +1319,18 @@ impl MemoryManager {
     ) -> Vec<String> {
         let mut lines = Vec::with_capacity(records.len());
         for record in records {
+            // B5：stable 节按来源域标注（D1 标注注入 / D2 unclassified），
+            // 让 LLM 与审计侧都能区分"LLM 提取"与"用户/系统写入"。
+            let display_key = if section == "stable" {
+                match Self::stable_domain_of(&record.key) {
+                    StableDomain::Llm => format!("[llm-extracted] {}", record.key),
+                    StableDomain::System => format!("[system] {}", record.key),
+                    StableDomain::User => record.key.clone(),
+                    StableDomain::Unclassified => format!("[unclassified] {}", record.key),
+                }
+            } else {
+                record.key.clone()
+            };
             let result = self.safety_auditor.audit(&record.value);
             for f in &result.findings {
                 tracing::warn!(
@@ -1240,14 +1345,14 @@ impl MemoryManager {
             }
             match result.text {
                 Some(clean) if !clean.trim().is_empty() => {
-                    lines.push(format!("- {}: {}\n", record.key, clean));
+                    lines.push(format!("- {}: {}\n", display_key, clean));
                 }
                 Some(_) => {} // 全部内容被剥离 → 该条目整体丢弃
                 None => {
                     // Reject 模式下放弃整段
                     lines.push(format!(
                         "- {}: [safety audit rejected this record]\n",
-                        record.key
+                        display_key
                     ));
                 }
             }
@@ -1995,6 +2100,96 @@ mod tests {
         assert!(mgr.cache.get("session_s1::topic").is_some());
         assert!(mgr.cache.get("wrong_key").is_none(), "旧 key 错位不应复现");
         m1.assert_async().await;
+    }
+
+    // ===== B5: stable_facts 来源域分离 =====
+
+    #[test]
+    fn test_stable_domain_of() {
+        assert_eq!(
+            MemoryManager::stable_domain_of("stable.llm.gpt-4o.topic"),
+            StableDomain::Llm
+        );
+        assert_eq!(
+            MemoryManager::stable_domain_of("stable.user.prefs"),
+            StableDomain::User
+        );
+        assert_eq!(
+            MemoryManager::stable_domain_of("stable.system.rollup"),
+            StableDomain::System
+        );
+        // 无域段旧数据 / 非 stable 前缀
+        assert_eq!(
+            MemoryManager::stable_domain_of("stable.topic"),
+            StableDomain::Unclassified
+        );
+        assert_eq!(
+            MemoryManager::stable_domain_of("sessions.s1.summary"),
+            StableDomain::Unclassified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_scoped_domain_admission() {
+        let mut mgr = MemoryManager::new("test", make_test_client()).with_session_id("s1");
+
+        // 受保护域：外部通道拒绝
+        assert!(matches!(
+            mgr.set_scoped(MemoryScope::Shared, "stable.llm.gpt-4o.x", "v").await,
+            Err(MemoryError::DomainForbidden(_))
+        ));
+        assert!(matches!(
+            mgr.set_scoped(MemoryScope::Shared, "stable.system.x", "v").await,
+            Err(MemoryError::DomainForbidden(_))
+        ));
+
+        // user 域 + 无域段旧格式：放行，source 标记为 user
+        mgr.set_scoped(MemoryScope::Shared, "stable.user.prefs", "v")
+            .await
+            .expect("user domain allowed");
+        let ck = mgr.cache_key_for(&MemoryScope::Shared, "stable.user.prefs");
+        assert_eq!(mgr.cache.get(&ck).unwrap().source, Some("user".to_string()));
+
+        mgr.set_scoped(MemoryScope::Shared, "stable.legacy", "v")
+            .await
+            .expect("legacy format allowed");
+        let ck = mgr.cache_key_for(&MemoryScope::Shared, "stable.legacy");
+        assert_eq!(mgr.cache.get(&ck).unwrap().source, Some("user".to_string()));
+
+        // 非 stable 域 key：不标 source（既有语义域不引入未约定含义）
+        mgr.set_scoped(MemoryScope::Shared, "sessions.s1.summary", "v")
+            .await
+            .expect("non-stable allowed");
+        let ck = mgr.cache_key_for(&MemoryScope::Shared, "sessions.s1.summary");
+        assert_eq!(mgr.cache.get(&ck).unwrap().source, None);
+    }
+
+    #[test]
+    fn test_recall_annotation_by_domain() {
+        let mgr = MemoryManager::new("test", make_test_client());
+        let mut recall = RecallContext::default();
+        recall.stable = vec![
+            MemoryRecord::new("stable.llm.gpt-4o.topic", "quantum computing", 1),
+            MemoryRecord::new("stable.user.prefs", "prefer concise answers", 2),
+            MemoryRecord::new("stable.legacy", "old data without domain", 3),
+        ];
+        let prompt = mgr.build_system_prompt_with_recall(
+            "base",
+            &recall,
+            &ContextBudget::new(100_000, 0.25),
+        );
+        assert!(
+            prompt.contains("[llm-extracted] stable.llm.gpt-4o.topic"),
+            "llm 域必须带标注: {prompt}"
+        );
+        assert!(
+            prompt.contains("- stable.user.prefs: prefer concise answers"),
+            "user 域无需标注: {prompt}"
+        );
+        assert!(
+            prompt.contains("[unclassified] stable.legacy"),
+            "无域段旧数据必须带 unclassified 标注: {prompt}"
+        );
     }
 
     // ===== P0: MessagePersistMode 测试 =====

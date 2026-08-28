@@ -40,6 +40,11 @@ pub struct SedimentConfig {
     pub max_injected_events: usize,
     /// 摘要 rollup 触发阈值（C4 用）
     pub summary_rollup_threshold: usize,
+    /// B5：写入 `stable.llm.{model}.*` 域所用的模型标识
+    ///
+    /// 路径段经消毒（非 `[a-zA-Z0-9-_]` 替换为 `-`）保证单一路径段；
+    /// 原始模型名记入 value.source（`llm:{raw}`）。
+    pub llm_model_id: String,
 }
 
 impl Default for SedimentConfig {
@@ -50,6 +55,7 @@ impl Default for SedimentConfig {
             max_session_summaries: 3,
             max_injected_events: 5,
             summary_rollup_threshold: 10,
+            llm_model_id: "unknown".to_string(),
         }
     }
 }
@@ -121,12 +127,18 @@ pub async fn sediment(
                     Err(e) => tracing::warn!(error = %e, "sediment: write summary failed"),
                 }
 
-                // 3. 稳定事实 → 共享空间
+                // 3. 稳定事实 → 共享空间（B5：写入 llm 域 `stable.llm.{model}.*`，
+                //    与用户/系统域隔离；source 由系统填充为 llm:{raw_model}）
                 for fact in &out.stable_facts {
-                    let key = format!("stable.{}", fact.key);
+                    let key = format!(
+                        "stable.llm.{}.{}",
+                        sanitize_model_id(&cfg.llm_model_id),
+                        fact.key
+                    );
+                    let source = format!("llm:{}", cfg.llm_model_id);
                     match deps
                         .memory
-                        .set_scoped(MemoryScope::Shared, &key, &fact.value)
+                        .set_scoped_with_source(MemoryScope::Shared, &key, &fact.value, &source)
                         .await
                     {
                         Ok(_) => result.stable_facts.push(fact.key.clone()),
@@ -154,6 +166,17 @@ pub async fn sediment(
     }
 
     result
+}
+
+/// B5：模型标识消毒为合法路径段（非 `[a-zA-Z0-9-_]` 替换为 `-`）
+///
+/// 保证 `stable.llm.{model}.{key}` 中 model 恒为单一路径段；
+/// 原始模型名已记录在 value.source（`llm:{raw}`），此处仅影响路径可读性。
+fn sanitize_model_id(model: &str) -> String {
+    model
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect()
 }
 
 /// 把消息列表拼接为纯文本对话（供 LLM 摘要）
@@ -302,6 +325,17 @@ mod tests {
         assert_eq!(cfg.max_session_summaries, 3);
         assert_eq!(cfg.max_injected_events, 5);
         assert_eq!(cfg.summary_rollup_threshold, 10);
+        assert_eq!(cfg.llm_model_id, "unknown");
+    }
+
+    #[test]
+    fn test_sanitize_model_id() {
+        assert_eq!(sanitize_model_id("gpt-4o"), "gpt-4o");
+        assert_eq!(sanitize_model_id("deepseek-chat"), "deepseek-chat");
+        // 带点的模型名消毒为单一路径段
+        assert_eq!(sanitize_model_id("gpt-4.1"), "gpt-4-1");
+        assert_eq!(sanitize_model_id("qwen/max"), "qwen-max");
+        assert_eq!(sanitize_model_id(""), "");
     }
 
     #[test]

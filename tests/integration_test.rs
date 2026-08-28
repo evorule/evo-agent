@@ -32,7 +32,7 @@ async fn test_auto_recall_with_mock_server() {
         .await;
 
     server
-        .mock("GET", "/api/shared/facts?prefix=shared.")
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
         .with_status(200)
         .with_body(
             json!([
@@ -121,7 +121,7 @@ async fn test_auto_rewind_on_error() {
         .await;
 
     server
-        .mock("GET", "/api/shared/facts?prefix=shared.")
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
         .with_status(200)
         .with_body("[]")
         .create_async()
@@ -193,7 +193,7 @@ async fn test_auto_recall_no_shared_facts() {
         .await;
 
     server
-        .mock("GET", "/api/shared/facts?prefix=shared.")
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
         .with_status(200)
         .with_body("[]")
         .create_async()
@@ -255,7 +255,7 @@ async fn test_full_workflow_with_all_features() {
         .await;
 
     server
-        .mock("GET", "/api/shared/facts?prefix=shared.")
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
         .with_status(200)
         .with_body(
             json!([

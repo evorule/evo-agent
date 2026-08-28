@@ -114,7 +114,7 @@ async fn test_auto_recall_empty_shared_facts() {
     let client = EvoruleApiClient::new(&server.url());
 
     server
-        .mock("GET", "/api/shared/facts?prefix=shared.")
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
         .with_status(200)
         .with_body("[]")
         .create_async()
@@ -135,7 +135,7 @@ async fn test_auto_recall_api_error_fetching_facts() {
     let client = EvoruleApiClient::new(&server.url());
 
     server
-        .mock("GET", "/api/shared/facts?prefix=shared.")
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
         .with_status(500)
         .with_body("Internal server error")
         .create_async()
@@ -155,7 +155,7 @@ async fn test_auto_recall_api_error_recording_used_at_startup() {
     let mut server = mockito::Server::new_async().await;
     let client = EvoruleApiClient::new(&server.url());
 
-    server.mock("GET", "/api/shared/facts?prefix=shared.")
+    server.mock("GET", "/api/shared/facts?prefix=shared.default.")
             .with_status(200)
             .with_body(r#"[{"fact_id": 1, "path": "shared.test", "value": "test", "source_session_id": 100, "version": 1}]"#)
             .create_async()
@@ -182,7 +182,7 @@ async fn test_auto_recall_with_memory() {
     let mut server = mockito::Server::new_async().await;
     let client = EvoruleApiClient::new(&server.url());
 
-    server.mock("GET", "/api/shared/facts?prefix=shared.")
+    server.mock("GET", "/api/shared/facts?prefix=shared.default.")
             .with_status(200)
             .with_body(r#"[{"fact_id": 1, "path": "shared.knowledge", "value": "important info", "source_session_id": 100, "version": 1}]"#)
             .create_async()
@@ -225,7 +225,7 @@ async fn test_auto_recall_with_multiple_facts() {
     let mut server = mockito::Server::new_async().await;
     let client = EvoruleApiClient::new(&server.url());
 
-    server.mock("GET", "/api/shared/facts?prefix=shared.")
+    server.mock("GET", "/api/shared/facts?prefix=shared.default.")
             .with_status(200)
             .with_body(r#"[{"fact_id": 1, "path": "shared.guideline", "value": "safety rule", "source_session_id": 100, "version": 1}, {"fact_id": 2, "path": "shared.knowledge", "value": "domain knowledge", "source_session_id": 200, "version": 2}, {"fact_id": 3, "path": "shared.policy", "value": "company policy", "source_session_id": 300, "version": 3}]"#)
             .create_async()
@@ -1653,7 +1653,7 @@ async fn test_run_recall_before_prompt() {
 
     // 4. auto_recall: shared. prefix → 空（auto_recall 提前返回）
     server
-        .mock("GET", "/api/shared/facts?prefix=shared.")
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
         .with_status(200)
         .with_body("[]")
         .create_async()
