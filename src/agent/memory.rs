@@ -415,6 +415,13 @@ pub struct MemoryManager {
     /// `SafetyAuditor::with_default_rules()` + Strip 模式；
     /// 命中即 warn 留痕（含规则名与片段）。
     safety_auditor: crate::agent::safety_auditor::SafetyAuditor,
+    /// B3：cache vs 真相源定期校验的最小间隔（秒）
+    ///
+    /// 召回路径按此间隔节流触发 `verify_cache_against_server`；
+    /// 0 表示每次召回都校验，`u64::MAX` 表示禁用。
+    cache_verify_interval_secs: u64,
+    /// B3：上次成功校验的时间戳（server 不可达时不更新，下次召回立即重试）
+    last_cache_verify: Option<std::time::Instant>,
 }
 
 /// 投影读取的三种结果（改进1：读路径"投影优先 + cache 离线兜底"）
@@ -440,6 +447,8 @@ impl MemoryManager {
             cache: BTreeMap::new(),
             ttl_secs: None,
             safety_auditor: crate::agent::safety_auditor::SafetyAuditor::with_default_rules(),
+            cache_verify_interval_secs: 300,
+            last_cache_verify: None,
         }
     }
 
@@ -467,6 +476,14 @@ impl MemoryManager {
     /// `get_scoped` 会惰性检查并移除过期条目，`cleanup_expired` 可显式清理。
     pub fn with_ttl_secs(mut self, ttl_secs: u64) -> Self {
         self.ttl_secs = Some(ttl_secs);
+        self
+    }
+
+    /// B3：设置 cache 定期校验的最小间隔（builder 风格）
+    ///
+    /// 默认 300 秒；0 = 每次召回都校验，`u64::MAX` = 禁用。
+    pub fn with_cache_verify_interval_secs(mut self, secs: u64) -> Self {
+        self.cache_verify_interval_secs = secs;
         self
     }
 
@@ -828,6 +845,11 @@ impl MemoryManager {
     }
 
     /// 从 evorule 同步当前 namespace 下的所有 facts 到 cache（旧版，向后兼容）
+    ///
+    /// B3 修复：旧实现用 `record.key` 作 cache key，与 `cache_key_for` 生成的
+    /// 带 scope 前缀键位错乱（如 Session scope 存成 `topic`，读时查
+    /// `session_{sid}::topic` 必然 miss）。统一走 [`Self::path_to_cache_key`]
+    /// 从 fact path 推导，保证与读路径一致。
     pub async fn sync_from_evorule(&mut self) -> Result<(), MemoryError> {
         if let Some(session_id) = &self.session_id {
             let prefix = format!("__memory__.{}", self.namespace);
@@ -836,13 +858,134 @@ impl MemoryManager {
                 .get_facts(session_id, Some(&prefix))
                 .await {
                 for fact in facts {
-                    if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
-                        self.cache.insert(record.key.clone(), record);
+                    if let Some(cache_key) = self.path_to_cache_key(&fact.path) {
+                        if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
+                            self.cache.insert(cache_key, record);
+                        }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    // ===== B3：cache vs 真相源定期校验 =====
+
+    /// 从 evorule fact path 推导 cache 内部 key（B3 校验/同步共用）
+    ///
+    /// 映射规则与 [`Self::build_path_scoped`] / [`Self::cache_key_for`] 严格互逆：
+    /// - `shared.{ns}.{key}` → `shared::{key}`
+    /// - `__memory__.{ns}.session_{sid}.messages.{idx}` → `session_{sid}::messages::{idx}`
+    /// - `__memory__.{ns}.session_{sid}.{key}` → `session_{sid}::{key}`
+    /// - 其他路径（非本 namespace 管辖）返回 `None`
+    fn path_to_cache_key(&self, path: &str) -> Option<String> {
+        if let Some(key) = path.strip_prefix(&format!("shared.{}.", self.namespace)) {
+            return Some(format!("shared::{key}"));
+        }
+        let rest = path.strip_prefix(&format!("__memory__.{}.session_", self.namespace))?;
+        let dot = rest.find('.')?;
+        let sid = &rest[..dot];
+        let tail = &rest[dot + 1..];
+        if let Some(idx) = tail.strip_prefix("messages.") {
+            return Some(format!("session_{sid}::messages::{idx}"));
+        }
+        Some(format!("session_{sid}::{tail}"))
+    }
+
+    /// B3：cache 与真相源（evorule）全量比对并**对齐（server wins）**
+    ///
+    /// 拉取本 namespace 的权威事实（session facts + shared facts）与本地 cache
+    /// 做存在性比对：
+    /// - cache 有、server 无（写入失败残留的幽灵条目）→ 移除
+    /// - cache 无、server 有（其他写入者新增/本端漏写）→ 回填
+    ///
+    /// 值级不一致不在此处理：读路径投影优先已保证 server 可达时返回权威值。
+    ///
+    /// 返回漂移条目总数（ghost + miss）。server 不可达时返回 `Err`，由调用方
+    /// （[`Self::verify_cache_if_due`]）决定节流重试语义。
+    pub async fn verify_cache_against_server(&mut self) -> Result<usize, crate::api::ApiError> {
+        // 未设置 session：cache 必然为空，无事可校验
+        let Some(session_id) = self.session_id.clone() else {
+            return Ok(0);
+        };
+        let mut authoritative: BTreeMap<String, MemoryRecord> = BTreeMap::new();
+
+        for fact in self
+            .evorule_client
+            .get_facts(&session_id, Some(&format!("__memory__.{}", self.namespace)))
+            .await?
+        {
+            if let Some(cache_key) = self.path_to_cache_key(&fact.path) {
+                if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
+                    authoritative.insert(cache_key, record);
+                }
+            }
+        }
+        for fact in self
+            .evorule_client
+            .get_shared_facts(Some(&format!("shared.{}.", self.namespace)))
+            .await?
+        {
+            if let Some(cache_key) = self.path_to_cache_key(&fact.path) {
+                if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
+                    authoritative.insert(cache_key, record);
+                }
+            }
+        }
+
+        let ghosts: Vec<String> = self
+            .cache
+            .keys()
+            .filter(|k| !authoritative.contains_key(*k))
+            .cloned()
+            .collect();
+        let mut drift = ghosts.len();
+        for k in &ghosts {
+            self.cache.remove(k);
+        }
+        for (k, record) in &authoritative {
+            if !self.cache.contains_key(k) {
+                self.cache.insert(k.clone(), record.clone());
+                drift += 1;
+            }
+        }
+        Ok(drift)
+    }
+
+    /// B3：按最小间隔节流执行 cache 校验（供召回路径在每轮 run 前调用）
+    ///
+    /// - 未到期 / 未触发 → 返回 0；
+    /// - 校验成功 → 更新节流时间戳；有漂移时 warn 留痕（cache 已对齐）；
+    /// - server 不可达 → **不更新时间戳**（下次召回立即重试），debug 留痕。
+    ///
+    /// 离线属常态（F3 语义），不可达不算漂移、不产生 notice。
+    pub async fn verify_cache_if_due(&mut self) -> usize {
+        if let Some(last) = self.last_cache_verify {
+            if last.elapsed().as_secs() < self.cache_verify_interval_secs {
+                return 0;
+            }
+        }
+        match self.verify_cache_against_server().await {
+            Ok(n) => {
+                self.last_cache_verify = Some(std::time::Instant::now());
+                if n > 0 {
+                    tracing::warn!(
+                        namespace = %self.namespace,
+                        drift = n,
+                        "memory cache drifted from evorule; re-aligned to source of truth (B3)"
+                    );
+                }
+                n
+            }
+            Err(e) => {
+                tracing::debug!(
+                    namespace = %self.namespace,
+                    error = %e,
+                    "memory cache verify skipped: evorule unreachable"
+                );
+                0
+            }
+        }
     }
 
     /// 追加消息到 evorule payload（P0 短期记忆持久化）
@@ -883,30 +1026,6 @@ impl MemoryManager {
             self.append_message(session_id, *idx, message).await?;
         }
         Ok(())
-    }
-
-    /// 构建 system prompt（注入记忆）
-    ///
-    /// 优先使用 summary（如果存在），否则拼接所有 KV。
-    pub fn build_system_prompt(&self, base_prompt: &str) -> String {
-        if self.cache.is_empty() {
-            return base_prompt.to_string();
-        }
-
-        let mut memory_lines = Vec::new();
-        memory_lines.push("=== AGENT MEMORY ===".to_string());
-        memory_lines.push(format!("Namespace: {}", self.namespace));
-        memory_lines.push("".to_string());
-
-        for key in self.cache.keys() {
-            if let Some(record) = self.cache.get(key) {
-                memory_lines.push(format!("{}: {}", record.key, record.value));
-            }
-        }
-        memory_lines.push("".to_string());
-        memory_lines.push("=== END MEMORY ===".to_string());
-
-        format!("{}\n\n{}", base_prompt, memory_lines.join("\n"))
     }
 
     /// C2: 从共享账本做三层召回。
@@ -1512,30 +1631,6 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_manager_build_system_prompt_empty() {
-        let mgr = MemoryManager::new("test", make_test_client());
-        let prompt = mgr.build_system_prompt("You are a helpful assistant");
-        assert_eq!(prompt, "You are a helpful assistant");
-    }
-
-    #[test]
-    fn test_memory_manager_build_system_prompt_with_memory() {
-        let mut mgr = MemoryManager::new("research", make_test_client()).with_session_id("s1");
-        tokio_test::block_on(async {
-            mgr.set("topic", "quantum computing").await.expect("set");
-            mgr.set("author", "John Doe").await.expect("set");
-
-            let prompt = mgr.build_system_prompt("You are a research assistant");
-            assert!(prompt.contains("=== AGENT MEMORY ==="));
-            assert!(prompt.contains("Namespace: research"));
-            assert!(prompt.contains("topic: quantum computing"));
-            assert!(prompt.contains("author: John Doe"));
-            assert!(prompt.contains("=== END MEMORY ==="));
-            assert!(prompt.starts_with("You are a research assistant"));
-        });
-    }
-
-    #[test]
     fn test_memory_manager_save_and_load() {
         let dir = make_tmp_dir();
         let path = dir.path().join("memory.json");
@@ -1773,6 +1868,133 @@ mod tests {
         let mgr = MemoryManager::new("test", make_test_client()).with_session_id("current");
         let result = mgr.session_id_for_scope(&MemoryScope::Session("other".to_string()));
         assert_eq!(result.unwrap(), "other");
+    }
+
+    // ===== B3: cache vs 真相源定期校验 =====
+
+    #[test]
+    fn test_path_to_cache_key_roundtrip() {
+        let mgr = MemoryManager::new("test", make_test_client());
+        assert_eq!(
+            mgr.path_to_cache_key("shared.test.topic"),
+            Some("shared::topic".to_string())
+        );
+        assert_eq!(
+            mgr.path_to_cache_key("__memory__.test.session_s1.topic"),
+            Some("session_s1::topic".to_string())
+        );
+        assert_eq!(
+            mgr.path_to_cache_key("__memory__.test.session_s1.messages.3"),
+            Some("session_s1::messages::3".to_string())
+        );
+        // 非 cache_key_for 生成范围：其他 namespace 的路径不属于本 manager
+        assert_eq!(mgr.path_to_cache_key("shared.other.topic"), None);
+        assert_eq!(
+            mgr.path_to_cache_key("__memory__.other.session_s1.topic"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_cache_reconciles_ghost_and_miss() {
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr = MemoryManager::new(
+            "test",
+            EvoruleApiClient::new(&server.url()),
+        )
+        .with_session_id("s1")
+        .with_cache_verify_interval_secs(0);
+
+        // 权威：session facts 1 条（topic） + shared facts 1 条（shared_topic）
+        let facts_body = r#"[{"version":1,"fact_id":1,"path":"__memory__.test.session_s1.topic","value":{"key":"topic","value":"v1","timestamp":10},"type":"payload_update"}]"#;
+        let shared_body = r#"[{"fact_id":2,"path":"shared.test.shared_topic","value":{"key":"shared_topic","value":"v2","timestamp":11},"source_session_id":1,"version":1}]"#;
+        let m1 = server
+            .mock("GET", "/api/sessions/s1/facts?prefix=__memory__.test")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(facts_body)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(shared_body)
+            .create_async()
+            .await;
+
+        // 幽灵条目：server 无（写入失败残留）→ 应被清理
+        mgr.cache
+            .insert("session_s1::ghost".to_string(), MemoryRecord::new("ghost", "g", 0));
+        // 正常条目：两边都有 → 保留
+        mgr.cache
+            .insert("session_s1::topic".to_string(), MemoryRecord::new("topic", "v1", 10));
+        // 缺失条目：server 有 cache 无 → 回填（shared_topic）
+
+        let drift = mgr.verify_cache_against_server().await.expect("verify");
+        assert_eq!(drift, 2, "1 ghost removed + 1 miss backfilled");
+        assert!(mgr.cache.get("session_s1::ghost").is_none());
+        assert!(mgr.cache.get("session_s1::topic").is_some());
+        assert!(mgr.cache.get("shared::shared_topic").is_some());
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_verify_cache_if_due_throttles_and_skips_offline() {
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+
+        // server 未匹配（不可达语义）→ Err → 返回 0 且不更新节流时间戳
+        assert_eq!(mgr.verify_cache_if_due().await, 0);
+        assert!(mgr.last_cache_verify.is_none());
+
+        let m1 = server
+            .mock("GET", "/api/sessions/s1/facts?prefix=__memory__.test")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        // 成功校验（空权威 = 空 cache，无漂移）→ 时间戳更新
+        assert_eq!(mgr.verify_cache_if_due().await, 0);
+        assert!(mgr.last_cache_verify.is_some());
+
+        // 节流间隔内再次调用：不再发请求（下面 assert 断言 mock 各仅命中 1 次）
+        assert_eq!(mgr.verify_cache_if_due().await, 0);
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_sync_from_evorule_uses_path_derived_key() {
+        let mut server = mockito::Server::new_async().await;
+        // record.key 与 path 末段刻意不一致：旧实现会错位存成 "wrong_key"（B3 修复回归）
+        let facts_body = r#"[{"version":1,"fact_id":1,"path":"__memory__.test.session_s1.topic","value":{"key":"wrong_key","value":"v","timestamp":10},"type":"payload_update"}]"#;
+        let m1 = server
+            .mock("GET", "/api/sessions/s1/facts?prefix=__memory__.test")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(facts_body)
+            .create_async()
+            .await;
+
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        mgr.sync_from_evorule().await.expect("sync");
+        assert!(mgr.cache.get("session_s1::topic").is_some());
+        assert!(mgr.cache.get("wrong_key").is_none(), "旧 key 错位不应复现");
+        m1.assert_async().await;
     }
 
     // ===== P0: MessagePersistMode 测试 =====

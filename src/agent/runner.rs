@@ -988,6 +988,16 @@ impl AgentRunner {
     pub async fn run(&mut self, goal: &str) -> Result<AgentResult, AgentError> {
         let start_time = std::time::Instant::now();
 
+        // B3: 召回前按节流间隔校验 cache 与真相源漂移（server wins 对齐）
+        if let Some(mem) = self.memory.as_mut() {
+            let drift = mem.verify_cache_if_due().await;
+            if drift > 0 {
+                if let Some(m) = &self.metrics {
+                    m.inc_memory_cache_drift(drift as u64);
+                }
+            }
+        }
+
         // C2: 召回顺序修复 —— recall 在 build_system_prompt 之前
         let recall = match self.memory.as_ref() {
             Some(mem) => {
@@ -2055,6 +2065,16 @@ impl AgentRunner {
             let start_time = std::time::Instant::now();
 
             // 1. 构造 system_prompt(同 run())
+            // B3: 召回前按节流间隔校验 cache 与真相源漂移（server wins 对齐）
+            if let Some(mem) = runner.memory.as_mut() {
+                let drift = mem.verify_cache_if_due().await;
+                if drift > 0 {
+                    if let Some(m) = &runner.metrics {
+                        m.inc_memory_cache_drift(drift as u64);
+                    }
+                }
+            }
+
             // C2: 召回顺序修复 —— recall 在 build_system_prompt 之前
             let recall = match runner.memory.as_ref() {
                 Some(mem) => mem.recall_context(

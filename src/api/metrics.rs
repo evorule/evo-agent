@@ -88,6 +88,11 @@ pub struct Metrics {
     ///
     /// 按命中规则打标签，使召回污染态势可告警（此前仅 tracing::warn 单通道）。
     safety_audit_hits_total: IntCounterVec,
+    /// B3 指标（2026-08-28）：memory cache 与真相源（evorule）漂移条目计数
+    ///
+    /// 定期校验对齐时累计漂移条目数（ghost 清理 + miss 回填），
+    /// 持续增长说明写入链路存在系统性失败。
+    memory_cache_drift_total: IntCounter,
 }
 
 impl fmt::Debug for Metrics {
@@ -174,6 +179,13 @@ impl Metrics {
         .map_err(|_| {
             MetricsError::CounterCreationFailed("evo_agent_safety_audit_hits_total".into())
         })?;
+        let memory_cache_drift_total = IntCounter::new(
+            "evo_agent_memory_cache_drift_total",
+            "Memory cache entries drifted from evorule source of truth (B3)",
+        )
+        .map_err(|_| {
+            MetricsError::CounterCreationFailed("evo_agent_memory_cache_drift_total".into())
+        })?;
 
         registry
             .register(Box::new(sessions_total.clone()))
@@ -225,6 +237,11 @@ impl Metrics {
             .map_err(|_| {
                 MetricsError::RegistryRegistrationFailed("evo_agent_safety_audit_hits_total".into())
             })?;
+        registry
+            .register(Box::new(memory_cache_drift_total.clone()))
+            .map_err(|_| {
+                MetricsError::RegistryRegistrationFailed("evo_agent_memory_cache_drift_total".into())
+            })?;
 
         Ok(Self {
             registry,
@@ -238,6 +255,7 @@ impl Metrics {
             sse_connections,
             llm_bypass_audit_total,
             safety_audit_hits_total,
+            memory_cache_drift_total,
         })
     }
 
@@ -335,6 +353,11 @@ impl Metrics {
     /// L2 SafetyAuditor 命中 +1（P5-A3 指标，按命中规则分桶）
     pub fn inc_safety_audit_hit(&self, rule: &str) {
         self.safety_audit_hits_total.with_label_values(&[rule]).inc();
+    }
+
+    /// B3：memory cache 漂移条目 +n（定期校验对齐时累计）
+    pub fn inc_memory_cache_drift(&self, n: u64) {
+        self.memory_cache_drift_total.inc_by(n);
     }
 }
 
