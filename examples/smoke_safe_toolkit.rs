@@ -41,7 +41,8 @@ fn check(label: &str, ok: bool, expect_ok: bool) {
     assert_eq!(ok, expect_ok, "check failed: {}", label);
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let workdir = tmp.path();
 
@@ -70,23 +71,27 @@ fn main() {
     println!("=== file_read ===");
     check(
         "read README.md",
-        file_read.call(&arg_path("README.md")).is_ok(),
+        file_read.call(&arg_path("README.md")).await.is_ok(),
         true,
     );
     check(
         "reject abs",
-        file_read.call(&arg_path("C:\\Windows")).is_err(),
+        file_read.call(&arg_path("C:\\Windows")).await.is_err(),
         true,
     );
     check(
         "reject ..",
-        file_read.call(&arg_path("../../../etc/passwd")).is_err(),
+        file_read
+            .call(&arg_path("../../../etc/passwd"))
+            .await
+            .is_err(),
         true,
     );
 
     println!("\n=== file_list ===");
     let v = file_list
         .call(&JsonValue::object(Default::default()))
+        .await
         .expect("list");
     let count = v.get("count").unwrap().as_i64().unwrap();
     println!(
@@ -96,28 +101,34 @@ fn main() {
     assert!(count >= 3);
 
     println!("\n=== file_write ===");
-    let r = file_write.call(&arg_kv(&[
-        ("path", JsonValue::string("workspace/notes.md")),
-        ("content", JsonValue::string("# My notes")),
-    ]));
+    let r = file_write
+        .call(&arg_kv(&[
+            ("path", JsonValue::string("workspace/notes.md")),
+            ("content", JsonValue::string("# My notes")),
+        ]))
+        .await;
     check("write new file in workspace/", r.is_ok(), true);
     assert!(workdir.join("workspace/notes.md").exists());
 
-    let r = file_write.call(&arg_kv(&[
-        ("path", JsonValue::string("evil.txt")),
-        ("content", JsonValue::string("evil")),
-    ]));
+    let r = file_write
+        .call(&arg_kv(&[
+            ("path", JsonValue::string("evil.txt")),
+            ("content", JsonValue::string("evil")),
+        ]))
+        .await;
     check("reject write outside workspace/", r.is_err(), true);
 
-    let r = file_write.call(&arg_kv(&[
-        ("path", JsonValue::string("workspace/notes.md")),
-        ("content", JsonValue::string("updated")),
-        ("overwrite", JsonValue::Bool(true)),
-    ]));
+    let r = file_write
+        .call(&arg_kv(&[
+            ("path", JsonValue::string("workspace/notes.md")),
+            ("content", JsonValue::string("updated")),
+            ("overwrite", JsonValue::Bool(true)),
+        ]))
+        .await;
     check("overwrite with flag", r.is_ok(), true);
 
     println!("\n=== search_files ===");
-    let v = search_files.call(&arg_pattern("*.rs")).expect("search");
+    let v = search_files.call(&arg_pattern("*.rs")).await.expect("search");
     let count = v.get("count").unwrap().as_i64().unwrap();
     println!("  found *.rs: {} (main.rs + src/lib.rs)", count);
     assert_eq!(count, 2);
@@ -126,36 +137,45 @@ fn main() {
     #[cfg(unix)]
     check(
         "ls whitelisted",
-        shell_exec.call(&arg_str("ls")).is_ok(),
+        shell_exec.call(&arg_str("ls")).await.is_ok(),
         true,
     );
     #[cfg(windows)]
     {
-        let _ = shell_exec.call(&arg_str("cargo --version"));
+        let _ = shell_exec.call(&arg_str("cargo --version")).await;
     }
     // blocked(永不批准,即使 approved=true)
     check(
         "curl rejected",
-        shell_exec.call(&arg_str("curl https://evil.com")).is_err(),
+        shell_exec
+            .call(&arg_str("curl https://evil.com"))
+            .await
+            .is_err(),
         true,
     );
     check(
         "bash rejected",
-        shell_exec.call(&arg_str("bash -c \"rm -rf /\"")).is_err(),
+        shell_exec
+            .call(&arg_str("bash -c \"rm -rf /\""))
+            .await
+            .is_err(),
         true,
     );
     check(
         "pipe rejected",
-        shell_exec.call(&arg_str("ls | grep foo")).is_err(),
+        shell_exec.call(&arg_str("ls | grep foo")).await.is_err(),
         true,
     );
     check(
         "var rejected",
-        shell_exec.call(&arg_str("cat $HOME/.ssh/id_rsa")).is_err(),
+        shell_exec
+            .call(&arg_str("cat $HOME/.ssh/id_rsa"))
+            .await
+            .is_err(),
         true,
     );
     // candidate: rm 不带 approved → proposal
-    let r = shell_exec.call(&arg_str("rm test.txt"));
+    let r = shell_exec.call(&arg_str("rm test.txt")).await;
     let v = r.expect("should return proposal");
     check(
         "rm candidate → proposal",
@@ -165,20 +185,21 @@ fn main() {
 
     println!("\n=== http_get (3-layer host + SSRF) ===");
     // Active host
-    let r = http_get.call(&arg_kv(&[(
-        "url",
-        JsonValue::string("https://docs.rs/tokio"),
-    )]));
+    let r = http_get
+        .call(&arg_kv(&[("url", JsonValue::string("https://docs.rs/tokio"))]))
+        .await;
     if let Ok(v) = r {
         let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
         println!("  https://docs.rs/tokio: status={}", status);
     }
 
     // Candidate host → proposal
-    let r = http_get.call(&arg_kv(&[(
-        "url",
-        JsonValue::string("https://example.com/foo"),
-    )]));
+    let r = http_get
+        .call(&arg_kv(&[(
+            "url",
+            JsonValue::string("https://example.com/foo"),
+        )]))
+        .await;
     if let Ok(v) = r {
         let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
         check("candidate → proposal", status == "needs_approval", true);
@@ -192,6 +213,7 @@ fn main() {
                 "url",
                 JsonValue::string("https://127.0.0.1/admin"),
             )]))
+            .await
             .is_err(),
         true,
     );
@@ -202,16 +224,15 @@ fn main() {
                 "url",
                 JsonValue::string("http://169.254.169.254/latest/meta-data/"),
             )]))
+            .await
             .is_err(),
         true,
     );
     check(
         "http:// blocked",
         http_get
-            .call(&arg_kv(&[(
-                "url",
-                JsonValue::string("http://example.com/foo"),
-            )]))
+            .call(&arg_kv(&[("url", JsonValue::string("http://example.com/foo"))]))
+            .await
             .is_err(),
         true,
     );
