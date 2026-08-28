@@ -53,6 +53,8 @@ evo-agent 支持三种认证方式，按优先级递减：
 | **Query Parameter** | `?token=<token>` | SSE 端点、WebSocket（浏览器 EventSource 不支持自定义 Header） |
 | **环境变量** | `EVORULE_AUTH_TOKEN` | evorule-server 内部调用 |
 
+客户端侧（evo-agent 作为 evorule-server 调用方）的 token 解析：`EVORULE_SERVICE_TOKEN`（service 身份，可写受保护域 `stable.llm`/`stable.system`）优先，缺省回退 `EVORULE_AUTH_TOKEN`（user 身份，受保护域写入将被 server 以 403 拒绝并走 best-effort warn 链路）。
+
 ### Token 轮换
 
 支持无缝 token 轮换：

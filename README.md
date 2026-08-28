@@ -370,7 +370,7 @@ port = 8081
 
 两个 client（`EvoruleApiClient` + `WorkspaceApiClient`）共享 `ApiCore`（base_url + reqwest Client + Bearer auth），统一错误为 `ApiError`。
 
-认证使用 `EVORULE_AUTH_TOKEN` 环境变量，构造时读取；开发模式下（token 缺失）不发 auth header。
+认证 token 构造时读取：`EVORULE_SERVICE_TOKEN`（service 身份，可写受保护域 `stable.llm`/`stable.system`）优先，缺省回退 `EVORULE_AUTH_TOKEN`（user 身份）；均缺失时不发 auth header（server 须为 dev mode）。
 
 ---
 

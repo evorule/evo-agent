@@ -31,14 +31,17 @@ pub struct ApiCore {
     base_url: String,
     client: Client,
     /// Optional Bearer token for HTTP API auth.
-    /// Read from `EVORULE_AUTH_TOKEN` env var at construction time.
+    /// B5-server：`EVORULE_SERVICE_TOKEN` 优先，缺省回退 `EVORULE_AUTH_TOKEN`。
     auth_token: Option<String>,
 }
 
 impl ApiCore {
     /// Create new API core.
-    /// If `EVORULE_AUTH_TOKEN` env var is set, use it as Bearer token.
-    /// Otherwise, send no auth header (server must be in dev mode / no auth).
+    /// B5-server 双 token 解析：`EVORULE_SERVICE_TOKEN`（service 身份，可写
+    /// 受保护域 `stable.llm` / `stable.system`）优先；未设置时回退
+    /// `EVORULE_AUTH_TOKEN`（user 身份，受保护域写入将被 server 以 403 拒绝，
+    /// 调用侧走既有 best-effort warn 链路——行为退化可观测、不崩溃）。
+    /// 均未设置时，发送无认证请求（server 须为 dev mode / no auth）。
     pub fn new(base_url: &str) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -46,9 +49,10 @@ impl ApiCore {
             .build()
             .expect("Failed to build HTTP client");
 
-        let auth_token = std::env::var("EVORULE_AUTH_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let auth_token = resolve_auth_token(
+            std::env::var("EVORULE_SERVICE_TOKEN").ok(),
+            std::env::var("EVORULE_AUTH_TOKEN").ok(),
+        );
 
         Self {
             base_url: base_url.to_string(),
@@ -96,5 +100,45 @@ impl ApiCore {
         }
 
         Ok(())
+    }
+}
+
+/// B5-server：双 token 解析——service 优先，缺省回退 user；均缺失/为空则 None。
+///
+/// 独立成纯函数以便单测（避免测试中改动进程级 env）。
+fn resolve_auth_token(service: Option<String>, user: Option<String>) -> Option<String> {
+    service
+        .filter(|s| !s.is_empty())
+        .or_else(|| user.filter(|s| !s.is_empty()))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn test_resolve_auth_token_service_takes_precedence() {
+        let token = resolve_auth_token(
+            Some("svc".to_string()),
+            Some("user".to_string()),
+        );
+        assert_eq!(token.as_deref(), Some("svc"));
+    }
+
+    #[test]
+    fn test_resolve_auth_token_fallback_and_empty_filter() {
+        // service 缺失 → 回退 user
+        let token = resolve_auth_token(None, Some("user".to_string()));
+        assert_eq!(token.as_deref(), Some("user"));
+        // service 为空串视为缺失 → 回退 user
+        let token = resolve_auth_token(Some(String::new()), Some("user".to_string()));
+        assert_eq!(token.as_deref(), Some("user"));
+        // 均缺失 / 均为空 → None（dev mode，无 auth header）
+        assert_eq!(resolve_auth_token(None, None), None);
+        assert_eq!(
+            resolve_auth_token(Some(String::new()), Some(String::new())),
+            None
+        );
     }
 }

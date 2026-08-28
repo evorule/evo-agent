@@ -203,7 +203,7 @@ DAG(有向无环图)拓扑编排多 agent,用 JSON DSL 定义:
 
 **桥接流程**(`AgentRunner::from_definition`,`src/agent/runner.rs:427-`):
 1. `AgentDefinitionManager::load("researcher")` 加载 JSON
-2. 构造 `EvoruleApiClient`(默认 `EVORULE_AUTH_TOKEN` 环境变量)
+2. 构造 `EvoruleApiClient`(token 解析: `EVORULE_SERVICE_TOKEN` 优先, 缺省回退 `EVORULE_AUTH_TOKEN`)
 3. `default_safe_toolkit(workdir)` 装 6 个工具
 4. `AgentRunner::from_definition(def, client, tool_handler)` 一步组装
 5. 早失败校验:`def.tools` 全部已在 `tool_handler` 注册(否则 `Err`)
