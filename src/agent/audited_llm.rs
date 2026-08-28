@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
+use crate::api::api_core::ApiError;
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::io_handler::IoHandler;
 use crate::io_handlers::LlmHandler;
@@ -49,6 +50,67 @@ use evorule_tcb::JsonValue;
 /// 主流程 step_timeout 默认量级参考；摘要类调用输入较大，取 90s。
 /// 该超时作用于每个等待点（HTTP 请求 / 下一个事件），并非全周期硬上限。
 pub const DEFAULT_AUDITED_CALL_TIMEOUT_SECS: u64 = 90;
+
+/// F2（audit-chain 专项 2026-08-28）：建链阶段（create_session / subscribe_events）
+/// 对瞬态错误的有界重试次数。语义为"审计链缺段比多一次请求更贵"——连接类
+/// 抖动不应直接造成审计链缺失。命令提交与事件回路阶段**不重试**（避免 LLM
+/// 重复执行副作用，保持既有 fail-fast 语义）。
+pub const SIDECAR_SETUP_RETRIES: u32 = 1;
+
+/// 建链重试间隔
+const SIDECAR_SETUP_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// 建链阶段瞬态错误判定
+///
+/// - HTTP 语义错误：仅 5xx 视为瞬态（服务端暂态故障）；4xx（认证失败、
+///   路径错误等）重试不会成功，不重试；
+/// - 连接类错误（`HttpError`：连接拒绝 / DNS / 超时）与响应格式异常
+///   （`InvalidResponse` / `SerializationError`）视为瞬态。
+fn is_transient_setup_error(err: &ApiError) -> bool {
+    match err {
+        ApiError::ApiError { status, .. } => *status >= 500,
+        ApiError::SessionNotFound | ApiError::InvalidVersion(_) => false,
+        ApiError::HttpError(_) | ApiError::InvalidResponse | ApiError::SerializationError(_) => true,
+    }
+}
+
+/// 建链步骤的统一包装：整体超时 + 瞬态错误有界重试（F2）
+///
+/// 重试发生时 `warn!` 留痕——重试本身也是审计信息（调用方 best-effort
+/// 语义可在日志侧看到"曾经历 N 次建链尝试"）。
+async fn setup_with_retry<T, F, Fut>(
+    deadline: Duration,
+    mut op: F,
+    step: &str,
+    purpose: &str,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ApiError>>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match tokio::time::timeout(deadline, op()).await {
+            Err(_) => {
+                if attempt <= SIDECAR_SETUP_RETRIES {
+                    warn!(purpose, step, attempt, "audited_llm: setup timed out, retrying");
+                    tokio::time::sleep(SIDECAR_SETUP_RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(format!(
+                    "audited_llm[{purpose}]: timed out {step} (after {attempt} attempts)"
+                ));
+            }
+            Ok(Err(e)) if is_transient_setup_error(&e) && attempt <= SIDECAR_SETUP_RETRIES => {
+                warn!(purpose, step, attempt, error = %e, "audited_llm: setup transient error, retrying");
+                tokio::time::sleep(SIDECAR_SETUP_RETRY_DELAY).await;
+            }
+            Ok(Err(e)) => return Err(format!("audited_llm[{purpose}]: {step}: {e}")),
+            Ok(Ok(v)) => return Ok(v),
+        }
+    }
+}
 
 /// 审计链内 LLM 执行器 —— 把"影子调用"迁入 evorule fact 流程
 #[derive(Debug, Clone)]
@@ -88,17 +150,19 @@ impl AuditedLlm {
     pub async fn execute(&self, purpose: &str, params: &JsonValue) -> Result<JsonValue, String> {
         let deadline = Duration::from_secs(self.timeout_secs);
 
-        // 1. 一次性 sidecar 会话
-        let session_id = tokio::time::timeout(deadline, self.client.create_session(None))
-            .await
-            .map_err(|_| format!("audited_llm[{purpose}]: timed out creating session"))?
-            .map_err(|e| format!("audited_llm[{purpose}]: create_session: {e}"))?;
+        // 1. 一次性 sidecar 会话（F2：瞬态错误有界重试，语义错误直接失败）
+        let session_id =
+            setup_with_retry(deadline, || self.client.create_session(None), "create_session", purpose)
+                .await?;
 
         // 2. 必须先订阅再提交命令（broadcast 通道不重放历史，与主循环同因）
-        let mut events = tokio::time::timeout(deadline, self.client.subscribe_events(&session_id))
-            .await
-            .map_err(|_| format!("audited_llm[{purpose}]: timed out subscribing events"))?
-            .map_err(|e| format!("audited_llm[{purpose}]: subscribe_events: {e}"))?;
+        let mut events = setup_with_retry(
+            deadline,
+            || self.client.subscribe_events(&session_id),
+            "subscribe_events",
+            purpose,
+        )
+        .await?;
 
         // 3. 提交 call_external 命令 —— prompt 经命令事实进入审计链
         let command = build_call_external_command(purpose, params)?;
@@ -319,6 +383,102 @@ mod tests {
         events_mock.assert_async().await;
         command_mock.assert_async().await;
         io_response_mock.assert_async().await;
+    }
+
+    /// F2 回归：create_session 返回 5xx（瞬态）→ 重试 1 次后成功，
+    /// 全协议走通；且重试请求确实发出（第一个 mock 命中 1 次）。
+    #[tokio::test]
+    async fn test_execute_retries_create_session_on_transient_error() {
+        let mut server = mockito::Server::new_async().await;
+        let audited = AuditedLlm::new(
+            EvoruleApiClient::new(&server.url()),
+            LlmHandler::mock(r#"{"content":"ok"}"#),
+        );
+
+        // 第一次：500 瞬态错误；第二次：成功（mockito 按注册顺序匹配）
+        let create_fail = server
+            .mock("POST", "/api/sessions")
+            .with_status(503)
+            .with_body("server busy")
+            .create_async()
+            .await;
+        let create_ok = server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"session_id":91}"#)
+            .create_async()
+            .await;
+        let sse = concat!(
+            "data: {\"type\":\"IoRequest\",\"id\":7}\n\n",
+            "data: {\"type\":\"Stable\"}\n\n"
+        );
+        let events_mock = server
+            .mock("GET", "/api/sessions/91/events")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create_async()
+            .await;
+        let command_mock = server
+            .mock("POST", "/api/sessions/91/command")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        let io_response_mock = server
+            .mock("POST", "/api/sessions/91/io_response")
+            .match_body(mockito::Matcher::PartialJson(json!({"request_id": 7})))
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let params = tcb(&json!({
+            "model": "mm",
+            "temperature": 0.0,
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        let result = audited.execute("summarize", &params).await.unwrap();
+        assert!(result.to_string().contains("ok"));
+
+        create_fail.assert_async().await;
+        create_ok.assert_async().await;
+        events_mock.assert_async().await;
+        command_mock.assert_async().await;
+        io_response_mock.assert_async().await;
+    }
+
+    /// F2 对照：create_session 返回 4xx（语义错误）→ 不重试，一次即失败。
+    #[tokio::test]
+    async fn test_execute_no_retry_on_semantic_error() {
+        let mut server = mockito::Server::new_async().await;
+        let audited = AuditedLlm::new(
+            EvoruleApiClient::new(&server.url()),
+            LlmHandler::mock(r#"{"content":"unused"}"#),
+        );
+
+        let create_reject = server
+            .mock("POST", "/api/sessions")
+            .with_status(401)
+            .with_body("unauthorized")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let params = tcb(&json!({
+            "model": "mm",
+            "temperature": 0.0,
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        let err = audited.execute("summarize", &params).await.unwrap_err();
+        assert!(
+            err.contains("create_session"),
+            "错误信息应指明建链阶段: {err}"
+        );
+        assert!(!err.contains("attempts"), "语义错误不应显示重试次数: {err}");
+
+        create_reject.assert_async().await;
     }
 
     /// 流在 Stable 前关闭 → 如实报错（不留悬挂等待）
