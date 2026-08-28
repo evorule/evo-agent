@@ -259,18 +259,30 @@ async fn rollup_old_summaries(
     // L-3 修复：标记被合并的旧摘要为 rolled_up，
     // 使其从 server 端 facts_by_path_prefix 查询结果中过滤，
     // 避免下次仍计入阈值、反复 rollup 造成共享空间膨胀。
-    // best-effort：失败仅记日志，不阻断会话返回。
+    // best-effort：失败不阻断会话返回。
+    // F4（audit-chain 专项 2026-08-28）：失败重试 1 次——标记缺失会导致
+    // 同批旧摘要下轮再次 rollup（浪费 + 审计噪声），一次重试可消除大部分
+    // 瞬态错误造成的重复合并；仍失败才 warn（现状语义保留）。
     if !rolled_fact_ids.is_empty() {
-        if let Err(e) = deps
+        let mut marked = deps
             .memory
             .evorule_client
             .mark_shared_facts_rollup(&rolled_fact_ids)
             .await
-        {
+            .is_ok();
+        if !marked {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            marked = deps
+                .memory
+                .evorule_client
+                .mark_shared_facts_rollup(&rolled_fact_ids)
+                .await
+                .is_ok();
+        }
+        if !marked {
             tracing::warn!(
                 ids = ?rolled_fact_ids,
-                error = %e,
-                "sediment: mark old summaries as rolled_up failed (best-effort)"
+                "sediment: mark old summaries as rolled_up failed after retry (best-effort) — 同批旧摘要下轮可能再次 rollup"
             );
         }
     }
