@@ -7,17 +7,16 @@
 //! 接入加载期：资产（或其 sidecar 标注层）反序列化后先过 jsonschema 全量校验，
 //! 再进入业务门卫（`AgentDefinition::validate` 等）。
 //!
-//! ## Schema 来源与降级策略
+//! ## Schema 来源与 fail-fast 策略（审计⑥ C12）
 //!
 //! 查找顺序：
 //! 1. `EVORULE_SYSTEM_RULES` 环境变量指向的仓根
 //! 2. 可执行文件向上 ancestor 中的 `evorule-system-rules/schemas`（兄弟目录约定）
 //!
-//! 都找不到时返回 `None`——调用方以 tracing::warn! 记录一次并**继续用仅业务
-//! 门卫的降级模式**。这是刻意设计：schema 校验是治理增强，不应让未检出宪法仓
-//! 的部署环境无法运行 agent；但降级必须留下可见日志，不做静默。
-//!
-//! struct 级门卫（取值范围、标识符白名单）不受此影响，始终生效。
+//! 都找不到时**拒绝加载资产（fail-fast）**,错误消息给出自助修复指引。
+//! 早期为"降级为仅业务门卫"的放行设计,审计⑥判定为治理缺口:门禁缺失
+//! 意味着资产未经宪法 schema 校验就进入运行时,对确定性执行不可接受。
+//! struct 级门卫（取值范围、标识符白名单）不受此影响,始终生效。
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -174,25 +173,38 @@ fn shelve(body: &serde_json::Value, kind: &str, schema_url: &str) -> serde_json:
     serde_json::Value::Object(doc)
 }
 
-/// 用 agent_def v1.0 校验裸文档（无壳 body）。找不到 schema 时 Ok(())（降级）。
+/// 用 agent_def v1.0 校验裸文档（无壳 body）。schema 不可用时 fail-fast 报错。
 pub fn validate_agent_def(body: &serde_json::Value) -> Result<(), Vec<String>> {
     validate_with(
         &shelve(body, "agent_def", "https://evorule.org/schemas/agent_def/v1.0.json"),
         compile_schema(&AGENT_DEF_SCHEMA, "agent_def/v1.0.json", "agent_def"),
+        "agent_def",
     )
 }
 
-/// 用 workflow_dag v1.0 校验裸文档（无壳 body）。找不到 schema 时 Ok(())（降级）。
+/// 用 workflow_dag v1.0 校验裸文档（无壳 body）。schema 不可用时 fail-fast 报错。
 pub fn validate_workflow_dag(body: &serde_json::Value) -> Result<(), Vec<String>> {
     validate_with(
         &shelve(body, "workflow_dag", "https://evorule.org/schemas/workflow_dag/v1.0.json"),
         compile_schema(&WORKFLOW_DAG_SCHEMA, "workflow_dag/v1.0.json", "workflow_dag"),
+        "workflow_dag",
     )
 }
 
-fn validate_with(doc: &serde_json::Value, schema: Option<&JSONSchema>) -> Result<(), Vec<String>> {
+fn validate_with(
+    doc: &serde_json::Value,
+    schema: Option<&JSONSchema>,
+    kind_label: &str,
+) -> Result<(), Vec<String>> {
     let Some(schema) = schema else {
-        return Ok(()); // 降级模式：仅有 struct 门卫
+        // C12 fail-fast（审计⑥）: schema 缺失不再降级放行——门禁缺失意味着
+        // 资产未经宪法校验就进入运行时。错误消息按系统自愈原则给出修复步骤。
+        return Err(vec![format!(
+            "constitution schema ({kind_label}) unavailable — refusing to load asset \
+             without schema-level validation. Fix: (1) set EVORULE_SYSTEM_RULES to the \
+             evorule-system-rules repo root, or (2) checkout evorule-system-rules as a \
+             sibling directory of the executable; then restart."
+        )]);
     };
     // jsonschema 0.18 API:JSONSchema::validate -> Result<(), ErrorIterator<ValidationError>>
     match schema.validate(doc) {
@@ -246,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_validate_agent_def_rejects_bad_temperature_when_schema_available() {
-        // 仅当能找到宪法仓时本测试才有意义；否则降级路径恒 Ok，跳过断言
+        // 仅当能找到宪法仓时本测试才有意义；schema 不可用时走 fail-fast 分支（见下）
         let Some(_) = locate_schemas_dir() else { return };
         let bad = serde_json::json!({
             "agent_type": "x", "version": "1", "description": "", "system_prompt": "s",
@@ -254,6 +266,24 @@ mod tests {
             "step_timeout_secs": 1, "tools": []
         });
         assert!(validate_agent_def(&bad).is_err());
+    }
+
+    /// C12 fail-fast: schema 不可用时必须拒绝加载（不再降级放行 Ok）。
+    /// 测试环境难注入"schema 必不可见"（OnceLock 全局 + exe 路径固定），
+    /// 故以 locate 失败分支反证：locate None ⇒ validate 必 Err 且含修复指引。
+    #[test]
+    fn test_validate_fails_fast_when_schema_unavailable() {
+        if locate_schemas_dir().is_some() {
+            eprintln!("schemas dir located — fail-fast branch not reachable here, skipped");
+            return;
+        }
+        let ok = serde_json::json!({
+            "agent_type": "x", "version": "1", "description": "", "system_prompt": "s",
+            "model": "m", "temperature": 0.3, "max_steps": 1,
+            "step_timeout_secs": 1, "tools": []
+        });
+        let err = validate_agent_def(&ok).expect_err("fail-fast must reject when schema unavailable");
+        assert!(err[0].contains("EVORULE_SYSTEM_RULES"), "错误须含修复指引: {err:?}");
     }
 
     #[test]
