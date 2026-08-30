@@ -478,18 +478,26 @@ evo-agent/
 ├── README.md
 ├── CHANGELOG.md
 ├── LICENSE
+├── NOTICE.md                        # 许可与依赖声明
+├── verify.ps1                       # 一键验证（build/test/防泄漏/布局断言）
 ├── agents/                          # Agent 定义
 │   ├── general.json
 │   ├── researcher.json
 │   └── rule-copilot.json
+├── config-examples/                 # 配置示例
+├── docs/
+│   ├── API.md
+│   ├── RELEASE_PROCESS.md           # 发布流程
+│   └── security/                    # 安全设计文档
 ├── src/
-│   ├── lib.rs                       # 入口 + 公共导出
+│   ├── lib.rs                       # 入口 + 公共契约面登记
 │   ├── config.rs                    # 4 层配置加载
 │   ├── json_convert.rs              # serde ↔ tcb::JsonValue 转换
 │   ├── io_handler.rs                # I/O handler 基类 trait
 │   ├── io_dispatcher.rs             # I/O 分发器
 │   ├── agent/
 │   │   ├── runner.rs                # ReAct 主循环
+│   │   ├── audited_llm.rs           # 审计链内 LLM 执行桥（sidecar 会话协议）
 │   │   ├── memory.rs                # 三层记忆管理
 │   │   ├── memory_event/            # 结构化记忆事件 + 因果链 + 回放
 │   │   │   ├── entity.rs            #   实体定义
@@ -534,10 +542,10 @@ evo-agent/
 │   │   ├── rule_tools.rs            #   rule CRUD 12 个
 │   │   ├── translate_tools.rs       #   规则转换 3 个
 │   │   ├── audit_tools.rs           #   审计 3 个
-│   │   ├── sandbox_tools.rs         #   沙盒 6 个
-│   │   ├── dataset_tools.rs         #   数据集 4 个
-│   │   ├── publish_tools.rs         #   发布 4 个
-│   │   ├── production_tools.rs      #   生产 4 个
+│   │   ├── sandbox_tools.rs         #   沙盒 5 个
+│   │   ├── dataset_tools.rs         #   数据集 2 个
+│   │   ├── publish_tools.rs         #   发布 5 个
+│   │   ├── production_tools.rs      #   生产 2 个
 │   │   └── mod.rs
 │   ├── mcp/                         # MCP 客户端
 │   │   ├── client.rs                #   JSON-RPC 2.0 客户端
@@ -551,14 +559,15 @@ evo-agent/
 │   └── bin/
 │       └── evo-agent.rs             # CLI 入口
 └── tests/
-    └── integration_test.rs          # mockito 端到端测试
+    ├── integration_test.rs          # mockito 端到端测试
+    └── llm_real_smoke.py            # 真实 LLM 冒烟脚本
 ```
 
 ---
 
 ## 当前状态 / 已知限制
 
-基于 2026-08 完成度核查（`文档/04.核查报告复核.md`、`文档/05.P1跨仓阻塞核查.md`、`文档/06.call_external修复记录.md`）：
+基于 2026-08 完成度核查：
 
 **已就绪（曾被报告误判为"未修"的项）**
 
@@ -575,7 +584,7 @@ evo-agent/
 | 项 | 状态 | 说明 |
 |----|------|------|
 | 集群协作（E2 / cluster） | ❌ 设计移除 | 多 reactor 协作原语已移出机制层，定位为应用层功能；evorule-server 路由已无 cluster 端点 |
-| Runner 拆分（Phase 2） | ⏳ | `runner.rs` 仍为约 2770 行单文件，未拆为子模块 |
+| Runner 拆分（Phase 2） | ⏳ | `runner.rs` 仍为约 2600 行单文件，未拆为子模块 |
 | UI 联调 | ⏳ | 无前端联调，本轮仅后端 + CLI 验证 |
 | 编译告警 | ⚠️ | 主体为 `missing_docs`；另有少量 clippy 代码质量 lint 待清理 |
 | `.workbuddy/` 未忽略 | ⚠️ | 当前未加入 `.gitignore`，有误入版本库风险，建议忽略 |
@@ -585,8 +594,8 @@ evo-agent/
 ## 依赖关系
 
 ```toml
-evorule-tcb = "0.2"           # 反应式执行内核（JsonValue / Fact / 因果链）
-evorule-reactor = "0.2"       # 反应器 + FactsLog + WAL
+evorule-tcb = "0.3"           # 反应式执行内核（JsonValue / Fact / 因果链）— path 依赖
+evorule-reactor = "0.3"       # 反应器 + FactsLog + WAL — path 依赖
 
 reqwest = "0.12"              # HTTP 客户端
 axum = "0.8"                  # HTTP 服务（含 WebSocket）
@@ -605,8 +614,8 @@ rustyline = "14"              # REPL 行编辑
 
 ## 相关项目
 
-- [evorule](https://gitee.com/evo-rule-lab/evorule) — 反应式执行引擎（tier0/tier1/tier2）
-- [evorule-server](https://gitee.com/evo-rule-lab/evorule-server) — HTTP 服务 + Workspace + 沙盒 + 发布队列
+- [evorule](https://gitee.com/evorule/evorule) — 反应式执行引擎（tier0/tier1/tier2）
+- [evorule-server](https://gitee.com/evorule/evorule-server) — HTTP 服务 + Workspace + 沙盒 + 发布队列
 
 ---
 
