@@ -115,6 +115,12 @@ impl LlmHandler {
         }
     }
 
+    /// G3:覆盖最大重试次数（builder 风格；契约测试用 0 关闭重试避免退避延迟）
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
     /// Create LLM handler with default config
     ///
     /// Priority: MiniMax > DeepSeek > OpenAI

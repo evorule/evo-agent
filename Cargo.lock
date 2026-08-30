@@ -573,7 +573,6 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "blake3",
  "bytes",
  "clap",
  "evorule-reactor",

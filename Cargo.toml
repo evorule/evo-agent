@@ -35,8 +35,6 @@ prometheus = "0.13"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 bytes = "1"
 
-blake3 = "1"
-
 # G3: LLM 重试退避抖动所需
 rand = "0.8"
 

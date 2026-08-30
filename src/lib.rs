@@ -6,17 +6,38 @@
 #![warn(unused_variables)]
 #![warn(missing_docs)]
 
-//! Evo-Agent 鈥斺€?AI Agent 缂栨帓灞傦紝閫氳繃 evorule HTTP API 瀹炵幇瀹屾暣鐨?Fact 闂幆
+//! Evo-Agent —— AI Agent 编排层，通过 evorule HTTP API 实现完整的 Fact 闭环
+//!
+//! # 公共契约面（生态公共设施专项 2026-08-30）
+//!
+//! 下游（数据治理系统、console 等）只应依赖以下契约项；它们受 semver 约束
+//! （0.x 阶段 breaking 变更必须升 minor 并记 CHANGELOG）：
+//!
+//! - [`io_handlers::LlmHandler`] / [`io_handlers::StreamChunk`] / [`io_handlers::ToolHandler`]
+//!   —— LLM/工具执行层（OpenAI 兼容，env 优先级 MiniMax > DeepSeek > OpenAI）
+//! - [`agent::audited_llm::AuditedLlm`] —— 审计链内 LLM 执行桥（一次性 sidecar 会话协议）
+//! - [`api::evorule_client::EvoruleApiClient`] 与 [`api::api_core::ApiError`] —— server HTTP 客户端
+//! - [`io_handler::IoHandler`] —— IO 执行器 trait（AuditedLlm 签名依赖）
+//! - [`config`] —— 配置加载（`LlmHandler::from_config` 构造契约）
+//!
+//! 其余模块（builtin_tools / mcp / rule_tools / io_dispatcher / json_convert /
+//! metrics）标注 `#[doc(hidden)]`：技术上仍可访问（真收窄留待 0.2.0），
+//! 但不在兼容承诺范围内，依赖它们的风险自负。
 
 pub mod agent;
 pub mod api;
+#[doc(hidden)]
 pub mod builtin_tools;
 pub mod config;
+#[doc(hidden)]
 pub mod io_dispatcher;
 pub mod io_handler;
 pub mod io_handlers;
+#[doc(hidden)]
 pub mod json_convert;
+#[doc(hidden)]
 pub mod mcp;
+#[doc(hidden)]
 pub mod rule_tools;
 
 /// P2-V3 止血（2026-08-27）：审计链旁路调用的全局指标桥
@@ -28,6 +49,7 @@ pub mod rule_tools;
 /// runner/agent 层代码应通过 [`crate::metrics::bypass_audit`] 上报，
 /// 应用入口（main/binary）负责在启动时安装真实回调：
 /// `crate::metrics::set_bypass_audit_hook(...)`
+#[doc(hidden)]
 pub mod metrics {
     use std::sync::Arc;
 

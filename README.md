@@ -35,7 +35,7 @@
 | **会话沉淀** | 会话结束时自动写入摘要 + 稳定事实到共享空间 |
 | **工具注册中心** | `ToolRegistry` + `ToolFunction` trait，任何 `async fn(JsonValue) -> Result<JsonValue, String>` 都能注册 |
 | **3 层安全模型** | active（白名单）/ candidate（待批）/ blocked（永不），含 SSRF 防护 + 工作目录沙箱 |
-| **规则管理工具集** | 34 个工具：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 6 + dataset 4 + publish 4 |
+| **规则管理工具集** | 34 个工具：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 |
 | **工作流引擎** | DAG 拓扑编排多 Agent，同层并行 + 跨层串行 + 模板渲染 |
 | **MCP 客户端** | 接入 Model Context Protocol 工具生态（stdio 传输） |
 | **上下文窗口管理** | 按 token 数裁剪历史消息，保留 system + 最近若干轮 |
@@ -90,13 +90,36 @@ Evo-Agent 是独立的应用层，通过 HTTP API 与 evorule 引擎对话：
 - 运行中的 evorule-server（默认 `http://127.0.0.1:18080`）
 - LLM provider 的 API key
 
+### 源码布局契约
+
+本仓以 **path 依赖**引用 evorule 核心库，因此源码构建要求与主仓**并排检出**（缺少该布局时 `cargo build` 无法解析依赖）：
+
+```text
+parent-dir/
+├── evo-agent/          # 本仓
+└── evorule/            # 主仓（提供 evorule-tcb / evorule-reactor）
+```
+
+- 该约束仅在**从源码构建**时存在；通过预编译产物或 Docker 镜像使用时无此要求。
+- 未来 evorule-tcb / evorule-reactor 发布到 crates.io 后，本仓将切换为版本依赖，
+  此布局契约随之解除（规划中，见 CHANGELOG / 台账）。
+
 ### 启动 evorule-server
 
 ```bash
 cd ../evorule-server
 cargo build --release
+
+# 基础启动（审计 / 记忆 / 时间机器 / 规则热重载）
 ./target/release/evorule-server --addr 127.0.0.1:18080 --wal-dir ./data/wal
+
+# 若需 rule-copilot / general / researcher 通过 call_external 调用外部服务，
+# 必须额外挂载服务注册表并放行本机回环（详见 evorule-server/README.md）：
+./target/release/evorule-server --addr 127.0.0.1:18080 --wal-dir ./data/wal \
+  --service-registry ./service_registry.json --allow-loopback
 ```
+
+> 角色 1/3（`call_external`）在 evorule-server 侧已就绪：挂载 `service_registry.json` 后即可跑通。仓库内置 `echo_server.py` + `dev-start.sh` 演示环境，参考 evorule-server 实战指南。
 
 ### 启动 Evo-Agent HTTP API
 
@@ -298,10 +321,10 @@ Agent 配置从 `agents/{type}.json` 加载：
 | rule | 12 | rule_list, rule_get, rule_create, rule_update, rule_versions, rule_version_get, rule_submit, rule_activate, rule_block, rule_archive, rule_fork, rule_reload |
 | translate | 3 | rule_to_transform, rule_to_conditional, rule_validate |
 | audit | 3 | audit_get, audit_verify, session_rewind |
-| sandbox | 6 | 沙盒编排（fork + 合成数据 + 测试报告） |
-| dataset | 4 | 数据集管理 |
-| publish | 4 | 发布队列 + 三级权限 |
-| production | 4 | 生产环境管理 |
+| sandbox | 5 | 沙盒编排（fork + 合成数据 + 测试报告） |
+| dataset | 2 | 数据集管理 |
+| publish | 5 | 发布队列 + 三级权限 |
+| production | 2 | 生产环境管理 |
 
 ### MCP 工具接入
 
@@ -532,6 +555,32 @@ evo-agent/
 ```
 
 ---
+
+## 当前状态 / 已知限制
+
+基于 2026-08 完成度核查（`文档/04.核查报告复核.md`、`文档/05.P1跨仓阻塞核查.md`、`文档/06.call_external修复记录.md`）：
+
+**已就绪（曾被报告误判为"未修"的项）**
+
+| 项 | 状态 | 说明 |
+|----|------|------|
+| 共享事实广播（原 L-1） | ✅ | evorule-server `session_payload` handler 已实现 `shared.*` → `SharedFactsLog::append` 广播 |
+| rollup 标记（原 L-3） | ✅ | evo-agent `mark_shared_facts_rollup` + server 端点均就绪，`facts_by_path_prefix` 过滤 `rolled_up` |
+| 共享路径格式（L-2）/ 上下文窗口字段（L-4）/ sediment 写入前缀（L-6） | ✅ | evo-agent 侧均已修复，与 recall 三前缀完全匹配 |
+| 记忆召回顺序（C2） | ✅ | `runner.rs` 已修复：recall 在 `build_system_prompt` 之前 |
+| 角色 1/3 `call_external` | ✅ | evorule-server 侧就绪，挂载 `service_registry.json` + `--allow-loopback` 即可跑通（已端到端验证） |
+
+**仍未完成 / 设计取舍**
+
+| 项 | 状态 | 说明 |
+|----|------|------|
+| 集群协作（E2 / cluster） | ❌ 设计移除 | 多 reactor 协作原语已移出机制层，定位为应用层功能；evorule-server 路由已无 cluster 端点 |
+| Runner 拆分（Phase 2） | ⏳ | `runner.rs` 仍为约 2770 行单文件，未拆为子模块 |
+| UI 联调 | ⏳ | 无前端联调，本轮仅后端 + CLI 验证 |
+| 编译告警 | ⚠️ | 主体为 `missing_docs`；另有少量 clippy 代码质量 lint 待清理 |
+| `.workbuddy/` 未忽略 | ⚠️ | 当前未加入 `.gitignore`，有误入版本库风险，建议忽略 |
+
+> 规则管理工具集总数为 **34 个**（workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
 
 ## 依赖关系
 

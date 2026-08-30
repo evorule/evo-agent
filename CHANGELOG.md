@@ -34,6 +34,33 @@
 
 ---
 
+## [Unreleased]
+
+### 🆕 新增
+
+#### 生态公共设施化（公共契约面 + 契约测试 + 治理文档）
+- **公共契约面显式登记** — crate 级文档新增"公共契约面"章节：`LlmHandler`/`StreamChunk`/`ToolHandler` +
+  `AuditedLlm` + `EvoruleApiClient`/`ApiError` + `IoHandler` + `config` 受 semver 约束
+  （0.x 内 breaking 必须升 minor）；内部模块（builtin_tools/mcp/rule_tools/io_dispatcher/json_convert/metrics）
+  标注 `#[doc(hidden)]`，真收窄留待 0.2.0
+- **审计桥契约测试 +3** — 协议常量锁定（90s 超时/建链重试 1 次，防无声变更）、
+  `is_transient_setup_error` 全分支（真实错误实例）、
+  LLM 失败 → 错误回写 io_response 不留悬空 IoRequest（回归锁定）
+- **`LlmHandler::with_max_retries`** — builder 风格重试次数覆盖（测试用 0 关闭退避延迟）
+- **`NOTICE.md`** — AGPL-3.0 + 商业双许可声明 + 生态/第三方依赖清单（对齐生态范式）
+- **`docs/RELEASE_PROCESS.md`** — 发布操作手册（git tag 形态 + crates.io 前置条件如实声明）
+- **`verify.ps1`** — 一键验证：build → test → 防泄漏扫描 → 源码布局断言
+- **README"源码布局契约"章节** — `../evorule/` path 依赖的并排检出要求与解除路径
+
+### 🔄 变更
+
+- **移除 `blake3` 直接依赖** — 零代码调用（仅文档注释提及概念），死依赖删除；
+  evorule-reactor 自身对 blake3 的依赖不受影响
+
+### 🐛 修复
+
+- **lib.rs crate 级文档 mojibake** — 门面文档乱码修复为正常中文
+
 ## [0.1.0] - 2026-07-20
 
 `evo-agent` 与 EvoRule 主线同步从 0.1.0 开始(原内部版本 1.0.0 退役)。

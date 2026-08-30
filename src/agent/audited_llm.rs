@@ -575,4 +575,92 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("create_session"), "got: {err}");
     }
+
+    // ===== 协议参数契约锁定（公共设施专项 2026-08-30：防无声变更） =====
+
+    /// 超时与建链重试次数是 sidecar 协议的显式契约（见模块 doc 与 memory 台账），
+    /// 变更必须是有意识的协议升级，此处锁定防止无声漂移。
+    #[test]
+    fn test_protocol_constants_locked() {
+        assert_eq!(DEFAULT_AUDITED_CALL_TIMEOUT_SECS, 90);
+        assert_eq!(SIDECAR_SETUP_RETRIES, 1);
+    }
+
+    /// is_transient_setup_error 全分支：
+    /// 5xx / 连接类 / 响应格式 / 序列化 → 瞬态（重试）；
+    /// 4xx / 会话类（SessionNotFound、InvalidVersion）→ 语义错误（不重试）。
+    #[tokio::test]
+    async fn test_transient_setup_error_all_branches() {
+        // 瞬态：5xx
+        assert!(is_transient_setup_error(&ApiError::ApiError {
+            status: 503,
+            message: "busy".into(),
+        }));
+        // 语义：4xx
+        assert!(!is_transient_setup_error(&ApiError::ApiError {
+            status: 401,
+            message: "unauthorized".into(),
+        }));
+        // 瞬态：连接类 / 序列化（#[from] 包装，用真实错误实例构造）
+        let http_err = reqwest::get("http://127.0.0.1:1").await.unwrap_err();
+        assert!(is_transient_setup_error(&ApiError::HttpError(http_err)));
+        let ser_err = serde_json::from_str::<serde_json::Value>("{bad").unwrap_err();
+        assert!(is_transient_setup_error(&ApiError::SerializationError(ser_err)));
+        // 瞬态：响应格式
+        assert!(is_transient_setup_error(&ApiError::InvalidResponse));
+        // 语义：会话类
+        assert!(!is_transient_setup_error(&ApiError::SessionNotFound));
+        assert!(!is_transient_setup_error(&ApiError::InvalidVersion("v-1".into())));
+    }
+
+    /// LLM 本地执行失败 → 错误写进 io_response（引擎状态机收尾，不留悬空 IoRequest），
+    /// 随后如实返回 Err。这是"LLM 失败不留悬挂 IoRequest"契约的回归测试。
+    #[tokio::test]
+    async fn test_execute_llm_failure_writes_error_io_response() {
+        let mut server = mockito::Server::new_async().await;
+        // LLM 指向不可达地址 → llm.execute 必失败
+        let failing_llm = LlmHandler::new("mm", "http://127.0.0.1:1", None).with_max_retries(0);
+
+        let audited = AuditedLlm::new(EvoruleApiClient::new(&server.url()), failing_llm);
+
+        server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"session_id":12}"#)
+            .create_async()
+            .await;
+        let sse = concat!(
+            "data: {\"type\":\"IoRequest\",\"id\":3}\n\n",
+            "data: {\"type\":\"Stable\"}\n\n"
+        );
+        server
+            .mock("GET", "/api/sessions/12/events")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/sessions/12/command")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        // 关键断言：io_response 必须被调用（错误也要回写，不能悬空）
+        let io_response_mock = server
+            .mock("POST", "/api/sessions/12/io_response")
+            .match_body(mockito::Matcher::PartialJson(json!({"request_id": 3})))
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let err = audited
+            .execute("summarize", &tcb(&json!({"messages": [{"role":"user","content":"hi"}]})))
+            .await
+            .unwrap_err();
+        assert!(err.contains("llm execute"), "错误应来自 LLM 执行: {err}");
+        io_response_mock.assert_async().await;
+    }
 }
