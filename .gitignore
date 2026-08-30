@@ -12,6 +12,9 @@ target/
 .env.*
 !.env.example
 
+# TRAE workspace files
+.trae/
+
 # 运行时数据（evorule-server 数据库等）
 data/
 
