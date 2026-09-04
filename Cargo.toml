@@ -3,8 +3,7 @@ name = "evo-agent"
 version = "0.1.0"
 edition = "2021"
 description = "Evo-Agent - AI Agent orchestration layer using evorule HTTP API"
-license = "AGPL-3.0"
-
+license = "AGPL-3.0-or-later"
 [dependencies]
 evorule-tcb = "0.3.2"
 evorule-reactor = "0.3.2"

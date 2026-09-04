@@ -101,6 +101,37 @@ impl ApiCore {
 
         Ok(())
     }
+
+    /// Check response status with full error body extraction (UV-084 W2).
+    ///
+    /// 与 `check_response` 的差异（新方法专用，既有调用不迁移）：
+    /// - 错误时读取响应 body，提取 server 统一错误格式 `{"error": "..."}`
+    ///   作为 message 透出（旧实现 message 为空串——400 校验失败详情丢失，
+    ///   LLM agent 无法自诊断修复，属静默吞错形态）；
+    /// - 404 不再特判为 `SessionNotFound`（对 knowledge/ bundles 端点误导：
+    ///   数据集未承载 ≠ 会话不存在），同样读 body 带 status 返回。
+    ///
+    /// 成功时原样返回 `Response` 供调用方继续 `resp.json()`（错误路径提前
+    /// 返回，body 已耗尽不影响——调用方 `?` 后不会再读）。
+    pub(crate) async fn check_response_full(
+        &self,
+        resp: Response,
+    ) -> Result<Response, ApiError> {
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or(serde_json::Value::Null);
+            let message = body
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or_default()
+                .to_string();
+            return Err(ApiError::ApiError { status, message });
+        }
+        Ok(resp)
+    }
 }
 
 /// B5-server：双 token 解析——service 优先，缺省回退 user；均缺失/为空则 None。
