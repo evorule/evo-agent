@@ -697,6 +697,49 @@ impl WorkspaceApiClient {
         let result: Vec<ProductionAuditRecord> = resp.json().await?;
         Ok(result)
     }
+
+    // ===== UV-084 W2：bundles 部署闭环（治理域导出，部署链上游） =====
+
+    /// POST /bundles/export — 带真实闸门一证据的导出（T0 决策：POST 承载 tests 数组）
+    ///
+    /// 闭环链路：本方法导出 DatasetBundle → 执行域 `bundle_import_dry_run`
+    /// 预检 → `bundle_import` 落盘激活。
+    ///
+    /// - `verdict="pass"` 时 `subset` 必须非空且每项以 `sandbox:<id>`（机器背书）
+    ///   或 `human:<actor>`（人工降级）开头——治理域证据形状校验（UV-080 B1），
+    ///   违反 → 400 显式错误；
+    /// - `verdict="fail"` 为显式"未验证"导出（无伪造风险，无 subset 要求）；
+    /// - `trim` 为可选裁剪视图语法（`tag:core` / `domain:tax` / `ids:id1,id2`，
+    ///   多段以 `;` 分隔，交集）。
+    ///
+    /// 走 check_response_full：证据形状校验失败的修复指引透出。
+    pub async fn export_bundle(
+        &self,
+        dataset_id: &str,
+        version: &str,
+        verdict: &str,
+        subset: Vec<String>,
+        trim: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        let url = self.core.url("/bundles/export");
+        let body = serde_json::json!({
+            "dataset_id": dataset_id,
+            "version": version,
+            "tests": {
+                "verdict": verdict,
+                "subset": subset,
+            },
+            "subset": trim,
+        });
+        let resp = self
+            .core
+            .auth_header(self.core.client().post(&url))
+            .json(&body)
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        Ok(resp.json().await?)
+    }
 }
 
 // =============================================================================

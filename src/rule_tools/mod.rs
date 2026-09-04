@@ -5,7 +5,9 @@
 //! 规则管理工具集 —— 把 WorkspaceApiClient/EvoruleApiClient 封装成 ToolFunction 工具
 
 pub mod audit_tools;
+pub mod bundle_tools;
 pub mod dataset_tools;
+pub mod knowledge_tools;
 pub mod production_tools;
 pub mod publish_tools;
 pub mod rule_tools;
@@ -27,7 +29,7 @@ pub fn rule_management_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -
     h
 }
 
-/// 组装完整规则工具集（M3：内置 20 + 沙盒/发布 14 = 34 工具）
+/// 组装完整规则工具集（M3：内置 20 + 沙盒/发布 14 + bundles/knowledge 8 = 42 工具）
 pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
     let mut h = rule_management_toolkit(ws, ev);
     translate_tools::register(&mut h, ws);
@@ -35,10 +37,12 @@ pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> Tool
     dataset_tools::register(&mut h, ws);
     publish_tools::register(&mut h, ws);
     production_tools::register(&mut h, ws);
+    bundle_tools::register(&mut h, ws, ev);
+    knowledge_tools::register(&mut h, ev);
     h
 }
 
-/// 全部规则工具 spec（34 个）
+/// 全部规则工具 spec（42 个）
 pub fn rule_tool_specs() -> Vec<ToolSpec> {
     let mut specs = Vec::new();
     specs.extend(workspace_tools::specs());
@@ -49,6 +53,8 @@ pub fn rule_tool_specs() -> Vec<ToolSpec> {
     specs.extend(dataset_tools::specs());
     specs.extend(publish_tools::specs());
     specs.extend(production_tools::specs());
+    specs.extend(bundle_tools::specs());
+    specs.extend(knowledge_tools::specs());
     specs
 }
 
@@ -59,7 +65,7 @@ mod tests {
     #[test]
     fn test_rule_tool_specs_count() {
         let specs = rule_tool_specs();
-        assert_eq!(specs.len(), 34, "expected 34 rule tool specs");
+        assert_eq!(specs.len(), 42, "expected 42 rule tool specs");
     }
 
     #[test]
@@ -174,8 +180,33 @@ mod tests {
     }
 
     #[test]
-    fn test_full_rule_toolkit_registers_all_34() {
-        // 验证 full_rule_toolkit 注册了全部 34 个工具（has_tool 逐个校验）
+    fn test_w2_bundle_knowledge_tools_in_specs() {
+        // UV-084 W2 新增的 8 个工具（bundles 部署闭环 5 + knowledge 数据面 3）
+        let specs = rule_tool_specs();
+        let spec_names: std::collections::HashSet<&str> =
+            specs.iter().map(|s| s.name.as_str()).collect();
+        let w2_tools = [
+            "bundle_export",
+            "bundle_import_dry_run",
+            "bundle_import",
+            "bundle_active_list",
+            "bundle_imports_list",
+            "knowledge_datasets",
+            "knowledge_search",
+            "knowledge_entry_get",
+        ];
+        for name in &w2_tools {
+            assert!(
+                spec_names.contains(name),
+                "W2 tool '{}' not in rule_tool_specs",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_full_rule_toolkit_registers_all_42() {
+        // 验证 full_rule_toolkit 注册了全部 42 个工具（has_tool 逐个校验）
         let ws = WorkspaceApiClient::new("http://localhost:0");
         let ev = EvoruleApiClient::new("http://localhost:0");
         let h = full_rule_toolkit(&ws, &ev);
@@ -222,8 +253,18 @@ mod tests {
             // production 2
             "prod_state",
             "prod_audit",
+            // bundles 5 (UV-084 W2)
+            "bundle_export",
+            "bundle_import_dry_run",
+            "bundle_import",
+            "bundle_active_list",
+            "bundle_imports_list",
+            // knowledge 3 (UV-084 W2)
+            "knowledge_datasets",
+            "knowledge_search",
+            "knowledge_entry_get",
         ];
-        assert_eq!(all_tools.len(), 34);
+        assert_eq!(all_tools.len(), 42);
         for name in &all_tools {
             assert!(
                 h.has_tool(name),

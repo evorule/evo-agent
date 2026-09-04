@@ -624,6 +624,159 @@ impl EvoruleApiClient {
         let result: Value = resp.json().await?;
         Ok(result)
     }
+
+    // =========================================================================
+    // UV-084 W2：bundles 部署闭环（执行域 4 端点）
+    // 全部走 check_response_full——校验失败(400)的 {"error": "..."} 详情透出，
+    // LLM agent 可自诊断修复；404 带 body 不误判为会话不存在。
+    // =========================================================================
+
+    /// POST /api/bundles/import/dry-run —— 导入预检（校验链全跑，不落盘不 reload）
+    ///
+    /// `bundle` 为治理域导出的 DatasetBundle JSON 原样对象。
+    /// 返回 `{valid, bundle_id, dataset_id, source_version, selection_mode,
+    /// resolved_version, entry_count, verdict, missing_services}`。
+    pub async fn bundle_import_dry_run(&self, bundle: &Value) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/bundles/import/dry-run");
+        let body = serde_json::json!({ "bundle": bundle });
+        let resp = self
+            .core
+            .auth_header(self.core.client().post(&url))
+            .json(&body)
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// POST /api/bundles/import —— 导入快照包并激活（破坏性：落盘 rules/bundles/ + reload）
+    ///
+    /// `bundle` 为治理域导出的 DatasetBundle JSON 原样对象。8 项校验任一失败
+    /// → 400 显式错误（message 含校验失败详情）；成功 → 201 导入结果。
+    pub async fn bundle_import(&self, bundle: &Value) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/bundles/import");
+        let body = serde_json::json!({ "bundle": bundle });
+        let resp = self
+            .core
+            .auth_header(self.core.client().post(&url))
+            .json(&body)
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// GET /api/bundles/active —— 当前激活 bundle 列表（rules/bundles/*/manifest 视图）
+    pub async fn bundle_active_list(&self) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/bundles/active");
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// GET /api/bundles/imports —— bundle 导入溯源记录（bundle_imports 表，只读审计）
+    pub async fn bundle_imports_list(&self) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/bundles/imports");
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    // =========================================================================
+    // UV-084 W2：knowledge 执行侧数据面（3 端点，只读）
+    // =========================================================================
+
+    /// GET /api/knowledge —— 已承载数据资产的数据集清单
+    pub async fn knowledge_datasets(&self) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/knowledge");
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// GET /api/knowledge/{ds}/entries?q=&domain=&tags= —— 数据集条目检索
+    ///
+    /// - `q`：包含匹配（entry_id/schema_ref/bundle_id/payload）；
+    /// - `domain`：领域精确匹配（忽略大小写）；
+    /// - `tags`：逗号分隔标签（任一命中）。
+    /// 数据集未承载 → 404 显式（区分"不存在"与"过滤后为空"）。
+    pub async fn knowledge_entries(
+        &self,
+        dataset: &str,
+        q: Option<&str>,
+        domain: Option<&str>,
+        tags: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        let mut url = format!(
+            "{}/api/knowledge/{}/entries",
+            self.core.base_url(),
+            dataset
+        );
+        let mut params: Vec<String> = Vec::new();
+        if let Some(v) = q {
+            params.push(format!("q={}", urlencode(v)));
+        }
+        if let Some(v) = domain {
+            params.push(format!("domain={}", urlencode(v)));
+        }
+        if let Some(v) = tags {
+            params.push(format!("tags={}", urlencode(v)));
+        }
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// GET /api/knowledge/{ds}/entries/{entry_id} —— 单条直取（payload 零转译原样）
+    pub async fn knowledge_entry(&self, dataset: &str, entry_id: &str) -> Result<Value, ApiError> {
+        let url = format!(
+            "{}/api/knowledge/{}/entries/{}",
+            self.core.base_url(),
+            dataset,
+            entry_id
+        );
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        Ok(resp.json().await?)
+    }
+}
+
+/// 最小百分号编码（query 参数安全；仅编码保留字与空格，字母数字与常见符号直通）
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 #[derive(Debug, Deserialize, Clone)]
