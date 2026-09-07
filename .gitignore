@@ -29,3 +29,7 @@ _design_docs/
 .workbuddy/
 _tmp_*
 
+# demo 资产（demo.ps1/demo.sh 下载的 server 包与运行日志）
+.demo/
+expenses/
+

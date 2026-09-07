@@ -2,6 +2,7 @@
 
 > 可信 AI 工作站 —— 在 evorule 确定性执行引擎之上，为开发者和企业提供基于规则约束的 AI Agent 编排层。
 
+[![CI](https://github.com/evorule/evo-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/evorule/evo-agent/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.74%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.1.0-green.svg)](Cargo.toml)
@@ -90,19 +91,35 @@ Evo-Agent 是独立的应用层，通过 HTTP API 与 evorule 引擎对话：
 - 运行中的 evorule-server（默认 `http://127.0.0.1:18080`）
 - LLM provider 的 API key
 
-### 源码布局契约
+### 5 分钟 Demo（一条命令）
 
-本仓以 **path 依赖**引用 evorule 核心库，因此源码构建要求与主仓**并排检出**（缺少该布局时 `cargo build` 无法解析依赖）：
+准备一个 MiniMax API key（或 DeepSeek），然后：
 
-```text
-parent-dir/
-├── evo-agent/          # 本仓
-└── evorule/            # 主仓（提供 evorule-tcb / evorule-reactor）
+```bash
+# Windows (PowerShell)
+$env:MINIMAX_API_KEY = "your-api-key"
+powershell -ExecutionPolicy Bypass -File demo.ps1
+
+# Linux / macOS
+export MINIMAX_API_KEY=your-api-key
+./demo.sh
 ```
 
-- 该约束仅在**从源码构建**时存在；通过预编译产物或 Docker 镜像使用时无此要求。
-- 未来 evorule-tcb / evorule-reactor 发布到 crates.io 后，本仓将切换为版本依赖，
-  此布局契约随之解除（规划中，见 CHANGELOG / 台账）。
+脚本自动完成：下载并启动 evorule-server（Gitee Release 整包，端口 18080，随机 token 认证）→ 写入项目配置 → 构建 → 跑一笔费用登记会话（LLM + 工具调用全部转为可审计 Fact）→ 调用 `audit/verify` 验证 Fact 哈希链并打印完整审计报告。完成后浏览器打开 http://localhost:18080 可查看审计页。重置：删除 `.demo/` 目录即可。
+
+### 依赖契约
+
+evorule 核心库（`evorule-tcb` / `evorule-reactor`）以 **crates.io 版本依赖**引用——clone 本仓后直接构建，无需并排检出主仓：
+
+```bash
+git clone https://gitee.com/evorule/evo-agent.git
+cd evo-agent
+cargo build          # 依赖自动从 crates.io 解析
+```
+
+- **禁止 path 依赖回流**：引擎 crate 一旦改回本地 path 引用，仓外构建即失效；
+  `verify.ps1` 第 4 步（依赖契约断言）会在发现 path 依赖时判 FAIL。
+- 运行时仍需一个可达的 evorule-server 实例（见下节）。
 
 ### 启动 evorule-server
 
