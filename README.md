@@ -23,6 +23,12 @@
 | **AI 执行器** | 通过 `call_external` 执行 LLM/工具调用，受规则约束 | `general` / `researcher` |
 | **对话管理入口** | 自然语言管理规则生命周期（创建/提交/激活/归档） | `rule-copilot` |
 
+### 30 秒看一眼
+
+![evo-agent CLI 概览](docs/evo-agent-cli.gif)
+
+*真实终端录制：`evo-agent list` / `tools show` / `validate` / `tools list` —— 6 个内置工具的 3 层安全模型（active 白名单 / candidate 待批 / blocked 永不）。*
+
 ---
 
 ## 核心特性
