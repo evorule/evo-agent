@@ -349,10 +349,40 @@ impl LlmHandler {
             .unwrap_or("")
             .to_string();
 
+        // OpenAI wire 形状 → 内部 ToolCall 形状({tool_name, args})
+        // 与流式路径(build_tool_calls / ToolCallAccumulator::to_tool_call)保持一致,
+        // 否则 handle_call_external 反序列化 LlmResponse 时必然失败
+        // (OpenAI 形状无 tool_name 字段)。arguments 是 JSON 字符串,解析为对象;
+        // 解析失败 fallback 到 {} 与流式路径行为一致。
         let tool_calls = choice
             .and_then(|c| c.get("message"))
             .and_then(|m| m.get("tool_calls"))
-            .cloned();
+            .and_then(|tc| tc.as_array())
+            .map(|arr| {
+                let normalized: Vec<serde_json::Value> = arr
+                    .iter()
+                    .filter_map(|tc| {
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            // 兼容已归一形状(直接携带 tool_name)
+                            .or_else(|| tc.get("tool_name").and_then(|n| n.as_str()))
+                            .map(|s| s.to_string())?;
+                        let args = match tc.get("function").and_then(|f| f.get("arguments")) {
+                            Some(serde_json::Value::String(s)) => {
+                                serde_json::from_str::<serde_json::Value>(s)
+                                    .unwrap_or(serde_json::json!({}))
+                            }
+                            // 兼容部分厂商直接返回对象
+                            Some(v @ serde_json::Value::Object(_)) => v.clone(),
+                            _ => serde_json::json!({}),
+                        };
+                        Some(serde_json::json!({"tool_name": name, "args": args}))
+                    })
+                    .collect();
+                serde_json::Value::Array(normalized)
+            });
 
         let finish_reason = choice
             .and_then(|c| c.get("finish_reason"))
@@ -450,6 +480,22 @@ impl LlmHandler {
                 return;
             }
 
+            // 200 但 content-type 是 JSON 而非 SSE:OpenAI 兼容端点(如 MiniMax)
+            // 对业务层错误(无效 key/额度不足)返回 HTTP 200 + JSON 错误体
+            // ({"base_resp":{"status_code":1004,...}})。若照常按 SSE 解析,
+            // 收不到任何 data 帧,会静默变成"空响应成功"——此处显式转错误。
+            if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
+                let ct_str = ct.to_str().unwrap_or("");
+                if ct_str.contains("application/json") {
+                    let text = resp.text().await.unwrap_or_default();
+                    yield Err(format!(
+                        "LLM API returned JSON instead of SSE stream: {}",
+                        text
+                    ));
+                    return;
+                }
+            }
+
             // === SSE 解析 ===
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
@@ -458,6 +504,7 @@ impl LlmHandler {
             let mut tool_calls_acc: BTreeMap<usize, ToolCallAccumulator> = BTreeMap::new();
             let mut finish_reason: Option<String> = None;
             let mut token_usage: Option<TokenUsage> = None;
+            let mut saw_data_frame = false;
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -501,6 +548,7 @@ impl LlmHandler {
                     if data.is_empty() {
                         continue;
                     }
+                    saw_data_frame = true;
 
                     // 检查 [DONE]
                     if data.trim() == "[DONE]" {
@@ -601,6 +649,25 @@ impl LlmHandler {
 
             // 流自然结束(未收到 [DONE],部分 provider 不发)
             let tool_calls = build_tool_calls(&tool_calls_acc);
+
+            // 零帧兜底:HTTP 200 且 content-type 非 JSON,但整个 body 没有任何
+            // SSE data 帧——错误体被网关以 text/* 包装时会走到这里。剩余缓冲
+            // 非空则按原始 body 显式报错,为空则报空流。禁止静默变"空响应成功"
+            // (fail-fast:执行异常必须显式浮出,不得写入假"成功"审计事实)。
+            if !saw_data_frame {
+                let leftover = buf.trim();
+                if leftover.is_empty() {
+                    yield Err("LLM stream contained no SSE frames (empty body)".to_string());
+                } else {
+                    let preview: String = leftover.chars().take(500).collect();
+                    yield Err(format!(
+                        "LLM stream contained no SSE frames; raw body: {}",
+                        preview
+                    ));
+                }
+                return;
+            }
+
             yield Ok(StreamChunk::Done(LlmResponse {
                 content: content_acc.clone(),
                 tool_calls,
@@ -941,6 +1008,72 @@ mod tests {
         assert_eq!(parsed["content"], "ok");
     }
 
+    /// tool_calls 归一化:OpenAI wire 形状 → 内部 {tool_name, args}
+    ///
+    /// 回归保护:execute() 输出必须可被 handle_call_external 反序列化为
+    /// LlmResponse { tool_calls: Vec<ToolCall{tool_name,args}> }。
+    /// 修复前此处透传 OpenAI 原始形状(无 tool_name 字段),真实 LLM
+    /// 返回 tool_calls 时 run() 必然报 "parse LLM response" 错误。
+    #[tokio::test]
+    async fn test_execute_normalizes_openai_tool_calls() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "choices":[{
+                        "message":{
+                            "content":"",
+                            "tool_calls":[{
+                                "id":"call_1","type":"function",
+                                "function":{"name":"file_read","arguments":"{\"path\":\"/tmp/a.txt\"}"}
+                            }]
+                        },
+                        "finish_reason":"tool_calls"
+                    }],
+                    "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
+            .with_retry_config(0, 0.001, 0.01);
+        let params = evorule_tcb::JsonValue::empty_object();
+        let result = handler
+            .execute(&params)
+            .await
+            .expect("execute should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&result.to_string()).unwrap();
+
+        let tcs = parsed["tool_calls"]
+            .as_array()
+            .expect("tool_calls should be array");
+        assert_eq!(tcs.len(), 1, "one tool call expected");
+        assert_eq!(
+            tcs[0]["tool_name"], "file_read",
+            "name must move to tool_name"
+        );
+        assert_eq!(
+            tcs[0]["args"]["path"], "/tmp/a.txt",
+            "arguments JSON string must be parsed into args object"
+        );
+        // 反序列化为 LlmResponse(即 handle_call_external 的消费方式)必须成功
+        let resp: Result<crate::agent::translator::LlmResponse, _> =
+            serde_json::from_str(&result.to_string());
+        assert!(
+            resp.is_ok(),
+            "execute() output must deserialize into LlmResponse: {:?}",
+            resp.err()
+        );
+        let resp = resp.unwrap();
+        let tc = resp.tool_calls.unwrap();
+        assert_eq!(tc[0].name, "file_read");
+        assert_eq!(tc[0].arguments["path"], "/tmp/a.txt");
+    }
+
     /// G3 集成测试:400 不重试,立即失败
     #[tokio::test]
     async fn test_no_retry_on_400() {
@@ -1208,6 +1341,74 @@ mod tests {
         }
 
         // 流应该结束(不再有第二项)
+        let second = stream.next().await;
+        assert!(second.is_none(), "stream should end after error");
+    }
+
+    /// 回归(demo 资产实测抓出):MiniMax 等端点对无效 key 返回 HTTP 200 +
+    /// JSON 错误体({"base_resp":{...}}),content-type=application/json。
+    /// 修复前:按 SSE 解析收不到任何 data 帧,静默变成"空响应成功"。
+    /// 修复后:必须显式 yield Err。
+    #[tokio::test]
+    async fn test_stream_json_error_body_yields_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"base_resp":{"status_code":1004,"status_msg":"login fail"}}"#,
+            )
+            .create_async()
+            .await;
+
+        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
+        let params = evorule_tcb::JsonValue::empty_object();
+        let mut stream = handler.execute_stream(&params);
+
+        let first = stream.next().await;
+        match first {
+            Some(Err(e)) => {
+                assert!(
+                    e.contains("JSON instead of SSE") && e.contains("login fail"),
+                    "error should surface the JSON error body: {}",
+                    e
+                );
+            }
+            other => panic!("expected Err, got {:?}", other),
+        }
+        let second = stream.next().await;
+        assert!(second.is_none(), "stream should end after error");
+    }
+
+    /// 零帧兜底:200 + 非 JSON content-type,但 body 没有任何 SSE data 帧
+    /// (网关以 text/* 包装错误体)。修复前静默"空响应成功",修复后显式报错。
+    #[tokio::test]
+    async fn test_stream_zero_sse_frames_yields_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("gateway error: upstream unavailable")
+            .create_async()
+            .await;
+
+        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
+        let params = evorule_tcb::JsonValue::empty_object();
+        let mut stream = handler.execute_stream(&params);
+
+        let first = stream.next().await;
+        match first {
+            Some(Err(e)) => {
+                assert!(
+                    e.contains("no SSE frames") && e.contains("gateway error"),
+                    "error should surface the raw body: {}",
+                    e
+                );
+            }
+            other => panic!("expected Err, got {:?}", other),
+        }
         let second = stream.next().await;
         assert!(second.is_none(), "stream should end after error");
     }
