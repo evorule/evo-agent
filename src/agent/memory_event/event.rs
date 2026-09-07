@@ -77,10 +77,7 @@ impl<'de> Deserialize<'de> for EventRef {
                 event_id: s,
                 fact_id: None,
             }),
-            Raw::New { event_id, fact_id } => Ok(EventRef {
-                event_id,
-                fact_id,
-            }),
+            Raw::New { event_id, fact_id } => Ok(EventRef { event_id, fact_id }),
         }
     }
 }
@@ -505,10 +502,21 @@ mod tests {
         assert_eq!(old.effects[1].event_id, "E003");
 
         // 新数据形态：对象数组往返一致
-        let mut ev = MemoryEvent::new_root("E001", EventType::EmotionEvent, 1000, EventSource::UserInput);
+        let mut ev = MemoryEvent::new_root(
+            "E001",
+            EventType::EmotionEvent,
+            1000,
+            EventSource::UserInput,
+        );
         ev.effects = vec![
-            EventRef { event_id: "E002".to_string(), fact_id: Some(20) },
-            EventRef { event_id: "E003".to_string(), fact_id: None },
+            EventRef {
+                event_id: "E002".to_string(),
+                fact_id: Some(20),
+            },
+            EventRef {
+                event_id: "E003".to_string(),
+                fact_id: None,
+            },
         ];
         let json = serde_json::to_string(&ev).unwrap();
         // fact_id Some → 输出对象含 fact_id；None → 省略

@@ -146,12 +146,9 @@ pub async fn run_operation(
     info!(operation = op.as_str(), request_id = ?req.request_id, "LLM named operation invoked");
 
     let model = req.model.as_deref().unwrap_or("default");
-    let result = run_llm_op(&op, &req, model).await.map_err(|e| {
-        (
-            e.status_code(),
-            e.to_string(),
-        )
-    })?;
+    let result = run_llm_op(&op, &req, model)
+        .await
+        .map_err(|e| (e.status_code(), e.to_string()))?;
 
     let timestamp = iso_now();
     Ok(axum::Json(LlmOpResponse {
@@ -192,19 +189,24 @@ async fn run_llm_op(op: &Operation, req: &LlmOpRequest, model: &str) -> Result<V
         .execute(&tcb_params)
         .await
         .map_err(|e| LlmOpsError::LlmFailure(e))?;
-    let content = io_to_content(&io).ok_or_else(|| LlmOpsError::LlmFailure("空响应".to_string()))?;
+    let content =
+        io_to_content(&io).ok_or_else(|| LlmOpsError::LlmFailure("空响应".to_string()))?;
 
     // 各 op 的输出解析（去掉可能的 ```json / ``` 围栏）
     let cleaned = strip_code_fence(&content);
-    let parsed: Value = serde_json::from_str(&cleaned)
-        .map_err(|e| LlmOpsError::OutputParse(e.to_string()))?;
-    normalize_output(*op, parsed).ok_or_else(|| LlmOpsError::OutputParse("输出结构不符合预期".to_string()))
+    let parsed: Value =
+        serde_json::from_str(&cleaned).map_err(|e| LlmOpsError::OutputParse(e.to_string()))?;
+    normalize_output(*op, parsed)
+        .ok_or_else(|| LlmOpsError::OutputParse("输出结构不符合预期".to_string()))
 }
 
 /// 从 `IoResult`（JsonValue 包装的 LlmResponse JSON）提取 `content` 字符串。
 fn io_to_content(io: &evorule_tcb::JsonValue) -> Option<String> {
     let serde_val = crate::json_convert::tcb_to_serde(io);
-    serde_val.get("content").and_then(|c| c.as_str()).map(ToOwned::to_owned)
+    serde_val
+        .get("content")
+        .and_then(|c| c.as_str())
+        .map(ToOwned::to_owned)
 }
 
 /// 剥离常见的 ```json ... ``` 代码块围栏。
@@ -258,9 +260,15 @@ mod tests {
 
     #[test]
     fn test_operation_parse() {
-        assert_eq!(Operation::parse("draft_rule").unwrap(), Operation::DraftRule);
+        assert_eq!(
+            Operation::parse("draft_rule").unwrap(),
+            Operation::DraftRule
+        );
         assert_eq!(Operation::parse("gen_tests").unwrap(), Operation::GenTests);
-        assert_eq!(Operation::parse("explain_rule").unwrap(), Operation::ExplainRule);
+        assert_eq!(
+            Operation::parse("explain_rule").unwrap(),
+            Operation::ExplainRule
+        );
         assert!(Operation::parse("patch_rule").is_err());
         assert!(Operation::parse("nope").is_err());
     }

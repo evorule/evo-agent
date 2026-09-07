@@ -573,11 +573,7 @@ impl MemoryEventStore {
     /// 身份锚点（首个精确匹配的 FactId）与 effect.fact_id 一致。
     /// - 全命中 → `true`（真实存在）
     /// - 无 effects / server 不可用 / 某 effect 缺 fact_id → `false`（降级，不阻断）
-    async fn verify_effects_binding(
-        &self,
-        event: &MemoryEvent,
-        session_id: &str,
-    ) -> bool {
+    async fn verify_effects_binding(&self, event: &MemoryEvent, session_id: &str) -> bool {
         if event.effects.is_empty() {
             return false; // 无正向因果可校验
         }
@@ -813,9 +809,7 @@ impl MemoryEventStore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::event::{
-        ConversationSubtype, EventSource, EventType, MilestoneSubtype,
-    };
+    use super::super::event::{ConversationSubtype, EventSource, EventType, MilestoneSubtype};
     use super::*;
     use crate::api::evorule_client::EvoruleApiClient;
 
@@ -888,10 +882,7 @@ mod tests {
         // E1.effects 应包含指向 E002 的 EventRef（改进2：引擎级引用）
         let e1_after = store.event_cache.get("E001").unwrap();
         assert!(
-            e1_after
-                .effects
-                .iter()
-                .any(|r| r.event_id == "E002"),
+            e1_after.effects.iter().any(|r| r.event_id == "E002"),
             "E1.effects should contain E002, got: {:?}",
             e1_after.effects
         );

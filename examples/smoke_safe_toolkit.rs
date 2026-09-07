@@ -128,7 +128,10 @@ async fn main() {
     check("overwrite with flag", r.is_ok(), true);
 
     println!("\n=== search_files ===");
-    let v = search_files.call(&arg_pattern("*.rs")).await.expect("search");
+    let v = search_files
+        .call(&arg_pattern("*.rs"))
+        .await
+        .expect("search");
     let count = v.get("count").unwrap().as_i64().unwrap();
     println!("  found *.rs: {} (main.rs + src/lib.rs)", count);
     assert_eq!(count, 2);
@@ -186,7 +189,10 @@ async fn main() {
     println!("\n=== http_get (3-layer host + SSRF) ===");
     // Active host
     let r = http_get
-        .call(&arg_kv(&[("url", JsonValue::string("https://docs.rs/tokio"))]))
+        .call(&arg_kv(&[(
+            "url",
+            JsonValue::string("https://docs.rs/tokio"),
+        )]))
         .await;
     if let Ok(v) = r {
         let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
@@ -231,7 +237,10 @@ async fn main() {
     check(
         "http:// blocked",
         http_get
-            .call(&arg_kv(&[("url", JsonValue::string("http://example.com/foo"))]))
+            .call(&arg_kv(&[(
+                "url",
+                JsonValue::string("http://example.com/foo"),
+            )]))
             .await
             .is_err(),
         true,

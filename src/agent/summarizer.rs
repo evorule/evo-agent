@@ -824,13 +824,11 @@ mod tests {
             .await;
         let command_mock = server
             .mock("POST", "/api/sessions/31/command")
-            .match_body(mockito::Matcher::PartialJson(
-                serde_json::json!({
-                    "instruction": {
-                        "params": {"audit_purpose": "summarize"}
-                    }
-                }),
-            ))
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "instruction": {
+                    "params": {"audit_purpose": "summarize"}
+                }
+            })))
             .with_status(200)
             .with_body("{}")
             .create_async()
@@ -866,7 +864,6 @@ mod tests {
         command_mock.assert_async().await;
         io_response_mock.assert_async().await;
     }
-
 
     #[tokio::test]
     async fn test_rollup_summaries_empty() {

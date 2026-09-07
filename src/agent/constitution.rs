@@ -156,10 +156,7 @@ fn shelve(body: &serde_json::Value, kind: &str, schema_url: &str) -> serde_json:
     let doc_id = format!("com.evoagent.runtime.{}", sanitized);
     doc.insert("$schema".into(), serde_json::json!(schema_url));
     doc.insert("kind".into(), serde_json::json!(kind));
-    doc.insert(
-        "id".into(),
-        serde_json::json!(doc_id),
-    );
+    doc.insert("id".into(), serde_json::json!(doc_id));
     if body.get("version").is_none() {
         doc.insert("version".into(), serde_json::json!("0.0.0"));
     }
@@ -176,7 +173,11 @@ fn shelve(body: &serde_json::Value, kind: &str, schema_url: &str) -> serde_json:
 /// 用 agent_def v1.0 校验裸文档（无壳 body）。schema 不可用时 fail-fast 报错。
 pub fn validate_agent_def(body: &serde_json::Value) -> Result<(), Vec<String>> {
     validate_with(
-        &shelve(body, "agent_def", "https://evorule.org/schemas/agent_def/v1.0.json"),
+        &shelve(
+            body,
+            "agent_def",
+            "https://evorule.org/schemas/agent_def/v1.0.json",
+        ),
         compile_schema(&AGENT_DEF_SCHEMA, "agent_def/v1.0.json", "agent_def"),
         "agent_def",
     )
@@ -185,8 +186,16 @@ pub fn validate_agent_def(body: &serde_json::Value) -> Result<(), Vec<String>> {
 /// 用 workflow_dag v1.0 校验裸文档（无壳 body）。schema 不可用时 fail-fast 报错。
 pub fn validate_workflow_dag(body: &serde_json::Value) -> Result<(), Vec<String>> {
     validate_with(
-        &shelve(body, "workflow_dag", "https://evorule.org/schemas/workflow_dag/v1.0.json"),
-        compile_schema(&WORKFLOW_DAG_SCHEMA, "workflow_dag/v1.0.json", "workflow_dag"),
+        &shelve(
+            body,
+            "workflow_dag",
+            "https://evorule.org/schemas/workflow_dag/v1.0.json",
+        ),
+        compile_schema(
+            &WORKFLOW_DAG_SCHEMA,
+            "workflow_dag/v1.0.json",
+            "workflow_dag",
+        ),
         "workflow_dag",
     )
 }
@@ -259,7 +268,9 @@ mod tests {
     #[test]
     fn test_validate_agent_def_rejects_bad_temperature_when_schema_available() {
         // 仅当能找到宪法仓时本测试才有意义；schema 不可用时走 fail-fast 分支（见下）
-        let Some(_) = locate_schemas_dir() else { return };
+        let Some(_) = locate_schemas_dir() else {
+            return;
+        };
         let bad = serde_json::json!({
             "agent_type": "x", "version": "1", "description": "", "system_prompt": "s",
             "model": "m", "temperature": 99.0, "max_steps": 1,
@@ -282,13 +293,19 @@ mod tests {
             "model": "m", "temperature": 0.3, "max_steps": 1,
             "step_timeout_secs": 1, "tools": []
         });
-        let err = validate_agent_def(&ok).expect_err("fail-fast must reject when schema unavailable");
-        assert!(err[0].contains("EVORULE_SYSTEM_RULES"), "错误须含修复指引: {err:?}");
+        let err =
+            validate_agent_def(&ok).expect_err("fail-fast must reject when schema unavailable");
+        assert!(
+            err[0].contains("EVORULE_SYSTEM_RULES"),
+            "错误须含修复指引: {err:?}"
+        );
     }
 
     #[test]
     fn test_validate_workflow_rejects_empty_nodes_when_schema_available() {
-        let Some(_) = locate_schemas_dir() else { return };
+        let Some(_) = locate_schemas_dir() else {
+            return;
+        };
         let bad = serde_json::json!({
             "workflow_id": "w", "nodes": [], "output_node": "x"
         });

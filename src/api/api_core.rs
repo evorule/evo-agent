@@ -113,10 +113,7 @@ impl ApiCore {
     ///
     /// 成功时原样返回 `Response` 供调用方继续 `resp.json()`（错误路径提前
     /// 返回，body 已耗尽不影响——调用方 `?` 后不会再读）。
-    pub(crate) async fn check_response_full(
-        &self,
-        resp: Response,
-    ) -> Result<Response, ApiError> {
+    pub(crate) async fn check_response_full(&self, resp: Response) -> Result<Response, ApiError> {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp
@@ -150,10 +147,7 @@ mod tests {
 
     #[test]
     fn test_resolve_auth_token_service_takes_precedence() {
-        let token = resolve_auth_token(
-            Some("svc".to_string()),
-            Some("user".to_string()),
-        );
+        let token = resolve_auth_token(Some("svc".to_string()), Some("user".to_string()));
         assert_eq!(token.as_deref(), Some("svc"));
     }
 

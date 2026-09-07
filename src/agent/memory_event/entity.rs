@@ -112,8 +112,7 @@ pub enum EntityType {
 }
 
 /// 实体状态
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum EntityStatus {
     /// 活跃
     #[default]
@@ -125,7 +124,6 @@ pub enum EntityStatus {
     /// 去世(人/宠物)
     Deceased,
 }
-
 
 /// 实体引用 —— 出现在 `MemoryEvent.entities` 中
 ///

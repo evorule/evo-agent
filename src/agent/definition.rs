@@ -311,8 +311,8 @@ impl AgentDefinition {
             return Err(AgentDefinitionError::NotFound(agent_type.to_string()));
         }
         let content = std::fs::read_to_string(&path)?;
-        let value: serde_json::Value = serde_json::from_str(&content)
-            .map_err(AgentDefinitionError::Json)?;
+        let value: serde_json::Value =
+            serde_json::from_str(&content).map_err(AgentDefinitionError::Json)?;
         // 门卫 2:宪法 jsonschema 全量校验(找不到 schema 时降级为仅门卫 3,tracing 留痕)
         crate::agent::constitution::validate_agent_def(&value).map_err(|errs| {
             AgentDefinitionError::InvalidDefinition(format!(
@@ -321,8 +321,8 @@ impl AgentDefinition {
             ))
         })?;
         // 门卫 3:定义级语义校验(取值范围)
-        let def: AgentDefinition = serde_json::from_value(value.clone())
-            .map_err(AgentDefinitionError::Json)?;
+        let def: AgentDefinition =
+            serde_json::from_value(value.clone()).map_err(AgentDefinitionError::Json)?;
         def.validate()?;
         Ok(def)
     }
@@ -506,7 +506,10 @@ mod tests {
                 Err(AgentDefinitionError::InvalidDefinition(msg)) => {
                     assert!(msg.contains("path traversal") || msg.contains("invalid agent_type"));
                 }
-                other => panic!("agent_type {:?} not rejected as InvalidDefinition: {:?}", bad, other),
+                other => panic!(
+                    "agent_type {:?} not rejected as InvalidDefinition: {:?}",
+                    bad, other
+                ),
             }
         }
     }
@@ -540,7 +543,11 @@ mod tests {
     fn test_validate_rejects_zero_max_steps_and_timeout() {
         let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":0,"step_timeout_secs":1,"tools":[],"output_format":null}"#;
         let def: AgentDefinition = serde_json::from_str(json).expect("parse");
-        assert!(def.validate().unwrap_err().to_string().contains("max_steps"));
+        assert!(def
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_steps"));
 
         let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":0,"tools":[],"output_format":null}"#;
         let def: AgentDefinition = serde_json::from_str(json).expect("parse");

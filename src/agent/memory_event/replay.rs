@@ -450,10 +450,7 @@ impl ReplayEngine {
         for fact in facts {
             let (turn_type, content, error) = match fact.fact_type.as_str() {
                 "Command" => {
-                    let content = fact
-                        .instruction()
-                        .map(extract_text)
-                        .unwrap_or_default();
+                    let content = fact.instruction().map(extract_text).unwrap_or_default();
                     (TurnType::UserCommand, content, None)
                 }
                 "IoRequest" => {

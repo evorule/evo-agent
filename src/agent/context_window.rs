@@ -151,8 +151,7 @@ impl TokenCounter for ApproxTokenCounter {
 }
 
 /// 裁剪策略
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrimStrategy {
     /// 保留 system + 最近 N 条(丢弃中间),tool_call/tool_result 原子对
     #[default]
@@ -160,7 +159,6 @@ pub enum TrimStrategy {
     /// 不裁剪(让 LLM 自己报错,仅计数用于观测)
     None,
 }
-
 
 /// 上下文窗口管理器
 #[derive(Debug)]

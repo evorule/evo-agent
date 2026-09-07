@@ -120,8 +120,7 @@ impl MemoryScope {
 /// 消息持久化模式（031 设计文档 P0，用户决策 2：可选开关）
 ///
 /// 控制 `AgentRunner` 何时把 messages 写入 evorule payload。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum MessagePersistMode {
     /// 每条消息立即写入（默认，最安全）
     #[default]
@@ -133,7 +132,6 @@ pub enum MessagePersistMode {
     /// 不持久化 messages（向后兼容旧行为）
     Disabled,
 }
-
 
 impl MessagePersistMode {
     /// 是否需要缓冲
@@ -768,7 +766,11 @@ impl MemoryManager {
     ) -> Result<ProjectOutcome, MemoryError> {
         let session_id = self.session_id_for_scope(scope)?; // SessionNotSet 传播（不变量）
         let path = self.build_path_scoped(scope, key);
-        let facts = match self.evorule_client.get_facts(&session_id, Some(&path)).await {
+        let facts = match self
+            .evorule_client
+            .get_facts(&session_id, Some(&path))
+            .await
+        {
             Ok(f) => f,
             Err(_) => return Ok(ProjectOutcome::Unreachable), // server 不可达
         };
@@ -949,7 +951,8 @@ impl MemoryManager {
             if let Ok(facts) = self
                 .evorule_client
                 .get_facts(session_id, Some(&prefix))
-                .await {
+                .await
+            {
                 for fact in facts {
                     if let Some(cache_key) = self.path_to_cache_key(&fact.path) {
                         if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
@@ -1312,11 +1315,7 @@ impl MemoryManager {
     ///
     /// 命中时 warn 留痕（P5-A3 要求"拒绝不能连日志都没有"）：
     /// 规则名 + 截断片段，供运营侧回查污染数据源。
-    fn audit_recall_section(
-        &self,
-        section: &str,
-        records: &[MemoryRecord],
-    ) -> Vec<String> {
+    fn audit_recall_section(&self, section: &str, records: &[MemoryRecord]) -> Vec<String> {
         let mut lines = Vec::with_capacity(records.len());
         for record in records {
             // B5：stable 节按来源域标注（D1 标注注入 / D2 unclassified），
@@ -2003,12 +2002,9 @@ mod tests {
     #[tokio::test]
     async fn test_verify_cache_reconciles_ghost_and_miss() {
         let mut server = mockito::Server::new_async().await;
-        let mut mgr = MemoryManager::new(
-            "test",
-            EvoruleApiClient::new(&server.url()),
-        )
-        .with_session_id("s1")
-        .with_cache_verify_interval_secs(0);
+        let mut mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()))
+            .with_session_id("s1")
+            .with_cache_verify_interval_secs(0);
 
         // 权威：session facts 1 条（topic） + shared facts 1 条（shared_topic）
         let facts_body = r#"[{"version":1,"fact_id":1,"path":"__memory__.test.session_s1.topic","value":{"key":"topic","value":"v1","timestamp":10},"type":"payload_update"}]"#;
@@ -2029,11 +2025,15 @@ mod tests {
             .await;
 
         // 幽灵条目：server 无（写入失败残留）→ 应被清理
-        mgr.cache
-            .insert("session_s1::ghost".to_string(), MemoryRecord::new("ghost", "g", 0));
+        mgr.cache.insert(
+            "session_s1::ghost".to_string(),
+            MemoryRecord::new("ghost", "g", 0),
+        );
         // 正常条目：两边都有 → 保留
-        mgr.cache
-            .insert("session_s1::topic".to_string(), MemoryRecord::new("topic", "v1", 10));
+        mgr.cache.insert(
+            "session_s1::topic".to_string(),
+            MemoryRecord::new("topic", "v1", 10),
+        );
         // 缺失条目：server 有 cache 无 → 回填（shared_topic）
 
         let drift = mgr.verify_cache_against_server().await.expect("verify");
@@ -2135,11 +2135,13 @@ mod tests {
 
         // 受保护域：外部通道拒绝
         assert!(matches!(
-            mgr.set_scoped(MemoryScope::Shared, "stable.llm.gpt-4o.x", "v").await,
+            mgr.set_scoped(MemoryScope::Shared, "stable.llm.gpt-4o.x", "v")
+                .await,
             Err(MemoryError::DomainForbidden(_))
         ));
         assert!(matches!(
-            mgr.set_scoped(MemoryScope::Shared, "stable.system.x", "v").await,
+            mgr.set_scoped(MemoryScope::Shared, "stable.system.x", "v")
+                .await,
             Err(MemoryError::DomainForbidden(_))
         ));
 
@@ -2727,7 +2729,11 @@ mod tests {
             "三层召回失败应产生三条降级通知，got: {:?}",
             ctx.degradation_notices
         );
-        for (notice, layer) in ctx.degradation_notices.iter().zip(["stable", "summaries", "events"]) {
+        for (notice, layer) in ctx
+            .degradation_notices
+            .iter()
+            .zip(["stable", "summaries", "events"])
+        {
             assert!(
                 notice.contains("[recall notice]") && notice.contains(layer),
                 "通知应含标记与层名，got: {notice}"
@@ -2992,10 +2998,7 @@ mod tests {
     #[test]
     fn test_reject_mode_flags_record() {
         let auditor = crate::agent::safety_auditor::SafetyAuditor::with_rules(
-            [(
-                "block_all".to_string(),
-                r"(?i)forbidden".to_string(),
-            )],
+            [("block_all".to_string(), r"(?i)forbidden".to_string())],
             AuditAction::Reject,
         )
         .expect("rule compiles");
