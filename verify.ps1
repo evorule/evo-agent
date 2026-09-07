@@ -45,16 +45,17 @@ if ($hits.Count -gt 0) {
     Write-Host "PASS: secret scan (0 hits)"
 }
 
-Write-Host "== [4/4] source layout assertion =="
-$layoutDeps = @(
-    "..\evorule\evorule-tcb\Cargo.toml",
-    "..\evorule\evorule-reactor\Cargo.toml"
-)
-foreach ($d in $layoutDeps) {
-    if (Test-Path $d) { Write-Host "PASS: layout $d" } else {
-        Write-Host "FAIL: layout missing $d (see README 'source layout contract')"
-        $failed = $true
-    }
+Write-Host "== [4/4] dependency contract assertion =="
+# EvoRule engine crates must come from crates.io (version deps), never from a
+# local path -- path deps would break out-of-tree builds for external users.
+$manifest = Get-Content (Join-Path $repo "Cargo.toml") -Raw
+$depHits = [regex]::Matches($manifest, '(?m)^\s*(evorule-tcb|evorule-reactor)\s*=\s*\{\s*path\s*=')
+if ($depHits.Count -gt 0) {
+    foreach ($h in $depHits) { Write-Host "FAIL: path dependency found: $($h.Value)" }
+    Write-Host "  (engine crates must be version deps like `evorule-tcb = `"0.x.y`"; see README 'dependency contract')"
+    $failed = $true
+} else {
+    Write-Host "PASS: dependency contract (evorule-tcb / evorule-reactor resolved from crates.io)"
 }
 
 if ($failed) { Write-Host "== RESULT: FAIL =="; exit 1 }
