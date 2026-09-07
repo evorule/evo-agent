@@ -1235,7 +1235,8 @@ impl AgentRunner {
     ///
     /// 形状遵循 OpenAI function calling 标准 JSON Schema:
     /// `{"type":"function","function":{"name","description","parameters":{type:object,properties,required}}}`。
-    /// 未知名(自定义注册、无静态 spec)降级为仅含名字的最小 schema 并记 debug 日志。
+    /// 未知名(自定义注册、服务代理等无静态 spec)从服务消费桥注册表透出
+    /// description/parameters,无声明时降级为最小 schema 并记 debug 日志。
     ///
     /// 返回 `None` = 请求不携带 tools 键(空集/无工具场景,向后兼容)。
     fn openai_tools_payload(&self) -> Option<Vec<Value>> {
@@ -1248,17 +1249,20 @@ impl AgentRunner {
         let mut tools = Vec::new();
         for name in &registered {
             let Some(spec) = specs.iter().find(|s| &s.name == name) else {
-                // 动态注册的工具(如 server 插件服务代理)无静态 spec:描述从
-                // 服务消费桥的注册表透出(对账清单 description),空则降级 ""
+                // 动态注册的工具(如 server 插件服务代理)无静态 spec:描述与参数
+                // 契约从服务消费桥的注册表透出(对账清单 description/parameters,
+                // 插件包 plugin.json 声明);参数契约无声明时降级空 object(向后兼容)。
                 let description =
                     crate::service_tools::service_description(name).unwrap_or_default();
+                let parameters = crate::service_tools::service_parameters(name)
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
                 debug!(tool = %name, "registered tool has no static spec; emitting dynamic schema");
                 tools.push(serde_json::json!({
                     "type": "function",
                     "function": {
                         "name": name,
                         "description": description,
-                        "parameters": { "type": "object", "properties": {} },
+                        "parameters": parameters,
                     }
                 }));
                 continue;
