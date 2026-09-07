@@ -115,8 +115,9 @@ impl ToolFunction for BundleImportDryRunTool {
             .get("bundle")
             .ok_or_else(|| "missing required parameter: bundle".to_string())?;
         if !bundle.is_object() {
-            return Err("bundle must be an object (DatasetBundle JSON from bundle_export)"
-                .to_string());
+            return Err(
+                "bundle must be an object (DatasetBundle JSON from bundle_export)".to_string(),
+            );
         }
         let result = self
             .client
@@ -149,8 +150,9 @@ impl ToolFunction for BundleImportTool {
             .get("bundle")
             .ok_or_else(|| "missing required parameter: bundle".to_string())?;
         if !bundle.is_object() {
-            return Err("bundle must be an object (DatasetBundle JSON from bundle_export)"
-                .to_string());
+            return Err(
+                "bundle must be an object (DatasetBundle JSON from bundle_export)".to_string(),
+            );
         }
         let result = self
             .client
@@ -220,10 +222,7 @@ impl ToolFunction for BundleImportsListTool {
 // =============================================================================
 
 pub fn register(h: &mut ToolHandler, ws: &WorkspaceApiClient, ev: &EvoruleApiClient) {
-    h.register_tool(
-        "bundle_export",
-        Arc::new(BundleExportTool::new(ws.clone())),
-    );
+    h.register_tool("bundle_export", Arc::new(BundleExportTool::new(ws.clone())));
     h.register_tool(
         "bundle_import_dry_run",
         Arc::new(BundleImportDryRunTool::new(ev.clone())),

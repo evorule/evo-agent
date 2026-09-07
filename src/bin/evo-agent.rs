@@ -1842,8 +1842,9 @@ mod tests {
     use evo_agent::{EventSource, EventType, MemoryEvent};
 
     fn make_event(id: &str, fact_id: Option<u64>) -> MemoryEvent {
-        let mut e = MemoryEvent::new_root(id, EventType::EmotionEvent, 1000, EventSource::UserInput)
-            .with_content(serde_json::json!({"summary": "t"}));
+        let mut e =
+            MemoryEvent::new_root(id, EventType::EmotionEvent, 1000, EventSource::UserInput)
+                .with_content(serde_json::json!({"summary": "t"}));
         e.fact_id = fact_id;
         e
     }

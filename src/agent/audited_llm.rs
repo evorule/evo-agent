@@ -70,7 +70,9 @@ fn is_transient_setup_error(err: &ApiError) -> bool {
     match err {
         ApiError::ApiError { status, .. } => *status >= 500,
         ApiError::SessionNotFound | ApiError::InvalidVersion(_) => false,
-        ApiError::HttpError(_) | ApiError::InvalidResponse | ApiError::SerializationError(_) => true,
+        ApiError::HttpError(_) | ApiError::InvalidResponse | ApiError::SerializationError(_) => {
+            true
+        }
     }
 }
 
@@ -94,7 +96,10 @@ where
         match tokio::time::timeout(deadline, op()).await {
             Err(_) => {
                 if attempt <= SIDECAR_SETUP_RETRIES {
-                    warn!(purpose, step, attempt, "audited_llm: setup timed out, retrying");
+                    warn!(
+                        purpose,
+                        step, attempt, "audited_llm: setup timed out, retrying"
+                    );
                     tokio::time::sleep(SIDECAR_SETUP_RETRY_DELAY).await;
                     continue;
                 }
@@ -151,9 +156,13 @@ impl AuditedLlm {
         let deadline = Duration::from_secs(self.timeout_secs);
 
         // 1. 一次性 sidecar 会话（F2：瞬态错误有界重试，语义错误直接失败）
-        let session_id =
-            setup_with_retry(deadline, || self.client.create_session(None), "create_session", purpose)
-                .await?;
+        let session_id = setup_with_retry(
+            deadline,
+            || self.client.create_session(None),
+            "create_session",
+            purpose,
+        )
+        .await?;
 
         // 2. 必须先订阅再提交命令（broadcast 通道不重放历史，与主循环同因）
         let mut events = setup_with_retry(
@@ -205,16 +214,14 @@ impl AuditedLlm {
                     // 本地执行；失败也要把错误写进 io_response 再返回，
                     // 保证引擎状态机能收尾（不留悬空 IoRequest）
                     let exec_result = self.llm.execute(params).await;
-                    let (response_value, error_msg): (
-                        serde_json::Value,
-                        Option<String>,
-                    ) = match &exec_result {
-                        Ok(v) => match serde_json_value_of(v) {
-                            Ok(value) => (value, None),
-                            Err(e) => (serde_json::json!({ "error": e }), Some(e)),
-                        },
-                        Err(e) => (serde_json::json!({ "error": e }), Some(e.clone())),
-                    };
+                    let (response_value, error_msg): (serde_json::Value, Option<String>) =
+                        match &exec_result {
+                            Ok(v) => match serde_json_value_of(v) {
+                                Ok(value) => (value, None),
+                                Err(e) => (serde_json::json!({ "error": e }), Some(e)),
+                            },
+                            Err(e) => (serde_json::json!({ "error": e }), Some(e.clone())),
+                        };
                     self.client
                         .submit_io_response(
                             &session_id,
@@ -282,8 +289,7 @@ fn build_call_external_command(
 /// 沿用既有风格（to_string + parse）：TCB JSON 的文本形式是合法 JSON，
 /// 解析结果一一对应。解析失败如实报错，不静默降级为 Null。
 fn serde_json_value_of(v: &JsonValue) -> Result<serde_json::Value, String> {
-    serde_json::from_str(&v.to_string())
-        .map_err(|e| format!("convert tcb json to serde_json: {e}"))
+    serde_json::from_str(&v.to_string()).map_err(|e| format!("convert tcb json to serde_json: {e}"))
 }
 
 #[cfg(test)]
@@ -519,7 +525,8 @@ mod tests {
             .create_async()
             .await;
 
-        let err = audited.execute("rollup", &tcb(&json!({"messages": []})))
+        let err = audited
+            .execute("rollup", &tcb(&json!({"messages": []})))
             .await
             .unwrap_err();
         assert!(err.contains("closed before Stable"), "got: {err}");
@@ -556,7 +563,8 @@ mod tests {
             .create_async()
             .await;
 
-        let err = audited.execute("session_summary", &tcb(&json!({"messages": []})))
+        let err = audited
+            .execute("session_summary", &tcb(&json!({"messages": []})))
             .await
             .unwrap_err();
         assert!(err.contains("path resolution failed"), "got: {err}");
@@ -570,7 +578,8 @@ mod tests {
             EvoruleApiClient::new("http://127.0.0.1:1"),
             LlmHandler::mock(r#"{"content":"should never be reached"}"#),
         );
-        let err = audited.execute("summarize", &tcb(&json!({"messages": []})))
+        let err = audited
+            .execute("summarize", &tcb(&json!({"messages": []})))
             .await
             .unwrap_err();
         assert!(err.contains("create_session"), "got: {err}");
@@ -605,12 +614,16 @@ mod tests {
         let http_err = reqwest::get("http://127.0.0.1:1").await.unwrap_err();
         assert!(is_transient_setup_error(&ApiError::HttpError(http_err)));
         let ser_err = serde_json::from_str::<serde_json::Value>("{bad").unwrap_err();
-        assert!(is_transient_setup_error(&ApiError::SerializationError(ser_err)));
+        assert!(is_transient_setup_error(&ApiError::SerializationError(
+            ser_err
+        )));
         // 瞬态：响应格式
         assert!(is_transient_setup_error(&ApiError::InvalidResponse));
         // 语义：会话类
         assert!(!is_transient_setup_error(&ApiError::SessionNotFound));
-        assert!(!is_transient_setup_error(&ApiError::InvalidVersion("v-1".into())));
+        assert!(!is_transient_setup_error(&ApiError::InvalidVersion(
+            "v-1".into()
+        )));
     }
 
     /// LLM 本地执行失败 → 错误写进 io_response（引擎状态机收尾，不留悬空 IoRequest），
@@ -657,7 +670,10 @@ mod tests {
             .await;
 
         let err = audited
-            .execute("summarize", &tcb(&json!({"messages": [{"role":"user","content":"hi"}]})))
+            .execute(
+                "summarize",
+                &tcb(&json!({"messages": [{"role":"user","content":"hi"}]})),
+            )
             .await
             .unwrap_err();
         assert!(err.contains("llm execute"), "错误应来自 LLM 执行: {err}");

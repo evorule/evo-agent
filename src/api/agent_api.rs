@@ -985,9 +985,7 @@ async fn agent_memory_recall(
     let max_summaries = params
         .max_summaries
         .unwrap_or(def.memory.max_session_summaries);
-    let max_events = params
-        .max_events
-        .unwrap_or(def.memory.max_injected_events);
+    let max_events = params.max_events.unwrap_or(def.memory.max_injected_events);
 
     // 4. recall（with_evidence=true 时走 C2 带证据路径）
     let ctx = if params.with_evidence.unwrap_or(false) {

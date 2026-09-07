@@ -237,10 +237,7 @@ impl EvoruleApiClient {
     /// 使它们在 server 端 `facts_by_path_prefix` 查询中被过滤，避免下次仍计入
     /// 阈值、反复 rollup 导致共享空间膨胀（L-3 修复）。
     /// 标记后仍可通过 `fact_by_id` 访问，保留审计可追溯性。
-    pub async fn mark_shared_facts_rollup(
-        &self,
-        fact_ids: &[u64],
-    ) -> Result<(), ApiError> {
+    pub async fn mark_shared_facts_rollup(&self, fact_ids: &[u64]) -> Result<(), ApiError> {
         let url = format!("{}/api/shared/facts/rollup", self.core.base_url());
         let body = serde_json::json!({
             "fact_ids": fact_ids,
@@ -719,11 +716,7 @@ impl EvoruleApiClient {
         domain: Option<&str>,
         tags: Option<&str>,
     ) -> Result<Value, ApiError> {
-        let mut url = format!(
-            "{}/api/knowledge/{}/entries",
-            self.core.base_url(),
-            dataset
-        );
+        let mut url = format!("{}/api/knowledge/{}/entries", self.core.base_url(), dataset);
         let mut params: Vec<String> = Vec::new();
         if let Some(v) = q {
             params.push(format!("q={}", urlencode(v)));

@@ -240,7 +240,9 @@ impl Metrics {
         registry
             .register(Box::new(memory_cache_drift_total.clone()))
             .map_err(|_| {
-                MetricsError::RegistryRegistrationFailed("evo_agent_memory_cache_drift_total".into())
+                MetricsError::RegistryRegistrationFailed(
+                    "evo_agent_memory_cache_drift_total".into(),
+                )
             })?;
 
         Ok(Self {
@@ -352,7 +354,9 @@ impl Metrics {
 
     /// L2 SafetyAuditor 命中 +1（P5-A3 指标，按命中规则分桶）
     pub fn inc_safety_audit_hit(&self, rule: &str) {
-        self.safety_audit_hits_total.with_label_values(&[rule]).inc();
+        self.safety_audit_hits_total
+            .with_label_values(&[rule])
+            .inc();
     }
 
     /// B3：memory cache 漂移条目 +n（定期校验对齐时累计）
@@ -489,12 +493,11 @@ mod tests {
         m.inc_llm_bypass_audit("rollup");
         m.inc_safety_audit_hit("instruction_override");
         let output = m.render();
-        assert!(output.contains(
-            "evo_agent_llm_bypass_audit_total{purpose=\"summarize\"} 2"
-        ));
+        assert!(output.contains("evo_agent_llm_bypass_audit_total{purpose=\"summarize\"} 2"));
         assert!(output.contains("evo_agent_llm_bypass_audit_total{purpose=\"rollup\"} 1"));
-        assert!(output
-            .contains("evo_agent_safety_audit_hits_total{rule=\"instruction_override\"} 1"));
+        assert!(
+            output.contains("evo_agent_safety_audit_hits_total{rule=\"instruction_override\"} 1")
+        );
     }
 
     #[test]

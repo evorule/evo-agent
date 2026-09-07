@@ -62,8 +62,7 @@ impl IoDispatcherBuilder {
     /// Build IoDispatcher
     pub fn build(self) -> IoDispatcher {
         IoDispatcher::new(
-            self.llm_handler
-                .unwrap_or_else(LlmHandler::with_defaults),
+            self.llm_handler.unwrap_or_else(LlmHandler::with_defaults),
             self.tool_handler.unwrap_or_else(ToolHandler::new),
         )
     }
