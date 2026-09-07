@@ -110,6 +110,78 @@ fn test_agent_runner_new() {
 }
 
 #[tokio::test]
+async fn test_openai_tools_payload_dynamic_service_schema_carries_parameters() {
+    // 参数契约链消费端端到端锁：对账清单 parameters → 服务消费桥注册表
+    // 缓存 → openai_tools_payload 动态 schema 透出（LLM 可带参调用服务）；
+    // 无参数声明的服务降级空 object（向后兼容）。
+    let mut server = mockito::Server::new_async().await;
+    let services = serde_json::json!([
+        {
+            "name": "param_svc",
+            "source": "plugin",
+            "plugin": "finance-config",
+            "description": "带参数契约的服务",
+            "sensitive": false,
+            "parameters": {
+                "type": "object",
+                "properties": { "key": { "type": "string", "description": "配置键" } },
+                "required": ["key"]
+            }
+        },
+        { "name": "noparam_svc", "source": "registry", "sensitive": false }
+    ])
+    .to_string();
+    server
+        .mock("GET", "/api/services")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(&services)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let mut runner = AgentRunner::new(AgentConfig::default(), client.clone());
+    let n = crate::service_tools::register_service_tools(
+        &mut runner.tool_handler,
+        &client,
+        &["param_svc".to_string(), "noparam_svc".to_string()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2, "两个白名单服务都应注册为代理工具");
+
+    let payload = runner
+        .openai_tools_payload()
+        .expect("注册了动态工具后 tools schema 应存在");
+    let find = |name: &str| {
+        payload
+            .iter()
+            .find(|t| t["function"]["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("schema 应含 {name}"))
+    };
+
+    // 带参数契约：description 与 parameters 原样透出
+    let with_p = find("param_svc");
+    assert_eq!(with_p["function"]["description"], "带参数契约的服务");
+    assert_eq!(
+        with_p["function"]["parameters"]["required"],
+        serde_json::json!(["key"])
+    );
+    assert_eq!(
+        with_p["function"]["parameters"]["properties"]["key"]["type"],
+        "string"
+    );
+
+    // 无声明：降级空 object（不伪造契约）
+    let no_p = find("noparam_svc");
+    assert_eq!(
+        no_p["function"]["parameters"],
+        serde_json::json!({ "type": "object", "properties": {} })
+    );
+}
+
+#[tokio::test]
 async fn test_auto_recall_empty_shared_facts() {
     let mut server = mockito::Server::new_async().await;
     let client = EvoruleApiClient::new(&server.url());

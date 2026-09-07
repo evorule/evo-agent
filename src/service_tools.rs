@@ -13,6 +13,8 @@
 //! - 白名单为空 = 不注册任何服务工具（安全默认）；
 //! - `sensitive=true` 的服务跳过注册（server 侧 invoke 对敏感服务 403，
 //!   敏感操作必须走会话审计链）；
+//! - 描述与参数契约随注册缓存（对账清单 `description`/`parameters`），
+//!   供 runner 生成带参动态工具 schema（LLM 可带参真实调用）；
 //! - 服务执行失败 fail-fast 透传（无静默降级）。
 
 use std::collections::HashMap;
@@ -37,6 +39,23 @@ fn descriptions() -> &'static RwLock<HashMap<String, String>> {
 /// 查询已注册服务工具的描述（未注册返回 None）
 pub fn service_description(name: &str) -> Option<String> {
     descriptions().read().ok()?.get(name).cloned()
+}
+
+/// 服务参数契约注册表：注册时缓存对账清单的 `parameters`
+/// （OpenAI function parameters 子集；插件包 plugin.json 声明 →
+/// server 对账透传 → 本表缓存）。
+///
+/// 供 runner 动态工具 schema 生成完整参数契约（LLM 可带参调用服务）；
+/// 服务未声明（native/registry 来源缺省）返回 None，schema 降级空 object。
+static SERVICE_PARAMETERS: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
+
+fn parameters() -> &'static RwLock<HashMap<String, serde_json::Value>> {
+    SERVICE_PARAMETERS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// 查询已注册服务工具的参数契约（未注册/服务未声明返回 None）
+pub fn service_parameters(name: &str) -> Option<serde_json::Value> {
+    parameters().read().ok()?.get(name).cloned()
 }
 
 /// 服务代理工具：`call` = `POST /api/services/{name}/invoke`(args 原样透传)
@@ -109,6 +128,14 @@ pub async fn register_service_tools(
                 m.insert(want.clone(), description);
             })
             .map_err(|_| "服务描述注册表写入失败".to_string())?;
+        if let Some(params) = info.get("parameters").filter(|p| !p.is_null()) {
+            parameters()
+                .write()
+                .map(|mut m| {
+                    m.insert(want.clone(), params.clone());
+                })
+                .map_err(|_| "服务参数契约注册表写入失败".to_string())?;
+        }
         handler.register_tool(
             want,
             Arc::new(ServiceProxyTool {
@@ -278,6 +305,42 @@ mod tests {
             "第二次请求应为服务直调"
         );
         assert_eq!(cap[1].body, r#"{"key":"demo"}"#, "args 应原样透传为 body");
+    }
+
+    #[test]
+    fn registration_caches_parameters_contract() {
+        // 参数契约随注册缓存（消费端链路：对账 parameters → 注册表
+        // → runner 动态 schema）；服务未声明参数时如实返回 None（不伪造契约）。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (base, _captured) = spawn_http_fixture(vec![(
+            200,
+            r#"[{"name":"params_svc","source":"plugin","sensitive":false,"description":"带参服务","parameters":{"type":"object","properties":{"key":{"type":"string","description":"配置键"}},"required":["key"]}},{"name":"nocontract_svc","source":"registry","sensitive":false}]"#,
+        )]);
+        let mut handler = ToolHandler::new();
+        let ev = EvoruleApiClient::new(&base);
+        let n = rt
+            .block_on(register_service_tools(
+                &mut handler,
+                &ev,
+                &["params_svc".to_string(), "nocontract_svc".to_string()],
+            ))
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            service_parameters("params_svc"),
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": { "key": { "type": "string", "description": "配置键" } },
+                "required": ["key"]
+            }))
+        );
+        assert!(
+            service_parameters("nocontract_svc").is_none(),
+            "未声明参数的服务不应有伪造契约"
+        );
     }
 
     #[test]
