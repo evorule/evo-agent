@@ -23,8 +23,16 @@ impl EvoruleApiClient {
     /// If `EVORULE_AUTH_TOKEN` env var is set, use it as Bearer token.
     /// Otherwise, send no auth header (server must be in dev mode / no auth).
     pub fn new(base_url: &str) -> Self {
+        Self::with_auth_token(base_url, None)
+    }
+
+    /// Create API client with an explicit auth token from the config file
+    /// (`evorum.api_key` declaration). Priority: explicit declaration > env
+    /// vars (`EVORULE_SERVICE_TOKEN` / `EVORULE_AUTH_TOKEN`) > no auth;
+    /// an empty declaration falls back to env resolution.
+    pub fn with_auth_token(base_url: &str, auth_token: Option<&str>) -> Self {
         Self {
-            core: ApiCore::new(base_url),
+            core: ApiCore::with_auth_token(base_url, auth_token),
         }
     }
 

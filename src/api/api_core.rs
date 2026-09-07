@@ -54,13 +54,25 @@ impl ApiCore {
     /// 调用侧走既有 best-effort warn 链路——行为退化可观测、不崩溃）。
     /// 均未设置时，发送无认证请求（server 须为 dev mode / no auth）。
     pub fn new(base_url: &str) -> Self {
+        Self::with_auth_token(base_url, None)
+    }
+
+    /// 带显式鉴权 token 构造（配置文件 `evorum.api_key` 声明的接线入口）。
+    ///
+    /// token 优先级：**显式声明 > 环境变量 > 无**（与 server `--secret`
+    /// 「显式传入 > 密钥文件 > 随机生成」的优先级语义对齐）：
+    /// - `Some(非空)`：直接作为 Bearer token，覆盖环境变量；
+    /// - `Some(空串)/None`：回落环境变量解析（`EVORULE_SERVICE_TOKEN` 优先，
+    ///   缺省回退 `EVORULE_AUTH_TOKEN`），均未设置时发送无认证请求。
+    pub fn with_auth_token(base_url: &str, explicit_token: Option<&str>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to build HTTP client");
 
-        let auth_token = resolve_auth_token(
+        let auth_token = resolve_effective_auth_token(
+            explicit_token,
             std::env::var("EVORULE_SERVICE_TOKEN").ok(),
             std::env::var("EVORULE_AUTH_TOKEN").ok(),
         );
@@ -151,6 +163,19 @@ fn resolve_auth_token(service: Option<String>, user: Option<String>) -> Option<S
         .or_else(|| user.filter(|s| !s.is_empty()))
 }
 
+/// Explicit declaration > env vars synthesis (config evorum.api_key wiring).
+/// Pure function so unit tests never mutate process env.
+fn resolve_effective_auth_token(
+    explicit: Option<&str>,
+    service: Option<String>,
+    user: Option<String>,
+) -> Option<String> {
+    match explicit.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(token) => Some(token.to_string()),
+        None => resolve_auth_token(service, user),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -175,6 +200,46 @@ mod tests {
         assert_eq!(
             resolve_auth_token(Some(String::new()), Some(String::new())),
             None
+        );
+    }
+
+    #[test]
+    fn test_explicit_token_overrides_env_resolution() {
+        // Explicit declaration (config evorum.api_key) wins over env resolution:
+        // assert the Bearer header injected by auth_header, no process env touched.
+        let core = ApiCore::with_auth_token("http://x", Some("cfg-key"));
+        let req = core
+            .auth_header(reqwest::Client::new().get("http://x"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer cfg-key")
+        );
+    }
+
+    #[test]
+    fn test_effective_token_priority_semantics() {
+        // Full priority table (pure function, no env dependency):
+        // explicit non-empty > service > user > none; empty explicit falls back.
+        assert_eq!(
+            resolve_effective_auth_token(
+                Some("cfg"),
+                Some("svc".to_string()),
+                Some("user".to_string()),
+            )
+            .as_deref(),
+            Some("cfg")
+        );
+        assert_eq!(
+            resolve_effective_auth_token(Some("  "), Some("svc".to_string()), None).as_deref(),
+            Some("svc")
+        );
+        assert_eq!(
+            resolve_effective_auth_token(None, None, Some("user".to_string())).as_deref(),
+            Some("user")
         );
     }
 }
