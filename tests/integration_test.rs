@@ -853,3 +853,206 @@ fn test_constitution_tool_call_contract_alignment() {
         "call_service io_request 必须携带 tool_name 键"
     );
 }
+
+/// 端到端接线锁:tools schema 必须出现在两处请求面上 ——
+/// ① submit_command 指令面(openai_tools_payload 注入,经 constitution 中继);
+/// ② 真正打向 LLM API 的请求体(handle_call_external 转发 io_request params.tools)。
+/// 同时验证多轮 ReAct 真实执行:LLM 回标准 tool_calls → file_write 真实落盘 →
+/// 工具结果回流消息历史 → LLM 给出含路径确认的最终回复。
+///
+/// 匹配设计:turn1 mock 仅匹配含 "file_write" 的请求体(该词只能来自 tools schema,
+/// 缺失则 404 → LLM 调用失败 → 测试红);turn2 mock 匹配含工具结果路径的请求体
+/// (证明工具结果回流 LLM)。turn2 后创建,优先匹配。
+#[tokio::test]
+async fn test_react_loop_llm_request_carries_tools_schema() {
+    // ── LLM mock 服务器 ──
+    let mut llm_server = Server::new_async().await;
+    // turn1:请求体必须携带 tools schema("file_write" 只能来自 tools 数组)
+    let llm_turn1 = llm_server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex("file_write".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"choices":[{"message":{"content":"","tool_calls":[
+                {"id":"c1","type":"function",
+                 "function":{"name":"file_write","arguments":"{\"path\":\"workspace/expenses_2026.json\",\"content\":\"amount=45.50\"}"}}]},
+                "finish_reason":"tool_calls"}]}"#,
+        )
+        .create_async()
+        .await;
+    // turn2:请求消息历史必须含工具结果(真实写盘返回的 path)
+    let llm_turn2 = llm_server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex("expenses_2026".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"choices":[{"message":{"content":"Wrote workspace/expenses_2026.json (amount=45.50)"},"finish_reason":"stop"}]}"#,
+        )
+        .create_async()
+        .await;
+
+    // ── evorule server mock:SSE 脚本化(params.tools 模拟 constitution `tools?` 中继)──
+    let mut server = Server::new_async().await;
+    // mockito 1.7 匹配序:同路径多 mock 按创建序优先喂"期望未满"者,
+    // 带断言的特定 mock 必须先于 base 兜底创建,否则被兜底截胡
+    let tools_schema = json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "file_write",
+                "description": "write a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }
+    ]);
+    let sse = format!(
+        "{}{}{}{}",
+        sse_line(&io_request(
+            1,
+            "call_external",
+            json!({"model": "mock-model", "tools": tools_schema})
+        )),
+        sse_line(&io_request(
+            2,
+            "call_service",
+            json!({"tool_name": "file_write",
+                   "args": {"path": "workspace/expenses_2026.json", "content": "amount=45.50"}})
+        )),
+        sse_line(&io_request(
+            3,
+            "call_external",
+            json!({"model": "mock-model", "tools": tools_schema})
+        )),
+        sse_line(&json!({"type": "Stable"})),
+    );
+    // ①指令面:submit_command 必须携带工具 schema
+    let cmd_mock = server
+        .mock("POST", "/api/sessions/777/command")
+        .match_body(mockito::Matcher::Regex("file_write".to_string()))
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    // state:最终 content 含路径确认(先于 base 创建以获得请求)
+    let state_mock = server
+        .mock("GET", "/api/sessions/777/state")
+        .with_status(200)
+        .with_body(
+            r#"{"payload":{"llm_response":{"content":"Wrote workspace/expenses_2026.json (amount=45.50)"}}}"#,
+        )
+        .create_async()
+        .await;
+    mock_evorule_base(&mut server, "777", sse).await;
+
+    // ── runner:真实 LlmHandler + 真实 file_write(tempdir 沙箱)──
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::create_dir(dir.path().join("workspace")).expect("workspace dir");
+    let client = EvoruleApiClient::new(&server.url());
+    let llm = LlmHandler::new("mock-model", &llm_server.url(), Some("k".to_string()))
+        .with_retry_config(0, 0.001, 0.01);
+    let mut runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_llm_handler(llm)
+        .with_tool_handler(evo_agent::builtin_tools::default_safe_toolkit(dir.path()));
+
+    let result = runner
+        .run("record the expense")
+        .await
+        .expect("run should not Err");
+    assert!(
+        result.success,
+        "multi-turn run should succeed: {:?}",
+        result.error
+    );
+    assert_eq!(result.steps, 3, "3 IoRequest events = 3 steps");
+    assert_eq!(result.tool_calls, vec!["file_write".to_string()]);
+    assert!(
+        result.content.contains("expenses_2026.json"),
+        "final content must confirm the written path, got: {}",
+        result.content
+    );
+    // ②LLM 请求面:两轮 mock 均按预期命中(缺 tools schema 时 turn1 必失配 → 测试红)
+    llm_turn1.assert_async().await;
+    llm_turn2.assert_async().await;
+    // ①指令面 schema 注入命中
+    cmd_mock.assert_async().await;
+    state_mock.assert_async().await;
+    // file_write 真实落盘
+    let written = std::fs::read_to_string(dir.path().join("workspace/expenses_2026.json"))
+        .expect("file_write must have created the file");
+    assert!(
+        written.contains("45.50"),
+        "written content mismatch: {}",
+        written
+    );
+}
+
+/// 假成功回归锁(边界如实声明):LLM 回复含工具意图文本但无
+/// tool_calls 字段时(如供应商原生 XML 形态),agent 不解析、不执行工具,
+/// 原始文本作为 llm_response.content 原样回传引擎(审计留痕)——
+/// 静默不执行优于幻觉执行。tools schema 注入修复后模型应返回标准 tool_calls;
+/// 此锁防止"回退到 XML 时代也照常报成功"的假成功形态再次无声出现。
+#[tokio::test]
+async fn test_llm_text_intent_without_tool_calls_does_not_execute_tools() {
+    let mut server = Server::new_async().await;
+    let sse = format!(
+        "{}{}",
+        sse_line(&io_request(
+            1,
+            "call_external",
+            json!({"model": "mock-model"})
+        )),
+        sse_line(&json!({"type": "Stable"})),
+    );
+    // 审计留痕:XML 原文作为 llm_response.content 回传引擎(io_response body 可查)
+    // 先于 base 兜底创建,否则单次 POST 被兜底截胡(mockito 1.7 匹配序)
+    let io_resp = server
+        .mock("POST", "/api/sessions/777/io_response")
+        .match_body(mockito::Matcher::Regex("minimax:tool_call".to_string()))
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    mock_evorule_base(&mut server, "777", sse).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools: BTreeMap<String, Arc<dyn ToolFunction>> = BTreeMap::new();
+    tools.insert(
+        "file_write".to_string(),
+        Arc::new(RecordingTool {
+            calls: calls.clone(),
+            result: "SHOULD_NOT_EXECUTE",
+        }),
+    );
+    let client = EvoruleApiClient::new(&server.url());
+    let xml_text = r#"<minimax:tool_call>{"name":"file_write","parameters":{"path":"workspace/pwned.txt","content":"should not run"}}</minimax:tool_call>"#;
+    let mut runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_llm_handler(LlmHandler::mock(xml_text))
+        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_tools(tools));
+
+    let result = runner
+        .run("record the expense")
+        .await
+        .expect("run should not Err");
+    assert!(result.success, "text-only reply must not fail the run");
+    assert_eq!(result.steps, 1, "no tool round: single IoRequest only");
+    assert!(
+        result.tool_calls.is_empty(),
+        "no tool must be recorded as executed"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "XML intent text must not trigger tool execution"
+    );
+    // 审计面:原文全量回传,不静默丢弃
+    io_resp.assert_async().await;
+}

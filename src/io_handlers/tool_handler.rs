@@ -72,6 +72,14 @@ impl ToolHandler {
         self.tools.contains_key(name)
     }
 
+    /// 已注册工具名列表(按字母序)
+    ///
+    /// 供 runner 组装 LLM 请求的 tools schema 时枚举执行器
+    /// (schema 数据源 = 静态 spec 目录 ∩ 本列表)。
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
+    }
+
     /// 按名取出工具实现(供 serve 按白名单过滤复用)
     pub fn get_tool(&self, name: &str) -> Option<Arc<dyn ToolFunction>> {
         self.tools.get(name).cloned()

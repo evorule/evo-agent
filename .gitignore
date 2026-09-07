@@ -31,5 +31,6 @@ _tmp_*
 
 # demo 资产（demo.ps1/demo.sh 下载的 server 包与运行日志）
 .demo/
-expenses/
+# file_write 工具沙箱目录（demo 业务产物落盘处）
+workspace/
 

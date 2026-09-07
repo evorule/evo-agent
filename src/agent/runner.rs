@@ -17,7 +17,7 @@ use evorule_tcb::JsonValue;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use tokio_util::sync::CancellationToken;
 
@@ -1051,7 +1051,8 @@ impl AgentRunner {
         // 如果先 submit_command 再 subscribe,会错过 io_request 事件,导致 ReAct 循环无法启动。
         let mut event_stream = self.evorule_client.subscribe_events(&session_id).await?;
 
-        let command = self.build_call_external_command(&system_prompt, goal);
+        let command =
+            self.build_call_external_command(&system_prompt, goal, self.openai_tools_payload());
         self.evorule_client
             .submit_command(&session_id, &command)
             .await?;
@@ -1226,21 +1227,97 @@ impl AgentRunner {
         ))
     }
 
-    fn build_call_external_command(&self, system_prompt: &str, goal: &str) -> Value {
+    /// 组装随 LLM 请求下发的工具 OpenAI function schema。
+    ///
+    /// 数据源 = 静态工具 spec 目录(`default_tool_specs`,delegate 若已注册则追加其 spec)
+    /// 与 `tool_handler` 实际注册执行器求交;agent 配置的 `tools` 列表已在
+    /// `from_definition` 校验过 ⊆ 注册集,故以注册集为准即可覆盖配置意图。
+    ///
+    /// 形状遵循 OpenAI function calling 标准 JSON Schema:
+    /// `{"type":"function","function":{"name","description","parameters":{type:object,properties,required}}}`。
+    /// 未知名(自定义注册、无静态 spec)降级为仅含名字的最小 schema 并记 debug 日志。
+    ///
+    /// 返回 `None` = 请求不携带 tools 键(空集/无工具场景,向后兼容)。
+    fn openai_tools_payload(&self) -> Option<Vec<Value>> {
+        let registered = self.tool_handler.tool_names();
+        let mut specs = crate::builtin_tools::default_tool_specs();
+        if self.tool_handler.has_tool("delegate") {
+            specs.push(crate::builtin_tools::delegate_tool::delegate_tool_spec());
+        }
+
+        let mut tools = Vec::new();
+        for name in &registered {
+            let Some(spec) = specs.iter().find(|s| &s.name == name) else {
+                debug!(tool = %name, "registered tool has no static spec; emitting minimal schema");
+                tools.push(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": "",
+                        "parameters": { "type": "object", "properties": {} },
+                    }
+                }));
+                continue;
+            };
+            let mut properties = serde_json::Map::new();
+            let mut required = Vec::new();
+            for p in &spec.parameters {
+                properties.insert(
+                    p.name.clone(),
+                    serde_json::json!({ "type": p.r#type, "description": p.description }),
+                );
+                if p.required {
+                    required.push(p.name.clone());
+                }
+            }
+            let mut parameters = serde_json::json!({ "type": "object", "properties": properties });
+            if !required.is_empty() {
+                parameters["required"] = serde_json::json!(required);
+            }
+            tools.push(serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": parameters,
+                }
+            }));
+        }
+
+        if tools.is_empty() {
+            None
+        } else {
+            Some(tools)
+        }
+    }
+
+    fn build_call_external_command(
+        &self,
+        system_prompt: &str,
+        goal: &str,
+        tools: Option<Vec<Value>>,
+    ) -> Value {
         // core_eval v0.3.1 合约:call_external 指令仅使用 messages(LLM 消息历史数组)
         // 与可选 tools;prompt/system/goal/tool_names 不再是指令参数。
         // core_eval 的 io_request 规则引用 __exec__.instruction.params.messages,
         // 缺失会导致 "path resolution failed"。
+        // tools(OpenAI function schema)让 LLM 知晓可用工具的真实名字与
+        // 参数形状,否则模型只能凭训练先验盲猜(如 read_file≠file_read)或输出
+        // 供应商原生格式(<minimax:tool_call> XML),两侧解析器均无法消费。
+        let mut params = serde_json::json!({
+            "model": self.config.model,
+            "temperature": self.config.temperature,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": goal },
+            ],
+        });
+        if let Some(tools) = tools {
+            params["tools"] = Value::Array(tools);
+        }
         serde_json::json!({
             "type": "call_external",
-            "params": {
-                "model": self.config.model,
-                "temperature": self.config.temperature,
-                "messages": [
-                    { "role": "system", "content": system_prompt },
-                    { "role": "user", "content": goal },
-                ],
-            }
+            "params": params,
         })
     }
 
@@ -1365,6 +1442,14 @@ impl AgentRunner {
             JsonValue::string(temperature.to_string()),
         );
         call_params.insert("messages".to_string(), tcb_messages);
+
+        // 转发 constitution 中继的 tools(OpenAI function schema)。
+        // 引擎 io_request 规则以 `tools?` 键中继指令的 tools;缺了它 LLM 只能凭
+        // 训练先验盲猜工具名(如 read_file≠file_read)或输出供应商原生 XML,
+        // 两侧解析器均无法消费 —— 与 build_call_external_command 的注入同源。
+        if let Some(tools) = params.get("tools") {
+            call_params.insert("tools".to_string(), serde_to_tcb(tools));
+        }
 
         // G17:LLM 调用计时 + 指标(observe_llm_call 在 ? 之前记录,确保 error 也被统计)
         let llm_start = std::time::Instant::now();
@@ -2141,8 +2226,9 @@ impl AgentRunner {
                 }
             };
 
-            // 6. 提交 call_external 命令
-            let command = runner.build_call_external_command(&system_prompt, &goal);
+            // 6. 提交 call_external 命令(携带工具 OpenAI schema)
+            let command =
+                runner.build_call_external_command(&system_prompt, &goal, runner.openai_tools_payload());
             if let Err(e) = runner.evorule_client.submit_command(&session_id, &command).await {
                 yield Err(AgentError::EvoruleError(e.to_string()));
                 return;
@@ -2323,6 +2409,10 @@ impl AgentRunner {
                                 call_params.insert("model".to_string(), JsonValue::string(model.to_string()));
                                 call_params.insert("temperature".to_string(), JsonValue::string(temperature.to_string()));
                                 call_params.insert("messages".to_string(), tcb_messages);
+                                // 转发 constitution 中继的 tools(同 handle_call_external 非流式路径)
+                                if let Some(tools) = params.get("tools") {
+                                    call_params.insert("tools".to_string(), serde_to_tcb(tools));
+                                }
                                 let call_params_json = JsonValue::Object(call_params);
 
                                 // G1:启动流式 LLM 调用
