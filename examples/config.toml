@@ -10,13 +10,14 @@ provider = "minimax"
 # api_key 支持 ${ENV:VAR_NAME} 占位符,加载时展开为环境变量值
 api_key = "${ENV:MINIMAX_API_KEY}"
 model = "MiniMax-M2.5"
-api_base = "https://api.minimax.io/v1/text/chatcompletion_v2"
+# 国际版端点(api.minimaxi.com);sk-cp- 前缀国际版 key 在国内版域名无效
+api_base = "https://api.minimaxi.com/v1/text/chatcompletion_v2"
 timeout_secs = 60
 max_retries = 3
 
 [evorule]
 # evorule HTTP 服务地址
-base_url = "http://localhost:8080"
+base_url = "http://localhost:18080"
 # evorule API key(留空 = evorule 本身无鉴权)
 api_key = ""
 timeout_secs = 30
