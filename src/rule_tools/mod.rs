@@ -10,7 +10,7 @@ pub mod dataset_tools;
 pub mod knowledge_tools;
 pub mod production_tools;
 pub mod publish_tools;
-pub mod rule_tools;
+pub mod rule_crud;
 pub mod sandbox_tools;
 pub mod translate_tools;
 pub mod workspace_tools;
@@ -24,7 +24,7 @@ use crate::io_handlers::tool_handler::ToolHandler;
 pub fn rule_management_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
     let mut h = ToolHandler::new();
     workspace_tools::register(&mut h, ws);
-    rule_tools::register(&mut h, ws);
+    rule_crud::register(&mut h, ws);
     audit_tools::register(&mut h, ev);
     h
 }
@@ -46,7 +46,7 @@ pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> Tool
 pub fn rule_tool_specs() -> Vec<ToolSpec> {
     let mut specs = Vec::new();
     specs.extend(workspace_tools::specs());
-    specs.extend(rule_tools::specs());
+    specs.extend(rule_crud::specs());
     specs.extend(translate_tools::specs());
     specs.extend(audit_tools::specs());
     specs.extend(sandbox_tools::specs());

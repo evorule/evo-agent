@@ -11,8 +11,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::pin::Pin;
 
+/// evorule server HTTP API 客户端（会话 / Fact / 审计 / bundle 部署）。
 #[derive(Debug, Clone)]
 pub struct EvoruleApiClient {
+    /// 复用的 HTTP 核心客户端（共享 base_url 与认证头注入）。
     core: ApiCore,
 }
 
@@ -31,6 +33,7 @@ impl EvoruleApiClient {
         self.core.base_url()
     }
 
+    /// 创建新会话，返回会话 ID。`initial_content` 为可选的初始 payload 内容。
     pub async fn create_session(
         &self,
         initial_content: Option<&Value>,
@@ -60,6 +63,7 @@ impl EvoruleApiClient {
         Ok(session_id)
     }
 
+    /// 从父会话 fork 出新会话，可选指定继承到的版本号。
     pub async fn create_session_fork(
         &self,
         parent_id: &str,
@@ -92,6 +96,7 @@ impl EvoruleApiClient {
         Ok(session_id)
     }
 
+    /// 向会话提交一条业务指令（POST command）。
     pub async fn submit_command(&self, session_id: &str, command: &Value) -> Result<(), ApiError> {
         let url = format!(
             "{}/api/sessions/{}/command",
@@ -111,6 +116,7 @@ impl EvoruleApiClient {
         Ok(())
     }
 
+    /// 回应会话的 IO 请求（POST io_response），`error` 非空表示 IO 执行失败。
     pub async fn submit_io_response(
         &self,
         session_id: &str,
@@ -141,6 +147,7 @@ impl EvoruleApiClient {
         Ok(())
     }
 
+    /// 按 path 更新会话 payload 中的指定值。
     pub async fn update_payload(
         &self,
         session_id: &str,
@@ -169,6 +176,7 @@ impl EvoruleApiClient {
         Ok(())
     }
 
+    /// 获取会话当前状态（GET state，返回完整 state JSON）。
     pub async fn get_state(&self, session_id: &str) -> Result<Value, ApiError> {
         let url = format!("{}/api/sessions/{}/state", self.core.base_url(), session_id);
 
@@ -183,6 +191,7 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 获取会话 Fact 列表，`prefix` 可选按 path 前缀过滤。
     pub async fn get_facts(
         &self,
         session_id: &str,
@@ -210,6 +219,7 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 获取跨会话共享 Fact 列表，`prefix` 可选按 path 前缀过滤。
     pub async fn get_shared_facts(
         &self,
         prefix: Option<&str>,
@@ -252,6 +262,7 @@ impl EvoruleApiClient {
         Ok(())
     }
 
+    /// 查询共享 Fact 的来源会话信息。
     pub async fn get_shared_fact_source(&self, fact_id: u64) -> Result<SharedFactEntry, ApiError> {
         let url = format!(
             "{}/api/shared/facts/{}/source",
@@ -270,6 +281,7 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 记录本会话启动时使用了哪些共享 Fact（回写 used_at_startup）。
     pub async fn record_used_at_startup(
         &self,
         session_id: &str,
@@ -296,6 +308,7 @@ impl EvoruleApiClient {
         Ok(())
     }
 
+    /// 查询本会话启动时使用过的共享 Fact ID 列表。
     pub async fn get_used_at_startup(&self, session_id: &str) -> Result<Vec<u64>, ApiError> {
         let url = format!(
             "{}/api/sessions/{}/used_at_startup",
@@ -321,6 +334,7 @@ impl EvoruleApiClient {
         Ok(fact_ids)
     }
 
+    /// 查询哪些会话使用过指定共享 Fact，返回会话 ID 列表。
     pub async fn get_sessions_using_fact(&self, fact_id: u64) -> Result<Vec<u64>, ApiError> {
         let url = format!(
             "{}/api/shared/facts/{}/used_by",
@@ -346,6 +360,7 @@ impl EvoruleApiClient {
         Ok(sessions)
     }
 
+    /// 获取会话审计报告（GET audit，返回完整报告 JSON）。
     pub async fn get_audit_report(&self, session_id: &str) -> Result<Value, ApiError> {
         let url = format!("{}/api/sessions/{}/audit", self.core.base_url(), session_id);
 
@@ -453,6 +468,7 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 回退会话到指定版本（GET rewind）。
     pub async fn rewind(&self, session_id: &str, version: u64) -> Result<Value, ApiError> {
         let url = format!(
             "{}/api/sessions/{}/rewind?version={}",
@@ -472,6 +488,7 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 全量重放会话 Fact 流（GET replay，按版本序返回 Fact JSON 列表）。
     pub async fn replay(&self, session_id: &str) -> Result<Vec<Value>, ApiError> {
         let url = format!(
             "{}/api/sessions/{}/replay",
@@ -523,6 +540,7 @@ impl EvoruleApiClient {
         Ok(resp.json().await?)
     }
 
+    /// 对比会话两个版本的 payload 差异（GET diff）。
     pub async fn diff(&self, session_id: &str, a: u64, b: u64) -> Result<Value, ApiError> {
         let url = format!(
             "{}/api/sessions/{}/diff?a={}&b={}",
@@ -543,6 +561,7 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 订阅会话 SSE 事件流，返回可逐事件拉取的流对象。
     pub async fn subscribe_events(&self, session_id: &str) -> Result<EvoruleEventStream, ApiError> {
         let url = format!(
             "{}/api/sessions/{}/events",
@@ -568,6 +587,7 @@ impl EvoruleApiClient {
         })
     }
 
+    /// 获取调试信息：当前执行阶段（GET debug/phase）。
     pub async fn get_debug_phase(&self, session_id: &str) -> Result<Value, ApiError> {
         let url = format!(
             "{}/api/sessions/{}/debug/phase",
@@ -586,6 +606,7 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 获取调试信息：指令队列（GET debug/queue）。
     pub async fn get_debug_queue(&self, session_id: &str) -> Result<Value, ApiError> {
         let url = format!(
             "{}/api/sessions/{}/debug/queue",
@@ -604,6 +625,7 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 获取调试信息：待回应的 IO 请求（GET debug/pending_io）。
     pub async fn get_debug_pending_io(&self, session_id: &str) -> Result<Value, ApiError> {
         let url = format!(
             "{}/api/sessions/{}/debug/pending_io",
@@ -708,6 +730,7 @@ impl EvoruleApiClient {
     /// - `q`：包含匹配（entry_id/schema_ref/bundle_id/payload）；
     /// - `domain`：领域精确匹配（忽略大小写）；
     /// - `tags`：逗号分隔标签（任一命中）。
+    ///
     /// 数据集未承载 → 404 显式（区分"不存在"与"过滤后为空"）。
     pub async fn knowledge_entries(
         &self,
@@ -772,13 +795,17 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// 会话 Fact 条目（GET facts 返回元素）。
 #[derive(Debug, Deserialize, Clone)]
 pub struct FactEntry {
+    /// Fact 版本号。
     pub version: u64,
     /// server 返回 "fact_id"；映射到 id 保持现有引用不变（B1 契约修复）
     #[serde(rename = "fact_id", default)]
     pub id: u64,
+    /// Fact 路径。
     pub path: String,
+    /// Fact 值（任意 JSON）。
     pub value: Value,
     /// server 不返回 "type"；default 兜底避免反序列化失败（B1 契约修复）
     #[serde(rename = "type", default)]
@@ -788,11 +815,15 @@ pub struct FactEntry {
 /// /replay 返回的单个 Fact（fact.to_json() + version）
 #[derive(Debug, Clone, Deserialize)]
 pub struct FactLogEntry {
+    /// Fact 版本号。
     pub version: u64,
+    /// Fact 类型（扁平捕获自原始 JSON）。
     #[serde(rename = "type", default)]
     pub fact_type: String,
+    /// Fact ID（server 返回 "fact_id"，缺失时为 0）。
     #[serde(rename = "fact_id", default)]
     pub id: u64,
+    /// 因果父 Fact 版本号。
     #[serde(default)]
     pub cause: Option<u64>,
     /// 变体字段扁平捕获（path/value/instruction/io_type/params/result/...）
@@ -801,40 +832,55 @@ pub struct FactLogEntry {
 }
 
 impl FactLogEntry {
+    /// 读取扁平捕获中的 path 字段。
     pub fn path(&self) -> Option<&str> {
         self.payload.get("path").and_then(|v| v.as_str())
     }
+    /// 读取扁平捕获中的 value 字段。
     pub fn value(&self) -> Option<&Value> {
         self.payload.get("value")
     }
+    /// 读取扁平捕获中的 instruction 字段。
     pub fn instruction(&self) -> Option<&Value> {
         self.payload.get("instruction")
     }
 }
 
+/// 跨会话共享 Fact 条目。
 #[derive(Debug, Deserialize, Clone)]
 pub struct SharedFactEntry {
+    /// Fact ID。
     pub fact_id: u64,
+    /// Fact 路径。
     pub path: String,
+    /// Fact 值（任意 JSON）。
     pub value: Value,
+    /// 来源会话 ID。
     pub source_session_id: u64,
+    /// Fact 版本号。
     pub version: u64,
 }
 
+/// 会话 SSE 事件流（按行缓冲解析 `data:` 帧）。
 pub struct EvoruleEventStream {
+    /// 未消费的字节缓冲。
     buffer: Vec<u8>,
+    /// 底层字节流。
     stream: Pin<Box<dyn futures_core::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
 }
 
+/// SSE 事件流中的单个事件（type 字段 + 扁平捕获的其余字段）。
 #[derive(Debug, Deserialize)]
 pub struct EvoruleEvent {
+    /// 事件类型（如 IoRequest / Stable）。
     #[serde(rename = "type")]
     pub event_type: String,
+    /// 事件其余字段扁平捕获。
     #[serde(flatten)]
     pub payload: Value,
 }
-
 impl EvoruleEventStream {
+    /// 拉取下一个事件；流结束或解析错误时返回 None。
     pub async fn next(&mut self) -> Option<EvoruleEvent> {
         let mut data = String::new();
 

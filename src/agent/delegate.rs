@@ -6,8 +6,8 @@
 //! ## G9:多 agent 编排
 //!
 //! 在原有串行单子 agent 委托(`delegate`)基础上,新增:
-//! - [`DelegateContext::delegate_parallel`]:并行委托多个子 agent(`join_all`)
-//! - [`DelegateContext::delegate_race`]:竞速委托(任一完成即返回,取消其余)
+//! - [`DelegateContext::delegate_parallel`] — 并行委托多个子 agent(`join_all`)
+//! - [`DelegateContext::delegate_race`] — 竞速委托(任一完成即返回,取消其余)
 //! - **深度强制**:`delegate()` 现在会检查 `current_depth >= max_depth`,超限直接返回 Err
 //!   (旧版只提供 `can_delegate` 辅助方法但不强制,容易无限递归)
 //! - **并发限流**:`max_concurrent` 用 `tokio::sync::Semaphore` 限制并行子 agent 数,
@@ -22,6 +22,9 @@ use tokio::sync::Semaphore;
 use crate::agent::definition::AgentDefinitionManager;
 use crate::agent::runner::DEFAULT_MAX_DELEGATE_DEPTH;
 use crate::api::evorule_client::EvoruleApiClient;
+
+/// 委托任务的 boxed future 类型别名（降低 delegate_race 的类型复杂度）。
+type DelegateFuture = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
 
 /// G9:并行委托的默认并发上限(§9.6 风险缓解,默认 5)
 pub const DEFAULT_MAX_CONCURRENT_DELEGATES: usize = 5;
@@ -243,7 +246,7 @@ impl DelegateContext {
     ///
     /// 第一个完成子 agent 的 `Result<String, String>`。
     pub async fn delegate_race(&self, tasks: Vec<(String, String)>) -> Result<String, String> {
-        let futures: Vec<Pin<Box<dyn Future<Output = Result<String, String>> + Send>>> = tasks
+        let futures: Vec<DelegateFuture> = tasks
             .into_iter()
             .map(|(agent_type, task)| {
                 let ctx = self.increment_depth();

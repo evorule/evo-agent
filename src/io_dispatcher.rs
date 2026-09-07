@@ -38,6 +38,12 @@ pub struct IoDispatcherBuilder {
     tool_handler: Option<ToolHandler>,
 }
 
+impl Default for IoDispatcherBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IoDispatcherBuilder {
     /// Create new builder
     pub fn new() -> Self {
@@ -63,7 +69,7 @@ impl IoDispatcherBuilder {
     pub fn build(self) -> IoDispatcher {
         IoDispatcher::new(
             self.llm_handler.unwrap_or_else(LlmHandler::with_defaults),
-            self.tool_handler.unwrap_or_else(ToolHandler::new),
+            self.tool_handler.unwrap_or_default(),
         )
     }
 }

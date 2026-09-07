@@ -331,10 +331,9 @@ fn strip_markdown_codeblock(s: &str) -> String {
     };
     // 去掉结尾的 ```
     let result = after_first_line.trim_end();
-    if result.ends_with("```") {
-        result[..result.len() - 3].trim().to_string()
-    } else {
-        result.to_string()
+    match result.strip_suffix("```") {
+        Some(stripped) => stripped.trim().to_string(),
+        None => result.to_string(),
     }
 }
 
@@ -950,7 +949,7 @@ impl AgentRunner {
         if self.pending_messages.is_empty() || self.memory.is_none() {
             return Ok(());
         }
-        let drained: Vec<(usize, Message)> = self.pending_messages.drain(..).collect();
+        let drained: Vec<(usize, Message)> = std::mem::take(&mut self.pending_messages);
         if let Some(memory) = self.memory.as_mut() {
             // &Vec<T> 自动 coercion 为 &[T]
             memory.append_messages_batch(session_id, &drained).await?;
@@ -2482,7 +2481,7 @@ impl AgentRunner {
                                         "is_finished": is_finished,
                                         // core_eval v0.3.1:merge 规则引用 llm_response.messages
                                         "messages": serde_json::to_value(&messages)
-                                            .unwrap_or_else(|_| serde_json::Value::Null),
+                                            .unwrap_or(serde_json::Value::Null),
                                     });
                                     if let Err(e) = runner.evorule_client
                                         .submit_io_response(&session_id, rid, &resp, None)

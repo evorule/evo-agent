@@ -11,16 +11,27 @@ use thiserror::Error;
 /// 统一 API 错误（全仓唯一，由原 EvoruleApiError 演化而来）
 #[derive(Error, Debug)]
 pub enum ApiError {
+    /// HTTP 传输层失败（连接/超时/解码等）。
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] reqwest::Error),
+    /// server 返回非 2xx 状态。
     #[error("API returned error: {status} {message}")]
-    ApiError { status: u16, message: String },
+    ApiError {
+        /// HTTP 状态码。
+        status: u16,
+        /// 错误详情（server error 字段或响应体）。
+        message: String,
+    },
+    /// 响应体结构不符合预期契约。
     #[error("Invalid response format")]
     InvalidResponse,
+    /// 目标会话不存在（404 语义化）。
     #[error("Session not found")]
     SessionNotFound,
+    /// 指定版本号非法（如超出会话版本范围）。
     #[error("Invalid version: {0}")]
     InvalidVersion(String),
+    /// 请求/响应序列化失败。
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
 }

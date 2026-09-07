@@ -434,11 +434,7 @@ fn extract_json_from_text(text: &str) -> String {
     if let Some(start) = trimmed.find("```") {
         let after_code = &trimmed[start + 3..];
         // 跳过语言标识(如 json)
-        let after_lang = if after_code.starts_with("json") {
-            &after_code[4..]
-        } else {
-            after_code
-        };
+        let after_lang = after_code.strip_prefix("json").unwrap_or(after_code);
         if let Some(end) = after_lang.find("```") {
             return after_lang[..end].trim().to_string();
         }
@@ -470,12 +466,6 @@ mod tests {
         Message::Assistant {
             content: content.to_string(),
             tool_calls: None,
-        }
-    }
-
-    fn system(content: &str) -> Message {
-        Message::System {
-            content: content.to_string(),
         }
     }
 

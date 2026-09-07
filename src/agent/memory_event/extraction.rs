@@ -357,11 +357,7 @@ fn extract_json_from_text(text: &str) -> String {
     if let Some(start) = trimmed.find("```") {
         let after_code = &trimmed[start + 3..];
         // 跳过语言标识(如 json)
-        let after_lang = if after_code.starts_with("json") {
-            &after_code[4..]
-        } else {
-            after_code
-        };
+        let after_lang = after_code.strip_prefix("json").unwrap_or(after_code);
         if let Some(end) = after_lang.find("```") {
             return after_lang[..end].trim().to_string();
         }
@@ -444,8 +440,10 @@ mod tests {
 
     #[test]
     fn test_custom_keywords() {
-        let mut config = ExtractionConfig::default();
-        config.keywords = vec!["面试".to_string(), "offer".to_string()];
+        let config = ExtractionConfig {
+            keywords: vec!["面试".to_string(), "offer".to_string()],
+            ..ExtractionConfig::default()
+        };
         let extractor = EventExtractor::new(LlmHandler::mock(""), config);
 
         assert_eq!(

@@ -13,14 +13,14 @@
 //! 运行:`cargo run --example bridge_agent_definition`
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::Path;
 
 use evo_agent::agent::definition::AgentDefinitionManager;
 use evo_agent::agent::runner::AgentRunner;
 use evo_agent::api::evorule_client::EvoruleApiClient;
 use evo_agent::builtin_tools::default_safe_toolkit;
 
-fn write_agent_json(dir: &PathBuf) {
+fn write_agent_json(dir: &Path) {
     let path = dir.join("researcher.json");
     let mut f = std::fs::File::create(&path).expect("create file");
     f.write_all(

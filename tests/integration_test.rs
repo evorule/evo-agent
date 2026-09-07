@@ -318,9 +318,11 @@ async fn test_full_workflow_with_all_features() {
         .await;
 
     let client = EvoruleApiClient::new(&server_url);
-    let mut config = AgentConfig::default();
-    config.system_prompt = "Safety first assistant".to_string();
-    config.tool_names = vec!["safety_check".to_string()];
+    let config = AgentConfig {
+        system_prompt: "Safety first assistant".to_string(),
+        tool_names: vec!["safety_check".to_string()],
+        ..AgentConfig::default()
+    };
 
     let mut runner =
         AgentRunner::new(config, client).with_llm_handler(LlmHandler::mock("Mock LLM response"));

@@ -554,12 +554,10 @@ mod tests {
             }
             other => panic!("expected Candidate, got {:?}", other),
         }
-        match ShellExecTool::classify("curl") {
-            // 注意:curl 在 candidate 中虽然有合法用途,但被划到 blocked
-            // 因为我们用 http_get 工具替代它(0.2.0)
-            // 这里先测试不会 panic
-            _ => {}
-        }
+        // 注意:curl 在 candidate 中虽然有合法用途,但被划到 blocked
+        // 因为我们用 http_get 工具替代它(0.2.0)
+        // 这里先测试不会 panic
+        let _ = ShellExecTool::classify("curl");
     }
 
     #[test]
@@ -627,8 +625,7 @@ mod tests {
         // mkdir 是 candidate 命令,加 approved=true 应该执行
         let result = tool.call_sync(&arg_with("mkdir test_dir_42", true));
         // mkdir 可能成功或失败(取决于系统),但不会是 proposal
-        if result.is_ok() {
-            let v = result.unwrap();
+        if let Ok(v) = result {
             assert_eq!(v.get("status").unwrap().as_str().unwrap(), "ok");
             // 验证目录真创建了
             assert!(tmp.path().join("test_dir_42").exists());
