@@ -21,7 +21,7 @@
 //! model = "MiniMax-M2.5"
 //!
 //! [evorule]
-//! base_url = "http://localhost:8080"
+//! base_url = "http://localhost:18080"
 //!
 //! [agents]
 //! dir = "./agents"
@@ -129,7 +129,7 @@ fn default_evorule_timeout() -> u64 {
 impl EvoruleConfig {
     /// TODO: doc
     pub fn default_base_url() -> String {
-        "http://localhost:8080".to_string()
+        "http://localhost:18080".to_string()
     }
     /// TODO: doc
     pub fn default_api_key() -> String {
@@ -187,8 +187,7 @@ impl Default for LoggingConfig {
 /// ```
 ///
 /// 环境变量:`EVO_AGENT_AUTH__ENABLED=true`、`EVO_AGENT_AUTH__TOKENS=t1,t2`
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AuthConfigFile {
     /// 是否启用鉴权(默认 false,开发模式)
     #[serde(default)]
@@ -197,7 +196,6 @@ pub struct AuthConfigFile {
     #[serde(default)]
     pub tokens: Vec<String>,
 }
-
 
 impl AuthConfigFile {
     /// 转换为 API 层的 `AuthConfig`
@@ -717,7 +715,7 @@ mod tests {
     fn test_default_config() {
         let cfg = Config::default();
         assert_eq!(cfg.llm.provider, "minimax");
-        assert_eq!(cfg.evorule.base_url, "http://localhost:8080");
+        assert_eq!(cfg.evorule.base_url, "http://localhost:18080");
         assert_eq!(cfg.agents.dir, PathBuf::from("./agents"));
         assert_eq!(cfg.agents.default, "general");
     }
@@ -812,7 +810,7 @@ model = "gpt-4o"
         assert_eq!(cfg.llm.provider, "openai");
         assert_eq!(cfg.llm.model, "gpt-4o");
         // 未被覆盖(保留 default)
-        assert_eq!(cfg.evorule.base_url, "http://localhost:8080");
+        assert_eq!(cfg.evorule.base_url, "http://localhost:18080");
     }
 
     #[test]
