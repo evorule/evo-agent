@@ -34,3 +34,6 @@ _tmp_*
 # file_write 工具沙箱目录（demo 业务产物落盘处）
 workspace/
 
+
+# 本地运行配置（含端点选择与本地路径,不随仓分发,密钥走 ENV 引用）
+evo-agent.toml
