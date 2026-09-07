@@ -378,7 +378,10 @@ fn cmd_run(
     };
 
     // 3. evorule + workspace 客户端(规则管理工具依赖 workspace API)
-    let client = EvoruleApiClient::new(&config.evorule.base_url);
+    let client = EvoruleApiClient::with_auth_token(
+        &config.evorule.base_url,
+        Some(&config.evorule.api_key),
+    );
     let ws_client = WorkspaceApiClient::new(&config.evorule.base_url);
 
     // 4. 工具 handler:内置安全工具(6) + 规则管理工具(20) 的 union
@@ -877,7 +880,10 @@ fn cmd_serve(
     // 4. 构造 API state
     let agents_dir = config.agents.dir.clone();
     let definitions = AgentDefinitionManager::new(agents_dir);
-    let evorule_client = EvoruleApiClient::new(&config.evorule.base_url);
+    let evorule_client = EvoruleApiClient::with_auth_token(
+        &config.evorule.base_url,
+        Some(&config.evorule.api_key),
+    );
     // E1:构造 workspace_client + union toolkit(启动时一次组装 26 个工具)
     let workspace_client = std::sync::Arc::new(WorkspaceApiClient::new(evorule_client.base_url()));
     let mut toolkit = evo_agent::api::serve_tools::build_union_toolkit(
@@ -1141,7 +1147,10 @@ fn cmd_workflow(
 
     // 4. 构造 DelegateContext
     let definitions = AgentDefinitionManager::new(config.agents.dir.clone());
-    let client = EvoruleApiClient::new(&config.evorule.base_url);
+    let client = EvoruleApiClient::with_auth_token(
+        &config.evorule.base_url,
+        Some(&config.evorule.api_key),
+    );
     let mut ctx =
         DelegateContext::new("workflow_root", definitions, client).with_max_depth(max_depth);
     if max_concurrent > 0 {
@@ -1232,7 +1241,10 @@ fn cmd_repl(
         }
     };
 
-    let client = EvoruleApiClient::new(&config.evorule.base_url);
+    let client = EvoruleApiClient::with_auth_token(
+        &config.evorule.base_url,
+        Some(&config.evorule.api_key),
+    );
 
     // session 文件路径(Q14:B 跨进程恢复)
     let session_file = workdir.join(".evo-agent").join("session");
@@ -1658,7 +1670,10 @@ fn cmd_replay(
     };
 
     // 2. 构造 evorule client + MemoryEventStore
-    let client = EvoruleApiClient::new(&config.evorule.base_url);
+    let client = EvoruleApiClient::with_auth_token(
+        &config.evorule.base_url,
+        Some(&config.evorule.api_key),
+    );
     let namespace = agent.unwrap_or(&config.agents.default);
     let mut store = MemoryEventStore::new(namespace, client);
     store.set_session_id(session);
