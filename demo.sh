@@ -4,6 +4,10 @@
 # -> run a finance demo session (LLM + tools, fully audited) -> replay the
 # fact chain with hash-chain verification.
 #
+# Success is dual-criteria: the audit chain must verify AND the business
+# artifact must exist on disk (workspace/expenses_2026.json with the 45.50
+# entry). A verified audit of "nothing happened" is a false success.
+#
 # Prerequisites:
 #   - bash, curl, cargo (https://rustup.rs)
 #   - an LLM API key, exported as an environment variable:
@@ -85,10 +89,15 @@ else
   DEMO_TOKEN=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
   SRV_DIR=$(dirname "$SRV_BIN")
   mkdir -p "$SRV_DIR/data"
+  # evo-agent's ReAct loop script is consumer-owned (locality principle):
+  # the bundled server_eval.json bridge collect template expects a different
+  # tool_calls shape; the agent ships its own full constitution instead.
+  # (absolute path: resolved here, before the subshell cds into SRV_DIR)
+  CORE_EVAL="$(pwd)/assets/agent_constitution.json"
   (cd "$SRV_DIR" && nohup "$(pwd)/$(basename "$SRV_BIN")" \
     --addr "127.0.0.1:$SERVER_PORT" --web-dir web --rules-dir rules \
     --service-registry service_registry.json \
-    --core-eval resources/server_eval.json \
+    --core-eval "$CORE_EVAL" \
     --wal-dir ./data/wal --wal-fsync \
     --auth-token "$DEMO_TOKEN" \
     2>>server-stderr.log >/dev/null &)
@@ -129,7 +138,9 @@ cargo build --quiet
 echo "PASS: build"
 
 echo "== [4/5] running finance demo session (streaming) =="
-GOAL="Register one expense: date 2026-09-07, item 'Team lunch', amount 45.50 CNY, category 'Catering', submitter 'evo-agent-demo'. Write it into expenses/expenses_2026.json as a JSON array (create the file if missing; append if it exists). Confirm the written path in one sentence."
+# file_write sandbox: only <workdir>/workspace/ is writable -> aim the goal there
+mkdir -p workspace
+GOAL="Register one expense: date 2026-09-07, item 'Team lunch', amount 45.50 CNY, category 'Catering', submitter 'evo-agent-demo'. Write it into workspace/expenses_2026.json as a JSON array (create the file if missing; append if it exists). Confirm the written path in one sentence."
 STDERR_LOG="$DEMO_DIR/run-stderr.log"
 set +e
 ./target/debug/evo-agent run "$GOAL" --stream --agent general 2>"$STDERR_LOG"
@@ -147,7 +158,21 @@ fi
 echo "PASS: session created (id=$SESSION_ID)"
 
 echo
-echo "== [5/5] audit chain verification =="
+echo "== [5/5] business artifact + audit chain verification =="
+# dual-criteria (fail-fast): the run exit code alone can hide a false success
+# (e.g. the LLM chats nicely but never executes the tool). Require the file.
+BIZ_OK=1
+if [ ! -f workspace/expenses_2026.json ]; then
+  echo "FAIL: business task not completed - workspace/expenses_2026.json was not created"
+  echo "  (the audit report below may still verify; a verified audit of"
+  echo "   'nothing happened' is exactly the false success this check guards)"
+  BIZ_OK=0
+elif ! grep -q '45\.50' workspace/expenses_2026.json; then
+  echo "FAIL: business task not completed - workspace/expenses_2026.json lacks the 45.50 entry"
+  BIZ_OK=0
+else
+  echo "PASS: business artifact written (workspace/expenses_2026.json contains 45.50)"
+fi
 AUTH=()
 if [ -n "${EVORULE_AUTH_TOKEN:-}" ]; then AUTH=(-H "Authorization: Bearer $EVORULE_AUTH_TOKEN"); fi
 # GET /api/sessions/{id}/audit/verify -> AuditVerify {verified, fact_count, last_hash}
@@ -163,12 +188,19 @@ echo "-- audit report (fact chain) --"
 curl -s "${AUTH[@]}" "$SERVER_URL/api/sessions/$SESSION_ID/audit" | head -c 4000
 echo
 
+if [ "$BIZ_OK" -ne 1 ]; then
+  echo "== RESULT: FAIL (business task not completed) =="
+  exit 1
+fi
+
 echo
 echo "============================================================="
 echo " DEMO COMPLETE"
 echo " - finance session ran with every LLM/tool call turned into"
 echo "   auditable facts by the evorule engine"
-echo " - replay --verify checked the fact hash chain"
+echo " - audit/verify checked the fact hash chain"
+echo " - business artifact on disk: workspace/expenses_2026.json"
+echo "   (45.50 entry present - the task really happened)"
 echo " - browse the audit trail: $SERVER_URL"
 echo " - stop the demo server:  pkill -f evorule-server"
 echo " - reset anytime: delete the .demo folder"
