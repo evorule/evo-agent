@@ -774,3 +774,80 @@ impl ToolFunction for ApprovalAwareTool {
         }
     }
 }
+
+/// 工具调用契约对齐锁定：constitution 模板/io_request 键与内部 ToolCall 序列化形状
+/// ({tool_name, args}) 一致 —— 防三处契约再漂移（collect 模板 / io_request 键 / 消息回传）。
+/// ①collect 模板消费 {{tool_name}}；②call_service io_request 参数键统一 tool_name；
+/// ③消息回传出站转换由 llm_handler::to_openai_wire_messages 单测锁定。
+#[test]
+fn test_constitution_tool_call_contract_alignment() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let path = std::path::Path::new(manifest).join("assets/agent_constitution.json");
+    let text = std::fs::read_to_string(&path).expect("read agent_constitution.json");
+    let doc: serde_json::Value = serde_json::from_str(&text).expect("constitution is valid JSON");
+
+    fn walk(v: &serde_json::Value, keys: &mut Vec<String>, strings: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    keys.push(k.clone());
+                    walk(val, keys, strings);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, keys, strings);
+                }
+            }
+            serde_json::Value::String(s) => strings.push(s.clone()),
+            _ => {}
+        }
+    }
+    let mut keys = Vec::new();
+    let mut strings = Vec::new();
+    walk(&doc, &mut keys, &mut strings);
+
+    // ①无 {{name}} 模板引用（内部 tool_calls 元素形状为 {tool_name, args}）
+    assert!(
+        !strings.iter().any(|s| s.contains("{{name}}")),
+        "constitution 不得再引用 name 模板（内部 tool_calls 形状字段是 tool_name）"
+    );
+    // ②无 service_name 参数键（runner handle_call_service 统一读 tool_name）
+    assert!(
+        !keys.iter().any(|k| k == "service_name"),
+        "constitution 不得再用 service_name 作为参数键"
+    );
+    // ①collect 模板消费 {{tool_name}}
+    assert!(
+        strings.iter().any(|s| s.contains("{{tool_name}}")),
+        "collect 模板必须消费 tool_name 字段"
+    );
+    // ②call_service io_request 携带 tool_name 键
+    fn find_call_service_io<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                if map.get("type").and_then(|t| t.as_str()) == Some("io_request") {
+                    out.push(v);
+                }
+                for val in map.values() {
+                    find_call_service_io(val, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    find_call_service_io(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut io_requests = Vec::new();
+    find_call_service_io(&doc, &mut io_requests);
+    assert!(
+        io_requests
+            .iter()
+            .any(|r| r["params"]["io_type"] == "call_service"
+                && r["params"].get("tool_name").is_some()),
+        "call_service io_request 必须携带 tool_name 键"
+    );
+}

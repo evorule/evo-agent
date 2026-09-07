@@ -282,7 +282,7 @@
                           "each": {
                             "type": "call_service",
                             "params": {
-                              "service_name": "{{name}}",
+                              "tool_name": "{{tool_name}}",
                               "args": "{{args}}"
                             }
                           }
@@ -395,7 +395,7 @@
                   "type": "io_request",
                   "params": {
                     "io_type": "call_service",
-                    "service_name": "__exec__.instruction.params.service_name",
+                    "tool_name": "__exec__.instruction.params.tool_name",
                     "args?": "__exec__.instruction.params.args"
                   }
                 }

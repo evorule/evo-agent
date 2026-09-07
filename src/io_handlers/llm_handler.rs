@@ -277,10 +277,12 @@ impl LlmHandler {
         if params_val.get("messages").is_some() {
             body.insert(
                 "messages".to_string(),
-                params_val
-                    .get("messages")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
+                to_openai_wire_messages(
+                    params_val
+                        .get("messages")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                ),
             );
         } else {
             body.insert(
@@ -691,6 +693,79 @@ fn build_tool_calls(acc: &BTreeMap<usize, ToolCallAccumulator>) -> Option<Vec<To
     }
 }
 
+/// 把内部消息历史转换为 OpenAI wire 形状（出站边界转换）:
+/// - Assistant.tool_calls: 内部 `{tool_name, args}` → `{id, type:"function", function:{name, arguments}}`
+///   （已是 function 形状的项原样透传，兼容上游已转换的历史）
+/// - Tool 消息: `tool_name` → `tool_call_id`（按名 FIFO 配对最近一个 assistant 产生的未消费 id，
+///   无可配对时回退 `call_{tool_name}`），并移除非标准的 `tool_name` 键
+///
+/// 其余消息与字段原样保留。id 确定性生成（`call_{index}_{name}`），同一 assistant 消息内
+/// 多个同名 tool_call 按 index 区分。
+fn to_openai_wire_messages(messages: serde_json::Value) -> serde_json::Value {
+    let Some(arr) = messages.as_array() else {
+        return messages;
+    };
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(arr.len());
+    // (tool_name, id) 待配对队列：assistant 产生、随后的 tool 消息按名 FIFO 消费
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for msg in arr {
+        let Some(obj) = msg.as_object() else {
+            out.push(msg.clone());
+            continue;
+        };
+        let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let mut converted = obj.clone();
+        match role {
+            "assistant" => {
+                pending.clear();
+                if let Some(calls) = obj.get("tool_calls").and_then(|v| v.as_array()) {
+                    let wire: Vec<serde_json::Value> = calls
+                        .iter()
+                        .enumerate()
+                        .map(|(i, call)| {
+                            if call.get("function").is_some() {
+                                return call.clone();
+                            }
+                            let name = call
+                                .get("tool_name")
+                                .or_else(|| call.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let arguments = match call.get("args") {
+                                Some(v) => v.to_string(),
+                                None => "{}".to_string(),
+                            };
+                            let id = format!("call_{}_{}", i, name);
+                            pending.push((name.clone(), id.clone()));
+                            serde_json::json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments}
+                            })
+                        })
+                        .collect();
+                    converted.insert("tool_calls".to_string(), serde_json::Value::Array(wire));
+                }
+            }
+            "tool" => {
+                if let Some(name) = obj.get("tool_name").and_then(|v| v.as_str()) {
+                    let id = pending
+                        .iter()
+                        .position(|(n, _)| n == name)
+                        .map(|pos| pending.remove(pos).1)
+                        .unwrap_or_else(|| format!("call_{}", name));
+                    converted.insert("tool_call_id".to_string(), serde_json::Value::String(id));
+                    converted.remove("tool_name");
+                }
+            }
+            _ => {}
+        }
+        out.push(serde_json::Value::Object(converted));
+    }
+    serde_json::Value::Array(out)
+}
+
 /// G3:判断 HTTP 状态码是否值得重试
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
@@ -837,6 +912,60 @@ fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
 mod tests {
     use super::*;
     use crate::io_handler::IoHandler;
+
+    /// 出站转换:内部 {tool_name, args} → OpenAI function 形状;tool 消息按名配对 id
+    #[test]
+    fn test_wire_messages_converts_internal_tool_calls() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"tool_name": "echo", "args": {"text": "hi"}}]},
+            {"role": "tool", "content": "ok", "tool_name": "echo"}
+        ]);
+        let wire = to_openai_wire_messages(messages);
+        let arr = wire.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        // user 原样
+        assert_eq!(arr[0], serde_json::json!({"role": "user", "content": "hi"}));
+        // assistant tool_calls → function 形状
+        let call = &arr[1]["tool_calls"][0];
+        assert_eq!(call["id"], "call_0_echo");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "echo");
+        assert_eq!(call["function"]["arguments"], r#"{"text":"hi"}"#);
+        assert!(call.get("tool_name").is_none());
+        // tool 消息 → tool_call_id 配对,tool_name 移除
+        assert_eq!(arr[2]["tool_call_id"], "call_0_echo");
+        assert_eq!(arr[2]["content"], "ok");
+        assert!(arr[2].get("tool_name").is_none());
+    }
+
+    /// 出站转换:已是 function 形状的项与 system/user 消息原样透传
+    #[test]
+    fn test_wire_messages_passthrough_wire_shape() {
+        let messages = serde_json::json!([
+            {"role": "system", "content": "sys"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "call_x", "type": "function",
+                             "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "content": "r", "tool_call_id": "call_x"}
+        ]);
+        let wire = to_openai_wire_messages(messages);
+        let arr = wire.as_array().unwrap();
+        assert_eq!(arr[1]["tool_calls"][0]["id"], "call_x");
+        assert_eq!(arr[1]["tool_calls"][0]["function"]["name"], "f");
+        assert_eq!(arr[2]["tool_call_id"], "call_x");
+    }
+
+    /// 出站转换:tool 消息无前置 assistant tool_call 可配对时回退 call_{tool_name}
+    #[test]
+    fn test_wire_messages_tool_fallback_id() {
+        let messages = serde_json::json!([
+            {"role": "tool", "content": "r", "tool_name": "orphan"}
+        ]);
+        let wire = to_openai_wire_messages(messages);
+        assert_eq!(wire[0]["tool_call_id"], "call_orphan");
+    }
 
     #[test]
     fn test_llm_handler_new() {
@@ -1356,9 +1485,7 @@ mod tests {
             .mock("POST", "/")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"base_resp":{"status_code":1004,"status_msg":"login fail"}}"#,
-            )
+            .with_body(r#"{"base_resp":{"status_code":1004,"status_msg":"login fail"}}"#)
             .create_async()
             .await;
 
