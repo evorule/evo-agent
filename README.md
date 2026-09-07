@@ -144,6 +144,8 @@ cargo build --release
 
 > 角色 1/3（`call_external`）在 evorule-server 侧已就绪：挂载 `service_registry.json` 后即可跑通。仓库内置 `echo_server.py` + `dev-start.sh` 演示环境，参考 evorule-server 实战指南。
 
+> **外部插件包生态**：evo-agent 可消费的服务来自三种来源——server 内置（native）、外部插件包（独立服务进程 + `plugin.json` 声明清单，规范见 evorule-server 仓 `docs/PLUGIN_GUIDE.md`）、注册表绑定（registry）。agent 启动期经服务对账端点发现可用服务，按配置白名单注册为本地工具；声明了参数契约的服务会自动生成工具 schema，LLM 可带参真实调用。
+
 ### 启动 Evo-Agent HTTP API
 
 ```bash
