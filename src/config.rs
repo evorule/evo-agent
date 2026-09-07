@@ -120,6 +120,11 @@ pub struct EvoruleConfig {
     /// HTTP 请求超时(秒)
     #[serde(default = "default_evorule_timeout")]
     pub timeout_secs: u64,
+    /// 服务工具白名单:启动时经 GET /api/services 发现,仅注册本列表内的
+    /// server 插件服务为 agent 代理工具(执行经 POST /api/services/{name}/invoke)。
+    /// 空列表 = 不注册任何服务工具(安全默认)。
+    #[serde(default)]
+    pub service_tools: Vec<String>,
 }
 
 fn default_evorule_timeout() -> u64 {
@@ -143,6 +148,7 @@ impl Default for EvoruleConfig {
             base_url: Self::default_base_url(),
             api_key: Self::default_api_key(),
             timeout_secs: default_evorule_timeout(),
+            service_tools: Vec::new(),
         }
     }
 }

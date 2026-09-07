@@ -412,6 +412,23 @@ fn cmd_run(
             );
         }
 
+        // 服务消费桥:按白名单把 server 插件服务注册为代理工具
+        // (发现失败降级继续并明示影响,不阻塞 agent 主流程)
+        if !config.evorule.service_tools.is_empty() {
+            match evo_agent::service_tools::register_service_tools(
+                &mut tool_handler,
+                &client,
+                &config.evorule.service_tools,
+            )
+            .await
+            {
+                Ok(n) => eprintln!("[service-tools] {n} service tool(s) registered"),
+                Err(e) => {
+                    eprintln!("[service-tools] 服务工具注册失败,本次运行无服务工具: {e}")
+                }
+            }
+        }
+
         AgentRunner::from_definition(def, client, tool_handler, Some(llm_handler)).await
     });
     let runner = match runner_result {
@@ -861,11 +878,32 @@ fn cmd_serve(
     let evorule_client = EvoruleApiClient::new(&config.evorule.base_url);
     // E1:构造 workspace_client + union toolkit(启动时一次组装 26 个工具)
     let workspace_client = std::sync::Arc::new(WorkspaceApiClient::new(evorule_client.base_url()));
-    let toolkit = std::sync::Arc::new(evo_agent::api::serve_tools::build_union_toolkit(
+    let mut toolkit = evo_agent::api::serve_tools::build_union_toolkit(
         workdir,
         &workspace_client,
         &evorule_client,
-    ));
+    );
+    // 服务消费桥:按白名单把 server 插件服务注册为代理工具
+    // (注册失败降级继续并明示影响,不阻塞 server 启动)
+    if !config.evorule.service_tools.is_empty() {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => match rt.block_on(evo_agent::service_tools::register_service_tools(
+                &mut toolkit,
+                &evorule_client,
+                &config.evorule.service_tools,
+            )) {
+                Ok(n) => eprintln!("[service-tools] {n} service tool(s) registered"),
+                Err(e) => {
+                    eprintln!("[service-tools] 服务工具注册失败,serve 面无服务工具: {e}")
+                }
+            },
+            Err(e) => eprintln!("[service-tools] 临时 runtime 构建失败: {e}"),
+        }
+    }
+    let toolkit = std::sync::Arc::new(toolkit);
     eprintln!(
         "[tools] union toolkit assembled: {} tool(s) (6 builtin + 20 rule)",
         26 // 6 builtin + 20 rule
@@ -1404,6 +1442,22 @@ fn run_repl_turn(
         // G12:MCP 工具注册
         if !config.mcp.servers.is_empty() {
             let _ = evo_agent::mcp::register_mcp_tools(&mut tool_handler, &config.mcp).await;
+        }
+
+        // 服务消费桥:按白名单把 server 插件服务注册为代理工具(失败降级继续)
+        if !config.evorule.service_tools.is_empty() {
+            match evo_agent::service_tools::register_service_tools(
+                &mut tool_handler,
+                &client,
+                &config.evorule.service_tools,
+            )
+            .await
+            {
+                Ok(n) => eprintln!("[service-tools] {n} service tool(s) registered"),
+                Err(e) => {
+                    eprintln!("[service-tools] 服务工具注册失败,本次会话无服务工具: {e}")
+                }
+            }
         }
 
         evo_agent::agent::runner::AgentRunner::from_definition(

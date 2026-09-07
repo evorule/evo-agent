@@ -39,6 +39,8 @@ pub mod json_convert;
 pub mod mcp;
 #[doc(hidden)]
 pub mod rule_tools;
+#[doc(hidden)]
+pub mod service_tools;
 
 /// P2-V3 止血（2026-08-27）：审计链旁路调用的全局指标桥
 ///

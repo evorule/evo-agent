@@ -1248,12 +1248,16 @@ impl AgentRunner {
         let mut tools = Vec::new();
         for name in &registered {
             let Some(spec) = specs.iter().find(|s| &s.name == name) else {
-                debug!(tool = %name, "registered tool has no static spec; emitting minimal schema");
+                // 动态注册的工具(如 server 插件服务代理)无静态 spec:描述从
+                // 服务消费桥的注册表透出(对账清单 description),空则降级 ""
+                let description =
+                    crate::service_tools::service_description(name).unwrap_or_default();
+                debug!(tool = %name, "registered tool has no static spec; emitting dynamic schema");
                 tools.push(serde_json::json!({
                     "type": "function",
                     "function": {
                         "name": name,
-                        "description": "",
+                        "description": description,
                         "parameters": { "type": "object", "properties": {} },
                     }
                 }));
