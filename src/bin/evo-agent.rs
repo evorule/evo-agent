@@ -357,10 +357,12 @@ fn cmd_run(
 
     // 2. 决定 agent 类型
     let agent_name = agent.unwrap_or(&config.agents.default);
-    let agents_dir = &config.agents.dir;
-    if !agents_dir.is_absolute() {
-        // 相对路径 → 相对 workdir
-    }
+    // 相对 agents.dir 相对 workdir 解析(与 config 加载基准一致),不基于进程 cwd
+    let agents_dir = if config.agents.dir.is_absolute() {
+        config.agents.dir.clone()
+    } else {
+        workdir.join(&config.agents.dir)
+    };
     let mgr = AgentDefinitionManager::new(agents_dir.clone());
     let def = match mgr.load(agent_name) {
         Ok(d) => d,
