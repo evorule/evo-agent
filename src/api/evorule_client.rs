@@ -33,6 +33,42 @@ impl EvoruleApiClient {
         self.core.base_url()
     }
 
+    /// GET /api/services —— 执行侧服务能力对账(服务消费契约的发现端)
+    ///
+    /// 返回 `[{name, source, version?, description?, plugin?, sensitive}, ...]`。
+    pub async fn list_services(&self) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/services");
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// POST /api/services/{name}/invoke —— 插件服务直调(服务消费契约的调用端)
+    ///
+    /// body = 服务 args;响应 = 服务执行结果。服务侧错误以 HTTP 状态透传
+    /// (401 未认证 / 403 敏感守卫 / 404 未知服务 / 502 执行失败),经 check_response fail-fast。
+    pub async fn invoke_service(
+        &self,
+        service_name: &str,
+        args: &Value,
+    ) -> Result<Value, ApiError> {
+        let url = self
+            .core
+            .url(&format!("/api/services/{service_name}/invoke"));
+        let resp = self
+            .core
+            .auth_header(self.core.client().post(&url))
+            .json(args)
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// 创建新会话，返回会话 ID。`initial_content` 为可选的初始 payload 内容。
     pub async fn create_session(
         &self,
