@@ -1,0 +1,65 @@
+# CI for evo-agent
+#
+# Coverage:
+# - lint: cargo fmt --check + cargo clippy (all targets)
+# - verify: verify.ps1 on Linux + Windows (build + test + secret scan
+#   + dependency-contract assertion) and doc tests
+#
+# Notes:
+# - verify.ps1 is the canonical acceptance entry point; it re-runs
+#   build + test internally, so the verify job does not duplicate them.
+# - clippy runs without -D warnings: existing advisory warnings are
+#   visible in the log but do not block CI.
+name: CI
+
+on:
+  push:
+    branches: [main, master, "release/**"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy (all targets)
+        run: cargo clippy --all-targets
+
+  verify:
+    name: verify (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: verify.ps1 (build + test + secret scan + dep contract)
+        shell: pwsh
+        run: ./verify.ps1
+
+      - name: doc tests
+        run: cargo test --doc
