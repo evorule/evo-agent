@@ -1396,7 +1396,7 @@ fn test_g15_rec_to_message_unknown_role() {
 
 #[tokio::test]
 async fn test_g15_load_messages_no_memory_returns_empty() {
-    let mut server = mockito::Server::new_async().await;
+    let server = mockito::Server::new_async().await;
     let client = EvoruleApiClient::new(&server.url());
     let config = AgentConfig::default();
     let runner = AgentRunner::new(config, client);
@@ -1543,7 +1543,7 @@ async fn test_g15_run_continuation_does_not_create_session() {
 
     // 消费流直到结束(空 SSE 流 → 立即结束 → Done 事件)
     let mut event_count = 0;
-    while let Some(event) = stream.next().await {
+    while let Some(_event) = stream.next().await {
         event_count += 1;
         if event_count > 20 {
             break; // 防止无限循环

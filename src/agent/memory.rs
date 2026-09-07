@@ -233,6 +233,7 @@ impl Default for ContextBudget {
 }
 
 impl ContextBudget {
+    /// 按总窗口大小与记忆预算比例构造（比例自动收敛到 0.1-0.5）。
     pub fn new(total_window: usize, memory_budget_ratio: f32) -> Self {
         Self {
             total_window,
@@ -448,8 +449,9 @@ pub struct MemoryManager {
 /// - server 不可达 → fail-open，回退 cache 以保持离线可用。
 #[derive(Debug, Clone)]
 enum ProjectOutcome {
-    /// server 可达，返回权威值（None = 该 path 在 evorule 无记忆 / value 非 MemoryRecord / 已过期）
-    Reachable(Option<MemoryRecord>),
+    /// server 可达，返回权威值（None = 该 path 在 evorule 无记忆 / value 非 MemoryRecord / 已过期）；
+    /// MemoryRecord 盒装以缩小枚举尺寸（large_enum_variant）
+    Reachable(Option<Box<MemoryRecord>>),
     /// server 不可达（fail-open 状态），可回退 cache
     Unreachable,
 }
@@ -559,14 +561,6 @@ impl MemoryManager {
     /// 获取 session_id
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
-    }
-
-    /// 旧版路径构建（向后兼容，使用单层 namespace）
-    ///
-    /// 生成 `__memory__.{namespace}.{key}` 形式路径。
-    /// 新代码应使用 `build_path_scoped`。
-    fn build_path(&self, key: &str) -> String {
-        format!("__memory__.{}.{}", self.namespace, key)
     }
 
     /// 分层路径构建（P1 三层 namespace）
@@ -792,7 +786,7 @@ impl MemoryManager {
         if self.is_expired(&record) {
             return Ok(ProjectOutcome::Reachable(None));
         }
-        Ok(ProjectOutcome::Reachable(Some(record)))
+        Ok(ProjectOutcome::Reachable(Some(Box::new(record))))
     }
 
     /// 分层 get（P1）— B1 改进1：**投影优先 + cache 离线兜底**
@@ -800,6 +794,7 @@ impl MemoryManager {
     /// 读路径即以 evorule Fact 流投影为**唯一真相**（消除陈旧记忆，对齐"审计即记忆 · evorule 是真相源"）：
     /// - server 可达 → 返回 evorule 权威值并回填 cache；权威无记忆 → 清理可能残留的陈旧 cache。
     /// - server 不可达（fail-open，D-B1-5）→ 回退本地 cache（TTL 仍生效）以保持离线可用；cache 也无 → Ok(None)。
+    ///
     /// 仅 SessionNotSet（不变量违例）传播为 `Err`。
     pub async fn get_scoped(
         &mut self,
@@ -811,6 +806,7 @@ impl MemoryManager {
             Err(e) => Err(e), // SessionNotSet 传播（不变量）
             // 权威真相：server 可达，以 evorule 为准并回填 cache
             Ok(ProjectOutcome::Reachable(Some(record))) => {
+                let record = *record;
                 self.cache.insert(cache_key, record.clone());
                 Ok(Some(record))
             }
@@ -845,7 +841,7 @@ impl MemoryManager {
         key: &str,
     ) -> Result<Option<MemoryRecord>, MemoryError> {
         match self.project_scoped_inner(scope, key).await {
-            Ok(ProjectOutcome::Reachable(record)) => Ok(record),
+            Ok(ProjectOutcome::Reachable(record)) => Ok(record.map(|b| *b)),
             Ok(ProjectOutcome::Unreachable) => Ok(None), // fail-open
             Err(e) => Err(e),
         }
@@ -1174,7 +1170,7 @@ impl MemoryManager {
                 })
                 .collect();
             // 时间倒序 → 取最近 max_summaries
-            summaries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            summaries.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
             ctx.summaries = summaries.into_iter().take(max_summaries).collect();
         }
 
@@ -1900,13 +1896,6 @@ mod tests {
         assert!(debug.contains("record_count: 0"));
     }
 
-    #[test]
-    fn test_build_path() {
-        let mgr = MemoryManager::new("agent_research", make_test_client());
-        assert_eq!(mgr.build_path("topic"), "__memory__.agent_research.topic");
-        assert_eq!(mgr.build_path("author"), "__memory__.agent_research.author");
-    }
-
     // ===== P1: MemoryScope 三层分层测试 =====
 
     #[test]
@@ -2038,9 +2027,9 @@ mod tests {
 
         let drift = mgr.verify_cache_against_server().await.expect("verify");
         assert_eq!(drift, 2, "1 ghost removed + 1 miss backfilled");
-        assert!(mgr.cache.get("session_s1::ghost").is_none());
-        assert!(mgr.cache.get("session_s1::topic").is_some());
-        assert!(mgr.cache.get("shared::shared_topic").is_some());
+        assert!(!mgr.cache.contains_key("session_s1::ghost"));
+        assert!(mgr.cache.contains_key("session_s1::topic"));
+        assert!(mgr.cache.contains_key("shared::shared_topic"));
 
         m1.assert_async().await;
         m2.assert_async().await;
@@ -2097,8 +2086,8 @@ mod tests {
         let mut mgr =
             MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
         mgr.sync_from_evorule().await.expect("sync");
-        assert!(mgr.cache.get("session_s1::topic").is_some());
-        assert!(mgr.cache.get("wrong_key").is_none(), "旧 key 错位不应复现");
+        assert!(mgr.cache.contains_key("session_s1::topic"));
+        assert!(!mgr.cache.contains_key("wrong_key"), "旧 key 错位不应复现");
         m1.assert_async().await;
     }
 
@@ -2169,12 +2158,14 @@ mod tests {
     #[test]
     fn test_recall_annotation_by_domain() {
         let mgr = MemoryManager::new("test", make_test_client());
-        let mut recall = RecallContext::default();
-        recall.stable = vec![
-            MemoryRecord::new("stable.llm.gpt-4o.topic", "quantum computing", 1),
-            MemoryRecord::new("stable.user.prefs", "prefer concise answers", 2),
-            MemoryRecord::new("stable.legacy", "old data without domain", 3),
-        ];
+        let recall = RecallContext {
+            stable: vec![
+                MemoryRecord::new("stable.llm.gpt-4o.topic", "quantum computing", 1),
+                MemoryRecord::new("stable.user.prefs", "prefer concise answers", 2),
+                MemoryRecord::new("stable.legacy", "old data without domain", 3),
+            ],
+            ..RecallContext::default()
+        };
         let prompt = mgr.build_system_prompt_with_recall(
             "base",
             &recall,

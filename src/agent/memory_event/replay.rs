@@ -24,7 +24,7 @@ use crate::io_handler::IoHandler;
 use crate::io_handlers::LlmHandler;
 use crate::json_convert::serde_to_tcb;
 
-use super::event::{EventRef, MemoryEvent};
+use super::event::MemoryEvent;
 use super::evidence::NarrativeWithEvidence;
 use super::store::{MemoryEventStore, StoreError};
 
@@ -52,27 +52,39 @@ pub struct Narrative {
 /// 对话轮类型（对话投影的输出分类）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TurnType {
+    /// 用户指令。
     UserCommand,
+    /// 工具调用。
     ToolCall,
+    /// 工具结果。
     ToolResult,
+    /// Stable 收敛（最终结论）。
     Stable,
 }
 
 /// 对话轮（对话投影的输出）
 #[derive(Debug, Clone)]
 pub struct ConversationTurn {
+    /// Fact 版本号。
     pub version: u64,
+    /// 来源 Fact ID。
     pub source_fact_id: u64,
+    /// 轮类型。
     pub turn_type: TurnType,
+    /// 轮内容。
     pub content: String,
+    /// 错误信息（无错误为 None）。
     pub error: Option<String>,
 }
 
 /// 时间旅行投影结果
 #[derive(Debug, Clone, Default)]
 pub struct MemoryProjection {
+    /// 投影到的版本号。
     pub version: u64,
+    /// 该版本时点的记忆记录。
     pub records: Vec<crate::agent::memory::MemoryRecord>,
+    /// 该版本时点的事件。
     pub events: Vec<MemoryEvent>,
 }
 
@@ -390,6 +402,7 @@ impl ReplayEngine {
     /// 过滤 PayloadUpdate + events 前缀的 Fact，按 path 分组做双提取：
     /// - 身份 = 第一个版本的 fact_id（不随 effects 更新漂移）
     /// - 内容 = 最后一个版本的 value（effects 完整）
+    ///
     /// 按 version 排序。
     pub async fn replay_events_from_fact_stream(
         &self,
@@ -634,7 +647,8 @@ fn is_leap_year(year: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::event::{
-        ConversationSubtype, Emotion, EmotionSubject, EventSource, EventType, MilestoneSubtype,
+        ConversationSubtype, Emotion, EmotionSubject, EventRef, EventSource, EventType,
+        MilestoneSubtype,
     };
     use super::*;
     use crate::api::evorule_client::{EvoruleApiClient, FactLogEntry};
@@ -848,8 +862,8 @@ mod tests {
             Emotion::new(0.3, 0.6, EmotionSubject::User).with_labels(&["love", "nostalgia"]),
         );
 
-        let n1 = engine1.narrate(&[event.clone()]).await.unwrap();
-        let n2 = engine2.narrate(&[event]).await.unwrap();
+        let n1 = engine1.narrate(std::slice::from_ref(&event)).await.unwrap();
+        let n2 = engine2.narrate(std::slice::from_ref(&event)).await.unwrap();
         assert_eq!(
             n1.text, n2.text,
             "narrate without LLM must be deterministic"

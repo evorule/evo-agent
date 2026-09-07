@@ -131,14 +131,16 @@ impl TokenCounter for ApproxTokenCounter {
         for msg in messages {
             total += self.per_message_overhead;
             total += self.count_text(msg.content());
-            if let Message::Assistant { tool_calls, .. } = msg {
-                if let Some(calls) = tool_calls {
-                    for tc in calls {
-                        // tool_name + arguments JSON
-                        total += self.count_text(&tc.name);
-                        let args_str = tc.arguments.to_string();
-                        total += self.count_text(&args_str);
-                    }
+            if let Message::Assistant {
+                tool_calls: Some(calls),
+                ..
+            } = msg
+            {
+                for tc in calls {
+                    // tool_name + arguments JSON
+                    total += self.count_text(&tc.name);
+                    let args_str = tc.arguments.to_string();
+                    total += self.count_text(&args_str);
                 }
             }
             if let Message::Tool { tool_name, .. } = msg {

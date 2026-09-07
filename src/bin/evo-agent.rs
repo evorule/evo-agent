@@ -1259,6 +1259,17 @@ fn cmd_repl(
 
     let mut current_session: Option<String> = resumed_session_id;
 
+    // REPL 共享环境(每轮稳定参数打包)
+    let env = ReplEnv {
+        runtime: &runtime,
+        config: &config,
+        def: &def,
+        client: &client,
+        workdir,
+        auto_approve_candidates,
+        session_file: &session_file,
+    };
+
     // 5. REPL 主循环
     loop {
         let prompt = if current_session.is_some() {
@@ -1320,17 +1331,7 @@ fn cmd_repl(
                 }
 
                 // 普通输入:调 agent
-                let exit = run_repl_turn(
-                    &runtime,
-                    &config,
-                    &def,
-                    &client,
-                    workdir,
-                    auto_approve_candidates,
-                    &mut current_session,
-                    &session_file,
-                    input,
-                );
+                let exit = run_repl_turn(&env, &mut current_session, input);
                 if let Some(code) = exit {
                     return code;
                 }
@@ -1353,6 +1354,17 @@ fn cmd_repl(
     ExitCode::SUCCESS
 }
 
+/// REPL 每轮共享环境（把 run_repl_turn 的稳定参数打包，避免超长参数列表）。
+struct ReplEnv<'a> {
+    runtime: &'a tokio::runtime::Runtime,
+    config: &'a evo_agent::config::Config,
+    def: &'a evo_agent::agent::definition::AgentDefinition,
+    client: &'a EvoruleApiClient,
+    workdir: &'a Path,
+    auto_approve_candidates: bool,
+    session_file: &'a Path,
+}
+
 /// G15:执行一轮 REPL 对话
 ///
 /// 首次输入(`current_session == None`):构造 runner → `run_streaming` → 捕获 session_id
@@ -1360,19 +1372,24 @@ fn cmd_repl(
 ///
 /// 返回 `Some(ExitCode)` 表示致命错误(应退出 REPL),`None` 表示继续下一轮。
 fn run_repl_turn(
-    runtime: &tokio::runtime::Runtime,
-    config: &evo_agent::config::Config,
-    def: &evo_agent::agent::definition::AgentDefinition,
-    client: &EvoruleApiClient,
-    workdir: &Path,
-    auto_approve_candidates: bool,
+    env: &ReplEnv<'_>,
     current_session: &mut Option<String>,
-    session_file: &Path,
     input: String,
 ) -> Option<ExitCode> {
     use evo_agent::AgentEvent;
     use futures_util::StreamExt;
     use std::io::Write;
+
+    // 解构共享环境(全部 Copy,函数体引用方式不变)
+    let ReplEnv {
+        runtime,
+        config,
+        def,
+        client,
+        workdir,
+        auto_approve_candidates,
+        session_file,
+    } = *env;
 
     // 构造 tool_handler + llm_handler + runner(每轮重建,因为 run_streaming/run_continuation 消费 self)
     // 与 cmd_run 一致:内置安全工具 + 规则管理工具 union,保证 rule-copilot 可用

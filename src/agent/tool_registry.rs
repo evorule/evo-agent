@@ -52,6 +52,12 @@ struct ToolEntry {
     spec: ToolSpec,
 }
 
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolRegistry {
     /// Create new tool registry
     pub fn new() -> Self {
@@ -306,7 +312,7 @@ mod tests {
         let schema = registry.to_openai_schema().await;
         assert_eq!(schema.len(), 1);
 
-        let tool = schema.get(0).unwrap();
+        let tool = schema.first().unwrap();
         assert_eq!(tool.get("type").and_then(|v| v.as_str()), Some("function"));
 
         let func = tool.get("function").and_then(|v| v.as_object());

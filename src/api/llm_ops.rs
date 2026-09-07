@@ -98,12 +98,17 @@ pub struct LlmOpRequest {
 /// 37 号 §4 响应骨架
 #[derive(Debug, Serialize)]
 pub struct LlmOpResponse {
+    /// 操作名（echo/draft_rule/gen_tests/explain_rule）。
     pub operation: String,
+    /// 请求回显 ID（请求携带则原样返回）。
     pub request_id: Option<String>,
     /// MVP 预留：将来异步任务的句柄（同步模式下为 `completed`，无实际队列）
     pub task_id: Option<String>,
+    /// 执行状态（completed / failed）。
     pub status: String,
+    /// 操作结果载荷。
     pub result: Value,
+    /// 失败原因（成功为 None）。
     pub errors: Option<String>,
     /// LLM 溯源（决策点⑦）：model/op/timestamp
     pub llm_generated: Value,
@@ -112,12 +117,16 @@ pub struct LlmOpResponse {
 /// 命名操作错误
 #[derive(Debug, Error)]
 pub enum LlmOpsError {
+    /// 请求的操作名不在已注册清单中。
     #[error("未知命名操作: {0}")]
     UnknownOperation(String),
+    /// 操作入参缺失或格式非法。
     #[error("操作入参非法: {0}")]
     InvalidParams(String),
+    /// LLM 上游调用失败（网络/限流/超时等）。
     #[error("LLM 调用失败: {0}")]
     LlmFailure(String),
+    /// LLM 返回内容无法解析为操作预期的输出形状。
     #[error("LLM 输出解析失败: {0}")]
     OutputParse(String),
 }
@@ -138,7 +147,7 @@ impl LlmOpsError {
 ///
 /// 通用骨架：解析 op → 走到对应 handler。所有 op 共用同一套请求/响应契约（37 号 §4）。
 pub async fn run_operation(
-    State(state): State<AgentApiState>,
+    State(_state): State<AgentApiState>,
     Path(operation): Path<String>,
     axum::Json(req): axum::Json<LlmOpRequest>,
 ) -> Result<axum::Json<LlmOpResponse>, (axum::http::StatusCode, String)> {
@@ -188,7 +197,7 @@ async fn run_llm_op(op: &Operation, req: &LlmOpRequest, model: &str) -> Result<V
     let io = llm
         .execute(&tcb_params)
         .await
-        .map_err(|e| LlmOpsError::LlmFailure(e))?;
+        .map_err(LlmOpsError::LlmFailure)?;
     let content =
         io_to_content(&io).ok_or_else(|| LlmOpsError::LlmFailure("空响应".to_string()))?;
 

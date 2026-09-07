@@ -14,11 +14,17 @@ use serde::{Deserialize, Serialize};
 /// /audit/causal/{fact_id} 链条中的单个节点
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CausalLink {
+    /// 节点 Fact ID。
     pub fact_id: u64,
+    /// Fact 类型。
     pub fact_type: String,
+    /// 逻辑时间（版本号）。
     pub logical_time: u64,
+    /// 本节点内容哈希。
     pub content_hash: String,
+    /// 前一节点哈希（链式防篡改）。
     pub prev_hash: String,
+    /// 因果父 Fact（无因果来源为 None）。
     #[serde(default)]
     pub cause: Option<u64>,
 }
@@ -26,19 +32,27 @@ pub struct CausalLink {
 /// /audit/causal/{fact_id} 完整响应（类型化）
 #[derive(Debug, Clone, Deserialize)]
 pub struct CausalChain {
+    /// 会话 ID。
     pub session_id: u64,
+    /// 查询起点的 Fact ID。
     pub fact_id: u64,
+    /// 链长。
     pub chain_length: usize,
+    /// 因果链节点（从根到当前）。
     pub chain: Vec<CausalLink>,
 }
 
 /// /audit/verify 完整响应（类型化）
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditVerify {
+    /// 整链哈希校验是否通过。
     pub verified: bool,
+    /// 会话 ID。
     pub session_id: u64,
+    /// Fact 总数（旧版 server 缺省）。
     #[serde(default)]
     pub fact_count: Option<u64>,
+    /// 末节点哈希（旧版 server 缺省）。
     #[serde(default)]
     pub last_hash: Option<String>,
 }
@@ -58,6 +72,7 @@ pub struct MemoryEvidence {
     pub path: Option<String>,
     /// 整链完整性（verify_audit_typed）
     pub verified: bool,
+    /// 末节点哈希（审计出口快照）。
     pub last_hash: Option<String>,
     /// 因果锚点：事件 cause 指向的源 FactId（KV 为 None）
     pub cause_fact_id: Option<u64>,
@@ -83,8 +98,11 @@ impl MemoryEvidence {
 /// 批量验证汇总
 #[derive(Debug, Clone, Default)]
 pub struct BatchVerifyReport {
+    /// 全部验证是否通过。
     pub verified: bool,
+    /// 验证的 Fact 总数。
     pub fact_count: usize,
+    /// 通过验证的 Fact ID 列表。
     pub verified_facts: Vec<u64>,
 }
 

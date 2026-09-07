@@ -94,10 +94,10 @@ impl LlmResponse {
 
     /// Check whether finished
     pub fn is_finished(&self) -> bool {
-        match self.finish_reason.as_deref() {
-            Some("stop") | Some("end_turn") => true,
-            _ => false,
-        }
+        matches!(
+            self.finish_reason.as_deref(),
+            Some("stop") | Some("end_turn")
+        )
     }
 
     /// Extract response content

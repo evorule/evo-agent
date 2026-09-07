@@ -15,8 +15,10 @@ use serde_json::Value;
 // 客户端
 // =============================================================================
 
+/// 工作区治理域 API 客户端（工作区 / 规则 / 沙盒 / 发布全生命周期）。
 #[derive(Debug, Clone)]
 pub struct WorkspaceApiClient {
+    /// 复用的 HTTP 核心客户端（共享 base_url 与认证头注入）。
     core: ApiCore,
 }
 
@@ -746,75 +748,116 @@ impl WorkspaceApiClient {
 // 请求/响应结构体（从 evorule-server core/workspace/src/models.rs 对齐）
 // =============================================================================
 
+/// 创建工作区请求（对齐 server models.rs CreateWorkspaceRequest）。
 #[derive(Debug, Serialize)]
 pub struct CreateWorkspaceRequest {
+    /// 工作区名称。
     pub name: String,
+    /// 所有者用户 ID。
     pub owner_id: String,
+    /// 可选描述。
     #[serde(default)]
     pub description: Option<String>,
 }
 
+/// 工作区记录（对齐 server models.rs WorkspaceRecord）。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkspaceRecord {
+    /// 工作区 ID。
     pub id: String,
+    /// 工作区名称。
     pub name: String,
+    /// 描述。
     pub description: Option<String>,
+    /// 创建时间（RFC3339 字符串）。
     pub created_at: String,
+    /// 所有者用户 ID。
     pub owner_id: String,
     /// server 侧是 WorkspaceState 枚举（active/archived，snake_case），非 `status`；client 用 String 兼容
     pub state: String,
+    /// 最近更新时间。
     pub updated_at: String,
+    /// 归档时间（未归档为 None）。
     pub archived_at: Option<String>,
 }
 
+/// 创建规则请求（对齐 server models.rs CreateRuleRequest）。
 #[derive(Debug, Serialize)]
 pub struct CreateRuleRequest {
+    /// 规则名称。
     pub name: String,
+    /// 规则内容（JSON 规则集文本）。
     pub content: String,
+    /// 创建者用户 ID。
     pub created_by: String,
+    /// 可选描述。
     #[serde(default)]
     pub description: Option<String>,
 }
 
+/// 规则记录（对齐 server models.rs RuleRecord）。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RuleRecord {
+    /// 规则 ID。
     pub id: String,
+    /// 所属工作区 ID。
     pub workspace_id: String,
+    /// 规则名称。
     pub name: String,
+    /// 当前版本 ID（尚无版本为 None）。
     pub current_version_id: Option<String>,
     /// server 侧是 RuleState 枚举（draft/candidate/active/blocked/archived，snake_case），client 用 String 兼容
     pub state: String,
+    /// 描述。
     pub description: Option<String>,
+    /// 创建者用户 ID。
     pub created_by: String,
+    /// 创建时间。
     pub created_at: String,
+    /// 最近更新时间。
     pub updated_at: String,
+    /// 归档时间（未归档为 None）。
     pub archived_at: Option<String>,
     /// 扩展元数据（JSON 字符串，空时为 "{}"）；v3 schema 新增列
     pub metadata: String,
 }
 
+/// 更新规则内容请求（对齐 server models.rs UpdateRuleContentRequest）。
 #[derive(Debug, Serialize)]
 pub struct UpdateRuleContentRequest {
+    /// 新的规则内容。
     pub content: String,
+    /// 操作者用户 ID。
     pub updated_by: String,
 }
 
+/// 规则版本记录（对齐 server models.rs RuleVersionRecord）。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RuleVersionRecord {
+    /// 版本记录 ID。
     pub id: String,
+    /// 所属规则 ID。
     pub rule_id: String,
+    /// 版本号（单调递增）。
     pub version: u64,
+    /// 内容 SHA256 哈希。
     pub content_hash: String,
+    /// 该版本的规则内容全文。
     pub content: String,
     /// server 侧是 RuleVersionState 枚举（current/superseded，snake_case），client 用 String 兼容
     pub state: String,
+    /// 创建者用户 ID。
     pub created_by: String,
+    /// 创建时间。
     pub created_at: String,
 }
 
+/// Fork 规则请求（对齐 server models.rs ForkRuleRequest）。
 #[derive(Debug, Serialize)]
 pub struct ForkRuleRequest {
+    /// 新规则名称。
     pub new_name: String,
+    /// 操作者用户 ID。
     pub created_by: String,
 }
 
@@ -827,8 +870,11 @@ pub struct ForkRuleRequest {
 /// 启动沙盒测试请求（对齐 server models.rs StartSandboxRequest）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartSandboxRequest {
+    /// 参与本次沙盒测试的规则版本 ID 列表。
     pub rule_version_ids: Vec<String>,
+    /// 用于验收的测试数据集 ID。
     pub test_dataset_id: i64,
+    /// 父版本号（增量沙盒时指定，首测为 None）。
     #[serde(default)]
     pub parent_version: Option<u64>,
 }
@@ -836,9 +882,13 @@ pub struct StartSandboxRequest {
 /// 启动沙盒测试响应（对齐 server models.rs StartSandboxResponse）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartSandboxResponse {
+    /// 沙盒会话 ID。
     pub sandbox_id: i64,
+    /// 引擎侧 TCB 会话 ID。
     pub tcb_session_id: u64,
+    /// 草稿规则集哈希。
     pub draft_ruleset_hash: String,
+    /// 测试用例总数。
     pub test_case_count: usize,
 }
 
@@ -846,96 +896,151 @@ pub struct StartSandboxResponse {
 /// status 为 SandboxStatus 枚举 snake_case 字符串，client 用 String 兼容）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxSession {
+    /// 沙盒会话 ID。
     pub id: i64,
+    /// 所属工作区 ID。
     pub workspace_id: String,
+    /// 引擎侧 TCB 会话 ID（未运行为 None）。
     pub tcb_session_id: Option<i64>,
+    /// 父沙盒会话 ID（增量沙盒链）。
     pub parent_session_id: i64,
+    /// 草稿规则集哈希。
     pub draft_ruleset_hash: Option<String>,
+    /// 测试数据集 ID。
     pub test_dataset_id: i64,
+    /// 沙盒状态（running/closed 等 snake_case 字符串）。
     pub status: String,
+    /// 启动时间。
     pub started_at: String,
+    /// 关闭时间（未关闭为 None）。
     pub closed_at: Option<String>,
+    /// 启动者用户 ID。
     pub started_by: String,
+    /// 审计导出文件路径。
     pub export_path: Option<String>,
 }
 
 /// 测试报告（对齐 server test_report.rs TestReport）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestReport {
+    /// 沙盒会话 ID。
     pub sandbox_id: String,
+    /// 所属工作区 ID。
     pub workspace_id: String,
+    /// 引擎侧 TCB 会话 ID。
     pub tcb_session_id: u64,
+    /// 父沙盒会话 ID。
     pub parent_session_id: Option<u64>,
+    /// 草稿规则集哈希。
     pub draft_ruleset_hash: String,
+    /// 测试统计摘要。
     pub summary: TestSummary,
+    /// 逐用例结果。
     pub cases: Vec<TestCaseResult>,
+    /// 测试异常列表。
     pub anomalies: Vec<TestAnomaly>,
+    /// 审计链信息。
     pub audit_info: AuditInfo,
+    /// 报告整体哈希（防篡改）。
     pub report_hash: String,
+    /// 报告生成时间。
     pub generated_at: String,
 }
 
 /// 测试统计摘要
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestSummary {
+    /// 用例总数。
     pub total_cases: usize,
+    /// 通过数。
     pub passed: usize,
+    /// 失败数。
     pub failed: usize,
+    /// 跳过数。
     pub skipped: usize,
+    /// 通过率（0.0-1.0）。
     pub pass_rate: f64,
+    /// 总耗时（毫秒）。
     pub total_duration_ms: u64,
+    /// 产生的引擎 Fact 总数。
     pub fact_count: usize,
 }
 
 /// 单个测试 case 结果（status 为 CaseStatus 枚举 snake_case 字符串，client 用 String 兼容）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestCaseResult {
+    /// 用例 ID。
     pub case_id: String,
+    /// 用例名称。
     pub case_name: String,
+    /// 执行状态（passed/failed/skipped 等）。
     pub status: String,
+    /// 产生的 Fact ID（未产生为 None）。
     pub fact_id: Option<u64>,
+    /// 失败时的错误信息。
     pub error_message: Option<String>,
+    /// 该用例耗时（毫秒）。
     pub duration_ms: u64,
 }
 
 /// 测试异常
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestAnomaly {
+    /// 异常类型标识。
     pub anomaly_type: String,
+    /// 异常描述。
     pub description: String,
+    /// 关联 Fact ID（无关联为 None）。
     pub fact_id: Option<u64>,
+    /// 严重级别。
     pub severity: String,
 }
 
 /// 审计链信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditInfo {
+    /// 审计链长度（Fact 节点数）。
     pub audit_chain_length: usize,
+    /// 审计链哈希校验是否通过。
     pub audit_chain_verified: bool,
+    /// 审计导出文件路径。
     pub audit_export_path: Option<String>,
 }
 
 /// 合成测试数据集记录（对齐 server models.rs TestDatasetRecord）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestDatasetRecord {
+    /// 数据集 ID。
     pub id: i64,
+    /// 数据集名称。
     pub name: String,
+    /// 所属工作区 ID（全局共享数据集为 None）。
     pub workspace_id: Option<String>,
+    /// 用例定义（JSON 字符串）。
     pub cases_json: String,
+    /// 用例数量。
     pub case_count: i64,
+    /// 创建时间。
     pub created_at: String,
+    /// 创建者用户 ID。
     pub created_by: String,
+    /// 描述。
     pub description: Option<String>,
 }
 
 /// 创建测试数据集请求（对齐 server models.rs CreateTestDatasetRequest）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTestDatasetRequest {
+    /// 数据集名称。
     pub name: String,
+    /// 用例定义（JSON 字符串）。
     pub cases_json: String,
+    /// 创建者用户 ID。
     pub created_by: String,
+    /// 所属工作区 ID（缺省为全局）。
     #[serde(default)]
     pub workspace_id: Option<String>,
+    /// 描述。
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -944,29 +1049,47 @@ pub struct CreateTestDatasetRequest {
 /// status 为 PublishStatus 枚举 snake_case 字符串，client 用 String 兼容）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishQueueItem {
+    /// 队列条目 ID。
     pub id: i64,
+    /// 所属工作区 ID。
     pub workspace_id: String,
+    /// 最终候选规则集（JSON 字符串）。
     pub final_candidate_rules: String,
+    /// 规则集哈希。
     pub ruleset_hash: String,
+    /// 验收依据的测试报告沙盒 ID。
     pub test_report_sandbox_id: Option<i64>,
+    /// 提交者用户 ID。
     pub submitted_by: String,
+    /// 提交时间。
     pub submitted_at: String,
+    /// 审批者用户 ID（未审批为 None）。
     pub reviewed_by: Option<String>,
+    /// 审批时间。
     pub reviewed_at: Option<String>,
+    /// 审批意见。
     pub review_comment: Option<String>,
+    /// 发布产生的生产版本号。
     pub published_version: Option<i64>,
+    /// 发布时间。
     pub published_at: Option<String>,
+    /// 队列状态（pending/approved/rejected/published 等）。
     pub status: String,
+    /// 发布说明。
     pub description: Option<String>,
 }
 
 /// 提交发布请求（对齐 server models.rs SubmitPublishRequest）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitPublishRequest {
+    /// 所属工作区 ID。
     pub workspace_id: String,
+    /// 进入发布的规则版本 ID 列表。
     pub rule_version_ids: Vec<String>,
+    /// 验收依据的测试报告沙盒 ID。
     #[serde(default)]
     pub test_report_sandbox_id: Option<i64>,
+    /// 发布说明。
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -976,6 +1099,7 @@ pub struct SubmitPublishRequest {
 pub struct ReviewPublishRequest {
     /// approved / rejected
     pub decision: String,
+    /// 审批意见。
     #[serde(default)]
     pub comment: Option<String>,
 }
@@ -983,35 +1107,55 @@ pub struct ReviewPublishRequest {
 /// 紧急回滚请求（对齐 server models.rs RollbackRequest）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackRequest {
+    /// 回滚目标生产版本号。
     pub target_version: i64,
+    /// 回滚原因。
     pub reason: String,
 }
 
 /// 生产状态记录（对齐 server models.rs ProductionStateRecord，单行表）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductionStateRecord {
+    /// 记录 ID。
     pub id: i64,
+    /// 当前生产 TCB 会话 ID。
     pub current_session_id: Option<i64>,
+    /// 当前规则集版本号。
     pub ruleset_version: i64,
+    /// 当前规则集哈希。
     pub ruleset_hash: Option<String>,
+    /// 最近操作者用户 ID。
     pub last_operated_by: Option<String>,
+    /// 最近更新时间。
     pub updated_at: String,
 }
 
 /// 生产审计记录（对齐 server models.rs ProductionAuditRecord）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductionAuditRecord {
+    /// 审计记录 ID。
     pub id: i64,
+    /// 事件类型（publish/rollback 等）。
     pub event_type: String,
+    /// 事件后的规则集版本号。
     pub ruleset_version: i64,
+    /// 事件前的规则集版本号。
     pub previous_version: Option<i64>,
+    /// 事件后的规则集哈希。
     pub ruleset_hash: String,
+    /// 关联的 TCB 会话 ID。
     pub tcb_session_id: i64,
+    /// 来源工作区 ID 列表（JSON 字符串）。
     pub source_workspace_ids: String,
+    /// 操作者用户 ID。
     pub operated_by: String,
+    /// 操作时间。
     pub operated_at: String,
+    /// 操作原因。
     pub reason: Option<String>,
+    /// 测试报告路径列表（JSON 字符串）。
     pub test_report_paths: Option<String>,
+    /// 规则集快照全文。
     pub ruleset_snapshot: Option<String>,
 }
 

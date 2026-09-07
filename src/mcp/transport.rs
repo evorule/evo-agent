@@ -352,6 +352,12 @@ pub mod tests {
         closed: std::sync::atomic::AtomicBool,
     }
 
+    impl Default for MockTransport {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockTransport {
         pub fn new() -> Self {
             Self {

@@ -993,9 +993,11 @@ mod tests {
     fn test_llm_handler_from_config_carries_max_retries() {
         // G3:验证 from_config 真正把 config.max_retries 传到 handler
         use crate::config::LlmConfig;
-        let mut cfg = LlmConfig::default();
-        cfg.max_retries = 5;
-        cfg.api_key = "test-key".to_string();
+        let cfg = LlmConfig {
+            max_retries: 5,
+            api_key: "test-key".to_string(),
+            ..LlmConfig::default()
+        };
         let handler = LlmHandler::from_config(&cfg);
         assert_eq!(handler.max_retries, 5);
         assert_eq!(handler.api_key, Some("test-key".to_string()));
@@ -1090,7 +1092,7 @@ mod tests {
         let d = backoff_duration(20, base, max);
         let secs = d.as_secs_f64();
         assert!(
-            secs >= 8.0 && secs <= 12.0,
+            (8.0..=12.0).contains(&secs),
             "attempt=20: secs={} should be capped near max=10 (±20%)",
             secs
         );
