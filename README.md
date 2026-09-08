@@ -646,6 +646,6 @@ rustyline = "14"              # REPL 行编辑
 
 ## License
 
-[AGPL-3.0](LICENSE)
+[AGPL-3.0](LICENSE) — EvoRule dual-license: closed-source use via [DUAL_LICENSE.md](DUAL_LICENSE.md) / [FREE_COMMERCIAL_LICENSE.md](FREE_COMMERCIAL_LICENSE.md) (free for eligible entities) / [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) (paid). Constitution `core_eval.json` is CC0-1.0. Commercial inquiries: evorulelab@gmail.com.
 
 
