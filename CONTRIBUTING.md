@@ -158,8 +158,8 @@ test(e2e): add core constitution smoke test
 
 **All contributions must include a CLA**. The bot will check automatically on PR.
 
-- Individual contributors: [CLA-individual.md](CLA-individual.md) (to be published)
-- Corporate contributors: contact evorulelab@gmail.com
+- Individual contributors: [CLA-individual.md](CLA-individual.md)（已发布）
+- Corporate contributors: [CLA-corporate.md](CLA-corporate.md)（已发布），或联系 evorulelab@gmail.com
 
 **Why CLA?**
 - Enable commercial licensing (see [DUAL_LICENSE.md](DUAL_LICENSE.md))

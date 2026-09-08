@@ -154,8 +154,8 @@ test(e2e): 添加宪法核心冒烟测试
 
 **所有贡献必须签署 CLA**。提交 PR 时,机器人会自动检查。
 
-- 个人贡献者:[CLA-individual.md](CLA-individual.md)(待发布)
-- 企业贡献者:请联系 evorulelab@gmail.com
+- 个人贡献者:[CLA-individual.md](CLA-individual.md)（已发布）
+- 企业贡献者:[CLA-corporate.md](CLA-corporate.md)（已发布），或联系 evorulelab@gmail.com
 
 **为什么需要 CLA?**
 - 保护项目可商业化(参考 [DUAL_LICENSE.md](DUAL_LICENSE.md))
