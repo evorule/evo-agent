@@ -1,0 +1,33 @@
+name: Bug 报告 / Bug Report
+description: 报告一个可复现的缺陷
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢报告缺陷。请尽量提供可复现信息, 以便快速定位。
+        **安全相关缺陷请走 SECURITY.md 的私秘渠道, 勿在此公开。**
+  - type: dropdown
+    id: component
+    attributes:
+      label: 涉及组件
+      options:
+        - evo-agent
+        - 文档 / 治理流程
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 期望行为 vs 实际行为, 附最小复现步骤。
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境信息
+      description: 版本号 / 操作系统 / 复现命令。
+    validations:
+      required: true
