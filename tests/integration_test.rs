@@ -777,10 +777,12 @@ impl ToolFunction for ApprovalAwareTool {
     }
 }
 
-/// 工具调用契约对齐锁定：constitution 模板/io_request 键与内部 ToolCall 序列化形状
-/// ({tool_name, args}) 一致 —— 防三处契约再漂移（collect 模板 / io_request 键 / 消息回传）。
-/// ①collect 模板消费 {{tool_name}}；②call_service io_request 参数键统一 tool_name；
+/// 工具调用契约对齐锁定：constitution io_request 键与内部 ToolCall 序列化形状
+/// ({tool_name, args}) 一致 —— 防契约再漂移（io_request 键 / 消息回传）。
+/// ①无 {{name}} 模板引用；②call_service io_request 参数键统一 tool_name；
 /// ③消息回传出站转换由 llm_handler::to_openai_wire_messages 单测锁定。
+/// （69 号清理 2026-09-14：collect/merge 元指令退役，宪法回归单轮口径——
+///  原「collect 模板消费 {{tool_name}}」断言改为「宪法不含 collect/merge」负向锁定）
 #[test]
 fn test_constitution_tool_call_contract_alignment() {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -819,10 +821,10 @@ fn test_constitution_tool_call_contract_alignment() {
         !keys.iter().any(|k| k == "service_name"),
         "constitution 不得再用 service_name 作为参数键"
     );
-    // ①collect 模板消费 {{tool_name}}
+    // ①collect/merge 已退役（69 号清理）——宪法不得再含已退役元指令类型
     assert!(
-        strings.iter().any(|s| s.contains("{{tool_name}}")),
-        "collect 模板必须消费 tool_name 字段"
+        !strings.iter().any(|s| s == "collect" || s == "merge"),
+        "constitution 不得再含已退役的 collect/merge 元指令类型（69 号清理，多轮编排回归应用层）"
     );
     // ②call_service io_request 携带 tool_name 键
     fn find_call_service_io<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
