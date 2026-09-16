@@ -1,0 +1,38 @@
+# Gitee Go pipeline for evo-agent
+# 精简版：与本仓 .github/workflows/ci.yml 的 lint/test 对齐。
+# 说明：核心仓 .gitee-ci 的 validate-pr 强阻塞门禁（validate-*.ps1 五件套 + check_doc_safety.py）
+# 依赖核心仓 scripts/ 下的专属脚本，本仓无该套件，故不复制该阶段；文档门禁集中在核心仓运行。
+
+stages:
+  - lint
+  - test
+
+variables:
+  GIT_DEPTH: "20"
+
+lint:
+  stage: lint
+  image: rust:1.92-slim
+  script:
+    - apt-get update && apt-get install -y --no-install-recommends pkg-config git
+    - cargo fmt --all -- --check
+    - cargo clippy --workspace --all-targets -- -D warnings
+  rules:
+    - changes:
+        - "**/*.rs"
+        - "**/Cargo.toml"
+        - "**/Cargo.lock"
+        - ".gitee-ci/**"
+
+test:
+  stage: test
+  image: rust:1.92-slim
+  script:
+    - apt-get update && apt-get install -y --no-install-recommends pkg-config git
+    - cargo test --workspace --all-targets
+  rules:
+    - changes:
+        - "**/*.rs"
+        - "**/Cargo.toml"
+        - "**/Cargo.lock"
+        - ".gitee-ci/**"
