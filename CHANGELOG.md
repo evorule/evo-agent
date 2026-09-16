@@ -240,30 +240,6 @@
 
 ---
 
-## [1.1.0] - 未发布
-
-### 计划(短期)
-
-- 🆕 真实 LLM Handler 实现(OpenAI / Anthropic / DeepSeek 至少一个)
-- 🆕 真实 Tool Handler 实现(至少 1 个示例工具)
-- 🆕 `cargo fix --lib` 补 124 warnings
-- 🆕 移除 unused import
-
-### 计划(中期)
-
-- 🆕 流式输出(SSE 转 WebSocket 或 HTTP chunked)
-- 🆕 Tool 调用错误重试 / 退避
-- 🆕 Agent run timeout 保护(防止 Agent 死循环)
-- 🆕 Memory 压缩 / 摘要(超长 session memory 摘要)
-
-### 计划(长期)
-
-- 🆕 嵌套 Agent 的 Fact 链可视化
-- 🆕 Agent 行为追踪 / 调试 UI
-- 🆕 多 Agent 协作(团队 Agent)
-
----
-
 ## 兼容性矩阵
 
 | evo-agent | evorule-server | 状态 |
@@ -286,7 +262,7 @@ cargo update evo-agent
 
 ### 1.x → 2.x(未来 major)
 
-待定。2.0 计划见上方"未发布"。
+待定。
 
 ---
 
