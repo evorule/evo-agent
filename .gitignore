@@ -37,3 +37,6 @@ workspace/
 
 # 本地运行配置（含端点选择与本地路径,不随仓分发,密钥走 ENV 引用）
 evo-agent.toml
+
+# 本地测试输出（cargo test 重定向产物）
+test_all_output.txt
