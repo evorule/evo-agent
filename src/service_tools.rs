@@ -100,10 +100,10 @@ pub async fn register_service_tools(
 
     let mut registered = 0usize;
     for want in whitelist {
-        let Some(info) = services
-            .as_array()
-            .and_then(|arr| arr.iter().find(|s| s["name"].as_str() == Some(want.as_str())))
-        else {
+        let Some(info) = services.as_array().and_then(|arr| {
+            arr.iter()
+                .find(|s| s["name"].as_str() == Some(want.as_str()))
+        }) else {
             eprintln!(
                 "[service-tools] 跳过白名单项 '{want}'：不在服务对账清单（GET /api/services）"
             );
@@ -116,9 +116,7 @@ pub async fn register_service_tools(
             continue;
         }
         if handler.has_tool(want) {
-            eprintln!(
-                "[service-tools] 跳过服务 '{want}'：与本地工具重名（本地工具优先）"
-            );
+            eprintln!("[service-tools] 跳过服务 '{want}'：与本地工具重名（本地工具优先）");
             continue;
         }
         let description = info["description"].as_str().unwrap_or("").to_string();

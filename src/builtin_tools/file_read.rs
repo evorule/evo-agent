@@ -177,12 +177,15 @@ mod tests {
     fn test_reject_absolute_path() {
         let dir = temp_workdir();
         let tool = make_tool(dir.path());
+        // 平台各自的真实绝对路径形态（"C:\..." 在 Unix 上不是绝对路径）
+        let abs = if cfg!(windows) {
+            "C:\\Windows\\System32"
+        } else {
+            "/etc/passwd"
+        };
         let result = tool.call_sync(&JsonValue::object({
             let mut m = std::collections::BTreeMap::new();
-            m.insert(
-                "path".to_string(),
-                JsonValue::string("C:\\Windows\\System32"),
-            );
+            m.insert("path".to_string(), JsonValue::string(abs));
             m
         }));
         assert!(result.is_err());
