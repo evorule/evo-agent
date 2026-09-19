@@ -903,6 +903,12 @@ pub struct SharedFactEntry {
     pub source_session_id: u64,
     /// Fact 版本号。
     pub version: u64,
+    /// 会话侧源头 fact_id（N6 链路统一，R10）。
+    ///
+    /// `None` = 对接旧 server（无此字段）或该条目先于 R10 写入。
+    /// `Option` 缺省反序列化为 `None`，新旧 server 双兼容。
+    #[serde(default)]
+    pub origin_fact_id: Option<u64>,
 }
 
 /// 会话 SSE 事件流（按行缓冲解析 `data:` 帧）。
@@ -1053,6 +1059,26 @@ mod tests {
         assert_eq!(entry.cause, Some(10));
         assert_eq!(entry.payload["io_type"], "call_external");
         assert_eq!(entry.payload["params"]["model"], "test");
+    }
+
+    // ===== R10 SharedFactEntry origin_fact_id 双兼容 =====
+
+    #[test]
+    fn test_shared_fact_entry_origin_dual_compat() {
+        // 新 server（R10+）：携带 origin_fact_id
+        let json = r#"{"fact_id":30066,"path":"shared.test.topic","value":{"key":"topic"},"source_session_id":9,"version":1,"origin_fact_id":53}"#;
+        let entry: SharedFactEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.origin_fact_id, Some(53));
+
+        // 新 server：origin 为 null（旧签名写入/历史条目）
+        let json = r#"{"fact_id":30066,"path":"shared.test.topic","value":{},"source_session_id":9,"version":1,"origin_fact_id":null}"#;
+        let entry: SharedFactEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.origin_fact_id, None);
+
+        // 旧 server（R10 前）：无该字段 → 缺省 None，不报错
+        let json = r#"{"fact_id":30066,"path":"shared.test.topic","value":{},"source_session_id":9,"version":1}"#;
+        let entry: SharedFactEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.origin_fact_id, None);
     }
 
     #[test]

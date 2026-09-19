@@ -3515,6 +3515,7 @@ mod tests {
             value,
             source_session_id: 1,
             version,
+            origin_fact_id: None,
         };
         // 乱序输入：version 3 先出现，version 2 后出现 → version 3 胜
         let out = latest_entries_by_path(vec![
