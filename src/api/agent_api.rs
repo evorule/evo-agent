@@ -299,8 +299,8 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/agents/{type}/memory/recall",
             axum::routing::get(agent_memory_recall),
         )
-        // 37 号(决策点⑦):LLM 命名操作端点 — 供 evorule-rule 作为命名操作契约消费
-        // draft_rule / gen_tests / explain_rule(MVP);受同一鉴权中间件保护(38 号:LLM 按租户隔离)
+        // 历史批次(既定设计决策):LLM 命名操作端点 — 供 evorule-rule 作为命名操作契约消费
+        // draft_rule / gen_tests / explain_rule(MVP);受同一鉴权中间件保护(LLM 按租户隔离)
         .route(
             "/ops/{operation}",
             axum::routing::post(crate::api::llm_ops::run_operation),

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! bundles 部署闭环工具（5 个，UV-084 W2 · 41 号 §4.3 缺口 1）
+//! bundles 部署闭环工具（5 个，批次 W2 · 设计文档 §4.3 缺口 1）
 //!
 //! 打通 evo-agent 独立完成"治理域导出 → 执行域部署"的全链路（此前
 //! publish_tools 止步于治理域，部署最后一步只能靠 console 或人工）：
@@ -60,7 +60,7 @@ impl ToolFunction for BundleExportTool {
         if verdict != "pass" && verdict != "fail" {
             return Err("verdict must be \"pass\" or \"fail\"".to_string());
         }
-        // 前置形状校验（与治理域 UV-080 B1 同口径，提前拦截省一次往返）：
+        // 前置形状校验（与治理域 回归验证 B1 同口径，提前拦截省一次往返）：
         // verdict=pass 必带可追溯标记，防零证据 pass 导出
         let subset: Vec<String> = args
             .get("subset")
@@ -395,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bundle_export_pass_without_traceable_subset_rejected() {
-        // 前置形状校验：pass + 空 subset → 拒绝（与治理域 UV-080 B1 同口径）
+        // 前置形状校验：pass + 空 subset → 拒绝（与治理域 回归验证 B1 同口径）
         let tool = BundleExportTool::new(make_ws());
         let mut m = std::collections::BTreeMap::new();
         m.insert("dataset_id".to_string(), JsonValue::string("ds1"));

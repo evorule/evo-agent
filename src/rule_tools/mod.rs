@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_w2_bundle_knowledge_tools_in_specs() {
-        // UV-084 W2 新增的 8 个工具（bundles 部署闭环 5 + knowledge 数据面 3）
+        // 批次 W2 新增的 8 个工具（bundles 部署闭环 5 + knowledge 数据面 3）
         let specs = rule_tool_specs();
         let spec_names: std::collections::HashSet<&str> =
             specs.iter().map(|s| s.name.as_str()).collect();
@@ -253,13 +253,13 @@ mod tests {
             // production 2
             "prod_state",
             "prod_audit",
-            // bundles 5 (UV-084 W2)
+            // bundles 5 (批次 W2)
             "bundle_export",
             "bundle_import_dry_run",
             "bundle_import",
             "bundle_active_list",
             "bundle_imports_list",
-            // knowledge 3 (UV-084 W2)
+            // knowledge 3 (批次 W2)
             "knowledge_datasets",
             "knowledge_search",
             "knowledge_entry_get",

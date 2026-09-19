@@ -125,7 +125,7 @@ impl ApiCore {
         Ok(())
     }
 
-    /// Check response status with full error body extraction (UV-084 W2).
+    /// Check response status with full error body extraction (批次 W2).
     ///
     /// 与 `check_response` 的差异（新方法专用，既有调用不迁移）：
     /// - 错误时读取响应 body，提取 server 统一错误格式 `{"error": "..."}`
