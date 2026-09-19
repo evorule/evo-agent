@@ -8,6 +8,7 @@
 //! 这是最危险的工具(写磁盘)。多层防护:
 //!
 //! 1. **工作目录沙箱**(同 file_read):绝对路径/`..`/symlink escape 一律拒
+//!    含 junction 父目录与悬空 symlink(P02/R03:CWE-59 链接跟随变体)
 //! 2. **写入路径白名单**:**只能**写 `writable_dir` 子目录(默认 `./workspace/`)
 //!    防止 agent 误写源码 / 配置 / `.git/` 等
 //! 3. **Overwrite 保护**:写已存在文件**必须**带 `overwrite=true`,否则拒
@@ -115,22 +116,48 @@ impl FileWriteTool {
             return Err(format!("path escapes workdir: '{}'", raw));
         }
 
-        // 5. 存在路径做 symlink 检查(canonical 必须仍在 writable_dir 内)
-        let target_canonical = if target.exists() {
-            let c = target
-                .canonicalize()
-                .map_err(|e| format!("path cannot be resolved: {}", e))?;
-            // 再 check 一次(symlink 可能跳出)
-            if !c.starts_with(&writable_canonical) {
-                return Err(format!(
-                    "path '{}' resolves outside writable_dir (symlink escape)",
-                    raw
-                ));
+        // 5. symlink / reparse point 检查(canonical 必须仍在 writable_dir 内)
+        //
+        // 判据用 `symlink_metadata`(不跟随链接)而非 `exists()`(跟随链接),覆盖三种情形:
+        //   a) 目标存在(普通文件或链接到已存在目标):canonicalize 解析后复查 containment
+        //   b) 悬空 symlink(P02/R03 补):`exists()`=false 但 write 会跟随链接
+        //      在 writable_dir 外创建文件 → symlink_metadata 可见,canonicalize 失败即拒
+        //   c) 目标不存在且本身不是链接:沿父目录链找最深的已存在祖先做 canonicalize
+        //      复查 containment(P02 实证的 junction 父目录逃逸,CWE-59 变体)
+        let target_canonical = match std::fs::symlink_metadata(&target) {
+            Ok(_meta) => {
+                let c = target
+                    .canonicalize()
+                    .map_err(|e| format!("path cannot be resolved: {}", e))?;
+                // 再 check 一次(symlink 可能跳出)
+                if !c.starts_with(&writable_canonical) {
+                    return Err(format!(
+                        "path '{}' resolves outside writable_dir (symlink escape)",
+                        raw
+                    ));
+                }
+                c
             }
-            c
-        } else {
-            // 不存在:不 canonicalize(用 logical target 就够)
-            target.clone()
+            Err(_) => {
+                // 目标不存在(且不是悬空链接):父目录链可能含 junction/symlink
+                let mut ancestor = target.parent();
+                while let Some(p) = ancestor {
+                    if p.exists() {
+                        let a = p
+                            .canonicalize()
+                            .map_err(|e| format!("path cannot be resolved: {}", e))?;
+                        if !a.starts_with(&writable_canonical) {
+                            return Err(format!(
+                                "path '{}' resolves outside writable_dir (parent symlink/junction escape)",
+                                raw
+                            ));
+                        }
+                        break;
+                    }
+                    ancestor = p.parent();
+                }
+                target.clone()
+            }
         };
 
         Ok((target, target_canonical))
@@ -435,7 +462,20 @@ mod tests {
         {
             // Windows 创建符号链接需要特权（错误码 1314），无特权环境跳过
             match std::os::windows::fs::symlink_file(&outside_file, &link_path) {
-                Ok(()) => {}
+                Ok(()) => {
+                    // P02 教训:不信 Ok(()) —— 本机存在 symlink 假 Ok 的中介层,
+                    // 必须核验链接真的创建了,否则该测试什么都没测到(假阳性/假阴性)
+                    match std::fs::symlink_metadata(&link_path) {
+                        Ok(m) if m.file_type().is_symlink() => {}
+                        _ => {
+                            eprintln!(
+                                "skip: symlink_file returned Ok but no symlink created (env intermediary)"
+                            );
+                            let _ = std::fs::remove_file(&link_path);
+                            return;
+                        }
+                    }
+                }
                 Err(e) if e.raw_os_error() == Some(1314) => {
                     eprintln!("skip: no symlink privilege on this Windows env");
                     return;
@@ -455,5 +495,148 @@ mod tests {
         // canonicalize 会解析 symlink → 目标在 outside
         // starts_with(writable_dir) 应为 false → reject
         assert!(result.is_err());
+    }
+
+    /// P02/R03 回归：junction 父目录 + **不存在的新文件** → 不得写穿 writable_dir。
+    /// junction 创建无需特权（Exp1 实证），CI 可稳定复现。
+    #[test]
+    fn test_reject_junction_escape_for_new_file() {
+        let dir = temp_workdir_with_workspace();
+        let outside = tempfile::tempdir().unwrap();
+        let link_dir = dir.path().join("workspace").join("linkdir");
+        let content_arg = |m: &mut std::collections::BTreeMap<String, JsonValue>| {
+            m.insert(
+                "path".to_string(),
+                JsonValue::string("workspace/linkdir/escaped_new.txt"),
+            );
+            m.insert("content".to_string(), JsonValue::string("escaped"));
+        };
+
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link_dir)
+                .arg(outside.path())
+                .output()
+                .expect("failed to spawn mklink");
+            if !out.status.success() {
+                eprintln!(
+                    "skip: junction creation failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                return;
+            }
+            // 不信返回码:必须核验 reparse point 真的创建了(本机 symlink 假 Ok 教训)
+            match std::fs::symlink_metadata(&link_dir) {
+                Ok(m) if m.file_type().is_symlink() => {}
+                _ => {
+                    eprintln!("skip: junction reported Ok but not created (env intermediary)");
+                    let _ = std::fs::remove_dir(&link_dir);
+                    return;
+                }
+            }
+
+            let tool = FileWriteTool::new(dir.path().to_path_buf());
+            let result = tool.call_sync(&JsonValue::object({
+                let mut m = std::collections::BTreeMap::new();
+                content_arg(&mut m);
+                m
+            }));
+            assert!(
+                result.is_err(),
+                "junction escape must be rejected, got: {:?}",
+                result
+            );
+            // 决定性核验:outside 不得出现文件
+            assert!(
+                !outside.path().join("escaped_new.txt").exists(),
+                "file escaped writable_dir via junction!"
+            );
+
+            // 清理:先摘 junction,避免 TempDir 递归删除穿透到 outside
+            let _ = std::fs::remove_dir(&link_dir);
+        }
+
+        #[cfg(unix)]
+        {
+            // unix 等价物:目录 symlink(同样无需特权)
+            std::os::unix::fs::symlink(outside.path(), &link_dir).unwrap();
+            let tool = FileWriteTool::new(dir.path().to_path_buf());
+            let result = tool.call_sync(&JsonValue::object({
+                let mut m = std::collections::BTreeMap::new();
+                content_arg(&mut m);
+                m
+            }));
+            assert!(
+                result.is_err(),
+                "symlink dir escape must be rejected, got: {:?}",
+                result
+            );
+            assert!(
+                !outside.path().join("escaped_new.txt").exists(),
+                "file escaped writable_dir via symlink dir!"
+            );
+            let _ = std::fs::remove_file(&link_dir);
+        }
+    }
+
+    /// P02/R03 回归：悬空 symlink（链接存在、指向的文件不存在）。
+    /// 修复前 `exists()`=false → 不做任何解析 → write 跟随链接在 writable_dir 外
+    /// 创建文件（CWE-59 同族）。修复后 symlink_metadata 可见链接 → 必须拒。
+    #[test]
+    fn test_reject_dangling_symlink_escape() {
+        let dir = temp_workdir_with_workspace();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("dangling_target.txt");
+        let link_path = dir.path().join("workspace").join("dangling.txt");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_file, &link_path).unwrap();
+        #[cfg(windows)]
+        {
+            match std::os::windows::fs::symlink_file(&outside_file, &link_path) {
+                Ok(()) => {
+                    // 假 Ok 防御(同上)
+                    match std::fs::symlink_metadata(&link_path) {
+                        Ok(m) if m.file_type().is_symlink() => {}
+                        _ => {
+                            eprintln!("skip: symlink_file returned Ok but no symlink created");
+                            let _ = std::fs::remove_file(&link_path);
+                            return;
+                        }
+                    }
+                }
+                Err(e) if e.raw_os_error() == Some(1314) => {
+                    eprintln!("skip: no symlink privilege on this Windows env");
+                    return;
+                }
+                Err(e) => panic!("unexpected symlink error: {e}"),
+            }
+        }
+
+        let tool = FileWriteTool::new(dir.path().to_path_buf());
+        let result = tool.call_sync(&JsonValue::object({
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "path".to_string(),
+                JsonValue::string("workspace/dangling.txt"),
+            );
+            m.insert("content".to_string(), JsonValue::string("escaped"));
+            m
+        }));
+        assert!(
+            result.is_err(),
+            "dangling symlink escape must be rejected, got: {:?}",
+            result
+        );
+        assert!(
+            !outside_file.exists(),
+            "file escaped writable_dir via dangling symlink!"
+        );
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&link_path);
+        #[cfg(windows)]
+        let _ = std::fs::remove_file(&link_path);
     }
 }
