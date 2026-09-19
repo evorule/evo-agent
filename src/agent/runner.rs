@@ -1910,7 +1910,12 @@ impl AgentRunner {
         let prefix = format!("shared.{}.", self.sediment_config.namespace);
         let shared_facts = self.evorule_client.get_shared_facts(Some(&prefix)).await?;
 
-        if shared_facts.is_empty() {
+        // R01（E19/S6 写回面）：与 recall_context 同一去重语义——
+        // 同 path 只保留最新版本，墓碑（最新版为 null）不进写回内容，
+        // 否则已删除的旧值经 auto_recall 写回记忆而复活。
+        let latest = crate::agent::memory::latest_entries_by_path(shared_facts);
+
+        if latest.is_empty() {
             info!(%session_id, "No shared facts to recall");
             return Ok(Vec::new());
         }
@@ -1918,7 +1923,7 @@ impl AgentRunner {
         let mut recalled_ids = Vec::new();
         let mut recalled_content = String::new();
 
-        for fact in &shared_facts {
+        for (fact, _) in &latest {
             recalled_ids.push(fact.fact_id);
             recalled_content.push_str(&format!(
                 "[Fact {}] {}: {}\n",
