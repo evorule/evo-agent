@@ -256,6 +256,43 @@ pub(crate) fn latest_entries_by_path(
         .collect()
 }
 
+/// R04（E20 对账复活修复）：按 path 取最新版本的 value，供 cache 对账/同步使用。
+///
+/// 语义与 [`latest_entries_by_path`] 一致：
+/// - 同 path 取 `version` 最大者（平局取后出现者，与服务端版本升序返回一致）；
+/// - **墓碑抑制**：最新版 `value == null` 的 path **不在存活集合**中，
+///   且单独以 `tombstoned` 返回——调用方据此清理 cache 中的残留条目
+///   （修复前 null 被跳过、旧版被认定为权威 → 已删除条目复活、ghost 检测失效）。
+///
+/// 返回 `(path → 最新存活 value, 墓碑 path 列表)`。
+pub(crate) fn latest_values_by_path(
+    facts: Vec<(String, u64, serde_json::Value)>,
+) -> (
+    std::collections::BTreeMap<String, serde_json::Value>,
+    Vec<String>,
+) {
+    let mut latest: std::collections::BTreeMap<String, (u64, serde_json::Value)> =
+        Default::default();
+    for (path, version, value) in facts {
+        match latest.get(&path) {
+            Some((prev, _)) if *prev > version => {}
+            _ => {
+                latest.insert(path, (version, value));
+            }
+        }
+    }
+    let mut tombstoned = Vec::new();
+    let mut alive = std::collections::BTreeMap::new();
+    for (path, (_, value)) in latest {
+        if value.is_null() {
+            tombstoned.push(path);
+        } else {
+            alive.insert(path, value);
+        }
+    }
+    (alive, tombstoned)
+}
+
 /// C2: 召回上下文（三层召回结果）
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct RecallContext {
@@ -1010,11 +1047,24 @@ impl MemoryManager {
                 .get_facts(session_id, Some(&prefix))
                 .await
             {
-                for fact in facts {
-                    if let Some(cache_key) = self.path_to_cache_key(&fact.path) {
-                        if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
+                // R04（E20）：按 path 取最新版本 + 墓碑清理。
+                // 修复前逐条遍历：null 墓碑被跳过、旧版本被写入 cache → 已删除条目复活。
+                let (alive, tombstoned) = latest_values_by_path(
+                    facts
+                        .into_iter()
+                        .map(|f| (f.path, f.version, f.value))
+                        .collect(),
+                );
+                for (path, value) in alive {
+                    if let Some(cache_key) = self.path_to_cache_key(&path) {
+                        if let Ok(record) = serde_json::from_value::<MemoryRecord>(value) {
                             self.cache.insert(cache_key, record);
                         }
+                    }
+                }
+                for path in tombstoned {
+                    if let Some(cache_key) = self.path_to_cache_key(&path) {
+                        self.cache.remove(&cache_key);
                     }
                 }
             }
@@ -1063,25 +1113,45 @@ impl MemoryManager {
         };
         let mut authoritative: BTreeMap<String, MemoryRecord> = BTreeMap::new();
 
-        for fact in self
-            .evorule_client
-            .get_facts(&session_id, Some(&format!("__memory__.{}", self.namespace)))
-            .await?
+        // R04（E20）：先按 path 取最新版本再判定权威。
+        // 修复前逐条遍历：null 墓碑被跳过、更早版本被（重）认定为权威
+        // → 已删除条目复活、ghost 检测失效（drift=0）。
+        // 墓碑 path 不进 authoritative → cache 残留条目被 ghost 清理逻辑移除。
         {
-            if let Some(cache_key) = self.path_to_cache_key(&fact.path) {
-                if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
-                    authoritative.insert(cache_key, record);
+            let facts = self
+                .evorule_client
+                .get_facts(&session_id, Some(&format!("__memory__.{}", self.namespace)))
+                .await?;
+            let (alive, _tombstoned) = latest_values_by_path(
+                facts
+                    .into_iter()
+                    .map(|f| (f.path, f.version, f.value))
+                    .collect(),
+            );
+            for (path, value) in alive {
+                if let Some(cache_key) = self.path_to_cache_key(&path) {
+                    if let Ok(record) = serde_json::from_value::<MemoryRecord>(value) {
+                        authoritative.insert(cache_key, record);
+                    }
                 }
             }
         }
-        for fact in self
-            .evorule_client
-            .get_shared_facts(Some(&format!("shared.{}.", self.namespace)))
-            .await?
         {
-            if let Some(cache_key) = self.path_to_cache_key(&fact.path) {
-                if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
-                    authoritative.insert(cache_key, record);
+            let facts = self
+                .evorule_client
+                .get_shared_facts(Some(&format!("shared.{}.", self.namespace)))
+                .await?;
+            let (alive, _tombstoned) = latest_values_by_path(
+                facts
+                    .into_iter()
+                    .map(|f| (f.path, f.version, f.value))
+                    .collect(),
+            );
+            for (path, value) in alive {
+                if let Some(cache_key) = self.path_to_cache_key(&path) {
+                    if let Ok(record) = serde_json::from_value::<MemoryRecord>(value) {
+                        authoritative.insert(cache_key, record);
+                    }
                 }
             }
         }
@@ -2095,6 +2165,158 @@ mod tests {
 
         m1.assert_async().await;
         m2.assert_async().await;
+    }
+
+    // ===== R04（E20 对账复活修复）：对账/同步按 path 取最新版本 + 墓碑抑制 =====
+
+    #[tokio::test]
+    async fn test_verify_cache_tombstoned_session_path_detected_as_ghost() {
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()))
+            .with_session_id("s1")
+            .with_cache_verify_interval_secs(0);
+
+        // server：session 侧同 path [v1, null 墓碑]；shared 侧空
+        let facts_body = r#"[
+            {"version":1,"fact_id":1,"path":"__memory__.test.session_s1.mine","value":{"key":"mine","value":"v1","timestamp":10},"type":"payload_update"},
+            {"version":2,"fact_id":2,"path":"__memory__.test.session_s1.mine","value":null,"type":"payload_update"}
+        ]"#;
+        let m1 = server
+            .mock("GET", "/api/sessions/s1/facts?prefix=__memory__.test")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(facts_body)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        // E20 场景：已删除条目残留在 cache
+        mgr.cache.insert(
+            "session_s1::mine".to_string(),
+            MemoryRecord::new("mine", "v1", 10),
+        );
+
+        let drift = mgr.verify_cache_against_server().await.expect("verify");
+        assert_eq!(drift, 1, "墓碑路径的 cache 残留必须被检出为 ghost");
+        assert!(
+            !mgr.cache.contains_key("session_s1::mine"),
+            "已删除条目不得复活（修复前 drift=0 且条目残留）"
+        );
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_verify_cache_tombstoned_shared_path_detected_as_ghost() {
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()))
+            .with_session_id("s1")
+            .with_cache_verify_interval_secs(0);
+
+        // server：session 侧空；shared 侧同 path [v1, null 墓碑]
+        let m1 = server
+            .mock("GET", "/api/sessions/s1/facts?prefix=__memory__.test")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+        let shared_body = r#"[
+            {"fact_id":11,"path":"shared.test.shared_mine","value":{"key":"shared_mine","value":"v1","timestamp":10},"source_session_id":1,"version":1},
+            {"fact_id":12,"path":"shared.test.shared_mine","value":null,"source_session_id":1,"version":2}
+        ]"#;
+        let m2 = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(shared_body)
+            .create_async()
+            .await;
+
+        mgr.cache.insert(
+            "shared::shared_mine".to_string(),
+            MemoryRecord::new("shared_mine", "v1", 10),
+        );
+
+        let drift = mgr.verify_cache_against_server().await.expect("verify");
+        assert_eq!(drift, 1, "shared 侧墓碑残留同样必须被检出");
+        assert!(!mgr.cache.contains_key("shared::shared_mine"));
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_verify_cache_backfills_latest_version() {
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()))
+            .with_session_id("s1")
+            .with_cache_verify_interval_secs(0);
+
+        // server：同 path 两版本（无墓碑），cache 空 → 回填的必须是最新版
+        let facts_body = r#"[
+            {"version":1,"fact_id":1,"path":"__memory__.test.session_s1.topic","value":{"key":"topic","value":"old","timestamp":10},"type":"payload_update"},
+            {"version":2,"fact_id":2,"path":"__memory__.test.session_s1.topic","value":{"key":"topic","value":"new","timestamp":20},"type":"payload_update"}
+        ]"#;
+        let m1 = server
+            .mock("GET", "/api/sessions/s1/facts?prefix=__memory__.test")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(facts_body)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        let drift = mgr.verify_cache_against_server().await.expect("verify");
+        assert_eq!(drift, 1, "1 miss backfilled");
+        let rec = mgr.cache.get("session_s1::topic").expect("backfilled");
+        assert_eq!(rec.value, "new", "回填必须是最新版本而非旧版本");
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_sync_from_evorule_tombstone_does_not_resurrect() {
+        let mut server = mockito::Server::new_async().await;
+
+        // server：同 path [v1, null 墓碑]
+        let facts_body = r#"[
+            {"version":1,"fact_id":1,"path":"__memory__.test.session_s1.mine","value":{"key":"mine","value":"v1","timestamp":10},"type":"payload_update"},
+            {"version":2,"fact_id":2,"path":"__memory__.test.session_s1.mine","value":null,"type":"payload_update"}
+        ]"#;
+        let m1 = server
+            .mock("GET", "/api/sessions/s1/facts?prefix=__memory__.test")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(facts_body)
+            .create_async()
+            .await;
+
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        // cache 残留已删除条目（E20 的"离线兜底复活"场景）
+        mgr.cache.insert(
+            "session_s1::mine".to_string(),
+            MemoryRecord::new("mine", "v1", 10),
+        );
+
+        mgr.sync_from_evorule().await.expect("sync");
+        assert!(
+            !mgr.cache.contains_key("session_s1::mine"),
+            "离线兜底同步不得复活墓碑路径（N3 不可主张清单对应项）"
+        );
+        m1.assert_async().await;
     }
 
     #[tokio::test]
