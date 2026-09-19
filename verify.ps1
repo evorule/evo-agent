@@ -58,5 +58,30 @@ if ($depHits.Count -gt 0) {
     Write-Host "PASS: dependency contract (evorule-tcb / evorule-reactor resolved from crates.io)"
 }
 
+# Version alignment: engine crates must track the主线 supported minor
+# (source of truth: evorule/SECURITY.md support table). Historical drift
+# (locked 0.4.3 while主线 0.6.0) is exactly what this check prevents (N8).
+$supportedMinor = "0.6"
+$depVers = [regex]::Matches($manifest, '(?m)^\s*(evorule-tcb|evorule-reactor)\s*=\s*"(\d+)\.(\d+)\.\d+"')
+$misaligned = @()
+foreach ($v in $depVers) {
+    $minor = "$($v.Groups[2].Value).$($v.Groups[3].Value)"
+    if ($minor -ne $supportedMinor) {
+        $misaligned += "$($v.Groups[1].Value)=$minor"
+    }
+}
+if ($depVers.Count -eq 0) {
+    Write-Host "FAIL: no pinned evorule-tcb/evorule-reactor version deps found in Cargo.toml"
+    $failed = $true
+} elseif ($misaligned.Count -gt 0) {
+    Write-Host "FAIL: engine crates not aligned with supported minor ${supportedMinor}.x:"
+    foreach ($m in $misaligned) { Write-Host "  $m" }
+    Write-Host "  (upgrade evorule-tcb/evorule-reactor, then update 'supportedMinor' here;"
+    Write-Host "   supported versions: evorule/SECURITY.md)"
+    $failed = $true
+} else {
+    Write-Host "PASS: version alignment (evorule engine crates on ${supportedMinor}.x)"
+}
+
 if ($failed) { Write-Host "== RESULT: FAIL =="; exit 1 }
 Write-Host "== RESULT: ALL PASS =="
