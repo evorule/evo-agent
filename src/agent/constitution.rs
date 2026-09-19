@@ -4,8 +4,9 @@
 //! 宪法 schema 校验桥（M7-B1/B2，2026-08-27）
 //!
 //! 把 evorule-system-rules 的 `agent_def/v1.0.json` / `workflow_dag/v1.0.json`
-//! 接入加载期：资产（或其 sidecar 标注层）反序列化后先过 jsonschema 全量校验，
-//! 再进入业务门卫（`AgentDefinition::validate` 等）。
+//! / `workflow_dag/v1.1.json` 接入加载期：资产（或其 sidecar 标注层）反序列化后
+//! 先过 jsonschema 全量校验，再进入业务门卫（`AgentDefinition::validate` 等）。
+//! workflow_dag 双版本并存：按文档形态分派（见 `detect_workflow_dag_version`）。
 //!
 //! ## Schema 来源与 fail-fast 策略（审计⑥ C12）
 //!
@@ -27,6 +28,8 @@ use jsonschema::JSONSchema;
 static AGENT_DEF_SCHEMA: OnceLock<Option<JSONSchema>> = OnceLock::new();
 /// 已编译的 workflow_dag v1.0 校验器（进程内单例）
 static WORKFLOW_DAG_SCHEMA: OnceLock<Option<JSONSchema>> = OnceLock::new();
+/// 已编译的 workflow_dag v1.1 校验器（进程内单例；v1.1 = v1.0 + 节点级可选 run_when）
+static WORKFLOW_DAG_SCHEMA_V1_1: OnceLock<Option<JSONSchema>> = OnceLock::new();
 
 /// 定位宪法仓 schemas 目录
 pub fn locate_schemas_dir() -> Option<PathBuf> {
@@ -183,19 +186,52 @@ pub fn validate_agent_def(body: &serde_json::Value) -> Result<(), Vec<String>> {
     )
 }
 
-/// 用 workflow_dag v1.0 校验裸文档（无壳 body）。schema 不可用时 fail-fast 报错。
+/// 判定 workflow_dag 裸文档应按哪个版本校验（并存窗口）
+///
+/// 分派规则（确定性：同输入必同分派）：
+/// 1. body 显式携带 `$schema` 字段 → 按声明分派（指向 v1.1 用 v1.1，其余按 v1.0）
+/// 2. 裸 body（运行时形态，无 `$schema`）→ 能力探测：任一节点含 `run_when`
+///    即按 v1.1（条件分支是 v1.1 相对 v1.0 的唯一增量），否则 v1.0
+fn detect_workflow_dag_version(body: &serde_json::Value) -> &'static str {
+    if let Some(url) = body.get("$schema").and_then(|v| v.as_str()) {
+        return if url.ends_with("/workflow_dag/v1.1.json") {
+            "v1.1"
+        } else {
+            "v1.0"
+        };
+    }
+    let uses_run_when = body
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .is_some_and(|nodes| nodes.iter().any(|n| n.get("run_when").is_some()));
+    if uses_run_when {
+        "v1.1"
+    } else {
+        "v1.0"
+    }
+}
+
+/// 用 workflow_dag 校验裸文档（无壳 body）。schema 不可用时 fail-fast 报错。
+///
+/// 按 [`detect_workflow_dag_version`] 分派 v1.0/v1.1 校验器（双版本并存窗口）。
 pub fn validate_workflow_dag(body: &serde_json::Value) -> Result<(), Vec<String>> {
-    validate_with(
-        &shelve(
-            body,
-            "workflow_dag",
-            "https://evorule.org/schemas/workflow_dag/v1.0.json",
-        ),
-        compile_schema(
+    let version = detect_workflow_dag_version(body);
+    let (cell, file, url) = if version == "v1.1" {
+        (
+            &WORKFLOW_DAG_SCHEMA_V1_1,
+            "workflow_dag/v1.1.json",
+            "https://evorule.org/schemas/workflow_dag/v1.1.json",
+        )
+    } else {
+        (
             &WORKFLOW_DAG_SCHEMA,
             "workflow_dag/v1.0.json",
-            "workflow_dag",
-        ),
+            "https://evorule.org/schemas/workflow_dag/v1.0.json",
+        )
+    };
+    validate_with(
+        &shelve(body, "workflow_dag", url),
+        compile_schema(cell, file, "workflow_dag"),
         "workflow_dag",
     )
 }
@@ -328,5 +364,107 @@ mod tests {
             "output_node": "a"
         });
         assert!(validate_workflow_dag(&ok_wf).is_ok());
+    }
+
+    // ----- workflow_dag v1.0/v1.1 双版本分派 -----
+
+    #[test]
+    fn test_detect_workflow_dag_version() {
+        // 显式 $schema 按声明分派
+        let explicit_v11 = serde_json::json!({
+            "$schema": "https://evorule.org/schemas/workflow_dag/v1.1.json",
+            "workflow_id": "w", "nodes": [], "output_node": "x"
+        });
+        assert_eq!(detect_workflow_dag_version(&explicit_v11), "v1.1");
+        let explicit_v10 = serde_json::json!({
+            "$schema": "https://evorule.org/schemas/workflow_dag/v1.0.json",
+            "workflow_id": "w", "nodes": [], "output_node": "x"
+        });
+        assert_eq!(detect_workflow_dag_version(&explicit_v10), "v1.0");
+        // 裸 body（运行时形态）能力探测：含 run_when → v1.1
+        let bare_v11 = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [
+                {"id": "a", "agent_type": "x", "run_when": {"node": "a", "op": "contains", "value": "v"}}
+            ],
+            "output_node": "a"
+        });
+        assert_eq!(detect_workflow_dag_version(&bare_v11), "v1.1");
+        // 裸 body 无 run_when → v1.0
+        let bare_v10 = serde_json::json!({
+            "workflow_id": "w", "nodes": [{"id": "a", "agent_type": "x"}], "output_node": "a"
+        });
+        assert_eq!(detect_workflow_dag_version(&bare_v10), "v1.0");
+    }
+
+    #[test]
+    fn test_validate_workflow_v11_accepts_run_when() {
+        let Some(_) = locate_schemas_dir() else {
+            return;
+        };
+        let ok = serde_json::json!({
+            "workflow_id": "w", "description": "",
+            "nodes": [
+                {"id": "a", "agent_type": "researcher", "task": "t"},
+                {"id": "b", "agent_type": "writer", "task": "t", "depends_on": ["a"],
+                 "run_when": {"node": "a", "op": "contains", "value": "APPROVE"}}
+            ],
+            "output_node": "b"
+        });
+        assert!(validate_workflow_dag(&ok).is_ok());
+    }
+
+    #[test]
+    fn test_validate_workflow_v11_rejects_unknown_op() {
+        // 含 run_when 的 body 走 v1.1 严格校验：op 枚举外取值被拒。
+        // （v1.0 schema 未定义 run_when、默认放行未知字段——本用例同时证明分派到了 v1.1）
+        let Some(_) = locate_schemas_dir() else {
+            return;
+        };
+        let bad = serde_json::json!({
+            "workflow_id": "w", "description": "",
+            "nodes": [
+                {"id": "a", "agent_type": "researcher", "task": "t"},
+                {"id": "b", "agent_type": "writer", "task": "t", "depends_on": ["a"],
+                 "run_when": {"node": "a", "op": "starts_with", "value": "APPROVE"}}
+            ],
+            "output_node": "b"
+        });
+        assert!(validate_workflow_dag(&bad).is_err());
+    }
+
+    #[test]
+    fn test_validate_workflow_v11_rejects_non_string_value() {
+        let Some(_) = locate_schemas_dir() else {
+            return;
+        };
+        let bad = serde_json::json!({
+            "workflow_id": "w", "description": "",
+            "nodes": [
+                {"id": "a", "agent_type": "researcher", "task": "t"},
+                {"id": "b", "agent_type": "writer", "task": "t", "depends_on": ["a"],
+                 "run_when": {"node": "a", "op": "equals", "value": 42}}
+            ],
+            "output_node": "b"
+        });
+        assert!(validate_workflow_dag(&bad).is_err());
+    }
+
+    #[test]
+    fn test_validate_workflow_v11_rejects_extra_keys_in_run_when() {
+        // run_when 子对象封口（additionalProperties: false）：防拼写漂移
+        let Some(_) = locate_schemas_dir() else {
+            return;
+        };
+        let bad = serde_json::json!({
+            "workflow_id": "w", "description": "",
+            "nodes": [
+                {"id": "a", "agent_type": "researcher", "task": "t"},
+                {"id": "b", "agent_type": "writer", "task": "t", "depends_on": ["a"],
+                 "run_when": {"node": "a", "op": "equals", "value": "v", "extra": 1}}
+            ],
+            "output_node": "b"
+        });
+        assert!(validate_workflow_dag(&bad).is_err());
     }
 }
