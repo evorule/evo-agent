@@ -482,6 +482,10 @@ impl ContextBudget {
 
     /// C3: 在 memory_cap 内组装记忆块；超限按降级顺序截断。
     /// 降级顺序：L2 稳定事实 > L1 摘要 > L2 事件
+    ///
+    /// R11（降级可见）：任何截断必须推入
+    /// [`RecallContext::degradation_notices`]——实测裁剪完全静默，
+    /// 比召回失败更不可见（失败尚有 notices，裁剪曾什么都不留）。
     pub fn fit_recall(&self, recall: &mut RecallContext) {
         if self.total_window == 0 {
             return; // 不限制
@@ -490,6 +494,7 @@ impl ContextBudget {
         let mut used = 0;
 
         // L2 稳定事实优先（硬注入）
+        let stable_total = recall.stable.len();
         let cut_stable = recall
             .stable
             .iter()
@@ -499,14 +504,30 @@ impl ContextBudget {
             })
             .unwrap_or(recall.stable.len());
         recall.stable.truncate(cut_stable);
+        if cut_stable < stable_total {
+            recall.degradation_notices.push(format!(
+                "memory budget: stable 层裁剪 {} 条(保留 {},预算 {} token)",
+                stable_total - cut_stable,
+                cut_stable,
+                budget
+            ));
+        }
 
         if used > budget {
+            if !recall.summaries.is_empty() || !recall.events.is_empty() {
+                recall.degradation_notices.push(format!(
+                    "memory budget: stable 层耗尽预算,L1 摘要清空 {} 条、L2 事件清空 {} 条",
+                    recall.summaries.len(),
+                    recall.events.len()
+                ));
+            }
             recall.summaries.clear();
             recall.events.clear();
             return;
         }
 
         // L1 摘要
+        let summaries_total = recall.summaries.len();
         let cut_summaries = recall
             .summaries
             .iter()
@@ -516,13 +537,28 @@ impl ContextBudget {
             })
             .unwrap_or(recall.summaries.len());
         recall.summaries.truncate(cut_summaries);
+        if cut_summaries < summaries_total {
+            recall.degradation_notices.push(format!(
+                "memory budget: L1 摘要裁剪 {} 条(保留 {},预算 {} token)",
+                summaries_total - cut_summaries,
+                cut_summaries,
+                budget
+            ));
+        }
 
         if used > budget {
+            if !recall.events.is_empty() {
+                recall.degradation_notices.push(format!(
+                    "memory budget: stable+摘要耗尽预算,L2 事件清空 {} 条",
+                    recall.events.len()
+                ));
+            }
             recall.events.clear();
             return;
         }
 
         // L2 事件（最低优先级）
+        let events_total = recall.events.len();
         let cut_events = recall
             .events
             .iter()
@@ -532,6 +568,14 @@ impl ContextBudget {
             })
             .unwrap_or(recall.events.len());
         recall.events.truncate(cut_events);
+        if cut_events < events_total {
+            recall.degradation_notices.push(format!(
+                "memory budget: L2 事件裁剪 {} 条(保留 {},预算 {} token)",
+                events_total - cut_events,
+                cut_events,
+                budget
+            ));
+        }
     }
 
     /// C3: 弹性预算 —— 记忆区未用满时，剩余还给 messages
@@ -3663,6 +3707,51 @@ mod tests {
         assert!(
             recall2.events.is_empty(),
             "events should be cleared when budget exhausted"
+        );
+    }
+
+    #[test]
+    fn test_fit_recall_trimming_pushes_degradation_notices() {
+        // R11（降级可见）：裁剪不得静默——每种截断都要留痕
+        // 场景 1: stable 截断（预算耗尽）→ summaries/events 清空,须有 notice
+        let mut recall = RecallContext::default();
+        recall
+            .stable
+            .push(MemoryRecord::new("k1", &"x".repeat(100), 1000));
+        recall
+            .summaries
+            .push(MemoryRecord::new("k2", &"y".repeat(100), 2000));
+        recall
+            .events
+            .push(MemoryRecord::new("k3", &"z".repeat(100), 3000));
+
+        // total_window=40, ratio=0.25 → cap=10;stable 单条 ≈25 token → 截断
+        let budget = ContextBudget::new(40, 0.25);
+        budget.fit_recall(&mut recall);
+        assert!(recall.stable.is_empty());
+        assert!(recall.summaries.is_empty());
+        assert!(recall.events.is_empty());
+        assert!(
+            !recall.degradation_notices.is_empty(),
+            "裁剪必须留痕,不得静默"
+        );
+        let joined = recall.degradation_notices.join("\n");
+        assert!(
+            joined.contains("stable") && joined.contains("清空"),
+            "notice 须说明 stable 裁剪与下游清空: {joined}"
+        );
+
+        // 场景 2: 全部放得下 → 不得产生 notice（无裁剪 = 无降级）
+        let mut recall_ok = RecallContext::default();
+        recall_ok
+            .stable
+            .push(MemoryRecord::new("k1", &"x".repeat(10), 1000));
+        let budget_ok = ContextBudget::new(128000, 0.25);
+        budget_ok.fit_recall(&mut recall_ok);
+        assert_eq!(recall_ok.stable.len(), 1);
+        assert!(
+            recall_ok.degradation_notices.is_empty(),
+            "无裁剪时不得伪造降级通知"
         );
     }
 

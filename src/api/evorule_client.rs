@@ -302,7 +302,24 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        // R11：不得走通用 check_response——它把 404 映射为
+        // SessionNotFound（对 rollup 是误导语义），且错误 message 恒为
+        // 空串（吞掉 server 的"未知 fact_id / 两 ID 空间不通用"诊断）。
+        // 此处显式读取 ApiResponse 格式的 message 透出。
+        let status = resp.status();
+        if !status.is_success() {
+            let status_u16 = status.as_u16();
+            let err_body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+            let message = err_body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string();
+            return Err(ApiError::ApiError {
+                status: status_u16,
+                message,
+            });
+        }
         Ok(())
     }
 

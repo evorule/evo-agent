@@ -710,7 +710,17 @@ impl AgentRunner {
             runner = runner.with_summarizer(summarizer);
         }
         // G2:自动构造 ContextWindowManager(默认 8192 token,reserve 1/4)
-        let max_tokens = def.context_window_tokens.unwrap_or(8192);
+        // R11：默认值必须可见，不得静默——未显式设置时记忆区预算
+        // = 8192 × 25% = 2,048 token，约 60-80 条即饱和并开始裁剪（实测）。
+        let max_tokens = match def.context_window_tokens {
+            Some(t) => t,
+            None => {
+                warn!(
+                    "context_window_tokens 未显式设置,使用默认 8192(记忆区预算 = 8192 × 25% = 2048 token,约 60-80 条即饱和;生产部署建议显式声明)"
+                );
+                8192
+            }
+        };
         let reserve = max_tokens / 4;
         let ctx_mgr = ContextWindowManager::with_approx_counter(
             max_tokens,
