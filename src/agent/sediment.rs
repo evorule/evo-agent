@@ -71,7 +71,7 @@ pub struct SedimentDeps<'a> {
     pub memory: &'a mut MemoryManager,
     /// 上下文摘要器（None 时不生成摘要）
     pub summarizer: Option<&'a ContextSummarizer>,
-    /// 事件提取器（C1 阶段 best-effort，可能为 None）
+    /// 事件提取器（R07/E17 接线后实际使用；None = memory 未启用）
     pub extractor: Option<&'a mut EventExtractor>,
 }
 
@@ -82,7 +82,7 @@ pub struct SedimentResult {
     pub summary_written: bool,
     /// 成功写入的稳定事实 key 列表
     pub stable_facts: Vec<String>,
-    /// 提取的事件 ID 列表（C1 阶段暂为空）
+    /// 提取并写入共享账本的事件 ID 列表（R07/E17 接线后实际填充）
     pub events: Vec<String>,
     /// rollup 是否执行（C4）
     pub rollup_done: bool,
@@ -95,7 +95,7 @@ pub struct SedimentResult {
 /// 1. 调 `summarizer.summarize_session()` 生成整会话摘要 + 稳定事实（一次 LLM 调用）
 /// 2. 摘要 → 共享空间 `write_shared_summary()`
 /// 3. 稳定事实 → 共享空间 `set_scoped(Shared, ...)`
-/// 4. 事件提取（C1 占位，暂不执行）
+/// 4. 事件提取（R07/E17 接线：触发式提取 → 写入 `shared.{ns}.events.*`）
 /// 5. rollup 检查（C4 占位，返回 false）
 ///
 /// # 参数
@@ -154,8 +154,17 @@ pub async fn sediment(
         }
     }
 
-    // 4. 事件提取（C1 阶段 best-effort，extractor 可能不存在）
-    // 事件提取的完整实现依赖 EventExtractor，这里先跳过具体提取逻辑
+    // 4. 事件提取（R07/E17 接线）
+    // 修复前：本步为占位 no-op——`enable_event_extraction` 从未被读取、
+    // `extractor` 从未被使用（配置面宣称启用，行为上是空操作，实证报告 §6.3）。
+    // 修复后：读取配置开关 + 实际使用 extractor，且写入目标为共享账本
+    // `shared.{ns}.events.*`（与召回层 `recall_context` 读取前缀一致——
+    // 报告 §6.3 增量结论：仅接线 extractor 而不改写入目标，事件层仍不可达）。
+    if cfg.enable_event_extraction {
+        if let Some(extractor) = deps.extractor.take() {
+            extract_and_store_events(extractor, deps, session_id, messages, &mut result).await;
+        }
+    }
 
     // 5. C4 rollup（阈值检查）：合并最旧摘要并标记旧摘要为 rolled_up
     if result.summary_written && cfg.summary_rollup_threshold > 0 {
@@ -183,6 +192,96 @@ fn sanitize_model_id(model: &str) -> String {
             }
         })
         .collect()
+}
+
+/// R07（E17 接线）：扫描会话消息，触发式提取结构化事件并写入共享账本
+///
+/// 写入目标 = `shared.{ns}.events.{event_id}`：经 `set_scoped(Shared)` →
+/// 会话 payload 更新 + 服务端 P3 广播进共享表，落点正是召回层
+/// `recall_context` 读取的 `shared.{ns}.events.` 前缀（E17 的实现级阻断点）。
+///
+/// 流程（Q13 方案 C）：
+/// 1. 逐条 User 消息 `detect_trigger`（显式短语/关键词，纯文本，不调 LLM）；
+/// 2. 命中 → LLM 提取结构化字段（temperature=0，`extract_from_conversation`）；
+/// 3. `MemoryEvent` 全量序列化进 `MemoryRecord.value` 写入共享账本
+///    （保留结构化字段供回放/因果链；R05 的 CJK 分词对 JSON 文本同样可命中）。
+///
+/// 全程 best-effort：LLM 判定"无事件"（`Custom("none")`）是正常路径走 debug；
+/// 其余失败 warn 留痕，不阻断会话返回。
+async fn extract_and_store_events(
+    extractor: &mut EventExtractor,
+    deps: &mut SedimentDeps<'_>,
+    session_id: &str,
+    messages: &[Message],
+    result: &mut SedimentResult,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut seq = 0usize;
+
+    for (i, msg) in messages.iter().enumerate() {
+        let Message::User { content } = msg else {
+            continue;
+        };
+        // 触发检测（显式/关键词，纯文本匹配，不调 LLM）
+        if extractor.detect_trigger(content).is_none() {
+            continue;
+        }
+        // assistant 上下文 = 紧随其后的 Assistant 消息（如有）
+        let assistant = messages.get(i + 1).and_then(|m| match m {
+            Message::Assistant { content, .. } => Some(content.as_str()),
+            _ => None,
+        });
+        // 事件 ID：会话内唯一 + 路径安全（复用模型名消毒保证单一路径段）
+        let event_id = format!("E-{}-{}-{}", sanitize_model_id(session_id), now, seq);
+        seq += 1;
+
+        match extractor
+            .extract_from_conversation(content, assistant, &event_id, now)
+            .await
+        {
+            Ok(Some(event)) => {
+                let key = format!("events.{}", event.event_id);
+                let value = match serde_json::to_string(&event) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            event_id = %event.event_id,
+                            "sediment: serialize event failed"
+                        );
+                        continue;
+                    }
+                };
+                match deps
+                    .memory
+                    .set_scoped(MemoryScope::Shared, &key, &value)
+                    .await
+                {
+                    Ok(_) => result.events.push(event.event_id.clone()),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        event_id = %event.event_id,
+                        "sediment: write event to shared ledger failed"
+                    ),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                if e.contains("no event") {
+                    tracing::debug!(event_id = %event_id, "sediment: no event extracted");
+                } else {
+                    tracing::warn!(
+                        error = %e,
+                        event_id = %event_id,
+                        "sediment: event extraction failed"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// 把消息列表拼接为纯文本对话（供 LLM 摘要）
@@ -432,5 +531,125 @@ mod tests {
         assert!(!result.summary_written);
         assert!(result.stable_facts.is_empty());
         assert!(!result.rollup_done);
+    }
+
+    // ===== R07（E17 接线）：事件提取 → shared.{ns}.events.* =====
+
+    #[tokio::test]
+    async fn test_sediment_extracts_and_writes_events() {
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        use crate::io_handlers::LlmHandler;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("test", client).with_session_id("s1");
+
+        let cfg = SedimentConfig {
+            namespace: "test".to_string(),
+            ..Default::default()
+        };
+        let mock_response = r#"{"event_type":{"kind":"Milestone","subtype":"Birthday"},"entities":[],"content":{"summary":"用户生日"},"emotion":null,"tags":["birthday"]}"#;
+        let mut extractor = EventExtractor::with_defaults(LlmHandler::mock(mock_response));
+        let mut deps = SedimentDeps {
+            memory: &mut memory,
+            summarizer: None,
+            extractor: Some(&mut extractor),
+        };
+        let messages = vec![
+            Message::User {
+                content: "今天是我生日".to_string(),
+            },
+            Message::Assistant {
+                content: "生日快乐！".to_string(),
+                tool_calls: None,
+            },
+        ];
+
+        // set_scoped(Shared) → 会话 payload 更新（P3 广播由服务端完成）。
+        // 请求体断言双重点：路径落在共享账本 events 域（E17 实现级阻断点）+
+        // value 携带完整 MemoryEvent 序列化内容。
+        let m1 = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .with_status(200)
+            .match_body(mockito::Matcher::Regex(
+                r#"shared\.test\.events\.E-s1-\d+-0[\s\S]*Milestone[\s\S]*用户生日"#.to_string(),
+            ))
+            .create_async()
+            .await;
+
+        let result = sediment(&mut deps, &cfg, "s1", &messages).await;
+
+        // E17 主断言：事件被提取并写入（修复前 result.events 恒为空）
+        assert_eq!(result.events.len(), 1, "关键词触发的事件应被提取");
+        assert!(result.events[0].starts_with("E-s1-"));
+        m1.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_sediment_event_extraction_disabled_skips() {
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        use crate::io_handlers::LlmHandler;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("test", client).with_session_id("s1");
+
+        let cfg = SedimentConfig {
+            namespace: "test".to_string(),
+            enable_event_extraction: false,
+            ..Default::default()
+        };
+        let mut extractor = EventExtractor::with_defaults(LlmHandler::mock(""));
+        let mut deps = SedimentDeps {
+            memory: &mut memory,
+            summarizer: None,
+            extractor: Some(&mut extractor),
+        };
+        let messages = vec![Message::User {
+            content: "今天是我生日".to_string(),
+        }];
+        // 开关关闭：不应有任何写入（配置语义从"静默失效"变为"真实生效"）
+        let m1 = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let result = sediment(&mut deps, &cfg, "s1", &messages).await;
+        assert!(result.events.is_empty());
+        m1.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_sediment_no_trigger_no_extraction() {
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        use crate::io_handlers::LlmHandler;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("test", client).with_session_id("s1");
+
+        let cfg = SedimentConfig {
+            namespace: "test".to_string(),
+            ..Default::default()
+        };
+        let mut extractor = EventExtractor::with_defaults(LlmHandler::mock(""));
+        let mut deps = SedimentDeps {
+            memory: &mut memory,
+            summarizer: None,
+            extractor: Some(&mut extractor),
+        };
+        let messages = vec![Message::User {
+            content: "今天天气不错".to_string(),
+        }];
+        // 无触发：不调 LLM、不写事件
+        let m1 = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let result = sediment(&mut deps, &cfg, "s1", &messages).await;
+        assert!(result.events.is_empty());
+        m1.assert_async().await;
     }
 }
