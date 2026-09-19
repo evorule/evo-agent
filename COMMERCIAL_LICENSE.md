@@ -122,7 +122,7 @@ EvoRule Project（以下简称"许可方"）授予您（以下简称"被许可�
 
 ### 5.3 不在支持范围
 
-- ❌ 用户私有代码的 bug
+- ❌ 项目方私有代码的 bug
 - ❌ 第三方库集成的问题
 - ❌ 使用方式咨询（可单独购买培训）
 
@@ -214,7 +214,7 @@ EvoRule Project（以下简称"许可方"）授予您（以下简称"被许可�
 
 **许可方**: EvoRule Project
 **邮箱**: <evorulelab@gmail.com>
-**网站**: <https://gitee.com/evorule/evo-agent>
+**网站**: <https://gitee.com/evorule/evorule>
 
 **被许可方**: ________________________
 **联系人**: ________________________
