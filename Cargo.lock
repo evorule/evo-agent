@@ -606,9 +606,9 @@ dependencies = [
 
 [[package]]
 name = "evorule-reactor"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d0fc3c6e336b285f1c1a7f52dac46cb72d7ca111f941cc3224d37bfdc779494"
+checksum = "a41badf1cb4d0eb65f19109c0a206ddb115bb055545b204b1c46d56a1916c3a6"
 dependencies = [
  "async-trait",
  "blake3",
@@ -620,9 +620,9 @@ dependencies = [
 
 [[package]]
 name = "evorule-tcb"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf746e941dd9958ebfe19dc28a8c9f41fd32aa57b9a6a31468ebe23ef8fce785"
+checksum = "1e4ffbce9379c15a7952e18c2cc4c0776e77b9eddc3ec860dc2970253fd2edd3"
 
 [[package]]
 name = "fancy-regex"
