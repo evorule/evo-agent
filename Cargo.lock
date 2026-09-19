@@ -390,7 +390,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -557,7 +557,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -606,9 +606,9 @@ dependencies = [
 
 [[package]]
 name = "evorule-reactor"
-version = "0.4.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e161cacf06d0f2a5f34797265fc80117fe5f4ac23b95befc9e93e80a7cd7067"
+checksum = "2d0fc3c6e336b285f1c1a7f52dac46cb72d7ca111f941cc3224d37bfdc779494"
 dependencies = [
  "async-trait",
  "blake3",
@@ -620,9 +620,9 @@ dependencies = [
 
 [[package]]
 name = "evorule-tcb"
-version = "0.4.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7295910a75fb0720effbe8182893812aa0635edfb7a3aea1190e3e5eeff792f"
+checksum = "bf746e941dd9958ebfe19dc28a8c9f41fd32aa57b9a6a31468ebe23ef8fce785"
 
 [[package]]
 name = "fancy-regex"
@@ -1812,7 +1812,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2195,7 +2195,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
