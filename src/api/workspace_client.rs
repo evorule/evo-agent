@@ -700,7 +700,7 @@ impl WorkspaceApiClient {
         Ok(result)
     }
 
-    // ===== UV-084 W2：bundles 部署闭环（治理域导出，部署链上游） =====
+    // ===== 批次 W2：bundles 部署闭环（治理域导出，部署链上游） =====
 
     /// POST /bundles/export — 带真实闸门一证据的导出（T0 决策：POST 承载 tests 数组）
     ///
@@ -708,7 +708,7 @@ impl WorkspaceApiClient {
     /// 预检 → `bundle_import` 落盘激活。
     ///
     /// - `verdict="pass"` 时 `subset` 必须非空且每项以 `sandbox:<id>`（机器背书）
-    ///   或 `human:<actor>`（人工降级）开头——治理域证据形状校验（UV-080 B1），
+    ///   或 `human:<actor>`（人工降级）开头——治理域证据形状校验（回归验证 B1），
     ///   违反 → 400 显式错误；
     /// - `verdict="fail"` 为显式"未验证"导出（无伪造风险，无 subset 要求）；
     /// - `trim` 为可选裁剪视图语法（`tag:core` / `domain:tax` / `ids:id1,id2`，

@@ -2,17 +2,17 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! LLM 命名操作（决策点⑦ / 37 号）
+//! LLM 命名操作（既定设计决策 / 历史批次）
 //!
 //! 供 evorule-rule（数据治理系统）作为客户端契约消费。暴露结构化命名操作端点，
 //! 而非裸 prompt 接口——输出约束到 JSON schema、可校验、可审计、模型可插拔。
 //!
 //! - MVP 只实现三个 op：`draft_rule` / `gen_tests` / `explain_rule`
-//!   （`patch_rule` / `query_corpus` 后置，对齐 30 号基线 §B⑦ 与 36 号回写通道后置）；
+//!   （`patch_rule` / `query_corpus` 后置，对齐 历史基线 §B⑦ 与历史批次回写通道后置）；
 //! - 同步为主（`status=completed` 直接返回结果），响应体预留 `task_id`（平滑升异步）；
 //! - 每次命名的 LLM 产出都带 `llm_generated` 溯源（model/op/timestamp）；
 //! - **确定性边界**：只负责"起草/解释/测试生成"，产出为 Draft 草稿，绝不直写执行态
-//!   （决策点⑦强约束，由 evorule-rule 侧 validate 的 LLM 边界强制）。
+//!   （既定设计决策强约束，由 evorule-rule 侧 validate 的 LLM 边界强制）。
 
 use std::time::SystemTime;
 
@@ -81,7 +81,7 @@ impl Operation {
     }
 }
 
-/// 请求参数（各 op 共享骨架，37 号 §4）
+/// 请求参数（各 op 共享骨架，设计文档 §4）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmOpRequest {
     /// 模型标识（可插拔，模型标识随请求传）
@@ -95,7 +95,7 @@ pub struct LlmOpRequest {
     pub params: Value,
 }
 
-/// 37 号 §4 响应骨架
+/// 设计文档 §4 响应骨架
 #[derive(Debug, Serialize)]
 pub struct LlmOpResponse {
     /// 操作名（echo/draft_rule/gen_tests/explain_rule）。
@@ -110,7 +110,7 @@ pub struct LlmOpResponse {
     pub result: Value,
     /// 失败原因（成功为 None）。
     pub errors: Option<String>,
-    /// LLM 溯源（决策点⑦）：model/op/timestamp
+    /// LLM 溯源（既定设计决策）：model/op/timestamp
     pub llm_generated: Value,
 }
 
@@ -145,7 +145,7 @@ impl LlmOpsError {
 
 /// `POST /ops/{operation}` 处理器
 ///
-/// 通用骨架：解析 op → 走到对应 handler。所有 op 共用同一套请求/响应契约（37 号 §4）。
+/// 通用骨架：解析 op → 走到对应 handler。所有 op 共用同一套请求/响应契约（设计文档 §4）。
 pub async fn run_operation(
     State(_state): State<AgentApiState>,
     Path(operation): Path<String>,
