@@ -320,6 +320,42 @@ async fn test_auto_recall_with_multiple_facts() {
     assert_eq!(result.unwrap(), vec![1, 2, 3]);
 }
 
+/// R01（E19/S6 写回面）回归：auto_recall 写回内容必须与 recall_context 同一去重语义——
+/// 同 path 只保留最新版本，墓碑（最新版为 null）的 path 不进写回（防删除记忆复活）。
+#[tokio::test]
+async fn test_auto_recall_dedups_versions_and_tombstones() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+
+    // k: 3 版本（只应写回 v2）+ dead: [v1, null 墓碑]（不应写回）
+    server.mock("GET", "/api/shared/facts?prefix=shared.default.")
+            .with_status(200)
+            .with_body(r#"[
+                {"fact_id": 1, "path": "shared.default.k", "value": {"key":"k","value":"v1","timestamp":100}, "source_session_id": 100, "version": 1},
+                {"fact_id": 2, "path": "shared.default.k", "value": {"key":"k","value":"v2","timestamp":200}, "source_session_id": 100, "version": 2},
+                {"fact_id": 3, "path": "shared.default.dead", "value": {"key":"dead","value":"x","timestamp":300}, "source_session_id": 100, "version": 1},
+                {"fact_id": 4, "path": "shared.default.dead", "value": null, "source_session_id": 100, "version": 2}
+            ]"#)
+            .create_async()
+            .await;
+
+    server
+        .mock("POST", "/api/sessions/test-session/used_at_startup")
+        .with_status(200)
+        .with_body(r#"{"success": true}"#)
+        .create_async()
+        .await;
+
+    let config = AgentConfig::default();
+    let runner = AgentRunner::new(config, client);
+
+    let result = runner.auto_recall("test-session").await;
+
+    assert!(result.is_ok());
+    // 仅 k 的最新版（fact_id=2）；dead 被墓碑抑制，k 的旧版（fact_id=1）被去重
+    assert_eq!(result.unwrap(), vec![2]);
+}
+
 #[tokio::test]
 async fn test_auto_rewind_not_enough_history() {
     let mut server = mockito::Server::new_async().await;

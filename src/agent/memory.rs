@@ -195,6 +195,67 @@ impl MemoryRecord {
     }
 }
 
+/// R01（S5/S6/E19 修复）：共享事实按 path 去重，取最新版本。
+///
+/// 语义（与 [`MemoryManager::project_prefix`] 的 `latest_by_path` 对齐，
+/// E20 实测该语义在在线读路径上正确）：
+/// - **裁决键 = `fact.path`**：服务端版本谱系定义在 path 上（同 path 覆写产生新版本、
+///   前缀查询按 path），payload 内的 `record.key` 只是数据、可漂移，不作身份锚点；
+/// - **同 path 多版本**：取 `version` 最大者（平局取后出现者，与服务端版本升序返回一致）；
+/// - **墓碑语义（latest-wins 含 null）**：最新版本 `value == null` → 整条 path 抑制，
+///   **绝不回退旧版本**（否则删除的记忆会复活，E20 的 ghost 问题在读路径复现）；
+///   非 null 但不可解析为 `MemoryRecord` 的值（如历史纯字符串）**透传保留**（record=None）；
+/// - **排序（I5 新鲜度优先）**：按 record.timestamp 倒序（稳定排序，无时间戳的条目
+///   沉底且保持原有相对顺序），修 S5 的"path 字典序裁决"。
+///
+/// 返回 `(条目, 解析出的记录或 None)`；record 的 `fact_id` 已绑定条目的 `fact_id`（I3）。
+pub(crate) fn latest_entries_by_path(
+    facts: Vec<crate::api::evorule_client::SharedFactEntry>,
+) -> Vec<(
+    crate::api::evorule_client::SharedFactEntry,
+    Option<MemoryRecord>,
+)> {
+    // 按 path 分组取最新版本（version 最大 / 平局后出现者胜）
+    let mut latest_by_path: std::collections::BTreeMap<
+        String,
+        crate::api::evorule_client::SharedFactEntry,
+    > = Default::default();
+    for fact in facts {
+        match latest_by_path.get(&fact.path) {
+            Some(prev) if prev.version > fact.version => {}
+            _ => {
+                latest_by_path.insert(fact.path.clone(), fact);
+            }
+        }
+    }
+
+    // 墓碑抑制 + 解析 + 排序键预计算
+    let mut entries: Vec<(
+        crate::api::evorule_client::SharedFactEntry,
+        Option<MemoryRecord>,
+        u64,
+    )> = latest_by_path
+        .into_values()
+        .filter(|f| !f.value.is_null())
+        .map(|f| {
+            let mut record = serde_json::from_value::<MemoryRecord>(f.value.clone()).ok();
+            let ts = record.as_ref().map(|r| r.timestamp).unwrap_or(0);
+            if let Some(record) = record.as_mut() {
+                if f.fact_id != 0 {
+                    record.fact_id.get_or_insert(f.fact_id);
+                }
+            }
+            (f, record, ts)
+        })
+        .collect();
+    // 稳定排序：timestamp 倒序，无时间戳者沉底且相对顺序不变
+    entries.sort_by_key(|(_, _, ts)| std::cmp::Reverse(*ts));
+    entries
+        .into_iter()
+        .map(|(f, record, _)| (f, record))
+        .collect()
+}
+
 /// C2: 召回上下文（三层召回结果）
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct RecallContext {
@@ -1141,10 +1202,11 @@ impl MemoryManager {
             .fetch_shared_facts_visible(&stable_prefix, "stable", &mut ctx.degradation_notices)
             .await
         {
-            for fact in facts {
-                if let Ok(record) = serde_json::from_value::<MemoryRecord>(fact.value) {
-                    let mut record = record;
-                    record.fact_id = Some(fact.fact_id);
+            // R01（S5/S6/E19）：按 path 去重取最新版本（墓碑抑制）+ 时间倒序（I5）。
+            // 修复前：全版本逐条 push（同 key 多版本同时进 prompt）且无排序
+            // （存活裁决 = 服务端 path 字典序 + 下游 fit_recall 前缀截断）。
+            for (_, record) in latest_entries_by_path(facts) {
+                if let Some(record) = record {
                     ctx.stable.push(record);
                 }
             }
@@ -2700,6 +2762,114 @@ mod tests {
             prompt.contains("do good"),
             "prompt should contain stable fact value"
         );
+    }
+
+    // ===== R01（S5/S6/E19）：stable 层按 path 去重取最新版本 =====
+
+    #[tokio::test]
+    async fn test_recall_context_stable_dedups_versions_latest_wins() {
+        let mut server = mockito::Server::new_async().await;
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+
+        // 同 path 3 个版本（服务端按版本升序返回，07 报告实测）+ 另一 path 1 条旧记录
+        let body = r#"[
+            {"fact_id":11,"path":"shared.test.stable.k","value":{"key":"stable.k","value":"v1","timestamp":100},"source_session_id":1,"version":1},
+            {"fact_id":12,"path":"shared.test.stable.k","value":{"key":"stable.k","value":"v2","timestamp":200},"source_session_id":1,"version":2},
+            {"fact_id":13,"path":"shared.test.stable.k","value":{"key":"stable.k","value":"v3","timestamp":300},"source_session_id":1,"version":3},
+            {"fact_id":14,"path":"shared.test.stable.other","value":{"key":"stable.other","value":"old","timestamp":50},"source_session_id":1,"version":1}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.stable.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let ctx = mgr.recall_context("goal", 5, 5).await;
+        assert_eq!(
+            ctx.stable.len(),
+            2,
+            "同 path 3 版本折叠为 1 条 + other 1 条"
+        );
+        // S6/E19：最新版胜出，fact_id 绑定最新版本（I3）
+        let k = ctx.stable.iter().find(|r| r.key == "stable.k").unwrap();
+        assert_eq!(k.value, "v3", "必须取最新版本");
+        assert_eq!(k.fact_id, Some(13), "fact_id 必须绑定最新版本的 fact");
+        // S5/I5：时间倒序（k@300 先于 other@50，非字典序裁决）
+        assert_eq!(ctx.stable[0].key, "stable.k");
+        assert_eq!(ctx.stable[1].key, "stable.other");
+    }
+
+    #[tokio::test]
+    async fn test_recall_context_stable_tombstone_suppresses_path() {
+        let mut server = mockito::Server::new_async().await;
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+
+        // E20 墓碑语义：同 path [v1, null] → 最新版为 null → 整条 path 抑制，不回退旧版
+        let body = r#"[
+            {"fact_id":21,"path":"shared.test.stable.mine","value":{"key":"stable.mine","value":"v1","timestamp":100},"source_session_id":1,"version":1},
+            {"fact_id":22,"path":"shared.test.stable.mine","value":null,"source_session_id":1,"version":2}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.stable.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let ctx = mgr.recall_context("goal", 5, 5).await;
+        assert!(
+            ctx.stable.is_empty(),
+            "墓碑路径不得被旧版本复活（E20 读路径语义）"
+        );
+    }
+
+    #[test]
+    fn test_latest_entries_by_path_unit() {
+        // 辅助函数直测：乱序版本输入 / 非 record 值透传 / 平局取后出现者
+        use crate::api::evorule_client::SharedFactEntry;
+        let mk = |fact_id: u64, version: u64, value: serde_json::Value| SharedFactEntry {
+            fact_id,
+            path: "shared.t.a".to_string(),
+            value,
+            source_session_id: 1,
+            version,
+        };
+        // 乱序输入：version 3 先出现，version 2 后出现 → version 3 胜
+        let out = latest_entries_by_path(vec![
+            mk(
+                3,
+                3,
+                serde_json::json!({"key":"a","value":"v3","timestamp":300}),
+            ),
+            mk(
+                2,
+                2,
+                serde_json::json!({"key":"a","value":"v2","timestamp":200}),
+            ),
+            mk(
+                1,
+                1,
+                serde_json::json!({"key":"a","value":"v1","timestamp":100}),
+            ),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0.fact_id, 3, "version 最大者胜出");
+        assert_eq!(out[0].1.as_ref().unwrap().value, "v3");
+        assert_eq!(out[0].1.as_ref().unwrap().fact_id, Some(3), "I3 绑定");
+
+        // 非 record 值（历史纯字符串）：透传保留，record=None
+        let out = latest_entries_by_path(vec![mk(5, 1, serde_json::json!("plain string"))]);
+        assert_eq!(out.len(), 1, "非 record 非 null 值不得丢弃");
+        assert!(out[0].1.is_none());
+
+        // 墓碑：value=null → 整条抑制
+        let out = latest_entries_by_path(vec![mk(6, 2, serde_json::Value::Null)]);
+        assert!(out.is_empty(), "墓碑必须抑制");
     }
 
     // ===== F3（audit-chain 2026-08-28）：召回降级 fail-visible =====
