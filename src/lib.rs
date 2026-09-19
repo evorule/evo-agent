@@ -42,11 +42,13 @@ pub mod rule_tools;
 #[doc(hidden)]
 pub mod service_tools;
 
-/// P2-V3 止血（2026-08-27）：审计链旁路调用的全局指标桥
+/// 审计链旁路调用的全局指标桥（P2-V3 引入，P2-V3 结构性修复后语义已收窄）
 ///
-/// Summarizer 等"影子调用"直连 LLM、不经 evorule fact 流程，属已知审计
-/// 盲区（见 research/issues P2-V3）。在指标系统尚未全程注入前，通过
-/// 进程级可选挂钩留痕：未安装回调时零开销空转。
+/// P2-V3 修复后的实际状态（与实现 `summarizer.rs::call_llm` 一致）：
+/// **生产路径（`from_definition` 构造）恒走审计分支**，Summarizer 等
+/// "影子调用"不再绕过 evorule fact 流程。直连分支仅存在于未挂载
+/// auditor 的场景（如部分单测），此时经 [`crate::metrics::bypass_audit`]
+/// 上报留痕：未安装回调时零开销空转，安装后由指标系统可见。
 ///
 /// runner/agent 层代码应通过 [`crate::metrics::bypass_audit`] 上报，
 /// 应用入口（main/binary）负责在启动时安装真实回调：
