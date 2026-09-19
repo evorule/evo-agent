@@ -73,6 +73,35 @@ pub enum StableDomain {
     Unclassified,
 }
 
+/// E10 写入语义可观测（实证报告 §6.6 / 处置优先级 P3）：
+/// `set_scoped` 的返回值携带「是否已持久化到 evorule」，调用方可程序化
+/// 区分「已落审计链」与「仅存本地 cache」——修复前该信息只存在于
+/// `tracing::warn!` 日志中，不是 API 契约。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistOutcome {
+    /// 已写入 evorule 审计链（payload 更新成功，将经 P3 广播进入共享账本）
+    Persisted,
+    /// 仅存本地 cache（evorule 不可达或拒绝）；cache 与真相源自此可能漂移，
+    /// 由 B3 对账（`verify_cache_against_server`）补偿。失败细节见 tracing warn。
+    CacheOnly,
+}
+
+impl PersistOutcome {
+    /// 是否已持久化到 evorule
+    pub fn persisted(&self) -> bool {
+        matches!(self, PersistOutcome::Persisted)
+    }
+}
+
+impl std::fmt::Display for PersistOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PersistOutcome::Persisted => write!(f, "persisted"),
+            PersistOutcome::CacheOnly => write!(f, "cache-only (not persisted to evorule)"),
+        }
+    }
+}
+
 impl From<std::io::Error> for MemoryError {
     fn from(e: std::io::Error) -> Self {
         MemoryError::Io(e)
@@ -424,9 +453,31 @@ impl ContextBudget {
         self.total_window.saturating_sub(self.memory_cap())
     }
 
-    /// 简单 token 估算（4 chars ≈ 1 token）
+    /// 简单 token 估算（ASCII：4 chars ≈ 1 token；CJK：1 char ≈ 1 token）
+    ///
+    /// P3 token 校准（实证报告 §3.6a）。校准说明——**报告的字面建议
+    /// 「按字符数」经复核会反向恶化，此处按其分析意图实施**：
+    /// - 原实现 `text.len()/4` 按字节计数：中文 3 字节/字 → 每字仅计
+    ///   0.75 token，低于现代分词器对中文 ~1 token/字的实际水平，
+    ///   记忆预算被系统性超发（§3.6a 的低估结论成立）。
+    /// - 报告字面建议「改按字符数」（chars/4 = 0.25 token/字）会使低估
+    ///   恶化 3 倍，与其自身的低估分析矛盾；「4 chars ≈ 1 token」的
+    ///   经验值只对 ASCII 成立。
+    /// - 本实现：ASCII 按 chars/4（英文行为不变），非 ASCII（CJK 为主）
+    ///   按 1 token/字计，消除中文预算超发。确定性、零依赖、可复现。
     fn estimate_tokens(text: &str) -> usize {
-        text.len() / 4
+        let mut tokens = 0usize;
+        let mut ascii_run = 0usize;
+        for ch in text.chars() {
+            if ch.is_ascii() {
+                ascii_run += 1;
+            } else {
+                tokens += ascii_run / 4;
+                ascii_run = 0;
+                tokens += 1;
+            }
+        }
+        tokens + ascii_run / 4
     }
 
     /// C3: 在 memory_cap 内组装记忆块；超限按降级顺序截断。
@@ -763,7 +814,7 @@ impl MemoryManager {
     /// 旧版 set（向后兼容，默认 Session scope）
     ///
     /// 等价于 `set_scoped(MemoryScope::Session(self.session_id?), key, value)`。
-    pub async fn set(&mut self, key: &str, value: &str) -> Result<(), MemoryError> {
+    pub async fn set(&mut self, key: &str, value: &str) -> Result<PersistOutcome, MemoryError> {
         let scope = MemoryScope::session_from_opt(&self.session_id)?;
         self.set_scoped(scope, key, value).await
     }
@@ -772,17 +823,18 @@ impl MemoryManager {
     ///
     /// 按 scope 写入 evorule payload，同时更新本地 cache。
     ///
-    /// **注意**：HTTP 调用是 best-effort 的（与 `sync_from_evorule` 一致），
-    /// 即 cache 总是更新，但 evorule 持久化失败不会传播错误。
-    /// 这使得单元测试可以在无服务器环境下运行。
+    /// **持久化语义（E10 可观测，best-effort）**：cache 总是更新；evorule
+    /// 持久化失败**不传播错误**（真相在 evorule，HTTP 失败不阻断），但返回值
+    /// 携带 [`PersistOutcome`]——`Persisted` = 已落审计链，`CacheOnly` =
+    /// 仅存本地（cache 与真相源可能漂移，由 B3 对账补偿，细节见 tracing warn）。
+    /// 调用方可据此程序化区分两种结果（如仅 `CacheOnly` 时升级告警）。
     /// **真相在 evorule**（改进1）：读取走投影优先，cache 仅是性能镜像 + 离线兜底（见 `get_scoped`）。
-    /// 如需严格持久化错误传播，使用 `append_message`（P0 消息持久化）。
     pub async fn set_scoped(
         &mut self,
         scope: MemoryScope,
         key: &str,
         value: &str,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<PersistOutcome, MemoryError> {
         if key.is_empty() {
             return Err(MemoryError::EmptyKey);
         }
@@ -816,16 +868,17 @@ impl MemoryManager {
             .await
         {
             // 不静默：持久化失败意味着该写入在 evorule 侧不可见，
-            // cache 与真相源开始漂移，必须留痕
+            // cache 与真相源开始漂移，必须留痕（返回值同时携带 CacheOnly）
             tracing::warn!(
                 session_id = %session_id,
                 path = %path,
                 error = %e,
                 "memory persist to evorule failed; cache may drift from source of truth"
             );
+            return Ok(PersistOutcome::CacheOnly);
         }
 
-        Ok(())
+        Ok(PersistOutcome::Persisted)
     }
 
     /// B5：受信内部通道写入（绕过域准入，source 由系统自动填充）
@@ -913,7 +966,9 @@ impl MemoryManager {
         summary: &str,
     ) -> Result<Option<u64>, MemoryError> {
         let key = format!("sessions.{}.summary", session_id);
-        self.set_scoped(MemoryScope::Shared, &key, summary).await?;
+        self.set_scoped(MemoryScope::Shared, &key, summary)
+            .await
+            .map(|_| ())?;
         Ok(None)
     }
 
@@ -2788,6 +2843,55 @@ mod tests {
             .expect("non-stable allowed");
         let ck = mgr.cache_key_for(&MemoryScope::Shared, "sessions.s1.summary");
         assert_eq!(mgr.cache.get(&ck).unwrap().source, None);
+    }
+
+    #[tokio::test]
+    async fn test_set_scoped_reports_persist_outcome() {
+        // E10 写入语义可观测：返回值区分 Persisted / CacheOnly
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+
+        // 服务可达 → Persisted
+        let m1 = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .with_status(200)
+            .create_async()
+            .await;
+        let outcome = mgr
+            .set_scoped(MemoryScope::Session("s1".into()), "topic", "v")
+            .await
+            .expect("set should not fail");
+        assert_eq!(outcome, PersistOutcome::Persisted);
+        m1.assert_async().await;
+
+        // 服务不可达 → 不传播错误，但返回 CacheOnly（修复前调用方只能从日志感知）
+        let mut mgr_dead = MemoryManager::new("test", make_test_client()).with_session_id("s1");
+        let outcome = mgr_dead
+            .set_scoped(MemoryScope::Session("s1".into()), "topic", "v")
+            .await
+            .expect("best-effort: HTTP failure must not propagate as Err");
+        assert_eq!(outcome, PersistOutcome::CacheOnly);
+        assert!(!outcome.persisted());
+        // cache 仍更新（离线兜底语义不变）
+        let ck = mgr_dead.cache_key_for(&MemoryScope::Session("s1".into()), "topic");
+        assert!(mgr_dead.cache.contains_key(&ck));
+    }
+
+    #[test]
+    fn test_estimate_tokens_cjk_calibration() {
+        // P3 token 校准：ASCII 行为不变（4 chars ≈ 1 token）
+        assert_eq!(ContextBudget::estimate_tokens("abcdefghijkl"), 3);
+        assert_eq!(ContextBudget::estimate_tokens(""), 0);
+        // 中文按 1 token/字（原字节口径 12 字 × 3B / 4 = 9，预算超发）
+        assert_eq!(
+            ContextBudget::estimate_tokens("一二三四五六七八九十甲乙"),
+            12
+        );
+        // 混合：ASCII 段 3 chars → 0，CJK 2 字 → 2
+        assert_eq!(ContextBudget::estimate_tokens("abc一二"), 2);
+        // 段边界正确：ascii run 在 CJK 前被结算
+        assert_eq!(ContextBudget::estimate_tokens("abcd一二efgh"), 1 + 2 + 1);
     }
 
     #[test]
