@@ -21,22 +21,57 @@
 //! ## 执行算法
 //!
 //! 1. **拓扑排序**(Kahn 分层):按 `depends_on` 把节点分成若干层,同层无互相依赖
-//! 2. **逐层执行**:同层节点并行(`DelegateContext::delegate_parallel`)
-//! 3. **模板渲染**:下一层的 `task_template` 中 `{node_id}` 被上游结果替换
-//! 4. 任一节点失败 → 整个工作流终止,返回 Err
-//! 5. 返回 `output_node` 的结果
+//! 2. **逐层规划**:先决定本层哪些节点执行、哪些跳过——
+//!    - 节点声明了 `run_when`(workflow_dag v1.1 条件分支)→ 按条件求值决定去留
+//!      (豁免级联:即使上游被跳过,条件为真仍执行)
+//!    - 未声明 `run_when` 的节点:任一直接依赖被跳过 → 级联跳过
+//! 3. **逐层执行**:同层待执行节点并行(`DelegateContext::delegate_parallel`)
+//! 4. **模板渲染**:下一层的 `task_template` 中 `{node_id}` 被上游结果替换;
+//!    被跳过的上游节点占位符替换为空字符串
+//! 5. 任一**执行中**节点失败 → 整个工作流终止,返回 Err(被跳过的节点不算失败)
+//! 6. 返回 `output_node` 的结果;`output_node` 被跳过 → 返回 Err(无静默空结果)
 //!
 //! ## 边界(§9.6)
 //!
-//! - 不支持条件分支(只支持静态 DAG);条件分支需 P2 的 plan-and-execute
+//! - 条件分支为**节点级静态条件**(v1.1 `run_when`,纯函数求值,谓词最小集
+//!   `contains`/`equals`/`not_contains`);动态 plan-and-execute 循环不在本引擎范围
 //! - 节点失败默认终止整个工作流(无 `on_failure: skip`)
-//! - `task_template` 引用失败节点会是空字符串(但失败即终止,不会走到这)
+//! - `run_when` 引用的节点被跳过/无结果时视作空字符串(确定性语义,同输入必同输出)
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::agent::delegate::DelegateContext;
+
+/// 条件谓词(workflow_dag v1.1 `run_when.op` 最小集,冻结于该版本)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionOp {
+    /// 上游结果包含 `value`
+    Contains,
+    /// 上游结果完全等于 `value`
+    Equals,
+    /// 上游结果不包含 `value`
+    NotContains,
+}
+
+/// 节点级执行条件(workflow_dag v1.1 新增可选字段 `run_when`)
+///
+/// 语义(纯函数,同输入必同输出):
+/// - 被观察节点(`node`)的结果取自已完成结果表;该节点被跳过或尚无结果时视作**空字符串**
+/// - 求值为真 → 执行本节点;为假 → 跳过本节点
+/// - 声明了 `run_when` 的节点**豁免级联跳过**(去留完全由自身条件决定);
+///   未声明的节点在任一直接依赖被跳过时级联跳过
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunWhen {
+    /// 被观察节点的 id(必须存在于工作流,且位于本节点的更早拓扑层)
+    pub node: String,
+    /// 比较谓词
+    pub op: ConditionOp,
+    /// 期望值(与被观察节点的结果字符串比较)
+    pub value: String,
+}
 
 /// 工作流节点
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +93,9 @@ pub struct WorkflowNode {
     /// 依赖的节点 id 列表(必须全部完成后本节点才能执行)
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// 执行条件(可选,workflow_dag v1.1):求值为假 → 跳过本节点;不写 = v1.0 现行为
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_when: Option<RunWhen>,
 }
 
 /// 工作流定义
@@ -97,11 +135,12 @@ impl WorkflowEngine {
     ///
     /// # 算法
     ///
-    /// 1. 校验(`output_node` 存在、无重复 id、依赖合法、无环)
+    /// 1. 校验(`output_node` 存在、无重复 id、依赖合法、无环、`run_when` 引用合法)
     /// 2. 拓扑排序成分层结构
-    /// 3. 逐层并行执行(`delegate_parallel`)
-    /// 4. 上游结果填入下游 `task_template`
-    /// 5. 返回 `output_node` 的结果
+    /// 3. 逐层规划:按 `run_when` / 级联规则决定本层执行与跳过(见 [`plan_layer`])
+    /// 4. 本层待执行节点并行执行(`delegate_parallel`)
+    /// 5. 上游结果填入下游 `task_template`(被跳过的上游占位符替换为空字符串)
+    /// 6. 返回 `output_node` 的结果
     ///
     /// # 错误
     ///
@@ -110,7 +149,9 @@ impl WorkflowEngine {
     /// - `depends_on` 引用不存在的节点
     /// - 自依赖
     /// - 检测到环
-    /// - 任一节点执行失败(终止整个工作流)
+    /// - `run_when` 引用不存在节点 / 自身 / 同层或下游节点
+    /// - 任一**执行中**节点失败(终止整个工作流;被跳过的节点不算失败)
+    /// - `output_node` 被跳过(无静默空结果)
     pub async fn execute(&self, wf: &Workflow) -> Result<String, String> {
         // 1. 校验
         self.validate(wf)?;
@@ -118,13 +159,33 @@ impl WorkflowEngine {
         // 2. 拓扑排序
         let layers = self.topological_sort(&wf.nodes)?;
 
-        // 3. 逐层执行
+        // 2.5 run_when 上游层检查:被观察节点必须位于更早拓扑层,
+        //     保证条件求值时其结果已就绪(同层并行节点的结果在规划期不可得)
+        Self::check_run_when_layers(wf, &layers)?;
+
+        // 3. 逐层规划 + 执行
         let mut results: BTreeMap<String, String> = BTreeMap::new();
+        let mut skipped: HashSet<String> = HashSet::new();
         for (layer_idx, layer) in layers.iter().enumerate() {
-            let tasks: Vec<(String, String)> = layer
+            let (to_run, newly_skipped) = plan_layer(layer, &results, &skipped);
+            for id in &newly_skipped {
+                tracing::info!(
+                    workflow_id = %wf.workflow_id,
+                    layer = layer_idx,
+                    node_id = %id,
+                    "workflow node skipped"
+                );
+            }
+            skipped.extend(newly_skipped);
+
+            if to_run.is_empty() {
+                continue;
+            }
+
+            let tasks: Vec<(String, String)> = to_run
                 .iter()
                 .map(|node| {
-                    let task = self.render_task(node, &results);
+                    let task = self.render_task(node, &results, &skipped);
                     (node.agent_type.clone(), task)
                 })
                 .collect();
@@ -132,13 +193,13 @@ impl WorkflowEngine {
             tracing::info!(
                 workflow_id = %wf.workflow_id,
                 layer = layer_idx,
-                node_count = layer.len(),
+                node_count = to_run.len(),
                 "executing workflow layer"
             );
 
             let layer_results = self.ctx.delegate_parallel(tasks).await;
 
-            for (node, result) in layer.iter().zip(layer_results.iter()) {
+            for (node, result) in to_run.iter().zip(layer_results.iter()) {
                 match result {
                     Ok(content) => {
                         tracing::info!(
@@ -214,7 +275,7 @@ impl WorkflowEngine {
             ));
         }
 
-        // 依赖合法性 + 自依赖
+        // 依赖合法性 + 自依赖 + run_when 引用合法性
         for n in &wf.nodes {
             for dep in &n.depends_on {
                 if dep == &n.id {
@@ -230,6 +291,21 @@ impl WorkflowEngine {
                     ));
                 }
             }
+            // run_when 引用合法性(层序检查在拓扑分层后进行,见 check_run_when_layers)
+            if let Some(cond) = &n.run_when {
+                if cond.node == n.id {
+                    return Err(format!(
+                        "workflow '{}' node '{}' run_when references itself",
+                        wf.workflow_id, n.id
+                    ));
+                }
+                if !id_set.contains(cond.node.as_str()) {
+                    return Err(format!(
+                        "workflow '{}' node '{}' run_when references unknown node '{}'",
+                        wf.workflow_id, n.id, cond.node
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -239,16 +315,62 @@ impl WorkflowEngine {
     ///
     /// 无 `task_template` 时返回 `node.task`。上游结果未就绪时占位符保留
     /// (但拓扑排序保证执行时上游已完成,不会出现未就绪)。
-    fn render_task(&self, node: &WorkflowNode, results: &BTreeMap<String, String>) -> String {
+    /// 被跳过的上游节点无结果:占位符替换为**空字符串**(可预测,不会把
+    /// `{id}` 字面量漏进下游任务文本)。
+    fn render_task(
+        &self,
+        node: &WorkflowNode,
+        results: &BTreeMap<String, String>,
+        skipped: &HashSet<String>,
+    ) -> String {
         if let Some(tmpl) = &node.task_template {
             let mut task = tmpl.clone();
             for (id, content) in results {
                 task = task.replace(&format!("{{{}}}", id), content);
             }
+            for id in skipped {
+                task = task.replace(&format!("{{{}}}", id), "");
+            }
             task
         } else {
             node.task.clone()
         }
+    }
+
+    /// run_when 上游层检查:被观察节点必须位于本节点的**更早拓扑层**
+    ///
+    /// Kahn 分层保证更早层的节点在本层规划前已完成;同层并行节点的结果在
+    /// 规划期不可得,下游节点同理。引用同层/下游节点几乎必然是定义错误,
+    /// 在执行前 fail-fast。validate 已保证引用节点存在,此处查不到层视为内部错误。
+    fn check_run_when_layers(wf: &Workflow, layers: &[Vec<&WorkflowNode>]) -> Result<(), String> {
+        let mut layer_of: HashMap<&str, usize> = HashMap::new();
+        for (i, layer) in layers.iter().enumerate() {
+            for n in layer {
+                layer_of.insert(n.id.as_str(), i);
+            }
+        }
+        for node in &wf.nodes {
+            if let Some(cond) = &node.run_when {
+                let target = layer_of.get(cond.node.as_str()).copied().ok_or_else(|| {
+                    format!(
+                        "workflow '{}': node '{}' run_when references unknown node '{}'",
+                        wf.workflow_id, node.id, cond.node
+                    )
+                })?;
+                let own = layer_of
+                    .get(node.id.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                if target >= own {
+                    return Err(format!(
+                        "workflow '{}': node '{}' run_when must reference an upstream node \
+                         from an earlier layer ('{}' is at same-or-later layer)",
+                        wf.workflow_id, node.id, cond.node
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 拓扑排序:返回按依赖层级分组的节点列表
@@ -299,6 +421,51 @@ impl WorkflowEngine {
     }
 }
 
+/// 条件求值(纯函数):同输入必同输出
+///
+/// 被观察节点无结果(被跳过/未完成)时视作**空字符串**——这是跳过语义的
+/// 确定性根基:同一执行轨迹下,条件结果只依赖已完成结果表的内容。
+fn eval_condition(cond: &RunWhen, results: &BTreeMap<String, String>) -> bool {
+    let actual = results.get(&cond.node).map(String::as_str).unwrap_or("");
+    match cond.op {
+        ConditionOp::Contains => actual.contains(cond.value.as_str()),
+        ConditionOp::Equals => actual == cond.value,
+        ConditionOp::NotContains => !actual.contains(cond.value.as_str()),
+    }
+}
+
+/// 一层的执行/跳过分划(纯函数,决定论:同输入必同输出)
+///
+/// 规则:
+/// 1. 节点声明了 `run_when` → 按条件求值决定去留(**豁免级联**:即使上游被跳过,
+///    条件为真仍执行)
+/// 2. 未声明 `run_when` → 任一直接依赖已被跳过即级联跳过
+///
+/// 层内规划不依赖层内执行结果(run_when 只允许引用更早拓扑层,见
+/// `check_run_when_layers`),因此层内节点顺序不影响分划结果。
+///
+/// 返回 (本层待执行节点[保持原序], 新增跳过节点 id 列表)
+fn plan_layer<'a>(
+    layer: &[&'a WorkflowNode],
+    results: &BTreeMap<String, String>,
+    skipped: &HashSet<String>,
+) -> (Vec<&'a WorkflowNode>, Vec<String>) {
+    let mut to_run = Vec::new();
+    let mut newly_skipped = Vec::new();
+    for &node in layer {
+        let run = match &node.run_when {
+            Some(cond) => eval_condition(cond, results),
+            None => !node.depends_on.iter().any(|d| skipped.contains(d.as_str())),
+        };
+        if run {
+            to_run.push(node);
+        } else {
+            newly_skipped.push(node.id.clone());
+        }
+    }
+    (to_run, newly_skipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +489,7 @@ mod tests {
             task: format!("task for {}", id),
             task_template: None,
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            run_when: None,
         }
     }
 
@@ -629,11 +797,12 @@ mod tests {
             task: String::new(),
             task_template: Some("Rust: {a}\nPython: {b}".to_string()),
             depends_on: vec!["a".to_string(), "b".to_string()],
+            run_when: None,
         };
         let mut results = BTreeMap::new();
         results.insert("a".to_string(), "rust-result".to_string());
         results.insert("b".to_string(), "python-result".to_string());
-        let rendered = engine.render_task(&n, &results);
+        let rendered = engine.render_task(&n, &results, &HashSet::new());
         assert_eq!(rendered, "Rust: rust-result\nPython: python-result");
     }
 
@@ -647,9 +816,10 @@ mod tests {
             task: "调研 Rust".to_string(),
             task_template: None,
             depends_on: vec![],
+            run_when: None,
         };
         let results = BTreeMap::new();
-        let rendered = engine.render_task(&n, &results);
+        let rendered = engine.render_task(&n, &results, &HashSet::new());
         assert_eq!(rendered, "调研 Rust");
     }
 
@@ -664,10 +834,11 @@ mod tests {
             task: "plain task".to_string(),
             task_template: Some("template {x}".to_string()),
             depends_on: vec![],
+            run_when: None,
         };
         let mut results = BTreeMap::new();
         results.insert("x".to_string(), "VAL".to_string());
-        let rendered = engine.render_task(&n, &results);
+        let rendered = engine.render_task(&n, &results, &HashSet::new());
         assert_eq!(rendered, "template VAL");
     }
 
@@ -682,12 +853,33 @@ mod tests {
             task: String::new(),
             task_template: Some("{a} and {b}".to_string()),
             depends_on: vec!["a".to_string()],
+            run_when: None,
         };
         let mut results = BTreeMap::new();
         results.insert("a".to_string(), "A".to_string());
         // b 未就绪
-        let rendered = engine.render_task(&n, &results);
+        let rendered = engine.render_task(&n, &results, &HashSet::new());
         assert_eq!(rendered, "A and {b}");
+    }
+
+    #[test]
+    fn test_render_task_skipped_upstream_replaced_with_empty() {
+        // 被跳过的上游无结果:占位符替换为空字符串(不把 {id} 字面量漏进下游任务)
+        let ctx = make_ctx();
+        let engine = WorkflowEngine::new(ctx);
+        let n = WorkflowNode {
+            id: "c".to_string(),
+            agent_type: "w".to_string(),
+            task: String::new(),
+            task_template: Some("review: {b}done".to_string()),
+            depends_on: vec!["b".to_string()],
+            run_when: None,
+        };
+        let mut results = BTreeMap::new();
+        results.insert("a".to_string(), "A".to_string());
+        let skipped: HashSet<String> = ["b".to_string()].into_iter().collect();
+        let rendered = engine.render_task(&n, &results, &skipped);
+        assert_eq!(rendered, "review: done");
     }
 
     // ===== execute(用深度超限避免实际 evorule 调用)=====
@@ -751,5 +943,297 @@ mod tests {
         };
         let err = engine.execute(&wf).await.unwrap_err();
         assert!(err.contains("no nodes"));
+    }
+
+    // ===== run_when 条件分支(workflow_dag v1.1)=====
+
+    fn cond(node_id: &str, op: ConditionOp, value: &str) -> RunWhen {
+        RunWhen {
+            node: node_id.to_string(),
+            op,
+            value: value.to_string(),
+        }
+    }
+
+    fn with_run_when(mut n: WorkflowNode, c: RunWhen) -> WorkflowNode {
+        n.run_when = Some(c);
+        n
+    }
+
+    // ----- 反序列化 -----
+
+    #[test]
+    fn test_workflow_deserialize_run_when() {
+        let json = r#"{
+            "workflow_id": "conditional_publish",
+            "nodes": [
+                {"id": "review", "agent_type": "reviewer", "task": "r"},
+                {"id": "publish", "agent_type": "publisher", "task": "p",
+                 "depends_on": ["review"],
+                 "run_when": {"node": "review", "op": "contains", "value": "APPROVE"}}
+            ],
+            "output_node": "publish"
+        }"#;
+        let wf: Workflow = serde_json::from_str(json).unwrap();
+        let rw = wf.nodes[1].run_when.as_ref().unwrap();
+        assert_eq!(rw.node, "review");
+        assert_eq!(rw.op, ConditionOp::Contains);
+        assert_eq!(rw.value, "APPROVE");
+        // 不含 run_when 的节点默认 None(v1.0 兼容)
+        assert!(wf.nodes[0].run_when.is_none());
+    }
+
+    #[test]
+    fn test_workflow_without_run_when_serializes_identically() {
+        // 语义等价实证:v1.0 形态往返后不含 run_when 键
+        let wf: Workflow = serde_json::from_str(
+            r#"{"workflow_id":"w","nodes":[{"id":"a","agent_type":"x","task":"t"}],"output_node":"a"}"#,
+        )
+        .unwrap();
+        let s = serde_json::to_string(&wf).unwrap();
+        assert!(!s.contains("run_when"));
+    }
+
+    // ----- validate -----
+
+    #[test]
+    fn test_validate_run_when_unknown_node() {
+        let ctx = make_ctx();
+        let engine = WorkflowEngine::new(ctx);
+        let wf = Workflow {
+            workflow_id: "w".to_string(),
+            description: String::new(),
+            nodes: vec![with_run_when(
+                node("a", "w", &[]),
+                cond("ghost", ConditionOp::Contains, "X"),
+            )],
+            output_node: "a".to_string(),
+        };
+        let err = engine.validate(&wf).unwrap_err();
+        assert!(
+            err.contains("run_when references unknown node"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_run_when_self_reference() {
+        let ctx = make_ctx();
+        let engine = WorkflowEngine::new(ctx);
+        let wf = Workflow {
+            workflow_id: "w".to_string(),
+            description: String::new(),
+            nodes: vec![with_run_when(
+                node("a", "w", &[]),
+                cond("a", ConditionOp::Contains, "X"),
+            )],
+            output_node: "a".to_string(),
+        };
+        let err = engine.validate(&wf).unwrap_err();
+        assert!(err.contains("run_when references itself"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_same_layer_run_when_reference() {
+        // run_when 引用同层节点 → 校验期拒绝(其结果在规划期不可得),
+        // execute 在触达 delegate 前返回 Err
+        let ctx = make_ctx();
+        let engine = WorkflowEngine::new(ctx);
+        let wf = Workflow {
+            workflow_id: "w".to_string(),
+            description: String::new(),
+            nodes: vec![
+                with_run_when(node("a", "w", &[]), cond("b", ConditionOp::Contains, "X")),
+                with_run_when(node("b", "w", &[]), cond("a", ConditionOp::Contains, "Y")),
+            ],
+            output_node: "a".to_string(),
+        };
+        let err = engine.execute(&wf).await.unwrap_err();
+        assert!(err.contains("earlier layer"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_run_when_coexists_with_cycle_detection() {
+        // 环检测共存:带 run_when 的图仍能检出环(validate 放行,拓扑排序拒绝)
+        let ctx = make_ctx();
+        let engine = WorkflowEngine::new(ctx);
+        let wf = Workflow {
+            workflow_id: "w".to_string(),
+            description: String::new(),
+            nodes: vec![
+                with_run_when(
+                    node("a", "w", &["b"]),
+                    cond("b", ConditionOp::Contains, "X"),
+                ),
+                with_run_when(
+                    node("b", "w", &["a"]),
+                    cond("a", ConditionOp::Contains, "Y"),
+                ),
+            ],
+            output_node: "a".to_string(),
+        };
+        assert!(engine.validate(&wf).is_ok());
+        let err = engine.topological_sort(&wf.nodes).unwrap_err();
+        assert!(err.contains("cycle detected"));
+    }
+
+    // ----- eval_condition(纯函数)-----
+
+    #[test]
+    fn test_eval_condition_ops() {
+        let mut results = BTreeMap::new();
+        results.insert("review".to_string(), "APPROVE: looks good".to_string());
+        assert!(eval_condition(
+            &cond("review", ConditionOp::Contains, "APPROVE"),
+            &results
+        ));
+        assert!(!eval_condition(
+            &cond("review", ConditionOp::Contains, "REJECT"),
+            &results
+        ));
+        assert!(eval_condition(
+            &cond("review", ConditionOp::Equals, "APPROVE: looks good"),
+            &results
+        ));
+        assert!(!eval_condition(
+            &cond("review", ConditionOp::Equals, "approve"),
+            &results
+        ));
+        assert!(eval_condition(
+            &cond("review", ConditionOp::NotContains, "REJECT"),
+            &results
+        ));
+        assert!(!eval_condition(
+            &cond("review", ConditionOp::NotContains, "APPROVE"),
+            &results
+        ));
+    }
+
+    #[test]
+    fn test_eval_condition_missing_node_treated_as_empty() {
+        // 被观察节点被跳过/无结果 → 视作空字符串(确定性语义)
+        let results = BTreeMap::new();
+        assert!(eval_condition(
+            &cond("gone", ConditionOp::Equals, ""),
+            &results
+        ));
+        assert!(eval_condition(
+            &cond("gone", ConditionOp::NotContains, "X"),
+            &results
+        ));
+        assert!(!eval_condition(
+            &cond("gone", ConditionOp::Contains, "X"),
+            &results
+        ));
+        assert!(!eval_condition(
+            &cond("gone", ConditionOp::Equals, "X"),
+            &results
+        ));
+    }
+
+    #[test]
+    fn test_eval_condition_deterministic() {
+        // 确定性实证:同一输入重复求值 N 次,结果一致
+        let mut results = BTreeMap::new();
+        results.insert("a".to_string(), "hello world".to_string());
+        let c = cond("a", ConditionOp::Contains, "world");
+        let expected = eval_condition(&c, &results);
+        for _ in 0..100 {
+            assert_eq!(eval_condition(&c, &results), expected);
+        }
+    }
+
+    // ----- plan_layer(纯函数:跳过/级联/豁免/混合)-----
+
+    #[test]
+    fn test_plan_layer_run_when_false_skips() {
+        // 混合层:无条件的 review 执行,条件为假的 publish 跳过
+        let nodes = [
+            node("review", "reviewer", &[]),
+            with_run_when(
+                node("publish", "publisher", &["review"]),
+                cond("review", ConditionOp::Contains, "APPROVE"),
+            ),
+        ];
+        let layer: Vec<&WorkflowNode> = nodes.iter().collect();
+        let mut results = BTreeMap::new();
+        results.insert("review".to_string(), "REJECT: bad".to_string());
+        let (to_run, newly_skipped) = plan_layer(&layer, &results, &HashSet::new());
+        assert_eq!(to_run.len(), 1);
+        assert_eq!(to_run[0].id, "review");
+        assert_eq!(newly_skipped, vec!["publish".to_string()]);
+    }
+
+    #[test]
+    fn test_plan_layer_run_when_true_runs() {
+        let nodes = [
+            node("review", "reviewer", &[]),
+            with_run_when(
+                node("publish", "publisher", &["review"]),
+                cond("review", ConditionOp::Contains, "APPROVE"),
+            ),
+        ];
+        let layer: Vec<&WorkflowNode> = nodes.iter().collect();
+        let mut results = BTreeMap::new();
+        results.insert("review".to_string(), "APPROVE: ok".to_string());
+        let (to_run, newly_skipped) = plan_layer(&layer, &results, &HashSet::new());
+        assert!(newly_skipped.is_empty());
+        assert_eq!(to_run.len(), 2);
+    }
+
+    #[test]
+    fn test_plan_layer_cascades_to_downstream() {
+        // 级联:b 已被跳过 → 无 run_when 的下游 c 级联跳过;
+        // 豁免:d 有自己的 run_when 且条件为真 → 照常执行
+        let nodes = [
+            node("c", "w", &["b"]),
+            with_run_when(
+                node("d", "w", &["b"]),
+                cond("a", ConditionOp::Contains, "GO"),
+            ),
+        ];
+        let layer: Vec<&WorkflowNode> = nodes.iter().collect();
+        let skipped: HashSet<String> = ["b".to_string()].into_iter().collect();
+        let mut results = BTreeMap::new();
+        results.insert("a".to_string(), "GO".to_string());
+        let (to_run, newly_skipped) = plan_layer(&layer, &results, &skipped);
+        assert_eq!(to_run.len(), 1);
+        assert_eq!(to_run[0].id, "d");
+        assert_eq!(newly_skipped, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn test_plan_layer_no_run_when_v10_behavior_identical() {
+        // 语义等价实证:无 run_when 且无跳过 → 分划与 v1.0 逐层执行完全一致
+        // (全执行、保持原序、跳过集为空)
+        let nodes = [node("a", "w", &[]), node("b", "w", &[])];
+        let layer: Vec<&WorkflowNode> = nodes.iter().collect();
+        let (to_run, newly_skipped) = plan_layer(&layer, &BTreeMap::new(), &HashSet::new());
+        assert!(newly_skipped.is_empty());
+        let ids: Vec<&str> = to_run.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_plan_layer_deterministic() {
+        // 确定性实证:同一含条件层重复规划 N 次,分划一致
+        let nodes = [with_run_when(
+            node("notify", "w", &["publish"]),
+            cond("review", ConditionOp::Contains, "APPROVE"),
+        )];
+        let layer: Vec<&WorkflowNode> = nodes.iter().collect();
+        let skipped: HashSet<String> = ["publish".to_string()].into_iter().collect();
+        let mut results = BTreeMap::new();
+        results.insert("review".to_string(), "APPROVE".to_string());
+        let first = plan_layer(&layer, &results, &skipped);
+        assert_eq!(first.0.len(), 1); // 豁免级联:review 含 APPROVE → notify 照常执行
+        assert_eq!(first.0[0].id, "notify");
+        for _ in 0..100 {
+            let again = plan_layer(&layer, &results, &skipped);
+            assert_eq!(first.0.len(), again.0.len());
+            assert_eq!(first.0[0].id, again.0[0].id);
+            assert_eq!(first.1, again.1);
+        }
     }
 }

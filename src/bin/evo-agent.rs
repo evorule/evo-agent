@@ -1107,10 +1107,11 @@ fn cmd_workflow(
         }
     };
 
-    // 3.5 宪法 jsonschema 全量校验(M7-B2;找不到 schema 时降级为仅结构门卫,tracing 留痕)
+    // 3.5 宪法 jsonschema 全量校验(M7-B2;workflow_dag v1.0/v1.1 按文档形态分派,
+    //     找不到 schema 时 fail-fast 拒载,tracing 留痕)
     if let Err(violations) = evo_agent::agent::constitution::validate_workflow_dag(&wf_value) {
         eprintln!(
-            "workflow '{}' violates constitution schema (workflow_dag/v1.0): {}",
+            "workflow '{}' violates constitution schema (workflow_dag): {}",
             workflow_id,
             violations.join("; ")
         );
