@@ -3,7 +3,7 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! `shell_exec` —— 执行 shell 命令(3 层安全模型: active / candidate / blocked)
 //!
-//! ## 设计原则(来自 Mavis 与 EvoRule 作者的对话,2026-07-20)
+//! ## 设计原则
 //!
 //! > 人类很乐意让 LLM 帮他们做所有事,但担心**不透明、失控、不可预测**。
 //! > 所以白名单、备选、黑名单,应**全部列出**:让人类可选,说明影响,列表本身就是透明。

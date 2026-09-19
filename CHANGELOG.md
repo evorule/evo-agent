@@ -100,7 +100,7 @@
 ### 🐛 修复
 
 - **版本号 1.0.0 → 0.1.0** — 与 evorule 主线对齐
-- **PR 模板 + Gitee CI** — D:\evo-agent\.gitee\ 复制
+- **PR 模板 + Gitee CI** — 本仓 `.gitee/` 目录配置
 
 ### ⚠️ Breaking Changes
 

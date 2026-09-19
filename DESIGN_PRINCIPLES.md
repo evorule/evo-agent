@@ -52,7 +52,7 @@
 
 **落地方式(active / candidate / blocked 三层):**
 
-- **active**:白名单,直接执行,无需请示(给 LLM 自由度)
+- **active**:白名单,直接执行,无需请示(对代理放宽自由度)
 - **candidate**:备选,LLM 想用 → 摊开 proposal(description / risk / alternative)→ 用户批 → 再执行
 - **blocked**:永不允许(逃逸出口 / 不可逆破坏)
 
@@ -152,7 +152,7 @@
 
 ## 应用:生态项目 review checklist
 
-> 今后**所有 EvoRule 生态项目**(`evorule` / `evo-agent` / `evorule-cli` / `evorule-application`)的设计 review,都要用这 5 条作为 checklist。
+> 今后**所有 EvoRule 生态项目**(`evorule` / `evo-agent` / `evorule-cli` 等)的设计 review,都要用这 5 条作为 checklist。
 
 **任何一个新功能 / 新工具 / 新 API 都要问:**
 
@@ -234,14 +234,14 @@ const BLOCKED_IP_RANGES: &[&str] = &[
 **长期:**
 
 - 5 原则要落到 evorule CLI(`evorule run` 也要有 candidate 工具审批流程)
-- 5 原则要落到 evorule-application(每个 panel v1 → v2 加 AI 解释,保留 5 原则)
+- 5 原则要落到应用层仓(每个 panel v1 → v2 加 AI 解释,保留 5 原则)
 
 ---
 
 ## 参考
 
 - [`README.md`](README.md) — evo-agent 总览
-- [`D:\evorule-application\STRATEGIC_DIRECTION.md`](../evorule-application/STRATEGIC_DIRECTION.md) — EvoRule 全生态战略
+- EvoRule 全生态战略 — 内部资料，暂不公开
 - `src/builtin_tools/mod.rs` — 6 工具的 3 层分类代码
 - `src/builtin_tools/shell_exec.rs` — 8 active + 20 candidate + 28 blocked
 - `src/builtin_tools/http_get.rs` — 6 active hosts + SSRF 防护

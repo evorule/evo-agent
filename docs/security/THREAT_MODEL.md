@@ -14,14 +14,14 @@
 > **Author**: EvoRule maintainers
 > **Date**: 2026-07-30
 > **Methodology**: STRIDE + Attack Trees + Data Flow Diagrams
-> **Scope**: **evo-agent 仓**(`D:\evo-agent\`)= AI agent 应用层(LLM 集成 + builtin_tools + 工具权限 + workdir sandbox)
+> **Scope**: **evo-agent 仓** = AI agent 应用层(LLM 集成 + builtin_tools + 工具权限 + workdir sandbox)
 > **Target readers**: 内部工程师 / 独立 security reviewer
 > **License**: CC0-1.0
 > **配套文档**:
 >
-> - evorule 机制层威胁 → `D:\evorule\docs\security\THREAT_MODEL_v0.2.0.md`
-> - evorule-application 应用层威胁 → `D:\evorule-application\docs\security\THREAT_MODEL.md`
-> - 生态全栈旧版(已废弃)→ `D:\evorule\docs\security\THREAT_MODEL.md`(2026-07-20)
+> - evorule 机制层威胁 → 见主仓发布物（安全文档随主仓版本发布）
+> - 应用层威胁 → 内部资料，暂不公开
+> - 生态全栈旧版(已废弃)→ 见主仓 git 历史
 
 ---
 
@@ -49,7 +49,7 @@
 
 ### 2.1 5 设计原则
 
-源自 [`D:\evo-agent\DESIGN_PRINCIPLES.md`](DESIGN_PRINCIPLES.md):
+源自 [`DESIGN_PRINCIPLES.md`](../../DESIGN_PRINCIPLES.md):
 
 | 原则       | 在威胁模型中怎么体现                         |
 | ---------- | -------------------------------------------- |
@@ -125,7 +125,7 @@ mitigation 是 3-layer 模型(active/candidate/blocked)+ 工具白名单 + workd
 | **B4**  | evo-agent → External HTTP (HTTPS)           | 出   | 无,但 evo-agent `http_get` 工具有 SSRF 防护(blocklist 127.0.0.0/8、169.254/16 等)                                                | 🟢 LOW(evo-agent)                                              | §6.1,§7.2 |
 | **B9**  | LLM Provider → evo-agent                    | 入   | HTTPS + cert                                                                                                                       | 🟢 LOW                                                         | §6.1,§7.2 |
 
-> 注:evo-agent → evorule-server 的 HTTP 边界(B2)在 evorule-application 威胁模型。
+> 注:evo-agent → evorule-server 的 HTTP 边界(B2)在应用层威胁模型（内部资料）。
 
 ---
 
@@ -352,8 +352,8 @@ LLM (next iteration) + evorule fact log (审计)
 ### 9.2 范围外(Out of Scope)
 
 - ❌ evorule 机制层威胁(Fact log / WAL / TCB)→ evorule 威胁模型
-- ❌ HTTP API 认证 / CORS / evorule-server → evorule-application 威胁模型
-- ❌ http_handler SSRF / db_handler SQL(io_handlers)→ evorule-application 威胁模型
+- ❌ HTTP API 认证 / CORS / evorule-server → 应用层威胁模型（内部资料）
+- ❌ http_handler SSRF / db_handler SQL(io_handlers)→ 应用层威胁模型（内部资料）
 - ❌ 物理访问 / OS / 内核 / 硬件攻击
 - ❌ 第三方 LLM provider 的 SLA / 内部漏洞
 
@@ -363,9 +363,9 @@ LLM (next iteration) + evorule fact log (审计)
 
 ### 10.1 内部
 
-- [`D:\evo-agent\DESIGN_PRINCIPLES.md`](DESIGN_PRINCIPLES.md) — 5 设计原则
-- evorule 机制层威胁 → `D:\evorule\docs\security\THREAT_MODEL_v0.2.0.md`
-- evorule-application 应用层威胁 → `D:\evorule-application\docs\security\THREAT_MODEL.md`
+- [`DESIGN_PRINCIPLES.md`](../../DESIGN_PRINCIPLES.md) — 5 设计原则
+- evorule 机制层威胁模型 → 见主仓发布物（安全文档随主仓版本发布）
+- 应用层威胁模型 → 内部资料，暂不公开
 
 ### 10.2 外部方法学
 

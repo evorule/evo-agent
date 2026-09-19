@@ -6,7 +6,7 @@
 
 evo-agent 是在 evorule 反应式执行引擎之上构建的 AI Agent 编排层。它不重新发明状态机,也不内嵌 LLM 客户端 — 所有 LLM 调用、工具调用、记忆读写都转成 evorule 的 `IoRequest` 事件,由 evorule 反应器负责执行、审计、回滚。
 
-**与 evorule-agent 的关系**:两者都是 evorule 引擎上的 Agent 实现,evorule-agent 是**库形态**的大脑主控运行时(同进程、共享类型、零 HTTP),evo-agent 是**服务形态**的 HTTP 解耦编排层(跨进程、JSON 通讯、19 个 evorule 端点)。两者都把 evorule 作为"身体",但绑定深度与适用场景不同。
+**库形态 vs 服务形态**:evorule 引擎上存在两种 Agent 形态——**库形态**的大脑主控运行时(同进程、共享类型、零 HTTP,见内部仓)与 evo-agent 的**服务形态** HTTP 解耦编排层(跨进程、JSON 通讯、19 个 evorule 端点)。两者都把 evorule 作为"身体",但绑定深度与适用场景不同。
 
 **项目状态**:`v0.1.0` (2026-07-20),158/158 单元测试通过,完整 Fact 闭环 + 三层记忆 + DAG 工作流 + 3 层安全模型已落地。
 

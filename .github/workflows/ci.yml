@@ -4,6 +4,7 @@
 # - lint: cargo fmt --check + cargo clippy (all targets)
 # - verify: verify.ps1 on Linux + Windows (build + test + secret scan
 #   + dependency-contract assertion) and doc tests
+# - doc-safety: 公开面文档安全门禁 (scripts/check_doc_safety.py)
 #
 # Notes:
 # - verify.ps1 is the canonical acceptance entry point; it re-runs
@@ -66,3 +67,16 @@ jobs:
 
       - name: doc tests
         run: cargo test --doc
+
+  # ==========================================================================
+  # doc-safety：公开面文档安全门禁（与主仓 CI 同型）。
+  # R-门控1 (staged 检查) 在 CI 无暂存区语义自动为空集, 不影响其余规则。
+  # ==========================================================================
+  doc-safety:
+    name: doc safety (R rules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: L1 文档安全与引用完整性
+        run: python3 scripts/check_doc_safety.py
