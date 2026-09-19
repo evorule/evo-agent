@@ -612,7 +612,6 @@ evo-agent/
 | Runner 拆分（Phase 2） | ⏳ | `runner.rs` 仍为约 2600 行单文件，未拆为子模块 |
 | UI 联调 | ⏳ | 无前端联调，本轮仅后端 + CLI 验证 |
 | 编译告警 | ⚠️ | 主体为 `missing_docs`；另有少量 clippy 代码质量 lint 待清理 |
-| `.workbuddy/` 未忽略 | ⚠️ | 当前未加入 `.gitignore`，有误入版本库风险，建议忽略 |
 
 > 规则管理工具集总数为 **34 个**（workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
 
