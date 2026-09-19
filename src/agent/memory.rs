@@ -933,6 +933,17 @@ impl MemoryManager {
     ) -> Result<ProjectOutcome, MemoryError> {
         let session_id = self.session_id_for_scope(scope)?; // SessionNotSet 传播（不变量）
         let path = self.build_path_scoped(scope, key);
+
+        // R06（E2 共享读路径不一致修复）：Shared scope 读走共享事实表端点。
+        // 修复前统一走会话事实端点 get_facts(session, path)——跨会话时本会话
+        // payload 无该条 → 恒 Reachable(None)，且 get_scoped 会据此清掉本地 cache
+        // （错误否定导致的破坏性清理）；而 recall_context 走共享表端点读得到，
+        // 两条读路径行为不一致（E2 P3/P4 对照实证）。
+        // 修复后：Shared 与 recall 同源（值/版本谱系/fact_id 三者一致，I3 改善）。
+        if matches!(scope, MemoryScope::Shared) {
+            return self.project_shared_inner(&path).await;
+        }
+
         let facts = match self
             .evorule_client
             .get_facts(&session_id, Some(&path))
@@ -956,6 +967,34 @@ impl MemoryManager {
             record.fact_id.get_or_insert(fact.id);
         }
         // TTL 检查
+        if self.is_expired(&record) {
+            return Ok(ProjectOutcome::Reachable(None));
+        }
+        Ok(ProjectOutcome::Reachable(Some(Box::new(record))))
+    }
+
+    /// R06（E2）：共享账本侧的投影读取（仅 Shared scope 使用）
+    ///
+    /// 语义与 [`latest_entries_by_path`]（R01）完全单源：
+    /// - 同 path 取 version 最大者；墓碑（最新版 null）→ 权威无记忆 `Reachable(None)`
+    ///   （get_scoped 据此清 cache —— 修复后这是**正确的**删除跨会话传播）；
+    /// - **客户端精确过滤 `f.path == path`**：服务端 prefix 语义是 starts_with，
+    ///   精确 path `shared.ns.topic` 会误匹配 `shared.ns.topic2`；
+    /// - 端点失败 → `Unreachable`（fail-open 语义与会话侧一致）。
+    async fn project_shared_inner(&self, path: &str) -> Result<ProjectOutcome, MemoryError> {
+        let facts = match self.evorule_client.get_shared_facts(Some(path)).await {
+            Ok(f) => f,
+            Err(_) => return Ok(ProjectOutcome::Unreachable), // server 不可达
+        };
+        let entries =
+            latest_entries_by_path(facts.into_iter().filter(|f| f.path == path).collect());
+        let Some((_, record)) = entries.first() else {
+            return Ok(ProjectOutcome::Reachable(None));
+        };
+        // 非 record 值透传（历史纯字符串）无法作为 MemoryRecord 读出 → 权威无记忆
+        let Some(record) = record.clone() else {
+            return Ok(ProjectOutcome::Reachable(None));
+        };
         if self.is_expired(&record) {
             return Ok(ProjectOutcome::Reachable(None));
         }
@@ -1035,6 +1074,22 @@ impl MemoryManager {
         // 复用 build_path_scoped（单一路径事实源，D-B1-6）：
         // 前缀经同一函数产出前缀路径 → 07d0 契约统一只改 build_path_scoped，此处自动跟随。
         let base = self.build_path_scoped(scope, prefix);
+
+        // R06（E2）：Shared scope 前缀投影同样走共享事实表端点
+        // （与 project_scoped/get_scoped 的 Shared 读同源；防御性修复——
+        // 当前无生产调用方，但不修则下次接线即复发 E2 同款不一致）
+        if matches!(scope, MemoryScope::Shared) {
+            let Ok(facts) = self.evorule_client.get_shared_facts(Some(&base)).await else {
+                return Ok(Vec::new()); // fail-open（D-B1-5）
+            };
+            let out: Vec<MemoryRecord> = latest_entries_by_path(facts)
+                .into_iter()
+                .filter_map(|(_, record)| record)
+                .filter(|record| !self.is_expired(record))
+                .collect();
+            return Ok(out);
+        }
+
         let Ok(facts) = self
             .evorule_client
             .get_facts(&session_id, Some(&base))
@@ -2529,6 +2584,146 @@ mod tests {
             .await;
         assert_eq!(ctx.events.len(), 2);
         assert_eq!(ctx.events[0].key, "EN_RELEVANT", "英文行为保持不变");
+    }
+
+    // ===== R06（E2 共享读路径不一致修复）：Shared 读与召回同源 =====
+
+    #[tokio::test]
+    async fn test_get_scoped_shared_cross_session_reads_shared_facts() {
+        // E2 主向量：跨会话（s2 未写过该条）读 Shared。
+        // 修复前走会话事实端点 → 恒 None；修复后走共享表端点 → 最新版 + 共享表 fact_id。
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s2");
+
+        // 只 mock 共享端点（同 path 2 版本，服务端版本升序返回）；
+        // 若实现仍走会话端点将无 mock 命中 → 真实 HTTP 失败 → Unreachable → None
+        let body = r#"[
+            {"fact_id":51,"path":"shared.test.topic","value":{"key":"topic","value":"v1","timestamp":100},"source_session_id":9,"version":1},
+            {"fact_id":52,"path":"shared.test.topic","value":{"key":"topic","value":"v2","timestamp":200},"source_session_id":9,"version":2}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.topic")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let record = mgr
+            .get_scoped(MemoryScope::Shared, "topic")
+            .await
+            .unwrap()
+            .expect("跨会话 Shared 读必须命中共享表（E2 修复）");
+        assert_eq!(
+            record.value, "v2",
+            "同 path 取 version 最大者（R01 语义单源）"
+        );
+        assert_eq!(
+            record.fact_id,
+            Some(52),
+            "fact_id 绑定共享表条目（与召回同源，I3）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_scoped_shared_tombstone_clears_cache() {
+        // E20/R06 语义交汇：共享表墓碑（最新版 null）→ 权威无记忆 →
+        // get_scoped 清 cache 从"错误否定的破坏性清理"变为正确的删除跨会话传播
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s2");
+        // 预置 cache 残留（模拟本会话此前读过该共享条）
+        mgr.cache.insert(
+            "shared::topic".to_string(),
+            MemoryRecord::new("topic", "stale", 999),
+        );
+
+        let body = r#"[
+            {"fact_id":61,"path":"shared.test.topic","value":{"key":"topic","value":"v1","timestamp":100},"source_session_id":9,"version":1},
+            {"fact_id":62,"path":"shared.test.topic","value":null,"source_session_id":9,"version":2}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.topic")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let result = mgr.get_scoped(MemoryScope::Shared, "topic").await.unwrap();
+        assert!(result.is_none(), "墓碑 path 权威无记忆，绝不回退旧版");
+        assert!(
+            !mgr.cache.contains_key("shared::topic"),
+            "cache 残留必须被清出（删除跨会话生效）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_scoped_shared_exact_path_filter() {
+        // P03 风险点：服务端 prefix 是 starts_with，"shared.test.topic" 会误匹配
+        // "shared.test.topic2" → 必须客户端精确过滤
+        let mut server = mockito::Server::new_async().await;
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s2");
+
+        let body = r#"[
+            {"fact_id":71,"path":"shared.test.topic","value":{"key":"topic","value":"v-topic","timestamp":100},"source_session_id":9,"version":1},
+            {"fact_id":72,"path":"shared.test.topic2","value":{"key":"topic2","value":"v-topic2","timestamp":999},"source_session_id":9,"version":1}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.topic")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let record = mgr
+            .get_scoped(MemoryScope::Shared, "topic")
+            .await
+            .unwrap()
+            .expect("exact path 命中");
+        assert_eq!(
+            record.value, "v-topic",
+            "不得误取 topic2（starts_with 误匹配）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evidence_for_shared_cross_session() {
+        // P03 新发现面：外部 API evidence(scope=shared) 经此路径——
+        // 修复前跨会话恒 404（I3 出处必随在外部 API 断裂），修复后出示共享表证据
+        let mut server = mockito::Server::new_async().await;
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s2");
+
+        let facts_body = r#"[
+            {"fact_id":81,"path":"shared.test.topic","value":{"key":"topic","value":"v2","timestamp":200},"source_session_id":9,"version":2}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.topic")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(facts_body)
+            .create_async()
+            .await;
+        let verify_body = r#"{"verified":true,"session_id":2,"fact_count":1,"last_hash":"abc123"}"#;
+        server
+            .mock("GET", "/api/sessions/s2/audit/verify")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(verify_body)
+            .create_async()
+            .await;
+
+        let ev = mgr
+            .evidence_for(&MemoryScope::Shared, "topic")
+            .await
+            .unwrap()
+            .expect("跨会话共享记忆必须可出示证据（I3）");
+        assert_eq!(ev.fact_id, 81, "证据指向共享表 fact 条目");
+        assert!(ev.verified);
     }
 
     // ===== B5: stable_facts 来源域分离 =====
