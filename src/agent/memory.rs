@@ -293,6 +293,81 @@ pub(crate) fn latest_values_by_path(
     (alive, tombstoned)
 }
 
+/// R05（E4 中文召回失效修复）：events 评分的 CJK 感知确定性分词（词法层，红线内）。
+///
+/// 修复前评分用 `goal.split_whitespace()`：中文无空格 → 整句成为单个 token，
+/// `value.contains(整句)` 几乎恒 false → events 层得分恒 0，
+/// `sort_by(score DESC, timestamp DESC)` 退化为纯时间倒序（E4 受控对照实证）。
+///
+/// 规则（纯词法、确定性可复现，零依赖、无向量 —— 对齐 `文档/09` I1–I5 准入判据：
+/// 召回单元仍由调用方携带 `(fact_id, version, cause)`，本函数只产 token）：
+/// - ASCII 字母/数字/下划线连续段 → 一个 token（小写化；英文行为与原实现等价）；
+/// - CJK 连续段 → 相邻二字 bigram（段长 1 时取该单字）。
+///   bigram 以子串方式命中**未分词的原文 value**，因此 value 侧无需分词；
+/// - 其它字符（空白/标点/符号）一律视为分隔符；
+/// - 输出去重保序：同一 token 只计一次（避免相邻 bigram 重叠与重复关键词重复计分，
+///   评分语义 = 「命中的不同关键词数」，与原实现的计数语义在英文常规输入下一致）。
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3400}'..='\u{4DBF}'   // CJK 扩展 A
+        | '\u{4E00}'..='\u{9FFF}' // CJK 统一表意文字
+        | '\u{F900}'..='\u{FAFF}' // CJK 兼容表意文字
+        | '\u{3040}'..='\u{30FF}' // 平假名/片假名
+        | '\u{AC00}'..='\u{D7AF}' // 谚文
+    )
+}
+
+fn emit_cjk_tokens(run: &[char], out: &mut Vec<String>) {
+    if run.len() == 1 {
+        out.push(run[0].to_string());
+        return;
+    }
+    for w in run.windows(2) {
+        out.push(w.iter().collect());
+    }
+}
+
+pub(crate) fn tokenize_for_match(text: &str) -> Vec<String> {
+    let mut raw: Vec<String> = Vec::new();
+    let mut ascii_buf = String::new();
+    let mut cjk_buf: Vec<char> = Vec::new();
+
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            if !cjk_buf.is_empty() {
+                emit_cjk_tokens(&cjk_buf, &mut raw);
+                cjk_buf.clear();
+            }
+            ascii_buf.push(c);
+        } else if is_cjk(c) {
+            if !ascii_buf.is_empty() {
+                raw.push(ascii_buf.to_lowercase());
+                ascii_buf.clear();
+            }
+            cjk_buf.push(c);
+        } else {
+            if !ascii_buf.is_empty() {
+                raw.push(ascii_buf.to_lowercase());
+                ascii_buf.clear();
+            }
+            if !cjk_buf.is_empty() {
+                emit_cjk_tokens(&cjk_buf, &mut raw);
+                cjk_buf.clear();
+            }
+        }
+    }
+    if !ascii_buf.is_empty() {
+        raw.push(ascii_buf.to_lowercase());
+    }
+    if !cjk_buf.is_empty() {
+        emit_cjk_tokens(&cjk_buf, &mut raw);
+    }
+
+    // 去重保序
+    let mut seen = std::collections::HashSet::new();
+    raw.into_iter().filter(|t| seen.insert(t.clone())).collect()
+}
+
 /// C2: 召回上下文（三层召回结果）
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct RecallContext {
@@ -1320,11 +1395,12 @@ impl MemoryManager {
                         .ok()
                         .map(|mut r| {
                             r.fact_id = Some(f.fact_id);
-                            // 简单关键词重叠评分：goal 中的词在 value 中出现的次数
-                            let score = goal
-                                .split_whitespace()
-                                .filter(|kw| !kw.is_empty())
-                                .filter(|kw| r.value.to_lowercase().contains(&kw.to_lowercase()))
+                            // R05（E4）：CJK 感知确定性分词 + 关键词重叠评分
+                            // （修复前 split_whitespace 对中文整句切词，得分恒 0）
+                            let value_lower = r.value.to_lowercase();
+                            let score = tokenize_for_match(goal)
+                                .iter()
+                                .filter(|kw| value_lower.contains(kw.as_str()))
                                 .count();
                             (r, score)
                         })
@@ -2373,6 +2449,86 @@ mod tests {
         assert!(mgr.cache.contains_key("session_s1::topic"));
         assert!(!mgr.cache.contains_key("wrong_key"), "旧 key 错位不应复现");
         m1.assert_async().await;
+    }
+
+    // ===== R05（E4 中文召回失效修复）：CJK 感知确定性分词 =====
+
+    #[test]
+    fn test_tokenize_for_match_unit() {
+        // 英文：等价于旧 split_whitespace 语义（小写化）
+        assert_eq!(
+            tokenize_for_match("How Should I Handle it"),
+            vec!["how", "should", "i", "handle", "it"]
+        );
+        // 中文整句 → 相邻 bigram（不依赖空格）
+        assert_eq!(tokenize_for_match("涨停回撤"), vec!["涨停", "停回", "回撤"]);
+        // 单字 → unigram
+        assert_eq!(tokenize_for_match("好"), vec!["好"]);
+        // 混合：ASCII 段与 CJK 段分别成词，标点/空白视为分隔
+        assert_eq!(
+            tokenize_for_match("AI涨停,backoff!"),
+            vec!["ai", "涨停", "backoff"]
+        );
+        // 去重保序：同一 token 只计一次
+        assert_eq!(tokenize_for_match("回撤 回撤 涨停"), vec!["回撤", "涨停"]);
+        // 空输入与纯标点
+        assert!(tokenize_for_match("").is_empty());
+        assert!(tokenize_for_match("... !!! ,,,").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_recall_context_events_chinese_goal_ranks_relevant() {
+        // E4 复现向量（中文）：相关记忆更旧、无关记忆更新。
+        // 修复前：中文 goal 整句切词得分恒 0 → 排序退化为时间倒序 → 无关者置顶；
+        // 修复后：相关记忆命中多个 bigram → 相关者置顶。
+        let mut server = mockito::Server::new_async().await;
+        let mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()));
+
+        let body = r#"[
+            {"fact_id":31,"path":"shared.test.events.CN_IRRELEVANT","value":{"key":"CN_IRRELEVANT","value":"今天天气不错适合睡觉","timestamp":999},"source_session_id":1,"version":1},
+            {"fact_id":32,"path":"shared.test.events.CN_RELEVANT","value":{"key":"CN_RELEVANT","value":"涨停回撤低吸策略：等待回调到位再买入，跌破涨停日最低价止损","timestamp":100},"source_session_id":1,"version":1}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.events.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let ctx = mgr
+            .recall_context("我该怎么处理涨停回撤低吸的时机问题", 3, 5)
+            .await;
+        assert_eq!(ctx.events.len(), 2);
+        assert_eq!(
+            ctx.events[0].key, "CN_RELEVANT",
+            "中文 goal 必须命中相关记忆（E4：修复前无关者因更新而置顶）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_context_events_english_goal_ranks_relevant() {
+        // L2 期望不变项：英文 goal 的相关性排序行为不受 R05 影响（E4 英文列基线）
+        let mut server = mockito::Server::new_async().await;
+        let mgr = MemoryManager::new("test", EvoruleApiClient::new(&server.url()));
+
+        let body = r#"[
+            {"fact_id":41,"path":"shared.test.events.EN_IRRELEVANT","value":{"key":"EN_IRRELEVANT","value":"unrelated weather content today","timestamp":999},"source_session_id":1,"version":1},
+            {"fact_id":42,"path":"shared.test.events.EN_RELEVANT","value":{"key":"EN_RELEVANT","value":"pullback entry timing strategy for stocks","timestamp":100},"source_session_id":1,"version":1}
+        ]"#;
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.events.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let ctx = mgr
+            .recall_context("how should I handle the pullback entry timing", 3, 5)
+            .await;
+        assert_eq!(ctx.events.len(), 2);
+        assert_eq!(ctx.events[0].key, "EN_RELEVANT", "英文行为保持不变");
     }
 
     // ===== B5: stable_facts 来源域分离 =====
