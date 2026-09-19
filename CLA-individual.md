@@ -15,7 +15,7 @@
 **生效日期**: 2026-07-19
 
 > ⚠️ **重要提示**:本协议是法律文件,影响您的版权与专利权。签署前请仔细阅读。如有疑问,请咨询专业律师。
-> 贡献者也可联系 evorulelab@gmail.com 获取澄清。
+> 贡献者也可联系 <evorulelab@gmail.com> 获取澄清。
 
 ---
 
@@ -23,8 +23,7 @@
 
 - **"项目"** 指 **EvoRule**(反应式执行引擎)及其所有相关代码仓库,包括但不限于:
   - `evorule`(主仓库,本仓库)
-  - `evorule/sdk/typescript`(TypeScript SDK)
-  - `evo-agent`(独立 Agent 编排仓库,evorule 生态的一部分)
+  - `evo-agent`(evorule 生态配套仓库)
   - 未来可能增加的关联仓库
 - **"贡献"** 指您(贡献者)提交给项目的任何源代码、文档、测试用例、补丁、翻译、示例或其他材料,通过 Pull Request / Merge Request / Issue / Email / 任何其他渠道提交。
 - **"版权人"** 指 EvoRule Project(项目版权所有者)。
@@ -37,7 +36,7 @@
 1. **复制、修改、改编、转换、翻译**您的贡献
 2. **将您的贡献合并到项目**及其衍生作品中
 3. **以 AGPL-3.0-or-later 许可证**分发项目及包含您贡献的版本
-4. **以其他许可证分发**项目,包括但不限于商业许可证、商业豁免协议(详见 [DUAL_LICENSE.md](DUAL_LICENSE.md)(待发布))
+4. **以其他许可证分发**项目,包括但不限于商业许可证、商业豁免协议(详见 [DUAL_LICENSE.md](DUAL_LICENSE.md))
 5. **创建和分发**基于您贡献的衍生作品
 6. **公开展示和表演**含您贡献的项目
 
@@ -87,7 +86,7 @@
 - 您对贡献的所有权发生变化(如公司重组、版权转让)
 - 您的贡献的来源发生变化
 
-通知方式:evorulelab@gmail.com(主题加 `[CLA Notice]`)
+通知方式:<evorulelab@gmail.com>(主题加 `[CLA Notice]`)
 
 ## 7. 协议性质与变更
 
@@ -141,14 +140,17 @@
 ## 提交方式
 
 **方式 1(推荐):首次 PR 时声明**
+
 - 在首个 PR 的描述中包含:
   > "I have read and agree to the EvoRule Individual CLA v1.0."
 
 **方式 2:邮件签署**
+
 - 下载本文件,填写并签名后发送至:
-  - **邮箱**: evorulelab@gmail.com(主题加 `[CLA Individual]`)
+  - **邮箱**: <evorulelab@gmail.com>(主题加 `[CLA Individual]`)
 
 **方式 3:Gitee 在线签署**
+
 - 在 Gitee 仓库的 CLA 机器人提示下,点击"我同意"。
 
 ---
@@ -177,7 +179,7 @@
 
 ### Q4:公司贡献怎么处理?
 
-**A**: 公司贡献者需要签署 **Corporate CLA**（已发布，见 [CLA-corporate.md](CLA-corporate.md)）。注意：Gitee 官方 CLA 模块当前**仅支持个人签署、无企业入口**，企业贡献者请按 CLA-corporate.md 的“企业如何签署”走邮件人工流程，勿用个人 CLA 代替。
+**A**: 公司贡献者需要签署 **Corporate CLA**（已发布，见 [CLA-corporate.md](CLA-corporate.md)）。注意：Gitee 官方 CLA 模块当前**仅支持个人签署、无企业入口**，企业贡献者请按 CLA-corporate.md 的"企业如何签署"走邮件人工流程，勿用个人 CLA 代替。
 
 ### Q5:CLA 适用所有贡献吗?
 
@@ -189,8 +191,8 @@
 
 - **项目**: EvoRule
 - **版权人**: EvoRule Project
-- **邮箱**: evorulelab@gmail.com
-- **Gitee**: https://gitee.com/evorulelab/evorule
+- **邮箱**: <evorulelab@gmail.com>
+- **Gitee**: <https://gitee.com/evorule/evorule>
 
 ---
 
