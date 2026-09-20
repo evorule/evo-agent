@@ -187,12 +187,14 @@ Start `evorule-server` and verify 5 core scenarios:
 
 See: `tests/e2e_smoke.py`
 
-### Kani formal verification (evorule-tcb only)
+### Kani formal verification (evorule main repo only)
 
-When adding new tier0 meta-instructions or domain types, you must add a Kani proof:
+evo-agent has no code-level dependency on the TCB (fully decoupled since O-044) — no Kani
+proofs are needed in this repo. tier0 meta-instruction / domain-type changes belong to the
+`evorule` main repo and require a Kani proof there:
 
 ```bash
-cargo kani -p evorule-tcb --features kani
+cargo kani -p evorule-tcb --features kani   # run in the evorule main repo
 ```
 
 ---

@@ -6,13 +6,12 @@
 
 use std::sync::Arc;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
-use crate::json_convert::serde_to_tcb;
 
 // =============================================================================
 // audit_get —— 获取审计报告
@@ -31,7 +30,7 @@ impl AuditGetTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for AuditGetTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let session_id = args
             .get("session_id")
             .and_then(|v| v.as_str())
@@ -41,7 +40,7 @@ impl ToolFunction for AuditGetTool {
             .get_audit_report(session_id)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -62,7 +61,7 @@ impl AuditVerifyTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for AuditVerifyTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let session_id = args
             .get("session_id")
             .and_then(|v| v.as_str())
@@ -73,7 +72,7 @@ impl ToolFunction for AuditVerifyTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::json!({ "verified": verified });
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -94,7 +93,7 @@ impl SessionRewindTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for SessionRewindTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let session_id = args
             .get("session_id")
             .and_then(|v| v.as_str())
@@ -111,7 +110,7 @@ impl ToolFunction for SessionRewindTool {
             .rewind(session_id, version as u64)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -201,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_get_missing_session_id() {
         let tool = AuditGetTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -212,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_verify_missing_session_id() {
         let tool = AuditVerifyTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -223,7 +222,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_rewind_missing_session_id() {
         let tool = SessionRewindTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -234,9 +233,9 @@ mod tests {
     #[tokio::test]
     async fn test_session_rewind_missing_version() {
         let tool = SessionRewindTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("session_id".to_string(), JsonValue::string("s1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("session_id".to_string(), Value::from("s1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -247,10 +246,10 @@ mod tests {
     #[tokio::test]
     async fn test_session_rewind_negative_version() {
         let tool = SessionRewindTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("session_id".to_string(), JsonValue::string("s1"));
-        m.insert("version".to_string(), JsonValue::Integer(-1));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("session_id".to_string(), Value::from("s1"));
+        m.insert("version".to_string(), Value::from(-1));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("version must be non-negative"));

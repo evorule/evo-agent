@@ -6,13 +6,12 @@
 
 use std::sync::Arc;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::api::workspace_client::WorkspaceApiClient;
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
-use crate::json_convert::{serde_to_tcb, tcb_to_serde};
 
 // =============================================================================
 // rule_to_transform —— 转译为 transform 格式
@@ -31,17 +30,17 @@ impl RuleToTransformTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleToTransformTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let body = args
             .get("body")
             .ok_or_else(|| "missing required parameter: body".to_string())?;
-        let serde_body = tcb_to_serde(body);
+        let serde_body = body.clone();
         let result = self
             .client
             .translate_to_transform(serde_body)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -62,17 +61,17 @@ impl RuleToConditionalTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleToConditionalTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let body = args
             .get("body")
             .ok_or_else(|| "missing required parameter: body".to_string())?;
-        let serde_body = tcb_to_serde(body);
+        let serde_body = body.clone();
         let result = self
             .client
             .translate_to_conditional(serde_body)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -93,7 +92,7 @@ impl RuleValidateTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleValidateTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let rules = args
             .get("rules")
             .and_then(|v| v.as_str())
@@ -104,7 +103,7 @@ impl ToolFunction for RuleValidateTool {
             .validate_rules(body)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -191,7 +190,7 @@ mod tests {
     #[tokio::test]
     async fn test_rule_to_transform_missing_body() {
         let tool = RuleToTransformTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -202,7 +201,7 @@ mod tests {
     #[tokio::test]
     async fn test_rule_to_conditional_missing_body() {
         let tool = RuleToConditionalTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -213,7 +212,7 @@ mod tests {
     #[tokio::test]
     async fn test_rule_validate_missing_rules() {
         let tool = RuleValidateTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result

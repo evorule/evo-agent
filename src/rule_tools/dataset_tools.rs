@@ -6,13 +6,12 @@
 
 use std::sync::Arc;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::api::workspace_client::{CreateTestDatasetRequest, WorkspaceApiClient};
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
-use crate::json_convert::serde_to_tcb;
 
 // =============================================================================
 // dataset_create —— 创建合成测试数据集
@@ -31,7 +30,7 @@ impl DatasetCreateTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for DatasetCreateTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -66,7 +65,7 @@ impl ToolFunction for DatasetCreateTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -87,7 +86,7 @@ impl DatasetListTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for DatasetListTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -98,7 +97,7 @@ impl ToolFunction for DatasetListTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -193,9 +192,9 @@ mod tests {
     #[tokio::test]
     async fn test_dataset_create_missing_name() {
         let tool = DatasetCreateTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -206,10 +205,10 @@ mod tests {
     #[tokio::test]
     async fn test_dataset_create_missing_cases_json() {
         let tool = DatasetCreateTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        m.insert("name".to_string(), JsonValue::string("ds"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        m.insert("name".to_string(), Value::from("ds"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -220,11 +219,11 @@ mod tests {
     #[tokio::test]
     async fn test_dataset_create_missing_created_by() {
         let tool = DatasetCreateTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        m.insert("name".to_string(), JsonValue::string("ds"));
-        m.insert("cases_json".to_string(), JsonValue::string("[]"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        m.insert("name".to_string(), Value::from("ds"));
+        m.insert("cases_json".to_string(), Value::from("[]"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -235,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn test_dataset_list_missing_workspace_id() {
         let tool = DatasetListTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result

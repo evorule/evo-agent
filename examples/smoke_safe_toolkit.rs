@@ -7,32 +7,32 @@
 
 use evo_agent::builtin_tools::default_safe_toolkit;
 use evo_agent::io_handlers::tool_handler::ToolFunction;
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
-fn arg_str(s: &str) -> JsonValue {
-    let mut m = std::collections::BTreeMap::new();
-    m.insert("command".to_string(), JsonValue::string(s));
-    JsonValue::object(m)
+fn arg_str(s: &str) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("command".to_string(), Value::from(s));
+    Value::Object(m)
 }
 
-fn arg_path(p: &str) -> JsonValue {
-    let mut m = std::collections::BTreeMap::new();
-    m.insert("path".to_string(), JsonValue::string(p));
-    JsonValue::object(m)
+fn arg_path(p: &str) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("path".to_string(), Value::from(p));
+    Value::Object(m)
 }
 
-fn arg_pattern(p: &str) -> JsonValue {
-    let mut m = std::collections::BTreeMap::new();
-    m.insert("pattern".to_string(), JsonValue::string(p));
-    JsonValue::object(m)
+fn arg_pattern(p: &str) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("pattern".to_string(), Value::from(p));
+    Value::Object(m)
 }
 
-fn arg_kv(kv: &[(&str, JsonValue)]) -> JsonValue {
-    let mut m = std::collections::BTreeMap::new();
+fn arg_kv(kv: &[(&str, Value)]) -> Value {
+    let mut m = serde_json::Map::new();
     for (k, v) in kv {
         m.insert(k.to_string(), v.clone());
     }
-    JsonValue::object(m)
+    Value::Object(m)
 }
 
 fn check(label: &str, ok: bool, expect_ok: bool) {
@@ -90,7 +90,7 @@ async fn main() {
 
     println!("\n=== file_list ===");
     let v = file_list
-        .call(&JsonValue::object(Default::default()))
+        .call(&Value::Object(Default::default()))
         .await
         .expect("list");
     let count = v.get("count").unwrap().as_i64().unwrap();
@@ -103,8 +103,8 @@ async fn main() {
     println!("\n=== file_write ===");
     let r = file_write
         .call(&arg_kv(&[
-            ("path", JsonValue::string("workspace/notes.md")),
-            ("content", JsonValue::string("# My notes")),
+            ("path", Value::from("workspace/notes.md")),
+            ("content", Value::from("# My notes")),
         ]))
         .await;
     check("write new file in workspace/", r.is_ok(), true);
@@ -112,17 +112,17 @@ async fn main() {
 
     let r = file_write
         .call(&arg_kv(&[
-            ("path", JsonValue::string("evil.txt")),
-            ("content", JsonValue::string("evil")),
+            ("path", Value::from("evil.txt")),
+            ("content", Value::from("evil")),
         ]))
         .await;
     check("reject write outside workspace/", r.is_err(), true);
 
     let r = file_write
         .call(&arg_kv(&[
-            ("path", JsonValue::string("workspace/notes.md")),
-            ("content", JsonValue::string("updated")),
-            ("overwrite", JsonValue::Bool(true)),
+            ("path", Value::from("workspace/notes.md")),
+            ("content", Value::from("updated")),
+            ("overwrite", Value::Bool(true)),
         ]))
         .await;
     check("overwrite with flag", r.is_ok(), true);
@@ -191,7 +191,7 @@ async fn main() {
     let r = http_get
         .call(&arg_kv(&[(
             "url",
-            JsonValue::string("https://docs.rs/tokio"),
+            Value::from("https://docs.rs/tokio"),
         )]))
         .await;
     if let Ok(v) = r {
@@ -203,7 +203,7 @@ async fn main() {
     let r = http_get
         .call(&arg_kv(&[(
             "url",
-            JsonValue::string("https://example.com/foo"),
+            Value::from("https://example.com/foo"),
         )]))
         .await;
     if let Ok(v) = r {
@@ -217,7 +217,7 @@ async fn main() {
         http_get
             .call(&arg_kv(&[(
                 "url",
-                JsonValue::string("https://127.0.0.1/admin"),
+                Value::from("https://127.0.0.1/admin"),
             )]))
             .await
             .is_err(),
@@ -228,7 +228,7 @@ async fn main() {
         http_get
             .call(&arg_kv(&[(
                 "url",
-                JsonValue::string("http://169.254.169.254/latest/meta-data/"),
+                Value::from("http://169.254.169.254/latest/meta-data/"),
             )]))
             .await
             .is_err(),
@@ -239,7 +239,7 @@ async fn main() {
         http_get
             .call(&arg_kv(&[(
                 "url",
-                JsonValue::string("http://example.com/foo"),
+                Value::from("http://example.com/foo"),
             )]))
             .await
             .is_err(),

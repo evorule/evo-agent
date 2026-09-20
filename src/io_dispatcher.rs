@@ -3,7 +3,7 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! I/O Dispatcher - dispatches based on IoType to corresponding handler
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::io_handler::{IoHandler, IoResult};
 use crate::io_handlers::{llm_handler::LlmHandler, tool_handler::ToolHandler};
@@ -22,7 +22,7 @@ impl IoDispatcher {
     }
 
     /// Dispatch based on IoType to corresponding handler
-    pub async fn dispatch(&self, io_type: &str, params: &JsonValue) -> IoResult {
+    pub async fn dispatch(&self, io_type: &str, params: &Value) -> IoResult {
         match io_type {
             "call_external" => self.llm.execute(params).await,
             "call_service" => self.tool.execute(params).await,
@@ -87,7 +87,7 @@ pub struct IoEvent {
 #[derive(Debug, Clone)]
 pub enum IoEventPayload {
     /// I/O request
-    IoRequest(Box<JsonValue>),
+    IoRequest(Box<Value>),
     /// I/O response
-    IoResponse(Box<JsonValue>),
+    IoResponse(Box<Value>),
 }

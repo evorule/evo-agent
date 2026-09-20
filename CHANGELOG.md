@@ -61,6 +61,9 @@
 
 - **移除 `blake3` 直接依赖** — 零代码调用（仅文档注释提及概念），死依赖删除；
   evorule-reactor 自身对 blake3 的依赖不受影响
+- **移除 `evorule-tcb` / `evorule-reactor` 依赖** — Agent 编排层与主仓 TCB/Reactor 代码解耦；
+  `evorule_tcb::JsonValue` 全面替换为 `serde_json::Value`（IoHandler trait 签名与工具参数同步），
+  专用转换模块 `json_convert` 不再需要，随之删除
 
 ### 🐛 修复
 

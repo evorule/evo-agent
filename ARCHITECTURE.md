@@ -277,17 +277,13 @@ DAG(有向无环图)拓扑编排多 agent,用 JSON DSL 定义:
 ## 11. 依赖关系
 
 ```toml
-# Cargo.toml 关键依赖
-evorule-tcb = { path = "../evorule/evorule-tcb" }        # 反应式执行内核
-evorule-reactor = { path = "../evorule/evorule-reactor" } # 反应器 + FactsLog
-
+# Cargo.toml 关键依赖（仅第三方 crates，自 O-044 起不含任何 evorule-* 依赖）
 reqwest = { version = "0.12", features = ["json", "stream"] }  # HTTP 客户端
 axum = "0.8"                                            # 自有 HTTP 服务
-tokio = { version = "1", features = ["full"] }          # 异步运行时
+tokio = "1"                                             # 异步运行时
 serde / serde_json = "1"                                # JSON 序列化
 prometheus = "0.13"                                     # 指标
 tracing = "0.1"                                         # 结构化日志
-blake3 = "1"                                            # 审计链哈希
 clap = "4"                                              # CLI
 jsonschema = "0.18"                                     # LLM 输出 JSON Schema 校验(G11)
 tokio-util = "0.7"                                      # CancellationToken(G6)

@@ -26,14 +26,13 @@
 //! 摘要可以用与主对话不同的(更便宜的)模型,通过 `summary_model` 配置。
 //! 如果未配置,fallback 到 `LlmHandler` 的 `default_model`。
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 use tracing::warn;
 
 use crate::agent::audited_llm::AuditedLlm;
 use crate::agent::translator::{LlmResponse, Message};
 use crate::io_handler::IoHandler;
 use crate::io_handlers::LlmHandler;
-use crate::json_convert::serde_to_tcb;
 
 /// G10:摘要触发的最小裁剪消息数(Q9 Strategy B,默认 5)
 pub const DEFAULT_SUMMARY_THRESHOLD: usize = 5;
@@ -164,7 +163,7 @@ impl ContextSummarizer {
     /// P2-V3 结构性修复后，生产路径（from_definition 构造）恒走审计分支；
     /// 直连分支仅存在于未挂载 auditor 的场景（单元测试/独立使用），
     /// 属显式配置而非静默兜底。
-    async fn call_llm(&self, purpose: &str, params: &JsonValue) -> Result<JsonValue, String> {
+    async fn call_llm(&self, purpose: &str, params: &Value) -> Result<Value, String> {
         match &self.audited {
             Some(audited) => audited.execute(purpose, params).await,
             None => {
@@ -228,7 +227,7 @@ impl ContextSummarizer {
         let messages_json = serde_json::Value::Array(messages_vec);
 
         // 构造 LLM 调用参数
-        // 用 serde_json::Value 构造再转 JsonValue,确保类型正确
+        // 用 serde_json::Value 构造再转 Value,确保类型正确
         // (temperature 必须是 number,不是 string)
         let mut params_map = serde_json::Map::new();
         if let Some(model) = &self.summary_model {
@@ -247,7 +246,7 @@ impl ContextSummarizer {
         );
         params_map.insert("messages".to_string(), messages_json);
         let params_json = serde_json::Value::Object(params_map);
-        let params = serde_to_tcb(&params_json);
+        let params = params_json.clone();
 
         // 调用 LLM（经审计链或直连，见 call_llm 分流说明）
         let result = self.call_llm("summarize", &params).await?;
@@ -320,7 +319,7 @@ impl ContextSummarizer {
             serde_json::Value::Array(messages_vec),
         );
         let params_json = serde_json::Value::Object(params_map);
-        let params = serde_to_tcb(&params_json);
+        let params = params_json.clone();
 
         // 调用 LLM（经审计链或直连，见 call_llm 分流说明）
         let result = self.call_llm("session_summary", &params).await?;
@@ -395,7 +394,7 @@ impl ContextSummarizer {
             serde_json::Value::Array(messages_vec),
         );
         let params_json = serde_json::Value::Object(params_map);
-        let params = serde_to_tcb(&params_json);
+        let params = params_json.clone();
 
         // 调用 LLM（经审计链或直连，见 call_llm 分流说明）
         let result = self.call_llm("rollup", &params).await?;

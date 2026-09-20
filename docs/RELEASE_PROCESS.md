@@ -13,10 +13,9 @@
 ## 发布形态（如实声明）
 
 - **当前发布形态 = git tag**（`v{MAJOR}.{MINOR}.{PATCH}`，如 `v0.1.0`）。
-- **crates.io 发布暂不可行**：本仓以 path 依赖引用 `../evorule/evorule-tcb`、
-  `../evorule/evorule-reactor`（见 README"源码布局契约"）。待主仓核心库发布
-  crates.io 后切换为版本依赖，届时补 crates.io 发布章节。
-- 下游使用方式：git 依赖 / 并排检出源码构建 / 预编译产物。
+- 本仓自 O-044（2026-09-20）起与 evorule 主仓完全解耦，Cargo 依赖面仅第三方 crates，
+  crates.io 发布不再受主仓依赖阻塞；当前仍以 git tag 发布，crates.io 发布另行评估，届时补发布章节。
+- 下游使用方式：git 依赖 / 源码构建 / 预编译产物。
 
 ## 0. 前置条件
 
@@ -24,7 +23,6 @@
 
 - Gitee 源仓库的 push 权限
 - Rust 工具链（1.74+）
-- 与主仓并排检出的源码布局（见 README）
 
 ## 1. 发布前就绪检查
 
@@ -35,7 +33,7 @@ pwsh verify.ps1
 ```
 
 覆盖 4 项：`cargo build` → `cargo test`（全量）→ 防泄漏扫描（密钥模式）→
-源码布局断言（path 依赖目标存在且可解析）。全部通过（exit 0）才可继续。
+依赖契约断言（Cargo.toml 不得出现任何 `evorule-*` 依赖）。全部通过（exit 0）才可继续。
 
 ### 1.2 手工确认
 
@@ -63,7 +61,7 @@ git ls-remote --tags origin v0.1.0
 ```
 
 - [ ] tag 在远端存在
-- [ ] 干净环境按 README 布局契约并排检出后 `cargo build && cargo test` 通过
+- [ ] 干净环境 clone 本仓后 `cargo build && cargo test` 通过（无需主仓）
 
 ## 附录：紧急回滚
 

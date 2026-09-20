@@ -43,7 +43,7 @@ use crate::api::api_core::ApiError;
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::io_handler::IoHandler;
 use crate::io_handlers::LlmHandler;
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 /// 单次审计调用的整体超时（含建会话 + LLM 执行 + 协议回路）
 ///
@@ -152,7 +152,7 @@ impl AuditedLlm {
     ///   messages），与直连路径构造方式完全一致；经命令事实进入审计链
     ///
     /// 成功返回本地 LLM 执行结果（不经服务端 payload 回读，避免存储形态耦合）。
-    pub async fn execute(&self, purpose: &str, params: &JsonValue) -> Result<JsonValue, String> {
+    pub async fn execute(&self, purpose: &str, params: &Value) -> Result<Value, String> {
         let deadline = Duration::from_secs(self.timeout_secs);
 
         // 1. 一次性 sidecar 会话（F2：瞬态错误有界重试，语义错误直接失败）
@@ -182,7 +182,7 @@ impl AuditedLlm {
         info!(%session_id, %purpose, "audited_llm: sidecar command submitted");
 
         // 4. 事件回路：IoRequest → 本地执行 → io_response；Stable → 完成
-        let mut llm_result: Option<JsonValue> = None;
+        let mut llm_result: Option<Value> = None;
         loop {
             let event = match tokio::time::timeout(deadline, events.next()).await {
                 Err(_) => {
@@ -216,10 +216,7 @@ impl AuditedLlm {
                     let exec_result = self.llm.execute(params).await;
                     let (response_value, error_msg): (serde_json::Value, Option<String>) =
                         match &exec_result {
-                            Ok(v) => match serde_json_value_of(v) {
-                                Ok(value) => (value, None),
-                                Err(e) => (serde_json::json!({ "error": e }), Some(e)),
-                            },
+                            Ok(v) => (v.clone(), None),
                             Err(e) => (serde_json::json!({ "error": e }), Some(e.clone())),
                         };
                     self.client
@@ -268,9 +265,9 @@ impl AuditedLlm {
 /// 但它随命令事实持久化进审计链，供审计侧区分调用类别。
 fn build_call_external_command(
     purpose: &str,
-    params: &JsonValue,
+    params: &Value,
 ) -> Result<serde_json::Value, String> {
-    let mut p = serde_json_value_of(params)?;
+    let mut p = params.clone();
     match &mut p {
         serde_json::Value::Object(map) => {
             map.insert("audit_purpose".to_string(), serde_json::json!(purpose));
@@ -284,22 +281,14 @@ fn build_call_external_command(
     Ok(serde_json::json!({ "type": "call_external", "params": p }))
 }
 
-/// JsonValue(TCB) → serde_json::Value
-///
-/// 沿用既有风格（to_string + parse）：TCB JSON 的文本形式是合法 JSON，
-/// 解析结果一一对应。解析失败如实报错，不静默降级为 Null。
-fn serde_json_value_of(v: &JsonValue) -> Result<serde_json::Value, String> {
-    serde_json::from_str(&v.to_string()).map_err(|e| format!("convert tcb json to serde_json: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use serde_json::json;
 
-    fn tcb(v: &serde_json::Value) -> JsonValue {
-        crate::json_convert::serde_to_tcb(v)
+    fn tcb(v: &serde_json::Value) -> Value {
+        v.clone()
     }
 
     // ===== 命令构造单元测试 =====

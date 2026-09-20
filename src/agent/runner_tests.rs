@@ -2,6 +2,8 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 
+use std::collections::BTreeMap;
+
 use super::*;
 
 fn make_test_client() -> EvoruleApiClient {
@@ -68,7 +70,7 @@ fn test_merge_delegate_tool() {
     };
 
     let args = serde_json::json!({"query": "test"});
-    let tcb_args = serde_to_tcb(&args);
+    let tcb_args = args.clone();
     let merged = merge_delegate_tool("search", &tcb_args, &delegate_ctx);
 
     assert_eq!(
@@ -563,8 +565,8 @@ fn make_handler_with(tool_names: &[&str]) -> ToolHandler {
     struct EchoTool;
     #[async_trait::async_trait]
     impl ToolFunction for EchoTool {
-        async fn call(&self, _args: &evorule_tcb::JsonValue) -> crate::io_handler::IoResult {
-            Ok(evorule_tcb::JsonValue::string("echo"))
+        async fn call(&self, _args: &serde_json::Value) -> crate::io_handler::IoResult {
+            Ok(serde_json::Value::from("echo"))
         }
     }
 
@@ -841,7 +843,7 @@ fn test_agent_error_clone() {
 #[tokio::test]
 async fn test_streaming_consumption_pattern_single_delta() {
     let handler = LlmHandler::mock("Hello world");
-    let params = JsonValue::Object(BTreeMap::new());
+    let params = Value::Object(serde_json::Map::new());
     let mut stream = handler.execute_stream(&params);
 
     let mut deltas: Vec<String> = Vec::new();
@@ -872,7 +874,7 @@ async fn test_streaming_consumption_pattern_single_delta() {
 #[tokio::test]
 async fn test_stream_chunk_to_agent_event_mapping() {
     let handler = LlmHandler::mock("Streaming response");
-    let params = JsonValue::Object(BTreeMap::new());
+    let params = Value::Object(serde_json::Map::new());
     let mut stream = handler.execute_stream(&params);
 
     // 模拟 run_streaming 中的映射逻辑
@@ -919,7 +921,7 @@ async fn test_stream_chunk_to_agent_event_mapping() {
 #[tokio::test]
 async fn test_stream_chunk_mapping_no_tool_calls() {
     let handler = LlmHandler::mock("No tools here");
-    let params = JsonValue::Object(BTreeMap::new());
+    let params = Value::Object(serde_json::Map::new());
     let mut stream = handler.execute_stream(&params);
 
     let mut full_content = String::new();
@@ -1110,9 +1112,9 @@ struct DelayedTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for DelayedTool {
-    async fn call(&self, _args: &JsonValue) -> IoResult {
+    async fn call(&self, _args: &Value) -> IoResult {
         tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
-        Ok(JsonValue::string(format!("result_{}", self.label)))
+        Ok(Value::from(format!("result_{}", self.label)))
     }
 }
 
@@ -1121,14 +1123,14 @@ struct ProposalTool;
 
 #[async_trait::async_trait]
 impl ToolFunction for ProposalTool {
-    async fn call(&self, _args: &JsonValue) -> IoResult {
+    async fn call(&self, _args: &Value) -> IoResult {
         let proposal = serde_json::json!({
             "status": "needs_approval",
             "command": "rm -rf /tmp/test",
             "risk": "high",
             "alternative": "use trash instead"
         });
-        Ok(serde_to_tcb(&proposal))
+        Ok(proposal.clone())
     }
 }
 
@@ -1169,7 +1171,7 @@ fn test_g13_parallel_cache_key_different_args() {
 fn test_g13_parallel_cache_put_get_clear() {
     let runner = make_parallel_runner(4, BTreeMap::new());
     let key = "test_key".to_string();
-    let value = JsonValue::string("cached_result");
+    let value = Value::from("cached_result");
 
     // 初始为空
     assert!(runner.parallel_cache_get(&key).is_none());
@@ -1191,7 +1193,7 @@ fn test_g13_check_cache_disabled_in_serial_mode() {
     let args = serde_json::json!({"path": "/tmp"});
     // 即使手动 put 了,串行模式也不查缓存
     let key = AgentRunner::parallel_cache_key("file_read", &args);
-    runner.parallel_cache_put(key, JsonValue::string("data"));
+    runner.parallel_cache_put(key, Value::from("data"));
     assert!(
         runner.check_parallel_cache("file_read", &args).is_none(),
         "serial mode (max_parallel_tools=1) should not check cache"
@@ -1204,7 +1206,7 @@ fn test_g13_check_cache_enabled_in_parallel_mode() {
     let runner = make_parallel_runner(4, BTreeMap::new());
     let args = serde_json::json!({"path": "/tmp/data"});
     let key = AgentRunner::parallel_cache_key("file_read", &args);
-    runner.parallel_cache_put(key, JsonValue::string("file content"));
+    runner.parallel_cache_put(key, Value::from("file content"));
 
     let hit = runner.check_parallel_cache("file_read", &args);
     assert!(hit.is_some(), "parallel mode should hit cache");

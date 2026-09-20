@@ -8,15 +8,13 @@
 //! SSE pushes io_request event -> AgentRunner executes external call -> POST /api/sessions/{id}/io_response ->
 //! evorule produces IoResponse + StateTransition -> SSE pushes stable event -> AgentRunner returns result
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 use futures_core::Stream;
 use futures_util::StreamExt;
-use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use tokio_util::sync::CancellationToken;
@@ -38,7 +36,6 @@ use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::metrics::{SessionActiveGuard, SharedMetrics};
 use crate::io_handler::IoHandler;
 use crate::io_handlers::{LlmHandler, StreamChunk, ToolHandler};
-use crate::json_convert::serde_to_tcb;
 
 /// TODO: doc
 pub const DEFAULT_MAX_DELEGATE_DEPTH: usize = 3;
@@ -466,9 +463,9 @@ pub struct AgentRunner {
     /// active 工具的结果(非 proposal)存入此缓存;后续 `call_service` IoRequest
     /// 命中缓存则直接返回(不重复执行),未命中(candidate proposal)则正常走审批。
     ///
-    /// key = `"{tool_name}:{serde(args)}"`,value = 工具返回的 JsonValue。
+    /// key = `"{tool_name}:{serde(args)}"`,value = 工具返回的 Value。
     /// 每次 `call_external` 开始时清空(新一轮 LLM 调用,旧缓存失效)。
-    parallel_tool_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, JsonValue>>>,
+    parallel_tool_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, Value>>>,
     /// G17:Prometheus 指标(None = 不插桩,如 CLI 模式)
     ///
     /// 由 `with_metrics()` 注入。serve 模式下从 `AgentApiState.metrics` clone。
@@ -1451,13 +1448,13 @@ impl AgentRunner {
 
         let serde_messages = serde_json::to_value(&messages_to_send)
             .map_err(|e| AgentError::Internal(format!("serialize messages: {}", e)))?;
-        let tcb_messages = serde_to_tcb(&serde_messages);
+        let tcb_messages = serde_messages.clone();
 
-        let mut call_params = BTreeMap::new();
-        call_params.insert("model".to_string(), JsonValue::string(model.to_string()));
+        let mut call_params = serde_json::Map::new();
+        call_params.insert("model".to_string(), Value::from(model.to_string()));
         call_params.insert(
             "temperature".to_string(),
-            JsonValue::string(temperature.to_string()),
+            Value::from(temperature.to_string()),
         );
         call_params.insert("messages".to_string(), tcb_messages);
 
@@ -1466,13 +1463,13 @@ impl AgentRunner {
         // 训练先验盲猜工具名(如 read_file≠file_read)或输出供应商原生 XML,
         // 两侧解析器均无法消费 —— 与 build_call_external_command 的注入同源。
         if let Some(tools) = params.get("tools") {
-            call_params.insert("tools".to_string(), serde_to_tcb(tools));
+            call_params.insert("tools".to_string(), tools.clone());
         }
 
         // G17:LLM 调用计时 + 指标(observe_llm_call 在 ? 之前记录,确保 error 也被统计)
         let llm_start = std::time::Instant::now();
         let llm_result = self
-            .execute_external("call_external", &JsonValue::Object(call_params))
+            .execute_external("call_external", &Value::Object(call_params))
             .await;
         let llm_duration = llm_start.elapsed();
         let llm_ok = llm_result.is_ok();
@@ -1678,18 +1675,18 @@ impl AgentRunner {
         &self,
         tool_name: &str,
         args: &Value,
-    ) -> Result<JsonValue, AgentError> {
-        let args_tcb = serde_to_tcb(args);
-        let mut call_params = BTreeMap::new();
+    ) -> Result<Value, AgentError> {
+        let args_tcb = args.clone();
+        let mut call_params = serde_json::Map::new();
         call_params.insert(
             "tool_name".to_string(),
-            JsonValue::string(tool_name.to_string()),
+            Value::from(tool_name.to_string()),
         );
         call_params.insert("args".to_string(), args_tcb);
         // G17:工具调用计时 + 指标(单一插桩点,覆盖 run() / run_streaming() / G13 并行路径)
         let tool_start = std::time::Instant::now();
         let result = self
-            .execute_external("call_service", &JsonValue::Object(call_params))
+            .execute_external("call_service", &Value::Object(call_params))
             .await;
         let tool_duration = tool_start.elapsed();
         let tool_ok = result.is_ok();
@@ -1713,7 +1710,7 @@ impl AgentRunner {
     }
 
     /// G13:从缓存读取工具结果(命中则返回克隆)
-    fn parallel_cache_get(&self, key: &str) -> Option<JsonValue> {
+    fn parallel_cache_get(&self, key: &str) -> Option<Value> {
         self.parallel_tool_cache
             .lock()
             .ok()
@@ -1721,7 +1718,7 @@ impl AgentRunner {
     }
 
     /// G13:写入工具结果到缓存
-    fn parallel_cache_put(&self, key: String, value: JsonValue) {
+    fn parallel_cache_put(&self, key: String, value: Value) {
         if let Ok(mut cache) = self.parallel_tool_cache.lock() {
             cache.insert(key, value);
         }
@@ -1737,17 +1734,17 @@ impl AgentRunner {
     /// G13:直接本地执行单个工具(不经 evorule IoRequest)
     ///
     /// 调 `tool_handler.execute_by_name`,用于并行批量执行。
-    /// 返回 `JsonValue`(工具结果,可能是 proposal)。
-    async fn execute_single_tool(&self, tc: &crate::agent::translator::ToolCall) -> JsonValue {
-        let args_tcb = serde_to_tcb(&tc.arguments);
+    /// 返回 `Value`(工具结果,可能是 proposal)。
+    async fn execute_single_tool(&self, tc: &crate::agent::translator::ToolCall) -> Value {
+        let args_tcb = tc.arguments.clone();
         match self.tool_handler.execute_by_name(&tc.name, &args_tcb).await {
             Ok(result) => result,
             Err(e) => {
                 // 工具执行失败:返回 error JSON(不中断其他并行工具)
-                let mut map = std::collections::BTreeMap::new();
-                map.insert("status".to_string(), JsonValue::string("error"));
-                map.insert("error".to_string(), JsonValue::string(e));
-                JsonValue::object(map)
+                let mut map = serde_json::Map::new();
+                map.insert("status".to_string(), Value::from("error"));
+                map.insert("error".to_string(), Value::from(e));
+                Value::Object(map)
             }
         }
     }
@@ -1763,7 +1760,7 @@ impl AgentRunner {
         &self,
         session_id: &str,
         tool_calls: &[crate::agent::translator::ToolCall],
-    ) -> Vec<(String, Value, JsonValue)> {
+    ) -> Vec<(String, Value, Value)> {
         info!(
             %session_id,
             count = tool_calls.len(),
@@ -1803,9 +1800,9 @@ impl AgentRunner {
 
     /// G13:检查 call_service 是否命中并行缓存
     ///
-    /// 命中则返回缓存的 JsonValue(不重复执行),未命中则返回 None。
+    /// 命中则返回缓存的 Value(不重复执行),未命中则返回 None。
     /// 仅当 `max_parallel_tools > 1` 时启用缓存查询。
-    fn check_parallel_cache(&self, tool_name: &str, args: &Value) -> Option<JsonValue> {
+    fn check_parallel_cache(&self, tool_name: &str, args: &Value) -> Option<Value> {
         if self.config.max_parallel_tools <= 1 {
             return None; // 串行模式,不走缓存
         }
@@ -1827,8 +1824,8 @@ impl AgentRunner {
         session_id: &str,
         tool_name: &str,
         args: &Value,
-        tool_result: JsonValue,
-    ) -> Result<JsonValue, AgentError> {
+        tool_result: Value,
+    ) -> Result<Value, AgentError> {
         let result_str = tool_result.to_string();
         let approval_req = match parse_approval_request(session_id, tool_name, args, &result_str) {
             Some(req) => req,
@@ -1846,7 +1843,7 @@ impl AgentRunner {
 
         if !approved {
             warn!(%session_id, tool = tool_name, "G8: tool call rejected");
-            return Ok(JsonValue::string(
+            return Ok(Value::from(
                 r#"{"status":"rejected","message":"User denied approval"}"#,
             ));
         }
@@ -1866,28 +1863,28 @@ impl AgentRunner {
     async fn execute_external(
         &self,
         io_type: &str,
-        params: &JsonValue,
-    ) -> Result<JsonValue, AgentError> {
+        params: &Value,
+    ) -> Result<Value, AgentError> {
         tokio::time::timeout(self.config.step_timeout, async {
-            let mut instr = BTreeMap::new();
-            instr.insert("type".to_string(), JsonValue::string(io_type.to_string()));
+            let mut instr = serde_json::Map::new();
+            instr.insert("type".to_string(), Value::from(io_type.to_string()));
             instr.insert("params".to_string(), params.clone());
 
-            let tcb_instr = JsonValue::Object(instr);
+            let tcb_instr = Value::Object(instr);
             self.execute_io_request(&tcb_instr).await
         })
         .await
         .map_err(|_| AgentError::Timeout(format!("{} timeout", io_type)))?
     }
 
-    async fn execute_io_request(&self, request: &JsonValue) -> Result<JsonValue, AgentError> {
+    async fn execute_io_request(&self, request: &Value) -> Result<Value, AgentError> {
         match request.get("type").and_then(|v| v.as_str()) {
             Some("call_external") => {
-                let params = request.get("params").cloned().unwrap_or(JsonValue::Null);
+                let params = request.get("params").cloned().unwrap_or(Value::Null);
                 self.execute_llm_request(&params).await
             }
             Some("call_service") => {
-                let params = request.get("params").cloned().unwrap_or(JsonValue::Null);
+                let params = request.get("params").cloned().unwrap_or(Value::Null);
                 self.execute_tool_request(&params).await
             }
             Some(t) => Err(AgentError::Internal(format!("unsupported io type: {}", t))),
@@ -1895,7 +1892,7 @@ impl AgentRunner {
         }
     }
 
-    async fn execute_llm_request(&self, params: &JsonValue) -> Result<JsonValue, AgentError> {
+    async fn execute_llm_request(&self, params: &Value) -> Result<Value, AgentError> {
         // Actually invoke LlmHandler (uses reqwest to call real HTTP API)
         // - Read MINIMAX_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY env vars
         // - Supports messages / tools / temperature / max_tokens
@@ -1906,7 +1903,7 @@ impl AgentRunner {
             .map_err(AgentError::LlmError)
     }
 
-    async fn execute_tool_request(&self, params: &JsonValue) -> Result<JsonValue, AgentError> {
+    async fn execute_tool_request(&self, params: &Value) -> Result<Value, AgentError> {
         // Real call through ToolHandler (60s timeout, tool_not_found detection).
         // Replaces the previous stub that returned a hardcoded "Simulated tool result".
         self.tool_handler
@@ -2426,17 +2423,17 @@ impl AgentRunner {
                                         return;
                                     }
                                 };
-                                let tcb_messages = serde_to_tcb(&serde_messages);
+                                let tcb_messages = serde_messages.clone();
 
-                                let mut call_params = BTreeMap::new();
-                                call_params.insert("model".to_string(), JsonValue::string(model.to_string()));
-                                call_params.insert("temperature".to_string(), JsonValue::string(temperature.to_string()));
+                                let mut call_params = serde_json::Map::new();
+                                call_params.insert("model".to_string(), Value::from(model.to_string()));
+                                call_params.insert("temperature".to_string(), Value::from(temperature.to_string()));
                                 call_params.insert("messages".to_string(), tcb_messages);
                                 // 转发 constitution 中继的 tools(同 handle_call_external 非流式路径)
                                 if let Some(tools) = params.get("tools") {
-                                    call_params.insert("tools".to_string(), serde_to_tcb(tools));
+                                    call_params.insert("tools".to_string(), tools.clone());
                                 }
-                                let call_params_json = JsonValue::Object(call_params);
+                                let call_params_json = Value::Object(call_params);
 
                                 // G1:启动流式 LLM 调用
                                 // G17:LLM 流式调用计时(在 loop 前后记录,Err 分支单独记录)
@@ -2671,7 +2668,7 @@ impl AgentRunner {
 
                                             if !approved {
                                                 warn!(%session_id, tool = %tool_name, "G8: streaming tool call rejected");
-                                                JsonValue::string(
+                                                Value::from(
                                                     r#"{"status":"rejected","message":"User denied approval"}"#,
                                                 )
                                             } else {
@@ -2851,18 +2848,18 @@ fn rec_to_message(rec: &MessageRecord) -> Option<Message> {
 /// TODO: doc
 pub fn merge_delegate_tool(
     _tool_name: &str,
-    args: &JsonValue,
+    args: &Value,
     delegate_context: &DelegateContext,
-) -> JsonValue {
+) -> Value {
     let mut merged = args.clone();
-    if let JsonValue::Object(map) = &mut merged {
+    if let Value::Object(map) = &mut merged {
         map.insert(
             "delegate_depth".to_string(),
-            JsonValue::integer(delegate_context.current_depth as i64),
+            Value::from(delegate_context.current_depth as i64),
         );
         map.insert(
             "parent_agent".to_string(),
-            JsonValue::string(delegate_context.parent_agent_type.clone()),
+            Value::from(delegate_context.parent_agent_type.clone()),
         );
     }
     merged

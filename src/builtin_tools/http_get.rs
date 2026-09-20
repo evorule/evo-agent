@@ -34,7 +34,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -261,51 +261,51 @@ impl HttpGetTool {
         let body_text = String::from_utf8_lossy(&body_bytes).to_string();
         let url_owned = url.to_string();
 
-        let mut map = std::collections::BTreeMap::new();
-        map.insert("status".to_string(), JsonValue::string("ok"));
-        map.insert("url".to_string(), JsonValue::string(url_owned));
-        map.insert("final_url".to_string(), JsonValue::string(final_url));
+        let mut map = serde_json::Map::new();
+        map.insert("status".to_string(), Value::from("ok"));
+        map.insert("url".to_string(), Value::from(url_owned));
+        map.insert("final_url".to_string(), Value::from(final_url));
         map.insert(
             "http_status".to_string(),
-            JsonValue::Integer(status.as_u16() as i64),
+            Value::from(status.as_u16() as i64),
         );
-        map.insert("content_type".to_string(), JsonValue::string(content_type));
+        map.insert("content_type".to_string(), Value::from(content_type));
         map.insert(
             "body_size".to_string(),
-            JsonValue::Integer(body_bytes.len() as i64),
+            Value::from(body_bytes.len() as i64),
         );
-        map.insert("body".to_string(), JsonValue::string(body_text));
-        Ok(JsonValue::object(map))
+        map.insert("body".to_string(), Value::from(body_text));
+        Ok(Value::Object(map))
     }
 
     /// 构造 proposal
     fn make_proposal(url: &str, host: &str) -> IoResult {
-        let mut map = std::collections::BTreeMap::new();
-        map.insert("status".to_string(), JsonValue::string("needs_approval"));
-        map.insert("url".to_string(), JsonValue::string(url.to_string()));
-        map.insert("host".to_string(), JsonValue::string(host.to_string()));
-        map.insert("category".to_string(), JsonValue::string("candidate"));
+        let mut map = serde_json::Map::new();
+        map.insert("status".to_string(), Value::from("needs_approval"));
+        map.insert("url".to_string(), Value::from(url.to_string()));
+        map.insert("host".to_string(), Value::from(host.to_string()));
+        map.insert("category".to_string(), Value::from("candidate"));
         map.insert(
             "description".to_string(),
-            JsonValue::string("HTTP GET to a host not in the active allowlist"),
+            Value::from("HTTP GET to a host not in the active allowlist"),
         );
         map.insert(
             "risk".to_string(),
-            JsonValue::string(
+            Value::from(
                 "Leak data to an external server; download malicious content; potential SSRF if host resolves to private IP",
             ),
         );
         map.insert(
             "alternative".to_string(),
-            JsonValue::string(
+            Value::from(
                 "Use a host in the active list (docs.rs, crates.io, github.com); or download manually and use file_read",
             ),
         );
         map.insert(
             "instructions".to_string(),
-            JsonValue::string("Ask the user. If approved, call with approved=true."),
+            Value::from("Ask the user. If approved, call with approved=true."),
         );
-        Ok(JsonValue::object(map))
+        Ok(Value::Object(map))
     }
 }
 
@@ -318,7 +318,7 @@ impl Default for HttpGetTool {
 #[async_trait::async_trait]
 impl ToolFunction for HttpGetTool {
     /// G13:async 入口 — 直接 await reqwest(无需 spawn_blocking)
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let url = args
             .get("url")
             .and_then(|v| v.as_str())
@@ -489,11 +489,11 @@ mod tests {
     async fn test_candidate_returns_proposal_without_approval() {
         let tool = HttpGetTool::new();
         let result = tool
-            .call(&JsonValue::object({
-                let mut m = std::collections::BTreeMap::new();
+            .call(&Value::Object({
+                let mut m = serde_json::Map::new();
                 m.insert(
                     "url".to_string(),
-                    JsonValue::string("https://example.com/foo"),
+                    Value::from("https://example.com/foo"),
                 );
                 m
             }))
@@ -509,13 +509,13 @@ mod tests {
     async fn test_blocked_host_always_rejected() {
         let tool = HttpGetTool::new();
         let result = tool
-            .call(&JsonValue::object({
-                let mut m = std::collections::BTreeMap::new();
+            .call(&Value::Object({
+                let mut m = serde_json::Map::new();
                 m.insert(
                     "url".to_string(),
-                    JsonValue::string("https://192.168.1.1/admin"),
+                    Value::from("https://192.168.1.1/admin"),
                 );
-                m.insert("approved".to_string(), JsonValue::Bool(true));
+                m.insert("approved".to_string(), Value::Bool(true));
                 m
             }))
             .await;
@@ -527,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn test_missing_url_arg() {
         let tool = HttpGetTool::new();
-        let result = tool.call(&JsonValue::object(Default::default())).await;
+        let result = tool.call(&Value::Object(Default::default())).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing required arg"));
     }

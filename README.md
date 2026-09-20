@@ -115,7 +115,8 @@ export MINIMAX_API_KEY=your-api-key
 
 ### 依赖契约
 
-evorule 核心库（`evorule-tcb` / `evorule-reactor`）以 **crates.io 版本依赖**引用——clone 本仓后直接构建，无需并排检出主仓：
+evo-agent 自 O-044（2026-09-20）起与 evorule 主仓完全解耦：Cargo 依赖面仅第三方 crates，
+不引用任何 `evorule-*` crate，与 evorule-server 的交互只走 HTTP/WS 协议——clone 本仓后直接构建：
 
 ```bash
 git clone https://gitee.com/evorule/evo-agent.git
@@ -123,8 +124,8 @@ cd evo-agent
 cargo build          # 依赖自动从 crates.io 解析
 ```
 
-- **禁止 path 依赖回流**：引擎 crate 一旦改回本地 path 引用，仓外构建即失效；
-  `verify.ps1` 第 4 步（依赖契约断言）会在发现 path 依赖时判 FAIL。
+- **禁止 `evorule-*` 依赖**：本仓是 Agent 编排层，不依赖主仓机制层代码（TCB / Reactor）；
+  `verify.ps1` 第 4 步（依赖契约断言）会在 Cargo.toml 出现任何 `evorule-*` 依赖时判 FAIL。
 - 运行时仍需一个可达的 evorule-server 实例（见下节）。
 
 ### 启动 evorule-server
@@ -618,9 +619,6 @@ evo-agent/
 ## 依赖关系
 
 ```toml
-evorule-tcb = "0.3"           # 反应式执行内核（JsonValue / Fact / 因果链）— path 依赖
-evorule-reactor = "0.3"       # 反应器 + FactsLog + WAL — path 依赖
-
 reqwest = "0.12"              # HTTP 客户端
 axum = "0.8"                  # HTTP 服务（含 WebSocket）
 tokio = "1"                   # 异步运行时
@@ -631,6 +629,9 @@ prometheus = "0.13"           # 指标
 jsonschema = "0.18"           # JSON Schema 校验
 rustyline = "14"              # REPL 行编辑
 ```
+
+依赖面仅第三方 crates（自 O-044 起，2026-09-20，不含任何 `evorule-*` 依赖）；
+与 evorule-server 之间只有 HTTP/WS 协议契约。
 
 **零 unsafe**：`#![forbid(unsafe_code)]` 在所有 module 强制。
 

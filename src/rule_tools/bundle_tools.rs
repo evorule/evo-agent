@@ -18,14 +18,13 @@
 
 use std::sync::Arc;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::workspace_client::WorkspaceApiClient;
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
-use crate::json_convert::{serde_to_tcb, tcb_to_serde};
 
 // =============================================================================
 // bundle_export —— 治理域带证据导出（闭环上游）
@@ -44,7 +43,7 @@ impl BundleExportTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for BundleExportTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let dataset_id = args
             .get("dataset_id")
             .and_then(|v| v.as_str())
@@ -89,7 +88,7 @@ impl ToolFunction for BundleExportTool {
             .export_bundle(dataset_id, version, verdict, subset, trim)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -110,7 +109,7 @@ impl BundleImportDryRunTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for BundleImportDryRunTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let bundle = args
             .get("bundle")
             .ok_or_else(|| "missing required parameter: bundle".to_string())?;
@@ -121,10 +120,10 @@ impl ToolFunction for BundleImportDryRunTool {
         }
         let result = self
             .client
-            .bundle_import_dry_run(&tcb_to_serde(bundle))
+            .bundle_import_dry_run(&bundle.clone())
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -145,7 +144,7 @@ impl BundleImportTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for BundleImportTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let bundle = args
             .get("bundle")
             .ok_or_else(|| "missing required parameter: bundle".to_string())?;
@@ -156,10 +155,10 @@ impl ToolFunction for BundleImportTool {
         }
         let result = self
             .client
-            .bundle_import(&tcb_to_serde(bundle))
+            .bundle_import(&bundle.clone())
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -180,13 +179,13 @@ impl BundleActiveListTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for BundleActiveListTool {
-    async fn call(&self, _args: &JsonValue) -> IoResult {
+    async fn call(&self, _args: &Value) -> IoResult {
         let result = self
             .client
             .bundle_active_list()
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -207,13 +206,13 @@ impl BundleImportsListTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for BundleImportsListTool {
-    async fn call(&self, _args: &JsonValue) -> IoResult {
+    async fn call(&self, _args: &Value) -> IoResult {
         let result = self
             .client
             .bundle_imports_list()
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -372,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn test_bundle_export_missing_dataset_id() {
         let tool = BundleExportTool::new(make_ws());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -383,11 +382,11 @@ mod tests {
     #[tokio::test]
     async fn test_bundle_export_invalid_verdict() {
         let tool = BundleExportTool::new(make_ws());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("dataset_id".to_string(), JsonValue::string("ds1"));
-        m.insert("version".to_string(), JsonValue::string("v1"));
-        m.insert("verdict".to_string(), JsonValue::string("maybe"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("dataset_id".to_string(), Value::from("ds1"));
+        m.insert("version".to_string(), Value::from("v1"));
+        m.insert("verdict".to_string(), Value::from("maybe"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("verdict must be"));
@@ -397,11 +396,11 @@ mod tests {
     async fn test_bundle_export_pass_without_traceable_subset_rejected() {
         // 前置形状校验：pass + 空 subset → 拒绝（与治理域 回归验证 B1 同口径）
         let tool = BundleExportTool::new(make_ws());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("dataset_id".to_string(), JsonValue::string("ds1"));
-        m.insert("version".to_string(), JsonValue::string("v1"));
-        m.insert("verdict".to_string(), JsonValue::string("pass"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("dataset_id".to_string(), Value::from("ds1"));
+        m.insert("version".to_string(), Value::from("v1"));
+        m.insert("verdict".to_string(), Value::from("pass"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -413,15 +412,15 @@ mod tests {
     async fn test_bundle_export_pass_with_bad_prefix_rejected() {
         // pass + subset 存在但前缀不是 sandbox:/human: → 拒绝
         let tool = BundleExportTool::new(make_ws());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("dataset_id".to_string(), JsonValue::string("ds1"));
-        m.insert("version".to_string(), JsonValue::string("v1"));
-        m.insert("verdict".to_string(), JsonValue::string("pass"));
+        let mut m = serde_json::Map::new();
+        m.insert("dataset_id".to_string(), Value::from("ds1"));
+        m.insert("version".to_string(), Value::from("v1"));
+        m.insert("verdict".to_string(), Value::from("pass"));
         m.insert(
             "subset".to_string(),
-            JsonValue::array(vec![JsonValue::string("opaque-ref")]),
+            Value::Array(vec![Value::from("opaque-ref")]),
         );
-        let args = JsonValue::object(m);
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -433,11 +432,11 @@ mod tests {
     async fn test_bundle_export_fail_without_subset_passes_shape_check() {
         // fail（显式未验证）无 subset 要求 → 通过本地形状校验，走到网络层失败
         let tool = BundleExportTool::new(make_ws());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("dataset_id".to_string(), JsonValue::string("ds1"));
-        m.insert("version".to_string(), JsonValue::string("v1"));
-        m.insert("verdict".to_string(), JsonValue::string("fail"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("dataset_id".to_string(), Value::from("ds1"));
+        m.insert("version".to_string(), Value::from("v1"));
+        m.insert("verdict".to_string(), Value::from("fail"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         let msg = result.unwrap_err();
@@ -448,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn test_bundle_import_missing_bundle() {
         let tool = BundleImportTool::new(make_ev());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -459,9 +458,9 @@ mod tests {
     #[tokio::test]
     async fn test_bundle_import_non_object_bundle_rejected() {
         let tool = BundleImportTool::new(make_ev());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("bundle".to_string(), JsonValue::string("not-an-object"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("bundle".to_string(), Value::from("not-an-object"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("bundle must be an object"));
@@ -470,7 +469,7 @@ mod tests {
     #[tokio::test]
     async fn test_bundle_import_dry_run_missing_bundle() {
         let tool = BundleImportDryRunTool::new(make_ev());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -481,9 +480,9 @@ mod tests {
     #[tokio::test]
     async fn test_bundle_import_dry_run_non_object_bundle_rejected() {
         let tool = BundleImportDryRunTool::new(make_ev());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("bundle".to_string(), JsonValue::Integer(42));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("bundle".to_string(), Value::from(42));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("bundle must be an object"));

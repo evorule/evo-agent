@@ -14,13 +14,12 @@
 
 use std::sync::Arc;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
-use crate::json_convert::serde_to_tcb;
 
 // =============================================================================
 // knowledge_datasets —— 数据集清单
@@ -39,13 +38,13 @@ impl KnowledgeDatasetsTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for KnowledgeDatasetsTool {
-    async fn call(&self, _args: &JsonValue) -> IoResult {
+    async fn call(&self, _args: &Value) -> IoResult {
         let result = self
             .client
             .knowledge_datasets()
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -66,7 +65,7 @@ impl KnowledgeSearchTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for KnowledgeSearchTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let dataset = args
             .get("dataset")
             .and_then(|v| v.as_str())
@@ -79,7 +78,7 @@ impl ToolFunction for KnowledgeSearchTool {
             .knowledge_entries(dataset, q, domain, tags)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -100,7 +99,7 @@ impl KnowledgeEntryGetTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for KnowledgeEntryGetTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let dataset = args
             .get("dataset")
             .and_then(|v| v.as_str())
@@ -114,7 +113,7 @@ impl ToolFunction for KnowledgeEntryGetTool {
             .knowledge_entry(dataset, entry_id)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -229,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn test_knowledge_search_missing_dataset() {
         let tool = KnowledgeSearchTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -240,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn test_knowledge_entry_get_missing_dataset() {
         let tool = KnowledgeEntryGetTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -251,9 +250,9 @@ mod tests {
     #[tokio::test]
     async fn test_knowledge_entry_get_missing_entry_id() {
         let tool = KnowledgeEntryGetTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("dataset".to_string(), JsonValue::string("ds1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("dataset".to_string(), Value::from("ds1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result

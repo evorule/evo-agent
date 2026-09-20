@@ -3,14 +3,14 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! I/O Handler trait
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 /// I/O operation result type
-pub type IoResult = Result<JsonValue, String>;
+pub type IoResult = Result<Value, String>;
 
 /// I/O Handler trait -- defines I/O execution interface
 #[async_trait::async_trait]
 pub trait IoHandler: Send + Sync {
     /// Execute I/O operation
-    async fn execute(&self, params: &JsonValue) -> IoResult;
+    async fn execute(&self, params: &Value) -> IoResult;
 }
