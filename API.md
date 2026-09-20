@@ -268,7 +268,7 @@ event: tool_result
 data: {"name": "file_read", "result": {"content": "[package]\nname = evo-agent..."}}
 
 event: done
-data: {"success": true, "content": "...", "steps": 3, "duration_ms": 1523}
+data: {"success": true, "content": "...", "steps": 3, "duration_ms": 1523, "cancelled": false, "tool_calls": [], "error": null}
 ```
 
 ### 4.3 取消 Agent 执行
@@ -578,9 +578,14 @@ GET /api/sessions/{id}/ws?agent_type={type}&token={token}
   "success": true,
   "content": "当前目录包含...",
   "steps": 3,
-  "duration_ms": 1523
+  "duration_ms": 1523,
+  "cancelled": false,
+  "tool_calls": [],
+  "error": null
 }
 ```
+
+`cancelled` 字段恒在下发（`AgentResult` 直接序列化）：`true` 表示该轮被用户中断收敛（interrupt 后已执行的步数照常计入 `steps`），`false` 为正常完成或执行失败（失败时 `success=false`）。
 
 #### 错误
 
@@ -891,9 +896,11 @@ POST /api/shared/facts/rollup
 常见错误消息：
 - `"agent '{type}' not found"` — Agent 类型不存在
 - `"a turn is already active; send interrupt first"` — 轮次并发冲突
-- `"no active turn to interrupt"` — 无活跃轮次可中断
 - `"cannot rewind during active turn; send interrupt first"` — 轮次中不能回滚
 - `"LLM 调用失败: connection timeout"` — LLM 网络超时
+- `"no session to rewind"` — 会话不存在无可回滚
+
+注意：`"no active turn to interrupt"`（无活跃轮次可中断）**不是 Error**——无活跃轮次时发送 `interrupt`，服务端以 **Info 帧** `{"type":"Info","message":"no active turn to interrupt"}` 回应，连接与后续轮次不受影响。
 
 ---
 
