@@ -19,7 +19,7 @@ use evo_agent::api::evorule_client::EvoruleApiClient;
 use evo_agent::io_handler::IoResult;
 use evo_agent::io_handlers::tool_handler::ToolFunction;
 use evo_agent::io_handlers::LlmHandler;
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 use mockito::Server;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -485,9 +485,9 @@ struct RecordingTool {
 }
 #[async_trait::async_trait]
 impl ToolFunction for RecordingTool {
-    async fn call(&self, _args: &JsonValue) -> IoResult {
+    async fn call(&self, _args: &Value) -> IoResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(JsonValue::string(self.result))
+        Ok(Value::from(self.result))
     }
 }
 
@@ -740,13 +740,13 @@ struct ProposalTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for ProposalTool {
-    async fn call(&self, _args: &JsonValue) -> IoResult {
+    async fn call(&self, _args: &Value) -> IoResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(JsonValue::object_from_pairs(&[
-            ("status", JsonValue::string("needs_approval")),
-            ("command", JsonValue::string("rm -rf /tmp/x")),
-            ("risk", JsonValue::string("high")),
-        ]))
+        Ok(serde_json::json!({
+            "status": "needs_approval",
+            "command": "rm -rf /tmp/x",
+            "risk": "high",
+        }))
     }
 }
 
@@ -757,22 +757,22 @@ struct ApprovalAwareTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for ApprovalAwareTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        // 结构化检查而非字符串匹配:JsonValue::Display 是非紧凑格式(": " 带空格),
-        // contains("\"approved\":true") 永远失配
+        // 结构化检查而非字符串匹配:serde_json::Value::Display 是紧凑格式,
+        // contains("\"approved\":true") 也可能命中,故用 get+as_bool 结构化取值
         let approved = args
             .get("approved")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if approved {
-            Ok(JsonValue::string("EXECUTED_AFTER_APPROVAL"))
+            Ok(Value::from("EXECUTED_AFTER_APPROVAL"))
         } else {
-            Ok(JsonValue::object_from_pairs(&[
-                ("status", JsonValue::string("needs_approval")),
-                ("command", JsonValue::string("rm -rf /tmp/y")),
-                ("risk", JsonValue::string("high")),
-            ]))
+            Ok(serde_json::json!({
+                "status": "needs_approval",
+                "command": "rm -rf /tmp/y",
+                "risk": "high",
+            }))
         }
     }
 }

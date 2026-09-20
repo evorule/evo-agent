@@ -6,14 +6,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 use tokio::sync::RwLock;
 
 #[async_trait]
 /// TODO: doc
 pub trait ToolFunction: Send + Sync + 'static {
     /// TODO: doc
-    async fn call(&self, args: &JsonValue) -> Result<JsonValue, String>;
+    async fn call(&self, args: &Value) -> Result<Value, String>;
 }
 
 /// Tool spec
@@ -137,49 +137,49 @@ impl ToolRegistry {
     }
 
     /// Convert to OpenAI tool schema format
-    pub async fn to_openai_schema(&self) -> Vec<JsonValue> {
+    pub async fn to_openai_schema(&self) -> Vec<Value> {
         let mut schema = Vec::new();
         for spec in self.list_tools().await {
-            let mut params = BTreeMap::new();
+            let mut params = serde_json::Map::new();
             let mut required = Vec::new();
 
             for param in &spec.parameters {
-                let mut param_schema = BTreeMap::new();
-                param_schema.insert("type".to_string(), JsonValue::string(param.r#type.clone()));
+                let mut param_schema = serde_json::Map::new();
+                param_schema.insert("type".to_string(), Value::from(param.r#type.clone()));
                 param_schema.insert(
                     "description".to_string(),
-                    JsonValue::string(param.description.clone()),
+                    Value::from(param.description.clone()),
                 );
-                params.insert(param.name.clone(), JsonValue::Object(param_schema));
+                params.insert(param.name.clone(), Value::Object(param_schema));
 
                 if param.required {
                     required.push(param.name.clone());
                 }
             }
 
-            let mut tool = BTreeMap::new();
-            tool.insert("type".to_string(), JsonValue::string("function"));
+            let mut tool = serde_json::Map::new();
+            tool.insert("type".to_string(), Value::from("function"));
             tool.insert(
                 "function".to_string(),
-                JsonValue::Object({
-                    let mut func = BTreeMap::new();
-                    func.insert("name".to_string(), JsonValue::string(spec.name));
+                Value::Object({
+                    let mut func = serde_json::Map::new();
+                    func.insert("name".to_string(), Value::from(spec.name));
                     func.insert(
                         "description".to_string(),
-                        JsonValue::string(spec.description),
+                        Value::from(spec.description),
                     );
-                    func.insert("parameters".to_string(), JsonValue::Object(params));
+                    func.insert("parameters".to_string(), Value::Object(params));
                     if !required.is_empty() {
                         func.insert(
                             "required".to_string(),
-                            JsonValue::Array(required.into_iter().map(JsonValue::string).collect()),
+                            Value::Array(required.into_iter().map(Value::String).collect()),
                         );
                     }
                     func
                 }),
             );
 
-            schema.push(JsonValue::Object(tool));
+            schema.push(Value::Object(tool));
         }
         schema
     }
@@ -193,7 +193,7 @@ mod tests {
 
     #[async_trait]
     impl ToolFunction for EchoTool {
-        async fn call(&self, args: &JsonValue) -> Result<JsonValue, String> {
+        async fn call(&self, args: &Value) -> Result<Value, String> {
             Ok(args.clone())
         }
     }
@@ -339,7 +339,7 @@ mod tests {
             .await;
 
         let func = registry.get("echo").await.unwrap();
-        let args = JsonValue::object_from_pairs(&[("text", JsonValue::string("hello"))]);
+        let args = serde_json::json!({"text": "hello"});
         let result = func.call(&args).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), args);

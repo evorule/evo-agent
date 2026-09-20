@@ -12,7 +12,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -90,7 +90,7 @@ impl FileReadTool {
 #[async_trait::async_trait]
 impl ToolFunction for FileReadTool {
     /// G13:async 入口 — 用 spawn_blocking 包装同步 fs 操作
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let tool = self.clone();
         let args = args.clone();
         tokio::task::spawn_blocking(move || tool.call_sync(&args))
@@ -101,7 +101,7 @@ impl ToolFunction for FileReadTool {
 
 impl FileReadTool {
     /// 同步实现(供 spawn_blocking 调用)
-    fn call_sync(&self, args: &JsonValue) -> IoResult {
+    fn call_sync(&self, args: &Value) -> IoResult {
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -126,17 +126,17 @@ impl FileReadTool {
         let content = std::fs::read_to_string(&safe_path)
             .map_err(|e| format!("read failed (binary or permission?): {}", e))?;
 
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = serde_json::Map::new();
         map.insert(
             "path".to_string(),
-            JsonValue::string(safe_path.display().to_string()),
+            Value::from(safe_path.display().to_string()),
         );
         map.insert(
             "size".to_string(),
-            JsonValue::Integer(metadata.len() as i64),
+            Value::from(metadata.len() as i64),
         );
-        map.insert("content".to_string(), JsonValue::string(content));
-        Ok(JsonValue::object(map))
+        map.insert("content".to_string(), Value::from(content));
+        Ok(Value::Object(map))
     }
 }
 
@@ -162,9 +162,9 @@ mod tests {
         std::fs::write(&file, b"hello, world").unwrap();
 
         let tool = make_tool(dir.path());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("hello.txt"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("hello.txt"));
             m
         }));
         assert!(result.is_ok());
@@ -183,9 +183,9 @@ mod tests {
         } else {
             "/etc/passwd"
         };
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string(abs));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from(abs));
             m
         }));
         assert!(result.is_err());
@@ -197,9 +197,9 @@ mod tests {
     fn test_reject_parent_dir_traversal() {
         let dir = temp_workdir();
         let tool = make_tool(dir.path());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("../etc/passwd"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("../etc/passwd"));
             m
         }));
         assert!(result.is_err());
@@ -232,9 +232,9 @@ mod tests {
         }
 
         let tool = make_tool(dir.path());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("link.txt"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("link.txt"));
             m
         }));
         assert!(result.is_err(), "symlink escape should be rejected");
@@ -244,7 +244,7 @@ mod tests {
     fn test_missing_path_arg() {
         let dir = temp_workdir();
         let tool = make_tool(dir.path());
-        let result = tool.call_sync(&JsonValue::object(std::collections::BTreeMap::new()));
+        let result = tool.call_sync(&Value::Object(serde_json::Map::new()));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing required arg"));
     }
@@ -253,9 +253,9 @@ mod tests {
     fn test_reject_nonexistent() {
         let dir = temp_workdir();
         let tool = make_tool(dir.path());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("does_not_exist.txt"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("does_not_exist.txt"));
             m
         }));
         assert!(result.is_err());
@@ -271,9 +271,9 @@ mod tests {
         drop(f);
 
         let tool = make_tool(dir.path()).with_max_bytes(1024 * 1024); // 1 MB limit
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("big.txt"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("big.txt"));
             m
         }));
         assert!(result.is_err());
@@ -288,9 +288,9 @@ mod tests {
         std::fs::create_dir(&subdir).unwrap();
 
         let tool = make_tool(dir.path());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("subdir"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("subdir"));
             m
         }));
         assert!(result.is_err());

@@ -35,7 +35,7 @@
 //! 由 [`AgentRunner::with_delegate_context`](crate::agent::runner::AgentRunner::with_delegate_context)
 //! 自动注册:设置 `delegate_context` 时,同步把 `DelegateTool` 注册进 `tool_handler`。
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::agent::delegate::DelegateContext;
 use crate::io_handler::IoResult;
@@ -72,7 +72,7 @@ impl DelegateTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for DelegateTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let agent_type = args
             .get("agent_type")
             .and_then(|v| v.as_str())
@@ -92,14 +92,14 @@ impl ToolFunction for DelegateTool {
         let result = self.ctx.delegate(agent_type, task).await;
         match result {
             Ok(content) => {
-                let mut map = std::collections::BTreeMap::new();
-                map.insert("status".to_string(), JsonValue::string("ok"));
+                let mut map = serde_json::Map::new();
+                map.insert("status".to_string(), Value::from("ok"));
                 map.insert(
                     "agent_type".to_string(),
-                    JsonValue::string(agent_type.to_string()),
+                    Value::from(agent_type.to_string()),
                 );
-                map.insert("content".to_string(), JsonValue::string(content));
-                Ok(JsonValue::object(map))
+                map.insert("content".to_string(), Value::from(content));
+                Ok(Value::Object(map))
             }
             Err(e) => Err(format!("delegate to '{}' failed: {}", agent_type, e)),
         }
@@ -154,9 +154,9 @@ mod tests {
     #[tokio::test]
     async fn test_delegate_tool_missing_agent_type() {
         let tool = DelegateTool::new(make_ctx());
-        let args = JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("task".to_string(), JsonValue::string("do thing"));
+        let args = Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("task".to_string(), Value::from("do thing"));
             m
         });
         let result = tool.call(&args).await;
@@ -167,9 +167,9 @@ mod tests {
     #[tokio::test]
     async fn test_delegate_tool_missing_task() {
         let tool = DelegateTool::new(make_ctx());
-        let args = JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("agent_type".to_string(), JsonValue::string("researcher"));
+        let args = Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("agent_type".to_string(), Value::from("researcher"));
             m
         });
         let result = tool.call(&args).await;
@@ -182,10 +182,10 @@ mod tests {
         // max_depth=0 → 任何 delegate 都超限,无需实际 evorule 调用
         let ctx = make_ctx().with_max_depth(0);
         let tool = DelegateTool::new(ctx);
-        let args = JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("agent_type".to_string(), JsonValue::string("researcher"));
-            m.insert("task".to_string(), JsonValue::string("anything"));
+        let args = Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("agent_type".to_string(), Value::from("researcher"));
+            m.insert("task".to_string(), Value::from("anything"));
             m
         });
         let result = tool.call(&args).await;

@@ -48,7 +48,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -383,64 +383,64 @@ impl ShellExecTool {
             &output.stderr
         };
 
-        let mut map = std::collections::BTreeMap::new();
-        map.insert("status".to_string(), JsonValue::string("ok"));
+        let mut map = serde_json::Map::new();
+        map.insert("status".to_string(), Value::from("ok"));
         map.insert(
             "command".to_string(),
-            JsonValue::string(original_cmd.to_string()),
+            Value::from(original_cmd.to_string()),
         );
         map.insert(
             "program".to_string(),
-            JsonValue::string(program.to_string()),
+            Value::from(program.to_string()),
         );
         map.insert(
             "exit_code".to_string(),
-            JsonValue::Integer(output.status.code().unwrap_or(-1) as i64),
+            Value::from(output.status.code().unwrap_or(-1) as i64),
         );
         map.insert(
             "stdout".to_string(),
-            JsonValue::string(String::from_utf8_lossy(stdout_bytes).to_string()),
+            Value::from(String::from_utf8_lossy(stdout_bytes).to_string()),
         );
         map.insert(
             "stderr".to_string(),
-            JsonValue::string(String::from_utf8_lossy(stderr_bytes).to_string()),
+            Value::from(String::from_utf8_lossy(stderr_bytes).to_string()),
         );
         map.insert(
             "stdout_truncated".to_string(),
-            JsonValue::Bool(output.stdout.len() > self.max_output_bytes),
+            Value::Bool(output.stdout.len() > self.max_output_bytes),
         );
-        Ok(JsonValue::object(map))
+        Ok(Value::Object(map))
     }
 
     /// 构造一个 proposal(给 agent/CLI 用于问用户)
     fn make_proposal(program: &str, original_cmd: &str, candidate: CandidateCommand) -> IoResult {
-        let mut map = std::collections::BTreeMap::new();
-        map.insert("status".to_string(), JsonValue::string("needs_approval"));
+        let mut map = serde_json::Map::new();
+        map.insert("status".to_string(), Value::from("needs_approval"));
         map.insert(
             "command".to_string(),
-            JsonValue::string(original_cmd.to_string()),
+            Value::from(original_cmd.to_string()),
         );
         map.insert(
             "program".to_string(),
-            JsonValue::string(program.to_string()),
+            Value::from(program.to_string()),
         );
-        map.insert("category".to_string(), JsonValue::string("candidate"));
+        map.insert("category".to_string(), Value::from("candidate"));
         map.insert(
             "description".to_string(),
-            JsonValue::string(candidate.description),
+            Value::from(candidate.description),
         );
-        map.insert("risk".to_string(), JsonValue::string(candidate.risk));
+        map.insert("risk".to_string(), Value::from(candidate.risk));
         map.insert(
             "alternative".to_string(),
-            JsonValue::string(candidate.alternative),
+            Value::from(candidate.alternative),
         );
         map.insert(
             "instructions".to_string(),
-            JsonValue::string(
+            Value::from(
                 "Ask the user. If approved, call with approved=true (or use --yes flag in CLI).",
             ),
         );
-        Ok(JsonValue::object(map))
+        Ok(Value::Object(map))
     }
 }
 
@@ -453,7 +453,7 @@ impl Default for ShellExecTool {
 #[async_trait::async_trait]
 impl ToolFunction for ShellExecTool {
     /// G13:async 入口 — 用 spawn_blocking 包装同步 std::process::Command 操作
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let tool = self.clone();
         let args = args.clone();
         tokio::task::spawn_blocking(move || tool.call_sync(&args))
@@ -464,7 +464,7 @@ impl ToolFunction for ShellExecTool {
 
 impl ShellExecTool {
     /// 同步实现(供 spawn_blocking 调用)
-    fn call_sync(&self, args: &JsonValue) -> IoResult {
+    fn call_sync(&self, args: &Value) -> IoResult {
         let cmd_str = args
             .get("command")
             .and_then(|v| v.as_str())
@@ -525,14 +525,14 @@ impl ShellExecTool {
 mod tests {
     use super::*;
 
-    fn arg_with(command: &str, approved: bool) -> JsonValue {
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("command".to_string(), JsonValue::string(command));
-        m.insert("approved".to_string(), JsonValue::Bool(approved));
-        JsonValue::object(m)
+    fn arg_with(command: &str, approved: bool) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("command".to_string(), Value::from(command));
+        m.insert("approved".to_string(), Value::Bool(approved));
+        Value::Object(m)
     }
 
-    fn arg(command: &str) -> JsonValue {
+    fn arg(command: &str) -> Value {
         arg_with(command, false)
     }
 
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn test_missing_command_arg() {
         let tool = ShellExecTool::new();
-        let result = tool.call_sync(&JsonValue::object(std::collections::BTreeMap::new()));
+        let result = tool.call_sync(&Value::Object(serde_json::Map::new()));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing required arg"));
     }

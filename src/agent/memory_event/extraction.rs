@@ -29,7 +29,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::io_handler::IoHandler;
 use crate::io_handlers::LlmHandler;
-use crate::json_convert::serde_to_tcb;
 
 use super::event::{Emotion, EventSource, EventType, MemoryEvent};
 
@@ -292,7 +291,7 @@ impl EventExtractor {
             serde_json::Value::Array(messages_vec),
         );
         let params_json = serde_json::Value::Object(params_map);
-        let params = serde_to_tcb(&params_json);
+        let params = params_json.clone();
 
         let result = self.llm.execute(&params).await?;
 

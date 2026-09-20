@@ -6,13 +6,12 @@
 
 use std::sync::Arc;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::api::workspace_client::{StartSandboxRequest, WorkspaceApiClient};
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
-use crate::json_convert::serde_to_tcb;
 
 // =============================================================================
 // sandbox_start —— 启动沙盒测试
@@ -31,7 +30,7 @@ impl SandboxStartTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for SandboxStartTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -67,7 +66,7 @@ impl ToolFunction for SandboxStartTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -88,7 +87,7 @@ impl SandboxListTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for SandboxListTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -103,7 +102,7 @@ impl ToolFunction for SandboxListTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -124,7 +123,7 @@ impl SandboxGetTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for SandboxGetTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -143,7 +142,7 @@ impl ToolFunction for SandboxGetTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -164,7 +163,7 @@ impl SandboxCloseTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for SandboxCloseTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -182,7 +181,7 @@ impl ToolFunction for SandboxCloseTool {
             .close_sandbox(workspace_id, sandbox_id, closed_by)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -203,7 +202,7 @@ impl SandboxReportTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for SandboxReportTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -218,7 +217,7 @@ impl ToolFunction for SandboxReportTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -404,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn test_sandbox_start_missing_workspace_id() {
         let tool = SandboxStartTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -415,9 +414,9 @@ mod tests {
     #[tokio::test]
     async fn test_sandbox_start_missing_rule_version_ids() {
         let tool = SandboxStartTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -428,10 +427,10 @@ mod tests {
     #[tokio::test]
     async fn test_sandbox_start_missing_test_dataset_id() {
         let tool = SandboxStartTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        m.insert("rule_version_ids".to_string(), JsonValue::array(vec![]));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        m.insert("rule_version_ids".to_string(), Value::Array(vec![]));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -442,9 +441,9 @@ mod tests {
     #[tokio::test]
     async fn test_sandbox_get_missing_sandbox_id() {
         let tool = SandboxGetTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -455,10 +454,10 @@ mod tests {
     #[tokio::test]
     async fn test_sandbox_close_missing_closed_by() {
         let tool = SandboxCloseTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        m.insert("sandbox_id".to_string(), JsonValue::Integer(1));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        m.insert("sandbox_id".to_string(), Value::from(1));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -469,9 +468,9 @@ mod tests {
     #[tokio::test]
     async fn test_sandbox_report_missing_sandbox_id() {
         let tool = SandboxReportTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -482,9 +481,9 @@ mod tests {
     #[tokio::test]
     async fn test_sandbox_list_missing_requester() {
         let tool = SandboxListTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result

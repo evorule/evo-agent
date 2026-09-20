@@ -6,13 +6,12 @@
 
 use std::sync::Arc;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::api::workspace_client::WorkspaceApiClient;
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
-use crate::json_convert::serde_to_tcb;
 
 // =============================================================================
 // prod_state —— 查询当前生产状态
@@ -31,14 +30,14 @@ impl ProdStateTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for ProdStateTool {
-    async fn call(&self, _args: &JsonValue) -> IoResult {
+    async fn call(&self, _args: &Value) -> IoResult {
         let result = self
             .client
             .get_production_state()
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -59,7 +58,7 @@ impl ProdAuditTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for ProdAuditTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let limit = args.get("limit").and_then(|v| v.as_i64());
         let result = self
             .client
@@ -67,7 +66,7 @@ impl ToolFunction for ProdAuditTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -127,7 +126,7 @@ mod tests {
     async fn test_prod_state_no_args_is_network_error() {
         // prod_state 无参数；空 args 不应触发 missing-parameter，而是网络连接错误。
         let tool = ProdStateTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(!result.unwrap_err().contains("missing required parameter"));
@@ -137,7 +136,7 @@ mod tests {
     async fn test_prod_audit_no_args_is_network_error() {
         // prod_audit 的 limit 是可选；空 args 不应触发 missing-parameter。
         let tool = ProdAuditTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(!result.unwrap_err().contains("missing required parameter"));

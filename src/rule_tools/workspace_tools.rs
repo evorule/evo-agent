@@ -6,13 +6,12 @@
 
 use std::sync::Arc;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::api::workspace_client::{CreateWorkspaceRequest, WorkspaceApiClient};
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
-use crate::json_convert::serde_to_tcb;
 
 // =============================================================================
 // ws_list —— 列出 workspace（可按 owner 过滤）
@@ -31,7 +30,7 @@ impl WsListTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for WsListTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let owner_id = args.get("owner_id").and_then(|v| v.as_str());
         let result = self
             .client
@@ -39,7 +38,7 @@ impl ToolFunction for WsListTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -60,7 +59,7 @@ impl WsCreateTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for WsCreateTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let name = args
             .get("name")
             .and_then(|v| v.as_str())
@@ -84,7 +83,7 @@ impl ToolFunction for WsCreateTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -161,7 +160,7 @@ mod tests {
     #[tokio::test]
     async fn test_ws_create_missing_name() {
         let tool = WsCreateTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -172,9 +171,9 @@ mod tests {
     #[tokio::test]
     async fn test_ws_create_missing_owner_id() {
         let tool = WsCreateTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("name".to_string(), JsonValue::string("ws"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("name".to_string(), Value::from("ws"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result

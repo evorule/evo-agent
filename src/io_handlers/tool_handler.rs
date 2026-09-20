@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 use tracing::debug;
 
 use crate::io_handler::{IoHandler, IoResult};
@@ -26,9 +26,9 @@ pub trait ToolFunction: Send + Sync {
     /// - `args`:工具参数(JSON)
     ///
     /// # 返回
-    /// - `Ok(JsonValue)`:工具执行结果
+    /// - `Ok(Value)`:工具执行结果
     /// - `Err(String)`:错误描述
-    async fn call(&self, args: &JsonValue) -> IoResult;
+    async fn call(&self, args: &Value) -> IoResult;
 }
 
 const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -90,7 +90,7 @@ impl ToolHandler {
     /// 供 runner 的并行执行路径(`execute_single_tool`)直接调用,
     /// 跳过 `params.get("tool_name")` 解包步骤。
     /// 包含 60s 超时(同 `IoHandler::execute`)。
-    pub async fn execute_by_name(&self, tool_name: &str, args: &JsonValue) -> IoResult {
+    pub async fn execute_by_name(&self, tool_name: &str, args: &Value) -> IoResult {
         let func = self
             .tools
             .get(tool_name)
@@ -118,13 +118,13 @@ impl Default for ToolHandler {
 #[async_trait::async_trait]
 impl IoHandler for ToolHandler {
     /// Execute tool invocation
-    async fn execute(&self, params: &JsonValue) -> IoResult {
+    async fn execute(&self, params: &Value) -> IoResult {
         let tool_name = params
             .get("tool_name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required param: tool_name".to_string())?;
 
-        let args = params.get("args").cloned().unwrap_or(JsonValue::Null);
+        let args = params.get("args").cloned().unwrap_or(Value::Null);
 
         self.execute_by_name(tool_name, &args).await
     }
@@ -138,8 +138,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolFunction for EchoTool {
-        async fn call(&self, _args: &JsonValue) -> IoResult {
-            Ok(JsonValue::string("result"))
+        async fn call(&self, _args: &Value) -> IoResult {
+            Ok(Value::from("result"))
         }
     }
 
@@ -161,7 +161,7 @@ mod tests {
     async fn test_tool_handler_execute_by_name() {
         let mut handler = ToolHandler::new();
         handler.register_tool("echo", Arc::new(EchoTool));
-        let result = handler.execute_by_name("echo", &JsonValue::Null).await;
+        let result = handler.execute_by_name("echo", &Value::Null).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().to_string(), "\"result\"");
     }
@@ -170,7 +170,7 @@ mod tests {
     async fn test_tool_handler_execute_not_found() {
         let handler = ToolHandler::new();
         let result = handler
-            .execute_by_name("nonexistent", &JsonValue::Null)
+            .execute_by_name("nonexistent", &Value::Null)
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("tool not found"));
@@ -181,8 +181,8 @@ mod tests {
         // 通过 IoHandler::execute 路径(params 含 tool_name + args)
         let mut handler = ToolHandler::new();
         handler.register_tool("echo", Arc::new(EchoTool));
-        let params = JsonValue::object(
-            std::iter::once(("tool_name".to_string(), JsonValue::string("echo"))).collect(),
+        let params = Value::Object(
+            std::iter::once(("tool_name".to_string(), Value::from("echo"))).collect(),
         );
         let result = handler.execute(&params).await;
         assert!(result.is_ok());

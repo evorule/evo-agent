@@ -13,7 +13,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -71,7 +71,7 @@ impl FileListTool {
 #[async_trait::async_trait]
 impl ToolFunction for FileListTool {
     /// G13:async 入口 — 用 spawn_blocking 包装同步 fs 操作
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let tool = self.clone();
         let args = args.clone();
         tokio::task::spawn_blocking(move || tool.call_sync(&args))
@@ -82,7 +82,7 @@ impl ToolFunction for FileListTool {
 
 impl FileListTool {
     /// 同步实现(供 spawn_blocking 调用)
-    fn call_sync(&self, args: &JsonValue) -> IoResult {
+    fn call_sync(&self, args: &Value) -> IoResult {
         let dir = args.get("dir").and_then(|v| v.as_str()).unwrap_or(".");
 
         let include_hidden = args
@@ -105,7 +105,7 @@ impl FileListTool {
         let entries =
             std::fs::read_dir(&safe_dir).map_err(|e| format!("read_dir failed: {}", e))?;
 
-        let mut items: Vec<JsonValue> = Vec::new();
+        let mut items: Vec<Value> = Vec::new();
         let mut total_seen = 0;
         for entry in entries.flatten() {
             total_seen += 1;
@@ -135,13 +135,13 @@ impl FileListTool {
             };
             let size = entry.metadata().ok().map(|m| m.len() as i64);
 
-            let mut item = std::collections::BTreeMap::new();
-            item.insert("name".to_string(), JsonValue::string(name));
-            item.insert("kind".to_string(), JsonValue::string(kind.to_string()));
+            let mut item = serde_json::Map::new();
+            item.insert("name".to_string(), Value::from(name));
+            item.insert("kind".to_string(), Value::from(kind.to_string()));
             if let Some(s) = size {
-                item.insert("size".to_string(), JsonValue::Integer(s));
+                item.insert("size".to_string(), Value::from(s));
             }
-            items.push(JsonValue::object(item));
+            items.push(Value::Object(item));
         }
 
         // 排序(按名字)
@@ -152,16 +152,16 @@ impl FileListTool {
         });
 
         let truncated = total_seen > items.len();
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = serde_json::Map::new();
         map.insert(
             "dir".to_string(),
-            JsonValue::string(safe_dir.display().to_string()),
+            Value::from(safe_dir.display().to_string()),
         );
-        map.insert("count".to_string(), JsonValue::Integer(items.len() as i64));
-        map.insert("truncated".to_string(), JsonValue::Bool(truncated));
-        map.insert("entries".to_string(), JsonValue::array(items));
+        map.insert("count".to_string(), Value::from(items.len() as i64));
+        map.insert("truncated".to_string(), Value::Bool(truncated));
+        map.insert("entries".to_string(), Value::Array(items));
 
-        Ok(JsonValue::object(map))
+        Ok(Value::Object(map))
     }
 }
 
@@ -173,9 +173,9 @@ mod tests {
     fn test_reject_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
         let tool = FileListTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("dir".to_string(), JsonValue::string("C:\\Windows"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("dir".to_string(), Value::from("C:\\Windows"));
             m
         }));
         assert!(result.is_err());
@@ -185,9 +185,9 @@ mod tests {
     fn test_reject_parent_dir() {
         let dir = tempfile::tempdir().unwrap();
         let tool = FileListTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("dir".to_string(), JsonValue::string("../etc"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("dir".to_string(), Value::from("../etc"));
             m
         }));
         assert!(result.is_err());
@@ -201,7 +201,7 @@ mod tests {
 
         let tool = FileListTool::new(dir.path().to_path_buf());
         let result = tool
-            .call_sync(&JsonValue::object(Default::default()))
+            .call_sync(&Value::Object(Default::default()))
             .unwrap();
         let entries = result.get("entries").unwrap();
         let count = entries.as_array().map(|a| a.len()).unwrap_or(0);
@@ -216,9 +216,9 @@ mod tests {
 
         let tool = FileListTool::new(dir.path().to_path_buf());
         let result = tool
-            .call_sync(&JsonValue::object({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("include_hidden".to_string(), JsonValue::Bool(true));
+            .call_sync(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert("include_hidden".to_string(), Value::Bool(true));
                 m
             }))
             .unwrap();
@@ -234,7 +234,7 @@ mod tests {
 
         let tool = FileListTool::new(dir.path().to_path_buf());
         let result = tool
-            .call_sync(&JsonValue::object(Default::default()))
+            .call_sync(&Value::Object(Default::default()))
             .unwrap();
         let entries = result.get("entries").unwrap().as_array().unwrap();
         let mut by_name: std::collections::HashMap<String, String> = Default::default();
@@ -251,9 +251,9 @@ mod tests {
     fn test_list_nonexistent_dir() {
         let dir = tempfile::tempdir().unwrap();
         let tool = FileListTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("dir".to_string(), JsonValue::string("does_not_exist"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("dir".to_string(), Value::from("does_not_exist"));
             m
         }));
         assert!(result.is_err());
@@ -267,7 +267,7 @@ mod tests {
         }
         let tool = FileListTool::new(dir.path().to_path_buf()).with_max_entries(3);
         let result = tool
-            .call_sync(&JsonValue::object(Default::default()))
+            .call_sync(&Value::Object(Default::default()))
             .unwrap();
         let count = result.get("count").unwrap().as_i64().unwrap();
         let truncated = result.get("truncated").unwrap().as_bool().unwrap();

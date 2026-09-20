@@ -20,7 +20,7 @@
 //! - [`io_handler::IoHandler`] —— IO 执行器 trait（AuditedLlm 签名依赖）
 //! - [`config`] —— 配置加载（`LlmHandler::from_config` 构造契约）
 //!
-//! 其余模块（builtin_tools / mcp / rule_tools / io_dispatcher / json_convert /
+//! 其余模块（builtin_tools / mcp / rule_tools / io_dispatcher /
 //! metrics）标注 `#[doc(hidden)]`：技术上仍可访问（真收窄留待 0.2.0），
 //! 但不在兼容承诺范围内，依赖它们的风险自负。
 
@@ -33,8 +33,6 @@ pub mod config;
 pub mod io_dispatcher;
 pub mod io_handler;
 pub mod io_handlers;
-#[doc(hidden)]
-pub mod json_convert;
 #[doc(hidden)]
 pub mod mcp;
 #[doc(hidden)]

@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use crate::api::evorule_client::FactLogEntry;
 use crate::io_handler::IoHandler;
 use crate::io_handlers::LlmHandler;
-use crate::json_convert::serde_to_tcb;
 
 use super::event::MemoryEvent;
 use super::evidence::NarrativeWithEvidence;
@@ -249,7 +248,7 @@ impl ReplayEngine {
             serde_json::Value::Array(messages_vec),
         );
         let params_json = serde_json::Value::Object(params_map);
-        let params = serde_to_tcb(&params_json);
+        let params = params_json.clone();
 
         let result = llm.execute(&params).await.map_err(|e| e.to_string())?;
 

@@ -192,7 +192,7 @@ async fn run_llm_op(op: &Operation, req: &LlmOpRequest, model: &str) -> Result<V
         "prompt": user_prompt,
         "temperature": 0.2,
     });
-    let tcb_params = crate::json_convert::serde_to_tcb(&params);
+    let tcb_params = params.clone();
 
     let io = llm
         .execute(&tcb_params)
@@ -209,9 +209,9 @@ async fn run_llm_op(op: &Operation, req: &LlmOpRequest, model: &str) -> Result<V
         .ok_or_else(|| LlmOpsError::OutputParse("输出结构不符合预期".to_string()))
 }
 
-/// 从 `IoResult`（JsonValue 包装的 LlmResponse JSON）提取 `content` 字符串。
-fn io_to_content(io: &evorule_tcb::JsonValue) -> Option<String> {
-    let serde_val = crate::json_convert::tcb_to_serde(io);
+/// 从 `IoResult`（Value 包装的 LlmResponse JSON）提取 `content` 字符串。
+fn io_to_content(io: &serde_json::Value) -> Option<String> {
+    let serde_val = io.clone();
     serde_val
         .get("content")
         .and_then(|c| c.as_str())
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn test_io_to_content() {
         let payload = json!({"content": "hello", "finish_reason": "stop"});
-        let tcb = crate::json_convert::serde_to_tcb(&payload);
+        let tcb = payload.clone();
         assert_eq!(io_to_content(&tcb).as_deref(), Some("hello"));
     }
 }

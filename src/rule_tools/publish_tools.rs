@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::api::workspace_client::{
     ReviewPublishRequest, RollbackRequest, SubmitPublishRequest, WorkspaceApiClient,
@@ -14,7 +14,6 @@ use crate::api::workspace_client::{
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
-use crate::json_convert::serde_to_tcb;
 
 // =============================================================================
 // publish_submit —— 提交到发布队列（DepartmentHead 权限）
@@ -33,7 +32,7 @@ impl PublishSubmitTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for PublishSubmitTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -71,7 +70,7 @@ impl ToolFunction for PublishSubmitTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -92,7 +91,7 @@ impl PublishListTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for PublishListTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let status = args.get("status").and_then(|v| v.as_str());
         let result = self
             .client
@@ -100,7 +99,7 @@ impl ToolFunction for PublishListTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -121,7 +120,7 @@ impl PublishQueueGetTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for PublishQueueGetTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let queue_id = args
             .get("queue_id")
             .and_then(|v| v.as_i64())
@@ -132,7 +131,7 @@ impl ToolFunction for PublishQueueGetTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -153,7 +152,7 @@ impl PublishReviewTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for PublishReviewTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let queue_id = args
             .get("queue_id")
             .and_then(|v| v.as_i64())
@@ -184,7 +183,7 @@ impl ToolFunction for PublishReviewTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -205,7 +204,7 @@ impl PublishRollbackTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for PublishRollbackTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let target_version = args
             .get("target_version")
             .and_then(|v| v.as_i64())
@@ -231,7 +230,7 @@ impl ToolFunction for PublishRollbackTool {
             .emergency_rollback(req, operated_by, role)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -433,9 +432,9 @@ mod tests {
     #[tokio::test]
     async fn test_publish_submit_missing_rule_version_ids() {
         let tool = PublishSubmitTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -446,11 +445,11 @@ mod tests {
     #[tokio::test]
     async fn test_publish_submit_missing_role() {
         let tool = PublishSubmitTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        m.insert("rule_version_ids".to_string(), JsonValue::array(vec![]));
-        m.insert("submitted_by".to_string(), JsonValue::string("u1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        m.insert("rule_version_ids".to_string(), Value::Array(vec![]));
+        m.insert("submitted_by".to_string(), Value::from("u1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -461,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn test_publish_queue_get_missing_queue_id() {
         let tool = PublishQueueGetTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -472,9 +471,9 @@ mod tests {
     #[tokio::test]
     async fn test_publish_review_missing_decision() {
         let tool = PublishReviewTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("queue_id".to_string(), JsonValue::Integer(1));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("queue_id".to_string(), Value::from(1));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -485,9 +484,9 @@ mod tests {
     #[tokio::test]
     async fn test_publish_rollback_missing_reason() {
         let tool = PublishRollbackTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("target_version".to_string(), JsonValue::Integer(2));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("target_version".to_string(), Value::from(2));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -498,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn test_publish_rollback_missing_target_version() {
         let tool = PublishRollbackTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -510,7 +509,7 @@ mod tests {
     async fn test_publish_list_no_args_ok_schema() {
         // publish_list 无必填参数；不传 args 会尝试连 localhost:0 失败（连接错误），不是 missing-param 错误。
         let tool = PublishListTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         // 应为 Err（网络错误），但不是 missing-parameter 错误
         assert!(result.is_err());

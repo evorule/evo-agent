@@ -46,41 +46,20 @@ if ($hits.Count -gt 0) {
 }
 
 Write-Host "== [4/4] dependency contract assertion =="
-# EvoRule engine crates must come from crates.io (version deps), never from a
-# local path -- path deps would break out-of-tree builds for external users.
+# O-044 (2026-09-20): evo-agent is fully decoupled from the evorule main repo.
+# NO evorule-* crate dependency is allowed at all (path OR version) -- the
+# agent orchestration layer must not depend on main-repo TCB code. This check
+# fails on any re-introduction of evorule-* deps (regression guard).
 $manifest = Get-Content (Join-Path $repo "Cargo.toml") -Raw
-$depHits = [regex]::Matches($manifest, '(?m)^\s*(evorule-tcb|evorule-reactor)\s*=\s*\{\s*path\s*=')
+$depHits = [regex]::Matches($manifest, '(?m)^\s*(evorule-[\w-]+)\s*=')
 if ($depHits.Count -gt 0) {
-    foreach ($h in $depHits) { Write-Host "FAIL: path dependency found: $($h.Value)" }
-    Write-Host "  (engine crates must be version deps like `evorule-tcb = `"0.x.y`"; see README 'dependency contract')"
+    foreach ($h in $depHits) { Write-Host "FAIL: evorule-* dependency found: $($h.Value)" }
+    Write-Host "  (evo-agent is decoupled from the evorule main repo since O-044;"
+    Write-Host "   agent layer must not depend on main-repo crates. Re-adding evorule-*"
+    Write-Host "   deps is a layering violation.)"
     $failed = $true
 } else {
-    Write-Host "PASS: dependency contract (evorule-tcb / evorule-reactor resolved from crates.io)"
-}
-
-# Version alignment: engine crates must track the主线 supported minor
-# (source of truth: evorule/SECURITY.md support table). Historical drift
-# (locked 0.4.3 while主线 0.6.0) is exactly what this check prevents (N8).
-$supportedMinor = "0.6"
-$depVers = [regex]::Matches($manifest, '(?m)^\s*(evorule-tcb|evorule-reactor)\s*=\s*"(\d+)\.(\d+)\.\d+"')
-$misaligned = @()
-foreach ($v in $depVers) {
-    $minor = "$($v.Groups[2].Value).$($v.Groups[3].Value)"
-    if ($minor -ne $supportedMinor) {
-        $misaligned += "$($v.Groups[1].Value)=$minor"
-    }
-}
-if ($depVers.Count -eq 0) {
-    Write-Host "FAIL: no pinned evorule-tcb/evorule-reactor version deps found in Cargo.toml"
-    $failed = $true
-} elseif ($misaligned.Count -gt 0) {
-    Write-Host "FAIL: engine crates not aligned with supported minor ${supportedMinor}.x:"
-    foreach ($m in $misaligned) { Write-Host "  $m" }
-    Write-Host "  (upgrade evorule-tcb/evorule-reactor, then update 'supportedMinor' here;"
-    Write-Host "   supported versions: evorule/SECURITY.md)"
-    $failed = $true
-} else {
-    Write-Host "PASS: version alignment (evorule engine crates on ${supportedMinor}.x)"
+    Write-Host "PASS: dependency contract (no evorule-* deps -- decoupled per O-044)"
 }
 
 if ($failed) { Write-Host "== RESULT: FAIL =="; exit 1 }

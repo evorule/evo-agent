@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_stream::stream;
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use rand::Rng;
@@ -25,7 +25,6 @@ use tracing::{debug, warn};
 
 use crate::agent::translator::{LlmResponse, TokenUsage, ToolCall};
 use crate::io_handler::{IoHandler, IoResult};
-use crate::json_convert::serde_to_tcb;
 
 /// 默认最大重试次数
 const DEFAULT_MAX_RETRIES: usize = 3;
@@ -233,7 +232,7 @@ impl LlmHandler {
     /// G3:构造请求体(从 IoRequest 参数提取 messages/tools 等)
     ///
     /// 拆出独立方法,便于 `execute` 和未来的 `execute_stream`(G1)复用。
-    fn build_request_body(&self, params: &JsonValue) -> Result<serde_json::Value, String> {
+    fn build_request_body(&self, params: &Value) -> Result<serde_json::Value, String> {
         let params_str = params.to_string();
         let params_val: serde_json::Value =
             serde_json::from_str(&params_str).map_err(|e| format!("parse params: {}", e))?;
@@ -333,7 +332,7 @@ impl LlmHandler {
     /// - `choices[0].message.tool_calls` → tool_calls
     /// - `choices[0].finish_reason`     → finish_reason
     /// - `usage`                        → token_usage
-    async fn parse_success_response(&self, resp: reqwest::Response) -> Result<JsonValue, String> {
+    async fn parse_success_response(&self, resp: reqwest::Response) -> Result<Value, String> {
         let json: serde_json::Value = resp
             .json()
             .await
@@ -405,7 +404,7 @@ impl LlmHandler {
             finish_reason = ?finish_reason,
             "LLM API response parsed"
         );
-        Ok(serde_to_tcb(&response_json))
+        Ok(response_json.clone())
     }
 
     /// G1:流式调用 LLM API(OpenAI 兼容 SSE)
@@ -428,7 +427,7 @@ impl LlmHandler {
     /// 如果 `mock_content` 已设置,直接 yield `Delta` + `Done`,不发 HTTP。
     pub fn execute_stream(
         &self,
-        params: &JsonValue,
+        params: &Value,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, String>> + Send>> {
         let body_result = self.build_request_body(params);
         let api_base = self.api_base.clone();
@@ -796,7 +795,7 @@ impl IoHandler for LlmHandler {
     /// Execute LLM API invocation
     ///
     /// G3:内置指数退避重试。重试触发:429/5xx + 网络错误。
-    async fn execute(&self, params: &JsonValue) -> IoResult {
+    async fn execute(&self, params: &Value) -> IoResult {
         // Mock LLM short-circuit (used by tests).
         // 重试逻辑不适用 mock,直接返回。
         if let Some(content) = &self.mock_content {
@@ -806,7 +805,7 @@ impl IoHandler for LlmHandler {
                 "finish_reason": "stop",
                 "token_usage": null,
             });
-            return Ok(serde_to_tcb(&response));
+            return Ok(response.clone());
         }
 
         let body = self.build_request_body(params)?;
@@ -1024,7 +1023,7 @@ mod tests {
         let handler = LlmHandler::mock("hello from mock");
         assert!(handler.is_mock());
 
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let result = handler.execute(&params).await.expect("mock execute");
         let s = result.to_string();
         // Must be parseable as LlmResponse (handle_call_external parses it this way)
@@ -1129,7 +1128,7 @@ mod tests {
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
             .with_retry_config(5, 0.001, 0.01);
 
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let result = handler
             .execute(&params)
             .await
@@ -1172,7 +1171,7 @@ mod tests {
 
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
             .with_retry_config(0, 0.001, 0.01);
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let result = handler
             .execute(&params)
             .await
@@ -1220,7 +1219,7 @@ mod tests {
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
             .with_retry_config(5, 0.001, 0.01);
 
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let result = handler.execute(&params).await;
         assert!(result.is_err(), "400 should fail immediately");
         let err = result.unwrap_err();
@@ -1248,7 +1247,7 @@ mod tests {
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
             .with_retry_config(2, 0.001, 0.01);
 
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let result = handler.execute(&params).await;
         assert!(result.is_err(), "persistent 429 should fail");
         let err = result.unwrap_err();
@@ -1271,7 +1270,7 @@ mod tests {
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
             .with_retry_config(0, 0.001, 0.01);
 
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let result = handler.execute(&params).await;
         assert!(result.is_err());
         mock.assert_async().await;
@@ -1301,7 +1300,7 @@ mod tests {
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
             .with_retry_config(3, 100.0, 200.0); // 故意设大,验证 Retry-After 优先
 
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         // 如果不读 Retry-After,会 sleep 100s 导致测试超时
         let result = tokio::time::timeout(Duration::from_secs(5), handler.execute(&params))
             .await
@@ -1315,7 +1314,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_mock_yields_delta_and_done() {
         let handler = LlmHandler::mock("hello world");
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 
         let mut chunks = Vec::new();
@@ -1365,7 +1364,7 @@ mod tests {
             .await;
 
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 
         let mut deltas = Vec::new();
@@ -1414,7 +1413,7 @@ mod tests {
             .await;
 
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 
         let mut tool_call_fragments: Vec<String> = Vec::new();
@@ -1461,7 +1460,7 @@ mod tests {
             .await;
 
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 
         let first = stream.next().await;
@@ -1492,7 +1491,7 @@ mod tests {
             .await;
 
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 
         let first = stream.next().await;
@@ -1524,7 +1523,7 @@ mod tests {
             .await;
 
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 
         let first = stream.next().await;
@@ -1560,7 +1559,7 @@ mod tests {
             .await;
 
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 
         let mut deltas = Vec::new();
@@ -1594,7 +1593,7 @@ mod tests {
             .await;
 
         let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
-        let params = evorule_tcb::JsonValue::empty_object();
+        let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 
         // 消费完整个流

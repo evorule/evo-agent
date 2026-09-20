@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::api::workspace_client::{
     CreateRuleRequest, ForkRuleRequest, UpdateRuleContentRequest, WorkspaceApiClient,
@@ -14,7 +14,6 @@ use crate::api::workspace_client::{
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
-use crate::json_convert::serde_to_tcb;
 
 // =============================================================================
 // rule_list —— 列出规则
@@ -33,7 +32,7 @@ impl RuleListTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleListTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -44,7 +43,7 @@ impl ToolFunction for RuleListTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -65,7 +64,7 @@ impl RuleGetTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleGetTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -80,7 +79,7 @@ impl ToolFunction for RuleGetTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -101,7 +100,7 @@ impl RuleCreateTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleCreateTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -134,7 +133,7 @@ impl ToolFunction for RuleCreateTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -155,7 +154,7 @@ impl RuleUpdateTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleUpdateTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -182,7 +181,7 @@ impl ToolFunction for RuleUpdateTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -203,7 +202,7 @@ impl RuleVersionsTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleVersionsTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -218,7 +217,7 @@ impl ToolFunction for RuleVersionsTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -239,7 +238,7 @@ impl RuleVersionGetTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleVersionGetTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -258,7 +257,7 @@ impl ToolFunction for RuleVersionGetTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -279,7 +278,7 @@ impl RuleSubmitTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleSubmitTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -294,7 +293,7 @@ impl ToolFunction for RuleSubmitTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -315,7 +314,7 @@ impl RuleActivateTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleActivateTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -330,7 +329,7 @@ impl ToolFunction for RuleActivateTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -351,7 +350,7 @@ impl RuleBlockTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleBlockTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -366,7 +365,7 @@ impl ToolFunction for RuleBlockTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -387,7 +386,7 @@ impl RuleArchiveTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleArchiveTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -402,7 +401,7 @@ impl ToolFunction for RuleArchiveTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -423,7 +422,7 @@ impl RuleForkTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleForkTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let workspace_id = args
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -450,7 +449,7 @@ impl ToolFunction for RuleForkTool {
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
-        Ok(serde_to_tcb(&v))
+        Ok(v.clone())
     }
 }
 
@@ -471,13 +470,13 @@ impl RuleReloadTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for RuleReloadTool {
-    async fn call(&self, _args: &JsonValue) -> IoResult {
+    async fn call(&self, _args: &Value) -> IoResult {
         let result = self
             .client
             .reload_rules()
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_to_tcb(&result))
+        Ok(result.clone())
     }
 }
 
@@ -800,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn test_rule_list_missing_workspace_id() {
         let tool = RuleListTool::new(make_client());
-        let args = JsonValue::object(std::collections::BTreeMap::new());
+        let args = Value::Object(serde_json::Map::new());
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -811,9 +810,9 @@ mod tests {
     #[tokio::test]
     async fn test_rule_get_missing_rule_id() {
         let tool = RuleGetTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -824,10 +823,10 @@ mod tests {
     #[tokio::test]
     async fn test_rule_create_missing_content() {
         let tool = RuleCreateTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        m.insert("name".to_string(), JsonValue::string("rule1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        m.insert("name".to_string(), Value::from("rule1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -838,11 +837,11 @@ mod tests {
     #[tokio::test]
     async fn test_rule_update_missing_updated_by() {
         let tool = RuleUpdateTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        m.insert("rule_id".to_string(), JsonValue::string("r1"));
-        m.insert("content".to_string(), JsonValue::string("{}"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        m.insert("rule_id".to_string(), Value::from("r1"));
+        m.insert("content".to_string(), Value::from("{}"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result
@@ -853,10 +852,10 @@ mod tests {
     #[tokio::test]
     async fn test_rule_fork_missing_new_name() {
         let tool = RuleForkTool::new(make_client());
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("workspace_id".to_string(), JsonValue::string("ws1"));
-        m.insert("rule_id".to_string(), JsonValue::string("r1"));
-        let args = JsonValue::object(m);
+        let mut m = serde_json::Map::new();
+        m.insert("workspace_id".to_string(), Value::from("ws1"));
+        m.insert("rule_id".to_string(), Value::from("r1"));
+        let args = Value::Object(m);
         let result = tool.call(&args).await;
         assert!(result.is_err());
         assert!(result

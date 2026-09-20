@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::io_handler::IoResult;
@@ -66,12 +66,12 @@ struct ServiceProxyTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for ServiceProxyTool {
-    async fn call(&self, args: &JsonValue) -> IoResult {
-        let serde_args = crate::json_convert::tcb_to_serde(args);
+    async fn call(&self, args: &Value) -> IoResult {
+        let serde_args = args.clone();
         self.ev
             .invoke_service(&self.service_name, &serde_args)
             .await
-            .map(|v| crate::json_convert::serde_to_tcb(&v))
+            .map(|v| v.clone())
             .map_err(|e| format!("service {} invoke failed: {e}", self.service_name))
     }
 }
@@ -288,11 +288,11 @@ mod tests {
         let out = rt
             .block_on(handler.execute_by_name(
                 "shape_svc",
-                &crate::json_convert::serde_to_tcb(&serde_json::json!({"key": "demo"})),
+                &serde_json::json!({"key": "demo"}),
             ))
             .unwrap();
         assert_eq!(
-            crate::json_convert::tcb_to_serde(&out),
+            out.clone(),
             serde_json::json!({"result": "ok"})
         );
 
@@ -369,7 +369,7 @@ mod tests {
         let err = rt
             .block_on(handler.execute_by_name(
                 "err_svc",
-                &crate::json_convert::serde_to_tcb(&serde_json::json!({})),
+                &serde_json::json!({}),
             ))
             .unwrap_err();
         assert!(err.contains("500"), "应透传 HTTP 状态码: {err}");

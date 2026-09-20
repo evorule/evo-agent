@@ -23,7 +23,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -167,7 +167,7 @@ impl FileWriteTool {
 #[async_trait::async_trait]
 impl ToolFunction for FileWriteTool {
     /// G13:async 入口 — 用 spawn_blocking 包装同步 fs 操作
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let tool = self.clone();
         let args = args.clone();
         tokio::task::spawn_blocking(move || tool.call_sync(&args))
@@ -178,7 +178,7 @@ impl ToolFunction for FileWriteTool {
 
 impl FileWriteTool {
     /// 同步实现(供 spawn_blocking 调用)
-    fn call_sync(&self, args: &JsonValue) -> IoResult {
+    fn call_sync(&self, args: &Value) -> IoResult {
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -239,21 +239,21 @@ impl FileWriteTool {
         std::fs::write(&target, content.as_bytes()).map_err(|e| format!("write failed: {}", e))?;
         let bytes_written = content.len();
 
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = serde_json::Map::new();
         map.insert(
             "path".to_string(),
-            JsonValue::string(target_canonical.display().to_string()),
+            Value::from(target_canonical.display().to_string()),
         );
         map.insert(
             "bytes_written".to_string(),
-            JsonValue::Integer(bytes_written as i64),
+            Value::from(bytes_written as i64),
         );
-        map.insert("created".to_string(), JsonValue::Bool(!overwrite));
+        map.insert("created".to_string(), Value::Bool(!overwrite));
         map.insert(
             "writable_dir".to_string(),
-            JsonValue::string(self.writable_dir.display().to_string()),
+            Value::from(self.writable_dir.display().to_string()),
         );
-        Ok(JsonValue::object(map))
+        Ok(Value::Object(map))
     }
 }
 
@@ -274,10 +274,10 @@ mod tests {
     fn test_reject_absolute_path() {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("C:\\evil.txt"));
-            m.insert("content".to_string(), JsonValue::string("x"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("C:\\evil.txt"));
+            m.insert("content".to_string(), Value::from("x"));
             m
         }));
         assert!(result.is_err());
@@ -287,10 +287,10 @@ mod tests {
     fn test_reject_parent_dir() {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("../evil.txt"));
-            m.insert("content".to_string(), JsonValue::string("x"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("../evil.txt"));
+            m.insert("content".to_string(), Value::from("x"));
             m
         }));
         assert!(result.is_err());
@@ -302,10 +302,10 @@ mod tests {
         // 想写 workdir 根(不在 workspace/ 里)
         std::fs::write(dir.path().join("config.toml"), b"").unwrap();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("config.toml"));
-            m.insert("content".to_string(), JsonValue::string("x"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("config.toml"));
+            m.insert("content".to_string(), Value::from("x"));
             m
         }));
         assert!(result.is_err());
@@ -321,10 +321,10 @@ mod tests {
     fn test_write_new_file_in_workspace() {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("workspace/new.txt"));
-            m.insert("content".to_string(), JsonValue::string("hello"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("workspace/new.txt"));
+            m.insert("content".to_string(), Value::from("hello"));
             m
         }));
         assert!(result.is_ok(), "got: {:?}", result);
@@ -340,13 +340,13 @@ mod tests {
         std::fs::write(dir.path().join("workspace/exists.txt"), b"old").unwrap();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
         // 试图覆盖(没带 overwrite=true)
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
             m.insert(
                 "path".to_string(),
-                JsonValue::string("workspace/exists.txt"),
+                Value::from("workspace/exists.txt"),
             );
-            m.insert("content".to_string(), JsonValue::string("new"));
+            m.insert("content".to_string(), Value::from("new"));
             m
         }));
         assert!(result.is_err());
@@ -366,11 +366,11 @@ mod tests {
         let dir = temp_workdir_with_workspace();
         std::fs::write(dir.path().join("workspace/x.txt"), b"old").unwrap();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("workspace/x.txt"));
-            m.insert("content".to_string(), JsonValue::string("new content"));
-            m.insert("overwrite".to_string(), JsonValue::Bool(true));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("workspace/x.txt"));
+            m.insert("content".to_string(), Value::from("new content"));
+            m.insert("overwrite".to_string(), Value::Bool(true));
             m
         }));
         assert!(result.is_ok());
@@ -383,14 +383,14 @@ mod tests {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
         // 写 workspace/sub/deep/file.txt,父目录不存在
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
             m.insert(
                 "path".to_string(),
-                JsonValue::string("workspace/sub/deep/file.txt"),
+                Value::from("workspace/sub/deep/file.txt"),
             );
-            m.insert("content".to_string(), JsonValue::string("x"));
-            m.insert("create_parents".to_string(), JsonValue::Bool(true));
+            m.insert("content".to_string(), Value::from("x"));
+            m.insert("create_parents".to_string(), Value::Bool(true));
             m
         }));
         assert!(result.is_ok(), "got: {:?}", result);
@@ -400,13 +400,13 @@ mod tests {
     fn test_no_create_parents_fails() {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
             m.insert(
                 "path".to_string(),
-                JsonValue::string("workspace/sub/deep/file.txt"),
+                Value::from("workspace/sub/deep/file.txt"),
             );
-            m.insert("content".to_string(), JsonValue::string("x"));
+            m.insert("content".to_string(), Value::from("x"));
             // 没有 create_parents
             m
         }));
@@ -418,10 +418,10 @@ mod tests {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf()).with_max_bytes(100);
         let big = "x".repeat(200);
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("workspace/big.txt"));
-            m.insert("content".to_string(), JsonValue::string(big));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("workspace/big.txt"));
+            m.insert("content".to_string(), Value::from(big));
             m
         }));
         assert!(result.is_err());
@@ -433,16 +433,16 @@ mod tests {
         let dir = temp_workdir_with_workspace();
         let tool = FileWriteTool::new(dir.path().to_path_buf());
         // no path
-        let r1 = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("content".to_string(), JsonValue::string("x"));
+        let r1 = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("content".to_string(), Value::from("x"));
             m
         }));
         assert!(r1.is_err());
         // no content
-        let r2 = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("workspace/x"));
+        let r2 = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("workspace/x"));
             m
         }));
         assert!(r2.is_err());
@@ -485,10 +485,10 @@ mod tests {
         }
 
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("workspace/link.txt"));
-            m.insert("content".to_string(), JsonValue::string("overwrite"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("workspace/link.txt"));
+            m.insert("content".to_string(), Value::from("overwrite"));
             m
         }));
         // symlink 通过 exists() 解析后指向 workdir 外
@@ -504,12 +504,12 @@ mod tests {
         let dir = temp_workdir_with_workspace();
         let outside = tempfile::tempdir().unwrap();
         let link_dir = dir.path().join("workspace").join("linkdir");
-        let content_arg = |m: &mut std::collections::BTreeMap<String, JsonValue>| {
+        let content_arg = |m: &mut serde_json::Map<String, Value>| {
             m.insert(
                 "path".to_string(),
-                JsonValue::string("workspace/linkdir/escaped_new.txt"),
+                Value::from("workspace/linkdir/escaped_new.txt"),
             );
-            m.insert("content".to_string(), JsonValue::string("escaped"));
+            m.insert("content".to_string(), Value::from("escaped"));
         };
 
         #[cfg(windows)]
@@ -538,8 +538,8 @@ mod tests {
             }
 
             let tool = FileWriteTool::new(dir.path().to_path_buf());
-            let result = tool.call_sync(&JsonValue::object({
-                let mut m = std::collections::BTreeMap::new();
+            let result = tool.call_sync(&Value::Object({
+                let mut m = serde_json::Map::new();
                 content_arg(&mut m);
                 m
             }));
@@ -563,8 +563,8 @@ mod tests {
             // unix 等价物:目录 symlink(同样无需特权)
             std::os::unix::fs::symlink(outside.path(), &link_dir).unwrap();
             let tool = FileWriteTool::new(dir.path().to_path_buf());
-            let result = tool.call_sync(&JsonValue::object({
-                let mut m = std::collections::BTreeMap::new();
+            let result = tool.call_sync(&Value::Object({
+                let mut m = serde_json::Map::new();
                 content_arg(&mut m);
                 m
             }));
@@ -616,13 +616,13 @@ mod tests {
         }
 
         let tool = FileWriteTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
             m.insert(
                 "path".to_string(),
-                JsonValue::string("workspace/dangling.txt"),
+                Value::from("workspace/dangling.txt"),
             );
-            m.insert("content".to_string(), JsonValue::string("escaped"));
+            m.insert("content".to_string(), Value::from("escaped"));
             m
         }));
         assert!(

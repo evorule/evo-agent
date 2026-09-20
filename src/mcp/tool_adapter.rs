@@ -19,12 +19,12 @@
 //!   → McpTransport::request("tools/call", ...)
 //!   → MCP server 子进程
 //!   → 返回 text content
-//!   → 包装成 JsonValue::string 返回给 runner
+//!   → 包装成 Value::string 返回给 runner
 //! ```
 
 use std::sync::Arc;
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -73,9 +73,9 @@ impl McpToolAdapter {
 
 #[async_trait::async_trait]
 impl ToolFunction for McpToolAdapter {
-    async fn call(&self, args: &JsonValue) -> IoResult {
-        // JsonValue → serde_json::Value(MCP 协议用 serde_json)
-        let args_json = crate::json_convert::tcb_to_serde(args);
+    async fn call(&self, args: &Value) -> IoResult {
+        // Value → serde_json::Value(MCP 协议用 serde_json)
+        let args_json = args.clone();
 
         tracing::debug!(
             tool = %self.tool_name,
@@ -89,8 +89,8 @@ impl ToolFunction for McpToolAdapter {
             .await
             .map_err(|e| format!("MCP tool '{}' failed: {}", self.tool_name, e))?;
 
-        // MCP 返回的是 text 字符串,包装成 JsonValue::string
-        Ok(JsonValue::string(result))
+        // MCP 返回的是 text 字符串,包装成 Value::string
+        Ok(Value::from(result))
     }
 }
 
@@ -227,9 +227,9 @@ mod tests {
         let adapter = McpToolAdapter::new(client, "read_file".to_string());
 
         let args = {
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("path".to_string(), JsonValue::string("/tmp/x"));
-            JsonValue::object(m)
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("/tmp/x"));
+            Value::Object(m)
         };
         let result = adapter.call(&args).await.unwrap();
         assert_eq!(result.as_str(), Some("hello from MCP"));
@@ -250,17 +250,17 @@ mod tests {
 
         // 复杂参数:嵌套对象 + 数组
         let args = {
-            let mut path_val = std::collections::BTreeMap::new();
-            path_val.insert("path".to_string(), JsonValue::string("/a/b"));
+            let mut path_val = serde_json::Map::new();
+            path_val.insert("path".to_string(), Value::from("/a/b"));
             path_val.insert(
                 "options".to_string(),
-                JsonValue::object({
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert("overwrite".to_string(), JsonValue::Bool(true));
+                Value::Object({
+                    let mut m = serde_json::Map::new();
+                    m.insert("overwrite".to_string(), Value::Bool(true));
                     m
                 }),
             );
-            JsonValue::object(path_val)
+            Value::Object(path_val)
         };
         let result = adapter.call(&args).await.unwrap();
         assert_eq!(result.as_str(), Some("ok"));
@@ -277,7 +277,7 @@ mod tests {
             .await;
         let adapter = McpToolAdapter::new(client, "delete_file".to_string());
 
-        let result = adapter.call(&JsonValue::Null).await;
+        let result = adapter.call(&Value::Null).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("MCP tool 'delete_file' failed"));
@@ -289,7 +289,7 @@ mod tests {
         let (client, _transport) = make_client_with_tool_response().await;
         // 没注册 tools/call 响应 → transport 返回 Err
         let adapter = McpToolAdapter::new(client, "unknown".to_string());
-        let result = adapter.call(&JsonValue::Null).await;
+        let result = adapter.call(&Value::Null).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("failed"));
     }
@@ -301,7 +301,7 @@ mod tests {
             .set_response("tools/call", serde_json::json!({}))
             .await;
         let adapter = McpToolAdapter::new(client, "noop".to_string());
-        let result = adapter.call(&JsonValue::Null).await.unwrap();
+        let result = adapter.call(&Value::Null).await.unwrap();
         assert_eq!(result.as_str(), Some(""));
     }
 

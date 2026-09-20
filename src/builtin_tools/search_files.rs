@@ -19,7 +19,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use evorule_tcb::JsonValue;
+use serde_json::Value;
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
@@ -166,7 +166,7 @@ impl SearchFilesTool {
 #[async_trait::async_trait]
 impl ToolFunction for SearchFilesTool {
     /// G13:async 入口 — 用 spawn_blocking 包装同步 fs 操作
-    async fn call(&self, args: &JsonValue) -> IoResult {
+    async fn call(&self, args: &Value) -> IoResult {
         let tool = self.clone();
         let args = args.clone();
         tokio::task::spawn_blocking(move || tool.call_sync(&args))
@@ -177,7 +177,7 @@ impl ToolFunction for SearchFilesTool {
 
 impl SearchFilesTool {
     /// 同步实现(供 spawn_blocking 调用)
-    fn call_sync(&self, args: &JsonValue) -> IoResult {
+    fn call_sync(&self, args: &Value) -> IoResult {
         let pattern = args
             .get("pattern")
             .and_then(|v| v.as_str())
@@ -200,29 +200,29 @@ impl SearchFilesTool {
         let mut results = Vec::new();
         Self::walk(&safe_dir, &safe_dir, pattern, max, &mut results);
 
-        let json_results: Vec<JsonValue> = results
+        let json_results: Vec<Value> = results
             .iter()
-            .map(|p| JsonValue::string(p.display().to_string()))
+            .map(|p| Value::from(p.display().to_string()))
             .collect();
 
         let truncated = results.len() >= max;
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = serde_json::Map::new();
         map.insert(
             "pattern".to_string(),
-            JsonValue::string(pattern.to_string()),
+            Value::from(pattern.to_string()),
         );
         map.insert(
             "dir".to_string(),
-            JsonValue::string(safe_dir.display().to_string()),
+            Value::from(safe_dir.display().to_string()),
         );
         map.insert(
             "count".to_string(),
-            JsonValue::Integer(results.len() as i64),
+            Value::from(results.len() as i64),
         );
-        map.insert("truncated".to_string(), JsonValue::Bool(truncated));
-        map.insert("results".to_string(), JsonValue::array(json_results));
+        map.insert("truncated".to_string(), Value::Bool(truncated));
+        map.insert("results".to_string(), Value::Array(json_results));
 
-        Ok(JsonValue::object(map))
+        Ok(Value::Object(map))
     }
 }
 
@@ -279,10 +279,10 @@ mod tests {
     fn test_reject_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
         let tool = SearchFilesTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("pattern".to_string(), JsonValue::string("*.txt"));
-            m.insert("dir".to_string(), JsonValue::string("C:\\Windows"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("pattern".to_string(), Value::from("*.txt"));
+            m.insert("dir".to_string(), Value::from("C:\\Windows"));
             m
         }));
         assert!(result.is_err());
@@ -292,10 +292,10 @@ mod tests {
     fn test_reject_parent_dir() {
         let dir = tempfile::tempdir().unwrap();
         let tool = SearchFilesTool::new(dir.path().to_path_buf());
-        let result = tool.call_sync(&JsonValue::object({
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("pattern".to_string(), JsonValue::string("*"));
-            m.insert("dir".to_string(), JsonValue::string("../etc"));
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("pattern".to_string(), Value::from("*"));
+            m.insert("dir".to_string(), Value::from("../etc"));
             m
         }));
         assert!(result.is_err());
@@ -311,9 +311,9 @@ mod tests {
 
         let tool = SearchFilesTool::new(dir.path().to_path_buf());
         let result = tool
-            .call_sync(&JsonValue::object({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("pattern".to_string(), JsonValue::string("*.txt"));
+            .call_sync(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert("pattern".to_string(), Value::from("*.txt"));
                 m
             }))
             .expect("should succeed");
@@ -335,9 +335,9 @@ mod tests {
 
         let tool = SearchFilesTool::new(dir.path().to_path_buf());
         let result = tool
-            .call_sync(&JsonValue::object({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("pattern".to_string(), JsonValue::string("*.txt"));
+            .call_sync(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert("pattern".to_string(), Value::from("*.txt"));
                 m
             }))
             .unwrap();
@@ -357,9 +357,9 @@ mod tests {
         }
         let tool = SearchFilesTool::new(dir.path().to_path_buf()).with_max_results(3);
         let result = tool
-            .call_sync(&JsonValue::object({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("pattern".to_string(), JsonValue::string("*.txt"));
+            .call_sync(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert("pattern".to_string(), Value::from("*.txt"));
                 m
             }))
             .unwrap();
