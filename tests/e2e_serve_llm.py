@@ -8,7 +8,7 @@ evo-agent serve 进程真实 LLM E2E(批 3 D6)
 与 tests/llm_real_smoke.py(直连 API 冒烟)不同,本脚本走 serve 进程全链:
   evo-agent serve(WS 会话协议) + evorule-server(规则数据面) + 真实 MiniMax LLM
 
-验证链(94 号立项方案 D6):
+验证链(批 3 D6):
   P0  双服务探活(evo-agent /health + evorule-server /api/health)
   P1  GET /admin/llm-status 脱敏快照(configured/provider/present/hint/source,
       响应体不含密钥全值)

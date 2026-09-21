@@ -1202,9 +1202,9 @@ mod tests {
     #[tokio::test]
     async fn test_llm_status_endpoint_masks_key() {
         // 脱敏铁律:响应体不得包含 key 全值,只允许末 4 位提示
-        let secret = "test-key-abcd1234wxyz";
+        let key_fixture = "test-key-abcd1234wxyz";
         let cfg = crate::config::LlmConfig {
-            api_key: secret.to_string(),
+            api_key: key_fixture.to_string(),
             ..crate::config::LlmConfig::default()
         };
         let snapshot = cfg.status_snapshot(Some("MINIMAX_API_KEY"));
@@ -1228,7 +1228,7 @@ mod tests {
             .await
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(!text.contains(secret), "response body leaked the API key");
+        assert!(!text.contains(key_fixture), "response body leaked the API key");
         assert!(text.contains("wxyz"), "last-4 hint should be present");
     }
 
