@@ -77,6 +77,31 @@ impl EvoruleApiClient {
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
+    /// 平台用户令牌校验 —— GET /api/platform/auth/me
+    ///
+    /// 用调用者提交的 Bearer 令牌直接请求认证端点，换取平台用户名。
+    /// 注意：此处必须显式携带被校验的令牌本身，不可复用核心客户端的
+    /// 服务级认证头（二者身份不同）。校验失败（网络 / 状态码 / 响应
+    /// 形状）一律返回 `ApiError`，由调用方降级为未验证身份，不阻断审批。
+    pub async fn verify_platform_token(&self, token: &str) -> Result<String, ApiError> {
+        let url = self.core.url("/api/platform/auth/me");
+        let resp = self
+            .core
+            .client()
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+
+        let result: Value = resp.json().await.map_err(|_| ApiError::InvalidResponse)?;
+        let username = result["user"]["username"]
+            .as_str()
+            .or_else(|| result["username"].as_str())
+            .ok_or(ApiError::InvalidResponse)?;
+        Ok(username.to_string())
+    }
+
     /// 创建新会话，返回会话 ID。`initial_content` 为可选的初始 payload 内容。
     pub async fn create_session(
         &self,
@@ -1184,5 +1209,62 @@ mod tests {
         assert_eq!(io_response_body["request_id"], request_id);
         assert_eq!(io_response_body["content"], content);
         assert_eq!(io_response_body["used_facts"].as_array().unwrap().len(), 2);
+    }
+
+    // ===== 平台用户令牌校验 =====
+
+    /// 校验成功:认证端点返回嵌套 user.username → 解析出用户名
+    #[tokio::test]
+    async fn test_verify_platform_token_success() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/platform/auth/me")
+            .match_header("authorization", "Bearer user-token-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"success":true,"user":{"username":"alice","displayName":"Alice",
+                    "email":"a@x.com","department":"sec","role":"user"},
+                    "permissions":[],"permissions_version":1}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let name = client.verify_platform_token("user-token-1").await;
+        assert_eq!(name.unwrap(), "alice");
+    }
+
+    /// 校验失败:非 2xx(如 401)→ 返回 Err,由调用方降级为未验证身份
+    #[tokio::test]
+    async fn test_verify_platform_token_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/platform/auth/me")
+            .with_status(401)
+            .with_body(r#"{"success":false}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        assert!(client.verify_platform_token("bad-token").await.is_err());
+    }
+
+    /// 校验失败:2xx 但响应缺少用户名 → InvalidResponse
+    #[tokio::test]
+    async fn test_verify_platform_token_missing_username() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/platform/auth/me")
+            .with_status(200)
+            .with_body(r#"{"success":true,"user":{}}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        assert!(matches!(
+            client.verify_platform_token("t").await,
+            Err(ApiError::InvalidResponse)
+        ));
     }
 }

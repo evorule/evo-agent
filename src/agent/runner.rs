@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::approval::{parse_approval_request, ApprovalCallback};
+use crate::agent::approval::{parse_approval_request, ApprovalCallback, ApprovalDecision};
 use crate::agent::callback::CallbackChain;
 use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
 use crate::agent::definition::{AgentDefinition, OutputFormat};
@@ -346,6 +346,8 @@ pub enum AgentEvent {
     SessionCreated {
         /// evorule session ID
         session_id: String,
+        /// 该 agent 是否启用记忆配置(memory_config 存在即 true)
+        memory_enabled: bool,
     },
     /// 进入第 N 步
     Step {
@@ -394,6 +396,8 @@ pub enum AgentEvent {
         risk: String,
         /// 替代方案
         alternative: String,
+        /// 提案 ID(审批留痕主键,/approve 回传校验用)
+        proposal_id: String,
     },
     /// G8:审批结果
     ApprovalResult {
@@ -401,6 +405,10 @@ pub enum AgentEvent {
         tool_name: String,
         /// 是否批准
         approved: bool,
+        /// 决策者标识(用户名 / unverified / cli-user / auto)
+        approver: String,
+        /// 是否系统自动拒绝(超时 / 通道关闭)
+        auto_rejected: bool,
     },
 }
 
@@ -1330,6 +1338,18 @@ impl AgentRunner {
         if let Some(tools) = tools {
             params["tools"] = Value::Array(tools);
         }
+        // 链上补记实际生效的生成参数(与 llm_handler 兜底逻辑同源):
+        // max_tokens 未在 agent 定义/配置层提供 → None 走 handler 兜底 4096,stream 恒 true
+        let (effective_temperature, effective_max_tokens, effective_stream) =
+            crate::io_handlers::llm_handler::effective_generation_params(
+                Some(self.config.temperature as f64),
+                None,
+            );
+        params["effective_params"] = serde_json::json!({
+            "temperature": effective_temperature,
+            "max_tokens": effective_max_tokens,
+            "stream": effective_stream,
+        });
         serde_json::json!({
             "type": "call_external",
             "params": params,
@@ -1638,9 +1658,12 @@ impl AgentRunner {
 
         // G13:检查并行缓存(如果 call_external 已并行执行过此 active 工具,直接返回缓存结果,跳过重复执行 + 审批)
         // candidate 工具(proposal)不会被缓存,所以缓存命中的一定是 active 工具,无需审批
-        let tool_result = if let Some(cached) = self.check_parallel_cache(tool_name, &args) {
+        // 审批留痕:仅本轮发生过审批时为 Some(内嵌进 io_response.result)
+        let (tool_result, approval_record) = if let Some(cached) =
+            self.check_parallel_cache(tool_name, &args)
+        {
             info!(%session_id, tool = %tool_name, "G13: call_service cache hit, skipping re-execution");
-            cached
+            (cached, None)
         } else {
             // 缓存未命中:走正常的 execute_tool_call + 审批流程
             // 第一次调用(不带 approved flag)
@@ -1660,10 +1683,14 @@ impl AgentRunner {
         // P0: 持久化 tool 消息
         self.persist_message(session_id, tool_idx, tool_msg).await?;
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
             "tool_name": tool_name,
             "result": tool_result.to_string(),
-        }))
+        });
+        if let Some(record) = approval_record {
+            result["approval"] = record;
+        }
+        Ok(result)
     }
 
     /// G8:执行工具调用(不含审批逻辑,纯执行)
@@ -1812,32 +1839,64 @@ impl AgentRunner {
     /// 4. 用户拒绝 → 返回 `{"status":"rejected"}`
     ///
     /// **不递归**:重调用的结果不再检查 proposal(避免无限循环)。
+    ///
+    /// 返回 `(工具最终结果, 审批留痕 record)`:record 仅在本轮发生过审批时
+    /// 为 `Some`(内嵌进 io_response.result,不扩 Fact 枚举)。
     async fn maybe_handle_approval(
         &self,
         session_id: &str,
         tool_name: &str,
         args: &Value,
         tool_result: Value,
-    ) -> Result<Value, AgentError> {
+    ) -> Result<(Value, Option<Value>), AgentError> {
         let result_str = tool_result.to_string();
         let approval_req = match parse_approval_request(session_id, tool_name, args, &result_str) {
             Some(req) => req,
-            None => return Ok(tool_result), // 不是 proposal,直接返回
+            None => return Ok((tool_result, None)), // 不是 proposal,直接返回
         };
 
         info!(%session_id, tool = tool_name, "G8: tool requires approval");
 
         // 问用户(无 callback = 默认拒绝,安全优先)
-        let approved = if let Some(cb) = &self.approval_callback {
+        let decision = if let Some(cb) = &self.approval_callback {
             cb.request_approval(&approval_req).await
         } else {
-            false
+            ApprovalDecision {
+                approved: false,
+                approver: "auto".to_string(),
+                verified: true,
+                reason: "denied by policy".to_string(),
+                auto_rejected: false,
+            }
         };
 
-        if !approved {
+        // 构造审批留痕 record(decided_at 用 epoch 秒)
+        let decided_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let decision_label = if decision.approved {
+            "approved"
+        } else if decision.auto_rejected {
+            "auto_rejected"
+        } else {
+            "rejected"
+        };
+        let approval_record = serde_json::json!({
+            "proposal_id": approval_req.proposal_id,
+            "tool": tool_name,
+            "decision": decision_label,
+            "approver": decision.approver,
+            "verified": decision.verified,
+            "decided_at": decided_at,
+            "reason": decision.reason,
+        });
+
+        if !decision.approved {
             warn!(%session_id, tool = tool_name, "G8: tool call rejected");
-            return Ok(Value::from(
-                r#"{"status":"rejected","message":"User denied approval"}"#,
+            return Ok((
+                Value::from(r#"{"status":"rejected","message":"User denied approval"}"#),
+                Some(approval_record),
             ));
         }
 
@@ -1850,7 +1909,8 @@ impl AgentRunner {
             // args 不是 object,包装一下
             approved_args = serde_json::json!({"original_args": args, "approved": true});
         }
-        self.execute_tool_call(tool_name, &approved_args).await
+        let final_result = self.execute_tool_call(tool_name, &approved_args).await?;
+        Ok((final_result, Some(approval_record)))
     }
 
     async fn execute_external(&self, io_type: &str, params: &Value) -> Result<Value, AgentError> {
@@ -2220,7 +2280,11 @@ impl AgentRunner {
                 if let Some(m) = &runner.metrics {
                     m.inc_sessions_total();
                 }
-                yield Ok(AgentEvent::SessionCreated { session_id: session_id.clone() });
+                yield Ok(AgentEvent::SessionCreated {
+                    session_id: session_id.clone(),
+                    // memory_config 存在(from_definition 已装 MemoryManager)即视为启用
+                    memory_enabled: runner.memory.is_some(),
+                });
 
                 // 3. auto_recall(best-effort,不阻塞流)
                 let _ = runner.auto_recall(&session_id).await;
@@ -2598,6 +2662,9 @@ impl AgentRunner {
                                 let args = params.get("args").cloned().unwrap_or(Value::Null);
                                 yield Ok(AgentEvent::ToolCall { name: tool_name.clone(), args: args.clone() });
 
+                                // 审批留痕(本轮发生过审批时内嵌进 io_response.result)
+                                let mut approval_record: Option<Value> = None;
+
                                 // G13:检查并行缓存(如果 call_external 已并行执行过此 active 工具,直接返回缓存结果,跳过重复执行 + 审批)
                                 // candidate 工具(proposal)不会被缓存,所以缓存命中的一定是 active 工具,无需审批
                                 let final_result = if let Some(cached) = runner.check_parallel_cache(&tool_name, &args) {
@@ -2640,22 +2707,53 @@ impl AgentRunner {
                                                 command: approval_req.command.clone(),
                                                 risk: approval_req.risk.clone(),
                                                 alternative: approval_req.alternative.clone(),
+                                                proposal_id: approval_req.proposal_id.clone(),
                                             });
 
                                             // 问用户(无 callback = 默认拒绝,安全优先)
                                             // borrow runner.approval_callback 仅在此 block 内,yield 已在 borrow 之前
-                                            let approved = if let Some(cb) = &runner.approval_callback {
+                                            let decision = if let Some(cb) = &runner.approval_callback {
                                                 cb.request_approval(&approval_req).await
                                             } else {
-                                                false
+                                                ApprovalDecision {
+                                                    approved: false,
+                                                    approver: "auto".to_string(),
+                                                    verified: true,
+                                                    reason: "denied by policy".to_string(),
+                                                    auto_rejected: false,
+                                                }
                                             };
 
                                             yield Ok(AgentEvent::ApprovalResult {
                                                 tool_name: tool_name.clone(),
-                                                approved,
+                                                approved: decision.approved,
+                                                approver: decision.approver.clone(),
+                                                auto_rejected: decision.auto_rejected,
                                             });
 
-                                            if !approved {
+                                            // 构造审批留痕 record(decided_at 用 epoch 秒)
+                                            let decided_at = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0);
+                                            let decision_label = if decision.approved {
+                                                "approved"
+                                            } else if decision.auto_rejected {
+                                                "auto_rejected"
+                                            } else {
+                                                "rejected"
+                                            };
+                                            approval_record = Some(serde_json::json!({
+                                                "proposal_id": approval_req.proposal_id,
+                                                "tool": tool_name,
+                                                "decision": decision_label,
+                                                "approver": decision.approver,
+                                                "verified": decision.verified,
+                                                "decided_at": decided_at,
+                                                "reason": decision.reason,
+                                            }));
+
+                                            if !decision.approved {
                                                 warn!(%session_id, tool = %tool_name, "G8: streaming tool call rejected");
                                                 Value::from(
                                                     r#"{"status":"rejected","message":"User denied approval"}"#,
@@ -2707,10 +2805,14 @@ impl AgentRunner {
                                 }
 
                                 // 4. yield ToolResult + 提交 io_response(格式同 handle_call_service)
-                                let result_value = serde_json::json!({
+                                // 本轮发生过审批时,把审批留痕内嵌进 result(不扩 Fact 枚举)
+                                let mut result_value = serde_json::json!({
                                     "tool_name": tool_name,
                                     "result": final_result.to_string(),
                                 });
+                                if let Some(record) = approval_record {
+                                    result_value["approval"] = record;
+                                }
                                 yield Ok(AgentEvent::ToolResult {
                                     name: tool_name.clone(),
                                     result: result_value.clone(),

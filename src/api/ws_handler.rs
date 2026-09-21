@@ -59,7 +59,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::agent::{AgentError, AgentEvent, AgentRunner};
+use crate::agent::{AgentError, AgentEvent, AgentRunner, MemoryManager};
 use crate::api::agent_api::AgentApiState;
 
 // =============================================================================
@@ -228,7 +228,7 @@ async fn handle_ws(
                                     continue;
                                 }
                                 // 构造 fresh AgentRunner(run_streaming/run_continuation 消费 self)
-                                let runner = match construct_runner(&state, &agent_type) {
+                                let runner = match construct_runner(&state, &agent_type).await {
                                     Some(r) => r,
                                     None => {
                                         let _ = send_ws_json(
@@ -305,12 +305,18 @@ async fn handle_ws(
                                 } else if let Some(sid) = &current_session {
                                     info!(session_id = %sid, version = version, "G16: rewind");
                                     match state.evorule_client().rewind(sid, version).await {
-                                        Ok(_) => {
+                                        Ok(reply) => {
+                                            // 透传服务端回执的实际回退版本(缺省回落到请求版本)
+                                            let actual = reply["actual_version"]
+                                                .as_u64()
+                                                .unwrap_or(version);
                                             let _ = send_ws_json(
                                                 &mut sender,
                                                 serde_json::json!({
                                                     "type": "Info",
-                                                    "message": format!("rewound to version {}", version)
+                                                    "message": format!("rewound to version {}", actual),
+                                                    "requested_version": version,
+                                                    "actual_version": actual,
                                                 }),
                                             ).await;
                                         }
@@ -372,7 +378,7 @@ async fn handle_ws(
                 match event {
                     Some(WsEvent::Agent(result)) => {
                         // 跟踪 session_id(首轮 run_streaming 会产出 SessionCreated)
-                        if let Ok(AgentEvent::SessionCreated { session_id: sid }) = &result {
+                        if let Ok(AgentEvent::SessionCreated { session_id: sid, .. }) = &result {
                             current_session = Some(sid.clone());
                             info!(session_id = %sid, "G16: session created");
                         }
@@ -417,11 +423,23 @@ async fn handle_ws(
 /// `run_streaming` / `run_continuation` 消费 `self`,所以每轮需要重新构造。
 /// 构造成本低(AgentRunner::new 只存 config + client handle)。
 ///
+/// 记忆:定义启用了 memory(含 serve 侧对 general 的缺省注入)时构建
+/// `MemoryManager`,使 continuation 轮次能回注会话历史。同步为
+/// best-effort:拉取失败只记 warn 不阻断(历史加载走会话状态接口,
+/// 不依赖本地同步结果)。
+///
 /// 返回 `None` = agent_type 加载失败(404 等价)。
-fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<AgentRunner> {
-    let def = state.definitions().load(agent_type).ok()?;
+async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<AgentRunner> {
+    let mut def = state.definitions().load(agent_type).ok()?;
+    // 与 HTTP 端点同口径:general 定义未配置 memory 时注入最小持久记忆档
+    if agent_type == "general"
+        && (def.memory.memory_type == "none" || def.memory.memory_type.is_empty())
+    {
+        def.memory.memory_type = "persistent".to_string();
+        def.memory.namespace = "general".to_string();
+    }
     let config = def.to_agent_config();
-    let runner = AgentRunner::new(config, state.evorule_client().clone())
+    let mut runner = AgentRunner::new(config, state.evorule_client().clone())
         // G8:注入 HttpApproval — candidate 工具返回 needs_approval 时,
         // runner 通过 oneshot channel 等 POST /approve(60s 超时自动拒绝)
         .with_approval_callback(Arc::new(crate::agent::approval::HttpApproval::new(
@@ -429,6 +447,23 @@ fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<AgentRunn
         )))
         // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
         .with_metrics(state.metrics().clone());
+    // 记忆启用时构建 MemoryManager(TTL / 持久化模式按定义透传)
+    if def.memory.memory_type != "none" && !def.memory.memory_type.is_empty() {
+        let mut mem = MemoryManager::new(&def.memory.namespace, state.evorule_client().clone());
+        if let Some(ttl) = def.memory.ttl_secs {
+            mem = mem.with_ttl_secs(ttl);
+        }
+        if let Err(e) = mem.sync_from_evorule().await {
+            warn!(
+                agent_type = %agent_type,
+                error = %e,
+                "memory sync failed; continuing without local sync"
+            );
+        }
+        runner = runner
+            .with_message_persist_mode(def.memory.message_persist.to_mode().unwrap_or_default())
+            .with_memory(mem);
+    }
     Some(runner)
 }
 
@@ -450,9 +485,13 @@ async fn send_ws_json(
 /// 注意:AgentEvent 和 AgentError 未 derive Serialize,需手动映射(同 `agent_event_to_sse`)。
 fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json::Value {
     match event {
-        Ok(AgentEvent::SessionCreated { session_id }) => serde_json::json!({
+        Ok(AgentEvent::SessionCreated {
+            session_id,
+            memory_enabled,
+        }) => serde_json::json!({
             "type": "SessionCreated",
             "session_id": session_id,
+            "memory_enabled": memory_enabled,
         }),
         Ok(AgentEvent::Step { step }) => serde_json::json!({
             "type": "Step",
@@ -504,20 +543,26 @@ fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json::Val
             command,
             risk,
             alternative,
+            proposal_id,
         }) => serde_json::json!({
             "type": "ApprovalRequired",
             "tool_name": tool_name,
             "command": command,
             "risk": risk,
             "alternative": alternative,
+            "proposal_id": proposal_id,
         }),
         Ok(AgentEvent::ApprovalResult {
             tool_name,
             approved,
+            approver,
+            auto_rejected,
         }) => serde_json::json!({
             "type": "ApprovalResult",
             "tool_name": tool_name,
             "approved": approved,
+            "approver": approver,
+            "auto_rejected": auto_rejected,
         }),
         Err(err) => serde_json::json!({
             "type": "Error",
@@ -601,9 +646,11 @@ mod tests {
     fn test_event_to_json_session_created() {
         let v = agent_event_to_json(Ok(AgentEvent::SessionCreated {
             session_id: "s-42".to_string(),
+            memory_enabled: true,
         }));
         assert_eq!(v["type"], "SessionCreated");
         assert_eq!(v["session_id"], "s-42");
+        assert_eq!(v["memory_enabled"], true);
     }
 
     #[test]
@@ -682,9 +729,11 @@ mod tests {
             command: "rm -rf /tmp".to_string(),
             risk: "high".to_string(),
             alternative: "use trash".to_string(),
+            proposal_id: "ap-ws-1".to_string(),
         }));
         assert_eq!(v["type"], "ApprovalRequired");
         assert_eq!(v["tool_name"], "shell_exec");
+        assert_eq!(v["proposal_id"], "ap-ws-1");
     }
 
     #[test]
