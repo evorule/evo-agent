@@ -1202,7 +1202,7 @@ mod tests {
     #[tokio::test]
     async fn test_llm_status_endpoint_masks_key() {
         // 脱敏铁律:响应体不得包含 key 全值,只允许末 4 位提示
-        let secret = "sk-test-abcd1234wxyz";
+        let secret = "mask-fixture-abcd1234wxyz";
         let cfg = crate::config::LlmConfig {
             api_key: secret.to_string(),
             ..crate::config::LlmConfig::default()
