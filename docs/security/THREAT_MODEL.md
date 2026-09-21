@@ -19,9 +19,9 @@
 > **License**: CC0-1.0
 > **配套文档**:
 >
-> - evorule 机制层威胁 → 见主仓发布物（安全文档随主仓版本发布）
+> - evorule 机制层威胁 → 见 evorule 仓发布物（安全文档随该仓版本发布）
 > - 应用层威胁 → 内部资料，暂不公开
-> - 生态全栈旧版(已废弃)→ 见主仓 git 历史
+> - 生态全栈旧版(已废弃)→ 见 evorule 仓 git 历史
 
 ---
 
@@ -364,7 +364,7 @@ LLM (next iteration) + evorule fact log (审计)
 ### 10.1 内部
 
 - [`DESIGN_PRINCIPLES.md`](../../DESIGN_PRINCIPLES.md) — 5 设计原则
-- evorule 机制层威胁模型 → 见主仓发布物（安全文档随主仓版本发布）
+- evorule 机制层威胁模型 → 见 evorule 仓发布物（安全文档随该仓版本发布）
 - 应用层威胁模型 → 内部资料，暂不公开
 
 ### 10.2 外部方法学

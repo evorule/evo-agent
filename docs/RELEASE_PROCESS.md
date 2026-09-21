@@ -13,8 +13,8 @@
 ## 发布形态（如实声明）
 
 - **当前发布形态 = git tag**（`v{MAJOR}.{MINOR}.{PATCH}`，如 `v0.1.0`）。
-- 本仓自 O-044（2026-09-20）起与 evorule 主仓完全解耦，Cargo 依赖面仅第三方 crates，
-  crates.io 发布不再受主仓依赖阻塞；当前仍以 git tag 发布，crates.io 发布另行评估，届时补发布章节。
+- 本仓自 O-044（2026-09-20）起与 evorule 仓完全解耦，Cargo 依赖面仅第三方 crates，
+  crates.io 发布不再受 evorule 仓依赖阻塞；当前仍以 git tag 发布，crates.io 发布另行评估，届时补发布章节。
 - 下游使用方式：git 依赖 / 源码构建 / 预编译产物。
 
 ## 0. 前置条件
@@ -61,7 +61,7 @@ git ls-remote --tags origin v0.1.0
 ```
 
 - [ ] tag 在远端存在
-- [ ] 干净环境 clone 本仓后 `cargo build && cargo test` 通过（无需主仓）
+- [ ] 干净环境 clone 本仓后 `cargo build && cargo test` 通过（无需 evorule 仓）
 
 ## 附录：紧急回滚
 
