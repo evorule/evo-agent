@@ -63,6 +63,8 @@ impl ToolFunction for PublishSubmitTool {
             rule_version_ids,
             test_report_sandbox_id,
             description,
+            kind: None,
+            meta_rule_content: None,
         };
         let result = self
             .client

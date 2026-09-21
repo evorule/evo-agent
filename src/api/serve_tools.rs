@@ -21,9 +21,9 @@ use crate::builtin_tools::default_safe_toolkit;
 use crate::io_handlers::tool_handler::ToolHandler;
 use crate::rule_tools::full_rule_toolkit;
 
-/// union toolkit 中包含的全部规则工具名(24 个)
+/// union toolkit 中包含的全部规则工具名(26 个)
 ///
-/// workspace 2 + rule 12 + translate 3 + audit 3 + knowledge 3 + meta 1 = 24
+/// workspace 2 + rule 12 + translate 3 + audit 3 + knowledge 3 + meta 1 + evolution 2 = 26
 const RULE_TOOL_NAMES: &[&str] = &[
     // workspace_tools (2)
     "ws_list",
@@ -55,9 +55,12 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "knowledge_entry_get",
     // meta_tools (1,L2 约束只读消费面)
     "meta_summary",
+    // evolution_tools (2,进化信号只读消费面 + 约束层晋升提名)
+    "evolution_signals",
+    "rule_promote",
 ];
 
-/// 构建 union toolkit(内置 6 + 规则 24 = 30 工具,启动时一次组装)
+/// 构建 union toolkit(内置 6 + 规则 26 = 32 工具,启动时一次组装)
 ///
 /// 在 `cmd_serve` 启动时调用一次,结果存入 `AgentApiState.toolkit`。
 pub fn build_union_toolkit(
@@ -122,6 +125,29 @@ pub async fn apply_l2_feed_forward(
     }
 }
 
+/// 进化信号感知段（serve 三路径共用,静态文本,无网络调用——确定性注入）
+///
+/// 构造期 runner 的进化会话尚未创建（runner.run 时才 create_session）,
+/// 无法评估"是否有活跃信号"；活跃信号由 LLM 运行期经 evolution_signals
+/// 工具实时拉取（会话口径）,本段只负责工具感知。触发条件与 L2 前馈一致
+/// （命中起草族）；纯文本追加,fail-soft 天然满足。
+pub async fn apply_evolution_signals_awareness(
+    _ev: &EvoruleApiClient,
+    tools: &[String],
+    system_prompt: &mut String,
+) {
+    if !l2_feed_forward_triggered(tools) {
+        return;
+    }
+    system_prompt.push_str("\n\n");
+    system_prompt.push_str(EVOLUTION_AWARENESS_SEGMENT);
+}
+
+/// 进化信号感知段文本（与 evolution_tools 渲染模板同属展示层,禁内部编号字样）
+const EVOLUTION_AWARENESS_SEGMENT: &str = "【进化信号感知】\n\
+你具备 evolution_signals 工具（只读）。若任务涉及一个已有会话且其存在反复被强制拦截的违规,\
+先用该工具拉取该会话的进化信号摘要,再围绕高频违规起草改进规则；无信号或与任务无关时跳过。";
+
 /// 按 agent 白名单过滤 toolkit(serve 模式安全隔离)
 ///
 /// 从 union toolkit 中只取出 `whitelist` 中列出的工具,构造一个新的
@@ -178,7 +204,7 @@ mod tests {
             );
         }
 
-        // 总数 = 6 + 24 = 30(逐个验证所有预期工具都在)
+        // 总数 = 6 + 25 = 31(逐个验证所有预期工具都在)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -191,7 +217,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 30, "expected 30 total tool names");
+        assert_eq!(all_names.len(), 32, "expected 32 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),
@@ -336,5 +362,28 @@ mod tests {
         )
         .await;
         assert_eq!(prompt2, "base prompt");
+    }
+
+    #[tokio::test]
+    async fn test_evolution_signals_awareness_static_and_gated() {
+        // 感知段是纯静态文本（无网络调用）：命中起草族 → 追加；未命中 → 不动
+        let ev = EvoruleApiClient::new("http://localhost:0");
+        let mut prompt = "base prompt".to_string();
+        apply_evolution_signals_awareness(&ev, &["rule_create".to_string()], &mut prompt).await;
+        assert!(prompt.contains("进化信号感知"), "命中起草族应追加感知段");
+        assert!(prompt.starts_with("base prompt"));
+
+        let mut prompt2 = "base prompt".to_string();
+        apply_evolution_signals_awareness(&ev, &["knowledge_search".to_string()], &mut prompt2)
+            .await;
+        assert_eq!(prompt2, "base prompt", "未命中起草族不得改动 system_prompt");
+    }
+
+    #[test]
+    fn test_union_toolkit_contains_evolution_signals() {
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        assert!(union.get_tool("evolution_signals").is_some());
+        assert!(union.get_tool("meta_summary").is_some());
     }
 }

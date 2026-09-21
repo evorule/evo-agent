@@ -42,7 +42,7 @@
 | **会话沉淀** | 会话结束时自动写入摘要 + 稳定事实到共享空间 |
 | **工具注册中心** | `ToolRegistry` + `ToolFunction` trait，任何 `async fn(JsonValue) -> Result<JsonValue, String>` 都能注册 |
 | **3 层安全模型** | active（白名单）/ candidate（待批）/ blocked（永不），含 SSRF 防护 + 工作目录沙箱 |
-| **规则管理工具集** | 43 个工具：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + meta 1 |
+| **规则管理工具集** | 45 个工具：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + meta 1 + evolution 2 |
 | **工作流引擎** | DAG 拓扑编排多 Agent，同层并行 + 跨层串行 + 模板渲染 |
 | **MCP 客户端** | 接入 Model Context Protocol 工具生态（stdio 传输） |
 | **上下文窗口管理** | 按 token 数裁剪历史消息，保留 system + 最近若干轮 |
@@ -272,7 +272,7 @@ Agent 配置从 `agents/{type}.json` 加载：
 |-------|------|------|
 | `general` | 通用 Agent — 文件操作 + Shell + Web | file_read, file_list, file_write, search_files, shell_exec, http_get |
 | `researcher` | 研究 Agent — 只读搜索 | file_read, search_files, file_list |
-| `rule-copilot` | 规则协作 Agent — 34 个规则管理工具 | ws_*, rule_*, audit_*, translate_*, sandbox_*, dataset_*, publish_* |
+| `rule-copilot` | 规则协作 Agent — 23 个规则管理工具（白名单） | ws_*, rule_*, audit_*, translate_*, sandbox_*, dataset_*, publish_*, knowledge_*, meta_*, evolution_signals, rule_promote |
 
 ---
 
@@ -337,7 +337,7 @@ Agent 配置从 `agents/{type}.json` 加载：
 | `shell_exec` | 执行 Shell 命令（白名单 + candidate 审批） |
 | `http_get` | HTTP GET 请求（主机白名单 + SSRF 防护） |
 
-### 规则管理工具集（34 个）
+### 规则管理工具集（45 个）
 
 通过 `rule_management_toolkit` / `full_rule_toolkit` 组装，用于 `rule-copilot` Agent：
 
@@ -351,6 +351,10 @@ Agent 配置从 `agents/{type}.json` 加载：
 | dataset | 2 | 数据集管理 |
 | publish | 5 | 发布队列 + 三级权限 |
 | production | 2 | 生产环境管理 |
+| bundles | 5 | 规则包导入/列出/回滚 |
+| knowledge | 3 | 知识库检索 |
+| meta | 1 | meta_summary（L2 约束清单摘要） |
+| evolution | 2 | evolution_signals（进化信号拉取）+ rule_promote（约束层晋升提名） |
 
 ### MCP 工具接入
 
@@ -563,7 +567,7 @@ evo-agent/
 │   │   ├── http_get.rs
 │   │   ├── delegate_tool.rs         # Agent 委托工具
 │   │   └── mod.rs
-│   ├── rule_tools/                  # 34 个规则管理工具
+│   ├── rule_tools/                  # 45 个规则管理工具
 │   │   ├── workspace_tools.rs       #   workspace 2 个
 │   │   ├── rule_tools.rs            #   rule CRUD 12 个
 │   │   ├── translate_tools.rs       #   规则转换 3 个
@@ -614,7 +618,7 @@ evo-agent/
 | UI 联调 | ⏳ | 无前端联调，本轮仅后端 + CLI 验证 |
 | 编译告警 | ⚠️ | 主体为 `missing_docs`；另有少量 clippy 代码质量 lint 待清理 |
 
-> 规则管理工具集总数为 **34 个**（workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
+> 规则管理工具集总数为 **45 个**（workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + meta 1 + evolution 2），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
 
 ## 依赖关系
 

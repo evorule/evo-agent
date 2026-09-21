@@ -38,6 +38,11 @@
 
 ### 🆕 新增
 
+#### 进化信号（自进化信号消费 + 约束层晋升提名）
+- **`evolution_signals` 工具** — 拉取指定会话的违规信号聚合摘要（`GET /api/sessions/{id}/evolution-signals`，只读）：按规则归因聚合 enforce 拦截记录（计数降序→规则引用升序确定性排序）＋治理队列现状（待审普通规则/待审约束层晋升计数）；无信号返回「当前无进化信号」明示文本。规则工具集 43 → 45（serve union 30 → 32）；`agents/rule-copilot.json` 白名单加入 `evolution_signals` / `rule_promote`（版本号随动 0.2.0 → 0.3.0）
+- **`rule_promote` 工具** — 约束层晋升提名：经治理链发布队列（`POST /api/publish/queue`）提名，`kind` 在工具实现内硬编码为 `meta_promotion`（LLM 无改道普通通道的口子）；`promoted_from` 等溯源字段由服务端权威预填（防伪造）；进入人审队列后由治理方审批，agent 面不提供任何审批通道
+- **进化信号感知段前馈注入** — serve 三路径共用：与 L2 边界段同触发条件（起草族工具命中），静态文本注入 `evolution_signals` 工具感知（构造期会话未创建、无法预判活跃信号，活跃信号由 LLM 运行期经工具实时拉取——会话口径）；纯文本追加，fail-soft 天然满足
+
 #### 元规则（L2 约束）接入
 - **`meta_summary` 工具** — 查询当前生效的 L2 约束（元规则）清单摘要（`GET /api/rules/l2-inventory`，只读）；渲染为人类可读摘要文本（含守卫边界声明、禁项清单、路径读写约定、守卫指令类型），无 L2 时返回「当前无 L2 约束规则」明示文本。规则工具集 42 → 43（serve union 29 → 30）；`agents/general.json` / `agents/rule-copilot.json` 白名单各加入 `meta_summary`（版本号随动 0.3.0 / 0.2.0）
 - **L2 约束边界段前馈注入** — serve 三路径（WebSocket / 同步 run / SSE run-stream）共用 helper：agent 工具白名单命中 `rule_create` / `rule_update` / `rule_validate` 之一时，runner 构造期实时拉取 L2 清单并把边界段追加到 system_prompt 尾部（memory recall 包装在外层，既有语义顺序不变）——LLM 生成规则草稿前先知道约束边界在哪，降低「生成即被拒」的无效消耗。纯消费 agent 不注入；拉取失败或清单为空 fail-soft 不注入（warn 留痕，绝不阻断会话）
