@@ -438,8 +438,15 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         def.memory.memory_type = "persistent".to_string();
         def.memory.namespace = "general".to_string();
     }
+    // 与 HTTP 端点(run_agent / run_agent_stream)同口径:按 def.tools 白名单从
+    // state.toolkit(union 29 工具)过滤出该 agent 可用工具,挂 runner 的 tool_handler。
+    // 缺这步时 runner 的 tool_handler 为空 —— LLM 请求无工具契约(模型只能盲猜
+    // 或输出供应商原生 XML),也调不通 call_service 工具。
+    let filtered = crate::api::serve_tools::build_filtered_toolkit(state.toolkit(), &def.tools);
     let config = def.to_agent_config();
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
+        // 挂 filtered toolkit(同 HTTP 端点口径,见 run_agent)
+        .with_tool_handler(filtered)
         // G8:注入 HttpApproval — candidate 工具返回 needs_approval 时,
         // runner 通过 oneshot channel 等 POST /approve(60s 超时自动拒绝)
         .with_approval_callback(Arc::new(crate::agent::approval::HttpApproval::new(

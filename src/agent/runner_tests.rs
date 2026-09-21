@@ -558,6 +558,45 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
     }
 }
 
+#[test]
+fn test_resolve_llm_tools_prefers_server_relay() {
+    // server 中继生效(IoRequest.params.tools 为非空数组)→ 原样采用,不查本地
+    let client = make_test_client();
+    let runner = AgentRunner::new(AgentConfig::default(), client);
+    let relay = serde_json::json!([{"type": "function", "function": {"name": "rule_list"}}]);
+    let params = serde_json::json!({ "tools": relay });
+    assert_eq!(runner.resolve_llm_tools(&params), Some(relay));
+}
+
+#[test]
+fn test_resolve_llm_tools_falls_back_to_local_schema() {
+    // server 侧 tcb 0.6.1 的 io_request 解释器不支持 `tools?` 可选中继,
+    // IoRequest.params 实测可能为空 → 三种空形态(缺键/空数组/Null)都应回
+    // runner 本地 schema(openai_tools_payload),保证 LLM 请求始终携带工具契约
+    let client = make_test_client();
+    let mut runner = AgentRunner::new(AgentConfig::default(), client);
+    runner.tool_handler = make_handler_with(&["echo"]);
+    for params in [
+        serde_json::json!({}),
+        serde_json::json!({ "tools": [] }),
+        serde_json::json!({ "tools": null }),
+    ] {
+        let tools = runner
+            .resolve_llm_tools(&params)
+            .expect("本地 schema 应兜底");
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            names.contains(&"echo"),
+            "本地 schema 应含 echo, got {names:?}"
+        );
+    }
+}
+
 fn make_handler_with(tool_names: &[&str]) -> ToolHandler {
     use crate::io_handlers::tool_handler::ToolFunction;
     use std::sync::Arc;

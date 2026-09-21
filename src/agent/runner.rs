@@ -19,7 +19,9 @@ use tracing::{debug, info, warn};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::approval::{parse_approval_request, ApprovalCallback, ApprovalDecision};
+use crate::agent::approval::{
+    parse_approval_request, ApprovalCallback, ApprovalDecision, ApprovalRequest,
+};
 use crate::agent::callback::CallbackChain;
 use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
 use crate::agent::definition::{AgentDefinition, OutputFormat};
@@ -332,6 +334,17 @@ fn strip_markdown_codeblock(s: &str) -> String {
         Some(stripped) => stripped.trim().to_string(),
         None => result.to_string(),
     }
+}
+
+/// 本地工具执行产物(流式本地 ReAct 循环与 call_service IoRequest 分支共用)
+///
+/// stream! 宏的 yield 无法跨越函数边界,审批事件数据由调用方取出后自行 yield。
+struct ToolExecOutcome {
+    final_result: Value,
+    /// 审批留痕(本轮发生过审批时内嵌进 ToolResult.result,不扩 Fact 枚举)
+    approval_record: Option<Value>,
+    /// 发生审批时的 (请求, 决定),供调用方补发 ApprovalRequired/ApprovalResult
+    approval_flow: Option<(ApprovalRequest, ApprovalDecision)>,
 }
 
 /// G4:Agent 执行过程中的事件流
@@ -1257,6 +1270,10 @@ impl AgentRunner {
     fn openai_tools_payload(&self) -> Option<Vec<Value>> {
         let registered = self.tool_handler.tool_names();
         let mut specs = crate::builtin_tools::default_tool_specs();
+        // 规则工具静态 spec 并入:rule_tools 的 23 个工具若不在此处,会走 dynamic
+        // 分支产出空参数 schema,LLM 无从得知 workspace_id 等必填参数(实测盲传
+        // 导致 rule_list 失败)。spec 与执行器同源于 rule_tool_specs()。
+        specs.extend(crate::rule_tools::rule_tool_specs());
         if self.tool_handler.has_tool("delegate") {
             specs.push(crate::builtin_tools::delegate_tool::delegate_tool_spec());
         }
@@ -1312,6 +1329,24 @@ impl AgentRunner {
         } else {
             Some(tools)
         }
+    }
+
+    /// LLM 请求的 tools 来源:server 中继优先,缺省回 runner 本地 schema
+    ///
+    /// 原设计依赖 server 的 io_request 规则以 `tools?` 键把指令中的 tools 中继回
+    /// IoRequest.params;但 server 侧 evorule-tcb 0.6.1 的规则解释器尚不支持该
+    /// 可选中继语法,IoRequest.params 实测可能为空。tools 是 runner 的自有状态
+    /// (from_definition 已校验 ⊆ 注册集),本地兜底保证 serve 链路的 LLM 请求
+    /// 始终携带工具契约 —— 缺了它模型只能凭训练先验盲猜或输出供应商原生 XML,
+    /// 两侧解析器均无法消费。
+    fn resolve_llm_tools(&self, params: &Value) -> Option<Value> {
+        if let Some(tools) = params.get("tools") {
+            let non_empty = tools.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+            if non_empty {
+                return Some(tools.clone());
+            }
+        }
+        self.openai_tools_payload().map(Value::Array)
     }
 
     fn build_call_external_command(
@@ -1482,8 +1517,9 @@ impl AgentRunner {
         // 引擎 io_request 规则以 `tools?` 键中继指令的 tools;缺了它 LLM 只能凭
         // 训练先验盲猜工具名(如 read_file≠file_read)或输出供应商原生 XML,
         // 两侧解析器均无法消费 —— 与 build_call_external_command 的注入同源。
-        if let Some(tools) = params.get("tools") {
-            call_params.insert("tools".to_string(), tools.clone());
+        // server 中继缺省时回 runner 本地 schema(见 resolve_llm_tools)。
+        if let Some(tools) = self.resolve_llm_tools(params) {
+            call_params.insert("tools".to_string(), tools);
         }
 
         // G17:LLM 调用计时 + 指标(observe_llm_call 在 ? 之前记录,确保 error 也被统计)
@@ -1714,6 +1750,101 @@ impl AgentRunner {
             m.observe_tool_call(tool_name, tool_duration, tool_ok);
         }
         result
+    }
+
+    /// 执行单个工具调用(含 G8 审批流),不含事件与 io_response 收尾
+    ///
+    /// 背景(v0.5.0 后的多轮编排回归应用层):server 的 collect/merge 元指令已退役,
+    /// call_external 指令的 io_response 提交后指令即 Stable,不会再有下一轮 ——
+    /// 工具结果回喂 LLM 由 runner 本地 ReAct 循环负责(见 run_streaming_inner)。
+    /// 本方法把「审批 + 执行」从 call_service IoRequest 分支抽出共用;缓存命中
+    /// (G13 预执行写入)直接返回。缓存写入仍只发生在 G13 预执行,保持原行为。
+    async fn execute_tool_with_approval(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        args: &Value,
+    ) -> Result<ToolExecOutcome, AgentError> {
+        // G13:并行缓存命中(如果 call_external 已并行执行过此 active 工具,
+        // 直接返回缓存结果,跳过重复执行 + 审批;candidate 工具不缓存)
+        if let Some(cached) = self.check_parallel_cache(tool_name, args) {
+            info!(%session_id, tool = %tool_name, "G13: cache hit, skipping re-execution");
+            return Ok(ToolExecOutcome {
+                final_result: cached,
+                approval_record: None,
+                approval_flow: None,
+            });
+        }
+
+        // G8:第一次调用(不带 approved flag)→ 可能返回 needs_approval proposal
+        let tool_result = self.execute_tool_call(tool_name, args).await?;
+        let result_str = tool_result.to_string();
+        let approval_req = match parse_approval_request(session_id, tool_name, args, &result_str) {
+            None => {
+                return Ok(ToolExecOutcome {
+                    final_result: tool_result,
+                    approval_record: None,
+                    approval_flow: None,
+                });
+            }
+            Some(req) => req,
+        };
+
+        // 审批决策(无 callback = 默认拒绝,安全优先)
+        let decision = if let Some(cb) = &self.approval_callback {
+            cb.request_approval(&approval_req).await
+        } else {
+            ApprovalDecision {
+                approved: false,
+                approver: "auto".to_string(),
+                verified: true,
+                reason: "denied by policy".to_string(),
+                auto_rejected: false,
+            }
+        };
+
+        // 审批留痕 record(decided_at 用 epoch 秒)
+        let decided_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let decision_label = if decision.approved {
+            "approved"
+        } else if decision.auto_rejected {
+            "auto_rejected"
+        } else {
+            "rejected"
+        };
+        let record = serde_json::json!({
+            "proposal_id": approval_req.proposal_id,
+            "tool": tool_name,
+            "decision": decision_label,
+            "approver": decision.approver,
+            "verified": decision.verified,
+            "decided_at": decided_at,
+            "reason": decision.reason,
+        });
+
+        let final_result = if !decision.approved {
+            warn!(%session_id, tool = %tool_name, "G8: tool call rejected");
+            Value::from(r#"{"status":"rejected","message":"User denied approval"}"#)
+        } else {
+            // 批准 → 带 approved:true 重新调用(不递归检查 proposal)
+            info!(%session_id, tool = %tool_name, "G8: tool call approved, re-executing with approved=true");
+            let mut approved_args = args.clone();
+            if let Some(obj) = approved_args.as_object_mut() {
+                obj.insert("approved".to_string(), Value::Bool(true));
+            } else {
+                approved_args = serde_json::json!({"original_args": args, "approved": true});
+            }
+            self.execute_tool_call(tool_name, &approved_args).await?
+        };
+
+        Ok(ToolExecOutcome {
+            final_result,
+            approval_record: Some(record),
+            approval_flow: Some((approval_req, decision)),
+        })
     }
 
     // ===== G13:并行工具调用 =====
@@ -2409,11 +2540,58 @@ impl AgentRunner {
 
                         match io_type {
                             "call_external" => {
-                                // G1:流式调用 LLM
-                                let model = params.get("model").and_then(|v| v.as_str()).unwrap_or(&runner.config.model);
-                                let temperature = params.get("temperature").and_then(|v| v.as_f64())
+                                // ===== 本地 ReAct 循环(v0.5.0 后多轮编排回归应用层) =====
+                                // server 的 collect/merge 元指令已随 v0.5.0 退役,call_external
+                                // 指令的 io_response 提交后即 Stable,不会再有下一轮。工具结果
+                                // 回喂 LLM 由本循环负责:LLM 返回 tool_calls → 本地执行(审批/
+                                // 缓存经 execute_tool_with_approval) → tool 消息追加 → 再调
+                                // LLM;直到产出最终 content 才提交 io_response(中间态不提交,
+                                // server 无感知,无 IoRequest 响应超时风险)。回喂轮计入
+                                // step_count 受 max_steps 限流,防失控循环。
+                                let react_model = params
+                                    .get("model")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| runner.config.model.clone());
+                                let react_temperature = params
+                                    .get("temperature")
+                                    .and_then(|v| v.as_f64())
                                     .unwrap_or(runner.config.temperature as f64);
+                                let mut react_round: u32 = 0;
+                                'react: loop {
+                                    // 首轮 LLM 调用已随 IoRequest 到达计过 step(L2508),回喂轮补计
+                                    if react_round > 0 {
+                                        step_count += 1;
+                                        if step_count > runner.config.max_steps {
+                                            let err = AgentError::Internal(format!(
+                                                "达到最大步数上限({}),工具结果回喂终止",
+                                                runner.config.max_steps
+                                            ));
+                                            if let Some(rid) = request_id {
+                                                let err_str = err.to_string();
+                                                let _ = runner.evorule_client
+                                                    .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
+                                                    .await;
+                                            }
+                                            yield Ok(AgentEvent::Error(err.clone()));
+                                            let duration = start_time.elapsed().as_millis() as u64;
+                                            let _ = runner.flush_messages(&session_id).await;
+                                            yield Ok(AgentEvent::Done(AgentResult::error(
+                                                err.to_string(), step_count, duration,
+                                            )));
+                                            return;
+                                        }
+                                        info!(
+                                            %session_id,
+                                            round = react_round,
+                                            "本地 ReAct 回喂:工具结果已入列,发起下一轮 LLM 调用"
+                                        );
+                                    }
+                                    react_round += 1;
+                                    let model: &str = react_model.as_str();
+                                    let temperature = react_temperature;
 
+                                // G1:流式调用 LLM
                                 // G2+G10:裁剪 messages(同 handle_call_external)
                                 // G10:如果有 summarizer,裁剪掉的消息生成摘要替换 hint
                                 let messages_to_send = if let Some(ctx) = &runner.context_window {
@@ -2482,9 +2660,10 @@ impl AgentRunner {
                                 call_params.insert("model".to_string(), Value::from(model.to_string()));
                                 call_params.insert("temperature".to_string(), Value::from(temperature.to_string()));
                                 call_params.insert("messages".to_string(), tcb_messages);
-                                // 转发 constitution 中继的 tools(同 handle_call_external 非流式路径)
-                                if let Some(tools) = params.get("tools") {
-                                    call_params.insert("tools".to_string(), tools.clone());
+                                // 转发 constitution 中继的 tools(同 handle_call_external 非流式路径);
+                                // server 中继缺省时回 runner 本地 schema(见 resolve_llm_tools)
+                                if let Some(tools) = runner.resolve_llm_tools(&params) {
+                                    call_params.insert("tools".to_string(), tools);
                                 }
                                 let call_params_json = Value::Object(call_params);
 
@@ -2621,22 +2800,117 @@ impl AgentRunner {
                                     return;
                                 }
 
-                                // yield ToolCall 事件(如果有)
-                                if let Some(tcs) = &full_tool_calls {
-                                    for tc in tcs {
+                                // ===== ReAct 分叉:有 tool_calls → 本地执行回喂;无 → 提交收尾 =====
+                                let has_tool_calls = full_tool_calls
+                                    .as_ref()
+                                    .map(|tcs| !tcs.is_empty())
+                                    .unwrap_or(false);
+                                if has_tool_calls {
+                                    // 有 tool_calls:本地执行每个工具(审批/缓存经 helper),
+                                    // tool 消息入列后 continue 'react 发起回喂轮
+                                    let tcs = full_tool_calls.unwrap();
+                                    for tc in &tcs {
                                         yield Ok(AgentEvent::ToolCall {
                                             name: tc.name.clone(),
                                             args: tc.arguments.clone(),
                                         });
+                                        // 本地执行(含 G8 审批流 + G13 缓存命中)。
+                                        // 工具执行 Err(参数错/后端 404 等)不终止回合:错误
+                                        // 作为 tool 消息回喂,LLM 可重试/换路/放弃 —— 实测
+                                        // 硬终止会让一次 knowledge_search 404 毁掉整个草稿回合
+                                        let outcome = match runner
+                                            .execute_tool_with_approval(
+                                                &session_id,
+                                                &tc.name,
+                                                &tc.arguments,
+                                            )
+                                            .await
+                                        {
+                                            Ok(o) => o,
+                                            Err(e) => {
+                                                warn!(
+                                                    %session_id,
+                                                    tool = %tc.name,
+                                                    error = %e,
+                                                    "本地 ReAct:工具执行失败,错误作为 tool 消息回喂"
+                                                );
+                                                tool_calls.push(tc.name.clone());
+                                                let err_tool_msg = Message::Tool {
+                                                    content: serde_json::json!({
+                                                        "error": e.to_string(),
+                                                        "tool_name": tc.name,
+                                                    })
+                                                    .to_string(),
+                                                    tool_name: tc.name.clone(),
+                                                };
+                                                messages.push(err_tool_msg.clone());
+                                                if let Err(pe) = runner
+                                                    .persist_message(&session_id, messages.len() - 1, err_tool_msg)
+                                                    .await
+                                                {
+                                                    yield Err(pe);
+                                                    return;
+                                                }
+                                                yield Ok(AgentEvent::ToolResult {
+                                                    name: tc.name.clone(),
+                                                    result: serde_json::json!({
+                                                        "tool_name": tc.name,
+                                                        "result": serde_json::json!({"error": e.to_string()}).to_string(),
+                                                    }),
+                                                });
+                                                continue;
+                                            }
+                                        };
+                                        // 审批事件(yield ApprovalRequired/Result 给前端)
+                                        if let Some((req, decision)) = &outcome.approval_flow {
+                                            yield Ok(AgentEvent::ApprovalRequired {
+                                                tool_name: tc.name.clone(),
+                                                command: req.command.clone(),
+                                                risk: req.risk.clone(),
+                                                alternative: req.alternative.clone(),
+                                                proposal_id: req.proposal_id.clone(),
+                                            });
+                                            yield Ok(AgentEvent::ApprovalResult {
+                                                tool_name: tc.name.clone(),
+                                                approved: decision.approved,
+                                                approver: decision.approver.clone(),
+                                                auto_rejected: decision.auto_rejected,
+                                            });
+                                        }
+                                        // 记录 tool_calls(回合级汇总,Done/审计消费)+ tool 消息持久化
+                                        // (回喂轮 LLM 需要它;tool_call_id 配对由 LlmHandler
+                                        // 按 tool_name FIFO 匹配最近 assistant)
+                                        tool_calls.push(tc.name.clone());
+                                        let tool_idx = messages.len();
+                                        let tool_msg = Message::Tool {
+                                            content: outcome.final_result.to_string(),
+                                            tool_name: tc.name.clone(),
+                                        };
+                                        messages.push(tool_msg.clone());
+                                        if let Err(e) = runner.persist_message(&session_id, tool_idx, tool_msg).await {
+                                            yield Err(e);
+                                            return;
+                                        }
+                                        // ToolResult 事件(审批留痕内嵌)
+                                        let mut result_value = serde_json::json!({
+                                            "tool_name": tc.name,
+                                            "result": outcome.final_result.to_string(),
+                                        });
+                                        if let Some(record) = outcome.approval_record {
+                                            result_value["approval"] = record;
+                                        }
+                                        yield Ok(AgentEvent::ToolResult {
+                                            name: tc.name.clone(),
+                                            result: result_value,
+                                        });
                                     }
+                                    // 所有 tool 结果已入列 messages,回喂轮 LLM 将看到它们
+                                    continue 'react;
                                 }
 
-                                // 提交 io_response(同 handle_call_external)
+                                // 无 tool_calls:产出最终 content,提交 io_response 收尾
                                 if let Some(rid) = request_id {
-                                    let tool_calls_json: serde_json::Value = match &full_tool_calls {
-                                        Some(tcs) => serde_json::to_value(tcs).unwrap_or(serde_json::Value::Null),
-                                        None => serde_json::Value::Null,
-                                    };
+                                    let tool_calls_json: serde_json::Value = serde_json::Value::Null;
                                     let is_finished = matches!(finish_reason.as_deref(), Some("stop") | Some("end_turn"));
                                     let resp = serde_json::json!({
                                         "content": full_content,
@@ -2654,142 +2928,57 @@ impl AgentRunner {
                                         return;
                                     }
                                 }
+                                break 'react;
+                                } // end 'react loop
 
-                                // (工具执行由 evorule rules 驱动,evorule 会发出 call_service IoRequest)
+                                // (工具执行由本地 ReAct 循环驱动,不再依赖 server 的 collect/merge)
                             }
                             "call_service" => {
                                 let tool_name = params.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let args = params.get("args").cloned().unwrap_or(Value::Null);
                                 yield Ok(AgentEvent::ToolCall { name: tool_name.clone(), args: args.clone() });
 
-                                // 审批留痕(本轮发生过审批时内嵌进 io_response.result)
-                                let mut approval_record: Option<Value> = None;
-
-                                // G13:检查并行缓存(如果 call_external 已并行执行过此 active 工具,直接返回缓存结果,跳过重复执行 + 审批)
-                                // candidate 工具(proposal)不会被缓存,所以缓存命中的一定是 active 工具,无需审批
-                                let final_result = if let Some(cached) = runner.check_parallel_cache(&tool_name, &args) {
-                                    info!(%session_id, tool = %tool_name, "G13: call_service cache hit, skipping re-execution");
-                                    cached
-                                } else {
-                                    // G8:流式路径内联审批逻辑(不调 handle_call_service,以便 yield 审批事件)
-                                    // 非流式路径(run)仍用 handle_call_service(内部调 maybe_handle_approval,不产事件)
-                                    // 1. 第一次调用(不带 approved flag)→ 可能返回 needs_approval proposal
-                                    let tool_result = match runner.execute_tool_call(&tool_name, &args).await {
-                                        Ok(r) => r,
-                                        Err(e) => {
-                                            if let Some(rid) = request_id {
-                                                let err_str = e.to_string();
-                                                let err_resp = serde_json::json!({"error": &err_str});
-                                                let _ = runner.evorule_client
-                                                    .submit_io_response(&session_id, rid, &err_resp, Some(err_str.as_str()))
-                                                    .await;
-                                            }
-                                            yield Ok(AgentEvent::Error(e.clone()));
-                                            let duration = start_time.elapsed().as_millis() as u64;
-                                            let _ = runner.flush_messages(&session_id).await;
-                                            yield Ok(AgentEvent::Done(AgentResult::error(
-                                                e.to_string(), step_count, duration,
-                                            )));
-                                            return;
+                                // 审批+执行抽到 execute_tool_with_approval(与本地 ReAct 循环共用);
+                                // 事件仍在此处 yield(stream! 宏限制)。非流式路径(run)仍走
+                                // handle_call_service(内部 maybe_handle_approval,不产事件)
+                                let outcome = match runner
+                                    .execute_tool_with_approval(&session_id, &tool_name, &args)
+                                    .await
+                                {
+                                    Ok(o) => o,
+                                    Err(e) => {
+                                        if let Some(rid) = request_id {
+                                            let err_str = e.to_string();
+                                            let err_resp = serde_json::json!({"error": &err_str});
+                                            let _ = runner.evorule_client
+                                                .submit_io_response(&session_id, rid, &err_resp, Some(err_str.as_str()))
+                                                .await;
                                         }
-                                    };
-
-                                    // 2. 检查是否是审批 proposal,如果是则走审批流程(yield 事件)
-                                    let result_str = tool_result.to_string();
-                                    match parse_approval_request(
-                                        &session_id, &tool_name, &args, &result_str,
-                                    ) {
-                                        None => tool_result, // 不是 proposal,直接用第一次结果
-                                        Some(approval_req) => {
-                                            // 是 proposal → yield ApprovalRequired 给前端
-                                            yield Ok(AgentEvent::ApprovalRequired {
-                                                tool_name: tool_name.clone(),
-                                                command: approval_req.command.clone(),
-                                                risk: approval_req.risk.clone(),
-                                                alternative: approval_req.alternative.clone(),
-                                                proposal_id: approval_req.proposal_id.clone(),
-                                            });
-
-                                            // 问用户(无 callback = 默认拒绝,安全优先)
-                                            // borrow runner.approval_callback 仅在此 block 内,yield 已在 borrow 之前
-                                            let decision = if let Some(cb) = &runner.approval_callback {
-                                                cb.request_approval(&approval_req).await
-                                            } else {
-                                                ApprovalDecision {
-                                                    approved: false,
-                                                    approver: "auto".to_string(),
-                                                    verified: true,
-                                                    reason: "denied by policy".to_string(),
-                                                    auto_rejected: false,
-                                                }
-                                            };
-
-                                            yield Ok(AgentEvent::ApprovalResult {
-                                                tool_name: tool_name.clone(),
-                                                approved: decision.approved,
-                                                approver: decision.approver.clone(),
-                                                auto_rejected: decision.auto_rejected,
-                                            });
-
-                                            // 构造审批留痕 record(decided_at 用 epoch 秒)
-                                            let decided_at = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|d| d.as_secs())
-                                                .unwrap_or(0);
-                                            let decision_label = if decision.approved {
-                                                "approved"
-                                            } else if decision.auto_rejected {
-                                                "auto_rejected"
-                                            } else {
-                                                "rejected"
-                                            };
-                                            approval_record = Some(serde_json::json!({
-                                                "proposal_id": approval_req.proposal_id,
-                                                "tool": tool_name,
-                                                "decision": decision_label,
-                                                "approver": decision.approver,
-                                                "verified": decision.verified,
-                                                "decided_at": decided_at,
-                                                "reason": decision.reason,
-                                            }));
-
-                                            if !decision.approved {
-                                                warn!(%session_id, tool = %tool_name, "G8: streaming tool call rejected");
-                                                Value::from(
-                                                    r#"{"status":"rejected","message":"User denied approval"}"#,
-                                                )
-                                            } else {
-                                                // 批准 → 带 approved:true 重新调用(不递归检查 proposal)
-                                                info!(%session_id, tool = %tool_name, "G8: streaming tool call approved, re-executing with approved=true");
-                                                let mut approved_args = args.clone();
-                                                if let Some(obj) = approved_args.as_object_mut() {
-                                                    obj.insert("approved".to_string(), Value::Bool(true));
-                                                } else {
-                                                    approved_args = serde_json::json!({"original_args": args, "approved": true});
-                                                }
-                                                match runner.execute_tool_call(&tool_name, &approved_args).await {
-                                                    Ok(r) => r,
-                                                    Err(e) => {
-                                                        if let Some(rid) = request_id {
-                                                            let err_str = e.to_string();
-                                                            let err_resp = serde_json::json!({"error": &err_str});
-                                                            let _ = runner.evorule_client
-                                                                .submit_io_response(&session_id, rid, &err_resp, Some(err_str.as_str()))
-                                                                .await;
-                                                        }
-                                                        yield Ok(AgentEvent::Error(e.clone()));
-                                                        let duration = start_time.elapsed().as_millis() as u64;
-                                                        let _ = runner.flush_messages(&session_id).await;
-                                                        yield Ok(AgentEvent::Done(AgentResult::error(
-                                                            e.to_string(), step_count, duration,
-                                                        )));
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        yield Ok(AgentEvent::Error(e.clone()));
+                                        let duration = start_time.elapsed().as_millis() as u64;
+                                        let _ = runner.flush_messages(&session_id).await;
+                                        yield Ok(AgentEvent::Done(AgentResult::error(
+                                            e.to_string(), step_count, duration,
+                                        )));
+                                        return;
                                     }
                                 };
+                                if let Some((approval_req, decision)) = &outcome.approval_flow {
+                                    yield Ok(AgentEvent::ApprovalRequired {
+                                        tool_name: tool_name.clone(),
+                                        command: approval_req.command.clone(),
+                                        risk: approval_req.risk.clone(),
+                                        alternative: approval_req.alternative.clone(),
+                                        proposal_id: approval_req.proposal_id.clone(),
+                                    });
+                                    yield Ok(AgentEvent::ApprovalResult {
+                                        tool_name: tool_name.clone(),
+                                        approved: decision.approved,
+                                        approver: decision.approver.clone(),
+                                        auto_rejected: decision.auto_rejected,
+                                    });
+                                }
+                                let final_result = outcome.final_result;
 
                                 // 3. 记录 tool_calls + 持久化 tool 消息(同 handle_call_service)
                                 tool_calls.push(tool_name.clone());
@@ -2810,7 +2999,7 @@ impl AgentRunner {
                                     "tool_name": tool_name,
                                     "result": final_result.to_string(),
                                 });
-                                if let Some(record) = approval_record {
+                                if let Some(record) = outcome.approval_record {
                                     result_value["approval"] = record;
                                 }
                                 yield Ok(AgentEvent::ToolResult {
