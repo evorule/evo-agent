@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
-use serde_json::Value;
 use futures_core::Stream;
 use futures_util::StreamExt;
+use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use tokio_util::sync::CancellationToken;
@@ -1671,17 +1671,10 @@ impl AgentRunner {
     /// 从 `handle_call_service` 和流式路径的审批重调用共用。
     /// 第一次调用不带 `approved` flag → 工具可能返回 `needs_approval` proposal。
     /// 第二次调用(审批通过后)带 `approved:true` → 工具直接执行。
-    async fn execute_tool_call(
-        &self,
-        tool_name: &str,
-        args: &Value,
-    ) -> Result<Value, AgentError> {
+    async fn execute_tool_call(&self, tool_name: &str, args: &Value) -> Result<Value, AgentError> {
         let args_tcb = args.clone();
         let mut call_params = serde_json::Map::new();
-        call_params.insert(
-            "tool_name".to_string(),
-            Value::from(tool_name.to_string()),
-        );
+        call_params.insert("tool_name".to_string(), Value::from(tool_name.to_string()));
         call_params.insert("args".to_string(), args_tcb);
         // G17:工具调用计时 + 指标(单一插桩点,覆盖 run() / run_streaming() / G13 并行路径)
         let tool_start = std::time::Instant::now();
@@ -1860,11 +1853,7 @@ impl AgentRunner {
         self.execute_tool_call(tool_name, &approved_args).await
     }
 
-    async fn execute_external(
-        &self,
-        io_type: &str,
-        params: &Value,
-    ) -> Result<Value, AgentError> {
+    async fn execute_external(&self, io_type: &str, params: &Value) -> Result<Value, AgentError> {
         tokio::time::timeout(self.config.step_timeout, async {
             let mut instr = serde_json::Map::new();
             instr.insert("type".to_string(), Value::from(io_type.to_string()));

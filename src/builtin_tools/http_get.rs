@@ -491,10 +491,7 @@ mod tests {
         let result = tool
             .call(&Value::Object({
                 let mut m = serde_json::Map::new();
-                m.insert(
-                    "url".to_string(),
-                    Value::from("https://example.com/foo"),
-                );
+                m.insert("url".to_string(), Value::from("https://example.com/foo"));
                 m
             }))
             .await;
@@ -511,10 +508,7 @@ mod tests {
         let result = tool
             .call(&Value::Object({
                 let mut m = serde_json::Map::new();
-                m.insert(
-                    "url".to_string(),
-                    Value::from("https://192.168.1.1/admin"),
-                );
+                m.insert("url".to_string(), Value::from("https://192.168.1.1/admin"));
                 m.insert("approved".to_string(), Value::Bool(true));
                 m
             }))

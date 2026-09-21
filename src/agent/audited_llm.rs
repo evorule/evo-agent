@@ -263,10 +263,7 @@ impl AuditedLlm {
 /// `instruction.params.messages`，缺失会导致 path resolution failed）；
 /// `audit_purpose` 作为额外键写入 params —— 规则不读取该键，
 /// 但它随命令事实持久化进审计链，供审计侧区分调用类别。
-fn build_call_external_command(
-    purpose: &str,
-    params: &Value,
-) -> Result<serde_json::Value, String> {
+fn build_call_external_command(purpose: &str, params: &Value) -> Result<serde_json::Value, String> {
     let mut p = params.clone();
     match &mut p {
         serde_json::Value::Object(map) => {

@@ -169,9 +169,7 @@ mod tests {
     #[tokio::test]
     async fn test_tool_handler_execute_not_found() {
         let handler = ToolHandler::new();
-        let result = handler
-            .execute_by_name("nonexistent", &Value::Null)
-            .await;
+        let result = handler.execute_by_name("nonexistent", &Value::Null).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("tool not found"));
     }

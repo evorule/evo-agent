@@ -131,10 +131,7 @@ impl FileReadTool {
             "path".to_string(),
             Value::from(safe_path.display().to_string()),
         );
-        map.insert(
-            "size".to_string(),
-            Value::from(metadata.len() as i64),
-        );
+        map.insert("size".to_string(), Value::from(metadata.len() as i64));
         map.insert("content".to_string(), Value::from(content));
         Ok(Value::Object(map))
     }

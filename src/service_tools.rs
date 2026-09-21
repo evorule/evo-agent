@@ -286,15 +286,9 @@ mod tests {
         );
 
         let out = rt
-            .block_on(handler.execute_by_name(
-                "shape_svc",
-                &serde_json::json!({"key": "demo"}),
-            ))
+            .block_on(handler.execute_by_name("shape_svc", &serde_json::json!({"key": "demo"})))
             .unwrap();
-        assert_eq!(
-            out.clone(),
-            serde_json::json!({"result": "ok"})
-        );
+        assert_eq!(out.clone(), serde_json::json!({"result": "ok"}));
 
         let cap = captured.lock().unwrap();
         assert_eq!(cap[0].path, "/api/services", "第一次请求应为服务发现");
@@ -367,10 +361,7 @@ mod tests {
         assert_eq!(n, 1);
 
         let err = rt
-            .block_on(handler.execute_by_name(
-                "err_svc",
-                &serde_json::json!({}),
-            ))
+            .block_on(handler.execute_by_name("err_svc", &serde_json::json!({})))
             .unwrap_err();
         assert!(err.contains("500"), "应透传 HTTP 状态码: {err}");
         assert!(
