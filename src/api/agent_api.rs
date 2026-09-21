@@ -26,6 +26,7 @@ use crate::api::auth::AuthConfig;
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::metrics::{Metrics, SharedMetrics, SseConnectionGuard};
 use crate::api::workspace_client::WorkspaceApiClient;
+use crate::config::LlmStatusSnapshot;
 use crate::io_handlers::tool_handler::ToolHandler;
 
 /// G6:正在运行的 session → 取消令牌的映射(SessionStore)
@@ -143,6 +144,8 @@ pub struct AgentApiState {
     workspace_client: Arc<WorkspaceApiClient>,
     /// E1:预建 union toolkit(内置 + 规则,启动时组装一次)
     toolkit: Arc<ToolHandler>,
+    /// LLM 配置脱敏快照(凭据可视化状态端点;不含任何密钥内容)
+    llm_status: Arc<LlmStatusSnapshot>,
 }
 
 impl AgentApiState {
@@ -188,7 +191,19 @@ impl AgentApiState {
             workdir,
             workspace_client,
             toolkit,
+            llm_status: Arc::new(LlmStatusSnapshot::unconfigured()),
         }
+    }
+
+    /// 注入 LLM 配置脱敏快照(builder 风格,供 serve 启动时调用)
+    pub fn with_llm_status(mut self, snapshot: Arc<LlmStatusSnapshot>) -> Self {
+        self.llm_status = snapshot;
+        self
+    }
+
+    /// 获取 LLM 配置脱敏快照(状态端点消费)
+    pub fn llm_status(&self) -> &LlmStatusSnapshot {
+        &self.llm_status
     }
 
     /// G6:获取 SessionStore 的引用(供 G5 server 层做断开即取消等扩展)
@@ -260,6 +275,8 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
     Router::new()
         .route("/health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(metrics_handler))
+        // 凭据可视化:LLM 配置只读状态(脱敏,响应体不携带任何密钥内容)
+        .route("/admin/llm-status", axum::routing::get(get_llm_status))
         .route("/agents", axum::routing::get(list_agents))
         .route("/agents/{agent_type}", axum::routing::get(get_agent))
         .route("/agents/{agent_type}/run", axum::routing::post(run_agent))
@@ -331,6 +348,15 @@ async fn health() -> &'static str {
 /// 供 Prometheus / Grafana 抓取,豁免鉴权(参见 [`crate::api::auth::auth_middleware`] 的 PUBLIC_PATHS)。
 async fn metrics_handler(State(state): State<AgentApiState>) -> String {
     state.metrics.render()
+}
+
+/// LLM 配置只读状态端点(脱敏)
+///
+/// 路由:`GET /admin/llm-status` → [`LlmStatusSnapshot`]。
+/// 凭据可视化消费面:报告 provider/model/端点与 API key 存在性、末 4 位提示、
+/// 来源变量名。响应体**不携带任何密钥内容**(见 [`LlmStatusSnapshot`] 设计铁律)。
+async fn get_llm_status(State(state): State<AgentApiState>) -> Json<LlmStatusSnapshot> {
+    Json(state.llm_status().clone())
 }
 
 async fn list_agents(State(state): State<AgentApiState>) -> Json<AgentListResponse> {
@@ -1146,6 +1172,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_llm_status_endpoint_unconfigured() {
+        // 兼容路径默认 state → 未配置快照(configured=false / present=false)
+        let state = make_test_state();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["configured"], serde_json::Value::Bool(false));
+        assert_eq!(json["api_key"]["present"], serde_json::Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn test_llm_status_endpoint_masks_key() {
+        // 脱敏铁律:响应体不得包含 key 全值,只允许末 4 位提示
+        let secret = "sk-test-abcd1234wxyz";
+        let cfg = crate::config::LlmConfig {
+            api_key: secret.to_string(),
+            ..crate::config::LlmConfig::default()
+        };
+        let snapshot = cfg.status_snapshot(Some("MINIMAX_API_KEY"));
+        assert_eq!(snapshot.api_key.hint.as_deref(), Some("wxyz"));
+
+        let state = make_test_state().with_llm_status(std::sync::Arc::new(snapshot));
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains(secret), "response body leaked the API key");
+        assert!(text.contains("wxyz"), "last-4 hint should be present");
     }
 
     #[tokio::test]

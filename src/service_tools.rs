@@ -71,7 +71,6 @@ impl ToolFunction for ServiceProxyTool {
         self.ev
             .invoke_service(&self.service_name, &serde_args)
             .await
-            .map(|v| v.clone())
             .map_err(|e| format!("service {} invoke failed: {e}", self.service_name))
     }
 }

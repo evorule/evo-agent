@@ -909,10 +909,11 @@ fn cmd_serve(
             Err(e) => eprintln!("[service-tools] 临时 runtime 构建失败: {e}"),
         }
     }
+    let toolkit_tool_count = toolkit.tool_names().len();
     let toolkit = std::sync::Arc::new(toolkit);
     eprintln!(
-        "[tools] union toolkit assembled: {} tool(s) (6 builtin + 20 rule)",
-        26 // 6 builtin + 20 rule
+        "[tools] union toolkit assembled: {} tool(s)",
+        toolkit_tool_count
     );
     // G17:构造共享 metrics(供 /metrics 端点 + runner 插桩共用)
     let metrics = match evo_agent::Metrics::new() {
@@ -943,12 +944,18 @@ fn cmd_serve(
         workdir.to_path_buf(),
         workspace_client,
         toolkit,
-    );
+    )
+    // 凭据可视化:注入 LLM 配置脱敏快照(响应体不含任何密钥内容)
+    .with_llm_status(std::sync::Arc::new(
+        config
+            .llm
+            .status_snapshot(config.llm_api_key_source.as_deref()),
+    ));
 
     // G12:MCP 工具注册(P1 边界:只在 `run` 子命令生效)
     //
     // `serve` 模式已接入完整工具面(`src/api/serve_tools.rs`:union toolkit =
-    // 内置 6 + rule 20 共 26 工具,存 `AgentApiState.toolkit`,按 agent 白名单
+    // 内置 6 + 规则 23 共 29 工具,存 `AgentApiState.toolkit`,按 agent 白名单
     // `build_filtered_toolkit` 过滤后注入每请求 runner)。MCP 适配器需要共享
     // 长生命周期的 McpClient(子进程),按请求 spawn 代价过高,故未入 serve
     // toolkit。因此 P1 阶段 MCP 工具仅在 `evo-agent run` 中生效;serve 模式
@@ -992,6 +999,7 @@ fn cmd_serve(
     eprintln!("evo-agent HTTP server listening on http://{}", addr);
     eprintln!("  GET  /health                  (no auth)");
     eprintln!("  GET  /metrics                 (no auth, Prometheus G17)");
+    eprintln!("  GET  /admin/llm-status        (auth, masked LLM config status)");
     eprintln!("  GET  /agents                  (auth)");
     eprintln!("  POST /agents/{{type}}/run          (auth)");
     eprintln!("  POST /agents/{{type}}/run/stream   (auth, SSE)");
