@@ -94,6 +94,94 @@ fn default_context_window_tokens() -> usize {
     8192
 }
 
+/// LLM 配置只读状态(脱敏快照)
+///
+/// 凭据可视化端点 `GET /admin/llm-status` 的响应体。设计铁律:**不携带任何
+/// 密钥内容**——仅报告是否存在、末 4 位提示(长度 ≥8 才出具)与来源变量名。
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlmStatusSnapshot {
+    /// LLM 是否可用(key 已配置)
+    pub configured: bool,
+    /// provider 名称
+    pub provider: String,
+    /// 模型名
+    pub model: String,
+    /// API 端点(去除 query/fragment,不含凭据)
+    pub api_base: String,
+    /// API key 脱敏状态
+    pub api_key: ApiKeyStatus,
+}
+
+/// API key 脱敏状态
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ApiKeyStatus {
+    /// 是否已配置
+    pub present: bool,
+    /// 末 4 位提示(长度 < 8 时不出具,防短 key 猜测)
+    pub hint: Option<String>,
+    /// 来源:环境变量名(如 `MINIMAX_API_KEY`)或 `"config"`
+    pub source: Option<String>,
+}
+
+impl LlmStatusSnapshot {
+    /// 未配置态快照(state 兼容路径的默认值)
+    pub fn unconfigured() -> Self {
+        Self {
+            configured: false,
+            provider: String::new(),
+            model: String::new(),
+            api_base: String::new(),
+            api_key: ApiKeyStatus {
+                present: false,
+                hint: None,
+                source: None,
+            },
+        }
+    }
+}
+
+impl LlmConfig {
+    /// 生成脱敏状态快照
+    ///
+    /// `key_source` 为配置加载期记录的密钥来源
+    /// (见 `Config::llm_api_key_source`),透传不加工。
+    pub fn status_snapshot(&self, key_source: Option<&str>) -> LlmStatusSnapshot {
+        let present = !self.api_key.is_empty();
+        let hint = if self.api_key.chars().count() >= 8 {
+            let tail: String = self
+                .api_key
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            Some(tail)
+        } else {
+            None
+        };
+        // 端点仅保留协议+主机+路径,去掉 query/fragment(防 URL 携带凭据参数)
+        let api_base = self
+            .api_base
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        LlmStatusSnapshot {
+            configured: present,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            api_base,
+            api_key: ApiKeyStatus {
+                present,
+                hint,
+                source: key_source.map(|s| s.to_string()),
+            },
+        }
+    }
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -295,6 +383,13 @@ pub struct Config {
     #[serde(default)]
     /// G12:MCP server 配置(可配置多个 stdio MCP server)
     pub mcp: McpConfig,
+    /// LLM API key 的来源记录(脱敏状态端点用;不携带任何密钥内容)
+    ///
+    /// 取值:`Some(环境变量名)`(如 `MINIMAX_API_KEY` / `EVO_AGENT_LLM__API_KEY`)
+    /// 或 `Some("config")`(配置文件字面量)。`None` = 未配置。
+    /// 由 `apply_env_overrides` / `resolve_env_placeholders*` 在加载期填充。
+    #[serde(skip)]
+    pub llm_api_key_source: Option<String>,
 }
 
 /// 配置加载/解析错误
@@ -451,6 +546,7 @@ impl Config {
         }
         if let Ok(v) = std::env::var("EVO_AGENT_LLM__API_KEY") {
             self.llm.api_key = v;
+            self.llm_api_key_source = Some("EVO_AGENT_LLM__API_KEY".to_string());
         }
         if let Ok(v) = std::env::var("EVO_AGENT_LLM__MODEL") {
             self.llm.model = v;
@@ -511,6 +607,7 @@ impl Config {
 
     /// 解析 `${ENV:VAR_NAME}` 占位符
     fn resolve_env_placeholders(&mut self) -> Result<(), ConfigError> {
+        self.record_llm_api_key_source();
         self.llm.api_key = resolve_env_placeholder(&self.llm.api_key)?;
         if !self.evorule.api_key.is_empty() {
             self.evorule.api_key = resolve_env_placeholder(&self.evorule.api_key)?;
@@ -518,11 +615,29 @@ impl Config {
         Ok(())
     }
 
+    /// 在占位符解析前记录 API key 的来源(脱敏状态端点用,不含密钥内容)
+    ///
+    /// 优先级低于 `EVO_AGENT_LLM__API_KEY` 覆盖分支(该分支已先行记录)。
+    fn record_llm_api_key_source(&mut self) {
+        if self.llm_api_key_source.is_some() || self.llm.api_key.is_empty() {
+            return;
+        }
+        let source = self
+            .llm
+            .api_key
+            .strip_prefix("${ENV:")
+            .and_then(|s| s.strip_suffix('}'))
+            .map(|var| var.to_string())
+            .unwrap_or_else(|| "config".to_string());
+        self.llm_api_key_source = Some(source);
+    }
+
     /// 宽松解析 `${ENV:VAR_NAME}` 占位符
     ///
     /// 与 [`resolve_env_placeholders`](Self::resolve_env_placeholders) 的区别:
     /// 环境变量未设置时替换为空字符串,不报错。
     fn resolve_env_placeholders_lenient(&mut self) {
+        self.record_llm_api_key_source();
         self.llm.api_key = resolve_env_placeholder_lenient(&self.llm.api_key);
         if !self.evorule.api_key.is_empty() {
             self.evorule.api_key = resolve_env_placeholder_lenient(&self.evorule.api_key);

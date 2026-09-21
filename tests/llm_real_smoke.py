@@ -17,7 +17,7 @@ evo-agent 真实 LLM 冒烟测试
   - 联网
 
 # 运行
-  cd D:\evo-agent
+  cd <repo-root>(evo-agent 仓库根目录)
   python tests/llm_real_smoke.py
 """
 
@@ -161,7 +161,9 @@ class E2ETest:
                     {"role": "system", "content": "你是一个简洁的助手,用 1 句话回答。"},
                     {"role": "user", "content": "What is EvoRule in one sentence?"},
                 ],
-                max_tokens=200,
+                # 推理模型(M2.5)会先产出 reasoning_content 再给 content,
+                # max_tokens 过小时推理耗尽预算导致 content 为空(finish_reason=length)
+                max_tokens=1024,
             )
             duration = time.time() - start
             content = (
@@ -189,7 +191,7 @@ class E2ETest:
                     {"role": "system", "content": "你是 EvoRule 反应式执行引擎的助手。"},
                     {"role": "user", "content": "用一句话解释 EvoRule 是做什么的。"},
                 ],
-                max_tokens=200,
+                max_tokens=1024,
             )
             duration = time.time() - start
             content = (
@@ -226,7 +228,7 @@ class E2ETest:
                         "content": "把 x 增加 5",
                     },
                 ],
-                max_tokens=300,
+                max_tokens=1024,
             )
             duration = time.time() - start
             content = (

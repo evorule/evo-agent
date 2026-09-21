@@ -5,7 +5,7 @@
 //! E1:serve 模式工具组装 —— union toolkit + 按白名单过滤
 //!
 //! serve 模式下 `cmd_serve` 在启动时调用 [`build_union_toolkit`] 一次,组装
-//! 内置 6 + 规则 20 = 26 个工具的 union toolkit,存入 `AgentApiState.toolkit`。
+//! 内置 6 + 规则 23 = 29 个工具的 union toolkit,存入 `AgentApiState.toolkit`。
 //!
 //! 每次 `/agents/{type}/run` 请求时,handler 调用 [`build_filtered_toolkit`]
 //! 按 `def.tools` 白名单从 union 中过滤出该 agent 可用的工具,实现安全隔离。
@@ -18,9 +18,9 @@ use crate::builtin_tools::default_safe_toolkit;
 use crate::io_handlers::tool_handler::ToolHandler;
 use crate::rule_tools::full_rule_toolkit;
 
-/// union toolkit 中包含的全部规则工具名(20 个)
+/// union toolkit 中包含的全部规则工具名(23 个)
 ///
-/// workspace 2 + rule 12 + translate 3 + audit 3 = 20
+/// workspace 2 + rule 12 + translate 3 + audit 3 + knowledge 3 = 23
 const RULE_TOOL_NAMES: &[&str] = &[
     // workspace_tools (2)
     "ws_list",
@@ -46,9 +46,13 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "audit_get",
     "audit_verify",
     "session_rewind",
+    // knowledge_tools (3,只读消费面)
+    "knowledge_datasets",
+    "knowledge_search",
+    "knowledge_entry_get",
 ];
 
-/// 构建 union toolkit(内置 6 + 规则 20 = 26 工具,启动时一次组装)
+/// 构建 union toolkit(内置 6 + 规则 23 = 29 工具,启动时一次组装)
 ///
 /// 在 `cmd_serve` 启动时调用一次,结果存入 `AgentApiState.toolkit`。
 pub fn build_union_toolkit(
@@ -94,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_union_toolkit_registers_26_tools() {
+    fn test_build_union_toolkit_registers_29_tools() {
         let (ws, ev) = make_clients();
         let handler = build_union_toolkit(Path::new("."), &ws, &ev);
 
@@ -114,7 +118,7 @@ mod tests {
             );
         }
 
-        // 20 个规则工具
+        // 23 个规则工具
         for name in RULE_TOOL_NAMES {
             assert!(
                 handler.has_tool(name),
@@ -123,7 +127,7 @@ mod tests {
             );
         }
 
-        // 总数 = 6 + 20 = 26(逐个验证所有预期工具都在)
+        // 总数 = 6 + 23 = 29(逐个验证所有预期工具都在)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -136,13 +140,48 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 26, "expected 26 total tool names");
+        assert_eq!(all_names.len(), 29, "expected 29 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),
                 "tool {} missing from union toolkit",
                 name
             );
+        }
+    }
+
+    #[test]
+    fn test_agents_definitions_whitelist_resolvable_in_union() {
+        // agents/*.json 的 tools 白名单必须全部能从 union toolkit 解析
+        // (agent 白名单声明了 union 中不存在的工具名 = 该能力实际不可用)
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+
+        let defs = [
+            ("general.json", include_str!("../../agents/general.json")),
+            (
+                "rule-copilot.json",
+                include_str!("../../agents/rule-copilot.json"),
+            ),
+            (
+                "researcher.json",
+                include_str!("../../agents/researcher.json"),
+            ),
+        ];
+        for (file, raw) in defs {
+            let def: serde_json::Value = serde_json::from_str(raw)
+                .unwrap_or_else(|e| panic!("{file} is not valid JSON: {e}"));
+            let tools = def["tools"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{file} missing tools array"));
+            assert!(!tools.is_empty(), "{file} has empty tools whitelist");
+            for tool in tools {
+                let name = tool.as_str().unwrap();
+                assert!(
+                    union.has_tool(name),
+                    "{file} whitelists tool '{name}' which is not in the serve union toolkit"
+                );
+            }
         }
     }
 
