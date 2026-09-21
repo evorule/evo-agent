@@ -8,6 +8,7 @@ pub mod audit_tools;
 pub mod bundle_tools;
 pub mod dataset_tools;
 pub mod knowledge_tools;
+pub mod meta_tools;
 pub mod production_tools;
 pub mod publish_tools;
 pub mod rule_crud;
@@ -29,7 +30,7 @@ pub fn rule_management_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -
     h
 }
 
-/// 组装完整规则工具集（M3：内置 20 + 沙盒/发布 14 + bundles/knowledge 8 = 42 工具）
+/// 组装完整规则工具集（M3：内置 20 + 沙盒/发布 14 + bundles/knowledge 8 + meta 1 = 43 工具）
 pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
     let mut h = rule_management_toolkit(ws, ev);
     translate_tools::register(&mut h, ws);
@@ -39,10 +40,11 @@ pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> Tool
     production_tools::register(&mut h, ws);
     bundle_tools::register(&mut h, ws, ev);
     knowledge_tools::register(&mut h, ev);
+    meta_tools::register(&mut h, ev);
     h
 }
 
-/// 全部规则工具 spec（42 个）
+/// 全部规则工具 spec（43 个）
 pub fn rule_tool_specs() -> Vec<ToolSpec> {
     let mut specs = Vec::new();
     specs.extend(workspace_tools::specs());
@@ -55,6 +57,7 @@ pub fn rule_tool_specs() -> Vec<ToolSpec> {
     specs.extend(production_tools::specs());
     specs.extend(bundle_tools::specs());
     specs.extend(knowledge_tools::specs());
+    specs.extend(meta_tools::specs());
     specs
 }
 
@@ -65,7 +68,7 @@ mod tests {
     #[test]
     fn test_rule_tool_specs_count() {
         let specs = rule_tool_specs();
-        assert_eq!(specs.len(), 42, "expected 42 rule tool specs");
+        assert_eq!(specs.len(), 43, "expected 43 rule tool specs");
     }
 
     #[test]
@@ -121,7 +124,7 @@ mod tests {
                 name
             );
         }
-        assert_eq!(tools.len(), 20, "expected 20 tools in rule-copilot.json");
+        assert_eq!(tools.len(), 21, "expected 21 tools in rule-copilot.json");
     }
 
     #[test]
@@ -263,8 +266,10 @@ mod tests {
             "knowledge_datasets",
             "knowledge_search",
             "knowledge_entry_get",
+            // meta 1（L2 约束只读消费面）
+            "meta_summary",
         ];
-        assert_eq!(all_tools.len(), 42);
+        assert_eq!(all_tools.len(), 43);
         for name in &all_tools {
             assert!(
                 h.has_tool(name),

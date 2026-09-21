@@ -38,6 +38,10 @@
 
 ### 🆕 新增
 
+#### 元规则（L2 约束）接入
+- **`meta_summary` 工具** — 查询当前生效的 L2 约束（元规则）清单摘要（`GET /api/rules/l2-inventory`，只读）；渲染为人类可读摘要文本（含守卫边界声明、禁项清单、路径读写约定、守卫指令类型），无 L2 时返回「当前无 L2 约束规则」明示文本。规则工具集 42 → 43（serve union 29 → 30）；`agents/general.json` / `agents/rule-copilot.json` 白名单各加入 `meta_summary`（版本号随动 0.3.0 / 0.2.0）
+- **L2 约束边界段前馈注入** — serve 三路径（WebSocket / 同步 run / SSE run-stream）共用 helper：agent 工具白名单命中 `rule_create` / `rule_update` / `rule_validate` 之一时，runner 构造期实时拉取 L2 清单并把边界段追加到 system_prompt 尾部（memory recall 包装在外层，既有语义顺序不变）——LLM 生成规则草稿前先知道约束边界在哪，降低「生成即被拒」的无效消耗。纯消费 agent 不注入；拉取失败或清单为空 fail-soft 不注入（warn 留痕，绝不阻断会话）
+
 #### 生态公共设施化（公共契约面 + 契约测试 + 治理文档）
 - **公共契约面显式登记** — crate 级文档新增"公共契约面"章节：`LlmHandler`/`StreamChunk`/`ToolHandler` +
   `AuditedLlm` + `EvoruleApiClient`/`ApiError` + `IoHandler` + `config` 受 semver 约束

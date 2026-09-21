@@ -439,10 +439,18 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         def.memory.namespace = "general".to_string();
     }
     // 与 HTTP 端点(run_agent / run_agent_stream)同口径:按 def.tools 白名单从
-    // state.toolkit(union 29 工具)过滤出该 agent 可用工具,挂 runner 的 tool_handler。
+    // state.toolkit(union 30 工具)过滤出该 agent 可用工具,挂 runner 的 tool_handler。
     // 缺这步时 runner 的 tool_handler 为空 —— LLM 请求无工具契约(模型只能盲猜
     // 或输出供应商原生 XML),也调不通 call_service 工具。
     let filtered = crate::api::serve_tools::build_filtered_toolkit(state.toolkit(), &def.tools);
+    // L2 约束前馈:具备规则生成/校验能力的 agent,构造时把 L2 边界段追加到
+    // system_prompt 尾部(memory recall 在 runner 内层包装,顺序不变;fail-soft)
+    crate::api::serve_tools::apply_l2_feed_forward(
+        state.evorule_client(),
+        &def.tools,
+        &mut def.system_prompt,
+    )
+    .await;
     let config = def.to_agent_config();
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
         // 挂 filtered toolkit(同 HTTP 端点口径,见 run_agent)
