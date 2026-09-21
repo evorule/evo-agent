@@ -115,7 +115,7 @@ export MINIMAX_API_KEY=your-api-key
 
 ### 依赖契约
 
-evo-agent 自 O-044（2026-09-20）起与 evorule 主仓完全解耦：Cargo 依赖面仅第三方 crates，
+evo-agent 自 O-044（2026-09-20）起与 evorule 仓完全解耦：Cargo 依赖面仅第三方 crates，
 不引用任何 `evorule-*` crate，与 evorule-server 的交互只走 HTTP/WS 协议——clone 本仓后直接构建：
 
 ```bash
@@ -124,7 +124,7 @@ cd evo-agent
 cargo build          # 依赖自动从 crates.io 解析
 ```
 
-- **禁止 `evorule-*` 依赖**：本仓是 Agent 编排层，不依赖主仓机制层代码（TCB / Reactor）；
+- **禁止 `evorule-*` 依赖**：本仓是 Agent 编排层，不依赖 evorule 仓机制层代码（TCB / Reactor）；
   `verify.ps1` 第 4 步（依赖契约断言）会在 Cargo.toml 出现任何 `evorule-*` 依赖时判 FAIL。
 - 运行时仍需一个可达的 evorule-server 实例（见下节）。
 

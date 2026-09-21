@@ -183,13 +183,13 @@ test(e2e): 添加宪法核心冒烟测试
 
 参考:`tests/e2e_smoke.py`
 
-### Kani 形式化验证(仅 evorule 主仓)
+### Kani 形式化验证(仅 evorule 仓)
 
 evo-agent 与 TCB 无代码依赖(自 O-044 起完全解耦),本仓无需 Kani。
-tier0 元指令 / 域类型变更属于 evorule 主仓,须在主仓配套 Kani proof:
+tier0 元指令 / 域类型变更属于 evorule 仓,须在该仓配套 Kani proof:
 
 ```bash
-cargo kani -p evorule-tcb --features kani   # 在 evorule 主仓执行
+cargo kani -p evorule-tcb --features kani   # 在 evorule 仓执行
 ```
 
 ---
