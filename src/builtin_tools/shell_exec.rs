@@ -385,14 +385,8 @@ impl ShellExecTool {
 
         let mut map = serde_json::Map::new();
         map.insert("status".to_string(), Value::from("ok"));
-        map.insert(
-            "command".to_string(),
-            Value::from(original_cmd.to_string()),
-        );
-        map.insert(
-            "program".to_string(),
-            Value::from(program.to_string()),
-        );
+        map.insert("command".to_string(), Value::from(original_cmd.to_string()));
+        map.insert("program".to_string(), Value::from(program.to_string()));
         map.insert(
             "exit_code".to_string(),
             Value::from(output.status.code().unwrap_or(-1) as i64),
@@ -416,14 +410,8 @@ impl ShellExecTool {
     fn make_proposal(program: &str, original_cmd: &str, candidate: CandidateCommand) -> IoResult {
         let mut map = serde_json::Map::new();
         map.insert("status".to_string(), Value::from("needs_approval"));
-        map.insert(
-            "command".to_string(),
-            Value::from(original_cmd.to_string()),
-        );
-        map.insert(
-            "program".to_string(),
-            Value::from(program.to_string()),
-        );
+        map.insert("command".to_string(), Value::from(original_cmd.to_string()));
+        map.insert("program".to_string(), Value::from(program.to_string()));
         map.insert("category".to_string(), Value::from("candidate"));
         map.insert(
             "description".to_string(),

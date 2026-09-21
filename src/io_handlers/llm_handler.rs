@@ -16,11 +16,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_stream::stream;
-use serde_json::Value;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use rand::Rng;
 use serde_json;
+use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::agent::translator::{LlmResponse, TokenUsage, ToolCall};

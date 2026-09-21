@@ -207,18 +207,12 @@ impl SearchFilesTool {
 
         let truncated = results.len() >= max;
         let mut map = serde_json::Map::new();
-        map.insert(
-            "pattern".to_string(),
-            Value::from(pattern.to_string()),
-        );
+        map.insert("pattern".to_string(), Value::from(pattern.to_string()));
         map.insert(
             "dir".to_string(),
             Value::from(safe_dir.display().to_string()),
         );
-        map.insert(
-            "count".to_string(),
-            Value::from(results.len() as i64),
-        );
+        map.insert("count".to_string(), Value::from(results.len() as i64));
         map.insert("truncated".to_string(), Value::Bool(truncated));
         map.insert("results".to_string(), Value::Array(json_results));
 

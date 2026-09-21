@@ -342,10 +342,7 @@ mod tests {
         // 试图覆盖(没带 overwrite=true)
         let result = tool.call_sync(&Value::Object({
             let mut m = serde_json::Map::new();
-            m.insert(
-                "path".to_string(),
-                Value::from("workspace/exists.txt"),
-            );
+            m.insert("path".to_string(), Value::from("workspace/exists.txt"));
             m.insert("content".to_string(), Value::from("new"));
             m
         }));
@@ -618,10 +615,7 @@ mod tests {
         let tool = FileWriteTool::new(dir.path().to_path_buf());
         let result = tool.call_sync(&Value::Object({
             let mut m = serde_json::Map::new();
-            m.insert(
-                "path".to_string(),
-                Value::from("workspace/dangling.txt"),
-            );
+            m.insert("path".to_string(), Value::from("workspace/dangling.txt"));
             m.insert("content".to_string(), Value::from("escaped"));
             m
         }));

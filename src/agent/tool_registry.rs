@@ -164,10 +164,7 @@ impl ToolRegistry {
                 Value::Object({
                     let mut func = serde_json::Map::new();
                     func.insert("name".to_string(), Value::from(spec.name));
-                    func.insert(
-                        "description".to_string(),
-                        Value::from(spec.description),
-                    );
+                    func.insert("description".to_string(), Value::from(spec.description));
                     func.insert("parameters".to_string(), Value::Object(params));
                     if !required.is_empty() {
                         func.insert(

@@ -200,9 +200,7 @@ mod tests {
         std::fs::create_dir(dir.path().join(".git")).unwrap();
 
         let tool = FileListTool::new(dir.path().to_path_buf());
-        let result = tool
-            .call_sync(&Value::Object(Default::default()))
-            .unwrap();
+        let result = tool.call_sync(&Value::Object(Default::default())).unwrap();
         let entries = result.get("entries").unwrap();
         let count = entries.as_array().map(|a| a.len()).unwrap_or(0);
         assert_eq!(count, 1, "should only show visible.txt");
@@ -233,9 +231,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
 
         let tool = FileListTool::new(dir.path().to_path_buf());
-        let result = tool
-            .call_sync(&Value::Object(Default::default()))
-            .unwrap();
+        let result = tool.call_sync(&Value::Object(Default::default())).unwrap();
         let entries = result.get("entries").unwrap().as_array().unwrap();
         let mut by_name: std::collections::HashMap<String, String> = Default::default();
         for e in entries {
@@ -266,9 +262,7 @@ mod tests {
             std::fs::write(dir.path().join(format!("f{}.txt", i)), b"x").unwrap();
         }
         let tool = FileListTool::new(dir.path().to_path_buf()).with_max_entries(3);
-        let result = tool
-            .call_sync(&Value::Object(Default::default()))
-            .unwrap();
+        let result = tool.call_sync(&Value::Object(Default::default())).unwrap();
         let count = result.get("count").unwrap().as_i64().unwrap();
         let truncated = result.get("truncated").unwrap().as_bool().unwrap();
         assert_eq!(count, 3);

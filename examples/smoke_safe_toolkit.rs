@@ -189,10 +189,7 @@ async fn main() {
     println!("\n=== http_get (3-layer host + SSRF) ===");
     // Active host
     let r = http_get
-        .call(&arg_kv(&[(
-            "url",
-            Value::from("https://docs.rs/tokio"),
-        )]))
+        .call(&arg_kv(&[("url", Value::from("https://docs.rs/tokio"))]))
         .await;
     if let Ok(v) = r {
         let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
@@ -201,10 +198,7 @@ async fn main() {
 
     // Candidate host → proposal
     let r = http_get
-        .call(&arg_kv(&[(
-            "url",
-            Value::from("https://example.com/foo"),
-        )]))
+        .call(&arg_kv(&[("url", Value::from("https://example.com/foo"))]))
         .await;
     if let Ok(v) = r {
         let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
@@ -215,10 +209,7 @@ async fn main() {
     check(
         "127.0.0.1 blocked",
         http_get
-            .call(&arg_kv(&[(
-                "url",
-                Value::from("https://127.0.0.1/admin"),
-            )]))
+            .call(&arg_kv(&[("url", Value::from("https://127.0.0.1/admin"))]))
             .await
             .is_err(),
         true,
@@ -237,10 +228,7 @@ async fn main() {
     check(
         "http:// blocked",
         http_get
-            .call(&arg_kv(&[(
-                "url",
-                Value::from("http://example.com/foo"),
-            )]))
+            .call(&arg_kv(&[("url", Value::from("http://example.com/foo"))]))
             .await
             .is_err(),
         true,
