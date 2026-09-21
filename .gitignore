@@ -39,3 +39,6 @@ evo-agent.toml
 
 # 本地测试输出（cargo test 重定向产物）
 test_all_output.txt
+
+# Python E2E 脚本字节码缓存
+__pycache__/

@@ -1087,11 +1087,20 @@ pub struct SubmitPublishRequest {
     /// 进入发布的规则版本 ID 列表。
     pub rule_version_ids: Vec<String>,
     /// 验收依据的测试报告沙盒 ID。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_report_sandbox_id: Option<i64>,
     /// 发布说明。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// 队列项类型（缺省 normal；约束层晋升提名固定 meta_promotion）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// 转写后的约束层规则内容（JSON 字符串；仅 kind=meta_promotion 必填）。
+    ///
+    /// promoted_from/promoted_by 等溯源字段由服务端权威预填，客户端同名
+    /// 字段会被覆盖（防伪造溯源）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_rule_content: Option<String>,
 }
 
 /// 审批发布请求（对齐 server models.rs ReviewPublishRequest）
@@ -1443,12 +1452,17 @@ mod tests {
             rule_version_ids: vec!["rv1".to_string(), "rv2".to_string()],
             test_report_sandbox_id: Some(5),
             description: None,
+            kind: None,
+            meta_rule_content: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["workspace_id"], "01JTEST");
         assert_eq!(json["rule_version_ids"][1], "rv2");
         assert_eq!(json["test_report_sandbox_id"], 5);
         assert!(json["description"].is_null());
+        // Option 字段缺省时不序列化（skip_serializing_if）
+        assert!(json.get("kind").is_none());
+        assert!(json.get("meta_rule_content").is_none());
     }
 
     #[test]

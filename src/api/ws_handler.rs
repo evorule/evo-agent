@@ -451,6 +451,12 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         &mut def.system_prompt,
     )
     .await;
+    crate::api::serve_tools::apply_evolution_signals_awareness(
+        state.evorule_client(),
+        &def.tools,
+        &mut def.system_prompt,
+    )
+    .await;
     let config = def.to_agent_config();
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
         // 挂 filtered toolkit(同 HTTP 端点口径,见 run_agent)

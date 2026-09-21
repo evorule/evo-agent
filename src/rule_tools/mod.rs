@@ -7,6 +7,7 @@
 pub mod audit_tools;
 pub mod bundle_tools;
 pub mod dataset_tools;
+pub mod evolution_tools;
 pub mod knowledge_tools;
 pub mod meta_tools;
 pub mod production_tools;
@@ -30,7 +31,7 @@ pub fn rule_management_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -
     h
 }
 
-/// 组装完整规则工具集（M3：内置 20 + 沙盒/发布 14 + bundles/knowledge 8 + meta 1 = 43 工具）
+/// 组装完整规则工具集（M3：内置 20 + 沙盒/发布 14 + bundles/knowledge 8 + meta 1 + 进化信号 2 = 45 工具）
 pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
     let mut h = rule_management_toolkit(ws, ev);
     translate_tools::register(&mut h, ws);
@@ -41,10 +42,11 @@ pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> Tool
     bundle_tools::register(&mut h, ws, ev);
     knowledge_tools::register(&mut h, ev);
     meta_tools::register(&mut h, ev);
+    evolution_tools::register(&mut h, ws, ev);
     h
 }
 
-/// 全部规则工具 spec（43 个）
+/// 全部规则工具 spec（45 个）
 pub fn rule_tool_specs() -> Vec<ToolSpec> {
     let mut specs = Vec::new();
     specs.extend(workspace_tools::specs());
@@ -58,6 +60,7 @@ pub fn rule_tool_specs() -> Vec<ToolSpec> {
     specs.extend(bundle_tools::specs());
     specs.extend(knowledge_tools::specs());
     specs.extend(meta_tools::specs());
+    specs.extend(evolution_tools::specs());
     specs
 }
 
@@ -68,7 +71,7 @@ mod tests {
     #[test]
     fn test_rule_tool_specs_count() {
         let specs = rule_tool_specs();
-        assert_eq!(specs.len(), 43, "expected 43 rule tool specs");
+        assert_eq!(specs.len(), 45, "expected 45 rule tool specs");
     }
 
     #[test]
@@ -124,7 +127,7 @@ mod tests {
                 name
             );
         }
-        assert_eq!(tools.len(), 21, "expected 21 tools in rule-copilot.json");
+        assert_eq!(tools.len(), 23, "expected 23 tools in rule-copilot.json");
     }
 
     #[test]

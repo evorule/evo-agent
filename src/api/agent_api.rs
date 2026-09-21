@@ -464,6 +464,12 @@ async fn run_agent(
         &mut def.system_prompt,
     )
     .await;
+    crate::api::serve_tools::apply_evolution_signals_awareness(
+        &state.evorule_client,
+        &def.tools,
+        &mut def.system_prompt,
+    )
+    .await;
     let mut runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
@@ -540,6 +546,12 @@ async fn run_agent_stream(
     let filtered = crate::api::serve_tools::build_filtered_toolkit(&state.toolkit, &def.tools);
     // L2 约束前馈:同 run_agent 口径(三路径共用 helper;fail-soft)
     crate::api::serve_tools::apply_l2_feed_forward(
+        &state.evorule_client,
+        &def.tools,
+        &mut def.system_prompt,
+    )
+    .await;
+    crate::api::serve_tools::apply_evolution_signals_awareness(
         &state.evorule_client,
         &def.tools,
         &mut def.system_prompt,

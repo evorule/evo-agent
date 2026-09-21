@@ -40,7 +40,7 @@ pub fn render_l2_inventory_summary(inv: &Value) -> Option<String> {
     );
     out.push_str("禁项：\n");
     out.push_str(
-        "- 禁止在业务规则中声明约束层层级标记（metadata.tier=\"meta\"）冒充约束层——层级门禁会拒载该文件；\n",
+        "- 禁止在业务规则中声明约束层层级标记（metadata.tier=\"constraint\" 或旧值 \"meta\"）冒充约束层——层级门禁会拒载该文件；\n",
     );
     out.push_str("- 禁止写入守卫保留的 metadata 保留域（保留域拒绝写入）；\n");
     out.push_str(
@@ -135,7 +135,7 @@ mod tests {
             "count": 1,
             "files": [
                 {
-                    "path": "00_meta_seed.json",
+                    "path": "00_constraint_seed.json",
                     "title": "种子元规则：运动安全哨兵",
                     "guard_for": ["validate_precision", "robot_move"]
                 }
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn test_render_contains_guard_line_and_boundary_text() {
         let text = render_l2_inventory_summary(&sample_inventory()).expect("非空清单应渲染");
-        assert!(text.contains("00_meta_seed.json"));
+        assert!(text.contains("00_constraint_seed.json"));
         assert!(text.contains("种子元规则"));
         assert!(text.contains("validate_precision, robot_move"));
         // 边界声明 + 禁项 + 路径约定四段齐全

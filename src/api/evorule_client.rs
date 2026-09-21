@@ -56,6 +56,32 @@ impl EvoruleApiClient {
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
+    /// GET /api/sessions/{id}/evolution-signals —— 进化信号只读聚合（自进化）
+    ///
+    /// 返回 `{session_id, total_violations, signals:[{kind,rule_ref,reason_summary,
+    /// count,last_version,last_instr_type}], queue:{pending_normal,pending_meta_promotion}}`
+    /// （服务端 fail-soft：空会话/不可读 → 200 + 空信号）。供 evolution_signals
+    /// 工具与前馈注入共用。`limit` 为 Some 时携带 `?limit=`（0 = 不限）。
+    pub async fn get_evolution_signals(
+        &self,
+        session_id: u64,
+        limit: Option<usize>,
+    ) -> Result<Value, ApiError> {
+        let mut url = self
+            .core
+            .url(&format!("/api/sessions/{session_id}/evolution-signals"));
+        if let Some(n) = limit {
+            url.push_str(&format!("?limit={n}"));
+        }
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// GET /api/services —— 执行侧服务能力对账(服务消费契约的发现端)
     ///
     /// 返回 `[{name, source, version?, description?, plugin?, sensitive}, ...]`。
