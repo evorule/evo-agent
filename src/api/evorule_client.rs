@@ -41,6 +41,21 @@ impl EvoruleApiClient {
         self.core.base_url()
     }
 
+    /// GET /api/rules/l2-inventory —— L2 约束（元规则）只读清单投影
+    ///
+    /// 返回 `{count, files:[{path,title,guard_for}]}`（服务端 fail-soft：任何扫描/解析
+    /// 失败均跳过，全失败返回空清单）。供 meta_summary 工具与前馈注入共用。
+    pub async fn get_l2_inventory(&self) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/rules/l2-inventory");
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// GET /api/services —— 执行侧服务能力对账(服务消费契约的发现端)
     ///
     /// 返回 `[{name, source, version?, description?, plugin?, sensitive}, ...]`。

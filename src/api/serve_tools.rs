@@ -5,10 +5,13 @@
 //! E1:serve 模式工具组装 —— union toolkit + 按白名单过滤
 //!
 //! serve 模式下 `cmd_serve` 在启动时调用 [`build_union_toolkit`] 一次,组装
-//! 内置 6 + 规则 23 = 29 个工具的 union toolkit,存入 `AgentApiState.toolkit`。
+//! 内置 6 + 规则 24 = 30 个工具的 union toolkit,存入 `AgentApiState.toolkit`。
 //!
 //! 每次 `/agents/{type}/run` 请求时,handler 调用 [`build_filtered_toolkit`]
 //! 按 `def.tools` 白名单从 union 中过滤出该 agent 可用的工具,实现安全隔离。
+//!
+//! 本模块还提供 [`apply_l2_feed_forward`]——serve 三路径（WS / run / run-stream）
+//! 共用的 L2 约束边界段前馈注入 helper。
 
 use std::path::Path;
 
@@ -18,9 +21,9 @@ use crate::builtin_tools::default_safe_toolkit;
 use crate::io_handlers::tool_handler::ToolHandler;
 use crate::rule_tools::full_rule_toolkit;
 
-/// union toolkit 中包含的全部规则工具名(23 个)
+/// union toolkit 中包含的全部规则工具名(24 个)
 ///
-/// workspace 2 + rule 12 + translate 3 + audit 3 + knowledge 3 = 23
+/// workspace 2 + rule 12 + translate 3 + audit 3 + knowledge 3 + meta 1 = 24
 const RULE_TOOL_NAMES: &[&str] = &[
     // workspace_tools (2)
     "ws_list",
@@ -50,9 +53,11 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "knowledge_datasets",
     "knowledge_search",
     "knowledge_entry_get",
+    // meta_tools (1,L2 约束只读消费面)
+    "meta_summary",
 ];
 
-/// 构建 union toolkit(内置 6 + 规则 23 = 29 工具,启动时一次组装)
+/// 构建 union toolkit(内置 6 + 规则 24 = 30 工具,启动时一次组装)
 ///
 /// 在 `cmd_serve` 启动时调用一次,结果存入 `AgentApiState.toolkit`。
 pub fn build_union_toolkit(
@@ -69,6 +74,52 @@ pub fn build_union_toolkit(
         }
     }
     handler
+}
+
+// =============================================================================
+// L2 约束边界段前馈注入（serve 三路径共用 helper）
+// =============================================================================
+
+/// 前馈触发工具集：白名单命中其一 = 具备规则生成/校验能力，才注入 L2 边界段
+///
+/// 纯消费 agent（如 researcher 类）不命中 → 不注入（对齐「仅规则草稿请求注入」语义）。
+const L2_FEED_FORWARD_TRIGGER_TOOLS: &[&str] = &["rule_create", "rule_update", "rule_validate"];
+
+/// 前馈触发条件判定（确定性）：`tools ∩ L2_FEED_FORWARD_TRIGGER_TOOLS ≠ ∅`
+pub fn l2_feed_forward_triggered(tools: &[String]) -> bool {
+    tools
+        .iter()
+        .any(|t| L2_FEED_FORWARD_TRIGGER_TOOLS.contains(&t.as_str()))
+}
+
+/// serve 三路径共用：L2 约束边界段前馈注入（拉取 + 渲染 + 追加 system_prompt 尾部）
+///
+/// - 触发条件：`tools ∩ {rule_create, rule_update, rule_validate} ≠ ∅`；
+/// - 注入位置：`system_prompt` 尾部追加（memory recall 在 runner 内层包装，
+///   既有语义顺序不变）；
+/// - fail-soft：拉取失败/端点不可达 → warn 留痕 + 不注入，绝不阻断会话；
+///   L2 清单为空 → 不注入。
+///
+/// 时效：每次 runner 构造实时拉取（无缓存）——元规则增删下一轮即反映。
+pub async fn apply_l2_feed_forward(
+    ev: &EvoruleApiClient,
+    tools: &[String],
+    system_prompt: &mut String,
+) {
+    if !l2_feed_forward_triggered(tools) {
+        return;
+    }
+    let inv = match ev.get_l2_inventory().await {
+        Ok(inv) => inv,
+        Err(e) => {
+            tracing::warn!(error = %e, "L2 feed-forward fetch failed; continuing without injection");
+            return;
+        }
+    };
+    if let Some(segment) = crate::rule_tools::meta_tools::render_l2_inventory_summary(&inv) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&segment);
+    }
 }
 
 /// 按 agent 白名单过滤 toolkit(serve 模式安全隔离)
@@ -98,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_union_toolkit_registers_29_tools() {
+    fn test_build_union_toolkit_registers_30_tools() {
         let (ws, ev) = make_clients();
         let handler = build_union_toolkit(Path::new("."), &ws, &ev);
 
@@ -127,7 +178,7 @@ mod tests {
             );
         }
 
-        // 总数 = 6 + 23 = 29(逐个验证所有预期工具都在)
+        // 总数 = 6 + 24 = 30(逐个验证所有预期工具都在)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -140,7 +191,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 29, "expected 29 total tool names");
+        assert_eq!(all_names.len(), 30, "expected 30 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),
@@ -246,5 +297,44 @@ mod tests {
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
 
         assert!(union.get_tool("nonexistent").is_none());
+    }
+
+    // ===== L2 约束前馈注入 helper 测试 =====
+
+    #[test]
+    fn test_l2_feed_forward_triggered_by_rule_tools() {
+        // 命中触发工具之一 → 注入
+        assert!(l2_feed_forward_triggered(&["rule_create".to_string()]));
+        assert!(l2_feed_forward_triggered(&[
+            "rule_list".to_string(),
+            "rule_update".to_string()
+        ]));
+        assert!(l2_feed_forward_triggered(&["rule_validate".to_string()]));
+        // 纯消费白名单 → 不注入
+        assert!(!l2_feed_forward_triggered(&[]));
+        assert!(!l2_feed_forward_triggered(&[
+            "file_read".to_string(),
+            "rule_list".to_string(),
+            "knowledge_search".to_string()
+        ]));
+    }
+
+    #[tokio::test]
+    async fn test_apply_l2_feed_forward_fail_soft() {
+        // 端点不可达（localhost:0 连接失败）→ 不注入不 panic；未命中触发 → 不发请求直接返回
+        let ev = EvoruleApiClient::new("http://localhost:0");
+        let mut prompt = "base prompt".to_string();
+        apply_l2_feed_forward(&ev, &["rule_create".to_string()], &mut prompt).await;
+        assert_eq!(prompt, "base prompt", "拉取失败不得改动 system_prompt");
+
+        // 未命中触发条件 → 不注入
+        let mut prompt2 = "base prompt".to_string();
+        apply_l2_feed_forward(
+            &ev,
+            &["file_read".to_string(), "rule_list".to_string()],
+            &mut prompt2,
+        )
+        .await;
+        assert_eq!(prompt2, "base prompt");
     }
 }

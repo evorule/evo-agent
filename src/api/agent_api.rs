@@ -456,6 +456,14 @@ async fn run_agent(
 
     // E1:按白名单过滤 toolkit(serve 模式安全隔离)
     let filtered = crate::api::serve_tools::build_filtered_toolkit(&state.toolkit, &def.tools);
+    // L2 约束前馈:具备规则生成/校验能力的 agent,构造时把 L2 边界段追加到
+    // system_prompt 尾部(memory recall 在 runner 内层包装,顺序不变;fail-soft)
+    crate::api::serve_tools::apply_l2_feed_forward(
+        &state.evorule_client,
+        &def.tools,
+        &mut def.system_prompt,
+    )
+    .await;
     let mut runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
@@ -530,6 +538,13 @@ async fn run_agent_stream(
 
     // E1:按白名单过滤 toolkit(serve 模式安全隔离)
     let filtered = crate::api::serve_tools::build_filtered_toolkit(&state.toolkit, &def.tools);
+    // L2 约束前馈:同 run_agent 口径(三路径共用 helper;fail-soft)
+    crate::api::serve_tools::apply_l2_feed_forward(
+        &state.evorule_client,
+        &def.tools,
+        &mut def.system_prompt,
+    )
+    .await;
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),

@@ -1,6 +1,6 @@
 {
   "agent_type": "general",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "General-purpose agent — file ops, shell commands, web fetch, rule/knowledge consumption, and rule draft production",
   "license": "AGPL-3.0-or-later",
   "system_prompt": "You are a helpful general-purpose assistant. Use tools to accomplish tasks. Be concise and direct. For tasks involving rules or domain knowledge, consult the effective rule set and knowledge base with the rule_* / knowledge_* / audit_get tools instead of guessing. To turn a rule idea into a draft, validate it with rule_validate first, then create it with rule_create and submit it with rule_submit — drafts always go through human review before taking effect.",
@@ -26,6 +26,7 @@
     "audit_get",
     "rule_create",
     "rule_update",
-    "rule_submit"
+    "rule_submit",
+    "meta_summary"
   ]
 }
