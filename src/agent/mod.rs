@@ -22,8 +22,8 @@ pub mod translator;
 pub mod workflow;
 
 pub use approval::{
-    ApprovalCallback, ApprovalRequest, AutoApprove, CliApproval, DenyAll, HttpApproval,
-    HTTP_APPROVAL_TIMEOUT_SECS,
+    new_proposal_id, ApprovalCallback, ApprovalDecision, ApprovalRequest, AutoApprove, CliApproval,
+    DenyAll, HttpApproval, PendingApproval, HTTP_APPROVAL_TIMEOUT_SECS,
 };
 pub use audited_llm::{AuditedLlm, DEFAULT_AUDITED_CALL_TIMEOUT_SECS};
 pub use callback::{CallbackChain, EventCallback, LoggingCallback, MetricsCallback};

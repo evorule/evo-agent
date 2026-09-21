@@ -19,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::agent::{AgentDefinitionManager, AgentError, AgentEvent, AgentRunner};
+use crate::agent::{
+    AgentDefinitionManager, AgentError, AgentEvent, AgentRunner, ApprovalDecision, PendingApproval,
+};
 use crate::api::auth::AuthConfig;
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::metrics::{Metrics, SharedMetrics, SseConnectionGuard};
@@ -108,14 +110,16 @@ pub struct AgentDefinitionResponse {
     pub memory_config: Option<crate::agent::MemoryConfig>,
 }
 
-/// G8:正在等待审批的 session → oneshot sender(ApprovalStore)
+/// G8:正在等待审批的 session → pending 审批项(ApprovalStore)
 ///
-/// - 流式端点 `run_agent_stream` 在 `ApprovalRequired` 时由 `HttpApproval` 插入 sender
-/// - `/approve` 端点按 `session_id` 取出 sender 并发送 `approved: bool`
+/// - 流式端点 `run_agent_stream` 在 `ApprovalRequired` 时由 `HttpApproval` 插入
+///   `PendingApproval`(oneshot sender + 提案 ID)
+/// - `/approve` 端点按 `session_id` 取出 pending 项,校验提案 ID 后发送
+///   [`ApprovalDecision`](crate::agent::ApprovalDecision)
 /// - 超时(`HTTP_APPROVAL_TIMEOUT_SECS` 秒)后 `HttpApproval` 自动清理 + 拒绝
 ///
 /// 用 `std::sync::Mutex`(临界区是 O(1) HashMap 操作,无 await)。
-pub type ApprovalStore = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
+pub type ApprovalStore = Arc<Mutex<HashMap<String, PendingApproval>>>;
 
 /// Agent API state
 #[derive(Debug, Clone)]
@@ -375,17 +379,37 @@ async fn get_agent(
     }))
 }
 
-async fn run_agent(
-    State(state): State<AgentApiState>,
-    axum::extract::Path(agent_type): axum::extract::Path<String>,
-    Json(req): Json<AgentRunRequest>,
-) -> Result<Json<AgentRunResponse>, (StatusCode, String)> {
-    let mut def = state.definitions.load(&agent_type).map_err(|_| {
+/// serve 模式定义加载 —— general agent 缺省补记忆基础档
+///
+/// - 按 agent_type 加载 agent 定义,失败返回 404
+/// - `general` 定义未配置 memory(或配为 none)时,注入最小持久记忆档
+///   (persistent + `general` 命名空间),使多轮 continuation 能回注历史;
+///   CLI 路径与显式配置过 memory 的定义不受影响
+fn load_serve_definition(
+    state: &AgentApiState,
+    agent_type: &str,
+) -> Result<crate::agent::definition::AgentDefinition, (StatusCode, String)> {
+    let mut def = state.definitions.load(agent_type).map_err(|_| {
         (
             StatusCode::NOT_FOUND,
             format!("agent '{}' not found", agent_type),
         )
     })?;
+    if agent_type == "general"
+        && (def.memory.memory_type == "none" || def.memory.memory_type.is_empty())
+    {
+        def.memory.memory_type = "persistent".to_string();
+        def.memory.namespace = "general".to_string();
+    }
+    Ok(def)
+}
+
+async fn run_agent(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(agent_type): axum::extract::Path<String>,
+    Json(req): Json<AgentRunRequest>,
+) -> Result<Json<AgentRunResponse>, (StatusCode, String)> {
+    let mut def = load_serve_definition(&state, &agent_type)?;
 
     // E1:per-request 覆盖直接改 def(from_definition 内部会调 to_agent_config)
     if let Some(max_steps) = req.max_steps {
@@ -459,12 +483,7 @@ async fn run_agent_stream(
     Json(req): Json<AgentRunRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + Send + 'static>, (StatusCode, String)>
 {
-    let mut def = state.definitions.load(&agent_type).map_err(|_| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("agent '{}' not found", agent_type),
-        )
-    })?;
+    let mut def = load_serve_definition(&state, &agent_type)?;
 
     // E1:per-request 覆盖直接改 def(from_definition 内部会调 to_agent_config)
     if let Some(max_steps) = req.max_steps {
@@ -517,7 +536,7 @@ async fn run_agent_stream(
         let mut current_session: Option<String> = None;
         while let Some(result) = event_stream.next().await {
             match &result {
-                Ok(AgentEvent::SessionCreated { session_id }) => {
+                Ok(AgentEvent::SessionCreated { session_id, .. }) => {
                     current_session = Some(session_id.clone());
                     if let Ok(mut map) = store.lock() {
                         map.insert(session_id.clone(), cancel_token.clone());
@@ -593,55 +612,117 @@ pub struct ApproveRequest {
     pub session_id: String,
     /// 是否批准(true = 批准执行,false = 拒绝)
     pub approved: bool,
+    /// 提案 ID(ApprovalRequired 帧携带;不匹配时请求被拒绝)
+    pub proposal_id: Option<String>,
+    /// 审批人平台令牌(可选;提供并校验通过时审批留痕带已验证身份)
+    ///
+    /// ⚠️ 该字段只用于换取用户名,不落审计链、不进日志。
+    pub approver_token: Option<String>,
+    /// 审批理由(可选,随决定写入审批留痕)
+    pub reason: Option<String>,
 }
 
 /// G8:审批正在等待的 candidate 工具调用
 ///
 /// 路由:`POST /agents/{agent_type}/approve`
-/// Body:`{"session_id":"xxx","approved":true|false}`
+/// Body:`{"session_id":"xxx","approved":true|false,"proposal_id":"ap-...","approver_token":"...","reason":"..."}`
 ///
-/// 按 `session_id` 在 ApprovalStore 中查找 oneshot sender 并发送审批结果。
-/// runner 的 `HttpApproval::request_approval()` 收到结果后:
-/// - `approved:true` → 带 `approved:true` 重新调用工具
-/// - `approved:false` → 返回 `{"status":"rejected"}`
+/// 按 `session_id` 在 ApprovalStore 中查找 pending 审批项:
+/// - 提案 ID 不匹配 → 400(审批保持等待,可携带正确 ID 重试)
+/// - 提供 `approver_token` → 调认证端点换取平台用户名作为已验证审批人;
+///   未提供或校验失败 → 审批人记 `unverified`(审批照常送达,不阻断)
+///
+/// runner 的 `HttpApproval::request_approval()` 收到决定后:
+/// - `approved:true` → 带已批准状态重新调用工具
+/// - 其他 → 返回 `{"status":"rejected"}`
 ///
 /// 200 = 审批结果已送达;404 = session 不在等待审批(已超时/不存在/未触发审批)。
 async fn approve_agent(
     State(state): State<AgentApiState>,
     axum::extract::Path(_agent_type): axum::extract::Path<String>,
     Json(req): Json<ApproveRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let sender = {
-        let mut map = state
-            .pending_approvals
-            .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let pending = {
+        let mut map = state.pending_approvals.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal error"})),
+            )
+        })?;
         map.remove(&req.session_id)
     };
-    match sender {
-        Some(tx) => {
-            // 发送审批结果(接收方已 drop 时返回 Err,但 HTTP 仍返回 200 表示"已处理")
-            let _ = tx.send(req.approved);
-            info!(
-                session_id = %req.session_id,
-                approved = req.approved,
-                "G8: approval decision delivered"
-            );
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "message": "approval delivered",
-                "session_id": req.session_id,
-                "approved": req.approved,
-            })))
-        }
-        None => {
+    let Some(pending) = pending else {
+        warn!(
+            session_id = %req.session_id,
+            "G8: approval requested but session not pending (timed out / not found / no approval needed)"
+        );
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not pending approval"})),
+        ));
+    };
+
+    // 提案 ID 校验:不匹配时把 pending 放回,允许携带正确 ID 重试
+    if let Some(pid) = &req.proposal_id {
+        if pid != &pending.proposal_id {
+            if let Ok(mut map) = state.pending_approvals.lock() {
+                map.insert(req.session_id.clone(), pending);
+            }
             warn!(
                 session_id = %req.session_id,
-                "G8: approval requested but session not pending (timed out / not found / no approval needed)"
+                "G8: proposal_id mismatch on approval request"
             );
-            Err(StatusCode::NOT_FOUND)
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "proposal_id mismatch",
+                    "session_id": req.session_id,
+                })),
+            ));
         }
     }
+
+    // 审批人身份:令牌校验通过 → 平台用户名;未提供/校验失败 → unverified
+    // (令牌本身不落日志、不落审计链,这里只保留换取到的用户名)
+    let (approver, verified) = match &req.approver_token {
+        Some(token) => match state.evorule_client().verify_platform_token(token).await {
+            Ok(username) => (username, true),
+            Err(e) => {
+                info!(
+                    session_id = %req.session_id,
+                    error = %e,
+                    "G8: approver token verification failed; degrading to unverified"
+                );
+                ("unverified".to_string(), false)
+            }
+        },
+        None => ("unverified".to_string(), false),
+    };
+
+    let decision = ApprovalDecision {
+        approved: req.approved,
+        approver: approver.clone(),
+        verified,
+        reason: req.reason.unwrap_or_default(),
+        auto_rejected: false,
+    };
+    // 发送审批决定(接收方已 drop 时返回 Err,但 HTTP 仍返回 200 表示"已处理")
+    let _ = pending.tx.send(decision);
+    info!(
+        session_id = %req.session_id,
+        approved = req.approved,
+        approver = %approver,
+        verified = verified,
+        "G8: approval decision delivered"
+    );
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "approval delivered",
+        "session_id": req.session_id,
+        "approved": req.approved,
+        "approver": approver,
+        "verified": verified,
+    })))
 }
 
 /// G4:把单个 `AgentEvent`(或流级错误)转成 axum SSE `Event`
@@ -650,9 +731,16 @@ async fn approve_agent(
 /// `Done` / `Error` 帧是终帧,前端收到后应关闭流。
 fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, Infallible> {
     let ev = match event {
-        Ok(AgentEvent::SessionCreated { session_id }) => Event::default()
-            .event("session_created")
-            .data(serde_json::json!({ "session_id": session_id }).to_string()),
+        Ok(AgentEvent::SessionCreated {
+            session_id,
+            memory_enabled,
+        }) => Event::default().event("session_created").data(
+            serde_json::json!({
+                "session_id": session_id,
+                "memory_enabled": memory_enabled,
+            })
+            .to_string(),
+        ),
         Ok(AgentEvent::Step { step }) => Event::default()
             .event("step")
             .data(serde_json::json!({ "step": step }).to_string()),
@@ -684,18 +772,19 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
         Ok(AgentEvent::Info(msg)) => Event::default()
             .event("info")
             .data(serde_json::json!({ "message": msg }).to_string()),
-        // G8:工具需要用户审批 — 前端收到后弹审批对话框,POST /agents/{t}/approve
         Ok(AgentEvent::ApprovalRequired {
             tool_name,
             command,
             risk,
             alternative,
+            proposal_id,
         }) => Event::default().event("approval_required").data(
             serde_json::json!({
                 "tool_name": tool_name,
                 "command": command,
                 "risk": risk,
                 "alternative": alternative,
+                "proposal_id": proposal_id,
             })
             .to_string(),
         ),
@@ -703,10 +792,14 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
         Ok(AgentEvent::ApprovalResult {
             tool_name,
             approved,
+            approver,
+            auto_rejected,
         }) => Event::default().event("approval_result").data(
             serde_json::json!({
                 "tool_name": tool_name,
                 "approved": approved,
+                "approver": approver,
+                "auto_rejected": auto_rejected,
             })
             .to_string(),
         ),
@@ -1197,11 +1290,13 @@ mod tests {
     fn test_agent_event_to_sse_session_created() {
         let ev = agent_event_to_sse(Ok(AgentEvent::SessionCreated {
             session_id: "s-123".to_string(),
+            memory_enabled: false,
         }))
         .unwrap();
         let s = format!("{:?}", ev);
         assert!(s.contains("session_created"));
         assert!(s.contains("s-123"));
+        assert!(s.contains("memory_enabled"));
     }
 
     #[test]
@@ -1433,6 +1528,7 @@ mod tests {
             command: "rm -rf /tmp/test".to_string(),
             risk: "high".to_string(),
             alternative: "use trash instead".to_string(),
+            proposal_id: "ap-test-1".to_string(),
         }))
         .unwrap();
         let s = format!("{:?}", ev);
@@ -1441,6 +1537,7 @@ mod tests {
         assert!(s.contains("rm -rf /tmp/test"));
         assert!(s.contains("high"));
         assert!(s.contains("use trash instead"));
+        assert!(s.contains("ap-test-1"));
     }
 
     #[test]
@@ -1448,12 +1545,15 @@ mod tests {
         let ev = agent_event_to_sse(Ok(AgentEvent::ApprovalResult {
             tool_name: "shell_exec".to_string(),
             approved: true,
+            approver: "alice".to_string(),
+            auto_rejected: false,
         }))
         .unwrap();
         let s = format!("{:?}", ev);
         assert!(s.contains("approval_result"));
         assert!(s.contains("shell_exec"));
         assert!(s.contains("true"));
+        assert!(s.contains("alice"));
     }
 
     #[test]
@@ -1461,12 +1561,15 @@ mod tests {
         let ev = agent_event_to_sse(Ok(AgentEvent::ApprovalResult {
             tool_name: "http_get".to_string(),
             approved: false,
+            approver: "auto".to_string(),
+            auto_rejected: true,
         }))
         .unwrap();
         let s = format!("{:?}", ev);
         assert!(s.contains("approval_result"));
         assert!(s.contains("http_get"));
         assert!(s.contains("false"));
+        assert!(s.contains("auto"));
     }
 
     // ===== G8 /approve 端点测试 =====
@@ -1518,16 +1621,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_approve_registered_session_delivers_decision() {
-        // 手动往 ApprovalStore 插入一个 oneshot sender,验证 /approve 能送达决定
+        // 手动往 ApprovalStore 插入一个 pending 项,验证 /approve 能送达决定
         let state = make_test_state();
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
         {
             let mut map = state.pending_approvals.lock().unwrap();
-            map.insert("approval-session-001".to_string(), tx);
+            map.insert(
+                "approval-session-001".to_string(),
+                PendingApproval {
+                    tx,
+                    proposal_id: "ap-001".to_string(),
+                },
+            );
         }
         let app = router(state);
 
-        let body = serde_json::json!({"session_id": "approval-session-001", "approved": true});
+        let body = serde_json::json!({
+            "session_id": "approval-session-001",
+            "approved": true,
+            "proposal_id": "ap-001",
+            "reason": "okay",
+        });
         let response = app
             .oneshot(
                 Request::builder()
@@ -1541,21 +1655,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        // sender 应已收到 true
-        let approved = rx.await.unwrap();
-        assert!(approved);
+        // sender 应已收到批准决定
+        let decision = rx.await.unwrap();
+        assert!(decision.approved);
+        assert_eq!(decision.approver, "unverified");
+        assert!(!decision.verified);
+        assert_eq!(decision.reason, "okay");
+        assert!(!decision.auto_rejected);
     }
 
     #[tokio::test]
     async fn test_approve_delivers_denial() {
         // 验证 approved:false 也能正确送达
         let state = make_test_state();
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        state
-            .pending_approvals
-            .lock()
-            .unwrap()
-            .insert("approval-session-002".to_string(), tx);
+        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+        state.pending_approvals.lock().unwrap().insert(
+            "approval-session-002".to_string(),
+            PendingApproval {
+                tx,
+                proposal_id: "ap-002".to_string(),
+            },
+        );
         let app = router(state);
 
         let body = serde_json::json!({"session_id": "approval-session-002", "approved": false});
@@ -1572,20 +1692,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let approved = rx.await.unwrap();
-        assert!(!approved);
+        let decision = rx.await.unwrap();
+        assert!(!decision.approved);
     }
 
     #[tokio::test]
     async fn test_approve_removes_session_from_store() {
         // /approve 后 session 应从 store 移除(再次 approve 同一 session → 404)
         let state = make_test_state();
-        let (tx, _rx) = tokio::sync::oneshot::channel::<bool>();
-        state
-            .pending_approvals
-            .lock()
-            .unwrap()
-            .insert("approval-session-003".to_string(), tx);
+        let (tx, _rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+        state.pending_approvals.lock().unwrap().insert(
+            "approval-session-003".to_string(),
+            PendingApproval {
+                tx,
+                proposal_id: "ap-003".to_string(),
+            },
+        );
         let app = router(state.clone());
 
         let body = serde_json::json!({"session_id": "approval-session-003", "approved": true});
@@ -1623,12 +1745,14 @@ mod tests {
     async fn test_approve_route_registered() {
         // 验证 /approve 路由已注册:对已注册 session 发 POST 应返回 200(非 405 Method Not Allowed)
         let state = make_test_state();
-        let (tx, _rx) = tokio::sync::oneshot::channel::<bool>();
-        state
-            .pending_approvals
-            .lock()
-            .unwrap()
-            .insert("route-test-sess".to_string(), tx);
+        let (tx, _rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+        state.pending_approvals.lock().unwrap().insert(
+            "route-test-sess".to_string(),
+            PendingApproval {
+                tx,
+                proposal_id: "ap-route".to_string(),
+            },
+        );
         let app = router(state);
 
         let body = serde_json::json!({"session_id": "route-test-sess", "approved": true});
@@ -1645,6 +1769,197 @@ mod tests {
             .unwrap();
         // 路由匹配成功 → handler 返回 200
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ===== 审批人身份验证(降级 / 提案 ID 校验) =====
+
+    #[tokio::test]
+    async fn test_approve_without_token_degrades_to_unverified() {
+        // 未携带 approver_token → 审批照常送达,审批人记 unverified
+        let state = make_test_state();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+        state.pending_approvals.lock().unwrap().insert(
+            "unverified-sess".to_string(),
+            PendingApproval {
+                tx,
+                proposal_id: "ap-uv".to_string(),
+            },
+        );
+        let app = router(state);
+
+        let body = serde_json::json!({"session_id": "unverified-sess", "approved": true});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/agents/general/approve")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let decision = rx.await.unwrap();
+        assert!(decision.approved);
+        assert_eq!(decision.approver, "unverified");
+        assert!(!decision.verified);
+    }
+
+    #[tokio::test]
+    async fn test_approve_token_verify_failure_degrades_to_unverified() {
+        // approver_token 校验失败(服务不可达)→ 不阻断审批,降级 unverified
+        let state = make_test_state();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+        state.pending_approvals.lock().unwrap().insert(
+            "badtoken-sess".to_string(),
+            PendingApproval {
+                tx,
+                proposal_id: "ap-bt".to_string(),
+            },
+        );
+        let app = router(state);
+
+        let body = serde_json::json!({
+            "session_id": "badtoken-sess",
+            "approved": true,
+            "approver_token": "some-invalid-token",
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/agents/general/approve")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let decision = rx.await.unwrap();
+        assert_eq!(decision.approver, "unverified");
+        assert!(!decision.verified);
+    }
+
+    #[tokio::test]
+    async fn test_approve_token_verify_success_carries_username() {
+        // approver_token 校验通过 → 审批人 = 平台用户名,verified = true
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/platform/auth/me")
+            .match_header("authorization", "Bearer good-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"success":true,"user":{"username":"bob"},"permissions":[],"permissions_version":1}"#,
+            )
+            .create_async()
+            .await;
+
+        let state = AgentApiState::new(
+            crate::agent::AgentDefinitionManager::with_default_dir(),
+            EvoruleApiClient::new(&server.url()),
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+        state.pending_approvals.lock().unwrap().insert(
+            "verify-sess".to_string(),
+            PendingApproval {
+                tx,
+                proposal_id: "ap-vf".to_string(),
+            },
+        );
+        let app = router(state);
+
+        let body = serde_json::json!({
+            "session_id": "verify-sess",
+            "approved": true,
+            "approver_token": "good-token",
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/agents/general/approve")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let decision = rx.await.unwrap();
+        assert_eq!(decision.approver, "bob");
+        assert!(decision.verified);
+    }
+
+    #[tokio::test]
+    async fn test_approve_proposal_id_mismatch_returns_400_and_keeps_pending() {
+        // 提案 ID 不匹配 → 400,且 pending 保留(可携带正确 ID 重试成功)
+        let state = make_test_state();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+        state.pending_approvals.lock().unwrap().insert(
+            "mismatch-sess".to_string(),
+            PendingApproval {
+                tx,
+                proposal_id: "ap-correct".to_string(),
+            },
+        );
+        let app = router(state.clone());
+
+        // 第一次:错误提案 ID → 400
+        let bad = serde_json::json!({
+            "session_id": "mismatch-sess",
+            "approved": true,
+            "proposal_id": "ap-wrong",
+        });
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/agents/general/approve")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(bad.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::BAD_REQUEST);
+
+        // pending 应被放回,可重试
+        assert!(
+            state
+                .pending_approvals
+                .lock()
+                .unwrap()
+                .contains_key("mismatch-sess"),
+            "pending approval must survive a mismatched proposal_id"
+        );
+
+        // 第二次:正确提案 ID → 200,决定送达
+        let good = serde_json::json!({
+            "session_id": "mismatch-sess",
+            "approved": true,
+            "proposal_id": "ap-correct",
+        });
+        let r2 = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/agents/general/approve")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(good.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        let decision = rx.await.unwrap();
+        assert!(decision.approved);
     }
 
     // ===== E2: 记忆证据/召回 query DTO 反序列化测试 =====

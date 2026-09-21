@@ -759,8 +759,9 @@ fn test_agent_config_default_output_format_is_none() {
 fn test_agent_event_all_variants() {
     let e = AgentEvent::SessionCreated {
         session_id: "s1".to_string(),
+        memory_enabled: false,
     };
-    assert!(matches!(e, AgentEvent::SessionCreated { session_id } if session_id == "s1"));
+    assert!(matches!(e, AgentEvent::SessionCreated { session_id, .. } if session_id == "s1"));
 
     let e = AgentEvent::Step { step: 3 };
     assert!(matches!(e, AgentEvent::Step { step: 3 }));
@@ -1070,11 +1071,13 @@ fn test_agent_event_approval_required_debug() {
         command: "rm /tmp/x".to_string(),
         risk: "high".to_string(),
         alternative: "use trash".to_string(),
+        proposal_id: "ap-123".to_string(),
     };
     let s = format!("{:?}", ev);
     assert!(s.contains("ApprovalRequired"));
     assert!(s.contains("shell_exec"));
     assert!(s.contains("rm /tmp/x"));
+    assert!(s.contains("ap-123"));
 }
 
 #[test]
@@ -1083,17 +1086,23 @@ fn test_agent_event_approval_result_debug() {
     let ev_approved = AgentEvent::ApprovalResult {
         tool_name: "shell_exec".to_string(),
         approved: true,
+        approver: "alice".to_string(),
+        auto_rejected: false,
     };
     let s = format!("{:?}", ev_approved);
     assert!(s.contains("ApprovalResult"));
     assert!(s.contains("true"));
+    assert!(s.contains("alice"));
 
     let ev_denied = AgentEvent::ApprovalResult {
         tool_name: "http_get".to_string(),
         approved: false,
+        approver: "auto".to_string(),
+        auto_rejected: true,
     };
     let s = format!("{:?}", ev_denied);
     assert!(s.contains("false"));
+    assert!(s.contains("auto_rejected"));
 }
 
 // ===== G13: 并行工具调用测试 =====
@@ -1710,7 +1719,7 @@ async fn test_g15_run_streaming_creates_new_session() {
     let mut event_count = 0;
     while let Some(event) = stream.next().await {
         event_count += 1;
-        if let Ok(AgentEvent::SessionCreated { session_id }) = &event {
+        if let Ok(AgentEvent::SessionCreated { session_id, .. }) = &event {
             assert_eq!(session_id, "99");
             got_session_created = true;
         }

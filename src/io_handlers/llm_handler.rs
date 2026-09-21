@@ -33,6 +33,21 @@ const DEFAULT_BASE_BACKOFF_SECS: f64 = 1.0;
 /// 默认最大退避(秒)
 const DEFAULT_MAX_BACKOFF_SECS: f64 = 30.0;
 
+/// 实际生效的生成参数(单一事实源,供链上留痕与请求体构造共用)
+///
+/// 入参 `None`(或链上未传)时按兜底值填充:
+/// temperature 兜底 0.7、max_tokens 兜底 4096、stream 恒为 true
+/// (本 handler 的请求统一走流式端点)。
+/// 返回 `(temperature, max_tokens, stream)`。
+pub fn effective_generation_params(
+    temperature: Option<f64>,
+    max_tokens: Option<u64>,
+) -> (f64, u64, bool) {
+    let t = temperature.unwrap_or(0.7);
+    let m = max_tokens.unwrap_or(4096);
+    (t, m, true)
+}
+
 /// G1:LLM 流式输出的单个分片
 ///
 /// `execute_stream` 依次产出:
@@ -242,15 +257,10 @@ impl LlmHandler {
             .and_then(|v| v.as_str())
             .unwrap_or(&self.default_model);
 
-        let temperature = params_val
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.7);
-
-        let max_tokens = params_val
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(4096);
+        let (temperature, max_tokens, _stream) = effective_generation_params(
+            params_val.get("temperature").and_then(|v| v.as_f64()),
+            params_val.get("max_tokens").and_then(|v| v.as_u64()),
+        );
 
         let prompt = params_val
             .get("prompt")
@@ -911,6 +921,26 @@ fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
 mod tests {
     use super::*;
     use crate::io_handler::IoHandler;
+
+    /// 实际生效参数:显式值原样透传,兜底值 0.7/4096,stream 恒 true
+    #[test]
+    fn test_effective_generation_params_defaults_and_passthrough() {
+        // 缺省 → 兜底
+        assert_eq!(effective_generation_params(None, None), (0.7, 4096, true));
+        // 显式值 → 原样保留
+        assert_eq!(
+            effective_generation_params(Some(0.2), Some(1024)),
+            (0.2, 1024, true)
+        );
+        // 混合:只传 temperature
+        assert_eq!(
+            effective_generation_params(Some(1.5), None),
+            (1.5, 4096, true)
+        );
+        // stream 恒为 true(本 handler 统一走流式)
+        let (_, _, stream) = effective_generation_params(Some(0.0), Some(1));
+        assert!(stream);
+    }
 
     /// 出站转换:内部 {tool_name, args} → OpenAI function 形状;tool 消息按名配对 id
     #[test]

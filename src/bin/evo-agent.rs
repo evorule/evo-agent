@@ -526,7 +526,7 @@ fn cmd_run_streaming(
 
         while let Some(event) = event_stream.next().await {
             match event {
-                Ok(AgentEvent::SessionCreated { session_id }) => {
+                Ok(AgentEvent::SessionCreated { session_id, .. }) => {
                     eprintln!("[session: {}]", session_id);
                 }
                 Ok(AgentEvent::Step { step }) => {
@@ -559,6 +559,7 @@ fn cmd_run_streaming(
                     command,
                     risk,
                     alternative,
+                    ..
                 }) => {
                     eprintln!("\n[⚠️ approval required] tool: {}", tool_name);
                     eprintln!("  command: {}", command);
@@ -570,6 +571,7 @@ fn cmd_run_streaming(
                 Ok(AgentEvent::ApprovalResult {
                     tool_name,
                     approved,
+                    ..
                 }) => {
                     if approved {
                         eprintln!("[✓ approved: {}] re-executing...", tool_name);
@@ -1515,7 +1517,7 @@ fn run_repl_turn(
 
         while let Some(event) = event_stream.next().await {
             match event {
-                Ok(AgentEvent::SessionCreated { session_id }) => {
+                Ok(AgentEvent::SessionCreated { session_id, .. }) => {
                     eprintln!("[session: {}]", session_id);
                     got_session = Some(session_id);
                 }
@@ -1547,6 +1549,7 @@ fn run_repl_turn(
                     command,
                     risk,
                     alternative,
+                    ..
                 }) => {
                     eprintln!("\n[approval required] tool: {}", tool_name);
                     eprintln!("  command: {}", command);
@@ -1558,6 +1561,7 @@ fn run_repl_turn(
                 Ok(AgentEvent::ApprovalResult {
                     tool_name,
                     approved,
+                    ..
                 }) => {
                     if approved {
                         eprintln!("[approved: {}]", tool_name);

@@ -183,7 +183,10 @@ impl Default for LoggingCallback {
 impl EventCallback for LoggingCallback {
     async fn on_event(&self, event: &AgentEvent) {
         match event {
-            AgentEvent::SessionCreated { session_id } => {
+            AgentEvent::SessionCreated {
+                session_id,
+                memory_enabled: _,
+            } => {
                 tracing::info!(%session_id, "callback: session created");
             }
             AgentEvent::Step { step } => {
@@ -216,8 +219,10 @@ impl EventCallback for LoggingCallback {
             AgentEvent::ApprovalResult {
                 tool_name,
                 approved,
+                approver,
+                auto_rejected,
             } => {
-                tracing::info!(%tool_name, %approved, "callback: approval result");
+                tracing::info!(%tool_name, %approved, %approver, %auto_rejected, "callback: approval result");
             }
             AgentEvent::Info(msg) => {
                 tracing::info!(%msg, "callback: info");
@@ -376,6 +381,7 @@ mod tests {
 
         let event = AgentEvent::SessionCreated {
             session_id: "s1".to_string(),
+            memory_enabled: false,
         };
         chain.dispatch(&event).await;
 
@@ -393,6 +399,7 @@ mod tests {
         chain
             .dispatch(&AgentEvent::SessionCreated {
                 session_id: "s1".to_string(),
+                memory_enabled: false,
             })
             .await;
         chain.dispatch(&AgentEvent::Step { step: 1 }).await;
@@ -413,6 +420,7 @@ mod tests {
         let chain = CallbackChain::new();
         let event = AgentEvent::SessionCreated {
             session_id: "s1".to_string(),
+            memory_enabled: false,
         };
         // Should not panic
         chain.dispatch(&event).await;
@@ -464,6 +472,7 @@ mod tests {
 
         let event = AgentEvent::SessionCreated {
             session_id: "s1".to_string(),
+            memory_enabled: false,
         };
         // Should not panic
         chain.dispatch(&event).await;
@@ -481,6 +490,7 @@ mod tests {
         let events = vec![
             AgentEvent::SessionCreated {
                 session_id: "s1".to_string(),
+                memory_enabled: false,
             },
             AgentEvent::Step { step: 1 },
             AgentEvent::LlmDelta {
@@ -503,10 +513,13 @@ mod tests {
                 command: "rm -rf".to_string(),
                 risk: "high".to_string(),
                 alternative: "use trash".to_string(),
+                proposal_id: "ap-1".to_string(),
             },
             AgentEvent::ApprovalResult {
                 tool_name: "shell_exec".to_string(),
                 approved: false,
+                approver: "auto".to_string(),
+                auto_rejected: false,
             },
             AgentEvent::Info("rewind".to_string()),
             AgentEvent::Error(AgentError::LlmError("timeout".to_string())),
@@ -530,6 +543,7 @@ mod tests {
 
         cb.on_event(&AgentEvent::SessionCreated {
             session_id: "s1".to_string(),
+            memory_enabled: false,
         })
         .await;
         cb.on_event(&AgentEvent::Step { step: 1 }).await;
@@ -609,6 +623,7 @@ mod tests {
             command: "rm".to_string(),
             risk: "high".to_string(),
             alternative: "trash".to_string(),
+            proposal_id: "ap-2".to_string(),
         })
         .await;
 
