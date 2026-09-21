@@ -1228,7 +1228,10 @@ mod tests {
             .await
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(!text.contains(key_fixture), "response body leaked the API key");
+        assert!(
+            !text.contains(key_fixture),
+            "response body leaked the API key"
+        );
         assert!(text.contains("wxyz"), "last-4 hint should be present");
     }
 
