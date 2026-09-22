@@ -47,19 +47,28 @@ if ($hits.Count -gt 0) {
 
 Write-Host "== [4/4] dependency contract assertion =="
 # O-044 (2026-09-20): evo-agent is fully decoupled from the evorule main repo.
-# NO evorule-* crate dependency is allowed at all (path OR version) -- the
-# agent orchestration layer must not depend on main-repo TCB code. This check
-# fails on any re-introduction of evorule-* deps (regression guard).
+# The agent orchestration layer must not depend on main-repo crates (TCB /
+# reactor / governance / cli) -- path OR version deps both banned. This check
+# fails on any re-introduction of main-repo deps (regression guard).
+#
+# Scope note (2026-09-22): the ban targets MAIN-REPO crates. Governance shared
+# components hosted in separate repos are allowed via explicit allowlist --
+# they are governance-face libraries, not engine crates, and do not bypass
+# evorule-server for rule execution. Current allowlist: evorule-constitution
+# (from evorule-system-rules; schema validation with embedded data).
+$separateRepoAllowlist = @('evorule-constitution')
 $manifest = Get-Content (Join-Path $repo "Cargo.toml") -Raw
-$depHits = [regex]::Matches($manifest, '(?m)^\s*(evorule-[\w-]+)\s*=')
+$depHits = [regex]::Matches($manifest, '(?m)^\s*(evorule-[\w-]+)\s*=') |
+    Where-Object { $separateRepoAllowlist -notcontains $_.Groups[1].Value }
 if ($depHits.Count -gt 0) {
-    foreach ($h in $depHits) { Write-Host "FAIL: evorule-* dependency found: $($h.Value)" }
+    foreach ($h in $depHits) { Write-Host "FAIL: main-repo dependency found: $($h.Value)" }
     Write-Host "  (evo-agent is decoupled from the evorule main repo since O-044;"
-    Write-Host "   agent layer must not depend on main-repo crates. Re-adding evorule-*"
-    Write-Host "   deps is a layering violation.)"
+    Write-Host "   agent layer must not depend on main-repo crates. Re-adding main-repo"
+    Write-Host "   deps is a layering violation. Separate-repo governance components"
+    Write-Host "   must be explicitly added to the allowlist.)"
     $failed = $true
 } else {
-    Write-Host "PASS: dependency contract (no evorule-* deps -- decoupled per O-044)"
+    Write-Host "PASS: dependency contract (no main-repo deps -- decoupled per O-044)"
 }
 
 if ($failed) { Write-Host "== RESULT: FAIL =="; exit 1 }

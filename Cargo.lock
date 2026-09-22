@@ -540,6 +540,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "evorule-constitution",
  "futures-core",
  "futures-util",
  "http",
@@ -565,6 +566,16 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "evorule-constitution"
+version = "0.2.0"
+source = "git+https://gitee.com/evorule/evorule-system-rules?rev=c8d7248f1b8bf553b7a697dd65c61c0a5ff577bf#c8d7248f1b8bf553b7a697dd65c61c0a5ff577bf"
+dependencies = [
+ "jsonschema",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
