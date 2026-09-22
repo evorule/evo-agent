@@ -172,11 +172,30 @@ evo-agent tools list                     # 列出 6 个内置工具（3 层安�
 evo-agent tools show <name>              # 显示单个工具的 active/candidate/blocked 详情
 evo-agent validate <agent>               # 校验 agent.json 是否合法
 evo-agent config                         # 显示合并后的配置
-evo-agent serve --port 8081              # 启动 HTTP server
+evo-agent serve --port 8081              # 启动 HTTP server（启动期预载校验全部 agent 档案，坏档案 fail-fast）
+evo-agent patrol --session <id> --workspace <ws_id>  # 进化巡视（一次性任务，见下文）
 evo-agent workflow <workflow_id>         # 执行多 agent DAG 工作流
 evo-agent repl                           # REPL 交互模式（复用同一 session）
 evo-agent replay --session <id>          # 回放 session 的记忆事件链
 ```
+
+### patrol（进化巡视任务模式）
+
+一次性自进化巡视：**信号探查 → agent 起草 → 闸门一证据组装 → 治理链提名 → 结构化 JSON 巡视报告**。触发器在本进程（可由 cron/运维脚本按需调起），server 侧零自治循环——每次调用只执行一次。
+
+```bash
+# 巡视指定会话的进化信号,有信号则自动完成起草与提名(默认 rule-copilot 档案)
+evo-agent patrol --session 42 --workspace 01ABC...
+
+# 巡视报告追加写入文件(调度器按时间序列归档)
+evo-agent patrol --session 42 --workspace 01ABC... --out patrol-report.jsonl
+```
+
+行为语义：
+
+- **无信号**：零动作静默退出（exit 0），报告 `status=no_signal`（一行 JSON 打印到 stdout，供调度器消费）。
+- **有信号**：轮A agent 拉取信号明细并起草源规则（rule_create → rule_submit → rule_versions），进程侧组装闸门一沙盒证据（数据集 → 沙盒 → 关闭），轮B agent 携证据调用 `rule_promote` 提名进入人审队列；报告 `status=nominated` 含 `queue_id`。
+- **重复提名**：同一目标规则的 pending 提名已存在时，server 侧去重门禁拒绝（409），报告 `status=duplicate_rejected`——提名权仍在人审闭环内，agent 面无审批通道。
 
 ### run
 
@@ -270,7 +289,7 @@ Agent 配置从 `agents/{type}.json` 加载：
 
 | Agent | 说明 | 工具 |
 |-------|------|------|
-| `general` | 通用 Agent — 文件操作 + Shell + Web | file_read, file_list, file_write, search_files, shell_exec, http_get |
+| `general` | 通用 Agent — 文件操作 + Shell + Web + 规则消费与起草（白名单 20 工具，含 `evolution_signals` 只读信号感知） | file_*, search_files, shell_exec, http_get, rule_list/get/versions/version_get/validate/create/update/submit, knowledge_*, audit_get, meta_summary, evolution_signals |
 | `researcher` | 研究 Agent — 只读搜索 | file_read, search_files, file_list |
 | `rule-copilot` | 规则协作 Agent — 23 个规则管理工具（白名单） | ws_*, rule_*, audit_*, translate_*, sandbox_*, dataset_*, publish_*, knowledge_*, meta_*, evolution_signals, rule_promote |
 

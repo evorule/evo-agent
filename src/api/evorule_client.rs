@@ -698,7 +698,7 @@ impl EvoruleApiClient {
 
         let resp = self
             .core
-            .auth_header(self.core.client().get(&url))
+            .auth_header(self.core.stream_client().get(&url))
             .send()
             .await?;
         if !resp.status().is_success() {

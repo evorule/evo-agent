@@ -41,6 +41,11 @@ pub enum ApiError {
 pub struct ApiCore {
     base_url: String,
     client: Client,
+    /// SSE 流式专用客户端：无总超时（长连接事件流不受 30s 上限切断），
+    /// 保留连接超时。本地 ReAct 循环期间 server 侧 io_request 可能挂起 30s+
+    /// 无事件下发,带总超时的常规客户端会在等待中切断流（实测「Event stream
+    /// closed」,巡视两轮制轮A 耗时 40s+ 必现）。
+    stream_client: Client,
     /// Optional Bearer token for HTTP API auth.
     /// B5-server：`EVORULE_SERVICE_TOKEN` 优先，缺省回退 `EVORULE_AUTH_TOKEN`。
     auth_token: Option<String>,
@@ -70,6 +75,10 @@ impl ApiCore {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to build HTTP client");
+        let stream_client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("Failed to build SSE stream HTTP client");
 
         let auth_token = resolve_effective_auth_token(
             explicit_token,
@@ -80,6 +89,7 @@ impl ApiCore {
         Self {
             base_url: base_url.to_string(),
             client,
+            stream_client,
             auth_token,
         }
     }
@@ -97,6 +107,11 @@ impl ApiCore {
     /// reqwest Client getter
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// SSE 流式专用 Client getter（无总超时，见字段文档）
+    pub fn stream_client(&self) -> &Client {
+        &self.stream_client
     }
 
     /// Attach auth header (if token set) to a request builder.

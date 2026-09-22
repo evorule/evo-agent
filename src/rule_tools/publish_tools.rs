@@ -95,9 +95,10 @@ impl PublishListTool {
 impl ToolFunction for PublishListTool {
     async fn call(&self, args: &Value) -> IoResult {
         let status = args.get("status").and_then(|v| v.as_str());
+        let workspace_id = args.get("workspace_id").and_then(|v| v.as_str());
         let result = self
             .client
-            .list_publish_queue(status)
+            .list_publish_queue(status, workspace_id)
             .await
             .map_err(|e| e.to_string())?;
         let v = serde_json::to_value(&result).unwrap_or_default();
@@ -311,15 +312,25 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "publish_list".to_string(),
-            description: "List the publish queue, optionally filtered by status.".to_string(),
-            parameters: vec![ParameterSpec {
-                name: "status".to_string(),
-                r#type: "string".to_string(),
-                description:
-                    "Optional status filter (pending/approved/published/rejected/cancelled)."
+            description: "List the publish queue, optionally filtered by status and workspace."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "status".to_string(),
+                    r#type: "string".to_string(),
+                    description:
+                        "Optional status filter (pending/approved/published/rejected/cancelled)."
+                            .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "workspace_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Optional workspace filter; omit to list across all workspaces."
                         .to_string(),
-                required: false,
-            }],
+                    required: false,
+                },
+            ],
         },
         ToolSpec {
             name: "publish_queue_get".to_string(),

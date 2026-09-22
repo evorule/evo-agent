@@ -45,7 +45,7 @@ impl WorkspaceApiClient {
             .json(&req)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: WorkspaceRecord = resp.json().await?;
         Ok(result)
     }
@@ -65,7 +65,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Vec<WorkspaceRecord> = resp.json().await?;
         Ok(result)
     }
@@ -89,7 +89,7 @@ impl WorkspaceApiClient {
             .json(&req)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: RuleRecord = resp.json().await?;
         Ok(result)
     }
@@ -106,7 +106,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Vec<RuleRecord> = resp.json().await?;
         Ok(result)
     }
@@ -128,7 +128,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: RuleRecord = resp.json().await?;
         Ok(result)
     }
@@ -152,7 +152,7 @@ impl WorkspaceApiClient {
             .json(&req)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: RuleVersionRecord = resp.json().await?;
         Ok(result)
     }
@@ -174,7 +174,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().post(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: RuleRecord = resp.json().await?;
         Ok(result)
     }
@@ -196,7 +196,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().post(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: RuleRecord = resp.json().await?;
         Ok(result)
     }
@@ -218,7 +218,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().post(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: RuleRecord = resp.json().await?;
         Ok(result)
     }
@@ -240,7 +240,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().post(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: RuleRecord = resp.json().await?;
         Ok(result)
     }
@@ -264,7 +264,7 @@ impl WorkspaceApiClient {
             .json(&req)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: RuleRecord = resp.json().await?;
         Ok(result)
     }
@@ -286,7 +286,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Vec<RuleVersionRecord> = resp.json().await?;
         Ok(result)
     }
@@ -310,7 +310,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: RuleVersionRecord = resp.json().await?;
         Ok(result)
     }
@@ -326,7 +326,7 @@ impl WorkspaceApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Value = resp.json().await?;
         Ok(result)
     }
@@ -340,7 +340,7 @@ impl WorkspaceApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Value = resp.json().await?;
         Ok(result)
     }
@@ -349,7 +349,7 @@ impl WorkspaceApiClient {
     ///
     /// body 需为 `{"rules": "..."}`（server.rs validate_rules_handler，rules 字段是 JSON 字符串）。
     /// 返回 200（passed=true）或 422（passed=false，含 errors 数组）。
-    /// 422 时 server 返回非 2xx → check_response 报 ApiError，调用方需按需处理。
+    /// 422 时 server 返回非 2xx → check_response_full 报 ApiError（message 含错误详情），调用方需按需处理。
     pub async fn validate_rules(&self, body: Value) -> Result<Value, ApiError> {
         let url = self.core.url("/api/rules/validate");
         let resp = self
@@ -363,7 +363,7 @@ impl WorkspaceApiClient {
             let result: Value = resp.json().await?;
             return Ok(result);
         }
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Value = resp.json().await?;
         Ok(result)
     }
@@ -380,7 +380,7 @@ impl WorkspaceApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Value = resp.json().await?;
         Ok(result)
     }
@@ -410,7 +410,7 @@ impl WorkspaceApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: StartSandboxResponse = resp.json().await?;
         Ok(result)
     }
@@ -432,7 +432,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Vec<SandboxSession> = resp.json().await?;
         Ok(result)
     }
@@ -456,7 +456,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: SandboxSession = resp.json().await?;
         Ok(result)
     }
@@ -481,7 +481,7 @@ impl WorkspaceApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Value = resp.json().await?;
         Ok(result)
     }
@@ -503,7 +503,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: TestReport = resp.json().await?;
         Ok(result)
     }
@@ -527,7 +527,7 @@ impl WorkspaceApiClient {
             .json(&req)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: TestDatasetRecord = resp.json().await?;
         Ok(result)
     }
@@ -547,7 +547,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Vec<TestDatasetRecord> = resp.json().await?;
         Ok(result)
     }
@@ -573,26 +573,37 @@ impl WorkspaceApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: PublishQueueItem = resp.json().await?;
         Ok(result)
     }
 
-    /// GET /api/publish/queue[?status=xxx] — 列出发布队列
+    /// GET /api/publish/queue[?status=xxx][&workspace_id=xxx] — 列出发布队列
+    ///
+    /// workspace_id 为可选过滤（治理队列跨工作空间污染的根治面，与 server 侧
+    /// 同名查询参数对齐）；None 保留旧行为（全量）。
     pub async fn list_publish_queue(
         &self,
         status: Option<&str>,
+        workspace_id: Option<&str>,
     ) -> Result<Vec<PublishQueueItem>, ApiError> {
-        let url = match status {
-            Some(s) => format!("{}/api/publish/queue?status={}", self.core.base_url(), s),
-            None => self.core.url("/api/publish/queue"),
-        };
+        let mut url = format!("{}/api/publish/queue", self.core.base_url());
+        let mut sep = '?';
+        if let Some(s) = status {
+            url.push(sep);
+            url.push_str(&format!("status={}", s));
+            sep = '&';
+        }
+        if let Some(ws) = workspace_id {
+            url.push(sep);
+            url.push_str(&format!("workspace_id={}", ws));
+        }
         let resp = self
             .core
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Vec<PublishQueueItem> = resp.json().await?;
         Ok(result)
     }
@@ -608,7 +619,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: PublishQueueItem = resp.json().await?;
         Ok(result)
     }
@@ -637,7 +648,7 @@ impl WorkspaceApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: PublishQueueItem = resp.json().await?;
         Ok(result)
     }
@@ -661,7 +672,7 @@ impl WorkspaceApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Value = resp.json().await?;
         Ok(result)
     }
@@ -676,7 +687,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: ProductionStateRecord = resp.json().await?;
         Ok(result)
     }
@@ -695,7 +706,7 @@ impl WorkspaceApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let result: Vec<ProductionAuditRecord> = resp.json().await?;
         Ok(result)
     }
@@ -1075,6 +1086,9 @@ pub struct PublishQueueItem {
     pub published_at: Option<String>,
     /// 队列状态（pending/approved/rejected/published 等）。
     pub status: String,
+    /// 队列项类型（normal / meta_promotion）。
+    #[serde(default)]
+    pub kind: String,
     /// 发布说明。
     pub description: Option<String>,
 }
