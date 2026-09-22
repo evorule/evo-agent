@@ -25,7 +25,7 @@ r"""
     (--insecure-serve --rules-dir <含 00_constraint_ enforce 种子的目录>
      --workspace-db <临时路径> --no-rate-limit;种子不进公开仓)
   - evo-agent debug 构建存在(target/debug/evo-agent.exe)
-  - D:\evo-agent\.env 含 MINIMAX_API_KEY(脚本读取后注入 patrol 子进程环境,
+  - 仓库根 .env 含 MINIMAX_API_KEY(脚本读取后注入 patrol 子进程环境,
     绝不回显);evo-agent.toml 的 evorule.base_url 指向 18080
   - pip install httpx
 
@@ -52,7 +52,9 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 SERVER_BASE = os.environ.get("E2E_SERVER_BASE", "http://127.0.0.1:18080")
-EVO_AGENT_DIR = os.environ.get("E2E_EVO_AGENT_DIR", r"D:\evo-agent")
+EVO_AGENT_DIR = os.environ.get(
+    "E2E_EVO_AGENT_DIR", str(Path(__file__).resolve().parents[1])
+)
 PATROL_BIN = os.environ.get(
     "E2E_PATROL_BIN", str(Path(EVO_AGENT_DIR) / "target" / "debug" / "evo-agent.exe")
 )
