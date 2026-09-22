@@ -40,6 +40,11 @@ subtle = "2"
 # G11: JSON Schema 校验(结构化输出)
 jsonschema = "0.21"
 
+# 宪法 schema 校验共享组件(属地执法统一实现;0.2.0 起 schema 编译期内嵌,
+# 运行时零磁盘依赖)。git 依赖 + rev 钉版:crate 未发 crates.io 前的受控消费,
+# 宪法演进须先推 system-rules 再随动升级 rev(演进 SOP)
+evorule-constitution = { git = "https://gitee.com/evorule/evorule-system-rules", rev = "c8d7248f1b8bf553b7a697dd65c61c0a5ff577bf" }
+
 # G16:WebSocket 双向流 —— 需要 axum 的 ws feature
 axum = { version = "0.8", features = ["ws"] }
 http = "1"

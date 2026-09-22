@@ -58,8 +58,8 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
-      - name: Checkout evorule-system-rules（宪法 schema，供 C12 门卫与测试使用）
-        run: git clone --depth 1 --branch main https://gitee.com/evorule/evorule-system-rules.git evorule-system-rules
+      # 宪法 schema 校验组件以 git 依赖(rev 钉版)由 cargo 自动拉取,
+      # 且 0.2.0 起 schema 编译期内嵌——运行时零磁盘依赖,无需检出宪法仓。
 
       - name: verify.ps1 (build + test + secret scan + dep contract)
         shell: pwsh
