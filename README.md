@@ -194,8 +194,8 @@ evo-agent patrol --session 42 --workspace 01ABC... --out patrol-report.jsonl
 行为语义：
 
 - **无信号**：零动作静默退出（exit 0），报告 `status=no_signal`（一行 JSON 打印到 stdout，供调度器消费）。
-- **有信号**：轮A agent 拉取信号明细并起草源规则（rule_create → rule_submit → rule_versions），进程侧组装闸门一沙盒证据（数据集 → 沙盒 → 关闭），轮B agent 携证据调用 `rule_promote` 提名进入人审队列；报告 `status=nominated` 含 `queue_id`。
-- **重复提名**：同一目标规则的 pending 提名已存在时，server 侧去重门禁拒绝（409），报告 `status=duplicate_rejected`——提名权仍在人审闭环内，agent 面无审批通道。
+- **有信号**：轮A agent 拉取信号明细并起草约束层草稿（rule_create → rule_submit → rule_versions），进程侧组装闸门一沙盒证据（数据集 → 沙盒 → 关闭），轮B agent 携证据调用 `rule_promote` 提名进入人审队列；报告 `status=nominated` 含 `queue_id`。草稿必须是 **enforce 拦截型**（`transform` 条目 `type=enforce`，`params` 必含 `domain` 与非空 `reason`，拦截条件写在 `params.domain` 内，严禁条目级 `condition` 等未知键）——提取后先经提交期结构校验（与 server schema 门禁同口径），失败即 fail-fast 落报告退出（报告 `error` 字段携带校验错误、`draft_json` 留存原始草稿），不带病进入轮B与提交链路。
+- **重复提名**：同一目标规则的提名已存在（pending 待审或 published 已发布）时，server 侧双态去重门禁拒绝（409），报告 `status=duplicate_rejected`——提名权仍在人审闭环内，agent 面无审批通道。
 
 ### run
 
