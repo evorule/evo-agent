@@ -77,6 +77,7 @@
 
 ### 🔄 变更
 
+- **宪法 schema 校验收编共享组件 `evorule-constitution`** — `src/agent/constitution.rs` 由本地实现（目录探测/跨文件 `$ref` 内联/校验执行）改为薄封装（公共 API 签名不变，消费点零改动）：判定逻辑与 schema 数据（编译期内嵌，运行时零磁盘依赖）委托统一 crate（git 依赖 + rev 钉版），判定代码单一化；`jsonschema` 0.18 → 0.21（`Validator` API，跨文件 `$ref` 经 `$id` 解析，内联 hack 退役）；CI「检出宪法仓」步骤退役（cargo 自动拉取 git 依赖）；依赖契约断言精确化（主仓 crates 拦截保留，独立仓治理组件显式 allowlist）
 - **`list_publish_queue` 客户端方法** — 新增可选 `workspace_id` 过滤参数（None 保留旧行为）；`PublishQueueItem` 补齐 `kind` 字段（对齐 server 模型）
 - **移除 `blake3` 直接依赖** — 零代码调用（仅文档注释提及概念），死依赖删除；
   evorule-reactor 自身对 blake3 的依赖不受影响
