@@ -22,14 +22,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use jsonschema::JSONSchema;
+use jsonschema::{Draft, Validator};
 
 /// 已编译的 agent_def v1.0 校验器（进程内单例）
-static AGENT_DEF_SCHEMA: OnceLock<Option<JSONSchema>> = OnceLock::new();
+static AGENT_DEF_SCHEMA: OnceLock<Option<Validator>> = OnceLock::new();
 /// 已编译的 workflow_dag v1.0 校验器（进程内单例）
-static WORKFLOW_DAG_SCHEMA: OnceLock<Option<JSONSchema>> = OnceLock::new();
+static WORKFLOW_DAG_SCHEMA: OnceLock<Option<Validator>> = OnceLock::new();
 /// 已编译的 workflow_dag v1.1 校验器（进程内单例；v1.1 = v1.0 + 节点级可选 run_when）
-static WORKFLOW_DAG_SCHEMA_V1_1: OnceLock<Option<JSONSchema>> = OnceLock::new();
+static WORKFLOW_DAG_SCHEMA_V1_1: OnceLock<Option<Validator>> = OnceLock::new();
 
 /// 定位宪法仓 schemas 目录
 pub fn locate_schemas_dir() -> Option<PathBuf> {
@@ -93,10 +93,10 @@ fn inline_meta_ref(doc: &mut serde_json::Value, schemas_dir: &Path) -> Result<()
 }
 
 fn compile_schema(
-    cell: &'static OnceLock<Option<JSONSchema>>,
+    cell: &'static OnceLock<Option<Validator>>,
     file: &str,
     kind_label: &str,
-) -> Option<&'static JSONSchema> {
+) -> Option<&'static Validator> {
     cell.get_or_init(|| {
         let Some(dir) = locate_schemas_dir() else {
             tracing::warn!(
@@ -119,7 +119,10 @@ fn compile_schema(
             .map_err(|e| e.to_string())
             .and_then(|mut v| {
                 inline_meta_ref(&mut v, &dir)?;
-                JSONSchema::compile(&v).map_err(|e| e.to_string())
+                Validator::options()
+                    .with_draft(Draft::Draft202012)
+                    .build(&v)
+                    .map_err(|e| e.to_string())
             });
         match result {
             Ok(schema) => Some(schema),
@@ -238,7 +241,7 @@ pub fn validate_workflow_dag(body: &serde_json::Value) -> Result<(), Vec<String>
 
 fn validate_with(
     doc: &serde_json::Value,
-    schema: Option<&JSONSchema>,
+    schema: Option<&Validator>,
     kind_label: &str,
 ) -> Result<(), Vec<String>> {
     let Some(schema) = schema else {
@@ -251,23 +254,14 @@ fn validate_with(
              sibling directory of the executable; then restart."
         )]);
     };
-    // jsonschema 0.18 API:JSONSchema::validate -> Result<(), ErrorIterator<ValidationError>>
+    // jsonschema 0.21 API:Validator::validate -> Result<(), ValidationErrorIterator>
     match schema.validate(doc) {
         Ok(()) => Ok(()),
         Err(err_iter) => {
             let errs: Vec<String> = err_iter
                 .take(10)
                 .map(|e| {
-                    let path: String = e
-                        .instance_path
-                        .iter()
-                        .map(|chunk| match chunk {
-                            jsonschema::paths::PathChunk::Property(p) => p.to_string(),
-                            jsonschema::paths::PathChunk::Index(i) => i.to_string(),
-                            jsonschema::paths::PathChunk::Keyword(k) => (*k).to_string(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join("/");
+                    let path = e.instance_path.to_string();
                     if path.is_empty() {
                         format!("{}", e)
                     } else {
