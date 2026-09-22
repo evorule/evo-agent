@@ -1648,7 +1648,29 @@ fn cmd_serve(
     }
 
     // 5. 构造 router + 中间件(G7 鉴权 + CORS + 1MB body limit)
-    let app = agent_api::router_with_auth(state, auth_config)
+    //
+    // 工作台静态托管:API 路由外层 fallback 到 web/dist(SPA,缺省回退 index.html)。
+    // fallback 挂在外层 Router 上,不经过 API 面的 auth 中间件 —— 工作台页面必须
+    // 无 token 可打开;API 与 WS 面仍全部走 G7 鉴权(auth 启用时前端以 ?token= 接入)。
+    let dist_dir = workdir.join("web").join("dist");
+    if dist_dir.join("index.html").exists() {
+        eprintln!(
+            "[workbench] serving workbench UI from {} at /",
+            dist_dir.display()
+        );
+    } else {
+        eprintln!(
+            "[workbench] web/dist not found ({}); workbench disabled, API-only mode. \
+             Build: npm --prefix web install && npm --prefix web run build",
+            dist_dir.display()
+        );
+    }
+    let workbench = tower_http::services::ServeDir::new(&dist_dir).not_found_service(
+        tower_http::services::ServeFile::new(dist_dir.join("index.html")),
+    );
+    let app = axum::Router::new()
+        .merge(agent_api::router_with_auth(state, auth_config))
+        .fallback_service(workbench)
         .layer(CorsLayer::permissive())
         .layer(RequestBodyLimitLayer::new(1024 * 1024));
 
@@ -1677,6 +1699,7 @@ fn cmd_serve(
     };
 
     eprintln!("evo-agent HTTP server listening on http://{}", addr);
+    eprintln!("  GET  /                       (workbench UI, web/dist)");
     eprintln!("  GET  /health                  (no auth)");
     eprintln!("  GET  /metrics                 (no auth, Prometheus G17)");
     eprintln!("  GET  /admin/llm-status        (auth, masked LLM config status)");
