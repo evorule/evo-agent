@@ -11,12 +11,12 @@
 //! 校验失败时,runner 注入校正消息并让 LLM 重试(最多 `max_retries` 次)。
 
 use crate::agent::definition::OutputFormat;
-use jsonschema::JSONSchema;
+use jsonschema::Validator;
 
 /// 结构化输出校验器
 pub struct OutputValidator {
     /// 编译后的 JSON Schema(None 表示只校验是否合法 JSON,不校验结构)
-    schema: Option<JSONSchema>,
+    schema: Option<Validator>,
     /// 格式类型("json" / "text" / ...)
     format_type: String,
     /// 预构建的格式指令(注入 system prompt)
@@ -38,7 +38,7 @@ impl OutputValidator {
     /// - JSON Schema 编译失败(格式非法)
     pub fn from_output_format(format: &OutputFormat) -> Result<Self, String> {
         let schema = if let Some(s) = &format.schema {
-            Some(JSONSchema::compile(s).map_err(|e| format!("invalid JSON schema: {}", e))?)
+            Some(Validator::new(s).map_err(|e| format!("invalid JSON schema: {}", e))?)
         } else {
             None
         };

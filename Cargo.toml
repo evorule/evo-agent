@@ -38,7 +38,7 @@ rand = "0.8"
 subtle = "2"
 
 # G11: JSON Schema 校验(结构化输出)
-jsonschema = "0.18"
+jsonschema = "0.21"
 
 # G16:WebSocket 双向流 —— 需要 axum 的 ws feature
 axum = { version = "0.8", features = ["ws"] }
