@@ -19,6 +19,9 @@ r"""
   E4  直调审批 approved → L2 约束文件落盘(/api/rules/l2-inventory 可见)
   E5  无信号静默: 全新无违规会话 patrol → exit 0 + status=no_signal + 零提名
   E6  审计链验证(种子会话 /audit/verify verified=true)
+  E7  审批落盘后同目标再提名被拒(双态去重 published 分支, 98 号 D3) → 409
+  E8  新会话违规归因=新约束(98 号核心断言: enforce 型晋升产物先于种子拦截,
+      evolution-signals rule_ref=00_constraint_promoted_*.json#k)
 
 前置(由运行方准备,脚本只做验证侧):
   - evorule-server 已运行: 127.0.0.1:18080
@@ -304,36 +307,12 @@ async def e3_duplicate_rejected(
     t: E2ETest, client: httpx.AsyncClient, ws_id: str, item: Dict[str, Any]
 ) -> None:
     t.header("E3 重复提名被拒(去重门禁, 同 workspace+kind+目标规则)")
-    content = item.get("meta_rule_content") or ""
-    promoted_from = ""
-    try:
-        promoted_from = str(json.loads(content).get("metadata", {}).get("promoted_from", ""))
-    except (json.JSONDecodeError, AttributeError):
-        pass
-    version_ids = [
-        v.strip()
-        for v in promoted_from.removeprefix("rule_version:").split(",")
-        if v.strip()
-    ]
+    version_ids = _parse_promoted_from(item.get("meta_rule_content") or "")
     if not version_ids:
-        t.fail("从队列项解析 promoted_from 版本集", f"promoted_from={promoted_from[:80]}")
+        t.fail("从队列项解析 promoted_from 版本集", "队列表单缺 promoted_from")
         return
     t.ok("从队列项解析 promoted_from 版本集", f"ids={version_ids}")
-    r = await client.post(
-        f"{SERVER_BASE}/api/publish/queue",
-        json={
-            "workspace_id": ws_id,
-            "rule_version_ids": version_ids,
-            "test_report_sandbox_id": item.get("test_report_sandbox_id"),
-            "kind": "meta_promotion",
-            "meta_rule_content": content,
-            # 与 patrol 同身份(evo-agent-patrol=workspace 属主):模拟巡视再次运行
-            # 重复提名同一目标——成员校验通过后才会触达去重门禁(409)
-            "submitted_by": "evo-agent-patrol",
-            "role": "department_head",
-            "description": "重复提名演练(应被去重门禁拒绝)",
-        },
-    )
+    r = await client.post(f"{SERVER_BASE}/api/publish/queue", json=_nominate_body(ws_id, item))
     if r.status_code == 409:
         t.ok("重复提名 409", r.text[:120].replace("\n", " "))
     else:
@@ -376,6 +355,101 @@ async def e4_review_publish(t: E2ETest, client: httpx.AsyncClient, item: Dict[st
         t.ok("L2 约束文件落盘且 inventory 可见", f"promoted={promoted}")
     else:
         t.fail("L2 约束文件落盘且 inventory 可见", f"轮询 {POLL_TIMEOUT}s 未出现 promoted 文件")
+
+
+def _parse_promoted_from(content: str) -> List[str]:
+    """从转写产物 metadata.promoted_from 解析目标版本集(与 E3 同口径)。"""
+    promoted_from = ""
+    try:
+        promoted_from = str(json.loads(content).get("metadata", {}).get("promoted_from", ""))
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return [
+        v.strip()
+        for v in promoted_from.removeprefix("rule_version:").split(",")
+        if v.strip()
+    ]
+
+
+def _nominate_body(ws_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "workspace_id": ws_id,
+        "rule_version_ids": _parse_promoted_from(item.get("meta_rule_content") or ""),
+        "test_report_sandbox_id": item.get("test_report_sandbox_id"),
+        "kind": "meta_promotion",
+        "meta_rule_content": item.get("meta_rule_content") or "",
+        # 与 patrol 同身份(evo-agent-patrol=workspace 属主):模拟巡视再次运行
+        # 重复提名同一目标——成员校验通过后才会触达去重门禁(409)
+        "submitted_by": "evo-agent-patrol",
+        "role": "department_head",
+        "description": "重复提名演练(应被去重门禁拒绝)",
+    }
+
+
+async def e7_published_renominate(
+    t: E2ETest, client: httpx.AsyncClient, ws_id: str, item: Dict[str, Any]
+) -> None:
+    t.header("E7 审批落盘后同目标再提名被拒(双态去重 published 分支, 98 号 D3)")
+    version_ids = _parse_promoted_from(item.get("meta_rule_content") or "")
+    if not version_ids:
+        t.fail("E7 promoted_from 版本集解析", "队列表单缺 promoted_from")
+        return
+    r = await client.post(f"{SERVER_BASE}/api/publish/queue", json=_nominate_body(ws_id, item))
+    if r.status_code == 409 and "published" in r.text:
+        t.ok("审批后再提名 409(published 同目标占用)", r.text[:120].replace("\n", " "))
+    else:
+        t.fail(
+            "审批后再提名 409(published 同目标占用)",
+            f"status={r.status_code} body={r.text[:200]}",
+        )
+
+
+async def e8_new_session_attribution(t: E2ETest, client: httpx.AsyncClient) -> None:
+    t.header("E8 新会话违规归因=新约束(enforce 型晋升产物先于种子拦截)")
+    sid = await make_session(client, t, "E8-新约束生效")
+    if sid is None:
+        return
+    r = await client.post(
+        f"{SERVER_BASE}/api/sessions/{sid}/command",
+        json={"instruction": {"type": SEED_INSTR_TYPE, "params": {"timestamp": 2}}},
+    )
+    if r.status_code == 200:
+        t.ok(f"新会话提交 {SEED_INSTR_TYPE} 指令", f"session={sid}")
+    else:
+        t.fail(f"新会话提交 {SEED_INSTR_TYPE} 指令", f"status={r.status_code} body={r.text[:200]}")
+        return
+
+    async def check():
+        r = await client.get(f"{SERVER_BASE}/api/sessions/{sid}/evolution-signals")
+        if r.status_code != 200:
+            return None
+        signals = r.json().get("signals") or []
+        hit = [
+            s
+            for s in signals
+            if str(s.get("rule_ref", "")).startswith("00_constraint_promoted_")
+            and "#" in str(s.get("rule_ref", ""))
+        ]
+        return hit or None
+
+    hit = await poll_until(check, POLL_TIMEOUT)
+    if not hit:
+        r = await client.get(f"{SERVER_BASE}/api/sessions/{sid}/evolution-signals")
+        got = (
+            json.dumps(r.json().get("signals"), ensure_ascii=False)[:300]
+            if r.status_code == 200
+            else f"status={r.status_code}"
+        )
+        t.fail(
+            "新会话违规归因=新约束(rule_ref=00_constraint_promoted_*#k)",
+            f"轮询 {POLL_TIMEOUT}s 未出现 promoted 归因; signals={got}",
+        )
+        return
+    t.ok("新会话违规归因=新约束(rule_ref=00_constraint_promoted_*#k)", f"rule_ref={hit[0].get('rule_ref')}")
+    if hit[0].get("last_instr_type") == SEED_INSTR_TYPE:
+        t.ok("归因信号指令类型=robot_move", f"reason={hit[0].get('reason_summary', '')[:60]}")
+    else:
+        t.fail("归因信号指令类型=robot_move", f"实际 {hit[0].get('last_instr_type')}")
 
 
 async def e5_no_signal_silent(
@@ -449,6 +523,8 @@ async def main() -> int:
             if item:
                 await e3_duplicate_rejected(t, client, ws_id, item)
                 await e4_review_publish(t, client, item)
+                await e7_published_renominate(t, client, ws_id, item)
+                await e8_new_session_attribution(t, client)
             else:
                 t.fail("E3/E4 前置队列项", "E2 未产出队列项")
         else:
