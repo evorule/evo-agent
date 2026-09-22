@@ -701,9 +701,9 @@ async fn patrol_consume(
     final_result.ok_or_else(|| "事件流在 Done 之前结束".to_string())
 }
 
-/// 进化巡视任务模式(97 号 D2):一次性「信号 → 起草 → 证据 → 提名 → 报告」。
+/// 进化巡视任务模式:一次性「信号 → 起草 → 证据 → 提名 → 报告」。
 ///
-/// 编排复用 96 号真实 LLM 全链演练的两轮制(轮A agent 起草三步,操作者组装
+/// 编排复用真实 LLM 全链演练已验证的两轮制(轮A agent 起草三步,操作者组装
 /// 闸门一沙盒证据,轮B agent 携证据提名);触发器在本进程,server 零自治循环。
 /// 无信号时零动作静默退出(exit 0,报告 status=no_signal)。
 fn cmd_patrol(
