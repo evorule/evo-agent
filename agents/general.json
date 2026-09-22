@@ -27,6 +27,7 @@
     "rule_create",
     "rule_update",
     "rule_submit",
-    "meta_summary"
+    "meta_summary",
+    "evolution_signals"
   ]
 }

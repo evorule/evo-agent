@@ -75,6 +75,18 @@ mod tests {
     }
 
     #[test]
+    fn test_readme_tool_count_locked() {
+        // 门禁增强:README 规则工具集计数与 rule_tool_specs 实际数量锁定,防文档漂移
+        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("read README.md");
+        let expected = format!("**规则管理工具集** | {} 个工具", rule_tool_specs().len());
+        assert!(
+            readme.contains(&expected),
+            "README 工具计数与实际不一致,期望包含: {expected}"
+        );
+    }
+
+    #[test]
     fn test_rule_tool_specs_names() {
         let specs = rule_tool_specs();
         let names: std::collections::HashSet<&str> =

@@ -153,6 +153,27 @@ enum Command {
         no_auth: bool,
     },
 
+    /// 进化巡视任务模式(一次性):信号探查 → 有信号则 agent 起草+提名 →
+    /// 结构化 JSON 巡视报告;无信号零动作静默退出(报告仍输出一行供调度器消费)。
+    /// 触发器在 agent 侧/外部调度(cron/运维脚本),server 零自治循环。
+    Patrol {
+        /// 要巡视的 evorule 会话 id(违规信号按会话归因,与信号端点同口径)
+        #[arg(long)]
+        session: u64,
+
+        /// 起草与提名所用的治理工作空间 id
+        #[arg(long)]
+        workspace: String,
+
+        /// agent 类型(默认 rule-copilot:提名工具在协作体档案白名单内)
+        #[arg(long, short = 'a')]
+        agent: Option<String>,
+
+        /// 巡视报告 JSON 追加写入路径(缺省仅打印到 stdout)
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        out: Option<PathBuf>,
+    },
+
     /// G9:执行多 agent 工作流(DAG 编排,并行层 + 串行依赖)
     Workflow {
         /// 工作流 id(对应 `rules/workflows/<id>.json`)
@@ -285,6 +306,18 @@ fn main() -> ExitCode {
             auth_token,
             no_auth,
         } => cmd_serve(&cli.workdir, &host, port, &auth_token, no_auth),
+        Command::Patrol {
+            session,
+            workspace,
+            agent,
+            out,
+        } => cmd_patrol(
+            &cli.workdir,
+            session,
+            &workspace,
+            agent.as_deref(),
+            out.as_deref(),
+        ),
         Command::Workflow {
             workflow_id,
             dir,
@@ -476,6 +509,521 @@ fn cmd_run(
     // 任务已结束,停止监听 Ctrl+C
     cancel_handle.abort();
     exit
+}
+
+/// 解析 agent 产出中的围栏 JSON 代码块(取最后一个 ```json 或 ``` 围栏块)
+fn extract_last_fenced_json(text: &str) -> Option<String> {
+    let mut result = None;
+    let mut rest = text;
+    while let Some(start) = rest.find("```") {
+        let after = &rest[start + 3..];
+        // 跳过语言标记(如 json)
+        let body_start_offset = after.find('\n').map(|i| i + 1).unwrap_or(0);
+        let body = &after[body_start_offset..];
+        let Some(end) = body.find("```") else {
+            break;
+        };
+        result = Some(body[..end].trim().to_string());
+        rest = &body[end + 3..];
+    }
+    result
+}
+
+/// 产物值清洗:去两侧空白/markdown 修饰符/引号/尾随分隔标点
+/// (真实 LLM 会把 prompt 列表里的分号一并照抄进值,如「VERSION_ID=<ulid>;」)。
+fn clean_extracted(v: &str) -> String {
+    v.trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches(|c: char| ";,，。、.：:；".contains(c))
+        .trim()
+        .to_string()
+}
+
+/// 字符边界安全的日志截断(参数/结果常含中文,按字节切会 panic)
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// 解析 `KEY=<值>` 形式的行内产物(E2E 演练同款约定,容忍 markdown 修饰符)
+fn extract_keyed_value(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let s = line
+            .trim()
+            .trim_start_matches("- ")
+            .trim_start_matches("* ");
+        let s = s
+            .trim()
+            .trim_matches('`')
+            .trim_start_matches('*')
+            .trim_end_matches('*')
+            .trim();
+        // 容忍 KEY=值 / KEY:值 / KEY：值 三种行式(真实 LLM 输出格式存在漂移)
+        for sep in ['=', ':', '：'] {
+            if let Some(v) = s.strip_prefix(&format!("{key}{sep}")) {
+                let cleaned = clean_extracted(v);
+                if !cleaned.is_empty() {
+                    return Some(cleaned);
+                }
+            }
+        }
+        // 容忍编号前缀行式(真实 LLM 常按 prompt 的 a)/b)/c) 要求以
+        // 「b) KEY=…」回填):key 可出现在行中,但其前缀须为纯装饰(序号/
+        // 括号/标点/空白,且不得以字母数字结尾——防 `valueX=1` 单词粘连
+        // 误命中),key 后须紧跟分隔符。
+        if let Some(pos) = s.find(key) {
+            let (before, after) = (&s[..pos], &s[pos + key.len()..]);
+            let decorated = before.chars().all(|c| {
+                c.is_whitespace() || c.is_ascii_alphanumeric() || ")]}.、·*-—：（(:\"".contains(c)
+            }) && before
+                .trim_end()
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric());
+            if decorated {
+                for sep in ['=', ':', '：'] {
+                    if let Some(v) = after.strip_prefix(sep) {
+                        let cleaned = clean_extracted(v);
+                        if !cleaned.is_empty() {
+                            return Some(cleaned);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// patrol 单轮 runner 组装(与 serve 同链:MCP + 服务工具 + 档案定义;
+/// run_streaming 消费 runner,两轮制每轮重建;巡视属无人值守任务,candidate 自动放行)。
+///
+/// `allowed_tools` 收窄本轮工具面(轮A 4 个起草工具/轮B 1 个提名工具):
+/// 宽工具面下真实 LLM 会绕路探索(file_read/ws_list 等),实测导致步数超限或
+/// 上下文被无关内容污染;窄面让 LLM 只见任务必需工具,行为收敛。
+async fn patrol_build_runner(
+    config: &evo_agent::config::Config,
+    workdir: &Path,
+    mut def: evo_agent::agent::definition::AgentDefinition,
+    client: &EvoruleApiClient,
+    allowed_tools: &[&str],
+) -> Result<AgentRunner, String> {
+    let ws_client = WorkspaceApiClient::new(&config.evorule.base_url);
+    let union = evo_agent::api::serve_tools::build_union_toolkit(workdir, &ws_client, client);
+    let whitelist: Vec<String> = allowed_tools.iter().map(|s| s.to_string()).collect();
+    let mut tool_handler = evo_agent::api::serve_tools::build_filtered_toolkit(&union, &whitelist);
+    // def.tools 与本轮工具面同步收窄:from_definition 会 fail-fast 校验 def.tools
+    // 每个名字都已在 tool_handler 注册,只窄 handler 不窄 def 会直接启动失败。
+    def.tools.retain(|t| whitelist.contains(t));
+    if !config.mcp.servers.is_empty() {
+        let connected = evo_agent::mcp::register_mcp_tools(&mut tool_handler, &config.mcp).await;
+        eprintln!(
+            "[mcp] {connected}/{} server(s) connected",
+            config.mcp.servers.len()
+        );
+    }
+    if !config.evorule.service_tools.is_empty() {
+        match evo_agent::service_tools::register_service_tools(
+            &mut tool_handler,
+            client,
+            &config.evorule.service_tools,
+        )
+        .await
+        {
+            Ok(n) => eprintln!("[service-tools] {n} service tool(s) registered"),
+            Err(e) => eprintln!("[service-tools] 服务工具注册失败,本次巡视无服务工具: {e}"),
+        }
+    }
+    let llm_handler = LlmHandler::from_config(&config.llm);
+    let runner = AgentRunner::from_definition(def, client.clone(), tool_handler, Some(llm_handler))
+        .await
+        .map_err(|e| format!("bridge error: {e}"))?;
+    Ok(runner.with_approval_callback(std::sync::Arc::new(
+        evo_agent::agent::approval::CliApproval { auto_approve: true },
+    )))
+}
+
+/// patrol 单轮流式执行:消费事件流至 Done。
+///
+/// 必须走流式路径:server 宪法 v0.5.0 起只做单发桥接(io_response 提交后即
+/// Stable),多轮工具回喂循环在应用层——仅 `run_streaming` 的本地 ReAct 循环
+/// 会把 tool_calls 的工具结果回喂 LLM 续轮;非流式 `run()` 单轮即止,LLM 若在
+/// 首响应携带 tool_calls + 前言 content,巡视将拿到前言当作最终产出。
+///
+/// `label`(轮A/轮B)用于 stderr 轨迹留痕:工具调用与参数摘要逐条打印,
+/// 巡视无人值守,轨迹是行为诊断(步数超限/工具误用)的唯一观测口。
+async fn patrol_consume(
+    runner: AgentRunner,
+    prompt: String,
+    label: &str,
+) -> Result<evo_agent::agent::runner::AgentResult, String> {
+    use futures_util::StreamExt;
+    let mut stream = runner.run_streaming(prompt);
+    let mut final_result: Option<evo_agent::agent::runner::AgentResult> = None;
+    let mut step = 0usize;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            Ok(evo_agent::agent::runner::AgentEvent::Step { step: n }) => {
+                step = n;
+                eprintln!("[patrol] {label} step {n}");
+            }
+            Ok(evo_agent::agent::runner::AgentEvent::ToolCall { name, args }) => {
+                let args = truncate_utf8(&args.to_string(), 200);
+                eprintln!("[patrol] {label} step {step} tool_call {name} args={args}");
+            }
+            Ok(evo_agent::agent::runner::AgentEvent::ToolResult { name, result }) => {
+                let r = truncate_utf8(&result.to_string(), 150);
+                eprintln!("[patrol] {label} step {step} tool_result {name} = {r}");
+            }
+            Ok(evo_agent::agent::runner::AgentEvent::LlmDone { finish_reason, .. }) => {
+                eprintln!("[patrol] {label} step {step} llm_done finish={finish_reason:?}");
+            }
+            Ok(evo_agent::agent::runner::AgentEvent::Error(e)) => {
+                eprintln!("[patrol] {label} 事件流错误: {e}");
+                return Err(e.to_string());
+            }
+            Ok(evo_agent::agent::runner::AgentEvent::Done(r)) => {
+                final_result = Some(r);
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    final_result.ok_or_else(|| "事件流在 Done 之前结束".to_string())
+}
+
+/// 进化巡视任务模式(97 号 D2):一次性「信号 → 起草 → 证据 → 提名 → 报告」。
+///
+/// 编排复用 96 号真实 LLM 全链演练的两轮制(轮A agent 起草三步,操作者组装
+/// 闸门一沙盒证据,轮B agent 携证据提名);触发器在本进程,server 零自治循环。
+/// 无信号时零动作静默退出(exit 0,报告 status=no_signal)。
+fn cmd_patrol(
+    workdir: &Path,
+    session: u64,
+    workspace: &str,
+    agent: Option<&str>,
+    out: Option<&Path>,
+) -> ExitCode {
+    // 巡视报告(全程填充;任何分支都以一行 JSON 收尾供调度器消费)
+    let mut report = serde_json::json!({
+        "task": "evolution_patrol",
+        "session_id": session,
+        "workspace_id": workspace,
+        "status": "error",
+        "actions": [],
+    });
+    let write_report = |report: &serde_json::Value, out: Option<&Path>| {
+        let line = serde_json::to_string(report).unwrap_or_default();
+        println!("{line}");
+        if let Some(path) = out {
+            // 追加写入:调度器可按时间序列归档每次巡视
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+    };
+
+    // 1. 加载配置(巡视需要 LLM,用严格模式)
+    let config = match evo_agent::config::Config::load(workdir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {e}");
+            report["error"] = serde_json::json!(format!("config error: {e}"));
+            write_report(&report, out);
+            return ExitCode::from(1);
+        }
+    };
+
+    // 2. 加载 agent 档案(默认 rule-copilot:rule_promote 在协作体档案白名单)
+    let agent_name = agent.unwrap_or("rule-copilot");
+    let agents_dir = if config.agents.dir.is_absolute() {
+        config.agents.dir.clone()
+    } else {
+        workdir.join(&config.agents.dir)
+    };
+    let mgr = AgentDefinitionManager::new(agents_dir.clone());
+    let def = match mgr.load(agent_name) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "failed to load agent '{}' from {}: {}",
+                agent_name,
+                agents_dir.display(),
+                e
+            );
+            report["error"] = serde_json::json!(format!("agent load failed: {e}"));
+            write_report(&report, out);
+            return ExitCode::from(1);
+        }
+    };
+
+    // 3. 客户端(工具面按轮组装,见 patrol_build_runner:run_streaming 消费 runner)
+    let client =
+        EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
+    let ws_client = WorkspaceApiClient::new(&config.evorule.base_url);
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to build tokio runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // 4. 信号探查(不调 LLM):无信号 → 零动作静默退出
+    let signals_resp = runtime.block_on(client.get_evolution_signals(session, None));
+    let signals_resp = match signals_resp {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to fetch evolution signals for session {session}: {e}");
+            report["error"] = serde_json::json!(format!("signals fetch failed: {e}"));
+            write_report(&report, out);
+            return ExitCode::from(1);
+        }
+    };
+    let has_signals = signals_resp
+        .get("signals")
+        .and_then(|s| s.as_array())
+        .is_some_and(|a| !a.is_empty());
+    report["signals"] = signals_resp.clone();
+    if !has_signals {
+        // 无信号零动作:status=no_signal,exit 0(静默 = 不起草不提名)
+        report["status"] = serde_json::json!("no_signal");
+        write_report(&report, out);
+        return ExitCode::SUCCESS;
+    }
+
+    // 5. 轮A:agent 拉信号 + 起草源规则三步 + 产出约束草稿/版本 id/测试用例
+    let prompt_a = format!(
+        "你正在执行一次自动化进化巡视,请严格按以下步骤执行,不要向用户提问或请求确认:\n\
+         你只能使用以下 4 个工具:evolution_signals、rule_create、rule_submit、rule_versions;\n\
+         其余工具一律不可用,禁止尝试调用它们。\n\
+         1) 调用 evolution_signals 工具(session_id 参数传 {session})查看当前违规信号明细。\n\
+         2) 针对排名第一的违规信号,设计一条源规则(普通规则,用于跟踪该违规模式涉及的\n\
+            行为),并设计一个约束层规则集草稿 JSON。约束草稿要求:$schema 用 \
+            https://evorule.org/schemas/rule_set/v1.0.json,kind 为 rule_set,\n\
+            metadata.tier 为 \"constraint\" 且 metadata.title 必须为非空字符串(可用\n\
+            「<违规模式>留痕约束」句式),transform 只允许跟踪型(用 set 写审计留痕属性,\n\
+            严禁出现 enforce 强制原语),内容针对该违规模式做事后留痕。\n\
+            源规则 content 必须是且仅是如下形态的 JSON 对象——顶层只含 type 与 params\n\
+            两个键,type 取 \"set\",params 必含 attr(字符串)/operation(只能是 set/add/sub)/\n\
+            value(字符串或数值)三键,可附 condition 对象表达触发条件。已验证可用的最小示例:\n\
+            {{\"type\":\"set\",\"params\":{{\"attr\":\"safety_audit\",\"operation\":\"set\",\"value\":\"violation_pattern_recorded\",\"condition\":{{\"instruction\":\"robot_move\"}}}}}}\n\
+            若 rule_create 返回校验错误,按错误信息修正参数后立即重试。\n\
+         3) 调用 rule_create 在工作空间 {workspace} 创建该源规则(name 自拟但需含\n\
+            \"巡视\" 字样,content 为第 2 步源规则的 JSON 字符串形式,created_by 用 \
+            \"evo-agent-patrol\")。\n\
+         4) 调用 rule_submit 把该规则提交为候选(workspace_id 为 {workspace},rule_id 用\n\
+            上一步返回的规则 id)。\n\
+         5) 调用 rule_versions 查询该规则版本列表,取最新版本的版本 id。\n\
+         6) 最后在回复中输出以下三样内容(必须齐全,顺序不限):\n\
+         a) 一个 ```json 围栏代码块,内容为第 2 步的约束层草稿 JSON;\n\
+         b) 一行 VERSION_ID=<第 5 步取到的版本 id>(行尾不要附加分号等标点);\n\
+         c) 一行 TEST_CASE=<单个 JSON 对象>,该对象能命中你源规则 transform 的 domain 条件。"
+    );
+    eprintln!("[patrol] 轮A:信号感知与起草(start)");
+    let turn_a = runtime.block_on(async {
+        let runner = patrol_build_runner(
+            &config,
+            workdir,
+            def.clone(),
+            &client,
+            &[
+                "evolution_signals",
+                "rule_create",
+                "rule_submit",
+                "rule_versions",
+            ],
+        )
+        .await?;
+        patrol_consume(runner, prompt_a, "轮A").await
+    });
+    let turn_a = match turn_a {
+        Ok(r) if r.success => r,
+        Ok(r) => {
+            eprintln!("[patrol] 轮A 失败: {}", r.error.unwrap_or_default());
+            report["error"] = serde_json::json!("patrol turn A failed");
+            write_report(&report, out);
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("[patrol] 轮A 失败: {e}");
+            report["error"] = serde_json::json!(format!("patrol turn A failed: {e}"));
+            write_report(&report, out);
+            return ExitCode::from(1);
+        }
+    };
+    report["actions"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"action": "draft", "tools": turn_a.tool_calls}));
+    let Some(version_id) = extract_keyed_value(&turn_a.content, "VERSION_ID") else {
+        eprintln!("[patrol] 轮A 产物解析失败: 未找到 VERSION_ID 行");
+        report["error"] = serde_json::json!("turn A: VERSION_ID not found in agent output");
+        report["turn_a_text"] = serde_json::json!(turn_a.content);
+        write_report(&report, out);
+        return ExitCode::from(1);
+    };
+    let Some(draft_json) = extract_last_fenced_json(&turn_a.content) else {
+        eprintln!("[patrol] 轮A 产物解析失败: 未找到约束草稿围栏 JSON");
+        report["error"] = serde_json::json!("turn A: constraint draft fenced json not found");
+        report["turn_a_text"] = serde_json::json!(turn_a.content);
+        write_report(&report, out);
+        return ExitCode::from(1);
+    };
+    let test_case = extract_keyed_value(&turn_a.content, "TEST_CASE")
+        .unwrap_or_else(|| "{\"probe\": true}".to_string());
+    report["version_id"] = serde_json::json!(version_id);
+    eprintln!("[patrol] 轮A 完成: VERSION_ID={version_id}");
+
+    // 7. 操作者组装闸门一证据(dataset → sandbox_start → close;与治理审批同范式)
+    let evidence = runtime.block_on(async {
+        let ds = ws_client
+            .create_test_dataset(
+                workspace,
+                evo_agent::api::workspace_client::CreateTestDatasetRequest {
+                    name: "进化巡视沙盒证据数据集".to_string(),
+                    cases_json: format!("[{test_case}]"),
+                    created_by: "evo-agent-patrol".to_string(),
+                    workspace_id: Some(workspace.to_string()),
+                    description: Some("进化巡视自动组装的闸门一证据".to_string()),
+                },
+            )
+            .await?;
+        let sb = ws_client
+            .start_sandbox(
+                workspace,
+                evo_agent::api::workspace_client::StartSandboxRequest {
+                    rule_version_ids: vec![version_id.clone()],
+                    test_dataset_id: ds.id,
+                    parent_version: None,
+                },
+                "evo-agent-patrol",
+            )
+            .await?;
+        ws_client
+            .close_sandbox(workspace, sb.sandbox_id, "evo-agent-patrol")
+            .await?;
+        Ok::<i64, evo_agent::api::ApiError>(sb.sandbox_id)
+    });
+    let sandbox_id = match evidence {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("[patrol] 闸门一证据组装失败: {e}");
+            report["error"] = serde_json::json!(format!("gate-one evidence failed: {e}"));
+            write_report(&report, out);
+            return ExitCode::from(1);
+        }
+    };
+    report["sandbox_id"] = serde_json::json!(sandbox_id);
+    report["actions"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"action": "gate_one_evidence", "sandbox_id": sandbox_id}));
+    eprintln!("[patrol] 闸门一证据就绪: sandbox_id={sandbox_id}");
+
+    // 8. 轮B:agent 携证据 id 调 rule_promote 提名(进人审队列)
+    let prompt_b = format!(
+        "你只能使用 rule_promote 这一个工具,其余工具一律不可用,禁止尝试调用它们。\n\
+         请调用 rule_promote 工具提交约束层晋升提名,参数如下(严格照传,不要修改内容):\n\
+         - workspace_id: \"{workspace}\"\n\
+         - rule_version_ids: [\"{version_id}\"]\n\
+         - meta_rule_content: 下面围栏 JSON 的字符串形式:\n\
+         ```json\n{draft_json}\n```\n\
+         - test_report_sandbox_id: {sandbox_id}\n\
+         - submitted_by: \"evo-agent-patrol\"\n\
+         - role: \"department_head\"\n\
+         - description: \"进化巡视自动提名\"\n\
+         完成后用中文简述提名结果。若工具返回校验错误,按错误信息修正参数后立即重试,\n\
+         不要向操作者询问或等待指示。"
+    );
+    eprintln!("[patrol] 轮B:治理链提名(start)");
+    let turn_b = runtime.block_on(async {
+        let runner = patrol_build_runner(&config, workdir, def, &client, &["rule_promote"]).await?;
+        patrol_consume(runner, prompt_b, "轮B").await
+    });
+    let turn_b = match turn_b {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[patrol] 轮B 失败: {e}");
+            report["error"] = serde_json::json!(format!("patrol turn B failed: {e}"));
+            write_report(&report, out);
+            return ExitCode::from(1);
+        }
+    };
+    report["actions"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"action": "nominate", "tools": turn_b.tool_calls}));
+
+    // 9. 轮询治理队列确认提名入队(带 workspace 过滤,kind=meta_promotion)
+    let poll_result = runtime.block_on(async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match ws_client
+                .list_publish_queue(Some("pending"), Some(workspace))
+                .await
+            {
+                Ok(items) => {
+                    if let Some(item) = items
+                        .iter()
+                        .find(|i| i.kind == "meta_promotion" && i.workspace_id == workspace)
+                    {
+                        return Ok(item.clone());
+                    }
+                }
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(e.to_string());
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("timeout waiting for meta_promotion queue item".to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    });
+    match poll_result {
+        Ok(item) => {
+            report["status"] = serde_json::json!("nominated");
+            report["queue_id"] = serde_json::json!(item.id);
+            report["queue_status"] = serde_json::json!(item.status);
+            write_report(&report, out);
+            eprintln!("[patrol] 提名入队: queue_id={} (等待人工审批)", item.id);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            // 提名可能已被预算门禁拒绝(重复提名 409)或入队超时——按轮B结果区分
+            let duplicate = turn_b.error.is_none() && !turn_b.success;
+            report["turn_b_text"] = serde_json::json!(turn_b.content);
+            if turn_b.error.is_none() && turn_b.content.contains("已存在") {
+                report["status"] = serde_json::json!("duplicate_rejected");
+            } else if duplicate {
+                report["status"] = serde_json::json!("turn_b_failed");
+            }
+            report["error"] = serde_json::json!(format!("queue confirm failed: {e}"));
+            write_report(&report, out);
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// G4:非流式运行(原逻辑)
@@ -878,8 +1426,56 @@ fn cmd_serve(
     }
 
     // 4. 构造 API state
-    let agents_dir = config.agents.dir.clone();
-    let definitions = AgentDefinitionManager::new(agents_dir);
+    // 相对 agents.dir 相对 workdir 解析(与 config 加载基准一致),不基于进程 cwd
+    let agents_dir = if config.agents.dir.is_absolute() {
+        config.agents.dir.clone()
+    } else {
+        workdir.join(&config.agents.dir)
+    };
+    let definitions = AgentDefinitionManager::new(agents_dir.clone());
+
+    // 启动期档案预载校验:缺失/坏 JSON/语义非法 fail-fast 并逐项列明,
+    // 消灭「会话期才报 agent not found」的延迟故障(含相对路径解析基准显式化)
+    match definitions.list_types() {
+        Ok(types) if types.is_empty() => {
+            eprintln!(
+                "agent definition preload failed: no agent definitions found in {} \
+                 (resolve base = workdir {:?})",
+                agents_dir.display(),
+                workdir
+            );
+            return ExitCode::from(1);
+        }
+        Ok(types) => {
+            let failures: Vec<String> = types
+                .iter()
+                .filter_map(|t| definitions.load(t).err().map(|e| format!("  - {t}: {e}")))
+                .collect();
+            if !failures.is_empty() {
+                eprintln!(
+                    "agent definition preload failed: {} problem(s) in {}:\n{}",
+                    failures.len(),
+                    agents_dir.display(),
+                    failures.join("\n")
+                );
+                return ExitCode::from(1);
+            }
+            eprintln!(
+                "[agents] {} definition(s) preloaded and validated from {}",
+                types.len(),
+                agents_dir.display()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "agent definition preload failed: cannot list {}: {e} (resolve base = workdir {:?})",
+                agents_dir.display(),
+                workdir
+            );
+            return ExitCode::from(1);
+        }
+    }
+
     let evorule_client =
         EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
     // E1:构造 workspace_client + union toolkit(启动时一次组装 26 个工具)
@@ -1972,5 +2568,113 @@ mod tests {
         let e = make_event("E002", Some(7));
         let map = std::collections::BTreeMap::new();
         assert_eq!(evidence_mark(&e, &map), " [fact#7]");
+    }
+}
+
+#[cfg(test)]
+mod patrol_parse_tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_last_fenced_json_takes_last_block() {
+        let text = "说明文字\n```json\n{\"a\": 1}\n```\n中间文字\n```json\n{\"tier\": \"constraint\"}\n```\n收尾";
+        let got = extract_last_fenced_json(text).expect("应取到最后一个围栏块");
+        assert!(got.contains("\"tier\""), "实际: {got}");
+        assert!(!got.contains("\"a\""), "不应取第一个块: {got}");
+    }
+
+    #[test]
+    fn test_extract_last_fenced_json_without_lang_tag() {
+        let text = "前言\n```\n{\"b\": 2}\n```";
+        assert_eq!(
+            extract_last_fenced_json(text).as_deref(),
+            Some("{\"b\": 2}")
+        );
+    }
+
+    #[test]
+    fn test_extract_last_fenced_json_none_when_absent() {
+        assert!(extract_last_fenced_json("没有任何围栏块").is_none());
+        assert!(extract_last_fenced_json("```json\n未闭合").is_none());
+    }
+
+    #[test]
+    fn test_extract_keyed_value_tolerates_markdown_decorations() {
+        let text = "step1 完成\n- **VERSION_ID=`01ABC`**\nTEST_CASE={\"motion\": \"forward\"}";
+        assert_eq!(
+            extract_keyed_value(text, "VERSION_ID").as_deref(),
+            Some("01ABC")
+        );
+        assert_eq!(
+            extract_keyed_value(text, "TEST_CASE").as_deref(),
+            Some("{\"motion\": \"forward\"}")
+        );
+    }
+
+    #[test]
+    fn test_extract_keyed_value_missing() {
+        assert!(extract_keyed_value("无产物", "VERSION_ID").is_none());
+    }
+
+    #[test]
+    fn test_extract_keyed_value_tolerates_colon_separators() {
+        // 真实 LLM 输出格式漂移:等号之外的冒号/全角冒号行式
+        assert_eq!(
+            extract_keyed_value("VERSION_ID: 01ABC", "VERSION_ID").as_deref(),
+            Some("01ABC")
+        );
+        assert_eq!(
+            extract_keyed_value("- **VERSION_ID：`01ABC`**", "VERSION_ID").as_deref(),
+            Some("01ABC")
+        );
+        // TEST_CASE 的 JSON 值内含冒号,不应被冒号分隔误切
+        let tc = "TEST_CASE:{\"probe\": true}";
+        assert_eq!(
+            extract_keyed_value(tc, "TEST_CASE").as_deref(),
+            Some("{\"probe\": true}")
+        );
+    }
+
+    #[test]
+    fn test_extract_keyed_value_tolerates_numbered_prefix() {
+        // 真实 LLM 按 prompt 的 a)/b)/c) 要求回填,编号前缀须被剥离
+        // (实测失败形态:turn_a_text 明明含「b) VERSION_ID=…」却解析失败)
+        assert_eq!(
+            extract_keyed_value("b) VERSION_ID=01M3361CKBX9BYWX654PZ7Z3K1", "VERSION_ID")
+                .as_deref(),
+            Some("01M3361CKBX9BYWX654PZ7Z3K1")
+        );
+        assert_eq!(
+            extract_keyed_value("1. VERSION_ID: 01ABC", "VERSION_ID").as_deref(),
+            Some("01ABC")
+        );
+        assert_eq!(
+            extract_keyed_value("(c) TEST_CASE={\"a\": \"b:c\"}", "TEST_CASE").as_deref(),
+            Some("{\"a\": \"b:c\"}")
+        );
+        // 防误命中:单词粘连(key 前缀以字母数字/下划线结尾)不得命中
+        assert_eq!(
+            extract_keyed_value("MY_VERSION_ID=01ABC", "VERSION_ID"),
+            None
+        );
+        assert_eq!(
+            extract_keyed_value("text VERSION_ID=01ABC", "VERSION_ID"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_keyed_value_trims_trailing_punctuation() {
+        // 实测失败形态:LLM 照抄 prompt 列表分号,值带尾标点导致按 id 查版本 404
+        assert_eq!(
+            extract_keyed_value("b) VERSION_ID=01M3366Z21DS57NZR9DQ0NEBS2;", "VERSION_ID")
+                .as_deref(),
+            Some("01M3366Z21DS57NZR9DQ0NEBS2")
+        );
+        // JSON 值两端为花括号,标点清洗不得伤及内容
+        assert_eq!(
+            extract_keyed_value("TEST_CASE={\"a\": \"b\"};", "TEST_CASE").as_deref(),
+            Some("{\"a\": \"b\"}")
+        );
     }
 }

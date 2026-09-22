@@ -38,6 +38,15 @@
 
 ### 🆕 新增
 
+#### 进化巡视任务模式（一次性自进化编排）
+- **`evo-agent patrol` 子命令** — 一次性进化巡视：信号探查（不调 LLM）→ 有信号则两轮制编排（轮A agent 拉信号明细 + 起草源规则三步；进程侧组装闸门一沙盒证据：数据集 → 沙盒 → 关闭；轮B agent 携证据调 `rule_promote` 提名）→ 结构化 JSON 巡视报告（一行 JSON 到 stdout，`--out` 可追加归档）；**无信号零动作静默退出**（`status=no_signal`，exit 0）。触发器在本进程/外部调度，server 零自治循环；重复提名被服务端去重门禁拒绝时报告 `status=duplicate_rejected`。默认 `rule-copilot` 档案（提名工具在协作体白名单）
+- **`serve` 启动期档案预载校验** — 启动时预载 agents 目录全部档案：缺失/坏 JSON/语义非法 fail-fast 并逐项列明；相对 `agents.dir` 改为相对 `--workdir` 解析（与 config 加载基准一致，不再受进程 cwd 影响，报错含实际解析基准）——消灭「会话期才报 agent not found」的延迟故障
+- **`publish_list` 工具 `workspace_id` 过滤参数** — 与 server 侧同名查询参数对齐，治理队列跨工作空间污染根治（消费侧透传）
+
+#### 档案与测试
+- **`agents/general.json` 白名单收录 `evolution_signals`**（19 → 20 工具）— general 会话可感知违规态势（只读）；`rule_promote` 维持协作体档案独占（提名权收敛）
+- **README 工具计数门禁测试** — 单测断言 README 规则工具集计数与 `rule_tool_specs()` 实际数量锁定，防文档漂移
+
 #### 进化信号（自进化信号消费 + 约束层晋升提名）
 - **`evolution_signals` 工具** — 拉取指定会话的违规信号聚合摘要（`GET /api/sessions/{id}/evolution-signals`，只读）：按规则归因聚合 enforce 拦截记录（计数降序→规则引用升序确定性排序）＋治理队列现状（待审普通规则/待审约束层晋升计数）；无信号返回「当前无进化信号」明示文本。规则工具集 43 → 45（serve union 30 → 32）；`agents/rule-copilot.json` 白名单加入 `evolution_signals` / `rule_promote`（版本号随动 0.2.0 → 0.3.0）
 - **`rule_promote` 工具** — 约束层晋升提名：经治理链发布队列（`POST /api/publish/queue`）提名，`kind` 在工具实现内硬编码为 `meta_promotion`（LLM 无改道普通通道的口子）；`promoted_from` 等溯源字段由服务端权威预填（防伪造）；进入人审队列后由治理方审批，agent 面不提供任何审批通道
@@ -68,6 +77,7 @@
 
 ### 🔄 变更
 
+- **`list_publish_queue` 客户端方法** — 新增可选 `workspace_id` 过滤参数（None 保留旧行为）；`PublishQueueItem` 补齐 `kind` 字段（对齐 server 模型）
 - **移除 `blake3` 直接依赖** — 零代码调用（仅文档注释提及概念），死依赖删除；
   evorule-reactor 自身对 blake3 的依赖不受影响
 - **移除 `evorule-tcb` / `evorule-reactor` 依赖** — Agent 编排层与 evorule 仓 TCB/Reactor 代码解耦；
