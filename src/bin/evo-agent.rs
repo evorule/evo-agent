@@ -884,11 +884,15 @@ fn cmd_patrol(
             enforce 的 params 必含 domain(匹配即强制中断剩余 transform 并拒绝执行违规指令,\n\
             与 branch.domain 同构的 7 域类型)和 reason(非空字符串,命中时随系统独占 Violation\n\
             事实审计回显)。**严禁使用 set 留痕型——进化约束必须自带拦截原语,留痕型不构成\n\
-            生效约束(违规指令仍被旧约束拦截、新约束不可达)。** 已验证可用的最小示例:\n\
-            {{\"type\":\"enforce\",\"params\":{{\"domain\":{{\"type\":\"instruction\",\"instruction_type\":\"robot_move\"}},\"reason\":\"robot_move 违规拦截\"}}}}\n\
+            生效约束(违规指令仍被旧约束拦截、新约束不可达)。** 草稿必须是且仅是如下完整\n\
+            JSON 对象:transform 数组每个元素直接就是 {{\"type\":...,\"params\":...}} 对象,\n\
+            严禁条目级出现 name/condition/meta 等任何其他键,严禁把 enforce 包进 meta 等\n\
+            包裹层数组。已验证可用的最小完整草稿示例:\n\
+            {{\"$schema\":\"https://evorule.org/schemas/rule_set/v1.0.json\",\"kind\":\"rule_set\",\"metadata\":{{\"tier\":\"constraint\",\"title\":\"robot_move 拦截约束\"}},\"transform\":[{{\"type\":\"enforce\",\"params\":{{\"domain\":{{\"type\":\"instruction\",\"instruction_type\":\"robot_move\"}},\"reason\":\"robot_move 违规拦截\"}}}}]}}\n\
             其中 domain.type 取 \"instruction\" 时匹配指令类型(如 robot_move),也可用 eq/lt/exists\n\
-            等域类型表达更精确的匹配条件。**条件必须写在 params.domain 内,严禁在条目级写\n\
-            condition 等未知键——条目级只允许 type 与 params,未知键会被 schema gate 拒收。**\n\
+            等域类型表达更精确的匹配条件(条件必须写在 params.domain 内)。输出前自查:\n\
+            transform 每个条目是否只含 type 与 params 两个键——条目级未知键会被 schema gate\n\
+            拒收,草稿整体作废。\n\
             源规则 content 必须是且仅是如下形态的 JSON 对象——顶层只含 type 与 params\n\
             两个键,type 取 \"set\",params 必含 attr(字符串)/operation(只能是 set/add/sub)/\n\
             value(字符串或数值)三键,可附 condition 对象表达触发条件。已验证可用的最小示例:\n\
