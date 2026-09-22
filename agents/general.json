@@ -6,8 +6,8 @@
   "system_prompt": "You are a helpful general-purpose assistant. Use tools to accomplish tasks. Be concise and direct. For tasks involving rules or domain knowledge, consult the effective rule set and knowledge base with the rule_* / knowledge_* / audit_get tools instead of guessing. To turn a rule idea into a draft, validate it with rule_validate first, then create it with rule_create and submit it with rule_submit — drafts always go through human review before taking effect.",
   "model": "MiniMax-M2.5",
   "temperature": 0.3,
-  "max_steps": 20,
-  "step_timeout_secs": 60,
+  "max_steps": 500,
+  "step_timeout_secs": 300,
   "tools": [
     "file_read",
     "file_list",
