@@ -39,7 +39,7 @@
 ### 🆕 新增
 
 #### 进化巡视任务模式（一次性自进化编排）
-- **`evo-agent patrol` 子命令** — 一次性进化巡视：信号探查（不调 LLM）→ 有信号则两轮制编排（轮A agent 拉信号明细 + 起草源规则三步；进程侧组装闸门一沙盒证据：数据集 → 沙盒 → 关闭；轮B agent 携证据调 `rule_promote` 提名）→ 结构化 JSON 巡视报告（一行 JSON 到 stdout，`--out` 可追加归档）；**无信号零动作静默退出**（`status=no_signal`，exit 0）。触发器在本进程/外部调度，server 零自治循环；重复提名被服务端去重门禁拒绝时报告 `status=duplicate_rejected`。默认 `rule-copilot` 档案（提名工具在协作体白名单）
+- **`evo-agent patrol` 子命令** — 一次性进化巡视：信号探查（不调 LLM）→ 有信号则两轮制编排（轮A agent 拉信号明细 + 起草约束层草稿三步，草稿为 **enforce 拦截型**（`type=enforce` + `params.domain/reason`），提取后经提交期结构校验（条目级键白名单 `{type,params}`、拒绝 set 留痕型、`reason` 非空——与 server schema 门禁同口径），失败 fail-fast 落报告退出；进程侧组装闸门一沙盒证据：数据集 → 沙盒 → 关闭；轮B agent 携证据调 `rule_promote` 提名）→ 结构化 JSON 巡视报告（一行 JSON 到 stdout，`--out` 可追加归档）；**无信号零动作静默退出**（`status=no_signal`，exit 0）。触发器在本进程/外部调度，server 零自治循环；重复提名被服务端双态去重门禁拒绝时报告 `status=duplicate_rejected`。默认 `rule-copilot` 档案（提名工具在协作体白名单）
 - **`serve` 启动期档案预载校验** — 启动时预载 agents 目录全部档案：缺失/坏 JSON/语义非法 fail-fast 并逐项列明；相对 `agents.dir` 改为相对 `--workdir` 解析（与 config 加载基准一致，不再受进程 cwd 影响，报错含实际解析基准）——消灭「会话期才报 agent not found」的延迟故障
 - **`publish_list` 工具 `workspace_id` 过滤参数** — 与 server 侧同名查询参数对齐，治理队列跨工作空间污染根治（消费侧透传）
 
