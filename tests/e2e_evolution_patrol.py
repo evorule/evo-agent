@@ -19,8 +19,8 @@ r"""
   E4  直调审批 approved → L2 约束文件落盘(/api/rules/l2-inventory 可见)
   E5  无信号静默: 全新无违规会话 patrol → exit 0 + status=no_signal + 零提名
   E6  审计链验证(种子会话 /audit/verify verified=true)
-  E7  审批落盘后同目标再提名被拒(双态去重 published 分支, 98 号 D3) → 409
-  E8  新会话违规归因=新约束(98 号核心断言: enforce 型晋升产物先于种子拦截,
+  E7  审批落盘后同目标再提名被拒(双态去重 published 分支) → 409
+  E8  新会话违规归因=新约束(核心断言: enforce 型晋升产物先于种子拦截,
       evolution-signals rule_ref=00_constraint_promoted_*.json#k)
 
 前置(由运行方准备,脚本只做验证侧):
@@ -389,7 +389,7 @@ def _nominate_body(ws_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
 async def e7_published_renominate(
     t: E2ETest, client: httpx.AsyncClient, ws_id: str, item: Dict[str, Any]
 ) -> None:
-    t.header("E7 审批落盘后同目标再提名被拒(双态去重 published 分支, 98 号 D3)")
+    t.header("E7 审批落盘后同目标再提名被拒(双态去重 published 分支)")
     version_ids = _parse_promoted_from(item.get("meta_rule_content") or "")
     if not version_ids:
         t.fail("E7 promoted_from 版本集解析", "队列表单缺 promoted_from")
