@@ -153,6 +153,22 @@ cargo build --release
 cargo run --release -- serve --port 8081
 ```
 
+### 打开工作台（Web IDE）
+
+serve 同时托管内置的 IDE 工作台（Trae 式布局：左文件树 / 中编辑器 / 右对话侧栏 / 底部审计抽屉），风格与 evorule 设计体系一致：
+
+```bash
+# 首次使用先构建前端（产物在 web/dist，已 gitignore）
+npm --prefix web install && npm --prefix web run build
+
+cargo run --release -- serve --port 8081
+# 浏览器打开 http://127.0.0.1:8081/ 即工作台
+```
+
+- 右侧对话侧栏直连 agent 会话（WS 双向流，见 API.md §6），真实模型流式回复
+- 编辑器区基于 Monaco（VS Code 同款内核），后续阶段在此打开与协作编辑文件
+- 未构建前端时 serve 自动降级为纯 API 模式，不影响既有用法
+
 ### 跑一个 Agent
 
 ```bash

@@ -38,6 +38,10 @@
 
 ### 🆕 新增
 
+#### IDE 工作台（Web IDE 前端，Trae 式布局）
+- **内置 IDE 工作台**（`web/`，Svelte 5 + Vite 5 + Monaco Editor）— serve 直接托管（API 路由外层 fallback 到 `web/dist`，SPA 缺省回退 index.html）：左活动栏+文件树面板（S0 静态占位）、中编辑器群（Monaco 欢迎页验证内核与主题集成）、右对话侧栏（WS 双向流直连 agent 会话，真实模型流式回复 + 工具调用摘要卡 + 审批卡展示）、底部审计抽屉（默认收起占位）。设计 token 全量提取自 console-cloud 设计系统 v3.0（Docker 风格深色主题，字体/色板/间距/圆角/阴影逐项一致）；未构建前端时自动降级纯 API 模式
+- **`tower-http` 新增 `fs` feature**（ServeDir/ServeFile 静态托管依赖）；工作台静态资源不经过 API 面鉴权中间件（页面须无 token 可打开），API 与 WS 面鉴权口径不变
+
 #### 进化巡视任务模式（一次性自进化编排）
 - **`evo-agent patrol` 子命令** — 一次性进化巡视：信号探查（不调 LLM）→ 有信号则两轮制编排（轮A agent 拉信号明细 + 起草约束层草稿三步，草稿为 **enforce 拦截型**（`type=enforce` + `params.domain/reason`），提取后经提交期结构校验（条目级键白名单 `{type,params}`、拒绝 set 留痕型、`reason` 非空——与 server schema 门禁同口径），失败 fail-fast 落报告退出；进程侧组装闸门一沙盒证据：数据集 → 沙盒 → 关闭；轮B agent 携证据调 `rule_promote` 提名）→ 结构化 JSON 巡视报告（一行 JSON 到 stdout，`--out` 可追加归档）；**无信号零动作静默退出**（`status=no_signal`，exit 0）。触发器在本进程/外部调度，server 零自治循环；重复提名被服务端双态去重门禁拒绝时报告 `status=duplicate_rejected`。默认 `rule-copilot` 档案（提名工具在协作体白名单）
 - **`serve` 启动期档案预载校验** — 启动时预载 agents 目录全部档案：缺失/坏 JSON/语义非法 fail-fast 并逐项列明；相对 `agents.dir` 改为相对 `--workdir` 解析（与 config 加载基准一致，不再受进程 cwd 影响，报错含实际解析基准）——消灭「会话期才报 agent not found」的延迟故障
