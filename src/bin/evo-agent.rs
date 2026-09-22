@@ -529,6 +529,66 @@ fn extract_last_fenced_json(text: &str) -> Option<String> {
     result
 }
 
+/// 约束层草稿结构校验(提名前置,意图静默丢失防御)
+///
+/// 与 server schema 门禁同口径的条目级键白名单({type, params},未知键 fail-fast
+/// 并列明键名)+ enforce 条目最小结构校验(params 必含 domain/reason 且 reason
+/// 非空)。背景:转写产物曾把匹配条件写成条目级 condition 字段,引擎静默忽略
+/// 导致约束对所有指令无条件触发——起草意图在提交期即校验,杜绝无效提名进
+/// 人审队列;同时进化约束必须自带拦截原语(enforce),留痕型产物不构成生效约束。
+fn validate_constraint_draft(draft: &str) -> Result<(), String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(draft).map_err(|e| format!("约束草稿不是合法 JSON: {e}"))?;
+    let transforms = parsed
+        .get("transform")
+        .and_then(|t| t.as_array())
+        .ok_or("约束草稿缺少 transform 数组")?;
+    if transforms.is_empty() {
+        return Err("约束草稿 transform 为空".to_string());
+    }
+    for (i, entry) in transforms.iter().enumerate() {
+        let obj = entry
+            .as_object()
+            .ok_or(format!("transform[{i}] 不是对象"))?;
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|k| *k != "type" && *k != "params")
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "transform[{i}] 携带条目级未知键 {}(条目级只允许 type/params;拦截条件必须写在 params.domain 内)",
+                unknown.join(",")
+            ));
+        }
+        let ty = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if ty != "enforce" {
+            return Err(format!(
+                "transform[{i}] type={ty:?} 不是 enforce——进化约束必须自带拦截原语(留痕型产物不构成生效约束)"
+            ));
+        }
+        let params = obj
+            .get("params")
+            .and_then(|p| p.as_object())
+            .ok_or(format!("transform[{i}] 缺少 params 对象"))?;
+        for req in ["domain", "reason"] {
+            if !params.contains_key(req) {
+                return Err(format!("transform[{i}] enforce 缺少 params.{req}"));
+            }
+        }
+        if params
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(format!(
+                "transform[{i}] enforce reason 须为非空字符串(无 reason 的拦截不可审计)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 产物值清洗:去两侧空白/markdown 修饰符/引号/尾随分隔标点
 /// (真实 LLM 会把 prompt 列表里的分号一并照抄进值,如「VERSION_ID=<ulid>;」)。
 fn clean_extracted(v: &str) -> String {
@@ -820,8 +880,15 @@ fn cmd_patrol(
             行为),并设计一个约束层规则集草稿 JSON。约束草稿要求:$schema 用 \
             https://evorule.org/schemas/rule_set/v1.0.json,kind 为 rule_set,\n\
             metadata.tier 为 \"constraint\" 且 metadata.title 必须为非空字符串(可用\n\
-            「<违规模式>留痕约束」句式),transform 只允许跟踪型(用 set 写审计留痕属性,\n\
-            严禁出现 enforce 强制原语),内容针对该违规模式做事后留痕。\n\
+            「<违规模式>拦截约束」句式)。**transform 必须使用 enforce 元指令**(而非 set):\n\
+            enforce 的 params 必含 domain(匹配即强制中断剩余 transform 并拒绝执行违规指令,\n\
+            与 branch.domain 同构的 7 域类型)和 reason(非空字符串,命中时随系统独占 Violation\n\
+            事实审计回显)。**严禁使用 set 留痕型——进化约束必须自带拦截原语,留痕型不构成\n\
+            生效约束(违规指令仍被旧约束拦截、新约束不可达)。** 已验证可用的最小示例:\n\
+            {{\"type\":\"enforce\",\"params\":{{\"domain\":{{\"type\":\"instruction\",\"instruction_type\":\"robot_move\"}},\"reason\":\"robot_move 违规拦截\"}}}}\n\
+            其中 domain.type 取 \"instruction\" 时匹配指令类型(如 robot_move),也可用 eq/lt/exists\n\
+            等域类型表达更精确的匹配条件。**条件必须写在 params.domain 内,严禁在条目级写\n\
+            condition 等未知键——条目级只允许 type 与 params,未知键会被 schema gate 拒收。**\n\
             源规则 content 必须是且仅是如下形态的 JSON 对象——顶层只含 type 与 params\n\
             两个键,type 取 \"set\",params 必含 attr(字符串)/operation(只能是 set/add/sub)/\n\
             value(字符串或数值)三键,可附 condition 对象表达触发条件。已验证可用的最小示例:\n\
@@ -888,6 +955,19 @@ fn cmd_patrol(
         write_report(&report, out);
         return ExitCode::from(1);
     };
+    // 提交期结构校验（意图静默丢失防御）：transform 条目级只允许 {type,params}，
+    // type 必须 enforce（拒绝 set 留痕型），params 必含 domain/reason。
+    // 校验失败即 fail-fast 落报告退出——不带病进入轮B/提交链路。
+    if let Err(reason) = validate_constraint_draft(&draft_json) {
+        eprintln!("[patrol] 约束草稿结构校验失败: {reason}");
+        report["error"] = serde_json::json!(format!(
+            "turn A: constraint draft validation failed: {reason}"
+        ));
+        report["draft_json"] = serde_json::json!(draft_json);
+        report["turn_a_text"] = serde_json::json!(turn_a.content);
+        write_report(&report, out);
+        return ExitCode::from(1);
+    }
     let test_case = extract_keyed_value(&turn_a.content, "TEST_CASE")
         .unwrap_or_else(|| "{\"probe\": true}".to_string());
     report["version_id"] = serde_json::json!(version_id);
@@ -2596,6 +2676,79 @@ mod patrol_parse_tests {
     fn test_extract_last_fenced_json_none_when_absent() {
         assert!(extract_last_fenced_json("没有任何围栏块").is_none());
         assert!(extract_last_fenced_json("```json\n未闭合").is_none());
+    }
+
+    /// 合法 enforce 草稿(含域内条件)应通过校验
+    #[test]
+    fn test_validate_constraint_draft_accepts_enforce() {
+        let draft = r#"{
+            "tier": "constraint",
+            "transform": [
+                {
+                    "type": "enforce",
+                    "params": {
+                        "domain": {"type": "instruction", "instruction_type": "robot_move"},
+                        "reason": "robot_move 违规拦截"
+                    }
+                }
+            ]
+        }"#;
+        assert!(validate_constraint_draft(draft).is_ok());
+    }
+
+    /// 条目级 condition(转写静默丢失形态)必须 fail-fast 并列明键名
+    #[test]
+    fn test_validate_constraint_draft_rejects_entry_level_condition() {
+        let draft = r#"{
+            "transform": [
+                {
+                    "type": "set",
+                    "condition": "__exec__.instruction.type == \"robot_move\"",
+                    "params": {"attr": "meta_guard.mark", "operation": "set", "value": true}
+                }
+            ]
+        }"#;
+        let err = validate_constraint_draft(draft).expect_err("条目级 condition 应被拒绝");
+        assert!(err.contains("condition"), "报错应列明未知键: {err}");
+        assert!(err.contains("type/params"), "报错应说明白名单: {err}");
+    }
+
+    /// 留痕型 set 条目不构成生效约束,必须拒绝
+    #[test]
+    fn test_validate_constraint_draft_rejects_set_placeholder() {
+        let draft = r#"{
+            "transform": [
+                {
+                    "type": "set",
+                    "params": {"attr": "meta_guard.mark", "operation": "set", "value": true}
+                }
+            ]
+        }"#;
+        let err = validate_constraint_draft(draft).expect_err("留痕型 set 应被拒绝");
+        assert!(err.contains("enforce"), "报错应说明必须 enforce: {err}");
+    }
+
+    /// enforce 缺 reason 拒绝(无 reason 的拦截不可审计)
+    #[test]
+    fn test_validate_constraint_draft_rejects_missing_reason() {
+        let draft = r#"{
+            "transform": [
+                {
+                    "type": "enforce",
+                    "params": {"domain": {"type": "instruction", "instruction_type": "robot_move"}}
+                }
+            ]
+        }"#;
+        let err = validate_constraint_draft(draft).expect_err("缺 reason 应被拒绝");
+        assert!(err.contains("reason"), "报错应指明缺失字段: {err}");
+    }
+
+    /// 非法 JSON / 缺 transform / 空 transform 均拒绝
+    #[test]
+    fn test_validate_constraint_draft_rejects_malformed() {
+        assert!(validate_constraint_draft("不是 JSON").is_err());
+        assert!(validate_constraint_draft(r#"{"tier": "constraint"}"#).is_err());
+        assert!(validate_constraint_draft(r#"{"transform": []}"#).is_err());
     }
 
     #[test]
