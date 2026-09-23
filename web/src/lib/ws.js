@@ -3,6 +3,7 @@
 // 工作台 WS 客户端 — 复用 evo-agent G16 双向流协议
 // (服务端实现见 src/api/ws_handler.rs:client→server snake_case,
 //  server→client PascalCase AgentEvent 帧)
+import { get } from 'svelte/store';
 import {
   connStatus,
   sessionId,
@@ -11,7 +12,10 @@ import {
   messages,
   pushMessage,
   updateMessage,
+  refreshSessions,
+  loadTranscriptInto,
 } from './stores.js';
+import { getTranscript } from './api.js';
 
 let ws = null;
 let streamMsgId = null; // 当前轮流式 assistant 气泡
@@ -81,7 +85,29 @@ export function interrupt() {
 export function newSession() {
   sessionId.set(null);
   localStorage.removeItem('evo_session_id');
+  messages.set([]);
   connect('new');
+}
+
+/** 打开历史会话:断开 → 回灌消息 → 以该会话 id 重连(继续对话) */
+export async function openSession(sid) {
+  if (!sid || sid === get(sessionId)) return;
+  sessionId.set(sid);
+  localStorage.setItem('evo_session_id', sid);
+  disconnect();
+  messages.set([]);
+  connStatus.set('connecting');
+  try {
+    const res = await getTranscript(sid);
+    loadTranscriptInto(res.messages || []);
+    pushMessage({ kind: 'info', text: `已恢复历史会话(${res.count ?? 0} 条消息)` });
+  } catch (e) {
+    pushMessage({
+      kind: 'error',
+      text: `历史恢复失败:${String(e?.message || e)}(已重连,可继续发消息)`,
+    });
+  }
+  connect(sid);
 }
 
 function handleFrame(f) {
@@ -93,6 +119,7 @@ function handleFrame(f) {
         kind: 'info',
         text: `会话已建立${f.memory_enabled ? '(记忆已启用)' : ''}`,
       });
+      refreshSessions();
       break;
     }
     case 'Step':

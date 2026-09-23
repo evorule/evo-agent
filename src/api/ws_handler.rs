@@ -200,6 +200,8 @@ async fn handle_ws(
     let mut current_cancel: Option<CancellationToken> = None;
     // 是否有轮次正在执行(防止并发 message)
     let mut turn_active = false;
+    // 会话索引:最近一条用户消息(标题来源;SessionCreated 时随索引落一行)
+    let mut pending_title: Option<String> = None;
 
     info!(
         agent_type = %agent_type,
@@ -245,6 +247,8 @@ async fn handle_ws(
                                 let cancel = runner.cancel_token().clone();
                                 current_cancel = Some(cancel);
                                 turn_active = true;
+                                // 会话索引:记录标题来源(首轮用户消息)
+                                pending_title = Some(content.clone());
 
                                 // 首轮(无 session)→ run_streaming(创建 session)
                                 // 后续(有 session)→ run_continuation(复用 session)
@@ -381,6 +385,21 @@ async fn handle_ws(
                         if let Ok(AgentEvent::SessionCreated { session_id: sid, .. }) = &result {
                             current_session = Some(sid.clone());
                             info!(session_id = %sid, "G16: session created");
+                            // 会话索引:新会话落一行(fail-soft,仅展示辅助)
+                            state.session_index().record(
+                                &crate::api::session_index::SessionIndexEntry {
+                                    session_id: sid.clone(),
+                                    agent_type: agent_type.clone(),
+                                    created_at: crate::api::session_index::unix_now(),
+                                    last_active: crate::api::session_index::unix_now(),
+                                    title: pending_title
+                                        .as_deref()
+                                        .unwrap_or("")
+                                        .chars()
+                                        .take(60)
+                                        .collect(),
+                                },
+                            );
                         }
                         // 序列化 + 推给客户端
                         let json = agent_event_to_json(result);
@@ -394,6 +413,19 @@ async fn handle_ws(
                         turn_active = false;
                         current_cancel = None;
                         info!("G16: turn ended");
+                        // 会话索引:续用会话(重连恢复/多轮)无 SessionCreated 事件,
+                        // 以 TurnEnd 补记录刷新 last_active(读时去重合并)
+                        if let Some(sid) = &current_session {
+                            state.session_index().record(
+                                &crate::api::session_index::SessionIndexEntry {
+                                    session_id: sid.clone(),
+                                    agent_type: agent_type.clone(),
+                                    created_at: crate::api::session_index::unix_now(),
+                                    last_active: crate::api::session_index::unix_now(),
+                                    title: String::new(),
+                                },
+                            );
+                        }
                     }
                     None => {
                         // event_tx 全部 drop(不应发生 — 主循环持有 event_tx)

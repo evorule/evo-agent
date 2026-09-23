@@ -7,11 +7,31 @@
     sessionId,
     turnActive,
     messages,
+    sessions,
+    refreshSessions,
   } from '../lib/stores.js';
-  import { sendMessage, interrupt, newSession } from '../lib/ws.js';
+  import { sendMessage, interrupt, newSession, openSession } from '../lib/ws.js';
+  import { onMount } from 'svelte';
 
   let draft = '';
   let listEl;
+  let showHistory = false;
+
+  onMount(() => {
+    refreshSessions();
+  });
+
+  function fmtTime(unix) {
+    if (!unix) return '';
+    const d = new Date(unix * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  function toggleHistory() {
+    showHistory = !showHistory;
+    if (showHistory) refreshSessions();
+  }
 
   // 消息变化时滚动到底部
   $effect(() => {
@@ -39,8 +59,31 @@
 <aside class="chat">
   <div class="chat-header">
     <span class="title">对话</span>
-    <button class="new-btn" onclick={newSession} title="断开并新建会话">新建会话</button>
+    <div class="header-actions">
+      <button class="new-btn" class:active={showHistory} onclick={toggleHistory} title="历史会话">历史</button>
+      <button class="new-btn" onclick={newSession} title="断开并新建会话">新建会话</button>
+    </div>
   </div>
+
+  {#if showHistory}
+    <div class="session-list">
+      {#if $sessions.length === 0}
+        <div class="session-empty">暂无历史会话</div>
+      {:else}
+        {#each $sessions as s (s.session_id)}
+          <button
+            class="session-item"
+            class:current={s.session_id === $sessionId}
+            onclick={() => openSession(s.session_id)}
+            title={s.session_id}
+          >
+            <span class="s-title">{s.title || '(无标题)'}</span>
+            <span class="s-time mono">{fmtTime(s.last_active)}</span>
+          </button>
+        {/each}
+      {/if}
+    </div>
+  {/if}
 
   <div class="msg-list" bind:this={listEl}>
     {#if $messages.length === 0}
@@ -140,6 +183,63 @@
   .new-btn:hover {
     color: var(--text-primary);
     background: var(--sidebar-hover);
+  }
+  .new-btn.active {
+    color: var(--brand);
+    border-color: var(--brand);
+  }
+  .header-actions {
+    display: flex;
+    gap: var(--sp-xs);
+  }
+  .session-list {
+    flex-shrink: 0;
+    max-height: 200px;
+    overflow-y: auto;
+    border-bottom: 1px solid var(--border);
+    padding: var(--sp-xs);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .session-empty {
+    padding: var(--sp-sm);
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    text-align: center;
+  }
+  .session-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-sm);
+    width: 100%;
+    padding: 6px var(--sp-sm);
+    border: none;
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--sidebar-text);
+    cursor: pointer;
+    text-align: left;
+  }
+  .session-item:hover {
+    background: var(--sidebar-hover);
+  }
+  .session-item.current {
+    background: rgba(29, 99, 237, 0.18);
+    box-shadow: inset 2px 0 0 var(--brand);
+  }
+  .s-title {
+    font-size: var(--fs-xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .s-time {
+    font-size: 10px;
+    color: var(--text-muted);
+    flex-shrink: 0;
   }
   .msg-list {
     flex: 1;

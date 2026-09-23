@@ -16,6 +16,7 @@
 8. [Metrics API](#8-metrics-api)
 9. [透传 evorule-server API](#9-透传-evorule-server-api)
 10. [工作台文件面](#10-工作台文件面)
+11. [会话索引与历史](#11-会话索引与历史)
 
 ---
 
@@ -962,6 +963,61 @@ PUT /api/files/write
 ```
 
 错误：`400`（路径越界 / 内容超限）。
+
+---
+
+## 11. 会话索引与历史
+
+服务 IDE 工作台的会话列表与历史恢复。职责边界：**消息历史**读取 evorule payload 的权威持久化(`__memory__.{ns}.session_{sid}.messages.{idx}`,agent 每轮自动写入,进 FactsLog 审计链),端点零写入只做投影;**会话枚举**为 serve 侧本地索引(`data/session_index.jsonl`,WS 面在 SessionCreated / TurnEnd 时记录,读时去重合并)——只覆盖经过 serve WS 面创建/续用的会话(工作台消费面),HTTP `run` 路径不含 session_id,不在索引范围。
+
+### 11.1 会话列表
+
+```
+GET /api/sessions
+```
+
+**响应:**
+```json
+{
+  "count": 1,
+  "sessions": [
+    {
+      "session_id": "15",
+      "agent_type": "general",
+      "created_at": 1790125690,
+      "last_active": 1790125690,
+      "title": "请用一句话介绍你自己"
+    }
+  ]
+}
+```
+
+标题 = 首轮用户消息前 60 字符;列表按 last_active 降序。
+
+### 11.2 会话消息历史
+
+```
+GET /api/sessions/{id}/transcript?agent_type={可选}
+```
+
+`agent_type` 缺省从索引回查(决定记忆 namespace,再缺省 `general`)。消息按 `idx` 升序,同 idx 后写覆盖(last-write-wins)。
+
+**响应:**
+```json
+{
+  "session_id": "15",
+  "agent_type": "general",
+  "namespace": "general",
+  "count": 3,
+  "messages": [
+    { "idx": 0, "role": "system", "content": "..." },
+    { "idx": 1, "role": "user", "content": "..." },
+    { "idx": 2, "role": "assistant", "content": "...", "tool_calls": null }
+  ]
+}
+```
+
+错误:`502`(evorule-server 不可达)。
 
 ---
 
