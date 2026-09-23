@@ -100,7 +100,15 @@ export async function openSession(sid) {
   try {
     const res = await getTranscript(sid);
     loadTranscriptInto(res.messages || []);
-    pushMessage({ kind: 'info', text: `已恢复历史会话(${res.count ?? 0} 条消息)` });
+    if (res.source === 'snapshot') {
+      // O-093:引擎会话已被 30min 闲置 TTL 回收,历史来自本地快照(非权威副本)
+      pushMessage({
+        kind: 'info',
+        text: `已恢复历史会话(${res.count ?? 0} 条消息,本地快照副本——引擎侧会话已过期;如需继续对话请新建会话)`,
+      });
+    } else {
+      pushMessage({ kind: 'info', text: `已恢复历史会话(${res.count ?? 0} 条消息)` });
+    }
   } catch (e) {
     pushMessage({
       kind: 'error',

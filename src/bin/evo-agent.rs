@@ -1686,6 +1686,52 @@ fn cmd_serve(
         }
     };
 
+    // O-093:快照目录自建 + 启动清扫 + 每日周期清理。
+    // 保留期每次清理时从 workbench_config.json 现读(改配置下次清理即生效);
+    // 删除只作用于 data/snapshots/ 目录,永不越界(展示层副本,非审计链)。
+    // 注:此处按同路径新建独立实例(state 已移入 router;两 store 仅持路径,无状态)。
+    {
+        let snapshots =
+            evo_agent::api::snapshots::SnapshotStore::new(workdir.join("data").join("snapshots"));
+        let config_store = evo_agent::api::snapshots::WorkbenchConfigStore::new(
+            workdir.join("data").join("workbench_config.json"),
+        );
+        snapshots.ensure_dir();
+        let policy = evo_agent::api::snapshots::RetentionPolicy::from_label(
+            &config_store.load().retention,
+        )
+        .unwrap_or(evo_agent::api::snapshots::RetentionPolicy::Month3);
+        let removed = snapshots.cleanup_expired(policy);
+        if removed > 0 {
+            eprintln!(
+                "[snapshots] startup cleanup: removed {} expired day-dir(s) (retention={})",
+                removed,
+                policy.label()
+            );
+        }
+        runtime.spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await; // 首次 tick 立即返回(启动清扫已做,消费掉)
+            loop {
+                interval.tick().await;
+                let policy = evo_agent::api::snapshots::RetentionPolicy::from_label(
+                    &config_store.load().retention,
+                )
+                .unwrap_or(evo_agent::api::snapshots::RetentionPolicy::Month3);
+                let removed = snapshots.cleanup_expired(policy);
+                if removed > 0 {
+                    eprintln!(
+                        "[snapshots] periodic cleanup: removed {} expired day-dir(s) (retention={})",
+                        removed,
+                        policy.label()
+                    );
+                }
+            }
+        });
+    }
+
     // 7. 绑定 + 启动
     let addr = format!("{}:{}", host, port);
     let bind_result = runtime.block_on(async { tokio::net::TcpListener::bind(&addr).await });
