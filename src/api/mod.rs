@@ -2,11 +2,12 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! Agent API 妯″潡
+//! Agent API 模块
 
 pub mod agent_api;
 pub mod api_core;
 pub mod auth;
+pub mod console_sidecar;
 pub mod evorule_client;
 pub mod file_api;
 pub mod llm_ops;

@@ -1686,6 +1686,32 @@ fn cmd_serve(
         }
     };
 
+    // O-094:console 审计页 sidecar 自动拉起(配置化,fail-soft)。
+    // workbench.console_dir 配置 console-cloud 仓目录后,serve 启动期探测端口,
+    // 未监听则拉起 vite dev(审计深链数据源);未配置/目录无效/拉起失败仅告警。
+    if let Some(console_dir) = config.workbench.console_dir.clone() {
+        let port = config
+            .workbench
+            .console_port
+            .unwrap_or(evo_agent::api::console_sidecar::DEFAULT_CONSOLE_PORT);
+        let log_file = workdir.join("data").join("console_sidecar.log");
+        runtime.spawn(async move {
+            let (spawned, msg) = evo_agent::api::console_sidecar::ensure_console_dev(
+                &console_dir,
+                port,
+                Some(&log_file),
+            )
+            .await;
+            eprintln!("[console-sidecar] {}", msg);
+            if spawned {
+                eprintln!(
+                    "[console-sidecar] audit deep-link target: http://localhost:{}/audit",
+                    port
+                );
+            }
+        });
+    }
+
     // O-093:快照目录自建 + 启动清扫 + 每日周期清理。
     // 保留期每次清理时从 workbench_config.json 现读(改配置下次清理即生效);
     // 删除只作用于 data/snapshots/ 目录,永不越界(展示层副本,非审计链)。
