@@ -8,7 +8,7 @@
 <script>
   import { sysEvents, govEvents, sessionId } from '../lib/stores.js';
 
-  // tabs:标准 IDE 标配 4 + evorule 专有 3(106 号 §九 设计输入)
+  // tabs:标准 IDE 标配 4 + evorule 专有 3(设计输入见立项文档)
   const tabs = [
     { id: 'terminal', label: '终端', disabled: true, tip: '真实终端(PTY)将拆独立子阶段接入' },
     { id: 'output', label: '输出' },
