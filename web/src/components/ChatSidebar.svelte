@@ -10,6 +10,8 @@
     sessions,
     refreshSessions,
     updateMessage,
+    artifacts,
+    openFile,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession } from '../lib/ws.js';
   import { getWorkbenchConfig, putWorkbenchConfig, approveProposal } from '../lib/api.js';
@@ -176,6 +178,20 @@
         <div class="row center"><span class="sys mono">{m.text}</span></div>
       {:else if m.kind === 'error'}
         <div class="row"><div class="bubble error-bubble">{m.text}</div></div>
+      {:else if m.kind === 'artifact'}
+        <div class="artifact-card">
+          <div class="ac-head">
+            <span class="ac-label">agent 产物</span>
+            <span
+              class="ac-state"
+              class:final={$artifacts.some((a) => a.path === m.path && a.finalizedAt)}
+            >
+              {$artifacts.some((a) => a.path === m.path && a.finalizedAt) ? '已定稿' : '草稿'}
+            </span>
+          </div>
+          <div class="ac-path mono" title={m.path}>{m.path}({m.bytes} B)</div>
+          <button class="ac-open" onclick={() => openFile(m.path)}>在编辑器打开</button>
+        </div>
       {:else if m.kind === 'approval'}
         <div class="approval-card">
           <div class="ap-head">需要审批 · {m.toolName}</div>
@@ -445,6 +461,55 @@
   .sys {
     font-size: 11px;
     color: var(--text-muted);
+  }
+  .artifact-card {
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--brand);
+    border-radius: 6px;
+    padding: var(--sp-sm) var(--sp-md);
+    margin: var(--sp-xs) 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: var(--bg-card);
+  }
+  .ac-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .ac-label {
+    font-size: var(--fs-xs);
+    font-weight: var(--fw-med);
+    color: var(--brand);
+  }
+  .ac-state {
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+  }
+  .ac-state.final {
+    color: var(--ok, #4ade80);
+  }
+  .ac-path {
+    font-size: var(--fs-xs);
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ac-open {
+    align-self: flex-start;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: var(--fs-xs);
+    padding: 2px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .ac-open:hover {
+    color: var(--text-primary);
+    border-color: var(--brand);
   }
   .approval-card {
     border: 1px solid var(--warning);

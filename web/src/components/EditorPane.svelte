@@ -1,7 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 EvoRule Project -->
 <!-- 编辑器群(Monaco):多 tab + 打开/编辑/保存(文件 REST 面,file_write 同通道)。
-     每文件一个 Monaco model(保留 undo 栈),切换即 setModel;Ctrl+S 保存落盘。 -->
+     每文件一个 Monaco model(保留 undo 栈),切换即 setModel;Ctrl+S 保存落盘。
+     S4 产物协作:agent file_write 产物自动打开,含草稿基线时可切 diff 视图
+     (左=agent 草稿,右=当前可编辑);保存即定稿(工作台层留痕,见 stores.js)。 -->
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
@@ -9,6 +11,7 @@
   import {
     tabs,
     activePath,
+    artifacts,
     closeTab,
     markDirty,
     saveTab,
@@ -25,17 +28,20 @@
 - 编辑器内 Ctrl+S 保存落盘(与 agent 写文件同一安全通道)
 - 在右侧对话侧栏与 general agent 对话(真实模型流式回复)
 - agent 的工具调用会以摘要卡片呈现在对话流中
+- agent 写文件后产物自动打开:可切「差异视图」对比 agent 草稿,
+  直接增删改,Ctrl+S 保存即定稿(草稿与定稿留痕在工作台内)
 
 ## 路线图
 
-- 对话历史与会话恢复
-- 治理叠加(审批交互 / 审计抽屉 / 治理状态徽标)
-- agent 产物与人协作编辑(agent 草稿 → 人定稿 → 落盘)
+- 治理状态徽标下钻(点击查看白名单/信号明细)
+- 更多 evorule 专有面板(时光机器 / 记忆)
 
-本编辑器区域即未来的产物协作编辑主场。`;
+本编辑器区域即产物协作编辑主场。`;
 
   let editorEl;
+  let diffEl;
   let editor = null;
+  let diffEditor = null;
   let welcomeModel = null;
   /** path → monaco model(含 undo 栈与编辑状态) */
   const models = new Map();
@@ -43,8 +49,17 @@
   const baseline = new Map();
   /** path → 打开失败的错误占位 model(缓存防重复创建) */
   const errorModels = new Map();
+  /** path → agent 草稿基线 model(diff 视图左栏) */
+  const draftModels = new Map();
+  /** 当前激活 tab 是否处于差异视图 */
+  let diffOn = false;
   /** 保存失败的临时提示,保存成功即清 */
   let saveError = '';
+
+  /** 当前激活 tab 对应的产物登记(null = 非产物文件) */
+  $: activeArtifact = $activePath
+    ? $artifacts.find((a) => a.path === $activePath) || null
+    : null;
 
   function langOf(path) {
     const ext = (path.split('.').pop() || '').toLowerCase();
@@ -78,15 +93,47 @@
     return model;
   }
 
-  function showTab(path) {
+  function draftModelFor(artifact) {
+    if (draftModels.has(artifact.path)) return draftModels.get(artifact.path);
+    const model = monaco.editor.createModel(artifact.draftContent, langOf(artifact.path));
+    draftModels.set(artifact.path, model);
+    return model;
+  }
+
+  function showHost(which) {
+    if (editorEl) editorEl.style.display = which === 'edit' ? '' : 'none';
+    if (diffEl) diffEl.style.display = which === 'diff' ? '' : 'none';
+  }
+
+  function ensureDiffEditor() {
+    if (!diffEditor) {
+      diffEditor = monaco.editor.createDiffEditor(diffEl, {
+        theme: 'evorule-dark',
+        automaticLayout: true,
+        fontSize: 14,
+        fontFamily: '"JetBrains Mono", Consolas, monospace',
+        lineHeight: 22,
+        minimap: { enabled: false },
+        renderLineHighlight: 'none',
+        scrollBeyondLastLine: false,
+        renderSideBySide: true,
+        padding: { top: 16, bottom: 16 },
+      });
+    }
+    return diffEditor;
+  }
+
+  function renderActive(path) {
     if (!editor) return;
     if (!path) {
       editor.setModel(welcomeModel);
+      showHost('edit');
       return;
     }
     const tab = get(tabs).find((t) => t.path === path) || null;
     if (!tab) {
       editor.setModel(welcomeModel);
+      showHost('edit');
       return;
     }
     if (tab.error) {
@@ -98,12 +145,27 @@
         );
       }
       editor.setModel(errorModels.get(tab.path));
+      showHost('edit');
       return;
     }
-    editor.setModel(modelFor(tab));
+    const model = modelFor(tab);
+    const artifact = get(artifacts).find((a) => a.path === path) || null;
+    if (diffOn && artifact) {
+      const de = ensureDiffEditor();
+      de.setModel({ original: draftModelFor(artifact), modified: model });
+      showHost('diff');
+    } else {
+      editor.setModel(model);
+      showHost('edit');
+    }
   }
 
-  // activePath 变化 → 切换 model(订阅在 onMount 中建立)
+  function toggleDiff() {
+    diffOn = !diffOn;
+    renderActive(get(activePath));
+  }
+
+  // activePath 变化 → 切换 model(每 tab 默认编辑模式;订阅在 onMount 中建立)
   let unsubActive = null;
 
   async function saveActive() {
@@ -121,6 +183,12 @@
       e.preventDefault();
       saveActive();
     }
+  }
+
+  function fmtTime(ts) {
+    const d = new Date(ts);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}`;
   }
 
   onMount(() => {
@@ -152,7 +220,10 @@
     // 焦点不在编辑器时(tab 栏 / 侧栏)的全局兜底
     window.addEventListener('keydown', onKeyDown);
 
-    unsubActive = activePath.subscribe((p) => showTab(p));
+    unsubActive = activePath.subscribe((p) => {
+      diffOn = false; // 切 tab 回到编辑模式
+      renderActive(p);
+    });
     return () => {
       window.removeEventListener('keydown', onKeyDown);
       if (unsubActive) unsubActive();
@@ -161,8 +232,11 @@
 
   onDestroy(() => {
     for (const m of models.values()) m.dispose();
+    for (const m of draftModels.values()) m.dispose();
+    for (const m of errorModels.values()) m.dispose();
     if (welcomeModel) welcomeModel.dispose();
     if (editor) editor.dispose();
+    if (diffEditor) diffEditor.dispose();
   });
 </script>
 
@@ -197,7 +271,24 @@
       <div class="save-error" title={saveError}>保存失败</div>
     {/if}
   </div>
+  {#if activeArtifact}
+    <div class="artifact-bar">
+      <span class="ab-tag">agent 产物</span>
+      <span class="ab-meta mono" title={activeArtifact.path}>
+        {activeArtifact.name} · {activeArtifact.bytes} B · 草稿 {fmtTime(activeArtifact.draftAt)}
+      </span>
+      <span class="ab-status" class:final={activeArtifact.finalizedAt !== null}>
+        {activeArtifact.finalizedAt !== null
+          ? `已定稿 ${fmtTime(activeArtifact.finalizedAt)}`
+          : '草稿 · 编辑后 Ctrl+S 保存即定稿'}
+      </span>
+      <button class="ab-diff" onclick={toggleDiff}>
+        {diffOn ? '返回编辑' : '查看与草稿差异'}
+      </button>
+    </div>
+  {/if}
   <div class="editor-host" bind:this={editorEl}></div>
+  <div class="editor-host diff-host" bind:this={diffEl} style="display:none"></div>
 </div>
 
 <style>
@@ -270,5 +361,48 @@
   .editor-host {
     flex: 1;
     min-height: 0;
+  }
+  .artifact-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-sm);
+    padding: 4px var(--sp-md);
+    background: var(--bg-header);
+    border-bottom: 1px solid var(--border);
+    font-size: var(--fs-xs);
+    flex-shrink: 0;
+  }
+  .ab-tag {
+    color: var(--brand);
+    font-weight: var(--fw-med);
+    flex-shrink: 0;
+  }
+  .ab-meta {
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ab-status {
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .ab-status.final {
+    color: var(--ok, #4ade80);
+  }
+  .ab-diff {
+    margin-left: auto;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: var(--fs-xs);
+    padding: 2px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .ab-diff:hover {
+    color: var(--text-primary);
+    border-color: var(--brand);
   }
 </style>

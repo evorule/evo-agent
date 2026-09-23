@@ -172,6 +172,7 @@ cargo run --release -- serve --port 8081
 - 底部多 tab 面板（中栏底部、拖拽调高、可折叠）：「输出」呈现系统事件流水、「审计」呈现当前会话治理事件流（工具调用/审批/错误）并提供「在审计页查看」深链跳转 console 审计页（`?session=<id>` 定位；默认 `http://localhost:5174`，localStorage `evo_console_origin` 可改）；终端（PTY）/问题/控制台日志/时光机器/记忆为占位待后续阶段。深链点击前自动探活——console 未运行时就地明示引导，不跳死链
 - **console 审计页自动拉起（可选配置）**：在 `evo-agent.toml` 配置 `[workbench] console_dir = "<console-cloud 仓目录>"`（可选 `console_port`，缺省 5174）后，serve 启动期检测该端口未监听时自动以子进程拉起 console dev server（fail-soft：目录无效/依赖缺失/端口占用仅告警；子进程输出落 `data/console_sidecar.log`）。缺省不配置 = 无任何副作用
 - 审批卡交互：agent 触发候选工具审批时，对话侧栏审批卡可直接「批准/拒绝」（走 §4.4 既有审批通道，60s 超时自动拒绝；WS 审批帧两阶段时序见 API.md §12.2）
+- **agent 产物协作编辑**：agent `file_write` 写文件成功后，产物自动在编辑器打开并登记（对话侧栏出现「agent 产物」卡，可随时点回编辑器）；编辑器顶部出现产物条——「查看与草稿差异」切 diff 视图（左=agent 草稿基线、右=当前可编辑），直接增删改，`Ctrl+S` 保存即定稿（产物条与产物卡实时显示草稿/已定稿状态与时间）；草稿基线与定稿留痕为工作台展示层记录（localStorage，不入审计链），按会话持久化、切会话自动载入
 - 顶栏治理徽标：白名单（agent 工具数）+ 信号（当前会话违规信号累计，见 API.md §12.1），均 fail-soft
 - 未构建前端时 serve 自动降级为纯 API 模式，不影响既有用法
 

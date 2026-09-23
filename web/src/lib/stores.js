@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-import { writable } from 'svelte/store';
+import { writable, get } from 'svelte/store';
 import { listSessions, readFile, writeFile, getAgentDef, getEvolutionSignals } from './api.js';
 
 /** 连接状态: connecting | online | offline */
@@ -166,10 +166,86 @@ export async function saveTab(path, content) {
   try {
     await writeFile(path, content);
     markSaved(path, content);
+    markFinalized(path); // S4:产物文件首次人工保存 = 定稿
     return null;
   } catch (e) {
     return String(e?.message || e);
   }
+}
+
+// ---- 产物协作编辑阶段(S4):agent 草稿 → 人定稿 ----
+//
+// 语义边界(立项设计阶段澄清,项目方默认接受):「agent 草稿 vs 人定稿」为工作台
+// 层面的对比留痕(localStorage 展示层持久化记录),不入 agent 会话审计链。
+
+/** 当前会话产物登记。元素:
+ *  {path, name, draftContent, draftAt, bytes, finalizedAt}
+ *  - draftContent: agent file_write 写入时的内容快照(diff 草稿基线)
+ *  - draftAt: agent 写入时间戳
+ *  - finalizedAt: 人首次保存(Ctrl+S)定稿时间戳;null = 仍是草稿 */
+export const artifacts = writable([]);
+
+const ARTIFACT_KEY = 'evo_artifacts';
+const ARTIFACT_PERSIST_LIMIT = 2 * 1024 * 1024; // localStorage 持久化总量上限,超限只留内存
+
+function persistArtifacts(list, sid) {
+  try {
+    if (!sid) return;
+    const all = JSON.parse(localStorage.getItem(ARTIFACT_KEY) || '{}');
+    all[sid] = list;
+    const total = Object.values(all).reduce((n, arr) => n + JSON.stringify(arr).length, 0);
+    if (total > ARTIFACT_PERSIST_LIMIT) return; // 超限静默跳过(留痕是尽力而为的展示层记录)
+    localStorage.setItem(ARTIFACT_KEY, JSON.stringify(all));
+  } catch {
+    /* 存储不可用(隐私模式等)时留痕只存活于内存 */
+  }
+}
+
+/** 载入某会话的产物留痕(切换/恢复会话时调用) */
+export function loadArtifacts(sid) {
+  try {
+    const all = JSON.parse(localStorage.getItem(ARTIFACT_KEY) || '{}');
+    artifacts.set(Array.isArray(all[sid]) ? all[sid] : []);
+  } catch {
+    artifacts.set([]);
+  }
+}
+
+/** 清空当前产物视图(新建会话时调用;已持久化的留痕不动) */
+export function clearArtifacts() {
+  artifacts.set([]);
+}
+
+/** 登记产物(agent file_write 成功时调用);同路径重复写入 = 刷新草稿基线 */
+export function registerArtifact(path, draftContent, sid) {
+  const name = path.split('/').pop() || path;
+  artifacts.update((list) => {
+    const entry = {
+      path,
+      name,
+      draftContent: draftContent || '',
+      draftAt: Date.now(),
+      bytes: (draftContent || '').length,
+      finalizedAt: null,
+    };
+    const idx = list.findIndex((a) => a.path === path);
+    const next = [...list];
+    if (idx >= 0) next[idx] = entry;
+    else next.push(entry);
+    persistArtifacts(next, sid);
+    return next;
+  });
+}
+
+/** 定稿标记(保存成功后调用;仅对已登记产物生效,幂等) */
+export function markFinalized(path) {
+  const sid = get(sessionId);
+  artifacts.update((list) => {
+    if (!list.some((a) => a.path === path && a.finalizedAt === null)) return list;
+    const next = list.map((a) => (a.path === path && a.finalizedAt === null ? { ...a, finalizedAt: Date.now() } : a));
+    persistArtifacts(next, sid);
+    return next;
+  });
 }
 
 // ---- 治理叠加阶段:事件流水(底部面板)+ 治理徽标 ----
