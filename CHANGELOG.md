@@ -41,6 +41,8 @@
 #### IDE 工作台（Web IDE 前端，Trae 式布局）
 - **内置 IDE 工作台**（`web/`，Svelte 5 + Vite 5 + Monaco Editor）— serve 直接托管（API 路由外层 fallback 到 `web/dist`，SPA 缺省回退 index.html）：左活动栏+文件树面板（S0 静态占位）、中编辑器群（Monaco 欢迎页验证内核与主题集成）、右对话侧栏（WS 双向流直连 agent 会话，真实模型流式回复 + 工具调用摘要卡 + 审批卡展示）、底部审计抽屉（默认收起占位）。设计 token 全量提取自 console-cloud 设计系统 v3.0（Docker 风格深色主题，字体/色板/间距/圆角/阴影逐项一致）；未构建前端时自动降级纯 API 模式
 - **`tower-http` 新增 `fs` feature**（ServeDir/ServeFile 静态托管依赖）；工作台静态资源不经过 API 面鉴权中间件（页面须无 token 可打开），API 与 WS 面鉴权口径不变
+- **工作台文件面（`src/api/file_api.rs`）** — 三端点 `GET /api/files/list` / `GET /api/files/read` / `PUT /api/files/write`，全部委托内置 file 工具实现（同一 workdir 沙箱与路径校验，不在 API 层重复安全逻辑）：list/read 复用 union toolkit 内同一工具实例（与 agent 完全同语义）；write 为人工编辑语义（`writable_dir="."` 使写面为 workdir 全域、固定 overwrite + create_parents，沙箱边界与 1 MB 上限原样保留）。受 G7 鉴权中间件保护；语义边界：本面服务人的直接操作，不构造 agent 会话事实（不进 agent 会话审计链），agent 路径 `file_write` 的 workspace 白名单与审批语义不变
+- **文件树与编辑器真实化（前端）** — 文件树改为真实目录懒加载浏览（点击目录展开/收起、文件点击进编辑器）；编辑器多 tab（每文件独立 Monaco model 保留 undo 栈、dirty 角标、关闭切换）、Ctrl+S 保存落盘（走文件 REST 面，同 agent 写文件安全通道）、打开失败占位与保存失败提示
 
 #### 进化巡视任务模式（一次性自进化编排）
 - **`evo-agent patrol` 子命令** — 一次性进化巡视：信号探查（不调 LLM）→ 有信号则两轮制编排（轮A agent 拉信号明细 + 起草约束层草稿三步，草稿为 **enforce 拦截型**（`type=enforce` + `params.domain/reason`），提取后经提交期结构校验（条目级键白名单 `{type,params}`、拒绝 set 留痕型、`reason` 非空——与 server schema 门禁同口径），失败 fail-fast 落报告退出；进程侧组装闸门一沙盒证据：数据集 → 沙盒 → 关闭；轮B agent 携证据调 `rule_promote` 提名）→ 结构化 JSON 巡视报告（一行 JSON 到 stdout，`--out` 可追加归档）；**无信号零动作静默退出**（`status=no_signal`，exit 0）。触发器在本进程/外部调度，server 零自治循环；重复提名被服务端双态去重门禁拒绝时报告 `status=duplicate_rejected`。默认 `rule-copilot` 档案（提名工具在协作体白名单）

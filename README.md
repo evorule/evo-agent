@@ -166,7 +166,8 @@ cargo run --release -- serve --port 8081
 ```
 
 - 右侧对话侧栏直连 agent 会话（WS 双向流，见 API.md §6），真实模型流式回复
-- 编辑器区基于 Monaco（VS Code 同款内核），后续阶段在此打开与协作编辑文件
+- 左侧文件树浏览工作目录（懒加载展开），点击文件在中栏编辑器打开
+- 编辑器多 tab（Monaco 内核），`Ctrl+S` 保存落盘——与 agent 写文件走同一 file 工具实现（同 workdir 沙箱与安全校验，见 API.md §7）
 - 未构建前端时 serve 自动降级为纯 API 模式，不影响既有用法
 
 ### 跑一个 Agent

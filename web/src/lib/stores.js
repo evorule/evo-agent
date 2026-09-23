@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 import { writable } from 'svelte/store';
+import { readFile, writeFile } from './api.js';
 
 /** 连接状态: connecting | online | offline */
 export const connStatus = writable('offline');
@@ -25,4 +26,80 @@ export function pushMessage(msg) {
 }
 export function updateMessage(id, patch) {
   messages.update((arr) => arr.map((m) => (m.id === id ? { ...m, ...patch } : m)));
+}
+
+// ---- 编辑器 tabs(标准 IDE 基础阶段) ----
+
+/** 打开的编辑器 tab 列表。元素:{path, name, content, dirty, error} */
+export const tabs = writable([]);
+
+/** 当前激活 tab 的文件路径(null = 无激活 tab,显示欢迎页) */
+export const activePath = writable(null);
+
+/** 按路径查找已打开的 tab(tabs 快照上) */
+export function findTab(list, path) {
+  return list.find((t) => t.path === path);
+}
+
+/** 打开文件:已开则激活;否则请求内容后开新 tab。返回错误消息或 null */
+export async function openFile(path) {
+  const name = path.split('/').pop() || path;
+  let existing = null;
+  tabs.update((list) => {
+    existing = findTab(list, path) || null;
+    return list;
+  });
+  if (existing) {
+    activePath.set(path);
+    return null;
+  }
+  try {
+    const res = await readFile(path);
+    const content = res.content ?? '';
+    tabs.update((list) => [...list, { path, name, content, dirty: false, error: null }]);
+    activePath.set(path);
+    return null;
+  } catch (e) {
+    const msg = String(e?.message || e);
+    tabs.update((list) => [...list, { path, name, content: '', dirty: false, error: msg }]);
+    activePath.set(path);
+    return msg;
+  }
+}
+
+/** 关闭 tab:返回相邻 tab 路径(若关的是激活 tab) */
+export function closeTab(path) {
+  let next = null;
+  tabs.update((list) => {
+    const idx = list.findIndex((t) => t.path === path);
+    const rest = list.filter((t) => t.path !== path);
+    if (rest.length > 0) {
+      next = rest[Math.min(idx, rest.length - 1)].path;
+    }
+    return rest;
+  });
+  activePath.update((cur) => (cur === path ? next : cur));
+}
+
+/** 标记 tab 内容已变(dirty) */
+export function markDirty(path, dirty) {
+  tabs.update((list) => list.map((t) => (t.path === path ? { ...t, dirty } : t)));
+}
+
+/** 保存完成后回写基准内容与 dirty=false */
+export function markSaved(path, content) {
+  tabs.update((list) =>
+    list.map((t) => (t.path === path ? { ...t, content, dirty: false, error: null } : t)),
+  );
+}
+
+/** 保存文件(content 由调用方从编辑器 model 取)。返回错误消息或 null */
+export async function saveTab(path, content) {
+  try {
+    await writeFile(path, content);
+    markSaved(path, content);
+    return null;
+  } catch (e) {
+    return String(e?.message || e);
+  }
 }
