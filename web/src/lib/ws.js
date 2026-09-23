@@ -8,6 +8,7 @@ import {
   sessionId,
   turnActive,
   stepCount,
+  messages,
   pushMessage,
   updateMessage,
 } from './stores.js';
