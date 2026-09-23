@@ -1478,6 +1478,12 @@ fn cmd_serve(
     use tower_http::cors::CorsLayer;
     use tower_http::limit::RequestBodyLimitLayer;
 
+    // 0. 加载 .env(若存在;已设置的环境变量优先,不覆盖)——O-095 结构性修复,
+    //    裸启动 serve 也能带 LLM 密钥,不再依赖外部注入
+    if let Some((path, applied)) = evo_agent::dotenv::load_dotenv_for(workdir) {
+        eprintln!("[dotenv] loaded {} key(s) from {}", applied, path.display());
+    }
+
     // 1. 加载配置(宽松模式:server 启动不需要 LLM API key,只在 run 时才需要)
     let config = match evo_agent::config::Config::load_lenient(workdir) {
         Ok(c) => c,
@@ -1489,6 +1495,23 @@ fn cmd_serve(
 
     // 2. 初始化 logging(尊重 config.logging)
     init_logging_for_serve(&config);
+
+    // 2.5 O-095 启动期告警:三个 provider 密钥全缺失时显式提示,避免 LLM 失联假故障被误判
+    let has_llm_key = ["MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"]
+        .iter()
+        .any(|k| {
+            std::env::var(k)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        });
+    if !has_llm_key {
+        eprintln!(
+            "[llm] WARNING: no LLM API key env found (MINIMAX_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY)"
+        );
+        eprintln!(
+            "[llm] WARNING: agent LLM calls will fail; set env vars or place a .env in the serve workdir (auto-loaded at startup)"
+        );
+    }
 
     // 3. G7:构造鉴权配置
     //    优先级:--no-auth > --auth-token > 配置文件/环境变量

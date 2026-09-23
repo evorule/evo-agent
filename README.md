@@ -552,7 +552,7 @@ evorule 生态本地开发涉及三个常驻服务：evorule-server（18080）�
 | `start-evo-agent-serve.ps1` | 幂等拉起 serve，自动注入 `.env` 环境变量（LLM 密钥等，日志只回显键名不回显值） |
 | `start-console.ps1` | 幂等拉起 console dev server |
 | `watchdog-check.ps1` | 单次巡检：三服务探活，不通则拉起（互斥锁防重叠）；手动运行即为「一键全启」 |
-| `install-watchdog-task.ps1` | 注册 Windows 计划任务 `EvoruleOpsWatchdog`（用户登录触发 + 每 1 分钟巡检自愈） |
+| `install-watchdog-task.ps1` | 注册 Windows 计划任务 `EvoruleOpsWatchdog`（用户登录触发 + 每 1 小时巡检自愈） |
 | `ops.local.example.json` | 本机配置模板（入库，中性路径示例） |
 
 ### 首次启用
@@ -571,6 +571,7 @@ Unregister-ScheduledTask -TaskName EvoruleOpsWatchdog -Confirm:$false
 设计要点：
 - **分离启动**：服务以脱离调用方的独立进程运行（隐藏窗口），不再挂在终端/会话后台作业下
 - **幂等**：所有启动脚本探活通过即跳过，可随时手动重跑；`watchdog-check.ps1` 即「一键全启」
+- **密钥双保险**：serve 自身启动时自动加载 workdir（或 exe 目录）下的 `.env`（已设置的环境变量优先，不覆盖；`src/dotenv.rs` 零依赖最小实现），密钥全缺失时启动期打印醒目 WARNING——即使绕过运维脚本裸启动也不会「LLM 失联」；脚本侧 `.env` 注入作为第二层保障
 - **密钥安全**：`.env` 注入只回显键名；`ops.local.json` 与日志目录均在 gitignore 内，密钥不进 git
 - **日志**：每次启动的 stdout/stderr 落 `log_dir`（上一份轮转为 `*.prev`），巡检动作落 `watchdog.log`
 - **边界**：纯运维层工具，不触碰 evorule 引擎执行面（哈希链 / Fact / 审计语义零依赖）

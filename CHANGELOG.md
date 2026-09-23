@@ -86,7 +86,9 @@
 - **动态工具 schema 生成** — 向 LLM 注入工具描述时,从参数契约生成 function schema,LLM 可带参真实调用服务(无契约声明时降级空 schema)
 
 #### 本地运维脚本族（服务稳定化：看门狗 + 开机自启）
-- **`scripts/ops/` 运维脚本族** — 解决本地三服务（evorule-server 18080 / serve 8081 / console 5174）「进程挂在终端/会话后台作业下、关终端或重启后消失、崩溃无人拉起、重启漏带密钥」四类不稳定：① 各服务幂等启动脚本（HTTP/TCP 探活通过即跳过，轮询等待启动完成，手动重跑即「一键全启」）；② `start-evo-agent-serve.ps1` 自动注入 `.env` 环境变量（LLM 密钥等，日志只回显键名绝不回显值——运维面根治「重启后 LLM 登录失败」复发点）；③ `watchdog-check.ps1` 单次巡检（不通则拉起，命名互斥防重叠）；④ `install-watchdog-task.ps1` 注册计划任务 `EvoruleOpsWatchdog`（用户登录触发 + 每 1 分钟巡检自愈，服务以分离进程独立于终端/会话存活）。本机真实路径走 gitignored `ops.local.json`（模板 `ops.local.example.json` 以中性路径入库）；纯运维层工具，不触碰引擎执行面（哈希链/Fact/审计语义零依赖）
+- **`scripts/ops/` 运维脚本族** — 解决本地三服务（evorule-server 18080 / serve 8081 / console 5174）「进程挂在终端/会话后台作业下、关终端或重启后消失、崩溃无人拉起、重启漏带密钥」四类不稳定：① 各服务幂等启动脚本（HTTP/TCP 探活通过即跳过，轮询等待启动完成，手动重跑即「一键全启」）；② `start-evo-agent-serve.ps1` 自动注入 `.env` 环境变量（LLM 密钥等，日志只回显键名绝不回显值）；③ `watchdog-check.ps1` 单次巡检（不通则拉起，命名互斥防重叠）；④ `install-watchdog-task.ps1` 注册计划任务 `EvoruleOpsWatchdog`（用户登录触发 + 每 1 小时巡检自愈，服务以分离进程独立于终端/会话存活）。本机真实路径走 gitignored `ops.local.json`（模板 `ops.local.example.json` 以中性路径入库）；纯运维层工具，不触碰引擎执行面（哈希链/Fact/审计语义零依赖）
+- **serve 启动期 `.env` 自动加载 + 密钥缺失告警** — 新增零依赖最小实现 `src/dotenv.rs`（workdir/exe 目录候选、已设环境变量优先不覆盖、支持引号/`export ` 前缀解析，含单测），serve 裸启动也能携带 LLM 密钥；三个 provider 密钥全缺失时启动期打印醒目 WARNING 指引配置——根除「重启漏注入导致 LLM 登录失败」复发点（登记册 O-095 建议①③闭环，运维脚本注入退居双保险第二层）
+- **看门狗巡检间隔调整** — 每 1 分钟 → 每 1 小时（项目方裁定「没必要太频繁」），开机自启仍由登录触发保证，进程死亡后最长 1 小时内自愈
 
 ### 🔄 变更
 
