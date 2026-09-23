@@ -23,10 +23,13 @@ async function unwrap(resp) {
     try {
       const body = await resp.json();
       if (typeof body === 'string') msg = body;
+      else if (body && typeof body.error === 'string') msg = body.error;
     } catch {
       /* 保留默认消息 */
     }
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = resp.status;
+    throw err;
   }
   return resp.json();
 }
@@ -76,5 +79,31 @@ export function putWorkbenchConfig(retention) {
     method: 'PUT',
     headers: headers(true),
     body: JSON.stringify({ retention }),
+  }).then(unwrap);
+}
+
+/** 审批决定(G8 既有通道;approved=true 批准 / false 拒绝) */
+export function approveProposal(agentType, sessionId, approved, proposalId) {
+  return fetch(`/agents/${encodeURIComponent(agentType)}/approve`, {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({
+      session_id: sessionId,
+      approved,
+      proposal_id: proposalId,
+      reason: '工作台审批',
+    }),
+  }).then(unwrap);
+}
+
+/** agent 定义(白名单徽标数据源:tools 列表) */
+export function getAgentDef(agentType = 'general') {
+  return fetch(`/agents/${encodeURIComponent(agentType)}`, { headers: headers() }).then(unwrap);
+}
+
+/** 会话进化信号(信号徽标数据源;只读代理 evorule-server 聚合端点) */
+export function getEvolutionSignals(sessionId) {
+  return fetch(`/api/sessions/${encodeURIComponent(sessionId)}/evolution-signals`, {
+    headers: headers(),
   }).then(unwrap);
 }

@@ -14,6 +14,8 @@ import {
   updateMessage,
   refreshSessions,
   loadTranscriptInto,
+  pushPanelEvent,
+  refreshGovBadges,
 } from './stores.js';
 import { getTranscript } from './api.js';
 
@@ -128,6 +130,8 @@ function handleFrame(f) {
         text: `会话已建立${f.memory_enabled ? '(记忆已启用)' : ''}`,
       });
       refreshSessions();
+      pushPanelEvent('sys', { label: 'SessionCreated', detail: `会话 ${f.session_id} 已建立` });
+      refreshGovBadges(f.session_id);
       break;
     }
     case 'Step':
@@ -145,6 +149,7 @@ function handleFrame(f) {
         args: safeJson(f.args),
         running: true,
       });
+      pushPanelEvent('gov', { label: 'ToolCall', detail: f.name, level: 'info' });
       break;
     }
     case 'ToolResult': {
@@ -152,6 +157,7 @@ function handleFrame(f) {
         updateMessage(lastToolMsgId, { running: false, result: safeJson(f.result) });
         lastToolMsgId = null;
       }
+      pushPanelEvent('gov', { label: 'ToolResult', detail: f.name, level: 'ok' });
       break;
     }
     case 'LlmDone':
@@ -161,32 +167,49 @@ function handleFrame(f) {
       finishStream();
       if (f.success === false && f.error) {
         pushMessage({ kind: 'error', text: String(f.error) });
+        pushPanelEvent('gov', { label: 'TurnFailed', detail: String(f.error), level: 'error' });
+      } else {
+        pushPanelEvent('sys', { label: 'Done', detail: `本轮完成(step ${f.steps ?? '?'})` });
       }
+      refreshGovBadges(get(sessionId));
       turnActive.set(false);
       break;
     }
     case 'Error':
       finishStream();
       pushMessage({ kind: 'error', text: String(f.error) });
+      pushPanelEvent('gov', { label: 'Error', detail: String(f.error), level: 'error' });
       turnActive.set(false);
       break;
     case 'Info':
       pushMessage({ kind: 'info', text: String(f.message) });
+      pushPanelEvent('sys', { label: 'Info', detail: String(f.message) });
       break;
     case 'ApprovalRequired':
-      // S0 仅展示;审批交互(approve 通道)在治理叠加阶段接入
+      // 治理叠加:审批卡按钮走既有 G8 /approve 通道
       pushMessage({
         kind: 'approval',
         toolName: f.tool_name,
         command: f.command,
         risk: f.risk,
+        alternative: f.alternative,
         proposalId: f.proposal_id,
+      });
+      pushPanelEvent('gov', {
+        label: 'ApprovalRequired',
+        detail: `${f.tool_name}(risk ${f.risk ?? '?'}) 待审批`,
+        level: 'warn',
       });
       break;
     case 'ApprovalResult':
       pushMessage({
         kind: 'info',
         text: `审批结果:${f.approved ? '已批准' : '已拒绝'}(工具 ${f.tool_name})`,
+      });
+      pushPanelEvent('gov', {
+        label: 'ApprovalResult',
+        detail: `${f.tool_name} ${f.approved ? '已批准' : `已拒绝${f.auto_rejected ? '(超时自动)' : ''}`}`,
+        level: f.approved ? 'ok' : 'warn',
       });
       break;
     default:

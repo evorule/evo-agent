@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 import { writable } from 'svelte/store';
-import { listSessions, readFile, writeFile } from './api.js';
+import { listSessions, readFile, writeFile, getAgentDef, getEvolutionSignals } from './api.js';
 
 /** 连接状态: connecting | online | offline */
 export const connStatus = writable('offline');
@@ -169,5 +169,51 @@ export async function saveTab(path, content) {
     return null;
   } catch (e) {
     return String(e?.message || e);
+  }
+}
+
+// ---- 治理叠加阶段:事件流水(底部面板)+ 治理徽标 ----
+
+const EVENT_CAP = 500; // 环形缓冲上限,防长会话内存膨胀
+
+function pushCapped(arr, entry) {
+  const next = [...arr, entry];
+  return next.length > EVENT_CAP ? next.slice(next.length - EVENT_CAP) : next;
+}
+
+/** 系统事件流水(输出 tab):SessionCreated/Step/Info/Error/Done 等非内容帧 */
+export const sysEvents = writable([]);
+
+/** 治理事件流(审计 tab):工具调用/审批/错误等治理可见事件 */
+export const govEvents = writable([]);
+
+let evSeq = 0;
+/** 底部面板事件入口(kind: sys | gov;label/level 决定渲染样式) */
+export function pushPanelEvent(kind, entry) {
+  const e = { id: ++evSeq, time: Date.now(), ...entry };
+  if (kind === 'gov') {
+    govEvents.update((arr) => pushCapped(arr, e));
+  } else {
+    sysEvents.update((arr) => pushCapped(arr, e));
+  }
+}
+
+/** agent 工具白名单(白名单徽标;null = 未加载) */
+export const toolWhitelist = writable(null);
+
+/** 当前会话违规信号数(信号徽标;null = 未加载/不可用) */
+export const signalCount = writable(null);
+
+/** 加载治理徽标数据(白名单 + 信号;均 fail-soft,失败置 null 显示「—」) */
+export function refreshGovBadges(sid) {
+  getAgentDef('general')
+    .then((def) => toolWhitelist.set(Array.isArray(def.tools) ? def.tools : []))
+    .catch(() => toolWhitelist.set(null));
+  if (sid) {
+    getEvolutionSignals(sid)
+      .then((s) => signalCount.set(typeof s.total_violations === 'number' ? s.total_violations : null))
+      .catch(() => signalCount.set(null));
+  } else {
+    signalCount.set(null);
   }
 }

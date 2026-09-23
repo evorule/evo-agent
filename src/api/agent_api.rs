@@ -341,6 +341,11 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/workbench/config",
             axum::routing::get(get_workbench_config).put(put_workbench_config),
         )
+        // 治理叠加:进化信号只读代理(工作台信号徽标数据源;evorule-server 零改动)
+        .route(
+            "/api/sessions/{id}/evolution-signals",
+            axum::routing::get(get_evolution_signals),
+        )
         // 工作台文件面(IDE 消费):目录列表 / 读 / 写 —— 全部委托 builtin_tools
         // 的 file 工具实现(同一沙箱与校验);写面为人工编辑语义,见 file_api 模块文档
         .route(
@@ -1017,6 +1022,34 @@ pub(crate) fn resolve_memory_namespace(state: &AgentApiState, agent_type: &str) 
         // 定义加载失败/未配置 → 与 serve 侧 general 注入口径一致
         _ => "general".to_string(),
     }
+}
+
+// =============================================================================
+// 治理叠加:进化信号只读代理(工作台信号徽标数据源)
+// =============================================================================
+
+/// `GET /api/sessions/{id}/evolution-signals` —— 会话进化信号只读代理
+///
+/// 透传 [`EvoruleApiClient::get_evolution_signals`](crate::api::evorule_client::EvoruleApiClient::get_evolution_signals)
+/// (既有只读聚合端点,服务端 fail-soft:空会话/不可读 → 200 + 空信号),
+/// 供工作台信号徽标消费。展示层零写入、零新 Fact 类型;evorule 不可达时
+/// 透传 502,由前端徽标 fail-soft 兜底(显示「—」不阻断)。
+async fn get_evolution_signals(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let sid: u64 = session_id.parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "session id must be numeric".to_string(),
+        )
+    })?;
+    let signals = state
+        .evorule_client()
+        .get_evolution_signals(sid, None)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok(Json(signals))
 }
 
 // =============================================================================
@@ -2317,5 +2350,64 @@ mod tests {
         assert!(q.max_summaries.is_none());
         assert!(q.max_events.is_none());
         assert_eq!(q.with_evidence, None); // #[serde(default)]
+    }
+
+    // ===== 治理叠加:进化信号只读代理 =====
+
+    #[tokio::test]
+    async fn test_evolution_signals_non_numeric_session_returns_400() {
+        // 会话 id 非数字 → 400(不触 evorule 客户端)
+        let state = make_test_state();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/not-a-number/evolution-signals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_evolution_signals_proxies_evorule_payload() {
+        // evorule-server 正常返回 → 透传聚合载荷(total_violations/signals/queue)
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/sessions/42/evolution-signals")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"session_id":42,"total_violations":3,"signals":[],"queue":{"pending_normal":0,"pending_meta_promotion":0}}"#,
+            )
+            .create_async()
+            .await;
+
+        let state = AgentApiState::new(
+            crate::agent::AgentDefinitionManager::with_default_dir(),
+            EvoruleApiClient::new(&server.url()),
+        );
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/42/evolution-signals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total_violations"], 3);
+        assert!(json["signals"].is_array());
     }
 }

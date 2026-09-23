@@ -9,9 +9,10 @@
     messages,
     sessions,
     refreshSessions,
+    updateMessage,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession } from '../lib/ws.js';
-  import { getWorkbenchConfig, putWorkbenchConfig } from '../lib/api.js';
+  import { getWorkbenchConfig, putWorkbenchConfig, approveProposal } from '../lib/api.js';
   import { onMount } from 'svelte';
 
   // Svelte 5:组件用了 $effect 等 rune 即进入 runes 模式,
@@ -75,6 +76,28 @@
       e.preventDefault();
       submit();
     }
+  }
+
+  // 治理叠加:审批决定走既有 G8 /approve 通道(60s 超时自动拒绝)
+  function decideApproval(m, approved) {
+    if (!m.proposalId || m.decision === 'sending' || m.decision === 'sent') return;
+    if (!$sessionId) {
+      updateMessage(m.id, { decision: 'error', errText: '会话未建立,无法提交审批' });
+      return;
+    }
+    updateMessage(m.id, { decision: 'sending', errText: null });
+    approveProposal('general', $sessionId, approved, m.proposalId)
+      .then(() => updateMessage(m.id, { decision: 'sent', sentApproved: approved }))
+      .catch((err) => {
+        const status = err?.status;
+        const text =
+          status === 404
+            ? '审批已失效(60 秒超时自动拒绝,或该会话无待审批项)'
+            : status === 400
+              ? `审批被拒:${String(err?.message || err)}`
+              : `提交失败:${String(err?.message || err)}`;
+        updateMessage(m.id, { decision: 'error', errText: text });
+      });
   }
 </script>
 
@@ -157,7 +180,25 @@
         <div class="approval-card">
           <div class="ap-head">需要审批 · {m.toolName}</div>
           <pre class="ap-cmd mono">{m.command}</pre>
-          <div class="ap-foot">风险等级:{m.risk} · 审批交互在治理叠加阶段接入(超时将自动拒绝)</div>
+          {#if m.alternative}
+            <div class="ap-alt">替代方案:{m.alternative}</div>
+          {/if}
+          <div class="ap-foot">风险等级:{m.risk}</div>
+          {#if !m.proposalId}
+            <div class="ap-err">缺少提案 ID,无法在工作台审批(请到会话台处理)</div>
+          {:else if m.decision === 'sending'}
+            <div class="ap-foot">审批提交中…</div>
+          {:else if m.decision === 'sent'}
+            <div class="ap-ok">已提交{m.sentApproved ? '批准' : '拒绝'},等待 agent 执行结果…</div>
+          {:else}
+            <div class="ap-actions">
+              <button class="ap-btn approve" onclick={() => decideApproval(m, true)}>批准</button>
+              <button class="ap-btn reject" onclick={() => decideApproval(m, false)}>拒绝</button>
+            </div>
+            {#if m.decision === 'error' && m.errText}
+              <div class="ap-err">{m.errText}</div>
+            {/if}
+          {/if}
         </div>
       {/if}
     {/each}
@@ -427,6 +468,45 @@
   }
   .ap-foot {
     color: var(--text-muted);
+  }
+  .ap-alt {
+    color: var(--text-secondary);
+    margin-bottom: var(--sp-xs);
+  }
+  .ap-actions {
+    display: flex;
+    gap: var(--sp-sm);
+    margin-top: var(--sp-xs);
+  }
+  .ap-btn {
+    height: 26px;
+    padding: 0 var(--sp-md);
+    font-size: var(--fs-xs);
+    font-weight: var(--fw-med);
+    border-radius: var(--r-sm);
+  }
+  .ap-btn.approve {
+    background: var(--brand);
+    color: #fff;
+  }
+  .ap-btn.approve:hover {
+    background: var(--brand-hover);
+  }
+  .ap-btn.reject {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+  }
+  .ap-btn.reject:hover {
+    background: var(--danger-bg);
+  }
+  .ap-ok {
+    margin-top: var(--sp-xs);
+    color: var(--success);
+  }
+  .ap-err {
+    margin-top: var(--sp-xs);
+    color: var(--danger);
   }
   .composer {
     flex-shrink: 0;
