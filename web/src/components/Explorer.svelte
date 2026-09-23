@@ -5,7 +5,7 @@
 <script>
   import { onMount } from 'svelte';
   import { listDir } from '../lib/api.js';
-  import { openFile } from '../lib/stores.js';
+  import { openFile, activePath } from '../lib/stores.js';
 
   let rootName = 'evo-agent(工作区)';
   let rootChildren = [];
@@ -95,6 +95,7 @@
           class="node {node.kind}"
           style="padding-left: {10 + depth * 14}px"
           role="treeitem"
+          aria-selected={node.kind === 'file' && node.path === $activePath}
           aria-expanded={node.kind === 'dir' ? !!dirState.get(node.path)?.expanded : undefined}
           tabindex="0"
           onclick={() => open(node)}

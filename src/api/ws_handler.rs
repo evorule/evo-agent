@@ -202,6 +202,12 @@ async fn handle_ws(
     let mut turn_active = false;
     // 会话索引:最近一条用户消息(标题来源;SessionCreated 时随索引落一行)
     let mut pending_title: Option<String> = None;
+    // 会话索引:会话是否真实建立过(SessionCreated 已见)
+    // — 防幽灵条目:localStorage/URL 残留不存在的 session id 时,
+    //   run_continuation 会失败,失败 turn 不得写入索引
+    let mut session_established = false;
+    // 会话索引:当前轮是否成功(Done success / 流级错误);每轮开始时重置
+    let mut turn_succeeded = false;
 
     info!(
         agent_type = %agent_type,
@@ -249,6 +255,8 @@ async fn handle_ws(
                                 turn_active = true;
                                 // 会话索引:记录标题来源(首轮用户消息)
                                 pending_title = Some(content.clone());
+                                // 会话索引:新轮次重置成功标志
+                                turn_succeeded = false;
 
                                 // 首轮(无 session)→ run_streaming(创建 session)
                                 // 后续(有 session)→ run_continuation(复用 session)
@@ -382,24 +390,31 @@ async fn handle_ws(
                 match event {
                     Some(WsEvent::Agent(result)) => {
                         // 跟踪 session_id(首轮 run_streaming 会产出 SessionCreated)
-                        if let Ok(AgentEvent::SessionCreated { session_id: sid, .. }) = &result {
-                            current_session = Some(sid.clone());
-                            info!(session_id = %sid, "G16: session created");
-                            // 会话索引:新会话落一行(fail-soft,仅展示辅助)
-                            state.session_index().record(
-                                &crate::api::session_index::SessionIndexEntry {
-                                    session_id: sid.clone(),
-                                    agent_type: agent_type.clone(),
-                                    created_at: crate::api::session_index::unix_now(),
-                                    last_active: crate::api::session_index::unix_now(),
-                                    title: pending_title
-                                        .as_deref()
-                                        .unwrap_or("")
-                                        .chars()
-                                        .take(60)
-                                        .collect(),
-                                },
-                            );
+                        match &result {
+                            Ok(AgentEvent::SessionCreated { session_id: sid, .. }) => {
+                                current_session = Some(sid.clone());
+                                session_established = true;
+                                info!(session_id = %sid, "G16: session created");
+                                // 会话索引:新会话落一行(fail-soft,仅展示辅助)
+                                state.session_index().record(
+                                    &crate::api::session_index::SessionIndexEntry {
+                                        session_id: sid.clone(),
+                                        agent_type: agent_type.clone(),
+                                        created_at: crate::api::session_index::unix_now(),
+                                        last_active: crate::api::session_index::unix_now(),
+                                        title: pending_title
+                                            .as_deref()
+                                            .unwrap_or("")
+                                            .chars()
+                                            .take(60)
+                                            .collect(),
+                                    },
+                                );
+                            }
+                            Ok(AgentEvent::Done(r)) => turn_succeeded = r.success,
+                            // 流级错误 / Error 事件 = 本轮失败(不落索引)
+                            Ok(AgentEvent::Error(_)) | Err(_) => turn_succeeded = false,
+                            _ => {}
                         }
                         // 序列化 + 推给客户端
                         let json = agent_event_to_json(result);
@@ -414,17 +429,22 @@ async fn handle_ws(
                         current_cancel = None;
                         info!("G16: turn ended");
                         // 会话索引:续用会话(重连恢复/多轮)无 SessionCreated 事件,
-                        // 以 TurnEnd 补记录刷新 last_active(读时去重合并)
+                        // 以 TurnEnd 补记录刷新 last_active(读时去重合并)。
+                        // 仅当会话真实建立过或本轮成功时落记录 — 防幽灵条目:
+                        // localStorage 残留不存在的 session id 时 run_continuation
+                        // 失败,失败 turn 不写入索引
                         if let Some(sid) = &current_session {
-                            state.session_index().record(
-                                &crate::api::session_index::SessionIndexEntry {
-                                    session_id: sid.clone(),
-                                    agent_type: agent_type.clone(),
-                                    created_at: crate::api::session_index::unix_now(),
-                                    last_active: crate::api::session_index::unix_now(),
-                                    title: String::new(),
-                                },
-                            );
+                            if session_established || turn_succeeded {
+                                state.session_index().record(
+                                    &crate::api::session_index::SessionIndexEntry {
+                                        session_id: sid.clone(),
+                                        agent_type: agent_type.clone(),
+                                        created_at: crate::api::session_index::unix_now(),
+                                        last_active: crate::api::session_index::unix_now(),
+                                        title: String::new(),
+                                    },
+                                );
+                            }
                         }
                     }
                     None => {

@@ -13,9 +13,11 @@
   import { sendMessage, interrupt, newSession, openSession } from '../lib/ws.js';
   import { onMount } from 'svelte';
 
-  let draft = '';
-  let listEl;
-  let showHistory = false;
+  // Svelte 5:组件用了 $effect 等 rune 即进入 runes 模式,
+  // 顶层状态必须 $state() 声明,普通 let 不具备响应性(历史面板/发送按钮会失效)
+  let draft = $state('');
+  let listEl = $state(null);
+  let showHistory = $state(false);
 
   onMount(() => {
     refreshSessions();
