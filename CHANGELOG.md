@@ -85,6 +85,9 @@
 - **参数契约缓存与查询** — 服务参数契约查询能力落地(契约由服务提供方声明为唯一权威,server 只透传不解释)
 - **动态工具 schema 生成** — 向 LLM 注入工具描述时,从参数契约生成 function schema,LLM 可带参真实调用服务(无契约声明时降级空 schema)
 
+#### 本地运维脚本族（服务稳定化：看门狗 + 开机自启）
+- **`scripts/ops/` 运维脚本族** — 解决本地三服务（evorule-server 18080 / serve 8081 / console 5174）「进程挂在终端/会话后台作业下、关终端或重启后消失、崩溃无人拉起、重启漏带密钥」四类不稳定：① 各服务幂等启动脚本（HTTP/TCP 探活通过即跳过，轮询等待启动完成，手动重跑即「一键全启」）；② `start-evo-agent-serve.ps1` 自动注入 `.env` 环境变量（LLM 密钥等，日志只回显键名绝不回显值——运维面根治「重启后 LLM 登录失败」复发点）；③ `watchdog-check.ps1` 单次巡检（不通则拉起，命名互斥防重叠）；④ `install-watchdog-task.ps1` 注册计划任务 `EvoruleOpsWatchdog`（用户登录触发 + 每 1 分钟巡检自愈，服务以分离进程独立于终端/会话存活）。本机真实路径走 gitignored `ops.local.json`（模板 `ops.local.example.json` 以中性路径入库）；纯运维层工具，不触碰引擎执行面（哈希链/Fact/审计语义零依赖）
+
 ### 🔄 变更
 
 - **宪法 schema 校验收编共享组件 `evorule-constitution`** — `src/agent/constitution.rs` 由本地实现（目录探测/跨文件 `$ref` 内联/校验执行）改为薄封装（公共 API 签名不变，消费点零改动）：判定逻辑与 schema 数据（编译期内嵌，运行时零磁盘依赖）委托统一 crate（git 依赖 + rev 钉版），判定代码单一化；`jsonschema` 0.18 → 0.21（`Validator` API，跨文件 `$ref` 经 `$id` 解析，内联 hack 退役）；CI「检出宪法仓」步骤退役（cargo 自动拉取 git 依赖）；依赖契约断言精确化（主仓 crates 拦截保留，独立仓治理组件显式 allowlist）

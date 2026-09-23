@@ -1,0 +1,24 @@
+{
+  "log_dir": "C:\\path\\to\\evo-agent\\data\\ops",
+  "services": {
+    "evorule-server": {
+      "probe": { "type": "http", "url": "http://127.0.0.1:18080/api/health", "timeout_sec": 4 },
+      "exe": "C:\\path\\to\\evorule-server\\target\\release\\evorule-server.exe",
+      "args": "--addr 127.0.0.1:18080 --insecure-serve --rules-dir C:\\path\\to\\evorule-server\\data\\agent-governance\\rules --db-path C:\\path\\to\\evorule-server\\data\\agent-governance\\evorule.db --workspace-db C:\\path\\to\\evorule-server\\data\\agent-governance\\workspace.db --core-eval C:\\path\\to\\evorule-server\\resources\\server_eval.json --no-rate-limit --log-file C:\\path\\to\\evorule-server\\data\\agent-governance\\logs\\server.log",
+      "workdir": "C:\\path\\to\\evorule-server"
+    },
+    "evo-agent-serve": {
+      "probe": { "type": "http", "url": "http://127.0.0.1:8081/health", "timeout_sec": 4 },
+      "exe": "C:\\path\\to\\evo-agent\\target\\release\\evo-agent.exe",
+      "args": "serve --port 8081",
+      "workdir": "C:\\path\\to\\evo-agent",
+      "env_file": "C:\\path\\to\\evo-agent\\.env"
+    },
+    "console": {
+      "probe": { "type": "tcp", "port": 5174, "timeout_sec": 3 },
+      "exe": "node",
+      "args": "C:\\path\\to\\evorule-console-cloud\\node_modules\\vite\\bin\\vite.js dev --port 5174 --strictPort --host 127.0.0.1",
+      "workdir": "C:\\path\\to\\evorule-console-cloud"
+    }
+  }
+}

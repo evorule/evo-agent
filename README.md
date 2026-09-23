@@ -541,6 +541,42 @@ cargo test --test integration_test
 
 ---
 
+## 本地运维：服务稳定化（看门狗 + 开机自启）
+
+evorule 生态本地开发涉及三个常驻服务：evorule-server（18080）、evo-agent serve（8081）、console 审计页 dev server（5174）。`scripts/ops/` 提供一套与仓库一同演进的运维脚本族，解决四类常见不稳定：进程挂在终端/会话后台作业下（会话结束服务陪葬）、关终端或重启电脑后服务消失、进程崩溃无人拉起、重启时漏带 LLM 密钥导致假性「LLM 失联」。
+
+| 文件 | 作用 |
+|------|------|
+| `_common.ps1` | 共享工具：配置加载 / HTTP+TCP 探活 / 轮询等待 / 分离启动 / 日志 |
+| `start-evorule-server.ps1` | 幂等拉起 evorule-server（探活通过即跳过） |
+| `start-evo-agent-serve.ps1` | 幂等拉起 serve，自动注入 `.env` 环境变量（LLM 密钥等，日志只回显键名不回显值） |
+| `start-console.ps1` | 幂等拉起 console dev server |
+| `watchdog-check.ps1` | 单次巡检：三服务探活，不通则拉起（互斥锁防重叠）；手动运行即为「一键全启」 |
+| `install-watchdog-task.ps1` | 注册 Windows 计划任务 `EvoruleOpsWatchdog`（用户登录触发 + 每 1 分钟巡检自愈） |
+| `ops.local.example.json` | 本机配置模板（入库，中性路径示例） |
+
+### 首次启用
+
+```powershell
+# 1. 复制模板为本机配置（已被 .gitignore 忽略，不入库），按本机实际路径修改 exe/args/workdir/env_file
+Copy-Item scripts\ops\ops.local.example.json scripts\ops\ops.local.json
+
+# 2. 注册计划任务（登录自启 + 每分钟巡检；重复注册用 -Force 覆盖，卸载见下）
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\ops\install-watchdog-task.ps1
+
+# 3. 卸载看门狗
+Unregister-ScheduledTask -TaskName EvoruleOpsWatchdog -Confirm:$false
+```
+
+设计要点：
+- **分离启动**：服务以脱离调用方的独立进程运行（隐藏窗口），不再挂在终端/会话后台作业下
+- **幂等**：所有启动脚本探活通过即跳过，可随时手动重跑；`watchdog-check.ps1` 即「一键全启」
+- **密钥安全**：`.env` 注入只回显键名；`ops.local.json` 与日志目录均在 gitignore 内，密钥不进 git
+- **日志**：每次启动的 stdout/stderr 落 `log_dir`（上一份轮转为 `*.prev`），巡检动作落 `watchdog.log`
+- **边界**：纯运维层工具，不触碰 evorule 引擎执行面（哈希链 / Fact / 审计语义零依赖）
+
+---
+
 ## 目录结构
 
 ```
@@ -629,6 +665,8 @@ evo-agent/
 │   │   └── mod.rs
 │   └── bin/
 │       └── evo-agent.rs             # CLI 入口
+├── scripts/
+│   └── ops/                         # 本地运维脚本族（看门狗/自启/一键拉起，见「本地运维」章节）
 └── tests/
     ├── integration_test.rs          # mockito 端到端测试
     └── llm_real_smoke.py            # 真实 LLM 冒烟脚本

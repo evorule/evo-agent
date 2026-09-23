@@ -37,6 +37,9 @@ workspace/
 # 本地运行配置(含端点选择与本地路径,不随仓分发,密钥走 ENV 引用)
 evo-agent.toml
 
+# 运维脚本本机实例配置(含本机真实路径,不随仓分发)
+scripts/ops/ops.local.json
+
 # 工作台前端(web/):依赖与构建产物不跟踪,源码正常入库
 web/node_modules/
 web/dist/
