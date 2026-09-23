@@ -16,12 +16,17 @@ import {
   loadTranscriptInto,
   pushPanelEvent,
   refreshGovBadges,
+  registerArtifact,
+  loadArtifacts,
+  clearArtifacts,
+  openFile,
 } from './stores.js';
 import { getTranscript } from './api.js';
 
 let ws = null;
 let streamMsgId = null; // 当前轮流式 assistant 气泡
 let lastToolMsgId = null; // 最近一个运行中工具气泡(按 name 匹配结果)
+let pendingWrite = null; // S4:进行中的 file_write {path, content}(ToolResult 成功即登记产物)
 
 function wsUrl(sid) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -88,6 +93,7 @@ export function newSession() {
   sessionId.set(null);
   localStorage.removeItem('evo_session_id');
   messages.set([]);
+  clearArtifacts();
   connect('new');
 }
 
@@ -96,6 +102,7 @@ export async function openSession(sid) {
   if (!sid || sid === get(sessionId)) return;
   sessionId.set(sid);
   localStorage.setItem('evo_session_id', sid);
+  loadArtifacts(sid); // S4:恢复该会话的产物留痕(草稿基线/定稿状态)
   disconnect();
   messages.set([]);
   connStatus.set('connecting');
@@ -149,6 +156,13 @@ function handleFrame(f) {
         args: safeJson(f.args),
         running: true,
       });
+      // S4:记下 file_write 的目标与内容(草稿基线),待成功结果确认
+      if (f.name === 'file_write' && f.args && typeof f.args.path === 'string') {
+        pendingWrite = {
+          path: f.args.path,
+          content: typeof f.args.content === 'string' ? f.args.content : '',
+        };
+      }
       pushPanelEvent('gov', { label: 'ToolCall', detail: f.name, level: 'info' });
       break;
     }
@@ -156,6 +170,18 @@ function handleFrame(f) {
       if (lastToolMsgId !== null) {
         updateMessage(lastToolMsgId, { running: false, result: safeJson(f.result) });
         lastToolMsgId = null;
+      }
+      // S4:file_write 成功(结果为对象含 path)→ 登记产物 + 编辑器自动打开 + 产物卡
+      if (f.name === 'file_write' && pendingWrite && f.result && typeof f.result === 'object') {
+        const sid = get(sessionId);
+        registerArtifact(pendingWrite.path, pendingWrite.content, sid);
+        openFile(pendingWrite.path);
+        pushMessage({
+          kind: 'artifact',
+          path: pendingWrite.path,
+          bytes: pendingWrite.content.length,
+        });
+        pendingWrite = null;
       }
       pushPanelEvent('gov', { label: 'ToolResult', detail: f.name, level: 'ok' });
       break;
