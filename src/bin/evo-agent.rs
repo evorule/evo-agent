@@ -1697,10 +1697,9 @@ fn cmd_serve(
             workdir.join("data").join("workbench_config.json"),
         );
         snapshots.ensure_dir();
-        let policy = evo_agent::api::snapshots::RetentionPolicy::from_label(
-            &config_store.load().retention,
-        )
-        .unwrap_or(evo_agent::api::snapshots::RetentionPolicy::Month3);
+        let policy =
+            evo_agent::api::snapshots::RetentionPolicy::from_label(&config_store.load().retention)
+                .unwrap_or(evo_agent::api::snapshots::RetentionPolicy::Month3);
         let removed = snapshots.cleanup_expired(policy);
         if removed > 0 {
             eprintln!(

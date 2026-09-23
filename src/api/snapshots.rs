@@ -157,7 +157,8 @@ impl WorkbenchConfigStore {
         {
             let text = serde_json::to_string_pretty(cfg)
                 .map_err(|e| format!("serialize config failed: {e}"))?;
-            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("write tmp failed: {e}"))?;
+            let mut f =
+                std::fs::File::create(&tmp).map_err(|e| format!("write tmp failed: {e}"))?;
             use std::io::Write as _;
             f.write_all(text.as_bytes())
                 .map_err(|e| format!("write tmp failed: {e}"))?;
@@ -279,10 +280,7 @@ impl SnapshotStore {
                     let Ok(snap) = serde_json::from_str::<SnapshotFile>(&text) else {
                         continue; // 损坏文件跳过
                     };
-                    if best
-                        .as_ref()
-                        .map_or(true, |b| snap.saved_at > b.saved_at)
-                    {
+                    if best.as_ref().map_or(true, |b| snap.saved_at > b.saved_at) {
                         best = Some(snap);
                     }
                 }
@@ -461,7 +459,10 @@ mod tests {
 
     #[test]
     fn test_retention_policy() {
-        assert_eq!(RetentionPolicy::from_label("3m"), Some(RetentionPolicy::Month3));
+        assert_eq!(
+            RetentionPolicy::from_label("3m"),
+            Some(RetentionPolicy::Month3)
+        );
         assert_eq!(RetentionPolicy::from_label("nope"), None);
         assert_eq!(WorkbenchConfig::default().retention, "3m");
         assert_eq!(RetentionPolicy::Forever.days(), None);
