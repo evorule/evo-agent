@@ -1068,6 +1068,45 @@ PUT /api/workbench/config
 
 ---
 
+## 12. 工作台治理面
+
+工作台(evorule 功能叠加)消费的治理数据面。审批决定**不经本节新增端点**——
+审批走 §4.4 既有 `POST /agents/{agent_type}/approve` 通道(工作台审批卡为该
+端点的第二消费面,与 CLI/console 同通道同语义);本节仅新增只读信号代理。
+
+### 12.1 会话进化信号(只读代理)
+
+```
+GET /api/sessions/{id}/evolution-signals
+```
+
+透传 evorule-server 的会话进化信号只读聚合端点(服务端 fail-soft:空会话/
+不可读 → 200 + 空信号),供工作台「信号」徽标消费。**零写入、零新 Fact 类型**;
+evorule-server 零改动。
+
+- 会话 id 非数字 → `400`
+- evorule-server 不可达 → `502`(前端徽标 fail-soft 显示「—」)
+
+**响应**(透传 evorule-server 聚合载荷):
+```json
+{
+  "session_id": 42,
+  "total_violations": 0,
+  "signals": [],
+  "queue": { "pending_normal": 0, "pending_meta_promotion": 0 }
+}
+```
+
+### 12.2 WS 审批帧时序语义(治理叠加修复)
+
+流式路径(WS/SSE)的审批事件时序已修复为**两阶段**:`ApprovalRequired` 帧在
+60s 审批窗口开启后、决策前发出(前端按钮在窗口内可操作);`ApprovalResult`
+帧随决定(用户决定/60s 超时自动拒绝)发出。修复前 `ApprovalRequired` 在决策
+完成后才补发,帧到达时窗口已过,HTTP 审批在流式路径上结构性不可用(真实
+LLM E2E 实测暴露并修复)。非流式 `run` 路径不产审批事件(CLI 交互审批不受影响)。
+
+---
+
 ## 版本变更日志
 
 ### v0.1.0 (当前)

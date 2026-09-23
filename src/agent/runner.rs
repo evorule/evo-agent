@@ -347,6 +347,21 @@ struct ToolExecOutcome {
     approval_flow: Option<(ApprovalRequest, ApprovalDecision)>,
 }
 
+/// 工具执行两阶段拆分的阶段一产物(流式路径专用)
+///
+/// 背景(治理叠加实测暴露):原一气呵成实现里,ApprovalRequired 事件在
+/// `request_approval` 返回后才 yield —— 帧到达前端时 60s 审批窗口已过
+/// (超时自动拒绝先行),HTTP 审批通道在流式路径上结构性不可用。拆为:
+/// 阶段一 [`AgentRunner::execute_tool_stage`] 执行并解析 proposal(不决策);
+/// 调用方(stream! 生成器)此时 yield ApprovalRequired,再进阶段二
+/// [`AgentRunner::resolve_approval`] 等待决定并按需重执行。
+enum ToolExecStage {
+    /// 无需审批(含 G13 缓存命中),执行已完成
+    Done(ToolExecOutcome),
+    /// 工具返回 needs_approval proposal,待调用方通知用户后进入阶段二
+    Pending(ApprovalRequest),
+}
+
 /// G4:Agent 执行过程中的事件流
 ///
 /// 由 `run_streaming` 产出,调用方按需消费:
@@ -1765,31 +1780,61 @@ impl AgentRunner {
         tool_name: &str,
         args: &Value,
     ) -> Result<ToolExecOutcome, AgentError> {
+        match self.execute_tool_stage(session_id, tool_name, args).await? {
+            ToolExecStage::Done(outcome) => Ok(outcome),
+            ToolExecStage::Pending(req) => {
+                self.resolve_approval(session_id, tool_name, args, req)
+                    .await
+            }
+        }
+    }
+
+    /// 阶段一(流式路径):执行工具并解析 needs_approval proposal,不做决策
+    ///
+    /// 供 stream! 生成器在 yield ApprovalRequired **之前**调用 —— 帧必须在
+    /// 60s 审批窗口开启后、超时前到达前端,否则 HTTP 审批结构性不可用。
+    /// 无审批(含缓存命中)时返回 [`ToolExecStage::Done`],一步到位。
+    async fn execute_tool_stage(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        args: &Value,
+    ) -> Result<ToolExecStage, AgentError> {
         // G13:并行缓存命中(如果 call_external 已并行执行过此 active 工具,
         // 直接返回缓存结果,跳过重复执行 + 审批;candidate 工具不缓存)
         if let Some(cached) = self.check_parallel_cache(tool_name, args) {
             info!(%session_id, tool = %tool_name, "G13: cache hit, skipping re-execution");
-            return Ok(ToolExecOutcome {
+            return Ok(ToolExecStage::Done(ToolExecOutcome {
                 final_result: cached,
                 approval_record: None,
                 approval_flow: None,
-            });
+            }));
         }
 
         // G8:第一次调用(不带 approved flag)→ 可能返回 needs_approval proposal
         let tool_result = self.execute_tool_call(tool_name, args).await?;
         let result_str = tool_result.to_string();
-        let approval_req = match parse_approval_request(session_id, tool_name, args, &result_str) {
-            None => {
-                return Ok(ToolExecOutcome {
-                    final_result: tool_result,
-                    approval_record: None,
-                    approval_flow: None,
-                });
-            }
-            Some(req) => req,
-        };
+        match parse_approval_request(session_id, tool_name, args, &result_str) {
+            None => Ok(ToolExecStage::Done(ToolExecOutcome {
+                final_result: tool_result,
+                approval_record: None,
+                approval_flow: None,
+            })),
+            Some(req) => Ok(ToolExecStage::Pending(req)),
+        }
+    }
 
+    /// 阶段二(流式路径):等待审批决定并按需重执行(阶段一返回 Pending 后调用)
+    ///
+    /// 语义与原一气呵成实现完全一致:决定 → 审批留痕 record → 拒绝返回
+    /// status:rejected / 批准带 approved:true 重新调用(不递归检查 proposal)。
+    async fn resolve_approval(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        args: &Value,
+        approval_req: ApprovalRequest,
+    ) -> Result<ToolExecOutcome, AgentError> {
         // 审批决策(无 callback = 默认拒绝,安全优先)
         let decision = if let Some(cb) = &self.approval_callback {
             cb.request_approval(&approval_req).await
@@ -2818,14 +2863,39 @@ impl AgentRunner {
                                         // 工具执行 Err(参数错/后端 404 等)不终止回合:错误
                                         // 作为 tool 消息回喂,LLM 可重试/换路/放弃 —— 实测
                                         // 硬终止会让一次 knowledge_search 404 毁掉整个草稿回合
-                                        let outcome = match runner
-                                            .execute_tool_with_approval(
-                                                &session_id,
-                                                &tc.name,
-                                                &tc.arguments,
-                                            )
+                                        // (两阶段:Pending 时先 yield ApprovalRequired 再等
+                                        // 决策 —— 帧必须赶在 60s 审批窗口内到达前端)
+                                        let outcome_res = match runner
+                                            .execute_tool_stage(&session_id, &tc.name, &tc.arguments)
                                             .await
                                         {
+                                            Err(e) => Err(e),
+                                            Ok(ToolExecStage::Done(o)) => Ok(o),
+                                            Ok(ToolExecStage::Pending(req)) => {
+                                                yield Ok(AgentEvent::ApprovalRequired {
+                                                    tool_name: tc.name.clone(),
+                                                    command: req.command.clone(),
+                                                    risk: req.risk.clone(),
+                                                    alternative: req.alternative.clone(),
+                                                    proposal_id: req.proposal_id.clone(),
+                                                });
+                                                let res = runner
+                                                    .resolve_approval(&session_id, &tc.name, &tc.arguments, req)
+                                                    .await;
+                                                if let Ok(o) = &res {
+                                                    if let Some((_, decision)) = &o.approval_flow {
+                                                        yield Ok(AgentEvent::ApprovalResult {
+                                                            tool_name: tc.name.clone(),
+                                                            approved: decision.approved,
+                                                            approver: decision.approver.clone(),
+                                                            auto_rejected: decision.auto_rejected,
+                                                        });
+                                                    }
+                                                }
+                                                res
+                                            }
+                                        };
+                                        let outcome = match outcome_res {
                                             Ok(o) => o,
                                             Err(e) => {
                                                 warn!(
@@ -2861,22 +2931,8 @@ impl AgentRunner {
                                                 continue;
                                             }
                                         };
-                                        // 审批事件(yield ApprovalRequired/Result 给前端)
-                                        if let Some((req, decision)) = &outcome.approval_flow {
-                                            yield Ok(AgentEvent::ApprovalRequired {
-                                                tool_name: tc.name.clone(),
-                                                command: req.command.clone(),
-                                                risk: req.risk.clone(),
-                                                alternative: req.alternative.clone(),
-                                                proposal_id: req.proposal_id.clone(),
-                                            });
-                                            yield Ok(AgentEvent::ApprovalResult {
-                                                tool_name: tc.name.clone(),
-                                                approved: decision.approved,
-                                                approver: decision.approver.clone(),
-                                                auto_rejected: decision.auto_rejected,
-                                            });
-                                        }
+                                        // 审批事件已在上面的两阶段流程中即时 yield
+                                        // (ApprovalRequired 先于决策、ApprovalResult 随决定)
                                         // 记录 tool_calls(回合级汇总,Done/审计消费)+ tool 消息持久化
                                         // (回喂轮 LLM 需要它;tool_call_id 配对由 LlmHandler
                                         // 按 tool_name FIFO 匹配最近 assistant)
@@ -2938,13 +2994,42 @@ impl AgentRunner {
                                 let args = params.get("args").cloned().unwrap_or(Value::Null);
                                 yield Ok(AgentEvent::ToolCall { name: tool_name.clone(), args: args.clone() });
 
-                                // 审批+执行抽到 execute_tool_with_approval(与本地 ReAct 循环共用);
-                                // 事件仍在此处 yield(stream! 宏限制)。非流式路径(run)仍走
-                                // handle_call_service(内部 maybe_handle_approval,不产事件)
-                                let outcome = match runner
-                                    .execute_tool_with_approval(&session_id, &tool_name, &args)
+                                // 审批+执行抽到两阶段 helper(与本地 ReAct 循环共用);
+                                // 事件仍在此处 yield(stream! 宏限制)。Pending 时先
+                                // yield ApprovalRequired 再等决策(帧须在 60s 窗口内
+                                // 到达前端)。非流式路径(run)仍走 handle_call_service
+                                // (内部 maybe_handle_approval,不产事件)
+                                let outcome_res = match runner
+                                    .execute_tool_stage(&session_id, &tool_name, &args)
                                     .await
                                 {
+                                    Err(e) => Err(e),
+                                    Ok(ToolExecStage::Done(o)) => Ok(o),
+                                    Ok(ToolExecStage::Pending(req)) => {
+                                        yield Ok(AgentEvent::ApprovalRequired {
+                                            tool_name: tool_name.clone(),
+                                            command: req.command.clone(),
+                                            risk: req.risk.clone(),
+                                            alternative: req.alternative.clone(),
+                                            proposal_id: req.proposal_id.clone(),
+                                        });
+                                        let res = runner
+                                            .resolve_approval(&session_id, &tool_name, &args, req)
+                                            .await;
+                                        if let Ok(o) = &res {
+                                            if let Some((_, decision)) = &o.approval_flow {
+                                                yield Ok(AgentEvent::ApprovalResult {
+                                                    tool_name: tool_name.clone(),
+                                                    approved: decision.approved,
+                                                    approver: decision.approver.clone(),
+                                                    auto_rejected: decision.auto_rejected,
+                                                });
+                                            }
+                                        }
+                                        res
+                                    }
+                                };
+                                let outcome = match outcome_res {
                                     Ok(o) => o,
                                     Err(e) => {
                                         if let Some(rid) = request_id {
@@ -2963,21 +3048,7 @@ impl AgentRunner {
                                         return;
                                     }
                                 };
-                                if let Some((approval_req, decision)) = &outcome.approval_flow {
-                                    yield Ok(AgentEvent::ApprovalRequired {
-                                        tool_name: tool_name.clone(),
-                                        command: approval_req.command.clone(),
-                                        risk: approval_req.risk.clone(),
-                                        alternative: approval_req.alternative.clone(),
-                                        proposal_id: approval_req.proposal_id.clone(),
-                                    });
-                                    yield Ok(AgentEvent::ApprovalResult {
-                                        tool_name: tool_name.clone(),
-                                        approved: decision.approved,
-                                        approver: decision.approver.clone(),
-                                        auto_rejected: decision.auto_rejected,
-                                    });
-                                }
+                                // 审批事件已在两阶段流程中即时 yield(见 Pending 分支)
                                 let final_result = outcome.final_result;
 
                                 // 3. 记录 tool_calls + 持久化 tool 消息(同 handle_call_service)

@@ -2,7 +2,8 @@
 <!-- Copyright (C) 2026 EvoRule Project -->
 <!-- 顶栏:与 console-cloud 头部同规格(52px / bg-header) -->
 <script>
-  import { connStatus, sessionId, stepCount, turnActive } from '../lib/stores.js';
+  import { onMount } from 'svelte';
+  import { connStatus, sessionId, stepCount, turnActive, toolWhitelist, signalCount, refreshGovBadges } from '../lib/stores.js';
 
   const statusText = {
     connecting: '连接中',
@@ -14,6 +15,11 @@
     online: 'success',
     offline: 'neutral',
   };
+
+  // 治理徽标初始加载(白名单 + 上次会话信号;均 fail-soft)
+  onMount(() => {
+    refreshGovBadges(localStorage.getItem('evo_session_id') || null);
+  });
 </script>
 
 <header class="header">
@@ -34,6 +40,21 @@
     {#if $turnActive}
       <span class="step-chip mono" title="当前轮次步数">step {$stepCount}</span>
     {/if}
+    <span
+      class="gov-chip mono"
+      title={$toolWhitelist ? `agent 工具白名单(${$toolWhitelist.length}):${$toolWhitelist.join(', ')}` : '工具白名单未加载'}
+    >
+      白名单 {$toolWhitelist === null ? '—' : $toolWhitelist.length}
+    </span>
+    <span
+      class="gov-chip mono"
+      class:alert={$signalCount !== null && $signalCount > 0}
+      title={$signalCount === null
+        ? '违规信号未加载(需已建立会话且 evorule 可达)'
+        : `当前会话违规信号累计 ${$signalCount} 条`}
+    >
+      信号 {$signalCount === null ? '—' : $signalCount}
+    </span>
     {#if $sessionId}
       <span class="session-chip mono" title="当前会话 id">{$sessionId}</span>
     {/if}
@@ -85,7 +106,8 @@
     gap: var(--sp-sm);
   }
   .session-chip,
-  .step-chip {
+  .step-chip,
+  .gov-chip {
     font-size: 11px;
     color: var(--text-secondary);
     background: var(--bg-hover);
@@ -96,6 +118,11 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .gov-chip.alert {
+    color: var(--warning);
+    border-color: var(--warning);
+    background: var(--warning-bg);
   }
   .conn {
     display: flex;
