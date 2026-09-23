@@ -383,6 +383,9 @@ pub struct Config {
     #[serde(default)]
     /// G12:MCP server 配置(可配置多个 stdio MCP server)
     pub mcp: McpConfig,
+    #[serde(default)]
+    /// 工作台附加配置(console 审计页自动拉起等,纯展示层)
+    pub workbench: WorkbenchConfig,
     /// LLM API key 的来源记录(脱敏状态端点用;不携带任何密钥内容)
     ///
     /// 取值:`Some(环境变量名)`(如 `MINIMAX_API_KEY` / `EVO_AGENT_LLM__API_KEY`)
@@ -390,6 +393,19 @@ pub struct Config {
     /// 由 `apply_env_overrides` / `resolve_env_placeholders*` 在加载期填充。
     #[serde(skip)]
     pub llm_api_key_source: Option<String>,
+}
+
+/// 工作台附加配置(纯展示层,零引擎/协议触碰)
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct WorkbenchConfig {
+    /// console-cloud 仓目录(本机路径,如 `C:\path\to\console-cloud`)。
+    /// 配置后 serve 启动期自动拉起其 dev server(工作台审计深链的数据源);
+    /// 缺省空 = 不启用(公开部署零耦合、零副作用)。
+    #[serde(default)]
+    pub console_dir: Option<String>,
+    /// console dev server 端口(缺省 5174,与 console-cloud vite 配置一致)
+    #[serde(default)]
+    pub console_port: Option<u16>,
 }
 
 /// 配置加载/解析错误
@@ -531,6 +547,9 @@ impl Config {
         }
         if let Some(table) = value.get("mcp") {
             self.mcp = table.clone().try_into().map_err(ConfigError::Parse)?;
+        }
+        if let Some(table) = value.get("workbench") {
+            self.workbench = table.clone().try_into().map_err(ConfigError::Parse)?;
         }
 
         Ok(())

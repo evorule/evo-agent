@@ -1105,6 +1105,28 @@ evorule-server 零改动。
 完成后才补发,帧到达时窗口已过,HTTP 审批在流式路径上结构性不可用(真实
 LLM E2E 实测暴露并修复)。非流式 `run` 路径不产审批事件(CLI 交互审批不受影响)。
 
+### 12.3 console 审计页 sidecar(配置化自动拉起)
+
+审计 tab 的「在审计页查看」深链指向 console-cloud 审计页(独立 SvelteKit
+dev server,缺省 `http://localhost:5174`,前端 localStorage `evo_console_origin`
+可改)。该服务不随 evo-agent serve 启动,深链点击前前端会先探活,不可达时
+就地明示引导而不跳死链。
+
+serve 侧提供配置化自动拉起(`evo-agent.toml`):
+
+```toml
+[workbench]
+console_dir = "C:\\path\\to\\console-cloud"   # console-cloud 仓目录;缺省空 = 不启用
+console_port = 5174                          # 可选,缺省 5174
+```
+
+行为:serve 启动期探测 `127.0.0.1:{console_port}`,未监听则以子进程拉起
+`vite dev --port {port} --strictPort --host 127.0.0.1`;**fail-soft**——目录
+无效/依赖缺失(node_modules/vite 不存在)/端口占用/拉起失败仅启动日志告警,
+绝不阻断 serve 主功能;子进程输出落 `data/console_sidecar.log` 供诊断;
+子进程脱离 serve 生命周期独立存活,下次 serve 启动探测到端口已监听即跳过
+(幂等)。缺省不配置 = 零副作用(公开部署零耦合)。
+
 ---
 
 ## 版本变更日志
