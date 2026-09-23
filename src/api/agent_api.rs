@@ -146,6 +146,8 @@ pub struct AgentApiState {
     toolkit: Arc<ToolHandler>,
     /// LLM 配置脱敏快照(凭据可视化状态端点;不含任何密钥内容)
     llm_status: Arc<LlmStatusSnapshot>,
+    /// 会话索引(JSONL 本地持久化;对话与历史阶段的枚举面)
+    session_index: Arc<crate::api::session_index::SessionIndex>,
 }
 
 impl AgentApiState {
@@ -188,6 +190,9 @@ impl AgentApiState {
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             metrics,
             auth_config: AuthConfig::disabled(),
+            session_index: Arc::new(crate::api::session_index::SessionIndex::new(
+                workdir.join("data").join("session_index.jsonl"),
+            )),
             workdir,
             workspace_client,
             toolkit,
@@ -204,6 +209,11 @@ impl AgentApiState {
     /// 获取 LLM 配置脱敏快照(状态端点消费)
     pub fn llm_status(&self) -> &LlmStatusSnapshot {
         &self.llm_status
+    }
+
+    /// 会话索引的引用(WS 处理器记录会话活动)
+    pub fn session_index(&self) -> &crate::api::session_index::SessionIndex {
+        &self.session_index
     }
 
     /// G6:获取 SessionStore 的引用(供 G5 server 层做断开即取消等扩展)
@@ -299,6 +309,12 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route(
             "/api/sessions/{id}/ws",
             axum::routing::get(crate::api::ws_handler::ws_handler),
+        )
+        // 对话与历史:会话枚举(本地索引)+ 消息历史投影(evorule facts 权威读)
+        .route("/api/sessions", axum::routing::get(list_sessions))
+        .route(
+            "/api/sessions/{id}/transcript",
+            axum::routing::get(get_transcript),
         )
         // 工作台文件面(IDE 消费):目录列表 / 读 / 写 —— 全部委托 builtin_tools
         // 的 file 工具实现(同一沙箱与校验);写面为人工编辑语义,见 file_api 模块文档
@@ -876,6 +892,73 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
             .data(serde_json::json!({ "error": err.to_string() }).to_string()),
     };
     Ok(ev)
+}
+
+// =============================================================================
+// 对话与历史:会话枚举 + 消息历史投影
+// =============================================================================
+
+/// `GET /api/sessions` —— 会话列表(本地索引,按最近活跃降序)
+///
+/// 索引由 WS 面在 SessionCreated / TurnEnd 时记录;只覆盖经过 serve WS 面
+/// 创建的会话(工作台消费面),见 session_index 模块文档的边界说明。
+async fn list_sessions(
+    State(state): State<AgentApiState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let sessions = state.session_index().list();
+    let count = sessions.len();
+    Ok(Json(serde_json::json!({
+        "count": count,
+        "sessions": sessions,
+    })))
+}
+
+/// `GET /api/sessions/{id}/transcript` 查询参数
+#[derive(Debug, serde::Deserialize)]
+struct TranscriptQuery {
+    /// agent 类型(缺省从索引回查,再缺省 general——决定记忆 namespace)
+    agent_type: Option<String>,
+}
+
+/// `GET /api/sessions/{id}/transcript` —— 会话消息历史(evorule facts 权威投影)
+///
+/// 数据源 = `MemoryManager` 持久化到 evorule payload 的消息(P0 短期记忆
+/// 持久化,进 FactsLog 审计链);本端点零写入,只做前缀读 + 同 idx 后写覆盖。
+async fn get_transcript(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<TranscriptQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // 解析 agent_type:query 参数 > 索引回查 > general(决定 namespace)
+    let agent_type = q.agent_type.clone().or_else(|| {
+        state
+            .session_index()
+            .list()
+            .into_iter()
+            .find(|e| e.session_id == session_id)
+            .map(|e| e.agent_type)
+    });
+    let agent_type = agent_type.unwrap_or_else(|| "general".to_string());
+
+    let namespace = match state.definitions().load(&agent_type) {
+        Ok(def) if !def.memory.namespace.is_empty() => def.memory.namespace,
+        // 定义加载失败/未配置 → 与 serve 侧 general 注入口径一致
+        _ => "general".to_string(),
+    };
+
+    let messages =
+        crate::api::session_index::load_transcript(state.evorule_client(), &session_id, &namespace)
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+
+    let count = messages.len();
+    Ok(Json(serde_json::json!({
+        "session_id": session_id,
+        "agent_type": agent_type,
+        "namespace": namespace,
+        "count": count,
+        "messages": messages,
+    })))
 }
 
 // =============================================================================

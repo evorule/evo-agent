@@ -52,3 +52,15 @@ export function writeFile(path, content) {
     body: JSON.stringify({ path, content }),
   }).then(unwrap);
 }
+
+/** 会话列表(本地索引,按最近活跃降序) */
+export function listSessions() {
+  return fetch('/api/sessions', { headers: headers() }).then(unwrap);
+}
+
+/** 会话消息历史(evorule facts 权威投影) */
+export function getTranscript(sessionId) {
+  return fetch(`/api/sessions/${encodeURIComponent(sessionId)}/transcript`, {
+    headers: headers(),
+  }).then(unwrap);
+}

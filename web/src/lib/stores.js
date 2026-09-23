@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 import { writable } from 'svelte/store';
-import { readFile, writeFile } from './api.js';
+import { listSessions, readFile, writeFile } from './api.js';
 
 /** 连接状态: connecting | online | offline */
 export const connStatus = writable('offline');
@@ -26,6 +26,74 @@ export function pushMessage(msg) {
 }
 export function updateMessage(id, patch) {
   messages.update((arr) => arr.map((m) => (m.id === id ? { ...m, ...patch } : m)));
+}
+
+// ---- 会话列表(对话与历史阶段) ----
+
+/** 会话列表(serve 本地索引,按最近活跃降序) */
+export const sessions = writable([]);
+
+/** 拉取会话列表;失败静默(列表是辅助面) */
+export async function refreshSessions() {
+  try {
+    const res = await listSessions();
+    sessions.set(res.sessions || []);
+  } catch {
+    /* 列表拉取失败不阻断 */
+  }
+}
+
+/** MessageRecord(evorule 投影)→ UI 消息 */
+export function recordToMessage(r) {
+  if (r.role === 'user') {
+    return { kind: 'user', text: r.content };
+  }
+  if (r.role === 'assistant') {
+    if (r.tool_calls) {
+      // 有工具调用的 assistant 消息:每个调用一张完成态工具卡
+      let calls = [];
+      try {
+        calls = Array.isArray(r.tool_calls) ? r.tool_calls : [r.tool_calls];
+      } catch {
+        calls = [];
+      }
+      return calls.map((c) => ({
+        kind: 'tool',
+        name: c?.name || c?.function?.name || 'tool',
+        args: c?.arguments ?? c?.function?.arguments ?? null,
+        result: null,
+        running: false,
+      }));
+    }
+    return { kind: 'assistant', text: r.content };
+  }
+  if (r.role === 'tool') {
+    return {
+      kind: 'tool',
+      name: r.tool_name || 'tool',
+      args: null,
+      result: r.content,
+      running: false,
+    };
+  }
+  return null; // system 等不渲染
+}
+
+/** 历史消息回灌(清空当前消息,按投影顺序渲染) */
+export function loadTranscriptInto(records) {
+  let id = 0;
+  const out = [];
+  for (const r of records) {
+    const m = recordToMessage(r);
+    if (Array.isArray(m)) {
+      for (const item of m) out.push({ id: ++id, ...item });
+    } else if (m) {
+      out.push({ id: ++id, ...m });
+    }
+  }
+  // seq 接到全局序号之后,避免与实时消息 id 冲突
+  messages.set(out);
+  if (out.length > 0) seq = Math.max(seq, id);
 }
 
 // ---- 编辑器 tabs(标准 IDE 基础阶段) ----
