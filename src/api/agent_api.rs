@@ -300,6 +300,20 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/sessions/{id}/ws",
             axum::routing::get(crate::api::ws_handler::ws_handler),
         )
+        // 工作台文件面(IDE 消费):目录列表 / 读 / 写 —— 全部委托 builtin_tools
+        // 的 file 工具实现(同一沙箱与校验);写面为人工编辑语义,见 file_api 模块文档
+        .route(
+            "/api/files/list",
+            axum::routing::get(crate::api::file_api::list_dir),
+        )
+        .route(
+            "/api/files/read",
+            axum::routing::get(crate::api::file_api::read_file),
+        )
+        .route(
+            "/api/files/write",
+            axum::routing::put(crate::api::file_api::write_file),
+        )
         // G14:记忆事件查询 — 返回 session 的所有结构化事件
         .route(
             "/api/sessions/{id}/events",

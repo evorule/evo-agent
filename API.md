@@ -15,6 +15,7 @@
 7. [SSE 流式事件](#7-sse-流式事件)
 8. [Metrics API](#8-metrics-api)
 9. [透传 evorule-server API](#9-透传-evorule-server-api)
+10. [工作台文件面](#10-工作台文件面)
 
 ---
 
@@ -901,6 +902,66 @@ POST /api/shared/facts/rollup
 - `"no session to rewind"` — 会话不存在无可回滚
 
 注意：`"no active turn to interrupt"`（无活跃轮次可中断）**不是 Error**——无活跃轮次时发送 `interrupt`，服务端以 **Info 帧** `{"type":"Info","message":"no active turn to interrupt"}` 回应，连接与后续轮次不受影响。
+
+---
+
+## 10. 工作台文件面
+
+服务 IDE 工作台的文件树浏览与编辑器保存。三个端点全部委托内置 `file_*` 工具实现（同一 workdir 沙箱与路径校验——拒绝绝对路径 / `..` / symlink 逃逸，资源限制原样保留），受鉴权中间件保护。语义边界：本面服务**人的直接操作**，不构造 agent 会话事实（不进 agent 会话审计链）；agent 路径 `file_write` 的 `workspace/` 白名单与审批语义不变。
+
+### 10.1 列目录
+
+```
+GET /api/files/list?dir={相对路径}
+```
+
+- `dir` 缺省 = workdir 根；隐藏文件默认跳过；结果按名字排序，单目录上限 1000 条
+
+**响应:**
+```json
+{
+  "dir": "D:\\path\\to\\subdir",
+  "count": 2,
+  "truncated": false,
+  "entries": [
+    { "name": "src", "kind": "dir" },
+    { "name": "README.md", "kind": "file", "size": 21247 }
+  ]
+}
+```
+
+### 10.2 读文件
+
+```
+GET /api/files/read?path={相对路径}
+```
+
+**响应:**
+```json
+{ "path": "CHANGELOG.md", "size": 21247, "content": "..." }
+```
+
+错误：`404`（不存在）/ `400`（路径越界、超 10 MB、非常规文件）。
+
+### 10.3 写文件
+
+```
+PUT /api/files/write
+```
+
+**请求体:**
+```json
+{ "path": "docs/notes.md", "content": "完整文件内容" }
+```
+
+人工编辑语义：整体覆盖写（服务端固定 `overwrite=true` 与 `create_parents=true`），写面为 workdir 全域（沙箱内），单次内容上限 1 MB。
+
+**响应:**
+```json
+{ "path": "docs/notes.md", "bytes_written": 18, "created": false, "writable_dir": "." }
+```
+
+错误：`400`（路径越界 / 内容超限）。
 
 ---
 
