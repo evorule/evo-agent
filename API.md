@@ -1002,12 +1002,22 @@ GET /api/sessions/{id}/transcript?agent_type={可选}
 
 `agent_type` 缺省从索引回查(决定记忆 namespace,再缺省 `general`)。消息按 `idx` 升序,同 idx 后写覆盖(last-write-wins)。
 
-**响应:**
+**数据源两级(O-093 定稿):**
+
+1. **live**(evorule 会话存活时):payload 权威投影,响应带 `"source": "live"`;
+2. **snapshot**(回落):evorule 会话闲置 30 分钟后被 TTL 自动回收,活投影报
+   `Session not found` 时回落 serve 本地快照(`data/snapshots/YYYY/MM/DD/session_{sid}.json`,
+   WS 面在每轮 TurnEnd 时与 live 同一投影路径落盘,响应带 `"source": "snapshot"`
+   与 `"authoritative": false`)。快照是**展示层非权威副本**——审计真相源仍是
+   evorule FactsLog(append-only),删除策略只作用于快照目录,永不越界。
+
+**响应(live):**
 ```json
 {
   "session_id": "15",
   "agent_type": "general",
   "namespace": "general",
+  "source": "live",
   "count": 3,
   "messages": [
     { "idx": 0, "role": "system", "content": "..." },
@@ -1017,7 +1027,44 @@ GET /api/sessions/{id}/transcript?agent_type={可选}
 }
 ```
 
-错误:`502`(evorule-server 不可达)。
+**响应(snapshot,回落时省略 `namespace`,附 `saved_at`):**
+```json
+{
+  "session_id": "15",
+  "agent_type": "general",
+  "source": "snapshot",
+  "authoritative": false,
+  "saved_at": 1790125690,
+  "count": 3,
+  "messages": [ ... ]
+}
+```
+
+错误:`502`(evorule-server 不可达,且无本地快照可回落)。
+
+### 11.3 工作台配置(快照保留期)
+
+```
+GET /api/workbench/config
+PUT /api/workbench/config
+```
+
+快照保留期配置,持久化到 `data/workbench_config.json`(原子写)。serve 启动时清扫
+过期快照目录并挂载每日周期清理任务(每次清理现读配置,改配置下次清理即生效);
+清理按日期分片目录(`YYYY/MM/DD`)整体删除,**只作用于 `data/snapshots/` 目录**。
+
+**GET 响应:**
+```json
+{ "retention": "3m", "allowed": ["1d", "1m", "3m", "6m", "1y", "forever"] }
+```
+
+**PUT 请求体:**
+```json
+{ "retention": "3m" }
+```
+
+合法标签:`1d`(1 天)/ `1m`(1 个月)/ `3m`(3 个月,缺省)/ `6m`(半年)/ `1y`(1 年)/
+`forever`(永不清理)。非法标签返回 `400`;保存成功返回 `{"retention": "..."}`。
 
 ---
 

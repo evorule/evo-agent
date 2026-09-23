@@ -148,6 +148,10 @@ pub struct AgentApiState {
     llm_status: Arc<LlmStatusSnapshot>,
     /// 会话索引(JSONL 本地持久化;对话与历史阶段的枚举面)
     session_index: Arc<crate::api::session_index::SessionIndex>,
+    /// O-093:会话消息本地快照(展示层非权威副本;TTL 回收后历史仍可见)
+    snapshots: Arc<crate::api::snapshots::SnapshotStore>,
+    /// O-093:工作台配置(快照保留期;data/workbench_config.json)
+    workbench_config: Arc<crate::api::snapshots::WorkbenchConfigStore>,
 }
 
 impl AgentApiState {
@@ -193,6 +197,12 @@ impl AgentApiState {
             session_index: Arc::new(crate::api::session_index::SessionIndex::new(
                 workdir.join("data").join("session_index.jsonl"),
             )),
+            snapshots: Arc::new(crate::api::snapshots::SnapshotStore::new(
+                workdir.join("data").join("snapshots"),
+            )),
+            workbench_config: Arc::new(crate::api::snapshots::WorkbenchConfigStore::new(
+                workdir.join("data").join("workbench_config.json"),
+            )),
             workdir,
             workspace_client,
             toolkit,
@@ -214,6 +224,16 @@ impl AgentApiState {
     /// 会话索引的引用(WS 处理器记录会话活动)
     pub fn session_index(&self) -> &crate::api::session_index::SessionIndex {
         &self.session_index
+    }
+
+    /// O-093:快照存储的引用(WS 处理器 TurnEnd 落快照;transcript 回落读)
+    pub fn snapshots(&self) -> &crate::api::snapshots::SnapshotStore {
+        &self.snapshots
+    }
+
+    /// O-093:工作台配置存储的引用(保留期 GET/PUT 端点 + 清理任务现读)
+    pub fn workbench_config(&self) -> &crate::api::snapshots::WorkbenchConfigStore {
+        &self.workbench_config
     }
 
     /// G6:获取 SessionStore 的引用(供 G5 server 层做断开即取消等扩展)
@@ -315,6 +335,11 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route(
             "/api/sessions/{id}/transcript",
             axum::routing::get(get_transcript),
+        )
+        // O-093:工作台配置(快照保留期;展示层,不触引擎面)
+        .route(
+            "/api/workbench/config",
+            axum::routing::get(get_workbench_config).put(put_workbench_config),
         )
         // 工作台文件面(IDE 消费):目录列表 / 读 / 写 —— 全部委托 builtin_tools
         // 的 file 工具实现(同一沙箱与校验);写面为人工编辑语义,见 file_api 模块文档
@@ -920,10 +945,14 @@ struct TranscriptQuery {
     agent_type: Option<String>,
 }
 
-/// `GET /api/sessions/{id}/transcript` —— 会话消息历史(evorule facts 权威投影)
+/// `GET /api/sessions/{id}/transcript` —— 会话消息历史
 ///
-/// 数据源 = `MemoryManager` 持久化到 evorule payload 的消息(P0 短期记忆
-/// 持久化,进 FactsLog 审计链);本端点零写入,只做前缀读 + 同 idx 后写覆盖。
+/// 数据源两级(O-093 定稿):
+/// 1. **live**(缺省):`MemoryManager` 持久化到 evorule payload 的消息
+///    (P0 短期记忆持久化,进 FactsLog 审计链);零写入,前缀读 + 同 idx 后写覆盖;
+/// 2. **snapshot**(回落):evorule 会话 30min 闲置 TTL 回收后活投影报
+///    `Session not found`,回落 serve 本地快照(`authoritative:false`,
+///    展示层副本;TurnEnd 时与 live 同一投影路径落盘)。
 async fn get_transcript(
     State(state): State<AgentApiState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
@@ -940,25 +969,103 @@ async fn get_transcript(
     });
     let agent_type = agent_type.unwrap_or_else(|| "general".to_string());
 
-    let namespace = match state.definitions().load(&agent_type) {
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+
+    match crate::api::session_index::load_transcript(
+        state.evorule_client(),
+        &session_id,
+        &namespace,
+    )
+    .await
+    {
+        Ok(messages) => {
+            let count = messages.len();
+            Ok(Json(serde_json::json!({
+                "session_id": session_id,
+                "agent_type": agent_type,
+                "namespace": namespace,
+                "source": "live",
+                "count": count,
+                "messages": messages,
+            })))
+        }
+        // O-093:会话已被 evorule TTL 回收 → 回落本地快照(非权威副本明示)
+        Err(e) if crate::api::snapshots::is_session_gone(&e) => {
+            match state.snapshots().load(&session_id) {
+                Some(snap) => Ok(Json(serde_json::json!({
+                    "session_id": session_id,
+                    "agent_type": snap.agent_type,
+                    "source": "snapshot",
+                    "authoritative": false,
+                    "saved_at": snap.saved_at,
+                    "count": snap.count,
+                    "messages": snap.messages,
+                }))),
+                // 无快照 → 保持原有 502 语义
+                None => Err((StatusCode::BAD_GATEWAY, e)),
+            }
+        }
+        Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
+    }
+}
+
+/// agent_type → memory namespace(与 serve 侧 general 缺省注入同口径);
+/// transcript 活投影与 TurnEnd 快照采集共用,保证两路读同一 namespace。
+pub(crate) fn resolve_memory_namespace(state: &AgentApiState, agent_type: &str) -> String {
+    match state.definitions().load(agent_type) {
         Ok(def) if !def.memory.namespace.is_empty() => def.memory.namespace,
         // 定义加载失败/未配置 → 与 serve 侧 general 注入口径一致
         _ => "general".to_string(),
+    }
+}
+
+// =============================================================================
+// O-093:工作台配置(快照保留期)
+// =============================================================================
+
+/// `GET /api/workbench/config` —— 读取工作台配置(缺文件/损坏 → 缺省 3m)
+async fn get_workbench_config(State(state): State<AgentApiState>) -> Json<serde_json::Value> {
+    let cfg = state.workbench_config().load();
+    Json(serde_json::json!({
+        "retention": cfg.retention,
+        "allowed": crate::api::snapshots::RetentionPolicy::ALL
+            .iter()
+            .map(|(label, _)| *label)
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// `PUT /api/workbench/config` 请求体
+#[derive(Debug, serde::Deserialize)]
+struct PutWorkbenchConfigBody {
+    retention: String,
+}
+
+/// `PUT /api/workbench/config` —— 保存快照保留期(标签非法 400;原子写)
+async fn put_workbench_config(
+    State(state): State<AgentApiState>,
+    axum::Json(body): axum::Json<PutWorkbenchConfigBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let policy = crate::api::snapshots::RetentionPolicy::from_label(&body.retention).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!(
+            "invalid retention: {} (allowed: {})",
+            body.retention,
+            crate::api::snapshots::RetentionPolicy::ALL
+                .iter()
+                .map(|(l, _)| *l)
+                .collect::<Vec<_>>()
+                .join("|")
+        ),
+    ))?;
+    let cfg = crate::api::snapshots::WorkbenchConfig {
+        retention: policy.label().to_string(),
     };
-
-    let messages =
-        crate::api::session_index::load_transcript(state.evorule_client(), &session_id, &namespace)
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
-
-    let count = messages.len();
-    Ok(Json(serde_json::json!({
-        "session_id": session_id,
-        "agent_type": agent_type,
-        "namespace": namespace,
-        "count": count,
-        "messages": messages,
-    })))
+    state
+        .workbench_config()
+        .save(&cfg)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({ "retention": cfg.retention })))
 }
 
 // =============================================================================

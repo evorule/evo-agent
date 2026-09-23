@@ -444,6 +444,30 @@ async fn handle_ws(
                                         title: String::new(),
                                     },
                                 );
+                                // O-093:同批落本地消息快照(与 transcript 端点同一
+                                // load_transcript 投影路径,保证同源同构)。fail-soft:
+                                // 快照是展示辅助(服务会话 TTL 回收后的历史可见),
+                                // 失败只 warn 不阻断会话流程。
+                                let ns = crate::api::agent_api::resolve_memory_namespace(
+                                    &state,
+                                    &agent_type,
+                                );
+                                match crate::api::snapshots::capture_from_engine(
+                                    state.evorule_client(),
+                                    state.snapshots(),
+                                    sid,
+                                    &agent_type,
+                                    &ns,
+                                )
+                                .await
+                                {
+                                    Ok(p) => debug!(path = %p.display(), "snapshot saved"),
+                                    Err(e) => warn!(
+                                        error = %e,
+                                        session_id = %sid,
+                                        "snapshot save failed (fail-soft)"
+                                    ),
+                                }
                             }
                         }
                     }
