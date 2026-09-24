@@ -555,6 +555,17 @@ fn expand(ir: Ir) -> Result<Workflow, Vec<String>> {
     // ---- 步骤 5：展开后图自校验 ----
     self_check(&nodes, &output_node, &ir)?;
 
+    // ---- 步骤 5.5 计划体检：孤立 compute warn（交付物 4 §5.3 / 1-A M3 裁定，
+    //      Phase 2 计划体检面落地）——非拒载，引导作者确认节点存在必要 ----
+    let orphans = find_orphan_computes(&nodes, &output_node);
+    if !orphans.is_empty() {
+        tracing::warn!(
+            workflow_id = %ir.workflow_id,
+            orphan_computes = ?orphans,
+            "plan health check: 孤立 compute 节点（结果无任何下游消费面，工作流结束后不可考）"
+        );
+    }
+
     // ---- 步骤 6：输出物化 DAG（R5-T06：日志面，人可核对）----
     let edge_count: usize = nodes.iter().map(|n| n.depends_on.len()).sum();
     tracing::info!(
@@ -580,6 +591,25 @@ fn expand(ir: Ir) -> Result<Workflow, Vec<String>> {
         nodes,
         output_node,
     })
+}
+
+/// 步骤 5.5 计划体检纯函数：孤立 compute 节点检测（交付物 4 §5.3）
+///
+/// 「孤立」= 该 compute 节点 id 不出现在任何节点的 `depends_on` 中、也不是
+/// `output_node`——其结果无任何下游消费面。仅检测不拒载（§5.3 建议形态）。
+fn find_orphan_computes(nodes: &[WorkflowNode], output_node: &str) -> Vec<String> {
+    let mut consumers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for n in nodes {
+        for d in &n.depends_on {
+            consumers.insert(d.as_str());
+        }
+    }
+    consumers.insert(output_node);
+    nodes
+        .iter()
+        .filter(|n| n.compute.is_some() && !consumers.contains(n.id.as_str()))
+        .map(|n| n.id.clone())
+        .collect()
 }
 
 /// 步骤 0：限额与命名空间校验（交付物 5 §3 步骤 0 / 交付物 3 §5 冻结值）

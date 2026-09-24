@@ -2021,8 +2021,9 @@ fn cmd_workflow(
     match outcome {
         Ok(o) => {
             eprintln!(
-                "\n=== workflow '{}' done (plan_versions={} replans={} nodes_executed={} wall_ms={}) ===",
-                workflow_id, o.stats.plan_versions, o.stats.replans, o.stats.nodes_executed, o.stats.wall_ms
+                "\n=== workflow '{}' done (plan_versions={} replans={} nodes_executed={} wall_ms={} repeated_nodes={} tokens_used={} replan_tokens={}) ===",
+                workflow_id, o.stats.plan_versions, o.stats.replans, o.stats.nodes_executed,
+                o.stats.wall_ms, o.stats.repeated_nodes, o.stats.tokens_used, o.stats.replan_tokens
             );
             println!("{}", o.content);
             ExitCode::SUCCESS

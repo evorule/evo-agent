@@ -211,6 +211,10 @@ pub struct WorkflowEngine {
     /// 交付物 6 §4.1，Phase 1-B 接线。compute 与 LLM 节点都计，跳过节点不计。
     /// Arc 包装保 `Clone`（克隆共享同一计数器——同一驱动循环语义）
     executed_nodes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// 已成功完成节点 id 累积表（Phase 2：静态拦截 R8-T03 与重复执行埋点的
+    /// 数据源。`take_executed_node_ids` drain 语义 = 取走自上次调用以来的
+    /// 增量；外层驱动跨版本累积成「已执行注册表」。Arc 共享同一份——克隆共享）
+    executed_node_ids: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl WorkflowEngine {
@@ -219,6 +223,7 @@ impl WorkflowEngine {
         Self {
             ctx,
             executed_nodes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            executed_node_ids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -227,6 +232,25 @@ impl WorkflowEngine {
     pub fn executed_nodes(&self) -> u64 {
         self.executed_nodes
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 取走自上次调用以来成功完成的节点 id（drain 语义 = 每版增量；
+    /// 外层驱动跨 replan 版本累积成已执行注册表，供 R8-T03 静态拦截比对）
+    pub fn take_executed_node_ids(&self) -> Vec<String> {
+        let mut guard = self
+            .executed_node_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut *guard)
+    }
+
+    /// 记录一个成功完成节点（内部辅助：compute 与 LLM 成功点各调一次）
+    fn record_executed_node(&self, id: &str) {
+        let mut guard = self
+            .executed_node_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.push(id.to_string());
     }
 
     /// 只读访问内部 `DelegateContext`
@@ -308,6 +332,7 @@ impl WorkflowEngine {
                         results.insert(node.id.clone(), output);
                         self.executed_nodes
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.record_executed_node(&node.id);
                     }
                     None => llm_nodes.push(node),
                 }
@@ -346,6 +371,7 @@ impl WorkflowEngine {
                         results.insert(node.id.clone(), content.clone());
                         self.executed_nodes
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.record_executed_node(&node.id);
                     }
                     Err(e) => {
                         tracing::warn!(

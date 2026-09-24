@@ -67,6 +67,8 @@ fn test_merge_delegate_tool() {
         // G9:新增字段(测试用默认值)
         max_depth: super::DEFAULT_MAX_DELEGATE_DEPTH,
         max_concurrent: None,
+        // plan-execute tokens 埋点(测试不埋点)
+        token_counter: None,
     };
 
     let args = serde_json::json!({"query": "test"});
