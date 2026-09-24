@@ -43,20 +43,21 @@ pub struct ReplanState {
 
 /// 预算计数器（外层驱动内存状态，每节点完成时累加；交付物 6 §4.1）
 ///
-/// `tokens_used` MVP 恒 0（无可靠来源不做估算，Phase 2 埋点启用）。
+/// `tokens_used` 经交付物 7 埋点真实累加（Phase 2 已落地）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct BudgetCounters {
     /// 已成功完成节点数（含 compute 与 LLM 节点，跳过不计）
     pub nodes_executed: u64,
     /// 累计墙钟毫秒（非确定源，作为传入计数器值参与判定——§4.3 注记）
     pub wall_ms: u64,
-    /// 累计 token（MVP 恒 0，Phase 2 埋点启用）
+    /// 累计 token（交付物 7 埋点：驱动经 ctx token 计数器真实累加）
     pub tokens_used: u64,
 }
 
 /// 预算阈值（驱动配置，交付物 6 §5；禁止进 PlanFact——§5.1 裁决）
 ///
-/// `None` 维度不参与判定：`max_tokens` MVP 恒 `None`（Phase 2 启用）。
+/// `None` 维度不参与判定：`max_tokens` 缺省 `None`（CLI `--max-tokens` 可启用，
+/// 收官遗留 B1；tokens 埋点已随交付物 7 落地）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetThresholds {
     /// replan 硬上限（纲领拍板 3 次）
@@ -65,7 +66,7 @@ pub struct BudgetThresholds {
     pub max_nodes: Option<u64>,
     /// 最大墙钟毫秒（默认 1,800,000 = 30 分钟，对齐引擎会话 TTL 量级）
     pub max_wall_ms: Option<u64>,
-    /// 最大 token（Phase 2 启用，MVP 恒 None 不参与判定）
+    /// 最大 token（CLI `--max-tokens` 可配；缺省 None 不参与判定）
     pub max_tokens: Option<u64>,
 }
 
@@ -265,7 +266,7 @@ mod tests {
 
     #[test]
     fn decision_none_dimension_never_triggers() {
-        // None 维度不参与判定（max_tokens MVP 恒 None）
+        // None 维度不参与判定（含缺省 max_tokens = None）
         let ok: Result<String, String> = Ok("done".to_string());
         let t = BudgetThresholds {
             max_replan: 3,
@@ -277,6 +278,34 @@ mod tests {
             should_replan(&ok, &counters(u64::MAX / 2, u64::MAX / 2), &t, &state(0)),
             None
         );
+    }
+
+    #[test]
+    fn decision_budget_tokens_dimension() {
+        // tokens 维度独立触发（B1 启用：CLI --max-tokens 可配；>= 语义等值触发）
+        let ok: Result<String, String> = Ok("done".to_string());
+        let t = BudgetThresholds {
+            max_replan: 3,
+            max_nodes: None,
+            max_wall_ms: None,
+            max_tokens: Some(50),
+        };
+        let c = BudgetCounters {
+            nodes_executed: 0,
+            wall_ms: 0,
+            tokens_used: 50,
+        };
+        let d = should_replan(&ok, &c, &t, &state(0)).expect("tokens budget trigger");
+        assert_eq!(d.reason, ReplanReason::Budget);
+        assert!(d.failure_record.is_none());
+        assert_eq!(d.budget_snapshot, Some(c));
+        // 低于阈值 → 不触发
+        let under = BudgetCounters {
+            nodes_executed: 0,
+            wall_ms: 0,
+            tokens_used: 49,
+        };
+        assert_eq!(should_replan(&ok, &under, &t, &state(0)), None);
     }
 
     #[test]

@@ -73,6 +73,9 @@ pub struct DriverLimits {
     pub max_replan: u32,
     /// 墙钟预算毫秒（默认 1,800,000 = 30 分钟；None = 不限）
     pub max_wall_ms: Option<u64>,
+    /// token 预算上限（累计 tokens_used ≥ 阈值触发 Budget；None = 不限，
+    /// 收官遗留 B1 启用——tokens 埋点已随交付物 7 落地，阈值可放开）
+    pub max_tokens: Option<u64>,
 }
 
 /// 驱动循环统计
@@ -214,6 +217,7 @@ pub async fn run_plan_loop(
         let mut thresholds = BudgetThresholds::defaults(cur_wf.nodes.len());
         thresholds.max_replan = limits.max_replan;
         thresholds.max_wall_ms = limits.max_wall_ms;
+        thresholds.max_tokens = limits.max_tokens;
 
         let Some(mut decision) = should_replan(
             &result,
