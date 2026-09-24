@@ -209,6 +209,10 @@ enum Command {
         /// 墙钟预算毫秒(默认 1,800,000 = 30 分钟,交付物 6 §5.2)
         #[arg(long, default_value_t = 1_800_000)]
         max_wall_ms: u64,
+
+        /// token 预算上限(累计 tokens_used 达到即触发 replan Budget;不指定 = 不限)
+        #[arg(long)]
+        max_tokens: Option<u64>,
     },
 
     /// G15:REPL 交互模式(对话式,复用同一 evorule session)
@@ -345,6 +349,7 @@ fn main() -> ExitCode {
             plan_execute,
             max_replan,
             max_wall_ms,
+            max_tokens,
         } => cmd_workflow(
             &cli.workdir,
             &workflow_id,
@@ -356,6 +361,7 @@ fn main() -> ExitCode {
                 limits: DriverLimits {
                     max_replan,
                     max_wall_ms: Some(max_wall_ms),
+                    max_tokens,
                 },
             },
         ),
@@ -1892,7 +1898,7 @@ async fn shutdown_signal() {
 struct WorkflowRunOpts {
     /// plan-execute 模式（先跑 planning probe DAG 产 PlanFact v1）
     plan_execute: bool,
-    /// 驱动限额（replan 硬上限 + 墙钟预算）
+    /// 驱动限额（replan 硬上限 + 墙钟预算 + token 预算）
     limits: DriverLimits,
 }
 

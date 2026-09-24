@@ -287,7 +287,8 @@ v1.1 节点级条件分支 `run_when`（求值为假跳过，豁免级联）；v
 执行失败或预算耗尽时由外层驱动循环（`src/agent/driver.rs`）按 replan 判定函数
 决定是否触发重规划：丢弃式重规划——失败摘要 + 计划结构喂给 planner 产出下一版
 PlanFact，物化后全新执行（已执行结果不注入），replan 硬上限默认 3 次
-（`--max-replan`/`--max-wall-ms` 可调）。plan-execute 全链路（planner 先产计划
+（`--max-replan`/`--max-wall-ms`/`--max-tokens` 可调，后者为累计 token 预算，
+不指定不限）。plan-execute 全链路（planner 先产计划
 再执行）加 `--plan-execute`：
 
 ```bash

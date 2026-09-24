@@ -37,6 +37,7 @@
 ## [Unreleased]
 
 ### 🆕 新增
+- **`workflow` 子命令新增 `--max-tokens <N>` flag** — token 预算阈值接线：累计 `tokens_used` 达到 N 即触发 replan Budget 分支（交付物 7 tokens 埋点的阈值消费闭环）；不指定 = 不限（缺省 None 维度不参与判定，行为不变）。`DriverLimits`/`BudgetThresholds.max_tokens` 逐版接线（driver.rs 阈值重算处）
 
 #### plan-execute Phase 2：enforce 判别 / planner 重试 / 静态拦截 / 成本埋点
 - **D-01 enforce 一票否决（runner.rs + driver.rs）** — `AgentRunner` 事件循环新增 `Violation` 分支：TCB 约束前置门拒绝违规指令时，runner 不 rewind 不重试，flush/sediment 后以固定前缀 `enforce violation: rule_index=..., reason=...` 上抛 `AgentResult::error`；外层驱动 `is_enforce_violation` 凭前缀判别后**终止整个循环且不 replan**（纲领 §9.5.1 选项 B——宪法违规是系统性错误，不开「换计划再试」通道）。 Violation 消费零新增 Fact 类型（消费既有 SSE `Violation` 事件的 `rule_index`/`reason` 字段）
