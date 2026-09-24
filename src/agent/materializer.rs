@@ -1679,4 +1679,51 @@ mod tests {
         assert_eq!(fin.depends_on, vec!["scan_iter1_p".to_string()]);
         assert_eq!(wf.output_node, "fin");
     }
+
+    // ----- R6-T01 PT：物化器大规模展开计时（#[ignore] 手动跑，不进 CI）-----
+
+    /// PT 基线（R6-T01，收官遗留 B5）：上限 512 节点展开 ×10 次计时。
+    ///
+    /// 定位 = 可观测性能基线（打印每次耗时供对账），非 CI 门禁——物化是
+    /// 纯函数（无 IO/无墙钟依赖），耗时只随输入规模线性波动；粗上限断言
+    /// 仅防数量级回归（如误加 O(n²) 全对全依赖）。手动跑：
+    /// `cargo test -p evo-agent --lib pt_materialize_512 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn pt_materialize_512_boundary_timing() {
+        let l1: Vec<_> = (0..8)
+            .map(|i| serde_json::json!({ "id": format!("a{i}"), "agent_type": "w", "task": "t" }))
+            .collect();
+        let l2: Vec<_> = (0..7)
+            .map(|i| serde_json::json!({ "id": format!("b{i}"), "agent_type": "w", "task": "t" }))
+            .collect();
+        let l3 = serde_json::json!([{ "id": "c", "agent_type": "w", "task": "t" }]);
+        let doc = serde_json::json!({
+            "workflow_id": "pt_boundary",
+            "nodes": [{ "id": "out", "agent_type": "w", "task": "t" }],
+            "loops": [
+                { "id": "l1", "max_iterations": 32, "body": l1 },
+                { "id": "l2", "max_iterations": 32, "body": l2 },
+                { "id": "l3", "max_iterations": 31, "body": l3 }
+            ],
+            "output_node": "out"
+        });
+        let runs = 10;
+        let mut total = std::time::Duration::ZERO;
+        for i in 0..runs {
+            let t0 = std::time::Instant::now();
+            let wf = materialize_workflow_dag(&doc).expect("512 展开须成功");
+            let dt = t0.elapsed();
+            assert_eq!(wf.nodes.len(), 512, "run {i}: 展开数须恰 512");
+            println!("PT run {i}: {} nodes in {:?}", wf.nodes.len(), dt);
+            total += dt;
+        }
+        let avg = total / runs;
+        println!("PT avg over {runs} runs: {avg:?}");
+        // 数量级防回归（512 节点展开应为毫秒级；此阈值按环境宽放 100 倍余量）
+        assert!(
+            avg < std::time::Duration::from_secs(10),
+            "物化 512 节点平均耗时 {avg:?} 异常（疑似复杂度回归）"
+        );
+    }
 }
