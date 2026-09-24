@@ -1,0 +1,20 @@
+{
+  "workflow_id": "ok_then_fail_drill",
+  "description": "replan 硬上限演练（Dsl 模式）：首个节点用合规 researcher 正常成功，其后节点引用不存在的 ghost_agent 必失败；配合 --max-replan 0 验证 should_replan 判定序第 1 步（硬上限）直接终止、显式传播 Err 不进入 replan（防抖动终态行为）",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "warmup",
+      "agent_type": "researcher",
+      "task": "Produce a one-sentence summary of what a deterministic rule engine is.",
+      "depends_on": []
+    },
+    {
+      "id": "boom",
+      "agent_type": "ghost_agent",
+      "task": "This node intentionally references a non-existent agent type to force a node failure after the warmup node has succeeded.",
+      "depends_on": ["warmup"]
+    }
+  ],
+  "output_node": "boom"
+}

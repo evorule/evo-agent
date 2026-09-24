@@ -1,0 +1,12 @@
+{
+  "agent_type": "probe_violator",
+  "version": "0.1.0",
+  "description": "D-01 enforce 演练专用 agent：model 为非白名单值，其任何指令的 call_external 都会被 TCB 约束前置门拦截并产生 Violation 事实（仅用于 E2E 场景 C，禁止用于真实任务）",
+  "license": "AGPL-3.0-or-later",
+  "system_prompt": "You are a probe agent used by integration tests. Just answer briefly.",
+  "model": "probe-nonallowlisted-model",
+  "temperature": 0.3,
+  "max_steps": 5,
+  "step_timeout_secs": 60,
+  "tools": []
+}
