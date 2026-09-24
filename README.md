@@ -307,6 +307,10 @@ evo-agent workflow enforce_drill
 # replan 硬上限防抖演练：合规节点成功后接必败节点，--max-replan 0
 # 使判定序第 1 步（硬上限）直接终止并显式传播错误
 evo-agent workflow ok_then_fail_drill --max-replan 0
+
+# planner 重试演练（真实 LLM E2E 场景 E 入口）：planner 首答非法 JSON →
+# 提取错误反馈重试 → 反馈分支输出合法 PlanFact → v1 物化执行成功
+evo-agent workflow retry_drill --plan-execute
 ```
 
 执行成功时输出统计行（Phase 2 起含成本埋点）：
