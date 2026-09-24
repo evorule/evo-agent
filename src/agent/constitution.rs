@@ -35,22 +35,30 @@ pub fn validate_agent_def(body: &serde_json::Value) -> Result<(), Vec<String>> {
 /// 判定 workflow_dag 裸文档应按哪个版本校验（并存窗口）
 ///
 /// 分派规则（确定性：同输入必同分派）：
-/// 1. body 显式携带 `$schema` 字段 → 按声明分派（指向 v1.1 用 v1.1，其余按 v1.0）
-/// 2. 裸 body（运行时形态，无 `$schema`）→ 能力探测：任一节点含 `run_when`
-///    即按 v1.1（条件分支是 v1.1 相对 v1.0 的唯一增量），否则 v1.0
+/// 1. body 显式携带 `$schema` 字段 → 按声明分派（v1.2/v1.1，其余按 v1.0）
+/// 2. 裸 body（运行时形态，无 `$schema`）→ 能力探测（有序）：
+///    顶层 `loops` 非空或任一节点含 `compute` → v1.2（v1.2 相对 v1.1 的增量特征）；
+///    任一节点含 `run_when` → v1.1（v1.1 相对 v1.0 的唯一增量）；否则 v1.0
 fn detect_workflow_dag_version(body: &serde_json::Value) -> &'static str {
     if let Some(url) = body.get("$schema").and_then(|v| v.as_str()) {
+        if url.ends_with("/workflow_dag/v1.2.json") {
+            return "v1.2";
+        }
         return if url.ends_with("/workflow_dag/v1.1.json") {
             "v1.1"
         } else {
             "v1.0"
         };
     }
-    let uses_run_when = body
-        .get("nodes")
+    let nodes = body.get("nodes").and_then(|v| v.as_array());
+    let uses_v12 = body
+        .get("loops")
         .and_then(|v| v.as_array())
-        .is_some_and(|nodes| nodes.iter().any(|n| n.get("run_when").is_some()));
-    if uses_run_when {
+        .is_some_and(|loops| !loops.is_empty())
+        || nodes.is_some_and(|nodes| nodes.iter().any(|n| n.get("compute").is_some()));
+    if uses_v12 {
+        "v1.2"
+    } else if nodes.is_some_and(|nodes| nodes.iter().any(|n| n.get("run_when").is_some())) {
         "v1.1"
     } else {
         "v1.0"
@@ -59,10 +67,26 @@ fn detect_workflow_dag_version(body: &serde_json::Value) -> &'static str {
 
 /// 用 workflow_dag 校验裸文档（无壳 body）。
 ///
-/// 按 [`detect_workflow_dag_version`] 分派 v1.0/v1.1 校验器（双版本并存窗口）。
+/// 按 [`detect_workflow_dag_version`] 分派 v1.0/v1.1/v1.2 校验器（三版本并存窗口）。
+///
+/// **v1.2 防呆门**：宪法 v1.2 schema 已可用，但工作流引擎尚不支持 v1.2 执行能力
+/// （loop 静态展开 / compute 节点分派未实现）——若放行，反序列化会静默忽略
+/// `loops`/`compute` 字段导致错误执行。故 v1.2 文档通过 schema 校验后仍显式
+/// 拒载；引擎实现落地后移除本门。
 pub fn validate_workflow_dag(body: &serde_json::Value) -> Result<(), Vec<String>> {
     let version = detect_workflow_dag_version(body);
-    validate_kind_version("workflow_dag", version, body)
+    let result = validate_kind_version("workflow_dag", version, body);
+    if version == "v1.2" {
+        return result.and_then(|_| {
+            Err(vec![
+                "workflow_dag v1.2 已通过宪法 schema 校验，但引擎尚不支持 v1.2 执行能力\
+                 （loop 静态展开 / compute 节点分派未实现）；为避免 loops/compute 被\
+                 静默忽略而错误执行，拒绝加载。"
+                    .to_string(),
+            ])
+        });
+    }
+    result
 }
 
 fn validate_kind_version(
@@ -199,5 +223,100 @@ mod tests {
             "output_node": "b"
         });
         assert!(validate_workflow_dag(&bad).is_err());
+    }
+
+    // ----- workflow_dag v1.2 三版本分派 + 防呆门 -----
+
+    #[test]
+    fn test_detect_workflow_dag_v12() {
+        // 显式 $schema 按声明分派
+        let explicit_v12 = serde_json::json!({
+            "$schema": "https://evorule.org/schemas/workflow_dag/v1.2.json",
+            "workflow_id": "w", "nodes": [], "output_node": "x"
+        });
+        assert_eq!(detect_workflow_dag_version(&explicit_v12), "v1.2");
+        // 裸 body：顶层 loops 非空 → v1.2
+        let bare_loops = serde_json::json!({
+            "workflow_id": "w", "nodes": [{"id": "a", "agent_type": "x"}],
+            "loops": [{"id": "lp", "max_iterations": 3, "body": [{"id": "s", "agent_type": "x"}]}],
+            "output_node": "a"
+        });
+        assert_eq!(detect_workflow_dag_version(&bare_loops), "v1.2");
+        // 裸 body：节点含 compute → v1.2
+        let bare_compute = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [
+                {"id": "a", "agent_type": "x"},
+                {"id": "c", "compute": {"function": "strcmp", "inputs": ["a", "a"], "mode": "equal"}}
+            ],
+            "output_node": "c"
+        });
+        assert_eq!(detect_workflow_dag_version(&bare_compute), "v1.2");
+        // 空 loops 数组不构成 v1.2 特征（无其他特征 → v1.0）
+        let empty_loops = serde_json::json!({
+            "workflow_id": "w", "nodes": [{"id": "a", "agent_type": "x"}],
+            "loops": [], "output_node": "a"
+        });
+        assert_eq!(detect_workflow_dag_version(&empty_loops), "v1.0");
+    }
+
+    #[test]
+    fn test_validate_workflow_v12_guard_rejects_before_engine_support() {
+        // v1.2 文档即使通过 schema 校验也显式拒载（引擎 loop/compute 能力未落地，
+        // 防 serde 静默忽略字段导致错误执行）
+        let doc = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [{"id": "a", "agent_type": "researcher", "task": "t"}],
+            "loops": [{"id": "lp", "max_iterations": 2, "body": [
+                {"id": "s", "agent_type": "researcher", "task": "t"}
+            ]}],
+            "output_node": "a"
+        });
+        assert_eq!(detect_workflow_dag_version(&doc), "v1.2");
+        let errs =
+            validate_workflow_dag(&doc).expect_err("v1.2 must be rejected before engine support");
+        assert!(
+            errs.iter().any(|e| e.contains("尚不支持 v1.2")),
+            "拒载消息须说明引擎能力未落地: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_workflow_v12_schema_errors_surface() {
+        // v1.2 schema 违规优先于防呆门消息（compute 节点带 agent_type 应报 schema 违规）
+        let bad = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [
+                {"id": "c", "agent_type": "x",
+                 "compute": {"function": "strcmp", "inputs": ["a", "b"], "mode": "equal"}}
+            ],
+            "output_node": "c"
+        });
+        let errs = validate_workflow_dag(&bad).expect_err("schema violation must reject");
+        assert!(
+            errs.iter().any(|e| !e.contains("尚不支持 v1.2")),
+            "应报 schema 违规而非防呆门消息: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_workflow_v10_v11_unchanged() {
+        // 回归：v1.0/v1.1 文档不受 v1.2 分派与防呆门影响
+        let v10 = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [{"id": "a", "agent_type": "x", "task": "t"}],
+            "output_node": "a"
+        });
+        assert!(validate_workflow_dag(&v10).is_ok());
+        let v11 = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [
+                {"id": "a", "agent_type": "researcher", "task": "t"},
+                {"id": "b", "agent_type": "writer", "task": "t", "depends_on": ["a"],
+                 "run_when": {"node": "a", "op": "contains", "value": "APPROVE"}}
+            ],
+            "output_node": "b"
+        });
+        assert!(validate_workflow_dag(&v11).is_ok());
     }
 }

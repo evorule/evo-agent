@@ -1767,28 +1767,6 @@ impl AgentRunner {
         result
     }
 
-    /// 执行单个工具调用(含 G8 审批流),不含事件与 io_response 收尾
-    ///
-    /// 背景(v0.5.0 后的多轮编排回归应用层):server 的 collect/merge 元指令已退役,
-    /// call_external 指令的 io_response 提交后指令即 Stable,不会再有下一轮 ——
-    /// 工具结果回喂 LLM 由 runner 本地 ReAct 循环负责(见 run_streaming_inner)。
-    /// 本方法把「审批 + 执行」从 call_service IoRequest 分支抽出共用;缓存命中
-    /// (G13 预执行写入)直接返回。缓存写入仍只发生在 G13 预执行,保持原行为。
-    async fn execute_tool_with_approval(
-        &self,
-        session_id: &str,
-        tool_name: &str,
-        args: &Value,
-    ) -> Result<ToolExecOutcome, AgentError> {
-        match self.execute_tool_stage(session_id, tool_name, args).await? {
-            ToolExecStage::Done(outcome) => Ok(outcome),
-            ToolExecStage::Pending(req) => {
-                self.resolve_approval(session_id, tool_name, args, req)
-                    .await
-            }
-        }
-    }
-
     /// 阶段一(流式路径):执行工具并解析 needs_approval proposal,不做决策
     ///
     /// 供 stream! 生成器在 yield ApprovalRequired **之前**调用 —— 帧必须在
@@ -2589,7 +2567,7 @@ impl AgentRunner {
                                 // server 的 collect/merge 元指令已随 v0.5.0 退役,call_external
                                 // 指令的 io_response 提交后即 Stable,不会再有下一轮。工具结果
                                 // 回喂 LLM 由本循环负责:LLM 返回 tool_calls → 本地执行(审批/
-                                // 缓存经 execute_tool_with_approval) → tool 消息追加 → 再调
+                                // 缓存经 execute_tool_stage + resolve_approval) → tool 消息追加 → 再调
                                 // LLM;直到产出最终 content 才提交 io_response(中间态不提交,
                                 // server 无感知,无 IoRequest 响应超时风险)。回喂轮计入
                                 // step_count 受 max_steps 限流,防失控循环。
