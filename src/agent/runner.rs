@@ -535,6 +535,14 @@ pub struct AgentRunner {
     max_context_tokens: usize,
     /// C3:记忆区占窗口比例（由 `def.memory.memory_budget_ratio` 构造，默认 0.25）
     memory_budget_ratio: f32,
+    /// plan-execute tokens 埋点累加器（纲领 §8 Phase 2 交付物 7，None = 不埋点）
+    ///
+    /// 由 [`DelegateContext::with_token_counter`] 注入并随每个子 runner 共享
+    /// 同一 `Arc`：每次 LLM `IoRequest` 处理完，从 io_response result 的
+    /// `token_usage.total_tokens`（llm_handler 已解析 provider usage）累加。
+    /// 外层驱动据此维护 `BudgetCounters.tokens_used` 与 replan 重复执行
+    /// token 埋点（D-02 判定数据源）。仅供观测，不改变任何控制流。
+    token_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl AgentRunner {
@@ -565,7 +573,17 @@ impl AgentRunner {
             sediment_config: sediment::SedimentConfig::default(),
             max_context_tokens: 8192,
             memory_budget_ratio: 0.25,
+            token_counter: None,
         }
+    }
+
+    /// 注入 tokens 埋点累加器（plan-execute 外层驱动经 [`DelegateContext`] 共享）
+    pub fn with_token_counter(
+        mut self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.token_counter = Some(counter);
+        self
     }
 
     /// 当前 agent 类型(读访问 — 5 原则:**透明**)
@@ -1201,6 +1219,18 @@ impl AgentRunner {
                             .await?;
                         info!(%session_id, request_id, "Submitted io_response");
                     }
+
+                    // plan-execute tokens 埋点（纲领 §8 Phase 2 交付物 7）：llm_handler
+                    // 把 provider usage 解析为 result.token_usage；此处只累加不干预。
+                    if let Some(counter) = &self.token_counter {
+                        if let Some(total) = result
+                            .get("token_usage")
+                            .and_then(|t| t.get("total_tokens"))
+                            .and_then(|v| v.as_u64())
+                        {
+                            counter.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 }
                 "Stable" => {
                     let duration = start_time.elapsed().as_millis() as u64;
@@ -1249,6 +1279,32 @@ impl AgentRunner {
                     let _ = self.sediment_session(&session_id, &messages).await;
                     return Ok(AgentResult::error(
                         error_msg.to_string(),
+                        step_count,
+                        duration,
+                    ));
+                }
+                "Violation" => {
+                    // D-01 拍板结论（纲领 §9.5.4 修订版 + D-01 契约分析 §6.2）：enforce
+                    // 命中直接失败上抛——不 auto_rewind、不重试；workflow 层凭固定
+                    // 前缀 `enforce violation:` 判别后终止、不 replan（§9.5.1 选项 B）。
+                    // 不 bump 会话版本——与 reactor 侧「指令已丢弃、状态未变」一致。
+                    let rule_index = event.payload.get("rule_index").and_then(|v| v.as_u64());
+                    let reason = event
+                        .payload
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no reason)");
+                    warn!(
+                        %session_id,
+                        rule_index,
+                        %reason,
+                        "enforce 拦截：违规指令被拒绝执行（D-01：一票否决，不重试）"
+                    );
+                    let _ = self.flush_messages(&session_id).await;
+                    let _ = self.sediment_session(&session_id, &messages).await;
+                    let duration = start_time.elapsed().as_millis() as u64;
+                    return Ok(AgentResult::error(
+                        format!("enforce violation: rule_index={rule_index:?}, reason={reason}"),
                         step_count,
                         duration,
                     ));
@@ -1687,6 +1743,10 @@ impl AgentRunner {
             "content": final_content,
             "tool_calls": effective_tool_calls,
             "is_finished": llm_response.is_finished(),
+            // plan-execute tokens 埋点数据源（纲领 §8 Phase 2 交付物 7）：
+            // provider usage 透传进 io_response result，runner 累加点据此计数
+            // （此前在此处被丢弃，埋点恒 0——E2E 场景 A 实测暴露后修复）
+            "token_usage": llm_response.token_usage.clone(),
             "messages": result_messages,
         }))
     }

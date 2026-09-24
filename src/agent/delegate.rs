@@ -53,6 +53,12 @@ pub struct DelegateContext {
     /// `None` = 不限流(测试/单机场景)。`Arc<Semaphore>` 在 `increment_depth`
     /// clone 时共享,因此限制是**全局的**(跨整个委托树)。
     pub max_concurrent: Option<Arc<Semaphore>>,
+    /// plan-execute tokens 埋点累加器（纲领 §8 Phase 2 交付物 7，None = 不埋点）
+    ///
+    /// `Some` 时注入本上下文派生的每个子 runner，共享同一 `Arc<AtomicU64>`：
+    /// runner 每次 LLM `IoRequest` 后累加 `token_usage.total_tokens`。外层驱动
+    /// （driver.rs）据此维护 `BudgetCounters.tokens_used`。仅观测，不改控制流。
+    pub token_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl DelegateContext {
@@ -69,7 +75,22 @@ impl DelegateContext {
             evorule_client,
             max_depth: DEFAULT_MAX_DELEGATE_DEPTH,
             max_concurrent: None,
+            token_counter: None,
         }
+    }
+
+    /// plan-execute tokens 埋点：注入共享累加器（随 `Clone` 延续到每个子 runner）
+    pub fn with_token_counter(mut self, counter: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.token_counter = Some(counter);
+        self
+    }
+
+    /// 读取 tokens 埋点累计值（未启用埋点返回 0）
+    pub fn token_total(&self) -> u64 {
+        self.token_counter
+            .as_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Set delegate depth
@@ -151,6 +172,9 @@ impl DelegateContext {
 
             let mut runner =
                 crate::agent::runner::AgentRunner::new(config, self.evorule_client.clone());
+            if let Some(counter) = &self.token_counter {
+                runner = runner.with_token_counter(counter.clone());
+            }
 
             let result = runner.run(task).await;
 
