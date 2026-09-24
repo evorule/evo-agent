@@ -38,6 +38,15 @@
 
 ### 🆕 新增
 
+#### plan-execute Phase 2：enforce 判别 / planner 重试 / 静态拦截 / 成本埋点
+- **D-01 enforce 一票否决（runner.rs + driver.rs）** — `AgentRunner` 事件循环新增 `Violation` 分支：TCB 约束前置门拒绝违规指令时，runner 不 rewind 不重试，flush/sediment 后以固定前缀 `enforce violation: rule_index=..., reason=...` 上抛 `AgentResult::error`；外层驱动 `is_enforce_violation` 凭前缀判别后**终止整个循环且不 replan**（纲领 §9.5.1 选项 B——宪法违规是系统性错误，不开「换计划再试」通道）。 Violation 消费零新增 Fact 类型（消费既有 SSE `Violation` 事件的 `rule_index`/`reason` 字段）
+- **planner 重试面（driver.rs，R1-T03/T04）** — `call_planner_with_retry`：PlanFact JSON 提取失败 → 原任务附提取错误反馈重试 1 次（全程硬上限 2 次 planner 调用），仍失败整体终止；probe 站点复用已产出的 probe 输出（`Some(first_output)` 不重复调用），replan 站点传 `None` 函数内先补首次调用
+- **静态拦截 R8-T03（driver.rs）** — v(n+1) 物化后提交前双重闸：① `find_non_idempotent_writes` 递归扫描 PlanFact（含 loops body 嵌套），声明 `file_write`/`shell_exec` 写类工具的 tool 节点即**拒绝提交**（schema J3 幂等读白名单之外的防御深度二道闸）；② `detect_repeated_nodes` 与已执行注册表（跨版本累积 `(node_id, agent_type)`，workflow.rs `take_executed_node_ids` drain 语义）比对，幂等重复 warn + 计数放行（丢弃式 D-02 接受重复执行成本，§9.4.2）
+- **计划体检面 M3（materializer.rs）** — `find_orphan_computes`：孤立 compute 节点（id 不在任何 `depends_on` 且非 `output_node`）物化时 warn 非拒载（交付物 4 §5.3 建议形态，步骤 5.5）
+- **replan 成本埋点（交付物 7）** — tokens 埋点链路贯通：llm_handler 解析的 provider `usage.total_tokens` → runner `IoRequest` 提交后经共享 `Arc<AtomicU64>` 累加（`DelegateContext::with_token_counter` 透传，随 Clone 延续到每个子 runner）→ driver 维护 `tokens_used`（总量）/`replan_tokens`（v2+ 各版执行差值 + replan planner 调用自身消耗）/`repeated_nodes` 三计数；统计行扩展为 `plan_versions/replans/nodes_executed/wall_ms/repeated_nodes/tokens_used/replan_tokens`。阈值判定 `max_tokens` 维度结构就绪（缺省 None 不参与，不改变控制流）
+- **D-01 演练素材** — `agents/probe_violator.json`（model 非白名单，指令必被 TCB 门拦截）、`rules/workflows/enforce_drill.json`（Dsl 单 violator 节点，验证终止不 replan）、`rules/workflows/ok_then_fail_drill.json`（合规节点后接 ghost_agent，配 `--max-replan 0` 验证硬上限判定序第 1 步终止）
+- **E2E 扩至四场景（tests/e2e_plan_execute.py）** — 新增场景 C（enforce 终止：EXIT=1 + `halted by enforce violation` + 全程无 replan）与场景 D（硬上限防抖：EXIT=1 + `replan budget exhausted`）；场景 A 补断言 `tokens_used>0`、场景 B 补断言 `replan_tokens>0`（交付物 7 真实生效证据）；统计行正则同步 7 字段
+
 #### plan-execute 外层驱动循环与 planner 节点（Phase 1-B）
 - **外层驱动循环（`src/agent/driver.rs`）** — `run_plan_loop` 编排「计划 → 执行 → replan 重跑」主循环，双模式：**Dsl**（手写 workflow 即 v1 计划直接执行，失败/预算触发 replan）与 **PlanExecute**（`--plan-execute`：载入工作流作为 planning probe 单 planner 节点 DAG，其输出解析为 PlanFact v1 → 注入元数据 → 物化 → 执行）。replan 为丢弃式（纲领 D-02）：v(n) 失败/预算耗尽 → 失败摘要 + 计划结构构造 replan 任务 → planner（走 delegate 既有路径，IoRequest sidecar 入链，零新增审计通道）产 PlanFact v(n+1) → 物化 → 全新 execute（已执行结果不注入）；`should_replan` 到硬上限仍 Err 时显式传播失败（含版本/replan 统计）不静默。注入组（`plan_source`/`plan_version`/`parent_plan_hash`）外层权威注入（LLM 不产出）；`parent_plan_hash` = BLAKE3 64-hex，锚 = 注入后 PlanFact canonical JSON（Dsl v1 锚 = workflow 文件原文 hash，seed_hash 传入）
 - **`workflow` 子命令 CLI 扩展** — 新增 `--plan-execute`（bool）、`--max-replan`（默认 3）、`--max-wall-ms`（默认 1,800,000 = 30 分钟）三 flag；执行成功打印统计行 `plan_versions/replans/nodes_executed/wall_ms`

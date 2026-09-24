@@ -222,6 +222,26 @@ replan 硬上限默认 3 次。注入组(`plan_source`/`plan_version`/`parent_pl
 PlanFact canonical JSON(Dsl v1 锚 = workflow 文件原文 hash,由 seed_hash 传入)。
 planner 走 delegate 既有路径(IoRequest sidecar 入链),零新增审计通道。
 
+**Phase 2 增强(driver.rs,纲领 §8 交付物 6/7 + R1-T03/T04 + R8-T03 + M3)**:
+
+- **D-01 enforce 一票否决**:runner 事件循环消费既有 SSE `Violation` 事件
+  (零新增 Fact 类型),不 rewind 不重试,以固定前缀
+  `enforce violation: rule_index=..., reason=...` 上抛;驱动 `is_enforce_violation`
+  凭前缀判别后终止整个循环且不 replan(§9.5.1 选项 B——宪法违规是系统性错误)。
+- **planner 重试面(R1-T03/T04)**:PlanFact 提取失败 → 带提取错误反馈重试 1 次
+  (`call_planner_with_retry`,全程硬上限 2 次 planner 调用),仍失败整体终止。
+- **静态拦截(R8-T03)**:v(n+1) 物化后提交前双重闸——写类工具节点
+  (`file_write`/`shell_exec`,递归扫描含 loops body)拒绝提交(schema J3 幂等读
+  白名单外的防御深度二道闸);幂等重复(同 id 同 agent_type,比对跨版本已执行
+  注册表 `take_executed_node_ids` drain 累积)warn + 计数放行(§9.4.2)。
+- **成本埋点(交付物 7)**:LLM `usage.total_tokens` 经 runner(共享
+  `Arc<AtomicU64>`,`DelegateContext::with_token_counter` 透传)→ 驱动维护
+  `tokens_used`(总量)/`replan_tokens`(v2+ 版本执行 + replan planner 调用消耗)/
+  `repeated_nodes` 三计数,随统计行输出;`max_tokens` 阈值维度结构就绪(缺省
+  None 不参与判定,埋点不改控制流)。
+- **计划体检(M3)**:孤立 compute 节点(无消费者且非 output_node)物化时 warn
+  非拒载(`find_orphan_computes`)。
+
 ---
 
 ## 7. Agent 定义与桥接

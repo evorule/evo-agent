@@ -298,7 +298,32 @@ evo-agent workflow research_plan --plan-execute
 # Dsl 模式：手写 workflow 即 v1 计划直接执行；失败触发 replan 时
 # 由 planner 产出 PlanFact v2 修复重跑（见 rules/workflows/replan_drill.json）
 evo-agent workflow replan_drill
+
+# D-01 enforce 演练：节点 model 非白名单 → TCB 门产生 Violation →
+# 驱动判别后终止整个循环且不 replan（宪法违规一票否决，§9.5.1-B）
+evo-agent workflow enforce_drill
+
+# replan 硬上限防抖演练：合规节点成功后接必败节点，--max-replan 0
+# 使判定序第 1 步（硬上限）直接终止并显式传播错误
+evo-agent workflow ok_then_fail_drill --max-replan 0
 ```
+
+执行成功时输出统计行（Phase 2 起含成本埋点）：
+
+```text
+=== workflow 'research_plan' done (plan_versions=1 replans=0 nodes_executed=3
+wall_ms=81234 repeated_nodes=0 tokens_used=18745 replan_tokens=0) ===
+```
+
+- `repeated_nodes`：replan 产物中与已执行节点（同 id 同 agent_type）的幂等重复
+  计数——warn 放行（丢弃式接受重复成本）；PlanFact 中声明 `file_write`/`shell_exec`
+  写类工具的节点则直接拒绝提交（防御深度二道闸）
+- `tokens_used`：全程 LLM token 消耗（provider `usage` 汇总，仅供观测）
+- `replan_tokens`：v2+ 各版执行 + replan planner 调用自身消耗（重复执行成本上界，
+  为增量式 replan 策略积累判定数据）
+
+planner 产出的 PlanFact 若无法解析为 JSON，驱动会带提取错误反馈重试 1 次
+（全程硬上限 2 次 planner 调用），仍失败则整体终止，不猜测不静默。
 
 ---
 
