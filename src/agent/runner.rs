@@ -1319,11 +1319,12 @@ impl AgentRunner {
         info!(%session_id, step_count, duration_ms = duration, "SSE event loop ended (stream closed)");
         // 流关闭前也尝试刷写
         let _ = self.flush_messages(&session_id).await;
-        Ok(AgentResult::error(
-            "Event stream closed".to_string(),
-            step_count,
-            duration,
-        ))
+        // D-01 二次保险（B2）：断流可能吞掉 Violation 帧，查 evolution-signals
+        // 兜底归因 enforce 命中；查询不可用时降级返回原错误（不掩盖不阻塞）。
+        let closed_error = self
+            .detect_enforce_after_stream_close(&session_id, "Event stream closed")
+            .await;
+        Ok(AgentResult::error(closed_error, step_count, duration))
     }
 
     /// 组装随 LLM 请求下发的工具 OpenAI function schema。
@@ -2216,6 +2217,65 @@ impl AgentRunner {
         info!(%session_id, "Recorded used_at_startup");
 
         Ok(recalled_ids)
+    }
+
+    /// D-01 二次保险 + 降级兜底（收官遗留 B2；契约档 §6.1 降级口径）
+    ///
+    /// SSE 断流可能吞掉 `Violation` 帧（违规表现为「静默成功后流关闭」）。流
+    /// 关闭时 best-effort 查 evolution-signals 检测 enforce 命中：
+    /// - `total_violations > 0` → 返回 `enforce violation: ...` 固定前缀错误，
+    ///   workflow 层凭前缀判别终止且不 replan（§9.5.1-B）；归因取链上最新违规
+    ///   信号（`last_version` 最大者——signals 按 count 排序非时间序）。
+    /// - 兜底查询不可用（网络断/会话被 TTL 收割/server 不可达）→ **降级**：
+    ///   warn 留痕 + 返回携带本地上下文的原流关闭错误——不掩盖、不阻塞、不重试。
+    async fn detect_enforce_after_stream_close(
+        &self,
+        session_id: &str,
+        base_error: &str,
+    ) -> String {
+        let sid = match session_id.parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(%session_id, "enforce 兜底查询跳过：session id 非 u64");
+                return base_error.to_string();
+            }
+        };
+        match self
+            .evorule_client
+            .get_evolution_signals(sid, Some(8))
+            .await
+        {
+            Ok(signals) if signals["total_violations"].as_u64().unwrap_or(0) > 0 => {
+                let latest = signals["signals"].as_array().and_then(|arr| {
+                    arr.iter()
+                        .max_by_key(|s| s["last_version"].as_u64().unwrap_or(0))
+                });
+                let rule_ref = latest
+                    .and_then(|s| s["rule_ref"].as_str())
+                    .unwrap_or("(unknown rule)");
+                let reason = latest
+                    .and_then(|s| s["reason_summary"].as_str())
+                    .unwrap_or("(no reason)");
+                warn!(
+                    %session_id,
+                    rule_ref,
+                    %reason,
+                    "SSE 流关闭后经 evolution-signals 检测到 enforce 命中（D-01 二次保险）"
+                );
+                format!(
+                    "enforce violation: rule_ref={rule_ref}, reason={reason} (detected via evolution-signals after stream close)"
+                )
+            }
+            Ok(_) => base_error.to_string(),
+            Err(e) => {
+                warn!(
+                    %session_id,
+                    error = %e,
+                    "enforce 兜底查询不可用，降级返回流关闭错误（本地信息附带）"
+                );
+                format!("{base_error} (steps context only; enforce-fallback unavailable: {e})")
+            }
+        }
     }
 
     async fn auto_rewind(&self, session_id: &str) -> Result<u64, AgentError> {
@@ -3184,6 +3244,26 @@ impl AgentRunner {
                         yield Ok(AgentEvent::Done(AgentResult::error(msg.to_string(), step_count, duration)));
                         return;
                     }
+                    "Violation" => {
+                        // D-01（契约档 §6.2，流式消费面补齐）：enforce 命中直接失败
+                        // 上抛——不 rewind、不重试；与 workflow 链路 Violation 分支
+                        // 同语义，凭 `enforce violation:` 前缀供上层判别终止不 replan。
+                        let rule_index = event.payload.get("rule_index").and_then(|v| v.as_u64());
+                        let reason = event
+                            .payload
+                            .get("reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("(no reason)");
+                        warn!(%session_id, rule_index, %reason, "enforce 拦截（流式路径）：违规指令被拒绝执行");
+                        let duration = start_time.elapsed().as_millis() as u64;
+                        let _ = runner.flush_messages(&session_id).await;
+                        let _ = runner.sediment_session(&session_id, &messages).await;
+                        yield Ok(AgentEvent::Done(AgentResult::error(
+                            format!("enforce violation: rule_index={rule_index:?}, reason={reason}"),
+                            step_count, duration,
+                        )));
+                        return;
+                    }
                     _ => {
                         // 未知事件,继续循环
                     }
@@ -3193,8 +3273,13 @@ impl AgentRunner {
             // 事件流关闭
             let duration = start_time.elapsed().as_millis() as u64;
             let _ = runner.flush_messages(&session_id).await;
+            // D-01 二次保险（B2）：断流可能吞掉 Violation 帧，查 evolution-signals
+            // 兜底归因 enforce 命中；查询不可用时降级返回原错误（不掩盖不阻塞）。
+            let closed_error = runner
+                .detect_enforce_after_stream_close(&session_id, "Event stream closed")
+                .await;
             yield Ok(AgentEvent::Done(AgentResult::error(
-                "Event stream closed".to_string(), step_count, duration,
+                closed_error, step_count, duration,
             )));
         })
     }

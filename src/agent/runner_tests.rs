@@ -1857,3 +1857,100 @@ async fn test_run_recall_before_prompt() {
     // 验证 command 请求体包含 recalled content（证明 recall 在 build_system_prompt 之前）
     command_mock.assert_async().await;
 }
+
+// ----- D-01 二次保险 + 降级兜底（收官遗留 B2：Halted get_state 兜底降级）-----
+
+#[tokio::test]
+async fn test_b2_fallback_detects_violation_after_stream_close() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let runner = AgentRunner::new(AgentConfig::default(), client);
+
+    // signals 按 count 排序（mock 特意让 count 首条非链上最新），
+    // 兜底归因必须取 last_version 最大者（链上最新违规）
+    let signals = serde_json::json!({
+        "session_id": 7,
+        "total_violations": 2,
+        "signals": [
+            {"kind": "violation", "rule_ref": "rule_index=11",
+             "reason_summary": "older reason", "count": 2,
+             "last_version": 5, "last_instr_type": "call_external"},
+            {"kind": "violation", "rule_ref": "rule_index=3",
+             "reason_summary": "newer reason", "count": 1,
+             "last_version": 9, "last_instr_type": "set"}
+        ],
+        "queue": {"pending_normal": 0, "pending_meta_promotion": 0}
+    });
+    server
+        .mock("GET", "/api/sessions/7/evolution-signals?limit=8")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(signals.to_string())
+        .create_async()
+        .await;
+
+    let err = runner
+        .detect_enforce_after_stream_close("7", "Event stream closed")
+        .await;
+    assert!(
+        err.starts_with("enforce violation:"),
+        "fallback must promote enforce prefix, got: {err}"
+    );
+    // 归因取链上最新（last_version=9 → rule_index=3），非 count 排序首条
+    assert!(err.contains("rule_ref=rule_index=3"), "got: {err}");
+    assert!(err.contains("reason=newer reason"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_b2_fallback_degrades_when_query_unavailable() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let runner = AgentRunner::new(AgentConfig::default(), client);
+
+    // 404：会话不存在（TTL 收割/server 重启形态）→ 降级返回原错误附上下文
+    server
+        .mock("GET", "/api/sessions/9/evolution-signals?limit=8")
+        .with_status(404)
+        .create_async()
+        .await;
+
+    let err = runner
+        .detect_enforce_after_stream_close("9", "Event stream closed")
+        .await;
+    assert!(
+        err.starts_with("Event stream closed"),
+        "degraded path must keep base error, got: {err}"
+    );
+    assert!(err.contains("enforce-fallback unavailable"), "got: {err}");
+    assert!(!err.starts_with("enforce violation"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_b2_fallback_passthrough_no_violation_and_bad_sid() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let runner = AgentRunner::new(AgentConfig::default(), client);
+
+    // 无违规：纯流关闭语义不变，原样返回
+    let signals = serde_json::json!({
+        "session_id": 5, "total_violations": 0, "signals": [],
+        "queue": {"pending_normal": 0, "pending_meta_promotion": 0}
+    });
+    server
+        .mock("GET", "/api/sessions/5/evolution-signals?limit=8")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(signals.to_string())
+        .create_async()
+        .await;
+    let err = runner
+        .detect_enforce_after_stream_close("5", "Event stream closed")
+        .await;
+    assert_eq!(err, "Event stream closed");
+
+    // session id 非 u64：兜底查询跳过，原样返回
+    let err = runner
+        .detect_enforce_after_stream_close("not-a-number", "Event stream closed")
+        .await;
+    assert_eq!(err, "Event stream closed");
+}
