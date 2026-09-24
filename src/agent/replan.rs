@@ -46,8 +46,11 @@ pub struct ReplanState {
 /// `tokens_used` MVP 恒 0（无可靠来源不做估算，Phase 2 埋点启用）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct BudgetCounters {
+    /// 已成功完成节点数（含 compute 与 LLM 节点，跳过不计）
     pub nodes_executed: u64,
+    /// 累计墙钟毫秒（非确定源，作为传入计数器值参与判定——§4.3 注记）
     pub wall_ms: u64,
+    /// 累计 token（MVP 恒 0，Phase 2 埋点启用）
     pub tokens_used: u64,
 }
 
@@ -113,6 +116,7 @@ pub struct WorkflowFailureRecord {
 /// replan 决策（交付物 6 §2：None | { reason, failure_record?, budget_snapshot }）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplanDecision {
+    /// 触发原因（Failure 失败优先于 Budget 预算）
     pub reason: ReplanReason,
     /// 仅 Failure 触发时携带
     pub failure_record: Option<WorkflowFailureRecord>,

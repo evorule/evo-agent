@@ -10,6 +10,7 @@ pub mod constitution;
 pub mod context_window;
 pub mod definition;
 pub mod delegate;
+pub mod driver;
 pub mod materializer;
 pub mod memory;
 pub mod memory_event;
@@ -36,6 +37,10 @@ pub use definition::{
     AgentDefinition, AgentDefinitionError, AgentDefinitionManager, MemoryConfig, OutputFormat,
 };
 pub use delegate::{DelegateContext, DEFAULT_MAX_CONCURRENT_DELEGATES};
+pub use driver::{
+    build_plan_summary, build_replan_task, extract_plan_json, inject_plan_meta,
+    plan_canonical_hash, run_plan_loop, DriverLimits, PlanLoopOutcome, PlanLoopStats, PlanMode,
+};
 pub use materializer::{materialize_plan_fact, materialize_workflow_dag, MATERIALIZER_VERSION};
 pub use memory::{MemoryError, MemoryManager};
 pub use memory_event::{

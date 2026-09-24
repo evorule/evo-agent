@@ -263,6 +263,14 @@ fn parse_plan_fact_node(v: &serde_json::Value) -> Result<IrNode, String> {
         ));
     }
     node.deps = Vec::new();
+    // C9（交付物 2 §6）：计划节点禁止引用 planner 自身（防自指递归——planner
+    // 是计划的生产者不是执行者；手写 DSL v1.2 probe 工作流不受此限）
+    if node.agent_type.as_deref() == Some("planner") {
+        return Err(format!(
+            "PlanFact 节点 '{}' 禁止引用 agent_type='planner'（C9 防自指递归）",
+            node.id
+        ));
+    }
     let ty = str_field(v, "type")
         .map_err(|e| e.join("; "))?
         .ok_or_else(|| format!("PlanFact 节点 '{}' 缺 type（J1 显式判别）", node.id))?;
@@ -1061,7 +1069,7 @@ mod tests {
             "plan_version": 1, "parent_plan_hash": null, "plan_source": "initial_planning",
             "materializer_version": "1.0.0",
             "nodes": [
-                { "id": "fetch",    "type": "llm", "agent_type": "planner",  "task": "获取并整理输入材料" },
+                { "id": "fetch",    "type": "llm", "agent_type": "researcher", "task": "获取并整理输入材料" },
                 { "id": "analyze",  "type": "llm", "agent_type": "analyst",
                   "task_template": "分析以下材料：\n{fetch}", "input_refs": ["fetch"] },
                 { "id": "report",   "type": "llm", "agent_type": "writer",
@@ -1571,6 +1579,18 @@ mod tests {
     }
 
     // ----- PlanFact 唯一汇点派生（实现新明确点）-----
+
+    #[test]
+    fn plan_fact_rejects_planner_agent_type() {
+        // C9（交付物 2 §6）：计划节点禁止引用 planner 自身（防自指递归）
+        let plan = serde_json::json!({
+            "nodes": [
+                { "id": "a", "type": "llm", "agent_type": "planner", "task": "t" }
+            ]
+        });
+        let errs = materialize_plan_fact(&plan, "wf").expect_err("C9 须拒");
+        assert!(errs[0].contains("planner"), "{errs:?}");
+    }
 
     #[test]
     fn plan_fact_requires_unique_sink() {
