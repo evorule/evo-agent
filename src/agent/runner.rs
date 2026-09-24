@@ -42,6 +42,11 @@ use crate::io_handlers::{LlmHandler, StreamChunk, ToolHandler};
 /// TODO: doc
 pub const DEFAULT_MAX_DELEGATE_DEPTH: usize = 3;
 
+/// R2-T04 链体积告警阈值（收官遗留 B3）：单会话 facts_log 审计链长达到该值
+/// 时 warn 告警（观测口径，不拦截）。量级参照：单节点 agent 会话典型链长
+/// 数十至数百条；10,000 条 = 超长会话（多轮重试/长循环）的异常增长信号。
+const CHAIN_SIZE_WARN_ENTRIES: u64 = 10_000;
+
 #[derive(Debug, Clone)]
 /// TODO: doc
 pub struct AgentConfig {
@@ -1238,6 +1243,8 @@ impl AgentRunner {
                     self.flush_messages(&session_id).await?;
                     // C1:会话沉淀（best-effort，摘要+稳定事实→共享空间）
                     let _ = self.sediment_session(&session_id, &messages).await;
+                    // R2-T04 链体积观测（B3）：会话收尾时 best-effort 查审计链长告警
+                    self.check_chain_size(&session_id).await;
                     let state = self.evorule_client.get_state(&session_id).await?;
                     // payload 结构取决于 evorule 规则如何存储 io_response 结果。
                     // 默认规则将 call_external 的 io_response result 存储在
@@ -2278,6 +2285,41 @@ impl AgentRunner {
         }
     }
 
+    /// R2-T04 链体积监控（收官遗留 B3）：长会话 facts_log 体积增长观测告警。
+    ///
+    /// 只读观测——best-effort 查审计报告 `entry_count`（BLAKE3 审计链长，链
+    /// 体积的权威只读投影），达到 [`CHAIN_SIZE_WARN_ENTRIES`] 时 warn 告警；
+    /// 查询失败静默降级。监控不干预执行：不写链、不拦截、不改变控制流
+    /// （零红线风险，观测面与审计链解耦）。
+    async fn check_chain_size(&self, session_id: &str) {
+        match self.evorule_client.get_audit_report(session_id).await {
+            Ok(report) => {
+                let entries = report["entry_count"].as_u64().unwrap_or(0);
+                if entries >= CHAIN_SIZE_WARN_ENTRIES {
+                    warn!(
+                        %session_id,
+                        chain_entries = entries,
+                        threshold = CHAIN_SIZE_WARN_ENTRIES,
+                        "facts_log 链体积告警：会话链长达到阈值（R2-T04 观测）"
+                    );
+                } else {
+                    debug!(
+                        %session_id,
+                        chain_entries = entries,
+                        "facts_log 链体积观测（R2-T04）"
+                    );
+                }
+            }
+            Err(e) => {
+                debug!(
+                    %session_id,
+                    error = %e,
+                    "链体积观测查询失败（不干预执行）"
+                );
+            }
+        }
+    }
+
     async fn auto_rewind(&self, session_id: &str) -> Result<u64, AgentError> {
         let history = self.evorule_client.get_facts(session_id, None).await?;
 
@@ -3202,6 +3244,8 @@ impl AgentRunner {
                         let _ = runner.flush_messages(&session_id).await;
                         // C1:会话沉淀（best-effort，摘要+稳定事实→共享空间）
                         let _ = runner.sediment_session(&session_id, &messages).await;
+                        // R2-T04 链体积观测（B3）：会话收尾时 best-effort 查审计链长告警
+                        runner.check_chain_size(&session_id).await;
                         let state = match runner.evorule_client.get_state(&session_id).await {
                             Ok(s) => s,
                             Err(e) => {
