@@ -280,7 +280,7 @@ impl SnapshotStore {
                     let Ok(snap) = serde_json::from_str::<SnapshotFile>(&text) else {
                         continue; // 损坏文件跳过
                     };
-                    if best.as_ref().map_or(true, |b| snap.saved_at > b.saved_at) {
+                    if best.as_ref().is_none_or(|b| snap.saved_at > b.saved_at) {
                         best = Some(snap);
                     }
                 }
@@ -312,22 +312,22 @@ impl SnapshotStore {
                         continue;
                     };
                     let dir_days = days_from_civil(yv, mv, dv);
-                    if today - dir_days >= max_age as i64 {
-                        if std::fs::remove_dir_all(&d.path()).is_ok() {
-                            removed += 1;
-                            // 空月目录顺手移除(非空则失败忽略)
-                            let _ = std::fs::remove_dir(&m.path());
-                        }
+                    if today - dir_days >= max_age as i64
+                        && std::fs::remove_dir_all(d.path()).is_ok()
+                    {
+                        removed += 1;
+                        // 空月目录顺手移除(非空则失败忽略)
+                        let _ = std::fs::remove_dir(m.path());
                     }
                 }
                 // 整月删空后移除空月目录
                 if is_dir_empty(&m.path()) {
-                    let _ = std::fs::remove_dir(&m.path());
+                    let _ = std::fs::remove_dir(m.path());
                 }
             }
             // 整年删空后移除空年目录
             if is_dir_empty(&y.path()) {
-                let _ = std::fs::remove_dir(&y.path());
+                let _ = std::fs::remove_dir(y.path());
             }
         }
         removed
