@@ -1,0 +1,14 @@
+{
+  "workflow_id": "replan_drill",
+  "description": "replan 触发演练（Dsl 模式）：v1 节点引用不存在的 agent_type（ghost_agent）必失败，触发 Failure replan，由 planner 产出 PlanFact v2 修复后重跑",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "boom",
+      "agent_type": "ghost_agent",
+      "task": "This node intentionally references a non-existent agent type to force a node failure and exercise the replan path. The replacement plan should research 'evorule deterministic workflow engine design' and produce a short digest.",
+      "depends_on": []
+    }
+  ],
+  "output_node": "boom"
+}
