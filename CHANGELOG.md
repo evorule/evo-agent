@@ -38,6 +38,17 @@
 
 ### 🆕 新增
 
+#### plan-execute 外层驱动循环与 planner 节点（Phase 1-B）
+- **外层驱动循环（`src/agent/driver.rs`）** — `run_plan_loop` 编排「计划 → 执行 → replan 重跑」主循环，双模式：**Dsl**（手写 workflow 即 v1 计划直接执行，失败/预算触发 replan）与 **PlanExecute**（`--plan-execute`：载入工作流作为 planning probe 单 planner 节点 DAG，其输出解析为 PlanFact v1 → 注入元数据 → 物化 → 执行）。replan 为丢弃式（纲领 D-02）：v(n) 失败/预算耗尽 → 失败摘要 + 计划结构构造 replan 任务 → planner（走 delegate 既有路径，IoRequest sidecar 入链，零新增审计通道）产 PlanFact v(n+1) → 物化 → 全新 execute（已执行结果不注入）；`should_replan` 到硬上限仍 Err 时显式传播失败（含版本/replan 统计）不静默。注入组（`plan_source`/`plan_version`/`parent_plan_hash`）外层权威注入（LLM 不产出）；`parent_plan_hash` = BLAKE3 64-hex，锚 = 注入后 PlanFact canonical JSON（Dsl v1 锚 = workflow 文件原文 hash，seed_hash 传入）
+- **`workflow` 子命令 CLI 扩展** — 新增 `--plan-execute`（bool）、`--max-replan`（默认 3）、`--max-wall-ms`（默认 1,800,000 = 30 分钟）三 flag；执行成功打印统计行 `plan_versions/replans/nodes_executed/wall_ms`
+- **引擎节点计数（workflow.rs）** — `WorkflowEngine` 新增 `executed_nodes()`（Arc<AtomicU64>，compute 成功与 LLM 成功两处累加，Clone 共享同一计数器），供驱动预算判定消费
+- **C9 防自指递归守卫（materializer.rs）** — PlanFact 节点引用 `agent_type="planner"` 即拒（planner 是计划生产者非执行者）；golden 示例 fixture 同步对齐
+- **planner agent 档案（`agents/planner.json`）** — PlanFact 产出者：temperature 0.2 / max_steps 2 / 无工具；system prompt 含 PlanFact schema 严格规则（节点 id 文法、agent_type 白名单 researcher|general 且禁 planner、单汇点、loops `prev.` 前缀、冻结限额）+ few-shot 示例
+- **planning probe 工作流（`rules/workflows/research_plan.json`）** — 单 planner 节点，task 为研究目标 + PlanFact 产出指令，`--plan-execute` 模式入口
+- **replan 演练工作流（`rules/workflows/replan_drill.json`）** — Dsl 模式 replan 触发演练：boom 节点引用不存在的 `ghost_agent` 必失败 → Failure replan → planner 产 v2 修复重跑
+- **真实 LLM E2E（`tests/e2e_plan_execute.py`，IT 级不进 CI）** — 两场景断言：场景 A（probe → PlanFact v1 → 物化 → 执行，`plan_versions=1 replans=0`）与场景 B（v1 失败 → Failure replan → v2 成功，`plan_versions=2 replans=1`）；`.env` 进程环境注入（O-095 口径）；`--evidence-dir` 证据落盘
+- **`blake3` 依赖重新引入** — `parent_plan_hash`/`failed_plan_hash` 锚计算需要（与生态 BLAKE3 哈希纪律一致；此前 0.x 曾以零调用移除，本批恢复为真实消费）
+
 #### workflow_dag v1.2 动态循环基座（plan-execute 方案 D Phase 1-A）
 - **workflow_dag v1.2 物化器（`src/agent/materializer.rs`）** — 纯函数物化器：把 v1.2 文档（手写 DSL 形态与 PlanFact 形态归一化）静态展开为线性 DAG——顶层 `loops` 循环体按 `{loop_id}_iter{k}_{node_id}` 展开为副本链（`max_iterations` 1..=32、`body` 1..=8、loops ≤ 8、展开前 ≤ 64、展开后 ≤ 512，冻结限额校验）；跨迭代引用文法 R1–R4 三消费面（模板占位符/compute inputs/run_when 观察）共用同一分类器，iter0 的 `prev.X` 统一消解为空串语义；跨迭代隐式依赖逐节点全连；展开后自检（id 唯一/引用存在性/拓扑层序/无环）；同输入必同输出（字节级确定性测试锁定）
 - **`constitution::load_workflow` 统一加载入口** — schema 校验 → v1.2 物化 / v1.0-v1.1 直接反序列化；v1.2 防呆拒载门翻转为「schema + 物化」双门（引擎 loop/compute 能力已落地，物化门保证 v1.2 增量语义被真正消费而非被 serde 静默忽略）；`workflow` 子命令切换至该入口

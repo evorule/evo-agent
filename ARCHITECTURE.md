@@ -71,6 +71,7 @@ evorule 引擎执行规则前必须加载一份 rule_set 作为运行宪法。**
 | **WorkflowEngine** | `src/agent/workflow.rs` | DAG 拓扑编排多 agent（含 compute 纯函数节点内联求值） |
 | **WorkflowMaterializer** | `src/agent/materializer.rs` | workflow_dag v1.2 物化器:loop 静态展开为线性副本链（纯函数,同输入必同输出） |
 | **Replan** | `src/agent/replan.rs` | replan 触发判定纯函数 + 失败摘要/预算计数器结构（plan-execute 方案 D） |
+| **PlanLoopDriver** | `src/agent/driver.rs` | plan-execute 外层驱动循环:计划 → 执行 → 失败/预算 replan 重跑（丢弃式 D-02） |
 | **ContextWindowManager** | `src/agent/context_window.rs` | Token 计数 + 消息裁剪 |
 | **OutputValidator** | `src/agent/output_validator.rs` | LLM 输出 JSON Schema 校验 |
 | **MemoryEventStore** | `src/agent/memory_event/store.rs` | 结构化记忆事件 + 因果链 |
@@ -203,7 +204,23 @@ DAG(有向无环图)拓扑编排多 agent,用 JSON DSL 定义:
 replan(重调 planner 产出下一版计划)。判定顺序写死:replan 硬上限(默认 3)→
 失败优先 → 预算任一维度(节点数/墙钟/token)达到阈值。阈值来自驱动配置
 (禁止进 PlanFact);失败摘要与预算快照为应用层内存结构,仅随 replan 摘要间接
-入链,零新增 Fact 类型。外层驱动循环(重调 planner 产 v2)属 Phase 1-B。
+入链,零新增 Fact 类型。
+
+**外层驱动循环(`src/agent/driver.rs`,plan-execute 方案 D)**:
+
+`run_plan_loop` 编排「计划 → 执行 → replan 重跑」应用层主循环,两种模式:
+
+- **Dsl 模式**(`evo-agent workflow <id>`):手写 workflow 即 v1 计划直接执行;
+  失败/预算触发 replan 时由 planner 产出 PlanFact v2+。
+- **PlanExecute 模式**(`evo-agent workflow <id> --plan-execute`):先执行载入的
+  planning probe DAG(单 planner 节点),其输出解析为 PlanFact v1 → 物化 → 执行。
+
+replan 为**丢弃式**(纲领 D-02):v(n) 失败/预算耗尽 → 失败摘要 + 计划结构喂给
+planner → PlanFact v(n+1) → 物化 → 全新 execute(v(n) 已执行结果不注入);
+replan 硬上限默认 3 次。注入组(`plan_source`/`plan_version`/`parent_plan_hash`)
+由外层驱动权威注入(LLM 不产出);`parent_plan_hash` 为 BLAKE3 64-hex,锚 = 注入后
+PlanFact canonical JSON(Dsl v1 锚 = workflow 文件原文 hash,由 seed_hash 传入)。
+planner 走 delegate 既有路径(IoRequest sidecar 入链),零新增审计通道。
 
 ---
 
