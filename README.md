@@ -197,7 +197,7 @@ evo-agent validate <agent>               # 校验 agent.json 是否合法
 evo-agent config                         # 显示合并后的配置
 evo-agent serve --port 8081              # 启动 HTTP server（启动期预载校验全部 agent 档案，坏档案 fail-fast）
 evo-agent patrol --session <id> --workspace <ws_id>  # 进化巡视（一次性任务，见下文）
-evo-agent workflow <workflow_id>         # 执行多 agent DAG 工作流
+evo-agent workflow <workflow_id>         # 执行多 agent DAG 工作流（--plan-execute 走 plan-execute 全链路）
 evo-agent repl                           # REPL 交互模式（复用同一 session）
 evo-agent replay --session <id>          # 回放 session 的记忆事件链
 ```
@@ -282,8 +282,23 @@ evo-agent workflow research_and_write
 v1.1 节点级条件分支 `run_when`（求值为假跳过，豁免级联）；v1.2 新增有界循环
 `loops`（加载时静态展开为线性副本链，展开后仍是纯 DAG）与纯函数节点 `compute`
 （封闭目录 `strcmp`/`numeric_cmp`/`regex_match`，不经 LLM、无 IO、无副作用，
-典型用法为循环收敛门控：结果与上一轮一致即提前退出）。执行失败或预算耗尽时
-按 replan 判定函数决定是否触发重规划（外层驱动循环属后续版本）。
+典型用法为循环收敛门控：结果与上一轮一致即提前退出）。
+
+执行失败或预算耗尽时由外层驱动循环（`src/agent/driver.rs`）按 replan 判定函数
+决定是否触发重规划：丢弃式重规划——失败摘要 + 计划结构喂给 planner 产出下一版
+PlanFact，物化后全新执行（已执行结果不注入），replan 硬上限默认 3 次
+（`--max-replan`/`--max-wall-ms` 可调）。plan-execute 全链路（planner 先产计划
+再执行）加 `--plan-execute`：
+
+```bash
+# PlanExecute 模式：载入工作流作为 planning probe（单 planner 节点），
+# 其输出解析为 PlanFact v1 → 物化 → 执行
+evo-agent workflow research_plan --plan-execute
+
+# Dsl 模式：手写 workflow 即 v1 计划直接执行；失败触发 replan 时
+# 由 planner 产出 PlanFact v2 修复重跑（见 rules/workflows/replan_drill.json）
+evo-agent workflow replan_drill
+```
 
 ---
 
@@ -629,6 +644,7 @@ evo-agent/
 │   │   ├── workflow.rs              # DAG 工作流引擎(compute 纯函数节点内联求值)
 │   │   ├── materializer.rs          # workflow_dag v1.2 物化器(loop 静态展开)
 │   │   ├── replan.rs                # replan 触发判定纯函数 + 预算结构
+│   │   ├── driver.rs                # plan-execute 外层驱动循环(计划→执行→replan 重跑)
 │   │   ├── context_window.rs        # 上下文窗口裁剪
 │   │   ├── summarizer.rs            # 会话摘要
 │   │   ├── sediment.rs              # 会话沉淀通道
