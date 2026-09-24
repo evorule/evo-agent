@@ -101,10 +101,15 @@ pub enum StrcmpMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NumericCmpMode {
+    /// 小于
     Lt,
+    /// 小于等于
     Le,
+    /// 大于
     Gt,
+    /// 大于等于
     Ge,
+    /// 相等
     Eq,
 }
 
@@ -118,19 +123,26 @@ pub enum NumericCmpMode {
 pub enum ComputeSpec {
     /// 字符串比较（恰 2 输入）
     Strcmp {
+        /// 输入引用（恰 2 个）
         inputs: Vec<ComputeInput>,
+        /// 比较模式
         mode: StrcmpMode,
     },
     /// 数值比较（IEEE 754 双精度；1..=2 输入，单输入必带 threshold、双输入禁带）
     NumericCmp {
+        /// 输入引用（1..=2 个）
         inputs: Vec<ComputeInput>,
+        /// 比较模式
         mode: NumericCmpMode,
+        /// 单输入形态的阈值（双输入形态禁止携带）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         threshold: Option<f64>,
     },
     /// 正则匹配（恰 1 输入；pattern 加载期校验，非法即拒载）
     RegexMatch {
+        /// 输入引用（恰 1 个）
         inputs: Vec<ComputeInput>,
+        /// 正则 pattern（加载期编译校验）
         pattern: String,
     },
 }
@@ -195,12 +207,26 @@ pub struct Workflow {
 #[derive(Debug, Clone)]
 pub struct WorkflowEngine {
     ctx: DelegateContext,
+    /// 已成功完成节点计数（外层驱动 replan 预算 `nodes_executed` 累加源；
+    /// 交付物 6 §4.1，Phase 1-B 接线。compute 与 LLM 节点都计，跳过节点不计。
+    /// Arc 包装保 `Clone`（克隆共享同一计数器——同一驱动循环语义）
+    executed_nodes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WorkflowEngine {
     /// 创建工作流引擎
     pub fn new(ctx: DelegateContext) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            executed_nodes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// 累计已成功完成的节点数（跨多次 `execute` 调用累加；外层驱动 replan
+    /// 循环据此维护 `BudgetCounters.nodes_executed`，交付物 6 §4.1）
+    pub fn executed_nodes(&self) -> u64 {
+        self.executed_nodes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 只读访问内部 `DelegateContext`
@@ -280,6 +306,8 @@ impl WorkflowEngine {
                             "workflow compute node evaluated"
                         );
                         results.insert(node.id.clone(), output);
+                        self.executed_nodes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     None => llm_nodes.push(node),
                 }
@@ -316,6 +344,8 @@ impl WorkflowEngine {
                             "workflow node succeeded"
                         );
                         results.insert(node.id.clone(), content.clone());
+                        self.executed_nodes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1204,6 +1234,11 @@ mod tests {
             .await
             .expect("pure compute workflow must run");
         assert_eq!(out, "match");
+        // 节点计数器（Phase 1-B）：执行 a/c/d = 3，被跳过的 b 不计（交付物 6 §4.1）
+        assert_eq!(engine.executed_nodes(), 3);
+        // 跨 execute 累加（同一引擎再跑一次 → 6）
+        engine.execute(&wf).await.expect("second run");
+        assert_eq!(engine.executed_nodes(), 6);
     }
 
     // ===== validate =====

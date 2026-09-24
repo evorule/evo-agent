@@ -57,11 +57,8 @@ use clap::{Parser, Subcommand, ValueHint};
 
 use evo_agent::agent::definition::AgentDefinitionManager;
 use evo_agent::agent::delegate::DelegateContext;
-use evo_agent::agent::replan::{
-    lookup_agent_type, should_replan, BudgetCounters, BudgetThresholds, ReplanReason, ReplanState,
-};
+use evo_agent::agent::driver::{run_plan_loop, DriverLimits, PlanMode};
 use evo_agent::agent::runner::AgentRunner;
-use evo_agent::agent::workflow::WorkflowEngine;
 use evo_agent::api::agent_api::AgentApiState;
 use evo_agent::api::evorule_client::EvoruleApiClient;
 use evo_agent::api::workspace_client::WorkspaceApiClient;
@@ -178,6 +175,13 @@ enum Command {
     },
 
     /// G9:执行多 agent 工作流(DAG 编排,并行层 + 串行依赖)
+    ///
+    /// 默认:载入的 workflow 即 v1 计划直接执行;失败/预算触发 replan 时由
+    /// planner(agents/planner.json)产出 PlanFact v2+ 物化重跑(丢弃式,上限 3 次)。
+    ///
+    /// `--plan-execute`:plan-execute 模式——先执行载入的 planning probe DAG
+    /// (单 planner 节点,task = 研究目标),其输出解析为 PlanFact v1 物化执行
+    /// (纲领 Phase 1-D 交付物 4/5)。
     Workflow {
         /// 工作流 id(对应 `rules/workflows/<id>.json`)
         workflow_id: String,
@@ -193,6 +197,18 @@ enum Command {
         /// 并行子 agent 并发上限(默认 5,0 = 不限流)
         #[arg(long, default_value_t = 5)]
         max_concurrent: usize,
+
+        /// plan-execute 模式:先跑 planning probe DAG 产 PlanFact v1
+        #[arg(long)]
+        plan_execute: bool,
+
+        /// replan 硬上限(交付物 6 §5.2,纲领拍板默认 3)
+        #[arg(long, default_value_t = 3)]
+        max_replan: u32,
+
+        /// 墙钟预算毫秒(默认 1,800,000 = 30 分钟,交付物 6 §5.2)
+        #[arg(long, default_value_t = 1_800_000)]
+        max_wall_ms: u64,
     },
 
     /// G15:REPL 交互模式(对话式,复用同一 evorule session)
@@ -326,12 +342,22 @@ fn main() -> ExitCode {
             dir,
             max_depth,
             max_concurrent,
+            plan_execute,
+            max_replan,
+            max_wall_ms,
         } => cmd_workflow(
             &cli.workdir,
             &workflow_id,
             dir.as_deref(),
             max_depth,
             max_concurrent,
+            WorkflowRunOpts {
+                plan_execute,
+                limits: DriverLimits {
+                    max_replan,
+                    max_wall_ms: Some(max_wall_ms),
+                },
+            },
         ),
         Command::Repl {
             agent,
@@ -1859,13 +1885,22 @@ async fn shutdown_signal() {
 }
 
 // =============================================================================
-// workflow —— G9:多 agent 工作流(DAG 编排)
+// workflow —— G9:多 agent 工作流(DAG 编排) + plan-execute 外层驱动
 // =============================================================================
 
-/// G9:执行多 agent 工作流
+/// workflow 子命令驱动参数（CLI 装配；阈值禁入 PlanFact，交付物 6 §5.1）
+struct WorkflowRunOpts {
+    /// plan-execute 模式（先跑 planning probe DAG 产 PlanFact v1）
+    plan_execute: bool,
+    /// 驱动限额（replan 硬上限 + 墙钟预算）
+    limits: DriverLimits,
+}
+
+/// G9:执行多 agent 工作流(DAG 编排)
 ///
 /// 从 `rules/workflows/<id>.json` 加载工作流定义,拓扑排序后逐层并行执行,
 /// 把上游节点结果填入下游 `task_template`,最终输出 `output_node` 的结果。
+/// 失败/预算触发 replan 时由 planner 产 PlanFact v2+ 物化重跑(丢弃式)。
 ///
 /// # 子 agent 配置
 ///
@@ -1873,13 +1908,14 @@ async fn shutdown_signal() {
 /// + `LlmHandler::with_defaults()`(读环境变量 API key)。因此执行前需确保:
 /// - evorule server 可达(`config.evorule.base_url`)
 /// - LLM API key 环境变量已设置(`MINIMAX_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`)
-/// - 各 `agent_type` 对应的 `agents/<type>.json` 已定义
+/// - 各 `agent_type` 对应的 `agents/<type>.json` 已定义(replan/plan-execute 需 `planner`)
 fn cmd_workflow(
     workdir: &Path,
     workflow_id: &str,
     dir: Option<&Path>,
     max_depth: usize,
     max_concurrent: usize,
+    opts: WorkflowRunOpts,
 ) -> ExitCode {
     // 1. 加载配置(宽松模式:workflow 子命令需要 evorule base_url + agents dir)
     let config = match evo_agent::config::Config::load_lenient(workdir) {
@@ -1958,7 +1994,9 @@ fn cmd_workflow(
         ctx = ctx.with_max_concurrent_delegates(max_concurrent);
     }
 
-    // 5. 执行(current_thread runtime:async I/O 并发足够,与 cmd_run 一致)
+    // 5. 外层驱动循环(Phase 1-B:execute → should_replan → planner 产 PlanFact
+    //    v(n+1) → 物化 → 全新 execute;丢弃式 D-02,纲领 §9.4)
+    //    current_thread runtime:async I/O 并发足够,与 cmd_run 一致
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1970,62 +2008,27 @@ fn cmd_workflow(
         }
     };
 
-    let engine = WorkflowEngine::new(ctx);
-    let started = std::time::Instant::now();
-    let result = runtime.block_on(engine.execute(&wf));
-    let wall_ms = started.elapsed().as_millis() as u64;
-
-    // replan 触发判定骨架(交付物 6 §2;T4 骨架:失败/预算触发路径先通,
-    // 外层驱动循环重调 planner 产 v2 属 Phase 1-B——骨架阶段输出决策并以非零码退出)
-    // nodes_executed 真实累加来源 = 外层驱动循环的节点完成事件(Phase 1-B),骨架置 0;
-    // tokens_used MVP 恒 0(交付物 6 §4.1,Phase 2 埋点)
-    let counters = BudgetCounters {
-        nodes_executed: 0,
-        wall_ms,
-        tokens_used: 0,
+    let mode = if opts.plan_execute {
+        PlanMode::PlanExecute
+    } else {
+        PlanMode::Dsl
     };
-    let thresholds = BudgetThresholds::defaults(wf.nodes.len());
-    let replan_state = ReplanState {
-        current_version: 1,
-        replan_count: 0,
-    };
-    if let Some(decision) = should_replan(&result, &counters, &thresholds, &replan_state) {
-        match decision.reason {
-            ReplanReason::Failure => {
-                let mut record = decision
-                    .failure_record
-                    .expect("failure decision carries record");
-                if let Some(node_id) = &record.failed_node_id {
-                    record.agent_type = lookup_agent_type(&wf.nodes, node_id);
-                }
-                eprintln!(
-                    "\nreplan triggered (failure): node={:?} agent={:?} plan_version={} \
-                     (replan driver loop lands in Phase 1-B)",
-                    record.failed_node_id, record.agent_type, record.failed_plan_version
-                );
-            }
-            ReplanReason::Budget => {
-                let snap = decision
-                    .budget_snapshot
-                    .expect("budget decision carries snapshot");
-                eprintln!(
-                    "\nreplan triggered (budget): nodes={} wall_ms={} tokens={} \
-                     (replan driver loop lands in Phase 1-B)",
-                    snap.nodes_executed, snap.wall_ms, snap.tokens_used
-                );
-            }
-        }
-        return ExitCode::from(1);
-    }
+    // Dsl v1 计划形态 hash 锚 = workflow 文件原文 BLAKE3(交付物 6 §3.1 failed_plan_hash)
+    let seed_hash = blake3::hash(wf_content.as_bytes()).to_hex().to_string();
 
-    match result {
-        Ok(content) => {
-            eprintln!("\n=== workflow '{}' done ===", wf.workflow_id);
-            println!("{}", content);
+    let outcome = runtime.block_on(run_plan_loop(ctx, wf, mode, opts.limits, Some(seed_hash)));
+
+    match outcome {
+        Ok(o) => {
+            eprintln!(
+                "\n=== workflow '{}' done (plan_versions={} replans={} nodes_executed={} wall_ms={}) ===",
+                workflow_id, o.stats.plan_versions, o.stats.replans, o.stats.nodes_executed, o.stats.wall_ms
+            );
+            println!("{}", o.content);
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("\nworkflow '{}' failed: {}", wf.workflow_id, e);
+            eprintln!("\nworkflow '{}' failed: {}", workflow_id, e);
             ExitCode::from(1)
         }
     }

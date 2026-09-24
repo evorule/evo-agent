@@ -1,0 +1,14 @@
+{
+  "workflow_id": "research_plan",
+  "description": "plan-execute planning probe：单 planner 节点，输出 PlanFact v1（--plan-execute 模式入口）",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "planner",
+      "agent_type": "planner",
+      "task": "Goal: research the topic 'evorule deterministic workflow engine design' and produce a research digest. Produce a PlanFact JSON for this goal: 2-4 llm nodes with agent_type \"researcher\" (collect key facts, then synthesize a structured digest), exactly one sink node. Output ONLY the PlanFact JSON object.",
+      "depends_on": []
+    }
+  ],
+  "output_node": "planner"
+}
