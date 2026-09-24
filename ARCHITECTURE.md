@@ -68,7 +68,9 @@ evorule 引擎执行规则前必须加载一份 rule_set 作为运行宪法。**
 | **AgentDefinitionManager** | `src/agent/definition.rs` | 从 `agent.json` 加载 Agent 定义 |
 | **ToolRegistry / ToolHandler** | `src/agent/tool_registry.rs` / `src/io_handlers/tool_handler.rs` | 工具注册中心 + 动态调度 |
 | **DelegateContext** | `src/agent/delegate.rs` | Agent 嵌套(深度 + 并发限流) |
-| **WorkflowEngine** | `src/agent/workflow.rs` | DAG 拓扑编排多 agent |
+| **WorkflowEngine** | `src/agent/workflow.rs` | DAG 拓扑编排多 agent（含 compute 纯函数节点内联求值） |
+| **WorkflowMaterializer** | `src/agent/materializer.rs` | workflow_dag v1.2 物化器:loop 静态展开为线性副本链（纯函数,同输入必同输出） |
+| **Replan** | `src/agent/replan.rs` | replan 触发判定纯函数 + 失败摘要/预算计数器结构（plan-execute 方案 D） |
 | **ContextWindowManager** | `src/agent/context_window.rs` | Token 计数 + 消息裁剪 |
 | **OutputValidator** | `src/agent/output_validator.rs` | LLM 输出 JSON Schema 校验 |
 | **MemoryEventStore** | `src/agent/memory_event/store.rs` | 结构化记忆事件 + 因果链 |
@@ -176,10 +178,32 @@ DAG(有向无环图)拓扑编排多 agent,用 JSON DSL 定义:
 
 **执行算法**:
 1. 拓扑排序(Kahn 分层):按 `depends_on` 把节点分成若干层,同层无互相依赖
-2. 逐层执行:同层节点并行(`delegate_parallel`)
-3. 模板渲染:下一层的 `task_template` 中 `{node_id}` 被上游结果替换
-4. 任一节点失败 → 整个工作流终止,返回 `Err`
-5. 返回 `output_node` 的结果
+2. 逐层规划:声明 `run_when`(v1.1 条件分支)的节点按条件求值决定去留(豁免级联);
+   未声明的节点任一直接依赖被跳过即级联跳过
+3. 逐层执行:同层 LLM/工具节点并行(`delegate_parallel`);`compute` 节点(v1.2)
+   在层循环内**同步内联求值**——不经 delegate(不占并发槽/不耗深度/无 IoRequest),
+   封闭目录三函数 `strcmp` / `numeric_cmp` / `regex_match`,纯函数同输入必同输出
+4. 模板渲染:下一层的 `task_template` 中 `{node_id}` 被上游结果替换
+5. 任一执行中节点失败 → 整个工作流终止,返回 `Err`
+6. 返回 `output_node` 的结果
+
+**workflow_dag v1.2(有界循环 + 纯函数节点)**:
+
+顶层可选 `loops` 声明有界循环(`max_iterations` 静态上界 1..=32,`body` 1..=8 节点);
+加载阶段由**物化器**(`src/agent/materializer.rs`,纯函数)把循环体静态展开为线性
+副本链(命名 `{loop_id}_iter{k}_{node_id}`),展开后仍是纯 DAG,Kahn 拓扑与环检测
+照常工作。跨迭代引用文法:`prev.X`(上一迭代)/`{loop_id}_iter{k}_{node_id}`(展开
+全名);iter0 的 `prev.X` 在三消费面(模板占位符/compute inputs/run_when 观察)统一
+消解为空串语义。加载统一走 `constitution::load_workflow`:schema 校验 → v1.2 物化
+/ v1.0-v1.1 直接反序列化。
+
+**replan 触发判定(`src/agent/replan.rs`,plan-execute 方案 D)**:
+
+工作流执行失败或预算耗尽时,外层驱动按纯函数 `should_replan` 判定是否触发
+replan(重调 planner 产出下一版计划)。判定顺序写死:replan 硬上限(默认 3)→
+失败优先 → 预算任一维度(节点数/墙钟/token)达到阈值。阈值来自驱动配置
+(禁止进 PlanFact);失败摘要与预算快照为应用层内存结构,仅随 replan 摘要间接
+入链,零新增 Fact 类型。外层驱动循环(重调 planner 产 v2)属 Phase 1-B。
 
 ---
 

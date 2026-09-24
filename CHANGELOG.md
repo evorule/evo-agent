@@ -38,6 +38,13 @@
 
 ### 🆕 新增
 
+#### workflow_dag v1.2 动态循环基座（plan-execute 方案 D Phase 1-A）
+- **workflow_dag v1.2 物化器（`src/agent/materializer.rs`）** — 纯函数物化器：把 v1.2 文档（手写 DSL 形态与 PlanFact 形态归一化）静态展开为线性 DAG——顶层 `loops` 循环体按 `{loop_id}_iter{k}_{node_id}` 展开为副本链（`max_iterations` 1..=32、`body` 1..=8、loops ≤ 8、展开前 ≤ 64、展开后 ≤ 512，冻结限额校验）；跨迭代引用文法 R1–R4 三消费面（模板占位符/compute inputs/run_when 观察）共用同一分类器，iter0 的 `prev.X` 统一消解为空串语义；跨迭代隐式依赖逐节点全连；展开后自检（id 唯一/引用存在性/拓扑层序/无环）；同输入必同输出（字节级确定性测试锁定）
+- **`constitution::load_workflow` 统一加载入口** — schema 校验 → v1.2 物化 / v1.0-v1.1 直接反序列化；v1.2 防呆拒载门翻转为「schema + 物化」双门（引擎 loop/compute 能力已落地，物化门保证 v1.2 增量语义被真正消费而非被 serde 静默忽略）；`workflow` 子命令切换至该入口
+- **compute 纯函数节点（workflow.rs）** — 封闭目录三函数 `strcmp`（equal|different / contained|not_contained）/ `numeric_cmp`（true|false，IEEE 754，解析失败 = 节点失败无静默回退）/ `regex_match`（match|no_match，pattern 加载期校验）；execute 层循环内同步内联求值——不经 delegate（不占并发槽/不耗 max_depth/无会话/无 IoRequest），结果与 LLM 节点同表同构（run_when 观察/占位符渲染/下游 compute 级联三面消费）；validate 层封闭目录代码校验（输入数量/threshold 互斥/pattern 编译/引用存在性）+ 层序检查（输入仅可引用更早拓扑层）
+- **replan 触发判定（`src/agent/replan.rs`，骨架）** — 纯函数 `should_replan` 判定序写死（replan 硬上限默认 3 → 失败优先 → 预算任一维度达到阈值）；`WorkflowFailureRecord` 失败摘要（Err 文本纯函数解析失败节点 id）+ `BudgetCounters` 预算计数器（tokens_used MVP 恒 0）+ `BudgetThresholds` 阈值（来自驱动配置禁止进 PlanFact，动态默认 max_nodes = 展开后节点数 × 2）；`workflow` 子命令接线失败/预算触发路径，外层驱动循环（重调 planner 产 v2）属 Phase 1-B；零新增 Fact 类型
+- **workflow_dag v1.1 `run_when` 条件分支补记** — v1.1 节点级条件分支（求值为假跳过、豁免级联、空观察源语义）此前未入 CHANGELOG，随本批一并补记
+
 #### IDE 工作台（Web IDE 前端，Trae 式布局）
 - **内置 IDE 工作台**（`web/`，Svelte 5 + Vite 5 + Monaco Editor）— serve 直接托管（API 路由外层 fallback 到 `web/dist`，SPA 缺省回退 index.html）：左活动栏+文件树面板（S0 静态占位）、中编辑器群（Monaco 欢迎页验证内核与主题集成）、右对话侧栏（WS 双向流直连 agent 会话，真实模型流式回复 + 工具调用摘要卡 + 审批卡展示）、底部审计抽屉（默认收起占位）。设计 token 全量提取自 console-cloud 设计系统 v3.0（Docker 风格深色主题，字体/色板/间距/圆角/阴影逐项一致）；未构建前端时自动降级纯 API 模式
 - **`tower-http` 新增 `fs` feature**（ServeDir/ServeFile 静态托管依赖）；工作台静态资源不经过 API 面鉴权中间件（页面须无 token 可打开），API 与 WS 面鉴权口径不变

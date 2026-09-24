@@ -278,6 +278,13 @@ evo-agent replay --session 123 --narrate
 evo-agent workflow research_and_write
 ```
 
+工作流 DSL 支持 workflow_dag v1.0/v1.1/v1.2 三版本并存（按文档形态自动分派）：
+v1.1 节点级条件分支 `run_when`（求值为假跳过，豁免级联）；v1.2 新增有界循环
+`loops`（加载时静态展开为线性副本链，展开后仍是纯 DAG）与纯函数节点 `compute`
+（封闭目录 `strcmp`/`numeric_cmp`/`regex_match`，不经 LLM、无 IO、无副作用，
+典型用法为循环收敛门控：结果与上一轮一致即提前退出）。执行失败或预算耗尽时
+按 replan 判定函数决定是否触发重规划（外层驱动循环属后续版本）。
+
 ---
 
 ## Agent 定义
@@ -619,7 +626,9 @@ evo-agent/
 │   │   ├── tool_registry.rs         # 工具注册中心
 │   │   ├── translator.rs            # LLM 响应解析
 │   │   ├── delegate.rs              # Agent 嵌套上下文
-│   │   ├── workflow.rs              # DAG 工作流引擎
+│   │   ├── workflow.rs              # DAG 工作流引擎(compute 纯函数节点内联求值)
+│   │   ├── materializer.rs          # workflow_dag v1.2 物化器(loop 静态展开)
+│   │   ├── replan.rs                # replan 触发判定纯函数 + 预算结构
 │   │   ├── context_window.rs        # 上下文窗口裁剪
 │   │   ├── summarizer.rs            # 会话摘要
 │   │   ├── sediment.rs              # 会话沉淀通道

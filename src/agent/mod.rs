@@ -10,9 +10,11 @@ pub mod constitution;
 pub mod context_window;
 pub mod definition;
 pub mod delegate;
+pub mod materializer;
 pub mod memory;
 pub mod memory_event;
 pub mod output_validator;
+pub mod replan;
 pub mod runner;
 pub mod safety_auditor;
 pub mod sediment;
@@ -34,11 +36,16 @@ pub use definition::{
     AgentDefinition, AgentDefinitionError, AgentDefinitionManager, MemoryConfig, OutputFormat,
 };
 pub use delegate::{DelegateContext, DEFAULT_MAX_CONCURRENT_DELEGATES};
+pub use materializer::{materialize_plan_fact, materialize_workflow_dag, MATERIALIZER_VERSION};
 pub use memory::{MemoryError, MemoryManager};
 pub use memory_event::{
     Emotion, EmotionSubject, Entity, EntityIndex, EntityRef, EntityStatus, EntityType,
     EventExtractor, EventSource, EventType, ExtractionConfig, ExtractionTrigger, FactId,
     MemoryEvent, MemoryEventStore, Narrative, ReplayDirection, ReplayEngine, StoreError,
+};
+pub use replan::{
+    should_replan, BudgetCounters, BudgetThresholds, ReplanDecision, ReplanReason, ReplanState,
+    WorkflowFailureRecord,
 };
 pub use runner::{
     merge_delegate_tool, AgentConfig, AgentError, AgentEvent, AgentResult, AgentRunner,
@@ -46,4 +53,4 @@ pub use runner::{
 };
 pub use tool_registry::{ToolRegistry, ToolSpec};
 pub use translator::{LlmResponse, Message, ToolCall};
-pub use workflow::{Workflow, WorkflowEngine, WorkflowNode};
+pub use workflow::{ComputeInput, ComputeSpec, Workflow, WorkflowEngine, WorkflowNode};

@@ -57,6 +57,9 @@ use clap::{Parser, Subcommand, ValueHint};
 
 use evo_agent::agent::definition::AgentDefinitionManager;
 use evo_agent::agent::delegate::DelegateContext;
+use evo_agent::agent::replan::{
+    lookup_agent_type, should_replan, BudgetCounters, BudgetThresholds, ReplanReason, ReplanState,
+};
 use evo_agent::agent::runner::AgentRunner;
 use evo_agent::agent::workflow::WorkflowEngine;
 use evo_agent::api::agent_api::AgentApiState;
@@ -1915,21 +1918,16 @@ fn cmd_workflow(
         }
     };
 
-    // 3.5 宪法 jsonschema 全量校验(M7-B2;workflow_dag v1.0/v1.1 按文档形态分派,
-    //     找不到 schema 时 fail-fast 拒载,tracing 留痕)
-    if let Err(violations) = evo_agent::agent::constitution::validate_workflow_dag(&wf_value) {
-        eprintln!(
-            "workflow '{}' violates constitution schema (workflow_dag): {}",
-            workflow_id,
-            violations.join("; ")
-        );
-        return ExitCode::from(1);
-    }
-
-    let wf: Workflow = match serde_json::from_value(wf_value) {
+    // 3.5 校验并加载(宪法 jsonschema 全量校验 + v1.2 物化 / v1.0-v1.1 反序列化;
+    //     workflow_dag v1.0/v1.1/v1.2 按文档形态分派,失败 fail-fast 拒载)
+    let wf: Workflow = match evo_agent::agent::constitution::load_workflow(&wf_value) {
         Ok(w) => w,
-        Err(e) => {
-            eprintln!("failed to parse workflow '{}': {}", workflow_id, e);
+        Err(violations) => {
+            eprintln!(
+                "workflow '{}' failed constitution validation/materialization (workflow_dag): {}",
+                workflow_id,
+                violations.join("; ")
+            );
             return ExitCode::from(1);
         }
     };
@@ -1973,7 +1971,52 @@ fn cmd_workflow(
     };
 
     let engine = WorkflowEngine::new(ctx);
+    let started = std::time::Instant::now();
     let result = runtime.block_on(engine.execute(&wf));
+    let wall_ms = started.elapsed().as_millis() as u64;
+
+    // replan 触发判定骨架(交付物 6 §2;T4 骨架:失败/预算触发路径先通,
+    // 外层驱动循环重调 planner 产 v2 属 Phase 1-B——骨架阶段输出决策并以非零码退出)
+    // nodes_executed 真实累加来源 = 外层驱动循环的节点完成事件(Phase 1-B),骨架置 0;
+    // tokens_used MVP 恒 0(交付物 6 §4.1,Phase 2 埋点)
+    let counters = BudgetCounters {
+        nodes_executed: 0,
+        wall_ms,
+        tokens_used: 0,
+    };
+    let thresholds = BudgetThresholds::defaults(wf.nodes.len());
+    let replan_state = ReplanState {
+        current_version: 1,
+        replan_count: 0,
+    };
+    if let Some(decision) = should_replan(&result, &counters, &thresholds, &replan_state) {
+        match decision.reason {
+            ReplanReason::Failure => {
+                let mut record = decision
+                    .failure_record
+                    .expect("failure decision carries record");
+                if let Some(node_id) = &record.failed_node_id {
+                    record.agent_type = lookup_agent_type(&wf.nodes, node_id);
+                }
+                eprintln!(
+                    "\nreplan triggered (failure): node={:?} agent={:?} plan_version={} \
+                     (replan driver loop lands in Phase 1-B)",
+                    record.failed_node_id, record.agent_type, record.failed_plan_version
+                );
+            }
+            ReplanReason::Budget => {
+                let snap = decision
+                    .budget_snapshot
+                    .expect("budget decision carries snapshot");
+                eprintln!(
+                    "\nreplan triggered (budget): nodes={} wall_ms={} tokens={} \
+                     (replan driver loop lands in Phase 1-B)",
+                    snap.nodes_executed, snap.wall_ms, snap.tokens_used
+                );
+            }
+        }
+        return ExitCode::from(1);
+    }
 
     match result {
         Ok(content) => {

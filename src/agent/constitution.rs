@@ -6,8 +6,9 @@
 //! 判定代码已收编至 [`evorule-constitution`] 共享组件（0.2.0：schema 编译期
 //! 内嵌 + `Policy` 双模式降级策略，缺省 Strict）。属地执法义务要求判定代码
 //! 必须是组件、禁止复制第二份——本模块自此只是**接入层**：
-//! - workflow_dag 双版本分派（按文档形态分派，见 [`detect_workflow_dag_version`]）
+//! - workflow_dag 三版本分派（按文档形态分派，见 [`detect_workflow_dag_version`]）
 //! - 校验结果形态转换（组件 `Violation` → 本仓 `Vec<String>`）
+//! - 统一加载入口 [`load_workflow`]（schema 校验 → v1.2 物化 / v1.0-v1.1 反序列化）
 //!
 //! 组件以内嵌 schema + 缺省 Strict 运行：v1.x schema 编译期随组件携带，
 //! 部署/CI 零磁盘依赖，「宪法仓不可得」的整类环境缺陷不再存在；未知
@@ -19,6 +20,9 @@
 use std::sync::OnceLock;
 
 use evorule_constitution::Constitution;
+
+use crate::agent::materializer;
+use crate::agent::workflow::Workflow;
 
 /// 进程级宪法校验器（组件内嵌模式 + 缺省 Strict 策略）
 fn constitution() -> &'static Constitution {
@@ -69,24 +73,36 @@ fn detect_workflow_dag_version(body: &serde_json::Value) -> &'static str {
 ///
 /// 按 [`detect_workflow_dag_version`] 分派 v1.0/v1.1/v1.2 校验器（三版本并存窗口）。
 ///
-/// **v1.2 防呆门**：宪法 v1.2 schema 已可用，但工作流引擎尚不支持 v1.2 执行能力
-/// （loop 静态展开 / compute 节点分派未实现）——若放行，反序列化会静默忽略
-/// `loops`/`compute` 字段导致错误执行。故 v1.2 文档通过 schema 校验后仍显式
-/// 拒载；引擎实现落地后移除本门。
+/// **v1.2 物化门**（原防呆拒载门，引擎 loop/compute 能力落地后翻转）：
+/// v1.2 文档通过 schema 校验后还须通过物化器 [`materializer::materialize_workflow_dag`]
+/// 的静态展开自检（引用文法 R1–R4、冻结限额、展开后 DAG 合法性）——
+/// `serde_json::from_value` 会静默忽略 `loops` 字段，物化门保证 v1.2 增量
+/// 语义被真正消费而非静默丢弃。
 pub fn validate_workflow_dag(body: &serde_json::Value) -> Result<(), Vec<String>> {
     let version = detect_workflow_dag_version(body);
-    let result = validate_kind_version("workflow_dag", version, body);
+    validate_kind_version("workflow_dag", version, body)?;
     if version == "v1.2" {
-        return result.and_then(|_| {
-            Err(vec![
-                "workflow_dag v1.2 已通过宪法 schema 校验，但引擎尚不支持 v1.2 执行能力\
-                 （loop 静态展开 / compute 节点分派未实现）；为避免 loops/compute 被\
-                 静默忽略而错误执行，拒绝加载。"
-                    .to_string(),
-            ])
-        });
+        // schema 已过；物化成功 = v1.2 增量语义可被完整消费
+        materializer::materialize_workflow_dag(body).map(|_| ())
+    } else {
+        Ok(())
     }
-    result
+}
+
+/// 校验并加载 workflow_dag 裸文档为可执行 [`Workflow`]。
+///
+/// 统一入口（v1.0/v1.1/v1.2 三版本并存）：
+/// - schema 校验（宪法内嵌 Strict）→ 失败即 Err
+/// - v1.2 → 物化器静态展开（loop 展开为线性副本链 + compute 节点就位）
+/// - v1.0/v1.1 → 直接反序列化
+pub fn load_workflow(body: &serde_json::Value) -> Result<Workflow, Vec<String>> {
+    let version = detect_workflow_dag_version(body);
+    validate_kind_version("workflow_dag", version, body)?;
+    match version {
+        "v1.2" => materializer::materialize_workflow_dag(body),
+        _ => serde_json::from_value(body.clone())
+            .map_err(|e| vec![format!("workflow_dag {version} 文档反序列化失败: {e}")]),
+    }
 }
 
 fn validate_kind_version(
@@ -261,29 +277,47 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_workflow_v12_guard_rejects_before_engine_support() {
-        // v1.2 文档即使通过 schema 校验也显式拒载（引擎 loop/compute 能力未落地，
-        // 防 serde 静默忽略字段导致错误执行）
+    fn test_validate_workflow_v12_materializes_after_engine_support() {
+        // v1.2 物化门翻转：schema + 物化双门通过即放行（loop 展开为副本链）
         let doc = serde_json::json!({
             "workflow_id": "w",
-            "nodes": [{"id": "a", "agent_type": "researcher", "task": "t"}],
+            "nodes": [
+                {"id": "a", "agent_type": "researcher", "task": "t",
+                 "depends_on": ["lp_iter1_s"]}
+            ],
             "loops": [{"id": "lp", "max_iterations": 2, "body": [
                 {"id": "s", "agent_type": "researcher", "task": "t"}
             ]}],
             "output_node": "a"
         });
         assert_eq!(detect_workflow_dag_version(&doc), "v1.2");
-        let errs =
-            validate_workflow_dag(&doc).expect_err("v1.2 must be rejected before engine support");
         assert!(
-            errs.iter().any(|e| e.contains("尚不支持 v1.2")),
-            "拒载消息须说明引擎能力未落地: {errs:?}"
+            validate_workflow_dag(&doc).is_ok(),
+            "v1.2 通过 schema + 物化双门后必须放行"
         );
+        // load_workflow：v1.2 走物化器，loop 展开为 {loop_id}_iter{k}_{node_id} 副本链
+        // （展开序 = 规格步骤 2→3：全局节点在前，循环副本在后）
+        let wf = load_workflow(&doc).expect("v1.2 must materialize");
+        let ids: Vec<&str> = wf.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "lp_iter0_s", "lp_iter1_s"]);
+    }
+
+    #[test]
+    fn test_load_workflow_v10_v11_direct_deserialize() {
+        // load_workflow 对 v1.0/v1.1 = schema 校验 + 直接反序列化（不物化）
+        let v10 = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [{"id": "a", "agent_type": "researcher", "task": "t"}],
+            "output_node": "a"
+        });
+        let wf = load_workflow(&v10).expect("v1.0 must load directly");
+        assert_eq!(wf.nodes.len(), 1);
+        assert_eq!(wf.output_node, "a");
     }
 
     #[test]
     fn test_validate_workflow_v12_schema_errors_surface() {
-        // v1.2 schema 违规优先于防呆门消息（compute 节点带 agent_type 应报 schema 违规）
+        // v1.2 schema 违规直接浮出（compute 节点带 agent_type 应报 schema 违规）
         let bad = serde_json::json!({
             "workflow_id": "w",
             "nodes": [
@@ -293,10 +327,7 @@ mod tests {
             "output_node": "c"
         });
         let errs = validate_workflow_dag(&bad).expect_err("schema violation must reject");
-        assert!(
-            errs.iter().any(|e| !e.contains("尚不支持 v1.2")),
-            "应报 schema 违规而非防呆门消息: {errs:?}"
-        );
+        assert!(!errs.is_empty(), "应报 schema 违规而非静默放行: {errs:?}");
     }
 
     #[test]
