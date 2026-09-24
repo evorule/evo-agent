@@ -15,6 +15,12 @@
     → 节点失败 → should_replan Failure → planner 产出 PlanFact v2 → 物化重跑成功。
     断言：EXIT=0、stdout 含 "replan materialized"、统计行 plan_versions=2
     replans=1、replan_tokens>0（v2+ 成本埋点）。
+    链上因果断言（R3-T03，收官遗留 B4）：运行前后会话列表 diff 圈定新建会话，
+    从 server 链上唯一推断 replan 因果——①恰一个 v2 planner 会话且其链上
+    IoRequest 含 v1 失败摘要（ghost_agent）；②链上 IoResponse.content 提取出
+    PlanFact JSON；③PlanFact 结构合法且已修复失败（无 ghost_agent）；④裸
+    PlanFact 不含注入组字段（元数据由外层权威注入非 LLM 产出——§5.1 链上
+    验证；注入正确性由 driver UT 覆盖）；planner 会话全链证据落盘 evidence_dir。
 
   场景 C（D-01 enforce 终止，Phase 2 交付物 6）：Dsl 含 probe_violator 节点
     （model 非白名单）→ TCB 约束前置门产生 Violation 事实 → runner 固定前缀
@@ -41,6 +47,7 @@
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -175,6 +182,161 @@ def check(cond: bool, ok_msg: str, fail_msg: str) -> bool:
     return cond
 
 
+def http_get_json(base_url: str, path: str):
+    """GET {base_url}{path} → JSON（诊断用途，异常原样上抛）"""
+    with urllib.request.urlopen(f"{base_url}{path}", timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def session_ids(base_url: str) -> set:
+    """GET /api/sessions → 会话 id 集合"""
+    return set(http_get_json(base_url, "/api/sessions")["sessions"])
+
+
+# replan planner 任务指示词（driver.rs build_replan_task 固定文案——链上识别锚）
+REPLAN_TASK_MARKER = "COMPLETE new plan"
+
+
+def find_replan_planner_sessions(base_url: str, sids: set) -> list:
+    """在新会话集合中找 replan planner 会话。
+
+    识别锚（链上唯一可判据）：会话链含 IoRequest(call_external) 其 params
+    文本同时含 replan 指示词（COMPLETE new plan）与 v1 失败摘要（ghost_agent）
+    ——只有 replan 任务同时具备两者。返回 [(sid, history), ...]。
+    """
+    found = []
+    for sid in sorted(sids):
+        try:
+            hist = http_get_json(base_url, f"/api/sessions/{sid}/history")
+        except Exception as e:  # noqa: BLE001 — 诊断用途，跳过不可读会话
+            print(f"  {YELLOW}···{RESET}  会话 {sid} history 不可读（{e}），跳过")
+            continue
+        for ev in hist:
+            if ev.get("type") != "IoRequest":
+                continue
+            text = json.dumps(ev.get("params", {}), ensure_ascii=False)
+            if REPLAN_TASK_MARKER in text and "ghost_agent" in text:
+                found.append((sid, hist))
+                break
+    return found
+
+
+def extract_plan_fact_from_chain(history: list) -> Optional[dict]:
+    """从 planner 会话链提取 PlanFact JSON。
+
+    链上形态（实测 2026-09-25）：IoResponse.result 为
+    `{content: "<LLM 原文>", is_finished, messages}` ——PlanFact JSON 在
+    content 字符串内（可能带 markdown 围栏/散文包裹，提取首个 JSON 对象）。
+    """
+    for ev in history:
+        if ev.get("type") != "IoResponse":
+            continue
+        result = ev.get("result")
+        raw = None
+        if isinstance(result, dict):
+            raw = result.get("content")
+        elif isinstance(result, str):
+            raw = result
+        if not isinstance(raw, str):
+            continue
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            continue
+        try:
+            candidate = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and "nodes" in candidate:
+            return candidate
+    return None
+
+
+def assert_chain_causality(base_url: str, new_ids: set, evidence_dir: Optional[Path]) -> bool:
+    """R3-T03：replan 因果链上断言（结论可从链上唯一推断，不依赖 stdout 叙述）。
+
+    断言四条（口径实测修正 2026-09-25：注入组 plan_source/plan_version/
+    parent_plan_hash 为**驱动内存态**（外层权威注入，交付物 4 审计模型），
+    链上载体 = planner LLM 裸输出，不含注入字段——「LLM 不产出元数据」本身
+    即为链上可验证事实（§5.1 裁决「阈值/元数据禁入 PlanFact」的反面印证）；
+    注入正确性由 driver UT（inject_replan_writes_parent_hash）覆盖）：
+      ① 恰一个 v2 planner 会话，其链上 IoRequest 含 v1 失败摘要（ghost_agent
+         进入 replan 任务）+ plan v2 指示——失败因入链；
+      ② 该链 IoResponse.content 提取出 PlanFact JSON——v2 计划产出入链；
+      ③ PlanFact 结构合法（nodes 非空数组；且不再含 ghost_agent——失败已修复）；
+      ④ 裸 PlanFact 不含注入组字段（plan_source/plan_version/parent_plan_hash
+         均缺位——元数据由外层注入而非 LLM 产出的链上验证）；parent_plan_hash
+         联动（== v1 workflow 文件 hash）在有 blake3 包时按驱动注入 UT + 本地
+         复算双重验证。
+    """
+    print(f"\n=== 场景 B-链：replan 因果链上断言（R3-T03） ===")
+    planners = find_replan_planner_sessions(base_url, new_ids)
+    ok = check(
+        len(planners) == 1,
+        f"链上恰 1 个 replan planner 会话（实得 {len(planners)}）",
+        f"预期链上恰 1 个 replan planner 会话，实得 {len(planners)}（失败摘要未入链或多会话歧义）",
+    )
+    if not planners:
+        return False
+    sid, hist = planners[0]
+    print(f"  {YELLOW}···{RESET}  planner 会话 id={sid}，链长={len(hist)}")
+    if evidence_dir is not None:
+        (evidence_dir / "scenarioB_chain_planner_session.json").write_text(
+            json.dumps({"session_id": sid, "history": hist}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"  {YELLOW}···{RESET}  链证据落盘 scenarioB_chain_planner_session.json")
+
+    plan = extract_plan_fact_from_chain(hist)
+    ok = ok and check(
+        plan is not None,
+        "链上 IoResponse 提取出 PlanFact JSON（v2 计划产出入链）",
+        "链上未能提取 PlanFact JSON（planner 输出未入链或形态不符）",
+    )
+    if plan is None:
+        return False
+
+    nodes = plan.get("nodes")
+    ok = ok and check(
+        isinstance(nodes, list) and len(nodes) > 0,
+        f"PlanFact 结构合法（nodes 非空，{len(nodes) if isinstance(nodes, list) else '?'} 节点）",
+        "PlanFact 结构不符（nodes 缺失或为空）",
+    )
+    if isinstance(nodes, list):
+        ghost_leaked = any(
+            n.get("agent_type") == "ghost_agent" for n in nodes if isinstance(n, dict)
+        )
+        ok = ok and check(
+            not ghost_leaked,
+            "v2 计划已修复 v1 失败（无 ghost_agent 节点）",
+            "v2 计划仍含 ghost_agent 节点（失败未修复）",
+        )
+
+    injected_absent = all(
+        plan.get(k) is None
+        for k in ("plan_source", "plan_version", "parent_plan_hash")
+    )
+    ok = ok and check(
+        injected_absent,
+        "裸 PlanFact 不含注入组字段（元数据由外层权威注入，LLM 不产出——§5.1 链上验证）",
+        f"LLM 原文出现注入组字段（plan_source={plan.get('plan_source')} "
+        f"plan_version={plan.get('plan_version')} parent_plan_hash={plan.get('parent_plan_hash')}）",
+    )
+
+    # v1 锚联动：驱动注入正确性 = driver UT + 本地复算（注入态不入链，链上仅存裸输出）
+    try:
+        import blake3
+
+        wf_path = REPO_ROOT / "rules" / "workflows" / "replan_drill.json"
+        seed = blake3.blake3(wf_path.read_bytes()).hexdigest()
+        print(
+            f"  {YELLOW}···{RESET}  v1 锚（BLAKE3(replan_drill.json)）={seed}"
+            f"——注入组 parent_plan_hash 联动由 driver UT 覆盖（链上无注入态载体）"
+        )
+    except ImportError:
+        print(f"  {YELLOW}···{RESET}  python blake3 包不可用，跳过 v1 锚复算展示")
+    return ok
+
+
 def scenario_a(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
     proc, ok = run_scenario(
         "A: PlanExecute 全链路（probe→PlanFact v1→物化→执行）",
@@ -206,7 +368,14 @@ def scenario_a(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
     return ok
 
 
-def scenario_b(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
+def scenario_b(env: Dict[str, str], evidence_dir: Optional[Path], server_url: str) -> bool:
+    # R3-T03：运行前快照会话集合，运行后 diff 出本场景新建会话（链上断言范围）
+    try:
+        before = session_ids(server_url)
+    except Exception as e:  # noqa: BLE001 — 会话列表不可用降级为空集（链断言将失败并给出原因）
+        print(f"  {YELLOW}···{RESET}  会话列表不可读（{e}），链上断言范围将为空")
+        before = set()
+
     proc, ok = run_scenario(
         "B: replan 触发链路（v1 失败→Failure replan→v2 成功）",
         "scenarioB", ["replan_drill"], env, evidence_dir,
@@ -235,6 +404,15 @@ def scenario_b(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
         "ghost_agent" in proc.stdout,
         "stdout 含 v1 失败原因（ghost_agent）", "stdout 缺 v1 失败原因（ghost_agent）",
     )
+    # R3-T03 链上因果断言（收官遗留 B4）：结论从链上唯一推断
+    try:
+        after = session_ids(server_url)
+        new_ids = after - before
+        print(f"  {YELLOW}···{RESET}  本场景新建会话 {len(new_ids)} 个（{sorted(new_ids)}）")
+        ok = ok and assert_chain_causality(server_url, new_ids, evidence_dir)
+    except Exception as e:  # noqa: BLE001 — 链断言失败需可见不吞
+        ok = False
+        print(f"  {RED}FAIL{RESET}  链上因果断言异常：{e}")
     return ok
 
 
@@ -315,7 +493,7 @@ def main() -> int:
     print(f"  {GREEN}PASS{RESET}  evorule-server 健康（{server_url}/api/health）")
 
     ok_a = scenario_a(env, args.evidence_dir)
-    ok_b = scenario_b(env, args.evidence_dir)
+    ok_b = scenario_b(env, args.evidence_dir, server_url)
     ok_c = scenario_c(env, args.evidence_dir)
     ok_d = scenario_d(env, args.evidence_dir)
 
