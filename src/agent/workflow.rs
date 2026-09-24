@@ -1357,6 +1357,73 @@ mod tests {
         }
     }
 
+    // ----- R6-T01 PT：compute-only 大工作流执行计时（#[ignore] 手动跑，不进 CI）-----
+
+    /// PT 基线（R6-T01，收官遗留 B5）：512 节点 compute-only 长链执行计时。
+    ///
+    /// 形态 = 最深拓扑（512 节点单链，每节点 strcmp 引用前驱——层序检查的最
+    /// 压迫形态：512 层逐层串行）。compute 不经 delegate（无会话/无 IO），
+    /// 本 PT 不触网、确定性可重复。定位 = 可观测基线 + 数量级防回归；手动跑：
+    /// `cargo test -p evo-agent --lib pt_compute_only_512 -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn pt_compute_only_512_node_chain_timing() {
+        const N: usize = 512;
+        let mut nodes = Vec::with_capacity(N);
+        for i in 0..N {
+            let deps: Vec<String> = if i == 0 {
+                Vec::new()
+            } else {
+                vec![format!("c{}", i - 1)]
+            };
+            let compute = if i == 0 {
+                // 首节点：空输入 strcmp（Empty 形态 = 物化器 iter0 同语义）
+                crate::agent::workflow::ComputeSpec::Strcmp {
+                    inputs: vec![
+                        crate::agent::workflow::ComputeInput::Empty,
+                        crate::agent::workflow::ComputeInput::Empty,
+                    ],
+                    mode: crate::agent::workflow::StrcmpMode::Equal,
+                }
+            } else {
+                crate::agent::workflow::ComputeSpec::Strcmp {
+                    inputs: vec![
+                        crate::agent::workflow::ComputeInput::Node(format!("c{}", i - 1)),
+                        crate::agent::workflow::ComputeInput::Empty,
+                    ],
+                    mode: crate::agent::workflow::StrcmpMode::Contains,
+                }
+            };
+            nodes.push(WorkflowNode {
+                id: format!("c{i}"),
+                agent_type: "w".to_string(),
+                task: "t".to_string(),
+                task_template: None,
+                depends_on: deps,
+                run_when: None,
+                compute: Some(compute),
+            });
+        }
+        let wf = Workflow {
+            workflow_id: "pt_compute_chain".to_string(),
+            description: String::new(),
+            nodes,
+            output_node: format!("c{}", N - 1),
+        };
+
+        let ctx = make_ctx();
+        let engine = WorkflowEngine::new(ctx);
+        let t0 = std::time::Instant::now();
+        let result = engine.execute(&wf).await.expect("512 compute 链须成功");
+        let dt = t0.elapsed();
+        println!("PT: {N} compute nodes (deepest chain) in {dt:?}, output={result:?}");
+        // 数量级防回归（纯函数内联求值应为亚秒级；宽放防环境抖动）
+        assert!(
+            dt < std::time::Duration::from_secs(30),
+            "512 compute 链耗时 {dt:?} 异常（疑似执行层复杂度回归）"
+        );
+    }
+
     #[test]
     fn test_validate_accepts_valid_identifiers() {
         let ctx = make_ctx();
