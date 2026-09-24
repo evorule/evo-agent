@@ -1,0 +1,14 @@
+{
+  "workflow_id": "enforce_drill",
+  "description": "D-01 enforce 拦截演练（Dsl 模式）：节点引用 probe_violator（model 非白名单），runner 收到 Violation 事实后以固定前缀 enforce violation: 上抛，外层驱动判别后终止整个循环且不 replan（纲领 §9.5.1 选项 B）",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "violator",
+      "agent_type": "probe_violator",
+      "task": "This node intentionally uses a non-allowlisted model so the evorule TCB gate rejects the instruction with a Violation fact. The driver must halt the whole loop without replanning.",
+      "depends_on": []
+    }
+  ],
+  "output_node": "violator"
+}
