@@ -2,9 +2,9 @@
 # Copyright (C) 2026 EvoRule Project
 # This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 
-"""plan-execute 真实 LLM E2E 测试（交付物 9 IT 级用例；Phase 1-B 场景 A/B + Phase 2 场景 C/D）
+"""plan-execute 真实 LLM E2E 测试（交付物 9 IT 级用例；Phase 1-B 场景 A/B + Phase 2 场景 C/D + 收官 B6 场景 E）
 
-验证 plan-execute 外层驱动四条真实链路（真实 MiniMax LLM API + 运行中的 evorule-server）：
+验证 plan-execute 外层驱动五条真实链路（真实 MiniMax LLM API + 运行中的 evorule-server）：
 
   场景 A（PlanExecute 全链路）：planning probe（planner 单节点 DAG）→ LLM 产出
     PlanFact v1 → 物化 → 执行 researcher 节点 → 产出研究摘要。
@@ -32,6 +32,17 @@
     （ghost_agent 必失败），--max-replan 0 → should_replan 判定序第 1 步硬上限
     直接终止、显式传播 Err。
     断言：EXIT=1、stderr 含 "replan budget exhausted"、无 "replan materialized"。
+
+  场景 E（planner 重试链路，R1-T03 IT 真实化，收官遗留 B6）：retry_drill 演练
+    工作流（planner 节点 task 含 __FLAKY_FIRST__ marker）→ 真实 LLM 首答非法
+    JSON（协议固定回复 NOT_JSON_YET）→ call_planner_with_retry 提取失败 →
+    原任务附 IMPORTANT 错误反馈重试 → 条件协议反馈分支输出合法 PlanFact →
+    v1 物化成功。
+    断言：EXIT=0、stdout 含 "plan v1 materialized"、统计行 plan_versions=1
+    replans=0 tokens_used>0；链上断言：恰两个 marker planner 会话（首调
+    P1 + 重试 P2），P1 IoResponse 提取不出 PlanFact（首答非法——触发重试的
+    前提）、P2 IoRequest 含 IMPORTANT 错误反馈文案（反馈入链）、P2
+    IoResponse 提取出结构合法 PlanFact（重试成功）。
 
 # 前置（本脚本不进 CI——依赖真实 LLM key/运行中 server/已编译产物）
   1. .env 含 MINIMAX_API_KEY（O-095：evo-agent 只认进程环境变量，脚本负责注入）
@@ -196,6 +207,11 @@ def session_ids(base_url: str) -> set:
 # replan planner 任务指示词（driver.rs build_replan_task 固定文案——链上识别锚）
 REPLAN_TASK_MARKER = "COMPLETE new plan"
 
+# R1-T03 重试演练锚（retry_drill.json 节点 task 与 planner.json 条件协议约定）
+RETRY_DRILL_MARKER = "__FLAKY_FIRST__"
+# driver.rs call_planner_with_retry 固定反馈文案前缀（重试任务 = 原任务 + 此段）
+RETRY_FEEDBACK_MARKER = "IMPORTANT: your previous response was not a valid PlanFact JSON"
+
 
 def find_replan_planner_sessions(base_url: str, sids: set) -> list:
     """在新会话集合中找 replan planner 会话。
@@ -337,6 +353,163 @@ def assert_chain_causality(base_url: str, new_ids: set, evidence_dir: Optional[P
     return ok
 
 
+def find_flaky_planner_sessions(base_url: str, sids: set) -> list:
+    """在新会话集合中找重试演练 planner 会话（R1-T03 场景 E）。
+
+    识别锚：会话链含 IoRequest 其 params 含 __FLAKY_FIRST__ marker
+    （retry_drill.json 节点 task；重试任务 = 原任务 + 反馈，同样含 marker）。
+    返回 [(sid, history, has_feedback), ...]，has_feedback = 该会话 IoRequest
+    的用户消息（messages 末条——system prompt 含协议示例文案故不能全文搜）
+    是否含 driver 固定 IMPORTANT 反馈文案（True = 重试调用 P2，False = 首调 P1）。
+    """
+    found = []
+    for sid in sorted(sids):
+        try:
+            hist = http_get_json(base_url, f"/api/sessions/{sid}/history")
+        except Exception as e:  # noqa: BLE001 — 诊断用途，跳过不可读会话
+            print(f"  {YELLOW}···{RESET}  会话 {sid} history 不可读（{e}），跳过")
+            continue
+        has_marker = False
+        has_feedback = False
+        for ev in hist:
+            if ev.get("type") != "IoRequest":
+                continue
+            params = ev.get("params", {})
+            blob = json.dumps(params, ensure_ascii=False)
+            if RETRY_DRILL_MARKER in blob:
+                has_marker = True
+            messages = params.get("messages") if isinstance(params, dict) else None
+            if isinstance(messages, list) and messages:
+                last = messages[-1]
+                content = last.get("content") if isinstance(last, dict) else None
+                if isinstance(content, str) and RETRY_FEEDBACK_MARKER in content:
+                    has_feedback = True
+        if has_marker:
+            found.append((sid, hist, has_feedback))
+    return found
+
+
+def assert_retry_chain(base_url: str, new_ids: set, evidence_dir: Optional[Path]) -> bool:
+    """R1-T03：planner 重试链路链上断言（结论从链上唯一推断）。
+
+    断言四条：
+      ① marker planner 会话恰两个：首调 P1（无反馈）+ 重试 P2（IoRequest 含
+         driver 固定 IMPORTANT 反馈文案——错误反馈入链）；
+      ② P1 的 IoResponse 提取不出 PlanFact（首答非法——触发重试的前提）；
+      ③ P2 的 IoResponse 提取出 PlanFact JSON 且结构合法（nodes 非空）——
+         重试成功；
+      ④ P2 产物无 ghost_agent（健康计划）。
+    """
+    print(f"\n=== 场景 E-链：planner 重试链上断言（R1-T03） ===")
+    planners = find_flaky_planner_sessions(base_url, new_ids)
+    firsts = [(sid, hist) for sid, hist, fb in planners if not fb]
+    retries = [(sid, hist) for sid, hist, fb in planners if fb]
+    ok = check(
+        len(planners) == 2 and len(firsts) == 1 and len(retries) == 1,
+        f"marker planner 会话恰两个（首调 {len(firsts)} + 重试 {len(retries)}）",
+        f"预期首调 1 + 重试 1，实得首调 {len(firsts)} + 重试 {len(retries)}"
+        f"（共 {len(planners)}）——首答可能未按协议输出非 JSON（真实 LLM 抖动，可重跑）",
+    )
+    if not (firsts and retries):
+        return False
+
+    sid1, hist1 = firsts[0]
+    sid2, hist2 = retries[0]
+    print(f"  {YELLOW}···{RESET}  P1（首调）id={sid1} 链长={len(hist1)}；P2（重试）id={sid2} 链长={len(hist2)}")
+    if evidence_dir is not None:
+        (evidence_dir / "scenarioE_chain_planner_sessions.json").write_text(
+            json.dumps(
+                {"first_call": {"session_id": sid1, "history": hist1},
+                 "retry_call": {"session_id": sid2, "history": hist2}},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"  {YELLOW}···{RESET}  链证据落盘 scenarioE_chain_planner_sessions.json")
+
+    # ② P1 首答非法（提取不出 PlanFact）
+    first_plan = extract_plan_fact_from_chain(hist1)
+    ok = ok and check(
+        first_plan is None,
+        "P1 首答为非法 JSON（IoResponse 提取不出 PlanFact——重试触发前提成立）",
+        "P1 首答竟是合法 PlanFact（协议未遵守或未触发重试路径）",
+    )
+
+    # ③ P2 重试成功（提取出结构合法 PlanFact）
+    retry_plan = extract_plan_fact_from_chain(hist2)
+    ok = ok and check(
+        retry_plan is not None,
+        "P2 重试输出提取出 PlanFact JSON（错误反馈后重试成功）",
+        "P2 重试输出仍提取不出 PlanFact（反馈未修复提取失败）",
+    )
+    if retry_plan is None:
+        return ok
+
+    nodes = retry_plan.get("nodes")
+    ok = ok and check(
+        isinstance(nodes, list) and len(nodes) > 0,
+        f"P2 PlanFact 结构合法（nodes 非空，{len(nodes) if isinstance(nodes, list) else '?'} 节点）",
+        "P2 PlanFact 结构不符（nodes 缺失或为空）",
+    )
+
+    # ④ 健康计划
+    ghost_leaked = any(
+        n.get("agent_type") == "ghost_agent" for n in nodes if isinstance(n, dict)
+    ) if isinstance(nodes, list) else True
+    ok = ok and check(
+        not ghost_leaked,
+        "P2 产物健康（无 ghost_agent 节点）",
+        "P2 产物含 ghost_agent（异常计划）",
+    )
+    return ok
+
+
+def scenario_e(env: Dict[str, str], evidence_dir: Optional[Path], server_url: str) -> bool:
+    # R1-T03：运行前快照会话集合，运行后 diff 圈定本场景新建会话
+    try:
+        before = session_ids(server_url)
+    except Exception as e:  # noqa: BLE001 — 会话列表不可用降级为空集（链断言将失败并给出原因）
+        print(f"  {YELLOW}···{RESET}  会话列表不可读（{e}），链上断言范围将为空")
+        before = set()
+
+    proc, ok = run_scenario(
+        "E: planner 重试链路（首答非法 JSON→错误反馈→重试成功，R1-T03）",
+        "scenarioE", ["retry_drill", "--plan-execute"], env, evidence_dir,
+    )
+    if proc is None:
+        return False
+    m = assert_stats_line(proc, "E")
+    ok = ok and m is not None
+    if m:
+        _, versions, replans, nodes, _, repeated, tokens, _ = m.groups()
+        ok = ok and check(
+            (versions, replans) == ("1", "0"),
+            "plan_versions=1 replans=0（重试是 planner 调用层，不产生新计划版本）",
+            f"预期 plan_versions=1 replans=0，实得 {versions}/{replans}",
+        )
+        ok = ok and check(
+            int(nodes) >= 1, "nodes_executed>=1（v1 物化后执行）", "nodes_executed=0（v1 未执行）",
+        )
+        ok = ok and check(
+            int(tokens) > 0, "tokens_used>0（含两次 planner 调用真实消耗）", "tokens_used=0（埋点未生效）",
+        )
+    ok = ok and check(
+        "plan v1 materialized" in proc.stdout,
+        "stdout 含 'plan v1 materialized'（重试成功后 v1 物化）",
+        "stdout 缺 'plan v1 materialized'",
+    )
+    # R1-T03 链上断言：结论从链上唯一推断
+    try:
+        after = session_ids(server_url)
+        new_ids = after - before
+        print(f"  {YELLOW}···{RESET}  本场景新建会话 {len(new_ids)} 个（{sorted(new_ids)}）")
+        ok = ok and assert_retry_chain(server_url, new_ids, evidence_dir)
+    except Exception as e:  # noqa: BLE001 — 链断言失败需可见不吞
+        ok = False
+        print(f"  {RED}FAIL{RESET}  链上重试断言异常：{e}")
+    return ok
+
+
 def scenario_a(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
     proc, ok = run_scenario(
         "A: PlanExecute 全链路（probe→PlanFact v1→物化→执行）",
@@ -472,9 +645,15 @@ def main() -> int:
         default=None,
         help="stdout/stderr 证据落盘目录（可选）",
     )
+    parser.add_argument(
+        "--only",
+        choices=["A", "B", "C", "D", "E"],
+        default=None,
+        help="只跑单个场景（调试用；缺省全量）",
+    )
     args = parser.parse_args()
 
-    print("plan-execute 真实 LLM E2E 测试（IT 级；Phase 1-B A/B + Phase 2 C/D）")
+    print("plan-execute 真实 LLM E2E 测试（IT 级；Phase 1-B A/B + Phase 2 C/D + 收官 B6 场景 E）")
     print(f"  时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  env:  {ENV_PATH}")
 
@@ -492,14 +671,16 @@ def main() -> int:
         return 1
     print(f"  {GREEN}PASS{RESET}  evorule-server 健康（{server_url}/api/health）")
 
-    ok_a = scenario_a(env, args.evidence_dir)
-    ok_b = scenario_b(env, args.evidence_dir, server_url)
-    ok_c = scenario_c(env, args.evidence_dir)
-    ok_d = scenario_d(env, args.evidence_dir)
+    only = args.only
+    ok_a = scenario_a(env, args.evidence_dir) if only in (None, "A") else True
+    ok_b = scenario_b(env, args.evidence_dir, server_url) if only in (None, "B") else True
+    ok_c = scenario_c(env, args.evidence_dir) if only in (None, "C") else True
+    ok_d = scenario_d(env, args.evidence_dir) if only in (None, "D") else True
+    ok_e = scenario_e(env, args.evidence_dir, server_url) if only in (None, "E") else True
 
-    total = ok_a and ok_b and ok_c and ok_d
+    total = ok_a and ok_b and ok_c and ok_d and ok_e
     print(f"\n{'=' * 60}")
-    print(f"结果: {'ALL PASS' if total else 'FAILED'}  (A={ok_a} B={ok_b} C={ok_c} D={ok_d})")
+    print(f"结果: {'ALL PASS' if total else 'FAILED'}  (A={ok_a} B={ok_b} C={ok_c} D={ok_d} E={ok_e})")
     print(f"{'=' * 60}")
     return 0 if total else 1
 

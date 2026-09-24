@@ -1,0 +1,14 @@
+{
+  "workflow_id": "retry_drill",
+  "description": "R1-T03 演练：planner 首答非法 JSON → 提取错误反馈 → 重试成功（E2E 场景 E 入口，--plan-execute 模式）",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "planner",
+      "agent_type": "planner",
+      "task": "__FLAKY_FIRST__ Goal: research the topic 'evorule plan-execute planner retry protocol' and produce a research digest. Produce a PlanFact JSON for this goal: 2-3 llm nodes with agent_type \"researcher\" (collect key facts, then synthesize a structured digest), exactly one sink node. Output ONLY the PlanFact JSON object.",
+      "depends_on": []
+    }
+  ],
+  "output_node": "planner"
+}
