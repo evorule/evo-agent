@@ -39,6 +39,7 @@
 ### 🆕 新增
 - **`workflow` 子命令新增 `--max-tokens <N>` flag** — token 预算阈值接线：累计 `tokens_used` 达到 N 即触发 replan Budget 分支（交付物 7 tokens 埋点的阈值消费闭环）；不指定 = 不限（缺省 None 维度不参与判定，行为不变）。`DriverLimits`/`BudgetThresholds.max_tokens` 逐版接线（driver.rs 阈值重算处）
 - **D-01 二次保险 + 降级兜底（runner.rs）** — SSE 流关闭路径新增 enforce 兜底：断流可能吞掉 `Violation` 帧（违规表现为「静默成功后流关闭」），流关闭时 best-effort 查 evolution-signals，`total_violations > 0` 即以 `enforce violation: rule_ref=..., reason=...` 固定前缀上抛（归因取链上最新违规信号 `last_version` 最大者；workflow 层凭前缀判别终止不 replan）；兜底查询不可用（网络断/会话被 TTL 收割/server 不可达）时**降级**——warn 留痕 + 返回携带本地上下文的原流关闭错误，不掩盖不阻塞不重试。同批补齐**流式消费面（REPL/工作台 `run_streaming`）的 `Violation` 分支**（此前流式路径违规事件落 `_` 静默丢弃）
+- **R2-T04 链体积监控（runner.rs）** — 长 会话 facts_log 体积增长观测告警：workflow 链与流式两消费面的 `Stable` 收尾路径 best-effort 查审计报告 `entry_count`（BLAKE3 审计链长 = 链体积权威只读投影），达到 `CHAIN_SIZE_WARN_ENTRIES`（10,000 条）warn 告警、低于阈值 debug 观测；查询失败静默降级。只读观测不干预执行——不写链、不拦截、不改变控制流（零红线风险）
 
 #### plan-execute Phase 2：enforce 判别 / planner 重试 / 静态拦截 / 成本埋点
 - **D-01 enforce 一票否决（runner.rs + driver.rs）** — `AgentRunner` 事件循环新增 `Violation` 分支：TCB 约束前置门拒绝违规指令时，runner 不 rewind 不重试，flush/sediment 后以固定前缀 `enforce violation: rule_index=..., reason=...` 上抛 `AgentResult::error`；外层驱动 `is_enforce_violation` 凭前缀判别后**终止整个循环且不 replan**（纲领 §9.5.1 选项 B——宪法违规是系统性错误，不开「换计划再试」通道）。 Violation 消费零新增 Fact 类型（消费既有 SSE `Violation` 事件的 `rule_index`/`reason` 字段）

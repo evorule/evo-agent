@@ -1954,3 +1954,41 @@ async fn test_b2_fallback_passthrough_no_violation_and_bad_sid() {
         .await;
     assert_eq!(err, "Event stream closed");
 }
+
+// ----- R2-T04 链体积观测（收官遗留 B3：长会话 facts_log 体积监控/告警）-----
+
+#[tokio::test]
+async fn test_b3_chain_size_observation_returns_without_warning_path() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let runner = AgentRunner::new(AgentConfig::default(), client);
+
+    // 低于阈值：debug 观测路径，不告警
+    let report = serde_json::json!({"entry_count": 42, "verified": true, "last_hash": "ab"});
+    server
+        .mock("GET", "/api/sessions/3/audit")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(report.to_string())
+        .create_async()
+        .await;
+
+    // 观测不干预执行：无返回值、不 Err、不 panic
+    runner.check_chain_size("3").await;
+}
+
+#[tokio::test]
+async fn test_b3_chain_size_observation_degrades_on_query_failure() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let runner = AgentRunner::new(AgentConfig::default(), client);
+
+    // 会话不存在（404）→ 静默降级（监控面失败不冒泡、不影响执行）
+    server
+        .mock("GET", "/api/sessions/4/audit")
+        .with_status(404)
+        .create_async()
+        .await;
+
+    runner.check_chain_size("4").await;
+}
