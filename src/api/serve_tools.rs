@@ -189,6 +189,53 @@ pub fn apply_regulation_index_awareness(system_prompt: &mut String) {
     system_prompt.push_str(REGULATION_INDEX_AWARENESS_SEGMENT);
 }
 
+// =============================================================================
+// O-116:运行体身份(serve 启动横幅与 GET /version 的共享正本)
+// =============================================================================
+
+/// 运行体身份快照(不可变值对象,serde 序列化即 `GET /version` 响应体)
+///
+/// `version` = crate 版本;`exe_mtime_epoch` = 运行中 exe 的文件 mtime
+/// (epoch 秒,≈ 最近一次 cargo build 产物时间,可与 git log 时间戳对照);
+/// `workdir` = 工作区绝对路径(去 Windows `\\?\` verbatim 展示形态)。
+/// 三元组足以核对「运行中的 exe」与「源码 HEAD」是否一致——排障不留盲区。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RuntimeIdentity {
+    /// crate 版本(Cargo.toml package.version)
+    pub version: &'static str,
+    /// 运行中 exe 的文件 mtime(epoch 秒,≈ 最近一次 cargo build 产物时间;
+    /// 元数据不可读时降级为 "unknown")
+    pub exe_mtime_epoch: String,
+    /// 工作区绝对路径(去 Windows `\\?\` verbatim 展示形态)
+    pub workdir: String,
+}
+
+/// 采集运行体身份(O-116:横幅与 HTTP 接口的单一事实源)
+///
+/// 单一事实源纪律(宪法 §七 反模式④):`cmd_serve` 启动横幅与 `GET /version`
+/// 端点共用本函数产出,禁止两处各写一份采集逻辑。exe 元数据不可读
+/// (权限/已删除)时 mtime 降级为 `"unknown"`,不 panic 不阻塞启动。
+pub fn runtime_identity(workdir: &Path) -> RuntimeIdentity {
+    let exe_mtime_epoch = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let abs_workdir = {
+        let raw = workdir
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(workdir));
+        simplify_verbatim(raw)
+    };
+    RuntimeIdentity {
+        version: env!("CARGO_PKG_VERSION"),
+        exe_mtime_epoch,
+        workdir: abs_workdir.to_string_lossy().into_owned(),
+    }
+}
+
 /// 按 agent 白名单过滤 toolkit(serve 模式安全隔离)
 ///
 /// 从 union toolkit 中只取出 `whitelist` 中列出的工具,构造一个新的
@@ -574,6 +621,28 @@ mod tests {
         let mut prompt2 = String::new();
         apply_regulation_index_awareness(&mut prompt2);
         assert!(prompt2.starts_with("\n\n【规范入口索引】"));
+    }
+
+    // ===== O-116 运行体身份测试 =====
+
+    #[test]
+    fn test_runtime_identity_fields() {
+        // 三字段齐备:version 非空、mtime 为 epoch 数字或 unknown 降级、
+        // workdir 为绝对路径且不含 \\?\ verbatim 前缀(展示形态)
+        let dir = std::env::temp_dir();
+        let id = runtime_identity(&dir);
+        assert!(!id.version.is_empty(), "version 必须非空");
+        assert!(
+            id.exe_mtime_epoch == "unknown" || id.exe_mtime_epoch.parse::<u64>().is_ok(),
+            "mtime 须为 epoch 数字或 unknown,实际: {}",
+            id.exe_mtime_epoch
+        );
+        assert!(!id.workdir.is_empty(), "workdir 必须非空");
+        assert!(
+            std::path::Path::new(&id.workdir).is_absolute(),
+            "workdir 必须为绝对路径"
+        );
+        assert!(!id.workdir.starts_with(r"\\?\"), "不得携带 verbatim 前缀");
     }
 
     // ===== M5-a 能力边界 helper 测试 =====

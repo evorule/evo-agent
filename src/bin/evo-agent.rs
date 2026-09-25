@@ -1544,37 +1544,15 @@ fn cmd_serve(
 
     // 2.4 O-116:启动即打印运行体身份(版本 + exe mtime + 工作区绝对路径)
     //     ——排障时核对「运行中的 exe」与「源码 HEAD」是否一致,不留盲区。
-    //     exe mtime = 最近一次 cargo build 产物时间(epoch 秒,可与 git log
-    //     时间戳对照);不引入 build.rs/vergen 依赖,最小实现。
+    //     采集逻辑与 GET /version 共用 serve_tools::runtime_identity 正本
+    //     (单一事实源;exe mtime = 最近一次 cargo build 产物时间 epoch 秒)。
     {
-        let exe_mtime = std::env::current_exe()
-            .ok()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let abs_workdir = {
-            // 展示形态:去 Windows canonicalize 的 \\?\ verbatim 前缀(与
-            // O-119① 边界展示面同口径;serve_tools 同款逻辑)
-            let raw = workdir
-                .canonicalize()
-                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(workdir));
-            match raw.to_str() {
-                Some(s) if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") => {
-                    std::path::PathBuf::from(format!(r"\\{}", stripped))
-                }
-                Some(s) if let Some(stripped) = s.strip_prefix(r"\\?\") => {
-                    std::path::PathBuf::from(stripped)
-                }
-                _ => raw,
-            }
-        };
+        let identity = evo_agent::api::serve_tools::runtime_identity(std::path::Path::new(workdir));
         eprintln!(
             "[serve] evo-agent v{} | exe mtime (epoch s): {} | workdir: {} | 核对运行体与源码 HEAD 是否一致",
-            env!("CARGO_PKG_VERSION"),
-            exe_mtime,
-            abs_workdir.display()
+            identity.version,
+            identity.exe_mtime_epoch,
+            identity.workdir
         );
     }
 
