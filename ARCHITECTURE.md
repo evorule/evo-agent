@@ -327,13 +327,26 @@ generic 不含标记知识,改协作纪律 = 改规则零发版。
 
 ## 9. HTTP API 概览
 
-### evo-agent 自有 API(3 个端点)
+### evo-agent 自有 API(路由注册于 `src/api/agent_api.rs::router_with_auth`)
 
-| 方法 | 路径 | 说明 |
+除 `/health` 与 `/metrics` 豁免鉴权外,其余端点在启用鉴权时需 Bearer token(或 `?token=`)。
+
+| 分组 | 端点 | 说明 |
 |---|---|---|
-| `GET` | `/api/agent/list` | 列出已注册 Agent 类型 |
-| `GET` | `/api/agent/{type}` | 查看 Agent 详细定义 |
-| `POST` | `/api/agent/run` | 启动 Agent 运行 |
+| 运维 | `GET /health` `GET /metrics` `GET /version` | 健康探针 / Prometheus 指标 / 运行体身份(版本+exe mtime+workdir,与启动横幅同正本) |
+| 凭据可视化 | `GET /admin/llm-status` | LLM 配置只读状态(脱敏,不含密钥内容) |
+| Agent 执行 | `GET /agents` `GET /agents/{type}` | 定义枚举 / 定义查看 |
+| | `POST /agents/{type}/run` | 非流式执行(内部消费流式 ReAct 至 Done,工具真实执行,返回聚合结果) |
+| | `POST /agents/{type}/run/stream` | SSE 流式执行(AgentEvent 逐帧) |
+| | `POST /agents/{type}/cancel` `POST /agents/{type}/approve` | 取消 / 审批(按 session_id) |
+| 会话与对话 | `GET /api/sessions` `GET /api/sessions/{id}/transcript` | 本地会话索引 / 消息历史投影(facts 权威读;WS 通道会话) |
+| | `GET /api/sessions/{id}/ws` | WebSocket 双向流(工作台真实通道) |
+| | `GET /api/sessions/{id}/events` `GET /api/sessions/{id}/replay` | 记忆事件查询 / 因果回放 |
+| | `GET /api/sessions/{id}/evolution-signals` | 进化信号只读代理 |
+| 工作台 | `GET|PUT /api/workbench/config` | 工作台配置(快照保留期) |
+| 文件面 | `GET /api/files/list` `GET /api/files/read` `PUT /api/files/write` | IDE 文件操作(同一沙箱与校验) |
+
+> 会话链上权威在 evorule-server(`GET {server}/api/sessions/{id}/state`);evo-agent 本地索引当前仅覆盖 WS 通道会话(REST run 会话见登记册 O-125)。
 
 ### 通过 `EvoruleApiClient` 透传到 evorule-server(19 个端点)
 

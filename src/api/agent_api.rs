@@ -20,11 +20,13 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::agent::{
-    AgentDefinitionManager, AgentError, AgentEvent, AgentRunner, ApprovalDecision, PendingApproval,
+    AgentDefinitionManager, AgentError, AgentEvent, AgentResult, AgentRunner, ApprovalDecision,
+    PendingApproval,
 };
 use crate::api::auth::AuthConfig;
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::metrics::{Metrics, SharedMetrics, SseConnectionGuard};
+use crate::api::serve_tools::RuntimeIdentity;
 use crate::api::workspace_client::WorkspaceApiClient;
 use crate::config::LlmStatusSnapshot;
 use crate::io_handlers::tool_handler::ToolHandler;
@@ -305,6 +307,8 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
     Router::new()
         .route("/health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(metrics_handler))
+        // O-116:运行体身份查询(与启动横幅共享正本;鉴权内)
+        .route("/version", axum::routing::get(get_version))
         // 凭据可视化:LLM 配置只读状态(脱敏,响应体不携带任何密钥内容)
         .route("/admin/llm-status", axum::routing::get(get_llm_status))
         .route("/agents", axum::routing::get(list_agents))
@@ -410,6 +414,16 @@ async fn metrics_handler(State(state): State<AgentApiState>) -> String {
     state.metrics.render()
 }
 
+/// O-116:运行体身份查询端点(工作台可见的版本面)
+///
+/// 路由:`GET /version` → [`RuntimeIdentity`] JSON(version / exe_mtime_epoch /
+/// workdir)。与 `cmd_serve` 启动横幅共用 [`serve_tools::runtime_identity`]
+/// 正本(单一事实源,排障时核对运行中 exe 与源码 HEAD 是否一致)。
+/// 鉴权内(不进 PUBLIC_PATHS——workdir 绝对路径不出无鉴权面)。
+async fn get_version(State(state): State<AgentApiState>) -> Json<RuntimeIdentity> {
+    Json(crate::api::serve_tools::runtime_identity(state.workdir()))
+}
+
 /// LLM 配置只读状态端点(脱敏)
 ///
 /// 路由:`GET /admin/llm-status` → [`LlmStatusSnapshot`]。
@@ -490,6 +504,31 @@ fn load_serve_definition(
     Ok(def)
 }
 
+/// O-124:消费流式事件至 Done,聚合为最终 [`AgentResult`]
+///
+/// 流式路径的终止语义(`run_streaming_inner` 契约):正常完成 / LLM 流中断 /
+/// evorule 错误 auto_rewind 失败 / max_steps 超限**均以 `Done(AgentResult)`
+/// 收尾**,故 Done 即权威结果。中间 `Error` 事件(如 auto_rewind 提示)不提前
+/// 返回,其后的 Done 承载最终判定;`Err(AgentError)` 形态与「流意外结束且无
+/// Done」(防御性,现实现不应发生)均组装为失败结果——不 panic 不静默。
+///
+/// 修法先例:O-114 delegate 同款(bb172b2「consumes run_streaming to Done」)。
+async fn consume_to_done(
+    mut stream: std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>>,
+) -> AgentResult {
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(AgentEvent::Done(r)) => return r,
+            Ok(AgentEvent::Error(e)) => {
+                tracing::debug!(error = %e, "intermediate error event before Done");
+            }
+            Ok(_) => {}
+            Err(e) => return AgentResult::error(e.to_string(), 0, 0),
+        }
+    }
+    AgentResult::error("stream ended without Done event".to_string(), 0, 0)
+}
+
 async fn run_agent(
     State(state): State<AgentApiState>,
     axum::extract::Path(agent_type): axum::extract::Path<String>,
@@ -535,7 +574,7 @@ async fn run_agent(
     .await;
     // M1 规范入口索引:全 serve 会话通用素养段(静态文本,无触发条件;立项-M1 §3.2)
     crate::api::serve_tools::apply_regulation_index_awareness(&mut def.system_prompt);
-    let mut runner = AgentRunner::from_definition(
+    let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
         filtered,
@@ -546,35 +585,35 @@ async fn run_agent(
     .with_capability_boundary(capability_boundary)
     .with_metrics(state.metrics.clone());
 
-    let result = runner.run(&req.goal).await;
+    // O-124:改消费流式 ReAct 回路(O-114 delegate 同款修法,bb172b2 先例)——
+    // 非流式 run() 是单发桥接(LLM 返 tool_calls 即返、工具不执行=能力面假象,
+    // s113 实证 success=true+content=""),本端点改为消费 run_streaming 至 Done:
+    // 多轮工具回喂在服务端执行完毕后聚合返回,对外 AgentRunResponse 结构零变化。
+    // approval 不注入(candidate 缺省拒绝,与 delegate 同款);cancel token 不注册
+    // (原 run() 路径亦不可 cancel,行为等价)。
+    let result = consume_to_done(runner.run_streaming(req.goal)).await;
 
-    match result {
-        Ok(r) => {
-            info!(
-                agent_type = agent_type,
-                steps = r.steps,
-                duration_ms = r.duration_ms,
-                "Agent execution completed"
-            );
-            Ok(Json(AgentRunResponse {
-                success: r.success,
-                content: r.content,
-                steps: r.steps,
-                duration_ms: r.duration_ms,
-                error: r.error,
-            }))
-        }
-        Err(e) => {
-            warn!(agent_type = agent_type, error = %e, "Agent execution failed");
-            Ok(Json(AgentRunResponse {
-                success: false,
-                content: String::new(),
-                steps: 0,
-                duration_ms: 0,
-                error: Some(e.to_string()),
-            }))
-        }
+    if result.success {
+        info!(
+            agent_type = agent_type,
+            steps = result.steps,
+            duration_ms = result.duration_ms,
+            "Agent execution completed"
+        );
+    } else {
+        warn!(
+            agent_type = agent_type,
+            error = ?result.error,
+            "Agent execution failed"
+        );
     }
+    Ok(Json(AgentRunResponse {
+        success: result.success,
+        content: result.content,
+        steps: result.steps,
+        duration_ms: result.duration_ms,
+        error: result.error,
+    }))
 }
 
 /// G4:流式执行 agent — 把 `AgentEvent` 流逐个转成 SSE 帧
@@ -1612,6 +1651,114 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ===== O-124 consume_to_done 测试 =====
+
+    type MockStream = std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>>;
+
+    #[tokio::test]
+    async fn test_consume_to_done_aggregates_done() {
+        // 正常链:Step → ToolCall → ToolResult → Done(权威结果原样聚合)
+        let events: Vec<Result<AgentEvent, AgentError>> = vec![
+            Ok(AgentEvent::Step { step: 1 }),
+            Ok(AgentEvent::ToolCall {
+                name: "file_read".to_string(),
+                args: serde_json::json!({"path": "README.md"}),
+            }),
+            Ok(AgentEvent::ToolResult {
+                name: "file_read".to_string(),
+                result: serde_json::json!("file content"),
+            }),
+            Ok(AgentEvent::Done(AgentResult::success(
+                "final answer".to_string(),
+                3,
+                1234,
+                vec!["file_read".to_string()],
+            ))),
+        ];
+        let result =
+            consume_to_done(Box::pin(futures_util::stream::iter(events)) as MockStream).await;
+        assert!(result.success);
+        assert_eq!(result.content, "final answer");
+        assert_eq!(result.steps, 3);
+        assert_eq!(result.duration_ms, 1234);
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_consume_to_done_err_item_is_failure() {
+        // Item 层 Err:组装失败结果(不 panic 不静默)
+        let events: Vec<Result<AgentEvent, AgentError>> =
+            vec![Err(AgentError::Internal("boom".to_string()))];
+        let result =
+            consume_to_done(Box::pin(futures_util::stream::iter(events)) as MockStream).await;
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn test_consume_to_done_stream_without_done() {
+        // 流意外结束且无 Done(防御性):返回失败结果
+        let events: Vec<Result<AgentEvent, AgentError>> = vec![Ok(AgentEvent::Step { step: 1 })];
+        let result =
+            consume_to_done(Box::pin(futures_util::stream::iter(events)) as MockStream).await;
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("without Done"));
+    }
+
+    #[tokio::test]
+    async fn test_consume_to_done_intermediate_error_then_done() {
+        // 中间 Error 事件不提前返回,其后 Done 承载权威判定
+        let events: Vec<Result<AgentEvent, AgentError>> = vec![
+            Ok(AgentEvent::Error(AgentError::EvoruleError(
+                "rewindable".to_string(),
+            ))),
+            Ok(AgentEvent::Done(AgentResult::error(
+                "final error".to_string(),
+                2,
+                500,
+            ))),
+        ];
+        let result =
+            consume_to_done(Box::pin(futures_util::stream::iter(events)) as MockStream).await;
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("final error"));
+    }
+
+    // ===== O-116 /version 端点测试 =====
+
+    #[tokio::test]
+    async fn test_version_endpoint() {
+        let state = make_test_state();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json.get("version")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "version 字段必须非空"
+        );
+        assert!(
+            json.get("exe_mtime_epoch").is_some(),
+            "exe_mtime_epoch 字段必须在"
+        );
+        assert!(json.get("workdir").is_some(), "workdir 字段必须在");
     }
 
     #[test]
