@@ -68,6 +68,10 @@ pub struct AgentRunResponse {
     pub duration_ms: u64,
     /// Error message (if failed)
     pub error: Option<String>,
+    /// Created session ID (if the run established one; O-125/O-086 收口:
+    /// 消费者可凭此查询 18080 权威面或工作台回放,旧消费者不受影响)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Agent list response
@@ -513,20 +517,32 @@ fn load_serve_definition(
 /// Done」(防御性,现实现不应发生)均组装为失败结果——不 panic 不静默。
 ///
 /// 修法先例:O-114 delegate 同款(bb172b2「consumes run_streaming to Done」)。
+///
+/// O-125:同时捕获流中的 `SessionCreated` 事件携带的会话 ID 并随结果返回
+/// (run 端点据此挂工作台本地索引 + 填充响应 `session_id` 字段)。
 async fn consume_to_done(
     mut stream: std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>>,
-) -> AgentResult {
+) -> (AgentResult, Option<String>) {
+    let mut session_id: Option<String> = None;
     while let Some(item) = stream.next().await {
         match item {
-            Ok(AgentEvent::Done(r)) => return r,
+            Ok(AgentEvent::SessionCreated {
+                session_id: sid, ..
+            }) => {
+                session_id = Some(sid);
+            }
+            Ok(AgentEvent::Done(r)) => return (r, session_id),
             Ok(AgentEvent::Error(e)) => {
                 tracing::debug!(error = %e, "intermediate error event before Done");
             }
             Ok(_) => {}
-            Err(e) => return AgentResult::error(e.to_string(), 0, 0),
+            Err(e) => return (AgentResult::error(e.to_string(), 0, 0), session_id),
         }
     }
-    AgentResult::error("stream ended without Done event".to_string(), 0, 0)
+    (
+        AgentResult::error("stream ended without Done event".to_string(), 0, 0),
+        session_id,
+    )
 }
 
 async fn run_agent(
@@ -591,7 +607,21 @@ async fn run_agent(
     // 多轮工具回喂在服务端执行完毕后聚合返回,对外 AgentRunResponse 结构零变化。
     // approval 不注入(candidate 缺省拒绝,与 delegate 同款);cancel token 不注册
     // (原 run() 路径亦不可 cancel,行为等价)。
-    let result = consume_to_done(runner.run_streaming(req.goal)).await;
+    // O-125:捕获流中 SessionCreated 的会话 ID,挂工作台本地索引(与 WS 面同
+    // 口径,fail-soft;record 读时去重合并)+ 响应携带 session_id(O-086 收口)。
+    let index_title: String = req.goal.chars().take(60).collect();
+    let (result, session_id) = consume_to_done(runner.run_streaming(req.goal)).await;
+    if let Some(sid) = &session_id {
+        state
+            .session_index()
+            .record(&crate::api::session_index::SessionIndexEntry {
+                session_id: sid.clone(),
+                agent_type: agent_type.clone(),
+                created_at: crate::api::session_index::unix_now(),
+                last_active: crate::api::session_index::unix_now(),
+                title: index_title,
+            });
+    }
 
     if result.success {
         info!(
@@ -613,6 +643,7 @@ async fn run_agent(
         steps: result.steps,
         duration_ms: result.duration_ms,
         error: result.error,
+        session_id,
     }))
 }
 
@@ -692,6 +723,10 @@ async fn run_agent_stream(
 
     // 用 stream! 包裹,在流入口创建 SseConnectionGuard(RAII),
     // 流结束(正常 / error / 客户端断开)时自动 dec sse_connections。
+    // O-125:SSE 面同挂工作台本地索引(SessionCreated 时机,对齐 ws_handler;
+    // title=goal 截 60 字符;record 自身 fail-soft)。
+    let index_title: String = req.goal.chars().take(60).collect();
+    let agent_type_for_index = agent_type.clone();
     let sse_stream = async_stream::stream! {
         let _sse_guard = SseConnectionGuard::new(sse_metrics);
         let mut event_stream = runner.run_streaming(req.goal);
@@ -705,6 +740,16 @@ async fn run_agent_stream(
                     if let Ok(mut map) = store.lock() {
                         map.insert(session_id.clone(), cancel_token.clone());
                     }
+                    // O-125:会话索引落一行(fail-soft,仅展示辅助)
+                    state.session_index().record(
+                        &crate::api::session_index::SessionIndexEntry {
+                            session_id: session_id.clone(),
+                            agent_type: agent_type_for_index.clone(),
+                            created_at: crate::api::session_index::unix_now(),
+                            last_active: crate::api::session_index::unix_now(),
+                            title: index_title.clone(),
+                        },
+                    );
                 }
                 Ok(AgentEvent::Done(_)) | Ok(AgentEvent::Error(_)) | Err(_) => {
                     if let Some(sid) = current_session.take() {
@@ -1677,13 +1722,14 @@ mod tests {
                 vec!["file_read".to_string()],
             ))),
         ];
-        let result =
+        let (result, session_id) =
             consume_to_done(Box::pin(futures_util::stream::iter(events)) as MockStream).await;
         assert!(result.success);
         assert_eq!(result.content, "final answer");
         assert_eq!(result.steps, 3);
         assert_eq!(result.duration_ms, 1234);
         assert!(result.error.is_none());
+        assert!(session_id.is_none(), "无 SessionCreated 时不应有会话 ID");
     }
 
     #[tokio::test]
@@ -1691,7 +1737,7 @@ mod tests {
         // Item 层 Err:组装失败结果(不 panic 不静默)
         let events: Vec<Result<AgentEvent, AgentError>> =
             vec![Err(AgentError::Internal("boom".to_string()))];
-        let result =
+        let (result, _) =
             consume_to_done(Box::pin(futures_util::stream::iter(events)) as MockStream).await;
         assert!(!result.success);
         assert!(result.error.unwrap().contains("boom"));
@@ -1701,7 +1747,7 @@ mod tests {
     async fn test_consume_to_done_stream_without_done() {
         // 流意外结束且无 Done(防御性):返回失败结果
         let events: Vec<Result<AgentEvent, AgentError>> = vec![Ok(AgentEvent::Step { step: 1 })];
-        let result =
+        let (result, _) =
             consume_to_done(Box::pin(futures_util::stream::iter(events)) as MockStream).await;
         assert!(!result.success);
         assert!(result.error.unwrap().contains("without Done"));
@@ -1720,10 +1766,31 @@ mod tests {
                 500,
             ))),
         ];
-        let result =
+        let (result, _) =
             consume_to_done(Box::pin(futures_util::stream::iter(events)) as MockStream).await;
         assert!(!result.success);
         assert_eq!(result.error.as_deref(), Some("final error"));
+    }
+
+    #[tokio::test]
+    async fn test_consume_to_done_captures_session_created() {
+        // O-125:SessionCreated 事件携带的会话 ID 被捕获并随结果返回
+        let events: Vec<Result<AgentEvent, AgentError>> = vec![
+            Ok(AgentEvent::SessionCreated {
+                session_id: "sess-run-1".to_string(),
+                memory_enabled: false,
+            }),
+            Ok(AgentEvent::Done(AgentResult::success(
+                "ok".to_string(),
+                1,
+                100,
+                vec![],
+            ))),
+        ];
+        let (result, session_id) =
+            consume_to_done(Box::pin(futures_util::stream::iter(events)) as MockStream).await;
+        assert!(result.success);
+        assert_eq!(session_id.as_deref(), Some("sess-run-1"));
     }
 
     // ===== O-116 /version 端点测试 =====
@@ -1786,9 +1853,21 @@ mod tests {
             steps: 3,
             duration_ms: 100,
             error: None,
+            session_id: Some("sess-1".to_string()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("success"));
+        assert!(
+            json.contains("session_id"),
+            "O-125:会话建立时应携带 session_id"
+        );
+        // O-125:None 时字段整体省略(旧消费者零影响)
+        let bare = AgentRunResponse {
+            session_id: None,
+            ..resp
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("session_id"));
         assert!(json.contains("hello"));
         assert!(json.contains("3"));
     }

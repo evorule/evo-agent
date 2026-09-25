@@ -13,13 +13,14 @@
 //! - **会话枚举**:evorule facts 以会话为维度,无跨会话枚举端点;本模块维护
 //!   serve 侧本地索引(JSONL,append-only,读时按 session_id 去重:
 //!   created_at 取最小 / last_active 取最大 / title 取首个非空),
-//!   由 WS 处理器在 SessionCreated / TurnEnd 时记录。
+//!   由 serve 各执行面在会话建立/活跃时机记录(见下方边界说明)。
 //!
 //! ## 边界说明(设计留痕)
 //!
-//! - 索引只覆盖经过 serve WS 面创建的会话(工作台消费面);HTTP `run` 响应
-//!   本身不含 session_id(O-086「id 未关联」),该路径不挂索引,console 侧
-//!   恢复属 console 仓任务;
+//! - 索引覆盖 serve 三执行面的会话:WS 处理器(SessionCreated / TurnEnd)、
+//!   REST `run` 端点与 `run-stream` SSE 端点(O-125:SessionCreated 捕获后
+//!   落记录,title=goal 截 60);REST run 响应亦携带 `session_id`(O-086「id
+//!   未关联」收口),消费者可凭此查询 18080 权威面或工作台回放;
 //! - 索引文件是**持久化记录**而非审计链级留痕(可读、不参与哈希);真相源
 //!   仍是 evorule(payload/facts),索引丢失仅影响列表展示,消息历史可凭
 //!   session_id 随时重新投影。
