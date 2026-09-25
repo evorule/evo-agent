@@ -1,0 +1,112 @@
+{
+  "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
+  "kind": "rule_set",
+  "id": "com.evorule.business.collab_task_marks",
+  "version": "1.0.0",
+  "metadata": {
+    "title": "协作工作流任务标记（meta_task.*）",
+    "description": "留痕型业务规则（design-08 模板 B 修正后形态：branch 壳+set）。规则=程序模式，每转换全程序执行；set 无匹配域概念，故以 branch(domain) 壳条件化——仅当本转换的指令是外层驱动发出的协作节点完成信号（set meta_signal.node_done=<节点id>）时，才置对应 meta_task.* 任务标记。节点→标记的映射完全由本规则承载（改协作纪律=改规则，零发版）。本规则不承担拦截职责（拦截须 enforce 元规则，走治理链）。",
+    "authors": ["evorulelab@gmail.com"],
+    "created": "2026-09-25",
+    "updated": "2026-09-25",
+    "tags": ["business", "collaboration", "task-marks", "meta-task"],
+    "license": "AGPL-3.0-or-later",
+    "tier": "business",
+    "provenance": { "source": "manual" }
+  },
+  "transform": [
+    {
+      "type": "branch",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            { "type": "instruction", "instruction_type": "set" },
+            {
+              "type": "eq",
+              "path": "instruction.params.attr",
+              "value": "meta_signal.node_done"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value",
+              "value": "due_diligence"
+            }
+          ]
+        },
+        "on_true": [
+          {
+            "type": "set",
+            "params": {
+              "attr": "meta_task.due_diligence_done",
+              "operation": "set",
+              "value": true
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "branch",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            { "type": "instruction", "instruction_type": "set" },
+            {
+              "type": "eq",
+              "path": "instruction.params.attr",
+              "value": "meta_signal.node_done"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value",
+              "value": "implementation"
+            }
+          ]
+        },
+        "on_true": [
+          {
+            "type": "set",
+            "params": {
+              "attr": "meta_task.implemented",
+              "operation": "set",
+              "value": true
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "branch",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            { "type": "instruction", "instruction_type": "set" },
+            {
+              "type": "eq",
+              "path": "instruction.params.attr",
+              "value": "meta_signal.node_done"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value",
+              "value": "closure"
+            }
+          ]
+        },
+        "on_true": [
+          {
+            "type": "set",
+            "params": {
+              "attr": "meta_task.closed",
+              "operation": "set",
+              "value": true
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -242,6 +242,15 @@ planner 走 delegate 既有路径(IoRequest sidecar 入链),零新增审计通�
 - **计划体检(M3)**:孤立 compute 节点(无消费者且非 output_node)物化时 warn
   非拒载(`find_orphan_computes`)。
 
+**协作任务标记(M5-b)**:`run_plan_loop` 增参 `marks_session`(None = 既有行为零
+变更)。workflow 执行时驱动创建标记会话(`initial_content` 载 `workflow_run`
+.kind/.workflow_id),每版执行成功后对 drain 出的已执行节点逐个提交中性完成信号
+`set meta_signal.node_done=<node_id>`(提交失败 fail-fast——留痕是硬义务)。
+信号为机制层伴生物、不含任务语义;「节点→任务标记」裁决完全在规则层
+(`rules/governance/collab_task_marks.json`,业务规则 branch 壳+set,写
+`meta_task.*` 标记,部署到 server 规则目录生效)。机制层/规则层分离:驱动
+generic 不含标记知识,改协作纪律 = 改规则零发版。
+
 ---
 
 ## 7. Agent 定义与桥接

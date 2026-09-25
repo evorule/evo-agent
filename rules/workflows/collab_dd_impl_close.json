@@ -1,0 +1,38 @@
+{
+  "$schema": "https://evorule.org/schemas/workflow_dag/v1.2.json",
+  "kind": "workflow_dag",
+  "id": "com.evorule.workflow.collab_dd_impl_close",
+  "version": "1.0.0",
+  "metadata": {
+    "title": "协作工作流模板：尽调 → 实施 → 核收",
+    "description": "三阶段协作纪律的编排层模板。各阶段完成事实经外层驱动以 meta_signal.node_done 信号进链，由业务规则 collab_task_marks（branch 壳+set）裁决写 meta_task.* 任务标记——任务全局观外置为引擎侧结构，防 LLM 对话遗忘（M5-b）。",
+    "authors": ["evorulelab@gmail.com"],
+    "created": "2026-09-25",
+    "updated": "2026-09-25",
+    "tags": ["workflow", "collaboration", "due-diligence", "closure"],
+    "license": "AGPL-3.0-or-later",
+    "provenance": { "source": "manual" }
+  },
+  "workflow_id": "collab_dd_impl_close",
+  "description": "尽调 → 实施 → 核收 三阶段协作：先调查取证，再产出交付物，最后验收核收；各阶段完成由驱动信号+规则标记进链留痕",
+  "nodes": [
+    {
+      "id": "due_diligence",
+      "agent_type": "researcher",
+      "task": "尽调阶段：盘点当前工作区 agents/ 目录，逐个读取 agent 定义文件（.json），汇总每个 agent 的职责定位与工具面，输出结构化尽调结论（每个 agent 一条：类型 / 职责 / 工具清单）。只调查，不产出交付物。"
+    },
+    {
+      "id": "implementation",
+      "agent_type": "general",
+      "task_template": "实施阶段：基于以下尽调结论产出交付物——《Agent 能力盘点表》（文本表格形态，直接输出在回复中，不写盘），覆盖尽调发现的全部 agent，不得遗漏。\n\n=== 尽调结论 ===\n{due_diligence}",
+      "depends_on": ["due_diligence"]
+    },
+    {
+      "id": "closure",
+      "agent_type": "general",
+      "task_template": "核收阶段：对照尽调结论逐项核查交付物，重点核验：①盘点表是否覆盖尽调发现的全部 agent；②每个条目的工具清单与尽调结论一致。核查通过则回复第一行为「核收通过」，并附核收说明；发现遗漏或不一致则回复「核收不通过」并列明差口。\n\n=== 尽调结论 ===\n{due_diligence}\n\n=== 待核收交付物 ===\n{implementation}",
+      "depends_on": ["implementation"]
+    }
+  ],
+  "output_node": "closure"
+}
