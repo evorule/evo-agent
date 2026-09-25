@@ -37,6 +37,7 @@
 ## [Unreleased]
 
 ### 🆕 新增
+- **workflow 任务标记（M5-b 全局观机制第二刀：协作留痕通道）** — `workflow` 执行时驱动创建标记会话（`initial_content={"kind":"workflow_run","workflow_id":...}`），每个节点执行成功后向其提交中性完成信号 `set meta_signal.node_done=<node_id>`（`run_plan_loop` 增参 `marks_session: Option<String>`，None=既有行为零变更；信号提交失败 fail-fast——留痕是硬义务）。信号不含任务语义，「节点→标记」裁决完全在规则层：新增业务规则资产 `rules/governance/collab_task_marks.json`（rule_set v1.0，tier="business"，三条 branch 壳+set：`due_diligence→meta_task.due_diligence_done`、`implementation→meta_task.implemented`、`closure→meta_task.closed`；部署到 server 规则目录生效），机制层生产信号、规则层裁决标记，改协作纪律=改规则零发版。新增示例工作流 `rules/workflows/collab_dd_impl_close.json`（尽调→实施→核收三节点线性协作，workflow_dag v1.2）。真实 LLM E2E：三节点走通（tokens_used=1036）+ 标记会话链上三标记全真（branch 壳条件触发与 on_true set 落链均实测确认）
 - **能力边界声明 `capability_boundary`(M5-a 全局观机制,agent_def v1.1 增量字段)** — agent.json 可声明 `{mode: "read_only"|"read_write", sandbox_root, tools}`,成为 file 类工具沙箱检查的单一事实源;未声明时按启动配置合成缺省边界(行为与既往完全一致)。声明生效后:①会话建立时在 system_prompt 尾部注入系统级边界段(LLM 自知边界,越界请求可自述边界而非误报「文件不存在」);②边界事实经 create_session 的 initial_content 载体进链(零新 Fact 类型);③file_read/file_write 越界错误改为回报「不可访问 + 边界路径」。语义门卫:mode 取值白名单/sandbox_root 必须为绝对路径/顶层 tools 中的沙箱类工具必须列于 boundary.tools/read_only 不得授予 file_write。Schema 权威:evorule-system-rules `agent_def/v1.1.json`(evorule-constitution 0.3.1,rev pin 同步 bump)
 - **`workflow` 子命令新增 `--max-tokens <N>` flag** — token 预算阈值接线：累计 `tokens_used` 达到 N 即触发 replan Budget 分支（交付物 7 tokens 埋点的阈值消费闭环）；不指定 = 不限（缺省 None 维度不参与判定，行为不变）。`DriverLimits`/`BudgetThresholds.max_tokens` 逐版接线（driver.rs 阈值重算处）
 - **D-01 二次保险 + 降级兜底（runner.rs）** — SSE 流关闭路径新增 enforce 兜底：断流可能吞掉 `Violation` 帧（违规表现为「静默成功后流关闭」），流关闭时 best-effort 查 evolution-signals，`total_violations > 0` 即以 `enforce violation: rule_ref=..., reason=...` 固定前缀上抛（归因取链上最新违规信号 `last_version` 最大者；workflow 层凭前缀判别终止不 replan）；兜底查询不可用（网络断/会话被 TTL 收割/server 不可达）时**降级**——warn 留痕 + 返回携带本地上下文的原流关闭错误，不掩盖不阻塞不重试。同批补齐**流式消费面（REPL/工作台 `run_streaming`）的 `Violation` 分支**（此前流式路径违规事件落 `_` 静默丢弃）
@@ -136,7 +137,10 @@
   专用转换模块 `json_convert` 不再需要，随之删除
 
 ### 🐛 修复
-
+- **`.env` 仅 serve 子命令加载（workflow/run 等子命令 LLM 密钥失联）** — O-095 结构性修复当时只接了
+  `cmd_serve`，`workflow`/`run`/`patrol` 等子命令路径不加载 `.env`：真实 LLM 运行在未显式注入环境变量时
+  密钥缺失，LLM 调用失败且节点表现为空产出假绿。现前置到 `main` 入口统一加载（已设置的环境变量优先，
+  serve 路径行为不变），所有子命令裸启动均可携带 LLM 密钥
 - **工作台对话侧栏交互失效(Svelte 5 runes 响应性)** — 对话侧栏组件混用 `$effect`(触发
   runes 模式)与普通 `let` 顶层状态,runes 模式下普通 `let` 不具备响应性:点「历史」面板
   不展开、输入文字后发送按钮不点亮;现改为 `$state()` 声明并在源码处注明语义防复发

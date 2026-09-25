@@ -112,12 +112,20 @@ pub struct PlanLoopOutcome {
 ///
 /// `seed_hash`：Dsl v1 计划形态 hash 锚（workflow 文件原文 BLAKE3 hex）；
 /// PlanExecute 模式可传 `None`（v1 hash 取注入后 PlanFact canonical JSON）。
+///
+/// `marks_session`：M5-b 协作工作流标记会话（`Some` = 启用）。启用后每个节点
+/// 成功完成时，驱动向该会话提交中性完成信号指令
+/// `set meta_signal.node_done = <node_id>`（机制层伴生事实，驱动不含任何
+/// 标记知识）；任务标记（meta_task.*）由规则面 branch 壳+set 业务规则裁决
+/// 写入——节点→标记映射全在规则层。信号提交失败 = fail-fast（留痕是硬义务）。
+/// `None` = 既有行为零变更（测试/无 server 场景）。
 pub async fn run_plan_loop(
     ctx: DelegateContext,
     initial: Workflow,
     mode: PlanMode,
     limits: DriverLimits,
     seed_hash: Option<String>,
+    marks_session: Option<String>,
 ) -> Result<PlanLoopOutcome, String> {
     // tokens 埋点累加器（纲领 §8 Phase 2 交付物 7）：驱动注入 ctx，随每个
     // 子 runner 共享；仅供观测统计，不改变任何控制流。
@@ -196,9 +204,18 @@ pub async fn run_plan_loop(
 
         // 已执行注册表 drain（R8-T03 比对源）：本版成功节点 (id, agent_type)
         // 跨版本累积；agent_type 按 id 反查（执行过必有定义，查不到兜底空串）。
+        // M5-b：同批 drained 节点逐个向标记会话提交中性完成信号（submit 失败
+        // fail-fast——留痕是硬义务，引擎不忘；信号幂等 set，replan 重执行安全）。
         for node_id in engine.take_executed_node_ids() {
             let agent_type = lookup_agent_type(&cur_wf.nodes, &node_id).unwrap_or_default();
-            executed_registry.push((node_id, agent_type));
+            executed_registry.push((node_id.clone(), agent_type));
+            if let Some(sid) = marks_session.as_deref() {
+                submit_node_signal(ctx_ref.evorule_client.clone(), sid, &node_id)
+                    .await
+                    .map_err(|e| {
+                        format!("workflow mark signal submit failed (node '{node_id}'): {e}")
+                    })?;
+            }
         }
 
         // D-01 enforce 判别（§9.5.1 选项 B）：宪法违规是系统性错误，一票否决
@@ -348,6 +365,35 @@ pub async fn run_plan_loop(
             "plan-execute: replan materialized, re-executing"
         );
     }
+}
+
+/// M5-b：协作节点完成信号指令形态（纯函数）
+///
+/// 中性事件：`set meta_signal.node_done = <node_id>`。驱动只报告「某节点完成了」，
+/// 不含任何标记知识——节点→任务标记的映射由规则面 branch 壳+set 业务规则裁决。
+pub fn node_done_signal(node_id: &str) -> Value {
+    json!({
+        "type": "set",
+        "params": {
+            "attr": "meta_signal.node_done",
+            "operation": "set",
+            "value": node_id
+        }
+    })
+}
+
+/// M5-b：向标记会话提交节点完成信号（submit_command 既有通道；成功即落链
+/// 为 StateTransition 事实，规则面在同一转换上求值 branch 壳并裁决标记）
+async fn submit_node_signal(
+    client: crate::api::evorule_client::EvoruleApiClient,
+    session_id: &str,
+    node_id: &str,
+) -> Result<(), String> {
+    let cmd = node_done_signal(node_id);
+    client
+        .submit_command(session_id, &cmd)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// D-01 enforce 违规判别（纯函数；§9.5.1 选项 B）
@@ -660,6 +706,49 @@ mod tests {
         // 无目标时的引导语
         let task2 = build_replan_task(None, &summary, "{}", 3);
         assert!(task2.contains("infer it from the previous plan summary"));
+    }
+
+    // ----- M5-b：协作工作流完成信号（node_done_signal / submit_node_signal）-----
+
+    #[test]
+    fn node_done_signal_shape_is_neutral_set() {
+        // 中性信号形态：set meta_signal.node_done=<node_id>；驱动不含标记知识
+        let sig = node_done_signal("due_diligence");
+        assert_eq!(sig["type"], "set");
+        assert_eq!(sig["params"]["attr"], "meta_signal.node_done");
+        assert_eq!(sig["params"]["operation"], "set");
+        assert_eq!(sig["params"]["value"], "due_diligence");
+        // 同输入必同输出（确定性）
+        assert_eq!(sig, node_done_signal("due_diligence"));
+    }
+
+    #[tokio::test]
+    async fn submit_node_signal_posts_signal_command() {
+        let mut server = mockito::Server::new_async().await;
+        let client = crate::api::evorule_client::EvoruleApiClient::new(&server.url());
+        let m = server
+            .mock("POST", "/api/sessions/42/command")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "instruction": node_done_signal("closure")
+            })))
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        submit_node_signal(client, "42", "closure")
+            .await
+            .expect("signal submit must succeed");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn submit_node_signal_fails_fast_on_transport_error() {
+        // 不可达端口 → Err（留痕是硬义务，fail-fast 由调用方上抛终止工作流）
+        let client = crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:1");
+        assert!(
+            submit_node_signal(client, "42", "closure").await.is_err(),
+            "unreachable server must yield transport error"
+        );
     }
 
     // ----- D-01 enforce 判别（§9.5.1-B：终止不 replan）-----

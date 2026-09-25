@@ -303,6 +303,13 @@ enum ToolsAction {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    // 0. 加载 .env(若存在;已设置的环境变量优先,不覆盖)——O-095 结构性修复的
+    //    全子命令推广:LLM 密钥加载前置到 main,run/workflow/patrol 等所有子命令
+    //    均不再依赖外部注入(此前仅 serve 加载,workflow 真实 LLM 运行会静默失联)
+    if let Some((path, applied)) = evo_agent::dotenv::load_dotenv_for(&cli.workdir) {
+        eprintln!("[dotenv] loaded {} key(s) from {}", applied, path.display());
+    }
+
     // 初始化 logging(0.1.0 简化:用 env RUST_LOG,默认 info)
     init_logging(cli.verbose);
 
@@ -1522,13 +1529,8 @@ fn cmd_serve(
     use tower_http::cors::CorsLayer;
     use tower_http::limit::RequestBodyLimitLayer;
 
-    // 0. 加载 .env(若存在;已设置的环境变量优先,不覆盖)——O-095 结构性修复,
-    //    裸启动 serve 也能带 LLM 密钥,不再依赖外部注入
-    if let Some((path, applied)) = evo_agent::dotenv::load_dotenv_for(workdir) {
-        eprintln!("[dotenv] loaded {} key(s) from {}", applied, path.display());
-    }
-
     // 1. 加载配置(宽松模式:server 启动不需要 LLM API key,只在 run 时才需要)
+    //    (.env 已在 main 入口统一加载,serve 不再单独处理)
     let config = match evo_agent::config::Config::load_lenient(workdir) {
         Ok(c) => c,
         Err(e) => {
@@ -2003,8 +2005,8 @@ fn cmd_workflow(
     let definitions = AgentDefinitionManager::new(config.agents.dir.clone());
     let client =
         EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
-    let mut ctx =
-        DelegateContext::new("workflow_root", definitions, client).with_max_depth(max_depth);
+    let mut ctx = DelegateContext::new("workflow_root", definitions, client.clone())
+        .with_max_depth(max_depth);
     if max_concurrent > 0 {
         ctx = ctx.with_max_concurrent_delegates(max_concurrent);
     }
@@ -2031,7 +2033,31 @@ fn cmd_workflow(
     // Dsl v1 计划形态 hash 锚 = workflow 文件原文 BLAKE3(交付物 6 §3.1 failed_plan_hash)
     let seed_hash = blake3::hash(wf_content.as_bytes()).to_hex().to_string();
 
-    let outcome = runtime.block_on(run_plan_loop(ctx, wf, mode, opts.limits, Some(seed_hash)));
+    // M5-b：协作工作流标记会话——驱动每个节点完成后向本会话提交中性完成信号
+    // (set meta_signal.node_done=<node_id>)，规则面 branch 壳+set 业务规则裁决
+    // 写 meta_task.* 任务标记(引擎不忘，链上可查)。创建失败 fail-fast。
+    let marks_session = match runtime.block_on(client.create_session(Some(&serde_json::json!({
+        "kind": "workflow_run",
+        "workflow_id": workflow_id,
+    })))) {
+        Ok(sid) => {
+            eprintln!("workflow marks session: {}", sid);
+            Some(sid)
+        }
+        Err(e) => {
+            eprintln!("failed to create workflow marks session: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+
+    let outcome = runtime.block_on(run_plan_loop(
+        ctx,
+        wf,
+        mode,
+        opts.limits,
+        Some(seed_hash),
+        marks_session,
+    ));
 
     match outcome {
         Ok(o) => {

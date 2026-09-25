@@ -330,6 +330,18 @@ wall_ms=81234 repeated_nodes=0 tokens_used=18745 replan_tokens=0) ===
 planner 产出的 PlanFact 若无法解析为 JSON，驱动会带提取错误反馈重试 1 次
 （全程硬上限 2 次 planner 调用），仍失败则整体终止，不猜测不静默。
 
+#### workflow 任务标记（协作留痕）
+
+workflow 执行时驱动会创建一个标记会话（`initial_content={"kind":"workflow_run",
+"workflow_id":...}`），每个节点执行成功后向该会话提交一条中性完成信号
+`set meta_signal.node_done=<node_id>`（信号提交失败即终止工作流——留痕是硬义务）。
+信号本身不含任何任务语义；「节点完成→任务标记」的裁决完全在规则层：
+治理规则（如 `rules/governance/collab_task_marks.json`，业务规则 branch 壳+set，
+部署到 server 规则目录后生效）监听信号并将 `meta_task.due_diligence_done` /
+`meta_task.implemented` / `meta_task.closed` 等标记写入会话状态。机制层生产信号、
+规则层裁决标记，二者分离——调整协作纪律只需改规则，零发版。示例工作流
+`collab_dd_impl_close`（尽调→实施→核收三节点）即按此协作纪律运行。
+
 ---
 
 ## Agent 定义
