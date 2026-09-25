@@ -129,6 +129,7 @@
 
 ### 🔄 变更
 
+- **serve 启动横幅打运行体身份** — 启动即打印 `版本 | exe mtime (epoch s) | workdir 绝对形态`，排障时可直接核对「运行中的 exe」与「源码 HEAD」是否一致，不留常驻进程二进制过期的盲区（无 build.rs 依赖）
 - **宪法 schema 校验收编共享组件 `evorule-constitution`** — `src/agent/constitution.rs` 由本地实现（目录探测/跨文件 `$ref` 内联/校验执行）改为薄封装（公共 API 签名不变，消费点零改动）：判定逻辑与 schema 数据（编译期内嵌，运行时零磁盘依赖）委托统一 crate（git 依赖 + rev 钉版），判定代码单一化；`jsonschema` 0.18 → 0.21（`Validator` API，跨文件 `$ref` 经 `$id` 解析，内联 hack 退役）；CI「检出宪法仓」步骤退役（cargo 自动拉取 git 依赖）；依赖契约断言精确化（主仓 crates 拦截保留，独立仓治理组件显式 allowlist）
 - **`list_publish_queue` 客户端方法** — 新增可选 `workspace_id` 过滤参数（None 保留旧行为）；`PublishQueueItem` 补齐 `kind` 字段（对齐 server 模型）
 - **移除 `blake3` 直接依赖** — 零代码调用（仅文档注释提及概念），死依赖删除；
@@ -138,6 +139,10 @@
   专用转换模块 `json_convert` 不再需要，随之删除
 
 ### 🐛 修复
+- **工具意图裁决假拦（独立裁决会话通道）** — 意图裁决原在主会话内「提交+1s 轮询 version」：主会话 `call_external` 在途（io_request 包装流）时引擎命令串行评估，意图指令仅在 IoResponse 后才被评估，轮询恒超时→一律判 blocked——工作台第二轮对话起相对路径合法文件操作也被假拦（首轮因新建分支漏设 session_id 恰好跳过裁决而正常）。重构为独立裁决会话通道（`agent/adjudicator.rs` `AdjudicationChannel`）：每 runner 一条 evorule 裁决会话（惰性创建、轮内复用，initial_content 自述身份供审计关联），不受主会话 io 在途影响；fail-closed 语义不变（version 未推进=拦截），传输错误失效重建重试一次仍败 fail-fast；首轮/续轮统一走裁决（删 `if let Some(session_id)` 守卫），新建分支同步回填 `runner.session_id`。四不变式：意图指令形态不变（中性 `set meta_tool.pending_target_scope`）/R1 规则资产零改动/workflow 场景零改动（phase 门仍走主会话）/裁决会话历史即审计证据。真实 LLM E2E 三场景验证：WS 多轮首轮/续轮相对路径放行、越界绝对路径拦截且 agent 自述边界；driver 正例三节点零误伤；driver 负例 R2 拦截 halt 零 LLM
+- **search_files 中文文件名 panic** — glob `*` 分支按字节索引切片（`0..=len`），索引落在多字节字符内部即 panic（byte index not a char boundary），中文/日文等文件名检索必触发、会话该轮崩溃；改为 `char_indices` 迭代+末尾空后缀补测（`?` 分支本就 char-safe 不动）；新增多字节 glob 断言与中文文件名端到端搜索单测
+- **file_list/search_files 越界文案缺边界路径** — 两工具绝对路径/父目录/越界错误仍是旧格式（无 M5-a 边界后缀），agent 被拒后无法自知边界；三条文案对齐 file_read/file_write 同款（回报「不可访问 + 沙箱边界绝对路径」）
+- **缺省沙箱根以相对「.」呈现** — 未声明 `capability_boundary` 时合成根直接用启动 workdir（相对路径形态），边界展示面（系统提示段/拦截文案）出现「outside the sandbox boundary '.'」，LLM 与用户均不可读；合成根改为 canonicalize 绝对化（目录缺失时 fallback cwd 拼接，相对尾段保留），Windows `\\?\` verbatim 前缀在展示面简化为常规形态（UNC 还原 `\\server\share`）
 - **workflow phase 门与节点完成信号时序倒挂（M5-c 实测修正）** — `node_done` 完成信号原由外层驱动在节点执行返回后 drain 提交，晚于引擎内 phase 门求值：带约束规则的 workflow 第二节点 delegate 前置门必被误拦（前置标记尚未落链，`exists` 判 false）。修正为 LLM 节点成功分支即时打标（workflow.rs `mark_node_done`：向标记会话提交完成信号并 version 感知等待落链），门/打标严格配对；driver drain 保留作幂等兜底，未注入 phase_gate 形态零变更
 - **`.env` 仅 serve 子命令加载（workflow/run 等子命令 LLM 密钥失联）** — O-095 结构性修复当时只接了
   `cmd_serve`，`workflow`/`run`/`patrol` 等子命令路径不加载 `.env`：真实 LLM 运行在未显式注入环境变量时

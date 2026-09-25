@@ -256,9 +256,13 @@ generic 不含标记知识,改协作纪律 = 改规则零发版。
 治理链晋升发布)——R1 边界强制/ R2 实施前置(未尽调不得实施)/ R3 核收前置
 (未实施不得核收)。机制层接线两处:
 - runner `handle_call_external`:file 类工具执行前 `resolve_target_scope`
-  解析目标落点 → 提交意图 set `meta_tool.pending_target_scope` 随指令进链 →
-  version 感知裁决(20×50ms 轮询)→ 被拦 = 不执行工具、向 LLM 返回治理拦截
-  错误(`enforce violation:` 前缀);handler 内联沙箱检查保留为兜底防线。
+  解析目标落点 → 经**独立裁决会话通道**(`agent/adjudicator.rs`
+  `AdjudicationChannel`:每 runner 一条 evorule 裁决会话,惰性创建轮内复用)
+  提交意图 set `meta_tool.pending_target_scope` 随指令进链 → version 感知
+  裁决(20×50ms 轮询)→ 被拦 = 不执行工具、向 LLM 返回治理拦截错误;
+  handler 内联沙箱检查保留为兜底防线。裁决走独立会话的原因:主会话
+  `call_external` 在途(io_request 包装流)时引擎命令串行评估,主会话内
+  轮询恒超时致合法操作假拦;传输错误失效重建重试一次仍败 fail-fast。
 - `WorkflowEngine::with_phase_gate`:LLM 节点 delegate 前向标记会话提交
   `set meta_workflow.phase=<node_id>` 由 R2/R3 裁决;**节点成功分支即时打标**
   (`mark_node_done`,version 感知等待标记落链)——门/打标配对时序:完成信号
