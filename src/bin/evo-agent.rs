@@ -2041,7 +2041,15 @@ fn cmd_workflow(
     let definitions = AgentDefinitionManager::new(config.agents.dir.clone());
     let client =
         EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
+    // O-114:注入 union toolkit + 工作目录——委托子代理按 def.tools 白名单获得
+    // 工具契约与能力边界，多轮工具回喂在流式 ReAct 循环完成（此前委托 runner
+    // 零工具契约：LLM 输出 <minimax:tool_call> 死文本且单轮即止，节点无实质产出）。
+    let ws_client =
+        evo_agent::api::workspace_client::WorkspaceApiClient::new(&config.evorule.base_url);
+    let union_toolkit =
+        evo_agent::api::serve_tools::build_union_toolkit(workdir, &ws_client, &client);
     let mut ctx = DelegateContext::new("workflow_root", definitions, client.clone())
+        .with_toolkit(union_toolkit, workdir)
         .with_max_depth(max_depth);
     if max_concurrent > 0 {
         ctx = ctx.with_max_concurrent_delegates(max_concurrent);

@@ -1424,6 +1424,32 @@ impl AgentRunner {
                         .or_else(|| state["payload"].as_str())
                         .unwrap_or_default()
                         .to_string();
+                    // O-113:与流式路径(last_llm_content fallback)对称——payload 读空时
+                    // 回捞本轮最近一次 LLM 输出(非流式单发场景=本会话唯一 LLM 响应)。
+                    let content = if content.is_empty() {
+                        messages
+                            .iter()
+                            .rev()
+                            .find_map(|m| match m {
+                                Message::Assistant { content, .. } => {
+                                    if content.is_empty() {
+                                        None
+                                    } else {
+                                        Some(content.clone())
+                                    }
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        content
+                    };
+                    if content.is_empty() {
+                        // O-113:空产出观测补位(不改判 success——合法空响应不误伤)。
+                        // 三联指纹(tokens=0+亚秒+空 content)曾掩盖 LLM 失败假绿,
+                        // 此处保证链上观测可见。
+                        warn!(%session_id, step_count, "Stable with empty content: possible LLM empty response (tokens_used side-channel in io_response)");
+                    }
 
                     info!(%session_id, content_len = content.len(), "Received Stable event, execution complete");
                     return Ok(AgentResult::success(
@@ -3127,6 +3153,18 @@ impl AgentRunner {
                                             full_tool_calls = resp.tool_calls.clone();
                                             finish_reason = resp.finish_reason.clone();
                                             last_llm_content = full_content.clone();
+                                            // plan-execute tokens 埋点（流式路径等效累加点，
+                                            // 对齐非流式 run() IoRequest 臂）：O-114 修复后
+                                            // delegate 改走流式运行，埋点随 token_counter 继续生效
+                                            // （流式中间态不提交 io_response，无非流式的 result 侧通道）
+                                            if let Some(counter) = &runner.token_counter {
+                                                if let Some(usage) = &resp.token_usage {
+                                                    counter.fetch_add(
+                                                        usage.total_tokens as u64,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                }
+                                            }
                                             // Fallback: LLM 未走 function calling 协议时,
                                             // 尝试从文本内容中解析 JSON tool call
                                             if full_tool_calls.is_none() || full_tool_calls.as_ref().map(|t| t.is_empty()).unwrap_or(true) {

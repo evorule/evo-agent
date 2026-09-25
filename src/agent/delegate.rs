@@ -14,6 +14,7 @@
 //!   防止高并发下 evorule session 数暴增(§9.6 风险缓解)
 
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ use tokio::sync::Semaphore;
 use crate::agent::definition::AgentDefinitionManager;
 use crate::agent::runner::DEFAULT_MAX_DELEGATE_DEPTH;
 use crate::api::evorule_client::EvoruleApiClient;
+use crate::io_handlers::tool_handler::ToolHandler;
 
 /// 委托任务的 boxed future 类型别名（降低 delegate_race 的类型复杂度）。
 type DelegateFuture = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
@@ -59,6 +61,14 @@ pub struct DelegateContext {
     /// runner 每次 LLM `IoRequest` 后累加 `token_usage.total_tokens`。外层驱动
     /// （driver.rs）据此维护 `BudgetCounters.tokens_used`。仅观测，不改控制流。
     pub token_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// O-114:union toolkit 来源（`with_toolkit` 成对注入；None = 子 runner 无工具面=旧行为）
+    ///
+    /// 注入后 `delegate()` 按子代理 `def.tools` 白名单过滤出可用工具挂载
+    /// （对齐 serve 面 construct_runner / CLI patrol_build_runner 模式），LLM
+    /// 请求据此携带工具契约；多轮工具回喂在流式路径的本地 ReAct 循环完成。
+    pub toolkit: Option<ToolHandler>,
+    /// O-114:工作目录（能力边界合成用；随 toolkit 成对注入）
+    pub workdir: Option<std::path::PathBuf>,
 }
 
 impl DelegateContext {
@@ -76,7 +86,18 @@ impl DelegateContext {
             max_depth: DEFAULT_MAX_DELEGATE_DEPTH,
             max_concurrent: None,
             token_counter: None,
+            toolkit: None,
+            workdir: None,
         }
+    }
+
+    /// O-114:注入 union toolkit + 工作目录（成对注入，随 `Clone` 延续到每个子 runner）
+    ///
+    /// toolkit 按各子代理 `def.tools` 白名单过滤后挂载；workdir 用于能力边界合成。
+    pub fn with_toolkit(mut self, toolkit: ToolHandler, workdir: &Path) -> Self {
+        self.toolkit = Some(toolkit);
+        self.workdir = Some(workdir.to_path_buf());
+        self
     }
 
     /// plan-execute tokens 埋点：注入共享累加器（随 `Clone` 延续到每个子 runner）
@@ -176,10 +197,50 @@ impl DelegateContext {
                 runner = runner.with_token_counter(counter.clone());
             }
 
-            let result = runner.run(task).await;
+            // O-114:工具面 + 能力边界接线（对齐 serve 面 construct_runner / CLI
+            // patrol_build_runner 模式）。委托 runner 此前零工具契约：LLM 无 tools
+            // 可知 → 凭训练先验输出供应商原生 XML（<minimax:tool_call> 死文本）。
+            // 按 def.tools 白名单过滤挂载；过滤后为空则不挂（纯规划类子代理维持旧行为）。
+            if let (Some(union), Some(workdir)) = (&self.toolkit, &self.workdir) {
+                let mut filtered =
+                    crate::api::serve_tools::build_filtered_toolkit(union, &def.tools);
+                if !filtered.tool_names().is_empty() {
+                    let boundary = crate::api::serve_tools::wire_capability_boundary(
+                        &mut filtered,
+                        &def,
+                        workdir,
+                    );
+                    runner = runner
+                        .with_tool_handler(filtered)
+                        .with_capability_boundary(boundary);
+                }
+            }
 
-            match result {
-                Ok(r) => {
+            // O-114:执行路径改走流式消费——宪法 v0.5.0 起 server 只做单发桥接
+            // （call_external 的 io_response 提交后即 Stable），多轮工具回喂在应用层
+            // run_streaming 的本地 ReAct 循环；非流式 run() 单轮即止，即使 LLM 正确
+            // 返回 tool_calls 也不执行。delegate() 对外签名 Result<String,String>
+            // 不变，driver/marks 层零改动。tokens 埋点已随流式路径 token_counter
+            // 累加点（StreamChunk::Done 臂）继续生效。
+            let mut stream = runner.run_streaming(task.to_string());
+            let mut final_result: Option<crate::agent::runner::AgentResult> = None;
+            let mut stream_err: Option<String> = None;
+            while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
+                match ev {
+                    Ok(crate::agent::runner::AgentEvent::Done(r)) => {
+                        final_result = Some(r);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        // 流式实现中 Err 后仍会跟 Done(error)；记录并以 Done 为权威终态
+                        stream_err = Some(e.to_string());
+                    }
+                }
+            }
+
+            match final_result {
+                Some(r) => {
                     if r.success {
                         tracing::info!(
                             agent_type,
@@ -198,8 +259,11 @@ impl DelegateContext {
                         Err(err)
                     }
                 }
-                Err(e) => {
-                    let err = format!("Sub-agent runtime error: {}", e);
+                None => {
+                    let err = format!(
+                        "Sub-agent runtime error: {}",
+                        stream_err.unwrap_or_else(|| "stream ended without Done".to_string())
+                    );
                     tracing::error!(agent_type, depth = self.current_depth, "{}", err);
                     Err(err)
                 }
@@ -368,6 +432,29 @@ mod tests {
         assert!(ctx.can_delegate(3));
         assert!(!ctx.can_delegate(2));
         assert!(ctx.can_delegate(10));
+    }
+
+    // ===== O-114:工具面注入 =====
+
+    #[test]
+    fn test_delegate_context_with_toolkit_injection() {
+        // 默认无工具面（旧行为）
+        let ctx = make_ctx();
+        assert!(ctx.toolkit.is_none());
+        assert!(ctx.workdir.is_none());
+        // with_toolkit 成对注入
+        let ctx2 = make_ctx().with_toolkit(ToolHandler::new(), Path::new("D:/tmp"));
+        assert!(ctx2.toolkit.is_some());
+        assert_eq!(ctx2.workdir.as_deref(), Some(Path::new("D:/tmp")));
+    }
+
+    #[test]
+    fn test_delegate_context_toolkit_continues_through_clone() {
+        // toolkit/workdir 随 increment_depth（内部 clone）延续到每个子 runner
+        let ctx = make_ctx().with_toolkit(ToolHandler::new(), Path::new("."));
+        let child = ctx.increment_depth();
+        assert!(child.toolkit.is_some());
+        assert!(child.workdir.is_some());
     }
 
     #[test]
