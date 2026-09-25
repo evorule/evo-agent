@@ -14,8 +14,16 @@ cargo build --quiet
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL: cargo build"; $failed = $true } else { Write-Host "PASS: cargo build" }
 
 Write-Host "== [2/4] cargo test =="
-cargo test 2>$null | Select-String -Pattern "^test result"
-if ($LASTEXITCODE -ne 0) { Write-Host "FAIL: cargo test"; $failed = $true } else { Write-Host "PASS: cargo test" }
+# 失败明细随 stderr 走——必须并流保留,否则 CI 日志只剩汇总行无法定位
+# (2026-09-25 教训:ubuntu 两测试红灯但日志零明细,只能本地 WSL 复现)。
+# $ErrorActionPreference 顶部已设 Continue,2>&1 不会中断脚本。
+$testLog = cargo test 2>&1 | ForEach-Object { "$_" }
+$testLog | Select-String -Pattern "^test result"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "FAIL: cargo test -- failure details (last 80 lines):"
+    $testLog | Select-Object -Last 80 | ForEach-Object { Write-Host $_ }
+    $failed = $true
+} else { Write-Host "PASS: cargo test" }
 
 Write-Host "== [3/4] secret scan =="
 $patterns = @(
