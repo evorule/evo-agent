@@ -423,7 +423,11 @@ async fn test_sediment_rollup_marks_old_summaries_as_rolled_up() {
 // LLM 侧用独立 mockito 服务器模拟 OpenAI 兼容 API（含 tool_calls 归一化回归）。
 
 /// 通用 evorule server mock：create_session / shared facts(空) / command / events(SSE) / state / io_response(兜底)
-async fn mock_evorule_base(server: &mut Server, session_id: &str, sse_body: String) {
+async fn mock_evorule_base(
+    server: &mut Server,
+    session_id: &str,
+    sse_body: String,
+) -> mockito::Mock {
     server
         .mock("POST", "/api/sessions")
         .with_status(200)
@@ -458,7 +462,10 @@ async fn mock_evorule_base(server: &mut Server, session_id: &str, sse_body: Stri
         .with_body(r#"{"payload":{"llm_response":{"content":"done"}}}"#)
         .create_async()
         .await;
-    // io_response 兜底(先创建;需要 body 断言的 mock 在各测试中后创建,优先级更高)
+    // io_response 兜底。mockito 1.7 匹配优先级（server.rs handle_request）：
+    // 「有未满足 expect 的匹配 mock（按创建序）」→ 否则「最后创建的匹配 mock」。
+    // 兜底无 expect 恒未满足且创建最早：首个 io_response 请求必落它；
+    // 需按 body 断言的测试应 delete 兜底后自建（见 O-118 回归测试）。
     server
         .mock(
             "POST",
@@ -467,7 +474,7 @@ async fn mock_evorule_base(server: &mut Server, session_id: &str, sse_body: Stri
         .with_status(200)
         .with_body("{}")
         .create_async()
-        .await;
+        .await
 }
 
 fn sse_line(event: &serde_json::Value) -> String {
@@ -581,6 +588,46 @@ async fn test_multi_turn_react_loop_with_tool_call() {
     );
     assert_eq!(result.tool_calls, vec!["lookup".to_string()]);
     llm_turn2.assert_async().await;
+}
+
+/// O-118 回归：IoRequest 处理失败时 run() 必须回写 error io_response，
+/// 不留悬挂在途请求。触发器用「LLM 不可达」快速产生 LlmError —— 与 60s
+/// step 超时（AgentConfig.step_timeout 在 execute_external 处包裹）走同一
+/// Err 传播臂，修复前 `r?` 直接上抛、零 io_response，server 侧 io_request
+/// 永久挂起（链实不一致）。修复后：错误回写引擎收尾，再如实上抛。
+#[tokio::test]
+async fn test_io_request_failure_submits_error_io_response() {
+    let mut server = Server::new_async().await;
+    let sse = format!(
+        "{}{}",
+        sse_line(&io_request(
+            1,
+            "call_external",
+            json!({"model":"mock-model"})
+        )),
+        sse_line(&json!({"type":"Stable"})),
+    );
+    // 删除 io_response 兜底（首个请求必落它，见 mock_evorule_base 注释），
+    // 换成带 body 断言的 mock：error io_response 必须到达且仅按该形状匹配。
+    let fallback = mock_evorule_base(&mut server, "777", sse).await;
+    fallback.remove();
+    let io_resp_err = server
+        .mock("POST", "/api/sessions/777/io_response")
+        .match_body(mockito::Matcher::PartialJson(json!({"request_id": 1})))
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    // LLM 指向保留端口且零重试 → call_external 立即失败（LlmError）
+    let llm =
+        LlmHandler::new("mock-model", "http://127.0.0.1:1", None).with_retry_config(0, 0.001, 0.01);
+    let mut runner = AgentRunner::new(AgentConfig::default(), client).with_llm_handler(llm);
+
+    let result = runner.run("trigger llm failure").await;
+    assert!(result.is_err(), "run must propagate the io failure");
+    io_resp_err.assert_async().await;
 }
 
 /// 审批-拒绝路径:工具返回 needs_approval proposal,无 approval callback

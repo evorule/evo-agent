@@ -139,6 +139,7 @@
   专用转换模块 `json_convert` 不再需要，随之删除
 
 ### 🐛 修复
+- **IoRequest 处理失败后引擎在途请求悬挂（链实不一致）** — 非流式 `run()` 主循环对 IoRequest 处理失败（60s step 超时 / LLM 错误 / 工具错误 / 内部错误）一律直接上抛，不回写 io_response：server 侧 io_request 永久挂起，链上留下幽灵在途请求，链记录与 runner 实际执行态脱节；流式路径另有 4 处 persist_message 失败早退同病。统一为「失败也回写 error io_response 再终止」——与 audited_llm 既有「LLM 失败不留悬空 IoRequest」契约、流式路径取消/错误分支同一语义，保证引擎状态机必能收尾；突变验证回归测试锁定（无修复红 / 有修复绿）
 - **工具意图裁决假拦（独立裁决会话通道）** — 意图裁决原在主会话内「提交+1s 轮询 version」：主会话 `call_external` 在途（io_request 包装流）时引擎命令串行评估，意图指令仅在 IoResponse 后才被评估，轮询恒超时→一律判 blocked——工作台第二轮对话起相对路径合法文件操作也被假拦（首轮因新建分支漏设 session_id 恰好跳过裁决而正常）。重构为独立裁决会话通道（`agent/adjudicator.rs` `AdjudicationChannel`）：每 runner 一条 evorule 裁决会话（惰性创建、轮内复用，initial_content 自述身份供审计关联），不受主会话 io 在途影响；fail-closed 语义不变（version 未推进=拦截），传输错误失效重建重试一次仍败 fail-fast；首轮/续轮统一走裁决（删 `if let Some(session_id)` 守卫），新建分支同步回填 `runner.session_id`。四不变式：意图指令形态不变（中性 `set meta_tool.pending_target_scope`）/R1 规则资产零改动/workflow 场景零改动（phase 门仍走主会话）/裁决会话历史即审计证据。真实 LLM E2E 三场景验证：WS 多轮首轮/续轮相对路径放行、越界绝对路径拦截且 agent 自述边界；driver 正例三节点零误伤；driver 负例 R2 拦截 halt 零 LLM
 - **search_files 中文文件名 panic** — glob `*` 分支按字节索引切片（`0..=len`），索引落在多字节字符内部即 panic（byte index not a char boundary），中文/日文等文件名检索必触发、会话该轮崩溃；改为 `char_indices` 迭代+末尾空后缀补测（`?` 分支本就 char-safe 不动）；新增多字节 glob 断言与中文文件名端到端搜索单测
 - **file_list/search_files 越界文案缺边界路径** — 两工具绝对路径/父目录/越界错误仍是旧格式（无 M5-a 边界后缀），agent 被拒后无法自知边界；三条文案对齐 file_read/file_write 同款（回报「不可访问 + 沙箱边界绝对路径」）
