@@ -605,8 +605,8 @@ dependencies = [
 
 [[package]]
 name = "evorule-constitution"
-version = "0.3.0"
-source = "git+https://gitee.com/evorule/evorule-system-rules?rev=e31f523e35a69d65ee47b0126fc0a995947a9900#e31f523e35a69d65ee47b0126fc0a995947a9900"
+version = "0.3.1"
+source = "git+https://gitee.com/evorule/evorule-system-rules?rev=706daa8e7c096debe8a2f29fa8c6dc04d5cba6b6#706daa8e7c096debe8a2f29fa8c6dc04d5cba6b6"
 dependencies = [
  "jsonschema",
  "serde_json",

@@ -192,6 +192,7 @@ GET /agents/{agent_type} HTTP/1.1
 | `model` | string | LLM 模型名 |
 | `temperature` | float | 温度参数 |
 | `max_steps` | int | 最大执行步数 |
+| `capability_boundary` | object\|null | 能力边界声明(可选,agent_def v1.1;缺省 = 未声明,serve 层按启动配置合成缺省边界)。`mode`: `"read_only"` / `"read_write"`;`sandbox_root`: 沙箱根目录(绝对路径,file 类工具路径相对该根解析);`tools`: 边界内沙箱类工具清单。声明为 file 类工具沙箱检查的单一事实源,并在会话建立时注入系统级边界段与会话事实 |
 | `memory_config` | object\|null | 记忆配置(详见下表) |
 | `memory_config.type` | string | 记忆类型:`"none"` 或 `"persistent"` |
 | `memory_config.namespace` | string | 记忆命名空间 |

@@ -200,6 +200,68 @@ pub struct OutputFormat {
     pub max_retries: Option<usize>,
 }
 
+/// 沙箱类工具清单:出现在顶层 `tools` 时,`capability_boundary.tools` 必须覆盖
+/// (单一事实源门卫的判定基准)
+pub const SANDBOX_CAPABLE_TOOLS: &[&str] = &["file_read", "file_write"];
+
+/// 能力边界声明（M5-a 全局观机制,2026-09-25;agent_def v1.1 增量字段）
+///
+/// 声明是 file 类工具沙箱检查的**唯一权威**（宪法 §七 反模式④封堵:禁声明与
+/// 执行双源并存——启动配置仅作为「未声明时」的缺省来源）,同时在会话建立时
+/// 注入系统级边界段与会话事实:首要读者是 agent 自身（LLM 自知边界,不再
+/// 「摸不着自己」——越界请求能自述边界而非误报「文件不存在」）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CapabilityBoundary {
+    /// 访问模式:"read_only"(只读) | "read_write"(沙箱根全域可读写)
+    pub mode: String,
+    /// 沙箱根目录(绝对路径);file 类工具路径一律相对该根解析,越界即拒
+    pub sandbox_root: PathBuf,
+    /// 边界内工具清单(语义门卫:顶层 tools 中的沙箱类工具必须列于此;
+    /// mode=read_only 时不得含 file_write)
+    pub tools: Vec<String>,
+}
+
+impl CapabilityBoundary {
+    /// 是否只读模式
+    pub fn is_read_only(&self) -> bool {
+        self.mode == "read_only"
+    }
+
+    /// 序列化为会话事实形态(经 create_session initial_content 既有载体进链,
+    /// 零新 Fact 类型)
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "capability_boundary": {
+                "mode": self.mode,
+                "sandbox_root": self.sandbox_root.display().to_string(),
+                "tools": self.tools,
+            }
+        })
+    }
+
+    /// 系统级边界段文本(会话建立稳定位置追加到 system_prompt 尾部;
+    /// 首要读者 = LLM 自知——缺输入就地编造是「一本正经胡说八道」的机理,
+    /// 显式供给边界是机制解法而非 prompt 恳求)
+    pub fn awareness_segment(&self) -> String {
+        let mode_desc = if self.is_read_only() {
+            "read_only(只读,你没有写文件能力)"
+        } else {
+            "read_write(沙箱根全域可读写)"
+        };
+        format!(
+            "【能力边界声明】\n\
+             - 访问模式:{}\n\
+             - 沙箱根目录:{}(一切文件路径相对该根解析)\n\
+             - 边界内工具:{}\n\
+             越出沙箱根的路径不可访问;尝试越界的操作会被拒绝并告知边界。\
+             若任务需要边界外的资源,如实说明边界限制,不要猜测或编造。",
+            mode_desc,
+            self.sandbox_root.display(),
+            self.tools.join(", ")
+        )
+    }
+}
+
 /// Agent definition
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentDefinition {
@@ -245,6 +307,10 @@ pub struct AgentDefinition {
         skip_serializing_if = "is_max_parallel_tools_default"
     )]
     pub max_parallel_tools: usize,
+    /// 能力边界声明(可选;agent_def v1.1 增量。None = 未声明,行为同 v1.0:
+    /// serve 层按启动配置合成缺省边界)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_boundary: Option<CapabilityBoundary>,
 }
 
 /// G13:`max_parallel_tools` 的默认值(串行)
@@ -298,6 +364,52 @@ impl AgentDefinition {
             return Err(AgentDefinitionError::InvalidDefinition(
                 "step_timeout_secs must be >= 1".to_string(),
             ));
+        }
+        // M5-a:capability_boundary 语义门卫(单一事实源 + 模式/工具一致性)
+        if let Some(b) = &self.capability_boundary {
+            if b.mode != "read_only" && b.mode != "read_write" {
+                return Err(AgentDefinitionError::InvalidDefinition(format!(
+                    "capability_boundary.mode '{}' must be 'read_only' or 'read_write'",
+                    b.mode
+                )));
+            }
+            if b.sandbox_root.as_os_str().is_empty() {
+                return Err(AgentDefinitionError::InvalidDefinition(
+                    "capability_boundary.sandbox_root must not be empty".to_string(),
+                ));
+            }
+            if !b.sandbox_root.is_absolute() {
+                return Err(AgentDefinitionError::InvalidDefinition(format!(
+                    "capability_boundary.sandbox_root '{}' must be an absolute path",
+                    b.sandbox_root.display()
+                )));
+            }
+            // 单一事实源:顶层 tools 中的沙箱类工具必须被声明覆盖
+            // (否则该工具沙箱绑定启动配置、声明形同虚设 → 双源漂移)
+            for t in &self.tools {
+                if SANDBOX_CAPABLE_TOOLS.contains(&t.as_str()) && !b.tools.contains(t) {
+                    return Err(AgentDefinitionError::InvalidDefinition(format!(
+                        "tool '{}' is sandbox-capable and must be declared in \
+                         capability_boundary.tools (single source of truth)",
+                        t
+                    )));
+                }
+            }
+            // 只读模式不得授予写工具
+            if b.is_read_only() && b.tools.iter().any(|t| t == "file_write") {
+                return Err(AgentDefinitionError::InvalidDefinition(
+                    "capability_boundary mode 'read_only' cannot grant 'file_write'".to_string(),
+                ));
+            }
+            // 死声明防护:声明的工具必须真实存在于顶层 tools
+            for t in &b.tools {
+                if !self.tools.contains(t) {
+                    return Err(AgentDefinitionError::InvalidDefinition(format!(
+                        "capability_boundary lists tool '{}' which is not in the agent's tools",
+                        t
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -364,6 +476,9 @@ impl AgentDefinition {
             } else {
                 self.max_parallel_tools
             },
+            // M5-a:边界声明不在 to_agent_config 复制——生效边界由 serve/CLI 层
+            // wire_capability_boundary 统一合成注入(单一事实源,禁双源)
+            capability_boundary: None,
         }
     }
 }
@@ -623,6 +738,7 @@ mod tests {
             output_format: None,
             context_window_tokens: None,
             max_parallel_tools: 1,
+            capability_boundary: None,
         };
         let config = def.to_agent_config();
         assert_eq!(config.agent_type, "writer");
@@ -889,6 +1005,126 @@ mod tests {
         );
     }
 
+    // ===== M5-a: capability_boundary 测试 =====
+
+    #[test]
+    fn test_capability_boundary_serde_roundtrip_and_skip() {
+        // None(缺省)时序列化不出现该键(v1.0 存量文档零迁移)
+        let json = r#"{
+            "agent_type": "x", "version": "1", "description": "",
+            "system_prompt": "", "model": "m", "temperature": 0.5,
+            "max_steps": 1, "step_timeout_secs": 1, "tools": [],
+            "output_format": null
+        }"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert!(def.capability_boundary.is_none());
+        let ser = serde_json::to_string(&def).expect("serialize");
+        assert!(
+            !ser.contains("capability_boundary"),
+            "None 应被 skip: {}",
+            ser
+        );
+
+        // 声明存在时往返保真
+        let json2 = r#"{
+            "agent_type": "x", "version": "1", "description": "",
+            "system_prompt": "", "model": "m", "temperature": 0.5,
+            "max_steps": 1, "step_timeout_secs": 1,
+            "tools": ["file_read"],
+            "output_format": null,
+            "capability_boundary": {
+                "mode": "read_only",
+                "sandbox_root": "D:/evo-agent",
+                "tools": ["file_read"]
+            }
+        }"#;
+        let def2: AgentDefinition = serde_json::from_str(json2).expect("parse");
+        let b = def2.capability_boundary.as_ref().expect("declared");
+        assert!(b.is_read_only());
+        assert_eq!(b.tools, vec!["file_read".to_string()]);
+        assert!(
+            def2.validate().is_ok(),
+            "合法声明应通过门卫: {:?}",
+            def2.validate()
+        );
+    }
+
+    #[test]
+    fn test_capability_boundary_validate_rejections() {
+        let mk = |mode: &str, root: &str, tools: Vec<&str>, btools: Vec<&str>| AgentDefinition {
+            agent_type: "x".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            system_prompt: String::new(),
+            model: "m".to_string(),
+            temperature: 0.5,
+            max_steps: 1,
+            step_timeout_secs: 1,
+            tools: tools.into_iter().map(String::from).collect(),
+            memory: MemoryConfig::default(),
+            output_format: None,
+            context_window_tokens: None,
+            max_parallel_tools: 1,
+            capability_boundary: Some(CapabilityBoundary {
+                mode: mode.to_string(),
+                sandbox_root: PathBuf::from(root),
+                tools: btools.into_iter().map(String::from).collect(),
+            }),
+        };
+        // mode 取值越界
+        let e = mk("read_all", "D:/x", vec!["file_read"], vec!["file_read"]);
+        assert!(e.validate().is_err());
+        // sandbox_root 相对路径
+        let e = mk(
+            "read_only",
+            "relative/dir",
+            vec!["file_read"],
+            vec!["file_read"],
+        );
+        assert!(e.validate().is_err());
+        // 单一事实源:顶层 tools 有沙箱类工具但声明未覆盖
+        let e = mk("read_only", "D:/x", vec!["file_read"], vec![]);
+        assert!(e.validate().is_err());
+        // read_only 授予写工具
+        let e = mk("read_only", "D:/x", vec!["file_write"], vec!["file_write"]);
+        assert!(e.validate().is_err());
+        // 死声明:声明的工具不在顶层 tools
+        let e = mk(
+            "read_only",
+            "D:/x",
+            vec!["file_read"],
+            vec!["file_read", "file_write"],
+        );
+        assert!(e.validate().is_err());
+        // 合法:read_write 覆盖双沙箱工具
+        let ok = mk(
+            "read_write",
+            "D:/x",
+            vec!["file_read", "file_write"],
+            vec!["file_read", "file_write"],
+        );
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn test_capability_boundary_to_json_and_segment() {
+        let b = CapabilityBoundary {
+            mode: "read_only".to_string(),
+            sandbox_root: PathBuf::from("D:/evo-agent"),
+            tools: vec!["file_read".to_string()],
+        };
+        // 会话事实形态:包裹键 capability_boundary(server initial_content 载体)
+        let j = b.to_json();
+        assert_eq!(j["capability_boundary"]["mode"], "read_only");
+        assert_eq!(j["capability_boundary"]["sandbox_root"], "D:/evo-agent");
+        // 系统级边界段:首要读者 LLM 自知——模式/根/工具三要素齐备
+        let seg = b.awareness_segment();
+        assert!(seg.contains("能力边界声明"));
+        assert!(seg.contains("read_only"));
+        assert!(seg.contains("D:/evo-agent"));
+        assert!(seg.contains("file_read"));
+    }
+
     // ===== G13: max_parallel_tools 测试 =====
 
     #[test]
@@ -971,6 +1207,7 @@ mod tests {
             output_format: None,
             context_window_tokens: None,
             max_parallel_tools: 1,
+            capability_boundary: None,
         };
         let json = serde_json::to_string(&def).expect("serialize");
         assert!(

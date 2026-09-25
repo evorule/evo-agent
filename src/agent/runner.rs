@@ -72,6 +72,9 @@ pub struct AgentConfig {
     ///
     /// candidate 工具(需审批)始终串行,不受此参数影响。
     pub max_parallel_tools: usize,
+    /// M5-a:生效能力边界声明(serve/CLI 层注入;None = 调用方未注入,
+    /// 会话无边界段与边界事实——缺省定义行为同 v1.0)
+    pub capability_boundary: Option<crate::agent::definition::CapabilityBoundary>,
 }
 
 impl Default for AgentConfig {
@@ -87,6 +90,7 @@ impl Default for AgentConfig {
             llm_retry_count: 3,
             output_format: None,
             max_parallel_tools: 1,
+            capability_boundary: None,
         }
     }
 }
@@ -938,6 +942,17 @@ impl AgentRunner {
         self
     }
 
+    /// M5-a:注入生效能力边界声明(serve/CLI 层按定义或启动配置合成后传入;
+    /// 注入后 run/run_streaming 会话建立时追加系统级边界段 + 随
+    /// create_session initial_content 进会话事实)
+    pub fn with_capability_boundary(
+        mut self,
+        boundary: crate::agent::definition::CapabilityBoundary,
+    ) -> Self {
+        self.config.capability_boundary = Some(boundary);
+        self
+    }
+
     /// G18:追加一个事件回调
     ///
     /// 回调在 `run_streaming()` 的每个事件 yield 点被调用(同步 await + 1s 超时 + panic 保护)。
@@ -1081,7 +1096,7 @@ impl AgentRunner {
             }
             None => crate::agent::memory::RecallContext::default(),
         };
-        let system_prompt = match self.memory.as_ref() {
+        let mut system_prompt = match self.memory.as_ref() {
             Some(mem) => mem.build_system_prompt_with_recall(
                 &self.config.system_prompt,
                 &recall,
@@ -1092,8 +1107,22 @@ impl AgentRunner {
             ),
             None => self.config.system_prompt.clone(),
         };
+        // M5-a:系统级边界段注入(会话建立稳定位置;首要读者 = LLM 自知)
+        if let Some(b) = &self.config.capability_boundary {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&b.awareness_segment());
+        }
 
-        let session_id = self.evorule_client.create_session(None).await?;
+        // M5-a:边界声明经 create_session initial_content 既有载体进会话事实
+        let boundary_json = self
+            .config
+            .capability_boundary
+            .as_ref()
+            .map(|b| b.to_json());
+        let session_id = self
+            .evorule_client
+            .create_session(boundary_json.as_ref())
+            .await?;
         self.session_id = Some(session_id.clone());
         info!(%session_id, "Created evorule session");
 
@@ -2558,7 +2587,7 @@ impl AgentRunner {
                 ).await,
                 None => crate::agent::memory::RecallContext::default(),
             };
-            let system_prompt = match runner.memory.as_ref() {
+            let mut system_prompt = match runner.memory.as_ref() {
                 Some(mem) => mem.build_system_prompt_with_recall(
                     &runner.config.system_prompt,
                     &recall,
@@ -2569,6 +2598,11 @@ impl AgentRunner {
                 ),
                 None => runner.config.system_prompt.clone(),
             };
+            // M5-a:系统级边界段注入(与 run() 同口径)
+            if let Some(b) = &runner.config.capability_boundary {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&b.awareness_segment());
+            }
 
             // 2. session:新建 或 复用(G15:continuation)
             let session_id = if let Some(id) = existing_session_id.clone() {
@@ -2579,7 +2613,9 @@ impl AgentRunner {
                 id
             } else {
                 // 新建 session(原 run_streaming 逻辑)
-                match runner.evorule_client.create_session(None).await {
+                // M5-a:边界声明经 initial_content 既有载体进会话事实
+                let boundary_json = runner.config.capability_boundary.as_ref().map(|b| b.to_json());
+                match runner.evorule_client.create_session(boundary_json.as_ref()).await {
                     Ok(id) => id,
                     Err(e) => {
                         yield Err(AgentError::EvoruleError(e.to_string()));

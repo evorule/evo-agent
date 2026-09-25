@@ -74,13 +74,20 @@ impl FileWriteTool {
     fn resolve_safe_path(&self, raw: &str) -> Result<(PathBuf, PathBuf), String> {
         let path = Path::new(raw);
         if path.is_absolute() {
-            return Err(format!("absolute path not allowed: '{}'", raw));
+            return Err(format!(
+                "absolute path not allowed: '{}' (all paths must stay within the sandbox \
+                 boundary '{}')",
+                raw,
+                self.workdir.display()
+            ));
         }
         for component in path.components() {
             if matches!(component, Component::ParentDir) {
                 return Err(format!(
-                    "parent dir (..) not allowed: '{}' (must stay within writable_dir)",
-                    raw
+                    "parent dir (..) not allowed: '{}' (must stay within the sandbox \
+                     boundary '{}')",
+                    raw,
+                    self.workdir.display()
                 ));
             }
         }
@@ -113,7 +120,12 @@ impl FileWriteTool {
             ));
         }
         if !target.starts_with(&self.workdir) {
-            return Err(format!("path escapes workdir: '{}'", raw));
+            // M5-a:越界错误回报「不可访问 + 边界路径」
+            return Err(format!(
+                "path escapes workdir: '{}' is not accessible (outside the sandbox boundary '{}')",
+                raw,
+                self.workdir.display()
+            ));
         }
 
         // 5. symlink / reparse point 检查(canonical 必须仍在 writable_dir 内)

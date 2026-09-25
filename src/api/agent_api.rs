@@ -515,7 +515,10 @@ async fn run_agent(
     );
 
     // E1:按白名单过滤 toolkit(serve 模式安全隔离)
-    let filtered = crate::api::serve_tools::build_filtered_toolkit(&state.toolkit, &def.tools);
+    let mut filtered = crate::api::serve_tools::build_filtered_toolkit(&state.toolkit, &def.tools);
+    // M5-a:能力边界接线(显式声明重绑 file 工具沙箱 + 生效边界注入 runner)
+    let capability_boundary =
+        crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
     // L2 约束前馈:具备规则生成/校验能力的 agent,构造时把 L2 边界段追加到
     // system_prompt 尾部(memory recall 在 runner 内层包装,顺序不变;fail-soft)
     crate::api::serve_tools::apply_l2_feed_forward(
@@ -538,6 +541,7 @@ async fn run_agent(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .with_capability_boundary(capability_boundary)
     .with_metrics(state.metrics.clone());
 
     let result = runner.run(&req.goal).await;
@@ -603,7 +607,10 @@ async fn run_agent_stream(
     );
 
     // E1:按白名单过滤 toolkit(serve 模式安全隔离)
-    let filtered = crate::api::serve_tools::build_filtered_toolkit(&state.toolkit, &def.tools);
+    let mut filtered = crate::api::serve_tools::build_filtered_toolkit(&state.toolkit, &def.tools);
+    // M5-a:能力边界接线(同 run_agent 口径)
+    let capability_boundary =
+        crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
     // L2 约束前馈:同 run_agent 口径(三路径共用 helper;fail-soft)
     crate::api::serve_tools::apply_l2_feed_forward(
         &state.evorule_client,
@@ -625,6 +632,7 @@ async fn run_agent_stream(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .with_capability_boundary(capability_boundary)
     // G8:注入 HttpApproval — candidate 工具返回 needs_approval 时,
     // runner 通过 oneshot channel 等 POST /approve(60s 超时自动拒绝)
     .with_approval_callback(std::sync::Arc::new(
