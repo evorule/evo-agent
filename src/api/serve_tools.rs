@@ -148,6 +148,47 @@ const EVOLUTION_AWARENESS_SEGMENT: &str = "【进化信号感知】\n\
 你具备 evolution_signals 工具（只读）。若任务涉及一个已有会话且其存在反复被强制拦截的违规,\
 先用该工具拉取该会话的进化信号摘要,再围绕高频违规起草改进规则；无信号或与任务无关时跳过。";
 
+// =============================================================================
+// M1 规范入口索引感知段（serve 三路径共用,静态文本,无网络调用——确定性注入）
+// =============================================================================
+
+/// 规范入口索引感知段（BACKLOG M1,2026-09-25）
+///
+/// 内容源 = `D:\knowledge\7-Expert\INDEX-规范入口-给agent.md` v1.0 的**产品端
+/// 投影**（立项-M1 §二方案 A 裁决）。投影三原则：
+/// - 速查自足：核心程序（三问/留痕格式）全文在段内,agent 不依赖外档即可执行；
+/// - 知识地图：知道什么规范存在、归哪个域；
+/// - 边界如实：规范原档在宿主侧知识库、沙箱内不可达,如实声明（对齐 M5-a
+///   「不要猜测或编造」）——第一案 P4 实测原档 `D:\knowledge\7-Expert` 物理
+///   不可达,原「search_files 定向检索原档」设想按实测修表转译。
+///
+/// 权威源与同步纪律：索引 v1.0 变更（新增规范档位/核心条款修订）必须同步
+/// 本投影,变更留痕于索引档头部与 CHANGELOG。
+const REGULATION_INDEX_AWARENESS_SEGMENT: &str = "【规范入口索引】(什么问题查什么档;遇到「做不到/缺能力/不可达/访问被拒」等受限情形,先过规范程序再行动,禁止臆答)\n\
+一、能力缺口三问——凡遇受限情形(做不到/缺能力/不可达/访问被拒),禁止直接出补齐方案或只作边界说明,必须先依次回答:\n\
+①缺陷还是特性?evorule 是反缺省架构,「做不到」更可能是刻意边界;\n\
+②该补在哪层?由外向内:外层预结构化喂字段→治理程序→视图→上下文;「扩内核」永远是最后选项;\n\
+③确需动内核→过红线核验:停止并上报,不擅自执行。\n\
+二、留痕纪律——修复必登记、变更必同步文档、发现非本任务范围的存量问题→登记册留痕、关键决策必留痕。\n\
+三、确定性红线——确定/可回放/可审计不可触碰;改动只落展示层,永不进入被哈希/被重放的机器事实与协议标识符。\n\
+四、宿主唯一——一切行为通道以 evorule 引擎为唯一入口,禁止绕引擎建第二执行通道。\n\
+五、规则判定一句话——违规机器可判→规则层;纯知识风格→上下文,永不规则化。\n\
+受限情形的答复必须以【三问留痕】段显式留痕,格式:【三问留痕】①缺陷/特性判定:<结论+依据>;②归属层:<层+方案>;③红线核验:<不需/已过程序>。\n\
+知识地图(规范原档在宿主侧知识库,你的沙箱内不可达;需要深读时如实说明并请宿主提供,不要猜测或编造):\n\
+能力缺口三问程序与案例→宪法档;规则落成/分层/治理→design-07/08/09;产品方向取舍→evo-agent 产品化指导;既有问题→OBSERVATIONS 登记册。";
+
+/// 规范入口索引感知段注入（serve 三路径共用,静态文本,无网络调用）
+///
+/// 与 [`apply_evolution_signals_awareness`] 同族但**无触发条件**——规范程序
+/// 是所有 serve 会话的通用素养（第一案失败场景 = general agent 纯文件任务
+/// 同样需要）,全量注入。纯文本追加,fail-soft 天然满足。
+/// 范围裁决（立项-M1 §3.2）：仅 serve 三路径;CLI/driver/delegate 不注入
+/// （开发工具链自有规范通道,token 形态零变化）。
+pub fn apply_regulation_index_awareness(system_prompt: &mut String) {
+    system_prompt.push_str("\n\n");
+    system_prompt.push_str(REGULATION_INDEX_AWARENESS_SEGMENT);
+}
+
 /// 按 agent 白名单过滤 toolkit(serve 模式安全隔离)
 ///
 /// 从 union toolkit 中只取出 `whitelist` 中列出的工具,构造一个新的
@@ -492,6 +533,47 @@ mod tests {
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
         assert!(union.get_tool("evolution_signals").is_some());
         assert!(union.get_tool("meta_summary").is_some());
+    }
+
+    // ===== M1 规范入口索引感知段测试 =====
+
+    #[test]
+    fn test_regulation_index_segment_anchors() {
+        // 关键锚点:三问程序/留痕格式/边界如实/知识地图——第一案 P1'/P2'/P3'
+        // 检验点的机制载体,缺失任一即投影不完整
+        let seg = REGULATION_INDEX_AWARENESS_SEGMENT;
+        assert!(seg.contains("规范入口索引"), "段名锚点");
+        assert!(seg.contains("能力缺口三问"), "三问程序锚点(P2')");
+        assert!(seg.contains("缺陷还是特性"), "三问①锚点");
+        assert!(seg.contains("归属层"), "三问②锚点");
+        assert!(seg.contains("红线核验"), "三问③锚点");
+        assert!(seg.contains("【三问留痕】"), "留痕格式锚点(P3')");
+        assert!(seg.contains("禁止臆答"), "索引使用指令锚点(P1')");
+        assert!(
+            seg.contains("沙箱内不可达"),
+            "边界如实锚点(对齐 M5-a 不编造)"
+        );
+        assert!(seg.contains("知识地图"), "知识地图锚点");
+        // 权威源同步纪律的最低护栏:登记册/宪法/design 关键域在地图中可发现
+        assert!(seg.contains("登记册"));
+        assert!(seg.contains("宪法档"));
+        assert!(seg.contains("design-07/08/09"));
+    }
+
+    #[test]
+    fn test_apply_regulation_index_awareness_appends() {
+        // 追加于尾部、原内容前缀保持、无条件注入(纯消费白名单同样注入)
+        let mut prompt = "base prompt".to_string();
+        apply_regulation_index_awareness(&mut prompt);
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("【规范入口索引】"));
+        assert!(prompt.ends_with("登记册。"), "段必须位于 prompt 尾部");
+
+        // 无触发条件:任何工具清单形态都注入(helper 不接收 tools 参数,此处
+        // 断言的是静态语义——第二次调用同样生效,幂等性由调用方保证)
+        let mut prompt2 = String::new();
+        apply_regulation_index_awareness(&mut prompt2);
+        assert!(prompt2.starts_with("\n\n【规范入口索引】"));
     }
 
     // ===== M5-a 能力边界 helper 测试 =====

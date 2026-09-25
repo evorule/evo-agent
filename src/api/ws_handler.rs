@@ -536,6 +536,8 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         &mut def.system_prompt,
     )
     .await;
+    // M1 规范入口索引:全 serve 会话通用素养段(静态文本,无触发条件;同 HTTP 端点口径)
+    crate::api::serve_tools::apply_regulation_index_awareness(&mut def.system_prompt);
     let config = def.to_agent_config();
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
         // M5-a:注入生效能力边界(声明重绑工具面 + 会话边界段/边界事实)

@@ -533,6 +533,8 @@ async fn run_agent(
         &mut def.system_prompt,
     )
     .await;
+    // M1 规范入口索引:全 serve 会话通用素养段(静态文本,无触发条件;立项-M1 §3.2)
+    crate::api::serve_tools::apply_regulation_index_awareness(&mut def.system_prompt);
     let mut runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
@@ -624,6 +626,8 @@ async fn run_agent_stream(
         &mut def.system_prompt,
     )
     .await;
+    // M1 规范入口索引:同 run_agent 口径
+    crate::api::serve_tools::apply_regulation_index_awareness(&mut def.system_prompt);
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
