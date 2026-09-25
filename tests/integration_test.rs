@@ -630,6 +630,103 @@ async fn test_io_request_failure_submits_error_io_response() {
     io_resp_err.assert_async().await;
 }
 
+/// O-113 突变验证（HTTP 层）：LLM 返回 HTTP 401 时 run() 必须如实 Err，
+/// 且 error io_response 先行回写（O-118 契约臂）。401 不可重试 → LlmHandler
+/// 直接 Err → handle_io_request Err → run() 回写后上抛。委托/workflow 层
+/// 凭 Err 判节点失败——修复前（O-118 前）零 io_response 挂起，绝不允许
+/// 回到「静默空成功」。
+#[tokio::test]
+async fn test_llm_http_401_propagates_as_run_error() {
+    let mut llm_server = Server::new_async().await;
+    llm_server
+        .mock("POST", "/")
+        .with_status(401)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"message":"invalid api key"}}"#)
+        .create_async()
+        .await;
+
+    let mut server = Server::new_async().await;
+    let sse = format!(
+        "{}{}",
+        sse_line(&io_request(
+            1,
+            "call_external",
+            json!({"model":"mock-model"})
+        )),
+        sse_line(&json!({"type":"Stable"})),
+    );
+    let fallback = mock_evorule_base(&mut server, "777", sse).await;
+    fallback.remove();
+    let io_resp_err = server
+        .mock("POST", "/api/sessions/777/io_response")
+        .match_body(mockito::Matcher::PartialJson(json!({"request_id": 1})))
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let llm = LlmHandler::new("mock-model", &llm_server.url(), Some("k".to_string()))
+        .with_retry_config(0, 0.001, 0.01);
+    let mut runner = AgentRunner::new(AgentConfig::default(), client).with_llm_handler(llm);
+
+    let result = runner.run("trigger http 401").await;
+    assert!(result.is_err(), "HTTP 401 must surface as run error");
+    io_resp_err.assert_async().await;
+}
+
+/// O-113 突变验证（业务层，修复主验）：OpenAI 兼容端点（MiniMax）对业务层
+/// 错误（无效 key/额度不足）返回 HTTP 200 + `{"base_resp":{"status_code":1004}}`
+/// 错误体（无 choices）。修复前 parse_success_response 对该形态 unwrap 出
+/// 空 content → io_response 正常提交 → Stable 判 success("") → workflow 节点
+/// 假绿（M5-b 首跑三联指纹：tokens=0+亚秒+content_len=0）。修复后显式转
+/// Err → run() Err + error io_response 回写。
+#[tokio::test]
+async fn test_llm_business_error_body_propagates_as_run_error() {
+    let mut llm_server = Server::new_async().await;
+    llm_server
+        .mock("POST", "/")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"base_resp":{"status_code":1004,"status_msg":"invalid api key"}}"#)
+        .create_async()
+        .await;
+
+    let mut server = Server::new_async().await;
+    let sse = format!(
+        "{}{}",
+        sse_line(&io_request(
+            1,
+            "call_external",
+            json!({"model":"mock-model"})
+        )),
+        sse_line(&json!({"type":"Stable"})),
+    );
+    let fallback = mock_evorule_base(&mut server, "777", sse).await;
+    fallback.remove();
+    let io_resp_err = server
+        .mock("POST", "/api/sessions/777/io_response")
+        .match_body(mockito::Matcher::PartialJson(json!({"request_id": 1})))
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let llm = LlmHandler::new("mock-model", &llm_server.url(), Some("k".to_string()))
+        .with_retry_config(0, 0.001, 0.01);
+    let mut runner = AgentRunner::new(AgentConfig::default(), client).with_llm_handler(llm);
+
+    let result = runner.run("trigger business error body").await;
+    assert!(
+        result.is_err(),
+        "HTTP 200 + base_resp error body must surface as run error, got: {:?}",
+        result
+    );
+    io_resp_err.assert_async().await;
+}
+
 /// 审批-拒绝路径:工具返回 needs_approval proposal,无 approval callback
 /// (默认拒绝,安全优先)→ 不重执行,拒绝结果作为 Tool 消息回传。
 #[tokio::test]

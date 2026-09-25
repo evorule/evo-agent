@@ -69,6 +69,9 @@ fn test_merge_delegate_tool() {
         max_concurrent: None,
         // plan-execute tokens 埋点(测试不埋点)
         token_counter: None,
+        // O-114:工具面注入(测试不注入)
+        toolkit: None,
+        workdir: None,
     };
 
     let args = serde_json::json!({"query": "test"});

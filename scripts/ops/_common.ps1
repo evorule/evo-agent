@@ -61,7 +61,19 @@ function Start-OpsDetached {
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $out = $StdoutLog -replace '\.log$', '.stdout.log'
         $err = $StdoutLog -replace '\.log$', '.stderr.log'
-        foreach ($f in @($out, $err)) { if (Test-Path $f) { Move-Item $f "$f.prev" -Force } }
+        foreach ($f in @($out, $err)) {
+            if (Test-Path $f) {
+                # Rotation fallback (a stale handle on .prev must not block startup):
+                # try rename; if .prev is locked, clear it and retry; if still locked,
+                # skip rotation and let Redirect overwrite the old log.
+                try { Move-Item $f "$f.prev" -Force -ErrorAction Stop } catch {
+                    try {
+                        Remove-Item "$f.prev" -Force -ErrorAction Stop
+                        Move-Item $f "$f.prev" -Force -ErrorAction Stop
+                    } catch { Write-Warning "[ops] log rotation failed for '$f', old log will be overwritten: $_" }
+                }
+            }
+        }
         return Start-Process -FilePath $resolved -ArgumentList $ArgLine -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput $out -RedirectStandardError $err @argList
     }

@@ -348,6 +348,39 @@ impl LlmHandler {
             .await
             .map_err(|e| format!("LLM API response parse error: {}", e))?;
 
+        // 业务层错误体检测(与流式路径 execute_stream 对称):OpenAI 兼容端点
+        // (如 MiniMax)对业务层错误(无效 key/额度不足)返回 HTTP 200 + JSON
+        // 错误体({"base_resp":{"status_code":1004,...}},无 choices)。若照常
+        // 解析,content 会 unwrap 成空串 → runner 侧 Stable 判 success("") →
+        // workflow 节点假绿(O-113)。此处显式转错误。
+        if let Some(base_resp) = json.get("base_resp") {
+            let status_code = base_resp.get("status_code").and_then(|v| v.as_i64());
+            let is_error = match status_code {
+                Some(code) => code != 0,
+                // 有 base_resp 但无 status_code:形态异常,按错误处理(附摘要)
+                None => true,
+            };
+            if is_error {
+                let status_msg = base_resp
+                    .get("status_msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no status_msg)");
+                return Err(format!(
+                    "LLM API business error (status_code={:?}): {}",
+                    status_code, status_msg
+                ));
+            }
+        }
+        let has_choices = json
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if !has_choices {
+            let snippet: String = json.to_string().chars().take(300).collect();
+            return Err(format!("LLM API response missing choices: {}", snippet));
+        }
+
         let choice = json
             .get("choices")
             .and_then(|c| c.as_array())
