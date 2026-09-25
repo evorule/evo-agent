@@ -298,13 +298,16 @@ mod tests {
     fn test_reject_absolute_path_reports_boundary_o119() {
         // O-119②:越界文案必须带边界路径(与 file_read/file_write M5-a 同款),
         // 首要读者是 LLM——只说 not allowed 会让 agent 无法自知边界
+        // 平台各自的真实绝对路径形态("C:\..." 在 Unix 上不是绝对路径,
+        // 走不到拒绝分支——M5-a ebe54da 同族教训,见 file_read.rs 测试先例)
+        let abs = if cfg!(windows) { "C:\\Windows" } else { "/etc" };
         let dir = tempfile::tempdir().unwrap();
         let tool = SearchFilesTool::new(dir.path().to_path_buf());
         let err = tool
             .call_sync(&Value::Object({
                 let mut m = serde_json::Map::new();
                 m.insert("pattern".to_string(), Value::from("*.txt"));
-                m.insert("dir".to_string(), Value::from("C:\\Windows"));
+                m.insert("dir".to_string(), Value::from(abs));
                 m
             }))
             .unwrap_err();
