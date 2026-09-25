@@ -1025,23 +1025,32 @@ mod tests {
             ser
         );
 
-        // 声明存在时往返保真
-        let json2 = r#"{
+        // 声明存在时往返保真(sandbox_root 取平台合法绝对路径,门卫要求绝对路径)
+        let abs_root = if cfg!(windows) {
+            "D:/evo-agent"
+        } else {
+            "/tmp/evo-agent"
+        };
+        let json2 = format!(
+            r#"{{
             "agent_type": "x", "version": "1", "description": "",
             "system_prompt": "", "model": "m", "temperature": 0.5,
             "max_steps": 1, "step_timeout_secs": 1,
             "tools": ["file_read"],
             "output_format": null,
-            "capability_boundary": {
+            "capability_boundary": {{
                 "mode": "read_only",
-                "sandbox_root": "D:/evo-agent",
+                "sandbox_root": "{}",
                 "tools": ["file_read"]
-            }
-        }"#;
-        let def2: AgentDefinition = serde_json::from_str(json2).expect("parse");
+            }}
+        }}"#,
+            abs_root
+        );
+        let def2: AgentDefinition = serde_json::from_str(&json2).expect("parse");
         let b = def2.capability_boundary.as_ref().expect("declared");
         assert!(b.is_read_only());
         assert_eq!(b.tools, vec!["file_read".to_string()]);
+        assert_eq!(b.sandbox_root, PathBuf::from(abs_root));
         assert!(
             def2.validate().is_ok(),
             "合法声明应通过门卫: {:?}",
@@ -1071,8 +1080,10 @@ mod tests {
                 tools: btools.into_iter().map(String::from).collect(),
             }),
         };
+        // 平台合法绝对路径(Linux 上 "D:/x" 非绝对路径,门卫语义会被绝对路径检查劫持)
+        let abs_root = if cfg!(windows) { "D:/x" } else { "/x" };
         // mode 取值越界
-        let e = mk("read_all", "D:/x", vec!["file_read"], vec!["file_read"]);
+        let e = mk("read_all", abs_root, vec!["file_read"], vec!["file_read"]);
         assert!(e.validate().is_err());
         // sandbox_root 相对路径
         let e = mk(
@@ -1083,15 +1094,20 @@ mod tests {
         );
         assert!(e.validate().is_err());
         // 单一事实源:顶层 tools 有沙箱类工具但声明未覆盖
-        let e = mk("read_only", "D:/x", vec!["file_read"], vec![]);
+        let e = mk("read_only", abs_root, vec!["file_read"], vec![]);
         assert!(e.validate().is_err());
         // read_only 授予写工具
-        let e = mk("read_only", "D:/x", vec!["file_write"], vec!["file_write"]);
+        let e = mk(
+            "read_only",
+            abs_root,
+            vec!["file_write"],
+            vec!["file_write"],
+        );
         assert!(e.validate().is_err());
         // 死声明:声明的工具不在顶层 tools
         let e = mk(
             "read_only",
-            "D:/x",
+            abs_root,
             vec!["file_read"],
             vec!["file_read", "file_write"],
         );
@@ -1099,7 +1115,7 @@ mod tests {
         // 合法:read_write 覆盖双沙箱工具
         let ok = mk(
             "read_write",
-            "D:/x",
+            abs_root,
             vec!["file_read", "file_write"],
             vec!["file_read", "file_write"],
         );
