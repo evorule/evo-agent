@@ -2,7 +2,7 @@
   "$schema": "https://evorule.org/schemas/workflow_dag/v1.2.json",
   "kind": "workflow_dag",
   "id": "com.evorule.workflow.collab_dd_impl_close",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "metadata": {
     "title": "协作工作流模板：尽调 → 实施 → 核收",
     "description": "三阶段协作纪律的编排层模板。各阶段完成事实经外层驱动以 meta_signal.node_done 信号进链，由业务规则 collab_task_marks（branch 壳+set）裁决写 meta_task.* 任务标记——任务全局观外置为引擎侧结构，防 LLM 对话遗忘（M5-b）。",
@@ -30,7 +30,7 @@
     {
       "id": "closure",
       "agent_type": "general",
-      "task_template": "核收阶段：对照尽调结论逐项核查交付物，重点核验：①盘点表是否覆盖尽调发现的全部 agent；②每个条目的工具清单与尽调结论一致。核查通过则回复第一行为「核收通过」，并附核收说明；发现遗漏或不一致则回复「核收不通过」并列明差口。\n\n=== 尽调结论 ===\n{due_diligence}\n\n=== 待核收交付物 ===\n{implementation}",
+      "task_template": "核收阶段：对照尽调结论逐项核查交付物。输出必须严格遵循以下两段结构：\n第一段（逐项核对清单）：对尽调发现的每个 agent 输出一行「{agent 类型}：覆盖=已覆盖/遗漏；工具清单=一致/差异（列出具体差异）」，一行一个，不得合并省略。\n最后一段（裁决行）：回复的最后一行单独输出「核收通过」或「核收不通过」——当且仅当清单中全部为「已覆盖」且「一致」时才可输出「核收通过」；存在任何遗漏或不一致必须输出「核收不通过」，并在裁决行的前一段落汇总差口。裁决词不得出现在清单结束之前。\n\n=== 尽调结论 ===\n{due_diligence}\n\n=== 待核收交付物 ===\n{implementation}",
       "depends_on": ["implementation"]
     }
   ],
