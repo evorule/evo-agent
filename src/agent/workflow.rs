@@ -201,6 +201,42 @@ pub struct Workflow {
     pub output_node: String,
 }
 
+/// M5-c:阶段前置裁决通道(②③ 载体)——标记会话 + 客户端
+///
+/// 引擎不承载任何协作纪律知识(哪些节点有何前置=规则层
+/// 00_constraint_collab_acceptance 的事);引擎只在每个 LLM 节点 delegate
+/// 前向标记会话提交中性阶段信号 `set meta_workflow.phase = <node_id>`,
+/// 并按会话 version 判别 enforce 是否拦截(被拦=前置条件不满足)。
+///
+/// 配对时序契约(2026-09-25 修正):phase 门查 `exists(meta_task.*)` 判据,
+/// 而标记由 `meta_signal.node_done` 完成信号经业务规则裁决写入。M5-b 的
+/// driver 层 drain 信号在 `execute` 返回后才提交——晚于门,任何带约束规则
+/// 的 workflow 第二个节点必被误拦(E2E 正例 a 实测)。故 phase_gate 激活时,
+/// LLM 节点成功分支内即时打标(见 [`Self::mark_node_done`]),下一节点的
+/// phase 门才可见前置标记;driver 层 drain 保留作幂等兜底(未激活形态照旧)。
+#[derive(Debug, Clone)]
+pub struct PhaseGate {
+    /// M5-b 协作标记会话 id(meta_task.* 状态所在,即 ②③ exists 判据的求值域)
+    pub marks_session: String,
+    /// evorule API 客户端(信号提交 + version 感知)
+    pub client: crate::api::evorule_client::EvoruleApiClient,
+}
+
+/// M5-c:协作阶段信号指令形态(纯函数)
+///
+/// 中性事件:`set meta_workflow.phase = <node_id>`(进入某节点阶段的信号)。
+/// 前置条件的裁决完全在规则层 enforce(未尽责调不得实施/未实施不得核收)。
+pub fn phase_signal(node_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "set",
+        "params": {
+            "attr": "meta_workflow.phase",
+            "operation": "set",
+            "value": node_id
+        }
+    })
+}
+
 /// 工作流引擎
 ///
 /// 持有 [`DelegateContext`],负责拓扑排序 + 并行执行 + 模板渲染。
@@ -215,6 +251,8 @@ pub struct WorkflowEngine {
     /// 数据源。`take_executed_node_ids` drain 语义 = 取走自上次调用以来的
     /// 增量；外层驱动跨版本累积成「已执行注册表」。Arc 共享同一份——克隆共享）
     executed_node_ids: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// M5-c:阶段前置裁决通道(None = 既有行为零变更)
+    phase_gate: Option<PhaseGate>,
 }
 
 impl WorkflowEngine {
@@ -224,7 +262,43 @@ impl WorkflowEngine {
             ctx,
             executed_nodes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             executed_node_ids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            phase_gate: None,
         }
+    }
+
+    /// M5-c:注入阶段前置裁决通道(驱动层按 marks_session 组装;未注入 =
+    /// 节点执行零额外链上往返,行为与 M5-b 前完全一致)
+    pub fn with_phase_gate(mut self, gate: PhaseGate) -> Self {
+        self.phase_gate = Some(gate);
+        self
+    }
+
+    /// M5-c:LLM 节点成功后即时向标记会话提交完成信号并等待标记落链
+    /// (version 感知;时序契约见 [`PhaseGate`] 文档)
+    ///
+    /// 信号形态:`set meta_signal.node_done = <node_id>`(中性事件,复用
+    /// driver 的 [`crate::agent::driver::node_done_signal`],标记知识在规则层
+    /// collab_task_marks 的 branch 壳)。branch 为放行型转换——version 推进
+    /// 即标记已 stable 落链,下一节点 phase 门可见。
+    ///
+    /// 失败语义:通道故障 = Err fail-fast(留痕是硬义务,同 M5-b drain 纪律);
+    /// 被规则层拒绝(Ok(false),当前规则面无此形态)= Err 显式报错——静默会
+    /// 退化为下一节点 phase 门的误导性拦截(归因失真)。
+    async fn mark_node_done(gate: &PhaseGate, node_id: &str) -> Result<(), String> {
+        let allowed = crate::agent::runner::submit_signal_and_await_verdict(
+            &gate.client,
+            &gate.marks_session,
+            &crate::agent::driver::node_done_signal(node_id),
+        )
+        .await
+        .map_err(|e| format!("workflow mark signal failed (node '{node_id}'): {e}"))?;
+        if !allowed {
+            return Err(format!(
+                "workflow mark signal rejected by rule layer (node '{node_id}') \
+                 - task mark not recorded"
+            ));
+        }
+        Ok(())
     }
 
     /// 累计已成功完成的节点数（跨多次 `execute` 调用累加；外层驱动 replan
@@ -342,6 +416,36 @@ impl WorkflowEngine {
                 continue;
             }
 
+            // M5-c:阶段前置裁决(②③ 载体)——LLM 节点 delegate 前向标记会话
+            // 提交阶段信号 `set meta_workflow.phase = <node_id>`,由规则层
+            // 00_constraint_collab_acceptance enforce 裁决前置条件(未尽责调
+            // 不得实施/未实施不得核收)。感知通道故障=fail-fast(裁决不可信);
+            // 被拦=前置条件不满足,错误文本带 `enforce violation:` 前缀——
+            // 外层驱动 D-01 判别终止整个循环且不 replan。
+            // 配对:节点成功后 mark_node_done 即时打标(见 PhaseGate 时序契约),
+            // 保证下一节点的门可查到前置标记。
+            if let Some(gate) = &self.phase_gate {
+                for node in &llm_nodes {
+                    let allowed = crate::agent::runner::submit_signal_and_await_verdict(
+                        &gate.client,
+                        &gate.marks_session,
+                        &phase_signal(&node.id),
+                    )
+                    .await
+                    .map_err(|e| {
+                        format!("workflow phase signal failed (node '{}'): {}", node.id, e)
+                    })?;
+                    if !allowed {
+                        return Err(format!(
+                            "enforce violation: workflow phase '{}' rejected by collab \
+                             acceptance rule (prerequisite task mark missing; see marks \
+                             session audit for Violation attribution)",
+                            node.id
+                        ));
+                    }
+                }
+            }
+
             let tasks: Vec<(String, String)> = llm_nodes
                 .iter()
                 .map(|node| {
@@ -372,6 +476,12 @@ impl WorkflowEngine {
                         self.executed_nodes
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.record_executed_node(&node.id);
+                        // M5-c:成功即时打标(version 感知等待标记落链)——
+                        // 下一层/下一节点的 phase 前置门依赖此标记存在。
+                        // driver 层 drain 保留(幂等),此处 fail-fast 同纪律。
+                        if let Some(gate) = &self.phase_gate {
+                            Self::mark_node_done(gate, &node.id).await?;
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -900,6 +1010,20 @@ mod tests {
             run_when: None,
             compute: None,
         }
+    }
+
+    // ===== M5-c:阶段前置裁决信号 =====
+
+    #[test]
+    fn m5c_phase_signal_shape_is_neutral_set() {
+        // 中性信号形态：set meta_workflow.phase=<node_id>；引擎不含协作纪律知识
+        let sig = phase_signal("n_due_diligence");
+        assert_eq!(sig["type"], "set");
+        assert_eq!(sig["params"]["attr"], "meta_workflow.phase");
+        assert_eq!(sig["params"]["operation"], "set");
+        assert_eq!(sig["params"]["value"], "n_due_diligence");
+        // 同输入必同输出（确定性）
+        assert_eq!(sig, phase_signal("n_due_diligence"));
     }
 
     // ===== 反序列化 =====

@@ -449,6 +449,105 @@ pub enum AgentEvent {
     },
 }
 
+// ----- M5-c:工具意图裁决(规范字段生产=机制层,处置=规则层,兜底=机制层)-----
+
+/// M5-c:工具意图信号指令形态(纯函数)
+///
+/// 中性判据:`set meta_tool.pending_target_scope = <scope>`。机制层只生产
+/// 规范字段(target_scope 解析结果),「拦不拦」的处置完全由规则层
+/// 00_constraint_collab_acceptance 的 enforce 裁决——被拦时引擎丢弃指令
+/// (version 不推进),放行时内建 set 落状态(version+1)。
+pub fn intent_signal(scope: &str) -> Value {
+    serde_json::json!({
+        "type": "set",
+        "params": {
+            "attr": "meta_tool.pending_target_scope",
+            "operation": "set",
+            "value": scope
+        }
+    })
+}
+
+/// M5-c:解析 file 类工具调用的目标范围(纯函数,宪法 §七「规范字段生产」)
+///
+/// file_read/file_write 的 path 参数对照能力边界 sandbox_root 判
+/// in_sandbox/out_of_sandbox;非 file 工具/无边界声明/无 path 参数
+/// → None(不提交意图,零开销路径)。纯字符串/路径运算不触 fs——
+/// symlink 逃逸等精确判定仍由机制层 handler 内联检查兜底(双层分工:
+/// 意图快筛供规则层裁决,handler 精判为最终防线)。
+pub fn resolve_target_scope(
+    tool_name: &str,
+    args: &Value,
+    boundary: Option<&crate::agent::definition::CapabilityBoundary>,
+) -> Option<&'static str> {
+    let boundary = boundary?;
+    if tool_name != "file_read" && tool_name != "file_write" {
+        return None;
+    }
+    let raw = args.get("path").and_then(|v| v.as_str())?;
+    let p = std::path::Path::new(raw);
+    if p.is_absolute() {
+        return Some("out_of_sandbox");
+    }
+    for component in p.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Some("out_of_sandbox");
+        }
+    }
+    let joined = boundary.sandbox_root.join(p);
+    if joined.starts_with(&boundary.sandbox_root) {
+        Some("in_sandbox")
+    } else {
+        Some("out_of_sandbox")
+    }
+}
+
+/// M5-c:意图裁决感知参数——提交后轮询会话 version 的窗口
+///
+/// command 端点=异步队列语义(HTTP success 不代表未被 enforce 拦截),
+/// 拦截的引擎语义=丢弃指令不推进 version;ReAct 循环串行提交无竞态。
+/// 引擎处理为毫秒级,20×50ms=1s 窗口上限远大于正常裁决时延。
+const INTENT_VERDICT_POLLS: usize = 20;
+const INTENT_VERDICT_INTERVAL_MS: u64 = 50;
+
+async fn session_version(client: &EvoruleApiClient, session_id: &str) -> Result<u64, String> {
+    let state = client
+        .get_state(session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    state
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| format!("session {} state missing version", session_id))
+}
+
+/// M5-c:提交信号指令并按会话 version 判别规则层裁决结果
+///
+/// 通用感知原语(M5-c 三条 enforce 的统一感知面):command 端点=异步队列
+/// 语义(HTTP success 不代表未被 enforce 拦截),拦截的引擎语义=丢弃指令
+/// 不推进 version;ReAct 循环串行提交无竞态。
+/// 返回 `Ok(true)`=放行(version 推进);`Ok(false)`=被 enforce 拦截
+/// (轮询窗口内 version 未变);`Err`=感知通道故障(裁决不可信,fail-fast
+/// 由调用方上抛——与 M5-b 信号提交失败同族的硬义务语义)。
+pub async fn submit_signal_and_await_verdict(
+    client: &EvoruleApiClient,
+    session_id: &str,
+    command: &Value,
+) -> Result<bool, String> {
+    let before = session_version(client, session_id).await?;
+    client
+        .submit_command(session_id, command)
+        .await
+        .map_err(|e| e.to_string())?;
+    for _ in 0..INTENT_VERDICT_POLLS {
+        tokio::time::sleep(std::time::Duration::from_millis(INTENT_VERDICT_INTERVAL_MS)).await;
+        if session_version(client, session_id).await? > before {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// TODO: doc
 pub struct AgentRunner {
     config: AgentConfig,
@@ -1847,6 +1946,48 @@ impl AgentRunner {
     /// 第一次调用不带 `approved` flag → 工具可能返回 `needs_approval` proposal。
     /// 第二次调用(审批通过后)带 `approved:true` → 工具直接执行。
     async fn execute_tool_call(&self, tool_name: &str, args: &Value) -> Result<Value, AgentError> {
+        // M5-c:工具意图裁决(双层防线的外层)——file 类调用先把规范字段
+        // target_scope 随意图指令进链,由协作验收规则 enforce 裁决:
+        // 被拦(version 未推进)则不执行工具,向 LLM 返回治理拦截结果;
+        // 放行则继续执行,机制层 handler 内联沙箱检查保留为最终防线
+        // (规则未部署时意图 set 正常落链留痕,handler 精判兜底拒绝)。
+        if let Some(scope) =
+            resolve_target_scope(tool_name, args, self.config.capability_boundary.as_ref())
+        {
+            if let Some(session_id) = self.session_id.clone() {
+                let allowed = submit_signal_and_await_verdict(
+                    &self.evorule_client,
+                    &session_id,
+                    &intent_signal(scope),
+                )
+                .await
+                .map_err(AgentError::Internal)?;
+                if !allowed {
+                    warn!(
+                        %session_id, tool = %tool_name, scope = %scope,
+                        "tool intent blocked by governance rule (collab acceptance)"
+                    );
+                    let raw_path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    let boundary_root = self
+                        .config
+                        .capability_boundary
+                        .as_ref()
+                        .map(|b| b.sandbox_root.display().to_string())
+                        .unwrap_or_default();
+                    return Ok(serde_json::json!({
+                        "status": "blocked_by_governance_rule",
+                        "tool": tool_name,
+                        "target_scope": scope,
+                        "reason": format!(
+                            "target '{}' is outside the sandbox boundary '{}'; \
+                             the collaboration acceptance rule rejected this tool intent \
+                             (see session audit Violation for rule attribution)",
+                            raw_path, boundary_root
+                        ),
+                    }));
+                }
+            }
+        }
         let args_tcb = args.clone();
         let mut call_params = serde_json::Map::new();
         call_params.insert("tool_name".to_string(), Value::from(tool_name.to_string()));
