@@ -46,11 +46,22 @@ impl FileListTool {
     fn resolve_safe_dir(&self, raw: &str) -> Result<PathBuf, String> {
         let path = Path::new(raw);
         if path.is_absolute() {
-            return Err(format!("absolute path not allowed: '{}'", raw));
+            // M5-a:错误告知边界,agent 自知而非误判(O-119② 文案对齐)
+            return Err(format!(
+                "absolute path not allowed: '{}' (all paths must stay within the sandbox \
+                 boundary '{}')",
+                raw,
+                self.workdir.display()
+            ));
         }
         for component in path.components() {
             if matches!(component, Component::ParentDir) {
-                return Err(format!("parent dir (..) not allowed: '{}'", raw));
+                return Err(format!(
+                    "parent dir (..) not allowed: '{}' (must stay within the sandbox \
+                     boundary '{}')",
+                    raw,
+                    self.workdir.display()
+                ));
             }
         }
         let joined = self.workdir.join(path);
@@ -62,7 +73,12 @@ impl FileListTool {
             .canonicalize()
             .map_err(|e| format!("workdir invalid: {}", e))?;
         if !canonical.starts_with(&workdir_canonical) {
-            return Err(format!("path escapes workdir: '{}'", raw));
+            // M5-a:越界错误回报「不可访问 + 边界路径」(O-119② 文案对齐)
+            return Err(format!(
+                "path not accessible: '{}' resolves outside the sandbox boundary '{}'",
+                raw,
+                workdir_canonical.display()
+            ));
         }
         Ok(canonical)
     }
@@ -179,6 +195,26 @@ mod tests {
             m
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_absolute_path_reports_boundary_o119() {
+        // O-119②:越界文案必须带边界路径(与 file_read/file_write M5-a 同款)
+        let dir = tempfile::tempdir().unwrap();
+        let tool = FileListTool::new(dir.path().to_path_buf());
+        let err = tool
+            .call_sync(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert("dir".to_string(), Value::from("C:\\Windows"));
+                m
+            }))
+            .unwrap_err();
+        assert!(err.contains("sandbox boundary"), "got: {}", err);
+        assert!(
+            err.contains(&dir.path().display().to_string()),
+            "error must contain the sandbox boundary path, got: {}",
+            err
+        );
     }
 
     #[test]

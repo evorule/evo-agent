@@ -651,11 +651,22 @@ pub struct AgentRunner {
     /// 外层驱动据此维护 `BudgetCounters.tokens_used` 与 replan 重复执行
     /// token 埋点（D-02 判定数据源）。仅供观测，不改变任何控制流。
     token_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// O-120:独立裁决会话通道(file 类工具意图裁决)
+    ///
+    /// 主会话 call_external 在途时引擎命令串行评估使「主会话提交+轮询」
+    /// 恒超时(假拦根因);裁决改走独立 evorule 会话(每会话独立反应器,
+    /// 不受主会话 io 在途影响)。tokio Mutex:G13 并行工具路径可并发进入
+    /// `execute_tool_call`,且裁决全程含 await。
+    adjudicator: tokio::sync::Mutex<crate::agent::adjudicator::AdjudicationChannel>,
 }
 
 impl AgentRunner {
     /// TODO: doc
     pub fn new(config: AgentConfig, evorule_client: EvoruleApiClient) -> Self {
+        // O-120:裁决通道与 runner 同源装配(单一事实源——CLI/driver/serve
+        // 三入口统一,与 M5-a 边界接线同款);agent_type 预取供 initial_content
+        let agent_type = config.agent_type.clone();
+        let adjudicator_client = evorule_client.clone();
         Self {
             config,
             evorule_client,
@@ -682,6 +693,12 @@ impl AgentRunner {
             max_context_tokens: 8192,
             memory_budget_ratio: 0.25,
             token_counter: None,
+            adjudicator: tokio::sync::Mutex::new(
+                crate::agent::adjudicator::AdjudicationChannel::new(
+                    adjudicator_client,
+                    &agent_type,
+                ),
+            ),
         }
     }
 
@@ -1946,46 +1963,48 @@ impl AgentRunner {
     /// 第一次调用不带 `approved` flag → 工具可能返回 `needs_approval` proposal。
     /// 第二次调用(审批通过后)带 `approved:true` → 工具直接执行。
     async fn execute_tool_call(&self, tool_name: &str, args: &Value) -> Result<Value, AgentError> {
-        // M5-c:工具意图裁决(双层防线的外层)——file 类调用先把规范字段
+        // M5-c/O-120:工具意图裁决(双层防线的外层)——file 类调用先把规范字段
         // target_scope 随意图指令进链,由协作验收规则 enforce 裁决:
         // 被拦(version 未推进)则不执行工具,向 LLM 返回治理拦截结果;
-        // 放行则继续执行,机制层 handler 内联沙箱检查保留为最终防线
-        // (规则未部署时意图 set 正常落链留痕,handler 精判兜底拒绝)。
+        // 放行则继续执行,机制层 handler 内联沙箱检查保留为最终防线。
+        // O-120:裁决改走独立裁决会话(AdjudicationChannel)——主会话
+        // call_external 在途时引擎串行评估使主会话内轮询恒超时(假拦根因),
+        // 独立会话裁决不受 io 在途影响(原型 PV2 实测 73ms)。原
+        // `if let Some(session_id)` 守卫删除:首轮/续轮统一走裁决通道,
+        // 伴生缺陷(新建分支漏设 session_id 致首轮跳过裁决)自然消解。
         if let Some(scope) =
             resolve_target_scope(tool_name, args, self.config.capability_boundary.as_ref())
         {
-            if let Some(session_id) = self.session_id.clone() {
-                let allowed = submit_signal_and_await_verdict(
-                    &self.evorule_client,
-                    &session_id,
-                    &intent_signal(scope),
-                )
+            let allowed = self
+                .adjudicator
+                .lock()
+                .await
+                .await_verdict(&intent_signal(scope), self.session_id.as_deref())
                 .await
                 .map_err(AgentError::Internal)?;
-                if !allowed {
-                    warn!(
-                        %session_id, tool = %tool_name, scope = %scope,
-                        "tool intent blocked by governance rule (collab acceptance)"
-                    );
-                    let raw_path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                    let boundary_root = self
-                        .config
-                        .capability_boundary
-                        .as_ref()
-                        .map(|b| b.sandbox_root.display().to_string())
-                        .unwrap_or_default();
-                    return Ok(serde_json::json!({
-                        "status": "blocked_by_governance_rule",
-                        "tool": tool_name,
-                        "target_scope": scope,
-                        "reason": format!(
-                            "target '{}' is outside the sandbox boundary '{}'; \
-                             the collaboration acceptance rule rejected this tool intent \
-                             (see session audit Violation for rule attribution)",
-                            raw_path, boundary_root
-                        ),
-                    }));
-                }
+            if !allowed {
+                warn!(
+                    main_session = ?self.session_id, tool = %tool_name, scope = %scope,
+                    "tool intent blocked by governance rule (collab acceptance, adjudication channel)"
+                );
+                let raw_path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let boundary_root = self
+                    .config
+                    .capability_boundary
+                    .as_ref()
+                    .map(|b| b.sandbox_root.display().to_string())
+                    .unwrap_or_default();
+                return Ok(serde_json::json!({
+                    "status": "blocked_by_governance_rule",
+                    "tool": tool_name,
+                    "target_scope": scope,
+                    "reason": format!(
+                        "target '{}' is outside the sandbox boundary '{}'; \
+                         the collaboration acceptance rule rejected this tool intent \
+                         (see session audit Violation for rule attribution)",
+                        raw_path, boundary_root
+                    ),
+                }));
             }
         }
         let args_tcb = args.clone();
@@ -2757,7 +2776,13 @@ impl AgentRunner {
                 // M5-a:边界声明经 initial_content 既有载体进会话事实
                 let boundary_json = runner.config.capability_boundary.as_ref().map(|b| b.to_json());
                 match runner.evorule_client.create_session(boundary_json.as_ref()).await {
-                    Ok(id) => id,
+                    Ok(id) => {
+                        // O-120 伴生缺陷修复:新建分支回填 runner.session_id
+                        // (裁决通道已不依赖它,但审计一致性/messages 持久化
+                        // 等消费方需要;与 continuation 分支对齐)
+                        runner.session_id = Some(id.clone());
+                        id
+                    }
                     Err(e) => {
                         yield Err(AgentError::EvoruleError(e.to_string()));
                         return;

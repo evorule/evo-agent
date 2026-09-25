@@ -52,11 +52,22 @@ impl SearchFilesTool {
     fn resolve_safe_dir(&self, raw: &str) -> Result<PathBuf, String> {
         let path = Path::new(raw);
         if path.is_absolute() {
-            return Err(format!("absolute path not allowed: '{}'", raw));
+            // M5-a:错误告知边界,agent 自知而非误判(O-119② 文案对齐)
+            return Err(format!(
+                "absolute path not allowed: '{}' (all paths must stay within the sandbox \
+                 boundary '{}')",
+                raw,
+                self.workdir.display()
+            ));
         }
         for component in path.components() {
             if matches!(component, Component::ParentDir) {
-                return Err(format!("parent dir (..) not allowed: '{}'", raw));
+                return Err(format!(
+                    "parent dir (..) not allowed: '{}' (must stay within the sandbox \
+                     boundary '{}')",
+                    raw,
+                    self.workdir.display()
+                ));
             }
         }
         let joined = self.workdir.join(path);
@@ -68,7 +79,12 @@ impl SearchFilesTool {
             .canonicalize()
             .map_err(|e| format!("workdir invalid: {}", e))?;
         if !canonical.starts_with(&workdir_canonical) {
-            return Err(format!("path escapes workdir: '{}'", raw));
+            // M5-a:越界错误回报「不可访问 + 边界路径」(O-119② 文案对齐)
+            return Err(format!(
+                "path not accessible: '{}' resolves outside the sandbox boundary '{}'",
+                raw,
+                workdir_canonical.display()
+            ));
         }
         Ok(canonical)
     }
@@ -106,14 +122,15 @@ impl SearchFilesTool {
         let after_prefix = &name[prefix.len()..];
 
         if is_star {
-            // `*` 匹配 0+ 个字符,尝试每个位置
-            for i in 0..=after_prefix.len() {
-                // 注意:要按 char 边界切,不能按 byte(中文/UTF-8 会断)
-                if Self::glob_match_safe(rest, &after_prefix[i..]) {
+            // `*` 匹配 0+ 个字符,逐个 char 边界尝试
+            // (O-117:字节索引切片落在多字节字符内部会 panic,中文文件名必踩)
+            for (i, _) in after_prefix.char_indices() {
+                if Self::glob_match(rest, &after_prefix[i..]) {
                     return true;
                 }
             }
-            false
+            // 末尾空后缀(char_indices 不含结尾位置,单独补测)
+            Self::glob_match(rest, "")
         } else {
             // `?` 匹配恰好 1 个字符(一个 char,不是 1 个 byte)
             let mut chars = after_prefix.chars();
@@ -121,13 +138,8 @@ impl SearchFilesTool {
                 return false;
             }
             let after_q: String = chars.collect();
-            Self::glob_match_safe(rest, &after_q)
+            Self::glob_match(rest, &after_q)
         }
-    }
-
-    /// 内部:在 char 边界上切 after_prefix,然后递归
-    fn glob_match_safe(pattern: &str, name: &str) -> bool {
-        Self::glob_match(pattern, name)
     }
 
     fn walk(root: &Path, dir: &Path, pattern: &str, max: usize, results: &mut Vec<PathBuf>) {
@@ -283,6 +295,28 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_absolute_path_reports_boundary_o119() {
+        // O-119②:越界文案必须带边界路径(与 file_read/file_write M5-a 同款),
+        // 首要读者是 LLM——只说 not allowed 会让 agent 无法自知边界
+        let dir = tempfile::tempdir().unwrap();
+        let tool = SearchFilesTool::new(dir.path().to_path_buf());
+        let err = tool
+            .call_sync(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert("pattern".to_string(), Value::from("*.txt"));
+                m.insert("dir".to_string(), Value::from("C:\\Windows"));
+                m
+            }))
+            .unwrap_err();
+        assert!(err.contains("sandbox boundary"), "got: {}", err);
+        assert!(
+            err.contains(&dir.path().display().to_string()),
+            "error must contain the sandbox boundary path, got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_reject_parent_dir() {
         let dir = tempfile::tempdir().unwrap();
         let tool = SearchFilesTool::new(dir.path().to_path_buf());
@@ -341,6 +375,38 @@ mod tests {
             count, 1,
             "should only find visible.txt, not .git/secret.txt"
         );
+    }
+
+    // === O-117 复现:多字节文件名 × '*' glob ===
+
+    #[test]
+    fn test_glob_match_multibyte_star_o117() {
+        // 修复前:星号分支按字节索引切片(0..=len),i 落在多字节字符内部即 panic
+        assert!(SearchFilesTool::glob_match("*.txt", "中文文档.txt"));
+        assert!(SearchFilesTool::glob_match("中*", "中文文档"));
+        assert!(SearchFilesTool::glob_match("*.txt", "日本語メモ.txt"));
+        assert!(SearchFilesTool::glob_match("报*", "报告.docx"));
+        assert!(!SearchFilesTool::glob_match("中*.md", "中文文档.txt"));
+        // `?` 恰匹配 1 个 char(非 1 字节)——回归防线
+        assert!(SearchFilesTool::glob_match("中?报", "中文报"));
+        assert!(!SearchFilesTool::glob_match("中?报", "中文汇报"));
+    }
+
+    #[test]
+    fn test_search_files_chinese_filename_end_to_end_o117() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("中文文档.txt"), b"").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        let tool = SearchFilesTool::new(dir.path().to_path_buf());
+        let result = tool
+            .call_sync(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert("pattern".to_string(), Value::from("*.txt"));
+                m
+            }))
+            .expect("multibyte filename must not panic (O-117)");
+        let count = result.get("count").unwrap().as_i64().unwrap();
+        assert_eq!(count, 2, "should find 中文文档.txt and notes.txt");
     }
 
     #[test]

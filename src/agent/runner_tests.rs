@@ -2253,6 +2253,66 @@ async fn m5c_verdict_fails_fast_on_transport_error() {
     );
 }
 
+// ----- O-120:裁决通道(独立会话)——首轮/续轮统一走裁决 -----
+
+#[tokio::test]
+async fn o120_first_round_intent_goes_through_adjudication_channel() {
+    // 守卫删除后:session_id=None(首轮,原伴生缺陷形态)也必走裁决——
+    // 越界意图被拦(裁决会话 version 停滞)→ blocked JSON;
+    // 断言裁决会话 create(initial_content 自述身份)+ command 均被调
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let m_create = server
+        .mock("POST", "/api/sessions")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "initial_content": {
+                "kind": "intent_adjudication",
+                "agent_type": "default"
+            }
+        })))
+        .with_status(200)
+        .with_body(r#"{"session_id": 77}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    // version 恒 0(1 首查 + 20 轮询 = 21)= 拦截(fail-closed 语义不变)
+    let m_state = server
+        .mock("GET", "/api/sessions/77/state")
+        .with_status(200)
+        .with_body(r#"{"version": 0}"#)
+        .expect(21)
+        .create_async()
+        .await;
+    let m_cmd = server
+        .mock("POST", "/api/sessions/77/command")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "instruction": intent_signal("out_of_sandbox")
+        })))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+
+    let runner =
+        AgentRunner::new(AgentConfig::default(), client).with_capability_boundary(m5c_boundary());
+    // 平台各自真实绝对路径形态(M5-a ebe54da 教训)
+    let abs = if cfg!(windows) {
+        "D:\\outside\\x.txt"
+    } else {
+        "/outside/x.txt"
+    };
+    let result = runner
+        .execute_tool_call("file_read", &serde_json::json!({ "path": abs }))
+        .await
+        .expect("blocked verdict must surface as tool result, not error");
+    assert_eq!(result["status"], "blocked_by_governance_rule");
+    assert_eq!(result["target_scope"], "out_of_sandbox");
+    m_create.assert_async().await;
+    m_state.assert_async().await;
+    m_cmd.assert_async().await;
+}
+
 // ----- M5-c:约束资产域路径形状守卫（1.0.0 缺陷回归防线）-----
 //
 // 域谓词 path 为 exec 相对路径（path.rs resolve_exec_path：裸路径自动补
