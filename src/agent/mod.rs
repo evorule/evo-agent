@@ -3,6 +3,7 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
 //! Agent orchestration layer -- AI Agent run loop, tool registry, and memory manager.
+pub mod adjudicator;
 pub mod approval;
 pub mod audited_llm;
 pub mod callback;

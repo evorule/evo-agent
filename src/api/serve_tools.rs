@@ -167,6 +167,21 @@ pub fn build_filtered_toolkit(union: &ToolHandler, whitelist: &[String]) -> Tool
 // M5-a 能力边界:生效边界合成 + 声明绑定(serve 三路径与 CLI 共用)
 // =============================================================================
 
+/// Windows canonicalize 产物带 `\\?\` verbatim 前缀,边界展示面(LLM 自知
+/// 边界/系统提示段)用常规形态;`\\?\UNC\` 还原为 `\\server\share`。
+/// 仅影响展示与纯路径运算的自洽形态,不含 fs 语义变更。
+fn simplify_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
+    if let Some(s) = p.to_str() {
+        if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{}", stripped));
+        }
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(stripped);
+        }
+    }
+    p
+}
+
 /// 合成生效能力边界:显式声明优先;未声明时按启动配置合成缺省(行为同 v1.0)
 ///
 /// 单一事实源纪律(宪法 §七 反模式④):`capability_boundary` 是边界值唯一
@@ -180,8 +195,6 @@ pub fn effective_capability_boundary(
     if let Some(b) = &def.capability_boundary {
         return b.clone();
     }
-    // 缺省合成:沙箱根 = 启动 workdir;模式按是否含写类工具如实判定;
-    // 边界内工具 = 顶层 tools ∩ 沙箱类工具
     let sandbox_tools: Vec<String> = def
         .tools
         .iter()
@@ -193,9 +206,20 @@ pub fn effective_capability_boundary(
     } else {
         "read_only"
     };
+    // 缺省合成:沙箱根 = 启动 workdir;模式按是否含写类工具如实判定;
+    // 边界内工具 = 顶层 tools ∩ 沙箱类工具
+    // O-119①:合成根必须为绝对路径——相对 workdir 启动时若原样入边界,
+    // LLM 面展示的沙箱边界是相对路径,agent 无法自知绝对边界(瞎子摸象)。
+    // canonicalize 失败(目录尚不存在等)时 fallback cwd 拼接——Path::join
+    // 遇绝对路径自动替换基准,相对/绝对两态皆正确。
+    let sandbox_root = simplify_verbatim(startup_workdir.canonicalize().unwrap_or_else(|_| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(startup_workdir)
+    }));
     CapabilityBoundary {
         mode: mode.to_string(),
-        sandbox_root: startup_workdir.to_path_buf(),
+        sandbox_root,
         tools: sandbox_tools,
     }
 }
@@ -527,11 +551,15 @@ mod tests {
 
     #[test]
     fn test_effective_boundary_default_synthesis() {
-        // 未声明:沙箱根 = 启动 workdir;含 file_write → read_write;工具取沙箱类交集
+        // 未声明:沙箱根 = 启动 workdir 合成**绝对路径**(O-119①);含 file_write → read_write;工具取沙箱类交集
         let def = make_def(&["file_read", "file_write", "rule_list"], None);
         let eff = effective_capability_boundary(&def, Path::new("."));
         assert!(!eff.is_read_only());
-        assert_eq!(eff.sandbox_root, Path::new("."));
+        assert!(
+            eff.sandbox_root.is_absolute(),
+            "O-119①: synthesized sandbox_root must be absolute, got: {}",
+            eff.sandbox_root.display()
+        );
         assert_eq!(eff.tools.len(), 2);
 
         // 纯只读白名单 → read_only,tools 只含 file_read
@@ -539,6 +567,43 @@ mod tests {
         let eff2 = effective_capability_boundary(&def2, Path::new("."));
         assert!(eff2.is_read_only());
         assert_eq!(eff2.tools, vec!["file_read".to_string()]);
+    }
+
+    #[test]
+    fn test_effective_boundary_default_root_absolute_o119() {
+        // O-119①:相对启动 workdir → 合成绝对沙箱根;目录不存在时 fallback
+        // cwd 拼接(join 绝对路径自动替换基准),相对尾段保留
+        let def = make_def(&["file_read"], None);
+        let eff = effective_capability_boundary(&def, Path::new("some/relative/dir"));
+        assert!(
+            eff.sandbox_root.is_absolute(),
+            "synthesized sandbox_root must be absolute, got: {}",
+            eff.sandbox_root.display()
+        );
+        assert!(
+            eff.sandbox_root
+                .ends_with(Path::new("some").join("relative").join("dir")),
+            "fallback join must preserve the relative tail, got: {}",
+            eff.sandbox_root.display()
+        );
+    }
+
+    #[test]
+    fn test_simplify_verbatim_strips_windows_prefix() {
+        // Windows canonicalize 产物去 \\?\ 前缀(展示面常规形态);UNC 还原
+        assert_eq!(
+            super::simplify_verbatim(std::path::PathBuf::from(r"\\?\D:\work")),
+            std::path::PathBuf::from(r"D:\work")
+        );
+        assert_eq!(
+            super::simplify_verbatim(std::path::PathBuf::from(r"\\?\UNC\srv\share")),
+            std::path::PathBuf::from(r"\\srv\share")
+        );
+        // 无前缀(Unix 形态/相对路径)原样返回
+        assert_eq!(
+            super::simplify_verbatim(std::path::PathBuf::from("/tmp/x")),
+            std::path::PathBuf::from("/tmp/x")
+        );
     }
 
     #[tokio::test]
@@ -553,7 +618,8 @@ mod tests {
         let def = make_def(&["file_read", "file_list"], None);
         let eff = wire_capability_boundary(&mut handler, &def, &root);
 
-        assert_eq!(eff.sandbox_root, root);
+        // O-119①:合成根 = 启动 workdir 的绝对化形态(去 \\?\ verbatim 前缀)
+        assert_eq!(eff.sandbox_root, super::simplify_verbatim(root.clone()));
         let res = handler
             .execute_by_name(
                 "file_read",
