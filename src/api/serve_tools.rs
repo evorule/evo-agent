@@ -163,6 +163,89 @@ pub fn build_filtered_toolkit(union: &ToolHandler, whitelist: &[String]) -> Tool
     filtered
 }
 
+// =============================================================================
+// M5-a 能力边界:生效边界合成 + 声明绑定(serve 三路径与 CLI 共用)
+// =============================================================================
+
+/// 合成生效能力边界:显式声明优先;未声明时按启动配置合成缺省(行为同 v1.0)
+///
+/// 单一事实源纪律(宪法 §七 反模式④):`capability_boundary` 是边界值唯一
+/// 权威,启动配置仅作为「未声明时」的缺省来源——两态合一处产出,禁两处
+/// 各存一份 root。
+pub fn effective_capability_boundary(
+    def: &crate::agent::definition::AgentDefinition,
+    startup_workdir: &Path,
+) -> crate::agent::definition::CapabilityBoundary {
+    use crate::agent::definition::{CapabilityBoundary, SANDBOX_CAPABLE_TOOLS};
+    if let Some(b) = &def.capability_boundary {
+        return b.clone();
+    }
+    // 缺省合成:沙箱根 = 启动 workdir;模式按是否含写类工具如实判定;
+    // 边界内工具 = 顶层 tools ∩ 沙箱类工具
+    let sandbox_tools: Vec<String> = def
+        .tools
+        .iter()
+        .filter(|t| SANDBOX_CAPABLE_TOOLS.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    let mode = if sandbox_tools.iter().any(|t| t == "file_write") {
+        "read_write"
+    } else {
+        "read_only"
+    };
+    CapabilityBoundary {
+        mode: mode.to_string(),
+        sandbox_root: startup_workdir.to_path_buf(),
+        tools: sandbox_tools,
+    }
+}
+
+/// 按「显式声明」重建 file 类工具沙箱绑定(声明缺省 → no-op,union 实例
+/// 已绑定启动 workdir,单一事实源成立)
+///
+/// 显式声明 = 唯一权威:`file_read` 按 `sandbox_root` 重建;`file_write` 在
+/// `read_write` 模式下按 `sandbox_root` 全域可写(writable_dir = ".")。
+/// 声明合法性(模式/工具一致性)由 `AgentDefinition::validate` 门卫先行保证。
+pub fn apply_capability_boundary(
+    handler: &mut ToolHandler,
+    declared: Option<&crate::agent::definition::CapabilityBoundary>,
+) {
+    let Some(b) = declared else {
+        return;
+    };
+    let root = b.sandbox_root.clone();
+    if b.tools.iter().any(|t| t == "file_read") {
+        handler.register_tool(
+            "file_read",
+            std::sync::Arc::new(crate::builtin_tools::file_read::FileReadTool::new(
+                root.clone(),
+            )),
+        );
+    }
+    if !b.is_read_only() && b.tools.iter().any(|t| t == "file_write") {
+        handler.register_tool(
+            "file_write",
+            std::sync::Arc::new(
+                crate::builtin_tools::file_write::FileWriteTool::new(root).with_writable_dir("."),
+            ),
+        );
+    }
+}
+
+/// M5-a:serve/CLI 共用一步接线 —— 合成生效边界 + (显式声明时)重绑工具面
+///
+/// 返回生效边界供调用方传给 `AgentRunner::with_capability_boundary`。
+pub fn wire_capability_boundary(
+    handler: &mut ToolHandler,
+    def: &crate::agent::definition::AgentDefinition,
+    startup_workdir: &Path,
+) -> crate::agent::definition::CapabilityBoundary {
+    let declared = def.capability_boundary.clone();
+    let effective = effective_capability_boundary(def, startup_workdir);
+    apply_capability_boundary(handler, declared.as_ref());
+    effective
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +468,214 @@ mod tests {
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
         assert!(union.get_tool("evolution_signals").is_some());
         assert!(union.get_tool("meta_summary").is_some());
+    }
+
+    // ===== M5-a 能力边界 helper 测试 =====
+
+    use std::path::PathBuf;
+
+    use crate::agent::definition::{AgentDefinition, CapabilityBoundary};
+
+    fn make_boundary(mode: &str, root: PathBuf, tools: &[&str]) -> CapabilityBoundary {
+        CapabilityBoundary {
+            mode: mode.to_string(),
+            sandbox_root: root,
+            tools: tools.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn make_def(tools: &[&str], boundary: Option<CapabilityBoundary>) -> AgentDefinition {
+        AgentDefinition {
+            agent_type: "tester".to_string(),
+            version: "1.0.0".to_string(),
+            description: "test".to_string(),
+            system_prompt: "p".to_string(),
+            model: "test-model".to_string(),
+            temperature: 0.7,
+            max_steps: 5,
+            step_timeout_secs: 30,
+            tools: tools.iter().map(|s| s.to_string()).collect(),
+            memory: Default::default(),
+            output_format: None,
+            context_window_tokens: None,
+            max_parallel_tools: 1,
+            capability_boundary: boundary,
+        }
+    }
+
+    #[test]
+    fn test_effective_boundary_declared_wins() {
+        // 显式声明 = 唯一权威:启动 workdir 不参与合成(单一事实源)
+        let declared_root = if cfg!(windows) {
+            PathBuf::from("D:\\declared-root")
+        } else {
+            PathBuf::from("/tmp/declared-root")
+        };
+        let def = make_def(
+            &["file_read", "file_list"],
+            Some(make_boundary(
+                "read_only",
+                declared_root.clone(),
+                &["file_read"],
+            )),
+        );
+        let eff = effective_capability_boundary(&def, Path::new("."));
+        assert!(eff.is_read_only());
+        assert_eq!(eff.sandbox_root, declared_root);
+        assert_eq!(eff.tools, vec!["file_read".to_string()]);
+    }
+
+    #[test]
+    fn test_effective_boundary_default_synthesis() {
+        // 未声明:沙箱根 = 启动 workdir;含 file_write → read_write;工具取沙箱类交集
+        let def = make_def(&["file_read", "file_write", "rule_list"], None);
+        let eff = effective_capability_boundary(&def, Path::new("."));
+        assert!(!eff.is_read_only());
+        assert_eq!(eff.sandbox_root, Path::new("."));
+        assert_eq!(eff.tools.len(), 2);
+
+        // 纯只读白名单 → read_only,tools 只含 file_read
+        let def2 = make_def(&["file_read", "file_list", "knowledge_search"], None);
+        let eff2 = effective_capability_boundary(&def2, Path::new("."));
+        assert!(eff2.is_read_only());
+        assert_eq!(eff2.tools, vec!["file_read".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_wire_no_declaration_is_noop() {
+        // 未声明:union 实例维持启动 workdir 绑定(缺省合成复现现状)
+        let startup = tempfile::tempdir().unwrap();
+        let root = startup.path().canonicalize().unwrap();
+        std::fs::write(root.join("startup_only.txt"), b"here").unwrap();
+
+        let (ws, ev) = make_clients();
+        let mut handler = build_union_toolkit(&root, &ws, &ev);
+        let def = make_def(&["file_read", "file_list"], None);
+        let eff = wire_capability_boundary(&mut handler, &def, &root);
+
+        assert_eq!(eff.sandbox_root, root);
+        let res = handler
+            .execute_by_name(
+                "file_read",
+                &serde_json::json!({"path": "startup_only.txt"}),
+            )
+            .await;
+        assert!(
+            res.is_ok(),
+            "no-declaration must keep startup binding: {:?}",
+            res.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wire_declared_root_rebinds_file_read() {
+        // 声明根 ≠ 启动 workdir:wire 后 file_read 按声明根解析,越界错误回报边界路径
+        let declared_dir = tempfile::tempdir().unwrap();
+        let startup_dir = tempfile::tempdir().unwrap();
+        let declared_root = declared_dir.path().canonicalize().unwrap();
+        let startup_root = startup_dir.path().canonicalize().unwrap();
+        std::fs::write(declared_root.join("in_boundary.txt"), b"inside").unwrap();
+        std::fs::write(startup_root.join("outside.txt"), b"outside").unwrap();
+
+        let (ws, ev) = make_clients();
+        let mut handler = build_union_toolkit(&startup_root, &ws, &ev);
+
+        // 对照:wire 前 union 实例按启动 workdir 绑定,相对路径可读
+        let pre = handler
+            .execute_by_name("file_read", &serde_json::json!({"path": "outside.txt"}))
+            .await;
+        assert!(
+            pre.is_ok(),
+            "startup binding should read outside.txt before wire"
+        );
+
+        let def = make_def(
+            &["file_read"],
+            Some(make_boundary(
+                "read_only",
+                declared_root.clone(),
+                &["file_read"],
+            )),
+        );
+        let eff = wire_capability_boundary(&mut handler, &def, &startup_root);
+        assert_eq!(eff.sandbox_root, declared_root);
+
+        // 声明根内文件可读(相对路径按声明根解析)
+        let ok = handler
+            .execute_by_name("file_read", &serde_json::json!({"path": "in_boundary.txt"}))
+            .await;
+        assert!(
+            ok.is_ok(),
+            "boundary-root file must be readable after rebind: {:?}",
+            ok.err()
+        );
+
+        // 原 workdir 独有文件(绝对路径) → 拒,且错误回报边界路径
+        let outside_abs = startup_root.join("outside.txt");
+        let err = handler
+            .execute_by_name(
+                "file_read",
+                &serde_json::json!({"path": outside_abs.display().to_string()}),
+            )
+            .await;
+        assert!(
+            err.is_err(),
+            "startup-only file must be rejected after rebind"
+        );
+        let msg = err.unwrap_err();
+        assert!(
+            msg.contains(&declared_root.display().to_string()),
+            "error must report the boundary path, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_read_write_declaration_enables_full_domain_write() {
+        // read_write 声明 → writable_dir="."(沙箱根全域可写,不再限 workspace/ 子目录)
+        let declared_dir = tempfile::tempdir().unwrap();
+        let root = declared_dir.path().canonicalize().unwrap();
+
+        // 对照:缺省实例(writable_dir=workspace)根下直写被拒
+        let mut default_handler = ToolHandler::new();
+        default_handler.register_tool(
+            "file_write",
+            std::sync::Arc::new(crate::builtin_tools::file_write::FileWriteTool::new(
+                root.clone(),
+            )),
+        );
+        let denied = default_handler
+            .execute_by_name(
+                "file_write",
+                &serde_json::json!({"path": "direct.txt", "content": "x"}),
+            )
+            .await;
+        assert!(
+            denied.is_err(),
+            "default binding must confine writes to workspace/"
+        );
+
+        // read_write 声明 apply 后:根下直写成功
+        let mut handler = ToolHandler::new();
+        handler.register_tool(
+            "file_write",
+            std::sync::Arc::new(crate::builtin_tools::file_write::FileWriteTool::new(
+                root.clone(),
+            )),
+        );
+        let b = make_boundary("read_write", root.clone(), &["file_write"]);
+        apply_capability_boundary(&mut handler, Some(&b));
+        let ok = handler
+            .execute_by_name(
+                "file_write",
+                &serde_json::json!({"path": "direct.txt", "content": "x"}),
+            )
+            .await;
+        assert!(
+            ok.is_ok(),
+            "read_write declaration implies full-domain write: {:?}",
+            ok.err()
+        );
+        assert!(root.join("direct.txt").exists());
     }
 }

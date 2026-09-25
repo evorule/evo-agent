@@ -557,6 +557,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         output_format: None,
         context_window_tokens: None,
         max_parallel_tools: 1,
+        capability_boundary: None,
     }
 }
 
@@ -1762,6 +1763,80 @@ async fn test_g15_run_streaming_creates_new_session() {
         event_count += 1;
         if let Ok(AgentEvent::SessionCreated { session_id, .. }) = &event {
             assert_eq!(session_id, "99");
+            got_session_created = true;
+        }
+        if event_count > 20 {
+            break;
+        }
+    }
+
+    assert!(
+        got_session_created,
+        "run_streaming should yield SessionCreated"
+    );
+    create_mock.assert_async().await;
+}
+
+/// M5-a:能力边界声明经 create_session initial_content 进会话事实
+/// (请求体必须含 initial_content.capability_boundary,零新 Fact 类型)
+#[tokio::test]
+async fn test_capability_boundary_sent_in_create_session() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+
+    let boundary = crate::agent::definition::CapabilityBoundary {
+        mode: "read_only".to_string(),
+        sandbox_root: std::env::temp_dir(),
+        tools: vec!["file_read".to_string()],
+    };
+
+    // 断言请求体含 initial_content.capability_boundary(PartialJson 子集匹配;
+    // sandbox_root 为平台相关绝对路径,不参与匹配)
+    let create_mock = server
+        .mock("POST", "/api/sessions")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "initial_content": {
+                "capability_boundary": {
+                    "mode": "read_only",
+                    "tools": ["file_read"]
+                }
+            }
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 77}"#)
+        .create_async()
+        .await;
+
+    // mock subscribe_events(空流)
+    server
+        .mock("GET", "/api/sessions/77/events")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("")
+        .create_async()
+        .await;
+
+    // mock submit_command
+    server
+        .mock("POST", "/api/sessions/77/command")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let runner =
+        AgentRunner::new(AgentConfig::default(), client).with_capability_boundary(boundary);
+
+    let stream = runner.run_streaming("hello".to_string());
+    let mut stream = stream;
+
+    let mut got_session_created = false;
+    let mut event_count = 0;
+    while let Some(event) = stream.next().await {
+        event_count += 1;
+        if let Ok(AgentEvent::SessionCreated { session_id, .. }) = &event {
+            assert_eq!(session_id, "77");
             got_session_created = true;
         }
         if event_count > 20 {

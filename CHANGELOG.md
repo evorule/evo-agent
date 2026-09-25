@@ -37,6 +37,7 @@
 ## [Unreleased]
 
 ### 🆕 新增
+- **能力边界声明 `capability_boundary`(M5-a 全局观机制,agent_def v1.1 增量字段)** — agent.json 可声明 `{mode: "read_only"|"read_write", sandbox_root, tools}`,成为 file 类工具沙箱检查的单一事实源;未声明时按启动配置合成缺省边界(行为与既往完全一致)。声明生效后:①会话建立时在 system_prompt 尾部注入系统级边界段(LLM 自知边界,越界请求可自述边界而非误报「文件不存在」);②边界事实经 create_session 的 initial_content 载体进链(零新 Fact 类型);③file_read/file_write 越界错误改为回报「不可访问 + 边界路径」。语义门卫:mode 取值白名单/sandbox_root 必须为绝对路径/顶层 tools 中的沙箱类工具必须列于 boundary.tools/read_only 不得授予 file_write。Schema 权威:evorule-system-rules `agent_def/v1.1.json`(evorule-constitution 0.3.1,rev pin 同步 bump)
 - **`workflow` 子命令新增 `--max-tokens <N>` flag** — token 预算阈值接线：累计 `tokens_used` 达到 N 即触发 replan Budget 分支（交付物 7 tokens 埋点的阈值消费闭环）；不指定 = 不限（缺省 None 维度不参与判定，行为不变）。`DriverLimits`/`BudgetThresholds.max_tokens` 逐版接线（driver.rs 阈值重算处）
 - **D-01 二次保险 + 降级兜底（runner.rs）** — SSE 流关闭路径新增 enforce 兜底：断流可能吞掉 `Violation` 帧（违规表现为「静默成功后流关闭」），流关闭时 best-effort 查 evolution-signals，`total_violations > 0` 即以 `enforce violation: rule_ref=..., reason=...` 固定前缀上抛（归因取链上最新违规信号 `last_version` 最大者；workflow 层凭前缀判别终止不 replan）；兜底查询不可用（网络断/会话被 TTL 收割/server 不可达）时**降级**——warn 留痕 + 返回携带本地上下文的原流关闭错误，不掩盖不阻塞不重试。同批补齐**流式消费面（REPL/工作台 `run_streaming`）的 `Violation` 分支**（此前流式路径违规事件落 `_` 静默丢弃）
 - **R2-T04 链体积监控（runner.rs）** — 长 会话 facts_log 体积增长观测告警：workflow 链与流式两消费面的 `Stable` 收尾路径 best-effort 查审计报告 `entry_count`（BLAKE3 审计链长 = 链体积权威只读投影），达到 `CHAIN_SIZE_WARN_ENTRIES`（10,000 条）warn 告警、低于阈值 debug 观测；查询失败静默降级。只读观测不干预执行——不写链、不拦截、不改变控制流（零红线风险）

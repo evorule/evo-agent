@@ -48,17 +48,24 @@ impl FileReadTool {
     fn resolve_safe_path(&self, raw: &str) -> Result<PathBuf, String> {
         let path = Path::new(raw);
 
-        // 拒绝绝对路径
+        // 拒绝绝对路径(M5-a:错误告知边界,agent 自知而非误判)
         if path.is_absolute() {
-            return Err(format!("absolute path not allowed: '{}'", raw));
+            return Err(format!(
+                "absolute path not allowed: '{}' (all paths must stay within the sandbox \
+                 boundary '{}')",
+                raw,
+                self.workdir.display()
+            ));
         }
 
         // 拒绝 `..` 段
         for component in path.components() {
             if matches!(component, Component::ParentDir) {
                 return Err(format!(
-                    "parent dir (..) not allowed: '{}' (must stay within workdir)",
-                    raw
+                    "parent dir (..) not allowed: '{}' (must stay within the sandbox \
+                     boundary '{}')",
+                    raw,
+                    self.workdir.display()
                 ));
             }
         }
@@ -77,9 +84,12 @@ impl FileReadTool {
             .map_err(|e| format!("workdir invalid: {}", e))?;
 
         if !canonical.starts_with(&workdir_canonical) {
+            // M5-a:越界错误回报「不可访问 + 边界路径」——首要读者是 LLM,
+            // 只说「不存在/逃逸」会让 agent 误判资源形态(瞎子摸象)
             return Err(format!(
-                "path escapes workdir: '{}' resolves outside sandbox",
-                raw
+                "path not accessible: '{}' resolves outside the sandbox boundary '{}'",
+                raw,
+                workdir_canonical.display()
             ));
         }
 

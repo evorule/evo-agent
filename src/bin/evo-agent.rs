@@ -454,6 +454,9 @@ fn cmd_run(
     //    修复:rule-copilot 等规则角色在 run 路径也能使用 ws_*/rule_*/audit_* 工具
     let mut tool_handler =
         evo_agent::api::serve_tools::build_union_toolkit(workdir, &ws_client, &client);
+    // M5-a:能力边界接线(显式声明重绑 file 工具沙箱 + 生效边界注入 runner)
+    let capability_boundary =
+        evo_agent::api::serve_tools::wire_capability_boundary(&mut tool_handler, &def, workdir);
 
     // 5. 桥接
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -500,7 +503,9 @@ fn cmd_run(
             }
         }
 
-        AgentRunner::from_definition(def, client, tool_handler, Some(llm_handler)).await
+        AgentRunner::from_definition(def, client, tool_handler, Some(llm_handler))
+            .await
+            .map(|r| r.with_capability_boundary(capability_boundary))
     });
     let runner = match runner_result {
         Ok(r) => r,
@@ -718,6 +723,9 @@ async fn patrol_build_runner(
     // def.tools 与本轮工具面同步收窄:from_definition 会 fail-fast 校验 def.tools
     // 每个名字都已在 tool_handler 注册,只窄 handler 不窄 def 会直接启动失败。
     def.tools.retain(|t| whitelist.contains(t));
+    // M5-a:能力边界接线(与 serve 同口径;retain 后 def.tools 已定,合成生效边界)
+    let capability_boundary =
+        evo_agent::api::serve_tools::wire_capability_boundary(&mut tool_handler, &def, workdir);
     if !config.mcp.servers.is_empty() {
         let connected = evo_agent::mcp::register_mcp_tools(&mut tool_handler, &config.mcp).await;
         eprintln!(
@@ -740,7 +748,8 @@ async fn patrol_build_runner(
     let llm_handler = LlmHandler::from_config(&config.llm);
     let runner = AgentRunner::from_definition(def, client.clone(), tool_handler, Some(llm_handler))
         .await
-        .map_err(|e| format!("bridge error: {e}"))?;
+        .map_err(|e| format!("bridge error: {e}"))?
+        .with_capability_boundary(capability_boundary);
     Ok(runner.with_approval_callback(std::sync::Arc::new(
         evo_agent::agent::approval::CliApproval { auto_approve: true },
     )))
@@ -2303,6 +2312,9 @@ fn run_repl_turn(
         evo_agent::api::workspace_client::WorkspaceApiClient::new(&config.evorule.base_url);
     let mut tool_handler =
         evo_agent::api::serve_tools::build_union_toolkit(workdir, &ws_client, client);
+    // M5-a:能力边界接线(与 cmd_run 同口径)
+    let capability_boundary =
+        evo_agent::api::serve_tools::wire_capability_boundary(&mut tool_handler, def, workdir);
 
     let runner_result = runtime.block_on(async {
         let llm_handler = evo_agent::io_handlers::LlmHandler::from_config(&config.llm);
@@ -2335,6 +2347,7 @@ fn run_repl_turn(
             Some(llm_handler),
         )
         .await
+        .map(|r| r.with_capability_boundary(capability_boundary))
     });
 
     let runner = match runner_result {
