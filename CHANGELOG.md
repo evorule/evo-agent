@@ -37,6 +37,7 @@
 ## [Unreleased]
 
 ### 🆕 新增
+- **协作验收规则三哨兵（M5-c 全局观机制第三刀：约束层 enforce）** — `00_constraint` 治理集三条 enforce 规则经 design-09 治理链发布（`rules/governance/00_constraint_collab_acceptance.json` v1.0.1）：R1 边界强制（`meta_tool.pending_target_scope=out_of_sandbox` → Halted）、R2 实施前置（workflow `meta_workflow.phase=implementation` 要求 `exists(payload.meta_task.due_diligence_done)`）、R3 核收前置（`phase=closure` 要求 `exists(payload.meta_task.implemented)`）。机制层配合两处：①runner 对 file 类工具调用先解析目标落点为规范字段 `meta_tool.pending_target_scope`（意图裁决规则化，机制层内联沙箱检查保留为兜底防线，双层各司其职）；②workflow 引擎对每个 LLM 节点 delegate 前向标记会话提交阶段信号 `set meta_workflow.phase=<node_id>`、节点成功后即时提交完成信号打标（`mark_node_done`，门/打标严格配对），driver drain 保留幂等兜底。域谓词状态路径遵循 exec 相对路径约定（`payload.*`/`instruction.*` 自动补 `__exec__.` 前缀）。真实 LLM E2E 四象限：越界企图/未尽责调均拦截且有 Violation 归因（rule_index+reason），合规链路逐级放行，误伤=0/漏放=0；`EVORULE_DISCIPLINE_GATE` 维持缺省 warn（flip enforce 另批）
 - **workflow 任务标记（M5-b 全局观机制第二刀：协作留痕通道）** — `workflow` 执行时驱动创建标记会话（`initial_content={"kind":"workflow_run","workflow_id":...}`），每个节点执行成功后向其提交中性完成信号 `set meta_signal.node_done=<node_id>`（`run_plan_loop` 增参 `marks_session: Option<String>`，None=既有行为零变更；信号提交失败 fail-fast——留痕是硬义务）。信号不含任务语义，「节点→标记」裁决完全在规则层：新增业务规则资产 `rules/governance/collab_task_marks.json`（rule_set v1.0，tier="business"，三条 branch 壳+set：`due_diligence→meta_task.due_diligence_done`、`implementation→meta_task.implemented`、`closure→meta_task.closed`；部署到 server 规则目录生效），机制层生产信号、规则层裁决标记，改协作纪律=改规则零发版。新增示例工作流 `rules/workflows/collab_dd_impl_close.json`（尽调→实施→核收三节点线性协作，workflow_dag v1.2）。真实 LLM E2E：三节点走通（tokens_used=1036）+ 标记会话链上三标记全真（branch 壳条件触发与 on_true set 落链均实测确认）
 - **能力边界声明 `capability_boundary`(M5-a 全局观机制,agent_def v1.1 增量字段)** — agent.json 可声明 `{mode: "read_only"|"read_write", sandbox_root, tools}`,成为 file 类工具沙箱检查的单一事实源;未声明时按启动配置合成缺省边界(行为与既往完全一致)。声明生效后:①会话建立时在 system_prompt 尾部注入系统级边界段(LLM 自知边界,越界请求可自述边界而非误报「文件不存在」);②边界事实经 create_session 的 initial_content 载体进链(零新 Fact 类型);③file_read/file_write 越界错误改为回报「不可访问 + 边界路径」。语义门卫:mode 取值白名单/sandbox_root 必须为绝对路径/顶层 tools 中的沙箱类工具必须列于 boundary.tools/read_only 不得授予 file_write。Schema 权威:evorule-system-rules `agent_def/v1.1.json`(evorule-constitution 0.3.1,rev pin 同步 bump)
 - **`workflow` 子命令新增 `--max-tokens <N>` flag** — token 预算阈值接线：累计 `tokens_used` 达到 N 即触发 replan Budget 分支（交付物 7 tokens 埋点的阈值消费闭环）；不指定 = 不限（缺省 None 维度不参与判定，行为不变）。`DriverLimits`/`BudgetThresholds.max_tokens` 逐版接线（driver.rs 阈值重算处）
@@ -137,6 +138,7 @@
   专用转换模块 `json_convert` 不再需要，随之删除
 
 ### 🐛 修复
+- **workflow phase 门与节点完成信号时序倒挂（M5-c 实测修正）** — `node_done` 完成信号原由外层驱动在节点执行返回后 drain 提交，晚于引擎内 phase 门求值：带约束规则的 workflow 第二节点 delegate 前置门必被误拦（前置标记尚未落链，`exists` 判 false）。修正为 LLM 节点成功分支即时打标（workflow.rs `mark_node_done`：向标记会话提交完成信号并 version 感知等待落链），门/打标严格配对；driver drain 保留作幂等兜底，未注入 phase_gate 形态零变更
 - **`.env` 仅 serve 子命令加载（workflow/run 等子命令 LLM 密钥失联）** — O-095 结构性修复当时只接了
   `cmd_serve`，`workflow`/`run`/`patrol` 等子命令路径不加载 `.env`：真实 LLM 运行在未显式注入环境变量时
   密钥缺失，LLM 调用失败且节点表现为空产出假绿。现前置到 `main` 入口统一加载（已设置的环境变量优先，

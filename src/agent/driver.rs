@@ -131,7 +131,16 @@ pub async fn run_plan_loop(
     // 子 runner 共享；仅供观测统计，不改变任何控制流。
     let token_arc = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ctx = ctx.with_token_counter(token_arc.clone());
-    let engine = WorkflowEngine::new(ctx.clone());
+    // M5-c:标记会话启用时同步注入阶段前置裁决通道(每个 LLM 节点 delegate
+    // 前提交 phase 信号,由 00_constraint enforce 裁决前置条件——引擎不含
+    // 协作纪律知识);None = 零变更
+    let mut engine = WorkflowEngine::new(ctx.clone());
+    if let Some(sid) = marks_session.as_deref() {
+        engine = engine.with_phase_gate(crate::agent::workflow::PhaseGate {
+            marks_session: sid.to_string(),
+            client: ctx.evorule_client.clone(),
+        });
+    }
     let initial_id = initial.workflow_id.clone();
 
     // 当前计划版本（v1 起；Dsl v1 = 手写 workflow，PlanExecute v1 = probe 产出 PlanFact）

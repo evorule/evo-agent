@@ -1,0 +1,99 @@
+{
+  "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
+  "kind": "rule_set",
+  "id": "com.evorule.constraint.collab_acceptance",
+  "version": "1.0.1",
+  "metadata": {
+    "title": "协作验收规则（边界强制 + 实施前置 + 核收前置）",
+    "description": "M5 全局观机制第三刀（约束层）：协作纪律的处置决策上移规则层（宪法 §七）。三条 enforce 哨兵——①边界强制：工具意图裁决（外层机制层把 file 类工具调用的目标解析为规范字段 meta_tool.pending_target_scope 后随指令进链）判 out_of_sandbox 即 Halted，机制层内联沙箱检查保留为兜底防线（双层各司其职）；②实施前置：阶段信号 meta_workflow.phase=implementation 要求 meta_task.due_diligence_done 已置（未尽调不得实施）；③核收前置：阶段信号 phase=closure 要求 meta_task.implemented 已置（未实施不得核收）。任务标记 meta_task.* 由协作任务标记业务规则（collab_task_marks.json）在节点完成信号上裁决写入。违规指令被引擎丢弃并发射 Violation（归因 rule_index→本规则集）。域谓词状态路径遵循 exec 相对路径约定（payload.* / instruction.*，自动补 __exec__. 前缀；1.0.0 曾因 exists 路径缺 payload. 前缀导致正象限误拦，2026-09-25 修正）。",
+    "authors": ["evorulelab@gmail.com"],
+    "created": "2026-09-25",
+    "updated": "2026-09-25",
+    "tags": ["constraint", "collaboration", "acceptance", "boundary", "enforce"],
+    "license": "AGPL-3.0-or-later",
+    "tier": "constraint",
+    "provenance": { "source": "manual" }
+  },
+  "transform": [
+    {
+      "type": "enforce",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            { "type": "instruction", "instruction_type": "set" },
+            {
+              "type": "eq",
+              "path": "instruction.params.attr",
+              "value": "meta_tool.pending_target_scope"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value",
+              "value": "out_of_sandbox"
+            }
+          ]
+        },
+        "reason": "越界访问企图：目标超出会话能力边界（target_scope=out_of_sandbox），已由协作验收规则拦截"
+      }
+    },
+    {
+      "type": "enforce",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            { "type": "instruction", "instruction_type": "set" },
+            {
+              "type": "eq",
+              "path": "instruction.params.attr",
+              "value": "meta_workflow.phase"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value",
+              "value": "implementation"
+            },
+            {
+              "type": "not",
+              "inner": {
+                "type": "exists",
+                "path": "payload.meta_task.due_diligence_done"
+              }
+            }
+          ]
+        },
+        "reason": "未尽责调不得开始实施（meta_task.due_diligence_done 缺失），已由协作验收规则拦截"
+      }
+    },
+    {
+      "type": "enforce",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            { "type": "instruction", "instruction_type": "set" },
+            {
+              "type": "eq",
+              "path": "instruction.params.attr",
+              "value": "meta_workflow.phase"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value",
+              "value": "closure"
+            },
+            {
+              "type": "not",
+              "inner": {
+                "type": "exists",
+                "path": "payload.meta_task.implemented"
+              }
+            }
+          ]
+        },
+        "reason": "未实施完成不得核收（meta_task.implemented 缺失），已由协作验收规则拦截"
+      }
+    }
+  ]
+}

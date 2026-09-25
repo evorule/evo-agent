@@ -342,6 +342,23 @@ workflow 执行时驱动会创建一个标记会话（`initial_content={"kind":"
 规则层裁决标记，二者分离——调整协作纪律只需改规则，零发版。示例工作流
 `collab_dd_impl_close`（尽调→实施→核收三节点）即按此协作纪律运行。
 
+#### 协作验收规则（协作纪律强制）
+
+约束层的处置决策同样上移规则层：`rules/governance/00_constraint_collab_acceptance.json`
+（宪法级约束，`tier="constraint"`，经治理链晋升发布）含三条 enforce 哨兵——
+R1 边界强制（工具意图 `meta_tool.pending_target_scope=out_of_sandbox` 即 Halted）、
+R2 实施前置（`meta_workflow.phase=implementation` 要求 `meta_task.due_diligence_done`
+已置——未尽调不得实施）、R3 核收前置（`phase=closure` 要求 `meta_task.implemented`
+已置——未实施不得核收）。违规指令被引擎丢弃并发射 Violation（归因 rule_index+reason）。
+
+机制层配合：runner 对 file 类工具调用先解析目标落点为规范字段
+`meta_tool.pending_target_scope`（vs 能力边界沙箱根）并随指令进链由 R1 裁决，
+handler 内联沙箱检查保留为兜底防线；workflow 引擎对每个 LLM 节点 delegate 前
+向标记会话提交阶段信号 `set meta_workflow.phase=<node_id>`（R2/R3 裁决前置条件），
+节点成功后即时提交完成信号打标（下一节点的门可见前置标记）——门/打标严格配对。
+被拦即 `enforce violation:` 错误终止（不 replan）；规则未部署时意图 set 照常留痕、
+内联兜底拒绝，双层各司其职。
+
 ---
 
 ## Agent 定义

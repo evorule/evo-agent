@@ -251,6 +251,21 @@ planner 走 delegate 既有路径(IoRequest sidecar 入链),零新增审计通�
 `meta_task.*` 标记,部署到 server 规则目录生效)。机制层/规则层分离:驱动
 generic 不含标记知识,改协作纪律 = 改规则零发版。
 
+**协作验收规则(M5-c,约束层 enforce 三哨兵)**:
+`rules/governance/00_constraint_collab_acceptance.json`(tier="constraint",
+治理链晋升发布)——R1 边界强制/ R2 实施前置(未尽调不得实施)/ R3 核收前置
+(未实施不得核收)。机制层接线两处:
+- runner `handle_call_external`:file 类工具执行前 `resolve_target_scope`
+  解析目标落点 → 提交意图 set `meta_tool.pending_target_scope` 随指令进链 →
+  version 感知裁决(20×50ms 轮询)→ 被拦 = 不执行工具、向 LLM 返回治理拦截
+  错误(`enforce violation:` 前缀);handler 内联沙箱检查保留为兜底防线。
+- `WorkflowEngine::with_phase_gate`:LLM 节点 delegate 前向标记会话提交
+  `set meta_workflow.phase=<node_id>` 由 R2/R3 裁决;**节点成功分支即时打标**
+  (`mark_node_done`,version 感知等待标记落链)——门/打标配对时序:完成信号
+  若晚于下一节点的门(如 M5-b 的 driver drain 形态)则前置标记必然缺失而误拦。
+  被拦错误带 `enforce violation:` 前缀,外层驱动 D-01 判别终止不 replan。
+规则未部署形态:意图/阶段 set 照常留痕入链,内联兜底拒绝——双层各司其职。
+
 ---
 
 ## 7. Agent 定义与桥接

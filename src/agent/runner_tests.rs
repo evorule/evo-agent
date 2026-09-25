@@ -2067,3 +2067,266 @@ async fn test_b3_chain_size_observation_degrades_on_query_failure() {
 
     runner.check_chain_size("4").await;
 }
+
+// ----- M5-c:工具意图裁决（规范字段生产 + version 感知通道）-----
+
+use crate::agent::definition::CapabilityBoundary;
+
+/// M5-c 测试用能力边界（纯路径运算，sandbox_root 无需真实存在）
+fn m5c_boundary() -> CapabilityBoundary {
+    CapabilityBoundary {
+        mode: "read_write".to_string(),
+        sandbox_root: std::path::PathBuf::from(if cfg!(windows) {
+            "C:\\tmp\\sandbox-root"
+        } else {
+            "/tmp/sandbox-root"
+        }),
+        tools: vec!["file_read".to_string(), "file_write".to_string()],
+    }
+}
+
+#[test]
+fn m5c_intent_signal_shape_is_neutral_set() {
+    // 中性信号形态：set meta_tool.pending_target_scope=<scope>；机制层不含拦截知识
+    let sig = intent_signal("out_of_sandbox");
+    assert_eq!(sig["type"], "set");
+    assert_eq!(sig["params"]["attr"], "meta_tool.pending_target_scope");
+    assert_eq!(sig["params"]["operation"], "set");
+    assert_eq!(sig["params"]["value"], "out_of_sandbox");
+    // 同输入必同输出（确定性）
+    assert_eq!(sig, intent_signal("out_of_sandbox"));
+}
+
+#[test]
+fn m5c_resolve_scope_in_sandbox_relative_path() {
+    let b = m5c_boundary();
+    assert_eq!(
+        resolve_target_scope(
+            "file_read",
+            &serde_json::json!({"path": "docs/readme.md"}),
+            Some(&b)
+        ),
+        Some("in_sandbox")
+    );
+    assert_eq!(
+        resolve_target_scope(
+            "file_write",
+            &serde_json::json!({"path": "a/b.txt"}),
+            Some(&b)
+        ),
+        Some("in_sandbox")
+    );
+}
+
+#[test]
+fn m5c_resolve_scope_out_of_sandbox_absolute_path() {
+    let b = m5c_boundary();
+    // 平台各自真实绝对路径形态（"C:\..." 在 Unix 上不是绝对路径——M5-a ebe54da 教训）
+    let abs = if cfg!(windows) {
+        "D:\\outside\\x.txt"
+    } else {
+        "/outside/x.txt"
+    };
+    assert_eq!(
+        resolve_target_scope("file_read", &serde_json::json!({"path": abs}), Some(&b)),
+        Some("out_of_sandbox")
+    );
+}
+
+#[test]
+fn m5c_resolve_scope_out_of_sandbox_parent_dir() {
+    let b = m5c_boundary();
+    assert_eq!(
+        resolve_target_scope(
+            "file_write",
+            &serde_json::json!({"path": "a/../../escape.txt"}),
+            Some(&b)
+        ),
+        Some("out_of_sandbox")
+    );
+}
+
+#[test]
+fn m5c_resolve_scope_none_for_non_file_tool() {
+    let b = m5c_boundary();
+    assert_eq!(
+        resolve_target_scope("shell_exec", &serde_json::json!({"cmd": "ls"}), Some(&b)),
+        None
+    );
+}
+
+#[test]
+fn m5c_resolve_scope_none_without_boundary() {
+    assert_eq!(
+        resolve_target_scope("file_read", &serde_json::json!({"path": "a.txt"}), None),
+        None
+    );
+}
+
+#[test]
+fn m5c_resolve_scope_none_without_path_arg() {
+    let b = m5c_boundary();
+    assert_eq!(
+        resolve_target_scope("file_read", &serde_json::json!({}), Some(&b)),
+        None
+    );
+}
+
+#[tokio::test]
+async fn m5c_verdict_allows_when_version_advances() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    // 首查命中 expect(1) mock（version 3，耗尽即摘除），轮询落到后建的
+    // version 4 mock——version 推进 = 放行（本 mockito 版本按创建顺序匹配）
+    let m_before = server
+        .mock("GET", "/api/sessions/42/state")
+        .with_status(200)
+        .with_body(r#"{"version": 3}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    // 轮询期后备 mock：绑定保活（mockito mock 被 drop 即摘除），放行成立即证明其被命中
+    let _m_after = server
+        .mock("GET", "/api/sessions/42/state")
+        .with_status(200)
+        .with_body(r#"{"version": 4}"#)
+        .create_async()
+        .await;
+    let m_cmd = server
+        .mock("POST", "/api/sessions/42/command")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "instruction": intent_signal("in_sandbox")
+        })))
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let allowed = submit_signal_and_await_verdict(&client, "42", &intent_signal("in_sandbox"))
+        .await
+        .expect("verdict channel must not fail");
+    assert!(allowed, "version advance must be read as allow");
+    m_before.assert_async().await;
+    m_cmd.assert_async().await;
+    // 放行成立即证明轮询命中了 version 4 mock（version 3 mock 已 expect(1) 摘除）
+}
+
+#[tokio::test]
+async fn m5c_verdict_blocks_when_version_stalls() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    // version 恒 3（1 次首查 + 20 次轮询 = 21）：窗口耗尽 → Ok(false)（被拦，
+    // 引擎语义 = enforce 丢弃指令不推进 version）
+    let m_state = server
+        .mock("GET", "/api/sessions/42/state")
+        .with_status(200)
+        .with_body(r#"{"version": 3}"#)
+        .expect(21)
+        .create_async()
+        .await;
+    server
+        .mock("POST", "/api/sessions/42/command")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let allowed = submit_signal_and_await_verdict(&client, "42", &intent_signal("out_of_sandbox"))
+        .await
+        .expect("channel must not fail on block");
+    assert!(!allowed, "stalled version must be read as blocked");
+    m_state.assert_async().await;
+}
+
+#[tokio::test]
+async fn m5c_verdict_fails_fast_on_transport_error() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    // 感知通道故障（500）→ Err（裁决不可信必须 fail-fast，调用方上抛）
+    server
+        .mock("GET", "/api/sessions/42/state")
+        .with_status(500)
+        .create_async()
+        .await;
+    let r = submit_signal_and_await_verdict(&client, "42", &intent_signal("in_sandbox")).await;
+    assert!(
+        r.is_err(),
+        "500 on state read must surface as channel error"
+    );
+}
+
+// ----- M5-c:约束资产域路径形状守卫（1.0.0 缺陷回归防线）-----
+//
+// 域谓词 path 为 exec 相对路径（path.rs resolve_exec_path：裸路径自动补
+// `__exec__.` 前缀），payload 状态路径必须写 `payload.*`；裸 `meta_task.*`
+// 解析到 `__exec__.meta_task.*` 永不存在 → exists 恒 false → R2/R3 恒触发
+// （1.0.0 正象限误拦根因，2026-09-25 E2E 发现）。本守卫对仓内约束资产
+// 做静态形状校验，在进入治理链之前拦下同类路径错误。
+
+/// 递归收集域谓词的 (type, path) 对（含 all/not 嵌套）
+fn m5c_collect_domain_paths(value: &serde_json::Value, out: &mut Vec<(String, String)>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let ty = map.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if matches!(ty, "eq" | "lt" | "gt" | "ge" | "exists" | "has_fields") {
+                if let Some(p) = map.get("path").and_then(|p| p.as_str()) {
+                    out.push((ty.to_string(), p.to_string()));
+                }
+            }
+            for v in map.values() {
+                m5c_collect_domain_paths(v, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                m5c_collect_domain_paths(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn m5c_constraint_asset_domain_paths_are_exec_relative() {
+    let asset_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("rules")
+        .join("governance")
+        .join("00_constraint_collab_acceptance.json");
+    let raw = std::fs::read_to_string(&asset_path)
+        .unwrap_or_else(|e| panic!("读取约束资产失败 {asset_path:?}: {e}"));
+    let asset: serde_json::Value = serde_json::from_str(&raw).expect("约束资产须为合法 JSON");
+
+    let mut paths = Vec::new();
+    m5c_collect_domain_paths(&asset, &mut paths);
+    // 3 规则：R1 eq×2，R2 eq×2+exists，R3 eq×2+exists = 8 个 path
+    assert!(
+        paths.len() >= 8,
+        "约束资产应含至少 8 个域 path，实际 {}: {paths:?}",
+        paths.len()
+    );
+    for (ty, p) in &paths {
+        let ok = p.starts_with("__exec__.")
+            || p.starts_with("payload.")
+            || p.starts_with("instruction.")
+            || p.starts_with("queue");
+        assert!(
+            ok,
+            "域 path（{ty}）必须为 exec 相对路径（payload.*/instruction.*/queue*/__exec__.*），发现违规: {p}"
+        );
+    }
+    // 定向回归：两条 exists 判据必须指向 payload 状态（1.0.0 缺陷为裸 meta_task.*）
+    let exists: Vec<&String> = paths
+        .iter()
+        .filter(|(ty, _)| ty == "exists")
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(
+        exists.len(),
+        2,
+        "应恰有 2 条 exists 判据（R2/R3 前置），实际: {exists:?}"
+    );
+    for p in &exists {
+        assert!(
+            p.starts_with("payload.meta_task."),
+            "exists 判据必须指向 payload 状态路径（payload.meta_task.*），发现: {p}"
+        );
+    }
+}
