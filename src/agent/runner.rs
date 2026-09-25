@@ -1339,7 +1339,28 @@ impl AgentRunner {
                     // G6:clone token 避免 &mut self(handle_io_request) 与 &self(cancel_token) 借用冲突
                     let cancel_token = self.cancel_token.clone();
                     let result = tokio::select! {
-                        r = self.handle_io_request(&session_id, &event.payload, &mut messages, &mut tool_calls) => r?,
+                        r = self.handle_io_request(&session_id, &event.payload, &mut messages, &mut tool_calls) => match r {
+                            Ok(r) => r,
+                            // O-118:处理失败(60s 超时/LLM 错误/工具错误/内部错误)也必须
+                            // 回写 error io_response —— 否则 server 侧 io_request 永久挂起、
+                            // 链实不一致(幽灵在途请求)。与取消分支/流式错误分支/audited_llm
+                            // 「失败也回写再返回」同一契约。回写后照旧上抛终止本轮。
+                            Err(e) => {
+                                if let Some(rid) = event.payload.get("id").and_then(|v| v.as_u64()) {
+                                    let err_str = e.to_string();
+                                    let _ = self.evorule_client
+                                        .submit_io_response(
+                                            &session_id,
+                                            rid,
+                                            &serde_json::json!({"error": &err_str}),
+                                            Some(err_str.as_str()),
+                                        )
+                                        .await;
+                                }
+                                let _ = self.flush_messages(&session_id).await;
+                                return Err(e);
+                            }
+                        },
                         _ = cancel_token.cancelled() => {
                             info!(%session_id, "Cancelled during io_request, cleaning up");
                             // 提交 error io_response 防止 evorule 卡死等 IoResponse
@@ -3183,6 +3204,13 @@ impl AgentRunner {
                                 };
                                 messages.push(assistant_msg.clone());
                                 if let Err(e) = runner.persist_message(&session_id, assistant_idx, assistant_msg).await {
+                                    // O-118:持久化失败也不留悬挂在途 io_request(回写后终止)
+                                    if let Some(rid) = request_id {
+                                        let err_str = e.to_string();
+                                        let _ = runner.evorule_client
+                                            .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
+                                            .await;
+                                    }
                                     yield Err(e);
                                     return;
                                 }
@@ -3260,6 +3288,13 @@ impl AgentRunner {
                                                     .persist_message(&session_id, messages.len() - 1, err_tool_msg)
                                                     .await
                                                 {
+                                                    // O-118:持久化失败也不留悬挂在途 io_request(回写后终止)
+                                                    if let Some(rid) = request_id {
+                                                        let pe_str = pe.to_string();
+                                                        let _ = runner.evorule_client
+                                                            .submit_io_response(&session_id, rid, &serde_json::json!({"error": &pe_str}), Some(pe_str.as_str()))
+                                                            .await;
+                                                    }
                                                     yield Err(pe);
                                                     return;
                                                 }
@@ -3286,6 +3321,13 @@ impl AgentRunner {
                                         };
                                         messages.push(tool_msg.clone());
                                         if let Err(e) = runner.persist_message(&session_id, tool_idx, tool_msg).await {
+                                            // O-118:持久化失败也不留悬挂在途 io_request(回写后终止)
+                                            if let Some(rid) = request_id {
+                                                let err_str = e.to_string();
+                                                let _ = runner.evorule_client
+                                                    .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
+                                                    .await;
+                                            }
                                             yield Err(e);
                                             return;
                                         }
@@ -3402,6 +3444,13 @@ impl AgentRunner {
                                 };
                                 messages.push(tool_msg.clone());
                                 if let Err(e) = runner.persist_message(&session_id, tool_idx, tool_msg).await {
+                                    // O-118:持久化失败也不留悬挂在途 io_request(回写后终止)
+                                    if let Some(rid) = request_id {
+                                        let err_str = e.to_string();
+                                        let _ = runner.evorule_client
+                                            .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
+                                            .await;
+                                    }
                                     yield Err(e);
                                     return;
                                 }
