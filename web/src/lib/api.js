@@ -82,6 +82,25 @@ export function putWorkbenchConfig(retention) {
   }).then(unwrap);
 }
 
+/** 工作台设置:合并后全量 + 每键生效层标注 */
+export function getWorkbenchSettings() {
+  return fetch('/api/workbench/settings', { headers: headers() }).then(unwrap);
+}
+
+/** 写工作台设置单键(value=null 重置;键/值非法返回 400) */
+export function putWorkbenchSetting(key, value) {
+  return fetch('/api/workbench/settings', {
+    method: 'PUT',
+    headers: headers(true),
+    body: JSON.stringify({ key, value }),
+  }).then(unwrap);
+}
+
+/** 工作台设置注册表(schema 单源下发;UI 渲染/校验/JSON 补全共用) */
+export function getWorkbenchSettingsSchema() {
+  return fetch('/api/workbench/settings/schema', { headers: headers() }).then(unwrap);
+}
+
 /** 审批决定(G8 既有通道;approved=true 批准 / false 拒绝) */
 export function approveProposal(agentType, sessionId, approved, proposalId) {
   return fetch(`/agents/${encodeURIComponent(agentType)}/approve`, {
