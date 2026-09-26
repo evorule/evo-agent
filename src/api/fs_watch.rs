@@ -500,6 +500,10 @@ mod tests {
         assert!(batch.is_empty());
     }
 
+    // verbatim(\\?\) 路径形态是 notify Windows 后端的产物,仅 Windows 有意义
+    // (Linux 下反斜杠路径不按组件分解,strip_prefix 语义不同);越界丢弃的
+    // 跨平台覆盖由 test_normalize_out_of_workdir_dropped 承担。
+    #[cfg(windows)]
     #[test]
     fn test_normalize_verbatim_workdir_prefix() {
         // notify Windows 后端以 \\?\ verbatim 绝对路径回投事件:
