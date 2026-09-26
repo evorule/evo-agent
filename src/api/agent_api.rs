@@ -590,8 +590,14 @@ async fn run_agent(
         "Starting agent execution"
     );
 
-    // E1:按白名单过滤 toolkit(serve 模式安全隔离)
-    let mut filtered = crate::api::serve_tools::build_filtered_toolkit(&state.toolkit, &def.tools);
+    // E1:按白名单过滤 toolkit(serve 模式安全隔离);agentTools.* 开关裁剪
+    // 文件增删改工具面(file_create/move/delete,开关关=契约同步消失)
+    let (merged_settings, _) = state.workbench_settings().merged();
+    let mut filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+        &state.toolkit,
+        &def.tools,
+        &merged_settings,
+    );
     // M5-a:能力边界接线(显式声明重绑 file 工具沙箱 + 生效边界注入 runner)
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
@@ -699,8 +705,14 @@ async fn run_agent_stream(
         "Starting agent streaming execution"
     );
 
-    // E1:按白名单过滤 toolkit(serve 模式安全隔离)
-    let mut filtered = crate::api::serve_tools::build_filtered_toolkit(&state.toolkit, &def.tools);
+    // E1:按白名单过滤 toolkit(serve 模式安全隔离);agentTools.* 开关裁剪
+    // 文件增删改工具面(同 run_agent 口径,三路径共用开关语义)
+    let (merged_settings, _) = state.workbench_settings().merged();
+    let mut filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+        &state.toolkit,
+        &def.tools,
+        &merged_settings,
+    );
     // M5-a:能力边界接线(同 run_agent 口径)
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());

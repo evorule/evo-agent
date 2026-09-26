@@ -157,6 +157,36 @@ pub fn schema() -> Vec<SettingEntry> {
             description: "AI 内联补全开关（补全能力上线后生效）",
             scope: "window",
         },
+        SettingEntry {
+            key: "agentTools.fileCreate",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 创建文件/目录（file_create；开启后每次调用默认需人工审批）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "agentTools.fileMove",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 移动/重命名文件（file_move；开启后每次调用默认需人工审批）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "agentTools.fileDelete",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 删除文件（file_delete，软删除进回收目录；开启后每次调用默认需人工审批）",
+            scope: "application",
+        },
     ]
 }
 
@@ -467,11 +497,15 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 7);
+        assert_eq!(settings.len(), 10);
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
         assert_eq!(settings["keybindings.overrides"], json!([]));
+        // agentTools.* 开关键:出厂默认(fileCreate 开 / fileMove、fileDelete 关)
+        assert_eq!(settings["agentTools.fileCreate"], json!(true));
+        assert_eq!(settings["agentTools.fileMove"], json!(false));
+        assert_eq!(settings["agentTools.fileDelete"], json!(false));
         for (k, v) in &sources {
             assert_eq!(v, &json!("default"), "key {k} should be default");
         }
