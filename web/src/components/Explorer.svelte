@@ -2,11 +2,13 @@
 <!-- Copyright (C) 2026 EvoRule Project -->
 <!-- 侧面板:文件树(真实目录浏览,懒加载;目录点击展开,文件点击进编辑器 tab)。
      渲染采用扁平行模型(展开目录按深度打平),避免递归组件。
-     B7 增量:顶部操作钮 / inline 命名(新建+重命名,支持 "/" 建层级)/
-     右键菜单 / 删除确认 / 折叠持久化 / WS fs_events 增量刷新 / tabs 联动。 -->
+     增量:顶部操作钮 / inline 命名(新建+重命名,支持 "/" 建层级)/
+     右键菜单 / 删除确认 / 折叠持久化 / WS fs_events 增量刷新 / tabs 联动 /
+     拖拽移动(目录节点与根区可放置)。 -->
 <script>
   import { onMount } from 'svelte';
   import { listDir, createFile, moveFile, deleteFile } from '../lib/api.js';
+  import { registerCommand, unregisterCommand } from '../lib/commands.js';
   import {
     openFile,
     closeTab,
@@ -37,6 +39,10 @@
   // ---- 右键菜单 / 删除确认 ----
   let menu = null; // {x, y, items}
   let confirmState = null; // {message, run()}
+
+  // ---- 选中与拖拽(选中 = 命令面板节点命令的作用对象;DnD = 树内移动) ----
+  let selected = null;
+  let dragOverPath = null; // 拖拽悬停的目标目录路径('' = 根,null = 无)
 
   async function loadChildren(path) {
     const st = dirState.get(path);
@@ -118,6 +124,7 @@
   }
 
   function open(node) {
+    selected = node;
     if (node.kind === 'dir') toggle(node);
     else openFile(node.path);
   }
@@ -227,6 +234,7 @@
 
   function openMenu(e, node) {
     e.preventDefault();
+    selected = node;
     menu = { x: e.clientX, y: e.clientY, items: menuFor(node) };
   }
 
@@ -258,6 +266,67 @@
         }
       },
     };
+  }
+
+  // =========================================================================
+  // 拖拽移动(HTML5 DnD):draggable 行携带相对路径,drop 到目录/根 → move
+  // =========================================================================
+
+  function startDrag(e, node) {
+    if (e.target && e.target.tagName === 'INPUT') {
+      e.preventDefault(); // inline 命名输入中的文本选择不触发节点拖拽
+      return;
+    }
+    e.dataTransfer.setData('text/plain', node.path);
+    e.dataTransfer.effectAllowed = 'move';
+  }
+
+  function dragOver(e, dirPath) {
+    e.preventDefault(); // 允许 drop(规范要求)
+    e.dataTransfer.dropEffect = 'move';
+    dragOverPath = dirPath;
+  }
+
+  async function dropTo(e, targetDir) {
+    e.preventDefault();
+    dragOverPath = null;
+    const from = e.dataTransfer.getData('text/plain');
+    if (!from) return;
+    const name = from.split('/').pop() || from;
+    const newPath = targetDir ? `${targetDir}/${name}` : name;
+    // 守卫:拖到自身/自身子树 = 无操作(原地移动 newPath === from 同样拦截)
+    if (newPath === from) return;
+    if (targetDir === from || (targetDir && targetDir.startsWith(`${from}/`))) return;
+    try {
+      await moveFile(from, targetDir || '.', null);
+      dirState.delete(from); // 旧子树状态随移动失效(展开态不迁移,v1 从简)
+      await reloadDir(parentDir(from));
+      if (dirState.get(targetDir)?.loaded) await reloadDir(targetDir);
+      rootChildren = dirState.get('')?.children || [];
+      persistExpanded();
+      rebuild();
+      // tab 打开时路径联动(dirty 保留;未打开时无 model 键,信号无害)
+      renameTabPath(from, newPath);
+    } catch (err) {
+      loadError = String(err?.message || err);
+    }
+  }
+
+  // =========================================================================
+  // 命令面板作用域:菜单/操作钮与命令共用同一本地函数(一处定义两处消费)
+  // =========================================================================
+
+  /** 选中节点 → 新建动作的目录锚点(dir→自身,file→父目录,无选中→根) */
+  function anchorFor(sel) {
+    if (!sel) return '';
+    return sel.kind === 'dir' ? sel.path : parentDir(sel.path);
+  }
+
+  /** 选中节点的树深度(inline 输入行缩进对齐用;找不到按根层) */
+  function depthOf(sel) {
+    if (!sel) return 0;
+    const row = rows.find((r) => r.node.path === sel.path);
+    return row ? row.depth : 0;
   }
 
   // =========================================================================
@@ -313,6 +382,57 @@
   }
 
   onMount(async () => {
+    // 命令自注册(注册置于任何 await 之前,保证组件存活期内命令可用)
+    const commands = [
+      {
+        id: 'explorer.newFile',
+        title: '新建文件',
+        category: '文件',
+        run: () => startCreate('createFile', anchorFor(selected)),
+      },
+      {
+        id: 'explorer.newFolder',
+        title: '新建文件夹',
+        category: '文件',
+        run: () => startCreate('createDir', anchorFor(selected)),
+      },
+      {
+        id: 'explorer.rename',
+        title: '重命名',
+        category: '文件',
+        keybinding: 'f2',
+        when: 'explorerFocus',
+        run: () => selected && startRename(selected, depthOf(selected)),
+      },
+      {
+        id: 'explorer.delete',
+        title: '删除…',
+        category: '文件',
+        when: 'explorerFocus',
+        run: () => selected && askDelete(selected),
+      },
+      {
+        id: 'explorer.copyPath',
+        title: '复制路径',
+        category: '文件',
+        when: 'explorerFocus',
+        run: () => selected && copyPath(selected),
+      },
+      {
+        id: 'explorer.open',
+        title: '在编辑器打开',
+        category: '文件',
+        when: 'explorerFocus',
+        run: () => selected && selected.kind === 'file' && openFile(selected.path),
+      },
+      {
+        id: 'explorer.refresh',
+        title: '刷新资源管理器',
+        category: '文件',
+        run: refreshAll,
+      },
+    ];
+    for (const c of commands) registerCommand(c);
     try {
       const res = await listDir();
       const seg = (res.dir || '').split(/[\\/]/).filter(Boolean).pop();
@@ -338,11 +458,14 @@
       fsEvents.set(null);
       applyFsEvents(ev);
     });
-    return () => unsubFs();
+    return () => {
+      for (const c of commands) unregisterCommand(c.id);
+      unsubFs();
+    };
   });
 </script>
 
-<div class="explorer">
+<div class="explorer" data-zone="explorer">
   <div class="panel-title">
     资源管理器
     {#if $connStatus === 'offline'}
@@ -350,7 +473,14 @@
     {/if}
   </div>
   <div class="actions">
-    <span class="workdir mono">
+    <span
+      class="workdir mono"
+      class:drop-root={dragOverPath === ''}
+      title="工作目录(拖动节点到此处移动到根)"
+      ondragover={(e) => dragOver(e, '')}
+      ondragleave={() => (dragOverPath = null)}
+      ondrop={(e) => dropTo(e, '')}
+    >
       <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8">
         <path d="M4 5a1 1 0 0 1 1-1h5l2 2h7a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5Z" />
       </svg>
@@ -397,14 +527,21 @@
       {#each rows as { node, depth } (node.path)}
         <div
           class="node {node.kind}"
+          class:selected={selected && selected.path === node.path}
+          class:drop-target={dragOverPath === node.path}
           style="padding-left: {10 + depth * 14}px"
           role="treeitem"
           aria-selected={node.kind === 'file' && node.path === $activePath}
           aria-expanded={node.kind === 'dir' ? !!dirState.get(node.path)?.expanded : undefined}
           tabindex="0"
+          draggable={!(naming && naming.target?.path === node.path)}
           onclick={() => open(node)}
           onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && open(node)}
           oncontextmenu={(e) => openMenu(e, node)}
+          ondragstart={(e) => startDrag(e, node)}
+          ondragover={(e) => node.kind === 'dir' && dragOver(e, node.path)}
+          ondragleave={() => (dragOverPath = null)}
+          ondrop={(e) => node.kind === 'dir' && dropTo(e, node.path)}
         >
           {#if node.kind === 'dir'}
             <svg
@@ -566,6 +703,19 @@
   }
   .node:hover {
     background: rgba(255, 255, 255, 0.06);
+  }
+  .node.selected {
+    background: var(--bg-active);
+  }
+  .node.drop-target {
+    outline: 1px dashed var(--brand);
+    outline-offset: -1px;
+    background: var(--brand-bg);
+  }
+  .workdir.drop-root {
+    outline: 1px dashed var(--brand);
+    outline-offset: -1px;
+    border-radius: var(--r-sm);
   }
   .node:focus-visible {
     outline: 1px solid var(--brand);

@@ -11,6 +11,7 @@ export const contextKeys = writable({
   editorFocus: false, // 焦点在编辑器(Monaco 宿主区)
   chatFocus: false, // 焦点在对话侧栏
   panelFocus: false, // 焦点在底部面板
+  explorerFocus: false, // 焦点在资源管理器侧栏
   inPalette: false, // 命令面板打开中(路由让位给面板内部导航)
   tabsOpen: false, // 有已打开的编辑器 tab(派生)
   sessionOpen: false, // 有已建立的 agent 会话(派生)
@@ -38,10 +39,16 @@ function applyZone(zone) {
     const editorFocus = zone === 'editor';
     const chatFocus = zone === 'chat';
     const panelFocus = zone === 'panel';
-    if (ctx.editorFocus === editorFocus && ctx.chatFocus === chatFocus && ctx.panelFocus === panelFocus) {
+    const explorerFocus = zone === 'explorer';
+    if (
+      ctx.editorFocus === editorFocus &&
+      ctx.chatFocus === chatFocus &&
+      ctx.panelFocus === panelFocus &&
+      ctx.explorerFocus === explorerFocus
+    ) {
       return ctx;
     }
-    return { ...ctx, editorFocus, chatFocus, panelFocus };
+    return { ...ctx, editorFocus, chatFocus, panelFocus, explorerFocus };
   });
 }
 
