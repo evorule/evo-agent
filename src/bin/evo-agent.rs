@@ -1715,6 +1715,18 @@ fn cmd_serve(
             .status_snapshot(config.llm_api_key_source.as_deref()),
     ));
 
+    // 工作台文件树实时刷新:启动 workdir 递归监听(400ms 去抖 + 规整),
+    // 变更经 WS 广播(fs_events 帧)。fail-soft:启动失败仅告警,文件树
+    // 失去实时刷新(手动刷新兜底),不影响其余功能。
+    match evo_agent::api::fs_watch::spawn_watcher(workdir, state.fs_events().clone()) {
+        Ok(()) => eprintln!(
+            "[fs-watch] watching workdir {} (debounce {}ms) for workbench tree refresh",
+            state.workdir().display(),
+            evo_agent::api::fs_watch::FS_DEBOUNCE_MS
+        ),
+        Err(e) => eprintln!("[fs-watch] watcher start failed (tree live-refresh disabled): {e}"),
+    }
+
     // G12:MCP 工具注册(P1 边界:只在 `run` 子命令生效)
     //
     // `serve` 模式已接入完整工具面(`src/api/serve_tools.rs`:union toolkit =

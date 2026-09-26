@@ -196,6 +196,9 @@ async fn handle_ws(
     // spawned task 结束且无更多 clone 时返回 None。用 WsEvent::TurnEnd 显式标记轮次结束。
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<WsEvent>(128);
 
+    // 文件系统事件广播(连接级订阅;连接建立后发生的变更可见,不补发历史)
+    let mut fs_rx = state.fs_events().subscribe();
+
     // 当前轮次的 cancel token(interrupt 时 cancel)
     let mut current_cancel: Option<CancellationToken> = None;
     // 是否有轮次正在执行(防止并发 message)
@@ -475,6 +478,26 @@ async fn handle_ws(
                         // event_tx 全部 drop(不应发生 — 主循环持有 event_tx)
                         // 视为连接异常,退出
                         warn!("G16: event channel closed unexpectedly");
+                        break;
+                    }
+                }
+            }
+            // ===== 转发文件系统事件批量给客户端(工作台文件树实时刷新) =====
+            fs_batch = fs_rx.recv() => {
+                match fs_batch {
+                    Ok(batch) => {
+                        let json = serde_json::json!({ "type": "fs_events", "events": &*batch });
+                        if send_ws_json(&mut sender, json).await.is_err() {
+                            warn!("G16: failed to send fs_events frame, client may have disconnected");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // 设计取舍:不补发——跳过落后量,前端手动刷新兜底
+                        debug!(skipped = n, "G16: fs_events lagged; skipping missed batches");
+                    }
+                    Err(_) => {
+                        // hub 关闭 = serve 正在关闭;正常退出连接
                         break;
                     }
                 }
