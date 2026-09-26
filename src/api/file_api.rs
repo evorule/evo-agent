@@ -19,6 +19,10 @@
 //!   (同实现,`writable_dir="."`;持树写互斥锁)
 //! - `DELETE /api/files?path=`   → [`FileDeleteTool`](crate::builtin_tools::file_delete::FileDeleteTool)
 //!   (同实现,软删除进 `.evo-trash`;持树写互斥锁)
+//! - `POST /api/files/search`    → [`grep_core`](crate::builtin_tools::grep_files::grep_core)
+//!   (全项目内容搜索;沙箱同款;30s 硬超时 partial)
+//! - `POST /api/files/replace`   → [`replace_core`](crate::builtin_tools::grep_files::replace_core)
+//!   (apply=false 预览零写盘 / apply=true 重匹配+原子写;核心层内部持树写互斥锁)
 //!
 //! ## 语义边界(与 agent 工具通道的差别,设计定稿留痕)
 //!
@@ -243,6 +247,70 @@ pub async fn delete_file(
         .call(&Value::Object(args))
         .await
         .map_err(|e| (err_status(&e), e))?;
+    Ok(Json(v))
+}
+
+/// `POST /api/files/search` —— 全项目内容搜索(委托 grep_core 核心层)
+///
+/// 请求体与 agent grep_files 工具 args 同形(query/isRegex/caseSensitive/
+/// wholeWord/smartCase/dir/includeGlobs/excludeGlobs/useIgnoreFiles/maxResults,
+/// camelCase/snake_case 双认);不委托 union toolkit 实例——工具实例把
+/// maxResults 钳到 DEFAULT_MAX_RESULTS,而 REST 面 maxResults 上限是
+/// 20 000(设置键 search.maxResults 同域)。
+/// 30s 硬超时返回已收集 partial(truncated+timedOut 标注)。
+/// 错误 → 404(dir 不存在)/ 400(非法正则 / 非法 glob / 参数非法 / 越界)。
+pub async fn search_files(
+    State(state): State<AgentApiState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let params = crate::builtin_tools::grep_files::GrepParams::from_args(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let workdir = state.workdir().to_path_buf();
+    // G13:核心层为同步 fs 遍历,spawn_blocking 包装
+    let v = tokio::task::spawn_blocking(move || {
+        crate::builtin_tools::grep_files::grep_core(&workdir, &params, None)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("search task failed: {e}"),
+        )
+    })?
+    .map_err(|e| (err_status(&e), e))?;
+    Ok(Json(v))
+}
+
+/// `POST /api/files/replace` —— 全局搜索替换(委托 replace_core 核心层)
+///
+/// 请求体=搜索参数 + `replacement`(必填)+ `apply`(缺省 false)+
+/// `paths`(限定替换文件集,「按所选文件替换」)。
+/// `apply=false` → 预览 `{preview:[{path,edits:[{line,before,after}]}],fileCount,matchCount}`,
+/// 零写盘;`apply=true` → **重新匹配**(不信任预览快照)后逐文件 tmp+rename
+/// 原子写,返回 `{appliedFiles,appliedMatches,failed:[{path,reason}]}`。
+/// 治理:人的 UI 写操作,不进 agent 审计链;误操作防护=强制预览+按文件应用+
+/// failed 留痕(设计 §四);树写互斥由 replace_core 内部持有。
+/// 错误 → 404(dir 不存在)/ 400(缺 replacement / 非法正则 / glob / 参数非法)。
+pub async fn replace_files(
+    State(state): State<AgentApiState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let params = crate::builtin_tools::grep_files::ReplaceParams::from_args(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let workdir = state.workdir().to_path_buf();
+    // G13:apply=true 在 replace_core 内部 blocking_lock 持树写锁,
+    // 必须 spawn_blocking(禁 async 上下文直调)
+    let v = tokio::task::spawn_blocking(move || {
+        crate::builtin_tools::grep_files::replace_core(&workdir, &params, None)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("replace task failed: {e}"),
+        )
+    })?
+    .map_err(|e| (err_status(&e), e))?;
     Ok(Json(v))
 }
 
@@ -564,5 +632,179 @@ mod tests {
         .await;
         let (status, _) = resp.expect_err("workdir root must be guarded");
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // =========================================================================
+    // 搜索/替换端点(B2-PR3):search / replace handler 级集成测试
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_search_handler_returns_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        std::fs::write(dir_canon.join("code.txt"), "needle here\nnothing\n").unwrap();
+        let state = mutation_state(&dir_canon);
+        let resp = search_files(
+            State(state),
+            Json(serde_json::json!({ "query": "needle", "smartCase": false })),
+        )
+        .await;
+        let v = resp.expect("search should succeed");
+        assert_eq!(v["totalMatches"], serde_json::json!(1));
+        assert_eq!(v["fileCount"], serde_json::json!(1));
+        assert_eq!(v["groups"][0]["path"], serde_json::json!("code.txt"));
+        assert_eq!(v["groups"][0]["hits"][0]["line"], serde_json::json!(1));
+        assert_eq!(v["groups"][0]["hits"][0]["col"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn test_search_invalid_regex_returns_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let state = mutation_state(&dir_canon);
+        let resp = search_files(
+            State(state),
+            Json(serde_json::json!({ "query": "(", "isRegex": true })),
+        )
+        .await;
+        let (status, msg) = resp.expect_err("invalid regex must fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("invalid regex"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_search_missing_dir_returns_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let state = mutation_state(&dir_canon);
+        let resp = search_files(
+            State(state),
+            Json(serde_json::json!({ "query": "x", "dir": "nope" })),
+        )
+        .await;
+        let (status, _) = resp.expect_err("missing dir must fail");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_search_escape_returns_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let state = mutation_state(&dir_canon);
+        let resp = search_files(
+            State(state),
+            Json(serde_json::json!({ "query": "x", "dir": "../outside" })),
+        )
+        .await;
+        let (status, _) = resp.expect_err("parent-dir escape must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_replace_preview_handler_no_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        std::fs::write(dir_canon.join("a.txt"), b"foo bar\n").unwrap();
+        let state = mutation_state(&dir_canon);
+        let resp = replace_files(
+            State(state),
+            Json(serde_json::json!({
+                "query": "foo",
+                "replacement": "baz",
+                "smartCase": false
+            })),
+        )
+        .await;
+        let v = resp.expect("preview should succeed");
+        assert_eq!(v["matchCount"], serde_json::json!(1));
+        assert_eq!(
+            v["preview"][0]["edits"][0]["before"],
+            serde_json::json!("foo")
+        );
+        assert_eq!(
+            v["preview"][0]["edits"][0]["after"],
+            serde_json::json!("baz")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir_canon.join("a.txt")).unwrap(),
+            "foo bar\n",
+            "preview must not write"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replace_apply_handler_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        std::fs::write(dir_canon.join("a.txt"), b"foo bar\n").unwrap();
+        let state = mutation_state(&dir_canon);
+        let resp = replace_files(
+            State(state),
+            Json(serde_json::json!({
+                "query": "foo",
+                "replacement": "baz",
+                "smartCase": false,
+                "apply": true
+            })),
+        )
+        .await;
+        let v = resp.expect("apply should succeed");
+        assert_eq!(v["appliedFiles"], serde_json::json!(1));
+        assert_eq!(v["appliedMatches"], serde_json::json!(1));
+        assert_eq!(v["failed"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            std::fs::read_to_string(dir_canon.join("a.txt")).unwrap(),
+            "baz bar\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replace_missing_replacement_returns_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let state = mutation_state(&dir_canon);
+        let resp = replace_files(State(state), Json(serde_json::json!({ "query": "x" }))).await;
+        let (status, msg) = resp.expect_err("missing replacement must fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("replacement"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_replace_invalid_regex_returns_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let state = mutation_state(&dir_canon);
+        let resp = replace_files(
+            State(state),
+            Json(serde_json::json!({ "query": "(", "isRegex": true, "replacement": "x" })),
+        )
+        .await;
+        let (status, msg) = resp.expect_err("invalid regex must fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("invalid regex"), "got: {msg}");
     }
 }

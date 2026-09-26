@@ -55,6 +55,10 @@ use crate::io_handlers::tool_handler::ToolFunction;
 /// 默认最大结果数(与 search_files max_results 量级一致)
 pub const DEFAULT_MAX_RESULTS: usize = 1000;
 
+/// maxResults 硬上限(设置键 search.maxResults 上限同域;防误传巨值撑爆内存,
+/// 30s 硬超时之外的第二道防线)
+pub const MAX_MAX_RESULTS: usize = 20_000;
+
 /// 硬超时:超时即停止遍历,返回已收集的 partial 结果(truncated+timedOut)
 pub const TIMEOUT_SECS: u64 = 30;
 
@@ -114,7 +118,7 @@ impl GrepParams {
             .get("maxResults")
             .or_else(|| args.get("max_results"))
             .and_then(|v| v.as_u64())
-            .map(|n| n.max(1) as usize)
+            .map(|n| (n.max(1) as usize).min(MAX_MAX_RESULTS))
             .unwrap_or(DEFAULT_MAX_RESULTS);
         let dir = args
             .get("dir")
