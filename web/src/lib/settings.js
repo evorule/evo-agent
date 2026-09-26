@@ -13,6 +13,7 @@ import {
   getWorkbenchSettings,
   getWorkbenchSettingsSchema,
   putWorkbenchSetting,
+  writeFile,
 } from './api.js';
 
 /** 缓存镜像键(降级回放;仅 schema/设置/生效层,无凭据) */
@@ -127,4 +128,108 @@ function persistCache(state) {
   } catch {
     /* 写失败静默(缓存是尽力而为的加速/降级层) */
   }
+}
+
+// ---- JSON 双模式(设置 JSON 文档编辑) ----
+//
+// user 模式:文档 = user 层键值集(生效层标注为 user 的键),保存 = 与打开时快照
+// 做 diff → 逐键 PUT(删除键 = PUT null 重置),不新增端点。
+// workspace 模式:文档 = <workdir>/.evo/settings.json 直读直写(files 通道)。
+
+/** 工作区层设置文件路径(files 通道读写) */
+export const WORKSPACE_SETTINGS_FILE = '.evo/settings.json';
+
+/** 从设置快照派生 user 层 JSON 文档对象(仅生效层为 user 的键值) */
+export function userLayerDoc(state) {
+  const out = {};
+  const sources = state?.sources || {};
+  for (const [k, v] of Object.entries(state?.settings || {})) {
+    if (sources[k] === 'user') out[k] = v;
+  }
+  return out;
+}
+
+/** schema 条目 → 标准 JSON Schema(Monaco jsonDefaults 挂载用;仅 properties 面) */
+export function buildSettingsSchema(entries) {
+  const properties = {};
+  for (const e of entries || []) {
+    const prop = { description: e.description || e.key };
+    if (e.type === 'number') {
+      prop.type = 'number';
+      if (Array.isArray(e.range) && e.range.length === 2) {
+        prop.minimum = e.range[0];
+        prop.maximum = e.range[1];
+      }
+    } else if (e.type === 'enum') {
+      prop.type = 'string';
+      prop.enum = Array.isArray(e.enum_values) ? e.enum_values : [];
+    } else if (e.type === 'boolean') {
+      prop.type = 'boolean';
+    } else if (e.type === 'array') {
+      prop.type = 'array';
+    } else {
+      prop.type = 'string';
+    }
+    properties[e.key] = prop;
+  }
+  return { type: 'object', properties, additionalProperties: false };
+}
+
+function parseObject(text, fallbackErrorPrefix) {
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch (e) {
+    return { error: `${fallbackErrorPrefix}:${String(e?.message || e)}` };
+  }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+    return { error: `${fallbackErrorPrefix}:设置文档必须是 JSON 对象` };
+  }
+  return { doc };
+}
+
+/**
+ * 保存 user 层 JSON 文档(text)相对打开时快照(baselineText)的变更:
+ * 删除键 → PUT null 重置;新增/变更键 → PUT 值。全部尝试后返回失败清单,
+ * 全部成功则重拉设置快照保证 sources 一致。返回错误消息或 null。
+ */
+export async function saveUserSettingsDoc(text, baselineText) {
+  const { doc, error } = parseObject(text, 'JSON 解析失败');
+  if (error) return error;
+  const { doc: base, error: baseError } = parseObject(baselineText || '{}', '基线解析失败');
+  if (baseError) return baseError;
+
+  const failures = [];
+  for (const k of Object.keys(base)) {
+    if (k in doc) continue;
+    try {
+      await setSetting(k, null);
+    } catch (e) {
+      failures.push(`${k}:${String(e?.message || e)}`);
+    }
+  }
+  for (const [k, v] of Object.entries(doc)) {
+    if (k in base && JSON.stringify(base[k]) === JSON.stringify(v)) continue;
+    try {
+      await setSetting(k, v);
+    } catch (e) {
+      failures.push(`${k}:${String(e?.message || e)}`);
+    }
+  }
+  if (failures.length > 0) return `${failures.length} 项保存失败 — ${failures.join('; ')}`;
+  await loadSettings();
+  return null;
+}
+
+/** 保存 workspace 层 JSON 文档(整体直写工作区设置文件)。返回错误消息或 null */
+export async function saveWorkspaceSettingsDoc(text) {
+  const { error } = parseObject(text, 'JSON 解析失败');
+  if (error) return error;
+  try {
+    await writeFile(WORKSPACE_SETTINGS_FILE, text);
+  } catch (e) {
+    return String(e?.message || e);
+  }
+  await loadSettings();
+  return null;
 }

@@ -10,6 +10,7 @@
   import { get } from 'svelte/store';
   import { settingsState, setSetting } from '../lib/settings.js';
   import { getWorkbenchConfig, putWorkbenchConfig, getLlmStatus } from '../lib/api.js';
+  import { openSettingsJson } from '../lib/stores.js';
 
   let query = '';
   /** 数组控件展开态(键 ID) */
@@ -142,12 +143,26 @@
 
 <div class="settings">
   <div class="head">
-    <input
-      class="search"
-      type="text"
-      placeholder="搜索设置(支持 @modified 过滤已修改项)"
-      bind:value={query}
-    />
+    <div class="head-row">
+      <input
+        class="search"
+        type="text"
+        placeholder="搜索设置(支持 @modified 过滤已修改项)"
+        bind:value={query}
+      />
+      <div class="json-links">
+        <button class="btn" title="以 JSON 编辑用户层设置(保存即生效)" onclick={() => openSettingsJson('user')}>
+          打开 settings.json
+        </button>
+        <button
+          class="btn"
+          title="编辑工作区层设置文件(.evo/settings.json,覆盖用户层)"
+          onclick={() => openSettingsJson('workspace')}
+        >
+          工作区 settings.json
+        </button>
+      </div>
+    </div>
     {#if degraded}
       <div class="degraded">服务不可达,当前显示缓存值(只读);恢复连接后自动解除</div>
     {/if}
@@ -304,8 +319,19 @@
     padding: var(--sp-md);
     border-bottom: 1px solid var(--border);
   }
+  .head-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-sm);
+  }
+  .json-links {
+    display: flex;
+    gap: var(--sp-xs);
+    flex-shrink: 0;
+  }
   .search {
-    width: 100%;
+    flex: 1;
+    min-width: 0;
     box-sizing: border-box;
     background: var(--bg-input);
     border: 1px solid var(--border);

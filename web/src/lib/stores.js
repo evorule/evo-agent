@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 import { writable, get } from 'svelte/store';
-import { listSessions, readFile, writeFile, getAgentDef, getEvolutionSignals } from './api.js';
+import { listSessions, readFile, writeFile, getAgentDef, getEvolutionSignals, getWorkbenchSettings } from './api.js';
+import { userLayerDoc } from './settings.js';
 
 /** 连接状态: connecting | online | offline */
 export const connStatus = writable('offline');
@@ -176,6 +177,12 @@ export async function saveTab(path, content) {
 /** 设置页虚拟路径(特殊 tab,非文件;EditorPane 按 kind 渲染设置组件) */
 export const SETTINGS_TAB_PATH = 'evo://settings';
 
+/** 用户层设置 JSON 虚拟路径(编辑器 tab;内容=生效层为 user 的键值集) */
+export const USER_SETTINGS_URI = 'evo://settings/user';
+
+/** 工作区层设置 JSON 虚拟路径(编辑器 tab;内容=.evo/settings.json 直读直写) */
+export const WORKSPACE_SETTINGS_URI = 'evo://settings/workspace';
+
 /** 打开设置页(特殊 tab;已开则激活) */
 export function openSettingsTab() {
   let existing = null;
@@ -192,6 +199,51 @@ export function openSettingsTab() {
     { path: SETTINGS_TAB_PATH, kind: 'settings', name: '设置', content: '', dirty: false, error: null },
   ]);
   activePath.set(SETTINGS_TAB_PATH);
+}
+
+/**
+ * 打开设置 JSON 文档(user=派生快照 / workspace=工作区文件;已开则激活,
+ * 保留未保存编辑)。返回错误消息或 null(错误也以错误占位 tab 呈现)。
+ */
+export async function openSettingsJson(mode = 'user') {
+  const path = mode === 'workspace' ? WORKSPACE_SETTINGS_URI : USER_SETTINGS_URI;
+  const name = mode === 'workspace' ? 'settings.json (工作区)' : 'settings.json';
+  let existing = null;
+  tabs.update((list) => {
+    existing = findTab(list, path) || null;
+    return list;
+  });
+  if (existing) {
+    activePath.set(path);
+    return null;
+  }
+  let content = '';
+  try {
+    if (mode === 'workspace') {
+      try {
+        const res = await readFile('.evo/settings.json');
+        content = res.content ?? '{}';
+      } catch {
+        content = '{}'; // 工作区层文件尚不存在,保存即创建(serve 侧自动建父目录)
+      }
+    } else {
+      const res = await getWorkbenchSettings();
+      content =
+        JSON.stringify(
+          userLayerDoc({ settings: res?.settings ?? {}, sources: res?.sources ?? {} }),
+          null,
+          2,
+        ) + '\n';
+    }
+  } catch (e) {
+    const msg = String(e?.message || e);
+    tabs.update((list) => [...list, { path, name, content: '', dirty: false, error: msg }]);
+    activePath.set(path);
+    return msg;
+  }
+  tabs.update((list) => [...list, { path, name, content, dirty: false, error: null }]);
+  activePath.set(path);
+  return null;
 }
 
 // ---- 产物协作编辑阶段(S4):agent 草稿 → 人定稿 ----
