@@ -410,6 +410,16 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/files",
             axum::routing::delete(crate::api::file_api::delete_file),
         )
+        // 全局搜索与替换(人工面,委托 grep_core/replace_core 核心层):
+        // 替换 apply=true 原子写,树写互斥由核心层内部持有
+        .route(
+            "/api/files/search",
+            axum::routing::post(crate::api::file_api::search_files),
+        )
+        .route(
+            "/api/files/replace",
+            axum::routing::post(crate::api::file_api::replace_files),
+        )
         // G14:记忆事件查询 — 返回 session 的所有结构化事件
         .route(
             "/api/sessions/{id}/events",
