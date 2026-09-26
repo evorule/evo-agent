@@ -3,7 +3,8 @@
 <!-- 命令面板(B1):Ctrl+Shift+P 命令模式 / Ctrl+P 文件模式,同一面板两数据源。
      键盘导航(↑↓ 循环/Home/End/Enter/Esc)+ 焦点陷阱 + combobox/listbox 语义;
      命令模式含 recently used 置顶(localStorage 上限 10)与快捷键提示列;
-     文件模式 v1 数据源:已开 tab(工作区文件索引与会话列表随 Ctrl+P 批次接入)。
+     文件模式数据源:最近打开(recent files)+ 已开 tab + 工作区文件索引(走树,
+     skip 名单/500 上限/失败降级)+ 会话列表(切换会话同入口)。
      配色/字体/间距全部复用工作台 CSS token,不自造颜色。 -->
 <script>
   import { get } from 'svelte/store';
@@ -12,12 +13,20 @@
     paletteMode,
     closePalette,
     tabs,
+    sessions,
     openFile,
   } from '../lib/stores.js';
+  import { openSession } from '../lib/ws.js';
   import { listCommands, executeCommand } from '../lib/commands.js';
   import { setContextKey } from '../lib/context-keys.js';
   import { fuzzyMatch, highlightSegments } from '../lib/fuzzy.js';
   import { formatKey, getEffectiveKeybinding } from '../lib/keybindings.js';
+  import {
+    collectFiles,
+    loadRecentFiles,
+    recordRecentFile,
+    nameOf,
+  } from '../lib/quick-open.js';
 
   const RECENT_COMMANDS_KEY = 'evo_recent_commands';
   const RECENT_LIMIT = 10;
@@ -93,6 +102,30 @@
     }
   }
 
+  // ---- 工作区文件索引(开面板 files 模式时加载一次,组件级缓存) ----
+
+  let workspaceFiles = []; // [{path, name}]
+  let workspaceLoading = false;
+  let workspaceLoaded = false;
+  let workspaceTruncated = false;
+
+  async function ensureWorkspace() {
+    if (workspaceLoaded || workspaceLoading) return;
+    workspaceLoading = true;
+    try {
+      const { files, truncated } = await collectFiles();
+      workspaceFiles = files;
+      workspaceTruncated = truncated;
+      workspaceLoaded = true;
+    } catch {
+      workspaceLoaded = true; // 降级:整体失败只剩 tabs+recent
+    } finally {
+      workspaceLoading = false;
+    }
+  }
+
+  $: if ($paletteOpen && $paletteMode === 'files') ensureWorkspace();
+
   // ---- 列表模型:过滤 + 排序 + 分组 ----
 
   /** @returns {{groups: {label: string, items: object[]}[]}} */
@@ -133,24 +166,70 @@
     }
   }
 
+  function bestFileMatch(q, name, path) {
+    const byName = fuzzyMatch(q, name);
+    const byPath = fuzzyMatch(q, path);
+    if (!byName) return byPath;
+    if (!byPath) return byName;
+    return byName.score >= byPath.score ? byName : byPath;
+  }
+
+  function fileItem(f, match = null) {
+    return { kind: 'file', file: f, match };
+  }
+
+  function sessionItem(s, match = null) {
+    return { kind: 'session', session: s, match };
+  }
+
+  /** 文件模式:recent + tabs + 工作区索引 + 会话列表。 */
   function buildFileItems(q) {
-    // v1 数据源:已开 tab;工作区文件索引/最近打开/会话列表随 Ctrl+P 文件模式批次接入
-    const items = get(tabs).map((t) => ({ kind: 'file', file: t }));
-    if (!q) return [{ label: '', items }];
-    return [
-      {
-        label: '',
-        items: items
-          .map((it) => {
-            const byName = fuzzyMatch(q, it.file.name);
-            const byPath = fuzzyMatch(q, it.file.path);
-            const match = !byName ? byPath : !byPath ? byName : byName.score >= byPath.score ? byName : byPath;
-            return { ...it, match };
-          })
-          .filter((it) => it.match !== null)
-          .sort((a, b) => b.match.score - a.match.score),
-      },
-    ];
+    const recent = loadRecentFiles().map((p) => ({ path: p, name: nameOf(p) }));
+    const opened = get(tabs).map((t) => ({ path: t.path, name: t.name }));
+
+    if (!q) {
+      const groups = [];
+      if (recent.length > 0) {
+        groups.push({ label: '最近打开', items: recent.map((f) => fileItem(f)) });
+      }
+      const recentSet = new Set(recent.map((f) => f.path));
+      const openedRest = opened.filter((f) => !recentSet.has(f.path));
+      if (openedRest.length > 0) {
+        groups.push({ label: '已打开标签', items: openedRest.map((f) => fileItem(f)) });
+      }
+      const openedSet = new Set(opened.map((f) => f.path));
+      const wsRest = workspaceFiles.filter((f) => !recentSet.has(f.path) && !openedSet.has(f.path));
+      if (wsRest.length > 0) {
+        groups.push({ label: '工作区文件', items: wsRest.map((f) => fileItem(f)) });
+      }
+      if (get(sessions).length > 0) {
+        groups.push({ label: '会话', items: get(sessions).map((s) => sessionItem(s)) });
+      }
+      return groups;
+    }
+
+    // 有查询:文件三源合并去重,按分数直排;会话命中追加在后
+    const byPath = new Map();
+    for (const f of [...recent, ...opened, ...workspaceFiles]) {
+      if (!byPath.has(f.path)) byPath.set(f.path, f);
+    }
+    const groups = [];
+    const scored = [...byPath.values()]
+      .map((f) => ({ ...fileItem(f), match: bestFileMatch(q, f.name, f.path) }))
+      .filter((it) => it.match !== null)
+      .sort((a, b) => b.match.score - a.match.score);
+    if (scored.length > 0) groups.push({ label: '', items: scored });
+    const sessionHits = get(sessions)
+      .map((s) => {
+        const byTitle = fuzzyMatch(q, s.title || '(无标题)');
+        const byId = fuzzyMatch(q, s.session_id);
+        const match = !byTitle ? byId : !byId ? byTitle : byTitle.score >= byId.score ? byTitle : byId;
+        return { ...sessionItem(s), match };
+      })
+      .filter((it) => it.match !== null)
+      .sort((a, b) => b.match.score - a.match.score);
+    if (sessionHits.length > 0) groups.push({ label: '会话', items: sessionHits });
+    return groups;
   }
 
   $: groups = $paletteOpen ? (mode === 'files' ? buildFileItems(query.trim()) : buildCommandItems(query.trim())) : [];
@@ -170,7 +249,10 @@
         execError = String(e?.message || e);
         setTimeout(() => (execError = ''), 4000);
       }
+    } else if (item.kind === 'session') {
+      openSession(item.session.session_id);
     } else {
+      recordRecentFile(item.file.path);
       openFile(item.file.path);
     }
   }
@@ -283,7 +365,7 @@
           {#if group.label}
             <li class="group-label" role="presentation">{group.label}</li>
           {/if}
-          {#each group.items as item (item.kind === 'command' ? item.cmd.id : item.file.path)}
+          {#each group.items as item (item.kind === 'command' ? item.cmd.id : item.kind === 'session' ? `session:${item.session.session_id}` : item.file.path)}
             {@const idx = flatItems.indexOf(item)}
             <!-- svelte-ignore a11y-mouse-events-have-key-events a11y-click-events-have-key-events -->
             <li
@@ -293,7 +375,9 @@
               aria-selected={idx === activeIndex}
               aria-label={item.kind === 'command'
                 ? `${item.cmd.category ? item.cmd.category + ': ' : ''}${item.cmd.title}`
-                : item.file.path}
+                : item.kind === 'session'
+                  ? `会话: ${item.session.title || '(无标题)'}`
+                  : item.file.path}
               class="row"
               class:active={idx === activeIndex}
               on:mouseenter={() => (activeIndex = idx)}
@@ -309,6 +393,13 @@
                 {#if item.cmd.keybinding || getEffectiveKeybinding(item.cmd.id)}
                   <kbd class="row-key mono">{getEffectiveKeybinding(item.cmd.id) || formatKey(item.cmd.keybinding)}</kbd>
                 {/if}
+              {:else if item.kind === 'session'}
+                <span class="row-title">
+                  {#each highlightSegments(item.session.title || '(无标题)', item.match ? item.match.positions : []) as seg}
+                    {#if seg.hit}<mark>{seg.text}</mark>{:else}{seg.text}{/if}
+                  {/each}
+                </span>
+                <span class="row-detail mono" title={item.session.session_id}>{item.session.session_id}</span>
               {:else}
                 <span class="row-title">
                   {#each highlightSegments(item.file.name, item.match ? item.match.positions : []) as seg}
@@ -322,8 +413,16 @@
         {/each}
         {#if flatItems.length === 0}
           <li class="empty" role="presentation">
-            {mode === 'files' ? '没有匹配的文件(当前仅索引已打开的文件)' : '没有匹配的命令'}
+            {#if mode === 'files'}
+              {workspaceLoading ? '正在索引工作区…' : '没有匹配的文件'}
+            {:else}
+              没有匹配的命令
+            {/if}
           </li>
+        {:else if mode === 'files' && workspaceLoading}
+          <li class="empty" role="presentation">正在索引工作区…</li>
+        {:else if mode === 'files' && workspaceTruncated}
+          <li class="empty" role="presentation">工作区文件较多,索引已截断(部分文件请用文件树浏览)</li>
         {/if}
       </ul>
     </div>
