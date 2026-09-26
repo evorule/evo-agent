@@ -228,6 +228,23 @@ pub fn remove_recursive(path: &Path) -> Result<(), String> {
     }
 }
 
+// =============================================================================
+// 文件树变更全局写互斥(设计 §3.1 v1)
+// =============================================================================
+
+/// REST 文件增删改端点共用的全局树写互斥锁。
+///
+/// 串行化工作台文件树的增删改(create/move/delete),防并发变更产生
+/// 中间态(如移动目标目录的同时该目录被删除)。tokio Mutex 因持锁
+/// 段跨 await(工具调用经 spawn_blocking 异步执行);agent 面工具
+/// 不持此锁——其并发由会话自身串行保证,锁只覆盖人工面端点。
+static TREE_MUTATION_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+/// 取全局树写互斥锁(handler 内 `.lock().await` 后持锁执行变更)
+pub fn tree_mutation_lock() -> &'static tokio::sync::Mutex<()> {
+    TREE_MUTATION_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// 生成 `.evo-trash/` 内唯一落点名:`<unix_ts>_<name>`,同秒重名追加 `_1`/`_2`…
 pub fn trash_destination(trash_dir: &Path, name: &str) -> PathBuf {
     let ts = std::time::SystemTime::now()
