@@ -11,6 +11,7 @@
   import TitleBar from './components/TitleBar.svelte';
   import ActivityBar from './components/ActivityBar.svelte';
   import Explorer from './components/Explorer.svelte';
+  import SearchPanel from './components/SearchPanel.svelte';
   import EditorPane from './components/EditorPane.svelte';
   import BottomPanel from './components/BottomPanel.svelte';
   import ChatSidebar from './components/ChatSidebar.svelte';
@@ -28,6 +29,7 @@
     refreshGovBadges,
     sessionId,
     sidebarView,
+    searchIntent,
     openSettingsTab,
     openSettingsJson,
   } from './lib/stores.js';
@@ -52,12 +54,22 @@
     'workbench.action.gov.refreshBadges',
     'workbench.action.openSettings',
     'workbench.action.openSettingsJson',
+    'workbench.action.search.show',
+    'workbench.action.search.replace',
+    'workbench.action.search.clear',
   ];
   let cleanupTracking = null;
 
   /** 活动栏条目分发(设置等非文件树视图的宿主接线路由) */
   function handleActivityItem(id) {
     if (id === 'settings') openSettingsTab();
+  }
+
+  /** 搜索视图入口:切视图 + 保证侧栏可见 + 发一次性意图信号(SearchPanel 消费) */
+  function showSearch(intent = 'show') {
+    sidebarView.set('search');
+    explorerVisible.set(true);
+    searchIntent.set(intent);
   }
 
   onMount(() => {
@@ -143,6 +155,26 @@
       category: '首选项',
       run: () => openSettingsJson('user'),
     });
+    registerCommand({
+      id: 'workbench.action.search.show',
+      title: '在文件中搜索',
+      category: '搜索',
+      keybinding: 'ctrl+shift+f',
+      run: () => showSearch('show'),
+    });
+    registerCommand({
+      id: 'workbench.action.search.replace',
+      title: '在文件中替换',
+      category: '搜索',
+      keybinding: 'ctrl+shift+h',
+      run: () => showSearch('replace'),
+    });
+    registerCommand({
+      id: 'workbench.action.search.clear',
+      title: '清除搜索结果',
+      category: '搜索',
+      run: () => searchIntent.set('clear'),
+    });
     loadSettings(); // 设置快照加载(失败降级缓存只读;编辑器参数订阅在 EditorPane)
     migrateKeybindings(); // 旧键位覆盖层一次性迁移(失败保留旧键,下次启动重试)
     cleanupTracking = initContextTracking();
@@ -175,8 +207,7 @@
       {#if $sidebarView === 'explorer'}
         <Explorer />
       {:else if $sidebarView === 'search'}
-        <!-- SearchPanel 接入于 B2-PR5 -->
-        <div class="side-placeholder"></div>
+        <SearchPanel />
       {/if}
     </div>
     <div class="center">
@@ -208,11 +239,5 @@
     display: flex;
     flex-direction: column;
     background: var(--bg-card);
-  }
-  .side-placeholder {
-    width: 220px;
-    flex-shrink: 0;
-    background: var(--sidebar-bg);
-    border-right: 1px solid var(--border);
   }
 </style>

@@ -84,6 +84,24 @@ export function deleteFile(path) {
   }).then(unwrap);
 }
 
+/** 全局内容搜索(body 与 agent grep_files 工具参数同形) */
+export function searchGrep(body) {
+  return fetch('/api/files/search', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify(body),
+  }).then(unwrap);
+}
+
+/** 全局替换(apply=false 预览零写盘 / true 应用重匹配原子写) */
+export function replaceFiles(body) {
+  return fetch('/api/files/replace', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify(body),
+  }).then(unwrap);
+}
+
 /** 会话列表(本地索引,按最近活跃降序) */
 export function listSessions() {
   return fetch('/api/sessions', { headers: headers() }).then(unwrap);
