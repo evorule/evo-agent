@@ -197,6 +197,52 @@ pub fn schema() -> Vec<SettingEntry> {
             description: "允许 agent 全项目内容搜索（grep_files，只读；随开随用）",
             scope: "application",
         },
+        SettingEntry {
+            key: "search.maxResults",
+            kind: SettingType::Number,
+            default: json!(1000),
+            enum_values: None,
+            range: Some([100, 20000]),
+            category: "搜索",
+            description: "全局搜索单次返回的匹配数上限（超出部分截断并提示）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "search.smartCase",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "搜索",
+            description: "智能大小写：查询含大写字母时才区分大小写（全小写查询不敏感）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "search.useIgnoreFiles",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "搜索",
+            description: "全局搜索尊重 .gitignore 等忽略文件",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "search.excludeGlobs",
+            kind: SettingType::Array,
+            default: json!([
+                ".git/**",
+                "target/**",
+                "node_modules/**",
+                ".evo-trash/**",
+                "data/**"
+            ]),
+            enum_values: None,
+            range: None,
+            category: "搜索",
+            description: "全局搜索排除的路径 glob 列表（serve 端另有恒叠加工集）",
+            scope: "window",
+        },
     ]
 }
 
@@ -507,7 +553,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 11);
+        assert_eq!(settings.len(), 15);
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -517,6 +563,20 @@ mod tests {
         assert_eq!(settings["agentTools.fileMove"], json!(false));
         assert_eq!(settings["agentTools.fileDelete"], json!(false));
         assert_eq!(settings["agentTools.grep"], json!(true));
+        // search.* 全局搜索 4 键(B2 消费)
+        assert_eq!(settings["search.maxResults"], json!(1000));
+        assert_eq!(settings["search.smartCase"], json!(true));
+        assert_eq!(settings["search.useIgnoreFiles"], json!(true));
+        assert_eq!(
+            settings["search.excludeGlobs"],
+            json!([
+                ".git/**",
+                "target/**",
+                "node_modules/**",
+                ".evo-trash/**",
+                "data/**"
+            ])
+        );
         for (k, v) in &sources {
             assert_eq!(v, &json!("default"), "key {k} should be default");
         }

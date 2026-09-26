@@ -362,6 +362,10 @@ export const sidebarView = writable('explorer');
  *  (serve 端搜索坐标约定;Monaco 消费时 +1)。问题面板/输出跳转直接复用 */
 export const pendingReveal = writable(null);
 
+/** 搜索面板意图信号(一次性):命令入口(Ctrl+Shift+F/H、清除)→ SearchPanel 消费。
+ *  值:'show' 聚焦查询框 / 'replace' 展开替换区并聚焦 / 'clear' 清空查询与结果 */
+export const searchIntent = writable(null);
+
 /** 对话侧栏显隐(Ctrl+Alt+C) */
 export const chatVisible = writable(true);
 
