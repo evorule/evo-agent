@@ -33,24 +33,22 @@
   $: sources = $settingsState.sources;
   $: settings = $settingsState.settings;
 
-  // 搜索解析:'@modified' 令牌(大小写不敏感)+ 自由文本(键/描述)
+  // 搜索解析:'@modified' 令牌(大小写不敏感)+ 自由文本(键/描述)。
+  // 过滤逻辑内联进分组推导(Svelte 响应式只追踪块内直接引用,函数内依赖不触发重算)
   $: modifiedOnly = /(^|\s)@modified(\s|$)/i.test(query);
   $: textQuery = query.replace(/(^|\s)@modified(\s|$)/gi, ' ').trim().toLowerCase();
-
-  function rowVisible(entry) {
-    if (modifiedOnly && (sources[entry.key] || 'default') === 'default') return false;
-    if (!textQuery) return true;
-    return (
-      entry.key.toLowerCase().includes(textQuery) ||
-      (entry.description || '').toLowerCase().includes(textQuery)
-    );
-  }
 
   // 分类分组(保持 schema 下发顺序)
   $: categories = (() => {
     const map = new Map();
     for (const e of entries) {
-      if (!rowVisible(e)) continue;
+      if (modifiedOnly && (sources[e.key] || 'default') === 'default') continue;
+      if (textQuery) {
+        const hit =
+          e.key.toLowerCase().includes(textQuery) ||
+          (e.description || '').toLowerCase().includes(textQuery);
+        if (!hit) continue;
+      }
       if (!map.has(e.category)) map.set(e.category, []);
       map.get(e.category).push(e);
     }

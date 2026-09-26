@@ -17,6 +17,7 @@ export default defineConfig({
     // 开发态代理到本地 evo-agent serve(API 与 WebSocket 同源)
     proxy: {
       '/api': { target: 'http://127.0.0.1:8081', ws: true },
+      '/admin': 'http://127.0.0.1:8081',
       '/health': 'http://127.0.0.1:8081',
     },
   },
