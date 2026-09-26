@@ -16,6 +16,7 @@
     "file_move",
     "file_delete",
     "search_files",
+    "grep_files",
     "shell_exec",
     "http_get",
     "rule_list",

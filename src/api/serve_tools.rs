@@ -252,15 +252,16 @@ pub fn build_filtered_toolkit(union: &ToolHandler, whitelist: &[String]) -> Tool
     filtered
 }
 
-/// 文件增删改工具的暴露开关(agentTools.*,布尔设置键;开=在 agent 工具面)
+/// 文件增删改与搜索工具的暴露开关(agentTools.*,布尔设置键;开=在 agent 工具面)
 ///
 /// 开关关 = 过滤 toolkit 不注册该执行器 = LLM 工具契约同步消失
 /// (openai_tools_payload 与注册执行器求交,零双声明)。键缺失/值非法时
-/// 按 schema 默认语义回落:fileCreate 开,fileMove/fileDelete 关。
-const TOOL_SWITCH_KEYS: &[(&str, &str)] = &[
-    ("file_create", "agentTools.fileCreate"),
-    ("file_move", "agentTools.fileMove"),
-    ("file_delete", "agentTools.fileDelete"),
+/// 按 schema 默认语义回落(元组第三位):fileCreate/grep 开,fileMove/fileDelete 关。
+const TOOL_SWITCH_KEYS: &[(&str, &str, bool)] = &[
+    ("file_create", "agentTools.fileCreate", true),
+    ("file_move", "agentTools.fileMove", false),
+    ("file_delete", "agentTools.fileDelete", false),
+    ("grep_files", "agentTools.grep", true),
 ];
 
 /// 在 [`build_filtered_toolkit`] 之上叠加 agentTools.* 开关过滤。
@@ -274,11 +275,11 @@ pub fn build_filtered_toolkit_with_switches(
     settings: &serde_json::Map<String, Value>,
 ) -> ToolHandler {
     let switch_on = |tool: &str| -> bool {
-        match TOOL_SWITCH_KEYS.iter().find(|(t, _)| *t == tool) {
-            Some((_, key)) => settings
+        match TOOL_SWITCH_KEYS.iter().find(|(t, _, _)| *t == tool) {
+            Some((_, key, default)) => settings
                 .get(*key)
                 .and_then(|v| v.as_bool())
-                .unwrap_or_else(|| *key == "agentTools.fileCreate"),
+                .unwrap_or(*default),
             None => true,
         }
     };
@@ -583,6 +584,32 @@ mod tests {
         assert!(filtered.has_tool("file_create"));
         assert!(!filtered.has_tool("file_move"));
         assert!(!filtered.has_tool("file_delete"));
+    }
+
+    #[test]
+    fn test_build_filtered_toolkit_grep_switch() {
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let whitelist: Vec<String> = ["grep_files", "file_read"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // 出厂默认(键缺失):grep 开(只读低风险)
+        let filtered =
+            build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
+        assert!(filtered.has_tool("grep_files"), "grep default-on");
+        assert!(filtered.has_tool("file_read"));
+
+        // 关闭后执行器与 LLM 契约同步消失
+        let mut settings = serde_json::Map::new();
+        settings.insert("agentTools.grep".to_string(), serde_json::json!(false));
+        let filtered = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        assert!(
+            !filtered.has_tool("grep_files"),
+            "off switch must remove executor"
+        );
+        assert!(filtered.has_tool("file_read"), "non-gated tools unaffected");
     }
 
     #[test]
