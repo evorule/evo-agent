@@ -13,7 +13,7 @@
 ## 发布形态（如实声明）
 
 - **当前发布形态 = git tag**（`v{MAJOR}.{MINOR}.{PATCH}`，如 `v0.1.0`）。
-- 本仓自 O-044（2026-09-20）起与 evorule 仓完全解耦，Cargo 依赖面仅第三方 crates，
+- 本仓自 2026-09-20 起与 evorule 仓完全解耦，Cargo 依赖面仅第三方 crates，
   crates.io 发布不再受 evorule 仓依赖阻塞；当前仍以 git tag 发布，crates.io 发布另行评估，届时补发布章节。
 - 下游使用方式：git 依赖 / 源码构建 / 预编译产物。
 

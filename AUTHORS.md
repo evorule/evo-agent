@@ -58,7 +58,7 @@ EvoRule Rust 版本的设计原则继承自早期 Python 版本 **evorule-core v
 
 ## 致谢
 
-- 早期 evorule-core-backup(Python 版本)的开发者,提供了设计蓝图
+- 早期原型仓(Python 版本)的开发者,提供了设计蓝图
 - Rust 社区,特别是 Kani 验证团队、Tokio 团队、axum 团队
 - 所有提供 issue、PR、discussion 的贡献者
 
@@ -86,4 +86,4 @@ EvoRule 项目遵循其自身哲学的精神 —— 贡献的价值基于**内�
 
 ---
 
-**本作者列表遵循 evorule-core-backup 的发布风格。**
+**本作者列表遵循早期原型仓的发布风格。**
