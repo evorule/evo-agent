@@ -19,6 +19,7 @@
     activePath,
     artifacts,
     closeTab,
+    lastRename,
     markDirty,
     markSaved,
     saveTab,
@@ -340,6 +341,26 @@
       diffOn = false; // 切 tab 回到编辑模式
       renderActive(p);
     });
+    // 重命名/移动:按 lastRename 信号迁移四类 path 键缓存(model/保存基线/
+    // 错误占位/草稿),dirty 内容与 undo 栈随 model 原对象保留。
+    // 本订阅必须先于下方 tabs-diff 清理建立:stores.renameTabPath 契约是
+    // 先 set lastRename 再更新 tabs——迁移完成后 diff 清理查不到旧路径
+    // model,即跳过 dispose(反之 dirty model 会被销毁)。
+    const migratePathCaches = (from, to) => {
+      const moveKey = (map) => {
+        if (map.has(from)) {
+          map.set(to, map.get(from));
+          map.delete(from);
+        }
+      };
+      moveKey(models);
+      moveKey(baseline);
+      moveKey(errorModels);
+      moveKey(draftModels);
+    };
+    const unsubRename = lastRename.subscribe((r) => {
+      if (r) migratePathCaches(r.from, r.to);
+    });
     // tab 关闭即弃:对 tabs 集合做 diff,销毁被关路径的全部 model 缓存
     // (重开=从磁盘重载;防复用含未保存残文的陈旧 model 且 dirty 失真)。
     let prevTabPaths = new Set();
@@ -382,6 +403,7 @@
       unregisterCommand('workbench.action.file.save');
       unregisterCommand('editor.action.toggleDiff');
       if (unsubActive) unsubActive();
+      unsubRename();
       unsubTabs();
       unsubSettings();
     };

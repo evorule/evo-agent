@@ -20,6 +20,7 @@ import {
   loadArtifacts,
   clearArtifacts,
   openFile,
+  fsEvents,
 } from './stores.js';
 import { getTranscript } from './api.js';
 
@@ -210,6 +211,10 @@ function handleFrame(f) {
     case 'Info':
       pushMessage({ kind: 'info', text: String(f.message) });
       pushPanelEvent('sys', { label: 'Info', detail: String(f.message) });
+      break;
+    case 'fs_events':
+      // 文件系统事件批量(相对 workdir);Explorer 订阅消费,一次性信号
+      fsEvents.set(f.events || { added: [], updated: [], removed: [], moved: [] });
       break;
     case 'ApprovalRequired':
       // 治理叠加:审批卡按钮走既有 G8 /approve 通道

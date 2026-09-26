@@ -150,6 +150,28 @@ export function closeTab(path) {
   activePath.update((cur) => (cur === path ? next : cur));
 }
 
+/** 文件系统事件批量(ws fs_events 帧投影;Explorer 订阅增量刷新)。
+ *  值被消费后由订阅方置 null(一次性信号),形如
+ *  {added:[], updated:[], removed:[], moved:[{from,to}]}(相对 workdir 路径) */
+export const fsEvents = writable(null);
+
+/** 最近一次 tab 路径迁移信号 {from, to, seq}(EditorPane 订阅迁移按路径
+ *  键缓存的 model,保 dirty 内容;先于 tabs 更新发出——订阅方迁移缓存的
+ *  顺序必须早于 tabs-diff 清理,晚到会销毁含未保存内容的 model) */
+export const lastRename = writable(null);
+
+let renameSeq = 0;
+
+/** 重命名/移动 tab 路径联动(tabs + activePath;dirty 内容保留在 model 中,
+ *  由 lastRename 信号驱动 EditorPane 迁移缓存键) */
+export function renameTabPath(from, to) {
+  if (!from || from === to) return;
+  const name = to.split('/').pop() || to;
+  lastRename.set({ from, to, seq: ++renameSeq });
+  tabs.update((list) => list.map((t) => (t.path === from ? { ...t, path: to, name } : t)));
+  activePath.update((cur) => (cur === from ? to : cur));
+}
+
 /** 标记 tab 内容已变(dirty) */
 export function markDirty(path, dirty) {
   tabs.update((list) => list.map((t) => (t.path === path ? { ...t, dirty } : t)));
