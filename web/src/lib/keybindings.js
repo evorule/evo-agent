@@ -28,6 +28,7 @@ export const DEFAULT_KEYBINDINGS = [
   { key: 'ctrl+b', command: 'workbench.action.view.toggleExplorer', when: '!inPalette' },
   { key: 'ctrl+alt+c', command: 'workbench.action.view.toggleChat', when: '!inPalette' },
   { key: 'ctrl+j', command: 'workbench.action.view.togglePanel', when: '!inPalette' },
+  { key: 'f2', command: 'explorer.rename', when: 'explorerFocus' },
 ];
 
 // ---- key 规范化 ----
