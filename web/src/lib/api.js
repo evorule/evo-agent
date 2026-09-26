@@ -56,6 +56,34 @@ export function writeFile(path, content) {
   }).then(unwrap);
 }
 
+/** 创建文件/目录(kind: 'file'|'dir',缺省 file;serve 侧自动建父目录) */
+export function createFile(path, kind = 'file') {
+  return fetch('/api/files/create', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ path, kind }),
+  }).then(unwrap);
+}
+
+/** 移动/重命名(targetDir 必须已存在;newName 缺省保留原名) */
+export function moveFile(path, targetDir, newName = null) {
+  const body = { path, target_dir: targetDir };
+  if (newName) body.new_name = newName;
+  return fetch('/api/files/move', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify(body),
+  }).then(unwrap);
+}
+
+/** 删除(软删除进 .evo-trash 回收目录,可找回) */
+export function deleteFile(path) {
+  return fetch(`/api/files?path=${encodeURIComponent(path)}`, {
+    method: 'DELETE',
+    headers: headers(),
+  }).then(unwrap);
+}
+
 /** 会话列表(本地索引,按最近活跃降序) */
 export function listSessions() {
   return fetch('/api/sessions', { headers: headers() }).then(unwrap);
