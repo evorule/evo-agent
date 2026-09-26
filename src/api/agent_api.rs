@@ -389,6 +389,19 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/files/write",
             axum::routing::put(crate::api::file_api::write_file),
         )
+        // 文件增删改(人工面):同沙箱委托实现 + 树写互斥;软删除进 .evo-trash
+        .route(
+            "/api/files/create",
+            axum::routing::post(crate::api::file_api::create_file),
+        )
+        .route(
+            "/api/files/move",
+            axum::routing::post(crate::api::file_api::move_file),
+        )
+        .route(
+            "/api/files",
+            axum::routing::delete(crate::api::file_api::delete_file),
+        )
         // G14:记忆事件查询 — 返回 session 的所有结构化事件
         .route(
             "/api/sessions/{id}/events",
