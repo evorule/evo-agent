@@ -160,6 +160,27 @@
     naming = null;
   }
 
+  // Windows 保留名/非法字符(前端预校验提示,免一次必败请求;后端为一等校验面)
+  const RESERVED_NAMES = new Set([
+    'CON', 'PRN', 'AUX', 'NUL',
+    ...['COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9'],
+    ...['LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'],
+  ]);
+  const ILLEGAL_CHARS = /[<>:"|?*]/; // 路径分隔符已由规整处理,余下非法字符在此拦截
+
+  /** 逐段校验路径;返回错误文案,合法返回空串 */
+  function invalidSegmentError(raw) {
+    for (const seg of raw.split('/')) {
+      if (!seg || seg === '.' || seg === '..') return `非法路径段:「${seg}」`;
+      if (ILLEGAL_CHARS.test(seg)) return `含非法字符:「${seg}」`;
+      if (RESERVED_NAMES.has(seg.replace(/[. ]+$/, '').toUpperCase())) {
+        return `Windows 保留名:「${seg}」`;
+      }
+      if (/[. ]$/.test(seg)) return `Windows 不允许尾部点/空格:「${seg}」`;
+    }
+    return '';
+  }
+
   async function commitNaming() {
     const n = naming;
     if (!n) return;
@@ -167,6 +188,11 @@
     const raw = n.value.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
     if (!raw) {
       naming = null;
+      return;
+    }
+    const segErr = invalidSegmentError(raw);
+    if (segErr) {
+      naming = { ...n, error: segErr };
       return;
     }
     if (n.mode === 'rename') {
