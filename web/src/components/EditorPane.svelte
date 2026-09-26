@@ -340,6 +340,41 @@
       diffOn = false; // 切 tab 回到编辑模式
       renderActive(p);
     });
+    // tab 关闭即弃:对 tabs 集合做 diff,销毁被关路径的全部 model 缓存
+    // (重开=从磁盘重载;防复用含未保存残文的陈旧 model 且 dirty 失真)。
+    let prevTabPaths = new Set();
+    const unsubTabs = tabs.subscribe((list) => {
+      const next = new Set(list.map((t) => t.path));
+      for (const p of prevTabPaths) {
+        if (next.has(p)) continue;
+        const m = models.get(p);
+        const dm = draftModels.get(p);
+        // 若关闭的是当前显示中的 model,先切回欢迎页/清空 diff,防悬挂引用
+        if (editor && m && editor.getModel() === m) editor.setModel(welcomeModel);
+        if (
+          diffEditor &&
+          ((dm && diffEditor.originalEditor.getModel() === dm) ||
+            (m && diffEditor.modifiedEditor.getModel() === m))
+        ) {
+          diffEditor.setModel(null);
+        }
+        if (m) {
+          m.dispose();
+          models.delete(p);
+          baseline.delete(p);
+        }
+        if (dm) {
+          dm.dispose();
+          draftModels.delete(p);
+        }
+        const em = errorModels.get(p);
+        if (em) {
+          em.dispose();
+          errorModels.delete(p);
+        }
+      }
+      prevTabPaths = next;
+    });
     const unsubSettings = settingsState.subscribe(() => {
       if (editor) applySettingsToEditors();
     });
@@ -347,6 +382,7 @@
       unregisterCommand('workbench.action.file.save');
       unregisterCommand('editor.action.toggleDiff');
       if (unsubActive) unsubActive();
+      unsubTabs();
       unsubSettings();
     };
   });
