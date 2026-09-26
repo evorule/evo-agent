@@ -37,12 +37,14 @@
   // 本组件注册的命令(卸载时注销;同 id 重复注册=覆盖,热替换安全)
   const OWNED_COMMANDS = [
     'workbench.action.showCommands',
+    'workbench.action.file.quickOpen',
     'workbench.action.file.closeTab',
     'workbench.action.view.toggleExplorer',
     'workbench.action.view.toggleChat',
     'workbench.action.view.togglePanel',
     'workbench.action.session.new',
     'workbench.action.session.refresh',
+    'workbench.action.session.switch',
     'workbench.action.gov.refreshBadges',
   ];
   let cleanupTracking = null;
@@ -54,6 +56,13 @@
       category: '帮助',
       keybinding: 'ctrl+shift+p',
       run: () => openPalette('commands'),
+    });
+    registerCommand({
+      id: 'workbench.action.file.quickOpen',
+      title: '快速打开文件',
+      category: '文件',
+      keybinding: 'ctrl+p',
+      run: () => openPalette('files'),
     });
     registerCommand({
       id: 'workbench.action.file.closeTab',
@@ -98,6 +107,12 @@
       title: '刷新会话列表',
       category: '会话',
       run: () => refreshSessions(),
+    });
+    registerCommand({
+      id: 'workbench.action.session.switch',
+      title: '切换会话',
+      category: '会话',
+      run: () => openPalette('files'),
     });
     registerCommand({
       id: 'workbench.action.gov.refreshBadges',
