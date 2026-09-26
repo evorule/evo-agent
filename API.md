@@ -1002,7 +1002,7 @@ GET /api/sessions/{id}/transcript?agent_type={可选}
 
 `agent_type` 缺省从索引回查(决定记忆 namespace,再缺省 `general`)。消息按 `idx` 升序,同 idx 后写覆盖(last-write-wins)。
 
-**数据源两级(O-093 定稿):**
+**数据源两级(快照机制定稿):**
 
 1. **live**(evorule 会话存活时):payload 权威投影,响应带 `"source": "live"`;
 2. **snapshot**(回落):evorule 会话闲置 30 分钟后被 TTL 自动回收,活投影报

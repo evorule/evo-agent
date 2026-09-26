@@ -189,7 +189,7 @@ See: `tests/e2e_smoke.py`
 
 ### Kani formal verification (evorule repo only)
 
-evo-agent has no code-level dependency on the TCB (fully decoupled since O-044) — no Kani
+evo-agent has no code-level dependency on the TCB (fully decoupled since 2026-09-20) — no Kani
 proofs are needed in this repo. tier0 meta-instruction / domain-type changes belong to the
 `evorule` repo and require a Kani proof there:
 
@@ -259,7 +259,7 @@ Thanks to all contributors! Your name will appear in [AUTHORS.md](AUTHORS.md).
 
 ---
 
-**Style follows `evorule-core-backup` + community best practices
+**Style follows the early Python prototype + community best practices
 ([Keep a Changelog](https://keepachangelog.com/),
 [Conventional Commits](https://www.conventionalcommits.org/),
 [Contributor Covenant](https://www.contributor-covenant.org/)).**

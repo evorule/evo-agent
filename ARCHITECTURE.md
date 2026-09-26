@@ -346,7 +346,7 @@ generic 不含标记知识,改协作纪律 = 改规则零发版。
 | 工作台 | `GET|PUT /api/workbench/config` | 工作台配置(快照保留期) |
 | 文件面 | `GET /api/files/list` `GET /api/files/read` `PUT /api/files/write` | IDE 文件操作(同一沙箱与校验) |
 
-> 会话链上权威在 evorule-server(`GET {server}/api/sessions/{id}/state`);evo-agent 本地索引当前仅覆盖 WS 通道会话(REST run 会话见登记册 O-125)。
+> 会话链上权威在 evorule-server(`GET {server}/api/sessions/{id}/state`);evo-agent 本地索引覆盖 WS 通道与 REST run/stream 端点会话。
 
 ### 通过 `EvoruleApiClient` 透传到 evorule-server(19 个端点)
 
@@ -379,7 +379,7 @@ generic 不含标记知识,改协作纪律 = 改规则零发版。
 ## 11. 依赖关系
 
 ```toml
-# Cargo.toml 关键依赖（仅第三方 crates，自 O-044 起不含任何 evorule-* 依赖）
+# Cargo.toml 关键依赖（仅第三方 crates，自 2026-09-20 起不含任何 evorule-* 依赖）
 reqwest = { version = "0.12", features = ["json", "stream"] }  # HTTP 客户端
 axum = "0.8"                                            # 自有 HTTP 服务
 tokio = "1"                                             # 异步运行时

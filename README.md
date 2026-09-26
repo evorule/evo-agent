@@ -115,7 +115,7 @@ export MINIMAX_API_KEY=your-api-key
 
 ### 依赖契约
 
-evo-agent 自 O-044（2026-09-20）起与 evorule 仓完全解耦：Cargo 依赖面仅第三方 crates，
+evo-agent 自 2026-09-20 起与 evorule 仓完全解耦：Cargo 依赖面仅第三方 crates，
 不引用任何 `evorule-*` crate，与 evorule-server 的交互只走 HTTP/WS 协议——clone 本仓后直接构建：
 
 ```bash
@@ -799,7 +799,7 @@ jsonschema = "0.18"           # JSON Schema 校验
 rustyline = "14"              # REPL 行编辑
 ```
 
-依赖面仅第三方 crates（自 O-044 起，2026-09-20，不含任何 `evorule-*` 依赖）；
+依赖面仅第三方 crates（自 2026-09-20 起，不含任何 `evorule-*` 依赖）；
 与 evorule-server 之间只有 HTTP/WS 协议契约。
 
 **零 unsafe**：`#![forbid(unsafe_code)]` 在所有 module 强制。

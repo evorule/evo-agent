@@ -75,4 +75,4 @@
 
 ---
 
-**本公约遵循 evorule-core-backup 的发布原则,采用 Contributor Covenant v2.1 标准。**
+**本公约遵循早期原型仓的发布原则,采用 Contributor Covenant v2.1 标准。**
