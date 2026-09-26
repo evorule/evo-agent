@@ -15,13 +15,18 @@
   import BottomPanel from './components/BottomPanel.svelte';
   import ChatSidebar from './components/ChatSidebar.svelte';
   import CommandPalette from './components/CommandPalette.svelte';
-  import { reconnectFromStorage } from './lib/ws.js';
+  import { reconnectFromStorage, newSession } from './lib/ws.js';
   import {
+    activePath,
+    closeTab,
     explorerVisible,
     chatVisible,
     panelVisible,
     paletteOpen,
     openPalette,
+    refreshSessions,
+    refreshGovBadges,
+    sessionId,
   } from './lib/stores.js';
   import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
   import { initContextTracking } from './lib/context-keys.js';
@@ -32,9 +37,13 @@
   // 本组件注册的命令(卸载时注销;同 id 重复注册=覆盖,热替换安全)
   const OWNED_COMMANDS = [
     'workbench.action.showCommands',
+    'workbench.action.file.closeTab',
     'workbench.action.view.toggleExplorer',
     'workbench.action.view.toggleChat',
     'workbench.action.view.togglePanel',
+    'workbench.action.session.new',
+    'workbench.action.session.refresh',
+    'workbench.action.gov.refreshBadges',
   ];
   let cleanupTracking = null;
 
@@ -45,6 +54,17 @@
       category: '帮助',
       keybinding: 'ctrl+shift+p',
       run: () => openPalette('commands'),
+    });
+    registerCommand({
+      id: 'workbench.action.file.closeTab',
+      title: '关闭当前标签页',
+      category: '文件',
+      keybinding: 'ctrl+w', // ⚠ 浏览器保留键:部分浏览器不可拦(web 版限制,远期 PWA/桌面壳解)
+      when: 'tabsOpen',
+      run: () => {
+        const path = get(activePath);
+        if (path) closeTab(path);
+      },
     });
     registerCommand({
       id: 'workbench.action.view.toggleExplorer',
@@ -66,6 +86,24 @@
       category: '视图',
       keybinding: 'ctrl+j',
       run: () => panelVisible.update((v) => !v),
+    });
+    registerCommand({
+      id: 'workbench.action.session.new',
+      title: '新建会话',
+      category: '会话',
+      run: newSession,
+    });
+    registerCommand({
+      id: 'workbench.action.session.refresh',
+      title: '刷新会话列表',
+      category: '会话',
+      run: () => refreshSessions(),
+    });
+    registerCommand({
+      id: 'workbench.action.gov.refreshBadges',
+      title: '刷新治理徽标',
+      category: '治理',
+      run: () => refreshGovBadges(get(sessionId)),
     });
     cleanupTracking = initContextTracking();
     return () => {

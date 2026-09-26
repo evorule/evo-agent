@@ -8,6 +8,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
   import { setupMonaco, monaco } from '../lib/monaco-setup.js';
+  import { registerCommand, unregisterCommand } from '../lib/commands.js';
   import {
     tabs,
     activePath,
@@ -178,13 +179,6 @@
     if (!saveError) baseline.set(path, content);
   }
 
-  function onKeyDown(e) {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-      e.preventDefault();
-      saveActive();
-    }
-  }
-
   function fmtTime(ts) {
     const d = new Date(ts);
     const p = (n) => String(n).padStart(2, '0');
@@ -215,17 +209,32 @@
         markDirty(path, model.getValue() !== baseline.get(path));
       }
     });
-    // 编辑器内 Ctrl+S(Monaco 拦截浏览器默认行为)
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveActive);
-    // 焦点不在编辑器时(tab 栏 / 侧栏)的全局兜底
-    window.addEventListener('keydown', onKeyDown);
+    // 本组件命令自注册(命令面板/键位路由统一入口;卸载时注销)。
+    // 编辑器内 Ctrl+S 也统一走全局键位路由(when editorFocus 命中)——
+    // Monaco addCommand 不阻止 keydown 冒泡,双注册会双触发(DC-2 实测)。
+    registerCommand({
+      id: 'workbench.action.file.save',
+      title: '保存当前文件',
+      category: '文件',
+      keybinding: 'ctrl+s',
+      when: 'editorFocus || tabsOpen',
+      run: saveActive,
+    });
+    registerCommand({
+      id: 'editor.action.toggleDiff',
+      title: '切换差异视图',
+      category: '编辑器',
+      when: 'tabsOpen',
+      run: toggleDiff,
+    });
 
     unsubActive = activePath.subscribe((p) => {
       diffOn = false; // 切 tab 回到编辑模式
       renderActive(p);
     });
     return () => {
-      window.removeEventListener('keydown', onKeyDown);
+      unregisterCommand('workbench.action.file.save');
+      unregisterCommand('editor.action.toggleDiff');
       if (unsubActive) unsubActive();
     };
   });
@@ -287,8 +296,8 @@
       </button>
     </div>
   {/if}
-  <div class="editor-host" bind:this={editorEl}></div>
-  <div class="editor-host diff-host" bind:this={diffEl} style="display:none"></div>
+  <div class="editor-host" bind:this={editorEl} data-zone="editor"></div>
+  <div class="editor-host diff-host" bind:this={diffEl} style="display:none" data-zone="editor"></div>
 </div>
 
 <style>

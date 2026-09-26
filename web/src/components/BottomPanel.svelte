@@ -118,7 +118,7 @@
   }
 </script>
 
-<div class="bottom-panel" class:open={$panelVisible}>
+<div class="bottom-panel" class:open={$panelVisible} data-zone="panel">
   <div
     class="sash"
     role="separator"

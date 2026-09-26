@@ -103,7 +103,7 @@
   }
 </script>
 
-<aside class="chat">
+<aside class="chat" data-zone="chat">
   <div class="chat-header">
     <span class="title">对话</span>
     <div class="header-actions">
