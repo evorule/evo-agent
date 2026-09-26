@@ -27,6 +27,7 @@
     refreshSessions,
     refreshGovBadges,
     sessionId,
+    sidebarView,
     openSettingsTab,
     openSettingsJson,
   } from './lib/stores.js';
@@ -171,7 +172,12 @@
   <div class="main">
     <ActivityBar onitemclick={handleActivityItem} />
     <div style:display={$explorerVisible ? 'contents' : 'none'}>
-      <Explorer />
+      {#if $sidebarView === 'explorer'}
+        <Explorer />
+      {:else if $sidebarView === 'search'}
+        <!-- SearchPanel 接入于 B2-PR5 -->
+        <div class="side-placeholder"></div>
+      {/if}
     </div>
     <div class="center">
       <EditorPane />
@@ -202,5 +208,11 @@
     display: flex;
     flex-direction: column;
     background: var(--bg-card);
+  }
+  .side-placeholder {
+    width: 220px;
+    flex-shrink: 0;
+    background: var(--sidebar-bg);
+    border-right: 1px solid var(--border);
   }
 </style>

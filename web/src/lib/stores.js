@@ -110,8 +110,10 @@ export function findTab(list, path) {
   return list.find((t) => t.path === path);
 }
 
-/** 打开文件:已开则激活;否则请求内容后开新 tab。返回错误消息或 null */
-export async function openFile(path) {
+/** 打开文件:已开则激活;否则请求内容后开新 tab。
+ *  reveal 可选 {line, col, endCol}(serve 搜索坐标约定):tab 打开后设
+ *  pendingReveal 定位信号,由 EditorPane 消费。返回错误消息或 null */
+export async function openFile(path, reveal = null) {
   const name = path.split('/').pop() || path;
   let existing = null;
   tabs.update((list) => {
@@ -120,6 +122,7 @@ export async function openFile(path) {
   });
   if (existing) {
     activePath.set(path);
+    if (reveal) pendingReveal.set({ path, ...reveal });
     return null;
   }
   try {
@@ -127,6 +130,7 @@ export async function openFile(path) {
     const content = res.content ?? '';
     tabs.update((list) => [...list, { path, name, content, dirty: false, error: null }]);
     activePath.set(path);
+    if (reveal) pendingReveal.set({ path, ...reveal });
     return null;
   } catch (e) {
     const msg = String(e?.message || e);
@@ -347,6 +351,16 @@ export function markFinalized(path) {
 
 /** 文件树显隐(Ctrl+B;display 切换保留组件状态,不销毁重建) */
 export const explorerVisible = writable(true);
+
+/** 活动栏侧面板视图:explorer = 文件树 / search = 全局搜索(B2)。
+ *  ActivityBar 高亮与 App.svelte 侧面板分支共同订阅 */
+export const sidebarView = writable('explorer');
+
+/** 定位跳转信号(一次性):openFile(path, reveal) 打开后设置,
+ *  EditorPane 消费(revealLineInCenter+setSelection+focus)后置 null。
+ *  元素:{path, line, col, endCol};line 1-based,col/endCol 0-based char 偏移
+ *  (serve 端搜索坐标约定;Monaco 消费时 +1)。问题面板/输出跳转直接复用 */
+export const pendingReveal = writable(null);
 
 /** 对话侧栏显隐(Ctrl+Alt+C) */
 export const chatVisible = writable(true);

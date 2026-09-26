@@ -1,21 +1,32 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 EvoRule Project -->
-<!-- 活动栏(Trae 最左列):资源管理器常驻 + 设置入口;后续阶段逐项点亮 -->
+<!-- 活动栏(Trae 最左列):资源管理器/搜索(B2)/设置入口;后续阶段逐项点亮 -->
 <script>
-  /** 条目点击外发(设置等非文件树视图的宿主接线;App.svelte 按 id 分发) */
+  import { sidebarView } from '../lib/stores.js';
+
+  /** 条目点击外发(设置等非视图切换入口的宿主接线;App.svelte 按 id 分发) */
   export let onitemclick = null;
 
-  let active = 'explorer';
   const items = [
     { id: 'explorer', label: '资源管理器', enabled: true },
-    { id: 'search', label: '搜索(文件树阶段接入)', enabled: false },
+    { id: 'search', label: '搜索', enabled: true },
     { id: 'audit', label: '审计(治理叠加阶段接入)', enabled: false },
     { id: 'settings', label: '设置', enabled: true },
   ];
 
+  /** 设置是快捷入口而非侧面板视图:点击后本地钉住高亮,直至切回视图 */
+  let settingsPinned = false;
+  $: active = settingsPinned ? 'settings' : $sidebarView;
+
   function click(it) {
     if (!it.enabled) return;
-    active = it.id;
+    if (it.id === 'settings') {
+      settingsPinned = true;
+      if (onitemclick) onitemclick(it.id);
+      return;
+    }
+    settingsPinned = false;
+    sidebarView.set(it.id);
     if (onitemclick) onitemclick(it.id);
   }
 </script>

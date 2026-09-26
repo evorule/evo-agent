@@ -23,6 +23,7 @@
     markDirty,
     markSaved,
     saveTab,
+    pendingReveal,
     USER_SETTINGS_URI,
     WORKSPACE_SETTINGS_URI,
   } from '../lib/stores.js';
@@ -258,6 +259,31 @@
     renderActive(get(activePath));
   }
 
+  // 消费一次性定位信号(B2 全局搜索跳转等):信号目标与当前激活 tab 及
+  // 显示中 model 一致时 revealLineInCenter+选区+聚焦,消费即清(幂等)。
+  // 双入口:activePath 切换渲染后探一次 + pendingReveal 变化时触发,
+  // 覆盖「先切 tab 后设信号」与「信号先于渲染就绪」两种时序。
+  function maybeConsumeReveal() {
+    const r = get(pendingReveal);
+    if (!r || !editor) return;
+    if (r.path !== get(activePath)) return;
+    const model = models.get(r.path);
+    if (!model || editor.getModel() !== model) return;
+    const line = Math.max(1, r.line);
+    editor.revealLineInCenter(line);
+    // col/endCol 为 0-based char 偏移(serve 搜索坐标),Monaco 列为 1-based
+    const col = Math.max(1, (r.col ?? 0) + 1);
+    const endCol = Math.max(col, (r.endCol ?? r.col ?? 0) + 1);
+    editor.setSelection({
+      startLineNumber: line,
+      startColumn: col,
+      endLineNumber: line,
+      endColumn: endCol,
+    });
+    editor.focus();
+    pendingReveal.set(null);
+  }
+
   // activePath 变化 → 切换 model(每 tab 默认编辑模式;订阅在 onMount 中建立)
   let unsubActive = null;
 
@@ -340,7 +366,9 @@
     unsubActive = activePath.subscribe((p) => {
       diffOn = false; // 切 tab 回到编辑模式
       renderActive(p);
+      maybeConsumeReveal();
     });
+    const unsubReveal = pendingReveal.subscribe(() => maybeConsumeReveal());
     // 重命名/移动:按 lastRename 信号迁移四类 path 键缓存(model/保存基线/
     // 错误占位/草稿),dirty 内容与 undo 栈随 model 原对象保留。
     // 本订阅必须先于下方 tabs-diff 清理建立:stores.renameTabPath 契约是
@@ -403,6 +431,7 @@
       unregisterCommand('workbench.action.file.save');
       unregisterCommand('editor.action.toggleDiff');
       if (unsubActive) unsubActive();
+      unsubReveal();
       unsubRename();
       unsubTabs();
       unsubSettings();
