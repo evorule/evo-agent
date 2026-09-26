@@ -61,13 +61,13 @@ pub struct DelegateContext {
     /// runner 每次 LLM `IoRequest` 后累加 `token_usage.total_tokens`。外层驱动
     /// （driver.rs）据此维护 `BudgetCounters.tokens_used`。仅观测，不改控制流。
     pub token_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// O-114:union toolkit 来源（`with_toolkit` 成对注入；None = 子 runner 无工具面=旧行为）
+    /// union toolkit 来源（`with_toolkit` 成对注入；None = 子 runner 无工具面=旧行为）
     ///
     /// 注入后 `delegate()` 按子代理 `def.tools` 白名单过滤出可用工具挂载
     /// （对齐 serve 面 construct_runner / CLI patrol_build_runner 模式），LLM
     /// 请求据此携带工具契约；多轮工具回喂在流式路径的本地 ReAct 循环完成。
     pub toolkit: Option<ToolHandler>,
-    /// O-114:工作目录（能力边界合成用；随 toolkit 成对注入）
+    /// 工作目录（能力边界合成用；随 toolkit 成对注入）
     pub workdir: Option<std::path::PathBuf>,
 }
 
@@ -91,7 +91,7 @@ impl DelegateContext {
         }
     }
 
-    /// O-114:注入 union toolkit + 工作目录（成对注入，随 `Clone` 延续到每个子 runner）
+    /// 注入 union toolkit + 工作目录（成对注入，随 `Clone` 延续到每个子 runner）
     ///
     /// toolkit 按各子代理 `def.tools` 白名单过滤后挂载；workdir 用于能力边界合成。
     pub fn with_toolkit(mut self, toolkit: ToolHandler, workdir: &Path) -> Self {
@@ -197,7 +197,7 @@ impl DelegateContext {
                 runner = runner.with_token_counter(counter.clone());
             }
 
-            // O-114:工具面 + 能力边界接线（对齐 serve 面 construct_runner / CLI
+            // 工具面 + 能力边界接线（对齐 serve 面 construct_runner / CLI
             // patrol_build_runner 模式）。委托 runner 此前零工具契约：LLM 无 tools
             // 可知 → 凭训练先验输出供应商原生 XML（<minimax:tool_call> 死文本）。
             // 按 def.tools 白名单过滤挂载；过滤后为空则不挂（纯规划类子代理维持旧行为）。
@@ -216,7 +216,7 @@ impl DelegateContext {
                 }
             }
 
-            // O-114:执行路径改走流式消费——宪法 v0.5.0 起 server 只做单发桥接
+            // 执行路径改走流式消费——宪法 v0.5.0 起 server 只做单发桥接
             // （call_external 的 io_response 提交后即 Stable），多轮工具回喂在应用层
             // run_streaming 的本地 ReAct 循环；非流式 run() 单轮即止，即使 LLM 正确
             // 返回 tool_calls 也不执行。delegate() 对外签名 Result<String,String>
@@ -434,7 +434,7 @@ mod tests {
         assert!(ctx.can_delegate(10));
     }
 
-    // ===== O-114:工具面注入 =====
+    // ===== 工具面注入 =====
 
     #[test]
     fn test_delegate_context_with_toolkit_injection() {

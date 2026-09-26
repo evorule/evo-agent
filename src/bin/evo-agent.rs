@@ -303,7 +303,7 @@ enum ToolsAction {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // 0. 加载 .env(若存在;已设置的环境变量优先,不覆盖)——O-095 结构性修复的
+    // 0. 加载 .env(若存在;已设置的环境变量优先,不覆盖)——结构性修复的
     //    全子命令推广:LLM 密钥加载前置到 main,run/workflow/patrol 等所有子命令
     //    均不再依赖外部注入(此前仅 serve 加载,workflow 真实 LLM 运行会静默失联)
     if let Some((path, applied)) = evo_agent::dotenv::load_dotenv_for(&cli.workdir) {
@@ -1542,7 +1542,7 @@ fn cmd_serve(
     // 2. 初始化 logging(尊重 config.logging)
     init_logging_for_serve(&config);
 
-    // 2.4 O-116:启动即打印运行体身份(版本 + exe mtime + 工作区绝对路径)
+    // 2.4 启动即打印运行体身份(版本 + exe mtime + 工作区绝对路径)
     //     ——排障时核对「运行中的 exe」与「源码 HEAD」是否一致,不留盲区。
     //     采集逻辑与 GET /version 共用 serve_tools::runtime_identity 正本
     //     (单一事实源;exe mtime = 最近一次 cargo build 产物时间 epoch 秒)。
@@ -1556,7 +1556,7 @@ fn cmd_serve(
         );
     }
 
-    // 2.5 O-095 启动期告警:三个 provider 密钥全缺失时显式提示,避免 LLM 失联假故障被误判
+    // 2.5 启动期告警:三个 provider 密钥全缺失时显式提示,避免 LLM 失联假故障被误判
     let has_llm_key = ["MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"]
         .iter()
         .any(|k| {
@@ -1781,7 +1781,7 @@ fn cmd_serve(
         }
     };
 
-    // O-094:console 审计页 sidecar 自动拉起(配置化,fail-soft)。
+    // console 审计页 sidecar 自动拉起(配置化,fail-soft)。
     // workbench.console_dir 配置 console-cloud 仓目录后,serve 启动期探测端口,
     // 未监听则拉起 vite dev(审计深链数据源);未配置/目录无效/拉起失败仅告警。
     if let Some(console_dir) = config.workbench.console_dir.clone() {
@@ -1807,7 +1807,7 @@ fn cmd_serve(
         });
     }
 
-    // O-093:快照目录自建 + 启动清扫 + 每日周期清理。
+    // 快照目录自建 + 启动清扫 + 每日周期清理。
     // 保留期每次清理时从 workbench_config.json 现读(改配置下次清理即生效);
     // 删除只作用于 data/snapshots/ 目录,永不越界(展示层副本,非审计链)。
     // 注:此处按同路径新建独立实例(state 已移入 router;两 store 仅持路径,无状态)。
@@ -2031,7 +2031,7 @@ fn cmd_workflow(
     let definitions = AgentDefinitionManager::new(config.agents.dir.clone());
     let client =
         EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
-    // O-114:注入 union toolkit + 工作目录——委托子代理按 def.tools 白名单获得
+    // 注入 union toolkit + 工作目录——委托子代理按 def.tools 白名单获得
     // 工具契约与能力边界，多轮工具回喂在流式 ReAct 循环完成（此前委托 runner
     // 零工具契约：LLM 输出 <minimax:tool_call> 死文本且单轮即止，节点无实质产出）。
     let ws_client =

@@ -192,7 +192,7 @@ pub fn apply_regulation_index_awareness(system_prompt: &mut String) {
 }
 
 // =============================================================================
-// O-116:运行体身份(serve 启动横幅与 GET /version 的共享正本)
+// 运行体身份(serve 启动横幅与 GET /version 的共享正本)
 // =============================================================================
 
 /// 运行体身份快照(不可变值对象,serde 序列化即 `GET /version` 响应体)
@@ -212,7 +212,7 @@ pub struct RuntimeIdentity {
     pub workdir: String,
 }
 
-/// 采集运行体身份(O-116:横幅与 HTTP 接口的单一事实源)
+/// 采集运行体身份(横幅与 HTTP 接口的单一事实源)
 ///
 /// 单一事实源纪律(宪法 §七 反模式④):`cmd_serve` 启动横幅与 `GET /version`
 /// 端点共用本函数产出,禁止两处各写一份采集逻辑。exe 元数据不可读
@@ -340,7 +340,7 @@ pub fn effective_capability_boundary(
     };
     // 缺省合成:沙箱根 = 启动 workdir;模式按是否含写类工具如实判定;
     // 边界内工具 = 顶层 tools ∩ 沙箱类工具
-    // O-119①:合成根必须为绝对路径——相对 workdir 启动时若原样入边界,
+    // 合成根必须为绝对路径——相对 workdir 启动时若原样入边界,
     // LLM 面展示的沙箱边界是相对路径,agent 无法自知绝对边界(瞎子摸象)。
     // canonicalize 失败(目录尚不存在等)时 fallback cwd 拼接——Path::join
     // 遇绝对路径自动替换基准,相对/绝对两态皆正确。
@@ -717,7 +717,7 @@ mod tests {
         assert!(prompt2.starts_with("\n\n【规范入口索引】"));
     }
 
-    // ===== O-116 运行体身份测试 =====
+    // ===== 运行体身份测试 =====
 
     #[test]
     fn test_runtime_identity_fields() {
@@ -796,13 +796,13 @@ mod tests {
 
     #[test]
     fn test_effective_boundary_default_synthesis() {
-        // 未声明:沙箱根 = 启动 workdir 合成**绝对路径**(O-119①);含 file_write → read_write;工具取沙箱类交集
+        // 未声明:沙箱根 = 启动 workdir 合成**绝对路径**;含 file_write → read_write;工具取沙箱类交集
         let def = make_def(&["file_read", "file_write", "rule_list"], None);
         let eff = effective_capability_boundary(&def, Path::new("."));
         assert!(!eff.is_read_only());
         assert!(
             eff.sandbox_root.is_absolute(),
-            "O-119①: synthesized sandbox_root must be absolute, got: {}",
+            "synthesized sandbox_root must be absolute, got: {}",
             eff.sandbox_root.display()
         );
         assert_eq!(eff.tools.len(), 2);
@@ -815,8 +815,8 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_boundary_default_root_absolute_o119() {
-        // O-119①:相对启动 workdir → 合成绝对沙箱根;目录不存在时 fallback
+    fn test_effective_boundary_default_root_absolute() {
+        // 相对启动 workdir → 合成绝对沙箱根;目录不存在时 fallback
         // cwd 拼接(join 绝对路径自动替换基准),相对尾段保留
         let def = make_def(&["file_read"], None);
         let eff = effective_capability_boundary(&def, Path::new("some/relative/dir"));
@@ -863,7 +863,7 @@ mod tests {
         let def = make_def(&["file_read", "file_list"], None);
         let eff = wire_capability_boundary(&mut handler, &def, &root);
 
-        // O-119①:合成根 = 启动 workdir 的绝对化形态(去 \\?\ verbatim 前缀)
+        // 合成根 = 启动 workdir 的绝对化形态(去 \\?\ verbatim 前缀)
         assert_eq!(eff.sandbox_root, super::simplify_verbatim(root.clone()));
         let res = handler
             .execute_by_name(

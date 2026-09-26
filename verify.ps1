@@ -54,7 +54,7 @@ if ($hits.Count -gt 0) {
 }
 
 Write-Host "== [4/4] dependency contract assertion =="
-# O-044 (2026-09-20): evo-agent is fully decoupled from the evorule main repo.
+# Since 2026-09-20: evo-agent is fully decoupled from the evorule main repo.
 # The agent orchestration layer must not depend on main-repo crates (TCB /
 # reactor / governance / cli) -- path OR version deps both banned. This check
 # fails on any re-introduction of main-repo deps (regression guard).
@@ -70,13 +70,13 @@ $depHits = [regex]::Matches($manifest, '(?m)^\s*(evorule-[\w-]+)\s*=') |
     Where-Object { $separateRepoAllowlist -notcontains $_.Groups[1].Value }
 if ($depHits.Count -gt 0) {
     foreach ($h in $depHits) { Write-Host "FAIL: main-repo dependency found: $($h.Value)" }
-    Write-Host "  (evo-agent is decoupled from the evorule main repo since O-044;"
+    Write-Host "  (evo-agent is decoupled from the evorule main repo since 2026-09-20;"
     Write-Host "   agent layer must not depend on main-repo crates. Re-adding main-repo"
     Write-Host "   deps is a layering violation. Separate-repo governance components"
     Write-Host "   must be explicitly added to the allowlist.)"
     $failed = $true
 } else {
-    Write-Host "PASS: dependency contract (no main-repo deps -- decoupled per O-044)"
+    Write-Host "PASS: dependency contract (no main-repo deps -- decoupled)"
 }
 
 if ($failed) { Write-Host "== RESULT: FAIL =="; exit 1 }

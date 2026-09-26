@@ -52,7 +52,7 @@ impl SearchFilesTool {
     fn resolve_safe_dir(&self, raw: &str) -> Result<PathBuf, String> {
         let path = Path::new(raw);
         if path.is_absolute() {
-            // M5-a:错误告知边界,agent 自知而非误判(O-119② 文案对齐)
+            // M5-a:错误告知边界,agent 自知而非误判(文案对齐)
             return Err(format!(
                 "absolute path not allowed: '{}' (all paths must stay within the sandbox \
                  boundary '{}')",
@@ -79,7 +79,7 @@ impl SearchFilesTool {
             .canonicalize()
             .map_err(|e| format!("workdir invalid: {}", e))?;
         if !canonical.starts_with(&workdir_canonical) {
-            // M5-a:越界错误回报「不可访问 + 边界路径」(O-119② 文案对齐)
+            // M5-a:越界错误回报「不可访问 + 边界路径」(文案对齐)
             return Err(format!(
                 "path not accessible: '{}' resolves outside the sandbox boundary '{}'",
                 raw,
@@ -123,7 +123,7 @@ impl SearchFilesTool {
 
         if is_star {
             // `*` 匹配 0+ 个字符,逐个 char 边界尝试
-            // (O-117:字节索引切片落在多字节字符内部会 panic,中文文件名必踩)
+            // (字节索引切片落在多字节字符内部会 panic,中文文件名必踩)
             for (i, _) in after_prefix.char_indices() {
                 if Self::glob_match(rest, &after_prefix[i..]) {
                     return true;
@@ -295,8 +295,8 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_absolute_path_reports_boundary_o119() {
-        // O-119②:越界文案必须带边界路径(与 file_read/file_write M5-a 同款),
+    fn test_reject_absolute_path_reports_boundary() {
+        // 越界文案必须带边界路径(与 file_read/file_write M5-a 同款),
         // 首要读者是 LLM——只说 not allowed 会让 agent 无法自知边界
         // 平台各自的真实绝对路径形态("C:\..." 在 Unix 上不是绝对路径,
         // 走不到拒绝分支——M5-a ebe54da 同族教训,见 file_read.rs 测试先例)
@@ -380,10 +380,10 @@ mod tests {
         );
     }
 
-    // === O-117 复现:多字节文件名 × '*' glob ===
+    // === 复现:多字节文件名 × '*' glob ===
 
     #[test]
-    fn test_glob_match_multibyte_star_o117() {
+    fn test_glob_match_multibyte_star() {
         // 修复前:星号分支按字节索引切片(0..=len),i 落在多字节字符内部即 panic
         assert!(SearchFilesTool::glob_match("*.txt", "中文文档.txt"));
         assert!(SearchFilesTool::glob_match("中*", "中文文档"));
@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_files_chinese_filename_end_to_end_o117() {
+    fn test_search_files_chinese_filename_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("中文文档.txt"), b"").unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
@@ -407,7 +407,7 @@ mod tests {
                 m.insert("pattern".to_string(), Value::from("*.txt"));
                 m
             }))
-            .expect("multibyte filename must not panic (O-117)");
+            .expect("multibyte filename must not panic");
         let count = result.get("count").unwrap().as_i64().unwrap();
         assert_eq!(count, 2, "should find 中文文档.txt and notes.txt");
     }

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! knowledge 执行侧数据面工具（3 个，批次 W2 · 设计文档 §4.3 缺口 2）
+//! knowledge 执行侧数据面工具（3 个，设计文档 §4.3 缺口 2）
 //!
 //! 消费执行域 knowledge 数据资产（GET /api/knowledge 三端点，只读）：
 //! - knowledge_datasets：已承载数据集清单；

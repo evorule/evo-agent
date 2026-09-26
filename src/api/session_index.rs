@@ -18,8 +18,8 @@
 //! ## 边界说明(设计留痕)
 //!
 //! - 索引覆盖 serve 三执行面的会话:WS 处理器(SessionCreated / TurnEnd)、
-//!   REST `run` 端点与 `run-stream` SSE 端点(O-125:SessionCreated 捕获后
-//!   落记录,title=goal 截 60);REST run 响应亦携带 `session_id`(O-086「id
+//!   REST `run` 端点与 `run-stream` SSE 端点(SessionCreated 捕获后
+//!   落记录,title=goal 截 60);REST run 响应亦携带 `session_id`(「id
 //!   未关联」收口),消费者可凭此查询 18080 权威面或工作台回放;
 //! - 索引文件是**持久化记录**而非审计链级留痕(可读、不参与哈希);真相源
 //!   仍是 evorule(payload/facts),索引丢失仅影响列表展示,消息历史可凭

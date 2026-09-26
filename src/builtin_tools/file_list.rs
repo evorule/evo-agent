@@ -46,7 +46,7 @@ impl FileListTool {
     fn resolve_safe_dir(&self, raw: &str) -> Result<PathBuf, String> {
         let path = Path::new(raw);
         if path.is_absolute() {
-            // M5-a:错误告知边界,agent 自知而非误判(O-119② 文案对齐)
+            // M5-a:错误告知边界,agent 自知而非误判(文案对齐)
             return Err(format!(
                 "absolute path not allowed: '{}' (all paths must stay within the sandbox \
                  boundary '{}')",
@@ -73,7 +73,7 @@ impl FileListTool {
             .canonicalize()
             .map_err(|e| format!("workdir invalid: {}", e))?;
         if !canonical.starts_with(&workdir_canonical) {
-            // M5-a:越界错误回报「不可访问 + 边界路径」(O-119② 文案对齐)
+            // M5-a:越界错误回报「不可访问 + 边界路径」(文案对齐)
             return Err(format!(
                 "path not accessible: '{}' resolves outside the sandbox boundary '{}'",
                 raw,
@@ -198,8 +198,8 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_absolute_path_reports_boundary_o119() {
-        // O-119②:越界文案必须带边界路径(与 file_read/file_write M5-a 同款)
+    fn test_reject_absolute_path_reports_boundary() {
+        // 越界文案必须带边界路径(与 file_read/file_write M5-a 同款)
         // 平台各自的真实绝对路径形态("C:\..." 在 Unix 上不是绝对路径,
         // 走不到拒绝分支——M5-a ebe54da 同族教训,见 file_read.rs 测试先例)
         let abs = if cfg!(windows) { "C:\\Windows" } else { "/etc" };

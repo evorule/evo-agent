@@ -69,7 +69,7 @@ fn test_merge_delegate_tool() {
         max_concurrent: None,
         // plan-execute tokens 埋点(测试不埋点)
         token_counter: None,
-        // O-114:工具面注入(测试不注入)
+        // 工具面注入(测试不注入)
         toolkit: None,
         workdir: None,
     };
@@ -2256,10 +2256,10 @@ async fn m5c_verdict_fails_fast_on_transport_error() {
     );
 }
 
-// ----- O-120:裁决通道(独立会话)——首轮/续轮统一走裁决 -----
+// ----- 裁决通道(独立会话)——首轮/续轮统一走裁决 -----
 
 #[tokio::test]
-async fn o120_first_round_intent_goes_through_adjudication_channel() {
+async fn first_round_intent_goes_through_adjudication_channel() {
     // 守卫删除后:session_id=None(首轮,原伴生缺陷形态)也必走裁决——
     // 越界意图被拦(裁决会话 version 停滞)→ blocked JSON;
     // 断言裁决会话 create(initial_content 自述身份)+ command 均被调

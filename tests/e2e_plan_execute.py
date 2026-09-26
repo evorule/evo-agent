@@ -45,7 +45,7 @@
     IoResponse 提取出结构合法 PlanFact（重试成功）。
 
 # 前置（本脚本不进 CI——依赖真实 LLM key/运行中 server/已编译产物）
-  1. .env 含 MINIMAX_API_KEY（O-095：evo-agent 只认进程环境变量，脚本负责注入）
+  1. .env 含 MINIMAX_API_KEY（evo-agent 只认进程环境变量，脚本负责注入）
   2. evorule-server 运行于 evo-agent.toml base_url（默认 http://127.0.0.1:18080），
      且其 TCB 约束前置门在位（BUG-P0-005 修复后版本，场景 C 依赖）
   3. cargo build 已产出 target/debug/evo-agent.exe
@@ -138,7 +138,7 @@ def run_scenario(
         print(f"  {RED}FAIL{RESET}  编译产物缺失: {BINARY}")
         return None, False
 
-    # O-095：evo-agent 只认进程环境变量，不自动加载 .env——此处注入
+    # evo-agent 只认进程环境变量，不自动加载 .env——此处注入
     proc_env = {**os.environ, **env}
 
     start = time.time()
