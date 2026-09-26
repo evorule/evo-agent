@@ -4,7 +4,10 @@
      每文件一个 Monaco model(保留 undo 栈),切换即 setModel;Ctrl+S 保存落盘。
      S4 产物协作:agent file_write 产物自动打开,含草稿基线时可切 diff 视图
      (左=agent 草稿,右=当前可编辑);保存即定稿(工作台层留痕,见 stores.js)。
-     设置页为特殊 tab(kind:settings):不建 Monaco model,渲染 SettingsEditor 组件。 -->
+     设置页为特殊 tab(kind:settings):不建 Monaco model,渲染 SettingsEditor 组件。
+     设置 JSON 双模式(evo://settings/user|workspace)为普通 Monaco JSON tab:
+     user 保存=diff 逐键写设置通道;workspace 保存=工作区设置文件直写;
+     user tab 激活期间挂设置 JSON Schema(快照恢复,防全局诊断污染)。 -->
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
@@ -17,8 +20,17 @@
     artifacts,
     closeTab,
     markDirty,
+    markSaved,
     saveTab,
+    USER_SETTINGS_URI,
+    WORKSPACE_SETTINGS_URI,
   } from '../lib/stores.js';
+  import {
+    settingsState,
+    buildSettingsSchema,
+    saveUserSettingsDoc,
+    saveWorkspaceSettingsDoc,
+  } from '../lib/settings.js';
 
   const welcomeText = `# evo-agent 工作台
 
@@ -66,6 +78,7 @@
     : null;
 
   function langOf(path) {
+    if (path.startsWith('evo://settings/')) return 'json';
     const ext = (path.split('.').pop() || '').toLowerCase();
     const map = {
       md: 'markdown',
@@ -110,6 +123,39 @@
     if (settingsEl) settingsEl.style.display = which === 'settings' ? '' : 'none';
   }
 
+  // 设置 JSON Schema:仅在用户层设置 tab 激活期间挂载,离开时恢复进入前快照
+  // (避免全局 jsonDefaults 污染普通 JSON 文件的诊断行为)。
+  let savedJsonDiagnostics = null;
+
+  function mountSettingsSchema() {
+    if (!monaco.languages.json?.jsonDefaults) return;
+    if (!savedJsonDiagnostics) {
+      savedJsonDiagnostics = monaco.languages.json.jsonDefaults.getDiagnosticsOptions();
+    }
+    const entries = get(settingsState).entries;
+    if (!entries.length) return;
+    monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
+      validate: true,
+      allowComments: false,
+      enableSchemaRequest: false,
+      schemas: [
+        {
+          uri: 'evo://workbench-settings.schema.json',
+          fileMatch: [USER_SETTINGS_URI],
+          schema: buildSettingsSchema(entries),
+        },
+      ],
+    });
+  }
+
+  function unmountSettingsSchema() {
+    if (!savedJsonDiagnostics) return;
+    if (monaco.languages.json?.jsonDefaults) {
+      monaco.languages.json.jsonDefaults.setDiagnosticsOptions(savedJsonDiagnostics);
+    }
+    savedJsonDiagnostics = null;
+  }
+
   function ensureDiffEditor() {
     if (!diffEditor) {
       diffEditor = monaco.editor.createDiffEditor(diffEl, {
@@ -130,12 +176,18 @@
 
   function renderActive(path) {
     if (!editor) return;
+    const tab = path ? get(tabs).find((t) => t.path === path) || null : null;
+    // 设置 Schema 仅在用户层设置 JSON tab 正常呈现时挂载,其余一律恢复快照
+    if (tab && !tab.kind && !tab.error && tab.path === USER_SETTINGS_URI) {
+      mountSettingsSchema();
+    } else {
+      unmountSettingsSchema();
+    }
     if (!path) {
       editor.setModel(welcomeModel);
       showHost('edit');
       return;
     }
-    const tab = get(tabs).find((t) => t.path === path) || null;
     if (!tab) {
       editor.setModel(welcomeModel);
       showHost('edit');
@@ -184,6 +236,20 @@
     const model = models.get(path);
     if (!model) return;
     const content = model.getValue();
+    // 设置 JSON 双模式:保存链分叉(不走文件通道)
+    if (path === USER_SETTINGS_URI || path === WORKSPACE_SETTINGS_URI) {
+      const base = baseline.get(path) ?? '';
+      const err =
+        path === USER_SETTINGS_URI
+          ? await saveUserSettingsDoc(content, base)
+          : await saveWorkspaceSettingsDoc(content);
+      saveError = err || '';
+      if (!saveError) {
+        baseline.set(path, content);
+        markSaved(path, content);
+      }
+      return;
+    }
     saveError = (await saveTab(path, content)) || '';
     if (!saveError) baseline.set(path, content);
   }
@@ -255,6 +321,7 @@
     if (welcomeModel) welcomeModel.dispose();
     if (editor) editor.dispose();
     if (diffEditor) diffEditor.dispose();
+    unmountSettingsSchema();
   });
 </script>
 

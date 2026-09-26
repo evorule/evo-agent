@@ -28,6 +28,7 @@
     refreshGovBadges,
     sessionId,
     openSettingsTab,
+    openSettingsJson,
   } from './lib/stores.js';
   import { loadSettings } from './lib/settings.js';
   import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
@@ -49,6 +50,7 @@
     'workbench.action.session.switch',
     'workbench.action.gov.refreshBadges',
     'workbench.action.openSettings',
+    'workbench.action.openSettingsJson',
   ];
   let cleanupTracking = null;
 
@@ -133,6 +135,12 @@
       title: '打开设置',
       category: '首选项',
       run: () => openSettingsTab(),
+    });
+    registerCommand({
+      id: 'workbench.action.openSettingsJson',
+      title: '打开用户设置 (JSON)',
+      category: '首选项',
+      run: () => openSettingsJson('user'),
     });
     loadSettings(); // 设置快照加载(失败降级缓存只读;编辑器参数订阅在 EditorPane)
     cleanupTracking = initContextTracking();

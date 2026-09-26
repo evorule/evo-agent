@@ -7,10 +7,27 @@ vi.mock('../src/lib/api.js', () => ({
   getWorkbenchSettings: vi.fn(),
   getWorkbenchSettingsSchema: vi.fn(),
   putWorkbenchSetting: vi.fn(),
+  writeFile: vi.fn(),
 }));
 
-import { settingsState, loadSettings, setSetting, initialState, SETTINGS_CACHE_KEY } from '../src/lib/settings.js';
-import { getWorkbenchSettings, getWorkbenchSettingsSchema, putWorkbenchSetting } from '../src/lib/api.js';
+import {
+  settingsState,
+  loadSettings,
+  setSetting,
+  initialState,
+  SETTINGS_CACHE_KEY,
+  userLayerDoc,
+  buildSettingsSchema,
+  saveUserSettingsDoc,
+  saveWorkspaceSettingsDoc,
+  WORKSPACE_SETTINGS_FILE,
+} from '../src/lib/settings.js';
+import {
+  getWorkbenchSettings,
+  getWorkbenchSettingsSchema,
+  putWorkbenchSetting,
+  writeFile,
+} from '../src/lib/api.js';
 
 const SCHEMA_RES = {
   entries: [
@@ -165,5 +182,115 @@ describe('setSetting', () => {
     await expect(setSetting('editor.fontSize', 999)).rejects.toThrow('HTTP 400');
     const s = get(settingsState);
     expect(s.settings['editor.fontSize']).toBe(18); // 回滚语义:调用方回滚控件值
+  });
+});
+
+describe('userLayerDoc(用户层文档派生)', () => {
+  it('仅保留生效层为 user 的键值', () => {
+    const doc = userLayerDoc({
+      settings: { 'editor.fontSize': 18, 'editor.minimap': true, 'workbench.theme': 'evorule-dark' },
+      sources: { 'editor.fontSize': 'user', 'editor.minimap': 'default', 'workbench.theme': 'workspace' },
+    });
+    expect(doc).toEqual({ 'editor.fontSize': 18 });
+  });
+
+  it('缺 sources/空 settings → 空文档', () => {
+    expect(userLayerDoc({ settings: {} })).toEqual({});
+    expect(userLayerDoc({})).toEqual({});
+  });
+});
+
+describe('buildSettingsSchema(schema 条目 → JSON Schema)', () => {
+  it('四类型映射 + range/enum + 拒绝未知键', () => {
+    const schema = buildSettingsSchema([
+      { key: 'editor.fontSize', type: 'number', range: [9, 28], description: '字体大小' },
+      { key: 'editor.minimap', type: 'boolean', description: '小地图' },
+      { key: 'editor.wordWrap', type: 'enum', enum_values: ['on', 'off'], description: '换行' },
+      { key: 'keybindings.overrides', type: 'array', description: '键位覆盖' },
+    ]);
+    expect(schema.type).toBe('object');
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.properties['editor.fontSize']).toEqual({ description: '字体大小', type: 'number', minimum: 9, maximum: 28 });
+    expect(schema.properties['editor.minimap'].type).toBe('boolean');
+    expect(schema.properties['editor.wordWrap'].enum).toEqual(['on', 'off']);
+    expect(schema.properties['keybindings.overrides'].type).toBe('array');
+  });
+
+  it('空条目 → 空属性 schema', () => {
+    const schema = buildSettingsSchema([]);
+    expect(schema.properties).toEqual({});
+  });
+});
+
+describe('saveUserSettingsDoc(diff 逐键保存)', () => {
+  const BASE = JSON.stringify({ 'editor.fontSize': 18, 'editor.minimap': false });
+
+  it('新增/修改/删除/未变 → PUT 序列正确(未变跳过,删除 PUT null)', async () => {
+    putWorkbenchSetting.mockResolvedValue({ key: 'x', value: null, source: 'default' });
+    const next = JSON.stringify({ 'editor.fontSize': 21, 'editor.tabSize': 4 }); // fontSize 改,tabSize 增,minimap 删
+    const err = await saveUserSettingsDoc(next, BASE);
+    expect(err).toBeNull();
+    const calls = putWorkbenchSetting.mock.calls.map(([k, v]) => [k, v]);
+    expect(calls).toEqual([
+      ['editor.minimap', null], // 删除键 → 重置
+      ['editor.fontSize', 21], // 修改键
+      ['editor.tabSize', 4], // 新增键
+    ]);
+  });
+
+  it('无变更 → 零 PUT', async () => {
+    const err = await saveUserSettingsDoc(BASE, BASE);
+    expect(err).toBeNull();
+    expect(putWorkbenchSetting).not.toHaveBeenCalled();
+  });
+
+  it('非法 JSON / 非对象 → 返回错误且零 PUT', async () => {
+    expect(await saveUserSettingsDoc('{ broken', BASE)).toMatch(/JSON 解析失败/);
+    expect(await saveUserSettingsDoc('[1,2]', BASE)).toMatch(/必须是 JSON 对象/);
+    expect(putWorkbenchSetting).not.toHaveBeenCalled();
+  });
+
+  it('部分键失败 → 全部尝试+失败清单返回', async () => {
+    putWorkbenchSetting.mockImplementation(async (key) => {
+      if (key === 'editor.fontSize') throw new Error('HTTP 400');
+      return { key, value: null, source: 'default' };
+    });
+    const next = JSON.stringify({ 'editor.fontSize': 999, 'editor.minimap': true });
+    const err = await saveUserSettingsDoc(next, BASE);
+    expect(err).toMatch(/1 项保存失败/);
+    expect(err).toMatch(/editor\.fontSize/);
+    expect(putWorkbenchSetting).toHaveBeenCalledTimes(2); // minimap 成功未中断
+  });
+
+  it('成功 → 重拉设置快照', async () => {
+    putWorkbenchSetting.mockResolvedValue({ key: 'x', value: null, source: 'default' });
+    getWorkbenchSettingsSchema.mockResolvedValue(SCHEMA_RES);
+    getWorkbenchSettings.mockResolvedValue(SETTINGS_RES);
+    await saveUserSettingsDoc(BASE, BASE);
+    expect(getWorkbenchSettings).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('saveWorkspaceSettingsDoc(工作区文件直写)', () => {
+  it('合法 JSON → writeFile 到工作区设置路径+重拉快照', async () => {
+    writeFile.mockResolvedValue({ ok: true });
+    getWorkbenchSettingsSchema.mockResolvedValue(SCHEMA_RES);
+    getWorkbenchSettings.mockResolvedValue(SETTINGS_RES);
+    const err = await saveWorkspaceSettingsDoc('{ "editor.fontSize": 16 }');
+    expect(err).toBeNull();
+    expect(writeFile).toHaveBeenCalledWith(WORKSPACE_SETTINGS_FILE, '{ "editor.fontSize": 16 }');
+    expect(getWorkbenchSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('非法 JSON → 返回错误且不写文件', async () => {
+    const err = await saveWorkspaceSettingsDoc('nope');
+    expect(err).toMatch(/JSON 解析失败/);
+    expect(writeFile).not.toHaveBeenCalled();
+  });
+
+  it('writeFile 失败 → 返回错误消息', async () => {
+    writeFile.mockRejectedValue(new Error('HTTP 500'));
+    const err = await saveWorkspaceSettingsDoc('{}');
+    expect(err).toBe('HTTP 500');
   });
 });
