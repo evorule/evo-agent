@@ -2,9 +2,9 @@
 <!-- Copyright (C) 2026 EvoRule Project -->
 <!-- 工作台布局底盘(Trae 范式):
      顶栏 / 左活动栏+侧面板(文件树) / 中编辑器群+底部面板 / 右对话侧栏。
-     B1 命令基础设施:全局键位路由(规则表解析→命令执行) + 命令面板挂载 +
-     视图显隐状态(display 切换,保留组件状态)。Monaco 已处理键不冒泡到 window,
-     「编辑器内 Monaco 优先、全局规则兜底」自然成立(设计见 02 号 §3.5)。 -->
+     命令基础设施:全局键位路由(规则表解析→命令执行) + 命令面板挂载 +
+     视图显隐状态(display 切换,保留组件状态)。编辑器内键位(含 Ctrl+S)
+     统一由本路由分发(Monaco addCommand 不阻止 keydown 冒泡,双注册会双触发)。 -->
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';

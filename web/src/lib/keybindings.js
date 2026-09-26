@@ -3,8 +3,9 @@
 // 键位规则系统:规则四元组 {key, command, when}(args 留 v2)。
 // 解析:keydown → 规范化 key 串 → 过滤 when 命中 → 自底向上首条命中
 // (默认规则在前、用户覆盖在后 = 后者天然遮蔽前者,对齐 VS Code 追加语义)。
-// Monaco 协调(02 号 §3.5):Monaco 内编辑器键不在此注册,编辑器聚焦时 Monaco
-// 先处理且已处理键不冒泡到 window——「Monaco 优先、全局兜底」自然成立。
+// Monaco 协调:Monaco 内建编辑器键(F12/Ctrl+D 等)不在此注册避免语义打架;
+// Monaco addCommand 不阻止 keydown 冒泡,编辑器内键位(含 Ctrl+S)统一由
+// 全局路由分发,不双注册。
 
 import { get } from 'svelte/store';
 import { contextKeys, evaluateWhen } from './context-keys.js';
@@ -12,9 +13,9 @@ import { contextKeys, evaluateWhen } from './context-keys.js';
 export const USER_KEYBINDINGS_STORAGE_KEY = 'evo_keybindings';
 
 /**
- * 默认规则集(§3.7 默认命令集;次序即优先级,后条遮蔽前条)。
- * 保存命令的执行体由 EditorPane 自注册;编辑器聚焦时该键由 Monaco 先行拦截,
- * 本规则兜底「焦点在编辑器之外但 tab 已开」的场景。
+ * 默认规则集(次序即优先级,后条遮蔽前条)。
+ * 保存命令的执行体由 EditorPane 自注册;编辑器内 Ctrl+S 亦由全局路由
+ * 统一分发(when editorFocus 命中),本规则同样覆盖「焦点在编辑器之外但 tab 已开」的场景。
  */
 export const DEFAULT_KEYBINDINGS = [
   { key: 'ctrl+shift+p', command: 'workbench.action.showCommands', when: '!inPalette' },

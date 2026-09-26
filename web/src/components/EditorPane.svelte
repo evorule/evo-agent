@@ -211,7 +211,7 @@
     });
     // 本组件命令自注册(命令面板/键位路由统一入口;卸载时注销)。
     // 编辑器内 Ctrl+S 也统一走全局键位路由(when editorFocus 命中)——
-    // Monaco addCommand 不阻止 keydown 冒泡,双注册会双触发(DC-2 实测)。
+    // Monaco addCommand 不阻止 keydown 冒泡,双注册会双触发(实测)。
     registerCommand({
       id: 'workbench.action.file.save',
       title: '保存当前文件',
