@@ -125,15 +125,10 @@
     if (settingsEl) settingsEl.style.display = which === 'settings' ? '' : 'none';
   }
 
-  // 设置 JSON Schema:仅在用户层设置 tab 激活期间挂载,离开时恢复进入前快照
-  // (避免全局 jsonDefaults 污染普通 JSON 文件的诊断行为)。
-  let savedJsonDiagnostics = null;
-
+  // 设置 JSON Schema:仅在用户层设置 tab 激活期间挂载(fileMatch 限定该虚拟 URI,
+  // 其他 JSON 文件不受影响),离开时摘除 schema(保留基础语法校验)。
   function mountSettingsSchema() {
     if (!monaco.languages.json?.jsonDefaults) return;
-    if (!savedJsonDiagnostics) {
-      savedJsonDiagnostics = monaco.languages.json.jsonDefaults.getDiagnosticsOptions();
-    }
     const entries = get(settingsState).entries;
     if (!entries.length) return;
     monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
@@ -151,11 +146,12 @@
   }
 
   function unmountSettingsSchema() {
-    if (!savedJsonDiagnostics) return;
-    if (monaco.languages.json?.jsonDefaults) {
-      monaco.languages.json.jsonDefaults.setDiagnosticsOptions(savedJsonDiagnostics);
-    }
-    savedJsonDiagnostics = null;
+    if (!monaco.languages.json?.jsonDefaults) return;
+    monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
+      validate: true,
+      allowComments: false,
+      schemas: [],
+    });
   }
 
   // ---- 设置消费:编辑器外观与行为由设置快照下发(默认值=原硬编码行为) ----
@@ -211,7 +207,7 @@
   function renderActive(path) {
     if (!editor) return;
     const tab = path ? get(tabs).find((t) => t.path === path) || null : null;
-    // 设置 Schema 仅在用户层设置 JSON tab 正常呈现时挂载,其余一律恢复快照
+    // 设置 Schema 仅在用户层设置 JSON tab 正常呈现时挂载,其余一律摘除
     if (tab && !tab.kind && !tab.error && tab.path === USER_SETTINGS_URI) {
       mountSettingsSchema();
     } else {
