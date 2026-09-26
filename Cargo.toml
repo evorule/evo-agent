@@ -71,6 +71,8 @@ rustyline = "14"
 
 # L2 SafetyAuditor(P1-F6/P2-V2 修复):Prompt 注入规则匹配
 regex = "1"
+notify = "8"
+notify-debouncer-full = "0.5"
 
 [dependencies.serde_with]
 version = "3"

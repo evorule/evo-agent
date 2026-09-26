@@ -160,6 +160,8 @@ pub struct AgentApiState {
     workbench_config: Arc<crate::api::snapshots::WorkbenchConfigStore>,
     /// 工作台设置(两级合并;data/workbench_settings.json + <workdir>/.evo/settings.json)
     workbench_settings: Arc<crate::api::settings::WorkbenchSettingsStore>,
+    /// 文件系统事件广播 hub(WS 连接订阅;serve 启动时 spawn_watcher 填充)
+    fs_events: crate::api::fs_watch::FsEventHub,
 }
 
 impl AgentApiState {
@@ -215,6 +217,7 @@ impl AgentApiState {
                 crate::api::settings::WorkbenchSettingsStore::new(&workdir)
                     .unwrap_or_else(|e| panic!("failed to init workbench settings store: {e}")),
             ),
+            fs_events: crate::api::fs_watch::FsEventHub::new(),
             workdir,
             workspace_client,
             toolkit,
@@ -251,6 +254,11 @@ impl AgentApiState {
     /// 工作台设置存储的引用(设置 GET/PUT/schema 端点)
     pub fn workbench_settings(&self) -> &crate::api::settings::WorkbenchSettingsStore {
         &self.workbench_settings
+    }
+
+    /// 文件系统事件 hub 的引用(WS 连接订阅 + serve 启动时传给 spawn_watcher)
+    pub fn fs_events(&self) -> &crate::api::fs_watch::FsEventHub {
+        &self.fs_events
     }
 
     /// G6:获取 SessionStore 的引用(供 G5 server 层做断开即取消等扩展)

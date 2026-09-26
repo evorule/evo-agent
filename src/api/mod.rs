@@ -10,6 +10,7 @@ pub mod auth;
 pub mod console_sidecar;
 pub mod evorule_client;
 pub mod file_api;
+pub mod fs_watch;
 pub mod llm_ops;
 pub mod metrics;
 pub mod serve_tools;
