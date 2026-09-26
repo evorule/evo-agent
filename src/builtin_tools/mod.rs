@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! 6 个内置工具(0.1.0:file_read / file_list / file_write / search_files / shell_exec / http_get)
+//! 内置工具(0.2.0:file_read / file_list / file_write / file_create / file_move /
+//! file_delete / search_files / shell_exec / http_get)
 //!
 //! ## 设计原则
 //!
@@ -37,9 +38,13 @@
 //! 默认是"宁可功能少,也不可被滥用"。
 
 pub mod delegate_tool;
+pub mod file_create;
+pub mod file_delete;
 pub mod file_list;
+pub mod file_move;
 pub mod file_read;
 pub mod file_write;
+pub mod fs_safety;
 pub mod http_get;
 pub mod search_files;
 pub mod shell_exec;
@@ -51,13 +56,19 @@ use crate::io_handlers::tool_handler::ToolHandler;
 
 /// 构造一个"安全默认工具集"
 ///
-/// 包含 6 个工具(0.1.0 阶段):
+/// 包含 9 个内置工具:
 /// - `file_read`:读文件(工作目录沙箱 + size limit)
 /// - `file_list`:列目录(工作目录沙箱 + 跳过隐藏)
 /// - `file_write`:写文件(只能写 `./workspace/` + overwrite 保护)
+/// - `file_create`:创建文件/目录(candidate 审批 + Windows 兼容名校验)
+/// - `file_move`:移动/重命名(candidate 审批 + 目标重名拒)
+/// - `file_delete`:软删除进 `.evo-trash/`(candidate 审批)
 /// - `search_files`:glob 找文件(工作目录沙箱 + max_results 限制)
 /// - `shell_exec`:执行白名单命令(8 active + 20 candidate + 28 blocked)
 /// - `http_get`:HTTP GET(6 active host + SSRF 防护 + 任何其他 host 需批准)
+///
+/// 注:file_create/move/delete 默认 `candidate`(agent 调用需用户批准);
+/// 工作台人工编辑面自建实例(`writable_dir="."`)绕过审批,见 file_api 模块文档。
 ///
 /// 用法:
 /// ```ignore
@@ -81,6 +92,18 @@ pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
     handler.register_tool(
         "file_write",
         Arc::new(file_write::FileWriteTool::new(workdir_buf.clone())),
+    );
+    handler.register_tool(
+        "file_create",
+        Arc::new(file_create::FileCreateTool::new(workdir_buf.clone())),
+    );
+    handler.register_tool(
+        "file_move",
+        Arc::new(file_move::FileMoveTool::new(workdir_buf.clone())),
+    );
+    handler.register_tool(
+        "file_delete",
+        Arc::new(file_delete::FileDeleteTool::new(workdir_buf.clone())),
     );
     handler.register_tool(
         "search_files",
@@ -167,6 +190,99 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     name: "create_parents".to_string(),
                     r#type: "boolean".to_string(),
                     description: "Set true to auto-create parent directories (default: false)".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "file_create".to_string(),
+            description: "Create an empty file or a directory in the writable subdir. \
+                          **ONLY creates inside ./workspace/** (configurable). \
+                          Rejects duplicates, Windows reserved names (CON/NUL/COM1-9/LPT1-9), \
+                          illegal filename characters and trailing dot/space. \
+                          Parent dirs are only created with `create_parents=true`. \
+                          Requires user approval: the first call returns a needs_approval proposal."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "path".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Target path, relative to writable_dir (e.g. \"workspace/notes/new.md\")".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "kind".to_string(),
+                    r#type: "string".to_string(),
+                    description: "\"file\" (default) or \"dir\"".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "create_parents".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Set true to auto-create missing parent directories (default: false)".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "approved".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Set to true ONLY after the user has approved the creation proposal.".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "file_move".to_string(),
+            description: "Move or rename a file/directory (rename = same-directory move). \
+                          **ONLY moves entries inside ./workspace/** (configurable). \
+                          Source and target dir must exist; duplicate target names are rejected. \
+                          Requires user approval: the first call returns a needs_approval proposal."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "path".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Existing entry to move, relative to writable_dir".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "target_dir".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Existing destination directory, relative to writable_dir".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "new_name".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Optional new name; defaults to keeping the current name".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "approved".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Set to true ONLY after the user has approved the move proposal.".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "file_delete".to_string(),
+            description: "Soft-delete a file or directory: the entry is moved into \
+                          `<workdir>/.evo-trash/` (timestamped name) and can be recovered manually. \
+                          **ONLY deletes inside ./workspace/** (configurable). \
+                          The workdir root, the writable root and the trash folder itself cannot be deleted. \
+                          Requires user approval: the first call returns a needs_approval proposal."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "path".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Existing entry to delete, relative to writable_dir".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "approved".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Set to true ONLY after the user has approved the deletion proposal.".to_string(),
                     required: false,
                 },
             ],

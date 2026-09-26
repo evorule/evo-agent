@@ -15,6 +15,8 @@
 
 use std::path::Path;
 
+use serde_json::Value;
+
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::workspace_client::WorkspaceApiClient;
 use crate::builtin_tools::default_safe_toolkit;
@@ -251,6 +253,48 @@ pub fn build_filtered_toolkit(union: &ToolHandler, whitelist: &[String]) -> Tool
     filtered
 }
 
+/// 文件增删改工具的暴露开关(agentTools.*,布尔设置键;开=在 agent 工具面)
+///
+/// 开关关 = 过滤 toolkit 不注册该执行器 = LLM 工具契约同步消失
+/// (openai_tools_payload 与注册执行器求交,零双声明)。键缺失/值非法时
+/// 按 schema 默认语义回落:fileCreate 开,fileMove/fileDelete 关。
+const TOOL_SWITCH_KEYS: &[(&str, &str)] = &[
+    ("file_create", "agentTools.fileCreate"),
+    ("file_move", "agentTools.fileMove"),
+    ("file_delete", "agentTools.fileDelete"),
+];
+
+/// 在 [`build_filtered_toolkit`] 之上叠加 agentTools.* 开关过滤。
+///
+/// `settings` 为合并后的工作台设置(Default→User→Workspace,含 schema 默认值;
+/// 见 `WorkbenchSettingsStore::merged`)。开关键 `scope=application`,
+/// 工作区层不可覆盖(防项目级配置私自扩权 agent 工具面)。
+pub fn build_filtered_toolkit_with_switches(
+    union: &ToolHandler,
+    whitelist: &[String],
+    settings: &serde_json::Map<String, Value>,
+) -> ToolHandler {
+    let switch_on = |tool: &str| -> bool {
+        match TOOL_SWITCH_KEYS.iter().find(|(t, _)| *t == tool) {
+            Some((_, key)) => settings
+                .get(*key)
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| *key == "agentTools.fileCreate"),
+            None => true,
+        }
+    };
+    let mut filtered = ToolHandler::new();
+    for name in whitelist {
+        if !switch_on(name) {
+            continue;
+        }
+        if let Some(tool) = union.get_tool(name) {
+            filtered.register_tool(name, tool);
+        }
+    }
+    filtered
+}
+
 // =============================================================================
 // M5-a 能力边界:生效边界合成 + 声明绑定(serve 三路径与 CLI 共用)
 // =============================================================================
@@ -374,11 +418,14 @@ mod tests {
         let (ws, ev) = make_clients();
         let handler = build_union_toolkit(Path::new("."), &ws, &ev);
 
-        // 6 个内置工具
+        // 9 个内置工具
         for name in [
             "file_read",
             "file_list",
             "file_write",
+            "file_create",
+            "file_move",
+            "file_delete",
             "search_files",
             "shell_exec",
             "http_get",
@@ -399,11 +446,14 @@ mod tests {
             );
         }
 
-        // 总数 = 6 + 25 = 31(逐个验证所有预期工具都在)
+        // 总数 = 9 + 26 = 35(逐个验证所有预期工具都在)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
             "file_write",
+            "file_create",
+            "file_move",
+            "file_delete",
             "search_files",
             "shell_exec",
             "http_get",
@@ -412,7 +462,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 32, "expected 32 total tool names");
+        assert_eq!(all_names.len(), 35, "expected 35 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),
@@ -490,6 +540,50 @@ mod tests {
 
         assert!(filtered.has_tool("file_read"));
         assert!(!filtered.has_tool("nonexistent_tool"));
+    }
+
+    #[test]
+    fn test_build_filtered_toolkit_switches_gate_file_mutation_tools() {
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let whitelist: Vec<String> = ["file_read", "file_create", "file_move", "file_delete"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // 出厂默认:fileCreate 开 / fileMove、fileDelete 关
+        let mut settings = serde_json::Map::new();
+        settings.insert("agentTools.fileCreate".to_string(), serde_json::json!(true));
+        settings.insert("agentTools.fileMove".to_string(), serde_json::json!(false));
+        settings.insert(
+            "agentTools.fileDelete".to_string(),
+            serde_json::json!(false),
+        );
+        let filtered = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        assert!(filtered.has_tool("file_create"));
+        assert!(
+            !filtered.has_tool("file_move"),
+            "off switch must remove executor"
+        );
+        assert!(
+            !filtered.has_tool("file_delete"),
+            "off switch must remove executor"
+        );
+        assert!(filtered.has_tool("file_read"), "non-gated tools unaffected");
+
+        // 全开:三工具都进执行面
+        settings.insert("agentTools.fileMove".to_string(), serde_json::json!(true));
+        settings.insert("agentTools.fileDelete".to_string(), serde_json::json!(true));
+        let filtered = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        assert!(filtered.has_tool("file_move"));
+        assert!(filtered.has_tool("file_delete"));
+
+        // 键缺失:按 schema 默认语义回落(fileCreate 开 / 其余关)
+        let filtered =
+            build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
+        assert!(filtered.has_tool("file_create"));
+        assert!(!filtered.has_tool("file_move"));
+        assert!(!filtered.has_tool("file_delete"));
     }
 
     #[test]

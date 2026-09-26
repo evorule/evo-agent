@@ -518,7 +518,12 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
     // state.toolkit(union 30 工具)过滤出该 agent 可用工具,挂 runner 的 tool_handler。
     // 缺这步时 runner 的 tool_handler 为空 —— LLM 请求无工具契约(模型只能盲猜
     // 或输出供应商原生 XML),也调不通 call_service 工具。
-    let mut filtered = crate::api::serve_tools::build_filtered_toolkit(state.toolkit(), &def.tools);
+    let (merged_settings, _) = state.workbench_settings().merged();
+    let mut filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+        state.toolkit(),
+        &def.tools,
+        &merged_settings,
+    );
     // M5-a:能力边界接线(同 HTTP 端点口径:声明重绑工具面 + 生效边界注入 runner)
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
