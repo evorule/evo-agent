@@ -14,6 +14,7 @@ pub mod llm_ops;
 pub mod metrics;
 pub mod serve_tools;
 pub mod session_index;
+pub mod settings;
 pub mod snapshots;
 pub mod workspace_client;
 pub mod ws_handler;

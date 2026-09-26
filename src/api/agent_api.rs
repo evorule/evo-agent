@@ -158,6 +158,8 @@ pub struct AgentApiState {
     snapshots: Arc<crate::api::snapshots::SnapshotStore>,
     /// O-093:工作台配置(快照保留期;data/workbench_config.json)
     workbench_config: Arc<crate::api::snapshots::WorkbenchConfigStore>,
+    /// 工作台设置(两级合并;data/workbench_settings.json + <workdir>/.evo/settings.json)
+    workbench_settings: Arc<crate::api::settings::WorkbenchSettingsStore>,
 }
 
 impl AgentApiState {
@@ -209,6 +211,10 @@ impl AgentApiState {
             workbench_config: Arc::new(crate::api::snapshots::WorkbenchConfigStore::new(
                 workdir.join("data").join("workbench_config.json"),
             )),
+            workbench_settings: Arc::new(
+                crate::api::settings::WorkbenchSettingsStore::new(&workdir)
+                    .unwrap_or_else(|e| panic!("failed to init workbench settings store: {e}")),
+            ),
             workdir,
             workspace_client,
             toolkit,
@@ -240,6 +246,11 @@ impl AgentApiState {
     /// O-093:工作台配置存储的引用(保留期 GET/PUT 端点 + 清理任务现读)
     pub fn workbench_config(&self) -> &crate::api::snapshots::WorkbenchConfigStore {
         &self.workbench_config
+    }
+
+    /// 工作台设置存储的引用(设置 GET/PUT/schema 端点)
+    pub fn workbench_settings(&self) -> &crate::api::settings::WorkbenchSettingsStore {
+        &self.workbench_settings
     }
 
     /// G6:获取 SessionStore 的引用(供 G5 server 层做断开即取消等扩展)
@@ -348,6 +359,16 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route(
             "/api/workbench/config",
             axum::routing::get(get_workbench_config).put(put_workbench_config),
+        )
+        // 工作台设置(两级合并;工作台数据面,不触引擎面;G16 中间件自动覆盖)
+        .route(
+            "/api/workbench/settings",
+            axum::routing::get(crate::api::settings::get_settings)
+                .put(crate::api::settings::put_settings),
+        )
+        .route(
+            "/api/workbench/settings/schema",
+            axum::routing::get(crate::api::settings::get_settings_schema),
         )
         // 治理叠加:进化信号只读代理(工作台信号徽标数据源;evorule-server 零改动)
         .route(
