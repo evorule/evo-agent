@@ -143,6 +143,9 @@ fn to_raw_events(ev: &DebouncedEvent) -> Vec<RawEvent> {
 ///
 /// 路径越出 workdir(strip 失败)或落在排除区的事件被丢弃;rename 的
 /// from/to 两侧分别判级(移入可见区 = added,移出 = removed)。
+/// workdir 前缀匹配同时兼容 verbatim(`\\?\`)与非 verbatim 形态——
+/// notify Windows 后端 canonicalize watch 根后以 verbatim 形态回投
+/// 事件路径,而调用方持有的 workdir 常为普通绝对/相对路径。
 pub fn normalize(workdir: &Path, raws: &[RawEvent]) -> FsEventBatch {
     let mut added = BTreeSet::new();
     let mut updated = BTreeSet::new();
@@ -151,7 +154,22 @@ pub fn normalize(workdir: &Path, raws: &[RawEvent]) -> FsEventBatch {
 
     // 相对路径化:越出 workdir 丢弃;Windows 反斜杠统一为 `/`
     let rel = |p: &Path| -> Option<String> {
-        let r = p.strip_prefix(workdir).ok()?;
+        let r = match p.strip_prefix(workdir) {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => {
+                // verbatim ↔ 非 verbatim 前缀互换后再试一次
+                let s = workdir.to_string_lossy();
+                let alt = if let Some(rest) = s.strip_prefix(r"\\?\") {
+                    PathBuf::from(rest)
+                } else {
+                    PathBuf::from(format!(r"\\?\{}", s))
+                };
+                match p.strip_prefix(&alt) {
+                    Ok(r) => r.to_path_buf(),
+                    Err(_) => return None,
+                }
+            }
+        };
         if r.as_os_str().is_empty() {
             return None;
         }
@@ -277,7 +295,13 @@ impl Default for FsEventHub {
 /// `std::mem::forget` 主动泄漏——serve 进程生命周期即 watcher 生命周期,
 /// 其内部线程持续运行;失败返回 Err 时调用方 fail-soft 降级(仅告警)。
 pub fn spawn_watcher(workdir: &Path, hub: FsEventHub) -> Result<(), String> {
-    let wd = workdir.to_path_buf();
+    // notify Windows 后端对 watch 根做 canonicalize(得 \\?\ verbatim 绝对路径)
+    // 并以该形态回投事件路径——workdir 为相对路径时事件前缀与根不匹配,
+    // normalize 的 strip 会全部失败(实测:watch "." 时零事件)。故此处
+    // 先解析为绝对路径再 watch;规整侧另有 verbatim/非 verbatim 兼容。
+    let wd = std::fs::canonicalize(workdir)
+        .map_err(|e| format!("failed to resolve workdir {}: {e}", workdir.display()))?;
+    let wd_for_norm = wd.clone();
     let mut debouncer = new_debouncer(
         Duration::from_millis(FS_DEBOUNCE_MS),
         None,
@@ -294,14 +318,14 @@ pub fn spawn_watcher(workdir: &Path, hub: FsEventHub) -> Result<(), String> {
                 }
             };
             let raw: Vec<RawEvent> = events.iter().flat_map(to_raw_events).collect();
-            let batch = normalize(&wd, &raw);
+            let batch = normalize(&wd_for_norm, &raw);
             hub.publish(batch);
         },
     )
     .map_err(|e| format!("failed to create file watcher: {e}"))?;
     debouncer
-        .watch(workdir, RecursiveMode::Recursive)
-        .map_err(|e| format!("failed to watch {}: {e}", workdir.display()))?;
+        .watch(&wd, RecursiveMode::Recursive)
+        .map_err(|e| format!("failed to watch {}: {e}", wd.display()))?;
     std::mem::forget(debouncer);
     Ok(())
 }
@@ -473,6 +497,29 @@ mod tests {
             RawEvent::Upsert(PathBuf::from("/elsewhere/x.txt")),
             RawEvent::Upsert(wd().clone()), // workdir 根自身:空相对路径,丢弃
         ]);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_verbatim_workdir_prefix() {
+        // notify Windows 后端以 \\?\ verbatim 绝对路径回投事件:
+        // verbatim workdir + verbatim 事件路径(主形态)
+        let vwd = PathBuf::from(r"\\?\D:\work");
+        let batch = normalize(
+            &vwd,
+            &[RawEvent::Upsert(PathBuf::from(
+                r"\\?\D:\work\手测-tmp\new.md",
+            ))],
+        );
+        assert_eq!(batch.added, vec!["手测-tmp/new.md"]);
+        // 非 verbatim 事件路径 vs verbatim workdir(混合形态兼容)
+        let batch = normalize(&vwd, &[RawEvent::Upsert(PathBuf::from(r"D:\work\top.txt"))]);
+        assert_eq!(batch.added, vec!["top.txt"]);
+        // verbatim workdir 下越界事件仍丢弃
+        let batch = normalize(
+            &vwd,
+            &[RawEvent::Upsert(PathBuf::from(r"\\?\C:\else\x.txt"))],
+        );
         assert!(batch.is_empty());
     }
 

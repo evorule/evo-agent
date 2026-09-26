@@ -47,6 +47,9 @@ scripts/ops/ops.local.json
 web/node_modules/
 web/dist/
 
+# 软删除回收目录(工作台/agent 删除文件的落点,本地状态不入库)
+.evo-trash/
+
 # 本地测试输出（cargo test 重定向产物）
 test_all_output.txt
 
