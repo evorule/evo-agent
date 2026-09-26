@@ -97,7 +97,8 @@
     searching = true;
     error = '';
     previewData = null;
-    applyResult = null;
+    // 注意:不清 applyResult——apply 成功后的汇总横幅靠自动重搜刷新结果树,
+    // 若在此清空则横幅一闪即逝(05-实施日志 PR5 修正记录);横幅由预览/关闭钮清除
     try {
       result = await searchGrep(baseParams());
       collapsed = new Set();

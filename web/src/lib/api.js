@@ -20,12 +20,18 @@ function headers(json = false) {
 async function unwrap(resp) {
   if (!resp.ok) {
     let msg = `HTTP ${resp.status}`;
-    try {
-      const body = await resp.json();
-      if (typeof body === 'string') msg = body;
-      else if (body && typeof body.error === 'string') msg = body.error;
-    } catch {
-      /* 保留默认消息 */
+    // 先整读文本再试 JSON(JSON 失败后 body 已耗尽不能再 text());
+    // serve 错误体可能是 JSON({error}) 也可能是纯文本(400 参数/正则错误说明)
+    const raw = await resp.text().catch(() => '');
+    if (raw) {
+      try {
+        const body = JSON.parse(raw);
+        if (typeof body === 'string') msg = body;
+        else if (body && typeof body.error === 'string') msg = body.error;
+        else msg = raw;
+      } catch {
+        msg = raw;
+      }
     }
     const err = new Error(msg);
     err.status = resp.status;
