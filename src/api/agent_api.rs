@@ -68,7 +68,7 @@ pub struct AgentRunResponse {
     pub duration_ms: u64,
     /// Error message (if failed)
     pub error: Option<String>,
-    /// Created session ID (if the run established one; O-125/O-086 收口:
+    /// Created session ID (if the run established one; 会话关联收口:
     /// 消费者可凭此查询 18080 权威面或工作台回放,旧消费者不受影响)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -154,9 +154,9 @@ pub struct AgentApiState {
     llm_status: Arc<LlmStatusSnapshot>,
     /// 会话索引(JSONL 本地持久化;对话与历史阶段的枚举面)
     session_index: Arc<crate::api::session_index::SessionIndex>,
-    /// O-093:会话消息本地快照(展示层非权威副本;TTL 回收后历史仍可见)
+    /// 会话消息本地快照(展示层非权威副本;TTL 回收后历史仍可见)
     snapshots: Arc<crate::api::snapshots::SnapshotStore>,
-    /// O-093:工作台配置(快照保留期;data/workbench_config.json)
+    /// 工作台配置(快照保留期;data/workbench_config.json)
     workbench_config: Arc<crate::api::snapshots::WorkbenchConfigStore>,
     /// 工作台设置(两级合并;data/workbench_settings.json + <workdir>/.evo/settings.json)
     workbench_settings: Arc<crate::api::settings::WorkbenchSettingsStore>,
@@ -241,12 +241,12 @@ impl AgentApiState {
         &self.session_index
     }
 
-    /// O-093:快照存储的引用(WS 处理器 TurnEnd 落快照;transcript 回落读)
+    /// 快照存储的引用(WS 处理器 TurnEnd 落快照;transcript 回落读)
     pub fn snapshots(&self) -> &crate::api::snapshots::SnapshotStore {
         &self.snapshots
     }
 
-    /// O-093:工作台配置存储的引用(保留期 GET/PUT 端点 + 清理任务现读)
+    /// 工作台配置存储的引用(保留期 GET/PUT 端点 + 清理任务现读)
     pub fn workbench_config(&self) -> &crate::api::snapshots::WorkbenchConfigStore {
         &self.workbench_config
     }
@@ -330,7 +330,7 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
     Router::new()
         .route("/health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(metrics_handler))
-        // O-116:运行体身份查询(与启动横幅共享正本;鉴权内)
+        // 运行体身份查询(与启动横幅共享正本;鉴权内)
         .route("/version", axum::routing::get(get_version))
         // 凭据可视化:LLM 配置只读状态(脱敏,响应体不携带任何密钥内容)
         .route("/admin/llm-status", axum::routing::get(get_llm_status))
@@ -363,7 +363,7 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/sessions/{id}/transcript",
             axum::routing::get(get_transcript),
         )
-        // O-093:工作台配置(快照保留期;展示层,不触引擎面)
+        // 工作台配置(快照保留期;展示层,不触引擎面)
         .route(
             "/api/workbench/config",
             axum::routing::get(get_workbench_config).put(put_workbench_config),
@@ -460,7 +460,7 @@ async fn metrics_handler(State(state): State<AgentApiState>) -> String {
     state.metrics.render()
 }
 
-/// O-116:运行体身份查询端点(工作台可见的版本面)
+/// 运行体身份查询端点(工作台可见的版本面)
 ///
 /// 路由:`GET /version` → [`RuntimeIdentity`] JSON(version / exe_mtime_epoch /
 /// workdir)。与 `cmd_serve` 启动横幅共用 [`serve_tools::runtime_identity`]
@@ -550,7 +550,7 @@ fn load_serve_definition(
     Ok(def)
 }
 
-/// O-124:消费流式事件至 Done,聚合为最终 [`AgentResult`]
+/// 消费流式事件至 Done,聚合为最终 [`AgentResult`]
 ///
 /// 流式路径的终止语义(`run_streaming_inner` 契约):正常完成 / LLM 流中断 /
 /// evorule 错误 auto_rewind 失败 / max_steps 超限**均以 `Done(AgentResult)`
@@ -558,9 +558,9 @@ fn load_serve_definition(
 /// 返回,其后的 Done 承载最终判定;`Err(AgentError)` 形态与「流意外结束且无
 /// Done」(防御性,现实现不应发生)均组装为失败结果——不 panic 不静默。
 ///
-/// 修法先例:O-114 delegate 同款(bb172b2「consumes run_streaming to Done」)。
+/// 修法先例:delegate 同款(bb172b2「consumes run_streaming to Done」)。
 ///
-/// O-125:同时捕获流中的 `SessionCreated` 事件携带的会话 ID 并随结果返回
+/// 同时捕获流中的 `SessionCreated` 事件携带的会话 ID 并随结果返回
 /// (run 端点据此挂工作台本地索引 + 填充响应 `session_id` 字段)。
 async fn consume_to_done(
     mut stream: std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>>,
@@ -649,14 +649,14 @@ async fn run_agent(
     .with_capability_boundary(capability_boundary)
     .with_metrics(state.metrics.clone());
 
-    // O-124:改消费流式 ReAct 回路(O-114 delegate 同款修法,bb172b2 先例)——
+    // 改消费流式 ReAct 回路(delegate 同款修法,bb172b2 先例)——
     // 非流式 run() 是单发桥接(LLM 返 tool_calls 即返、工具不执行=能力面假象,
     // s113 实证 success=true+content=""),本端点改为消费 run_streaming 至 Done:
     // 多轮工具回喂在服务端执行完毕后聚合返回,对外 AgentRunResponse 结构零变化。
     // approval 不注入(candidate 缺省拒绝,与 delegate 同款);cancel token 不注册
     // (原 run() 路径亦不可 cancel,行为等价)。
-    // O-125:捕获流中 SessionCreated 的会话 ID,挂工作台本地索引(与 WS 面同
-    // 口径,fail-soft;record 读时去重合并)+ 响应携带 session_id(O-086 收口)。
+    // 捕获流中 SessionCreated 的会话 ID,挂工作台本地索引(与 WS 面同
+    // 口径,fail-soft;record 读时去重合并)+ 响应携带 session_id(会话关联收口)。
     let index_title: String = req.goal.chars().take(60).collect();
     let (result, session_id) = consume_to_done(runner.run_streaming(req.goal)).await;
     if let Some(sid) = &session_id {
@@ -777,7 +777,7 @@ async fn run_agent_stream(
 
     // 用 stream! 包裹,在流入口创建 SseConnectionGuard(RAII),
     // 流结束(正常 / error / 客户端断开)时自动 dec sse_connections。
-    // O-125:SSE 面同挂工作台本地索引(SessionCreated 时机,对齐 ws_handler;
+    // SSE 面同挂工作台本地索引(SessionCreated 时机,对齐 ws_handler;
     // title=goal 截 60 字符;record 自身 fail-soft)。
     let index_title: String = req.goal.chars().take(60).collect();
     let agent_type_for_index = agent_type.clone();
@@ -794,7 +794,7 @@ async fn run_agent_stream(
                     if let Ok(mut map) = store.lock() {
                         map.insert(session_id.clone(), cancel_token.clone());
                     }
-                    // O-125:会话索引落一行(fail-soft,仅展示辅助)
+                    // 会话索引落一行(fail-soft,仅展示辅助)
                     state.session_index().record(
                         &crate::api::session_index::SessionIndexEntry {
                             session_id: session_id.clone(),
@@ -1102,7 +1102,7 @@ struct TranscriptQuery {
 
 /// `GET /api/sessions/{id}/transcript` —— 会话消息历史
 ///
-/// 数据源两级(O-093 定稿):
+/// 数据源两级(快照机制定稿):
 /// 1. **live**(缺省):`MemoryManager` 持久化到 evorule payload 的消息
 ///    (P0 短期记忆持久化,进 FactsLog 审计链);零写入,前缀读 + 同 idx 后写覆盖;
 /// 2. **snapshot**(回落):evorule 会话 30min 闲置 TTL 回收后活投影报
@@ -1144,7 +1144,7 @@ async fn get_transcript(
                 "messages": messages,
             })))
         }
-        // O-093:会话已被 evorule TTL 回收 → 回落本地快照(非权威副本明示)
+        // 会话已被 evorule TTL 回收 → 回落本地快照(非权威副本明示)
         Err(e) if crate::api::snapshots::is_session_gone(&e) => {
             match state.snapshots().load(&session_id) {
                 Some(snap) => Ok(Json(serde_json::json!({
@@ -1203,7 +1203,7 @@ async fn get_evolution_signals(
 }
 
 // =============================================================================
-// O-093:工作台配置(快照保留期)
+// 工作台配置(快照保留期)
 // =============================================================================
 
 /// `GET /api/workbench/config` —— 读取工作台配置(缺文件/损坏 → 缺省 3m)
@@ -1752,7 +1752,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    // ===== O-124 consume_to_done 测试 =====
+    // ===== consume_to_done 测试 =====
 
     type MockStream = std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>>;
 
@@ -1828,7 +1828,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_consume_to_done_captures_session_created() {
-        // O-125:SessionCreated 事件携带的会话 ID 被捕获并随结果返回
+        // SessionCreated 事件携带的会话 ID 被捕获并随结果返回
         let events: Vec<Result<AgentEvent, AgentError>> = vec![
             Ok(AgentEvent::SessionCreated {
                 session_id: "sess-run-1".to_string(),
@@ -1847,7 +1847,7 @@ mod tests {
         assert_eq!(session_id.as_deref(), Some("sess-run-1"));
     }
 
-    // ===== O-116 /version 端点测试 =====
+    // ===== /version 端点测试 =====
 
     #[tokio::test]
     async fn test_version_endpoint() {
@@ -1911,11 +1911,8 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("success"));
-        assert!(
-            json.contains("session_id"),
-            "O-125:会话建立时应携带 session_id"
-        );
-        // O-125:None 时字段整体省略(旧消费者零影响)
+        assert!(json.contains("session_id"), "会话建立时应携带 session_id");
+        // None 时字段整体省略(旧消费者零影响)
         let bare = AgentRunResponse {
             session_id: None,
             ..resp

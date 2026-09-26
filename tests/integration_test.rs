@@ -465,7 +465,7 @@ async fn mock_evorule_base(
     // io_response 兜底。mockito 1.7 匹配优先级（server.rs handle_request）：
     // 「有未满足 expect 的匹配 mock（按创建序）」→ 否则「最后创建的匹配 mock」。
     // 兜底无 expect 恒未满足且创建最早：首个 io_response 请求必落它；
-    // 需按 body 断言的测试应 delete 兜底后自建（见 O-118 回归测试）。
+    // 需按 body 断言的测试应 delete 兜底后自建（见回归测试）。
     server
         .mock(
             "POST",
@@ -590,7 +590,7 @@ async fn test_multi_turn_react_loop_with_tool_call() {
     llm_turn2.assert_async().await;
 }
 
-/// O-118 回归：IoRequest 处理失败时 run() 必须回写 error io_response，
+/// 回归：IoRequest 处理失败时 run() 必须回写 error io_response，
 /// 不留悬挂在途请求。触发器用「LLM 不可达」快速产生 LlmError —— 与 60s
 /// step 超时（AgentConfig.step_timeout 在 execute_external 处包裹）走同一
 /// Err 传播臂，修复前 `r?` 直接上抛、零 io_response，server 侧 io_request
@@ -630,10 +630,10 @@ async fn test_io_request_failure_submits_error_io_response() {
     io_resp_err.assert_async().await;
 }
 
-/// O-113 突变验证（HTTP 层）：LLM 返回 HTTP 401 时 run() 必须如实 Err，
-/// 且 error io_response 先行回写（O-118 契约臂）。401 不可重试 → LlmHandler
+/// 突变验证（HTTP 层）：LLM 返回 HTTP 401 时 run() 必须如实 Err，
+/// 且 error io_response 先行回写（契约臂）。401 不可重试 → LlmHandler
 /// 直接 Err → handle_io_request Err → run() 回写后上抛。委托/workflow 层
-/// 凭 Err 判节点失败——修复前（O-118 前）零 io_response 挂起，绝不允许
+/// 凭 Err 判节点失败——修复前零 io_response 挂起，绝不允许
 /// 回到「静默空成功」。
 #[tokio::test]
 async fn test_llm_http_401_propagates_as_run_error() {
@@ -676,7 +676,7 @@ async fn test_llm_http_401_propagates_as_run_error() {
     io_resp_err.assert_async().await;
 }
 
-/// O-113 突变验证（业务层，修复主验）：OpenAI 兼容端点（MiniMax）对业务层
+/// 突变验证（业务层，修复主验）：OpenAI 兼容端点（MiniMax）对业务层
 /// 错误（无效 key/额度不足）返回 HTTP 200 + `{"base_resp":{"status_code":1004}}`
 /// 错误体（无 choices）。修复前 parse_success_response 对该形态 unwrap 出
 /// 空 content → io_response 正常提交 → Stable 判 success("") → workflow 节点

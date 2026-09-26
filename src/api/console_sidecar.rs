@@ -2,7 +2,7 @@
 //!
 //! 背景:工作台审计 tab 的「在审计页查看」深链指向 console-cloud 审计页
 //! (独立 SvelteKit dev server,缺省 `127.0.0.1:5174`)。该服务未运行时深链
-//! 为死链(O-094 首验实测)。本模块提供配置化自动拉起:`workbench.console_dir`
+//! 为死链(首验实测)。本模块提供配置化自动拉起:`workbench.console_dir`
 //! 配置 console-cloud 仓目录后,serve 启动期探测端口,未监听则以子进程拉起
 //! vite dev;**fail-soft**——目录无效/依赖缺失/端口占用/拉起失败仅告警,
 //! 绝不阻断 serve 主功能;缺省不配置 = 零副作用(公开部署零耦合)。

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! 会话消息本地快照与保留期管理(O-093)—— 展示层持久化
+//! 会话消息本地快照与保留期管理—— 展示层持久化
 //!
 //! ## 三层边界(设计留痕,项目方批准的方案红线)
 //!
@@ -10,7 +10,7 @@
 //!   不写入、不读取任何审计面;
 //! - **回放/时光机器**:引擎自审计链重建,零依赖本快照 —— 不受影响;
 //! - **本快照**:展示层**非权威副本**(文件内嵌 `authoritative:false`),
-//!   服务「evorule 会话 30min 闲置 TTL 回收后历史仍可见」(O-093),
+//!   服务「evorule 会话 30min 闲置 TTL 回收后历史仍可见」,
 //!   按保留期配置可删除;**删除只作用于 `data/snapshots/` 目录,永不越界**。
 //!
 //! ## 日期分片与清理口径
@@ -114,7 +114,7 @@ pub struct WorkbenchConfig {
 
 impl Default for WorkbenchConfig {
     fn default() -> Self {
-        // 缺省 3 个月(项目方批准的 O-093 方案默认值)
+        // 缺省 3 个月(项目方批准的方案默认值)
         Self {
             retention: "3m".to_string(),
         }

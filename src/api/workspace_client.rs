@@ -711,7 +711,7 @@ impl WorkspaceApiClient {
         Ok(result)
     }
 
-    // ===== 批次 W2：bundles 部署闭环（治理域导出，部署链上游） =====
+    // ===== bundles 部署闭环（治理域导出，部署链上游） =====
 
     /// POST /bundles/export — 带真实闸门一证据的导出（T0 决策：POST 承载 tests 数组）
     ///

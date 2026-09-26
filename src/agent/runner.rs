@@ -651,7 +651,7 @@ pub struct AgentRunner {
     /// 外层驱动据此维护 `BudgetCounters.tokens_used` 与 replan 重复执行
     /// token 埋点（D-02 判定数据源）。仅供观测，不改变任何控制流。
     token_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    /// O-120:独立裁决会话通道(file 类工具意图裁决)
+    /// 独立裁决会话通道(file 类工具意图裁决)
     ///
     /// 主会话 call_external 在途时引擎命令串行评估使「主会话提交+轮询」
     /// 恒超时(假拦根因);裁决改走独立 evorule 会话(每会话独立反应器,
@@ -663,7 +663,7 @@ pub struct AgentRunner {
 impl AgentRunner {
     /// TODO: doc
     pub fn new(config: AgentConfig, evorule_client: EvoruleApiClient) -> Self {
-        // O-120:裁决通道与 runner 同源装配(单一事实源——CLI/driver/serve
+        // 裁决通道与 runner 同源装配(单一事实源——CLI/driver/serve
         // 三入口统一,与 M5-a 边界接线同款);agent_type 预取供 initial_content
         let agent_type = config.agent_type.clone();
         let adjudicator_client = evorule_client.clone();
@@ -1341,7 +1341,7 @@ impl AgentRunner {
                     let result = tokio::select! {
                         r = self.handle_io_request(&session_id, &event.payload, &mut messages, &mut tool_calls) => match r {
                             Ok(r) => r,
-                            // O-118:处理失败(60s 超时/LLM 错误/工具错误/内部错误)也必须
+                            // 处理失败(60s 超时/LLM 错误/工具错误/内部错误)也必须
                             // 回写 error io_response —— 否则 server 侧 io_request 永久挂起、
                             // 链实不一致(幽灵在途请求)。与取消分支/流式错误分支/audited_llm
                             // 「失败也回写再返回」同一契约。回写后照旧上抛终止本轮。
@@ -1424,7 +1424,7 @@ impl AgentRunner {
                         .or_else(|| state["payload"].as_str())
                         .unwrap_or_default()
                         .to_string();
-                    // O-113:与流式路径(last_llm_content fallback)对称——payload 读空时
+                    // 与流式路径(last_llm_content fallback)对称——payload 读空时
                     // 回捞本轮最近一次 LLM 输出(非流式单发场景=本会话唯一 LLM 响应)。
                     let content = if content.is_empty() {
                         messages
@@ -1445,7 +1445,7 @@ impl AgentRunner {
                         content
                     };
                     if content.is_empty() {
-                        // O-113:空产出观测补位(不改判 success——合法空响应不误伤)。
+                        // 空产出观测补位(不改判 success——合法空响应不误伤)。
                         // 三联指纹(tokens=0+亚秒+空 content)曾掩盖 LLM 失败假绿,
                         // 此处保证链上观测可见。
                         warn!(%session_id, step_count, "Stable with empty content: possible LLM empty response (tokens_used side-channel in io_response)");
@@ -2010,11 +2010,11 @@ impl AgentRunner {
     /// 第一次调用不带 `approved` flag → 工具可能返回 `needs_approval` proposal。
     /// 第二次调用(审批通过后)带 `approved:true` → 工具直接执行。
     async fn execute_tool_call(&self, tool_name: &str, args: &Value) -> Result<Value, AgentError> {
-        // M5-c/O-120:工具意图裁决(双层防线的外层)——file 类调用先把规范字段
+        // M5-c:工具意图裁决(双层防线的外层)——file 类调用先把规范字段
         // target_scope 随意图指令进链,由协作验收规则 enforce 裁决:
         // 被拦(version 未推进)则不执行工具,向 LLM 返回治理拦截结果;
         // 放行则继续执行,机制层 handler 内联沙箱检查保留为最终防线。
-        // O-120:裁决改走独立裁决会话(AdjudicationChannel)——主会话
+        // 裁决改走独立裁决会话(AdjudicationChannel)——主会话
         // call_external 在途时引擎串行评估使主会话内轮询恒超时(假拦根因),
         // 独立会话裁决不受 io 在途影响(原型 PV2 实测 73ms)。原
         // `if let Some(session_id)` 守卫删除:首轮/续轮统一走裁决通道,
@@ -2824,7 +2824,7 @@ impl AgentRunner {
                 let boundary_json = runner.config.capability_boundary.as_ref().map(|b| b.to_json());
                 match runner.evorule_client.create_session(boundary_json.as_ref()).await {
                     Ok(id) => {
-                        // O-120 伴生缺陷修复:新建分支回填 runner.session_id
+                        // 伴生缺陷修复:新建分支回填 runner.session_id
                         // (裁决通道已不依赖它,但审计一致性/messages 持久化
                         // 等消费方需要;与 continuation 分支对齐)
                         runner.session_id = Some(id.clone());
@@ -3154,7 +3154,7 @@ impl AgentRunner {
                                             finish_reason = resp.finish_reason.clone();
                                             last_llm_content = full_content.clone();
                                             // plan-execute tokens 埋点（流式路径等效累加点，
-                                            // 对齐非流式 run() IoRequest 臂）：O-114 修复后
+                                            // 对齐非流式 run() IoRequest 臂）：
                                             // delegate 改走流式运行，埋点随 token_counter 继续生效
                                             // （流式中间态不提交 io_response，无非流式的 result 侧通道）
                                             if let Some(counter) = &runner.token_counter {
@@ -3242,7 +3242,7 @@ impl AgentRunner {
                                 };
                                 messages.push(assistant_msg.clone());
                                 if let Err(e) = runner.persist_message(&session_id, assistant_idx, assistant_msg).await {
-                                    // O-118:持久化失败也不留悬挂在途 io_request(回写后终止)
+                                    // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                     if let Some(rid) = request_id {
                                         let err_str = e.to_string();
                                         let _ = runner.evorule_client
@@ -3326,7 +3326,7 @@ impl AgentRunner {
                                                     .persist_message(&session_id, messages.len() - 1, err_tool_msg)
                                                     .await
                                                 {
-                                                    // O-118:持久化失败也不留悬挂在途 io_request(回写后终止)
+                                                    // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                                     if let Some(rid) = request_id {
                                                         let pe_str = pe.to_string();
                                                         let _ = runner.evorule_client
@@ -3359,7 +3359,7 @@ impl AgentRunner {
                                         };
                                         messages.push(tool_msg.clone());
                                         if let Err(e) = runner.persist_message(&session_id, tool_idx, tool_msg).await {
-                                            // O-118:持久化失败也不留悬挂在途 io_request(回写后终止)
+                                            // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                             if let Some(rid) = request_id {
                                                 let err_str = e.to_string();
                                                 let _ = runner.evorule_client
@@ -3482,7 +3482,7 @@ impl AgentRunner {
                                 };
                                 messages.push(tool_msg.clone());
                                 if let Err(e) = runner.persist_message(&session_id, tool_idx, tool_msg).await {
-                                    // O-118:持久化失败也不留悬挂在途 io_request(回写后终止)
+                                    // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                     if let Some(rid) = request_id {
                                         let err_str = e.to_string();
                                         let _ = runner.evorule_client

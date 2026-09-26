@@ -352,7 +352,7 @@ impl LlmHandler {
         // (如 MiniMax)对业务层错误(无效 key/额度不足)返回 HTTP 200 + JSON
         // 错误体({"base_resp":{"status_code":1004,...}},无 choices)。若照常
         // 解析,content 会 unwrap 成空串 → runner 侧 Stable 判 success("") →
-        // workflow 节点假绿(O-113)。此处显式转错误。
+        // workflow 节点假绿。此处显式转错误。
         if let Some(base_resp) = json.get("base_resp") {
             let status_code = base_resp.get("status_code").and_then(|v| v.as_i64());
             let is_error = match status_code {

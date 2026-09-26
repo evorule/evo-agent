@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! O-120:裁决通道(AdjudicationChannel)—— file 类工具意图的独立 evorule 会话裁决
+//! 裁决通道(AdjudicationChannel)—— file 类工具意图的独立 evorule 会话裁决
 //!
-//! ## 背景(O-120 本体缺陷)
+//! ## 背景(本体缺陷)
 //! 主会话 ReAct 循环中 call_external 在途时,引擎命令串行评估语义使后续
 //! 命令(含意图 set)仅在 IoResponse 后才被评估——主会话内「提交 + 1s
 //! 轮询 version」的裁决原语恒超时,合法相对路径操作被假拦。引擎侧每会话
@@ -11,7 +11,7 @@
 //! 影响(原型 PV2 实测 73ms 放行);server 级规则集(含 R1)自动覆盖
 //! 裁决会话,PV1 实证 R1 拦截只丢弃指令不推进 version,会话可复用。
 //!
-//! ## 设计(立项档 O-120 §11.1-11.3,四不变式)
+//! ## 设计(四不变式)
 //! - 意图指令形态不变:仍是中性 `set meta_tool.pending_target_scope`
 //!   (机制层生产规范字段、规则层裁决,宪法 §七分工不变);
 //! - R1 规则资产零改动;fail-closed 不变:version 未推进=拦截,传输错误
@@ -34,7 +34,7 @@ use crate::api::evorule_client::EvoruleApiClient;
 const VERDICT_POLLS: usize = 20;
 const VERDICT_INTERVAL_MS: u64 = 50;
 
-/// O-120:裁决通道 —— 每 runner 一条独立 evorule 裁决会话
+/// 裁决通道 —— 每 runner 一条独立 evorule 裁决会话
 pub struct AdjudicationChannel {
     client: EvoruleApiClient,
     /// 裁决会话 id(None = 尚未创建,惰性建;传输错误后 reset 回 None)
@@ -119,7 +119,7 @@ impl AdjudicationChannel {
     /// - 返回 `Ok(true)` = 放行(version 推进);`Ok(false)` = 被 enforce
     ///   拦截(引擎丢弃指令不推进 version);`Err` = 通道故障;
     /// - 传输错误 → `reset()` 重建一次重试 → 仍失败 fail-fast
-    ///   (fail-closed 语义不变,立项档 §11.3)。
+    ///   (fail-closed 语义不变)。
     pub async fn await_verdict(
         &mut self,
         command: &Value,
@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o120_creates_session_lazily_and_allows_on_version_advance() {
+    async fn adjudication_creates_session_lazily_and_allows_on_version_advance() {
         let mut server = mockito::Server::new_async().await;
         let mut ch = AdjudicationChannel::new(make_client(&server), "tester");
 
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o120_reuses_session_across_verdicts() {
+    async fn adjudication_reuses_session_across_verdicts() {
         let mut server = mockito::Server::new_async().await;
         let mut ch = AdjudicationChannel::new(make_client(&server), "tester");
 
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o120_blocks_when_version_stalls() {
+    async fn adjudication_blocks_when_version_stalls() {
         let mut server = mockito::Server::new_async().await;
         let mut ch = AdjudicationChannel::new(make_client(&server), "tester");
 
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o120_resets_and_retries_once_on_transport_error() {
+    async fn adjudication_resets_and_retries_once_on_transport_error() {
         let mut server = mockito::Server::new_async().await;
         let mut ch = AdjudicationChannel::new(make_client(&server), "tester");
 
@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o120_fails_fast_when_retry_also_fails() {
+    async fn adjudication_fails_fast_when_retry_also_fails() {
         let mut server = mockito::Server::new_async().await;
         let mut ch = AdjudicationChannel::new(make_client(&server), "tester");
 
