@@ -9,8 +9,11 @@
 
 import { get } from 'svelte/store';
 import { contextKeys, evaluateWhen } from './context-keys.js';
+import { settingsState, setSetting } from './settings.js';
 
 export const USER_KEYBINDINGS_STORAGE_KEY = 'evo_keybindings';
+/** 键位覆盖层的设置键(存储点统一;serve 端按同口径校验元素契约) */
+export const KEYBINDINGS_OVERRIDES_KEY = 'keybindings.overrides';
 
 /**
  * 默认规则集(次序即优先级,后条遮蔽前条)。
@@ -96,20 +99,15 @@ export function resolveKeybinding(e, rules, ctx = get(contextKeys)) {
   return null;
 }
 
-// ---- 用户覆盖层(localStorage;编辑 UI 归 B6,本层只留数据与读取) ----
+// ---- 用户覆盖层(设置键 keybindings.overrides;旧 localStorage 层已退役,见 migrateKeybindings) ----
 
 function userBindingsUnsafe() {
-  if (typeof localStorage === 'undefined') return [];
-  try {
-    const raw = JSON.parse(localStorage.getItem(USER_KEYBINDINGS_STORAGE_KEY) || '[]');
-    if (!Array.isArray(raw)) return [];
-    return raw
-      .filter((r) => r && typeof r.key === 'string' && typeof r.command === 'string')
-      .map((r) => ({ key: parseKeybinding(r.key), command: r.command, when: r.when || '' }))
-      .filter((r) => r.key !== null);
-  } catch {
-    return [];
-  }
+  const overrides = get(settingsState).settings[KEYBINDINGS_OVERRIDES_KEY];
+  if (!Array.isArray(overrides)) return [];
+  return overrides
+    .filter((r) => r && typeof r.key === 'string' && typeof r.command === 'string')
+    .map((r) => ({ key: parseKeybinding(r.key), command: r.command, when: r.when || '' }))
+    .filter((r) => r.key !== null);
 }
 
 /** 有效规则集:默认规则 + 用户覆盖(追加在后 = 遮蔽默认)。 */
@@ -117,22 +115,49 @@ export function getEffectiveRules() {
   return DEFAULT_KEYBINDINGS.concat(userBindingsUnsafe());
 }
 
-/** 写入用户覆盖层(B6 编辑 UI 的数据落点;格式 [{key, command}],非法条目丢弃) */
-export function saveUserBindings(list) {
-  if (typeof localStorage === 'undefined') return;
-  localStorage.setItem(
-    USER_KEYBINDINGS_STORAGE_KEY,
-    JSON.stringify(
-      (Array.isArray(list) ? list : []).filter(
+/**
+ * 一次性迁移:旧 localStorage 覆盖层 → 设置键。有内容则写入设置
+ * (成功后清旧键;写入失败/服务不可达保留旧键,下次启动重试)。
+ * 旧层为空或损坏视为无有效内容,直接清旧键收尾(旧层已退役)。幂等。
+ */
+export async function migrateKeybindings() {
+  if (typeof localStorage === 'undefined') return false;
+  let raw = null;
+  try {
+    raw = localStorage.getItem(USER_KEYBINDINGS_STORAGE_KEY);
+  } catch {
+    return false;
+  }
+  if (raw == null) return false;
+  let list = [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      list = parsed.filter(
         (r) =>
           r &&
           typeof r.key === 'string' &&
           r.key.trim() &&
           typeof r.command === 'string' &&
           r.command.trim(),
-      ),
-    ),
-  );
+      );
+    }
+  } catch {
+    list = [];
+  }
+  if (list.length > 0) {
+    try {
+      await setSetting(KEYBINDINGS_OVERRIDES_KEY, list);
+    } catch {
+      return false; // 保留旧键待重试
+    }
+  }
+  try {
+    localStorage.removeItem(USER_KEYBINDINGS_STORAGE_KEY);
+  } catch {
+    /* 清理失败不影响迁移结果 */
+  }
+  return list.length > 0;
 }
 
 /** 命令的生效键位(提示列显示):规则表自底向上找该命令的首条绑定;无则回退注册默认键。 */

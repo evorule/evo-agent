@@ -1,16 +1,37 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+vi.mock('../src/lib/api.js', () => ({
+  getWorkbenchSettings: vi.fn(),
+  getWorkbenchSettingsSchema: vi.fn(),
+  putWorkbenchSetting: vi.fn(),
+  writeFile: vi.fn(),
+}));
+
 import {
   parseKeybinding,
   normalizeKeyEvent,
   formatKey,
   resolveKeybinding,
   getEffectiveRules,
-  saveUserBindings,
+  migrateKeybindings,
   getEffectiveKeybinding,
   DEFAULT_KEYBINDINGS,
+  USER_KEYBINDINGS_STORAGE_KEY,
+  KEYBINDINGS_OVERRIDES_KEY,
 } from '../src/lib/keybindings.js';
+import { settingsState } from '../src/lib/settings.js';
+import { putWorkbenchSetting } from '../src/lib/api.js';
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  settingsState.set({ entries: [], settings: {}, sources: {}, degraded: false, loaded: false });
+});
+
+afterEach(() => {
+  delete globalThis.localStorage;
+});
 
 describe('parseKeybinding', () => {
   it('已规范的串原样通过', () => {
@@ -105,11 +126,7 @@ describe('resolveKeybinding(自底向上首条命中)', () => {
   });
 });
 
-describe('用户覆盖层', () => {
-  afterEach(() => {
-    delete globalThis.localStorage;
-  });
-
+describe('用户覆盖层(设置键)', () => {
   function withLocalStorage() {
     const map = new Map();
     globalThis.localStorage = {
@@ -120,13 +137,18 @@ describe('用户覆盖层', () => {
     return map;
   }
 
-  it('无 localStorage 时有效规则 = 默认规则(降级安全)', () => {
+  it('无覆盖时有效规则 = 默认规则', () => {
     expect(getEffectiveRules()).toEqual(DEFAULT_KEYBINDINGS);
   });
 
   it('覆盖层追加在默认规则之后 = 遮蔽默认键位', () => {
-    withLocalStorage();
-    saveUserBindings([{ key: 'ctrl+b', command: 'user.toggle' }]);
+    settingsState.set({
+      entries: [],
+      settings: { [KEYBINDINGS_OVERRIDES_KEY]: [{ key: 'ctrl+b', command: 'user.toggle' }] },
+      sources: {},
+      degraded: false,
+      loaded: true,
+    });
     const rules = getEffectiveRules();
     expect(rules.length).toBe(DEFAULT_KEYBINDINGS.length + 1);
     expect(rules[rules.length - 1].command).toBe('user.toggle');
@@ -134,20 +156,74 @@ describe('用户覆盖层', () => {
     expect(getEffectiveKeybinding('user.toggle', rules)).toBe('Ctrl+B');
   });
 
-  it('saveUserBindings 过滤非法条目', () => {
-    const map = withLocalStorage();
-    saveUserBindings([
-      { key: 'ctrl+1', command: 'ok.cmd' },
-      { key: '', command: 'bad' },
-      null,
-      { key: 'ctrl+2' },
-    ]);
-    const saved = JSON.parse(map.get('evo_keybindings'));
-    expect(saved).toEqual([{ key: 'ctrl+1', command: 'ok.cmd' }]);
+  it('覆盖层非法条目过滤(key 不可解析丢弃)', () => {
+    settingsState.set({
+      entries: [],
+      settings: {
+        [KEYBINDINGS_OVERRIDES_KEY]: [{ key: 'ctrl+1', command: 'ok.cmd' }, null, { key: '', command: 'bad' }],
+      },
+      sources: {},
+      degraded: false,
+      loaded: true,
+    });
+    const rules = getEffectiveRules();
+    expect(rules.length).toBe(DEFAULT_KEYBINDINGS.length + 1);
+    expect(rules[rules.length - 1].key).toBe('ctrl+1');
+  });
+});
+
+describe('migrateKeybindings(旧层一次性迁移)', () => {
+  function withLocalStorage() {
+    const map = new Map();
+    globalThis.localStorage = {
+      getItem: (k) => (map.has(k) ? map.get(k) : null),
+      setItem: (k, v) => map.set(k, v),
+      removeItem: (k) => map.delete(k),
+    };
+    return map;
+  }
+
+  it('无旧键 → 不迁移', async () => {
+    withLocalStorage();
+    expect(await migrateKeybindings()).toBe(false);
+    expect(putWorkbenchSetting).not.toHaveBeenCalled();
   });
 
-  it('损坏的存储内容降级为空覆盖层', () => {
-    withLocalStorage().set('evo_keybindings', '{broken json');
-    expect(getEffectiveRules()).toEqual(DEFAULT_KEYBINDINGS);
+  it('有旧键 → 写设置键+清旧键,非法条目丢弃', async () => {
+    putWorkbenchSetting.mockResolvedValue({ key: KEYBINDINGS_OVERRIDES_KEY, value: [], source: 'user' });
+    const map = withLocalStorage();
+    map.set(
+      USER_KEYBINDINGS_STORAGE_KEY,
+      JSON.stringify([{ key: 'ctrl+b', command: 'user.toggle' }, { key: '', command: 'bad' }]),
+    );
+    expect(await migrateKeybindings()).toBe(true);
+    expect(putWorkbenchSetting).toHaveBeenCalledWith(KEYBINDINGS_OVERRIDES_KEY, [
+      { key: 'ctrl+b', command: 'user.toggle' },
+    ]);
+    expect(map.has(USER_KEYBINDINGS_STORAGE_KEY)).toBe(false);
+  });
+
+  it('写入失败 → 旧键保留待重试', async () => {
+    putWorkbenchSetting.mockRejectedValue(new Error('down'));
+    const map = withLocalStorage();
+    map.set(USER_KEYBINDINGS_STORAGE_KEY, JSON.stringify([{ key: 'ctrl+b', command: 'user.toggle' }]));
+    expect(await migrateKeybindings()).toBe(false);
+    expect(map.has(USER_KEYBINDINGS_STORAGE_KEY)).toBe(true);
+  });
+
+  it('损坏旧层 → 视为无有效内容,清旧键不写设置', async () => {
+    const map = withLocalStorage();
+    map.set(USER_KEYBINDINGS_STORAGE_KEY, '{broken json');
+    expect(await migrateKeybindings()).toBe(false);
+    expect(putWorkbenchSetting).not.toHaveBeenCalled();
+    expect(map.has(USER_KEYBINDINGS_STORAGE_KEY)).toBe(false);
+  });
+
+  it('空数组旧层 → 清旧键不写设置', async () => {
+    const map = withLocalStorage();
+    map.set(USER_KEYBINDINGS_STORAGE_KEY, '[]');
+    expect(await migrateKeybindings()).toBe(false);
+    expect(putWorkbenchSetting).not.toHaveBeenCalled();
+    expect(map.has(USER_KEYBINDINGS_STORAGE_KEY)).toBe(false);
   });
 });

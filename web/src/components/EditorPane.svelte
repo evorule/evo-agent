@@ -105,6 +105,7 @@
   function modelFor(tab) {
     if (models.has(tab.path)) return models.get(tab.path);
     const model = monaco.editor.createModel(tab.content, langOf(tab.path));
+    model.updateOptions({ tabSize: tabSizeValue() });
     baseline.set(tab.path, tab.content);
     models.set(tab.path, model);
     return model;
@@ -113,6 +114,7 @@
   function draftModelFor(artifact) {
     if (draftModels.has(artifact.path)) return draftModels.get(artifact.path);
     const model = monaco.editor.createModel(artifact.draftContent, langOf(artifact.path));
+    model.updateOptions({ tabSize: tabSizeValue() });
     draftModels.set(artifact.path, model);
     return model;
   }
@@ -156,15 +158,47 @@
     savedJsonDiagnostics = null;
   }
 
+  // ---- 设置消费:编辑器外观与行为由设置快照下发(默认值=原硬编码行为) ----
+
+  /** tabSize 当前值(model 级选项) */
+  function tabSizeValue() {
+    const v = get(settingsState).settings['editor.tabSize'];
+    return typeof v === 'number' ? v : 4;
+  }
+
+  /** 实例级 options 的当前设置面(theme/fontSize/minimap/wordWrap) */
+  function appearanceOptions() {
+    const s = get(settingsState).settings;
+    return {
+      theme: s['workbench.theme'] || 'evorule-dark',
+      fontSize: typeof s['editor.fontSize'] === 'number' ? s['editor.fontSize'] : 14,
+      minimap: { enabled: s['editor.minimap'] != null ? !!s['editor.minimap'] : false },
+      wordWrap: s['editor.wordWrap'] === 'on' ? 'on' : 'off',
+    };
+  }
+
+  /** 设置快照变化 → 实例 options 全量下发 + 遍历现存 model 同步 tabSize */
+  function applySettingsToEditors() {
+    const o = appearanceOptions();
+    const ts = tabSizeValue();
+    if (editor) editor.updateOptions({ ...o });
+    if (diffEditor) diffEditor.updateOptions({ ...o });
+    for (const m of models.values()) m.updateOptions({ tabSize: ts });
+    for (const m of draftModels.values()) m.updateOptions({ tabSize: ts });
+    if (welcomeModel) welcomeModel.updateOptions({ tabSize: ts });
+  }
+
   function ensureDiffEditor() {
     if (!diffEditor) {
+      const o = appearanceOptions();
       diffEditor = monaco.editor.createDiffEditor(diffEl, {
-        theme: 'evorule-dark',
+        theme: o.theme,
+        fontSize: o.fontSize,
+        minimap: o.minimap,
+        wordWrap: o.wordWrap,
         automaticLayout: true,
-        fontSize: 14,
         fontFamily: '"JetBrains Mono", Consolas, monospace',
         lineHeight: 22,
-        minimap: { enabled: false },
         renderLineHighlight: 'none',
         scrollBeyondLastLine: false,
         renderSideBySide: true,
@@ -263,15 +297,18 @@
   onMount(() => {
     setupMonaco();
     welcomeModel = monaco.editor.createModel(welcomeText, 'markdown');
+    welcomeModel.updateOptions({ tabSize: tabSizeValue() });
+    const o = appearanceOptions();
     editor = monaco.editor.create(editorEl, {
       model: welcomeModel,
-      theme: 'evorule-dark',
+      theme: o.theme,
+      fontSize: o.fontSize,
+      minimap: o.minimap,
+      wordWrap: o.wordWrap,
       readOnly: false,
       automaticLayout: true,
-      fontSize: 14,
       fontFamily: '"JetBrains Mono", Consolas, monospace',
       lineHeight: 22,
-      minimap: { enabled: false },
       lineNumbers: 'on',
       renderLineHighlight: 'none',
       scrollBeyondLastLine: false,
@@ -307,10 +344,14 @@
       diffOn = false; // 切 tab 回到编辑模式
       renderActive(p);
     });
+    const unsubSettings = settingsState.subscribe(() => {
+      if (editor) applySettingsToEditors();
+    });
     return () => {
       unregisterCommand('workbench.action.file.save');
       unregisterCommand('editor.action.toggleDiff');
       if (unsubActive) unsubActive();
+      unsubSettings();
     };
   });
 
