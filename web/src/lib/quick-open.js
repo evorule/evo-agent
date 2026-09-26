@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-// 快速打开(B1 PR#4):工作区文件索引 + 最近打开文件。
+// 快速打开:工作区文件索引 + 最近打开文件。
 //
-// collectFiles 递归走 listDir 目录树,护栏(00-立项方案 裁决 7):
+// collectFiles 递归走 listDir 目录树,护栏:
 //   - skip 名单:依赖/产物/隐藏目录不入索引
 //   - 条目上限 500:大仓库防面板卡顿
 //   - 失败静默降级:单层列表失败跳过该层,整体返回已收集部分(面板仍可用 tabs+recent)

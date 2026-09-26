@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // 上下文键:键位 when 条件与命令可见性的求值依据。
-// v1 裁剪(02 号 §3.4):求值仅支持 !/&&/|| 切分,完整 context key 表达式语法留 v2。
+// v1 裁剪:求值仅支持 !/&&/|| 切分,完整 context key 表达式语法留 v2。
 
 import { writable } from 'svelte/store';
 import { tabs, sessionId } from './stores.js';

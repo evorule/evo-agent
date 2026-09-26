@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-// 轻量模糊匹配(02 号 §3.2:子序列 + 连续命中加分,自实现不引库)。
+// 轻量模糊匹配(子序列 + 连续命中加分,自实现不引库)。
 // fuzzyMatch 返回命中的字符位置(供面板高亮)与评分(供排序);
 // highlightSegments 把位置切分为渲染片段。
 

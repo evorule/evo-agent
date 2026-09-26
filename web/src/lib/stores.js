@@ -248,7 +248,7 @@ export function markFinalized(path) {
   });
 }
 
-// ---- 命令基础设施(B1):视图显隐 + 命令面板状态 ----
+// ---- 命令基础设施:视图显隐 + 命令面板状态 ----
 
 /** 文件树显隐(Ctrl+B;display 切换保留组件状态,不销毁重建) */
 export const explorerVisible = writable(true);

@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 EvoRule Project -->
-<!-- 命令面板(B1):Ctrl+Shift+P 命令模式 / Ctrl+P 文件模式,同一面板两数据源。
+<!-- 命令面板:Ctrl+Shift+P 命令模式 / Ctrl+P 文件模式,同一面板两数据源。
      键盘导航(↑↓ 循环/Home/End/Enter/Esc)+ 焦点陷阱 + combobox/listbox 语义;
      命令模式含 recently used 置顶(localStorage 上限 10)与快捷键提示列;
      文件模式数据源:最近打开(recent files)+ 已开 tab + 工作区文件索引(走树,

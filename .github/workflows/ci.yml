@@ -4,6 +4,7 @@
 # - lint: cargo fmt --check + cargo clippy (all targets)
 # - verify: verify.ps1 on Linux + Windows (build + test + secret scan
 #   + dependency-contract assertion) and doc tests
+# - web-test: workbench frontend unit tests (vitest)
 # - doc-safety: 公开面文档安全门禁 (scripts/check_doc_safety.py)
 #
 # Notes:
@@ -69,7 +70,31 @@ jobs:
         run: cargo test --doc
 
   # ==========================================================================
-  # doc-safety：公开面文档安全门禁（与主仓 CI 同型）。
+  # web-test：工作台前端单测门禁（vitest,与 Rust 面同门禁）。
+  # ==========================================================================
+  web-test:
+    name: web unit tests (vitest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: vitest run
+        run: npm test
+
+  # ==========================================================================
+  # doc-safety：公开面文档安全门禁 (与主仓 CI 同型)。
   # R-门控1 (staged 检查) 在 CI 无暂存区语义自动为空集, 不影响其余规则。
   # ==========================================================================
   doc-safety:

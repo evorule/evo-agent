@@ -19,7 +19,7 @@
     { id: 'memory', label: '记忆', disabled: true, tip: '记忆面板在后续阶段接入' },
   ];
 
-  // 开合状态已提升为全局 store(命令面板 Ctrl+J 可切换;B1 命令基础设施)
+  // 开合状态已提升为全局 store(命令面板 Ctrl+J 可切换)
   let activeTab = 'output';
   let bodyHeight = 180; // 面板体高度(sash 拖拽可调,px)
   let listEl = null;
