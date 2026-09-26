@@ -14,7 +14,7 @@
     openFile,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession } from '../lib/ws.js';
-  import { getWorkbenchConfig, putWorkbenchConfig, approveProposal } from '../lib/api.js';
+  import { approveProposal } from '../lib/api.js';
   import { onMount } from 'svelte';
 
   // Svelte 5:组件用了 $effect 等 rune 即进入 runes 模式,
@@ -22,29 +22,10 @@
   let draft = $state('');
   let listEl = $state(null);
   let showHistory = $state(false);
-  // O-093:快照保留期(serve 侧持久化;null = 未加载)
-  let retention = $state(null);
-  let retentionMsg = $state('');
 
   onMount(() => {
     refreshSessions();
-    getWorkbenchConfig()
-      .then((c) => (retention = c.retention))
-      .catch(() => {});
   });
-
-  // 保留期变更:保存到 serve(原子写;清理任务下次 tick 按新值执行)
-  async function changeRetention(e) {
-    const v = e.target.value;
-    retentionMsg = '';
-    try {
-      const res = await putWorkbenchConfig(v);
-      retention = res.retention;
-      retentionMsg = '已保存';
-    } catch (err) {
-      retentionMsg = String(err?.message || err);
-    }
-  }
 
   function fmtTime(unix) {
     if (!unix) return '';
@@ -113,18 +94,6 @@
   </div>
 
   {#if showHistory}
-    <div class="retention-row">
-      <label for="retention-sel">快照保留</label>
-      <select id="retention-sel" value={retention ?? '3m'} onchange={changeRetention}>
-        <option value="1d">1 天</option>
-        <option value="1m">1 个月</option>
-        <option value="3m">3 个月</option>
-        <option value="6m">半年</option>
-        <option value="1y">1 年</option>
-        <option value="forever">长期保留</option>
-      </select>
-      {#if retentionMsg}<span class="retention-msg">{retentionMsg}</span>{/if}
-    </div>
     <div class="session-list">
       {#if $sessions.length === 0}
         <div class="session-empty">暂无历史会话</div>
@@ -282,31 +251,6 @@
   .header-actions {
     display: flex;
     gap: var(--sp-xs);
-  }
-  .retention-row {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-sm);
-    padding: var(--sp-xs) var(--sp-md);
-    border-bottom: 1px solid var(--border);
-    font-size: var(--fs-xs);
-    color: var(--text-secondary);
-    flex-shrink: 0;
-  }
-  .retention-row label {
-    white-space: nowrap;
-  }
-  .retention-row select {
-    font-size: var(--fs-xs);
-    padding: 2px var(--sp-xs);
-    border-radius: var(--r-sm);
-    border: 1px solid var(--border);
-    background: var(--sidebar-bg);
-    color: var(--text-primary);
-  }
-  .retention-msg {
-    font-size: var(--fs-xs);
-    color: var(--brand);
   }
   .session-list {
     flex-shrink: 0;

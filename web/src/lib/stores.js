@@ -173,6 +173,27 @@ export async function saveTab(path, content) {
   }
 }
 
+/** 设置页虚拟路径(特殊 tab,非文件;EditorPane 按 kind 渲染设置组件) */
+export const SETTINGS_TAB_PATH = 'evo://settings';
+
+/** 打开设置页(特殊 tab;已开则激活) */
+export function openSettingsTab() {
+  let existing = null;
+  tabs.update((list) => {
+    existing = findTab(list, SETTINGS_TAB_PATH) || null;
+    return list;
+  });
+  if (existing) {
+    activePath.set(SETTINGS_TAB_PATH);
+    return;
+  }
+  tabs.update((list) => [
+    ...list,
+    { path: SETTINGS_TAB_PATH, kind: 'settings', name: '设置', content: '', dirty: false, error: null },
+  ]);
+  activePath.set(SETTINGS_TAB_PATH);
+}
+
 // ---- 产物协作编辑阶段(S4):agent 草稿 → 人定稿 ----
 //
 // 语义边界(立项设计阶段澄清,项目方默认接受):「agent 草稿 vs 人定稿」为工作台
