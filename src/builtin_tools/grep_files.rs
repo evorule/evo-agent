@@ -1362,18 +1362,20 @@ mod tests {
         let mut args = replace_args("needle", "x");
         args["apply"] = json!(true);
         let (tx, rx) = std::sync::mpsc::channel();
-        let path = dir.path().to_path_buf();
-        let handle = std::thread::spawn(move || {
-            let out = replace(&path, args).unwrap();
-            let _ = tx.send(out);
-        });
-        // 主线程占住全局树写锁 → apply 必须被阻塞(锁互斥)
+        // 主线程先占住全局树写锁(必须先于 spawn:若 spawn 在前,apply 线程可能
+        // 抢先拿锁并完成替换,断言即成竞态——2026-09-26 CI ubuntu 复现实锤)
         let guard = loop {
             if let Ok(g) = crate::builtin_tools::fs_safety::tree_mutation_lock().try_lock() {
                 break g;
             }
             std::thread::sleep(Duration::from_millis(20));
         };
+        let path = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let out = replace(&path, args).unwrap();
+            let _ = tx.send(out);
+        });
+        // 锁在握:留足调度余量;若 apply 未被锁阻塞则早已完成,断言即翻红
         std::thread::sleep(Duration::from_millis(300));
         assert!(
             rx.try_recv().is_err(),
