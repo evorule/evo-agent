@@ -6,7 +6,7 @@
      实装 tab:输出(WS 系统事件流水)/ 审计(治理事件流 + console 审计页深链);
      其余为占位禁用(tooltip 注明去向)。纯展示层状态,不落盘、不冒充审计链。 -->
 <script>
-  import { sysEvents, govEvents, sessionId } from '../lib/stores.js';
+  import { sysEvents, govEvents, sessionId, panelVisible } from '../lib/stores.js';
 
   // tabs:标准 IDE 标配 4 + evorule 专有 3(设计输入见立项文档)
   const tabs = [
@@ -19,7 +19,7 @@
     { id: 'memory', label: '记忆', disabled: true, tip: '记忆面板在后续阶段接入' },
   ];
 
-  let open = false;
+  // 开合状态已提升为全局 store(命令面板 Ctrl+J 可切换;B1 命令基础设施)
   let activeTab = 'output';
   let bodyHeight = 180; // 面板体高度(sash 拖拽可调,px)
   let listEl = null;
@@ -29,12 +29,12 @@
 
   function clickTab(t) {
     if (t.disabled) return;
-    if (activeTab === t.id && open) {
-      open = false; // VS Code 惯例:再点激活 tab 折叠面板
+    if (activeTab === t.id && $panelVisible) {
+      panelVisible.set(false); // VS Code 惯例:再点激活 tab 折叠面板
       return;
     }
     activeTab = t.id;
-    open = true;
+    panelVisible.set(true);
   }
 
   // ---- sash 拖拽调高(向上拉升/向下拉低) ----
@@ -55,7 +55,7 @@
     if (!dragState) return;
     const delta = dragState.startY - e.clientY; // 向上拖 = 变高
     bodyHeight = clampHeight(dragState.startH + delta);
-    open = true;
+    panelVisible.set(true);
   }
 
   function onDragEnd() {
@@ -66,15 +66,15 @@
 
   function onSashKeydown(e) {
     if (e.key === 'ArrowUp') {
-      bodyHeight = clampHeight((open ? bodyHeight : MIN_H) + 20);
-      open = true;
+      bodyHeight = clampHeight(($panelVisible ? bodyHeight : MIN_H) + 20);
+      panelVisible.set(true);
       e.preventDefault();
     } else if (e.key === 'ArrowDown') {
-      bodyHeight = clampHeight((open ? bodyHeight : MIN_H) - 20);
-      open = true;
+      bodyHeight = clampHeight(($panelVisible ? bodyHeight : MIN_H) - 20);
+      panelVisible.set(true);
       e.preventDefault();
     } else if (e.key === 'Enter' || e.key === ' ') {
-      open = !open;
+      panelVisible.update((v) => !v);
       e.preventDefault();
     }
   }
@@ -118,12 +118,12 @@
   }
 </script>
 
-<div class="bottom-panel" class:open>
+<div class="bottom-panel" class:open={$panelVisible}>
   <div
     class="sash"
     role="separator"
     aria-orientation="horizontal"
-    aria-expanded={open}
+    aria-expanded={$panelVisible}
     tabindex="0"
     title="拖拽调整面板高度"
     onmousedown={onSashMousedown}
@@ -133,7 +133,7 @@
     {#each tabs as t (t.id)}
       <button
         class="tab"
-        class:active={open && activeTab === t.id}
+        class:active={$panelVisible && activeTab === t.id}
         disabled={t.disabled}
         title={t.tip || t.label}
         onclick={() => clickTab(t)}
@@ -142,13 +142,13 @@
       </button>
     {/each}
     <div class="tab-actions">
-      <button class="collapse-btn" onclick={() => (open = !open)} aria-expanded={open} title={open ? '折叠面板' : '展开面板'}>
-        {open ? '▾' : '▴'}
+      <button class="collapse-btn" onclick={() => panelVisible.update((v) => !v)} aria-expanded={$panelVisible} title={$panelVisible ? '折叠面板' : '展开面板'}>
+        {$panelVisible ? '▾' : '▴'}
       </button>
     </div>
   </div>
 
-  {#if open}
+  {#if $panelVisible}
     <div class="panel-body" bind:this={listEl} style={`height:${bodyHeight}px`}>
       {#if activeTab === 'output'}
         {#if $sysEvents.length === 0}
