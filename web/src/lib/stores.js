@@ -248,6 +248,34 @@ export function markFinalized(path) {
   });
 }
 
+// ---- 命令基础设施(B1):视图显隐 + 命令面板状态 ----
+
+/** 文件树显隐(Ctrl+B;display 切换保留组件状态,不销毁重建) */
+export const explorerVisible = writable(true);
+
+/** 对话侧栏显隐(Ctrl+Alt+C) */
+export const chatVisible = writable(true);
+
+/** 底部面板开合(Ctrl+J;自 BottomPanel 组件内状态提升,命令层可切换) */
+export const panelVisible = writable(false);
+
+/** 命令面板开合(Ctrl+Shift+P / Ctrl+P) */
+export const paletteOpen = writable(false);
+
+/** 命令面板模式:commands = 命令(Ctrl+Shift+P);files = 文件/会话(Ctrl+P) */
+export const paletteMode = writable('commands');
+
+/** 打开命令面板(统一入口:置模式再开) */
+export function openPalette(mode = 'commands') {
+  paletteMode.set(mode);
+  paletteOpen.set(true);
+}
+
+/** 关闭命令面板 */
+export function closePalette() {
+  paletteOpen.set(false);
+}
+
 // ---- 治理叠加阶段:事件流水(底部面板)+ 治理徽标 ----
 
 const EVENT_CAP = 500; // 环形缓冲上限,防长会话内存膨胀

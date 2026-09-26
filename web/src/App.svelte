@@ -1,30 +1,110 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 EvoRule Project -->
 <!-- 工作台布局底盘(Trae 范式):
-     顶栏 / 左活动栏+侧面板(文件树) / 中编辑器群+底部面板 / 右对话侧栏 -->
+     顶栏 / 左活动栏+侧面板(文件树) / 中编辑器群+底部面板 / 右对话侧栏。
+     B1 命令基础设施:全局键位路由(规则表解析→命令执行) + 命令面板挂载 +
+     视图显隐状态(display 切换,保留组件状态)。Monaco 已处理键不冒泡到 window,
+     「编辑器内 Monaco 优先、全局规则兜底」自然成立(设计见 02 号 §3.5)。 -->
 <script>
+  import { onMount, onDestroy } from 'svelte';
+  import { get } from 'svelte/store';
   import TitleBar from './components/TitleBar.svelte';
   import ActivityBar from './components/ActivityBar.svelte';
   import Explorer from './components/Explorer.svelte';
   import EditorPane from './components/EditorPane.svelte';
   import BottomPanel from './components/BottomPanel.svelte';
   import ChatSidebar from './components/ChatSidebar.svelte';
+  import CommandPalette from './components/CommandPalette.svelte';
   import { reconnectFromStorage } from './lib/ws.js';
+  import {
+    explorerVisible,
+    chatVisible,
+    panelVisible,
+    paletteOpen,
+    openPalette,
+  } from './lib/stores.js';
+  import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
+  import { initContextTracking } from './lib/context-keys.js';
+  import { getEffectiveRules, resolveKeybinding } from './lib/keybindings.js';
 
   reconnectFromStorage();
+
+  // 本组件注册的命令(卸载时注销;同 id 重复注册=覆盖,热替换安全)
+  const OWNED_COMMANDS = [
+    'workbench.action.showCommands',
+    'workbench.action.view.toggleExplorer',
+    'workbench.action.view.toggleChat',
+    'workbench.action.view.togglePanel',
+  ];
+  let cleanupTracking = null;
+
+  onMount(() => {
+    registerCommand({
+      id: 'workbench.action.showCommands',
+      title: '显示全部命令',
+      category: '帮助',
+      keybinding: 'ctrl+shift+p',
+      run: () => openPalette('commands'),
+    });
+    registerCommand({
+      id: 'workbench.action.view.toggleExplorer',
+      title: '切换文件树',
+      category: '视图',
+      keybinding: 'ctrl+b',
+      run: () => explorerVisible.update((v) => !v),
+    });
+    registerCommand({
+      id: 'workbench.action.view.toggleChat',
+      title: '切换对话侧栏',
+      category: '视图',
+      keybinding: 'ctrl+alt+c',
+      run: () => chatVisible.update((v) => !v),
+    });
+    registerCommand({
+      id: 'workbench.action.view.togglePanel',
+      title: '切换底部面板',
+      category: '视图',
+      keybinding: 'ctrl+j',
+      run: () => panelVisible.update((v) => !v),
+    });
+    cleanupTracking = initContextTracking();
+    return () => {
+      for (const id of OWNED_COMMANDS) unregisterCommand(id);
+      if (cleanupTracking) cleanupTracking();
+    };
+  });
+
+  /** 全局键位路由:面板打开时让位(面板内部导航);其余按规则表分发。
+   *  规则命中但命令未注册(后续批次才落)时仅吞键不执行。 */
+  function onGlobalKeydown(e) {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (get(paletteOpen)) return;
+    const rule = resolveKeybinding(e, getEffectiveRules());
+    if (rule) {
+      e.preventDefault();
+      if (getCommand(rule.command)) executeCommand(rule.command);
+    }
+  }
 </script>
+
+<svelte:window on:keydown={onGlobalKeydown} />
 
 <div class="app">
   <TitleBar />
   <div class="main">
     <ActivityBar />
-    <Explorer />
+    <div style:display={$explorerVisible ? 'contents' : 'none'}>
+      <Explorer />
+    </div>
     <div class="center">
       <EditorPane />
       <BottomPanel />
     </div>
-    <ChatSidebar />
+    <div style:display={$chatVisible ? 'contents' : 'none'}>
+      <ChatSidebar />
+    </div>
   </div>
+  <CommandPalette />
 </div>
 
 <style>
