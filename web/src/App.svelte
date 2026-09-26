@@ -33,7 +33,7 @@
   import { loadSettings } from './lib/settings.js';
   import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
   import { initContextTracking } from './lib/context-keys.js';
-  import { getEffectiveRules, resolveKeybinding } from './lib/keybindings.js';
+  import { getEffectiveRules, resolveKeybinding, migrateKeybindings } from './lib/keybindings.js';
 
   reconnectFromStorage();
 
@@ -143,6 +143,7 @@
       run: () => openSettingsJson('user'),
     });
     loadSettings(); // 设置快照加载(失败降级缓存只读;编辑器参数订阅在 EditorPane)
+    migrateKeybindings(); // 旧键位覆盖层一次性迁移(失败保留旧键,下次启动重试)
     cleanupTracking = initContextTracking();
     return () => {
       for (const id of OWNED_COMMANDS) unregisterCommand(id);
