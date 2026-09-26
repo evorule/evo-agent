@@ -124,7 +124,12 @@ impl FileDeleteTool {
         let dest = fs_safety::trash_destination(&trash_dir, &name);
 
         if let Err(rename_err) = std::fs::rename(&source, &dest) {
-            // 跨盘 fallback:递归 copy 进回收目录 + 删源
+            // 跨盘/锁占用 fallback:递归 copy 进回收目录 + 删源。
+            // 两段式恢复语义(实测留痕):copy 先行,任何失败点 trash 都有完整
+            // 快照——copy 失败则整体失败无副作用;copy 成功而 remove 失败
+            // (如源文件被占用,Windows os error 32)则报错返回但 trash 已有
+            // 完整副本,源残留,无数据丢失路径。重复尝试的失败副本按时间戳
+            // 落点不撞名,累积的是恢复点而非垃圾。
             fs_safety::copy_recursive(&source, &dest)
                 .map_err(|e| format!("soft-delete failed (rename: {rename_err}; fallback: {e})"))?;
             fs_safety::remove_recursive(&source)
