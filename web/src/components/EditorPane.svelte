@@ -3,12 +3,14 @@
 <!-- 编辑器群(Monaco):多 tab + 打开/编辑/保存(文件 REST 面,file_write 同通道)。
      每文件一个 Monaco model(保留 undo 栈),切换即 setModel;Ctrl+S 保存落盘。
      S4 产物协作:agent file_write 产物自动打开,含草稿基线时可切 diff 视图
-     (左=agent 草稿,右=当前可编辑);保存即定稿(工作台层留痕,见 stores.js)。 -->
+     (左=agent 草稿,右=当前可编辑);保存即定稿(工作台层留痕,见 stores.js)。
+     设置页为特殊 tab(kind:settings):不建 Monaco model,渲染 SettingsEditor 组件。 -->
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
   import { setupMonaco, monaco } from '../lib/monaco-setup.js';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
+  import SettingsEditor from './SettingsEditor.svelte';
   import {
     tabs,
     activePath,
@@ -41,6 +43,7 @@
 
   let editorEl;
   let diffEl;
+  let settingsEl;
   let editor = null;
   let diffEditor = null;
   let welcomeModel = null;
@@ -104,6 +107,7 @@
   function showHost(which) {
     if (editorEl) editorEl.style.display = which === 'edit' ? '' : 'none';
     if (diffEl) diffEl.style.display = which === 'diff' ? '' : 'none';
+    if (settingsEl) settingsEl.style.display = which === 'settings' ? '' : 'none';
   }
 
   function ensureDiffEditor() {
@@ -135,6 +139,11 @@
     if (!tab) {
       editor.setModel(welcomeModel);
       showHost('edit');
+      return;
+    }
+    if (tab.kind === 'settings') {
+      // 设置页:非 Monaco 特殊 tab,渲染设置组件(不建 model)
+      showHost('settings');
       return;
     }
     if (tab.error) {
@@ -298,6 +307,9 @@
   {/if}
   <div class="editor-host" bind:this={editorEl} data-zone="editor"></div>
   <div class="editor-host diff-host" bind:this={diffEl} style="display:none" data-zone="editor"></div>
+  <div class="editor-host settings-host" bind:this={settingsEl} style="display:none" data-zone="editor">
+    <SettingsEditor />
+  </div>
 </div>
 
 <style>

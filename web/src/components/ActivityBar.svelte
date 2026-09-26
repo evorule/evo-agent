@@ -1,14 +1,23 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 EvoRule Project -->
-<!-- 活动栏(Trae 最左列):资源管理器常驻;后续阶段逐项点亮 -->
+<!-- 活动栏(Trae 最左列):资源管理器常驻 + 设置入口;后续阶段逐项点亮 -->
 <script>
+  /** 条目点击外发(设置等非文件树视图的宿主接线;App.svelte 按 id 分发) */
+  export let onitemclick = null;
+
   let active = 'explorer';
   const items = [
     { id: 'explorer', label: '资源管理器', enabled: true },
     { id: 'search', label: '搜索(文件树阶段接入)', enabled: false },
     { id: 'audit', label: '审计(治理叠加阶段接入)', enabled: false },
-    { id: 'settings', label: '设置(整合收口阶段接入)', enabled: false },
+    { id: 'settings', label: '设置', enabled: true },
   ];
+
+  function click(it) {
+    if (!it.enabled) return;
+    active = it.id;
+    if (onitemclick) onitemclick(it.id);
+  }
 </script>
 
 <nav class="activity-bar" aria-label="活动栏">
@@ -18,7 +27,7 @@
       title={it.label}
       aria-label={it.label}
       disabled={!it.enabled}
-      onclick={() => it.enabled && (active = it.id)}
+      onclick={() => click(it)}
     >
       {#if it.id === 'explorer'}
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">

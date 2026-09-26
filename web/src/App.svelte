@@ -27,7 +27,9 @@
     refreshSessions,
     refreshGovBadges,
     sessionId,
+    openSettingsTab,
   } from './lib/stores.js';
+  import { loadSettings } from './lib/settings.js';
   import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
   import { initContextTracking } from './lib/context-keys.js';
   import { getEffectiveRules, resolveKeybinding } from './lib/keybindings.js';
@@ -46,8 +48,14 @@
     'workbench.action.session.refresh',
     'workbench.action.session.switch',
     'workbench.action.gov.refreshBadges',
+    'workbench.action.openSettings',
   ];
   let cleanupTracking = null;
+
+  /** 活动栏条目分发(设置等非文件树视图的宿主接线路由) */
+  function handleActivityItem(id) {
+    if (id === 'settings') openSettingsTab();
+  }
 
   onMount(() => {
     registerCommand({
@@ -120,6 +128,13 @@
       category: '治理',
       run: () => refreshGovBadges(get(sessionId)),
     });
+    registerCommand({
+      id: 'workbench.action.openSettings',
+      title: '打开设置',
+      category: '首选项',
+      run: () => openSettingsTab(),
+    });
+    loadSettings(); // 设置快照加载(失败降级缓存只读;编辑器参数订阅在 EditorPane)
     cleanupTracking = initContextTracking();
     return () => {
       for (const id of OWNED_COMMANDS) unregisterCommand(id);
@@ -145,7 +160,7 @@
 <div class="app">
   <TitleBar />
   <div class="main">
-    <ActivityBar />
+    <ActivityBar onitemclick={handleActivityItem} />
     <div style:display={$explorerVisible ? 'contents' : 'none'}>
       <Explorer />
     </div>

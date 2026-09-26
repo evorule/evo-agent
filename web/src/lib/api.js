@@ -101,6 +101,11 @@ export function getWorkbenchSettingsSchema() {
   return fetch('/api/workbench/settings/schema', { headers: headers() }).then(unwrap);
 }
 
+/** LLM 配置只读快照(脱敏;响应体不携带任何密钥内容) */
+export function getLlmStatus() {
+  return fetch('/admin/llm-status', { headers: headers() }).then(unwrap);
+}
+
 /** 审批决定(G8 既有通道;approved=true 批准 / false 拒绝) */
 export function approveProposal(agentType, sessionId, approved, proposalId) {
   return fetch(`/agents/${encodeURIComponent(agentType)}/approve`, {
