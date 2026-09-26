@@ -45,6 +45,7 @@ pub mod file_move;
 pub mod file_read;
 pub mod file_write;
 pub mod fs_safety;
+pub mod grep_files;
 pub mod http_get;
 pub mod search_files;
 pub mod shell_exec;
@@ -108,6 +109,10 @@ pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
     handler.register_tool(
         "search_files",
         Arc::new(search_files::SearchFilesTool::new(workdir_buf.clone())),
+    );
+    handler.register_tool(
+        "grep_files",
+        Arc::new(grep_files::GrepFilesTool::new(workdir_buf.clone())),
     );
     handler.register_tool(
         "shell_exec",
@@ -311,6 +316,60 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     name: "max_results".to_string(),
                     r#type: "integer".to_string(),
                     description: "Max number of results (default 1000)".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "grep_files".to_string(),
+            description: "Search file CONTENTS across the workdir (ripgrep-style). \
+                          Literal or regex mode; case/whole-word toggles; \
+                          gitignore respected by default; binary files skipped. \
+                          Results are grouped per file with 1-based line numbers and \
+                          0-based char column offsets. Capped by max_results; \
+                          hard 30s timeout returns partial results."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "query".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Text or regex to search for (must not be empty)".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "isRegex".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Set true to treat query as a regular expression (default: literal)".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "caseSensitive".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Case-sensitive matching (default: false)".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "wholeWord".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Match whole words only (default: false)".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "dir".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Subdirectory to search in, relative to workdir (default: \".\")".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "includeGlobs".to_string(),
+                    r#type: "array".to_string(),
+                    description: "Glob patterns to include, e.g. [\"*.rs\"] (default: all files)".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "max_results".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Max total matches (default 1000)".to_string(),
                     required: false,
                 },
             ],
