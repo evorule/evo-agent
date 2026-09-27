@@ -420,6 +420,36 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/files/replace",
             axum::routing::post(crate::api::file_api::replace_files),
         )
+        // 工作台 Git 面(B3,人工面):SCM 视图/diff/暂存/丢弃/提交 —— 薄委托
+        // git::GitOps 核心层;身份缺失只引导不代写 config;G16 中间件自动覆盖
+        .route(
+            "/api/git/status",
+            axum::routing::get(crate::api::git_api::status),
+        )
+        .route(
+            "/api/git/diff",
+            axum::routing::get(crate::api::git_api::diff),
+        )
+        .route(
+            "/api/git/stage",
+            axum::routing::post(crate::api::git_api::stage),
+        )
+        .route(
+            "/api/git/unstage",
+            axum::routing::post(crate::api::git_api::unstage),
+        )
+        .route(
+            "/api/git/discard",
+            axum::routing::post(crate::api::git_api::discard),
+        )
+        .route(
+            "/api/git/commit",
+            axum::routing::post(crate::api::git_api::commit),
+        )
+        .route(
+            "/api/git/identity",
+            axum::routing::get(crate::api::git_api::identity),
+        )
         // G14:记忆事件查询 — 返回 session 的所有结构化事件
         .route(
             "/api/sessions/{id}/events",
@@ -1714,6 +1744,26 @@ mod tests {
 
         // 无 token 也应返回 200(豁免鉴权)
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_git_endpoints_require_auth() {
+        // G16:git REST 面受统一鉴权保护——auth enabled 且无 token → 401
+        let state = make_test_state();
+        let auth_config = crate::api::auth::AuthConfig::new(vec!["secret".to_string()], true);
+        let app = router_with_auth(state, auth_config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/git/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
