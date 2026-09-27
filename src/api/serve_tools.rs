@@ -256,12 +256,19 @@ pub fn build_filtered_toolkit(union: &ToolHandler, whitelist: &[String]) -> Tool
 ///
 /// 开关关 = 过滤 toolkit 不注册该执行器 = LLM 工具契约同步消失
 /// (openai_tools_payload 与注册执行器求交,零双声明)。键缺失/值非法时
-/// 按 schema 默认语义回落(元组第三位):fileCreate/grep 开,fileMove/fileDelete 关。
+/// 按 schema 默认语义回落(元组第三位):fileCreate/grep/gitRead 开,
+/// fileMove/fileDelete/gitWrite 关。
 const TOOL_SWITCH_KEYS: &[(&str, &str, bool)] = &[
     ("file_create", "agentTools.fileCreate", true),
     ("file_move", "agentTools.fileMove", false),
     ("file_delete", "agentTools.fileDelete", false),
     ("grep_files", "agentTools.grep", true),
+    // B3 git 两级注册(17 号 §3.2):读面 active 标配开,写面 candidate 标配关
+    ("git_status", "agentTools.gitRead", true),
+    ("git_diff", "agentTools.gitRead", true),
+    ("git_log", "agentTools.gitRead", true),
+    ("git_stage", "agentTools.gitWrite", false),
+    ("git_commit", "agentTools.gitWrite", false),
 ];
 
 /// 在 [`build_filtered_toolkit`] 之上叠加 agentTools.* 开关过滤。
@@ -418,7 +425,7 @@ mod tests {
         let (ws, ev) = make_clients();
         let handler = build_union_toolkit(Path::new("."), &ws, &ev);
 
-        // 9 个内置工具
+        // 15 个内置工具(10 文件/搜索/网络 + 5 git 族)
         for name in [
             "file_read",
             "file_list",
@@ -427,8 +434,14 @@ mod tests {
             "file_move",
             "file_delete",
             "search_files",
+            "grep_files",
             "shell_exec",
             "http_get",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_stage",
+            "git_commit",
         ] {
             assert!(
                 handler.has_tool(name),
@@ -446,7 +459,7 @@ mod tests {
             );
         }
 
-        // 总数 = 9 + 26 = 35(逐个验证所有预期工具都在)
+        // 总数 = 15 + 26 = 41(逐个验证所有预期工具都在)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -455,14 +468,20 @@ mod tests {
             "file_move",
             "file_delete",
             "search_files",
+            "grep_files",
             "shell_exec",
             "http_get",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_stage",
+            "git_commit",
         ]
         .iter()
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 35, "expected 35 total tool names");
+        assert_eq!(all_names.len(), 41, "expected 41 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),
@@ -610,6 +629,58 @@ mod tests {
             "off switch must remove executor"
         );
         assert!(filtered.has_tool("file_read"), "non-gated tools unaffected");
+    }
+
+    #[test]
+    fn test_build_filtered_toolkit_git_switches_two_level() {
+        // B3 git 两级注册(17 号 §3.2):gitRead 开 / gitWrite 关
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let whitelist: Vec<String> = [
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_stage",
+            "git_commit",
+            "file_read",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // 出厂默认(键缺失):读面三工具开,写面两工具关
+        let filtered =
+            build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
+        assert!(filtered.has_tool("git_status"), "gitRead default-on");
+        assert!(filtered.has_tool("git_diff"), "gitRead default-on");
+        assert!(filtered.has_tool("git_log"), "gitRead default-on");
+        assert!(
+            !filtered.has_tool("git_stage"),
+            "gitWrite default-off must remove executor"
+        );
+        assert!(
+            !filtered.has_tool("git_commit"),
+            "gitWrite default-off must remove executor"
+        );
+        assert!(filtered.has_tool("file_read"), "non-gated tools unaffected");
+
+        // gitWrite 开:写面进入执行面(开关与审批层正交,candidate 仍走 needs_approval)
+        let mut settings = serde_json::Map::new();
+        settings.insert("agentTools.gitWrite".to_string(), serde_json::json!(true));
+        let filtered = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        assert!(filtered.has_tool("git_stage"));
+        assert!(filtered.has_tool("git_commit"));
+
+        // gitRead 关:读面三工具与 LLM 契约同步消失
+        settings.insert("agentTools.gitRead".to_string(), serde_json::json!(false));
+        let filtered = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        assert!(!filtered.has_tool("git_status"));
+        assert!(!filtered.has_tool("git_diff"));
+        assert!(!filtered.has_tool("git_log"));
+        assert!(
+            filtered.has_tool("git_stage"),
+            "gitWrite untouched by gitRead off"
+        );
     }
 
     #[test]

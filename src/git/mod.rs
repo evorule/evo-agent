@@ -81,9 +81,7 @@ impl GitError {
         match self {
             GitError::NotARepository => "not a git repository".to_string(),
             GitError::NotSupported(what) => format!("git operation not supported: {what}"),
-            GitError::IdentityMissing => {
-                "identity_missing".to_string()
-            }
+            GitError::IdentityMissing => "identity_missing".to_string(),
             GitError::CliFailed(stderr) => {
                 format!("git command failed: {}", stderr)
             }
@@ -199,7 +197,9 @@ impl GitOps {
             return Err(GitError::Invalid(format!("invalid path: {raw:?}")));
         }
         if Path::new(&p).is_absolute() {
-            return Err(GitError::Invalid(format!("absolute path rejected: {raw:?}")));
+            return Err(GitError::Invalid(format!(
+                "absolute path rejected: {raw:?}"
+            )));
         }
         Ok(p)
     }
@@ -220,9 +220,7 @@ impl GitOps {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(GitError::Io(e.to_string())),
         };
-        let already = existing
-            .lines()
-            .any(|l| l.trim() == TRASH_DIR);
+        let already = existing.lines().any(|l| l.trim() == TRASH_DIR);
         if already {
             return Ok(());
         }
@@ -231,7 +229,9 @@ impl GitOps {
         if !next.is_empty() && !next.ends_with('\n') {
             next.push('\n');
         }
-        next.push_str(&format!("\n# evo-agent workbench private dirs (added by evo-agent serve)\n{TRASH_DIR}\n"));
+        next.push_str(&format!(
+            "\n# evo-agent workbench private dirs (added by evo-agent serve)\n{TRASH_DIR}\n"
+        ));
         // 原子写：tmp + rename（Windows 侧 std rename 走 MOVEFILE_REPLACE_EXISTING）
         let tmp = info_dir.join("exclude.evo-agent.tmp");
         {
@@ -287,7 +287,10 @@ impl GitOps {
                 } else {
                     'M' // INDEX_MODIFIED / INDEX_TYPECHANGE
                 };
-                staged.push(StatusEntry { path, status: letter });
+                staged.push(StatusEntry {
+                    path,
+                    status: letter,
+                });
             }
             // 更改组（workdir vs index；WT_NEW = untracked → U）
             if s.intersects(
@@ -308,7 +311,10 @@ impl GitOps {
                 } else {
                     'M' // WT_MODIFIED / WT_TYPECHANGE
                 };
-                changes.push(StatusEntry { path, status: letter });
+                changes.push(StatusEntry {
+                    path,
+                    status: letter,
+                });
             }
         }
         let dirty = !staged.is_empty() || !changes.is_empty();
@@ -360,9 +366,7 @@ impl GitOps {
         };
 
         if original.is_empty() && modified.is_empty() {
-            return Err(GitError::Invalid(format!(
-                "no content to diff for: {path}"
-            )));
+            return Err(GitError::Invalid(format!("no content to diff for: {path}")));
         }
         Ok(GitDiff {
             original,
@@ -585,9 +589,14 @@ impl GitOps {
     }
 
     /// 提交历史（agent `git_log` 只读消费面；新→旧，limit 上限 500）
+    ///
+    /// 未出生 HEAD（空仓零提交）→ 空列表（"没有历史"不是错误）
     pub fn log(&self, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
         let limit = limit.clamp(1, 500);
         let repo = self.open()?;
+        if repo.head().is_err() {
+            return Ok(Vec::new());
+        }
         let mut walk = repo
             .revwalk()
             .map_err(|e| GitError::Lib(e.message().to_string()))?;
@@ -656,11 +665,7 @@ fn language_id(path: &str) -> &'static str {
 ///
 /// 安全约束：argv 数组直接 exec（无 shell 解析）/ stdin 定向注入 / 30s 超时
 /// kill / 工作目录锁死 workdir / stdout·stderr 由独立线程排空（防管道填满死锁）。
-fn run_git_cli(
-    workdir: &Path,
-    args: &[&str],
-    stdin_data: Option<&str>,
-) -> Result<(), GitError> {
+fn run_git_cli(workdir: &Path, args: &[&str], stdin_data: Option<&str>) -> Result<(), GitError> {
     let mut child = Command::new("git")
         .args(args)
         .current_dir(workdir)
@@ -810,7 +815,10 @@ mod tests {
         let sa = find(&st2.staged, "a.txt").expect("a.txt staged");
         assert_eq!(sa.status, 'M');
         assert!(find(&st2.changes, "a.txt").is_none());
-        assert!(find(&st2.changes, "b.txt").is_some(), "b.txt still untracked");
+        assert!(
+            find(&st2.changes, "b.txt").is_some(),
+            "b.txt still untracked"
+        );
     }
 
     #[test]
@@ -829,7 +837,11 @@ mod tests {
 
         let st = ops.status().unwrap();
         let r = find(&st.staged, "new.txt").expect("rename shown at new path");
-        assert_eq!(r.status, 'R', "staged rename detected: staged={:?}", st.staged);
+        assert_eq!(
+            r.status, 'R',
+            "staged rename detected: staged={:?}",
+            st.staged
+        );
     }
 
     #[test]
@@ -856,13 +868,19 @@ mod tests {
         // 折叠目录条目按目录整体暂存
         ops.stage(&["bundle/".to_string()]).unwrap();
         let st = ops.status().unwrap();
-        assert!(find(&st.staged, "bundle/x.txt").is_some(), "file staged via dir");
+        assert!(
+            find(&st.staged, "bundle/x.txt").is_some(),
+            "file staged via dir"
+        );
         assert!(st.changes.is_empty());
 
         // unstage 回到 untracked
         ops.unstage(&["bundle/x.txt".to_string()]).unwrap();
         let st2 = ops.status().unwrap();
-        assert!(find(&st2.changes, "bundle/").is_some(), "back to untracked fold");
+        assert!(
+            find(&st2.changes, "bundle/").is_some(),
+            "back to untracked fold"
+        );
         assert!(st2.staged.is_empty());
     }
 
@@ -875,7 +893,10 @@ mod tests {
         // 已跟踪文件修改 → discard 恢复
         std::fs::write(ops.workdir.join("a.txt"), "changed\n").unwrap();
         ops.discard(&["a.txt".to_string()]).unwrap();
-        assert_eq!(std::fs::read_to_string(ops.workdir.join("a.txt")).unwrap(), "base\n");
+        assert_eq!(
+            std::fs::read_to_string(ops.workdir.join("a.txt")).unwrap(),
+            "base\n"
+        );
         let st = ops.status().unwrap();
         assert!(!st.dirty, "clean after discard");
 
@@ -917,12 +938,8 @@ mod tests {
         // GitOps::new 已执行一次；再显式执行两次 → 幂等且只追加一条
         ops.ensure_exclude().unwrap();
         ops.ensure_exclude().unwrap();
-        let content =
-            std::fs::read_to_string(ops.workdir.join(".git/info/exclude")).unwrap();
-        let hits = content
-            .lines()
-            .filter(|l| l.trim() == TRASH_DIR)
-            .count();
+        let content = std::fs::read_to_string(ops.workdir.join(".git/info/exclude")).unwrap();
+        let hits = content.lines().filter(|l| l.trim() == TRASH_DIR).count();
         assert_eq!(hits, 1, "exactly one .evo-trash/ entry, got: {content:?}");
 
         // 不污染用户 .gitignore（文件根本不该被创建）
@@ -933,7 +950,10 @@ mod tests {
         std::fs::write(&exclude, "# custom\n*.tmp\n").unwrap();
         ops.ensure_exclude().unwrap();
         let content = std::fs::read_to_string(&exclude).unwrap();
-        assert!(content.starts_with("# custom\n*.tmp\n"), "original preserved");
+        assert!(
+            content.starts_with("# custom\n*.tmp\n"),
+            "original preserved"
+        );
         assert!(content.contains(TRASH_DIR));
     }
 
@@ -1009,7 +1029,9 @@ mod tests {
         std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
         let id = ops.commit("cli committed message").unwrap();
         let repo = Repository::open(&ops.workdir).unwrap();
-        let head = repo.find_commit(repo.head().unwrap().target().unwrap()).unwrap();
+        let head = repo
+            .find_commit(repo.head().unwrap().target().unwrap())
+            .unwrap();
         assert_eq!(head.id().to_string(), id);
         assert_eq!(head.summary().unwrap(), "cli committed message");
         let st = ops.status().unwrap();

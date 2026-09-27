@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! 内置工具(0.2.0:file_read / file_list / file_write / file_create / file_move /
-//! file_delete / search_files / shell_exec / http_get)
+//! 内置工具(0.2.0:file_read / file_list / file_write / file_create /
+//! file_move / file_delete / search_files / shell_exec / http_get /
+//! git_status / git_diff / git_log / git_stage / git_commit)
 //!
 //! ## 设计原则
 //!
@@ -45,6 +46,7 @@ pub mod file_move;
 pub mod file_read;
 pub mod file_write;
 pub mod fs_safety;
+pub mod git_tools;
 pub mod grep_files;
 pub mod http_get;
 pub mod search_files;
@@ -67,9 +69,12 @@ use crate::io_handlers::tool_handler::ToolHandler;
 /// - `search_files`:glob 找文件(工作目录沙箱 + max_results 限制)
 /// - `shell_exec`:执行白名单命令(8 active + 20 candidate + 28 blocked)
 /// - `http_get`:HTTP GET(6 active host + SSRF 防护 + 任何其他 host 需批准)
+/// - `git_status` / `git_diff` / `git_log`:git 只读面(active,agentTools.gitRead)
+/// - `git_stage` / `git_commit`:git 写面(candidate 审批,agentTools.gitWrite)
 ///
-/// 注:file_create/move/delete 默认 `candidate`(agent 调用需用户批准);
-/// 工作台人工编辑面自建实例(`writable_dir="."`)绕过审批,见 file_api 模块文档。
+/// 注:file_create/move/delete 与 git_stage/git_commit 默认 `candidate`
+/// (agent 调用需用户批准);工作台人工编辑面自建实例(`writable_dir="."`)
+/// 绕过审批,见 file_api 模块文档。
 ///
 /// 用法:
 /// ```ignore
@@ -119,6 +124,26 @@ pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
         Arc::new(shell_exec::ShellExecTool::new().with_workdir(&workdir_buf)),
     );
     handler.register_tool("http_get", Arc::new(http_get::HttpGetTool::new()));
+    handler.register_tool(
+        "git_status",
+        Arc::new(git_tools::GitStatusTool::new(workdir_buf.clone())),
+    );
+    handler.register_tool(
+        "git_diff",
+        Arc::new(git_tools::GitDiffTool::new(workdir_buf.clone())),
+    );
+    handler.register_tool(
+        "git_log",
+        Arc::new(git_tools::GitLogTool::new(workdir_buf.clone())),
+    );
+    handler.register_tool(
+        "git_stage",
+        Arc::new(git_tools::GitStageTool::new(workdir_buf.clone())),
+    );
+    handler.register_tool(
+        "git_commit",
+        Arc::new(git_tools::GitCommitTool::new(workdir_buf.clone())),
+    );
     handler
 }
 
@@ -409,6 +434,91 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     r#type: "boolean".to_string(),
                     description: "Set to true ONLY after the user has approved a candidate-host proposal. \
                                   Blocked hosts (private IP, localhost) reject regardless."
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "git_status".to_string(),
+            description: "Show the working tree git status: current branch, dirty flag, \
+                          and two change groups — staged (index vs HEAD) and changes \
+                          (workdir vs index, untracked included, dirs folded with a trailing `/`). \
+                          Path entries use `/` separators relative to the repo root; \
+                          status letters: M modified / A added / D deleted / R renamed / U untracked."
+                .to_string(),
+            parameters: vec![],
+        },
+        ToolSpec {
+            name: "git_diff".to_string(),
+            description: "Read the full diff content of ONE file: `original` is the HEAD \
+                          version, `modified` is the working-tree version (empty original = \
+                          untracked/new file). Does not produce a patch — inspect content \
+                          and report changes in your own words."
+                .to_string(),
+            parameters: vec![ParameterSpec {
+                name: "path".to_string(),
+                r#type: "string".to_string(),
+                description: "File path relative to the repo root (e.g. \"src/main.rs\")"
+                    .to_string(),
+                required: true,
+            }],
+        },
+        ToolSpec {
+            name: "git_log".to_string(),
+            description: "List recent commits of the current branch (newest first) with \
+                          id, short id, author, email, time and first-line summary."
+                .to_string(),
+            parameters: vec![ParameterSpec {
+                name: "limit".to_string(),
+                r#type: "integer".to_string(),
+                description: "Max number of commits to return (default 50, hard cap 500)"
+                    .to_string(),
+                required: false,
+            }],
+        },
+        ToolSpec {
+            name: "git_stage".to_string(),
+            description: "Stage files or directories into the git index (like `git add`). \
+                          Paths are relative to the repo root; a trailing `/` stages a whole \
+                          directory. Requires user approval: the first call returns a \
+                          needs_approval proposal."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "paths".to_string(),
+                    r#type: "array".to_string(),
+                    description: "Paths to stage, relative to the repo root (e.g. [\"src/main.rs\"])".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "approved".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Set to true ONLY after the user has approved the staging proposal."
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "git_commit".to_string(),
+            description: "Commit ALL pending changes: stages everything first (like \
+                          `git add -A` + `git commit`), matching the workbench SCM commit \
+                          semantics. Requires a configured git identity (user.name / \
+                          user.email). Requires user approval: the first call returns a \
+                          needs_approval proposal."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "message".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Commit message (must not be empty)".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "approved".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Set to true ONLY after the user has approved the commit proposal."
                         .to_string(),
                     required: false,
                 },

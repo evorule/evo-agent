@@ -92,9 +92,7 @@ pub async fn status(
     State(state): State<AgentApiState>,
     Query(_q): Query<EmptyQuery>,
 ) -> Result<Json<GitStatus>, (StatusCode, Json<Value>)> {
-    git_blocking(&state, |ops| ops.status())
-        .await
-        .map(Json)
+    git_blocking(&state, |ops| ops.status()).await.map(Json)
 }
 
 /// `GET /api/git/diff` —— 两版全文（Monaco DiffEditor 直接消费）
@@ -114,11 +112,9 @@ pub async fn stage(
     Json(body): Json<PathsBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let paths = body.paths;
-    git_blocking(&state, move |ops| {
-        ops.stage(&paths).map(|n| Value::from(n))
-    })
-    .await
-    .map(Json)
+    git_blocking(&state, move |ops| ops.stage(&paths).map(Value::from))
+        .await
+        .map(Json)
 }
 
 /// `POST /api/git/unstage` —— 取消暂存
@@ -127,11 +123,9 @@ pub async fn unstage(
     Json(body): Json<PathsBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let paths = body.paths;
-    git_blocking(&state, move |ops| {
-        ops.unstage(&paths).map(|n| Value::from(n))
-    })
-    .await
-    .map(Json)
+    git_blocking(&state, move |ops| ops.unstage(&paths).map(Value::from))
+        .await
+        .map(Json)
 }
 
 /// `POST /api/git/discard` —— 丢弃工作区变更（危险；前端强制 ConfirmDialog）
@@ -140,11 +134,9 @@ pub async fn discard(
     Json(body): Json<PathsBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let paths = body.paths;
-    git_blocking(&state, move |ops| {
-        ops.discard(&paths).map(|n| Value::from(n))
-    })
-    .await
-    .map(Json)
+    git_blocking(&state, move |ops| ops.discard(&paths).map(Value::from))
+        .await
+        .map(Json)
 }
 
 /// `POST /api/git/commit` —— 提交（身份预检 + hooks 检测分流；空消息 400）
@@ -195,10 +187,7 @@ mod tests {
         AgentApiState::new_with_metrics(
             crate::agent::AgentDefinitionManager::with_default_dir(),
             EvoruleApiClient::new("http://localhost:0"),
-            Arc::new(
-                crate::api::Metrics::new()
-                    .unwrap_or_else(|e| panic!("metrics: {e}")),
-            ),
+            Arc::new(crate::api::Metrics::new().unwrap_or_else(|e| panic!("metrics: {e}"))),
             workdir,
             Arc::new(crate::api::workspace_client::WorkspaceApiClient::new(
                 "http://localhost:0",
@@ -289,7 +278,11 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "stage: {b}");
         let (_, b) = call(app.clone(), "GET", "/api/git/status", None).await;
         assert!(
-            b["staged"].as_array().unwrap().iter().any(|e| e["path"] == "a.txt"),
+            b["staged"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["path"] == "a.txt"),
             "a.txt staged: {b}"
         );
 
@@ -304,7 +297,11 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "unstage: {b}");
         let (_, b) = call(app, "GET", "/api/git/status", None).await;
         assert!(
-            b["changes"].as_array().unwrap().iter().any(|e| e["path"] == "a.txt"),
+            b["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["path"] == "a.txt"),
             "a.txt back in changes: {b}"
         );
     }
