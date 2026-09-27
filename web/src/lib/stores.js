@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 import { writable, get } from 'svelte/store';
-import { listSessions, readFile, writeFile, getAgentDef, getEvolutionSignals, getWorkbenchSettings } from './api.js';
+import {
+  listSessions,
+  readFile,
+  writeFile,
+  getAgentDef,
+  getEvolutionSignals,
+  getWorkbenchSettings,
+  gitStatus as fetchGitStatus,
+} from './api.js';
 import { userLayerDoc } from './settings.js';
 
 /** 连接状态: connecting | online | offline */
@@ -158,6 +166,51 @@ export function closeTab(path) {
  *  值被消费后由订阅方置 null(一次性信号),形如
  *  {added:[], updated:[], removed:[], moved:[{from,to}]}(相对 workdir 路径) */
 export const fsEvents = writable(null);
+
+// ---- Git 状态(B3;单状态源:SCM 视图与 Explorer 装饰共同订阅) ----
+
+/** git 双态 status(null = 非 git 仓 / 未加载 / 拉取失败)。
+ *  形如 {branch, dirty, staged:[{path,status}], changes:[{path,status}]}(serve GitStatus)。
+ *  刷新触发:ws fs_events 帧(800ms 防抖)/ SCM 面操作后 / 启动加载 / 手动刷新 */
+export const gitStatus = writable(null);
+
+let gitRefreshTimer = null;
+let gitRefreshInFlight = false;
+let gitRefreshQueued = false;
+
+/** 刷新 git status(默认 800ms 防抖,合并突发 fs 事件;in-flight 期间新触发
+ *  合并为一次尾巴刷新,保证最终一致)。delay=0 供操作后立即刷新 */
+export function refreshGitStatus(delay = 800) {
+  if (gitRefreshTimer) clearTimeout(gitRefreshTimer);
+  gitRefreshTimer = setTimeout(() => {
+    gitRefreshTimer = null;
+    if (gitRefreshInFlight) {
+      gitRefreshQueued = true;
+      return;
+    }
+    gitRefreshInFlight = true;
+    fetchGitStatus()
+      .then((st) => gitStatus.set(st))
+      .catch(() => gitStatus.set(null)) // 非 git 仓/网络失败 → 无 git 面
+      .finally(() => {
+        gitRefreshInFlight = false;
+        if (gitRefreshQueued) {
+          gitRefreshQueued = false;
+          refreshGitStatus(0);
+        }
+      });
+  }, delay);
+}
+
+/** 打开 git diff 视图信号(一次性):ScmView 行点击 / git.openDiff 命令设置,
+ *  EditorPane 消费(打开 kind:'git-diff' 特殊 tab)后置 null。值为相对路径 */
+export const pendingGitDiff = writable(null);
+
+/** 请求打开某文件的 git diff 虚拟 tab(git-diff://<path>) */
+export function openGitDiff(path) {
+  if (!path) return;
+  pendingGitDiff.set(path);
+}
 
 /** 最近一次 tab 路径迁移信号 {from, to, seq}(EditorPane 订阅迁移按路径
  *  键缓存的 model,保 dirty 内容;先于 tabs 更新发出——订阅方迁移缓存的

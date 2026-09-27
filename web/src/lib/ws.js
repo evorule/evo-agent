@@ -21,6 +21,7 @@ import {
   clearArtifacts,
   openFile,
   fsEvents,
+  refreshGitStatus,
 } from './stores.js';
 import { getTranscript } from './api.js';
 
@@ -213,8 +214,11 @@ function handleFrame(f) {
       pushPanelEvent('sys', { label: 'Info', detail: String(f.message) });
       break;
     case 'fs_events':
-      // 文件系统事件批量(相对 workdir);Explorer 订阅消费,一次性信号
+      // 文件系统事件批量(相对 workdir);Explorer 订阅消费,一次性信号。
+      // git 装饰/SCM 面不订阅一次性信号(防被 Explorer 抢走),此处直接
+      // 触发防抖刷新(B3;800ms 合并突发事件)
       fsEvents.set(f.events || { added: [], updated: [], removed: [], moved: [] });
+      refreshGitStatus(800);
       break;
     case 'ApprovalRequired':
       // 治理叠加:审批卡按钮走既有 G8 /approve 通道

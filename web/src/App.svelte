@@ -12,6 +12,7 @@
   import ActivityBar from './components/ActivityBar.svelte';
   import Explorer from './components/Explorer.svelte';
   import SearchPanel from './components/SearchPanel.svelte';
+  import ScmView from './components/ScmView.svelte';
   import EditorPane from './components/EditorPane.svelte';
   import BottomPanel from './components/BottomPanel.svelte';
   import ChatSidebar from './components/ChatSidebar.svelte';
@@ -32,6 +33,7 @@
     searchIntent,
     openSettingsTab,
     openSettingsJson,
+    refreshGitStatus,
   } from './lib/stores.js';
   import { loadSettings } from './lib/settings.js';
   import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
@@ -178,6 +180,7 @@
     loadSettings(); // 设置快照加载(失败降级缓存只读;编辑器参数订阅在 EditorPane)
     migrateKeybindings(); // 旧键位覆盖层一次性迁移(失败保留旧键,下次启动重试)
     cleanupTracking = initContextTracking();
+    refreshGitStatus(0); // git 状态启动加载(B3;后续 fs_events 防抖自愈)
     return () => {
       for (const id of OWNED_COMMANDS) unregisterCommand(id);
       if (cleanupTracking) cleanupTracking();
@@ -208,6 +211,8 @@
         <Explorer />
       {:else if $sidebarView === 'search'}
         <SearchPanel />
+      {:else if $sidebarView === 'scm'}
+        <ScmView />
       {/if}
     </div>
     <div class="center">

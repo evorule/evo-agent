@@ -109,6 +109,11 @@
   --warning-bg: rgba(243, 156, 18, 0.12);
   --info: #3b82f6;
   --info-bg: rgba(59, 130, 246, 0.12);
+  /* Git 装饰(B3):状态字母语义色(别名既有色板,明度饱和度一致) */
+  --git-added: #2ecc71;    /* A/U 新增·未跟踪 = --success */
+  --git-modified: #f39c12; /* M 修改 = --warning */
+  --git-deleted: #e74c3c;  /* D 删除 = --danger */
+  --git-renamed: #3b82f6;  /* R 重命名 = --info */
   --sh-card: 0 1px 3px rgba(0, 0, 0, 0.3);
   --sh-modal: 0 10px 25px rgba(0, 0, 0, 0.5);
   --sidebar-bg: #09101f;
