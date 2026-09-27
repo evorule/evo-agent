@@ -15,8 +15,32 @@
 //
 // 本模块零 monaco 静态依赖:initDiagnostics(monaco) 由编辑器宿主注入,
 // 纯逻辑(uri 规约/排序/游标)可独立单测。
-// 消费契约(LSP 接入方):文件未打开时 setDiagnostics 仅入缓存,待 model 创建时
-// 回放进单源——v1 面板只呈现已打开文件,与「无全仓扫描」边界一致。
+//
+// ── B5 消费契约(v1 冻结,08 号 LSP 板块按此接入,勿在未升版前改动形状) ──
+//
+// 1. 生产者入口(仅此一对,其余导出为工作台内部消费):
+//      setDiagnostics(path, owner, markers)   全量替换(非增量;同 owner 幂等覆盖)
+//      clearDiagnostics(path, owner?)         owner 省略 = 清该 path 全部 owner
+// 2. path 口径:工作区相对路径(注册表权威键,禁绝对路径/URL);设置等虚拟页
+//    用 'evo://settings/user' 形态。重命名经 rebindPath 重绑,生产者无需感知。
+// 3. owner 命名空间:'json' / 'markdown.lint' / '<lsp-server-name>'(接入方自报,
+//    全局唯一,等价于 VS Code DiagnosticCollection 名)。各 owner 独立全量替换,
+//    清理互不波及。
+// 4. markers 元素形状(Monaco IMarkerData 子集,冻结):
+//      { message: string,
+//        severity: 1|2|4|8,          // Hint/Info/Warning/Error(取 SEVERITY 常量)
+//        startLineNumber: number,    // 1-based
+//        startColumn: number,        // 1-based
+//        endLineNumber: number,
+//        endColumn: number,
+//        source?: string,            // 展示名,如 'rust-analyzer'
+//        code?: string|number }      // 面板展示与 hover 链接预留
+//    未列出字段一概不进契约(会被透传但不保证展示语义)。
+// 5. 生命周期语义:文件未打开时仅入前端缓存,model 创建时自动回放;model dispose
+//    时缓存与 marker 一并消亡(重开=生产者需重推)。v1 面板只呈现已打开文件,
+//    与「无全仓扫描」边界一致——LSP 服务端如持诊断缓存,推送仍需以本 API 为准。
+// 6. 聚合为单向流:setDiagnostics → marker 服务 → onDidChangeMarkers → problems
+//    store。生产者不直接写 problems store。
 
 import { writable } from 'svelte/store';
 
@@ -114,7 +138,7 @@ export function markerToReveal(pair) {
   };
 }
 
-/** severity 计数(8/4/2/1 四级;未知值按 Hint 归档) */
+/** severity 计数(阈值语义:≥8 错误/≥4 警告/≥2 提示/其余归 Hint) */
 export function severityCounts(markers) {
   const c = { errors: 0, warnings: 0, infos: 0, hints: 0 };
   for (const m of markers) {
