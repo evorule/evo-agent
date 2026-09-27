@@ -16,9 +16,41 @@
     activePath,
     fsEvents,
     connStatus,
+    gitStatus,
   } from '../lib/stores.js';
   import ContextMenu from './ContextMenu.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
+
+  // ---- git 状态字母装饰(B3) ----
+  // 单状态源 $gitStatus;exact 命中文件条目,折叠目录条目(尾 `/`)前缀命中其
+  // 目录行。staged 与 changes 同时存在时 changes 优先(工作区状态更醒目)。
+  $: gitMap = buildGitMap($gitStatus);
+
+  function buildGitMap(st) {
+    const map = new Map();
+    if (!st) return map;
+    for (const e of st.changes || []) map.set(e.path, e.status);
+    for (const e of st.staged || []) if (!map.has(e.path)) map.set(e.path, e.status);
+    return map;
+  }
+
+  function gitLetter(node) {
+    const hit = gitMap.get(node.path);
+    if (hit) return hit;
+    if (node.kind !== 'dir') return null;
+    const prefix = `${node.path}/`;
+    for (const [p, s] of gitMap) {
+      if (p.endsWith('/') && p.startsWith(prefix)) return s; // 折叠目录(untracked)
+    }
+    return null;
+  }
+
+  function gitLetterClass(s) {
+    if (s === 'A' || s === 'U') return 'added';
+    if (s === 'D') return 'deleted';
+    if (s === 'R') return 'renamed';
+    return 'modified';
+  }
 
   let rootName = 'evo-agent(工作区)';
   let rootChildren = [];
@@ -602,6 +634,10 @@
           {:else}
             <span class="name">{node.name}</span>
           {/if}
+          {#if gitLetter(node)}
+            <span class="git-letter {gitLetterClass(gitLetter(node))}"
+              title="git:{gitLetter(node)}">{gitLetter(node)}</span>
+          {/if}
         </div>
         {#if naming && naming.mode !== 'rename' && naming.anchor === node.path}
           <div class="node naming" style="padding-left: {10 + (depth + 1) * 14}px">
@@ -768,6 +804,27 @@
   .name {
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .name + .git-letter {
+    margin-left: auto; /* 状态字母钉在行尾(VS Code 同款) */
+  }
+  .git-letter {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: var(--fw-sb);
+    flex-shrink: 0;
+  }
+  .git-letter.added {
+    color: var(--git-added);
+  }
+  .git-letter.modified {
+    color: var(--git-modified);
+  }
+  .git-letter.deleted {
+    color: var(--git-deleted);
+  }
+  .git-letter.renamed {
+    color: var(--git-renamed);
   }
   .name-input {
     flex: 1;

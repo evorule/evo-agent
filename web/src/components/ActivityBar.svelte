@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 EvoRule Project -->
-<!-- 活动栏(Trae 最左列):资源管理器/搜索(B2)/设置入口;后续阶段逐项点亮 -->
+<!-- 活动栏(Trae 最左列):资源管理器/搜索(B2)/源代码管理(B3)/设置入口;后续阶段逐项点亮 -->
 <script>
   import { sidebarView } from '../lib/stores.js';
 
@@ -10,6 +10,7 @@
   const items = [
     { id: 'explorer', label: '资源管理器', enabled: true },
     { id: 'search', label: '搜索', enabled: true },
+    { id: 'scm', label: '源代码管理', enabled: true },
     { id: 'audit', label: '审计(治理叠加阶段接入)', enabled: false },
     { id: 'settings', label: '设置', enabled: true },
   ];
@@ -48,6 +49,13 @@
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
           <circle cx="11" cy="11" r="6" />
           <path d="m20 20-4.5-4.5" />
+        </svg>
+      {:else if it.id === 'scm'}
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
+          <circle cx="7" cy="6" r="2.4" />
+          <circle cx="7" cy="18" r="2.4" />
+          <circle cx="17" cy="9" r="2.4" />
+          <path d="M7 8.4v7.2M17 11.4c0 3-2.5 3.6-7.6 3.6" />
         </svg>
       {:else if it.id === 'audit'}
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">

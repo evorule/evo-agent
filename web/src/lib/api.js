@@ -183,3 +183,58 @@ export function getEvolutionSignals(sessionId) {
     headers: headers(),
   }).then(unwrap);
 }
+
+// ===== Git REST 面(B3;7 端点薄委托 serve GitOps,错误体 {error, hint?}) =====
+
+/** 双态 status(暂存的更改 index vs HEAD + 更改 workdir vs index 含 untracked) */
+export function gitStatus() {
+  return fetch('/api/git/status', { headers: headers() }).then(unwrap);
+}
+
+/** 单文件两版全文 diff(HEAD vs 工作区;untracked original 为空串) */
+export function gitDiff(path) {
+  return fetch(`/api/git/diff?path=${encodeURIComponent(path)}`, {
+    headers: headers(),
+  }).then(unwrap);
+}
+
+/** 暂存(paths 数组;尾 `/` 折叠目录) */
+export function gitStage(paths) {
+  return fetch('/api/git/stage', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ paths }),
+  }).then(unwrap);
+}
+
+/** 取消暂存(paths 数组) */
+export function gitUnstage(paths) {
+  return fetch('/api/git/unstage', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ paths }),
+  }).then(unwrap);
+}
+
+/** 丢弃工作区变更(危险;untracked 直接删除) */
+export function gitDiscard(paths) {
+  return fetch('/api/git/discard', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ paths }),
+  }).then(unwrap);
+}
+
+/** 提交(全量暂存后提交;身份缺失返回结构化 identity_missing + hint) */
+export function gitCommit(message) {
+  return fetch('/api/git/commit', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ message }),
+  }).then(unwrap);
+}
+
+/** git 身份快照({identity_missing, name, email}) */
+export function gitIdentity() {
+  return fetch('/api/git/identity', { headers: headers() }).then(unwrap);
+}
