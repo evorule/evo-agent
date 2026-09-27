@@ -660,7 +660,7 @@ async fn run_agent(
         &merged_settings,
     );
     // 开关裁剪后同步收紧 def.tools(白名单声明=执行器=LLM 契约三者一致,
-    // 防 from_definition 早失败校验把「声明了默认关工具」误判为配置错误;O-142)
+    // 防 from_definition 早失败校验把「声明了默认关工具」误判为配置错误)
     crate::api::serve_tools::restrict_tools_to_surface(&mut def.tools, &filtered);
     // M5-a:能力边界接线(显式声明重绑 file 工具沙箱 + 生效边界注入 runner)
     let capability_boundary =
@@ -777,7 +777,7 @@ async fn run_agent_stream(
         &def.tools,
         &merged_settings,
     );
-    // 开关裁剪后同步收紧 def.tools(同 run_agent 口径;O-142)
+    // 开关裁剪后同步收紧 def.tools(同 run_agent 口径)
     crate::api::serve_tools::restrict_tools_to_surface(&mut def.tools, &filtered);
     // M5-a:能力边界接线(同 run_agent 口径)
     let capability_boundary =

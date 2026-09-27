@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! git 工具族(B3 agent 面)——两级注册治理(17 号工具面配置指南 §3.2)
+//! git 工具族——两级注册治理（工具面配置指南 §3.2）
 //!
 //! | 工具 | 开关组 | 审批层 | 默认 |
 //! |---|---|---|---|
