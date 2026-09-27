@@ -354,7 +354,7 @@ impl GitOps {
         };
 
         let fs_path = self.workdir.join(&path);
-        let modified = if fs_path.is_file() {
+        let mut modified = if fs_path.is_file() {
             std::fs::read(&fs_path)
                 .map_err(|e| GitError::Io(e.to_string()))
                 .and_then(|bytes| {
@@ -364,6 +364,21 @@ impl GitOps {
         } else {
             String::new() // 工作区已删除 → modified 为空 = 全删除
         };
+
+        // autocrlf 语义对齐（O-143）：库内 blob 为 LF、工作区为 CRLF 时，git 的
+        // clean filter 在比较前把工作区 CRLF→LF（`git diff` 对 clean 文件输出空）。
+        // 手工取两版全文绕过了 filter，会在 autocrlf=true/input 的 Windows 环境
+        // 对 clean 文件产生「全行假差异」——此处按同语义规范化工作区内容：
+        // 仅当 HEAD 侧 blob 不含 CR（入库为 LF）且 core.autocrlf 为 true/input。
+        // 已知覆盖边界：`.gitattributes` 的 text/eol 自定义属性不展开（登记 O-143）。
+        if !original.is_empty() && !original.contains('\r') && modified.contains("\r\n") {
+            if let Ok(mode) = repo.config().and_then(|c| c.get_string("core.autocrlf")) {
+                let m = mode.to_ascii_lowercase();
+                if m == "true" || m == "input" || m == "1" || m == "yes" || m == "on" {
+                    modified = modified.replace("\r\n", "\n");
+                }
+            }
+        }
 
         if original.is_empty() && modified.is_empty() {
             return Err(GitError::Invalid(format!("no content to diff for: {path}")));
@@ -933,10 +948,45 @@ mod tests {
     }
 
     #[test]
+    fn test_diff_autocrlf_clean_file_no_false_changes() {
+        // O-143：autocrlf=true 时库内 LF blob vs 工作区 CRLF，clean 文件必须
+        // 判空差异（对齐 `git diff` 的 clean filter 语义），真修改照常显示
+        let (_d, ops) = fresh_repo();
+        set_identity(&ops, "T", "t@example.com");
+        {
+            let repo = ops.open().unwrap();
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("core.autocrlf", "true").unwrap();
+        }
+        seed_commit(&ops, "a.rs", "fn old() {}\n", "init");
+
+        // clean（内容一致，仅换行形态不同）→ 两版相等 = 无差异
+        std::fs::write(ops.workdir.join("a.rs"), "fn old() {}\r\n").unwrap();
+        let d = ops.diff("a.rs").unwrap();
+        assert_eq!(d.original, "fn old() {}\n");
+        assert_eq!(d.modified, "fn old() {}\n");
+
+        // 真修改（CRLF 工作区 + 内容不同）→ 规范化后仍显示真实差异
+        std::fs::write(ops.workdir.join("a.rs"), "fn new() {}\r\n").unwrap();
+        let d2 = ops.diff("a.rs").unwrap();
+        assert_eq!(d2.original, "fn old() {}\n");
+        assert_eq!(d2.modified, "fn new() {}\n");
+
+        // autocrlf 未设（缺省 false）→ 不规范化，保持字节级两版全文
+        {
+            let repo = ops.open().unwrap();
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("core.autocrlf", "false").unwrap();
+        }
+        std::fs::write(ops.workdir.join("a.rs"), "fn old() {}\r\n").unwrap();
+        let d3 = ops.diff("a.rs").unwrap();
+        assert_eq!(d3.modified, "fn old() {}\r\n");
+    }
+
+    #[test]
     fn test_exclude_isolation_idempotent_and_gitignore_untouched() {
         let (_d, ops) = fresh_repo();
         // GitOps::new 已执行一次；再显式执行两次 → 幂等且只追加一条
-        ops.ensure_exclude().unwrap();
         ops.ensure_exclude().unwrap();
         let content = std::fs::read_to_string(ops.workdir.join(".git/info/exclude")).unwrap();
         let hits = content.lines().filter(|l| l.trim() == TRASH_DIR).count();
