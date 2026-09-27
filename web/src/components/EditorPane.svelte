@@ -13,7 +13,7 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
-  import { setupMonaco, monaco } from '../lib/monaco-setup.js';
+  import { setupMonaco, monaco, jsonDiagnosticsOptions } from '../lib/monaco-setup.js';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
   import { uriSpecFor, initDiagnostics, rebindPath } from '../lib/diagnostics.js';
   import SettingsEditor from './SettingsEditor.svelte';
@@ -156,15 +156,19 @@
   }
 
   // 设置 JSON Schema:仅在用户层设置 tab 激活期间挂载(fileMatch 限定该虚拟 URI,
-  // 其他 JSON 文件不受影响),离开时摘除 schema(保留基础语法校验)。
+  // 其他 JSON 文件不受影响),离开时摘除 schema(恢复基线语法校验,validate
+  // 随 problems.json.validate 设置键联动)。
+  /** problems.json.validate 当前值(缺省视为开;仅显式 false 关闭) */
+  function jsonValidateEnabled() {
+    return get(settingsState).settings['problems.json.validate'] !== false;
+  }
+
   function mountSettingsSchema() {
     if (!monaco.languages.json?.jsonDefaults) return;
     const entries = get(settingsState).entries;
     if (!entries.length) return;
     monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
-      validate: true,
-      allowComments: false,
-      enableSchemaRequest: false,
+      ...jsonDiagnosticsOptions(jsonValidateEnabled()),
       schemas: [
         {
           uri: 'evo://workbench-settings.schema.json',
@@ -177,11 +181,22 @@
 
   function unmountSettingsSchema() {
     if (!monaco.languages.json?.jsonDefaults) return;
-    monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
-      validate: true,
-      allowComments: false,
-      schemas: [],
-    });
+    monaco.languages.json.jsonDefaults.setDiagnosticsOptions(jsonDiagnosticsOptions(jsonValidateEnabled()));
+  }
+
+  /** problems.json.validate 联动:开→按挂载态恢复基线/Schema;关→整体停用并清除现有 json 标记 */
+  function syncJsonValidation() {
+    if (!monaco.languages.json?.jsonDefaults) return;
+    if (!jsonValidateEnabled()) {
+      monaco.languages.json.jsonDefaults.setDiagnosticsOptions(jsonDiagnosticsOptions(false));
+      for (const m of monaco.editor.getModels()) {
+        if (m.getLanguageId() === 'json') monaco.editor.setModelMarkers(m, 'json', []);
+      }
+      return;
+    }
+    const entries = get(settingsState).entries;
+    if (get(activePath) === USER_SETTINGS_URI && entries.length) mountSettingsSchema();
+    else unmountSettingsSchema();
   }
 
   // ---- 设置消费:编辑器外观与行为由设置快照下发(默认值=原硬编码行为) ----
@@ -490,6 +505,7 @@
     });
     const unsubSettings = settingsState.subscribe(() => {
       if (editor) applySettingsToEditors();
+      syncJsonValidation();
     });
     return () => {
       unregisterCommand('workbench.action.file.save');

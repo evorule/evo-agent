@@ -263,6 +263,26 @@ pub fn schema() -> Vec<SettingEntry> {
             description: "全局搜索排除的路径 glob 列表（serve 端另有恒叠加工集）",
             scope: "window",
         },
+        SettingEntry {
+            key: "problems.json.validate",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "问题",
+            description: "JSON 文件语法校验（编辑器内实时波浪线与问题面板条目；关闭即清除现有标记）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "problems.markdown.lint",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "问题",
+            description: "Markdown 轻量校验（标题跳级/重复、代码围栏配对、行尾空白；关闭即清除现有标记）",
+            scope: "window",
+        },
     ]
 }
 
@@ -573,7 +593,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 17);
+        assert_eq!(settings.len(), 19);
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -599,6 +619,9 @@ mod tests {
                 "data/**"
             ])
         );
+        // problems.* 诊断面 2 键(问题面板/编辑器校验开关)
+        assert_eq!(settings["problems.json.validate"], json!(true));
+        assert_eq!(settings["problems.markdown.lint"], json!(true));
         for (k, v) in &sources {
             assert_eq!(v, &json!("default"), "key {k} should be default");
         }
