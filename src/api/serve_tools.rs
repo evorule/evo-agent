@@ -263,7 +263,7 @@ const TOOL_SWITCH_KEYS: &[(&str, &str, bool)] = &[
     ("file_move", "agentTools.fileMove", false),
     ("file_delete", "agentTools.fileDelete", false),
     ("grep_files", "agentTools.grep", true),
-    // B3 git 两级注册(17 号 §3.2):读面 active 标配开,写面 candidate 标配关
+    // git 两级注册:读面 active 标配开,写面 candidate 标配关
     ("git_status", "agentTools.gitRead", true),
     ("git_diff", "agentTools.gitRead", true),
     ("git_log", "agentTools.gitRead", true),
@@ -308,7 +308,7 @@ pub fn build_filtered_toolkit_with_switches(
 /// 开关关掉的工具从声明面同步移除——否则 [`crate::agent::runner::AgentRunner::
 /// from_definition`] 的早失败校验(白名单 ⊆ 注册执行器)会把「声明了默认关工具」
 /// 误判为配置错误,HTTP run/stream 路径直接 500(而 WS 路径用 `AgentRunner::new`
-/// 无校验,两路径行为分裂;O-142 实证)。
+/// 无校验,两路径行为分裂;HTTP run 路径实测暴露)。
 ///
 /// 必须在 `wire_capability_boundary` / `apply_l2_feed_forward` 等消费 def.tools
 /// 之前调用,使能力边界与 L2 判定同样基于过滤后的真实工具面(关着的工具不进边界)。
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     fn test_restrict_tools_to_surface_drops_switched_off() {
-        // O-142:声明了默认关工具的 agent,from_definition 早失败校验会把
+        // 声明了默认关工具的 agent,from_definition 早失败校验会把
         // 「白名单 ⊄ 注册执行器」误判为配置错误 → restrict 后声明面与
         // 实际工具面一致,HTTP run/stream 路径不再 500
         let (ws, ev) = make_clients();
@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_build_filtered_toolkit_git_switches_two_level() {
-        // B3 git 两级注册(17 号 §3.2):gitRead 开 / gitWrite 关
+        // git 两级注册:gitRead 开 / gitWrite 关
         let (ws, ev) = make_clients();
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
         let whitelist: Vec<String> = [

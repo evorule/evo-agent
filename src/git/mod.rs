@@ -5,7 +5,7 @@
 //! Git 基础面核心层（B3）—— SCM 侧栏 / REST git 面 / agent git 工具的单一实现
 //!
 //! 三个消费面（REST `git_api`、agent `git_tools`、未来 B15）都薄委托本模块，
-//! 保证「agent 与人看到同一份 git 语义」。职责与边界（设计档 06 号 §3.2）：
+//! 保证「agent 与人看到同一份 git 语义」。职责与边界（板块设计档 §3.2）：
 //!
 //! - **双态 status**：`暂存的更改`（index vs HEAD）+ `更改`（workdir vs index，
 //!   untracked 并入更改组——VS Code 同款两组模型）；全量 status 恒带 rename
@@ -17,12 +17,12 @@
 //! - **提交流程**：身份预检（user.name/email 缺失→结构化错误）→ hooks 检测
 //!   （存在 pre-commit/commit-msg → CLI 子进程回退，libgit2 不跑 hooks 的已知
 //!   差异被此弥合）→ 无 hooks 走 git2 原生提交；
-//! - **`.evo-*` 工具私有目录隔离**（04 号 §八#6 闭环）：确保 workdir
+//! - **`.evo-*` 工具私有目录隔离**（文件 API 批次遗留待办闭环）：确保 workdir
 //!   `.git/info/exclude` 含 `.evo-trash/`——info/exclude 是 git 官方本地忽略位，
 //!   不污染用户 .gitignore / 不进版本库；
 //! - **边缘形态拒绝**：`.git` 为文件（worktree/submodule）→ 明确报错不半残工作。
 //!
-//! 治理边界（06 号 §四）：本模块不读不改 git config（身份缺失只报错引导用户
+//! 治理边界（板块设计档）：本模块不读不改 git config（身份缺失只报错引导用户
 //! 自行配置）；CLI 回退仅白名单子命令（`add -A` / `commit --file=-`）、argv
 //! 数组构造无 shell、消息走 stdin、30s 超时、工作目录锁死 workdir。
 
@@ -37,7 +37,7 @@ use serde::Serialize;
 /// evo-agent 工具私有目录（B7 软删除回收站）——git status 中必须不可见
 pub const TRASH_DIR: &str = ".evo-trash/";
 
-/// CLI 回退单条子命令超时（设计档 06 号 §四：30s 硬性 DoD）
+/// CLI 回退单条子命令超时（板块设计档：30s 硬性 DoD）
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// stderr 透传尾部最大字节数（防长输出刷屏，保留离错误最近的部分）
@@ -48,7 +48,7 @@ const STDERR_TAIL_BYTES: usize = 800;
 pub enum GitError {
     /// workdir 不是 git 仓库（无 `.git` 目录）→ 400
     NotARepository,
-    /// `.git` 为文件（worktree/submodule 等边缘形态）→ 400（06 号 §八#5）
+    /// `.git` 为文件（worktree/submodule 等边缘形态）→ 400（板块设计档裁定）
     NotSupported(&'static str),
     /// 提交身份缺失（user.name/user.email 任一为空）→ 400 + 引导 hint
     IdentityMissing,
@@ -166,7 +166,7 @@ pub struct GitOps {
 
 impl GitOps {
     /// 构造 GitOps（构造即执行 info/exclude 隔离；不可写降级仅告警，见
-    /// [`Self::ensure_exclude`]——设计档 06 号 §3.2「serve 启动时确保」语义，
+    /// [`Self::ensure_exclude`]——板块设计档「serve 启动时确保」语义，
     /// 每次构造自愈等价且更强）
     pub fn new(workdir: PathBuf) -> Self {
         let ops = Self { workdir };
@@ -365,12 +365,12 @@ impl GitOps {
             String::new() // 工作区已删除 → modified 为空 = 全删除
         };
 
-        // autocrlf 语义对齐（O-143）：库内 blob 为 LF、工作区为 CRLF 时，git 的
+        // autocrlf 语义对齐：库内 blob 为 LF、工作区为 CRLF 时，git 的
         // clean filter 在比较前把工作区 CRLF→LF（`git diff` 对 clean 文件输出空）。
         // 手工取两版全文绕过了 filter，会在 autocrlf=true/input 的 Windows 环境
         // 对 clean 文件产生「全行假差异」——此处按同语义规范化工作区内容：
         // 仅当 HEAD 侧 blob 不含 CR（入库为 LF）且 core.autocrlf 为 true/input。
-        // 已知覆盖边界：`.gitattributes` 的 text/eol 自定义属性不展开（登记 O-143）。
+        // 已知覆盖边界：`.gitattributes` 的 text/eol 自定义属性不展开（登记册留痕）。
         if !original.is_empty() && !original.contains('\r') && modified.contains("\r\n") {
             if let Ok(mode) = repo.config().and_then(|c| c.get_string("core.autocrlf")) {
                 let m = mode.to_ascii_lowercase();
@@ -491,7 +491,7 @@ impl GitOps {
 
     /// 读提交身份（user.name + user.email；任一缺失/为空 → None）
     ///
-    /// 只读不写——serve 代写 git config 越权，明确不做（06 号 §四）。
+    /// 只读不写——serve 代写 git config 越权，明确不做（板块设计档）。
     pub fn identity(&self) -> Result<Option<(String, String)>, GitError> {
         let repo = self.open()?;
         let config = repo
@@ -507,7 +507,7 @@ impl GitOps {
 
     /// 检测提交 hooks（pre-commit / commit-msg 任一存在且可执行）
     ///
-    /// Windows 无可执行位语义 → 仅存在性判定（06 号 §八#3：Windows 场景 hooks 少见）。
+    /// Windows 无可执行位语义 → 仅存在性判定（Windows 场景 hooks 少见）。
     pub fn has_commit_hooks(&self) -> Result<bool, GitError> {
         let hooks = self.workdir.join(".git").join("hooks");
         for name in ["pre-commit", "commit-msg"] {
@@ -588,7 +588,7 @@ impl GitOps {
 
     /// CLI 回退提交（hooks 保真路径）：`git add -A` + `git commit --file=-`（stdin 传消息）
     ///
-    /// 硬性约束（06 号 §四 DoD）：argv 数组构造 / 无 shell / 仅白名单子命令
+    /// 硬性约束（板块设计档 DoD）：argv 数组构造 / 无 shell / 仅白名单子命令
     /// （add·commit）/ 消息走 stdin（防参数长度与转义）/ 30s 超时 / 工作目录锁死 workdir。
     fn commit_cli(&self, message: &str) -> Result<String, GitError> {
         run_git_cli(&self.workdir, &["add", "-A"], None)?;
@@ -949,7 +949,7 @@ mod tests {
 
     #[test]
     fn test_diff_autocrlf_clean_file_no_false_changes() {
-        // O-143：autocrlf=true 时库内 LF blob vs 工作区 CRLF，clean 文件必须
+        // autocrlf=true 时库内 LF blob vs 工作区 CRLF，clean 文件必须
         // 判空差异（对齐 `git diff` 的 clean filter 语义），真修改照常显示
         let (_d, ops) = fresh_repo();
         set_identity(&ops, "T", "t@example.com");
