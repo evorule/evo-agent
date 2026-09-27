@@ -34,7 +34,30 @@
 
 ---
 
-## [Unreleased]
+## [0.2.0] - 2026-09-27
+
+**v0.1.0 首发后的能力面总览（补记）+ 近期批次详录。**
+
+### ⚠️ Breaking Change
+
+- **宪法单轮指令映射化（agent 宪法 v0.5.0）** — `react_iteration` / `collect` 工具扇出 / `merge` 结果回环退役，LLM/工具多轮编排上收应用层 runner；agent 宪法 schema 随动并加载防呆
+- **与 evorule 引擎 crate 完全解耦** — 移除 `evorule-tcb` / `evorule-reactor` 本地 path 依赖，改 crates.io/git 依赖供给（引擎经 evorule-server HTTP 面消费）
+
+### 🆕 新增（总览补记）
+
+- **记忆系统**（P0+P1）— TTL / 消息持久化 / stable 层读侧去重（latest-wins + 墓碑抑制 + 新鲜度排序）/ 对账与离线兜底复活 / events 评分 CJK 感知分词（中文召回退化修复）/ 事件提取接线 sediment / Shared 读路径与召回同源 / token 估算 CJK 校准 / 裁剪降级可见；memory cache 定期校验与真相源对齐（server wins）
+- **审计链加固** — 「审计即记忆」结构性修复（SafetyAuditor 接入召回 / AuditedLlm 生产必挂 / 吞错改 warn 留痕）；sidecar 建链瞬态错误有界重试；召回降级 fail-visible（degradation_notices 进 prompt 与审计链）；rollup 标记失败重试；审批链留痕与身份验证；共享事实 `origin_fact_id` 双兼容消费
+- **plan-execute 与工作流引擎** — plan-execute 外层驱动循环与 planner 节点落地；workflow_dag v1.1 节点级条件分支 `run_when`；v1.2 物化器、compute 纯函数节点与 replan 触发判定；enforce 一票否决与 planner 重试面、静态拦截、成本埋点（tokens_used/replan_tokens/repeated_nodes）
+- **工具面扩容（42 工具）** — bundles 部署闭环 + knowledge 数据面；git 工具五件套（gitRead/gitWrite 双层级注册）与 Git REST 端点；file_create/file_move/file_delete 与开关切换；grep_files 项目内容搜索；服务消费桥（发现 server 插件服务注册为代理工具，动态 schema 带参调用）
+- **自进化系统** — L2 约束（元规则）只读消费面；自进化工具面（evolution_signals/rule_promote）真实 LLM 全链 E2E；进化巡视任务模式（patrol 子命令）与草稿提交期 enforce 语义校验
+- **内置 IDE 工作台**（Svelte+Monaco，serve 托管 web/dist）— 命令面板与全局快捷键路由；设置体系（两级合并/缓存回放/schema 表单/JSON 编辑/键位迁移）；文件树与文件 API（创建/重命名/删除/拖拽移动/WS 实时刷新）；全局搜索替换（预览+原子应用）；Git 基础面（双态变更列表/装饰/编辑器 diff 页签）；诊断与问题面板（单源诊断模型/JSON 校验/Markdown lint/问题导航，消费契约冻结）；quick open；会话列表与历史恢复；多标签编辑器
+- **serve API 面** — run/stream 工具执行回路真实化；`GET /version` 运行体身份端点（与启动横幅单一事实源）；LLM 命名操作端点（/ops）；LLM 配置状态端点；意图裁定独立会话通道（误拦修复）与悬挂 io_request 关闭；流式 Violation 分支消费
+- **运维** — 看门狗/开机自启/密钥自动注入脚本族；serve 启动期 .env 自动加载与密钥缺失告警；审计深链探活与 console 审计页配置化自动拉起
+
+### 🔒 安全
+
+- file_write 沙箱逃逸修复 — junction 父目录与悬空 symlink 写穿 writable_dir（CWE-59）；客户端路径段校验
+- 审计深链/凭据可视化面鉴权边界收口；公开面清修批次（署名头中性化/机器路径与私有仓名移除）
 
 ### 🆕 新增
 - **REST run/stream 会话进工作台索引（修复：run 会话不可见）+ 响应携带 `session_id`（id 关联收口）** — `consume_to_done` 增捕获流中 `SessionCreated` 会话 ID；`POST /agents/{type}/run` 完成后与 `run/stream` SSE 的 `SessionCreated` 臂均按 WS 面同口径挂本地会话索引（title=goal 截 60 字符，record fail-soft）；`AgentRunResponse` 增可选 `session_id` 字段（`skip_serializing_if` 省略 None，旧消费者零影响）——消费者凭此直查 18080 权威面或工作台回放。真实 MiniMax E2E 十二断言全 PASS（run 会话与 stream 会话均入 8081 索引、title 截断、transcript 投影）；E2E 证据留档
