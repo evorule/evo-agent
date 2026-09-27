@@ -36,12 +36,15 @@
     refreshGitStatus,
     gitStatus,
     openGitDiff,
+    openFile,
   } from './lib/stores.js';
   import { loadSettings } from './lib/settings.js';
   import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
   import { initContextTracking } from './lib/context-keys.js';
   import { getEffectiveRules, resolveKeybinding, migrateKeybindings } from './lib/keybindings.js';
   import { gitStage } from './lib/api.js';
+  import { nextProblem, markerToReveal } from './lib/diagnostics.js';
+  import { openBottomPanel } from './lib/panel.js';
 
   reconnectFromStorage();
 
@@ -66,6 +69,10 @@
     'workbench.action.git.stageAll',
     'workbench.action.git.refresh',
     'workbench.action.git.openDiff',
+    'workbench.action.problems.focus',
+    'workbench.action.problems.next',
+    'workbench.action.problems.prev',
+    'workbench.action.problems.nextInFile',
   ];
   let cleanupTracking = null;
 
@@ -86,6 +93,14 @@
     sidebarView.set('scm');
     explorerVisible.set(true);
     refreshGitStatus(0);
+  }
+
+  /** 问题导航(F8 系):按确定性序取下一个/上一个问题并聚焦。
+   *  inFile=仅在当前文件内循环;无问题时不动作(不自动弹面板)。 */
+  function gotoProblem({ inFile = false, backward = false } = {}) {
+    const m = nextProblem({ activePath: get(activePath), inFile, backward });
+    if (!m) return;
+    openFile(m.path, markerToReveal(m));
   }
 
   onMount(() => {
@@ -222,6 +237,30 @@
         if (path) openGitDiff(path);
         else showScm(); // 无参调用(命令面板)→ 聚源代码管理视图选文件
       },
+    });
+    registerCommand({
+      id: 'workbench.action.problems.focus',
+      title: '打开问题面板',
+      category: '问题',
+      run: () => openBottomPanel('problems'),
+    });
+    registerCommand({
+      id: 'workbench.action.problems.next',
+      title: '转到下一个问题',
+      category: '问题',
+      run: () => gotoProblem(),
+    });
+    registerCommand({
+      id: 'workbench.action.problems.prev',
+      title: '转到上一个问题',
+      category: '问题',
+      run: () => gotoProblem({ backward: true }),
+    });
+    registerCommand({
+      id: 'workbench.action.problems.nextInFile',
+      title: '转到文件内下一个问题',
+      category: '问题',
+      run: () => gotoProblem({ inFile: true }),
     });
     loadSettings(); // 设置快照加载(失败降级缓存只读;编辑器参数订阅在 EditorPane)
     migrateKeybindings(); // 旧键位覆盖层一次性迁移(失败保留旧键,下次启动重试)

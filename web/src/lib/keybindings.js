@@ -31,6 +31,9 @@ export const DEFAULT_KEYBINDINGS = [
   { key: 'ctrl+shift+f', command: 'workbench.action.search.show', when: '!inPalette' },
   { key: 'ctrl+shift+h', command: 'workbench.action.search.replace', when: '!inPalette' },
   { key: 'f2', command: 'explorer.rename', when: 'explorerFocus' },
+  { key: 'f8', command: 'workbench.action.problems.next', when: '!inPalette' },
+  { key: 'shift+f8', command: 'workbench.action.problems.prev', when: '!inPalette' },
+  { key: 'alt+f8', command: 'workbench.action.problems.nextInFile', when: '!inPalette' },
 ];
 
 // ---- key 规范化 ----
