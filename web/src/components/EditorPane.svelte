@@ -15,6 +15,7 @@
   import { get } from 'svelte/store';
   import { setupMonaco, monaco } from '../lib/monaco-setup.js';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
+  import { uriSpecFor, initDiagnostics, rebindPath } from '../lib/diagnostics.js';
   import SettingsEditor from './SettingsEditor.svelte';
   import {
     tabs,
@@ -112,7 +113,14 @@
 
   function modelFor(tab) {
     if (models.has(tab.path)) return models.get(tab.path);
-    const model = monaco.editor.createModel(tab.content, langOf(tab.path));
+    // 正式文件 model 挂规约 Uri(诊断按 path 关联 model 的前提;设置虚拟路径
+    // 原样透传使设置 Schema 的 fileMatch 真正命中)。重复打开同 path 由上方
+    // 缓存键拦截,同 Uri 二次 createModel 不会发生。
+    const model = monaco.editor.createModel(
+      tab.content,
+      langOf(tab.path),
+      monaco.Uri.parse(uriSpecFor(tab.path)),
+    );
     model.updateOptions({ tabSize: tabSizeValue() });
     baseline.set(tab.path, tab.content);
     models.set(tab.path, model);
@@ -352,6 +360,7 @@
 
   onMount(() => {
     setupMonaco();
+    const disposeDiagnostics = initDiagnostics(monaco); // 诊断单源(model 生命周期/聚合/F8)
     welcomeModel = monaco.editor.createModel(welcomeText, 'markdown');
     welcomeModel.updateOptions({ tabSize: tabSizeValue() });
     const o = appearanceOptions();
@@ -426,7 +435,10 @@
       moveKey(draftModels);
     };
     const unsubRename = lastRename.subscribe((r) => {
-      if (r) migratePathCaches(r.from, r.to);
+      if (r) {
+        migratePathCaches(r.from, r.to);
+        rebindPath(r.from, r.to); // 诊断注册表同步重绑(model 原对象保留,undo 栈不破)
+      }
     });
     // tab 关闭即弃:对 tabs 集合做 diff,销毁被关路径的全部 model 缓存
     // (重开=从磁盘重载;防复用含未保存残文的陈旧 model 且 dirty 失真)。
@@ -482,6 +494,7 @@
     return () => {
       unregisterCommand('workbench.action.file.save');
       unregisterCommand('editor.action.toggleDiff');
+      disposeDiagnostics();
       if (unsubActive) unsubActive();
       unsubReveal();
       unsubGitDiff();
