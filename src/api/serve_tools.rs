@@ -302,6 +302,20 @@ pub fn build_filtered_toolkit_with_switches(
     filtered
 }
 
+/// 把 `def.tools` 收紧为 filtered toolkit 实际注册的工具面(白名单 ∩ 开关开)。
+///
+/// 保证「白名单声明 = 执行器注册 = LLM 契约」三者一致:声明了但被 agentTools.*
+/// 开关关掉的工具从声明面同步移除——否则 [`crate::agent::runner::AgentRunner::
+/// from_definition`] 的早失败校验(白名单 ⊆ 注册执行器)会把「声明了默认关工具」
+/// 误判为配置错误,HTTP run/stream 路径直接 500(而 WS 路径用 `AgentRunner::new`
+/// 无校验,两路径行为分裂;O-142 实证)。
+///
+/// 必须在 `wire_capability_boundary` / `apply_l2_feed_forward` 等消费 def.tools
+/// 之前调用,使能力边界与 L2 判定同样基于过滤后的真实工具面(关着的工具不进边界)。
+pub fn restrict_tools_to_surface(def_tools: &mut Vec<String>, filtered: &ToolHandler) {
+    def_tools.retain(|t| filtered.has_tool(t));
+}
+
 // =============================================================================
 // M5-a 能力边界:生效边界合成 + 声明绑定(serve 三路径与 CLI 共用)
 // =============================================================================
@@ -603,6 +617,37 @@ mod tests {
         assert!(filtered.has_tool("file_create"));
         assert!(!filtered.has_tool("file_move"));
         assert!(!filtered.has_tool("file_delete"));
+    }
+
+    #[test]
+    fn test_restrict_tools_to_surface_drops_switched_off() {
+        // O-142:声明了默认关工具的 agent,from_definition 早失败校验会把
+        // 「白名单 ⊄ 注册执行器」误判为配置错误 → restrict 后声明面与
+        // 实际工具面一致,HTTP run/stream 路径不再 500
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let whitelist: Vec<String> = ["file_read", "file_move", "file_delete"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // 默认(键缺失):fileMove/fileDelete 关 → 声明面同步收紧
+        let filtered =
+            build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
+        let mut def_tools = whitelist.clone();
+        restrict_tools_to_surface(&mut def_tools, &filtered);
+        assert!(def_tools.contains(&"file_read".to_string()));
+        assert!(!def_tools.contains(&"file_move".to_string()));
+        assert!(!def_tools.contains(&"file_delete".to_string()));
+
+        // 开关全开后:声明面恢复完整
+        let mut settings = serde_json::Map::new();
+        settings.insert("agentTools.fileMove".to_string(), serde_json::json!(true));
+        settings.insert("agentTools.fileDelete".to_string(), serde_json::json!(true));
+        let filtered = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        let mut def_tools = whitelist.clone();
+        restrict_tools_to_surface(&mut def_tools, &filtered);
+        assert_eq!(def_tools.len(), 3);
     }
 
     #[test]

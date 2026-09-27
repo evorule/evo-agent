@@ -547,6 +547,10 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         &def.tools,
         &merged_settings,
     );
+    // 开关裁剪后同步收紧 def.tools(同 HTTP 端点口径:白名单声明=执行器=LLM 契约
+    // 三者一致;WS 路径虽无 from_definition 校验,能力边界/L2 判定消费 def.tools
+    // 也应基于过滤后的真实工具面;O-142)
+    crate::api::serve_tools::restrict_tools_to_surface(&mut def.tools, &filtered);
     // M5-a:能力边界接线(同 HTTP 端点口径:声明重绑工具面 + 生效边界注入 runner)
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
