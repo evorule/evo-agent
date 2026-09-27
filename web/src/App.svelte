@@ -34,11 +34,14 @@
     openSettingsTab,
     openSettingsJson,
     refreshGitStatus,
+    gitStatus,
+    openGitDiff,
   } from './lib/stores.js';
   import { loadSettings } from './lib/settings.js';
   import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
   import { initContextTracking } from './lib/context-keys.js';
   import { getEffectiveRules, resolveKeybinding, migrateKeybindings } from './lib/keybindings.js';
+  import { gitStage } from './lib/api.js';
 
   reconnectFromStorage();
 
@@ -59,6 +62,10 @@
     'workbench.action.search.show',
     'workbench.action.search.replace',
     'workbench.action.search.clear',
+    'workbench.action.git.commit',
+    'workbench.action.git.stageAll',
+    'workbench.action.git.refresh',
+    'workbench.action.git.openDiff',
   ];
   let cleanupTracking = null;
 
@@ -72,6 +79,13 @@
     sidebarView.set('search');
     explorerVisible.set(true);
     searchIntent.set(intent);
+  }
+
+  /** 源代码管理视图入口:切视图 + 保证侧栏可见 + 立即刷新状态 */
+  function showScm() {
+    sidebarView.set('scm');
+    explorerVisible.set(true);
+    refreshGitStatus(0);
   }
 
   onMount(() => {
@@ -176,6 +190,38 @@
       title: '清除搜索结果',
       category: '搜索',
       run: () => searchIntent.set('clear'),
+    });
+    registerCommand({
+      id: 'workbench.action.git.commit',
+      title: 'Git: 提交',
+      category: 'Git',
+      run: showScm, // 提交需消息输入 → 聚焦源代码管理视图(提交框)
+    });
+    registerCommand({
+      id: 'workbench.action.git.stageAll',
+      title: 'Git: 暂存全部更改',
+      category: 'Git',
+      run: async () => {
+        const st = get(gitStatus);
+        const paths = (st?.changes || []).map((e) => e.path);
+        if (paths.length) await gitStage(paths);
+        refreshGitStatus(0);
+      },
+    });
+    registerCommand({
+      id: 'workbench.action.git.refresh',
+      title: 'Git: 刷新状态',
+      category: 'Git',
+      run: () => refreshGitStatus(0),
+    });
+    registerCommand({
+      id: 'workbench.action.git.openDiff',
+      title: 'Git: 打开差异视图',
+      category: 'Git',
+      run: (path) => {
+        if (path) openGitDiff(path);
+        else showScm(); // 无参调用(命令面板)→ 聚源代码管理视图选文件
+      },
     });
     loadSettings(); // 设置快照加载(失败降级缓存只读;编辑器参数订阅在 EditorPane)
     migrateKeybindings(); // 旧键位覆盖层一次性迁移(失败保留旧键,下次启动重试)
