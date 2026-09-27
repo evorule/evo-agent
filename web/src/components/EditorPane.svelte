@@ -15,7 +15,8 @@
   import { get } from 'svelte/store';
   import { setupMonaco, monaco, jsonDiagnosticsOptions } from '../lib/monaco-setup.js';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
-  import { uriSpecFor, initDiagnostics, rebindPath } from '../lib/diagnostics.js';
+  import { uriSpecFor, initDiagnostics, rebindPath, setDiagnostics, clearDiagnostics } from '../lib/diagnostics.js';
+  import { lintMarkdown, LINT_MAX_LENGTH } from '../lib/markdown-lint.js';
   import SettingsEditor from './SettingsEditor.svelte';
   import {
     tabs,
@@ -124,6 +125,7 @@
     model.updateOptions({ tabSize: tabSizeValue() });
     baseline.set(tab.path, tab.content);
     models.set(tab.path, model);
+    if (model.getLanguageId() === 'markdown') lintMarkdownModel(tab.path, model); // 初次内容即校验
     return model;
   }
 
@@ -197,6 +199,55 @@
     const entries = get(settingsState).entries;
     if (get(activePath) === USER_SETTINGS_URI && entries.length) mountSettingsSchema();
     else unmountSettingsSchema();
+  }
+
+  // ---- Markdown 轻校验(自写 4 规则,去抖触发;诊断经单源 owner 'markdown.lint') ----
+
+  /** path → 去抖计时器(tab 关闭/重命名即取消,防对已不存在的 path 回写缓存) */
+  const lintTimers = new Map();
+  const LINT_DEBOUNCE_MS = 500;
+
+  /** problems.markdown.lint 当前值(缺省视为开;仅显式 false 关闭) */
+  function markdownLintEnabled() {
+    return get(settingsState).settings['problems.markdown.lint'] !== false;
+  }
+
+  function lintMarkdownModel(path, model) {
+    if (!markdownLintEnabled()) return;
+    if (model.getValueLength() > LINT_MAX_LENGTH) {
+      setDiagnostics(path, 'markdown.lint', []); // 超限跳过并清旧标记(防卡顿)
+      return;
+    }
+    setDiagnostics(path, 'markdown.lint', lintMarkdown(model.getValue()));
+  }
+
+  function scheduleMarkdownLint(path, model) {
+    if (model.getLanguageId() !== 'markdown') return;
+    cancelMarkdownLint(path);
+    lintTimers.set(
+      path,
+      setTimeout(() => {
+        lintTimers.delete(path);
+        lintMarkdownModel(path, model);
+      }, LINT_DEBOUNCE_MS),
+    );
+  }
+
+  function cancelMarkdownLint(path) {
+    const t = lintTimers.get(path);
+    if (t) {
+      clearTimeout(t);
+      lintTimers.delete(path);
+    }
+  }
+
+  /** problems.markdown.lint 联动:关→清全部 markdown 标记;开→全量重算(纯文本扫描,代价小) */
+  function syncMarkdownLint() {
+    for (const [path, model] of models.entries()) {
+      if (model.getLanguageId() !== 'markdown') continue;
+      if (markdownLintEnabled()) lintMarkdownModel(path, model);
+      else setDiagnostics(path, 'markdown.lint', []);
+    }
   }
 
   // ---- 设置消费:编辑器外观与行为由设置快照下发(默认值=原硬编码行为) ----
@@ -399,6 +450,7 @@
       const model = models.get(path);
       if (model && editor.getModel() === model) {
         markDirty(path, model.getValue() !== baseline.get(path));
+        scheduleMarkdownLint(path, model); // markdown 去抖校验(非 markdown 直接跳过)
       }
     });
     // 本组件命令自注册(命令面板/键位路由统一入口;卸载时注销)。
@@ -453,6 +505,9 @@
       if (r) {
         migratePathCaches(r.from, r.to);
         rebindPath(r.from, r.to); // 诊断注册表同步重绑(model 原对象保留,undo 栈不破)
+        // 取消挂起的去抖计时器并清旧 path 的 lint 缓存(内容未变,模型上标记仍有效)
+        cancelMarkdownLint(r.from);
+        clearDiagnostics(r.from, 'markdown.lint');
       }
     });
     // tab 关闭即弃:对 tabs 集合做 diff,销毁被关路径的全部 model 缓存
@@ -462,6 +517,7 @@
       const next = new Set(list.map((t) => t.path));
       for (const p of prevTabPaths) {
         if (next.has(p)) continue;
+        cancelMarkdownLint(p); // 防去抖计时器在关闭后对已消亡 path 回写缓存
         const m = models.get(p);
         const dm = draftModels.get(p);
         // 若关闭的是当前显示中的 model,先切回欢迎页/清空 diff,防悬挂引用
@@ -506,6 +562,7 @@
     const unsubSettings = settingsState.subscribe(() => {
       if (editor) applySettingsToEditors();
       syncJsonValidation();
+      syncMarkdownLint();
     });
     return () => {
       unregisterCommand('workbench.action.file.save');
@@ -521,6 +578,7 @@
   });
 
   onDestroy(() => {
+    for (const t of lintTimers.values()) clearTimeout(t);
     for (const m of models.values()) m.dispose();
     for (const m of draftModels.values()) m.dispose();
     for (const m of errorModels.values()) m.dispose();
