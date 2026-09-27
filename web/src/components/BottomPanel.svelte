@@ -3,24 +3,27 @@
 <!-- 底部多 tab 面板(治理叠加阶段):
      置于中栏底部、宽度随中栏(不横跨通栏,左右面板不动);
      sash 拖拽向上拉升/向下拉低高度,可折叠,默认收起。
-     实装 tab:输出(WS 系统事件流水)/ 审计(治理事件流 + console 审计页深链);
-     其余为占位禁用(tooltip 注明去向)。纯展示层状态,不落盘、不冒充审计链。 -->
+     实装 tab:输出(WS 系统事件流水)/ 审计(治理事件流 + console 审计页深链)/
+     问题(诊断单源聚合树,ProblemsView);其余为占位禁用(tooltip 注明去向)。
+     激活 tab 为全局 store(panel.js):计数 chip/命令跨组件直达指定 tab。
+     纯展示层状态,不落盘、不冒充审计链。 -->
 <script>
   import { sysEvents, govEvents, sessionId, panelVisible } from '../lib/stores.js';
+  import { panelTab, openBottomPanel } from '../lib/panel.js';
+  import ProblemsView from './ProblemsView.svelte';
 
   // tabs:标准 IDE 标配 4 + evorule 专有 3(设计输入见立项文档)
   const tabs = [
     { id: 'terminal', label: '终端', disabled: true, tip: '真实终端(PTY)将拆独立子阶段接入' },
     { id: 'output', label: '输出' },
-    { id: 'problems', label: '问题', disabled: true, tip: '诊断数据源在后续阶段接入' },
+    { id: 'problems', label: '问题' },
     { id: 'console', label: '控制台日志', disabled: true, tip: 'serve 日志流在后续阶段接入' },
     { id: 'audit', label: '审计' },
     { id: 'timetravel', label: '时光机器', disabled: true, tip: '回放面板在后续阶段接入(引擎侧回放已就绪)' },
     { id: 'memory', label: '记忆', disabled: true, tip: '记忆面板在后续阶段接入' },
   ];
 
-  // 开合状态已提升为全局 store(命令面板 Ctrl+J 可切换)
-  let activeTab = 'output';
+  // 开合状态已提升为全局 store(命令面板 Ctrl+J 可切换);激活 tab 同为全局 store
   let bodyHeight = 180; // 面板体高度(sash 拖拽可调,px)
   let listEl = null;
 
@@ -29,12 +32,11 @@
 
   function clickTab(t) {
     if (t.disabled) return;
-    if (activeTab === t.id && $panelVisible) {
+    if ($panelTab === t.id && $panelVisible) {
       panelVisible.set(false); // VS Code 惯例:再点激活 tab 折叠面板
       return;
     }
-    activeTab = t.id;
-    panelVisible.set(true);
+    openBottomPanel(t.id);
   }
 
   // ---- sash 拖拽调高(向上拉升/向下拉低) ----
@@ -133,7 +135,7 @@
     {#each tabs as t (t.id)}
       <button
         class="tab"
-        class:active={$panelVisible && activeTab === t.id}
+        class:active={$panelVisible && $panelTab === t.id}
         disabled={t.disabled}
         title={t.tip || t.label}
         onclick={() => clickTab(t)}
@@ -150,7 +152,7 @@
 
   {#if $panelVisible}
     <div class="panel-body" bind:this={listEl} style={`height:${bodyHeight}px`}>
-      {#if activeTab === 'output'}
+      {#if $panelTab === 'output'}
         {#if $sysEvents.length === 0}
           <div class="empty">暂无输出。与 agent 对话后,系统事件(SessionCreated / Done / Info 等)在此流水呈现。</div>
         {:else}
@@ -162,7 +164,9 @@
             </div>
           {/each}
         {/if}
-      {:else if activeTab === 'audit'}
+      {:else if $panelTab === 'problems'}
+        <ProblemsView />
+      {:else if $panelTab === 'audit'}
         <div class="audit-head">
           <span class="audit-note">当前会话治理事件流(展示层视图;权威审计链以审计页为准)</span>
           <a class="deep-link" href={auditDeepLink()} onclick={openAuditLink} target="_blank" rel="noopener noreferrer">在审计页查看 →</a>
