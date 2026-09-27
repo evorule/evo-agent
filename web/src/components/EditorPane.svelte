@@ -5,6 +5,8 @@
      S4 产物协作:agent file_write 产物自动打开,含草稿基线时可切 diff 视图
      (左=agent 草稿,右=当前可编辑);保存即定稿(工作台层留痕,见 stores.js)。
      设置页为特殊 tab(kind:settings):不建 Monaco model,渲染 SettingsEditor 组件。
+     git diff 虚拟 tab(kind:git-diff,路径 git-diff://<path>):共享 DiffEditor
+     只读渲染 HEAD vs 工作区快照,折叠未变更区;model 对随 tab 关闭 dispose。
      设置 JSON 双模式(evo://settings/user|workspace)为普通 Monaco JSON tab:
      user 保存=diff 逐键写设置通道;workspace 保存=工作区设置文件直写;
      user tab 激活期间挂设置 JSON Schema(快照恢复,防全局诊断污染)。 -->
@@ -24,6 +26,8 @@
     markSaved,
     saveTab,
     pendingReveal,
+    pendingGitDiff,
+    openGitDiffTab,
     USER_SETTINGS_URI,
     WORKSPACE_SETTINGS_URI,
   } from '../lib/stores.js';
@@ -69,6 +73,8 @@
   const errorModels = new Map();
   /** path → agent 草稿基线 model(diff 视图左栏) */
   const draftModels = new Map();
+  /** git-diff 虚拟路径 → {original, modified} 只读 model 对(B3) */
+  const gitDiffModels = new Map();
   /** 当前激活 tab 是否处于差异视图 */
   let diffOn = false;
   /** 保存失败的临时提示,保存成功即清 */
@@ -119,6 +125,20 @@
     model.updateOptions({ tabSize: tabSizeValue() });
     draftModels.set(artifact.path, model);
     return model;
+  }
+
+  /** git diff 快照的只读 model 对(缓存;随 tab 关闭 dispose) */
+  function gitDiffModelPair(tab) {
+    if (gitDiffModels.has(tab.path)) return gitDiffModels.get(tab.path);
+    const lang = tab.language || 'plaintext';
+    const pair = {
+      original: monaco.editor.createModel(tab.original || '', lang),
+      modified: monaco.editor.createModel(tab.modified || '', lang),
+    };
+    pair.original.updateOptions({ tabSize: tabSizeValue() });
+    pair.modified.updateOptions({ tabSize: tabSizeValue() });
+    gitDiffModels.set(tab.path, pair);
+    return pair;
   }
 
   function showHost(which) {
@@ -183,6 +203,10 @@
     if (diffEditor) diffEditor.updateOptions({ ...o });
     for (const m of models.values()) m.updateOptions({ tabSize: ts });
     for (const m of draftModels.values()) m.updateOptions({ tabSize: ts });
+    for (const pair of gitDiffModels.values()) {
+      pair.original.updateOptions({ tabSize: ts });
+      pair.modified.updateOptions({ tabSize: ts });
+    }
     if (welcomeModel) welcomeModel.updateOptions({ tabSize: ts });
   }
 
@@ -242,10 +266,19 @@
       showHost('edit');
       return;
     }
+    if (tab.kind === 'git-diff') {
+      // git diff 虚拟 tab(B3):共享 DiffEditor 只读渲染快照,折叠未变更区
+      const de = ensureDiffEditor();
+      de.updateOptions({ readOnly: true, hideUnchangedRegions: { enabled: true } });
+      de.setModel(gitDiffModelPair(tab));
+      showHost('diff');
+      return;
+    }
     const model = modelFor(tab);
     const artifact = get(artifacts).find((a) => a.path === path) || null;
     if (diffOn && artifact) {
       const de = ensureDiffEditor();
+      de.updateOptions({ readOnly: false }); // 产物 diff 右栏可编辑(git-diff 可能刚置只读)
       de.setModel({ original: draftModelFor(artifact), modified: model });
       showHost('diff');
     } else {
@@ -369,6 +402,12 @@
       maybeConsumeReveal();
     });
     const unsubReveal = pendingReveal.subscribe(() => maybeConsumeReveal());
+    // git diff 打开信号(B3):消费即清 → 打开 git-diff 虚拟 tab
+    const unsubGitDiff = pendingGitDiff.subscribe((p) => {
+      if (!p) return;
+      pendingGitDiff.set(null);
+      openGitDiffTab(p);
+    });
     // 重命名/移动:按 lastRename 信号迁移四类 path 键缓存(model/保存基线/
     // 错误占位/草稿),dirty 内容与 undo 栈随 model 原对象保留。
     // 本订阅必须先于下方 tabs-diff 清理建立:stores.renameTabPath 契约是
@@ -421,6 +460,19 @@
           em.dispose();
           errorModels.delete(p);
         }
+        const gp = gitDiffModels.get(p);
+        if (gp) {
+          if (
+            diffEditor &&
+            (diffEditor.originalEditor.getModel() === gp.original ||
+              diffEditor.modifiedEditor.getModel() === gp.modified)
+          ) {
+            diffEditor.setModel(null);
+          }
+          gp.original.dispose();
+          gp.modified.dispose();
+          gitDiffModels.delete(p);
+        }
       }
       prevTabPaths = next;
     });
@@ -432,6 +484,7 @@
       unregisterCommand('editor.action.toggleDiff');
       if (unsubActive) unsubActive();
       unsubReveal();
+      unsubGitDiff();
       unsubRename();
       unsubTabs();
       unsubSettings();
@@ -442,6 +495,10 @@
     for (const m of models.values()) m.dispose();
     for (const m of draftModels.values()) m.dispose();
     for (const m of errorModels.values()) m.dispose();
+    for (const pair of gitDiffModels.values()) {
+      pair.original.dispose();
+      pair.modified.dispose();
+    }
     if (welcomeModel) welcomeModel.dispose();
     if (editor) editor.dispose();
     if (diffEditor) diffEditor.dispose();

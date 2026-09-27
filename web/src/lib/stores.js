@@ -9,6 +9,7 @@ import {
   getEvolutionSignals,
   getWorkbenchSettings,
   gitStatus as fetchGitStatus,
+  gitDiff,
 } from './api.js';
 import { userLayerDoc } from './settings.js';
 
@@ -210,6 +211,51 @@ export const pendingGitDiff = writable(null);
 export function openGitDiff(path) {
   if (!path) return;
   pendingGitDiff.set(path);
+}
+
+const GIT_DIFF_SCHEME = 'git-diff://';
+
+/** 打开 git diff 虚拟 tab(kind:'git-diff';快照 original/modified 随 tab 携带,
+ *  EditorPane 构建只读 DiffEditor 模型)。失败以错误占位 tab 呈现。 */
+export async function openGitDiffTab(path) {
+  if (!path) return;
+  const virtual = `${GIT_DIFF_SCHEME}${path}`;
+  const name = `${(path.split('/').pop() || path)}(工作区)`;
+  let existing = null;
+  tabs.update((list) => {
+    existing = list.find((t) => t.path === virtual) || null;
+    return list;
+  });
+  if (existing) {
+    activePath.set(virtual);
+    return;
+  }
+  try {
+    const d = await gitDiff(path);
+    tabs.update((list) => [
+      ...list,
+      {
+        path: virtual,
+        kind: 'git-diff',
+        gitPath: path,
+        name,
+        content: '',
+        dirty: false,
+        error: null,
+        original: d.original ?? '',
+        modified: d.modified ?? '',
+        language: d.language || 'plaintext',
+      },
+    ]);
+    activePath.set(virtual);
+  } catch (e) {
+    const msg = String(e?.message || e);
+    tabs.update((list) => [
+      ...list,
+      { path: virtual, kind: 'git-diff', gitPath: path, name, content: '', dirty: false, error: msg },
+    ]);
+    activePath.set(virtual);
+  }
 }
 
 /** 最近一次 tab 路径迁移信号 {from, to, seq}(EditorPane 订阅迁移按路径
