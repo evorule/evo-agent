@@ -198,6 +198,26 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.gitRead",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 读取 git 状态（git_status/git_diff/git_log，只读；随开随用）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "agentTools.gitWrite",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 执行 git 写操作（git_stage/git_commit；开启后每次调用默认需人工审批）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "search.maxResults",
             kind: SettingType::Number,
             default: json!(1000),
@@ -553,16 +573,18 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 15);
+        assert_eq!(settings.len(), 17);
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
         assert_eq!(settings["keybindings.overrides"], json!([]));
-        // agentTools.* 开关键:出厂默认(fileCreate/grep 开 / fileMove、fileDelete 关)
+        // agentTools.* 开关键:出厂默认(fileCreate/grep/gitRead 开 / fileMove、fileDelete、gitWrite 关)
         assert_eq!(settings["agentTools.fileCreate"], json!(true));
         assert_eq!(settings["agentTools.fileMove"], json!(false));
         assert_eq!(settings["agentTools.fileDelete"], json!(false));
         assert_eq!(settings["agentTools.grep"], json!(true));
+        assert_eq!(settings["agentTools.gitRead"], json!(true));
+        assert_eq!(settings["agentTools.gitWrite"], json!(false));
         // search.* 全局搜索 4 键(B2 消费)
         assert_eq!(settings["search.maxResults"], json!(1000));
         assert_eq!(settings["search.smartCase"], json!(true));
