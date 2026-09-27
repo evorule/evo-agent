@@ -4,6 +4,8 @@
 <script>
   import { onMount } from 'svelte';
   import { connStatus, sessionId, stepCount, turnActive, toolWhitelist, signalCount, refreshGovBadges } from '../lib/stores.js';
+  import { problems } from '../lib/diagnostics.js';
+  import { openBottomPanel } from '../lib/panel.js';
 
   const statusText = {
     connecting: '连接中',
@@ -39,6 +41,20 @@
   <div class="actions">
     {#if $turnActive}
       <span class="step-chip mono" title="当前轮次步数">step {$stepCount}</span>
+    {/if}
+    {#if $problems.counts.errors > 0 || $problems.counts.warnings > 0}
+      <button
+        class="gov-chip mono diag-chip"
+        title={`诊断:错误 ${$problems.counts.errors} / 警告 ${$problems.counts.warnings}(点击打开问题面板)`}
+        onclick={() => openBottomPanel('problems')}
+      >
+        {#if $problems.counts.errors > 0}
+          <span class="d-err">✕ {$problems.counts.errors}</span>
+        {/if}
+        {#if $problems.counts.warnings > 0}
+          <span class="d-warn">△ {$problems.counts.warnings}</span>
+        {/if}
+      </button>
     {/if}
     <span
       class="gov-chip mono"
@@ -123,6 +139,22 @@
     color: var(--warning);
     border-color: var(--warning);
     background: var(--warning-bg);
+  }
+  button.gov-chip {
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  button.gov-chip:hover {
+    color: var(--text-primary);
+    border-color: var(--brand);
+  }
+  .diag-chip .d-err {
+    color: var(--danger);
+  }
+  .diag-chip .d-warn {
+    color: var(--warning);
   }
   .conn {
     display: flex;
