@@ -724,6 +724,13 @@ async fn run_agent(
     } else {
         runner
     };
+    // 执行桥后端上下文注入轨迹采集器:请求携带容器名(docker-exec 后端)时
+    // shell_exec 轨迹成形分流 program 旗标(分流≠删检);宿主后端零变化
+    let runner = if let Some(container) = &req.container {
+        runner.with_trace_exec_backend(container)
+    } else {
+        runner
+    };
     let runner = runner.with_metrics(state.metrics.clone());
 
     // 改消费流式 ReAct 回路(delegate 同款修法,bb172b2 先例)——
@@ -860,6 +867,15 @@ async fn run_agent_stream(
     })
     // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
     .with_metrics(state.metrics.clone());
+
+    // 执行桥后端上下文注入轨迹采集器(同 run_agent 口径):请求携带容器名
+    // (docker-exec 后端)时 shell_exec 轨迹成形分流 program 旗标(分流≠删检);
+    // 宿主后端零变化
+    let runner = if let Some(container) = &req.container {
+        runner.with_trace_exec_backend(container)
+    } else {
+        runner
+    };
 
     // G6:clone token(run_streaming 会 move runner),存入 SessionStore 供 /cancel 使用
     let cancel_token = runner.cancel_token().clone();

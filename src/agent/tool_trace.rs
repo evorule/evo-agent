@@ -47,6 +47,10 @@ const SENSITIVE_KEYS: &[&str] = &[
 pub struct ToolTraceCollector {
     entries: Vec<Value>,
     submit_failures: usize,
+    /// 执行桥后端上下文:Some(容器名)=shell_exec 走 docker-exec 后端
+    /// (容器名经 serve run 请求扩展字段传入,LLM 不可控);None=宿主后端。
+    /// 影响 shell_exec 轨迹成形(后端感知分流,分流≠删检),见 [`ToolTraceCollector::record`]
+    exec_backend: Option<String>,
 }
 
 /// rm 递归强删旗标(词级匹配):`rm` 本身是 candidate(需审批),
@@ -108,6 +112,11 @@ fn detect_domain_hits(text: &str) -> Vec<String> {
 }
 
 impl ToolTraceCollector {
+    /// 设置后端上下文(runner 构造后、运行前调用一次;不注入=宿主后端)
+    pub fn set_exec_backend(&mut self, container: Option<&str>) {
+        self.exec_backend = container.map(str::to_string);
+    }
+
     /// 记录一次工具调用(含被治理拦截的调用——拦截也是真实执行史)
     ///
     /// `status`: `ok` / `error` / `blocked_by_governance`(M5-c 裁决拦截)。
@@ -115,6 +124,12 @@ impl ToolTraceCollector {
     /// 数组(词级检测+违禁域扫描见 [`detect_danger_hits`]);command 从
     /// 原始 args 读取(截断降级仅作用于入链 args 副本,不影响打标保真)。
     /// http_get 调用附带违禁域打标(A4/A5,扫描 `url` 参数)。
+    ///
+    /// 后端感知成形(分流≠删检):宿主后端 `danger_hits` 全量旗标(与既有
+    /// 逐字节一致);docker-exec 后端容器域=一次性任务沙箱,host 视角
+    /// program/rm 旗标分流至 `program_hits` 留链备裁(容器内命令策略由
+    /// 规则面随动),`danger_hits` 仅保留违禁域旗标(A4/A5 合规红线双后端
+    /// enforce),并 stamp `exec_backend`/`container` 供回放定位。
     pub fn record(&mut self, tool_name: &str, args: &Value, status: &str, duration_ms: u64) {
         let seq = self.entries.len() as i64;
         let mut entry = serde_json::json!({
@@ -127,8 +142,37 @@ impl ToolTraceCollector {
         if tool_name == "shell_exec" {
             if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
                 let hits = detect_danger_hits(cmd);
-                if !hits.is_empty() {
-                    entry["danger_hits"] = serde_json::json!(hits);
+                match self.exec_backend.as_deref() {
+                    // docker-exec 后端:容器域=一次性任务沙箱,host 视角 program/rm
+                    // 旗标分流至 `program_hits` 留链备裁(分流≠删检);danger_hits
+                    // 仅保留违禁域旗标(A4/A5 合规红线,规则面双后端 enforce 维持);
+                    // stamp 后端/容器供回放定位
+                    Some(container) => {
+                        let domain: Vec<String> = hits
+                            .iter()
+                            .filter(|h| h.starts_with("domain:"))
+                            .cloned()
+                            .collect();
+                        let program: Vec<String> = hits
+                            .iter()
+                            .filter(|h| !h.starts_with("domain:"))
+                            .cloned()
+                            .collect();
+                        if !domain.is_empty() {
+                            entry["danger_hits"] = serde_json::json!(domain);
+                        }
+                        if !program.is_empty() {
+                            entry["program_hits"] = serde_json::json!(program);
+                        }
+                        entry["exec_backend"] = serde_json::json!("docker-exec");
+                        entry["container"] = serde_json::json!(container);
+                    }
+                    // 宿主后端:成形与既有逐字节一致
+                    None => {
+                        if !hits.is_empty() {
+                            entry["danger_hits"] = serde_json::json!(hits);
+                        }
+                    }
                 }
             }
         } else if tool_name == "http_get" {
@@ -347,6 +391,87 @@ mod tests {
         assert!(detect_danger_hits("cat shutdown.log && tail reboot.txt").is_empty());
         // 「sudo-like」首尾均为字母数字,trim 后不等于 sudo
         assert!(detect_danger_hits("echo sudo-like").is_empty());
+    }
+
+    // 后端感知成形:docker-exec 后端把 program/rm 旗标分流至 program_hits
+    // (留链备裁),danger_hits 仅违禁域旗标,条目 stamp exec_backend/container
+    // (分流≠删检;宿主后端成形与既有逐字节一致,由既有测试回归保证)
+    #[test]
+    fn container_backend_splits_program_hits_from_danger_hits() {
+        let mut c = ToolTraceCollector::default();
+        c.set_exec_backend(Some("tb-task-1"));
+        c.record(
+            "shell_exec",
+            &json!({"command": "python3 -c \"import tbench.ai\""}),
+            "ok",
+            5,
+        );
+        let entries = c.drain();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry["danger_hits"], json!(["domain:tbench.ai"]));
+        assert_eq!(entry["program_hits"], json!(["program:python3"]));
+        assert_eq!(entry["exec_backend"], json!("docker-exec"));
+        assert_eq!(entry["container"], json!("tb-task-1"));
+    }
+
+    #[test]
+    fn container_backend_program_only_hit_leaves_danger_hits_absent() {
+        let mut c = ToolTraceCollector::default();
+        c.set_exec_backend(Some("tb-task-1"));
+        c.record("shell_exec", &json!({"command": "python3 -V"}), "ok", 5);
+        let entries = c.drain();
+        let entry = &entries[0];
+        assert!(entry.get("danger_hits").is_none());
+        assert_eq!(entry["program_hits"], json!(["program:python3"]));
+        assert_eq!(entry["exec_backend"], json!("docker-exec"));
+    }
+
+    #[test]
+    fn container_backend_without_hits_stamps_backend_only() {
+        let mut c = ToolTraceCollector::default();
+        c.set_exec_backend(Some("tb-task-1"));
+        c.record("shell_exec", &json!({"command": "ls -la"}), "ok", 5);
+        let entries = c.drain();
+        let entry = &entries[0];
+        assert!(entry.get("danger_hits").is_none());
+        assert!(entry.get("program_hits").is_none());
+        assert_eq!(entry["exec_backend"], json!("docker-exec"));
+        assert_eq!(entry["container"], json!("tb-task-1"));
+    }
+
+    #[test]
+    fn container_backend_records_blocked_calls_with_same_shape() {
+        let mut c = ToolTraceCollector::default();
+        c.set_exec_backend(Some("tb-task-1"));
+        c.record(
+            "shell_exec",
+            &json!({"command": "curl http://example.com"}),
+            "blocked_by_governance",
+            0,
+        );
+        let entries = c.drain();
+        let entry = &entries[0];
+        // 无违禁域命中 → danger_hits 缺省不写;host 视角 program 旗标照常留链
+        assert!(entry.get("danger_hits").is_none());
+        assert_eq!(entry["program_hits"], json!(["program:curl"]));
+    }
+
+    #[test]
+    fn host_backend_default_shape_unchanged() {
+        let mut c = ToolTraceCollector::default();
+        c.record(
+            "shell_exec",
+            &json!({"command": "curl http://example.com"}),
+            "ok",
+            5,
+        );
+        let entries = c.drain();
+        let entry = &entries[0];
+        assert_eq!(entry["danger_hits"], json!(["program:curl"]));
+        assert!(entry.get("program_hits").is_none());
+        assert!(entry.get("exec_backend").is_none());
+        assert!(entry.get("container").is_none());
     }
 
     #[test]
