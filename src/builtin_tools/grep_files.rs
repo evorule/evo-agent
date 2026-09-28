@@ -36,7 +36,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -418,40 +418,9 @@ fn strip_terminator(raw: &[u8]) -> &[u8] {
     &raw[..end]
 }
 
-/// 沙箱解析(与 search_files 同款语义与文案):相对/拒 ../canonicalize containment
+/// 沙箱解析(P0 收口):判据唯一权威在 fs_safety::resolve_existing,本模块不再持判据
 fn resolve_safe_dir(workdir: &Path, raw: &str) -> Result<PathBuf, String> {
-    let path = Path::new(raw);
-    if path.is_absolute() {
-        return Err(format!(
-            "absolute path not allowed: '{}' (all paths must stay within the sandbox boundary '{}')",
-            raw,
-            workdir.display()
-        ));
-    }
-    for component in path.components() {
-        if matches!(component, Component::ParentDir) {
-            return Err(format!(
-                "parent dir (..) not allowed: '{}' (must stay within the sandbox boundary '{}')",
-                raw,
-                workdir.display()
-            ));
-        }
-    }
-    let joined = workdir.join(path);
-    let canonical = joined
-        .canonicalize()
-        .map_err(|e| format!("dir does not exist or cannot resolve: {}", e))?;
-    let workdir_canonical = workdir
-        .canonicalize()
-        .map_err(|e| format!("workdir invalid: {}", e))?;
-    if !canonical.starts_with(&workdir_canonical) {
-        return Err(format!(
-            "path not accessible: '{}' resolves outside the sandbox boundary '{}'",
-            raw,
-            workdir_canonical.display()
-        ));
-    }
-    Ok(canonical)
+    crate::builtin_tools::fs_safety::resolve_existing(workdir, raw)
 }
 
 // =============================================================================

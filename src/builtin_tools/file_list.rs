@@ -11,7 +11,7 @@
 //! - 结果按名字排序
 //! - max_entries 限制(防 OOM)
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::Value;
 
@@ -43,44 +43,10 @@ impl FileListTool {
         self
     }
 
+    /// P0 收口:判据已提入 [`fs_safety::resolve_existing`]
+    /// (crate::builtin_tools::fs_safety)为唯一权威,本处仅委托。
     fn resolve_safe_dir(&self, raw: &str) -> Result<PathBuf, String> {
-        let path = Path::new(raw);
-        if path.is_absolute() {
-            // M5-a:错误告知边界,agent 自知而非误判(文案对齐)
-            return Err(format!(
-                "absolute path not allowed: '{}' (all paths must stay within the sandbox \
-                 boundary '{}')",
-                raw,
-                self.workdir.display()
-            ));
-        }
-        for component in path.components() {
-            if matches!(component, Component::ParentDir) {
-                return Err(format!(
-                    "parent dir (..) not allowed: '{}' (must stay within the sandbox \
-                     boundary '{}')",
-                    raw,
-                    self.workdir.display()
-                ));
-            }
-        }
-        let joined = self.workdir.join(path);
-        let canonical = joined
-            .canonicalize()
-            .map_err(|e| format!("dir does not exist or cannot resolve: {}", e))?;
-        let workdir_canonical = self
-            .workdir
-            .canonicalize()
-            .map_err(|e| format!("workdir invalid: {}", e))?;
-        if !canonical.starts_with(&workdir_canonical) {
-            // M5-a:越界错误回报「不可访问 + 边界路径」(文案对齐)
-            return Err(format!(
-                "path not accessible: '{}' resolves outside the sandbox boundary '{}'",
-                raw,
-                workdir_canonical.display()
-            ));
-        }
-        Ok(canonical)
+        crate::builtin_tools::fs_safety::resolve_existing(&self.workdir, raw)
     }
 }
 
