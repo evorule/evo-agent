@@ -561,6 +561,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         context_window_tokens: None,
         max_parallel_tools: 1,
         capability_boundary: None,
+        approval_mode: None,
     }
 }
 

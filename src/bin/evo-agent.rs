@@ -452,6 +452,9 @@ fn cmd_run(
         }
     };
 
+    // 人工审查开合(2026-09-28):def move 前捕获审批模式(auto_policy → PolicyApproval)
+    let approval_auto = def.approval_mode.as_deref() == Some("auto_policy");
+
     // 3. evorule + workspace 客户端(规则管理工具依赖 workspace API)
     let client = evorule_client_from(&config);
     let ws_client = WorkspaceApiClient::new(&config.evorule.base_url);
@@ -521,14 +524,19 @@ fn cmd_run(
         }
     };
 
-    // G8:注入 CliApproval — candidate 工具返回 needs_approval 时走交互式审批
-    // --auto-approve-candidates 时跳过交互直接批准(自动化场景)
-    // 不带 flag 时走 stdin 交互(y/N),无 callback 则默认拒绝(安全优先)
-    let mut runner = runner.with_approval_callback(std::sync::Arc::new(
-        evo_agent::agent::approval::CliApproval {
-            auto_approve: auto_approve_candidates,
-        },
-    ));
+    // G8:注入审批决策端(人工审查开合,2026-09-28)——
+    // --auto-approve-candidates=配置的命令行快捷方式(语义归一到 auto_policy):
+    // 命中旗标或定义级 approval_mode=auto_policy → PolicyApproval(无人值守,
+    // 判定理由必产+决策入审计链);否则 CliApproval stdin 交互(manual 态,现状行为)
+    let callback: std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback> =
+        if approval_auto || auto_approve_candidates {
+            std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval)
+        } else {
+            std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                auto_approve: false,
+            })
+        };
+    let mut runner = runner.with_approval_callback(callback);
 
     // 6. 跑
     eprintln!(
@@ -756,8 +764,11 @@ async fn patrol_build_runner(
         .await
         .map_err(|e| format!("bridge error: {e}"))?
         .with_capability_boundary(capability_boundary);
+    // 人工审查开合(2026-09-28):巡视为无人值守场景,决策端统一 PolicyApproval
+    // (语义归一:approver="auto_policy"+判定理由必产,替换原 CliApproval{
+    // auto_approve} 的 "cli-user" 语义混乱点;运行期零人工决策事件不变)
     Ok(runner.with_approval_callback(std::sync::Arc::new(
-        evo_agent::agent::approval::CliApproval { auto_approve: true },
+        evo_agent::agent::approval::PolicyApproval,
     )))
 }
 
@@ -2420,11 +2431,17 @@ fn run_repl_turn(
         }
     };
 
-    let runner = runner.with_approval_callback(std::sync::Arc::new(
-        evo_agent::agent::approval::CliApproval {
-            auto_approve: auto_approve_candidates,
-        },
-    ));
+    // 人工审查开合(2026-09-28):旗标或定义级 approval_mode=auto_policy →
+    // PolicyApproval 判定式决策端(无人值守);否则 CliApproval stdin 交互(manual 态)
+    let callback: std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback> =
+        if auto_approve_candidates || def.approval_mode.as_deref() == Some("auto_policy") {
+            std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval)
+        } else {
+            std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                auto_approve: false,
+            })
+        };
+    let runner = runner.with_approval_callback(callback);
 
     // G6:Ctrl+C → cancel_token
     let cancel_token = runner.cancel_token().clone();

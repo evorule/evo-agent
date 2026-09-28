@@ -576,11 +576,17 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         .with_capability_boundary(capability_boundary)
         // 挂 filtered toolkit(同 HTTP 端点口径,见 run_agent)
         .with_tool_handler(filtered)
-        // G8:注入 HttpApproval — candidate 工具返回 needs_approval 时,
-        // runner 通过 oneshot channel 等 POST /approve(60s 超时自动拒绝)
-        .with_approval_callback(Arc::new(crate::agent::approval::HttpApproval::new(
-            state.pending_approvals().clone(),
-        )))
+        // G8:注入审批决策端(人工审查开合)——定义级 approval_mode=auto_policy 时
+        // 走 PolicyApproval 判定式决策端(无人值守,理由必产);否则 HttpApproval
+        // 60s 人工审批窗(manual 态,现状行为)
+        .with_approval_callback(if def.approval_mode.as_deref() == Some("auto_policy") {
+            Arc::new(crate::agent::approval::PolicyApproval)
+                as Arc<dyn crate::agent::approval::ApprovalCallback>
+        } else {
+            Arc::new(crate::agent::approval::HttpApproval::new(
+                state.pending_approvals().clone(),
+            )) as Arc<dyn crate::agent::approval::ApprovalCallback>
+        })
         // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
         .with_metrics(state.metrics().clone());
     // 记忆启用时构建 MemoryManager(TTL / 持久化模式按定义透传)
