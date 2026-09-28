@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn test_full_rule_toolkit_registers_all_45() {
         // 验证 full_rule_toolkit 注册了全部 45 个工具（40 透传 + 5 本地逻辑，
-        // has_tool 逐个校验；计数与 rule_tool_specs 对齐，O-154 清理）
+        // has_tool 逐个校验；计数与 rule_tool_specs 对齐）
         let ws = WorkspaceApiClient::new("http://localhost:0");
         let ev = EvoruleApiClient::new("http://localhost:0");
         let h = full_rule_toolkit(&ws, &ev);

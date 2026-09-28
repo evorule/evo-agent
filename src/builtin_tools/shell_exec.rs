@@ -277,8 +277,8 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MB
 
 /// 执行后端(P1 执行桥:配置选择器 local / docker-exec)
 ///
-/// 参赛兼容层三原则②「删配置即下线」:不传容器名即回落 `Local`,宿主语义零变化
-/// (03 号 §十)。容器名经 serve run 请求扩展字段传入,不由 LLM 可控
+/// 参赛兼容层三原则②「删配置即下线」:不传容器名即回落 `Local`,宿主语义零变化。
+/// 容器名经 serve run 请求扩展字段传入,不由 LLM 可控
 /// (LLM 面只见 shell_exec 工具,无任何指定后端/容器的参数)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecBackend {
@@ -316,7 +316,7 @@ pub fn validate_container_name(name: &str) -> Result<(), String> {
 /// 宿主侧唯一 program = `docker`(硬编码),命令字符串整体交给容器内 `sh -c`
 /// 解释。容器域为任务沙箱:宿主 3 层分类与 metachar 拒绝不适用容器侧命令
 /// (分类语义以宿主 program 为对象;容器内命令策略的正式化=参赛 P2 扩权批,
-/// 01 号 §2.4 六级清单 + 02 号 §二规则面随动)。
+/// 六级清单与规则面随动)。
 fn docker_exec_argv(container: &str, command: &str) -> Vec<String> {
     vec![
         "docker".to_string(),
@@ -475,7 +475,7 @@ impl ShellExecTool {
     /// 宿主侧 spawn 的 program 恒为 `docker`(argv 硬编码构造,LLM 不可控);
     /// 命令字符串整体交容器内 `sh -c` 解释(pipe/redirect/heredoc 等均为容器域
     /// shell 语义)。执行事实(backend/container/exit_code/stdout/stderr)随工具
-    /// 观察入审计链——02 号 §一注记 2 的 G1 验收口径。
+    /// 观察入审计链——G1 验收口径。
     fn execute_docker_exec(&self, container: &str, original_cmd: &str) -> IoResult {
         let argv = docker_exec_argv(container, original_cmd);
         let mut cmd = Command::new(&argv[0]);

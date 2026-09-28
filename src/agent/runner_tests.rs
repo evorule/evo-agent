@@ -2317,7 +2317,7 @@ async fn first_round_intent_goes_through_adjudication_channel() {
     m_cmd.assert_async().await;
 }
 
-// ----- P2(O-077 方案 C):治理级工具事前意图裁决 -----
+// ----- P2 治理级工具事前意图裁决 -----
 
 #[test]
 fn p2_non_governance_tool_produces_no_intent() {

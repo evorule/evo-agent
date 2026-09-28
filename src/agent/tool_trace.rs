@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! O-077 P1:工具调用轨迹采集器 —— 工具级行为治理的事实地基
+//! P1:工具调用轨迹采集器 —— 工具级行为治理的事实地基
 //!
 //! ## 背景与治理语义
 //!
-//! agent 会话每轮仅 1 条 `call_external` 过引擎(见存量问题登记册 O-077),
+//! agent 会话每轮仅 1 条 `call_external` 过引擎,
 //! 工具调用全部在 runner 本地执行——引擎审计链对工具级操作零感知,「规则
 //! 约束 agent 真实操作」对工具级不可达。本模块在 G17 插桩点采集每次工具
 //! 调用的完整轨迹,会话收尾时以 `tool_trace` 指令(宪法 core_eval v0.5.0
