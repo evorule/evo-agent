@@ -2,10 +2,13 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! bundles 部署闭环工具（5 个，设计文档 §4.3 缺口 1）
+//! bundles 部署闭环工具（本地逻辑部分）：bundle_export
 //!
-//! 打通 evo-agent 独立完成"治理域导出 → 执行域部署"的全链路（此前
-//! publish_tools 止步于治理域，部署最后一步只能靠 console 或人工）：
+//! 透传族 bundle_import_dry_run / bundle_import / bundle_active_list /
+//! bundle_imports_list 已迁入 adapter 表驱动（rule_tools::adapter）；本文件仅
+//! 保留带本地证据校验的导出工具。
+//!
+//! 部署闭环链路：
 //!
 //! ```text
 //! bundle_export(治理域 :18081) → bundle_import_dry_run(执行域预检)
@@ -13,14 +16,13 @@
 //!   → bundle_imports_list(溯源)
 //! ```
 //!
-//! 错误纪律：全部走 check_response_full——校验失败(400)的 {"error": "..."}
+//! 错误纪律：走 check_response_full——校验失败(400)的 {"error": "..."}
 //! 详情透出，LLM agent 可自诊断修复（不静默）。
 
 use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::workspace_client::WorkspaceApiClient;
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handler::IoResult;
@@ -93,245 +95,67 @@ impl ToolFunction for BundleExportTool {
 }
 
 // =============================================================================
-// bundle_import_dry_run —— 执行域导入预检（校验链全跑，不落盘）
-// =============================================================================
-
-#[derive(Clone)]
-pub struct BundleImportDryRunTool {
-    client: EvoruleApiClient,
-}
-
-impl BundleImportDryRunTool {
-    pub fn new(client: EvoruleApiClient) -> Self {
-        Self { client }
-    }
-}
-
-#[async_trait::async_trait]
-impl ToolFunction for BundleImportDryRunTool {
-    async fn call(&self, args: &Value) -> IoResult {
-        let bundle = args
-            .get("bundle")
-            .ok_or_else(|| "missing required parameter: bundle".to_string())?;
-        if !bundle.is_object() {
-            return Err(
-                "bundle must be an object (DatasetBundle JSON from bundle_export)".to_string(),
-            );
-        }
-        let result = self
-            .client
-            .bundle_import_dry_run(&bundle.clone())
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(result.clone())
-    }
-}
-
-// =============================================================================
-// bundle_import —— 执行域导入并激活（破坏性：落盘 + reload）
-// =============================================================================
-
-#[derive(Clone)]
-pub struct BundleImportTool {
-    client: EvoruleApiClient,
-}
-
-impl BundleImportTool {
-    pub fn new(client: EvoruleApiClient) -> Self {
-        Self { client }
-    }
-}
-
-#[async_trait::async_trait]
-impl ToolFunction for BundleImportTool {
-    async fn call(&self, args: &Value) -> IoResult {
-        let bundle = args
-            .get("bundle")
-            .ok_or_else(|| "missing required parameter: bundle".to_string())?;
-        if !bundle.is_object() {
-            return Err(
-                "bundle must be an object (DatasetBundle JSON from bundle_export)".to_string(),
-            );
-        }
-        let result = self
-            .client
-            .bundle_import(&bundle.clone())
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(result.clone())
-    }
-}
-
-// =============================================================================
-// bundle_active_list —— 当前激活 bundle 列表
-// =============================================================================
-
-#[derive(Clone)]
-pub struct BundleActiveListTool {
-    client: EvoruleApiClient,
-}
-
-impl BundleActiveListTool {
-    pub fn new(client: EvoruleApiClient) -> Self {
-        Self { client }
-    }
-}
-
-#[async_trait::async_trait]
-impl ToolFunction for BundleActiveListTool {
-    async fn call(&self, _args: &Value) -> IoResult {
-        let result = self
-            .client
-            .bundle_active_list()
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(result.clone())
-    }
-}
-
-// =============================================================================
-// bundle_imports_list —— 导入溯源记录（只读审计）
-// =============================================================================
-
-#[derive(Clone)]
-pub struct BundleImportsListTool {
-    client: EvoruleApiClient,
-}
-
-impl BundleImportsListTool {
-    pub fn new(client: EvoruleApiClient) -> Self {
-        Self { client }
-    }
-}
-
-#[async_trait::async_trait]
-impl ToolFunction for BundleImportsListTool {
-    async fn call(&self, _args: &Value) -> IoResult {
-        let result = self
-            .client
-            .bundle_imports_list()
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(result.clone())
-    }
-}
-
-// =============================================================================
 // register / specs
 // =============================================================================
 
-pub fn register(h: &mut ToolHandler, ws: &WorkspaceApiClient, ev: &EvoruleApiClient) {
-    h.register_tool("bundle_export", Arc::new(BundleExportTool::new(ws.clone())));
+pub fn register(h: &mut ToolHandler, client: &WorkspaceApiClient) {
     h.register_tool(
-        "bundle_import_dry_run",
-        Arc::new(BundleImportDryRunTool::new(ev.clone())),
-    );
-    h.register_tool("bundle_import", Arc::new(BundleImportTool::new(ev.clone())));
-    h.register_tool(
-        "bundle_active_list",
-        Arc::new(BundleActiveListTool::new(ev.clone())),
-    );
-    h.register_tool(
-        "bundle_imports_list",
-        Arc::new(BundleImportsListTool::new(ev.clone())),
+        "bundle_export",
+        Arc::new(BundleExportTool::new(client.clone())),
     );
 }
 
 pub fn specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec {
-            name: "bundle_export".to_string(),
-            description: "Export a dataset bundle with sandbox test evidence from the \
-                          governance domain (POST /bundles/export). Returns the DatasetBundle \
-                          JSON to pass to bundle_import_dry_run / bundle_import."
-                .to_string(),
-            parameters: vec![
-                ParameterSpec {
-                    name: "dataset_id".to_string(),
-                    r#type: "string".to_string(),
-                    description: "Dataset id to export.".to_string(),
-                    required: true,
-                },
-                ParameterSpec {
-                    name: "version".to_string(),
-                    r#type: "string".to_string(),
-                    description: "Dataset version to export (current version uses live \
-                                  entries; historical versions rebuilt from snapshots)."
-                        .to_string(),
-                    required: true,
-                },
-                ParameterSpec {
-                    name: "verdict".to_string(),
-                    r#type: "string".to_string(),
-                    description: "Test verdict: \"pass\" (requires traceable subset) or \
-                                  \"fail\" (explicit unverified export)."
-                        .to_string(),
-                    required: true,
-                },
-                ParameterSpec {
-                    name: "subset".to_string(),
-                    r#type: "array".to_string(),
-                    description: "Traceable test evidence refs (array of strings). Required \
-                                  for verdict=pass: each item must be \"sandbox:<id>\" \
-                                  (machine attestation) or \"human:<actor>\" (explicit \
-                                  human downgrade)."
-                        .to_string(),
-                    required: false,
-                },
-                ParameterSpec {
-                    name: "trim".to_string(),
-                    r#type: "string".to_string(),
-                    description: "Optional trim-view syntax: \"tag:core\" / \"domain:tax\" / \
-                                  \"ids:id1,id2\" (multiple segments joined by \";\", \
-                                  intersection)."
-                        .to_string(),
-                    required: false,
-                },
-            ],
-        },
-        ToolSpec {
-            name: "bundle_import_dry_run".to_string(),
-            description: "Pre-check a bundle import in the execution domain (all 8 \
-                          validations run, no disk write, no reload). Pass the bundle object \
-                          returned by bundle_export."
-                .to_string(),
-            parameters: vec![ParameterSpec {
-                name: "bundle".to_string(),
-                r#type: "object".to_string(),
-                description: "DatasetBundle JSON object (as returned by bundle_export)."
+    vec![ToolSpec {
+        name: "bundle_export".to_string(),
+        description: "Export a dataset bundle with sandbox test evidence from the \
+                      governance domain (POST /bundles/export). Returns the DatasetBundle \
+                      JSON to pass to bundle_import_dry_run / bundle_import."
+            .to_string(),
+        parameters: vec![
+            ParameterSpec {
+                name: "dataset_id".to_string(),
+                r#type: "string".to_string(),
+                description: "Dataset id to export.".to_string(),
+                required: true,
+            },
+            ParameterSpec {
+                name: "version".to_string(),
+                r#type: "string".to_string(),
+                description: "Dataset version to export (current version uses live \
+                              entries; historical versions rebuilt from snapshots)."
                     .to_string(),
                 required: true,
-            }],
-        },
-        ToolSpec {
-            name: "bundle_import".to_string(),
-            description: "Import and activate a bundle in the execution domain (destructive: \
-                          atomic write to rules/bundles/ + reload; new sessions pick up the \
-                          new ruleset). Run bundle_import_dry_run first."
-                .to_string(),
-            parameters: vec![ParameterSpec {
-                name: "bundle".to_string(),
-                r#type: "object".to_string(),
-                description: "DatasetBundle JSON object (as returned by bundle_export)."
+            },
+            ParameterSpec {
+                name: "verdict".to_string(),
+                r#type: "string".to_string(),
+                description: "Test verdict: \"pass\" (requires traceable subset) or \
+                              \"fail\" (explicit unverified export)."
                     .to_string(),
                 required: true,
-            }],
-        },
-        ToolSpec {
-            name: "bundle_active_list".to_string(),
-            description: "List currently active bundles in the execution domain (from \
-                          rules/bundles/*/bundle_manifest.json)."
-                .to_string(),
-            parameters: vec![],
-        },
-        ToolSpec {
-            name: "bundle_imports_list".to_string(),
-            description: "List bundle import provenance records in the execution domain \
-                          (read-only audit trail)."
-                .to_string(),
-            parameters: vec![],
-        },
-    ]
+            },
+            ParameterSpec {
+                name: "subset".to_string(),
+                r#type: "array".to_string(),
+                description: "Traceable test evidence refs (array of strings). Required \
+                              for verdict=pass: each item must be \"sandbox:<id>\" \
+                              (machine attestation) or \"human:<actor>\" (explicit \
+                              human downgrade)."
+                    .to_string(),
+                required: false,
+            },
+            ParameterSpec {
+                name: "trim".to_string(),
+                r#type: "string".to_string(),
+                description: "Optional trim-view syntax: \"tag:core\" / \"domain:tax\" / \
+                              \"ids:id1,id2\" (multiple segments joined by \";\", \
+                              intersection)."
+                    .to_string(),
+                required: false,
+            },
+        ],
+    }]
 }
 
 #[cfg(test)]
@@ -342,30 +166,16 @@ mod tests {
         WorkspaceApiClient::new("http://localhost:0")
     }
 
-    fn make_ev() -> EvoruleApiClient {
-        EvoruleApiClient::new("http://localhost:0")
-    }
-
     #[test]
     fn test_specs_count() {
-        assert_eq!(specs().len(), 5);
+        assert_eq!(specs().len(), 1);
     }
 
     #[test]
     fn test_register_tools() {
-        let ws = make_ws();
-        let ev = make_ev();
         let mut h = ToolHandler::new();
-        register(&mut h, &ws, &ev);
-        for name in [
-            "bundle_export",
-            "bundle_import_dry_run",
-            "bundle_import",
-            "bundle_active_list",
-            "bundle_imports_list",
-        ] {
-            assert!(h.has_tool(name), "tool {} should be registered", name);
-        }
+        register(&mut h, &make_ws());
+        assert!(h.has_tool("bundle_export"));
     }
 
     #[tokio::test]
@@ -442,49 +252,5 @@ mod tests {
         let msg = result.unwrap_err();
         assert!(!msg.contains("missing required parameter"));
         assert!(!msg.contains("requires traceable evidence"));
-    }
-
-    #[tokio::test]
-    async fn test_bundle_import_missing_bundle() {
-        let tool = BundleImportTool::new(make_ev());
-        let args = Value::Object(serde_json::Map::new());
-        let result = tool.call(&args).await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("missing required parameter: bundle"));
-    }
-
-    #[tokio::test]
-    async fn test_bundle_import_non_object_bundle_rejected() {
-        let tool = BundleImportTool::new(make_ev());
-        let mut m = serde_json::Map::new();
-        m.insert("bundle".to_string(), Value::from("not-an-object"));
-        let args = Value::Object(m);
-        let result = tool.call(&args).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("bundle must be an object"));
-    }
-
-    #[tokio::test]
-    async fn test_bundle_import_dry_run_missing_bundle() {
-        let tool = BundleImportDryRunTool::new(make_ev());
-        let args = Value::Object(serde_json::Map::new());
-        let result = tool.call(&args).await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("missing required parameter: bundle"));
-    }
-
-    #[tokio::test]
-    async fn test_bundle_import_dry_run_non_object_bundle_rejected() {
-        let tool = BundleImportDryRunTool::new(make_ev());
-        let mut m = serde_json::Map::new();
-        m.insert("bundle".to_string(), Value::from(42));
-        let args = Value::Object(m);
-        let result = tool.call(&args).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("bundle must be an object"));
     }
 }

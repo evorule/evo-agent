@@ -167,6 +167,22 @@ impl ApiCore {
         }
         Ok(resp)
     }
+
+    /// `check_response_full` 的宽容变体：`accept` 中的非 2xx 状态视为成功
+    /// （响应体原样返回给调用方自行判断语义）。
+    ///
+    /// 用例：`POST /api/rules/validate` 的 422 = 校验未通过（含 errors 数组），
+    /// 是业务结果而非传输错误，须把 body 交给调用方。
+    pub(crate) async fn check_response_full_accept(
+        &self,
+        resp: Response,
+        accept: &[u16],
+    ) -> Result<Response, ApiError> {
+        if !resp.status().is_success() && !accept.contains(&resp.status().as_u16()) {
+            return self.check_response_full(resp).await;
+        }
+        Ok(resp)
+    }
 }
 
 /// B5-server：双 token 解析——service 优先，缺省回退 user；均缺失/为空则 None。

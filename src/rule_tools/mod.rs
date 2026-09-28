@@ -3,45 +3,29 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
 //! 规则管理工具集 —— 把 WorkspaceApiClient/EvoruleApiClient 封装成 ToolFunction 工具
+//!
+//! 组装结构（理顺批 P1 适配器化后）：
+//! - 40 个纯透传工具 → `adapter` 表驱动（ALL_TRANSPARENT_BINDINGS 声明式映射）；
+//! - 5 个本地逻辑工具驻独立文件：audit_verify / bundle_export /
+//!   meta_summary / evolution_signals / rule_promote。
 
 pub mod adapter;
 pub mod audit_tools;
 pub mod bundle_tools;
-pub mod dataset_tools;
 pub mod evolution_tools;
-pub mod knowledge_tools;
 pub mod meta_tools;
-pub mod production_tools;
-pub mod publish_tools;
-pub mod rule_crud;
-pub mod sandbox_tools;
-pub mod translate_tools;
-pub mod workspace_tools;
 
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::workspace_client::WorkspaceApiClient;
 use crate::builtin_tools::ToolSpec;
 use crate::io_handlers::tool_handler::ToolHandler;
 
-/// 组装规则管理工具集（M1：workspace 2 + rule 12 + audit 3 = 17 工具）
-pub fn rule_management_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
-    let mut h = ToolHandler::new();
-    workspace_tools::register(&mut h, ws);
-    rule_crud::register(&mut h, ws);
-    audit_tools::register(&mut h, ev);
-    h
-}
-
-/// 组装完整规则工具集（M3：内置 20 + 沙盒/发布 14 + bundles/knowledge 8 + meta 1 + 进化信号 2 = 45 工具）
+/// 组装完整规则工具集（M3：透传 40 + 本地逻辑 5 = 45 工具）
 pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
-    let mut h = rule_management_toolkit(ws, ev);
-    translate_tools::register(&mut h, ws);
-    sandbox_tools::register(&mut h, ws);
-    dataset_tools::register(&mut h, ws);
-    publish_tools::register(&mut h, ws);
-    production_tools::register(&mut h, ws);
-    bundle_tools::register(&mut h, ws, ev);
-    knowledge_tools::register(&mut h, ev);
+    let mut h = ToolHandler::new();
+    adapter::register_bindings(&mut h, ws, ev, adapter::ALL_TRANSPARENT_BINDINGS);
+    audit_tools::register(&mut h, ev);
+    bundle_tools::register(&mut h, ws);
     meta_tools::register(&mut h, ev);
     evolution_tools::register(&mut h, ws, ev);
     h
@@ -49,17 +33,9 @@ pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> Tool
 
 /// 全部规则工具 spec（45 个）
 pub fn rule_tool_specs() -> Vec<ToolSpec> {
-    let mut specs = Vec::new();
-    specs.extend(workspace_tools::specs());
-    specs.extend(rule_crud::specs());
-    specs.extend(translate_tools::specs());
+    let mut specs = adapter::specs_from(adapter::ALL_TRANSPARENT_BINDINGS);
     specs.extend(audit_tools::specs());
-    specs.extend(sandbox_tools::specs());
-    specs.extend(dataset_tools::specs());
-    specs.extend(publish_tools::specs());
-    specs.extend(production_tools::specs());
     specs.extend(bundle_tools::specs());
-    specs.extend(knowledge_tools::specs());
     specs.extend(meta_tools::specs());
     specs.extend(evolution_tools::specs());
     specs

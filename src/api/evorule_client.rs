@@ -45,12 +45,14 @@ impl EvoruleApiClient {
     /// query）+ 可选 JSON body → 响应 JSON 原样返回。
     ///
     /// 错误口径 = check_response_full（非 2xx 时 server 错误详情透出，LLM 可自
-    /// 诊断修复），与 bundle/knowledge 侧既有方法一致。
+    /// 诊断修复）；`accept_statuses` 中的非 2xx 状态视为成功、body 原样返回
+    /// （如 validate 类端点的 422=校验未通过业务结果）。
     pub async fn passthrough_request(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<&Value>,
+        accept_statuses: &[u16],
     ) -> Result<Value, ApiError> {
         let url = self.core.url(path);
         let mut req = self
@@ -60,7 +62,10 @@ impl EvoruleApiClient {
             req = req.json(b);
         }
         let resp = req.send().await?;
-        let resp = self.core.check_response_full(resp).await?;
+        let resp = self
+            .core
+            .check_response_full_accept(resp, accept_statuses)
+            .await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -932,7 +937,7 @@ impl EvoruleApiClient {
 }
 
 /// 最小百分号编码（query 参数安全；仅编码保留字与空格，字母数字与常见符号直通）
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
