@@ -348,7 +348,7 @@ pub fn build_filtered_toolkit_with_switches(
 /// 调用点 = HTTP run/stream handler,在 `build_filtered_toolkit_with_switches`
 /// 之后(过滤产物为 per-request 新实例,替换不影响启动期 union toolkit)。
 /// 容器域 = 任务沙箱语义见 `shell_exec::docker_exec_argv` 注记;白名单/规则面
-/// 随动 = 参赛 P2 扩权批(02 号 §二);不传容器名即零变化(删配置即下线)。
+/// 随动 = 参赛 P2 扩权批规则面;不传容器名即零变化(删配置即下线)。
 /// 容器命令超时取 600s(容器内 pip/构建类命令显著长于宿主 30s 缺省)。
 pub fn with_shell_exec_backend(filtered: &mut ToolHandler, container: &str) {
     let tool = crate::builtin_tools::shell_exec::ShellExecTool::new()
@@ -613,7 +613,7 @@ mod tests {
         restrict_tools_to_surface(&mut def_tools, &filtered);
         assert!(
             !def_tools.is_empty(),
-            "readonly-degraded copilot must retain a read surface"
+            "readonly-degraded agent must retain a read surface"
         );
         for t in &def_tools {
             assert!(filtered.has_tool(t));

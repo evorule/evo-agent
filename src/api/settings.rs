@@ -615,7 +615,7 @@ mod tests {
         assert_eq!(settings["agentTools.grep"], json!(true));
         assert_eq!(settings["agentTools.gitRead"], json!(true));
         assert_eq!(settings["agentTools.gitWrite"], json!(false));
-        // 治理写权开关(O-155):单键默认开 = 45 工具全量,零行为变化
+        // 治理写权开关:单键默认开 = 45 工具全量,零行为变化
         assert_eq!(settings["agentTools.governanceWrite"], json!(true));
         // search.* 全局搜索 4 键(B2 消费)
         assert_eq!(settings["search.maxResults"], json!(1000));

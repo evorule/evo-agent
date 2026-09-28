@@ -308,7 +308,7 @@ impl ApprovalCallback for PolicyApproval {
     }
 }
 
-/// G8(O-165 修复,人工审查开合):剥离工具调用参数中 LLM 自带的 `approved` 旗标
+/// G8(人工审查开合):剥离工具调用参数中 LLM 自带的 `approved` 旗标
 ///
 /// candidate 工具两次调用协议中,`approved:true` 只能由 runner 在决策端批准后的
 /// 重执行时注入([`crate::agent::runner`] 的 `maybe_handle_approval`/`resolve_approval`)。
@@ -543,7 +543,7 @@ mod tests {
         assert!(d.reason.contains("medium"));
     }
 
-    // ===== strip_approved_flag 测试(O-165) =====
+    // ===== strip_approved_flag 测试 =====
 
     #[test]
     fn test_strip_approved_flag_removes_flag() {

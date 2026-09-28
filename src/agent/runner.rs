@@ -515,7 +515,7 @@ fn path_scope(
     }
 }
 
-// ----- P2(O-077 方案 C):治理级工具事前意图裁决(裁决泛化)-----
+// ----- P2 治理级工具事前意图裁决(裁决泛化) -----
 
 /// P2:治理级工具分级表(裁决面单一事实源)
 ///
@@ -598,7 +598,7 @@ pub fn resolve_tool_intent(
 ///
 /// 中性判据:`set meta_tool.pending_tool_intent = {tool_name, target_scope?, args}`。
 /// 与 M5-c 的 `pending_target_scope`(R1 通道)并存互不干扰;宪法 set 规则纯
-/// 透传(rules_dir enforce 对裁决会话 set 指令可达——O-078 先占只卡 call_external),
+/// 透传(rules_dir enforce 对裁决会话 set 指令可达——先占裁决只卡 call_external),
 /// 被拦=引擎丢弃指令不推进 version,放行=内建 set 落状态。
 pub fn tool_intent_signal(intent: &Value) -> Value {
     serde_json::json!({
@@ -767,7 +767,7 @@ pub struct AgentRunner {
     /// 不受主会话 io 在途影响)。tokio Mutex:G13 并行工具路径可并发进入
     /// `execute_tool_call`,且裁决全程含 await。
     adjudicator: tokio::sync::Mutex<crate::agent::adjudicator::AdjudicationChannel>,
-    /// O-077 P1:工具调用轨迹采集器(会话内累积,io_response 收尾后随
+    /// P1:工具调用轨迹采集器(会话内累积,io_response 收尾后随
     /// tool_trace 指令批量提交进引擎审计链;std Mutex:临界区无 await)
     tool_traces: std::sync::Arc<std::sync::Mutex<crate::agent::tool_trace::ToolTraceCollector>>,
 }
@@ -1301,7 +1301,7 @@ impl AgentRunner {
         Ok(())
     }
 
-    /// O-077 P1:会话收尾把工具调用轨迹随 tool_trace 指令批量提交进引擎审计链
+    /// P1:会话收尾把工具调用轨迹随 tool_trace 指令批量提交进引擎审计链
     ///
     /// 宪法 core_eval v0.5.0 tool_trace 规则将 value 按指令给定 attr set 入
     /// payload(attr=meta_tool.tool_traces.<seq>),随 StateTransition 事实落链;
@@ -2145,7 +2145,7 @@ impl AgentRunner {
             (cached, None)
         } else {
             // 缓存未命中:走正常的 execute_tool_call + 审批流程
-            // 第一次调用(不带 approved flag)——O-165:LLM 自带 approved 旗标
+            // 第一次调用(不带 approved flag):LLM 自带的 approved 旗标
             // 强制剥离,决策门唯一控制权归 runner
             let first_args = strip_approved_flag(&args);
             let tool_result = self.execute_tool_call(tool_name, &first_args).await?;
@@ -2204,7 +2204,7 @@ impl AgentRunner {
                     main_session = ?self.session_id, tool = %tool_name, scope = %scope,
                     "tool intent blocked by governance rule (collab acceptance, adjudication channel)"
                 );
-                // O-077 P1:被治理拦截的调用也是真实执行史——进轨迹(status=blocked)
+                // 被治理拦截的调用也是真实执行史——进轨迹(status=blocked)
                 if let Ok(mut tt) = self.tool_traces.lock() {
                     tt.record(tool_name, args, "blocked_by_governance", 0);
                 }
@@ -2228,7 +2228,7 @@ impl AgentRunner {
                 }));
             }
         }
-        // P2(O-077 方案 C):治理级工具事前意图裁决——分级表命中的调用先把
+        // P2 治理级工具事前意图裁决——分级表命中的调用先把
         // 意图规范字段(tool_name/target_scope?/args 净化副本)随中性 set 指令
         // 进裁决会话,由 00_constraint_tool_intent_adjudication enforce 裁决:
         // 被拦(version 未推进)则不执行工具(fail-closed),放行继续。与上方
@@ -2248,7 +2248,7 @@ impl AgentRunner {
                     main_session = ?self.session_id, tool = %tool_name,
                     "tool intent blocked by governance rule (tool intent adjudication, adjudication channel)"
                 );
-                // O-077 P1:被治理拦截的调用也是真实执行史——进轨迹(status=blocked)
+                // 被治理拦截的调用也是真实执行史——进轨迹(status=blocked)
                 if let Ok(mut tt) = self.tool_traces.lock() {
                     tt.record(tool_name, args, "blocked_by_governance", 0);
                 }
@@ -2276,7 +2276,7 @@ impl AgentRunner {
         if let Some(m) = &self.metrics {
             m.observe_tool_call(tool_name, tool_duration, tool_ok);
         }
-        // O-077 P1:轨迹采集(G17 同点;脱敏+截断在 collector 内;std Mutex
+        // 轨迹采集(G17 同点;脱敏+截断在 collector 内;std Mutex
         // 临界区无 await,G13 并发下 poison 按 fail-soft 跳过)
         if let Ok(mut tt) = self.tool_traces.lock() {
             tt.record(
@@ -2312,7 +2312,7 @@ impl AgentRunner {
         }
 
         // G8:第一次调用(不带 approved flag)→ 可能返回 needs_approval proposal
-        // O-165:LLM 自带 approved 旗标强制剥离(决策门唯一控制权归 runner)
+        // LLM 自带 approved 旗标强制剥离(决策门唯一控制权归 runner)
         let first_args = strip_approved_flag(args);
         let tool_result = self.execute_tool_call(tool_name, &first_args).await?;
         let result_str = tool_result.to_string();
