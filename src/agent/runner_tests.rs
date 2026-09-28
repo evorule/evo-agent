@@ -2316,6 +2316,199 @@ async fn first_round_intent_goes_through_adjudication_channel() {
     m_cmd.assert_async().await;
 }
 
+// ----- P2(O-077 方案 C):治理级工具事前意图裁决 -----
+
+#[test]
+fn p2_non_governance_tool_produces_no_intent() {
+    let b = m5c_boundary();
+    assert_eq!(
+        resolve_tool_intent("file_read", &serde_json::json!({"path": "a.txt"}), Some(&b)),
+        None
+    );
+    assert_eq!(
+        resolve_tool_intent(
+            "shell_exec",
+            &serde_json::json!({"command": "ls"}),
+            Some(&b)
+        ),
+        None
+    );
+    assert_eq!(
+        resolve_tool_intent("grep_files", &serde_json::json!({}), None),
+        None
+    );
+}
+
+#[test]
+fn p2_file_delete_intent_carries_scope_and_args() {
+    let b = m5c_boundary();
+    let intent = resolve_tool_intent(
+        "file_delete",
+        &serde_json::json!({"path": "sub/a.txt"}),
+        Some(&b),
+    )
+    .expect("governance tool must produce intent");
+    assert_eq!(intent["tool_name"], "file_delete");
+    assert_eq!(intent["target_scope"], "in_sandbox");
+    assert_eq!(intent["args"]["path"], "sub/a.txt");
+
+    let out = resolve_tool_intent(
+        "file_delete",
+        &serde_json::json!({"path": "../../x"}),
+        Some(&b),
+    )
+    .unwrap();
+    assert_eq!(out["target_scope"], "out_of_sandbox");
+}
+
+#[test]
+fn p2_file_move_intent_uses_both_path_fields() {
+    let b = m5c_boundary();
+    // target_dir 越界(path 沙箱内)即 out_of_sandbox
+    let abs_out = if cfg!(windows) {
+        "D:\\outside"
+    } else {
+        "/outside"
+    };
+    let intent = resolve_tool_intent(
+        "file_move",
+        &serde_json::json!({"path": "a.txt", "target_dir": abs_out}),
+        Some(&b),
+    )
+    .unwrap();
+    assert_eq!(intent["target_scope"], "out_of_sandbox");
+    // 双字段全沙箱内 → in_sandbox
+    let intent = resolve_tool_intent(
+        "file_move",
+        &serde_json::json!({"path": "a.txt", "target_dir": "sub"}),
+        Some(&b),
+    )
+    .unwrap();
+    assert_eq!(intent["target_scope"], "in_sandbox");
+    // 仅 path 字段(缺 target_dir) → 以 path 为准
+    let intent =
+        resolve_tool_intent("file_move", &serde_json::json!({"path": "a.txt"}), Some(&b)).unwrap();
+    assert_eq!(intent["target_scope"], "in_sandbox");
+}
+
+#[test]
+fn p2_non_file_governance_tool_has_no_scope_but_args() {
+    // 无边界声明:非 file 族治理工具仍上裁决(意图留痕),无 scope 字段
+    let intent =
+        resolve_tool_intent("rule_activate", &serde_json::json!({"id": "R-1"}), None).unwrap();
+    assert_eq!(intent["tool_name"], "rule_activate");
+    assert!(intent.get("target_scope").is_none());
+    assert_eq!(intent["args"]["id"], "R-1");
+}
+
+#[test]
+fn p2_sensitive_args_redacted_in_intent() {
+    let intent = resolve_tool_intent(
+        "rule_create",
+        &serde_json::json!({"api_key": "SECRET-VALUE"}),
+        None,
+    )
+    .unwrap();
+    assert_eq!(intent["args"]["api_key"], "[REDACTED]");
+}
+
+#[test]
+fn p2_intent_signal_shape_is_neutral_set() {
+    let intent = serde_json::json!({"tool_name": "file_delete", "args": {}});
+    let sig = tool_intent_signal(&intent);
+    assert_eq!(sig["type"], "set");
+    assert_eq!(sig["params"]["attr"], "meta_tool.pending_tool_intent");
+    assert_eq!(sig["params"]["value"]["tool_name"], "file_delete");
+}
+
+#[test]
+fn p2_adjudication_table_matches_design() {
+    // 设计档 §3.1 全表 24 项(2026-09-28 用户批 D1=A);防漂移守卫
+    assert_eq!(GOVERNANCE_ADJUDICATION_TOOLS.len(), 24);
+    for t in [
+        "file_create",
+        "file_move",
+        "file_delete",
+        "git_stage",
+        "git_commit",
+        "rule_activate",
+        "bundle_import",
+    ] {
+        assert!(is_governance_adjudication_tool(t), "{t} must be gated");
+    }
+    for t in [
+        "file_read",
+        "file_write",
+        "shell_exec",
+        "grep_files",
+        "publish_list",
+        "publish_queue_get",
+        "git_status",
+    ] {
+        assert!(!is_governance_adjudication_tool(t), "{t} must NOT be gated");
+    }
+}
+
+#[tokio::test]
+async fn p2_blocked_intent_prevents_execution() {
+    // file_delete 越界 → 裁决会话 version 恒 0(被拦) → blocked JSON,fail-closed;
+    // 断言裁决会话 create + command 均被调,且意图指令形态正确
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let m_create = server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_body(r#"{"session_id": 78}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let m_state = server
+        .mock("GET", "/api/sessions/78/state")
+        .with_status(200)
+        .with_body(r#"{"version": 0}"#)
+        .expect(21)
+        .create_async()
+        .await;
+    let abs = if cfg!(windows) {
+        "D:\\outside\\x.txt"
+    } else {
+        "/outside/x.txt"
+    };
+    let m_cmd = server
+        .mock("POST", "/api/sessions/78/command")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "instruction": {
+                "type": "set",
+                "params": {
+                    "attr": "meta_tool.pending_tool_intent",
+                    "value": {
+                        "tool_name": "file_delete",
+                        "target_scope": "out_of_sandbox",
+                        "args": { "path": abs }
+                    }
+                }
+            }
+        })))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+
+    let runner =
+        AgentRunner::new(AgentConfig::default(), client).with_capability_boundary(m5c_boundary());
+    let result = runner
+        .execute_tool_call("file_delete", &serde_json::json!({ "path": abs }))
+        .await
+        .expect("blocked verdict must surface as tool result, not error");
+    assert_eq!(result["status"], "blocked_by_governance_rule");
+    assert_eq!(result["tool"], "file_delete");
+    assert_eq!(result["intent"]["target_scope"], "out_of_sandbox");
+    m_create.assert_async().await;
+    m_state.assert_async().await;
+    m_cmd.assert_async().await;
+}
+
 // ----- M5-c:约束资产域路径形状守卫（1.0.0 缺陷回归防线）-----
 //
 // 域谓词 path 为 exec 相对路径（path.rs resolve_exec_path：裸路径自动补
