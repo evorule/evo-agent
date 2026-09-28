@@ -114,6 +114,19 @@ impl ToolTraceCollector {
         self.entries.push(entry);
     }
 
+    /// 人工审查开合(2026-09-28 立项):把 G8 审批决策附加到最近一条轨迹条目
+    ///
+    /// candidate 工具批准后的重执行经 execute_tool_call 记录轨迹(status=ok),
+    /// 本方法在该条目附加 `approval` 子对象(proposal_id/decision/approver/
+    /// verified/decided_at/reason)——决策事件全量入审计链(三原则③)。
+    /// 拒绝时不重执行,附加到 proposal 首调条目。candidate 工具始终串行
+    /// (G13 定义级约束),记录与附加之间无并发交错。
+    pub fn attach_approval_to_last(&mut self, approval: Value) {
+        if let Some(entry) = self.entries.last_mut() {
+            entry["approval"] = approval;
+        }
+    }
+
     /// 取出全部已采集轨迹(提交用)
     pub fn drain(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.entries)
@@ -240,6 +253,28 @@ mod tests {
         assert!(out["original_bytes"].as_u64().unwrap() > MAX_ARGS_BYTES as u64);
         let small = json!({"command": "ls"});
         assert_eq!(truncate_args(small.clone()), small);
+    }
+
+    #[test]
+    fn attach_approval_to_last_appends_decision() {
+        let mut c = ToolTraceCollector::default();
+        c.record("shell_exec", &json!({"command": "rm x"}), "ok", 7);
+        c.attach_approval_to_last(json!({
+            "proposal_id": "ap-1",
+            "decision": "approved",
+            "approver": "auto_policy",
+            "reason": "auto_policy: risk=medium accepted in unattended mode"
+        }));
+        let e = c.drain().remove(0);
+        assert_eq!(e["approval"]["approver"], "auto_policy");
+        assert_eq!(e["approval"]["proposal_id"], "ap-1");
+        assert!(e["approval"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("unattended"));
+        // 空采集器附加为 no-op(防御性,不 panic)
+        c.attach_approval_to_last(json!({"x": 1}));
+        assert!(c.is_empty());
     }
 
     #[test]

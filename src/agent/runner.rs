@@ -2382,6 +2382,12 @@ impl AgentRunner {
             self.execute_tool_call(tool_name, &approved_args).await?
         };
 
+        // 人工审查开合:决策事件入审计链(tool_trace 条目附加 approval 子对象;
+        // 批准=重执行条目,拒绝=proposal 首调条目;candidate 始终串行无交错)
+        if let Ok(mut tt) = self.tool_traces.lock() {
+            tt.attach_approval_to_last(record.clone());
+        }
+
         Ok(ToolExecOutcome {
             final_result,
             approval_record: Some(record),
@@ -2567,6 +2573,10 @@ impl AgentRunner {
 
         if !decision.approved {
             warn!(%session_id, tool = tool_name, "G8: tool call rejected");
+            // 人工审查开合:决策事件入审计链(拒绝不重执行,附加到 proposal 首调条目)
+            if let Ok(mut tt) = self.tool_traces.lock() {
+                tt.attach_approval_to_last(approval_record.clone());
+            }
             return Ok((
                 Value::from(r#"{"status":"rejected","message":"User denied approval"}"#),
                 Some(approval_record),
@@ -2583,6 +2593,10 @@ impl AgentRunner {
             approved_args = serde_json::json!({"original_args": args, "approved": true});
         }
         let final_result = self.execute_tool_call(tool_name, &approved_args).await?;
+        // 人工审查开合:决策事件入审计链(附加到重执行条目)
+        if let Ok(mut tt) = self.tool_traces.lock() {
+            tt.attach_approval_to_last(approval_record.clone());
+        }
         Ok((final_result, Some(approval_record)))
     }
 

@@ -311,6 +311,14 @@ pub struct AgentDefinition {
     /// serve 层按启动配置合成缺省边界)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_boundary: Option<CapabilityBoundary>,
+    /// 人工审查开合(审批决策端模式;2026-09-28 立项,agent 定义级,D1 首版粒度)
+    ///
+    /// - 缺省 None(等价 "manual"):现状行为零变化(candidate 走交互审批)
+    /// - "manual":人工审查开启(CLI stdin 交互 / HTTP 60s 审批窗)
+    /// - "auto_policy":自动判定模式(无人值守)——candidate proposal 由
+    ///   PolicyApproval 判定式决策端自动批准,判断逻辑照跑、理由逐笔留痕入链
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
 }
 
 /// G13:`max_parallel_tools` 的默认值(串行)
@@ -409,6 +417,15 @@ impl AgentDefinition {
                         t
                     )));
                 }
+            }
+        }
+        // 人工审查开合:approval_mode 取值门卫(未知值加载期即拒,不给运行期惊喜)
+        if let Some(m) = &self.approval_mode {
+            if m != "manual" && m != "auto_policy" {
+                return Err(AgentDefinitionError::InvalidDefinition(format!(
+                    "approval_mode '{}' must be 'manual' or 'auto_policy'",
+                    m
+                )));
             }
         }
         Ok(())
@@ -739,6 +756,7 @@ mod tests {
             context_window_tokens: None,
             max_parallel_tools: 1,
             capability_boundary: None,
+            approval_mode: None,
         };
         let config = def.to_agent_config();
         assert_eq!(config.agent_type, "writer");
@@ -1079,6 +1097,7 @@ mod tests {
                 sandbox_root: PathBuf::from(root),
                 tools: btools.into_iter().map(String::from).collect(),
             }),
+            approval_mode: None,
         };
         // 平台合法绝对路径(Linux 上 "D:/x" 非绝对路径,门卫语义会被绝对路径检查劫持)
         let abs_root = if cfg!(windows) { "D:/x" } else { "/x" };
@@ -1224,6 +1243,7 @@ mod tests {
             context_window_tokens: None,
             max_parallel_tools: 1,
             capability_boundary: None,
+            approval_mode: None,
         };
         let json = serde_json::to_string(&def).expect("serialize");
         assert!(
@@ -1255,5 +1275,47 @@ mod tests {
         assert_eq!(cfg.max_injected_events, 5);
         assert_eq!(cfg.summary_rollup_threshold, 10);
         assert!(cfg.enable_event_extraction);
+    }
+
+    // ===== 人工审查开合:approval_mode 测试 =====
+
+    #[test]
+    fn test_approval_mode_defaults_to_none() {
+        // 旧版 agent.json 不含 approval_mode → None(manual 态,现状行为零变化)
+        let json = r#"{
+            "agent_type": "x", "version": "1", "description": "",
+            "system_prompt": "", "model": "m", "temperature": 0.5,
+            "max_steps": 1, "step_timeout_secs": 1, "tools": [],
+            "output_format": null
+        }"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert!(def.approval_mode.is_none());
+        // 缺省序列化不出现该键(存量定义零迁移)
+        let ser = serde_json::to_string(&def).expect("serialize");
+        assert!(!ser.contains("approval_mode"));
+    }
+
+    #[test]
+    fn test_approval_mode_auto_policy_accepted_and_validated() {
+        let json = r#"{
+            "agent_type": "x", "version": "1", "description": "",
+            "system_prompt": "", "model": "m", "temperature": 0.5,
+            "max_steps": 1, "step_timeout_secs": 1, "tools": [],
+            "output_format": null,
+            "approval_mode": "auto_policy"
+        }"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert_eq!(def.approval_mode.as_deref(), Some("auto_policy"));
+        assert!(def.validate().is_ok());
+
+        let mut manual = def.clone();
+        manual.approval_mode = Some("manual".to_string());
+        assert!(manual.validate().is_ok());
+
+        // 未知值:加载期门卫即拒
+        let mut bad = def;
+        bad.approval_mode = Some("yolo".to_string());
+        let err = bad.validate().unwrap_err();
+        assert!(err.to_string().contains("approval_mode"));
     }
 }

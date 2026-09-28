@@ -9,10 +9,11 @@
 //! `{"status":"needs_approval",...}` 时,runner 拦截并通过 `ApprovalCallback`
 //! 问用户是否批准。用户批准后,runner 带 `approved:true` 重新调用工具。
 //!
-//! ## 三种实现
+//! ## 实现
 //!
-//! - [`CliApproval`]:CLI 模式,从 stdin 读 y/n
-//! - [`HttpApproval`]:HTTP/SSE 模式,通过 oneshot channel 等 POST `/approve`
+//! - [`CliApproval`]:CLI 模式,从 stdin 读 y/n(manual 态)
+//! - [`HttpApproval`]:HTTP/SSE 模式,通过 oneshot channel 等 POST `/approve`(manual 态)
+//! - [`PolicyApproval`]:auto_policy 态,判定式决策端(无人值守,理由必产+留痕)
 //! - [`AutoApprove`]:测试用,总是返回 true
 
 use std::collections::HashMap;
@@ -276,6 +277,37 @@ impl ApprovalCallback for DenyAll {
     }
 }
 
+/// auto_policy 态:判定式决策端(人工审查开合,2026-09-28 立项)
+///
+/// 「全自主」语义 = 运行期零人工决策事件,但每个原需人工决策的点均有
+/// 程序判定+理由留痕:工具侧 candidate 分支照常评估 risk 产出 proposal
+/// (判断逻辑零改动,#13 红线),本决策端对 proposal 执行判定评估——
+/// 判断结果降级为留痕(reason 必产),不阻塞执行。
+///
+/// 与 [`AutoApprove`](测试用)的本质区别:判定理由必产 + approver 语义
+/// 精确("auto_policy"),决策事件随 tool_trace approval 子对象入审计链。
+pub struct PolicyApproval;
+
+#[async_trait]
+impl ApprovalCallback for PolicyApproval {
+    async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision {
+        let reason = format!("auto_policy: risk={} accepted in unattended mode", req.risk);
+        info!(
+            tool = %req.tool_name,
+            command = %req.command,
+            proposal_id = %req.proposal_id,
+            "auto_policy: candidate approved by policy (unattended mode)"
+        );
+        ApprovalDecision {
+            approved: true,
+            approver: "auto_policy".to_string(),
+            verified: false,
+            reason,
+            auto_rejected: false,
+        }
+    }
+}
+
 /// G8:从工具返回的 JSON 中解析审批请求
 ///
 /// 如果工具返回 `{"status":"needs_approval",...}`,则解析出 `ApprovalRequest`。
@@ -462,6 +494,34 @@ mod tests {
         assert_eq!(decision.approver, "cli-user");
         assert!(!decision.verified);
         assert!(!decision.auto_rejected);
+    }
+
+    // ===== PolicyApproval 测试(人工审查开合) =====
+
+    #[tokio::test]
+    async fn test_policy_approval_decision_fields() {
+        let cb = PolicyApproval;
+        let req = ApprovalRequest {
+            session_id: "s1".to_string(),
+            tool_name: "shell_exec".to_string(),
+            args: serde_json::json!({"command": "ls"}),
+            command: "ls".to_string(),
+            risk: "medium: executes a shell command".to_string(),
+            alternative: String::new(),
+            proposal_id: new_proposal_id(),
+        };
+        let d = cb.request_approval(&req).await;
+        assert!(d.approved);
+        assert_eq!(d.approver, "auto_policy");
+        assert!(!d.auto_rejected);
+        // 判定理由必产(#13:判断结果降级留痕)
+        assert!(
+            d.reason.starts_with("auto_policy: risk="),
+            "reason: {}",
+            d.reason
+        );
+        assert!(d.reason.contains("accepted in unattended mode"));
+        assert!(d.reason.contains("medium"));
     }
 
     // ===== HttpApproval 测试 =====

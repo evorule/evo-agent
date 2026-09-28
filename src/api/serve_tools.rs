@@ -1101,6 +1101,7 @@ mod tests {
             context_window_tokens: None,
             max_parallel_tools: 1,
             capability_boundary: boundary,
+            approval_mode: None,
         }
     }
 

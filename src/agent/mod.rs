@@ -28,7 +28,7 @@ pub mod workflow;
 
 pub use approval::{
     new_proposal_id, ApprovalCallback, ApprovalDecision, ApprovalRequest, AutoApprove, CliApproval,
-    DenyAll, HttpApproval, PendingApproval, HTTP_APPROVAL_TIMEOUT_SECS,
+    DenyAll, HttpApproval, PendingApproval, PolicyApproval, HTTP_APPROVAL_TIMEOUT_SECS,
 };
 pub use audited_llm::{AuditedLlm, DEFAULT_AUDITED_CALL_TIMEOUT_SECS};
 pub use callback::{CallbackChain, EventCallback, LoggingCallback, MetricsCallback};

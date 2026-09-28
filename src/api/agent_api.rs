@@ -823,6 +823,8 @@ async fn run_agent_stream(
     .await;
     // M1 规范入口索引:同 run_agent 口径
     crate::api::serve_tools::apply_regulation_index_awareness(&mut def.system_prompt);
+    // 人工审查开合(2026-09-28):def move 前捕获审批模式(auto_policy → PolicyApproval)
+    let approval_auto = def.approval_mode.as_deref() == Some("auto_policy");
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
@@ -832,11 +834,17 @@ async fn run_agent_stream(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .with_capability_boundary(capability_boundary)
-    // G8:注入 HttpApproval — candidate 工具返回 needs_approval 时,
-    // runner 通过 oneshot channel 等 POST /approve(60s 超时自动拒绝)
-    .with_approval_callback(std::sync::Arc::new(
-        crate::agent::approval::HttpApproval::new(state.pending_approvals.clone()),
-    ))
+    // G8:注入审批决策端(人工审查开合)——定义级 approval_mode=auto_policy 时
+    // 走 PolicyApproval 判定式决策端(无人值守,理由必产);否则 HttpApproval
+    // 60s 人工审批窗(manual 态,现状行为)
+    .with_approval_callback(if approval_auto {
+        std::sync::Arc::new(crate::agent::approval::PolicyApproval)
+            as std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>
+    } else {
+        std::sync::Arc::new(crate::agent::approval::HttpApproval::new(
+            state.pending_approvals.clone(),
+        )) as std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>
+    })
     // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
     .with_metrics(state.metrics.clone());
 
