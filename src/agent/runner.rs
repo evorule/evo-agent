@@ -1358,6 +1358,13 @@ impl AgentRunner {
     ///
     /// 与 [`Self::run_streaming`] 共享 G17 工具插桩与治理链路;本路径在
     /// 全部终止边界(取消/超步/错误/Violation/Stable/流关闭)提交工具轨迹。
+    ///
+    /// 引擎自 v0.5.0 起仅单发桥接(call_external 的 io_response 消费后即
+    /// Stable,不再发起下一轮),多轮编排由应用层负责——本方法**没有**本地
+    /// 工具结果回喂循环,LLM 首轮返回 tool_calls 的任务会在 Stable 终止
+    /// (此时按编排断裂指纹显式判错,不再假绿)。生产多轮工具任务一律走
+    /// [`Self::run_streaming`](本地回喂循环);本方法仅保留给 mock 引擎
+    /// 测试面与单轮纯文本场景。
     pub async fn run(&mut self, goal: &str) -> Result<AgentResult, AgentError> {
         let start_time = std::time::Instant::now();
 
@@ -1620,6 +1627,36 @@ impl AgentRunner {
                         content
                     };
                     if content.is_empty() {
+                        // 假绿改判(fail-fast):content 空且末条 Assistant 携带
+                        // tool_calls = LLM 意图调用工具但多轮编排未继续(引擎
+                        // v0.5.0 起仅单发桥接,本方法无本地回喂循环)——此时返回
+                        // success 即静默假绿,改判 error 并指向流式回喂路径。
+                        // 纯 LLM 真返空(末条 assistant 无 tool_calls)仍按
+                        // success 空产出放行,不误伤。
+                        let orchestration_broken = matches!(
+                            messages.last(),
+                            Some(Message::Assistant {
+                                tool_calls: Some(tcs),
+                                ..
+                            }) if !tcs.is_empty()
+                        );
+                        if orchestration_broken {
+                            warn!(
+                                %session_id, step_count,
+                                "Stable with empty content while LLM requested tool calls: \
+                                 multi-round orchestration did not continue (single-shot bridge), \
+                                 failing fast"
+                            );
+                            self.submit_tool_traces(&session_id).await;
+                            return Ok(AgentResult::error(
+                                "agent requested tool calls but no further round executed \
+                                 (engine single-shot bridge); use the streaming run path, \
+                                 which feeds tool results back to the LLM"
+                                    .to_string(),
+                                step_count,
+                                duration,
+                            ));
+                        }
                         // 空产出观测补位(不改判 success——合法空响应不误伤)。
                         // 三联指纹(tokens=0+亚秒+空 content)曾掩盖 LLM 失败假绿,
                         // 此处保证链上观测可见。

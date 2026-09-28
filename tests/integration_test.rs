@@ -1202,3 +1202,119 @@ async fn test_llm_text_intent_without_tool_calls_does_not_execute_tools() {
     // 审计面:原文全量回传,不静默丢弃
     io_resp.assert_async().await;
 }
+
+// ===== Stable 假绿改判（fail-fast）:多轮编排断裂指纹 =====
+//
+// 引擎自宪法 v0.5.0 起仅单发桥接（io_response 消费后即 Stable，不再发起下一轮），
+// run() 无本地工具结果回喂循环——LLM 首轮请求工具时旧实现返回 success=true+空
+// content（假绿）。改判后：Stable 时 content 空 ∧ 末条 Assistant 带 tool_calls
+// → 显式判错；纯文本/合法空响应不误伤。
+
+/// 搭建单发桥接 mock 面并跑 run()：IoRequest(call_external) → LLM(mock content)
+/// → io_response → Stable(payload.llm_response.content 为空)
+async fn run_single_shot_bridge(mock_llm_content: &str) -> evo_agent::AgentResult {
+    let mut server = Server::new_async().await;
+    let server_url = server.url();
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_body(r#"{"session_id": 77}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", "/api/sessions/77/payload")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    // auto_recall: shared facts → 空（recall 提前返回）
+    server
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
+        .with_status(200)
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", "/api/sessions/77/command")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", "/api/sessions/77/io_response")
+        .with_status(200)
+        .with_body(r#"{"success": true}"#)
+        .create_async()
+        .await;
+
+    // 事件类型值与 evorule-server 实际发出的 PascalCase 一致（IoRequest/Stable）
+    let sse_events = "data: {\"type\":\"IoRequest\",\"io_type\":\"call_external\",\"id\":1,\"params\":{\"model\":\"gpt-4o-mini\"}}\r\n\r\ndata: {\"type\":\"Stable\"}\r\n\r\n";
+    server
+        .mock("GET", "/api/sessions/77/events")
+        .with_status(200)
+        .with_header("Content-Type", "text/event-stream")
+        .with_body(sse_events)
+        .create_async()
+        .await;
+
+    // Stable 分支经 get_state 读产出——空 content（单发桥接断裂场景）
+    server
+        .mock("GET", "/api/sessions/77/state")
+        .with_status(200)
+        .with_body(r#"{"payload": {"llm_response": {"content": ""}}}"#)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server_url);
+    let mut runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_llm_handler(LlmHandler::mock(mock_llm_content));
+
+    runner.run("do the task").await.expect("run should not Err")
+}
+
+#[tokio::test]
+async fn test_run_fails_fast_when_tool_calls_orchestration_breaks() {
+    // LLM 文本内嵌 JSON tool call → fallback 解析为 effective_tool_calls
+    // → assistant 消息带 tool_calls 入列 → 单发桥接后 Stable → 假绿指纹命中
+    let result =
+        run_single_shot_bridge(r#"{"name":"file_read","parameters":{"path":"notes.txt"}}"#).await;
+
+    assert!(
+        !result.success,
+        "tool-call request followed by Stable must not report success (fake green)"
+    );
+    let err = result.error.unwrap_or_default();
+    assert!(
+        err.contains("tool calls"),
+        "error should explain the broken orchestration, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_run_plain_text_reply_not_punished_by_fake_green_guard() {
+    // 纯文本回复（无 tool_calls）：fallback 读最后一条非空 Assistant → 正常成功
+    let result = run_single_shot_bridge("plain final answer").await;
+
+    assert!(
+        result.success,
+        "plain text reply must stay success (no false positive)"
+    );
+    assert_eq!(result.content, "plain final answer");
+}
+
+#[tokio::test]
+async fn test_run_empty_llm_response_stays_success() {
+    // LLM 真返空（无 tool_calls）：合法空响应不误伤，保持 success（观测 warn 即可）
+    let result = run_single_shot_bridge("").await;
+
+    assert!(
+        result.success,
+        "genuinely empty LLM response must not be misjudged as orchestration failure"
+    );
+    assert!(result.content.is_empty());
+}
