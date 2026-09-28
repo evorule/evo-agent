@@ -53,7 +53,15 @@ pub struct ToolTraceCollector {
 /// 但携带递归旗标的 rm 属破坏性操作,轨迹打 `rm:<flag>` 旗标。
 const RM_DANGEROUS_FLAGS: &[&str] = &["-rf", "-fr", "-r"];
 
-/// 危险命令检测(词级 token 匹配,非裸子串——防 `cat shutdown.log` 类误伤)
+/// 违禁域名单(A4/A5 反作弊,合规红线):禁经 tbench.ai 与 terminal-bench
+/// benchmark 仓网络取答案。子串级检测只在应用采集侧(零子串谓词纪律
+/// 仅约束规则层),命中打 `domain:<域名>` 旗标,由 server 层规则以
+/// `exists(danger_hits)` 判定 enforce——与危险程序打标同链路。
+const BANNED_DOMAINS: &[&str] = &["tbench.ai", "terminal-bench"];
+
+/// 危险命令检测:程序/旗标为词级 token 匹配(非裸子串——防
+/// `cat shutdown.log` 类误伤),违禁域为子串级扫描(域名串特异性高,
+/// 且 A4/A5 为合规红线,fail-closed 方向误伤只影响轨迹入链形态)。
 ///
 /// 单一事实源 = [`crate::builtin_tools::shell_exec::BLOCKED_COMMANDS`]
 /// (执行前防线Blocked 永不名单);本检测是审计链防线:轨迹条目附加
@@ -61,8 +69,8 @@ const RM_DANGEROUS_FLAGS: &[&str] = &["-rf", "-fr", "-r"];
 /// 判定并 enforce 拦截(违规轨迹→Violation 留痕)。零子串谓词纪律下,
 /// 子串级检测不可入规则层(7 基础域无 contains),故打标在应用采集侧。
 ///
-/// 返回命中描述(如 `program:dd` / `rm:-rf`);无命中返回空 Vec——
-/// **空结果不写字段**(规则层 exists 语义:字段不存在=false)。
+/// 返回命中描述(如 `program:dd` / `rm:-rf` / `domain:tbench.ai`);无命中
+/// 返回空 Vec——**空结果不写字段**(规则层 exists 语义:字段不存在=false)。
 fn detect_danger_hits(command: &str) -> Vec<String> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     let mut hits = Vec::new();
@@ -84,7 +92,19 @@ fn detect_danger_hits(command: &str) -> Vec<String> {
             }
         }
     }
+    hits.extend(detect_domain_hits(command));
     hits
+}
+
+/// 违禁域检测(子串级,小写化全文扫描):shell_exec 命令串与 http_get url
+/// 共用。命中打 `domain:<域名>` 旗标(如 `domain:tbench.ai`)。
+fn detect_domain_hits(text: &str) -> Vec<String> {
+    let lower = text.to_lowercase();
+    BANNED_DOMAINS
+        .iter()
+        .filter(|d| lower.contains(&d.to_lowercase()))
+        .map(|d| format!("domain:{d}"))
+        .collect()
 }
 
 impl ToolTraceCollector {
@@ -92,8 +112,9 @@ impl ToolTraceCollector {
     ///
     /// `status`: `ok` / `error` / `blocked_by_governance`(M5-c 裁决拦截)。
     /// shell_exec 调用附带危险命令打标:命中则轨迹条目附加 `danger_hits`
-    /// 数组(词级检测见 [`detect_danger_hits`]);command 从原始 args 读取
-    /// (截断降级仅作用于入链 args 副本,不影响打标保真)。
+    /// 数组(词级检测+违禁域扫描见 [`detect_danger_hits`]);command 从
+    /// 原始 args 读取(截断降级仅作用于入链 args 副本,不影响打标保真)。
+    /// http_get 调用附带违禁域打标(A4/A5,扫描 `url` 参数)。
     pub fn record(&mut self, tool_name: &str, args: &Value, status: &str, duration_ms: u64) {
         let seq = self.entries.len() as i64;
         let mut entry = serde_json::json!({
@@ -106,6 +127,13 @@ impl ToolTraceCollector {
         if tool_name == "shell_exec" {
             if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
                 let hits = detect_danger_hits(cmd);
+                if !hits.is_empty() {
+                    entry["danger_hits"] = serde_json::json!(hits);
+                }
+            }
+        } else if tool_name == "http_get" {
+            if let Some(url) = args.get("url").and_then(|v| v.as_str()) {
+                let hits = detect_domain_hits(url);
                 if !hits.is_empty() {
                     entry["danger_hits"] = serde_json::json!(hits);
                 }
@@ -326,5 +354,65 @@ mod tests {
         let mut c = ToolTraceCollector::default();
         c.record("file_write", &json!({"command": "rm -rf /"}), "ok", 2);
         assert!(c.drain().remove(0).get("danger_hits").is_none());
+    }
+
+    #[test]
+    fn banned_domain_marked_in_shell_command() {
+        let mut c = ToolTraceCollector::default();
+        c.record(
+            "shell_exec",
+            &json!({"command": "curl -s https://tbench.ai/api/tasks"}),
+            "ok",
+            4,
+        );
+        // curl 属 BLOCKED 名单(program 打标照常)+违禁域命中,双旗标
+        assert_eq!(
+            c.drain().remove(0)["danger_hits"],
+            json!(["program:curl", "domain:tbench.ai"])
+        );
+
+        c.record(
+            "shell_exec",
+            &json!({"command": "git clone https://github.com/laude-institute/terminal-bench"}),
+            "ok",
+            9,
+        );
+        assert_eq!(
+            c.drain().remove(0)["danger_hits"],
+            json!(["domain:terminal-bench"])
+        );
+    }
+
+    #[test]
+    fn no_false_positive_on_ordinary_urls() {
+        // 普通 URL 不触发违禁域打标(curl 本身属 BLOCKED 名单,program 打标照常)
+        assert_eq!(
+            detect_danger_hits("curl -s https://example.com/api"),
+            vec!["program:curl".to_string()]
+        );
+        assert!(detect_danger_hits("pip install requests && pytest -q").is_empty());
+        let mut c = ToolTraceCollector::default();
+        c.record(
+            "http_get",
+            &json!({"url": "https://example.com/data.json"}),
+            "ok",
+            6,
+        );
+        assert!(c.drain().remove(0).get("danger_hits").is_none());
+    }
+
+    #[test]
+    fn http_get_banned_domain_marked() {
+        let mut c = ToolTraceCollector::default();
+        c.record(
+            "http_get",
+            &json!({"url": "https://tbench.ai/tasks/1/references"}),
+            "ok",
+            8,
+        );
+        assert_eq!(
+            c.drain().remove(0)["danger_hits"],
+            json!(["domain:tbench.ai"])
+        );
     }
 }
