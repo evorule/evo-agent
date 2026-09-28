@@ -5,7 +5,7 @@
 //! E1:serve 模式工具组装 —— union toolkit + 按白名单过滤
 //!
 //! serve 模式下 `cmd_serve` 在启动时调用 [`build_union_toolkit`] 一次,组装
-//! 内置 6 + 规则 24 = 30 个工具的 union toolkit,存入 `AgentApiState.toolkit`。
+//! 内置 15 + 规则 26 = 41 个工具的 union toolkit,存入 `AgentApiState.toolkit`。
 //!
 //! 每次 `/agents/{type}/run` 请求时,handler 调用 [`build_filtered_toolkit`]
 //! 按 `def.tools` 白名单从 union 中过滤出该 agent 可用的工具,实现安全隔离。
@@ -62,7 +62,7 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "rule_promote",
 ];
 
-/// 构建 union toolkit(内置 6 + 规则 26 = 32 工具,启动时一次组装)
+/// 构建 union toolkit(内置 15 + 规则 26 = 41 工具,启动时一次组装)
 ///
 /// 在 `cmd_serve` 启动时调用一次,结果存入 `AgentApiState.toolkit`。
 pub fn build_union_toolkit(

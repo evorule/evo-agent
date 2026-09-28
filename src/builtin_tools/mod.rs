@@ -2,8 +2,8 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! 内置工具(0.2.0:file_read / file_list / file_write / file_create /
-//! file_move / file_delete / search_files / shell_exec / http_get /
-//! git_status / git_diff / git_log / git_stage / git_commit)
+//! file_move / file_delete / search_files / grep_files / shell_exec /
+//! http_get / git_status / git_diff / git_log / git_stage / git_commit)
 //!
 //! ## 设计原则
 //!
