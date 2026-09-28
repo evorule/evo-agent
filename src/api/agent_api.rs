@@ -197,7 +197,7 @@ impl AgentApiState {
         workspace_client: Arc<WorkspaceApiClient>,
         toolkit: Arc<ToolHandler>,
     ) -> Self {
-        Self {
+        let state = Self {
             definitions,
             evorule_client,
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -222,7 +222,18 @@ impl AgentApiState {
             workspace_client,
             toolkit,
             llm_status: Arc::new(LlmStatusSnapshot::unconfigured()),
+        };
+        // 治理写权开关启动期观测:敏感部署(agentTools.governanceWrite=false)
+        // 一开服即显式曝光只读模式,避免「写工具静默消失」被误判为故障。
+        // 沿用 provider-key 缺失告警的 eprintln 风格(stdout 启动日志面)。
+        let (merged, _) = state.workbench_settings().merged();
+        if !crate::api::serve_tools::governance_write_enabled(&merged) {
+            eprintln!(
+                "[governance] readonly mode: agentTools.governanceWrite=false -> 21 governance write tools gated off \
+                 (rule write x8, rule_promote, ws_create, sandbox_start/close, dataset_create, publish x5, bundle export/import x3)"
+            );
         }
+        state
     }
 
     /// 注入 LLM 配置脱敏快照(builder 风格,供 serve 启动时调用)

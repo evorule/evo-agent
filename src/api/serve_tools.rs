@@ -252,7 +252,10 @@ pub fn build_filtered_toolkit(union: &ToolHandler, whitelist: &[String]) -> Tool
     filtered
 }
 
-/// 文件增删改与搜索工具的暴露开关(agentTools.*,布尔设置键;开=在 agent 工具面)
+/// 治理写权开关键(单一事实源:TOOL_SWITCH_KEYS 表项与 settings schema 登记共用)
+pub const GOVERNANCE_WRITE_KEY: &str = "agentTools.governanceWrite";
+
+/// 文件/git 增删改与搜索工具的暴露开关(agentTools.*,布尔设置键;开=在 agent 工具面)
 ///
 /// 开关关 = 过滤 toolkit 不注册该执行器 = LLM 工具契约同步消失
 /// (openai_tools_payload 与注册执行器求交,零双声明)。键缺失/值非法时
@@ -269,7 +272,45 @@ const TOOL_SWITCH_KEYS: &[(&str, &str, bool)] = &[
     ("git_log", "agentTools.gitRead", true),
     ("git_stage", "agentTools.gitWrite", false),
     ("git_commit", "agentTools.gitWrite", false),
+    // 治理写权开关(单键,默认 true = 45 工具全量,LLM 自运行的前提;市场主口径:
+    // 保密企业跑内网自有模型数据不出内网,LLM 功能照样全开;中小企业为最大
+    // 用户群,对数据隐私相对不敏感)。敏感领域部署(政府/军工/金融/医疗等)
+    // 设 false 一键转只读:21 个治理写工具的执行器与 LLM 契约同步下线
+    // (连工具 spec 都不出现,非"调用被拒"),24 只读消费面保留——LLM 仍可
+    // 辅助人起草(translate/validate 纯计算),提交/晋升/发布权回到人。
+    ("rule_create", GOVERNANCE_WRITE_KEY, true),
+    ("rule_update", GOVERNANCE_WRITE_KEY, true),
+    ("rule_submit", GOVERNANCE_WRITE_KEY, true),
+    ("rule_activate", GOVERNANCE_WRITE_KEY, true),
+    ("rule_block", GOVERNANCE_WRITE_KEY, true),
+    ("rule_archive", GOVERNANCE_WRITE_KEY, true),
+    ("rule_fork", GOVERNANCE_WRITE_KEY, true),
+    ("rule_reload", GOVERNANCE_WRITE_KEY, true),
+    ("rule_promote", GOVERNANCE_WRITE_KEY, true),
+    ("ws_create", GOVERNANCE_WRITE_KEY, true),
+    ("sandbox_start", GOVERNANCE_WRITE_KEY, true),
+    ("sandbox_close", GOVERNANCE_WRITE_KEY, true),
+    ("dataset_create", GOVERNANCE_WRITE_KEY, true),
+    ("publish_submit", GOVERNANCE_WRITE_KEY, true),
+    ("publish_list", GOVERNANCE_WRITE_KEY, true),
+    ("publish_queue_get", GOVERNANCE_WRITE_KEY, true),
+    ("publish_review", GOVERNANCE_WRITE_KEY, true),
+    ("publish_rollback", GOVERNANCE_WRITE_KEY, true),
+    ("bundle_export", GOVERNANCE_WRITE_KEY, true),
+    ("bundle_import_dry_run", GOVERNANCE_WRITE_KEY, true),
+    ("bundle_import", GOVERNANCE_WRITE_KEY, true),
 ];
+
+/// 治理写权开关当前是否开启(键缺失/值非法回落默认 true)
+///
+/// 供 serve 启动观测横幅等启动期只读场景使用;请求路径的开关判定走
+/// TOOL_SWITCH_KEYS 表(同一键同一默认值,无第二语义)。
+pub fn governance_write_enabled(settings: &serde_json::Map<String, Value>) -> bool {
+    settings
+        .get(GOVERNANCE_WRITE_KEY)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
 
 /// 在 [`build_filtered_toolkit`] 之上叠加 agentTools.* 开关过滤。
 ///
@@ -432,6 +473,139 @@ mod tests {
             WorkspaceApiClient::new("http://localhost:0"),
             EvoruleApiClient::new("http://localhost:0"),
         )
+    }
+
+    /// 治理写权开关门控的 21 个写工具(与 TOOL_SWITCH_KEYS 治理段同源)
+    const GOVERNANCE_WRITE_TOOLS: &[&str] = &[
+        "rule_create",
+        "rule_update",
+        "rule_submit",
+        "rule_activate",
+        "rule_block",
+        "rule_archive",
+        "rule_fork",
+        "rule_reload",
+        "rule_promote",
+        "ws_create",
+        "sandbox_start",
+        "sandbox_close",
+        "dataset_create",
+        "publish_submit",
+        "publish_list",
+        "publish_queue_get",
+        "publish_review",
+        "publish_rollback",
+        "bundle_export",
+        "bundle_import_dry_run",
+        "bundle_import",
+    ];
+
+    fn all_rule_tool_names() -> Vec<String> {
+        crate::rule_tools::rule_tool_specs()
+            .into_iter()
+            .map(|s| s.name)
+            .collect()
+    }
+
+    #[test]
+    fn test_governance_write_switch_defaults_to_full_open() {
+        // 默认(键缺失):21 写工具全部在面——治理写权默认全开,向后兼容锁
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let whitelist: Vec<String> = GOVERNANCE_WRITE_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let filtered =
+            build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
+        for name in GOVERNANCE_WRITE_TOOLS {
+            // 21 写工具中 11 个(sandbox/dataset/publish/bundle 族)不在 serve
+            // union 41 面(union 规则面=26,D-4 实测口径)——它们本就不被 serve,
+            // 与开关无关;此处仅断言 union 内写工具默认不被门控。
+            if !RULE_TOOL_NAMES.contains(name) {
+                continue;
+            }
+            assert!(
+                filtered.has_tool(name),
+                "governance write tool {name} must default to ON"
+            );
+        }
+    }
+
+    #[test]
+    fn test_governance_write_switch_off_gates_exactly_21_write_tools() {
+        // false:21 写工具下线(执行器+LLM 契约同步消失),其余 24 只读保留
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let all = all_rule_tool_names();
+        assert_eq!(all.len(), 45, "rule tool spec count drift");
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            "agentTools.governanceWrite".to_string(),
+            serde_json::json!(false),
+        );
+        let filtered = build_filtered_toolkit_with_switches(&union, &all, &settings);
+        for name in GOVERNANCE_WRITE_TOOLS {
+            assert!(
+                !filtered.has_tool(name),
+                "governance write tool {name} must be gated off"
+            );
+        }
+        let keep: Vec<&str> = all
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| !GOVERNANCE_WRITE_TOOLS.contains(s))
+            .collect();
+        assert_eq!(
+            keep.len(),
+            24,
+            "readonly surface must keep exactly 24 tools"
+        );
+        // 24 只读 spec 中不在 serve union 41 面者本就不被 serve(与开关无关),
+        // 只断言 union 内只读工具全保留
+        for name in &keep {
+            if !RULE_TOOL_NAMES.contains(name) {
+                continue;
+            }
+            assert!(
+                filtered.has_tool(name),
+                "readonly tool {name} must remain available"
+            );
+        }
+    }
+
+    #[test]
+    fn test_governance_off_rule_copilot_degrades_to_readonly_surface() {
+        // 敏感模式:rule-copilot 白名单被收紧到只读交集,from_definition
+        // 早失败校验不会误报(def ⊆ 注册执行器,不 500)
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let def: serde_json::Value =
+            serde_json::from_str(include_str!("../../agents/rule-copilot.json")).unwrap();
+        let mut def_tools: Vec<String> = def["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            "agentTools.governanceWrite".to_string(),
+            serde_json::json!(false),
+        );
+        let filtered = build_filtered_toolkit_with_switches(&union, &def_tools, &settings);
+        restrict_tools_to_surface(&mut def_tools, &filtered);
+        assert!(
+            !def_tools.is_empty(),
+            "readonly-degraded copilot must retain a read surface"
+        );
+        for t in &def_tools {
+            assert!(filtered.has_tool(t));
+            assert!(
+                !GOVERNANCE_WRITE_TOOLS.contains(&t.as_str()),
+                "write tool {t} leaked into readonly surface"
+            );
+        }
     }
 
     #[test]
