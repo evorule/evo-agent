@@ -460,6 +460,17 @@ Agent 配置从 `agents/{type}.json` 加载：
 | `shell_exec` | 执行 Shell 命令（白名单 + candidate 审批） |
 | `http_get` | HTTP GET 请求（主机白名单 + SSRF 防护） |
 
+### 治理写权开关（agentTools.governanceWrite）
+
+治理写权默认**全开**（`true`，向后兼容，LLM 自运行的前提）。敏感领域部署（政府/军工/金融/医疗等）可在工作台设置一键关闭：
+
+| 配置 | 效果 |
+|------|------|
+| `agentTools.governanceWrite = true`（默认） | 45 个规则工具全量，现状零变化 |
+| `agentTools.governanceWrite = false` | **21 个治理写工具整体下线**（rule 写 8 + rule_promote + ws_create + sandbox_start/close + dataset_create + publish ×5 + bundle_export/bundle_import/bundle_import_dry_run），连 LLM 的工具 spec 都不出现（能力面不存在，非"调用被拒"）；24 个只读工具保留（查询/审计/knowledge/meta/evolution_signals/translate/validate 等） |
+
+说明：键为 `application` 作用域，**工作区层不可覆盖**（防项目级配置私自扩权 agent 工具面）；关闭后 LLM 仍可辅助「人起草」（rule_to_transform / rule_to_conditional / rule_validate 纯计算，不出网不落盘），提交/晋升/发布权回到人（console-cloud 审批流）。真正的保密企业通常跑内网自有模型、数据不出内网，此开关默认不干预其全开形态。
+
 ### 规则管理工具集（45 个）
 
 通过 `rule_management_toolkit` / `full_rule_toolkit` 组装，用于 `rule-copilot` Agent：

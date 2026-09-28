@@ -218,6 +218,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.governanceWrite",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 执行治理写操作（rule 写 8 + rule_promote + ws_create + sandbox_start/close + dataset_create + publish ×5 + bundle export/import ×3，共 21 个工具；关闭 = 敏感部署只读模式：写工具连 LLM 契约一起下线，LLM 仍可查询与辅助起草，提交/晋升/发布权回到人）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "search.maxResults",
             kind: SettingType::Number,
             default: json!(1000),
@@ -593,7 +603,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 19);
+        assert_eq!(settings.len(), 20);
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -605,6 +615,8 @@ mod tests {
         assert_eq!(settings["agentTools.grep"], json!(true));
         assert_eq!(settings["agentTools.gitRead"], json!(true));
         assert_eq!(settings["agentTools.gitWrite"], json!(false));
+        // 治理写权开关(O-155):单键默认开 = 45 工具全量,零行为变化
+        assert_eq!(settings["agentTools.governanceWrite"], json!(true));
         // search.* 全局搜索 4 键(B2 消费)
         assert_eq!(settings["search.maxResults"], json!(1000));
         assert_eq!(settings["search.smartCase"], json!(true));
