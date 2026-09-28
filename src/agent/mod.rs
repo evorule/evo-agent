@@ -22,6 +22,7 @@ pub mod safety_auditor;
 pub mod sediment;
 pub mod summarizer;
 pub mod tool_registry;
+pub mod tool_trace;
 pub mod translator;
 pub mod workflow;
 

@@ -658,6 +658,9 @@ pub struct AgentRunner {
     /// 不受主会话 io 在途影响)。tokio Mutex:G13 并行工具路径可并发进入
     /// `execute_tool_call`,且裁决全程含 await。
     adjudicator: tokio::sync::Mutex<crate::agent::adjudicator::AdjudicationChannel>,
+    /// O-077 P1:工具调用轨迹采集器(会话内累积,io_response 收尾后随
+    /// tool_trace 指令批量提交进引擎审计链;std Mutex:临界区无 await)
+    tool_traces: std::sync::Arc<std::sync::Mutex<crate::agent::tool_trace::ToolTraceCollector>>,
 }
 
 impl AgentRunner {
@@ -699,6 +702,9 @@ impl AgentRunner {
                     &agent_type,
                 ),
             ),
+            tool_traces: Arc::new(std::sync::Mutex::new(
+                crate::agent::tool_trace::ToolTraceCollector::default(),
+            )),
         }
     }
 
@@ -1186,7 +1192,52 @@ impl AgentRunner {
         Ok(())
     }
 
-    /// TODO: doc
+    /// O-077 P1:会话收尾把工具调用轨迹随 tool_trace 指令批量提交进引擎审计链
+    ///
+    /// 宪法 core_eval v0.5.0 tool_trace 规则将 value 按指令给定 attr set 入
+    /// payload(attr=meta_tool.tool_traces.<seq>),随 StateTransition 事实落链;
+    /// 规则面可对 instruction_type=tool_trace 精确求值(shell_exec 黑名单类
+    /// enforce 在约束门事前检测,违规轨迹以 Violation 留痕)。
+    ///
+    /// 时序:io_response 提交后调用——若 io 仍在途,submit_command 由引擎
+    /// 串行语义排队,IoResponse 收敛后按序评估(先收敛 call_external 转换
+    /// 再评估轨迹),顺序确定性由引擎保证。fail-soft:单条失败仅计数+warn,
+    /// 绝不阻断会话收尾(与 L2 前馈注入同纪律)。
+    async fn submit_tool_traces(&self, session_id: &str) {
+        let entries = match self.tool_traces.lock() {
+            Ok(mut tt) => tt.drain(),
+            Err(_) => return,
+        };
+        if entries.is_empty() {
+            return;
+        }
+        let total = entries.len();
+        for entry in &entries {
+            let seq = entry.get("seq").and_then(|v| v.as_i64()).unwrap_or(0);
+            let cmd = serde_json::json!({
+                "type": "tool_trace",
+                "params": {
+                    "attr": format!("meta_tool.tool_traces.{}", seq),
+                    "value": entry,
+                }
+            });
+            if let Err(e) = self.evorule_client.submit_command(session_id, &cmd).await {
+                if let Ok(mut tt) = self.tool_traces.lock() {
+                    tt.record_submit_failure();
+                }
+                warn!(
+                    %session_id, seq, error = %e,
+                    "tool_trace submit failed; audit chain gap (fail-soft, counted)"
+                );
+            }
+        }
+        info!(%session_id, total, "tool_trace batch submitted to engine audit chain");
+    }
+
+    /// 非流式主循环:执行 ReAct 推理至目标完成,返回最终结果
+    ///
+    /// 与 [`Self::run_streaming`] 共享 G17 工具插桩与治理链路;本路径在
+    /// 全部终止边界(取消/超步/错误/Violation/Stable/流关闭)提交工具轨迹。
     pub async fn run(&mut self, goal: &str) -> Result<AgentResult, AgentError> {
         let start_time = std::time::Instant::now();
 
@@ -1306,6 +1357,7 @@ impl AgentRunner {
             if self.cancel_token.is_cancelled() {
                 info!(%session_id, "Cancellation requested at event boundary, cleaning up");
                 let _ = self.flush_messages(&session_id).await;
+                self.submit_tool_traces(&session_id).await;
                 let duration = start_time.elapsed().as_millis() as u64;
                 return Ok(AgentResult::cancelled(
                     "cancelled by user".to_string(),
@@ -1323,6 +1375,7 @@ impl AgentRunner {
                     }
                     if step_count > self.config.max_steps {
                         let duration = start_time.elapsed().as_millis() as u64;
+                        self.submit_tool_traces(&session_id).await;
                         return Ok(AgentResult::error(
                             format!("Max steps exceeded: {}", self.config.max_steps),
                             step_count,
@@ -1358,6 +1411,7 @@ impl AgentRunner {
                                         .await;
                                 }
                                 let _ = self.flush_messages(&session_id).await;
+                                self.submit_tool_traces(&session_id).await;
                                 return Err(e);
                             }
                         },
@@ -1375,6 +1429,7 @@ impl AgentRunner {
                                     .await;
                             }
                             let _ = self.flush_messages(&session_id).await;
+                            self.submit_tool_traces(&session_id).await;
                             let duration = start_time.elapsed().as_millis() as u64;
                             return Ok(AgentResult::error(
                                 "cancelled by user".to_string(),
@@ -1452,6 +1507,7 @@ impl AgentRunner {
                     }
 
                     info!(%session_id, content_len = content.len(), "Received Stable event, execution complete");
+                    self.submit_tool_traces(&session_id).await;
                     return Ok(AgentResult::success(
                         content, step_count, duration, tool_calls,
                     ));
@@ -1476,6 +1532,7 @@ impl AgentRunner {
                     let _ = self.flush_messages(&session_id).await;
                     // C1:会话沉淀（best-effort，即使出错也尝试沉淀已收集的对话）
                     let _ = self.sediment_session(&session_id, &messages).await;
+                    self.submit_tool_traces(&session_id).await;
                     return Ok(AgentResult::error(
                         error_msg.to_string(),
                         step_count,
@@ -1501,6 +1558,7 @@ impl AgentRunner {
                     );
                     let _ = self.flush_messages(&session_id).await;
                     let _ = self.sediment_session(&session_id, &messages).await;
+                    self.submit_tool_traces(&session_id).await;
                     let duration = start_time.elapsed().as_millis() as u64;
                     return Ok(AgentResult::error(
                         format!("enforce violation: rule_index={rule_index:?}, reason={reason}"),
@@ -1518,6 +1576,7 @@ impl AgentRunner {
         info!(%session_id, step_count, duration_ms = duration, "SSE event loop ended (stream closed)");
         // 流关闭前也尝试刷写
         let _ = self.flush_messages(&session_id).await;
+        self.submit_tool_traces(&session_id).await;
         // D-01 二次保险（B2）：断流可能吞掉 Violation 帧，查 evolution-signals
         // 兜底归因 enforce 命中；查询不可用时降级返回原错误（不掩盖不阻塞）。
         let closed_error = self
@@ -2034,6 +2093,10 @@ impl AgentRunner {
                     main_session = ?self.session_id, tool = %tool_name, scope = %scope,
                     "tool intent blocked by governance rule (collab acceptance, adjudication channel)"
                 );
+                // O-077 P1:被治理拦截的调用也是真实执行史——进轨迹(status=blocked)
+                if let Ok(mut tt) = self.tool_traces.lock() {
+                    tt.record(tool_name, args, "blocked_by_governance", 0);
+                }
                 let raw_path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 let boundary_root = self
                     .config
@@ -2067,6 +2130,16 @@ impl AgentRunner {
         let tool_ok = result.is_ok();
         if let Some(m) = &self.metrics {
             m.observe_tool_call(tool_name, tool_duration, tool_ok);
+        }
+        // O-077 P1:轨迹采集(G17 同点;脱敏+截断在 collector 内;std Mutex
+        // 临界区无 await,G13 并发下 poison 按 fail-soft 跳过)
+        if let Ok(mut tt) = self.tool_traces.lock() {
+            tt.record(
+                tool_name,
+                args,
+                if tool_ok { "ok" } else { "error" },
+                tool_duration.as_millis() as u64,
+            );
         }
         result
     }
@@ -2929,6 +3002,7 @@ impl AgentRunner {
                     _ = cancel_token.cancelled() => {
                         info!("Cancellation requested during streaming, cleaning up");
                         let _ = runner.flush_messages(&session_id).await;
+                        runner.submit_tool_traces(&session_id).await;
                         let duration = start_time.elapsed().as_millis() as u64;
                         yield Ok(AgentEvent::Error(AgentError::Internal(
                             "cancelled by user".to_string(),
@@ -2954,6 +3028,7 @@ impl AgentRunner {
                             )));
                             let duration = start_time.elapsed().as_millis() as u64;
                             let _ = runner.flush_messages(&session_id).await;
+                            runner.submit_tool_traces(&session_id).await;
                             yield Ok(AgentEvent::Done(AgentResult::error(
                                 format!("Max steps exceeded: {}", runner.config.max_steps),
                                 step_count,
@@ -3010,6 +3085,7 @@ impl AgentRunner {
                                             yield Ok(AgentEvent::Error(err.clone()));
                                             let duration = start_time.elapsed().as_millis() as u64;
                                             let _ = runner.flush_messages(&session_id).await;
+                                            runner.submit_tool_traces(&session_id).await;
                                             yield Ok(AgentEvent::Done(AgentResult::error(
                                                 err.to_string(), step_count, duration,
                                             )));
@@ -3082,6 +3158,7 @@ impl AgentRunner {
                                         let err = AgentError::Internal(format!("serialize messages: {}", e));
                                         yield Ok(AgentEvent::Error(err.clone()));
                                         let duration = start_time.elapsed().as_millis() as u64;
+                                        runner.submit_tool_traces(&session_id).await;
                                         yield Ok(AgentEvent::Done(AgentResult::error(
                                             err.to_string(), step_count, duration,
                                         )));
@@ -3128,6 +3205,7 @@ impl AgentRunner {
                                                     .await;
                                             }
                                             let _ = runner.flush_messages(&session_id).await;
+                                            runner.submit_tool_traces(&session_id).await;
                                             let duration = start_time.elapsed().as_millis() as u64;
                                             yield Ok(AgentEvent::Error(AgentError::Internal(
                                                 "cancelled by user".to_string(),
@@ -3204,6 +3282,7 @@ impl AgentRunner {
                                             yield Ok(AgentEvent::Error(err.clone()));
                                             let duration = start_time.elapsed().as_millis() as u64;
                                             let _ = runner.flush_messages(&session_id).await;
+                                            runner.submit_tool_traces(&session_id).await;
                                             yield Ok(AgentEvent::Done(AgentResult::error(
                                                 err.to_string(), step_count, duration,
                                             )));
@@ -3464,6 +3543,7 @@ impl AgentRunner {
                                         yield Ok(AgentEvent::Error(e.clone()));
                                         let duration = start_time.elapsed().as_millis() as u64;
                                         let _ = runner.flush_messages(&session_id).await;
+                                        runner.submit_tool_traces(&session_id).await;
                                         yield Ok(AgentEvent::Done(AgentResult::error(
                                             e.to_string(), step_count, duration,
                                         )));
@@ -3489,6 +3569,8 @@ impl AgentRunner {
                                             .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
                                             .await;
                                     }
+                                    // 工具已执行、轨迹已采集：终止前补提交，避免审计链缺口（fail-soft）
+                                    runner.submit_tool_traces(&session_id).await;
                                     yield Err(e);
                                     return;
                                 }
@@ -3555,6 +3637,7 @@ impl AgentRunner {
                         } else {
                             content
                         };
+                        runner.submit_tool_traces(&session_id).await;
                         yield Ok(AgentEvent::Done(AgentResult::success(
                             content, step_count, duration, tool_calls,
                         )));
@@ -3574,6 +3657,7 @@ impl AgentRunner {
                         let _ = runner.flush_messages(&session_id).await;
                         // C1:会话沉淀（best-effort，即使出错也尝试沉淀已收集的对话）
                         let _ = runner.sediment_session(&session_id, &messages).await;
+                        runner.submit_tool_traces(&session_id).await;
                         yield Ok(AgentEvent::Done(AgentResult::error(msg.to_string(), step_count, duration)));
                         return;
                     }
@@ -3591,6 +3675,7 @@ impl AgentRunner {
                         let duration = start_time.elapsed().as_millis() as u64;
                         let _ = runner.flush_messages(&session_id).await;
                         let _ = runner.sediment_session(&session_id, &messages).await;
+                        runner.submit_tool_traces(&session_id).await;
                         yield Ok(AgentEvent::Done(AgentResult::error(
                             format!("enforce violation: rule_index={rule_index:?}, reason={reason}"),
                             step_count, duration,
@@ -3606,6 +3691,7 @@ impl AgentRunner {
             // 事件流关闭
             let duration = start_time.elapsed().as_millis() as u64;
             let _ = runner.flush_messages(&session_id).await;
+            runner.submit_tool_traces(&session_id).await;
             // D-01 二次保险（B2）：断流可能吞掉 Violation 帧，查 evolution-signals
             // 兜底归因 enforce 命中；查询不可用时降级返回原错误（不掩盖不阻塞）。
             let closed_error = runner
