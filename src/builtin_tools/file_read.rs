@@ -10,7 +10,7 @@
 //! - 文件大小限制(默认 10 MB,可通过 `max_bytes` 调整)
 //! - 只读常规文件(拒绝目录、socket、设备等)
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::Value;
 
@@ -45,55 +45,11 @@ impl FileReadTool {
     }
 
     /// 解析并校验路径,确保在工作目录内
+    ///
+    /// P0 收口:判据已提入 [`fs_safety::resolve_existing`]
+    /// (crate::builtin_tools::fs_safety)为唯一权威,本处仅委托。
     fn resolve_safe_path(&self, raw: &str) -> Result<PathBuf, String> {
-        let path = Path::new(raw);
-
-        // 拒绝绝对路径(M5-a:错误告知边界,agent 自知而非误判)
-        if path.is_absolute() {
-            return Err(format!(
-                "absolute path not allowed: '{}' (all paths must stay within the sandbox \
-                 boundary '{}')",
-                raw,
-                self.workdir.display()
-            ));
-        }
-
-        // 拒绝 `..` 段
-        for component in path.components() {
-            if matches!(component, Component::ParentDir) {
-                return Err(format!(
-                    "parent dir (..) not allowed: '{}' (must stay within the sandbox \
-                     boundary '{}')",
-                    raw,
-                    self.workdir.display()
-                ));
-            }
-        }
-
-        let joined = self.workdir.join(path);
-
-        // canonicalize 解析 symlink 和 . / ..
-        let canonical = joined
-            .canonicalize()
-            .map_err(|e| format!("path does not exist or cannot resolve: {}", e))?;
-
-        // 必须在 workdir 内
-        let workdir_canonical = self
-            .workdir
-            .canonicalize()
-            .map_err(|e| format!("workdir invalid: {}", e))?;
-
-        if !canonical.starts_with(&workdir_canonical) {
-            // M5-a:越界错误回报「不可访问 + 边界路径」——首要读者是 LLM,
-            // 只说「不存在/逃逸」会让 agent 误判资源形态(瞎子摸象)
-            return Err(format!(
-                "path not accessible: '{}' resolves outside the sandbox boundary '{}'",
-                raw,
-                workdir_canonical.display()
-            ));
-        }
-
-        Ok(canonical)
+        crate::builtin_tools::fs_safety::resolve_existing(&self.workdir, raw)
     }
 }
 
@@ -150,6 +106,8 @@ impl FileReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::path::Path;
 
     fn temp_workdir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

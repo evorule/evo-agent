@@ -21,7 +21,7 @@
 //! - 高级用户:可改 `writable_dir` 到 workdir 根(不推荐,慎用)
 //! - 自动化:CI 环境可设 `overwrite=true`(环境可控,人为审查由 CI 流程保证)
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::Value;
 
@@ -68,111 +68,14 @@ impl FileWriteTool {
 
     /// 解析 + 校验:必须**在 writable_dir 内**
     ///
-    /// 返回 `(target_path, canonical_or_logical_path)`:
-    /// - 存在路径:返回 canonical(用于 symlink 校验)
-    /// - 不存在路径:返回 logical target + writable_canonical(用于 containment 校验)
+    /// P0 收口:判据已提入 [`fs_safety::resolve_writable_target`]
+    /// (crate::builtin_tools::fs_safety)为唯一权威,本处仅委托。
     fn resolve_safe_path(&self, raw: &str) -> Result<(PathBuf, PathBuf), String> {
-        let path = Path::new(raw);
-        if path.is_absolute() {
-            return Err(format!(
-                "absolute path not allowed: '{}' (all paths must stay within the sandbox \
-                 boundary '{}')",
-                raw,
-                self.workdir.display()
-            ));
-        }
-        for component in path.components() {
-            if matches!(component, Component::ParentDir) {
-                return Err(format!(
-                    "parent dir (..) not allowed: '{}' (must stay within the sandbox \
-                     boundary '{}')",
-                    raw,
-                    self.workdir.display()
-                ));
-            }
-        }
-
-        // 1. workdir 必须是已存在的(整个工具的前提)
-        let _workdir_canonical = self
-            .workdir
-            .canonicalize()
-            .map_err(|e| format!("workdir invalid: {}", e))?;
-
-        // 2. writable_dir 也必须存在(否则无法写入)
-        let writable_abs = self.workdir.join(&self.writable_dir);
-        let writable_canonical = writable_abs.canonicalize().map_err(|e| {
-            format!(
-                "writable_dir does not exist: {} ({})",
-                writable_abs.display(),
-                e
-            )
-        })?;
-
-        // 3. 目标路径 = workdir + path(逻辑路径,不一定存在)
-        let target = self.workdir.join(path);
-
-        // 4. containment check(逻辑路径)
-        if !target.starts_with(&writable_abs) {
-            return Err(format!(
-                "path '{}' is outside writable_dir '{}' (path traversal)",
-                raw,
-                self.writable_dir.display()
-            ));
-        }
-        if !target.starts_with(&self.workdir) {
-            // M5-a:越界错误回报「不可访问 + 边界路径」
-            return Err(format!(
-                "path escapes workdir: '{}' is not accessible (outside the sandbox boundary '{}')",
-                raw,
-                self.workdir.display()
-            ));
-        }
-
-        // 5. symlink / reparse point 检查(canonical 必须仍在 writable_dir 内)
-        //
-        // 判据用 `symlink_metadata`(不跟随链接)而非 `exists()`(跟随链接),覆盖三种情形:
-        //   a) 目标存在(普通文件或链接到已存在目标):canonicalize 解析后复查 containment
-        //   b) 悬空 symlink(P02/R03 补):`exists()`=false 但 write 会跟随链接
-        //      在 writable_dir 外创建文件 → symlink_metadata 可见,canonicalize 失败即拒
-        //   c) 目标不存在且本身不是链接:沿父目录链找最深的已存在祖先做 canonicalize
-        //      复查 containment(P02 实证的 junction 父目录逃逸,CWE-59 变体)
-        let target_canonical = match std::fs::symlink_metadata(&target) {
-            Ok(_meta) => {
-                let c = target
-                    .canonicalize()
-                    .map_err(|e| format!("path cannot be resolved: {}", e))?;
-                // 再 check 一次(symlink 可能跳出)
-                if !c.starts_with(&writable_canonical) {
-                    return Err(format!(
-                        "path '{}' resolves outside writable_dir (symlink escape)",
-                        raw
-                    ));
-                }
-                c
-            }
-            Err(_) => {
-                // 目标不存在(且不是悬空链接):父目录链可能含 junction/symlink
-                let mut ancestor = target.parent();
-                while let Some(p) = ancestor {
-                    if p.exists() {
-                        let a = p
-                            .canonicalize()
-                            .map_err(|e| format!("path cannot be resolved: {}", e))?;
-                        if !a.starts_with(&writable_canonical) {
-                            return Err(format!(
-                                "path '{}' resolves outside writable_dir (parent symlink/junction escape)",
-                                raw
-                            ));
-                        }
-                        break;
-                    }
-                    ancestor = p.parent();
-                }
-                target.clone()
-            }
-        };
-
-        Ok((target, target_canonical))
+        crate::builtin_tools::fs_safety::resolve_writable_target(
+            &self.workdir,
+            &self.writable_dir,
+            raw,
+        )
     }
 }
 
