@@ -37,12 +37,14 @@ impl WorkspaceApiClient {
     /// 错误口径 = check_response_full（非 2xx 时 server 错误详情透出）。与既有
     /// typed 方法（反序列化成具体 struct 再转回 Value）相比，本方法不做 typed
     /// 契约校验——透传工具的「响应原样返回」语义下 JSON 直通零损耗，形状校验
-    /// 属 server 职责（机制层 TCB）。
+    /// 属 server 职责（机制层 TCB）。`accept_statuses` 中的非 2xx 状态视为
+    /// 成功、body 原样返回（如 validate 类端点的 422=校验未通过业务结果）。
     pub async fn passthrough_request(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<&Value>,
+        accept_statuses: &[u16],
     ) -> Result<Value, ApiError> {
         let url = self.core.url(path);
         let mut req = self
@@ -52,7 +54,10 @@ impl WorkspaceApiClient {
             req = req.json(b);
         }
         let resp = req.send().await?;
-        let resp = self.core.check_response_full(resp).await?;
+        let resp = self
+            .core
+            .check_response_full_accept(resp, accept_statuses)
+            .await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
