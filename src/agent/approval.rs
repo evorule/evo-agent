@@ -308,6 +308,25 @@ impl ApprovalCallback for PolicyApproval {
     }
 }
 
+/// G8(O-165 修复,人工审查开合):剥离工具调用参数中 LLM 自带的 `approved` 旗标
+///
+/// candidate 工具两次调用协议中,`approved:true` 只能由 runner 在决策端批准后的
+/// 重执行时注入([`crate::agent::runner`] 的 `maybe_handle_approval`/`resolve_approval`)。
+/// 若放行 LLM 首调自带该旗标,工具会跳过 proposal 直接执行——决策门被参数旁路
+/// (无决策事件、无审计留痕,manual/auto_policy 两态同洞)。首调前强制剥离,
+/// 保证每个 candidate 操作必然经过决策端(manual=人工窗 / auto_policy=判定式)
+/// 并留痕。非 object 参数原样返回。
+pub fn strip_approved_flag(args: &serde_json::Value) -> serde_json::Value {
+    match args {
+        serde_json::Value::Object(map) => {
+            let mut cleaned = map.clone();
+            cleaned.remove("approved");
+            serde_json::Value::Object(cleaned)
+        }
+        other => other.clone(),
+    }
+}
+
 /// G8:从工具返回的 JSON 中解析审批请求
 ///
 /// 如果工具返回 `{"status":"needs_approval",...}`,则解析出 `ApprovalRequest`。
@@ -522,6 +541,30 @@ mod tests {
         );
         assert!(d.reason.contains("accepted in unattended mode"));
         assert!(d.reason.contains("medium"));
+    }
+
+    // ===== strip_approved_flag 测试(O-165) =====
+
+    #[test]
+    fn test_strip_approved_flag_removes_flag() {
+        let args = json!({"path": "a.txt", "approved": true, "content": "x"});
+        let cleaned = strip_approved_flag(&args);
+        assert_eq!(cleaned, json!({"path": "a.txt", "content": "x"}));
+    }
+
+    #[test]
+    fn test_strip_approved_flag_no_flag_unchanged() {
+        let args = json!({"path": "a.txt", "content": "x"});
+        assert_eq!(strip_approved_flag(&args), args);
+    }
+
+    #[test]
+    fn test_strip_approved_flag_non_object_passthrough() {
+        assert_eq!(strip_approved_flag(&json!("plain")), json!("plain"));
+        assert_eq!(
+            strip_approved_flag(&serde_json::Value::Null),
+            serde_json::Value::Null
+        );
     }
 
     // ===== HttpApproval 测试 =====

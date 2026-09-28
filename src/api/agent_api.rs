@@ -703,6 +703,8 @@ async fn run_agent(
     .await;
     // M1 规范入口索引:全 serve 会话通用素养段(静态文本,无触发条件;立项-M1 §3.2)
     crate::api::serve_tools::apply_regulation_index_awareness(&mut def.system_prompt);
+    // 人工审查开合(2026-09-28):def move 前捕获审批模式
+    let approval_auto = def.approval_mode.as_deref() == Some("auto_policy");
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
@@ -711,14 +713,25 @@ async fn run_agent(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .with_capability_boundary(capability_boundary)
-    .with_metrics(state.metrics.clone());
+    .with_capability_boundary(capability_boundary);
+    // G8:注入审批决策端(人工审查开合)——定义级 approval_mode=auto_policy 时
+    // 走 PolicyApproval 判定式决策端(无人值守,理由必产);manual 态维持本端点
+    // 既定行为(不注入=缺省拒绝,安全优先,行为零变化)
+    let runner = if approval_auto {
+        let callback: std::sync::Arc<dyn crate::agent::approval::ApprovalCallback> =
+            std::sync::Arc::new(crate::agent::approval::PolicyApproval);
+        runner.with_approval_callback(callback)
+    } else {
+        runner
+    };
+    let runner = runner.with_metrics(state.metrics.clone());
 
     // 改消费流式 ReAct 回路(delegate 同款修法,bb172b2 先例)——
     // 非流式 run() 是单发桥接(LLM 返 tool_calls 即返、工具不执行=能力面假象,
     // s113 实证 success=true+content=""),本端点改为消费 run_streaming 至 Done:
     // 多轮工具回喂在服务端执行完毕后聚合返回,对外 AgentRunResponse 结构零变化。
-    // approval 不注入(candidate 缺省拒绝,与 delegate 同款);cancel token 不注册
+    // approval 注入随 approval_mode(auto_policy→PolicyApproval,见上;manual 态
+    // 不注入=candidate 缺省拒绝);cancel token 不注册
     // (原 run() 路径亦不可 cancel,行为等价)。
     // 捕获流中 SessionCreated 的会话 ID,挂工作台本地索引(与 WS 面同
     // 口径,fail-soft;record 读时去重合并)+ 响应携带 session_id(会话关联收口)。
