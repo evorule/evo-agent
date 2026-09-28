@@ -53,6 +53,12 @@ pub struct AgentRunRequest {
     pub temperature: Option<f32>,
     /// Model name (optional)
     pub model: Option<String>,
+    /// P1 执行桥扩展字段(可选):shell_exec 转入 docker-exec 后端,命令在
+    /// 指定任务容器内执行。None = 宿主后端,行为与既有消费者完全一致
+    /// (参赛兼容层三原则②:删配置即下线)。LLM 面不可见该字段——仅 HTTP
+    /// 请求方(如评测 harness 的 agent 壳)可设。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
 }
 
 /// Agent run response
@@ -673,6 +679,11 @@ async fn run_agent(
     // 开关裁剪后同步收紧 def.tools(白名单声明=执行器=LLM 契约三者一致,
     // 防 from_definition 早失败校验把「声明了默认关工具」误判为配置错误)
     crate::api::serve_tools::restrict_tools_to_surface(&mut def.tools, &filtered);
+    // P1 执行桥:run 请求携带容器名 → shell_exec 替换为 docker-exec 后端
+    // (per-request 替换,不影响启动期 union toolkit;None = 宿主语义零变化)
+    if let Some(container) = &req.container {
+        crate::api::serve_tools::with_shell_exec_backend(&mut filtered, container);
+    }
     // M5-a:能力边界接线(显式声明重绑 file 工具沙箱 + 生效边界注入 runner)
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
@@ -790,6 +801,10 @@ async fn run_agent_stream(
     );
     // 开关裁剪后同步收紧 def.tools(同 run_agent 口径)
     crate::api::serve_tools::restrict_tools_to_surface(&mut def.tools, &filtered);
+    // P1 执行桥:同 run_agent 口径(请求携带容器名 → shell_exec 转 docker-exec)
+    if let Some(container) = &req.container {
+        crate::api::serve_tools::with_shell_exec_backend(&mut filtered, container);
+    }
     // M5-a:能力边界接线(同 run_agent 口径)
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
@@ -1811,6 +1826,7 @@ mod tests {
             max_steps: None,
             temperature: None,
             model: None,
+            container: None,
         };
 
         let response = app
@@ -2113,6 +2129,7 @@ mod tests {
             max_steps: None,
             temperature: None,
             model: None,
+            container: None,
         };
         let response = rt.block_on(async {
             app.oneshot(

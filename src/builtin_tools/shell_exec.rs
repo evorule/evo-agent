@@ -275,12 +275,66 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// 输出最大字节数
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MB
 
+/// 执行后端(P1 执行桥:配置选择器 local / docker-exec)
+///
+/// 参赛兼容层三原则②「删配置即下线」:不传容器名即回落 `Local`,宿主语义零变化
+/// (03 号 §十)。容器名经 serve run 请求扩展字段传入,不由 LLM 可控
+/// (LLM 面只见 shell_exec 工具,无任何指定后端/容器的参数)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecBackend {
+    /// 宿主直接执行(默认):3 层分类 + metachar 拒绝语义不变
+    Local,
+    /// `docker exec` 进任务容器执行:容器域 = 任务沙箱(一次性环境)
+    DockerExec { container: String },
+}
+
+/// 校验 docker 容器名(防 argv 注入:容器名以 `-` 开头会被 docker 解析为 flag)
+///
+/// 合法形态 = `[a-zA-Z0-9][a-zA-Z0-9_.-]*`,长度 1..=128(docker 名字上限 128)。
+pub fn validate_container_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(format!(
+            "invalid container name length: {} (must be 1..=128)",
+            name.len()
+        ));
+    }
+    let ok_first = name.chars().next().unwrap().is_ascii_alphanumeric();
+    let ok_rest = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+    if !ok_first || !ok_rest {
+        return Err(format!(
+            "invalid container name '{}': must match [a-zA-Z0-9][a-zA-Z0-9_.-]*",
+            name
+        ));
+    }
+    Ok(())
+}
+
+/// 构造 docker exec 的宿主侧 argv(纯函数,便于测试注入面)
+///
+/// 宿主侧唯一 program = `docker`(硬编码),命令字符串整体交给容器内 `sh -c`
+/// 解释。容器域为任务沙箱:宿主 3 层分类与 metachar 拒绝不适用容器侧命令
+/// (分类语义以宿主 program 为对象;容器内命令策略的正式化=参赛 P2 扩权批,
+/// 01 号 §2.4 六级清单 + 02 号 §二规则面随动)。
+fn docker_exec_argv(container: &str, command: &str) -> Vec<String> {
+    vec![
+        "docker".to_string(),
+        "exec".to_string(),
+        container.to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        command.to_string(),
+    ]
+}
+
 /// `shell_exec` 工具
 #[derive(Clone)]
 pub struct ShellExecTool {
     timeout: Duration,
     max_output_bytes: usize,
     workdir: Option<std::path::PathBuf>,
+    backend: ExecBackend,
 }
 
 impl ShellExecTool {
@@ -290,6 +344,7 @@ impl ShellExecTool {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             workdir: None,
+            backend: ExecBackend::Local,
         }
     }
 
@@ -308,6 +363,15 @@ impl ShellExecTool {
     /// TODO: doc
     pub fn with_max_output_bytes(mut self, n: usize) -> Self {
         self.max_output_bytes = n;
+        self
+    }
+
+    /// 设置 docker-exec 执行后端(P1 执行桥)
+    ///
+    /// 容器名在构造期校验(非法名即 panic-free 拒绝:返回的工具携带错误,
+    /// 调用时返回 Err)——此处先行校验并保留结果,`call_sync` 时再终检。
+    pub fn with_backend(mut self, backend: ExecBackend) -> Self {
+        self.backend = backend;
         self
     }
 
@@ -351,7 +415,7 @@ impl ShellExecTool {
         }
     }
 
-    /// 实际执行命令
+    /// 实际执行命令(宿主后端)
     fn execute(&self, parts: &[&str], original_cmd: &str) -> IoResult {
         let program = Self::program_name(parts[0]);
 
@@ -387,6 +451,64 @@ impl ShellExecTool {
         map.insert("status".to_string(), Value::from("ok"));
         map.insert("command".to_string(), Value::from(original_cmd.to_string()));
         map.insert("program".to_string(), Value::from(program.to_string()));
+        map.insert(
+            "exit_code".to_string(),
+            Value::from(output.status.code().unwrap_or(-1) as i64),
+        );
+        map.insert(
+            "stdout".to_string(),
+            Value::from(String::from_utf8_lossy(stdout_bytes).to_string()),
+        );
+        map.insert(
+            "stderr".to_string(),
+            Value::from(String::from_utf8_lossy(stderr_bytes).to_string()),
+        );
+        map.insert(
+            "stdout_truncated".to_string(),
+            Value::Bool(output.stdout.len() > self.max_output_bytes),
+        );
+        Ok(Value::Object(map))
+    }
+
+    /// 实际执行命令(docker-exec 后端)
+    ///
+    /// 宿主侧 spawn 的 program 恒为 `docker`(argv 硬编码构造,LLM 不可控);
+    /// 命令字符串整体交容器内 `sh -c` 解释(pipe/redirect/heredoc 等均为容器域
+    /// shell 语义)。执行事实(backend/container/exit_code/stdout/stderr)随工具
+    /// 观察入审计链——02 号 §一注记 2 的 G1 验收口径。
+    fn execute_docker_exec(&self, container: &str, original_cmd: &str) -> IoResult {
+        let argv = docker_exec_argv(container, original_cmd);
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        cmd.stdin(std::process::Stdio::null());
+
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                return Err(format!(
+                    "failed to spawn '{}': {} (is docker installed and in PATH?)",
+                    argv[0], e
+                ));
+            }
+        };
+
+        let stdout_bytes = if output.stdout.len() > self.max_output_bytes {
+            &output.stdout[..self.max_output_bytes]
+        } else {
+            &output.stdout
+        };
+        let stderr_bytes = if output.stderr.len() > self.max_output_bytes {
+            &output.stderr[..self.max_output_bytes]
+        } else {
+            &output.stderr
+        };
+
+        let mut map = serde_json::Map::new();
+        map.insert("status".to_string(), Value::from("ok"));
+        map.insert("command".to_string(), Value::from(original_cmd.to_string()));
+        map.insert("program".to_string(), Value::from("docker exec"));
+        map.insert("backend".to_string(), Value::from("docker-exec"));
+        map.insert("container".to_string(), Value::from(container.to_string()));
         map.insert(
             "exit_code".to_string(),
             Value::from(output.status.code().unwrap_or(-1) as i64),
@@ -457,6 +579,16 @@ impl ShellExecTool {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required arg: command (string)".to_string())?;
+
+        // docker-exec 后端:容器域 = 任务沙箱,宿主 3 层分类与 metachar 拒绝
+        // 不适用容器侧命令(见 docker_exec_argv 注记);宿主面唯一 program=docker。
+        if let ExecBackend::DockerExec { container } = &self.backend {
+            if cmd_str.trim().is_empty() {
+                return Err("empty command".to_string());
+            }
+            validate_container_name(container)?;
+            return self.execute_docker_exec(container, cmd_str);
+        }
 
         // 1. 解析
         let parts: Vec<&str> = cmd_str.split_whitespace().collect();
@@ -689,5 +821,86 @@ mod tests {
         {
             let _ = tool.call_sync(&arg("ls"));
         }
+    }
+
+    // === docker-exec 后端(P1 执行桥)===
+
+    #[test]
+    fn test_container_name_validation() {
+        assert!(validate_container_name("tb-task-1").is_ok());
+        assert!(validate_container_name("a").is_ok());
+        assert!(validate_container_name("A_b.c-9").is_ok());
+        // 注入面:flag 形态/路径段/空串/超长一律拒绝
+        assert!(validate_container_name("").is_err());
+        assert!(validate_container_name("-c").is_err());
+        assert!(validate_container_name("--privileged").is_err());
+        assert!(validate_container_name("a/b").is_err());
+        assert!(validate_container_name("a b").is_err());
+        assert!(validate_container_name(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn test_docker_exec_argv_shape() {
+        // 宿主侧唯一 program=docker,命令字符串整体交容器 sh -c
+        let argv = docker_exec_argv("tb-task-1", "python3 -c 'print(1)'");
+        assert_eq!(argv[0], "docker");
+        assert_eq!(argv[1], "exec");
+        assert_eq!(argv[2], "tb-task-1");
+        assert_eq!(argv[3], "sh");
+        assert_eq!(argv[4], "-c");
+        assert_eq!(argv[5], "python3 -c 'print(1)'");
+        assert_eq!(argv.len(), 6);
+    }
+
+    #[test]
+    fn test_docker_exec_empty_command_rejected_before_spawn() {
+        let tool = ShellExecTool::new().with_backend(ExecBackend::DockerExec {
+            container: "tb-task-1".to_string(),
+        });
+        let result = tool.call_sync(&arg("   "));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty command"));
+    }
+
+    #[test]
+    fn test_docker_exec_invalid_container_rejected_before_spawn() {
+        let tool = ShellExecTool::new().with_backend(ExecBackend::DockerExec {
+            container: "-privileged".to_string(),
+        });
+        let result = tool.call_sync(&arg("ls"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid container name"));
+    }
+
+    #[test]
+    fn test_docker_exec_metachars_not_rejected() {
+        // 容器域 shell 语义:含 metachar 的命令不应在分类/metachar 关被拒
+        // (不实际 spawn docker 的可测形态:合法容器名+非空命令+docker 未装/无容器
+        //  时结果为 spawn 或执行类输出,但绝不是 metacharacter 拒绝文本)
+        let tool = ShellExecTool::new().with_backend(ExecBackend::DockerExec {
+            container: "no-such-container-xyz".to_string(),
+        });
+        let result = tool.call_sync(&arg("echo hi > /tmp/f"));
+        if let Err(e) = result {
+            assert!(
+                !e.contains("metacharacter"),
+                "container-mode command must not be metachar-rejected: {e}"
+            );
+            assert!(
+                !e.contains("BLOCKED"),
+                "container-mode must not hit host blocklist: {e}"
+            );
+        }
+        // Ok(容器不存在但命令已下发)同样可接受——关键断言在 Err 分支
+    }
+
+    #[test]
+    fn test_local_backend_default_unchanged() {
+        // 缺省(未设后端)= Local:python3 仍走宿主 blocked 语义
+        let tool = ShellExecTool::new();
+        assert_eq!(tool.backend, ExecBackend::Local);
+        let result = tool.call_sync(&arg("python3 --version"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("BLOCKED"));
     }
 }

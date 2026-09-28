@@ -343,6 +343,22 @@ pub fn build_filtered_toolkit_with_switches(
     filtered
 }
 
+/// P1 执行桥:按 run 请求扩展字段把 shell_exec 替换为 docker-exec 后端
+///
+/// 调用点 = HTTP run/stream handler,在 `build_filtered_toolkit_with_switches`
+/// 之后(过滤产物为 per-request 新实例,替换不影响启动期 union toolkit)。
+/// 容器域 = 任务沙箱语义见 `shell_exec::docker_exec_argv` 注记;白名单/规则面
+/// 随动 = 参赛 P2 扩权批(02 号 §二);不传容器名即零变化(删配置即下线)。
+/// 容器命令超时取 600s(容器内 pip/构建类命令显著长于宿主 30s 缺省)。
+pub fn with_shell_exec_backend(filtered: &mut ToolHandler, container: &str) {
+    let tool = crate::builtin_tools::shell_exec::ShellExecTool::new()
+        .with_backend(crate::builtin_tools::shell_exec::ExecBackend::DockerExec {
+            container: container.to_string(),
+        })
+        .with_timeout(600);
+    filtered.register_tool("shell_exec", std::sync::Arc::new(tool));
+}
+
 /// 把 `def.tools` 收紧为 filtered toolkit 实际注册的工具面(白名单 ∩ 开关开)。
 ///
 /// 保证「白名单声明 = 执行器注册 = LLM 契约」三者一致:声明了但被 agentTools.*
