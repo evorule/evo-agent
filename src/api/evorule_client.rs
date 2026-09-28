@@ -41,6 +41,29 @@ impl EvoruleApiClient {
         self.core.base_url()
     }
 
+    /// 通用透传请求（rule_tools OpenAPI 适配器专用）：method + path（可含
+    /// query）+ 可选 JSON body → 响应 JSON 原样返回。
+    ///
+    /// 错误口径 = check_response_full（非 2xx 时 server 错误详情透出，LLM 可自
+    /// 诊断修复），与 bundle/knowledge 侧既有方法一致。
+    pub async fn passthrough_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, ApiError> {
+        let url = self.core.url(path);
+        let mut req = self
+            .core
+            .auth_header(self.core.client().request(method, &url));
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let resp = req.send().await?;
+        let resp = self.core.check_response_full(resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// GET /api/rules/l2-inventory —— L2 约束（元规则）只读清单投影
     ///
     /// 返回 `{count, files:[{path,title,guard_for}]}`（服务端 fail-soft：任何扫描/解析
