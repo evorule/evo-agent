@@ -140,6 +140,11 @@ impl ToolTraceCollector {
     }
 }
 
+/// args 净化组合(脱敏+截断;P1 轨迹与 P2 意图裁决共用)
+pub fn sanitize_args(args: &Value) -> Value {
+    truncate_args(redact_sensitive(args))
+}
+
 /// args 敏感键脱敏:递归遍历对象/数组,键名命中敏感表(小写精确 +
 /// `_key`/`_token` 等前后缀同族)即以 `[REDACTED]` 替换其值。
 pub fn redact_sensitive(v: &Value) -> Value {

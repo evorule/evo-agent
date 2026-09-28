@@ -480,11 +480,23 @@ pub fn resolve_target_scope(
     args: &Value,
     boundary: Option<&crate::agent::definition::CapabilityBoundary>,
 ) -> Option<&'static str> {
-    let boundary = boundary?;
     if tool_name != "file_read" && tool_name != "file_write" {
         return None;
     }
     let raw = args.get("path").and_then(|v| v.as_str())?;
+    path_scope(raw, boundary)
+}
+
+/// P2:path 参数越界快筛(resolve_target_scope/resolve_tool_intent 共用)
+///
+/// 判据与 M5-c resolve_target_scope 逐字同源:绝对路径/含 `..` 组件/join 后
+/// 越出 sandbox_root 即 out_of_sandbox;boundary 未声明 → None(不判越界,
+/// handler 内联检查保留为最终防线)。纯字符串/路径运算不触 fs。
+fn path_scope(
+    raw: &str,
+    boundary: Option<&crate::agent::definition::CapabilityBoundary>,
+) -> Option<&'static str> {
+    let boundary = boundary?;
     let p = std::path::Path::new(raw);
     if p.is_absolute() {
         return Some("out_of_sandbox");
@@ -500,6 +512,102 @@ pub fn resolve_target_scope(
     } else {
         Some("out_of_sandbox")
     }
+}
+
+// ----- P2(O-077 方案 C):治理级工具事前意图裁决(裁决泛化)-----
+
+/// P2:治理级工具分级表(裁决面单一事实源)
+///
+/// 表内工具执行前先经裁决会话意图裁决([`resolve_tool_intent`] +
+/// [`tool_intent_signal`],规则层 00_constraint_tool_intent_adjudication
+/// enforce 事前拦截)。划定口径(设计档 §3.1,2026-09-28 用户批 D1=A 全量
+/// candidate 族):file 破坏族+git 写族+rule_* 治理写族+publish 写面+bundle 面;
+/// 纯读面(file_read/file_list/search_files/grep_files/git_status/git_diff/
+/// git_log/publish_list/publish_queue_get)排除;shell_exec 高频不上裁决
+/// (P1 事后 shell_guard 已覆盖其治理语义);file_read/file_write 维持 M5-c
+/// 既有 R1 通道([`resolve_target_scope`])不变。
+pub const GOVERNANCE_ADJUDICATION_TOOLS: &[&str] = &[
+    "file_create",
+    "file_move",
+    "file_delete",
+    "git_stage",
+    "git_commit",
+    "rule_create",
+    "rule_update",
+    "rule_submit",
+    "rule_activate",
+    "rule_block",
+    "rule_archive",
+    "rule_fork",
+    "rule_reload",
+    "rule_promote",
+    "ws_create",
+    "sandbox_start",
+    "sandbox_close",
+    "dataset_create",
+    "publish_submit",
+    "publish_review",
+    "publish_rollback",
+    "bundle_export",
+    "bundle_import_dry_run",
+    "bundle_import",
+];
+
+/// P2:工具是否上裁决(分级表命中)
+pub fn is_governance_adjudication_tool(tool_name: &str) -> bool {
+    GOVERNANCE_ADJUDICATION_TOOLS.contains(&tool_name)
+}
+
+/// P2:解析治理级工具调用的意图规范字段(纯函数,宪法 §七「规范字段生产」)
+///
+/// 分级表未命中 → None(零开销路径)。file 族(file_create/file_move/file_delete)
+/// 附加 target_scope([`path_scope`] 快筛;file_move 对 path+target_dir 双字段
+/// 判定,任一越界即 out_of_sandbox,其余字段全 None 时无 scope 字段);其余治理
+/// 工具无 scope 字段(拦截条件由规则种子自行定义,首批=放行留痕)。args 经
+/// 脱敏+截断(与 P1 轨迹同纪律:SENSITIVE_KEYS redact+体积上限)。
+pub fn resolve_tool_intent(
+    tool_name: &str,
+    args: &Value,
+    boundary: Option<&crate::agent::definition::CapabilityBoundary>,
+) -> Option<Value> {
+    if !is_governance_adjudication_tool(tool_name) {
+        return None;
+    }
+    let mut intent = serde_json::json!({ "tool_name": tool_name });
+    let path_fields: &[&str] = match tool_name {
+        "file_create" | "file_delete" => &["path"],
+        "file_move" => &["path", "target_dir"],
+        _ => &[],
+    };
+    let scopes: Vec<Option<&'static str>> = path_fields
+        .iter()
+        .filter_map(|k| args.get(*k).and_then(|v| v.as_str()))
+        .map(|raw| path_scope(raw, boundary))
+        .collect();
+    if scopes.contains(&Some("out_of_sandbox")) {
+        intent["target_scope"] = Value::from("out_of_sandbox");
+    } else if let Some(s) = scopes.into_iter().flatten().next() {
+        intent["target_scope"] = Value::from(s);
+    }
+    intent["args"] = crate::agent::tool_trace::sanitize_args(args);
+    Some(intent)
+}
+
+/// P2:治理级工具意图信号指令形态(纯函数)
+///
+/// 中性判据:`set meta_tool.pending_tool_intent = {tool_name, target_scope?, args}`。
+/// 与 M5-c 的 `pending_target_scope`(R1 通道)并存互不干扰;宪法 set 规则纯
+/// 透传(rules_dir enforce 对裁决会话 set 指令可达——O-078 先占只卡 call_external),
+/// 被拦=引擎丢弃指令不推进 version,放行=内建 set 落状态。
+pub fn tool_intent_signal(intent: &Value) -> Value {
+    serde_json::json!({
+        "type": "set",
+        "params": {
+            "attr": "meta_tool.pending_tool_intent",
+            "operation": "set",
+            "value": intent
+        }
+    })
 }
 
 /// M5-c:意图裁决感知参数——提交后轮询会话 version 的窗口
@@ -2114,6 +2222,40 @@ impl AgentRunner {
                          (see session audit Violation for rule attribution)",
                         raw_path, boundary_root
                     ),
+                }));
+            }
+        }
+        // P2(O-077 方案 C):治理级工具事前意图裁决——分级表命中的调用先把
+        // 意图规范字段(tool_name/target_scope?/args 净化副本)随中性 set 指令
+        // 进裁决会话,由 00_constraint_tool_intent_adjudication enforce 裁决:
+        // 被拦(version 未推进)则不执行工具(fail-closed),放行继续。与上方
+        // M5-c file_read/file_write 通道(R1)并存互不干扰;裁决会话轮内复用。
+        if let Some(intent) =
+            resolve_tool_intent(tool_name, args, self.config.capability_boundary.as_ref())
+        {
+            let allowed = self
+                .adjudicator
+                .lock()
+                .await
+                .await_verdict(&tool_intent_signal(&intent), self.session_id.as_deref())
+                .await
+                .map_err(AgentError::Internal)?;
+            if !allowed {
+                warn!(
+                    main_session = ?self.session_id, tool = %tool_name,
+                    "tool intent blocked by governance rule (tool intent adjudication, adjudication channel)"
+                );
+                // O-077 P1:被治理拦截的调用也是真实执行史——进轨迹(status=blocked)
+                if let Ok(mut tt) = self.tool_traces.lock() {
+                    tt.record(tool_name, args, "blocked_by_governance", 0);
+                }
+                return Ok(serde_json::json!({
+                    "status": "blocked_by_governance_rule",
+                    "tool": tool_name,
+                    "intent": intent,
+                    "reason": "tool intent rejected by governance rule \
+                               (tool intent adjudication; see adjudication session \
+                               audit Violation for rule attribution)",
                 }));
             }
         }
