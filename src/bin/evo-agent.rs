@@ -453,11 +453,10 @@ fn cmd_run(
     };
 
     // 3. evorule + workspace 客户端(规则管理工具依赖 workspace API)
-    let client =
-        EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
+    let client = evorule_client_from(&config);
     let ws_client = WorkspaceApiClient::new(&config.evorule.base_url);
 
-    // 4. 工具 handler:内置安全工具(6) + 规则管理工具(20) 的 union
+    // 4. 工具 handler:内置工具(15) + 规则工具(26) 的 union
     //    修复:rule-copilot 等规则角色在 run 路径也能使用 ws_*/rule_*/audit_* 工具
     let mut tool_handler =
         evo_agent::api::serve_tools::build_union_toolkit(workdir, &ws_client, &client);
@@ -883,8 +882,7 @@ fn cmd_patrol(
     };
 
     // 3. 客户端(工具面按轮组装,见 patrol_build_runner:run_streaming 消费 runner)
-    let client =
-        EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
+    let client = evorule_client_from(&config);
     let ws_client = WorkspaceApiClient::new(&config.evorule.base_url);
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -1643,8 +1641,7 @@ fn cmd_serve(
         }
     }
 
-    let evorule_client =
-        EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
+    let evorule_client = evorule_client_from(&config);
     // E1:构造 workspace_client + union toolkit(启动时一次组装 26 个工具)
     let workspace_client = std::sync::Arc::new(WorkspaceApiClient::new(evorule_client.base_url()));
     let mut toolkit = evo_agent::api::serve_tools::build_union_toolkit(
@@ -1887,6 +1884,13 @@ fn cmd_serve(
     ExitCode::SUCCESS
 }
 
+/// EvoruleApiClient 统一工厂（理顺批 P3 卫生收敛）：base_url/api_key 取值
+/// 单点声明，各子命令禁止散落 `with_auth_token(&config.evorule.base_url, …)`
+/// 式重复拼接，防鉴权口径漂移。
+fn evorule_client_from(config: &evo_agent::config::Config) -> EvoruleApiClient {
+    EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key))
+}
+
 /// G5:根据 config.logging 初始化日志
 fn init_logging_for_serve(config: &evo_agent::config::Config) {
     use tracing_subscriber::{fmt, EnvFilter};
@@ -2029,8 +2033,7 @@ fn cmd_workflow(
 
     // 4. 构造 DelegateContext
     let definitions = AgentDefinitionManager::new(config.agents.dir.clone());
-    let client =
-        EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
+    let client = evorule_client_from(&config);
     // 注入 union toolkit + 工作目录——委托子代理按 def.tools 白名单获得
     // 工具契约与能力边界，多轮工具回喂在流式 ReAct 循环完成（此前委托 runner
     // 零工具契约：LLM 输出 <minimax:tool_call> 死文本且单轮即止，节点无实质产出）。
@@ -2166,8 +2169,7 @@ fn cmd_repl(
         }
     };
 
-    let client =
-        EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
+    let client = evorule_client_from(&config);
 
     // session 文件路径(Q14:B 跨进程恢复)
     let session_file = workdir.join(".evo-agent").join("session");
@@ -2599,8 +2601,7 @@ fn cmd_replay(
     };
 
     // 2. 构造 evorule client + MemoryEventStore
-    let client =
-        EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
+    let client = evorule_client_from(&config);
     let namespace = agent.unwrap_or(&config.agents.default);
     let mut store = MemoryEventStore::new(namespace, client);
     store.set_session_id(session);

@@ -191,8 +191,9 @@ mod tests {
     }
 
     #[test]
-    fn test_full_rule_toolkit_registers_all_42() {
-        // 验证 full_rule_toolkit 注册了全部 42 个工具（has_tool 逐个校验）
+    fn test_full_rule_toolkit_registers_all_45() {
+        // 验证 full_rule_toolkit 注册了全部 45 个工具（40 透传 + 5 本地逻辑，
+        // has_tool 逐个校验；计数与 rule_tool_specs 对齐，O-154 清理）
         let ws = WorkspaceApiClient::new("http://localhost:0");
         let ev = EvoruleApiClient::new("http://localhost:0");
         let h = full_rule_toolkit(&ws, &ev);
@@ -251,8 +252,11 @@ mod tests {
             "knowledge_entry_get",
             // meta 1（L2 约束只读消费面）
             "meta_summary",
+            // evolution 2（进化信号只读消费面 + 约束层晋升提名）
+            "evolution_signals",
+            "rule_promote",
         ];
-        assert_eq!(all_tools.len(), 43);
+        assert_eq!(all_tools.len(), 45);
         for name in &all_tools {
             assert!(
                 h.has_tool(name),

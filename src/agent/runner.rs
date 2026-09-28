@@ -1541,7 +1541,7 @@ impl AgentRunner {
     fn openai_tools_payload(&self) -> Option<Vec<Value>> {
         let registered = self.tool_handler.tool_names();
         let mut specs = crate::builtin_tools::default_tool_specs();
-        // 规则工具静态 spec 并入:rule_tools 的 23 个工具若不在此处,会走 dynamic
+        // 规则工具静态 spec 并入:rule_tools 的 45 个工具若不在此处,会走 dynamic
         // 分支产出空参数 schema,LLM 无从得知 workspace_id 等必填参数(实测盲传
         // 导致 rule_list 失败)。spec 与执行器同源于 rule_tool_specs()。
         specs.extend(crate::rule_tools::rule_tool_specs());

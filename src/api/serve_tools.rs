@@ -654,7 +654,7 @@ mod tests {
             );
         }
 
-        // 23 个规则工具
+        // 26 个规则工具(=RULE_TOOL_NAMES 白名单)
         for name in RULE_TOOL_NAMES {
             assert!(
                 handler.has_tool(name),
