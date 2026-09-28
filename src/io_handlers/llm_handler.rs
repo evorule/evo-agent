@@ -445,6 +445,7 @@ impl LlmHandler {
         debug!(
             content_len = content.len(),
             finish_reason = ?finish_reason,
+            tool_calls = ?tool_calls,
             "LLM API response parsed"
         );
         Ok(response_json.clone())
