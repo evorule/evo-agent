@@ -20,7 +20,8 @@ use tracing::{debug, info, warn};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::approval::{
-    parse_approval_request, ApprovalCallback, ApprovalDecision, ApprovalRequest,
+    parse_approval_request, strip_approved_flag, ApprovalCallback, ApprovalDecision,
+    ApprovalRequest,
 };
 use crate::agent::callback::CallbackChain;
 use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
@@ -2144,10 +2145,12 @@ impl AgentRunner {
             (cached, None)
         } else {
             // 缓存未命中:走正常的 execute_tool_call + 审批流程
-            // 第一次调用(不带 approved flag)
-            let tool_result = self.execute_tool_call(tool_name, &args).await?;
+            // 第一次调用(不带 approved flag)——O-165:LLM 自带 approved 旗标
+            // 强制剥离,决策门唯一控制权归 runner
+            let first_args = strip_approved_flag(&args);
+            let tool_result = self.execute_tool_call(tool_name, &first_args).await?;
             // G8:检查是否需要审批,如果需要则走审批流程(可能重新调用 with approved:true)
-            self.maybe_handle_approval(session_id, tool_name, &args, tool_result)
+            self.maybe_handle_approval(session_id, tool_name, &first_args, tool_result)
                 .await?
         };
 
@@ -2309,9 +2312,11 @@ impl AgentRunner {
         }
 
         // G8:第一次调用(不带 approved flag)→ 可能返回 needs_approval proposal
-        let tool_result = self.execute_tool_call(tool_name, args).await?;
+        // O-165:LLM 自带 approved 旗标强制剥离(决策门唯一控制权归 runner)
+        let first_args = strip_approved_flag(args);
+        let tool_result = self.execute_tool_call(tool_name, &first_args).await?;
         let result_str = tool_result.to_string();
-        match parse_approval_request(session_id, tool_name, args, &result_str) {
+        match parse_approval_request(session_id, tool_name, &first_args, &result_str) {
             None => Ok(ToolExecStage::Done(ToolExecOutcome {
                 final_result: tool_result,
                 approval_record: None,
