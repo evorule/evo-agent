@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 //! 规则管理工具集 —— 把 WorkspaceApiClient/EvoruleApiClient 封装成 ToolFunction 工具
 
+pub mod adapter;
 pub mod audit_tools;
 pub mod bundle_tools;
 pub mod dataset_tools;
