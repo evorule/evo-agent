@@ -1,0 +1,290 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 EvoRule Project
+// This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
+//! O-077 P1:工具调用轨迹采集器 —— 工具级行为治理的事实地基
+//!
+//! ## 背景与治理语义
+//!
+//! agent 会话每轮仅 1 条 `call_external` 过引擎(见存量问题登记册 O-077),
+//! 工具调用全部在 runner 本地执行——引擎审计链对工具级操作零感知,「规则
+//! 约束 agent 真实操作」对工具级不可达。本模块在 G17 插桩点采集每次工具
+//! 调用的完整轨迹,会话收尾时以 `tool_trace` 指令(宪法 core_eval v0.5.0
+//! 新增规则)批量提交进引擎:
+//!
+//! - 合法轨迹 → StateTransition 事实落审计链(全文可回放);
+//! - 违规轨迹 → rules_dir enforce 在约束门拦截(Halted→Violation 留痕);
+//! - 两类留痕互补,审计面完整。
+//!
+//! ## 纪律
+//!
+//! - fail-soft:提交失败仅计数+warn,绝不阻断会话收尾(与 L2 前馈同纪律);
+//! - args 全文进链(裁定口径)前做敏感键脱敏 + 单条体积上限截断(防 payload
+//!   膨胀炸链),截断为显式标记不静默丢弃。
+
+use serde_json::{Map, Value};
+
+/// 单条轨迹 args 序列化后的体积上限(字节)。超出即截断并标记 `truncated`,
+/// 防巨型 file_write/http_get 响应把 payload 撑爆审计链。
+const MAX_ARGS_BYTES: usize = 32 * 1024;
+
+/// 敏感键名表(小写精确/前后缀匹配):命中值替换为 `[REDACTED]`。
+const SENSITIVE_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "token",
+    "password",
+    "passwd",
+    "secret",
+    "authorization",
+    "credential",
+    "private_key",
+    "passphrase",
+    "auth",
+];
+
+/// 工具调用轨迹采集器(会话内累积,AgentRunner 持有)
+#[derive(Debug, Default)]
+pub struct ToolTraceCollector {
+    entries: Vec<Value>,
+    submit_failures: usize,
+}
+
+/// rm 递归强删旗标(词级匹配):`rm` 本身是 candidate(需审批),
+/// 但携带递归旗标的 rm 属破坏性操作,轨迹打 `rm:<flag>` 旗标。
+const RM_DANGEROUS_FLAGS: &[&str] = &["-rf", "-fr", "-r"];
+
+/// 危险命令检测(词级 token 匹配,非裸子串——防 `cat shutdown.log` 类误伤)
+///
+/// 单一事实源 = [`crate::builtin_tools::shell_exec::BLOCKED_COMMANDS`]
+/// (执行前防线Blocked 永不名单);本检测是审计链防线:轨迹条目附加
+/// `danger_hits` 字段,server 层规则文件以 `exists(value.danger_hits)`
+/// 判定并 enforce 拦截(违规轨迹→Violation 留痕)。零子串谓词纪律下,
+/// 子串级检测不可入规则层(7 基础域无 contains),故打标在应用采集侧。
+///
+/// 返回命中描述(如 `program:dd` / `rm:-rf`);无命中返回空 Vec——
+/// **空结果不写字段**(规则层 exists 语义:字段不存在=false)。
+fn detect_danger_hits(command: &str) -> Vec<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut hits = Vec::new();
+    for (i, tok) in tokens.iter().enumerate() {
+        let bare = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let is_blocked = crate::builtin_tools::shell_exec::BLOCKED_COMMANDS
+            .iter()
+            .any(|(name, _)| *name == bare);
+        if is_blocked {
+            hits.push(format!("program:{bare}"));
+        }
+        if bare == "rm" {
+            if let Some(flag) = tokens[i + 1..]
+                .iter()
+                .take_while(|t| t.starts_with('-'))
+                .find(|t| RM_DANGEROUS_FLAGS.contains(t))
+            {
+                hits.push(format!("rm:{flag}"));
+            }
+        }
+    }
+    hits
+}
+
+impl ToolTraceCollector {
+    /// 记录一次工具调用(含被治理拦截的调用——拦截也是真实执行史)
+    ///
+    /// `status`: `ok` / `error` / `blocked_by_governance`(M5-c 裁决拦截)。
+    /// shell_exec 调用附带危险命令打标:命中则轨迹条目附加 `danger_hits`
+    /// 数组(词级检测见 [`detect_danger_hits`]);command 从原始 args 读取
+    /// (截断降级仅作用于入链 args 副本,不影响打标保真)。
+    pub fn record(&mut self, tool_name: &str, args: &Value, status: &str, duration_ms: u64) {
+        let seq = self.entries.len() as i64;
+        let mut entry = serde_json::json!({
+            "tool_name": tool_name,
+            "args": truncate_args(redact_sensitive(args)),
+            "status": status,
+            "duration_ms": duration_ms,
+            "seq": seq,
+        });
+        if tool_name == "shell_exec" {
+            if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                let hits = detect_danger_hits(cmd);
+                if !hits.is_empty() {
+                    entry["danger_hits"] = serde_json::json!(hits);
+                }
+            }
+        }
+        self.entries.push(entry);
+    }
+
+    /// 取出全部已采集轨迹(提交用)
+    pub fn drain(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.entries)
+    }
+
+    /// 提交失败计数(fail-soft 留痕;metrics 暴露前的观测口径)
+    pub fn record_submit_failure(&mut self) {
+        self.submit_failures += 1;
+    }
+
+    /// 累计提交失败次数(观测口径:非零即审计链存在缺口)
+    pub fn submit_failures(&self) -> usize {
+        self.submit_failures
+    }
+
+    /// 当前已采集、未 drain 的轨迹条数
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 是否无未提交轨迹
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// args 敏感键脱敏:递归遍历对象/数组,键名命中敏感表(小写精确 +
+/// `_key`/`_token` 等前后缀同族)即以 `[REDACTED]` 替换其值。
+pub fn redact_sensitive(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, val)| {
+                    if is_sensitive_key(k) {
+                        (k.clone(), Value::from("[REDACTED]"))
+                    } else {
+                        (k.clone(), redact_sensitive(val))
+                    }
+                })
+                .collect::<Map<String, Value>>(),
+        ),
+        Value::Array(arr) => Value::Array(arr.iter().map(redact_sensitive).collect()),
+        other => other.clone(),
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let k = key.to_lowercase();
+    SENSITIVE_KEYS
+        .iter()
+        .any(|s| k == *s || k.ends_with(&format!("_{s}")) || k.starts_with(&format!("{s}_")))
+}
+
+/// args 体积上限截断:序列化超限时降级为摘要对象(显式 truncated 标记,
+/// 不静默丢内容——可审计性优先于完整性,原文以本地日志兜底)。
+fn truncate_args(args: Value) -> Value {
+    let serialized = args.to_string();
+    if serialized.len() <= MAX_ARGS_BYTES {
+        return args;
+    }
+    serde_json::json!({
+        "truncated": true,
+        "original_bytes": serialized.len(),
+        "max_bytes": MAX_ARGS_BYTES,
+        "preview_head": &serialized[..MAX_ARGS_BYTES / 2],
+        "preview_tail": &serialized[serialized.len() - MAX_ARGS_BYTES / 2..],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn record_captures_full_trace_with_seq() {
+        let mut c = ToolTraceCollector::default();
+        c.record("shell_exec", &json!({"command": "ls"}), "ok", 12);
+        c.record("file_read", &json!({"path": "a.txt"}), "error", 3);
+        assert_eq!(c.len(), 2);
+        let drained = c.drain();
+        assert_eq!(drained[0]["seq"], 0);
+        assert_eq!(drained[0]["tool_name"], "shell_exec");
+        assert_eq!(drained[0]["status"], "ok");
+        assert_eq!(drained[0]["duration_ms"], 12);
+        assert_eq!(drained[1]["seq"], 1);
+        assert_eq!(drained[1]["status"], "error");
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn redact_masks_nested_sensitive_values() {
+        let args = json!({
+            "command": "curl -H 'X-Api-Key: sk-123' https://x",
+            "headers": {
+                "Authorization": "Bearer abc",
+                "Content-Type": "application/json",
+                "auth_token": "t-1",
+                "author_note": "keep me"
+            },
+            "items": [{"password": "p", "name": "n"}]
+        });
+        let out = redact_sensitive(&args);
+        assert_eq!(out["headers"]["Authorization"], "[REDACTED]");
+        assert_eq!(out["headers"]["auth_token"], "[REDACTED]");
+        assert_eq!(out["headers"]["Content-Type"], "application/json");
+        // 「author」含 auth 子串但非 auth 词族——不得误伤
+        assert_eq!(out["headers"]["author_note"], "keep me");
+        assert_eq!(out["items"][0]["password"], "[REDACTED]");
+        assert_eq!(out["items"][0]["name"], "n");
+        assert_eq!(out["command"], "curl -H 'X-Api-Key: sk-123' https://x");
+    }
+
+    #[test]
+    fn truncate_marks_oversized_args_explicitly() {
+        let big = json!({"content": "x".repeat(MAX_ARGS_BYTES + 100)});
+        let out = truncate_args(big);
+        assert_eq!(out["truncated"], true);
+        assert!(out["original_bytes"].as_u64().unwrap() > MAX_ARGS_BYTES as u64);
+        let small = json!({"command": "ls"});
+        assert_eq!(truncate_args(small.clone()), small);
+    }
+
+    #[test]
+    fn blocked_status_is_recorded_as_execution_history() {
+        let mut c = ToolTraceCollector::default();
+        c.record(
+            "file_delete",
+            &json!({"path": "/tmp/x"}),
+            "blocked_by_governance",
+            0,
+        );
+        assert_eq!(c.drain()[0]["status"], "blocked_by_governance");
+    }
+
+    #[test]
+    fn danger_hits_marked_for_blocked_program() {
+        let mut c = ToolTraceCollector::default();
+        c.record(
+            "shell_exec",
+            &json!({"command": "dd if=/dev/zero of=/dev/sda"}),
+            "ok",
+            5,
+        );
+        let entry = c.drain().remove(0);
+        assert_eq!(entry["danger_hits"], json!(["program:dd"]));
+    }
+
+    #[test]
+    fn rm_recursive_flag_marked_but_plain_rm_not() {
+        let mut c = ToolTraceCollector::default();
+        c.record("shell_exec", &json!({"command": "rm -rf /tmp/x"}), "ok", 1);
+        let entry = c.drain().remove(0);
+        assert_eq!(entry["danger_hits"], json!(["rm:-rf"]));
+
+        c.record("shell_exec", &json!({"command": "rm notes.txt"}), "ok", 1);
+        assert!(c.drain().remove(0).get("danger_hits").is_none());
+    }
+
+    #[test]
+    fn no_false_positive_on_word_boundary() {
+        // 「shutdown.log」是单个 token,不得命中 program:shutdown
+        assert!(detect_danger_hits("cat shutdown.log && tail reboot.txt").is_empty());
+        // 「sudo-like」首尾均为字母数字,trim 后不等于 sudo
+        assert!(detect_danger_hits("echo sudo-like").is_empty());
+    }
+
+    #[test]
+    fn non_shell_tool_never_marked() {
+        let mut c = ToolTraceCollector::default();
+        c.record("file_write", &json!({"command": "rm -rf /"}), "ok", 2);
+        assert!(c.drain().remove(0).get("danger_hits").is_none());
+    }
+}
