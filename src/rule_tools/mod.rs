@@ -6,14 +6,11 @@
 //!
 //! 组装结构（理顺批 P1 适配器化后）：
 //! - 40 个纯透传工具 → `adapter` 表驱动（ALL_TRANSPARENT_BINDINGS 声明式映射）；
-//! - 5 个本地逻辑工具驻独立文件：audit_verify / bundle_export /
-//!   meta_summary / evolution_signals / rule_promote。
+//! - 5 个本地逻辑工具（audit_verify / bundle_export / meta_summary /
+//!   evolution_signals / rule_promote）→ `local_handlers` 统一外置。
 
 pub mod adapter;
-pub mod audit_tools;
-pub mod bundle_tools;
-pub mod evolution_tools;
-pub mod meta_tools;
+pub mod local_handlers;
 
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::workspace_client::WorkspaceApiClient;
@@ -24,20 +21,14 @@ use crate::io_handlers::tool_handler::ToolHandler;
 pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
     let mut h = ToolHandler::new();
     adapter::register_bindings(&mut h, ws, ev, adapter::ALL_TRANSPARENT_BINDINGS);
-    audit_tools::register(&mut h, ev);
-    bundle_tools::register(&mut h, ws);
-    meta_tools::register(&mut h, ev);
-    evolution_tools::register(&mut h, ws, ev);
+    local_handlers::register(&mut h, ws, ev);
     h
 }
 
 /// 全部规则工具 spec（45 个）
 pub fn rule_tool_specs() -> Vec<ToolSpec> {
     let mut specs = adapter::specs_from(adapter::ALL_TRANSPARENT_BINDINGS);
-    specs.extend(audit_tools::specs());
-    specs.extend(bundle_tools::specs());
-    specs.extend(meta_tools::specs());
-    specs.extend(evolution_tools::specs());
+    specs.extend(local_handlers::specs());
     specs
 }
 
