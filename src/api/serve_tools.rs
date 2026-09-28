@@ -121,7 +121,7 @@ pub async fn apply_l2_feed_forward(
             return;
         }
     };
-    if let Some(segment) = crate::rule_tools::meta_tools::render_l2_inventory_summary(&inv) {
+    if let Some(segment) = crate::rule_tools::local_handlers::render_l2_inventory_summary(&inv) {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&segment);
     }
