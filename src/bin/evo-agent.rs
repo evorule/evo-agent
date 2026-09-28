@@ -536,7 +536,7 @@ fn cmd_run(
                 auto_approve: false,
             })
         };
-    let mut runner = runner.with_approval_callback(callback);
+    let runner = runner.with_approval_callback(callback);
 
     // 6. 跑
     eprintln!(
@@ -558,7 +558,7 @@ fn cmd_run(
     let exit = if stream {
         cmd_run_streaming(&runtime, runner, goal)
     } else {
-        cmd_run_blocking(&runtime, &mut runner, goal)
+        cmd_run_blocking(&runtime, runner, goal)
     };
     // 任务已结束,停止监听 Ctrl+C
     cancel_handle.abort();
@@ -1173,13 +1173,76 @@ fn cmd_patrol(
 /// G4:非流式运行(原逻辑)
 fn cmd_run_blocking(
     runtime: &tokio::runtime::Runtime,
-    runner: &mut AgentRunner,
+    runner: AgentRunner,
     goal: &str,
 ) -> ExitCode {
-    let run_result = runtime.block_on(async { runner.run(goal).await });
+    // 消费流式 ReAct 回路聚合最终结果（delegate 同款修法，agent_api run 端点先例）。
+    // 原实现调 runner.run()（引擎事件驱动单轮桥接）——引擎自宪法 v0.5.0 起仅
+    // 单发桥接、多轮编排归应用层，run() 在多轮工具任务中首轮 io_response 提交后
+    // 引擎即 Stable，返回 success=true + 空 content（假绿）。本函数改为消费
+    // run_streaming 至 Done（本地工具结果回喂循环承载多轮）；对外 stdout 契约
+    // 不变（仅最终 JSON），过程摘要走 stderr（多轮静默期可观测）。
+    use evo_agent::AgentEvent;
+    use futures_util::StreamExt;
 
-    match run_result {
-        Ok(result) => {
+    let final_result = runtime.block_on(async move {
+        let mut event_stream = runner.run_streaming(goal.to_string());
+
+        let mut final_result: Option<evo_agent::AgentResult> = None;
+
+        while let Some(event) = event_stream.next().await {
+            match event {
+                Ok(AgentEvent::SessionCreated { session_id, .. }) => {
+                    eprintln!("[session: {}]", session_id);
+                }
+                Ok(AgentEvent::Step { step }) => {
+                    eprintln!("[step {}]", step);
+                }
+                Ok(AgentEvent::ToolCall { name, .. }) => {
+                    eprintln!("[tool call: {}]", name);
+                }
+                Ok(AgentEvent::ToolResult { name, .. }) => {
+                    eprintln!("[tool result: {}]", name);
+                }
+                Ok(AgentEvent::ApprovalRequired {
+                    tool_name, risk, ..
+                }) => {
+                    eprintln!("[approval required: {}] risk: {}", tool_name, risk);
+                }
+                Ok(AgentEvent::ApprovalResult {
+                    tool_name,
+                    approved,
+                    ..
+                }) => {
+                    if approved {
+                        eprintln!("[approved: {}]", tool_name);
+                    } else {
+                        eprintln!("[denied: {}]", tool_name);
+                    }
+                }
+                Ok(AgentEvent::Error(e)) => {
+                    eprintln!("[error: {}]", e);
+                }
+                Ok(AgentEvent::Info(msg)) => {
+                    eprintln!("[info: {}]", msg);
+                }
+                Ok(AgentEvent::Done(result)) => {
+                    final_result = Some(result);
+                }
+                Err(e) => {
+                    eprintln!("[fatal: {}]", e);
+                    final_result = Some(evo_agent::AgentResult::error(e.to_string(), 0, 0));
+                }
+                // LlmDelta/LlmDone：非流式语义不逐 token 输出（stdout 仅最终 JSON）
+                _ => {}
+            }
+        }
+
+        final_result
+    });
+
+    match final_result {
+        Some(result) => {
             let json = match serde_json::to_string_pretty(&result) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1194,8 +1257,8 @@ fn cmd_run_blocking(
                 ExitCode::from(1)
             }
         }
-        Err(e) => {
-            eprintln!("agent run failed: {}", e);
+        None => {
+            eprintln!("agent run ended without a final result");
             ExitCode::from(1)
         }
     }
