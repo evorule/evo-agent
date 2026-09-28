@@ -1727,7 +1727,7 @@ fn cmd_serve(
     // G12:MCP 工具注册(P1 边界:只在 `run` 子命令生效)
     //
     // `serve` 模式已接入完整工具面(`src/api/serve_tools.rs`:union toolkit =
-    // 内置 6 + 规则 23 共 29 工具,存 `AgentApiState.toolkit`,按 agent 白名单
+    // 内置 15 + 规则 26 共 41 工具,存 `AgentApiState.toolkit`,按 agent 白名单
     // `build_filtered_toolkit` 过滤后注入每请求 runner)。MCP 适配器需要共享
     // 长生命周期的 McpClient(子进程),按请求 spawn 代价过高,故未入 serve
     // toolkit。因此 P1 阶段 MCP 工具仅在 `evo-agent run` 中生效;serve 模式

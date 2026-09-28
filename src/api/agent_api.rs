@@ -194,7 +194,7 @@ impl AgentApiState {
     /// 用于 `cmd_serve` 注入共享 metrics(供 `/metrics` 端点 + runner 插桩共用)。
     ///
     /// E1:新增 `workdir` / `workspace_client` / `toolkit` 参数,供 serve 模式
-    /// 注入预建的 union toolkit(内置 6 + 规则 20 = 26 工具)。
+    /// 注入预建的 union toolkit(内置 15 + 规则 26 = 41 工具)。
     pub fn new_with_metrics(
         definitions: AgentDefinitionManager,
         evorule_client: EvoruleApiClient,
@@ -318,7 +318,7 @@ impl AgentApiState {
         &self.workspace_client
     }
 
-    /// E1:获取预建 union toolkit 的引用(26 工具,启动时组装)
+    /// E1:获取预建 union toolkit 的引用(41 工具,启动时组装)
     pub fn toolkit(&self) -> &ToolHandler {
         &self.toolkit
     }
