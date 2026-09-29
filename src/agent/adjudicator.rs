@@ -71,7 +71,7 @@ impl AdjudicationChannel {
         }
         let id = self
             .client
-            .create_session(Some(&initial))
+            .create_session(Some(&initial), Some("llm"))
             .await
             .map_err(|e| e.to_string())?;
         self.session_id = Some(id.clone());

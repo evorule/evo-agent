@@ -1415,7 +1415,7 @@ impl AgentRunner {
             .map(|b| b.to_json());
         let session_id = self
             .evorule_client
-            .create_session(boundary_json.as_ref())
+            .create_session(boundary_json.as_ref(), Some("llm"))
             .await?;
         self.session_id = Some(session_id.clone());
         info!(%session_id, "Created evorule session");
@@ -3104,7 +3104,11 @@ impl AgentRunner {
                 // 新建 session(原 run_streaming 逻辑)
                 // M5-a:边界声明经 initial_content 既有载体进会话事实
                 let boundary_json = runner.config.capability_boundary.as_ref().map(|b| b.to_json());
-                match runner.evorule_client.create_session(boundary_json.as_ref()).await {
+                match runner
+                    .evorule_client
+                    .create_session(boundary_json.as_ref(), Some("llm"))
+                    .await
+                {
                     Ok(id) => {
                         // 伴生缺陷修复:新建分支回填 runner.session_id
                         // (裁决通道已不依赖它,但审计一致性/messages 持久化

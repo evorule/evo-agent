@@ -1318,3 +1318,70 @@ async fn test_run_empty_llm_response_stays_success() {
     );
     assert!(result.content.is_empty());
 }
+
+// ===== O-185：create_session caller_role 声明（声明值取值面） =====
+
+/// 声明 llm：body 携带 caller_role 字段
+#[tokio::test]
+async fn test_create_session_body_contains_caller_role() {
+    let mut server = Server::new_async().await;
+    let mock = server
+        .mock("POST", "/api/sessions")
+        .match_body(mockito::Matcher::Json(json!({"caller_role": "llm"})))
+        .with_status(200)
+        .with_body(r#"{"session_id": 9001}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let sid = client.create_session(None, Some("llm")).await.unwrap();
+    assert_eq!(sid, "9001");
+    mock.assert_async().await;
+}
+
+/// caller_role 与 initial_content 共存（agent 主工作会话形态）
+#[tokio::test]
+async fn test_create_session_caller_role_coexists_with_initial_content() {
+    let mut server = Server::new_async().await;
+    let content = json!({"kind": "agent_run", "capability_boundary": {"allow": ["read"]}});
+    let mock = server
+        .mock("POST", "/api/sessions")
+        .match_body(mockito::Matcher::Json(json!({
+            "initial_content": content,
+            "caller_role": "llm"
+        })))
+        .with_status(200)
+        .with_body(r#"{"session_id": 9002}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let sid = client
+        .create_session(Some(&content), Some("llm"))
+        .await
+        .unwrap();
+    assert_eq!(sid, "9002");
+    mock.assert_async().await;
+}
+
+/// None 不声明：body 不含 caller_role（零回归——未声明会话与服务端
+/// fail-closed Unknown → Deny 既有口径一致）
+#[tokio::test]
+async fn test_create_session_none_keeps_body_free_of_caller_role() {
+    let mut server = Server::new_async().await;
+    let mock = server
+        .mock("POST", "/api/sessions")
+        .match_body(mockito::Matcher::Json(json!({})))
+        .with_status(200)
+        .with_body(r#"{"session_id": 9003}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let sid = client.create_session(None, None).await.unwrap();
+    assert_eq!(sid, "9003");
+    mock.assert_async().await;
+}

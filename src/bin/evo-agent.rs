@@ -2147,10 +2147,13 @@ fn cmd_workflow(
     // M5-b：协作工作流标记会话——驱动每个节点完成后向本会话提交中性完成信号
     // (set meta_signal.node_done=<node_id>)，规则面 branch 壳+set 业务规则裁决
     // 写 meta_task.* 任务标记(引擎不忘，链上可查)。创建失败 fail-fast。
-    let marks_session = match runtime.block_on(client.create_session(Some(&serde_json::json!({
-        "kind": "workflow_run",
-        "workflow_id": workflow_id,
-    })))) {
+    let marks_session = match runtime.block_on(client.create_session(
+        Some(&serde_json::json!({
+            "kind": "workflow_run",
+            "workflow_id": workflow_id,
+        })),
+        Some("llm"),
+    )) {
         Ok(sid) => {
             eprintln!("workflow marks session: {}", sid);
             Some(sid)
