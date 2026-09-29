@@ -49,6 +49,7 @@ pub mod fs_safety;
 pub mod git_tools;
 pub mod grep_files;
 pub mod http_get;
+pub mod net_guard;
 pub mod search_files;
 pub mod shell_exec;
 

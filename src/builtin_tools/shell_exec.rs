@@ -39,6 +39,8 @@
 //! 1. **No shell**:`std::process::Command` 直接 exec,不经任何 shell 解析
 //! 2. **拒绝 shell metacharacter**:`; | & $ \` > < ( ) \n \r` 在任何 arg 里都被拒
 //! 3. **3 层分类**:active 直跑 / candidate 请示 / blocked 拒
+//! 4. **网络负面域守卫**([`super::net_guard`]):命令串命中 benchmark 基础设施
+//!    域即拒绝——local/docker-exec 两后端统一前置,红线拦截无审批通道
 //!
 //! ## 不支持(明确)
 //!
@@ -580,8 +582,12 @@ impl ShellExecTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required arg: command (string)".to_string())?;
 
+        // 0. 网络负面域守卫(红线):local/docker-exec 两后端统一前置,
+        //    命令串命中 benchmark 基础设施域即拒绝,无审批通道
+        super::net_guard::check_denied_network_target(cmd_str)?;
+
         // docker-exec 后端:容器域 = 任务沙箱,宿主 3 层分类与 metachar 拒绝
-        // 不适用容器侧命令(见 docker_exec_argv 注记);宿主面唯一 program=docker。
+        // 不适用容器侧命令(见 docker_exec_argv 注释);宿主面唯一 program=docker。
         if let ExecBackend::DockerExec { container } = &self.backend {
             if cmd_str.trim().is_empty() {
                 return Err("empty command".to_string());
@@ -902,5 +908,45 @@ mod tests {
         let result = tool.call_sync(&arg("python3 --version"));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("BLOCKED"));
+    }
+
+    // === 网络负面域守卫(net_guard,两后端统一前置红线)===
+
+    #[test]
+    fn test_net_guard_denies_benchmark_domain_before_backend_dispatch() {
+        // docker-exec 后端:容器域本不受宿主分类约束,但红线守卫仍前置拦截
+        let tool = ShellExecTool::new().with_backend(ExecBackend::DockerExec {
+            container: "tb-task-1".to_string(),
+        });
+        let result = tool.call_sync(&arg("curl https://tbench.ai/solution"));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("denied by policy"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_net_guard_denies_benchmark_repo_on_local_backend() {
+        // git 是宿主 ACTIVE 命令,clone benchmark 仓仍被红线拦截(先于分类执行)
+        let tool = ShellExecTool::new();
+        let result = tool.call_sync(&arg(
+            "git clone https://github.com/laude-institute/terminal-bench",
+        ));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("denied by policy"));
+    }
+
+    #[test]
+    fn test_net_guard_does_not_block_normal_commands() {
+        let tool = ShellExecTool::new().with_backend(ExecBackend::DockerExec {
+            container: "no-such-container-xyz".to_string(),
+        });
+        let result = tool.call_sync(&arg("curl https://example.com/data.csv"));
+        // 不应出现红线拒绝文本(spawn 失败与否取决于环境,但绝不是域守卫拒绝)
+        if let Err(e) = result {
+            assert!(
+                !e.contains("denied by policy"),
+                "normal domain must not be net-guard denied: {e}"
+            );
+        }
     }
 }
