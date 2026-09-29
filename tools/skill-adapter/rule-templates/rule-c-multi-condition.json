@@ -1,0 +1,77 @@
+{
+  "rule_id": "{{rule_c_id}}",
+  "version": 1,
+  "description": "C类模板：多条件组合判定——expense_submit 金额<5000 且部门=finance 自动批准，否则转人工（all 多条件 AND）",
+  "_usage": "复制本 JSON 为 vars.rules 新条目：替换 {{rule_c_id}}（可留空自动生成 rule-c-*）；调整金额阈值 value / 部门值；domain 用 all 组合任意多个条件（lt/gt/eq/exists/not）",
+  "_contract_note": "params 契约：入参读 instruction.params.*；set 写状态（status/approval_required）；不与宪法桥接规则冲突（domain=expense_submit 业务指令）",
+  "transform": [
+    {
+      "type": "branch",
+      "params": {
+        "domain": {
+          "type": "instruction",
+          "instruction_type": "expense_submit"
+        },
+        "on_true": [
+          {
+            "type": "branch",
+            "params": {
+              "domain": {
+                "type": "all",
+                "inner": [
+                  {
+                    "type": "lt",
+                    "path": "instruction.params.amount",
+                    "value": 5000
+                  },
+                  {
+                    "type": "eq",
+                    "path": "instruction.params.department",
+                    "value": "finance"
+                  }
+                ]
+              },
+              "on_true": [
+                {
+                  "type": "set",
+                  "params": {
+                    "attr": "status",
+                    "operation": "set",
+                    "value": "approved"
+                  }
+                },
+                {
+                  "type": "set",
+                  "params": {
+                    "attr": "approval_required",
+                    "operation": "set",
+                    "value": false
+                  }
+                }
+              ],
+              "on_false": [
+                {
+                  "type": "set",
+                  "params": {
+                    "attr": "status",
+                    "operation": "set",
+                    "value": "pending"
+                  }
+                },
+                {
+                  "type": "set",
+                  "params": {
+                    "attr": "approval_required",
+                    "operation": "set",
+                    "value": true
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "on_false": []
+      }
+    }
+  ]
+}

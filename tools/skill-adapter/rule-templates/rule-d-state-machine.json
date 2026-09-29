@@ -1,0 +1,52 @@
+{
+  "rule_id": "{{rule_d_id}}",
+  "version": 1,
+  "description": "D类模板：状态机节点迁移——收到 state_next 指令且 from=pending → 迁移 processing 并 push 后续 noop（状态迁移 + 指令队列）",
+  "_usage": "复制本 JSON 为 vars.rules 新条目：替换 {{rule_d_id}}（可留空自动生成 rule-d-*）；改 from/to 状态值；push.instructions 可改为后续业务指令",
+  "_contract_note": "push 语义：instructions 数组入指令队列（宪法 while_loop/sequence 同源）；set 写状态；状态读 instruction.params.from（入参走 params 契约）",
+  "transform": [
+    {
+      "type": "branch",
+      "params": {
+        "domain": {
+          "type": "instruction",
+          "instruction_type": "state_next"
+        },
+        "on_true": [
+          {
+            "type": "branch",
+            "params": {
+              "domain": {
+                "type": "eq",
+                "path": "instruction.params.from",
+                "value": "pending"
+              },
+              "on_true": [
+                {
+                  "type": "set",
+                  "params": {
+                    "attr": "status",
+                    "operation": "set",
+                    "value": "processing"
+                  }
+                },
+                {
+                  "type": "push",
+                  "params": {
+                    "instructions": [
+                      {
+                        "type": "noop"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "on_false": []
+            }
+          }
+        ],
+        "on_false": []
+      }
+    }
+  ]
+}
