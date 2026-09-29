@@ -59,6 +59,11 @@ pub struct AgentRunRequest {
     /// 请求方(如评测 harness 的 agent 壳)可设。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
+    /// P2 沙箱根映射扩展字段(可选):file 类工具沙箱根重绑到指定绝对路径
+    /// (校验域随执行域迁移,fs_safety 判据零改动;None = 既有语义零变化,
+    /// 删字段即下线)。LLM 面不可见该字段——仅 HTTP 请求方可设。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 /// Agent run response
@@ -684,6 +689,12 @@ async fn run_agent(
     if let Some(container) = &req.container {
         crate::api::serve_tools::with_shell_exec_backend(&mut filtered, container);
     }
+    // P2 沙箱根映射:请求携带 workspace → 以声明态注入能力边界
+    // (先于 M5-a 接线,fs_safety 判据零改动;None = 零变化)
+    if let Some(ws) = &req.workspace {
+        crate::api::serve_tools::apply_workspace_boundary(&mut def, ws)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
     // M5-a:能力边界接线(显式声明重绑 file 工具沙箱 + 生效边界注入 runner)
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
@@ -824,6 +835,11 @@ async fn run_agent_stream(
     // P1 执行桥:同 run_agent 口径(请求携带容器名 → shell_exec 转 docker-exec)
     if let Some(container) = &req.container {
         crate::api::serve_tools::with_shell_exec_backend(&mut filtered, container);
+    }
+    // P2 沙箱根映射:同 run_agent 口径(请求携带 workspace → 声明态注入边界)
+    if let Some(ws) = &req.workspace {
+        crate::api::serve_tools::apply_workspace_boundary(&mut def, ws)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
     // M5-a:能力边界接线(同 run_agent 口径)
     let capability_boundary =
@@ -1864,6 +1880,7 @@ mod tests {
             temperature: None,
             model: None,
             container: None,
+            workspace: None,
         };
 
         let response = app
@@ -2167,6 +2184,7 @@ mod tests {
             temperature: None,
             model: None,
             container: None,
+            workspace: None,
         };
         let response = rt.block_on(async {
             app.oneshot(
