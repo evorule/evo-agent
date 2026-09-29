@@ -725,8 +725,15 @@ mod tests {
             // 真实 evorule-server，union 不含服务工具属预期；若 agent 白名单
             // 声明了既不在 union 也不在 service_tools 白名单的名字 → 判失败。
             let svc_whitelist: std::collections::HashSet<String> = {
-                let cfg: toml::Value =
-                    toml::from_str(include_str!("../../evo-agent.toml")).unwrap();
+                // 服务工具豁免清单固化于测试（本地 evo-agent.toml 不入库，不可
+                // include_str）；新增服务工具时此处有意失败，强制同步更新。
+                let cfg: toml::Value = toml::from_str(
+                    r#"
+[evorule]
+service_tools = ["config_persist", "rule_sandbox"]
+"#,
+                )
+                .unwrap();
                 cfg["evorule"]["service_tools"]
                     .as_array()
                     .map(|a| {
