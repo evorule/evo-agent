@@ -232,6 +232,11 @@ impl HttpGetTool {
 
         let status = resp.status();
         let final_url = resp.url().to_string();
+
+        // redirect 落点复检(网络负面域守卫):防重定向跳入 benchmark 基础设施域
+        // 后把内容带回观察面;红线拦截无审批通道
+        super::net_guard::check_denied_network_target(&final_url)?;
+
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -323,6 +328,10 @@ impl ToolFunction for HttpGetTool {
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required arg: url (string)".to_string())?;
+
+        // 网络负面域守卫(红线):URL 命中 benchmark 基础设施域即拒绝,
+        // 先于 SSRF 分类与审批链,无审批通道
+        super::net_guard::check_denied_network_target(url)?;
 
         let approved = args
             .get("approved")
@@ -524,5 +533,66 @@ mod tests {
         let result = tool.call(&Value::Object(Default::default())).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing required arg"));
+    }
+
+    // === 网络负面域守卫(net_guard,红线前置无审批通道)===
+
+    #[tokio::test]
+    async fn test_net_guard_denies_benchmark_url_before_request() {
+        let tool = HttpGetTool::new();
+        let result = tool
+            .call(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert("url".to_string(), Value::from("https://tbench.ai/docs"));
+                m
+            }))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("denied by policy"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_net_guard_denies_benchmark_url_even_with_approval() {
+        let tool = HttpGetTool::new();
+        let result = tool
+            .call(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "url".to_string(),
+                    Value::from("https://huggingface.co/datasets/terminal-bench/terminal-bench-2"),
+                );
+                m.insert("approved".to_string(), Value::Bool(true));
+                m
+            }))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // 红线拦截不受 approved 影响(区别于 SSRF blocked 与 candidate 语义)
+        assert!(err.contains("denied by policy"), "got: {}", err);
+        assert!(!err.contains("needs_approval"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_net_guard_does_not_block_legitimate_hf_model_url() {
+        // 不实际发起网络请求的断言形态:命中 candidate 白名单外的正常域
+        // 走 proposal 而非红线拒绝(有网络环境下 active 域则真实放行)
+        let tool = HttpGetTool::new();
+        let result = tool
+            .call(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "url".to_string(),
+                    Value::from("https://huggingface.co/meta-llama/Meta-Llama-3-8B"),
+                );
+                m
+            }))
+            .await;
+        if let Err(e) = result {
+            assert!(
+                !e.contains("denied by policy"),
+                "legitimate HF model URL must not be net-guard denied: {e}"
+            );
+        }
     }
 }
