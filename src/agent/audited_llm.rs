@@ -158,7 +158,7 @@ impl AuditedLlm {
         // 1. 一次性 sidecar 会话（F2：瞬态错误有界重试，语义错误直接失败）
         let session_id = setup_with_retry(
             deadline,
-            || self.client.create_session(None),
+            || self.client.create_session(None, Some("llm")),
             "create_session",
             purpose,
         )
