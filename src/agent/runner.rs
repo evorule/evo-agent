@@ -818,7 +818,7 @@ impl AgentRunner {
     }
 
     /// 执行桥后端上下文注入轨迹采集器:run 请求携带容器名(docker-exec 后端)时,
-    /// shell_exec 轨迹 danger_hits 仅保留违禁域旗标(A4/A5 合规红线双后端
+    /// shell_exec 轨迹 danger_hits 仅保留违禁域旗标(合规红线双后端
     /// enforce 维持),host 视角 program/rm 旗标分流至 `program_hits` 留链备裁
     /// (分流≠删检,容器内命令策略由规则面随动);不注入=宿主后端成形零变化
     pub fn with_trace_exec_backend(self, container: &str) -> Self {
