@@ -7,7 +7,7 @@
   "model": "MiniMax-M2.5",
   "temperature": 0.3,
   "max_steps": 500,
-  "context_window_tokens": 32768,
+  "context_window_tokens": 204800,
   "step_timeout_secs": 300,
   "tools": [
     "file_read",
