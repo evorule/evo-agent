@@ -27,6 +27,10 @@ use crate::io_handlers::tool_handler::ToolFunction;
 /// 默认最大结果数
 pub const DEFAULT_MAX_RESULTS: usize = 1000;
 
+/// 默认排除的目录名（walk 进入子目录前跳过；与 grep_files DEFAULT_EXCLUDE_GLOBS 对齐，
+/// 防全树搜索在含编译产物/依赖的大工作区超时）
+pub const DEFAULT_EXCLUDE_DIRS: &[&str] = &["target", "node_modules", ".git", ".evo-trash", "data"];
+
 /// `search_files` 工具
 #[derive(Clone)]
 pub struct SearchFilesTool {
@@ -108,7 +112,14 @@ impl SearchFilesTool {
         }
     }
 
-    fn walk(root: &Path, dir: &Path, pattern: &str, max: usize, results: &mut Vec<PathBuf>) {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        pattern: &str,
+        max: usize,
+        exclude: &std::collections::HashSet<String>,
+        results: &mut Vec<PathBuf>,
+    ) {
         if results.len() >= max {
             return;
         }
@@ -129,13 +140,17 @@ impl SearchFilesTool {
             if name.starts_with('.') {
                 continue;
             }
+            // 跳过排除目录(默认 target/node_modules 等 + 用户自定义 exclude)
+            if exclude.contains(name) {
+                continue;
+            }
             if Self::glob_match(pattern, name) {
                 if let Ok(rel) = path.strip_prefix(root) {
                     results.push(rel.to_path_buf());
                 }
             }
             if path.is_dir() {
-                Self::walk(root, &path, pattern, max, results);
+                Self::walk(root, &path, pattern, max, exclude, results);
             }
         }
     }
@@ -173,10 +188,21 @@ impl SearchFilesTool {
             return Err("max_results must be > 0".to_string());
         }
 
+        // 排除目录:默认集 + 用户自定义 exclude(数组,目录名精确匹配)
+        let mut exclude: std::collections::HashSet<String> =
+            DEFAULT_EXCLUDE_DIRS.iter().map(|s| s.to_string()).collect();
+        if let Some(arr) = args.get("exclude").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    exclude.insert(s.to_string());
+                }
+            }
+        }
+
         let safe_dir = self.resolve_safe_dir(dir)?;
 
         let mut results = Vec::new();
-        Self::walk(&safe_dir, &safe_dir, pattern, max, &mut results);
+        Self::walk(&safe_dir, &safe_dir, pattern, max, &exclude, &mut results);
 
         let json_results: Vec<Value> = results
             .iter()
@@ -344,6 +370,53 @@ mod tests {
             count, 1,
             "should only find visible.txt, not .git/secret.txt"
         );
+    }
+
+    #[test]
+    fn test_walk_skips_default_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("src.txt"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/build-artifact.txt"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("node_modules/dep.txt"), b"").unwrap();
+
+        let tool = SearchFilesTool::new(dir.path().to_path_buf());
+        let result = tool
+            .call_sync(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert("pattern".to_string(), Value::from("*.txt"));
+                m
+            }))
+            .unwrap();
+
+        let count = result.get("count").unwrap().as_i64().unwrap();
+        assert_eq!(
+            count, 1,
+            "target/ 与 node_modules/ 应被默认排除,只返回 src.txt; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_walk_custom_exclude() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("vendor")).unwrap();
+        std::fs::write(dir.path().join("vendor/skip.txt"), b"").unwrap();
+
+        let tool = SearchFilesTool::new(dir.path().to_path_buf());
+        let result = tool
+            .call_sync(&Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert("pattern".to_string(), Value::from("*.txt"));
+                m.insert("exclude".to_string(), Value::from(vec!["vendor"]));
+                m
+            }))
+            .unwrap();
+
+        let count = result.get("count").unwrap().as_i64().unwrap();
+        assert_eq!(count, 1, "自定义 exclude 应跳过 vendor/; got {:?}", result);
     }
 
     // === 复现:多字节文件名 × '*' glob ===

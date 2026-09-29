@@ -1,0 +1,45 @@
+{
+  "workflow_id": "cond_compute_drill",
+  "description": "条件分支(run_when v1.1)+纯函数节点(compute v1.2)真实执行实测:regex_match 求值→条件真执行/条件假跳过",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "probe",
+      "agent_type": "researcher",
+      "task": "用 file_read 读取项目根目录 README.md 的开头部分(约前 120 行),原样输出其中与项目定位相关的段落(不要改写、不要总结,直接引用原文片段)。",
+      "depends_on": []
+    },
+    {
+      "id": "check",
+      "compute": {
+        "function": "regex_match",
+        "inputs": ["probe"],
+        "pattern": "Evo-Agent"
+      },
+      "depends_on": ["probe"]
+    },
+    {
+      "id": "do_report",
+      "agent_type": "researcher",
+      "run_when": {
+        "node": "check",
+        "op": "equals",
+        "value": "match"
+      },
+      "task_template": "compute 节点 check 判定 probe 内容匹配 Evo-Agent。基于 {probe} 写一段不超过 120 字的项目定位摘要。",
+      "depends_on": ["check"]
+    },
+    {
+      "id": "skip_me",
+      "agent_type": "researcher",
+      "run_when": {
+        "node": "check",
+        "op": "equals",
+        "value": "no_match"
+      },
+      "task": "这条节点预期被跳过。如果你真的执行了,请输出 不应当执行 四个字。",
+      "depends_on": ["check"]
+    }
+  ],
+  "output_node": "do_report"
+}

@@ -67,7 +67,7 @@ use crate::io_handlers::tool_handler::ToolHandler;
 /// - `file_move`:移动/重命名(candidate 审批 + 目标重名拒)
 /// - `file_delete`:软删除进 `.evo-trash/`(candidate 审批)
 /// - `search_files`:glob 找文件(工作目录沙箱 + max_results 限制)
-/// - `shell_exec`:执行白名单命令(8 active + 20 candidate + 28 blocked)
+/// - `shell_exec`:执行白名单命令(8 active + 20 candidate + 35 blocked)
 /// - `http_get`:HTTP GET(6 active host + SSRF 防护 + 任何其他 host 需批准)
 /// - `git_status` / `git_diff` / `git_log`:git 只读面(active,agentTools.gitRead)
 /// - `git_stage` / `git_commit`:git 写面(candidate 审批,agentTools.gitWrite)
@@ -322,6 +322,9 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
             description: "Find files by glob pattern in workdir. \
                           Supports `*` (any chars) and `?` (single char). \
                           Hidden files (starting with `.`) are skipped. \
+                          Big directories are excluded by default: target, node_modules, .git, \
+                          .evo-trash, data — pass `exclude` to skip additional directories. \
+                          Prefer `file_read` when you know the file path (much cheaper than a full-tree search). \
                           Max results capped to prevent OOM."
                 .to_string(),
             parameters: vec![
@@ -338,6 +341,12 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     required: false,
                 },
                 ParameterSpec {
+                    name: "exclude".to_string(),
+                    r#type: "array".to_string(),
+                    description: "Directory names to skip in addition to the default excludes (e.g. [\"vendor\", \"dist\"])".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
                     name: "max_results".to_string(),
                     r#type: "integer".to_string(),
                     description: "Max number of results (default 1000)".to_string(),
@@ -350,6 +359,8 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
             description: "Search file CONTENTS across the workdir (ripgrep-style). \
                           Literal or regex mode; case/whole-word toggles; \
                           gitignore respected by default; binary files skipped. \
+                          Default excludes always apply: .git, target, node_modules, \
+                          .evo-trash, data — pass `excludeGlobs` to skip more (e.g. [\"vendor/**\"]). \
                           Results are grouped per file with 1-based line numbers and \
                           0-based char column offsets. Capped by max_results; \
                           hard 30s timeout returns partial results."
@@ -389,6 +400,12 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     name: "includeGlobs".to_string(),
                     r#type: "array".to_string(),
                     description: "Glob patterns to include, e.g. [\"*.rs\"] (default: all files)".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "excludeGlobs".to_string(),
+                    r#type: "array".to_string(),
+                    description: "Glob patterns to exclude, e.g. [\"vendor/**\", \"dist/**\"] (added to default excludes)".to_string(),
                     required: false,
                 },
                 ParameterSpec {

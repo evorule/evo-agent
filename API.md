@@ -1,6 +1,6 @@
 # Evo-Agent API 接口文档
 
-> 版本 0.1.0 | 最后更新 2026-08-15
+> 版本 0.2.0 | 最后更新 2026-09-27
 
 ---
 
@@ -110,15 +110,15 @@ GET /agents
   "agents": [
     {
       "agent_type": "general",
-      "version": "0.1.0",
-      "description": "通用 Agent — 文件操作 + Shell + Web",
-      "tools": ["file_read", "file_list", "file_write", "search_files", "shell_exec", "http_get"]
+      "version": "0.3.0",
+      "description": "General-purpose agent — file ops, shell commands, web fetch, rule/knowledge consumption, and rule draft production",
+      "tools": ["file_read", "file_list", "file_write", "file_create", "file_move", "file_delete", "search_files", "grep_files", "git_status", "git_diff", "git_log", "shell_exec", "http_get", "rule_list", "rule_get", "rule_versions", "rule_version_get", "rule_validate", "knowledge_datasets", "knowledge_search", "knowledge_entry_get", "audit_get", "rule_create", "rule_update", "rule_submit", "meta_summary", "evolution_signals"]
     },
     {
       "agent_type": "rule-copilot",
-      "version": "0.1.0",
-      "description": "规则协作 Agent",
-      "tools": ["ws_list", "rule_list", "rule_create", ...]
+      "version": "0.3.0",
+      "description": "Rule collaboration agent — helps domain experts manage system rules via natural language",
+      "tools": ["rule_list", "rule_get", "rule_create", "..."]
     }
   ]
 }
@@ -140,13 +140,13 @@ GET /agents/{agent_type}
 ```json
 {
   "agent_type": "general",
-  "version": "0.1.0",
-  "description": "通用 Agent",
+  "version": "0.3.0",
+  "description": "General-purpose agent — file ops, shell commands, web fetch, rule/knowledge consumption, and rule draft production",
   "system_prompt": "You are a helpful general-purpose assistant...",
   "model": "MiniMax-M2.5",
   "temperature": 0.3,
-  "max_steps": 20,
-  "tools": ["file_read", "file_list", "file_write", "search_files", "shell_exec", "http_get"],
+  "max_steps": 500,
+  "tools": ["file_read", "file_list", "file_write", "file_create", "file_move", "file_delete", "search_files", "grep_files", "git_status", "git_diff", "git_log", "shell_exec", "http_get", "rule_list", "rule_get", "rule_versions", "rule_version_get", "rule_validate", "knowledge_datasets", "knowledge_search", "knowledge_entry_get", "audit_get", "rule_create", "rule_update", "rule_submit", "meta_summary", "evolution_signals"],
   "memory_config": null
 }
 ```
@@ -200,6 +200,7 @@ POST /agents/{agent_type}/run
   "content": "当前目录包含以下 Rust 文件:\n- main.rs\n- lib.rs\n...",
   "steps": 8,
   "duration_ms": 3245,
+  "session_id": "42",
   "error": null
 }
 ```
@@ -211,6 +212,7 @@ POST /agents/{agent_type}/run
   "content": "",
   "steps": 0,
   "duration_ms": 0,
+  "session_id": null,
   "error": "LLM 调用失败: connection timeout"
 }
 ```
@@ -836,6 +838,7 @@ POST /api/shared/facts/rollup
 | `content` | `string` | 结果内容 |
 | `steps` | `number` | 执行步数 |
 | `duration_ms` | `number` | 执行耗时（毫秒） |
+| `session_id` | `string \| null` | 创建的 evorule session ID（失败时为 null） |
 | `error` | `string \| null` | 错误信息 |
 
 ### AgentInfo
@@ -1129,9 +1132,123 @@ console_port = 5174                          # 可选,缺省 5174
 
 ---
 
+## 13. 工作台 Git 面
+
+服务 IDE 工作台的 SCM 侧栏与 diff 视图。七个端点全部委托 [`crate::git::GitOps`](src/git/)（单一实现，agent `git_tools` 与 REST 面共享同一语义），挂鉴权中间件。与 `file_api` 同为主体语义：服务**人的直接操作**，不构造 agent 会话事实。
+
+### 13.1 查询状态
+
+```
+GET /api/git/status
+```
+
+双栏 status（分支 / 暂存 / 修改组）。无参数，显式声明空结构便于扩展。
+
+### 13.2 查看差异
+
+```
+GET /api/git/diff?path={相对路径}
+```
+
+HEAD 版本 vs 工作区版本两版全文（Monaco DiffEditor 直接消费）。
+
+### 13.3 暂存与取消暂存
+
+```
+POST /api/git/stage
+POST /api/git/unstage
+```
+
+**请求体:**
+```json
+{ "paths": ["src/main.rs", "Cargo.toml"] }
+```
+
+`paths` 支持文件或折叠目录（递归）。
+
+### 13.4 提交
+
+```
+POST /api/git/commit
+```
+
+**请求体:**
+```json
+{ "message": "fix: ..." }
+```
+
+提交前做身份预检（缺失则 400）；hooks 按流分流。
+
+### 13.5 丢弃工作区变更
+
+```
+POST /api/git/discard
+```
+
+**请求体:**
+```json
+{ "paths": ["src/main.rs"] }
+```
+
+丢弃工作区变更（前端强制确认，后端 400 语义明确：非 git 仓库 / 边缘形态 / 身份缺失 / hooks 拒绝）。
+
+### 13.6 提交身份预检
+
+```
+GET /api/git/identity
+```
+
+提交身份预检（前端先查、后端 commit 时再查，双保险）。
+
+---
+
+## 14. 工作台设置面与运维操作
+
+### 14.1 设置 schema
+
+```
+GET /api/workbench/settings/schema
+```
+
+设置条目的注册表单源在 serve 侧：键 ID / 类型 / 默认值 / 枚举 / 范围 / 分类 / 描述。前端设置 UI 的渲染、校验提示与 JSON 补全全部消费该 schema，前后端零双声明。
+
+### 14.2 读取/写入设置
+
+```
+GET /api/workbench/settings
+PUT /api/workbench/settings
+```
+
+- **User 层** = `data/workbench_settings.json`（serve 原子写；PUT 端点唯一写入口）
+- **Workspace 层** = `<workdir>/.evo/settings.json`（只读合并源；人工经文件面编辑，保存后下一次 GET 合并生效）
+- **合并序**：Default → User → Workspace（后层覆盖前层），`sources` 标注每键生效层
+- 磁盘文件为扁平键值对象（如 `{"editor.fontSize": 18}`），键 ID 即 schema 键；`ensure_fixed_relative` 白名单门拒绝绝对路径与父目录穿越，无任意路径写入口
+- 不含任何密钥/服务端配置——那是 `evo-agent.toml` 启动期配置域；设置页只消费 `/admin/llm-status` 脱敏快照，零新增泄露面
+- 设置读写不落审计链（与按钮点击同级别；settings 属工作台数据面非规则面）
+
+### 14.3 运维操作
+
+```
+POST /ops/{operation}
+```
+
+运行时运维操作（如触发快照清理），鉴权保护。
+
+---
+
 ## 版本变更日志
 
-### v0.1.0 (当前)
+### v0.2.0 (2026-09-27)
+
+- 新增 `GET /version`（版本+exe mtime+workdir 运行体身份）与 `GET /admin/llm-status`（脱敏）
+- 新增记忆系统端点：`GET /agents/{type}/memory/evidence` / `GET /agents/{type}/memory/recall`
+- 新增工作台 Git 面七个端点（§13）与设置面（§14）
+- 文件面扩展：`POST /api/files/create` / `move` / `replace`、`GET /api/files/search`
+- 新增 `GET /api/sessions/{id}/evolution-signals` 进化信号只读代理（§12.1）
+- WS 审批帧两阶段时序修复（§12.2）
+- 会话索引与快照机制（§11）：`GET /api/sessions`、transcript live/snapshot 回落、保留期配置
+
+### v0.1.0 (2026-08-15)
 
 - 初始 API 发布
 - HTTP REST / SSE / WebSocket 三种协议

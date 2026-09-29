@@ -55,3 +55,12 @@ test_all_output.txt
 
 # Python E2E 脚本字节码缓存
 __pycache__/
+
+# 工作台运行时会话产物（本地状态不入库）
+.evo-agent/
+
+# 本地配置备份（含本机端点，不入库）
+evo-agent.toml.bak*
+
+# 本地临时脚手架（hello-world 试验项目，不入库）
+sleep_worker/

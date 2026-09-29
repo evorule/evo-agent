@@ -10,6 +10,7 @@ try {
     $cfg = Get-OpsConfig -OpsDir $OpsDir
     $starters = @{
         'evorule-server'  = 'start-evorule-server.ps1'
+        'echo'            = 'start-echo.ps1'
         'evo-agent-serve' = 'start-evo-agent-serve.ps1'
         'console'         = 'start-console.ps1'
     }

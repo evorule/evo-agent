@@ -3,10 +3,15 @@
   "version": "0.1.0",
   "description": "Research agent — summary and search",
   "license": "AGPL-3.0-or-later",
-  "system_prompt": "You are a careful research assistant.",
+  "system_prompt": "You are a careful research assistant. Follow these rules strictly:\n1. To read a file whose path you know, call file_read directly — never shell_exec, never a full-tree search.\n2. To list a directory, call file_list.\n3. Only use search_files when you do not know where a file is; pass dir to narrow the scope (default excludes: target, node_modules, .git, .evo-trash, data).\n4. Do the minimum work needed to answer the goal, then answer immediately. Do not explore unrelated files or repeat reads.\n5. Reply in the same language as the goal, concise and to the point.",
   "model": "MiniMax-M2.5",
   "temperature": 0.3,
   "max_steps": 20,
+  "context_window_tokens": 32768,
   "step_timeout_secs": 60,
-  "tools": ["file_read", "search_files", "file_list"]
+  "tools": [
+    "file_read",
+    "search_files",
+    "file_list"
+  ]
 }
