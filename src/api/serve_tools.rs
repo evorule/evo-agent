@@ -480,6 +480,34 @@ pub fn wire_capability_boundary(
     effective
 }
 
+/// P2 沙箱根映射:run 请求携带 workspace → 以声明态注入能力边界
+///
+/// 语义 = **映射≠放宽**(合规审查 §二裁定):fs_safety containment 判据逻辑
+/// 保持,校验域随执行域迁移(宿主 serve workdir → 请求指定 workspace)。
+/// 复用 [`effective_capability_boundary`] 的声明合成(root=workspace 规范化
+/// 形态,mode/tools 按 def.tools 推导),后续 [`wire_capability_boundary`] 的
+/// 声明重绑通路不变,fs_safety 判据零改动。
+///
+/// 请求级覆盖优先于 def 静态声明(与 model/temperature 等 per-request 覆盖
+/// 同口径);字段仅 HTTP 请求方可设,LLM 面不可见;不传即零变化(删字段即下线)。
+pub fn apply_workspace_boundary(
+    def: &mut crate::agent::definition::AgentDefinition,
+    workspace: &str,
+) -> Result<(), String> {
+    let ws_path = std::path::PathBuf::from(workspace);
+    if !ws_path.is_absolute() {
+        return Err(format!(
+            "workspace must be an absolute path, got: '{}'",
+            workspace
+        ));
+    }
+    // 请求级覆盖:先清 def 静态声明,否则 effective_capability_boundary 的
+    // 「声明优先」语义会原样返回旧边界,覆盖落空
+    def.capability_boundary = None;
+    def.capability_boundary = Some(effective_capability_boundary(def, &ws_path));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1347,5 +1375,109 @@ service_tools = ["config_persist", "rule_sandbox"]
             ok.err()
         );
         assert!(root.join("direct.txt").exists());
+    }
+
+    // ===== P2 沙箱根映射(apply_workspace_boundary)=====
+
+    #[test]
+    fn test_workspace_boundary_relative_path_rejected() {
+        let mut def = make_def(&["file_read", "file_write"], None);
+        let err = apply_workspace_boundary(&mut def, "relative/ws");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("absolute path"));
+        assert!(def.capability_boundary.is_none(), "失败注入不得残留半态");
+    }
+
+    #[test]
+    fn test_workspace_boundary_synthesizes_declaration() {
+        // 未声明边界 + 请求 workspace → 合成声明态:root=workspace 规范化,
+        // mode 按 file_write 推导为 read_write,tools=def.tools ∩ 沙箱类
+        let ws = tempfile::tempdir().unwrap();
+        let mut def = make_def(&["file_read", "file_write", "shell_exec"], None);
+        apply_workspace_boundary(&mut def, ws.path().to_str().unwrap()).unwrap();
+        let b = def.capability_boundary.as_ref().expect("boundary injected");
+        assert_eq!(
+            b.sandbox_root,
+            simplify_verbatim(ws.path().canonicalize().unwrap())
+        );
+        assert_eq!(b.mode, "read_write");
+        assert!(b.tools.contains(&"file_read".to_string()));
+        assert!(b.tools.contains(&"file_write".to_string()));
+        assert!(
+            !b.tools.contains(&"shell_exec".to_string()),
+            "非沙箱类工具不进边界"
+        );
+    }
+
+    #[test]
+    fn test_workspace_boundary_overrides_static_declaration() {
+        // 请求级覆盖优先于 def 静态声明(per-request 覆盖口径)
+        let ws_dir = tempfile::tempdir().unwrap();
+        let static_dir = tempfile::tempdir().unwrap();
+        let mut def = make_def(
+            &["file_read"],
+            Some(make_boundary(
+                "read_only",
+                static_dir.path().to_path_buf(),
+                &["file_read"],
+            )),
+        );
+        apply_workspace_boundary(&mut def, ws_dir.path().to_str().unwrap()).unwrap();
+        let b = def.capability_boundary.as_ref().unwrap();
+        assert_eq!(
+            b.sandbox_root,
+            simplify_verbatim(ws_dir.path().canonicalize().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_boundary_rebind_is_live() {
+        // 注入 → wire:file 可读写在映射 workspace 内、拒 workspace 外
+        // (复用 M5-a 声明重绑通路,判据语义不变)
+        let ws = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
+        let startup_root = startup.path().canonicalize().unwrap();
+        let (wsc, evc) = make_clients();
+        let mut handler = build_union_toolkit(&startup_root, &wsc, &evc);
+
+        let mut def = make_def(&["file_read", "file_write"], None);
+        apply_workspace_boundary(&mut def, ws.path().to_str().unwrap()).unwrap();
+
+        let eff = wire_capability_boundary(&mut handler, &def, &startup_root);
+        assert_eq!(
+            eff.sandbox_root,
+            simplify_verbatim(ws.path().canonicalize().unwrap())
+        );
+
+        // workspace 内可写(产物落在映射根)
+        let ok = handler
+            .execute_by_name(
+                "file_write",
+                &serde_json::json!({"path": "out.txt", "content": "hi"}),
+            )
+            .await;
+        assert!(
+            ok.is_ok(),
+            "write inside mapped workspace must succeed: {:?}",
+            ok.err()
+        );
+        assert!(
+            ws.path().join("out.txt").exists(),
+            "artifact must land in the mapped workspace"
+        );
+
+        // workspace 外(启动 workdir 独有文件)拒
+        let outside = startup_root.join("outside.txt");
+        std::fs::write(&outside, b"o").unwrap();
+        let err = handler
+            .execute_by_name(
+                "file_write",
+                &serde_json::json!({"path": outside.display().to_string(), "content": "x"}),
+            )
+            .await;
+        assert!(
+            err.is_err(),
+            "write outside mapped workspace must be rejected"
+        );
     }
 }
