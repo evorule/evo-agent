@@ -1,0 +1,51 @@
+{
+  "rule_id": "{{rule_gate_id}}",
+  "version": 1,
+  "description": "门禁类模板：仅 admin 角色可执行 approve_purchase，否则记录违规标记（violation=reason）",
+  "_usage": "复制本 JSON 为 vars.rules 新条目：替换 {{rule_gate_id}}（可留空自动生成 rule-gate-*）；改指令类型 instruction_type / 角色值 / reason 文案",
+  "_contract_note": "E2E 实测修正（2026-09-29）：server 执行域 bundle 导入元指令白名单 = set/push/branch/io_request/collect/merge，**enforce 不在白名单（宪法层专用）**——bundle 层纪律以 branch+set 违规标记表达；如需 enforce 强阻断语义请提升至宪法层（00_meta_*.json）。原 enforce 顶层声明形态（evorule-tcb/discipline DC 纪律）仍适用于宪法层，不适用于 bundle 层模板",
+  "transform": [
+    {
+      "type": "branch",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            {
+              "type": "instruction",
+              "instruction_type": "approve_purchase"
+            },
+            {
+              "type": "not",
+              "inner": {
+                "type": "eq",
+                "path": "instruction.params.role",
+                "value": "admin"
+              }
+            }
+          ]
+        },
+        "on_true": [
+          {
+            "type": "set",
+            "params": {
+              "attr": "violation",
+              "operation": "set",
+              "value": "仅 admin 角色可执行 approve_purchase（role != admin 触发违规）"
+            }
+          }
+        ],
+        "on_false": [
+          {
+            "type": "set",
+            "params": {
+              "attr": "violation",
+              "operation": "set",
+              "value": null
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,69 @@
+{
+  "_doc": "判定标准声明块模板（规范正本 v1.0 §八 自举五步·步骤1 判定声明）：每条规则/流程必须声明机器化判定——四条件（标准一）+ 三问（标准二）+ 落点（标准三）+ 通道（标准四）+ 归属类，附证据引用。并入方式：复制本文件 declaration 段到流程实例 meta.machine_judge（meta 允许附加字段，schema 兼容）；执行器消费=登记缺口（见 GapRegister），当前版本=信息承载+填写自查+判例回归基准。",
+  "_usage": "每新增一条规则/流程，先在 meta.machine_judge.items 加一条声明（entry_id_ref 指向 vars.rules 条目）；四条件/三问任一为 false 应归模型保留区（不加声明或 class=LLM）；证据字段必须可指（expect 断言/params 契约/FactsLog 锚点），禁'待核实'。",
+  "_evidence_rule": "四条件全过才可机器化；三问全过才可状态机化；placement=server/agent（四问判据）；channel=json/gate/code（三级漏斗，能 json 一律 json）。判定存疑记 GapRegister，不静默归类。",
+  "declaration": {
+    "judge_items": [
+      {
+        "entry_id_ref": "{{rule_a_id}}",
+        "judge": {
+          "verifiable": true,
+          "verifiable_evidence": "expect 可写断言：probe_results.status eq approved（s12 实证）",
+          "structured": true,
+          "structured_evidence": "入参 schema 明确：instruction.params.amount 数值域（params 契约）",
+          "deterministic": true,
+          "deterministic_evidence": "lt 域 + branch 查表，零 LLM（TCB 纯函数）",
+          "traceable": true,
+          "traceable_evidence": "FactsLog + 审计链运行固有",
+          "enum": true,
+          "assertable": true,
+          "params_finite": true,
+          "placement": "server",
+          "channel": "json",
+          "class": "A",
+          "standard_ref": "机器化判定标准-规范-20260929.md §二/§三/§四/§五"
+        }
+      },
+      {
+        "entry_id_ref": "{{rule_e_id}}",
+        "judge": {
+          "verifiable": true,
+          "verifiable_evidence": "expect 可写断言：probe_results.N.io_ok eq true（s12 实证）",
+          "structured": true,
+          "structured_evidence": "instruction 域路由：instruction_type=call_service + not exists(service_name)（宪法补集）",
+          "deterministic": true,
+          "deterministic_evidence": "instruction 域匹配 + branch 分流，零 LLM（e1 模板实证）",
+          "traceable": true,
+          "traceable_evidence": "FactsLog + 审计链运行固有",
+          "enum": true,
+          "assertable": true,
+          "params_finite": true,
+          "placement": "server",
+          "channel": "json",
+          "class": "E",
+          "standard_ref": "机器化判定标准-规范-20260929.md §二/§三/§四/§五"
+        }
+      },
+      {
+        "entry_id_ref": "{{flow_id}}",
+        "judge": {
+          "verifiable": true,
+          "verifiable_evidence": "每步 expect 断言（13 步流程 FLOW PASS 13/13 实证）",
+          "structured": true,
+          "structured_evidence": "steps 数组可枚举 + inputs 模板化（flow-schema）",
+          "deterministic": true,
+          "deterministic_evidence": "执行器业务无关顺序执行（fail-closed）",
+          "traceable": true,
+          "traceable_evidence": "capture 回填 + s12 audit 取证防假 PASS",
+          "enum": true,
+          "assertable": true,
+          "params_finite": true,
+          "placement": "server+executor",
+          "channel": "json+gate",
+          "class": "F",
+          "standard_ref": "机器化判定标准-规范-20260929.md §三判例（流程固化 13 步）"
+        }
+      }
+    ]
+  }
+}
