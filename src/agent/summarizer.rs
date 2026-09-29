@@ -37,8 +37,26 @@ use crate::io_handlers::LlmHandler;
 /// G10:摘要触发的最小裁剪消息数(Q9 Strategy B,默认 5)
 pub const DEFAULT_SUMMARY_THRESHOLD: usize = 5;
 
-/// G10:摘要最大 token 数(限制摘要长度,避免摘要本身占用过多 context)
+/// G10:摘要最小 token 数(输入极小时的下限;O-199 修复后实际值随输入规模自适应)
+///
+/// O-199:固定 512 在长会话(51k token prompt)下必然截断——模型对长输入
+/// 倾向更长的输出且可能夹杂格式噪音,512 上限把摘要硬截在半句。
+/// 修复=`adaptive_max_tokens()` 按输入规模放大,512 保留为下限。
 const SUMMARY_MAX_TOKENS: u64 = 512;
+
+/// 摘要 max_tokens 自适应上限(O-199:防长输入下 512 硬截断)
+const SUMMARY_MAX_TOKENS_CAP: u64 = 8192;
+
+/// O-199:按输入规模自适应摘要 max_tokens
+///
+/// - 输入 token 估算 = 字符数 / 3(中英混合粗估)
+/// - max_tokens = clamp(估算值 / 4, 512, 8192):摘要长度随输入次线性增长,
+///   /4 给足 JSON 结构与格式噪音余量;下限 512 保证小会话完整表述,
+///   上限 8192 封顶防成本失控
+fn adaptive_max_tokens(input_chars: usize) -> u64 {
+    let est_input_tokens = (input_chars / 3) as u64;
+    (est_input_tokens / 4).clamp(SUMMARY_MAX_TOKENS, SUMMARY_MAX_TOKENS_CAP)
+}
 
 /// C1:整会话摘要 + 稳定事实 LLM 输出结构
 ///
@@ -74,6 +92,7 @@ const DEFAULT_SUMMARY_PROMPT: &str = "\
 4. 尚未解决的问题或待办事项\n\n\
 要求:\n\
 - 用中文输出,不超过 300 字\n\
+- 只输出摘要纯文本本身,禁止输出任何工具调用格式(如 <minimax:tool_call>)、JSON 或代码块\n\
 - 不要编造对话中不存在的信息\n\
 - 不要包含寒暄、客套等无关内容\n\
 - 用要点格式(1. 2. 3.)组织,便于快速阅读";
@@ -242,7 +261,7 @@ impl ContextSummarizer {
         );
         params_map.insert(
             "max_tokens".to_string(),
-            serde_json::json!(SUMMARY_MAX_TOKENS),
+            serde_json::json!(adaptive_max_tokens(messages_json.to_string().len())),
         );
         params_map.insert("messages".to_string(), messages_json);
         let params_json = serde_json::Value::Object(params_map);
@@ -292,7 +311,7 @@ impl ContextSummarizer {
         let mut messages_vec: Vec<serde_json::Value> = Vec::with_capacity(2);
         messages_vec.push(serde_json::json!({
             "role": "system",
-            "content": "你是对话摘要助手。请总结对话并提取稳定事实（用户偏好、决策、约束）。只输出 JSON，不要输出其他内容。",
+            "content": "你是对话摘要助手。请总结对话并提取稳定事实（用户偏好、决策、约束）。只输出 JSON，不要输出其他内容，禁止输出任何工具调用格式。",
         }));
         messages_vec.push(serde_json::json!({
             "role": "user",
@@ -312,7 +331,7 @@ impl ContextSummarizer {
         );
         params_map.insert(
             "max_tokens".to_string(),
-            serde_json::json!(SUMMARY_MAX_TOKENS),
+            serde_json::json!(adaptive_max_tokens(prompt.len())),
         );
         params_map.insert(
             "messages".to_string(),
@@ -387,7 +406,7 @@ impl ContextSummarizer {
         params_map.insert("temperature".to_string(), serde_json::json!(0.0));
         params_map.insert(
             "max_tokens".to_string(),
-            serde_json::json!(SUMMARY_MAX_TOKENS),
+            serde_json::json!(adaptive_max_tokens(combined.len())),
         );
         params_map.insert(
             "messages".to_string(),
@@ -507,6 +526,29 @@ mod tests {
     #[test]
     fn test_default_threshold_is_5() {
         assert_eq!(DEFAULT_SUMMARY_THRESHOLD, 5);
+    }
+
+    // ========== O-199: adaptive_max_tokens 测试 ==========
+
+    #[test]
+    fn test_adaptive_max_tokens_small_input_floors_at_512() {
+        // 小输入(甚至 0 字符)→ 下限 512
+        assert_eq!(adaptive_max_tokens(0), 512);
+        assert_eq!(adaptive_max_tokens(3000), 512); // est 1000 tok / 4 = 250 → 512
+    }
+
+    #[test]
+    fn test_adaptive_max_tokens_scales_with_input() {
+        // 51k token 级输入(O-199 实测场景):~153k 字符 → est 51000 /4 = 12750 → 封顶 8192
+        assert_eq!(adaptive_max_tokens(153_000), 8192);
+        // 中等输入:60k 字符 → est 20000 /4 = 5000
+        assert_eq!(adaptive_max_tokens(60_000), 5000);
+    }
+
+    #[test]
+    fn test_adaptive_max_tokens_caps_at_8192() {
+        // 超大输入 → 上限 8192(防成本失控)
+        assert_eq!(adaptive_max_tokens(10_000_000), 8192);
     }
 
     // ========== summarize_dropped 测试 ==========

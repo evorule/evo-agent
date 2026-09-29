@@ -126,6 +126,14 @@ pub struct AgentDefinitionResponse {
     pub tools: Vec<String>,
     /// Memory config
     pub memory_config: Option<crate::agent::MemoryConfig>,
+    /// G2:生效上下文窗口 token 数(定义未声明时为默认 8192)
+    ///
+    /// O-201:窗口值是裁剪行为的核心参数,运行时须有权威读口——
+    /// 换模型/调窗口后的验收、裁剪误触发排障的第一手核对面。
+    pub context_window_tokens: usize,
+    /// 实际可用输入预算 = `context_window_tokens - context_window_tokens / 4`
+    /// (1/4 预留给响应,与 `ContextWindowManager` 裁剪口径一致)
+    pub input_budget_tokens: usize,
 }
 
 /// G8:正在等待审批的 session → pending 审批项(ApprovalStore)
@@ -574,6 +582,12 @@ async fn get_agent(
         .load(&agent_type)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
+    let (context_window_tokens, input_budget_tokens) = {
+        // 与 AgentRunner 装配同口径:定义未声明 → 默认 8192;1/4 预留响应
+        let window = def.context_window_tokens.unwrap_or(8192);
+        (window, window - window / 4)
+    };
+
     Ok(Json(AgentDefinitionResponse {
         agent_type: def.agent_type,
         version: def.version,
@@ -584,6 +598,8 @@ async fn get_agent(
         max_steps: def.max_steps,
         tools: def.tools,
         memory_config: Some(def.memory),
+        context_window_tokens,
+        input_budget_tokens,
     }))
 }
 
