@@ -155,7 +155,7 @@ pub async fn run_operation(
     info!(operation = op.as_str(), request_id = ?req.request_id, "LLM named operation invoked");
 
     let model = req.model.as_deref().unwrap_or("default");
-    let result = run_llm_op(&op, &req, model)
+    let result = run_llm_op(&op, &req)
         .await
         .map_err(|e| (e.status_code(), e.to_string()))?;
 
@@ -176,7 +176,7 @@ pub async fn run_operation(
 }
 
 /// 按 op 分发：构建 LLM prompt，调用 `LlmHandler::execute`（同步 + mock 兼容），解析输出。
-async fn run_llm_op(op: &Operation, req: &LlmOpRequest, model: &str) -> Result<Value, LlmOpsError> {
+async fn run_llm_op(op: &Operation, req: &LlmOpRequest) -> Result<Value, LlmOpsError> {
     // 构建给 LLM 的用户消息（含 op 指令 + 入参序列化）
     let payload = serde_json::to_string(&req.params).unwrap_or_else(|_| "{}".to_string());
     let user_prompt = format!("{}\n\n入参 JSON：\n{}", op.prompt_instruction(), payload);
