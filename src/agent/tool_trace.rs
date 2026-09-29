@@ -62,7 +62,6 @@ const RM_DANGEROUS_FLAGS: &[&str] = &["-rf", "-fr", "-r"];
 /// 子串级检测只在应用采集侧(零子串谓词纪律
 /// 仅约束规则层),命中打 `domain:<域名>` 旗标,由 server 层规则以
 /// `exists(danger_hits)` 判定 enforce——与危险程序打标同链路。
-
 /// 危险命令检测:程序/旗标为词级 token 匹配(非裸子串——防
 /// `cat shutdown.log` 类误伤),违禁域为子串级扫描(域名串特异性高,
 /// 且违禁域为合规红线,fail-closed 方向误伤只影响轨迹入链形态)。

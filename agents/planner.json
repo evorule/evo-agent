@@ -9,5 +9,10 @@
   "max_steps": 2,
   "context_window_tokens": 204800,
   "step_timeout_secs": 120,
-  "tools": []
+  "tools": [],
+  "memory": {
+    "type": "none",
+    "namespace": "planner",
+    "summary_model": "MiniMax-M2.5"
+  }
 }

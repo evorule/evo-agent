@@ -13,5 +13,10 @@
     "file_read",
     "search_files",
     "file_list"
-  ]
+  ],
+  "memory": {
+    "type": "none",
+    "namespace": "researcher",
+    "summary_model": "MiniMax-M2.5"
+  }
 }
