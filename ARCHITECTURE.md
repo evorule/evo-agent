@@ -6,9 +6,9 @@
 
 evo-agent 是在 evorule 反应式执行引擎之上构建的 AI Agent 编排层。它不重新发明状态机,也不内嵌 LLM 客户端 — 所有 LLM 调用、工具调用、记忆读写都转成 evorule 的 `IoRequest` 事件,由 evorule 反应器负责执行、审计、回滚。
 
-**库形态 vs 服务形态**:evorule 引擎上存在两种 Agent 形态——**库形态**的大脑主控运行时(同进程、共享类型、零 HTTP,见内部仓)与 evo-agent 的**服务形态** HTTP 解耦编排层(跨进程、JSON 通讯、19 个 evorule 端点)。两者都把 evorule 作为"身体",但绑定深度与适用场景不同。
+**库形态 vs 服务形态**:evorule 引擎上存在两种 Agent 形态——**库形态**的大脑主控运行时(同进程、共享类型、零 HTTP,见内部仓)与 evo-agent 的**服务形态** HTTP 解耦编排层(跨进程、JSON 通讯、40 个 evorule 端点方法透传)。两者都把 evorule 作为"身体",但绑定深度与适用场景不同。
 
-**项目状态**:`v0.1.0` (2026-07-20),158/158 单元测试通过,完整 Fact 闭环 + 三层记忆 + DAG 工作流 + 3 层安全模型已落地。
+**项目状态**:`v0.2.0` (2026-09-27),1214 项测试通过(单元 1177 + 集成 34 + doc 3,0 失败),完整 Fact 闭环 + 三层记忆 + DAG 工作流 + plan-execute + 3 层安全模型 + 内置 IDE 工作台已落地。
 
 ---
 
@@ -75,9 +75,9 @@ evorule 引擎执行规则前必须加载一份 rule_set 作为运行宪法。**
 | **ContextWindowManager** | `src/agent/context_window.rs` | Token 计数 + 消息裁剪 |
 | **OutputValidator** | `src/agent/output_validator.rs` | LLM 输出 JSON Schema 校验 |
 | **MemoryEventStore** | `src/agent/memory_event/store.rs` | 结构化记忆事件 + 因果链 |
-| **EvoruleApiClient** | `src/api/evorule_client.rs` | 19 个 evorule 端点透传 |
-| **AgentApi** | `src/api/agent_api.rs` | evo-agent 自有 HTTP 服务(3 个端点) |
-| **builtin_tools** | `src/builtin_tools/*` | 6 个内置工具 + 3 层安全模型 |
+| **EvoruleApiClient** | `src/api/evorule_client.rs` | 40 个 evorule 端点方法透传(另有 WorkspaceApiClient) |
+| **AgentApi** | `src/api/agent_api.rs` | evo-agent 自有 HTTP 服务(37 条路由,见 §9) |
+| **builtin_tools** | `src/builtin_tools/*` | 15 个内置工具 + 3 层安全模型 |
 | **MCP 集成** | `src/mcp/*` | Model Context Protocol 客户端(stdio) |
 
 ---
@@ -114,7 +114,7 @@ evorule 引擎执行规则前必须加载一份 rule_set 作为运行宪法。**
 |---|---|---|
 | **active** | 白名单,直接执行,无需请示 | `cargo` / `git` / `ls` / `cat` 等 8 个 |
 | **candidate** | 备选,LLM 想用 → 返回 proposal → 用户批 → 再执行 | `rm` / `mv` / `sed` / `chmod` 等 20 个 |
-| **blocked** | 永不允许(逃逸出口 / 不可逆破坏) | `sudo` / `bash` / `python` / `curl` / `kill` 等 28 个 |
+| **blocked** | 永不允许(逃逸出口 / 不可逆破坏) | `sudo` / `bash` / `python` / `curl` / `kill` 等 35 个 |
 
 **`propose` 协议**(统一格式,所有 candidate 一致):
 ```json
@@ -135,10 +135,12 @@ evorule 引擎执行规则前必须加载一份 rule_set 作为运行宪法。**
 4. **No shell**:`shell_exec` 走 `std::process::Command` 直接 exec,不经任何 shell 解析
 5. **SSRF 防护**:`http_get` 硬编码黑名单(127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, IPv6 fe80/fc00/::1)
 
-**6 个内置工具**:
-- `file_read` / `file_list` / `file_write` / `search_files` — 文件 I/O(沙箱)
-- `shell_exec` — 8 active + 20 candidate + 28 blocked
+**15 个内置工具**(`default_tool_specs()`,实测 `tools list` ACTIVE 段):
+- `file_read` / `file_list` / `file_write` / `file_create` / `file_move` / `file_delete` — 文件 I/O(沙箱)
+- `search_files` / `grep_files` — 文本搜索
+- `shell_exec` — 8 active + 20 candidate + 35 blocked
 - `http_get` — 6 active hosts + SSRF 防护
+- `git_status` / `git_diff` / `git_log` / `git_stage` / `git_commit` — 只读 git + 安全写
 
 ---
 
@@ -293,7 +295,7 @@ generic 不含标记知识,改协作纪律 = 改规则零发版。
 **桥接流程**(`AgentRunner::from_definition`,`src/agent/runner.rs:427-`):
 1. `AgentDefinitionManager::load("researcher")` 加载 JSON
 2. 构造 `EvoruleApiClient`(token 解析: `EVORULE_SERVICE_TOKEN` 优先, 缺省回退 `EVORULE_AUTH_TOKEN`)
-3. `default_safe_toolkit(workdir)` 装 6 个工具
+3. `default_safe_toolkit(workdir)` 装 15 个内置工具(规则工具按 agent 白名单追加)
 4. `AgentRunner::from_definition(def, client, tool_handler)` 一步组装
 5. 早失败校验:`def.tools` 全部已在 `tool_handler` 注册(否则 `Err`)
 
@@ -309,7 +311,7 @@ generic 不含标记知识,改协作纪律 = 改规则零发版。
 
 | # | 原则 | 落地方式 |
 |---|---|---|
-| 1 | **透明** | `tools list` 列全部 6 工具 + 3 层分类;`config` 打印完整合并后配置;`validate` 跑前告知 |
+| 1 | **透明** | `tools list` 列全部 15 内置工具 + 3 层分类;`config` 打印完整合并后配置;`validate` 跑前告知 |
 | 2 | **可选** | active / candidate / blocked 三层(不是 2 选 1) |
 | 3 | **可控** | `propose` 协议 + 候选工具默认拒绝 + `--auto-approve-candidates` 显式 flag |
 | 4 | **可回放** | evorule fact log 录像带 + replay / diff / rewind 端点 |
@@ -339,24 +341,35 @@ generic 不含标记知识,改协作纪律 = 改规则零发版。
 | | `POST /agents/{type}/run` | 非流式执行(内部消费流式 ReAct 至 Done,工具真实执行,返回聚合结果) |
 | | `POST /agents/{type}/run/stream` | SSE 流式执行(AgentEvent 逐帧) |
 | | `POST /agents/{type}/cancel` `POST /agents/{type}/approve` | 取消 / 审批(按 session_id) |
+| 记忆系统 | `GET /agents/{type}/memory/evidence` `GET /agents/{type}/memory/recall` | 记忆证据查询 / 语义召回 |
 | 会话与对话 | `GET /api/sessions` `GET /api/sessions/{id}/transcript` | 本地会话索引 / 消息历史投影(facts 权威读;WS 通道会话) |
 | | `GET /api/sessions/{id}/ws` | WebSocket 双向流(工作台真实通道) |
 | | `GET /api/sessions/{id}/events` `GET /api/sessions/{id}/replay` | 记忆事件查询 / 因果回放 |
 | | `GET /api/sessions/{id}/evolution-signals` | 进化信号只读代理 |
 | 工作台 | `GET|PUT /api/workbench/config` | 工作台配置(快照保留期) |
-| 文件面 | `GET /api/files/list` `GET /api/files/read` `PUT /api/files/write` | IDE 文件操作(同一沙箱与校验) |
+| | `GET /api/workbench/settings` `GET /api/workbench/settings/schema` | 工作台设置(三层合并 Default→User→Workspace) / 设置 schema(前端渲染与校验单源) |
+| 文件面 | `GET /api/files` `GET /api/files/list` `GET /api/files/read` | IDE 文件操作(同一沙箱与校验) |
+| | `PUT /api/files/write` `POST /api/files/create` `POST /api/files/move` | 写 / 建 / 移 |
+| | `POST /api/files/replace` `GET /api/files/search` | 替换 / 搜索 |
+| Git 面 | `GET /api/git/status` `GET /api/git/diff` `GET /api/git/identity` | 双栏 status / HEAD vs 工作区 diff / 提交身份预检 |
+| | `POST /api/git/stage` `POST /api/git/unstage` `POST /api/git/commit` `POST /api/git/discard` | 暂存 / 取消暂存 / 提交(hooks 分流) / 丢弃(前端强制确认) |
+| 运维操作 | `POST /ops/{operation}` | 运行时运维操作(如快照清理触发) |
 
-> 会话链上权威在 evorule-server(`GET {server}/api/sessions/{id}/state`);evo-agent 本地索引覆盖 WS 通道与 REST run/stream 端点会话。
+> 会话链上权威在 evorule-server(`GET {server}/api/sessions/{id}/state`);evo-agent 本地索引覆盖 WS 通道与 REST run/stream 端点会话。路由正本以 `src/api/agent_api.rs::router_with_auth` 为准(实测 37 条)。
 
-### 通过 `EvoruleApiClient` 透传到 evorule-server(19 个端点)
+### 通过 `EvoruleApiClient` 透传到 evorule-server(40 个方法)
 
-- **会话管理**:`create_session` / `fork_session` / `list_sessions`
-- **命令**:`command` / `update_payload` / `state`
-- **时间机器**:`replay` / `rewind` / `diff`
-- **审计**:`audit` / `audit_verify` / `get_causal_chain`
-- **共享 Fact**:`shared_facts` / `shared_fact_source` / `shared_fact_used_by`
-- **集群**:`join` / `leave` / `cluster_status`
-- **I/O 提交**:`submit_io_response` / `record_used_at_startup` / `get_used_at_startup`
+- **会话管理**:`create_session` / `create_session_fork` / `get_state`
+- **命令与载荷**:`submit_command` / `submit_io_response` / `update_payload`
+- **Fact 查询**:`get_facts` / `get_shared_facts` / `get_shared_fact_source` / `get_sessions_using_fact` / `mark_shared_facts_rollup`
+- **审计链**:`get_audit_report` / `verify_audit` / `verify_audit_typed` / `get_causal_chain` / `get_causal_chain_typed`
+- **时间机器**:`rewind` / `replay` / `replay_range` / `diff`
+- **I/O 提交**:`record_used_at_startup` / `get_used_at_startup` / `subscribe_events`
+- **调试**:`get_debug_phase` / `get_debug_pending_io` / `get_debug_queue`
+- **服务与平台**:`list_services` / `invoke_service` / `verify_platform_token` / `get_l2_inventory` / `get_evolution_signals`
+- **知识库**:`knowledge_datasets` / `knowledge_entries` / `knowledge_entry`(WorkspaceApiClient)
+
+> 另有 `WorkspaceApiClient`(`src/api/workspace_client.rs`,33 个方法,含 bundle 导入/清单)。
 
 ### WebSocket 流(`src/api/ws_handler.rs`)
 
@@ -369,7 +382,7 @@ generic 不含标记知识,改协作纪律 = 改规则零发版。
 | 抽象 | Trait | 用途 | 0.1.0 状态 |
 |---|---|---|---|
 | `LlmHandler` | `async_trait` | LLM 调用抽象 | **stub**(返回模拟响应,用户需自行实现) |
-| `ToolHandler` | `async_trait` | 工具注册与调度 | 6 个内置工具已注册 |
+| `ToolHandler` | `async_trait` | 工具注册与调度 | 15 个内置工具已注册 |
 | `ApprovalCallback` | `async_trait` | 候选工具审批 | `CliApproval` / `HttpApproval` / `DenyAll` / `AutoApprove` |
 | `EventCallback` | `async_trait` | 结构化事件回调链 | `LoggingCallback` / `MetricsCallback` / `CallbackChain` |
 | `TokenCounter` | `async_trait` | 上下文窗口计数 | `ApproxTokenCounter`(无外部依赖,CJK-aware) |
@@ -387,7 +400,7 @@ serde / serde_json = "1"                                # JSON 序列化
 prometheus = "0.13"                                     # 指标
 tracing = "0.1"                                         # 结构化日志
 clap = "4"                                              # CLI
-jsonschema = "0.18"                                     # LLM 输出 JSON Schema 校验(G11)
+jsonschema = "0.21"                                     # LLM 输出 JSON Schema 校验(G11)
 tokio-util = "0.7"                                      # CancellationToken(G6)
 subtle = "2"                                            # 恒定时间比较(防时序攻击,G7)
 rustyline = "14"                                        # REPL 行编辑(G15)
@@ -403,16 +416,21 @@ rustyline = "14"                                        # REPL 行编辑(G15)
 |---|---|
 | `run <goal>` | 跑 agent(给一个 goal + 可选 agent 类型) |
 | `list` | 列出 `agents/` 目录下的所有 agent |
-| `tools list` | 列出 6 个工具(active/candidate/blocked 3 层) |
+| `tools list` | 列出 15 个内置工具(active/candidate/blocked 3 层) |
 | `tools show <name>` | 显示单个工具的 3 层详情 |
 | `validate <agent>` | 校验 agent.json 是否合法 |
 | `config` | 显示合并后的配置(default + user + project + env) |
+| `serve` | 启动 HTTP server(含 IDE 工作台托管) |
+| `patrol` | 进化巡视(信号探查→起草→闸门→提名,一次性任务) |
+| `workflow <id>` | 执行多 agent DAG 工作流(`--plan-execute` 走 plan-execute 全链路) |
+| `repl` | REPL 交互模式(复用同一 session) |
+| `replay` | 回放 session 的记忆事件链 |
 
 ---
 
 ## 13. 测试
 
-- **单元测试**:158/158 通过
+- **单元测试**:1214 项通过(单元 1177 + 集成 34 + doc 3,0 失败,实测 2026-09-29)
 - **集成测试**:`tests/integration_test.rs`(mockito mock evorule-server,260 行)
   - `auto_recall`(启动时拉取 shared facts)
   - ReAct 主循环的 SSE 事件驱动

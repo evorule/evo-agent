@@ -102,7 +102,10 @@ impl ToolHandler {
             .await
             .map_err(|_| {
                 format!(
-                    "tool '{tool_name}' timed out after {}s",
+                    "tool '{tool_name}' timed out after {}s. Hint: for reading a specific file use 'file_read'; \
+                     for listing a directory use 'file_list'; full-tree search ('search_files' / 'grep_files') \
+                     may be slow on large workspaces — pass 'dir' to scope it or 'exclude' to skip big directories \
+                     (default excludes: target, node_modules, .git, .evo-trash, data)",
                     TOOL_TIMEOUT.as_secs()
                 )
             })?

@@ -1426,6 +1426,12 @@ impl AgentRunner {
             // best-effort 从 evorule 同步已有事件(HTTP 失败不阻塞)
             let _ = store.sync_from_evorule().await;
         }
+        // 修复(2026-09-29 实测):此前注释承诺"session_id 通过 set_session_id 设置"
+        // 但从未调用 → sediment 写 Shared 域全部 SessionNotSet。
+        // 与 MemoryEventStore 对齐,会话建立后同步到 MemoryManager。
+        if let Some(mem) = self.memory.as_mut() {
+            mem.set_session_id(&session_id);
+        }
 
         // G17:session 指标 — sessions_total + sessions_active(RAII guard 保证所有返回路径 dec)
         if let Some(m) = &self.metrics {
@@ -3122,6 +3128,12 @@ impl AgentRunner {
                     }
                 }
             };
+
+            // 修复(2026-09-29 实测):MemoryManager.session_id 同步(与 run() 对齐),
+            // sediment Shared 域写入依赖此绑定。
+            if let Some(mem) = runner.memory.as_mut() {
+                mem.set_session_id(&session_id);
+            }
 
             // G17:session 活跃度守卫(新建 / 复用均持有,stream! 块结束时 dec)
             let _session_guard = SessionActiveGuard::new(runner.metrics.clone());

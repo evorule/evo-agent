@@ -720,11 +720,30 @@ mod tests {
                 .as_array()
                 .unwrap_or_else(|| panic!("{file} missing tools array"));
             assert!(!tools.is_empty(), "{file} has empty tools whitelist");
+            // 服务工具豁免：config/service_tools 白名单项由运行时服务发现解析
+            // （register_service_tools 经 GET /api/services 注册），单测环境无
+            // 真实 evorule-server，union 不含服务工具属预期；若 agent 白名单
+            // 声明了既不在 union 也不在 service_tools 白名单的名字 → 判失败。
+            let svc_whitelist: std::collections::HashSet<String> = {
+                let cfg: toml::Value =
+                    toml::from_str(include_str!("../../evo-agent.toml")).unwrap();
+                cfg["evorule"]["service_tools"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            // delegate 由 runner 运行期注入（runner.rs register_delegate_tool），
+            // 不在 serve union toolkit，属预期。
+            let injected = ["delegate"];
             for tool in tools {
                 let name = tool.as_str().unwrap();
                 assert!(
-                    union.has_tool(name),
-                    "{file} whitelists tool '{name}' which is not in the serve union toolkit"
+                    union.has_tool(name) || svc_whitelist.contains(name) || injected.contains(&name),
+                    "{file} whitelists tool '{name}' which is neither in the serve union toolkit nor the service_tools whitelist"
                 );
             }
         }

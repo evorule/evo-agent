@@ -97,17 +97,27 @@ mod tests {
         let json_str = include_str!("../../agents/rule-copilot.json");
         let def: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let tools = def["tools"].as_array().unwrap();
-        let spec_names: std::collections::HashSet<String> =
+        let mut spec_names: std::collections::HashSet<String> =
             rule_tool_specs().iter().map(|s| s.name.clone()).collect();
+        // 服务工具豁免：config_persist/rule_sandbox 由 service_tools 白名单
+        // 注册（运行时服务发现解析），不属 rule_tool_specs 属预期。
+        let cfg: toml::Value = toml::from_str(include_str!("../../evo-agent.toml")).unwrap();
+        if let Some(services) = cfg["evorule"]["service_tools"].as_array() {
+            for v in services {
+                if let Some(s) = v.as_str() {
+                    spec_names.insert(s.to_string());
+                }
+            }
+        }
         for tool in tools {
             let name = tool.as_str().unwrap();
             assert!(
                 spec_names.contains(name),
-                "rule-copilot.json tool '{}' not in rule_tool_specs",
+                "rule-copilot.json tool '{}' not in rule_tool_specs nor service_tools",
                 name
             );
         }
-        assert_eq!(tools.len(), 23, "expected 23 tools in rule-copilot.json");
+        assert_eq!(tools.len(), 25, "expected 25 tools in rule-copilot.json");
     }
 
     #[test]

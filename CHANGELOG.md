@@ -48,7 +48,7 @@
 - **记忆系统**（P0+P1）— TTL / 消息持久化 / stable 层读侧去重（latest-wins + 墓碑抑制 + 新鲜度排序）/ 对账与离线兜底复活 / events 评分 CJK 感知分词（中文召回退化修复）/ 事件提取接线 sediment / Shared 读路径与召回同源 / token 估算 CJK 校准 / 裁剪降级可见；memory cache 定期校验与真相源对齐（server wins）
 - **审计链加固** — 「审计即记忆」结构性修复（SafetyAuditor 接入召回 / AuditedLlm 生产必挂 / 吞错改 warn 留痕）；sidecar 建链瞬态错误有界重试；召回降级 fail-visible（degradation_notices 进 prompt 与审计链）；rollup 标记失败重试；审批链留痕与身份验证；共享事实 `origin_fact_id` 双兼容消费
 - **plan-execute 与工作流引擎** — plan-execute 外层驱动循环与 planner 节点落地；workflow_dag v1.1 节点级条件分支 `run_when`；v1.2 物化器、compute 纯函数节点与 replan 触发判定；enforce 一票否决与 planner 重试面、静态拦截、成本埋点（tokens_used/replan_tokens/repeated_nodes）
-- **工具面扩容（42 工具）** — bundles 部署闭环 + knowledge 数据面；git 工具五件套（gitRead/gitWrite 双层级注册）与 Git REST 端点；file_create/file_move/file_delete 与开关切换；grep_files 项目内容搜索；服务消费桥（发现 server 插件服务注册为代理工具，动态 schema 带参调用）
+- **工具面扩容（42 工具，发布中期计数；最终口径：规则工具 spec 45 / serve 面暴露 41 = 内置 15 + 规则 26，勘误见 README「规则管理工具集」）** — bundles 部署闭环 + knowledge 数据面；git 工具五件套（gitRead/gitWrite 双层级注册）与 Git REST 端点；file_create/file_move/file_delete 与开关切换；grep_files 项目内容搜索；服务消费桥（发现 server 插件服务注册为代理工具，动态 schema 带参调用）
 - **自进化系统** — L2 约束（元规则）只读消费面；自进化工具面（evolution_signals/rule_promote）真实 LLM 全链 E2E；进化巡视任务模式（patrol 子命令）与草稿提交期 enforce 语义校验
 - **内置 IDE 工作台**（Svelte+Monaco，serve 托管 web/dist）— 命令面板与全局快捷键路由；设置体系（两级合并/缓存回放/schema 表单/JSON 编辑/键位迁移）；文件树与文件 API（创建/重命名/删除/拖拽移动/WS 实时刷新）；全局搜索替换（预览+原子应用）；Git 基础面（双态变更列表/装饰/编辑器 diff 页签）；诊断与问题面板（单源诊断模型/JSON 校验/Markdown lint/问题导航，消费契约冻结）；quick open；会话列表与历史恢复；多标签编辑器
 - **serve API 面** — run/stream 工具执行回路真实化；`GET /version` 运行体身份端点（与启动横幅单一事实源）；LLM 命名操作端点（/ops）；LLM 配置状态端点；意图裁定独立会话通道（误拦修复）与悬挂 io_request 关闭；流式 Violation 分支消费

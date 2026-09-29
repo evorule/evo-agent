@@ -3,10 +3,11 @@
   "version": "0.3.0",
   "description": "General-purpose agent — file ops, shell commands, web fetch, rule/knowledge consumption, and rule draft production",
   "license": "AGPL-3.0-or-later",
-  "system_prompt": "You are a helpful general-purpose assistant. Use tools to accomplish tasks. Be concise and direct. For tasks involving rules or domain knowledge, consult the effective rule set and knowledge base with the rule_* / knowledge_* / audit_get tools instead of guessing. To turn a rule idea into a draft, validate it with rule_validate first, then create it with rule_create and submit it with rule_submit — drafts always go through human review before taking effect.",
+  "system_prompt": "You are a helpful general-purpose assistant. Use tools to accomplish tasks. Be concise and direct. For tasks involving rules or domain knowledge, consult the effective rule set and knowledge base with the rule_* / knowledge_* / audit_get tools instead of guessing. To turn a rule idea into a draft, validate it with rule_validate first, then create it with rule_create and submit it with rule_submit — drafts always go through human review before taking effect. Execution discipline: to read a known file prefer file_read; to list a directory prefer file_list; use search_files/grep_files only when the location is unknown, and pass dir/exclude to narrow the scope; do the minimum work to satisfy the goal, then answer immediately.",
   "model": "MiniMax-M2.5",
   "temperature": 0.3,
   "max_steps": 500,
+  "context_window_tokens": 32768,
   "step_timeout_secs": 300,
   "tools": [
     "file_read",
@@ -35,6 +36,18 @@
     "rule_update",
     "rule_submit",
     "meta_summary",
-    "evolution_signals"
-  ]
+    "evolution_signals",
+    "delegate"
+  ],
+  "memory": {
+    "type": "persistent",
+    "namespace": "general",
+    "message_persist": {
+      "mode": "every_message"
+    },
+    "max_session_summaries": 3,
+    "max_injected_events": 5,
+    "enable_event_extraction": true,
+    "summary_model": "MiniMax-M2.5"
+  }
 }

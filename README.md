@@ -5,7 +5,7 @@
 [![CI](https://github.com/evorule/evo-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/evorule/evo-agent/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.74%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.0-green.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.2.0-green.svg)](Cargo.toml)
 
 ---
 
@@ -27,7 +27,7 @@
 
 ![evo-agent CLI 概览](docs/evo-agent-cli.gif)
 
-*真实终端录制：`evo-agent list` / `tools show` / `validate` / `tools list` —— 6 个内置工具的 3 层安全模型（active 白名单 / candidate 待批 / blocked 永不）。*
+*真实终端录制：`evo-agent list` / `tools show` / `validate` / `tools list` —— 15 个内置工具的 3 层安全模型（active 白名单 / candidate 待批 / blocked 永不）。*
 
 ---
 
@@ -42,7 +42,7 @@
 | **会话沉淀** | 会话结束时自动写入摘要 + 稳定事实到共享空间 |
 | **工具注册中心** | `ToolRegistry` + `ToolFunction` trait，任何 `async fn(JsonValue) -> Result<JsonValue, String>` 都能注册 |
 | **3 层安全模型** | active（白名单）/ candidate（待批）/ blocked（永不），含 SSRF 防护 + 工作目录沙箱 |
-| **规则管理工具集** | 45 个工具：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + meta 1 + evolution 2 |
+| **规则管理工具集** | 45 个工具（spec 数，测试锁定；serve 面默认暴露 41 = 内置 15 + 规则 26，sandbox/dataset/publish/production/bundles 共 19 个为已定义未入 serve 面的高级工具）：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + meta 1 + evolution 2 |
 | **工作流引擎** | DAG 拓扑编排多 Agent，同层并行 + 跨层串行 + 模板渲染 |
 | **MCP 客户端** | 接入 Model Context Protocol 工具生态（stdio 传输） |
 | **上下文窗口管理** | 按 token 数裁剪历史消息，保留 system + 最近若干轮 |
@@ -90,6 +90,16 @@ Evo-Agent 是独立的应用层，通过 HTTP API 与 evorule 引擎对话：
 ---
 
 ## 快速开始
+### 使用建议（避免大工作区超时）
+
+- **用独立 workdir 跑真实任务**：不要把源码仓（含 `target/` 等编译产物）直接当 agent 工作目录；
+  建议 `evo-agent run --workdir <你的项目目录>` 指向干净的项目目录。
+- **读文件优先 `file_read`**，列目录用 `file_list`；只有在不确定文件位置时才用 `search_files` / `grep_files`。
+- **全树搜索默认排除大目录**：`search_files` / `grep_files` 默认跳过 `target` / `node_modules` / `.git` / `.evo-trash` / `data`；
+  还可传 `exclude`（search_files）或 `excludeGlobs`（grep_files）追加排除，例如 `["vendor", "dist"]`。
+- **上下文窗口已显式配置**：各 agent 定义 `agents/<name>.json` 已声明 `context_window_tokens = 32768`
+  （MiniMax-M2.5 支持 204800），长任务历史不易被裁剪；可按模型实际能力调整。
+
 
 ### 前置条件
 
@@ -179,7 +189,7 @@ cargo run --release -- serve --port 8081
 ### 跑一个 Agent
 
 ```bash
-curl -X POST http://127.0.0.1:8081/api/agent/run \
+curl -X POST http://127.0.0.1:8081/agents/researcher/run \
   -H "Content-Type: application/json" \
   -d '{"agent_type": "researcher", "goal": "总结当前目录的 README"}'
 ```
@@ -191,7 +201,7 @@ curl -X POST http://127.0.0.1:8081/api/agent/run \
 ```text
 evo-agent run <goal>                    # 跑 agent（给一个 goal + 可选 agent 类型）
 evo-agent list                           # 列出 agents/ 目录下的所有 agent
-evo-agent tools list                     # 列出 6 个内置工具（3 层安全模型）
+evo-agent tools list                     # 列出 15 个内置工具（3 层安全模型）
 evo-agent tools show <name>              # 显示单个工具的 active/candidate/blocked 详情
 evo-agent validate <agent>               # 校验 agent.json 是否合法
 evo-agent config                         # 显示合并后的配置
@@ -384,7 +394,7 @@ Agent 配置从 `agents/{type}.json` 加载：
     "max_injected_events": 5,
     "enable_event_extraction": true
   },
-  "context_window_tokens": 8192,
+  "context_window_tokens": 32768,
   "parallel_tools": 1
 }
 ```
@@ -393,9 +403,9 @@ Agent 配置从 `agents/{type}.json` 加载：
 
 | Agent | 说明 | 工具 |
 |-------|------|------|
-| `general` | 通用 Agent — 文件操作 + Shell + Web + 规则消费与起草（白名单 20 工具，含 `evolution_signals` 只读信号感知） | file_*, search_files, shell_exec, http_get, rule_list/get/versions/version_get/validate/create/update/submit, knowledge_*, audit_get, meta_summary, evolution_signals |
+| `general` | 通用 Agent — 文件操作 + Shell + Web + 规则消费与起草（白名单 28 工具，含 `evolution_signals` 只读信号感知） | file_*（6）, search_files, grep_files, git_status/diff/log, shell_exec, http_get, rule_list/get/versions/version_get/validate/create/update/submit, knowledge_datasets/search/entry_get, audit_get, meta_summary, evolution_signals |
 | `researcher` | 研究 Agent — 只读搜索 | file_read, search_files, file_list |
-| `rule-copilot` | 规则协作 Agent — 23 个规则管理工具（白名单） | ws_*, rule_*, audit_*, translate_*, sandbox_*, dataset_*, publish_*, knowledge_*, meta_*, evolution_signals, rule_promote |
+| `rule-copilot` | 规则协作 Agent — 23 个规则管理工具（白名单，实测） | ws_list, ws_create, rule_list/get/create/update/versions/version_get/submit/activate/block/archive/fork/reload, rule_to_transform, rule_to_conditional, rule_validate, audit_get, audit_verify, session_rewind, meta_summary, evolution_signals, rule_promote |
 
 ---
 
@@ -445,20 +455,19 @@ Agent 配置从 `agents/{type}.json` 加载：
 
 | 层级 | 行为 | 示例 |
 |------|------|------|
-| **ACTIVE** | 直接执行，无需审批 | file_read, file_list, file_write, search_files, shell_exec（8 命令白名单）, http_get（6 主机白名单） |
-| **CANDIDATE** | LLM 想用 → 返回 proposal → 用户审批 → 执行 | rm, mv, curl 等 20+ shell 命令，任意公开 HTTP host |
-| **BLOCKED** | 永不批准 | sudo, python, bash 等 28+ 逃逸命令，SSRF 黑名单 IP 段 |
+| **ACTIVE** | 直接执行，无需审批 | file_read/file_list/file_write/file_create/file_move/file_delete, search_files/grep_files, git_status/git_diff/git_log/git_stage/git_commit, shell_exec（8 命令白名单）, http_get（6 主机白名单） |
+| **CANDIDATE** | LLM 想用 → 返回 proposal → 用户审批 → 执行 | rm, mv, sed, chmod 等 20 个 shell 命令，任意公开 HTTP host |
+| **BLOCKED** | 永不批准 | sudo, python, bash, curl, kill 等 35 个逃逸命令，SSRF 黑名单 IP 段 |
 
-### 内置工具（6 个）
+### 内置工具（15 个）
 
 | 工具 | 说明 |
 |------|------|
-| `file_read` | 读取文件（工作目录沙箱，拒绝 `..` / 绝对路径 / symlink 逃逸） |
-| `file_list` | 列出目录内容 |
-| `file_write` | 写入文件 |
-| `search_files` | 按内容搜索文件 |
-| `shell_exec` | 执行 Shell 命令（白名单 + candidate 审批） |
-| `http_get` | HTTP GET 请求（主机白名单 + SSRF 防护） |
+| `file_read` / `file_list` / `file_write` / `file_create` / `file_move` / `file_delete` | 文件 I/O（工作目录沙箱，拒绝 `..` / 绝对路径 / symlink 逃逸） |
+| `search_files` / `grep_files` | 按内容搜索文件 |
+| `shell_exec` | 执行 Shell 命令（8 active + 20 candidate + 35 blocked 三层） |
+| `http_get` | HTTP GET 请求（6 主机白名单 + SSRF 防护） |
+| `git_status` / `git_diff` / `git_log` / `git_stage` / `git_commit` | git 只读 + 安全写（暂存/提交，拒绝危险 flag） |
 
 ### 治理写权开关（agentTools.governanceWrite）
 
@@ -548,10 +557,21 @@ port = 8081
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `GET` | `/api/agent/list` | 列出所有已注册 Agent 类型 |
-| `GET` | `/api/agent/{type}` | 查看指定 Agent 详细定义 |
-| `POST` | `/api/agent/run` | 启动一个 Agent 运行 |
-| `GET` | `/api/health` | 健康检查 |
+| `GET` | `/health` `/metrics` `/version` | 健康检查 / Prometheus 指标 / 运行体身份 |
+| `GET` | `/admin/llm-status` | LLM 配置只读状态（脱敏） |
+| `GET` | `/agents` `/agents/{type}` | 列出所有 Agent / 查看定义 |
+| `POST` | `/agents/{type}/run` | 启动一个 Agent 运行（同步） |
+| `POST` | `/agents/{type}/run/stream` | SSE 流式执行 |
+| `POST` | `/agents/{type}/cancel` `/agents/{type}/approve` | 取消 / 审批 |
+| `GET` | `/agents/{type}/memory/evidence` `/agents/{type}/memory/recall` | 记忆证据 / 语义召回 |
+| `GET` | `/api/sessions` `/api/sessions/{id}/transcript` `/api/sessions/{id}/ws` | 会话索引 / 消息历史 / WebSocket |
+| `GET` | `/api/sessions/{id}/events` `/api/sessions/{id}/replay` `/api/sessions/{id}/evolution-signals` | 记忆事件 / 因果回放 / 进化信号 |
+| `GET\|PUT` | `/api/workbench/config` `/api/workbench/settings` `GET /api/workbench/settings/schema` | 工作台配置 / 设置 / 设置 schema |
+| `GET/POST/PUT` | `/api/files/*` | 文件面（list/read/write/create/move/replace/search） |
+| `GET/POST` | `/api/git/*` | Git 面（status/diff/stage/unstage/commit/discard/identity） |
+| `POST` | `/ops/{operation}` | 运行时运维操作 |
+
+完整端点清单与协议见 [docs/API.md](docs/API.md)。
 
 ### 通过 ApiCore 透传到 evorule-server
 
@@ -726,19 +746,19 @@ evo-agent/
 │   │   ├── api_core.rs              # 共享 HTTP 基建（ApiCore + ApiError）
 │   │   ├── evorule_client.rs        # evorule-server 端点客户端
 │   │   ├── workspace_client.rs      # workspace 服务客户端
-│   │   ├── agent_api.rs             # /api/agent/* 路由
+│   │   ├── agent_api.rs             # 自有 HTTP 路由(/agents/* 与 /api/*)
 │   │   ├── serve_tools.rs           # serve 模式工具注册
 │   │   ├── ws_handler.rs            # WebSocket 双向流
 │   │   ├── auth.rs                  # Bearer 认证
 │   │   ├── metrics.rs               # Prometheus 指标
 │   │   └── mod.rs
-│   ├── builtin_tools/               # 6 个内置工具
-│   │   ├── file_read.rs
-│   │   ├── file_list.rs
-│   │   ├── file_write.rs
-│   │   ├── search_files.rs
-│   │   ├── shell_exec.rs
-│   │   ├── http_get.rs
+│   ├── builtin_tools/               # 15 个内置工具
+│   │   ├── file_read.rs / file_list.rs / file_write.rs / file_create.rs / file_move.rs / file_delete.rs
+│   │   ├── search_files.rs / grep_files.rs
+│   │   ├── shell_exec.rs            # 3 层命令安全模型(8 active / 20 candidate / 35 blocked)
+│   │   ├── http_get.rs              # 6 active hosts + SSRF 防护
+│   │   ├── git_tools.rs             # git_status / git_diff / git_log / git_stage / git_commit
+│   │   ├── fs_safety.rs             # 沙箱路径校验(绝对路径/../symlink 逃逸)
 │   │   ├── delegate_tool.rs         # Agent 委托工具
 │   │   └── mod.rs
 │   ├── rule_tools/                  # 45 个规则管理工具
@@ -773,7 +793,7 @@ evo-agent/
 
 ## 当前状态 / 已知限制
 
-基于 2026-08 完成度核查：
+基于 2026-09 完成度核查：
 
 **已就绪（曾被报告误判为"未修"的项）**
 
@@ -784,14 +804,14 @@ evo-agent/
 | 共享路径格式（L-2）/ 上下文窗口字段（L-4）/ sediment 写入前缀（L-6） | ✅ | evo-agent 侧均已修复，与 recall 三前缀完全匹配 |
 | 记忆召回顺序（C2） | ✅ | `runner.rs` 已修复：recall 在 `build_system_prompt` 之前 |
 | 角色 1/3 `call_external` | ✅ | evorule-server 侧就绪，挂载 `service_registry.json` + `--allow-loopback` 即可跑通（已端到端验证） |
+| IDE 工作台 UI 联调 | ✅ | 内置工作台（文件树/编辑器/对话侧栏/审计抽屉）+ Git 面 + 设置面已实现并托管于 serve |
 
 **仍未完成 / 设计取舍**
 
 | 项 | 状态 | 说明 |
 |----|------|------|
 | 集群协作（E2 / cluster） | ❌ 设计移除 | 多 reactor 协作原语已移出机制层，定位为应用层功能；evorule-server 路由已无 cluster 端点 |
-| Runner 拆分（Phase 2） | ⏳ | `runner.rs` 仍为约 2600 行单文件，未拆为子模块 |
-| UI 联调 | ⏳ | 无前端联调，本轮仅后端 + CLI 验证 |
+| Runner 拆分（Phase 2） | ⏳ | `runner.rs` 仍为约 4000 行单文件，未拆为子模块 |
 | 编译告警 | ⚠️ | 主体为 `missing_docs`；另有少量 clippy 代码质量 lint 待清理 |
 
 > 规则管理工具集总数为 **45 个**（workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + meta 1 + evolution 2），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
@@ -806,7 +826,7 @@ serde / serde_json = "1"      # JSON 序列化
 clap = "4"                    # CLI 参数解析
 tracing = "0.1"               # 结构化日志
 prometheus = "0.13"           # 指标
-jsonschema = "0.18"           # JSON Schema 校验
+jsonschema = "0.21"           # JSON Schema 校验
 rustyline = "14"              # REPL 行编辑
 ```
 

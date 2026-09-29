@@ -187,11 +187,16 @@ async fn run_llm_op(op: &Operation, req: &LlmOpRequest, model: &str) -> Result<V
         Ok(mock) => LlmHandler::mock(&mock),
         Err(_) => LlmHandler::with_defaults(),
     };
-    let params = json!({
-        "model": model,
+    // 修复(2026-09-29 实测发现):字面量 "default" 不是真实模型名,
+    // 直接下发会被 LLM API 拒绝(model=default 必失败)。仅当调用方
+    // 显式指定 model 时才下发;否则缺省,由 LlmHandler 使用 default_model。
+    let mut params = json!({
         "prompt": user_prompt,
         "temperature": 0.2,
     });
+    if let Some(m) = req.model.as_deref() {
+        params["model"] = json!(m);
+    }
     let tcb_params = params.clone();
 
     let io = llm

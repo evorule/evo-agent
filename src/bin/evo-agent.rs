@@ -15,7 +15,7 @@
 //! ```text
 //! evo-agent run <goal>           # 跑 agent
 //! evo-agent list                  # 列出可用 agent 类型
-//! evo-agent tools list            # 列出 6 个工具(active/candidate/blocked)
+//! evo-agent tools list            # 列出 15 个内置工具(active/candidate/blocked)
 //! evo-agent tools show <name>     # 显示工具详情
 //! evo-agent validate <agent>      # 校验 agent.json
 //! evo-agent config                # 显示合并后的配置
@@ -46,7 +46,7 @@
 //! # 3) 列出可用 agent
 //! evo-agent list
 //!
-//! # 4) 看 6 工具的 3 层安全模型
+//! # 4) 看 15 个内置工具的 3 层安全模型
 //! evo-agent tools list
 //! ```
 
@@ -1432,7 +1432,11 @@ fn cmd_tools(_workdir: &Path, action: ToolsAction) -> ExitCode {
 }
 
 fn tools_list() -> ExitCode {
-    println!("=== 6 Built-in Tools (3-layer security model) ===\n");
+    let builtin_count = default_tool_specs().len();
+    println!(
+        "=== {} Built-in Tools (3-layer security model) ===\n",
+        builtin_count
+    );
 
     println!("[ACTIVE] 直接执行(无需请示):");
     for spec in default_tool_specs() {
