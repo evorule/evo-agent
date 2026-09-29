@@ -128,7 +128,7 @@ pub struct AgentDefinitionResponse {
     pub memory_config: Option<crate::agent::MemoryConfig>,
     /// G2:生效上下文窗口 token 数(定义未声明时为默认 8192)
     ///
-    /// O-201:窗口值是裁剪行为的核心参数,运行时须有权威读口——
+    /// 窗口值是裁剪行为的核心参数,运行时须有权威读口——
     /// 换模型/调窗口后的验收、裁剪误触发排障的第一手核对面。
     pub context_window_tokens: usize,
     /// 实际可用输入预算 = `context_window_tokens - context_window_tokens / 4`

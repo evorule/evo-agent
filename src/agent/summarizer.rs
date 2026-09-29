@@ -37,17 +37,17 @@ use crate::io_handlers::LlmHandler;
 /// G10:摘要触发的最小裁剪消息数(Q9 Strategy B,默认 5)
 pub const DEFAULT_SUMMARY_THRESHOLD: usize = 5;
 
-/// G10:摘要最小 token 数(输入极小时的下限;O-199 修复后实际值随输入规模自适应)
+/// G10:摘要最小 token 数(输入极小时的下限;长会话截断缺陷修复后实际值随输入规模自适应)
 ///
-/// O-199:固定 512 在长会话(51k token prompt)下必然截断——模型对长输入
+/// 缺陷背景:固定 512 在长会话(51k token prompt)下必然截断——模型对长输入
 /// 倾向更长的输出且可能夹杂格式噪音,512 上限把摘要硬截在半句。
 /// 修复=`adaptive_max_tokens()` 按输入规模放大,512 保留为下限。
 const SUMMARY_MAX_TOKENS: u64 = 512;
 
-/// 摘要 max_tokens 自适应上限(O-199:防长输入下 512 硬截断)
+/// 摘要 max_tokens 自适应上限(防长输入下 512 硬截断)
 const SUMMARY_MAX_TOKENS_CAP: u64 = 8192;
 
-/// O-199:按输入规模自适应摘要 max_tokens
+/// 按输入规模自适应摘要 max_tokens
 ///
 /// - 输入 token 估算 = 字符数 / 3(中英混合粗估)
 /// - max_tokens = clamp(估算值 / 4, 512, 8192):摘要长度随输入次线性增长,
@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(DEFAULT_SUMMARY_THRESHOLD, 5);
     }
 
-    // ========== O-199: adaptive_max_tokens 测试 ==========
+    // ========== adaptive_max_tokens 测试 ==========
 
     #[test]
     fn test_adaptive_max_tokens_small_input_floors_at_512() {
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_max_tokens_scales_with_input() {
-        // 51k token 级输入(O-199 实测场景):~153k 字符 → est 51000 /4 = 12750 → 封顶 8192
+        // 51k token 级输入(长会话实测场景):~153k 字符 → est 51000 /4 = 12750 → 封顶 8192
         assert_eq!(adaptive_max_tokens(153_000), 8192);
         // 中等输入:60k 字符 → est 20000 /4 = 5000
         assert_eq!(adaptive_max_tokens(60_000), 5000);
