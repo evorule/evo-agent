@@ -173,7 +173,7 @@ impl EvoruleApiClient {
 
     /// 创建新会话，返回会话 ID。`initial_content` 为可选的初始 payload 内容。
     ///
-    /// `caller_role` 为可选的主体声明（O-185：`Some("llm")` = LLM agent 会话；
+    /// `caller_role` 为可选的主体声明（`Some("llm")` = LLM agent 会话；
     /// 服务端登记后命令入口注入 `__meta__.caller_role`，权限门按声明判定；
     /// None 不声明 → 服务端 fail-closed Unknown → Deny，与既有口径一致）。
     pub async fn create_session(

@@ -1319,7 +1319,7 @@ async fn test_run_empty_llm_response_stays_success() {
     assert!(result.content.is_empty());
 }
 
-// ===== O-185：create_session caller_role 声明（声明值取值面） =====
+// ===== create_session caller_role 声明（声明值取值面） =====
 
 /// 声明 llm：body 携带 caller_role 字段
 #[tokio::test]
