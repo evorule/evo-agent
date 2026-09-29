@@ -57,15 +57,15 @@ pub struct ToolTraceCollector {
 /// 但携带递归旗标的 rm 属破坏性操作,轨迹打 `rm:<flag>` 旗标。
 const RM_DANGEROUS_FLAGS: &[&str] = &["-rf", "-fr", "-r"];
 
-/// 违禁域名单(A4/A5 反作弊,合规红线):禁经 tbench.ai 与 terminal-bench
-/// benchmark 仓网络取答案。子串级检测只在应用采集侧(零子串谓词纪律
+/// 违禁域名单单一事实源 = [`crate::builtin_tools::net_guard::DENIED_NETWORK_PATTERNS`]
+/// （执行前防线与审计链防线共用同一名单，禁经 benchmark 基础设施网络取答案）。
+/// 子串级检测只在应用采集侧(零子串谓词纪律
 /// 仅约束规则层),命中打 `domain:<域名>` 旗标,由 server 层规则以
 /// `exists(danger_hits)` 判定 enforce——与危险程序打标同链路。
-const BANNED_DOMAINS: &[&str] = &["tbench.ai", "terminal-bench"];
 
 /// 危险命令检测:程序/旗标为词级 token 匹配(非裸子串——防
 /// `cat shutdown.log` 类误伤),违禁域为子串级扫描(域名串特异性高,
-/// 且 A4/A5 为合规红线,fail-closed 方向误伤只影响轨迹入链形态)。
+/// 且违禁域为合规红线,fail-closed 方向误伤只影响轨迹入链形态)。
 ///
 /// 单一事实源 = [`crate::builtin_tools::shell_exec::BLOCKED_COMMANDS`]
 /// (执行前防线Blocked 永不名单);本检测是审计链防线:轨迹条目附加
@@ -104,7 +104,7 @@ fn detect_danger_hits(command: &str) -> Vec<String> {
 /// 共用。命中打 `domain:<域名>` 旗标(如 `domain:tbench.ai`)。
 fn detect_domain_hits(text: &str) -> Vec<String> {
     let lower = text.to_lowercase();
-    BANNED_DOMAINS
+    crate::builtin_tools::net_guard::DENIED_NETWORK_PATTERNS
         .iter()
         .filter(|d| lower.contains(&d.to_lowercase()))
         .map(|d| format!("domain:{d}"))
@@ -123,12 +123,12 @@ impl ToolTraceCollector {
     /// shell_exec 调用附带危险命令打标:命中则轨迹条目附加 `danger_hits`
     /// 数组(词级检测+违禁域扫描见 [`detect_danger_hits`]);command 从
     /// 原始 args 读取(截断降级仅作用于入链 args 副本,不影响打标保真)。
-    /// http_get 调用附带违禁域打标(A4/A5,扫描 `url` 参数)。
+    /// http_get 调用附带违禁域打标(扫描 `url` 参数)。
     ///
     /// 后端感知成形(分流≠删检):宿主后端 `danger_hits` 全量旗标(与既有
     /// 逐字节一致);docker-exec 后端容器域=一次性任务沙箱,host 视角
     /// program/rm 旗标分流至 `program_hits` 留链备裁(容器内命令策略由
-    /// 规则面随动),`danger_hits` 仅保留违禁域旗标(A4/A5 合规红线双后端
+    /// 规则面随动),`danger_hits` 仅保留违禁域旗标(合规红线双后端
     /// enforce),并 stamp `exec_backend`/`container` 供回放定位。
     pub fn record(&mut self, tool_name: &str, args: &Value, status: &str, duration_ms: u64) {
         let seq = self.entries.len() as i64;
@@ -145,7 +145,7 @@ impl ToolTraceCollector {
                 match self.exec_backend.as_deref() {
                     // docker-exec 后端:容器域=一次性任务沙箱,host 视角 program/rm
                     // 旗标分流至 `program_hits` 留链备裁(分流≠删检);danger_hits
-                    // 仅保留违禁域旗标(A4/A5 合规红线,规则面双后端 enforce 维持);
+                    // 仅保留违禁域旗标(合规红线,规则面双后端 enforce 维持);
                     // stamp 后端/容器供回放定位
                     Some(container) => {
                         let domain: Vec<String> = hits
@@ -502,9 +502,12 @@ mod tests {
             "ok",
             9,
         );
+        // 名单为精确形态(org/路径级,单一事实源=DENIED_NETWORK_PATTERNS):
+        // laude-institute org 路径命中 org 形态;裸 "terminal-bench" 字样
+        // (非基础设施路径)不在名单——纯提及不打标,访问基础设施才打标
         assert_eq!(
             c.drain().remove(0)["danger_hits"],
-            json!(["domain:terminal-bench"])
+            json!(["domain:laude-institute"])
         );
     }
 
