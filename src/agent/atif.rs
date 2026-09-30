@@ -643,16 +643,26 @@ fn finalize_agent_step(
     total_prompt: &mut u64,
     total_completion: &mut u64,
 ) {
-    // 消息:审计链 IoResponse.content → transcript 对位 assistant → journal 摘要
-    let mut message = a
-        .evorule_request_id
-        .and_then(|rid| audit.llm_content(rid))
-        .or_else(|| {
-            assistant_msgs
-                .get(a.react_ordinal)
-                .map(|m| m.content.clone())
-        })
-        .unwrap_or_else(|| a.response_digest.clone());
+    // 消息选取按轮型分流:审计链 call_external IoResponse.content 是「turn
+    // 收尾全文」语义(react 中间轮不提交 io_response,单 turn 单 request_id),
+    // 中间轮按 request_id 查询会命中收尾轮全文造成步间错位 → 仅收尾轮
+    // (无 tool_calls)首源用审计链;中间轮直取 transcript 对位 assistant,
+    // journal 摘要兜底。
+    let mut message = if a.calls.is_empty() {
+        a.evorule_request_id
+            .and_then(|rid| audit.llm_content(rid))
+            .or_else(|| {
+                assistant_msgs
+                    .get(a.react_ordinal)
+                    .map(|m| m.content.clone())
+            })
+            .unwrap_or_else(|| a.response_digest.clone())
+    } else {
+        assistant_msgs
+            .get(a.react_ordinal)
+            .map(|m| m.content.clone())
+            .unwrap_or_else(|| a.response_digest.clone())
+    };
 
     // 合成空步承接的异常流:react_ordinal = MAX 表示无 react 调用,消息置空
     if a.react_ordinal == usize::MAX {
@@ -785,14 +795,22 @@ fn arguments_from_transcript(tool_calls: &Value, tool: &str, name_ordinal: usize
     let Some(arr) = tool_calls.as_array() else {
         return json!({});
     };
+    // 两种持久化形状兼容(实测 transcript 投影为引擎 payload 形状):
+    // - 引擎 payload 形状:{"tool_name": "...", "args": {...}}
+    // - OpenAI function 形状:{"function": {"name": "...", "arguments": "..."}}
     let mut seen = 0usize;
     for entry in arr {
-        let name = entry
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|v| v.as_str());
+        let name = entry.get("tool_name").and_then(|v| v.as_str()).or_else(|| {
+            entry
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+        });
         if name == Some(tool) {
             if seen == name_ordinal {
+                if let Some(args) = entry.get("args") {
+                    return args.clone();
+                }
                 let args = entry.get("function").and_then(|f| f.get("arguments"));
                 return match args {
                     Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
@@ -1112,6 +1130,113 @@ mod tests {
         // content 来自 transcript tool 消息对位
         let obs = a.observation.as_ref().unwrap();
         assert_eq!(obs.results[0].content.as_deref(), Some("文件内容全文"));
+    }
+
+    #[test]
+    fn arguments_from_transcript_engine_payload_shape() {
+        // 引擎 payload 形状({"tool_name","args"})是 transcript 投影实测形态
+        let tc = json!([
+            {"tool_name": "file_list", "args": {"dir": "."}},
+            {"tool_name": "file_write", "args": {"path": "a.txt", "content": "x"}},
+        ]);
+        assert_eq!(
+            arguments_from_transcript(&tc, "file_list", 0),
+            json!({"dir": "."})
+        );
+        assert_eq!(
+            arguments_from_transcript(&tc, "file_write", 0),
+            json!({"path": "a.txt", "content": "x"})
+        );
+        // OpenAI function 形状仍兼容
+        let tc_openai = json!([
+            {"function": {"name": "file_read", "arguments": "{\"path\":\"b.txt\"}"}}
+        ]);
+        assert_eq!(
+            arguments_from_transcript(&tc_openai, "file_read", 0),
+            json!({"path": "b.txt"})
+        );
+        // 未知名/序溢出规范化 {}
+        assert_eq!(arguments_from_transcript(&tc, "grep_files", 0), json!({}));
+        assert_eq!(arguments_from_transcript(&tc, "file_list", 1), json!({}));
+    }
+
+    #[test]
+    fn intermediate_react_steps_not_poisoned_by_final_audit_response() {
+        // 单 turn 多轮 react:call_external request_id 全轮相同,审计链只有
+        // 收尾 IoResponse → 中间轮 message 必须走 transcript 对位,不得命中
+        // 收尾全文(实测回归:4 步 message 全变成最终结论)
+        let mut j = JFix::new();
+        j.push(JE::TurnStarted {
+            turn_seq: 1,
+            goal: "g".into(),
+        });
+        j.push(JE::LlmCalled {
+            model: "glm-5.3".into(),
+            purpose: "react".into(),
+            evorule_request_id: Some(1),
+            tokens: tok(100, 10),
+            tokens_est: None,
+            request: 2,
+            response: "第一轮:去列表".into(),
+        });
+        j.push(JE::ToolInvoked {
+            call_id: "t3".into(),
+            tool: "file_list".into(),
+            args_digest: "blake3:aa".into(),
+            evorule_request_id: None,
+        });
+        j.push(JE::ToolResult {
+            call_id: "t3".into(),
+            status: "ok".into(),
+            size_bytes: 5,
+            content_digest: "blake3:bb".into(),
+        });
+        j.push(JE::LlmCalled {
+            model: "glm-5.3".into(),
+            purpose: "react".into(),
+            evorule_request_id: Some(1),
+            tokens: tok(120, 8),
+            tokens_est: None,
+            request: 4,
+            response: "完成".into(),
+        });
+        j.push(JE::TurnEnded {
+            status: "success".into(),
+            steps: 2,
+            duration_ms: 10,
+        });
+        let mut asst0 = msg(1, "assistant", "第一轮:去列表");
+        asst0.tool_calls = Some(json!([
+            {"tool_name": "file_list", "args": {"dir": "."}}
+        ]));
+        let transcript = vec![
+            msg(0, "system", "sys"),
+            msg(2, "user", "g"),
+            asst0,
+            msg(4, "tool", "[]"),
+            msg(5, "assistant", "完成"),
+        ];
+        let audit = vec![json!({
+            "type": "IoResponse", "id": 9u64, "request_id": 1u64,
+            "result": {"content": "完成"}, "error": null
+        })];
+        let src = AtifSources {
+            session_id: "s",
+            journal: &j.lines,
+            transcript: &transcript,
+            audit_facts: &audit,
+            tool_definitions: None,
+        };
+        let t = export(src).unwrap();
+        let agent_steps: Vec<&AtifStep> = t.steps.iter().filter(|s| s.source == "agent").collect();
+        assert_eq!(agent_steps.len(), 2);
+        // 中间轮:transcript 对位,非收尾全文
+        assert_eq!(agent_steps[0].message, "第一轮:去列表");
+        // 收尾轮:审计链全文
+        assert_eq!(agent_steps[1].message, "完成");
+        // 中间轮 arguments 引擎形状对位成功
+        let calls = agent_steps[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].arguments, json!({"dir": "."}));
     }
 
     #[test]
