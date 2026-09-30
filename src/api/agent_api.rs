@@ -393,6 +393,8 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/sessions/{id}/transcript",
             axum::routing::get(get_transcript),
         )
+        // B21 PR-4/G2:ATIF v1.8 轨迹导出(journal × 审计链 × transcript 三源 join)
+        .route("/api/sessions/{id}/atif", axum::routing::get(get_atif))
         // 工作台配置(快照保留期;展示层,不触引擎面)
         .route(
             "/api/workbench/config",
@@ -1320,6 +1322,117 @@ pub(crate) fn resolve_memory_namespace(state: &AgentApiState, agent_type: &str) 
 }
 
 // =============================================================================
+// B21 PR-4 / G2:ATIF v1.8 轨迹导出(只读;journal × 审计链 × transcript 三源 join)
+// =============================================================================
+
+/// `GET /api/sessions/{id}/atif` 查询参数
+#[derive(Debug, Deserialize)]
+pub struct AtifQuery {
+    /// agent 定义类型(工具 schema 与 memory namespace 解析用);缺省时按
+    /// 会话索引回查,再缺省 general(与 transcript 端点同口径)
+    #[serde(default)]
+    pub agent_type: Option<String>,
+}
+
+/// `GET /api/sessions/{id}/atif` —— 三源 join 导出 ATIF v1.8 轨迹
+///
+/// 装配 [`crate::agent::atif::AtifSources`] 四源后调用纯函数导出器
+/// [`crate::agent::atif::export`](crate::agent::atif::export);装配语义见
+/// atif.rs 模块文档(三源 join 模型/确定性裁定),此处只做 IO 与错误映射:
+///
+/// - journal 骨架:`data/sessions/{sid}.jsonl`(与 runner 注入 journal_dir
+///   同路径);缺失或为空 → 404 fail-visible,不产半截轨迹;
+/// - 审计链全文:`EvoruleApiClient::replay`(fact.to_json() 列表;audit/export
+///   端点只含哈希链元数据无内容,不可作内容源)不可达 → 502;
+/// - transcript 消息投影:`session_index::load_transcript`(namespace 解析与
+///   get_transcript 同口径),不可达 → 502;空投影合法(ATIF 全 Optional);
+/// - 工具 schema:[`AgentRunner::openai_function_schemas_for`](crate::agent::AgentRunner::openai_function_schemas_for)
+///   (与 LLM 请求单一实现)× agent 定义 tools 列表;定义缺失/空清单时
+///   降级省略该字段(ATIF Optional)。
+///
+/// 端点纯只读:同 session 重导出逐字节一致(atif.rs 幂等保证,P3 验收 #7,
+/// `extra.exported_at` 由 journal 尾事件 ts 派生而非当前时钟)。
+async fn get_atif(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<AtifQuery>,
+) -> Result<Json<crate::agent::atif::AtifTrajectory>, (StatusCode, String)> {
+    // agent_type 解析:query 参数 > 索引回查 > general(与 get_transcript 同口径)
+    let agent_type = q.agent_type.clone().or_else(|| {
+        state
+            .session_index()
+            .list()
+            .into_iter()
+            .find(|e| e.session_id == session_id)
+            .map(|e| e.agent_type)
+    });
+    let agent_type = agent_type.unwrap_or_else(|| "general".to_string());
+
+    // 1. journal 骨架(路径与 runner 注入 journal_dir 同源)
+    let journal_dir = state.workdir.join("data").join("sessions");
+    let journal = crate::agent::journal::read_all(&crate::agent::journal::JournalWriter::path_for(
+        &journal_dir,
+        &session_id,
+    ))
+    .map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("atif export: journal unavailable for session '{session_id}': {e}"),
+        )
+    })?;
+    if journal.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("atif export: journal is empty for session '{session_id}'"),
+        ));
+    }
+
+    // 2. 审计链全文(18080 权威面唯一全文通道)
+    let audit_facts = state
+        .evorule_client()
+        .replay(&session_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("atif export: audit replay failed: {e}"),
+            )
+        })?;
+
+    // 3. transcript 消息投影
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+    let transcript =
+        crate::api::session_index::load_transcript(state.evorule_client(), &session_id, &namespace)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("atif export: transcript fetch failed: {e}"),
+                )
+            })?;
+
+    // 4. 工具 schema(与 runner LLM 请求单一实现;定义缺失/空清单降级省略)
+    let tool_definitions = state
+        .definitions
+        .load(&agent_type)
+        .ok()
+        .map(|def| AgentRunner::openai_function_schemas_for(&def.tools))
+        .filter(|t| !t.is_empty())
+        .map(serde_json::Value::Array);
+
+    let sources = crate::agent::atif::AtifSources {
+        session_id: &session_id,
+        journal: &journal,
+        transcript: &transcript,
+        audit_facts: &audit_facts,
+        tool_definitions,
+    };
+    let trajectory = crate::agent::atif::export(sources)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    Ok(Json(trajectory))
+}
+
+// =============================================================================
 // 治理叠加:进化信号只读代理(工作台信号徽标数据源)
 // =============================================================================
 
@@ -1694,6 +1807,132 @@ mod tests {
             AgentDefinitionManager::with_default_dir(),
             EvoruleApiClient::new("http://localhost:8080"),
         )
+    }
+
+    #[tokio::test]
+    async fn test_atif_export_endpoint_joins_three_sources() {
+        // G2/B21 PR-4:端点装配 journal × 审计链 × transcript 三源产出合法 ATIF。
+        // journal 由 JournalWriter 真写;审计链由 mockito 提供 IoRequest/IoResponse
+        // 全文(replay = fact JSON 数组);transcript 返回空投影(合法,全 Optional)。
+        use crate::agent::journal::JournalWriter;
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/sessions/atif-e2e/replay")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[
+                    {"type":"IoRequest","id":100,"io_type":"call_service",
+                     "params":{"service":"stock_price","args":{"ticker":"GOOGL"}}},
+                    {"type":"IoResponse","request_id":100,
+                     "result":{"price":185.35}}
+                ]"#,
+            )
+            .create_async()
+            .await;
+        // transcript facts 前缀含 namespace(依赖 agent 配置),用前缀正则放宽;
+        // 兼容 mockito 匹配面带/不带 query 串两种语义
+        server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/sessions/atif-e2e/facts(\?.*)?$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        // journal 事件序:turn_started(1) → llm_called(2) → tool_invoked(3,"t3")
+        // → tool_result(4) → turn_ended(5)
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("data").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let writer = JournalWriter::open(&sessions, "atif-e2e").unwrap();
+        let _guard = writer.begin_turn("查询股价").unwrap();
+        writer
+            .llm_called_react("test-model", Some(100), None, Some(1000), 3, "调用工具查价")
+            .unwrap();
+        let call_id = writer
+            .tool_invoked(
+                "stock_price",
+                &serde_json::json!({"ticker": "GOOGL"}),
+                Some(100),
+            )
+            .unwrap();
+        writer
+            .tool_result(&call_id, "ok", r#"{"price":185.35}"#)
+            .unwrap();
+        writer.end_turn("done", 1, 10).unwrap();
+
+        let state = AgentApiState::new_with_metrics(
+            AgentDefinitionManager::with_default_dir(),
+            EvoruleApiClient::new(&server.url()),
+            Arc::new(Metrics::new().unwrap()),
+            tmp.path().to_path_buf(),
+            Arc::new(WorkspaceApiClient::new(&server.url())),
+            Arc::new(ToolHandler::new()),
+        );
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/atif-e2e/atif")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["schema_version"], "ATIF-v1.8");
+        assert_eq!(body["session_id"], "atif-e2e");
+        // transcript 为空 → 无 system 步:user 步(turn_started) + agent 步(react)
+        let steps = body["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["source"], "user");
+        assert_eq!(steps[1]["source"], "agent");
+        // 三源 join:tool_call_id = journal 合成;arguments = 审计链 IoRequest;
+        // observation content = 审计链 IoResponse
+        assert_eq!(steps[1]["tool_calls"][0]["tool_call_id"], "t3");
+        assert_eq!(steps[1]["tool_calls"][0]["arguments"]["ticker"], "GOOGL");
+        assert_eq!(
+            steps[1]["observation"]["results"][0]["source_call_id"],
+            "t3"
+        );
+        assert_eq!(
+            steps[1]["observation"]["results"][0]["content"],
+            r#"{"price":185.35}"#
+        );
+        // tokens_est=1000(无真值)→ 7:3 拆分
+        assert_eq!(body["final_metrics"]["total_prompt_tokens"], 700);
+        assert_eq!(body["final_metrics"]["total_completion_tokens"], 300);
+    }
+
+    #[tokio::test]
+    async fn test_atif_export_missing_journal_is_404() {
+        // fail-visible:无 journal 的会话不产半截轨迹
+        let state = make_test_state();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/no-such-session/atif")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

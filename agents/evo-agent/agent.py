@@ -228,6 +228,62 @@ class EvoRuleAgent(BaseAgent):
     def version(self) -> str:
         return self._version or "0.1.0"
 
+    # ------------------------------------------------------------------
+    # ATIF trajectory export (G2 reporter, thin pull)
+    #
+    # After each run the engine reports the session id it established; the
+    # full ATIF trajectory is assembled engine-side (journal x audit chain x
+    # transcript three-source join, see src/agent/atif.rs) and served
+    # read-only at ``GET /api/sessions/{id}/atif``. This adapter only
+    # persists the trajectory (``trajectory.json``) and a small statistics
+    # digest (``atif-summary.json``) next to the harness logs. Export
+    # failures degrade to warnings and never affect the task outcome.
+    # ------------------------------------------------------------------
+
+    def _export_atif_trajectory(self, logging_dir: Path, payload: dict) -> None:
+        session_id = payload.get("session_id")
+        if not session_id:
+            logger.warning(
+                "run response carries no session_id; skipping ATIF export"
+            )
+            return
+        resp = requests.get(
+            f"{self._server_url}/api/sessions/{session_id}/atif",
+            params={"agent_type": self._agent_type},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        trajectory = resp.json()
+        (logging_dir / "trajectory.json").write_text(
+            json.dumps(trajectory, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        steps = trajectory.get("steps") or []
+        summary = {
+            "schema_version": trajectory.get("schema_version"),
+            "session_id": trajectory.get("session_id"),
+            "trajectory_id": trajectory.get("trajectory_id"),
+            "steps": len(steps),
+            "tool_calls": sum(
+                len(step.get("tool_calls") or [])
+                for step in steps
+                if isinstance(step, dict)
+            ),
+            "final_metrics": trajectory.get("final_metrics"),
+            "journal_seq_range": (trajectory.get("extra") or {}).get(
+                "journal_seq_range"
+            ),
+        }
+        (logging_dir / "atif-summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info(
+            "ATIF trajectory exported (%s steps) to %s",
+            summary["steps"],
+            logging_dir / "trajectory.json",
+        )
+
     def perform_task(
         self,
         instruction: str,
@@ -284,6 +340,13 @@ class EvoRuleAgent(BaseAgent):
                     json.dumps(raw_dump, indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
+                try:
+                    self._export_atif_trajectory(logging_dir, payload)
+                except Exception as exc:
+                    logger.warning(
+                        "ATIF trajectory export failed (continuing without it): %s",
+                        exc,
+                    )
 
             if not payload.get("success"):
                 return AgentResult(failure_mode=FailureMode.UNKNOWN_AGENT_ERROR)
