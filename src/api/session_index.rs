@@ -24,6 +24,11 @@
 //! - 索引文件是**持久化记录**而非审计链级留痕(可读、不参与哈希);真相源
 //!   仍是 evorule(payload/facts),索引丢失仅影响列表展示,消息历史可凭
 //!   session_id 随时重新投影。
+//! - **B21 PR-1 收编(投影语义)**:`data/sessions/{sid}.jsonl` journal 事件流
+//!   ([crate::agent::journal])自本批次起成为**会话唯一真相源**(步级事件:
+//!   turn/llm/tool/approval/policy);本索引降级为**会话级投影**(枚举面),
+//!   仅服务列表展示,不参与真相判定;冲突以 journal 为准。快照
+//!   (snapshots)同理为消息级投影。
 
 use std::io::Write as _;
 use std::path::PathBuf;

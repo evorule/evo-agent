@@ -588,7 +588,10 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
             )) as Arc<dyn crate::agent::approval::ApprovalCallback>
         })
         // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
-        .with_metrics(state.metrics().clone());
+        .with_metrics(state.metrics().clone())
+        // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源;
+        // run_streaming_inner 内按会话创建 {sid}.jsonl)
+        .with_journal_dir(state.workdir().join("data").join("sessions"));
     // 记忆启用时构建 MemoryManager(TTL / 持久化模式按定义透传)
     if def.memory.memory_type != "none" && !def.memory.memory_type.is_empty() {
         let mut mem = MemoryManager::new(&def.memory.namespace, state.evorule_client().clone());
