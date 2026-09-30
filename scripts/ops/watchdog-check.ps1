@@ -1,4 +1,4 @@
-# 看门狗单次巡检: 三服务探活,不通则拉起。计划任务每分钟触发,也可手动运行当作"一键全启"。
+# 看门狗单次巡检: 四服务探活,不通则拉起。计划任务每 5 分钟触发(2026-09-30 由每小时提频),也可手动运行当作"一键全启"。
 $created = $false
 $mutex = [System.Threading.Mutex]::new($false, 'Global\EvoruleOpsWatchdog')
 try { $created = $mutex.WaitOne(0) } catch { $created = $true }
