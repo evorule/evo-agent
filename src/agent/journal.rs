@@ -514,7 +514,8 @@ pub fn read_all(path: &Path) -> Result<Vec<JournalLine>, JournalError> {
 }
 
 /// session_id 消毒:仅保留 [A-Za-z0-9._-],其余替 '_',防路径注入/跨平台文件名问题
-fn sanitize_session_id(sid: &str) -> String {
+/// (公开:atif 导出面需以同口径回写 source_journal 相对路径)
+pub fn sanitize_session_id(sid: &str) -> String {
     let cleaned: String = sid
         .chars()
         .take(128)

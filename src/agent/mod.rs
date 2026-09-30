@@ -5,6 +5,7 @@
 //! Agent orchestration layer -- AI Agent run loop, tool registry, and memory manager.
 pub mod adjudicator;
 pub mod approval;
+pub mod atif;
 pub mod audited_llm;
 pub mod callback;
 pub mod constitution;
