@@ -758,7 +758,10 @@ async fn run_agent(
     } else {
         runner
     };
-    let runner = runner.with_metrics(state.metrics.clone());
+    let runner = runner
+        .with_metrics(state.metrics.clone())
+        // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
+        .with_journal_dir(state.workdir.join("data").join("sessions"));
 
     // 改消费流式 ReAct 回路(delegate 同款修法,bb172b2 先例)——
     // 非流式 run() 是单发桥接(LLM 返 tool_calls 即返、工具不执行=能力面假象,
@@ -898,7 +901,9 @@ async fn run_agent_stream(
         )) as std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>
     })
     // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
-    .with_metrics(state.metrics.clone());
+    .with_metrics(state.metrics.clone())
+    // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
+    .with_journal_dir(state.workdir.join("data").join("sessions"));
 
     // 执行桥后端上下文注入轨迹采集器(同 run_agent 口径):请求携带容器名
     // (docker-exec 后端)时 shell_exec 轨迹成形分流 program 旗标(分流≠删检);

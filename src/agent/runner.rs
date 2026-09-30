@@ -798,6 +798,10 @@ pub struct AgentRunner {
     /// P1:工具调用轨迹采集器(会话内累积,io_response 收尾后随
     /// tool_trace 指令批量提交进引擎审计链;std Mutex:临界区无 await)
     tool_traces: std::sync::Arc<std::sync::Mutex<crate::agent::tool_trace::ToolTraceCollector>>,
+    /// B21 PR-1:journal 目录(serve 注入 `<workdir>/data/sessions`;None=不启用
+    /// ——CLI/子代理路径零改动)。run_streaming_inner 创建会话时在此目录建
+    /// `{session_id}.jsonl` 事件流(会话唯一真相源,见 crate::agent::journal)
+    journal_dir: Option<std::path::PathBuf>,
 }
 
 impl AgentRunner {
@@ -842,6 +846,7 @@ impl AgentRunner {
             tool_traces: Arc::new(std::sync::Mutex::new(
                 crate::agent::tool_trace::ToolTraceCollector::default(),
             )),
+            journal_dir: None,
         }
     }
 
@@ -1209,6 +1214,14 @@ impl AgentRunner {
     /// CLI 模式不设置(默认 `None`),所有插桩点为 no-op。
     pub fn with_metrics(mut self, metrics: SharedMetrics) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// B21 PR-1:注入 journal 目录(serve 模式;启用会话事件流落盘)。
+    /// 注入后 run_streaming_inner 每会话创建 `data/sessions/{sid}.jsonl`
+    /// 唯一真相源;不注入(默认)行为零变化。
+    pub fn with_journal_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.journal_dir = Some(dir);
         self
     }
 
@@ -2230,7 +2243,7 @@ impl AgentRunner {
             // 第一次调用(不带 approved flag):LLM 自带的 approved 旗标
             // 强制剥离,决策门唯一控制权归 runner
             let first_args = strip_approved_flag(&args);
-            let tool_result = self.execute_tool_call(tool_name, &first_args).await?;
+            let tool_result = self.execute_tool_call(tool_name, &first_args, None).await?;
             // G8:检查是否需要审批,如果需要则走审批流程(可能重新调用 with approved:true)
             self.maybe_handle_approval(session_id, tool_name, &first_args, tool_result)
                 .await?
@@ -2271,7 +2284,12 @@ impl AgentRunner {
     /// 从 `handle_call_service` 和流式路径的审批重调用共用。
     /// 第一次调用不带 `approved` flag → 工具可能返回 `needs_approval` proposal。
     /// 第二次调用(审批通过后)带 `approved:true` → 工具直接执行。
-    async fn execute_tool_call(&self, tool_name: &str, args: &Value) -> Result<Value, AgentError> {
+    async fn execute_tool_call(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        journal: Option<&crate::agent::journal::JournalWriter>,
+    ) -> Result<Value, AgentError> {
         // M5-c:工具意图裁决(双层防线的外层)——file 类调用先把规范字段
         // target_scope 随意图指令进链,由协作验收规则 enforce 裁决:
         // 被拦(version 未推进)则不执行工具,向 LLM 返回治理拦截结果;
@@ -2291,6 +2309,13 @@ impl AgentRunner {
                 .await_verdict(&intent_signal(scope), self.session_id.as_deref())
                 .await
                 .map_err(AgentError::Internal)?;
+            // B21:policy_judged(意图裁决输出;judgement_id 由 seq 确定性合成)
+            if let Some(j) = journal {
+                let _ = j.policy_judged(
+                    if allowed { "allowed" } else { "blocked" },
+                    &format!("{tool_name} target_scope={scope}"),
+                );
+            }
             if !allowed {
                 warn!(
                     main_session = ?self.session_id, tool = %tool_name, scope = %scope,
@@ -2335,6 +2360,16 @@ impl AgentRunner {
                 .await_verdict(&tool_intent_signal(&intent), self.session_id.as_deref())
                 .await
                 .map_err(AgentError::Internal)?;
+            // B21:policy_judged(工具意图裁决输出)
+            if let Some(j) = journal {
+                let _ = j.policy_judged(
+                    if allowed { "allowed" } else { "blocked" },
+                    &format!(
+                        "{tool_name} intent={}",
+                        serde_json::to_string(&intent).unwrap_or_default()
+                    ),
+                );
+            }
             if !allowed {
                 warn!(
                     main_session = ?self.session_id, tool = %tool_name,
@@ -2391,6 +2426,7 @@ impl AgentRunner {
         session_id: &str,
         tool_name: &str,
         args: &Value,
+        journal: Option<&crate::agent::journal::JournalWriter>,
     ) -> Result<ToolExecStage, AgentError> {
         // G13:并行缓存命中(如果 call_external 已并行执行过此 active 工具,
         // 直接返回缓存结果,跳过重复执行 + 审批;candidate 工具不缓存)
@@ -2406,7 +2442,9 @@ impl AgentRunner {
         // G8:第一次调用(不带 approved flag)→ 可能返回 needs_approval proposal
         // LLM 自带 approved 旗标强制剥离(决策门唯一控制权归 runner)
         let first_args = strip_approved_flag(args);
-        let tool_result = self.execute_tool_call(tool_name, &first_args).await?;
+        let tool_result = self
+            .execute_tool_call(tool_name, &first_args, journal)
+            .await?;
         let result_str = tool_result.to_string();
         match parse_approval_request(session_id, tool_name, &first_args, &result_str) {
             None => Ok(ToolExecStage::Done(ToolExecOutcome {
@@ -2428,6 +2466,7 @@ impl AgentRunner {
         tool_name: &str,
         args: &Value,
         approval_req: ApprovalRequest,
+        journal: Option<&crate::agent::journal::JournalWriter>,
     ) -> Result<ToolExecOutcome, AgentError> {
         // 审批决策(无 callback = 默认拒绝,安全优先)
         let decision = if let Some(cb) = &self.approval_callback {
@@ -2476,7 +2515,8 @@ impl AgentRunner {
             } else {
                 approved_args = serde_json::json!({"original_args": args, "approved": true});
             }
-            self.execute_tool_call(tool_name, &approved_args).await?
+            self.execute_tool_call(tool_name, &approved_args, journal)
+                .await?
         };
 
         // 人工审查开合:决策事件入审计链(tool_trace 条目附加 approval 子对象;
@@ -2689,7 +2729,9 @@ impl AgentRunner {
             // args 不是 object,包装一下
             approved_args = serde_json::json!({"original_args": args, "approved": true});
         }
-        let final_result = self.execute_tool_call(tool_name, &approved_args).await?;
+        let final_result = self
+            .execute_tool_call(tool_name, &approved_args, None)
+            .await?;
         // 人工审查开合:决策事件入审计链(附加到重执行条目)
         if let Ok(mut tt) = self.tool_traces.lock() {
             tt.attach_approval_to_last(approval_record.clone());
@@ -3173,6 +3215,38 @@ impl AgentRunner {
                 mem.set_session_id(&session_id);
             }
 
+            // B21 PR-1:journal 会话事件流(serve 注入 journal_dir 时启用)。
+            // 打开失败 fail-soft 降级为无 journal 会话(warn 留痕,不阻塞主流程
+            // ——与 metrics/tool_traces 同风格);读侧 seq 连续性校验 fail-visible。
+            let journal: Option<std::sync::Arc<crate::agent::journal::JournalWriter>> =
+                match &runner.journal_dir {
+                    Some(dir) => match crate::agent::journal::JournalWriter::open(dir, &session_id)
+                    {
+                        Ok(w) => Some(std::sync::Arc::new(w)),
+                        Err(e) => {
+                            warn!(
+                                %session_id,
+                                error = %e,
+                                "B21: journal open failed, session runs without journal"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
+            // turn_started(轮顶;turn_seq 按 journal 内既有轮数递增,G15 续跑同文件续轮)。
+            // turn_guard 保证所有终止路径(优雅显式 end / 异常 drop 补写 aborted)轮界闭合。
+            let mut turn_guard = match &journal {
+                Some(j) => match j.begin_turn(&goal) {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        warn!(%session_id, error = %e, "B21: turn_started journal failed");
+                        None
+                    }
+                },
+                None => None,
+            };
+
             // G17:session 活跃度守卫(新建 / 复用均持有,stream! 块结束时 dec)
             let _session_guard = SessionActiveGuard::new(runner.metrics.clone());
 
@@ -3267,6 +3341,10 @@ impl AgentRunner {
                         let _ = runner.flush_messages(&session_id).await;
                         runner.submit_tool_traces(&session_id).await;
                         let duration = start_time.elapsed().as_millis() as u64;
+                        // B21:turn_ended(cancelled)
+                        if let Some(g) = turn_guard.take() {
+                            g.end("cancelled", step_count as u64, duration);
+                        }
                         yield Ok(AgentEvent::Error(AgentError::Internal(
                             "cancelled by user".to_string(),
                         )));
@@ -3290,6 +3368,10 @@ impl AgentRunner {
                                 runner.config.max_steps,
                             )));
                             let duration = start_time.elapsed().as_millis() as u64;
+                            // B21:turn_ended(error)
+                            if let Some(g) = turn_guard.take() {
+                                g.end("error", step_count as u64, duration);
+                            }
                             let _ = runner.flush_messages(&session_id).await;
                             runner.submit_tool_traces(&session_id).await;
                             yield Ok(AgentEvent::Done(AgentResult::error(
@@ -3347,6 +3429,10 @@ impl AgentRunner {
                                             }
                                             yield Ok(AgentEvent::Error(err.clone()));
                                             let duration = start_time.elapsed().as_millis() as u64;
+                                            // B21:turn_ended(error)
+                                            if let Some(g) = turn_guard.take() {
+                                                g.end("error", step_count as u64, duration);
+                                            }
                                             let _ = runner.flush_messages(&session_id).await;
                                             runner.submit_tool_traces(&session_id).await;
                                             yield Ok(AgentEvent::Done(AgentResult::error(
@@ -3448,6 +3534,8 @@ impl AgentRunner {
                                 let mut full_content = String::new();
                                 let mut full_tool_calls: Option<Vec<crate::agent::translator::ToolCall>> = None;
                                 let mut finish_reason: Option<String> = None;
+                                // B21:provider token 真值(Done chunk 采集,llm_called 埋点消费)
+                                let mut react_tokens: Option<crate::agent::translator::TokenUsage> = None;
 
                                 // G6:LLM 流式输出期间也监听取消(token-by-token 响应)
                                 loop {
@@ -3470,6 +3558,10 @@ impl AgentRunner {
                                             let _ = runner.flush_messages(&session_id).await;
                                             runner.submit_tool_traces(&session_id).await;
                                             let duration = start_time.elapsed().as_millis() as u64;
+                                            // B21:turn_ended(cancelled)
+                                            if let Some(g) = turn_guard.take() {
+                                                g.end("cancelled", step_count as u64, duration);
+                                            }
                                             yield Ok(AgentEvent::Error(AgentError::Internal(
                                                 "cancelled by user".to_string(),
                                             )));
@@ -3494,6 +3586,8 @@ impl AgentRunner {
                                             full_tool_calls = resp.tool_calls.clone();
                                             finish_reason = resp.finish_reason.clone();
                                             last_llm_content = full_content.clone();
+                                            // B21:采集 provider token 真值
+                                            react_tokens = resp.token_usage.clone();
                                             // plan-execute tokens 埋点（流式路径等效累加点，
                                             // 对齐非流式 run() IoRequest 臂）：
                                             // delegate 改走流式运行，埋点随 token_counter 继续生效
@@ -3544,6 +3638,10 @@ impl AgentRunner {
                                             let err = AgentError::LlmError(e);
                                             yield Ok(AgentEvent::Error(err.clone()));
                                             let duration = start_time.elapsed().as_millis() as u64;
+                                            // B21:turn_ended(error)
+                                            if let Some(g) = turn_guard.take() {
+                                                g.end("error", step_count as u64, duration);
+                                            }
                                             let _ = runner.flush_messages(&session_id).await;
                                             runner.submit_tool_traces(&session_id).await;
                                             yield Ok(AgentEvent::Done(AgentResult::error(
@@ -3557,6 +3655,38 @@ impl AgentRunner {
                                 // G17:记录 LLM 流式调用成功指标(正常完成)
                                 if let Some(m) = &runner.metrics {
                                     m.observe_llm_call(model, llm_start.elapsed(), true);
+                                }
+
+                                // B21:llm_called 事件(provider 真值优先,tokens_est 兜底;
+                                // purpose=react,One-LLM-per-step 映射依据)
+                                if let Some(j) = &journal {
+                                    let tokens = react_tokens.as_ref().map(|u| {
+                                        crate::agent::journal::TokenRecord {
+                                            prompt: u.prompt_tokens as u64,
+                                            completion: u.completion_tokens as u64,
+                                            total: u.total_tokens as u64,
+                                        }
+                                    });
+                                    // tokens_est:近似计数器估算 prompt+completion 总量
+                                    let tokens_est = {
+                                        use crate::agent::context_window::TokenCounter as _;
+                                        let counter = crate::agent::context_window::ApproxTokenCounter::new();
+                                        (counter.count_messages(&messages_to_send)
+                                            + counter.count_message(&crate::agent::translator::Message::Assistant {
+                                                content: full_content.clone(),
+                                                tool_calls: None,
+                                            })) as u64
+                                    };
+                                    if let Err(e) = j.llm_called_react(
+                                        model,
+                                        request_id,
+                                        tokens,
+                                        Some(tokens_est),
+                                        messages_to_send.len(),
+                                        &full_content,
+                                    ) {
+                                        warn!(%session_id, error = %e, "B21: llm_called journal failed");
+                                    }
                                 }
 
                                 // G13:并行预执行工具(max_parallel_tools > 1 且有多个 tool_calls 时)
@@ -3605,6 +3735,12 @@ impl AgentRunner {
                                     // tool 消息入列后 continue 'react 发起回喂轮
                                     let tcs = full_tool_calls.unwrap();
                                     for tc in &tcs {
+                                        // B21:tool_invoked(本地 ReAct 路径不经 evorule
+                                        // IoRequest,evorule_request_id=None,全文内容源=
+                                        // transcript payload;call_id 由事件 seq 确定性合成)
+                                        let j_call_id = journal.as_ref().and_then(|j| {
+                                            j.tool_invoked(&tc.name, &tc.arguments, None).ok()
+                                        });
                                         yield Ok(AgentEvent::ToolCall {
                                             name: tc.name.clone(),
                                             args: tc.arguments.clone(),
@@ -3616,7 +3752,7 @@ impl AgentRunner {
                                         // (两阶段:Pending 时先 yield ApprovalRequired 再等
                                         // 决策 —— 帧必须赶在 60s 审批窗口内到达前端)
                                         let outcome_res = match runner
-                                            .execute_tool_stage(&session_id, &tc.name, &tc.arguments)
+                                            .execute_tool_stage(&session_id, &tc.name, &tc.arguments, journal.as_deref())
                                             .await
                                         {
                                             Err(e) => Err(e),
@@ -3629,17 +3765,36 @@ impl AgentRunner {
                                                     alternative: req.alternative.clone(),
                                                     proposal_id: req.proposal_id.clone(),
                                                 });
+                                                // B21:approval_requested(60s 审批窗开启)
+                                                if let Some(j) = &journal {
+                                                    let _ = j.approval_requested(
+                                                        &req.proposal_id,
+                                                        &tc.name,
+                                                        &req.command,
+                                                    );
+                                                }
                                                 let res = runner
-                                                    .resolve_approval(&session_id, &tc.name, &tc.arguments, req)
+                                                    .resolve_approval(&session_id, &tc.name, &tc.arguments, req, journal.as_deref())
                                                     .await;
                                                 if let Ok(o) = &res {
-                                                    if let Some((_, decision)) = &o.approval_flow {
+                                                    if let Some((req0, decision)) = &o.approval_flow {
                                                         yield Ok(AgentEvent::ApprovalResult {
                                                             tool_name: tc.name.clone(),
                                                             approved: decision.approved,
                                                             approver: decision.approver.clone(),
                                                             auto_rejected: decision.auto_rejected,
                                                         });
+                                                        // B21:approval_resolved(approval_id = proposal_id)
+                                                        if let Some(j) = &journal {
+                                                            let label = if decision.approved {
+                                                                "approved"
+                                                            } else if decision.auto_rejected {
+                                                                "auto_rejected"
+                                                            } else {
+                                                                "rejected"
+                                                            };
+                                                            let _ = j.approval_resolved(&req0.proposal_id, label);
+                                                        }
                                                     }
                                                 }
                                                 res
@@ -3655,12 +3810,13 @@ impl AgentRunner {
                                                     "本地 ReAct:工具执行失败,错误作为 tool 消息回喂"
                                                 );
                                                 tool_calls.push(tc.name.clone());
+                                                let err_content = serde_json::json!({
+                                                    "error": e.to_string(),
+                                                    "tool_name": tc.name,
+                                                })
+                                                .to_string();
                                                 let err_tool_msg = Message::Tool {
-                                                    content: serde_json::json!({
-                                                        "error": e.to_string(),
-                                                        "tool_name": tc.name,
-                                                    })
-                                                    .to_string(),
+                                                    content: err_content.clone(),
                                                     tool_name: tc.name.clone(),
                                                 };
                                                 messages.push(err_tool_msg.clone());
@@ -3685,6 +3841,10 @@ impl AgentRunner {
                                                         "result": serde_json::json!({"error": e.to_string()}).to_string(),
                                                     }),
                                                 });
+                                                // B21:tool_result(error;内容与 transcript 回喂消息一致)
+                                                if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
+                                                    let _ = j.tool_result(cid, "error", &err_content);
+                                                }
                                                 continue;
                                             }
                                         };
@@ -3697,6 +3857,10 @@ impl AgentRunner {
                                         let tool_idx = messages.len();
                                         // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
                                         let raw_content = outcome.final_result.to_string();
+                                        // B21:tool_result(ok;content = 工具输出全文与 transcript 一致)
+                                        if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
+                                            let _ = j.tool_result(cid, "ok", &raw_content);
+                                        }
                                         let tool_msg = Message::Tool {
                                             content: truncate_tool_result(raw_content.clone()),
                                             tool_name: tc.name.clone(),
@@ -3769,6 +3933,11 @@ impl AgentRunner {
                                 let tool_name = params.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let args = params.get("args").cloned().unwrap_or(Value::Null);
                                 yield Ok(AgentEvent::ToolCall { name: tool_name.clone(), args: args.clone() });
+                                // B21:tool_invoked(call_service 路径,evorule_request_id =
+                                // IoRequest.id,审计链 join 键——ATIF 映射表 §五)
+                                let j_call_id = journal.as_ref().and_then(|j| {
+                                    j.tool_invoked(&tool_name, &args, request_id).ok()
+                                });
 
                                 // 审批+执行抽到两阶段 helper(与本地 ReAct 循环共用);
                                 // 事件仍在此处 yield(stream! 宏限制)。Pending 时先
@@ -3776,7 +3945,7 @@ impl AgentRunner {
                                 // 到达前端)。非流式路径(run)仍走 handle_call_service
                                 // (内部 maybe_handle_approval,不产事件)
                                 let outcome_res = match runner
-                                    .execute_tool_stage(&session_id, &tool_name, &args)
+                                    .execute_tool_stage(&session_id, &tool_name, &args, journal.as_deref())
                                     .await
                                 {
                                     Err(e) => Err(e),
@@ -3789,17 +3958,32 @@ impl AgentRunner {
                                             alternative: req.alternative.clone(),
                                             proposal_id: req.proposal_id.clone(),
                                         });
+                                        // B21:approval_requested(60s 审批窗开启)
+                                        if let Some(j) = &journal {
+                                            let _ = j.approval_requested(&req.proposal_id, &tool_name, &req.command);
+                                        }
                                         let res = runner
-                                            .resolve_approval(&session_id, &tool_name, &args, req)
+                                            .resolve_approval(&session_id, &tool_name, &args, req, journal.as_deref())
                                             .await;
                                         if let Ok(o) = &res {
-                                            if let Some((_, decision)) = &o.approval_flow {
+                                            if let Some((req0, decision)) = &o.approval_flow {
                                                 yield Ok(AgentEvent::ApprovalResult {
                                                     tool_name: tool_name.clone(),
                                                     approved: decision.approved,
                                                     approver: decision.approver.clone(),
                                                     auto_rejected: decision.auto_rejected,
                                                 });
+                                                // B21:approval_resolved(approval_id = proposal_id)
+                                                if let Some(j) = &journal {
+                                                    let label = if decision.approved {
+                                                        "approved"
+                                                    } else if decision.auto_rejected {
+                                                        "auto_rejected"
+                                                    } else {
+                                                        "rejected"
+                                                    };
+                                                    let _ = j.approval_resolved(&req0.proposal_id, label);
+                                                }
                                             }
                                         }
                                         res
@@ -3816,9 +4000,17 @@ impl AgentRunner {
                                                 .await;
                                         }
                                         yield Ok(AgentEvent::Error(e.clone()));
+                                        // B21:tool_result(error;工具尝试已失败,补记保重放完整)
+                                        if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
+                                            let _ = j.tool_result(cid, "error", &e.to_string());
+                                        }
                                         let duration = start_time.elapsed().as_millis() as u64;
                                         let _ = runner.flush_messages(&session_id).await;
                                         runner.submit_tool_traces(&session_id).await;
+                                        // B21:turn_ended(error,优雅终止路径显式收尾)
+                                        if let Some(g) = turn_guard.take() {
+                                            g.end("error", step_count as u64, duration);
+                                        }
                                         yield Ok(AgentEvent::Done(AgentResult::error(
                                             e.to_string(), step_count, duration,
                                         )));
@@ -3827,6 +4019,11 @@ impl AgentRunner {
                                 };
                                 // 审批事件已在两阶段流程中即时 yield(见 Pending 分支)
                                 let final_result = outcome.final_result;
+
+                                // B21:tool_result(ok;content = 工具输出全文与 io_response 一致)
+                                if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
+                                    let _ = j.tool_result(cid, "ok", &final_result.to_string());
+                                }
 
                                 // 3. 记录 tool_calls + 持久化 tool 消息(同 handle_call_service)
                                 tool_calls.push(tool_name.clone());
@@ -3925,6 +4122,10 @@ impl AgentRunner {
                             content
                         };
                         runner.submit_tool_traces(&session_id).await;
+                        // B21:turn_ended(success)
+                        if let Some(g) = turn_guard.take() {
+                            g.end("success", step_count as u64, duration);
+                        }
                         yield Ok(AgentEvent::Done(AgentResult::success(
                             content, step_count, duration, tool_calls,
                         )));
@@ -3945,6 +4146,10 @@ impl AgentRunner {
                         // C1:会话沉淀（best-effort，即使出错也尝试沉淀已收集的对话）
                         let _ = runner.sediment_session(&session_id, &messages).await;
                         runner.submit_tool_traces(&session_id).await;
+                        // B21:turn_ended(error)
+                        if let Some(g) = turn_guard.take() {
+                            g.end("error", step_count as u64, duration);
+                        }
                         yield Ok(AgentEvent::Done(AgentResult::error(msg.to_string(), step_count, duration)));
                         return;
                     }
@@ -3963,6 +4168,10 @@ impl AgentRunner {
                         let _ = runner.flush_messages(&session_id).await;
                         let _ = runner.sediment_session(&session_id, &messages).await;
                         runner.submit_tool_traces(&session_id).await;
+                        // B21:turn_ended(error)
+                        if let Some(g) = turn_guard.take() {
+                            g.end("error", step_count as u64, duration);
+                        }
                         yield Ok(AgentEvent::Done(AgentResult::error(
                             format!("enforce violation: rule_index={rule_index:?}, reason={reason}"),
                             step_count, duration,
@@ -3979,6 +4188,10 @@ impl AgentRunner {
             let duration = start_time.elapsed().as_millis() as u64;
             let _ = runner.flush_messages(&session_id).await;
             runner.submit_tool_traces(&session_id).await;
+            // B21:turn_ended(error)
+            if let Some(g) = turn_guard.take() {
+                g.end("error", step_count as u64, duration);
+            }
             // D-01 二次保险（B2）：断流可能吞掉 Violation 帧，查 evolution-signals
             // 兜底归因 enforce 命中；查询不可用时降级返回原错误（不掩盖不阻塞）。
             let closed_error = runner

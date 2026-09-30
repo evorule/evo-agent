@@ -2334,7 +2334,7 @@ async fn first_round_intent_goes_through_adjudication_channel() {
         "/outside/x.txt"
     };
     let result = runner
-        .execute_tool_call("file_read", &serde_json::json!({ "path": abs }))
+        .execute_tool_call("file_read", &serde_json::json!({ "path": abs }), None)
         .await
         .expect("blocked verdict must surface as tool result, not error");
     assert_eq!(result["status"], "blocked_by_governance_rule");
@@ -2526,7 +2526,7 @@ async fn p2_blocked_intent_prevents_execution() {
     let runner =
         AgentRunner::new(AgentConfig::default(), client).with_capability_boundary(m5c_boundary());
     let result = runner
-        .execute_tool_call("file_delete", &serde_json::json!({ "path": abs }))
+        .execute_tool_call("file_delete", &serde_json::json!({ "path": abs }), None)
         .await
         .expect("blocked verdict must surface as tool result, not error");
     assert_eq!(result["status"], "blocked_by_governance_rule");
