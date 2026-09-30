@@ -1791,29 +1791,44 @@ impl AgentRunner {
 
     /// 组装随 LLM 请求下发的工具 OpenAI function schema。
     ///
-    /// 数据源 = 静态工具 spec 目录(`default_tool_specs`,delegate 若已注册则追加其 spec)
-    /// 与 `tool_handler` 实际注册执行器求交;agent 配置的 `tools` 列表已在
-    /// `from_definition` 校验过 ⊆ 注册集,故以注册集为准即可覆盖配置意图。
+    /// 数据源与 schema 形状见 [`Self::openai_function_schemas_for`];此处仅决定
+    /// 名字清单来源(`tool_handler` 实际注册执行器;agent 配置的 `tools` 列表已在
+    /// `from_definition` 校验过 ⊆ 注册集,故以注册集为准即可覆盖配置意图)与
+    /// 空集语义(返回 `None` = 请求不携带 tools 键,向后兼容)。
+    fn openai_tools_payload(&self) -> Option<Vec<Value>> {
+        let registered = self.tool_handler.tool_names();
+        let tools = Self::openai_function_schemas_for(&registered);
+        if tools.is_empty() {
+            None
+        } else {
+            Some(tools)
+        }
+    }
+
+    /// 工具名清单 → OpenAI function calling schema 数组。
+    ///
+    /// runner LLM 请求([`Self::openai_tools_payload`])与 G2 atif 导出端点
+    /// (`GET /api/sessions/{id}/atif` 的 tool_definitions)共用此**单一实现**,
+    /// 防两处 schema 组装漂移。
+    ///
+    /// 数据源 = 静态工具 spec 目录(`default_tool_specs` + `rule_tool_specs` +
+    /// delegate)与传入名字清单求交(delegate spec 常驻目录,仅在名字命中时
+    /// 产出,与旧「注册才并入」语义等价);未知名(自定义注册、服务代理等无
+    /// 静态 spec)从服务消费桥注册表透出 description/parameters,无声明时
+    /// 降级为最小 schema 并记 debug 日志。
     ///
     /// 形状遵循 OpenAI function calling 标准 JSON Schema:
     /// `{"type":"function","function":{"name","description","parameters":{type:object,properties,required}}}`。
-    /// 未知名(自定义注册、服务代理等无静态 spec)从服务消费桥注册表透出
-    /// description/parameters,无声明时降级为最小 schema 并记 debug 日志。
-    ///
-    /// 返回 `None` = 请求不携带 tools 键(空集/无工具场景,向后兼容)。
-    fn openai_tools_payload(&self) -> Option<Vec<Value>> {
-        let registered = self.tool_handler.tool_names();
+    pub(crate) fn openai_function_schemas_for(names: &[String]) -> Vec<Value> {
         let mut specs = crate::builtin_tools::default_tool_specs();
         // 规则工具静态 spec 并入:rule_tools 的 45 个工具若不在此处,会走 dynamic
         // 分支产出空参数 schema,LLM 无从得知 workspace_id 等必填参数(实测盲传
         // 导致 rule_list 失败)。spec 与执行器同源于 rule_tool_specs()。
         specs.extend(crate::rule_tools::rule_tool_specs());
-        if self.tool_handler.has_tool("delegate") {
-            specs.push(crate::builtin_tools::delegate_tool::delegate_tool_spec());
-        }
+        specs.push(crate::builtin_tools::delegate_tool::delegate_tool_spec());
 
         let mut tools = Vec::new();
-        for name in &registered {
+        for name in names {
             let Some(spec) = specs.iter().find(|s| &s.name == name) else {
                 // 动态注册的工具(如 server 插件服务代理)无静态 spec:描述与参数
                 // 契约从服务消费桥的注册表透出(对账清单 description/parameters,
@@ -1857,12 +1872,7 @@ impl AgentRunner {
                 }
             }));
         }
-
-        if tools.is_empty() {
-            None
-        } else {
-            Some(tools)
-        }
+        tools
     }
 
     /// LLM 请求的 tools 来源:server 中继优先,缺省回 runner 本地 schema
