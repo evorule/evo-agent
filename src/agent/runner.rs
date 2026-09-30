@@ -48,6 +48,34 @@ pub const DEFAULT_MAX_DELEGATE_DEPTH: usize = 3;
 /// 数十至数百条；10,000 条 = 超长会话（多轮重试/长循环）的异常增长信号。
 const CHAIN_SIZE_WARN_ENTRIES: u64 = 10_000;
 
+/// tool_result 回喂 LLM 前的字符上限(约 12k tokens,ASCII 口径)
+///
+/// 单个超大工具输出(整页网页、长日志等)会挤占上下文预算,连带把任务锚点
+/// 从尾部保留区挤出。截断仅作用于回喂 LLM 的 messages 入列值;审计链
+/// persist_message / ToolResult 事件保留原始全文(事实记录不动,与 trim
+/// 不改写原 messages 的哲学一致)。
+const TOOL_RESULT_MAX_CHARS: usize = 48_000;
+
+/// 截断过长的 tool_result:保留头尾各半,中间插入截断标注;未超限原样归还
+fn truncate_tool_result(raw: String) -> String {
+    // 字节长度快路径(字符数 ≤ 字节数,未超字节限必然未超字符限)
+    if raw.len() <= TOOL_RESULT_MAX_CHARS {
+        return raw;
+    }
+    let total_chars = raw.chars().count();
+    if total_chars <= TOOL_RESULT_MAX_CHARS {
+        return raw;
+    }
+    let truncated = total_chars - TOOL_RESULT_MAX_CHARS;
+    let marker = format!("\n...[truncated {} chars]...\n", truncated);
+    let keep = TOOL_RESULT_MAX_CHARS.saturating_sub(marker.chars().count());
+    let head = keep / 2;
+    let tail = keep - head;
+    let head_str: String = raw.chars().take(head).collect();
+    let tail_str: String = raw.chars().skip(total_chars - tail).collect();
+    format!("{}{}{}", head_str, marker, tail_str)
+}
+
 #[derive(Debug, Clone)]
 /// TODO: doc
 pub struct AgentConfig {
@@ -2210,13 +2238,23 @@ impl AgentRunner {
 
         tool_calls.push(tool_name.to_string());
         let tool_idx = messages.len();
+        // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文(事实记录)
+        let raw_content = tool_result.to_string();
         let tool_msg = Message::Tool {
-            content: tool_result.to_string(),
+            content: truncate_tool_result(raw_content.clone()),
             tool_name: tool_name.to_string(),
         };
-        messages.push(tool_msg.clone());
+        messages.push(tool_msg);
         // P0: 持久化 tool 消息
-        self.persist_message(session_id, tool_idx, tool_msg).await?;
+        self.persist_message(
+            session_id,
+            tool_idx,
+            Message::Tool {
+                content: raw_content,
+                tool_name: tool_name.to_string(),
+            },
+        )
+        .await?;
 
         let mut result = serde_json::json!({
             "tool_name": tool_name,
@@ -3657,12 +3695,24 @@ impl AgentRunner {
                                         // 按 tool_name FIFO 匹配最近 assistant)
                                         tool_calls.push(tc.name.clone());
                                         let tool_idx = messages.len();
+                                        // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
+                                        let raw_content = outcome.final_result.to_string();
                                         let tool_msg = Message::Tool {
-                                            content: outcome.final_result.to_string(),
+                                            content: truncate_tool_result(raw_content.clone()),
                                             tool_name: tc.name.clone(),
                                         };
-                                        messages.push(tool_msg.clone());
-                                        if let Err(e) = runner.persist_message(&session_id, tool_idx, tool_msg).await {
+                                        messages.push(tool_msg);
+                                        if let Err(e) = runner
+                                            .persist_message(
+                                                &session_id,
+                                                tool_idx,
+                                                Message::Tool {
+                                                    content: raw_content,
+                                                    tool_name: tc.name.clone(),
+                                                },
+                                            )
+                                            .await
+                                        {
                                             // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                             if let Some(rid) = request_id {
                                                 let err_str = e.to_string();
@@ -3781,12 +3831,24 @@ impl AgentRunner {
                                 // 3. 记录 tool_calls + 持久化 tool 消息(同 handle_call_service)
                                 tool_calls.push(tool_name.clone());
                                 let tool_idx = messages.len();
+                                // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
+                                let raw_content = final_result.to_string();
                                 let tool_msg = Message::Tool {
-                                    content: final_result.to_string(),
+                                    content: truncate_tool_result(raw_content.clone()),
                                     tool_name: tool_name.clone(),
                                 };
-                                messages.push(tool_msg.clone());
-                                if let Err(e) = runner.persist_message(&session_id, tool_idx, tool_msg).await {
+                                messages.push(tool_msg);
+                                if let Err(e) = runner
+                                    .persist_message(
+                                        &session_id,
+                                        tool_idx,
+                                        Message::Tool {
+                                            content: raw_content,
+                                            tool_name: tool_name.clone(),
+                                        },
+                                    )
+                                    .await
+                                {
                                     // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                     if let Some(rid) = request_id {
                                         let err_str = e.to_string();
@@ -3953,7 +4015,9 @@ fn rec_to_message(rec: &MessageRecord) -> Option<Message> {
             })
         }
         "tool" => rec.tool_name.clone().map(|tool_name| Message::Tool {
-            content: rec.content.clone(),
+            // 重建值同样按上限截断:continuation 恢复路径与运行中回喂的 wire
+            // 形态保持一致(审计链始终存原始全文,截断仅作用于回喂 LLM 的值)
+            content: truncate_tool_result(rec.content.clone()),
             tool_name,
         }),
         other => {
