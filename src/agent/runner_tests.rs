@@ -1527,6 +1527,33 @@ fn test_g15_rec_to_message_tool() {
 }
 
 #[test]
+fn test_g15_rec_to_message_tool_long_content_truncated() {
+    // 重建路径与运行中回喂 wire 形态一致:超限 tool 记录重建时同样截断
+    let raw = "a".repeat(TOOL_RESULT_MAX_CHARS + 100);
+    let rec = MessageRecord {
+        idx: 3,
+        role: "tool".to_string(),
+        content: raw.clone(),
+        tool_calls: None,
+        tool_name: Some("search".to_string()),
+        timestamp: 0,
+        fact_id: None,
+    };
+    let msg = rec_to_message(&rec).expect("tool rec should convert");
+    match msg {
+        Message::Tool { content, tool_name } => {
+            assert_eq!(tool_name, "search");
+            assert!(
+                content.contains("[truncated 100 chars]"),
+                "reconstructed tool content must be truncated like the live feed path"
+            );
+            assert!(content.chars().count() <= TOOL_RESULT_MAX_CHARS);
+        }
+        other => panic!("expected Tool message, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_g15_rec_to_message_tool_missing_name() {
     let rec = MessageRecord {
         idx: 3,
@@ -2586,4 +2613,58 @@ fn m5c_constraint_asset_domain_paths_are_exec_relative() {
             "exists 判据必须指向 payload 状态路径（payload.meta_task.*），发现: {p}"
         );
     }
+}
+
+// ----- tool_result 回喂截断 -----
+
+#[test]
+fn truncate_tool_result_short_unchanged() {
+    assert_eq!(truncate_tool_result("hello".to_string()), "hello");
+}
+
+#[test]
+fn truncate_tool_result_exact_boundary_unchanged() {
+    let s = "x".repeat(TOOL_RESULT_MAX_CHARS);
+    assert_eq!(truncate_tool_result(s.clone()), s);
+}
+
+#[test]
+fn truncate_tool_result_long_truncated_with_marker() {
+    let s = "a".repeat(TOOL_RESULT_MAX_CHARS + 100);
+    let out = truncate_tool_result(s);
+    assert!(
+        out.contains("[truncated 100 chars]"),
+        "marker must carry exact truncated count, tail: {}",
+        &out[out.len().saturating_sub(80)..]
+    );
+    assert!(out.starts_with("aaaa"), "head half must be preserved");
+    assert!(out.ends_with("aaaa"), "tail half must be preserved");
+    assert!(
+        out.chars().count() <= TOOL_RESULT_MAX_CHARS,
+        "truncated output must not exceed the cap"
+    );
+}
+
+#[test]
+fn truncate_tool_result_cjk_char_boundary_safe() {
+    // CJK 3 字节/字符:字节超限但必须按字符边界切,不得 panic
+    let s: String = std::iter::repeat_n('中', TOOL_RESULT_MAX_CHARS + 50).collect();
+    let out = truncate_tool_result(s);
+    assert!(out.contains("[truncated 50 chars]"));
+    assert!(out.starts_with('中'));
+    assert!(out.ends_with('中'));
+}
+
+#[test]
+fn truncate_tool_result_keeps_head_and_tail() {
+    let s = format!(
+        "{}{}{}",
+        "H".repeat(30_000),
+        "M".repeat(30_000),
+        "T".repeat(30_000)
+    );
+    let out = truncate_tool_result(s);
+    assert!(out.starts_with('H'), "head half must come from original head");
+    assert!(out.ends_with('T'), "tail half must come from original tail");
+    assert!(!out.contains('M'), "middle section must be cut");
 }

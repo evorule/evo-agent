@@ -26,6 +26,8 @@
 //! 摘要可以用与主对话不同的(更便宜的)模型,通过 `summary_model` 配置。
 //! 如果未配置,fallback 到 `LlmHandler` 的 `default_model`。
 
+use std::sync::{Arc, Mutex};
+
 use serde_json::Value;
 use tracing::warn;
 
@@ -134,6 +136,17 @@ pub struct ContextSummarizer {
     summary_prompt: String,
     /// Q9 Strategy B:触发摘要的最小裁剪消息数
     summary_threshold: usize,
+    /// 滚动摘要缓存:(frozen_dropped_len, 不含头缀的摘要正文)
+    ///
+    /// summarizer 随 runner 构造(每次运行新建实例),dropped 序列随裁剪单调
+    /// 增长,按 frozen 长度做增量摘要,消除每轮全量重算:
+    /// - dropped.len() == frozen → 直接复用,零 LLM 调用
+    /// - dropped.len() > frozen → 输入 = 旧摘要(并入 system prompt)+ dropped[frozen..]
+    /// - LLM 失败不写缓存,旧值保留(下次重试仍从旧 frozen 增量)
+    /// - dropped.len() < frozen(理论不发生,防御)→ 忽略缓存全量重算
+    /// - 前提:缓存随 runner 实例私有(现状成立);若未来跨会话共享
+    ///   summarizer,需为缓存键引入会话维度
+    summary_cache: Arc<Mutex<Option<(usize, String)>>>,
 }
 
 impl ContextSummarizer {
@@ -148,6 +161,7 @@ impl ContextSummarizer {
             summary_model,
             summary_prompt: DEFAULT_SUMMARY_PROMPT.to_string(),
             summary_threshold: DEFAULT_SUMMARY_THRESHOLD,
+            summary_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -225,20 +239,48 @@ impl ContextSummarizer {
             return Ok(String::new());
         }
 
+        // 滚动缓存快照(锁内仅取快照,不做 await)。长度命中时直接复用,零 LLM 调用
+        let (frozen, rolling) = {
+            let guard = self
+                .summary_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match guard.as_ref() {
+                Some((frozen, rolling)) if *frozen == dropped.len() => {
+                    tracing::debug!(dropped = dropped.len(), "G10: summary cache hit");
+                    return Ok(format!("[earlier conversation summary]\n{}", rolling));
+                }
+                Some((frozen, rolling)) if *frozen < dropped.len() => {
+                    (Some(*frozen), Some(rolling.clone()))
+                }
+                _ => (None, None),
+            }
+        };
+        let incremental_from = frozen.unwrap_or(0);
+
         tracing::debug!(
             dropped = dropped.len(),
+            incremental_from = incremental_from,
             model = ?self.summary_model,
             "G10: generating summary for dropped messages"
         );
 
         // 构造 messages 数组:system prompt + dropped messages
         // Message 实现了 Serialize(tag = "role"),直接序列化为 {role, content, ...}
+        // 增量模式:system prompt 附带旧摘要,输入 = 增量段而非全量重算
+        let mut system_content = self.summary_prompt.clone();
+        if let Some(old) = &rolling {
+            system_content.push_str(
+                "\n\n[以下是更早消息的既有摘要,请在其基础上合并续写,保留仍然有效的要点]\n",
+            );
+            system_content.push_str(old);
+        }
         let mut messages_vec: Vec<serde_json::Value> = Vec::with_capacity(dropped.len() + 1);
         messages_vec.push(serde_json::json!({
             "role": "system",
-            "content": self.summary_prompt,
+            "content": system_content,
         }));
-        for msg in dropped {
+        for msg in &dropped[incremental_from..] {
             let serialized = serde_json::to_value(msg)
                 .map_err(|e| format!("serialize dropped message: {}", e))?;
             messages_vec.push(serialized);
@@ -278,6 +320,15 @@ impl ContextSummarizer {
         if summary.is_empty() {
             warn!("G10: LLM returned empty summary, keeping original hint");
             return Ok(String::new());
+        }
+
+        // 成功后才更新缓存;失败路径不触碰缓存(下次重试仍从旧 frozen 增量)
+        {
+            let mut guard = self
+                .summary_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *guard = Some((dropped.len(), summary.to_string()));
         }
 
         Ok(format!("[earlier conversation summary]\n{}", summary))
@@ -975,5 +1026,132 @@ mod tests {
         let out: SessionSummaryOut = serde_json::from_str(json).unwrap();
         assert_eq!(out.summary, "test");
         assert!(out.stable_facts.is_empty());
+    }
+
+    // ========== 滚动摘要缓存测试 ==========
+
+    fn marker_msgs(prefix: &str, n: usize) -> Vec<Message> {
+        (0..n).map(|i| user(&format!("{}-{}", prefix, i))).collect()
+    }
+
+    fn openai_body(content: &str) -> String {
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": content}}]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_summarize_dropped_cache_hit_zero_llm_calls() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openai_body("cached summary text").as_str())
+            .expect(1)
+            .create_async()
+            .await;
+        let llm = LlmHandler::new("m", &server.url(), None).with_max_retries(0);
+        let s = ContextSummarizer::new(llm, None).with_threshold(2);
+        let dropped = make_dropped(3);
+        let first = s.summarize_dropped(&dropped).await.unwrap();
+        assert!(first.contains("cached summary text"));
+        // 同长度再次调用 → 命中缓存,零 LLM 调用
+        let second = s.summarize_dropped(&dropped).await.unwrap();
+        assert_eq!(second, first);
+        mock.assert_async().await; // expect(1):第二次若再击中服务端则失败
+    }
+
+    #[tokio::test]
+    async fn test_summarize_dropped_cache_incremental_input() {
+        let mut server = mockito::Server::new_async().await;
+        // 第一次:全量输入(含 old-0 原文)
+        let m1 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex("old-0".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openai_body("FIRST-ROUND-SUMMARY").as_str())
+            .expect(1)
+            .create_async()
+            .await;
+        // 第二次:增量输入 = 旧摘要(并入 system prompt)+ dropped[frozen..]
+        // (含 new-0 与旧摘要正文,不含 old-0 原文)
+        let m2 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "FIRST-ROUND-SUMMARY.*new-0".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openai_body("SECOND-ROUND-SUMMARY").as_str())
+            .expect(1)
+            .create_async()
+            .await;
+        let llm = LlmHandler::new("m", &server.url(), None).with_max_retries(0);
+        let s = ContextSummarizer::new(llm, None).with_threshold(2);
+        let dropped = marker_msgs("old", 5);
+        let first = s.summarize_dropped(&dropped).await.unwrap();
+        assert!(first.contains("FIRST-ROUND-SUMMARY"));
+        // dropped 增长后再次调用:增量输入 = 旧摘要(并入 system prompt)+ dropped[frozen..]
+        let mut grown = dropped.clone();
+        grown.extend(marker_msgs("new", 3));
+        let second = s.summarize_dropped(&grown).await.unwrap();
+        assert!(second.contains("SECOND-ROUND-SUMMARY"));
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_summarize_dropped_cache_failure_keeps_old_cache() {
+        let mut server = mockito::Server::new_async().await;
+        // 第一次成功(全量,含 old-0 原文)
+        let ok1 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex("old-0".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openai_body("FIRST-SUMMARY").as_str())
+            .expect(1)
+            .create_async()
+            .await;
+        // 第二次失败(增量请求,500;mock 饱和后不再匹配,第三次落到 ok2)
+        let fail = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex("new-0".to_string()))
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+        // 第三次成功:失败后缓存保留,仍从旧 frozen 增量(输入含 new-0 而非全量重算)
+        let ok2 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex("new-0".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openai_body("SECOND-SUMMARY").as_str())
+            .expect(1)
+            .create_async()
+            .await;
+        let llm = LlmHandler::new("m", &server.url(), None).with_max_retries(0);
+        let s = ContextSummarizer::new(llm, None).with_threshold(2);
+        let dropped = marker_msgs("old", 5);
+
+        let first = s.summarize_dropped(&dropped).await.unwrap();
+        assert!(first.contains("FIRST-SUMMARY"));
+
+        // dropped 增长 → 增量请求(500 失败)
+        let mut grown = dropped.clone();
+        grown.extend(marker_msgs("new", 3));
+        assert!(s.summarize_dropped(&grown).await.is_err());
+
+        // 失败后缓存保留:重试仍从旧 frozen 增量(输入含 new-0 而非全量重算)
+        let third = s.summarize_dropped(&grown).await.unwrap();
+        assert!(third.contains("SECOND-SUMMARY"));
+
+        ok1.assert_async().await;
+        fail.assert_async().await;
+        ok2.assert_async().await;
     }
 }

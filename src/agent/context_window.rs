@@ -22,7 +22,8 @@
 //! 1. 拆分 system / non-system
 //! 2. 保留所有 system 消息
 //! 3. 从尾部往前累加 non-system,直到接近 budget
-//! 4. tool_call + 紧随其后的 tool_result 视为原子对,要么都留要么都丢
+//! 4. tool_call 与其紧随的连续 tool_result 段(并行 tool_calls 产生多条)
+//!    视为原子组,要么都留要么都丢
 //! 5. 中间插入一条 system 提示 "[earlier N messages trimmed]"
 
 use crate::agent::translator::Message;
@@ -299,18 +300,25 @@ impl ContextWindowManager {
             };
         }
 
-        // 3. 从尾部往前累加,tool_call/tool_result 视为原子对
+        // 3. 从尾部往前累加,tool_call/tool_result 视为原子组
         let mut kept: Vec<(usize, Message)> = Vec::new();
         let mut kept_tokens = 0usize;
         let mut i = non_system.len();
         while i > 0 {
             i -= 1;
             let (_, msg) = &non_system[i];
-            // 如果是 tool_result(Message::Tool),它前面的 assistant 可能含 tool_calls,
-            // 二者必须一起保留(否则 LLM 收到孤立的 tool_result 会报错)
+            // 如果是 tool_result(Message::Tool),它所属的连续 Tool 结果段必须与
+            // 发起 tool_calls 的 assistant 整体成组:并行 tool_calls 会产生多条
+            // 连续 Tool 消息,只合并紧邻 assistant 会在段中间切开,留下孤立的
+            // tool_result(LLM 收到无配对 tool_call_id 的 tool 消息会报错)
             let mut group: Vec<(usize, Message)> = vec![non_system[i].clone()];
             if let Message::Tool { .. } = msg {
-                // 向前找紧邻的 Assistant(含 tool_calls)
+                // 向前收集连续 Tool 段(多并行 tool_calls 的结果队列)
+                while i > 0 && matches!(non_system[i - 1].1, Message::Tool { .. }) {
+                    group.insert(0, non_system[i - 1].clone());
+                    i -= 1;
+                }
+                // 段前紧邻的 Assistant(含 tool_calls)一并成组
                 if i > 0 {
                     if let Message::Assistant { tool_calls, .. } = &non_system[i - 1].1 {
                         if tool_calls.as_ref().map(|c| !c.is_empty()).unwrap_or(false) {
@@ -551,6 +559,73 @@ mod tests {
                         trimmed[i - 1]
                     ),
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_trim_parallel_tool_calls_group_atomic() {
+        // 多并行 tool_calls:assistant(tc×3) + 3 条连续 tool_result 是一个原子组,
+        // 裁剪边界切进组中间时不得留下孤立的 tool_result
+        let mgr =
+            ContextWindowManager::with_approx_counter(40, 10, TrimStrategy::KeepSystemKeepLast);
+        // budget = 30;system "sys" ≈ 8 token,available_for_recent ≈ 2 token,
+        // 尾部工具组整体超预算,但必须整组保留(不得切进组中间)
+        let three_calls = Message::Assistant {
+            content: "calling".to_string(),
+            tool_calls: Some(vec![
+                ToolCall {
+                    name: "search".to_string(),
+                    arguments: json!({"q": "test"}),
+                },
+                ToolCall {
+                    name: "search".to_string(),
+                    arguments: json!({"q": "test"}),
+                },
+                ToolCall {
+                    name: "search".to_string(),
+                    arguments: json!({"q": "test"}),
+                },
+            ]),
+        };
+        let msgs = vec![
+            system("sys"),
+            user("q1"),
+            three_calls,
+            tool_result("result1", "search"),
+            tool_result("result2", "search"),
+            tool_result("result3", "search"),
+        ];
+        let (trimmed, dropped) = mgr.trim(&msgs);
+        assert_eq!(dropped, 1, "only the earliest user msg should drop");
+        // 原子性:3 条 tool_result 必须全部一起保留
+        let tool_count = trimmed
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { .. }))
+            .count();
+        assert_eq!(
+            tool_count, 3,
+            "all 3 parallel tool results must survive together"
+        );
+        // 配对完整性:每条连续 tool_result 段的段头前面必须是有 tool_calls 的
+        // assistant(段中消息的合法前驱就是前一条 tool_result,无需检查)
+        for i in 0..trimmed.len() {
+            if !matches!(trimmed[i], Message::Tool { .. }) {
+                continue;
+            }
+            if i > 0 && matches!(trimmed[i - 1], Message::Tool { .. }) {
+                continue;
+            }
+            let prev = i.checked_sub(1).map(|p| &trimmed[p]);
+            match prev {
+                Some(Message::Assistant { tool_calls, .. }) => {
+                    assert!(
+                        tool_calls.as_ref().map(|c| !c.is_empty()).unwrap_or(false),
+                        "tool_result run head at {} preceded by assistant without tool_calls",
+                        i
+                    );
+                }
+                other => panic!("orphan tool_result run at {}: head preceded by {:?}", i, other),
             }
         }
     }
