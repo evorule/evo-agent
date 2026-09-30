@@ -2664,7 +2664,10 @@ fn truncate_tool_result_keeps_head_and_tail() {
         "T".repeat(30_000)
     );
     let out = truncate_tool_result(s);
-    assert!(out.starts_with('H'), "head half must come from original head");
+    assert!(
+        out.starts_with('H'),
+        "head half must come from original head"
+    );
     assert!(out.ends_with('T'), "tail half must come from original tail");
     assert!(!out.contains('M'), "middle section must be cut");
 }

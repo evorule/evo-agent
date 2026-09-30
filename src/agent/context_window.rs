@@ -625,7 +625,10 @@ mod tests {
                         i
                     );
                 }
-                other => panic!("orphan tool_result run at {}: head preceded by {:?}", i, other),
+                other => panic!(
+                    "orphan tool_result run at {}: head preceded by {:?}",
+                    i, other
+                ),
             }
         }
     }

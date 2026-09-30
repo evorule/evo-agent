@@ -241,10 +241,7 @@ impl ContextSummarizer {
 
         // 滚动缓存快照(锁内仅取快照,不做 await)。长度命中时直接复用,零 LLM 调用
         let (frozen, rolling) = {
-            let guard = self
-                .summary_cache
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let guard = self.summary_cache.lock().unwrap_or_else(|p| p.into_inner());
             match guard.as_ref() {
                 Some((frozen, rolling)) if *frozen == dropped.len() => {
                     tracing::debug!(dropped = dropped.len(), "G10: summary cache hit");
@@ -324,10 +321,7 @@ impl ContextSummarizer {
 
         // 成功后才更新缓存;失败路径不触碰缓存(下次重试仍从旧 frozen 增量)
         {
-            let mut guard = self
-                .summary_cache
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut guard = self.summary_cache.lock().unwrap_or_else(|p| p.into_inner());
             *guard = Some((dropped.len(), summary.to_string()));
         }
 
