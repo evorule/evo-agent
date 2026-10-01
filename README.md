@@ -99,6 +99,10 @@ Evo-Agent 是独立的应用层，通过 HTTP API 与 evorule 引擎对话：
   还可传 `exclude`（search_files）或 `excludeGlobs`（grep_files）追加排除，例如 `["vendor", "dist"]`。
 - **上下文窗口已显式配置**：各 agent 定义 `agents/<name>.json` 已声明 `context_window_tokens = 32768`
   （MiniMax-M2.5 支持 204800），长任务历史不易被裁剪；可按模型实际能力调整。
+- **workspace 目录跨会话持久**：agent 可写目录（`workspace/`）在会话结束后不自动清理；
+  自动化脚本、批跑驱动或测试装置复用同一目录前，请先显式清场（删除上轮产物）或改用独立
+  workdir——残留文件会静默改变后续运行的前提（如「文件已存在」「读到上轮内容」），使断言
+  与实验结论失真。
 
 
 ### 前置条件
