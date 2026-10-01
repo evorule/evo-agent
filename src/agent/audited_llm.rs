@@ -34,6 +34,14 @@
 //! 无静默直连兜底。server 不可达/协议失败时如实返回 `Err`，由调用方既有的
 //! best-effort 语义承接（如 G10 保留原 hint）。三个生产调用点全部位于依赖
 //! server 的运行周期内，直连兜底不带来新可用性，只会制造不可审计数据。
+//!
+//! ## 上下文压缩硬纪律（2026-10-01 立规）
+//!
+//! 本协议是「记账先于压缩」纪律的机制保障：prompt 全文（命令事实）与
+//! response 全文（io_response 事实）先于/伴随每次 LLM 执行入审计链。
+//! 未来任何上下文管理类调用（摘要变体、compaction 等）**必须经由本协议**，
+//! 禁止绕开直连 provider；新 purpose 值接入时同步核对 journal 侧
+//! `LlmCalled.purpose` 枚举与 ATIF 导出映射。
 
 use std::time::Duration;
 

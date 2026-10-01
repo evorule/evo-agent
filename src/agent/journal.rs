@@ -127,6 +127,12 @@ pub enum JournalEvent {
         evidence: String,
     },
     /// 窗口压力压缩执行(PR-3 接线,事件面先就绪)
+    ///
+    /// 接线纪律(2026-10-01 立规):压缩动作前被压缩原文必须全文在账
+    /// (审计链权威面,压缩只改工作记忆视图);压缩后窗口必须可由「账上
+    /// 事件+纯函数 render」确定性重建并留重建演示;压缩器若调 LLM 必走
+    /// AuditedLlm sidecar(purpose=compaction);本事件须携带被压缩原文的
+    /// 账面锚(call_id/FactId join 键)供 ATIF 导出对账。
     CompactionPerformed {
         /// 压缩前 token 估算
         before_est: usize,
