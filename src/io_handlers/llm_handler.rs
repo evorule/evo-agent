@@ -28,6 +28,10 @@ use crate::io_handler::{IoHandler, IoResult};
 
 /// 默认最大重试次数
 const DEFAULT_MAX_RETRIES: usize = 3;
+/// O-260: default connect timeout (secs) - unattended runs must not wait forever on a hung endpoint
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// O-260: default per-request total timeout (secs)
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// 默认初始退避(秒)
 const DEFAULT_BASE_BACKOFF_SECS: f64 = 1.0;
 /// 默认最大退避(秒)
@@ -113,6 +117,10 @@ pub struct LlmHandler {
     base_backoff_secs: f64,
     /// G3:最大退避(秒)
     max_backoff_secs: f64,
+    /// O-260:连接超时(秒)
+    connect_timeout_secs: u64,
+    /// O-260:单请求总超时(秒)
+    request_timeout_secs: u64,
 }
 
 impl LlmHandler {
@@ -126,12 +134,20 @@ impl LlmHandler {
             max_retries: DEFAULT_MAX_RETRIES,
             base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
             max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
+            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
         }
     }
 
     /// G3:覆盖最大重试次数（builder 风格；契约测试用 0 关闭重试避免退避延迟）
     pub fn with_max_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    /// O-260:覆盖请求超时(秒；连接超时固定 DEFAULT_CONNECT_TIMEOUT_SECS)
+    pub fn with_request_timeout(mut self, secs: u64) -> Self {
+        self.request_timeout_secs = secs;
         self
     }
 
@@ -151,6 +167,8 @@ impl LlmHandler {
                 max_retries: DEFAULT_MAX_RETRIES,
                 base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
                 max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
+                connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             }
         } else if let Ok(api_key) = std::env::var("DEEPSEEK_API_KEY") {
             Self {
@@ -163,6 +181,8 @@ impl LlmHandler {
                 max_retries: DEFAULT_MAX_RETRIES,
                 base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
                 max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
+                connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             }
         } else if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
             Self {
@@ -175,6 +195,8 @@ impl LlmHandler {
                 max_retries: DEFAULT_MAX_RETRIES,
                 base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
                 max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
+                connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             }
         } else {
             Self {
@@ -185,6 +207,8 @@ impl LlmHandler {
                 max_retries: DEFAULT_MAX_RETRIES,
                 base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
                 max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
+                connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             }
         }
     }
@@ -205,6 +229,8 @@ impl LlmHandler {
             max_retries: config.max_retries,
             base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
             max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
+            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
         }
     }
 
@@ -214,10 +240,14 @@ impl LlmHandler {
         max_retries: usize,
         base_backoff_secs: f64,
         max_backoff_secs: f64,
+        connect_timeout_secs: u64,
+        request_timeout_secs: u64,
     ) -> Self {
         self.max_retries = max_retries;
         self.base_backoff_secs = base_backoff_secs;
         self.max_backoff_secs = max_backoff_secs;
+        self.connect_timeout_secs = connect_timeout_secs;
+        self.request_timeout_secs = request_timeout_secs;
         self
     }
 
@@ -236,6 +266,8 @@ impl LlmHandler {
             max_retries: 0, // mock 不重试
             base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
             max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
+            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
         }
     }
 
@@ -325,7 +357,12 @@ impl LlmHandler {
         &self,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let client = reqwest::Client::new();
+        // O-260: connect/request dual timeout - unattended runs must not hang
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(self.connect_timeout_secs))
+            .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let mut request = client.post(&self.api_base).json(body);
 
         if let Some(api_key) = &self.api_key {
@@ -477,6 +514,9 @@ impl LlmHandler {
         let api_base = self.api_base.clone();
         let api_key = self.api_key.clone();
         let mock_content = self.mock_content.clone();
+        // O-260:超时值提升为局部量（stream! 块内不持有 &self）
+        let connect_secs = self.connect_timeout_secs;
+        let request_secs = self.request_timeout_secs;
 
         Box::pin(stream! {
             // === Mock 短路 ===
@@ -504,7 +544,12 @@ impl LlmHandler {
             }
 
             // === HTTP 请求 ===
-            let client = reqwest::Client::new();
+            // O-260: streaming path same dual timeout
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(connect_secs))
+                .timeout(std::time::Duration::from_secs(request_secs))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
             let mut request = client.post(&api_base).json(&body);
             if let Some(key) = &api_key {
                 request = request.header("Authorization", format!("Bearer {}", key));
