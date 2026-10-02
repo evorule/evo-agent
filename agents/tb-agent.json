@@ -25,7 +25,15 @@
     "git_diff",
     "git_log",
     "git_stage",
-    "git_commit"
+    "git_commit",
+    "rule_list",
+    "rule_get",
+    "rule_validate",
+    "rule_create",
+    "rule_update",
+    "knowledge_datasets",
+    "knowledge_search",
+    "knowledge_entry_get"
   ],
   "memory": {
     "type": "persistent",
