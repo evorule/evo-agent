@@ -1330,6 +1330,34 @@ impl AgentRunner {
         Ok(())
     }
 
+    /// O-240:会话终态标记（PayloadUpdate，append-only 不改既有事实）。
+    /// 早期失败窗口的失败也留痕——不留「有始无终」孤儿会话。
+    /// 标记提交自身失败时再留一层 warn（两层失败可见，不静默）。
+    fn mark_session_terminal(&self, session_id: &str, stage: &str, reason: &str) {
+        warn!(%session_id, stage, reason, "O-240: startup failure - session terminal marker pending");
+        let session_id = session_id.to_owned();
+        let marker = serde_json::json!({
+            "session_terminal": {
+                "state": "error",
+                "stage": stage,
+                "reason": reason,
+                "at_epoch_ms": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            }
+        });
+        let client = self.evorule_client.clone();
+        tokio::spawn(async move {
+            if let Err(land_err) = client
+                .update_payload(&session_id, "__meta__.session_terminal", &marker)
+                .await
+            {
+                warn!(%session_id, error = %land_err, "O-240: 终态标记提交也失败（会话彻底孤儿，人工介入）");
+            }
+        });
+    }
+
     async fn persist_message(
         &mut self,
         session_id: &str,
@@ -1540,12 +1568,27 @@ impl AgentRunner {
         }
         let _session_guard = SessionActiveGuard::new(self.metrics.clone());
 
-        let _recalled_fact_ids = self.auto_recall(&session_id).await?;
+        // O-240:早期失败窗口收口——create_session 成功后的失败也留终态标记，
+        // 不留「有始无终」孤儿会话（与「失败也回写 io_response」契约同族）
+        let _recalled_fact_ids = match self.auto_recall(&session_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.mark_session_terminal(&session_id, "startup", &e.to_string());
+                return Err(e);
+            }
+        };
 
         // 注意:必须先订阅 SSE 事件,再提交命令。
         // tokio broadcast 通道只接收订阅之后发出的消息,不重放历史。
         // 如果先 submit_command 再 subscribe,会错过 io_request 事件,导致 ReAct 循环无法启动。
-        let mut event_stream = self.evorule_client.subscribe_events(&session_id).await?;
+        let mut event_stream = match self.evorule_client.subscribe_events(&session_id).await {
+            Ok(es) => es,
+            Err(e) => {
+                let err = AgentError::from(e);
+                self.mark_session_terminal(&session_id, "startup", &err.to_string());
+                return Err(err);
+            }
+        };
 
         let command =
             self.build_call_external_command(&system_prompt, goal, self.openai_tools_payload());
