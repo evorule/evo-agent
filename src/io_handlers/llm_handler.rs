@@ -240,14 +240,10 @@ impl LlmHandler {
         max_retries: usize,
         base_backoff_secs: f64,
         max_backoff_secs: f64,
-        connect_timeout_secs: u64,
-        request_timeout_secs: u64,
     ) -> Self {
         self.max_retries = max_retries;
         self.base_backoff_secs = base_backoff_secs;
         self.max_backoff_secs = max_backoff_secs;
-        self.connect_timeout_secs = connect_timeout_secs;
-        self.request_timeout_secs = request_timeout_secs;
         self
     }
 

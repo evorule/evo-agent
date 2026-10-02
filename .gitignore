@@ -64,3 +64,6 @@ evo-agent.toml.bak*
 
 # 本地临时脚手架（hello-world 试验项目，不入库）
 sleep_worker/
+
+# CodeGraph 工具本地数据(自忽略声明文件属于工具,不入库)
+.codegraph/
