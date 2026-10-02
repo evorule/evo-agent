@@ -1450,7 +1450,7 @@ impl MemoryManager {
     /// - `idx`: 消息在 messages 数组中的索引
     /// - `message`: 消息内容
     pub async fn append_message(
-        &mut self,
+        &self,
         session_id: &str,
         idx: usize,
         message: &Message,
@@ -1464,6 +1464,40 @@ impl MemoryManager {
             .update_payload(session_id, &path, &payload_value)
             .await?;
         Ok(())
+    }
+
+    /// R3：滚动摘要落链（PayloadUpdate 专用路径）。
+    ///
+    /// 路径：`__memory__.{ns}.session_{sid}.rolling_summary`
+    /// （与 sediment 的跨会话共享路径分属不同层：本路径=会话内 L8 治理产物账，
+    /// sediment=跨会话 L6 知识——非双写，权威关系见 07-R3 研究档 §二.B）。
+    pub async fn save_rolling_summary(
+        &self,
+        session_id: &str,
+        entry: &serde_json::Value,
+    ) -> Result<(), MemoryError> {
+        let path = self.build_path_scoped(
+            &MemoryScope::Session(session_id.to_string()),
+            "rolling_summary",
+        );
+        self.evorule_client
+            .update_payload(session_id, &path, entry)
+            .await?;
+        Ok(())
+    }
+
+    /// R3/G-3：从 payload 状态回读滚动摘要种子（None = 未落链）。
+    pub fn rolling_summary_from_state(
+        state: &serde_json::Value,
+        namespace: &str,
+        session_id: &str,
+    ) -> Option<(usize, String, u64)> {
+        let node = &state["payload"]["__memory__"][namespace][&format!("session_{}", session_id)]
+            ["rolling_summary"];
+        let frozen = node["frozen_len_after"].as_u64()?;
+        let text = node["summary_text"].as_str()?.to_owned();
+        let gen = node["gen"].as_u64()?;
+        Some((frozen as usize, text, gen))
     }
 
     /// 批量追加消息（P0 性能优化，用于 EveryN/PerReactRound 模式）
