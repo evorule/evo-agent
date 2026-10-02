@@ -159,7 +159,57 @@ pub struct ContextSummarizer {
     /// - dropped.len() < frozen(理论不发生,防御)→ 忽略缓存全量重算
     /// - 前提:缓存随 runner 实例私有(现状成立);若未来跨会话共享
     ///   summarizer,需为缓存键引入会话维度
-    summary_cache: Arc<Mutex<Option<(usize, String)>>>,
+    summary_cache: Arc<Mutex<Option<RollingCache>>>,
+}
+
+/// 滚动摘要缓存条目（R3 落链批：缓存带代数，供落链 metadata 与 payload 回读种子）。
+#[derive(Debug, Clone)]
+struct RollingCache {
+    frozen_len: usize,
+    summary_text: String,
+    gen: u64,
+}
+
+/// 一次新生成摘要的落链元数据（R3 方案 B：PayloadUpdate 专用命名空间，
+/// 见 knowledge/上下文管理/07-R3 摘要升格 Fact 研究）。
+#[derive(Debug, Clone)]
+pub struct SummaryGenMetadata {
+    /// 摘要代数（会话内从 1 递增）
+    pub gen: u64,
+    /// 上一代 frozen 边界（首代 0）
+    pub frozen_len_before: usize,
+    /// 本代 frozen 边界（= dropped.len()）
+    pub frozen_len_after: usize,
+    /// 摘要策略指纹（RL-B3：可版本化、人类可读）
+    pub strategy_fingerprint: String,
+    /// 上一代代数（首代 None）
+    pub parent_gen: Option<u64>,
+    /// 摘要正文（不含 [earlier conversation summary] 头缀）
+    pub summary_text: String,
+    /// 含头缀的完整 hint 替换文本（与既有 wire 形态一致）
+    pub formatted: String,
+}
+
+/// 一次 summarize_dropped 的结果分类（R3 落链批）。
+#[derive(Debug, Clone)]
+pub enum SummarizeOutcome {
+    /// dropped 为空或低于阈值——无摘要（调用方保留原 hint）
+    Empty,
+    /// 缓存命中——无新代，不落链
+    CacheHit(String),
+    /// 新代生成——调用方应落链（PayloadUpdate），并将 formatted 写入 hint
+    Generated(SummaryGenMetadata),
+}
+
+impl SummarizeOutcome {
+    /// hint 替换文本（Empty → None）。
+    pub fn formatted(&self) -> Option<String> {
+        match self {
+            SummarizeOutcome::Empty => None,
+            SummarizeOutcome::CacheHit(f) => Some(f.clone()),
+            SummarizeOutcome::Generated(m) => Some(m.formatted.clone()),
+        }
+    }
 }
 
 impl ContextSummarizer {
@@ -237,9 +287,27 @@ impl ContextSummarizer {
     ///
     /// - `dropped`:`trim_detailed()` 返回的被裁剪消息列表
     pub async fn summarize_dropped(&self, dropped: &[Message]) -> Result<String, String> {
+        match self.summarize_dropped_with_metadata(dropped).await? {
+            SummarizeOutcome::Empty => Ok(String::new()),
+            SummarizeOutcome::CacheHit(formatted) => Ok(formatted),
+            SummarizeOutcome::Generated(meta) => Ok(meta.formatted),
+        }
+    }
+
+    /// R3 落链批：带落链元数据的摘要生成。
+    ///
+    /// - `Empty`：无摘要（保留原 hint），不落链
+    /// - `CacheHit`：缓存命中（零 LLM 调用），不落链
+    /// - `Generated(meta)`：新代生成——调用方应将 meta 落链
+    ///   （PayloadUpdate 至 `__memory__.{ns}.session_{sid}.rolling_summary`，
+    ///   见 knowledge/上下文管理/07-R3 研究档），并将 meta.formatted 写入 hint
+    pub async fn summarize_dropped_with_metadata(
+        &self,
+        dropped: &[Message],
+    ) -> Result<SummarizeOutcome, String> {
         // 空列表:无需摘要
         if dropped.is_empty() {
-            return Ok(String::new());
+            return Ok(SummarizeOutcome::Empty);
         }
 
         // Q9 Strategy B:低于阈值不调 LLM(避免小裁剪浪费 token)
@@ -249,21 +317,24 @@ impl ContextSummarizer {
                 threshold = self.summary_threshold,
                 "G10: dropped below threshold, skipping summary"
             );
-            return Ok(String::new());
+            return Ok(SummarizeOutcome::Empty);
         }
 
         // 滚动缓存快照(锁内仅取快照,不做 await)。长度命中时直接复用,零 LLM 调用
-        let (frozen, rolling) = {
+        let (frozen, rolling, prev_gen) = {
             let guard = self.summary_cache.lock().unwrap_or_else(|p| p.into_inner());
             match guard.as_ref() {
-                Some((frozen, rolling)) if *frozen == dropped.len() => {
+                Some(c) if c.frozen_len == dropped.len() => {
                     tracing::debug!(dropped = dropped.len(), "G10: summary cache hit");
-                    return Ok(format!("[earlier conversation summary]\n{}", rolling));
+                    let formatted = format!("[earlier conversation summary]\n{}", c.summary_text);
+                    return Ok(SummarizeOutcome::CacheHit(formatted));
                 }
-                Some((frozen, rolling)) if *frozen < dropped.len() => {
-                    (Some(*frozen), Some(rolling.clone()))
-                }
-                _ => (None, None),
+                Some(c) if c.frozen_len < dropped.len() => (
+                    Some(c.frozen_len),
+                    Some(c.summary_text.clone()),
+                    Some(c.gen),
+                ),
+                _ => (None, None, None),
             }
         };
         let incremental_from = frozen.unwrap_or(0);
@@ -329,16 +400,54 @@ impl ContextSummarizer {
         let summary = response.content.trim();
         if summary.is_empty() {
             warn!("G10: LLM returned empty summary, keeping original hint");
-            return Ok(String::new());
+            return Ok(SummarizeOutcome::Empty);
         }
 
         // 成功后才更新缓存;失败路径不触碰缓存(下次重试仍从旧 frozen 增量)
+        // R3:缓存带代数;新代元数据交由调用方落链(PayloadUpdate)
+        let gen = prev_gen.unwrap_or(0) + 1;
         {
             let mut guard = self.summary_cache.lock().unwrap_or_else(|p| p.into_inner());
-            *guard = Some((dropped.len(), summary.to_string()));
+            *guard = Some(RollingCache {
+                frozen_len: dropped.len(),
+                summary_text: summary.to_string(),
+                gen,
+            });
         }
 
-        Ok(format!("[earlier conversation summary]\n{}", summary))
+        let meta = SummaryGenMetadata {
+            gen,
+            frozen_len_before: frozen.unwrap_or(0),
+            frozen_len_after: dropped.len(),
+            strategy_fingerprint: self.strategy_fingerprint(),
+            parent_gen: prev_gen,
+            summary_text: summary.to_string(),
+            formatted: format!("[earlier conversation summary]\n{}", summary),
+        };
+        Ok(SummarizeOutcome::Generated(meta))
+    }
+
+    /// 摘要策略指纹（RL-B3：可版本化、人类可读；策略参数变化 → 指纹变化）。
+    pub fn strategy_fingerprint(&self) -> String {
+        format!(
+            "summarizer:threshold={};model={};clamp=512-8192;temp=0",
+            self.summary_threshold,
+            self.summary_model.as_deref().unwrap_or("default")
+        )
+    }
+
+    /// R3/G-3：从落链 payload 回读种子滚动缓存（continuation/重启后
+    /// 不触发 LLM 重算——重建读账，不重算）。
+    pub fn seed_cache(&self, frozen_len: usize, summary_text: String, gen: u64) {
+        let mut guard = self.summary_cache.lock().unwrap_or_else(|p| p.into_inner());
+        // 只在回读代数更新时覆盖（防旧账回灌）
+        if guard.as_ref().map(|c| c.gen).unwrap_or(0) < gen {
+            *guard = Some(RollingCache {
+                frozen_len,
+                summary_text,
+                gen,
+            });
+        }
     }
 
     /// C1:整会话摘要 + 稳定事实（一次调用，返回结构化 JSON）
@@ -1160,5 +1269,95 @@ mod tests {
         ok1.assert_async().await;
         fail.assert_async().await;
         ok2.assert_async().await;
+    }
+
+    // ========== R3 落链批：元数据 / 代数 / payload 种子（G-3 关闭） ==========
+
+    #[tokio::test]
+    async fn test_r3_generated_metadata_and_gen_increment() {
+        let mut server = mockito::Server::new_async().await;
+        let m1 = server
+            .mock("POST", "/")
+            .with_body(openai_body("GEN-1-TEXT").as_str())
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("POST", "/")
+            .with_body(openai_body("GEN-2-TEXT").as_str())
+            .expect(1)
+            .create_async()
+            .await;
+        let llm = LlmHandler::new("m", &server.url(), None).with_max_retries(0);
+        let s = ContextSummarizer::new(llm, None).with_threshold(2);
+
+        // 第一代：frozen 0→3，gen=1，parent=None
+        let d1 = make_dropped(3);
+        let out1 = s.summarize_dropped_with_metadata(&d1).await.unwrap();
+        let meta1 = match &out1 {
+            SummarizeOutcome::Generated(m) => m,
+            other => panic!("期望 Generated，实得 {other:?}"),
+        };
+        assert_eq!(meta1.gen, 1);
+        assert_eq!(meta1.frozen_len_before, 0);
+        assert_eq!(meta1.frozen_len_after, 3);
+        assert_eq!(meta1.parent_gen, None);
+        assert!(meta1.summary_text.contains("GEN-1"));
+        assert!(meta1
+            .formatted
+            .starts_with("[earlier conversation summary]"));
+        assert!(meta1.strategy_fingerprint.contains("threshold=2"));
+        m1.assert_async().await;
+
+        // 第二代：frozen 3→5，gen=2，parent=1
+        let d2 = make_dropped(5);
+        let out2 = s.summarize_dropped_with_metadata(&d2).await.unwrap();
+        let meta2 = match &out2 {
+            SummarizeOutcome::Generated(m) => m,
+            other => panic!("期望 Generated，实得 {other:?}"),
+        };
+        assert_eq!(meta2.gen, 2);
+        assert_eq!(meta2.frozen_len_before, 3);
+        assert_eq!(meta2.frozen_len_after, 5);
+        assert_eq!(meta2.parent_gen, Some(1));
+        assert!(meta2.summary_text.contains("GEN-2"));
+        m2.assert_async().await;
+    }
+
+    #[test]
+    fn test_r3_seed_cache_closes_g3_without_llm() {
+        // G-3 关闭证明：payload 回读种子后，同 frozen 长度调用零 LLM 直接命中
+        let llm = LlmHandler::new("m", "http://127.0.0.1:9", None).with_max_retries(0);
+        let s = ContextSummarizer::new(llm, None).with_threshold(2);
+        // 模拟从 payload 回读（gen=2，frozen=5）
+        s.seed_cache(5, "SEEDED-FROM-PAYLOAD".to_string(), 2);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let dropped = make_dropped(5);
+            let out = s.summarize_dropped_with_metadata(&dropped).await.unwrap();
+            match out {
+                SummarizeOutcome::CacheHit(formatted) => {
+                    assert!(
+                        formatted.contains("SEEDED-FROM-PAYLOAD"),
+                        "种子文本必须命中"
+                    );
+                }
+                other => panic!("期望 CacheHit，实得 {other:?}"),
+            }
+        });
+        // URL 指向必死端口 + 零网络调用即证 G-3 关闭（不重算）
+    }
+
+    #[test]
+    fn test_r3_seed_ignores_stale_gen() {
+        let llm = LlmHandler::new("m", "http://127.0.0.1:9", None).with_max_retries(0);
+        let s = ContextSummarizer::new(llm, None).with_threshold(2);
+        s.seed_cache(5, "NEWER".to_string(), 3);
+        s.seed_cache(2, "STALE".to_string(), 2); // 旧账回灌防御
+        let guard = s.summary_cache.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        assert_eq!(c.summary_text, "NEWER");
+        assert_eq!(c.gen, 3);
     }
 }

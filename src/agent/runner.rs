@@ -32,7 +32,7 @@ use crate::agent::memory_event::extraction::{EventExtractor, ExtractionConfig};
 use crate::agent::memory_event::MemoryEventStore;
 use crate::agent::output_validator::OutputValidator;
 use crate::agent::sediment;
-use crate::agent::summarizer::ContextSummarizer;
+use crate::agent::summarizer::{ContextSummarizer, SummarizeOutcome};
 use crate::agent::translator::{LlmResponse, Message};
 use crate::api::api_core::ApiError;
 use crate::api::evorule_client::EvoruleApiClient;
@@ -730,6 +730,8 @@ pub struct AgentRunner {
     /// 由 `from_definition` 从 `def.output_format` 构造。
     /// `handle_call_external` 中:注入格式指令到 system prompt + 校验 LLM 输出。
     output_validator: Option<OutputValidator>,
+    /// R3-b/G-7:已落链的格式指令(去重——同指令不重复落链)
+    landed_format_instruction: std::sync::Mutex<Option<String>>,
     /// G11:当前步骤的格式校验重试计数(超过 max 时降级为接受原输出)
     output_format_retries: usize,
     /// G8:工具审批回调(None = 默认拒绝 candidate 工具,安全优先)
@@ -826,6 +828,7 @@ impl AgentRunner {
             summarizer: None,
             cancel_token: CancellationToken::new(),
             output_validator: None,
+            landed_format_instruction: std::sync::Mutex::new(None),
             output_format_retries: 0,
             approval_callback: None,
             parallel_tool_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1270,6 +1273,63 @@ impl AgentRunner {
     ///
     /// 如果 `memory` 为 `None`（agent.json 配置 `memory.type = "none"`），
     /// 此方法是 no-op。
+    /// R3：摘要生成 + PayloadUpdate 落链 + hint 替换（非流式/流式两路径共用）。
+    ///
+    /// - `Generated(meta)` → PayloadUpdate 至 `__memory__.{ns}.session_{sid}.rolling_summary`
+    ///   （best-effort：失败留痕不阻塞主流程；run/rebuild 分叉由 context-doctor 标记）
+    /// - hint 替换语义与既有实现一致（[earlier 前缀消息替换为摘要）
+    async fn handle_summary_outcome(
+        &self,
+        session_id: &str,
+        summarizer: &ContextSummarizer,
+        dropped: &[Message],
+        trim_messages: &mut [Message],
+    ) -> Result<(), AgentError> {
+        let outcome = summarizer
+            .summarize_dropped_with_metadata(dropped)
+            .await
+            .map_err(AgentError::Internal)?;
+        let Some(formatted) = outcome.formatted() else {
+            tracing::debug!(%session_id, "R3: summary skipped (below threshold or empty)");
+            return Ok(());
+        };
+        if let SummarizeOutcome::Generated(meta) = &outcome {
+            if let Some(memory) = &self.memory {
+                let entry = serde_json::json!({
+                    "gen": meta.gen,
+                    "frozen_len_before": meta.frozen_len_before,
+                    "frozen_len_after": meta.frozen_len_after,
+                    "strategy_fingerprint": meta.strategy_fingerprint,
+                    "parent_gen": meta.parent_gen,
+                    "summary_text": meta.summary_text,
+                });
+                match memory.save_rolling_summary(session_id, &entry).await {
+                    Ok(()) => info!(
+                        %session_id,
+                        gen = meta.gen,
+                        frozen = meta.frozen_len_after,
+                        "R3: rolling summary landed (PayloadUpdate)"
+                    ),
+                    Err(e) => warn!(
+                        %session_id,
+                        gen = meta.gen,
+                        error = %e,
+                        "R3: rolling summary landing failed (best-effort)——run/rebuild divergence possible, context-doctor flags"
+                    ),
+                }
+            }
+        }
+        for msg in trim_messages {
+            if let Message::System { content } = msg {
+                if content.starts_with("[earlier") {
+                    *content = formatted;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn persist_message(
         &mut self,
         session_id: &str,
@@ -1994,36 +2054,17 @@ impl AgentRunner {
             // G10:记忆压缩 — 如果有 summarizer,用摘要替换 [earlier N messages trimmed] 提示
             if let Some(summarizer) = &self.summarizer {
                 if !trim_result.dropped.is_empty() {
-                    match summarizer.summarize_dropped(&trim_result.dropped).await {
-                        Ok(summary) if !summary.is_empty() => {
-                            // 在 trim_result.messages 中找到 hint 消息并替换为摘要
-                            for msg in &mut trim_result.messages {
-                                if let Message::System { content } = msg {
-                                    if content.starts_with("[earlier") {
-                                        *content = summary.clone();
-                                        break;
-                                    }
-                                }
-                            }
-                            info!(
-                                %session_id,
-                                dropped = trim_result.dropped.len(),
-                                "G10: generated summary for dropped messages"
-                            );
-                        }
-                        Ok(_) => {
-                            tracing::debug!(
-                                %session_id,
-                                "G10: summary skipped (below threshold or empty)"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                %session_id,
-                                error = %e,
-                                "G10: summary generation failed, keeping original hint"
-                            );
-                        }
+                    // R3:摘要生成 + PayloadUpdate 落链 + hint 替换（helper 共用）
+                    if let Err(e) = self
+                        .handle_summary_outcome(
+                            session_id,
+                            summarizer,
+                            &trim_result.dropped,
+                            &mut trim_result.messages,
+                        )
+                        .await
+                    {
+                        warn!(%session_id, error = %e, "R3: summary handling failed, keeping original hint");
                     }
                 }
             }
@@ -2033,6 +2074,7 @@ impl AgentRunner {
         };
 
         // G11:注入格式指令到 system prompt(只影响本次请求的 messages_to_send,不改原 messages)
+        // R3-b/G-7 收口:指令落链(影响输出必落链,RL-A2);同指令去重;失败 best-effort 留痕
         if let Some(validator) = &self.output_validator {
             let instruction = validator.instruction();
             if !instruction.is_empty() {
@@ -2040,6 +2082,38 @@ impl AgentRunner {
                     if let Message::System { content } = msg {
                         content.push_str(instruction);
                         break;
+                    }
+                }
+                let needs_land = {
+                    let landed = self
+                        .landed_format_instruction
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    landed.as_deref() != Some(instruction)
+                };
+                if needs_land {
+                    match self
+                        .evorule_client
+                        .update_payload(
+                            session_id,
+                            "__context__.format_instruction",
+                            &serde_json::json!({ "format_instruction": instruction }),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            let mut landed = self
+                                .landed_format_instruction
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            *landed = Some(instruction.to_owned());
+                            info!(%session_id, "R3: format instruction landed (G-7 closed)");
+                        }
+                        Err(e) => warn!(
+                            %session_id,
+                            error = %e,
+                            "R3: format instruction landing failed (best-effort)——G-7 divergence, doctor flags"
+                        ),
                     }
                 }
             }
@@ -3003,6 +3077,19 @@ impl AgentRunner {
             .filter_map(|rec| rec_to_message(&rec))
             .collect();
 
+        // R3/G-3：回读滚动摘要种子——continuation/重启后缓存从账上恢复，
+        // 不触发 LLM 重算（重建读账不重算；G-3 关闭）
+        if let Some(summarizer) = runner.summarizer.as_ref() {
+            if let Some((frozen, text, gen)) =
+                crate::agent::memory::MemoryManager::rolling_summary_from_state(
+                    &state, &namespace, session_id,
+                )
+            {
+                summarizer.seed_cache(frozen, text, gen);
+                info!(%session_id, gen, frozen, "R3: rolling summary seeded from payload");
+            }
+        }
+
         Ok(messages)
     }
 
@@ -3471,38 +3558,23 @@ impl AgentRunner {
                                             "trimmed history messages to fit context window"
                                         );
                                     }
-                                    // G10:记忆压缩
+                                    // G10:记忆压缩 + R3 摘要落链（helper 共用）
                                     if let Some(summarizer) = &runner.summarizer {
                                         if !trim_result.dropped.is_empty() {
-                                            match summarizer.summarize_dropped(&trim_result.dropped).await {
-                                                Ok(summary) if !summary.is_empty() => {
-                                                    for msg in &mut trim_result.messages {
-                                                        if let Message::System { content } = msg {
-                                                            if content.starts_with("[earlier") {
-                                                                *content = summary.clone();
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                    info!(
-                                                        %session_id,
-                                                        dropped = trim_result.dropped.len(),
-                                                        "G10: generated summary for dropped messages"
-                                                    );
-                                                }
-                                                Ok(_) => {
-                                                    tracing::debug!(
-                                                        %session_id,
-                                                        "G10: summary skipped (below threshold or empty)"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    warn!(
-                                                        %session_id,
-                                                        error = %e,
-                                                        "G10: summary generation failed, keeping original hint"
-                                                    );
-                                                }
+                                            if let Err(e) = runner
+                                                .handle_summary_outcome(
+                                                    &session_id,
+                                                    summarizer,
+                                                    &trim_result.dropped,
+                                                    &mut trim_result.messages,
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    %session_id,
+                                                    error = %e,
+                                                    "R3: summary handling failed, keeping original hint"
+                                                );
                                             }
                                         }
                                     }
