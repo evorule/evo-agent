@@ -1157,6 +1157,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             capability_boundary: boundary,
             approval_mode: None,
             assembly: None,
+            skills: None,
         }
     }
 

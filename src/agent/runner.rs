@@ -117,6 +117,9 @@ pub struct AgentConfig {
     /// 元层先行批:组装配方(None = 内置默认配方 = 现状行为;from_definition
     /// 会把 memory_budget_ratio 合入默认配方的 S3 槽位,保持既有配置语义)
     pub assembly: Option<crate::agent::assembly::AssemblyRecipe>,
+    /// B2:skills 生效清单(None = 无技能,manifest 槽位静默跳过 = 现状行为;
+    /// serve/CLI 层 wire_skills 从 def.skills 解析注入)
+    pub skills: Option<Vec<crate::agent::definition::SkillManifestEntry>>,
 }
 
 impl Default for AgentConfig {
@@ -134,6 +137,7 @@ impl Default for AgentConfig {
             max_parallel_tools: 1,
             capability_boundary: None,
             assembly: None,
+            skills: None,
         }
     }
 }
