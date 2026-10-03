@@ -2285,7 +2285,7 @@ impl AgentRunner {
                         )
                         .await
                     {
-                        Ok(()) => {
+                        Ok(_fact_id) => {
                             let mut landed = self
                                 .landed_format_instruction
                                 .lock()
