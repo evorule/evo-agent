@@ -440,6 +440,14 @@ pub struct AgentDefinition {
     /// 预留 1/4 给响应,实际可用输入 = `n - n/4`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<usize>,
+    /// 16 号档 D2:验收判据自检命令（可选；长程/TB 模式）
+    ///
+    /// 配置后，`task_done` 指令提交前 runner 强制在 shell 执行此命令：
+    /// exit 0 = 判据通过（`params.acceptance_passed=true` 放行），
+    /// 非 0 = 门禁拒绝提交（LLM 收到失败详情并被强制继续）——
+    /// **判据不过不存在 done 退出路径**。未配置时不拦截（非长程运行零影响）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_command: Option<String>,
     /// G13:单轮内并行工具调用上限(可选,默认 1 = 串行)
     ///
     /// - `1`(默认):工具按顺序串行执行(向后兼容旧行为)
@@ -1301,6 +1309,7 @@ mod tests {
             memory: MemoryConfig::default(),
             output_format: None,
             context_window_tokens: None,
+            acceptance_command: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
@@ -1642,6 +1651,7 @@ mod tests {
             memory: MemoryConfig::default(),
             output_format: None,
             context_window_tokens: None,
+            acceptance_command: None,
             max_parallel_tools: 1,
             capability_boundary: Some(CapabilityBoundary {
                 mode: mode.to_string(),
@@ -1796,6 +1806,7 @@ mod tests {
             memory: MemoryConfig::default(),
             output_format: None,
             context_window_tokens: None,
+            acceptance_command: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
@@ -1953,6 +1964,7 @@ mod tests {
             memory: MemoryConfig::default(),
             output_format: None,
             context_window_tokens: None,
+            acceptance_command: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,

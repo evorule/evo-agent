@@ -31,6 +31,7 @@ use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
 /// v2:组装路径由配方数据驱动(AssemblyExecutor 取代硬编码分层),配方三元落账链上。
 pub const ASSEMBLY_PROTOCOL_VERSION: &str = "assembly-v2";
 
+use crate::agent::acceptance::{apply_acceptance_gate, GateOutcome};
 use crate::agent::definition::{AgentDefinition, OutputFormat};
 use crate::agent::delegate::DelegateContext;
 use crate::agent::memory::{MemoryManager, MessagePersistMode, MessageRecord};
@@ -838,6 +839,10 @@ pub struct AgentRunner {
     /// ——CLI/子代理路径零改动)。run_streaming_inner 创建会话时在此目录建
     /// `{session_id}.jsonl` 事件流(会话唯一真相源,见 crate::agent::journal)
     journal_dir: Option<std::path::PathBuf>,
+    /// 16 号档 D2:验收判据自检命令(可选;长程/TB 模式)。task_done 提交前
+    /// runner 强制执行,exit 0=通过放行,非 0=门禁拒绝(不存在 done 退出路径)。
+    /// None=不拦截(非长程运行零影响)。由 from_definition 从 def 穿线。
+    acceptance_command: Option<String>,
 }
 
 impl AgentRunner {
@@ -885,6 +890,7 @@ impl AgentRunner {
                 crate::agent::tool_trace::ToolTraceCollector::default(),
             )),
             journal_dir: None,
+            acceptance_command: None,
         }
     }
 
@@ -1092,6 +1098,9 @@ impl AgentRunner {
                 .clone()
                 .unwrap_or_else(|| def.model.clone()),
         };
+        // 16 号档 D2:判据自检回路——acceptance_command 从 definition 穿线
+        // (task_done 提交前 runner 强制执行验收命令,判据不过不存在 done 退出路径)
+        runner.acceptance_command = def.acceptance_command.clone();
         // 用户决策 3 + G10：summary_model 单独配置,同时构造 ContextSummarizer
         if let Some(sm) = def.memory.summary_model {
             runner = runner.with_summary_model(&sm);
@@ -2497,6 +2506,20 @@ impl AgentRunner {
             })?;
 
         let args = params.get("args").cloned().unwrap_or(Value::Null);
+
+        // 16 号档 D2:判据自检门禁——task_done/task_blocked 提交前过验收;
+        // 拒绝时详情作为 tool_result 回喂 LLM(指令不提交引擎)
+        let args = match apply_acceptance_gate(self.acceptance_command.as_deref(), &args).await {
+            GateOutcome::Allow(a) => a,
+            GateOutcome::Reject(detail) => {
+                warn!(%session_id, %detail, "acceptance gate rejected instruction submission");
+                return Ok(serde_json::json!({
+                    "status": "rejected_by_acceptance_gate",
+                    "detail": detail,
+                    "guidance": "task_done 需判据自检通过(acceptance_passed=true);task_blocked 需非空 reason。请继续工作或按 fail-visible 诚实退出。"
+                }));
+            }
+        };
 
         // G13:检查并行缓存(如果 call_external 已并行执行过此 active 工具,直接返回缓存结果,跳过重复执行 + 审批)
         // candidate 工具(proposal)不会被缓存,所以缓存命中的一定是 active 工具,无需审批
@@ -4314,6 +4337,41 @@ impl AgentRunner {
                                 // yield ApprovalRequired 再等决策(帧须在 60s 窗口内
                                 // 到达前端)。非流式路径(run)仍走 handle_call_service
                                 // (内部 maybe_handle_approval,不产事件)
+                                // 16 号档 D2:判据自检门禁(与非流式 handle_call_service 同款)。
+                                // 拒绝 → 审计留痕 + 合成 tool 消息回喂 LLM + continue 下一个 tc
+                                // (指令不提交引擎——判据不过不存在 done 退出路径)
+                                let args = match apply_acceptance_gate(
+                                    runner.acceptance_command.as_deref(),
+                                    &args,
+                                )
+                                .await
+                                {
+                                    GateOutcome::Allow(a) => a,
+                                    GateOutcome::Reject(detail) => {
+                                        warn!(%session_id, %detail, "acceptance gate rejected instruction submission");
+                                        if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
+                                            let _ = j.tool_result(cid, "rejected", &detail);
+                                        }
+                                        tool_calls.push(tool_name.clone());
+                                        let tool_idx = messages.len();
+                                        messages.push(Message::Tool {
+                                            content: format!(
+                                                "{{\"status\":\"rejected_by_acceptance_gate\",\"detail\":\"{detail}\"}}"
+                                            ),
+                                            tool_name: tool_name.clone(),
+                                        });
+                                        if let Err(e) = runner
+                                            .persist_message(&session_id, tool_idx, messages.last().cloned().expect("gate reject tool msg"))
+                                            .await
+                                        {
+                                            tracing::warn!(session_id = %session_id, error = %e, "gate reject message persist failed");
+                                        }
+                                        yield Ok(AgentEvent::Info(format!(
+                                            "acceptance gate rejected: {detail}"
+                                        )));
+                                        continue;
+                                    }
+                                };
                                 let outcome_res = match runner
                                     .execute_tool_stage(&session_id, &tool_name, &args, journal.as_deref())
                                     .await

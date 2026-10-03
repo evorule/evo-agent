@@ -1209,6 +1209,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             memory: Default::default(),
             output_format: None,
             context_window_tokens: None,
+            acceptance_command: None,
             max_parallel_tools: 1,
             capability_boundary: boundary,
             approval_mode: None,
