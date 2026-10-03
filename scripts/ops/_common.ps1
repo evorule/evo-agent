@@ -1,4 +1,4 @@
-# evorule 本地运维脚本族 - 共享工具(配置加载/探活/分离启动/日志)
+﻿# evorule 本地运维脚本族 - 共享工具(配置加载/探活/分离启动/日志)
 # 由各 start-*.ps1 与 watchdog-check.ps1 点源加载,不单独执行
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -86,4 +86,43 @@ function Write-OpsLog {
     $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
     Add-Content -Path (Join-Path $LogDir 'watchdog.log') -Value $line -Encoding utf8
     Write-Host $line
+}
+
+function Test-OpsBinaryFreshness {
+    # Compare the built binary's mtime against the last commit time that touched
+    # the paths which feed the binary (source + manifests). Guards against a
+    # stale exe silently serving old code after an in-place build failed to link
+    # (e.g. target locked by a running process: cargo may print "Finished"
+    # without actually linking).
+    # Returns Status: STALE | FRESH | UNKNOWN | MISSING (UNKNOWN never blocks).
+    param(
+        [Parameter(Mandatory)][string]$ExePath,
+        [Parameter(Mandatory)][string]$RepoPath,
+        [Parameter(Mandatory)][string[]]$Paths
+    )
+    if (-not (Test-Path $ExePath)) {
+        return [pscustomobject]@{ Status = 'MISSING'; Detail = "exe 不存在(需先构建): $ExePath";
+                                 ExeMtimeEpoch = $null; CodeCommitEpoch = $null; CodeCommitShortSha = $null }
+    }
+    $unknown = { return [pscustomobject]@{ Status = 'UNKNOWN'; Detail = 'git 不可用或非 git 仓, 跳过新鲜度核对(放行)';
+                                           ExeMtimeEpoch = $null; CodeCommitEpoch = $null; CodeCommitShortSha = $null } }
+    try {
+        $null = & git -C $RepoPath rev-parse --is-inside-work-tree 2>$null
+        if ($LASTEXITCODE -ne 0) { return & $unknown }
+    } catch { return & $unknown }
+    # Last commit that touched binary-relevant paths (docs/tests are excluded).
+    $out = $null
+    try { $out = & git -C $RepoPath log -1 --format='%h %ct' -- $Paths 2>$null } catch { return & $unknown }
+    if ($LASTEXITCODE -ne 0 -or -not $out) { return & $unknown }
+    $parts = ("$out".Trim() -split '\s+')
+    if ($parts.Count -lt 2 -or $parts[1] -notmatch '^\d+$') { return & $unknown }
+    $codeEpoch = [int64]$parts[1]
+    # PS 5.1 (.NET Framework) DateTime lacks ToUnixTimeSeconds -- convert via
+    # DateTimeOffset(ticks, zero offset); ticks of a UTC DateTime are UTC scale.
+    $exeDt = [IO.File]::GetLastWriteTimeUtc($ExePath)
+    $exeEpoch = [DateTimeOffset]::new($exeDt.Ticks, [TimeSpan]::Zero).ToUnixTimeSeconds()
+    $status = if ($exeEpoch -lt $codeEpoch) { 'STALE' } else { 'FRESH' }
+    $detail = 'exe mtime={0} vs 代码 commit {1}({2})' -f $exeEpoch, $parts[0], $codeEpoch
+    return [pscustomobject]@{ Status = $status; Detail = $detail;
+                             ExeMtimeEpoch = $exeEpoch; CodeCommitEpoch = $codeEpoch; CodeCommitShortSha = $parts[0] }
 }
