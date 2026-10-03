@@ -628,18 +628,9 @@ impl AgentDefinition {
     ///   短语(记忆分区标题/感知段/规范索引文案只允许由机制写入,定义文本
     ///   不得伪造——字面级判定,确定性)。
     pub fn validate_constitution(&self) -> Result<(), AgentDefinitionError> {
-        // R3:机制哨兵短语集合(与 memory.rs 分区标题/assembly.rs 感知段/
-        // serve_tools.rs 规范索引同源;新增机制分区须同步扩充)
-        const MECHANISM_SENTINELS: &[&str] = &[
-            "## Stable Facts",
-            "## Previous Sessions",
-            "## Relevant Events",
-            "## Recall Degradation Notices",
-            "【能力边界声明】",
-            "【可用技能清单】",
-            "【规范入口索引】",
-        ];
-        for s in MECHANISM_SENTINELS {
+        // R3:机制哨兵短语集合(权威源=context_inspector::MECHANISM_SECTION_MARKERS
+        // ——与 I2 检查器分区切分同源;新增机制分区须同步)
+        for s in crate::agent::context_inspector::MECHANISM_SECTION_MARKERS {
             if self.system_prompt.contains(s) {
                 return Err(AgentDefinitionError::InvalidDefinition(format!(
                     "[R3 cross-zone] system_prompt must not contain mechanism sentinel phrase '{}'",

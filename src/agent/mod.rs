@@ -10,6 +10,7 @@ pub mod atif;
 pub mod audited_llm;
 pub mod callback;
 pub mod constitution;
+pub mod context_inspector;
 pub mod context_window;
 pub mod definition;
 pub mod delegate;

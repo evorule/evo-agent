@@ -48,7 +48,7 @@ pub struct TokenRecord {
     pub total: u64,
 }
 
-/// journal 事件(13 种;schema 终版 = ATIF 映射表 §二增补)
+/// journal 事件(14 种;schema 终版 = ATIF 映射表 §二增补)
 ///
 /// 序列化形态:`{"type":"<event>","payload":{...}}`(adjacently tagged,
 /// 与文件行内 seq/ts 平铺后即全行)
@@ -167,6 +167,15 @@ pub enum JournalEvent {
         content_hash: String,
         /// wire 全文(未截断)
         full_text: String,
+    },
+    /// C-3(收尾清偿批,F-905 初版):I2 分区间字面级冲突扫描报告——组装后
+    /// 检出跨分区「禁令×声明」矛盾时落账(仅检出时写,不阻断会话;与 F-201
+    /// 加载拒载分层)。REST 可查=ATIF context_management 步。
+    I2ScanReport {
+        /// 轮序号(与 turn_started.turn_seq 同源)
+        round: u64,
+        /// 冲突记录(初版词法子集,见 context_inspector)
+        conflicts: Vec<crate::agent::context_inspector::I2ConflictRecord>,
     },
     /// 轮收尾(优雅终止路径显式写;异常路径由 TurnEndGuard drop 补写 aborted)
     TurnEnded {
@@ -508,6 +517,15 @@ impl JournalWriter {
         })
     }
 
+    /// C-3:i2_scan_report——I2 冲突扫描报告落账(仅检出冲突时调用)
+    pub fn i2_scan_report(
+        &self,
+        round: u64,
+        conflicts: Vec<crate::agent::context_inspector::I2ConflictRecord>,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::I2ScanReport { round, conflicts })
+    }
+
     /// 审批请求开启
     pub fn approval_requested(
         &self,
@@ -633,7 +651,7 @@ mod tests {
     use JournalEvent as JE;
 
     #[test]
-    fn roundtrip_all_13_events() {
+    fn roundtrip_all_14_events() {
         let events = vec![
             JE::TurnStarted {
                 turn_seq: 1,
@@ -695,6 +713,17 @@ mod tests {
                 wire_len: 9,
                 content_hash: evorule_digest("wire body"),
                 full_text: "wire body".into(),
+            },
+            JE::I2ScanReport {
+                round: 1,
+                conflicts: vec![crate::agent::context_inspector::I2ConflictRecord {
+                    kind: "deny_vs_capability".into(),
+                    token: "web_search".into(),
+                    section_a: "(基底段)".into(),
+                    section_b: "【能力边界声明】".into(),
+                    excerpt_a: "禁止使用 web_search".into(),
+                    excerpt_b: "可用工具:web_search".into(),
+                }],
             },
             JE::TurnEnded {
                 status: "success".into(),
