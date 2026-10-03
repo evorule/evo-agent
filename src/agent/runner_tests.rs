@@ -268,7 +268,7 @@ async fn test_auto_recall_empty_shared_facts() {
         .await;
 
     let config = AgentConfig::default();
-    let runner = AgentRunner::new(config, client);
+    let mut runner = AgentRunner::new(config, client);
 
     let result = runner.auto_recall("test-session").await;
 
@@ -289,7 +289,7 @@ async fn test_auto_recall_api_error_fetching_facts() {
         .await;
 
     let config = AgentConfig::default();
-    let runner = AgentRunner::new(config, client);
+    let mut runner = AgentRunner::new(config, client);
 
     let result = runner.auto_recall("test-session").await;
 
@@ -316,7 +316,7 @@ async fn test_auto_recall_api_error_recording_used_at_startup() {
         .await;
 
     let config = AgentConfig::default();
-    let runner = AgentRunner::new(config, client);
+    let mut runner = AgentRunner::new(config, client);
 
     let result = runner.auto_recall("test-session").await;
 
@@ -359,7 +359,7 @@ async fn test_auto_recall_with_memory() {
     let config = AgentConfig::default();
     let memory = crate::agent::memory::MemoryManager::new("test", client.clone())
         .with_session_id("test-session");
-    let runner = AgentRunner::new(config, client).with_memory(memory);
+    let mut runner = AgentRunner::new(config, client).with_memory(memory);
 
     let result = runner.auto_recall("test-session").await;
 
@@ -386,7 +386,7 @@ async fn test_auto_recall_with_multiple_facts() {
         .await;
 
     let config = AgentConfig::default();
-    let runner = AgentRunner::new(config, client);
+    let mut runner = AgentRunner::new(config, client);
 
     let result = runner.auto_recall("test-session").await;
 
@@ -421,7 +421,7 @@ async fn test_auto_recall_dedups_versions_and_tombstones() {
         .await;
 
     let config = AgentConfig::default();
-    let runner = AgentRunner::new(config, client);
+    let mut runner = AgentRunner::new(config, client);
 
     let result = runner.auto_recall("test-session").await;
 

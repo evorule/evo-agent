@@ -1040,18 +1040,19 @@ impl MemoryManager {
     ///
     /// # 返回值
     ///
-    /// - `Ok(None)`:`set_scoped` 是 best-effort 持久化，不返回 fact_id
+    /// - `Ok(PersistOutcome)`（O-248②）：Persisted=已落审计链，CacheOnly=仅本地
+    ///   （调用方——sediment——不应把 CacheOnly 计为 summary_written）
     /// - `Err(e)`:键校验失败（空键/超长）或 session 未设置
+    ///
+    /// 挂账（跨仓）：`update_payload` 客户端返回 `Result<(), _>`，fact_id 无法
+    /// 回填——证据链上游缺失需 server 仓让该端点返回 FactId 后方能闭环。
     pub async fn write_shared_summary(
         &mut self,
         session_id: &str,
         summary: &str,
-    ) -> Result<Option<u64>, MemoryError> {
+    ) -> Result<PersistOutcome, MemoryError> {
         let key = format!("sessions.{}.summary", session_id);
-        self.set_scoped(MemoryScope::Shared, &key, summary)
-            .await
-            .map(|_| ())?;
-        Ok(None)
+        self.set_scoped(MemoryScope::Shared, &key, summary).await
     }
 
     /// 旧版 get（向后兼容，默认 Session scope）
@@ -1259,30 +1260,51 @@ impl MemoryManager {
     }
 
     /// 旧版 remove（向后兼容，默认 Session scope）
-    pub async fn remove(&mut self, key: &str) -> Result<Option<MemoryRecord>, MemoryError> {
+    ///
+    /// 返回 (被移除记录（若 cache 有），墓碑持久化结果)——O-248①：CacheOnly
+    /// 表示墓碑未达 server（投影读将复活该 key），调用方应告警或重试。
+    pub async fn remove(
+        &mut self,
+        key: &str,
+    ) -> Result<(Option<MemoryRecord>, PersistOutcome), MemoryError> {
         let scope = MemoryScope::session_from_opt(&self.session_id)?;
         self.remove_scoped(scope, key).await
     }
 
     /// 分层 remove（P1）
+    ///
+    /// O-248①：null 墓碑持久化失败不再静默——PersistOutcome 随返回值上浮
+    /// （E10 口径；CacheOnly=删除未达 server，投影读将复活该 key）。
     pub async fn remove_scoped(
         &mut self,
         scope: MemoryScope,
         key: &str,
-    ) -> Result<Option<MemoryRecord>, MemoryError> {
+    ) -> Result<(Option<MemoryRecord>, PersistOutcome), MemoryError> {
         let cache_key = self.cache_key_for(&scope, key);
         let removed = self.cache.remove(&cache_key);
 
-        // best-effort 持久化：真相在 evorule，HTTP 失败不阻断（cache 为离线兜底）
+        // best-effort 持久化：真相在 evorule，HTTP 失败不阻断（cache 为离线兜底），
+        // 但结果上浮（O-248①）
         let session_id = self.session_id_for_scope(&scope)?;
         let path = self.build_path_scoped(&scope, key);
         let null_value = serde_json::json!(null);
-        let _ = self
+        let persist = match self
             .evorule_client
             .update_payload(&session_id, &path, &null_value)
-            .await;
-
-        Ok(removed)
+            .await
+        {
+            Ok(_) => PersistOutcome::Persisted,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    path = %path,
+                    error = %e,
+                    "memory tombstone to evorule failed; deletion may be revived by projection reads"
+                );
+                PersistOutcome::CacheOnly
+            }
+        };
+        Ok((removed, persist))
     }
 
     /// 清空所有 cache（仅本地，不删除 evorule 中的数据）
@@ -1541,9 +1563,12 @@ impl MemoryManager {
         Some((frozen as usize, text, gen))
     }
 
-    /// 批量追加消息（P0 性能优化，用于 EveryN/PerReactRound 模式）
+    /// 批量追加消息（EveryN/PerReactRound 模式）
     ///
-    /// 一次性写入多条消息，减少 HTTP 往返。
+    /// O-247 诚实契约：**当前为循环逐条写入**（每条一次 HTTP）——server 端
+    /// 暂无批量 payload 端点，本方法不减少 HTTP 往返；中途失败时前面已写、
+    /// 后面丢弃（无原子性），调用方依赖 B3 对账兜底。批量端点就绪后本方法
+    /// 是唯一改造点。
     pub async fn append_messages_batch(
         &mut self,
         session_id: &str,
@@ -2135,11 +2160,11 @@ mod tests {
             mgr.set("key1", "val1").await.expect("set");
             mgr.set("key2", "val2").await.expect("set");
 
-            let removed = mgr.remove("key1").await.expect("remove").expect("record");
+            let removed = mgr.remove("key1").await.expect("remove").0.expect("record");
             assert_eq!(removed.key, "key1");
             assert_eq!(mgr.len(), 1);
 
-            assert!(mgr.remove("nonexistent").await.expect("remove").is_none());
+            assert!(mgr.remove("nonexistent").await.expect("remove").0.is_none());
         });
     }
 
@@ -3394,7 +3419,8 @@ mod tests {
         tokio_test::block_on(async {
             let result = mgr.write_shared_summary("s1", "会话摘要内容").await;
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), None);
+            // make_test_client 不可达:诚实结果=CacheOnly(墓碑/写未达 server,B3 对账补偿)
+            assert_eq!(result.unwrap(), PersistOutcome::CacheOnly);
             // 验证 cache 中有对应记录
             // cache_key_for(Shared, key) = "shared::sessions.{sid}.summary"
             let expected_cache_key = "shared::sessions.s1.summary";
@@ -3418,8 +3444,9 @@ mod tests {
         let mut mgr = MemoryManager::new("ns", make_test_client()).with_session_id("s1");
         tokio_test::block_on(async {
             let result = mgr.write_shared_summary("s1", "摘要").await.unwrap();
-            // set_scoped 不返回 fact_id，所以 write_shared_summary 返回 None
-            assert_eq!(result, None);
+            // O-248②: write_shared_summary 返回 PersistOutcome（fact_id 回填挂账 server 仓）
+            // make_test_client 不可达 → CacheOnly
+            assert_eq!(result, PersistOutcome::CacheOnly);
         });
     }
 

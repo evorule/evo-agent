@@ -132,6 +132,15 @@ pub struct MemoryConfig {
     /// 否则 fallback 到主 `model`。可用便宜模型(如 GPT-4o-mini)降低成本。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extraction_model: Option<String>,
+    /// O-246:事件提取关键词列表（可选；缺省=内置默认表）
+    ///
+    /// 覆盖 032 EventExtractor 的自动提取触发关键词（原实现配置面
+    /// 宣称可覆盖但恒用 Default——本字段使宣称成立）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_keywords: Option<Vec<String>>,
+    /// O-246:显式触发短语列表（可选；缺省=内置默认表）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_explicit_phrases: Option<Vec<String>>,
     /// C3: 记忆区占窗口的比例（默认 0.25）
     #[serde(default = "default_memory_budget_ratio")]
     pub memory_budget_ratio: f32,
@@ -174,6 +183,8 @@ impl Default for MemoryConfig {
             ttl_secs: None,
             summary_model: None,
             extraction_model: None,
+            extraction_keywords: None,
+            extraction_explicit_phrases: None,
             memory_budget_ratio: default_memory_budget_ratio(),
             max_session_summaries: default_max_session_summaries(),
             max_injected_events: default_max_injected_events(),

@@ -262,7 +262,9 @@ pub(crate) fn observation_value_weight(tool_name: &str, output: &str, goal: &str
         0.0
     } else {
         let out_tokens: std::collections::HashSet<String> =
-            crate::agent::memory::tokenize_for_match(output).into_iter().collect();
+            crate::agent::memory::tokenize_for_match(output)
+                .into_iter()
+                .collect();
         let hits = goal_uniq.iter().filter(|g| out_tokens.contains(*g)).count();
         (hits as f32 / goal_uniq.len() as f32).min(1.0)
     };
@@ -280,11 +282,7 @@ fn observation_annotations(dropped: &[Message], goal: &str) -> String {
     }
     let mut rows: Vec<(f32, String)> = Vec::new();
     for (idx, msg) in dropped.iter().enumerate() {
-        if let Message::Tool {
-            content,
-            tool_name,
-        } = msg
-        {
+        if let Message::Tool { content, tool_name } = msg {
             let w = observation_value_weight(tool_name, content, goal);
             rows.push((
                 w,
@@ -296,9 +294,8 @@ fn observation_annotations(dropped: &[Message], goal: &str) -> String {
         return String::new();
     }
     rows.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-    let mut s = String::from(
-        "\n\n[观察价值标注(F-702,确定性词法):摘要请优先覆盖高价值观察的结论与影响]\n",
-    );
+    let mut s =
+        String::from("\n\n[观察价值标注(F-702,确定性词法):摘要请优先覆盖高价值观察的结论与影响]\n");
     for (w, row) in &rows {
         // 分档阈值对齐实际得分域(0.9×0.6×1.0=0.54 ~ 0.9×1.0×1.5=1.35):
         // 高≥0.8(变更类+命中/长输出),中≥0.6,低<0.6
@@ -389,14 +386,14 @@ impl ContextSummarizer {
         self.summary_model.as_deref()
     }
 
-pub async fn summarize_dropped(&self, dropped: &[Message]) -> Result<String, String> {
-    // F-702:goal 空串=不产观察价值标注(旧调用路径行为字节级兼容)
-    match self.summarize_dropped_with_metadata(dropped, "").await? {
-        SummarizeOutcome::Empty => Ok(String::new()),
-        SummarizeOutcome::CacheHit(formatted) => Ok(formatted),
-        SummarizeOutcome::Generated(meta) => Ok(meta.formatted),
+    pub async fn summarize_dropped(&self, dropped: &[Message]) -> Result<String, String> {
+        // F-702:goal 空串=不产观察价值标注(旧调用路径行为字节级兼容)
+        match self.summarize_dropped_with_metadata(dropped, "").await? {
+            SummarizeOutcome::Empty => Ok(String::new()),
+            SummarizeOutcome::CacheHit(formatted) => Ok(formatted),
+            SummarizeOutcome::Generated(meta) => Ok(meta.formatted),
+        }
     }
-}
 
     /// R3 落链批：带落链元数据的摘要生成。
     ///
@@ -1446,7 +1443,10 @@ mod tests {
 
         // 第一代：frozen 0→3，gen=1，parent=None
         let d1 = make_dropped(3);
-        let out1 = s.summarize_dropped_with_metadata(&d1, "test goal").await.unwrap();
+        let out1 = s
+            .summarize_dropped_with_metadata(&d1, "test goal")
+            .await
+            .unwrap();
         let meta1 = match &out1 {
             SummarizeOutcome::Generated(m) => m,
             other => panic!("期望 Generated，实得 {other:?}"),
@@ -1464,7 +1464,10 @@ mod tests {
 
         // 第二代：frozen 3→5，gen=2，parent=1
         let d2 = make_dropped(5);
-        let out2 = s.summarize_dropped_with_metadata(&d2, "test goal").await.unwrap();
+        let out2 = s
+            .summarize_dropped_with_metadata(&d2, "test goal")
+            .await
+            .unwrap();
         let meta2 = match &out2 {
             SummarizeOutcome::Generated(m) => m,
             other => panic!("期望 Generated，实得 {other:?}"),
@@ -1488,7 +1491,10 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let dropped = make_dropped(5);
-            let out = s.summarize_dropped_with_metadata(&dropped, "test goal").await.unwrap();
+            let out = s
+                .summarize_dropped_with_metadata(&dropped, "test goal")
+                .await
+                .unwrap();
             match out {
                 SummarizeOutcome::CacheHit(formatted) => {
                     assert!(
