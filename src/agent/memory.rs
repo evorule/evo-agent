@@ -397,6 +397,40 @@ pub(crate) fn tokenize_for_match(text: &str) -> Vec<String> {
     raw.into_iter().filter(|t| seen.insert(t.clone())).collect()
 }
 
+/// F-605：stable 条目对 goal 的词法相关性（R05 bigram 命中数，确定性，零向量）
+fn stable_relevance(record: &MemoryRecord, goal_uniq_sorted: &[String]) -> usize {
+    let text = format!("{} {}", record.key, record.value);
+    tokenize_for_match(&text)
+        .iter()
+        .filter(|t| goal_uniq_sorted.binary_search(t).is_ok())
+        .count()
+}
+
+/// F-605：stable 层内部价值排序（09 规格 F-605，I5/I6 补强）
+///
+/// 三因子确定性排序：相关性 desc（R05 词法对 goal 的命中数）▸
+/// 新鲜度 desc（timestamp）▸ 置信度 desc（None 视为 0.5 中位）。
+/// 全序 Tie-break：key 字典序 asc——同分同新鲜同置信时输出仍确定。
+/// 词法评分在检索红线内（确定性词法，禁向量库）。排序须在
+/// `fit_recall` 前缀截断之前完成，截断即优先淘汰低价值条目（I6）。
+pub(crate) fn sort_stable_by_value(stable: &mut [MemoryRecord], goal: &str) {
+    let mut goal_uniq = tokenize_for_match(goal);
+    goal_uniq.sort();
+    goal_uniq.dedup();
+    stable.sort_by(|a, b| {
+        let ra = stable_relevance(a, &goal_uniq);
+        let rb = stable_relevance(b, &goal_uniq);
+        rb.cmp(&ra)
+            .then(b.timestamp.cmp(&a.timestamp))
+            .then(
+                b.confidence
+                    .unwrap_or(0.5)
+                    .total_cmp(&a.confidence.unwrap_or(0.5)),
+            )
+            .then(a.key.cmp(&b.key))
+    });
+}
+
 /// C2: 召回上下文（三层召回结果）
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct RecallContext {
@@ -1550,6 +1584,9 @@ impl MemoryManager {
                     ctx.stable.push(record);
                 }
             }
+            // F-605：价值排序（相关性▸新鲜度▸置信度，key 全序兜底）——
+            // 在 fit_recall 前缀截断前完成，截断优先淘汰低价值条目（I6）。
+            sort_stable_by_value(&mut ctx.stable, goal);
         }
 
         // 2. summaries: get_shared_facts(Some("shared.{ns}.sessions."))
@@ -2117,6 +2154,46 @@ mod tests {
             assert!(mgr.is_empty());
             assert_eq!(mgr.len(), 0);
         });
+    }
+
+    #[test]
+    fn test_f605_stable_value_sort() {
+        // F-605:三因子确定性排序(相关性▸新鲜度▸置信度,key 全序兜底)
+        let mk = |key: &str, value: &str, ts: u64, conf: Option<f32>| {
+            let mut r = MemoryRecord::new(key, value, ts);
+            r.confidence = conf;
+            r
+        };
+        let mut stable = vec![
+            // 无 goal 命中,旧 → 末位
+            mk("stable.llm.m.a", "用户喜欢 Rust 编程", 100, Some(0.9)),
+            // goal 命中但较旧 → 第二
+            mk("stable.llm.m.b", "记忆预算裁剪规则说明", 50, Some(0.6)),
+            // goal 命中且最新 → 第一(相关性同分,新鲜度裁决)
+            mk("stable.llm.m.c", "记忆预算裁剪规则 v2", 200, Some(0.6)),
+        ];
+        sort_stable_by_value(&mut stable, "记忆预算 裁剪");
+        assert_eq!(stable[0].key, "stable.llm.m.c");
+        assert_eq!(stable[1].key, "stable.llm.m.b");
+        assert_eq!(stable[2].key, "stable.llm.m.a");
+
+        // 置信度 tie-break:同分同新鲜 → conf 高者前
+        let mut two = vec![mk("k1", "x", 10, Some(0.3)), mk("k2", "x", 10, Some(0.8))];
+        sort_stable_by_value(&mut two, "x");
+        assert_eq!(two[0].key, "k2");
+
+        // 全同 → key 字典序兜底(确定性输出)
+        let mut same = vec![mk("kz", "x", 10, None), mk("ka", "x", 10, None)];
+        sort_stable_by_value(&mut same, "x");
+        assert_eq!(same[0].key, "ka");
+
+        // 空 goal:全部零相关 → 新鲜度 desc
+        let mut by_ts = vec![
+            mk("old", "任意内容", 1, None),
+            mk("new", "任意内容", 99, None),
+        ];
+        sort_stable_by_value(&mut by_ts, "");
+        assert_eq!(by_ts[0].key, "new");
     }
 
     #[test]
