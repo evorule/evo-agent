@@ -262,6 +262,141 @@ impl CapabilityBoundary {
     }
 }
 
+/// Skill 声明条目(skills 装配 B2 批,agent_def 增量字段)
+///
+/// 声明时刻 = 人工把关(供应链闸口前移到 definition):声明者只管挑文件,
+/// LLM 的装载判断依据 100% 来自 SKILL.md 本身——description 不手填,启动时
+/// 从 frontmatter 自动解析(单一事实源,防两处维护漂移,见
+/// [`resolve_skill_manifest_entries`])。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SkillEntry {
+    /// 技能名(必填,全表唯一;LLM 用它调 read_skill)
+    pub name: String,
+    /// SKILL.md 文件路径(绝对,或相对 definition 文件——load_from_dir
+    /// 解析为绝对路径;read_skill 按此表映射,不走 path_scope 沙箱:
+    /// 路径来源=人工声明而非 LLM 参数,沙箱攻击面不存在)
+    pub path: PathBuf,
+}
+
+/// Skill 解析产物(声明 name → 绝对路径 + frontmatter description;
+/// manifest 注入与 read_skill 注册共用此形态)
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SkillManifestEntry {
+    /// 技能名(= SkillEntry.name)
+    pub name: String,
+    /// 解析后的 SKILL.md 绝对路径
+    pub path: PathBuf,
+    /// frontmatter description(manifest 渲染用;缺失时为空串,加载期 warn)
+    pub description: String,
+}
+
+/// SKILL.md frontmatter 解析产物(轻量:仅取围栏内平铺键值)
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SkillFrontmatter {
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
+/// 轻量 frontmatter 解析(照 skill-adapter 正则行解析口径,不引 YAML 依赖:
+/// 仅取 `---` 围栏内平铺 `key: value` 行;嵌套/列表不支持——显式未覆盖声明,
+/// 市面 skill 实测遇解析失败按样本补)
+pub fn parse_skill_frontmatter(content: &str) -> Result<SkillFrontmatter, String> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut lines = content.lines().map(str::trim_start);
+    let first = lines
+        .find(|l| !l.is_empty())
+        .ok_or_else(|| "empty file, expected '---' frontmatter fence".to_string())?;
+    if first.trim_end() != "---" {
+        return Err("missing '---' frontmatter fence at file head".to_string());
+    }
+    let mut fm = SkillFrontmatter::default();
+    let mut closed = false;
+    for line in lines {
+        let t = line.trim_end();
+        if t == "---" {
+            closed = true;
+            break;
+        }
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        // 平铺 `key: value`(无冒号行跳过,宽松口径与 adapter 一致)
+        let Some((k, v)) = t.split_once(':') else {
+            continue;
+        };
+        let value = v
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string();
+        match k.trim() {
+            "name" => fm.name = Some(value),
+            "description" => fm.description = Some(value),
+            _ => {}
+        }
+    }
+    if !closed {
+        return Err("frontmatter fence not closed (missing closing '---')".to_string());
+    }
+    Ok(fm)
+}
+
+/// 解析 skills 声明为生效清单(逐条验证:路径存在且为文件、frontmatter
+/// 可解析;description 缺失 warn 不拦——描述质量决定 LLM 是否装载,是
+/// 声明者的生态责任,机制只提醒)
+///
+/// 路径语义:绝对路径原样;相对路径相对 definition 文件目录(load_from_dir
+/// 解析)或进程工作目录(直接构造 definition 的调用方,如测试)。Err =
+/// fail-visible,调用方(加载期/runner 构造期)拒绝启动,不静默降级。
+pub fn resolve_skill_manifest_entries(
+    entries: &[SkillEntry],
+) -> Result<Vec<SkillManifestEntry>, String> {
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        let meta = std::fs::metadata(&e.path).map_err(|err| {
+            format!(
+                "skill '{}' path '{}' unreadable: {}",
+                e.name,
+                e.path.display(),
+                err
+            )
+        })?;
+        if !meta.is_file() {
+            return Err(format!(
+                "skill '{}' path '{}' is not a regular file",
+                e.name,
+                e.path.display()
+            ));
+        }
+        let content = std::fs::read_to_string(&e.path)
+            .map_err(|err| format!("skill '{}' read failed: {}", e.name, err))?;
+        let fm = parse_skill_frontmatter(&content).map_err(|err| {
+            format!(
+                "skill '{}' frontmatter unparseable ({}): {}",
+                e.name,
+                e.path.display(),
+                err
+            )
+        })?;
+        let description = match fm.description {
+            Some(d) if !d.is_empty() => d,
+            _ => {
+                tracing::warn!(
+                    skill = %e.name,
+                    "skill frontmatter has no description; manifest line will be empty \
+                     (description quality drives the LLM's loading decision)"
+                );
+                String::new()
+            }
+        };
+        out.push(SkillManifestEntry {
+            name: e.name.clone(),
+            path: e.path.clone(),
+            description,
+        });
+    }
+    Ok(out)
+}
+
 /// Agent definition
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentDefinition {
@@ -323,6 +458,11 @@ pub struct AgentDefinition {
     /// 现状行为逐字节等价;声明后配方版本/哈希进 effective_params 三阶落账)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assembly: Option<crate::agent::assembly::AssemblyRecipe>,
+    /// skills 声明(可选;skills 装配 B2 批,agent_def 增量。None/空 = 不注入
+    /// manifest 段、不注册 read_skill——零变化)。声明时刻 = 人工把关,详见
+    /// [`SkillEntry`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<SkillEntry>>,
 }
 
 /// G13:`max_parallel_tools` 的默认值(串行)
@@ -439,6 +579,24 @@ impl AgentDefinition {
                 AgentDefinitionError::InvalidDefinition(format!("assembly recipe invalid: {}", e))
             })?;
         }
+        // B2:skills 声明门卫(name 非空 + 全表唯一——read_skill 查表键的合法性;
+        // 路径存在性/frontmatter 可解析在 load_from_dir 有目录上下文时校验)
+        if let Some(skills) = &self.skills {
+            let mut seen = std::collections::HashSet::new();
+            for s in skills {
+                if s.name.trim().is_empty() {
+                    return Err(AgentDefinitionError::InvalidDefinition(
+                        "skills.name must not be empty".to_string(),
+                    ));
+                }
+                if !seen.insert(s.name.as_str()) {
+                    return Err(AgentDefinitionError::InvalidDefinition(format!(
+                        "duplicate skill name '{}'",
+                        s.name
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -465,9 +623,22 @@ impl AgentDefinition {
             ))
         })?;
         // 门卫 3:定义级语义校验(取值范围)
-        let def: AgentDefinition =
+        let mut def: AgentDefinition =
             serde_json::from_value(value.clone()).map_err(AgentDefinitionError::Json)?;
         def.validate()?;
+        // B2:skills 声明 fail-fast(相对路径先按 definition 目录解析为绝对
+        // 路径——单一解析点,后续消费方拿到的声明路径全部绝对;再逐条验证
+        // 存在/为文件/frontmatter 可解析,启动期拦截不留运行期惊喜)
+        if let Some(skills) = &mut def.skills {
+            for s in skills.iter_mut() {
+                if s.path.is_relative() {
+                    s.path = dir.join(&s.path);
+                }
+            }
+            crate::agent::definition::resolve_skill_manifest_entries(skills).map_err(|e| {
+                AgentDefinitionError::InvalidDefinition(format!("skills invalid: {}", e))
+            })?;
+        }
         Ok(def)
     }
 
@@ -514,6 +685,9 @@ impl AgentDefinition {
             // 元层先行批:配方经 serve/CLI 层 from_definition 注入生效执行器
             // (此处 None = AgentConfig 默认配方语义,消费侧展开为内置默认)
             assembly: None,
+            // B2:skills 生效清单不在 to_agent_config 复制——由 serve/CLI 层
+            // wire_skills 统一解析注入(单一事实源,与边界同口径)
+            skills: None,
         }
     }
 }
@@ -880,6 +1054,7 @@ mod tests {
             capability_boundary: None,
             approval_mode: None,
             assembly: None,
+            skills: None,
         };
         let config = def.to_agent_config();
         assert_eq!(config.agent_type, "writer");
@@ -1222,6 +1397,7 @@ mod tests {
             }),
             approval_mode: None,
             assembly: None,
+            skills: None,
         };
         // 平台合法绝对路径(Linux 上 "D:/x" 非绝对路径,门卫语义会被绝对路径检查劫持)
         let abs_root = if cfg!(windows) { "D:/x" } else { "/x" };
@@ -1369,6 +1545,7 @@ mod tests {
             capability_boundary: None,
             approval_mode: None,
             assembly: None,
+            skills: None,
         };
         let json = serde_json::to_string(&def).expect("serialize");
         assert!(
@@ -1442,5 +1619,191 @@ mod tests {
         bad.approval_mode = Some("yolo".to_string());
         let err = bad.validate().unwrap_err();
         assert!(err.to_string().contains("approval_mode"));
+    }
+
+    // =========================================================================
+    // skills 装配 B2 批(声明字段/frontmatter 解析/加载门卫)
+    // =========================================================================
+
+    fn write_skill_md(dir: &Path, rel: &str, body: &str) -> PathBuf {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+        let mut f = std::fs::File::create(&path).expect("create file");
+        f.write_all(body.as_bytes()).expect("write file");
+        path
+    }
+
+    const SAMPLE_SKILL_MD: &str = "---\n\
+         name: git-discipline\n\
+         description: 提交前先看 diff,身份旗标逐项检查\n\
+         version: 1.0.0\n\
+         ---\n\
+         # 纪律正文\n\
+         先 git status 再 git diff。\n";
+
+    /// schema 向后兼容:旧 JSON 无 skills 字段 → 加载成功且为 None(零破坏)
+    #[test]
+    fn test_skills_absent_is_none_backward_compat() {
+        let dir = make_tmp_dir();
+        write_json(dir.path(), "old_agent", &minimal_def_json());
+        let def = AgentDefinition::load_from_dir(dir.path(), "old_agent").expect("load");
+        assert!(def.skills.is_none());
+    }
+
+    /// skills 声明加载正例:字段透传 + 相对路径按 definition 目录解析为绝对
+    #[test]
+    fn test_skills_loading_resolves_relative_paths() {
+        let dir = make_tmp_dir();
+        write_skill_md(dir.path(), "skills/git-discipline/SKILL.md", SAMPLE_SKILL_MD);
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(
+            r#", "skills": [
+                { "name": "git-discipline", "path": "skills/git-discipline/SKILL.md" }
+            ]}"#,
+        );
+        write_json(dir.path(), "skill_agent", &json);
+        let def = AgentDefinition::load_from_dir(dir.path(), "skill_agent").expect("load");
+        let skills = def.skills.expect("skills present");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "git-discipline");
+        assert!(skills[0].path.is_absolute(), "relative path must be resolved");
+        assert!(skills[0].path.ends_with("SKILL.md"));
+    }
+
+    /// validate 门卫:name 为空拒绝;重名拒绝
+    #[test]
+    fn test_skills_validate_rejects_empty_and_duplicate_names() {
+        let dir = make_tmp_dir();
+        let skill_path = write_skill_md(dir.path(), "a/SKILL.md", SAMPLE_SKILL_MD);
+        let empty_name = AgentDefinition {
+            agent_type: "x".into(),
+            version: "1".into(),
+            description: "d".into(),
+            system_prompt: "s".into(),
+            model: "m".into(),
+            temperature: 0.5,
+            max_steps: 1,
+            step_timeout_secs: 1,
+            tools: vec![],
+            memory: MemoryConfig::default(),
+            output_format: None,
+            context_window_tokens: None,
+            max_parallel_tools: 1,
+            capability_boundary: None,
+            approval_mode: None,
+            assembly: None,
+            skills: Some(vec![SkillEntry {
+                name: "  ".into(),
+                path: skill_path.clone(),
+            }]),
+        };
+        assert!(empty_name.validate().unwrap_err().to_string().contains("name"));
+
+        let dup = AgentDefinition {
+            skills: Some(vec![
+                SkillEntry {
+                    name: "a".into(),
+                    path: skill_path.clone(),
+                },
+                SkillEntry {
+                    name: "a".into(),
+                    path: skill_path,
+                },
+            ]),
+            ..empty_name
+        };
+        assert!(dup.validate().unwrap_err().to_string().contains("duplicate skill name"));
+    }
+
+    /// load_from_dir fail-fast:路径不存在 → 加载即拒
+    #[test]
+    fn test_skills_missing_file_rejected_at_load() {
+        let dir = make_tmp_dir();
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(
+            r#", "skills": [
+                { "name": "gone", "path": "skills/missing/SKILL.md" }
+            ]}"#,
+        );
+        write_json(dir.path(), "skill_agent", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "skill_agent").unwrap_err();
+        assert!(err.to_string().contains("skills invalid"), "got: {}", err);
+    }
+
+    /// frontmatter 不可解析(无围栏) → 加载即拒
+    #[test]
+    fn test_skills_unparseable_frontmatter_rejected_at_load() {
+        let dir = make_tmp_dir();
+        write_skill_md(dir.path(), "skills/bad/SKILL.md", "# 只有正文,没有围栏\n");
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(
+            r#", "skills": [
+                { "name": "bad", "path": "skills/bad/SKILL.md" }
+            ]}"#,
+        );
+        write_json(dir.path(), "skill_agent", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "skill_agent").unwrap_err();
+        assert!(err.to_string().contains("frontmatter"), "got: {}", err);
+    }
+
+    /// frontmatter 解析正例:键值提取 + 引号剥离 + 围栏外正文不混入
+    #[test]
+    fn test_parse_skill_frontmatter_extracts_flat_keys() {
+        let fm = parse_skill_frontmatter(SAMPLE_SKILL_MD).expect("parse");
+        assert_eq!(fm.name.as_deref(), Some("git-discipline"));
+        assert_eq!(
+            fm.description.as_deref(),
+            Some("提交前先看 diff,身份旗标逐项检查")
+        );
+    }
+
+    /// frontmatter 解析反例:无围栏/围栏未闭合 → Err
+    #[test]
+    fn test_parse_skill_frontmatter_rejects_missing_or_unclosed_fence() {
+        assert!(parse_skill_frontmatter("no fence here").is_err());
+        assert!(parse_skill_frontmatter("---\nname: x\n").is_err());
+        assert!(parse_skill_frontmatter("").is_err());
+    }
+
+    /// resolve 正例:description 提取;缺失 → Ok(空串) 且不 panic(warn 口径)
+    #[test]
+    fn test_resolve_skill_manifest_entries_description_semantics() {
+        let dir = make_tmp_dir();
+        let with_desc = write_skill_md(dir.path(), "a/SKILL.md", SAMPLE_SKILL_MD);
+        let no_desc = write_skill_md(
+            dir.path(),
+            "b/SKILL.md",
+            "---\nname: b\n---\nbody only\n",
+        );
+        let entries = resolve_skill_manifest_entries(&[
+            SkillEntry {
+                name: "a".into(),
+                path: with_desc,
+            },
+            SkillEntry {
+                name: "b".into(),
+                path: no_desc,
+            },
+        ])
+        .expect("resolve");
+        assert_eq!(entries[0].description, "提交前先看 diff,身份旗标逐项检查");
+        assert_eq!(entries[1].description, "", "missing description = empty string");
+    }
+
+    /// resolve 反例:路径是目录 → Err
+    #[test]
+    fn test_resolve_rejects_directory_path() {
+        let dir = make_tmp_dir();
+        let sub = dir.path().join("skills-dir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let err = resolve_skill_manifest_entries(&[SkillEntry {
+            name: "d".into(),
+            path: sub,
+        }])
+        .unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {}", err);
     }
 }
