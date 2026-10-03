@@ -1347,9 +1347,10 @@ impl AgentRunner {
         summarizer: &ContextSummarizer,
         dropped: &[Message],
         trim_messages: &mut [Message],
+        goal: &str,
     ) -> Result<(), AgentError> {
         let outcome = summarizer
-            .summarize_dropped_with_metadata(dropped)
+            .summarize_dropped_with_metadata(dropped, goal)
             .await
             .map_err(AgentError::Internal)?;
         let Some(formatted) = outcome.formatted() else {
@@ -1755,7 +1756,7 @@ impl AgentRunner {
                     // G6:clone token 避免 &mut self(handle_io_request) 与 &self(cancel_token) 借用冲突
                     let cancel_token = self.cancel_token.clone();
                     let result = tokio::select! {
-                        r = self.handle_io_request(&session_id, &event.payload, &mut messages, &mut tool_calls) => match r {
+                        r = self.handle_io_request(&session_id, &event.payload, &mut messages, &mut tool_calls, goal) => match r {
                             Ok(r) => r,
                             // 处理失败(60s 超时/LLM 错误/工具错误/内部错误)也必须
                             // 回写 error io_response —— 否则 server 侧 io_request 永久挂起、
@@ -2140,6 +2141,7 @@ impl AgentRunner {
         payload: &Value,
         messages: &mut Vec<Message>,
         tool_calls: &mut Vec<String>,
+        goal: &str,
     ) -> Result<Value, AgentError> {
         let io_type = payload
             .get("io_type")
@@ -2150,7 +2152,7 @@ impl AgentRunner {
 
         match io_type {
             "call_external" => {
-                self.handle_call_external(session_id, &params, messages)
+                self.handle_call_external(session_id, &params, messages, goal)
                     .await
             }
             "call_service" => {
@@ -2169,6 +2171,7 @@ impl AgentRunner {
         session_id: &str,
         params: &Value,
         messages: &mut Vec<Message>,
+        goal: &str,
     ) -> Result<Value, AgentError> {
         let model = params
             .get("model")
@@ -2200,6 +2203,7 @@ impl AgentRunner {
                             summarizer,
                             &trim_result.dropped,
                             &mut trim_result.messages,
+                            goal,
                         )
                         .await
                     {
@@ -3753,6 +3757,7 @@ impl AgentRunner {
                                                     summarizer,
                                                     &trim_result.dropped,
                                                     &mut trim_result.messages,
+                                                    &goal,
                                                 )
                                                 .await
                                             {
