@@ -482,6 +482,128 @@ pub fn resolve_assembly_ref(value: &mut serde_json::Value, base_dir: &Path) -> R
     Ok(())
 }
 
+/// 组装执行器:配方 → system_prompt 与预算参数的**单一确定性纯函数组**
+///
+/// 双路径一致性由代码结构保证(run/流式两组装点收敛为同一次 `assemble` 调用,
+/// 不再是「纪律要求同步」而是「物理上同一段代码」)。槽内渲染(S3 记忆区分区
+/// 标题/行格式/notices 位置与 L2 安全审计)留在 `MemoryManager::build_system_
+/// prompt_with_recall` ——配方是槽位级声明,渲染机制不进配方(§三 范围裁定)。
+#[derive(Debug, Clone)]
+pub struct AssemblyExecutor {
+    recipe: AssemblyRecipe,
+}
+
+impl AssemblyExecutor {
+    /// 由配方构造执行器
+    pub fn new(recipe: AssemblyRecipe) -> Self {
+        Self { recipe }
+    }
+
+    /// 内置默认配方执行器(等价迁移:现状硬编码行为)
+    pub fn default_executor() -> Self {
+        Self::new(AssemblyRecipe::default())
+    }
+
+    /// 底层配方(版本落账读取 recipe_version/内容哈希用)
+    pub fn recipe(&self) -> &AssemblyRecipe {
+        &self.recipe
+    }
+
+    /// 记忆区预算比例(配方 S3 槽位声明;None = 配方无 S3 槽位)
+    pub fn memory_budget_ratio(&self) -> Option<f32> {
+        self.slot("S3_memory")
+            .and_then(|s| s.budget.as_ref())
+            .map(|b| b.ratio)
+    }
+
+    /// 响应预留百分比(默认配方 25 = 现状 max_tokens/4)
+    pub fn reserve_for_response_pct(&self) -> u32 {
+        self.recipe.budget.reserve_for_response_pct
+    }
+
+    /// 工具输出回喂字符上限(默认配方 48000 = 现状 TOOL_RESULT_MAX_CHARS)
+    pub fn tool_result_max_chars(&self) -> usize {
+        self.recipe.budget.tool_result_max_chars
+    }
+
+    /// S7 裁剪参数(策略名/buffer%/hint token,供 ContextWindowManager 构造)
+    pub fn trim_params(&self) -> Option<(&str, u32, usize)> {
+        self.slot("S7_history")
+            .and_then(|s| s.trim.as_ref())
+            .map(|t| (t.strategy.as_str(), t.buffer_pct, t.hint_budget_tokens))
+    }
+
+    fn slot(&self, id: &str) -> Option<&SlotSpec> {
+        self.recipe.slots.iter().find(|s| s.id == id)
+    }
+
+    /// 组装 system_prompt(按配方槽位序拼接)
+    ///
+    /// - `base_prompt`:S1_base 源(definition.system_prompt)
+    /// - `memory`:S3_memory 源载体(None = memory 未启用,槽位静默跳过 =
+    ///   现状 memory none 分支行为)
+    /// - `recall`:S3_memory 内容(已在调用侧完成召回;预算裁剪在渲染器内)
+    /// - `total_window`:记忆区预算基准(现状 max_context_tokens;A-1 口径
+    ///   `base: total_window` 由配方声明,PR-4 演示修正为 input)
+    /// - `boundary_segment`:S4_boundary 源(None = 未声明边界,槽位跳过)
+    ///
+    /// Err 仅当配置启用了执行器未实现的槽位(如 S4b_skills manifest 渲染器
+    /// 待 B2 批)——配置错误 fail-fast,不做静默降级。
+    pub fn assemble(
+        &self,
+        base_prompt: &str,
+        memory: Option<&crate::agent::memory::MemoryManager>,
+        recall: &crate::agent::memory::RecallContext,
+        total_window: usize,
+        boundary_segment: Option<&str>,
+    ) -> Result<String, String> {
+        let mut prompt = String::new();
+        for slot in &self.recipe.slots {
+            if !slot.enabled {
+                continue; // 开关停用(如 S4b_skills 预留位)
+            }
+            match slot.source.as_str() {
+                // S1_base:系统提示(硬注入,不裁剪)
+                "definition.system_prompt" => prompt.push_str(base_prompt),
+                // S3_memory:记忆区(渲染机制在 MemoryManager,含 fit_recall
+                // 预算裁剪 + L2 安全审计 + 分区渲染;比例/基准由配方声明。
+                // 渲染器以「当前累积 prompt」为 base 前缀,返回 base+记忆区)
+                "recall" => {
+                    if let Some(mem) = memory {
+                        let ratio = slot
+                            .budget
+                            .as_ref()
+                            .map(|b| b.ratio)
+                            .unwrap_or(0.25);
+                        let budget =
+                            crate::agent::memory::ContextBudget::new(total_window, ratio);
+                        prompt = mem.build_system_prompt_with_recall(&prompt, recall, &budget);
+                    }
+                }
+                // S4_boundary:边界段(现状 "\n\n" 前缀由配方 separator 声明)
+                "definition.capability_boundary.awareness_segment" => {
+                    if let Some(seg) = boundary_segment {
+                        let sep = slot.separator.as_deref().unwrap_or("\n\n");
+                        prompt.push_str(sep);
+                        prompt.push_str(seg);
+                    }
+                }
+                // S4b_skills:manifest 渲染器待 B2 批实现
+                "manifest" => {
+                    return Err(format!(
+                        "slot '{}' (source=manifest) renderer not implemented yet (B2 batch)",
+                        slot.id
+                    ));
+                }
+                // S5_task/S6_summary/S7_history:messages 面槽位,不在
+                // system_prompt 组装内(裁剪参数经 trim_params 消费)
+                _ => {}
+            }
+        }
+        Ok(prompt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,5 +802,111 @@ mod tests {
         let mut doc = serde_json::json!({ "agent_type": "x" });
         resolve_assembly_ref(&mut doc, tmp.path()).unwrap();
         assert!(doc.get("assembly").is_none());
+    }
+
+    /// 黄金样本回归(等价迁移第一验收):executor 输出与重构前现状组装逻辑
+    /// 逐字节一致。fixtures 由重构前现状代码捕获生成(2026-10-03,覆盖 CJK
+    /// 记忆区/极端小窗降级通知/boundary+memory none 三场景)。
+    #[test]
+    fn test_golden_samples_byte_identical() {
+        use crate::agent::definition::CapabilityBoundary;
+        use crate::agent::memory::{MemoryManager, MemoryRecord, RecallContext};
+        use std::path::PathBuf;
+
+        let client =
+            crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080");
+        let mem = MemoryManager::new("golden", client);
+        let mk = |k: &str, v: &str| MemoryRecord {
+            key: k.to_string(),
+            value: v.to_string(),
+            timestamp: 1_760_000_000,
+            source: None,
+            confidence: None,
+            tags: Vec::new(),
+            fact_id: None,
+            cause_fact_id: None,
+            evidence: None,
+        };
+        let base = "你是测试助手,负责回答关于项目的问题。";
+        let mut recall = RecallContext::default();
+        recall.stable = vec![
+            mk("fact_lang", "项目主语言为 Rust,前端使用 Svelte 4。"),
+            mk("fact_rule", "宪法规则 RL-B1 要求单一真相源,禁止双写。"),
+            mk("fact_style", "回复使用中文,代码注释保持确定性口径描述。"),
+        ];
+        recall.summaries = vec![
+            mk("sum_1", "上次会话完成了上下文窗口裁剪策略的回归测试。"),
+            mk("sum_2", "此前一轮讨论了记忆区预算比例与弹性归还机制。"),
+        ];
+        recall.events = vec![
+            mk("ev_1", "用户批准了元层先行批设计稿并下达开工指令。"),
+            mk("ev_2", "PR-1 组装配方 schema 已推送并通过全部测试。"),
+        ];
+        let exec = AssemblyExecutor::default_executor();
+
+        // 场景 1:CJK 长记忆(正常预算 8192×0.25,无降级)
+        let out1 = exec
+            .assemble(base, Some(&mem), &recall, 8192, None)
+            .unwrap();
+        assert_eq!(
+            out1,
+            std::fs::read_to_string("tests/fixtures/golden_cjk_memory.txt").unwrap()
+        );
+
+        // 场景 2:极端小窗口(60 token)强制降级通知
+        let out2 = exec.assemble(base, Some(&mem), &recall, 60, None).unwrap();
+        assert_eq!(
+            out2,
+            std::fs::read_to_string("tests/fixtures/golden_degradation.txt").unwrap()
+        );
+
+        // 场景 3:memory none 路径 + boundary 段追加(组装点现状语义)
+        let boundary = CapabilityBoundary {
+            mode: "read_only".to_string(),
+            sandbox_root: PathBuf::from("/tmp/sandbox-golden"),
+            tools: vec!["file_read".to_string()],
+        };
+        let out3 = exec
+            .assemble(
+                base,
+                None,
+                &RecallContext::default(),
+                0,
+                Some(&boundary.awareness_segment()),
+            )
+            .unwrap();
+        assert_eq!(
+            out3,
+            std::fs::read_to_string("tests/fixtures/golden_boundary.txt").unwrap()
+        );
+    }
+
+    /// 执行器预算参数访问:默认配方 = 现状硬编码值
+    #[test]
+    fn test_executor_budget_params() {
+        let exec = AssemblyExecutor::default_executor();
+        assert_eq!(exec.memory_budget_ratio(), Some(0.25));
+        assert_eq!(exec.reserve_for_response_pct(), 25);
+        assert_eq!(exec.tool_result_max_chars(), 48_000);
+        let (strategy, buffer_pct, hint) = exec.trim_params().unwrap();
+        assert_eq!(strategy, "KeepSystemKeepLast");
+        assert_eq!(buffer_pct, 5);
+        assert_eq!(hint, 15);
+    }
+
+    /// manifest 槽位 enabled=true:fail-fast(渲染器待 B2 批)
+    #[test]
+    fn test_assemble_manifest_enabled_fails_fast() {
+        let mut recipe = AssemblyRecipe::default();
+        for s in &mut recipe.slots {
+            if s.id == "S4b_skills" {
+                s.enabled = true;
+            }
+        }
+        let exec = AssemblyExecutor::new(recipe);
+        assert!(exec
+            .assemble("base", None, &Default::default(), 0, None)
+            .unwrap_err()
+            .contains("manifest"));
     }
 }
