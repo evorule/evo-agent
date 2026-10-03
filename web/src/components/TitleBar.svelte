@@ -3,6 +3,7 @@
 <!-- 顶栏:与 console-cloud 头部同规格(52px / bg-header) -->
 <script>
   import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
   import { connStatus, sessionId, stepCount, turnActive, toolWhitelist, signalCount, refreshGovBadges } from '../lib/stores.js';
   import { problems } from '../lib/diagnostics.js';
   import { openBottomPanel } from '../lib/panel.js';
@@ -21,6 +22,19 @@
   // 治理徽标初始加载(白名单 + 上次会话信号;均 fail-soft)
   onMount(() => {
     refreshGovBadges(localStorage.getItem('evo_session_id') || null);
+    // 空闲期自愈:白名单徽标另有会话创建/每轮 Done 刷新,但页面挂后台期间
+    // agent 定义被改(如补工具)时无轮次活动不会触发——回到前台即重拉。
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        refreshGovBadges(get(sessionId));
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
+    };
   });
 </script>
 
