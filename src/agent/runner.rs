@@ -26,9 +26,10 @@ use crate::agent::approval::{
 use crate::agent::callback::CallbackChain;
 use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
 
-/// F-302:组装策略版本——八层分区/槽位排列/预算口径的版本标识。
+/// F-302:组装策略版本——组装行为(分层方式/预算口径/记忆注入)的协议级版本标识。
 /// 版本变更=组装行为变更=历史重建需切版本（RL-B3 落地）。
-pub const ASSEMBLY_PROTOCOL_VERSION: &str = "assembly-v1";
+/// v2:组装路径由配方数据驱动(AssemblyExecutor 取代硬编码分层),配方三元落账链上。
+pub const ASSEMBLY_PROTOCOL_VERSION: &str = "assembly-v2";
 
 use crate::agent::definition::{AgentDefinition, OutputFormat};
 use crate::agent::delegate::DelegateContext;
@@ -2066,12 +2067,20 @@ impl AgentRunner {
                 Some(self.config.temperature as f64),
                 None,
             );
+        // F-302:配方三元落账——协议版本(组装行为,码级)+配方版本(数据契约)+配方指纹
+        // (内容寻址:同配方同 hash,改配方即变)。同协议下配方数据可独立演进(不改码),
+        // 指纹保证回放/审计可锚定实际生效的配方内容。
+        let recipe = self.assembly.recipe();
+        let recipe_version = recipe.recipe_version.as_str();
+        let recipe_json = serde_json::to_string(recipe).unwrap_or_default();
+        let recipe_hash = format!("blake3:{}", blake3::hash(recipe_json.as_bytes()).to_hex());
         params["effective_params"] = serde_json::json!({
             "temperature": effective_temperature,
             "max_tokens": effective_max_tokens,
             "stream": effective_stream,
-            // F-302:组装策略版本落链——八层分区方式可审计、可回放重建
             "assembly_protocol_version": ASSEMBLY_PROTOCOL_VERSION,
+            "assembly_recipe_version": recipe_version,
+            "assembly_recipe_hash": recipe_hash,
         });
         serde_json::json!({
             "type": "call_external",
