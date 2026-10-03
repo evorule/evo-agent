@@ -217,7 +217,7 @@ fn default_slots() -> Vec<SlotSpec> {
             enabled: true,
             budget: Some(SlotBudget {
                 ratio: 0.25,
-                base: "total_window".to_string(),
+                base: "input".to_string(),
                 clamp: [0.1, 0.5],
             }),
             degradation_order: Some(DEGRADATION_LAYERS.iter().map(|s| s.to_string()).collect()),
@@ -557,10 +557,11 @@ impl AssemblyExecutor {
         self.recipe.slots.iter().find(|s| s.id == id)
     }
 
-    /// 槽位预算基数解析:`total_window` = 现状口径(总窗直接作基数);
-    /// `input` = A-1 修正口径(总窗扣除响应预留后的输入侧空间作基数,
-    /// 整数算术与 runner reserve 同族)。未知值 Err(validate 白名单应已拦截,
-    /// 此处运行时兜底 fail-fast)。
+    /// 槽位预算基数解析:`input` = 默认口径(2026-10-03 A-1 完全切换:总窗扣除
+    /// 响应预留后的输入侧空间作基数,整数算术与 runner reserve 同族);
+    /// `total_window` = 兼容口径(显式声明仍合法,总窗直接作基数——2026-10-03
+    /// 前的历史行为,已部署配置显式声明者零影响)。未知值 Err(validate 白名单
+    /// 应已拦截,此处运行时兜底 fail-fast)。
     fn budget_base_tokens(&self, base: &str, total_window: usize) -> Result<usize, String> {
         match base {
             "total_window" => Ok(total_window),
@@ -580,8 +581,8 @@ impl AssemblyExecutor {
     /// - `memory`:S3_memory 源载体(None = memory 未启用,槽位静默跳过 =
     ///   现状 memory none 分支行为)
     /// - `recall`:S3_memory 内容(已在调用侧完成召回;预算裁剪在渲染器内)
-    /// - `total_window`:记忆区预算基准的原始输入(默认配方 `base: total_window`
-    ///   直接作基数;`base: input` 时扣除响应预留后作基数——A-1 修正口径)
+    /// - `total_window`:记忆区预算基准的原始输入(默认配方 `base: input`
+    ///   扣除响应预留后作基数;显式 `base: total_window` 直接作基数=兼容口径)
     /// - `boundary_segment`:S4_boundary 源(None = 未声明边界,槽位跳过)
     /// - `skills`:S4b_skills 源(None/空 = 未声明技能,槽位跳过 = 历史行为)
     ///
@@ -614,8 +615,11 @@ impl AssemblyExecutor {
                                 let base_tokens = self.budget_base_tokens(&b.base, total_window)?;
                                 crate::agent::memory::ContextBudget::new(base_tokens, b.ratio)
                             }
-                            // 槽位未声明 budget:现状默认口径(总窗×0.25)
-                            None => crate::agent::memory::ContextBudget::new(total_window, 0.25),
+                            // 槽位未声明 budget:默认口径(input 基×0.25,与默认配方一致)
+                            None => crate::agent::memory::ContextBudget::new(
+                                self.budget_base_tokens("input", total_window)?,
+                                0.25,
+                            ),
                         };
                         prompt = mem.build_system_prompt_with_recall(&prompt, recall, &budget);
                     }
@@ -679,7 +683,7 @@ mod tests {
         assert!(s3.degradable);
         let b = s3.budget.as_ref().unwrap();
         assert!((b.ratio - 0.25).abs() < 1e-6);
-        assert_eq!(b.base, "total_window"); // A-1 现状口径(默认配方等价迁移维持;input=可选修正口径)
+        assert_eq!(b.base, "input"); // A-1 完全切换口径(2026-10-03 默认基数=输入侧;显式 total_window 声明仍合法=向后兼容)
         assert_eq!(b.clamp, [0.1, 0.5]);
         assert_eq!(
             s3.degradation_order.as_ref().unwrap(),
@@ -1039,8 +1043,9 @@ mod tests {
         assert_eq!(out, "base");
     }
 
-    /// A-1 口径修正演示(PR-4):`base: input` 配方数据切换预算基数——
-    /// 执行器代码零改动,同内容记忆在 input 口径下预算更小、裁剪更早
+    /// A-1 完全切换验证(2026-10-03):默认配方基数=input(输入侧);显式
+    /// `base: total_window` 声明=兼容口径仍合法——同内容记忆在 input 口径下
+    /// 预算更小、裁剪更早,显式声明者行为与历史一致(向后兼容实测)
     #[test]
     fn test_budget_base_input_switches_memory_cap() {
         use crate::agent::memory::{MemoryManager, MemoryRecord, RecallContext};
@@ -1069,18 +1074,20 @@ mod tests {
             mk("f3", &long_fact),
         ];
 
-        let out_total = AssemblyExecutor::new(AssemblyRecipe::default())
+        // 默认配方(基数=input,完全切换后口径)
+        let out_input = AssemblyExecutor::new(AssemblyRecipe::default())
             .assemble("base", Some(&mem), &recall, 8192, None, None)
             .unwrap();
-        let mut input_recipe = AssemblyRecipe::default();
-        for s in &mut input_recipe.slots {
+        // 显式兼容口径(base=total_window,历史行为)
+        let mut total_recipe = AssemblyRecipe::default();
+        for s in &mut total_recipe.slots {
             if s.id == "S3_memory" {
                 if let Some(b) = s.budget.as_mut() {
-                    b.base = "input".to_string();
+                    b.base = "total_window".to_string();
                 }
             }
         }
-        let out_input = AssemblyExecutor::new(input_recipe)
+        let out_total = AssemblyExecutor::new(total_recipe)
             .assemble("base", Some(&mem), &recall, 8192, None, None)
             .unwrap();
 

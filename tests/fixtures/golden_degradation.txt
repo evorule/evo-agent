@@ -1,9 +1,5 @@
 你是测试助手,负责回答关于项目的问题。
 
 ## Recall Degradation Notices
-memory budget: stable 层裁剪 2 条(保留 1,预算 15 token)
+memory budget: stable 层裁剪 3 条(保留 0,预算 11 token)
 memory budget: stable 层耗尽预算,L1 摘要清空 2 条、L2 事件清空 2 条
-
-
-## Stable Facts
-- [unclassified] fact_lang: 项目主语言为 Rust,前端使用 Svelte 4。
