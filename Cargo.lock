@@ -622,6 +622,7 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "evorule-bundle",
  "evorule-constitution",
  "futures-core",
  "futures-util",
@@ -659,6 +660,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "evorule-bundle"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f356086fd8c3268755aec5fe2babc9c4b03e955d93f35631ce3b534c8b6f5b5d"
+dependencies = [
+ "evorule-hash",
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "evorule-constitution"
 version = "0.3.1"
 source = "git+https://gitee.com/evorule/evorule-system-rules?rev=706daa8e7c096debe8a2f29fa8c6dc04d5cba6b6#706daa8e7c096debe8a2f29fa8c6dc04d5cba6b6"
@@ -666,6 +680,17 @@ dependencies = [
  "jsonschema",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "evorule-hash"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b5be34733395be29a8da2f42d28c326a83a891c53b6798a9c200d68a776be7f"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

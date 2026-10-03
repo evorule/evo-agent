@@ -48,6 +48,11 @@ blake3 = "1"
 # 宪法演进须先推 system-rules 再随动升级 rev(演进 SOP)
 evorule-constitution = { git = "https://gitee.com/evorule/evorule-system-rules", rev = "706daa8e7c096debe8a2f29fa8c6dc04d5cba6b6" }
 
+# 快照包类型+自洽校验(DatasetBundle/BundleImporter,TCB 纯函数库)——
+# skill pack → 执行域 bundle 桥接用;版本与 evorule-server 消费面同源对齐,
+# 升级时两仓同批(哈希字节兼容依赖同版本序列化形态)
+evorule-bundle = "0.3.1"
+
 # G16:WebSocket 双向流 —— 需要 axum 的 ws feature
 axum = { version = "0.8", features = ["ws"] }
 http = "1"

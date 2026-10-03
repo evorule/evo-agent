@@ -42,7 +42,7 @@
 | **会话沉淀** | 会话结束时自动写入摘要 + 稳定事实到共享空间 |
 | **工具注册中心** | `ToolRegistry` + `ToolFunction` trait，任何 `async fn(JsonValue) -> Result<JsonValue, String>` 都能注册 |
 | **3 层安全模型** | active（白名单）/ candidate（待批）/ blocked（永不），含 SSRF 防护 + 工作目录沙箱 |
-| **规则管理工具集** | 45 个工具（spec 数，测试锁定；serve 面默认暴露 41 = 内置 15 + 规则 26，sandbox/dataset/publish/production/bundles 共 19 个为已定义未入 serve 面的高级工具）：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + meta 1 + evolution 2 |
+| **规则管理工具集** | 46 个工具（spec 数，测试锁定；serve 面默认暴露 42 = 内置 15 + 规则 27，sandbox/dataset/publish/production/bundles 共 19 个为已定义未入 serve 面的高级工具）：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + skill 装配 1 + meta 1 + evolution 2 |
 | **工作流引擎** | DAG 拓扑编排多 Agent，同层并行 + 跨层串行 + 模板渲染 |
 | **MCP 客户端** | 接入 Model Context Protocol 工具生态（stdio 传输） |
 | **上下文窗口管理** | 按 token 数裁剪历史消息，保留 system + 最近若干轮 |
@@ -479,12 +479,12 @@ Agent 配置从 `agents/{type}.json` 加载：
 
 | 配置 | 效果 |
 |------|------|
-| `agentTools.governanceWrite = true`（默认） | 45 个规则工具全量，现状零变化 |
-| `agentTools.governanceWrite = false` | **21 个治理写工具整体下线**（rule 写 8 + rule_promote + ws_create + sandbox_start/close + dataset_create + publish ×5 + bundle_export/bundle_import/bundle_import_dry_run），连 LLM 的工具 spec 都不出现（能力面不存在，非"调用被拒"）；24 个只读工具保留（查询/审计/knowledge/meta/evolution_signals/translate/validate 等） |
+| `agentTools.governanceWrite = true`（默认） | 46 个规则工具全量，现状零变化 |
+| `agentTools.governanceWrite = false` | **21 个治理写工具整体下线**（rule 写 8 + rule_promote + ws_create + sandbox_start/close + dataset_create + publish ×5 + bundle_export/bundle_import/bundle_import_dry_run），连 LLM 的工具 spec 都不出现（能力面不存在，非"调用被拒"）；25 个只读工具保留（查询/审计/knowledge/skill 装配/meta/evolution_signals/translate/validate 等） |
 
 说明：键为 `application` 作用域，**工作区层不可覆盖**（防项目级配置私自扩权 agent 工具面）；关闭后 LLM 仍可辅助「人起草」（rule_to_transform / rule_to_conditional / rule_validate 纯计算，不出网不落盘），提交/晋升/发布权回到人（console-cloud 审批流）。真正的保密企业通常跑内网自有模型、数据不出内网，此开关默认不干预其全开形态。
 
-### 规则管理工具集（45 个）
+### 规则管理工具集（46 个）
 
 通过 `rule_management_toolkit` / `full_rule_toolkit` 组装，用于 `rule-copilot` Agent：
 
@@ -500,6 +500,7 @@ Agent 配置从 `agents/{type}.json` 加载：
 | production | 2 | 生产环境管理 |
 | bundles | 5 | 规则包导入/列出/回滚 |
 | knowledge | 3 | 知识库检索 |
+| skill 装配 | 1 | skill_pack_to_bundle（skill 规则壳 → 执行域快照包桥接，crate 算哈希+结构预检） |
 | meta | 1 | meta_summary（L2 约束清单摘要） |
 | evolution | 2 | evolution_signals（进化信号拉取）+ rule_promote（约束层晋升提名） |
 
@@ -818,7 +819,7 @@ evo-agent/
 | Runner 拆分（Phase 2） | ⏳ | `runner.rs` 仍为约 4000 行单文件，未拆为子模块 |
 | 编译告警 | ⚠️ | 主体为 `missing_docs`；另有少量 clippy 代码质量 lint 待清理 |
 
-> 规则管理工具集总数为 **45 个**（workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + meta 1 + evolution 2），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
+> 规则管理工具集总数为 **46 个**（workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + skill 装配 1 + meta 1 + evolution 2），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
 
 ## 依赖关系
 

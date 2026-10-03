@@ -6,8 +6,8 @@
 //!
 //! 组装结构（理顺批 P1 适配器化后）：
 //! - 40 个纯透传工具 → `adapter` 表驱动（ALL_TRANSPARENT_BINDINGS 声明式映射）；
-//! - 5 个本地逻辑工具（audit_verify / bundle_export / meta_summary /
-//!   evolution_signals / rule_promote）→ `local_handlers` 统一外置。
+//! - 6 个本地逻辑工具（audit_verify / bundle_export / skill_pack_to_bundle /
+//!   meta_summary / evolution_signals / rule_promote）→ `local_handlers` 统一外置。
 
 pub mod adapter;
 pub mod local_handlers;
@@ -17,7 +17,7 @@ use crate::api::workspace_client::WorkspaceApiClient;
 use crate::builtin_tools::ToolSpec;
 use crate::io_handlers::tool_handler::ToolHandler;
 
-/// 组装完整规则工具集（M3：透传 40 + 本地逻辑 5 = 45 工具）
+/// 组装完整规则工具集（M3：透传 40 + 本地逻辑 6 = 46 工具）
 pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
     let mut h = ToolHandler::new();
     adapter::register_bindings(&mut h, ws, ev, adapter::ALL_TRANSPARENT_BINDINGS);
@@ -25,7 +25,7 @@ pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> Tool
     h
 }
 
-/// 全部规则工具 spec（45 个）
+/// 全部规则工具 spec（46 个）
 pub fn rule_tool_specs() -> Vec<ToolSpec> {
     let mut specs = adapter::specs_from(adapter::ALL_TRANSPARENT_BINDINGS);
     specs.extend(local_handlers::specs());
@@ -39,7 +39,7 @@ mod tests {
     #[test]
     fn test_rule_tool_specs_count() {
         let specs = rule_tool_specs();
-        assert_eq!(specs.len(), 45, "expected 45 rule tool specs");
+        assert_eq!(specs.len(), 46, "expected 46 rule tool specs");
     }
 
     #[test]
@@ -125,7 +125,7 @@ service_tools = ["config_persist", "rule_sandbox"]
                 name
             );
         }
-        assert_eq!(tools.len(), 25, "expected 25 tools in rule-copilot.json");
+        assert_eq!(tools.len(), 26, "expected 26 tools in rule-copilot.json");
     }
 
     #[test]
