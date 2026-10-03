@@ -436,10 +436,7 @@ impl AgentDefinition {
         // 降级序/裁剪策略/骨架槽位/全局预算——加载期 fail-fast)
         if let Some(recipe) = &self.assembly {
             recipe.validate().map_err(|e| {
-                AgentDefinitionError::InvalidDefinition(format!(
-                    "assembly recipe invalid: {}",
-                    e
-                ))
+                AgentDefinitionError::InvalidDefinition(format!("assembly recipe invalid: {}", e))
             })?;
         }
         Ok(())
