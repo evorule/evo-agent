@@ -2243,6 +2243,22 @@ fn m5c_resolve_scope_out_of_sandbox_absolute_path() {
 }
 
 #[test]
+fn m5c_resolve_scope_absolute_path_inside_boundary() {
+    let b = m5c_boundary();
+    // 边界内绝对路径:形态判 out 的口径钉死(设计特性——快筛与 handler
+    // 权威沙箱检查同判绝对路径;修复仅对齐拒绝文案,不放宽拦截行为)
+    let abs = if cfg!(windows) {
+        "C:\\tmp\\sandbox-root\\x.txt"
+    } else {
+        "/tmp/sandbox-root/x.txt"
+    };
+    assert_eq!(
+        resolve_target_scope("file_read", &serde_json::json!({"path": abs}), Some(&b)),
+        Some("out_of_sandbox")
+    );
+}
+
+#[test]
 fn m5c_resolve_scope_out_of_sandbox_parent_dir() {
     let b = m5c_boundary();
     assert_eq!(
@@ -2417,9 +2433,72 @@ async fn first_round_intent_goes_through_adjudication_channel() {
         .expect("blocked verdict must surface as tool result, not error");
     assert_eq!(result["status"], "blocked_by_governance_rule");
     assert_eq!(result["target_scope"], "out_of_sandbox");
+    // 越界拒(目标在边界外):维持 containment 文案
+    assert!(result["reason"]
+        .as_str()
+        .unwrap()
+        .contains("is outside the sandbox boundary"));
     m_create.assert_async().await;
     m_state.assert_async().await;
     m_cmd.assert_async().await;
+}
+
+#[tokio::test]
+async fn blocked_intent_inside_boundary_uses_form_reason() {
+    // 边界内绝对路径:scope 仍判 out(形态口径不变),但拒绝文案必须是
+    // 形态判定口径(相对路径约定),不再出现"outside the boundary"自相矛盾表述
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    server
+        .mock("POST", "/api/sessions")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "initial_content": {
+                "kind": "intent_adjudication",
+                "agent_type": "default"
+            }
+        })))
+        .with_status(200)
+        .with_body(r#"{"session_id": 78}"#)
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/api/sessions/78/state")
+        .with_status(200)
+        .with_body(r#"{"version": 0}"#)
+        .create_async()
+        .await;
+    server
+        .mock("POST", "/api/sessions/78/command")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "instruction": intent_signal("out_of_sandbox")
+        })))
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let runner =
+        AgentRunner::new(AgentConfig::default(), client).with_capability_boundary(m5c_boundary());
+    let abs = if cfg!(windows) {
+        "C:\\tmp\\sandbox-root\\x.txt"
+    } else {
+        "/tmp/sandbox-root/x.txt"
+    };
+    let result = runner
+        .execute_tool_call("file_read", &serde_json::json!({ "path": abs }), None)
+        .await
+        .expect("blocked verdict must surface as tool result, not error");
+    assert_eq!(result["status"], "blocked_by_governance_rule");
+    assert_eq!(result["target_scope"], "out_of_sandbox");
+    let reason = result["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("absolute path form not allowed"),
+        "form-rejection phrasing expected, got: {reason}"
+    );
+    assert!(
+        !reason.contains("is outside the sandbox boundary"),
+        "containment phrasing must not appear for in-boundary target, got: {reason}"
+    );
 }
 
 // ----- P2 治理级工具事前意图裁决 -----

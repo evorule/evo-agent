@@ -2524,22 +2524,41 @@ impl AgentRunner {
                     tt.record(tool_name, args, "blocked_by_governance", 0);
                 }
                 let raw_path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let boundary_root = self
-                    .config
-                    .capability_boundary
-                    .as_ref()
+                let boundary = self.config.capability_boundary.as_ref();
+                let boundary_root = boundary
                     .map(|b| b.sandbox_root.display().to_string())
                     .unwrap_or_default();
-                return Ok(serde_json::json!({
-                    "status": "blocked_by_governance_rule",
-                    "tool": tool_name,
-                    "target_scope": scope,
-                    "reason": format!(
+                // 拒绝文案两态:绝对路径在快筛一律按形态判 out(判据与
+                // handler 权威沙箱检查同源),但目标实际落在边界内时(join
+                // 后 starts_with 成立)"越界"语义不成立——改用形态判定文案
+                // (相对路径口径),避免审计链出现"target 在 boundary 前缀内
+                // 却被称 outside"的自相矛盾留痕;真·越界(join 逃逸/
+                // `..` 穿越)维持 containment 文案。
+                let inside_boundary = boundary.is_some_and(|b| {
+                    let p = std::path::Path::new(raw_path);
+                    p.is_absolute() && b.sandbox_root.join(p).starts_with(&b.sandbox_root)
+                });
+                let reason = if inside_boundary {
+                    format!(
+                        "absolute path form not allowed: '{}' (paths are relative \
+                         to the sandbox root '{}'; the target resolves inside the \
+                         boundary); the collaboration acceptance rule rejected this \
+                         tool intent (see session audit Violation for rule attribution)",
+                        raw_path, boundary_root
+                    )
+                } else {
+                    format!(
                         "target '{}' is outside the sandbox boundary '{}'; \
                          the collaboration acceptance rule rejected this tool intent \
                          (see session audit Violation for rule attribution)",
                         raw_path, boundary_root
-                    ),
+                    )
+                };
+                return Ok(serde_json::json!({
+                    "status": "blocked_by_governance_rule",
+                    "tool": tool_name,
+                    "target_scope": scope,
+                    "reason": reason,
                 }));
             }
         }
