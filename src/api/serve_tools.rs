@@ -487,17 +487,13 @@ pub fn wire_capability_boundary(
 // B2 skills 装配:声明解析 + read_skill 注册(serve/CLI/delegate 共用)
 // =============================================================================
 
-/// B2:skills 声明接线 —— 解析生效清单 + 注册 read_skill 工具(声明非空时)
-///
-/// 与 [`wire_capability_boundary`] 同族( mutate handler + 返回生效数据,供
-/// `AgentRunner::with_skills` 注入)。单一接线点:ws_handler::construct_runner
-/// / AgentRunner::from_definition / delegate 子代理共用。路径解析在定义
-/// 加载期已完成(load_from_dir),此处读 frontmatter 提取描述。
+/// B2:skills 声明面解析 —— def.skills 显式声明 → 生效清单(C 形态后供
+/// CLI from_definition / delegate 子代理路径使用;serve 会话创建路径改为
+/// 「声明+目录扫描」两源合并后直接喂 [`wire_skills`])
 ///
 /// None/空声明 → 无操作返回 None(零变化)。Err = fail-visible(声明文件
 /// 不可读/frontmatter 不可解析),不静默降级——定义损坏等效加载失败。
-pub fn wire_skills(
-    handler: &mut ToolHandler,
+pub fn resolve_declared_skills(
     def: &crate::agent::definition::AgentDefinition,
 ) -> Result<Option<Vec<crate::agent::definition::SkillManifestEntry>>, String> {
     let Some(entries) = def.skills.as_deref() else {
@@ -506,7 +502,31 @@ pub fn wire_skills(
     if entries.is_empty() {
         return Ok(None);
     }
-    let resolved = crate::agent::definition::resolve_skill_manifest_entries(entries)?;
+    Ok(Some(
+        crate::agent::definition::resolve_skill_manifest_entries(entries)?,
+    ))
+}
+
+/// skills 接线 —— 注册 read_skill 工具(清单非空时) + 返回 manifest 槽位源
+///
+/// 与 [`wire_capability_boundary`] 同族( mutate handler + 返回生效数据,供
+/// `AgentRunner::with_skills` 注入)。单一接线点:ws_handler::construct_runner
+/// / AgentRunner::from_definition / delegate 子代理共用。
+///
+/// C 形态(skills 全动态装配)后入参 = **合并后清单**(definition 显式声明 +
+/// 目录扫描注册项;serve 会话创建路径见 skill_api::merged_manifest_for_session,
+/// CLI/delegate 路径传 [`resolve_declared_skills`] 的解析结果)。清单来源扩展
+/// 对本函数与 read_skill 工具、manifest 渲染均透明——空清单 → 无操作(零变化)。
+pub fn wire_skills(
+    handler: &mut ToolHandler,
+    manifest: Option<Vec<crate::agent::definition::SkillManifestEntry>>,
+) -> Result<Option<Vec<crate::agent::definition::SkillManifestEntry>>, String> {
+    let Some(resolved) = manifest else {
+        return Ok(None);
+    };
+    if resolved.is_empty() {
+        return Ok(None);
+    }
     handler.register_tool(
         "read_skill",
         std::sync::Arc::new(crate::builtin_tools::skill_read::SkillReadTool::new(
@@ -1551,7 +1571,8 @@ service_tools = ["config_persist", "rule_sandbox"]
         }]);
 
         let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
-        let resolved = super::wire_skills(&mut handler, &def).unwrap();
+        let declared = super::resolve_declared_skills(&def).unwrap();
+        let resolved = super::wire_skills(&mut handler, declared).unwrap();
         let resolved = resolved.expect("non-empty declaration must yield manifest");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "git-discipline");
@@ -1579,19 +1600,14 @@ service_tools = ["config_persist", "rule_sandbox"]
 
     #[test]
     fn test_wire_skills_none_and_empty_are_noop() {
-        // None 与空数组均零变化:不注册工具、返回 None
-        for label in ["none", "empty"] {
-            let mut def = make_def(&["file_read"], None);
-            def.skills = match label {
-                "none" => None,
-                _ => Some(vec![]),
-            };
+        // None 与空清单均零变化:不注册工具、返回 None
+        for manifest in [None, Some(vec![])] {
             let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
-            let resolved = super::wire_skills(&mut handler, &def).unwrap();
-            assert!(resolved.is_none(), "{label}: must return None");
+            let resolved = super::wire_skills(&mut handler, manifest).unwrap();
+            assert!(resolved.is_none(), "must return None");
             assert!(
                 !handler.has_tool("read_skill"),
-                "{label}: read_skill must NOT be registered"
+                "read_skill must NOT be registered"
             );
         }
     }
@@ -1605,10 +1621,10 @@ service_tools = ["config_persist", "rule_sandbox"]
             path: PathBuf::from("Z:/definitely/not/here/SKILL.md"),
         }]);
         let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
-        let err = super::wire_skills(&mut handler, &def).unwrap_err();
+        let declared = super::resolve_declared_skills(&def).unwrap_err();
         assert!(
-            err.contains("skill 'ghost'") && err.contains("unreadable"),
-            "error must name the broken skill entry: {err}"
+            declared.contains("skill 'ghost'") && declared.contains("unreadable"),
+            "error must name the broken skill entry: {declared}"
         );
         assert!(
             !handler.has_tool("read_skill"),

@@ -52,21 +52,31 @@ fn registry_path(state: &AgentApiState) -> std::path::PathBuf {
 /// 单条 skill 视图（GET /api/skills 元素）
 #[derive(Debug, Serialize)]
 pub struct SkillView {
+    /// 技能名（skill 子目录名）
     pub name: String,
+    /// 来源级："user" | "project"
     pub level: String,
+    /// SKILL.md 绝对路径
     pub path: String,
+    /// 三态："discovered" | "active" | "revoked"
     pub status: String,
+    /// frontmatter description（账本 stale 行为空串）
     pub description: String,
+    /// 批准钉死的 blake3 哈希（prefixed；无管理动作时缺省）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    /// 批准时刻（unix secs）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approved_at: Option<u64>,
+    /// 批准者（缺省 local-operator）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approved_by: Option<String>,
 }
 
+/// GET /api/skills 响应（管理面权威全清单）
 #[derive(Debug, Serialize)]
 pub struct SkillInventoryResponse {
+    /// 全部 skill 视图（user 级在前，级内按名排序）
     pub skills: Vec<SkillView>,
 }
 
@@ -74,52 +84,72 @@ pub struct SkillInventoryResponse {
 /// （审批前必读内容——人工过目 = 供应链闸口）
 #[derive(Debug, Serialize)]
 pub struct PendingSkillView {
+    /// 技能名
     pub name: String,
+    /// 来源级："user" | "project"
     pub level: String,
+    /// SKILL.md 绝对路径
     pub path: String,
+    /// frontmatter description
     pub description: String,
-    /// SKILL.md 全文（人工过目用）
+    /// SKILL.md 全文（人工过目用；frontmatter 损坏时为错误说明占位）
     pub content: String,
 }
 
+/// GET /api/skills/pending 响应
 #[derive(Debug, Serialize)]
 pub struct PendingSkillsResponse {
+    /// discovered 项列表（正文全文随行）
     pub pending: Vec<PendingSkillView>,
 }
 
+/// approve/revoke 请求体
 #[derive(Debug, Deserialize)]
 pub struct SkillNameRequest {
+    /// 目标技能名（skill 子目录名）
     pub name: String,
-    /// "user" | "project"
+    /// 来源级："user" | "project"
     pub level: String,
     /// 操作者（可选；v1 无操作者身份体系，缺省 local-operator）
     #[serde(default)]
     pub operator: Option<String>,
 }
 
+/// approve 成功响应
 #[derive(Debug, Serialize)]
 pub struct ApproveResponse {
+    /// 技能名
     pub name: String,
+    /// 来源级
     pub level: String,
+    /// 结果状态（恒 "active"）
     pub status: String,
+    /// 批准钉死的 blake3 哈希（prefixed 形态）
     pub content_hash: String,
     /// 警告级命中（技术词——合法产品内容，可批；明示供操作者裁量留痕）
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<crate::agent::skill_store::LeakHit>,
 }
 
+/// 拒绝/错误响应（approve 硬拦与其他端点错误共用形态）
 #[derive(Debug, Serialize)]
 pub struct LeakRejectResponse {
+    /// 是否为泄露检查拒绝（其余错误为 false）
     pub rejected: bool,
+    /// 拒绝/错误原因
     pub reason: String,
-    /// 硬拦命中明细（署名泄露族）
+    /// 硬拦命中明细（署名泄露族；非泄露错误时为空）
     pub hits: Vec<crate::agent::skill_store::LeakHit>,
 }
 
+/// revoke 成功响应
 #[derive(Debug, Serialize)]
 pub struct RevokeResponse {
+    /// 技能名
     pub name: String,
+    /// 来源级
     pub level: String,
+    /// 结果状态（恒 "revoked"）
     pub status: String,
 }
 
@@ -144,7 +174,7 @@ fn build_inventory(state: &AgentApiState) -> Result<SkillInventoryResponse, Stri
     let registry = SkillRegistry::load(&registry_path(state))?;
 
     let mut views: Vec<SkillView> = Vec::new();
-    let mut push_scanned = |s: &crate::agent::skill_store::ScannedSkill,
+    let push_scanned = |s: &crate::agent::skill_store::ScannedSkill,
                             views: &mut Vec<SkillView>| {
         let (status, content_hash, approved_at, approved_by) =
             match registry.find(&s.name, s.level) {
@@ -721,7 +751,7 @@ mod tests {
         let (_, inv) = get(app.clone(), "/api/skills").await;
         assert_eq!(inv["skills"][0]["status"], "revoked");
         assert!(
-            inv["skills"][0]["content_hash"].is_null() == false,
+            !inv["skills"][0]["content_hash"].is_null(),
             "revoked row keeps history hash"
         );
 
@@ -762,5 +792,118 @@ mod tests {
         let e = reg.find("proj-skill", SkillLevel::Project).unwrap();
         assert_eq!(e.status, SkillStatus::Active);
         assert_eq!(e.approved_by.as_deref(), Some("damu"), "operator override");
+    }
+
+    // =========================================================================
+    // 会话创建装配链(C 形态 PR-3):merged_manifest_for_session + wire_skills
+    // =========================================================================
+
+    /// 装配链辅助:对给定 workdir 跑「合并 → wire_skills」返回 (read_skill 是否
+    /// 注册, manifest 清单)
+    fn assemble(workdir: &std::path::Path, declared: Vec<crate::agent::definition::SkillManifestEntry>) -> (bool, Vec<crate::agent::definition::SkillManifestEntry>) {
+        let state = make_state(workdir.to_path_buf());
+        let (manifest, reg_path) = merged_manifest_for_session(&state, declared).unwrap();
+        assert!(reg_path.ends_with("registry.json"));
+        let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+        let resolved = crate::api::serve_tools::wire_skills(&mut handler, Some(manifest)).unwrap();
+        (handler.has_tool("read_skill"), resolved.unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn test_assembly_active_skill_enters_manifest_and_read_skill() {
+        // active 项(经 REST approve)→ 进 manifest + read_skill 可读
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "data/skills", "git-discipline", CLEAN_SKILL);
+        let app = router(make_state(tmp.path().to_path_buf()));
+        let (status, _) = post(
+            app,
+            "/api/skills/approve",
+            serde_json::json!({"name": "git-discipline", "level": "user"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (has_read_skill, manifest) = assemble(tmp.path(), vec![]);
+        assert!(has_read_skill, "active skill must register read_skill");
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].name, "git-discipline");
+        assert_eq!(manifest[0].description, "git 纪律指引");
+    }
+
+    #[tokio::test]
+    async fn test_assembly_discovered_skill_absent_everywhere() {
+        // discovered 项(扫到未审)→ manifest 无 + read_skill 不注册
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "data/skills", "not-approved", CLEAN_SKILL);
+        let (has_read_skill, manifest) = assemble(tmp.path(), vec![]);
+        assert!(!has_read_skill, "discovered skill must NOT register read_skill");
+        assert!(manifest.is_empty(), "discovered skill must NOT enter manifest");
+    }
+
+    #[tokio::test]
+    async fn test_assembly_declared_entry_independent_of_registry() {
+        // definition 声明项(B2 语义不变)→ 不经账本直接生效
+        let tmp = tempfile::tempdir().unwrap();
+        let declared_dir = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&declared_dir).unwrap();
+        let declared_path = declared_dir.join("SKILL.md");
+        std::fs::write(&declared_path, CLEAN_SKILL).unwrap();
+        let declared = vec![crate::agent::definition::SkillManifestEntry {
+            name: "git-discipline".to_string(),
+            path: declared_path,
+            description: "declared".to_string(),
+        }];
+        let (has_read_skill, manifest) = assemble(tmp.path(), declared);
+        assert!(has_read_skill);
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].description, "declared");
+    }
+
+    #[tokio::test]
+    async fn test_assembly_declared_beats_registered_on_name_conflict() {
+        // 同名冲突:declaration > 用户级注册项(高优先保留 + warn 不 fail-fast)
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "data/skills", "git-discipline", CLEAN_SKILL);
+        let app = router(make_state(tmp.path().to_path_buf()));
+        let (status, _) = post(
+            app,
+            "/api/skills/approve",
+            serde_json::json!({"name": "git-discipline", "level": "user"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let declared_dir = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&declared_dir).unwrap();
+        let declared_path = declared_dir.join("SKILL.md");
+        std::fs::write(&declared_path, CLEAN_SKILL.replace("git 纪律指引", "declared wins")).unwrap();
+        let declared = vec![crate::agent::definition::SkillManifestEntry {
+            name: "git-discipline".to_string(),
+            path: declared_path.clone(),
+            description: "declared wins".to_string(),
+        }];
+        let (has_read_skill, manifest) = assemble(tmp.path(), declared);
+        assert!(has_read_skill);
+        assert_eq!(manifest.len(), 1, "conflict resolves to one entry");
+        assert_eq!(manifest[0].path, declared_path, "declaration must win");
+    }
+
+    #[tokio::test]
+    async fn test_assembly_project_level_active_enters_manifest() {
+        // 项目级 active 项同样进 manifest(两级目录均扫描)
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), ".evo/skills", "proj-flow", CLEAN_SKILL);
+        let app = router(make_state(tmp.path().to_path_buf()));
+        let (status, _) = post(
+            app,
+            "/api/skills/approve",
+            serde_json::json!({"name": "proj-flow", "level": "project"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (has_read_skill, manifest) = assemble(tmp.path(), vec![]);
+        assert!(has_read_skill);
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].name, "proj-flow");
     }
 }
