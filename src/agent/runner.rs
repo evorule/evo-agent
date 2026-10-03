@@ -3622,6 +3622,14 @@ impl AgentRunner {
                                             }
                                         }
                                     }
+                                    // F-902:压缩事件落 journal（G-6/G-7 账面收敛）
+                                    if !trim_result.dropped.is_empty() {
+                                        if let Some(j) = &journal {
+                                            let before: usize = messages.iter().map(|m| m.content().len()).sum();
+                                            let after: usize = trim_result.messages.iter().map(|m| m.content().len()).sum();
+                                            let _ = j.compaction_performed(before, after, true);
+                                        }
+                                    }
                                     trim_result.messages
                                 } else {
                                     messages.clone()
