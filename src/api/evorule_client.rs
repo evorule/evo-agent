@@ -292,13 +292,17 @@ impl EvoruleApiClient {
         Ok(())
     }
 
-    /// 按 path 更新会话 payload 中的指定值。
+    /// 按 path 更新会话 payload 中的指定值（挂账一闭环：返回 server 侧 fact_id）
+    ///
+    /// server `/api/sessions/{id}/payload` 成功响应携带 `fact_id`
+    /// （ApiResponse.fact_id）——证据链上游锚点。旧版丢弃响应体恒返回 `()`。
+    /// server 未返回 fact_id 时为 `None`（不视为错误，兼容旧版 server）。
     pub async fn update_payload(
         &self,
         session_id: &str,
         path: &str,
         value: &Value,
-    ) -> Result<(), ApiError> {
+    ) -> Result<Option<u64>, ApiError> {
         let url = format!(
             "{}/api/sessions/{}/payload",
             self.core.base_url(),
@@ -317,8 +321,65 @@ impl EvoruleApiClient {
             .send()
             .await?;
         self.core.check_response(&resp).await?;
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        Ok(body.get("fact_id").and_then(|f| f.as_u64()))
+    }
 
-        Ok(())
+    /// 批量更新会话 payload（跨仓挂账二随动：一次 HTTP 写入多条）
+    ///
+    /// server `/api/sessions/{id}/payloads`——预校验整批拒绝
+    /// （空批次/受保护域身份不足/会话不存在）、执行期逐条上报。
+    /// 返回逐条 fact_id（失败条为 None）。
+    /// `success=false`（部分失败）按 [`ApiError`] 上浮，调用方由 B3 对账兜底。
+    pub async fn update_payloads_batch(
+        &self,
+        session_id: &str,
+        updates: &[(String, Value)],
+    ) -> Result<Vec<Option<u64>>, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/payloads",
+            self.core.base_url(),
+            session_id
+        );
+        let items: Vec<serde_json::Value> = updates
+            .iter()
+            .map(|(path, value)| serde_json::json!({ "path": path, "value": value }))
+            .collect();
+        let body = serde_json::json!({ "updates": items });
+
+        let resp = self
+            .core
+            .auth_header(self.core.client().post(&url))
+            .json(&body)
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        let success = body
+            .get("success")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+        if !success {
+            let message = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string();
+            return Err(ApiError::ApiError {
+                status: 200,
+                message: format!("batch payload partial failure: {message}"),
+            });
+        }
+        let fact_ids = body
+            .get("results")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|r| r.get("fact_id").and_then(|f| f.as_u64()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(fact_ids)
     }
 
     /// 获取会话当前状态（GET state，返回完整 state JSON）。

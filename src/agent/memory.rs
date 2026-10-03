@@ -79,8 +79,13 @@ pub enum StableDomain {
 /// `tracing::warn!` 日志中，不是 API 契约。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistOutcome {
-    /// 已写入 evorule 审计链（payload 更新成功，将经 P3 广播进入共享账本）
-    Persisted,
+    /// 已写入 evorule 审计链（payload 更新成功，将经 P3 广播进入共享账本）。
+    /// `fact_id` = server 侧会话事实 ID（挂账一闭环：证据链上游锚点；
+    /// 旧版 server 或缺失响应时为 None）。
+    Persisted {
+        /// server 侧会话事实 ID
+        fact_id: Option<u64>,
+    },
     /// 仅存本地 cache（evorule 不可达或拒绝）；cache 与真相源自此可能漂移，
     /// 由 B3 对账（`verify_cache_against_server`）补偿。失败细节见 tracing warn。
     CacheOnly,
@@ -89,14 +94,16 @@ pub enum PersistOutcome {
 impl PersistOutcome {
     /// 是否已持久化到 evorule
     pub fn persisted(&self) -> bool {
-        matches!(self, PersistOutcome::Persisted)
+        matches!(self, PersistOutcome::Persisted { .. })
     }
 }
 
 impl std::fmt::Display for PersistOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PersistOutcome::Persisted => write!(f, "persisted"),
+            PersistOutcome::Persisted { fact_id } => {
+                write!(f, "persisted (fact_id={:?})", fact_id)
+            }
             PersistOutcome::CacheOnly => write!(f, "cache-only (not persisted to evorule)"),
         }
     }
@@ -940,11 +947,11 @@ impl MemoryManager {
         let session_id = self.session_id_for_scope(&scope)?;
         let path = self.build_path_scoped(&scope, key);
         let payload_value = serde_json::to_value(record)?;
-        if let Err(e) = self
+        let fact_id = self
             .evorule_client
             .update_payload(&session_id, &path, &payload_value)
-            .await
-        {
+            .await;
+        if let Err(e) = &fact_id {
             // 不静默：持久化失败意味着该写入在 evorule 侧不可见，
             // cache 与真相源开始漂移，必须留痕（返回值同时携带 CacheOnly）
             tracing::warn!(
@@ -956,7 +963,10 @@ impl MemoryManager {
             return Ok(PersistOutcome::CacheOnly);
         }
 
-        Ok(PersistOutcome::Persisted)
+        Ok(PersistOutcome::Persisted {
+            // 挂账一闭环：server 响应携带 fact_id（证据链上游锚点）
+            fact_id: fact_id.unwrap_or(None),
+        })
     }
 
     /// B5：受信内部通道写入（绕过域准入，source 由系统自动填充）
@@ -993,11 +1003,11 @@ impl MemoryManager {
         let session_id = self.session_id_for_scope(&scope)?;
         let path = self.build_path_scoped(&scope, key);
         let payload_value = serde_json::to_value(&record)?;
-        if let Err(e) = self
+        let fact_id = self
             .evorule_client
             .update_payload(&session_id, &path, &payload_value)
-            .await
-        {
+            .await;
+        if let Err(e) = &fact_id {
             tracing::warn!(
                 session_id = %session_id,
                 path = %path,
@@ -1006,7 +1016,9 @@ impl MemoryManager {
             );
             return Ok(PersistOutcome::CacheOnly);
         }
-        Ok(PersistOutcome::Persisted)
+        Ok(PersistOutcome::Persisted {
+            fact_id: fact_id.unwrap_or(None),
+        })
     }
 
     /// B5：stable key 的来源域判定（召回标注用）
@@ -1293,7 +1305,7 @@ impl MemoryManager {
             .update_payload(&session_id, &path, &null_value)
             .await
         {
-            Ok(_) => PersistOutcome::Persisted,
+            Ok(fact_id) => PersistOutcome::Persisted { fact_id },
             Err(e) => {
                 tracing::warn!(
                     session_id = %session_id,
@@ -1565,18 +1577,28 @@ impl MemoryManager {
 
     /// 批量追加消息（EveryN/PerReactRound 模式）
     ///
-    /// 诚实契约：**当前为循环逐条写入**（每条一次 HTTP）——server 端
-    /// 暂无批量 payload 端点，本方法不减少 HTTP 往返；中途失败时前面已写、
-    /// 后面丢弃（无原子性），调用方依赖 B3 对账兜底。批量端点就绪后本方法
-    /// 是唯一改造点。
+    /// **真批量**——一次 HTTP 写入整批（server
+    /// `/api/sessions/{id}/payloads`：预校验整批拒绝、执行期逐条上报）。
+    /// 任一条失败按 Err 上浮（server 端已写入部分由 B3 对账兜底）。
     pub async fn append_messages_batch(
         &mut self,
         session_id: &str,
         messages: &[(usize, Message)],
     ) -> Result<(), MemoryError> {
-        for (idx, message) in messages {
-            self.append_message(session_id, *idx, message).await?;
+        if messages.is_empty() {
+            return Ok(());
         }
+        let timestamp = now_secs();
+        let mut updates: Vec<(String, serde_json::Value)> = Vec::with_capacity(messages.len());
+        for (idx, message) in messages {
+            let record = MessageRecord::from_message(*idx, message, timestamp);
+            let scope = MemoryScope::Messages(session_id.to_string(), *idx);
+            let path = self.build_path_scoped(&scope, "");
+            updates.push((path, serde_json::to_value(&record)?));
+        }
+        self.evorule_client
+            .update_payloads_batch(session_id, &updates)
+            .await?;
         Ok(())
     }
 
@@ -3043,13 +3065,18 @@ mod tests {
         let m1 = server
             .mock("POST", "/api/sessions/s1/payload")
             .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"message":"ok","fact_id":42,"code":null}"#)
             .create_async()
             .await;
         let outcome = mgr
             .set_scoped(MemoryScope::Session("s1".into()), "topic", "v")
             .await
             .expect("set should not fail");
-        assert_eq!(outcome, PersistOutcome::Persisted);
+        assert!(matches!(
+            outcome,
+            PersistOutcome::Persisted { fact_id: Some(_) }
+        ));
         m1.assert_async().await;
 
         // 服务不可达 → 不传播错误，但返回 CacheOnly（修复前调用方只能从日志感知）
