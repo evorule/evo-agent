@@ -1214,6 +1214,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             approval_mode: None,
             assembly: None,
             skills: None,
+            identity_segment: None,
         }
     }
 

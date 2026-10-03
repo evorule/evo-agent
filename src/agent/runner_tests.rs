@@ -631,6 +631,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         approval_mode: None,
         assembly: None,
         skills: None,
+        identity_segment: None,
     }
 }
 
