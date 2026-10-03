@@ -437,6 +437,20 @@ impl JournalWriter {
         })
     }
 
+    /// F-902:压缩事件落 journal（上下文管理 09 规格 F-902）
+    pub fn compaction_performed(
+        &self,
+        before_est: usize,
+        after_est: usize,
+        summary_generated: bool,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::CompactionPerformed {
+            before_est,
+            after_est,
+            cleared_call_ids: vec![format!("summary_generated={}", summary_generated)],
+        })
+    }
+
     /// 审批请求开启
     pub fn approval_requested(
         &self,
