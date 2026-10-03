@@ -9,10 +9,11 @@ try {
     . (Join-Path $OpsDir '_common.ps1')
     $cfg = Get-OpsConfig -OpsDir $OpsDir
     $starters = @{
-        'evorule-server'  = 'start-evorule-server.ps1'
-        'echo'            = 'start-echo.ps1'
-        'evo-agent-serve' = 'start-evo-agent-serve.ps1'
-        'console'         = 'start-console.ps1'
+        'evorule-server'      = 'start-evorule-server.ps1'
+        'echo'                = 'start-echo.ps1'
+        'evo-agent-serve'     = 'start-evo-agent-serve.ps1'
+        'console'             = 'start-console.ps1'
+        'context-inspector'   = 'start-context-inspector.ps1'
     }
     foreach ($name in $cfg.services.PSObject.Properties.Name) {
         $svc = $cfg.services.$name
