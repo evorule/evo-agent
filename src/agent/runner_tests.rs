@@ -72,7 +72,7 @@ fn test_merge_delegate_tool() {
         // 工具面注入(测试不注入)
         toolkit: None,
         workdir: None,
-        // O-275:journal 目录(测试不落盘)
+        // journal 目录(测试不落盘)
         journal_dir: None,
     };
 

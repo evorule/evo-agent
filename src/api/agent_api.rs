@@ -764,7 +764,7 @@ async fn run_agent(
         .with_metrics(state.metrics.clone())
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
         .with_journal_dir(state.workdir.join("data").join("sessions"))
-        // O-274:注入 delegate 上下文——serve 模式多代理委托通路接线
+        // 注入 delegate 上下文——serve 模式多代理委托通路接线
         .with_delegate_context(crate::agent::delegate::DelegateContext::new(
             &agent_type,
             state.definitions.clone(),
