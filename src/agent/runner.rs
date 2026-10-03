@@ -977,9 +977,11 @@ impl AgentRunner {
         llm_handler: Option<LlmHandler>,
     ) -> Result<Self, AgentError> {
         // 1. 配置
-        // F-201:加载时静态宪法审查(from_definition 直构路径与 load_from_dir
-        // 门卫 4 同规则;违反=拒建,错误明示规则名)
-        def.validate_constitution()
+        // F-201:配方绑定审查(R1/R2)。R3 哨兵检查不在此重复——serve 面 M1/L2/
+        // 进化信号机制注入先于本构造修改 system_prompt,注入段合法含机制分区,
+        // R3 由文件入口 load_from_dir 门卫 4 单独把关(批次 D E2E 实测修订;
+        // 违反=拒建,错误明示规则名)
+        def.validate_assembly_binding()
             .map_err(|e| AgentError::Internal(e.to_string()))?;
         let config = def.to_agent_config();
 

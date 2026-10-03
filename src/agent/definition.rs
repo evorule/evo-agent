@@ -632,6 +632,12 @@ impl AgentDefinition {
     /// - R3 禁跨区内容混入(全量生效):system_prompt 基底文本禁含机制哨兵
     ///   短语(记忆分区标题/感知段/规范索引文案只允许由机制写入,定义文本
     ///   不得伪造——字面级判定,确定性)。
+    ///
+    /// 挂点分工(批次 D E2E 实测修订):本方法 = **文件供给侧关口**
+    /// (load_from_dir 门卫 4)。运行时构造路径(from_definition)只查
+    /// [`Self::validate_assembly_binding`](R1/R2)——serve 面 M1 规范索引/
+    /// L2 前馈/进化信号注入先于 from_definition 修改 system_prompt,注入段
+    /// 合法含机制哨兵短语,运行时重复 R3 会把机制注入误判为跨区伪造。
     pub fn validate_constitution(&self) -> Result<(), AgentDefinitionError> {
         // R3:机制哨兵短语集合(权威源=context_inspector::MECHANISM_SECTION_MARKERS
         // ——与 I2 检查器分区切分同源;新增机制分区须同步)
@@ -643,6 +649,15 @@ impl AgentDefinition {
                 )));
             }
         }
+        self.validate_assembly_binding()
+    }
+
+    /// R1/R2 配方绑定审查(运行时构造路径挂点:from_definition)。
+    ///
+    /// 只查 assembly 配方声明(骨架槽位来源绑定 + 权威分区序),不查 R3——
+    /// 机制注入(M1/L2/进化信号)先于运行时构造发生且不触配方,故此路径
+    /// 不会误伤注入段;R3 由文件入口([`Self::load_from_dir`])单独把关。
+    pub fn validate_assembly_binding(&self) -> Result<(), AgentDefinitionError> {
         // R1/R2:仅对声明配方的定义生效(未声明 = 内置默认配方,骨架/槽序
         // 由代码保证)
         if let Some(recipe) = &self.assembly {
