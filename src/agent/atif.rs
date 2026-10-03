@@ -27,11 +27,12 @@
 //!   由 journal 尾事件 ts 派生而非取当前时钟(映射表 §三 exported_at 与 §十 #7
 //!   幂等的冲突点,取幂等优先;语义 = 会话末次活动时刻,注释留痕)。
 //!
-//! 已知边界(v1 留痕,02-实施日志同口径):
-//! - delegate 子代理 `journal_dir=None` 不落 journal → 子代理内部轨迹不导出,
-//!   主轨迹中 delegate 仅呈现为普通工具调用(映射表 §六 v1 口径);
-//! - `compaction_performed` v1 事件面就绪但运行时未接线(PR-3),导出按映射表
-//!   §四.4 产出 context_management 系统步,摘要正文待 PR-3 补 journal 字段后充实;
+//! 已知边界(v1 留痕,02-实施日志同口径;现状随接线更新):
+//! - delegate 子代理 journal 已接线(DelegateContext.journal_dir 注入,
+//!   子代理事件流落 data/sessions/{sid}.jsonl)——子轨迹的 ATIF 独立导出
+//!   充实随二期;主轨迹中 delegate 仍呈现为普通工具调用(映射表 §六 v1 口径);
+//! - `compaction_performed` 运行时已接线(裁剪时落 journal),导出按映射表
+//!   §四.4 产出 context_management 系统步;
 //! - `session_crashed` 运行时不写(PR-2 resume 检测补写),导出遇此事件即截断。
 
 use std::collections::HashMap;
