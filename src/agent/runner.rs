@@ -665,7 +665,9 @@ pub fn tool_intent_signal(intent: &Value) -> Value {
 const INTENT_VERDICT_POLLS: usize = 20;
 const INTENT_VERDICT_INTERVAL_MS: u64 = 50;
 
-async fn session_version(client: &EvoruleApiClient, session_id: &str) -> Result<u64, String> {
+/// 查询会话当前服务端 Fact 版本(evorule-server state.version 权威口径)。
+/// 调用方:每轮 Done 回执权威校正(ws_handler);runner 内部 M5-c 裁决判别。
+pub(crate) async fn session_version(client: &EvoruleApiClient, session_id: &str) -> Result<u64, String> {
     let state = client
         .get_state(session_id)
         .await
