@@ -86,8 +86,7 @@ impl SkillReadTool {
             ));
         };
 
-        let metadata =
-            std::fs::metadata(path).map_err(|e| format!("stat failed: {}", e))?;
+        let metadata = std::fs::metadata(path).map_err(|e| format!("stat failed: {}", e))?;
         if !metadata.is_file() {
             return Err(format!(
                 "declared skill path is not a regular file: '{}'",
@@ -152,7 +151,10 @@ mod tests {
         assert!(result.is_ok());
         let v = result.unwrap();
         assert_eq!(v["skill_name"], "git-discipline");
-        assert_eq!(v["content"], "---\nname: git-discipline\ndescription: d\n---\n# 正文\n先 git status。");
+        assert_eq!(
+            v["content"],
+            "---\nname: git-discipline\ndescription: d\n---\n# 正文\n先 git status。"
+        );
         assert!(v["size"].as_i64().unwrap() > 0);
         assert!(v["path"].as_str().unwrap().ends_with("SKILL.md"));
     }
@@ -162,10 +164,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = write_skill(dir.path(), "a/SKILL.md", "---\nname: a\n---\nA");
         let b = write_skill(dir.path(), "b/SKILL.md", "---\nname: b\n---\nB");
-        let tool = SkillReadTool::new(&[
-            entry("alpha", a, "d"),
-            entry("beta", b, "d"),
-        ]);
+        let tool = SkillReadTool::new(&[entry("alpha", a, "d"), entry("beta", b, "d")]);
 
         let err = tool.call_sync(&args("nope")).unwrap_err();
         assert!(err.contains("skill 'nope' is not declared"), "got: {}", err);
@@ -182,7 +181,9 @@ mod tests {
     #[test]
     fn test_missing_skill_name_arg() {
         let tool = SkillReadTool::new(&[]);
-        let err = tool.call_sync(&Value::Object(serde_json::Map::new())).unwrap_err();
+        let err = tool
+            .call_sync(&Value::Object(serde_json::Map::new()))
+            .unwrap_err();
         assert!(err.contains("missing required arg"), "got: {}", err);
     }
 

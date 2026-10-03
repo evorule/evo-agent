@@ -506,7 +506,9 @@ pub fn wire_skills(
     let resolved = crate::agent::definition::resolve_skill_manifest_entries(entries)?;
     handler.register_tool(
         "read_skill",
-        std::sync::Arc::new(crate::builtin_tools::skill_read::SkillReadTool::new(&resolved)),
+        std::sync::Arc::new(crate::builtin_tools::skill_read::SkillReadTool::new(
+            &resolved,
+        )),
     );
     Ok(Some(resolved))
 }
@@ -1536,7 +1538,8 @@ service_tools = ["config_persist", "rule_sandbox"]
         // 声明非空:read_skill 注册 + 返回生效清单(description 取自 frontmatter);
         // 端到端:注册后即可经 execute_by_name 读到正文
         let root = tempfile::tempdir().unwrap();
-        let skill_path = write_skill_md(root.path(), "git-discipline", "git 提交纪律", "正文标记XYZ");
+        let skill_path =
+            write_skill_md(root.path(), "git-discipline", "git 提交纪律", "正文标记XYZ");
 
         let mut def = make_def(&["file_read"], None);
         def.skills = Some(vec![crate::agent::definition::SkillEntry {
@@ -1558,11 +1561,17 @@ service_tools = ["config_persist", "rule_sandbox"]
 
         // 端到端:接线后工具即可用(声明表名 → 绝对路径 → 正文)
         let out = handler
-            .execute_by_name("read_skill", &serde_json::json!({"skill_name": "git-discipline"}))
+            .execute_by_name(
+                "read_skill",
+                &serde_json::json!({"skill_name": "git-discipline"}),
+            )
             .await
             .expect("read_skill must read declared skill after wiring");
         let content = out["content"].as_str().expect("content field");
-        assert!(content.contains("正文标记XYZ"), "full body returned: {content}");
+        assert!(
+            content.contains("正文标记XYZ"),
+            "full body returned: {content}"
+        );
     }
 
     #[test]
