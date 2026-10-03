@@ -2635,7 +2635,9 @@ impl AgentRunner {
         let mut call_params = serde_json::Map::new();
         call_params.insert("tool_name".to_string(), Value::from(tool_name.to_string()));
         call_params.insert("args".to_string(), args_tcb);
-        // G17:工具调用计时 + 指标(单一插桩点,覆盖 run() / run_streaming() / G13 并行路径)
+        // G17:工具调用计时 + 指标(call_service 路径插桩;G13 并行预执行
+        // 在 execute_single_tool 内做同规格插桩——O-273 修复前该路径零记录,
+        // 本注释原称「单一插桩点覆盖 G13 并行路径」与实现不符,已修正)
         let tool_start = std::time::Instant::now();
         let result = self
             .execute_external("call_service", &Value::Object(call_params))
@@ -2815,7 +2817,10 @@ impl AgentRunner {
     /// 返回 `Value`(工具结果,可能是 proposal)。
     async fn execute_single_tool(&self, tc: &crate::agent::translator::ToolCall) -> Value {
         let args_tcb = tc.arguments.clone();
-        match self.tool_handler.execute_by_name(&tc.name, &args_tcb).await {
+        // O-273:G13 并行预执行接入 G17 同规格插桩——此前该路径直调
+        // tool_handler,metrics/tool_traces 双观测面断流(注释宣称已覆盖,实测否)
+        let tool_start = std::time::Instant::now();
+        let result = match self.tool_handler.execute_by_name(&tc.name, &args_tcb).await {
             Ok(result) => result,
             Err(e) => {
                 // 工具执行失败:返回 error JSON(不中断其他并行工具)
@@ -2824,7 +2829,25 @@ impl AgentRunner {
                 map.insert("error".to_string(), Value::from(e));
                 Value::Object(map)
             }
+        };
+        let tool_duration = tool_start.elapsed();
+        let tool_ok = result
+            .get("status")
+            .and_then(Value::as_str)
+            .map(|s| s != "error")
+            .unwrap_or(true);
+        if let Some(m) = &self.metrics {
+            m.observe_tool_call(&tc.name, tool_duration, tool_ok);
         }
+        if let Ok(mut tt) = self.tool_traces.lock() {
+            tt.record(
+                &tc.name,
+                &args_tcb,
+                if tool_ok { "ok" } else { "error" },
+                tool_duration.as_millis() as u64,
+            );
+        }
+        result
     }
 
     /// G13:并行执行多个 tool_calls
