@@ -120,6 +120,9 @@ pub struct AgentConfig {
     /// B2:skills 生效清单(None = 无技能,manifest 槽位静默跳过 = 现状行为;
     /// serve/CLI 层 wire_skills 从 def.skills 解析注入)
     pub skills: Option<Vec<crate::agent::definition::SkillManifestEntry>>,
+    /// F-101:身份资产段(None = S1 槽仅基底块 = 现状行为;声明后 S1 槽内
+    /// 拼接序 = 基底块→身份段)
+    pub identity_segment: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -138,6 +141,7 @@ impl Default for AgentConfig {
             capability_boundary: None,
             assembly: None,
             skills: None,
+            identity_segment: None,
         }
     }
 }
@@ -1628,6 +1632,7 @@ impl AgentRunner {
             .assembly
             .assemble(
                 &self.config.system_prompt,
+                self.config.identity_segment.as_deref(),
                 self.memory.as_ref(),
                 &recall,
                 self.max_context_tokens,
@@ -3479,6 +3484,7 @@ impl AgentRunner {
                 .map(|b| b.awareness_segment());
             let system_prompt = match runner.assembly.assemble(
                 &runner.config.system_prompt,
+                runner.config.identity_segment.as_deref(),
                 runner.memory.as_ref(),
                 &recall,
                 runner.max_context_tokens,

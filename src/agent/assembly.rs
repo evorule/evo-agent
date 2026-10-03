@@ -578,6 +578,8 @@ impl AssemblyExecutor {
     /// 组装 system_prompt(按配方槽位序拼接)
     ///
     /// - `base_prompt`:S1_base 源(definition.system_prompt)
+    /// - `identity_segment`:F-101 身份资产段(None = 未声明,S1 槽仅基底块;
+    ///   声明后 S1 槽内拼接序 = 基底块→"\n\n"→身份段)
     /// - `memory`:S3_memory 源载体(None = memory 未启用,槽位静默跳过 =
     ///   现状 memory none 分支行为)
     /// - `recall`:S3_memory 内容(已在调用侧完成召回;预算裁剪在渲染器内)
@@ -591,6 +593,7 @@ impl AssemblyExecutor {
     pub fn assemble(
         &self,
         base_prompt: &str,
+        identity_segment: Option<&str>,
         memory: Option<&crate::agent::memory::MemoryManager>,
         recall: &crate::agent::memory::RecallContext,
         total_window: usize,
@@ -603,8 +606,15 @@ impl AssemblyExecutor {
                 continue; // 开关停用(如 S4b_skills 预留位)
             }
             match slot.source.as_str() {
-                // S1_base:系统提示(硬注入,不裁剪)
-                "definition.system_prompt" => prompt.push_str(base_prompt),
+                // S1_base:系统提示(硬注入,不裁剪)。F-101:身份资产段紧随
+                // 基底块(槽内拼接序固定,后续槽位仍按配方序)
+                "definition.system_prompt" => {
+                    prompt.push_str(base_prompt);
+                    if let Some(seg) = identity_segment {
+                        prompt.push_str("\n\n");
+                        prompt.push_str(seg);
+                    }
+                }
                 // S3_memory:记忆区(渲染机制在 MemoryManager,含 fit_recall
                 // 预算裁剪 + L2 安全审计 + 分区渲染;比例/基准由配方声明。
                 // 渲染器以「当前累积 prompt」为 base 前缀,返回 base+记忆区)
@@ -897,7 +907,7 @@ mod tests {
 
         // 场景 1:CJK 长记忆(正常预算 8192×0.25,无降级)
         let out1 = exec
-            .assemble(base, Some(&mem), &recall, 8192, None, None)
+            .assemble(base, None, Some(&mem), &recall, 8192, None, None)
             .unwrap();
         assert_eq!(
             out1,
@@ -906,7 +916,7 @@ mod tests {
 
         // 场景 2:极端小窗口(60 token)强制降级通知
         let out2 = exec
-            .assemble(base, Some(&mem), &recall, 60, None, None)
+            .assemble(base, None, Some(&mem), &recall, 60, None, None)
             .unwrap();
         assert_eq!(
             out2,
@@ -923,6 +933,7 @@ mod tests {
             .assemble(
                 base,
                 None,
+                None,
                 &RecallContext::default(),
                 0,
                 Some(&boundary.awareness_segment()),
@@ -933,6 +944,33 @@ mod tests {
             out3,
             std::fs::read_to_string("tests/fixtures/golden_boundary.txt").unwrap()
         );
+    }
+
+    /// F-101:S1 槽内拼接序 = 基底块→身份段;None = 基底块原样(既有行为零变化)
+    #[test]
+    fn test_assemble_identity_segment_order() {
+        let exec = AssemblyExecutor::default_executor();
+        // 无身份段:输出 = 基底块原样
+        let out_none = exec
+            .assemble("base", None, None, &Default::default(), 0, None, None)
+            .unwrap();
+        assert_eq!(out_none, "base");
+        // 有身份段:紧跟基底块("\n\n" 分隔),且在边界段之前(S1 槽序 < S4 槽序)
+        let out_id = exec
+            .assemble(
+                "base",
+                Some("【身份资产】我是谁/服务谁/边界自述/基调"),
+                None,
+                &Default::default(),
+                0,
+                Some("【能力边界声明】boundary"),
+                None,
+            )
+            .unwrap();
+        assert!(out_id.starts_with("base\n\n【身份资产】我是谁/服务谁/边界自述/基调"));
+        let id_pos = out_id.find("【身份资产】").unwrap();
+        let boundary_pos = out_id.find("【能力边界声明】").unwrap();
+        assert!(id_pos < boundary_pos, "S1 槽序:基底块→身份段→…→边界段");
     }
 
     /// 执行器预算参数访问:默认配方 = 现状硬编码值
@@ -953,7 +991,7 @@ mod tests {
     fn test_assemble_manifest_without_skills_not_injected() {
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble("base", None, &Default::default(), 0, None, None)
+            .assemble("base", None, None, &Default::default(), 0, None, None)
             .unwrap();
         assert_eq!(out, "base");
         assert!(!out.contains("可用技能清单"));
@@ -977,7 +1015,15 @@ mod tests {
         ];
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble("base", None, &Default::default(), 0, None, Some(&skills))
+            .assemble(
+                "base",
+                None,
+                None,
+                &Default::default(),
+                0,
+                None,
+                Some(&skills),
+            )
             .unwrap();
         assert!(out.starts_with("base\n\n"));
         assert!(out.contains("【可用技能清单】以下技能可经 read_skill 工具装载正文："));
@@ -999,6 +1045,7 @@ mod tests {
         let out = exec
             .assemble(
                 "base",
+                None,
                 None,
                 &Default::default(),
                 0,
@@ -1028,7 +1075,15 @@ mod tests {
             }
         }
         let out = AssemblyExecutor::new(recipe)
-            .assemble("base", None, &Default::default(), 0, None, Some(&skills))
+            .assemble(
+                "base",
+                None,
+                None,
+                &Default::default(),
+                0,
+                None,
+                Some(&skills),
+            )
             .unwrap();
         assert_eq!(out, "base");
     }
@@ -1038,7 +1093,7 @@ mod tests {
     fn test_assemble_manifest_empty_skills_not_injected() {
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble("base", None, &Default::default(), 0, None, Some(&[]))
+            .assemble("base", None, None, &Default::default(), 0, None, Some(&[]))
             .unwrap();
         assert_eq!(out, "base");
     }
@@ -1076,7 +1131,7 @@ mod tests {
 
         // 默认配方(基数=input,完全切换后口径)
         let out_input = AssemblyExecutor::new(AssemblyRecipe::default())
-            .assemble("base", Some(&mem), &recall, 8192, None, None)
+            .assemble("base", None, Some(&mem), &recall, 8192, None, None)
             .unwrap();
         // 显式兼容口径(base=total_window,历史行为)
         let mut total_recipe = AssemblyRecipe::default();
@@ -1088,7 +1143,7 @@ mod tests {
             }
         }
         let out_total = AssemblyExecutor::new(total_recipe)
-            .assemble("base", Some(&mem), &recall, 8192, None, None)
+            .assemble("base", None, Some(&mem), &recall, 8192, None, None)
             .unwrap();
 
         assert_ne!(out_input, out_total, "口径切换必须改变记忆区预算效果");
@@ -1129,7 +1184,7 @@ mod tests {
         let r10: AssemblyRecipe = serde_json::from_str(v10).unwrap();
         r10.validate().unwrap();
         AssemblyExecutor::new(r10)
-            .assemble("base", None, &Default::default(), 8192, None, None)
+            .assemble("base", None, None, &Default::default(), 8192, None, None)
             .unwrap();
         // 新配方:加载 → validate → 字段落位
         let r11: AssemblyRecipe = serde_json::from_str(&v11).unwrap();
@@ -1147,7 +1202,7 @@ mod tests {
             "input"
         );
         exec11
-            .assemble("base", None, &Default::default(), 8192, None, None)
+            .assemble("base", None, None, &Default::default(), 8192, None, None)
             .unwrap();
     }
 }
