@@ -293,7 +293,9 @@ pub struct SkillManifestEntry {
 /// SKILL.md frontmatter 解析产物(轻量:仅取围栏内平铺键值)
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SkillFrontmatter {
+    /// frontmatter name(仅解析留档;生效名 = 声明表名,单一事实源防两处漂移)
     pub name: Option<String>,
+    /// frontmatter description(manifest 渲染用;缺省 = 声明缺失,加载期 warn)
     pub description: Option<String>,
 }
 
@@ -324,10 +326,7 @@ pub fn parse_skill_frontmatter(content: &str) -> Result<SkillFrontmatter, String
         let Some((k, v)) = t.split_once(':') else {
             continue;
         };
-        let value = v
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'')
-            .to_string();
+        let value = v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
         match k.trim() {
             "name" => fm.name = Some(value),
             "description" => fm.description = Some(value),
@@ -1654,7 +1653,11 @@ mod tests {
     #[test]
     fn test_skills_loading_resolves_relative_paths() {
         let dir = make_tmp_dir();
-        write_skill_md(dir.path(), "skills/git-discipline/SKILL.md", SAMPLE_SKILL_MD);
+        write_skill_md(
+            dir.path(),
+            "skills/git-discipline/SKILL.md",
+            SAMPLE_SKILL_MD,
+        );
         let mut json = minimal_def_json();
         json.pop();
         json.push_str(
@@ -1667,7 +1670,10 @@ mod tests {
         let skills = def.skills.expect("skills present");
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "git-discipline");
-        assert!(skills[0].path.is_absolute(), "relative path must be resolved");
+        assert!(
+            skills[0].path.is_absolute(),
+            "relative path must be resolved"
+        );
         assert!(skills[0].path.ends_with("SKILL.md"));
     }
 
@@ -1698,7 +1704,11 @@ mod tests {
                 path: skill_path.clone(),
             }]),
         };
-        assert!(empty_name.validate().unwrap_err().to_string().contains("name"));
+        assert!(empty_name
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("name"));
 
         let dup = AgentDefinition {
             skills: Some(vec![
@@ -1713,7 +1723,11 @@ mod tests {
             ]),
             ..empty_name
         };
-        assert!(dup.validate().unwrap_err().to_string().contains("duplicate skill name"));
+        assert!(dup
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate skill name"));
     }
 
     /// load_from_dir fail-fast:路径不存在 → 加载即拒
@@ -1773,11 +1787,7 @@ mod tests {
     fn test_resolve_skill_manifest_entries_description_semantics() {
         let dir = make_tmp_dir();
         let with_desc = write_skill_md(dir.path(), "a/SKILL.md", SAMPLE_SKILL_MD);
-        let no_desc = write_skill_md(
-            dir.path(),
-            "b/SKILL.md",
-            "---\nname: b\n---\nbody only\n",
-        );
+        let no_desc = write_skill_md(dir.path(), "b/SKILL.md", "---\nname: b\n---\nbody only\n");
         let entries = resolve_skill_manifest_entries(&[
             SkillEntry {
                 name: "a".into(),
@@ -1790,7 +1800,10 @@ mod tests {
         ])
         .expect("resolve");
         assert_eq!(entries[0].description, "提交前先看 diff,身份旗标逐项检查");
-        assert_eq!(entries[1].description, "", "missing description = empty string");
+        assert_eq!(
+            entries[1].description, "",
+            "missing description = empty string"
+        );
     }
 
     /// resolve 反例:路径是目录 → Err
