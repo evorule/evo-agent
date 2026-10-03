@@ -85,7 +85,7 @@ pub struct SedimentResult {
     pub summary_written: bool,
     /// 成功写入的稳定事实 key 列表
     pub stable_facts: Vec<String>,
-    /// 仅本地 cache 的稳定事实 key 列表（O-245：持久化失败 CacheOnly，
+    /// 仅本地 cache 的稳定事实 key 列表（持久化失败 CacheOnly，
     /// 不计入 stable_facts 防虚报成功；由 B3 对账补偿）
     pub stable_facts_cache_only: Vec<String>,
     /// 提取并写入共享账本的事件 ID 列表（R07/E17 接线后实际填充）
@@ -152,7 +152,7 @@ pub async fn sediment(
                         .set_scoped_with_source(MemoryScope::Shared, &key, &fact.value, &source)
                         .await
                     {
-                        // O-245:区分 Persisted/CacheOnly——CacheOnly 不计入 stable_facts 防虚报
+                        // 区分 Persisted/CacheOnly——CacheOnly 不计入 stable_facts 防虚报
                         Ok(PersistOutcome::Persisted) => result.stable_facts.push(fact.key.clone()),
                         Ok(PersistOutcome::CacheOnly) => {
                             result.stable_facts_cache_only.push(fact.key.clone())

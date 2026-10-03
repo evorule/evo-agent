@@ -141,7 +141,7 @@ pub enum JournalEvent {
         /// 被清除的工具结果 call_id 列表
         cleared_call_ids: Vec<String>,
     },
-    /// 会话沉淀结果落账（O-245）：sediment 四项持久化结果进步级账面。
+    /// 会话沉淀结果落账：sediment 四项持久化结果进步级账面。
     /// CacheOnly 事实仅本地 cache、由 B3 对账补偿——落账后「沉淀成功与否」有对账依据，
     /// ATIF 导出 context_management 段随之充实（F-902 同精神）。
     SedimentPerformed {
@@ -466,7 +466,7 @@ impl JournalWriter {
         })
     }
 
-    /// O-245:sediment 结果落 journal（受信通道持久化信号 + 四项结果对账依据）
+    /// sediment 结果落 journal（受信通道持久化信号 + 四项结果对账依据）
     pub fn sediment_performed(
         &self,
         summary_written: bool,
