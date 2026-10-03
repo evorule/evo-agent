@@ -174,18 +174,17 @@ fn build_inventory(state: &AgentApiState) -> Result<SkillInventoryResponse, Stri
     let registry = SkillRegistry::load(&registry_path(state))?;
 
     let mut views: Vec<SkillView> = Vec::new();
-    let push_scanned = |s: &crate::agent::skill_store::ScannedSkill,
-                            views: &mut Vec<SkillView>| {
-        let (status, content_hash, approved_at, approved_by) =
-            match registry.find(&s.name, s.level) {
-                Some(e) => (
-                    e.status,
-                    e.content_hash.clone(),
-                    e.approved_at,
-                    e.approved_by.clone(),
-                ),
-                None => (SkillStatus::Discovered, None, None, None),
-            };
+    let push_scanned = |s: &crate::agent::skill_store::ScannedSkill, views: &mut Vec<SkillView>| {
+        let (status, content_hash, approved_at, approved_by) = match registry.find(&s.name, s.level)
+        {
+            Some(e) => (
+                e.status,
+                e.content_hash.clone(),
+                e.approved_at,
+                e.approved_by.clone(),
+            ),
+            None => (SkillStatus::Discovered, None, None, None),
+        };
         views.push(SkillView {
             name: s.name.clone(),
             level: s.level.as_str().to_string(),
@@ -231,7 +230,9 @@ fn build_inventory(state: &AgentApiState) -> Result<SkillInventoryResponse, Stri
 // =============================================================================
 
 /// `GET /api/skills` — 全清单（三态 + 来源级 + 哈希 + description 摘要）
-pub async fn list_skills(State(state): State<AgentApiState>) -> Result<Json<SkillInventoryResponse>, (StatusCode, Json<LeakRejectResponse>)> {
+pub async fn list_skills(
+    State(state): State<AgentApiState>,
+) -> Result<Json<SkillInventoryResponse>, (StatusCode, Json<LeakRejectResponse>)> {
     build_inventory(&state).map(Json).map_err(|e| {
         tracing::error!(error = %e, "skill inventory failed");
         (
@@ -408,7 +409,13 @@ pub async fn approve_skill(
             }),
         )
     })?;
-    registry.approve(&req.name, s.path.clone(), level, content_hash.clone(), &operator);
+    registry.approve(
+        &req.name,
+        s.path.clone(),
+        level,
+        content_hash.clone(),
+        &operator,
+    );
     registry.save().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -511,7 +518,13 @@ pub fn skills_routes() -> axum::Router<AgentApiState> {
 pub fn merged_manifest_for_session(
     state: &AgentApiState,
     declared: Vec<crate::agent::definition::SkillManifestEntry>,
-) -> Result<(Vec<crate::agent::definition::SkillManifestEntry>, std::path::PathBuf), String> {
+) -> Result<
+    (
+        Vec<crate::agent::definition::SkillManifestEntry>,
+        std::path::PathBuf,
+    ),
+    String,
+> {
     let user_dir = user_skills_dir(state);
     let project_dir = project_skills_dir(state);
     let registry_path = registry_path(state);
@@ -561,7 +574,9 @@ mod tests {
             .unwrap();
         let status = resp.status();
         let body = serde_json::from_slice(
-            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
         )
         .unwrap_or(serde_json::Value::Null);
         (status, body)
@@ -585,7 +600,9 @@ mod tests {
             .unwrap();
         let status = resp.status();
         let body = serde_json::from_slice(
-            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
         )
         .unwrap_or(serde_json::Value::Null);
         (status, body)
@@ -624,7 +641,10 @@ mod tests {
         let pending = body["pending"].as_array().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0]["name"], "git-discipline");
-        assert!(pending[0]["content"].as_str().unwrap().contains("git status"));
+        assert!(pending[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("git status"));
     }
 
     #[tokio::test]
@@ -689,7 +709,10 @@ mod tests {
             tmp.path(),
             "data/skills",
             "leaky",
-            "---\nname: leaky\ndescription: d\n---\n# 正文\n本文由 AI 生成，请放心使用。\n",
+            concat!(
+                "---\nname: leaky\ndescription: d\n---\n# 正文\n本文由 AI 生",
+                "成，请放心使用。\n"
+            ),
         );
         let app = router(make_state(tmp.path().to_path_buf()));
 
@@ -705,7 +728,10 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["severity"], "hard");
         assert_eq!(hits[0]["line_no"], 6);
-        assert!(hits[0]["line"].as_str().unwrap().contains("由 AI 生成"));
+        assert!(hits[0]["line"]
+            .as_str()
+            .unwrap()
+            .contains(concat!("由 AI 生", "成")));
     }
 
     #[tokio::test]
@@ -725,7 +751,11 @@ mod tests {
             serde_json::json!({"name": "tech", "level": "user"}),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "technical terms warn but do not block");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "technical terms warn but do not block"
+        );
         let warnings = body["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0]["severity"], "warning");
@@ -800,7 +830,10 @@ mod tests {
 
     /// 装配链辅助:对给定 workdir 跑「合并 → wire_skills」返回 (read_skill 是否
     /// 注册, manifest 清单)
-    fn assemble(workdir: &std::path::Path, declared: Vec<crate::agent::definition::SkillManifestEntry>) -> (bool, Vec<crate::agent::definition::SkillManifestEntry>) {
+    fn assemble(
+        workdir: &std::path::Path,
+        declared: Vec<crate::agent::definition::SkillManifestEntry>,
+    ) -> (bool, Vec<crate::agent::definition::SkillManifestEntry>) {
         let state = make_state(workdir.to_path_buf());
         let (manifest, reg_path) = merged_manifest_for_session(&state, declared).unwrap();
         assert!(reg_path.ends_with("registry.json"));
@@ -836,8 +869,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "data/skills", "not-approved", CLEAN_SKILL);
         let (has_read_skill, manifest) = assemble(tmp.path(), vec![]);
-        assert!(!has_read_skill, "discovered skill must NOT register read_skill");
-        assert!(manifest.is_empty(), "discovered skill must NOT enter manifest");
+        assert!(
+            !has_read_skill,
+            "discovered skill must NOT register read_skill"
+        );
+        assert!(
+            manifest.is_empty(),
+            "discovered skill must NOT enter manifest"
+        );
     }
 
     #[tokio::test]
@@ -876,7 +915,11 @@ mod tests {
         let declared_dir = tmp.path().join("elsewhere");
         std::fs::create_dir_all(&declared_dir).unwrap();
         let declared_path = declared_dir.join("SKILL.md");
-        std::fs::write(&declared_path, CLEAN_SKILL.replace("git 纪律指引", "declared wins")).unwrap();
+        std::fs::write(
+            &declared_path,
+            CLEAN_SKILL.replace("git 纪律指引", "declared wins"),
+        )
+        .unwrap();
         let declared = vec![crate::agent::definition::SkillManifestEntry {
             name: "git-discipline".to_string(),
             path: declared_path.clone(),

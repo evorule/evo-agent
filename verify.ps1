@@ -69,7 +69,10 @@ Write-Host "== [4/4] dependency contract assertion =="
 #     hash + import verify chain). Hash byte-compatibility with the
 #     evorule-server import side depends on the same crate serialization, so
 #     both repos must upgrade the crate version in lockstep.
-$separateRepoAllowlist = @('evorule-constitution', 'evorule-bundle')
+#   evorule-hash (from evorule-hash; canonical BLAKE3 hashing crate --
+#     hash discipline: all hashing goes through evorule-hash, self-written
+#     blake3 is banned); used by the skill registry content pinning.
+$separateRepoAllowlist = @('evorule-constitution', 'evorule-bundle', 'evorule-hash')
 $manifest = Get-Content (Join-Path $repo "Cargo.toml") -Raw
 $depHits = [regex]::Matches($manifest, '(?m)^\s*(evorule-[\w-]+)\s*=') |
     Where-Object { $separateRepoAllowlist -notcontains $_.Groups[1].Value }

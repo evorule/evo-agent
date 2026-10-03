@@ -229,8 +229,7 @@ impl DelegateContext {
                     // 上抛拒委托(声明时刻=人工把关,路径由系统解析)。
                     // C 形态后子代理路径为纯声明面(不扫目录——两源合并在 serve
                     // 会话创建路径,见 skill_api::merged_manifest_for_session)
-                    let declared_skills =
-                        crate::api::serve_tools::resolve_declared_skills(&def)?;
+                    let declared_skills = crate::api::serve_tools::resolve_declared_skills(&def)?;
                     let resolved_skills =
                         crate::api::serve_tools::wire_skills(&mut filtered, declared_skills)?;
                     runner = runner
