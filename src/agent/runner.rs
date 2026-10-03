@@ -2046,7 +2046,6 @@ impl AgentRunner {
         })
     }
 
-
     async fn handle_io_request(
         &mut self,
         session_id: &str,

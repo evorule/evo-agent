@@ -763,7 +763,13 @@ async fn run_agent(
     let runner = runner
         .with_metrics(state.metrics.clone())
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
-        .with_journal_dir(state.workdir.join("data").join("sessions"));
+        .with_journal_dir(state.workdir.join("data").join("sessions"))
+        // O-274:注入 delegate 上下文——serve 模式多代理委托通路接线
+        .with_delegate_context(crate::agent::delegate::DelegateContext::new(
+            &agent_type,
+            state.definitions.clone(),
+            state.evorule_client.clone(),
+        ));
 
     // 改消费流式 ReAct 回路(delegate 同款修法,bb172b2 先例)——
     // 非流式 run() 是单发桥接(LLM 返 tool_calls 即返、工具不执行=能力面假象,
