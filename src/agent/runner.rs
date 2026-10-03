@@ -25,6 +25,11 @@ use crate::agent::approval::{
 };
 use crate::agent::callback::CallbackChain;
 use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
+
+/// F-302:组装策略版本——八层分区/槽位排列/预算口径的版本标识。
+/// 版本变更=组装行为变更=历史重建需切版本（RL-B3 落地）。
+pub const ASSEMBLY_PROTOCOL_VERSION: &str = "assembly-v1";
+
 use crate::agent::definition::{AgentDefinition, OutputFormat};
 use crate::agent::delegate::DelegateContext;
 use crate::agent::memory::{MemoryManager, MessagePersistMode, MessageRecord};
@@ -2032,12 +2037,15 @@ impl AgentRunner {
             "temperature": effective_temperature,
             "max_tokens": effective_max_tokens,
             "stream": effective_stream,
+            // F-302:组装策略版本落链——八层分区方式可审计、可回放重建
+            "assembly_protocol_version": ASSEMBLY_PROTOCOL_VERSION,
         });
         serde_json::json!({
             "type": "call_external",
             "params": params,
         })
     }
+
 
     async fn handle_io_request(
         &mut self,
