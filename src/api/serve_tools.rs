@@ -1620,7 +1620,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             name: "ghost".to_string(),
             path: PathBuf::from("Z:/definitely/not/here/SKILL.md"),
         }]);
-        let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+        let handler = crate::io_handlers::tool_handler::ToolHandler::new();
         let declared = super::resolve_declared_skills(&def).unwrap_err();
         assert!(
             declared.contains("skill 'ghost'") && declared.contains("unreadable"),
