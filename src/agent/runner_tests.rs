@@ -626,6 +626,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         memory: MemoryConfig::default(), // type = "none"
         output_format: None,
         context_window_tokens: None,
+        acceptance_command: None,
         max_parallel_tools: 1,
         capability_boundary: None,
         approval_mode: None,
