@@ -3580,6 +3580,26 @@ impl AgentRunner {
                 }
             }
 
+            // C-3/F-905 I2 检查器初版:组装后 system 分区间字面级冲突扫描
+            // (词法确定性子集);输出=报告落账(仅检出时),不阻断会话。
+            // 失败 fail-soft(与其它 journal 写入同风格)
+            if let Some(j) = &journal {
+                let round = turn_guard.as_ref().map(|g| g.turn_seq()).unwrap_or(0);
+                let mut tokens: Vec<String> = runner.config.tool_names.clone();
+                if let Some(skills) = &runner.config.skills {
+                    tokens.extend(skills.iter().map(|s| s.name.clone()));
+                }
+                let conflicts = crate::agent::context_inspector::inspect_system_sections(
+                    &system_prompt,
+                    &tokens,
+                );
+                if !conflicts.is_empty() {
+                    if let Err(e) = j.i2_scan_report(round, conflicts) {
+                        warn!(%session_id, error = %e, "i2_scan_report journal failed");
+                    }
+                }
+            }
+
             // G17:session 活跃度守卫(新建 / 复用均持有,stream! 块结束时 dec)
             let _session_guard = SessionActiveGuard::new(runner.metrics.clone());
 

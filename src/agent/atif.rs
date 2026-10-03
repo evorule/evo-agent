@@ -654,6 +654,47 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                 });
                 next_step_id += 1;
             }
+            JournalEvent::I2ScanReport { round, conflicts } => {
+                // I2 冲突扫描报告——context_management 系统步(C-3/F-905)。
+                // 冲突记录随事件 payload 在 journal(权威面),导出步全量携带
+                // (初版低频事件,不做摘录截断)
+                if let Some(a) = acc.take() {
+                    finalize_agent_step(
+                        a,
+                        &audit,
+                        sources.transcript,
+                        &assistant_msgs,
+                        &mut steps,
+                        &mut next_step_id,
+                        &mut total_prompt,
+                        &mut total_completion,
+                    );
+                }
+                steps.push(AtifStep {
+                    step_id: next_step_id,
+                    timestamp: Some(iso8601_from_unix_ms(line.ts)),
+                    source: "system".into(),
+                    model_name: None,
+                    message: "Context I2 conflict scan".into(),
+                    tool_calls: None,
+                    observation: Some(AtifObservation {
+                        results: vec![AtifObservationResult {
+                            source_call_id: None,
+                            content: Some(format!("round={} conflicts={}", round, conflicts.len())),
+                        }],
+                    }),
+                    metrics: None,
+                    extra: Some(json!({
+                        "context_management": {
+                            "type": "i2_scan_report",
+                            "round": round,
+                            "conflicts": conflicts
+                        }
+                    })),
+                    llm_call_count: None,
+                });
+                next_step_id += 1;
+            }
             JournalEvent::TurnEnded { .. } => {
                 // 轮界收步(映射表 §四.3 边界切割)
                 if let Some(a) = acc.take() {
@@ -1440,6 +1481,60 @@ mod tests {
         assert_eq!(
             obs.results[0].content.as_deref(),
             Some("cleared 2 tool results: [t3, t5]")
+        );
+    }
+
+    #[test]
+    fn i2_scan_report_emits_context_management_step() {
+        let mut j = JFix::new();
+        j.push(JE::TurnStarted {
+            turn_seq: 1,
+            goal: "g".into(),
+        });
+        j.push(JE::I2ScanReport {
+            round: 1,
+            conflicts: vec![crate::agent::context_inspector::I2ConflictRecord {
+                kind: "deny_vs_capability".into(),
+                token: "web_search".into(),
+                section_a: "(基底段)".into(),
+                section_b: "【能力边界声明】".into(),
+                excerpt_a: "禁止使用 web_search".into(),
+                excerpt_b: "可用工具:web_search".into(),
+            }],
+        });
+        j.push(JE::TurnEnded {
+            status: "success".into(),
+            steps: 1,
+            duration_ms: 10,
+        });
+        let src = AtifSources {
+            session_id: "s",
+            journal: &j.lines,
+            transcript: &[msg(0, "system", "sys"), msg(1, "user", "g")],
+            audit_facts: &[],
+            tool_definitions: None,
+        };
+        let t = export(src).unwrap();
+        // system + user + i2_scan_report-system(turn 内无 LLM 步,agent 步不产生)
+        assert_eq!(t.steps.len(), 3);
+        let cs = &t.steps[2];
+        assert_eq!(cs.source, "system");
+        assert_eq!(
+            cs.extra,
+            Some(json!({
+                "context_management": {
+                    "type": "i2_scan_report",
+                    "round": 1,
+                    "conflicts": [{
+                        "kind": "deny_vs_capability",
+                        "token": "web_search",
+                        "section_a": "(基底段)",
+                        "section_b": "【能力边界声明】",
+                        "excerpt_a": "禁止使用 web_search",
+                        "excerpt_b": "可用工具:web_search"
+                    }]
+                }
+            }))
         );
     }
 
