@@ -1,0 +1,4 @@
+# Golden-sample fixtures are compared byte-for-byte by regression tests
+# (assert_eq! against fs::read_to_string). Pin exact bytes: no EOL conversion
+# on checkout (Windows autocrlf would turn LF into CRLF and break the test).
+tests/fixtures/*.txt -text
