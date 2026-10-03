@@ -624,6 +624,7 @@ dependencies = [
  "clap",
  "evorule-bundle",
  "evorule-constitution",
+ "evorule-hash",
  "futures-core",
  "futures-util",
  "git2",
