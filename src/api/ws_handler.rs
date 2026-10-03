@@ -569,30 +569,30 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
             return None;
         }
     };
-    let merged_skills = match crate::api::skill_api::merged_manifest_for_session(state, declared_skills)
-    {
-        Ok((manifest, _registry_path)) => manifest,
-        Err(e) => {
-            error!(
-                agent_type = %agent_type,
-                error = %e,
-                "skills scan/merge failed; rejecting runner construction"
-            );
-            return None;
-        }
-    };
-    let resolved_skills = match crate::api::serve_tools::wire_skills(&mut filtered, Some(merged_skills))
-    {
-        Ok(skills) => skills,
-        Err(e) => {
-            error!(
-                agent_type = %agent_type,
-                error = %e,
-                "skills wiring failed; rejecting runner construction"
-            );
-            return None;
-        }
-    };
+    let merged_skills =
+        match crate::api::skill_api::merged_manifest_for_session(state, declared_skills) {
+            Ok((manifest, _registry_path)) => manifest,
+            Err(e) => {
+                error!(
+                    agent_type = %agent_type,
+                    error = %e,
+                    "skills scan/merge failed; rejecting runner construction"
+                );
+                return None;
+            }
+        };
+    let resolved_skills =
+        match crate::api::serve_tools::wire_skills(&mut filtered, Some(merged_skills)) {
+            Ok(skills) => skills,
+            Err(e) => {
+                error!(
+                    agent_type = %agent_type,
+                    error = %e,
+                    "skills wiring failed; rejecting runner construction"
+                );
+                return None;
+            }
+        };
     // L2 约束前馈:具备规则生成/校验能力的 agent,构造时把 L2 边界段追加到
     // system_prompt 尾部(memory recall 在 runner 内层包装,顺序不变;fail-soft)
     crate::api::serve_tools::apply_l2_feed_forward(
