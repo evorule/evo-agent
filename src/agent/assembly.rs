@@ -244,11 +244,13 @@ fn default_slots() -> Vec<SlotSpec> {
             source: "manifest".to_string(),
             degradable: false,
             optional: true,
-            enabled: false, // B2 v0.4 预留位,现状不注入
+            // B2 批启用:skills 未声明(None/空)时槽位静默跳过(optional),
+            // 行为与预留期逐字节一致;声明后注入 manifest 段
+            enabled: true,
             budget: None,
             degradation_order: None,
             sections: None,
-            separator: None,
+            separator: Some("\n\n".to_string()),
             role: None,
             trim: None,
         },
@@ -483,6 +485,23 @@ pub fn resolve_assembly_ref(value: &mut serde_json::Value, base_dir: &Path) -> R
     Ok(())
 }
 
+/// 渲染技能 manifest 段(skills 装配 B2 批,设计档 §4.2 形态:标题+
+/// 每 skill 一行 `name: description`+按需装载尾注)
+///
+/// 定位:渐进披露的常驻半区——LLM 知有哪些能力锚,正文经 read_skill
+/// 工具按需装载(独立段,不并入 L2 前馈,约束面语义纯净性)。
+fn render_skills_manifest(skills: &[crate::agent::definition::SkillManifestEntry]) -> String {
+    let mut seg = String::from("【可用技能清单】以下技能可经 read_skill 工具装载正文：");
+    for s in skills {
+        seg.push_str("\n- ");
+        seg.push_str(&s.name);
+        seg.push_str(": ");
+        seg.push_str(&s.description);
+    }
+    seg.push_str("\n按需装载，不要一次性全部读取。");
+    seg
+}
+
 /// 组装执行器:配方 → system_prompt 与预算参数的**单一确定性纯函数组**
 ///
 /// 双路径一致性由代码结构保证(run/流式两组装点收敛为同一次 `assemble` 调用,
@@ -564,9 +583,10 @@ impl AssemblyExecutor {
     /// - `total_window`:记忆区预算基准的原始输入(默认配方 `base: total_window`
     ///   直接作基数;`base: input` 时扣除响应预留后作基数——A-1 修正口径)
     /// - `boundary_segment`:S4_boundary 源(None = 未声明边界,槽位跳过)
+    /// - `skills`:S4b_skills 源(None/空 = 未声明技能,槽位跳过 = 历史行为)
     ///
-    /// Err 仅当配置启用了执行器未实现的槽位(如 S4b_skills manifest 渲染器
-    /// 待 B2 批)——配置错误 fail-fast,不做静默降级。
+    /// Err 仅当配方声明了执行器不认识的预算基准(budget.base——validate 白名单
+    /// 应已拦截,此处运行时兜底 fail-fast),不做静默降级。
     pub fn assemble(
         &self,
         base_prompt: &str,
@@ -574,6 +594,7 @@ impl AssemblyExecutor {
         recall: &crate::agent::memory::RecallContext,
         total_window: usize,
         boundary_segment: Option<&str>,
+        skills: Option<&[crate::agent::definition::SkillManifestEntry]>,
     ) -> Result<String, String> {
         let mut prompt = String::new();
         for slot in &self.recipe.slots {
@@ -607,12 +628,16 @@ impl AssemblyExecutor {
                         prompt.push_str(seg);
                     }
                 }
-                // S4b_skills:manifest 渲染器待 B2 批实现
+                // S4b_skills:技能 manifest 段(B2)——声明面人工把关后,LLM 侧
+                // 能力锚常驻+read_skill 按需装载正文的渐进披露读法
                 "manifest" => {
-                    return Err(format!(
-                        "slot '{}' (source=manifest) renderer not implemented yet (B2 batch)",
-                        slot.id
-                    ));
+                    if let Some(skills) = skills {
+                        if !skills.is_empty() {
+                            let sep = slot.separator.as_deref().unwrap_or("\n\n");
+                            prompt.push_str(sep);
+                            prompt.push_str(&render_skills_manifest(skills));
+                        }
+                    }
                 }
                 // S5_task/S6_summary/S7_history:messages 面槽位,不在
                 // system_prompt 组装内(裁剪参数经 trim_params 消费)
@@ -664,8 +689,10 @@ mod tests {
         // S4 边界段:optional + "\n\n"
         assert!(r.slots[2].optional);
         assert_eq!(r.slots[2].separator.as_deref(), Some("\n\n"));
-        // S4b:B2 v0.4 预留位,现状停用
-        assert!(!r.slots[3].enabled);
+        // S4b:B2 启用(optional + skills 未声明时跳过 = 预留期行为逐字节一致)
+        assert!(r.slots[3].enabled);
+        assert!(r.slots[3].optional);
+        assert_eq!(r.slots[3].separator.as_deref(), Some("\n\n"));
         // S5 任务:user 角色
         assert_eq!(r.slots[4].role.as_deref(), Some("user"));
         // S7 裁剪:KeepSystemKeepLast + buffer 5% + hint 15
@@ -866,7 +893,7 @@ mod tests {
 
         // 场景 1:CJK 长记忆(正常预算 8192×0.25,无降级)
         let out1 = exec
-            .assemble(base, Some(&mem), &recall, 8192, None)
+            .assemble(base, Some(&mem), &recall, 8192, None, None)
             .unwrap();
         assert_eq!(
             out1,
@@ -874,7 +901,9 @@ mod tests {
         );
 
         // 场景 2:极端小窗口(60 token)强制降级通知
-        let out2 = exec.assemble(base, Some(&mem), &recall, 60, None).unwrap();
+        let out2 = exec
+            .assemble(base, Some(&mem), &recall, 60, None, None)
+            .unwrap();
         assert_eq!(
             out2,
             std::fs::read_to_string("tests/fixtures/golden_degradation.txt").unwrap()
@@ -893,6 +922,7 @@ mod tests {
                 &RecallContext::default(),
                 0,
                 Some(&boundary.awareness_segment()),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -914,20 +944,99 @@ mod tests {
         assert_eq!(hint, 15);
     }
 
-    /// manifest 槽位 enabled=true:fail-fast(渲染器待 B2 批)
+    /// manifest 槽位:skills 未声明 → 不注入(历史行为逐字节等价)
     #[test]
-    fn test_assemble_manifest_enabled_fails_fast() {
+    fn test_assemble_manifest_without_skills_not_injected() {
+        let exec = AssemblyExecutor::default_executor();
+        let out = exec
+            .assemble("base", None, &Default::default(), 0, None, None)
+            .unwrap();
+        assert_eq!(out, "base");
+        assert!(!out.contains("可用技能清单"));
+    }
+
+    /// manifest 槽位:skills 声明 → 渲染技能清单段(名称+描述逐行)
+    #[test]
+    fn test_assemble_manifest_renders_skill_lines() {
+        use crate::agent::definition::SkillManifestEntry;
+        let skills = vec![
+            SkillManifestEntry {
+                name: "pdf-processing".to_string(),
+                path: std::path::PathBuf::from("/x/pdf/SKILL.md"),
+                description: "提取 PDF 文本/表格并生成摘要".to_string(),
+            },
+            SkillManifestEntry {
+                name: "git-discipline".to_string(),
+                path: std::path::PathBuf::from("/x/git/SKILL.md"),
+                description: "提交前先看 diff".to_string(),
+            },
+        ];
+        let exec = AssemblyExecutor::default_executor();
+        let out = exec
+            .assemble("base", None, &Default::default(), 0, None, Some(&skills))
+            .unwrap();
+        assert!(out.starts_with("base\n\n"));
+        assert!(out.contains("【可用技能清单】以下技能可经 read_skill 工具装载正文："));
+        assert!(out.contains("\n- pdf-processing: 提取 PDF 文本/表格并生成摘要"));
+        assert!(out.contains("\n- git-discipline: 提交前先看 diff"));
+        assert!(out.ends_with("\n按需装载，不要一次性全部读取。"));
+    }
+
+    /// manifest 槽位:紧随边界段之后(同为稳定尾注位,语义分层:能力锚在边界锚后)
+    #[test]
+    fn test_assemble_manifest_follows_boundary_segment() {
+        use crate::agent::definition::SkillManifestEntry;
+        let skills = vec![SkillManifestEntry {
+            name: "s".to_string(),
+            path: std::path::PathBuf::from("/x/SKILL.md"),
+            description: "d".to_string(),
+        }];
+        let exec = AssemblyExecutor::default_executor();
+        let out = exec
+            .assemble(
+                "base",
+                None,
+                &Default::default(),
+                0,
+                Some("【能力边界声明】boundary"),
+                Some(&skills),
+            )
+            .unwrap();
+        let boundary_pos = out.find("【能力边界声明】").expect("boundary present");
+        let manifest_pos = out.find("【可用技能清单】").expect("manifest present");
+        assert!(boundary_pos < manifest_pos, "manifest must follow boundary");
+        assert!(out.contains("【能力边界声明】boundary\n\n【可用技能清单】"));
+    }
+
+    /// manifest 槽位:配方声明 enabled=false → 硬关(有技能也不注入)
+    #[test]
+    fn test_assemble_manifest_disabled_hard_off() {
+        use crate::agent::definition::SkillManifestEntry;
+        let skills = vec![SkillManifestEntry {
+            name: "s".to_string(),
+            path: std::path::PathBuf::from("/x/SKILL.md"),
+            description: "d".to_string(),
+        }];
         let mut recipe = AssemblyRecipe::default();
         for s in &mut recipe.slots {
             if s.id == "S4b_skills" {
-                s.enabled = true;
+                s.enabled = false;
             }
         }
-        let exec = AssemblyExecutor::new(recipe);
-        assert!(exec
-            .assemble("base", None, &Default::default(), 0, None)
-            .unwrap_err()
-            .contains("manifest"));
+        let out = AssemblyExecutor::new(recipe)
+            .assemble("base", None, &Default::default(), 0, None, Some(&skills))
+            .unwrap();
+        assert_eq!(out, "base");
+    }
+
+    /// manifest 槽位:skills 空数组 → 不注入(与 None 同语义)
+    #[test]
+    fn test_assemble_manifest_empty_skills_not_injected() {
+        let exec = AssemblyExecutor::default_executor();
+        let out = exec
+            .assemble("base", None, &Default::default(), 0, None, Some(&[]))
+            .unwrap();
+        assert_eq!(out, "base");
     }
 
     /// A-1 口径修正演示(PR-4):`base: input` 配方数据切换预算基数——
@@ -961,7 +1070,7 @@ mod tests {
         ];
 
         let out_total = AssemblyExecutor::new(AssemblyRecipe::default())
-            .assemble("base", Some(&mem), &recall, 8192, None)
+            .assemble("base", Some(&mem), &recall, 8192, None, None)
             .unwrap();
         let mut input_recipe = AssemblyRecipe::default();
         for s in &mut input_recipe.slots {
@@ -972,7 +1081,7 @@ mod tests {
             }
         }
         let out_input = AssemblyExecutor::new(input_recipe)
-            .assemble("base", Some(&mem), &recall, 8192, None)
+            .assemble("base", Some(&mem), &recall, 8192, None, None)
             .unwrap();
 
         assert_ne!(out_input, out_total, "口径切换必须改变记忆区预算效果");
@@ -1013,7 +1122,7 @@ mod tests {
         let r10: AssemblyRecipe = serde_json::from_str(v10).unwrap();
         r10.validate().unwrap();
         AssemblyExecutor::new(r10)
-            .assemble("base", None, &Default::default(), 8192, None)
+            .assemble("base", None, &Default::default(), 8192, None, None)
             .unwrap();
         // 新配方:加载 → validate → 字段落位
         let r11: AssemblyRecipe = serde_json::from_str(&v11).unwrap();
@@ -1031,7 +1140,7 @@ mod tests {
             "input"
         );
         exec11
-            .assemble("base", None, &Default::default(), 8192, None)
+            .assemble("base", None, &Default::default(), 8192, None, None)
             .unwrap();
     }
 }
