@@ -212,6 +212,120 @@ impl SummarizeOutcome {
     }
 }
 
+/// F-702:观察价值权重——工具类别 × 输出长度 × goal 关键词命中。
+///
+/// 词法权重表固定（09 规格 F-702"确定性:词法权重表固定"，零向量）：
+/// - 类别基权（工具名小写子串匹配，取首个命中；未命中 0.5）：
+///   变更类(write/edit/create/delete/update/apply)=0.9 ▸
+///   执行类(shell/exec/run/command/bash)=0.8 ▸
+///   检索类(search/find/grep/query/list)=0.7 ▸
+///   读取类(read/cat/open/show/get)=0.6
+/// - 长度因子：(len/4000).min(1.0)——长输出更需摘要择要
+/// - goal 命中：1 + 0.5×命中比（R05 词法，cap 1.0）
+///
+/// 最终 = 基权 × (0.6+0.4×长度因子) × (1.0+0.5×命中比)——仅用于相对分档。
+pub(crate) fn observation_value_weight(tool_name: &str, output: &str, goal: &str) -> f32 {
+    const TABLE: &[(&str, f32)] = &[
+        ("write", 0.9),
+        ("edit", 0.9),
+        ("create", 0.9),
+        ("delete", 0.9),
+        ("update", 0.9),
+        ("apply", 0.9),
+        ("shell", 0.8),
+        ("exec", 0.8),
+        ("run", 0.8),
+        ("command", 0.8),
+        ("bash", 0.8),
+        ("search", 0.7),
+        ("find", 0.7),
+        ("grep", 0.7),
+        ("query", 0.7),
+        ("list", 0.7),
+        ("read", 0.6),
+        ("cat", 0.6),
+        ("open", 0.6),
+        ("show", 0.6),
+        ("get", 0.6),
+    ];
+    let n = tool_name.to_lowercase();
+    let category = TABLE
+        .iter()
+        .find(|(k, _)| n.contains(k))
+        .map(|(_, w)| *w)
+        .unwrap_or(0.5);
+    let len_factor = (output.len() as f32 / 4000.0).min(1.0);
+    let mut goal_uniq = crate::agent::memory::tokenize_for_match(goal);
+    goal_uniq.sort();
+    goal_uniq.dedup();
+    let hit_ratio = if goal_uniq.is_empty() {
+        0.0
+    } else {
+        let out_tokens: std::collections::HashSet<String> =
+            crate::agent::memory::tokenize_for_match(output).into_iter().collect();
+        let hits = goal_uniq.iter().filter(|g| out_tokens.contains(*g)).count();
+        (hits as f32 / goal_uniq.len() as f32).min(1.0)
+    };
+    category * (0.6 + 0.4 * len_factor) * (1.0 + 0.5 * hit_ratio)
+}
+
+/// F-702:观察价值标注段——附于摘要 system prompt,引导 LLM 择要覆盖重点。
+///
+/// 对 dropped 中的 Tool 消息逐条计权重,降序分档列出（高≥0.9/中≥0.7/低）。
+/// 同分按行字典序（确定性）。无 Tool 消息或 goal 为空时不产标注段
+/// （goal 空即旧调用路径,行为字节级兼容）。
+fn observation_annotations(dropped: &[Message], goal: &str) -> String {
+    if goal.is_empty() {
+        return String::new();
+    }
+    let mut rows: Vec<(f32, String)> = Vec::new();
+    for (idx, msg) in dropped.iter().enumerate() {
+        if let Message::Tool {
+            content,
+            tool_name,
+        } = msg
+        {
+            let w = observation_value_weight(tool_name, content, goal);
+            rows.push((
+                w,
+                format!("#{} {} len={} w={:.2}", idx, tool_name, content.len(), w),
+            ));
+        }
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut s = String::from(
+        "\n\n[观察价值标注(F-702,确定性词法):摘要请优先覆盖高价值观察的结论与影响]\n",
+    );
+    for (w, row) in &rows {
+        // 分档阈值对齐实际得分域(0.9×0.6×1.0=0.54 ~ 0.9×1.0×1.5=1.35):
+        // 高≥0.8(变更类+命中/长输出),中≥0.6,低<0.6
+        let tier = if *w >= 0.8 {
+            "高"
+        } else if *w >= 0.6 {
+            "中"
+        } else {
+            "低"
+        };
+        s.push_str(&format!("- [{}] {}\n", tier, row));
+    }
+    s
+}
+
+/// G10:被裁剪消息摘要（legacy 便捷封装）。
+///
+/// # 返回值
+///
+/// - `Ok("")`:被裁剪消息为空,或低于阈值(Q9 Strategy B),不生成摘要
+/// - `Ok(summary)`:摘要生成成功,格式为 `[earlier conversation summary]\n{内容}`
+/// - `Err(e)`:LLM 调用或解析失败,调用方应 fallback 到原 hint
+///
+/// # 参数
+///
+/// - `dropped`:`trim_detailed()` 返回的被裁剪消息列表
+
 impl ContextSummarizer {
     /// 创建摘要器
     ///
@@ -275,24 +389,14 @@ impl ContextSummarizer {
         self.summary_model.as_deref()
     }
 
-    /// G10:对被裁剪的消息生成摘要
-    ///
-    /// # 返回值
-    ///
-    /// - `Ok("")`:被裁剪消息为空,或低于阈值(Q9 Strategy B),不生成摘要
-    /// - `Ok(summary)`:摘要生成成功,格式为 `[earlier conversation summary]\n{内容}`
-    /// - `Err(e)`:LLM 调用或解析失败,调用方应 fallback 到原 hint
-    ///
-    /// # 参数
-    ///
-    /// - `dropped`:`trim_detailed()` 返回的被裁剪消息列表
-    pub async fn summarize_dropped(&self, dropped: &[Message]) -> Result<String, String> {
-        match self.summarize_dropped_with_metadata(dropped).await? {
-            SummarizeOutcome::Empty => Ok(String::new()),
-            SummarizeOutcome::CacheHit(formatted) => Ok(formatted),
-            SummarizeOutcome::Generated(meta) => Ok(meta.formatted),
-        }
+pub async fn summarize_dropped(&self, dropped: &[Message]) -> Result<String, String> {
+    // F-702:goal 空串=不产观察价值标注(旧调用路径行为字节级兼容)
+    match self.summarize_dropped_with_metadata(dropped, "").await? {
+        SummarizeOutcome::Empty => Ok(String::new()),
+        SummarizeOutcome::CacheHit(formatted) => Ok(formatted),
+        SummarizeOutcome::Generated(meta) => Ok(meta.formatted),
     }
+}
 
     /// R3 落链批：带落链元数据的摘要生成。
     ///
@@ -300,10 +404,12 @@ impl ContextSummarizer {
     /// - `CacheHit`：缓存命中（零 LLM 调用），不落链
     /// - `Generated(meta)`：新代生成——调用方应将 meta 落链
     ///   （PayloadUpdate 至 `__memory__.{ns}.session_{sid}.rolling_summary`，
-    ///   见 knowledge/上下文管理/07-R3 研究档），并将 meta.formatted 写入 hint
+    ///   见 knowledge/上下文管理/07-R3 研究档），并将 meta.formatted 写入 hint。
+    ///   `goal` 非空时附观察价值标注段（F-702），引导摘要择要覆盖高价值观察。
     pub async fn summarize_dropped_with_metadata(
         &self,
         dropped: &[Message],
+        goal: &str,
     ) -> Result<SummarizeOutcome, String> {
         // 空列表:无需摘要
         if dropped.is_empty() {
@@ -659,6 +765,53 @@ mod tests {
     }
 
     // ========== 基础结构测试 ==========
+
+    #[test]
+    fn test_f702_observation_value_weight() {
+        // 类别表:变更 > 执行 > 检索 > 读取 > 未知(0.5 兜底)
+        let w_write = observation_value_weight("file_write", "x", "");
+        let w_exec = observation_value_weight("shell_exec", "x", "");
+        let w_search = observation_value_weight("file_search", "x", "");
+        let w_read = observation_value_weight("file_read", "x", "");
+        let w_unknown = observation_value_weight("mystery_tool", "x", "");
+        assert!(w_write > w_exec && w_exec > w_search && w_search > w_read);
+        // 未知类别=0.5 基权,短输出+空 goal:w=0.5×(0.6+0.4/4000)≈0.300
+        assert!((w_unknown - 0.3).abs() < 0.001);
+        assert!(w_unknown < w_read);
+        // 长度因子:长输出权重更高
+        assert!(
+            observation_value_weight("file_read", &"x".repeat(8000), "")
+                > observation_value_weight("file_read", "x", "")
+        );
+        // goal 命中加成:命中输出 > 无关输出
+        assert!(
+            observation_value_weight("file_read", "记忆预算裁剪的细节结论", "记忆预算裁剪")
+                > observation_value_weight("file_read", "完全无关的内容", "记忆预算裁剪")
+        );
+    }
+
+    #[test]
+    fn test_f702_observation_annotations() {
+        let dropped = vec![
+            Message::Tool {
+                content: "short".to_string(),
+                tool_name: "file_read".to_string(),
+            },
+            Message::Tool {
+                content: "记忆预算裁剪的关键结论".to_string(),
+                tool_name: "file_write".to_string(),
+            },
+        ];
+        let a = observation_annotations(&dropped, "记忆预算裁剪");
+        assert!(a.contains("[高]"));
+        assert!(a.contains("[低]"));
+        // 写工具+goal 命中排在读工具前(降序)
+        let write_pos = a.find("file_write").unwrap();
+        let read_pos = a.find("file_read").unwrap();
+        assert!(write_pos < read_pos);
+        // 空 goal → 无标注(旧路径字节级兼容)
+        assert!(observation_annotations(&dropped, "").is_empty());
+    }
 
     #[test]
     fn test_summarizer_new_with_model() {
@@ -1293,7 +1446,7 @@ mod tests {
 
         // 第一代：frozen 0→3，gen=1，parent=None
         let d1 = make_dropped(3);
-        let out1 = s.summarize_dropped_with_metadata(&d1).await.unwrap();
+        let out1 = s.summarize_dropped_with_metadata(&d1, "test goal").await.unwrap();
         let meta1 = match &out1 {
             SummarizeOutcome::Generated(m) => m,
             other => panic!("期望 Generated，实得 {other:?}"),
@@ -1311,7 +1464,7 @@ mod tests {
 
         // 第二代：frozen 3→5，gen=2，parent=1
         let d2 = make_dropped(5);
-        let out2 = s.summarize_dropped_with_metadata(&d2).await.unwrap();
+        let out2 = s.summarize_dropped_with_metadata(&d2, "test goal").await.unwrap();
         let meta2 = match &out2 {
             SummarizeOutcome::Generated(m) => m,
             other => panic!("期望 Generated，实得 {other:?}"),
@@ -1335,7 +1488,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let dropped = make_dropped(5);
-            let out = s.summarize_dropped_with_metadata(&dropped).await.unwrap();
+            let out = s.summarize_dropped_with_metadata(&dropped, "test goal").await.unwrap();
             match out {
                 SummarizeOutcome::CacheHit(formatted) => {
                     assert!(
