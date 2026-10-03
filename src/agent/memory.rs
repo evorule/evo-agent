@@ -931,14 +931,17 @@ impl MemoryManager {
     /// `sessions.rollup.*`）使用。与 [`Self::set_scoped`] 的差异：
     /// - 不做域准入拒绝（调用方即受信管道，域由调用方构造的 key 声明）；
     /// - `source` 必填，由系统按通道生成（如 `llm:{model}` / `system:rollup`），
-    ///   **不接受调用方之外的来源声明**。
+    ///   **不接受调用方之外的来源声明**；
+    /// - 返回 [`PersistOutcome`]（O-245）：调用方可程序化区分 Persisted/CacheOnly，
+    ///   CacheOnly 仅本地 cache、由 B3 对账（`verify_cache_against_server`）补偿，
+    ///   不作为 Err 中断受信管道（与 [`Self::set_scoped`] 同契约）。
     pub(crate) async fn set_scoped_with_source(
         &mut self,
         scope: MemoryScope,
         key: &str,
         value: &str,
         source: &str,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<PersistOutcome, MemoryError> {
         if key.is_empty() {
             return Err(MemoryError::EmptyKey);
         }
@@ -952,7 +955,7 @@ impl MemoryManager {
         let cache_key = self.cache_key_for(&scope, key);
         self.cache.insert(cache_key, record.clone());
 
-        // best-effort 持久化（与 set_scoped 同语义）
+        // O-245:受信通道返回 PersistOutcome 供调用方区分（与 set() 同契约）
         let session_id = self.session_id_for_scope(&scope)?;
         let path = self.build_path_scoped(&scope, key);
         let payload_value = serde_json::to_value(&record)?;
@@ -967,8 +970,9 @@ impl MemoryManager {
                 error = %e,
                 "memory persist to evorule failed; cache may drift from source of truth"
             );
+            return Ok(PersistOutcome::CacheOnly);
         }
-        Ok(())
+        Ok(PersistOutcome::Persisted)
     }
 
     /// B5：stable key 的来源域判定（召回标注用）

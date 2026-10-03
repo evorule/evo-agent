@@ -1491,6 +1491,7 @@ impl AgentRunner {
         &mut self,
         session_id: &str,
         messages: &[Message],
+        journal: Option<&crate::agent::journal::JournalWriter>,
     ) -> Result<(), AgentError> {
         if let Some(memory) = self.memory.as_mut() {
             let mut deps = sediment::SedimentDeps {
@@ -1499,8 +1500,27 @@ impl AgentRunner {
                 extractor: self.extractor.as_mut(),
                 event_store: self.memory_event_store.as_mut(),
             };
-            let _ =
+            // O-245:sediment 四项结果落 journal——此前被 `let _ =` 丢弃，
+            // 沉淀成功与否无对账依据（受信通道持久化信号闭环的最后半程）
+            let result =
                 sediment::sediment(&mut deps, &self.sediment_config, session_id, messages).await;
+            if let Some(j) = journal {
+                let _ = j.sediment_performed(
+                    result.summary_written,
+                    result.stable_facts.clone(),
+                    result.stable_facts_cache_only.clone(),
+                    result.events.len(),
+                    result.rollup_done,
+                );
+            }
+            if !result.stable_facts_cache_only.is_empty() {
+                tracing::warn!(
+                    session_id = %session_id,
+                    cache_only = result.stable_facts_cache_only.len(),
+                    persisted = result.stable_facts.len(),
+                    "sediment: 部分 stable 事实仅本地 cache（持久化失败），由 B3 对账补偿"
+                );
+            }
         }
         Ok(())
     }
@@ -1806,7 +1826,7 @@ impl AgentRunner {
                     // 确保所有缓冲的消息都写入 evorule（EveryN/PerReactRound 模式）
                     self.flush_messages(&session_id).await?;
                     // C1:会话沉淀（best-effort，摘要+稳定事实→共享空间）
-                    let _ = self.sediment_session(&session_id, &messages).await;
+                    let _ = self.sediment_session(&session_id, &messages, None).await;
                     // R2-T04 链体积观测（B3）：会话收尾时 best-effort 查审计链长告警
                     self.check_chain_size(&session_id).await;
                     let state = self.evorule_client.get_state(&session_id).await?;
@@ -1904,7 +1924,7 @@ impl AgentRunner {
                     // 错误返回前尝试刷写缓冲消息（best-effort，忽略 flush 错误）
                     let _ = self.flush_messages(&session_id).await;
                     // C1:会话沉淀（best-effort，即使出错也尝试沉淀已收集的对话）
-                    let _ = self.sediment_session(&session_id, &messages).await;
+                    let _ = self.sediment_session(&session_id, &messages, None).await;
                     self.submit_tool_traces(&session_id).await;
                     return Ok(AgentResult::error(
                         error_msg.to_string(),
@@ -1930,7 +1950,7 @@ impl AgentRunner {
                         "enforce 拦截：违规指令被拒绝执行（D-01：一票否决，不重试）"
                     );
                     let _ = self.flush_messages(&session_id).await;
-                    let _ = self.sediment_session(&session_id, &messages).await;
+                    let _ = self.sediment_session(&session_id, &messages, None).await;
                     self.submit_tool_traces(&session_id).await;
                     let duration = start_time.elapsed().as_millis() as u64;
                     return Ok(AgentResult::error(
@@ -4337,7 +4357,7 @@ impl AgentRunner {
                         let duration = start_time.elapsed().as_millis() as u64;
                         let _ = runner.flush_messages(&session_id).await;
                         // C1:会话沉淀（best-effort，摘要+稳定事实→共享空间）
-                        let _ = runner.sediment_session(&session_id, &messages).await;
+                        let _ = runner.sediment_session(&session_id, &messages, journal.as_deref()).await;
                         // R2-T04 链体积观测（B3）：会话收尾时 best-effort 查审计链长告警
                         runner.check_chain_size(&session_id).await;
                         let state = match runner.evorule_client.get_state(&session_id).await {
@@ -4383,7 +4403,7 @@ impl AgentRunner {
                         let duration = start_time.elapsed().as_millis() as u64;
                         let _ = runner.flush_messages(&session_id).await;
                         // C1:会话沉淀（best-effort，即使出错也尝试沉淀已收集的对话）
-                        let _ = runner.sediment_session(&session_id, &messages).await;
+                        let _ = runner.sediment_session(&session_id, &messages, journal.as_deref()).await;
                         runner.submit_tool_traces(&session_id).await;
                         // B21:turn_ended(error)
                         if let Some(g) = turn_guard.take() {
@@ -4405,7 +4425,7 @@ impl AgentRunner {
                         warn!(%session_id, rule_index, %reason, "enforce 拦截（流式路径）：违规指令被拒绝执行");
                         let duration = start_time.elapsed().as_millis() as u64;
                         let _ = runner.flush_messages(&session_id).await;
-                        let _ = runner.sediment_session(&session_id, &messages).await;
+                        let _ = runner.sediment_session(&session_id, &messages, journal.as_deref()).await;
                         runner.submit_tool_traces(&session_id).await;
                         // B21:turn_ended(error)
                         if let Some(g) = turn_guard.take() {

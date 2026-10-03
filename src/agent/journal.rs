@@ -141,6 +141,21 @@ pub enum JournalEvent {
         /// 被清除的工具结果 call_id 列表
         cleared_call_ids: Vec<String>,
     },
+    /// 会话沉淀结果落账（O-245）：sediment 四项持久化结果进步级账面。
+    /// CacheOnly 事实仅本地 cache、由 B3 对账补偿——落账后「沉淀成功与否」有对账依据，
+    /// ATIF 导出 context_management 段随之充实（F-902 同精神）。
+    SedimentPerformed {
+        /// 摘要是否写入共享空间
+        summary_written: bool,
+        /// 已落审计链的稳定事实 key 列表
+        stable_facts: Vec<String>,
+        /// 仅本地 cache 的稳定事实 key 列表
+        stable_facts_cache_only: Vec<String>,
+        /// 写入共享账本的事件数
+        events_count: usize,
+        /// rollup 是否执行
+        rollup_done: bool,
+    },
     /// 轮收尾(优雅终止路径显式写;异常路径由 TurnEndGuard drop 补写 aborted)
     TurnEnded {
         /// success|error|cancelled|aborted
@@ -448,6 +463,24 @@ impl JournalWriter {
             before_est,
             after_est,
             cleared_call_ids: vec![format!("summary_generated={}", summary_generated)],
+        })
+    }
+
+    /// O-245:sediment 结果落 journal（受信通道持久化信号 + 四项结果对账依据）
+    pub fn sediment_performed(
+        &self,
+        summary_written: bool,
+        stable_facts: Vec<String>,
+        stable_facts_cache_only: Vec<String>,
+        events_count: usize,
+        rollup_done: bool,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::SedimentPerformed {
+            summary_written,
+            stable_facts,
+            stable_facts_cache_only,
+            events_count,
+            rollup_done,
         })
     }
 

@@ -22,7 +22,7 @@
 //! 所有写入操作都是 best-effort：失败时记 `tracing::warn!` 日志，不阻断
 //! 会话返回。这与 `MemoryManager::set_scoped` 的 fail-open 语义一致。
 
-use crate::agent::memory::{MemoryManager, MemoryRecord, MemoryScope};
+use crate::agent::memory::{MemoryManager, MemoryRecord, MemoryScope, PersistOutcome};
 use crate::agent::memory_event::extraction::EventExtractor;
 use crate::agent::summarizer::ContextSummarizer;
 use crate::agent::translator::Message;
@@ -85,6 +85,9 @@ pub struct SedimentResult {
     pub summary_written: bool,
     /// 成功写入的稳定事实 key 列表
     pub stable_facts: Vec<String>,
+    /// 仅本地 cache 的稳定事实 key 列表（O-245：持久化失败 CacheOnly，
+    /// 不计入 stable_facts 防虚报成功；由 B3 对账补偿）
+    pub stable_facts_cache_only: Vec<String>,
     /// 提取并写入共享账本的事件 ID 列表（R07/E17 接线后实际填充）
     pub events: Vec<String>,
     /// rollup 是否执行（C4）
@@ -144,7 +147,11 @@ pub async fn sediment(
                         .set_scoped_with_source(MemoryScope::Shared, &key, &fact.value, &source)
                         .await
                     {
-                        Ok(_) => result.stable_facts.push(fact.key.clone()),
+                        // O-245:区分 Persisted/CacheOnly——CacheOnly 不计入 stable_facts 防虚报
+                        Ok(PersistOutcome::Persisted) => result.stable_facts.push(fact.key.clone()),
+                        Ok(PersistOutcome::CacheOnly) => {
+                            result.stable_facts_cache_only.push(fact.key.clone())
+                        }
                         Err(e) => tracing::warn!(
                             error = %e,
                             key = %fact.key,
