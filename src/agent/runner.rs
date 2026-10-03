@@ -123,6 +123,9 @@ pub struct AgentConfig {
     /// F-101:身份资产段(None = S1 槽仅基底块 = 现状行为;声明后 S1 槽内
     /// 拼接序 = 基底块→身份段)
     pub identity_segment: Option<String>,
+    /// F-101 北极星锚(None = 不注入;声明后 S1 槽内拼接序 = 基底块→
+    /// 身份段→北极星锚——目标对焦供锚面)
+    pub north_star: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -142,6 +145,7 @@ impl Default for AgentConfig {
             assembly: None,
             skills: None,
             identity_segment: None,
+            north_star: None,
         }
     }
 }
@@ -1637,6 +1641,7 @@ impl AgentRunner {
             .assemble(
                 &self.config.system_prompt,
                 self.config.identity_segment.as_deref(),
+                self.config.north_star.as_deref(),
                 self.memory.as_ref(),
                 &recall,
                 self.max_context_tokens,
@@ -3489,6 +3494,7 @@ impl AgentRunner {
             let system_prompt = match runner.assembly.assemble(
                 &runner.config.system_prompt,
                 runner.config.identity_segment.as_deref(),
+                runner.config.north_star.as_deref(),
                 runner.memory.as_ref(),
                 &recall,
                 runner.max_context_tokens,

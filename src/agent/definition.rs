@@ -476,9 +476,14 @@ pub struct AgentDefinition {
     /// F-101 身份资产段(可选;agent_def 增量。我是谁/服务谁/能力边界自述/
     /// 行为基调,规格成本 ≤300 token;来源=human,权威=指令级,置信=1.0)。
     /// None = S1 槽仅基底块原样(既有定义零变化);声明后 S1 槽内拼接序固定
-    /// 为 基底块→身份段(09 号 §五 5.3-1),随 system_prompt 落链自然覆盖账面。
+    /// 为 基底块→身份段(槽位协议权威序),随 system_prompt 落链自然覆盖账面。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_segment: Option<String>,
+    /// F-101 北极星锚(可选;agent_def 增量。任务对焦锚——聚焦论供锚面,
+    /// 来源=human,权威=指令级)。None = 不注入;声明后 S1 槽内拼接序 =
+    /// 基底块→身份段→北极星锚(槽位协议权威序)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub north_star: Option<String>,
 }
 
 /// G13:`max_parallel_tools` 的默认值(串行)
@@ -782,6 +787,8 @@ impl AgentDefinition {
             // F-101:身份资产段直拷(定义内容面,与 system_prompt 同族——
             // 无缺省合成,声明即生效)
             identity_segment: self.identity_segment.clone(),
+            // F-101:北极星锚直拷(同身份段口径——无缺省合成,声明即生效)
+            north_star: self.north_star.clone(),
         }
     }
 }
@@ -876,6 +883,21 @@ mod tests {
         assert_eq!(
             cfg.identity_segment, def2.identity_segment,
             "to_agent_config 直拷(声明即生效,无缺省合成)"
+        );
+        // C-4:north_star 同批——可选加载+直拷透传(声明即生效)
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(r#", "north_star": "【北极星】以最小上下文获得可靠任务完成"}"#);
+        write_json(dir.path(), "with_north_star", &json);
+        let def3 = AgentDefinition::load_from_dir(dir.path(), "with_north_star").expect("load");
+        assert_eq!(
+            def3.north_star.as_deref(),
+            Some("【北极星】以最小上下文获得可靠任务完成")
+        );
+        let cfg3 = def3.to_agent_config();
+        assert_eq!(
+            cfg3.north_star, def3.north_star,
+            "north_star 直拷同身份段口径"
         );
     }
 
@@ -1270,6 +1292,7 @@ mod tests {
             assembly: None,
             skills: None,
             identity_segment: None,
+            north_star: None,
         };
         let config = def.to_agent_config();
         assert_eq!(config.agent_type, "writer");
@@ -1614,6 +1637,7 @@ mod tests {
             assembly: None,
             skills: None,
             identity_segment: None,
+            north_star: None,
         };
         // 平台合法绝对路径(Linux 上 "D:/x" 非绝对路径,门卫语义会被绝对路径检查劫持)
         let abs_root = if cfg!(windows) { "D:/x" } else { "/x" };
@@ -1763,6 +1787,7 @@ mod tests {
             assembly: None,
             skills: None,
             identity_segment: None,
+            north_star: None,
         };
         let json = serde_json::to_string(&def).expect("serialize");
         assert!(
@@ -1922,6 +1947,7 @@ mod tests {
                 path: skill_path.clone(),
             }]),
             identity_segment: None,
+            north_star: None,
         };
         assert!(empty_name
             .validate()

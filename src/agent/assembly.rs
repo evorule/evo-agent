@@ -594,6 +594,7 @@ impl AssemblyExecutor {
         &self,
         base_prompt: &str,
         identity_segment: Option<&str>,
+        north_star: Option<&str>,
         memory: Option<&crate::agent::memory::MemoryManager>,
         recall: &crate::agent::memory::RecallContext,
         total_window: usize,
@@ -607,12 +608,17 @@ impl AssemblyExecutor {
             }
             match slot.source.as_str() {
                 // S1_base:系统提示(硬注入,不裁剪)。F-101:身份资产段紧随
-                // 基底块(槽内拼接序固定,后续槽位仍按配方序)
+                // 基底块,C-4:北极星锚紧随身份段(槽内拼接序固定,后续槽位
+                // 仍按配方序)
                 "definition.system_prompt" => {
                     prompt.push_str(base_prompt);
                     if let Some(seg) = identity_segment {
                         prompt.push_str("\n\n");
                         prompt.push_str(seg);
+                    }
+                    if let Some(ns) = north_star {
+                        prompt.push_str("\n\n");
+                        prompt.push_str(ns);
                     }
                 }
                 // S3_memory:记忆区(渲染机制在 MemoryManager,含 fit_recall
@@ -907,7 +913,7 @@ mod tests {
 
         // 场景 1:CJK 长记忆(正常预算 8192×0.25,无降级)
         let out1 = exec
-            .assemble(base, None, Some(&mem), &recall, 8192, None, None)
+            .assemble(base, None, None, Some(&mem), &recall, 8192, None, None)
             .unwrap();
         assert_eq!(
             out1,
@@ -916,7 +922,7 @@ mod tests {
 
         // 场景 2:极端小窗口(60 token)强制降级通知
         let out2 = exec
-            .assemble(base, None, Some(&mem), &recall, 60, None, None)
+            .assemble(base, None, None, Some(&mem), &recall, 60, None, None)
             .unwrap();
         assert_eq!(
             out2,
@@ -934,6 +940,7 @@ mod tests {
                 base,
                 None,
                 None,
+                None,
                 &RecallContext::default(),
                 0,
                 Some(&boundary.awareness_segment()),
@@ -946,13 +953,14 @@ mod tests {
         );
     }
 
-    /// F-101:S1 槽内拼接序 = 基底块→身份段;None = 基底块原样(既有行为零变化)
+    /// F-101/C-4:S1 槽内拼接序 = 基底块→身份段→北极星锚;None = 基底块
+    /// 原样(既有行为零变化)
     #[test]
     fn test_assemble_identity_segment_order() {
         let exec = AssemblyExecutor::default_executor();
         // 无身份段:输出 = 基底块原样
         let out_none = exec
-            .assemble("base", None, None, &Default::default(), 0, None, None)
+            .assemble("base", None, None, None, &Default::default(), 0, None, None)
             .unwrap();
         assert_eq!(out_none, "base");
         // 有身份段:紧跟基底块("\n\n" 分隔),且在边界段之前(S1 槽序 < S4 槽序)
@@ -960,6 +968,7 @@ mod tests {
             .assemble(
                 "base",
                 Some("【身份资产】我是谁/服务谁/边界自述/基调"),
+                None,
                 None,
                 &Default::default(),
                 0,
@@ -971,6 +980,23 @@ mod tests {
         let id_pos = out_id.find("【身份资产】").unwrap();
         let boundary_pos = out_id.find("【能力边界声明】").unwrap();
         assert!(id_pos < boundary_pos, "S1 槽序:基底块→身份段→…→边界段");
+        // C-4:身份段+北极星锚:S1 槽内序 = 基底块→身份段→北极星锚(逐字节)
+        let out_ns = exec
+            .assemble(
+                "base",
+                Some("【身份资产】identity"),
+                Some("【北极星】north star"),
+                None,
+                &Default::default(),
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            out_ns,
+            "base\n\n【身份资产】identity\n\n【北极星】north star"
+        );
     }
 
     /// 执行器预算参数访问:默认配方 = 现状硬编码值
@@ -991,7 +1017,7 @@ mod tests {
     fn test_assemble_manifest_without_skills_not_injected() {
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble("base", None, None, &Default::default(), 0, None, None)
+            .assemble("base", None, None, None, &Default::default(), 0, None, None)
             .unwrap();
         assert_eq!(out, "base");
         assert!(!out.contains("可用技能清单"));
@@ -1017,6 +1043,7 @@ mod tests {
         let out = exec
             .assemble(
                 "base",
+                None,
                 None,
                 None,
                 &Default::default(),
@@ -1045,6 +1072,7 @@ mod tests {
         let out = exec
             .assemble(
                 "base",
+                None,
                 None,
                 None,
                 &Default::default(),
@@ -1079,6 +1107,7 @@ mod tests {
                 "base",
                 None,
                 None,
+                None,
                 &Default::default(),
                 0,
                 None,
@@ -1093,7 +1122,16 @@ mod tests {
     fn test_assemble_manifest_empty_skills_not_injected() {
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble("base", None, None, &Default::default(), 0, None, Some(&[]))
+            .assemble(
+                "base",
+                None,
+                None,
+                None,
+                &Default::default(),
+                0,
+                None,
+                Some(&[]),
+            )
             .unwrap();
         assert_eq!(out, "base");
     }
@@ -1131,7 +1169,7 @@ mod tests {
 
         // 默认配方(基数=input,完全切换后口径)
         let out_input = AssemblyExecutor::new(AssemblyRecipe::default())
-            .assemble("base", None, Some(&mem), &recall, 8192, None, None)
+            .assemble("base", None, None, Some(&mem), &recall, 8192, None, None)
             .unwrap();
         // 显式兼容口径(base=total_window,历史行为)
         let mut total_recipe = AssemblyRecipe::default();
@@ -1143,7 +1181,7 @@ mod tests {
             }
         }
         let out_total = AssemblyExecutor::new(total_recipe)
-            .assemble("base", None, Some(&mem), &recall, 8192, None, None)
+            .assemble("base", None, None, Some(&mem), &recall, 8192, None, None)
             .unwrap();
 
         assert_ne!(out_input, out_total, "口径切换必须改变记忆区预算效果");
@@ -1184,7 +1222,16 @@ mod tests {
         let r10: AssemblyRecipe = serde_json::from_str(v10).unwrap();
         r10.validate().unwrap();
         AssemblyExecutor::new(r10)
-            .assemble("base", None, None, &Default::default(), 8192, None, None)
+            .assemble(
+                "base",
+                None,
+                None,
+                None,
+                &Default::default(),
+                8192,
+                None,
+                None,
+            )
             .unwrap();
         // 新配方:加载 → validate → 字段落位
         let r11: AssemblyRecipe = serde_json::from_str(&v11).unwrap();
@@ -1202,7 +1249,16 @@ mod tests {
             "input"
         );
         exec11
-            .assemble("base", None, None, &Default::default(), 8192, None, None)
+            .assemble(
+                "base",
+                None,
+                None,
+                None,
+                &Default::default(),
+                8192,
+                None,
+                None,
+            )
             .unwrap();
     }
 }
