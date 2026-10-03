@@ -86,19 +86,25 @@ def parse_skill(path):
     return {'frontmatter': front, 'sections': sections, 'path': path}
 
 # ---------- 2. 五件套标记（主标记优先级：纪律>校验>步骤>schema>触发>知识>智能） ----------
-TRIGGER_KW = ['何时使用', '适用', '触发', 'when', 'when to use', '什么时候']
-STEP_KW    = ['步骤', '怎么', '怎么做', '流程', 'operation', '操作']
+# 词表口径（真实样本实测校准 v0.2）：纪律/校验/步骤词可在标题或正文命中（配结构特征）；
+# 触发/知识/智能词仅标题命中——正文常见短词（when/example/design/review）全文匹配会大面积
+# 误伤知识段（实测 169 段 24.3% 误入 core），故收窄为标题匹配。
+TRIGGER_KW = ['何时使用', '适用', '触发', 'when', 'when to use', '什么时候', 'when to offer']
+STEP_KW    = ['步骤', '怎么', '怎么做', '流程', 'operation', '操作', 'step', 'workflow', 'process']
 SCHEMA_KW  = ['格式', 'schema', '模板', 'template', '结构']
-CHECK_KW   = ['验证', '校验', '测试', '检查', 'check', 'verify']
-RULE_KW    = ['纪律', '禁止', '不得', '必须', '约束', '不许', 'rule', '禁']
-KNOW_KW    = ['参考', '示例', '背景', '概述', '速查', 'reference', 'example']
-CORE_KW    = ['评估', '判断', '权衡', '建议', '策略', '设计', '选择', 'review', 'decide']
+CHECK_KW   = ['验证', '校验', '测试', '检查', 'check', 'verify', 'test', 'review checklist']
+RULE_KW    = ['纪律', '禁止', '不得', '必须', '约束', '不许', 'rule', '禁',
+              'never', 'must', 'warning', 'critical', 'pitfall', 'mandatory',
+              'requirement', 'required', 'always']
+KNOW_KW    = ['参考', '示例', '背景', '概述', '速查', 'reference', 'example', 'quick start', 'overview']
+CORE_KW    = ['评估', '判断', '权衡', '建议', '策略', '设计', '选择', 'review', 'decide', 'philosophy', 'approach']
 
 def classify(s):
     t = (s['title'] or '').lower()
     txt = '\n'.join(s['lines']).lower()
     # 纪律 > 校验 > 步骤 > schema > 触发 > 知识 > 智能
-    if any(k in t or k in txt for k in RULE_KW) and any(k in t for k in RULE_KW):
+    # 纪律：标题必须命中（词表含强纪律词）；正文命中仅辅助不独立成立
+    if any(k in t for k in RULE_KW) and (any(k in t for k in RULE_KW) or any(k in txt for k in RULE_KW)):
         return 'discipline'
     if any(k in t or k in txt for k in CHECK_KW) and (s['has_table'] or s['n_items'] > 0 or s['n_ordered'] > 0):
         return 'check'
@@ -106,11 +112,11 @@ def classify(s):
         return 'step'
     if s['code_json'] or any(k in t for k in SCHEMA_KW):
         return 'schema'
-    if any(k in t or k in txt for k in TRIGGER_KW):
+    if any(k in t for k in TRIGGER_KW):
         return 'trigger'
-    if any(k in t or k in txt for k in KNOW_KW):
+    if any(k in t for k in KNOW_KW):
         return 'knowledge'
-    if any(k in t or k in txt for k in CORE_KW):
+    if any(k in t for k in CORE_KW):
         return 'core'
     return 'knowledge'  # 未分类 → 知识体（unmapped=0 硬性，不静默丢弃）
 
@@ -137,7 +143,10 @@ def judge_channel(mark, s):
     if mark == 'check':
         return 'shell' if (s['has_table'] or s['n_items'] > 0) else 'knowledge'
     if mark == 'step':
-        # 确定性步骤可枚举 → knowledge（v0.1 不生成业务 transform，留人工；记录可规则化）
+        # 步骤段含显式 instruction_type 结构 → 确定性可路由（shell，走 tool-router 骨架）；
+        # 确定性步骤可枚举 → knowledge（v0.1 不生成业务 transform，留人工）；开放步骤 → core
+        if s['code_json']:
+            return 'shell'
         return 'knowledge' if s['n_ordered'] >= 2 else 'core'
     if mark == 'knowledge':
         return 'knowledge'

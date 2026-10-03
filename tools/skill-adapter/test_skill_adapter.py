@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 import skill_adapter as sa
 
 SAMPLES_DIR = os.path.join(HERE, 'samples')
-SAMPLES = ['table-dense', 'code-rich', 'list-minimal']
+SAMPLES = ['table-dense', 'code-rich', 'list-minimal', 'en-mixed']
 
 
 def build(name):
@@ -104,10 +104,23 @@ def test_t6_suffix_and_wizard():
     print('T6 后缀版本化+向导包往返 PASS')
 
 
+def test_t7_en_mixed_channels():
+    """英文混合形态样本通道分布快照（真实样本校准回归：纪律/校验/步骤段须命中预期通道）。"""
+    pack, _ = build('en-mixed')
+    cov = pack['coverage']
+    assert cov['shell_rules'] >= 2, cov
+    assert cov['knowledge'] >= 2, cov
+    assert cov['unmapped'] == 0, cov
+    # 纪律清单段（Requirements for Every Output）须进 enforce 骨架（gate 模板命中）
+    assert cov['template_classes']['gate'] >= 1, cov['template_classes']
+    print('T7 英文混合样本通道分布 PASS')
+
+
 if __name__ == '__main__':
     test_t1_assemble()
     test_t3_self_check()
     test_t4_llm_consumable()
     test_t5_templates()
     test_t6_suffix_and_wizard()
+    test_t7_en_mixed_channels()
     print('ALL PASS —— skill-adapter 集成回归全绿（自包含样本版）')
