@@ -39,6 +39,12 @@
     "evolution_signals",
     "delegate"
   ],
+  "skills": [
+    {
+      "name": "git-discipline",
+      "path": "skills/git-discipline/SKILL.md"
+    }
+  ],
   "memory": {
     "type": "persistent",
     "namespace": "general",
