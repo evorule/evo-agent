@@ -1576,6 +1576,7 @@ impl AgentRunner {
                 &recall,
                 self.max_context_tokens,
                 boundary_segment.as_deref(),
+                self.config.skills.as_deref(),
             )
             .map_err(AgentError::Internal)?;
 
@@ -3368,6 +3369,7 @@ impl AgentRunner {
                 &recall,
                 runner.max_context_tokens,
                 boundary_segment.as_deref(),
+                runner.config.skills.as_deref(),
             ) {
                 Ok(p) => p,
                 Err(e) => {
