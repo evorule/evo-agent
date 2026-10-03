@@ -508,6 +508,9 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/ops/{operation}",
             axum::routing::post(crate::api::llm_ops::run_operation),
         )
+        // skills 注册审批管理面(C 形态):全清单/待审预览/批准/撤销 —— 定义期
+        // 供应链准入,留痕在 registry.json 账本(不走会话期 ApprovalCallback)
+        .merge(crate::api::skill_api::skills_routes())
         .with_state(state)
         // G7:鉴权中间件(对 /health、/metrics 豁免)
         .layer(axum::middleware::from_fn_with_state(
