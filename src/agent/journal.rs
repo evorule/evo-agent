@@ -48,7 +48,7 @@ pub struct TokenRecord {
     pub total: u64,
 }
 
-/// journal 事件(11 种;schema 终版 = ATIF 映射表 §二增补)
+/// journal 事件(13 种;schema 终版 = ATIF 映射表 §二增补)
 ///
 /// 序列化形态:`{"type":"<event>","payload":{...}}`(adjacently tagged,
 /// 与文件行内 seq/ts 平铺后即全行)
@@ -155,6 +155,18 @@ pub enum JournalEvent {
         events_count: usize,
         /// rollup 是否执行
         rollup_done: bool,
+    },
+    /// B-1(收尾清偿批):逐轮 wire 留痕——本轮组装完成的完整上下文 wire 落账。
+    /// 每轮全量(不裁剪)双写成本已裁定接受;F-903 重建演示以此为逐字节比对基准。
+    WireRendered {
+        /// 轮序号(与 turn_started.turn_seq 同源)
+        round: u64,
+        /// wire 字节长度(UTF-8)
+        wire_len: usize,
+        /// wire 全文 digest(evorule-hash 口径)
+        content_hash: String,
+        /// wire 全文(未截断)
+        full_text: String,
     },
     /// 轮收尾(优雅终止路径显式写;异常路径由 TurnEndGuard drop 补写 aborted)
     TurnEnded {
@@ -338,9 +350,10 @@ impl JournalWriter {
 
     /// turn 开始:写 turn_started,返回轮守卫(drop 未显式 end 时补写 aborted)
     pub fn begin_turn(&self, goal: &str) -> Result<TurnEndGuard, JournalError> {
+        let turn_seq;
         {
             let mut g = self.core.lock().unwrap_or_else(|p| p.into_inner());
-            let turn_seq = g.turn_count + 1;
+            turn_seq = g.turn_count + 1;
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -362,6 +375,7 @@ impl JournalWriter {
         }
         Ok(TurnEndGuard {
             writer: self.clone(),
+            turn_seq,
         })
     }
 
@@ -484,6 +498,16 @@ impl JournalWriter {
         })
     }
 
+    /// B-1:wire_rendered——本轮组装完成的 wire 全文落账(len/hash 就地计算)
+    pub fn wire_rendered(&self, round: u64, full_text: &str) -> Result<u64, JournalError> {
+        self.push(JournalEvent::WireRendered {
+            round,
+            wire_len: full_text.len(),
+            content_hash: evorule_digest(full_text),
+            full_text: full_text.to_string(),
+        })
+    }
+
     /// 审批请求开启
     pub fn approval_requested(
         &self,
@@ -527,9 +551,16 @@ impl JournalWriter {
 /// 检测兜底)。
 pub struct TurnEndGuard {
     writer: JournalWriter,
+    /// 本 guard 对应的轮序号(begin_turn 时分配,与 turn_started.turn_seq 一致)
+    turn_seq: u64,
 }
 
 impl TurnEndGuard {
+    /// 本轮轮序号(wire_rendered 等逐轮事件的 round 来源)
+    pub fn turn_seq(&self) -> u64 {
+        self.turn_seq
+    }
+
     /// 显式收尾(消费守卫;此后 drop 不再补写)
     pub fn end(self, status: &str, steps: u64, duration_ms: u64) {
         let _ = self.writer.end_turn(status, steps, duration_ms);
@@ -602,7 +633,7 @@ mod tests {
     use JournalEvent as JE;
 
     #[test]
-    fn roundtrip_all_11_events() {
+    fn roundtrip_all_13_events() {
         let events = vec![
             JE::TurnStarted {
                 turn_seq: 1,
@@ -652,6 +683,19 @@ mod tests {
                 after_est: 4000,
                 cleared_call_ids: vec!["t3".into()],
             },
+            JE::SedimentPerformed {
+                summary_written: true,
+                stable_facts: vec!["stable.llm.x".into()],
+                stable_facts_cache_only: vec![],
+                events_count: 2,
+                rollup_done: false,
+            },
+            JE::WireRendered {
+                round: 1,
+                wire_len: 9,
+                content_hash: evorule_digest("wire body"),
+                full_text: "wire body".into(),
+            },
             JE::TurnEnded {
                 status: "success".into(),
                 steps: 5,
@@ -672,6 +716,46 @@ mod tests {
             assert_eq!(parsed.ts, 1000 + i as u64);
             assert_eq!(&parsed.event, ev, "roundtrip mismatch at variant {i}");
         }
+    }
+
+    #[test]
+    fn wire_rendered_fields_and_hash_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-wire").unwrap();
+        let text = "S1_base\n\nS3_memory(裁剪后)";
+        w.wire_rendered(1, text).unwrap();
+        let lines = read_all(&JournalWriter::path_for(dir.path(), "s-wire")).unwrap();
+        assert_eq!(lines.len(), 1);
+        match &lines[0].event {
+            JE::WireRendered {
+                round,
+                wire_len,
+                content_hash,
+                full_text,
+            } => {
+                assert_eq!(*round, 1);
+                assert_eq!(*wire_len, text.len());
+                assert_eq!(full_text, text);
+                assert_eq!(
+                    content_hash,
+                    &evorule_digest(text),
+                    "hash 可由全文复算(F-903 重建比对基准)"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_guard_exposes_turn_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-seq").unwrap();
+        let g1 = w.begin_turn("g1").unwrap();
+        assert_eq!(g1.turn_seq(), 1);
+        g1.end("success", 0, 0);
+        let g2 = w.begin_turn("g2").unwrap();
+        assert_eq!(g2.turn_seq(), 2);
+        g2.end("success", 0, 0);
     }
 
     #[test]

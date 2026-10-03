@@ -604,6 +604,56 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                 });
                 next_step_id += 1;
             }
+            JournalEvent::WireRendered {
+                round,
+                wire_len,
+                content_hash,
+                ..
+            } => {
+                // 逐轮 wire 留痕——context_management 系统步(B-1)。wire 全文
+                // 已在 journal 事件 payload(权威面),导出步仅留指针字段
+                // (round/len/hash)不重复全文;重建比对在 journal 侧进行(F-903)
+                if let Some(a) = acc.take() {
+                    finalize_agent_step(
+                        a,
+                        &audit,
+                        sources.transcript,
+                        &assistant_msgs,
+                        &mut steps,
+                        &mut next_step_id,
+                        &mut total_prompt,
+                        &mut total_completion,
+                    );
+                }
+                steps.push(AtifStep {
+                    step_id: next_step_id,
+                    timestamp: Some(iso8601_from_unix_ms(line.ts)),
+                    source: "system".into(),
+                    model_name: None,
+                    message: "Context wire rendered".into(),
+                    tool_calls: None,
+                    observation: Some(AtifObservation {
+                        results: vec![AtifObservationResult {
+                            source_call_id: None,
+                            content: Some(format!(
+                                "round={} wire_len={} hash={}",
+                                round, wire_len, content_hash
+                            )),
+                        }],
+                    }),
+                    metrics: None,
+                    extra: Some(json!({
+                        "context_management": {
+                            "type": "wire_rendered",
+                            "round": round,
+                            "wire_len": wire_len,
+                            "content_hash": content_hash
+                        }
+                    })),
+                    llm_call_count: None,
+                });
+                next_step_id += 1;
+            }
             JournalEvent::TurnEnded { .. } => {
                 // 轮界收步(映射表 §四.3 边界切割)
                 if let Some(a) = acc.take() {
@@ -1390,6 +1440,54 @@ mod tests {
         assert_eq!(
             obs.results[0].content.as_deref(),
             Some("cleared 2 tool results: [t3, t5]")
+        );
+    }
+
+    #[test]
+    fn wire_rendered_emits_context_management_step() {
+        let mut j = JFix::new();
+        j.push(JE::TurnStarted {
+            turn_seq: 1,
+            goal: "g".into(),
+        });
+        j.push(JE::WireRendered {
+            round: 1,
+            wire_len: 1234,
+            content_hash: "blake3:deadbeef".into(),
+            full_text: "sys".into(),
+        });
+        j.push(JE::TurnEnded {
+            status: "success".into(),
+            steps: 1,
+            duration_ms: 10,
+        });
+        let src = AtifSources {
+            session_id: "s",
+            journal: &j.lines,
+            transcript: &[msg(0, "system", "sys"), msg(1, "user", "g")],
+            audit_facts: &[],
+            tool_definitions: None,
+        };
+        let t = export(src).unwrap();
+        // system + user + wire_rendered-system(turn 内无 LLM 步,agent 步不产生)
+        assert_eq!(t.steps.len(), 3);
+        let cs = &t.steps[2];
+        assert_eq!(cs.source, "system");
+        assert_eq!(
+            cs.extra,
+            Some(json!({
+                "context_management": {
+                    "type": "wire_rendered",
+                    "round": 1,
+                    "wire_len": 1234,
+                    "content_hash": "blake3:deadbeef"
+                }
+            }))
+        );
+        let obs = cs.observation.as_ref().unwrap();
+        assert_eq!(
+            obs.results[0].content.as_deref(),
+            Some("round=1 wire_len=1234 hash=blake3:deadbeef")
         );
     }
 
