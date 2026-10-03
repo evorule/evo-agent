@@ -319,6 +319,10 @@ pub struct AgentDefinition {
     ///   PolicyApproval 判定式决策端自动批准,判断逻辑照跑、理由逐笔留痕入链
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
+    /// 组装配方(可选;元层先行批,agent_def 增量。None = 内置默认配方 =
+    /// 现状行为逐字节等价;声明后配方版本/哈希进 effective_params 三阶落账)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assembly: Option<crate::agent::assembly::AssemblyRecipe>,
 }
 
 /// G13:`max_parallel_tools` 的默认值(串行)
@@ -428,6 +432,16 @@ impl AgentDefinition {
                 )));
             }
         }
+        // 元层先行批:assembly 配方语义门卫(槽位 id 唯一/来源白名单/ratio 越界/
+        // 降级序/裁剪策略/骨架槽位/全局预算——加载期 fail-fast)
+        if let Some(recipe) = &self.assembly {
+            recipe.validate().map_err(|e| {
+                AgentDefinitionError::InvalidDefinition(format!(
+                    "assembly recipe invalid: {}",
+                    e
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -440,8 +454,12 @@ impl AgentDefinition {
             return Err(AgentDefinitionError::NotFound(agent_type.to_string()));
         }
         let content = std::fs::read_to_string(&path)?;
-        let value: serde_json::Value =
+        let mut value: serde_json::Value =
             serde_json::from_str(&content).map_err(AgentDefinitionError::Json)?;
+        // 元层先行批:assembly $ref 外部配方引用解析(原位替换为内嵌形态,
+        // 相对 definition 目录;穿越/绝对路径/混合形态加载期即拒)
+        crate::agent::assembly::resolve_assembly_ref(&mut value, dir)
+            .map_err(AgentDefinitionError::InvalidDefinition)?;
         // 门卫 2:宪法 jsonschema 全量校验(找不到 schema 时降级为仅门卫 3,tracing 留痕)
         crate::agent::constitution::validate_agent_def(&value).map_err(|errs| {
             AgentDefinitionError::InvalidDefinition(format!(
@@ -548,6 +566,110 @@ mod tests {
         let path = dir.join(format!("{}.json", name));
         let mut f = std::fs::File::create(&path).expect("create file");
         f.write_all(json.as_bytes()).expect("write file");
+    }
+
+    /// 组装配方测试的最小合法 definition JSON(骨架字段齐全)
+    fn minimal_def_json() -> String {
+        r#"{
+            "agent_type": "recipe_test",
+            "version": "1.0.0",
+            "description": "assembly recipe test",
+            "system_prompt": "you are a test agent",
+            "model": "test-model",
+            "temperature": 0.5,
+            "max_steps": 5,
+            "step_timeout_secs": 30,
+            "tools": []
+        }"#
+        .to_string()
+    }
+
+    /// 元层先行批:assembly 内嵌段加载(字段正确透传)
+    #[test]
+    fn test_assembly_inline_loading() {
+        let dir = make_tmp_dir();
+        let mut json = minimal_def_json();
+        json.pop(); // 去掉尾部 '}'
+        json.push_str(
+            r#", "assembly": {
+                "recipe_version": "recipe-v1.0",
+                "slots": [
+                    { "id": "S1_base", "source": "definition.system_prompt" },
+                    { "id": "S5_task", "source": "goal", "role": "user" },
+                    { "id": "S7_history", "source": "messages",
+                      "trim": { "strategy": "KeepSystemKeepLast", "buffer_pct": 10, "hint_budget_tokens": 20 } }
+                ],
+                "budget": { "reserve_for_response_pct": 30, "tool_result_max_chars": 9000 }
+            }}"#,
+        );
+        write_json(dir.path(), "recipe_test", &json);
+        let def = AgentDefinition::load_from_dir(dir.path(), "recipe_test").expect("load");
+        let recipe = def.assembly.expect("assembly present");
+        assert_eq!(recipe.budget.reserve_for_response_pct, 30);
+        assert_eq!(recipe.budget.tool_result_max_chars, 9000);
+        assert_eq!(recipe.slots[2].trim.as_ref().unwrap().buffer_pct, 10);
+    }
+
+    /// 元层先行批:$ref 外部配方文件加载(相对 definition 目录解析后等价内嵌)
+    #[test]
+    fn test_assembly_ref_loading() {
+        let dir = make_tmp_dir();
+        let recipes = dir.path().join("recipes");
+        std::fs::create_dir_all(&recipes).expect("create recipes dir");
+        std::fs::write(
+            recipes.join("assembly-v1.json"),
+            r#"{"recipe_version":"recipe-v1.0","budget":{"reserve_for_response_pct":35}}"#,
+        )
+        .expect("write recipe file");
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(r#", "assembly": { "$ref": "recipes/assembly-v1.json" }}"#);
+        write_json(dir.path(), "recipe_test", &json);
+        let def = AgentDefinition::load_from_dir(dir.path(), "recipe_test").expect("load");
+        let recipe = def.assembly.expect("assembly present via $ref");
+        assert_eq!(recipe.recipe_version, "recipe-v1.0");
+        assert_eq!(recipe.budget.reserve_for_response_pct, 35);
+    }
+
+    /// 元层先行批:未声明 assembly = None(None 在消费侧展开为内置默认配方)
+    #[test]
+    fn test_assembly_absent_is_none() {
+        let dir = make_tmp_dir();
+        write_json(dir.path(), "recipe_test", &minimal_def_json());
+        let def = AgentDefinition::load_from_dir(dir.path(), "recipe_test").expect("load");
+        assert!(def.assembly.is_none());
+    }
+
+    /// 元层先行批:非法配方加载期即拒(ratio 越声明 clamp 区间)
+    #[test]
+    fn test_assembly_invalid_rejected_at_load() {
+        let dir = make_tmp_dir();
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(
+            r#", "assembly": {
+                "recipe_version": "recipe-v1.0",
+                "slots": [
+                    { "id": "S1_base", "source": "definition.system_prompt" },
+                    { "id": "S5_task", "source": "goal" },
+                    { "id": "S7_history", "source": "messages" }
+                ]
+            }}"#,
+        );
+        // 篡改 ratio 越界(0.9 越出 [0.1,0.5])
+        let bad = json.replace(
+            r#""slots": ["#,
+            r#""slots": [ { "id": "S3_memory", "source": "recall",
+                "budget": { "ratio": 0.9, "base": "total_window", "clamp": [0.1, 0.5] } }, "#,
+        );
+        write_json(dir.path(), "recipe_test", &bad);
+        let err = AgentDefinition::load_from_dir(dir.path(), "recipe_test")
+            .expect_err("invalid recipe must be rejected");
+        assert!(
+            err.to_string().contains("budget.ratio"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -757,6 +879,7 @@ mod tests {
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
+            assembly: None,
         };
         let config = def.to_agent_config();
         assert_eq!(config.agent_type, "writer");
@@ -1098,6 +1221,7 @@ mod tests {
                 tools: btools.into_iter().map(String::from).collect(),
             }),
             approval_mode: None,
+            assembly: None,
         };
         // 平台合法绝对路径(Linux 上 "D:/x" 非绝对路径,门卫语义会被绝对路径检查劫持)
         let abs_root = if cfg!(windows) { "D:/x" } else { "/x" };
@@ -1244,6 +1368,7 @@ mod tests {
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
+            assembly: None,
         };
         let json = serde_json::to_string(&def).expect("serialize");
         assert!(

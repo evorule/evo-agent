@@ -385,7 +385,9 @@ mod tests {
 
     fn make_ctx() -> DelegateContext {
         let definitions = AgentDefinitionManager::with_default_dir();
-        DelegateContext::new("parent", definitions, make_test_client())
+        let mut ctx = DelegateContext::new("parent", definitions, make_test_client());
+        ctx.journal_dir = None;
+        ctx
     }
 
     #[test]

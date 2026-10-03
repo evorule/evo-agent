@@ -1156,6 +1156,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             max_parallel_tools: 1,
             capability_boundary: boundary,
             approval_mode: None,
+            assembly: None,
         }
     }
 

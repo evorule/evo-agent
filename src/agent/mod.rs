@@ -5,6 +5,7 @@
 //! Agent orchestration layer -- AI Agent run loop, tool registry, and memory manager.
 pub mod adjudicator;
 pub mod approval;
+pub mod assembly;
 pub mod atif;
 pub mod audited_llm;
 pub mod callback;
@@ -32,6 +33,7 @@ pub use approval::{
     new_proposal_id, ApprovalCallback, ApprovalDecision, ApprovalRequest, AutoApprove, CliApproval,
     DenyAll, HttpApproval, PendingApproval, PolicyApproval, HTTP_APPROVAL_TIMEOUT_SECS,
 };
+pub use assembly::{AssemblyRecipe, DEFAULT_RECIPE_VERSION};
 pub use audited_llm::{AuditedLlm, DEFAULT_AUDITED_CALL_TIMEOUT_SECS};
 pub use callback::{CallbackChain, EventCallback, LoggingCallback, MetricsCallback};
 pub use context_window::{

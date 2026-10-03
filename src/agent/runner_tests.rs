@@ -72,6 +72,8 @@ fn test_merge_delegate_tool() {
         // 工具面注入(测试不注入)
         toolkit: None,
         workdir: None,
+        // O-275:journal 目录(测试不落盘)
+        journal_dir: None,
     };
 
     let args = serde_json::json!({"query": "test"});
@@ -562,6 +564,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         max_parallel_tools: 1,
         capability_boundary: None,
         approval_mode: None,
+        assembly: None,
     }
 }
 
