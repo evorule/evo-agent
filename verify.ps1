@@ -62,9 +62,14 @@ Write-Host "== [4/4] dependency contract assertion =="
 # Scope note (2026-09-22): the ban targets MAIN-REPO crates. Governance shared
 # components hosted in separate repos are allowed via explicit allowlist --
 # they are governance-face libraries, not engine crates, and do not bypass
-# evorule-server for rule execution. Current allowlist: evorule-constitution
-# (from evorule-system-rules; schema validation with embedded data).
-$separateRepoAllowlist = @('evorule-constitution')
+# evorule-server for rule execution. Current allowlist:
+#   evorule-constitution (from evorule-system-rules; schema validation with
+#     embedded data);
+#   evorule-bundle (from evorule-bundle; DatasetBundle schema + blake3 content
+#     hash + import verify chain). Hash byte-compatibility with the
+#     evorule-server import side depends on the same crate serialization, so
+#     both repos must upgrade the crate version in lockstep.
+$separateRepoAllowlist = @('evorule-constitution', 'evorule-bundle')
 $manifest = Get-Content (Join-Path $repo "Cargo.toml") -Raw
 $depHits = [regex]::Matches($manifest, '(?m)^\s*(evorule-[\w-]+)\s*=') |
     Where-Object { $separateRepoAllowlist -notcontains $_.Groups[1].Value }
