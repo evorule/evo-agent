@@ -1434,6 +1434,7 @@ impl AgentRunner {
                 memory,
                 summarizer: self.summarizer.as_ref(),
                 extractor: self.extractor.as_mut(),
+                event_store: self.memory_event_store.as_mut(),
             };
             let _ =
                 sediment::sediment(&mut deps, &self.sediment_config, session_id, messages).await;
