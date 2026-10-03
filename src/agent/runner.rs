@@ -3560,6 +3560,16 @@ impl AgentRunner {
                 None => None,
             };
 
+            // B-1:逐轮 wire 留痕(挂点=本轮 wire 组装完成+轮顶事件之后、首个 LLM
+            // 调用之前;F-903 重建演示以此为逐字节比对基准)。失败 fail-soft
+            // (warn 留痕,不阻塞主流程——与其它 journal 写入同风格)
+            if let Some(j) = &journal {
+                let round = turn_guard.as_ref().map(|g| g.turn_seq()).unwrap_or(0);
+                if let Err(e) = j.wire_rendered(round, &system_prompt) {
+                    warn!(%session_id, error = %e, "wire_rendered journal failed");
+                }
+            }
+
             // G17:session 活跃度守卫(新建 / 复用均持有,stream! 块结束时 dec)
             let _session_guard = SessionActiveGuard::new(runner.metrics.clone());
 
