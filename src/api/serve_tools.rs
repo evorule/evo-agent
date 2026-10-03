@@ -5,7 +5,7 @@
 //! E1:serve 模式工具组装 —— union toolkit + 按白名单过滤
 //!
 //! serve 模式下 `cmd_serve` 在启动时调用 [`build_union_toolkit`] 一次,组装
-//! 内置 15 + 规则 26 = 41 个工具的 union toolkit,存入 `AgentApiState.toolkit`。
+//! 内置 15 + 规则 27 = 42 个工具的 union toolkit,存入 `AgentApiState.toolkit`。
 //!
 //! 每次 `/agents/{type}/run` 请求时,handler 调用 [`build_filtered_toolkit`]
 //! 按 `def.tools` 白名单从 union 中过滤出该 agent 可用的工具,实现安全隔离。
@@ -23,9 +23,10 @@ use crate::builtin_tools::default_safe_toolkit;
 use crate::io_handlers::tool_handler::ToolHandler;
 use crate::rule_tools::full_rule_toolkit;
 
-/// union toolkit 中包含的全部规则工具名(26 个)
+/// union toolkit 中包含的全部规则工具名(27 个)
 ///
-/// workspace 2 + rule 12 + translate 3 + audit 3 + knowledge 3 + meta 1 + evolution 2 = 26
+/// workspace 2 + rule 12 + translate 3 + audit 3 + knowledge 3 + skill 装配 1
+/// + meta 1 + evolution 2 = 27
 const RULE_TOOL_NAMES: &[&str] = &[
     // workspace_tools (2)
     "ws_list",
@@ -55,6 +56,8 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "knowledge_datasets",
     "knowledge_search",
     "knowledge_entry_get",
+    // skill 装配面 (1,纯本地转换:skill pack → 执行域快照包,非写工具)
+    "skill_pack_to_bundle",
     // meta_tools (1,L2 约束只读消费面)
     "meta_summary",
     // evolution_tools (2,进化信号只读消费面 + 约束层晋升提名)
@@ -62,7 +65,7 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "rule_promote",
 ];
 
-/// 构建 union toolkit(内置 15 + 规则 26 = 41 工具,启动时一次组装)
+/// 构建 union toolkit(内置 15 + 规则 27 = 42 工具,启动时一次组装)
 ///
 /// 在 `cmd_serve` 启动时调用一次,结果存入 `AgentApiState.toolkit`。
 pub fn build_union_toolkit(
@@ -597,7 +600,7 @@ mod tests {
             build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
         for name in GOVERNANCE_WRITE_TOOLS {
             // 21 写工具中 11 个(sandbox/dataset/publish/bundle 族)不在 serve
-            // union 41 面(union 规则面=26,D-4 实测口径)——它们本就不被 serve,
+            // union 42 面(union 规则面=27,D-4 实测口径)——它们本就不被 serve,
             // 与开关无关;此处仅断言 union 内写工具默认不被门控。
             if !RULE_TOOL_NAMES.contains(name) {
                 continue;
@@ -611,11 +614,11 @@ mod tests {
 
     #[test]
     fn test_governance_write_switch_off_gates_exactly_21_write_tools() {
-        // false:21 写工具下线(执行器+LLM 契约同步消失),其余 24 只读保留
+        // false:21 写工具下线(执行器+LLM 契约同步消失),其余 25 只读保留
         let (ws, ev) = make_clients();
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
         let all = all_rule_tool_names();
-        assert_eq!(all.len(), 45, "rule tool spec count drift");
+        assert_eq!(all.len(), 46, "rule tool spec count drift");
         let mut settings = serde_json::Map::new();
         settings.insert(
             "agentTools.governanceWrite".to_string(),
@@ -635,10 +638,10 @@ mod tests {
             .collect();
         assert_eq!(
             keep.len(),
-            24,
-            "readonly surface must keep exactly 24 tools"
+            25,
+            "readonly surface must keep exactly 25 tools"
         );
-        // 24 只读 spec 中不在 serve union 41 面者本就不被 serve(与开关无关),
+        // 25 只读 spec 中不在 serve union 42 面者本就不被 serve(与开关无关),
         // 只断言 union 内只读工具全保留
         for name in &keep {
             if !RULE_TOOL_NAMES.contains(name) {
@@ -715,7 +718,7 @@ mod tests {
             );
         }
 
-        // 26 个规则工具(=RULE_TOOL_NAMES 白名单)
+        // 27 个规则工具(=RULE_TOOL_NAMES 白名单)
         for name in RULE_TOOL_NAMES {
             assert!(
                 handler.has_tool(name),
@@ -724,7 +727,7 @@ mod tests {
             );
         }
 
-        // 总数 = 15 + 26 = 41(逐个验证所有预期工具都在)
+        // 总数 = 15 + 27 = 42(逐个验证所有预期工具都在)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -746,7 +749,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 41, "expected 41 total tool names");
+        assert_eq!(all_names.len(), 42, "expected 42 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),

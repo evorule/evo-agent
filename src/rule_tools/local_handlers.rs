@@ -2,11 +2,13 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! 本地逻辑工具 handler（D-1 分类表 5 个）——无法表驱动为纯透传、带本地语义
+//! 本地逻辑工具 handler（D-1 分类表 6 个）——无法表驱动为纯透传、带本地语义
 //! 变换/校验/渲染的工具统一外置于本文件；纯透传族见 [`super::adapter`]。
 //!
 //! - audit_verify：验证审计链 → 包装为 {"verified": bool}；
 //! - bundle_export：治理域带证据导出（verdict/subset 前置形状校验）；
+//! - skill_pack_to_bundle：skill 规则壳 → 执行域快照包桥接（crate 算哈希 +
+//!   本地条目结构预检；knowledge 段不进执行域，闸门一缺省 fail）；
 //! - meta_summary：L2 约束清单摘要（读取与陈述，展示层）；
 //! - evolution_signals：会话违规信号聚合摘要（读取与陈述，展示层）；
 //! - rule_promote：约束层晋升提名（kind 硬编码 meta_promotion 防旁路，
@@ -23,6 +25,12 @@
 use std::sync::Arc;
 
 use serde_json::Value;
+
+use evorule_bundle::{
+    BundleAudit, BundleDatasetMeta, BundleEntry, BundleError, BundleImporter, BundleTests,
+    DatasetBundle, DomainSchemaResolver, EntryKind, Provenance, TestVerdict, VersionSelection,
+    VersionSelectionMode, BUNDLE_SCHEMA_VERSION,
+};
 
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::workspace_client::{SubmitPublishRequest, WorkspaceApiClient};
@@ -242,6 +250,246 @@ impl ToolFunction for BundleExportTool {
 }
 
 // =============================================================================
+// skill_pack_to_bundle —— skill 规则壳 → 执行域快照包桥接（纯本地构造+自洽校验）
+// =============================================================================
+
+/// skill-rule-pack（tools/skill-adapter 产物）→ DatasetBundle 转换器。
+///
+/// 设计边界（三条硬边界）：
+/// - 仅搬运 `pack.rules`（判定标准四条件全过段落的规则壳，rule_body 零转译）；
+///   `knowledge_index`/`llm_core_note` 不进执行域——知识条目 D3 强校验
+///   schema_ref 必填，skill 知识体的正当归宿是上下文面（read_skill 装载），
+///   本工具不提供绕门禁形态；
+/// - content_hash 全程由 evorule-bundle crate 计算（零复刻零旁路，哈希纪律）；
+/// - 闸门一语义：verdict 缺省 fail（未验证不得默认通过）；pass 必带
+///   sandbox:/human: 前缀可追溯证据（与 bundle_export 同口径）。骨架规则
+///   （on_true.noop 占位）须先填充并取得沙箱证据，再经
+///   bundle_import_dry_run → bundle_import 激活——本工具定位是
+///   「规范化落包+结构预检」，不是一键激活。
+#[derive(Clone)]
+pub struct SkillPackToBundleTool;
+
+impl SkillPackToBundleTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SkillPackToBundleTool {
+    fn default() -> Self {
+        Self
+    }
+}
+
+/// epoch 毫秒 → RFC3339 UTC（YYYY-MM-DDTHH:MM:SSZ），零依赖（civil_from_days 算法）。
+fn rfc3339_utc_now() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let secs = ms as i64 / 1000;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mth <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mth:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+#[async_trait::async_trait]
+impl ToolFunction for SkillPackToBundleTool {
+    async fn call(&self, args: &Value) -> IoResult {
+        let pack = args
+            .get("pack")
+            .and_then(|v| v.as_object())
+            .ok_or(
+                "missing required parameter: pack (skill-rule-pack object as produced by the \
+                 skill adapter)",
+            )
+            .map_err(|e| e.to_string())?;
+        let verdict = args
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .unwrap_or("fail");
+        if verdict != "pass" && verdict != "fail" {
+            return Err("verdict must be \"pass\" or \"fail\"".to_string());
+        }
+        let evidence: Vec<String> = args
+            .get("evidence")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if verdict == "pass"
+            && (evidence.is_empty()
+                || !evidence
+                    .iter()
+                    .all(|s| s.starts_with("sandbox:") || s.starts_with("human:")))
+        {
+            return Err(
+                "verdict=pass requires traceable evidence: evidence must be non-empty and each \
+                 item must start with \"sandbox:<id>\" or \"human:<actor>\""
+                    .to_string(),
+            );
+        }
+        let rules = pack
+            .get("rules")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "pack.rules missing or not an array".to_string())?;
+        if rules.is_empty() {
+            return Err("pack.rules is empty: nothing to convert".to_string());
+        }
+        let skill_name = pack
+            .get("source_skill")
+            .and_then(|s| s.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let skill_version = pack
+            .get("source_skill")
+            .and_then(|s| s.get("version"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let pack_id = pack
+            .get("pack_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("skill-pack-unknown");
+        let str_arg = |name: &str| args.get(name).and_then(|v| v.as_str()).map(String::from);
+        let dataset_id = str_arg("dataset_id").unwrap_or_else(|| pack_id.to_string());
+        let dataset_name = str_arg("dataset_name").unwrap_or_else(|| format!("skill:{skill_name}"));
+        let tenant_id = str_arg("tenant_id").unwrap_or_else(|| "local".to_string());
+        let instance_id = str_arg("instance_id").unwrap_or_else(|| "evo-agent".to_string());
+
+        let mut entries = Vec::with_capacity(rules.len());
+        for r in rules {
+            let entry_id = r
+                .get("entry_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "pack rule missing entry_id".to_string())?
+                .to_string();
+            let rule_body = r
+                .get("rule_body")
+                .cloned()
+                .ok_or_else(|| format!("pack rule {entry_id} missing rule_body"))?;
+            let domain = r
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .unwrap_or("skill")
+                .to_string();
+            let tags = r
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            entries.push(BundleEntry {
+                entry_id,
+                entry_kind: EntryKind::Rule,
+                rule_body,
+                schema_ref: None,
+                provenance: Provenance {
+                    source: format!("skill-adapter:{skill_name}@{skill_version}"),
+                    clause: None,
+                    document_id: None,
+                    effective_from: None,
+                    effective_to: None,
+                    last_verified: None,
+                    verified_by: None,
+                },
+                domain,
+                tags,
+                dependencies: Vec::new(),
+            });
+        }
+
+        let bundle = DatasetBundle {
+            bundle_schema_version: BUNDLE_SCHEMA_VERSION.to_string(),
+            bundle_id: format!("bundle-{dataset_id}"),
+            dataset: BundleDatasetMeta {
+                dataset_id,
+                name: dataset_name,
+                tenant_id,
+                instance_id,
+                versioning: evorule_bundle::Versioning::default(),
+                version_selection: Some(VersionSelection {
+                    mode: VersionSelectionMode::Pinned,
+                    pinned_version: Some("v1".to_string()),
+                    pinned_include_patch: None,
+                }),
+                law_ref: None,
+                view_of: None,
+                event_schemas: Vec::new(),
+            },
+            entries,
+            data_dependencies: None,
+            tests: BundleTests {
+                subset: evidence,
+                fixtures: Vec::new(),
+                verdict: if verdict == "pass" {
+                    TestVerdict::Pass
+                } else {
+                    TestVerdict::Fail
+                },
+            },
+            audit: BundleAudit {
+                exported_at: rfc3339_utc_now(),
+                exported_by: "skill-adapter-bridge".to_string(),
+                source_version: "v1".to_string(),
+                content_hash: String::new(),
+                hash_algo: "blake3".to_string(),
+            },
+        };
+        let mut bundle = bundle;
+        bundle.audit.content_hash = bundle.compute_content_hash();
+
+        // 条目级结构预检：全量收集（BundleImporter::validate 整体 fail-fast，这里逐条显式清单）
+        let resolver: DomainSchemaResolver<'_> = &|_: &str| None;
+        let declared: Vec<String> = Vec::new();
+        let mut structural_errors: Vec<String> = Vec::new();
+        for e in &bundle.entries {
+            if let Err(be) = BundleImporter::validate_entry(e, &declared, resolver) {
+                structural_errors.push(format!("{}: {be}", e.entry_id));
+            }
+        }
+        let gate_one_status = match BundleImporter::validate(&bundle, resolver) {
+            Ok(_) => "pass".to_string(),
+            Err(BundleError::TestsNotPassed { .. }) => {
+                "fail (expected for unverified skeleton rules: fill rule bodies, obtain \
+                 sandbox/human evidence, re-run with verdict=pass, then bundle_import_dry_run)"
+                    .to_string()
+            }
+            Err(be) => {
+                structural_errors.push(format!("bundle-level: {be}"));
+                "blocked".to_string()
+            }
+        };
+        let entry_count = bundle.entries.len();
+        let bundle_json = serde_json::to_value(&bundle).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "bundle": bundle_json,
+            "validation": {
+                "entry_count": entry_count,
+                "structural_errors": structural_errors,
+                "gate_one_status": gate_one_status,
+            }
+        }))
+    }
+}
+
+// =============================================================================
 // meta_summary —— L2 约束清单摘要
 // =============================================================================
 
@@ -420,10 +668,14 @@ impl ToolFunction for RulePromoteTool {
 // register / specs
 // =============================================================================
 
-/// 注册全部本地逻辑工具（5 个）
+/// 注册全部本地逻辑工具（6 个）
 pub fn register(h: &mut ToolHandler, ws: &WorkspaceApiClient, ev: &EvoruleApiClient) {
     h.register_tool("audit_verify", Arc::new(AuditVerifyTool::new(ev.clone())));
     h.register_tool("bundle_export", Arc::new(BundleExportTool::new(ws.clone())));
+    h.register_tool(
+        "skill_pack_to_bundle",
+        Arc::new(SkillPackToBundleTool::new()),
+    );
     h.register_tool("meta_summary", Arc::new(MetaSummaryTool::new(ev.clone())));
     h.register_tool(
         "evolution_signals",
@@ -491,6 +743,63 @@ pub fn specs() -> Vec<ToolSpec> {
                     description: "Optional trim-view syntax: \"tag:core\" / \"domain:tax\" / \
                                   \"ids:id1,id2\" (multiple segments joined by \";\", \
                                   intersection)."
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "skill_pack_to_bundle".to_string(),
+            description: "Convert a skill-rule-pack (the JSON produced by the skill adapter) \
+                          into a DatasetBundle for the execution domain: pack.rules become \
+                          Rule entries (rule_body passed through unchanged), the content hash \
+                          is computed by the evorule-bundle crate, and a per-entry structural \
+                          pre-check runs locally. verdict defaults to \"fail\" (unverified \
+                          skeleton rules); \"pass\" requires traceable evidence items \
+                          (\"sandbox:<id>\" or \"human:<actor>\"). Feed the returned bundle to \
+                          bundle_import_dry_run / bundle_import. Knowledge sections of the \
+                          pack are NOT included: they belong to the context plane (read_skill), \
+                          not the execution domain."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "pack".to_string(),
+                    r#type: "object".to_string(),
+                    description: "The skill-rule-pack object (pack_id / source_skill / rules \
+                                  array with entry_id + rule_body + domain + tags per rule)."
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "dataset_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Dataset id for the bundle (defaults to the pack's pack_id)."
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "dataset_name".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Human-readable dataset name (defaults to \"skill:<name>\")."
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "verdict".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Test verdict: \"fail\" (default, explicit unverified) or \
+                                  \"pass\" (requires evidence). Skeleton rules with unfilled \
+                                  on_true.noop bodies must stay \"fail\" until filled and \
+                                  sandbox-verified."
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "evidence".to_string(),
+                    r#type: "array".to_string(),
+                    description: "Traceable evidence refs (array of strings). Required for \
+                                  verdict=pass: each item must be \"sandbox:<id>\" (machine \
+                                  attestation) or \"human:<actor>\" (explicit human downgrade)."
                         .to_string(),
                     required: false,
                 },
@@ -712,7 +1021,7 @@ mod tests {
 
     #[test]
     fn test_specs_count() {
-        assert_eq!(specs().len(), 5);
+        assert_eq!(specs().len(), 6);
     }
 
     #[test]
@@ -841,6 +1150,138 @@ mod tests {
         let msg = result.unwrap_err();
         assert!(!msg.contains("missing required parameter"));
         assert!(!msg.contains("requires traceable evidence"));
+    }
+
+    // =========================================================================
+    // skill_pack_to_bundle
+    // =========================================================================
+
+    /// 最小合法 pack fixture：骨架规则体与 skill-adapter tool-router 骨架同构。
+    fn demo_pack() -> Value {
+        serde_json::json!({
+            "pack_id": "skill-pack-demo",
+            "source_skill": {"name": "demo-skill", "version": "1.0.0",
+                             "path": "skills/demo/SKILL.md", "description": "demo"},
+            "rules": [{
+                "entry_id": "demo-a-01",
+                "domain": "audit",
+                "tags": ["skill-adapter", "tpl-tool-router"],
+                "rule_body": {
+                    "rule_id": "demo-a-01", "version": 1, "description": "router skeleton",
+                    "transform": [{"type": "branch", "params": {
+                        "domain": {"type": "instruction", "instruction_type": "audit_tool"},
+                        "on_true": [{"type": "push",
+                                     "params": {"instructions": [{"type": "noop"}]}}],
+                        "on_false": []}}]
+                }
+            }],
+            "knowledge_index": [{"key": "k1", "summary": "s", "trigger_kw": ["t"],
+                                 "src": "x#k1", "kind": "ref"}],
+            "llm_core_note": [],
+            "machine_judge": {"items": []},
+            "coverage": {"unmapped": 0}
+        })
+    }
+
+    #[tokio::test]
+    async fn test_skill_pack_to_bundle_happy_fail() {
+        let tool = SkillPackToBundleTool::new();
+        let args = serde_json::json!({ "pack": demo_pack() });
+        let out = tool.call(&args).await.expect("convert should succeed");
+        let bundle = &out["bundle"];
+        assert_eq!(bundle["bundle_id"], "bundle-skill-pack-demo");
+        assert_eq!(bundle["bundle_schema_version"], "1.0");
+        assert_eq!(bundle["dataset"]["dataset_id"], "skill-pack-demo");
+        assert_eq!(bundle["dataset"]["version_selection"]["mode"], "pinned");
+        assert_eq!(bundle["entries"][0]["entry_id"], "demo-a-01");
+        assert_eq!(bundle["entries"][0]["entry_kind"], "rule");
+        assert_eq!(
+            bundle["entries"][0]["provenance"]["source"],
+            "skill-adapter:demo-skill@1.0.0"
+        );
+        assert_eq!(bundle["tests"]["verdict"], "fail");
+        assert!(bundle["audit"]["content_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("blake3:"));
+        assert_eq!(out["validation"]["entry_count"], 1);
+        assert!(
+            out["validation"]["structural_errors"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "skeleton rule must pass structural gate"
+        );
+        assert!(
+            out["validation"]["gate_one_status"]
+                .as_str()
+                .unwrap()
+                .starts_with("fail"),
+            "unverified skeleton must land on gate one (expected fail)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skill_pack_to_bundle_verify_hash_roundtrip() {
+        let tool = SkillPackToBundleTool::new();
+        let args = serde_json::json!({ "pack": demo_pack() });
+        let out = tool.call(&args).await.expect("convert should succeed");
+        let rebuilt: DatasetBundle =
+            serde_json::from_value(out["bundle"].clone()).expect("bundle must round-trip");
+        rebuilt
+            .verify_content_hash()
+            .expect("content hash must verify after JSON round-trip");
+    }
+
+    #[tokio::test]
+    async fn test_skill_pack_to_bundle_pass_requires_evidence() {
+        let tool = SkillPackToBundleTool::new();
+        let args = serde_json::json!({ "pack": demo_pack(), "verdict": "pass" });
+        let result = tool.call(&args).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("requires traceable evidence"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_pack_to_bundle_pass_with_evidence() {
+        let tool = SkillPackToBundleTool::new();
+        let args = serde_json::json!({
+            "pack": demo_pack(),
+            "verdict": "pass",
+            "evidence": ["sandbox:sb-1"]
+        });
+        let out = tool.call(&args).await.expect("convert should succeed");
+        assert_eq!(out["bundle"]["tests"]["verdict"], "pass");
+        assert_eq!(out["validation"]["gate_one_status"], "pass");
+    }
+
+    #[tokio::test]
+    async fn test_skill_pack_to_bundle_structural_error() {
+        let mut pack = demo_pack();
+        pack["rules"][0]["rule_body"] = serde_json::json!({
+            "rule_id": "demo-a-01", "version": 1,
+            "transform": [{"type": "nonexistent_hint"}]
+        });
+        let tool = SkillPackToBundleTool::new();
+        let args = serde_json::json!({ "pack": pack });
+        let out = tool
+            .call(&args)
+            .await
+            .expect("convert itself should succeed");
+        let errs = out["validation"]["structural_errors"]
+            .as_array()
+            .expect("structural errors list");
+        assert!(!errs.is_empty(), "illegal rule_body must be reported");
+    }
+
+    #[tokio::test]
+    async fn test_skill_pack_to_bundle_knowledge_not_included() {
+        let tool = SkillPackToBundleTool::new();
+        let args = serde_json::json!({ "pack": demo_pack() });
+        let out = tool.call(&args).await.expect("convert should succeed");
+        // pack 含 1 条 knowledge_index + 0 条 llm_core：bundle 只收 rules（1 条）
+        assert_eq!(out["bundle"]["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(out["validation"]["entry_count"], 1);
     }
 
     // =========================================================================
