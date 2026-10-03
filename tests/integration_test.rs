@@ -385,6 +385,16 @@ async fn test_sediment_rollup_marks_old_summaries_as_rolled_up() {
         .create_async()
         .await;
 
+    // 摘要落链端点（write_shared_summary → update_payload）：写入诚实化后
+    // server 写失败 = CacheOnly，sediment 不计入 summary_written（防虚报），
+    // 故须 mock 成功落链方能驱动 rollup 流程
+    server
+        .mock("POST", "/api/sessions/s1/payload")
+        .with_status(200)
+        .with_body(r#"{"success": true}"#)
+        .create_async()
+        .await;
+
     let client = EvoruleApiClient::new(&server_url);
     let mut memory = MemoryManager::new("default", client).with_session_id("s1");
     // 阈值 10 → rollup_count = 5（最旧 5 条被合并并标记）
