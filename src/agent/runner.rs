@@ -1095,8 +1095,7 @@ impl AgentRunner {
         };
         // 响应预留:配方 budget.reserve_for_response_pct 声明(默认 25%,
         // 整数算术与现状 max_tokens/4 逐值等价)
-        let reserve =
-            max_tokens * executor.reserve_for_response_pct() as usize / 100;
+        let reserve = max_tokens * executor.reserve_for_response_pct() as usize / 100;
         let ctx_mgr = ContextWindowManager::with_approx_counter(
             max_tokens,
             reserve,

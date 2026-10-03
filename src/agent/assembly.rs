@@ -41,7 +41,8 @@ pub const DEGRADATION_LAYERS: &[&str] = &["stable", "summaries", "events"];
 /// 裁剪策略白名单（现状唯一实现;新增策略 = 执行器升级 = major）
 pub const TRIM_STRATEGIES: &[&str] = &["KeepSystemKeepLast"];
 
-/// 预算基准白名单（A-1 口径:现状 `total_window`;修正为 `input` 属配方 minor 变更）
+/// 预算基准白名单(`total_window` = 现状口径;`input` = A-1 修正口径,
+/// PR-4 起执行器已消费——配方 minor 变更即可切换,不改码)
 pub const BUDGET_BASES: &[&str] = &["total_window", "input"];
 
 /// 单槽位声明
@@ -85,7 +86,8 @@ pub struct SlotSpec {
 pub struct SlotBudget {
     /// 记忆区占窗口比例（现状 0.25;越声明 clamp 区间加载期即拒）
     pub ratio: f32,
-    /// 预算基准（"total_window" = A-1 现状口径;"input" = 修正口径,PR-4 演示）
+    /// 预算基准（"total_window" = 现状口径;"input" = A-1 修正口径,
+    /// 扣除响应预留后作基数）
     pub base: String,
     /// 收敛区间 [min, max]（现状 clamp(0.1, 0.5)）
     pub clamp: [f32; 2],
@@ -165,7 +167,9 @@ fn default_recipe_version() -> String {
 
 impl Default for SlotSections {
     fn default() -> Self {
-        Self { notices_first: true }
+        Self {
+            notices_first: true,
+        }
     }
 }
 
@@ -216,9 +220,7 @@ fn default_slots() -> Vec<SlotSpec> {
                 base: "total_window".to_string(),
                 clamp: [0.1, 0.5],
             }),
-            degradation_order: Some(
-                DEGRADATION_LAYERS.iter().map(|s| s.to_string()).collect(),
-            ),
+            degradation_order: Some(DEGRADATION_LAYERS.iter().map(|s| s.to_string()).collect()),
             sections: Some(SlotSections::default()),
             separator: None,
             role: None,
@@ -419,8 +421,7 @@ impl AssemblyRecipe {
                 return Err(format!("required slot '{}' missing", required));
             }
         }
-        if self.budget.reserve_for_response_pct == 0
-            || self.budget.reserve_for_response_pct >= 100
+        if self.budget.reserve_for_response_pct == 0 || self.budget.reserve_for_response_pct >= 100
         {
             return Err(format!(
                 "budget.reserve_for_response_pct {} out of range (1..99)",
@@ -537,14 +538,31 @@ impl AssemblyExecutor {
         self.recipe.slots.iter().find(|s| s.id == id)
     }
 
+    /// 槽位预算基数解析:`total_window` = 现状口径(总窗直接作基数);
+    /// `input` = A-1 修正口径(总窗扣除响应预留后的输入侧空间作基数,
+    /// 整数算术与 runner reserve 同族)。未知值 Err(validate 白名单应已拦截,
+    /// 此处运行时兜底 fail-fast)。
+    fn budget_base_tokens(&self, base: &str, total_window: usize) -> Result<usize, String> {
+        match base {
+            "total_window" => Ok(total_window),
+            "input" => {
+                let pct = self.recipe.budget.reserve_for_response_pct;
+                Ok(total_window - total_window * pct as usize / 100)
+            }
+            other => Err(format!(
+                "slot budget.base '{other}' unknown (allowed: {BUDGET_BASES:?})"
+            )),
+        }
+    }
+
     /// 组装 system_prompt(按配方槽位序拼接)
     ///
     /// - `base_prompt`:S1_base 源(definition.system_prompt)
     /// - `memory`:S3_memory 源载体(None = memory 未启用,槽位静默跳过 =
     ///   现状 memory none 分支行为)
     /// - `recall`:S3_memory 内容(已在调用侧完成召回;预算裁剪在渲染器内)
-    /// - `total_window`:记忆区预算基准(现状 max_context_tokens;A-1 口径
-    ///   `base: total_window` 由配方声明,PR-4 演示修正为 input)
+    /// - `total_window`:记忆区预算基准的原始输入(默认配方 `base: total_window`
+    ///   直接作基数;`base: input` 时扣除响应预留后作基数——A-1 修正口径)
     /// - `boundary_segment`:S4_boundary 源(None = 未声明边界,槽位跳过)
     ///
     /// Err 仅当配置启用了执行器未实现的槽位(如 S4b_skills manifest 渲染器
@@ -570,13 +588,14 @@ impl AssemblyExecutor {
                 // 渲染器以「当前累积 prompt」为 base 前缀,返回 base+记忆区)
                 "recall" => {
                     if let Some(mem) = memory {
-                        let ratio = slot
-                            .budget
-                            .as_ref()
-                            .map(|b| b.ratio)
-                            .unwrap_or(0.25);
-                        let budget =
-                            crate::agent::memory::ContextBudget::new(total_window, ratio);
+                        let budget = match slot.budget.as_ref() {
+                            Some(b) => {
+                                let base_tokens = self.budget_base_tokens(&b.base, total_window)?;
+                                crate::agent::memory::ContextBudget::new(base_tokens, b.ratio)
+                            }
+                            // 槽位未声明 budget:现状默认口径(总窗×0.25)
+                            None => crate::agent::memory::ContextBudget::new(total_window, 0.25),
+                        };
                         prompt = mem.build_system_prompt_with_recall(&prompt, recall, &budget);
                     }
                 }
@@ -635,7 +654,7 @@ mod tests {
         assert!(s3.degradable);
         let b = s3.budget.as_ref().unwrap();
         assert!((b.ratio - 0.25).abs() < 1e-6);
-        assert_eq!(b.base, "total_window"); // A-1 现状口径(PR-4 才修正)
+        assert_eq!(b.base, "total_window"); // A-1 现状口径(默认配方等价迁移维持;input=可选修正口径)
         assert_eq!(b.clamp, [0.1, 0.5]);
         assert_eq!(
             s3.degradation_order.as_ref().unwrap(),
@@ -744,7 +763,10 @@ mod tests {
     fn test_validate_rejects_bad_reserve_pct() {
         let mut r = AssemblyRecipe::default();
         r.budget.reserve_for_response_pct = 100;
-        assert!(r.validate().unwrap_err().contains("reserve_for_response_pct"));
+        assert!(r
+            .validate()
+            .unwrap_err()
+            .contains("reserve_for_response_pct"));
     }
 
     /// 内嵌正例:自定义参数通过(改配方不改码的承载面)
@@ -788,8 +810,7 @@ mod tests {
         assert!(resolve_assembly_ref(&mut doc, tmp.path()).is_err());
 
         // 绝对路径拒绝
-        let mut doc =
-            serde_json::json!({ "assembly": { "$ref": recipe_path.to_str().unwrap() } });
+        let mut doc = serde_json::json!({ "assembly": { "$ref": recipe_path.to_str().unwrap() } });
         assert!(resolve_assembly_ref(&mut doc, tmp.path()).is_err());
 
         // 混合形态拒绝
@@ -813,8 +834,7 @@ mod tests {
         use crate::agent::memory::{MemoryManager, MemoryRecord, RecallContext};
         use std::path::PathBuf;
 
-        let client =
-            crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080");
+        let client = crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080");
         let mem = MemoryManager::new("golden", client);
         let mk = |k: &str, v: &str| MemoryRecord {
             key: k.to_string(),
@@ -908,5 +928,110 @@ mod tests {
             .assemble("base", None, &Default::default(), 0, None)
             .unwrap_err()
             .contains("manifest"));
+    }
+
+    /// A-1 口径修正演示(PR-4):`base: input` 配方数据切换预算基数——
+    /// 执行器代码零改动,同内容记忆在 input 口径下预算更小、裁剪更早
+    #[test]
+    fn test_budget_base_input_switches_memory_cap() {
+        use crate::agent::memory::{MemoryManager, MemoryRecord, RecallContext};
+
+        let client = crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080");
+        let mem = MemoryManager::new("a1-demo", client);
+        let mk = |k: &str, v: &str| MemoryRecord {
+            key: k.to_string(),
+            value: v.to_string(),
+            timestamp: 1_760_000_000,
+            source: None,
+            confidence: None,
+            tags: Vec::new(),
+            fact_id: None,
+            cause_fact_id: None,
+            evidence: None,
+        };
+        // CJK 1:1 估算:600 字符/条 ×3 条 ≈1800 tokens,落在 input 口径
+        // cap(8192-25%=6144;6144×0.25=1536)与 total_window 口径
+        // cap(8192×0.25=2048)之间——两侧裁剪行为必然分叉
+        let long_fact = "长".repeat(600);
+        let mut recall = RecallContext::default();
+        recall.stable = vec![
+            mk("f1", &long_fact),
+            mk("f2", &long_fact),
+            mk("f3", &long_fact),
+        ];
+
+        let out_total = AssemblyExecutor::new(AssemblyRecipe::default())
+            .assemble("base", Some(&mem), &recall, 8192, None)
+            .unwrap();
+        let mut input_recipe = AssemblyRecipe::default();
+        for s in &mut input_recipe.slots {
+            if s.id == "S3_memory" {
+                if let Some(b) = s.budget.as_mut() {
+                    b.base = "input".to_string();
+                }
+            }
+        }
+        let out_input = AssemblyExecutor::new(input_recipe)
+            .assemble("base", Some(&mem), &recall, 8192, None)
+            .unwrap();
+
+        assert_ne!(out_input, out_total, "口径切换必须改变记忆区预算效果");
+        assert!(
+            out_input.len() < out_total.len(),
+            "input 口径 cap(1536) < total_window 口径 cap(2048),记忆区应裁得更紧"
+        );
+    }
+
+    /// 「改配方不改码」演示(PR-4):v1.1 配方 JSON(base=input)与 v1.0 JSON
+    /// (base=total_window)同为合法数据——schema/执行器零改动,旧配方向后
+    /// 兼容,新配方纯数据 diff 生效(配方资产属性实弹验证)
+    #[test]
+    fn test_recipe_v1_1_json_data_only_evolution() {
+        let v10 = r#"{
+            "recipe_version": "recipe-v1.0",
+            "slots": [
+                { "id": "S1_base", "source": "definition.system_prompt" },
+                { "id": "S3_memory", "source": "recall", "degradable": true,
+                  "budget": { "ratio": 0.25, "base": "total_window", "clamp": [0.1, 0.5] },
+                  "degradation_order": ["stable", "summaries", "events"],
+                  "sections": { "notices_first": true } },
+                { "id": "S5_task", "source": "goal", "role": "user" },
+                { "id": "S7_history", "source": "messages",
+                  "trim": { "strategy": "KeepSystemKeepLast", "buffer_pct": 5, "hint_budget_tokens": 15 } }
+            ],
+            "budget": { "window_tokens_source": "definition.context_window_tokens",
+                        "reserve_for_response_pct": 25, "tool_result_max_chars": 48000 },
+            "recall_scope": { "max_session_summaries_ref": "sediment_config",
+                              "max_injected_events_ref": "sediment_config" }
+        }"#;
+        // v1.1 = v1.0 的纯数据 diff:版本号 minor bump + 预算基准切换
+        let v11 = v10
+            .replace("recipe-v1.0", "recipe-v1.1")
+            .replace("total_window", "input");
+
+        // 旧配方向后兼容:仍加载、仍 validate、仍可组装
+        let r10: AssemblyRecipe = serde_json::from_str(v10).unwrap();
+        r10.validate().unwrap();
+        AssemblyExecutor::new(r10)
+            .assemble("base", None, &Default::default(), 8192, None)
+            .unwrap();
+        // 新配方:加载 → validate → 字段落位
+        let r11: AssemblyRecipe = serde_json::from_str(&v11).unwrap();
+        r11.validate().unwrap();
+        assert_eq!(r11.recipe_version, "recipe-v1.1");
+        let exec11 = AssemblyExecutor::new(r11);
+        assert_eq!(
+            exec11
+                .slot("S3_memory")
+                .unwrap()
+                .budget
+                .as_ref()
+                .unwrap()
+                .base,
+            "input"
+        );
+        exec11
+            .assemble("base", None, &Default::default(), 8192, None)
+            .unwrap();
     }
 }

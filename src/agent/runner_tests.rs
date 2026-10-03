@@ -149,6 +149,30 @@ fn test_assembly_recipe_hash_deterministic_and_content_bound() {
 }
 
 #[test]
+fn test_external_recipe_v1_1_recorded_on_wire() {
+    // PR-4 演示闭环:外置 v1.1 配方(base=input,A-1 修正口径,数据)注入 runner
+    // → effective_params 落账可查(协议版本不变,配方版本/指纹随数据演进)
+    let mut recipe = crate::agent::assembly::AssemblyRecipe::default();
+    recipe.recipe_version = "recipe-v1.1".to_string();
+    for s in &mut recipe.slots {
+        if s.id == "S3_memory" {
+            if let Some(b) = s.budget.as_mut() {
+                b.base = "input".to_string();
+            }
+        }
+    }
+    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    runner.assembly = crate::agent::assembly::AssemblyExecutor::new(recipe);
+
+    let command = runner.build_call_external_command("sys", "goal", None);
+    let eff = &command["params"]["effective_params"];
+    assert_eq!(eff["assembly_protocol_version"], "assembly-v2");
+    assert_eq!(eff["assembly_recipe_version"], "recipe-v1.1");
+    let hash = eff["assembly_recipe_hash"].as_str().unwrap();
+    assert!(hash.starts_with("blake3:") && hash.len() == "blake3:".len() + 64);
+}
+
+#[test]
 fn test_agent_runner_new() {
     let config = AgentConfig::default();
     let client = make_test_client();
@@ -1481,7 +1505,8 @@ fn test_g15_rec_to_message_system() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec, recipe_tool_result_max_chars()).expect("system rec should convert");
+    let msg =
+        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("system rec should convert");
     assert!(matches!(msg, Message::System { ref content } if content == "You are helpful"));
 }
 
@@ -1496,7 +1521,8 @@ fn test_g15_rec_to_message_user() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec, recipe_tool_result_max_chars()).expect("user rec should convert");
+    let msg =
+        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("user rec should convert");
     assert!(matches!(msg, Message::User { ref content } if content == "Hello"));
 }
 
@@ -1514,7 +1540,8 @@ fn test_g15_rec_to_message_assistant_with_tool_calls() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec, recipe_tool_result_max_chars()).expect("assistant rec should convert");
+    let msg =
+        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("assistant rec should convert");
     match msg {
         Message::Assistant {
             content,
@@ -1540,7 +1567,8 @@ fn test_g15_rec_to_message_assistant_without_tool_calls() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec, recipe_tool_result_max_chars()).expect("assistant rec should convert");
+    let msg =
+        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("assistant rec should convert");
     match msg {
         Message::Assistant {
             content,
@@ -1564,7 +1592,8 @@ fn test_g15_rec_to_message_tool() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec, recipe_tool_result_max_chars()).expect("tool rec should convert");
+    let msg =
+        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("tool rec should convert");
     assert!(
         matches!(msg, Message::Tool { ref content, ref tool_name } if content == "result data" && tool_name == "search")
     );
@@ -1574,8 +1603,9 @@ fn test_g15_rec_to_message_tool() {
 fn test_g15_rec_to_message_tool_long_content_truncated() {
     // 重建路径与运行中回喂 wire 形态一致:超限 tool 记录重建时同样截断
     // 元层先行批:上限 = 配方生效值(默认配方 48000,与原常量等价)
-    let max_chars =
-        crate::agent::assembly::AssemblyRecipe::default().budget.tool_result_max_chars;
+    let max_chars = crate::agent::assembly::AssemblyRecipe::default()
+        .budget
+        .tool_result_max_chars;
     let raw = "a".repeat(max_chars + 100);
     let rec = MessageRecord {
         idx: 3,
@@ -2665,7 +2695,9 @@ fn m5c_constraint_asset_domain_paths_are_exec_relative() {
 // ----- tool_result 回喂截断 -----
 // 元层先行批:上限 = 配方生效值(默认配方 48000,与原常量等价)
 fn recipe_tool_result_max_chars() -> usize {
-    crate::agent::assembly::AssemblyRecipe::default().budget.tool_result_max_chars
+    crate::agent::assembly::AssemblyRecipe::default()
+        .budget
+        .tool_result_max_chars
 }
 
 #[test]
