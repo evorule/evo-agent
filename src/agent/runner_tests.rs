@@ -108,6 +108,47 @@ fn test_build_call_external_command() {
 }
 
 #[test]
+fn test_effective_params_records_assembly_recipe_triple() {
+    // F-302 三元落账:协议版本(组装行为,码级)+配方版本(数据契约)+配方指纹(内容寻址),
+    // 链上可审计实际生效的组装配置
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+
+    let command = runner.build_call_external_command("sys", "goal", None);
+    let eff = &command["params"]["effective_params"];
+    assert_eq!(eff["assembly_protocol_version"], "assembly-v2");
+    // 默认配方(AgentRunner::new → default_executor → recipe-v1.0)
+    assert_eq!(eff["assembly_recipe_version"], "recipe-v1.0");
+    let hash = eff["assembly_recipe_hash"].as_str().unwrap();
+    assert!(hash.starts_with("blake3:"));
+    assert_eq!(hash.len(), "blake3:".len() + 64);
+}
+
+#[test]
+fn test_assembly_recipe_hash_deterministic_and_content_bound() {
+    // 同配方同指纹(确定性回放);配方内容变更指纹随之变(内容寻址)——
+    // 配方数据独立于代码演进,链上可锚定实际生效的配方内容
+    let command_hash = |runner: &AgentRunner| {
+        runner.build_call_external_command("sys", "goal", None)["params"]["effective_params"]
+            ["assembly_recipe_hash"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let a = AgentRunner::new(AgentConfig::default(), make_test_client());
+    let b = AgentRunner::new(AgentConfig::default(), make_test_client());
+    let hash_a = command_hash(&a);
+    assert_eq!(hash_a, command_hash(&b), "同配方必须产生同一指纹(确定性)");
+
+    // 配方内容变更(不改码):bump recipe_version → 指纹随之变化
+    let mut c = AgentRunner::new(AgentConfig::default(), make_test_client());
+    let mut bumped = crate::agent::assembly::AssemblyRecipe::default();
+    bumped.recipe_version = "recipe-v1.1".to_string();
+    c.assembly = crate::agent::assembly::AssemblyExecutor::new(bumped);
+    assert_ne!(hash_a, command_hash(&c), "配方变更必须改变指纹(内容寻址)");
+}
+
+#[test]
 fn test_agent_runner_new() {
     let config = AgentConfig::default();
     let client = make_test_client();
