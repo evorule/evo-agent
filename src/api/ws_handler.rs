@@ -420,7 +420,28 @@ async fn handle_ws(
                             _ => {}
                         }
                         // 序列化 + 推给客户端
-                        let json = agent_event_to_json(result);
+                        let mut json = agent_event_to_json(result.clone());
+                        // 每轮权威校正(2026-10-03): Done 回执附服务端 Fact 版本
+                        // (actual_version,与 rewind 回执同口径)——console 侧每轮据此
+                        // 同步本地指针,版本漂移窗口清零。查询失败回落=不带字段
+                        // (客户端容错保留旧指针,fail-soft)。
+                        if json["type"] == "Done" {
+                            if let Some(sid) = &current_session {
+                                match crate::agent::runner::session_version(
+                                    state.evorule_client(),
+                                    sid,
+                                )
+                                .await
+                                {
+                                    Ok(ver) => {
+                                        json["actual_version"] = serde_json::json!(ver);
+                                    }
+                                    Err(e) => {
+                                        debug!(error = %e, session_id = %sid, "session_version query failed; Done frame without actual_version");
+                                    }
+                                }
+                            }
+                        }
                         if send_ws_json(&mut sender, json).await.is_err() {
                             warn!("G16: failed to send WS frame, client may have disconnected");
                             break;
