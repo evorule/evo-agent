@@ -39,6 +39,9 @@ use crate::agent::memory_event::extraction::{EventExtractor, ExtractionConfig};
 use crate::agent::memory_event::MemoryEventStore;
 use crate::agent::output_validator::OutputValidator;
 use crate::agent::sediment;
+use crate::agent::stagnation::{
+    StagnationDetector, StagnationVerdict, STAGNATION_EXHAUSTED_MARK, STAGNATION_WARNING_MARK,
+};
 use crate::agent::summarizer::{ContextSummarizer, SummarizeOutcome};
 use crate::agent::translator::{LlmResponse, Message};
 use crate::api::api_core::ApiError;
@@ -843,6 +846,9 @@ pub struct AgentRunner {
     /// runner 强制执行,exit 0=通过放行,非 0=门禁拒绝(不存在 done 退出路径)。
     /// None=不拦截(非长程运行零影响)。由 from_definition 从 def 穿线。
     acceptance_command: Option<String>,
+    /// 16 号档 D3:进展停滞检测器(F2 空转克星)。跨轮持续观察
+    /// (工具名,参数,结果)三元组,连续重复→警告→按 H2 阻塞收尾
+    stagnation: crate::agent::stagnation::StagnationDetector,
 }
 
 impl AgentRunner {
@@ -891,6 +897,7 @@ impl AgentRunner {
             )),
             journal_dir: None,
             acceptance_command: None,
+            stagnation: crate::agent::stagnation::StagnationDetector::new(),
         }
     }
 
@@ -2541,6 +2548,11 @@ impl AgentRunner {
         };
 
         tool_calls.push(tool_name.to_string());
+        // 16 号档 D3:停滞检测(F2 空转克星)——观察(工具,参数,结果)三元组;
+        // Warning/Exhausted 标记随结果回喂 LLM(fail-visible,下一轮可见)
+        let stagnation_verdict =
+            self.stagnation
+                .observe(tool_name, &args.to_string(), &tool_result.to_string());
         let tool_idx = messages.len();
         // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文(事实记录)
         let raw_content = tool_result.to_string();
@@ -2564,6 +2576,17 @@ impl AgentRunner {
             "tool_name": tool_name,
             "result": tool_result.to_string(),
         });
+        match stagnation_verdict {
+            StagnationVerdict::Normal => {}
+            StagnationVerdict::Warning { repeat_count } => {
+                warn!(%session_id, tool = %tool_name, repeat_count, "stagnation warning (F2)");
+                result["stagnation"] = serde_json::json!(STAGNATION_WARNING_MARK);
+            }
+            StagnationVerdict::Exhausted => {
+                warn!(%session_id, tool = %tool_name, "stagnation EXHAUSTED (F2)——按 H2 阻塞收尾指引");
+                result["stagnation"] = serde_json::json!(STAGNATION_EXHAUSTED_MARK);
+            }
+        }
         if let Some(record) = approval_record {
             result["approval"] = record;
         }
@@ -4448,7 +4471,37 @@ impl AgentRunner {
                                     }
                                 };
                                 // 审批事件已在两阶段流程中即时 yield(见 Pending 分支)
-                                let final_result = outcome.final_result;
+                                // 16 号档 D3:停滞检测(与非流式同款;标记随 tool 消息回喂)
+                                let final_result = {
+                                    let mut fr = outcome.final_result;
+                                    let verdict = runner.stagnation.observe(
+                                        &tool_name,
+                                        &args.to_string(),
+                                        &fr.to_string(),
+                                    );
+                                    match verdict {
+                                        StagnationVerdict::Normal => {}
+                                        StagnationVerdict::Warning { repeat_count } => {
+                                            warn!(%session_id, tool = %tool_name, repeat_count, "stagnation warning (F2)");
+                                            if let Some(obj) = fr.as_object_mut() {
+                                                obj.insert(
+                                                    "stagnation".to_string(),
+                                                    serde_json::json!(STAGNATION_WARNING_MARK),
+                                                );
+                                            }
+                                        }
+                                        StagnationVerdict::Exhausted => {
+                                            warn!(%session_id, tool = %tool_name, "stagnation EXHAUSTED (F2)——按 H2 阻塞收尾指引");
+                                            if let Some(obj) = fr.as_object_mut() {
+                                                obj.insert(
+                                                    "stagnation".to_string(),
+                                                    serde_json::json!(STAGNATION_EXHAUSTED_MARK),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    fr
+                                };
 
                                 // B21:tool_result(ok;content = 工具输出全文与 io_response 一致)
                                 if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
