@@ -26,6 +26,7 @@ pub mod runner;
 pub mod safety_auditor;
 pub mod sediment;
 pub mod skill_store;
+pub mod stagnation;
 pub mod summarizer;
 pub mod tool_registry;
 pub mod tool_trace;
