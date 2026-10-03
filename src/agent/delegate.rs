@@ -223,9 +223,15 @@ impl DelegateContext {
                         &def,
                         workdir,
                     );
+                    // B2:skills 声明接线(read_skill 注册 + manifest 槽位源)。
+                    // 置于工具面挂载块内:无工具面的纯规划子代理不注入 manifest,
+                    // 防 LLM 看到技能清单却无 read_skill 可调;解析失败=定义损坏,
+                    // 上抛拒委托(声明时刻=人工把关,路径由系统解析)。
+                    let resolved_skills = crate::api::serve_tools::wire_skills(&mut filtered, &def)?;
                     runner = runner
                         .with_tool_handler(filtered)
-                        .with_capability_boundary(boundary);
+                        .with_capability_boundary(boundary)
+                        .with_skills(resolved_skills);
                 }
             }
 

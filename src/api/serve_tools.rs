@@ -480,6 +480,37 @@ pub fn wire_capability_boundary(
     effective
 }
 
+// =============================================================================
+// B2 skills 装配:声明解析 + read_skill 注册(serve/CLI/delegate 共用)
+// =============================================================================
+
+/// B2:skills 声明接线 —— 解析生效清单 + 注册 read_skill 工具(声明非空时)
+///
+/// 与 [`wire_capability_boundary`] 同族( mutate handler + 返回生效数据,供
+/// `AgentRunner::with_skills` 注入)。单一接线点:ws_handler::construct_runner
+/// / AgentRunner::from_definition / delegate 子代理共用。路径解析在定义
+/// 加载期已完成(load_from_dir),此处读 frontmatter 提取描述。
+///
+/// None/空声明 → 无操作返回 None(零变化)。Err = fail-visible(声明文件
+/// 不可读/frontmatter 不可解析),不静默降级——定义损坏等效加载失败。
+pub fn wire_skills(
+    handler: &mut ToolHandler,
+    def: &crate::agent::definition::AgentDefinition,
+) -> Result<Option<Vec<crate::agent::definition::SkillManifestEntry>>, String> {
+    let Some(entries) = def.skills.as_deref() else {
+        return Ok(None);
+    };
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let resolved = crate::agent::definition::resolve_skill_manifest_entries(entries)?;
+    handler.register_tool(
+        "read_skill",
+        std::sync::Arc::new(crate::builtin_tools::skill_read::SkillReadTool::new(&resolved)),
+    );
+    Ok(Some(resolved))
+}
+
 /// P2 沙箱根映射:run 请求携带 workspace → 以声明态注入能力边界
 ///
 /// 语义 = **映射≠放宽**(合规审查 §二裁定):fs_safety containment 判据逻辑
@@ -1480,6 +1511,96 @@ service_tools = ["config_persist", "rule_sandbox"]
         assert!(
             err.is_err(),
             "write outside mapped workspace must be rejected"
+        );
+    }
+
+    // =========================================================================
+    // B2 wire_skills 接线测试
+    // =========================================================================
+
+    /// 测试辅助:在 tempdir 下写一个标准 SKILL.md,返回绝对路径
+    fn write_skill_md(dir: &Path, name: &str, description: &str, body: &str) -> PathBuf {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &path,
+            format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn test_wire_skills_declared_registers_read_skill() {
+        // 声明非空:read_skill 注册 + 返回生效清单(description 取自 frontmatter);
+        // 端到端:注册后即可经 execute_by_name 读到正文
+        let root = tempfile::tempdir().unwrap();
+        let skill_path = write_skill_md(root.path(), "git-discipline", "git 提交纪律", "正文标记XYZ");
+
+        let mut def = make_def(&["file_read"], None);
+        def.skills = Some(vec![crate::agent::definition::SkillEntry {
+            name: "git-discipline".to_string(),
+            path: skill_path.clone(),
+        }]);
+
+        let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+        let resolved = super::wire_skills(&mut handler, &def).unwrap();
+        let resolved = resolved.expect("non-empty declaration must yield manifest");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "git-discipline");
+        assert_eq!(resolved[0].path, skill_path);
+        assert_eq!(resolved[0].description, "git 提交纪律");
+        assert!(
+            handler.has_tool("read_skill"),
+            "read_skill must be registered on non-empty declaration"
+        );
+
+        // 端到端:接线后工具即可用(声明表名 → 绝对路径 → 正文)
+        let out = handler
+            .execute_by_name("read_skill", &serde_json::json!({"skill_name": "git-discipline"}))
+            .await
+            .expect("read_skill must read declared skill after wiring");
+        let content = out["content"].as_str().expect("content field");
+        assert!(content.contains("正文标记XYZ"), "full body returned: {content}");
+    }
+
+    #[test]
+    fn test_wire_skills_none_and_empty_are_noop() {
+        // None 与空数组均零变化:不注册工具、返回 None
+        for label in ["none", "empty"] {
+            let mut def = make_def(&["file_read"], None);
+            def.skills = match label {
+                "none" => None,
+                _ => Some(vec![]),
+            };
+            let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+            let resolved = super::wire_skills(&mut handler, &def).unwrap();
+            assert!(resolved.is_none(), "{label}: must return None");
+            assert!(
+                !handler.has_tool("read_skill"),
+                "{label}: read_skill must NOT be registered"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wire_skills_unreadable_file_fails_visible() {
+        // 声明文件不可读 = 定义损坏:Err 上抛(fail-visible),不静默降级
+        let mut def = make_def(&["file_read"], None);
+        def.skills = Some(vec![crate::agent::definition::SkillEntry {
+            name: "ghost".to_string(),
+            path: PathBuf::from("Z:/definitely/not/here/SKILL.md"),
+        }]);
+        let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+        let err = super::wire_skills(&mut handler, &def).unwrap_err();
+        assert!(
+            err.contains("skill 'ghost'") && err.contains("unreadable"),
+            "error must name the broken skill entry: {err}"
+        );
+        assert!(
+            !handler.has_tool("read_skill"),
+            "failed wiring must not register read_skill"
         );
     }
 }

@@ -3,7 +3,12 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! 内置工具(0.2.0:file_read / file_list / file_write / file_create /
 //! file_move / file_delete / search_files / grep_files / shell_exec /
-//! http_get / git_status / git_diff / git_log / git_stage / git_commit)
+//! http_get / git_status / git_diff / git_log / git_stage / git_commit /
+//! read_skill)
+//!
+//! 注:`read_skill`(skills 装配 B2)不在 default_safe_toolkit 静态注册——
+//! 其技能表来自 agent definition 的 skills 声明(声明非空时由 serve_tools::
+//! wire_skills / AgentRunner::from_definition 按定义注册)。
 //!
 //! ## 设计原则
 //!
@@ -52,6 +57,7 @@ pub mod http_get;
 pub mod net_guard;
 pub mod search_files;
 pub mod shell_exec;
+pub mod skill_read;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -541,6 +547,25 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     required: false,
                 },
             ],
+        },
+        ToolSpec {
+            name: "read_skill".to_string(),
+            description: "Load the full guidance text of a DECLARED skill by name. \
+                          Use it when the available-skills list (【可用技能清单】 in \
+                          your instructions) names a skill relevant to the current task: \
+                          load it first, then follow its guidance. Only names in the \
+                          agent's declared skill list resolve — the file path is \
+                          system-resolved from the declaration, so this tool cannot be \
+                          used to read arbitrary files (use file_read for that). \
+                          Returns { skill_name, path, size, content }."
+                .to_string(),
+            parameters: vec![ParameterSpec {
+                name: "skill_name".to_string(),
+                r#type: "string".to_string(),
+                description: "Skill name exactly as listed in the available-skills list"
+                    .to_string(),
+                required: true,
+            }],
         },
     ]
 }

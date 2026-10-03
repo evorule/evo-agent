@@ -57,7 +57,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::agent::{AgentError, AgentEvent, AgentRunner, MemoryManager};
 use crate::api::agent_api::AgentApiState;
@@ -554,6 +554,19 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
     // M5-a:能力边界接线(同 HTTP 端点口径:声明重绑工具面 + 生效边界注入 runner)
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
+    // B2:skills 声明接线(read_skill 注册 + manifest 槽位源)。声明时刻=人工把关,
+    // 路径由系统解析,LLM 无法用 read_skill 读任意文件;解析失败=定义损坏,拒构造。
+    let resolved_skills = match crate::api::serve_tools::wire_skills(&mut filtered, &def) {
+        Ok(skills) => skills,
+        Err(e) => {
+            error!(
+                agent_type = %agent_type,
+                error = %e,
+                "skills wiring failed; rejecting runner construction"
+            );
+            return None;
+        }
+    };
     // L2 约束前馈:具备规则生成/校验能力的 agent,构造时把 L2 边界段追加到
     // system_prompt 尾部(memory recall 在 runner 内层包装,顺序不变;fail-soft)
     crate::api::serve_tools::apply_l2_feed_forward(
@@ -591,7 +604,9 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         .with_metrics(state.metrics().clone())
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源;
         // run_streaming_inner 内按会话创建 {sid}.jsonl)
-        .with_journal_dir(state.workdir().join("data").join("sessions"));
+        .with_journal_dir(state.workdir().join("data").join("sessions"))
+        // B2:注入 skills manifest(read_skill 已注册进 filtered,清单喂 S4b 槽位)
+        .with_skills(resolved_skills);
     // 记忆启用时构建 MemoryManager(TTL / 持久化模式按定义透传)
     if def.memory.memory_type != "none" && !def.memory.memory_type.is_empty() {
         let mut mem = MemoryManager::new(&def.memory.namespace, state.evorule_client().clone());
