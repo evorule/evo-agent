@@ -1252,13 +1252,16 @@ impl MemoryManager {
     }
 
     /// 清空所有 cache（仅本地，不删除 evorule 中的数据）
-    pub async fn clear(&mut self) -> Result<(), MemoryError> {
-        let keys: Vec<String> = self.cache.keys().cloned().collect();
-        for key in keys {
-            self.remove(&key).await?;
-        }
+    ///
+    /// O-244 修复：原实现对 cache 内部键逐条调 [`Self::remove`]——cache 键是
+    /// [`Self::cache_key_for`] 产物（已含 scope 前缀），再经 remove 的 scope 化
+    /// 会二次拼接生成错误路径（如 `session_{sid}::shared::topic`），向 evorule
+    /// 写 null 墓碑（payload 污染+审计噪声，违反本方法「仅本地」契约）；
+    /// `?` 传播还会让清空半途而废（session 未设置时 cache 不清）。
+    /// 现语义：**纯本地清空，evorule 侧零写入**；server 侧数据由投影读与
+    /// B3 对账（`verify_cache_against_server`）维持一致性。
+    pub fn clear(&mut self) {
         self.cache.clear();
-        Ok(())
     }
 
     /// 返回所有 cache key 的迭代器
@@ -2110,7 +2113,7 @@ mod tests {
             mgr.set("key1", "val1").await.expect("set");
             mgr.set("key2", "val2").await.expect("set");
 
-            mgr.clear().await.expect("clear");
+            mgr.clear();
             assert!(mgr.is_empty());
             assert_eq!(mgr.len(), 0);
         });
