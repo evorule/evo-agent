@@ -28,9 +28,9 @@ use crate::io_handler::{IoHandler, IoResult};
 
 /// 默认最大重试次数
 const DEFAULT_MAX_RETRIES: usize = 3;
-/// O-260: default connect timeout (secs) - unattended runs must not wait forever on a hung endpoint
+/// default connect timeout (secs) - unattended runs must not wait forever on a hung endpoint
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
-/// O-260: default per-request total timeout (secs)
+/// default per-request total timeout (secs)
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// 默认初始退避(秒)
 const DEFAULT_BASE_BACKOFF_SECS: f64 = 1.0;
@@ -117,9 +117,9 @@ pub struct LlmHandler {
     base_backoff_secs: f64,
     /// G3:最大退避(秒)
     max_backoff_secs: f64,
-    /// O-260:连接超时(秒)
+    /// 连接超时(秒)
     connect_timeout_secs: u64,
-    /// O-260:单请求总超时(秒)
+    /// 单请求总超时(秒)
     request_timeout_secs: u64,
 }
 
@@ -145,7 +145,7 @@ impl LlmHandler {
         self
     }
 
-    /// O-260:覆盖请求超时(秒；连接超时固定 DEFAULT_CONNECT_TIMEOUT_SECS)
+    /// 覆盖请求超时(秒；连接超时固定 DEFAULT_CONNECT_TIMEOUT_SECS)
     pub fn with_request_timeout(mut self, secs: u64) -> Self {
         self.request_timeout_secs = secs;
         self
@@ -353,7 +353,7 @@ impl LlmHandler {
         &self,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        // O-260: connect/request dual timeout - unattended runs must not hang
+        // connect/request dual timeout - unattended runs must not hang
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(self.connect_timeout_secs))
             .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
@@ -510,7 +510,7 @@ impl LlmHandler {
         let api_base = self.api_base.clone();
         let api_key = self.api_key.clone();
         let mock_content = self.mock_content.clone();
-        // O-260:超时值提升为局部量（stream! 块内不持有 &self）
+        // 超时值提升为局部量（stream! 块内不持有 &self）
         let connect_secs = self.connect_timeout_secs;
         let request_secs = self.request_timeout_secs;
 
@@ -540,7 +540,7 @@ impl LlmHandler {
             }
 
             // === HTTP 请求 ===
-            // O-260: streaming path same dual timeout
+            // streaming path same dual timeout
             let client = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(connect_secs))
                 .timeout(std::time::Duration::from_secs(request_secs))

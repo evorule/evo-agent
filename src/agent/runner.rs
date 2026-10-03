@@ -1367,11 +1367,11 @@ impl AgentRunner {
         Ok(())
     }
 
-    /// O-240:会话终态标记（PayloadUpdate，append-only 不改既有事实）。
+    /// 会话终态标记（PayloadUpdate，append-only 不改既有事实）。
     /// 早期失败窗口的失败也留痕——不留「有始无终」孤儿会话。
     /// 标记提交自身失败时再留一层 warn（两层失败可见，不静默）。
     fn mark_session_terminal(&self, session_id: &str, stage: &str, reason: &str) {
-        warn!(%session_id, stage, reason, "O-240: startup failure - session terminal marker pending");
+        warn!(%session_id, stage, reason, "startup failure - session terminal marker pending");
         let session_id = session_id.to_owned();
         let marker = serde_json::json!({
             "session_terminal": {
@@ -1390,7 +1390,7 @@ impl AgentRunner {
                 .update_payload(&session_id, "__meta__.session_terminal", &marker)
                 .await
             {
-                warn!(%session_id, error = %land_err, "O-240: 终态标记提交也失败（会话彻底孤儿，人工介入）");
+                warn!(%session_id, error = %land_err, "终态标记提交也失败（会话彻底孤儿，人工介入）");
             }
         });
     }
@@ -1607,7 +1607,7 @@ impl AgentRunner {
         }
         let _session_guard = SessionActiveGuard::new(self.metrics.clone());
 
-        // O-240:早期失败窗口收口——create_session 成功后的失败也留终态标记，
+        // 早期失败窗口收口——create_session 成功后的失败也留终态标记，
         // 不留「有始无终」孤儿会话（与「失败也回写 io_response」契约同族）
         let _recalled_fact_ids = match self.auto_recall(&session_id).await {
             Ok(v) => v,

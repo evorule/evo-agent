@@ -73,7 +73,7 @@ pub struct SedimentDeps<'a> {
     pub summarizer: Option<&'a ContextSummarizer>,
     /// 事件提取器（R07/E17 接线后实际使用；None = memory 未启用）
     pub extractor: Option<&'a mut EventExtractor>,
-    /// O-243:事件证据链账本（双写——shared 召回 + __memory__ 证据链，
+    /// 事件证据链账本（双写——shared 召回 + __memory__ 证据链，
     /// 非 RL-B5 双写：同一数据两个消费面，__memory__ 为权威）
     pub event_store: Option<&'a mut crate::agent::memory_event::store::MemoryEventStore>,
 }
@@ -265,7 +265,7 @@ async fn extract_and_store_events(
                 {
                     Ok(_) => {
                         result.events.push(event.event_id.clone());
-                        // O-243:双写事件到 __memory__ 证据链（如果 event_store 可用）
+                        // 双写事件到 __memory__ 证据链（如果 event_store 可用）
                         if let Some(store) = deps.event_store.as_mut() {
                             if let Err(e) = store.write_event(event.clone()).await {
                                 tracing::warn!(
