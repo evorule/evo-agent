@@ -554,9 +554,35 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
     // M5-a:能力边界接线(同 HTTP 端点口径:声明重绑工具面 + 生效边界注入 runner)
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
-    // B2:skills 声明接线(read_skill 注册 + manifest 槽位源)。声明时刻=人工把关,
-    // 路径由系统解析,LLM 无法用 read_skill 读任意文件;解析失败=定义损坏,拒构造。
-    let resolved_skills = match crate::api::serve_tools::wire_skills(&mut filtered, &def) {
+    // skills 装配(C 形态):两源合并 —— definition 显式声明(最高优先,声明时刻=
+    // 人工把关) + 两级目录注册项(经 REST 注册审批闸口 active + blake3 哈希钉死,
+    // 失配自动降级)。声明解析失败/目录级失败/账本损坏 = 拒构造(fail-visible,
+    // H 族门禁不可静默降级);单 skill 不合格由扫描器跳过 + warn,不炸会话创建。
+    let declared_skills = match crate::api::serve_tools::resolve_declared_skills(&def) {
+        Ok(declared) => declared.unwrap_or_default(),
+        Err(e) => {
+            error!(
+                agent_type = %agent_type,
+                error = %e,
+                "skills declaration invalid; rejecting runner construction"
+            );
+            return None;
+        }
+    };
+    let merged_skills = match crate::api::skill_api::merged_manifest_for_session(state, declared_skills)
+    {
+        Ok((manifest, _registry_path)) => manifest,
+        Err(e) => {
+            error!(
+                agent_type = %agent_type,
+                error = %e,
+                "skills scan/merge failed; rejecting runner construction"
+            );
+            return None;
+        }
+    };
+    let resolved_skills = match crate::api::serve_tools::wire_skills(&mut filtered, Some(merged_skills))
+    {
         Ok(skills) => skills,
         Err(e) => {
             error!(

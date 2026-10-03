@@ -967,8 +967,12 @@ impl AgentRunner {
         let config = def.to_agent_config();
 
         // B2:skills 声明接线(read_skill 注册 + manifest 槽位源;声明时刻=
-        // 人工把关,路径由系统解析,LLM 无法用 read_skill 读任意文件)
-        let resolved_skills = crate::api::serve_tools::wire_skills(&mut tool_handler, &def)
+        // 人工把关,路径由系统解析,LLM 无法用 read_skill 读任意文件)。
+        // C 形态后 CLI 直启路径仍为纯声明面(不扫目录——serve 会话创建路径
+        // 才做两源合并,见 skill_api::merged_manifest_for_session)
+        let declared_skills = crate::api::serve_tools::resolve_declared_skills(&def)
+            .map_err(AgentError::Internal)?;
+        let resolved_skills = crate::api::serve_tools::wire_skills(&mut tool_handler, declared_skills)
             .map_err(AgentError::Internal)?;
 
         // 2. 校验:def.tools 全部已在 tool_handler 注册
