@@ -402,6 +402,8 @@ async fn test_sediment_rollup_marks_old_summaries_as_rolled_up() {
         memory: &mut memory,
         summarizer: Some(&summarizer),
         extractor: None,
+        // O-243 事件证据链账本(测试不落盘)
+        event_store: None,
     };
     let messages = vec![Message::User {
         content: "some conversation".to_string(),
