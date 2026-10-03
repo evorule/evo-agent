@@ -1041,10 +1041,18 @@ impl AgentRunner {
         // C1:自动构造 EventExtractor(memory 启用时)
         // extractor 在 sediment_session() 中被借用做事件提取(C1 阶段占位)
         if def.memory.memory_type != "none" {
-            let config = ExtractionConfig {
+            let mut config = ExtractionConfig {
                 extraction_model: def.memory.extraction_model.clone(),
                 ..Default::default()
             };
+            // O-246:触发词配置接线——配置面宣称「可被 agent.json 覆盖」自此成立
+            // （None=沿用内置默认表,既有 agent 配置零影响）
+            if let Some(kws) = &def.memory.extraction_keywords {
+                config.keywords = kws.clone();
+            }
+            if let Some(phrases) = &def.memory.extraction_explicit_phrases {
+                config.explicit_phrases = phrases.clone();
+            }
             let extractor = EventExtractor::new(runner.llm_handler.clone(), config);
             runner.extractor = Some(extractor);
         }
@@ -1720,7 +1728,9 @@ impl AgentRunner {
             // G6:取消检查(event 边界 — 即使 LLM 调用已返回,也在此处响应取消)
             if self.cancel_token.is_cancelled() {
                 info!(%session_id, "Cancellation requested at event boundary, cleaning up");
-                let _ = self.flush_messages(&session_id).await;
+                if let Err(e) = self.flush_messages(&session_id).await {
+                    tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                }
                 self.submit_tool_traces(&session_id).await;
                 let duration = start_time.elapsed().as_millis() as u64;
                 return Ok(AgentResult::cancelled(
@@ -1774,7 +1784,9 @@ impl AgentRunner {
                                         )
                                         .await;
                                 }
-                                let _ = self.flush_messages(&session_id).await;
+                                if let Err(e) = self.flush_messages(&session_id).await {
+                                tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                            }
                                 self.submit_tool_traces(&session_id).await;
                                 return Err(e);
                             }
@@ -1792,7 +1804,9 @@ impl AgentRunner {
                                     )
                                     .await;
                             }
-                            let _ = self.flush_messages(&session_id).await;
+                            if let Err(e) = self.flush_messages(&session_id).await {
+                                tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                            }
                             self.submit_tool_traces(&session_id).await;
                             let duration = start_time.elapsed().as_millis() as u64;
                             return Ok(AgentResult::error(
@@ -1923,7 +1937,9 @@ impl AgentRunner {
                     }
 
                     // 错误返回前尝试刷写缓冲消息（best-effort，忽略 flush 错误）
-                    let _ = self.flush_messages(&session_id).await;
+                    if let Err(e) = self.flush_messages(&session_id).await {
+                        tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                    }
                     // C1:会话沉淀（best-effort，即使出错也尝试沉淀已收集的对话）
                     let _ = self.sediment_session(&session_id, &messages, None).await;
                     self.submit_tool_traces(&session_id).await;
@@ -1950,7 +1966,9 @@ impl AgentRunner {
                         %reason,
                         "enforce 拦截：违规指令被拒绝执行（D-01：一票否决，不重试）"
                     );
-                    let _ = self.flush_messages(&session_id).await;
+                    if let Err(e) = self.flush_messages(&session_id).await {
+                        tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                    }
                     let _ = self.sediment_session(&session_id, &messages, None).await;
                     self.submit_tool_traces(&session_id).await;
                     let duration = start_time.elapsed().as_millis() as u64;
@@ -1969,7 +1987,9 @@ impl AgentRunner {
         let duration = start_time.elapsed().as_millis() as u64;
         info!(%session_id, step_count, duration_ms = duration, "SSE event loop ended (stream closed)");
         // 流关闭前也尝试刷写
-        let _ = self.flush_messages(&session_id).await;
+        if let Err(e) = self.flush_messages(&session_id).await {
+            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+        }
         self.submit_tool_traces(&session_id).await;
         // D-01 二次保险（B2）：断流可能吞掉 Violation 帧，查 evolution-signals
         // 兜底归因 enforce 命中；查询不可用时降级返回原错误（不掩盖不阻塞）。
@@ -3056,7 +3076,7 @@ impl AgentRunner {
             .map_err(AgentError::ToolError)
     }
 
-    async fn auto_recall(&self, session_id: &str) -> Result<Vec<u64>, AgentError> {
+    async fn auto_recall(&mut self, session_id: &str) -> Result<Vec<u64>, AgentError> {
         // B5/D3：限定本 namespace（旧实现 `shared.` 跨 namespace 越权读）
         let prefix = format!("shared.{}.", self.sediment_config.namespace);
         let shared_facts = self.evorule_client.get_shared_facts(Some(&prefix)).await?;
@@ -3086,8 +3106,9 @@ impl AgentRunner {
 
         info!(%session_id, fact_count = recalled_ids.len(), "Auto-recalled shared facts");
 
-        if let Some(memory) = self.memory.as_ref() {
-            let mut mem = memory.clone();
+        if let Some(mem) = self.memory.as_mut() {
+            // O-250:直写主体 cache——原实现 clone 后写,server 有写但主体
+            // cache 永不含该条目(靠 B3 对账回填,对账前视图不一致)
             mem.set("auto_recall_context", &recalled_content).await?;
         }
 
@@ -3625,7 +3646,9 @@ impl AgentRunner {
                     },
                     _ = cancel_token.cancelled() => {
                         info!("Cancellation requested during streaming, cleaning up");
-                        let _ = runner.flush_messages(&session_id).await;
+                        if let Err(e) = runner.flush_messages(&session_id).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                        }
                         runner.submit_tool_traces(&session_id).await;
                         let duration = start_time.elapsed().as_millis() as u64;
                         // B21:turn_ended(cancelled)
@@ -3659,7 +3682,9 @@ impl AgentRunner {
                             if let Some(g) = turn_guard.take() {
                                 g.end("error", step_count as u64, duration);
                             }
-                            let _ = runner.flush_messages(&session_id).await;
+                            if let Err(e) = runner.flush_messages(&session_id).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                        }
                             runner.submit_tool_traces(&session_id).await;
                             yield Ok(AgentEvent::Done(AgentResult::error(
                                 format!("Max steps exceeded: {}", runner.config.max_steps),
@@ -3672,7 +3697,9 @@ impl AgentRunner {
 
                         // PerReactRound:处理前刷写上一轮缓冲的消息
                         if matches!(runner.message_persist_mode, MessagePersistMode::PerReactRound) {
-                            let _ = runner.flush_messages(&session_id).await;
+                            if let Err(e) = runner.flush_messages(&session_id).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                        }
                         }
 
                         let io_type = event.payload.get("io_type").and_then(|v| v.as_str()).unwrap_or("");
@@ -3720,7 +3747,9 @@ impl AgentRunner {
                                             if let Some(g) = turn_guard.take() {
                                                 g.end("error", step_count as u64, duration);
                                             }
-                                            let _ = runner.flush_messages(&session_id).await;
+                                            if let Err(e) = runner.flush_messages(&session_id).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                        }
                                             runner.submit_tool_traces(&session_id).await;
                                             yield Ok(AgentEvent::Done(AgentResult::error(
                                                 err.to_string(), step_count, duration,
@@ -3836,7 +3865,9 @@ impl AgentRunner {
                                                     )
                                                     .await;
                                             }
-                                            let _ = runner.flush_messages(&session_id).await;
+                                            if let Err(e) = runner.flush_messages(&session_id).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                        }
                                             runner.submit_tool_traces(&session_id).await;
                                             let duration = start_time.elapsed().as_millis() as u64;
                                             // B21:turn_ended(cancelled)
@@ -3923,7 +3954,9 @@ impl AgentRunner {
                                             if let Some(g) = turn_guard.take() {
                                                 g.end("error", step_count as u64, duration);
                                             }
-                                            let _ = runner.flush_messages(&session_id).await;
+                                            if let Err(e) = runner.flush_messages(&session_id).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                        }
                                             runner.submit_tool_traces(&session_id).await;
                                             yield Ok(AgentEvent::Done(AgentResult::error(
                                                 err.to_string(), step_count, duration,
@@ -4289,7 +4322,9 @@ impl AgentRunner {
                                             let _ = j.tool_result(cid, "error", &e.to_string());
                                         }
                                         let duration = start_time.elapsed().as_millis() as u64;
-                                        let _ = runner.flush_messages(&session_id).await;
+                                        if let Err(e) = runner.flush_messages(&session_id).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                        }
                                         runner.submit_tool_traces(&session_id).await;
                                         // B21:turn_ended(error,优雅终止路径显式收尾)
                                         if let Some(g) = turn_guard.take() {
@@ -4383,7 +4418,9 @@ impl AgentRunner {
                     }
                     "Stable" => {
                         let duration = start_time.elapsed().as_millis() as u64;
-                        let _ = runner.flush_messages(&session_id).await;
+                        if let Err(e) = runner.flush_messages(&session_id).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                        }
                         // C1:会话沉淀（best-effort，摘要+稳定事实→共享空间）
                         let _ = runner.sediment_session(&session_id, &messages, journal.as_deref()).await;
                         // R2-T04 链体积观测（B3）：会话收尾时 best-effort 查审计链长告警
@@ -4429,7 +4466,9 @@ impl AgentRunner {
                             continue;
                         }
                         let duration = start_time.elapsed().as_millis() as u64;
-                        let _ = runner.flush_messages(&session_id).await;
+                        if let Err(e) = runner.flush_messages(&session_id).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                        }
                         // C1:会话沉淀（best-effort，即使出错也尝试沉淀已收集的对话）
                         let _ = runner.sediment_session(&session_id, &messages, journal.as_deref()).await;
                         runner.submit_tool_traces(&session_id).await;
@@ -4452,7 +4491,9 @@ impl AgentRunner {
                             .unwrap_or("(no reason)");
                         warn!(%session_id, rule_index, %reason, "enforce 拦截（流式路径）：违规指令被拒绝执行");
                         let duration = start_time.elapsed().as_millis() as u64;
-                        let _ = runner.flush_messages(&session_id).await;
+                        if let Err(e) = runner.flush_messages(&session_id).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                        }
                         let _ = runner.sediment_session(&session_id, &messages, journal.as_deref()).await;
                         runner.submit_tool_traces(&session_id).await;
                         // B21:turn_ended(error)
@@ -4473,7 +4514,9 @@ impl AgentRunner {
 
             // 事件流关闭
             let duration = start_time.elapsed().as_millis() as u64;
-            let _ = runner.flush_messages(&session_id).await;
+            if let Err(e) = runner.flush_messages(&session_id).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "O-248: flush_messages failed; buffered messages not yet persisted");
+                        }
             runner.submit_tool_traces(&session_id).await;
             // B21:turn_ended(error)
             if let Some(g) = turn_guard.take() {

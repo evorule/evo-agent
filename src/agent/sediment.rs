@@ -129,7 +129,12 @@ pub async fn sediment(
                     .write_shared_summary(session_id, &out.summary)
                     .await
                 {
-                    Ok(_) => result.summary_written = true,
+                    // O-248②:CacheOnly 不计入 summary_written（防虚报；B3 对账补偿）
+                    Ok(PersistOutcome::Persisted) => result.summary_written = true,
+                    Ok(PersistOutcome::CacheOnly) => tracing::warn!(
+                        session_id = %session_id,
+                        "sediment: summary persisted cache-only; not counted as written"
+                    ),
                     Err(e) => tracing::warn!(error = %e, "sediment: write summary failed"),
                 }
 
