@@ -20,11 +20,11 @@ description: evorule 仓 git 提交与推送纪律——commit 身份固定、�
 ## 推送纪律
 
 4. **推送前密钥检查**：推送任何远端之前，必须对本仓所有 `.env` 文件运行
-   `D:\evorule\scripts\check-push-secret-safety.ps1`（逐个 env 文件传参），
+   `evorule 仓 scripts/check-push-secret-safety.ps1`（逐个 env 文件传参），
    确认 PASS 后方可推送；有命中立即停止并上报。
 5. **双推**：先推 Gitee（remote 名 `origin`），再推 GitHub（remote 名 `github`）。
 6. **CI 检绿**：推送完成后必须检查远端 CI 是否全绿（可用
-   `D:\evorule\scripts\check-ci-green.ps1`，按 HEAD sha 轮询）；
+   `evorule 仓 scripts/check-ci-green.ps1`，按 HEAD sha 轮询）；
    存在红灯必须修复为绿，任务方算完成；检查超时可改用 GitHub API 直查兜底。
 7. **镜像重试**：GitHub 推送偶发失败可隔几分钟重试，一般 2-5 次内成功；仍失败则放置待办。
 

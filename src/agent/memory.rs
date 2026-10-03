@@ -966,7 +966,7 @@ impl MemoryManager {
     /// - 不做域准入拒绝（调用方即受信管道，域由调用方构造的 key 声明）；
     /// - `source` 必填，由系统按通道生成（如 `llm:{model}` / `system:rollup`），
     ///   **不接受调用方之外的来源声明**；
-    /// - 返回 [`PersistOutcome`]（O-245）：调用方可程序化区分 Persisted/CacheOnly，
+    /// - 返回 [`PersistOutcome`]：调用方可程序化区分 Persisted/CacheOnly，
     ///   CacheOnly 仅本地 cache、由 B3 对账（`verify_cache_against_server`）补偿，
     ///   不作为 Err 中断受信管道（与 [`Self::set_scoped`] 同契约）。
     pub(crate) async fn set_scoped_with_source(
@@ -989,7 +989,7 @@ impl MemoryManager {
         let cache_key = self.cache_key_for(&scope, key);
         self.cache.insert(cache_key, record.clone());
 
-        // O-245:受信通道返回 PersistOutcome 供调用方区分（与 set() 同契约）
+        // 受信通道返回 PersistOutcome 供调用方区分（与 set() 同契约）
         let session_id = self.session_id_for_scope(&scope)?;
         let path = self.build_path_scoped(&scope, key);
         let payload_value = serde_json::to_value(&record)?;
@@ -1309,7 +1309,7 @@ impl MemoryManager {
 
     /// 清空所有 cache（仅本地，不删除 evorule 中的数据）
     ///
-    /// O-244 修复：原实现对 cache 内部键逐条调 [`Self::remove`]——cache 键是
+    /// 修复：原实现对 cache 内部键逐条调 [`Self::remove`]——cache 键是
     /// [`Self::cache_key_for`] 产物（已含 scope 前缀），再经 remove 的 scope 化
     /// 会二次拼接生成错误路径（如 `session_{sid}::shared::topic`），向 evorule
     /// 写 null 墓碑（payload 污染+审计噪声，违反本方法「仅本地」契约）；
@@ -1565,7 +1565,7 @@ impl MemoryManager {
 
     /// 批量追加消息（EveryN/PerReactRound 模式）
     ///
-    /// O-247 诚实契约：**当前为循环逐条写入**（每条一次 HTTP）——server 端
+    /// 诚实契约：**当前为循环逐条写入**（每条一次 HTTP）——server 端
     /// 暂无批量 payload 端点，本方法不减少 HTTP 往返；中途失败时前面已写、
     /// 后面丢弃（无原子性），调用方依赖 B3 对账兜底。批量端点就绪后本方法
     /// 是唯一改造点。
