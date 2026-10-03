@@ -69,6 +69,8 @@ pub struct DelegateContext {
     pub toolkit: Option<ToolHandler>,
     /// 工作目录（能力边界合成用；随 toolkit 成对注入）
     pub workdir: Option<std::path::PathBuf>,
+    /// O-275:journal 目录（Some = 子代理落 journal；serve 面从 workbench config 取）
+    pub journal_dir: Option<std::path::PathBuf>,
 }
 
 impl DelegateContext {
@@ -88,7 +90,14 @@ impl DelegateContext {
             token_counter: None,
             toolkit: None,
             workdir: None,
+            journal_dir: None,
         }
+    }
+
+    /// O-275:注入 journal 目录（serve 面从 workbench config 取）
+    pub fn with_journal_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.journal_dir = Some(dir);
+        self
     }
 
     /// 注入 union toolkit + 工作目录（成对注入，随 `Clone` 延续到每个子 runner）
@@ -195,6 +204,10 @@ impl DelegateContext {
                 crate::agent::runner::AgentRunner::new(config, self.evorule_client.clone());
             if let Some(counter) = &self.token_counter {
                 runner = runner.with_token_counter(counter.clone());
+            }
+            // O-275:委托子代理 journal 步级账面接线
+            if let Some(dir) = &self.journal_dir {
+                runner = runner.with_journal_dir(dir.clone());
             }
 
             // 工具面 + 能力边界接线（对齐 serve 面 construct_runner / CLI
