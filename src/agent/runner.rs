@@ -960,11 +960,16 @@ impl AgentRunner {
     pub async fn from_definition(
         def: AgentDefinition,
         client: EvoruleApiClient,
-        tool_handler: ToolHandler,
+        mut tool_handler: ToolHandler,
         llm_handler: Option<LlmHandler>,
     ) -> Result<Self, AgentError> {
         // 1. 配置
         let config = def.to_agent_config();
+
+        // B2:skills 声明接线(read_skill 注册 + manifest 槽位源;声明时刻=
+        // 人工把关,路径由系统解析,LLM 无法用 read_skill 读任意文件)
+        let resolved_skills = crate::api::serve_tools::wire_skills(&mut tool_handler, &def)
+            .map_err(AgentError::Internal)?;
 
         // 2. 校验:def.tools 全部已在 tool_handler 注册
         // (早失败:用户能在跑之前就发现配错,而不是跑一半才挂)
@@ -1015,7 +1020,8 @@ impl AgentRunner {
         let mut runner = Self::new(config, client)
             .with_llm_handler(llm)
             .with_tool_handler(tool_handler)
-            .with_message_persist_mode(persist_mode);
+            .with_message_persist_mode(persist_mode)
+            .with_skills(resolved_skills);
         if let Some(mem) = memory {
             runner = runner.with_memory(mem);
         }
@@ -1277,6 +1283,17 @@ impl AgentRunner {
         boundary: crate::agent::definition::CapabilityBoundary,
     ) -> Self {
         self.config.capability_boundary = Some(boundary);
+        self
+    }
+
+    /// B2:注入 skills 生效清单(manifest 槽位源;None = 无技能,槽位静默跳过)。
+    /// read_skill 工具的注册在 serve_tools::wire_skills(handler 面),两者
+    /// 必须同源同批——清单来自同一次 wire_skills 返回值。
+    pub fn with_skills(
+        mut self,
+        skills: Option<Vec<crate::agent::definition::SkillManifestEntry>>,
+    ) -> Self {
+        self.config.skills = skills;
         self
     }
 
