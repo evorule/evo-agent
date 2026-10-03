@@ -973,6 +973,10 @@ impl AgentRunner {
         llm_handler: Option<LlmHandler>,
     ) -> Result<Self, AgentError> {
         // 1. 配置
+        // F-201:加载时静态宪法审查(from_definition 直构路径与 load_from_dir
+        // 门卫 4 同规则;违反=拒建,错误明示规则名)
+        def.validate_constitution()
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
         let config = def.to_agent_config();
 
         // B2:skills 声明接线(read_skill 注册 + manifest 槽位源;声明时刻=

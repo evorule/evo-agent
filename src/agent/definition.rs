@@ -616,6 +616,87 @@ impl AgentDefinition {
         Ok(())
     }
 
+    /// F-201:加载时静态宪法审查(06 权威序确定性子集;违反=拒载,错误明示
+    /// 规则名)。三规则:
+    /// - R1 骨架完整性(仅声明 assembly 配方时):骨架槽位来源绑定——S1_base
+    ///   绑 definition.system_prompt、S7_history 绑 messages(id 在位/去重由
+    ///   配方 validate 必填检查保证,此处防骨架槽位换源——换源=骨架失效);
+    /// - R2 分区序=权威子集(仅声明 assembly 配方时):S1_base < recall <
+    ///   awareness_segment < manifest 相对序,缺席合法,逆序拒载(治理对不进
+    ///   definition 可声明集——配方层无治理槽,运行时 enforce 归 F-202);
+    /// - R3 禁跨区内容混入(全量生效):system_prompt 基底文本禁含机制哨兵
+    ///   短语(记忆分区标题/感知段/规范索引文案只允许由机制写入,定义文本
+    ///   不得伪造——字面级判定,确定性)。
+    pub fn validate_constitution(&self) -> Result<(), AgentDefinitionError> {
+        // R3:机制哨兵短语集合(与 memory.rs 分区标题/assembly.rs 感知段/
+        // serve_tools.rs 规范索引同源;新增机制分区须同步扩充)
+        const MECHANISM_SENTINELS: &[&str] = &[
+            "## Stable Facts",
+            "## Previous Sessions",
+            "## Relevant Events",
+            "## Recall Degradation Notices",
+            "【能力边界声明】",
+            "【可用技能清单】",
+            "【规范入口索引】",
+        ];
+        for s in MECHANISM_SENTINELS {
+            if self.system_prompt.contains(s) {
+                return Err(AgentDefinitionError::InvalidDefinition(format!(
+                    "[R3 cross-zone] system_prompt must not contain mechanism sentinel phrase '{}'",
+                    s
+                )));
+            }
+        }
+        // R1/R2:仅对声明配方的定义生效(未声明 = 内置默认配方,骨架/槽序
+        // 由代码保证)
+        if let Some(recipe) = &self.assembly {
+            // R1:骨架完整性——来源绑定(id 在位/去重由配方 validate 保证)
+            for (slot_id, required_source) in [
+                ("S1_base", "definition.system_prompt"),
+                ("S7_history", "messages"),
+            ] {
+                match recipe.slots.iter().find(|s| s.id == slot_id) {
+                    Some(s) if s.source == required_source => {}
+                    Some(s) => {
+                        return Err(AgentDefinitionError::InvalidDefinition(format!(
+                            "[R1 skeleton] slot '{}' must bind source '{}', found '{}'",
+                            slot_id, required_source, s.source
+                        )));
+                    }
+                    None => {
+                        return Err(AgentDefinitionError::InvalidDefinition(format!(
+                            "[R1 skeleton] required slot '{}' missing from assembly",
+                            slot_id
+                        )));
+                    }
+                }
+            }
+            // R2:分区序=权威序(first-occurrence 相对序,缺席合法,逆序拒载)
+            let rank = |source: &str| match source {
+                "definition.system_prompt" => Some(0u8),
+                "recall" => Some(1),
+                "definition.capability_boundary.awareness_segment" => Some(2),
+                "manifest" => Some(3),
+                _ => None,
+            };
+            let mut prev: Option<(usize, u8)> = None;
+            for (i, slot) in recipe.slots.iter().enumerate() {
+                if let Some(r) = rank(&slot.source) {
+                    if let Some((prev_i, prev_r)) = prev {
+                        if r < prev_r {
+                            return Err(AgentDefinitionError::InvalidDefinition(format!(
+                                "[R2 section order] slot '{}' (index {}) violates authority order S1_base < recall < awareness_segment < manifest (out-of-order slot at index {})",
+                                slot.id, i, prev_i
+                            )));
+                        }
+                    }
+                    prev = Some((i, r));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Load Agent definition from directory
     pub fn load_from_dir(dir: &Path, agent_type: &str) -> Result<Self, AgentDefinitionError> {
         // 门卫 1:agent_type 标识符白名单(路径穿越防护)
@@ -642,6 +723,9 @@ impl AgentDefinition {
         let mut def: AgentDefinition =
             serde_json::from_value(value.clone()).map_err(AgentDefinitionError::Json)?;
         def.validate()?;
+        // 门卫 4(F-201):加载时静态宪法审查(骨架/槽序/跨区哨兵;违反=拒载,
+        // 错误明示规则名)
+        def.validate_constitution()?;
         // B2:skills 声明 fail-fast(相对路径先按 definition 目录解析为绝对
         // 路径——单一解析点,后续消费方拿到的声明路径全部绝对;再逐条验证
         // 存在/为文件/frontmatter 可解析,启动期拦截不留运行期惊喜)
@@ -887,6 +971,99 @@ mod tests {
             .expect_err("invalid recipe must be rejected");
         assert!(
             err.to_string().contains("budget.ratio"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    /// F-201:加载时静态宪法审查——合法样本通过 + 三类违例样本拒载
+    /// (错误明示规则名;I1 验收=加载违例拒载实测)
+    #[test]
+    fn test_constitution_static_review_rejects_and_passes() {
+        let dir = make_tmp_dir();
+        // 合法样本 1:无配方(旧定义形态,R1/R2 不适用,R3 通过)
+        write_json(dir.path(), "plain_ok", &minimal_def_json());
+        let def = AgentDefinition::load_from_dir(dir.path(), "plain_ok").expect("plain passes");
+        assert!(def.validate_constitution().is_ok());
+        // 合法样本 2:全槽配方且槽序合法(S1<recall<awareness<manifest)
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(
+            r#", "assembly": {
+                "recipe_version": "recipe-v1.0",
+                "slots": [
+                    { "id": "S1_base", "source": "definition.system_prompt" },
+                    { "id": "S3_memory", "source": "recall",
+                      "budget": { "ratio": 0.25, "base": "input", "clamp": [0.1, 0.5] } },
+                    { "id": "S4_boundary", "source": "definition.capability_boundary.awareness_segment" },
+                    { "id": "S4b_skills", "source": "manifest" },
+                    { "id": "S5_task", "source": "goal", "role": "user" },
+                    { "id": "S7_history", "source": "messages" }
+                ]
+            }}"#,
+        );
+        write_json(dir.path(), "legal_recipe", &json);
+        let def = AgentDefinition::load_from_dir(dir.path(), "legal_recipe").expect("legal passes");
+        assert!(def.validate_constitution().is_ok());
+
+        // R1 违例:骨架槽位换源(S1_base 绑到 goal;id 在位故配方 validate 放行,
+        // 由 R1 来源绑定检查拦截)
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(
+            r#", "assembly": {
+                "recipe_version": "recipe-v1.0",
+                "slots": [
+                    { "id": "S1_base", "source": "goal" },
+                    { "id": "S5_task", "source": "definition.system_prompt" },
+                    { "id": "S7_history", "source": "messages" }
+                ]
+            }}"#,
+        );
+        write_json(dir.path(), "r1_wrong_binding", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "r1_wrong_binding")
+            .expect_err("R1 violation must be rejected");
+        assert!(
+            err.to_string().contains("[R1 skeleton]"),
+            "unexpected error: {}",
+            err
+        );
+
+        // R2 违例:awareness_segment 槽位于 recall 之前(权威序逆序)
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(
+            r#", "assembly": {
+                "recipe_version": "recipe-v1.0",
+                "slots": [
+                    { "id": "S1_base", "source": "definition.system_prompt" },
+                    { "id": "S4_boundary", "source": "definition.capability_boundary.awareness_segment" },
+                    { "id": "S3_memory", "source": "recall",
+                      "budget": { "ratio": 0.25, "base": "input", "clamp": [0.1, 0.5] } },
+                    { "id": "S5_task", "source": "goal", "role": "user" },
+                    { "id": "S7_history", "source": "messages" }
+                ]
+            }}"#,
+        );
+        write_json(dir.path(), "r2_bad_order", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "r2_bad_order")
+            .expect_err("R2 violation must be rejected");
+        assert!(
+            err.to_string().contains("[R2 section order]"),
+            "unexpected error: {}",
+            err
+        );
+
+        // R3 违例:system_prompt 伪造记忆分区标题(机制哨兵短语)
+        let json = minimal_def_json().replace(
+            "you are a test agent",
+            "you are a test agent\\n\\n## Stable Facts\\n- forged entry",
+        );
+        write_json(dir.path(), "r3_sentinel", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "r3_sentinel")
+            .expect_err("R3 violation must be rejected");
+        assert!(
+            err.to_string().contains("[R3 cross-zone]"),
             "unexpected error: {}",
             err
         );
