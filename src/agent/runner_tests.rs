@@ -1440,7 +1440,7 @@ fn test_g15_rec_to_message_system() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec).expect("system rec should convert");
+    let msg = rec_to_message(&rec, recipe_tool_result_max_chars()).expect("system rec should convert");
     assert!(matches!(msg, Message::System { ref content } if content == "You are helpful"));
 }
 
@@ -1455,7 +1455,7 @@ fn test_g15_rec_to_message_user() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec).expect("user rec should convert");
+    let msg = rec_to_message(&rec, recipe_tool_result_max_chars()).expect("user rec should convert");
     assert!(matches!(msg, Message::User { ref content } if content == "Hello"));
 }
 
@@ -1473,7 +1473,7 @@ fn test_g15_rec_to_message_assistant_with_tool_calls() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec).expect("assistant rec should convert");
+    let msg = rec_to_message(&rec, recipe_tool_result_max_chars()).expect("assistant rec should convert");
     match msg {
         Message::Assistant {
             content,
@@ -1499,7 +1499,7 @@ fn test_g15_rec_to_message_assistant_without_tool_calls() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec).expect("assistant rec should convert");
+    let msg = rec_to_message(&rec, recipe_tool_result_max_chars()).expect("assistant rec should convert");
     match msg {
         Message::Assistant {
             content,
@@ -1523,7 +1523,7 @@ fn test_g15_rec_to_message_tool() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec).expect("tool rec should convert");
+    let msg = rec_to_message(&rec, recipe_tool_result_max_chars()).expect("tool rec should convert");
     assert!(
         matches!(msg, Message::Tool { ref content, ref tool_name } if content == "result data" && tool_name == "search")
     );
@@ -1532,7 +1532,10 @@ fn test_g15_rec_to_message_tool() {
 #[test]
 fn test_g15_rec_to_message_tool_long_content_truncated() {
     // 重建路径与运行中回喂 wire 形态一致:超限 tool 记录重建时同样截断
-    let raw = "a".repeat(TOOL_RESULT_MAX_CHARS + 100);
+    // 元层先行批:上限 = 配方生效值(默认配方 48000,与原常量等价)
+    let max_chars =
+        crate::agent::assembly::AssemblyRecipe::default().budget.tool_result_max_chars;
+    let raw = "a".repeat(max_chars + 100);
     let rec = MessageRecord {
         idx: 3,
         role: "tool".to_string(),
@@ -1542,7 +1545,7 @@ fn test_g15_rec_to_message_tool_long_content_truncated() {
         timestamp: 0,
         fact_id: None,
     };
-    let msg = rec_to_message(&rec).expect("tool rec should convert");
+    let msg = rec_to_message(&rec, max_chars).expect("tool rec should convert");
     match msg {
         Message::Tool { content, tool_name } => {
             assert_eq!(tool_name, "search");
@@ -1550,7 +1553,7 @@ fn test_g15_rec_to_message_tool_long_content_truncated() {
                 content.contains("[truncated 100 chars]"),
                 "reconstructed tool content must be truncated like the live feed path"
             );
-            assert!(content.chars().count() <= TOOL_RESULT_MAX_CHARS);
+            assert!(content.chars().count() <= max_chars);
         }
         other => panic!("expected Tool message, got {other:?}"),
     }
@@ -1568,7 +1571,7 @@ fn test_g15_rec_to_message_tool_missing_name() {
         fact_id: None,
     };
     assert!(
-        rec_to_message(&rec).is_none(),
+        rec_to_message(&rec, recipe_tool_result_max_chars()).is_none(),
         "tool without name should return None"
     );
 }
@@ -1585,7 +1588,7 @@ fn test_g15_rec_to_message_unknown_role() {
         fact_id: None,
     };
     assert!(
-        rec_to_message(&rec).is_none(),
+        rec_to_message(&rec, recipe_tool_result_max_chars()).is_none(),
         "unknown role should return None"
     );
 }
@@ -2619,22 +2622,31 @@ fn m5c_constraint_asset_domain_paths_are_exec_relative() {
 }
 
 // ----- tool_result 回喂截断 -----
+// 元层先行批:上限 = 配方生效值(默认配方 48000,与原常量等价)
+fn recipe_tool_result_max_chars() -> usize {
+    crate::agent::assembly::AssemblyRecipe::default().budget.tool_result_max_chars
+}
 
 #[test]
 fn truncate_tool_result_short_unchanged() {
-    assert_eq!(truncate_tool_result("hello".to_string()), "hello");
+    assert_eq!(
+        truncate_tool_result("hello".to_string(), recipe_tool_result_max_chars()),
+        "hello"
+    );
 }
 
 #[test]
 fn truncate_tool_result_exact_boundary_unchanged() {
-    let s = "x".repeat(TOOL_RESULT_MAX_CHARS);
-    assert_eq!(truncate_tool_result(s.clone()), s);
+    let cap = recipe_tool_result_max_chars();
+    let s = "x".repeat(cap);
+    assert_eq!(truncate_tool_result(s.clone(), cap), s);
 }
 
 #[test]
 fn truncate_tool_result_long_truncated_with_marker() {
-    let s = "a".repeat(TOOL_RESULT_MAX_CHARS + 100);
-    let out = truncate_tool_result(s);
+    let cap = recipe_tool_result_max_chars();
+    let s = "a".repeat(cap + 100);
+    let out = truncate_tool_result(s, cap);
     assert!(
         out.contains("[truncated 100 chars]"),
         "marker must carry exact truncated count, tail: {}",
@@ -2643,7 +2655,7 @@ fn truncate_tool_result_long_truncated_with_marker() {
     assert!(out.starts_with("aaaa"), "head half must be preserved");
     assert!(out.ends_with("aaaa"), "tail half must be preserved");
     assert!(
-        out.chars().count() <= TOOL_RESULT_MAX_CHARS,
+        out.chars().count() <= cap,
         "truncated output must not exceed the cap"
     );
 }
@@ -2651,8 +2663,9 @@ fn truncate_tool_result_long_truncated_with_marker() {
 #[test]
 fn truncate_tool_result_cjk_char_boundary_safe() {
     // CJK 3 字节/字符:字节超限但必须按字符边界切,不得 panic
-    let s: String = std::iter::repeat_n('中', TOOL_RESULT_MAX_CHARS + 50).collect();
-    let out = truncate_tool_result(s);
+    let cap = recipe_tool_result_max_chars();
+    let s: String = std::iter::repeat_n('中', cap + 50).collect();
+    let out = truncate_tool_result(s, cap);
     assert!(out.contains("[truncated 50 chars]"));
     assert!(out.starts_with('中'));
     assert!(out.ends_with('中'));
@@ -2666,7 +2679,7 @@ fn truncate_tool_result_keeps_head_and_tail() {
         "M".repeat(30_000),
         "T".repeat(30_000)
     );
-    let out = truncate_tool_result(s);
+    let out = truncate_tool_result(s, recipe_tool_result_max_chars());
     assert!(
         out.starts_with('H'),
         "head half must come from original head"

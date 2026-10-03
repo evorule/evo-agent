@@ -53,27 +53,31 @@ pub const DEFAULT_MAX_DELEGATE_DEPTH: usize = 3;
 /// 数十至数百条；10,000 条 = 超长会话（多轮重试/长循环）的异常增长信号。
 const CHAIN_SIZE_WARN_ENTRIES: u64 = 10_000;
 
-/// tool_result 回喂 LLM 前的字符上限(约 12k tokens,ASCII 口径)
+/// tool_result 回喂 LLM 前的默认字符上限已配方化
+/// (AssemblyRecipe::default() budget.tool_result_max_chars = 48000,约 12k
+/// tokens,ASCII 口径)
 ///
 /// 单个超大工具输出(整页网页、长日志等)会挤占上下文预算,连带把任务锚点
 /// 从尾部保留区挤出。截断仅作用于回喂 LLM 的 messages 入列值;审计链
 /// persist_message / ToolResult 事件保留原始全文(事实记录不动,与 trim
-/// 不改写原 messages 的哲学一致)。
-const TOOL_RESULT_MAX_CHARS: usize = 48_000;
+/// 不改写原 messages 的哲学一致)。生效值见 `AgentRunner::tool_result_max_chars`。
 
 /// 截断过长的 tool_result:保留头尾各半,中间插入截断标注;未超限原样归还
-fn truncate_tool_result(raw: String) -> String {
+///
+/// 元层先行批:上限由配方 budget.tool_result_max_chars 声明(默认 48000 =
+/// 原 TOOL_RESULT_MAX_CHARS 常量,等价迁移)
+fn truncate_tool_result(raw: String, max_chars: usize) -> String {
     // 字节长度快路径(字符数 ≤ 字节数,未超字节限必然未超字符限)
-    if raw.len() <= TOOL_RESULT_MAX_CHARS {
+    if raw.len() <= max_chars {
         return raw;
     }
     let total_chars = raw.chars().count();
-    if total_chars <= TOOL_RESULT_MAX_CHARS {
+    if total_chars <= max_chars {
         return raw;
     }
-    let truncated = total_chars - TOOL_RESULT_MAX_CHARS;
+    let truncated = total_chars - max_chars;
     let marker = format!("\n...[truncated {} chars]...\n", truncated);
-    let keep = TOOL_RESULT_MAX_CHARS.saturating_sub(marker.chars().count());
+    let keep = max_chars.saturating_sub(marker.chars().count());
     let head = keep / 2;
     let tail = keep - head;
     let head_str: String = raw.chars().take(head).collect();
@@ -109,6 +113,9 @@ pub struct AgentConfig {
     /// M5-a:生效能力边界声明(serve/CLI 层注入;None = 调用方未注入,
     /// 会话无边界段与边界事实——缺省定义行为同 v1.0)
     pub capability_boundary: Option<crate::agent::definition::CapabilityBoundary>,
+    /// 元层先行批:组装配方(None = 内置默认配方 = 现状行为;from_definition
+    /// 会把 memory_budget_ratio 合入默认配方的 S3 槽位,保持既有配置语义)
+    pub assembly: Option<crate::agent::assembly::AssemblyRecipe>,
 }
 
 impl Default for AgentConfig {
@@ -125,6 +132,7 @@ impl Default for AgentConfig {
             output_format: None,
             max_parallel_tools: 1,
             capability_boundary: None,
+            assembly: None,
         }
     }
 }
@@ -783,10 +791,13 @@ pub struct AgentRunner {
     sediment_config: sediment::SedimentConfig,
     /// C3:总上下文窗口 token 数（由 `def.context_window_tokens` 构造，默认 8192）
     ///
-    /// 与 `memory_budget_ratio` 一起构造 `ContextBudget`，控制记忆区占比。
+    /// 作为记忆区预算基准传入 `AssemblyExecutor::assemble`（配方的
+    /// `base: total_window` 声明所指的总窗口）。
     max_context_tokens: usize,
-    /// C3:记忆区占窗口比例（由 `def.memory.memory_budget_ratio` 构造，默认 0.25）
-    memory_budget_ratio: f32,
+    /// 元层先行批:组装执行器(配方驱动的单一组装出口;run/流式两组装点共用)
+    assembly: crate::agent::assembly::AssemblyExecutor,
+    /// 工具输出回喂字符上限(配方 budget.tool_result_max_chars;默认 48000)
+    tool_result_max_chars: usize,
     /// plan-execute tokens 埋点累加器（纲领 §8 Phase 2 交付物 7，None = 不埋点）
     ///
     /// 由 [`DelegateContext::with_token_counter`] 注入并随每个子 runner 共享
@@ -843,7 +854,8 @@ impl AgentRunner {
             extractor: None,
             sediment_config: sediment::SedimentConfig::default(),
             max_context_tokens: 8192,
-            memory_budget_ratio: 0.25,
+            assembly: crate::agent::assembly::AssemblyExecutor::default_executor(),
+            tool_result_max_chars: 48_000,
             token_counter: None,
             adjudicator: tokio::sync::Mutex::new(
                 crate::agent::adjudicator::AdjudicationChannel::new(
@@ -1052,6 +1064,22 @@ impl AgentRunner {
                 ContextSummarizer::new(runner.llm_handler.clone(), Some(sm)).with_auditor(audited);
             runner = runner.with_summarizer(summarizer);
         }
+        // 元层先行批:组装执行器构造。definition 未声明 assembly 时用内置
+        // 默认配方,并把 memory_budget_ratio 合入 S3 槽位(保持既有配置语义:
+        // 默认 0.25 与配方默认等价,显式值透传);已声明配方的 ratio 以配方
+        // 为唯一权威(单一真相源,memory.memory_budget_ratio 不再生效)。
+        let recipe = def.assembly.clone().unwrap_or_else(|| {
+            let mut r = crate::agent::assembly::AssemblyRecipe::default();
+            for slot in &mut r.slots {
+                if slot.id == "S3_memory" {
+                    if let Some(b) = slot.budget.as_mut() {
+                        b.ratio = def.memory.memory_budget_ratio;
+                    }
+                }
+            }
+            r
+        });
+        let executor = crate::agent::assembly::AssemblyExecutor::new(recipe);
         // G2:自动构造 ContextWindowManager(默认 8192 token,reserve 1/4)
         // R11：默认值必须可见，不得静默——未显式设置时记忆区预算
         // = 8192 × 25% = 2,048 token，约 60-80 条即饱和并开始裁剪（实测）。
@@ -1064,16 +1092,20 @@ impl AgentRunner {
                 8192
             }
         };
-        let reserve = max_tokens / 4;
+        // 响应预留:配方 budget.reserve_for_response_pct 声明(默认 25%,
+        // 整数算术与现状 max_tokens/4 逐值等价)
+        let reserve =
+            max_tokens * executor.reserve_for_response_pct() as usize / 100;
         let ctx_mgr = ContextWindowManager::with_approx_counter(
             max_tokens,
             reserve,
             TrimStrategy::KeepSystemKeepLast,
         );
         runner = runner.with_context_window(ctx_mgr);
-        // C3:记录总窗口 token 与记忆区占比,供 run() 构造 ContextBudget
+        // C3:记录总窗口 token,供组装执行器作记忆区预算基准
         runner.max_context_tokens = max_tokens;
-        runner.memory_budget_ratio = def.memory.memory_budget_ratio;
+        runner.assembly = executor;
+        runner.tool_result_max_chars = runner.assembly.tool_result_max_chars();
 
         // G11:从 def.output_format 构造 OutputValidator
         // schema 编译失败时早失败(可控),不让用户跑一半才发现配错
@@ -1513,7 +1545,7 @@ impl AgentRunner {
             }
         }
 
-        // C2: 召回顺序修复 —— recall 在 build_system_prompt 之前
+        // C2: 召回顺序修复 —— recall 在组装之前
         let recall = match self.memory.as_ref() {
             Some(mem) => {
                 mem.recall_context(
@@ -1525,22 +1557,23 @@ impl AgentRunner {
             }
             None => crate::agent::memory::RecallContext::default(),
         };
-        let mut system_prompt = match self.memory.as_ref() {
-            Some(mem) => mem.build_system_prompt_with_recall(
+        // 元层先行批:组装执行器单一出口(run/流式两组装点收敛为同一段代码,
+        // 双路径一致性由代码结构保证;槽位序/预算比例/分隔符由配方声明)
+        let boundary_segment = self
+            .config
+            .capability_boundary
+            .as_ref()
+            .map(|b| b.awareness_segment());
+        let system_prompt = self
+            .assembly
+            .assemble(
                 &self.config.system_prompt,
+                self.memory.as_ref(),
                 &recall,
-                &crate::agent::memory::ContextBudget::new(
-                    self.max_context_tokens,
-                    self.memory_budget_ratio,
-                ),
-            ),
-            None => self.config.system_prompt.clone(),
-        };
-        // M5-a:系统级边界段注入(会话建立稳定位置;首要读者 = LLM 自知)
-        if let Some(b) = &self.config.capability_boundary {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&b.awareness_segment());
-        }
+                self.max_context_tokens,
+                boundary_segment.as_deref(),
+            )
+            .map_err(AgentError::Internal)?;
 
         // M5-a:边界声明经 create_session initial_content 既有载体进会话事实
         let boundary_json = self
@@ -2389,7 +2422,7 @@ impl AgentRunner {
         // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文(事实记录)
         let raw_content = tool_result.to_string();
         let tool_msg = Message::Tool {
-            content: truncate_tool_result(raw_content.clone()),
+            content: truncate_tool_result(raw_content.clone(), self.tool_result_max_chars),
             tool_name: tool_name.to_string(),
         };
         messages.push(tool_msg);
@@ -3125,7 +3158,7 @@ impl AgentRunner {
 
         let messages: Vec<Message> = records
             .into_iter()
-            .filter_map(|rec| rec_to_message(&rec))
+            .filter_map(|rec| rec_to_message(&rec, runner.tool_result_max_chars))
             .collect();
 
         // R3/G-3：回读滚动摘要种子——continuation/重启后缓存从账上恢复，
@@ -3290,7 +3323,7 @@ impl AgentRunner {
             let mut runner = self;
             let start_time = std::time::Instant::now();
 
-            // 1. 构造 system_prompt(同 run())
+            // 1. 构造 system_prompt(与 run() 同源:组装执行器单一出口)
             // B3: 召回前按节流间隔校验 cache 与真相源漂移（server wins 对齐）
             if let Some(mem) = runner.memory.as_mut() {
                 let drift = mem.verify_cache_if_due().await;
@@ -3301,7 +3334,7 @@ impl AgentRunner {
                 }
             }
 
-            // C2: 召回顺序修复 —— recall 在 build_system_prompt 之前
+            // C2: 召回顺序修复 —— recall 在组装之前
             let recall = match runner.memory.as_ref() {
                 Some(mem) => mem.recall_context(
                     &goal,
@@ -3310,22 +3343,26 @@ impl AgentRunner {
                 ).await,
                 None => crate::agent::memory::RecallContext::default(),
             };
-            let mut system_prompt = match runner.memory.as_ref() {
-                Some(mem) => mem.build_system_prompt_with_recall(
-                    &runner.config.system_prompt,
-                    &recall,
-                    &crate::agent::memory::ContextBudget::new(
-                        runner.max_context_tokens,
-                        runner.memory_budget_ratio,
-                    ),
-                ),
-                None => runner.config.system_prompt.clone(),
+            // 元层先行批:组装执行器单一出口(run/流式两组装点收敛为同一段
+            // 代码,双路径一致性由代码结构保证;槽位序/预算比例/分隔符由配方声明)
+            let boundary_segment = runner
+                .config
+                .capability_boundary
+                .as_ref()
+                .map(|b| b.awareness_segment());
+            let system_prompt = match runner.assembly.assemble(
+                &runner.config.system_prompt,
+                runner.memory.as_ref(),
+                &recall,
+                runner.max_context_tokens,
+                boundary_segment.as_deref(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    yield Err(AgentError::Internal(e));
+                    return;
+                }
             };
-            // M5-a:系统级边界段注入(与 run() 同口径)
-            if let Some(b) = &runner.config.capability_boundary {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(&b.awareness_segment());
-            }
 
             // 2. session:新建 或 复用(G15:continuation)
             let session_id = if let Some(id) = existing_session_id.clone() {
@@ -4003,7 +4040,10 @@ impl AgentRunner {
                                             let _ = j.tool_result(cid, "ok", &raw_content);
                                         }
                                         let tool_msg = Message::Tool {
-                                            content: truncate_tool_result(raw_content.clone()),
+                                            content: truncate_tool_result(
+                                                raw_content.clone(),
+                                                runner.tool_result_max_chars,
+                                            ),
                                             tool_name: tc.name.clone(),
                                         };
                                         messages.push(tool_msg);
@@ -4172,7 +4212,10 @@ impl AgentRunner {
                                 // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
                                 let raw_content = final_result.to_string();
                                 let tool_msg = Message::Tool {
-                                    content: truncate_tool_result(raw_content.clone()),
+                                    content: truncate_tool_result(
+                                        raw_content.clone(),
+                                        runner.tool_result_max_chars,
+                                    ),
                                     tool_name: tool_name.clone(),
                                 };
                                 messages.push(tool_msg);
@@ -4351,7 +4394,8 @@ impl AgentRunner {
 /// - 未知 role(非 system/user/assistant/tool)
 /// - assistant 的 tool_calls 反序列化失败(降级为无 tool_calls)
 /// - tool 消息缺少 tool_name
-fn rec_to_message(rec: &MessageRecord) -> Option<Message> {
+/// 元层先行批:max_chars 由调用方从配方生效值传入(runner.tool_result_max_chars)
+fn rec_to_message(rec: &MessageRecord, max_chars: usize) -> Option<Message> {
     match rec.role.as_str() {
         "system" => Some(Message::System {
             content: rec.content.clone(),
@@ -4371,7 +4415,7 @@ fn rec_to_message(rec: &MessageRecord) -> Option<Message> {
         "tool" => rec.tool_name.clone().map(|tool_name| Message::Tool {
             // 重建值同样按上限截断:continuation 恢复路径与运行中回喂的 wire
             // 形态保持一致(审计链始终存原始全文,截断仅作用于回喂 LLM 的值)
-            content: truncate_tool_result(rec.content.clone()),
+            content: truncate_tool_result(rec.content.clone(), max_chars),
             tool_name,
         }),
         other => {

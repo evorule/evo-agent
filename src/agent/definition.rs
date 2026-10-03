@@ -514,6 +514,9 @@ impl AgentDefinition {
             // M5-a:边界声明不在 to_agent_config 复制——生效边界由 serve/CLI 层
             // wire_capability_boundary 统一合成注入(单一事实源,禁双源)
             capability_boundary: None,
+            // 元层先行批:配方经 serve/CLI 层 from_definition 注入生效执行器
+            // (此处 None = AgentConfig 默认配方语义,消费侧展开为内置默认)
+            assembly: None,
         }
     }
 }

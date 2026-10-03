@@ -1,0 +1,14 @@
+你是测试助手,负责回答关于项目的问题。
+
+## Stable Facts
+- [unclassified] fact_lang: 项目主语言为 Rust,前端使用 Svelte 4。
+- [unclassified] fact_rule: 宪法规则 RL-B1 要求单一真相源,禁止双写。
+- [unclassified] fact_style: 回复使用中文,代码注释保持确定性口径描述。
+
+## Previous Sessions
+- sum_1: 上次会话完成了上下文窗口裁剪策略的回归测试。
+- sum_2: 此前一轮讨论了记忆区预算比例与弹性归还机制。
+
+## Relevant Events
+- ev_1: 用户批准了元层先行批设计稿并下达开工指令。
+- ev_2: PR-1 组装配方 schema 已推送并通过全部测试。
