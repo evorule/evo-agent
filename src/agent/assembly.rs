@@ -502,6 +502,46 @@ fn render_skills_manifest(skills: &[crate::agent::definition::SkillManifestEntry
     seg
 }
 
+/// 渲染交接底座包为 S3 槽内 "## Handoff Base" 结构化块(上下文延续归一件)
+///
+/// 确定性纯函数:字段序固定(goal→milestone→next_step→verified_facts 逐条→
+/// dead_ends 逐条),可选项缺省整行省略,空清单整节省略——同输入逐字节同输出,
+/// 适用 wire 可重建验收(完整性锚同款)。dead_ends 标注「勿重试」= 失败教训
+/// 强制回喂。
+fn render_handoff_base(h: &crate::agent::definition::HandoffPackage) -> String {
+    let mut seg = String::from("## Handoff Base\n");
+    seg.push_str("- Goal: ");
+    seg.push_str(&h.goal);
+    seg.push('\n');
+    if let Some(m) = &h.milestone_current {
+        seg.push_str("- Milestone: ");
+        seg.push_str(m);
+        seg.push('\n');
+    }
+    if let Some(n) = &h.next_step {
+        seg.push_str("- Next Step: ");
+        seg.push_str(n);
+        seg.push('\n');
+    }
+    if !h.verified_facts.is_empty() {
+        seg.push_str("- Verified Facts:\n");
+        for (i, f) in h.verified_facts.iter().enumerate() {
+            seg.push_str(&format!("  {}. {f}\n", i + 1));
+        }
+    }
+    if !h.dead_ends.is_empty() {
+        seg.push_str("- Dead Ends (do not retry):\n");
+        for (i, d) in h.dead_ends.iter().enumerate() {
+            seg.push_str(&format!("  {}. {d}\n", i + 1));
+        }
+    }
+    // 尾部收敛为单换行(与技能段同风格,拼接时统一由调用方补 "\n\n")
+    while seg.ends_with('\n') {
+        seg.pop();
+    }
+    seg
+}
+
 /// 组装执行器:配方 → system_prompt 与预算参数的**单一确定性纯函数组**
 ///
 /// 双路径一致性由代码结构保证(run/流式两组装点收敛为同一次 `assemble` 调用,
@@ -600,6 +640,7 @@ impl AssemblyExecutor {
         total_window: usize,
         boundary_segment: Option<&str>,
         skills: Option<&[crate::agent::definition::SkillManifestEntry]>,
+        handoff: Option<&crate::agent::definition::HandoffPackage>,
     ) -> Result<String, String> {
         let mut prompt = String::new();
         for slot in &self.recipe.slots {
@@ -623,7 +664,11 @@ impl AssemblyExecutor {
                 }
                 // S3_memory:记忆区(渲染机制在 MemoryManager,含 fit_recall
                 // 预算裁剪 + L2 安全审计 + 分区渲染;比例/基准由配方声明。
-                // 渲染器以「当前累积 prompt」为 base 前缀,返回 base+记忆区)
+                // 渲染器以「当前累积 prompt」为 base 前缀,返回 base+记忆区)。
+                // 槽内尾随:交接底座包 "## Handoff Base" 结构化块(确定性包=
+                // 底座层,与滚动摘要语义面分层配对;纯底座可独立续跑——
+                // memory None 而 handoff 在场时照常渲染)。底座块不占记忆
+                // 预算(结构字段完整性优先,体量小;与降级通知同口径)。
                 "recall" => {
                     if let Some(mem) = memory {
                         let budget = match slot.budget.as_ref() {
@@ -638,6 +683,18 @@ impl AssemblyExecutor {
                             ),
                         };
                         prompt = mem.build_system_prompt_with_recall(&prompt, recall, &budget);
+                    }
+                    if let Some(h) = handoff {
+                        prompt.push_str("\n\n");
+                        prompt.push_str(&render_handoff_base(h));
+                    } else if !recall.summaries.is_empty() {
+                        // 配对完整性断言(松弛实现):前会话语义面摘要注入中
+                        // 而底座包缺位=上下文延续单腿行走。warn 降级可见
+                        // (缺任一层不阻塞);反向(纯底座无摘要)合法不告警。
+                        tracing::warn!(
+                            summaries = recall.summaries.len(),
+                            "handoff pairing: session summaries present but no handoff base package declared; continuing degraded"
+                        );
                     }
                 }
                 // S4_boundary:边界段(现状 "\n\n" 前缀由配方 separator 声明)
@@ -915,7 +972,7 @@ mod tests {
 
         // 场景 1:CJK 长记忆(正常预算 8192×0.25,无降级)
         let out1 = exec
-            .assemble(base, None, None, Some(&mem), &recall, 8192, None, None)
+            .assemble(base, None, None, Some(&mem), &recall, 8192, None, None, None)
             .unwrap();
         assert_eq!(
             out1,
@@ -924,7 +981,7 @@ mod tests {
 
         // 场景 2:极端小窗口(60 token)强制降级通知
         let out2 = exec
-            .assemble(base, None, None, Some(&mem), &recall, 60, None, None)
+            .assemble(base, None, None, Some(&mem), &recall, 60, None, None, None)
             .unwrap();
         assert_eq!(
             out2,
@@ -947,6 +1004,7 @@ mod tests {
                 0,
                 Some(&boundary.awareness_segment()),
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -962,7 +1020,7 @@ mod tests {
         let exec = AssemblyExecutor::default_executor();
         // 无身份段:输出 = 基底块原样
         let out_none = exec
-            .assemble("base", None, None, None, &Default::default(), 0, None, None)
+            .assemble("base", None, None, None, &Default::default(), 0, None, None, None)
             .unwrap();
         assert_eq!(out_none, "base");
         // 有身份段:紧跟基底块("\n\n" 分隔),且在边界段之前(S1 槽序 < S4 槽序)
@@ -975,6 +1033,7 @@ mod tests {
                 &Default::default(),
                 0,
                 Some("【能力边界声明】boundary"),
+                None,
                 None,
             )
             .unwrap();
@@ -991,6 +1050,7 @@ mod tests {
                 None,
                 &Default::default(),
                 0,
+                None,
                 None,
                 None,
             )
@@ -1019,7 +1079,7 @@ mod tests {
     fn test_assemble_manifest_without_skills_not_injected() {
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble("base", None, None, None, &Default::default(), 0, None, None)
+            .assemble("base", None, None, None, &Default::default(), 0, None, None, None)
             .unwrap();
         assert_eq!(out, "base");
         assert!(!out.contains("可用技能清单"));
@@ -1052,6 +1112,7 @@ mod tests {
                 0,
                 None,
                 Some(&skills),
+                None,
             )
             .unwrap();
         assert!(out.starts_with("base\n\n"));
@@ -1081,6 +1142,7 @@ mod tests {
                 0,
                 Some("【能力边界声明】boundary"),
                 Some(&skills),
+                None,
             )
             .unwrap();
         let boundary_pos = out.find("【能力边界声明】").expect("boundary present");
@@ -1114,6 +1176,7 @@ mod tests {
                 0,
                 None,
                 Some(&skills),
+                None,
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1133,6 +1196,7 @@ mod tests {
                 0,
                 None,
                 Some(&[]),
+                None,
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1173,7 +1237,7 @@ mod tests {
 
         // 默认配方(基数=input,完全切换后口径)
         let out_input = AssemblyExecutor::new(AssemblyRecipe::default())
-            .assemble("base", None, None, Some(&mem), &recall, 8192, None, None)
+            .assemble("base", None, None, Some(&mem), &recall, 8192, None, None, None)
             .unwrap();
         // 显式兼容口径(base=total_window,历史行为)
         let mut total_recipe = AssemblyRecipe::default();
@@ -1185,7 +1249,7 @@ mod tests {
             }
         }
         let out_total = AssemblyExecutor::new(total_recipe)
-            .assemble("base", None, None, Some(&mem), &recall, 8192, None, None)
+            .assemble("base", None, None, Some(&mem), &recall, 8192, None, None, None)
             .unwrap();
 
         assert_ne!(out_input, out_total, "口径切换必须改变记忆区预算效果");
@@ -1235,6 +1299,7 @@ mod tests {
                 8192,
                 None,
                 None,
+                None,
             )
             .unwrap();
         // 新配方:加载 → validate → 字段落位
@@ -1262,7 +1327,97 @@ mod tests {
                 8192,
                 None,
                 None,
+                None,
             )
             .unwrap();
+    }
+
+    /// 交接底座包渲染:字段序固定+可选项省略+确定性(同输入逐字节同输出)
+    #[test]
+    fn test_render_handoff_base_deterministic_shape() {
+        use crate::agent::definition::HandoffPackage;
+        let full = HandoffPackage {
+            goal: "完成数据管线迁移".to_string(),
+            milestone_current: Some("阶段 2 完成".to_string()),
+            next_step: Some("跑验收测试".to_string()),
+            verified_facts: vec!["构建通过".to_string(), "单测全绿".to_string()],
+            dead_ends: vec!["方案甲:内存缓存不可回放".to_string()],
+        };
+        let out1 = render_handoff_base(&full);
+        let out2 = render_handoff_base(&full);
+        assert_eq!(out1, out2, "确定性:同输入逐字节同输出");
+        assert!(out1.starts_with("## Handoff Base
+"));
+        assert!(out1.contains("- Goal: 完成数据管线迁移
+"));
+        assert!(out1.contains("- Milestone: 阶段 2 完成
+"));
+        assert!(out1.contains("- Next Step: 跑验收测试
+"));
+        assert!(out1.contains("- Verified Facts:
+  1. 构建通过
+  2. 单测全绿
+"));
+        assert!(out1.contains("- Dead Ends (do not retry):
+  1. 方案甲:内存缓存不可回放"));
+
+        // 可选项/空清单 → 整行/整节省略(最小包只含 goal)
+        let minimal = HandoffPackage {
+            goal: "只带目标".to_string(),
+            milestone_current: None,
+            next_step: None,
+            verified_facts: Vec::new(),
+            dead_ends: Vec::new(),
+        };
+        let out3 = render_handoff_base(&minimal);
+        assert_eq!(out3, "## Handoff Base
+- Goal: 只带目标");
+        assert!(!out3.contains("Milestone"));
+        assert!(!out3.contains("Verified Facts"));
+        assert!(!out3.contains("Dead Ends"));
+    }
+
+    /// 交接底座包装配:memory 在场=记忆分区后尾随底座块;memory None=
+    /// 纯底座独立续跑;handoff None=零影响(既有组装逐字节不变)
+    #[test]
+    fn test_assemble_handoff_base_pairing() {
+        use crate::agent::definition::HandoffPackage;
+        use crate::agent::memory::{MemoryManager, MemoryRecord, RecallContext};
+        let exec = AssemblyExecutor::default_executor();
+        let handoff = HandoffPackage {
+            goal: "跨会话接续".to_string(),
+            milestone_current: Some("第 2 程".to_string()),
+            next_step: None,
+            verified_facts: vec!["F1".to_string()],
+            dead_ends: Vec::new(),
+        };
+
+        // 场景 1:memory + handoff → 底座块尾随在记忆分区之后(S3 槽内)
+        let mem = MemoryManager::new("h1", crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"));
+        let mut recall = RecallContext::default();
+        recall
+            .stable
+            .push(MemoryRecord::new("k", "稳定事实内容", 1000));
+        let out1 = exec
+            .assemble("base", None, None, Some(&mem), &recall, 8192, None, None, Some(&handoff))
+            .unwrap();
+        let stable_pos = out1.find("## Stable Facts").expect("memory section present");
+        let handoff_pos = out1.find("## Handoff Base").expect("handoff block present");
+        assert!(stable_pos < handoff_pos, "底座块尾随在记忆分区之后");
+        assert!(out1.contains("- Goal: 跨会话接续"));
+
+        // 场景 2:纯底座独立续跑(memory None)
+        let out2 = exec
+            .assemble("base", None, None, None, &RecallContext::default(), 8192, None, None, Some(&handoff))
+            .unwrap();
+        assert!(out2.contains("## Handoff Base"));
+        assert!(out2.starts_with("base"));
+
+        // 场景 3:handoff None → 零影响
+        let out3 = exec
+            .assemble("base", None, None, None, &RecallContext::default(), 8192, None, None, None)
+            .unwrap();
+        assert_eq!(out3, "base");
+        assert!(!out3.contains("Handoff Base"));
     }
 }

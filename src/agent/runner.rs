@@ -131,6 +131,9 @@ pub struct AgentConfig {
     /// F-101 北极星锚(None = 不注入;声明后 S1 槽内拼接序 = 基底块→
     /// 身份段→北极星锚——目标对焦供锚面)
     pub north_star: Option<String>,
+    /// 交接底座包(None = 不注入;声明后 S3 槽内渲染 "## Handoff Base"
+    /// 结构化块——确定性底座,与滚动摘要语义面分层配对)
+    pub handoff: Option<crate::agent::definition::HandoffPackage>,
 }
 
 impl Default for AgentConfig {
@@ -151,6 +154,7 @@ impl Default for AgentConfig {
             skills: None,
             identity_segment: None,
             north_star: None,
+            handoff: None,
         }
     }
 }
@@ -1716,6 +1720,7 @@ impl AgentRunner {
                 self.max_context_tokens,
                 boundary_segment.as_deref(),
                 self.config.skills.as_deref(),
+                self.config.handoff.as_ref(),
             )
             .map_err(AgentError::Internal)?;
 
@@ -3652,6 +3657,7 @@ impl AgentRunner {
                 runner.max_context_tokens,
                 boundary_segment.as_deref(),
                 runner.config.skills.as_deref(),
+                runner.config.handoff.as_ref(),
             ) {
                 Ok(p) => p,
                 Err(e) => {

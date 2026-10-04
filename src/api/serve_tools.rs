@@ -1217,6 +1217,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             skills: None,
             identity_segment: None,
             north_star: None,
+            handoff: None,
         }
     }
 
