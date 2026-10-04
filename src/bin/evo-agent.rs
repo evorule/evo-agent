@@ -763,7 +763,11 @@ async fn patrol_build_runner(
     let runner = AgentRunner::from_definition(def, client.clone(), tool_handler, Some(llm_handler))
         .await
         .map_err(|e| format!("bridge error: {e}"))?
-        .with_capability_boundary(capability_boundary);
+        .with_capability_boundary(capability_boundary)
+        // O-242:patrol 会话本地事件流——此前只有 server 侧审计链,本地
+        // 步级 journal 缺位。目录随 serve 约定(<workdir>/data/sessions);
+        // run_streaming_inner 打开失败 fail-soft,与 serve 同语义。
+        .with_journal_dir(workdir.join("data").join("sessions"));
     // 人工审查开合(2026-09-28):巡视为无人值守场景,决策端统一 PolicyApproval
     // (语义归一:approver="auto_policy"+判定理由必产,替换原 CliApproval{
     // auto_approve} 的 "cli-user" 语义混乱点;运行期零人工决策事件不变)
