@@ -1957,15 +1957,13 @@ impl MemoryManager {
     ///   (warn 留痕后回退——预算完整性优先,不许声明把某层排除在预算外)。
     pub(crate) fn degradation_order_override(&self) -> Option<Vec<String>> {
         let order = &self.recipe.as_ref()?.budget.degradation_order;
-        let known =
-            |l: &String| matches!(l.as_str(), "stable" | "summaries" | "events");
+        let known = |l: &String| matches!(l.as_str(), "stable" | "summaries" | "events");
         if order.len() == 3 && order.iter().all(known) {
             let mut uniq = order.clone();
             uniq.sort();
             uniq.dedup();
-            let is_default = order[0] == "stable"
-                && order[1] == "summaries"
-                && order[2] == "events";
+            let is_default =
+                order[0] == "stable" && order[1] == "summaries" && order[2] == "events";
             if uniq.len() == 3 && !is_default {
                 return Some(order.clone());
             }
@@ -4439,12 +4437,9 @@ mod tests {
         let v = |c: char| c.to_string().repeat(24); // 24 ascii chars ≈ 6 token/条
         let mk_recall = || {
             let mut r = RecallContext::default();
-            r.stable
-                .push(MemoryRecord::new("k1", &v('x'), 1000));
-            r.summaries
-                .push(MemoryRecord::new("k2", &v('y'), 2000));
-            r.events
-                .push(MemoryRecord::new("k3", &v('z'), 3000));
+            r.stable.push(MemoryRecord::new("k1", &v('x'), 1000));
+            r.summaries.push(MemoryRecord::new("k2", &v('y'), 2000));
+            r.events.push(MemoryRecord::new("k3", &v('z'), 3000));
             r
         };
 

@@ -1599,7 +1599,9 @@ impl AgentRunner {
             // F-609 执行器:生命周期规则应用(晋升/归档,Recipe 阈值)
             // (async fn 必须显式 .await——不 await 则 Future 被 drop 静默不执行)
             let recipe = memory.recipe.clone().unwrap_or_default();
-            memory.apply_lifecycle_transitions(session_id, &recipe).await;
+            memory
+                .apply_lifecycle_transitions(session_id, &recipe)
+                .await;
             let mut deps = sediment::SedimentDeps {
                 memory,
                 summarizer: self.summarizer.as_ref(),
@@ -2155,21 +2157,21 @@ impl AgentRunner {
                 }),
                 crate::agent::memory_tool::MEMORY_PROPOSE_TOOL => {
                     let p = proposer.get_or_insert_with(|| {
-                        let anchor =
-                            std::sync::Arc::new(std::sync::RwLock::new(None));
-                        let inner = std::sync::Arc::new(
-                            crate::agent::memory_tool::MemoryProposer::new(
+                        let anchor = std::sync::Arc::new(std::sync::RwLock::new(None));
+                        let inner =
+                            std::sync::Arc::new(crate::agent::memory_tool::MemoryProposer::new(
                                 self.sediment_config.namespace.clone(),
                                 self.evorule_client.clone(),
                                 std::sync::Arc::clone(&anchor),
-                            ),
-                        );
+                            ));
                         self.propose_anchor = Some(anchor);
                         inner
                     });
-                    Some(std::sync::Arc::new(
-                        crate::agent::memory_tool::MemoryProposeTool::new(std::sync::Arc::clone(p)),
-                    ) as std::sync::Arc<dyn ToolFunction>)
+                    Some(
+                        std::sync::Arc::new(crate::agent::memory_tool::MemoryProposeTool::new(
+                            std::sync::Arc::clone(p),
+                        )) as std::sync::Arc<dyn ToolFunction>,
+                    )
                 }
                 _ => None,
             };

@@ -2925,7 +2925,10 @@ fn test_register_memory_introspection_tools_happy_path() {
     mem.set_lex_store(std::sync::Arc::new(
         crate::agent::lexstore::LexStore::open(&temp_lex_db("happy")).unwrap(),
     ));
-    mem.set_recipe(make_memory_recipe_with_expose(vec!["memory_search", "memory_get"]));
+    mem.set_recipe(make_memory_recipe_with_expose(vec![
+        "memory_search",
+        "memory_get",
+    ]));
     runner.memory = Some(mem);
     runner.config.tool_names = vec!["memory_search".to_string()];
     runner.register_memory_introspection_tools().unwrap();
@@ -2949,7 +2952,10 @@ fn test_register_memory_introspection_tools_happy_path() {
 fn test_register_memory_introspection_tools_declared_but_unmet_errors() {
     // tools 声明了自省工具而暴露条件不满足(无 store/recipe)=配置矛盾,早失败
     let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
-    runner.memory = Some(crate::agent::memory::MemoryManager::new("ns", make_test_client()));
+    runner.memory = Some(crate::agent::memory::MemoryManager::new(
+        "ns",
+        make_test_client(),
+    ));
     runner.config.tool_names = vec!["memory_search".to_string()];
     let err = runner.register_memory_introspection_tools().unwrap_err();
     assert!(err.to_string().contains("exposure"));

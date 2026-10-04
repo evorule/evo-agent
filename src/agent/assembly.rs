@@ -972,7 +972,17 @@ mod tests {
 
         // 场景 1:CJK 长记忆(正常预算 8192×0.25,无降级)
         let out1 = exec
-            .assemble(base, None, None, Some(&mem), &recall, 8192, None, None, None)
+            .assemble(
+                base,
+                None,
+                None,
+                Some(&mem),
+                &recall,
+                8192,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(
             out1,
@@ -1020,7 +1030,17 @@ mod tests {
         let exec = AssemblyExecutor::default_executor();
         // 无身份段:输出 = 基底块原样
         let out_none = exec
-            .assemble("base", None, None, None, &Default::default(), 0, None, None, None)
+            .assemble(
+                "base",
+                None,
+                None,
+                None,
+                &Default::default(),
+                0,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(out_none, "base");
         // 有身份段:紧跟基底块("\n\n" 分隔),且在边界段之前(S1 槽序 < S4 槽序)
@@ -1079,7 +1099,17 @@ mod tests {
     fn test_assemble_manifest_without_skills_not_injected() {
         let exec = AssemblyExecutor::default_executor();
         let out = exec
-            .assemble("base", None, None, None, &Default::default(), 0, None, None, None)
+            .assemble(
+                "base",
+                None,
+                None,
+                None,
+                &Default::default(),
+                0,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(out, "base");
         assert!(!out.contains("可用技能清单"));
@@ -1237,7 +1267,17 @@ mod tests {
 
         // 默认配方(基数=input,完全切换后口径)
         let out_input = AssemblyExecutor::new(AssemblyRecipe::default())
-            .assemble("base", None, None, Some(&mem), &recall, 8192, None, None, None)
+            .assemble(
+                "base",
+                None,
+                None,
+                Some(&mem),
+                &recall,
+                8192,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         // 显式兼容口径(base=total_window,历史行为)
         let mut total_recipe = AssemblyRecipe::default();
@@ -1249,7 +1289,17 @@ mod tests {
             }
         }
         let out_total = AssemblyExecutor::new(total_recipe)
-            .assemble("base", None, None, Some(&mem), &recall, 8192, None, None, None)
+            .assemble(
+                "base",
+                None,
+                None,
+                Some(&mem),
+                &recall,
+                8192,
+                None,
+                None,
+                None,
+            )
             .unwrap();
 
         assert_ne!(out_input, out_total, "口径切换必须改变记忆区预算效果");
@@ -1346,20 +1396,32 @@ mod tests {
         let out1 = render_handoff_base(&full);
         let out2 = render_handoff_base(&full);
         assert_eq!(out1, out2, "确定性:同输入逐字节同输出");
-        assert!(out1.starts_with("## Handoff Base
-"));
-        assert!(out1.contains("- Goal: 完成数据管线迁移
-"));
-        assert!(out1.contains("- Milestone: 阶段 2 完成
-"));
-        assert!(out1.contains("- Next Step: 跑验收测试
-"));
-        assert!(out1.contains("- Verified Facts:
+        assert!(out1.starts_with(
+            "## Handoff Base
+"
+        ));
+        assert!(out1.contains(
+            "- Goal: 完成数据管线迁移
+"
+        ));
+        assert!(out1.contains(
+            "- Milestone: 阶段 2 完成
+"
+        ));
+        assert!(out1.contains(
+            "- Next Step: 跑验收测试
+"
+        ));
+        assert!(out1.contains(
+            "- Verified Facts:
   1. 构建通过
   2. 单测全绿
-"));
-        assert!(out1.contains("- Dead Ends (do not retry):
-  1. 方案甲:内存缓存不可回放"));
+"
+        ));
+        assert!(out1.contains(
+            "- Dead Ends (do not retry):
+  1. 方案甲:内存缓存不可回放"
+        ));
 
         // 可选项/空清单 → 整行/整节省略(最小包只含 goal)
         let minimal = HandoffPackage {
@@ -1370,8 +1432,11 @@ mod tests {
             dead_ends: Vec::new(),
         };
         let out3 = render_handoff_base(&minimal);
-        assert_eq!(out3, "## Handoff Base
-- Goal: 只带目标");
+        assert_eq!(
+            out3,
+            "## Handoff Base
+- Goal: 只带目标"
+        );
         assert!(!out3.contains("Milestone"));
         assert!(!out3.contains("Verified Facts"));
         assert!(!out3.contains("Dead Ends"));
@@ -1393,29 +1458,64 @@ mod tests {
         };
 
         // 场景 1:memory + handoff → 底座块尾随在记忆分区之后(S3 槽内)
-        let mem = MemoryManager::new("h1", crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"));
+        let mem = MemoryManager::new(
+            "h1",
+            crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),
+        );
         let mut recall = RecallContext::default();
         recall
             .stable
             .push(MemoryRecord::new("k", "稳定事实内容", 1000));
         let out1 = exec
-            .assemble("base", None, None, Some(&mem), &recall, 8192, None, None, Some(&handoff))
+            .assemble(
+                "base",
+                None,
+                None,
+                Some(&mem),
+                &recall,
+                8192,
+                None,
+                None,
+                Some(&handoff),
+            )
             .unwrap();
-        let stable_pos = out1.find("## Stable Facts").expect("memory section present");
+        let stable_pos = out1
+            .find("## Stable Facts")
+            .expect("memory section present");
         let handoff_pos = out1.find("## Handoff Base").expect("handoff block present");
         assert!(stable_pos < handoff_pos, "底座块尾随在记忆分区之后");
         assert!(out1.contains("- Goal: 跨会话接续"));
 
         // 场景 2:纯底座独立续跑(memory None)
         let out2 = exec
-            .assemble("base", None, None, None, &RecallContext::default(), 8192, None, None, Some(&handoff))
+            .assemble(
+                "base",
+                None,
+                None,
+                None,
+                &RecallContext::default(),
+                8192,
+                None,
+                None,
+                Some(&handoff),
+            )
             .unwrap();
         assert!(out2.contains("## Handoff Base"));
         assert!(out2.starts_with("base"));
 
         // 场景 3:handoff None → 零影响
         let out3 = exec
-            .assemble("base", None, None, None, &RecallContext::default(), 8192, None, None, None)
+            .assemble(
+                "base",
+                None,
+                None,
+                None,
+                &RecallContext::default(),
+                8192,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(out3, "base");
         assert!(!out3.contains("Handoff Base"));

@@ -49,9 +49,8 @@ pub const SYNTHETIC_ID_FLAG: u64 = 0x8000_0000_0000_0000;
 /// 仅用于确不入账的本地源(如技能正文索引);入账源一律用真 fact_id。
 pub fn synthetic_fact_id(path: &str) -> u64 {
     let hex = evorule_hash::digest(path.trim().as_bytes());
-    let low = u64::from_str_radix(&hex[..hex.len().min(16)], 16)
-        .unwrap_or(0)
-        & 0x7FFF_FFFF_FFFF_FFFF;
+    let low =
+        u64::from_str_radix(&hex[..hex.len().min(16)], 16).unwrap_or(0) & 0x7FFF_FFFF_FFFF_FFFF;
     low | SYNTHETIC_ID_FLAG
 }
 
@@ -130,10 +129,8 @@ fn ensure_column(
         .any(|c| c.map(|n| n == column).unwrap_or(false));
     drop(stmt);
     if !exists {
-        conn.execute_batch(&format!(
-            "ALTER TABLE {table} ADD COLUMN {column_ddl}"
-        ))
-        .map_err(|e| LexError(format!("migrate: {e}")))?;
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column_ddl}"))
+            .map_err(|e| LexError(format!("migrate: {e}")))?;
     }
     Ok(())
 }
@@ -195,7 +192,12 @@ impl LexStore {
         conn.execute_batch(SCHEMA)
             .map_err(|e| LexError(format!("schema: {e}")))?;
         // 旧库迁移:幂等补型别直证列(DEFAULT 兜底,存量行自动归类)
-        ensure_column(&conn, "facts", "source", "source TEXT NOT NULL DEFAULT 'ledger'")?;
+        ensure_column(
+            &conn,
+            "facts",
+            "source",
+            "source TEXT NOT NULL DEFAULT 'ledger'",
+        )?;
         ensure_column(
             &conn,
             "facts",
@@ -264,7 +266,7 @@ impl LexStore {
                 .map_err(|e| LexError(format!("insert posting: {e}")))?;
             }
             // F-609 落标 + P5 时间线 + P2 实体 + P3 因果：抽取器管线
-            // （从 value JSON 确定性提取，零 LLM——12 号 §四抽取器=机制）
+            // （从 value JSON 确定性提取，零 LLM——抽取器即机制本体）
             let ts = value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
             let state = value
                 .get("lifecycle_state")
@@ -506,10 +508,9 @@ impl LexStore {
                 .prepare(&sql)
                 .map_err(|e| LexError(format!("lookup: {e}")))?;
             let rows = stmt
-                .query_map(
-                    rusqlite::params_from_iter(params.iter()),
-                    |row| row.get::<_, i64>(0),
-                )
+                .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                    row.get::<_, i64>(0)
+                })
                 .map_err(|e| LexError(format!("lookup: {e}")))?;
             for id in rows {
                 *hits
@@ -686,14 +687,24 @@ mod tests {
             "shared.ns.stable.kc.k1".to_string(),
             serde_json::json!({"key": "k1", "value": "程序碎片", "timestamp": 4, "mem_type": "procedural"}),
         )];
-        store.replace_partition("shared.ns.stable.", &stable).unwrap();
-        store.replace_partition("shared.ns.events.", &events).unwrap();
+        store
+            .replace_partition("shared.ns.stable.", &stable)
+            .unwrap();
+        store
+            .replace_partition("shared.ns.events.", &events)
+            .unwrap();
         store
             .replace_partition("shared.ns.sessions.", &sessions)
             .unwrap();
 
-        assert_eq!(fact_columns(&store, 1), ("ledger".into(), "semantic".into()));
-        assert_eq!(fact_columns(&store, 2), ("ledger".into(), "episodic".into()));
+        assert_eq!(
+            fact_columns(&store, 1),
+            ("ledger".into(), "semantic".into())
+        );
+        assert_eq!(
+            fact_columns(&store, 2),
+            ("ledger".into(), "episodic".into())
+        );
         assert_eq!(fact_columns(&store, 3), ("ledger".into(), "work".into()));
 
         // 逐行覆盖压过前缀推导(策略压机制默认)——注意 replace_partition
@@ -740,8 +751,12 @@ mod tests {
             "shared.ns.procedural.skills.x".to_string(),
             serde_json::json!({"key": "x", "value": "部署完成手册", "timestamp": 3, "mem_type": "procedural"}),
         )];
-        store.replace_partition("shared.ns.stable.", &stable).unwrap();
-        store.replace_partition("shared.ns.events.", &events).unwrap();
+        store
+            .replace_partition("shared.ns.stable.", &stable)
+            .unwrap();
+        store
+            .replace_partition("shared.ns.events.", &events)
+            .unwrap();
         store
             .replace_partition("shared.ns.procedural.", &procedural)
             .unwrap();
@@ -752,11 +767,15 @@ mod tests {
             "shared.ns.procedural.".to_string(),
         ];
         // 无型别过滤:跨族候选集统一(单族旧口径结果 ⊆ 跨族结果)
-        let all = store.lookup_candidates_typed(&prefixes, "部署", 10, &[]).unwrap();
+        let all = store
+            .lookup_candidates_typed(&prefixes, "部署", 10, &[])
+            .unwrap();
         let ids: Vec<u64> = all.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&1) && ids.contains(&2) && ids.contains(&3));
         // 单族旧口径与 typed 单族无过滤逐字节一致(门禁)
-        let legacy = store.lookup_candidates("shared.ns.stable.", "部署", 10).unwrap();
+        let legacy = store
+            .lookup_candidates("shared.ns.stable.", "部署", 10)
+            .unwrap();
         let single = store
             .lookup_candidates_typed(&["shared.ns.stable.".to_string()], "部署", 10, &[])
             .unwrap();
@@ -772,7 +791,10 @@ mod tests {
             .unwrap();
         assert_eq!(pro.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![3]);
         // 空前缀集=空结果
-        assert!(store.lookup_candidates_typed(&[], "部署", 10, &[]).unwrap().is_empty());
+        assert!(store
+            .lookup_candidates_typed(&[], "部署", 10, &[])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -797,7 +819,13 @@ mod tests {
             .replace_partition("shared.ns.stable.", &facts()[..1])
             .unwrap();
         // 迁移后写入的行携带直证列默认值
-        assert_eq!(fact_columns(&store, 1), ("ledger".into(), "semantic".into()));
-        assert_eq!(store.cached_facts("shared.ns.stable.", 60).unwrap().len(), 1);
+        assert_eq!(
+            fact_columns(&store, 1),
+            ("ledger".into(), "semantic".into())
+        );
+        assert_eq!(
+            store.cached_facts("shared.ns.stable.", 60).unwrap().len(),
+            1
+        );
     }
 }
