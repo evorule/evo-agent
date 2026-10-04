@@ -34,6 +34,12 @@
 
 ---
 
+## [Unreleased]
+
+### 🆕 新增
+
+- **会话收尾知识候选提取（巩固管线最小版）** — 会话沉淀（sediment）在摘要/稳定事实/事件产物之外新增一次知识候选提取 sidecar 调用：从整段对话提取可复用知识片段（fact/procedure/heuristic/narrative/model 五类），每候选以记忆事件形态（自定义事件类型 knowledge_candidate）写入共享账本独立域（与情景事件流隔离，不混入召回）并双写证据链。提取调用全程经审计链 sidecar 协议（prompt/response 全文入审计链），无审计通路时自动跳过不提取。提取提示词内置概念模型类知识示例作为首个输出模板实例，候选置信度低于阈值语义由治理层后续批次把关。配置项 `memory.enable_knowledge_extraction`（默认开启）、最短触发会话 4 条消息
+
 ## [0.2.1] - 2026-10-03
 
 ### ⚠️ Breaking Change

@@ -349,7 +349,9 @@ struct ExtractedEvent {
 }
 
 /// 从可能包含 markdown 代码块的文本中提取 JSON
-fn extract_json_from_text(text: &str) -> String {
+///
+/// pub(crate)：sediment.rs 的 A2-1 知识候选提取复用（同一解析纪律）。
+pub(crate) fn extract_json_from_text(text: &str) -> String {
     let trimmed = text.trim();
 
     // 尝试直接解析

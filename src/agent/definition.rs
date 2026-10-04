@@ -168,6 +168,13 @@ pub struct MemoryConfig {
     /// C1: 是否启用事件提取（默认 true）
     #[serde(default = "default_true")]
     pub enable_event_extraction: bool,
+    /// A2-1: 是否启用知识候选提取（默认 true；F-613 裁剪最小版）
+    ///
+    /// 会话收尾时 sediment 增一次 sidecar 审计 LLM 调用提取知识候选
+    /// （五类），落 shared.{ns}.knowledge_candidates.*；无审计通路时
+    /// 自动跳过（纪律①）。
+    #[serde(default = "default_true")]
+    pub enable_knowledge_extraction: bool,
 }
 
 fn default_memory_budget_ratio() -> f32 {
@@ -204,6 +211,7 @@ impl Default for MemoryConfig {
             max_injected_events: default_max_injected_events(),
             summary_rollup_threshold: default_summary_rollup_threshold(),
             enable_event_extraction: default_true(),
+            enable_knowledge_extraction: default_true(),
         }
     }
 }

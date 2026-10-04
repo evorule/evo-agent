@@ -562,6 +562,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                 stable_facts_cache_only,
                 events_count,
                 rollup_done,
+                knowledge_candidates,
             } => {
                 // 沉淀边界——context_management 系统步（四项持久化结果可对账）
                 if let Some(a) = acc.take() {
@@ -587,12 +588,13 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                         results: vec![AtifObservationResult {
                             source_call_id: None,
                             content: Some(format!(
-                                "summary_written={} persisted_facts={} cache_only_facts={} events={} rollup={}",
+                                "summary_written={} persisted_facts={} cache_only_facts={} events={} rollup={} knowledge_candidates={}",
                                 summary_written,
                                 stable_facts.len(),
                                 stable_facts_cache_only.len(),
                                 events_count,
-                                rollup_done
+                                rollup_done,
+                                knowledge_candidates
                             )),
                         }],
                     }),

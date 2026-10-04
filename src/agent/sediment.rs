@@ -22,8 +22,10 @@
 //! 所有写入操作都是 best-effort：失败时记 `tracing::warn!` 日志，不阻断
 //! 会话返回。这与 `MemoryManager::set_scoped` 的 fail-open 语义一致。
 
+use crate::agent::audited_llm::AuditedLlm;
 use crate::agent::memory::{MemoryManager, MemoryRecord, MemoryScope, PersistOutcome};
-use crate::agent::memory_event::extraction::EventExtractor;
+use crate::agent::memory_event::event::{EventSource, EventType, MemoryEvent};
+use crate::agent::memory_event::extraction::{extract_json_from_text, EventExtractor};
 use crate::agent::summarizer::ContextSummarizer;
 use crate::agent::translator::Message;
 
@@ -45,6 +47,16 @@ pub struct SedimentConfig {
     /// 路径段经消毒（非 `[a-zA-Z0-9-_]` 替换为 `-`）保证单一路径段；
     /// 原始模型名记入 value.source（`llm:{raw}`）。
     pub llm_model_id: String,
+    /// A2-1：是否启用知识候选提取（F-613 裁剪最小版）
+    ///
+    /// 会话收尾时在摘要/事实/事件产物之外，增一次 sidecar LLM 调用提取
+    /// 知识候选（fact/procedure/heuristic/narrative/model 五类），落
+    /// `shared.{ns}.knowledge_candidates.{event_id}`（MemoryEvent，
+    /// kind=Custom("knowledge_candidate")，即 01 号方案字面
+    /// custom:knowledge_candidate 的 serde 映射）。
+    pub enable_knowledge_extraction: bool,
+    /// A2-1：触发知识候选提取的最小消息条数（太短会话无知识可提取）
+    pub min_messages_for_extraction: usize,
 }
 
 impl Default for SedimentConfig {
@@ -56,6 +68,8 @@ impl Default for SedimentConfig {
             max_injected_events: 5,
             summary_rollup_threshold: 10,
             llm_model_id: "unknown".to_string(),
+            enable_knowledge_extraction: true,
+            min_messages_for_extraction: 4,
         }
     }
 }
@@ -76,6 +90,9 @@ pub struct SedimentDeps<'a> {
     /// 事件证据链账本（双写——shared 召回 + __memory__ 证据链，
     /// 非 RL-B5 双写：同一数据两个消费面，__memory__ 为权威）
     pub event_store: Option<&'a mut crate::agent::memory_event::store::MemoryEventStore>,
+    /// A2-1：审计链执行器（None = 不提取——纪律①：知识候选提取属沉淀
+    /// 提取面，无审计通路则跳过并 warn，禁止新增直连 provider 调用路径）
+    pub auditor: Option<&'a AuditedLlm>,
 }
 
 /// 沉淀结果
@@ -90,6 +107,8 @@ pub struct SedimentResult {
     pub stable_facts_cache_only: Vec<String>,
     /// 提取并写入共享账本的事件 ID 列表（R07/E17 接线后实际填充）
     pub events: Vec<String>,
+    /// A2-1：写入共享账本的知识候选 event_id 列表
+    pub knowledge_candidates: Vec<String>,
     /// rollup 是否执行（C4）
     pub rollup_done: bool,
 }
@@ -103,6 +122,8 @@ pub struct SedimentResult {
 /// 3. 稳定事实 → 共享空间 `set_scoped(Shared, ...)`
 /// 4. 事件提取（R07/E17 接线：触发式提取 → 写入 `shared.{ns}.events.*`）
 /// 5. rollup 检查（C4 占位，返回 false）
+/// 6. 知识候选提取（A2-1/F-613 裁剪：sidecar 审计调用 → 写入
+///    `shared.{ns}.knowledge_candidates.*`，kind=Custom("knowledge_candidate")）
 ///
 /// # 参数
 ///
@@ -191,6 +212,12 @@ pub async fn sediment(
         }
     }
 
+    // 6. A2-1 知识候选提取（F-613 裁剪最小版）：sidecar 审计调用 →
+    //    候选落 shared.{ns}.knowledge_candidates.*（与 sediment 既有产物并列）
+    if cfg.enable_knowledge_extraction {
+        extract_knowledge_candidates(deps, cfg, session_id, messages, &mut result).await;
+    }
+
     result
 }
 
@@ -209,6 +236,300 @@ fn sanitize_model_id(model: &str) -> String {
             }
         })
         .collect()
+}
+
+// ===== A2-1 知识候选提取（F-613 裁剪最小版） =====
+//
+// 01 号方案 §4.2 A2-1：会话收尾时 sediment 产物之外增「知识候选提取」sidecar
+// 调用（提示词模板=model 类知识的第一个实例，自举）→ 候选落 MemoryEvent
+// （kind=custom:knowledge_candidate）。
+//
+// 口径映射（D3）：方案字面 `custom:knowledge_candidate` →
+// `EventType::Custom("knowledge_candidate")`（serde 形态
+// `{"kind":"Custom","subtype":"knowledge_candidate"}`）。
+//
+// 自举（D4）：提示词内置一个 model 类知识示例（按 evorule-rule 内置壳
+// `builtin:knowledge/model` 的最小结构构造）——即「第一个实例」；系统
+// 启动时知识库为空，第一个实例只能编译期内置，未来 Active 条目反哺提示词
+// 属后续批次。
+
+/// A2-1：知识候选五类（与 evorule-rule 内置域 schema 五件一一对应）
+const KNOWLEDGE_KINDS: &[&str] = &["fact", "procedure", "heuristic", "narrative", "model"];
+
+/// A2-1：提取系统提示（对齐 EventExtractor 纪律：只提取对话中明确存在的
+/// 信息，输出 JSON，无候选返回空列表）
+const KNOWLEDGE_EXTRACTION_SYSTEM_PROMPT: &str = "\
+你是一个知识候选提取助手。你的任务是从对话中识别值得沉淀为可复用知识的片段,提取为结构化候选。\n\
+\n\
+知识分五类:\n\
+- fact: 客观事实(某配置项含义/某接口行为/某约束存在)\n\
+- procedure: 操作步骤(如何完成某任务的步骤序列)\n\
+- heuristic: 经验法则(什么情况下用什么方法更好/避坑经验)\n\
+- narrative: 叙事性知识(决策背景/来龙去脉)\n\
+- model: 概念模型(对某事物的结构化理解,如某机制的工作原理)\n\
+\n\
+严格约束:\n\
+1. 只提取对话中明确存在的信息,不能编造或臆测\n\
+2. 每条候选必须自包含(脱离对话上下文仍可读)\n\
+3. 输出必须是 JSON 格式,不要输出自然语言解释\n\
+4. knowledge_kind 只能取五类之一\n\
+5. 如果对话中没有值得沉淀的知识,返回 {\"candidates\": []}";
+
+/// A2-1：model 类知识示例——提示词模板的「第一个实例」（D4 自举）
+const MODEL_EXAMPLE: &str = r#"{"knowledge_kind":"model","title":"规则条目生命周期模型","body":"规则条目按状态机演进:Draft(草稿,仅作者可见)→Candidate(候选,待审)→Active(生效,可被检索注入)→Published(发布,归档)。状态迁移必经治理闸,每次迁移落 StateChange 审计事实。","tags":["lifecycle","governance"],"confidence":0.9}"#;
+
+/// A2-1：单条知识候选 LLM 输出结构
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct KnowledgeCandidateOut {
+    /// 知识类别（五类之一；越界候选在解析后丢弃）
+    pub knowledge_kind: String,
+    /// 候选标题（自包含短语）
+    pub title: String,
+    /// 候选正文（自包含、脱离上下文可读）
+    pub body: String,
+    /// 自由标签
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// 置信度 0.0-1.0（LLM 自评，缺失默认 0.5——提取性内容低于用户直述）
+    #[serde(default = "default_candidate_confidence")]
+    pub confidence: f32,
+}
+
+fn default_candidate_confidence() -> f32 {
+    0.5
+}
+
+/// A2-1：LLM 输出信封（candidates 缺省=无候选）
+#[derive(Debug, serde::Deserialize)]
+struct KnowledgeExtractionOut {
+    #[serde(default)]
+    candidates: Vec<KnowledgeCandidateOut>,
+}
+
+/// A2-1 主入口：会话收尾时提取知识候选并写入共享账本（best-effort）
+///
+/// 流程：
+/// 1. 前置闸：消息数 < `min_messages_for_extraction` → 跳过；
+/// 2. 无 auditor → 跳过 + warn（纪律①：无审计通路不提取，不直连 provider）；
+/// 3. 整会话一次 sidecar LLM 调用（purpose=knowledge_candidate_extraction，
+///    prompt/response 全文入审计链）；
+/// 4. 解析候选（五类越界/正文空丢弃）；
+/// 5. 每候选一个 MemoryEvent 写入 `shared.{ns}.knowledge_candidates.{event_id}`
+///    （event_id 前缀 KC-，与事件提取 E- 风格对齐）+ __memory__ 证据链双写。
+async fn extract_knowledge_candidates(
+    deps: &mut SedimentDeps<'_>,
+    cfg: &SedimentConfig,
+    session_id: &str,
+    messages: &[Message],
+    result: &mut SedimentResult,
+) {
+    // 前置闸：太短会话无知识可提取（省一次 LLM 调用）
+    if messages.len() < cfg.min_messages_for_extraction {
+        return;
+    }
+    // 纪律①：知识候选提取属沉淀提取面，必须经审计 sidecar；
+    // 无审计通路则跳过（不新增直连 provider 调用路径）。
+    let auditor = match deps.auditor {
+        Some(a) => a,
+        None => {
+            tracing::warn!(
+                session_id = %session_id,
+                "sediment: knowledge extraction skipped (no audited LLM path)"
+            );
+            return;
+        }
+    };
+
+    let conversation = conversation_text(messages);
+    let prompt = format!(
+        "请从以下对话中提取值得沉淀为知识候选的片段,输出 JSON 格式。\n\n\
+         对话:\n{}\n\n\
+         输出 JSON 格式(候选列表,可为空):\n\
+         {{\"candidates\": [{{\n\
+           \"knowledge_kind\": \"model\",\n\
+           \"title\": \"候选标题\",\n\
+           \"body\": \"自包含正文\",\n\
+           \"tags\": [\"标签\"],\n\
+           \"confidence\": 0.8\n\
+         }}]}}\n\n\
+         model 类候选示例(输出参照此实例的结构与颗粒度):\n{}\n\n\
+         knowledge_kind 可取: {}\n\
+         只输出 JSON,不要输出其他内容。",
+        conversation,
+        MODEL_EXAMPLE,
+        KNOWLEDGE_KINDS.join(", ")
+    );
+
+    let mut messages_vec: Vec<serde_json::Value> = Vec::with_capacity(2);
+    messages_vec.push(serde_json::json!({
+        "role": "system",
+        "content": KNOWLEDGE_EXTRACTION_SYSTEM_PROMPT,
+    }));
+    messages_vec.push(serde_json::json!({
+        "role": "user",
+        "content": prompt,
+    }));
+    let mut params_map = serde_json::Map::new();
+    // server 治理声明要求 instruction.params.model 必须存在（on_missing=error），
+    // sidecar 命令缺 model 会被规则拒收（path_not_found，E2E 实证）。
+    // 取 B5 既有权威 llm_model_id（summary_model 回退主模型），与摘要调用同一模型口径。
+    params_map.insert(
+        "model".to_string(),
+        serde_json::Value::String(cfg.llm_model_id.clone()),
+    );
+    params_map.insert(
+        "temperature".to_string(),
+        serde_json::json!(0.0), // temperature=0 保证最大确定性（对齐事件提取）
+    );
+    params_map.insert("max_tokens".to_string(), serde_json::json!(1024));
+    params_map.insert(
+        "messages".to_string(),
+        serde_json::Value::Array(messages_vec),
+    );
+
+    // sidecar 审计调用：prompt/response 全文入 evorule 审计链（纪律①）
+    let audited_result = match auditor
+        .execute(
+            "knowledge_candidate_extraction",
+            &serde_json::Value::Object(params_map),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                session_id = %session_id,
+                "sediment: knowledge candidate extraction LLM call failed"
+            );
+            return;
+        }
+    };
+
+    // 解析审计回包（形态与直连一致：LlmResponse JSON → content → 内嵌 JSON）
+    let response: crate::agent::translator::LlmResponse =
+        match serde_json::from_str(&audited_result.to_string()) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session_id,
+                    "sediment: parse audited LLM response failed"
+                );
+                return;
+            }
+        };
+    let json_str = extract_json_from_text(&response.content);
+    let candidates = match parse_knowledge_candidates(&json_str) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                session_id = %session_id,
+                "sediment: parse knowledge candidates failed"
+            );
+            return;
+        }
+    };
+    if candidates.is_empty() {
+        return; // 无候选是正常路径
+    }
+
+    write_knowledge_candidates(deps, session_id, candidates, result).await;
+}
+
+/// A2-1：解析 LLM 输出为候选列表（纯函数，单测覆盖）
+fn parse_knowledge_candidates(json_str: &str) -> Result<Vec<KnowledgeCandidateOut>, String> {
+    let out: KnowledgeExtractionOut =
+        serde_json::from_str(json_str).map_err(|e| format!("parse candidates JSON: {}", e))?;
+    // 逐条过滤：五类越界/正文空 → 丢弃（治理口径：越界候选将来过不了
+    // A2-3 契约校验，直接在提取面拒收并留 warn）
+    let kept: Vec<KnowledgeCandidateOut> = out
+        .candidates
+        .into_iter()
+        .filter(|c| {
+            let kind_ok = KNOWLEDGE_KINDS.contains(&c.knowledge_kind.as_str());
+            let body_ok = !c.body.trim().is_empty() && !c.title.trim().is_empty();
+            if !kind_ok {
+                tracing::warn!(kind = %c.knowledge_kind, "sediment: drop candidate (unknown knowledge_kind)");
+            } else if !body_ok {
+                tracing::warn!(kind = %c.knowledge_kind, "sediment: drop candidate (empty title/body)");
+            }
+            kind_ok && body_ok
+        })
+        .collect();
+    Ok(kept)
+}
+
+/// A2-1：候选写入共享账本 + __memory__ 证据链双写（best-effort）
+async fn write_knowledge_candidates(
+    deps: &mut SedimentDeps<'_>,
+    session_id: &str,
+    candidates: Vec<KnowledgeCandidateOut>,
+    result: &mut SedimentResult,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for (seq, cand) in candidates.into_iter().enumerate() {
+        // 事件 ID：会话内唯一 + 路径安全（KC- 前缀与事件提取 E- 风格对齐）
+        let event_id = format!("KC-{}-{}-{}", sanitize_model_id(session_id), now, seq);
+        let mut event = MemoryEvent::new_root(
+            &event_id,
+            // D3：方案字面 custom:knowledge_candidate → Custom("knowledge_candidate")
+            EventType::Custom("knowledge_candidate".to_string()),
+            now,
+            EventSource::LlmExtraction,
+        )
+        .with_confidence(cand.confidence.clamp(0.0, 1.0))
+        .with_tag("knowledge_candidate")
+        .with_tag(&cand.knowledge_kind)
+        .with_session(session_id);
+        event.content = serde_json::json!({
+            "knowledge_kind": cand.knowledge_kind,
+            "title": cand.title,
+            "body": cand.body,
+        });
+        for t in &cand.tags {
+            if !t.trim().is_empty() {
+                event = event.with_tag(t);
+            }
+        }
+
+        let value = match serde_json::to_string(&event) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, event_id = %event_id, "sediment: serialize knowledge candidate failed");
+                continue;
+            }
+        };
+        let key = format!("knowledge_candidates.{}", event_id);
+        match deps
+            .memory
+            .set_scoped(MemoryScope::Shared, &key, &value)
+            .await
+        {
+            Ok(_) => {
+                result.knowledge_candidates.push(event_id.clone());
+                // 双写到 __memory__ 证据链（与事件提取同型）
+                if let Some(store) = deps.event_store.as_mut() {
+                    if let Err(e) = store.write_event(event.clone()).await {
+                        tracing::warn!(
+                            error = %e,
+                            event_id = %event_id,
+                            "sediment: knowledge candidate dual-write failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                event_id = %event_id,
+                "sediment: write knowledge candidate to shared ledger failed"
+            ),
+        }
+    }
 }
 
 /// R07（E17 接线）：扫描会话消息，触发式提取结构化事件并写入共享账本
@@ -465,6 +786,9 @@ mod tests {
         assert_eq!(cfg.max_injected_events, 5);
         assert_eq!(cfg.summary_rollup_threshold, 10);
         assert_eq!(cfg.llm_model_id, "unknown");
+        // A2-1：知识候选提取默认开、最短会话 4 条
+        assert!(cfg.enable_knowledge_extraction);
+        assert_eq!(cfg.min_messages_for_extraction, 4);
     }
 
     #[test]
@@ -494,6 +818,7 @@ mod tests {
         assert!(!result.summary_written);
         assert!(result.stable_facts.is_empty());
         assert!(result.events.is_empty());
+        assert!(result.knowledge_candidates.is_empty());
         assert!(!result.rollup_done);
     }
 
@@ -541,6 +866,7 @@ mod tests {
             summarizer: None,
             extractor: None,
             event_store: None,
+            auditor: None,
         };
         let result = rollup_old_summaries(&mut deps, &cfg).await;
         assert!(result.is_ok(), "below threshold / no server should be Ok");
@@ -559,6 +885,7 @@ mod tests {
             summarizer: None,
             extractor: None,
             event_store: None,
+            auditor: None,
         };
         let messages = vec![Message::User {
             content: "hello".to_string(),
@@ -590,6 +917,7 @@ mod tests {
             summarizer: None,
             extractor: Some(&mut extractor),
             event_store: None,
+            auditor: None,
         };
         let messages = vec![
             Message::User {
@@ -640,6 +968,7 @@ mod tests {
             summarizer: None,
             extractor: Some(&mut extractor),
             event_store: None,
+            auditor: None,
         };
         let messages = vec![Message::User {
             content: "今天是我生日".to_string(),
@@ -675,6 +1004,7 @@ mod tests {
             summarizer: None,
             extractor: Some(&mut extractor),
             event_store: None,
+            auditor: None,
         };
         let messages = vec![Message::User {
             content: "今天天气不错".to_string(),
@@ -689,6 +1019,215 @@ mod tests {
 
         let result = sediment(&mut deps, &cfg, "s1", &messages).await;
         assert!(result.events.is_empty());
+        m1.assert_async().await;
+    }
+
+    // ===== A2-1：知识候选提取（F-613 裁剪最小版） =====
+
+    #[test]
+    fn test_parse_knowledge_candidates_keeps_valid() {
+        let json = r#"{"candidates":[
+            {"knowledge_kind":"model","title":"生命周期模型","body":"状态机演进说明","tags":["a"],"confidence":0.9},
+            {"knowledge_kind":"fact","title":"配置含义","body":"某配置项的语义"}
+        ]}"#;
+        let out = parse_knowledge_candidates(json).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].knowledge_kind, "model");
+        // confidence 缺省 0.5（fact 条未带）
+        assert!((out[1].confidence - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_knowledge_candidates_filters_invalid() {
+        let json = r#"{"candidates":[
+            {"knowledge_kind":"unknown_kind","title":"x","body":"y"},
+            {"knowledge_kind":"heuristic","title":"","body":"y"},
+            {"knowledge_kind":"procedure","title":"步骤","body":"   "},
+            {"knowledge_kind":"narrative","title":"背景","body":"决策来龙去脉"}
+        ]}"#;
+        let out = parse_knowledge_candidates(json).unwrap();
+        assert_eq!(out.len(), 1, "越界 kind 与空 title/body 应被过滤");
+        assert_eq!(out[0].knowledge_kind, "narrative");
+    }
+
+    #[test]
+    fn test_parse_knowledge_candidates_empty_envelope() {
+        // 显式空列表与缺省信封都=无候选
+        assert!(parse_knowledge_candidates(r#"{"candidates": []}"#)
+            .unwrap()
+            .is_empty());
+        assert!(parse_knowledge_candidates("{}").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sediment_knowledge_extraction_disabled_skips() {
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("test", client).with_session_id("s1");
+        let cfg = SedimentConfig {
+            namespace: "test".to_string(),
+            enable_knowledge_extraction: false,
+            ..Default::default()
+        };
+        let mut deps = SedimentDeps {
+            memory: &mut memory,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: None,
+        };
+        // 4 条消息：长度过前置闸，证明跳过来自开关而非长度
+        let messages = vec![
+            Message::User {
+                content: "第一条".to_string(),
+            },
+            Message::Assistant {
+                content: "回复一".to_string(),
+                tool_calls: None,
+            },
+            Message::User {
+                content: "第二条".to_string(),
+            },
+            Message::Assistant {
+                content: "回复二".to_string(),
+                tool_calls: None,
+            },
+        ];
+        let m1 = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let result = sediment(&mut deps, &cfg, "s1", &messages).await;
+        assert!(result.knowledge_candidates.is_empty());
+        m1.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_sediment_knowledge_short_session_skips() {
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("test", client).with_session_id("s1");
+        let cfg = SedimentConfig {
+            namespace: "test".to_string(),
+            ..Default::default()
+        };
+        let mut deps = SedimentDeps {
+            memory: &mut memory,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: None,
+        };
+        let messages = vec![
+            Message::User {
+                content: "你好".to_string(),
+            },
+            Message::Assistant {
+                content: "你好！".to_string(),
+                tool_calls: None,
+            },
+        ];
+        // 2 条 < min_messages_for_extraction(4)：不提取、无写入
+        let m1 = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let result = sediment(&mut deps, &cfg, "s1", &messages).await;
+        assert!(result.knowledge_candidates.is_empty());
+        m1.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_sediment_knowledge_no_auditor_skips() {
+        // 纪律①：无审计通路不提取（不直连 provider），跳过并 warn
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("test", client).with_session_id("s1");
+        let cfg = SedimentConfig {
+            namespace: "test".to_string(),
+            ..Default::default()
+        };
+        let mut deps = SedimentDeps {
+            memory: &mut memory,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: None,
+        };
+        let messages = vec![
+            Message::User {
+                content: "第一条".to_string(),
+            },
+            Message::Assistant {
+                content: "回复一".to_string(),
+                tool_calls: None,
+            },
+            Message::User {
+                content: "第二条".to_string(),
+            },
+            Message::Assistant {
+                content: "回复二".to_string(),
+                tool_calls: None,
+            },
+        ];
+        let m1 = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let result = sediment(&mut deps, &cfg, "s1", &messages).await;
+        assert!(result.knowledge_candidates.is_empty());
+        m1.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_write_knowledge_candidates_writes_shared() {
+        // 写入通路断言双重点：路径落 knowledge_candidates 域（KC- 前缀）+
+        // value 携带 MemoryEvent（Custom kind + 候选内容）——D3 映射实证
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("test", client).with_session_id("s1");
+        let cfg = SedimentConfig {
+            namespace: "test".to_string(),
+            ..Default::default()
+        };
+        let mut deps = SedimentDeps {
+            memory: &mut memory,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: None,
+        };
+        let candidates = vec![KnowledgeCandidateOut {
+            knowledge_kind: "model".to_string(),
+            title: "生命周期模型".to_string(),
+            body: "规则条目按状态机演进".to_string(),
+            tags: vec!["lifecycle".to_string()],
+            confidence: 0.8,
+        }];
+        let mut result = SedimentResult::default();
+        let m1 = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .with_status(200)
+            .match_body(mockito::Matcher::Regex(
+                // 注意锚顺序：json! 序列化后 content 按键字母序 body 先于 title
+                r#"shared\.test\.knowledge_candidates\.KC-s1-\d+-0[\s\S]*Custom[\s\S]*knowledge_candidate[\s\S]*状态机[\s\S]*生命周期模型"#.to_string(),
+            ))
+            .create_async()
+            .await;
+        let _ = &cfg;
+        write_knowledge_candidates(&mut deps, "s1", candidates, &mut result).await;
+        assert_eq!(result.knowledge_candidates.len(), 1);
+        assert!(result.knowledge_candidates[0].starts_with("KC-s1-"));
         m1.assert_async().await;
     }
 }

@@ -414,6 +414,8 @@ async fn test_sediment_rollup_marks_old_summaries_as_rolled_up() {
         extractor: None,
         // 事件证据链账本(测试不落盘)
         event_store: None,
+        // A2-1:无审计通路→知识候选提取自动跳过(纪律①)
+        auditor: None,
     };
     let messages = vec![Message::User {
         content: "some conversation".to_string(),
