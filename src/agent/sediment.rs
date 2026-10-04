@@ -47,15 +47,14 @@ pub struct SedimentConfig {
     /// 路径段经消毒（非 `[a-zA-Z0-9-_]` 替换为 `-`）保证单一路径段；
     /// 原始模型名记入 value.source（`llm:{raw}`）。
     pub llm_model_id: String,
-    /// A2-1：是否启用知识候选提取（F-613 裁剪最小版）
+    /// 是否启用知识候选提取（会话收尾巩固管线最小版）
     ///
     /// 会话收尾时在摘要/事实/事件产物之外，增一次 sidecar LLM 调用提取
     /// 知识候选（fact/procedure/heuristic/narrative/model 五类），落
     /// `shared.{ns}.knowledge_candidates.{event_id}`（MemoryEvent，
-    /// kind=Custom("knowledge_candidate")，即 01 号方案字面
-    /// custom:knowledge_candidate 的 serde 映射）。
+    /// kind=Custom("knowledge_candidate")，即知识候选事件类型的 serde 映射）。
     pub enable_knowledge_extraction: bool,
-    /// A2-1：触发知识候选提取的最小消息条数（太短会话无知识可提取）
+    /// 触发知识候选提取的最小消息条数（太短会话无知识可提取）
     pub min_messages_for_extraction: usize,
 }
 
@@ -90,7 +89,7 @@ pub struct SedimentDeps<'a> {
     /// 事件证据链账本（双写——shared 召回 + __memory__ 证据链，
     /// 非 RL-B5 双写：同一数据两个消费面，__memory__ 为权威）
     pub event_store: Option<&'a mut crate::agent::memory_event::store::MemoryEventStore>,
-    /// A2-1：审计链执行器（None = 不提取——纪律①：知识候选提取属沉淀
+    /// 审计链执行器（None = 不提取——纪律①：知识候选提取属沉淀
     /// 提取面，无审计通路则跳过并 warn，禁止新增直连 provider 调用路径）
     pub auditor: Option<&'a AuditedLlm>,
 }
@@ -107,7 +106,7 @@ pub struct SedimentResult {
     pub stable_facts_cache_only: Vec<String>,
     /// 提取并写入共享账本的事件 ID 列表（R07/E17 接线后实际填充）
     pub events: Vec<String>,
-    /// A2-1：写入共享账本的知识候选 event_id 列表
+    /// 写入共享账本的知识候选 event_id 列表
     pub knowledge_candidates: Vec<String>,
     /// rollup 是否执行（C4）
     pub rollup_done: bool,
@@ -122,7 +121,7 @@ pub struct SedimentResult {
 /// 3. 稳定事实 → 共享空间 `set_scoped(Shared, ...)`
 /// 4. 事件提取（R07/E17 接线：触发式提取 → 写入 `shared.{ns}.events.*`）
 /// 5. rollup 检查（C4 占位，返回 false）
-/// 6. 知识候选提取（A2-1/F-613 裁剪：sidecar 审计调用 → 写入
+/// 6. 知识候选提取（sidecar 审计调用 → 写入
 ///    `shared.{ns}.knowledge_candidates.*`，kind=Custom("knowledge_candidate")）
 ///
 /// # 参数
@@ -212,7 +211,7 @@ pub async fn sediment(
         }
     }
 
-    // 6. A2-1 知识候选提取（F-613 裁剪最小版）：sidecar 审计调用 →
+    // 6. 知识候选提取（巩固管线最小版）：sidecar 审计调用 →
     //    候选落 shared.{ns}.knowledge_candidates.*（与 sediment 既有产物并列）
     if cfg.enable_knowledge_extraction {
         extract_knowledge_candidates(deps, cfg, session_id, messages, &mut result).await;
@@ -238,25 +237,25 @@ fn sanitize_model_id(model: &str) -> String {
         .collect()
 }
 
-// ===== A2-1 知识候选提取（F-613 裁剪最小版） =====
+// ===== 知识候选提取（会话收尾巩固管线最小版） =====
 //
-// 01 号方案 §4.2 A2-1：会话收尾时 sediment 产物之外增「知识候选提取」sidecar
+// 会话收尾时 sediment 产物之外增「知识候选提取」sidecar
 // 调用（提示词模板=model 类知识的第一个实例，自举）→ 候选落 MemoryEvent
 // （kind=custom:knowledge_candidate）。
 //
-// 口径映射（D3）：方案字面 `custom:knowledge_candidate` →
+// 口径映射：方案字面 `custom:knowledge_candidate` →
 // `EventType::Custom("knowledge_candidate")`（serde 形态
 // `{"kind":"Custom","subtype":"knowledge_candidate"}`）。
 //
-// 自举（D4）：提示词内置一个 model 类知识示例（按 evorule-rule 内置壳
+// 自举：提示词内置一个 model 类知识示例（按 evorule-rule 内置壳
 // `builtin:knowledge/model` 的最小结构构造）——即「第一个实例」；系统
 // 启动时知识库为空，第一个实例只能编译期内置，未来 Active 条目反哺提示词
 // 属后续批次。
 
-/// A2-1：知识候选五类（与 evorule-rule 内置域 schema 五件一一对应）
+/// 知识候选五类（与 evorule-rule 内置域 schema 五件一一对应）
 const KNOWLEDGE_KINDS: &[&str] = &["fact", "procedure", "heuristic", "narrative", "model"];
 
-/// A2-1：提取系统提示（对齐 EventExtractor 纪律：只提取对话中明确存在的
+/// 提取系统提示（对齐 EventExtractor 纪律：只提取对话中明确存在的
 /// 信息，输出 JSON，无候选返回空列表）
 const KNOWLEDGE_EXTRACTION_SYSTEM_PROMPT: &str = "\
 你是一个知识候选提取助手。你的任务是从对话中识别值得沉淀为可复用知识的片段,提取为结构化候选。\n\
@@ -275,10 +274,10 @@ const KNOWLEDGE_EXTRACTION_SYSTEM_PROMPT: &str = "\
 4. knowledge_kind 只能取五类之一\n\
 5. 如果对话中没有值得沉淀的知识,返回 {\"candidates\": []}";
 
-/// A2-1：model 类知识示例——提示词模板的「第一个实例」（D4 自举）
+/// model 类知识示例——提示词模板的「第一个实例」（自举）
 const MODEL_EXAMPLE: &str = r#"{"knowledge_kind":"model","title":"规则条目生命周期模型","body":"规则条目按状态机演进:Draft(草稿,仅作者可见)→Candidate(候选,待审)→Active(生效,可被检索注入)→Published(发布,归档)。状态迁移必经治理闸,每次迁移落 StateChange 审计事实。","tags":["lifecycle","governance"],"confidence":0.9}"#;
 
-/// A2-1：单条知识候选 LLM 输出结构
+/// 单条知识候选 LLM 输出结构
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct KnowledgeCandidateOut {
     /// 知识类别（五类之一；越界候选在解析后丢弃）
@@ -299,14 +298,14 @@ fn default_candidate_confidence() -> f32 {
     0.5
 }
 
-/// A2-1：LLM 输出信封（candidates 缺省=无候选）
+/// LLM 输出信封（candidates 缺省=无候选）
 #[derive(Debug, serde::Deserialize)]
 struct KnowledgeExtractionOut {
     #[serde(default)]
     candidates: Vec<KnowledgeCandidateOut>,
 }
 
-/// A2-1 主入口：会话收尾时提取知识候选并写入共享账本（best-effort）
+/// 主入口：会话收尾时提取知识候选并写入共享账本（best-effort）
 ///
 /// 流程：
 /// 1. 前置闸：消息数 < `min_messages_for_extraction` → 跳过；
@@ -438,7 +437,7 @@ async fn extract_knowledge_candidates(
     write_knowledge_candidates(deps, session_id, candidates, result).await;
 }
 
-/// A2-1：解析 LLM 输出为候选列表（纯函数，单测覆盖）
+/// 解析 LLM 输出为候选列表（纯函数，单测覆盖）
 fn parse_knowledge_candidates(json_str: &str) -> Result<Vec<KnowledgeCandidateOut>, String> {
     let out: KnowledgeExtractionOut =
         serde_json::from_str(json_str).map_err(|e| format!("parse candidates JSON: {}", e))?;
@@ -461,7 +460,7 @@ fn parse_knowledge_candidates(json_str: &str) -> Result<Vec<KnowledgeCandidateOu
     Ok(kept)
 }
 
-/// A2-1：候选写入共享账本 + __memory__ 证据链双写（best-effort）
+/// 候选写入共享账本 + __memory__ 证据链双写（best-effort）
 async fn write_knowledge_candidates(
     deps: &mut SedimentDeps<'_>,
     session_id: &str,
@@ -477,7 +476,7 @@ async fn write_knowledge_candidates(
         let event_id = format!("KC-{}-{}-{}", sanitize_model_id(session_id), now, seq);
         let mut event = MemoryEvent::new_root(
             &event_id,
-            // D3：方案字面 custom:knowledge_candidate → Custom("knowledge_candidate")
+            // 方案字面 custom:knowledge_candidate → Custom("knowledge_candidate")
             EventType::Custom("knowledge_candidate".to_string()),
             now,
             EventSource::LlmExtraction,
@@ -786,7 +785,7 @@ mod tests {
         assert_eq!(cfg.max_injected_events, 5);
         assert_eq!(cfg.summary_rollup_threshold, 10);
         assert_eq!(cfg.llm_model_id, "unknown");
-        // A2-1：知识候选提取默认开、最短会话 4 条
+        // 知识候选提取默认开、最短会话 4 条
         assert!(cfg.enable_knowledge_extraction);
         assert_eq!(cfg.min_messages_for_extraction, 4);
     }
@@ -1022,7 +1021,7 @@ mod tests {
         m1.assert_async().await;
     }
 
-    // ===== A2-1：知识候选提取（F-613 裁剪最小版） =====
+    // ===== 知识候选提取（巩固管线最小版） =====
 
     #[test]
     fn test_parse_knowledge_candidates_keeps_valid() {
