@@ -1948,6 +1948,36 @@ impl MemoryManager {
             .unwrap_or_else(crate::agent::recipe::RetrievalPolicy::default_lexical)
     }
 
+    /// 阶段 2:预算降级序的 Recipe 覆盖读取(策略数据化收尾——穿线到
+    /// fit_recall 调用点)。
+    ///
+    /// - Some(序)=Recipe 声明了非默认且合法的序(恰含 stable/summaries/events
+    ///   三层各一次)——按声明执行;
+    /// - None=无 Recipe/默认序(走历史原实现,通知文案逐字节保真)/非法序
+    ///   (warn 留痕后回退——预算完整性优先,不许声明把某层排除在预算外)。
+    pub(crate) fn degradation_order_override(&self) -> Option<Vec<String>> {
+        let order = &self.recipe.as_ref()?.budget.degradation_order;
+        let known =
+            |l: &String| matches!(l.as_str(), "stable" | "summaries" | "events");
+        if order.len() == 3 && order.iter().all(known) {
+            let mut uniq = order.clone();
+            uniq.sort();
+            uniq.dedup();
+            let is_default = order[0] == "stable"
+                && order[1] == "summaries"
+                && order[2] == "events";
+            if uniq.len() == 3 && !is_default {
+                return Some(order.clone());
+            }
+            return None; // 默认序:历史原实现逐字节保真
+        }
+        tracing::warn!(
+            order = ?order,
+            "recipe budget.degradation_order illegal (must contain each of stable/summaries/events exactly once); falling back to default degradation order"
+        );
+        None
+    }
+
     /// 阶段 3(F-611):构造自省记忆工具的共享协作件快照。
     ///
     /// 前置=LexStore 与 Recipe 双双在位(检索缓存是数据前提,
@@ -2200,9 +2230,15 @@ impl MemoryManager {
         recall: &RecallContext,
         budget: &ContextBudget,
     ) -> String {
-        // 预算截断
+        // 预算截断（降级序：Recipe 声明优先——非默认合法序按声明执行；
+        // 缺省/默认序/非法序回退历史原实现，Q9 冻结语义逐字节保真）
         let mut recall = recall.clone();
-        budget.fit_recall(&mut recall);
+        if let Some(order) = self.degradation_order_override() {
+            let refs: Vec<&str> = order.iter().map(String::as_str).collect();
+            budget.fit_recall_ordered(&mut recall, &refs);
+        } else {
+            budget.fit_recall(&mut recall);
+        }
 
         // L2 安全审计（P1-F6/P2-V2 修复）：所有召回内容拼入 prompt 前
         // 统一过 SafetyAuditor。默认 Strip 模式剥离注入片段、warn 留痕，
@@ -4384,6 +4420,63 @@ mod tests {
             recall2.events.is_empty(),
             "events should be cleared when budget exhausted"
         );
+    }
+
+    #[test]
+    fn test_degradation_order_override_recipe_dispatch() {
+        // 穿线验收:Recipe 声明非默认合法序 → 序驱动截断按声明执行;
+        // 默认序/缺省 Recipe → 历史原实现(逐字节保真);
+        // 非法序(某层缺失=被排除在预算外)→ warn 回退,预算完整性优先。
+        let budget = ContextBudget::new(40, 0.25); // cap=10 token
+        let v = |c: char| c.to_string().repeat(24); // 24 ascii chars ≈ 6 token/条
+        let mk_recall = || {
+            let mut r = RecallContext::default();
+            r.stable
+                .push(MemoryRecord::new("k1", &v('x'), 1000));
+            r.summaries
+                .push(MemoryRecord::new("k2", &v('y'), 2000));
+            r.events
+                .push(MemoryRecord::new("k3", &v('z'), 3000));
+            r
+        };
+
+        // 场景 A:非默认序(summaries 最优先)→ summaries 存活,stable/events 出局
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        recipe.budget.degradation_order = vec![
+            "summaries".to_string(),
+            "stable".to_string(),
+            "events".to_string(),
+        ];
+        mgr.set_recipe(recipe);
+        assert!(mgr.degradation_order_override().is_some());
+        let prompt = mgr.build_system_prompt_with_recall("base", &mk_recall(), &budget);
+        assert!(
+            prompt.contains("## Previous Sessions"),
+            "非默认序:summaries 最先占预算并存活"
+        );
+        assert!(
+            !prompt.contains("## Stable Facts"),
+            "前序层耗尽预算,stable 被清空"
+        );
+        assert!(!prompt.contains("## Relevant Events"));
+
+        // 场景 B:默认序 → 历史原实现(stable 最优先)
+        let mut mgr2 = MemoryManager::new("ns", make_test_client());
+        mgr2.set_recipe(crate::agent::recipe::MemoryRecipe::default());
+        assert!(mgr2.degradation_order_override().is_none());
+        let prompt2 = mgr2.build_system_prompt_with_recall("base", &mk_recall(), &budget);
+        assert!(prompt2.contains("## Stable Facts"));
+        assert!(!prompt2.contains("## Previous Sessions"));
+
+        // 场景 C:非法序(仅一层,其余层被排除在预算外)→ 回退历史原实现
+        let mut mgr3 = MemoryManager::new("ns", make_test_client());
+        let mut bad = crate::agent::recipe::MemoryRecipe::default();
+        bad.budget.degradation_order = vec!["summaries".to_string()];
+        mgr3.set_recipe(bad);
+        assert!(mgr3.degradation_order_override().is_none());
+        let prompt3 = mgr3.build_system_prompt_with_recall("base", &mk_recall(), &budget);
+        assert!(prompt3.contains("## Stable Facts"), "非法序回退默认序行为");
     }
 
     #[test]
