@@ -6,7 +6,6 @@
 pub mod acceptance;
 pub mod adjudicator;
 pub mod approval;
-pub mod recipe;
 pub mod assembly;
 pub mod atif;
 pub mod audited_llm;
@@ -23,6 +22,7 @@ pub mod materializer;
 pub mod memory;
 pub mod memory_event;
 pub mod output_validator;
+pub mod recipe;
 pub mod replan;
 pub mod runner;
 pub mod safety_auditor;

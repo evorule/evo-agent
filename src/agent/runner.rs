@@ -1090,6 +1090,20 @@ impl AgentRunner {
         }
         // 阶段 1(F-618):LexStore 检索缓存(definition 配 lex_store 路径时启用;
         // open 失败 warn 降级全量路径,I14)
+        // 阶段 2(F-610):MemoryRecipe 策略规则集(内嵌 JSON;解析失败 warn 降级
+        // 词法 legacy,零影响)
+        if let Some(rj) = &def.memory.recipe {
+            match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone()) {
+                Ok(recipe) => {
+                    if let Some(mem) = runner.memory.as_mut() {
+                        mem.set_recipe(recipe);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "MemoryRecipe 解析失败——召回走词法 legacy 路径");
+                }
+            }
+        }
         if let Some(db) = &def.memory.lex_store {
             match crate::agent::lexstore::LexStore::open(std::path::Path::new(db)) {
                 Ok(store) => {

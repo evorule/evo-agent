@@ -148,6 +148,11 @@ pub struct MemoryConfig {
     /// (I14)。未配置零影响。tb-agent 竞赛配置建议启用。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lex_store: Option<String>,
+    /// 阶段 2(F-610):MemoryRecipe 策略规则集(可选;内嵌 JSON 形态,
+    /// 解析为 recipe::MemoryRecipe——检索权重/半衰期/生命周期阈值数据化;
+    /// 未配置=词法 legacy 行为,既有 agent 零影响)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<serde_json::Value>,
     /// C3: 记忆区占窗口的比例（默认 0.25）
     #[serde(default = "default_memory_budget_ratio")]
     pub memory_budget_ratio: f32,
@@ -193,6 +198,7 @@ impl Default for MemoryConfig {
             extraction_keywords: None,
             extraction_explicit_phrases: None,
             lex_store: None,
+            recipe: None,
             memory_budget_ratio: default_memory_budget_ratio(),
             max_session_summaries: default_max_session_summaries(),
             max_injected_events: default_max_injected_events(),
