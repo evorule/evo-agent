@@ -6,6 +6,7 @@
 pub mod acceptance;
 pub mod adjudicator;
 pub mod approval;
+pub mod recipe;
 pub mod assembly;
 pub mod atif;
 pub mod audited_llm;

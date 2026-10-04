@@ -129,7 +129,7 @@ pub async fn sediment(
                     .write_shared_summary(session_id, &out.summary)
                     .await
                 {
-                    // O-248②:CacheOnly 不计入 summary_written（防虚报；B3 对账补偿）
+                    // 缺陷登记项②:CacheOnly 不计入 summary_written（防虚报；B3 对账补偿）
                     Ok(PersistOutcome::Persisted { .. }) => result.summary_written = true,
                     Ok(PersistOutcome::CacheOnly) => tracing::warn!(
                         session_id = %session_id,

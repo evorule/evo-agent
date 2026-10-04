@@ -1057,7 +1057,7 @@ impl MemoryManager {
     ///
     /// # 返回值
     ///
-    /// - `Ok(PersistOutcome)`（O-248②）：Persisted=已落审计链，CacheOnly=仅本地
+    /// - `Ok(PersistOutcome)`（缺陷登记项②）：Persisted=已落审计链，CacheOnly=仅本地
     ///   （调用方——sediment——不应把 CacheOnly 计为 summary_written）
     /// - `Err(e)`:键校验失败（空键/超长）或 session 未设置
     ///
@@ -1278,7 +1278,7 @@ impl MemoryManager {
 
     /// 旧版 remove（向后兼容，默认 Session scope）
     ///
-    /// 返回 (被移除记录（若 cache 有），墓碑持久化结果)——O-248①：CacheOnly
+    /// 返回 (被移除记录（若 cache 有），墓碑持久化结果)——缺陷登记项①：CacheOnly
     /// 表示墓碑未达 server（投影读将复活该 key），调用方应告警或重试。
     pub async fn remove(
         &mut self,
@@ -1290,7 +1290,7 @@ impl MemoryManager {
 
     /// 分层 remove（P1）
     ///
-    /// O-248①：null 墓碑持久化失败不再静默——PersistOutcome 随返回值上浮
+    /// 缺陷登记项①：null 墓碑持久化失败不再静默——PersistOutcome 随返回值上浮
     /// （E10 口径；CacheOnly=删除未达 server，投影读将复活该 key）。
     pub async fn remove_scoped(
         &mut self,
@@ -1301,7 +1301,7 @@ impl MemoryManager {
         let removed = self.cache.remove(&cache_key);
 
         // best-effort 持久化：真相在 evorule，HTTP 失败不阻断（cache 为离线兜底），
-        // 但结果上浮（O-248①）
+        // 但结果上浮（缺陷登记项①）
         let session_id = self.session_id_for_scope(&scope)?;
         let path = self.build_path_scoped(&scope, key);
         let null_value = serde_json::json!(null);
@@ -3527,7 +3527,7 @@ mod tests {
         let mut mgr = MemoryManager::new("ns", make_test_client()).with_session_id("s1");
         tokio_test::block_on(async {
             let result = mgr.write_shared_summary("s1", "摘要").await.unwrap();
-            // O-248②: write_shared_summary 返回 PersistOutcome（fact_id 回填挂账 server 仓）
+            // 缺陷登记项②: write_shared_summary 返回 PersistOutcome（fact_id 回填挂账 server 仓）
             // make_test_client 不可达 → CacheOnly
             assert_eq!(result, PersistOutcome::CacheOnly);
         });
