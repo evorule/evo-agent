@@ -110,6 +110,28 @@ pub struct ToolsSection {
     pub expose: Vec<String>,
 }
 
+/// 跨源检索源启用开关（跨源注册规格策略面）。
+///
+/// 源启用是策略不是代码：新增记忆源（journal 摘要投影/技能索引/
+/// 北极星残余节/材料）的注册与检索暴露由本节声明，缺省全关=
+/// 既有 agent 零影响。semantic/episodic/会话摘要三族的既有覆盖不受
+/// 本节管辖（恒启用）。serde 宽容语义与既有节一致（未知名忽略）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SourcesSection {
+    /// journal 摘要投影源（work 型，sediment 会话末派生品）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub journal_digest: bool,
+    /// 技能索引源（procedural 型，声明面镜像+正文本地索引）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skills_index: bool,
+    /// 北极星 pack 残余节源（procedural 型，mirror 通道扩展）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub northstar_pack: bool,
+    /// 材料源（procedural 型，随程序记忆统一批落地）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub materials: bool,
+}
+
 fn default_degradation() -> Vec<String> {
     vec![
         "stable".to_string(),
@@ -135,6 +157,9 @@ pub struct MemoryRecipe {
     /// 自省工具暴露面（F-611；缺省=不暴露任何工具）
     #[serde(default)]
     pub tools: ToolsSection,
+    /// 跨源检索源启用开关（注册规格策略面；缺省=全关，既有 agent 零影响）
+    #[serde(default)]
+    pub sources: SourcesSection,
 }
 
 impl Default for MemoryRecipe {
@@ -157,6 +182,7 @@ impl Default for MemoryRecipe {
                 degradation_order: default_degradation(),
             },
             tools: ToolsSection::default(),
+            sources: SourcesSection::default(),
         }
     }
 }

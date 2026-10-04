@@ -362,6 +362,18 @@ impl LexStore {
         out
     }
 
+    /// 行级类别直证:(source, mem_type)。供工具响应面直证域与调用方
+    /// 型别判定;行不在缓存=None。
+    pub fn fact_class(&self, fact_id: u64) -> Option<(String, String)> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT source, mem_type FROM facts WHERE fact_id = ?1 LIMIT 1",
+            [fact_id as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .ok()
+    }
+
     /// P2 实体检索原语：按实体名直查候选集。
     pub fn entity_scan(&self, entity: &str, prefix: &str) -> Result<Vec<u64>, LexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
