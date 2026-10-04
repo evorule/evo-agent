@@ -891,6 +891,7 @@ mod tests {
             confidence: None,
             tags: Vec::new(),
             fact_id: None,
+            lifecycle_state: None,
             cause_fact_id: None,
             evidence: None,
         };
@@ -1153,6 +1154,7 @@ mod tests {
             confidence: None,
             tags: Vec::new(),
             fact_id: None,
+            lifecycle_state: None,
             cause_fact_id: None,
             evidence: None,
         };

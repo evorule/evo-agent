@@ -212,6 +212,10 @@ pub struct MemoryRecord {
     /// 证据（B4 记忆证据伴随，07c 定义）。**存储时恒 None**，仅展示/审计时按需填充（attach_evidence）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<crate::agent::memory_event::evidence::MemoryEvidence>,
+    /// 生命周期状态（阶段 2/R4：Captured/Settled/Consolidated/Promoted/...
+    /// 显式字段=重放直证；None=历史数据（视同 Settled）。状态迁移=新增事实，不改写本字段）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_state: Option<String>,
 }
 
 impl MemoryRecord {
@@ -220,6 +224,7 @@ impl MemoryRecord {
         Self {
             key: key.to_string(),
             value: value.to_string(),
+            lifecycle_state: None,
             timestamp,
             source: None,
             confidence: None,
@@ -421,21 +426,68 @@ fn stable_relevance(record: &MemoryRecord, goal_uniq_sorted: &[String]) -> usize
 /// 词法评分在检索红线内（确定性词法，禁向量库）。排序须在
 /// `fit_recall` 前缀截断之前完成，截断即优先淘汰低价值条目（I6）。
 pub(crate) fn sort_stable_by_value(stable: &mut [MemoryRecord], goal: &str) {
+    // 阶段 2（策略数据化）：无 Recipe 场景 = 词法 legacy（w_r=1，行为与历史逐字节一致）；
+    // Recipe 在位时召回入口应走 sort_by_policy（三因子加权）
+    let policy = crate::agent::recipe::RetrievalPolicy::default_lexical();
+    sort_by_policy(stable, goal, &policy);
+}
+
+/// 三因子加权排序（策略数据化通用版）：
+/// `S = w_r·rel_norm + w_t·recency + w_i·confidence`
+/// rel_norm = 命中数/最大命中数（批内归一，避免绝对数尺度支配加权）；
+/// recency = 半衰期因子（0.5^(age_days/half_life)，语义分型）；
+/// 全序 Tie-break：新鲜度 ▸ 置信度 ▸ key 字典序（确定性可回放）。
+pub(crate) fn sort_by_policy(
+    stable: &mut [MemoryRecord],
+    goal: &str,
+    policy: &crate::agent::recipe::RetrievalPolicy,
+) {
     let mut goal_uniq = tokenize_for_match(goal);
     goal_uniq.sort();
     goal_uniq.dedup();
-    stable.sort_by(|a, b| {
-        let ra = stable_relevance(a, &goal_uniq);
-        let rb = stable_relevance(b, &goal_uniq);
-        rb.cmp(&ra)
-            .then(b.timestamp.cmp(&a.timestamp))
+    let now = now_secs() as f64;
+    let rels: Vec<usize> = stable
+        .iter()
+        .map(|r| stable_relevance(r, &goal_uniq))
+        .collect();
+    let max_rel = rels.iter().copied().max().unwrap_or(0).max(1);
+    // 预计算每条的三因子（避免比较器内重复计算）
+    let scores: Vec<f32> = stable
+        .iter()
+        .zip(rels.iter())
+        .map(|(r, &rel)| {
+            let rel_norm = rel as f32 / max_rel as f32;
+            let age_days = (now_secs().saturating_sub(r.timestamp)) as f64 / 86400.0;
+            let half = if r.key.contains("events.") {
+                policy.half_life_episodic_days
+            } else {
+                policy.half_life_semantic_days
+            };
+            let recency = policy.recency_factor(age_days, half);
+            let importance = r.confidence.unwrap_or(0.5);
+            policy.w_relevance * rel_norm
+                + policy.w_recency * recency
+                + policy.w_importance * importance
+        })
+        .collect();
+    //排序：S desc ▸ timestamp desc ▸ confidence desc ▸ key asc（确定性全序）
+    let mut idx: Vec<usize> = (0..stable.len()).collect();
+    idx.sort_by(|&i, &j| {
+        scores[j]
+            .total_cmp(&scores[i])
+            .then(stable[j].timestamp.cmp(&stable[i].timestamp))
             .then(
-                b.confidence
+                stable[j]
+                    .confidence
                     .unwrap_or(0.5)
-                    .total_cmp(&a.confidence.unwrap_or(0.5)),
+                    .total_cmp(&stable[i].confidence.unwrap_or(0.5)),
             )
-            .then(a.key.cmp(&b.key))
+            .then(stable[i].key.cmp(&stable[j].key))
     });
+    let sorted: Vec<MemoryRecord> = idx.into_iter().map(|k| stable[k].clone()).collect();
+    for (slot, rec) in stable.iter_mut().zip(sorted.into_iter()) {
+        *slot = rec;
+    }
 }
 
 /// C2: 召回上下文（三层召回结果）
@@ -733,6 +785,8 @@ pub struct MemoryManager {
     /// 走本地索引缓存,TTL 过期才全量刷新——省每轮 O(N) 网络拉取。
     /// None=全量路径,零影响;I14:store 错误一律降级全量)
     pub(crate) lex_store: Option<std::sync::Arc<crate::agent::lexstore::LexStore>>,
+    /// 阶段 2(F-610):MemoryRecipe 策略规则集(可选;None=词法 legacy 行为)
+    pub(crate) recipe: Option<crate::agent::recipe::MemoryRecipe>,
     session_id: Option<String>,
     cache: BTreeMap<String, MemoryRecord>,
     /// 记忆过期时间（秒，用户决策 5：TTL）
@@ -776,6 +830,7 @@ impl MemoryManager {
             namespace: namespace.to_string(),
             evorule_client,
             lex_store: None,
+            recipe: None,
             session_id: None,
             cache: BTreeMap::new(),
             ttl_secs: None,
@@ -1621,6 +1676,8 @@ impl MemoryManager {
     ) -> RecallContext {
         let ns = &self.namespace;
         let mut ctx = RecallContext::default();
+        // 阶段 2(R1):检索策略上下文——Recipe 在位=三因子加权；None=词法 legacy
+        let policy = self.recipe_policy();
 
         // 1. stable: get_shared_facts(Some("shared.{ns}.stable."))
         let stable_prefix = format!("shared.{}.stable.", ns);
@@ -1640,7 +1697,7 @@ impl MemoryManager {
             }
             // F-605：价值排序（相关性▸新鲜度▸置信度，key 全序兜底）——
             // 在 fit_recall 前缀截断前完成，截断优先淘汰低价值条目（I6）。
-            sort_stable_by_value(&mut ctx.stable, goal);
+            sort_by_policy(&mut ctx.stable, goal, &policy);
         }
 
         // 2. summaries: get_shared_facts(Some("shared.{ns}.sessions."))
@@ -1674,26 +1731,41 @@ impl MemoryManager {
             .recall_facts_cached(&events_prefix, "events", goal, &mut ctx.degradation_notices)
             .await
         {
-            let mut events: Vec<(MemoryRecord, usize)> = facts
+            let mut events: Vec<(MemoryRecord, f32)> = facts
                 .into_iter()
                 .filter_map(|f| {
                     serde_json::from_value::<MemoryRecord>(f.value)
                         .ok()
                         .map(|mut r| {
                             r.fact_id = Some(f.fact_id);
-                            // R05（E4）：CJK 感知确定性分词 + 关键词重叠评分
-                            // （修复前 split_whitespace 对中文整句切词，得分恒 0）
+                            // R05（E4）：CJK 感知确定性分词 + 关键词重叠计数
                             let value_lower = r.value.to_lowercase();
-                            let score = tokenize_for_match(goal)
+                            let hits = tokenize_for_match(goal)
                                 .iter()
                                 .filter(|kw| value_lower.contains(kw.as_str()))
                                 .count();
+                            // 阶段 2：评分双模式——Recipe 在位=三因子加权
+                            // （相关性归一+情景半衰期+置信度）；None=词法 legacy
+                            let score = if policy.is_legacy() {
+                                hits as f32
+                            } else {
+                                let goal_n = tokenize_for_match(goal).len().max(1) as f32;
+                                let rel_norm = (hits as f32 / goal_n).min(1.0);
+                                let age_days =
+                                    (now_secs().saturating_sub(r.timestamp)) as f64 / 86400.0;
+                                let recency =
+                                    policy.recency_factor(age_days, policy.half_life_episodic_days);
+                                let conf = r.confidence.unwrap_or(0.5);
+                                policy.w_relevance * rel_norm
+                                    + policy.w_recency * recency
+                                    + policy.w_importance * conf
+                            };
                             (r, score)
                         })
                 })
                 .collect();
-            // 按 score 降序，同分按时间倒序
-            events.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.timestamp.cmp(&a.0.timestamp)));
+            // 按 score 降序，同分按时间倒序（f32 全序比较，确定性）
+            events.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.timestamp.cmp(&a.0.timestamp)));
             ctx.events = events
                 .into_iter()
                 .take(max_events)
@@ -1707,6 +1779,20 @@ impl MemoryManager {
     /// 阶段 1(F-618):注入 LexStore 检索缓存
     pub fn set_lex_store(&mut self, store: std::sync::Arc<crate::agent::lexstore::LexStore>) {
         self.lex_store = Some(store);
+    }
+
+    /// 阶段 2(F-610):注入 MemoryRecipe 策略规则集
+    pub fn set_recipe(&mut self, recipe: crate::agent::recipe::MemoryRecipe) {
+        self.recipe = Some(recipe);
+    }
+
+    /// R1:检索策略上下文——召回入口单点构造
+    /// (Recipe 在位=三因子加权;None=词法 legacy,行为与历史逐字节一致)
+    pub(crate) fn recipe_policy(&self) -> crate::agent::recipe::RetrievalPolicy {
+        self.recipe
+            .as_ref()
+            .map(crate::agent::recipe::RetrievalPolicy::from_recipe)
+            .unwrap_or_else(crate::agent::recipe::RetrievalPolicy::default_lexical)
     }
 
     /// 召回事实获取的缓存优先封装(F-618):

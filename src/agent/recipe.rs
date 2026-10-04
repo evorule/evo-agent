@@ -200,6 +200,12 @@ impl RetrievalPolicy {
         }
         (0.5f64).powf(age_days / half_life_days) as f32
     }
+
+    /// 词法 legacy 判定：新鲜度/重要性权重全零 = 历史行为模式
+    /// （该模式下评分退化为纯词法命中数，与策略数据化前逐字节一致）
+    pub fn is_legacy(&self) -> bool {
+        self.w_recency == 0.0 && self.w_importance == 0.0
+    }
 }
 
 #[cfg(test)]
