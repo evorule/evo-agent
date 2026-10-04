@@ -1,4 +1,4 @@
-//! 16 号档 D2:验收判据自检门禁(TB/长程模式)。
+//! 验收判据自检门禁(TB/长程模式)。
 //!
 //! `task_done` 提交前 runner 强制执行验收命令(`acceptance_command`,
 //! definition 配置):exit 0=判据通过放行,非 0=门禁拒绝——**判据不过
