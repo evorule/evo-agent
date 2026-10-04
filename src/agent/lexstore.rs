@@ -169,6 +169,22 @@ impl LexStore {
         Some(out)
     }
 
+    /// 反查 fact_id → path(F-616 usage 批量回写的路径定位)
+    pub fn paths_by_fact_ids(&self, fact_ids: &[u64]) -> std::collections::HashMap<u64, String> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = std::collections::HashMap::new();
+        for fid in fact_ids {
+            if let Ok(path) = conn.query_row(
+                "SELECT path FROM facts WHERE fact_id = ?1 LIMIT 1",
+                [fid],
+                |row| row.get::<_, String>(0),
+            ) {
+                out.insert(*fid, path);
+            }
+        }
+        out
+    }
+
     /// P1 检索原语:goal 词法倒排候选集(按命中 token 数降序,上限 limit)。
     /// 返回 (fact_id, hits)——评分语义在调用方(存储不藏策略,12 号原则 5)。
     pub fn lookup_candidates(

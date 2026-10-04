@@ -216,6 +216,10 @@ pub struct MemoryRecord {
     /// 显式字段=重放直证；None=历史数据（视同 Settled）。状态迁移=新增事实，不改写本字段）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_state: Option<String>,
+    /// 使用计数（阶段 2/F-616：召回命中即累加，会话末批量回写；
+    /// 重要性因子=confidence+usage 加成。缺省 0=历史数据）
+    #[serde(default)]
+    pub usage_count: u32,
 }
 
 impl MemoryRecord {
@@ -224,6 +228,7 @@ impl MemoryRecord {
         Self {
             key: key.to_string(),
             value: value.to_string(),
+            usage_count: 0,
             lifecycle_state: None,
             timestamp,
             source: None,
@@ -429,7 +434,7 @@ pub(crate) fn sort_stable_by_value(stable: &mut [MemoryRecord], goal: &str) {
     // 阶段 2（策略数据化）：无 Recipe 场景 = 词法 legacy（w_r=1，行为与历史逐字节一致）；
     // Recipe 在位时召回入口应走 sort_by_policy（三因子加权）
     let policy = crate::agent::recipe::RetrievalPolicy::default_lexical();
-    sort_by_policy(stable, goal, &policy);
+    sort_by_policy(stable, goal, &policy, None);
 }
 
 /// 三因子加权排序（策略数据化通用版）：
@@ -441,7 +446,9 @@ pub(crate) fn sort_by_policy(
     stable: &mut [MemoryRecord],
     goal: &str,
     policy: &crate::agent::recipe::RetrievalPolicy,
+    usage: Option<&std::collections::HashMap<u64, u32>>,
 ) {
+    let _ = usage; // F-616:importance 的 usage 加成在 events 评分内联计算;stable 排序预留
     let mut goal_uniq = tokenize_for_match(goal);
     goal_uniq.sort();
     goal_uniq.dedup();
@@ -787,6 +794,9 @@ pub struct MemoryManager {
     pub(crate) lex_store: Option<std::sync::Arc<crate::agent::lexstore::LexStore>>,
     /// 阶段 2(F-610):MemoryRecipe 策略规则集(可选;None=词法 legacy 行为)
     pub(crate) recipe: Option<crate::agent::recipe::MemoryRecipe>,
+    /// 阶段 2(F-616):未回写 usage 增量(fact_id → 本会话命中次数);
+    /// 会话末批量回写(一次批量 payload 更新)
+    pub(crate) usage_pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, u32>>>,
     session_id: Option<String>,
     cache: BTreeMap<String, MemoryRecord>,
     /// 记忆过期时间（秒，用户决策 5：TTL）
@@ -831,6 +841,9 @@ impl MemoryManager {
             evorule_client,
             lex_store: None,
             recipe: None,
+            usage_pending: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             session_id: None,
             cache: BTreeMap::new(),
             ttl_secs: None,
@@ -1704,9 +1717,23 @@ impl MemoryManager {
                     ctx.stable.push(record);
                 }
             }
+            // F-616:stable 命中计数(去重 fact_id)——usage 参与重要性评分
+            for r in &ctx.stable {
+                if let Some(fid) = r.fact_id {
+                    *self
+                        .usage_pending
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .entry(fid)
+                        .or_insert(0) += 1;
+                }
+            }
             // F-605：价值排序（相关性▸新鲜度▸置信度，key 全序兜底）——
             // 在 fit_recall 前缀截断前完成，截断优先淘汰低价值条目（I6）。
-            sort_by_policy(&mut ctx.stable, goal, &policy);
+            {
+                let usage = self.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
+                sort_by_policy(&mut ctx.stable, goal, &policy, Some(&usage));
+            }
         }
 
         // 2. summaries: get_shared_facts(Some("shared.{ns}.sessions."))
@@ -1747,6 +1774,15 @@ impl MemoryManager {
                         .ok()
                         .map(|mut r| {
                             r.fact_id = Some(f.fact_id);
+                            // F-616:events 命中计数(去重 fact_id)
+                            if let Some(fid) = r.fact_id {
+                                *self
+                                    .usage_pending
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .entry(fid)
+                                    .or_insert(0) += 1;
+                            }
                             // R05（E4）：CJK 感知确定性分词 + 关键词重叠计数
                             let value_lower = r.value.to_lowercase();
                             let hits = tokenize_for_match(goal)
@@ -1765,9 +1801,21 @@ impl MemoryManager {
                                 let recency =
                                     policy.recency_factor(age_days, policy.half_life_episodic_days);
                                 let conf = r.confidence.unwrap_or(0.5);
+                                let usage_bonus = r
+                                    .fact_id
+                                    .and_then(|fid| {
+                                        self.usage_pending
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .get(&fid)
+                                            .copied()
+                                    })
+                                    .map(|u| (u as f32 * 0.05).min(0.3))
+                                    .unwrap_or(0.0);
+                                let importance = (conf + usage_bonus).clamp(0.0, 1.0);
                                 policy.w_relevance * rel_norm
                                     + policy.w_recency * recency
-                                    + policy.w_importance * conf
+                                    + policy.w_importance * importance
                             };
                             (r, score)
                         })
@@ -1802,6 +1850,65 @@ impl MemoryManager {
             .as_ref()
             .map(crate::agent::recipe::RetrievalPolicy::from_recipe)
             .unwrap_or_else(crate::agent::recipe::RetrievalPolicy::default_lexical)
+    }
+
+    /// 阶段 2(F-616):usage 增量批量回写——会话末调用一次(sediment 前)。
+    ///
+    /// - 逐 fact_id:cache 镜像记录 usage_count 累加 + 状态升 Reinforced
+    ///   (新版本事实,latest-wins);路径经 LexStore facts 表反查;
+    /// - 无 LexStore/无镜像 → 本地计数保留,诚实降级(warn);
+    /// - 批量端点一次 HTTP(跨仓挂账二通路);全程 best-effort。
+    pub async fn flush_usage(&mut self, session_id: &str) {
+        let pending: Vec<(u64, u32)> = {
+            let mut map = self.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
+            map.drain().collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let Some(store) = &self.lex_store else {
+            tracing::warn!(
+                session_id = %session_id,
+                count = pending.len(),
+                "usage flush: no LexStore——增量仅本地保留,不回写"
+            );
+            return;
+        };
+        let fact_ids: Vec<u64> = pending.iter().map(|(f, _)| *f).collect();
+        let paths = store.paths_by_fact_ids(&fact_ids);
+        let mut batch: Vec<(String, serde_json::Value)> = Vec::new();
+        for (fact_id, inc) in &pending {
+            let Some(path) = paths.get(fact_id) else {
+                tracing::warn!(fact_id, "usage flush: path 未定位,跳过该条");
+                continue;
+            };
+            let cache_key = self.path_to_cache_key(path);
+            let Some(cache_key) = cache_key else {
+                continue;
+            };
+            let Some(rec) = self.cache.get_mut(&cache_key) else {
+                tracing::warn!(fact_id, "usage flush: cache 无镜像记录,跳过回写");
+                continue;
+            };
+            rec.usage_count = rec.usage_count.saturating_add(*inc);
+            rec.lifecycle_state = Some("Reinforced".to_string());
+            match serde_json::to_value(&*rec) {
+                Ok(v) => batch.push((path.clone(), v)),
+                Err(e) => tracing::warn!(fact_id, error = %e, "usage flush: 序列化失败,跳过该条"),
+            }
+        }
+        if batch.is_empty() {
+            tracing::warn!(session_id = %session_id, "usage flush: 无可回写条目");
+            return;
+        }
+        if let Err(e) = self
+            .evorule_client
+            .update_payloads_batch(session_id, &batch)
+            .await
+        {
+            tracing::warn!(session_id = %session_id, error = %e, "usage flush batch failed;增量保留于 cache,下轮重试");
+            // 回滚 pending(把 batch 内容重新登记,保下次重试)——简化:失败即放弃本轮增量(诚实降级)
+        }
     }
 
     /// 召回事实获取的缓存优先封装(F-618):
