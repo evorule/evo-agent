@@ -2862,10 +2862,9 @@ fn temp_lex_db(tag: &str) -> std::path::PathBuf {
 #[test]
 fn test_exposed_tools_from_definition_conditions() {
     let mut def = make_def_with_tools(vec![]);
-    // 缺 lex_store → 不放行
+    // 缺 recipe → 不放行
     assert!(crate::agent::memory_tool::exposed_tools_from_definition(&def).is_empty());
-    // lex_store + recipe.tools.expose → 放行两件;写面工具(依赖治理闸)被过滤
-    def.memory.lex_store = Some("mem.db".to_string());
+    // A2-2 暴露条件拆分:无 lex_store → 读件不放行,写件(memory_propose)放行
     def.memory.recipe = Some(serde_json::json!({
         "recipe_version": "memory-v1.0",
         "retrieval": {}, "lifecycle": {}, "budget": {},
@@ -2873,8 +2872,50 @@ fn test_exposed_tools_from_definition_conditions() {
     }));
     assert_eq!(
         crate::agent::memory_tool::exposed_tools_from_definition(&def),
-        vec!["memory_search".to_string(), "memory_get".to_string()]
+        vec!["memory_propose".to_string()]
     );
+    // lex_store + recipe.tools.expose → 三件全放行(写件不再被过滤)
+    def.memory.lex_store = Some("mem.db".to_string());
+    assert_eq!(
+        crate::agent::memory_tool::exposed_tools_from_definition(&def),
+        vec![
+            "memory_search".to_string(),
+            "memory_get".to_string(),
+            "memory_propose".to_string()
+        ]
+    );
+}
+
+#[test]
+fn test_register_memory_propose_without_lex_store() {
+    // A2-2:写件不依赖 lex_store——recipe 声明即可注册,锚注册期为空
+    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    let mut mem = crate::agent::memory::MemoryManager::new("ns", make_test_client());
+    mem.set_recipe(make_memory_recipe_with_expose(vec!["memory_propose"]));
+    runner.memory = Some(mem);
+    // from_definition 从 def.memory.namespace 赋值;单元测试直设同值
+    runner.sediment_config.namespace = "ns".to_string();
+    runner.config.tool_names = vec!["memory_propose".to_string()];
+    runner.register_memory_introspection_tools().unwrap();
+    assert!(runner.tool_handler.has_tool("memory_propose"));
+    assert!(!runner.tool_handler.has_tool("memory_search"));
+    // 注册期锚存在但为空;bind 后与会话一致(两 run 路径同款调用)
+    let anchor = runner
+        .propose_anchor
+        .as_ref()
+        .expect("propose anchor must be created when memory_propose registers");
+    assert!(anchor.read().unwrap().is_none());
+    runner.bind_propose_anchor("s-anchor-1");
+    assert_eq!(anchor.read().unwrap().as_deref(), Some("s-anchor-1"));
+    // schema 随注册下发(随 openai_tools_payload 进 LLM 工具契约)
+    let schemas = AgentRunner::openai_function_schemas_for(&runner.tool_handler.tool_names());
+    let schema = schemas
+        .iter()
+        .find(|s| s["function"]["name"] == "memory_propose")
+        .expect("memory_propose schema must be emitted for registered write tool");
+    assert!(schema["function"]["parameters"]["properties"]
+        .get("candidates")
+        .is_some());
 }
 
 #[test]

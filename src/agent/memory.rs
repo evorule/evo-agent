@@ -2000,10 +2000,13 @@ impl MemoryManager {
         ))
     }
 
-    /// 阶段 3(F-611):暴露面集合——Recipe.tools.expose ∩ 已实现的只读两件。
+    /// 阶段 3(F-611):暴露面集合——Recipe.tools.expose ∩ 已实现的自省三件。
     ///
-    /// 未知名 warn 跳过(数据面笔误不致命,但要留痕可查);
-    /// 写面工具依赖治理闸,不在本实现集,声明了同样 warn 跳过。
+    /// 暴露条件按读写拆分(A2-2 §3.3):读件要求 lex_store 在位(检索缓存是
+    /// 读面数据前提——声明了读件而无 lex_store 从本函数即不视为可暴露,
+    /// 注册步 missing 检查早失败,fail-visible);写件(memory_propose)不
+    /// 检索,声明即可。
+    /// 未知名 warn 跳过(数据面笔误不致命,但要留痕可查)。
     pub(crate) fn exposed_introspection_tools(&self) -> Vec<String> {
         let Some(recipe) = &self.recipe else {
             return Vec::new();
@@ -2016,8 +2019,13 @@ impl MemoryManager {
                 let known = crate::agent::memory_tool::is_introspection_tool(n);
                 if !known {
                     tracing::warn!(tool = %n, "recipe.tools.expose declares unknown/unavailable memory tool; skipped");
+                    return false;
                 }
-                known
+                if crate::agent::memory_tool::is_introspection_write_tool(n) {
+                    true
+                } else {
+                    self.lex_store.is_some()
+                }
             })
             .cloned()
             .collect()

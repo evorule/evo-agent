@@ -816,6 +816,12 @@ pub struct AgentRunner {
     /// 由 `from_definition` 从 `def.memory` 自动构造。控制会话沉淀行为
     /// (命名空间、事件提取开关、摘要上限等)。
     sediment_config: sediment::SedimentConfig,
+    /// A2-2(F-611 写件):memory_propose 会话锚(None=写件未注册)
+    ///
+    /// 注册期构造空锚并注入 MemoryProposer;两 run 路径 create_session 后
+    /// 绑定——Shared 域写=写当前会话 payload,运行期才可绑定(与
+    /// MemoryManager/MemoryEventStore 的 session_id 同步同型)。
+    propose_anchor: Option<std::sync::Arc<std::sync::RwLock<Option<String>>>>,
     /// C3:总上下文窗口 token 数（由 `def.context_window_tokens` 构造，默认 8192）
     ///
     /// 作为记忆区预算基准传入 `AssemblyExecutor::assemble`（配方的
@@ -887,6 +893,7 @@ impl AgentRunner {
             memory_event_store: None,
             extractor: None,
             sediment_config: sediment::SedimentConfig::default(),
+            propose_anchor: None,
             max_context_tokens: 8192,
             assembly: crate::agent::assembly::AssemblyExecutor::default_executor(),
             tool_result_max_chars: 48_000,
@@ -1127,9 +1134,8 @@ impl AgentRunner {
                 }
             }
         }
-        // 阶段 3(F-611):自省记忆工具注册(声明面已在 step 2 按暴露条件预放行;
-        // 此处声明了而条件不满足=配置矛盾,早失败)
-        runner.register_memory_introspection_tools()?;
+        // 阶段 3(F-611)读件注册前移除——A2-2 起注册挪至 sediment_config 赋值
+        // 之后(写件 MemoryProposer 的 namespace 取自 sediment_config)
         // C1:沉淀配置(总是构造,sediment_session 在 memory 为 None 时是 no-op)
         // C3/C4:从 MemoryConfig 读取 max_session_summaries/max_injected_events/
         //        summary_rollup_threshold/enable_event_extraction
@@ -1151,6 +1157,10 @@ impl AgentRunner {
             enable_knowledge_extraction: def.memory.enable_knowledge_extraction,
             min_messages_for_extraction: 4,
         };
+        // 阶段 3(F-611)+A2-2:自省记忆工具注册(声明面已在 step 2 按暴露条件
+        // 预放行;此处声明了而条件不满足=配置矛盾,早失败)。置于 sediment_config
+        // 赋值之后:写件(MemoryProposer)的 namespace 取自 sediment_config
+        runner.register_memory_introspection_tools()?;
         // 判据自检回路——acceptance_command 从 definition 穿线
         // (task_done 提交前 runner 强制执行验收命令,判据不过不存在 done 退出路径)
         runner.acceptance_command = def.acceptance_command.clone();
@@ -1749,6 +1759,8 @@ impl AgentRunner {
         if let Some(mem) = self.memory.as_mut() {
             mem.set_session_id(&session_id);
         }
+        // A2-2:memory_propose 会话锚绑定(注册期空锚,运行期才可绑定)
+        self.bind_propose_anchor(&session_id);
 
         // G17:session 指标 — sessions_total + sessions_active(RAII guard 保证所有返回路径 dec)
         if let Some(m) = &self.metrics {
@@ -2092,10 +2104,11 @@ impl AgentRunner {
         Ok(AgentResult::error(closed_error, step_count, duration))
     }
 
-    /// 阶段 3(F-611):自省记忆工具注册——只读两件(search/get)。
+    /// 阶段 3(F-611)+A2-2:自省记忆工具注册——读两件(search/get)+写一件(propose)。
     ///
-    /// 暴露面=策略:`MemoryRecipe.tools.expose` 白名单声明,前置=LexStore 在位
-    /// (检索缓存是自省检索的数据前提)。协作件全部与 MemoryManager 共享
+    /// 暴露面=策略(按读写拆分,A2-2 §3.3):`MemoryRecipe.tools.expose` 白名单
+    /// 声明;读件另要求 LexStore 在位(检索缓存是读面数据前提),写件
+    /// (memory_propose)不检索、声明即可。协作件全部与 MemoryManager 共享
     /// (usage 计数/审计器同源,不产生第二策略面)。
     /// `tools` 配置声明了自省工具而暴露条件不满足=配置矛盾,早失败(可控);
     /// 未声明而条件满足=照常注册(注册即随 openai_tools_payload 下发,
@@ -2116,30 +2129,67 @@ impl AgentRunner {
         if !missing.is_empty() {
             return Err(AgentError::Internal(format!(
                 "agent config lists memory introspection tool(s) {declared:?} but exposure \
-                 conditions are not met (requires memory.type=persistent, memory.recipe with \
-                 tools.expose declaring them, and memory.lex_store configured); unmet: {missing:?}"
+                 conditions are not met (requires memory.type=persistent and memory.recipe \
+                 with tools.expose declaring them; read tools additionally require \
+                 memory.lex_store configured); unmet: {missing:?}"
             )));
         }
-        if let Some(intro) = intro {
-            if exposed.is_empty() {
-                return Ok(());
-            }
-            let intro = std::sync::Arc::new(intro);
-            for name in &exposed {
-                let exec: std::sync::Arc<dyn ToolFunction> = match name.as_str() {
-                    crate::agent::memory_tool::MEMORY_SEARCH_TOOL => std::sync::Arc::new(
-                        crate::agent::memory_tool::MemorySearchTool::new(intro.clone()),
-                    ),
-                    crate::agent::memory_tool::MEMORY_GET_TOOL => std::sync::Arc::new(
-                        crate::agent::memory_tool::MemoryGetTool::new(intro.clone()),
-                    ),
-                    _ => continue,
-                };
-                self.tool_handler.register_tool(name, exec);
-                info!(tool = %name, "memory introspection tool registered");
-            }
+        if exposed.is_empty() {
+            return Ok(());
+        }
+        let intro = intro.map(std::sync::Arc::new);
+        // A2-2:写件协作件惰性构造(与读件 Intro 相互独立——不依赖 LexStore);
+        // 会话锚注册期为空,两 run 路径 create_session 后 bind_propose_anchor
+        let mut proposer: Option<std::sync::Arc<crate::agent::memory_tool::MemoryProposer>> = None;
+        for name in &exposed {
+            let exec: Option<std::sync::Arc<dyn ToolFunction>> = match name.as_str() {
+                crate::agent::memory_tool::MEMORY_SEARCH_TOOL => intro.as_ref().map(|i| {
+                    std::sync::Arc::new(crate::agent::memory_tool::MemorySearchTool::new(
+                        std::sync::Arc::clone(i),
+                    )) as std::sync::Arc<dyn ToolFunction>
+                }),
+                crate::agent::memory_tool::MEMORY_GET_TOOL => intro.as_ref().map(|i| {
+                    std::sync::Arc::new(crate::agent::memory_tool::MemoryGetTool::new(
+                        std::sync::Arc::clone(i),
+                    )) as std::sync::Arc<dyn ToolFunction>
+                }),
+                crate::agent::memory_tool::MEMORY_PROPOSE_TOOL => {
+                    let p = proposer.get_or_insert_with(|| {
+                        let anchor =
+                            std::sync::Arc::new(std::sync::RwLock::new(None));
+                        let inner = std::sync::Arc::new(
+                            crate::agent::memory_tool::MemoryProposer::new(
+                                self.sediment_config.namespace.clone(),
+                                self.evorule_client.clone(),
+                                std::sync::Arc::clone(&anchor),
+                            ),
+                        );
+                        self.propose_anchor = Some(anchor);
+                        inner
+                    });
+                    Some(std::sync::Arc::new(
+                        crate::agent::memory_tool::MemoryProposeTool::new(std::sync::Arc::clone(p)),
+                    ) as std::sync::Arc<dyn ToolFunction>)
+                }
+                _ => None,
+            };
+            // 暴露拆分后读件无 Intro 不可能(exposed 已按 lex_store 过滤);防御 continue
+            let Some(exec) = exec else {
+                continue;
+            };
+            self.tool_handler.register_tool(name, exec);
+            info!(tool = %name, "memory introspection tool registered");
         }
         Ok(())
+    }
+
+    /// A2-2:绑定 memory_propose 会话锚(两 run 路径 create_session 后调用;
+    /// 写件未注册时 no-op)。Shared 域写=写当前会话 payload,运行期才可绑定。
+    fn bind_propose_anchor(&self, session_id: &str) {
+        if let Some(anchor) = &self.propose_anchor {
+            *anchor.write().unwrap_or_else(|p| p.into_inner()) = Some(session_id.to_string());
+            info!(%session_id, "memory_propose session anchor bound");
+        }
     }
 
     /// 组装随 LLM 请求下发的工具 OpenAI function schema。
@@ -3701,6 +3751,9 @@ impl AgentRunner {
             if let Some(mem) = runner.memory.as_mut() {
                 mem.set_session_id(&session_id);
             }
+            // A2-2:memory_propose 会话锚绑定(与 run() 对齐;G15 continuation
+            // 复用会话分支同样绑定,保证锚与 session 事实一致)
+            runner.bind_propose_anchor(&session_id);
 
             // B21 PR-1:journal 会话事件流(serve 注入 journal_dir 时启用)。
             // 打开失败 fail-soft 降级为无 journal 会话(warn 留痕,不阻塞主流程
