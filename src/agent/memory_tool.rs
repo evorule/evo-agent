@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::api::evorule_client::{EvoruleApiClient, SharedFactEntry};
 use crate::agent::definition::AgentDefinition;
-use crate::agent::lexstore::LexStore;
+use crate::agent::lexstore::{mem_type, LexStore};
 use crate::agent::memory::{latest_entries_by_path, sort_by_policy, tokenize_for_match, MemoryRecord};
 use crate::agent::recipe::{MemoryRecipe, RetrievalPolicy};
 use crate::agent::safety_auditor::SafetyAuditor;
@@ -65,8 +65,9 @@ pub fn memory_tool_specs() -> Vec<ToolSpec> {
                 ParameterSpec {
                     name: "kind".to_string(),
                     r#type: "string".to_string(),
-                    description: "Optional layer filter: stable | summaries | events \
-                                  (default: all layers)"
+                    description: "Optional type filter: semantic | episodic | procedural | \
+                                  work (legacy aliases: stable | summaries | events). \
+                                  Default: all types"
                         .to_string(),
                     required: false,
                 },
@@ -318,13 +319,22 @@ impl MemoryIntrospector {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "missing required param: query (non-empty string)".to_string())?
             .to_string();
-        let kind = match args.get("kind") {
+        // 型别过滤口径：四型为权威命名，旧层名保留为别名（逐字节兼容）。
+        // 过滤走行级型别直证列（跨源规格机制批），不靠前缀约定。
+        let kind_filter: Option<&'static str> = match args.get("kind") {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => match s.as_str() {
-                "stable" | "summaries" | "events" => Some(s.clone()),
+                "semantic" => Some(mem_type::SEMANTIC),
+                "episodic" => Some(mem_type::EPISODIC),
+                "procedural" => Some(mem_type::PROCEDURAL),
+                "work" => Some(mem_type::WORK),
+                "stable" => Some(mem_type::SEMANTIC),
+                "events" => Some(mem_type::EPISODIC),
+                "summaries" => Some(mem_type::WORK),
                 other => {
                     return Err(format!(
-                        "invalid kind '{other}'; expected one of: stable, summaries, events"
+                        "invalid kind '{other}'; expected one of: semantic, episodic, \
+                         procedural, work (legacy aliases: stable, summaries, events)"
                     ))
                 }
             },
@@ -342,9 +352,14 @@ impl MemoryIntrospector {
         };
 
         let mut notices: Vec<String> = Vec::new();
-        let layers: Vec<&str> = match kind.as_deref() {
-            Some(k) => vec![k],
-            None => vec!["stable", "summaries", "events"],
+        // 型别→检索层族映射：过滤由型别直证列承担；层族清单随源注册批
+        // 推进（程序源注册落地前 kind=procedural 如实空结果，无降级噪音）
+        let (layers, type_filter): (Vec<&str>, Vec<&str>) = match kind_filter {
+            None => (vec!["stable", "summaries", "events"], Vec::new()),
+            Some(mem_type::SEMANTIC) => (vec!["stable"], vec![mem_type::SEMANTIC]),
+            Some(mem_type::EPISODIC) => (vec!["events"], vec![mem_type::EPISODIC]),
+            Some(mem_type::WORK) => (vec!["summaries"], vec![mem_type::WORK]),
+            Some(mt) => (Vec::new(), vec![mt]),
         };
 
         let mut path_by_id: HashMap<u64, String> = HashMap::new();
@@ -364,10 +379,12 @@ impl MemoryIntrospector {
                 }
             }
             let candidate_limit = limit.saturating_mul(SEARCH_CANDIDATE_FACTOR).max(16);
-            let picked: Vec<MemoryRecord> = match self
-                .store
-                .lookup_candidates(&prefix, &query, candidate_limit)
-            {
+            let picked: Vec<MemoryRecord> = match self.store.lookup_candidates_typed(
+                std::slice::from_ref(&prefix),
+                &query,
+                candidate_limit,
+                &type_filter,
+            ) {
                 Ok(pairs) => {
                     let idset: std::collections::HashSet<u64> =
                         pairs.into_iter().map(|(id, _)| id).collect();
@@ -432,6 +449,11 @@ impl MemoryIntrospector {
                 AuditedText::StrippedEmpty => continue,
                 AuditedText::Rejected => Value::from("[safety audit rejected this record]"),
             };
+            let (src_col, mt_col) = r
+                .fact_id
+                .and_then(|fid| self.store.fact_class(fid))
+                .map(|(s, m)| (Value::from(s), Value::from(m)))
+                .unwrap_or((Value::Null, Value::Null));
             results.push(json!({
                 "fact_id": r.fact_id,
                 "key": r.key,
@@ -440,6 +462,8 @@ impl MemoryIntrospector {
                 "timestamp": r.timestamp,
                 "confidence": r.confidence.map(Value::from).unwrap_or(Value::Null),
                 "lifecycle_state": r.lifecycle_state.map(Value::from).unwrap_or(Value::Null),
+                "source": src_col,
+                "mem_type": mt_col,
             }));
         }
 
@@ -489,6 +513,7 @@ impl MemoryIntrospector {
             }
             AuditedText::Rejected => Value::from("[safety audit rejected this record]"),
         };
+        let class = self.store.fact_class(entry.fact_id);
         let fact_json = json!({
             "fact_id": entry.fact_id,
             "path": entry.path,
@@ -498,6 +523,8 @@ impl MemoryIntrospector {
             "confidence": record.as_ref().and_then(|r| r.confidence).map(Value::from).unwrap_or(Value::Null),
             "lifecycle_state": record.as_ref().and_then(|r| r.lifecycle_state.clone()).map(Value::from).unwrap_or(Value::Null),
             "cause_fact_id": record.as_ref().and_then(|r| r.cause_fact_id).map(Value::from).unwrap_or(Value::Null),
+            "source": class.as_ref().map(|c| c.0.clone()).map(Value::from).unwrap_or(Value::Null),
+            "mem_type": class.as_ref().map(|c| c.1.clone()).map(Value::from).unwrap_or(Value::Null),
         });
 
         let mut causes = Vec::new();
@@ -528,11 +555,14 @@ impl MemoryIntrospector {
                     AuditedText::Rejected => "[safety audit rejected this record]".to_string(),
                 };
                 let (excerpt, was_truncated) = char_truncate(&audited, CAUSE_EXCERPT_CHARS);
+                let cclass = self.store.fact_class(cid);
                 causes.push(json!({
                     "fact_id": cid,
                     "path": ce.path,
                     "excerpt": excerpt,
                     "truncated": was_truncated,
+                    "source": cclass.as_ref().map(|c| c.0.clone()).map(Value::from).unwrap_or(Value::Null),
+                    "mem_type": cclass.as_ref().map(|c| c.1.clone()).map(Value::from).unwrap_or(Value::Null),
                 }));
             }
         }
@@ -893,5 +923,100 @@ mod tests {
         let (out2, truncated2) = char_truncate("短文本", 10);
         assert_eq!(out2, "短文本");
         assert!(!truncated2);
+    }
+
+    // ===== 跨源注册策略批:kind 四型化 + 响应直证域 =====
+
+    #[tokio::test]
+    async fn test_search_type_filter_and_provenance() {
+        // 同族内一行默认推导 semantic、一行 value JSON 覆盖为 procedural:
+        // kind=semantic 按型别直证列过滤(覆盖行出局),响应携带直证域
+        let intro = make_introspector(
+            "typefilter",
+            &[
+                (1, "shared.ns.stable.llm.m.a".into(), fact_json("a", "部署完成事项甲", now())),
+                (2, "shared.ns.stable.kc.k1".into(), serde_json::json!({"key": "k1", "value": "部署完成手册", "timestamp": now(), "mem_type": "procedural"})),
+            ],
+        );
+        let sem = intro
+            .search(&serde_json::json!({"query": "部署完成", "kind": "semantic"}))
+            .await
+            .unwrap();
+        let results = sem["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "型别直证过滤:覆盖行出局");
+        assert_eq!(results[0]["fact_id"], 1);
+        assert_eq!(results[0]["source"], "ledger");
+        assert_eq!(results[0]["mem_type"], "semantic");
+        // 无 kind=不过滤(旧行为):两行都回
+        let all = intro
+            .search(&serde_json::json!({"query": "部署完成"}))
+            .await
+            .unwrap();
+        assert_eq!(all["result_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_search_kind_alias_equivalence() {
+        let intro = make_introspector(
+            "alias",
+            &[(1, "shared.ns.stable.llm.m.a".into(), fact_json("a", "别名等价测试", now()))],
+        );
+        let via_type = intro
+            .search(&serde_json::json!({"query": "别名等价", "kind": "semantic"}))
+            .await
+            .unwrap();
+        let via_legacy = intro
+            .search(&serde_json::json!({"query": "别名等价", "kind": "stable"}))
+            .await
+            .unwrap();
+        assert_eq!(via_type["results"], via_legacy["results"]);
+        assert_eq!(via_type["result_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_kind_procedural_unregistered_honest_empty() {
+        // 程序源注册落地前:kind=procedural 如实空结果,无降级噪音
+        let intro = make_introspector(
+            "proc",
+            &[(1, "shared.ns.stable.llm.m.a".into(), fact_json("a", "部署完成", now()))],
+        );
+        let out = intro
+            .search(&serde_json::json!({"query": "部署完成", "kind": "procedural"}))
+            .await
+            .unwrap();
+        assert_eq!(out["result_count"], 0);
+        assert!(out["degradation_notices"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_response_carries_provenance() {
+        let intro = make_introspector(
+            "getprov",
+            &[(7, "shared.ns.stable.llm.m.g".into(), fact_json("g", "直证域事实", now()))],
+        );
+        let out = intro.get(&serde_json::json!({"fact_id": 7})).await.unwrap();
+        assert_eq!(out["fact"]["source"], "ledger");
+        assert_eq!(out["fact"]["mem_type"], "semantic");
+    }
+
+    #[test]
+    fn test_recipe_sources_section_compat() {
+        // 无 sources 字段(历史 definition)→ 缺省全关
+        let legacy: MemoryRecipe = serde_json::from_str(
+            r#"{"recipe_version":"memory-v1.0","retrieval":{},"lifecycle":{},"budget":{}}"#,
+        )
+        .unwrap();
+        assert!(!legacy.sources.journal_digest);
+        assert!(!legacy.sources.skills_index);
+        // 带 sources → 解析
+        let with_sources: MemoryRecipe = serde_json::from_value(serde_json::json!({
+            "recipe_version": "memory-v1.0",
+            "retrieval": {}, "lifecycle": {}, "budget": {},
+            "sources": {"journal_digest": true, "skills_index": true}
+        }))
+        .unwrap();
+        assert!(with_sources.sources.journal_digest);
+        assert!(with_sources.sources.skills_index);
+        assert!(!with_sources.sources.northstar_pack);
     }
 }
