@@ -248,7 +248,7 @@ impl LexStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     prefix,
-                    fact_id,
+                    *fact_id as i64,
                     path,
                     value_json,
                     row_source::LEDGER,
@@ -261,7 +261,7 @@ impl LexStore {
                 tx.execute(
                     "INSERT OR IGNORE INTO postings(bigram, fact_id, prefix, mem_type)
                      VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![token, fact_id, prefix, mem_type],
+                    rusqlite::params![token, *fact_id as i64, prefix, mem_type],
                 )
                 .map_err(|e| LexError(format!("insert posting: {e}")))?;
             }
@@ -276,7 +276,7 @@ impl LexStore {
                 "INSERT INTO timeline(fact_id, prefix, kind, valid_at, lifecycle_state, superseded_by)
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL)
                  ON CONFLICT(fact_id) DO UPDATE SET lifecycle_state = excluded.lifecycle_state",
-                rusqlite::params![fact_id, prefix, "fact", ts, state],
+                rusqlite::params![*fact_id as i64, prefix, "fact", ts, state],
             )
             .map_err(|e| LexError(format!("insert timeline: {e}")))?;
             if let Some(entities) = value.get("entities").and_then(|v| v.as_array()) {
@@ -284,7 +284,7 @@ impl LexStore {
                     if let Some(name) = ent.get("name").and_then(|v| v.as_str()) {
                         tx.execute(
                             "INSERT OR IGNORE INTO entities(entity, fact_id, prefix) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![name, fact_id, prefix],
+                            rusqlite::params![name, *fact_id as i64, prefix],
                         )
                         .map_err(|e| LexError(format!("insert entity: {e}")))?;
                     }
@@ -293,7 +293,7 @@ impl LexStore {
             if let Some(cause) = value.get("cause_fact_id").and_then(|v| v.as_u64()) {
                 tx.execute(
                     "INSERT OR IGNORE INTO causes(fact_id, cause_id) VALUES (?1, ?2)",
-                    rusqlite::params![fact_id, cause],
+                    rusqlite::params![*fact_id as i64, cause as i64],
                 )
                 .map_err(|e| LexError(format!("insert cause: {e}")))?;
             }
@@ -355,7 +355,7 @@ impl LexStore {
         for fid in fact_ids {
             if let Ok(path) = conn.query_row(
                 "SELECT path FROM facts WHERE fact_id = ?1 LIMIT 1",
-                [fid],
+                [*fid as i64],
                 |row| row.get::<_, String>(0),
             ) {
                 out.insert(*fid, path);
@@ -374,6 +374,36 @@ impl LexStore {
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .ok()
+    }
+
+    /// 本地家族行读取(TTL 免除):`local.*` 家族由属主整族重建
+    /// (replace_partition),无账本刷新概念——不受 partitions 新鲜度
+    /// 约束。非本地家族勿用(会绕过 TTL 降级语义)。
+    pub fn local_facts(&self, prefix: &str) -> Option<Vec<CachedFact>> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT fact_id, path, value_json FROM facts WHERE prefix = ?1")
+            .ok()?;
+        let rows = stmt
+            .query_map([prefix], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .ok()?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (fact_id, path, value_json) = row.ok()?;
+            let value = serde_json::from_str(&value_json).ok()?;
+            out.push(CachedFact {
+                fact_id: fact_id as u64,
+                path,
+                value,
+            });
+        }
+        Some(out)
     }
 
     /// P2 实体检索原语：按实体名直查候选集。
@@ -404,7 +434,7 @@ impl LexStore {
                     .prepare("SELECT cause_id FROM causes WHERE fact_id = ?1")
                     .map_err(|e| LexError(format!("causal_expand: {e}")))?;
                 let rows = stmt
-                    .query_map([fid], |row| row.get::<_, i64>(0))
+                    .query_map([*fid as i64], |row| row.get::<_, i64>(0))
                     .map_err(|e| LexError(format!("causal_expand: {e}")))?;
                 for cid in rows {
                     let cid = cid.map_err(|e| LexError(format!("row: {e}")))? as u64;
@@ -827,5 +857,40 @@ mod tests {
             store.cached_facts("shared.ns.stable.", 60).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn test_synthetic_id_int64_roundtrip() {
+        // 受限本地源合成 id(bit63 置位,超 i64::MAX)入库读出回路:
+        // 整数绑定统一 i64 补码域,读侧 as u64 无损还原
+        let path = temp_db("synth");
+        let store = LexStore::open(&path).unwrap();
+        let fid = synthetic_fact_id("local.skills.x#1");
+        assert!(fid & SYNTHETIC_ID_FLAG != 0);
+        let rows = vec![(
+            fid,
+            "local.skills.x#1".to_string(),
+            serde_json::json!({"key": "x", "value": "正文节内容", "timestamp": 1, "mem_type": "procedural"}),
+        )];
+        store.replace_partition("local.skills.", &rows).unwrap();
+        assert_eq!(store.cached_facts("local.skills.", 60).unwrap()[0].fact_id, fid);
+        assert_eq!(store.local_facts("local.skills.").unwrap()[0].fact_id, fid);
+        let hits = store.lookup_candidates("local.skills.", "正文", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, fid);
+        let typed = store
+            .lookup_candidates_typed(
+                &["local.skills.".to_string()],
+                "正文",
+                10,
+                &[mem_type::PROCEDURAL],
+            )
+            .unwrap();
+        assert_eq!(typed.len(), 1);
+        assert_eq!(
+            store.paths_by_fact_ids(&[fid]).get(&fid).map(|s| s.as_str()),
+            Some("local.skills.x#1")
+        );
+        assert_eq!(store.fact_class(fid).unwrap().1, "procedural");
     }
 }

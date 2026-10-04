@@ -1763,6 +1763,26 @@ impl AgentRunner {
         }
         // A2-2:memory_propose 会话锚绑定(注册期空锚,运行期才可绑定)
         self.bind_propose_anchor(&session_id);
+        // 跨源批 D:技能双层注册同步(声明面真账镜像+正文本地索引;
+        // Recipe sources.skills_index 门控,缺省关=no-op;best-effort
+        // 不阻塞会话)
+        if self.config.skills.is_some() {
+            if let Some(mem) = self.memory.as_mut() {
+                let empty_manifest = Vec::new();
+                let manifest = self.config.skills.as_ref().unwrap_or(&empty_manifest);
+                let stats =
+                    crate::agent::skills_mirror::sync_skills_mirror(mem, manifest).await;
+                if !stats.skipped {
+                    info!(
+                        written = stats.metadata_written,
+                        tombstoned = stats.tombstoned,
+                        sections = stats.body_sections,
+                        degraded = stats.degraded,
+                        "skills mirror synced"
+                    );
+                }
+            }
+        }
 
         // G17:session 指标 — sessions_total + sessions_active(RAII guard 保证所有返回路径 dec)
         if let Some(m) = &self.metrics {
@@ -3756,6 +3776,25 @@ impl AgentRunner {
             // A2-2:memory_propose 会话锚绑定(与 run() 对齐;G15 continuation
             // 复用会话分支同样绑定,保证锚与 session 事实一致)
             runner.bind_propose_anchor(&session_id);
+            // 跨源批 D:技能双层注册同步(与 run() 同钩位;Recipe
+            // sources.skills_index 门控缺省关=no-op;best-effort 不阻塞会话)
+            if runner.config.skills.is_some() {
+                if let Some(mem) = runner.memory.as_mut() {
+                    let empty_manifest = Vec::new();
+                    let manifest = runner.config.skills.as_ref().unwrap_or(&empty_manifest);
+                    let stats =
+                        crate::agent::skills_mirror::sync_skills_mirror(mem, manifest).await;
+                    if !stats.skipped {
+                        info!(
+                            written = stats.metadata_written,
+                            tombstoned = stats.tombstoned,
+                            sections = stats.body_sections,
+                            degraded = stats.degraded,
+                            "skills mirror synced"
+                        );
+                    }
+                }
+            }
 
             // B21 PR-1:journal 会话事件流(serve 注入 journal_dir 时启用)。
             // 打开失败 fail-soft 降级为无 journal 会话(warn 留痕,不阻塞主流程
