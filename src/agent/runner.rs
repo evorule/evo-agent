@@ -1566,6 +1566,8 @@ impl AgentRunner {
         journal: Option<&crate::agent::journal::JournalWriter>,
     ) -> Result<(), AgentError> {
         if let Some(memory) = self.memory.as_mut() {
+            // F-616:usage 增量批量回写(sediment 前刷,批量端点一次 HTTP)
+            memory.flush_usage(session_id).await;
             let mut deps = sediment::SedimentDeps {
                 memory,
                 summarizer: self.summarizer.as_ref(),
