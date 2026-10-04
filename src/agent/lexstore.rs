@@ -68,6 +68,26 @@ CREATE TABLE IF NOT EXISTS postings(
     PRIMARY KEY(bigram, fact_id, prefix)
 );
 CREATE INDEX IF NOT EXISTS idx_postings_bigram ON postings(bigram);
+CREATE TABLE IF NOT EXISTS entities(
+    entity TEXT NOT NULL,
+    fact_id INTEGER NOT NULL,
+    prefix TEXT NOT NULL,
+    PRIMARY KEY(entity, fact_id)
+);
+CREATE TABLE IF NOT EXISTS timeline(
+    fact_id INTEGER PRIMARY KEY,
+    prefix TEXT NOT NULL,
+    kind TEXT,
+    valid_at INTEGER,
+    lifecycle_state TEXT,
+    superseded_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_timeline_prefix ON timeline(prefix, kind, valid_at);
+CREATE TABLE IF NOT EXISTS causes(
+    fact_id INTEGER NOT NULL,
+    cause_id INTEGER NOT NULL,
+    PRIMARY KEY(fact_id, cause_id)
+);
 ";
 
 impl LexStore {
@@ -102,6 +122,15 @@ impl LexStore {
             .map_err(|e| LexError(format!("delete facts: {e}")))?;
         tx.execute("DELETE FROM postings WHERE prefix = ?1", [prefix])
             .map_err(|e| LexError(format!("delete postings: {e}")))?;
+        tx.execute("DELETE FROM entities WHERE prefix = ?1", [prefix])
+            .map_err(|e| LexError(format!("delete entities: {e}")))?;
+        tx.execute("DELETE FROM timeline WHERE prefix = ?1", [prefix])
+            .map_err(|e| LexError(format!("delete timeline: {e}")))?;
+        tx.execute(
+            "DELETE FROM causes WHERE fact_id IN (SELECT fact_id FROM timeline WHERE prefix = ?1)",
+            [prefix],
+        )
+        .map_err(|e| LexError(format!("delete causes: {e}")))?;
         for (fact_id, path, value) in facts {
             let value_json =
                 serde_json::to_string(value).map_err(|e| LexError(format!("serialize: {e}")))?;
@@ -117,6 +146,38 @@ impl LexStore {
                     rusqlite::params![token, fact_id, prefix],
                 )
                 .map_err(|e| LexError(format!("insert posting: {e}")))?;
+            }
+            // F-609 落标 + P5 时间线 + P2 实体 + P3 因果：抽取器管线
+            // （从 value JSON 确定性提取，零 LLM——12 号 §四抽取器=机制）
+            let ts = value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+            let state = value
+                .get("lifecycle_state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Settled");
+            tx.execute(
+                "INSERT INTO timeline(fact_id, prefix, kind, valid_at, lifecycle_state, superseded_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)
+                 ON CONFLICT(fact_id) DO UPDATE SET lifecycle_state = excluded.lifecycle_state",
+                rusqlite::params![fact_id, prefix, "fact", ts, state],
+            )
+            .map_err(|e| LexError(format!("insert timeline: {e}")))?;
+            if let Some(entities) = value.get("entities").and_then(|v| v.as_array()) {
+                for ent in entities {
+                    if let Some(name) = ent.get("name").and_then(|v| v.as_str()) {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO entities(entity, fact_id, prefix) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![name, fact_id, prefix],
+                        )
+                        .map_err(|e| LexError(format!("insert entity: {e}")))?;
+                    }
+                }
+            }
+            if let Some(cause) = value.get("cause_fact_id").and_then(|v| v.as_u64()) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO causes(fact_id, cause_id) VALUES (?1, ?2)",
+                    rusqlite::params![fact_id, cause],
+                )
+                .map_err(|e| LexError(format!("insert cause: {e}")))?;
             }
         }
         tx.execute(
@@ -183,6 +244,80 @@ impl LexStore {
             }
         }
         out
+    }
+
+    /// P2 实体检索原语：按实体名直查候选集。
+    pub fn entity_scan(&self, entity: &str, prefix: &str) -> Result<Vec<u64>, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT fact_id FROM entities WHERE entity = ?1 AND prefix = ?2")
+            .map_err(|e| LexError(format!("entity_scan: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![entity, prefix], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|e| LexError(format!("entity_scan: {e}")))?;
+        Ok(rows.filter_map(|r| r.ok()).map(|i| i as u64).collect())
+    }
+
+    /// P3 因果展开原语：沿 causes 邻接表递归展开（带环保护，深度上限 16）。
+    pub fn causal_expand(&self, fact_id: u64, max_depth: usize) -> Result<Vec<u64>, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::new();
+        let mut frontier = vec![fact_id];
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(fact_id);
+        for _ in 0..max_depth {
+            let mut next = Vec::new();
+            for fid in &frontier {
+                let mut stmt = conn
+                    .prepare("SELECT cause_id FROM causes WHERE fact_id = ?1")
+                    .map_err(|e| LexError(format!("causal_expand: {e}")))?;
+                let rows = stmt
+                    .query_map([fid], |row| row.get::<_, i64>(0))
+                    .map_err(|e| LexError(format!("causal_expand: {e}")))?;
+                for cid in rows {
+                    let cid = cid.map_err(|e| LexError(format!("row: {e}")))? as u64;
+                    if seen.insert(cid) {
+                        out.push(cid);
+                        next.push(cid);
+                    }
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// P5 时间线窗口原语：valid_at ∈ [t0, t1] 的候选集。
+    pub fn timeline_window(&self, prefix: &str, t0: u64, t1: u64) -> Result<Vec<u64>, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare(
+                "SELECT fact_id FROM timeline WHERE prefix = ?1 AND valid_at BETWEEN ?2 AND ?3",
+            )
+            .map_err(|e| LexError(format!("timeline_window: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![prefix, t0 as i64, t1 as i64], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|e| LexError(format!("timeline_window: {e}")))?;
+        Ok(rows.filter_map(|r| r.ok()).map(|i| i as u64).collect())
+    }
+
+    /// P6 生命周期状态过滤原语。
+    pub fn state_filter(&self, prefix: &str, state: &str) -> Result<Vec<u64>, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT fact_id FROM timeline WHERE prefix = ?1 AND lifecycle_state = ?2")
+            .map_err(|e| LexError(format!("state_filter: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![prefix, state], |row| row.get::<_, i64>(0))
+            .map_err(|e| LexError(format!("state_filter: {e}")))?;
+        Ok(rows.filter_map(|r| r.ok()).map(|i| i as u64).collect())
     }
 
     /// P1 检索原语:goal 词法倒排候选集(按命中 token 数降序,上限 limit)。
@@ -274,6 +409,49 @@ mod tests {
         let got = store.cached_facts("shared.ns.stable.", 60).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].fact_id, 1);
+    }
+
+    #[test]
+    fn test_p2_p3_p5_p6_primitives() {
+        let path = temp_db("prims");
+        let store = LexStore::open(&path).unwrap();
+        let facts = vec![
+            (
+                1u64,
+                "shared.ns.events.E1".to_string(),
+                serde_json::json!({"key": "E1", "value": "部署完成", "timestamp": 1000,
+                               "entities": [{"name": "calc.py"}], "cause_fact_id": 99,
+                               "lifecycle_state": "Settled"}),
+            ),
+            (
+                2u64,
+                "shared.ns.events.E2".to_string(),
+                serde_json::json!({"key": "E2", "value": "修复 calc.py bug", "timestamp": 2000,
+                               "lifecycle_state": "Captured"}),
+            ),
+        ];
+        store
+            .replace_partition("shared.ns.events.", &facts)
+            .unwrap();
+
+        // P2 entity_scan
+        let hits = store.entity_scan("calc.py", "shared.ns.events.").unwrap();
+        assert!(hits.contains(&1));
+
+        // P3 causal_expand
+        let chain = store.causal_expand(1, 8).unwrap();
+        assert!(chain.contains(&99));
+
+        // P5 timeline_window
+        let tl = store
+            .timeline_window("shared.ns.events.", 500, 1500)
+            .unwrap();
+        assert!(tl.contains(&1));
+        assert!(!tl.contains(&2)); // ts=2000 超窗
+
+        // P6 state_filter
+        let settled = store.state_filter("shared.ns.events.", "Settled").unwrap();
+        assert!(settled.contains(&1));
     }
 
     #[test]
