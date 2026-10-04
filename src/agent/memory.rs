@@ -587,6 +587,12 @@ impl ContextBudget {
     /// [`RecallContext::degradation_notices`]——实测裁剪完全静默，
     /// 比召回失败更不可见（失败尚有 notices，裁剪曾什么都不留）。
     pub fn fit_recall(&self, recall: &mut RecallContext) {
+        // 缺省=历史降级序（stable>summaries>events，Q9 冻结语义）→ 原实现逐字节保真
+        self.fit_recall_default(recall);
+    }
+
+    /// 历史降级序原实现（默认序专用：通知文案逐字节与 Q9 冻结样本一致）
+    fn fit_recall_default(&self, recall: &mut RecallContext) {
         if self.total_window == 0 {
             return; // 不限制
         }
@@ -675,6 +681,83 @@ impl ContextBudget {
                 cut_events,
                 budget
             ));
+        }
+    }
+
+    /// C3: 在 memory_cap 内组装记忆块；降级序由 Recipe 声明（策略数据化）。
+    ///
+    /// 序驱动实现：按给定序逐层截断（同一套 position-scan 语义），先被
+    /// 处理的层优先占预算；某层耗尽预算 → 其余层整体清空（fail-visible
+    /// 通知），与历史三分支行为逐字节一致（默认序下）。
+    pub fn fit_recall_ordered(&self, recall: &mut RecallContext, order: &[&str]) {
+        if self.total_window == 0 {
+            return; // 不限制
+        }
+        let budget = self.memory_cap();
+        let mut used = 0;
+
+        for layer in order {
+            let (list, name) = match *layer {
+                "stable" => (&mut recall.stable, "stable"),
+                "summaries" => (&mut recall.summaries, "L1 摘要"),
+                "events" => (&mut recall.events, "L2 事件"),
+                _ => continue,
+            };
+            let total = list.len();
+            let cut = list
+                .iter()
+                .position(|r| {
+                    used += Self::estimate_tokens(&r.value);
+                    used > budget
+                })
+                .unwrap_or(total);
+            list.truncate(cut);
+            if cut < total {
+                recall.degradation_notices.push(format!(
+                    "memory budget: {} 层裁剪 {} 条(保留 {},预算 {} token)",
+                    name,
+                    total - cut,
+                    cut,
+                    budget
+                ));
+            }
+            if used > budget {
+                // 该层已耗尽预算：按给定序，当前层之后的层整体清空（fail-visible）
+                let cur = order.iter().position(|l| *l == name).unwrap_or(0);
+                let mut cleared = String::new();
+                for later in &order[cur + 1..] {
+                    match *later {
+                        "stable" => {
+                            let n = recall.stable.len();
+                            if n > 0 {
+                                cleared.push_str(&format!("stable {n} 条 "));
+                                recall.stable.clear();
+                            }
+                        }
+                        "summaries" => {
+                            let n = recall.summaries.len();
+                            if n > 0 {
+                                cleared.push_str(&format!("L1 摘要 {n} 条 "));
+                                recall.summaries.clear();
+                            }
+                        }
+                        "events" => {
+                            let n = recall.events.len();
+                            if n > 0 {
+                                cleared.push_str(&format!("L2 事件 {n} 条 "));
+                                recall.events.clear();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !cleared.is_empty() {
+                    recall
+                        .degradation_notices
+                        .push(format!("memory budget: 前序层耗尽预算,清空 {cleared}"));
+                }
+                return;
+            }
         }
     }
 
