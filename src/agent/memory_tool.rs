@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use serde_json::{json, Value};
 
 use crate::agent::definition::AgentDefinition;
-use crate::agent::lexstore::{mem_type, LexStore};
+use crate::agent::lexstore::{mem_type, LexStore, SYNTHETIC_ID_FLAG};
 use crate::agent::memory::{
     latest_entries_by_path, sort_by_policy, tokenize_for_match, MemoryRecord,
 };
@@ -45,9 +45,13 @@ use crate::agent::sediment::{
     build_knowledge_candidate_event, is_valid_knowledge_kind, knowledge_candidate_event_id,
     mark_llm_generated, KnowledgeCandidateOut,
 };
+use crate::agent::skills_mirror::LOCAL_SKILLS_PREFIX;
 use crate::api::evorule_client::{EvoruleApiClient, SharedFactEntry};
 use crate::builtin_tools::{ParameterSpec, ToolSpec};
 use crate::io_handlers::tool_handler::ToolFunction;
+
+/// 本地正文索引层名（技能双层注册批：检索层族清单中的本地家族）
+const LOCAL_SKILLS_LAYER: &str = "local.skills";
 
 /// 自省检索工具名
 pub const MEMORY_SEARCH_TOOL: &str = "memory_search";
@@ -245,6 +249,7 @@ impl MemoryIntrospector {
         match layer {
             "summaries" => format!("shared.{}.sessions.", self.namespace),
             "events" => format!("shared.{}.events.", self.namespace),
+            LOCAL_SKILLS_LAYER => LOCAL_SKILLS_PREFIX.to_string(),
             _ => format!("shared.{}.stable.", self.namespace),
         }
     }
@@ -323,12 +328,17 @@ impl MemoryIntrospector {
 
     /// 按 fact_id 取数：账本直取为权威；不可达时本地检索缓存兜底（TTL 内，
     /// 可能滞后——通知如实声明）；两处皆无=None。
+    /// 合成 id（bit63）=受限本地源：本地缓存即权威，直读无账本回退语义
+    /// （无降级噪音）。
     async fn fetch_fact_by_id(
         &self,
         fact_id: u64,
         layer: &str,
         notices: &mut Vec<String>,
     ) -> Option<SharedFactEntry> {
+        if fact_id & SYNTHETIC_ID_FLAG != 0 {
+            return self.scan_cache_for_fact(fact_id);
+        }
         match self.client.get_shared_fact_source(fact_id).await {
             Ok(entry) => Some(entry),
             Err(e) => {
@@ -349,9 +359,14 @@ impl MemoryIntrospector {
     }
 
     fn scan_cache_for_fact(&self, fact_id: u64) -> Option<SharedFactEntry> {
-        for layer in ["stable", "summaries", "events"] {
+        for layer in ["stable", "summaries", "events", LOCAL_SKILLS_LAYER] {
             let prefix = self.prefix_for(layer);
-            if let Some(facts) = self.store.cached_facts(&prefix, PARTITION_TTL_SECS) {
+            let cached = if layer == LOCAL_SKILLS_LAYER {
+                self.store.local_facts(&prefix)
+            } else {
+                self.store.cached_facts(&prefix, PARTITION_TTL_SECS)
+            };
+            if let Some(facts) = cached {
                 if let Some(f) = facts.into_iter().find(|f| f.fact_id == fact_id) {
                     return Some(SharedFactEntry {
                         fact_id: f.fact_id,
@@ -415,15 +430,18 @@ impl MemoryIntrospector {
 
         let mut notices: Vec<String> = Vec::new();
         // 型别→检索层族映射：过滤由型别直证列承担（同族混型行被列过滤正确
-        // 排除）。北极星锚残余节（procedural 型逐行覆盖）落 stable 族，故
-        // kind=procedural 检索 stable 族；专属族（procedural./local.）随
-        // 源注册批扩入清单。
+        // 排除）。北极星锚残余节与技能正文索引（均 procedural 型逐行覆盖/
+        // 显式标注）分别在 stable 族与本地族，kind=procedural 两族同查；
+        // 专属账本族（procedural.*）随源注册批扩入清单。
         let (layers, type_filter): (Vec<&str>, Vec<&str>) = match kind_filter {
             None => (vec!["stable", "summaries", "events"], Vec::new()),
             Some(mem_type::SEMANTIC) => (vec!["stable"], vec![mem_type::SEMANTIC]),
             Some(mem_type::EPISODIC) => (vec!["events"], vec![mem_type::EPISODIC]),
             Some(mem_type::WORK) => (vec!["summaries"], vec![mem_type::WORK]),
-            Some(mem_type::PROCEDURAL) => (vec!["stable"], vec![mem_type::PROCEDURAL]),
+            Some(mem_type::PROCEDURAL) => (
+                vec!["stable", LOCAL_SKILLS_LAYER],
+                vec![mem_type::PROCEDURAL],
+            ),
             Some(mt) => (Vec::new(), vec![mt]),
         };
 
@@ -431,7 +449,26 @@ impl MemoryIntrospector {
         let mut records: Vec<MemoryRecord> = Vec::new();
         for layer in layers {
             let prefix = self.prefix_for(layer);
-            let Some(entries) = self.fetch_partition(&prefix, layer, &mut notices).await else {
+            // 本地家族：TTL 免除直读（属主整族重建，无账本刷新概念），
+            // 永不触网零降级噪音
+            let entries = if layer == LOCAL_SKILLS_LAYER {
+                self.store.local_facts(&prefix).map(|facts| {
+                    facts
+                        .into_iter()
+                        .map(|f| SharedFactEntry {
+                            fact_id: f.fact_id,
+                            path: f.path,
+                            value: f.value,
+                            source_session_id: 0,
+                            version: 0,
+                            origin_fact_id: None,
+                        })
+                        .collect()
+                })
+            } else {
+                self.fetch_partition(&prefix, layer, &mut notices).await
+            };
+            let Some(entries) = entries else {
                 continue;
             };
             // 先去重取最新版本（墓碑抑制），再做候选筛选
