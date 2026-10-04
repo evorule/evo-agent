@@ -3600,6 +3600,14 @@ impl AgentRunner {
                     Some(dir) => match crate::agent::journal::JournalWriter::open(dir, &session_id)
                     {
                         Ok(w) => Some(std::sync::Arc::new(w)),
+                        // O-276:同会话已有活跃写者=继续运行只会交错损坏账面,
+                        // 此特定错误 fail-fast 上浮(其余 IO 错误保持 fail-soft 降级)
+                        Err(crate::agent::journal::JournalError::WriterActive(sid)) => {
+                            yield Err(AgentError::Internal(format!(
+                                "O-276: session '{sid}' already has an active journal writer (并发双写防护;等先前运行收尾后再续跑)"
+                            )));
+                            return;
+                        }
                         Err(e) => {
                             warn!(
                                 %session_id,

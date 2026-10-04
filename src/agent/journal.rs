@@ -220,6 +220,10 @@ pub enum JournalError {
     /// 行级损坏(JSON 非法/缺字段/未知事件)
     #[error("journal corrupted: {0}")]
     Corrupt(String),
+    /// 同会话已有活跃写者(O-276:并发双写会使 seq 交错损坏账面,fail-fast;
+    /// 旧写者 Drop 释放占位后可重开)
+    #[error("journal writer already active for session: {0}")]
+    WriterActive(String),
     /// seq 连续性破坏(空洞/重复 = 日志损坏,fail-visible)
     #[error("journal seq gap: expected {expected}, found {found}")]
     SeqGap {
@@ -288,6 +292,26 @@ struct JournalInner {
 #[derive(Clone)]
 pub struct JournalWriter {
     core: Arc<Mutex<JournalInner>>,
+    /// O-276:进程内活跃写者注册表键(sanitized session_id);最后一个克隆
+    /// Drop 时释放占位
+    registry_key: String,
+}
+
+/// O-276:进程内活跃写者注册表(键=sanitized session_id)
+static ACTIVE_WRITERS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+impl Drop for JournalWriter {
+    fn drop(&mut self) {
+        // 仅最后一个克隆释放占位(中间克隆 drop 时 Arc 强计数 > 1,不放锁)
+        if Arc::strong_count(&self.core) == 1 {
+            if let Ok(mut guard) = ACTIVE_WRITERS.lock() {
+                if let Some(set) = guard.as_mut() {
+                    set.remove(&self.registry_key);
+                }
+            }
+        }
+    }
 }
 
 impl JournalWriter {
@@ -320,6 +344,18 @@ impl JournalWriter {
             }
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // O-276:占位进程内活跃写者——同会话第二个写者在此 fail-fast,
+        // 不再出现两写者各自恢复 last_seq 后交错 append(seq 重复/空洞=账面损坏)
+        let registry_key = sanitize_session_id(session_id);
+        {
+            let mut guard = ACTIVE_WRITERS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let set = guard.get_or_insert_with(std::collections::HashSet::new);
+            if !set.insert(registry_key.clone()) {
+                return Err(JournalError::WriterActive(registry_key));
+            }
+        }
         Ok(JournalWriter {
             core: Arc::new(Mutex::new(JournalInner {
                 file,
@@ -327,6 +363,7 @@ impl JournalWriter {
                 turn_count,
                 turn_open: false,
             })),
+            registry_key,
         })
     }
 
@@ -855,16 +892,30 @@ mod tests {
     }
 
     #[test]
+    fn test_writer_active_registry_blocks_double_open_then_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "reg-test").unwrap();
+        // O-276:同会话第二写者 fail-fast(并发双写会使 seq 交错损坏账面)
+        assert!(matches!(
+            JournalWriter::open(dir.path(), "reg-test"),
+            Err(JournalError::WriterActive(_))
+        ));
+        // 最后一个写者 Drop → 占位释放,可重开(续跑场景)
+        drop(w);
+        assert!(JournalWriter::open(dir.path(), "reg-test").is_ok());
+    }
+
+    #[test]
     fn turn_guard_explicit_end_writes_once() {
         let dir = tempfile::tempdir().unwrap();
-        let w = JournalWriter::open(dir.path(), "s").unwrap();
+        let w = JournalWriter::open(dir.path(), "s-explicit").unwrap();
         {
             let g = w.begin_turn("goal").unwrap();
             assert!(w.turn_open());
             g.end("cancelled", 4, 500);
         }
         assert!(!w.turn_open());
-        let lines = read_all(&JournalWriter::path_for(dir.path(), "s")).unwrap();
+        let lines = read_all(&JournalWriter::path_for(dir.path(), "s-explicit")).unwrap();
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[1].event,
@@ -879,12 +930,12 @@ mod tests {
     #[test]
     fn turn_guard_drop_writes_aborted() {
         let dir = tempfile::tempdir().unwrap();
-        let w = JournalWriter::open(dir.path(), "s").unwrap();
+        let w = JournalWriter::open(dir.path(), "s-guard-drop").unwrap();
         {
             let _g = w.begin_turn("goal").unwrap();
             // 不显式 end,直接 drop(模拟 yield Err 早退/panic)
         }
-        let lines = read_all(&JournalWriter::path_for(dir.path(), "s")).unwrap();
+        let lines = read_all(&JournalWriter::path_for(dir.path(), "s-guard-drop")).unwrap();
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[1].event,

@@ -153,7 +153,9 @@ pub async fn sediment(
                         .await
                     {
                         // 区分 Persisted/CacheOnly——CacheOnly 不计入 stable_facts 防虚报
-                        Ok(PersistOutcome::Persisted { .. }) => result.stable_facts.push(fact.key.clone()),
+                        Ok(PersistOutcome::Persisted { .. }) => {
+                            result.stable_facts.push(fact.key.clone())
+                        }
                         Ok(PersistOutcome::CacheOnly) => {
                             result.stable_facts_cache_only.push(fact.key.clone())
                         }
@@ -341,6 +343,11 @@ async fn rollup_old_summaries(
     deps: &mut SedimentDeps<'_>,
     cfg: &SedimentConfig,
 ) -> Result<bool, String> {
+    // O-277:进程内串行化——读-合并-标记五步非原子,跨会话并发 sediment
+    // 会同批双 rollup(近似摘要双写+LLM 成本双花);进程级互斥消除交错。
+    // 诚实边界:跨进程并发归 server 侧归属(登记维持)。
+    static ROLLUP_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _rollup_guard = ROLLUP_GUARD.lock().await;
     let sessions_prefix = format!("shared.{}.sessions.", cfg.namespace);
     // fail-open：读取失败视为无摘要，不触发 rollup
     let facts = match deps
