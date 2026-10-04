@@ -995,6 +995,13 @@ impl MemoryManager {
 
         let timestamp = now_secs();
         let mut record = MemoryRecord::new(key, value, timestamp);
+        // F-609：生命周期落标——events 前缀=情景记忆 Captured；其余=Settled
+        // （状态迁移=新增版本事实，不改写本字段；RL-A1）
+        record.lifecycle_state = Some(if key.contains(".events.") {
+            "Captured".to_string()
+        } else {
+            "Settled".to_string()
+        });
         // B5：stable.* 键经外部通道写入 → source 标记为 user（其余域不标，
         // 避免对 events/sessions 等既有语义域引入未约定含义）
         if key.starts_with("stable.") {
@@ -1056,6 +1063,8 @@ impl MemoryManager {
         let timestamp = now_secs();
         let mut record = MemoryRecord::new(key, value, timestamp);
         record.source = Some(source.to_string());
+        // F-609：受信管道产物（stable.llm/rollup）落标 Settled
+        record.lifecycle_state = Some("Settled".to_string());
         let cache_key = self.cache_key_for(&scope, key);
         self.cache.insert(cache_key, record.clone());
 
@@ -2342,6 +2351,20 @@ mod tests {
             mgr.clear();
             assert!(mgr.is_empty());
             assert_eq!(mgr.len(), 0);
+        });
+    }
+
+    #[test]
+    fn test_f609_lifecycle_tag_on_writes() {
+        // 写入路径生命周期落标：events 前缀=Captured，其余=Settled
+        let mut mgr = MemoryManager::new("test", make_test_client()).with_session_id("s1");
+        tokio_test::block_on(async {
+            mgr.set("topic", "v").await.expect("set");
+            let ck = mgr.cache_key_for(&MemoryScope::Session("s1".into()), "topic");
+            assert_eq!(
+                mgr.cache.get(&ck).unwrap().lifecycle_state,
+                Some("Settled".to_string())
+            );
         });
     }
 
