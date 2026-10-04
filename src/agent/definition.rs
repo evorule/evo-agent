@@ -141,6 +141,13 @@ pub struct MemoryConfig {
     /// 显式触发短语列表（可选；缺省=内置默认表）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extraction_explicit_phrases: Option<Vec<String>>,
+    /// 阶段 1(F-618):LexStore 检索缓存 DB 路径(可选)
+    ///
+    /// 配置后 stable/events 召回走本地 SQLite 索引缓存(60s TTL,过期才
+    /// 全量刷新)——省每轮 O(N) 网络拉取;store 错误一律降级全量路径
+    /// (I14)。未配置零影响。tb-agent 竞赛配置建议启用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lex_store: Option<String>,
     /// C3: 记忆区占窗口的比例（默认 0.25）
     #[serde(default = "default_memory_budget_ratio")]
     pub memory_budget_ratio: f32,
@@ -185,6 +192,7 @@ impl Default for MemoryConfig {
             extraction_model: None,
             extraction_keywords: None,
             extraction_explicit_phrases: None,
+            lex_store: None,
             memory_budget_ratio: default_memory_budget_ratio(),
             max_session_summaries: default_max_session_summaries(),
             max_injected_events: default_max_injected_events(),

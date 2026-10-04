@@ -17,6 +17,7 @@ pub mod definition;
 pub mod delegate;
 pub mod driver;
 pub mod journal;
+pub mod lexstore;
 pub mod materializer;
 pub mod memory;
 pub mod memory_event;

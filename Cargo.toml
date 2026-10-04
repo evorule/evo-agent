@@ -81,6 +81,10 @@ rustyline = "14"
 # L2 SafetyAuditor(P1-F6/P2-V2 修复):Prompt 注入规则匹配
 regex = "1"
 
+# 阶段 1(F-618)LexStore 检索缓存:本地 SQLite(进程内,非内核依赖;
+# bundled=自编 SQLite 免系统库版本纠缠;WAL 模式)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # 全项目内容搜索:rg 官方 crate 家族(并行遍历+gitignore/正则匹配/逐行搜索器/glob)
 ignore = "0.4"
 globset = "0.4"
