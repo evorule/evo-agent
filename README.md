@@ -500,7 +500,7 @@ Agent 配置从 `agents/{type}.json` 加载：
 | production | 2 | 生产环境管理 |
 | bundles | 5 | 规则包导入/列出/回滚 |
 | knowledge | 3 | 知识库检索 |
-| skill 装配 | 1 | skill_pack_to_bundle（skill 规则壳 → 执行域快照包桥接，crate 算哈希+结构预检） |
+| skill 装配 | 1 | skill_pack_to_bundle（skill 规则壳 → 执行域快照包桥接，crate 算哈希+结构预检；恒出未验证 fail 包，pass 重出包走治理域通路） |
 | meta | 1 | meta_summary（L2 约束清单摘要） |
 | evolution | 2 | evolution_signals（进化信号拉取）+ rule_promote（约束层晋升提名） |
 
