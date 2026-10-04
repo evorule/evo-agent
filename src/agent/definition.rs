@@ -517,6 +517,38 @@ pub struct AgentDefinition {
     /// 基底块→身份段→北极星锚(槽位协议权威序)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub north_star: Option<String>,
+    /// 交接底座包(可选;上下文延续归一件。确定性结构字段——上一程任务的
+    /// 目标/里程碑/下一步/已验证事实/死路清单,由驱动纯查表生成,零 LLM;
+    /// 注入=S3 槽内 "## Handoff Base" 结构化块,与滚动摘要(语义面)分层
+    /// 配对、永不合并存储。None = 不注入(既有 agent 零影响)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HandoffPackage>,
+}
+
+/// 交接底座包(上下文延续归一件:确定性包=底座,sidecar 摘要=语义面)。
+///
+/// 字段语义(与驱动侧 handoff 生成器对齐):
+/// - `goal`:总目标(跨程不变);
+/// - `milestone_current`:当前里程碑(每程推进后随包 generation 更新);
+/// - `next_step`:下一动作;
+/// - `verified_facts`:已验证事实逐条(可溯源到账面);
+/// - `dead_ends`:死路清单逐条(失败教训强制回喂——只增不删,防重试)。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HandoffPackage {
+    /// 总目标
+    pub goal: String,
+    /// 当前里程碑(可选)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone_current: Option<String>,
+    /// 下一动作(可选)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<String>,
+    /// 已验证事实(逐条)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_facts: Vec<String>,
+    /// 死路清单(逐条;只增不删)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dead_ends: Vec<String>,
 }
 
 /// G13:`max_parallel_tools` 的默认值(串行)
@@ -837,6 +869,8 @@ impl AgentDefinition {
             identity_segment: self.identity_segment.clone(),
             // F-101:北极星锚直拷(同身份段口径——无缺省合成,声明即生效)
             north_star: self.north_star.clone(),
+            // 交接底座包直拷(同口径——声明即生效,S3 槽内渲染)
+            handoff: self.handoff.clone(),
         }
     }
 }
@@ -947,6 +981,28 @@ mod tests {
             cfg3.north_star, def3.north_star,
             "north_star 直拷同身份段口径"
         );
+        // 交接底座包同批——可选加载+直拷透传(声明即生效)
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(
+            r#", "handoff": {
+                "goal": "完成数据管线迁移",
+                "milestone_current": "阶段 2 完成",
+                "next_step": "跑验收测试",
+                "verified_facts": ["构建通过", "单测全绿"],
+                "dead_ends": ["方案甲:内存缓存不可回放"]
+            }}"#,
+        );
+        write_json(dir.path(), "with_handoff", &json);
+        let def4 = AgentDefinition::load_from_dir(dir.path(), "with_handoff").expect("load");
+        let h = def4.handoff.as_ref().expect("handoff present");
+        assert_eq!(h.goal, "完成数据管线迁移");
+        assert_eq!(h.milestone_current.as_deref(), Some("阶段 2 完成"));
+        assert_eq!(h.next_step.as_deref(), Some("跑验收测试"));
+        assert_eq!(h.verified_facts.len(), 2);
+        assert_eq!(h.dead_ends.len(), 1);
+        let cfg4 = def4.to_agent_config();
+        assert_eq!(cfg4.handoff, def4.handoff, "handoff 直拷同口径");
     }
 
     /// 元层先行批:assembly 内嵌段加载(字段正确透传)
@@ -1342,6 +1398,7 @@ mod tests {
             skills: None,
             identity_segment: None,
             north_star: None,
+            handoff: None,
         };
         let config = def.to_agent_config();
         assert_eq!(config.agent_type, "writer");
@@ -1688,6 +1745,7 @@ mod tests {
             skills: None,
             identity_segment: None,
             north_star: None,
+            handoff: None,
         };
         // 平台合法绝对路径(Linux 上 "D:/x" 非绝对路径,门卫语义会被绝对路径检查劫持)
         let abs_root = if cfg!(windows) { "D:/x" } else { "/x" };
@@ -1839,6 +1897,7 @@ mod tests {
             skills: None,
             identity_segment: None,
             north_star: None,
+            handoff: None,
         };
         let json = serde_json::to_string(&def).expect("serialize");
         assert!(
@@ -2000,6 +2059,7 @@ mod tests {
             }]),
             identity_segment: None,
             north_star: None,
+            handoff: None,
         };
         assert!(empty_name
             .validate()

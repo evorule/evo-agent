@@ -634,6 +634,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         skills: None,
         identity_segment: None,
         north_star: None,
+        handoff: None,
     }
 }
 
