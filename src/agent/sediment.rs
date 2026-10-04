@@ -23,6 +23,7 @@
 //! 会话返回。这与 `MemoryManager::set_scoped` 的 fail-open 语义一致。
 
 use crate::agent::audited_llm::AuditedLlm;
+use crate::agent::journal::{JournalEvent, JournalLine};
 use crate::agent::memory::{MemoryManager, MemoryRecord, MemoryScope, PersistOutcome};
 use crate::agent::memory_event::event::{EventSource, EventType, MemoryEvent};
 use crate::agent::memory_event::extraction::{extract_json_from_text, EventExtractor};
@@ -56,6 +57,9 @@ pub struct SedimentConfig {
     pub enable_knowledge_extraction: bool,
     /// 触发知识候选提取的最小消息条数（太短会话无知识可提取）
     pub min_messages_for_extraction: usize,
+    /// 是否启用 journal 摘要投影（跨源注册规格：确定性结构投影，零 LLM；
+    /// Recipe sources.journal_digest 数据化开关，缺省关=既有 agent 零影响）
+    pub enable_journal_digest: bool,
 }
 
 impl Default for SedimentConfig {
@@ -69,6 +73,7 @@ impl Default for SedimentConfig {
             llm_model_id: "unknown".to_string(),
             enable_knowledge_extraction: true,
             min_messages_for_extraction: 4,
+            enable_journal_digest: false,
         }
     }
 }
@@ -92,6 +97,9 @@ pub struct SedimentDeps<'a> {
     /// 审计链执行器（None = 不提取——纪律①：知识候选提取属沉淀
     /// 提取面，无审计通路则跳过并 warn，禁止新增直连 provider 调用路径）
     pub auditor: Option<&'a AuditedLlm>,
+    /// journal 全量行（会话收尾投影消费；调用方经 `JournalWriter::read_lines`
+    /// 预读，读取失败=空集如实降级）
+    pub journal_lines: Vec<JournalLine>,
 }
 
 /// 沉淀结果
@@ -110,6 +118,8 @@ pub struct SedimentResult {
     pub knowledge_candidates: Vec<String>,
     /// rollup 是否执行（C4）
     pub rollup_done: bool,
+    /// journal 摘要投影是否成功写入共享空间（跨源注册规格）
+    pub journal_digest_written: bool,
 }
 
 /// C1 主入口：会话结束时调用（best-effort，错误记日志不阻断）
@@ -217,7 +227,135 @@ pub async fn sediment(
         extract_knowledge_candidates(deps, cfg, session_id, messages, &mut result).await;
     }
 
+    // 7. journal 摘要投影（跨源注册规格）：确定性结构投影（零 LLM）——
+    //    轮目标/步数/工具分布/错误与死路 → shared.{ns}.work.journal.{sid}。
+    //    journal 本体「唯一真相源、不进 prompt」纪律不变；检索可达的是
+    //    有界派生品，逐字节引用仍以 journal 为准（digest 内附 session 回指）。
+    if cfg.enable_journal_digest {
+        let lines = std::mem::take(&mut deps.journal_lines);
+        if lines.is_empty() {
+            tracing::debug!(session_id = %session_id, "sediment: no journal lines; digest skipped");
+        } else {
+            let digest = build_journal_digest(session_id, &lines);
+            if deps.memory.write_journal_digest(session_id, &digest).await {
+                result.journal_digest_written = true;
+            } else {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "sediment: journal digest write failed (best-effort)"
+                );
+            }
+        }
+    }
+
     result
+}
+
+/// journal 摘要投影构造（确定性纯函数；同输入逐字节同输出）。
+///
+/// 投影面：轮目标（去重截 5 条）/LLM 调用计数（react 与 sidecar 分列）/
+/// 工具调用总量与按名分布（字典序）/成功失败计数/错误与死路清单（工具
+/// 失败逐条+policy 拦截+审批拒绝计数，seq 序）/收尾状态。零 LLM、
+/// 零向量（检索红线内）。
+pub(crate) fn build_journal_digest(session_id: &str, lines: &[JournalLine]) -> String {
+    let mut goals: Vec<String> = Vec::new();
+    let mut llm_total = 0usize;
+    let mut llm_react = 0usize;
+    let mut tool_by_name: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut call_tool: std::collections::BTreeMap<String, String> = Default::default();
+    let mut tool_ok = 0usize;
+    let mut tool_err: Vec<String> = Vec::new();
+    let mut policy_blocked = 0usize;
+    let mut approvals_rejected = 0usize;
+    let mut ended: Option<(&str, u64, u64)> = None;
+    for line in lines {
+        match &line.event {
+            JournalEvent::TurnStarted { goal, .. } => {
+                if !goals.contains(goal) && goals.len() < 5 {
+                    goals.push(goal.clone());
+                }
+            }
+            JournalEvent::LlmCalled { purpose, .. } => {
+                llm_total += 1;
+                if purpose == "react" {
+                    llm_react += 1;
+                }
+            }
+            JournalEvent::ToolInvoked {
+                call_id, tool, ..
+            } => {
+                *tool_by_name.entry(tool.clone()).or_insert(0) += 1;
+                call_tool.insert(call_id.clone(), tool.clone());
+            }
+            JournalEvent::ToolResult {
+                call_id, status, ..
+            } => {
+                if status == "ok" {
+                    tool_ok += 1;
+                } else {
+                    let tool = call_tool.get(call_id).cloned().unwrap_or_default();
+                    tool_err.push(format!("{tool} 调用失败({call_id})"));
+                }
+            }
+            JournalEvent::PolicyJudged { verdict, .. } => {
+                if verdict == "blocked" {
+                    policy_blocked += 1;
+                }
+            }
+            JournalEvent::ApprovalResolved { decision, .. } => {
+                if decision != "approved" {
+                    approvals_rejected += 1;
+                }
+            }
+            JournalEvent::TurnEnded {
+                status,
+                steps,
+                duration_ms,
+            } => ended = Some((status.as_str(), *steps, *duration_ms)),
+            _ => {}
+        }
+    }
+    let tool_total: usize = tool_by_name.values().sum();
+    let dist = tool_by_name
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut s = format!("会话 journal 摘要（session {session_id}）。\n");
+    if goals.is_empty() {
+        s.push_str("轮目标: 无\n");
+    } else {
+        s.push_str(&format!("轮目标: {}\n", goals.join("；")));
+    }
+    s.push_str(&format!("LLM 调用: {llm_total}（react {llm_react}）。\n"));
+    if tool_total == 0 {
+        s.push_str("工具调用: 无。\n");
+    } else {
+        s.push_str(&format!(
+            "工具调用: {tool_total}（成功 {tool_ok} / 失败 {}）；分布: {dist}。\n",
+            tool_total - tool_ok
+        ));
+    }
+    let dead_ends = if tool_err.is_empty() && policy_blocked == 0 && approvals_rejected == 0 {
+        "无".to_string()
+    } else {
+        let mut parts = tool_err;
+        if policy_blocked > 0 {
+            parts.push(format!("policy 拦截 {policy_blocked} 次"));
+        }
+        if approvals_rejected > 0 {
+            parts.push(format!("审批拒绝 {approvals_rejected} 次"));
+        }
+        parts.join("；")
+    };
+    s.push_str(&format!("错误与死路: {dead_ends}。\n"));
+    match ended {
+        Some((status, steps, ms)) => {
+            s.push_str(&format!("收尾: {status}，{steps} 步，{ms}ms。\n"));
+        }
+        None => s.push_str("收尾: 无 turn_ended 记录。\n"),
+    }
+    s
 }
 
 /// B5：模型标识消毒为合法路径段（非 `[a-zA-Z0-9-_]` 替换为 `-`）
@@ -815,6 +953,101 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_build_journal_digest_deterministic_projection() {
+        // 跨源批 C:journal 摘要投影构造器——确定性纯函数,同输入逐字节同输出
+        let lines = vec![
+            JournalLine {
+                seq: 1,
+                ts: 1,
+                event: JournalEvent::TurnStarted {
+                    turn_seq: 1,
+                    goal: "部署服务".into(),
+                },
+            },
+            JournalLine {
+                seq: 2,
+                ts: 2,
+                event: JournalEvent::LlmCalled {
+                    model: "m".into(),
+                    purpose: "react".into(),
+                    evorule_request_id: None,
+                    tokens: None,
+                    tokens_est: Some(100),
+                    request: 3,
+                    response: "r".into(),
+                },
+            },
+            JournalLine {
+                seq: 3,
+                ts: 3,
+                event: JournalEvent::ToolInvoked {
+                    call_id: "t3".into(),
+                    tool: "shell_exec".into(),
+                    args_digest: "d".into(),
+                    evorule_request_id: None,
+                },
+            },
+            JournalLine {
+                seq: 4,
+                ts: 4,
+                event: JournalEvent::ToolResult {
+                    call_id: "t3".into(),
+                    status: "error".into(),
+                    size_bytes: 0,
+                    content_digest: "d".into(),
+                },
+            },
+            JournalLine {
+                seq: 5,
+                ts: 5,
+                event: JournalEvent::ToolInvoked {
+                    call_id: "t5".into(),
+                    tool: "file_read".into(),
+                    args_digest: "d".into(),
+                    evorule_request_id: None,
+                },
+            },
+            JournalLine {
+                seq: 6,
+                ts: 6,
+                event: JournalEvent::ToolResult {
+                    call_id: "t5".into(),
+                    status: "ok".into(),
+                    size_bytes: 10,
+                    content_digest: "d".into(),
+                },
+            },
+            JournalLine {
+                seq: 7,
+                ts: 7,
+                event: JournalEvent::TurnEnded {
+                    status: "success".into(),
+                    steps: 2,
+                    duration_ms: 800,
+                },
+            },
+        ];
+        let d1 = build_journal_digest("s1", &lines);
+        let d2 = build_journal_digest("s1", &lines);
+        assert_eq!(d1, d2, "确定性:同输入逐字节同输出");
+        assert!(d1.contains("session s1"));
+        assert!(d1.contains("轮目标: 部署服务"));
+        assert!(d1.contains("LLM 调用: 1（react 1）"));
+        assert!(d1.contains("工具调用: 2（成功 1 / 失败 1）"));
+        // 按名分布字典序(确定性)
+        assert!(d1.contains("file_read=1, shell_exec=1"));
+        // 错误与死路:失败工具逐条(call_id 回指)
+        assert!(d1.contains("shell_exec 调用失败(t3)"));
+        assert!(d1.contains("收尾: success，2 步，800ms。"));
+        // 空 journal → 各字段如实「无」(fail-visible 不虚构)
+        let empty = build_journal_digest("s2", &[]);
+        assert!(empty.contains("轮目标: 无"));
+        assert!(empty.contains("工具调用: 无。"));
+        assert!(empty.contains("错误与死路: 无。"));
+        assert!(empty.contains("收尾: 无 turn_ended 记录。"));
+    }
+
+    #[test]
     fn test_sediment_config_default() {
         let cfg = SedimentConfig::default();
         assert_eq!(cfg.namespace, "default");
@@ -904,6 +1137,7 @@ mod tests {
             extractor: None,
             event_store: None,
             auditor: None,
+            journal_lines: Vec::new(),
         };
         let result = rollup_old_summaries(&mut deps, &cfg).await;
         assert!(result.is_ok(), "below threshold / no server should be Ok");
@@ -923,6 +1157,7 @@ mod tests {
             extractor: None,
             event_store: None,
             auditor: None,
+            journal_lines: Vec::new(),
         };
         let messages = vec![Message::User {
             content: "hello".to_string(),
@@ -955,6 +1190,7 @@ mod tests {
             extractor: Some(&mut extractor),
             event_store: None,
             auditor: None,
+            journal_lines: Vec::new(),
         };
         let messages = vec![
             Message::User {
@@ -1006,6 +1242,7 @@ mod tests {
             extractor: Some(&mut extractor),
             event_store: None,
             auditor: None,
+            journal_lines: Vec::new(),
         };
         let messages = vec![Message::User {
             content: "今天是我生日".to_string(),
@@ -1042,6 +1279,7 @@ mod tests {
             extractor: Some(&mut extractor),
             event_store: None,
             auditor: None,
+            journal_lines: Vec::new(),
         };
         let messages = vec![Message::User {
             content: "今天天气不错".to_string(),
@@ -1113,6 +1351,7 @@ mod tests {
             extractor: None,
             event_store: None,
             auditor: None,
+            journal_lines: Vec::new(),
         };
         // 4 条消息：长度过前置闸，证明跳过来自开关而非长度
         let messages = vec![
@@ -1158,6 +1397,7 @@ mod tests {
             extractor: None,
             event_store: None,
             auditor: None,
+            journal_lines: Vec::new(),
         };
         let messages = vec![
             Message::User {
@@ -1197,6 +1437,7 @@ mod tests {
             extractor: None,
             event_store: None,
             auditor: None,
+            journal_lines: Vec::new(),
         };
         let messages = vec![
             Message::User {
@@ -1243,6 +1484,7 @@ mod tests {
             extractor: None,
             event_store: None,
             auditor: None,
+            journal_lines: Vec::new(),
         };
         let candidates = vec![KnowledgeCandidateOut {
             knowledge_kind: "model".to_string(),

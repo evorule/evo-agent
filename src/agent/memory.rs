@@ -2029,6 +2029,47 @@ impl MemoryManager {
             .collect()
     }
 
+    /// 跨源注册规格:journal 摘要投影写入(work 型确定性派生品)。
+    ///
+    /// path=shared.{ns}.work.journal.{session_id},每会话恰好一条
+    /// (追加只增——他会话行永不改写);confidence 0.7(系统派生,低于
+    /// 人工与 LLM 提取);journal 本体「唯一真相源、不进 prompt」纪律
+    /// 不变,此处只落有界派生品。best-effort:失败返回 false 由调用方
+    /// warn 留痕(会话级降级通知既有语义覆盖)。
+    pub async fn write_journal_digest(&mut self, session_id: &str, digest_text: &str) -> bool {
+        let path = format!("shared.{}.work.journal.{}", self.namespace, session_id);
+        let mut record = MemoryRecord::new(
+            &format!("journal.{session_id}"),
+            digest_text,
+            now_secs(),
+        );
+        record.lifecycle_state = Some("Settled".to_string());
+        record.source = Some("system".to_string());
+        record.confidence = Some(0.7);
+        record.tags = vec!["journal".to_string(), "digest".to_string()];
+        let mut payload = match serde_json::to_value(&record) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "journal digest: record serialize failed");
+                return false;
+            }
+        };
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("mem_type".to_string(), serde_json::Value::from("work"));
+        }
+        match self
+            .evorule_client
+            .update_payload(session_id, &path, &payload)
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "journal digest: persist failed");
+                false
+            }
+        }
+    }
+
     /// 阶段 2(F-616):usage 增量批量回写——会话末调用一次(sediment 前)。
     ///
     /// - 逐 fact_id:cache 镜像记录 usage_count 累加 + 状态升 Reinforced

@@ -298,6 +298,8 @@ pub struct JournalWriter {
     /// 进程内活跃写者注册表键(sanitized session_id);最后一个克隆
     /// Drop 时释放占位
     registry_key: String,
+    /// journal 文件路径(会话收尾投影读回用;与写者并存只读句柄)
+    file_path: PathBuf,
 }
 
 /// 进程内活跃写者注册表(键=sanitized session_id)
@@ -367,7 +369,14 @@ impl JournalWriter {
                 turn_open: false,
             })),
             registry_key,
+            file_path: path,
         })
+    }
+
+    /// 读取全量 journal 行(会话收尾投影消费;与写者并存只读句柄)。
+    /// 读取失败如实上抛(调用方 best-effort 降级)。
+    pub fn read_lines(&self) -> Result<Vec<JournalLine>, JournalError> {
+        read_all(&self.file_path)
     }
 
     /// 会话 journal 文件路径(`{dir}/{session_id}.jsonl`,session_id 消毒防路径注入)
