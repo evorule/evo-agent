@@ -1088,6 +1088,20 @@ impl AgentRunner {
             let extractor = EventExtractor::new(runner.llm_handler.clone(), config);
             runner.extractor = Some(extractor);
         }
+        // 阶段 1(F-618):LexStore 检索缓存(definition 配 lex_store 路径时启用;
+        // open 失败 warn 降级全量路径,I14)
+        if let Some(db) = &def.memory.lex_store {
+            match crate::agent::lexstore::LexStore::open(std::path::Path::new(db)) {
+                Ok(store) => {
+                    if let Some(mem) = runner.memory.as_mut() {
+                        mem.set_lex_store(std::sync::Arc::new(store));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(db = %db, error = %e, "LexStore open failed——召回走全量拉取降级路径");
+                }
+            }
+        }
         // C1:沉淀配置(总是构造,sediment_session 在 memory 为 None 时是 no-op)
         // C3/C4:从 MemoryConfig 读取 max_session_summaries/max_injected_events/
         //        summary_rollup_threshold/enable_event_extraction

@@ -729,6 +729,10 @@ pub struct MemoryManager {
     namespace: String,
     /// C4: pub(crate) 以便 sediment 模块直接读取共享账本做 rollup
     pub(crate) evorule_client: EvoruleApiClient,
+    /// 阶段 1(F-618):LexStore 检索缓存(可选;配置后 stable/events 召回
+    /// 走本地索引缓存,TTL 过期才全量刷新——省每轮 O(N) 网络拉取。
+    /// None=全量路径,零影响;I14:store 错误一律降级全量)
+    pub(crate) lex_store: Option<std::sync::Arc<crate::agent::lexstore::LexStore>>,
     session_id: Option<String>,
     cache: BTreeMap<String, MemoryRecord>,
     /// 记忆过期时间（秒，用户决策 5：TTL）
@@ -771,6 +775,7 @@ impl MemoryManager {
         Self {
             namespace: namespace.to_string(),
             evorule_client,
+            lex_store: None,
             session_id: None,
             cache: BTreeMap::new(),
             ttl_secs: None,
@@ -1619,8 +1624,10 @@ impl MemoryManager {
 
         // 1. stable: get_shared_facts(Some("shared.{ns}.stable."))
         let stable_prefix = format!("shared.{}.stable.", ns);
+        // 阶段 1(F-618):LexStore 缓存优先(TTL 内零网络);过期/未配置/错误
+        // → 既有全量拉取路径(I14 降级兜底)。拉取成功即整分区替换进缓存。
         if let Some(facts) = self
-            .fetch_shared_facts_visible(&stable_prefix, "stable", &mut ctx.degradation_notices)
+            .recall_facts_cached(&stable_prefix, "stable", goal, &mut ctx.degradation_notices)
             .await
         {
             // R01（S5/S6/E19）：按 path 去重取最新版本（墓碑抑制）+ 时间倒序（I5）。
@@ -1664,7 +1671,7 @@ impl MemoryManager {
         //    按 goal 关键词重叠分 + 时间倒序 → 取 max_events
         let events_prefix = format!("shared.{}.events.", ns);
         if let Some(facts) = self
-            .fetch_shared_facts_visible(&events_prefix, "events", &mut ctx.degradation_notices)
+            .recall_facts_cached(&events_prefix, "events", goal, &mut ctx.degradation_notices)
             .await
         {
             let mut events: Vec<(MemoryRecord, usize)> = facts
@@ -1695,6 +1702,55 @@ impl MemoryManager {
         }
 
         ctx
+    }
+
+    /// 阶段 1(F-618):注入 LexStore 检索缓存
+    pub fn set_lex_store(&mut self, store: std::sync::Arc<crate::agent::lexstore::LexStore>) {
+        self.lex_store = Some(store);
+    }
+
+    /// 召回事实获取的缓存优先封装(F-618):
+    /// LexStore 在位且 TTL 内 → 零网络取缓存;否则全量拉取(既有降级语义)
+    /// 并整分区替换进缓存。goal 仅用于未来 P1 候选预筛(v0 直取全分区)。
+    async fn recall_facts_cached(
+        &self,
+        prefix: &str,
+        layer: &str,
+        goal: &str,
+        notices: &mut Vec<String>,
+    ) -> Option<Vec<crate::api::evorule_client::SharedFactEntry>> {
+        const RECALL_TTL_SECS: u64 = 60;
+        let _ = goal;
+        if let Some(store) = &self.lex_store {
+            if let Some(cached) = store.cached_facts(prefix, RECALL_TTL_SECS) {
+                return Some(
+                    cached
+                        .into_iter()
+                        .map(|f| crate::api::evorule_client::SharedFactEntry {
+                            fact_id: f.fact_id,
+                            path: f.path,
+                            value: f.value,
+                            source_session_id: 0,
+                            version: 0,
+                            origin_fact_id: None,
+                        })
+                        .collect(),
+                );
+            }
+        }
+        let fetched = self
+            .fetch_shared_facts_visible(prefix, layer, notices)
+            .await;
+        if let (Some(store), Some(facts)) = (&self.lex_store, &fetched) {
+            let rows: Vec<(u64, String, serde_json::Value)> = facts
+                .iter()
+                .map(|f| (f.fact_id, f.path.clone(), f.value.clone()))
+                .collect();
+            if let Err(e) = store.replace_partition(prefix, &rows) {
+                tracing::warn!(prefix = %prefix, error = %e, "LexStore replace_partition failed; next recall refetches");
+            }
+        }
+        fetched
     }
 
     /// F3：带降级可见性的共享事实拉取
