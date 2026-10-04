@@ -220,7 +220,7 @@ pub enum JournalError {
     /// 行级损坏(JSON 非法/缺字段/未知事件)
     #[error("journal corrupted: {0}")]
     Corrupt(String),
-    /// 同会话已有活跃写者(O-276:并发双写会使 seq 交错损坏账面,fail-fast;
+    /// 同会话已有活跃写者(并发双写会使 seq 交错损坏账面,fail-fast;
     /// 旧写者 Drop 释放占位后可重开)
     #[error("journal writer already active for session: {0}")]
     WriterActive(String),
@@ -292,12 +292,12 @@ struct JournalInner {
 #[derive(Clone)]
 pub struct JournalWriter {
     core: Arc<Mutex<JournalInner>>,
-    /// O-276:进程内活跃写者注册表键(sanitized session_id);最后一个克隆
+    /// 进程内活跃写者注册表键(sanitized session_id);最后一个克隆
     /// Drop 时释放占位
     registry_key: String,
 }
 
-/// O-276:进程内活跃写者注册表(键=sanitized session_id)
+/// 进程内活跃写者注册表(键=sanitized session_id)
 static ACTIVE_WRITERS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
     std::sync::Mutex::new(None);
 
@@ -344,7 +344,7 @@ impl JournalWriter {
             }
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        // O-276:占位进程内活跃写者——同会话第二个写者在此 fail-fast,
+        // 占位进程内活跃写者——同会话第二个写者在此 fail-fast,
         // 不再出现两写者各自恢复 last_seq 后交错 append(seq 重复/空洞=账面损坏)
         let registry_key = sanitize_session_id(session_id);
         {
@@ -895,7 +895,7 @@ mod tests {
     fn test_writer_active_registry_blocks_double_open_then_releases() {
         let dir = tempfile::tempdir().unwrap();
         let w = JournalWriter::open(dir.path(), "reg-test").unwrap();
-        // O-276:同会话第二写者 fail-fast(并发双写会使 seq 交错损坏账面)
+        // 同会话第二写者 fail-fast(并发双写会使 seq 交错损坏账面)
         assert!(matches!(
             JournalWriter::open(dir.path(), "reg-test"),
             Err(JournalError::WriterActive(_))

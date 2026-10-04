@@ -842,11 +842,11 @@ pub struct AgentRunner {
     /// ——CLI/子代理路径零改动)。run_streaming_inner 创建会话时在此目录建
     /// `{session_id}.jsonl` 事件流(会话唯一真相源,见 crate::agent::journal)
     journal_dir: Option<std::path::PathBuf>,
-    /// 16 号档 D2:验收判据自检命令(可选;长程/TB 模式)。task_done 提交前
+    /// 验收判据自检命令(可选;长程/TB 模式)。task_done 提交前
     /// runner 强制执行,exit 0=通过放行,非 0=门禁拒绝(不存在 done 退出路径)。
     /// None=不拦截(非长程运行零影响)。由 from_definition 从 def 穿线。
     acceptance_command: Option<String>,
-    /// 16 号档 D3:进展停滞检测器(F2 空转克星)。跨轮持续观察
+    /// 进展停滞检测器(F2 空转克星)。跨轮持续观察
     /// (工具名,参数,结果)三元组,连续重复→警告→按 H2 阻塞收尾
     stagnation: crate::agent::stagnation::StagnationDetector,
 }
@@ -1105,7 +1105,7 @@ impl AgentRunner {
                 .clone()
                 .unwrap_or_else(|| def.model.clone()),
         };
-        // 16 号档 D2:判据自检回路——acceptance_command 从 definition 穿线
+        // 判据自检回路——acceptance_command 从 definition 穿线
         // (task_done 提交前 runner 强制执行验收命令,判据不过不存在 done 退出路径)
         runner.acceptance_command = def.acceptance_command.clone();
         // 用户决策 3 + G10：summary_model 单独配置,同时构造 ContextSummarizer
@@ -2514,7 +2514,7 @@ impl AgentRunner {
 
         let args = params.get("args").cloned().unwrap_or(Value::Null);
 
-        // 16 号档 D2:判据自检门禁——task_done/task_blocked 提交前过验收;
+        // 判据自检门禁——task_done/task_blocked 提交前过验收;
         // 拒绝时详情作为 tool_result 回喂 LLM(指令不提交引擎)
         let args = match apply_acceptance_gate(self.acceptance_command.as_deref(), &args).await {
             GateOutcome::Allow(a) => a,
@@ -2548,7 +2548,7 @@ impl AgentRunner {
         };
 
         tool_calls.push(tool_name.to_string());
-        // 16 号档 D3:停滞检测(F2 空转克星)——观察(工具,参数,结果)三元组;
+        // 停滞检测(F2 空转克星)——观察(工具,参数,结果)三元组;
         // Warning/Exhausted 标记随结果回喂 LLM(fail-visible,下一轮可见)
         let stagnation_verdict =
             self.stagnation
@@ -3600,11 +3600,11 @@ impl AgentRunner {
                     Some(dir) => match crate::agent::journal::JournalWriter::open(dir, &session_id)
                     {
                         Ok(w) => Some(std::sync::Arc::new(w)),
-                        // O-276:同会话已有活跃写者=继续运行只会交错损坏账面,
+                        // 同会话已有活跃写者=继续运行只会交错损坏账面,
                         // 此特定错误 fail-fast 上浮(其余 IO 错误保持 fail-soft 降级)
                         Err(crate::agent::journal::JournalError::WriterActive(sid)) => {
                             yield Err(AgentError::Internal(format!(
-                                "O-276: session '{sid}' already has an active journal writer (并发双写防护;等先前运行收尾后再续跑)"
+                                "session '{sid}' already has an active journal writer (并发双写防护;等先前运行收尾后再续跑)"
                             )));
                             return;
                         }
@@ -4368,7 +4368,7 @@ impl AgentRunner {
                                 // yield ApprovalRequired 再等决策(帧须在 60s 窗口内
                                 // 到达前端)。非流式路径(run)仍走 handle_call_service
                                 // (内部 maybe_handle_approval,不产事件)
-                                // 16 号档 D2:判据自检门禁(与非流式 handle_call_service 同款)。
+                                // 判据自检门禁(与非流式 handle_call_service 同款)。
                                 // 拒绝 → 审计留痕 + 合成 tool 消息回喂 LLM + continue 下一个 tc
                                 // (指令不提交引擎——判据不过不存在 done 退出路径)
                                 let args = match apply_acceptance_gate(
@@ -4479,7 +4479,7 @@ impl AgentRunner {
                                     }
                                 };
                                 // 审批事件已在两阶段流程中即时 yield(见 Pending 分支)
-                                // 16 号档 D3:停滞检测(与非流式同款;标记随 tool 消息回喂)
+                                // 停滞检测(与非流式同款;标记随 tool 消息回喂)
                                 let final_result = {
                                     let mut fr = outcome.final_result;
                                     let verdict = runner.stagnation.observe(

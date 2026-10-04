@@ -343,7 +343,7 @@ async fn rollup_old_summaries(
     deps: &mut SedimentDeps<'_>,
     cfg: &SedimentConfig,
 ) -> Result<bool, String> {
-    // O-277:进程内串行化——读-合并-标记五步非原子,跨会话并发 sediment
+    // 进程内串行化——读-合并-标记五步非原子,跨会话并发 sediment
     // 会同批双 rollup(近似摘要双写+LLM 成本双花);进程级互斥消除交错。
     // 诚实边界:跨进程并发归 server 侧归属(登记维持)。
     static ROLLUP_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

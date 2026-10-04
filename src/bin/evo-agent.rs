@@ -764,7 +764,7 @@ async fn patrol_build_runner(
         .await
         .map_err(|e| format!("bridge error: {e}"))?
         .with_capability_boundary(capability_boundary)
-        // O-242:patrol 会话本地事件流——此前只有 server 侧审计链,本地
+        // patrol 会话本地事件流——此前只有 server 侧审计链,本地
         // 步级 journal 缺位。目录随 serve 约定(<workdir>/data/sessions);
         // run_streaming_inner 打开失败 fail-soft,与 serve 同语义。
         .with_journal_dir(workdir.join("data").join("sessions"));

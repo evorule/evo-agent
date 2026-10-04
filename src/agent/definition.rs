@@ -440,7 +440,7 @@ pub struct AgentDefinition {
     /// 预留 1/4 给响应,实际可用输入 = `n - n/4`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<usize>,
-    /// 16 号档 D2:验收判据自检命令（可选；长程/TB 模式）
+    /// 验收判据自检命令（可选；长程/TB 模式）
     ///
     /// 配置后，`task_done` 指令提交前 runner 强制在 shell 执行此命令：
     /// exit 0 = 判据通过（`params.acceptance_passed=true` 放行），
