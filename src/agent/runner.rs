@@ -1583,8 +1583,9 @@ impl AgentRunner {
             // F-616:usage 增量批量回写(sediment 前刷,批量端点一次 HTTP)
             memory.flush_usage(session_id).await;
             // F-609 执行器:生命周期规则应用(晋升/归档,Recipe 阈值)
+            // (async fn 必须显式 .await——不 await 则 Future 被 drop 静默不执行)
             let recipe = memory.recipe.clone().unwrap_or_default();
-            memory.apply_lifecycle_transitions(session_id, &recipe);
+            memory.apply_lifecycle_transitions(session_id, &recipe).await;
             let mut deps = sediment::SedimentDeps {
                 memory,
                 summarizer: self.summarizer.as_ref(),
