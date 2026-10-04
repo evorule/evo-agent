@@ -416,6 +416,7 @@ async fn test_sediment_rollup_marks_old_summaries_as_rolled_up() {
         event_store: None,
         // A2-1:无审计通路→知识候选提取自动跳过(纪律①)
         auditor: None,
+        journal_lines: Vec::new(),
     };
     let messages = vec![Message::User {
         content: "some conversation".to_string(),

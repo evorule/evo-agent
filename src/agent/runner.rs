@@ -1111,11 +1111,15 @@ impl AgentRunner {
             match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone()) {
                 Ok(recipe) => {
                     let rollup = recipe.lifecycle.rollup_threshold;
+                    let journal_digest = recipe.sources.journal_digest;
                     if let Some(mem) = runner.memory.as_mut() {
                         mem.set_recipe(recipe);
                     }
                     // Recipe.rollup_threshold 覆盖同名 def 配置（策略数据化）
                     runner.sediment_config.summary_rollup_threshold = rollup;
+                    // Recipe.sources.journal_digest 穿线（跨源注册规格策略面；
+                    // 缺省关=既有 agent 零影响）
+                    runner.sediment_config.enable_journal_digest = journal_digest;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "MemoryRecipe 解析失败——召回走词法 legacy 路径");
@@ -1156,6 +1160,8 @@ impl AgentRunner {
             // 无审计通路时 sediment 内部自动跳过）
             enable_knowledge_extraction: def.memory.enable_knowledge_extraction,
             min_messages_for_extraction: 4,
+            // 跨源批 C:journal 摘要投影(缺省关;Recipe sources 穿线于上)
+            enable_journal_digest: false,
         };
         // 阶段 3(F-611)+A2-2:自省记忆工具注册(声明面已在 step 2 按暴露条件
         // 预放行;此处声明了而条件不满足=配置矛盾,早失败)。置于 sediment_config
@@ -1609,6 +1615,11 @@ impl AgentRunner {
                 event_store: self.memory_event_store.as_mut(),
                 // A2-1：审计执行器自 summarizer 复用（同一 sidecar 通路）
                 auditor: self.summarizer.as_ref().and_then(|s| s.auditor()),
+                // 跨源批 C:journal 全量行预读(读取失败=空集如实降级;
+                // sources.journal_digest 门控在 sediment 内判定)
+                journal_lines: journal
+                    .map(|j| j.read_lines().unwrap_or_default())
+                    .unwrap_or_default(),
             };
             // sediment 四项结果落 journal——此前被 `let _ =` 丢弃，
             // 沉淀成功与否无对账依据（受信通道持久化信号闭环的最后半程）
