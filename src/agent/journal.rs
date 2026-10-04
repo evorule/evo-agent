@@ -155,7 +155,7 @@ pub enum JournalEvent {
         events_count: usize,
         /// rollup 是否执行
         rollup_done: bool,
-        /// A2-1：写入共享账本的知识候选数（serde default 保旧 journal 兼容）
+        /// 写入共享账本的知识候选数（serde default 保旧 journal 兼容）
         #[serde(default)]
         knowledge_candidates: usize,
     },

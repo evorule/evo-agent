@@ -348,7 +348,7 @@ impl ContextSummarizer {
         self
     }
 
-    /// A2-1：审计执行器只读访问
+    /// 审计执行器只读访问
     ///
     /// sediment 知识候选提取复用同一 sidecar 通路（纪律①：沉淀提取面
     /// 禁止新增直连 provider 调用路径）。

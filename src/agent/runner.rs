@@ -1135,7 +1135,7 @@ impl AgentRunner {
                 .summary_model
                 .clone()
                 .unwrap_or_else(|| def.model.clone()),
-            // A2-1：知识候选提取开关（默认 true；提取走 auditor sidecar，
+            // 知识候选提取开关（默认 true；提取走 auditor sidecar，
             // 无审计通路时 sediment 内部自动跳过）
             enable_knowledge_extraction: def.memory.enable_knowledge_extraction,
             min_messages_for_extraction: 4,
