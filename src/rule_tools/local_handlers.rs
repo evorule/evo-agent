@@ -261,11 +261,13 @@ impl ToolFunction for BundleExportTool {
 ///   schema_ref 必填，skill 知识体的正当归宿是上下文面（read_skill 装载），
 ///   本工具不提供绕门禁形态；
 /// - content_hash 全程由 evorule-bundle crate 计算（零复刻零旁路，哈希纪律）；
-/// - 闸门一语义：verdict 缺省 fail（未验证不得默认通过）；pass 必带
-///   sandbox:/human: 前缀可追溯证据（与 bundle_export 同口径）。骨架规则
-///   （on_true.noop 占位）须先填充并取得沙箱证据，再经
-///   bundle_import_dry_run → bundle_import 激活——本工具定位是
-///   「规范化落包+结构预检」，不是一键激活。
+/// - 闸门一语义（fail-closed 硬边界）：本工具恒出 fail 包（未验证不得激活）。
+///   与 bundle_export 不同——export 的 pass 是治理侧已有证据的转述，本工具
+///   是凭空构造，治理域在先事实不存在，故不持有 pass 发放权：verdict/evidence
+///   参数已移除，传入即拒。pass 重出包属治理域职责（治理侧取得沙箱证据后经
+///   bundle_export 带证据导出）。骨架规则（on_true.noop 占位）须先填充并取得
+///   沙箱证据，再经治理域通路升级 verdict——本工具定位是「规范化落包+结构
+///   预检」，不是一键激活，更不是 verdict 升级器。
 #[derive(Clone)]
 pub struct SkillPackToBundleTool;
 
@@ -315,31 +317,15 @@ impl ToolFunction for SkillPackToBundleTool {
                  skill adapter)",
             )
             .map_err(|e| e.to_string())?;
-        let verdict = args
-            .get("verdict")
-            .and_then(|v| v.as_str())
-            .unwrap_or("fail");
-        if verdict != "pass" && verdict != "fail" {
-            return Err("verdict must be \"pass\" or \"fail\"".to_string());
-        }
-        let evidence: Vec<String> = args
-            .get("evidence")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if verdict == "pass"
-            && (evidence.is_empty()
-                || !evidence
-                    .iter()
-                    .all(|s| s.starts_with("sandbox:") || s.starts_with("human:")))
-        {
+        // fail-closed 硬边界：verdict/evidence 参数已移除（本工具不持有 pass
+        // 发放权——凭空构造的包无治理域在先证据，前缀格式校验不构成真实证据）。
+        // 任一参数出现即拒，防旧调用方/幻觉参数绕过闸门一。
+        if args.get("verdict").is_some() || args.get("evidence").is_some() {
             return Err(
-                "verdict=pass requires traceable evidence: evidence must be non-empty and each \
-                 item must start with \"sandbox:<id>\" or \"human:<actor>\""
+                "skill_pack_to_bundle always produces an unverified (fail) bundle: \
+                 verdict/evidence parameters are not accepted — a verified pass bundle must \
+                 be re-exported from the governance domain (bundle_export) after sandbox \
+                 evidence is obtained there"
                     .to_string(),
             );
         }
@@ -436,13 +422,9 @@ impl ToolFunction for SkillPackToBundleTool {
             entries,
             data_dependencies: None,
             tests: BundleTests {
-                subset: evidence,
+                subset: Vec::new(),
                 fixtures: Vec::new(),
-                verdict: if verdict == "pass" {
-                    TestVerdict::Pass
-                } else {
-                    TestVerdict::Fail
-                },
+                verdict: TestVerdict::Fail,
             },
             audit: BundleAudit {
                 exported_at: rfc3339_utc_now(),
@@ -468,7 +450,8 @@ impl ToolFunction for SkillPackToBundleTool {
             Ok(_) => "pass".to_string(),
             Err(BundleError::TestsNotPassed { .. }) => {
                 "fail (expected for unverified skeleton rules: fill rule bodies, obtain \
-                 sandbox/human evidence, re-run with verdict=pass, then bundle_import_dry_run)"
+                 sandbox evidence via the governance domain, then re-export the verified \
+                 bundle there with bundle_export)"
                     .to_string()
             }
             Err(be) => {
@@ -754,12 +737,13 @@ pub fn specs() -> Vec<ToolSpec> {
                           into a DatasetBundle for the execution domain: pack.rules become \
                           Rule entries (rule_body passed through unchanged), the content hash \
                           is computed by the evorule-bundle crate, and a per-entry structural \
-                          pre-check runs locally. verdict defaults to \"fail\" (unverified \
-                          skeleton rules); \"pass\" requires traceable evidence items \
-                          (\"sandbox:<id>\" or \"human:<actor>\"). Feed the returned bundle to \
-                          bundle_import_dry_run / bundle_import. Knowledge sections of the \
-                          pack are NOT included: they belong to the context plane (read_skill), \
-                          not the execution domain."
+                          pre-check runs locally. The tool always produces an unverified \
+                          (fail) bundle: verdict/evidence parameters are not accepted — a \
+                          verified pass bundle must be re-exported from the governance domain \
+                          (bundle_export) after sandbox evidence is obtained there. Feed the \
+                          returned bundle to bundle_import_dry_run / bundle_import. Knowledge \
+                          sections of the pack are NOT included: they belong to the context \
+                          plane (read_skill), not the execution domain."
                 .to_string(),
             parameters: vec![
                 ParameterSpec {
@@ -781,25 +765,6 @@ pub fn specs() -> Vec<ToolSpec> {
                     name: "dataset_name".to_string(),
                     r#type: "string".to_string(),
                     description: "Human-readable dataset name (defaults to \"skill:<name>\")."
-                        .to_string(),
-                    required: false,
-                },
-                ParameterSpec {
-                    name: "verdict".to_string(),
-                    r#type: "string".to_string(),
-                    description: "Test verdict: \"fail\" (default, explicit unverified) or \
-                                  \"pass\" (requires evidence). Skeleton rules with unfilled \
-                                  on_true.noop bodies must stay \"fail\" until filled and \
-                                  sandbox-verified."
-                        .to_string(),
-                    required: false,
-                },
-                ParameterSpec {
-                    name: "evidence".to_string(),
-                    r#type: "array".to_string(),
-                    description: "Traceable evidence refs (array of strings). Required for \
-                                  verdict=pass: each item must be \"sandbox:<id>\" (machine \
-                                  attestation) or \"human:<actor>\" (explicit human downgrade)."
                         .to_string(),
                     required: false,
                 },
@@ -1234,25 +1199,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skill_pack_to_bundle_pass_requires_evidence() {
+    async fn test_skill_pack_to_bundle_pass_parameter_rejected() {
         let tool = SkillPackToBundleTool::new();
+        // fail-closed 硬边界：verdict/evidence 参数已移除，任一出现即拒
+        // （凭空构造的包无治理域在先证据，不持有 pass 发放权）。
         let args = serde_json::json!({ "pack": demo_pack(), "verdict": "pass" });
         let result = tool.call(&args).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("requires traceable evidence"));
-    }
+        assert!(result.unwrap_err().contains("parameters are not accepted"));
 
-    #[tokio::test]
-    async fn test_skill_pack_to_bundle_pass_with_evidence() {
         let tool = SkillPackToBundleTool::new();
         let args = serde_json::json!({
             "pack": demo_pack(),
-            "verdict": "pass",
+            "verdict": "fail",
             "evidence": ["sandbox:sb-1"]
         });
-        let out = tool.call(&args).await.expect("convert should succeed");
-        assert_eq!(out["bundle"]["tests"]["verdict"], "pass");
-        assert_eq!(out["validation"]["gate_one_status"], "pass");
+        let result = tool.call(&args).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("parameters are not accepted"));
     }
 
     #[tokio::test]
