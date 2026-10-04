@@ -96,6 +96,20 @@ pub struct BudgetConfig {
     pub degradation_order: Vec<String>,
 }
 
+/// 自省工具暴露面声明（F-611）。
+///
+/// 工具暴露是策略不是代码：哪些自省记忆工具随 LLM 请求下发
+/// （`openai_tools_payload`）由本节声明，未声明=不暴露（既有 agent 零影响）。
+/// 前置条件=LexStore 已配置（检索缓存是自省检索的数据前提）。
+/// 只读两件（`memory_search`/`memory_get`）随声明注册；写面工具
+/// （propose/link/forget）依赖治理闸，未开放声明（声明了也不注册）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ToolsSection {
+    /// 暴露的自省工具名集合（白名单语义；未知名在接线时 warn 跳过）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expose: Vec<String>,
+}
+
 fn default_degradation() -> Vec<String> {
     vec![
         "stable".to_string(),
@@ -118,6 +132,9 @@ pub struct MemoryRecipe {
     pub lifecycle: LifecycleConfig,
     /// 预算降级序
     pub budget: BudgetConfig,
+    /// 自省工具暴露面（F-611；缺省=不暴露任何工具）
+    #[serde(default)]
+    pub tools: ToolsSection,
 }
 
 impl Default for MemoryRecipe {
@@ -139,6 +156,7 @@ impl Default for MemoryRecipe {
             budget: BudgetConfig {
                 degradation_order: default_degradation(),
             },
+            tools: ToolsSection::default(),
         }
     }
 }
