@@ -305,6 +305,63 @@ struct KnowledgeExtractionOut {
     candidates: Vec<KnowledgeCandidateOut>,
 }
 
+/// 知识类别白名单判定（A2-1 提取面过滤与 A2-2 memory_propose 结构闸共用）
+pub fn is_valid_knowledge_kind(kind: &str) -> bool {
+    KNOWLEDGE_KINDS.contains(&kind)
+}
+
+/// 知识候选 event_id 生成（KC- 前缀 + 会话消毒段 + 秒级时间戳 + 批内序号；
+/// 提取路与工具路共用单点，保证命名零漂移）
+pub fn knowledge_candidate_event_id(session_id: &str, now: u64, seq: usize) -> String {
+    format!("KC-{}-{}-{}", sanitize_model_id(session_id), now, seq)
+}
+
+/// 共用构造：知识候选 → MemoryEvent（A2-1 sediment 提取路与 A2-2
+/// memory_propose 工具路**同一构造单点**，两路产物逐字段同构）。
+///
+/// 产物形态：`Custom("knowledge_candidate")` + `EventSource::LlmExtraction` +
+/// confidence clamp[0,1] + tags=[knowledge_candidate, kind, ...候选自带] +
+/// session 锚 + content={knowledge_kind,title,body}。
+/// A2-2 工具路的 `llm_generated` 旗标由 [`mark_llm_generated`] 在本函数
+/// 产物之上强制追加（提取路产物不带该旗标——sediment 侧车调用本身也是
+/// LLM 提取，但其产物语义=系统沉淀动作，旗标口径以 A2-1 落地为准）。
+pub fn build_knowledge_candidate_event(
+    event_id: &str,
+    session_id: &str,
+    now: u64,
+    cand: &KnowledgeCandidateOut,
+) -> MemoryEvent {
+    let mut event = MemoryEvent::new_root(
+        event_id,
+        // 方案字面 custom:knowledge_candidate → Custom("knowledge_candidate")
+        EventType::Custom("knowledge_candidate".to_string()),
+        now,
+        EventSource::LlmExtraction,
+    )
+    .with_confidence(cand.confidence.clamp(0.0, 1.0))
+    .with_tag("knowledge_candidate")
+    .with_tag(&cand.knowledge_kind)
+    .with_session(session_id);
+    event.content = serde_json::json!({
+        "knowledge_kind": cand.knowledge_kind,
+        "title": cand.title,
+        "body": cand.body,
+    });
+    for t in &cand.tags {
+        if !t.trim().is_empty() {
+            event = event.with_tag(t);
+        }
+    }
+    event
+}
+
+/// A2-2（F-611 写件）：`llm_generated` 旗标强制——content 字段 + tag 双落，
+/// 由系统写死（工具参数 schema 不收该字段，LLM 无法伪造 human 来源）。
+pub fn mark_llm_generated(mut event: MemoryEvent) -> MemoryEvent {
+    event.content["llm_generated"] = serde_json::Value::Bool(true);
+    event.with_tag("llm_generated")
+}
+
 /// 主入口：会话收尾时提取知识候选并写入共享账本（best-effort）
 ///
 /// 流程：
@@ -447,7 +504,7 @@ fn parse_knowledge_candidates(json_str: &str) -> Result<Vec<KnowledgeCandidateOu
         .candidates
         .into_iter()
         .filter(|c| {
-            let kind_ok = KNOWLEDGE_KINDS.contains(&c.knowledge_kind.as_str());
+            let kind_ok = is_valid_knowledge_kind(&c.knowledge_kind);
             let body_ok = !c.body.trim().is_empty() && !c.title.trim().is_empty();
             if !kind_ok {
                 tracing::warn!(kind = %c.knowledge_kind, "sediment: drop candidate (unknown knowledge_kind)");
@@ -473,28 +530,9 @@ async fn write_knowledge_candidates(
         .unwrap_or(0);
     for (seq, cand) in candidates.into_iter().enumerate() {
         // 事件 ID：会话内唯一 + 路径安全（KC- 前缀与事件提取 E- 风格对齐）
-        let event_id = format!("KC-{}-{}-{}", sanitize_model_id(session_id), now, seq);
-        let mut event = MemoryEvent::new_root(
-            &event_id,
-            // 方案字面 custom:knowledge_candidate → Custom("knowledge_candidate")
-            EventType::Custom("knowledge_candidate".to_string()),
-            now,
-            EventSource::LlmExtraction,
-        )
-        .with_confidence(cand.confidence.clamp(0.0, 1.0))
-        .with_tag("knowledge_candidate")
-        .with_tag(&cand.knowledge_kind)
-        .with_session(session_id);
-        event.content = serde_json::json!({
-            "knowledge_kind": cand.knowledge_kind,
-            "title": cand.title,
-            "body": cand.body,
-        });
-        for t in &cand.tags {
-            if !t.trim().is_empty() {
-                event = event.with_tag(t);
-            }
-        }
+        let event_id = knowledge_candidate_event_id(session_id, now, seq);
+        // 事件构造收敛共用单点（A2-2 工具路同构零漂移）
+        let event = build_knowledge_candidate_event(&event_id, session_id, now, &cand);
 
         let value = match serde_json::to_string(&event) {
             Ok(v) => v,
