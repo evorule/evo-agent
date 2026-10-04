@@ -1098,6 +1098,15 @@ impl MemoryManager {
         } else {
             "Settled".to_string()
         });
+        // F-609:事件载荷 confidence 浮面（晋升阈值判读用；确定性字段拷贝；
+        // value 为序列化 JSON 字符串,解析失败即不浮面)
+        if key.contains(".events.") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(value) {
+                if let Some(conf) = v.get("confidence").and_then(|c| c.as_f64()) {
+                    record.confidence = Some(conf as f32);
+                }
+            }
+        }
         // B5：stable.* 键经外部通道写入 → source 标记为 user（其余域不标，
         // 避免对 events/sessions 等既有语义域引入未约定含义）
         if key.starts_with("stable.") {
@@ -1994,6 +2003,62 @@ impl MemoryManager {
         }
     }
 
+    /// 阶段 2(F-609 执行器):生命周期规则应用——按 Recipe 阈值确定性迁移。
+    ///
+    /// v1 覆盖:
+    /// - 晋升:events 域 Captured 条目达 (promote_min_confidence ×
+    ///   promote_min_uses) → 机械复制晋升为 stable.llm.promoted.* 事实
+    ///   (零 LLM,受信通道,Settled 落标),原事件标 Promoted;
+    /// - 归档:非 Captured 条目闲置超 archive_after_idle_days → 本地标
+    ///   Archived(视图层语义,持久随下次自然重写——写放大 v1 规避)。
+    /// 确定性:阈值判读纯函数;RL-A1:只增不改(晋升=新增事实)。
+    pub async fn apply_lifecycle_transitions(
+        &mut self,
+        session_id: &str,
+        recipe: &crate::agent::recipe::MemoryRecipe,
+    ) {
+        let lc = &recipe.lifecycle;
+        let now = now_secs();
+        let mut to_promote: Vec<(String, String, MemoryRecord)> = Vec::new();
+        for rec in self.cache.values_mut() {
+            if rec.lifecycle_state.as_deref() == Some("Captured") && rec.key.starts_with("events.")
+            {
+                let conf = rec.confidence.unwrap_or(0.5);
+                if conf >= lc.promote_min_confidence && rec.usage_count >= lc.promote_min_uses {
+                    rec.lifecycle_state = Some("Promoted".to_string());
+                    let stable_key =
+                        format!("stable.llm.promoted.{}", rec.key.replace(".events.", "."));
+                    let mut p = MemoryRecord::new(&stable_key, &rec.value, now);
+                    p.confidence = rec.confidence;
+                    p.usage_count = rec.usage_count;
+                    p.source = rec.source.clone();
+                    p.lifecycle_state = Some("Settled".to_string());
+                    to_promote.push((stable_key, "system:promote".to_string(), p));
+                }
+            }
+            // 归档标记（闲置超阈值,非 Captured）——本地视图语义,持久随下次自然重写
+            if matches!(
+                rec.lifecycle_state.as_deref(),
+                Some("Settled") | Some("Promoted") | Some("Reinforced")
+            ) {
+                let idle_days = (now.saturating_sub(rec.timestamp)) as f64 / 86400.0;
+                if idle_days > lc.archive_after_idle_days as f64 {
+                    rec.lifecycle_state = Some("Archived".to_string());
+                }
+            }
+        }
+        for (key, source, rec) in &to_promote {
+            tracing::info!(
+                session_id = %session_id,
+                key = %key,
+                "lifecycle: event promoted to stable (机械复制,零 LLM)"
+            );
+            let _ = self
+                .set_scoped_with_source(MemoryScope::Shared, key, &rec.value, source)
+                .await;
+        }
+    }
+
     /// 召回事实获取的缓存优先封装(F-618):
     /// LexStore 在位且 TTL 内 → 零网络取缓存;否则全量拉取(既有降级语义)
     /// 并整分区替换进缓存。goal 仅用于未来 P1 候选预筛(v0 直取全分区)。
@@ -2542,6 +2607,41 @@ mod tests {
             assert!(mgr.is_empty());
             assert_eq!(mgr.len(), 0);
         });
+    }
+
+    #[test]
+    fn test_f609_executor_promotes_and_archives() {
+        // 执行器：events Captured 达阈值 → 晋升 stable；闲置超限 → Archived
+        let mut mgr = MemoryManager::new("test", make_test_client()).with_session_id("s1");
+        let recipe = crate::agent::recipe::MemoryRecipe::default();
+        let now = now_secs();
+        // 高置信+高使用事件 → 应晋升
+        let mut hot = MemoryRecord::new("events.E-hot", "{\"conf\":1}", now);
+        hot.key = "events.E-hot".to_string();
+        hot.confidence = Some(0.9);
+        hot.usage_count = 5;
+        hot.lifecycle_state = Some("Captured".to_string());
+        mgr.cache.insert("shared::events.E-hot".to_string(), hot);
+        // 闲置非 Captured → Archived
+        let mut stale = MemoryRecord::new("stable.old", "v", now - 400 * 86400);
+        stale.lifecycle_state = Some("Settled".to_string());
+        mgr.cache.insert("shared::stable.old".to_string(), stale);
+
+        tokio_test::block_on(async {
+            mgr.apply_lifecycle_transitions("s1", &recipe).await;
+        });
+
+        let promoted = mgr.cache.get("shared::events.E-hot").unwrap();
+        assert_eq!(promoted.lifecycle_state, Some("Promoted".to_string()));
+        // 晋升产生了 stable.llm.promoted 镜像事实
+        let promoted_key = mgr
+            .cache
+            .keys()
+            .find(|k| k.contains("stable.llm.promoted"))
+            .cloned();
+        assert!(promoted_key.is_some(), "promoted stable fact should exist");
+        let archived = mgr.cache.get("shared::stable.old").unwrap();
+        assert_eq!(archived.lifecycle_state, Some("Archived".to_string()));
     }
 
     #[test]

@@ -1095,9 +1095,12 @@ impl AgentRunner {
         if let Some(rj) = &def.memory.recipe {
             match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone()) {
                 Ok(recipe) => {
+                    let rollup = recipe.lifecycle.rollup_threshold;
                     if let Some(mem) = runner.memory.as_mut() {
                         mem.set_recipe(recipe);
                     }
+                    // Recipe.rollup_threshold 覆盖同名 def 配置（策略数据化）
+                    runner.sediment_config.summary_rollup_threshold = rollup;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "MemoryRecipe 解析失败——召回走词法 legacy 路径");
@@ -1568,6 +1571,9 @@ impl AgentRunner {
         if let Some(memory) = self.memory.as_mut() {
             // F-616:usage 增量批量回写(sediment 前刷,批量端点一次 HTTP)
             memory.flush_usage(session_id).await;
+            // F-609 执行器:生命周期规则应用(晋升/归档,Recipe 阈值)
+            let recipe = memory.recipe.clone().unwrap_or_default();
+            memory.apply_lifecycle_transitions(session_id, &recipe);
             let mut deps = sediment::SedimentDeps {
                 memory,
                 summarizer: self.summarizer.as_ref(),
