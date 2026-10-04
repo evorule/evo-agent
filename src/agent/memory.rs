@@ -892,7 +892,9 @@ pub struct MemoryManager {
     /// 召回内容拼入 prompt 前的最后一道防线。默认使用
     /// `SafetyAuditor::with_default_rules()` + Strip 模式；
     /// 命中即 warn 留痕（含规则名与片段）。
-    safety_auditor: crate::agent::safety_auditor::SafetyAuditor,
+    /// Arc 共享：自省记忆工具的响应面走同一实例（同一规则集/模式，
+    /// 防工具面与召回注入面审计口径漂移）。
+    safety_auditor: std::sync::Arc<crate::agent::safety_auditor::SafetyAuditor>,
     /// B3：cache vs 真相源定期校验的最小间隔（秒）
     ///
     /// 召回路径按此间隔节流触发 `verify_cache_against_server`；
@@ -930,7 +932,9 @@ impl MemoryManager {
             session_id: None,
             cache: BTreeMap::new(),
             ttl_secs: None,
-            safety_auditor: crate::agent::safety_auditor::SafetyAuditor::with_default_rules(),
+            safety_auditor: std::sync::Arc::new(
+                crate::agent::safety_auditor::SafetyAuditor::with_default_rules(),
+            ),
             cache_verify_interval_secs: 300,
             last_cache_verify: None,
         }
@@ -944,7 +948,7 @@ impl MemoryManager {
         mut self,
         auditor: crate::agent::safety_auditor::SafetyAuditor,
     ) -> Self {
-        self.safety_auditor = auditor;
+        self.safety_auditor = std::sync::Arc::new(auditor);
         self
     }
 
@@ -1942,6 +1946,51 @@ impl MemoryManager {
             .as_ref()
             .map(crate::agent::recipe::RetrievalPolicy::from_recipe)
             .unwrap_or_else(crate::agent::recipe::RetrievalPolicy::default_lexical)
+    }
+
+    /// 阶段 3(F-611):构造自省记忆工具的共享协作件快照。
+    ///
+    /// 前置=LexStore 与 Recipe 双双在位(检索缓存是数据前提,
+    /// Recipe.tools.expose 是暴露面载体)。协作件全部 Arc/clone 共享:
+    /// usage 计数与审计器与召回路径同源(工具命中计入强化、
+    /// 响应剥离与 prompt 注入同闸),不产生第二策略面。
+    /// None=任一前提缺失(调用方如实不暴露工具)。
+    pub(crate) fn memory_introspector(
+        &self,
+    ) -> Option<crate::agent::memory_tool::MemoryIntrospector> {
+        let store = self.lex_store.clone()?;
+        let recipe = self.recipe.clone()?;
+        Some(crate::agent::memory_tool::MemoryIntrospector::new(
+            self.namespace.clone(),
+            self.evorule_client.clone(),
+            store,
+            recipe,
+            std::sync::Arc::clone(&self.usage_pending),
+            std::sync::Arc::clone(&self.safety_auditor),
+        ))
+    }
+
+    /// 阶段 3(F-611):暴露面集合——Recipe.tools.expose ∩ 已实现的只读两件。
+    ///
+    /// 未知名 warn 跳过(数据面笔误不致命,但要留痕可查);
+    /// 写面工具依赖治理闸,不在本实现集,声明了同样 warn 跳过。
+    pub(crate) fn exposed_introspection_tools(&self) -> Vec<String> {
+        let Some(recipe) = &self.recipe else {
+            return Vec::new();
+        };
+        recipe
+            .tools
+            .expose
+            .iter()
+            .filter(|n| {
+                let known = crate::agent::memory_tool::is_introspection_tool(n);
+                if !known {
+                    tracing::warn!(tool = %n, "recipe.tools.expose declares unknown/unavailable memory tool; skipped");
+                }
+                known
+            })
+            .cloned()
+            .collect()
     }
 
     /// 阶段 2(F-616):usage 增量批量回写——会话末调用一次(sediment 前)。

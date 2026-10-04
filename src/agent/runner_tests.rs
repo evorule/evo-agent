@@ -2843,3 +2843,80 @@ fn truncate_tool_result_keeps_head_and_tail() {
     assert!(out.ends_with('T'), "tail half must come from original tail");
     assert!(!out.contains('M'), "middle section must be cut");
 }
+
+// === 自省记忆工具接线测试(阶段 3 F-611)===
+
+fn make_memory_recipe_with_expose(expose: Vec<&str>) -> crate::agent::recipe::MemoryRecipe {
+    let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+    recipe.tools.expose = expose.into_iter().map(String::from).collect();
+    recipe
+}
+
+fn temp_lex_db(tag: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("runner-lex-test-{}-{tag}.db", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+#[test]
+fn test_exposed_tools_from_definition_conditions() {
+    let mut def = make_def_with_tools(vec![]);
+    // 缺 lex_store → 不放行
+    assert!(crate::agent::memory_tool::exposed_tools_from_definition(&def).is_empty());
+    // lex_store + recipe.tools.expose → 放行两件;写面工具(依赖治理闸)被过滤
+    def.memory.lex_store = Some("mem.db".to_string());
+    def.memory.recipe = Some(serde_json::json!({
+        "recipe_version": "memory-v1.0",
+        "retrieval": {}, "lifecycle": {}, "budget": {},
+        "tools": {"expose": ["memory_search", "memory_get", "memory_propose"]}
+    }));
+    assert_eq!(
+        crate::agent::memory_tool::exposed_tools_from_definition(&def),
+        vec!["memory_search".to_string(), "memory_get".to_string()]
+    );
+}
+
+#[test]
+fn test_register_memory_introspection_tools_happy_path() {
+    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    let mut mem = crate::agent::memory::MemoryManager::new("ns", make_test_client());
+    mem.set_lex_store(std::sync::Arc::new(
+        crate::agent::lexstore::LexStore::open(&temp_lex_db("happy")).unwrap(),
+    ));
+    mem.set_recipe(make_memory_recipe_with_expose(vec!["memory_search", "memory_get"]));
+    runner.memory = Some(mem);
+    runner.config.tool_names = vec!["memory_search".to_string()];
+    runner.register_memory_introspection_tools().unwrap();
+    assert!(runner.tool_handler.has_tool("memory_search"));
+    assert!(runner.tool_handler.has_tool("memory_get"));
+    // schema 目录能产出两件的 function schema(随 openai_tools_payload 下发)
+    let schemas = AgentRunner::openai_function_schemas_for(&runner.tool_handler.tool_names());
+    let search = schemas
+        .iter()
+        .find(|s| s["function"]["name"] == "memory_search")
+        .expect("memory_search schema must be emitted for registered introspection tools");
+    let props = search["function"]["parameters"]["properties"]
+        .as_object()
+        .unwrap();
+    assert!(props.contains_key("query"));
+    assert!(props.contains_key("kind"));
+    assert!(props.contains_key("limit"));
+}
+
+#[test]
+fn test_register_memory_introspection_tools_declared_but_unmet_errors() {
+    // tools 声明了自省工具而暴露条件不满足(无 store/recipe)=配置矛盾,早失败
+    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    runner.memory = Some(crate::agent::memory::MemoryManager::new("ns", make_test_client()));
+    runner.config.tool_names = vec!["memory_search".to_string()];
+    let err = runner.register_memory_introspection_tools().unwrap_err();
+    assert!(err.to_string().contains("exposure"));
+}
+
+#[test]
+fn test_register_memory_introspection_tools_not_declared_no_exposure() {
+    // 未声明且条件不满足 → 静默通过(既有 agent 零影响)
+    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    runner.register_memory_introspection_tools().unwrap();
+    assert!(!runner.tool_handler.has_tool("memory_search"));
+}

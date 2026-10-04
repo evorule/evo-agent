@@ -48,6 +48,7 @@ use crate::api::api_core::ApiError;
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::metrics::{SessionActiveGuard, SharedMetrics};
 use crate::io_handler::IoHandler;
+use crate::io_handlers::tool_handler::ToolFunction;
 use crate::io_handlers::{LlmHandler, StreamChunk, ToolHandler};
 
 /// TODO: doc
@@ -1010,8 +1011,11 @@ impl AgentRunner {
 
         // 2. 校验:def.tools 全部已在 tool_handler 注册
         // (早失败:用户能在跑之前就发现配错,而不是跑一半才挂)
+        // 例外:自省记忆工具在记忆装配后才注册(阶段 3 F-611),此处按暴露
+        // 条件预放行;装配后仍未注册=配置矛盾,由注册步显式报错(fail-visible)
+        let introspect_allowed = crate::agent::memory_tool::exposed_tools_from_definition(&def);
         for tool_name in &config.tool_names {
-            if !tool_handler.has_tool(tool_name) {
+            if !tool_handler.has_tool(tool_name) && !introspect_allowed.contains(tool_name) {
                 return Err(AgentError::Internal(format!(
                     "agent '{}' requires tool '{}' but it is NOT registered in tool_handler; \
                      check your agent.json 'tools' list vs the tool_handler you passed",
@@ -1119,6 +1123,9 @@ impl AgentRunner {
                 }
             }
         }
+        // 阶段 3(F-611):自省记忆工具注册(声明面已在 step 2 按暴露条件预放行;
+        // 此处声明了而条件不满足=配置矛盾,早失败)
+        runner.register_memory_introspection_tools()?;
         // C1:沉淀配置(总是构造,sediment_session 在 memory 为 None 时是 no-op)
         // C3/C4:从 MemoryConfig 读取 max_session_summaries/max_injected_events/
         //        summary_rollup_threshold/enable_event_extraction
@@ -2079,6 +2086,56 @@ impl AgentRunner {
         Ok(AgentResult::error(closed_error, step_count, duration))
     }
 
+    /// 阶段 3(F-611):自省记忆工具注册——只读两件(search/get)。
+    ///
+    /// 暴露面=策略:`MemoryRecipe.tools.expose` 白名单声明,前置=LexStore 在位
+    /// (检索缓存是自省检索的数据前提)。协作件全部与 MemoryManager 共享
+    /// (usage 计数/审计器同源,不产生第二策略面)。
+    /// `tools` 配置声明了自省工具而暴露条件不满足=配置矛盾,早失败(可控);
+    /// 未声明而条件满足=照常注册(注册即随 openai_tools_payload 下发,
+    /// 与既有工具语义一致)。
+    fn register_memory_introspection_tools(&mut self) -> Result<(), AgentError> {
+        let declared: Vec<String> = self
+            .config
+            .tool_names
+            .iter()
+            .filter(|n| crate::agent::memory_tool::is_introspection_tool(n))
+            .cloned()
+            .collect();
+        let (exposed, intro) = match self.memory.as_ref() {
+            Some(mem) => (mem.exposed_introspection_tools(), mem.memory_introspector()),
+            None => (Vec::new(), None),
+        };
+        let missing: Vec<&String> = declared.iter().filter(|n| !exposed.contains(n)).collect();
+        if !missing.is_empty() {
+            return Err(AgentError::Internal(format!(
+                "agent config lists memory introspection tool(s) {declared:?} but exposure \
+                 conditions are not met (requires memory.type=persistent, memory.recipe with \
+                 tools.expose declaring them, and memory.lex_store configured); unmet: {missing:?}"
+            )));
+        }
+        if let Some(intro) = intro {
+            if exposed.is_empty() {
+                return Ok(());
+            }
+            let intro = std::sync::Arc::new(intro);
+            for name in &exposed {
+                let exec: std::sync::Arc<dyn ToolFunction> = match name.as_str() {
+                    crate::agent::memory_tool::MEMORY_SEARCH_TOOL => std::sync::Arc::new(
+                        crate::agent::memory_tool::MemorySearchTool::new(intro.clone()),
+                    ),
+                    crate::agent::memory_tool::MEMORY_GET_TOOL => std::sync::Arc::new(
+                        crate::agent::memory_tool::MemoryGetTool::new(intro.clone()),
+                    ),
+                    _ => continue,
+                };
+                self.tool_handler.register_tool(name, exec);
+                info!(tool = %name, "memory introspection tool registered");
+            }
+        }
+        Ok(())
+    }
+
     /// 组装随 LLM 请求下发的工具 OpenAI function schema。
     ///
     /// 数据源与 schema 形状见 [`Self::openai_function_schemas_for`];此处仅决定
@@ -2116,6 +2173,9 @@ impl AgentRunner {
         // 导致 rule_list 失败)。spec 与执行器同源于 rule_tool_specs()。
         specs.extend(crate::rule_tools::rule_tool_specs());
         specs.push(crate::builtin_tools::delegate_tool::delegate_tool_spec());
+        // 自省记忆工具静态 spec(阶段 3 F-611):仅名字命中注册集时产出
+        // (见下方循环),静态并入目录无暴露副作用。
+        specs.extend(crate::agent::memory_tool::memory_tool_specs());
 
         let mut tools = Vec::new();
         for name in names {

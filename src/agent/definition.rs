@@ -146,10 +146,13 @@ pub struct MemoryConfig {
     /// 配置后 stable/events 召回走本地 SQLite 索引缓存(60s TTL,过期才
     /// 全量刷新)——省每轮 O(N) 网络拉取;store 错误一律降级全量路径
     /// (I14)。未配置零影响。tb-agent 竞赛配置建议启用。
+    /// 另为自省记忆工具(阶段 3)的数据前提:工具暴露还需
+    /// memory.recipe 的 tools.expose 声明(白名单,缺省不暴露)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lex_store: Option<String>,
     /// 阶段 2(F-610):MemoryRecipe 策略规则集(可选;内嵌 JSON 形态,
-    /// 解析为 recipe::MemoryRecipe——检索权重/半衰期/生命周期阈值数据化;
+    /// 解析为 recipe::MemoryRecipe——检索权重/半衰期/生命周期阈值/
+    /// 自省工具暴露面(tools.expose)数据化;
     /// 未配置=词法 legacy 行为,既有 agent 零影响)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipe: Option<serde_json::Value>,
