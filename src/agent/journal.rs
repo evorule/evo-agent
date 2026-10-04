@@ -155,6 +155,9 @@ pub enum JournalEvent {
         events_count: usize,
         /// rollup 是否执行
         rollup_done: bool,
+        /// A2-1：写入共享账本的知识候选数（serde default 保旧 journal 兼容）
+        #[serde(default)]
+        knowledge_candidates: usize,
     },
     /// B-1(收尾清偿批):逐轮 wire 留痕——本轮组装完成的完整上下文 wire 落账。
     /// 每轮全量(不裁剪)双写成本已裁定接受;F-903 重建演示以此为逐字节比对基准。
@@ -526,7 +529,7 @@ impl JournalWriter {
         })
     }
 
-    /// sediment 结果落 journal（受信通道持久化信号 + 四项结果对账依据）
+    /// sediment 结果落 journal（受信通道持久化信号 + 沉淀结果对账依据）
     pub fn sediment_performed(
         &self,
         summary_written: bool,
@@ -534,6 +537,7 @@ impl JournalWriter {
         stable_facts_cache_only: Vec<String>,
         events_count: usize,
         rollup_done: bool,
+        knowledge_candidates: usize,
     ) -> Result<u64, JournalError> {
         self.push(JournalEvent::SedimentPerformed {
             summary_written,
@@ -541,6 +545,7 @@ impl JournalWriter {
             stable_facts_cache_only,
             events_count,
             rollup_done,
+            knowledge_candidates,
         })
     }
 
@@ -744,6 +749,7 @@ mod tests {
                 stable_facts_cache_only: vec![],
                 events_count: 2,
                 rollup_done: false,
+                knowledge_candidates: 1,
             },
             JE::WireRendered {
                 round: 1,

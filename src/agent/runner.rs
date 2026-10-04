@@ -1135,6 +1135,10 @@ impl AgentRunner {
                 .summary_model
                 .clone()
                 .unwrap_or_else(|| def.model.clone()),
+            // A2-1：知识候选提取开关（默认 true；提取走 auditor sidecar，
+            // 无审计通路时 sediment 内部自动跳过）
+            enable_knowledge_extraction: def.memory.enable_knowledge_extraction,
+            min_messages_for_extraction: 4,
         };
         // 判据自检回路——acceptance_command 从 definition 穿线
         // (task_done 提交前 runner 强制执行验收命令,判据不过不存在 done 退出路径)
@@ -1579,6 +1583,8 @@ impl AgentRunner {
                 summarizer: self.summarizer.as_ref(),
                 extractor: self.extractor.as_mut(),
                 event_store: self.memory_event_store.as_mut(),
+                // A2-1：审计执行器自 summarizer 复用（同一 sidecar 通路）
+                auditor: self.summarizer.as_ref().and_then(|s| s.auditor()),
             };
             // sediment 四项结果落 journal——此前被 `let _ =` 丢弃，
             // 沉淀成功与否无对账依据（受信通道持久化信号闭环的最后半程）
@@ -1591,6 +1597,7 @@ impl AgentRunner {
                     result.stable_facts_cache_only.clone(),
                     result.events.len(),
                     result.rollup_done,
+                    result.knowledge_candidates.len(),
                 );
             }
             if !result.stable_facts_cache_only.is_empty() {

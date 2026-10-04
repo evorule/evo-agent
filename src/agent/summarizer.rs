@@ -348,6 +348,14 @@ impl ContextSummarizer {
         self
     }
 
+    /// A2-1：审计执行器只读访问
+    ///
+    /// sediment 知识候选提取复用同一 sidecar 通路（纪律①：沉淀提取面
+    /// 禁止新增直连 provider 调用路径）。
+    pub fn auditor(&self) -> Option<&AuditedLlm> {
+        self.audited.as_ref()
+    }
+
     /// 自定义摘要阈值(Q9 Strategy B,测试用)
     pub fn with_threshold(mut self, threshold: usize) -> Self {
         self.summary_threshold = threshold;
