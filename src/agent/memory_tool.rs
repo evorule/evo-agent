@@ -414,13 +414,16 @@ impl MemoryIntrospector {
         };
 
         let mut notices: Vec<String> = Vec::new();
-        // 型别→检索层族映射：过滤由型别直证列承担；层族清单随源注册批
-        // 推进（程序源注册落地前 kind=procedural 如实空结果，无降级噪音）
+        // 型别→检索层族映射：过滤由型别直证列承担（同族混型行被列过滤正确
+        // 排除）。北极星锚残余节（procedural 型逐行覆盖）落 stable 族，故
+        // kind=procedural 检索 stable 族；专属族（procedural./local.）随
+        // 源注册批扩入清单。
         let (layers, type_filter): (Vec<&str>, Vec<&str>) = match kind_filter {
             None => (vec!["stable", "summaries", "events"], Vec::new()),
             Some(mem_type::SEMANTIC) => (vec!["stable"], vec![mem_type::SEMANTIC]),
             Some(mem_type::EPISODIC) => (vec!["events"], vec![mem_type::EPISODIC]),
             Some(mem_type::WORK) => (vec!["summaries"], vec![mem_type::WORK]),
+            Some(mem_type::PROCEDURAL) => (vec!["stable"], vec![mem_type::PROCEDURAL]),
             Some(mt) => (Vec::new(), vec![mt]),
         };
 
@@ -1527,8 +1530,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_search_kind_procedural_unregistered_honest_empty() {
-        // 程序源注册落地前:kind=procedural 如实空结果,无降级噪音
+    async fn test_search_kind_procedural_no_rows_honest_empty() {
+        // 族内无 procedural 型行:kind=procedural 如实空结果,无降级噪音
         let intro = make_introspector(
             "proc",
             &[(
@@ -1543,6 +1546,36 @@ mod tests {
             .unwrap();
         assert_eq!(out["result_count"], 0);
         assert!(out["degradation_notices"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_kind_procedural_hits_override_rows() {
+        // 北极星锚残余节形态:stable 族行携带 mem_type=procedural 逐行覆盖
+        // → kind=procedural 命中,semantic 同族行被型别列正确排除
+        let intro = make_introspector(
+            "procwalk",
+            &[
+                (1, "shared.ns.stable.llm.m.a".into(), fact_json("a", "部署完成事项", now())),
+                (2, "shared.ns.stable.northstar.milestones".into(),
+                 serde_json::json!({"key": "northstar.milestones",
+                                    "value": "里程碑1: 部署完成；验收: 全绿",
+                                    "timestamp": now(), "mem_type": "procedural"})),
+            ],
+        );
+        let out = intro
+            .search(&serde_json::json!({"query": "部署完成", "kind": "procedural"}))
+            .await
+            .unwrap();
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["fact_id"], 2);
+        assert_eq!(results[0]["mem_type"], "procedural");
+        // 无 kind 查询:两行都回(不过滤=旧行为)
+        let all = intro
+            .search(&serde_json::json!({"query": "部署完成"}))
+            .await
+            .unwrap();
+        assert_eq!(all["result_count"], 2);
     }
 
     #[tokio::test]
