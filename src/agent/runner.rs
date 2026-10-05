@@ -861,6 +861,11 @@ pub struct AgentRunner {
     /// 进入允许面。false:注册面 ∪ 静态表(主路径行为等价口径不变,B2 断言
     /// 测试盯守)。
     assembly_scope_focus: bool,
+    /// 摘要保真对照(规格修正批交付物 B):当前会话 journal 写者(流式路径
+    /// 注入;CLI run 纯路径无 journal=只 warn 不落账)。G10 摘要替换时
+    /// 自动对照落 summary_fidelity_scan 事件。
+    active_journal:
+        Option<std::sync::Arc<crate::agent::journal::JournalWriter>>,
 }
 
 /// 管道阶段⑦执行器：runner 的 call_service 通路
@@ -935,6 +940,7 @@ impl AgentRunner {
             stagnation: crate::agent::stagnation::StagnationDetector::new(),
             pipeline_entry: crate::agent::pipeline::PipelineEntry::React,
             assembly_scope_focus: false,
+            active_journal: None,
         }
     }
 
@@ -1505,7 +1511,35 @@ impl AgentRunner {
             .summarize_dropped_with_metadata(dropped, goal)
             .await
             .map_err(AgentError::Internal)?;
-        let Some(formatted) = outcome.formatted() else {
+        // 摘要保真对照(规格修正批交付物 B):被裁剪消息确定性锚点 vs 摘要
+        // 文本,每次压缩自动对照(I5 升级)。journal 在位才落账(流式路径);
+        // ratio<0.5 warn(fail-visible);空摘要=跳过判定但事件照落。
+        let summary_text = outcome.formatted();
+        let scan = crate::agent::summary_fidelity::scan(
+            dropped,
+            summary_text.as_deref().unwrap_or(""),
+            summary_text.is_none(),
+        );
+        if scan.ratio < 0.5 && !scan.summary_empty {
+            warn!(
+                session_id = %session_id,
+                ratio = scan.ratio,
+                anchors = scan.anchors_n,
+                hit = scan.hit_n,
+                "summary fidelity below 0.5 - key info may be lost from trimmed history (fail-visible)"
+            );
+        }
+        if let Some(j) = self.active_journal.as_deref() {
+            let _ = j.summary_fidelity_scan(
+                session_id,
+                scan.trimmed_n,
+                scan.anchors_n,
+                scan.hit_n,
+                scan.ratio,
+                scan.summary_empty,
+            );
+        }
+        let Some(formatted) = summary_text else {
             tracing::debug!(%session_id, "R3: summary skipped (below threshold or empty)");
             return Ok(());
         };
@@ -4122,6 +4156,8 @@ impl AgentRunner {
                     },
                     None => None,
                 };
+            // 摘要保真对照(交付物 B):journal 写者克隆挂 runner(摘要替换时落账)
+            runner.active_journal = journal.clone();
             // turn_started(轮顶;turn_seq 按 journal 内既有轮数递增,G15 续跑同文件续轮)。
             // turn_guard 保证所有终止路径(优雅显式 end / 异常 drop 补写 aborted)轮界闭合。
             let mut turn_guard = match &journal {
