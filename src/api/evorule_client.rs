@@ -146,6 +146,35 @@ impl EvoruleApiClient {
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
+    /// 提议知识条目入账 Draft（治理语义封装，非裸 passthrough）
+    ///
+    /// 经服务编排层服务注册桥（`knowledge-propose`）→ 规则引擎服务端闸：
+    /// `governance.llm_generated.flag` 由服务端强制构造（请求值不可生效）、
+    /// `trust_level` 强制 `llm`（冒充显式拒绝）、`cause` 必填入溯源锚，
+    /// 入账复用规则引擎既有全闸链，一律 Draft 落账（行权在生命周期迁移闸）。
+    ///
+    /// - `entry`：与规则引擎 knowledge 条目入账请求同构（entry_id/version/payload/
+    ///   schema_ref/...；其内混入的 governance/trust_level 声明不采信）；
+    /// - `source_session_id`：来源会话锚（提取候选所在会话，可审计回放），可缺省。
+    ///
+    /// 服务名固定白名单（不开放任意服务直调封装）；服务侧 4xx（冒充拒绝/契约闸）
+    /// 经 `check_response` fail-fast 显式上抛。
+    pub async fn propose_knowledge_entry(
+        &self,
+        dataset_id: &str,
+        entry: &Value,
+        cause: &str,
+        source_session_id: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        let args = serde_json::json!({
+            "dataset_id": dataset_id,
+            "entry": entry,
+            "cause": cause,
+            "source_session_id": source_session_id,
+        });
+        self.invoke_service("knowledge-propose", &args).await
+    }
+
     /// 平台用户令牌校验 —— GET /api/platform/auth/me
     ///
     /// 用调用者提交的 Bearer 令牌直接请求认证端点，换取平台用户名。
@@ -1403,5 +1432,87 @@ mod tests {
             client.verify_platform_token("t").await,
             Err(ApiError::InvalidResponse)
         ));
+    }
+
+    // ===== 治理写通路：propose_knowledge_entry 封装 =====
+
+    /// 请求形状：服务名固定 knowledge-propose，body = {dataset_id, entry, cause,
+    /// source_session_id}；响应透传（proposed 回执）
+    #[tokio::test]
+    async fn test_propose_knowledge_entry_request_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/services/knowledge-propose/invoke")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "dataset_id": "ds-a23",
+                "cause": "E2E：候选入账",
+                "source_session_id": "sess-1"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status":"proposed","entry_id":"k-1","version":1,"lifecycle":"Draft"}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let entry = serde_json::json!({
+            "entry_id": "k-1", "version": 1,
+            "payload": {"statement": "x"}, "schema_ref": "builtin:knowledge/fact"
+        });
+        let resp = client
+            .propose_knowledge_entry("ds-a23", &entry, "E2E：候选入账", Some("sess-1"))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "proposed");
+        assert_eq!(resp["lifecycle"], "Draft");
+        mock.assert_async().await;
+    }
+
+    /// 请求形状：source_session_id 缺省时字段在 body 内显式 null（形状稳定，服务端 serde 可选）
+    #[tokio::test]
+    async fn test_propose_knowledge_entry_session_none_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/services/knowledge-propose/invoke")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "dataset_id": "ds-a23",
+                "cause": "c",
+                "source_session_id": serde_json::Value::Null
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status":"proposed"}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let entry = serde_json::json!({"entry_id": "k-2", "version": 1,
+            "payload": {}, "schema_ref": "builtin:knowledge/fact"});
+        client
+            .propose_knowledge_entry("ds-a23", &entry, "c", None)
+            .await
+            .unwrap();
+        mock.assert_async().await;
+    }
+
+    /// 错误翻译：服务侧 4xx（冒充拒绝/契约闸）fail-fast 显式上抛，不静默
+    #[tokio::test]
+    async fn test_propose_knowledge_entry_error_fail_fast() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/services/knowledge-propose/invoke")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"code":"bad_request","message":"trust_level 冒充拒绝"}}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let entry = serde_json::json!({"entry_id": "k-3", "version": 1,
+            "payload": {}, "schema_ref": "builtin:knowledge/fact"});
+        assert!(client
+            .propose_knowledge_entry("ds-a23", &entry, "c", None)
+            .await
+            .is_err());
     }
 }
