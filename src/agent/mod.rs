@@ -23,6 +23,7 @@ pub mod memory;
 pub mod memory_event;
 pub mod memory_tool;
 pub mod output_validator;
+pub mod pipeline;
 pub mod recipe;
 pub mod replan;
 pub mod runner;
@@ -61,6 +62,11 @@ pub use memory_event::{
     Emotion, EmotionSubject, Entity, EntityIndex, EntityRef, EntityStatus, EntityType,
     EventExtractor, EventSource, EventType, ExtractionConfig, ExtractionTrigger, FactId,
     MemoryEvent, MemoryEventStore, Narrative, ReplayDirection, ReplayEngine, StoreError,
+};
+pub use pipeline::{
+    CallerContext, DenialStage, FocusSnapshot, LedgerRecord, PipelineDenial, PipelineDeps,
+    PipelineEntry, PipelineExecutor, PipelineFailure, PipelineOutcome, PipelineRequest,
+    PolicyJudgedSink, ToolExecutionPipeline,
 };
 pub use replan::{
     should_replan, BudgetCounters, BudgetThresholds, ReplanDecision, ReplanReason, ReplanState,

@@ -1,0 +1,833 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 EvoRule Project
+// This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
+#![forbid(unsafe_code)]
+//! ToolExecutionPipeline —— 工具执行唯一管道（工具面统一架构「一管道」，§3.2）
+//!
+//! 所有 agent 面工具执行必须经过的唯一函数。管道阶段是**结构性在场**的——
+//! 不存在「没挂门禁的调用点」。八阶段语义：
+//!
+//! | 阶段 | 语义 | PR-2 状态 |
+//! |---|---|---|
+//! | ① 查表 | manifest 必须存在（静态表 + handler 注册的动态源） | 显式实装 |
+//! | ② 聚焦过滤 | tool_name ∈ focus_snapshot（装配期允许面快照） | 显式实装 |
+//! | ③ 意图信号 | 按 adjudication_class 提交 pending_tool_intent | 复用既有裁决通道（原 execute_tool_call 内联逻辑逐字迁入） |
+//! | ④ 规则裁决 | version 判据（放行/拦截，fail-closed 语义不变） | 同上 |
+//! | ⑤ 分级审批 | 按 approval_policy：AlwaysDeny 拒 / 其余走既有 proposal 协议 | 显式实装（决策端两调协议仍归 runner，PR-4 统一） |
+//! | ⑥ 机制沙箱 | fs_safety/net_guard 路径围栏 | 占位阶段——守卫仍在工具实现内联（双层分工不变，实现可在 handler 内二次防御） |
+//! | ⑦ 执行 | 注入执行器 + 真实结局采集（metrics/轨迹） | 显式实装 |
+//! | ⑧ 结局落账 | LedgerRecord 全程账 + journal 写失败显式化（fail-visible） | 显式实装（链侧 tool_trace 指令接线 = 信号契约批次） |
+//!
+//! 行为等价纪律（§七.2 硬验收）：本模块是**结构重构而非策略变更**——治理拦截
+//! 的两态 JSON 文案、裁决 fail-closed 语义、轨迹/指标采集点均与原 execute_tool_call
+//! 逐字对齐；runner_tests 既有基线测试（放行/拦截/审批）不改一行保持全绿。
+//!
+//! PR-2 已知范围外（后续 PR 收口）：G13 并行预执行入口（PR-3）、file_api 读面
+//! 查表（PR-3）、两面身份与 HumanGate（PR-4）、链侧 tool_trace 统一指令（信号
+//! 契约批次）、delegate 聚焦决策落账（PR-8）。
+
+use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Instant;
+
+use serde::Serialize;
+use serde_json::Value;
+
+use crate::agent::adjudicator::AdjudicationChannel;
+use crate::agent::definition::CapabilityBoundary;
+use crate::agent::journal::{JournalError, JournalWriter};
+use crate::agent::runner::{
+    intent_signal, resolve_target_scope, resolve_tool_intent, tool_intent_signal, AgentError,
+};
+use crate::agent::tool_manifest::{ApprovalPolicy, ToolManifest};
+use crate::agent::tool_trace::ToolTraceCollector;
+use crate::api::metrics::Metrics;
+
+// =============================================================================
+// 请求/依赖（管道输入面）
+// =============================================================================
+
+/// 调用方入口（PR-2 最小集：runner 内部 ReAct 族路径统一记 React；
+/// 入口差异化的完整 CallerContext 随 PR-3 入口收口 / PR-4 两面扩展）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineEntry {
+    /// runner 主循环工具调用
+    React,
+    /// 审批批准后重执行
+    ApprovalReexec,
+    /// 子代理 delegate 路径（PR-8 接线）
+    Delegate,
+}
+
+/// 调用方上下文（设计档 §3.2：agent def id / serve|cli|delegate / session id；
+/// PR-2 先落 session_id 与入口类，其余字段随后续 PR 扩展——只增不改）
+#[derive(Debug, Clone, Serialize)]
+pub struct CallerContext {
+    /// 调用入口类
+    pub entry: PipelineEntry,
+    /// 主会话 id（裁决审计关联用）
+    pub session_id: Option<String>,
+}
+
+/// 聚焦快照（本次允许面：def.tools ∩ 开关 ∩ surface 的已装配集合）
+///
+/// PR-2 主路径快照 = 装配期注册面（注册面==可见面，故过滤不产生新拒绝——
+/// 行为等价）；真正的收窄消费方是 PR-3（G13 并行实例）与 PR-8（delegate
+/// 子代理装配）。快照本身可序列化，随调用落账（聚焦范围=可审计对象）。
+#[derive(Debug, Clone, Serialize)]
+pub struct FocusSnapshot {
+    allowed: BTreeSet<String>,
+}
+
+impl FocusSnapshot {
+    /// 从允许工具名集合构建快照
+    pub fn from_names<I>(names: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        Self {
+            allowed: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// 工具是否在允许面内
+    pub fn allows(&self, tool_name: &str) -> bool {
+        self.allowed.contains(tool_name)
+    }
+
+    /// 允许面大小
+    pub fn len(&self) -> usize {
+        self.allowed.len()
+    }
+
+    /// 是否为空面
+    pub fn is_empty(&self) -> bool {
+        self.allowed.is_empty()
+    }
+}
+
+/// 管道执行请求（设计档 §3.2 PipelineRequest）
+pub struct PipelineRequest<'a> {
+    /// 工具名（LLM 面稳定标识）
+    pub tool_name: &'a str,
+    /// 工具参数（JSON）
+    pub args: &'a Value,
+    /// 调用方上下文
+    pub caller: CallerContext,
+    /// 本次允许面快照（装配期已过滤集合）
+    pub focus: &'a FocusSnapshot,
+}
+
+/// 阶段⑦执行器抽象（runner 注入 call_service 通路；测试注入桩。
+/// Sync 超界：PipelineDeps 需跨 await 持有（流式路径 Send 要求））
+pub trait PipelineExecutor: Sync {
+    /// 执行工具调用（step_timeout 语义由实现持有，管道不另设超时）
+    fn execute_tool(
+        &self,
+        tool_name: &str,
+        args: &Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, AgentError>> + Send + '_>>;
+}
+
+/// 阶段⑧账面写入口（journal 注入缝：§七.6「journal 写失败注入 → 显式报错」
+/// 验收测试经此替换失败桩；生产实现 = JournalWriter）
+pub trait PolicyJudgedSink {
+    /// 记录一次意图裁决输出（verdict = allowed/blocked）
+    fn policy_judged(&self, verdict: &str, evidence: &str) -> Result<u64, JournalError>;
+}
+
+impl PolicyJudgedSink for JournalWriter {
+    fn policy_judged(&self, verdict: &str, evidence: &str) -> Result<u64, JournalError> {
+        JournalWriter::policy_judged(self, verdict, evidence)
+    }
+}
+
+/// 管道逐调用依赖（runner 装配件借用注入——裁决通道/账面/指标均为 runner
+/// 持有的既有实例，管道自身无状态，避免装配环）
+pub struct PipelineDeps<'a> {
+    /// 阶段⑦执行器
+    pub executor: &'a dyn PipelineExecutor,
+    /// 阶段③④裁决通道（与 runner 同源；tokio Mutex 语义保持）
+    pub adjudicator: &'a tokio::sync::Mutex<AdjudicationChannel>,
+    /// 阶段①查表访问器（静态表 + handler 动态注册条目）
+    pub manifest_of: &'a (dyn Fn(&str) -> Option<ToolManifest> + Sync),
+    /// 阶段⑧账面（None = 不启用——CLI/子代理现状语义保持）
+    pub journal: Option<&'a (dyn PolicyJudgedSink + Sync)>,
+    /// 能力边界（意图快筛判据）
+    pub boundary: Option<&'a CapabilityBoundary>,
+    /// 工具轨迹采集器（P1 既有采集点，采集语义不变）
+    pub traces: Option<&'a std::sync::Mutex<ToolTraceCollector>>,
+    /// 指标桥（G17 既有观测点）
+    pub metrics: Option<&'a Metrics>,
+}
+
+// =============================================================================
+// 结局/账面（管道输出面）
+// =============================================================================
+
+/// 显式拒绝阶段（设计档 §3.2 Denial{stage, reason}）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenialStage {
+    /// ①查表失败：无 manifest
+    NoManifest,
+    /// ②聚焦过滤：不在允许面
+    OutOfFocus,
+    /// ③④治理拦截（规则层裁决不放行）
+    Governance,
+    /// ⑤分级审批拒绝（AlwaysDeny / 决策端拒绝）
+    ApprovalDenied,
+    /// ③④裁决通道故障（fail-closed 语义：通道错误显式上抛）
+    Channel,
+    /// ⑧账面写失败（fail-visible：账写不掉=错误显式化）
+    Ledger,
+}
+
+/// 显式拒绝（无静默路径：每条 Denial 带阶段与原因）
+#[derive(Debug, Clone, Serialize)]
+pub struct PipelineDenial {
+    /// 拒绝发生的管道阶段
+    pub stage: DenialStage,
+    /// 拒绝原因（显式文本，回喂/审计两用）
+    pub reason: String,
+    /// LLM 可见面负载（治理拦截=现状两态 blocked JSON，原样回喂；
+    /// 其余拒绝 None——由调用方决定错误形态）
+    pub llm_payload: Option<Value>,
+}
+
+impl PipelineDenial {
+    fn new(stage: DenialStage, reason: impl Into<String>) -> Self {
+        Self {
+            stage,
+            reason: reason.into(),
+            llm_payload: None,
+        }
+    }
+}
+
+/// 裁决事实（账面：意图信号+裁决结论同条记录）
+#[derive(Debug, Clone, Serialize)]
+pub struct AdjudicationFact {
+    /// 通道标识（target_scope_r1 = M5-c file 面；tool_intent_p2 = 治理级工具）
+    pub channel: &'static str,
+    /// 规则层裁决结论（true=放行）
+    pub allowed: bool,
+    /// 证据（scope / intent 序列化摘要）
+    pub evidence: String,
+}
+
+/// 执行事实（账面：真实结局）
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutionFact {
+    /// 执行是否成功（false = ⑦已发生的真实失败，区别于拒绝）
+    pub ok: bool,
+    /// 执行耗时（毫秒）
+    pub duration_ms: u64,
+}
+
+/// 全程账（设计档 §3.2 LedgerRecord：各阶段事实，§七.6 审计完整性断言的数据面——
+/// 意图信号/裁决结论/审批策略/执行结局四类事实俱在）
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerRecord {
+    /// 工具名
+    pub tool_name: String,
+    /// 调用方上下文（入口类 + 会话 id）
+    pub caller: CallerContext,
+    /// ①查表
+    pub manifest_found: bool,
+    /// ②聚焦
+    pub in_focus: bool,
+    /// ⑤审批策略（查表所得，含未触发场景——策略在场即可审计）
+    pub approval_policy: Option<ApprovalPolicy>,
+    /// ③④裁决事实（按提交顺序）
+    pub adjudication: Vec<AdjudicationFact>,
+    /// ⑦执行结局
+    pub execution: Option<ExecutionFact>,
+    /// 拒绝（无静默路径）
+    pub denial: Option<DenialStage>,
+}
+
+impl LedgerRecord {
+    fn new(tool_name: &str, caller: CallerContext) -> Self {
+        Self {
+            tool_name: tool_name.to_string(),
+            caller,
+            manifest_found: false,
+            in_focus: false,
+            approval_policy: None,
+            adjudication: Vec::new(),
+            execution: None,
+            denial: None,
+        }
+    }
+}
+
+/// 管道失败（执行失败 ≠ 拒绝：拒绝=⑦之前的显式不执行；执行失败=⑦已发生
+/// 的真实结局——账面 execution.ok=false 与失败原因并行在案）
+#[derive(Debug)]
+pub enum PipelineFailure {
+    /// 显式拒绝（各阶段 Denial）
+    Denial(PipelineDenial),
+    /// 阶段⑦执行错误（原样透传——错误显式回喂语义与原实现一致）
+    Execution(AgentError),
+}
+
+/// 管道结局（设计档 §3.2 PipelineOutcome）
+pub struct PipelineOutcome {
+    /// Ok = 放行并执行完毕；Err = 显式拒绝或执行错误（无静默路径）
+    pub result: Result<Value, PipelineFailure>,
+    /// 全程账
+    pub ledger: LedgerRecord,
+}
+
+// =============================================================================
+// 管道本体
+// =============================================================================
+
+/// 工具执行管道（无状态编排器；依赖经 [`PipelineDeps`] 逐调用注入）
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ToolExecutionPipeline;
+
+impl ToolExecutionPipeline {
+    /// 八阶段执行（PR-2 骨架：①②⑤⑦⑧显式实装，③④复用既有裁决通道，⑥占位）
+    pub async fn execute(
+        &self,
+        req: PipelineRequest<'_>,
+        deps: PipelineDeps<'_>,
+    ) -> PipelineOutcome {
+        let mut ledger = LedgerRecord::new(req.tool_name, req.caller.clone());
+
+        // ── ① 查表：manifest 必须存在（无 manifest 拒绝注册的镜像面：
+        // 无 manifest 的调用同样拒绝——显式拒绝回喂，不静默降级） ──
+        let Some(manifest) = (deps.manifest_of)(req.tool_name) else {
+            ledger.denial = Some(DenialStage::NoManifest);
+            return PipelineOutcome {
+                result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                    DenialStage::NoManifest,
+                    format!("tool not found: {}", req.tool_name),
+                ))),
+                ledger,
+            };
+        };
+        ledger.manifest_found = true;
+        ledger.approval_policy = Some(manifest.approval_policy);
+
+        // ── ② 聚焦过滤：tool_name ∈ focus_snapshot（装配期允许面） ──
+        if !req.focus.allows(req.tool_name) {
+            ledger.denial = Some(DenialStage::OutOfFocus);
+            return PipelineOutcome {
+                result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                    DenialStage::OutOfFocus,
+                    format!(
+                        "tool '{}' is not in the allowed focus set ({} tools)",
+                        req.tool_name,
+                        req.focus.len()
+                    ),
+                ))),
+                ledger,
+            };
+        }
+        ledger.in_focus = true;
+
+        // ── ③ 意图信号 + ④ 规则裁决 ──
+        // R1 通道（M5-c）：file_read/file_write 的 target_scope 随意图指令进链，
+        // 由协作验收规则 enforce 裁决。原 execute_tool_call 内联逻辑逐字迁入。
+        if let Some(scope) = resolve_target_scope(req.tool_name, req.args, deps.boundary) {
+            let allowed = match deps
+                .adjudicator
+                .lock()
+                .await
+                .await_verdict(&intent_signal(scope), req.caller.session_id.as_deref())
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // fail-closed 语义保持：通道故障显式上抛（原 map_err(AgentError::Internal)?）
+                    ledger.denial = Some(DenialStage::Channel);
+                    return PipelineOutcome {
+                        result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                            DenialStage::Channel,
+                            format!("adjudication channel error: {e}"),
+                        ))),
+                        ledger,
+                    };
+                }
+            };
+            ledger.adjudication.push(AdjudicationFact {
+                channel: "target_scope_r1",
+                allowed,
+                evidence: format!("{tool} target_scope={scope}", tool = req.tool_name),
+            });
+            // B21:policy_judged（fail-visible——§七.6 账写不掉=错误显式化；
+            // 原 `let _ =` fail-soft 消灭）
+            if let Some(j) = deps.journal {
+                if let Err(e) = j.policy_judged(
+                    if allowed { "allowed" } else { "blocked" },
+                    &format!("{} target_scope={}", req.tool_name, scope),
+                ) {
+                    ledger.denial = Some(DenialStage::Ledger);
+                    return PipelineOutcome {
+                        result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                            DenialStage::Ledger,
+                            format!("journal policy_judged write failed: {e}"),
+                        ))),
+                        ledger,
+                    };
+                }
+            }
+            if !allowed {
+                tracing::warn!(
+                    main_session = ?req.caller.session_id, tool = %req.tool_name, scope = %scope,
+                    "tool intent blocked by governance rule (collab acceptance, adjudication channel)"
+                );
+                // 被治理拦截的调用也是真实执行史——进轨迹(status=blocked)
+                if let Some(tt) = deps.traces {
+                    if let Ok(mut tt) = tt.lock() {
+                        tt.record(req.tool_name, req.args, "blocked_by_governance", 0);
+                    }
+                }
+                ledger.denial = Some(DenialStage::Governance);
+                return PipelineOutcome {
+                    result: Err(PipelineFailure::Denial(PipelineDenial {
+                        stage: DenialStage::Governance,
+                        reason: "governance rule rejected target scope".to_string(),
+                        llm_payload: Some(r1_blocked_payload(
+                            req.tool_name,
+                            scope,
+                            req.args,
+                            deps.boundary,
+                        )),
+                    })),
+                    ledger,
+                };
+            }
+        }
+        // P2 通道：治理级工具事前意图裁决（分级=manifest 派生）。与 R1 通道
+        // 并存互不干扰；裁决会话轮内复用。原内联逻辑逐字迁入。
+        if let Some(intent) = resolve_tool_intent(req.tool_name, req.args, deps.boundary) {
+            let allowed = match deps
+                .adjudicator
+                .lock()
+                .await
+                .await_verdict(
+                    &tool_intent_signal(&intent),
+                    req.caller.session_id.as_deref(),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    ledger.denial = Some(DenialStage::Channel);
+                    return PipelineOutcome {
+                        result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                            DenialStage::Channel,
+                            format!("adjudication channel error: {e}"),
+                        ))),
+                        ledger,
+                    };
+                }
+            };
+            ledger.adjudication.push(AdjudicationFact {
+                channel: "tool_intent_p2",
+                allowed,
+                evidence: serde_json::to_string(&intent).unwrap_or_default(),
+            });
+            if let Some(j) = deps.journal {
+                if let Err(e) = j.policy_judged(
+                    if allowed { "allowed" } else { "blocked" },
+                    &format!(
+                        "{} intent={}",
+                        req.tool_name,
+                        serde_json::to_string(&intent).unwrap_or_default()
+                    ),
+                ) {
+                    ledger.denial = Some(DenialStage::Ledger);
+                    return PipelineOutcome {
+                        result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                            DenialStage::Ledger,
+                            format!("journal policy_judged write failed: {e}"),
+                        ))),
+                        ledger,
+                    };
+                }
+            }
+            if !allowed {
+                tracing::warn!(
+                    main_session = ?req.caller.session_id, tool = %req.tool_name,
+                    "tool intent blocked by governance rule (tool intent adjudication, adjudication channel)"
+                );
+                if let Some(tt) = deps.traces {
+                    if let Ok(mut tt) = tt.lock() {
+                        tt.record(req.tool_name, req.args, "blocked_by_governance", 0);
+                    }
+                }
+                ledger.denial = Some(DenialStage::Governance);
+                return PipelineOutcome {
+                    result: Err(PipelineFailure::Denial(PipelineDenial {
+                        stage: DenialStage::Governance,
+                        reason: "governance rule rejected tool intent".to_string(),
+                        llm_payload: Some(serde_json::json!({
+                            "status": "blocked_by_governance_rule",
+                            "tool": req.tool_name,
+                            "intent": intent,
+                            "reason": "tool intent rejected by governance rule \
+                                       (tool intent adjudication; see adjudication session \
+                                       audit Violation for rule attribution)",
+                        })),
+                    })),
+                    ledger,
+                };
+            }
+        }
+
+        // ── ⑤ 分级审批（approval_policy 派发）──
+        // AlwaysDeny：执行前拒绝（逃逸出口/不可逆破坏类预留；现状静态表无
+        // AlwaysDeny 工具，此臂为策略完备性在案）。ManualDefault/AutoPolicy/
+        // HumanOnly：PR-2 保持既有工具侧 proposal 两调协议（工具返回
+        // needs_approval → runner 决策端处置），决策端统一收编在 PR-4。
+        if manifest.approval_policy == ApprovalPolicy::AlwaysDeny {
+            ledger.denial = Some(DenialStage::ApprovalDenied);
+            return PipelineOutcome {
+                result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                    DenialStage::ApprovalDenied,
+                    format!(
+                        "tool '{}' is configured AlwaysDeny (irreversible/escape-class)",
+                        req.tool_name
+                    ),
+                ))),
+                ledger,
+            };
+        }
+
+        // ── ⑥ 机制沙箱（占位）──
+        // fs_safety 路径围栏/net_guard 仍在工具实现内联执行（双层分工：
+        // 意图快筛供规则层裁决，handler 精判为最终防线）；管道侧阶段位在案，
+        // PR-6 执行契约批次再评估守卫上提。
+
+        // ── ⑦ 执行（真实结局采集：metrics + 轨迹，G17 同点同规格）──
+        let tool_start = Instant::now();
+        let raw = deps.executor.execute_tool(req.tool_name, req.args).await;
+        let tool_duration = tool_start.elapsed();
+        let tool_ok = raw.is_ok();
+        ledger.execution = Some(ExecutionFact {
+            ok: tool_ok,
+            duration_ms: tool_duration.as_millis() as u64,
+        });
+        if let Some(m) = deps.metrics {
+            m.observe_tool_call(req.tool_name, tool_duration, tool_ok);
+        }
+        // 轨迹采集（脱敏+截断在 collector 内;std Mutex 临界区无 await,
+        // G13 并发下 poison 按 fail-soft 跳过——原语义保持）
+        if let Some(tt) = deps.traces {
+            if let Ok(mut tt) = tt.lock() {
+                tt.record(
+                    req.tool_name,
+                    req.args,
+                    if tool_ok { "ok" } else { "error" },
+                    tool_duration.as_millis() as u64,
+                );
+            }
+        }
+
+        // ── ⑧ 结局落账 ──
+        // LedgerRecord 已含执行结局（管道内事实层账面）；链侧 tool_trace
+        // 指令统一接线（工具名/结局/时长/摘要）随信号契约批次落地。
+        // 执行错误≠拒绝（语义分离见 PipelineFailure）：原样透传回喂。
+        PipelineOutcome {
+            result: raw.map_err(PipelineFailure::Execution),
+            ledger,
+        }
+    }
+}
+
+/// R1 通道治理拦截负载（原 execute_tool_call 内联文案逐字保留——行为等价）
+///
+/// 拒绝文案两态：绝对路径在快筛一律按形态判 out（判据与 handler 权威沙箱
+/// 检查同源），但目标实际落在边界内时（join 后 starts_with 成立）"越界"
+/// 语义不成立——改用形态判定文案（相对路径口径），避免审计链出现
+/// "target 在 boundary 前缀内却被称 outside"的自相矛盾留痕；真·越界
+/// （join 逃逸/`..` 穿越）维持 containment 文案。
+fn r1_blocked_payload(
+    tool_name: &str,
+    scope: &str,
+    args: &Value,
+    boundary: Option<&CapabilityBoundary>,
+) -> Value {
+    let raw_path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let boundary_root = boundary
+        .map(|b| b.sandbox_root.display().to_string())
+        .unwrap_or_default();
+    let inside_boundary = boundary.is_some_and(|b| {
+        let p = std::path::Path::new(raw_path);
+        p.is_absolute() && b.sandbox_root.join(p).starts_with(&b.sandbox_root)
+    });
+    let reason = if inside_boundary {
+        format!(
+            "absolute path form not allowed: '{raw_path}' (paths are relative \
+             to the sandbox root '{boundary_root}'; the target resolves inside the \
+             boundary); the collaboration acceptance rule rejected this \
+             tool intent (see session audit Violation for rule attribution)"
+        )
+    } else {
+        format!(
+            "target '{raw_path}' is outside the sandbox boundary '{boundary_root}'; \
+             the collaboration acceptance rule rejected this tool intent \
+             (see session audit Violation for rule attribution)"
+        )
+    };
+    serde_json::json!({
+        "status": "blocked_by_governance_rule",
+        "tool": tool_name,
+        "target_scope": scope,
+        "reason": reason,
+    })
+}
+
+// =============================================================================
+// 测试（管道单元面；runner 端到端行为等价由 runner_tests 既有基线锁守）
+// ==============================================================================
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::agent::tool_manifest::lookup_static;
+
+    /// 正常执行桩（到达⑦即返回固定值；未到达则 panic 暴露阶段跳转错误）
+    struct OkExecutor;
+    impl PipelineExecutor for OkExecutor {
+        fn execute_tool(
+            &self,
+            tool_name: &str,
+            _args: &Value,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, AgentError>> + Send + '_>> {
+            assert_ne!(tool_name, "", "executor must receive a tool name");
+            Box::pin(async { Ok(Value::from("executed")) })
+        }
+    }
+
+    /// 不应到达⑦的执行器（到达即 panic）
+    struct UnreachableExecutor;
+    impl PipelineExecutor for UnreachableExecutor {
+        fn execute_tool(
+            &self,
+            tool_name: &str,
+            _args: &Value,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, AgentError>> + Send + '_>> {
+            panic!("stage ⑦ must not be reached, but executed tool: {tool_name}")
+        }
+    }
+
+    /// 恒失败账面（§七.6 写失败注入桩）
+    struct FailingJournal;
+    impl PolicyJudgedSink for FailingJournal {
+        fn policy_judged(&self, _verdict: &str, _evidence: &str) -> Result<u64, JournalError> {
+            Err(JournalError::Corrupt("injected write failure".to_string()))
+        }
+    }
+
+    fn dummy_adjudicator() -> tokio::sync::Mutex<AdjudicationChannel> {
+        // 测试桩：仅测①②⑤⑧路径时不触网；触③④的场景由 runner_tests
+        // mockito 基线覆盖（见模块文档）。
+        tokio::sync::Mutex::new(AdjudicationChannel::new(
+            crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:1"),
+            "default",
+        ))
+    }
+
+    /// 断言结局为 Denial 并取出（执行失败与拒绝语义分离）
+    fn denial_of(outcome: &PipelineOutcome) -> PipelineDenial {
+        match &outcome.result {
+            Err(PipelineFailure::Denial(d)) => d.clone(),
+            other => panic!("expected denial, got: {other:?}"),
+        }
+    }
+
+    fn deps_for<'a>(
+        executor: &'a dyn PipelineExecutor,
+        adj: &'a tokio::sync::Mutex<AdjudicationChannel>,
+        manifest_of: &'a (dyn Fn(&str) -> Option<ToolManifest> + Sync),
+    ) -> PipelineDeps<'a> {
+        PipelineDeps {
+            executor,
+            adjudicator: adj,
+            manifest_of,
+            journal: None,
+            boundary: None,
+            traces: None,
+            metrics: None,
+        }
+    }
+
+    fn req_for<'a>(
+        tool_name: &'a str,
+        args: &'a Value,
+        focus: &'a FocusSnapshot,
+    ) -> PipelineRequest<'a> {
+        PipelineRequest {
+            tool_name,
+            args,
+            caller: CallerContext {
+                entry: PipelineEntry::React,
+                session_id: Some("s-test".to_string()),
+            },
+            focus,
+        }
+    }
+
+    #[tokio::test]
+    async fn stage1_unknown_tool_is_no_manifest_denial() {
+        // ①查表：无 manifest = 显式拒绝，原因文本与 ToolHandler not-found 等价
+        let adj = dummy_adjudicator();
+        let manifests = |_n: &str| None;
+        let focus = FocusSnapshot::from_names(Vec::<String>::new());
+        let args = Value::Null;
+        let deps = deps_for(&UnreachableExecutor, &adj, &manifests);
+        let out = ToolExecutionPipeline
+            .execute(req_for("no_such_tool", &args, &focus), deps)
+            .await;
+        let denial = denial_of(&out);
+        assert_eq!(denial.stage, DenialStage::NoManifest);
+        assert_eq!(denial.reason, "tool not found: no_such_tool");
+        assert!(denial.llm_payload.is_none());
+        assert!(!out.ledger.manifest_found);
+        assert_eq!(out.ledger.denial, Some(DenialStage::NoManifest));
+    }
+
+    #[tokio::test]
+    async fn stage2_out_of_focus_denied_before_execution() {
+        // ②聚焦：查表通过但不在允许面 = OutOfFocus，且不触达⑦
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(Vec::<String>::new()); // 空允许面
+        let args = Value::Null;
+        let deps = deps_for(&UnreachableExecutor, &adj, &manifests);
+        let out = ToolExecutionPipeline
+            .execute(req_for("grep_files", &args, &focus), deps)
+            .await;
+        let denial = denial_of(&out);
+        assert_eq!(denial.stage, DenialStage::OutOfFocus);
+        assert!(out.ledger.manifest_found);
+        assert!(!out.ledger.in_focus);
+        assert_eq!(out.ledger.denial, Some(DenialStage::OutOfFocus));
+    }
+
+    #[tokio::test]
+    async fn stage5_always_deny_denied_without_execution() {
+        // ⑤分级审批：AlwaysDeny = 执行前拒绝（不经③④——无 scope/无 intent）
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| {
+            lookup_static(n).map(|mut m| {
+                m.approval_policy = ApprovalPolicy::AlwaysDeny;
+                m
+            })
+        };
+        let focus = FocusSnapshot::from_names(["grep_files"]);
+        let args = Value::Null;
+        let deps = deps_for(&UnreachableExecutor, &adj, &manifests);
+        let out = ToolExecutionPipeline
+            .execute(req_for("grep_files", &args, &focus), deps)
+            .await;
+        let denial = denial_of(&out);
+        assert_eq!(denial.stage, DenialStage::ApprovalDenied);
+        assert_eq!(out.ledger.approval_policy, Some(ApprovalPolicy::AlwaysDeny));
+        assert!(out.ledger.execution.is_none());
+    }
+
+    #[tokio::test]
+    async fn happy_path_records_full_ledger() {
+        // 放行直通：①②⑤通过（无③④触发工具）→⑦执行→⑧账面四类事实俱在
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["grep_files"]);
+        let args = Value::Null;
+        let deps = deps_for(&OkExecutor, &adj, &manifests);
+        let out = ToolExecutionPipeline
+            .execute(req_for("grep_files", &args, &focus), deps)
+            .await;
+        assert!(out.result.is_ok(), "allowed tool must execute");
+        let ledger = &out.ledger;
+        assert!(ledger.manifest_found);
+        assert!(ledger.in_focus);
+        assert_eq!(ledger.approval_policy, Some(ApprovalPolicy::AutoPolicy));
+        assert!(ledger.adjudication.is_empty(), "非治理工具不应有裁决事实");
+        let execution = ledger.execution.as_ref().expect("执行结局必须落账");
+        assert!(execution.ok);
+        assert_eq!(out.result.unwrap(), Value::from("executed"));
+        // 账面可序列化（§七.6 审计完整性断言的数据面契约）
+        serde_json::to_string(ledger).expect("ledger must serialize");
+    }
+
+    #[tokio::test]
+    async fn channel_failure_is_fail_closed() {
+        // ③④裁决通道故障 = 显式上抛（fail-closed 镜像；原 map_err(Internal) 语义）
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_create"]);
+        let args = serde_json::json!({"path": "rel.txt"});
+        let deps = deps_for(&UnreachableExecutor, &adj, &manifests);
+        let out = ToolExecutionPipeline
+            .execute(req_for("file_create", &args, &focus), deps)
+            .await;
+        let denial = denial_of(&out);
+        assert_eq!(denial.stage, DenialStage::Channel);
+        assert!(denial.reason.contains("adjudication channel error"));
+    }
+
+    #[tokio::test]
+    async fn journal_write_failure_is_visible() {
+        // §七.6：journal 写失败注入 → 显式报错非静默。
+        // mockito 放行判据（before=0 + poll=1，同 adjudicator.rs 形态）——
+        // P2 通道裁决放行后 policy_judged 写失败 → Ledger 拒绝（fail-visible），
+        // ⑦不触达。
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_body(r#"{"session_id": 90}"#)
+            .create_async()
+            .await;
+        // before 首查命中 version 0，轮询命中 version 1 = 放行（同
+        // adjudicator.rs 测试形态；单 mock 恒 1 会令 before=1 恒拦截）
+        server
+            .mock("GET", "/api/sessions/90/state")
+            .with_status(200)
+            .with_body(r#"{"version": 0}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/sessions/90/state")
+            .with_status(200)
+            .with_body(r#"{"version": 1}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/sessions/90/command")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let adj = tokio::sync::Mutex::new(AdjudicationChannel::new(
+            crate::api::evorule_client::EvoruleApiClient::new(&server.url()),
+            "default",
+        ));
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_create"]);
+        let args = serde_json::json!({"path": "rel.txt"});
+        let mut deps = deps_for(&UnreachableExecutor, &adj, &manifests);
+        deps.journal = Some(&FailingJournal);
+        let out = ToolExecutionPipeline
+            .execute(req_for("file_create", &args, &focus), deps)
+            .await;
+        let denial = denial_of(&out);
+        assert_eq!(denial.stage, DenialStage::Ledger);
+        assert!(denial.reason.contains("journal policy_judged write failed"));
+        // 裁决已发生且放行——账面应记裁决事实后死于账面写
+        assert_eq!(out.ledger.adjudication.len(), 1);
+        assert!(out.ledger.adjudication[0].allowed);
+    }
+}
