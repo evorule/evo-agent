@@ -27,6 +27,7 @@
 pub mod agent;
 pub mod api;
 #[doc(hidden)]
+pub mod budget_report;
 pub mod builtin_tools;
 pub mod config;
 pub mod dotenv;
