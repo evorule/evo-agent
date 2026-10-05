@@ -351,8 +351,12 @@ fn terminate_family_by_pid(pid: u32) {
     }
     #[cfg(unix)]
     {
+        // `--` 防歧义:负 pid 组目标必须落在操作数位——部分 kill 实现
+        // (procps 家族)将首个负数字参解析为信号号/选项,致信号未投递且
+        // 退出码混乱;`--` 后目标必按 pid 操作数处理。
         let _ = Command::new("kill")
             .arg("-9")
+            .arg("--")
             .arg(format!("-{pid}"))
             .stdin(std::process::Stdio::null())
             .output();
@@ -479,6 +483,7 @@ fn unix_group_empty(pgid: u32) -> Option<bool> {
     }
     match Command::new("kill")
         .arg("-0")
+        .arg("--")
         .arg(format!("-{pgid}"))
         .stdin(std::process::Stdio::null())
         .status()
@@ -1682,9 +1687,59 @@ mod tests {
         let tool = ShellExecTool::new().with_timeout(1);
         let result = tool.execute(&parts, cmd_str);
         let err = result.expect_err("hanging command tree must time out");
+        // 诊断仪器(unix):断言失败时附甄别函数现值+组内成员快照+kill 身份,
+        // 使 CI 失败日志可独立定案(击杀后时序敏感,事后无法复取)
+        #[cfg(unix)]
+        let diag = {
+            let pid: Option<u32> = err
+                .split("pid=")
+                .nth(1)
+                .and_then(|s| s.split(',').next())
+                .and_then(|s| s.trim().parse().ok());
+            let mut d = String::new();
+            if let Some(pid) = pid {
+                d.push_str(&format!(
+                    "; diag: now unix_group_empty={:?} has_live_member={:?} members=[",
+                    unix_group_empty(pid),
+                    linux_group_has_live_member(pid)
+                ));
+                if let Ok(entries) = std::fs::read_dir("/proc") {
+                    for e in entries.flatten() {
+                        let Ok(p) = e.file_name().to_str().unwrap_or("").parse::<u32>() else {
+                            continue;
+                        };
+                        let Ok(stat) = std::fs::read_to_string(format!("/proc/{p}/stat")) else {
+                            continue;
+                        };
+                        let Some(c) = stat.rfind(')') else { continue };
+                        let mut f = stat[c + 1..].split_ascii_whitespace();
+                        let Some(state) = f.next() else { continue };
+                        let Some(_ppid) = f.next() else { continue };
+                        let Some(Ok(pgrp)) = f.next().map(|s| s.parse::<u32>()) else {
+                            continue;
+                        };
+                        if pgrp == pid {
+                            let comm = stat[..c]
+                                .rsplit_once('(')
+                                .map(|(_, s)| s.to_string())
+                                .unwrap_or_default();
+                            d.push_str(&format!(" (pid={p} state={state} comm={comm})"));
+                        }
+                    }
+                }
+                d.push(']');
+            }
+            if let Ok(out) = Command::new("kill").arg("--version").output() {
+                let v = String::from_utf8_lossy(&out.stdout);
+                d.push_str(&format!("; kill={}", v.lines().next().unwrap_or("").trim()));
+            }
+            d
+        };
+        #[cfg(windows)]
+        let diag = "";
         assert!(
             err.contains("survivors_verified=true"),
-            "survivor verification must be explicit in the outcome: {err}"
+            "survivor verification must be explicit in the outcome: {err}{diag}"
         );
 
         // 轨迹面核验结论同步入账
