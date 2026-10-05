@@ -873,9 +873,14 @@ mod tests {
             serde_json::json!({"key": "x", "value": "正文节内容", "timestamp": 1, "mem_type": "procedural"}),
         )];
         store.replace_partition("local.skills.", &rows).unwrap();
-        assert_eq!(store.cached_facts("local.skills.", 60).unwrap()[0].fact_id, fid);
+        assert_eq!(
+            store.cached_facts("local.skills.", 60).unwrap()[0].fact_id,
+            fid
+        );
         assert_eq!(store.local_facts("local.skills.").unwrap()[0].fact_id, fid);
-        let hits = store.lookup_candidates("local.skills.", "正文", 10).unwrap();
+        let hits = store
+            .lookup_candidates("local.skills.", "正文", 10)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, fid);
         let typed = store
@@ -888,7 +893,10 @@ mod tests {
             .unwrap();
         assert_eq!(typed.len(), 1);
         assert_eq!(
-            store.paths_by_fact_ids(&[fid]).get(&fid).map(|s| s.as_str()),
+            store
+                .paths_by_fact_ids(&[fid])
+                .get(&fid)
+                .map(|s| s.as_str()),
             Some("local.skills.x#1")
         );
         assert_eq!(store.fact_class(fid).unwrap().1, "procedural");
