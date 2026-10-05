@@ -2239,13 +2239,32 @@ impl MemoryManager {
         recipe: &crate::agent::recipe::MemoryRecipe,
     ) {
         let lc = &recipe.lifecycle;
+        let gate_dataset = recipe
+            .promote_gate
+            .dataset_id
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .map(String::from);
+        let gate_enabled = recipe.promote_gate.enabled && gate_dataset.is_some();
+        if recipe.promote_gate.enabled && !gate_enabled {
+            tracing::warn!(
+                "promote_gate enabled but dataset_id missing; falling back to mechanical promotion"
+            );
+        }
         let now = now_secs();
         let mut to_promote: Vec<(String, String, MemoryRecord)> = Vec::new();
+        let mut gated: Vec<(String, MemoryRecord)> = Vec::new();
         for rec in self.cache.values_mut() {
             if rec.lifecycle_state.as_deref() == Some("Captured") && rec.key.starts_with("events.")
             {
                 let conf = rec.confidence.unwrap_or(0.5);
                 if conf >= lc.promote_min_confidence && rec.usage_count >= lc.promote_min_uses {
+                    if gate_enabled {
+                        // 治理门开:候选暂不标 Promoted,先经治理写通路提议入账
+                        // (回执=资格凭据);失败保持 Captured 留待下次批
+                        gated.push((rec.key.clone(), rec.clone()));
+                        continue;
+                    }
                     rec.lifecycle_state = Some("Promoted".to_string());
                     let stable_key =
                         format!("stable.llm.promoted.{}", rec.key.replace(".events.", "."));
@@ -2265,6 +2284,70 @@ impl MemoryManager {
                 let idle_days = (now.saturating_sub(rec.timestamp)) as f64 / 86400.0;
                 if idle_days > lc.archive_after_idle_days as f64 {
                     rec.lifecycle_state = Some("Archived".to_string());
+                }
+            }
+        }
+        // 治理门路径:提议入账(资格凭据)成功才晋升+稳定副本;失败保持 Captured
+        for (key, candidate) in &gated {
+            let dataset = gate_dataset.as_deref().unwrap_or_default();
+            let entry = serde_json::json!({
+                "title": candidate.key.clone(),
+                "body": candidate.value.clone(),
+                "confidence": candidate.confidence,
+                "tags": ["memory-promote"],
+            });
+            let cause = format!(
+                "memory lifecycle promotion: captured fact met promote thresholds; source key {}",
+                candidate.key
+            );
+            match self
+                .evorule_client
+                .propose_knowledge_entry(dataset, &entry, &cause, Some(session_id))
+                .await
+            {
+                Ok(receipt) => {
+                    let lifecycle = receipt
+                        .get("lifecycle")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Draft");
+                    tracing::info!(
+                        session_id = %session_id,
+                        key = %key,
+                        lifecycle = %lifecycle,
+                        "promote gate: candidate proposed into governance (Draft receipt = qualification evidence)"
+                    );
+                    let cache_key = format!("shared::{key}");
+                    if let Some(rec) = self.cache.get_mut(&cache_key) {
+                        rec.lifecycle_state = Some("Promoted".to_string());
+                        let receipt_id = receipt
+                            .get("entry_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("receipt-ok");
+                        rec.tags.push(format!("governance:{receipt_id}"));
+                    }
+                    let stable_key =
+                        format!("stable.llm.promoted.{}", key.replace(".events.", "."));
+                    let mut p = MemoryRecord::new(&stable_key, &candidate.value, now_secs());
+                    p.confidence = candidate.confidence;
+                    p.usage_count = candidate.usage_count;
+                    p.source = candidate.source.clone();
+                    p.lifecycle_state = Some("Settled".to_string());
+                    let _ = self
+                        .set_scoped_with_source(
+                            MemoryScope::Shared,
+                            &stable_key,
+                            &p.value,
+                            "system:promote-gated",
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        key = %key,
+                        error = %e,
+                        "promote gate: proposal failed; candidate stays Captured for next batch (fail-visible)"
+                    );
                 }
             }
         }
@@ -4562,6 +4645,104 @@ mod tests {
             recall2.events.is_empty(),
             "events should be cleared when budget exhausted"
         );
+    }
+
+    #[tokio::test]
+    async fn test_promote_gate_disabled_is_mechanical() {
+        // 门控关(缺省)=机械复制既有行为:合格 Captured 直接 Promoted
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        recipe.lifecycle.promote_min_confidence = 0.5;
+        recipe.lifecycle.promote_min_uses = 1;
+        mgr.set_recipe(recipe);
+        let mut rec = MemoryRecord::new("events.e1", "合格候选", now_secs() - 3600);
+        rec.lifecycle_state = Some("Captured".to_string());
+        rec.confidence = Some(0.8);
+        rec.usage_count = 3;
+        mgr.cache.insert("shared::events.e1".to_string(), rec);
+        mgr.set_session_id("s1");
+        let recipe_snapshot = mgr.recipe.clone().unwrap_or_default();
+        mgr.apply_lifecycle_transitions("s1", &recipe_snapshot).await;
+        let after = mgr.cache.get("shared::events.e1").unwrap();
+        assert_eq!(after.lifecycle_state.as_deref(), Some("Promoted"));
+    }
+
+    #[tokio::test]
+    async fn test_promote_gate_enabled_unreachable_stays_captured() {
+        // 门控开+账本不可达 → 提议失败,候选保持 Captured(留待下次批);
+        // 稳定副本不写(无凭据不晋升)
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        recipe.lifecycle.promote_min_confidence = 0.5;
+        recipe.lifecycle.promote_min_uses = 1;
+        recipe.promote_gate.enabled = true;
+        recipe.promote_gate.dataset_id = Some("ds-gate".to_string());
+        mgr.set_recipe(recipe);
+        let mut rec = MemoryRecord::new("events.e2", "门控候选", now_secs() - 3600);
+        rec.lifecycle_state = Some("Captured".to_string());
+        rec.confidence = Some(0.8);
+        rec.usage_count = 3;
+        mgr.cache.insert("shared::events.e2".to_string(), rec);
+        mgr.set_session_id("s1");
+        let recipe_snapshot = mgr.recipe.clone().unwrap_or_default();
+        mgr.apply_lifecycle_transitions("s1", &recipe_snapshot).await;
+        let after = mgr.cache.get("shared::events.e2").unwrap();
+        assert_eq!(
+            after.lifecycle_state.as_deref(),
+            Some("Captured"),
+            "提议失败保持 Captured(fail-visible 留待下次批)"
+        );
+        assert!(
+            !mgr.cache.contains_key("shared::stable.llm.promoted.e2"),
+            "无凭据不写稳定副本"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_promote_gate_success_marks_promoted_with_receipt() {
+        // 门控开+提议回执成功 → Promoted+治理凭据 tag+稳定副本
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/services/knowledge-propose/invoke")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"status":"proposed","entry_id":"k-9","version":1,"lifecycle":"Draft"}"#,
+            )
+            .create_async()
+            .await;
+        let mut mgr = MemoryManager::new(
+            "ns",
+            crate::api::evorule_client::EvoruleApiClient::new(&server.url()),
+        );
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        recipe.lifecycle.promote_min_confidence = 0.5;
+        recipe.lifecycle.promote_min_uses = 1;
+        recipe.promote_gate.enabled = true;
+        recipe.promote_gate.dataset_id = Some("ds-gate".to_string());
+        mgr.set_recipe(recipe);
+        let mut rec = MemoryRecord::new("events.e3", "门控成功候选", now_secs() - 3600);
+        rec.lifecycle_state = Some("Captured".to_string());
+        rec.confidence = Some(0.8);
+        rec.usage_count = 3;
+        mgr.cache.insert("shared::events.e3".to_string(), rec);
+        mgr.set_session_id("s1");
+        let recipe_snapshot = mgr.recipe.clone().unwrap_or_default();
+        mgr.apply_lifecycle_transitions("s1", &recipe_snapshot).await;
+        let after = mgr.cache.get("shared::events.e3").unwrap();
+        assert_eq!(after.lifecycle_state.as_deref(), Some("Promoted"));
+        assert!(
+            after.tags.iter().any(|t| t.starts_with("governance:k-9")),
+            "治理凭据 tag(入账回执 entry_id)"
+        );
+        // 稳定副本来源=治理门通道
+        // (键形态=key.replace(".events.",".") 既有语义;无前导点时保留 events 段)
+        let stable = mgr
+            .cache
+            .get("shared::stable.llm.promoted.events.e3")
+            .unwrap();
+        assert_eq!(stable.source.as_deref(), Some("system:promote-gated"));
+        mock.assert_async().await;
     }
 
     #[tokio::test]
