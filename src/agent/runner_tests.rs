@@ -1639,7 +1639,13 @@ async fn delegate_path_union_escalation_denied_at_focus_stage() {
         .with_assembly_scope_focus()
         .with_delegate_pipeline_entry();
     let err = runner
-        .execute_tool_call("grep_files", &serde_json::json!({}), None)
+        .execute_tool_call_gated(
+            "test-session",
+            "grep_files",
+            &serde_json::json!({}),
+            None,
+            None,
+        )
         .await
         .expect_err("unregistered tool must be denied at focus stage");
     match err {
