@@ -2731,7 +2731,8 @@ impl AgentRunner {
             .await?;
 
         // G13:并行预执行工具(max_parallel_tools > 1 且有多个 tool_calls 时)
-        // 结果存入 parallel_tool_cache,后续 call_service IoRequest 命中缓存秒回
+        // 预执行=管道并行实例(PR-3):产物=已过闸结果,存入 parallel_tool_cache,
+        // 后续 call_service 命中走缓存收口路径(①-⑤⑧照常仅⑦免重执行)
         // candidate 工具(返回 proposal)不缓存,留给 call_service 走审批
         if self.config.max_parallel_tools > 1 {
             if let Some(tcs) = &effective_tool_calls {
@@ -2798,11 +2799,16 @@ impl AgentRunner {
         // G13:检查并行缓存(如果 call_external 已并行执行过此 active 工具,直接返回缓存结果,跳过重复执行 + 审批)
         // candidate 工具(proposal)不会被缓存,所以缓存命中的一定是 active 工具,无需审批
         // 审批留痕:仅本轮发生过审批时为 Some(内嵌进 io_response.result)
+        // PR-3 缓存收口:命中值=预执行管道实例的已过闸产物——命中调用仍走
+        // 完整管道(①-⑤⑧照常,仅⑦免重执行),意图/裁决/账面逐调用在场。
         let (tool_result, approval_record) = if let Some(cached) =
             self.check_parallel_cache(tool_name, &args)
         {
-            info!(%session_id, tool = %tool_name, "G13: call_service cache hit, skipping re-execution");
-            (cached, None)
+            info!(%session_id, tool = %tool_name, "G13: call_service cache hit, serving gated result (gates re-run, execution memoized)");
+            let result = self
+                .execute_tool_call_gated(tool_name, &args, None, Some(cached))
+                .await?;
+            (result, None)
         } else {
             // 缓存未命中:走正常的 execute_tool_call + 审批流程
             // 第一次调用(不带 approved flag):LLM 自带的 approved 旗标
@@ -2871,30 +2877,76 @@ impl AgentRunner {
         args: &Value,
         journal: Option<&crate::agent::journal::JournalWriter>,
     ) -> Result<Value, AgentError> {
-        // 一管道（工具面统一架构 §3.2）：本函数收口为管道的薄翻译层——
-        // 八阶段（①查表②聚焦③意图④裁决⑤审批⑥沙箱位⑦执行⑧落账）由
-        // ToolExecutionPipeline 执行；治理拦截两态 JSON 文案/裁决 fail-closed
-        // 语义/轨迹与指标采集点经管道逐字保留（行为等价，runner_tests 基线
-        // 不改一行即验收）。PR-2 主路径快照=装配期注册面（注册面==可见面，
-        // ②不产生新拒绝）；G13 并行入口与 file_api 读面的收口在 PR-3。
-        // 查表合并视图（一表两源）：运行时注册条目优先（可覆盖静态同名），
-        // 未注册回落静态表——裸 runner/CLI 直构造场景 handler 为空但工具名
-        // 有效（静态表内），原实现直达裁决不查 handler，①查表必须同样放行
-        // 才是行为等价（runner_tests 裸 runner 基线不改一行即验收）。
-        let manifest_of = |name: &str| {
-            self.tool_handler
-                .manifest(name)
-                .or_else(|| crate::agent::tool_manifest::lookup_static(name))
-        };
-        // 主路径快照 = 注册面 ∪ 静态表面（PR-2 行为等价口径：②不产生新拒绝；
-        // 真正的收窄消费方是 PR-3 G13 并行实例与 PR-8 delegate 子代理装配）
-        let focus = crate::agent::pipeline::FocusSnapshot::from_names(
+        self.execute_tool_call_gated(tool_name, args, journal, None)
+            .await
+    }
+
+    /// G8 执行入口的缓存收口形态(PR-3):`precomputed=Some` 为 G13 并行缓存
+    /// 命中——缓存键=「已过门禁的证据」(预执行管道实例的落账结果),命中调用
+    /// ①-⑤与⑧随本次调用照常(意图/裁决/账面逐调用在场,P0-3/A1 关闭判据),
+    /// 仅⑦免重执行。审批重执行路径恒传 None(批准后的动作必须真实执行)。
+    async fn execute_tool_call_gated(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        journal: Option<&crate::agent::journal::JournalWriter>,
+        precomputed: Option<Value>,
+    ) -> Result<Value, AgentError> {
+        // 一管道(工具面统一架构 §3.2):本函数为管道的薄翻译层——
+        // 八阶段(①查表②聚焦③意图④裁决⑤审批⑥沙箱位⑦执行⑧落账)由
+        // ToolExecutionPipeline 执行;治理拦截两态 JSON 文案/裁决 fail-closed
+        // 语义/轨迹与指标采集点经管道逐字保留(行为等价,runner_tests 基线
+        // 不改一行即验收)。PR-3 起 G13 并行预执行同为管道并行实例
+        // (ParallelPreflight 入口),两入口共用 run_pipeline 单点。
+        let outcome = self
+            .run_pipeline(
+                tool_name,
+                args,
+                journal,
+                precomputed,
+                crate::agent::pipeline::PipelineEntry::React,
+            )
+            .await;
+        Self::translate_pipeline_outcome(outcome, tool_name)
+    }
+
+    /// 主路径聚焦快照(注册面 ∪ 静态表面)
+    ///
+    /// PR-2 行为等价口径:②不产生新拒绝(裸 runner/CLI 直构造场景 handler
+    /// 为空但工具名有效——静态表内,原实现直达裁决不查 handler,①查表必须
+    /// 同样放行才是行为等价)。收窄为注册面严格子集随装配收口批次落地
+    /// (B2 断言测试盯守);G13 并行预执行实例与本入口共用本构造。
+    fn main_path_focus(&self) -> crate::agent::pipeline::FocusSnapshot {
+        crate::agent::pipeline::FocusSnapshot::from_names(
             self.tool_handler.tool_names().into_iter().chain(
                 crate::agent::tool_manifest::static_manifests()
                     .into_iter()
                     .map(|m| m.name),
             ),
-        );
+        )
+    }
+
+    /// 管道执行单点(两入口共用:React 主路径 / ParallelPreflight 并行实例)
+    ///
+    /// 聚焦快照/查表合并视图/依赖装配统一在此,入口差异仅 CallerContext.entry
+    /// 与 precomputed(缓存收口面)。裁决通道为 runner 持有的 tokio Mutex——
+    /// 并行实例在③④天然串行(设计档 §3.2 Mutex 语义保持)。
+    async fn run_pipeline(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        journal: Option<&crate::agent::journal::JournalWriter>,
+        precomputed: Option<Value>,
+        entry: crate::agent::pipeline::PipelineEntry,
+    ) -> crate::agent::pipeline::PipelineOutcome {
+        // 查表合并视图(一表两源):运行时注册条目优先(可覆盖静态同名),
+        // 未注册回落静态表。
+        let manifest_of = |name: &str| {
+            self.tool_handler
+                .manifest(name)
+                .or_else(|| crate::agent::tool_manifest::lookup_static(name))
+        };
+        let focus = self.main_path_focus();
         let deps = crate::agent::pipeline::PipelineDeps {
             executor: self,
             adjudicator: &self.adjudicator,
@@ -2902,39 +2954,47 @@ impl AgentRunner {
             journal: journal.map(|j| j as &(dyn crate::agent::pipeline::PolicyJudgedSink + Sync)),
             boundary: self.config.capability_boundary.as_ref(),
             traces: Some(&self.tool_traces),
-            metrics: self.metrics.as_ref().map(|m| &**m),
+            metrics: self.metrics.as_deref(),
         };
         let req = crate::agent::pipeline::PipelineRequest {
             tool_name,
             args,
             caller: crate::agent::pipeline::CallerContext {
-                entry: crate::agent::pipeline::PipelineEntry::React,
+                entry,
                 session_id: self.session_id.clone(),
             },
             focus: &focus,
+            precomputed,
         };
-        let outcome = crate::agent::pipeline::ToolExecutionPipeline
+        crate::agent::pipeline::ToolExecutionPipeline
             .execute(req, deps)
-            .await;
+            .await
+    }
+
+    /// 管道结局 → LLM 可见面翻译(两入口共用;错误语义逐臂与原实现等价)
+    fn translate_pipeline_outcome(
+        outcome: crate::agent::pipeline::PipelineOutcome,
+        tool_name: &str,
+    ) -> Result<Value, AgentError> {
         match outcome.result {
             Ok(value) => Ok(value),
-            // 阶段⑦执行错误 = 原样透传（错误显式回喂，与原实现一致）
+            // 阶段⑦执行错误 = 原样透传(错误显式回喂,与原实现一致)
             Err(crate::agent::pipeline::PipelineFailure::Execution(e)) => Err(e),
             Err(crate::agent::pipeline::PipelineFailure::Denial(denial)) => match denial.stage {
-                // ①查表拒绝 = 原 ToolHandler not-found 错误文本（行为等价）；
+                // ①查表拒绝 = 原 ToolHandler not-found 错误文本(行为等价);
                 // ②聚焦/⑤审批拒绝 = 显式错误上抛
                 crate::agent::pipeline::DenialStage::NoManifest
                 | crate::agent::pipeline::DenialStage::OutOfFocus
                 | crate::agent::pipeline::DenialStage::ApprovalDenied => {
                     Err(AgentError::ToolError(denial.reason))
                 }
-                // ③④通道故障/⑧账面失败 = 显式内部错误（fail-closed/fail-visible）
+                // ③④通道故障/⑧账面失败 = 显式内部错误(fail-closed/fail-visible)
                 crate::agent::pipeline::DenialStage::Channel
                 | crate::agent::pipeline::DenialStage::Ledger => {
                     Err(AgentError::Internal(denial.reason))
                 }
-                // 治理拦截 = 原状 Ok(blocked JSON) 回喂 LLM（被拦调用也是真实
-                // 执行史，作为工具结果进对话——与原实现一致）
+                // 治理拦截 = 原状 Ok(blocked JSON) 回喂 LLM(被拦调用也是真实
+                // 执行史,作为工具结果进对话——与原实现一致)
                 crate::agent::pipeline::DenialStage::Governance => {
                     Ok(denial.llm_payload.unwrap_or_else(|| {
                         serde_json::json!({
@@ -2962,10 +3022,15 @@ impl AgentRunner {
     ) -> Result<ToolExecStage, AgentError> {
         // G13:并行缓存命中(如果 call_external 已并行执行过此 active 工具,
         // 直接返回缓存结果,跳过重复执行 + 审批;candidate 工具不缓存)
+        // PR-3 缓存收口:命中调用仍走完整管道(①-⑤⑧照常,仅⑦免重执行——
+        // 缓存值=预执行管道实例的已过闸产物),意图/裁决/账面逐调用在场。
         if let Some(cached) = self.check_parallel_cache(tool_name, args) {
-            info!(%session_id, tool = %tool_name, "G13: cache hit, skipping re-execution");
+            info!(%session_id, tool = %tool_name, "G13: cache hit, serving gated result (gates re-run, execution memoized)");
+            let final_result = self
+                .execute_tool_call_gated(tool_name, args, journal, Some(cached))
+                .await?;
             return Ok(ToolExecStage::Done(ToolExecOutcome {
-                final_result: cached,
+                final_result,
                 approval_record: None,
                 approval_flow: None,
             }));
@@ -3099,49 +3164,65 @@ impl AgentRunner {
         }
     }
 
-    /// G13:直接本地执行单个工具(不经 evorule IoRequest)
+    /// G13:并行预执行单个工具=管道并行实例(PR-3 入口收口)
     ///
-    /// 调 `tool_handler.execute_by_name`,用于并行批量执行。
-    /// 返回 `Value`(工具结果,可能是 proposal)。
+    /// 预执行与主路径共用 run_pipeline 单点(ParallelPreflight 入口)——八阶段
+    /// 全部在场(意图/裁决/审批/落账逐调用发生),产物=已过闸结果,不再存在
+    /// 零门禁直调 execute_by_name 的旁路窗口(修 P0-3/A1)。裁决阶段经共享
+    /// tokio Mutex 天然串行(设计档 §3.2 Mutex 语义保持)。失败不中断其他
+    /// 并行工具:执行错误/拒绝折叠为 error JSON(拒绝中治理拦截保留两态
+    /// blocked 原文案,被拦调用也是真实执行史)。
+    ///
+    /// 观测由管道⑦⑧统一采集(G17 同点同规格),此处不再手工记账。
     async fn execute_single_tool(&self, tc: &crate::agent::translator::ToolCall) -> Value {
-        let args_tcb = tc.arguments.clone();
-        // G13 并行预执行接入 G17 同规格插桩——此前该路径直调
-        // tool_handler,metrics/tool_traces 双观测面断流(注释宣称已覆盖,实测否)
-        let tool_start = std::time::Instant::now();
-        let result = match self.tool_handler.execute_by_name(&tc.name, &args_tcb).await {
+        let outcome = self
+            .run_pipeline(
+                &tc.name,
+                &tc.arguments,
+                None,
+                None,
+                crate::agent::pipeline::PipelineEntry::ParallelPreflight,
+            )
+            .await;
+        match outcome.result {
             Ok(result) => result,
-            Err(e) => {
-                // 工具执行失败:返回 error JSON(不中断其他并行工具)
+            Err(crate::agent::pipeline::PipelineFailure::Execution(e)) => {
                 let mut map = serde_json::Map::new();
                 map.insert("status".to_string(), Value::from("error"));
-                map.insert("error".to_string(), Value::from(e));
+                map.insert("error".to_string(), Value::from(e.to_string()));
                 Value::Object(map)
             }
-        };
-        let tool_duration = tool_start.elapsed();
-        let tool_ok = result
-            .get("status")
-            .and_then(Value::as_str)
-            .map(|s| s != "error")
-            .unwrap_or(true);
-        if let Some(m) = &self.metrics {
-            m.observe_tool_call(&tc.name, tool_duration, tool_ok);
+            Err(crate::agent::pipeline::PipelineFailure::Denial(denial)) => {
+                match denial.stage {
+                    // 治理拦截保留两态 blocked JSON(与主路径文案逐字一致)
+                    crate::agent::pipeline::DenialStage::Governance => {
+                        denial.llm_payload.unwrap_or_else(|| {
+                            serde_json::json!({
+                                "status": "blocked_by_governance_rule",
+                                "tool": tc.name,
+                                "reason": denial.reason,
+                            })
+                        })
+                    }
+                    // 其余拒绝(①②⑤/③④通道/⑧账面)= error JSON 显式回喂,
+                    // 不中断并行批次中其他工具
+                    _ => {
+                        let mut map = serde_json::Map::new();
+                        map.insert("status".to_string(), Value::from("error"));
+                        map.insert("error".to_string(), Value::from(denial.reason));
+                        Value::Object(map)
+                    }
+                }
+            }
         }
-        if let Ok(mut tt) = self.tool_traces.lock() {
-            tt.record(
-                &tc.name,
-                &args_tcb,
-                if tool_ok { "ok" } else { "error" },
-                tool_duration.as_millis() as u64,
-            );
-        }
-        result
     }
 
     /// G13:并行执行多个 tool_calls
     ///
-    /// - 所有工具并行执行(`futures::future::join_all`)
-    /// - active 工具(返回非 proposal)的结果存入缓存,后续 call_service 命中缓存秒回
+    /// - 所有工具=管道并行实例并行执行(`futures::future::join_all`,PR-3 起
+    ///   无任何门禁豁免——治理级工具同样走完整管道,临时加固已随本体修复移除)
+    /// - active 工具(返回非 proposal)的结果存入缓存,后续 call_service 命中
+    ///   缓存走缓存收口路径(①-⑤⑧照常仅⑦免重执行)
     /// - candidate 工具(返回 proposal)的结果**不**缓存,留给 call_service 走审批
     ///
     /// 返回 `Vec<(tool_name, args_clone, result)>`,按原始 tool_calls 顺序。
@@ -3154,36 +3235,25 @@ impl AgentRunner {
             %session_id,
             count = tool_calls.len(),
             max_parallel = self.config.max_parallel_tools,
-            "G13: executing tool calls in parallel"
+            "G13: executing tool calls in parallel (pipeline preflight instances)"
         );
 
-        // 构造 futures:每个 tool_call 一个 execute_single_tool
+        // 构造 futures:每个 tool_call 一个管道并行实例
         let futures: Vec<_> = tool_calls
             .iter()
             .map(|tc| async move {
                 let name = tc.name.clone();
                 let args = tc.arguments.clone();
-                // 治理级(P2)工具跳过预执行:预执行直调 execute_by_name 零门禁,
-                // P2 工具借并行窗口免检(意图裁决/审批/落账全跳)。占位返回且
-                // 不入缓存,留待主路径(execute_tool_stage)走完整管道——以性能
-                // 换语义安全;管道并行实例落地后收编。
-                if is_governance_adjudication_tool(&name) {
-                    return (name, args, Value::Null);
-                }
                 let result = self.execute_single_tool(tc).await;
                 (name, args, result)
             })
             .collect();
 
-        // 并行执行(join_all 保证顺序与输入一致)
+        // 并行执行(join_all 保证顺序与输入一致;裁决阶段经共享 Mutex 串行)
         let results = futures_util::future::join_all(futures).await;
 
-        // 缓存 active 工具结果(非 proposal)
+        // 缓存 active 工具结果(非 proposal)——缓存键=「已过门禁的证据」
         for (name, args, result) in &results {
-            // 治理级(P2)工具占位结果不入缓存(主路径管道执行后经 call_service 回流)
-            if is_governance_adjudication_tool(name) {
-                continue;
-            }
             let result_str = result.to_string();
             // 检查是否是 proposal(candidate 工具)
             let is_proposal = parse_approval_request(session_id, name, args, &result_str).is_some();
@@ -4344,7 +4414,8 @@ impl AgentRunner {
                                 }
 
                                 // G13:并行预执行工具(max_parallel_tools > 1 且有多个 tool_calls 时)
-                                // 结果存入 parallel_tool_cache,后续 call_service IoRequest 命中缓存秒回
+                                // 预执行=管道并行实例(PR-3):产物=已过闸结果,存入 parallel_tool_cache,
+                                // 后续 call_service 命中走缓存收口路径(①-⑤⑧照常仅⑦免重执行)
                                 // candidate 工具(返回 proposal)不缓存,留给 call_service 走审批
                                 if runner.config.max_parallel_tools > 1 {
                                     if let Some(tcs) = &full_tool_calls {

@@ -22,9 +22,11 @@
 //! 的两态 JSON 文案、裁决 fail-closed 语义、轨迹/指标采集点均与原 execute_tool_call
 //! 逐字对齐；runner_tests 既有基线测试（放行/拦截/审批）不改一行保持全绿。
 //!
-//! PR-2 已知范围外（后续 PR 收口）：G13 并行预执行入口（PR-3）、file_api 读面
-//! 查表（PR-3）、两面身份与 HumanGate（PR-4）、链侧 tool_trace 统一指令（信号
-//! 契约批次）、delegate 聚焦决策落账（PR-8）。
+//! PR-3 已收口：G13 并行预执行=管道并行实例（ParallelPreflight 入口）、
+//! 缓存收口（precomputed=已过闸执行产物，命中调用①-⑤⑧照常仅⑦免重执行）、
+//! file_api 读面 manifest 查表（调用侧）。仍范围外：两面身份与 HumanGate
+//! （PR-4）、链侧 tool_trace 统一指令（信号契约批次）、delegate 聚焦决策
+//! 落账（PR-8）。
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -48,8 +50,8 @@ use crate::api::metrics::Metrics;
 // 请求/依赖（管道输入面）
 // =============================================================================
 
-/// 调用方入口（PR-2 最小集：runner 内部 ReAct 族路径统一记 React；
-/// 入口差异化的完整 CallerContext 随 PR-3 入口收口 / PR-4 两面扩展）
+/// 调用方入口（PR-2 最小集 + PR-3 并行预执行入口；完整 CallerContext
+/// 随 PR-4 两面扩展——只增不改）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PipelineEntry {
@@ -57,6 +59,8 @@ pub enum PipelineEntry {
     React,
     /// 审批批准后重执行
     ApprovalReexec,
+    /// G13 并行预执行（PR-3 收口：预执行=管道并行实例，产物=已过闸结果）
+    ParallelPreflight,
     /// 子代理 delegate 路径（PR-8 接线）
     Delegate,
 }
@@ -73,9 +77,10 @@ pub struct CallerContext {
 
 /// 聚焦快照（本次允许面：def.tools ∩ 开关 ∩ surface 的已装配集合）
 ///
-/// PR-2 主路径快照 = 装配期注册面（注册面==可见面，故过滤不产生新拒绝——
-/// 行为等价）；真正的收窄消费方是 PR-3（G13 并行实例）与 PR-8（delegate
-/// 子代理装配）。快照本身可序列化，随调用落账（聚焦范围=可审计对象）。
+/// 主路径快照 = 装配期注册面 ∪ 静态表（行为等价口径：②不产生新拒绝；
+/// 收窄为注册面严格子集随装配收口批次落地，B2 断言测试盯守）。G13 并行
+/// 预执行实例与主路径共用同一快照构造（run_pipeline 单点）。快照本身可
+/// 序列化，随调用落账（聚焦范围=可审计对象）。
 #[derive(Debug, Clone, Serialize)]
 pub struct FocusSnapshot {
     allowed: BTreeSet<String>,
@@ -119,6 +124,11 @@ pub struct PipelineRequest<'a> {
     pub caller: CallerContext,
     /// 本次允许面快照（装配期已过滤集合）
     pub focus: &'a FocusSnapshot,
+    /// 已过闸执行产物（G13 缓存收口面，PR-3）：预执行管道实例的落账结果。
+    /// Some = 命中缓存——①-⑤与⑧随本次调用照常（意图/裁决/账面必须逐调用
+    /// 在场，P0-3/A1 关闭判据），仅⑦免重执行直接采信缓存值（缓存键=「已过
+    /// 门禁的证据」）。None = 常规执行。
+    pub precomputed: Option<Value>,
 }
 
 /// 阶段⑦执行器抽象（runner 注入 call_service 通路；测试注入桩。
@@ -557,8 +567,14 @@ impl ToolExecutionPipeline {
         // PR-6 执行契约批次再评估守卫上提。
 
         // ── ⑦ 执行（真实结局采集：metrics + 轨迹，G17 同点同规格）──
+        // precomputed=缓存命中（G13 收口）：⑦免重执行直接采信已过闸产物，
+        // 观测照常（时长≈0 的真实结局——本次调用确实被服务完成）。
+        let pre = req.precomputed.clone();
         let tool_start = Instant::now();
-        let raw = deps.executor.execute_tool(req.tool_name, req.args).await;
+        let raw = match pre {
+            Some(cached) => Ok(cached),
+            None => deps.executor.execute_tool(req.tool_name, req.args).await,
+        };
         let tool_duration = tool_start.elapsed();
         let tool_ok = raw.is_ok();
         ledger.execution = Some(ExecutionFact {
@@ -734,6 +750,7 @@ mod tests {
                 session_id: Some("s-test".to_string()),
             },
             focus,
+            precomputed: None,
         }
     }
 
@@ -794,6 +811,25 @@ mod tests {
         assert_eq!(denial.stage, DenialStage::ApprovalDenied);
         assert_eq!(out.ledger.approval_policy, Some(ApprovalPolicy::AlwaysDeny));
         assert!(out.ledger.execution.is_none());
+    }
+
+    #[tokio::test]
+    async fn precomputed_serves_cached_result_without_executor_and_keeps_ledger() {
+        // 缓存收口（PR-3）：precomputed=Some 时⑦免重执行（UnreachableExecutor
+        // 证明执行器不触达），①②⑤照常、⑧结局落账照常——命中调用不缺账面。
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["grep_files"]);
+        let args = Value::Null;
+        let deps = deps_for(&UnreachableExecutor, &adj, &manifests);
+        let mut req = req_for("grep_files", &args, &focus);
+        req.precomputed = Some(Value::from("cached-result"));
+        let out = ToolExecutionPipeline.execute(req, deps).await;
+        assert_eq!(out.result.expect("缓存命中必须回喂缓存值"), "cached-result");
+        let execution = out.ledger.execution.as_ref().expect("命中调用也必须落账");
+        assert!(execution.ok);
+        // 入口类可审计：缓存命中走的仍是管道（非旁路）
+        assert_eq!(out.ledger.caller.entry, PipelineEntry::React);
     }
 
     #[tokio::test]

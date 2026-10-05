@@ -1272,21 +1272,30 @@ impl ToolFunction for ProposalTool {
     }
 }
 
-/// 构造一个带并行配置 + 自定义工具的 runner
+/// 构造一个带并行配置 + 自定义工具 + 指定裁决端点的 runner
 ///
 /// 测试假工具不在静态 manifest 表——内部经 dynamic_manifest 补齐 Inline
-/// 契约成对注册(一表硬规则 1:禁止无 manifest 注册)。
-fn make_parallel_runner(
+/// 契约成对注册(一表硬规则 1:禁止无 manifest 注册)。A1 回归测试等需要
+/// mockito 裁决通道的场景经此注入 client;其余场景用 make_parallel_runner。
+fn make_parallel_runner_on(
     max_parallel: usize,
     tools: BTreeMap<String, Arc<dyn ToolFunction>>,
+    client: EvoruleApiClient,
 ) -> AgentRunner {
     let config = AgentConfig {
         max_parallel_tools: max_parallel,
         ..AgentConfig::default()
     };
-    let client = make_test_client();
     let handler = ToolHandler::with_functions(tools);
     AgentRunner::new(config, client).with_tool_handler(handler)
+}
+
+/// 无 mockito 需求的并行测试便捷构造(裁决端点用占位 client,不触网)
+fn make_parallel_runner(
+    max_parallel: usize,
+    tools: BTreeMap<String, Arc<dyn ToolFunction>>,
+) -> AgentRunner {
+    make_parallel_runner_on(max_parallel, tools, make_test_client())
 }
 
 #[test]
@@ -1434,12 +1443,12 @@ async fn test_g13_execute_parallel_skips_candidate_cache() {
 }
 
 #[tokio::test]
-async fn test_g13_parallel_preflight_skips_p2_governance_tools() {
-    // 治理级(P2)工具不得借 G13 并行预执行窗口免检:预执行直调
-    // execute_by_name 零门禁,若 P2 工具(意图裁决/审批/落账)被预执行并
-    // 入缓存,后续 call_service 缓存命中即整体跳过管道=免检执行。
-    // 加固形态:预执行循环跳过 P2 工具(占位 Null)+结果不入缓存,
-    // 留待主路径(execute_tool_stage)走完整管道。
+async fn test_g13_cache_hit_reruns_adjudication_for_p2_tools() {
+    // A1 关闭判据(02号档 §四 A1/PR-3 判据3):并行预执行=管道并行实例——
+    // P2 工具(git_stage)预执行同样过完整门禁(意图提交+裁决),产物入缓存;
+    // 缓存命中调用①-⑤与⑧照常(第二次意图提交=裁决账面逐调用在场),
+    // 仅⑦免重执行直接采信缓存值(缓存键=「已过门禁的证据」)。
+    // 回归锚:mockito command expect(2)——两次调用两次意图提交,少一次即红。
     assert!(
         is_governance_adjudication_tool("git_stage"),
         "git_stage must be a P2 adjudicated tool for this test to be meaningful"
@@ -1453,47 +1462,117 @@ async fn test_g13_parallel_preflight_skips_p2_governance_tools() {
         }
     }
 
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+
+    // 裁决通道 mock(两连跑语义,同 adjudicator 会话复用先例):
+    // create 仅 1 次;GET state 序列 v0(before1)/v1(poll1+before2)/v2(poll2);
+    // command expect(2)=两次管道运行各提交一次 P2 意图(A1 断言本体)。
+    let m_create = server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_body(r#"{"session_id": 77}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let _m_state_0 = server
+        .mock("GET", "/api/sessions/77/state")
+        .with_status(200)
+        .with_body(r#"{"version": 0}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let _m_state_1 = server
+        .mock("GET", "/api/sessions/77/state")
+        .with_status(200)
+        .with_body(r#"{"version": 1}"#)
+        .expect(2)
+        .create_async()
+        .await;
+    let _m_state_2 = server
+        .mock("GET", "/api/sessions/77/state")
+        .with_status(200)
+        .with_body(r#"{"version": 2}"#)
+        .create_async()
+        .await;
+    let m_cmd = server
+        .mock("POST", "/api/sessions/77/command")
+        // 线格式信封:submit_command 以 {"instruction": command} 包装,
+        // PartialJson 子集匹配递归生效,意图判据锚在 instruction.params.attr
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "instruction": { "params": { "attr": "meta_tool.pending_tool_intent" } }
+        })))
+        .with_status(200)
+        .with_body("{}")
+        .expect(2)
+        .create_async()
+        .await;
+
     let mut tools: BTreeMap<String, Arc<dyn ToolFunction>> = BTreeMap::new();
-    tools.insert("echo_a".to_string(), Arc::new(EchoTool));
-    // git_stage 故意不注册 handler:若加固失效(未跳过),预执行将得到
-    // error JSON 而非占位 Null——is_null 断言即红
-    let runner = make_parallel_runner(4, tools);
+    // git_stage 注册 EchoTool:P2 分级查静态表(is_governance_adjudication_tool
+    // → lookup_static),与 handler 的 dynamic_manifest(Standard)独立——意图
+    // 照常提交,冒名注册不改变治理分级(本测试的判据前提)。
+    tools.insert("git_stage".to_string(), Arc::new(EchoTool));
+    let runner = make_parallel_runner_on(4, tools, client);
 
-    let tool_calls = vec![
-        ToolCall {
-            name: "git_stage".to_string(),
-            arguments: serde_json::json!({"files": ["a.rs"]}),
-        },
-        ToolCall {
-            name: "echo_a".to_string(),
-            arguments: serde_json::json!({}),
-        },
-    ];
+    let args = serde_json::json!({"files": ["a.rs"]});
+    let tool_calls = vec![ToolCall {
+        name: "git_stage".to_string(),
+        arguments: args.clone(),
+    }];
 
+    // 第一次调用:并行预执行=管道并行实例——P2 意图提交#1,真实执行(非占位),
+    // 已过闸结果入缓存
     let results = runner
         .execute_tools_parallel("test-session", &tool_calls)
         .await;
-
-    // P2 工具预执行被跳过:占位 Null(未执行)
+    assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, "git_stage");
-    assert!(
-        results[0].2.is_null(),
-        "P2 tool must be skipped in preflight (Null placeholder, not executed)"
-    );
-    // 混合批的非 P2 工具照常预执行
-    assert_eq!(results[1].2, Value::from("echo"));
-    // P2 工具结果不入缓存(主路径 call_service 必然缓存 miss → 走完整管道)
-    assert!(
-        runner
-            .check_parallel_cache("git_stage", &serde_json::json!({"files": ["a.rs"]}))
-            .is_none(),
-        "P2 tool result must NOT be cached (main path must run full pipeline)"
+    assert_eq!(
+        results[0].2,
+        Value::from("echo"),
+        "P2 tool preflight must run the full pipeline (real execution, not Null placeholder)"
     );
     assert!(
-        runner
-            .check_parallel_cache("echo_a", &serde_json::json!({}))
-            .is_some(),
-        "non-P2 tool should still be cached as usual"
+        runner.check_parallel_cache("git_stage", &args).is_some(),
+        "pipeline-preflight result of P2 tool must be cached (cache key = gated evidence)"
+    );
+
+    // 第二次调用:缓存命中仍走完整管道——意图提交#2(裁决账面逐调用在场),
+    // ⑦采信缓存值免重执行
+    match runner
+        .execute_tool_stage("test-session", "git_stage", &args, None)
+        .await
+        .expect("cache-hit gated call must not fail")
+    {
+        ToolExecStage::Done(outcome) => {
+            assert_eq!(outcome.final_result, Value::from("echo"));
+        }
+        ToolExecStage::Pending(_) => {
+            panic!("cache-hit of non-proposal result must not be Pending");
+        }
+    }
+
+    m_create.assert_async().await;
+    m_cmd.assert_async().await; // expect(2)=第二次调用仍产生裁决账面(A1 关闭判据)
+}
+
+#[test]
+#[ignore = "B2 窗口期声明:主路径 focus 收窄为注册面严格子集随装配收口批次启用(02号档 §四 B2/PR-3 判据5);现状=注册面∪静态表,本测试当前必红"]
+fn b2_main_path_focus_is_strict_subset_of_registration() {
+    // 期望终态:空注册面 runner 的主路径聚焦快照为空(注册面严格子集)——
+    // 静态表不再自动进入允许面,grep_files 等未注册工具②聚焦即拒。
+    // 现状快照=注册面∪静态表(行为等价口径,runner.rs main_path_focus 注释),
+    // 故本测试 #[ignore] 盯守,装配收口批次落地时移除 ignore 即转绿。
+    let runner = make_parallel_runner(4, BTreeMap::new());
+    let focus = runner.main_path_focus();
+    assert!(
+        focus.is_empty(),
+        "empty registration must yield empty focus (strict subset of registration)"
+    );
+    assert!(
+        !focus.allows("grep_files"),
+        "unregistered static-table tool must be out of focus"
     );
 }
 
