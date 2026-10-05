@@ -1,0 +1,110 @@
+{
+  "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
+  "kind": "rule_set",
+  "metadata": {
+    "tier": "constraint",
+    "title": "治理级工具事前意图裁决",
+    "description": "拦截越界的治理级 file 族工具意图。agent 采集侧（evo-agent resolve_tool_intent，GOVERNANCE_ADJUDICATION_TOOLS 分级表）在工具执行前把意图规范字段 meta_tool.pending_tool_intent={tool_name, target_scope?, args} 随中性 set 指令提交进裁决会话（独立会话裁决，不受主会话 io 串行影响）；本规则 enforce 判 file_create/file_move/file_delete 的 target_scope=out_of_sandbox 即丢弃指令（version 不推进，agent 轮询判据感知=fail-closed 不执行）并发射 Violation（归因 rule_index→本规则集）。其余治理级工具意图无匹配 enforce=放行落链（裁决事实即审计证据，规则扩充零代码）。判据为机制层 path_scope 快筛规范字段（eq 精确判定；7 基础域无子串谓词，子串级检测不可入规则层）；handler 内联沙箱检查保留为最终防线（双层分工）。与协作验收规则（meta_tool.pending_target_scope，file_read/file_write 通道）并存互不干扰。"
+  },
+  "transform": [
+    {
+      "type": "enforce",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            {
+              "type": "instruction",
+              "instruction_type": "set"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.attr",
+              "value": "meta_tool.pending_tool_intent",
+              "on_missing": "error"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value.tool_name",
+              "value": "file_create",
+              "on_missing": "error"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value.target_scope",
+              "value": "out_of_sandbox",
+              "on_missing": "error"
+            }
+          ]
+        },
+        "reason": "越界创建企图：file_create 目标超出会话能力边界（target_scope=out_of_sandbox），已由治理级工具事前意图裁决拦截"
+      }
+    },
+    {
+      "type": "enforce",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            {
+              "type": "instruction",
+              "instruction_type": "set"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.attr",
+              "value": "meta_tool.pending_tool_intent",
+              "on_missing": "error"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value.tool_name",
+              "value": "file_move",
+              "on_missing": "error"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value.target_scope",
+              "value": "out_of_sandbox",
+              "on_missing": "error"
+            }
+          ]
+        },
+        "reason": "越界移动企图：file_move 源或目标超出会话能力边界（target_scope=out_of_sandbox），已由治理级工具事前意图裁决拦截"
+      }
+    },
+    {
+      "type": "enforce",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            {
+              "type": "instruction",
+              "instruction_type": "set"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.attr",
+              "value": "meta_tool.pending_tool_intent",
+              "on_missing": "error"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value.tool_name",
+              "value": "file_delete",
+              "on_missing": "error"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value.target_scope",
+              "value": "out_of_sandbox",
+              "on_missing": "error"
+            }
+          ]
+        },
+        "reason": "越界删除企图：file_delete 目标超出会话能力边界（target_scope=out_of_sandbox），已由治理级工具事前意图裁决拦截"
+      }
+    }
+  ]
+}

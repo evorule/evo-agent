@@ -33,6 +33,7 @@ pub mod skill_store;
 pub mod skills_mirror;
 pub mod stagnation;
 pub mod summarizer;
+pub mod tool_intent;
 pub mod tool_manifest;
 pub mod tool_trace;
 pub mod translator;
