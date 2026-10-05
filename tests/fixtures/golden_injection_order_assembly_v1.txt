@@ -1,0 +1,31 @@
+【基底】固定基底提示词。
+
+【身份资产】测试身份段。
+
+【北极星】测试目标锚。
+
+## Stable Facts
+- [unclassified] golden.stable: 固定稳定事实内容。
+
+## Previous Sessions
+- golden.session: 固定会话摘要。
+
+## Relevant Events
+- golden.events.e1: 固定事件。
+
+
+## Handoff Base
+- Goal: 黄金样本固定目标
+- Milestone: 固化期
+- Verified Facts:
+  1. 组装纯函数
+
+【能力边界声明】
+- 访问模式:read_only(只读,你没有写文件能力)
+- 沙箱根目录:/srvbox/golden(一切文件路径相对该根解析)
+- 边界内工具:file_read
+越出沙箱根的路径不可访问;尝试越界的操作会被拒绝并告知边界。若任务需要边界外的资源,如实说明边界限制,不要猜测或编造。
+
+【可用技能清单】以下技能可经 read_skill 工具装载正文：
+- demo-skill: 演示技能(黄金样本固定件)
+按需装载，不要一次性全部读取。
