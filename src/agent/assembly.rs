@@ -1520,4 +1520,161 @@ mod tests {
         assert_eq!(out3, "base");
         assert!(!out3.contains("Handoff Base"));
     }
+
+// ===== 24 号批次三(K-17①):注入序黄金样本 =====
+//
+// golden v1 = 当前运行序,**含已知缺陷序(K-17:serve 注入段先于身份段)**——
+// 固化现状不等于认可现状:此后任何配方/注入序变更,CI 上 golden 不匹配即红,
+// "字面成立、结构靠后"类漂移从静默累积变为硬失败。
+// 重录方式:`GOLDEN_REWRITE=1 cargo test --lib injection_order -- --nocapture`
+// (重录必配人工段序裁定;S2 前移批以 golden v1/v2 双版本为回滚对照基线)。
+// L2 前馈段以固定库存 fixture 经渲染纯函数驱动(真实通路=服务端库存拉取,
+// 渲染函数同源;追加模式与 apply_l2_feed_forward 一致)。
+
+#[tokio::test]
+async fn test_injection_order_golden_sample() {
+    use crate::agent::definition::{CapabilityBoundary, HandoffPackage, SkillManifestEntry};
+    use crate::api::serve_tools::{
+        apply_evolution_signals_awareness, apply_regulation_index_awareness,
+    };
+    use crate::rule_tools::local_handlers::render_l2_inventory_summary;
+    use std::path::PathBuf;
+
+    const GOLDEN_ASSEMBLY: &str = "tests/fixtures/golden_injection_order_assembly_v1.txt";
+    const GOLDEN_FULL: &str = "tests/fixtures/golden_injection_order_full_v1.txt";
+
+    // ---- 固定输入件(全确定性,零网络) ----
+    let base = "【基底】固定基底提示词。";
+    let identity = "【身份资产】测试身份段。";
+    let north_star = "【北极星】测试目标锚。";
+    let boundary = CapabilityBoundary {
+        mode: "read_only".to_string(),
+        sandbox_root: PathBuf::from("/srvbox/golden"),
+        tools: vec!["file_read".to_string()],
+    };
+    let skills = vec![SkillManifestEntry {
+        name: "demo-skill".to_string(),
+        path: PathBuf::from("/skills/demo/SKILL.md"),
+        description: "演示技能(黄金样本固定件)".to_string(),
+    }];
+    let handoff = HandoffPackage {
+        goal: "黄金样本固定目标".to_string(),
+        milestone_current: Some("固化期".to_string()),
+        next_step: None,
+        verified_facts: vec!["组装纯函数".to_string()],
+        dead_ends: Vec::new(),
+    };
+    let mut recall = crate::agent::memory::RecallContext::default();
+    let mut stable = crate::agent::memory::MemoryRecord::new(
+        "golden.stable",
+        "固定稳定事实内容。",
+        1_700_000_000,
+    );
+    stable.source = Some("system".to_string());
+    recall.stable.push(stable);
+    recall
+        .summaries
+        .push(crate::agent::memory::MemoryRecord::new(
+            "golden.session",
+            "固定会话摘要。",
+            1_700_000_100,
+        ));
+    recall
+        .events
+        .push(crate::agent::memory::MemoryRecord::new(
+            "golden.events.e1",
+            "固定事件。",
+            1_700_000_200,
+        ));
+    let mem = crate::agent::memory::MemoryManager::new(
+        "golden-ns",
+        crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),
+    );
+    let exec = AssemblyExecutor::default_executor();
+
+    // ---- (a) assemble() 单体黄金(不含 serve 段) ----
+    let assembly_out = exec
+        .assemble(
+            base,
+            Some(identity),
+            Some(north_star),
+            Some(&mem),
+            &recall,
+            8192,
+            Some(&boundary.awareness_segment()),
+            Some(&skills),
+            Some(&handoff),
+        )
+        .unwrap();
+
+    // ---- (b) serve 段前置后全文(K-17 缺陷序:serve 段位于身份段之前) ----
+    // 顺序镜像 ws_handler 会话创建路径:L2 前馈 → 进化信号感知 → 规范入口索引,
+    // 三段全部追加在 def.system_prompt(=assemble 的 base)尾部。
+    let mut serve_base = base.to_string();
+    let l2_inventory = serde_json::json!({
+        "count": 1,
+        "files": [
+            {"path": "guard-demo", "title": "演示守卫规则", "guard_for": ["deploy"]}
+        ],
+    });
+    if let Some(seg) = render_l2_inventory_summary(&l2_inventory) {
+        serve_base.push_str("\n\n");
+        serve_base.push_str(&seg);
+    }
+    apply_evolution_signals_awareness(
+        &crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),
+        &["rule_create".to_string()],
+        &mut serve_base,
+    )
+    .await;
+    apply_regulation_index_awareness(&mut serve_base);
+    let full = exec
+        .assemble(
+            &serve_base,
+            Some(identity),
+            Some(north_star),
+            Some(&mem),
+            &recall,
+            8192,
+            Some(&boundary.awareness_segment()),
+            Some(&skills),
+            Some(&handoff),
+        )
+        .unwrap();
+
+    // ---- 写录/比对 ----
+    if std::env::var("GOLDEN_REWRITE").is_ok() {
+        std::fs::write(GOLDEN_ASSEMBLY, &assembly_out).unwrap();
+        std::fs::write(GOLDEN_FULL, &full).unwrap();
+        println!("[golden] rewritten: {GOLDEN_ASSEMBLY} / {GOLDEN_FULL}");
+        return;
+    }
+    let expect_a = std::fs::read_to_string(GOLDEN_ASSEMBLY).unwrap_or_else(|e| {
+        panic!(
+            "golden 缺失({e});重录=GOLDEN_REWRITE=1 cargo test --lib injection_order -- --nocapture"
+        )
+    });
+    assert_eq!(
+        assembly_out, expect_a,
+        "assemble() 黄金样本失配——注入序/配方变更必须显式重录(24 号批次三守护语义)"
+    );
+    let expect_f = std::fs::read_to_string(GOLDEN_FULL).unwrap_or_else(|e| {
+        panic!(
+            "golden 缺失({e});重录=GOLDEN_REWRITE=1 cargo test --lib injection_order -- --nocapture"
+        )
+    });
+    assert_eq!(
+        full, expect_f,
+        "serve 全文黄金样本失配——v1 含已知缺陷序(serve 段先于身份段,K-17);序变更须显式重录并走 S2 前移批(24 号批次七)裁定"
+    );
+    // 缺陷序显式断言:v1 固化的正是"身份段位于 serve 注入段之后"这一现状——
+    // 若未来序被修正(身份段前移),本断言随 golden v2 重录一并翻转。
+    let serve_end = full.find(serve_base.trim_end()).unwrap() + serve_base.trim_end().len();
+    let identity_pos = full.find(identity).unwrap();
+    let l2_pos = full.find("【L2 约束边界").unwrap();
+    assert!(
+        l2_pos < serve_end && identity_pos >= serve_end,
+        "v1 结构预期:serve 段在 base 尾部、身份段在其后(K-17 缺陷序)"
+    );
+}
 }
