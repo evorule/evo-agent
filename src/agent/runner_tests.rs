@@ -1433,6 +1433,70 @@ async fn test_g13_execute_parallel_skips_candidate_cache() {
     );
 }
 
+#[tokio::test]
+async fn test_g13_parallel_preflight_skips_p2_governance_tools() {
+    // 治理级(P2)工具不得借 G13 并行预执行窗口免检:预执行直调
+    // execute_by_name 零门禁,若 P2 工具(意图裁决/审批/落账)被预执行并
+    // 入缓存,后续 call_service 缓存命中即整体跳过管道=免检执行。
+    // 加固形态:预执行循环跳过 P2 工具(占位 Null)+结果不入缓存,
+    // 留待主路径(execute_tool_stage)走完整管道。
+    assert!(
+        is_governance_adjudication_tool("git_stage"),
+        "git_stage must be a P2 adjudicated tool for this test to be meaningful"
+    );
+
+    struct EchoTool;
+    #[async_trait::async_trait]
+    impl ToolFunction for EchoTool {
+        async fn call(&self, _args: &serde_json::Value) -> crate::io_handler::IoResult {
+            Ok(serde_json::Value::from("echo"))
+        }
+    }
+
+    let mut tools: BTreeMap<String, Arc<dyn ToolFunction>> = BTreeMap::new();
+    tools.insert("echo_a".to_string(), Arc::new(EchoTool));
+    // git_stage 故意不注册 handler:若加固失效(未跳过),预执行将得到
+    // error JSON 而非占位 Null——is_null 断言即红
+    let runner = make_parallel_runner(4, tools);
+
+    let tool_calls = vec![
+        ToolCall {
+            name: "git_stage".to_string(),
+            arguments: serde_json::json!({"files": ["a.rs"]}),
+        },
+        ToolCall {
+            name: "echo_a".to_string(),
+            arguments: serde_json::json!({}),
+        },
+    ];
+
+    let results = runner
+        .execute_tools_parallel("test-session", &tool_calls)
+        .await;
+
+    // P2 工具预执行被跳过:占位 Null(未执行)
+    assert_eq!(results[0].0, "git_stage");
+    assert!(
+        results[0].2.is_null(),
+        "P2 tool must be skipped in preflight (Null placeholder, not executed)"
+    );
+    // 混合批的非 P2 工具照常预执行
+    assert_eq!(results[1].2, Value::from("echo"));
+    // P2 工具结果不入缓存(主路径 call_service 必然缓存 miss → 走完整管道)
+    assert!(
+        runner
+            .check_parallel_cache("git_stage", &serde_json::json!({"files": ["a.rs"]}))
+            .is_none(),
+        "P2 tool result must NOT be cached (main path must run full pipeline)"
+    );
+    assert!(
+        runner
+            .check_parallel_cache("echo_a", &serde_json::json!({}))
+            .is_some(),
+        "non-P2 tool should still be cached as usual"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_g13_parallel_faster_than_serial() {
     // 3 个工具各 sleep 100ms:串行 ~300ms,并行 ~100ms
