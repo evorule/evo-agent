@@ -96,10 +96,10 @@ pub mod metrics {
 
 pub use agent::{
     merge_delegate_tool, AgentConfig, AgentDefinition, AgentDefinitionError,
-    AgentDefinitionManager, AgentError, AgentEvent, AgentResult, AgentRunner, DelegateContext,
-    LlmResponse, MemoryConfig, MemoryError, MemoryManager, Message, OutputFormat, ToolCall,
-    ToolRegistry, ToolSpec, Workflow, WorkflowEngine, WorkflowNode,
-    DEFAULT_MAX_CONCURRENT_DELEGATES, DEFAULT_MAX_DELEGATE_DEPTH,
+    AgentDefinitionManager, AgentError, AgentEvent, AgentResult, DelegateContext, LlmResponse,
+    MemoryConfig, MemoryError, MemoryManager, Message, OutputFormat, ToolCall, ToolManifest,
+    Workflow, WorkflowEngine, WorkflowNode, DEFAULT_MAX_CONCURRENT_DELEGATES,
+    DEFAULT_MAX_DELEGATE_DEPTH,
 };
 // G14:032 MemoryEvent re-export(结构化记忆事件 + 因果链 + 确定性回放)
 pub use agent::callback::{CallbackChain, EventCallback, LoggingCallback, MetricsCallback};

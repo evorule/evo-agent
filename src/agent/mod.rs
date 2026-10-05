@@ -32,7 +32,7 @@ pub mod skill_store;
 pub mod skills_mirror;
 pub mod stagnation;
 pub mod summarizer;
-pub mod tool_registry;
+pub mod tool_manifest;
 pub mod tool_trace;
 pub mod translator;
 pub mod workflow;
@@ -70,6 +70,9 @@ pub use runner::{
     merge_delegate_tool, AgentConfig, AgentError, AgentEvent, AgentResult, AgentRunner,
     DEFAULT_MAX_DELEGATE_DEPTH,
 };
-pub use tool_registry::{ToolRegistry, ToolSpec};
+pub use tool_manifest::{
+    dynamic_manifest, lookup_static, static_manifests, AdjudicationClass, ApprovalPolicy,
+    CapDomain, SandboxScope, SpecSource, SwitchBinding, TimeoutClass, ToolManifest, ToolSource,
+};
 pub use translator::{LlmResponse, Message, ToolCall};
 pub use workflow::{ComputeInput, ComputeSpec, Workflow, WorkflowEngine, WorkflowNode};

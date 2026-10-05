@@ -169,8 +169,26 @@ async fn connect_and_register_one(
             registered_as = %registered_name,
             "registering MCP tool"
         );
-        tool_handler.register_tool(
+        // 一表硬规则 3:MCP 握手后 tools/list 的 description/inputSchema 透传
+        // 进 manifest(Inline 契约)——丢字段即注册失败(设计档 §3.1,消灭
+        // MCP 空 schema 降级;现状缺陷:两字段全丢,mcp/tool_adapter.rs:172)
+        let manifest = crate::agent::tool_manifest::dynamic_manifest(
             &registered_name,
+            crate::agent::tool_manifest::ToolSource::Mcp,
+            tool.description.clone(),
+            tool.input_schema.clone(),
+        )
+        .map_err(|e| {
+            tracing::warn!(
+                server = %server_cfg.name,
+                mcp_tool = %tool.name,
+                error = %e,
+                "MCP tool registration rejected by manifest contract"
+            );
+            e
+        })?;
+        tool_handler.register(
+            manifest,
             Arc::new(McpToolAdapter::new(client.clone(), tool.name)),
         );
     }

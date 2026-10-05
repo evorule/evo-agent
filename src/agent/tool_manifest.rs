@@ -1,0 +1,852 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 EvoRule Project
+// This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
+#![forbid(unsafe_code)]
+//! 工具面统一架构（一表）：ToolManifest 单一真相源
+//!
+//! 设计档：knowledge/agent-tools/evo-agent-工具面统一架构设计-20261005.md §3.1。
+//!
+//! 每个工具一条 manifest 记录，是工具全部**治理元数据**的唯一权威源：
+//! 来源、能力域、裁决分级、审批策略、agentTools 开关绑定、沙箱域、超时档。
+//!
+//! **三条硬规则**（设计档 §3.1，对齐生态约束 H fail-fast）：
+//! 1. 无 manifest 拒绝注册：[`crate::io_handlers::tool_handler::ToolHandler::register`]
+//!    接收 `(manifest, handler)`；按名查不到静态条目且非动态源（服务代理/MCP）
+//!    的注册在启动期 panic（fail-fast）。
+//! 2. 静态层锁定：内置 16 + 规则 46 + delegate 1 + memory 4 的 manifest 为
+//!    静态表（[`static_manifests`]）；测试断言数量、名称无重叠、spec 可解析、
+//!    派生视图与旧表快照一致——「union 42 vs 41」类注释漂移机制上不可能再现。
+//! 3. 动态层注册期补全：服务代理与 MCP 在注册期必须产出 spec
+//!    （[`SpecSource::Inline`]）；丢字段即注册失败。
+//!
+//! **spec 不复制**：LLM 契约文本（description/参数）仍由既有 spec 源函数产出
+//! （`default_tool_specs` / `rule_tool_specs` / `memory_tool_specs` /
+//! `delegate_tool_spec`），manifest 经 [`SpecSource`] 分派引用——单一真相源
+//! （治理元数据在表、契约文本单源），静态层测试锁两侧名称集合相等。
+//!
+//! 分级口径（与现状行为等价，快照测试锁定）：
+//! - [`AdjudicationClass::Sentineled`]：P2 事前意图裁决 + 规则正本 enforce 已在场
+//!   （file_create/file_move/file_delete 的 out_of_sandbox enforce）；
+//! - [`AdjudicationClass::Sensitive`]：P2 事前意图裁决在通道（意图必报，暂无
+//!   enforce——git 写族 2 + 规则治理写族 19）；
+//! - [`AdjudicationClass::Standard`]：不走 P2 裁决（机制层治理或纯落链）。
+//!   `is_governance_adjudication_tool` 改由 manifest 派生后，命中集合恰等于
+//!   原 GOVERNANCE_ADJUDICATION_TOOLS 24 表（runner_tests 快照锁定）。
+//!   delegate 暂标 Standard，PR-8（delegate 统一装配批）升 Sensitive 并接
+//!   P2 通道（设计档 §3.2 终态）；file_write 的意图信号走 M5-c R1 通道
+//!   （机制层，由实现持有），不属 P2 分级面。
+
+use serde::{Deserialize, Serialize};
+
+use crate::builtin_tools::ParameterSpec;
+
+// =============================================================================
+// 枚举（manifest 治理元数据的值域）
+// =============================================================================
+
+/// 工具来源（装配与治理语义按来源分派）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSource {
+    /// 内置工具（宿主实现，default_safe_toolkit 注册）
+    Builtin,
+    /// 规则工具·透传（rule_tools adapter 表驱动，40 个）
+    RuleTransparent,
+    /// 规则工具·本地逻辑（rule_tools local_handlers，6 个）
+    RuleLocal,
+    /// 自省记忆工具（memory_tool，4 个）
+    Memory,
+    /// delegate 子代理派发
+    Delegate,
+    /// 技能面（read_skill，按 agent definition skills 声明注册）
+    Skill,
+    /// 服务代理（evorule-server 插件服务，发现期动态注册）
+    ServiceProxy,
+    /// MCP 远端工具（握手后 tools/list 动态注册）
+    Mcp,
+}
+
+/// 能力域（聚焦语言：agent 定义 def.tools 是基础聚焦，能力域是聚焦的词汇表）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapDomain {
+    /// 文件系统读
+    FsRead,
+    /// 文件系统写
+    FsWrite,
+    /// git 读（status/log/diff 等）
+    GitRead,
+    /// git 写（stage/commit）
+    GitWrite,
+    /// 进程执行（shell/命令）
+    Process,
+    /// 网络访问（http_get 等）
+    Network,
+    /// 治理写（规则/发布/生产面）
+    Governance,
+    /// 记忆系统读写
+    Memory,
+    /// 子代理委派
+    Delegate,
+    /// 技能加载
+    Skill,
+}
+
+/// 裁决分级（P2 事前意图裁决的通道分级，见模块文档）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdjudicationClass {
+    /// 哨兵：P2 裁决 + 规则正本 enforce 已在场
+    Sentineled,
+    /// 敏感：P2 裁决在通道（意图必报，暂无 enforce）
+    Sensitive,
+    /// 常规：免 P2 裁决（机制层治理或纯落链）
+    Standard,
+}
+
+/// 审批策略（PR-2 管道阶段⑤分级审批的输入；现状如实盘点）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    /// 永远拒绝（逃逸出口/不可逆破坏类）
+    AlwaysDeny,
+    /// 缺省拒绝（candidate 审批模式：首次调用返回 needs_approval 提案）
+    ManualDefault,
+    /// 策略端自动（active 白名单即策略；默认宽+事后账全）
+    AutoPolicy,
+    /// 转人工（人工面专属）
+    HumanOnly,
+}
+
+/// 沙箱域（PR-6 执行契约与 D3 容器策略的输入）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxScope {
+    /// 宿主机制沙箱（fs_safety/net_guard 机制层围栏）
+    HostSandboxed,
+    /// 容器可执行（D3 策略选项，现状无消费）
+    ContainerEligible,
+    /// 无沙箱（仅人工面）
+    NoSandbox,
+}
+
+/// 超时档（PR-6 执行契约接线前不改变现有 60s 全局行为）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeoutClass {
+    /// 30s（与工具内部硬超时一致，如 grep_files）
+    Fast,
+    /// 60s（现状全局默认）
+    Default,
+    /// 600s（容器/构建类，D3 采纳后启用）
+    Long,
+}
+
+/// agentTools.* 开关绑定（从 serve_tools TOOL_SWITCH_KEYS 迁移，快照测试锁等价）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchBinding {
+    /// 设置键（agentTools.*，scope=application）
+    pub key: String,
+    /// 键缺失/值非法时的回落默认（开=在 agent 工具面）
+    pub default_on: bool,
+}
+
+// =============================================================================
+// spec 分派（契约文本单源，manifest 引用不复制）
+// =============================================================================
+
+/// spec 契约的来源分派
+///
+/// 静态源 = 既有 spec 生成函数按名查找（文本单源零复制）；
+/// 动态源（服务代理/MCP）= 注册期产出的内联契约（硬规则 3）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SpecSource {
+    /// 内置 spec（builtin_tools::default_tool_specs 按名查找）
+    Builtin,
+    /// 规则工具 spec（rule_tools::rule_tool_specs 按名查找）
+    Rule,
+    /// 自省记忆 spec（memory_tool_specs 按名查找）
+    Memory,
+    /// delegate spec（delegate_tool_spec，单例）
+    Delegate,
+    /// 动态内联契约（服务代理/MCP 注册期产出）
+    Inline {
+        /// 工具描述（动态源注册期必填，空 = 注册失败）
+        description: String,
+        /// 参数 schema（OpenAI object 形态）
+        parameters: serde_json::Value,
+    },
+}
+
+impl SpecSource {
+    /// 解析出 LLM 契约文本（description + OpenAI parameters object 形态）
+    ///
+    /// 静态源查不到（表漂移）返回 None——由静态层测试锁兜住，运行期不该发生。
+    pub fn resolve(&self, name: &str) -> Option<(String, serde_json::Value)> {
+        match self {
+            SpecSource::Builtin => crate::builtin_tools::default_tool_specs()
+                .into_iter()
+                .find(|s| s.name == name)
+                .map(|s| (s.description, params_to_openai(&s.parameters))),
+            SpecSource::Rule => crate::rule_tools::rule_tool_specs()
+                .into_iter()
+                .find(|s| s.name == name)
+                .map(|s| (s.description, params_to_openai(&s.parameters))),
+            SpecSource::Memory => crate::agent::memory_tool::memory_tool_specs()
+                .into_iter()
+                .find(|s| s.name == name)
+                .map(|s| (s.description, params_to_openai(&s.parameters))),
+            SpecSource::Delegate => {
+                let s = crate::builtin_tools::delegate_tool::delegate_tool_spec();
+                Some((s.description, params_to_openai(&s.parameters)))
+            }
+            SpecSource::Inline {
+                description,
+                parameters,
+            } => Some((description.clone(), parameters.clone())),
+        }
+    }
+}
+
+/// ToolSpec 参数列表 → OpenAI function parameters object（与
+/// runner::openai_function_schemas_for 同一形状，测试锁两侧一致）
+fn params_to_openai(parameters: &[ParameterSpec]) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for p in parameters {
+        properties.insert(
+            p.name.clone(),
+            serde_json::json!({ "type": p.r#type, "description": p.description }),
+        );
+        if p.required {
+            required.push(p.name.clone());
+        }
+    }
+    let mut object = serde_json::json!({ "type": "object", "properties": properties });
+    if !required.is_empty() {
+        object["required"] = serde_json::json!(required);
+    }
+    object
+}
+
+// =============================================================================
+// ToolManifest
+// =============================================================================
+
+/// 工具治理元数据单一真相源（一表；spec 文本经 [`SpecSource`] 分派单源）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolManifest {
+    /// 全局唯一工具名（LLM 面稳定标识）
+    pub name: String,
+    /// 来源
+    pub source: ToolSource,
+    /// spec 契约来源（硬规则 3：动态源必须 Inline 且字段齐全）
+    pub spec: SpecSource,
+    /// 能力域（主域；聚焦过滤与开关键派生的词汇表）
+    pub capability_domains: Vec<CapDomain>,
+    /// 裁决分级（P2 通道判定 = class != Standard）
+    pub adjudication_class: AdjudicationClass,
+    /// 审批策略（PR-2 管道阶段⑤消费；现状如实盘点）
+    pub approval_policy: ApprovalPolicy,
+    /// agentTools.* 开关绑定（无绑定 = 不受开关过滤，恒可用）
+    pub default_switch: Option<SwitchBinding>,
+    /// 沙箱域
+    pub sandbox_scope: SandboxScope,
+    /// 超时档（PR-6 接线前不改变现有 60s 行为）
+    pub timeout_class: TimeoutClass,
+}
+
+impl ToolManifest {
+    /// 解析 LLM 契约（description + OpenAI parameters object）
+    pub fn resolve_spec(&self) -> Option<(String, serde_json::Value)> {
+        self.spec.resolve(&self.name)
+    }
+
+    /// P2 事前意图裁决通道判定（`GOVERNANCE_ADJUDICATION_TOOLS` 的 manifest 派生）
+    pub fn is_p2_adjudicated(&self) -> bool {
+        self.adjudication_class != AdjudicationClass::Standard
+    }
+}
+
+// =============================================================================
+// 静态表（硬规则 2：内置 16 + 规则 46 + delegate 1 + memory 4 = 67）
+// =============================================================================
+
+/// agentTools.fileCreate（默认开）
+const SWITCH_FILE_CREATE: &str = "agentTools.fileCreate";
+/// agentTools.fileMove（默认关）
+const SWITCH_FILE_MOVE: &str = "agentTools.fileMove";
+/// agentTools.fileDelete（默认关）
+const SWITCH_FILE_DELETE: &str = "agentTools.fileDelete";
+/// agentTools.grep（默认开）
+const SWITCH_GREP: &str = "agentTools.grep";
+/// agentTools.gitRead（默认开）
+const SWITCH_GIT_READ: &str = "agentTools.gitRead";
+/// agentTools.gitWrite（默认关）
+const SWITCH_GIT_WRITE: &str = "agentTools.gitWrite";
+/// agentTools.governanceWrite（默认开；单键管规则治理写族全量）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_GOVERNANCE_WRITE: &str = "agentTools.governanceWrite";
+const SWITCH_GOVERNANCE_WRITE: &str = AGENT_TOOLS_GOVERNANCE_WRITE;
+
+/// 开关绑定便捷构造（静态键 → String 归一）
+fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
+    Some(SwitchBinding {
+        key: key.to_string(),
+        default_on,
+    })
+}
+
+/// 构造静态条目的便捷底版（name/spec/分级/开关/域逐项覆写）
+fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain>) -> ToolManifest {
+    ToolManifest {
+        name: name.to_string(),
+        source,
+        spec,
+        capability_domains: domains,
+        adjudication_class: AdjudicationClass::Standard,
+        approval_policy: ApprovalPolicy::AutoPolicy,
+        default_switch: None,
+        sandbox_scope: SandboxScope::HostSandboxed,
+        timeout_class: TimeoutClass::Default,
+    }
+}
+
+/// 内置工具 manifest（16 条，与 default_tool_specs 名称集合相等——测试锁）
+fn builtin_manifests() -> Vec<ToolManifest> {
+    use CapDomain::*;
+    let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
+        base(name, ToolSource::Builtin, SpecSource::Builtin, domains)
+    };
+    vec![
+        b("file_read", vec![FsRead]),
+        b("file_list", vec![FsRead]),
+        b("file_write", vec![FsWrite]),
+        b("file_create", vec![FsWrite]),
+        b("file_move", vec![FsWrite]),
+        b("file_delete", vec![FsWrite]),
+        b("search_files", vec![FsRead]),
+        b("grep_files", vec![FsRead]),
+        b("shell_exec", vec![Process]),
+        b("http_get", vec![Network]),
+        b("git_status", vec![GitRead]),
+        b("git_diff", vec![GitRead]),
+        b("git_log", vec![GitRead]),
+        b("git_stage", vec![GitWrite]),
+        b("git_commit", vec![GitWrite]),
+        // read_skill 按 agent definition skills 声明注册（非 default_safe_toolkit
+        // 静态注册），spec 常驻 default_tool_specs；来源标 Skill。
+        base(
+            "read_skill",
+            ToolSource::Skill,
+            SpecSource::Builtin,
+            vec![Skill],
+        ),
+    ]
+    .into_iter()
+    .map(|mut m| {
+        // 分级/审批/开关/超时的现状如实盘点（设计档 §3.1 派生关系）
+        match m.name.as_str() {
+            // 哨兵：规则正本 00_constraint_tool_intent_adjudication 已有
+            // out_of_sandbox enforce（核查报告活体实测 BLOCKED）；
+            // 同时是 candidate 审批模式（handler 内嵌 needs_approval 提案机制）
+            "file_create" | "file_move" | "file_delete" => {
+                m.adjudication_class = AdjudicationClass::Sentineled;
+                m.approval_policy = ApprovalPolicy::ManualDefault;
+            }
+            // git 写族：P2 裁决在通道；D1 建议上 enforce（PR-5 规则正本入库时
+            // 追加，升级 Sentineled），manifest 先如实标 Sensitive；
+            // 同为 candidate 审批模式
+            "git_stage" | "git_commit" => {
+                m.adjudication_class = AdjudicationClass::Sensitive;
+                m.approval_policy = ApprovalPolicy::ManualDefault;
+            }
+            // grep_files 内部 30s 硬超时（与全局 60s 双层，如实标注）
+            "grep_files" => m.timeout_class = TimeoutClass::Fast,
+            _ => {}
+        }
+        // agentTools.* 开关绑定（原 TOOL_SWITCH_KEYS 内置段，快照测试锁等价）
+        m.default_switch = match m.name.as_str() {
+            "file_create" => sw(SWITCH_FILE_CREATE, true),
+            "file_move" => sw(SWITCH_FILE_MOVE, false),
+            "file_delete" => sw(SWITCH_FILE_DELETE, false),
+            "grep_files" => sw(SWITCH_GREP, true),
+            "git_status" | "git_diff" | "git_log" => sw(SWITCH_GIT_READ, true),
+            "git_stage" | "git_commit" => sw(SWITCH_GIT_WRITE, false),
+            _ => None,
+        };
+        m
+    })
+    .collect()
+}
+
+/// 规则治理写族（agentTools.governanceWrite 单键管全量，21 个）
+const GOVERNANCE_WRITE_TOOLS: &[&str] = &[
+    "rule_create",
+    "rule_update",
+    "rule_submit",
+    "rule_activate",
+    "rule_block",
+    "rule_archive",
+    "rule_fork",
+    "rule_reload",
+    "rule_promote",
+    "ws_create",
+    "sandbox_start",
+    "sandbox_close",
+    "dataset_create",
+    "publish_submit",
+    "publish_list",
+    "publish_queue_get",
+    "publish_review",
+    "publish_rollback",
+    "bundle_export",
+    "bundle_import_dry_run",
+    "bundle_import",
+];
+
+/// P2 裁决在通道的规则工具（原 GOVERNANCE_ADJUDICATION_TOOLS 规则段 19 个；
+/// publish_list/publish_queue_get 有写权开关但不走 P2 裁决——读面语义）
+const RULE_P2_ADJUDICATED_TOOLS: &[&str] = &[
+    "rule_create",
+    "rule_update",
+    "rule_submit",
+    "rule_activate",
+    "rule_block",
+    "rule_archive",
+    "rule_fork",
+    "rule_reload",
+    "rule_promote",
+    "ws_create",
+    "sandbox_start",
+    "sandbox_close",
+    "dataset_create",
+    "publish_submit",
+    "publish_review",
+    "publish_rollback",
+    "bundle_export",
+    "bundle_import_dry_run",
+    "bundle_import",
+];
+
+/// 规则工具 manifest（46 条 = 透传 40 + 本地逻辑 6，名称集合与
+/// rule_tool_specs() 相等——测试锁）
+fn rule_manifests() -> Vec<ToolManifest> {
+    let mut manifests: Vec<ToolManifest> = crate::rule_tools::adapter::ALL_TRANSPARENT_BINDINGS
+        .iter()
+        .map(|binding| {
+            let name = binding.name;
+            let mut m = base(
+                name,
+                ToolSource::RuleTransparent,
+                SpecSource::Rule,
+                vec![CapDomain::Governance],
+            );
+            if RULE_P2_ADJUDICATED_TOOLS.contains(&name) {
+                m.adjudication_class = AdjudicationClass::Sensitive;
+            }
+            if GOVERNANCE_WRITE_TOOLS.contains(&name) {
+                m.default_switch = sw(SWITCH_GOVERNANCE_WRITE, true);
+            }
+            m
+        })
+        .collect();
+    // 本地逻辑 6（rule_tools::local_handlers::register 的注册名）
+    for name in [
+        "audit_verify",
+        "bundle_export",
+        "skill_pack_to_bundle",
+        "meta_summary",
+        "evolution_signals",
+        "rule_promote",
+    ] {
+        let mut m = base(
+            name,
+            ToolSource::RuleLocal,
+            SpecSource::Rule,
+            vec![CapDomain::Governance],
+        );
+        if RULE_P2_ADJUDICATED_TOOLS.contains(&name) {
+            m.adjudication_class = AdjudicationClass::Sensitive;
+        }
+        if GOVERNANCE_WRITE_TOOLS.contains(&name) {
+            m.default_switch = sw(SWITCH_GOVERNANCE_WRITE, true);
+        }
+        manifests.push(m);
+    }
+    manifests
+}
+
+/// delegate manifest（1 条）
+///
+/// 注：设计档终态 adjudication_class=Sensitive（PR-8 接 P2 通道），PR-1
+/// 行为等价期暂标 Standard（快照测试锁 24 集合不变）。
+fn delegate_manifest() -> ToolManifest {
+    base(
+        "delegate",
+        ToolSource::Delegate,
+        SpecSource::Delegate,
+        vec![CapDomain::Delegate],
+    )
+}
+
+/// 自省记忆工具 manifest（4 条，与 memory_tool_specs 名称集合相等——测试锁）
+fn memory_manifests() -> Vec<ToolManifest> {
+    use crate::agent::memory_tool::{
+        MEMORY_GET_TOOL, MEMORY_PROPOSE_TOOL, MEMORY_SEARCH_TOOL, NOTE_WRITE_TOOL,
+    };
+    vec![
+        base(
+            MEMORY_SEARCH_TOOL,
+            ToolSource::Memory,
+            SpecSource::Memory,
+            vec![CapDomain::Memory],
+        ),
+        base(
+            MEMORY_GET_TOOL,
+            ToolSource::Memory,
+            SpecSource::Memory,
+            vec![CapDomain::Memory],
+        ),
+        base(
+            MEMORY_PROPOSE_TOOL,
+            ToolSource::Memory,
+            SpecSource::Memory,
+            vec![CapDomain::Memory],
+        ),
+        base(
+            NOTE_WRITE_TOOL,
+            ToolSource::Memory,
+            SpecSource::Memory,
+            vec![CapDomain::Memory],
+        ),
+    ]
+}
+
+/// 全部静态 manifest（67 条；测试锁数量/唯一名/双侧集合相等）
+pub fn static_manifests() -> Vec<ToolManifest> {
+    let mut all = builtin_manifests();
+    all.extend(rule_manifests());
+    all.push(delegate_manifest());
+    all.extend(memory_manifests());
+    all
+}
+
+/// 按名查静态 manifest（注册点 fail-fast 查询入口）
+pub fn lookup_static(name: &str) -> Option<ToolManifest> {
+    static_manifests().into_iter().find(|m| m.name == name)
+}
+
+/// 动态源 manifest 构造（服务代理/MCP 注册期；硬规则 3）
+///
+/// - 服务代理：description/parameters 来自服务对账清单（注册期已校验非敏感）；
+/// - MCP：description/inputSchema 来自远端 tools/list 透传；
+/// - `description` 为空视为丢字段（fail-fast，调用方拒注册）。
+pub fn dynamic_manifest(
+    name: &str,
+    source: ToolSource,
+    description: String,
+    parameters: serde_json::Value,
+) -> Result<ToolManifest, String> {
+    if description.trim().is_empty() {
+        return Err(format!(
+            "tool '{name}' ({source:?}) rejected: empty description at registration \
+             (manifest hard rule 3: dynamic sources must produce a spec)"
+        ));
+    }
+    if !parameters.is_object() {
+        return Err(format!(
+            "tool '{name}' ({source:?}) rejected: parameters is not an object at \
+             registration (manifest hard rule 3)"
+        ));
+    }
+    let domains = match source {
+        ToolSource::ServiceProxy => vec![CapDomain::Governance],
+        ToolSource::Mcp => vec![CapDomain::Process],
+        _ => return Err(format!("unsupported dynamic tool source: {source:?}")),
+    };
+    Ok(ToolManifest {
+        name: name.to_string(),
+        source,
+        spec: SpecSource::Inline {
+            description,
+            parameters,
+        },
+        capability_domains: domains,
+        adjudication_class: AdjudicationClass::Standard,
+        approval_policy: ApprovalPolicy::AutoPolicy,
+        default_switch: None,
+        sandbox_scope: SandboxScope::HostSandboxed,
+        timeout_class: TimeoutClass::Default,
+    })
+}
+
+// =============================================================================
+// 测试（硬规则 2 静态层锁 + 派生等价快照）
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn all() -> Vec<ToolManifest> {
+        static_manifests()
+    }
+
+    #[test]
+    fn test_static_manifest_count_locked() {
+        // 内置 16 + 规则 46 + delegate 1 + memory 4 = 67
+        assert_eq!(builtin_manifests().len(), 16);
+        assert_eq!(rule_manifests().len(), 46);
+        assert_eq!(all().len(), 67);
+    }
+
+    #[test]
+    fn test_static_manifest_names_unique() {
+        let manifests = all();
+        let names: Vec<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
+        let set: HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(names.len(), set.len(), "manifest names must be unique");
+    }
+
+    #[test]
+    fn test_names_match_spec_sources_both_ways() {
+        // manifest 表 ↔ spec 源函数 双向名称集合相等（消灭 spec/handler 两张皮）
+        let manifest_names: HashSet<String> = all().iter().map(|m| m.name.clone()).collect();
+
+        let mut spec_names: HashSet<String> = crate::builtin_tools::default_tool_specs()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        spec_names.extend(
+            crate::rule_tools::rule_tool_specs()
+                .into_iter()
+                .map(|s| s.name),
+        );
+        spec_names.extend(
+            crate::agent::memory_tool::memory_tool_specs()
+                .into_iter()
+                .map(|s| s.name),
+        );
+        spec_names.insert(crate::builtin_tools::delegate_tool::delegate_tool_spec().name);
+
+        let missing_in_manifest: Vec<&String> = spec_names.difference(&manifest_names).collect();
+        assert!(
+            missing_in_manifest.is_empty(),
+            "spec sources not in manifest: {missing_in_manifest:?}"
+        );
+        let orphan_manifests: Vec<&String> = manifest_names.difference(&spec_names).collect();
+        assert!(
+            orphan_manifests.is_empty(),
+            "manifests without spec source: {orphan_manifests:?}"
+        );
+    }
+
+    #[test]
+    fn test_every_manifest_resolves_serializable_spec() {
+        for m in all() {
+            let (description, parameters) = m
+                .resolve_spec()
+                .unwrap_or_else(|| panic!("manifest '{}' spec source must resolve", m.name));
+            assert!(
+                !description.trim().is_empty(),
+                "{}: empty description",
+                m.name
+            );
+            assert!(
+                parameters.is_object(),
+                "{}: parameters must be an object",
+                m.name
+            );
+            assert!(
+                parameters.get("type").and_then(|v| v.as_str()) == Some("object"),
+                "{}: parameters.type must be object",
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_capability_domains_within_enum() {
+        for m in all() {
+            assert!(
+                !m.capability_domains.is_empty(),
+                "{}: empty domains",
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_manifest_serialization_roundtrip() {
+        for m in all() {
+            let json =
+                serde_json::to_string(&m).unwrap_or_else(|e| panic!("{} serialize: {e}", m.name));
+            let back: ToolManifest =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("{}: {e}", m.name));
+            assert_eq!(back, m, "{}: roundtrip mismatch", m.name);
+        }
+    }
+
+    // ---------- 派生等价快照（防迁移丢失） ----------
+
+    /// 原 GOVERNANCE_ADJUDICATION_TOOLS 24 表快照（runner.rs 已改派生，
+    /// 快照在此固化防漂移）
+    const GOVERNANCE_SNAPSHOT: &[&str] = &[
+        "file_create",
+        "file_move",
+        "file_delete",
+        "git_stage",
+        "git_commit",
+        "rule_create",
+        "rule_update",
+        "rule_submit",
+        "rule_activate",
+        "rule_block",
+        "rule_archive",
+        "rule_fork",
+        "rule_reload",
+        "rule_promote",
+        "ws_create",
+        "sandbox_start",
+        "sandbox_close",
+        "dataset_create",
+        "publish_submit",
+        "publish_review",
+        "publish_rollback",
+        "bundle_export",
+        "bundle_import_dry_run",
+        "bundle_import",
+    ];
+
+    #[test]
+    fn test_p2_adjudicated_set_matches_governance_snapshot() {
+        let manifests = all();
+        let derived: HashSet<&str> = manifests
+            .iter()
+            .filter(|m| m.is_p2_adjudicated())
+            .map(|m| m.name.as_str())
+            .collect();
+        let snapshot: HashSet<&str> = GOVERNANCE_SNAPSHOT.iter().copied().collect();
+        assert_eq!(
+            derived, snapshot,
+            "P2 派生集合必须与 GOVERNANCE_ADJUDICATION_TOOLS 快照完全一致"
+        );
+    }
+
+    #[test]
+    fn test_sentineled_is_exactly_file_break_family() {
+        let manifests = all();
+        let sentineled: Vec<&str> = manifests
+            .iter()
+            .filter(|m| m.adjudication_class == AdjudicationClass::Sentineled)
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(sentineled, vec!["file_create", "file_move", "file_delete"]);
+    }
+
+    /// 原 TOOL_SWITCH_KEYS 30 条快照（tool, key, default_on）
+    const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
+        ("file_create", "agentTools.fileCreate", true),
+        ("file_move", "agentTools.fileMove", false),
+        ("file_delete", "agentTools.fileDelete", false),
+        ("grep_files", "agentTools.grep", true),
+        ("git_status", "agentTools.gitRead", true),
+        ("git_diff", "agentTools.gitRead", true),
+        ("git_log", "agentTools.gitRead", true),
+        ("git_stage", "agentTools.gitWrite", false),
+        ("git_commit", "agentTools.gitWrite", false),
+        ("rule_create", "agentTools.governanceWrite", true),
+        ("rule_update", "agentTools.governanceWrite", true),
+        ("rule_submit", "agentTools.governanceWrite", true),
+        ("rule_activate", "agentTools.governanceWrite", true),
+        ("rule_block", "agentTools.governanceWrite", true),
+        ("rule_archive", "agentTools.governanceWrite", true),
+        ("rule_fork", "agentTools.governanceWrite", true),
+        ("rule_reload", "agentTools.governanceWrite", true),
+        ("rule_promote", "agentTools.governanceWrite", true),
+        ("ws_create", "agentTools.governanceWrite", true),
+        ("sandbox_start", "agentTools.governanceWrite", true),
+        ("sandbox_close", "agentTools.governanceWrite", true),
+        ("dataset_create", "agentTools.governanceWrite", true),
+        ("publish_submit", "agentTools.governanceWrite", true),
+        ("publish_list", "agentTools.governanceWrite", true),
+        ("publish_queue_get", "agentTools.governanceWrite", true),
+        ("publish_review", "agentTools.governanceWrite", true),
+        ("publish_rollback", "agentTools.governanceWrite", true),
+        ("bundle_export", "agentTools.governanceWrite", true),
+        ("bundle_import_dry_run", "agentTools.governanceWrite", true),
+        ("bundle_import", "agentTools.governanceWrite", true),
+    ];
+
+    #[test]
+    fn test_switch_bindings_match_snapshot() {
+        let manifests = all();
+        let derived: HashMap<&str, (&str, bool)> = manifests
+            .iter()
+            .filter_map(|m| {
+                m.default_switch
+                    .as_ref()
+                    .map(|s| (m.name.as_str(), (s.key.as_str(), s.default_on)))
+            })
+            .collect();
+        assert_eq!(
+            derived.len(),
+            SWITCH_SNAPSHOT.len(),
+            "开关绑定条数必须与 TOOL_SWITCH_KEYS 快照一致"
+        );
+        for (tool, key, default_on) in SWITCH_SNAPSHOT {
+            let got = derived
+                .get(tool)
+                .unwrap_or_else(|| panic!("switch binding missing for '{tool}'"));
+            assert_eq!(
+                got,
+                &(*key, *default_on),
+                "switch binding drift for '{tool}'"
+            );
+        }
+    }
+
+    // ---------- 动态源（硬规则 3） ----------
+
+    #[test]
+    fn test_dynamic_manifest_rejects_empty_description() {
+        let err = dynamic_manifest(
+            "svc_x",
+            ToolSource::ServiceProxy,
+            String::new(),
+            serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(err.contains("empty description"), "{err}");
+    }
+
+    #[test]
+    fn test_dynamic_manifest_rejects_non_object_parameters() {
+        let err = dynamic_manifest(
+            "svc_x",
+            ToolSource::ServiceProxy,
+            "desc".to_string(),
+            serde_json::json!("not-object"),
+        )
+        .unwrap_err();
+        assert!(err.contains("not an object"), "{err}");
+    }
+
+    #[test]
+    fn test_dynamic_manifest_inline_spec_resolves() {
+        let m = dynamic_manifest(
+            "svc_x",
+            ToolSource::ServiceProxy,
+            "a service tool".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        let (description, parameters) = m.resolve_spec().unwrap();
+        assert_eq!(description, "a service tool");
+        assert!(parameters.is_object());
+    }
+}

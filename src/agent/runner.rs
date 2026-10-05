@@ -40,7 +40,7 @@ use crate::agent::memory_event::MemoryEventStore;
 use crate::agent::output_validator::OutputValidator;
 use crate::agent::sediment;
 use crate::agent::stagnation::{
-    StagnationDetector, StagnationVerdict, STAGNATION_EXHAUSTED_MARK, STAGNATION_WARNING_MARK,
+    StagnationVerdict, STAGNATION_EXHAUSTED_MARK, STAGNATION_WARNING_MARK,
 };
 use crate::agent::summarizer::{ContextSummarizer, SummarizeOutcome};
 use crate::agent::translator::{LlmResponse, Message};
@@ -580,46 +580,27 @@ fn path_scope(
 
 // ----- P2 治理级工具事前意图裁决(裁决泛化) -----
 
-/// P2:治理级工具分级表(裁决面单一事实源)
+/// P2:治理级工具分级表(裁决面单一事实源——manifest 派生)
 ///
-/// 表内工具执行前先经裁决会话意图裁决([`resolve_tool_intent`] +
-/// [`tool_intent_signal`],规则层 00_constraint_tool_intent_adjudication
-/// enforce 事前拦截)。划定口径(设计档 §3.1,2026-09-28 用户批 D1=A 全量
-/// candidate 族):file 破坏族+git 写族+rule_* 治理写族+publish 写面+bundle 面;
-/// 纯读面(file_read/file_list/search_files/grep_files/git_status/git_diff/
+/// 一表化(工具面统一架构 §3.1):`adjudication_class != Standard` 即 P2
+/// 裁决通道——Sentineled(file_create/file_move/file_delete,正本 enforce
+/// 已在场)+ Sensitive(git_stage/git_commit + 规则治理写族 19)= 24 工具,
+/// 与原 GOVERNANCE_ADJUDICATION_TOOLS 手工表派生等价(快照测试锁:
+/// tool_manifest::tests::test_p2_adjudicated_set_matches_governance_snapshot;
+/// 行为防漂移守卫:下方 p2_adjudication_table_matches_design)。
+/// 划定口径(设计档 §3.1,2026-09-28 用户批 D1=A 全量 candidate 族):
+/// file 破坏族+git 写族+rule_* 治理写族+publish 写面+bundle 面;纯读面
+/// (file_read/file_list/search_files/grep_files/git_status/git_diff/
 /// git_log/publish_list/publish_queue_get)排除;shell_exec 高频不上裁决
-/// (P1 事后 shell_guard 已覆盖其治理语义);file_read/file_write 维持 M5-c
-/// 既有 R1 通道([`resolve_target_scope`])不变。
-pub const GOVERNANCE_ADJUDICATION_TOOLS: &[&str] = &[
-    "file_create",
-    "file_move",
-    "file_delete",
-    "git_stage",
-    "git_commit",
-    "rule_create",
-    "rule_update",
-    "rule_submit",
-    "rule_activate",
-    "rule_block",
-    "rule_archive",
-    "rule_fork",
-    "rule_reload",
-    "rule_promote",
-    "ws_create",
-    "sandbox_start",
-    "sandbox_close",
-    "dataset_create",
-    "publish_submit",
-    "publish_review",
-    "publish_rollback",
-    "bundle_export",
-    "bundle_import_dry_run",
-    "bundle_import",
-];
-
-/// P2:工具是否上裁决(分级表命中)
+/// (P1 事后 shell_guard 已覆盖其治理语义);file_read/file_write 维持
+/// M5-c 既有 R1 通道([`resolve_target_scope`])不变。
+///
+/// 历史:原手工 const 表(GOVERNANCE_ADJUDICATION_TOOLS 24 项)已由
+/// manifest 静态表取代——手工表与注册面两张皮的漂移从机制上消灭。
 pub fn is_governance_adjudication_tool(tool_name: &str) -> bool {
-    GOVERNANCE_ADJUDICATION_TOOLS.contains(&tool_name)
+    crate::agent::tool_manifest::lookup_static(tool_name)
+        .map(|m| m.is_p2_adjudicated())
+        .unwrap_or(false)
 }
 
 /// P2:解析治理级工具调用的意图规范字段(纯函数,宪法 §七「规范字段生产」)
@@ -1300,7 +1281,7 @@ impl AgentRunner {
         let delegate_tool = Arc::new(crate::builtin_tools::delegate_tool::DelegateTool::new(
             ctx.clone(),
         ));
-        self.tool_handler.register_tool("delegate", delegate_tool);
+        self.tool_handler.register_static("delegate", delegate_tool);
         self.delegate_context = Some(ctx);
         self
     }
@@ -1783,8 +1764,7 @@ impl AgentRunner {
             if let Some(mem) = self.memory.as_mut() {
                 let empty_manifest = Vec::new();
                 let manifest = self.config.skills.as_ref().unwrap_or(&empty_manifest);
-                let stats =
-                    crate::agent::skills_mirror::sync_skills_mirror(mem, manifest).await;
+                let stats = crate::agent::skills_mirror::sync_skills_mirror(mem, manifest).await;
                 if !stats.skipped {
                     info!(
                         written = stats.metadata_written,
@@ -2188,9 +2168,7 @@ impl AgentRunner {
             .collect();
         let missing: Vec<&String> = declared
             .iter()
-            .filter(|n| {
-                *n != crate::agent::memory_tool::NOTE_WRITE_TOOL && !exposed.contains(n)
-            })
+            .filter(|n| *n != crate::agent::memory_tool::NOTE_WRITE_TOOL && !exposed.contains(n))
             .collect();
         if !missing.is_empty() {
             return Err(AgentError::Internal(format!(
@@ -2203,8 +2181,7 @@ impl AgentRunner {
         let intro = intro.map(std::sync::Arc::new);
         // A2-2:写件协作件惰性构造(与读件 Intro 相互独立——不依赖 LexStore);
         // 会话锚注册期为空,两 run 路径 create_session 后 bind_propose_anchor
-        let mut proposer: Option<std::sync::Arc<crate::agent::memory_tool::MemoryProposer>> =
-            None;
+        let mut proposer: Option<std::sync::Arc<crate::agent::memory_tool::MemoryProposer>> = None;
         for name in &exposed {
             let exec: Option<std::sync::Arc<dyn ToolFunction>> = match name.as_str() {
                 crate::agent::memory_tool::MEMORY_SEARCH_TOOL => intro.as_ref().map(|i| {
@@ -2220,21 +2197,20 @@ impl AgentRunner {
                 crate::agent::memory_tool::MEMORY_PROPOSE_TOOL => {
                     let p = proposer.get_or_insert_with(|| {
                         let anchor = std::sync::Arc::new(std::sync::RwLock::new(None));
-                        let inner = std::sync::Arc::new(
-                            crate::agent::memory_tool::MemoryProposer::new(
+                        let inner =
+                            std::sync::Arc::new(crate::agent::memory_tool::MemoryProposer::new(
                                 self.sediment_config.namespace.clone(),
                                 self.evorule_client.clone(),
                                 std::sync::Arc::clone(&anchor),
-                            ),
-                        );
+                            ));
                         self.propose_anchor = Some(anchor);
                         inner
                     });
-                    Some(std::sync::Arc::new(
-                        crate::agent::memory_tool::MemoryProposeTool::new(std::sync::Arc::clone(
-                            p,
-                        )),
-                    ) as std::sync::Arc<dyn ToolFunction>)
+                    Some(
+                        std::sync::Arc::new(crate::agent::memory_tool::MemoryProposeTool::new(
+                            std::sync::Arc::clone(p),
+                        )) as std::sync::Arc<dyn ToolFunction>,
+                    )
                 }
                 // note_write 走会话期注册(register_session_scoped_memory_tools)
                 _ => None,
@@ -2243,7 +2219,7 @@ impl AgentRunner {
             let Some(exec) = exec else {
                 continue;
             };
-            self.tool_handler.register_tool(name, exec);
+            self.tool_handler.register_static(name, exec);
             info!(tool = %name, "memory introspection tool registered");
         }
         Ok(())
@@ -2276,18 +2252,21 @@ impl AgentRunner {
             }
             None => return,
         };
-        if !declared || self.tool_handler.has_tool(crate::agent::memory_tool::NOTE_WRITE_TOOL) {
+        if !declared
+            || self
+                .tool_handler
+                .has_tool(crate::agent::memory_tool::NOTE_WRITE_TOOL)
+        {
             return;
         }
-        let exec: std::sync::Arc<dyn ToolFunction> = std::sync::Arc::new(
-            crate::agent::memory_tool::MemoryNoteWriteTool::new(
+        let exec: std::sync::Arc<dyn ToolFunction> =
+            std::sync::Arc::new(crate::agent::memory_tool::MemoryNoteWriteTool::new(
                 namespace,
                 client,
                 session_id.to_string(),
-            ),
-        );
+            ));
         self.tool_handler
-            .register_tool(crate::agent::memory_tool::NOTE_WRITE_TOOL, exec);
+            .register_static(crate::agent::memory_tool::NOTE_WRITE_TOOL, exec);
         info!(
             tool = crate::agent::memory_tool::NOTE_WRITE_TOOL,
             "note_write tool registered (session-scoped)"

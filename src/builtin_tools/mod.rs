@@ -94,60 +94,60 @@ pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
         .unwrap_or_else(|_| workdir.to_path_buf());
 
     let mut handler = ToolHandler::new();
-    handler.register_tool(
+    handler.register_static(
         "file_read",
         Arc::new(file_read::FileReadTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "file_list",
         Arc::new(file_list::FileListTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "file_write",
         Arc::new(file_write::FileWriteTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "file_create",
         Arc::new(file_create::FileCreateTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "file_move",
         Arc::new(file_move::FileMoveTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "file_delete",
         Arc::new(file_delete::FileDeleteTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "search_files",
         Arc::new(search_files::SearchFilesTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "grep_files",
         Arc::new(grep_files::GrepFilesTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "shell_exec",
         Arc::new(shell_exec::ShellExecTool::new().with_workdir(&workdir_buf)),
     );
-    handler.register_tool("http_get", Arc::new(http_get::HttpGetTool::new()));
-    handler.register_tool(
+    handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
+    handler.register_static(
         "git_status",
         Arc::new(git_tools::GitStatusTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "git_diff",
         Arc::new(git_tools::GitDiffTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "git_log",
         Arc::new(git_tools::GitLogTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "git_stage",
         Arc::new(git_tools::GitStageTool::new(workdir_buf.clone())),
     );
-    handler.register_tool(
+    handler.register_static(
         "git_commit",
         Arc::new(git_tools::GitCommitTool::new(workdir_buf.clone())),
     );
@@ -620,7 +620,7 @@ fn http_get_description() -> String {
     )
 }
 
-/// 工具 spec(给 LLM 看,跟 ToolRegistry 里的 spec 兼容)
+/// 工具 spec(给 LLM 看;工具面统一架构后为 tool_manifest 的 spec 文本源)
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     /// TODO: doc

@@ -383,7 +383,7 @@ pub fn register_bindings(
             "{} path placeholders inconsistent with Path params",
             b.name
         );
-        h.register_tool(b.name, Arc::new(PassthroughTool::new(ws, ev, b)));
+        h.register_static(b.name, Arc::new(PassthroughTool::new(ws, ev, b)));
     }
 }
 
