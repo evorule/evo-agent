@@ -1,6 +1,8 @@
 {
   "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
   "kind": "rule_set",
+  "id": "com.evorule.constraint.tool_intent_adjudication",
+  "version": "1.0.0",
   "metadata": {
     "tier": "constraint",
     "title": "治理级工具事前意图裁决",

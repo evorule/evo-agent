@@ -1,6 +1,8 @@
 {
   "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
   "kind": "rule_set",
+  "id": "com.evorule.constraint.model_allowlist",
+  "version": "1.0.0",
   "metadata": {
     "tier": "constraint",
     "title": "会话模型准入白名单",
