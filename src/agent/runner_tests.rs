@@ -1444,7 +1444,7 @@ async fn test_g13_execute_parallel_skips_candidate_cache() {
 
 #[tokio::test]
 async fn test_g13_cache_hit_reruns_adjudication_for_p2_tools() {
-    // A1 关闭判据(02号档 §四 A1/PR-3 判据3):并行预执行=管道并行实例——
+    // A1 关闭判据(工具面统一架构基准档处置台账 A1/PR-3 判据3):并行预执行=管道并行实例——
     // P2 工具(git_stage)预执行同样过完整门禁(意图提交+裁决),产物入缓存;
     // 缓存命中调用①-⑤与⑧照常(第二次意图提交=裁决账面逐调用在场),
     // 仅⑦免重执行直接采信缓存值(缓存键=「已过门禁的证据」)。
@@ -1558,7 +1558,7 @@ async fn test_g13_cache_hit_reruns_adjudication_for_p2_tools() {
 }
 
 #[test]
-#[ignore = "B2 窗口期声明:主路径 focus 收窄为注册面严格子集随装配收口批次启用(02号档 §四 B2/PR-3 判据5);现状=注册面∪静态表,本测试当前必红"]
+#[ignore = "B2 窗口期声明:主路径 focus 收窄为注册面严格子集随装配收口批次启用(工具面统一架构基准档处置台账 B2/PR-3 判据5);现状=注册面∪静态表,本测试当前必红"]
 fn b2_main_path_focus_is_strict_subset_of_registration() {
     // 期望终态:空注册面 runner 的主路径聚焦快照为空(注册面严格子集)——
     // 静态表不再自动进入允许面,grep_files 等未注册工具②聚焦即拒。
