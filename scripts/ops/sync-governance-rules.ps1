@@ -1,4 +1,4 @@
-# 治理规则正本单向同步: evo-agent/rules/governance(版本化正本) -> evorule-server 运行时 rules_dir。
+﻿# 治理规则正本单向同步: evo-agent/rules/governance(版本化正本) -> evorule-server 运行时 rules_dir。
 # 部署纪律: repo->rules_dir 单向, data 目录手改=违规; 每份正本先 SHA256 对比后落盘复制,
 # 不一致=提示人工确认 diff, 不静默覆盖; -Check 只校验不写(巡检/CI 用, 发现漂移退出码 1)。
 # 正本缺失于 rules_dir 时: 若其 rule id 已以其他文件名(如 publish 晋升产物)在场则跳过

@@ -1,4 +1,4 @@
-# 注册 Windows 计划任务 EvoruleOpsWatchdog: 用户登录时 + 每 1 分钟重复巡检
+﻿# 注册 Windows 计划任务 EvoruleOpsWatchdog: 用户登录时 + 每 1 分钟重复巡检
 # 卸载: Unregister-ScheduledTask -TaskName EvoruleOpsWatchdog -Confirm:$false
 $OpsDir = $PSScriptRoot
 $script = Join-Path $OpsDir 'watchdog-check.ps1'
