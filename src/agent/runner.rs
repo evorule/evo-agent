@@ -3158,6 +3158,13 @@ impl AgentRunner {
             .map(|tc| async move {
                 let name = tc.name.clone();
                 let args = tc.arguments.clone();
+                // 治理级(P2)工具跳过预执行:预执行直调 execute_by_name 零门禁,
+                // P2 工具借并行窗口免检(意图裁决/审批/落账全跳)。占位返回且
+                // 不入缓存,留待主路径(execute_tool_stage)走完整管道——以性能
+                // 换语义安全;管道并行实例落地后收编。
+                if is_governance_adjudication_tool(&name) {
+                    return (name, args, Value::Null);
+                }
                 let result = self.execute_single_tool(tc).await;
                 (name, args, result)
             })
@@ -3168,6 +3175,10 @@ impl AgentRunner {
 
         // 缓存 active 工具结果(非 proposal)
         for (name, args, result) in &results {
+            // 治理级(P2)工具占位结果不入缓存(主路径管道执行后经 call_service 回流)
+            if is_governance_adjudication_tool(name) {
+                continue;
+            }
             let result_str = result.to_string();
             // 检查是否是 proposal(candidate 工具)
             let is_proposal = parse_approval_request(session_id, name, args, &result_str).is_some();
