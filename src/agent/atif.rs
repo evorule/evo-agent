@@ -697,6 +697,59 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                 });
                 next_step_id += 1;
             }
+            JournalEvent::SummaryFidelityScan {
+                session,
+                trimmed_n,
+                anchors_n,
+                hit_n,
+                ratio,
+                summary_empty,
+            } => {
+                // 摘要保真对照——context_management 系统步(规格修正批交付物 B)。
+                // 事件 payload 全量随 extra 导出(低频事件不做摘录)
+                if let Some(a) = acc.take() {
+                    finalize_agent_step(
+                        a,
+                        &audit,
+                        sources.transcript,
+                        &assistant_msgs,
+                        &mut steps,
+                        &mut next_step_id,
+                        &mut total_prompt,
+                        &mut total_completion,
+                    );
+                }
+                steps.push(AtifStep {
+                    step_id: next_step_id,
+                    timestamp: Some(iso8601_from_unix_ms(line.ts)),
+                    source: "system".into(),
+                    model_name: None,
+                    message: "Summary fidelity scan".into(),
+                    tool_calls: None,
+                    observation: Some(AtifObservation {
+                        results: vec![AtifObservationResult {
+                            source_call_id: None,
+                            content: Some(format!(
+                                "session={session} trimmed={trimmed_n} anchors={anchors_n} hit={hit_n} ratio={ratio}"
+                            )),
+                        }],
+                    }),
+                    metrics: None,
+                    extra: Some(json!({
+                        "context_management": {
+                            "type": "summary_fidelity_scan",
+                            "session": session,
+                            "trimmed_n": trimmed_n,
+                            "anchors_n": anchors_n,
+                            "hit_n": hit_n,
+                            "ratio": ratio,
+                            "summary_empty": summary_empty
+                        }
+                    })),
+                    llm_call_count: None,
+                });
+                next_step_id += 1;
+            }
             JournalEvent::TurnEnded { .. } => {
                 // 轮界收步(映射表 §四.3 边界切割)
                 if let Some(a) = acc.take() {

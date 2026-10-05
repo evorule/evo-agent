@@ -189,6 +189,23 @@ pub enum JournalEvent {
         /// 本轮时长(ms)
         duration_ms: u64,
     },
+    /// 摘要保真对照（规格修正批交付物 B）：G10 摘要替换后，被裁剪消息
+    /// 确定性锚点 vs 摘要文本的命中对照落账（I2ScanReport 同款形态；
+    /// ratio 为四舍五入 4 位小数；summary_empty=空摘要跳过判定）
+    SummaryFidelityScan {
+        /// 会话 ID
+        session: String,
+        /// 被裁剪消息数
+        trimmed_n: usize,
+        /// 锚点数
+        anchors_n: usize,
+        /// 命中锚点数
+        hit_n: usize,
+        /// 保真比（0.0-1.0，4 位小数）
+        ratio: f64,
+        /// 摘要为空（跳过判定；事件照落）
+        summary_empty: bool,
+    },
     /// 崩溃标记(P2 resume 检测到尾部无 turn_ended 后补写,运行时不写)
     SessionCrashed {
         /// 崩溃原因
@@ -604,6 +621,28 @@ impl JournalWriter {
     }
 
     /// 治理裁决输出(judgement_id 由本事件 seq 确定性合成)
+    /// 摘要保真对照落账(规格修正批交付物 B;每次 G10 摘要替换自动对照,
+    /// I5 从"原则上可对照"升级为"每次压缩自动对照")。best-effort 调用方
+    /// 决定失败处置(留痕不阻塞)。
+    pub fn summary_fidelity_scan(
+        &self,
+        session: &str,
+        trimmed_n: usize,
+        anchors_n: usize,
+        hit_n: usize,
+        ratio: f64,
+        summary_empty: bool,
+    ) -> Result<u64, JournalError> {
+        self.push_with(|_| JournalEvent::SummaryFidelityScan {
+            session: session.to_string(),
+            trimmed_n,
+            anchors_n,
+            hit_n,
+            ratio,
+            summary_empty,
+        })
+    }
+
     pub fn policy_judged(&self, verdict: &str, evidence: &str) -> Result<u64, JournalError> {
         let evidence = evidence.to_string();
         self.push_with(|seq| JournalEvent::PolicyJudged {
@@ -698,6 +737,42 @@ fn truncate_text(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_summary_fidelity_scan_event_roundtrip() {
+        // 规格修正批交付物 B:事件落账+读回(验收例 2 账面半边)
+        let dir = std::env::temp_dir().join(format!("jf-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-scan").unwrap();
+            w.summary_fidelity_scan("s-scan", 4, 6, 1, 0.1667, false).unwrap();
+            w.summary_fidelity_scan("s-scan", 2, 0, 0, 0.0, true).unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-scan")).unwrap();
+        let mut seen = Vec::new();
+        for l in lines {
+            if let JournalEvent::SummaryFidelityScan {
+                session,
+                trimmed_n,
+                anchors_n,
+                hit_n,
+                ratio,
+                summary_empty,
+            } = l.event
+            {
+                seen.push((session, trimmed_n, anchors_n, hit_n, ratio, summary_empty));
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("s-scan".to_string(), 4, 6, 1, 0.1667, false),
+                ("s-scan".to_string(), 2, 0, 0, 0.0, true),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use JournalEvent as JE;
 
