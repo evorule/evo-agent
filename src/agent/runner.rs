@@ -1774,6 +1774,8 @@ impl AgentRunner {
         }
         // A2-2:memory_propose 会话锚绑定(注册期空锚,运行期才可绑定)
         self.bind_propose_anchor(&session_id);
+        // 双通道笔记批:note_write 会话期注册(payload 写,session_id 在手)
+        self.register_session_scoped_memory_tools(&session_id);
         // 跨源批 D:技能双层注册同步(声明面真账镜像+正文本地索引;
         // Recipe sources.skills_index 门控,缺省关=no-op;best-effort
         // 不阻塞会话)
@@ -2137,12 +2139,14 @@ impl AgentRunner {
         Ok(AgentResult::error(closed_error, step_count, duration))
     }
 
-    /// 阶段 3(F-611)+A2-2:自省记忆工具注册——读两件(search/get)+写一件(propose)。
+    /// 阶段 3(F-611)+A2-2+双通道笔记:记忆工具注册——读两件(search/get)
+    /// 装配期注册;写两件(propose/note_write)中 propose 装配期注册、
+    /// note_write 会话期注册(payload 通道,session_id 在手)。
     ///
     /// 暴露面=策略(按读写拆分,A2-2 §3.3):`MemoryRecipe.tools.expose` 白名单
     /// 声明;读件另要求 LexStore 在位(检索缓存是读面数据前提),写件
-    /// (memory_propose)不检索、声明即可。协作件全部与 MemoryManager 共享
-    /// (usage 计数/审计器同源,不产生第二策略面)。
+    /// (memory_propose/note_write)不检索、声明即可。协作件全部与
+    /// MemoryManager 共享(usage 计数/审计器同源,不产生第二策略面)。
     /// `tools` 配置声明了自省工具而暴露条件不满足=配置矛盾,早失败(可控);
     /// 未声明而条件满足=照常注册(注册即随 openai_tools_payload 下发,
     /// 与既有工具语义一致)。
@@ -2151,20 +2155,46 @@ impl AgentRunner {
             .config
             .tool_names
             .iter()
-            .filter(|n| crate::agent::memory_tool::is_introspection_tool(n))
+            .filter(|n| crate::agent::memory_tool::is_registered_memory_tool(n))
             .cloned()
             .collect();
-        let (exposed, intro) = match self.memory.as_ref() {
+        let (exposed_all, intro) = match self.memory.as_ref() {
             Some(mem) => (mem.exposed_introspection_tools(), mem.memory_introspector()),
             None => (Vec::new(), None),
         };
-        let missing: Vec<&String> = declared.iter().filter(|n| !exposed.contains(n)).collect();
+        // note_write 不在装配期注册(会话期,payload 通道);只校验声明一致性
+        let note_declared = declared
+            .iter()
+            .any(|n| n == crate::agent::memory_tool::NOTE_WRITE_TOOL);
+        let note_exposed = exposed_all
+            .iter()
+            .any(|n| n == crate::agent::memory_tool::NOTE_WRITE_TOOL);
+        if note_declared && self.memory.is_none() {
+            return Err(AgentError::Internal(
+                "agent config lists note_write but memory is disabled (requires memory.type=persistent)"
+                    .to_string(),
+            ));
+        }
+        if note_declared && !note_exposed {
+            return Err(AgentError::Internal(
+                "agent config lists note_write but memory.recipe tools.expose does not declare it (policy carrier is the recipe)"
+                    .to_string(),
+            ));
+        }
+        let exposed: Vec<String> = exposed_all
+            .iter()
+            .filter(|n| crate::agent::memory_tool::is_introspection_tool(n))
+            .cloned()
+            .collect();
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|n| {
+                *n != crate::agent::memory_tool::NOTE_WRITE_TOOL && !exposed.contains(n)
+            })
+            .collect();
         if !missing.is_empty() {
             return Err(AgentError::Internal(format!(
-                "agent config lists memory introspection tool(s) {declared:?} but exposure \
-                 conditions are not met (requires memory.type=persistent and memory.recipe \
-                 with tools.expose declaring them; read tools additionally require \
-                 memory.lex_store configured); unmet: {missing:?}"
+                "agent config lists memory introspection tool(s) {declared:?} but exposure conditions are not met (requires memory.type=persistent and memory.recipe with tools.expose declaring them; read tools additionally require memory.lex_store configured); unmet: {missing:?}"
             )));
         }
         if exposed.is_empty() {
@@ -2173,7 +2203,8 @@ impl AgentRunner {
         let intro = intro.map(std::sync::Arc::new);
         // A2-2:写件协作件惰性构造(与读件 Intro 相互独立——不依赖 LexStore);
         // 会话锚注册期为空,两 run 路径 create_session 后 bind_propose_anchor
-        let mut proposer: Option<std::sync::Arc<crate::agent::memory_tool::MemoryProposer>> = None;
+        let mut proposer: Option<std::sync::Arc<crate::agent::memory_tool::MemoryProposer>> =
+            None;
         for name in &exposed {
             let exec: Option<std::sync::Arc<dyn ToolFunction>> = match name.as_str() {
                 crate::agent::memory_tool::MEMORY_SEARCH_TOOL => intro.as_ref().map(|i| {
@@ -2189,21 +2220,23 @@ impl AgentRunner {
                 crate::agent::memory_tool::MEMORY_PROPOSE_TOOL => {
                     let p = proposer.get_or_insert_with(|| {
                         let anchor = std::sync::Arc::new(std::sync::RwLock::new(None));
-                        let inner =
-                            std::sync::Arc::new(crate::agent::memory_tool::MemoryProposer::new(
+                        let inner = std::sync::Arc::new(
+                            crate::agent::memory_tool::MemoryProposer::new(
                                 self.sediment_config.namespace.clone(),
                                 self.evorule_client.clone(),
                                 std::sync::Arc::clone(&anchor),
-                            ));
+                            ),
+                        );
                         self.propose_anchor = Some(anchor);
                         inner
                     });
-                    Some(
-                        std::sync::Arc::new(crate::agent::memory_tool::MemoryProposeTool::new(
-                            std::sync::Arc::clone(p),
-                        )) as std::sync::Arc<dyn ToolFunction>,
-                    )
+                    Some(std::sync::Arc::new(
+                        crate::agent::memory_tool::MemoryProposeTool::new(std::sync::Arc::clone(
+                            p,
+                        )),
+                    ) as std::sync::Arc<dyn ToolFunction>)
                 }
+                // note_write 走会话期注册(register_session_scoped_memory_tools)
                 _ => None,
             };
             // 暴露拆分后读件无 Intro 不可能(exposed 已按 lex_store 过滤);防御 continue
@@ -2223,6 +2256,42 @@ impl AgentRunner {
             *anchor.write().unwrap_or_else(|p| p.into_inner()) = Some(session_id.to_string());
             info!(%session_id, "memory_propose session anchor bound");
         }
+    }
+
+    /// 双通道笔记批:会话期注册 note_write(payload 通道写,session_id 在手
+    /// 后才可注册;G15 续跑幂等——已注册即跳过)。门控=Recipe.tools.expose
+    /// 声明;best-effort 条件不满足=静默跳过(装配期已做一致性校验)。
+    fn register_session_scoped_memory_tools(&mut self, session_id: &str) {
+        let (declared, namespace, client) = match self.memory.as_ref() {
+            Some(mem) => {
+                let exposed = mem.exposed_introspection_tools();
+                let declared = exposed
+                    .iter()
+                    .any(|n| n == crate::agent::memory_tool::NOTE_WRITE_TOOL);
+                (
+                    declared,
+                    mem.namespace().to_string(),
+                    mem.evorule_client.clone(),
+                )
+            }
+            None => return,
+        };
+        if !declared || self.tool_handler.has_tool(crate::agent::memory_tool::NOTE_WRITE_TOOL) {
+            return;
+        }
+        let exec: std::sync::Arc<dyn ToolFunction> = std::sync::Arc::new(
+            crate::agent::memory_tool::MemoryNoteWriteTool::new(
+                namespace,
+                client,
+                session_id.to_string(),
+            ),
+        );
+        self.tool_handler
+            .register_tool(crate::agent::memory_tool::NOTE_WRITE_TOOL, exec);
+        info!(
+            tool = crate::agent::memory_tool::NOTE_WRITE_TOOL,
+            "note_write tool registered (session-scoped)"
+        );
     }
 
     /// 组装随 LLM 请求下发的工具 OpenAI function schema。
@@ -3787,6 +3856,8 @@ impl AgentRunner {
             // A2-2:memory_propose 会话锚绑定(与 run() 对齐;G15 continuation
             // 复用会话分支同样绑定,保证锚与 session 事实一致)
             runner.bind_propose_anchor(&session_id);
+            // 双通道笔记批:note_write 会话期注册(与 run() 同钩位)
+            runner.register_session_scoped_memory_tools(&session_id);
             // 跨源批 D:技能双层注册同步(与 run() 同钩位;Recipe
             // sources.skills_index 门控缺省关=no-op;best-effort 不阻塞会话)
             if runner.config.skills.is_some() {
