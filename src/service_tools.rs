@@ -119,10 +119,27 @@ pub async fn register_service_tools(
             continue;
         }
         let description = info["description"].as_str().unwrap_or("").to_string();
+        let parameters_decl = info
+            .get("parameters")
+            .filter(|p| !p.is_null())
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
+        // 一表硬规则 3:动态源注册期产出 Inline 契约——丢字段(空描述/参数
+        // 非 object)即注册失败(设计档 §3.1,消灭服务代理空 schema 降级)。
+        // 校验先行，失败时不残留描述/参数缓存。
+        let manifest = crate::agent::tool_manifest::dynamic_manifest(
+            want,
+            crate::agent::tool_manifest::ToolSource::ServiceProxy,
+            description,
+            parameters_decl,
+        )?;
         descriptions()
             .write()
             .map(|mut m| {
-                m.insert(want.clone(), description);
+                m.insert(
+                    want.clone(),
+                    info["description"].as_str().unwrap_or("").to_string(),
+                );
             })
             .map_err(|_| "服务描述注册表写入失败".to_string())?;
         if let Some(params) = info.get("parameters").filter(|p| !p.is_null()) {
@@ -133,8 +150,8 @@ pub async fn register_service_tools(
                 })
                 .map_err(|_| "服务参数契约注册表写入失败".to_string())?;
         }
-        handler.register_tool(
-            want,
+        handler.register(
+            manifest,
             Arc::new(ServiceProxyTool {
                 ev: ev.clone(),
                 service_name: want.clone(),
@@ -308,7 +325,7 @@ mod tests {
             .unwrap();
         let (base, _captured) = spawn_http_fixture(vec![(
             200,
-            r#"[{"name":"params_svc","source":"plugin","sensitive":false,"description":"带参服务","parameters":{"type":"object","properties":{"key":{"type":"string","description":"配置键"}},"required":["key"]}},{"name":"nocontract_svc","source":"registry","sensitive":false}]"#,
+            r#"[{"name":"params_svc","source":"plugin","sensitive":false,"description":"带参服务","parameters":{"type":"object","properties":{"key":{"type":"string","description":"配置键"}},"required":["key"]}},{"name":"nocontract_svc","source":"registry","sensitive":false,"description":"无参数契约的服务"}]"#,
         )]);
         let mut handler = ToolHandler::new();
         let ev = EvoruleApiClient::new(&base);
@@ -344,7 +361,7 @@ mod tests {
         let (base, _captured) = spawn_http_fixture(vec![
             (
                 200,
-                r#"[{"name":"err_svc","source":"native","sensitive":false}]"#,
+                r#"[{"name":"err_svc","source":"native","sensitive":false,"description":"执行即报错的服务"}]"#,
             ),
             (500, r#"{"error":"boom"}"#),
         ]);
@@ -367,5 +384,30 @@ mod tests {
             err.contains("service err_svc invoke failed"),
             "应带服务名上下文: {err}"
         );
+    }
+
+    #[test]
+    fn registration_rejects_empty_description() {
+        // 一表硬规则 3：服务对账清单缺 description = 注册失败（fail-fast，
+        // 消灭空 schema 降级——行为变更点，原实现静默注册空描述工具）。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (base, _captured) = spawn_http_fixture(vec![(
+            200,
+            r#"[{"name":"nodesc_svc","source":"native","sensitive":false}]"#,
+        )]);
+        let mut handler = ToolHandler::new();
+        let ev = EvoruleApiClient::new(&base);
+        let err = rt
+            .block_on(register_service_tools(
+                &mut handler,
+                &ev,
+                &["nodesc_svc".to_string()],
+            ))
+            .unwrap_err();
+        assert!(err.contains("empty description"), "应报空描述拒绝: {err}");
+        assert!(!handler.has_tool("nodesc_svc"), "被拒服务不应注册为工具");
     }
 }

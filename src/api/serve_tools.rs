@@ -75,11 +75,10 @@ pub fn build_union_toolkit(
 ) -> ToolHandler {
     let mut handler = default_safe_toolkit(workdir);
     let rule_handler = full_rule_toolkit(ws, ev);
-    // 合并规则工具到 handler(按白名单逐个取出,保证只注册已知工具)
+    // 合并规则工具到 handler(按白名单逐个取出,保证只注册已知工具;
+    // manifest+执行器成对迁移,治理元数据不丢)
     for name in RULE_TOOL_NAMES {
-        if let Some(tool) = rule_handler.get_tool(name) {
-            handler.register_tool(name, tool);
-        }
+        handler.register_entry_from(&rule_handler, name);
     }
     handler
 }
@@ -248,66 +247,18 @@ pub fn runtime_identity(workdir: &Path) -> RuntimeIdentity {
 pub fn build_filtered_toolkit(union: &ToolHandler, whitelist: &[String]) -> ToolHandler {
     let mut filtered = ToolHandler::new();
     for name in whitelist {
-        if let Some(tool) = union.get_tool(name) {
-            filtered.register_tool(name, tool);
-        }
+        filtered.register_entry_from(union, name);
     }
     filtered
 }
 
-/// 治理写权开关键(单一事实源:TOOL_SWITCH_KEYS 表项与 settings schema 登记共用)
-pub const GOVERNANCE_WRITE_KEY: &str = "agentTools.governanceWrite";
-
-/// 文件/git 增删改与搜索工具的暴露开关(agentTools.*,布尔设置键;开=在 agent 工具面)
-///
-/// 开关关 = 过滤 toolkit 不注册该执行器 = LLM 工具契约同步消失
-/// (openai_tools_payload 与注册执行器求交,零双声明)。键缺失/值非法时
-/// 按 schema 默认语义回落(元组第三位):fileCreate/grep/gitRead 开,
-/// fileMove/fileDelete/gitWrite 关。
-const TOOL_SWITCH_KEYS: &[(&str, &str, bool)] = &[
-    ("file_create", "agentTools.fileCreate", true),
-    ("file_move", "agentTools.fileMove", false),
-    ("file_delete", "agentTools.fileDelete", false),
-    ("grep_files", "agentTools.grep", true),
-    // git 两级注册:读面 active 标配开,写面 candidate 标配关
-    ("git_status", "agentTools.gitRead", true),
-    ("git_diff", "agentTools.gitRead", true),
-    ("git_log", "agentTools.gitRead", true),
-    ("git_stage", "agentTools.gitWrite", false),
-    ("git_commit", "agentTools.gitWrite", false),
-    // 治理写权开关(单键,默认 true = 45 工具全量,LLM 自运行的前提;市场主口径:
-    // 保密企业跑内网自有模型数据不出内网,LLM 功能照样全开;中小企业为最大
-    // 用户群,对数据隐私相对不敏感)。敏感领域部署(政府/军工/金融/医疗等)
-    // 设 false 一键转只读:21 个治理写工具的执行器与 LLM 契约同步下线
-    // (连工具 spec 都不出现,非"调用被拒"),24 只读消费面保留——LLM 仍可
-    // 辅助人起草(translate/validate 纯计算),提交/晋升/发布权回到人。
-    ("rule_create", GOVERNANCE_WRITE_KEY, true),
-    ("rule_update", GOVERNANCE_WRITE_KEY, true),
-    ("rule_submit", GOVERNANCE_WRITE_KEY, true),
-    ("rule_activate", GOVERNANCE_WRITE_KEY, true),
-    ("rule_block", GOVERNANCE_WRITE_KEY, true),
-    ("rule_archive", GOVERNANCE_WRITE_KEY, true),
-    ("rule_fork", GOVERNANCE_WRITE_KEY, true),
-    ("rule_reload", GOVERNANCE_WRITE_KEY, true),
-    ("rule_promote", GOVERNANCE_WRITE_KEY, true),
-    ("ws_create", GOVERNANCE_WRITE_KEY, true),
-    ("sandbox_start", GOVERNANCE_WRITE_KEY, true),
-    ("sandbox_close", GOVERNANCE_WRITE_KEY, true),
-    ("dataset_create", GOVERNANCE_WRITE_KEY, true),
-    ("publish_submit", GOVERNANCE_WRITE_KEY, true),
-    ("publish_list", GOVERNANCE_WRITE_KEY, true),
-    ("publish_queue_get", GOVERNANCE_WRITE_KEY, true),
-    ("publish_review", GOVERNANCE_WRITE_KEY, true),
-    ("publish_rollback", GOVERNANCE_WRITE_KEY, true),
-    ("bundle_export", GOVERNANCE_WRITE_KEY, true),
-    ("bundle_import_dry_run", GOVERNANCE_WRITE_KEY, true),
-    ("bundle_import", GOVERNANCE_WRITE_KEY, true),
-];
+/// 治理写权开关键(单一事实源:manifest 开关绑定与 settings schema 登记共用)
+pub use crate::agent::tool_manifest::AGENT_TOOLS_GOVERNANCE_WRITE as GOVERNANCE_WRITE_KEY;
 
 /// 治理写权开关当前是否开启(键缺失/值非法回落默认 true)
 ///
 /// 供 serve 启动观测横幅等启动期只读场景使用;请求路径的开关判定走
-/// TOOL_SWITCH_KEYS 表(同一键同一默认值,无第二语义)。
+/// manifest 开关绑定(同一键同一默认值,无第二语义)。
 pub fn governance_write_enabled(settings: &serde_json::Map<String, Value>) -> bool {
     settings
         .get(GOVERNANCE_WRITE_KEY)
@@ -320,17 +271,20 @@ pub fn governance_write_enabled(settings: &serde_json::Map<String, Value>) -> bo
 /// `settings` 为合并后的工作台设置(Default→User→Workspace,含 schema 默认值;
 /// 见 `WorkbenchSettingsStore::merged`)。开关键 `scope=application`,
 /// 工作区层不可覆盖(防项目级配置私自扩权 agent 工具面)。
+///
+/// 开关判定从 manifest 开关绑定派生(一表:TOOL_SWITCH_KEYS 手工表已废,
+/// 快照测试锁派生等价):绑定缺失 = 恒可用(原 None=>true 语义保持)。
 pub fn build_filtered_toolkit_with_switches(
     union: &ToolHandler,
     whitelist: &[String],
     settings: &serde_json::Map<String, Value>,
 ) -> ToolHandler {
     let switch_on = |tool: &str| -> bool {
-        match TOOL_SWITCH_KEYS.iter().find(|(t, _, _)| *t == tool) {
-            Some((_, key, default)) => settings
-                .get(*key)
+        match union.manifest(tool).and_then(|m| m.default_switch) {
+            Some(binding) => settings
+                .get(&binding.key)
                 .and_then(|v| v.as_bool())
-                .unwrap_or(*default),
+                .unwrap_or(binding.default_on),
             None => true,
         }
     };
@@ -339,9 +293,7 @@ pub fn build_filtered_toolkit_with_switches(
         if !switch_on(name) {
             continue;
         }
-        if let Some(tool) = union.get_tool(name) {
-            filtered.register_tool(name, tool);
-        }
+        filtered.register_entry_from(union, name);
     }
     filtered
 }
@@ -359,7 +311,7 @@ pub fn with_shell_exec_backend(filtered: &mut ToolHandler, container: &str) {
             container: container.to_string(),
         })
         .with_timeout(600);
-    filtered.register_tool("shell_exec", std::sync::Arc::new(tool));
+    filtered.register_static("shell_exec", std::sync::Arc::new(tool));
 }
 
 /// 把 `def.tools` 收紧为 filtered toolkit 实际注册的工具面(白名单 ∩ 开关开)。
@@ -452,7 +404,7 @@ pub fn apply_capability_boundary(
     };
     let root = b.sandbox_root.clone();
     if b.tools.iter().any(|t| t == "file_read") {
-        handler.register_tool(
+        handler.register_static(
             "file_read",
             std::sync::Arc::new(crate::builtin_tools::file_read::FileReadTool::new(
                 root.clone(),
@@ -460,7 +412,7 @@ pub fn apply_capability_boundary(
         );
     }
     if !b.is_read_only() && b.tools.iter().any(|t| t == "file_write") {
-        handler.register_tool(
+        handler.register_static(
             "file_write",
             std::sync::Arc::new(
                 crate::builtin_tools::file_write::FileWriteTool::new(root).with_writable_dir("."),
@@ -527,7 +479,7 @@ pub fn wire_skills(
     if resolved.is_empty() {
         return Ok(None);
     }
-    handler.register_tool(
+    handler.register_static(
         "read_skill",
         std::sync::Arc::new(crate::builtin_tools::skill_read::SkillReadTool::new(
             &resolved,
@@ -1398,7 +1350,7 @@ service_tools = ["config_persist", "rule_sandbox"]
 
         // 对照:缺省实例(writable_dir=workspace)根下直写被拒
         let mut default_handler = ToolHandler::new();
-        default_handler.register_tool(
+        default_handler.register_static(
             "file_write",
             std::sync::Arc::new(crate::builtin_tools::file_write::FileWriteTool::new(
                 root.clone(),
@@ -1417,7 +1369,7 @@ service_tools = ["config_persist", "rule_sandbox"]
 
         // read_write 声明 apply 后:根下直写成功
         let mut handler = ToolHandler::new();
-        handler.register_tool(
+        handler.register_static(
             "file_write",
             std::sync::Arc::new(crate::builtin_tools::file_write::FileWriteTool::new(
                 root.clone(),

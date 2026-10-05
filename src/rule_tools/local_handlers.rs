@@ -653,18 +653,18 @@ impl ToolFunction for RulePromoteTool {
 
 /// 注册全部本地逻辑工具（6 个）
 pub fn register(h: &mut ToolHandler, ws: &WorkspaceApiClient, ev: &EvoruleApiClient) {
-    h.register_tool("audit_verify", Arc::new(AuditVerifyTool::new(ev.clone())));
-    h.register_tool("bundle_export", Arc::new(BundleExportTool::new(ws.clone())));
-    h.register_tool(
+    h.register_static("audit_verify", Arc::new(AuditVerifyTool::new(ev.clone())));
+    h.register_static("bundle_export", Arc::new(BundleExportTool::new(ws.clone())));
+    h.register_static(
         "skill_pack_to_bundle",
         Arc::new(SkillPackToBundleTool::new()),
     );
-    h.register_tool("meta_summary", Arc::new(MetaSummaryTool::new(ev.clone())));
-    h.register_tool(
+    h.register_static("meta_summary", Arc::new(MetaSummaryTool::new(ev.clone())));
+    h.register_static(
         "evolution_signals",
         Arc::new(EvolutionSignalsTool::new(ev.clone())),
     );
-    h.register_tool("rule_promote", Arc::new(RulePromoteTool::new(ws.clone())));
+    h.register_static("rule_promote", Arc::new(RulePromoteTool::new(ws.clone())));
 }
 
 /// 全部本地逻辑工具 spec（5 个）

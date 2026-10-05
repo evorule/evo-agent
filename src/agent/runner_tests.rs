@@ -202,7 +202,8 @@ async fn test_openai_tools_payload_dynamic_service_schema_carries_parameters() {
                 "required": ["key"]
             }
         },
-        { "name": "noparam_svc", "source": "registry", "sensitive": false }
+        { "name": "noparam_svc", "source": "registry", "sensitive": false,
+          "description": "无参数契约的服务" }
     ])
     .to_string();
     server
@@ -691,7 +692,16 @@ fn make_handler_with(tool_names: &[&str]) -> ToolHandler {
 
     let mut h = ToolHandler::new();
     for name in tool_names {
-        h.register_tool(name, Arc::new(EchoTool));
+        // 测试假工具不在静态 manifest 表——走动态源注册通道(Inline 契约,
+        // 同服务代理/MCP 路径;一表硬规则 1 禁止无契约注册)
+        let manifest = crate::agent::tool_manifest::dynamic_manifest(
+            name,
+            crate::agent::tool_manifest::ToolSource::Mcp,
+            format!("test echo tool {name}"),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .expect("test manifest");
+        h.register(manifest, Arc::new(EchoTool));
     }
     h
 }
@@ -1263,6 +1273,9 @@ impl ToolFunction for ProposalTool {
 }
 
 /// 构造一个带并行配置 + 自定义工具的 runner
+///
+/// 测试假工具不在静态 manifest 表——内部经 dynamic_manifest 补齐 Inline
+/// 契约成对注册(一表硬规则 1:禁止无 manifest 注册)。
 fn make_parallel_runner(
     max_parallel: usize,
     tools: BTreeMap<String, Arc<dyn ToolFunction>>,
@@ -1272,7 +1285,7 @@ fn make_parallel_runner(
         ..AgentConfig::default()
     };
     let client = make_test_client();
-    let handler = ToolHandler::with_tools(tools);
+    let handler = ToolHandler::with_functions(tools);
     AgentRunner::new(config, client).with_tool_handler(handler)
 }
 
@@ -2612,8 +2625,13 @@ fn p2_intent_signal_shape_is_neutral_set() {
 
 #[test]
 fn p2_adjudication_table_matches_design() {
-    // 设计档 §3.1 全表 24 项(2026-09-28 用户批 D1=A);防漂移守卫
-    assert_eq!(GOVERNANCE_ADJUDICATION_TOOLS.len(), 24);
+    // 设计档 §3.1 全表 24 项(2026-09-28 用户批 D1=A);防漂移守卫。
+    // 手工 const 表已由 manifest 派生取代(数量断言改静态表 P2 集合计数)
+    let p2_count = crate::agent::tool_manifest::static_manifests()
+        .iter()
+        .filter(|m| m.is_p2_adjudicated())
+        .count();
+    assert_eq!(p2_count, 24);
     for t in [
         "file_create",
         "file_move",

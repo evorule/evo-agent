@@ -583,7 +583,7 @@ async fn test_multi_turn_react_loop_with_tool_call() {
     );
     let mut runner = AgentRunner::new(AgentConfig::default(), client)
         .with_llm_handler(llm)
-        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_tools(tools));
+        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_functions(tools));
 
     let result = runner
         .run("find knowledge about evorule")
@@ -798,7 +798,7 @@ async fn test_approval_denied_by_default_in_loop() {
     );
     let mut runner = AgentRunner::new(AgentConfig::default(), client)
         .with_llm_handler(llm)
-        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_tools(tools));
+        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_functions(tools));
     // 不设置 approval callback → 默认拒绝
 
     let result = runner
@@ -874,7 +874,7 @@ async fn test_approval_auto_approved_reexecutes_with_flag() {
     );
     let mut runner = AgentRunner::new(AgentConfig::default(), client)
         .with_llm_handler(llm)
-        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_tools(tools))
+        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_functions(tools))
         .with_approval_callback(Arc::new(AutoApprove));
 
     let result = runner
@@ -1197,7 +1197,7 @@ async fn test_llm_text_intent_without_tool_calls_does_not_execute_tools() {
     let xml_text = r#"<minimax:tool_call>{"name":"file_write","parameters":{"path":"workspace/pwned.txt","content":"should not run"}}</minimax:tool_call>"#;
     let mut runner = AgentRunner::new(AgentConfig::default(), client)
         .with_llm_handler(LlmHandler::mock(xml_text))
-        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_tools(tools));
+        .with_tool_handler(evo_agent::io_handlers::ToolHandler::with_functions(tools));
 
     let result = runner
         .run("record the expense")
