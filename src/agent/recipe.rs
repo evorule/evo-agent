@@ -164,6 +164,32 @@ impl Default for AdjudicationConfig {
     }
 }
 
+/// 晋升治理门配置（阶段 4 F-609 完善，资产化时序「批即行权、机器上限」）。
+///
+/// 治理闸只管晋升不管记录：开启后，状态机阈值合格的晋升候选**不再机械
+/// 晋升**，须经治理写通路提议入账（`propose_knowledge_entry`，服务端
+/// 全闸链：入账契约+领域 schema+LLM 边界+凭据扫描，Draft 落账=资格
+/// 凭据），回执成功才打 Promoted；提议失败保持 Captured 留待下次批
+/// （M3 重复提案拒绝=天然幂等防护）。缺省关=机械复制既有行为零影响。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromoteGateConfig {
+    /// 是否启用晋升治理门（缺省关=机械复制既有行为）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 治理层知识数据集 ID（提议入账目标；启用时必填，缺省视为未启用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_id: Option<String>,
+}
+
+impl Default for PromoteGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dataset_id: None,
+        }
+    }
+}
+
 /// 跨源检索源启用开关（跨源注册规格策略面）。
 ///
 /// 源启用是策略不是代码：新增记忆源（journal 摘要投影/技能索引/
@@ -217,6 +243,9 @@ pub struct MemoryRecipe {
     /// 矛盾裁决配置（F-612；缺省 enabled=false 既有 agent 零影响）
     #[serde(default)]
     pub adjudication: AdjudicationConfig,
+    /// 晋升治理门配置（F-609 完善；缺省关=机械复制既有行为）
+    #[serde(default)]
+    pub promote_gate: PromoteGateConfig,
 }
 
 impl Default for MemoryRecipe {
@@ -241,6 +270,7 @@ impl Default for MemoryRecipe {
             tools: ToolsSection::default(),
             sources: SourcesSection::default(),
             adjudication: AdjudicationConfig::default(),
+            promote_gate: PromoteGateConfig::default(),
         }
     }
 }
