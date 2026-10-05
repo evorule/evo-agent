@@ -7,7 +7,9 @@
 //! (判据见 fs_safety):沙箱 containment、symlink/junction 逃逸拒绝、目标重名
 //! 拒(409 语义)、目录移入自身拒绝。跨盘 rename 失败时递归 copy+remove 兜底。
 //!
-//! 审批:candidate(与 file_create 同款两段式,`approved=true` 执行)。
+//! 审批:candidate,经管道⑤收编(PR-4)——评估单源 [`ToolFunction::evaluate_proposal`]
+//! (与 call 共用 [`Self::plan_move`] 校验链,评估与执行同源),决策端批准后
+//! 才进执行体。
 
 use std::path::PathBuf;
 
@@ -50,10 +52,65 @@ impl ToolFunction for FileMoveTool {
             .await
             .map_err(|e| format!("file_move tool panicked: {e}"))?
     }
+
+    /// 管道⑤评估单源(PR-4 收编):与 call 共用 plan_move 校验链——校验
+    /// 全通过(源/目标/碰撞俱合法)即属写面 candidate;任一校验失败返回
+    /// None(call 期显式报错,与原判定次序一致)。只读校验无副作用。
+    fn evaluate_proposal(&self, args: &Value) -> Option<Value> {
+        self.plan_move(args).ok()?;
+        let path = args.get("path").and_then(|v| v.as_str())?;
+        let target_dir = args.get("target_dir").and_then(|v| v.as_str())?;
+        let new_name = args.get("new_name").and_then(|v| v.as_str());
+        let description = if let Some(n) = new_name {
+            format!("move '{path}' to '{target_dir}' as '{n}'")
+        } else {
+            format!("move '{path}' to '{target_dir}'")
+        };
+        Some(serde_json::json!({
+            "status": "needs_approval",
+            "category": "candidate",
+            "description": description,
+            "risk": "relocates project files",
+            "alternative": "move or rename the file manually in the workbench file tree",
+        }))
+    }
 }
 
 impl FileMoveTool {
     fn call_sync(&self, args: &Value) -> IoResult {
+        // 校验链(plan_move):审批门在管道⑤(PR-4 收编)——评估臂先行拦截
+        // candidate,只有决策端批准后才进本执行体;工作台 REST 人工面为
+        // 服务端构造调用(人工操作不进 agent 审批链),直接落此处执行。
+        let (source, target, name) = self.plan_move(args)?;
+
+        if let Err(rename_err) = std::fs::rename(&source, &target) {
+            // 跨盘 fallback:递归 copy + 删源(rename 语义尽力保持:目标重名已预检)
+            fs_safety::copy_recursive(&source, &target)
+                .map_err(|e| format!("move failed (rename: {rename_err}; fallback: {e})"))?;
+            fs_safety::remove_recursive(&source)
+                .map_err(|e| format!("move fallback cleanup failed: {e}"))?;
+        }
+
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "path".to_string(),
+            Value::from(target.display().to_string()),
+        );
+        map.insert(
+            "from".to_string(),
+            Value::from(source.display().to_string()),
+        );
+        map.insert("name".to_string(), Value::from(name));
+        Ok(Value::Object(map))
+    }
+
+    /// 移动计划校验链(call 与管道⑤评估共用单源):参数形状 → 源存在且在
+    /// writable_dir 内 → 目标目录存在且在 writable_dir 内 → 不移入自身子树
+    /// → 新名兼容性 → 目标碰撞。只读(metadata/存在性),无副作用。
+    fn plan_move(
+        &self,
+        args: &Value,
+    ) -> Result<(std::path::PathBuf, std::path::PathBuf, String), String> {
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -63,10 +120,6 @@ impl FileMoveTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required arg: target_dir (string)".to_string())?;
         let new_name = args.get("new_name").and_then(|v| v.as_str());
-        let approved = args
-            .get("approved")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
 
         let writable_canonical = fs_safety::writable_root(&self.workdir, &self.writable_dir)?;
 
@@ -121,40 +174,7 @@ impl FileMoveTool {
             ));
         }
 
-        if !approved {
-            let description = if new_name.is_some() {
-                format!("move '{path}' to '{target_dir}' as '{name}'")
-            } else {
-                format!("move '{path}' to '{target_dir}'")
-            };
-            return Ok(serde_json::json!({
-                "status": "needs_approval",
-                "category": "candidate",
-                "description": description,
-                "risk": "relocates project files",
-                "alternative": "move or rename the file manually in the workbench file tree",
-            }));
-        }
-
-        if let Err(rename_err) = std::fs::rename(&source, &target) {
-            // 跨盘 fallback:递归 copy + 删源(rename 语义尽力保持:目标重名已预检)
-            fs_safety::copy_recursive(&source, &target)
-                .map_err(|e| format!("move failed (rename: {rename_err}; fallback: {e})"))?;
-            fs_safety::remove_recursive(&source)
-                .map_err(|e| format!("move fallback cleanup failed: {e}"))?;
-        }
-
-        let mut map = serde_json::Map::new();
-        map.insert(
-            "path".to_string(),
-            Value::from(target.display().to_string()),
-        );
-        map.insert(
-            "from".to_string(),
-            Value::from(source.display().to_string()),
-        );
-        map.insert("name".to_string(), Value::from(name));
-        Ok(Value::Object(map))
+        Ok((source, target, name))
     }
 }
 
@@ -322,17 +342,24 @@ mod tests {
     }
 
     #[test]
-    fn test_no_approval_returns_proposal() {
+    fn test_candidate_evaluated_by_proposal_hook() {
         let (_d, workdir) = temp_workdir();
         std::fs::write(workdir.join("workspace/a.txt"), b"x").unwrap();
         let tool = FileMoveTool::new(workdir.clone());
-        let v = call(
+        // 管道⑤评估单源(PR-4 收编):candidate 分类由 evaluate_proposal 判定
+        let v = tool
+            .evaluate_proposal(
+                &json!({"path": "workspace/a.txt", "target_dir": "workspace", "new_name": "b.txt"}),
+            )
+            .expect("valid move plan is a candidate");
+        assert_eq!(v["status"], json!("needs_approval"));
+        // 直接调用(人工面/决策端批准后形态)真实执行——不再返回 proposal
+        let r = call(
             &tool,
             json!({"path": "workspace/a.txt", "target_dir": "workspace", "new_name": "b.txt"}),
         )
         .unwrap();
-        assert_eq!(v["status"], json!("needs_approval"));
-        assert!(workdir.join("workspace/a.txt").is_file());
+        assert_eq!(r["name"], json!("b.txt"));
     }
 
     #[test]

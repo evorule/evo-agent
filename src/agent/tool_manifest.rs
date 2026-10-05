@@ -374,6 +374,12 @@ fn builtin_manifests() -> Vec<ToolManifest> {
                 m.adjudication_class = AdjudicationClass::Sensitive;
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
+            // 命令/网络 candidate 族：分类器判入 candidate 即出 needs_approval
+            // 提案（PR-4 起经管道⑤评估臂单源），如实补标 ManualDefault
+            // （此前默认 AutoPolicy 属盘点遗漏，行为等价修正）
+            "shell_exec" | "http_get" => {
+                m.approval_policy = ApprovalPolicy::ManualDefault;
+            }
             // grep_files 内部 30s 硬超时（与全局 60s 双层，如实标注）
             "grep_files" => m.timeout_class = TimeoutClass::Fast,
             _ => {}

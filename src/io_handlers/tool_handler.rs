@@ -37,6 +37,20 @@ pub trait ToolFunction: Send + Sync {
     /// 在飞子进程/任务,并让 [`Self::call`] 尽快返回真实结局(如 killed 记账)。
     /// 缺省 no-op:未实现时外层在终止宽限期满后放弃等待(兜底语义)。
     fn on_execution_timeout(&self) {}
+
+    /// 审批评估钩子(管道⑤分级审批的 proposal 单源,工具面统一架构 PR-4)
+    ///
+    /// candidate 类工具实现此钩子:按参数分类判定本次调用是否需要人工审批,
+    /// 需要则返回完整 proposal JSON(`{"status":"needs_approval",...}`),
+    /// 管道⑤据此暂停并交决策端;active/blocked/参数非法等无需审批形态返回
+    /// `None`(blocked/非法的拒绝仍在 [`Self::call`] 内执行期判定)。
+    /// 缺省 `None`:非 candidate 工具(读面/直跑类)直通执行。
+    ///
+    /// 契约:纯函数(无 IO/无副作用),与 `call` 的执行判定同源——同一参数
+    /// 评估为 Some 时 `call` 必须不做真实动作(该契约由各工具单测锁定)。
+    fn evaluate_proposal(&self, _args: &Value) -> Option<Value> {
+        None
+    }
 }
 
 /// 终止宽限:执行超时钩子触发后,收取工具真实结局(killed 记账)的等待上限
@@ -183,6 +197,15 @@ impl ToolHandler {
     /// 按名查治理元数据（一表派生面：裁决分级/审批/开关/能力域）
     pub fn manifest(&self, name: &str) -> Option<ToolManifest> {
         self.tools.get(name).map(|e| e.manifest.clone())
+    }
+
+    /// 管道⑤评估单源访问器（按注册条目的执行器实例求值）
+    ///
+    /// 关键语义:按 **handler 注册的 func 实例** 调用 `evaluate_proposal`,
+    /// 而非按工具名查静态表——同名冒名注册(如测试把无协议工具注册在
+    /// candidate 工具名下)以实际执行器为准,评估与执行永远同源。
+    pub fn evaluate_proposal_for(&self, name: &str, args: &Value) -> Option<Value> {
+        self.tools.get(name)?.func.evaluate_proposal(args)
     }
 
     /// 全部条目治理元数据（按名字序）

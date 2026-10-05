@@ -2588,8 +2588,15 @@ async fn first_round_intent_goes_through_adjudication_channel() {
         "/outside/x.txt"
     };
     let result = runner
-        .execute_tool_call("file_read", &serde_json::json!({ "path": abs }), None)
+        .execute_tool_call_gated(
+            "test-session",
+            "file_read",
+            &serde_json::json!({ "path": abs }),
+            None,
+            None,
+        )
         .await
+        .map(|(result, _record)| result)
         .expect("blocked verdict must surface as tool result, not error");
     assert_eq!(result["status"], "blocked_by_governance_rule");
     assert_eq!(result["target_scope"], "out_of_sandbox");
@@ -2645,8 +2652,15 @@ async fn blocked_intent_inside_boundary_uses_form_reason() {
         "/tmp/sandbox-root/x.txt"
     };
     let result = runner
-        .execute_tool_call("file_read", &serde_json::json!({ "path": abs }), None)
+        .execute_tool_call_gated(
+            "test-session",
+            "file_read",
+            &serde_json::json!({ "path": abs }),
+            None,
+            None,
+        )
         .await
+        .map(|(result, _record)| result)
         .expect("blocked verdict must surface as tool result, not error");
     assert_eq!(result["status"], "blocked_by_governance_rule");
     assert_eq!(result["target_scope"], "out_of_sandbox");
@@ -2848,8 +2862,15 @@ async fn p2_blocked_intent_prevents_execution() {
     let runner =
         AgentRunner::new(AgentConfig::default(), client).with_capability_boundary(m5c_boundary());
     let result = runner
-        .execute_tool_call("file_delete", &serde_json::json!({ "path": abs }), None)
+        .execute_tool_call_gated(
+            "test-session",
+            "file_delete",
+            &serde_json::json!({ "path": abs }),
+            None,
+            None,
+        )
         .await
+        .map(|(result, _record)| result)
         .expect("blocked verdict must surface as tool result, not error");
     assert_eq!(result["status"], "blocked_by_governance_rule");
     assert_eq!(result["tool"], "file_delete");

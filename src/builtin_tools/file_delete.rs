@@ -11,7 +11,9 @@
 //! symlink/junction 逃逸拒绝。额外守护:workdir 根、可写根与回收目录自身
 //! 不可删除。
 //!
-//! 审批:candidate(与 file_create 同款两段式,`approved=true` 执行)。
+//! 审批:candidate,经管道⑤收编(PR-4)——评估单源 [`ToolFunction::evaluate_proposal`]
+//! (与 call 共用 [`Self::plan_delete`] 校验链,评估与执行同源),决策端批准后
+//! 才进执行体。评估只读,不触碰回收目录。
 
 use std::path::{Path, PathBuf};
 
@@ -57,71 +59,38 @@ impl ToolFunction for FileDeleteTool {
             .await
             .map_err(|e| format!("file_delete tool panicked: {e}"))?
     }
+
+    /// 管道⑤评估单源(PR-4 收编):与 call 共用 plan_delete 校验链——校验
+    /// 全通过(源存在/沙箱内/守护未命中)即属写面 candidate;任一校验失败
+    /// 返回 None(call 期显式报错,与原判定次序一致)。只读校验,不创建
+    /// 回收目录。
+    fn evaluate_proposal(&self, args: &Value) -> Option<Value> {
+        let (_, kind) = self.plan_delete(args).ok()?;
+        let path = args.get("path").and_then(|v| v.as_str())?;
+        Some(serde_json::json!({
+            "status": "needs_approval",
+            "category": "candidate",
+            "description": format!("delete {kind} '{path}' (soft-delete to {TRASH_DIR_NAME}/)"),
+            "risk": "removes the entry from the project tree (recoverable from the trash folder)",
+            "alternative": "delete the entry manually in the workbench file tree",
+        }))
+    }
 }
 
 impl FileDeleteTool {
     fn call_sync(&self, args: &Value) -> IoResult {
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing required arg: path (string)".to_string())?;
-        let approved = args
-            .get("approved")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // 校验链(plan_delete):审批门在管道⑤(PR-4 收编)——评估臂先行拦截
+        // candidate,只有决策端批准后才进本执行体;工作台 REST 人工面为
+        // 服务端构造调用(人工操作不进 agent 审批链),直接落此处执行。
+        let (source, kind) = self.plan_delete(args)?;
 
-        let writable_canonical = fs_safety::writable_root(&self.workdir, &self.writable_dir)?;
-        let workdir_canonical = self
-            .workdir
-            .canonicalize()
-            .map_err(|e| format!("workdir invalid: {e}"))?;
-
-        // 源:必须已存在且在 writable_dir 内
-        let source = fs_safety::resolve_existing(&self.workdir, path)?;
-        if !source.starts_with(&writable_canonical) {
-            return Err(format!(
-                "path '{path}' is outside writable_dir '{}' (path traversal)",
-                self.writable_dir.display()
-            ));
-        }
-
-        // 守护:根 / 可写根 / 回收目录自身不可删
-        if source == workdir_canonical {
-            return Err("cannot delete the workdir root".to_string());
-        }
-        if source == writable_canonical {
-            return Err("cannot delete the writable root".to_string());
-        }
-        let trash_dir = self.workdir.join(TRASH_DIR_NAME);
-        let trash_canonical = fs_safety::writable_root(&self.workdir, Path::new(TRASH_DIR_NAME))
-            .unwrap_or(trash_dir.clone());
-        if source == trash_canonical {
-            return Err("cannot delete the trash directory itself".to_string());
-        }
-
-        let kind = match std::fs::symlink_metadata(&source) {
-            Ok(m) if m.is_dir() => "dir",
-            Ok(m) if m.file_type().is_symlink() => "symlink",
-            _ => "file",
-        };
-
-        if !approved {
-            return Ok(serde_json::json!({
-                "status": "needs_approval",
-                "category": "candidate",
-                "description": format!("delete {kind} '{path}' (soft-delete to {TRASH_DIR_NAME}/)"),
-                "risk": "removes the entry from the project tree (recoverable from the trash folder)",
-                "alternative": "delete the entry manually in the workbench file tree",
-            }));
-        }
-
-        std::fs::create_dir_all(&trash_dir)
+        std::fs::create_dir_all(trash_dir(&self.workdir))
             .map_err(|e| format!("failed to create trash dir: {e}"))?;
         let name = source
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .ok_or_else(|| "cannot delete a path without a file name".to_string())?;
-        let dest = fs_safety::trash_destination(&trash_dir, &name);
+        let dest = fs_safety::trash_destination(&trash_dir(&self.workdir), &name);
 
         if let Err(rename_err) = std::fs::rename(&source, &dest) {
             // 跨盘/锁占用 fallback:递归 copy 进回收目录 + 删源。
@@ -148,6 +117,57 @@ impl FileDeleteTool {
         map.insert("kind".to_string(), Value::from(kind));
         Ok(Value::Object(map))
     }
+
+    /// 删除计划校验链(call 与管道⑤评估共用单源):参数形状 → 源存在且在
+    /// writable_dir 内 → 三守护(workdir 根/可写根/回收目录自身)→ kind
+    /// 检测。只读(metadata/存在性),无副作用——不创建回收目录。
+    fn plan_delete(&self, args: &Value) -> Result<(PathBuf, &'static str), String> {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing required arg: path (string)".to_string())?;
+
+        let writable_canonical = fs_safety::writable_root(&self.workdir, &self.writable_dir)?;
+        let workdir_canonical = self
+            .workdir
+            .canonicalize()
+            .map_err(|e| format!("workdir invalid: {e}"))?;
+
+        // 源:必须已存在且在 writable_dir 内
+        let source = fs_safety::resolve_existing(&self.workdir, path)?;
+        if !source.starts_with(&writable_canonical) {
+            return Err(format!(
+                "path '{path}' is outside writable_dir '{}' (path traversal)",
+                self.writable_dir.display()
+            ));
+        }
+
+        // 守护:根 / 可写根 / 回收目录自身不可删
+        if source == workdir_canonical {
+            return Err("cannot delete the workdir root".to_string());
+        }
+        if source == writable_canonical {
+            return Err("cannot delete the writable root".to_string());
+        }
+        let trash_canonical = fs_safety::writable_root(&self.workdir, Path::new(TRASH_DIR_NAME))
+            .unwrap_or_else(|_| trash_dir(&self.workdir));
+        if source == trash_canonical {
+            return Err("cannot delete the trash directory itself".to_string());
+        }
+
+        let kind = match std::fs::symlink_metadata(&source) {
+            Ok(m) if m.is_dir() => "dir",
+            Ok(m) if m.file_type().is_symlink() => "symlink",
+            _ => "file",
+        };
+
+        Ok((source, kind))
+    }
+}
+
+/// 回收目录绝对落点(workdir 下的固定位置;评估链只读引用,执行链创建)
+fn trash_dir(workdir: &Path) -> PathBuf {
+    workdir.join(TRASH_DIR_NAME)
 }
 
 #[cfg(test)]
@@ -282,17 +302,42 @@ mod tests {
     }
 
     #[test]
-    fn test_no_approval_returns_proposal() {
+    fn test_candidate_evaluated_by_proposal_hook() {
         let (_d, workdir) = temp_workdir();
         std::fs::write(workdir.join("workspace/a.txt"), b"x").unwrap();
         let tool = FileDeleteTool::new(workdir.clone());
-        let v = call(&tool, json!({"path": "workspace/a.txt"})).unwrap();
-        assert_eq!(v["status"], json!("needs_approval"));
-        assert!(workdir.join("workspace/a.txt").is_file());
+
+        // 管道⑤评估臂:合法 candidate 返回 proposal(与原两调协议同文)
+        let proposal = tool
+            .evaluate_proposal(&json!({"path": "workspace/a.txt"}))
+            .unwrap();
+        assert_eq!(proposal["status"], json!("needs_approval"));
+        assert_eq!(proposal["category"], json!("candidate"));
+        assert_eq!(
+            proposal["description"],
+            json!("delete file 'workspace/a.txt' (soft-delete to .evo-trash/)")
+        );
+        // 评估只读:不创建回收目录、不移动源
         assert!(
             !workdir.join(TRASH_DIR_NAME).exists(),
-            "proposal 不得创建回收目录"
+            "评估不得创建回收目录"
         );
+        assert!(workdir.join("workspace/a.txt").is_file());
+
+        // 非法输入不属 candidate:返回 None(call 期显式报错)
+        assert!(tool.evaluate_proposal(&json!({})).is_none());
+        assert!(tool
+            .evaluate_proposal(&json!({"path": "workspace/ghost.txt"}))
+            .is_none());
+        assert!(tool
+            .evaluate_proposal(&json!({"path": "root.txt"}))
+            .is_none());
+
+        // 直调(决策端批准后 / 人工面):真实执行软删除,无需 approved 参数
+        let v = call(&tool, json!({"path": "workspace/a.txt"})).unwrap();
+        assert_eq!(v["kind"], json!("file"));
+        assert!(!workdir.join("workspace/a.txt").exists());
+        assert!(PathBuf::from(v["trash_path"].as_str().unwrap()).is_file());
     }
 
     #[test]

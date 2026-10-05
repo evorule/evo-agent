@@ -13,11 +13,12 @@
 //!    尾部点空格(尚不存在的新组件;后端一等校验面,前端仅预校验)
 //! 5. 父目录:`create_parents=true` 才逐级创建(默认 false)
 //!
-//! ## 审批(三层模型:candidate)
+//! ## 审批(三层模型:candidate,管道⑤收编)
 //!
-//! agent 调用默认返回 `needs_approval` proposal(与 shell_exec/http_get 同款
-//! 两段式:批后带 `approved=true` 重调即执行)。工作台 REST 面以服务端构造的
-//! 调用绕过(人工操作不进 agent 审批链)。
+//! agent 面调用属 candidate:管道⑤经 [`ToolFunction::evaluate_proposal`]
+//! 评估钩子先行拦截(合法路径=写面 candidate),决策端批准后才进执行体
+//! (工具侧两调协议已消灭,call 无 approved 分支)。工作台 REST 面以服务端
+//! 构造的调用直落执行体(人工操作不进 agent 审批链)。
 
 use std::path::PathBuf;
 
@@ -60,6 +61,29 @@ impl ToolFunction for FileCreateTool {
             .await
             .map_err(|e| format!("file_create tool panicked: {e}"))?
     }
+
+    /// 管道⑤评估单源(PR-4 收编):candidate 分类钩子——路径可解析(沙箱+
+    /// 白名单校验通过)即属写面 candidate,返回 proposal;参数形状非法或
+    /// 路径非法返回 None(call 期显式报错,与原判定次序一致:非法路径先 Err)。
+    /// 纯函数:仅做路径解析校验,无 IO 副作用。
+    fn evaluate_proposal(&self, args: &Value) -> Option<Value> {
+        let path = args.get("path").and_then(|v| v.as_str())?;
+        let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("file");
+        if kind != "file" && kind != "dir" {
+            return None;
+        }
+        fs_safety::resolve_create_target(&self.workdir, &self.writable_dir, path)
+            .ok()
+            .map(|_| {
+                serde_json::json!({
+                    "status": "needs_approval",
+                    "category": "candidate",
+                    "description": format!("create {kind} '{path}'"),
+                    "risk": "writes to the project workspace",
+                    "alternative": "create the file or folder manually in the workbench file tree",
+                })
+            })
+    }
 }
 
 impl FileCreateTool {
@@ -78,22 +102,12 @@ impl FileCreateTool {
             .get("create_parents")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let approved = args
-            .get("approved")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
 
         let target = fs_safety::resolve_create_target(&self.workdir, &self.writable_dir, path)?;
 
-        if !approved {
-            return Ok(serde_json::json!({
-                "status": "needs_approval",
-                "category": "candidate",
-                "description": format!("create {kind} '{path}'"),
-                "risk": "writes to the project workspace",
-                "alternative": "create the file or folder manually in the workbench file tree",
-            }));
-        }
+        // 审批门在管道⑤(PR-4 收编):评估臂先行拦截 candidate,只有决策端
+        // 批准后才进本执行体;工作台 REST 人工面为服务端构造调用(人工操作
+        // 不进 agent 审批链),直接落此处执行。
 
         if let Some(parent) = target.parent() {
             if !parent.exists() {
@@ -259,13 +273,24 @@ mod tests {
     }
 
     #[test]
-    fn test_no_approval_returns_proposal() {
+    fn test_candidate_evaluated_by_proposal_hook() {
         let (_d, workdir) = temp_workdir();
         let tool = FileCreateTool::new(workdir.clone());
-        let v = call(&tool, json!({"path": "workspace/x.txt"})).unwrap();
+        // 管道⑤评估单源(PR-4 收编):candidate 分类由 evaluate_proposal 钩子
+        // 判定,call 不再自管 approved 分支——合法路径评估为 Some(proposal)
+        let v = tool
+            .evaluate_proposal(&json!({"path": "workspace/x.txt"}))
+            .expect("valid workspace path is a candidate");
         assert_eq!(v["status"], json!("needs_approval"));
         assert_eq!(v["category"], json!("candidate"));
         assert!(!workdir.join("workspace/x.txt").exists());
+        // 非法路径评估为 None(call 期显式报错,与原判定次序一致)
+        assert!(tool
+            .evaluate_proposal(&json!({"path": "root.txt"}))
+            .is_none());
+        // 直接调用(人工面/决策端批准后形态)真实执行——不再返回 proposal
+        let r = call(&tool, json!({"path": "workspace/x.txt"})).unwrap();
+        assert_eq!(r["created"], json!(true));
     }
 
     #[test]

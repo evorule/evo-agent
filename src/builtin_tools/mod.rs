@@ -238,7 +238,8 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                           Rejects duplicates, Windows reserved names (CON/NUL/COM1-9/LPT1-9), \
                           illegal filename characters and trailing dot/space. \
                           Parent dirs are only created with `create_parents=true`. \
-                          Requires user approval: the first call returns a needs_approval proposal."
+                          Requires user approval: a candidate call returns a needs_approval \
+                          proposal and waits for the user's decision."
                 .to_string(),
             parameters: vec![
                 ParameterSpec {
@@ -259,12 +260,6 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     description: "Set true to auto-create missing parent directories (default: false)".to_string(),
                     required: false,
                 },
-                ParameterSpec {
-                    name: "approved".to_string(),
-                    r#type: "boolean".to_string(),
-                    description: "Set to true ONLY after the user has approved the creation proposal.".to_string(),
-                    required: false,
-                },
             ],
         },
         ToolSpec {
@@ -272,7 +267,8 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
             description: "Move or rename a file/directory (rename = same-directory move). \
                           **ONLY moves entries inside ./workspace/** (configurable). \
                           Source and target dir must exist; duplicate target names are rejected. \
-                          Requires user approval: the first call returns a needs_approval proposal."
+                          Requires user approval: a candidate call returns a needs_approval \
+                          proposal and waits for the user's decision."
                 .to_string(),
             parameters: vec![
                 ParameterSpec {
@@ -293,12 +289,6 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     description: "Optional new name; defaults to keeping the current name".to_string(),
                     required: false,
                 },
-                ParameterSpec {
-                    name: "approved".to_string(),
-                    r#type: "boolean".to_string(),
-                    description: "Set to true ONLY after the user has approved the move proposal.".to_string(),
-                    required: false,
-                },
             ],
         },
         ToolSpec {
@@ -307,7 +297,8 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                           `<workdir>/.evo-trash/` (timestamped name) and can be recovered manually. \
                           **ONLY deletes inside ./workspace/** (configurable). \
                           The workdir root, the writable root and the trash folder itself cannot be deleted. \
-                          Requires user approval: the first call returns a needs_approval proposal."
+                          Requires user approval: a candidate call returns a needs_approval \
+                          proposal and waits for the user's decision."
                 .to_string(),
             parameters: vec![
                 ParameterSpec {
@@ -315,12 +306,6 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     r#type: "string".to_string(),
                     description: "Existing entry to delete, relative to writable_dir".to_string(),
                     required: true,
-                },
-                ParameterSpec {
-                    name: "approved".to_string(),
-                    r#type: "boolean".to_string(),
-                    description: "Set to true ONLY after the user has approved the deletion proposal.".to_string(),
-                    required: false,
                 },
             ],
         },
@@ -433,14 +418,6 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     description: "Command to execute, e.g. \"cargo test --release\" or \"ls -la\"".to_string(),
                     required: true,
                 },
-                ParameterSpec {
-                    name: "approved".to_string(),
-                    r#type: "boolean".to_string(),
-                    description: "Set to true ONLY after the user has approved a candidate-command proposal. \
-                                  Active commands ignore this flag. Blocked commands reject regardless."
-                        .to_string(),
-                    required: false,
-                },
             ],
         },
         ToolSpec {
@@ -452,14 +429,6 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     r#type: "string".to_string(),
                     description: "HTTPS URL to GET. Must be in active allowlist OR approved by user.".to_string(),
                     required: true,
-                },
-                ParameterSpec {
-                    name: "approved".to_string(),
-                    r#type: "boolean".to_string(),
-                    description: "Set to true ONLY after the user has approved a candidate-host proposal. \
-                                  Blocked hosts (private IP, localhost) reject regardless."
-                        .to_string(),
-                    required: false,
                 },
             ],
         },
@@ -505,8 +474,8 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
             name: "git_stage".to_string(),
             description: "Stage files or directories into the git index (like `git add`). \
                           Paths are relative to the repo root; a trailing `/` stages a whole \
-                          directory. Requires user approval: the first call returns a \
-                          needs_approval proposal."
+                          directory. Requires user approval: a candidate call returns a \
+                          needs_approval proposal and waits for the user's decision."
                 .to_string(),
             parameters: vec![
                 ParameterSpec {
@@ -515,13 +484,6 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     description: "Paths to stage, relative to the repo root (e.g. [\"src/main.rs\"])".to_string(),
                     required: true,
                 },
-                ParameterSpec {
-                    name: "approved".to_string(),
-                    r#type: "boolean".to_string(),
-                    description: "Set to true ONLY after the user has approved the staging proposal."
-                        .to_string(),
-                    required: false,
-                },
             ],
         },
         ToolSpec {
@@ -529,8 +491,8 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
             description: "Commit ALL pending changes: stages everything first (like \
                           `git add -A` + `git commit`), matching the workbench SCM commit \
                           semantics. Requires a configured git identity (user.name / \
-                          user.email). Requires user approval: the first call returns a \
-                          needs_approval proposal."
+                          user.email). Requires user approval: a candidate call returns a \
+                          needs_approval proposal and waits for the user's decision."
                 .to_string(),
             parameters: vec![
                 ParameterSpec {
@@ -538,13 +500,6 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     r#type: "string".to_string(),
                     description: "Commit message (must not be empty)".to_string(),
                     required: true,
-                },
-                ParameterSpec {
-                    name: "approved".to_string(),
-                    r#type: "boolean".to_string(),
-                    description: "Set to true ONLY after the user has approved the commit proposal."
-                        .to_string(),
-                    required: false,
                 },
             ],
         },
@@ -587,13 +542,13 @@ fn shell_exec_description() -> String {
     format!(
         "Execute a shell command with a 3-layer safety model.\n\n\
          **Active (run directly, no approval needed):** {}\n\n\
-         **Candidate (require user approval via approved=true):** {}\n\n\
+         **Candidate (require user approval):** {}\n\n\
          **Blocked (always rejected, no candidate path):** {}\n\n\
          **Rules:**\n\
          - No shell — args passed directly (no pipe, no redirect, no glob expansion)\n\
          - Shell metacharacters rejected: ; | & $ ` > < ( )\n\
-         - To use a candidate command: FIRST show user the proposal (status=needs_approval), \
-         THEN call again with approved=true after they confirm",
+         - To use a candidate command: the call returns a needs_approval proposal — \
+         show it to the user; after they approve, re-issue the same call to execute",
         active.join(", "),
         candidates.join("; "),
         blocked.join("; "),
@@ -609,8 +564,8 @@ fn http_get_description() -> String {
     format!(
         "HTTP GET with a 3-layer host safety model.\n\n\
          **Active (request directly, no approval needed):** {}\n\n\
-         **Candidate (require user approval via approved=true):** any other public host\n\n\
-         **Blocked (ALWAYS rejected, even with approved=true):**\n\
+         **Candidate (require user approval):** any other public host\n\n\
+         **Blocked (ALWAYS rejected, regardless of approval):**\n\
          - `http://` (only `https://` allowed by default)\n\
          - `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (private IPs / SSRF)\n\
          - `169.254.0.0/16` (link-local, **especially cloud metadata 169.254.169.254**)\n\
