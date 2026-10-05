@@ -846,6 +846,21 @@ pub struct AgentRunner {
     /// 进展停滞检测器(F2 空转克星)。跨轮持续观察
     /// (工具名,参数,结果)三元组,连续重复→警告→按 H2 阻塞收尾
     stagnation: crate::agent::stagnation::StagnationDetector,
+    /// 管道入口类标记(delegate 统一装配批;默认 React 主路径)
+    ///
+    /// CallerContext.entry 的 runner 侧单一来源:execute_tool_call_gated /
+    /// run_pipeline 据此落账——delegate 子代理的工具调用与主路径在账面可分
+    /// (子代理聚焦决策落账的观测面)。ParallelPreflight 并行实例在调用点
+    /// 显式传入,不经此字段。
+    pipeline_entry: crate::agent::pipeline::PipelineEntry,
+    /// 装配面聚焦(delegate 统一装配批;delegate 子代理装配路径置 true)
+    ///
+    /// true:主路径聚焦快照=注册面本身(装配产物)——LLM 契约面(messages
+    /// 侧 tools payload,同为注册面)与管道②聚焦允许面同源(设计档 §4.4:
+    /// 子代理工具面=manifest 过滤后的聚焦快照,装配即过滤),静态表不再自动
+    /// 进入允许面。false:注册面 ∪ 静态表(主路径行为等价口径不变,B2 断言
+    /// 测试盯守)。
+    assembly_scope_focus: bool,
 }
 
 /// 管道阶段⑦执行器：runner 的 call_service 通路
@@ -918,6 +933,8 @@ impl AgentRunner {
             journal_dir: None,
             acceptance_command: None,
             stagnation: crate::agent::stagnation::StagnationDetector::new(),
+            pipeline_entry: crate::agent::pipeline::PipelineEntry::React,
+            assembly_scope_focus: false,
         }
     }
 
@@ -1310,6 +1327,28 @@ impl AgentRunner {
         ));
         self.tool_handler.register_static("delegate", delegate_tool);
         self.delegate_context = Some(ctx);
+        self
+    }
+
+    /// delegate 子代理装配路径标记（delegate() 构建子 runner 时接线）
+    ///
+    /// 管道账面入口类记 [`crate::agent::pipeline::PipelineEntry::Delegate`]——
+    /// 子代理工具调用与主路径（React）在账面 caller.entry 可分（子代理聚焦
+    /// 决策落账的观测面）。
+    pub(crate) fn with_delegate_pipeline_entry(mut self) -> Self {
+        self.pipeline_entry = crate::agent::pipeline::PipelineEntry::Delegate;
+        self
+    }
+
+    /// 装配面聚焦（delegate 子代理装配路径）
+    ///
+    /// 主路径聚焦快照=注册面本身（装配产物），不再并静态表——子代理聚焦
+    /// 快照=manifest 过滤后的装配面，LLM 契约面（messages 侧 tools payload，
+    /// 同为注册面）与管道②聚焦允许面同源（设计档 §4.4 装配即过滤）；未装配
+    /// 的静态表工具②聚焦即拒（union 提权面在装配期收口，不再依赖⑦执行器
+    /// 报错兜底）。主路径不启用（行为等价口径不变，B2 断言测试盯守）。
+    pub(crate) fn with_assembly_scope_focus(mut self) -> Self {
+        self.assembly_scope_focus = true;
         self
     }
 
@@ -2890,14 +2929,16 @@ impl AgentRunner {
         // ToolExecutionPipeline 执行;治理拦截两态 JSON 文案/裁决 fail-closed
         // 语义/轨迹与指标采集点经管道逐字保留(行为等价,runner_tests 基线
         // 不改一行即验收)。PR-3 起 G13 并行预执行同为管道并行实例
-        // (ParallelPreflight 入口),两入口共用 run_pipeline 单点。
+        // (ParallelPreflight 入口),两入口共用 run_pipeline 单点;delegate
+        // 统一装配批起子代理路径入口类由 runner 标记决定(React 主路径 /
+        // Delegate 子代理),账面 caller.entry 落账。
         let outcome = self
             .run_pipeline(
                 tool_name,
                 args,
                 journal,
                 precomputed,
-                crate::agent::pipeline::PipelineEntry::React,
+                self.pipeline_entry,
                 None,
             )
             .await;
@@ -2946,15 +2987,21 @@ impl AgentRunner {
         }
     }
 
-    /// 主路径聚焦快照(注册面 ∪ 静态表面)
+    /// 主路径聚焦快照(注册面 ∪ 静态表面;装配面聚焦时=注册面本身)
     ///
     /// PR-2 行为等价口径:②不产生新拒绝(裸 runner/CLI 直构造场景 handler
     /// 为空但工具名有效——静态表内,原实现直达裁决不查 handler,①查表必须
     /// 同样放行才是行为等价)。收窄为注册面严格子集随装配收口批次落地
     /// (B2 断言测试盯守);G13 并行预执行实例与本入口共用本构造。
+    /// delegate 统一装配批:子代理路径(装配面聚焦标记)快照=注册面本身——
+    /// LLM 契约面(messages 侧 tools payload)与②聚焦允许面同源。
     fn main_path_focus(&self) -> crate::agent::pipeline::FocusSnapshot {
+        let registered = self.tool_handler.tool_names();
+        if self.assembly_scope_focus {
+            return crate::agent::pipeline::FocusSnapshot::from_names(registered);
+        }
         crate::agent::pipeline::FocusSnapshot::from_names(
-            self.tool_handler.tool_names().into_iter().chain(
+            registered.into_iter().chain(
                 crate::agent::tool_manifest::static_manifests()
                     .into_iter()
                     .map(|m| m.name),

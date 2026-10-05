@@ -24,9 +24,10 @@
 //!
 //! PR-3 已收口：G13 并行预执行=管道并行实例（ParallelPreflight 入口）、
 //! 缓存收口（precomputed=已过闸执行产物，命中调用①-⑤⑧照常仅⑦免重执行）、
-//! file_api 读面 manifest 查表（调用侧）。仍范围外：两面身份与 HumanGate
-//! （PR-4）、链侧 tool_trace 统一指令（信号契约批次）、delegate 聚焦决策
-//! 落账（PR-8）。
+//! file_api 读面 manifest 查表（调用侧）。PR-8（delegate 统一装配）已接线：
+//! 子代理路径入口类记 Delegate（构建期标记）、聚焦快照=装配面（注册面本身，
+//! LLM 契约面与允许面同源）。仍范围外：两面身份与 HumanGate（PR-4）、
+//! 链侧 tool_trace 统一指令（信号契约批次）。
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -61,7 +62,8 @@ pub enum PipelineEntry {
     ApprovalReexec,
     /// G13 并行预执行（PR-3 收口：预执行=管道并行实例，产物=已过闸结果）
     ParallelPreflight,
-    /// 子代理 delegate 路径（PR-8 接线）
+    /// 子代理 delegate 路径（delegate 统一装配批接线：子 runner 构建期经
+    /// `with_delegate_pipeline_entry` 标记，账面 caller.entry 落账）
     Delegate,
 }
 

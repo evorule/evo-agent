@@ -200,8 +200,15 @@ impl DelegateContext {
 
             let config = def.to_agent_config();
 
+            // 统一装配（delegate 统一装配批）：子代理 runner 构建期标记
+            // 管道入口类=Delegate（子代理工具调用账面可分，聚焦决策落账），
+            // 聚焦快照=装配面（注册面本身）——LLM 契约面（messages 侧 tools
+            // payload，同为注册面）与管道②聚焦允许面同源，静态表不再自动
+            // 进入子代理允许面（union 提权面在装配期收口）。
             let mut runner =
-                crate::agent::runner::AgentRunner::new(config, self.evorule_client.clone());
+                crate::agent::runner::AgentRunner::new(config, self.evorule_client.clone())
+                    .with_delegate_pipeline_entry()
+                    .with_assembly_scope_focus();
             if let Some(counter) = &self.token_counter {
                 runner = runner.with_token_counter(counter.clone());
             }
