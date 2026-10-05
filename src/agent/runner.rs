@@ -843,6 +843,28 @@ pub struct AgentRunner {
     stagnation: crate::agent::stagnation::StagnationDetector,
 }
 
+/// 管道阶段⑦执行器：runner 的 call_service 通路
+///
+/// step_timeout 在 execute_external 内包裹（现状语义保持——管道不另设超时，
+/// TOOL_TIMEOUT 60s 在 ToolHandler 内不变）；call_params 形态与原
+/// execute_tool_call 逐字一致（{"tool_name","args"}）。
+impl crate::agent::pipeline::PipelineExecutor for AgentRunner {
+    fn execute_tool(
+        &self,
+        tool_name: &str,
+        args: &Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, AgentError>> + Send + '_>>
+    {
+        let mut call_params = serde_json::Map::new();
+        call_params.insert("tool_name".to_string(), Value::from(tool_name.to_string()));
+        call_params.insert("args".to_string(), args.clone());
+        Box::pin(async move {
+            self.execute_external("call_service", &Value::Object(call_params))
+                .await
+        })
+    }
+}
+
 impl AgentRunner {
     /// TODO: doc
     pub fn new(config: AgentConfig, evorule_client: EvoruleApiClient) -> Self {
@@ -2844,151 +2866,81 @@ impl AgentRunner {
         args: &Value,
         journal: Option<&crate::agent::journal::JournalWriter>,
     ) -> Result<Value, AgentError> {
-        // M5-c:工具意图裁决(双层防线的外层)——file 类调用先把规范字段
-        // target_scope 随意图指令进链,由协作验收规则 enforce 裁决:
-        // 被拦(version 未推进)则不执行工具,向 LLM 返回治理拦截结果;
-        // 放行则继续执行,机制层 handler 内联沙箱检查保留为最终防线。
-        // 裁决改走独立裁决会话(AdjudicationChannel)——主会话
-        // call_external 在途时引擎串行评估使主会话内轮询恒超时(假拦根因),
-        // 独立会话裁决不受 io 在途影响(原型 PV2 实测 73ms)。原
-        // `if let Some(session_id)` 守卫删除:首轮/续轮统一走裁决通道,
-        // 伴生缺陷(新建分支漏设 session_id 致首轮跳过裁决)自然消解。
-        if let Some(scope) =
-            resolve_target_scope(tool_name, args, self.config.capability_boundary.as_ref())
-        {
-            let allowed = self
-                .adjudicator
-                .lock()
-                .await
-                .await_verdict(&intent_signal(scope), self.session_id.as_deref())
-                .await
-                .map_err(AgentError::Internal)?;
-            // B21:policy_judged(意图裁决输出;judgement_id 由 seq 确定性合成)
-            if let Some(j) = journal {
-                let _ = j.policy_judged(
-                    if allowed { "allowed" } else { "blocked" },
-                    &format!("{tool_name} target_scope={scope}"),
-                );
-            }
-            if !allowed {
-                warn!(
-                    main_session = ?self.session_id, tool = %tool_name, scope = %scope,
-                    "tool intent blocked by governance rule (collab acceptance, adjudication channel)"
-                );
-                // 被治理拦截的调用也是真实执行史——进轨迹(status=blocked)
-                if let Ok(mut tt) = self.tool_traces.lock() {
-                    tt.record(tool_name, args, "blocked_by_governance", 0);
-                }
-                let raw_path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let boundary = self.config.capability_boundary.as_ref();
-                let boundary_root = boundary
-                    .map(|b| b.sandbox_root.display().to_string())
-                    .unwrap_or_default();
-                // 拒绝文案两态:绝对路径在快筛一律按形态判 out(判据与
-                // handler 权威沙箱检查同源),但目标实际落在边界内时(join
-                // 后 starts_with 成立)"越界"语义不成立——改用形态判定文案
-                // (相对路径口径),避免审计链出现"target 在 boundary 前缀内
-                // 却被称 outside"的自相矛盾留痕;真·越界(join 逃逸/
-                // `..` 穿越)维持 containment 文案。
-                let inside_boundary = boundary.is_some_and(|b| {
-                    let p = std::path::Path::new(raw_path);
-                    p.is_absolute() && b.sandbox_root.join(p).starts_with(&b.sandbox_root)
-                });
-                let reason = if inside_boundary {
-                    format!(
-                        "absolute path form not allowed: '{}' (paths are relative \
-                         to the sandbox root '{}'; the target resolves inside the \
-                         boundary); the collaboration acceptance rule rejected this \
-                         tool intent (see session audit Violation for rule attribution)",
-                        raw_path, boundary_root
-                    )
-                } else {
-                    format!(
-                        "target '{}' is outside the sandbox boundary '{}'; \
-                         the collaboration acceptance rule rejected this tool intent \
-                         (see session audit Violation for rule attribution)",
-                        raw_path, boundary_root
-                    )
-                };
-                return Ok(serde_json::json!({
-                    "status": "blocked_by_governance_rule",
-                    "tool": tool_name,
-                    "target_scope": scope,
-                    "reason": reason,
-                }));
-            }
-        }
-        // P2 治理级工具事前意图裁决——分级表命中的调用先把
-        // 意图规范字段(tool_name/target_scope?/args 净化副本)随中性 set 指令
-        // 进裁决会话,由 00_constraint_tool_intent_adjudication enforce 裁决:
-        // 被拦(version 未推进)则不执行工具(fail-closed),放行继续。与上方
-        // M5-c file_read/file_write 通道(R1)并存互不干扰;裁决会话轮内复用。
-        if let Some(intent) =
-            resolve_tool_intent(tool_name, args, self.config.capability_boundary.as_ref())
-        {
-            let allowed = self
-                .adjudicator
-                .lock()
-                .await
-                .await_verdict(&tool_intent_signal(&intent), self.session_id.as_deref())
-                .await
-                .map_err(AgentError::Internal)?;
-            // B21:policy_judged(工具意图裁决输出)
-            if let Some(j) = journal {
-                let _ = j.policy_judged(
-                    if allowed { "allowed" } else { "blocked" },
-                    &format!(
-                        "{tool_name} intent={}",
-                        serde_json::to_string(&intent).unwrap_or_default()
-                    ),
-                );
-            }
-            if !allowed {
-                warn!(
-                    main_session = ?self.session_id, tool = %tool_name,
-                    "tool intent blocked by governance rule (tool intent adjudication, adjudication channel)"
-                );
-                // 被治理拦截的调用也是真实执行史——进轨迹(status=blocked)
-                if let Ok(mut tt) = self.tool_traces.lock() {
-                    tt.record(tool_name, args, "blocked_by_governance", 0);
-                }
-                return Ok(serde_json::json!({
-                    "status": "blocked_by_governance_rule",
-                    "tool": tool_name,
-                    "intent": intent,
-                    "reason": "tool intent rejected by governance rule \
-                               (tool intent adjudication; see adjudication session \
-                               audit Violation for rule attribution)",
-                }));
-            }
-        }
-        let args_tcb = args.clone();
-        let mut call_params = serde_json::Map::new();
-        call_params.insert("tool_name".to_string(), Value::from(tool_name.to_string()));
-        call_params.insert("args".to_string(), args_tcb);
-        // G17:工具调用计时 + 指标(call_service 路径插桩;G13 并行预执行
-        // 在 execute_single_tool 内做同规格插桩——修复前该路径零记录,
-        // 本注释原称「单一插桩点覆盖 G13 并行路径」与实现不符,已修正)
-        let tool_start = std::time::Instant::now();
-        let result = self
-            .execute_external("call_service", &Value::Object(call_params))
+        // 一管道（工具面统一架构 §3.2）：本函数收口为管道的薄翻译层——
+        // 八阶段（①查表②聚焦③意图④裁决⑤审批⑥沙箱位⑦执行⑧落账）由
+        // ToolExecutionPipeline 执行；治理拦截两态 JSON 文案/裁决 fail-closed
+        // 语义/轨迹与指标采集点经管道逐字保留（行为等价，runner_tests 基线
+        // 不改一行即验收）。PR-2 主路径快照=装配期注册面（注册面==可见面，
+        // ②不产生新拒绝）；G13 并行入口与 file_api 读面的收口在 PR-3。
+        // 查表合并视图（一表两源）：运行时注册条目优先（可覆盖静态同名），
+        // 未注册回落静态表——裸 runner/CLI 直构造场景 handler 为空但工具名
+        // 有效（静态表内），原实现直达裁决不查 handler，①查表必须同样放行
+        // 才是行为等价（runner_tests 裸 runner 基线不改一行即验收）。
+        let manifest_of = |name: &str| {
+            self.tool_handler
+                .manifest(name)
+                .or_else(|| crate::agent::tool_manifest::lookup_static(name))
+        };
+        // 主路径快照 = 注册面 ∪ 静态表面（PR-2 行为等价口径：②不产生新拒绝；
+        // 真正的收窄消费方是 PR-3 G13 并行实例与 PR-8 delegate 子代理装配）
+        let focus = crate::agent::pipeline::FocusSnapshot::from_names(
+            self.tool_handler.tool_names().into_iter().chain(
+                crate::agent::tool_manifest::static_manifests()
+                    .into_iter()
+                    .map(|m| m.name),
+            ),
+        );
+        let deps = crate::agent::pipeline::PipelineDeps {
+            executor: self,
+            adjudicator: &self.adjudicator,
+            manifest_of: &manifest_of,
+            journal: journal.map(|j| j as &(dyn crate::agent::pipeline::PolicyJudgedSink + Sync)),
+            boundary: self.config.capability_boundary.as_ref(),
+            traces: Some(&self.tool_traces),
+            metrics: self.metrics.as_ref().map(|m| &**m),
+        };
+        let req = crate::agent::pipeline::PipelineRequest {
+            tool_name,
+            args,
+            caller: crate::agent::pipeline::CallerContext {
+                entry: crate::agent::pipeline::PipelineEntry::React,
+                session_id: self.session_id.clone(),
+            },
+            focus: &focus,
+        };
+        let outcome = crate::agent::pipeline::ToolExecutionPipeline
+            .execute(req, deps)
             .await;
-        let tool_duration = tool_start.elapsed();
-        let tool_ok = result.is_ok();
-        if let Some(m) = &self.metrics {
-            m.observe_tool_call(tool_name, tool_duration, tool_ok);
+        match outcome.result {
+            Ok(value) => Ok(value),
+            // 阶段⑦执行错误 = 原样透传（错误显式回喂，与原实现一致）
+            Err(crate::agent::pipeline::PipelineFailure::Execution(e)) => Err(e),
+            Err(crate::agent::pipeline::PipelineFailure::Denial(denial)) => match denial.stage {
+                // ①查表拒绝 = 原 ToolHandler not-found 错误文本（行为等价）；
+                // ②聚焦/⑤审批拒绝 = 显式错误上抛
+                crate::agent::pipeline::DenialStage::NoManifest
+                | crate::agent::pipeline::DenialStage::OutOfFocus
+                | crate::agent::pipeline::DenialStage::ApprovalDenied => {
+                    Err(AgentError::ToolError(denial.reason))
+                }
+                // ③④通道故障/⑧账面失败 = 显式内部错误（fail-closed/fail-visible）
+                crate::agent::pipeline::DenialStage::Channel
+                | crate::agent::pipeline::DenialStage::Ledger => {
+                    Err(AgentError::Internal(denial.reason))
+                }
+                // 治理拦截 = 原状 Ok(blocked JSON) 回喂 LLM（被拦调用也是真实
+                // 执行史，作为工具结果进对话——与原实现一致）
+                crate::agent::pipeline::DenialStage::Governance => {
+                    Ok(denial.llm_payload.unwrap_or_else(|| {
+                        serde_json::json!({
+                            "status": "blocked_by_governance_rule",
+                            "tool": tool_name,
+                            "reason": denial.reason,
+                        })
+                    }))
+                }
+            },
         }
-        // 轨迹采集(G17 同点;脱敏+截断在 collector 内;std Mutex
-        // 临界区无 await,G13 并发下 poison 按 fail-soft 跳过)
-        if let Ok(mut tt) = self.tool_traces.lock() {
-            tt.record(
-                tool_name,
-                args,
-                if tool_ok { "ok" } else { "error" },
-                tool_duration.as_millis() as u64,
-            );
-        }
-        result
     }
 
     /// 阶段一(流式路径):执行工具并解析 needs_approval proposal,不做决策
