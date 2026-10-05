@@ -28,13 +28,14 @@
 //! - [`AdjudicationClass::Sentineled`]：P2 事前意图裁决 + 规则正本 enforce 已在场
 //!   （file_create/file_move/file_delete 的 out_of_sandbox enforce）；
 //! - [`AdjudicationClass::Sensitive`]：P2 事前意图裁决在通道（意图必报，暂无
-//!   enforce——git 写族 2 + 规则治理写族 19）；
+//!   enforce——git 写族 2 + 规则治理写族 19 + delegate 1）；
 //! - [`AdjudicationClass::Standard`]：不走 P2 裁决（机制层治理或纯落链）。
 //!   `is_governance_adjudication_tool` 改由 manifest 派生后，命中集合恰等于
-//!   原 GOVERNANCE_ADJUDICATION_TOOLS 24 表（runner_tests 快照锁定）。
-//!   delegate 暂标 Standard，PR-8（delegate 统一装配批）升 Sensitive 并接
-//!   P2 通道（设计档 §3.2 终态）；file_write 的意图信号走 M5-c R1 通道
-//!   （机制层，由实现持有），不属 P2 分级面。
+//!   原 GOVERNANCE_ADJUDICATION_TOOLS 24 表；delegate 统一装配批兑现模块
+//!   注释承诺：delegate 升 Sensitive 并接 P2 通道（设计档 §3.2 终态），
+//!   派生集合演进为 25 条（重录快照须 diff 审；数量锁 67 不变——级别
+//!   变化不增减条目数）。file_write 的意图信号走 M5-c R1 通道（机制层，
+//!   由实现持有），不属 P2 分级面。
 
 use serde::{Deserialize, Serialize};
 
@@ -498,15 +499,20 @@ fn rule_manifests() -> Vec<ToolManifest> {
 
 /// delegate manifest（1 条）
 ///
-/// 注：设计档终态 adjudication_class=Sensitive（PR-8 接 P2 通道），PR-1
-/// 行为等价期暂标 Standard（快照测试锁 24 集合不变）。
+/// delegate 统一装配批起 adjudication_class=Sensitive（接 P2 通道，设计档
+/// §3.2 终态；PR-1 行为等价期的 Standard 暂标已随快照重录一并演进）。
 fn delegate_manifest() -> ToolManifest {
-    base(
+    // delegate 统一装配批：级别演进 Standard→Sensitive（模块文档承诺兑现）——
+    // delegate 自身调用接 P2 事前意图裁决通道（意图必报）。条目数不变
+    // （静态数量锁仍 67），仅级别字段演进；P2 派生集合 24→25（快照重录）。
+    let mut m = base(
         "delegate",
         ToolSource::Delegate,
         SpecSource::Delegate,
         vec![CapDomain::Delegate],
-    )
+    );
+    m.adjudication_class = AdjudicationClass::Sensitive;
+    m
 }
 
 /// 自省记忆工具 manifest（4 条，与 memory_tool_specs 名称集合相等——测试锁）
@@ -742,7 +748,9 @@ mod tests {
     // ---------- 派生等价快照（防迁移丢失） ----------
 
     /// 原 GOVERNANCE_ADJUDICATION_TOOLS 24 表快照（runner.rs 已改派生，
-    /// 快照在此固化防漂移）
+    /// 快照在此固化防漂移）；delegate 统一装配批 delegate 升 Sensitive 后
+    /// 演进为 25 条（delegate 加入治理裁决集——快照重录须 diff 审，数量锁
+    /// 67 不变，级别变化不增减条目数）。
     const GOVERNANCE_SNAPSHOT: &[&str] = &[
         "file_create",
         "file_move",
@@ -768,6 +776,7 @@ mod tests {
         "bundle_export",
         "bundle_import_dry_run",
         "bundle_import",
+        "delegate",
     ];
 
     #[test]
@@ -783,6 +792,20 @@ mod tests {
             derived, snapshot,
             "P2 派生集合必须与 GOVERNANCE_ADJUDICATION_TOOLS 快照完全一致"
         );
+    }
+
+    #[test]
+    fn test_delegate_manifest_is_sensitive_p2_adjudicated() {
+        // delegate 统一装配批：级别演进 Standard→Sensitive（模块文档承诺
+        // 兑现）——delegate 自身调用接 P2 意图必报通道。条目数不变（静态
+        // 数量锁仍 67，test_static_manifest_count_locked 锁守），仅级别演进。
+        let manifests = all();
+        let m = manifests
+            .iter()
+            .find(|m| m.name == "delegate")
+            .expect("delegate manifest must exist in static table");
+        assert_eq!(m.adjudication_class, AdjudicationClass::Sensitive);
+        assert!(m.is_p2_adjudicated());
     }
 
     #[test]

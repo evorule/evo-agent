@@ -1576,6 +1576,83 @@ fn b2_main_path_focus_is_strict_subset_of_registration() {
     );
 }
 
+// ----- delegate 统一装配:装配面聚焦 + 入口类标记(子代理路径) -----
+
+#[test]
+fn delegate_path_assembly_scope_focus_is_registration_face() {
+    // delegate 统一装配批:子代理聚焦快照=装配面(注册面本身),静态表不再
+    // 自动进入允许面——LLM 契约面(messages 侧 tools payload,同为注册面)与
+    // ②聚焦允许面同源(装配即过滤)。空注册面 → 空快照;主路径行为等价口径
+    // 不变(上方 B2 测试仍 #[ignore] 盯守)。
+    let runner = make_parallel_runner(4, BTreeMap::new()).with_assembly_scope_focus();
+    let focus = runner.main_path_focus();
+    assert!(
+        focus.is_empty(),
+        "empty registration must yield empty focus on delegate path"
+    );
+    assert!(
+        !focus.allows("grep_files"),
+        "unregistered static-table tool must be out of focus on delegate path"
+    );
+    // 装配面内工具仍在允许面(快照=注册面本身)
+    struct EchoTool;
+    #[async_trait::async_trait]
+    impl ToolFunction for EchoTool {
+        async fn call(&self, _args: &Value) -> IoResult {
+            Ok(Value::from("echo"))
+        }
+    }
+    let runner = make_parallel_runner(4, {
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            "grep_files".to_string(),
+            std::sync::Arc::new(EchoTool) as std::sync::Arc<dyn ToolFunction>,
+        );
+        tools
+    })
+    .with_assembly_scope_focus();
+    assert!(runner.main_path_focus().allows("grep_files"));
+}
+
+#[test]
+fn delegate_path_pipeline_entry_marker_defaults_and_marks() {
+    // 入口类标记:主路径默认 React;delegate 装配路径显式置 Delegate——
+    // 账面 caller.entry 可分(子代理聚焦决策落账的观测面)。
+    let plain = make_parallel_runner(4, BTreeMap::new());
+    assert_eq!(
+        plain.pipeline_entry,
+        crate::agent::pipeline::PipelineEntry::React
+    );
+    let delegated = make_parallel_runner(4, BTreeMap::new()).with_delegate_pipeline_entry();
+    assert_eq!(
+        delegated.pipeline_entry,
+        crate::agent::pipeline::PipelineEntry::Delegate
+    );
+}
+
+#[tokio::test]
+async fn delegate_path_union_escalation_denied_at_focus_stage() {
+    // ②聚焦过滤真实收窄(delegate 路径):未装配的静态表工具(如 grep_files,
+    // handler 为空)聚焦即拒——union 提权面在装配期收口,不再依赖⑦执行器
+    // 报错兜底;拒绝发生在③④裁决之前(不触裁决通道)。
+    let runner = make_parallel_runner(4, BTreeMap::new())
+        .with_assembly_scope_focus()
+        .with_delegate_pipeline_entry();
+    let err = runner
+        .execute_tool_call("grep_files", &serde_json::json!({}), None)
+        .await
+        .expect_err("unregistered tool must be denied at focus stage");
+    match err {
+        AgentError::ToolError(msg) => {
+            assert!(
+                msg.contains("not in the allowed focus set"),
+                "expected OutOfFocus denial, got: {msg}"
+            );
+        }
+        other => panic!("expected ToolError, got: {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_g13_parallel_faster_than_serial() {
     // 3 个工具各 sleep 100ms:串行 ~300ms,并行 ~100ms
@@ -2783,12 +2860,14 @@ fn p2_intent_signal_shape_is_neutral_set() {
 #[test]
 fn p2_adjudication_table_matches_design() {
     // 设计档 §3.1 全表 24 项(2026-09-28 用户批 D1=A);防漂移守卫。
-    // 手工 const 表已由 manifest 派生取代(数量断言改静态表 P2 集合计数)
+    // 手工 const 表已由 manifest 派生取代(数量断言改静态表 P2 集合计数)。
+    // delegate 统一装配批:delegate 升 Sensitive 加入治理裁决集,集合演进
+    // 24→25(重录已 diff 审——数量锁 67 不变,级别变化不增减条目数)。
     let p2_count = crate::agent::tool_manifest::static_manifests()
         .iter()
         .filter(|m| m.is_p2_adjudicated())
         .count();
-    assert_eq!(p2_count, 24);
+    assert_eq!(p2_count, 25);
     for t in [
         "file_create",
         "file_move",
@@ -2797,6 +2876,7 @@ fn p2_adjudication_table_matches_design() {
         "git_commit",
         "rule_activate",
         "bundle_import",
+        "delegate",
     ] {
         assert!(is_governance_adjudication_tool(t), "{t} must be gated");
     }
