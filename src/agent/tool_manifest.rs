@@ -130,7 +130,7 @@ pub enum SandboxScope {
     NoSandbox,
 }
 
-/// 超时档（PR-6 执行契约接线前不改变现有 60s 全局行为）
+/// 超时档（执行器生命周期契约：执行超时按档位分派）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeoutClass {
@@ -138,8 +138,19 @@ pub enum TimeoutClass {
     Fast,
     /// 60s（现状全局默认）
     Default,
-    /// 600s（容器/构建类，D3 采纳后启用）
+    /// 600s（容器/构建类，容器域策略采纳后启用）
     Long,
+}
+
+impl TimeoutClass {
+    /// 超时档 → 执行超时值（全仓唯一映射点，执行路径按此分派）
+    pub fn duration(self) -> std::time::Duration {
+        match self {
+            TimeoutClass::Fast => std::time::Duration::from_secs(30),
+            TimeoutClass::Default => std::time::Duration::from_secs(60),
+            TimeoutClass::Long => std::time::Duration::from_secs(600),
+        }
+    }
 }
 
 /// agentTools.* 开关绑定（从 serve_tools TOOL_SWITCH_KEYS 迁移，快照测试锁等价）
@@ -253,7 +264,7 @@ pub struct ToolManifest {
     pub default_switch: Option<SwitchBinding>,
     /// 沙箱域
     pub sandbox_scope: SandboxScope,
-    /// 超时档（PR-6 接线前不改变现有 60s 行为）
+    /// 超时档（执行路径按此分派，见 [`TimeoutClass::duration`]）
     pub timeout_class: TimeoutClass,
 }
 
@@ -678,6 +689,23 @@ mod tests {
                 m.name
             );
         }
+    }
+
+    #[test]
+    fn test_timeout_class_duration_mapping() {
+        // 超时档 → 执行超时值映射锁(与枚举变体文档一致)
+        assert_eq!(
+            TimeoutClass::Fast.duration(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            TimeoutClass::Default.duration(),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            TimeoutClass::Long.duration(),
+            std::time::Duration::from_secs(600)
+        );
     }
 
     #[test]

@@ -30,9 +30,19 @@ pub trait ToolFunction: Send + Sync {
     /// - `Ok(Value)`:工具执行结果
     /// - `Err(String)`:错误描述
     async fn call(&self, args: &Value) -> IoResult;
+
+    /// 执行超时钩子(执行器生命周期契约:超时=终止并记账,非放弃)
+    ///
+    /// 外层执行守卫在 manifest.timeout_class 档位到期时调用。实现方应终止
+    /// 在飞子进程/任务,并让 [`Self::call`] 尽快返回真实结局(如 killed 记账)。
+    /// 缺省 no-op:未实现时外层在终止宽限期满后放弃等待(兜底语义)。
+    fn on_execution_timeout(&self) {}
 }
 
-const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+/// 终止宽限:执行超时钩子触发后,收取工具真实结局(killed 记账)的等待上限
+///
+/// 外层放弃时点 = manifest.timeout_class 档位值 + 本宽限。
+const KILL_GRACE: Duration = Duration::from_secs(5);
 
 /// 注册条目：治理元数据(manifest) + 执行器(func)成对在场
 ///
@@ -60,6 +70,9 @@ impl std::fmt::Debug for ToolEntry {
 #[derive(Clone)]
 pub struct ToolHandler {
     tools: Arc<BTreeMap<String, ToolEntry>>,
+    /// 测试注入:覆盖(执行超时, 终止宽限)——短超时实测钩子/放弃路径
+    #[cfg(test)]
+    test_timeouts: Option<(Duration, Duration)>,
 }
 
 impl std::fmt::Debug for ToolHandler {
@@ -75,6 +88,8 @@ impl ToolHandler {
     pub fn new() -> Self {
         Self {
             tools: Arc::new(BTreeMap::new()),
+            #[cfg(test)]
+            test_timeouts: None,
         }
     }
 
@@ -82,6 +97,8 @@ impl ToolHandler {
     pub fn with_tools(tools: BTreeMap<String, ToolEntry>) -> Self {
         Self {
             tools: Arc::new(tools),
+            #[cfg(test)]
+            test_timeouts: None,
         }
     }
 
@@ -105,6 +122,8 @@ impl ToolHandler {
             .collect();
         Self {
             tools: Arc::new(tools),
+            #[cfg(test)]
+            test_timeouts: None,
         }
     }
 
@@ -175,28 +194,75 @@ impl ToolHandler {
     ///
     /// 供 runner 的并行执行路径(`execute_single_tool`)直接调用,
     /// 跳过 `params.get("tool_name")` 解包步骤。
-    /// 包含 60s 超时(同 `IoHandler::execute`)。
+    ///
+    /// 执行器生命周期契约(超时=终止并记账,非放弃):执行超时按
+    /// manifest.timeout_class 档位分派;档位到期先触发工具的执行超时钩子
+    /// ([`ToolFunction::on_execution_timeout`],工具侧终止进程族并回传真实
+    /// 结局),再等 [`KILL_GRACE`] 宽限收取真实结局;宽限期满仍无结局才放弃
+    /// 等待(工具未实现钩子时的兜底语义,放弃消息秒数=档位值)。
     pub async fn execute_by_name(&self, tool_name: &str, args: &Value) -> IoResult {
-        let func = self
+        let entry = self
             .tools
             .get(tool_name)
-            .ok_or_else(|| format!("tool not found: {tool_name}"))?
-            .func
-            .clone();
+            .ok_or_else(|| format!("tool not found: {tool_name}"))?;
+        let func = entry.func.clone();
+        let exec_timeout = self.exec_timeout_for(&entry.manifest);
+        let kill_grace = self.kill_grace();
 
         debug!(tool_name = tool_name, "ready to invoke tool (async)");
 
-        tokio::time::timeout(TOOL_TIMEOUT, func.call(args))
-            .await
-            .map_err(|_| {
-                format!(
-                    "tool '{tool_name}' timed out after {}s. Hint: for reading a specific file use 'file_read'; \
-                     for listing a directory use 'file_list'; full-tree search ('search_files' / 'grep_files') \
-                     may be slow on large workspaces — pass 'dir' to scope it or 'exclude' to skip big directories \
-                     (default excludes: target, node_modules, .git, .evo-trash, data)",
-                    TOOL_TIMEOUT.as_secs()
-                )
-            })?
+        // 有界等待三段式:档位到期 → 钩子(终止) → 宽限收真实结局 → 放弃
+        let mut fut = func.call(args);
+        let kill_at = tokio::time::Instant::now() + exec_timeout;
+        let give_up_at = kill_at + kill_grace;
+        let mut hooked = false;
+
+        let outcome = loop {
+            let wait_point = if hooked { give_up_at } else { kill_at };
+            tokio::select! {
+                biased;
+                res = &mut fut => break Some(res),
+                _ = tokio::time::sleep_until(wait_point) => {
+                    if hooked {
+                        // 宽限期满仍无真实结局:放弃等待(兜底语义)
+                        break None;
+                    }
+                    // 档位到期:触发执行超时钩子(工具侧终止进程族),
+                    // 随后仅再等一个宽限期收取真实结局
+                    hooked = true;
+                    func.on_execution_timeout();
+                }
+            }
+        };
+
+        match outcome {
+            Some(result) => result,
+            None => Err(format!(
+                "tool '{tool_name}' timed out after {}s. Hint: for reading a specific file use 'file_read'; \
+                 for listing a directory use 'file_list'; full-tree search ('search_files' / 'grep_files') \
+                 may be slow on large workspaces — pass 'dir' to scope it or 'exclude' to skip big directories \
+                 (default excludes: target, node_modules, .git, .evo-trash, data)",
+                exec_timeout.as_secs()
+            )),
+        }
+    }
+
+    /// 执行超时值(按 manifest.timeout_class 档位分派;测试可注入覆盖)
+    fn exec_timeout_for(&self, manifest: &ToolManifest) -> Duration {
+        #[cfg(test)]
+        if let Some((exec, _)) = self.test_timeouts {
+            return exec;
+        }
+        manifest.timeout_class.duration()
+    }
+
+    /// 终止宽限(钩子触发后收取真实结局的等待上限;测试可注入覆盖)
+    fn kill_grace(&self) -> Duration {
+        #[cfg(test)]
+        if let Some((_, grace)) = self.test_timeouts {
+            return grace;
+        }
+        KILL_GRACE
     }
 }
 
@@ -325,5 +391,129 @@ mod tests {
             m.spec,
             crate::agent::tool_manifest::SpecSource::Inline { .. }
         ));
+    }
+
+    // === 执行器生命周期契约:超时档分派 + 钩子 + 终止宽限 ===
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// 钩子探针:call 挂起等待钩子置位,随后回传真实结局(killed 形态)
+    struct HookProbe {
+        fired: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolFunction for HookProbe {
+        async fn call(&self, _args: &Value) -> IoResult {
+            let started = std::time::Instant::now();
+            while !self.fired.load(Ordering::Relaxed) {
+                if started.elapsed() > Duration::from_secs(10) {
+                    return Err("probe natural exit (hook never fired)".to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err("tool killed (exit_code=Some(-9))".to_string())
+        }
+
+        fn on_execution_timeout(&self) {
+            self.fired.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 挂起探针:不实现钩子(缺省 no-op),call 远超测试宽限
+    struct StuckTool;
+
+    #[async_trait::async_trait]
+    impl ToolFunction for StuckTool {
+        async fn call(&self, _args: &Value) -> IoResult {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(Value::from("never"))
+        }
+    }
+
+    fn handler_with_test_timeouts(
+        static_name: &str,
+        func: Arc<dyn ToolFunction>,
+        exec: Duration,
+        grace: Duration,
+    ) -> ToolHandler {
+        let mut handler = ToolHandler::new();
+        let manifest = lookup_static(static_name)
+            .unwrap_or_else(|| panic!("static manifest missing: {static_name}"));
+        handler.register(manifest, func);
+        handler.test_timeouts = Some((exec, grace));
+        handler
+    }
+
+    #[test]
+    fn test_exec_timeout_follows_manifest_timeout_class() {
+        // 分派断言:Fast/Default 档工具按静态表取不同超时值
+        let handler = ToolHandler::new();
+        let fast = lookup_static("grep_files").unwrap();
+        let default = lookup_static("shell_exec").unwrap();
+        assert_eq!(
+            fast.timeout_class,
+            crate::agent::tool_manifest::TimeoutClass::Fast
+        );
+        assert_eq!(
+            default.timeout_class,
+            crate::agent::tool_manifest::TimeoutClass::Default
+        );
+        assert_eq!(handler.exec_timeout_for(&fast), Duration::from_secs(30));
+        assert_eq!(handler.exec_timeout_for(&default), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn test_timeout_hook_delivers_real_outcome_within_grace() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let probe = HookProbe {
+            fired: fired.clone(),
+        };
+        // 短超时实测:档位 100ms 到期触发钩子 → 真实结局(killed)在宽限内收取
+        let handler = handler_with_test_timeouts(
+            "grep_files",
+            Arc::new(probe),
+            Duration::from_millis(100),
+            Duration::from_secs(2),
+        );
+        let started = std::time::Instant::now();
+        let result = handler.execute_by_name("grep_files", &Value::Null).await;
+        let elapsed = started.elapsed();
+
+        assert!(fired.load(Ordering::Relaxed), "hook must fire");
+        let err = result.expect_err("killed real outcome is an Err");
+        assert!(err.contains("killed"), "real outcome expected, got: {err}");
+        // 真实结局在宽限期内收取(远早于探针 10s 自然退出上限)
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "took too long: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_grace_expiry_gives_up_with_hint() {
+        // 未实现钩子的挂起工具:档位 + 宽限期满后放弃等待,不悬挂至自然结束
+        let handler = handler_with_test_timeouts(
+            "file_read",
+            Arc::new(StuckTool),
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        let result = handler.execute_by_name("file_read", &Value::Null).await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("stuck tool must time out");
+        assert!(err.contains("timed out"), "got: {err}");
+        assert!(err.contains("Hint:"), "hint text preserved, got: {err}");
+        // 放弃发生在宽限期满(而非 30s 挂起自然结束)
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "gave up too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "grace expiry must not hang: {elapsed:?}"
+        );
     }
 }
