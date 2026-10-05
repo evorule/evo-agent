@@ -460,11 +460,23 @@ fn win_direct_children_alive(pid: u32) -> Option<bool> {
     )
 }
 
-/// [unix] 进程组空核验:组级 SIGKILL 由内核对组内全员投递,`kill -0`
-/// 探测组空(ESRCH)即核验通过。Some(true)=组空;Some(false)=组内仍有成员;
+/// [unix] 进程组空核验:组级 SIGKILL 由内核对组内全员投递,组内无存活
+/// 成员即核验通过。Some(true)=组空;Some(false)=组内仍有成员;
 /// None=探测不可用(不确定)。
+///
+/// zombie 不算存活者:Z 状态是已死进程的进程表残体(孤儿收养方未及
+/// reap 或不再 reap),不执行任何代码,不构成逃逸存活者。Linux 经
+/// /proc 枚举按状态甄别;`kill -0` 无法区分 zombie 与存活者,仅作
+/// /proc 不可用时的回退与其余 unix 平台的探测路径。
 #[cfg(unix)]
 fn unix_group_empty(pgid: u32) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(has_live) = linux_group_has_live_member(pgid) {
+            return Some(!has_live);
+        }
+        // /proc 不可用(异常环境):回落 kill -0 组存在性探测
+    }
     match Command::new("kill")
         .arg("-0")
         .arg(format!("-{pgid}"))
@@ -474,6 +486,43 @@ fn unix_group_empty(pgid: u32) -> Option<bool> {
         Ok(s) => Some(!s.success()),
         Err(_) => None,
     }
+}
+
+/// [linux] /proc 枚举组内存活成员(pgrp==pgid 且状态非 Z)
+///
+/// stat 形态:`pid (comm) state ppid pgrp ...`——comm 可含空格与右括号,
+/// 从最后一个 `)` 之后切字段。读到即 Some;成员全为 zombie 也返回
+/// Some(false)(无存活者)。/proc 不可用返回 None(交由调用方回退)。
+#[cfg(target_os = "linux")]
+fn linux_group_has_live_member(pgid: u32) -> Option<bool> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut found_member = false;
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_str().unwrap_or("").parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let mut fields = stat[close + 1..].split_ascii_whitespace();
+        // ')' 后首个字段为 state,其后为 ppid、pgrp(字段序按 proc(5))
+        let Some(state) = fields.next() else { continue };
+        let Some(ppid) = fields.next() else { continue };
+        let Some(Ok(pgrp)) = fields.next().map(|f| f.parse::<u32>()) else {
+            continue;
+        };
+        let _ = ppid;
+        if pgrp == pgid {
+            found_member = true;
+            if !state.starts_with('Z') {
+                return Some(true);
+            }
+        }
+    }
+    Some(found_member)
 }
 
 /// 击杀后核验轮询预算(20×150ms=3s 上限;仅终止路径执行,不触正常路径)
