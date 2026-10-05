@@ -299,11 +299,13 @@ enum FamilyOutcome {
     Completed(std::process::Output),
     /// spawn/等待 IO 失败
     Failed(std::io::Error),
-    /// 超时(或执行超时钩子)触发进程族终止,携带回收到的真实结局与主进程 pid
-    /// (pid 供轨迹审计留痕与进程回收断言)
+    /// 超时(或执行超时钩子)触发进程族终止,携带回收到的真实结局、主进程 pid
+    /// 与击杀后核验结论(pid 供轨迹审计留痕与进程回收断言;verified 语义见
+    /// [`KilledOutcome::verified`])
     Terminated {
         output: std::process::Output,
         pid: u32,
+        verified: bool,
     },
 }
 
@@ -358,10 +360,138 @@ fn terminate_family_by_pid(pid: u32) {
 }
 
 /// 终止整个进程族并回收主进程(执行器生命周期契约:超时=终止而非放弃)
+///
+/// 击杀后核验由调用方完成(两相核验:击杀前快照后代集合,击杀后扫描存留;
+/// Windows 快照须在击杀前采集——树存活时 PPID 链才完整)。
 fn terminate_family(child: &mut std::process::Child) {
     terminate_family_by_pid(child.id());
     let _ = child.kill(); // 直杀兜底:组级/树级终止不可用时保证主进程回收
     let _ = child.wait(); // reap(僵尸预防),取真实结局
+}
+
+/// [windows] 击杀前快照:全量进程表按 PPID 链收集 `<pid>` 的全部后代
+/// (树存活时链条完整,快照集合即两相核验基线)。快照不可用返回 None,
+/// 调用方降级为击杀后直接子代清点——不确定性显式入账而非静默宣称已净。
+#[cfg(windows)]
+fn win_descendant_pids(pid: u32) -> Option<Vec<u32>> {
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Csv -NoTypeInformation",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parse = |s: &str| s.trim_matches('"').trim().parse::<u32>().ok();
+    let mut parent_of: HashMap<u32, u32> = HashMap::new();
+    for line in text.lines().skip(1) {
+        let mut it = line.split(',');
+        let (Some(p), Some(pp)) = (it.next().and_then(parse), it.next().and_then(parse)) else {
+            continue;
+        };
+        parent_of.insert(p, pp);
+    }
+    if parent_of.is_empty() {
+        return None;
+    }
+    let mut descendants: Vec<u32> = Vec::new();
+    let mut frontier = vec![pid];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(cur) = frontier.pop() {
+        if !seen.insert(cur) {
+            continue;
+        }
+        for (&child_pid, &parent) in parent_of.iter() {
+            if parent == cur && !descendants.contains(&child_pid) {
+                descendants.push(child_pid);
+                frontier.push(child_pid);
+            }
+        }
+    }
+    Some(descendants)
+}
+
+/// [windows] 击杀后核验:任务表单次扫描。Some(true)=发现快照集合存活者;
+/// Some(false)=集合全部清零;None=工具不可用(不确定)。
+#[cfg(windows)]
+fn win_pids_alive(pids: &[u32]) -> Option<bool> {
+    let out = Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(pids.iter().any(|p| text.contains(&format!(",\"{p}\","))))
+}
+
+/// [windows] 击杀后直接子代清点(钩子路径回退核验):击杀时无击杀前快照,
+/// 仅能按 PPID=击杀目标清点直接子代;链条经已亡中间者的更深层后代不可达,
+/// 覆盖面窄于两相核验。None=工具不可用(不确定)。
+#[cfg(windows)]
+fn win_direct_children_alive(pid: u32) -> Option<bool> {
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-CimInstance Win32_Process -Filter \"ParentProcessId={pid}\").Count"),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok()?
+            > 0,
+    )
+}
+
+/// [unix] 进程组空核验:组级 SIGKILL 由内核对组内全员投递,`kill -0`
+/// 探测组空(ESRCH)即核验通过。Some(true)=组空;Some(false)=组内仍有成员;
+/// None=探测不可用(不确定)。
+#[cfg(unix)]
+fn unix_group_empty(pgid: u32) -> Option<bool> {
+    match Command::new("kill")
+        .arg("-0")
+        .arg(format!("-{pgid}"))
+        .stdin(std::process::Stdio::null())
+        .status()
+    {
+        Ok(s) => Some(!s.success()),
+        Err(_) => None,
+    }
+}
+
+/// 击杀后核验轮询预算(20×150ms=3s 上限;仅终止路径执行,不触正常路径)
+const SURVIVOR_VERIFY_ATTEMPTS: usize = 20;
+const SURVIVOR_VERIFY_INTERVAL: Duration = Duration::from_millis(150);
+
+/// 击杀后核验轮询:进程终止异步生效(强制终止请求发出后内核回收有延迟),
+/// 存活清零前短轮询;预算耗尽仍有存活或探测不可用 = 核验不通过——不确定性
+/// 显式入账而非静默宣称已净。清零即刻返回,不付满预算。
+fn poll_family_clear(mut clear: impl FnMut() -> Option<bool>) -> bool {
+    for _ in 0..SURVIVOR_VERIFY_ATTEMPTS {
+        match clear() {
+            Some(true) => return true,
+            Some(false) => std::thread::sleep(SURVIVOR_VERIFY_INTERVAL),
+            None => return false,
+        }
+    }
+    false
 }
 
 /// 执行后端(P1 执行桥:配置选择器 local / docker-exec)
@@ -525,6 +655,9 @@ impl ShellExecTool {
         let started = std::time::Instant::now();
         let mut terminated = false;
         let mut status: Option<std::process::ExitStatus> = None;
+        // 击杀前后代快照(两相核验基线;仅自击路径采集,钩子路径无击杀前时机)
+        #[cfg(windows)]
+        let mut descendants: Option<Vec<u32>> = None;
         loop {
             if cancel.load(Ordering::Relaxed) {
                 terminated = true;
@@ -537,6 +670,10 @@ impl ShellExecTool {
                 }
                 Ok(None) => {
                     if started.elapsed() >= timeout {
+                        #[cfg(windows)]
+                        {
+                            descendants = win_descendant_pids(pid);
+                        }
                         terminate_family(&mut child);
                         terminated = true;
                         break;
@@ -554,6 +691,25 @@ impl ShellExecTool {
                 Err(e) => return FamilyOutcome::Failed(e),
             },
         };
+        // 击杀后核验:进程族无存活的显式化(核验不通过/不可用均记 false,
+        // 不确定性入账——核验语义见 KilledOutcome::verified)
+        let verified = if terminated {
+            #[cfg(windows)]
+            {
+                match descendants {
+                    Some(set) => poll_family_clear(|| win_pids_alive(&set).map(|alive| !alive)),
+                    None => {
+                        poll_family_clear(|| win_direct_children_alive(pid).map(|alive| !alive))
+                    }
+                }
+            }
+            #[cfg(unix)]
+            {
+                poll_family_clear(|| unix_group_empty(pid))
+            }
+        } else {
+            false
+        };
         let stdout = stdout_reader.join().unwrap_or_default();
         let stderr = stderr_reader.join().unwrap_or_default();
         let output = std::process::Output {
@@ -562,7 +718,11 @@ impl ShellExecTool {
             stderr,
         };
         if terminated {
-            FamilyOutcome::Terminated { output, pid }
+            FamilyOutcome::Terminated {
+                output,
+                pid,
+                verified,
+            }
         } else {
             FamilyOutcome::Completed(output)
         }
@@ -577,6 +737,7 @@ impl ShellExecTool {
         pid: u32,
         status: &std::process::ExitStatus,
         timeout: Duration,
+        survivors_verified: bool,
     ) -> IoResult {
         let exit_code = status.code();
         #[cfg(unix)]
@@ -592,11 +753,13 @@ impl ShellExecTool {
                 ident: original_cmd.to_string(),
                 exit_code,
                 signal,
+                verified: survivors_verified,
             },
         );
         Err(format!(
             "command '{original_cmd}' timed out after {}s; process family terminated \
-             (pid={pid}, exit_code={exit_code:?}, signal={signal:?})",
+             (pid={pid}, exit_code={exit_code:?}, signal={signal:?}, \
+             survivors_verified={survivors_verified})",
             timeout.as_secs()
         ))
     }
@@ -650,8 +813,18 @@ impl ShellExecTool {
                     program, e
                 ));
             }
-            FamilyOutcome::Terminated { output, pid } => {
-                return Self::report_terminated(original_cmd, pid, &output.status, self.timeout);
+            FamilyOutcome::Terminated {
+                output,
+                pid,
+                verified,
+            } => {
+                return Self::report_terminated(
+                    original_cmd,
+                    pid,
+                    &output.status,
+                    self.timeout,
+                    verified,
+                );
             }
             FamilyOutcome::Completed(output) => {
                 Self::completed_result(original_cmd, program, &output, self.max_output_bytes)
@@ -720,9 +893,11 @@ impl ShellExecTool {
                 "failed to spawn '{}': {} (is docker installed and in PATH?)",
                 argv[0], e
             )),
-            FamilyOutcome::Terminated { output, pid } => {
-                Self::report_terminated(original_cmd, pid, &output.status, self.timeout)
-            }
+            FamilyOutcome::Terminated {
+                output,
+                pid,
+                verified,
+            } => Self::report_terminated(original_cmd, pid, &output.status, self.timeout, verified),
             FamilyOutcome::Completed(output) => {
                 let stdout_bytes = if output.stdout.len() > self.max_output_bytes {
                     &output.stdout[..self.max_output_bytes]
@@ -1432,6 +1607,49 @@ mod tests {
                 count_group_members(pid)
             );
         }
+    }
+
+    #[test]
+    fn test_timeout_kill_reports_survivor_verification() {
+        // 击杀后核验:两相核验(击杀前快照+击杀后扫描/Unix 组空探测)结论
+        // 显式入账——错误信息与轨迹 killed 载荷均携带核验结论
+        let _registry = crate::agent::tool_trace::KILLED_OUTCOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _serial = PING_SERIES.lock().unwrap_or_else(|p| p.into_inner());
+
+        // 树形态:主进程再 spawn 孙进程(cmd→PING.EXE / sh→sleep)
+        #[cfg(windows)]
+        let (cmd_str, parts) = (
+            "cmd /c ping -n 31 127.0.0.1",
+            vec!["cmd", "/c", "ping", "-n", "31", "127.0.0.1"],
+        );
+        #[cfg(unix)]
+        let (cmd_str, parts) = (
+            "sh -c 'sleep 31 & wait'",
+            vec!["sh", "-c", "sleep 31 & wait"],
+        );
+
+        let tool = ShellExecTool::new().with_timeout(1);
+        let result = tool.execute(&parts, cmd_str);
+        let err = result.expect_err("hanging command tree must time out");
+        assert!(
+            err.contains("survivors_verified=true"),
+            "survivor verification must be explicit in the outcome: {err}"
+        );
+
+        // 轨迹面核验结论同步入账
+        let mut collector = crate::agent::tool_trace::ToolTraceCollector::default();
+        collector.record(
+            "shell_exec",
+            &serde_json::json!({"command": cmd_str}),
+            "error",
+            1000,
+        );
+        let entry = collector.drain().remove(0);
+        assert_eq!(entry["status"], "killed");
+        assert_eq!(entry["killed"]["verified"], true, "got: {entry}");
+        crate::agent::tool_trace::clear_killed_outcomes();
     }
 
     #[test]

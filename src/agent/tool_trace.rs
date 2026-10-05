@@ -50,6 +50,11 @@ pub struct KilledOutcome {
     pub exit_code: Option<i32>,
     /// 终止信号(Unix SIGKILL=9;Windows 强制终止无信号 = None)
     pub signal: Option<i32>,
+    /// 击杀后核验:true = 按所用核验方法未发现进程族存活者(覆盖面见
+    /// 回收方注释;Unix 进程组全组 / Windows 击杀前快照集合,回退路径为
+    /// 直接子代);false = 发现存活或核验不可用——不确定性显式入账,
+    /// 不静默宣称已净。
+    pub verified: bool,
 }
 
 static KILLED_OUTCOMES: Mutex<Vec<KilledOutcome>> = Mutex::new(Vec::new());
@@ -215,6 +220,7 @@ impl ToolTraceCollector {
                     entry["killed"] = serde_json::json!({
                         "exit_code": killed.exit_code,
                         "signal": killed.signal,
+                        "verified": killed.verified,
                     });
                 }
                 let hits = detect_danger_hits(cmd);
@@ -633,6 +639,7 @@ mod tests {
             ident: "lifecycle-probe-a".to_string(),
             exit_code: None,
             signal: Some(9),
+            verified: true,
         });
         let mut c = ToolTraceCollector::default();
         c.record(
@@ -658,6 +665,7 @@ mod tests {
             ident: "lifecycle-probe-b".to_string(),
             exit_code: Some(1),
             signal: None,
+            verified: true,
         });
         let mut c = ToolTraceCollector::default();
         // 无匹配登记的调用:status 保持采集点原值,登记表不被误消费
@@ -697,6 +705,7 @@ mod tests {
                 ident: format!("bounded-{i}"),
                 exit_code: Some(0),
                 signal: None,
+                verified: false,
             });
         }
         assert_eq!(killed_outcome_len(), MAX_KILLED_OUTCOMES);
@@ -718,6 +727,7 @@ mod tests {
             ident: "lifecycle-probe-c".to_string(),
             exit_code: Some(2),
             signal: None,
+            verified: true,
         });
         let mut c = ToolTraceCollector::default();
         c.record(
