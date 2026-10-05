@@ -28,7 +28,7 @@ use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::metrics::{Metrics, SharedMetrics, SseConnectionGuard};
 use crate::api::serve_tools::RuntimeIdentity;
 use crate::api::workspace_client::WorkspaceApiClient;
-use crate::config::LlmStatusSnapshot;
+use crate::config::{LlmConfig, LlmStatusSnapshot};
 use crate::io_handlers::tool_handler::ToolHandler;
 
 /// G6:正在运行的 session → 取消令牌的映射(SessionStore)
@@ -171,6 +171,12 @@ pub struct AgentApiState {
     toolkit: Arc<ToolHandler>,
     /// LLM 配置脱敏快照(凭据可视化状态端点;不含任何密钥内容)
     llm_status: Arc<LlmStatusSnapshot>,
+    /// LLM 配置统一解析产物(env 优先、toml 兜底;serve 与 CLI 共用同一解析链)
+    ///
+    /// serve 面各请求路径的 handler 构造统一走
+    /// `LlmHandler::from_config(state.llm_config())`,不再绕过配置体系
+    /// 直读裸环境变量。
+    llm_config: Arc<LlmConfig>,
     /// 会话索引(JSONL 本地持久化;对话与历史阶段的枚举面)
     session_index: Arc<crate::api::session_index::SessionIndex>,
     /// 会话消息本地快照(展示层非权威副本;TTL 回收后历史仍可见)
@@ -241,6 +247,12 @@ impl AgentApiState {
             workspace_client,
             toolkit,
             llm_status: Arc::new(LlmStatusSnapshot::unconfigured()),
+            // 默认态:api_key 置空(from_config 视空为未配置),待 cmd_serve
+            // 注入经统一解析的完整配置
+            llm_config: Arc::new(LlmConfig {
+                api_key: String::new(),
+                ..LlmConfig::default()
+            }),
         };
         // 治理写权开关启动期观测:敏感部署(agentTools.governanceWrite=false)
         // 一开服即显式曝光只读模式,避免「写工具静默消失」被误判为故障。
@@ -264,6 +276,20 @@ impl AgentApiState {
     /// 获取 LLM 配置脱敏快照(状态端点消费)
     pub fn llm_status(&self) -> &LlmStatusSnapshot {
         &self.llm_status
+    }
+
+    /// 注入统一解析后的 LLM 配置(builder 风格,供 serve 启动时调用)
+    ///
+    /// `config.llm` 来自 `Config::load`(env 优先、toml 兜底的统一解析),
+    /// serve 面各请求路径的 handler 构造与 CLI 共用同一语义。
+    pub fn with_llm_config(mut self, config: LlmConfig) -> Self {
+        self.llm_config = Arc::new(config);
+        self
+    }
+
+    /// 获取统一解析后的 LLM 配置(请求路径 handler 构造消费)
+    pub fn llm_config(&self) -> &LlmConfig {
+        &self.llm_config
     }
 
     /// 会话索引的引用(WS 处理器记录会话活动)
@@ -741,7 +767,9 @@ async fn run_agent(
         def,
         state.evorule_client.clone(),
         filtered,
-        None, // llm_handler — serve 模式从 env 自动读
+        Some(crate::io_handlers::LlmHandler::from_config(
+            state.llm_config(),
+        )), // llm_handler — serve 与 CLI 共用统一解析产物(env 优先、toml 兜底)
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -895,7 +923,9 @@ async fn run_agent_stream(
         def,
         state.evorule_client.clone(),
         filtered,
-        None, // llm_handler — serve 模式从 env 自动读
+        Some(crate::io_handlers::LlmHandler::from_config(
+            state.llm_config(),
+        )), // llm_handler — serve 与 CLI 共用统一解析产物(env 优先、toml 兜底)
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -1628,10 +1658,10 @@ async fn replay_session_events(
 
     let mut engine = ReplayEngine::new(store);
 
-    // 可选注入 LLM(narrate=true 时)
+    // 可选注入 LLM(narrate=true 时)——统一解析产物,与 CLI 同一配置语义
     let do_narrate = params.narrate.unwrap_or(false);
     if do_narrate {
-        let llm = crate::io_handlers::LlmHandler::with_defaults();
+        let llm = crate::io_handlers::LlmHandler::from_config(state.llm_config());
         engine = engine.with_llm(llm);
     }
 
@@ -1816,6 +1846,23 @@ mod tests {
             AgentDefinitionManager::with_default_dir(),
             EvoruleApiClient::new("http://localhost:8080"),
         )
+    }
+
+    #[test]
+    fn test_state_carries_resolved_llm_config() {
+        // serve 接线:state 携带统一解析产物,请求路径 handler 构造
+        // (from_config)与 CLI 直接消费 config.llm 输入相同——
+        // 双路径一致性由同源保证,此处锁住 state 的携带与传递
+        let injected = crate::config::LlmConfig {
+            api_key: "resolved-key".to_string(),
+            model: "resolved-model".to_string(),
+            ..crate::config::LlmConfig::default()
+        };
+        let state = make_test_state().with_llm_config(injected.clone());
+        assert_eq!(state.llm_config(), &injected);
+        // 默认态(未注入):api_key 为空(from_config 视为未配置,不误用占位符)
+        let fresh = make_test_state();
+        assert!(fresh.llm_config().api_key.is_empty());
     }
 
     #[tokio::test]

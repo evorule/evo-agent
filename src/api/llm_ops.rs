@@ -147,15 +147,22 @@ impl LlmOpsError {
 ///
 /// 通用骨架：解析 op → 走到对应 handler。所有 op 共用同一套请求/响应契约（设计文档 §4）。
 pub async fn run_operation(
-    State(_state): State<AgentApiState>,
+    State(state): State<AgentApiState>,
     Path(operation): Path<String>,
     axum::Json(req): axum::Json<LlmOpRequest>,
 ) -> Result<axum::Json<LlmOpResponse>, (axum::http::StatusCode, String)> {
     let op = Operation::parse(&operation).map_err(|e| (e.status_code(), e.to_string()))?;
     info!(operation = op.as_str(), request_id = ?req.request_id, "LLM named operation invoked");
 
+    // 冒烟/离线测试开关：`EVO_AGENT_LLM_MOCK_CONTENT` 非空时用 mock handler，
+    // 不访问外部 LLM；未设置时走统一解析产物(state 持有,与 CLI 同一语义)。
+    let llm = match std::env::var("EVO_AGENT_LLM_MOCK_CONTENT") {
+        Ok(mock) => LlmHandler::mock(&mock),
+        Err(_) => LlmHandler::from_config(state.llm_config()),
+    };
+
     let model = req.model.as_deref().unwrap_or("default");
-    let result = run_llm_op(&op, &req)
+    let result = run_llm_op(&op, &req, llm)
         .await
         .map_err(|e| (e.status_code(), e.to_string()))?;
 
@@ -176,17 +183,15 @@ pub async fn run_operation(
 }
 
 /// 按 op 分发：构建 LLM prompt，调用 `LlmHandler::execute`（同步 + mock 兼容），解析输出。
-async fn run_llm_op(op: &Operation, req: &LlmOpRequest) -> Result<Value, LlmOpsError> {
+async fn run_llm_op(
+    op: &Operation,
+    req: &LlmOpRequest,
+    llm: LlmHandler,
+) -> Result<Value, LlmOpsError> {
     // 构建给 LLM 的用户消息（含 op 指令 + 入参序列化）
     let payload = serde_json::to_string(&req.params).unwrap_or_else(|_| "{}".to_string());
     let user_prompt = format!("{}\n\n入参 JSON：\n{}", op.prompt_instruction(), payload);
 
-    // 冒烟/离线测试开关：`EVO_AGENT_LLM_MOCK_CONTENT` 非空时用 mock handler，
-    // 不访问外部 LLM（供端到端契约验证；未设置时走真实 `with_defaults`）。
-    let llm = match std::env::var("EVO_AGENT_LLM_MOCK_CONTENT") {
-        Ok(mock) => LlmHandler::mock(&mock),
-        Err(_) => LlmHandler::with_defaults(),
-    };
     // 修复(2026-09-29 实测发现):字面量 "default" 不是真实模型名,
     // 直接下发会被 LLM API 拒绝(model=default 必失败)。仅当调用方
     // 显式指定 model 时才下发;否则缺省,由 LlmHandler 使用 default_model。

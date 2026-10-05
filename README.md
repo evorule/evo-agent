@@ -538,7 +538,6 @@ model = "MiniMax-M2.5"
 api_base = "https://api.minimax.io/v1/text/chatcompletion_v2"
 timeout_secs = 30
 max_retries = 3
-context_window_tokens = 8192
 
 [evorule]
 base_url = "http://127.0.0.1:18080"

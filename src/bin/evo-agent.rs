@@ -1792,7 +1792,11 @@ fn cmd_serve(
         config
             .llm
             .status_snapshot(config.llm_api_key_source.as_deref()),
-    ));
+    ))
+    // 配置统一:注入经统一解析的 LLM 配置(env 优先、toml 兜底)——
+    // serve 面各请求路径的 handler 构造与 CLI 共用同一解析产物,
+    // 不再绕过配置体系直读裸环境变量
+    .with_llm_config(config.llm.clone());
 
     // 工作台文件树实时刷新:启动 workdir 递归监听(400ms 去抖 + 规整),
     // 变更经 WS 广播(fs_events 帧)。fail-soft:启动失败仅告警,文件树
