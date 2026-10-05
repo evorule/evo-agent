@@ -383,10 +383,32 @@ impl ToolExecutionPipeline {
                     main_session = ?req.caller.session_id, tool = %req.tool_name, scope = %scope,
                     "tool intent blocked by governance rule (collab acceptance, adjudication channel)"
                 );
-                // 被治理拦截的调用也是真实执行史——进轨迹(status=blocked)
+                // 被治理拦截的调用也是真实执行史——进轨迹(status=blocked)。
+                // 轨迹锁显式处理：中毒=前持锁 panic，轨迹账面组件不可用=显式
+                // 失败（此时尚未执行，Ledger 拒绝无重复执行险）。
                 if let Some(tt) = deps.traces {
-                    if let Ok(mut tt) = tt.lock() {
-                        tt.record(req.tool_name, req.args, "blocked_by_governance", 0);
+                    match tt.lock() {
+                        Ok(mut tt) => {
+                            tt.record(req.tool_name, req.args, "blocked_by_governance", 0);
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                main_session = ?req.caller.session_id, tool = %req.tool_name,
+                                "tool trace lock poisoned at blocked_by_governance record"
+                            );
+                            ledger.denial = Some(DenialStage::Ledger);
+                            return PipelineOutcome {
+                                result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                                    DenialStage::Ledger,
+                                    format!(
+                                        "tool trace write failed (poisoned lock): {} \
+                                         blocked_by_governance",
+                                        req.tool_name
+                                    ),
+                                ))),
+                                ledger,
+                            };
+                        }
                     }
                 }
                 ledger.denial = Some(DenialStage::Governance);
@@ -407,7 +429,17 @@ impl ToolExecutionPipeline {
         }
         // P2 通道：治理级工具事前意图裁决（分级=manifest 派生）。与 R1 通道
         // 并存互不干扰；裁决会话轮内复用。原内联逻辑逐字迁入。
-        if let Some(intent) = resolve_tool_intent(req.tool_name, req.args, deps.boundary) {
+        if let Some(mut intent) = resolve_tool_intent(req.tool_name, req.args, deps.boundary) {
+            // 契约 session_ref 补齐：主会话 id 由调用方上下文写入解析输出，
+            // tool_intent_signal 派生 tool_intent.v1 契约时随 value 落链
+            // （裁决账面审计关联）。
+            if let Some(sid) = req.caller.session_id.as_deref() {
+                intent["session_ref"] = Value::from(sid);
+            }
+            // 账面证据统一契约形态：裁决事实与 journal 留痕均落 tool_intent.v1
+            // 契约 JSON（schema_ver/args_digest 锚点在账，摘要可从轨迹 args 复算）。
+            let contract = crate::agent::tool_intent::ToolIntentV1::from_resolved(&intent);
+            let contract_json = serde_json::to_string(&contract).unwrap_or_default();
             let allowed = match deps
                 .adjudicator
                 .lock()
@@ -433,16 +465,12 @@ impl ToolExecutionPipeline {
             ledger.adjudication.push(AdjudicationFact {
                 channel: "tool_intent_p2",
                 allowed,
-                evidence: serde_json::to_string(&intent).unwrap_or_default(),
+                evidence: contract_json.clone(),
             });
             if let Some(j) = deps.journal {
                 if let Err(e) = j.policy_judged(
                     if allowed { "allowed" } else { "blocked" },
-                    &format!(
-                        "{} intent={}",
-                        req.tool_name,
-                        serde_json::to_string(&intent).unwrap_or_default()
-                    ),
+                    &format!("{} intent={}", req.tool_name, contract_json),
                 ) {
                     ledger.denial = Some(DenialStage::Ledger);
                     return PipelineOutcome {
@@ -460,8 +488,29 @@ impl ToolExecutionPipeline {
                     "tool intent blocked by governance rule (tool intent adjudication, adjudication channel)"
                 );
                 if let Some(tt) = deps.traces {
-                    if let Ok(mut tt) = tt.lock() {
-                        tt.record(req.tool_name, req.args, "blocked_by_governance", 0);
+                    // 轨迹锁显式处理（同 R1 拦截臂：账面组件不可用=显式失败）
+                    match tt.lock() {
+                        Ok(mut tt) => {
+                            tt.record(req.tool_name, req.args, "blocked_by_governance", 0);
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                main_session = ?req.caller.session_id, tool = %req.tool_name,
+                                "tool trace lock poisoned at blocked_by_governance record"
+                            );
+                            ledger.denial = Some(DenialStage::Ledger);
+                            return PipelineOutcome {
+                                result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                                    DenialStage::Ledger,
+                                    format!(
+                                        "tool trace write failed (poisoned lock): {} \
+                                         blocked_by_governance",
+                                        req.tool_name
+                                    ),
+                                ))),
+                                ledger,
+                            };
+                        }
                     }
                 }
                 ledger.denial = Some(DenialStage::Governance);
@@ -519,16 +568,27 @@ impl ToolExecutionPipeline {
         if let Some(m) = deps.metrics {
             m.observe_tool_call(req.tool_name, tool_duration, tool_ok);
         }
-        // 轨迹采集（脱敏+截断在 collector 内;std Mutex 临界区无 await,
-        // G13 并发下 poison 按 fail-soft 跳过——原语义保持）
+        // 轨迹采集（脱敏+截断在 collector 内；std Mutex 临界区无 await）。
+        // 轨迹锁显式处理：中毒=前持锁 panic（进程状态可疑），error 留痕——
+        // 但执行已发生且真实结局必须回喂（此处拒绝会诱导 LLM 对已执行工具
+        // 重试，重复执行险大于账面缺口），故豁免 Ledger 拒绝、仅显式留痕
+        // 账面缺口（轨迹缺失以 error 日志为信号，不做静默跳过）。
         if let Some(tt) = deps.traces {
-            if let Ok(mut tt) = tt.lock() {
-                tt.record(
-                    req.tool_name,
-                    req.args,
-                    if tool_ok { "ok" } else { "error" },
-                    tool_duration.as_millis() as u64,
-                );
+            match tt.lock() {
+                Ok(mut tt) => {
+                    tt.record(
+                        req.tool_name,
+                        req.args,
+                        if tool_ok { "ok" } else { "error" },
+                        tool_duration.as_millis() as u64,
+                    );
+                }
+                Err(_) => {
+                    tracing::error!(
+                        main_session = ?req.caller.session_id, tool = %req.tool_name,
+                        "tool trace lock poisoned after execution; trace entry lost (ledger gap)"
+                    );
+                }
             }
         }
 
@@ -829,5 +889,270 @@ mod tests {
         // 裁决已发生且放行——账面应记裁决事实后死于账面写
         assert_eq!(out.ledger.adjudication.len(), 1);
         assert!(out.ledger.adjudication[0].allowed);
+    }
+
+    // ----- 账面可复算（LedgerRecord ↔ journal + tool_trace 一致性）-----
+
+    /// 账面记录桩：捕获 policy_judged 调用序列（账面可复算断言用）
+    struct RecordingJournal(std::sync::Mutex<Vec<(String, String)>>);
+    impl PolicyJudgedSink for RecordingJournal {
+        fn policy_judged(&self, verdict: &str, evidence: &str) -> Result<u64, JournalError> {
+            if let Ok(mut seq) = self.0.lock() {
+                seq.push((verdict.to_string(), evidence.to_string()));
+            }
+            Ok(0)
+        }
+    }
+
+    /// 装配放行判据 mock（before=0 命中一次 + 轮询=1，同 adjudicator.rs 形态）
+    async fn mock_allow_once(server: &mut mockito::Server) {
+        server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_body(r#"{"session_id": 90}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/sessions/90/state")
+            .with_status(200)
+            .with_body(r#"{"version": 0}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/sessions/90/state")
+            .with_status(200)
+            .with_body(r#"{"version": 1}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/sessions/90/command")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+    }
+
+    /// 装配拦截判据 mock（version 恒 0：1 次首查 + 20 次轮询，fail-closed 判据）
+    async fn mock_block_always(server: &mut mockito::Server) {
+        server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_body(r#"{"session_id": 90}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/sessions/90/state")
+            .with_status(200)
+            .with_body(r#"{"version": 0}"#)
+            .expect(21)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/sessions/90/command")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+    }
+
+    /// 账面可复算断言：从 journal（policy_judged 序列）+ tool_trace（record
+    /// 序列）重建与 LedgerRecord 一致的事实——裁决条数/结论/证据、执行结局
+    /// 与轨迹逐项对齐（账写不掉的镜像面：账面必须可由持久账复算）。
+    fn assert_ledger_rebuildable_from_books(
+        ledger: &LedgerRecord,
+        journal: &[(String, String)],
+        traces: &[Value],
+    ) {
+        // 裁决事实：journal 序列与 ledger.adjudication 逐条对齐
+        assert_eq!(
+            journal.len(),
+            ledger.adjudication.len(),
+            "裁决账条数必须一致"
+        );
+        for ((verdict, evidence), fact) in journal.iter().zip(&ledger.adjudication) {
+            assert_eq!(
+                verdict,
+                if fact.allowed { "allowed" } else { "blocked" },
+                "裁决结论必须一致: {evidence}"
+            );
+            assert!(
+                evidence.contains(&fact.evidence),
+                "journal 证据必须含 ledger 证据: {evidence} vs {}",
+                fact.evidence
+            );
+        }
+        // 执行事实：轨迹与 ledger.execution 对齐（被拒调用无执行结局，
+        // 轨迹记 blocked_by_governance；放行调用结局/时长逐值一致）
+        match (&ledger.execution, traces.last()) {
+            (Some(exec), Some(trace)) => {
+                assert_eq!(trace["tool_name"], ledger.tool_name);
+                assert_eq!(
+                    trace["status"],
+                    if exec.ok { "ok" } else { "error" },
+                    "轨迹结局必须与账面一致"
+                );
+                assert_eq!(trace["duration_ms"], exec.duration_ms);
+            }
+            (None, Some(trace)) => {
+                assert_eq!(trace["status"], "blocked_by_governance");
+                assert_eq!(trace["duration_ms"], 0);
+            }
+            (None, None) => {}
+            (Some(_), None) => panic!("账面有执行结局而轨迹为零——账面不可复算"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ledger_is_rebuildable_from_journal_and_traces_p2_allowed() {
+        // P2 放行链路：裁决放行→执行→三账（ledger/journal/tool_trace）互证；
+        // 契约摘要可从轨迹 args 复算（账面可复算）。
+        let mut server = mockito::Server::new_async().await;
+        mock_allow_once(&mut server).await;
+        let adj = tokio::sync::Mutex::new(AdjudicationChannel::new(
+            crate::api::evorule_client::EvoruleApiClient::new(&server.url()),
+            "default",
+        ));
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_create"]);
+        let args = serde_json::json!({"path": "rel.txt"});
+        let journal = RecordingJournal(std::sync::Mutex::new(Vec::new()));
+        let traces = std::sync::Mutex::new(ToolTraceCollector::default());
+        let mut deps = deps_for(&OkExecutor, &adj, &manifests);
+        deps.journal = Some(&journal);
+        deps.traces = Some(&traces);
+        let out = ToolExecutionPipeline
+            .execute(req_for("file_create", &args, &focus), deps)
+            .await;
+        assert!(out.result.is_ok(), "allowed tool must execute");
+        let jseq = journal.0.lock().expect("journal seq").clone();
+        let tseq = traces.lock().expect("traces").drain();
+        assert_ledger_rebuildable_from_books(&out.ledger, &jseq, &tseq);
+        // P2 契约证据：schema_ver/session_ref 在账、摘要可由轨迹 args 复算
+        let fact = &out.ledger.adjudication[0];
+        assert_eq!(fact.channel, "tool_intent_p2");
+        let contract: Value = serde_json::from_str(&fact.evidence).expect("契约 JSON");
+        assert_eq!(contract["schema_ver"], "tool_intent.v1");
+        assert_eq!(contract["session_ref"], "s-test");
+        assert_eq!(
+            contract["args_digest"],
+            crate::agent::tool_intent::args_digest(&tseq[0]["args"]),
+            "摘要必须可从轨迹 args 复算"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_is_rebuildable_from_journal_and_traces_p2_blocked() {
+        // P2 拦截链路：裁决拦截→轨迹记 blocked→三账互证（无执行结局）
+        let mut server = mockito::Server::new_async().await;
+        mock_block_always(&mut server).await;
+        let adj = tokio::sync::Mutex::new(AdjudicationChannel::new(
+            crate::api::evorule_client::EvoruleApiClient::new(&server.url()),
+            "default",
+        ));
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_create"]);
+        let args = serde_json::json!({"path": "rel.txt"});
+        let journal = RecordingJournal(std::sync::Mutex::new(Vec::new()));
+        let traces = std::sync::Mutex::new(ToolTraceCollector::default());
+        let mut deps = deps_for(&UnreachableExecutor, &adj, &manifests);
+        deps.journal = Some(&journal);
+        deps.traces = Some(&traces);
+        let out = ToolExecutionPipeline
+            .execute(req_for("file_create", &args, &focus), deps)
+            .await;
+        let denial = denial_of(&out);
+        assert_eq!(denial.stage, DenialStage::Governance);
+        assert_eq!(out.ledger.denial, Some(DenialStage::Governance));
+        assert!(out.ledger.execution.is_none());
+        let jseq = journal.0.lock().expect("journal seq").clone();
+        let tseq = traces.lock().expect("traces").drain();
+        assert_ledger_rebuildable_from_books(&out.ledger, &jseq, &tseq);
+        assert!(!out.ledger.adjudication[0].allowed, "拦截结论须入账");
+    }
+
+    #[tokio::test]
+    async fn ledger_is_rebuildable_from_traces_without_adjudication() {
+        // 非治理工具直通：journal 零条、轨迹 1 条 ok，与账面一致
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["grep_files"]);
+        let args = Value::Null;
+        let journal = RecordingJournal(std::sync::Mutex::new(Vec::new()));
+        let traces = std::sync::Mutex::new(ToolTraceCollector::default());
+        let mut deps = deps_for(&OkExecutor, &adj, &manifests);
+        deps.journal = Some(&journal);
+        deps.traces = Some(&traces);
+        let out = ToolExecutionPipeline
+            .execute(req_for("grep_files", &args, &focus), deps)
+            .await;
+        assert!(out.result.is_ok());
+        assert!(out.ledger.adjudication.is_empty());
+        let jseq = journal.0.lock().expect("journal seq").clone();
+        assert!(jseq.is_empty(), "无裁决无 journal 条目");
+        let tseq = traces.lock().expect("traces").drain();
+        assert_ledger_rebuildable_from_books(&out.ledger, &jseq, &tseq);
+    }
+
+    // ----- 轨迹锁中毒显式处理（账面组件不可用=显式失败）-----
+
+    /// 制造锁中毒（前持锁 panic），返回被毒化的采集器互斥体
+    fn poisoned_traces() -> std::sync::Arc<std::sync::Mutex<ToolTraceCollector>> {
+        let traces = std::sync::Arc::new(std::sync::Mutex::new(ToolTraceCollector::default()));
+        let t = std::sync::Arc::clone(&traces);
+        let _ = std::thread::spawn(move || {
+            let _guard = t.lock().expect("guard before poisoning panic");
+            panic!("poison the tool trace lock");
+        })
+        .join();
+        traces
+    }
+
+    #[tokio::test]
+    async fn poisoned_trace_lock_at_blocked_path_is_explicit_ledger_failure() {
+        // 拦截臂轨迹锁中毒：账写不掉=显式 Ledger 拒绝（未执行，无重复执行险）
+        let mut server = mockito::Server::new_async().await;
+        mock_block_always(&mut server).await;
+        let adj = tokio::sync::Mutex::new(AdjudicationChannel::new(
+            crate::api::evorule_client::EvoruleApiClient::new(&server.url()),
+            "default",
+        ));
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_create"]);
+        let args = serde_json::json!({"path": "rel.txt"});
+        let traces = poisoned_traces();
+        let mut deps = deps_for(&UnreachableExecutor, &adj, &manifests);
+        deps.traces = Some(traces.as_ref());
+        let out = ToolExecutionPipeline
+            .execute(req_for("file_create", &args, &focus), deps)
+            .await;
+        let denial = denial_of(&out);
+        assert_eq!(denial.stage, DenialStage::Ledger);
+        assert!(denial.reason.contains("tool trace write failed"));
+        assert_eq!(out.ledger.denial, Some(DenialStage::Ledger));
+    }
+
+    #[tokio::test]
+    async fn poisoned_trace_lock_after_execution_keeps_result_visible() {
+        // 执行臂轨迹锁中毒：执行已发生，真实结局必须回喂（拒绝会诱导重复
+        // 执行）；账面缺口仅 error 留痕，结局/账面不受影响。
+        let mut server = mockito::Server::new_async().await;
+        mock_allow_once(&mut server).await;
+        let adj = tokio::sync::Mutex::new(AdjudicationChannel::new(
+            crate::api::evorule_client::EvoruleApiClient::new(&server.url()),
+            "default",
+        ));
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_create"]);
+        let args = serde_json::json!({"path": "rel.txt"});
+        let traces = poisoned_traces();
+        let mut deps = deps_for(&OkExecutor, &adj, &manifests);
+        deps.traces = Some(traces.as_ref());
+        let out = ToolExecutionPipeline
+            .execute(req_for("file_create", &args, &focus), deps)
+            .await;
+        assert!(out.result.is_ok(), "执行结局必须回喂");
+        let exec = out.ledger.execution.as_ref().expect("执行结局必须入账");
+        assert!(exec.ok);
     }
 }

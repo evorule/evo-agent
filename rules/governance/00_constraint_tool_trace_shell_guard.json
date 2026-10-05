@@ -1,0 +1,61 @@
+{
+  "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
+  "kind": "rule_set",
+  "metadata": {
+    "tier": "constraint",
+    "title": "工具轨迹危险命令与违禁域守卫",
+    "description": "拦截携带 danger_hits 打标的工具轨迹入审计链，覆盖 shell_exec 与 http_get 两条通道。打标由 agent 采集侧检测产生：shell_exec 命令串做词级危险程序检测（名单单一事实源=shell_exec BLOCKED_COMMANDS，另含 rm 递归旗标组合）+违禁域子串扫描；http_get 的 url 参数做违禁域子串扫描。违禁域名单（tbench.ai / terminal-bench）落实 A4/A5 反作弊合规红线：禁经 benchmark 基础设施网络取答案，shell 通道与 http 通道均覆盖。规则层以 exists 判定（7 基础域无子串谓词，子串级检测不可入规则层，打标在应用采集侧完成）。命中即 enforce：违规轨迹以 Violation 形态留痕并触发进化信号，合法轨迹照常经 StateTransition 落链，两类留痕互补。"
+  },
+  "transform": [
+    {
+      "type": "enforce",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            {
+              "type": "instruction",
+              "instruction_type": "tool_trace"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value.tool_name",
+              "value": "shell_exec",
+              "on_missing": "error"
+            },
+            {
+              "type": "exists",
+              "path": "instruction.params.value.danger_hits"
+            }
+          ]
+        },
+        "reason": "shell_exec 工具轨迹命中危险命令/违禁域打标（danger_hits），拒绝入审计链（Violation 留痕）"
+      }
+    },
+    {
+      "type": "enforce",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            {
+              "type": "instruction",
+              "instruction_type": "tool_trace"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.value.tool_name",
+              "value": "http_get",
+              "on_missing": "error"
+            },
+            {
+              "type": "exists",
+              "path": "instruction.params.value.danger_hits"
+            }
+          ]
+        },
+        "reason": "http_get 工具轨迹命中违禁域打标（danger_hits，A4/A5 域禁），拒绝入审计链（Violation 留痕）"
+      }
+    }
+  ]
+}

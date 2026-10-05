@@ -1,0 +1,72 @@
+{
+  "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
+  "kind": "rule_set",
+  "id": "com.evorule.constraint.container_tooling_permit",
+  "version": "1.0.0",
+  "metadata": {
+    "tier": "constraint",
+    "title": "容器域工具许可边界（声明性条目）",
+    "description": "容器执行域（docker-exec 后端，一次性任务沙箱）内工具命令族的许可声明条目。语义分工：00_constraint_tool_trace_shell_guard 以 exists(danger_hits) enforce 拦截违禁域与宿主后端危险程序；本条目不新增任何 enforce 拦截，仅（a）在 metadata.permits 声明容器域许可边界——许可以任务指令显式要求的任务域内操作为限，通用工程规范边界内不含任务解法；（b）以 transform 为 program_hits（docker-exec 后端宿主视角危险程序/递归删除旗标分流旗标，留链备裁）提供显式备裁位：空动作放行，行为与缺省语义一致（零执行语义变化）；超出许可清单之外的宿主视角危险程序命中仍以轨迹留链供事后审计（程序名随 args 全文可回放）。容器一次性生命周期天然约束放宽行为的持久性风险，故宿主域安全模型（BLOCKED 名单等）不受本条目影响。",
+    "license": "AGPL-3.0-or-later",
+    "created": "2026-09-29",
+    "permits": [
+      {
+        "scope": "container_domain",
+        "commands": ["python3", "pip3", "pytest"],
+        "statement": "任务沙箱域内解释器/包管理/测试框架许可"
+      },
+      {
+        "scope": "container_domain",
+        "commands": ["curl", "wget"],
+        "statement": "网络外联许可；benchmark 基础设施违禁域不在许可范围，由执行面守卫与轨迹守卫（00_constraint_tool_trace_shell_guard）双线拦截"
+      },
+      {
+        "scope": "container_domain",
+        "commands": ["apt-get"],
+        "statement": "容器内系统包管理许可（一次性环境语义）"
+      },
+      {
+        "scope": "container_domain",
+        "commands": ["psql", "sqlite3"],
+        "statement": "数据 CLI 许可（并入解释器/数据工具族）"
+      },
+      {
+        "scope": "container_domain",
+        "commands": ["tar", "unzip", "gzip", "jq", "npm"],
+        "statement": "构建/压缩/数据处理工具许可"
+      }
+    ],
+    "out_of_scope": [
+      "tmux 交互会话：另行评估，未列入许可",
+      "宿主域（Local 后端）命令分类：维持既有三层结构，本条目不触及"
+    ],
+    "tags": [
+      "constraint",
+      "container",
+      "tooling",
+      "permit",
+      "declaration"
+    ]
+  },
+  "transform": [
+    {
+      "type": "branch",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            {
+              "type": "instruction",
+              "instruction_type": "tool_trace"
+            },
+            {
+              "type": "exists",
+              "path": "instruction.params.value.program_hits"
+            }
+          ]
+        },
+        "on_true": []
+      }
+    }
+  ]
+}

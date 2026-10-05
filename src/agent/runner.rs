@@ -640,17 +640,22 @@ pub fn resolve_tool_intent(
 
 /// P2:治理级工具意图信号指令形态(纯函数)
 ///
-/// 中性判据:`set meta_tool.pending_tool_intent = {tool_name, target_scope?, args}`。
-/// 与 M5-c 的 `pending_target_scope`(R1 通道)并存互不干扰;宪法 set 规则纯
+/// 中性判据:`set meta_tool.pending_tool_intent = <tool_intent.v1 契约 value>`。
+/// value 经 [`crate::agent::tool_intent::ToolIntentV1`] 从解析输出派生:
+/// tool_name/target_scope/args 透传(与历史形态前缀兼容——规则层 enforce
+/// 匹配键不变),增补 args_digest(规范化摘要)/session_ref(主会话审计关联,
+/// 由管道调用方上下文补齐)/schema_ver(契约版本号)。与 M5-c 的
+/// `pending_target_scope`(R1 通道)并存互不干扰;宪法 set 规则纯
 /// 透传(rules_dir enforce 对裁决会话 set 指令可达——先占裁决只卡 call_external),
 /// 被拦=引擎丢弃指令不推进 version,放行=内建 set 落状态。
 pub fn tool_intent_signal(intent: &Value) -> Value {
+    let contract = crate::agent::tool_intent::ToolIntentV1::from_resolved(intent);
     serde_json::json!({
         "type": "set",
         "params": {
             "attr": "meta_tool.pending_tool_intent",
             "operation": "set",
-            "value": intent
+            "value": contract
         }
     })
 }

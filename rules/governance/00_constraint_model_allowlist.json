@@ -1,0 +1,35 @@
+{
+  "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
+  "kind": "rule_set",
+  "metadata": {
+    "tier": "constraint",
+    "title": "会话模型准入白名单",
+    "description": "本工作区仅允许准入白名单内的模型发起 LLM 会话（call_external）。拦截未授权模型的会话命令，用于治理接入本工作区的 agent 与外部客户端的模型准入。"
+  },
+  "transform": [
+    {
+      "type": "enforce",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            {
+              "type": "instruction",
+              "instruction_type": "call_external"
+            },
+            {
+              "type": "not",
+              "inner": {
+                "type": "eq",
+                "path": "instruction.params.model",
+                "value": "MiniMax-M2.5",
+                "on_missing": "error"
+              }
+            }
+          ]
+        },
+        "reason": "会话模型不在本工作区准入白名单（仅允许 MiniMax-M2.5）"
+      }
+    }
+  ]
+}
