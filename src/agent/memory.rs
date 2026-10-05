@@ -1813,6 +1813,10 @@ impl MemoryManager {
                     ctx.stable.push(record);
                 }
             }
+            // 阶段 3(F-612):召回期矛盾裁决——检测→规则裁决→wire 呈现裁剪
+            // (败者退出本词 prompt;落链 best-effort)。门控=Recipe.adjudication
+            // (缺省关=既有 agent 零影响)
+            self.adjudicate_stable(&mut ctx).await;
             // F-616:stable 命中计数(去重 fact_id)——usage 参与重要性评分
             for r in &ctx.stable {
                 if let Some(fid) = r.fact_id {
@@ -2028,6 +2032,99 @@ impl MemoryManager {
             })
             .cloned()
             .collect()
+    }
+
+    /// 阶段 3(F-612):召回期矛盾裁决(记忆设计档 §5.2)。
+    ///
+    /// 检测(确定性)=词面相似≥阈值 且 极性相反(否定词表);裁决=维度序
+    /// (authority>confidence>freshness,Recipe 声明),胜者为 wire 视图
+    /// 呈现项;败者=同 path 新版本标 Superseded(append-only 不删除,
+    /// RL-A1)+裁决记录落链(确定性 pair-hash 路径,已存在即跳过=幂等)。
+    /// 裁决权在规则——LLM 侧仅可经 sidecar 提议疑似矛盾(独立面)。
+    /// 落链 best-effort:无会话/账本不可达=仅 wire 裁剪生效(降级通知
+    /// fail-visible),落账留待下次召回(候选对仍在,路径幂等不空转)。
+    async fn adjudicate_stable(&self, ctx: &mut RecallContext) {
+        let Some(recipe) = &self.recipe else {
+            return;
+        };
+        if !recipe.adjudication.enabled {
+            return;
+        }
+        let pairs = crate::agent::adjudication::scan_and_adjudicate(
+            &ctx.stable,
+            &recipe.adjudication.negation_markers,
+            recipe.adjudication.similarity_threshold,
+            &recipe.adjudication.order,
+        );
+        if pairs.is_empty() {
+            return;
+        }
+        let session = self.session_id.clone();
+        let mut losers: Vec<usize> = Vec::new();
+        let mut marks: Vec<(String, MemoryRecord, String, MemoryRecord)> = Vec::new();
+        for (i, j, winner) in &pairs {
+            let (w, l) = if *winner == 0 { (i, j) } else { (j, i) };
+            let winner_path = format!("shared.{}.{}", self.namespace, ctx.stable[*w].key);
+            let loser_path = format!("shared.{}.{}", self.namespace, ctx.stable[*l].key);
+            let adj_path = crate::agent::adjudication::adjudication_path(
+                &self.namespace,
+                &winner_path,
+                &loser_path,
+            );
+            let mut loser = ctx.stable[*l].clone();
+            loser.lifecycle_state = Some("Superseded".to_string());
+            loser.tags.push(format!("superseded_by:{winner_path}"));
+            let mut adj = MemoryRecord::new(
+                adj_path.rsplit('.').next().unwrap_or("pair"),
+                &format!(
+                    "矛盾裁决: 败者={loser_path} 胜者={winner_path} (维度序裁决,败者已标 Superseded)"
+                ),
+                now_secs(),
+            );
+            adj.lifecycle_state = Some("Settled".to_string());
+            adj.source = Some("system".to_string());
+            // (裁决记录路径, 裁决记录, 败者账本路径, 败者 Superseded 版本)
+            let loser_ledger_path = loser_path.clone();
+            marks.push((adj_path, adj, loser_ledger_path, loser));
+            losers.push(*l);
+        }
+        // wire 呈现裁剪(败者退出 prompt;后到先删防位移)
+        losers.sort_unstable();
+        losers.dedup();
+        for idx in losers.into_iter().rev() {
+            ctx.stable.remove(idx);
+        }
+        ctx.degradation_notices.push(format!(
+            "[adjudication] 矛盾裁决: {} 对候选经规则裁决,败者已退出呈现(记录落链)",
+            pairs.len()
+        ));
+        // 落链(需会话;幂等:确定性路径已存在即跳过)
+        let Some(session) = session else {
+            return;
+        };
+        for (adj_path, adj, loser_ledger_path, loser) in marks {
+            let exists = self
+                .evorule_client
+                .get_shared_facts(Some(&adj_path))
+                .await
+                .map(|facts| facts.iter().any(|f| f.path == adj_path))
+                .unwrap_or(false);
+            if exists {
+                continue;
+            }
+            if let Ok(payload) = serde_json::to_value(&adj) {
+                let _ = self
+                    .evorule_client
+                    .update_payload(&session, &adj_path, &payload)
+                    .await;
+            }
+            if let Ok(payload) = serde_json::to_value(&loser) {
+                let _ = self
+                    .evorule_client
+                    .update_payload(&session, &loser_ledger_path, &payload)
+                    .await;
+            }
+        }
     }
 
     /// 跨源注册规格:journal 摘要投影写入(work 型确定性派生品)。
@@ -4465,6 +4562,56 @@ mod tests {
             recall2.events.is_empty(),
             "events should be cleared when budget exhausted"
         );
+    }
+
+    #[tokio::test]
+    async fn test_adjudication_wire_view_gated_and_suppressing() {
+        // F-612 验收:门控关=no-op;门控开=矛盾对胜者进 wire、败者退出,
+        // 降级通知 fail-visible(账本不可达=仅裁剪生效,落账留待下次)
+        let mk = |enabled: bool| {
+            let mut mgr = MemoryManager::new("ns", make_test_client());
+            let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+            recipe.adjudication.enabled = enabled;
+            mgr.set_recipe(recipe);
+            mgr
+        };
+        let dropped = vec![Message::User { content: "部署".to_string() }];
+        let mut ctx_on = RecallContext::default();
+        ctx_on.stable.push(MemoryRecord::new(
+            "stable.llm.m.a",
+            "缓存开关默认开启",
+            1000,
+        ));
+        let mut loser = MemoryRecord::new("stable.llm.m.b", "缓存开关默认不开启", 2000);
+        loser.source = Some("llm".to_string());
+        loser.confidence = Some(0.4);
+        ctx_on.stable.push(loser);
+        // 门控开:矛盾对被裁决——user 权威(未标注按 0? 首 条 source None=0,败者 llm=1)
+        // 权威平局时按 confidence/freshness——构造:前者 source=user 胜
+        ctx_on.stable[0].source = Some("user".to_string());
+        let mut mgr_on = mk(true);
+        mgr_on.adjudicate_stable(&mut ctx_on).await;
+        assert_eq!(ctx_on.stable.len(), 1, "败者退出 wire 呈现");
+        assert_eq!(ctx_on.stable[0].value, "缓存开关默认开启");
+        assert!(ctx_on
+            .degradation_notices
+            .iter()
+            .any(|n| n.contains("[adjudication]")), "裁决须 fail-visible");
+
+        // 门控关:零影响(矛盾对原样呈现)
+        let mut ctx_off = RecallContext::default();
+        ctx_off.stable.push(MemoryRecord::new(
+            "stable.llm.m.a",
+            "缓存开关默认开启",
+            1000,
+        ));
+        ctx_off
+            .stable
+            .push(MemoryRecord::new("stable.llm.m.b", "缓存开关默认不开启", 2000));
+        let mut mgr_off = mk(false);
+        mgr_off.adjudicate_stable(&mut ctx_off).await;
+        assert_eq!(ctx_off.stable.len(), 2, "缺省关=既有 agent 零影响");
+        let _ = dropped; // goal 锚点由用户消息构造(此处不参与断言)
     }
 
     #[test]

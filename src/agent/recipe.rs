@@ -110,6 +110,60 @@ pub struct ToolsSection {
     pub expose: Vec<String>,
 }
 
+/// 矛盾裁决配置（阶段 3 F-612，记忆设计档 §八 adjudication 节）。
+///
+/// 裁决是策略：维度序/否定词表/相似阈值全部数据化。`enabled` 缺省关=
+/// 既有 agent 零影响（裁决会改变 wire 视图呈现集——败者不再进 prompt，
+/// 属行为变更，须显式开启）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdjudicationConfig {
+    /// 是否启用召回期矛盾裁决（缺省关）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 裁决维度序（缺省 authority>confidence>freshness）
+    #[serde(default = "default_adjudication_order")]
+    pub order: Vec<String>,
+    /// 否定词表（词法极性判定；缺省中英常用否定词）
+    #[serde(default = "default_negation_markers")]
+    pub negation_markers: Vec<String>,
+    /// 词面相似阈值（分词集 Jaccard；缺省 0.6）
+    #[serde(default = "default_similarity_threshold")]
+    pub similarity_threshold: f32,
+}
+
+fn default_adjudication_order() -> Vec<String> {
+    vec![
+        "authority".to_string(),
+        "confidence".to_string(),
+        "freshness".to_string(),
+    ]
+}
+
+fn default_negation_markers() -> Vec<String> {
+    vec![
+        "不".to_string(),
+        "无".to_string(),
+        "禁止".to_string(),
+        "not".to_string(),
+        "never".to_string(),
+    ]
+}
+
+fn default_similarity_threshold() -> f32 {
+    0.6
+}
+
+impl Default for AdjudicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            order: default_adjudication_order(),
+            negation_markers: default_negation_markers(),
+            similarity_threshold: default_similarity_threshold(),
+        }
+    }
+}
+
 /// 跨源检索源启用开关（跨源注册规格策略面）。
 ///
 /// 源启用是策略不是代码：新增记忆源（journal 摘要投影/技能索引/
@@ -160,6 +214,9 @@ pub struct MemoryRecipe {
     /// 跨源检索源启用开关（注册规格策略面；缺省=全关，既有 agent 零影响）
     #[serde(default)]
     pub sources: SourcesSection,
+    /// 矛盾裁决配置（F-612；缺省 enabled=false 既有 agent 零影响）
+    #[serde(default)]
+    pub adjudication: AdjudicationConfig,
 }
 
 impl Default for MemoryRecipe {
@@ -183,6 +240,7 @@ impl Default for MemoryRecipe {
             },
             tools: ToolsSection::default(),
             sources: SourcesSection::default(),
+            adjudication: AdjudicationConfig::default(),
         }
     }
 }
