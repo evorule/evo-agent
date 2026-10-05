@@ -7,9 +7,17 @@
 //! 1. **默认值** —— 代码中 `Config::default()`
 //! 2. **用户配置** —— `~/.config/evo-agent/config.toml`(Linux/macOS)
 //!    或 `%APPDATA%\evo-agent\config.toml`(Windows)
-//! 3. **项目配置** —— `./evo-agent.toml`(由 `project_dir` 指定)
+//! 3. **项目配置** —— `./evo-agent.toml`(由 `project_dir` 指定;字段级合并,
+//!    文件中显式出现的字段才覆盖,未出现的字段保持上层值)
 //! 4. **环境变量** —— `EVO_AGENT_*` 前缀,`__` 分隔 section/field
 //!    (如 `EVO_AGENT_LLM__PROVIDER=openai`)
+//!
+//! LLM 配置的解析统一走 [`LlmConfig::resolve`](LlmConfig::resolve) 单一入口
+//! (env 优先、toml 兜底),serve 与 CLI 共用同一语义:
+//! - `EVO_AGENT_LLM__*` 显式环境变量优先;
+//! - 其次裸 provider 环境变量(`MINIMAX_API_KEY` / `DEEPSEEK_API_KEY` /
+//!   `OPENAI_API_KEY` 族,优先级同序,详见 `.env.example`);
+//! - 都缺省时回落 toml 合并值或代码默认值。
 //!
 //! 配置文件支持 `${ENV:VAR_NAME}` 占位符(用于 `api_key` 字段),加载时展开为环境变量值。
 //!
@@ -36,7 +44,11 @@ use serde::{Deserialize, Serialize};
 /// LLM provider 配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LlmConfig {
-    /// provider 名称: `minimax` | `deepseek` | `openai`
+    /// provider 名称:`minimax` | `deepseek` | `openai`
+    ///
+    /// 展示预留字段:当前仅随脱敏状态端点回显,不参与请求路由
+    /// (实际请求端点由 `api_base`/`model` 决定)。未知值装载时出警告
+    /// 日志但不拒绝(为未来多 provider 路由预留)。
     #[serde(default = "LlmConfig::default_provider")]
     pub provider: String,
     /// API key,支持 `${ENV:VAR_NAME}` 占位符
@@ -54,12 +66,6 @@ pub struct LlmConfig {
     /// 失败重试次数
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
-    /// G2:上下文窗口 token 数(默认 8192,按模型调整)
-    ///
-    /// `AgentRunner` 用此值构造 `ContextWindowManager`,
-    /// 在发给 LLM 前裁剪历史消息,保留 system + 最近若干轮。
-    #[serde(default = "default_context_window_tokens")]
-    pub context_window_tokens: usize,
 }
 
 impl LlmConfig {
@@ -87,11 +93,6 @@ fn default_llm_timeout() -> u64 {
 
 fn default_max_retries() -> usize {
     3
-}
-
-/// G2:默认上下文窗口 token 数
-fn default_context_window_tokens() -> usize {
-    8192
 }
 
 /// LLM 配置只读状态(脱敏快照)
@@ -138,6 +139,128 @@ impl LlmStatusSnapshot {
             },
         }
     }
+}
+
+impl LlmConfig {
+    /// LLM 配置统一解析入口(env 优先、toml 兜底)
+    ///
+    /// serve 与 CLI 共用此函数,消灭「一个入口只看裸环境变量、另一个只看
+    /// toml」的双真相。`base` 为 toml 合并后的基线(user + project 配置,
+    /// 或代码默认值)。字段独立判定优先级:
+    /// 1. `EVO_AGENT_LLM__*` 显式环境变量(部署注入,最高优先);
+    /// 2. 裸 provider 环境变量(`MINIMAX_API_KEY` / `DEEPSEEK_API_KEY` /
+    ///    `OPENAI_API_KEY`,按此顺序取第一个设置者):key 兜底 `api_key`;
+    ///    `model`/`api_base` 取对应伴随变量(`{P}_MODEL` / `{P}_API_BASE`),
+    ///    伴随变量未设置且基线值仍为出厂默认时换用该 provider 的默认组
+    ///    ——已被 toml 定制的值不会被裸环境变量冲掉;
+    /// 3. 都缺省时保持 `base`(toml 合并值或代码默认)。
+    pub fn resolve(base: LlmConfig) -> LlmConfig {
+        Self::resolve_with_source(base).0
+    }
+
+    /// 同 [`resolve`](Self::resolve),附带返回 api_key 的来源环境变量名
+    /// (供脱敏状态端点记录;未命中任何环境变量时为 `None`)。
+    pub fn resolve_with_source(mut base: LlmConfig) -> (LlmConfig, Option<String>) {
+        let explicit_key = apply_explicit_llm_env(&mut base);
+        apply_bare_provider_env(&mut base, explicit_key.is_some());
+        (base, explicit_key.or_else(bare_provider_key_source))
+    }
+}
+
+/// 应用 `EVO_AGENT_LLM__*` 显式环境变量覆盖,返回 api_key 是否被其接管
+///
+/// 各字段独立判定(设置即覆盖,互不依赖);仅 api_key 的接管与否决定
+/// 是否继续走裸 provider 环境变量兜底。
+fn apply_explicit_llm_env(cfg: &mut LlmConfig) -> Option<String> {
+    if let Ok(v) = std::env::var("EVO_AGENT_LLM__PROVIDER") {
+        cfg.provider = v;
+    }
+    if let Ok(v) = std::env::var("EVO_AGENT_LLM__MODEL") {
+        cfg.model = v;
+    }
+    if let Ok(v) = std::env::var("EVO_AGENT_LLM__API_BASE") {
+        cfg.api_base = v;
+    }
+    if let Ok(v) = std::env::var("EVO_AGENT_LLM__TIMEOUT_SECS") {
+        if let Ok(n) = v.parse() {
+            cfg.timeout_secs = n;
+        }
+    }
+    if let Ok(v) = std::env::var("EVO_AGENT_LLM__MAX_RETRIES") {
+        if let Ok(n) = v.parse() {
+            cfg.max_retries = n;
+        }
+    }
+    match std::env::var("EVO_AGENT_LLM__API_KEY") {
+        Ok(v) => {
+            cfg.api_key = v;
+            Some("EVO_AGENT_LLM__API_KEY".to_string())
+        }
+        Err(_) => None,
+    }
+}
+
+/// 应用裸 provider 环境变量兜底(MiniMax > DeepSeek > OpenAI,取第一个设置者)
+///
+/// `explicit_key_taken` 为 `true`(api_key 已被 `EVO_AGENT_LLM__API_KEY`
+/// 接管)时整体跳过——显式配置环境变量是部署方的完整意志,不需要裸环境
+/// 变量再补语义。`model`/`api_base` 仅在基线仍为出厂默认(未被 toml 或
+/// 显式环境变量定制)时才切到该 provider 的默认组,已定制的值不覆盖。
+fn apply_bare_provider_env(cfg: &mut LlmConfig, explicit_key_taken: bool) {
+    if explicit_key_taken {
+        return;
+    }
+    let (key, model_var, base_var, def_model, def_base) =
+        if let Ok(k) = std::env::var("MINIMAX_API_KEY") {
+            (
+                k,
+                "MINIMAX_MODEL",
+                "MINIMAX_API_BASE",
+                "MiniMax-M2.5",
+                "https://api.minimaxi.com/v1/text/chatcompletion_v2",
+            )
+        } else if let Ok(k) = std::env::var("DEEPSEEK_API_KEY") {
+            (
+                k,
+                "DEEPSEEK_MODEL",
+                "DEEPSEEK_API_BASE",
+                "deepseek-chat",
+                "https://api.deepseek.com/v1/chat/completions",
+            )
+        } else if let Ok(k) = std::env::var("OPENAI_API_KEY") {
+            (
+                k,
+                "OPENAI_MODEL",
+                "OPENAI_API_BASE",
+                "gpt-4o-mini",
+                "https://api.openai.com/v1/chat/completions",
+            )
+        } else {
+            return;
+        };
+    cfg.api_key = key;
+    // model/api_base:基线已被显式 env 或 toml 定制(≠出厂默认)时不动,
+    // 保持「环境变量只补缺省、不冲掉显式定制」的兜底语义
+    if let Ok(v) = std::env::var(model_var) {
+        cfg.model = v;
+    } else if cfg.model == LlmConfig::default_model() {
+        cfg.model = def_model.to_string();
+    }
+    if let Ok(v) = std::env::var(base_var) {
+        cfg.api_base = v;
+    } else if cfg.api_base == LlmConfig::default_api_base() {
+        cfg.api_base = def_base.to_string();
+    }
+}
+
+/// 裸 provider 环境变量命中时的 api_key 来源名(脱敏状态端点用)
+fn bare_provider_key_source() -> Option<String> {
+    for name in ["MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"] {
+        if std::env::var(name).is_ok() {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 impl LlmConfig {
@@ -191,7 +314,6 @@ impl Default for LlmConfig {
             api_base: Self::default_api_base(),
             timeout_secs: default_llm_timeout(),
             max_retries: default_max_retries(),
-            context_window_tokens: default_context_window_tokens(),
         }
     }
 }
@@ -417,7 +539,7 @@ pub enum ConfigError {
     Parse(toml::de::Error),
     /// `${ENV:VAR_NAME}` 引用的环境变量未设置
     EnvVarNotFound(String),
-    /// 字段值非法(如 provider 不在白名单、URL 协议错等)
+    /// 字段值非法(如 URL 协议错、日志级别未知等)
     InvalidValue {
         /// 字段路径(如 "llm.provider" / "evorule.base_url")
         field: String,
@@ -525,31 +647,56 @@ impl Config {
         Ok(config)
     }
 
-    /// 从单个配置文件合并(只覆盖文件中存在的字段)
+    /// 从单个配置文件合并(字段级深合并)
+    ///
+    /// 文件中**显式出现**的字段覆盖当前值(默认值或上层配置文件的值),
+    /// 未出现的字段保持当前值——多层配置(user + project)叠加时各自只
+    /// 贡献自己声明的字段,不会整段互覆。数组字段(如 `mcp.servers`)按
+    /// 字段整体覆盖(数组元素不做逐项合并)。
     fn merge_from_file(&mut self, path: &Path) -> Result<(), ConfigError> {
         let content = std::fs::read_to_string(path)?;
         let value: toml::Value = content.parse().map_err(ConfigError::Parse)?;
 
-        if let Some(table) = value.get("llm") {
-            self.llm = table.clone().try_into().map_err(ConfigError::Parse)?;
+        if let Some(table) = value.get("llm").and_then(|v| v.as_table()) {
+            // 迁移提示:该字段从未接入实际消费,上下文窗口由 agent 定义的
+            // context_window_tokens 决定;旧配置文件里出现时提示但不拒绝装载
+            if table.contains_key("context_window_tokens") {
+                tracing::warn!(
+                    "{}: llm.context_window_tokens 已移除(从未接入实际消费,实际窗口由 agent 定义的 context_window_tokens 决定);该键被忽略",
+                    path.display()
+                );
+            }
+            merge_field(table, "provider", &mut self.llm.provider)?;
+            merge_field(table, "api_key", &mut self.llm.api_key)?;
+            merge_field(table, "model", &mut self.llm.model)?;
+            merge_field(table, "api_base", &mut self.llm.api_base)?;
+            merge_field(table, "timeout_secs", &mut self.llm.timeout_secs)?;
+            merge_field(table, "max_retries", &mut self.llm.max_retries)?;
         }
-        if let Some(table) = value.get("evorule") {
-            self.evorule = table.clone().try_into().map_err(ConfigError::Parse)?;
+        if let Some(table) = value.get("evorule").and_then(|v| v.as_table()) {
+            merge_field(table, "base_url", &mut self.evorule.base_url)?;
+            merge_field(table, "api_key", &mut self.evorule.api_key)?;
+            merge_field(table, "timeout_secs", &mut self.evorule.timeout_secs)?;
+            merge_field(table, "service_tools", &mut self.evorule.service_tools)?;
         }
-        if let Some(table) = value.get("logging") {
-            self.logging = table.clone().try_into().map_err(ConfigError::Parse)?;
+        if let Some(table) = value.get("logging").and_then(|v| v.as_table()) {
+            merge_field(table, "level", &mut self.logging.level)?;
+            merge_field(table, "format", &mut self.logging.format)?;
         }
-        if let Some(table) = value.get("agents") {
-            self.agents = table.clone().try_into().map_err(ConfigError::Parse)?;
+        if let Some(table) = value.get("agents").and_then(|v| v.as_table()) {
+            merge_field(table, "dir", &mut self.agents.dir)?;
+            merge_field(table, "default", &mut self.agents.default)?;
         }
-        if let Some(table) = value.get("auth") {
-            self.auth = table.clone().try_into().map_err(ConfigError::Parse)?;
+        if let Some(table) = value.get("auth").and_then(|v| v.as_table()) {
+            merge_field(table, "enabled", &mut self.auth.enabled)?;
+            merge_field(table, "tokens", &mut self.auth.tokens)?;
         }
-        if let Some(table) = value.get("mcp") {
-            self.mcp = table.clone().try_into().map_err(ConfigError::Parse)?;
+        if let Some(table) = value.get("mcp").and_then(|v| v.as_table()) {
+            merge_field(table, "servers", &mut self.mcp.servers)?;
         }
-        if let Some(table) = value.get("workbench") {
-            self.workbench = table.clone().try_into().map_err(ConfigError::Parse)?;
+        if let Some(table) = value.get("workbench").and_then(|v| v.as_table()) {
+            merge_field(table, "console_dir", &mut self.workbench.console_dir)?;
+            merge_field(table, "console_port", &mut self.workbench.console_port)?;
         }
 
         Ok(())
@@ -559,34 +706,16 @@ impl Config {
     ///
     /// 约定: `EVO_AGENT_<SECTION>__<FIELD>=value`
     /// 例如: `EVO_AGENT_LLM__PROVIDER=openai` → `config.llm.provider = "openai"`
+    ///
+    /// llm 段统一走 [`LlmConfig::resolve`](LlmConfig::resolve) 单一入口
+    /// (env 优先、toml 兜底;含裸 provider 环境变量兜底),serve 与 CLI 共用。
     fn apply_env_overrides(&mut self) {
-        if let Ok(v) = std::env::var("EVO_AGENT_LLM__PROVIDER") {
-            self.llm.provider = v;
-        }
-        if let Ok(v) = std::env::var("EVO_AGENT_LLM__API_KEY") {
-            self.llm.api_key = v;
-            self.llm_api_key_source = Some("EVO_AGENT_LLM__API_KEY".to_string());
-        }
-        if let Ok(v) = std::env::var("EVO_AGENT_LLM__MODEL") {
-            self.llm.model = v;
-        }
-        if let Ok(v) = std::env::var("EVO_AGENT_LLM__API_BASE") {
-            self.llm.api_base = v;
-        }
-        if let Ok(v) = std::env::var("EVO_AGENT_LLM__TIMEOUT_SECS") {
-            if let Ok(n) = v.parse() {
-                self.llm.timeout_secs = n;
-            }
-        }
-        if let Ok(v) = std::env::var("EVO_AGENT_LLM__MAX_RETRIES") {
-            if let Ok(n) = v.parse() {
-                self.llm.max_retries = n;
-            }
-        }
-        if let Ok(v) = std::env::var("EVO_AGENT_LLM__CONTEXT_WINDOW_TOKENS") {
-            if let Ok(n) = v.parse() {
-                self.llm.context_window_tokens = n;
-            }
+        // llm 段:统一解析入口(覆盖当前 toml 合并基线)
+        let base = std::mem::take(&mut self.llm);
+        let (resolved, key_source) = LlmConfig::resolve_with_source(base);
+        self.llm = resolved;
+        if key_source.is_some() {
+            self.llm_api_key_source = key_source;
         }
 
         if let Ok(v) = std::env::var("EVO_AGENT_EVORULE__BASE_URL") {
@@ -599,6 +728,14 @@ impl Config {
             if let Ok(n) = v.parse() {
                 self.evorule.timeout_secs = n;
             }
+        }
+        // 服务工具白名单(逗号分隔;容器化部署经环境变量注入)
+        if let Ok(v) = std::env::var("EVO_AGENT_EVORULE__SERVICE_TOOLS") {
+            self.evorule.service_tools = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
 
         if let Ok(v) = std::env::var("EVO_AGENT_LOGGING__LEVEL") {
@@ -613,6 +750,20 @@ impl Config {
         }
         if let Ok(v) = std::env::var("EVO_AGENT_AGENTS__DEFAULT") {
             self.agents.default = v;
+        }
+
+        // MCP server 配置(JSON 数组;容器化部署经环境变量注入)。
+        // 解析失败仅告警不拒绝装载(与整段配置容忍语义一致,避免单变量
+        // 拼写错误让整个进程起不来)。
+        if let Ok(v) = std::env::var("EVO_AGENT_MCP__SERVERS") {
+            match serde_json::from_str::<Vec<McpServerConfig>>(&v) {
+                Ok(servers) => self.mcp.servers = servers,
+                Err(e) => {
+                    tracing::warn!(
+                        "EVO_AGENT_MCP__SERVERS 不是合法的 MCP server JSON 数组,已忽略: {e}"
+                    );
+                }
+            }
         }
 
         // G7:鉴权配置
@@ -665,18 +816,14 @@ impl Config {
 
     /// 验证配置值的合法性
     fn validate(&self) -> Result<(), ConfigError> {
-        // LLM provider 必须是已知值
+        // provider 为展示预留字段:未知值仅警告不拒绝(实际请求端点由
+        // api_base/model 决定,旧配置文件里的自定义值装载不受影响)
         match self.llm.provider.as_str() {
             "minimax" | "deepseek" | "openai" => {}
-            other => {
-                return Err(ConfigError::InvalidValue {
-                    field: "llm.provider".to_string(),
-                    reason: format!(
-                        "unknown provider '{}', expected one of: minimax, deepseek, openai",
-                        other
-                    ),
-                });
-            }
+            other => tracing::warn!(
+                "llm.provider '{}' 当前仅作展示预留,不参与请求路由(实际端点由 api_base/model 决定);未来多 provider 路由接入时将消费此字段",
+                other
+            ),
         }
 
         // LLM API key 不能为空
@@ -732,20 +879,15 @@ impl Config {
     ///
     /// 与 [`validate`](Self::validate) 的区别:
     /// - 跳过 LLM API key 非空验证
-    /// - 仍然验证 provider/base_url/logging 等非 LLM 字段
+    /// - 仍然验证 base_url/logging 等非 LLM 字段
     fn validate_lenient(&self) -> Result<(), ConfigError> {
-        // LLM provider 必须是已知值
+        // provider 为展示预留字段:未知值仅警告不拒绝(同严格模式口径)
         match self.llm.provider.as_str() {
             "minimax" | "deepseek" | "openai" => {}
-            other => {
-                return Err(ConfigError::InvalidValue {
-                    field: "llm.provider".to_string(),
-                    reason: format!(
-                        "unknown provider '{}', expected one of: minimax, deepseek, openai",
-                        other
-                    ),
-                });
-            }
+            other => tracing::warn!(
+                "llm.provider '{}' 当前仅作展示预留,不参与请求路由(实际端点由 api_base/model 决定);未来多 provider 路由接入时将消费此字段",
+                other
+            ),
         }
 
         // 注意:宽松模式跳过 LLM API key 非空检查
@@ -816,6 +958,22 @@ fn resolve_env_placeholder_lenient(s: &str) -> String {
     }
 }
 
+/// 字段级合并辅助:toml 表中显式出现的字段覆盖目标值,未出现则保持原值
+///
+/// 类型不符按配置解析错误处理(与整段反序列化的错误语义一致)。
+fn merge_field<T>(table: &toml::value::Table, key: &str, target: &mut T) -> Result<(), ConfigError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match table.get(key) {
+        Some(v) => {
+            *target = v.clone().try_into().map_err(ConfigError::Parse)?;
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
 /// 用户级配置文件路径
 ///
 /// - Unix: `$XDG_CONFIG_HOME/evo-agent/config.toml` 或 `$HOME/.config/evo-agent/config.toml`
@@ -851,6 +1009,59 @@ mod tests {
     // 防止 env 变量测试并发干扰
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// 配置解析涉及的全部环境变量名(测试隔离用)
+    const LLM_ENV_NAMES: [&str; 17] = [
+        "MINIMAX_API_KEY",
+        "MINIMAX_MODEL",
+        "MINIMAX_API_BASE",
+        "DEEPSEEK_API_KEY",
+        "DEEPSEEK_MODEL",
+        "DEEPSEEK_API_BASE",
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
+        "OPENAI_API_BASE",
+        "EVO_AGENT_LLM__PROVIDER",
+        "EVO_AGENT_LLM__API_KEY",
+        "EVO_AGENT_LLM__MODEL",
+        "EVO_AGENT_LLM__API_BASE",
+        "EVO_AGENT_LLM__TIMEOUT_SECS",
+        "EVO_AGENT_LLM__MAX_RETRIES",
+        "EVO_AGENT_EVORULE__SERVICE_TOOLS",
+        "EVO_AGENT_MCP__SERVERS",
+    ];
+
+    /// 删除全部 LLM 相关环境变量(防本机环境泄漏进测试),返回原值快照供恢复
+    fn clear_llm_env() -> Vec<(&'static str, Option<String>)> {
+        let snap: Vec<_> = LLM_ENV_NAMES
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, _) in &snap {
+            std::env::remove_var(k);
+        }
+        snap
+    }
+
+    /// 隔离用户级配置目录(防真实 user config 混入),返回快照供恢复
+    fn isolate_user_config_dirs(baseline: &Path) -> Vec<(&'static str, Option<String>)> {
+        let names = ["HOME", "APPDATA", "USERPROFILE", "XDG_CONFIG_HOME"];
+        let snap: Vec<_> = names.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in names {
+            std::env::set_var(k, baseline.join("no-such-home"));
+        }
+        snap
+    }
+
+    /// 按快照恢复环境变量(与 clear_llm_env / isolate_user_config_dirs 配对)
+    fn restore_env(snap: Vec<(&'static str, Option<String>)>) {
+        for (k, v) in snap {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
     #[test]
     fn test_default_config() {
         let cfg = Config::default();
@@ -882,15 +1093,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_provider_unknown() {
+    fn test_validate_provider_unknown_warns_but_loads() {
+        // provider 为展示预留字段:未知值仅警告不拒绝装载(旧配置兼容)
         let mut cfg = Config::default();
-        cfg.llm.provider = "bogus".to_string();
+        cfg.llm.provider = "some-future-provider".to_string();
         cfg.llm.api_key = "direct".to_string();
-        let result = cfg.validate();
-        assert!(matches!(
-            result,
-            Err(ConfigError::InvalidValue { ref field, .. }) if field == "llm.provider"
-        ));
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.validate_lenient().is_ok());
     }
 
     #[test]
@@ -981,6 +1190,8 @@ model = "gpt-4o"
     #[test]
     fn test_load_full_flow_with_project_config() {
         let _lock = ENV_LOCK.lock().unwrap();
+        // 隔离 LLM env:toml 字面量 api_key 不应被本机裸 provider env 覆盖
+        let env_snap = clear_llm_env();
 
         // 准备:临时项目目录,放 evo-agent.toml
         let tmp = tempfile::tempdir().unwrap();
@@ -1035,11 +1246,14 @@ default = "coder"
         assert_eq!(cfg.evorule.base_url, "https://evorule.example.com:8443");
         assert_eq!(cfg.agents.dir, PathBuf::from("./my-agents"));
         assert_eq!(cfg.agents.default, "coder");
+        restore_env(env_snap);
     }
 
     #[test]
     fn test_load_resolves_env_placeholder() {
         let _lock = ENV_LOCK.lock().unwrap();
+        // 隔离 LLM env:本机裸 provider env 不应干扰占位符展开断言
+        let env_snap = clear_llm_env();
 
         // 设置 env
         std::env::set_var("TEST_EVO_API_KEY_99", "real-secret-from-env");
@@ -1068,6 +1282,7 @@ api_key = "${ENV:TEST_EVO_API_KEY_99}"
         std::env::remove_var("TEST_EVO_API_KEY_99");
 
         assert_eq!(cfg.llm.api_key, "real-secret-from-env");
+        restore_env(env_snap);
     }
 
     #[test]
@@ -1144,5 +1359,318 @@ command = "echo"
         assert_eq!(cfg.mcp.servers[0].command, "echo");
         assert!(cfg.mcp.servers[0].args.is_empty());
         assert!(cfg.mcp.servers[0].env.is_empty());
+    }
+
+    // =========================================================================
+    // LLM 配置统一解析(env 优先、toml 兜底)
+    // =========================================================================
+
+    #[test]
+    fn test_llm_resolve_env_takes_precedence_over_toml() {
+        // env 设置 → env 值生效(优先于 toml 基线)
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        std::env::set_var("EVO_AGENT_LLM__API_KEY", "env-key");
+        std::env::set_var("EVO_AGENT_LLM__MODEL", "env-model");
+
+        let mut base = LlmConfig::default();
+        base.api_key = "toml-key".to_string();
+        base.model = "toml-model".to_string();
+
+        let resolved = LlmConfig::resolve(base);
+        assert_eq!(resolved.api_key, "env-key");
+        assert_eq!(resolved.model, "env-model");
+        restore_env(env_snap);
+    }
+
+    #[test]
+    fn test_llm_resolve_falls_back_to_toml() {
+        // env 缺 → toml 基线值生效
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+
+        let mut base = LlmConfig::default();
+        base.api_key = "toml-key".to_string();
+        base.model = "toml-model".to_string();
+
+        let resolved = LlmConfig::resolve(base);
+        assert_eq!(resolved.api_key, "toml-key");
+        assert_eq!(resolved.model, "toml-model");
+        restore_env(env_snap);
+    }
+
+    #[test]
+    fn test_llm_resolve_defaults_when_env_and_toml_missing() {
+        // 两者都缺 → 代码默认值
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+
+        let resolved = LlmConfig::resolve(LlmConfig::default());
+        assert_eq!(resolved.api_key, LlmConfig::default_api_key());
+        assert_eq!(resolved.model, LlmConfig::default_model());
+        assert_eq!(resolved.api_base, LlmConfig::default_api_base());
+        assert_eq!(resolved.timeout_secs, default_llm_timeout());
+        assert_eq!(resolved.max_retries, default_max_retries());
+        restore_env(env_snap);
+    }
+
+    #[test]
+    fn test_llm_resolve_bare_provider_env_switches_provider_defaults() {
+        // 裸 provider env 兜底:DEEPSEEK_API_KEY 命中且基线为出厂默认时,
+        // model/api_base 切到 deepseek 默认组(与裸 env 时代 serve 行为对齐)
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        std::env::set_var("DEEPSEEK_API_KEY", "sk-bare");
+
+        let resolved = LlmConfig::resolve(LlmConfig::default());
+        assert_eq!(resolved.api_key, "sk-bare");
+        assert_eq!(resolved.model, "deepseek-chat");
+        assert_eq!(
+            resolved.api_base,
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        restore_env(env_snap);
+    }
+
+    #[test]
+    fn test_llm_resolve_bare_env_respects_toml_customization() {
+        // 裸 key 只兜底 api_key;toml 已定制的 model 不被 provider 默认组冲掉
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        std::env::set_var("MINIMAX_API_KEY", "sk-bare");
+
+        let mut base = LlmConfig::default();
+        base.model = "custom-model".to_string();
+        let resolved = LlmConfig::resolve(base);
+        assert_eq!(resolved.api_key, "sk-bare");
+        assert_eq!(resolved.model, "custom-model");
+        restore_env(env_snap);
+    }
+
+    #[test]
+    fn test_llm_resolve_explicit_key_blocks_bare_env() {
+        // EVO_AGENT_LLM__API_KEY 接管 api_key 后,裸 provider env 整体跳过
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        std::env::set_var("MINIMAX_API_KEY", "sk-bare");
+        std::env::set_var("EVO_AGENT_LLM__API_KEY", "env-key");
+
+        let resolved = LlmConfig::resolve(LlmConfig::default());
+        assert_eq!(resolved.api_key, "env-key");
+        assert_eq!(resolved.model, LlmConfig::default_model());
+        assert_eq!(resolved.api_base, LlmConfig::default_api_base());
+        restore_env(env_snap);
+    }
+
+    #[test]
+    fn test_llm_resolve_records_key_source() {
+        // 裸 provider env 命中时来源记录为该环境变量名(脱敏状态端点用)
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        std::env::set_var("DEEPSEEK_API_KEY", "sk-bare");
+
+        let (_, source) = LlmConfig::resolve_with_source(LlmConfig::default());
+        assert_eq!(source, Some("DEEPSEEK_API_KEY".to_string()));
+
+        std::env::set_var("EVO_AGENT_LLM__API_KEY", "env-key");
+        let (_, source) = LlmConfig::resolve_with_source(LlmConfig::default());
+        assert_eq!(source, Some("EVO_AGENT_LLM__API_KEY".to_string()));
+        restore_env(env_snap);
+    }
+
+    #[test]
+    fn test_dual_path_llm_config_consistency() {
+        // 双路径一致性:同一组 env(+无 toml 定制)输入下,
+        // CLI 路径(Config::load 产物,run 命令直接消费)与 serve 路径
+        // (cmd_serve 注入 state 的解析产物)得出相同的 LLM 字段——
+        // 两条入口共用同一解析链后,一致性由同源保证,本测试锁住该事实
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        std::env::set_var("MINIMAX_API_KEY", "sk-both-paths");
+        std::env::set_var("MINIMAX_MODEL", "MiniMax-Path-Test");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_snap = isolate_user_config_dirs(tmp.path());
+
+        let cfg = Config::load(tmp.path()).expect("load should succeed");
+        // serve 侧独立按同一解析入口重算(无 toml 基线),应与 CLI 路径一致
+        let serve_side = LlmConfig::resolve(LlmConfig::default());
+
+        restore_env(dir_snap);
+        assert_eq!(cfg.llm.api_key, serve_side.api_key);
+        assert_eq!(cfg.llm.model, serve_side.model);
+        assert_eq!(cfg.llm.api_base, serve_side.api_base);
+        assert_eq!(cfg.llm.api_key, "sk-both-paths");
+        assert_eq!(cfg.llm.model, "MiniMax-Path-Test");
+        restore_env(env_snap);
+    }
+
+    // =========================================================================
+    // 字段级深合并
+    // =========================================================================
+
+    #[test]
+    fn test_merge_from_file_field_level_across_layers() {
+        // 跨层叠加:user 层声明 api_key/model,project 层只声明 provider——
+        // 字段级合并下 project 层未声明的字段保留 user 层值(整段覆盖时代
+        // 会被 project 层缺失字段的默认值冲掉)
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let user_path = tmp.path().join("user.toml");
+        let project_path = tmp.path().join("project.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[llm]
+api_key = "user-key"
+model = "user-model"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project_path,
+            r#"
+[llm]
+provider = "openai"
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.merge_from_file(&user_path).unwrap();
+        cfg.merge_from_file(&project_path).unwrap();
+
+        assert_eq!(cfg.llm.api_key, "user-key");
+        assert_eq!(cfg.llm.model, "user-model");
+        assert_eq!(cfg.llm.provider, "openai");
+        // project 层未声明的 llm 字段保持默认
+        assert_eq!(cfg.llm.timeout_secs, default_llm_timeout());
+        // 未涉及的 section 保持默认
+        assert_eq!(cfg.evorule.base_url, "http://localhost:18080");
+        restore_env(env_snap);
+    }
+
+    #[test]
+    fn test_merge_from_file_single_section_partial_fields() {
+        // 单文件内部分字段:显式字段覆盖,未声明字段保持父值(同 section)
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("evo-agent.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[evorule]
+base_url = "https://override.example.com"
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.evorule.api_key = "parent-key".to_string();
+        cfg.merge_from_file(&toml_path).unwrap();
+
+        assert_eq!(cfg.evorule.base_url, "https://override.example.com");
+        assert_eq!(cfg.evorule.api_key, "parent-key");
+        assert_eq!(cfg.evorule.timeout_secs, default_evorule_timeout());
+        restore_env(env_snap);
+    }
+
+    // =========================================================================
+    // 旧配置装载兼容(死字段移除 + provider 展示预留)
+    // =========================================================================
+
+    #[test]
+    fn test_legacy_toml_with_dead_field_and_unknown_provider_loads() {
+        // 旧配置兼容:llm.context_window_tokens 已移除(警告后忽略,不破装载);
+        // provider 未知值仅警告不拒绝
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("evo-agent.toml"),
+            r#"
+[llm]
+provider = "legacy-provider"
+api_key = "literal-key"
+context_window_tokens = 32768
+"#,
+        )
+        .unwrap();
+        let dir_snap = isolate_user_config_dirs(tmp.path());
+
+        let cfg = Config::load(tmp.path()).expect("legacy config should still load");
+
+        restore_env(dir_snap);
+        // 死字段被忽略,其余字段正常装载
+        assert_eq!(cfg.llm.provider, "legacy-provider");
+        assert_eq!(cfg.llm.api_key, "literal-key");
+        restore_env(env_snap);
+    }
+
+    // =========================================================================
+    // 环境变量白名单
+    // =========================================================================
+
+    #[test]
+    fn test_env_whitelist_service_tools_and_mcp_servers() {
+        // 白名单内 key 可读:服务工具白名单(逗号分隔)与 MCP server(JSON 数组)
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        std::env::set_var("EVO_AGENT_EVORULE__SERVICE_TOOLS", "svc_a, svc_b");
+        std::env::set_var(
+            "EVO_AGENT_MCP__SERVERS",
+            r#"[{"name":"fs","command":"npx","args":["-y","server-fs"]}]"#,
+        );
+
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides();
+
+        assert_eq!(
+            cfg.evorule.service_tools,
+            vec!["svc_a".to_string(), "svc_b".to_string()]
+        );
+        assert_eq!(cfg.mcp.servers.len(), 1);
+        assert_eq!(cfg.mcp.servers[0].name, "fs");
+        assert_eq!(cfg.mcp.servers[0].command, "npx");
+        assert_eq!(
+            cfg.mcp.servers[0].args,
+            vec!["-y".to_string(), "server-fs".to_string()]
+        );
+        restore_env(env_snap);
+    }
+
+    #[test]
+    fn test_env_whitelist_mcp_malformed_json_ignored() {
+        // EVO_AGENT_MCP__SERVERS 非法 JSON:告警后忽略,装载不破
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        std::env::set_var("EVO_AGENT_MCP__SERVERS", "not-a-json-array");
+
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides();
+
+        assert!(cfg.mcp.servers.is_empty());
+        restore_env(env_snap);
+    }
+
+    #[test]
+    fn test_env_whitelist_unknown_keys_filtered() {
+        // 白名单外的 EVO_AGENT_* 变量被过滤:不进配置、不报错
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_snap = clear_llm_env();
+        std::env::set_var("EVO_AGENT_MCP__NOT_A_FIELD", "zzz");
+        std::env::set_var("EVO_AGENT_UNKNOWN_SECTION__X", "1");
+
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides();
+
+        assert!(cfg.mcp.servers.is_empty());
+        assert_eq!(cfg.evorule.base_url, EvoruleConfig::default_base_url());
+        assert_eq!(cfg.llm.provider, LlmConfig::default_provider());
+        std::env::remove_var("EVO_AGENT_MCP__NOT_A_FIELD");
+        std::env::remove_var("EVO_AGENT_UNKNOWN_SECTION__X");
+        restore_env(env_snap);
     }
 }
