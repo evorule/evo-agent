@@ -2874,7 +2874,7 @@ fn test_exposed_tools_from_definition_conditions() {
         crate::agent::memory_tool::exposed_tools_from_definition(&def),
         vec!["memory_propose".to_string()]
     );
-    // lex_store + recipe.tools.expose → 三件全放行(写件不再被过滤)
+    // lex_store + recipe.tools.expose → 四件全放行(写件不再被过滤)
     def.memory.lex_store = Some("mem.db".to_string());
     assert_eq!(
         crate::agent::memory_tool::exposed_tools_from_definition(&def),
@@ -2883,6 +2883,17 @@ fn test_exposed_tools_from_definition_conditions() {
             "memory_get".to_string(),
             "memory_propose".to_string()
         ]
+    );
+    // note_write 仅配方声明即可(写经 payload 通道,不依赖检索缓存)
+    let mut def2 = make_def_with_tools(vec![]);
+    def2.memory.recipe = Some(serde_json::json!({
+        "recipe_version": "memory-v1.0",
+        "retrieval": {}, "lifecycle": {}, "budget": {},
+        "tools": {"expose": ["note_write"]}
+    }));
+    assert_eq!(
+        crate::agent::memory_tool::exposed_tools_from_definition(&def2),
+        vec!["note_write".to_string()]
     );
 }
 
@@ -2967,4 +2978,33 @@ fn test_register_memory_introspection_tools_not_declared_no_exposure() {
     let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
     runner.register_memory_introspection_tools().unwrap();
     assert!(!runner.tool_handler.has_tool("memory_search"));
+}
+
+#[test]
+fn test_register_note_write_session_scoped() {
+    // note_write 仅配方声明(无 lex_store)→ 装配期不注册但一致性校验通过;
+    // 会话期钩子注册;G15 幂等
+    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    let mut mem = crate::agent::memory::MemoryManager::new("ns", make_test_client());
+    mem.set_recipe(make_memory_recipe_with_expose(vec!["note_write"]));
+    runner.memory = Some(mem);
+    runner.config.tool_names = vec!["note_write".to_string()];
+    runner.register_memory_introspection_tools().unwrap();
+    assert!(
+        !runner.tool_handler.has_tool("note_write"),
+        "装配期不注册(会话期注册,session_id 在手)"
+    );
+    runner.register_session_scoped_memory_tools("s1");
+    assert!(runner.tool_handler.has_tool("note_write"));
+    runner.register_session_scoped_memory_tools("s2");
+    assert!(runner.tool_handler.has_tool("note_write"));
+}
+
+#[test]
+fn test_register_note_write_without_memory_errors() {
+    // memory 未启用而声明 note_write = 配置矛盾,装配期早失败
+    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    runner.config.tool_names = vec!["note_write".to_string()];
+    let err = runner.register_memory_introspection_tools().unwrap_err();
+    assert!(err.to_string().contains("note_write"), "{err}");
 }

@@ -59,20 +59,106 @@ pub const MEMORY_SEARCH_TOOL: &str = "memory_search";
 pub const MEMORY_GET_TOOL: &str = "memory_get";
 /// 记忆提议工具名（A2-2，F-611 族写件：提议≠入账，写必过结构闸）
 pub const MEMORY_PROPOSE_TOOL: &str = "memory_propose";
+/// 笔记写入工具名（双通道笔记 Q3 写面：落账 Captured，写不过闸、晋升受治）
+pub const NOTE_WRITE_TOOL: &str = "note_write";
 
 /// 自省族**读件**判定（读面数据前提=LexStore 检索缓存）
 pub fn is_introspection_read_tool(name: &str) -> bool {
     name == MEMORY_SEARCH_TOOL || name == MEMORY_GET_TOOL
 }
 
-/// 自省族**写件**判定（A2-2：结构闸+旗标强制在工具实现内，治理闸在 A2-3/A2-4）
+/// 自省族**写件**判定（A2-2：结构闸+旗标强制在工具实现内，治理闸在 A2-3/A2-4；
+/// note_write 落账 Captured 写不过闸、晋升受治——同属写面声明即可，不入治理闸族）
 pub fn is_introspection_write_tool(name: &str) -> bool {
-    name == MEMORY_PROPOSE_TOOL
+    name == MEMORY_PROPOSE_TOOL || name == NOTE_WRITE_TOOL
 }
 
-/// 已实现的自省记忆工具名判定（读两件+写一件）
+/// 已实现的自省记忆工具名判定（读两件+写两件）
 pub fn is_introspection_tool(name: &str) -> bool {
     is_introspection_read_tool(name) || is_introspection_write_tool(name)
+}
+
+/// 会随 LLM 请求下发的全部记忆工具名判定（含会话期注册的 note_write）
+pub fn is_registered_memory_tool(name: &str) -> bool {
+    is_introspection_tool(name)
+}
+
+/// 笔记八类（双通道笔记 Q3 分类学，机制固定；自由扩展走 tags）
+const NOTE_CATEGORIES: &[&str] = &[
+    "charter", "selection", "design", "build", "verify", "failure", "summary", "todo",
+];
+
+/// 各类强制字段（分类学约束：缺一即拒，fail-visible 交还 LLM 补齐）
+/// 返回 (参数名, 落账标签) 有序表。
+fn note_required_fields(category: &str) -> &'static [(&'static str, &'static str)] {
+    match category {
+        "charter" => &[("acceptance", "验收判据")],
+        "selection" => &[("alternatives", "备选项"), ("rejected", "否决理由")],
+        "design" => &[("decision", "决策"), ("impact", "影响面")],
+        "verify" => &[("verify_command", "判据命令")],
+        "failure" => &[
+            ("phenomenon", "现象"),
+            ("root_cause", "根因假设"),
+            ("prevention", "防再踩"),
+        ],
+        "todo" => &[("next_action", "后续动作")],
+        _ => &[],
+    }
+}
+
+/// unix 秒（本模块时钟口径）
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// unix 秒 → UTC 日期字符串 YYYYMMDD（确定性儒略日算法，无外部依赖）
+fn utc_date_str(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    // Howard Hinnant civil_from_days（公有域算法）
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}{m:02}{d:02}")
+}
+
+/// 笔记账本路径：shared.{ns}.notes.{category}.{date}-{seq}
+/// （seq 三位零填充——同日多条按路径字典序即时间序，可回查）
+fn note_path(namespace: &str, category: &str, ymd: &str, seq: usize) -> String {
+    format!("shared.{namespace}.notes.{category}.{ymd}-{seq:03}")
+}
+
+/// 笔记正文集装（确定性：字段序=分类学强制序，标签固定）
+fn compose_note_text(
+    category: &str,
+    title: Option<&str>,
+    content: &str,
+    fields: &[(&str, &str)],
+) -> String {
+    let mut s = String::new();
+    if let Some(t) = title {
+        s.push_str(t.trim());
+        s.push_str("\n\n");
+    }
+    s.push_str(content.trim());
+    for (param, label) in note_required_fields(category) {
+        if let Some((_, v)) = fields.iter().find(|(p, _)| p == param) {
+            s.push('\n');
+            s.push_str(label);
+            s.push_str(": ");
+            s.push_str(v.trim());
+        }
+    }
+    s
 }
 
 /// 自省工具静态 spec（LLM function schema 数据源，与执行器同源维护；
@@ -155,6 +241,27 @@ pub fn memory_tool_specs() -> Vec<ToolSpec> {
                     .to_string(),
                 required: true,
             }],
+        },
+        ToolSpec {
+            name: NOTE_WRITE_TOOL.to_string(),
+            description: "Write a judgement note to long-term memory (double-channel notebook, active-write side). Notes land as Captured ledger facts - recording is free, promotion is governed. Eight fixed categories, some with mandatory fields (e.g. failure notes require phenomenon + root-cause hypothesis + prevention). Write the WHY, not the what.".to_string(),
+            parameters: vec![
+                ParameterSpec { name: "category".to_string(), r#type: "string".to_string(), description: "Note category: charter | selection | design | build | verify | failure | summary | todo".to_string(), required: true },
+                ParameterSpec { name: "content".to_string(), r#type: "string".to_string(), description: "Note body (judgement/knowledge; mechanical facts belong to the system side)".to_string(), required: true },
+                ParameterSpec { name: "title".to_string(), r#type: "string".to_string(), description: "Optional title line".to_string(), required: false },
+                ParameterSpec { name: "confidence".to_string(), r#type: "number".to_string(), description: "Self-assessed confidence 0-1 (default 0.6)".to_string(), required: false },
+                ParameterSpec { name: "tags".to_string(), r#type: "array".to_string(), description: "Optional free-form tags (categories are fixed; extend via tags)".to_string(), required: false },
+                ParameterSpec { name: "acceptance".to_string(), r#type: "string".to_string(), description: "charter: acceptance criteria (required for charter)".to_string(), required: false },
+                ParameterSpec { name: "alternatives".to_string(), r#type: "string".to_string(), description: "selection: options considered (required for selection)".to_string(), required: false },
+                ParameterSpec { name: "rejected".to_string(), r#type: "string".to_string(), description: "selection: why each option was rejected (required for selection)".to_string(), required: false },
+                ParameterSpec { name: "decision".to_string(), r#type: "string".to_string(), description: "design: the decision (required for design)".to_string(), required: false },
+                ParameterSpec { name: "impact".to_string(), r#type: "string".to_string(), description: "design: impact surface (required for design)".to_string(), required: false },
+                ParameterSpec { name: "verify_command".to_string(), r#type: "string".to_string(), description: "verify: reproduction/verification command (required for verify)".to_string(), required: false },
+                ParameterSpec { name: "phenomenon".to_string(), r#type: "string".to_string(), description: "failure: observed phenomenon (required for failure)".to_string(), required: false },
+                ParameterSpec { name: "root_cause".to_string(), r#type: "string".to_string(), description: "failure: root-cause hypothesis (required for failure)".to_string(), required: false },
+                ParameterSpec { name: "prevention".to_string(), r#type: "string".to_string(), description: "failure: prevention measure (required for failure)".to_string(), required: false },
+                ParameterSpec { name: "next_action".to_string(), r#type: "string".to_string(), description: "todo: next action (required for todo)".to_string(), required: false },
+            ],
         },
     ]
 }
@@ -721,6 +828,159 @@ impl MemoryGetTool {
 impl ToolFunction for MemoryGetTool {
     async fn call(&self, args: &Value) -> Result<Value, String> {
         self.inner.get(args).await
+    }
+}
+
+
+
+/// 笔记写入执行体（双通道笔记 Q3 写面；会话期注册——session_id 在手）。
+///
+/// 治理口径：**写不过闸**——落账为 Captured 状态（生命周期状态机白送的
+/// 免费治理：记录自由、晋升受治）；来源域=`llm-note`，置信度=LLM 自评。
+/// seq=当日同类别序号（账本前缀计数+1，三位零填充——同日多条按路径
+/// 字典序即时间序）；账本不可达=如实报错交还 LLM（不虚构序号）。
+pub(crate) async fn note_write_exec(
+    namespace: &str,
+    client: &EvoruleApiClient,
+    session_id: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let category = args
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| NOTE_CATEGORIES.contains(s))
+        .ok_or_else(|| {
+            format!(
+                "invalid category; expected one of: {}",
+                NOTE_CATEGORIES.join(", ")
+            )
+        })?;
+    let content = args
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing required param: content (non-empty string)".to_string())?;
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // 强制字段校验（分类学约束；缺一即拒并列明缺项）
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    for (param, label) in note_required_fields(category) {
+        match args
+            .get(param)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(v) => fields.push((param.to_string(), v.to_string())),
+            None => missing.push(*label),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "category '{category}' requires mandatory field(s): {} - a note without them is \
+             not a note ({category} notes exist to prevent repeat failures / pin down \
+             judgements); fill them and retry",
+            missing.join("、")
+        ));
+    }
+    let confidence = match args.get("confidence") {
+        None | Some(Value::Null) => 0.6f64,
+        Some(v) => {
+            let c = v
+                .as_f64()
+                .ok_or_else(|| "invalid confidence: expected number 0-1".to_string())?;
+            if !(0.0..=1.0).contains(&c) {
+                return Err("invalid confidence: expected number 0-1".to_string());
+            }
+            c
+        }
+    };
+    let tags: Vec<String> = match args.get("tags") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .ok_or_else(|| "invalid tags: expected array of strings".to_string())?
+            .iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect(),
+    };
+
+    // seq=当日同类别序号（账本前缀计数；不可达=如实报错）
+    let family = format!("shared.{namespace}.notes.{category}.");
+    let existing = client
+        .get_shared_facts(Some(&family))
+        .await
+        .map_err(|e| format!("note_write: ledger unreachable, cannot allocate sequence ({e})"))?;
+    let ymd = utc_date_str(now_secs());
+    let date_marker = format!("{ymd}-");
+    let seq = existing
+        .iter()
+        .filter(|f| {
+            f.path
+                .rsplit('.')
+                .next()
+                .is_some_and(|t| t.starts_with(&date_marker))
+        })
+        .count()
+        + 1;
+    let path = note_path(namespace, category, &ymd, seq);
+    let key_tail = format!("{category}.{ymd}-{seq:03}");
+
+    let field_refs: Vec<(&str, &str)> =
+        fields.iter().map(|(p, v)| (p.as_str(), v.as_str())).collect();
+    let text = compose_note_text(category, title, content, &field_refs);
+    let mut record = MemoryRecord::new(&key_tail, &text, now_secs());
+    record.lifecycle_state = Some("Captured".to_string());
+    record.source = Some("llm-note".to_string());
+    record.confidence = Some(confidence as f32);
+    let mut all_tags = vec![category.to_string()];
+    all_tags.extend(tags);
+    record.tags = all_tags;
+    let payload = serde_json::to_value(&record)
+        .map_err(|e| format!("note_write: record serialize failed ({e})"))?;
+
+    client
+        .update_payload(session_id, &path, &payload)
+        .await
+        .map_err(|e| format!("note_write: persist failed ({e})"))?;
+    Ok(json!({
+        "status": "ok",
+        "path": path,
+        "key": key_tail,
+        "category": category,
+        "seq": seq,
+        "lifecycle_state": "Captured",
+        "note": "笔记已落账（Captured）；晋升由生命周期状态机按置信/引用数治理",
+    }))
+}
+
+/// `note_write` 执行器（Q3 写面；会话期注册——session_id 在手）
+pub struct MemoryNoteWriteTool {
+    namespace: String,
+    client: EvoruleApiClient,
+    session_id: String,
+}
+
+impl MemoryNoteWriteTool {
+    pub fn new(namespace: String, client: EvoruleApiClient, session_id: String) -> Self {
+        Self {
+            namespace,
+            client,
+            session_id,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolFunction for MemoryNoteWriteTool {
+    async fn call(&self, args: &Value) -> Result<Value, String> {
+        note_write_exec(&self.namespace, &self.client, &self.session_id, args).await
     }
 }
 
@@ -1292,7 +1552,7 @@ mod tests {
     #[test]
     fn test_memory_tool_specs_shape() {
         let specs = memory_tool_specs();
-        assert_eq!(specs.len(), 3);
+        assert_eq!(specs.len(), 4);
         let search = specs.iter().find(|s| s.name == "memory_search").unwrap();
         assert_eq!(search.parameters.len(), 3);
         assert!(search.parameters[0].required);
@@ -1306,6 +1566,10 @@ mod tests {
         assert!(propose.parameters[0].required);
         // 语义分层口径：候选域提议 ≠ 入账写通路（A2-3 propose_knowledge_entry）
         assert!(propose.description.contains("NOT promotion"));
+        // 双通道笔记写件 spec：category/content 必填+强制字段参数面
+        let note = specs.iter().find(|s| s.name == "note_write").unwrap();
+        assert_eq!(note.parameters.iter().filter(|p| p.required).count(), 2);
+        assert!(note.parameters.iter().any(|p| p.name == "root_cause"));
     }
 
     // ===== A2-2：memory_propose 写件 =====
