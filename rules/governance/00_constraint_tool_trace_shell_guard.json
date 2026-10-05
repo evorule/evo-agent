@@ -1,6 +1,8 @@
 {
   "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
   "kind": "rule_set",
+  "id": "com.evorule.constraint.tool_trace_shell_guard",
+  "version": "1.0.0",
   "metadata": {
     "tier": "constraint",
     "title": "工具轨迹危险命令与违禁域守卫",
