@@ -31,6 +31,11 @@ prometheus = "0.13"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 bytes = "1"
 
+# http_get host 归一化分类:与 reqwest 同源的 url 解析(WHATWG IPv4/IPv6
+# host 语义),十进制整数/点分简写/十六进制等形态先归一化为标准 IP 再判
+# SSRF,防「形态特殊」绕过分类
+url = "2"
+
 # G3: LLM 重试退避抖动所需
 rand = "0.8"
 

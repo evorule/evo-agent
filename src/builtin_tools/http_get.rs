@@ -29,7 +29,16 @@
 //! - **强制 https://**(http:// 被拒)
 //! - **Timeout 10s** + connect timeout 5s
 //! - **Max response 1 MB**
-//! - **Max 3 个 redirect**(防 redirect-based SSRF)
+//! - **Max 3 个 redirect**(防 redirect-based SSRF);每跳落点在**跟随前**
+//!   复检——重跑网络负面域守卫 + host 分类(IP 字面量含归一化形态),
+//!   重定向跳入内网/元数据地址在请求发出前即拒
+//!
+//! ## host 归一化(SSRF 分类前置)
+//!
+//! IP 字面量的「形态特殊」变体(`[::1]` bracket、十进制整数 `2130706433`、
+//! 点分简写 `127.1`、十六进制段 `0x7f.0.0.1`)不受 `IpAddr::from_str`
+//! 直解,但底层解析器仍会当 IP 连接——分类前先经 WHATWG host 解析
+//! (与 reqwest 连接语义同源)归一化为标准 IP,防绕过 SSRF 分类。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
@@ -165,8 +174,13 @@ impl HttpGetTool {
             return HostCategory::Invalid;
         }
 
-        // IP 检查(SSRF)
-        if let Ok(ip) = host.parse::<IpAddr>() {
+        // IP 检查(SSRF):先直解,再经 WHATWG host 解析归一化
+        // (bracket/十进制整数/点分简写/十六进制段形态,见模块文档)
+        let ip = host
+            .parse::<IpAddr>()
+            .ok()
+            .or_else(|| normalize_host_ip(host));
+        if let Some(ip) = ip {
             if Self::is_blocked_ip(&ip) {
                 return HostCategory::Blocked {
                     reason: "IP is in SSRF blocklist (private/localhost/link-local)",
@@ -214,12 +228,50 @@ impl HttpGetTool {
         }
     }
 
+    /// redirect 落点复检(redirect-based SSRF 防线):每跳落点在**跟随前**
+    /// 重过网络负面域守卫 + host 分类(IP 字面量含归一化形态)
+    ///
+    /// 返回 Err = 拒绝跟随的显式原因(落点命中负面域/SSRF blocklist/降级
+    /// http/非法 URL);blocked 语义与首跳一致——永不批准,无审批通道。
+    fn check_redirect_target(target: &reqwest::Url) -> Result<(), String> {
+        // 负面域红线(与首跳 call() 同源)
+        super::net_guard::check_denied_network_target(target.as_str())
+            .map_err(|e| format!("redirect blocked: {e}"))?;
+
+        // SSRF 复检:落点重跑 host 分类(http 降级/IP 字面量内网均拒)
+        match Self::classify(target.as_str()) {
+            HostCategory::Blocked { reason } => Err(format!(
+                "redirect blocked: target '{}' is BLOCKED (reason: {})",
+                target.as_str(),
+                reason
+            )),
+            HostCategory::Invalid => Err(format!(
+                "redirect blocked: target '{}' is not a valid URL",
+                target.as_str()
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// reqwest redirect 策略:限次语义与 `Policy::limited` 一致 + 落点复检
+    /// (决策单源在 [`Self::check_redirect_target`])
+    fn redirect_guard(attempt: reqwest::redirect::Attempt) -> reqwest::redirect::Action {
+        // 与 reqwest Policy::limited 同判据:previous 首项是初始 URL 非重定向
+        if attempt.previous().len() > MAX_REDIRECTS as usize {
+            return attempt.error("redirect limit exceeded");
+        }
+        match Self::check_redirect_target(attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(reason) => attempt.error(reason),
+        }
+    }
+
     /// 实际 HTTP GET(G13:原生 async,不再创建独立 runtime)
     async fn fetch(&self, url: &str) -> IoResult {
         let client = reqwest::Client::builder()
             .timeout(self.timeout)
             .connect_timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS as usize))
+            .redirect(reqwest::redirect::Policy::custom(Self::redirect_guard))
             .user_agent("evo-agent/0.1.0")
             .build()
             .map_err(|e| format!("client build: {}", e))?;
@@ -358,6 +410,31 @@ impl ToolFunction for HttpGetTool {
 // =============================================================================
 // 辅助函数
 // =============================================================================
+
+/// host 归一化为 IP(WHATWG 语义,与 reqwest 实际连接解析同源)
+///
+/// 覆盖 `IpAddr::from_str` 拒收、但底层解析器仍按 IP 连接的「形态特殊」
+/// 字面量:IPv6 bracket(`[::1]`)、十进制整数(`2130706433` = 127.0.0.1)、
+/// 点分简写(`127.1`)、十六进制段(`0x7f.0.0.1`)。非 IP 字面量(域名的
+/// WHATWG 解析结果为 Domain)返回 None,交由既有分类路径处理。
+fn normalize_host_ip(host: &str) -> Option<IpAddr> {
+    // IPv6 bracket 去括号后可直解,避免再走一遍 URL 解析
+    let candidate = if host.starts_with('[') && host.ends_with(']') {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
+    if let Ok(ip) = candidate.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    // WHATWG host 解析:十进制整数/点分简写/十六进制段 → 标准 IPv4/IPv6
+    let parsed = url::Url::parse(&format!("https://{candidate}/")).ok()?;
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+        _ => None,
+    }
+}
 
 fn v4_octets_match(ip: Ipv4Addr, net: Ipv4Addr, prefix: u8) -> bool {
     if prefix == 0 {
@@ -594,5 +671,125 @@ mod tests {
                 "legitimate HF model URL must not be net-guard denied: {e}"
             );
         }
+    }
+
+    // === host 归一化(SSRF 分类前置:形态特殊 IP 字面量不降级)===
+
+    #[test]
+    fn test_classify_blocked_ipv6_bracket() {
+        // bracket 形态:`IpAddr::from_str` 拒收 "[::1]",归一化后必须命中
+        assert!(matches!(
+            HttpGetTool::classify("https://[::1]/admin"),
+            HostCategory::Blocked { .. }
+        ));
+        // bracket + 端口:提取面连 bracket 都剥不净,WHATWG 解析兜底
+        assert!(matches!(
+            HttpGetTool::classify("https://[::1]:8080/x"),
+            HostCategory::Blocked { .. }
+        ));
+        // IPv6 link-local bracket 形态
+        assert!(matches!(
+            HttpGetTool::classify("https://[fe80::1]/"),
+            HostCategory::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn test_classify_blocked_normalized_ip_forms() {
+        // 十进制整数 2130706433 = 127.0.0.1
+        assert!(matches!(
+            HttpGetTool::classify("https://2130706433/secret"),
+            HostCategory::Blocked { .. }
+        ));
+        // 十进制整数 2852039166 = 169.254.169.254(云元数据端点)
+        assert!(matches!(
+            HttpGetTool::classify("https://2852039166/latest/meta-data/"),
+            HostCategory::Blocked { .. }
+        ));
+        // 点分简写 127.1 = 127.0.0.1
+        assert!(matches!(
+            HttpGetTool::classify("https://127.1/admin"),
+            HostCategory::Blocked { .. }
+        ));
+        // 十六进制段 0x7f.0.0.1 = 127.0.0.1
+        assert!(matches!(
+            HttpGetTool::classify("https://0x7f.0.0.1/admin"),
+            HostCategory::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn test_classify_public_ipv6_bracket_still_candidate() {
+        // 归一化不得误伤:公开 IPv6 bracket 形态仍走 candidate(需审批)
+        match HttpGetTool::classify("https://[2606:4700::1111]/dns-query") {
+            HostCategory::Candidate { host } => assert_eq!(host, "[2606:4700::1111]"),
+            other => panic!("expected Candidate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_normalize_host_ip_domain_is_none() {
+        // 域名不是 IP 字面量:归一化返回 None,交既有分类路径
+        assert_eq!(normalize_host_ip("example.com"), None);
+        assert_eq!(normalize_host_ip("docs.rs"), None);
+    }
+
+    // === redirect 落点复检(redirect-based SSRF 防线)===
+
+    #[test]
+    fn test_redirect_target_allows_public_host() {
+        let target = reqwest::Url::parse("https://example.com/path").unwrap();
+        assert!(HttpGetTool::check_redirect_target(&target).is_ok());
+    }
+
+    #[test]
+    fn test_redirect_target_blocks_private_ip() {
+        let target = reqwest::Url::parse("https://127.0.0.1/secret").unwrap();
+        let err = HttpGetTool::check_redirect_target(&target)
+            .expect_err("private IP redirect must be rejected");
+        assert!(err.contains("redirect blocked"), "got: {err}");
+        assert!(err.contains("BLOCKED"), "got: {err}");
+    }
+
+    #[test]
+    fn test_redirect_target_blocks_normalized_private_ip() {
+        // 落点为十进制整数 IP(= 127.0.0.1):归一化复检,不得绕过
+        let target = reqwest::Url::parse("https://2130706433/secret").unwrap();
+        assert!(HttpGetTool::check_redirect_target(&target).is_err());
+    }
+
+    #[test]
+    fn test_redirect_target_blocks_http_downgrade() {
+        let target = reqwest::Url::parse("http://example.com/").unwrap();
+        assert!(HttpGetTool::check_redirect_target(&target).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_redirect_target_denies_negative_domain() {
+        let target = reqwest::Url::parse("https://tbench.ai/solution").unwrap();
+        let err = HttpGetTool::check_redirect_target(&target)
+            .expect_err("negative domain redirect must be rejected");
+        assert!(err.contains("denied by policy"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_redirect_to_private_ip_rejected_before_follow() {
+        // 策略接线层(直驱 fetch 绕过首跳分类——mockito 地址本身是内网
+        // 字面量):302 落点 https://127.0.0.1/secret 必须在发出请求前被拒
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/jump", server.url());
+        server
+            .mock("GET", "/jump")
+            .with_status(302)
+            .with_header("Location", "https://127.0.0.1/secret")
+            .create_async()
+            .await;
+
+        let tool = HttpGetTool::new();
+        let result = tool.fetch(&url).await;
+        assert!(result.is_err(), "redirect to private IP must fail");
+        let err = result.unwrap_err();
+        // reqwest 重定向错误形态(区别于连接失败,证明是策略拒绝)
+        assert!(err.contains("redirect"), "got: {err}");
     }
 }

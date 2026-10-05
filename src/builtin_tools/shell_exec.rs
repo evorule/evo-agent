@@ -41,13 +41,23 @@
 //! 3. **3 层分类**:active 直跑 / candidate 请示 / blocked 拒
 //! 4. **网络负面域守卫**([`super::net_guard`]):命令串命中 benchmark 基础设施
 //!    域即拒绝——local/docker-exec 两后端统一前置,红线拦截无审批通道
+//! 5. **执行器生命周期契约(超时=终止并记账,非放弃)**:进程等待为有界
+//!    轮询,到期即终止整个进程族并回收(Windows `taskkill /T /F` 终止进程
+//!    树;Unix spawn 侧独立进程组 + 组级 SIGKILL),真实结局
+//!    「timeout→killed(exit_code/信号)」登记入执行轨迹
+//!    ([`crate::agent::tool_trace`]);执行超时钩子
+//!    ([`ToolFunction::on_execution_timeout`])由外层执行守卫按
+//!    manifest.timeout_class 档位触发
 //!
 //! ## 不支持(明确)
 //!
 //! - pipe / 重定向 / glob / 变量展开 — 用多次 `shell_exec` 调用组合
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -272,14 +282,91 @@ pub enum CommandCategory {
 }
 
 /// 单次执行超时(秒)
+///
+/// 直调兜底缺省(handler 介入的执行路径以静态表超时档
+/// manifest.timeout_class 派生值为准,见 [`ShellExecTool::new`])。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// 输出最大字节数
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MB
 
+/// 进程等待轮询间隔(有界等待的粒度;到期即终止进程族)
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// 进程族执行结局(超时终止路径携带真实结局)
+enum FamilyOutcome {
+    /// 自然退出(与原 `Command::output` 同语义)
+    Completed(std::process::Output),
+    /// spawn/等待 IO 失败
+    Failed(std::io::Error),
+    /// 超时(或执行超时钩子)触发进程族终止,携带回收到的真实结局与主进程 pid
+    /// (pid 供轨迹审计留痕与进程回收断言)
+    Terminated {
+        output: std::process::Output,
+        pid: u32,
+    },
+}
+
+/// 在飞子进程登记的退出摘除守卫(早退路径不残留登记)
+struct LiveGuard<'a> {
+    pid: u32,
+    live: &'a StdMutex<HashMap<u32, Arc<AtomicBool>>>,
+}
+
+impl Drop for LiveGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut live) = self.live.lock() {
+            live.remove(&self.pid);
+        }
+    }
+}
+
+/// 排空管道到缓冲(与 `Command::output` 同语义;不排空会撑满管道死锁)
+fn drain_pipe<R: std::io::Read>(pipe: &mut Option<R>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Some(p) = pipe {
+        let _ = std::io::Read::read_to_end(p, &mut buf);
+    }
+    buf
+}
+
+/// 按 pid 终止进程族(执行超时钩子侧;无 Child 句柄,组级/树级终止尽力)
+///
+/// - Windows:`taskkill /PID <pid> /T /F` 终止进程树(Job Object 主方案需
+///   FFI 依赖,本仓 forbid(unsafe) 纪律下以 taskkill 为 std 兑现形态);
+/// - Unix:组级 SIGKILL(spawn 侧 `process_group(0)` 使 pgid=pid,组 kill
+///   覆盖全部子孙;经 kill 二进制,规避 FFI)。
+///
+/// 用 `.output()` 同步回收终止器自身(阻塞毫秒级):std `Child` drop 不
+/// reap,`spawn` 后不管会留僵尸。
+fn terminate_family_by_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .output();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(format!("-{pid}"))
+            .stdin(std::process::Stdio::null())
+            .output();
+    }
+}
+
+/// 终止整个进程族并回收主进程(执行器生命周期契约:超时=终止而非放弃)
+fn terminate_family(child: &mut std::process::Child) {
+    terminate_family_by_pid(child.id());
+    let _ = child.kill(); // 直杀兜底:组级/树级终止不可用时保证主进程回收
+    let _ = child.wait(); // reap(僵尸预防),取真实结局
+}
+
 /// 执行后端(P1 执行桥:配置选择器 local / docker-exec)
 ///
-/// 参赛兼容层三原则②「删配置即下线」:不传容器名即回落 `Local`,宿主语义零变化。
+/// 兼容层三原则②「删配置即下线」:不传容器名即回落 `Local`,宿主语义零变化。
 /// 容器名经 serve run 请求扩展字段传入,不由 LLM 可控
 /// (LLM 面只见 shell_exec 工具,无任何指定后端/容器的参数)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,7 +404,7 @@ pub fn validate_container_name(name: &str) -> Result<(), String> {
 ///
 /// 宿主侧唯一 program = `docker`(硬编码),命令字符串整体交给容器内 `sh -c`
 /// 解释。容器域为任务沙箱:宿主 3 层分类与 metachar 拒绝不适用容器侧命令
-/// (分类语义以宿主 program 为对象;容器内命令策略的正式化=参赛 P2 扩权批,
+/// (分类语义以宿主 program 为对象;容器内命令策略的正式化=后续 P2 扩权批,
 /// 六级清单与规则面随动)。
 fn docker_exec_argv(container: &str, command: &str) -> Vec<String> {
     vec![
@@ -337,16 +424,23 @@ pub struct ShellExecTool {
     max_output_bytes: usize,
     workdir: Option<std::path::PathBuf>,
     backend: ExecBackend,
+    /// 在飞子进程登记(pid → 取消旗标):执行超时钩子的进程族回收面
+    live: Arc<StdMutex<HashMap<u32, Arc<AtomicBool>>>>,
 }
 
 impl ShellExecTool {
     /// TODO: doc
     pub fn new() -> Self {
         Self {
-            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            // 直调兜底超时=静态表超时档(shell_exec=Default 档);handler 介入
+            // 的执行路径以外层守卫(manifest.timeout_class 分派)+执行超时钩子为准
+            timeout: crate::agent::tool_manifest::lookup_static("shell_exec")
+                .map(|m| m.timeout_class.duration())
+                .unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             workdir: None,
             backend: ExecBackend::Local,
+            live: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -383,6 +477,128 @@ impl ShellExecTool {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(arg0)
+    }
+
+    /// 进程族执行(有界等待;超时→终止整个进程族→真实结局)
+    ///
+    /// 等待为轮询式([`POLL_INTERVAL`] 粒度):到期即 [`terminate_family`],
+    /// 主进程回收(exit_code/信号可查)——spawn_blocking 任务因此自带上界,
+    /// 不再无限阻塞;外层执行超时钩子置位取消旗标+按 pid 终止后,本任务
+    /// 同样即刻退出并回传真实结局。
+    ///
+    /// 容器后端注记:宿主侧在飞程序= docker CLI,本机制回收的是宿主进程
+    /// 族;容器内侧进程生命周期属容器域策略面,不在本机制范围。
+    fn run_family(&self, mut cmd: Command, timeout: Duration) -> FamilyOutcome {
+        // Unix:子进程独立进程组(pgid=pid),组级 kill 覆盖全部子孙
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return FamilyOutcome::Failed(e),
+        };
+        let pid = child.id();
+
+        // 在飞登记(执行超时钩子的回收面)+ 早退路径自动摘除
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Ok(mut live) = self.live.lock() {
+            live.insert(pid, cancel.clone());
+        }
+        let _live_guard = LiveGuard {
+            pid,
+            live: &self.live,
+        };
+
+        // stdout/stderr 读者线程(与 Command::output 同语义)
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let stdout_reader = std::thread::spawn(move || drain_pipe(&mut stdout_pipe));
+        let stderr_reader = std::thread::spawn(move || drain_pipe(&mut stderr_pipe));
+
+        // 有界等待轮询:到期即终止进程族
+        let started = std::time::Instant::now();
+        let mut terminated = false;
+        let mut status: Option<std::process::ExitStatus> = None;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                terminated = true;
+                break;
+            }
+            match child.try_wait() {
+                Ok(Some(s)) => {
+                    status = Some(s);
+                    break;
+                }
+                Ok(None) => {
+                    if started.elapsed() >= timeout {
+                        terminate_family(&mut child);
+                        terminated = true;
+                        break;
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(e) => return FamilyOutcome::Failed(e),
+            }
+        }
+        let status = match status {
+            Some(s) => s,
+            // 终止后回收(僵尸预防),取真实结局(退出码/信号)
+            None => match child.wait() {
+                Ok(s) => s,
+                Err(e) => return FamilyOutcome::Failed(e),
+            },
+        };
+        let stdout = stdout_reader.join().unwrap_or_default();
+        let stderr = stderr_reader.join().unwrap_or_default();
+        let output = std::process::Output {
+            status,
+            stdout,
+            stderr,
+        };
+        if terminated {
+            FamilyOutcome::Terminated { output, pid }
+        } else {
+            FamilyOutcome::Completed(output)
+        }
+    }
+
+    /// 超时终止的真实结局:登记入执行轨迹(killed)+ 显式回传
+    ///
+    /// 登记先于返回——采集点(管道/G13 路径)在本调用返回后 record,
+    /// 顺序保证 killed 状态能落到该次调用轨迹上。
+    fn report_terminated(
+        original_cmd: &str,
+        pid: u32,
+        status: &std::process::ExitStatus,
+        timeout: Duration,
+    ) -> IoResult {
+        let exit_code = status.code();
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(windows)]
+        let signal: Option<i32> = None;
+        crate::agent::tool_trace::register_killed_outcome(
+            crate::agent::tool_trace::KilledOutcome {
+                tool: "shell_exec".to_string(),
+                ident: original_cmd.to_string(),
+                exit_code,
+                signal,
+            },
+        );
+        Err(format!(
+            "command '{original_cmd}' timed out after {}s; process family terminated \
+             (pid={pid}, exit_code={exit_code:?}, signal={signal:?})",
+            timeout.as_secs()
+        ))
     }
 
     /// 拒绝任何含 shell metacharacter 的 arg
@@ -426,27 +642,39 @@ impl ShellExecTool {
         if let Some(dir) = &self.workdir {
             cmd.current_dir(dir);
         }
-        cmd.stdin(std::process::Stdio::null());
 
-        let output = match cmd.output() {
-            Ok(o) => o,
-            Err(e) => {
+        match self.run_family(cmd, self.timeout) {
+            FamilyOutcome::Failed(e) => {
                 return Err(format!(
                     "failed to spawn '{}': {} (is it installed and in PATH?)",
                     program, e
                 ));
             }
-        };
+            FamilyOutcome::Terminated { output, pid } => {
+                return Self::report_terminated(original_cmd, pid, &output.status, self.timeout);
+            }
+            FamilyOutcome::Completed(output) => {
+                Self::completed_result(original_cmd, program, &output, self.max_output_bytes)
+            }
+        }
+    }
 
-        let stdout_bytes = if output.stdout.len() > self.max_output_bytes {
-            &output.stdout[..self.max_output_bytes]
+    /// 自然退出的结果 JSON(与原 `Command::output` 路径同形态)
+    fn completed_result(
+        original_cmd: &str,
+        program: &str,
+        output: &std::process::Output,
+        max_output_bytes: usize,
+    ) -> IoResult {
+        let stdout_bytes = if output.stdout.len() > max_output_bytes {
+            &output.stdout[..max_output_bytes]
         } else {
-            &output.stdout
+            &output.stdout[..]
         };
-        let stderr_bytes = if output.stderr.len() > self.max_output_bytes {
-            &output.stderr[..self.max_output_bytes]
+        let stderr_bytes = if output.stderr.len() > max_output_bytes {
+            &output.stderr[..max_output_bytes]
         } else {
-            &output.stderr
+            &output.stderr[..]
         };
 
         let mut map = serde_json::Map::new();
@@ -467,7 +695,7 @@ impl ShellExecTool {
         );
         map.insert(
             "stdout_truncated".to_string(),
-            Value::Bool(output.stdout.len() > self.max_output_bytes),
+            Value::Bool(output.stdout.len() > max_output_bytes),
         );
         Ok(Value::Object(map))
     }
@@ -478,56 +706,60 @@ impl ShellExecTool {
     /// 命令字符串整体交容器内 `sh -c` 解释(pipe/redirect/heredoc 等均为容器域
     /// shell 语义)。执行事实(backend/container/exit_code/stdout/stderr)随工具
     /// 观察入审计链——G1 验收口径。
+    ///
+    /// 执行器生命周期契约与宿主后端同构:宿主侧进程族(docker CLI 及其子进程)
+    /// 超时即终止回收,真实结局 killed 入轨迹;容器内侧进程生命周期属容器域
+    /// 策略面,不在本机制范围(见 [`Self::run_family`] 容器后端注记)。
     fn execute_docker_exec(&self, container: &str, original_cmd: &str) -> IoResult {
         let argv = docker_exec_argv(container, original_cmd);
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
-        cmd.stdin(std::process::Stdio::null());
 
-        let output = match cmd.output() {
-            Ok(o) => o,
-            Err(e) => {
-                return Err(format!(
-                    "failed to spawn '{}': {} (is docker installed and in PATH?)",
-                    argv[0], e
-                ));
+        match self.run_family(cmd, self.timeout) {
+            FamilyOutcome::Failed(e) => Err(format!(
+                "failed to spawn '{}': {} (is docker installed and in PATH?)",
+                argv[0], e
+            )),
+            FamilyOutcome::Terminated { output, pid } => {
+                Self::report_terminated(original_cmd, pid, &output.status, self.timeout)
             }
-        };
+            FamilyOutcome::Completed(output) => {
+                let stdout_bytes = if output.stdout.len() > self.max_output_bytes {
+                    &output.stdout[..self.max_output_bytes]
+                } else {
+                    &output.stdout[..]
+                };
+                let stderr_bytes = if output.stderr.len() > self.max_output_bytes {
+                    &output.stderr[..self.max_output_bytes]
+                } else {
+                    &output.stderr[..]
+                };
 
-        let stdout_bytes = if output.stdout.len() > self.max_output_bytes {
-            &output.stdout[..self.max_output_bytes]
-        } else {
-            &output.stdout
-        };
-        let stderr_bytes = if output.stderr.len() > self.max_output_bytes {
-            &output.stderr[..self.max_output_bytes]
-        } else {
-            &output.stderr
-        };
-
-        let mut map = serde_json::Map::new();
-        map.insert("status".to_string(), Value::from("ok"));
-        map.insert("command".to_string(), Value::from(original_cmd.to_string()));
-        map.insert("program".to_string(), Value::from("docker exec"));
-        map.insert("backend".to_string(), Value::from("docker-exec"));
-        map.insert("container".to_string(), Value::from(container.to_string()));
-        map.insert(
-            "exit_code".to_string(),
-            Value::from(output.status.code().unwrap_or(-1) as i64),
-        );
-        map.insert(
-            "stdout".to_string(),
-            Value::from(String::from_utf8_lossy(stdout_bytes).to_string()),
-        );
-        map.insert(
-            "stderr".to_string(),
-            Value::from(String::from_utf8_lossy(stderr_bytes).to_string()),
-        );
-        map.insert(
-            "stdout_truncated".to_string(),
-            Value::Bool(output.stdout.len() > self.max_output_bytes),
-        );
-        Ok(Value::Object(map))
+                let mut map = serde_json::Map::new();
+                map.insert("status".to_string(), Value::from("ok"));
+                map.insert("command".to_string(), Value::from(original_cmd.to_string()));
+                map.insert("program".to_string(), Value::from("docker exec"));
+                map.insert("backend".to_string(), Value::from("docker-exec"));
+                map.insert("container".to_string(), Value::from(container.to_string()));
+                map.insert(
+                    "exit_code".to_string(),
+                    Value::from(output.status.code().unwrap_or(-1) as i64),
+                );
+                map.insert(
+                    "stdout".to_string(),
+                    Value::from(String::from_utf8_lossy(stdout_bytes).to_string()),
+                );
+                map.insert(
+                    "stderr".to_string(),
+                    Value::from(String::from_utf8_lossy(stderr_bytes).to_string()),
+                );
+                map.insert(
+                    "stdout_truncated".to_string(),
+                    Value::Bool(output.stdout.len() > self.max_output_bytes),
+                );
+                Ok(Value::Object(map))
+            }
+        }
     }
 
     /// 构造一个 proposal(给 agent/CLI 用于问用户)
@@ -571,6 +803,21 @@ impl ToolFunction for ShellExecTool {
         tokio::task::spawn_blocking(move || tool.call_sync(&args))
             .await
             .map_err(|e| format!("shell_exec tool panicked: {}", e))?
+    }
+
+    /// 执行超时钩子(执行器生命周期契约):外层执行守卫按超时档到期时调用,
+    /// 本工具在此终止全部在飞进程族——轮询等待感知取消旗标即退出并回传
+    /// 真实结局(spawn_blocking 任务不因外层放弃而悬挂)
+    fn on_execution_timeout(&self) {
+        // 摘录登记快照再操作,避免持锁跨进程终止(终止器自身可能阻塞毫秒级)
+        let snapshot: Vec<(u32, Arc<AtomicBool>)> = match self.live.lock() {
+            Ok(live) => live.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            Err(_) => return,
+        };
+        for (pid, cancel) in snapshot {
+            cancel.store(true, Ordering::Relaxed);
+            terminate_family_by_pid(pid);
+        }
     }
 }
 
@@ -948,5 +1195,246 @@ mod tests {
                 "normal domain must not be net-guard denied: {e}"
             );
         }
+    }
+
+    // === 执行器生命周期契约(超时=终止并记账,非放弃)===
+    //
+    // 命令 3 层分类把 ping/sleep 归 Unknown(拒),生命周期机制测试直调私有
+    // execute() 绕过分类(分类语义由既有 call_sync 测试覆盖);短超时(1s)
+    // 实测,避免拖慢测试面。Windows 两个 ping 用例以互斥串行,防 PING.EXE
+    // 计数基线互扰。
+
+    static PING_SERIES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 挂起命令(平台差异):运行 30s,远超测试超时
+    fn hanging_command() -> (&'static str, Vec<&'static str>) {
+        #[cfg(windows)]
+        {
+            (
+                "ping 127.0.0.1 -n 30",
+                vec!["ping", "127.0.0.1", "-n", "30"],
+            )
+        }
+        #[cfg(unix)]
+        {
+            ("sleep 30", vec!["sleep", "30"])
+        }
+    }
+
+    #[cfg(windows)]
+    fn process_alive(pid: u32) -> bool {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .expect("tasklist must run");
+        String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// 存活 PING.EXE 计数(Windows 进程树断言基线)
+    #[cfg(windows)]
+    fn count_ping_processes() -> usize {
+        let out = Command::new("tasklist")
+            .args(["/FO", "CSV", "/NH", "/FI", "IMAGENAME eq PING.EXE"])
+            .output()
+            .expect("tasklist must run");
+        String::from_utf8_lossy(&out.stdout)
+            .matches("PING.EXE")
+            .count()
+    }
+
+    /// 同进程组存活成员数(Unix 进程树断言;spawn 侧 process_group(0) 使
+    /// 主进程与全部子孙同组,组空即进程族回收完成;僵尸态不计——孙进程
+    ///死后由 init 兜底 reap,回收存在内核窗口)
+    #[cfg(unix)]
+    fn count_group_members(pgid: u32) -> usize {
+        let out = Command::new("ps")
+            .args(["-e", "-o", "pgid=,stat="])
+            .output()
+            .expect("ps must run");
+        let pgid_str = pgid.to_string();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| {
+                let mut cols = line.split_whitespace();
+                let first = cols.next();
+                let stat = cols.next().unwrap_or("");
+                first == Some(pgid_str.as_str()) && !stat.starts_with('Z')
+            })
+            .count()
+    }
+
+    /// 从超时错误消息解析主进程 pid(report_terminated 留痕形态)
+    fn parse_pid_from_error(err: &str) -> u32 {
+        err.split("pid=")
+            .nth(1)
+            .unwrap_or_else(|| panic!("timeout error must carry pid: {err}"))
+            .split(',')
+            .next()
+            .unwrap_or_else(|| panic!("pid must precede comma: {err}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("pid must be numeric: {err}"))
+    }
+
+    #[test]
+    fn test_timeout_terminates_direct_child_and_records_killed() {
+        // 登记表为进程级全局态:与 tool_trace 的登记/清空用例互斥
+        // (锁序统一:先登记表锁,后 PING 计数锁,防交叉死锁)
+        let _registry = crate::agent::tool_trace::KILLED_OUTCOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        #[cfg(windows)]
+        let _serial = PING_SERIES.lock().unwrap_or_else(|p| p.into_inner());
+        crate::agent::tool_trace::clear_killed_outcomes();
+        let tool = ShellExecTool::new().with_timeout(1);
+        let (cmd_str, parts) = hanging_command();
+
+        let result = tool.execute(&parts, cmd_str);
+        let err = result.expect_err("hanging command must time out");
+        assert!(err.contains("timed out"), "got: {err}");
+
+        // 主进程回收断言:超时返回后 pid 必须已不存在
+        let pid = parse_pid_from_error(&err);
+        assert!(
+            !process_alive(pid),
+            "pid {pid} must be reaped after timeout"
+        );
+
+        // 真实结局补记:轨迹面按 (tool, command) 消费登记,status=killed
+        let mut collector = crate::agent::tool_trace::ToolTraceCollector::default();
+        collector.record(
+            "shell_exec",
+            &serde_json::json!({"command": cmd_str}),
+            "error",
+            1000,
+        );
+        let entry = collector.drain().remove(0);
+        assert_eq!(entry["status"], "killed");
+        assert!(entry.get("killed").is_some(), "killed payload present");
+        // 平台真实结局:组级 SIGKILL 记信号 9;taskkill /F 记退出码、无信号
+        #[cfg(unix)]
+        assert_eq!(entry["killed"]["signal"], 9, "got: {entry}");
+        #[cfg(windows)]
+        {
+            assert!(
+                entry["killed"]["exit_code"].is_i64(),
+                "forceful termination yields an exit code: {entry}"
+            );
+            assert!(entry["killed"]["signal"].is_null(), "got: {entry}");
+        }
+        crate::agent::tool_trace::clear_killed_outcomes();
+    }
+
+    #[test]
+    fn test_timeout_terminates_process_family_tree() {
+        // 锁序统一:先登记表锁(本用例超时终止会写登记),后 PING 计数锁
+        let _registry = crate::agent::tool_trace::KILLED_OUTCOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _serial = PING_SERIES.lock().unwrap_or_else(|p| p.into_inner());
+
+        // 树形态:主进程再 spawn 孙进程(cmd→PING.EXE / sh→sleep)
+        #[cfg(windows)]
+        let (cmd_str, parts) = (
+            "cmd /c ping -n 31 127.0.0.1",
+            vec!["cmd", "/c", "ping", "-n", "31", "127.0.0.1"],
+        );
+        #[cfg(unix)]
+        let (cmd_str, parts) = (
+            "sh -c 'sleep 31 & wait'",
+            vec!["sh", "-c", "sleep 31 & wait"],
+        );
+
+        #[cfg(windows)]
+        let baseline = count_ping_processes();
+
+        let tool = ShellExecTool::new().with_timeout(1);
+        let result = tool.execute(&parts, cmd_str);
+        let err = result.expect_err("hanging command tree must time out");
+        let pid = parse_pid_from_error(&err);
+
+        // 主进程回收
+        assert!(!process_alive(pid), "main pid {pid} must be reaped");
+
+        // 进程树断言:孙进程同样回收(taskkill /T 树终止 / Unix 组级 SIGKILL);
+        // 终止异步生效,轮询等待内核回收完成
+        #[cfg(windows)]
+        {
+            for _ in 0..40 {
+                if count_ping_processes() == baseline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!(
+                "grandchild PING.EXE must be reaped with the family: {} vs baseline {}",
+                count_ping_processes(),
+                baseline
+            );
+        }
+        #[cfg(unix)]
+        {
+            for _ in 0..40 {
+                if count_group_members(pid) == 0 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!(
+                "process group must be empty after family termination: {} members left",
+                count_group_members(pid)
+            );
+        }
+    }
+
+    #[test]
+    fn test_execution_timeout_hook_terminates_inflight_family() {
+        // 钩子路径:外层守卫在档位到期触发 on_execution_timeout → 在飞
+        // 进程族终止,run_family 感知取消旗标即刻退出并回传真实结局
+        // (spawn_blocking 任务不悬挂)
+        //
+        // 双锁同序(登记表→PING 计数):本用例 spawn 挂起命令且超时终止
+        // 会写登记表
+        let _registry = crate::agent::tool_trace::KILLED_OUTCOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        #[cfg(windows)]
+        let _serial = PING_SERIES.lock().unwrap_or_else(|p| p.into_inner());
+        let tool = std::sync::Arc::new(ShellExecTool::new().with_timeout(60));
+        let tool2 = tool.clone();
+        let handle = std::thread::spawn(move || {
+            let (cmd_str, parts) = hanging_command();
+            tool2.execute(&parts, cmd_str)
+        });
+
+        // 等待在飞登记出现(执行线程 spawn 完成即可见)
+        let mut spawned_pid = None;
+        for _ in 0..100 {
+            if let Ok(live) = tool.live.lock() {
+                spawned_pid = live.keys().next().copied();
+            }
+            if spawned_pid.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let pid = spawned_pid.expect("in-flight process must register");
+
+        // 钩子触发:置位取消旗标 + 按 pid 终止进程族
+        tool.on_execution_timeout();
+
+        let result = handle.join().expect("execute thread must not hang");
+        let err = result.expect_err("hook-terminated family reports real outcome");
+        assert!(err.contains("timed out"), "got: {err}");
+        assert!(!process_alive(pid), "in-flight family must be reaped");
     }
 }

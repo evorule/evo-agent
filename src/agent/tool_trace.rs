@@ -22,10 +22,76 @@
 //!   膨胀炸链),截断为显式标记不静默丢弃。
 
 use serde_json::{Map, Value};
+use std::sync::Mutex;
 
 /// 单条轨迹 args 序列化后的体积上限(字节)。超出即截断并标记 `truncated`,
 /// 防巨型 file_write/http_get 响应把 payload 撑爆审计链。
 const MAX_ARGS_BYTES: usize = 32 * 1024;
+
+/// 超时终止真实结局登记表上限:采集点缺席时(CLI 直调等无轨迹面的路径)
+/// 丢弃最旧条目,防登记表无界堆积。
+const MAX_KILLED_OUTCOMES: usize = 64;
+
+/// 超时终止真实结局(执行器生命周期契约)
+///
+/// 进程族回收方(工具实现,spawn_blocking 内)与轨迹采集点(管道/G13 并行
+/// 路径)无共享句柄,以「工具名+参数标识」关联:回收方在终止进程族后登记
+/// 真实结局(exit_code/信号),采集点 [`ToolTraceCollector::record`] 取走
+/// 匹配项,该次调用轨迹 status 标 `killed` 并附加真实结局——消灭「超时
+/// 放弃后结局永不可知」。同名同命令并发超时的极端交错可能互换条目
+/// (两方均为真实 killed 结局,仅 exit_code 可能错配,登记表按此取舍)。
+#[derive(Debug, Clone)]
+pub struct KilledOutcome {
+    /// 工具名(与 record 的 tool_name 匹配)
+    pub tool: String,
+    /// 参数标识(shell_exec = command 原文)
+    pub ident: String,
+    /// 终止后回收到的退出码(信号终止时为 None)
+    pub exit_code: Option<i32>,
+    /// 终止信号(Unix SIGKILL=9;Windows 强制终止无信号 = None)
+    pub signal: Option<i32>,
+}
+
+static KILLED_OUTCOMES: Mutex<Vec<KilledOutcome>> = Mutex::new(Vec::new());
+
+/// 登记超时终止真实结局(进程族回收方调用;fail-soft:锁中毒即放弃)
+pub fn register_killed_outcome(outcome: KilledOutcome) {
+    if let Ok(mut queue) = KILLED_OUTCOMES.lock() {
+        if queue.len() >= MAX_KILLED_OUTCOMES {
+            queue.remove(0);
+        }
+        queue.push(outcome);
+    }
+}
+
+/// 取走与 (tool_name, ident) 匹配的登记(FIFO 首条;无匹配不动登记表)
+fn take_killed_outcome(tool_name: &str, ident: &str) -> Option<KilledOutcome> {
+    let mut queue = KILLED_OUTCOMES.lock().ok()?;
+    let idx = queue
+        .iter()
+        .position(|o| o.tool == tool_name && o.ident == ident)?;
+    Some(queue.remove(idx))
+}
+
+/// 清空登记表(测试面:用例间隔离)
+#[cfg(test)]
+pub(crate) fn clear_killed_outcomes() {
+    if let Ok(mut queue) = KILLED_OUTCOMES.lock() {
+        queue.clear();
+    }
+}
+
+/// 登记表当前条数(测试面)
+#[cfg(test)]
+pub(crate) fn killed_outcome_len() -> usize {
+    KILLED_OUTCOMES.lock().map(|q| q.len()).unwrap_or(0)
+}
+
+/// 登记表相关用例的跨模块串行锁(测试面):登记/清空为进程级全局态,
+/// 本模块与 shell_exec 的「登记→采集点消费」集成用例须互斥,防并行测试
+/// 的 clear 清掉他模块刚登记的条目
+#[cfg(test)]
+pub(crate) static KILLED_OUTCOME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// 敏感键名表(小写精确/前后缀匹配):命中值替换为 `[REDACTED]`。
 const SENSITIVE_KEYS: &[&str] = &[
@@ -118,7 +184,8 @@ impl ToolTraceCollector {
 
     /// 记录一次工具调用(含被治理拦截的调用——拦截也是真实执行史)
     ///
-    /// `status`: `ok` / `error` / `blocked_by_governance`(M5-c 裁决拦截)。
+    /// `status`: `ok` / `error` / `blocked_by_governance`(裁决拦截) /
+    /// `killed`(执行超时,进程族终止后的真实结局,见 [`KilledOutcome`])。
     /// shell_exec 调用附带危险命令打标:命中则轨迹条目附加 `danger_hits`
     /// 数组(词级检测+违禁域扫描见 [`detect_danger_hits`]);command 从
     /// 原始 args 读取(截断降级仅作用于入链 args 副本,不影响打标保真)。
@@ -140,6 +207,16 @@ impl ToolTraceCollector {
         });
         if tool_name == "shell_exec" {
             if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                // 真实结局补记:超时进程族终止的调用,轨迹 status 标 killed
+                // 并附加 exit_code/信号(登记由回收方写入,此处按命令取走;
+                // 采集点传入的 ok/error 被 killed 取代——终止即真实执行史)
+                if let Some(killed) = take_killed_outcome(tool_name, cmd) {
+                    entry["status"] = serde_json::json!("killed");
+                    entry["killed"] = serde_json::json!({
+                        "exit_code": killed.exit_code,
+                        "signal": killed.signal,
+                    });
+                }
                 let hits = detect_danger_hits(cmd);
                 match self.exec_backend.as_deref() {
                     // docker-exec 后端:容器域=一次性任务沙箱,host 视角 program/rm
@@ -541,5 +618,117 @@ mod tests {
             c.drain().remove(0)["danger_hits"],
             json!(["domain:tbench.ai"])
         );
+    }
+
+    // === 真实结局补记:超时终止的 killed 状态(登记→采集点消费)===
+
+    #[test]
+    fn killed_outcome_marks_trace_status_with_real_exit() {
+        let _serial = KILLED_OUTCOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_killed_outcomes();
+        register_killed_outcome(KilledOutcome {
+            tool: "shell_exec".to_string(),
+            ident: "lifecycle-probe-a".to_string(),
+            exit_code: None,
+            signal: Some(9),
+        });
+        let mut c = ToolTraceCollector::default();
+        c.record(
+            "shell_exec",
+            &json!({"command": "lifecycle-probe-a"}),
+            "error",
+            60001,
+        );
+        let entry = c.drain().remove(0);
+        assert_eq!(entry["status"], "killed");
+        assert_eq!(entry["killed"]["signal"], 9);
+        assert_eq!(entry["killed"]["exit_code"], Value::Null);
+    }
+
+    #[test]
+    fn killed_outcome_requires_matching_ident() {
+        let _serial = KILLED_OUTCOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_killed_outcomes();
+        register_killed_outcome(KilledOutcome {
+            tool: "shell_exec".to_string(),
+            ident: "lifecycle-probe-b".to_string(),
+            exit_code: Some(1),
+            signal: None,
+        });
+        let mut c = ToolTraceCollector::default();
+        // 无匹配登记的调用:status 保持采集点原值,登记表不被误消费
+        c.record(
+            "shell_exec",
+            &json!({"command": "lifecycle-other-call"}),
+            "error",
+            12,
+        );
+        let entry = c.drain().remove(0);
+        assert_eq!(entry["status"], "error");
+        assert!(entry.get("killed").is_none());
+        assert_eq!(killed_outcome_len(), 1);
+
+        // 匹配调用取走登记
+        c.record(
+            "shell_exec",
+            &json!({"command": "lifecycle-probe-b"}),
+            "error",
+            12,
+        );
+        let entry = c.drain().remove(0);
+        assert_eq!(entry["status"], "killed");
+        assert_eq!(entry["killed"]["exit_code"], 1);
+        assert_eq!(killed_outcome_len(), 0);
+    }
+
+    #[test]
+    fn killed_outcome_registry_is_bounded() {
+        let _serial = KILLED_OUTCOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_killed_outcomes();
+        for i in 0..(MAX_KILLED_OUTCOMES + 8) {
+            register_killed_outcome(KilledOutcome {
+                tool: "shell_exec".to_string(),
+                ident: format!("bounded-{i}"),
+                exit_code: Some(0),
+                signal: None,
+            });
+        }
+        assert_eq!(killed_outcome_len(), MAX_KILLED_OUTCOMES);
+        // 最旧条目被挤出:只剩尾部窗口内的 ident
+        let mut c = ToolTraceCollector::default();
+        c.record("shell_exec", &json!({"command": "bounded-0"}), "error", 1);
+        assert_eq!(c.drain().remove(0)["status"], "error");
+        clear_killed_outcomes();
+    }
+
+    #[test]
+    fn killed_outcome_not_consumed_for_other_tools() {
+        let _serial = KILLED_OUTCOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_killed_outcomes();
+        register_killed_outcome(KilledOutcome {
+            tool: "shell_exec".to_string(),
+            ident: "lifecycle-probe-c".to_string(),
+            exit_code: Some(2),
+            signal: None,
+        });
+        let mut c = ToolTraceCollector::default();
+        c.record(
+            "http_get",
+            &json!({"url": "https://example.com/lifecycle-probe-c"}),
+            "error",
+            3,
+        );
+        let entry = c.drain().remove(0);
+        assert_eq!(entry["status"], "error");
+        assert_eq!(killed_outcome_len(), 1);
+        clear_killed_outcomes();
     }
 }
