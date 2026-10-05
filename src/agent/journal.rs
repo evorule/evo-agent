@@ -206,6 +206,16 @@ pub enum JournalEvent {
         /// 摘要为空（跳过判定；事件照落）
         summary_empty: bool,
     },
+    /// wire blob 过期标记(journal 体积治理批:保留期窗口外降级可见,
+    /// 不留静默空洞——I4 全文级重建保证随窗口关闭降级为 hash 校验)
+    WireBlobExpired {
+        /// 轮序号(与 wire_rendered.round 同源)
+        round: u64,
+        /// wire 全文 digest(降级后仅存校验凭证)
+        content_hash: String,
+        /// wire 字节长度(与 hash 组成完整性校验对)
+        wire_len: usize,
+    },
     /// 崩溃标记(P2 resume 检测到尾部无 turn_ended 后补写,运行时不写)
     SessionCrashed {
         /// 崩溃原因
@@ -621,6 +631,21 @@ impl JournalWriter {
     }
 
     /// 治理裁决输出(judgement_id 由本事件 seq 确定性合成)
+    /// wire blob 过期标记落账(journal 体积治理批;离线 GC 经 writer 追加,
+    /// 复用活跃写者锁=并发安全)。best-effort 调用方决定失败处置。
+    pub fn wire_blob_expired(
+        &self,
+        round: u64,
+        content_hash: &str,
+        wire_len: usize,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::WireBlobExpired {
+            round,
+            content_hash: content_hash.to_string(),
+            wire_len,
+        })
+    }
+
     /// 摘要保真对照落账(规格修正批交付物 B;每次 G10 摘要替换自动对照,
     /// I5 从"原则上可对照"升级为"每次压缩自动对照")。best-effort 调用方
     /// 决定失败处置(留痕不阻塞)。
@@ -707,6 +732,205 @@ pub fn read_all(path: &Path) -> Result<Vec<JournalLine>, JournalError> {
 
 /// session_id 消毒:仅保留 [A-Za-z0-9._-],其余替 '_',防路径注入/跨平台文件名问题
 /// (公开:atif 导出面需以同口径回写 source_journal 相对路径)
+/// journal 体积治理 GC 报告（规格修正批批次四/K-01）
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct GcReport {
+    /// 扫描的 journal 文件数
+    pub files_scanned: usize,
+    /// 归档到旁路件的 wire blob 数（全文出 journal，可回读）
+    pub wire_archived: usize,
+    /// 过期删除的 wire blob 数（仅存 hash+长度，降级可见）
+    pub wire_expired: usize,
+    /// 处理前字节总量
+    pub bytes_before: u64,
+    /// 处理后字节总量
+    pub bytes_after: u64,
+}
+
+fn collect_journal_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), JournalError> {
+    let entries = std::fs::read_dir(dir).map_err(JournalError::Io)?;
+    for entry in entries {
+        let path = entry.map_err(JournalError::Io)?.path();
+        if path.is_dir() {
+            collect_journal_jsonl(&path, out)?;
+        } else if path.extension().map(|e| e == "jsonl").unwrap_or(false)
+            && !path.to_string_lossy().ends_with("wire-archive.jsonl")
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// 目录级 wire blob 治理（离线命令；热路径零改动）。
+///
+/// 分层保留：骨架事件永久保留；wire_rendered 全文按保留期窗口三段处理——
+/// `wire_blob_days` 内留 journal 正文，超窗入旁路归档件
+/// （`{session}.wire-archive.jsonl`，同 encode 口径自描述行），超
+/// `expire_days` 过期删除（journal 落 `wire_blob_expired` 标记事件，
+/// 降级可见不留静默空洞）。并发安全=活跃写者注册表锁拒绝活跃会话
+/// （fail-visible）；原子性=临时文件+rename；行重写走裸 JSON 操作
+/// （保留未知键，非 typed 全量重编）；幂等（重跑无二次副作用）。
+pub fn gc_wire_blobs(
+    dir: &Path,
+    now_ms: u64,
+    wire_blob_days: u64,
+    expire_days: u64,
+) -> Result<GcReport, JournalError> {
+    let wire_blob_ms = wire_blob_days * 86_400_000;
+    let expire_ms = expire_days * 86_400_000;
+    let mut stats = GcReport::default();
+    let mut jsonls: Vec<PathBuf> = Vec::new();
+    collect_journal_jsonl(dir, &mut jsonls)?;
+    jsonls.sort();
+    for path in &jsonls {
+        stats.files_scanned += 1;
+        let stem = path
+            .file_stem()
+            .map(|st| st.to_string_lossy().to_string())
+            .unwrap_or_default();
+        {
+            let active = ACTIVE_WRITERS
+                .lock()
+                .map(|g| g.as_ref().map_or(false, |set| set.contains(&stem)))
+                .unwrap_or(false);
+            if active {
+                return Err(JournalError::WriterActive(stem));
+            }
+        }
+        let content = std::fs::read_to_string(path).map_err(JournalError::Io)?;
+        stats.bytes_before += content.len() as u64;
+        let sidecar_path = path.with_extension("wire-archive.jsonl");
+        let mut modified = false;
+        let mut out_lines: Vec<String> = Vec::new();
+        let mut archive_lines: Vec<String> = Vec::new();
+        let mut expired_infos: Vec<(u64, String, usize)> = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut obj: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => {
+                    // 非 journal schema 的行（他种账本）原样保留不治理
+                    out_lines.push(line.to_string());
+                    continue;
+                }
+            };
+            // 事件字段在 "payload" 包裹层(真实 journal 形态);顶层兜底
+            // (ts 在顶层,先取出避免借用冲突)
+            let line_ts = obj.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+            let payload_face = match obj.get_mut("payload") {
+                Some(v) => v.as_object_mut(),
+                None => obj.as_object_mut(),
+            };
+            let Some(face) = payload_face else {
+                out_lines.push(obj.to_string());
+                continue;
+            };
+            let is_wire = face.contains_key("full_text")
+                && face.contains_key("content_hash")
+                && face.contains_key("round");
+            if is_wire {
+                let ts = line_ts;
+                let full = face
+                    .get("full_text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let age = now_ms.saturating_sub(ts);
+                if !full.is_empty() && age >= expire_ms {
+                    face.insert("full_text".to_string(), serde_json::Value::String(String::new()));
+                    let round = face.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let hash = face
+                        .get("content_hash")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let len = face.get("wire_len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    expired_infos.push((round, hash, len));
+                    stats.wire_expired += 1;
+                    modified = true;
+                } else if !full.is_empty() && age >= wire_blob_ms {
+                    archive_lines.push(line.to_string());
+                    face.insert("full_text".to_string(), serde_json::Value::String(String::new()));
+                    stats.wire_archived += 1;
+                    modified = true;
+                }
+            }
+            out_lines.push(obj.to_string());
+        }
+        if !archive_lines.is_empty() {
+            let mut sc = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&sidecar_path)
+                .map_err(JournalError::Io)?;
+            for l in &archive_lines {
+                writeln!(sc, "{l}").map_err(JournalError::Io)?;
+            }
+        }
+        if sidecar_path.exists() {
+            let sc_content =
+                std::fs::read_to_string(&sidecar_path).map_err(JournalError::Io)?;
+            let mut kept: Vec<String> = Vec::new();
+            for l in sc_content.lines() {
+                if l.trim().is_empty() {
+                    continue;
+                }
+                let obj: serde_json::Value = match serde_json::from_str(l) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        kept.push(l.to_string());
+                        continue;
+                    }
+                };
+                let ts = obj.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+                if now_ms.saturating_sub(ts) >= expire_ms {
+                    let round = obj.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let hash = obj
+                        .get("content_hash")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let len =
+                        obj.get("wire_len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    expired_infos.push((round, hash, len));
+                    stats.wire_expired += 1;
+                } else {
+                    kept.push(l.to_string());
+                }
+            }
+            let orig_count = sc_content.lines().count();
+            if kept.len() != orig_count {
+                let mut joined = kept.join("\n");
+                if !joined.is_empty() {
+                    joined.push('\n');
+                }
+                std::fs::write(&sidecar_path, joined).map_err(JournalError::Io)?;
+                modified = true;
+            }
+        }
+        if modified {
+            let tmp = path.with_extension("jsonl.gc-tmp");
+            let mut joined = out_lines.join("\n");
+            if !joined.is_empty() {
+                joined.push('\n');
+            }
+            std::fs::write(&tmp, joined).map_err(JournalError::Io)?;
+            std::fs::rename(&tmp, path).map_err(JournalError::Io)?;
+        }
+        stats.bytes_after += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if !expired_infos.is_empty() {
+            let w = JournalWriter::open(path.parent().unwrap_or(Path::new(".")), &stem)?;
+            for (round, hash, len) in &expired_infos {
+                w.wire_blob_expired(*round, hash, *len)?;
+            }
+        }
+    }
+    Ok(stats)
+}
+
 pub fn sanitize_session_id(sid: &str) -> String {
     let cleaned: String = sid
         .chars()
@@ -737,6 +961,78 @@ fn truncate_text(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_gc_wire_blobs_tiered_retention() {
+        // 规格修正批批次四验收:构造含过期/中窗/新窗 wire_rendered 的 journal
+        // → GC → 过期全文出账+expired 事件在账+中窗入旁路件+新窗不动
+        // +骨架事件逐字节不动+seq 连续(read_all 过)
+        use crate::agent::journal::gc_wire_blobs;
+        let dir = std::env::temp_dir().join(format!("journal-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = 1_800_000_000_000u64; // 固定"当前"毫秒
+        let day = 86_400_000u64;
+        // 手工构造 journal(带回溯时间戳):turn_started + 3 条 wire_rendered
+        // (过期 100d/中窗 30d/新窗 1d)+ skeleton 行
+        let mk_wire = |seq: u64, ts: u64, round: u64, text: &str| {
+            format!(
+                "{{\"seq\":{seq},\"ts\":{ts},\"type\":\"wire_rendered\",\"payload\":{{\"round\":{round},\"wire_len\":{},\"content_hash\":\"hash-{round}\",\"full_text\":\"{text}\"}}}}",
+                text.len()
+            )
+        };
+        let lines = vec![
+            format!("{{\"seq\":1,\"ts\":{},\"type\":\"turn_started\",\"payload\":{{\"turn_seq\":1,\"goal\":\"g\"}}}}", now - 100 * day),
+            mk_wire(2, now - 100 * day, 1, "过期全文"),
+            mk_wire(3, now - 30 * day, 2, "中窗全文"),
+            mk_wire(4, now - 1 * day, 3, "新窗全文"),
+        ];
+        std::fs::write(dir.join("s-gc.jsonl"), lines.join("\n") + "\n").unwrap();
+        // GC:7d 入旁路,90d 过期
+        let stats = gc_wire_blobs(&dir, now, 7, 90).unwrap();
+        assert_eq!(stats.files_scanned, 1);
+        assert_eq!(stats.wire_archived, 1, "中窗入旁路");
+        assert_eq!(stats.wire_expired, 1, "过期删除+标记");
+        // journal:过期/中窗行 full_text 清空;新窗保留;expired 标记在账
+        let after = read_all(&JournalWriter::path_for(&dir, "s-gc")).unwrap();
+        let mut wire_texts = Vec::new();
+        let mut expired_n = 0;
+        let mut skeleton_ok = false;
+        for l in &after {
+            match &l.event {
+                JournalEvent::WireRendered { round, full_text, content_hash, .. } => {
+                    if *round == 3 {
+                        assert!(full_text.starts_with("新窗全文"), "新窗不动");
+                    } else {
+                        assert!(full_text.is_empty(), "超窗全文应出 journal");
+                    }
+                    assert_eq!(content_hash, &format!("hash-{round}"), "hash 校验凭证保持");
+                    wire_texts.push(*round);
+                }
+                JournalEvent::WireBlobExpired { round, .. } => {
+                    expired_n += 1;
+                    assert_eq!(*round, 1, "仅过期窗出标记");
+                }
+                JournalEvent::TurnStarted { goal, .. } => {
+                    skeleton_ok = goal == "g";
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(wire_texts.len(), 3);
+        assert_eq!(expired_n, 1);
+        assert!(skeleton_ok, "骨架事件逐字节不动");
+        // 旁路件:中窗全文在档(可回读),过期全文不在
+        let sidecar = std::fs::read_to_string(dir.join("s-gc.wire-archive.jsonl")).unwrap();
+        assert!(sidecar.contains("中窗全文"));
+        assert!(!sidecar.contains("过期全文"));
+        // 幂等:重跑无二次副作用
+        let stats2 = gc_wire_blobs(&dir, now, 7, 90).unwrap();
+        assert_eq!(stats2.wire_archived, 0);
+        assert_eq!(stats2.wire_expired, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_summary_fidelity_scan_event_roundtrip() {
         // 规格修正批交付物 B:事件落账+读回(验收例 2 账面半边)

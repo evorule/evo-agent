@@ -750,6 +750,100 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                 });
                 next_step_id += 1;
             }
+            JournalEvent::WireBlobExpired {
+                round,
+                content_hash,
+                wire_len,
+            } => {
+                // wire blob 过期——context_management 系统步(体积治理批)。
+                // 降级可见:hash+长度仍可校验完整性,全文级重建随窗口关闭降级
+                if let Some(a) = acc.take() {
+                    finalize_agent_step(
+                        a,
+                        &audit,
+                        sources.transcript,
+                        &assistant_msgs,
+                        &mut steps,
+                        &mut next_step_id,
+                        &mut total_prompt,
+                        &mut total_completion,
+                    );
+                }
+                steps.push(AtifStep {
+                    step_id: next_step_id,
+                    timestamp: Some(iso8601_from_unix_ms(line.ts)),
+                    source: "system".into(),
+                    model_name: None,
+                    message: "Wire blob expired".into(),
+                    tool_calls: None,
+                    observation: Some(AtifObservation {
+                        results: vec![AtifObservationResult {
+                            source_call_id: None,
+                            content: Some(format!(
+                                "round={round} wire_len={wire_len} hash={content_hash}"
+                            )),
+                        }],
+                    }),
+                    metrics: None,
+                    extra: Some(json!({
+                        "context_management": {
+                            "type": "wire_blob_expired",
+                            "round": round,
+                            "content_hash": content_hash,
+                            "wire_len": wire_len
+                        }
+                    })),
+                    llm_call_count: None,
+                });
+                next_step_id += 1;
+            }
+            JournalEvent::WireBlobExpired {
+                round,
+                content_hash,
+                wire_len,
+            } => {
+                // wire blob 过期——context_management 系统步(体积治理批)。
+                // 降级可见:hash+长度仍可校验完整性,全文级重建随窗口关闭降级
+                if let Some(a) = acc.take() {
+                    finalize_agent_step(
+                        a,
+                        &audit,
+                        sources.transcript,
+                        &assistant_msgs,
+                        &mut steps,
+                        &mut next_step_id,
+                        &mut total_prompt,
+                        &mut total_completion,
+                    );
+                }
+                steps.push(AtifStep {
+                    step_id: next_step_id,
+                    timestamp: Some(iso8601_from_unix_ms(line.ts)),
+                    source: "system".into(),
+                    model_name: None,
+                    message: "Wire blob expired".into(),
+                    tool_calls: None,
+                    observation: Some(AtifObservation {
+                        results: vec![AtifObservationResult {
+                            source_call_id: None,
+                            content: Some(format!(
+                                "round={round} wire_len={wire_len} hash={content_hash}"
+                            )),
+                        }],
+                    }),
+                    metrics: None,
+                    extra: Some(json!({
+                        "context_management": {
+                            "type": "wire_blob_expired",
+                            "round": round,
+                            "content_hash": content_hash,
+                            "wire_len": wire_len
+                        }
+                    })),
+                    llm_call_count: None,
+                });
+                next_step_id += 1;
+            }
             JournalEvent::TurnEnded { .. } => {
                 // 轮界收步(映射表 §四.3 边界切割)
                 if let Some(a) = acc.take() {
