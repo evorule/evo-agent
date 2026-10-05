@@ -537,17 +537,31 @@ fn memory_manifests() -> Vec<ToolManifest> {
 }
 
 /// 全部静态 manifest（67 条；测试锁数量/唯一名/双侧集合相等）
+///
+/// C1 性能收口（PR-3 顺手）：静态表在首次访问后经 OnceLock 缓存——
+/// 构造函数为纯函数（无常量/无环境依赖），行为零变化（调用面拿到的
+/// 仍是克隆值，外部无法扰动缓存）；消除热路径（逐工具调用查表/聚焦
+/// 构面）的每次全量重建。
 pub fn static_manifests() -> Vec<ToolManifest> {
-    let mut all = builtin_manifests();
-    all.extend(rule_manifests());
-    all.push(delegate_manifest());
-    all.extend(memory_manifests());
-    all
+    static_manifest_table().values().cloned().collect()
 }
 
 /// 按名查静态 manifest（注册点 fail-fast 查询入口）
 pub fn lookup_static(name: &str) -> Option<ToolManifest> {
-    static_manifests().into_iter().find(|m| m.name == name)
+    static_manifest_table().get(name).cloned()
+}
+
+/// 静态表 OnceLock 缓存单点（BTreeMap：按名 O(log n) 查找 + 名序稳定）
+fn static_manifest_table() -> &'static std::collections::BTreeMap<String, ToolManifest> {
+    static TABLE: std::sync::OnceLock<std::collections::BTreeMap<String, ToolManifest>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut all = builtin_manifests();
+        all.extend(rule_manifests());
+        all.push(delegate_manifest());
+        all.extend(memory_manifests());
+        all.into_iter().map(|m| (m.name.clone(), m)).collect()
+    })
 }
 
 /// 动态源 manifest 构造（服务代理/MCP 注册期；硬规则 3）
@@ -768,12 +782,14 @@ mod tests {
     #[test]
     fn test_sentineled_is_exactly_file_break_family() {
         let manifests = all();
-        let sentineled: Vec<&str> = manifests
+        // 名序化表(C1 OnceLock BTreeMap)遍历序=字典序;断言按集合语义排序比较
+        let mut sentineled: Vec<&str> = manifests
             .iter()
             .filter(|m| m.adjudication_class == AdjudicationClass::Sentineled)
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(sentineled, vec!["file_create", "file_move", "file_delete"]);
+        sentineled.sort_unstable();
+        assert_eq!(sentineled, vec!["file_create", "file_delete", "file_move"]);
     }
 
     /// 原 TOOL_SWITCH_KEYS 30 条快照（tool, key, default_on）

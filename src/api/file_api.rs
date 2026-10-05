@@ -113,6 +113,10 @@ fn err_status(msg: &str) -> StatusCode {
 }
 
 /// 调 union toolkit 中的 file 工具(list/read 与 agent 同一实例)
+///
+/// PR-3 入口收口(读面):直读保留(无写风险),但调用前查 manifest 在场——
+/// 无 manifest 的工具拒载(NoManifest 显式拒绝,防读面越界能力域;注册期
+/// manifest 强制不变量的运行期镜像面)。
 async fn call_toolkit_tool(
     state: &AgentApiState,
     name: &str,
@@ -124,6 +128,15 @@ async fn call_toolkit_tool(
             format!("tool not registered in union toolkit: {name}"),
         )
     })?;
+    if state.toolkit().manifest(name).is_none() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "tool '{name}' has no manifest (NoManifest) — refusing to invoke \
+                 (entry-point closure: read surface must not reach unmanifested tools)"
+            ),
+        ));
+    }
     tool.call(&args).await.map_err(|e| (err_status(&e), e))
 }
 
