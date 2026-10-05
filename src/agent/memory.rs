@@ -2039,11 +2039,8 @@ impl MemoryManager {
     /// warn 留痕(会话级降级通知既有语义覆盖)。
     pub async fn write_journal_digest(&mut self, session_id: &str, digest_text: &str) -> bool {
         let path = format!("shared.{}.work.journal.{}", self.namespace, session_id);
-        let mut record = MemoryRecord::new(
-            &format!("journal.{session_id}"),
-            digest_text,
-            now_secs(),
-        );
+        let mut record =
+            MemoryRecord::new(&format!("journal.{session_id}"), digest_text, now_secs());
         record.lifecycle_state = Some("Settled".to_string());
         record.source = Some("system".to_string());
         record.confidence = Some(0.7);

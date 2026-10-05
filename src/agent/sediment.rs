@@ -281,9 +281,7 @@ pub(crate) fn build_journal_digest(session_id: &str, lines: &[JournalLine]) -> S
                     llm_react += 1;
                 }
             }
-            JournalEvent::ToolInvoked {
-                call_id, tool, ..
-            } => {
+            JournalEvent::ToolInvoked { call_id, tool, .. } => {
                 *tool_by_name.entry(tool.clone()).or_insert(0) += 1;
                 call_tool.insert(call_id.clone(), tool.clone());
             }

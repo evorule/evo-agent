@@ -85,7 +85,14 @@ pub fn is_registered_memory_tool(name: &str) -> bool {
 
 /// 笔记八类（双通道笔记 Q3 分类学，机制固定；自由扩展走 tags）
 const NOTE_CATEGORIES: &[&str] = &[
-    "charter", "selection", "design", "build", "verify", "failure", "summary", "todo",
+    "charter",
+    "selection",
+    "design",
+    "build",
+    "verify",
+    "failure",
+    "summary",
+    "todo",
 ];
 
 /// 各类强制字段（分类学约束：缺一即拒，fail-visible 交还 LLM 补齐）
@@ -831,8 +838,6 @@ impl ToolFunction for MemoryGetTool {
     }
 }
 
-
-
 /// 笔记写入执行体（双通道笔记 Q3 写面；会话期注册——session_id 在手）。
 ///
 /// 治理口径：**写不过闸**——落账为 Captured 状态（生命周期状态机白送的
@@ -932,8 +937,10 @@ pub(crate) async fn note_write_exec(
     let path = note_path(namespace, category, &ymd, seq);
     let key_tail = format!("{category}.{ymd}-{seq:03}");
 
-    let field_refs: Vec<(&str, &str)> =
-        fields.iter().map(|(p, v)| (p.as_str(), v.as_str())).collect();
+    let field_refs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(p, v)| (p.as_str(), v.as_str()))
+        .collect();
     let text = compose_note_text(category, title, content, &field_refs);
     let mut record = MemoryRecord::new(&key_tail, &text, now_secs());
     record.lifecycle_state = Some("Captured".to_string());
@@ -1856,11 +1863,18 @@ mod tests {
         let intro = make_introspector(
             "procwalk",
             &[
-                (1, "shared.ns.stable.llm.m.a".into(), fact_json("a", "部署完成事项", now())),
-                (2, "shared.ns.stable.northstar.milestones".into(),
-                 serde_json::json!({"key": "northstar.milestones",
+                (
+                    1,
+                    "shared.ns.stable.llm.m.a".into(),
+                    fact_json("a", "部署完成事项", now()),
+                ),
+                (
+                    2,
+                    "shared.ns.stable.northstar.milestones".into(),
+                    serde_json::json!({"key": "northstar.milestones",
                                     "value": "里程碑1: 部署完成；验收: 全绿",
-                                    "timestamp": now(), "mem_type": "procedural"})),
+                                    "timestamp": now(), "mem_type": "procedural"}),
+                ),
             ],
         );
         let out = intro

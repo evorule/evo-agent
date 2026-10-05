@@ -110,7 +110,11 @@ pub async fn sync_skills_mirror(
         let Ok(payload) = serde_json::to_value(&record) else {
             continue;
         };
-        match mem.evorule_client.update_payload(&session, path, &payload).await {
+        match mem
+            .evorule_client
+            .update_payload(&session, path, &payload)
+            .await
+        {
             Ok(_) => stats.metadata_written += 1,
             Err(e) => {
                 tracing::warn!(path = %path, error = %e, "skills mirror: metadata write failed");
@@ -301,7 +305,10 @@ mod tests {
     fn test_split_skill_sections() {
         let body = "# 用法\n\n第一步做甲。\n\n## 注意\n\n不要做乙。续行也属首段。\n";
         let sections = split_skill_sections(body);
-        assert_eq!(sections, vec!["用法\n第一步做甲。", "注意\n不要做乙。续行也属首段。"]);
+        assert_eq!(
+            sections,
+            vec!["用法\n第一步做甲。", "注意\n不要做乙。续行也属首段。"]
+        );
     }
 
     #[test]
@@ -321,13 +328,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("skills-mirror-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let skill_path = dir.join("SKILL.md");
-        std::fs::write(&skill_path, "# 用法\n\n第一步做甲。\n\n## 注意\n\n不要做乙。\n").unwrap();
+        std::fs::write(
+            &skill_path,
+            "# 用法\n\n第一步做甲。\n\n## 注意\n\n不要做乙。\n",
+        )
+        .unwrap();
         let skills = manifest(&[("demo", &skill_path.to_string_lossy(), "d")]);
-        let store = Arc::new(LexStore::open(&{
-            let p = std::env::temp_dir().join(format!("skills-mirror-db-{}.db", std::process::id()));
-            let _ = std::fs::remove_file(&p);
-            p
-        }).unwrap());
+        let store = Arc::new(
+            LexStore::open(&{
+                let p = std::env::temp_dir()
+                    .join(format!("skills-mirror-db-{}.db", std::process::id()));
+                let _ = std::fs::remove_file(&p);
+                p
+            })
+            .unwrap(),
+        );
         let n = rebuild_body_index(&store, &skills, 1_700_000_000);
         assert_eq!(n, 2);
         let rows = store.local_facts(LOCAL_SKILLS_PREFIX).unwrap();
@@ -335,7 +350,9 @@ mod tests {
         for row in &rows {
             assert!(row.fact_id & crate::agent::lexstore::SYNTHETIC_ID_FLAG != 0);
             assert_eq!(row.value["mem_type"], "procedural");
-            assert!(row.path.starts_with(&skill_path.to_string_lossy().to_string()));
+            assert!(row
+                .path
+                .starts_with(&skill_path.to_string_lossy().to_string()));
         }
         // 撤销技能=空清单整族重建 → 正文自然出局
         let n2 = rebuild_body_index(&store, &[], 1_700_000_001);
