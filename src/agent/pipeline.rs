@@ -129,6 +129,11 @@ pub struct PipelineRequest<'a> {
     /// 在场，P0-3/A1 关闭判据），仅⑦免重执行直接采信缓存值（缓存键=「已过
     /// 门禁的证据」）。None = 常规执行。
     pub precomputed: Option<Value>,
+    /// 预供给审批决策（⑤收编 PR-4）：流式/重执行路径的决策端在外部编排层
+    /// 已完成决策（callback 结论），随 ApprovalReexec 入口带入——⑤评估出
+    /// proposal 时直接消费此决策（批准→⑦ / 拒绝→显式拒绝回喂），不再询问。
+    /// None = 无预供给：⑤评估出 proposal 时暂停（ApprovalPending）。
+    pub approval_preset: Option<crate::agent::approval::ApprovalDecision>,
 }
 
 /// 阶段⑦执行器抽象（runner 注入 call_service 通路；测试注入桩。
@@ -155,6 +160,9 @@ impl PolicyJudgedSink for JournalWriter {
     }
 }
 
+/// 阶段⑤评估单源函数形态(类型别名化解内联复杂类型)
+pub type ProposalEvalFn<'a> = &'a (dyn Fn(&str, &Value) -> Option<Value> + Sync);
+
 /// 管道逐调用依赖（runner 装配件借用注入——裁决通道/账面/指标均为 runner
 /// 持有的既有实例，管道自身无状态，避免装配环）
 pub struct PipelineDeps<'a> {
@@ -164,6 +172,10 @@ pub struct PipelineDeps<'a> {
     pub adjudicator: &'a tokio::sync::Mutex<AdjudicationChannel>,
     /// 阶段①查表访问器（静态表 + handler 动态注册条目）
     pub manifest_of: &'a (dyn Fn(&str) -> Option<ToolManifest> + Sync),
+    /// 阶段⑤审批评估单源（PR-4 收编：candidate proposal 由注册执行器实例
+    /// 的 evaluate_proposal 钩子求值——评估与执行同源，冒名注册以实际
+    /// 执行器为准）。None = 管道测试桩场景（评估缺省直通）。
+    pub proposal_of: Option<ProposalEvalFn<'a>>,
     /// 阶段⑧账面（None = 不启用——CLI/子代理现状语义保持）
     pub journal: Option<&'a (dyn PolicyJudgedSink + Sync)>,
     /// 能力边界（意图快筛判据）
@@ -190,6 +202,10 @@ pub enum DenialStage {
     Governance,
     /// ⑤分级审批拒绝（AlwaysDeny / 决策端拒绝）
     ApprovalDenied,
+    /// ⑤分级审批暂停（candidate proposal 已评估、等待决策端结论——
+    /// 决策在外部编排：非流式=runner 决策端，流式=事件循环审批窗；
+    /// 并行预执行实例经此形态表达「candidate 不入缓存」G13 语义）
+    ApprovalPending,
     /// ③④裁决通道故障（fail-closed 语义：通道错误显式上抛）
     Channel,
     /// ⑧账面写失败（fail-visible：账写不掉=错误显式化）
@@ -252,6 +268,10 @@ pub struct LedgerRecord {
     pub in_focus: bool,
     /// ⑤审批策略（查表所得，含未触发场景——策略在场即可审计）
     pub approval_policy: Option<ApprovalPolicy>,
+    /// ⑤审批决策记录（PR-4 收编：决策端结论入统一账面——
+    /// 形态与流式审批留痕同构 proposal_id/tool/decision/approver/verified/
+    /// decided_at/reason；未触发审批 = None）
+    pub approval: Option<Value>,
     /// ③④裁决事实（按提交顺序）
     pub adjudication: Vec<AdjudicationFact>,
     /// ⑦执行结局
@@ -268,6 +288,7 @@ impl LedgerRecord {
             manifest_found: false,
             in_focus: false,
             approval_policy: None,
+            approval: None,
             adjudication: Vec::new(),
             execution: None,
             denial: None,
@@ -542,11 +563,17 @@ impl ToolExecutionPipeline {
             }
         }
 
-        // ── ⑤ 分级审批（approval_policy 派发）──
+        // ── ⑤ 分级审批（approval_policy 派发 + candidate 评估单源，PR-4 收编）──
         // AlwaysDeny：执行前拒绝（逃逸出口/不可逆破坏类预留；现状静态表无
-        // AlwaysDeny 工具，此臂为策略完备性在案）。ManualDefault/AutoPolicy/
-        // HumanOnly：PR-2 保持既有工具侧 proposal 两调协议（工具返回
-        // needs_approval → runner 决策端处置），决策端统一收编在 PR-4。
+        // AlwaysDeny 工具，此臂为策略完备性在案）。
+        // ManualDefault/AutoPolicy/HumanOnly 的 candidate 形态：proposal 由
+        // 注册执行器实例的 evaluate_proposal 钩子求值（评估与执行同源，工具
+        // 侧两调协议消灭——call 不再自管 approved 旗标分支）：
+        // - 有预供给决策（ApprovalReexec 入口）→ 消费决策（批准→⑦ / 拒绝→
+        //   显式拒绝回喂），决策记录入统一账面（ledger.approval）；
+        // - 无预供给 → 暂停（ApprovalPending 携带 proposal JSON），决策在
+        //   外部编排层（非流式=runner 决策端 / 流式=事件循环审批窗 / 并行
+        //   预执行=candidate 不入缓存）。
         if manifest.approval_policy == ApprovalPolicy::AlwaysDeny {
             ledger.denial = Some(DenialStage::ApprovalDenied);
             return PipelineOutcome {
@@ -559,6 +586,105 @@ impl ToolExecutionPipeline {
                 ))),
                 ledger,
             };
+        }
+        if let Some(mut proposal) = deps
+            .proposal_of
+            .and_then(|evaluate| evaluate(req.tool_name, req.args))
+        {
+            // proposal_id 单源：评估臂生成并注入 proposal JSON，决策记录与
+            // 决策端 parse 共用同一 id（账面/留痕/决策端三方一致）
+            let proposal_id = crate::agent::approval::new_proposal_id();
+            if let Some(obj) = proposal.as_object_mut() {
+                obj.insert("proposal_id".to_string(), Value::from(proposal_id.clone()));
+            }
+            match &req.approval_preset {
+                Some(decision) => {
+                    // 决策记录（字段序与流式审批留痕逐字同构）
+                    let decided_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let decision_label = if decision.approved {
+                        "approved"
+                    } else if decision.auto_rejected {
+                        "auto_rejected"
+                    } else {
+                        "rejected"
+                    };
+                    let record = serde_json::json!({
+                        "proposal_id": proposal_id,
+                        "tool": req.tool_name,
+                        "decision": decision_label,
+                        "approver": decision.approver,
+                        "verified": decision.verified,
+                        "decided_at": decided_at,
+                        "reason": decision.reason,
+                    });
+                    ledger.approval = Some(record.clone());
+                    if !decision.approved {
+                        tracing::warn!(
+                            main_session = ?req.caller.session_id, tool = %req.tool_name,
+                            "pipeline ⑤: candidate rejected by preset decision"
+                        );
+                        // 轨迹：先落一条审批拒绝条目再附加决策记录（拒绝路径
+                        // 无⑦执行条目，无前置条目可附——显式新写防串话）
+                        if let Some(tt) = deps.traces {
+                            if let Ok(mut tt) = tt.lock() {
+                                tt.record(req.tool_name, req.args, "approval_denied", 0);
+                                tt.attach_approval_to_last(record);
+                            } else {
+                                tracing::error!(
+                                    main_session = ?req.caller.session_id, tool = %req.tool_name,
+                                    "tool trace lock poisoned at approval_denied record (ledger gap)"
+                                );
+                            }
+                        }
+                        ledger.denial = Some(DenialStage::ApprovalDenied);
+                        return PipelineOutcome {
+                            result: Err(PipelineFailure::Denial(PipelineDenial {
+                                stage: DenialStage::ApprovalDenied,
+                                reason: format!(
+                                    "tool '{}' candidate action rejected by approver",
+                                    req.tool_name
+                                ),
+                                llm_payload: Some(serde_json::json!({
+                                    "status": "rejected",
+                                    "message": "User denied approval",
+                                })),
+                            })),
+                            ledger,
+                        };
+                    }
+                    // 批准 → 直通⑦（真实执行，无 approved 旗标注入——决策在
+                    // 管道内闭环，工具不再自管协议）
+                }
+                None => {
+                    // 无预供给：暂停等决策（决策端在编排层）。轨迹先落
+                    // approval_pending 条目——决策端拒绝时 attach 载体在案。
+                    if let Some(tt) = deps.traces {
+                        if let Ok(mut tt) = tt.lock() {
+                            tt.record(req.tool_name, req.args, "approval_pending", 0);
+                        } else {
+                            tracing::error!(
+                                main_session = ?req.caller.session_id, tool = %req.tool_name,
+                                "tool trace lock poisoned at approval_pending record (ledger gap)"
+                            );
+                        }
+                    }
+                    ledger.denial = Some(DenialStage::ApprovalPending);
+                    return PipelineOutcome {
+                        result: Err(PipelineFailure::Denial(PipelineDenial {
+                            stage: DenialStage::ApprovalPending,
+                            reason: format!(
+                                "tool '{}' candidate action awaits approval decision",
+                                req.tool_name
+                            ),
+                            llm_payload: Some(proposal),
+                        })),
+                        ledger,
+                    };
+                }
+            }
         }
 
         // ── ⑥ 机制沙箱（占位）──
@@ -730,6 +856,7 @@ mod tests {
             executor,
             adjudicator: adj,
             manifest_of,
+            proposal_of: None,
             journal: None,
             boundary: None,
             traces: None,
@@ -751,6 +878,7 @@ mod tests {
             },
             focus,
             precomputed: None,
+            approval_preset: None,
         }
     }
 

@@ -364,8 +364,14 @@ pub fn parse_approval_request(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        // 提案 ID 在解析出 proposal 时即生成,后续审批留痕与 /approve 校验共用
-        proposal_id: new_proposal_id(),
+        // 提案 ID 单源:管道⑤评估臂已生成并注入 proposal JSON 时直接沿用
+        // (账面/留痕/决策端三方一致);兼容形态(工具自管协议遗留)无该字段
+        // 则在此生成,后续审批留痕与 /approve 校验共用
+        proposal_id: result_json
+            .get("proposal_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(new_proposal_id),
     })
 }
 

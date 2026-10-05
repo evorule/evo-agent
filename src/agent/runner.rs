@@ -2805,18 +2805,15 @@ impl AgentRunner {
             self.check_parallel_cache(tool_name, &args)
         {
             info!(%session_id, tool = %tool_name, "G13: call_service cache hit, serving gated result (gates re-run, execution memoized)");
-            let result = self
-                .execute_tool_call_gated(tool_name, &args, None, Some(cached))
-                .await?;
-            (result, None)
+            self.execute_tool_call_gated(session_id, tool_name, &args, None, Some(cached))
+                .await?
         } else {
-            // 缓存未命中:走正常的 execute_tool_call + 审批流程
+            // 缓存未命中:统一走 gated 入口——candidate 由管道⑤评估臂先行
+            // 拦截(PR-4 收编,暂停→决策端),遗留 proposal 形态由兼容臂承接。
             // 第一次调用(不带 approved flag):LLM 自带的 approved 旗标
-            // 强制剥离,决策门唯一控制权归 runner
+            // 强制剥离,决策门唯一控制权归 runner。
             let first_args = strip_approved_flag(&args);
-            let tool_result = self.execute_tool_call(tool_name, &first_args, None).await?;
-            // G8:检查是否需要审批,如果需要则走审批流程(可能重新调用 with approved:true)
-            self.maybe_handle_approval(session_id, tool_name, &first_args, tool_result)
+            self.execute_tool_call_gated(session_id, tool_name, &first_args, None, None)
                 .await?
         };
 
@@ -2866,32 +2863,28 @@ impl AgentRunner {
         Ok(result)
     }
 
-    /// G8:执行工具调用(不含审批逻辑,纯执行)
-    ///
-    /// 从 `handle_call_service` 和流式路径的审批重调用共用。
-    /// 第一次调用不带 `approved` flag → 工具可能返回 `needs_approval` proposal。
-    /// 第二次调用(审批通过后)带 `approved:true` → 工具直接执行。
-    async fn execute_tool_call(
-        &self,
-        tool_name: &str,
-        args: &Value,
-        journal: Option<&crate::agent::journal::JournalWriter>,
-    ) -> Result<Value, AgentError> {
-        self.execute_tool_call_gated(tool_name, args, journal, None)
-            .await
-    }
-
     /// G8 执行入口的缓存收口形态(PR-3):`precomputed=Some` 为 G13 并行缓存
     /// 命中——缓存键=「已过门禁的证据」(预执行管道实例的落账结果),命中调用
     /// ①-⑤与⑧随本次调用照常(意图/裁决/账面逐调用在场,P0-3/A1 关闭判据),
     /// 仅⑦免重执行。审批重执行路径恒传 None(批准后的动作必须真实执行)。
+    ///
+    /// PR-4 ⑤收编:本函数为工具面唯一决策编排点——
+    /// - 管道⑤暂停(Denial(ApprovalPending),收编型 candidate proposal)→
+    ///   统一决策端([`Self::decide_and_reexecute`]);
+    /// - ⑦结果解析命中 proposal(未收编工具自管协议的遗留形态,兼容臂)→
+    ///   同一决策端;
+    /// - 其余结局=translate 直传。
+    ///
+    /// 返回 `(工具最终结果, 审批留痕 record)`:record 仅在本轮发生过审批时
+    /// 为 `Some`(内嵌进 io_response.result,不扩 Fact 枚举)。
     async fn execute_tool_call_gated(
         &self,
+        session_id: &str,
         tool_name: &str,
         args: &Value,
         journal: Option<&crate::agent::journal::JournalWriter>,
         precomputed: Option<Value>,
-    ) -> Result<Value, AgentError> {
+    ) -> Result<(Value, Option<Value>), AgentError> {
         // 一管道(工具面统一架构 §3.2):本函数为管道的薄翻译层——
         // 八阶段(①查表②聚焦③意图④裁决⑤审批⑥沙箱位⑦执行⑧落账)由
         // ToolExecutionPipeline 执行;治理拦截两态 JSON 文案/裁决 fail-closed
@@ -2905,9 +2898,52 @@ impl AgentRunner {
                 journal,
                 precomputed,
                 crate::agent::pipeline::PipelineEntry::React,
+                None,
             )
             .await;
-        Self::translate_pipeline_outcome(outcome, tool_name)
+        let ledger = outcome.ledger;
+        match outcome.result {
+            Ok(result) => {
+                // 兼容臂:未收编工具自管协议遗留形态(⑦结果即 proposal JSON)
+                // 仍走统一决策端——收编后内置 candidate 工具不再产生此形态
+                // (评估臂在⑤先行拦截,call 直接执行)。
+                let result_str = result.to_string();
+                if let Some(req) = parse_approval_request(session_id, tool_name, args, &result_str)
+                {
+                    return self
+                        .decide_and_reexecute(session_id, tool_name, args, req, journal)
+                        .await;
+                }
+                Ok((result, None))
+            }
+            Err(crate::agent::pipeline::PipelineFailure::Denial(denial))
+                if denial.stage == crate::agent::pipeline::DenialStage::ApprovalPending =>
+            {
+                // ⑤收编暂停:proposal JSON 由评估臂生成(payload 在案),
+                // parse 取回 ApprovalRequest(proposal_id 三方一致)
+                let payload = denial.llm_payload.unwrap_or_else(
+                    || serde_json::json!({"status": "needs_approval", "tool": tool_name}),
+                );
+                let payload_str = payload.to_string();
+                let req = parse_approval_request(session_id, tool_name, args, &payload_str)
+                    .ok_or_else(|| {
+                        AgentError::Internal(format!(
+                            "approval pending payload is not a parsable proposal: {}",
+                            denial.reason
+                        ))
+                    })?;
+                self.decide_and_reexecute(session_id, tool_name, args, req, journal)
+                    .await
+            }
+            other => Self::translate_pipeline_outcome(
+                crate::agent::pipeline::PipelineOutcome {
+                    result: other,
+                    ledger,
+                },
+                tool_name,
+            )
+            .map(|v| (v, None)),
+        }
     }
 
     /// 主路径聚焦快照(注册面 ∪ 静态表面)
@@ -2931,6 +2967,8 @@ impl AgentRunner {
     /// 聚焦快照/查表合并视图/依赖装配统一在此,入口差异仅 CallerContext.entry
     /// 与 precomputed(缓存收口面)。裁决通道为 runner 持有的 tokio Mutex——
     /// 并行实例在③④天然串行(设计档 §3.2 Mutex 语义保持)。
+    /// PR-4 ⑤收编:proposal_of 按注册执行器实例求值(评估与执行同源);
+    /// approval_preset 为预供给决策(ApprovalReexec 重执行入口消费)。
     async fn run_pipeline(
         &self,
         tool_name: &str,
@@ -2938,6 +2976,7 @@ impl AgentRunner {
         journal: Option<&crate::agent::journal::JournalWriter>,
         precomputed: Option<Value>,
         entry: crate::agent::pipeline::PipelineEntry,
+        approval_preset: Option<crate::agent::approval::ApprovalDecision>,
     ) -> crate::agent::pipeline::PipelineOutcome {
         // 查表合并视图(一表两源):运行时注册条目优先(可覆盖静态同名),
         // 未注册回落静态表。
@@ -2946,11 +2985,16 @@ impl AgentRunner {
                 .manifest(name)
                 .or_else(|| crate::agent::tool_manifest::lookup_static(name))
         };
+        // ⑤评估单源:按 handler 注册条目的执行器实例求值(冒名注册以实际
+        // 执行器为准——EchoTool 注册在 candidate 名下亦无协议)。
+        let proposal_of =
+            move |name: &str, args: &Value| self.tool_handler.evaluate_proposal_for(name, args);
         let focus = self.main_path_focus();
         let deps = crate::agent::pipeline::PipelineDeps {
             executor: self,
             adjudicator: &self.adjudicator,
             manifest_of: &manifest_of,
+            proposal_of: Some(&proposal_of),
             journal: journal.map(|j| j as &(dyn crate::agent::pipeline::PolicyJudgedSink + Sync)),
             boundary: self.config.capability_boundary.as_ref(),
             traces: Some(&self.tool_traces),
@@ -2965,6 +3009,7 @@ impl AgentRunner {
             },
             focus: &focus,
             precomputed,
+            approval_preset,
         };
         crate::agent::pipeline::ToolExecutionPipeline
             .execute(req, deps)
@@ -2988,6 +3033,15 @@ impl AgentRunner {
                 | crate::agent::pipeline::DenialStage::ApprovalDenied => {
                     Err(AgentError::ToolError(denial.reason))
                 }
+                // ⑤审批暂停 = 决策端（execute_tool_call_gated 内统一决策）的
+                // 消化对象；漏到翻译层 = 编排缺失（fail-visible 显式内部错误）
+                crate::agent::pipeline::DenialStage::ApprovalPending => {
+                    Err(AgentError::Internal(format!(
+                        "approval pending leaked to translation layer (no adjudication \
+                         orchestrator consumed it): {}",
+                        denial.reason
+                    )))
+                }
                 // ③④通道故障/⑧账面失败 = 显式内部错误(fail-closed/fail-visible)
                 crate::agent::pipeline::DenialStage::Channel
                 | crate::agent::pipeline::DenialStage::Ledger => {
@@ -3008,11 +3062,16 @@ impl AgentRunner {
         }
     }
 
-    /// 阶段一(流式路径):执行工具并解析 needs_approval proposal,不做决策
+    /// 阶段一(流式路径):执行工具并解析审批请求,不做决策
     ///
     /// 供 stream! 生成器在 yield ApprovalRequired **之前**调用 —— 帧必须在
     /// 60s 审批窗口开启后、超时前到达前端,否则 HTTP 审批结构性不可用。
     /// 无审批(含缓存命中)时返回 [`ToolExecStage::Done`],一步到位。
+    ///
+    /// PR-4 ⑤收编:本阶段直调管道原始结局(不经 gated 决策编排——决策必须
+    /// 留给事件循环,ApprovalRequired 帧时序约束)。收编型 candidate 在⑤
+    /// 暂停(ApprovalPending 携带 proposal JSON)=流式 Pending 语义;兼容型
+    /// (遗留 proposal 形态)经⑦结果解析识别,两型统一转 Pending。
     async fn execute_tool_stage(
         &self,
         session_id: &str,
@@ -3026,8 +3085,8 @@ impl AgentRunner {
         // 缓存值=预执行管道实例的已过闸产物),意图/裁决/账面逐调用在场。
         if let Some(cached) = self.check_parallel_cache(tool_name, args) {
             info!(%session_id, tool = %tool_name, "G13: cache hit, serving gated result (gates re-run, execution memoized)");
-            let final_result = self
-                .execute_tool_call_gated(tool_name, args, journal, Some(cached))
+            let (final_result, _record) = self
+                .execute_tool_call_gated(session_id, tool_name, args, journal, Some(cached))
                 .await?;
             return Ok(ToolExecStage::Done(ToolExecOutcome {
                 final_result,
@@ -3036,20 +3095,64 @@ impl AgentRunner {
             }));
         }
 
-        // G8:第一次调用(不带 approved flag)→ 可能返回 needs_approval proposal
-        // LLM 自带 approved 旗标强制剥离(决策门唯一控制权归 runner)
+        // G8:第一次调用(不带 approved flag)。LLM 自带 approved 旗标强制
+        // 剥离(决策门唯一控制权归 runner)。
         let first_args = strip_approved_flag(args);
-        let tool_result = self
-            .execute_tool_call(tool_name, &first_args, journal)
-            .await?;
-        let result_str = tool_result.to_string();
-        match parse_approval_request(session_id, tool_name, &first_args, &result_str) {
-            None => Ok(ToolExecStage::Done(ToolExecOutcome {
-                final_result: tool_result,
-                approval_record: None,
-                approval_flow: None,
-            })),
-            Some(req) => Ok(ToolExecStage::Pending(req)),
+        let outcome = self
+            .run_pipeline(
+                tool_name,
+                &first_args,
+                journal,
+                None,
+                crate::agent::pipeline::PipelineEntry::React,
+                None,
+            )
+            .await;
+        let ledger = outcome.ledger;
+        match outcome.result {
+            Ok(tool_result) => {
+                // 兼容臂:未收编工具自管协议遗留形态
+                let result_str = tool_result.to_string();
+                match parse_approval_request(session_id, tool_name, &first_args, &result_str) {
+                    None => Ok(ToolExecStage::Done(ToolExecOutcome {
+                        final_result: tool_result,
+                        approval_record: None,
+                        approval_flow: None,
+                    })),
+                    Some(req) => Ok(ToolExecStage::Pending(req)),
+                }
+            }
+            Err(crate::agent::pipeline::PipelineFailure::Denial(denial))
+                if denial.stage == crate::agent::pipeline::DenialStage::ApprovalPending =>
+            {
+                // ⑤收编暂停:proposal JSON 由评估臂生成 → 流式 Pending
+                let payload = denial.llm_payload.unwrap_or_else(
+                    || serde_json::json!({"status": "needs_approval", "tool": tool_name}),
+                );
+                let payload_str = payload.to_string();
+                let req = parse_approval_request(session_id, tool_name, &first_args, &payload_str)
+                    .ok_or_else(|| {
+                        AgentError::Internal(format!(
+                            "approval pending payload is not a parsable proposal: {}",
+                            denial.reason
+                        ))
+                    })?;
+                Ok(ToolExecStage::Pending(req))
+            }
+            other => {
+                let final_result = Self::translate_pipeline_outcome(
+                    crate::agent::pipeline::PipelineOutcome {
+                        result: other,
+                        ledger,
+                    },
+                    tool_name,
+                )?;
+                Ok(ToolExecStage::Done(ToolExecOutcome {
+                    final_result,
+                    approval_record: None,
+                    approval_flow: None,
+                }))
+            }
         }
     }
 
@@ -3104,16 +3207,27 @@ impl AgentRunner {
             warn!(%session_id, tool = %tool_name, "G8: tool call rejected");
             Value::from(r#"{"status":"rejected","message":"User denied approval"}"#)
         } else {
-            // 批准 → 带 approved:true 重新调用(不递归检查 proposal)
-            info!(%session_id, tool = %tool_name, "G8: tool call approved, re-executing with approved=true");
+            // 批准 → 管道 ApprovalReexec 重执行(不递归检查 proposal):
+            // 预供给决策由⑤消费(收编型直通⑦真实执行),args 注入 approved:true
+            // 兼容未收编工具的自管检查
+            info!(%session_id, tool = %tool_name, "G8: tool call approved, re-executing via pipeline (preset decision)");
             let mut approved_args = args.clone();
             if let Some(obj) = approved_args.as_object_mut() {
                 obj.insert("approved".to_string(), Value::Bool(true));
             } else {
                 approved_args = serde_json::json!({"original_args": args, "approved": true});
             }
-            self.execute_tool_call(tool_name, &approved_args, journal)
-                .await?
+            let outcome = self
+                .run_pipeline(
+                    tool_name,
+                    &approved_args,
+                    journal,
+                    None,
+                    crate::agent::pipeline::PipelineEntry::ApprovalReexec,
+                    Some(decision.clone()),
+                )
+                .await;
+            Self::translate_pipeline_outcome(outcome, tool_name)?
         };
 
         // 人工审查开合:决策事件入审计链(tool_trace 条目附加 approval 子对象;
@@ -3182,6 +3296,7 @@ impl AgentRunner {
                 None,
                 None,
                 crate::agent::pipeline::PipelineEntry::ParallelPreflight,
+                None,
             )
             .await;
         match outcome.result {
@@ -3204,7 +3319,19 @@ impl AgentRunner {
                             })
                         })
                     }
-                    // 其余拒绝(①②⑤/③④通道/⑧账面)= error JSON 显式回喂,
+                    // ⑤审批暂停(PR-4 收编):candidate proposal 的预执行形态——
+                    // 映射回 proposal JSON 原文,execute_tools_parallel 的
+                    // parse 命中 → 不入缓存(G13 语义保持:candidate 不缓存,
+                    // 审批留给 call_service/流式主路径)
+                    crate::agent::pipeline::DenialStage::ApprovalPending => {
+                        denial.llm_payload.unwrap_or_else(|| {
+                            serde_json::json!({
+                                "status": "needs_approval",
+                                "tool": tc.name,
+                            })
+                        })
+                    }
+                    // 其余拒绝(①②⑤拒绝/③④通道/⑧账面)= error JSON 显式回喂,
                     // 不中断并行批次中其他工具
                     _ => {
                         let mut map = serde_json::Map::new();
@@ -3280,31 +3407,30 @@ impl AgentRunner {
         self.parallel_cache_get(&key)
     }
 
-    /// G8:检查 tool_result 是否是 proposal,如果是则走审批流程
+    /// G8:统一审批决策端(决策 → 留痕 → 拒绝回喂 / 批准重执行)
     ///
     /// 流程:
-    /// 1. 解析 tool_result,如果不是 `needs_approval` → 直接返回原结果
-    /// 2. 通过 `approval_callback` 问用户(无 callback = 默认拒绝)
-    /// 3. 用户批准 → 带 `approved:true` 重新调用工具
-    /// 4. 用户拒绝 → 返回 `{"status":"rejected"}`
+    /// 1. 通过 `approval_callback` 问用户(无 callback = 默认拒绝)
+    /// 2. 用户批准 → 管道 ApprovalReexec 重执行(preset 消费)
+    /// 3. 用户拒绝 → 返回 `{"status":"rejected"}`
     ///
     /// **不递归**:重调用的结果不再检查 proposal(避免无限循环)。
     ///
+    /// PR-4 ⑤收编定位:统一决策端——管道⑤暂停(收编型 candidate)与兼容臂
+    /// (未收编工具遗留 proposal 形态)共用本方法完成决策与重执行。批准重调
+    /// 走管道 ApprovalReexec 入口+预供给决策(⑤消费批准结论→⑦真实执行),
+    /// 同时保留 args 注入 approved:true(未收编工具的自管检查兼容形态)。
+    ///
     /// 返回 `(工具最终结果, 审批留痕 record)`:record 仅在本轮发生过审批时
     /// 为 `Some`(内嵌进 io_response.result,不扩 Fact 枚举)。
-    async fn maybe_handle_approval(
+    async fn decide_and_reexecute(
         &self,
         session_id: &str,
         tool_name: &str,
         args: &Value,
-        tool_result: Value,
+        approval_req: ApprovalRequest,
+        journal: Option<&crate::agent::journal::JournalWriter>,
     ) -> Result<(Value, Option<Value>), AgentError> {
-        let result_str = tool_result.to_string();
-        let approval_req = match parse_approval_request(session_id, tool_name, args, &result_str) {
-            Some(req) => req,
-            None => return Ok((tool_result, None)), // 不是 proposal,直接返回
-        };
-
         info!(%session_id, tool = tool_name, "G8: tool requires approval");
 
         // 问用户(无 callback = 默认拒绝,安全优先)
@@ -3344,7 +3470,9 @@ impl AgentRunner {
 
         if !decision.approved {
             warn!(%session_id, tool = tool_name, "G8: tool call rejected");
-            // 人工审查开合:决策事件入审计链(拒绝不重执行,附加到 proposal 首调条目)
+            // 人工审查开合:决策事件入审计链(拒绝不重执行,附加到载体条目——
+            // 收编型=管道⑤已落的 approval_pending 条目;兼容型=proposal 首调
+            // 执行条目)
             if let Ok(mut tt) = self.tool_traces.lock() {
                 tt.attach_approval_to_last(approval_record.clone());
             }
@@ -3354,8 +3482,9 @@ impl AgentRunner {
             ));
         }
 
-        // 用户批准 → 带 approved:true 重新调用
-        info!(%session_id, tool = tool_name, "G8: tool call approved, re-executing with approved=true");
+        // 用户批准 → 管道 ApprovalReexec 重执行:预供给决策由⑤消费(收编型
+        // 直通⑦真实执行),args 注入 approved:true 兼容未收编工具的自管检查
+        info!(%session_id, tool = tool_name, "G8: tool call approved, re-executing via pipeline (preset decision)");
         let mut approved_args = args.clone();
         if let Some(obj) = approved_args.as_object_mut() {
             obj.insert("approved".to_string(), Value::Bool(true));
@@ -3363,13 +3492,21 @@ impl AgentRunner {
             // args 不是 object,包装一下
             approved_args = serde_json::json!({"original_args": args, "approved": true});
         }
-        let final_result = self
-            .execute_tool_call(tool_name, &approved_args, None)
-            .await?;
+        let outcome = self
+            .run_pipeline(
+                tool_name,
+                &approved_args,
+                journal,
+                None,
+                crate::agent::pipeline::PipelineEntry::ApprovalReexec,
+                Some(decision),
+            )
+            .await;
         // 人工审查开合:决策事件入审计链(附加到重执行条目)
         if let Ok(mut tt) = self.tool_traces.lock() {
             tt.attach_approval_to_last(approval_record.clone());
         }
+        let final_result = Self::translate_pipeline_outcome(outcome, tool_name)?;
         Ok((final_result, Some(approval_record)))
     }
 

@@ -360,7 +360,9 @@ impl HttpGetTool {
         );
         map.insert(
             "instructions".to_string(),
-            Value::from("Ask the user. If approved, call with approved=true."),
+            Value::from(
+                "Ask the user. The request pauses for approval and executes once the user approves.",
+            ),
         );
         Ok(Value::Object(map))
     }
@@ -403,6 +405,24 @@ impl ToolFunction for HttpGetTool {
                 Err(format!("host BLOCKED: {} (reason: {})", url, reason))
             }
             HostCategory::Invalid => Err(format!("invalid URL: '{}'", url)),
+        }
+    }
+
+    /// 管道⑤评估单源(PR-4 收编):candidate 分类钩子——复刻 call 的判定
+    /// 次序(net_guard 红线 → classify),仅 Candidate 形态返回 proposal。
+    /// 纯函数:无网络请求。call 内保留的 approved 旗标检查降级为人工面
+    /// 直调旗标 + 防御双保险(评估与执行同源,agent 面正常路径不会再触达
+    /// 该分支)。
+    fn evaluate_proposal(&self, args: &Value) -> Option<Value> {
+        let url = args.get("url").and_then(|v| v.as_str())?;
+        if super::net_guard::check_denied_network_target(url).is_err() {
+            return None;
+        }
+        match Self::classify(url) {
+            HostCategory::Candidate { host } => {
+                Some(Self::make_proposal(url, &host).expect("proposal construction is infallible"))
+            }
+            _ => None,
         }
     }
 }

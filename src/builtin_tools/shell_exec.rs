@@ -27,7 +27,7 @@
 //!   "description": "删除文件或目录",
 //!   "risk": "可能误删重要数据,且不可逆",
 //!   "alternative": "用文件管理器;或 mv 到 ~/.local/trash",
-//!   "instructions": "Ask the user. If approved, call with approved=true."
+//!   "instructions": "Ask the user. The request pauses for approval and executes once the user approves."
 //! }
 //! ```
 //!
@@ -762,7 +762,7 @@ impl ShellExecTool {
         }
     }
 
-    /// 构造一个 proposal(给 agent/CLI 用于问用户)
+    /// 构造一个 proposal(管道⑤评估单源/兼容双用途)
     fn make_proposal(program: &str, original_cmd: &str, candidate: CandidateCommand) -> IoResult {
         let mut map = serde_json::Map::new();
         map.insert("status".to_string(), Value::from("needs_approval"));
@@ -781,10 +781,41 @@ impl ShellExecTool {
         map.insert(
             "instructions".to_string(),
             Value::from(
-                "Ask the user. If approved, call with approved=true (or use --yes flag in CLI).",
+                "Ask the user. The request pauses for approval and executes once the user approves.",
             ),
         );
         Ok(Value::Object(map))
+    }
+
+    /// 管道⑤评估单源(PR-4 收编):candidate 分类钩子——复刻 call_sync 的
+    /// 判定次序(net_guard 红线 → 解析 → metachars → classify),仅
+    /// Candidate 形态返回 proposal,其余(None)留给 call 期显式结局。
+    /// 纯函数:无进程派生、无 IO 副作用。
+    fn evaluate_proposal_sync(&self, args: &Value) -> Option<Value> {
+        let cmd_str = args.get("command").and_then(|v| v.as_str())?;
+        // 红线守卫命中 = call 期显式拒绝,非审批范畴
+        if super::net_guard::check_denied_network_target(cmd_str).is_err() {
+            return None;
+        }
+        // docker 后端无宿主 3 层分类(容器域=任务沙箱),无 proposal
+        if matches!(self.backend, ExecBackend::DockerExec { .. }) {
+            return None;
+        }
+        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+        if parts.is_empty() {
+            return None;
+        }
+        if Self::check_no_shell_metachars(&parts).is_err() {
+            return None;
+        }
+        let program = Self::program_name(parts[0]);
+        match Self::classify(program) {
+            CommandCategory::Candidate(c) => Some(
+                Self::make_proposal(program, cmd_str, c)
+                    .expect("proposal construction is infallible"),
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -803,6 +834,13 @@ impl ToolFunction for ShellExecTool {
         tokio::task::spawn_blocking(move || tool.call_sync(&args))
             .await
             .map_err(|e| format!("shell_exec tool panicked: {}", e))?
+    }
+
+    /// 管道⑤评估单源(PR-4 收编):candidate 分类由评估钩子先行拦截。
+    /// call 内保留的 approved 旗标检查降级为人工面直调旗标 + 防御双保险
+    /// (评估与执行同源,agent 面正常路径不会再触达该分支)。
+    fn evaluate_proposal(&self, args: &Value) -> Option<Value> {
+        self.evaluate_proposal_sync(args)
     }
 
     /// 执行超时钩子(执行器生命周期契约):外层执行守卫按超时档到期时调用,

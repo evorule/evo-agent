@@ -11,8 +11,8 @@
 //! 三面同源:全部薄委托 [`crate::git::GitOps`],agent 与人(REST 面 / SCM 视图)
 //! 看到同一份 git 语义;git 操作属于人工治理面,不进 evorule 审计链。
 //!
-//! candidate 两段式与 file_create 同款:首次调用返回 `needs_approval`
-//! proposal,批后带 `approved=true` 重调即执行。
+//! candidate 审批经管道⑤收编(PR-4):评估单源在 [`ToolFunction::evaluate_proposal`]
+//! 钩子,决策端批准后才进执行体——工具侧两调协议已消灭(call 无 approved 分支)。
 
 use std::path::PathBuf;
 
@@ -131,24 +131,33 @@ impl GitStageTool {
         if paths.is_empty() {
             return Err("paths must not be empty".to_string());
         }
-        let approved = args
-            .get("approved")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
 
-        if !approved {
-            return Ok(serde_json::json!({
-                "status": "needs_approval",
-                "category": "candidate",
-                "description": format!("git stage {} path(s): {}", paths.len(), paths.join(", ")),
-                "risk": "modifies the git index (staging area)",
-                "alternative": "stage changes manually in the workbench SCM view",
-            }));
-        }
-
+        // 审批门在管道⑤(PR-4 收编):评估臂先行拦截 candidate,只有决策端
+        // 批准后才进本执行体;工作台 REST 人工面为服务端构造调用(人工操作
+        // 不进 agent 审批链),直接落此处执行。
         let ops = GitOps::new(self.workdir.clone());
         let staged = ops.stage(&paths).map_err(|e| e.message())?;
         Ok(serde_json::json!({ "staged": staged }))
+    }
+
+    /// 管道⑤评估单源(PR-4 收编):paths 参数合法(非空字符串数组)即属
+    /// git 写面 candidate。纯函数:无 IO 副作用。
+    fn evaluate_proposal_sync(&self, args: &Value) -> Option<Value> {
+        let paths: Vec<String> = args.get("paths").and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })?;
+        if paths.is_empty() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "status": "needs_approval",
+            "category": "candidate",
+            "description": format!("git stage {} path(s): {}", paths.len(), paths.join(", ")),
+            "risk": "modifies the git index (staging area)",
+            "alternative": "stage changes manually in the workbench SCM view",
+        }))
     }
 }
 
@@ -160,6 +169,10 @@ impl ToolFunction for GitStageTool {
         tokio::task::spawn_blocking(move || tool.call_sync(&args))
             .await
             .map_err(|e| format!("git_stage tool panicked: {e}"))?
+    }
+
+    fn evaluate_proposal(&self, args: &Value) -> Option<Value> {
+        self.evaluate_proposal_sync(args)
     }
 }
 
@@ -180,31 +193,32 @@ impl GitCommitTool {
             .get("message")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required arg: message (string)".to_string())?;
-        let approved = args
-            .get("approved")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
 
-        if !approved {
-            let summary: String = message
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(120)
-                .collect();
-            return Ok(serde_json::json!({
-                "status": "needs_approval",
-                "category": "candidate",
-                "description": format!("git commit: {summary}"),
-                "risk": "creates a commit on the current branch (all pending changes are staged first)",
-                "alternative": "commit manually in the workbench SCM view",
-            }));
-        }
-
+        // 审批门在管道⑤(PR-4 收编),同 git_stage:评估臂先行拦截,决策端
+        // 批准后才进本执行体。
         let ops = GitOps::new(self.workdir.clone());
         let id = ops.commit(message).map_err(|e| e.message())?;
         Ok(serde_json::json!({ "committed": true, "commit": id }))
+    }
+
+    /// 管道⑤评估单源(PR-4 收编):message 参数合法即属 git 写面 candidate。
+    /// 纯函数:无 IO 副作用。
+    fn evaluate_proposal_sync(&self, args: &Value) -> Option<Value> {
+        let message = args.get("message").and_then(|v| v.as_str())?;
+        let summary: String = message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+        Some(serde_json::json!({
+            "status": "needs_approval",
+            "category": "candidate",
+            "description": format!("git commit: {summary}"),
+            "risk": "creates a commit on the current branch (all pending changes are staged first)",
+            "alternative": "commit manually in the workbench SCM view",
+        }))
     }
 }
 
@@ -216,6 +230,10 @@ impl ToolFunction for GitCommitTool {
         tokio::task::spawn_blocking(move || tool.call_sync(&args))
             .await
             .map_err(|e| format!("git_commit tool panicked: {e}"))?
+    }
+
+    fn evaluate_proposal(&self, args: &Value) -> Option<Value> {
+        self.evaluate_proposal_sync(args)
     }
 }
 
@@ -279,16 +297,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stage_without_approval_returns_proposal() {
+    async fn test_stage_candidate_evaluated_by_proposal_hook() {
         let (_d, workdir) = fresh_repo();
         repo_with_change(&workdir);
         let tool = GitStageTool::new(workdir.clone());
-        let v = tool.call(&json!({"paths": ["a.txt"]})).await.unwrap();
+        // 管道⑤评估单源(PR-4 收编):candidate 分类由 evaluate_proposal 判定
+        let v = tool
+            .evaluate_proposal(&json!({"paths": ["a.txt"]}))
+            .expect("valid stage args are a candidate");
         assert_eq!(v["status"], json!("needs_approval"));
         assert_eq!(v["category"], json!("candidate"));
-        // 未批准不落任何变更
-        let status = GitOps::new(workdir.clone()).status().unwrap();
-        assert!(status.staged.is_empty());
+        // 直接调用(人工面/决策端批准后形态)真实执行——不再返回 proposal
+        let r = tool.call(&json!({"paths": ["a.txt"]})).await.unwrap();
+        assert_eq!(r["staged"], json!(1));
     }
 
     #[tokio::test]
@@ -317,17 +338,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_without_approval_returns_proposal() {
+    async fn test_commit_candidate_evaluated_by_proposal_hook() {
         let (_d, workdir) = fresh_repo();
         repo_with_change(&workdir);
         let tool = GitCommitTool::new(workdir.clone());
+        // 管道⑤评估单源(PR-4 收编):candidate 分类由 evaluate_proposal 判定
         let v = tool
+            .evaluate_proposal(&json!({"message": "agent commit"}))
+            .expect("valid commit args are a candidate");
+        assert_eq!(v["status"], json!("needs_approval"));
+        // 直接调用(人工面/决策端批准后形态)真实执行——不再返回 proposal
+        let r = tool
             .call(&json!({"message": "agent commit"}))
             .await
             .unwrap();
-        assert_eq!(v["status"], json!("needs_approval"));
-        // 未批准不产生提交
-        assert!(GitOps::new(workdir.clone()).log(10).unwrap().is_empty());
+        assert_eq!(r["committed"], json!(true));
     }
 
     #[tokio::test]

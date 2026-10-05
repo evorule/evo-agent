@@ -29,9 +29,14 @@
 //! - 本面服务的是**人**在工作台编辑器中的直接操作(打开 / 编辑 / 保存落盘)。
 //!   人的 UI 操作不构造 agent 会话事实,因此**不进 agent 会话审计链**——
 //!   审计链记录的是 agent 执行行为,把人的编辑操作伪造成 agent 事实反而污染
-//!   审计真实性;
-//! - agent 路径的 `file_write`(`writable_dir=workspace` + candidate 审批 +
-//!   call_external 过引擎入审计链)**完全不受影响**,两个消费面互不干涉;
+//!   审计真实性;写面操作落**人工审计账**([`human_gate`],独立 JSONL,
+//!   两本账可经时间戳关联);
+//! - 写面身份门(HumanGate):human(auth token 校验通过)可写并落人工账;
+//!   anonymous(auth disabled)**只读**——写面一律 403,响应体带开启指引,
+//!   拒绝本身同样落人工账(本地回环 + auth=false 的过渡宽限口径见 human_gate
+//!   模块文档);
+//! - agent 路径的 `file_write`(`writable_dir=workspace` + 管道⑤ candidate
+//!   审批 + call_external 过引擎入审计链)**完全不受影响**,两个消费面互不干涉;
 //! - 写面差异是主体差异的忠实反映:agent 只能写 `workspace/`(防误写源码),
 //!   人(项目方)在本机本就有完整文件系统权限,workdir 沙箱对人是 UX 边界
 //!   (防误操作出 workdir),不是安全边界。
@@ -43,6 +48,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::api::agent_api::AgentApiState;
+use crate::api::human_gate::{ensure_write_allowed, CallerIdentity};
 use crate::builtin_tools::file_create::FileCreateTool;
 use crate::builtin_tools::file_delete::FileDeleteTool;
 use crate::builtin_tools::file_move::FileMoveTool;
@@ -140,6 +146,36 @@ async fn call_toolkit_tool(
     tool.call(&args).await.map_err(|e| (err_status(&e), e))
 }
 
+/// HumanGate 写面准入门:human 放行;anonymous 拒绝(403+开启指引)且
+/// 拒绝本身落人工账(outcome=denied)。
+fn gate_write(
+    state: &AgentApiState,
+    op: &str,
+    path: &str,
+) -> Result<CallerIdentity, (StatusCode, String)> {
+    match ensure_write_allowed(state.auth_config()) {
+        Ok(identity) => Ok(identity),
+        Err(e) => {
+            state
+                .human_gate()
+                .record(op, CallerIdentity::Anonymous, path, "denied");
+            Err(e)
+        }
+    }
+}
+
+/// 写面操作结局落人工账(执行成功 ok / 失败 error)
+fn record_outcome(
+    state: &AgentApiState,
+    op: &str,
+    identity: CallerIdentity,
+    path: &str,
+    result: &Result<Value, (StatusCode, String)>,
+) {
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    state.human_gate().record(op, identity, path, outcome);
+}
+
 /// `GET /api/files/list` —— 列目录(委托 file_list 工具)
 ///
 /// 错误 → 404(目录不存在)/ 400(路径越界等)。
@@ -171,34 +207,39 @@ pub async fn read_file(
 /// `PUT /api/files/write` —— 写文件(委托 file_write 实现,`writable_dir="."`)
 ///
 /// IDE 保存语义:已打开的文件必然已存在,`overwrite=true` 即「保存覆盖」。
-/// 错误 → 400(路径越界 / 内容过大)。
+/// HumanGate:human 可写(落人工账);anonymous 403(拒绝留痕)。
+/// 错误 → 403(anonymous)/ 400(路径越界 / 内容过大)。
 pub async fn write_file(
     State(state): State<AgentApiState>,
     Json(body): Json<WriteBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let identity = gate_write(&state, "file_write", &body.path)?;
     let tool = FileWriteTool::new(state.workdir().to_path_buf()).with_writable_dir(".");
     let mut args = serde_json::Map::new();
     args.insert("path".to_string(), Value::from(body.path.as_str()));
     args.insert("content".to_string(), Value::from(body.content.as_str()));
     args.insert("overwrite".to_string(), Value::Bool(true));
     args.insert("create_parents".to_string(), Value::Bool(true));
-    let v = tool
+    let result = tool
         .call(&Value::Object(args))
         .await
-        .map_err(|e| (err_status(&e), e))?;
-    Ok(Json(v))
+        .map_err(|e| (err_status(&e), e));
+    record_outcome(&state, "file_write", identity, &body.path, &result);
+    result.map(Json)
 }
 
 /// `POST /api/files/create` —— 创建文件/目录(委托 file_create 实现,`writable_dir="."`)
 ///
-/// 人工面语义:`approved=true` 绕过 candidate 审批(REST 面无 agent 会话
-/// 审批通道,审批对象是 agent 行为而非人的点击),`create_parents=true`
-/// 与写面同语义(IDE 保存即自动建父目录)。持树写互斥锁串行执行。
-/// 错误 → 409(已存在)/ 400(越界 / 保留名 / 非法字符 / kind 非法)。
+/// 人工面语义:人工面不走 agent 审批(人即最终审批者,REST 面无 agent 会话
+/// 审批通道),`create_parents=true` 与写面同语义(IDE 保存即自动建父目录)。
+/// HumanGate:human 可写(落人工账);anonymous 403(拒绝留痕)。
+/// 持树写互斥锁串行执行。
+/// 错误 → 403(anonymous)/ 409(已存在)/ 400(越界 / 保留名 / 非法字符 / kind 非法)。
 pub async fn create_file(
     State(state): State<AgentApiState>,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let identity = gate_write(&state, "file_create", &body.path)?;
     let _guard = tree_mutation_lock().lock().await;
     let tool = FileCreateTool::new(state.workdir().to_path_buf()).with_writable_dir(".");
     let mut args = serde_json::Map::new();
@@ -207,22 +248,25 @@ pub async fn create_file(
         args.insert("kind".to_string(), Value::from(kind.as_str()));
     }
     args.insert("create_parents".to_string(), Value::Bool(true));
-    args.insert("approved".to_string(), Value::Bool(true));
-    let v = tool
+    let result = tool
         .call(&Value::Object(args))
         .await
-        .map_err(|e| (err_status(&e), e))?;
-    Ok(Json(v))
+        .map_err(|e| (err_status(&e), e));
+    record_outcome(&state, "file_create", identity, &body.path, &result);
+    result.map(Json)
 }
 
 /// `POST /api/files/move` —— 移动/重命名(委托 file_move 实现,`writable_dir="."`)
 ///
-/// 源与目标目录都必须已存在;移入自身子树被拒。持树写互斥锁串行执行。
-/// 错误 → 404(源或目标目录不存在)/ 400(越界 / 保留名 / 移入自身子树)。
+/// 源与目标目录都必须已存在;移入自身子树被拒。
+/// HumanGate:human 可写(落人工账);anonymous 403(拒绝留痕)。
+/// 持树写互斥锁串行执行。
+/// 错误 → 403(anonymous)/ 404(源或目标目录不存在)/ 400(越界 / 保留名 / 移入自身子树)。
 pub async fn move_file(
     State(state): State<AgentApiState>,
     Json(body): Json<MoveBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let identity = gate_write(&state, "file_move", &body.path)?;
     let _guard = tree_mutation_lock().lock().await;
     let tool = FileMoveTool::new(state.workdir().to_path_buf()).with_writable_dir(".");
     let mut args = serde_json::Map::new();
@@ -234,33 +278,35 @@ pub async fn move_file(
     if let Some(new_name) = &body.new_name {
         args.insert("new_name".to_string(), Value::from(new_name.as_str()));
     }
-    args.insert("approved".to_string(), Value::Bool(true));
-    let v = tool
+    let result = tool
         .call(&Value::Object(args))
         .await
-        .map_err(|e| (err_status(&e), e))?;
-    Ok(Json(v))
+        .map_err(|e| (err_status(&e), e));
+    record_outcome(&state, "file_move", identity, &body.path, &result);
+    result.map(Json)
 }
 
 /// `DELETE /api/files` —— 删除(软删除进 `.evo-trash`;委托 file_delete 实现)
 ///
 /// workdir 根 / writable 根 / 回收目录自身三类守护目标拒绝。
+/// HumanGate:human 可写(落人工账);anonymous 403(拒绝留痕)。
 /// 持树写互斥锁串行执行。
-/// 错误 → 404(目标不存在)/ 400(越界 / 守护目标)。
+/// 错误 → 403(anonymous)/ 404(目标不存在)/ 400(越界 / 守护目标)。
 pub async fn delete_file(
     State(state): State<AgentApiState>,
     Query(q): Query<DeleteQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let identity = gate_write(&state, "file_delete", &q.path)?;
     let _guard = tree_mutation_lock().lock().await;
     let tool = FileDeleteTool::new(state.workdir().to_path_buf()).with_writable_dir(".");
     let mut args = serde_json::Map::new();
     args.insert("path".to_string(), Value::from(q.path.as_str()));
-    args.insert("approved".to_string(), Value::Bool(true));
-    let v = tool
+    let result = tool
         .call(&Value::Object(args))
         .await
-        .map_err(|e| (err_status(&e), e))?;
-    Ok(Json(v))
+        .map_err(|e| (err_status(&e), e));
+    record_outcome(&state, "file_delete", identity, &q.path, &result);
+    result.map(Json)
 }
 
 /// `POST /api/files/search` —— 全项目内容搜索(委托 grep_core 核心层)
@@ -303,17 +349,26 @@ pub async fn search_files(
 /// 原子写,返回 `{appliedFiles,appliedMatches,failed:[{path,reason}]}`。
 /// 治理:人的 UI 写操作,不进 agent 审计链;误操作防护=强制预览+按文件应用+
 /// failed 留痕(设计 §四);树写互斥由 replace_core 内部持有。
-/// 错误 → 404(dir 不存在)/ 400(缺 replacement / 非法正则 / glob / 参数非法)。
+/// HumanGate:`apply=true` 属写面(多文件原子写)——human 可写(落人工账),
+/// anonymous 403(拒绝留痕);`apply=false` 预览只读,不设门。
+/// 错误 → 403(anonymous 写)/ 404(dir 不存在)/ 400(缺 replacement / 非法正则 / glob / 参数非法)。
 pub async fn replace_files(
     State(state): State<AgentApiState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let params = crate::builtin_tools::grep_files::ReplaceParams::from_args(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // HumanGate:apply=true 写面准入;账目 path 字段落操作选择器 query
+    // (本操作无单一路径语义;params 进 blocking 闭包前先取出)
+    let query_selector = params.search.query.clone();
+    if params.apply {
+        gate_write(&state, "files_replace", &query_selector)?;
+    }
     let workdir = state.workdir().to_path_buf();
     // G13:apply=true 在 replace_core 内部 blocking_lock 持树写锁,
-    // 必须 spawn_blocking(禁 async 上下文直调)
-    let v = tokio::task::spawn_blocking(move || {
+    // 必须 spawn_blocking(禁 async 上下文直调);apply 快照供闭包后判定
+    let apply = params.apply;
+    let result = tokio::task::spawn_blocking(move || {
         crate::builtin_tools::grep_files::replace_core(&workdir, &params, None)
     })
     .await
@@ -323,8 +378,17 @@ pub async fn replace_files(
             format!("replace task failed: {e}"),
         )
     })?
-    .map_err(|e| (err_status(&e), e))?;
-    Ok(Json(v))
+    .map_err(|e| (err_status(&e), e));
+    if apply {
+        record_outcome(
+            &state,
+            "files_replace",
+            CallerIdentity::Human,
+            &query_selector,
+            &result,
+        );
+    }
+    result.map(Json)
 }
 
 #[cfg(test)]
@@ -390,6 +454,8 @@ mod tests {
     }
 
     /// 端点级冒烟:write_file handler 走真实 AgentApiState(workdir 指向 tempdir)。
+    /// HumanGate:写面需 human 身份(state 注入 auth enabled;中间件层已验
+    /// token 的语义由 handler 前置的 gate_write 承接)。
     #[tokio::test]
     async fn test_write_file_handler_writes_via_state_workdir() {
         let dir = tempfile::tempdir().unwrap();
@@ -397,16 +463,7 @@ mod tests {
             .path()
             .canonicalize()
             .unwrap_or_else(|_| dir.path().to_path_buf());
-        let state = AgentApiState::new_with_metrics(
-            crate::agent::definition::AgentDefinitionManager::new(dir_canon.join("agents")),
-            crate::api::evorule_client::EvoruleApiClient::new("http://localhost:0"),
-            std::sync::Arc::new(crate::api::metrics::Metrics::new().unwrap()),
-            dir_canon.clone(),
-            std::sync::Arc::new(crate::api::workspace_client::WorkspaceApiClient::new(
-                "http://localhost:0",
-            )),
-            std::sync::Arc::new(crate::io_handlers::tool_handler::ToolHandler::new()),
-        );
+        let state = human_state(&dir_canon);
         let body = WriteBody {
             path: "notes/todo.md".to_string(),
             content: "- [ ] item".to_string(),
@@ -417,12 +474,13 @@ mod tests {
         assert_eq!(written, "- [ ] item");
     }
 
-    // =========================================================================
-    // 增删改端点(PR2):create / move / delete handler 级集成测试
-    // =========================================================================
+    /// 构造 human 身份(写面放行)的 handler 级 AgentApiState
+    fn human_state(dir_canon: &std::path::Path) -> AgentApiState {
+        mutation_state(dir_canon)
+    }
 
-    /// 构造指向 tempdir 的 handler 级 AgentApiState(与上方 write 测试同型)
-    fn mutation_state(dir_canon: &std::path::Path) -> AgentApiState {
+    /// 构造 anonymous 身份(auth disabled)的 handler 级 AgentApiState
+    fn anonymous_state(dir_canon: &std::path::Path) -> AgentApiState {
         AgentApiState::new_with_metrics(
             crate::agent::definition::AgentDefinitionManager::new(dir_canon.join("agents")),
             crate::api::evorule_client::EvoruleApiClient::new("http://localhost:0"),
@@ -434,6 +492,164 @@ mod tests {
             std::sync::Arc::new(crate::io_handlers::tool_handler::ToolHandler::new()),
         )
     }
+
+    /// 构造指向 tempdir 的 handler 级 AgentApiState(写面测试缺省 human 态:
+    /// auth enabled——增删改端点的既有行为断言全部以 human 身份走过 HumanGate)
+    fn mutation_state(dir_canon: &std::path::Path) -> AgentApiState {
+        anonymous_state(dir_canon).with_auth_config(crate::api::auth::AuthConfig::new(
+            vec!["test-token".to_string()],
+            true,
+        ))
+    }
+
+    // =========================================================================
+    // HumanGate(PR-4 两面):身份门 + 人工审计账
+    // =========================================================================
+
+    /// anonymous 真实拒绝路径:auth disabled 状态下调写面 → 403 + 开启指引,
+    /// 文件未被触碰,拒绝本身落人工账。
+    #[tokio::test]
+    async fn test_anonymous_write_file_denied_403_with_ledger_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let state = anonymous_state(&dir_canon); // auth disabled = anonymous
+        let resp = write_file(
+            State(state),
+            Json(WriteBody {
+                path: "should-not-exist.txt".to_string(),
+                content: "nope".to_string(),
+            }),
+        )
+        .await;
+        let (status, msg) = resp.expect_err("anonymous write must be denied");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            msg.contains("--auth-token"),
+            "403 body must carry enablement guidance, got: {msg}"
+        );
+        assert!(
+            !dir_canon.join("should-not-exist.txt").exists(),
+            "denied write must not touch the filesystem"
+        );
+        // 拒绝本身留痕
+        let ledger = std::fs::read_to_string(dir_canon.join("data/human_gate_ledger.jsonl"))
+            .expect("denial must be recorded");
+        let entry: serde_json::Value =
+            serde_json::from_str(ledger.lines().last().unwrap()).unwrap();
+        assert_eq!(entry["op"], "file_write");
+        assert_eq!(entry["identity"], "anonymous");
+        assert_eq!(entry["outcome"], "denied");
+        assert_eq!(entry["path"], "should-not-exist.txt");
+    }
+
+    /// anonymous 调 create/delete 同拒(写面四端点同一门,代表性覆盖两态)
+    #[tokio::test]
+    async fn test_anonymous_create_and_delete_denied_403() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        std::fs::write(dir_canon.join("keep.txt"), b"x").unwrap();
+        let state = anonymous_state(&dir_canon);
+        let (status, _) = create_file(
+            State(state.clone()),
+            Json(CreateBody {
+                path: "new.txt".to_string(),
+                kind: None,
+            }),
+        )
+        .await
+        .expect_err("anonymous create must be denied");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = delete_file(
+            State(state),
+            Query(DeleteQuery {
+                path: "keep.txt".to_string(),
+            }),
+        )
+        .await
+        .expect_err("anonymous delete must be denied");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // 只读面不受影响 + 文件未被触碰
+        assert!(dir_canon.join("keep.txt").is_file());
+        assert!(!dir_canon.join("new.txt").exists());
+    }
+
+    /// human 写面放行且操作落人工账(outcome=ok)
+    #[tokio::test]
+    async fn test_human_write_recorded_in_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let state = human_state(&dir_canon);
+        let resp = create_file(
+            State(state),
+            Json(CreateBody {
+                path: "ledgertest/a.md".to_string(),
+                kind: None,
+            }),
+        )
+        .await;
+        assert!(resp.is_ok(), "human create should succeed");
+        let ledger = std::fs::read_to_string(dir_canon.join("data/human_gate_ledger.jsonl"))
+            .expect("human write must be recorded");
+        let entry: serde_json::Value =
+            serde_json::from_str(ledger.lines().last().unwrap()).unwrap();
+        assert_eq!(entry["op"], "file_create");
+        assert_eq!(entry["identity"], "human");
+        assert_eq!(entry["outcome"], "ok");
+        assert_eq!(entry["path"], "ledgertest/a.md");
+    }
+
+    /// replace apply=true 属写面:anonymous 403;预览(apply=false)匿名可通
+    #[tokio::test]
+    async fn test_anonymous_replace_apply_denied_preview_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        std::fs::write(dir_canon.join("doc.txt"), b"foo\n").unwrap();
+        let state = anonymous_state(&dir_canon);
+        // 预览只读:匿名放行
+        let preview = replace_files(
+            State(state.clone()),
+            Json(serde_json::json!({ "query": "foo", "replacement": "bar" })),
+        )
+        .await;
+        assert!(preview.is_ok(), "anonymous preview must be allowed");
+        assert_eq!(
+            std::fs::read_to_string(dir_canon.join("doc.txt")).unwrap(),
+            "foo\n",
+            "preview must not write"
+        );
+        // apply=true:匿名 403,文件未被改写
+        let (status, _) = replace_files(
+            State(state),
+            Json(serde_json::json!({
+                "query": "foo",
+                "replacement": "bar",
+                "apply": true
+            })),
+        )
+        .await
+        .expect_err("anonymous apply must be denied");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            std::fs::read_to_string(dir_canon.join("doc.txt")).unwrap(),
+            "foo\n"
+        );
+    }
+
+    // =========================================================================
+    // 增删改端点(PR2):create / move / delete handler 级集成测试
+    // =========================================================================
 
     #[test]
     fn test_err_status_mapping() {

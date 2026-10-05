@@ -187,6 +187,8 @@ pub struct AgentApiState {
     workbench_settings: Arc<crate::api::settings::WorkbenchSettingsStore>,
     /// 文件系统事件广播 hub(WS 连接订阅;serve 启动时 spawn_watcher 填充)
     fs_events: crate::api::fs_watch::FsEventHub,
+    /// 人工审计账(HumanGate 写面操作 JSONL;data/human_gate_ledger.jsonl)
+    human_gate: Arc<crate::api::human_gate::HumanGateLedger>,
 }
 
 impl AgentApiState {
@@ -242,6 +244,7 @@ impl AgentApiState {
                 crate::api::settings::WorkbenchSettingsStore::new(&workdir)
                     .unwrap_or_else(|e| panic!("failed to init workbench settings store: {e}")),
             ),
+            human_gate: Arc::new(crate::api::human_gate::HumanGateLedger::new(&workdir)),
             fs_events: crate::api::fs_watch::FsEventHub::new(),
             workdir,
             workspace_client,
@@ -335,6 +338,11 @@ impl AgentApiState {
     /// G16:获取 AuthConfig 的引用(WebSocket 升级前检查 ?token=)
     pub fn auth_config(&self) -> &AuthConfig {
         &self.auth_config
+    }
+
+    /// HumanGate:获取人工审计账的引用(写面操作/拒绝留痕)
+    pub fn human_gate(&self) -> &crate::api::human_gate::HumanGateLedger {
+        &self.human_gate
     }
 
     /// G16:获取 AgentDefinitionManager 的引用(WebSocket handler 构造 runner)
