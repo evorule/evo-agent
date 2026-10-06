@@ -614,22 +614,13 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
                 return None;
             }
         };
-    // L2 约束前馈:具备规则生成/校验能力的 agent,构造时把 L2 边界段追加到
-    // system_prompt 尾部(memory recall 在 runner 内层包装,顺序不变;fail-soft)
-    crate::api::serve_tools::apply_l2_feed_forward(
+    // S2 治理门禁段(S2 前移批):三段合并构造,经 runner 配置进组装层
+    // (v2 序=权威紧跟 S1 身份段之后;不再改写 def.system_prompt——K-17②)
+    let governance_segment = crate::api::serve_tools::build_governance_segment(
         state.evorule_client(),
         &def.tools,
-        &mut def.system_prompt,
     )
     .await;
-    crate::api::serve_tools::apply_evolution_signals_awareness(
-        state.evorule_client(),
-        &def.tools,
-        &mut def.system_prompt,
-    )
-    .await;
-    // M1 规范入口索引:全 serve 会话通用素养段(静态文本,无触发条件;同 HTTP 端点口径)
-    crate::api::serve_tools::apply_regulation_index_awareness(&mut def.system_prompt);
     let config = def.to_agent_config();
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
         // M5-a:注入生效能力边界(声明重绑工具面 + 会话边界段/边界事实)
@@ -655,7 +646,9 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         // 查账工具族接线（PR-11a）：以本会话态重绑 filtered 内查账工具实例
         .wire_accounting(state.workdir())
         // B2:注入 skills manifest(read_skill 已注册进 filtered,清单喂 S4b 槽位)
-        .with_skills(resolved_skills);
+        .with_skills(resolved_skills)
+        // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位,不再内嵌基底)
+        .with_governance_segment(governance_segment);
     // 记忆启用时构建 MemoryManager(TTL / 持久化模式按定义透传)
     if def.memory.memory_type != "none" && !def.memory.memory_type.is_empty() {
         let mut mem = MemoryManager::new(&def.memory.namespace, state.evorule_client().clone());

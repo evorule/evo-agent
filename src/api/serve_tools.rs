@@ -112,6 +112,46 @@ pub fn l2_feed_forward_triggered(tools: &[String]) -> bool {
 ///   L2 清单为空 → 不注入。
 ///
 /// 时效：每次 runner 构造实时拉取（无缓存）——元规则增删下一轮即反映。
+/// 治理门禁段合并构造（S2 槽位内容物；v2 前移批迁移——段不再改写
+/// def.system_prompt，由调用方经 runner.with_governance_segment 进组装层，
+/// 渲染位次=S1 之后 S3 之前[09 号 §5.1 v2 目标序]）。三段序与文本与
+/// 旧 apply_* 逐字节同源：L2 约束前馈(触发+拉取+渲染) → 进化信号感知
+/// (触发+静态) → 规范入口索引(无条件)。全部为空=None。
+pub async fn build_governance_segment(
+    ev: &EvoruleApiClient,
+    tools: &[String],
+) -> Option<String> {
+    let mut seg = String::new();
+    if l2_feed_forward_triggered(tools) {
+        if let Ok(inv) = ev.get_l2_inventory().await {
+            if let Some(l2) =
+                crate::rule_tools::local_handlers::render_l2_inventory_summary(&inv)
+            {
+                seg.push_str("
+
+");
+                seg.push_str(&l2);
+            }
+        } else {
+            tracing::warn!("governance segment: L2 feed-forward fetch failed; continuing without injection");
+        }
+        seg.push_str("
+
+");
+        seg.push_str(EVOLUTION_AWARENESS_SEGMENT);
+    }
+    seg.push_str("
+
+");
+    seg.push_str(REGULATION_INDEX_AWARENESS_SEGMENT);
+    let trimmed = seg.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 pub async fn apply_l2_feed_forward(
     ev: &EvoruleApiClient,
     tools: &[String],
@@ -152,7 +192,7 @@ pub async fn apply_evolution_signals_awareness(
 }
 
 /// 进化信号感知段文本（与 evolution_tools 渲染模板同属展示层,禁内部编号字样）
-const EVOLUTION_AWARENESS_SEGMENT: &str = "【进化信号感知】\n\
+pub(crate) const EVOLUTION_AWARENESS_SEGMENT: &str = "【进化信号感知】\n\
 你具备 evolution_signals 工具（只读）。若任务涉及一个已有会话且其存在反复被强制拦截的违规,\
 先用该工具拉取该会话的进化信号摘要,再围绕高频违规起草改进规则；无信号或与任务无关时跳过。";
 
@@ -171,7 +211,7 @@ const EVOLUTION_AWARENESS_SEGMENT: &str = "【进化信号感知】\n\
 ///
 /// 权威源与同步纪律：索引 v1.0 变更（新增规范档位/核心条款修订）必须同步
 /// 本投影,变更留痕于索引档头部与 CHANGELOG。
-const REGULATION_INDEX_AWARENESS_SEGMENT: &str = "【规范入口索引】(什么问题查什么档;遇到「做不到/缺能力/不可达/访问被拒」等受限情形,先过规范程序再行动,禁止臆答)\n\
+pub(crate) const REGULATION_INDEX_AWARENESS_SEGMENT: &str = "【规范入口索引】(什么问题查什么档;遇到「做不到/缺能力/不可达/访问被拒」等受限情形,先过规范程序再行动,禁止臆答)\n\
 一、能力缺口三问——凡遇受限情形(做不到/缺能力/不可达/访问被拒),禁止直接出补齐方案或只作边界说明,必须先依次回答:\n\
 ①缺陷还是特性?evorule 是反缺省架构,「做不到」更可能是刻意边界;\n\
 ②该补在哪层?由外向内:外层预结构化喂字段→治理程序→视图→上下文;「扩内核」永远是最后选项;\n\

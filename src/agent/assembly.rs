@@ -27,6 +27,7 @@ pub const DEFAULT_RECIPE_VERSION: &str = "recipe-v1.0";
 /// 槽位来源白名单（执行器只认这些来源;新增来源 = 执行器升级 = major）
 pub const SLOT_SOURCES: &[&str] = &[
     "definition.system_prompt",
+    "governance_segment",
     "recall",
     "definition.capability_boundary.awareness_segment",
     "manifest",
@@ -201,6 +202,19 @@ fn default_slots() -> Vec<SlotSpec> {
             source: "definition.system_prompt".to_string(),
             degradable: false,
             optional: false,
+            enabled: true,
+            budget: None,
+            degradation_order: None,
+            sections: None,
+            separator: None,
+            role: None,
+            trim: None,
+        },
+        SlotSpec {
+            id: "S2_governance".to_string(),
+            source: "governance_segment".to_string(),
+            degradable: false,
+            optional: true,
             enabled: true,
             budget: None,
             degradation_order: None,
@@ -641,6 +655,7 @@ impl AssemblyExecutor {
         boundary_segment: Option<&str>,
         skills: Option<&[crate::agent::definition::SkillManifestEntry]>,
         handoff: Option<&crate::agent::definition::HandoffPackage>,
+        governance_segment: Option<&str>,
     ) -> Result<String, String> {
         let mut prompt = String::new();
         for slot in &self.recipe.slots {
@@ -660,6 +675,17 @@ impl AssemblyExecutor {
                     if let Some(ns) = north_star {
                         prompt.push_str("\n\n");
                         prompt.push_str(ns);
+                    }
+                }
+                // S2_governance:治理门禁段(serve 三段合并:L2 约束前馈/
+                // 进化信号感知/规范入口索引;authority=L2 约束层,独立分区
+                // 不可降级)。v2 序=权威最高者紧跟 S1 之后(09 号 §5.1)
+                "governance_segment" => {
+                    if let Some(seg) = governance_segment {
+                        if !seg.trim().is_empty() {
+                            prompt.push_str("\n\n");
+                            prompt.push_str(seg);
+                        }
                     }
                 }
                 // S3_memory:记忆区(渲染机制在 MemoryManager,含 fit_recall
@@ -742,6 +768,7 @@ mod tests {
             ids,
             [
                 "S1_base",
+                "S2_governance",
                 "S3_memory",
                 "S4_boundary",
                 "S4b_skills",
@@ -750,8 +777,13 @@ mod tests {
                 "S7_history"
             ]
         );
+        // S2 治理门禁:S2 前移批(09 号 §5.3.2 v2 目标序;不可降级,缺席合法)
+        let s2 = &r.slots[1];
+        assert_eq!(s2.id, "S2_governance");
+        assert!(!s2.degradable);
+        assert!(s2.optional);
         // S3 记忆区:C3 默认 0.25 + clamp(0.1,0.5) + 降级序 stable>summaries>events + notices 置前
-        let s3 = &r.slots[1];
+        let s3 = &r.slots[2];
         assert_eq!(s3.source, "recall");
         assert!(s3.degradable);
         let b = s3.budget.as_ref().unwrap();
@@ -764,16 +796,16 @@ mod tests {
         );
         assert!(s3.sections.unwrap().notices_first);
         // S4 边界段:optional + "\n\n"
-        assert!(r.slots[2].optional);
-        assert_eq!(r.slots[2].separator.as_deref(), Some("\n\n"));
-        // S4b:B2 启用(optional + skills 未声明时跳过 = 预留期行为逐字节一致)
-        assert!(r.slots[3].enabled);
         assert!(r.slots[3].optional);
         assert_eq!(r.slots[3].separator.as_deref(), Some("\n\n"));
+        // S4b:B2 启用(optional + skills 未声明时跳过 = 预留期行为逐字节一致)
+        assert!(r.slots[4].enabled);
+        assert!(r.slots[3].optional);
+        assert_eq!(r.slots[4].separator.as_deref(), Some("\n\n"));
         // S5 任务:user 角色
-        assert_eq!(r.slots[4].role.as_deref(), Some("user"));
+        assert_eq!(r.slots[5].role.as_deref(), Some("user"));
         // S7 裁剪:KeepSystemKeepLast + buffer 5% + hint 15
-        let t = r.slots[6].trim.as_ref().unwrap();
+        let t = r.slots[7].trim.as_ref().unwrap();
         assert_eq!(t.strategy, "KeepSystemKeepLast");
         assert_eq!(t.buffer_pct, 5);
         assert_eq!(t.hint_budget_tokens, 15);
@@ -808,7 +840,7 @@ mod tests {
     #[test]
     fn test_validate_rejects_ratio_out_of_clamp() {
         let mut r = AssemblyRecipe::default();
-        r.slots[1].budget.as_mut().unwrap().ratio = 0.9;
+        r.slots[2].budget.as_mut().unwrap().ratio = 0.9;
         let err = r.validate().unwrap_err();
         assert!(err.contains("budget.ratio"), "got: {}", err);
     }
@@ -817,7 +849,7 @@ mod tests {
     #[test]
     fn test_validate_rejects_invalid_clamp() {
         let mut r = AssemblyRecipe::default();
-        r.slots[1].budget.as_mut().unwrap().clamp = [0.5, 0.1];
+        r.slots[2].budget.as_mut().unwrap().clamp = [0.5, 0.1];
         assert!(r.validate().unwrap_err().contains("clamp"));
     }
 
@@ -842,7 +874,7 @@ mod tests {
     #[test]
     fn test_validate_rejects_unknown_degradation_layer() {
         let mut r = AssemblyRecipe::default();
-        r.slots[1].degradation_order.as_mut().unwrap()[0] = "chat_history".to_string();
+        r.slots[2].degradation_order.as_mut().unwrap()[0] = "chat_history".to_string();
         assert!(r.validate().unwrap_err().contains("unknown layer"));
     }
 
@@ -850,7 +882,7 @@ mod tests {
     #[test]
     fn test_validate_rejects_unknown_trim_strategy() {
         let mut r = AssemblyRecipe::default();
-        r.slots[6].trim.as_mut().unwrap().strategy = "DropEverything".to_string();
+        r.slots[7].trim.as_mut().unwrap().strategy = "DropEverything".to_string();
         assert!(r.validate().unwrap_err().contains("trim.strategy"));
     }
 
@@ -982,6 +1014,8 @@ mod tests {
                 None,
                 None,
                 None,
+            None,
+
             )
             .unwrap();
         assert_eq!(
@@ -991,7 +1025,7 @@ mod tests {
 
         // 场景 2:极端小窗口(60 token)强制降级通知
         let out2 = exec
-            .assemble(base, None, None, Some(&mem), &recall, 60, None, None, None)
+            .assemble(base, None, None, Some(&mem), &recall, 60, None, None, None, None)
             .unwrap();
         assert_eq!(
             out2,
@@ -1015,6 +1049,8 @@ mod tests {
                 Some(&boundary.awareness_segment()),
                 None,
                 None,
+            None,
+
             )
             .unwrap();
         assert_eq!(
@@ -1040,6 +1076,8 @@ mod tests {
                 None,
                 None,
                 None,
+            None,
+
             )
             .unwrap();
         assert_eq!(out_none, "base");
@@ -1055,6 +1093,8 @@ mod tests {
                 Some("【能力边界声明】boundary"),
                 None,
                 None,
+            None,
+
             )
             .unwrap();
         assert!(out_id.starts_with("base\n\n【身份资产】我是谁/服务谁/边界自述/基调"));
@@ -1073,6 +1113,8 @@ mod tests {
                 None,
                 None,
                 None,
+            None,
+
             )
             .unwrap();
         assert_eq!(
@@ -1109,6 +1151,8 @@ mod tests {
                 None,
                 None,
                 None,
+            None,
+
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1143,6 +1187,8 @@ mod tests {
                 None,
                 Some(&skills),
                 None,
+            None,
+
             )
             .unwrap();
         assert!(out.starts_with("base\n\n"));
@@ -1173,6 +1219,8 @@ mod tests {
                 Some("【能力边界声明】boundary"),
                 Some(&skills),
                 None,
+            None,
+
             )
             .unwrap();
         let boundary_pos = out.find("【能力边界声明】").expect("boundary present");
@@ -1207,6 +1255,8 @@ mod tests {
                 None,
                 Some(&skills),
                 None,
+            None,
+
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1227,6 +1277,8 @@ mod tests {
                 None,
                 Some(&[]),
                 None,
+            None,
+
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1277,6 +1329,8 @@ mod tests {
                 None,
                 None,
                 None,
+            None,
+
             )
             .unwrap();
         // 显式兼容口径(base=total_window,历史行为)
@@ -1299,6 +1353,8 @@ mod tests {
                 None,
                 None,
                 None,
+            None,
+
             )
             .unwrap();
 
@@ -1350,6 +1406,8 @@ mod tests {
                 None,
                 None,
                 None,
+            None,
+
             )
             .unwrap();
         // 新配方:加载 → validate → 字段落位
@@ -1378,6 +1436,8 @@ mod tests {
                 None,
                 None,
                 None,
+            None,
+
             )
             .unwrap();
     }
@@ -1477,6 +1537,8 @@ mod tests {
                 None,
                 None,
                 Some(&handoff),
+            None,
+
             )
             .unwrap();
         let stable_pos = out1
@@ -1498,6 +1560,8 @@ mod tests {
                 None,
                 None,
                 Some(&handoff),
+            None,
+
             )
             .unwrap();
         assert!(out2.contains("## Handoff Base"));
@@ -1515,6 +1579,8 @@ mod tests {
                 None,
                 None,
                 None,
+            None,
+
             )
             .unwrap();
         assert_eq!(out3, "base");
@@ -1533,15 +1599,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_injection_order_golden_sample() {
+        // S2 前移批 golden v2(09 号 §5.1 v2 目标序落地):
+        // v2 全文序=基底 → 身份段 → 北极星锚 → 治理门禁段 → 记忆区 → …
+        // (K-17 缺陷序已修正:治理段经组装层 S2_governance 独立槽位渲染,
+        // 不再改写 def.system_prompt——身份段前于治理段,结构断言随 v2 翻转)。
+        // golden v1 双件(assembly/full)留档为回滚对照基线,不再断言。
+        // 重录方式:GOLDEN_REWRITE=1 cargo test --lib injection_order -- --nocapture
         use crate::agent::definition::{CapabilityBoundary, HandoffPackage, SkillManifestEntry};
-        use crate::api::serve_tools::{
-            apply_evolution_signals_awareness, apply_regulation_index_awareness,
-        };
+        use crate::api::serve_tools::build_governance_segment;
         use crate::rule_tools::local_handlers::render_l2_inventory_summary;
         use std::path::PathBuf;
 
         const GOLDEN_ASSEMBLY: &str = "tests/fixtures/golden_injection_order_assembly_v1.txt";
-        const GOLDEN_FULL: &str = "tests/fixtures/golden_injection_order_full_v1.txt";
+        const GOLDEN_FULL_V2: &str = "tests/fixtures/golden_injection_order_full_v2.txt";
 
         // ---- 固定输入件(全确定性,零网络) ----
         let base = "【基底】固定基底提示词。";
@@ -1579,18 +1649,20 @@ mod tests {
                 "固定会话摘要。",
                 1_700_000_100,
             ));
-        recall.events.push(crate::agent::memory::MemoryRecord::new(
-            "golden.events.e1",
-            "固定事件。",
-            1_700_000_200,
-        ));
+        recall
+            .events
+            .push(crate::agent::memory::MemoryRecord::new(
+                "golden.events.e1",
+                "固定事件。",
+                1_700_000_200,
+            ));
         let mem = crate::agent::memory::MemoryManager::new(
             "golden-ns",
             crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),
         );
         let exec = AssemblyExecutor::default_executor();
 
-        // ---- (a) assemble() 单体黄金(不含 serve 段) ----
+        // ---- (a) assemble 单体黄金(无治理段;CLI 形态,S2 槽位缺席合法) ----
         let assembly_out = exec
             .assemble(
                 base,
@@ -1602,33 +1674,39 @@ mod tests {
                 Some(&boundary.awareness_segment()),
                 Some(&skills),
                 Some(&handoff),
+                None,
             )
             .unwrap();
+        // v1 断言维持:无治理段=CLI 形态输出与 golden v1 逐字节一致
+        assert_eq!(
+            assembly_out,
+            std::fs::read_to_string(GOLDEN_ASSEMBLY).unwrap()
+        );
 
-        // ---- (b) serve 段前置后全文(K-17 缺陷序:serve 段位于身份段之前) ----
-        // 顺序镜像 ws_handler 会话创建路径:L2 前馈 → 进化信号感知 → 规范入口索引,
-        // 三段全部追加在 def.system_prompt(=assemble 的 base)尾部。
-        let mut serve_base = base.to_string();
+        // ---- (b) serve 形态黄金 v2:治理段经 S2 槽位进组装(身份段前于治理段) ----
+        // 三段构造与 serve_tools::build_governance_segment 同源同序:
+        // L2 约束前馈(固定库存 fixture 经渲染纯函数) → 进化信号感知 → 规范入口索引
+        let mut governance = String::new();
         let l2_inventory = serde_json::json!({
             "count": 1,
             "files": [
                 {"path": "guard-demo", "title": "演示守卫规则", "guard_for": ["deploy"]}
             ],
         });
-        if let Some(seg) = render_l2_inventory_summary(&l2_inventory) {
-            serve_base.push_str("\n\n");
-            serve_base.push_str(&seg);
+        if let Some(l2) = render_l2_inventory_summary(&l2_inventory) {
+            governance.push_str(&l2);
+            governance.push_str("
+
+");
         }
-        apply_evolution_signals_awareness(
-            &crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),
-            &["rule_create".to_string()],
-            &mut serve_base,
-        )
-        .await;
-        apply_regulation_index_awareness(&mut serve_base);
-        let full = exec
+        governance.push_str(crate::api::serve_tools::EVOLUTION_AWARENESS_SEGMENT);
+        governance.push_str("
+
+");
+        governance.push_str(crate::api::serve_tools::REGULATION_INDEX_AWARENESS_SEGMENT);
+        let full_v2 = exec
             .assemble(
-                &serve_base,
+                base,
                 Some(identity),
                 Some(north_star),
                 Some(&mem),
@@ -1637,42 +1715,32 @@ mod tests {
                 Some(&boundary.awareness_segment()),
                 Some(&skills),
                 Some(&handoff),
+                Some(&governance),
             )
             .unwrap();
 
         // ---- 写录/比对 ----
         if std::env::var("GOLDEN_REWRITE").is_ok() {
-            std::fs::write(GOLDEN_ASSEMBLY, &assembly_out).unwrap();
-            std::fs::write(GOLDEN_FULL, &full).unwrap();
-            println!("[golden] rewritten: {GOLDEN_ASSEMBLY} / {GOLDEN_FULL}");
+            std::fs::write(GOLDEN_FULL_V2, &full_v2).unwrap();
+            println!("[golden] rewritten: {GOLDEN_FULL_V2}");
             return;
         }
-        let expect_a = std::fs::read_to_string(GOLDEN_ASSEMBLY).unwrap_or_else(|e| {
+        let expect_v2 = std::fs::read_to_string(GOLDEN_FULL_V2).unwrap_or_else(|e| {
             panic!(
-            "golden 缺失({e});重录=GOLDEN_REWRITE=1 cargo test --lib injection_order -- --nocapture"
-        )
+                "golden v2 缺失({e});重录=GOLDEN_REWRITE=1 cargo test --lib injection_order -- --nocapture"
+            )
         });
         assert_eq!(
-            assembly_out, expect_a,
-            "assemble() 黄金样本失配——注入序/配方变更必须显式重录(装配守护语义)"
+            full_v2, expect_v2,
+            "golden v2 失配——注入序/配方/治理段变更必须显式重录(24 号批次七守护语义)"
         );
-        let expect_f = std::fs::read_to_string(GOLDEN_FULL).unwrap_or_else(|e| {
-            panic!(
-            "golden 缺失({e});重录=GOLDEN_REWRITE=1 cargo test --lib injection_order -- --nocapture"
-        )
-        });
-        assert_eq!(
-        full, expect_f,
-        "serve 全文黄金样本失配——v1 含已知缺陷序(serve 段先于身份段);序变更须显式重录并走人工段序裁定"
-    );
-        // 缺陷序显式断言:v1 固化的正是"身份段位于 serve 注入段之后"这一现状——
-        // 若未来序被修正(身份段前移),本断言随 golden v2 重录一并翻转。
-        let serve_end = full.find(serve_base.trim_end()).unwrap() + serve_base.trim_end().len();
-        let identity_pos = full.find(identity).unwrap();
-        let l2_pos = full.find("【L2 约束边界").unwrap();
+        // v2 结构断言(相对 v1 翻转):身份段/北极星锚 前于 治理门禁段
+        let identity_pos = full_v2.find(identity).unwrap();
+        let anchor_pos = full_v2.find(north_star).unwrap();
+        let l2_pos = full_v2.find("【L2 约束边界").unwrap();
         assert!(
-            l2_pos < serve_end && identity_pos >= serve_end,
-            "v1 结构预期:serve 段在 base 尾部、身份段在其后(K-17 缺陷序)"
+            identity_pos < l2_pos && anchor_pos < l2_pos,
+            "v2 结构预期:身份段/北极星锚 前于治理门禁段(S2 前移已落地)"
         );
     }
 }

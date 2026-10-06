@@ -753,22 +753,13 @@ async fn run_agent(
     // M5-a:能力边界接线(显式声明重绑 file 工具沙箱 + 生效边界注入 runner)
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
-    // L2 约束前馈:具备规则生成/校验能力的 agent,构造时把 L2 边界段追加到
-    // system_prompt 尾部(memory recall 在 runner 内层包装,顺序不变;fail-soft)
-    crate::api::serve_tools::apply_l2_feed_forward(
+    // S2 治理门禁段(S2 前移批):三段合并构造,经 runner 配置进组装层
+    // (v2 序=权威紧跟 S1 身份段之后;不再改写 def.system_prompt——K-17②)
+    let governance_segment = crate::api::serve_tools::build_governance_segment(
         &state.evorule_client,
         &def.tools,
-        &mut def.system_prompt,
     )
     .await;
-    crate::api::serve_tools::apply_evolution_signals_awareness(
-        &state.evorule_client,
-        &def.tools,
-        &mut def.system_prompt,
-    )
-    .await;
-    // M1 规范入口索引:全 serve 会话通用素养段(静态文本,无触发条件;立项-M1 §3.2)
-    crate::api::serve_tools::apply_regulation_index_awareness(&mut def.system_prompt);
     // 人工审查开合(2026-09-28):def move 前捕获审批模式
     let approval_auto = def.approval_mode.as_deref() == Some("auto_policy");
     let runner = AgentRunner::from_definition(
@@ -783,7 +774,9 @@ async fn run_agent(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .with_capability_boundary(capability_boundary)
     // 查账工具族接线（PR-11a）：以本会话态重绑 handler 内查账工具实例
-    .wire_accounting(&state.workdir);
+    .wire_accounting(&state.workdir)
+    // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位)
+    .with_governance_segment(governance_segment);
     // G8:注入审批决策端(人工审查开合)——定义级 approval_mode=auto_policy 时
     // 走 PolicyApproval 判定式决策端(无人值守,理由必产);manual 态维持本端点
     // 既定行为(不注入=缺省拒绝,安全优先,行为零变化)
@@ -912,21 +905,12 @@ async fn run_agent_stream(
     // M5-a:能力边界接线(同 run_agent 口径)
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
-    // L2 约束前馈:同 run_agent 口径(三路径共用 helper;fail-soft)
-    crate::api::serve_tools::apply_l2_feed_forward(
+    // S2 治理门禁段(S2 前移批):同 run_agent 口径
+    let governance_segment = crate::api::serve_tools::build_governance_segment(
         &state.evorule_client,
         &def.tools,
-        &mut def.system_prompt,
     )
     .await;
-    crate::api::serve_tools::apply_evolution_signals_awareness(
-        &state.evorule_client,
-        &def.tools,
-        &mut def.system_prompt,
-    )
-    .await;
-    // M1 规范入口索引:同 run_agent 口径
-    crate::api::serve_tools::apply_regulation_index_awareness(&mut def.system_prompt);
     // 人工审查开合(2026-09-28):def move 前捕获审批模式(auto_policy → PolicyApproval)
     let approval_auto = def.approval_mode.as_deref() == Some("auto_policy");
     let runner = AgentRunner::from_definition(
@@ -942,6 +926,8 @@ async fn run_agent_stream(
     .with_capability_boundary(capability_boundary)
     // 查账工具族接线（PR-11a）：以本会话态重绑 handler 内查账工具实例
     .wire_accounting(&state.workdir)
+    // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位)
+    .with_governance_segment(governance_segment)
     // G8:注入审批决策端(人工审查开合)——定义级 approval_mode=auto_policy 时
     // 走 PolicyApproval 判定式决策端(无人值守,理由必产);否则 HttpApproval
     // 60s 人工审批窗(manual 态,现状行为)
