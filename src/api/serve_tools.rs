@@ -295,6 +295,24 @@ pub fn build_filtered_toolkit_with_switches(
         }
         filtered.register_entry_from(union, name);
     }
+    // D6 终态 + D7-A 方案一：动态源分级按来源级 settings 键覆写
+    // （= "standard" 时人工降档为 Standard，免意图裁决；"sensitive"/缺省 =
+    // 维持 dynamic_manifest 默认 Sensitive 意图必报）。覆写只命中动态源
+    // 条目——静态条目分级以静态表为准不在射程（防降级锚，见
+    // is_p2_adjudicated_runtime）。分级管裁决性，开关管在场性，正交。
+    let downgraded = |key: &str| settings.get(key).and_then(|v| v.as_str()) == Some("standard");
+    if downgraded(crate::agent::tool_manifest::AGENT_TOOLS_MCP_ADJUDICATION) {
+        filtered.set_adjudication_for_source(
+            crate::agent::tool_manifest::ToolSource::Mcp,
+            crate::agent::tool_manifest::AdjudicationClass::Standard,
+        );
+    }
+    if downgraded(crate::agent::tool_manifest::AGENT_TOOLS_SERVICE_PROXY_ADJUDICATION) {
+        filtered.set_adjudication_for_source(
+            crate::agent::tool_manifest::ToolSource::ServiceProxy,
+            crate::agent::tool_manifest::AdjudicationClass::Standard,
+        );
+    }
     filtered
 }
 

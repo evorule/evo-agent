@@ -461,8 +461,14 @@ impl ToolExecutionPipeline {
             }
         }
         // P2 通道：治理级工具事前意图裁决（分级=manifest 派生）。与 R1 通道
-        // 并存互不干扰；裁决会话轮内复用。原内联逻辑逐字迁入。
-        if let Some(mut intent) = resolve_tool_intent(req.tool_name, req.args, deps.boundary) {
+        // 并存互不干扰；裁决会话轮内复用。原内联逻辑逐字迁入。D6 终态：
+        // runtime manifest 传阶段①查得条目——动态源（MCP/ServiceProxy，
+        // 默认 Sensitive）入 P2；静态名防降级由 is_p2_adjudicated_runtime
+        // 的静态优先判定序保证（不直接消费 handler 优先的 manifest_of 结果
+        // 做静态判定）。
+        if let Some(mut intent) =
+            resolve_tool_intent(req.tool_name, req.args, deps.boundary, Some(&manifest))
+        {
             // 契约 session_ref 补齐：主会话 id 由调用方上下文写入解析输出，
             // tool_intent_signal 派生 tool_intent.v1 契约时随 value 落链
             // （裁决账面审计关联）。

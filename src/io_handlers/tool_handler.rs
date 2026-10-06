@@ -119,18 +119,25 @@ impl ToolHandler {
     /// Create handler from bare tool functions（测试/外部装配便捷口）
     ///
     /// 每个函数按 Mcp 动态源补全 manifest（硬规则 3：动态源注册期产出
-    /// Inline spec），治理元数据与执行器成对在场。
+    /// Inline spec），治理元数据与执行器成对在场。**分级显式定级
+    /// Standard**：本口输入是裸函数非 MCP 握手产物——复用动态注册通道
+    /// （Inline 契约）不等于继承真实 MCP 面的 D6 默认分级（Sensitive）；
+    /// 治理面需要 Sensitive 的调用方显式用 [`Self::register`] +
+    /// `dynamic_manifest` 或 [`Self::set_adjudication_for_source`]（测试为
+    /// 证据，定级显式化）。
     pub fn with_functions(funcs: BTreeMap<String, Arc<dyn ToolFunction>>) -> Self {
         let tools: BTreeMap<String, ToolEntry> = funcs
             .into_iter()
             .map(|(name, func)| {
-                let manifest = crate::agent::tool_manifest::dynamic_manifest(
+                let mut manifest = crate::agent::tool_manifest::dynamic_manifest(
                     &name,
                     crate::agent::tool_manifest::ToolSource::Mcp,
                     format!("tool {name}"),
                     serde_json::json!({"type": "object", "properties": {}}),
                 )
                 .unwrap_or_else(|e| panic!("with_functions: {e}"));
+                manifest.adjudication_class =
+                    crate::agent::tool_manifest::AdjudicationClass::Standard;
                 (name, ToolEntry { manifest, func })
             })
             .collect();
@@ -173,6 +180,26 @@ impl ToolHandler {
                 true
             }
             None => false,
+        }
+    }
+
+    /// 按来源覆写裁决分级（D6 方案甲人工分级降档，D7-A 方案一）
+    ///
+    /// 消费点 = `build_filtered_toolkit_with_switches` 装配末段（settings
+    /// 键 `agentTools.mcpAdjudication` / `agentTools.serviceProxyAdjudication`
+    /// = standard 时对该来源动态条目降 Standard）。按 manifest.source 匹配
+    /// 遍历覆写——静态条目分级以静态表为准不在射程（防降级）；仅装配期
+    /// 调用，运行时分级不可变。
+    pub fn set_adjudication_for_source(
+        &mut self,
+        source: crate::agent::tool_manifest::ToolSource,
+        class: crate::agent::tool_manifest::AdjudicationClass,
+    ) {
+        let map = Arc::make_mut(&mut self.tools);
+        for entry in map.values_mut() {
+            if entry.manifest.source == source {
+                entry.manifest.adjudication_class = class;
+            }
         }
     }
 

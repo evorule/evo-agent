@@ -597,6 +597,10 @@ fn path_scope(
 ///
 /// 历史:原手工 const 表(GOVERNANCE_ADJUDICATION_TOOLS 24 项)已由
 /// manifest 静态表取代——手工表与注册面两张皮的漂移从机制上消灭。
+///
+/// D6 终态(2026-10-06):本函数保持**纯静态查询**语义(P2 管道判定已迁
+/// [`crate::agent::tool_manifest::is_p2_adjudicated_runtime`]——静态优先
+/// 防降级 ∪ 动态按 runtime manifest);快照守卫测试的消费面不变。
 pub fn is_governance_adjudication_tool(tool_name: &str) -> bool {
     crate::agent::tool_manifest::lookup_static(tool_name)
         .map(|m| m.is_p2_adjudicated())
@@ -605,17 +609,22 @@ pub fn is_governance_adjudication_tool(tool_name: &str) -> bool {
 
 /// P2:解析治理级工具调用的意图规范字段(纯函数,宪法 §七「规范字段生产」)
 ///
-/// 分级表未命中 → None(零开销路径)。file 族(file_create/file_move/file_delete)
-/// 附加 target_scope([`path_scope`] 快筛;file_move 对 path+target_dir 双字段
-/// 判定,任一越界即 out_of_sandbox,其余字段全 None 时无 scope 字段);其余治理
-/// 工具无 scope 字段(拦截条件由规则种子自行定义,首批=放行留痕)。args 经
-/// 脱敏+截断(与 P1 轨迹同纪律:SENSITIVE_KEYS redact+体积上限)。
+/// P2 派生判定 = [`crate::agent::tool_manifest::is_p2_adjudicated_runtime`]
+/// (D6 终态:静态优先防降级 ∪ 动态按 runtime manifest)——`runtime` 传管道
+/// 阶段①查得的 manifest(生产消费点 pipeline P2 段);`None` 退化为纯静态
+/// 语义(既有测试与静态查询面)。分级表未命中 → None(零开销路径)。file 族
+/// (file_create/file_move/file_delete)附加 target_scope([`path_scope`])
+/// 快筛;file_move 对 path+target_dir 双字段判定,任一越界即
+/// out_of_sandbox,其余字段全 None 时无 scope 字段);其余治理工具无 scope
+/// 字段(拦截条件由规则种子自行定义,首批=放行留痕)。args 经脱敏+截断
+/// (与 P1 轨迹同纪律:SENSITIVE_KEYS redact+体积上限)。
 pub fn resolve_tool_intent(
     tool_name: &str,
     args: &Value,
     boundary: Option<&crate::agent::definition::CapabilityBoundary>,
+    runtime: Option<&crate::agent::tool_manifest::ToolManifest>,
 ) -> Option<Value> {
-    if !is_governance_adjudication_tool(tool_name) {
+    if !crate::agent::tool_manifest::is_p2_adjudicated_runtime(tool_name, runtime) {
         return None;
     }
     let mut intent = serde_json::json!({ "tool_name": tool_name });
