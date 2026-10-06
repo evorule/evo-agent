@@ -1095,6 +1095,30 @@ async fn test_react_loop_llm_request_carries_tools_schema() {
         )),
         sse_line(&json!({"type": "Stable"})),
     );
+    // ── P2 裁决通道 mock 链（file_write 静态分级 Sentineled → 工具调用前走
+    // 意图裁决）：裁决会话经 create_session 建立且 body 含 kind=intent_adjudication，
+    // 按该词条件匹配路由到独立会话 888（与主会话 777 的 mock 隔离；session_id
+    // 须为数字——client 端 as_u64 解析）；state 带 version（裁决 version 判据
+    // 读），command?wait=true 带 accepted:true（放行语义，file_write 照常执行）。
+    let adj_create = server
+        .mock("POST", "/api/sessions")
+        .match_body(mockito::Matcher::Regex("intent_adjudication".to_string()))
+        .with_status(200)
+        .with_body(r#"{"session_id":888}"#)
+        .create_async()
+        .await;
+    let adj_state = server
+        .mock("GET", "/api/sessions/888/state")
+        .with_status(200)
+        .with_body(r#"{"version":1}"#)
+        .create_async()
+        .await;
+    let adj_command = server
+        .mock("POST", "/api/sessions/888/command?wait=true")
+        .with_status(200)
+        .with_body(r#"{"accepted":true}"#)
+        .create_async()
+        .await;
     // ①指令面:submit_command 必须携带工具 schema
     let cmd_mock = server
         .mock("POST", "/api/sessions/777/command")
@@ -1146,6 +1170,9 @@ async fn test_react_loop_llm_request_carries_tools_schema() {
     // ①指令面 schema 注入命中
     cmd_mock.assert_async().await;
     state_mock.assert_async().await;
+    // P2 裁决通道真实走通（file_write 意图裁决：创建会话+同步放行裁决各 1 次）
+    adj_create.assert_async().await;
+    adj_command.assert_async().await;
     // file_write 真实落盘
     let written = std::fs::read_to_string(dir.path().join("workspace/expenses_2026.json"))
         .expect("file_write must have created the file");
