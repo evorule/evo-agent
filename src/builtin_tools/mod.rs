@@ -628,9 +628,11 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                           last_read, writes_after }. is_stale is computed from this \
                           session's own action trace only — true means the file was \
                           written after your most recent read of it in this session \
-                          (writes_after lists those writes). Modifications made outside \
-                          this session are NOT tracked. Returns current content so you \
-                          can refresh your memory in one call."
+                          (writes_after lists those writes). last_read.trace_seq is the \
+                          tool-trace index (0-based, same domain as query_trace entries), \
+                          NOT the journal seq. Modifications made outside this session \
+                          are NOT tracked. Returns current content so you can refresh \
+                          your memory in one call."
                 .to_string(),
             parameters: vec![ParameterSpec {
                 name: "path".to_string(),

@@ -345,27 +345,27 @@ impl ToolFunction for ReadBackTool {
 
         // 1. staleness 判定（会话内纯轨迹推算）：最近一次 file_read 之后
         //    是否有对该路径的写（file_write/file_create/file_delete 命中
-        //    path；file_move 命中源 path 或合成目标）
+        //    path；file_move 命中源 path 或合成目标）。锚=trace_seq（轨迹
+        //    collector 内部 0 起序号，与 query_trace 输出同域）——trace 条目
+        //    无 journal seq/ts，不得伪造（E2E 修正：原形态输出 seq/ts 会被
+        //    误读为 journal 全局账锚，ts 恒为缺省 0）
         let entries = self.deps.trace_snapshot()?;
-        let mut last_read: Option<(i64, u64)> = None;
+        let mut last_read: Option<i64> = None;
         let mut writes_after: Vec<Value> = Vec::new();
         for e in &entries {
             let tool = e.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
             let paths = touched_paths(e);
             let is_read = READ_TOOLS.contains(&tool) && paths.iter().any(|p| *p == norm);
             let is_write = WRITE_TOOLS.contains(&tool) && paths.iter().any(|p| *p == norm);
+            let entry_seq = e.get("seq").and_then(|v| v.as_i64()).unwrap_or(-1);
             if is_read {
-                last_read = Some((
-                    e.get("seq").and_then(|v| v.as_i64()).unwrap_or(-1),
-                    e.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
-                ));
+                last_read = Some(entry_seq);
                 // 读本身刷新判定基线；其后的写才构成 stale
                 writes_after.clear();
             } else if is_write {
                 if last_read.is_some() {
                     writes_after.push(json!({
-                        "seq": e.get("seq").and_then(|v| v.as_i64()).unwrap_or(-1),
-                        "ts": e.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
+                        "trace_seq": entry_seq,
                         "tool": tool,
                     }));
                 }
@@ -420,7 +420,7 @@ impl ToolFunction for ReadBackTool {
         Ok(json!({
             "path": raw_path,
             "is_stale": is_stale,
-            "last_read": last_read.map(|(seq, ts)| json!({"seq": seq, "ts": ts})),
+            "last_read": last_read.map(|seq| json!({"trace_seq": seq})),
             "writes_after": writes_after,
             "content": content,
             "content_bytes": content_bytes,
@@ -576,7 +576,7 @@ mod tests {
             .expect("read_back must succeed");
         assert!(!out["is_stale"].as_bool().unwrap());
         assert_eq!(out["content"], "hello");
-        assert_eq!(out["last_read"]["seq"], 0);
+        assert_eq!(out["last_read"]["trace_seq"], 0);
         assert!(out["writes_after"].as_array().unwrap().is_empty());
     }
 
@@ -600,7 +600,7 @@ mod tests {
             .expect("read_back must succeed");
         assert!(out["is_stale"].as_bool().unwrap());
         assert_eq!(out["writes_after"][0]["tool"], "file_write");
-        assert_eq!(out["writes_after"][0]["seq"], 2);
+        assert_eq!(out["writes_after"][0]["trace_seq"], 2);
         assert_eq!(out["content"], "v2", "content must be current on-disk text");
     }
 
