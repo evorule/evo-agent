@@ -14,8 +14,9 @@
 //! ## 设计(四不变式)
 //! - 意图指令形态不变:仍是中性 `set meta_tool.pending_target_scope`
 //!   (机制层生产规范字段、规则层裁决,宪法 §七分工不变);
-//! - R1 规则资产零改动;fail-closed 不变:version 未推进=拦截,传输错误
-//!   =失效重建一次重试,仍失败 fail-fast 上抛;
+//! - R1 规则资产零改动;fail-closed 不变:wait=true 同步结论优先
+//!   (accepted=false=显式拦截/true=受理),降级回退 version 轮询
+//!   (未推进=拦截),传输错误=失效重建一次重试,仍失败 fail-fast 上抛;
 //! - workflow 场景零改动:phase 门/marks 继续走主会话
 //!   `submit_signal_and_await_verdict`,本通道只服务 ReAct 工具意图。
 //!
@@ -29,7 +30,8 @@ use serde_json::Value;
 
 use crate::api::evorule_client::EvoruleApiClient;
 
-/// 轮询窗口(与主会话裁决原语同参:20×50ms=1s;裁决会话无在途 io,
+/// 回退轮询窗口(与主会话裁决原语同参:20×50ms=1s;仅 wait=true 未落定/
+/// 传输错误时启用——正常路径同步结论毫秒级返回,裁决会话无在途 io,
 /// 引擎毫秒级推进,1s 上限宽裕)
 const VERDICT_POLLS: usize = 20;
 const VERDICT_INTERVAL_MS: u64 = 50;
@@ -97,13 +99,26 @@ impl AdjudicationChannel {
     }
 
     /// 单次裁决尝试(不含重试)。`Err` = 感知通道故障(传输错误)。
+    ///
+    /// wait=true 同步裁决优先: 结论事实落链后应答(毫秒级, 拦截有显式
+    /// Violation 确认)。accepted 缺失(WAIT_TIMEOUT 降级/旧版 server 无
+    /// wait 支持)或 wait 请求传输错误 → 回退既有 version 轮询判据
+    /// (before 保留在提交前, 回退路径判据连续); 轮询内的传输错误照常
+    /// 上抛, 由 await_verdict 走 reset 重建重试(fail-closed 不变)。
     async fn try_verdict(&mut self, command: &Value) -> Result<bool, String> {
         let session_id = self.ensure_session().await?;
         let before = self.session_version(&session_id).await?;
-        self.client
-            .submit_command(&session_id, command)
-            .await
-            .map_err(|e| e.to_string())?;
+        match self.client.submit_command_wait(&session_id, command).await {
+            Ok(resp) => {
+                if let Some(accepted) = resp.get("accepted").and_then(|v| v.as_bool()) {
+                    return Ok(accepted);
+                }
+                tracing::debug!("wait=true verdict not settled; falling back to version polling");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "wait=true submit failed; falling back to version polling");
+            }
+        }
         for _ in 0..VERDICT_POLLS {
             tokio::time::sleep(std::time::Duration::from_millis(VERDICT_INTERVAL_MS)).await;
             if self.session_version(&session_id).await? > before {
@@ -199,7 +214,7 @@ mod tests {
             .create_async()
             .await;
         let m_cmd = server
-            .mock("POST", "/api/sessions/77/command")
+            .mock("POST", "/api/sessions/77/command?wait=true")
             .with_status(200)
             .with_body("{}")
             .create_async()
@@ -251,7 +266,7 @@ mod tests {
             .create_async()
             .await;
         let _m_cmd = server
-            .mock("POST", "/api/sessions/77/command")
+            .mock("POST", "/api/sessions/77/command?wait=true")
             .with_status(200)
             .with_body("{}")
             .expect(2)
@@ -291,7 +306,7 @@ mod tests {
             .create_async()
             .await;
         server
-            .mock("POST", "/api/sessions/77/command")
+            .mock("POST", "/api/sessions/77/command?wait=true")
             .with_status(200)
             .with_body("{}")
             .create_async()
@@ -347,7 +362,7 @@ mod tests {
             .create_async()
             .await;
         let m_cmd78 = server
-            .mock("POST", "/api/sessions/78/command")
+            .mock("POST", "/api/sessions/78/command?wait=true")
             .with_status(200)
             .with_body("{}")
             .create_async()
@@ -396,5 +411,163 @@ mod tests {
             "error must mark the reset-retry semantics, got: {}",
             msg
         );
+    }
+
+    // ===== wait=true 同步裁决路径（PR-9）=====
+
+    /// wait=true 同步结论 accepted=true → 短路放行, 不进入轮询
+    /// (state mock 仅 before 一次, 轮询发生即 404 失败)
+    #[tokio::test]
+    async fn adjudication_wait_true_accepted_short_circuits_polling() {
+        let mut server = mockito::Server::new_async().await;
+        let mut ch = AdjudicationChannel::new(make_client(&server), "tester");
+
+        server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_body(r#"{"session_id": 77}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/sessions/77/state")
+            .with_status(200)
+            .with_body(r#"{"version": 0}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let m_cmd = server
+            .mock("POST", "/api/sessions/77/command?wait=true")
+            .with_status(200)
+            .with_body(r#"{"success":true,"fact_id":30001,"accepted":true,"violation":null}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let allowed = ch
+            .await_verdict(&intent_like("in_sandbox"), Some("42"))
+            .await
+            .expect("wait verdict must not fail");
+        assert!(allowed, "accepted=true must be read as allow");
+        m_cmd.assert_async().await;
+    }
+
+    /// wait=true 同步结论 accepted=false + violation → 显式拦截, 不进入轮询
+    /// (既有轮询只能靠超时推断拦截, wait 补齐该缺口)
+    #[tokio::test]
+    async fn adjudication_wait_true_violation_blocks_without_polling() {
+        let mut server = mockito::Server::new_async().await;
+        let mut ch = AdjudicationChannel::new(make_client(&server), "tester");
+
+        server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_body(r#"{"session_id": 77}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/sessions/77/state")
+            .with_status(200)
+            .with_body(r#"{"version": 0}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let m_cmd = server
+            .mock("POST", "/api/sessions/77/command?wait=true")
+            .with_status(200)
+            .with_body(
+                r#"{"success":true,"fact_id":30001,"accepted":false,
+                    "violation":{"rule_index":0,"reason":"out of sandbox"},"code":"RULE_VIOLATION"}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let allowed = ch
+            .await_verdict(&intent_like("out_of_sandbox"), Some("42"))
+            .await
+            .expect("wait verdict must not fail");
+        assert!(!allowed, "accepted=false must be read as blocked");
+        m_cmd.assert_async().await;
+    }
+
+    /// wait=true 应答 accepted=null(WAIT_TIMEOUT 降级) → 回退既有轮询判据
+    #[tokio::test]
+    async fn adjudication_wait_timeout_falls_back_to_polling() {
+        let mut server = mockito::Server::new_async().await;
+        let mut ch = AdjudicationChannel::new(make_client(&server), "tester");
+
+        server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_body(r#"{"session_id": 77}"#)
+            .create_async()
+            .await;
+        // before=v0, 回退轮询第 1 拍命中 v1 → 放行
+        let _m_state_0 = server
+            .mock("GET", "/api/sessions/77/state")
+            .with_status(200)
+            .with_body(r#"{"version": 0}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _m_state_1 = server
+            .mock("GET", "/api/sessions/77/state")
+            .with_status(200)
+            .with_body(r#"{"version": 1}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/sessions/77/command?wait=true")
+            .with_status(200)
+            .with_body(
+                r#"{"success":true,"fact_id":30001,"accepted":null,"code":"WAIT_TIMEOUT"}"#,
+            )
+            .create_async()
+            .await;
+
+        let allowed = ch
+            .await_verdict(&intent_like("in_sandbox"), Some("42"))
+            .await
+            .expect("fallback verdict must not fail");
+        assert!(allowed, "fallback polling must read version advance");
+    }
+
+    /// wait=true 请求传输错误(500) → 回退既有轮询判据(不 reset——
+    /// 提交可能已落链; 轮询内传输错误才由 await_verdict reset 重建)
+    #[tokio::test]
+    async fn adjudication_wait_transport_error_falls_back_to_polling() {
+        let mut server = mockito::Server::new_async().await;
+        let mut ch = AdjudicationChannel::new(make_client(&server), "tester");
+
+        server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_body(r#"{"session_id": 77}"#)
+            .create_async()
+            .await;
+        let _m_state_0 = server
+            .mock("GET", "/api/sessions/77/state")
+            .with_status(200)
+            .with_body(r#"{"version": 3}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _m_state_1 = server
+            .mock("GET", "/api/sessions/77/state")
+            .with_status(200)
+            .with_body(r#"{"version": 4}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/sessions/77/command?wait=true")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let allowed = ch
+            .await_verdict(&intent_like("in_sandbox"), Some("42"))
+            .await
+            .expect("fallback verdict must not fail");
+        assert!(allowed, "fallback polling must read version advance");
     }
 }

@@ -1496,7 +1496,7 @@ async fn test_g13_cache_hit_reruns_adjudication_for_p2_tools() {
         .create_async()
         .await;
     let m_cmd = server
-        .mock("POST", "/api/sessions/77/command")
+        .mock("POST", "/api/sessions/77/command?wait=true")
         // 线格式信封:submit_command 以 {"instruction": command} 包装,
         // PartialJson 子集匹配递归生效,意图判据锚在 instruction.params.attr
         .match_body(mockito::Matcher::PartialJson(serde_json::json!({
@@ -1630,7 +1630,7 @@ async fn mcp_dynamic_tool_produces_intent_adjudication() {
         .create_async()
         .await;
     let m_cmd = server
-        .mock("POST", "/api/sessions/77/command")
+        .mock("POST", "/api/sessions/77/command?wait=true")
         .match_body(mockito::Matcher::PartialJson(serde_json::json!({
             "instruction": { "params": { "attr": "meta_tool.pending_tool_intent" } }
         })))
@@ -1674,7 +1674,7 @@ async fn downgraded_dynamic_tool_executes_without_intent() {
     // 意图提交端点 expect(0):降档后不得有任何 pending_tool_intent 提交
     // (路径固定 77——降档生效时本端点零请求,expect(0) 即回归锚)
     let m_cmd = server
-        .mock("POST", "/api/sessions/77/command")
+        .mock("POST", "/api/sessions/77/command?wait=true")
         .match_body(mockito::Matcher::PartialJson(serde_json::json!({
             "instruction": { "params": { "attr": "meta_tool.pending_tool_intent" } }
         })))
@@ -2911,7 +2911,7 @@ async fn first_round_intent_goes_through_adjudication_channel() {
         .create_async()
         .await;
     let m_cmd = server
-        .mock("POST", "/api/sessions/77/command")
+        .mock("POST", "/api/sessions/77/command?wait=true")
         .match_body(mockito::Matcher::PartialJson(serde_json::json!({
             "instruction": intent_signal("out_of_sandbox")
         })))
@@ -2977,7 +2977,7 @@ async fn blocked_intent_inside_boundary_uses_form_reason() {
         .create_async()
         .await;
     server
-        .mock("POST", "/api/sessions/78/command")
+        .mock("POST", "/api/sessions/78/command?wait=true")
         .match_body(mockito::Matcher::PartialJson(serde_json::json!({
             "instruction": intent_signal("out_of_sandbox")
         })))
@@ -3205,7 +3205,7 @@ async fn p2_blocked_intent_prevents_execution() {
         "/outside/x.txt"
     };
     let m_cmd = server
-        .mock("POST", "/api/sessions/78/command")
+        .mock("POST", "/api/sessions/78/command?wait=true")
         .match_body(mockito::Matcher::PartialJson(serde_json::json!({
             "instruction": {
                 "type": "set",
