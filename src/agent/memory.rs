@@ -4648,6 +4648,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_lifecycle_concurrent_same_key_versions_chain_order_deterministic() {
+        // 生命周期边界声明批(批次六/K-02):同 key 两版本并发写——视图层
+        // last-wins(version 高者胜)且重放确定(重跑同序)
+        let dir = std::env::temp_dir().join(format!("lc-ns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(crate::agent::lexstore::LexStore::open(
+            &dir.join("lc.db"),
+        )
+        .unwrap());
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        mgr.set_lex_store(store.clone());
+        // 并发语义模型:同 path 两版本(版本号即链序)先后入索引
+        let mk = |v: u64, val: &str| {
+            (
+                v,
+                format!("shared.ns.stable.k",),
+                serde_json::json!({"key": "k", "value": val, "timestamp": 1000 + v}),
+            )
+        };
+        let rows = vec![mk(1, "旧值"), mk(2, "新值")];
+        store.replace_partition("shared.ns.stable.", &rows).unwrap();
+        // 视图层 last-wins:重放两次结果一致(链序确定可重放)
+        let first = store.cached_facts("shared.ns.stable.", 60).unwrap();
+        let second = store.cached_facts("shared.ns.stable.", 60).unwrap();
+        assert_eq!(first.len(), second.len());
+        assert_eq!(first[0].fact_id, second[0].fact_id);
+        // 高版本胜(链序定序)
+        let winner = first.iter().find(|f| f.fact_id == 2).unwrap();
+        assert_eq!(winner.value["value"], "新值");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_namespace_isolation_undeclared_shared_invisible() {
+        // 生命周期边界声明批(批次六/K-13):ns 隔离为默认——未声明共享的
+        // 双 ns 互不可见(a 的 recall 永不触 b 前缀,b 的 recall 不见 a 内容)
+        let dir = std::env::temp_dir().join(format!("lc-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_a = std::sync::Arc::new(crate::agent::lexstore::LexStore::open(
+            &dir.join("a.db"),
+        )
+        .unwrap());
+        let store_b = std::sync::Arc::new(crate::agent::lexstore::LexStore::open(
+            &dir.join("b.db"),
+        )
+        .unwrap());
+        store_a
+            .replace_partition(
+                "shared.a.stable.",
+                &vec![(
+                    1u64,
+                    "shared.a.stable.k".to_string(),
+                    serde_json::json!({"key": "k", "value": "甲的机密", "timestamp": 1}),
+                )],
+            )
+            .unwrap();
+        store_b
+            .replace_partition(
+                "shared.b.stable.",
+                &vec![(
+                    2u64,
+                    "shared.b.stable.k".to_string(),
+                    serde_json::json!({"key": "k", "value": "乙的内容", "timestamp": 2}),
+                )],
+            )
+            .unwrap();
+        let mut mgr_a = MemoryManager::new("a", make_test_client());
+        mgr_a.set_lex_store(store_a);
+        let ctx_a = mgr_a.recall_context("探查", 3, 3).await;
+        let a_values: Vec<&str> = ctx_a.stable.iter().map(|r| r.value.as_str()).collect();
+        assert!(a_values.contains(&"甲的机密"));
+        assert!(!a_values.contains(&"乙的内容"), "ns 隔离:a 不见 b");
+
+        let mut mgr_b = MemoryManager::new("b", make_test_client());
+        mgr_b.set_lex_store(store_b);
+        let ctx_b = mgr_b.recall_context("探查", 3, 3).await;
+        let b_values: Vec<&str> = ctx_b.stable.iter().map(|r| r.value.as_str()).collect();
+        assert!(b_values.contains(&"乙的内容"));
+        assert!(!b_values.contains(&"甲的机密"), "ns 隔离:b 不见 a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tokenize_chinese_goal_regression_baseline() {
+        // 检索质量观测批(K-12)防线:中文 goal 经分词必须产出 >1 token——
+        // 单词兜底陷阱(整句吞成一个 token→检索永不命中)的回归基线
+        for goal in [
+            "部署服务",
+            "修复登录超时问题并验证",
+            "配置数据库连接池参数",
+        ] {
+            let tokens = tokenize_for_match(goal);
+            assert!(
+                tokens.len() > 1,
+                "中文 goal '{goal}' 分词退化(产出 {} token)——分词器回归",
+                tokens.len()
+            );
+        }
+        // 分词回归基线:同一输入 tokens 集合确定性(排序后逐字节一致)
+        let a = {
+            let mut t = tokenize_for_match("部署服务并验证构建产物");
+            t.sort();
+            t
+        };
+        let b = {
+            let mut t = tokenize_for_match("部署服务并验证构建产物");
+            t.sort();
+            t
+        };
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
     async fn test_promote_gate_disabled_is_mechanical() {
         // 门控关(缺省)=机械复制既有行为:合格 Captured 直接 Promoted
         let mut mgr = MemoryManager::new("ns", make_test_client());

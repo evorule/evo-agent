@@ -216,6 +216,15 @@ pub enum JournalEvent {
         /// wire 字节长度(与 hash 组成完整性校验对)
         wire_len: usize,
     },
+    /// 召回集观测（检索质量观测批 K-11 观测级）：每次 recall 的命中集
+    /// （"层@序:key" 条目，排序位即分位）。ground truth 判据列二期，
+    /// 先积累数据（context-inspector A/B 面读取展示）
+    RecallSet {
+        /// 会话 ID
+        session: String,
+        /// 命中集条目（"层@序:key" 格式）
+        hits: Vec<String>,
+    },
     /// 崩溃标记(P2 resume 检测到尾部无 turn_ended 后补写,运行时不写)
     SessionCrashed {
         /// 崩溃原因
@@ -631,6 +640,15 @@ impl JournalWriter {
     }
 
     /// 治理裁决输出(judgement_id 由本事件 seq 确定性合成)
+    /// 召回集观测落账(检索质量观测批 K-11 观测级;每会话 recall 后调用,
+    /// journal 在位才落——ground truth 判据列二期,先积累数据)。
+    pub fn recall_set(&self, session: &str, hits: Vec<String>) -> Result<u64, JournalError> {
+        self.push(JournalEvent::RecallSet {
+            session: session.to_string(),
+            hits,
+        })
+    }
+
     /// wire blob 过期标记落账(journal 体积治理批;离线 GC 经 writer 追加,
     /// 复用活跃写者锁=并发安全)。best-effort 调用方决定失败处置。
     pub fn wire_blob_expired(
@@ -965,6 +983,38 @@ fn truncate_text(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_recall_set_event_roundtrip() {
+        // 检索质量观测批 K-11:事件落账+读回(观测级)
+        let dir = std::env::temp_dir().join(format!("jf-recall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-recall").unwrap();
+            w.recall_set(
+                "s-recall",
+                vec![
+                    "stable@1:k.a".to_string(),
+                    "summaries@1:s1".to_string(),
+                    "events@1:e1".to_string(),
+                ],
+            )
+            .unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-recall")).unwrap();
+        let mut seen = Vec::new();
+        for l in lines {
+            if let JournalEvent::RecallSet { session, hits } = l.event {
+                seen.push((session, hits));
+            }
+        }
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "s-recall");
+        assert_eq!(seen[0].1.len(), 3);
+        assert_eq!(seen[0].1[0], "stable@1:k.a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_gc_wire_blobs_tiered_retention() {
