@@ -781,7 +781,9 @@ async fn run_agent(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .with_capability_boundary(capability_boundary);
+    .with_capability_boundary(capability_boundary)
+    // 查账工具族接线（PR-11a）：以本会话态重绑 handler 内查账工具实例
+    .wire_accounting(&state.workdir);
     // G8:注入审批决策端(人工审查开合)——定义级 approval_mode=auto_policy 时
     // 走 PolicyApproval 判定式决策端(无人值守,理由必产);manual 态维持本端点
     // 既定行为(不注入=缺省拒绝,安全优先,行为零变化)
@@ -938,6 +940,8 @@ async fn run_agent_stream(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .with_capability_boundary(capability_boundary)
+    // 查账工具族接线（PR-11a）：以本会话态重绑 handler 内查账工具实例
+    .wire_accounting(&state.workdir)
     // G8:注入审批决策端(人工审查开合)——定义级 approval_mode=auto_policy 时
     // 走 PolicyApproval 判定式决策端(无人值守,理由必产);否则 HttpApproval
     // 60s 人工审批窗(manual 态,现状行为)

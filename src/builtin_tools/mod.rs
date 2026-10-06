@@ -4,7 +4,7 @@
 //! 内置工具(0.2.0:file_read / file_list / file_write / file_create /
 //! file_move / file_delete / search_files / grep_files / shell_exec /
 //! http_get / git_status / git_diff / git_log / git_stage / git_commit /
-//! read_skill)
+//! read_skill / query_journal / query_trace / read_back / diff_runs)
 //!
 //! 注:`read_skill`(skills 装配 B2)不在 default_safe_toolkit 静态注册——
 //! 其技能表来自 agent definition 的 skills 声明(声明非空时由 serve_tools::
@@ -43,6 +43,7 @@
 //!
 //! 默认是"宁可功能少,也不可被滥用"。
 
+pub mod accounting;
 pub mod delegate_tool;
 pub mod file_create;
 pub mod file_delete;
@@ -150,6 +151,26 @@ pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
     handler.register_static(
         "git_commit",
         Arc::new(git_tools::GitCommitTool::new(workdir_buf.clone())),
+    );
+    // 查账工具族（PR-11a）：以未接线 deps 注册占位实例（进程级 toolkit
+    // 单例）；runner 构造后经 AgentRunner::wire_accounting(workdir) 以本
+    // 会话态重绑——未接线的实例被调用时如实报错，不静默返回空账
+    let acc_deps = accounting::AccountingDeps::unwired_placeholder(&workdir_buf);
+    handler.register_static(
+        "query_journal",
+        Arc::new(accounting::QueryJournalTool::new(acc_deps.clone())),
+    );
+    handler.register_static(
+        "query_trace",
+        Arc::new(accounting::QueryTraceTool::new(acc_deps.clone())),
+    );
+    handler.register_static(
+        "read_back",
+        Arc::new(accounting::ReadBackTool::new(acc_deps.clone())),
+    );
+    handler.register_static(
+        "diff_runs",
+        Arc::new(accounting::DiffRunsTool::new(acc_deps)),
     );
     handler
 }
@@ -521,6 +542,146 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     .to_string(),
                 required: true,
             }],
+        },
+        ToolSpec {
+            name: "query_journal".to_string(),
+            description: "Query this session's journal (the append-only action ledger). \
+                          Returns journal lines (seq/timestamp/event type/payload fields) \
+                          filtered by turn number, starting seq, or event type. Use it to \
+                          recall what happened earlier in the session (tool calls, LLM \
+                          rounds, approvals, verdicts) without re-reading everything. \
+                          Read-only; the query itself is also recorded in the ledger."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "turn".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Only events of this turn (1-based turn number)".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "since_seq".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Only events with seq >= this value".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "type".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Only events of this type (e.g. \"tool_invoked\", \
+                                  \"tool_result\", \"turn_started\", \"policy_judged\")"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "limit".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Max events returned, newest last (default 100, max 500)"
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "query_trace".to_string(),
+            description: "Query this session's tool-call trace (per-call records with \
+                          status/duration/args). Filter by tool name, status (ok/error/\
+                          blocked_by_governance/killed) or starting seq. Use it to check \
+                          what a previous tool call actually did and how it ended — e.g. \
+                          find the exact error output of the last failed command. \
+                          Read-only; the query itself is also recorded."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "tool".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Only calls of this tool (e.g. \"shell_exec\")".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "status".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Only calls with this status (ok | error | \
+                                  blocked_by_governance | killed)"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "from_seq".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Only trace entries with seq >= this value".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "limit".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Max entries returned, newest last (default 100, max 500)"
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "read_back".to_string(),
+            description: "Re-read a file's CURRENT on-disk content and judge whether your \
+                          earlier knowledge of it is stale: returns { content, is_stale, \
+                          last_read, writes_after }. is_stale is computed from this \
+                          session's own action trace only — true means the file was \
+                          written after your most recent read of it in this session \
+                          (writes_after lists those writes). Modifications made outside \
+                          this session are NOT tracked. Returns current content so you \
+                          can refresh your memory in one call."
+                .to_string(),
+            parameters: vec![ParameterSpec {
+                name: "path".to_string(),
+                r#type: "string".to_string(),
+                description: "File path, relative to workdir (same semantics as file_read)"
+                    .to_string(),
+                required: true,
+            }],
+        },
+        ToolSpec {
+            name: "diff_runs".to_string(),
+            description: "Line-level structural comparison of two text snippets (pure \
+                          function). Typical use: fetch two command outputs with \
+                          query_trace (e.g. the previous failure and the current one), \
+                          then pass them as left/right to see whether this is the same \
+                          failure as last time. Returns { identical, stats, hunks } — \
+                          hunks carry tagged lines (' ' context, '-' removed, '+' added)."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "left".to_string(),
+                    r#type: "string".to_string(),
+                    description: "First text (e.g. previous run output)".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "right".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Second text (e.g. current run output)".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "left_label".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Label for the first text (default \"left\")".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "right_label".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Label for the second text (default \"right\")".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "context".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Context lines around each change hunk (default 3, max 50)"
+                        .to_string(),
+                    required: false,
+                },
+            ],
         },
     ]
 }

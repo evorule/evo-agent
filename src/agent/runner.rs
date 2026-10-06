@@ -874,6 +874,11 @@ pub struct AgentRunner {
     /// 注入;CLI run 纯路径无 journal=只 warn 不落账)。G10 摘要替换时
     /// 自动对照落 summary_fidelity_scan 事件。
     active_journal: Option<std::sync::Arc<crate::agent::journal::JournalWriter>>,
+    /// 查账工具族（PR-11a）：会话 journal 上下文共享槽——wire_accounting
+    /// 重绑的查账工具实例经此感知当前会话（journal_dir 未启用=槽保持
+    /// None，query_journal 如实报错）
+    accounting_journal:
+        std::sync::Arc<std::sync::RwLock<Option<crate::builtin_tools::accounting::JournalCtx>>>,
 }
 
 /// 管道阶段⑦执行器：runner 的 call_service 通路
@@ -949,6 +954,7 @@ impl AgentRunner {
             pipeline_entry: crate::agent::pipeline::PipelineEntry::React,
             assembly_scope_focus: false,
             active_journal: None,
+            accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -1448,6 +1454,52 @@ impl AgentRunner {
         self
     }
 
+    /// 查账工具接线（工具面统一架构 PR-11a）：以本 runner 会话态重绑
+    /// handler 内已注册的查账工具实例（进程级 toolkit 中的共享占位实例 →
+    /// per-runner 实例，与 delegate 定义级注册同型）。
+    ///
+    /// - `workdir` = read_back 沙箱根（与装配 toolkit 的 workdir 同源）；
+    /// - 轨迹句柄 = 本 runner 的 collector（Arc clone，只读快照消费）；
+    /// - journal 上下文 = 共享槽（set_session_id 时经 sync 写入）。
+    ///
+    /// handler 未注册查账工具（自定义 toolkit）时逐名跳过，零强加。
+    pub fn wire_accounting(mut self, workdir: &std::path::Path) -> Self {
+        use crate::builtin_tools::accounting::{
+            AccountingDeps, DiffRunsTool, QueryJournalTool, QueryTraceTool, ReadBackTool,
+        };
+        let deps = AccountingDeps::wired(
+            workdir,
+            self.tool_traces.clone(),
+            self.accounting_journal.clone(),
+        );
+        for name in ["query_journal", "query_trace", "read_back", "diff_runs"] {
+            if !self.tool_handler.has_tool(name) {
+                continue;
+            }
+            let func: Arc<dyn ToolFunction> = match name {
+                "query_journal" => Arc::new(QueryJournalTool::new(deps.clone())),
+                "query_trace" => Arc::new(QueryTraceTool::new(deps.clone())),
+                "read_back" => Arc::new(ReadBackTool::new(deps.clone())),
+                _ => Arc::new(DiffRunsTool::new(deps.clone())),
+            };
+            self.tool_handler.register_static(name, func);
+        }
+        self
+    }
+
+    /// journal 上下文同步到查账工具（session_id 落定点调用；journal_dir
+    /// 未启用时槽保持 None——CLI 直跑路径 query_journal 如实报错）
+    fn sync_accounting_journal(&self) {
+        if let (Some(dir), Some(sid)) = (&self.journal_dir, self.session_id.as_ref()) {
+            if let Ok(mut slot) = self.accounting_journal.write() {
+                *slot = Some(crate::builtin_tools::accounting::JournalCtx {
+                    dir: dir.clone(),
+                    session_id: sid.clone(),
+                });
+            }
+        }
+    }
+
     /// M5-a:注入生效能力边界声明(serve/CLI 层按定义或启动配置合成后传入;
     /// 注入后 run/run_streaming 会话建立时追加系统级边界段 + 随
     /// create_session initial_content 进会话事实)
@@ -1851,6 +1903,7 @@ impl AgentRunner {
             .create_session(boundary_json.as_ref(), Some("llm"))
             .await?;
         self.session_id = Some(session_id.clone());
+        self.sync_accounting_journal();
         info!(%session_id, "Created evorule session");
 
         // G14:同步 session_id 到 MemoryEventStore(若已注入)
@@ -4108,6 +4161,7 @@ impl AgentRunner {
                 // G15:continuation — 复用已有 session,不创建新 session
                 // (session_active 守卫在下方统一创建,避免双重计数)
                 runner.session_id = Some(id.clone());
+                runner.sync_accounting_journal();
                 info!(%id, "G15: continuing existing session");
                 id
             } else {
@@ -4124,6 +4178,7 @@ impl AgentRunner {
                         // (裁决通道已不依赖它,但审计一致性/messages 持久化
                         // 等消费方需要;与 continuation 分支对齐)
                         runner.session_id = Some(id.clone());
+                        runner.sync_accounting_journal();
                         id
                     }
                     Err(e) => {

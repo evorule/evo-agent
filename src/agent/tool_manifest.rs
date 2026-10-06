@@ -291,7 +291,7 @@ impl ToolManifest {
 }
 
 // =============================================================================
-// 静态表（硬规则 2：内置 16 + 规则 46 + delegate 1 + memory 4 = 67）
+// 静态表（硬规则 2：内置 20 + 规则 46 + delegate 1 + memory 4 = 71）
 // =============================================================================
 
 /// agentTools.fileCreate（默认开）
@@ -354,7 +354,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（16 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（20 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -376,6 +376,14 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         b("git_log", vec![GitRead]),
         b("git_stage", vec![GitWrite]),
         b("git_commit", vec![GitWrite]),
+        // 查账工具族（工具面统一架构 PR-11a）：会话账面只读查询——journal
+        // 事件流/工具轨迹/文件现势+staleness/两段文本比对。全部 Standard
+        // （免裁决但落账：查账自身入账）+ AutoPolicy（查账是减错动作本身，
+        // 不加审批摩擦，设计档 §11.1）；无写面，不绑开关（与 file_read 同列）。
+        b("query_journal", vec![Governance]),
+        b("query_trace", vec![Governance]),
+        b("read_back", vec![FsRead, Governance]),
+        b("diff_runs", vec![Governance]),
         // read_skill 按 agent definition skills 声明注册（非 default_safe_toolkit
         // 静态注册），spec 常驻 default_tool_specs；来源标 Skill。
         base(
@@ -576,7 +584,7 @@ fn memory_manifests() -> Vec<ToolManifest> {
     ]
 }
 
-/// 全部静态 manifest（67 条；测试锁数量/唯一名/双侧集合相等）
+/// 全部静态 manifest（71 条；测试锁数量/唯一名/双侧集合相等）
 ///
 /// C1 性能收口（PR-3 顺手）：静态表在首次访问后经 OnceLock 缓存——
 /// 构造函数为纯函数（无常量/无环境依赖），行为零变化（调用面拿到的
@@ -694,10 +702,11 @@ mod tests {
 
     #[test]
     fn test_static_manifest_count_locked() {
-        // 内置 16 + 规则 46 + delegate 1 + memory 4 = 67
-        assert_eq!(builtin_manifests().len(), 16);
+        // 内置 20 + 规则 46 + delegate 1 + memory 4 = 71
+        // （PR-11a 查账工具族 +4：16→20，数量锁 67→71；基线+7 的 11a 步）
+        assert_eq!(builtin_manifests().len(), 20);
         assert_eq!(rule_manifests().len(), 46);
-        assert_eq!(all().len(), 67);
+        assert_eq!(all().len(), 71);
     }
 
     #[test]
