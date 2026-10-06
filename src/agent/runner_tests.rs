@@ -1596,7 +1596,7 @@ fn make_dynamic_tool_runner_on(
 
 #[tokio::test]
 async fn mcp_dynamic_tool_produces_intent_adjudication() {
-    // B1 收官判据 1(02号档 D6 方案甲):MCP 动态工具 D6 终态默认 Sensitive
+    // 动态源裁决分级判据一(来源级配置形态):MCP 动态工具终态默认 Sensitive
     // → 调用产生事前意图裁决账面。P2 派生 = is_p2_adjudicated_runtime 动态
     // 分支(静态表未命中 → runtime manifest 分级)。回归锚:mockito command
     // expect(1)——意图提交恰一次,少一次即红(免检直执行回归=分级丢失)。
