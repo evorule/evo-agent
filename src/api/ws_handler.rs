@@ -616,11 +616,8 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         };
     // S2 治理门禁段(S2 前移批):三段合并构造,经 runner 配置进组装层
     // (v2 序=权威紧跟 S1 身份段之后;不再改写 def.system_prompt——K-17②)
-    let governance_segment = crate::api::serve_tools::build_governance_segment(
-        state.evorule_client(),
-        &def.tools,
-    )
-    .await;
+    let governance_segment =
+        crate::api::serve_tools::build_governance_segment(state.evorule_client(), &def.tools).await;
     let config = def.to_agent_config();
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
         // M5-a:注入生效能力边界(声明重绑工具面 + 会话边界段/边界事实)

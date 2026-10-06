@@ -114,35 +114,38 @@ pub fn l2_feed_forward_triggered(tools: &[String]) -> bool {
 /// 时效：每次 runner 构造实时拉取（无缓存）——元规则增删下一轮即反映。
 /// 治理门禁段合并构造（S2 槽位内容物；v2 前移批迁移——段不再改写
 /// def.system_prompt，由调用方经 runner.with_governance_segment 进组装层，
-/// 渲染位次=S1 之后 S3 之前[09 号 §5.1 v2 目标序]）。三段序与文本与
+/// 渲染位次=S1 之后 S3 之前[装配序设计 §5.1 v2 目标序]）。三段序与文本与
 /// 旧 apply_* 逐字节同源：L2 约束前馈(触发+拉取+渲染) → 进化信号感知
 /// (触发+静态) → 规范入口索引(无条件)。全部为空=None。
-pub async fn build_governance_segment(
-    ev: &EvoruleApiClient,
-    tools: &[String],
-) -> Option<String> {
+pub async fn build_governance_segment(ev: &EvoruleApiClient, tools: &[String]) -> Option<String> {
     let mut seg = String::new();
     if l2_feed_forward_triggered(tools) {
         if let Ok(inv) = ev.get_l2_inventory().await {
-            if let Some(l2) =
-                crate::rule_tools::local_handlers::render_l2_inventory_summary(&inv)
-            {
-                seg.push_str("
+            if let Some(l2) = crate::rule_tools::local_handlers::render_l2_inventory_summary(&inv) {
+                seg.push_str(
+                    "
 
-");
+",
+                );
                 seg.push_str(&l2);
             }
         } else {
-            tracing::warn!("governance segment: L2 feed-forward fetch failed; continuing without injection");
+            tracing::warn!(
+                "governance segment: L2 feed-forward fetch failed; continuing without injection"
+            );
         }
-        seg.push_str("
+        seg.push_str(
+            "
 
-");
+",
+        );
         seg.push_str(EVOLUTION_AWARENESS_SEGMENT);
     }
-    seg.push_str("
+    seg.push_str(
+        "
 
-");
+",
+    );
     seg.push_str(REGULATION_INDEX_AWARENESS_SEGMENT);
     let trimmed = seg.trim().to_string();
     if trimmed.is_empty() {

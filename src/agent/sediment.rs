@@ -478,7 +478,11 @@ fn parse_consolidation(json_str: &str) -> Result<ConsolidationOut, String> {
 }
 
 /// 从账本行解析候选面（MemoryEvent JSON；payload 包裹与顶层双兼容）
-fn parse_candidate_face(path: &str, fact_id: u64, value: &serde_json::Value) -> Option<CandidateFace> {
+fn parse_candidate_face(
+    path: &str,
+    fact_id: u64,
+    value: &serde_json::Value,
+) -> Option<CandidateFace> {
     let face = value
         .get("payload")
         .and_then(|v| v.as_object())
