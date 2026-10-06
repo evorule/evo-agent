@@ -215,7 +215,7 @@ service_tools = ["config_persist", "rule_sandbox"]
 
     #[test]
     fn test_full_rule_toolkit_registers_all_45() {
-        // 验证 full_rule_toolkit 注册了全部 48 个工具（40 透传 + 5 本地逻辑 +
+        // 验证 full_rule_toolkit 注册了全部 49 个工具（40 透传 + 6 本地逻辑 +
         // 3 why/order，has_tool 逐个校验；计数与 rule_tool_specs 对齐）
         let ws = WorkspaceApiClient::new("http://localhost:0");
         let ev = EvoruleApiClient::new("http://localhost:0");

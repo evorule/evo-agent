@@ -5,7 +5,7 @@
 //! E1:serve 模式工具组装 —— union toolkit + 按白名单过滤
 //!
 //! serve 模式下 `cmd_serve` 在启动时调用 [`build_union_toolkit`] 一次,组装
-//! 内置 15 + 规则 27 = 42 个工具的 union toolkit,存入 `AgentApiState.toolkit`。
+//! 内置 15 + 规则 30 = 45 个工具的 union toolkit,存入 `AgentApiState.toolkit`。
 //!
 //! 每次 `/agents/{type}/run` 请求时,handler 调用 [`build_filtered_toolkit`]
 //! 按 `def.tools` 白名单从 union 中过滤出该 agent 可用的工具,实现安全隔离。
@@ -594,7 +594,7 @@ mod tests {
             build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
         for name in GOVERNANCE_WRITE_TOOLS {
             // 21 写工具中 11 个(sandbox/dataset/publish/bundle 族)不在 serve
-            // union 42 面(union 规则面=27,D-4 实测口径)——它们本就不被 serve,
+            // union 45 面(union 规则面=30,D-4 实测口径)——它们本就不被 serve,
             // 与开关无关;此处仅断言 union 内写工具默认不被门控。
             if !RULE_TOOL_NAMES.contains(name) {
                 continue;
@@ -712,7 +712,7 @@ mod tests {
             );
         }
 
-        // 27 个规则工具(=RULE_TOOL_NAMES 白名单)
+        // 30 个规则工具(=RULE_TOOL_NAMES 白名单)
         for name in RULE_TOOL_NAMES {
             assert!(
                 handler.has_tool(name),
@@ -721,7 +721,7 @@ mod tests {
             );
         }
 
-        // 总数 = 15 + 27 = 42(逐个验证所有预期工具都在)
+        // 总数 = 15 + 30 = 45(逐个验证所有预期工具都在)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
