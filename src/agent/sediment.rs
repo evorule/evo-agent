@@ -391,6 +391,8 @@ struct CandidateFace {
     knowledge_kind: String,
     title: String,
     body: String,
+    /// 账本 fact_id（整数 cause 链接用）
+    fact_id: u64,
 }
 
 /// 贪心聚类（确定性）：按 (kind, event_id) 序遍历，未分配者成种子，
@@ -476,7 +478,7 @@ fn parse_consolidation(json_str: &str) -> Result<ConsolidationOut, String> {
 }
 
 /// 从账本行解析候选面（MemoryEvent JSON；payload 包裹与顶层双兼容）
-fn parse_candidate_face(path: &str, value: &serde_json::Value) -> Option<CandidateFace> {
+fn parse_candidate_face(path: &str, fact_id: u64, value: &serde_json::Value) -> Option<CandidateFace> {
     let face = value
         .get("payload")
         .and_then(|v| v.as_object())
@@ -485,6 +487,7 @@ fn parse_candidate_face(path: &str, value: &serde_json::Value) -> Option<Candida
     let event_id = path.rsplit('.').next()?.to_string();
     Some(CandidateFace {
         event_id,
+        fact_id,
         knowledge_kind: content
             .get("knowledge_kind")
             .and_then(|v| v.as_str())?
@@ -530,7 +533,7 @@ async fn consolidate_knowledge_candidates(
     };
     let mut faces: Vec<CandidateFace> = Vec::new();
     for f in &facts {
-        if let Some(face) = parse_candidate_face(&f.path, &f.value) {
+        if let Some(face) = parse_candidate_face(&f.path, f.fact_id, &f.value) {
             faces.push(face);
         }
     }
@@ -1281,6 +1284,7 @@ mod tests {
             knowledge_kind: kind.to_string(),
             title: title.to_string(),
             body: body.to_string(),
+            fact_id: 0,
         };
         let cands = vec![
             face(
