@@ -755,11 +755,8 @@ async fn run_agent(
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
     // S2 治理门禁段(S2 前移批):三段合并构造,经 runner 配置进组装层
     // (v2 序=权威紧跟 S1 身份段之后;不再改写 def.system_prompt——K-17②)
-    let governance_segment = crate::api::serve_tools::build_governance_segment(
-        &state.evorule_client,
-        &def.tools,
-    )
-    .await;
+    let governance_segment =
+        crate::api::serve_tools::build_governance_segment(&state.evorule_client, &def.tools).await;
     // 人工审查开合(2026-09-28):def move 前捕获审批模式
     let approval_auto = def.approval_mode.as_deref() == Some("auto_policy");
     let runner = AgentRunner::from_definition(
@@ -906,11 +903,8 @@ async fn run_agent_stream(
     let capability_boundary =
         crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
     // S2 治理门禁段(S2 前移批):同 run_agent 口径
-    let governance_segment = crate::api::serve_tools::build_governance_segment(
-        &state.evorule_client,
-        &def.tools,
-    )
-    .await;
+    let governance_segment =
+        crate::api::serve_tools::build_governance_segment(&state.evorule_client, &def.tools).await;
     // 人工审查开合(2026-09-28):def move 前捕获审批模式(auto_policy → PolicyApproval)
     let approval_auto = def.approval_mode.as_deref() == Some("auto_policy");
     let runner = AgentRunner::from_definition(

@@ -679,7 +679,7 @@ impl AssemblyExecutor {
                 }
                 // S2_governance:治理门禁段(serve 三段合并:L2 约束前馈/
                 // 进化信号感知/规范入口索引;authority=L2 约束层,独立分区
-                // 不可降级)。v2 序=权威最高者紧跟 S1 之后(09 号 §5.1)
+                // 不可降级)。v2 序=权威最高者紧跟 S1 之后(装配序设计 §5.1)
                 "governance_segment" => {
                     if let Some(seg) = governance_segment {
                         if !seg.trim().is_empty() {
@@ -777,7 +777,7 @@ mod tests {
                 "S7_history"
             ]
         );
-        // S2 治理门禁:S2 前移批(09 号 §5.3.2 v2 目标序;不可降级,缺席合法)
+        // S2 治理门禁:S2 前移(v2 目标序;不可降级,缺席合法)
         let s2 = &r.slots[1];
         assert_eq!(s2.id, "S2_governance");
         assert!(!s2.degradable);
@@ -1014,8 +1014,7 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1025,7 +1024,18 @@ mod tests {
 
         // 场景 2:极端小窗口(60 token)强制降级通知
         let out2 = exec
-            .assemble(base, None, None, Some(&mem), &recall, 60, None, None, None, None)
+            .assemble(
+                base,
+                None,
+                None,
+                Some(&mem),
+                &recall,
+                60,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(
             out2,
@@ -1049,8 +1059,7 @@ mod tests {
                 Some(&boundary.awareness_segment()),
                 None,
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1076,8 +1085,7 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         assert_eq!(out_none, "base");
@@ -1093,8 +1101,7 @@ mod tests {
                 Some("【能力边界声明】boundary"),
                 None,
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         assert!(out_id.starts_with("base\n\n【身份资产】我是谁/服务谁/边界自述/基调"));
@@ -1113,8 +1120,7 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1151,8 +1157,7 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1187,8 +1192,7 @@ mod tests {
                 None,
                 Some(&skills),
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         assert!(out.starts_with("base\n\n"));
@@ -1219,8 +1223,7 @@ mod tests {
                 Some("【能力边界声明】boundary"),
                 Some(&skills),
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         let boundary_pos = out.find("【能力边界声明】").expect("boundary present");
@@ -1255,8 +1258,7 @@ mod tests {
                 None,
                 Some(&skills),
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1277,8 +1279,7 @@ mod tests {
                 None,
                 Some(&[]),
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1329,8 +1330,7 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         // 显式兼容口径(base=total_window,历史行为)
@@ -1353,8 +1353,7 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
-
+                None,
             )
             .unwrap();
 
@@ -1406,8 +1405,7 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         // 新配方:加载 → validate → 字段落位
@@ -1436,8 +1434,7 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
-
+                None,
             )
             .unwrap();
     }
@@ -1537,8 +1534,7 @@ mod tests {
                 None,
                 None,
                 Some(&handoff),
-            None,
-
+                None,
             )
             .unwrap();
         let stable_pos = out1
@@ -1560,8 +1556,7 @@ mod tests {
                 None,
                 None,
                 Some(&handoff),
-            None,
-
+                None,
             )
             .unwrap();
         assert!(out2.contains("## Handoff Base"));
@@ -1579,8 +1574,7 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
-
+                None,
             )
             .unwrap();
         assert_eq!(out3, "base");
@@ -1599,7 +1593,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_injection_order_golden_sample() {
-        // S2 前移批 golden v2(09 号 §5.1 v2 目标序落地):
+        // S2 前移 golden v2(装配序设计 §5.1 v2 目标序落地):
         // v2 全文序=基底 → 身份段 → 北极星锚 → 治理门禁段 → 记忆区 → …
         // (K-17 缺陷序已修正:治理段经组装层 S2_governance 独立槽位渲染,
         // 不再改写 def.system_prompt——身份段前于治理段,结构断言随 v2 翻转)。
@@ -1649,13 +1643,11 @@ mod tests {
                 "固定会话摘要。",
                 1_700_000_100,
             ));
-        recall
-            .events
-            .push(crate::agent::memory::MemoryRecord::new(
-                "golden.events.e1",
-                "固定事件。",
-                1_700_000_200,
-            ));
+        recall.events.push(crate::agent::memory::MemoryRecord::new(
+            "golden.events.e1",
+            "固定事件。",
+            1_700_000_200,
+        ));
         let mem = crate::agent::memory::MemoryManager::new(
             "golden-ns",
             crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),
@@ -1695,14 +1687,18 @@ mod tests {
         });
         if let Some(l2) = render_l2_inventory_summary(&l2_inventory) {
             governance.push_str(&l2);
-            governance.push_str("
+            governance.push_str(
+                "
 
-");
+",
+            );
         }
         governance.push_str(crate::api::serve_tools::EVOLUTION_AWARENESS_SEGMENT);
-        governance.push_str("
+        governance.push_str(
+            "
 
-");
+",
+        );
         governance.push_str(crate::api::serve_tools::REGULATION_INDEX_AWARENESS_SEGMENT);
         let full_v2 = exec
             .assemble(
@@ -1732,7 +1728,7 @@ mod tests {
         });
         assert_eq!(
             full_v2, expect_v2,
-            "golden v2 失配——注入序/配方/治理段变更必须显式重录(24 号批次七守护语义)"
+            "golden v2 失配——注入序/配方/治理段变更必须显式重录(装配守护语义)"
         );
         // v2 结构断言(相对 v1 翻转):身份段/北极星锚 前于 治理门禁段
         let identity_pos = full_v2.find(identity).unwrap();
