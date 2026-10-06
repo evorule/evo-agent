@@ -1557,6 +1557,265 @@ async fn test_g13_cache_hit_reruns_adjudication_for_p2_tools() {
     m_cmd.assert_async().await; // expect(2)=第二次调用仍产生裁决账面(A1 关闭判据)
 }
 
+// ----- D6 终态:动态源 Sensitive 分级(B1 收官批) -----
+
+/// Sensitive 动态假工具 runner(manifest 用 dynamic_manifest 真实构建,不经
+/// with_functions——裸函数便捷口显式定级 Standard,见 tool_handler 文档)
+fn make_dynamic_tool_runner_on(
+    max_parallel: usize,
+    name: &str,
+    class: crate::agent::tool_manifest::AdjudicationClass,
+    client: EvoruleApiClient,
+) -> AgentRunner {
+    struct EchoTool;
+    #[async_trait::async_trait]
+    impl ToolFunction for EchoTool {
+        async fn call(&self, _args: &serde_json::Value) -> crate::io_handler::IoResult {
+            Ok(serde_json::Value::from("echo"))
+        }
+    }
+    let mut manifest = crate::agent::tool_manifest::dynamic_manifest(
+        name,
+        crate::agent::tool_manifest::ToolSource::Mcp,
+        format!("dynamic echo tool {name}"),
+        serde_json::json!({"type": "object", "properties": {}}),
+    )
+    .expect("dynamic manifest");
+    manifest.adjudication_class = class;
+    let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+    handler.register(
+        manifest,
+        std::sync::Arc::new(EchoTool) as std::sync::Arc<dyn ToolFunction>,
+    );
+    let config = AgentConfig {
+        max_parallel_tools: max_parallel,
+        ..AgentConfig::default()
+    };
+    AgentRunner::new(config, client).with_tool_handler(handler)
+}
+
+#[tokio::test]
+async fn mcp_dynamic_tool_produces_intent_adjudication() {
+    // B1 收官判据 1(02号档 D6 方案甲):MCP 动态工具 D6 终态默认 Sensitive
+    // → 调用产生事前意图裁决账面。P2 派生 = is_p2_adjudicated_runtime 动态
+    // 分支(静态表未命中 → runtime manifest 分级)。回归锚:mockito command
+    // expect(1)——意图提交恰一次,少一次即红(免检直执行回归=分级丢失)。
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let m_create = server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_body(r#"{"session_id": 77}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let _m_state_0 = server
+        .mock("GET", "/api/sessions/77/state")
+        .with_status(200)
+        .with_body(r#"{"version": 0}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let _m_state_1 = server
+        .mock("GET", "/api/sessions/77/state")
+        .with_status(200)
+        .with_body(r#"{"version": 1}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let _m_state_2 = server
+        .mock("GET", "/api/sessions/77/state")
+        .with_status(200)
+        .with_body(r#"{"version": 2}"#)
+        .create_async()
+        .await;
+    let m_cmd = server
+        .mock("POST", "/api/sessions/77/command")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "instruction": { "params": { "attr": "meta_tool.pending_tool_intent" } }
+        })))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+
+    let runner = make_dynamic_tool_runner_on(
+        4,
+        "mcp_test_echo",
+        crate::agent::tool_manifest::AdjudicationClass::Sensitive,
+        client,
+    );
+    let tool_calls = vec![ToolCall {
+        name: "mcp_test_echo".to_string(),
+        arguments: serde_json::json!({}),
+    }];
+    let results = runner
+        .execute_tools_parallel("test-session", &tool_calls)
+        .await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].2,
+        Value::from("echo"),
+        "sensitive dynamic tool executes after adjudication"
+    );
+
+    m_create.assert_async().await;
+    m_cmd.assert_async().await; // expect(1)=意图必报(D6 终态)
+}
+
+#[tokio::test]
+async fn downgraded_dynamic_tool_executes_without_intent() {
+    // B1 收官判据 3 执行层(D7-A 方案一):人工降档 Standard 后动态工具免意图
+    // 裁决直执行(可执行性不变,裁决性收起)。回归锚:command 端点零命中——
+    // expect(0) mock + 任何意图提交即红(降档失效回归)。
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    // 意图提交端点 expect(0):降档后不得有任何 pending_tool_intent 提交
+    // (路径固定 77——降档生效时本端点零请求,expect(0) 即回归锚)
+    let m_cmd = server
+        .mock("POST", "/api/sessions/77/command")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "instruction": { "params": { "attr": "meta_tool.pending_tool_intent" } }
+        })))
+        .with_status(200)
+        .with_body("{}")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let runner = make_dynamic_tool_runner_on(
+        4,
+        "mcp_test_echo",
+        crate::agent::tool_manifest::AdjudicationClass::Standard,
+        client,
+    );
+    let tool_calls = vec![ToolCall {
+        name: "mcp_test_echo".to_string(),
+        arguments: serde_json::json!({}),
+    }];
+    let results = runner
+        .execute_tools_parallel("test-session", &tool_calls)
+        .await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].2,
+        Value::from("echo"),
+        "downgraded tool still executes (adjudication-only change)"
+    );
+
+    m_cmd.assert_async().await; // expect(0)=零意图提交(降档生效)
+}
+
+#[test]
+fn serve_assembly_switch_adjudication_orthogonal() {
+    // B1 收官判据 3 装配层:开关(在场性)×分级(裁决性)正交四态 + 静态条目
+    // 不受分级键影响(覆写只命中动态源,防降级锚=裁决点静态优先,本测试锁
+    // 装配面不泄漏)。
+    struct EchoTool;
+    #[async_trait::async_trait]
+    impl ToolFunction for EchoTool {
+        async fn call(&self, _args: &serde_json::Value) -> crate::io_handler::IoResult {
+            Ok(serde_json::Value::from("echo"))
+        }
+    }
+    let union = crate::io_handlers::tool_handler::ToolHandler::new();
+    let mcp_manifest = crate::agent::tool_manifest::dynamic_manifest(
+        "mcp_test_echo",
+        crate::agent::tool_manifest::ToolSource::Mcp,
+        "dynamic echo tool".to_string(),
+        serde_json::json!({"type": "object", "properties": {}}),
+    )
+    .expect("dynamic manifest");
+    let mut union = union;
+    union.register(
+        mcp_manifest,
+        std::sync::Arc::new(EchoTool) as std::sync::Arc<dyn ToolFunction>,
+    );
+    union.register_static(
+        "file_create",
+        std::sync::Arc::new(EchoTool) as std::sync::Arc<dyn ToolFunction>,
+    );
+    let whitelist = vec!["mcp_test_echo".to_string(), "file_create".to_string()];
+
+    // 态 1:缺省(无分级键) → 动态工具在场且 Sensitive(D6 终态默认)
+    let filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+        &union,
+        &whitelist,
+        &serde_json::Map::new(),
+    );
+    assert!(filtered.has_tool("mcp_test_echo"));
+    assert!(filtered
+        .manifest("mcp_test_echo")
+        .unwrap()
+        .is_p2_adjudicated());
+    // 静态条目不受缺省影响
+    assert!(filtered
+        .manifest("file_create")
+        .unwrap()
+        .is_p2_adjudicated());
+
+    // 态 2:分级键=standard → 动态工具仍在场(开关未触)但降 Standard
+    let mut settings = serde_json::Map::new();
+    settings.insert(
+        "agentTools.mcpAdjudication".to_string(),
+        serde_json::json!("standard"),
+    );
+    let filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+        &union, &whitelist, &settings,
+    );
+    assert!(
+        filtered.has_tool("mcp_test_echo"),
+        "downgrade must not affect presence (switch domain)"
+    );
+    assert!(
+        !filtered
+            .manifest("mcp_test_echo")
+            .unwrap()
+            .is_p2_adjudicated(),
+        "downgrade must drop dynamic tool to Standard"
+    );
+    // 静态条目分级键不泄漏:file_create(静态 Sensitive)维持原级
+    assert!(
+        filtered
+            .manifest("file_create")
+            .unwrap()
+            .is_p2_adjudicated(),
+        "adjudication key must not leak to static entries"
+    );
+
+    // 态 3:开关关 → 动态工具下线(与分级无关,在场性归开关)
+    let mut settings = serde_json::Map::new();
+    settings.insert("agentTools.mcp".to_string(), serde_json::json!(false));
+    settings.insert(
+        "agentTools.mcpAdjudication".to_string(),
+        serde_json::json!("sensitive"),
+    );
+    let filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+        &union, &whitelist, &settings,
+    );
+    assert!(
+        !filtered.has_tool("mcp_test_echo"),
+        "switch off removes the tool regardless of adjudication class"
+    );
+    assert!(
+        filtered.has_tool("file_create"),
+        "static tool unaffected by mcp switch"
+    );
+
+    // 态 4:开关关+降档同设 → 仍下线(正交:两键独立作用,无耦合放大)
+    let mut settings = serde_json::Map::new();
+    settings.insert("agentTools.mcp".to_string(), serde_json::json!(false));
+    settings.insert(
+        "agentTools.mcpAdjudication".to_string(),
+        serde_json::json!("standard"),
+    );
+    let filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+        &union, &whitelist, &settings,
+    );
+    assert!(!filtered.has_tool("mcp_test_echo"));
+}
+
 #[test]
 #[ignore = "B2 窗口期声明:主路径 focus 收窄为注册面严格子集随装配收口批次启用(工具面统一架构基准档处置台账 B2/PR-3 判据5);现状=注册面∪静态表,本测试当前必红"]
 fn b2_main_path_focus_is_strict_subset_of_registration() {
@@ -2764,19 +3023,25 @@ async fn blocked_intent_inside_boundary_uses_form_reason() {
 fn p2_non_governance_tool_produces_no_intent() {
     let b = m5c_boundary();
     assert_eq!(
-        resolve_tool_intent("file_read", &serde_json::json!({"path": "a.txt"}), Some(&b)),
+        resolve_tool_intent(
+            "file_read",
+            &serde_json::json!({"path": "a.txt"}),
+            Some(&b),
+            None
+        ),
         None
     );
     assert_eq!(
         resolve_tool_intent(
             "shell_exec",
             &serde_json::json!({"command": "ls"}),
-            Some(&b)
+            Some(&b),
+            None
         ),
         None
     );
     assert_eq!(
-        resolve_tool_intent("grep_files", &serde_json::json!({}), None),
+        resolve_tool_intent("grep_files", &serde_json::json!({}), None, None),
         None
     );
 }
@@ -2788,6 +3053,7 @@ fn p2_file_delete_intent_carries_scope_and_args() {
         "file_delete",
         &serde_json::json!({"path": "sub/a.txt"}),
         Some(&b),
+        None,
     )
     .expect("governance tool must produce intent");
     assert_eq!(intent["tool_name"], "file_delete");
@@ -2798,6 +3064,7 @@ fn p2_file_delete_intent_carries_scope_and_args() {
         "file_delete",
         &serde_json::json!({"path": "../../x"}),
         Some(&b),
+        None,
     )
     .unwrap();
     assert_eq!(out["target_scope"], "out_of_sandbox");
@@ -2816,6 +3083,7 @@ fn p2_file_move_intent_uses_both_path_fields() {
         "file_move",
         &serde_json::json!({"path": "a.txt", "target_dir": abs_out}),
         Some(&b),
+        None,
     )
     .unwrap();
     assert_eq!(intent["target_scope"], "out_of_sandbox");
@@ -2824,20 +3092,31 @@ fn p2_file_move_intent_uses_both_path_fields() {
         "file_move",
         &serde_json::json!({"path": "a.txt", "target_dir": "sub"}),
         Some(&b),
+        None,
     )
     .unwrap();
     assert_eq!(intent["target_scope"], "in_sandbox");
     // 仅 path 字段(缺 target_dir) → 以 path 为准
-    let intent =
-        resolve_tool_intent("file_move", &serde_json::json!({"path": "a.txt"}), Some(&b)).unwrap();
+    let intent = resolve_tool_intent(
+        "file_move",
+        &serde_json::json!({"path": "a.txt"}),
+        Some(&b),
+        None,
+    )
+    .unwrap();
     assert_eq!(intent["target_scope"], "in_sandbox");
 }
 
 #[test]
 fn p2_non_file_governance_tool_has_no_scope_but_args() {
     // 无边界声明:非 file 族治理工具仍上裁决(意图留痕),无 scope 字段
-    let intent =
-        resolve_tool_intent("rule_activate", &serde_json::json!({"id": "R-1"}), None).unwrap();
+    let intent = resolve_tool_intent(
+        "rule_activate",
+        &serde_json::json!({"id": "R-1"}),
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(intent["tool_name"], "rule_activate");
     assert!(intent.get("target_scope").is_none());
     assert_eq!(intent["args"]["id"], "R-1");
@@ -2848,6 +3127,7 @@ fn p2_sensitive_args_redacted_in_intent() {
     let intent = resolve_tool_intent(
         "rule_create",
         &serde_json::json!({"api_key": "SECRET-VALUE"}),
+        None,
         None,
     )
     .unwrap();

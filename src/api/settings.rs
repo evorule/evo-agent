@@ -248,6 +248,26 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.mcpAdjudication",
+            kind: SettingType::Enum,
+            default: json!("sensitive"),
+            enum_values: Some(vec!["sensitive", "standard"]),
+            range: None,
+            category: "Agent 工具",
+            description: "MCP 动态工具的裁决分级（D6 方案甲：默认 sensitive = 每次调用事前意图裁决留账；standard = 免意图裁决直执行。人工分级后可降档，分级不影响开关——agentTools.mcp 管在场性，本键管裁决性）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "agentTools.serviceProxyAdjudication",
+            kind: SettingType::Enum,
+            default: json!("sensitive"),
+            enum_values: Some(vec!["sensitive", "standard"]),
+            range: None,
+            category: "Agent 工具",
+            description: "服务代理动态工具的裁决分级（语义同 agentTools.mcpAdjudication，作用于服务代理来源）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "search.maxResults",
             kind: SettingType::Number,
             default: json!(1000),
@@ -623,7 +643,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 22);
+        assert_eq!(settings.len(), 24);
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -640,6 +660,12 @@ mod tests {
         // 动态源开关(D6 裁定方案甲):默认开 = 向后兼容,现状零行为变化
         assert_eq!(settings["agentTools.mcp"], json!(true));
         assert_eq!(settings["agentTools.serviceProxy"], json!(true));
+        // 动态源裁决分级(D6 终态+D7-A 方案一):默认 sensitive = 意图必报
+        assert_eq!(settings["agentTools.mcpAdjudication"], json!("sensitive"));
+        assert_eq!(
+            settings["agentTools.serviceProxyAdjudication"],
+            json!("sensitive")
+        );
         // search.* 全局搜索 4 键(B2 消费)
         assert_eq!(settings["search.maxResults"], json!(1000));
         assert_eq!(settings["search.smartCase"], json!(true));

@@ -36,6 +36,15 @@
 //!   派生集合演进为 25 条（重录快照须 diff 审；数量锁 67 不变——级别
 //!   变化不增减条目数）。file_write 的意图信号走 M5-c R1 通道（机制层，
 //!   由实现持有），不属 P2 分级面。
+//!
+//! **D6 终态（2026-10-06，B1 收官批）——P2 派生集合语义扩展**：从纯静态表
+//! 扩展为「静态表 ∪ 动态注册条目（class≠Standard）」，判定 =
+//! [`is_p2_adjudicated_runtime`]——静态命中分级以静态表为准（防降级：冒名
+//! 注册不改变治理分级），静态未命中按 runtime manifest（MCP/ServiceProxy
+//! 默认 Sensitive 意图必报，人工分级降档走 settings 键
+//! `agentTools.mcpAdjudication` / `agentTools.serviceProxyAdjudication`，
+//! D7-A 方案一来源级）。`GOVERNANCE_SNAPSHOT` 25 条快照锁静态面不变；
+//! 本扩展零静态表变更（数量锁 67 不变）。
 
 use serde::{Deserialize, Serialize};
 
@@ -313,6 +322,14 @@ pub const AGENT_TOOLS_MCP: &str = "agentTools.mcp";
 /// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
 /// D6 裁定同上。
 pub const AGENT_TOOLS_SERVICE_PROXY: &str = "agentTools.serviceProxy";
+/// agentTools.mcpAdjudication（默认 sensitive；D7-A 方案一：MCP 动态工具
+/// 来源级裁决分级——standard = 人工降档免意图裁决）
+///
+/// 公开常量：serve settings schema 登记与装配覆写共用此单一来源。
+pub const AGENT_TOOLS_MCP_ADJUDICATION: &str = "agentTools.mcpAdjudication";
+/// agentTools.serviceProxyAdjudication（默认 sensitive；D7-A 同上，作用域
+/// = 服务代理来源）
+pub const AGENT_TOOLS_SERVICE_PROXY_ADJUDICATION: &str = "agentTools.serviceProxyAdjudication";
 
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
@@ -596,11 +613,10 @@ fn static_manifest_table() -> &'static std::collections::BTreeMap<String, ToolMa
 /// **D6 裁定（2026-10-06 项目方批方案甲）**：动态源绑定 `agentTools.mcp` /
 /// `agentTools.serviceProxy` 开关（默认开，向后兼容；消费点 =
 /// `build_filtered_toolkit_with_switches`，关闭 = 该来源工具面整体下线）。
-/// 裁决分级维持 Standard 属**等价期暂态**——D6 终态 = 动态源 Sensitive
-/// （意图必报），但 P2 派生查静态表（`is_governance_adjudication_tool`
-/// `lookup_static().unwrap_or(false)`），本函数的分级字段对 P2 尚无消费点；
-/// 终态须随 P2 查询点扩展（静态优先防降级 ∪ 动态按 runtime manifest）
-/// 一并落地（随 PR-3/5 择机）。
+/// **D6 终态已落地**：动态源默认 `Sensitive`（意图必报）——P2 派生判定 =
+/// [`is_p2_adjudicated_runtime`]（静态优先防降级 ∪ 动态按本 manifest 分级）；
+/// 人工分级降 Standard 走 settings 键 `agentTools.mcpAdjudication` /
+/// `agentTools.serviceProxyAdjudication`（来源级，D7-A 方案一，装配层覆写）。
 pub fn dynamic_manifest(
     name: &str,
     source: ToolSource,
@@ -635,12 +651,32 @@ pub fn dynamic_manifest(
             parameters,
         },
         capability_domains: domains,
-        adjudication_class: AdjudicationClass::Standard,
+        adjudication_class: AdjudicationClass::Sensitive,
         approval_policy: ApprovalPolicy::AutoPolicy,
         default_switch,
         sandbox_scope: SandboxScope::HostSandboxed,
         timeout_class: TimeoutClass::Default,
     })
+}
+
+/// P2 派生判定（运行时形态，D6 终态）：静态优先防降级 ∪ 动态按 runtime manifest
+///
+/// 判定序（防降级锚，设计档 §12.2）：
+/// - `lookup_static` 命中 → 分级以**静态表**为准——冒名注册（静态名下挂
+///   动态 manifest）不改变治理分级（runner_tests 冒名测试的判据前提）；
+/// - 静态未命中 → 按 runtime manifest（MCP/ServiceProxy 注册期产出的
+///   分级，D6 终态默认 Sensitive，人工可降 Standard）。
+///
+/// 与 [`is_governance_adjudication_tool`]（runner，纯静态查询）的分工：本
+/// 函数消费管道阶段①查得的 runtime manifest（`PipelineDeps.manifest_of`
+/// 为 handler 优先+静态兜底——直接消费会遮蔽静态表，故本函数显式以
+/// `lookup_static` 先行）。`runtime = None` 退化为纯静态语义（与旧查询
+/// 等价）。
+pub fn is_p2_adjudicated_runtime(name: &str, runtime: Option<&ToolManifest>) -> bool {
+    match lookup_static(name) {
+        Some(static_m) => static_m.is_p2_adjudicated(),
+        None => runtime.map(|m| m.is_p2_adjudicated()).unwrap_or(false),
+    }
 }
 
 // =============================================================================

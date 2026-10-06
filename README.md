@@ -497,6 +497,19 @@ MCP 远端工具与服务代理工具为运行期动态注册（非静态工具�
 
 说明：与治理写开关同作用域语义（`application`，工作区层不可覆盖）；工具要进入某个 agent 的会话仍须其 `def.tools` 逐名声明——开关是来源级总闸，`def.tools` 是会话级聚焦。
 
+### 动态源工具裁决分级（agentTools.mcpAdjudication / agentTools.serviceProxyAdjudication）
+
+动态源工具的裁决分级独立于开关（开关管**在场性**，分级管**裁决性**，两键正交）。默认 **`sensitive`**：每次调用事前提交意图、经治理规则裁决并留账（意图必报）；人工分级后可降 `standard`（免意图裁决直执行，可执行性不变）：
+
+| 配置 | 效果 |
+|------|------|
+| `agentTools.mcpAdjudication = "sensitive"`（默认） | MCP 动态工具每次调用事前意图裁决留账 |
+| `agentTools.mcpAdjudication = "standard"` | MCP 动态工具免意图裁决直执行 |
+| `agentTools.serviceProxyAdjudication = "sensitive"`（默认） | 服务代理工具每次调用事前意图裁决留账 |
+| `agentTools.serviceProxyAdjudication = "standard"` | 服务代理工具免意图裁决直执行 |
+
+说明：同 `application` 作用域；分级键只作用于动态源条目——静态工具的治理分级以静态表为准，不受此键影响。
+
 ### 规则管理工具集（46 个）
 
 通过 `rule_management_toolkit` / `full_rule_toolkit` 组装，用于 `rule-copilot` Agent：
