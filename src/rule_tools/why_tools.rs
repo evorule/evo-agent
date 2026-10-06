@@ -93,6 +93,15 @@ fn is_violation_type(fact_type: &str) -> bool {
     fact_type.to_ascii_lowercase().contains("violation")
 }
 
+/// WAL 重载链兜底：审计条目 fact_type 失真（重载映射抹平为非违规型名）时，
+/// content_json.type 仍保留原始型别——以内容型别补充甄别。
+fn content_type_is_violation(content: &Value) -> bool {
+    content
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(is_violation_type)
+}
+
 pub struct ExplainDenialTool {
     ev: EvoruleApiClient,
 }
@@ -131,13 +140,17 @@ impl ToolFunction for ExplainDenialTool {
             .get("fact_type")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if !is_violation_type(fact_type) {
+        let content = target.get("content_json").cloned().unwrap_or(Value::Null);
+        // 双字段甄别：live 审计路径 fact_type 直接携带违规型别；WAL 重载/
+        // 归档还原路径经治理静态事实型表映射会把 fact_type 抹平，而
+        // content_json.type 保留原始型别——两字段取或，重载链上的拒绝
+        // 事实不被误拒，非违规事实（含被抹平的普通事实）仍如实拒绝。
+        if !is_violation_type(fact_type) && !content_type_is_violation(&content) {
             return Err(format!(
                 "fact {fact_id} in session {session_id} is a {fact_type:?} fact, not a \
                  violation — explain_denial only explains denial (Violation) facts"
             ));
         }
-        let content = target.get("content_json").cloned().unwrap_or(Value::Null);
         let (rule_index, reason, cause) = violation_fields(&content).ok_or_else(|| {
             format!(
                 "violation fact {fact_id} lacks structured rule_index/reason fields \
@@ -689,6 +702,61 @@ mod tests {
             err.contains("not a violation"),
             "应如实拒绝非违规事实: {err}"
         );
+    }
+
+    #[test]
+    fn explain_denial_accepts_violation_whose_fact_type_was_lost_on_reload() {
+        // WAL 重载/归档还原镜像：治理静态事实型表无违规型变体，重载链上
+        // 拒绝事实的 fact_type 被抹平——双字段甄别以 content_json.type
+        // 为准放行，拒因三字段照常解析。
+        let entries = json!([
+            {"fact_id": 5, "fact_type": "Unknown", "logical_time": 5, "cause": null,
+             "content_json": {"type": "Command", "id": 5}},
+            {"fact_id": 6, "fact_type": "Unknown", "logical_time": 6, "cause": null,
+             "content_json": {"type": "Violation", "id": 6, "cause": 5,
+                              "rule_index": 1, "reason": "reloaded denial"}}
+        ]);
+        let base = spawn_http_fixture(vec![(200, audit_report_resp(entries)), (200, rules_json())]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "explain_denial",
+            Arc::new(ExplainDenialTool::new(EvoruleApiClient::new(&base))),
+        );
+        let out = rt
+            .block_on(
+                handler
+                    .execute_by_name("explain_denial", &json!({"session_id": "42", "fact_id": 6})),
+            )
+            .unwrap();
+
+        assert_eq!(out["violation"]["rule_index"], 1);
+        assert_eq!(out["violation"]["reason"], "reloaded denial");
+        assert_eq!(out["violation"]["cause"], 5);
+    }
+
+    #[test]
+    fn explain_denial_still_rejects_non_violation_whose_fact_type_was_lost() {
+        // 甄别不是对失真型名无条件放行：内容型别同样不是违规（如被抹平的
+        // 普通指令事实）时仍如实拒绝。
+        let entries = json!([
+            {"fact_id": 5, "fact_type": "Unknown", "logical_time": 5, "cause": null,
+             "content_json": {"type": "Command", "id": 5}}
+        ]);
+        let base = spawn_http_fixture(vec![(200, audit_report_resp(entries))]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "explain_denial",
+            Arc::new(ExplainDenialTool::new(EvoruleApiClient::new(&base))),
+        );
+        let err = rt
+            .block_on(
+                handler
+                    .execute_by_name("explain_denial", &json!({"session_id": "42", "fact_id": 5})),
+            )
+            .unwrap_err();
+        assert!(err.contains("not a violation"), "应如实拒绝: {err}");
     }
 
     // =========================================================================
