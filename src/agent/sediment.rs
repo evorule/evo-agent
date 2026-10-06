@@ -370,7 +370,7 @@ pub(crate) fn build_journal_digest(session_id: &str, lines: &[JournalLine]) -> S
 
 // ===== 巩固管线（阶段 5 F-613 完整版第一增量）=====
 //
-// 11 号 §六 完整版三步的最小闭环：
+// 完整版三步的最小闭环：
 // 1. 跨会话候选加载（确定性：账本 knowledge_candidates 家族全量拉取）；
 // 2. 聚类（确定性：分词集 Jaccard ≥ 阈值贪心成簇——与矛盾裁决同函数族）；
 // 3. sidecar LLM 合并提议（purpose=knowledge_consolidation，审计在链）→
