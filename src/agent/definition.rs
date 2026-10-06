@@ -871,6 +871,9 @@ impl AgentDefinition {
             north_star: self.north_star.clone(),
             // 交接底座包直拷(同口径——声明即生效,S3 槽内渲染)
             handoff: self.handoff.clone(),
+            // 治理门禁段不在此复制——serve 三路径构造期经
+            // with_governance_segment 注入(非 definition 数据)
+            governance_segment: None,
         }
     }
 }

@@ -134,6 +134,9 @@ pub struct AgentConfig {
     /// 交接底座包(None = 不注入;声明后 S3 槽内渲染 "## Handoff Base"
     /// 结构化块——确定性底座,与滚动摘要语义面分层配对)
     pub handoff: Option<crate::agent::definition::HandoffPackage>,
+    /// 治理门禁段(S2 槽位内容物;serve 三路径构造期算好传入,CLI=None;
+    /// L2 约束前馈/进化信号感知/规范入口索引 合并段,v2 序=权威紧跟 S1)
+    pub governance_segment: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -155,6 +158,7 @@ impl Default for AgentConfig {
             identity_segment: None,
             north_star: None,
             handoff: None,
+            governance_segment: None,
         }
     }
 }
@@ -1522,6 +1526,13 @@ impl AgentRunner {
         self
     }
 
+    /// 治理门禁段注入(serve 三路径构造期传入;None=CLI 纯基底,S2 槽位
+    /// 缺席合法)。段内容=serve_tools::build_governance_segment 纯构造产物。
+    pub fn with_governance_segment(mut self, segment: Option<String>) -> Self {
+        self.config.governance_segment = segment;
+        self
+    }
+
     /// G18:追加一个事件回调
     ///
     /// 回调在 `run_streaming()` 的每个事件 yield 点被调用(同步 await + 1s 超时 + panic 保护)。
@@ -1889,6 +1900,7 @@ impl AgentRunner {
                 boundary_segment.as_deref(),
                 self.config.skills.as_deref(),
                 self.config.handoff.as_ref(),
+                self.config.governance_segment.as_deref(),
             )
             .map_err(AgentError::Internal)?;
 
@@ -4148,6 +4160,7 @@ impl AgentRunner {
                 boundary_segment.as_deref(),
                 runner.config.skills.as_deref(),
                 runner.config.handoff.as_ref(),
+                runner.config.governance_segment.as_deref(),
             ) {
                 Ok(p) => p,
                 Err(e) => {
