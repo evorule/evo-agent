@@ -485,7 +485,7 @@ const RULE_P2_ADJUDICATED_TOOLS: &[&str] = &[
     "bundle_import",
 ];
 
-/// 规则工具 manifest（46 条 = 透传 40 + 本地逻辑 6，名称集合与
+/// 规则工具 manifest（49 条 = 透传 40 + 本地逻辑 6 + why/order 3，名称集合与
 /// rule_tool_specs() 相等——测试锁）
 fn rule_manifests() -> Vec<ToolManifest> {
     let mut manifests: Vec<ToolManifest> = crate::rule_tools::adapter::ALL_TRANSPARENT_BINDINGS
@@ -528,6 +528,18 @@ fn rule_manifests() -> Vec<ToolManifest> {
         if GOVERNANCE_WRITE_TOOLS.contains(&name) {
             m.default_switch = sw(SWITCH_GOVERNANCE_WRITE, true);
         }
+        manifests.push(m);
+    }
+    // why/order 3（rule_tools::why_tools::register 的注册名，PR-11b 查账
+    // 因果查询面）——全部只读，Standard（免裁决但落账）+AutoPolicy（免审）
+    // +无开关（不进 GOVERNANCE_SNAPSHOT/SWITCH_SNAPSHOT，快照面零变化）
+    for name in ["explain_denial", "causal_order", "lineage_of"] {
+        let m = base(
+            name,
+            ToolSource::RuleLocal,
+            SpecSource::Rule,
+            vec![CapDomain::Governance],
+        );
         manifests.push(m);
     }
     manifests
@@ -702,11 +714,12 @@ mod tests {
 
     #[test]
     fn test_static_manifest_count_locked() {
-        // 内置 20 + 规则 46 + delegate 1 + memory 4 = 71
-        // （PR-11a 查账工具族 +4：16→20，数量锁 67→71；基线+7 的 11a 步）
+        // 内置 20 + 规则 49 + delegate 1 + memory 4 = 74
+        // （PR-11a 查账工具族 +4：16→20；PR-11b why/order 三工具 +3：
+        //   规则 46→49，数量锁 71→74）
         assert_eq!(builtin_manifests().len(), 20);
-        assert_eq!(rule_manifests().len(), 46);
-        assert_eq!(all().len(), 71);
+        assert_eq!(rule_manifests().len(), 49);
+        assert_eq!(all().len(), 74);
     }
 
     #[test]

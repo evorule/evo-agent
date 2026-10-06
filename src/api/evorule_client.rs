@@ -657,6 +657,50 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 获取会话审计报告（含完整 Fact 内容，F5）。
+    ///
+    /// `GET /api/sessions/{id}/audit?include_content=true` —— 每条审计条目
+    /// 附加 `content_json`（完整 Fact 内容，含 IoRequest params / IoResponse
+    /// result）。查账 why 族（explain_denial）用：拒因解释需要被拒命令的
+    /// 原始参数与 Violation 事实的 rule_index/reason/cause 同框。
+    pub async fn get_audit_report_with_content(&self, session_id: &str) -> Result<Value, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/audit?include_content=true",
+            self.core.base_url(),
+            session_id
+        );
+
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+
+        let result: Value = resp.json().await?;
+        Ok(result)
+    }
+
+    /// 获取当前生效的 core_eval 规则正本（GET /api/rules，014 合法 API #2）。
+    ///
+    /// 返回 `{count, core_eval: [...], tiers}` —— `core_eval` 数组按引擎
+    /// 求值序排列，`rule_index` 即该数组下标（Violation 事实归因锚）；
+    /// 晋升约束（`00_constraint_promoted_*`）装载后同样在此数组内，
+    /// 其 `metadata.promoted_from/promoted_at/promoted_by` 即晋升账
+    /// （lineage_of 第二账数据源）。
+    pub async fn get_rules(&self) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/rules");
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+
+        let result: Value = resp.json().await?;
+        Ok(result)
+    }
+
     /// **已废弃**：使用 `verify_audit_typed` 替代。此方法字段名已修正（valid→verified）。
     pub async fn verify_audit(&self, session_id: &str) -> Result<bool, ApiError> {
         let url = format!(

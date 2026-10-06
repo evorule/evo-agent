@@ -7,28 +7,33 @@
 //! 组装结构（理顺批 P1 适配器化后）：
 //! - 40 个纯透传工具 → `adapter` 表驱动（ALL_TRANSPARENT_BINDINGS 声明式映射）；
 //! - 6 个本地逻辑工具（audit_verify / bundle_export / skill_pack_to_bundle /
-//!   meta_summary / evolution_signals / rule_promote）→ `local_handlers` 统一外置。
+//!   meta_summary / evolution_signals / rule_promote）→ `local_handlers` 统一外置；
+//! - 3 个查账 why/order 工具（explain_denial / causal_order / lineage_of，
+//!   PR-11b）→ `why_tools`（因果查询面，只读）。
 
 pub mod adapter;
 pub mod local_handlers;
+pub mod why_tools;
 
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::workspace_client::WorkspaceApiClient;
 use crate::builtin_tools::ToolSpec;
 use crate::io_handlers::tool_handler::ToolHandler;
 
-/// 组装完整规则工具集（M3：透传 40 + 本地逻辑 6 = 46 工具）
+/// 组装完整规则工具集（透传 40 + 本地逻辑 6 + why/order 3 = 49 工具）
 pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
     let mut h = ToolHandler::new();
     adapter::register_bindings(&mut h, ws, ev, adapter::ALL_TRANSPARENT_BINDINGS);
     local_handlers::register(&mut h, ws, ev);
+    why_tools::register(&mut h, ws, ev);
     h
 }
 
-/// 全部规则工具 spec（46 个）
+/// 全部规则工具 spec（49 个）
 pub fn rule_tool_specs() -> Vec<ToolSpec> {
     let mut specs = adapter::specs_from(adapter::ALL_TRANSPARENT_BINDINGS);
     specs.extend(local_handlers::specs());
+    specs.extend(why_tools::specs());
     specs
 }
 
@@ -39,7 +44,7 @@ mod tests {
     #[test]
     fn test_rule_tool_specs_count() {
         let specs = rule_tool_specs();
-        assert_eq!(specs.len(), 46, "expected 46 rule tool specs");
+        assert_eq!(specs.len(), 49, "expected 49 rule tool specs");
     }
 
     #[test]
@@ -125,7 +130,7 @@ service_tools = ["config_persist", "rule_sandbox"]
                 name
             );
         }
-        assert_eq!(tools.len(), 26, "expected 26 tools in rule-copilot.json");
+        assert_eq!(tools.len(), 29, "expected 29 tools in rule-copilot.json");
     }
 
     #[test]
@@ -210,8 +215,8 @@ service_tools = ["config_persist", "rule_sandbox"]
 
     #[test]
     fn test_full_rule_toolkit_registers_all_45() {
-        // 验证 full_rule_toolkit 注册了全部 45 个工具（40 透传 + 5 本地逻辑，
-        // has_tool 逐个校验；计数与 rule_tool_specs 对齐）
+        // 验证 full_rule_toolkit 注册了全部 48 个工具（40 透传 + 5 本地逻辑 +
+        // 3 why/order，has_tool 逐个校验；计数与 rule_tool_specs 对齐）
         let ws = WorkspaceApiClient::new("http://localhost:0");
         let ev = EvoruleApiClient::new("http://localhost:0");
         let h = full_rule_toolkit(&ws, &ev);
@@ -273,8 +278,12 @@ service_tools = ["config_persist", "rule_sandbox"]
             // evolution 2（进化信号只读消费面 + 约束层晋升提名）
             "evolution_signals",
             "rule_promote",
+            // why/order 3（查账因果查询面，PR-11b，只读）
+            "explain_denial",
+            "causal_order",
+            "lineage_of",
         ];
-        assert_eq!(all_tools.len(), 45);
+        assert_eq!(all_tools.len(), 48);
         for name in &all_tools {
             assert!(
                 h.has_tool(name),

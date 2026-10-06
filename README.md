@@ -42,7 +42,7 @@
 | **会话沉淀** | 会话结束时自动写入摘要 + 稳定事实到共享空间 |
 | **工具注册中心** | `ToolRegistry` + `ToolFunction` trait，任何 `async fn(JsonValue) -> Result<JsonValue, String>` 都能注册 |
 | **3 层安全模型** | active（白名单）/ candidate（待批）/ blocked（永不），含 SSRF 防护 + 工作目录沙箱 |
-| **规则管理工具集** | 46 个工具（spec 数，测试锁定；serve 面默认暴露 42 = 内置 15 + 规则 27，sandbox/dataset/publish/production/bundles 共 19 个为已定义未入 serve 面的高级工具）：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + skill 装配 1 + meta 1 + evolution 2 |
+| **规则管理工具集** | 49 个工具（spec 数，测试锁定；serve 面默认暴露 45 = 内置 15 + 规则 30，sandbox/dataset/publish/production/bundles 共 19 个为已定义未入 serve 面的高级工具）：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + skill 装配 1 + meta 1 + evolution 2 + why/order 3 |
 | **工作流引擎** | DAG 拓扑编排多 Agent，同层并行 + 跨层串行 + 模板渲染 |
 | **MCP 客户端** | 接入 Model Context Protocol 工具生态（stdio 传输） |
 | **上下文窗口管理** | 按 token 数裁剪历史消息，保留 system + 最近若干轮 |
@@ -510,7 +510,7 @@ MCP 远端工具与服务代理工具为运行期动态注册（非静态工具�
 
 说明：同 `application` 作用域；分级键只作用于动态源条目——静态工具的治理分级以静态表为准，不受此键影响。
 
-### 规则管理工具集（46 个）
+### 规则管理工具集（49 个）
 
 通过 `rule_management_toolkit` / `full_rule_toolkit` 组装，用于 `rule-copilot` Agent：
 
@@ -529,6 +529,7 @@ MCP 远端工具与服务代理工具为运行期动态注册（非静态工具�
 | skill 装配 | 1 | skill_pack_to_bundle（skill 规则壳 → 执行域快照包桥接，crate 算哈希+结构预检；恒出未验证 fail 包，pass 重出包走治理域通路） |
 | meta | 1 | meta_summary（L2 约束清单摘要） |
 | evolution | 2 | evolution_signals（进化信号拉取）+ rule_promote（约束层晋升提名） |
+| why/order | 3 | explain_denial（拒因解释+规则正本对账）+ causal_order（两事实因果序，链式哈希序）+ lineage_of（规则谱系=版本链+晋升账拼接），均只读 |
 
 ### MCP 工具接入
 
@@ -844,7 +845,7 @@ evo-agent/
 | Runner 拆分（Phase 2） | ⏳ | `runner.rs` 仍为约 4000 行单文件，未拆为子模块 |
 | 编译告警 | ⚠️ | 主体为 `missing_docs`；另有少量 clippy 代码质量 lint 待清理 |
 
-> 规则管理工具集总数为 **46 个**（workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + skill 装配 1 + meta 1 + evolution 2），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
+> 规则管理工具集总数为 **49 个**（workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + skill 装配 1 + meta 1 + evolution 2 + why/order 3），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
 
 ## 依赖关系
 

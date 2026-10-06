@@ -1,0 +1,928 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 EvoRule Project
+// This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
+#![forbid(unsafe_code)]
+//! 查账 why/order 工具（工具面统一架构 PR-11b）：因果查询面三件
+//!
+//! 相对 what 层（query_journal/query_trace/read_back/diff_runs，PR-11a），
+//! 本组回答「为什么发生 / 谁导致谁 / 凭什么变成现在这样」：
+//!
+//! - `explain_denial`：给定会话内一次拒绝事实（Violation），返回结构化
+//!   拒因——`rule_index`/`reason`/被拒命令原文 + 命中的规则正本条目
+//!   （`GET /api/rules` 的 core_eval 数组按索引原样透出，对账即一致）；
+//! - `causal_order`：同会话审计链内两事实的因果序——序由 cause 指针
+//!   （链式哈希链）确定，**非墙钟**；无直接因果路径时按链位
+//!   （logical_time，链上串行化序）定先后并如实标注 `causally_related:
+//!   false`；跨链域（非同一会话审计链）不可比，返回域说明——诚实边界
+//!   （设计档 §11.6 裁定③）；
+//! - `lineage_of`：规则谱系两账拼接——版本链（workspace RuleVersionRecord）
+//!   + 晋升账（`00_constraint_promoted_*` 装载进 core_eval 后的
+//!   `metadata.promoted_from/promoted_at/promoted_by`）。
+//!
+//! 全部只读：仅 GET 审计链/规则正本/版本账，零写路径；server 侧零改动
+//! （全部消费既有端点，尽调结论 2026-10-06）。
+//!
+//! 治理语义与 11a 四工具同型：Standard（免裁决但落账）+ AutoPolicy（免审）
+//! + `default_switch.is_none()`（不绑开关）。
+
+use serde_json::{json, Value};
+
+use crate::api::evorule_client::EvoruleApiClient;
+use crate::api::workspace_client::WorkspaceApiClient;
+use crate::builtin_tools::{ParameterSpec, ToolSpec};
+use crate::io_handler::IoResult;
+use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
+use std::sync::Arc;
+
+/// 解析 u64 参数（宽容数字/数字字符串，对齐 evolution_signals 先例口径）
+fn parse_u64_arg(args: &Value, key: &str) -> Result<u64, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Err(format!("missing required parameter: {key}")),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| format!("{key} must be a non-negative integer")),
+        Some(Value::String(s)) => s
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{key} must be a valid integer string")),
+        Some(_) => Err(format!("{key} must be a non-negative integer")),
+    }
+}
+
+/// 必填字符串参数
+fn require_str(args: &Value, key: &str) -> Result<String, String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("missing required parameter: {key}"))
+}
+
+// =============================================================================
+// explain_denial —— 拒因解释（结构化拒因 + 规则正本对账）
+// =============================================================================
+
+/// 审计条目中抽取 Violation 事实的归因字段（content_json 宽容形态：
+/// 顶层或 payload 子对象；server 侧 Fact::to_json 的字段名以实测为准，
+/// E2E 校准点）
+fn violation_fields(content: &Value) -> Option<(u64, String, Option<u64>)> {
+    for probe in [content.clone(), content["payload"].clone()] {
+        let idx = probe
+            .get("rule_index")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                probe
+                    .get("rule_index")
+                    .and_then(|v| v.as_str()?.parse().ok())
+            });
+        let reason = probe
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let (Some(idx), Some(reason)) = (idx, reason) {
+            let cause = probe
+                .get("cause")
+                .and_then(|v| v.as_u64())
+                .or_else(|| probe.get("cause").and_then(|v| v.as_str()?.parse().ok()));
+            return Some((idx, reason, cause));
+        }
+    }
+    None
+}
+
+fn is_violation_type(fact_type: &str) -> bool {
+    fact_type.to_ascii_lowercase().contains("violation")
+}
+
+pub struct ExplainDenialTool {
+    ev: EvoruleApiClient,
+}
+
+impl ExplainDenialTool {
+    pub fn new(ev: EvoruleApiClient) -> Self {
+        Self { ev }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolFunction for ExplainDenialTool {
+    async fn call(&self, args: &Value) -> IoResult {
+        let session_id = parse_u64_arg(args, "session_id")?;
+        let fact_id = parse_u64_arg(args, "fact_id")?;
+        let session_str = session_id.to_string();
+
+        let report = self
+            .ev
+            .get_audit_report_with_content(&session_str)
+            .await
+            .map_err(|e| format!("audit report fetch failed: {e}"))?;
+        let entries = report
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "audit report has no entries array".to_string())?;
+
+        // 1. 定位 Violation 事实
+        let target = entries
+            .iter()
+            .find(|e| e.get("fact_id").and_then(|v| v.as_u64()) == Some(fact_id))
+            .ok_or_else(|| {
+                format!("fact {fact_id} not found in session {session_id} audit chain")
+            })?;
+        let fact_type = target
+            .get("fact_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !is_violation_type(fact_type) {
+            return Err(format!(
+                "fact {fact_id} in session {session_id} is a {fact_type:?} fact, not a \
+                 violation — explain_denial only explains denial (Violation) facts"
+            ));
+        }
+        let content = target.get("content_json").cloned().unwrap_or(Value::Null);
+        let (rule_index, reason, cause) = violation_fields(&content).ok_or_else(|| {
+            format!(
+                "violation fact {fact_id} lacks structured rule_index/reason fields \
+                 (content shape mismatch — server-side fact shape needs calibration)"
+            )
+        })?;
+
+        // 2. 规则正本对账：core_eval[rule_index] 原样透出（GET /api/rules）
+        let rules = self
+            .ev
+            .get_rules()
+            .await
+            .map_err(|e| format!("rules fetch failed: {e}"))?;
+        let core_eval = rules
+            .get("core_eval")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "GET /api/rules response has no core_eval array".to_string())?;
+        let matched_rule = core_eval.get(rule_index as usize).cloned();
+
+        // 3. 被拒命令原文（cause 指向的事实）
+        let denied_command = cause.and_then(|cid| {
+            entries.iter().find_map(|e| {
+                (e.get("fact_id").and_then(|v| v.as_u64()) == Some(cid))
+                    .then(|| e.get("content_json").cloned().unwrap_or(Value::Null))
+            })
+        });
+
+        Ok(json!({
+            "session_id": session_id,
+            "fact_id": fact_id,
+            "violation": {
+                "rule_index": rule_index,
+                "reason": reason,
+                "cause": cause,
+            },
+            "matched_rule": matched_rule,
+            "reconciliation": matched_rule.is_some(),
+            "denied_command": denied_command,
+            "note": if matched_rule.is_some() {
+                "matched_rule is the verbatim core_eval entry from GET /api/rules (canonical \
+                 effective rule set, indexed by the engine's rule_index)"
+            } else {
+                "rule_index points outside the current core_eval array (rule set reloaded since \
+                 the denial?) — matched_rule absent, cross-check the rule set version"
+            },
+        }))
+    }
+}
+
+// =============================================================================
+// causal_order —— 两事实因果序（链式哈希序，非墙钟；限同链域内）
+// =============================================================================
+
+fn chain_entry_map(chain_resp: &Value) -> Result<Vec<Value>, String> {
+    chain_resp
+        .get("chain")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .ok_or_else(|| "causal chain response has no chain array".to_string())
+}
+
+fn entry_fact_id(e: &Value) -> Option<u64> {
+    e.get("fact_id").and_then(|v| v.as_u64())
+}
+
+fn entry_cause(e: &Value) -> Option<u64> {
+    e.get("cause")
+        .and_then(|v| v.as_u64())
+        .or_else(|| e.get("cause").and_then(|v| v.as_str()?.parse().ok()))
+}
+
+fn entry_logical_time(e: &Value) -> u64 {
+    e.get("logical_time").and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+pub struct CausalOrderTool {
+    ev: EvoruleApiClient,
+}
+
+impl CausalOrderTool {
+    pub fn new(ev: EvoruleApiClient) -> Self {
+        Self { ev }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolFunction for CausalOrderTool {
+    async fn call(&self, args: &Value) -> IoResult {
+        let session_id = parse_u64_arg(args, "session_id")?;
+        let fact_a = parse_u64_arg(args, "fact_a")?;
+        let fact_b = parse_u64_arg(args, "fact_b")?;
+        let session_str = session_id.to_string();
+
+        // 两条因果链（各自回溯至创世）合并 = 该查询域内可见的链片段
+        let resp_a = self
+            .ev
+            .get_causal_chain(&session_str, fact_a)
+            .await
+            .map_err(|e| format!("causal chain (fact {fact_a}) fetch failed: {e}"))?;
+        let resp_b = self
+            .ev
+            .get_causal_chain(&session_str, fact_b)
+            .await
+            .map_err(|e| format!("causal chain (fact {fact_b}) fetch failed: {e}"))?;
+        let mut merged: Vec<Value> = chain_entry_map(&resp_a)?;
+        for e in chain_entry_map(&resp_b)? {
+            let id = entry_fact_id(&e);
+            if !merged.iter().any(|m| entry_fact_id(m) == id) {
+                merged.push(e);
+            }
+        }
+
+        // 域边界（裁定③）：任一事实不在本会话链上 → 不可比 + 域说明
+        let has_a = merged.iter().any(|e| entry_fact_id(e) == Some(fact_a));
+        let has_b = merged.iter().any(|e| entry_fact_id(e) == Some(fact_b));
+        if !has_a || !has_b {
+            return Ok(json!({
+                "session_id": session_id,
+                "fact_a": fact_a,
+                "fact_b": fact_b,
+                "comparable": false,
+                "reason": "one or both facts are absent from this session's audit chain — order \
+                           is defined only within a single session's hash-chained audit chain; \
+                           facts from other sessions/domains (agent journal seq, other WAL \
+                           chains) are NOT comparable to it",
+            }));
+        }
+
+        // 因果路径：从 X 沿 cause 指针回溯（祖先链）
+        let ancestors_of = |start: u64| -> Vec<u64> {
+            let mut path = Vec::new();
+            let mut cur = Some(start);
+            while let Some(id) = cur {
+                path.push(id);
+                cur = merged
+                    .iter()
+                    .find(|e| entry_fact_id(e) == Some(id))
+                    .and_then(entry_cause);
+            }
+            path
+        };
+        let path_a = ancestors_of(fact_a); // [a, parent(a), ..., genesis]
+        let path_b = ancestors_of(fact_b);
+
+        let (order, middle, causally_related) = if path_a.contains(&fact_b) && fact_a != fact_b {
+            // b 是 a 的祖先：b → … → a
+            let pos = path_a.iter().position(|&x| x == fact_b).unwrap_or(0);
+            let mut seg: Vec<u64> = path_a[..=pos].to_vec();
+            seg.reverse(); // [b, ..., a]
+            ("b_before_a", Some(seg), true)
+        } else if path_b.contains(&fact_a) {
+            let pos = path_b.iter().position(|&x| x == fact_a).unwrap_or(0);
+            let mut seg: Vec<u64> = path_b[..=pos].to_vec();
+            seg.reverse(); // [a, ..., b]
+            ("a_before_b", Some(seg), true)
+        } else {
+            // 无直接因果路径：按链位（logical_time = 链上串行化位置）定先后
+            let ta = merged
+                .iter()
+                .find(|e| entry_fact_id(e) == Some(fact_a))
+                .map(entry_logical_time)
+                .unwrap_or(0);
+            let tb = merged
+                .iter()
+                .find(|e| entry_fact_id(e) == Some(fact_b))
+                .map(entry_logical_time)
+                .unwrap_or(0);
+            let ord = if ta <= tb { "a_before_b" } else { "b_before_a" };
+            (ord, None, false)
+        };
+
+        Ok(json!({
+            "session_id": session_id,
+            "fact_a": fact_a,
+            "fact_b": fact_b,
+            "comparable": true,
+            "order": order,
+            "middle_chain": middle,
+            "causally_related": causally_related,
+            "basis": "hash-chained audit chain: direct causal path via cause pointers when one \
+                      exists, otherwise chain position (logical_time assigned by the serialized \
+                      engine) — never wall-clock timestamps",
+        }))
+    }
+}
+
+// =============================================================================
+// lineage_of —— 规则谱系（版本链 + 晋升账两账拼接）
+// =============================================================================
+
+const PROMOTED_FROM_PREFIX: &str = "rule_version:";
+
+pub struct LineageOfTool {
+    ws: WorkspaceApiClient,
+    ev: EvoruleApiClient,
+}
+
+impl LineageOfTool {
+    pub fn new(ws: WorkspaceApiClient, ev: EvoruleApiClient) -> Self {
+        Self { ws, ev }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolFunction for LineageOfTool {
+    async fn call(&self, args: &Value) -> IoResult {
+        let workspace_id = require_str(args, "workspace_id")?;
+        let rule_id = require_str(args, "rule_id")?;
+
+        // 账一：规则主状态 + 版本链（workspace 正本）
+        let rule = self
+            .ws
+            .get_rule(&workspace_id, &rule_id)
+            .await
+            .map_err(|e| format!("rule fetch failed: {e}"))?;
+        let rule_json = serde_json::to_value(&rule).map_err(|e| e.to_string())?;
+        let versions = self
+            .ws
+            .list_rule_versions(&workspace_id, &rule_id)
+            .await
+            .map_err(|e| format!("rule versions fetch failed: {e}"))?;
+
+        // 账二：晋升账（晋升约束装载进 core_eval 后按 metadata.id 匹配）
+        let rules = self
+            .ev
+            .get_rules()
+            .await
+            .map_err(|e| format!("rules fetch failed: {e}"))?;
+        let promoted_entry = rules
+            .get("core_eval")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter().find(|r| {
+                    r.get("id").and_then(|v| v.as_str()) == Some(rule_id.as_str())
+                        || r.get("metadata")
+                            .and_then(|m| m.get("id"))
+                            .and_then(|v| v.as_str())
+                            == Some(rule_id.as_str())
+                })
+            })
+            .cloned();
+        let promotion = promoted_entry.as_ref().map(|e| {
+            let meta = e.get("metadata").unwrap_or(e);
+            json!({
+                "promoted_from": meta.get("promoted_from").cloned().unwrap_or(Value::Null),
+                "promoted_at": meta.get("promoted_at").cloned().unwrap_or(Value::Null),
+                "promoted_by": meta.get("promoted_by").cloned().unwrap_or(Value::Null),
+            })
+        });
+        // 晋升源版本 id（promoted_from: "rule_version:<id>"）→ 版本链对齐标记
+        let promoted_version_id = promotion.as_ref().and_then(|p| {
+            p.get("promoted_from")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.strip_prefix(PROMOTED_FROM_PREFIX))
+                .map(|s| s.to_string())
+        });
+
+        let version_chain: Vec<Value> = versions
+            .iter()
+            .map(|v| {
+                json!({
+                    "id": v.id,
+                    "version": v.version,
+                    "state": v.state,
+                    "created_by": v.created_by,
+                    "created_at": v.created_at,
+                    "content_hash": v.content_hash,
+                    "promotion_origin": promoted_version_id.as_deref() == Some(v.id.as_str()),
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "workspace_id": workspace_id,
+            "rule_id": rule_id,
+            "rule_state": rule_json.get("state").cloned().unwrap_or(Value::Null),
+            "version_chain": version_chain,
+            "promotion": promotion,
+            "notes": match (&promoted_entry, promoted_version_id) {
+                (None, _) => vec![
+                    "no promoted (constraint-tier) entry matching this rule id in the effective \
+                     rule set — either not promoted or promoted under a different id",
+                ],
+                (Some(_), None) => vec![
+                    "promotion entry found but its promoted_from carries no rule_version anchor",
+                ],
+                (Some(_), Some(_)) => vec![],
+            },
+        }))
+    }
+}
+
+// =============================================================================
+// register / specs
+// =============================================================================
+
+/// 注册 why/order 三工具（full_rule_toolkit 装配点）
+pub fn register(h: &mut ToolHandler, ws: &WorkspaceApiClient, ev: &EvoruleApiClient) {
+    h.register_static(
+        "explain_denial",
+        Arc::new(ExplainDenialTool::new(ev.clone())),
+    );
+    h.register_static("causal_order", Arc::new(CausalOrderTool::new(ev.clone())));
+    h.register_static(
+        "lineage_of",
+        Arc::new(LineageOfTool::new(ws.clone(), ev.clone())),
+    );
+}
+
+/// why/order 三工具 spec（LLM 可见面）
+pub fn specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec {
+            name: "explain_denial".to_string(),
+            description: "Explain why a command was denied in a session: locate the Violation \
+                          fact on the session's hash-chained audit chain and return the \
+                          structured denial (rule_index, reason), the verbatim effective rule \
+                          entry it maps to (reconciled against GET /api/rules), and the denied \
+                          command's original content. Read-only."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "session_id".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Server session id (integer or integer string).".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "fact_id".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Fact id of the denial (Violation) fact on the audit chain. \
+                                  Fails honestly if the fact exists but is not a violation."
+                        .to_string(),
+                    required: true,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "causal_order".to_string(),
+            description: "Determine the causal order of two facts within one session's \
+                          hash-chained audit chain. Order comes from cause pointers (direct \
+                          causal path, with the intermediate chain segment returned) or, when \
+                          no causal path exists, from chain position (logical_time assigned by \
+                          the serialized engine) — never wall-clock timestamps. Facts outside \
+                          this session's chain are reported as not comparable (domain \
+                          boundary). Read-only."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "session_id".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Server session id (integer or integer string).".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "fact_a".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "First fact id.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "fact_b".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Second fact id.".to_string(),
+                    required: true,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "lineage_of".to_string(),
+            description: "Return the full lineage of a rule by stitching two ledgers: the \
+                          version chain (workspace rule versions with state/author/hash, \
+                          newest first) and the promotion ledger (the promoted constraint \
+                          entry's promoted_from/promoted_at/promoted_by from the effective \
+                          rule set, with the promoted version marked in the chain). Read-only."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "workspace_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Workspace id owning the rule.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "rule_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Rule id (e.g. com.evorule.constraint.safety).".to_string(),
+                    required: true,
+                },
+            ],
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::sync::Arc;
+
+    // —— 进程内顺序应答式 HTTP 假服务（同 service_tools.rs tests 先例）——
+
+    fn spawn_http_fixture(responses: Vec<(u16, String)>) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (stream, _) = listener.accept().unwrap();
+                let mut stream = stream;
+                let mut req_body = Vec::new();
+                {
+                    let mut reader = BufReader::new(&stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let _path = line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut h = String::new();
+                        reader.read_line(&mut h).unwrap();
+                        if h.trim().is_empty() {
+                            break;
+                        }
+                        if let Ok(v) = h
+                            .to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .unwrap_or("")
+                            .trim()
+                            .parse::<usize>()
+                        {
+                            content_length = v;
+                        }
+                    }
+                    if content_length > 0 {
+                        req_body = vec![0u8; content_length];
+                        reader.read_exact(&mut req_body).unwrap();
+                    }
+                }
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn audit_entries_json() -> String {
+        // 审计链 fixture：7=IoRequest（被拒命令）/8=Violation（rule_index=2,
+        // reason, cause=7）/9=后续事实；logical_time 链上串行化位置
+        r#"{
+          "session_id": 42, "fact_count": 3, "last_hash": "aa..ff", "verified": true,
+          "entries": [
+            {"fact_id": 7, "fact_type": "io_request", "logical_time": 7,
+             "content_hash": "h7", "prev_hash": "h6", "cause": 6,
+             "content_json": {"kind": "io_request", "tool": "shell_exec", "params": {"command": "rm -rf /"}}},
+            {"fact_id": 8, "fact_type": "violation", "logical_time": 8,
+             "content_hash": "h8", "prev_hash": "h7", "cause": 7,
+             "content_json": {"kind": "violation", "rule_index": 2, "reason": "blocked by seed constraint", "cause": 7}},
+            {"fact_id": 9, "fact_type": "io_response", "logical_time": 9,
+             "content_hash": "h9", "prev_hash": "h8", "cause": 8,
+             "content_json": {"kind": "io_response", "result": "halted"}}
+          ]
+        }"#.to_string()
+    }
+
+    fn rules_json() -> String {
+        r#"{
+          "count": 3,
+          "core_eval": [
+            {"id": "com.evorule.seed.zero", "metadata": {"id": "com.evorule.seed.zero", "tier": "seed"}},
+            {"id": "com.evorule.seed.one", "metadata": {"id": "com.evorule.seed.one", "tier": "seed"}},
+            {"id": "com.evorule.constraint.safety", "transform": [{"type": "guard"}],
+             "metadata": {"id": "com.evorule.constraint.safety", "tier": "constraint",
+                          "promoted_from": "rule_version:01M3BDCC39Y5FQVGYHSE034R36",
+                          "promoted_at": "2026-09-25T04:33:05Z", "promoted_by": "console"}}
+          ],
+          "tiers": {}
+        }"#.to_string()
+    }
+
+    // =========================================================================
+    // explain_denial
+    // =========================================================================
+
+    #[test]
+    fn explain_denial_reconciles_rule_with_canonical_source() {
+        // 对账锚：matched_rule 必须是 GET /api/rules core_eval[rule_index]
+        // 条目逐字透传（设计验收：规则 id/版本须与治理正本一致）
+        let base = spawn_http_fixture(vec![(200, audit_entries_json()), (200, rules_json())]);
+        let rt = rt();
+        let handler = ToolHandler::new();
+        let mut handler = handler;
+        handler.register_static(
+            "explain_denial",
+            Arc::new(ExplainDenialTool::new(EvoruleApiClient::new(&base))),
+        );
+        let out = rt
+            .block_on(
+                handler
+                    .execute_by_name("explain_denial", &json!({"session_id": "42", "fact_id": 8})),
+            )
+            .unwrap();
+
+        assert_eq!(out["violation"]["rule_index"], 2);
+        assert_eq!(out["violation"]["reason"], "blocked by seed constraint");
+        assert_eq!(out["violation"]["cause"], 7);
+        // 对账：与正本 core_eval[2] 逐字一致
+        let rules: Value = serde_json::from_str(&rules_json()).unwrap();
+        assert_eq!(
+            out["matched_rule"], rules["core_eval"][2],
+            "matched_rule must be the verbatim canonical entry"
+        );
+        assert_eq!(out["reconciliation"], true);
+        // 被拒命令原文抽取（cause=7）
+        assert_eq!(out["denied_command"]["tool"], "shell_exec");
+        assert_eq!(out["denied_command"]["params"]["command"], "rm -rf /");
+    }
+
+    #[test]
+    fn explain_denial_non_violation_fails_honestly() {
+        let base = spawn_http_fixture(vec![(200, audit_entries_json())]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "explain_denial",
+            Arc::new(ExplainDenialTool::new(EvoruleApiClient::new(&base))),
+        );
+        let err = rt
+            .block_on(
+                handler
+                    .execute_by_name("explain_denial", &json!({"session_id": "42", "fact_id": 7})),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("not a violation"),
+            "应如实拒绝非违规事实: {err}"
+        );
+    }
+
+    // =========================================================================
+    // causal_order
+    // =========================================================================
+
+    fn chain_resp(fact_id: u64, chain: Value) -> String {
+        json!({"session_id": 42, "fact_id": fact_id, "chain_length": chain.as_array().map(|a| a.len()).unwrap_or(0), "chain": chain})
+            .to_string()
+    }
+
+    #[test]
+    fn causal_order_ancestor_path_determines_order_not_wallclock() {
+        // 链式哈希序锚定：7 是 9 的祖先（cause 指针），序=7 before 9——
+        // 即使响应携带的任何时间类字段被交换，序仍由 cause 指针决定
+        let chain_for_9 = json!([
+            {"fact_id": 9, "fact_type": "io_response", "logical_time": 9, "cause": 8},
+            {"fact_id": 8, "fact_type": "violation", "logical_time": 8, "cause": 7},
+            {"fact_id": 7, "fact_type": "io_request", "logical_time": 7, "cause": 6}
+        ]);
+        let chain_for_7 = json!([
+            {"fact_id": 7, "fact_type": "io_request", "logical_time": 7, "cause": 6}
+        ]);
+        let base = spawn_http_fixture(vec![
+            (200, chain_resp(9, chain_for_9)),
+            (200, chain_resp(7, chain_for_7)),
+        ]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "causal_order",
+            Arc::new(CausalOrderTool::new(EvoruleApiClient::new(&base))),
+        );
+        let out = rt
+            .block_on(handler.execute_by_name(
+                "causal_order",
+                &json!({"session_id": "42", "fact_a": 9, "fact_b": 7}),
+            ))
+            .unwrap();
+
+        assert_eq!(out["comparable"], true);
+        assert_eq!(out["order"], "b_before_a");
+        assert_eq!(out["causally_related"], true);
+        assert_eq!(out["middle_chain"], json!([7, 8, 9]));
+        assert!(out["basis"].as_str().unwrap().contains("never wall-clock"));
+    }
+
+    #[test]
+    fn causal_order_no_causal_path_falls_back_to_chain_position() {
+        // 平行事实（互不为祖先）：按链位（logical_time）定先后并如实标注
+        let chain_for_10 = json!([
+            {"fact_id": 10, "fact_type": "io_request", "logical_time": 10, "cause": 5}
+        ]);
+        let chain_for_11 = json!([
+            {"fact_id": 11, "fact_type": "io_request", "logical_time": 11, "cause": 5}
+        ]);
+        let base = spawn_http_fixture(vec![
+            (200, chain_resp(11, chain_for_11)),
+            (200, chain_resp(10, chain_for_10)),
+        ]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "causal_order",
+            Arc::new(CausalOrderTool::new(EvoruleApiClient::new(&base))),
+        );
+        let out = rt
+            .block_on(handler.execute_by_name(
+                "causal_order",
+                &json!({"session_id": "42", "fact_a": 11, "fact_b": 10}),
+            ))
+            .unwrap();
+
+        assert_eq!(out["comparable"], true);
+        assert_eq!(out["order"], "b_before_a"); // logical_time 10 < 11
+        assert_eq!(out["causally_related"], false);
+        assert_eq!(out["middle_chain"], Value::Null);
+    }
+
+    #[test]
+    fn causal_order_absent_fact_reports_honest_domain_boundary() {
+        // 裁定③诚实边界：事实不在本会话链上 → 不可比 + 域说明
+        let chain_for_9 = json!([
+            {"fact_id": 9, "fact_type": "io_response", "logical_time": 9, "cause": 8}
+        ]);
+        let base = spawn_http_fixture(vec![
+            (200, chain_resp(9, chain_for_9)),
+            (200, chain_resp(999, json!([]))),
+        ]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "causal_order",
+            Arc::new(CausalOrderTool::new(EvoruleApiClient::new(&base))),
+        );
+        let out = rt
+            .block_on(handler.execute_by_name(
+                "causal_order",
+                &json!({"session_id": "42", "fact_a": 9, "fact_b": 999}),
+            ))
+            .unwrap();
+
+        assert_eq!(out["comparable"], false);
+        let reason = out["reason"].as_str().unwrap();
+        assert!(reason.contains("NOT comparable"), "域说明在场: {reason}");
+    }
+
+    // =========================================================================
+    // lineage_of
+    // =========================================================================
+
+    fn versions_json() -> String {
+        r#"[
+          {"id": "01M3BDCC39Y5FQVGYHSE034R36", "rule_id": "com.evorule.constraint.safety",
+           "version": 2, "content_hash": "sha256:bbb", "content": "{}",
+           "state": "current", "created_by": "agent", "created_at": "2026-09-25T04:30:00Z"},
+          {"id": "01M3BDCC39YAAAAAAAAAAAAAAA", "rule_id": "com.evorule.constraint.safety",
+           "version": 1, "content_hash": "sha256:aaa", "content": "{}",
+           "state": "superseded", "created_by": "agent", "created_at": "2026-09-24T10:00:00Z"}
+        ]"#
+        .to_string()
+    }
+
+    fn rule_record_json() -> String {
+        // 对齐 workspace_client::RuleRecord 全字段（非 Option 字段必须在场）
+        r#"{"id": "com.evorule.constraint.safety", "workspace_id": "ws1", "name": "协作验收规则",
+            "current_version_id": "01M3BDCC39Y5FQVGYHSE034R36", "state": "active",
+            "description": null, "created_by": "agent", "created_at": "2026-09-24T10:00:00Z",
+            "updated_at": "2026-09-25T04:33:05Z", "archived_at": null, "metadata": "{}"}"#
+            .to_string()
+    }
+
+    #[test]
+    fn lineage_of_stitches_version_chain_and_promotion_ledger() {
+        // 两账拼接：版本链（workspace）+ 晋升账（core_eval 晋升条目），
+        // promoted_from 锚对齐版本 id → promotion_origin 标记
+        let base = spawn_http_fixture(vec![
+            (200, rule_record_json()),
+            (200, versions_json()),
+            (200, rules_json()),
+        ]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "lineage_of",
+            Arc::new(LineageOfTool::new(
+                WorkspaceApiClient::new(&base),
+                EvoruleApiClient::new(&base),
+            )),
+        );
+        let out = rt
+            .block_on(handler.execute_by_name(
+                "lineage_of",
+                &json!({"workspace_id": "ws1", "rule_id": "com.evorule.constraint.safety"}),
+            ))
+            .unwrap();
+
+        assert_eq!(out["rule_state"], "active");
+        let chain = out["version_chain"].as_array().unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0]["promotion_origin"], true); // promoted_from 锚命中
+        assert_eq!(chain[1]["promotion_origin"], false);
+        assert_eq!(out["promotion"]["promoted_by"], "console");
+        assert_eq!(
+            out["promotion"]["promoted_from"],
+            "rule_version:01M3BDCC39Y5FQVGYHSE034R36"
+        );
+        assert!(out["notes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lineage_of_unpromoted_rule_states_it_honestly() {
+        // 未晋升规则：promotion=null + notes 如实说明
+        let base = spawn_http_fixture(vec![
+            (200, rule_record_json()),
+            (200, versions_json()),
+            (200, rules_json()), // core_eval 无匹配 id 的条目
+        ]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "lineage_of",
+            Arc::new(LineageOfTool::new(
+                WorkspaceApiClient::new(&base),
+                EvoruleApiClient::new(&base),
+            )),
+        );
+        let out = rt
+            .block_on(handler.execute_by_name(
+                "lineage_of",
+                &json!({"workspace_id": "ws1", "rule_id": "com.evorule.other.unpromoted"}),
+            ))
+            .unwrap();
+
+        assert_eq!(out["promotion"], Value::Null);
+        assert!(out["version_chain"].as_array().unwrap().len() == 2);
+        let notes = out["notes"].as_array().unwrap();
+        assert!(notes
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("not promoted")));
+    }
+
+    // =========================================================================
+    // manifest 治理定性（与 11a 同型断言）
+    // =========================================================================
+
+    #[test]
+    fn manifest_governance_fields_for_why_tools() {
+        // 快照锁随动（PR-11b）：静态计数 20/49/74 由
+        // tool_manifest::test_static_manifest_count_locked 锁守；此处锁
+        // rule_tool_specs 侧 3 spec 在场 + manifest 治理定性
+        // （Standard+AutoPolicy+无开关——不绑开关、不进快照）
+        let specs = super::super::rule_tool_specs();
+        for name in ["explain_denial", "causal_order", "lineage_of"] {
+            let spec = specs
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("spec '{name}' must be in rule_tool_specs"));
+            assert!(!spec.description.is_empty());
+            assert!(!spec.parameters.is_empty());
+            let m = crate::agent::tool_manifest::lookup_static(name)
+                .unwrap_or_else(|| panic!("manifest '{name}' must be in static table"));
+            assert_eq!(
+                m.adjudication_class,
+                crate::agent::tool_manifest::AdjudicationClass::Standard
+            );
+            assert_eq!(
+                m.approval_policy,
+                crate::agent::tool_manifest::ApprovalPolicy::AutoPolicy
+            );
+            assert!(m.default_switch.is_none(), "why/order tools bind no switch");
+        }
+    }
+}

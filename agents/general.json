@@ -41,6 +41,9 @@
     "rule_submit",
     "meta_summary",
     "evolution_signals",
+    "explain_denial",
+    "causal_order",
+    "lineage_of",
     "skill_pack_to_bundle",
     "delegate"
   ],

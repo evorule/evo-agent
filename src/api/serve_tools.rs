@@ -23,10 +23,10 @@ use crate::builtin_tools::default_safe_toolkit;
 use crate::io_handlers::tool_handler::ToolHandler;
 use crate::rule_tools::full_rule_toolkit;
 
-/// union toolkit 中包含的全部规则工具名(27 个)
+/// union toolkit 中包含的全部规则工具名(30 个)
 ///
 /// workspace 2 + rule 12 + translate 3 + audit 3 + knowledge 3 + skill 装配 1
-/// + meta 1 + evolution 2 = 27
+/// + meta 1 + evolution 2 + why/order 3 = 30
 const RULE_TOOL_NAMES: &[&str] = &[
     // workspace_tools (2)
     "ws_list",
@@ -63,9 +63,13 @@ const RULE_TOOL_NAMES: &[&str] = &[
     // evolution_tools (2,进化信号只读消费面 + 约束层晋升提名)
     "evolution_signals",
     "rule_promote",
+    // why/order_tools (3,查账因果查询面,PR-11b,只读)
+    "explain_denial",
+    "causal_order",
+    "lineage_of",
 ];
 
-/// 构建 union toolkit(内置 15 + 规则 27 = 42 工具,启动时一次组装)
+/// 构建 union toolkit(内置 15 + 规则 30 = 45 工具,启动时一次组装)
 ///
 /// 在 `cmd_serve` 启动时调用一次,结果存入 `AgentApiState.toolkit`。
 pub fn build_union_toolkit(
@@ -608,7 +612,7 @@ mod tests {
         let (ws, ev) = make_clients();
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
         let all = all_rule_tool_names();
-        assert_eq!(all.len(), 46, "rule tool spec count drift");
+        assert_eq!(all.len(), 49, "rule tool spec count drift");
         let mut settings = serde_json::Map::new();
         settings.insert(
             "agentTools.governanceWrite".to_string(),
@@ -628,10 +632,10 @@ mod tests {
             .collect();
         assert_eq!(
             keep.len(),
-            25,
-            "readonly surface must keep exactly 25 tools"
+            28,
+            "readonly surface must keep exactly 28 tools"
         );
-        // 25 只读 spec 中不在 serve union 42 面者本就不被 serve(与开关无关),
+        // 28 只读 spec 中不在 serve union 45 面者本就不被 serve(与开关无关),
         // 只断言 union 内只读工具全保留
         for name in &keep {
             if !RULE_TOOL_NAMES.contains(name) {
@@ -739,7 +743,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 42, "expected 42 total tool names");
+        assert_eq!(all_names.len(), 45, "expected 45 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),
