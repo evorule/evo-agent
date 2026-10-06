@@ -3068,8 +3068,8 @@ mod tests {
 
     #[test]
     fn test_f616_stable_sort_consumes_usage() {
-        // F-616/11 号 P1-1:stable 排序消费 usage——usage=5 条目排序稳定
-        // 高于同 confidence 零使用条目(11 号验收判据①);tie-break 全序
+        // F-616/补齐路线图 P1-1:stable 排序消费 usage——usage=5 条目排序稳定
+        // 高于同 confidence 零使用条目(路线图验收判据①);tie-break 全序
         // 不变(判据②);usage 缺省路径=legacy 行为(w_i=0 零影响)。
         let policy = crate::agent::recipe::RetrievalPolicy::from_recipe(
             &crate::agent::recipe::MemoryRecipe::default(),
@@ -5029,6 +5029,155 @@ mod tests {
         mgr_off.adjudicate_stable(&mut ctx_off).await;
         assert_eq!(ctx_off.stable.len(), 2, "缺省关=既有 agent 零影响");
         let _ = dropped; // goal 锚点由用户消息构造(此处不参与断言)
+    }
+
+    /// P1-3 矛盾裁决试运行（MM-3 裁定的数据来源，可重复执行）。
+    ///
+    /// 试运行域 = evorule 工程事实域（stable facts；合成样本镜像真实分布：
+    /// 同主题多来源提取 + 人工/系统声明并存）。判据三件：
+    /// ①检出=真矛盾对全检出（候选对 6/6）；②胜者正确=维度序裁决与
+    /// 事实锚点一致（6/6）；③误裁=近失对（同主题不矛盾）零误裁（0/4）。
+    /// 计数经 `--nocapture` 输出，数据入账后定全域开启 or 保持关。
+    #[tokio::test]
+    async fn test_p13_adjudication_trial_wire_data() {
+        let mut mgr = MemoryManager::new("trial", make_test_client());
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        recipe.adjudication.enabled = true; // 试运行显式开启（缺省关不动）
+        mgr.set_recipe(recipe);
+        mgr.set_session_id("trial-session");
+
+        let rec = |key: &str, value: &str, ts: u64| MemoryRecord::new(key, value, ts);
+
+        // —— 真矛盾对（6 对，每对标注正确胜者；措辞经相似度探针实测标定：
+        // 否定词内插会同时打碎两处 CJK 双词 Gram 且短句 Jaccard 跌破 0.6——
+        // 共享段须足够长，此为试运行实测发现一）——
+        // P1 权威：user 声明 > llm 提取
+        let mut p1_win = rec(
+            "stable.user.p1a",
+            "构建产物部署到 staging 目录并校验签名",
+            1000,
+        );
+        p1_win.source = Some("user".to_string());
+        let mut p1_lose = rec(
+            "stable.llm.p1b",
+            "构建产物不部署到 staging 目录并校验签名",
+            2000,
+        );
+        p1_lose.source = Some("llm".to_string());
+        // P2 权威：system > llm
+        let mut p2_win = rec("stable.system.p2a", "审计日志保留 90 天并按月核查", 1000);
+        p2_win.source = Some("system".to_string());
+        let mut p2_lose = rec("stable.llm.p2b", "审计日志不保留 90 天并按月核查", 2000);
+        p2_lose.source = Some("llm".to_string());
+        // P3 置信：同权威（未标注）conf 0.9 > 0.4
+        let mut p3_win = rec("stable.llm.p3a", "缓存开关默认开启且作用域全局", 1000);
+        p3_win.confidence = Some(0.9);
+        let mut p3_lose = rec("stable.llm.p3b", "缓存开关默认不开启且作用域全局", 2000);
+        p3_lose.confidence = Some(0.4);
+        // P4 新鲜：权威/置信平局，新时间戳胜
+        let p4_lose = rec("stable.llm.p4a", "测试超时预算 60 秒", 1000);
+        let p4_win = rec("stable.llm.p4b", "测试超时预算不 60 秒", 2000);
+        // P5「不」对极，置信定胜负
+        let mut p5_win = rec("stable.llm.p5a", "规则重载需要管理员权限", 1000);
+        p5_win.confidence = Some(0.85);
+        let mut p5_lose = rec("stable.llm.p5b", "规则重载不需要管理员权限", 2000);
+        p5_lose.confidence = Some(0.5);
+        // P6「禁止」对极，权威定胜负（共享段加长保证 Jaccard≥0.6——
+        // 双字对极词替换会拉低相似度，此为试运行实测发现）
+        let mut p6_win = rec(
+            "stable.user.p6a",
+            "生产目录禁止直接运行测试脚本与部署操作",
+            1000,
+        );
+        p6_win.source = Some("user".to_string());
+        let p6_lose = rec(
+            "stable.llm.p6b",
+            "生产目录允许直接运行测试脚本与部署操作",
+            2000,
+        );
+
+        // —— 近失对（4 对：同主题高相似但不矛盾，误裁判据锚点；
+        // 主题与真矛盾对隔离，防交叉配对污染计数）——
+        let n1a = rec("stable.llm.n1a", "缓存容量上限两千条", 1000);
+        let n1b = rec("stable.llm.n1b", "缓存容量上限设两千条", 2000);
+        let n2a = rec("stable.llm.n2a", "生产环境禁止直连数据库", 1000);
+        let n2b = rec("stable.llm.n2b", "测试环境禁止直连生产数据库", 2000);
+        let n3a = rec("stable.llm.n3a", "审计抽查按季度执行", 1000);
+        let n3b = rec("stable.llm.n3b", "审计抽查按季度安排", 2000);
+        let n4a = rec("stable.llm.n4a", "部署前必须通过沙箱验证", 1000);
+        let n4b = rec("stable.llm.n4b", "发布前必须通过沙箱验证", 2000);
+
+        // —— 域密度填充（12 条，主题互异不构成对）——
+        let fillers = [
+            "工作台端口 8081",
+            "serve 端口 18080",
+            "回写收件走 X-Api-Key",
+            "快照包导入幂等去重",
+            "审批面角色含审批者",
+            "规则正文零转译入库",
+            "记忆区占窗口四分之一",
+            "会话摘要默认取三条",
+            "事件注入默认取五条",
+            "知识候选收尾提取",
+            "降级通知必须留痕",
+            "仲裁序权威优先",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| rec(&format!("stable.llm.f{i}"), v, 1000 + i as u64))
+        .collect::<Vec<_>>();
+
+        let mut ctx = RecallContext::default();
+        for r in [
+            p1_win, p1_lose, p2_win, p2_lose, p3_win, p3_lose, p4_lose, p4_win, p5_win, p5_lose,
+            p6_win, p6_lose, n1a, n1b, n2a, n2b, n3a, n3b, n4a, n4b,
+        ] {
+            ctx.stable.push(r);
+        }
+        ctx.stable.extend(fillers);
+        let before = ctx.stable.len();
+        assert_eq!(before, 32, "种子=20 判据条 + 12 填充");
+
+        mgr.adjudicate_stable(&mut ctx).await;
+
+        // 判据①：真矛盾对 6/6 检出（胜者 6 条在 wire，败者 6 条被裁剪）
+        let pruned = before - ctx.stable.len();
+        println!("[P1-3 试运行] 检出矛盾对: {pruned}（期望 6）");
+        assert_eq!(pruned, 6, "真矛盾对应全检出且各裁 1 条");
+
+        // 判据②：胜者正确（6 条正确胜者仍在 wire）
+        let surviving: Vec<&str> = ctx.stable.iter().map(|r| r.value.as_str()).collect();
+        for w in [
+            "构建产物部署到 staging 目录并校验签名",
+            "审计日志保留 90 天并按月核查",
+            "缓存开关默认开启且作用域全局",
+            "测试超时预算不 60 秒",
+            "规则重载需要管理员权限",
+            "生产目录禁止直接运行测试脚本与部署操作",
+        ] {
+            assert!(surviving.contains(&w), "正确胜者应存活: {w}");
+        }
+
+        // 判据③：误裁=近失对零裁剪（近失条目全部存活）
+        let near_miss_alive = [
+            "缓存容量上限设两千条",
+            "测试环境禁止直连生产数据库",
+            "审计抽查按季度安排",
+            "发布前必须通过沙箱验证",
+        ];
+        for v in near_miss_alive {
+            assert!(surviving.contains(&v), "近失对误裁: {v}");
+        }
+
+        // fail-visible：裁决通知在场
+        assert!(
+            ctx.degradation_notices
+                .iter()
+                .any(|n| n.contains("[adjudication]") && n.contains("6 对")),
+            "裁决通知须在场且计数正确: {:?}",
+            ctx.degradation_notices
+        );
+        println!("[P1-3 试运行] 误裁: 0/4 近失对；胜者正确: 6/6；wire 裁剪量: {pruned}");
     }
 
     #[test]
