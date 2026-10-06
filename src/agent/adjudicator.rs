@@ -519,9 +519,7 @@ mod tests {
         server
             .mock("POST", "/api/sessions/77/command?wait=true")
             .with_status(200)
-            .with_body(
-                r#"{"success":true,"fact_id":30001,"accepted":null,"code":"WAIT_TIMEOUT"}"#,
-            )
+            .with_body(r#"{"success":true,"fact_id":30001,"accepted":null,"code":"WAIT_TIMEOUT"}"#)
             .create_async()
             .await;
 
