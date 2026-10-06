@@ -406,10 +406,8 @@ fn cluster_candidates(cands: &[CandidateFace], threshold: f32) -> Vec<Vec<usize>
     let toks: Vec<Vec<String>> = cands
         .iter()
         .map(|c| {
-            let mut t = crate::agent::memory::tokenize_for_match(&format!(
-                "{} {}",
-                c.title, c.body
-            ));
+            let mut t =
+                crate::agent::memory::tokenize_for_match(&format!("{} {}", c.title, c.body));
             t.sort();
             t.dedup();
             t
@@ -487,7 +485,10 @@ fn parse_candidate_face(path: &str, value: &serde_json::Value) -> Option<Candida
     let event_id = path.rsplit('.').next()?.to_string();
     Some(CandidateFace {
         event_id,
-        knowledge_kind: content.get("knowledge_kind").and_then(|v| v.as_str())?.to_string(),
+        knowledge_kind: content
+            .get("knowledge_kind")
+            .and_then(|v| v.as_str())?
+            .to_string(),
         title: content.get("title").and_then(|v| v.as_str())?.to_string(),
         body: content.get("body").and_then(|v| v.as_str())?.to_string(),
     })
@@ -538,8 +539,7 @@ async fn consolidate_knowledge_candidates(
     }
     let clusters = cluster_candidates(&faces, CONSOLIDATE_SIMILARITY_THRESHOLD);
     for cluster in clusters {
-        let sources: Vec<String> =
-            cluster.iter().map(|i| faces[*i].event_id.clone()).collect();
+        let sources: Vec<String> = cluster.iter().map(|i| faces[*i].event_id.clone()).collect();
         let corpus = cluster
             .iter()
             .map(|i| {
@@ -1249,17 +1249,21 @@ mod tests {
 
     #[test]
     fn probe_sim_detail() {
-        let mut a = crate::agent::memory::tokenize_for_match("登录超时阈值 登录超时阈值为 30 秒,超时即断开");
-        a.sort(); a.dedup();
-        let mut b = crate::agent::memory::tokenize_for_match("登录超时阈值说明 登录超时阈值 30 秒的相关说明");
-        b.sort(); b.dedup();
+        let mut a = crate::agent::memory::tokenize_for_match(
+            "登录超时阈值 登录超时阈值为 30 秒,超时即断开",
+        );
+        a.sort();
+        a.dedup();
+        let mut b = crate::agent::memory::tokenize_for_match(
+            "登录超时阈值说明 登录超时阈值 30 秒的相关说明",
+        );
+        b.sort();
+        b.dedup();
         println!("a={a:?}");
         println!("b={b:?}");
         let inter = a.iter().filter(|t| b.contains(t)).count();
         println!("inter={inter} union={}", a.len() + b.len() - inter);
     }
-
-
 
     use super::*;
     use crate::agent::translator::Message;
@@ -1268,7 +1272,6 @@ mod tests {
     fn make_test_client() -> crate::api::evorule_client::EvoruleApiClient {
         crate::api::evorule_client::EvoruleApiClient::new("http://localhost:8080")
     }
-
 
     #[test]
     fn test_cluster_candidates_greedy_deterministic() {
@@ -1280,8 +1283,18 @@ mod tests {
             body: body.to_string(),
         };
         let cands = vec![
-            face("KC-1", "fact", "登录超时阈值", "登录超时阈值为 30 秒,超时即断开"),
-            face("KC-2", "fact", "登录超时阈值说明", "登录超时阈值 30 秒的相关说明"),
+            face(
+                "KC-1",
+                "fact",
+                "登录超时阈值",
+                "登录超时阈值为 30 秒,超时即断开",
+            ),
+            face(
+                "KC-2",
+                "fact",
+                "登录超时阈值说明",
+                "登录超时阈值 30 秒的相关说明",
+            ),
             face("KC-3", "fact", "数据库连接池", "连接池大小默认为 10"),
         ];
         let c1 = cluster_candidates(&cands, 0.3);
@@ -1300,10 +1313,7 @@ mod tests {
         assert_eq!(out.title, "合并标题");
         assert_eq!(out.knowledge_kind, "fact");
         // 空标题拒绝
-        assert!(parse_consolidation(
-            r#"{"title":"","body":"x"}"#
-        )
-        .is_err());
+        assert!(parse_consolidation(r#"{"title":"","body":"x"}"#).is_err());
     }
 
     #[tokio::test]

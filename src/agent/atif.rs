@@ -869,10 +869,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                     observation: Some(AtifObservation {
                         results: vec![AtifObservationResult {
                             source_call_id: None,
-                            content: Some(format!(
-                                "session={session} hits={}",
-                                hits.join(" | ")
-                            )),
+                            content: Some(format!("session={session} hits={}", hits.join(" | "))),
                         }],
                     }),
                     metrics: None,
