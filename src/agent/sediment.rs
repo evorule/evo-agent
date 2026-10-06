@@ -57,6 +57,9 @@ pub struct SedimentConfig {
     pub enable_knowledge_extraction: bool,
     /// 触发知识候选提取的最小消息条数（太短会话无知识可提取）
     pub min_messages_for_extraction: usize,
+    /// 是否启用知识候选巩固（阶段 5 F-613 完整版第一增量：跨会话聚类→
+    /// sidecar 合并提议→Consolidated 落账；缺省开，跟随最小版先例）
+    pub enable_consolidation: bool,
     /// 是否启用 journal 摘要投影（跨源注册规格：确定性结构投影，零 LLM；
     /// Recipe sources.journal_digest 数据化开关，缺省关=既有 agent 零影响）
     pub enable_journal_digest: bool,
@@ -73,6 +76,7 @@ impl Default for SedimentConfig {
             llm_model_id: "unknown".to_string(),
             enable_knowledge_extraction: true,
             min_messages_for_extraction: 4,
+            enable_consolidation: true,
             enable_journal_digest: false,
         }
     }
@@ -120,6 +124,8 @@ pub struct SedimentResult {
     pub rollup_done: bool,
     /// journal 摘要投影是否成功写入共享空间（跨源注册规格）
     pub journal_digest_written: bool,
+    /// 巩固产物 event_id 列表（Consolidated 落账；阶段 5 F-613）
+    pub knowledge_consolidated: Vec<String>,
 }
 
 /// C1 主入口：会话结束时调用（best-effort，错误记日志不阻断）
@@ -225,6 +231,12 @@ pub async fn sediment(
     //    候选落 shared.{ns}.knowledge_candidates.*（与 sediment 既有产物并列）
     if cfg.enable_knowledge_extraction {
         extract_knowledge_candidates(deps, cfg, session_id, messages, &mut result).await;
+    }
+
+    // 6.5 巩固管线（阶段 5 F-613 完整版第一增量）：跨会话候选确定性聚类 →
+    //    sidecar 合并提议 → Consolidated 落账（溯源=consolidates 清单）
+    if cfg.enable_consolidation {
+        consolidate_knowledge_candidates(deps, cfg, session_id, &mut result).await;
     }
 
     // 7. journal 摘要投影（跨源注册规格）：确定性结构投影（零 LLM）——
@@ -354,6 +366,292 @@ pub(crate) fn build_journal_digest(session_id: &str, lines: &[JournalLine]) -> S
         None => s.push_str("收尾: 无 turn_ended 记录。\n"),
     }
     s
+}
+
+// ===== 巩固管线（阶段 5 F-613 完整版第一增量）=====
+//
+// 11 号 §六 完整版三步的最小闭环：
+// 1. 跨会话候选加载（确定性：账本 knowledge_candidates 家族全量拉取）；
+// 2. 聚类（确定性：分词集 Jaccard ≥ 阈值贪心成簇——与矛盾裁决同函数族）；
+// 3. sidecar LLM 合并提议（purpose=knowledge_consolidation，审计在链）→
+//    Consolidated 事件落账（content.consolidates 清单=溯源一键展开；
+//    整数 cause 链接随下一增量，源 id 为字符串键不适用 FactId 通路口径）。
+//
+// 语义边界：LLM 只做合并提议，落账=规则通路（set_scoped 受信通道，
+// Settled 直落——巩固产物是系统沉淀动作而非候选提案，与最小版产物同级）；
+// 治理闸行权面（Draft→Active）随治理域演进。
+
+/// 巩固聚类相似阈值（分词集 Jaccard；与矛盾裁决同族口径）
+const CONSOLIDATE_SIMILARITY_THRESHOLD: f32 = 0.5;
+
+/// 巩固候选面（从账本 MemoryEvent JSON 解析的投影）
+#[derive(Debug, Clone)]
+struct CandidateFace {
+    event_id: String,
+    knowledge_kind: String,
+    title: String,
+    body: String,
+}
+
+/// 贪心聚类（确定性）：按 (kind, event_id) 序遍历，未分配者成种子，
+/// 相似 ≥ 阈值者并入；返回簇（成员为原表下标），单元素簇不出（无合并对象）。
+fn cluster_candidates(cands: &[CandidateFace], threshold: f32) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..cands.len()).collect();
+    order.sort_by(|a, b| {
+        cands[*a]
+            .knowledge_kind
+            .cmp(&cands[*b].knowledge_kind)
+            .then(cands[*a].event_id.cmp(&cands[*b].event_id))
+    });
+    let toks: Vec<Vec<String>> = cands
+        .iter()
+        .map(|c| {
+            let mut t = crate::agent::memory::tokenize_for_match(&format!(
+                "{} {}",
+                c.title, c.body
+            ));
+            t.sort();
+            t.dedup();
+            t
+        })
+        .collect();
+    let sim = |x: usize, y: usize| -> f32 {
+        let (sa, sb) = (&toks[x], &toks[y]);
+        if sa.is_empty() || sb.is_empty() {
+            return 0.0;
+        }
+        let inter = sa.iter().filter(|t| sb.contains(t)).count();
+        let union = sa.len() + sb.len() - inter;
+        if union == 0 {
+            0.0
+        } else {
+            inter as f32 / union as f32
+        }
+    };
+    let mut assigned = vec![false; cands.len()];
+    let mut clusters = Vec::new();
+    for seed in &order {
+        let seed = *seed;
+        if assigned[seed] {
+            continue;
+        }
+        let mut cluster = vec![seed];
+        assigned[seed] = true;
+        for &cand in order.iter() {
+            if assigned[cand] {
+                continue;
+            }
+            if sim(seed, cand) >= threshold {
+                cluster.push(cand);
+                assigned[cand] = true;
+            }
+        }
+        if cluster.len() >= 2 {
+            clusters.push(cluster);
+        }
+    }
+    clusters
+}
+
+/// 巩固合并提议 LLM 输出信封
+#[derive(Debug, serde::Deserialize)]
+struct ConsolidationOut {
+    title: String,
+    body: String,
+    #[serde(default = "default_consolidation_kind")]
+    knowledge_kind: String,
+    #[serde(default = "default_candidate_confidence")]
+    confidence: f32,
+}
+
+fn default_consolidation_kind() -> String {
+    "model".to_string()
+}
+
+fn parse_consolidation(json_str: &str) -> Result<ConsolidationOut, String> {
+    let out: ConsolidationOut =
+        serde_json::from_str(json_str).map_err(|e| format!("parse consolidation JSON: {}", e))?;
+    if out.title.trim().is_empty() || out.body.trim().is_empty() {
+        return Err("consolidation empty title/body".to_string());
+    }
+    Ok(out)
+}
+
+/// 从账本行解析候选面（MemoryEvent JSON；payload 包裹与顶层双兼容）
+fn parse_candidate_face(path: &str, value: &serde_json::Value) -> Option<CandidateFace> {
+    let face = value
+        .get("payload")
+        .and_then(|v| v.as_object())
+        .unwrap_or(value.as_object()?);
+    let content = face.get("content").and_then(|v| v.as_object())?;
+    let event_id = path.rsplit('.').next()?.to_string();
+    Some(CandidateFace {
+        event_id,
+        knowledge_kind: content.get("knowledge_kind").and_then(|v| v.as_str())?.to_string(),
+        title: content.get("title").and_then(|v| v.as_str())?.to_string(),
+        body: content.get("body").and_then(|v| v.as_str())?.to_string(),
+    })
+}
+
+/// 主入口：跨会话候选巩固（best-effort，审计 sidecar 通路复用纪律①）
+async fn consolidate_knowledge_candidates(
+    deps: &mut SedimentDeps<'_>,
+    cfg: &SedimentConfig,
+    session_id: &str,
+    result: &mut SedimentResult,
+) {
+    let auditor = match deps.auditor {
+        Some(a) => a,
+        None => {
+            tracing::warn!(
+                session_id = %session_id,
+                "sediment: consolidation skipped (no audited LLM path)"
+            );
+            return;
+        }
+    };
+    let prefix = format!("shared.{}.knowledge_candidates.", deps.memory.namespace());
+    let facts = match deps
+        .memory
+        .evorule_client
+        .get_shared_facts(Some(&prefix))
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "sediment: consolidation candidate load failed (best-effort skip)"
+            );
+            return;
+        }
+    };
+    let mut faces: Vec<CandidateFace> = Vec::new();
+    for f in &facts {
+        if let Some(face) = parse_candidate_face(&f.path, &f.value) {
+            faces.push(face);
+        }
+    }
+    if faces.len() < 2 {
+        return; // 少于 2 条无合并对象
+    }
+    let clusters = cluster_candidates(&faces, CONSOLIDATE_SIMILARITY_THRESHOLD);
+    for cluster in clusters {
+        let sources: Vec<String> =
+            cluster.iter().map(|i| faces[*i].event_id.clone()).collect();
+        let corpus = cluster
+            .iter()
+            .map(|i| {
+                let c = &faces[*i];
+                format!("- [{}] {}: {}", c.knowledge_kind, c.title, c.body)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!(
+            "以下同主题知识候选经确定性聚类判为可合并。请合并/去重/抽象为一条语义候选,输出 JSON。\n\n候选:\n{corpus}\n\n输出 JSON 格式:\n{{\"title\":\"合并后标题\",\"body\":\"自包含合并正文(须覆盖各候选要点)\",\"knowledge_kind\":\"五类之一\",\"confidence\":0.8}}\n\n只输出 JSON,不要输出其他内容。"
+        );
+        let mut params_map = serde_json::Map::new();
+        params_map.insert(
+            "model".to_string(),
+            serde_json::Value::String(cfg.llm_model_id.clone()),
+        );
+        params_map.insert("temperature".to_string(), serde_json::json!(0.0));
+        params_map.insert("max_tokens".to_string(), serde_json::json!(1024));
+        params_map.insert(
+            "messages".to_string(),
+            serde_json::json!([
+                {"role": "system", "content": "你是知识巩固助手:把同主题候选合并为一条更凝练的语义候选。"},
+                {"role": "user", "content": prompt}
+            ]),
+        );
+        let out = match auditor
+            .execute(
+                "knowledge_consolidation",
+                &serde_json::Value::Object(params_map),
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "sediment: consolidation LLM call failed (cluster skipped)"
+                );
+                continue;
+            }
+        };
+        let text = out
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&out.to_string())
+            .to_string();
+        let merged = match parse_consolidation(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "sediment: consolidation parse failed (cluster skipped)"
+                );
+                continue;
+            }
+        };
+        // Consolidated 事件落账（溯源=content.consolidates 清单一键展开）
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let event_id = format!("CC-{}-{}", sanitize_model_id(session_id), now);
+        let mut event = crate::agent::memory_event::event::MemoryEvent::new_root(
+            &event_id,
+            crate::agent::memory_event::event::EventType::Custom(
+                "knowledge_consolidated".to_string(),
+            ),
+            now,
+            crate::agent::memory_event::event::EventSource::LlmExtraction,
+        )
+        .with_confidence(merged.confidence.clamp(0.0, 1.0))
+        .with_tag("consolidated")
+        .with_tag(&merged.knowledge_kind)
+        .with_session(session_id);
+        event.content = serde_json::json!({
+            "knowledge_kind": merged.knowledge_kind,
+            "title": merged.title,
+            "body": merged.body,
+            "consolidates": sources,
+        });
+        let value = match serde_json::to_string(&event) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "sediment: consolidation serialize failed");
+                continue;
+            }
+        };
+        let key = format!("knowledge_candidates.consolidated.{}", event_id);
+        match deps
+            .memory
+            .set_scoped(crate::agent::memory::MemoryScope::Shared, &key, &value)
+            .await
+        {
+            Ok(_) => {
+                result.knowledge_consolidated.push(event_id.clone());
+                if let Some(store) = deps.event_store.as_mut() {
+                    if let Err(e) = store.write_event(event).await {
+                        tracing::warn!(
+                            error = %e,
+                            event_id = %event_id,
+                            "sediment: consolidation dual-write failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "sediment: consolidation write failed");
+            }
+        }
+    }
 }
 
 /// B5：模型标识消毒为合法路径段（非 `[a-zA-Z0-9-_]` 替换为 `-`）
@@ -948,7 +1246,89 @@ async fn rollup_old_summaries(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn probe_sim_detail() {
+        let mut a = crate::agent::memory::tokenize_for_match("登录超时阈值 登录超时阈值为 30 秒,超时即断开");
+        a.sort(); a.dedup();
+        let mut b = crate::agent::memory::tokenize_for_match("登录超时阈值说明 登录超时阈值 30 秒的相关说明");
+        b.sort(); b.dedup();
+        println!("a={a:?}");
+        println!("b={b:?}");
+        let inter = a.iter().filter(|t| b.contains(t)).count();
+        println!("inter={inter} union={}", a.len() + b.len() - inter);
+    }
+
+
+
     use super::*;
+    use crate::agent::translator::Message;
+    use crate::io_handlers::LlmHandler;
+
+    fn make_test_client() -> crate::api::evorule_client::EvoruleApiClient {
+        crate::api::evorule_client::EvoruleApiClient::new("http://localhost:8080")
+    }
+
+
+    #[test]
+    fn test_cluster_candidates_greedy_deterministic() {
+        // 巩固聚类:同主题成簇、异主题孤立(单元素簇不出)、同输入同簇序
+        let face = |id: &str, kind: &str, title: &str, body: &str| CandidateFace {
+            event_id: id.to_string(),
+            knowledge_kind: kind.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+        };
+        let cands = vec![
+            face("KC-1", "fact", "登录超时阈值", "登录超时阈值为 30 秒,超时即断开"),
+            face("KC-2", "fact", "登录超时阈值说明", "登录超时阈值 30 秒的相关说明"),
+            face("KC-3", "fact", "数据库连接池", "连接池大小默认为 10"),
+        ];
+        let c1 = cluster_candidates(&cands, 0.3);
+        let c2 = cluster_candidates(&cands, 0.3);
+        assert_eq!(c1, c2, "确定性:同输入同簇序");
+        assert_eq!(c1.len(), 1, "同主题两候选成簇,异主题孤立");
+        assert_eq!(c1[0].len(), 2);
+    }
+
+    #[test]
+    fn test_parse_consolidation_output() {
+        let out = parse_consolidation(
+            r#"{"title":"合并标题","body":"合并正文","knowledge_kind":"fact","confidence":0.9}"#,
+        )
+        .unwrap();
+        assert_eq!(out.title, "合并标题");
+        assert_eq!(out.knowledge_kind, "fact");
+        // 空标题拒绝
+        assert!(parse_consolidation(
+            r#"{"title":"","body":"x"}"#
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_consolidate_skips_small_candidate_set() {
+        // 候选 <2 → 无合并对象直接返回(不调 LLM 不写账;离线客户端安全)
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        mgr.set_recipe(recipe.clone());
+        let mut cfg = SedimentConfig::default();
+        cfg.enable_consolidation = true;
+        let llm = LlmHandler::mock(r#"{"title":"x","body":"y"}"#);
+        let auditor = AuditedLlm::new(make_test_client(), llm);
+        let mut deps = SedimentDeps {
+            memory: &mut mgr,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: Some(&auditor),
+            journal_lines: Vec::new(),
+        };
+        let mut result = SedimentResult::default();
+        // 账本加载离线失败 → best-effort skip(不 panic 不写账)
+        consolidate_knowledge_candidates(&mut deps, &cfg, "s1", &mut result).await;
+        assert!(result.knowledge_consolidated.is_empty());
+    }
 
     #[test]
     fn test_build_journal_digest_deterministic_projection() {

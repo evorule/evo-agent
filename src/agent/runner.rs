@@ -1192,6 +1192,8 @@ impl AgentRunner {
             min_messages_for_extraction: 4,
             // 跨源批 C:journal 摘要投影(缺省关;Recipe sources 穿线于上)
             enable_journal_digest: false,
+            // 阶段 5 F-613:知识候选巩固(缺省开,跟随最小版先例)
+            enable_consolidation: true,
         };
         // 阶段 3(F-611)+A2-2:自省记忆工具注册(声明面已在 step 2 按暴露条件
         // 预放行;此处声明了而条件不满足=配置矛盾,早失败)。置于 sediment_config
