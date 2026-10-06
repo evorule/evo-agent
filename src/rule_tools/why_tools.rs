@@ -191,14 +191,6 @@ impl ToolFunction for ExplainDenialTool {
 // causal_order —— 两事实因果序（链式哈希序，非墙钟；限同链域内）
 // =============================================================================
 
-fn chain_entry_map(chain_resp: &Value) -> Result<Vec<Value>, String> {
-    chain_resp
-        .get("chain")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .ok_or_else(|| "causal chain response has no chain array".to_string())
-}
-
 fn entry_fact_id(e: &Value) -> Option<u64> {
     e.get("fact_id").and_then(|v| v.as_u64())
 }
@@ -231,28 +223,30 @@ impl ToolFunction for CausalOrderTool {
         let fact_b = parse_u64_arg(args, "fact_b")?;
         let session_str = session_id.to_string();
 
-        // 两条因果链（各自回溯至创世）合并 = 该查询域内可见的链片段
-        let resp_a = self
+        // 单次拉取全链审计报告（含 content）。cause 解析 = 条目级 cause 优先，
+        // content_json.cause 兜底——实测（PR-11b E2E, session 607）Violation
+        // 事实的因果指针只在 content 层透出（governance auditor 条目级 cause
+        // 对 Violation 为 null），两级取或即覆盖全形态。
+        let report = self
             .ev
-            .get_causal_chain(&session_str, fact_a)
+            .get_audit_report_with_content(&session_str)
             .await
-            .map_err(|e| format!("causal chain (fact {fact_a}) fetch failed: {e}"))?;
-        let resp_b = self
-            .ev
-            .get_causal_chain(&session_str, fact_b)
-            .await
-            .map_err(|e| format!("causal chain (fact {fact_b}) fetch failed: {e}"))?;
-        let mut merged: Vec<Value> = chain_entry_map(&resp_a)?;
-        for e in chain_entry_map(&resp_b)? {
-            let id = entry_fact_id(&e);
-            if !merged.iter().any(|m| entry_fact_id(m) == id) {
-                merged.push(e);
-            }
-        }
+            .map_err(|e| format!("audit report fetch failed: {e}"))?;
+        let entries = report
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "audit report has no entries array".to_string())?;
+
+        let cause_of = |e: &Value| -> Option<u64> {
+            entry_cause(e).or_else(|| {
+                let c = e.get("content_json").and_then(|c| c.get("cause"))?;
+                c.as_u64().or_else(|| c.as_str()?.parse().ok())
+            })
+        };
 
         // 域边界（裁定③）：任一事实不在本会话链上 → 不可比 + 域说明
-        let has_a = merged.iter().any(|e| entry_fact_id(e) == Some(fact_a));
-        let has_b = merged.iter().any(|e| entry_fact_id(e) == Some(fact_b));
+        let has_a = entries.iter().any(|e| entry_fact_id(e) == Some(fact_a));
+        let has_b = entries.iter().any(|e| entry_fact_id(e) == Some(fact_b));
         if !has_a || !has_b {
             return Ok(json!({
                 "session_id": session_id,
@@ -266,16 +260,19 @@ impl ToolFunction for CausalOrderTool {
             }));
         }
 
-        // 因果路径：从 X 沿 cause 指针回溯（祖先链）
+        // 因果路径：从 X 沿 cause 指针回溯（祖先链；visited 防环）
         let ancestors_of = |start: u64| -> Vec<u64> {
             let mut path = Vec::new();
             let mut cur = Some(start);
             while let Some(id) = cur {
+                if path.contains(&id) {
+                    break;
+                }
                 path.push(id);
-                cur = merged
+                cur = entries
                     .iter()
                     .find(|e| entry_fact_id(e) == Some(id))
-                    .and_then(entry_cause);
+                    .and_then(cause_of);
             }
             path
         };
@@ -295,12 +292,12 @@ impl ToolFunction for CausalOrderTool {
             ("a_before_b", Some(seg), true)
         } else {
             // 无直接因果路径：按链位（logical_time = 链上串行化位置）定先后
-            let ta = merged
+            let ta = entries
                 .iter()
                 .find(|e| entry_fact_id(e) == Some(fact_a))
                 .map(entry_logical_time)
                 .unwrap_or(0);
-            let tb = merged
+            let tb = entries
                 .iter()
                 .find(|e| entry_fact_id(e) == Some(fact_b))
                 .map(entry_logical_time)
@@ -698,27 +695,24 @@ mod tests {
     // causal_order
     // =========================================================================
 
-    fn chain_resp(fact_id: u64, chain: Value) -> String {
-        json!({"session_id": 42, "fact_id": fact_id, "chain_length": chain.as_array().map(|a| a.len()).unwrap_or(0), "chain": chain})
-            .to_string()
+    fn audit_report_resp(entries: Value) -> String {
+        json!({
+            "session_id": 42, "fact_count": entries.as_array().map(|a| a.len()).unwrap_or(0),
+            "last_hash": "aa..ff", "verified": true, "entries": entries
+        })
+        .to_string()
     }
 
     #[test]
     fn causal_order_ancestor_path_determines_order_not_wallclock() {
         // 链式哈希序锚定：7 是 9 的祖先（cause 指针），序=7 before 9——
         // 即使响应携带的任何时间类字段被交换，序仍由 cause 指针决定
-        let chain_for_9 = json!([
+        let entries = json!([
             {"fact_id": 9, "fact_type": "io_response", "logical_time": 9, "cause": 8},
             {"fact_id": 8, "fact_type": "violation", "logical_time": 8, "cause": 7},
             {"fact_id": 7, "fact_type": "io_request", "logical_time": 7, "cause": 6}
         ]);
-        let chain_for_7 = json!([
-            {"fact_id": 7, "fact_type": "io_request", "logical_time": 7, "cause": 6}
-        ]);
-        let base = spawn_http_fixture(vec![
-            (200, chain_resp(9, chain_for_9)),
-            (200, chain_resp(7, chain_for_7)),
-        ]);
+        let base = spawn_http_fixture(vec![(200, audit_report_resp(entries))]);
         let rt = rt();
         let mut handler = ToolHandler::new();
         handler.register_static(
@@ -741,17 +735,13 @@ mod tests {
 
     #[test]
     fn causal_order_no_causal_path_falls_back_to_chain_position() {
-        // 平行事实（互不为祖先）：按链位（logical_time）定先后并如实标注
-        let chain_for_10 = json!([
-            {"fact_id": 10, "fact_type": "io_request", "logical_time": 10, "cause": 5}
+        // 平行事实（互不为祖先，条目级与内容级均无 cause）：按链位
+        // （logical_time）定先后并如实标注 causally_related:false
+        let entries = json!([
+            {"fact_id": 11, "fact_type": "io_request", "logical_time": 11, "cause": null},
+            {"fact_id": 10, "fact_type": "io_request", "logical_time": 10, "cause": null}
         ]);
-        let chain_for_11 = json!([
-            {"fact_id": 11, "fact_type": "io_request", "logical_time": 11, "cause": 5}
-        ]);
-        let base = spawn_http_fixture(vec![
-            (200, chain_resp(11, chain_for_11)),
-            (200, chain_resp(10, chain_for_10)),
-        ]);
+        let base = spawn_http_fixture(vec![(200, audit_report_resp(entries))]);
         let rt = rt();
         let mut handler = ToolHandler::new();
         handler.register_static(
@@ -774,13 +764,10 @@ mod tests {
     #[test]
     fn causal_order_absent_fact_reports_honest_domain_boundary() {
         // 裁定③诚实边界：事实不在本会话链上 → 不可比 + 域说明
-        let chain_for_9 = json!([
+        let entries = json!([
             {"fact_id": 9, "fact_type": "io_response", "logical_time": 9, "cause": 8}
         ]);
-        let base = spawn_http_fixture(vec![
-            (200, chain_resp(9, chain_for_9)),
-            (200, chain_resp(999, json!([]))),
-        ]);
+        let base = spawn_http_fixture(vec![(200, audit_report_resp(entries))]);
         let rt = rt();
         let mut handler = ToolHandler::new();
         handler.register_static(
@@ -797,6 +784,41 @@ mod tests {
         assert_eq!(out["comparable"], false);
         let reason = out["reason"].as_str().unwrap();
         assert!(reason.contains("NOT comparable"), "域说明在场: {reason}");
+    }
+
+    #[test]
+    fn causal_order_violation_cause_falls_back_to_content_layer() {
+        // PR-11b E2E 实测校准（session 607）：Violation 事实的条目级 cause
+        // 为 null（governance auditor extract_cause 不覆盖 Violation），因果
+        // 指针只在 content_json.cause 透出——兜底解析后祖先路径成立，
+        // 30125（被拒指令）before 7（Violation），causally_related:true。
+        let entries = json!([
+            {"fact_id": 7, "fact_type": "Violation", "logical_time": 45,
+             "cause": null,
+             "content_json": {"type": "Violation", "id": 7, "cause": 30125,
+                              "rule_index": 20, "reason": "shell_exec danger_hits"}},
+            {"fact_id": 30125, "fact_type": "Command", "logical_time": 43,
+             "cause": null,
+             "content_json": {"type": "Command", "id": 30125}}
+        ]);
+        let base = spawn_http_fixture(vec![(200, audit_report_resp(entries))]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "causal_order",
+            Arc::new(CausalOrderTool::new(EvoruleApiClient::new(&base))),
+        );
+        let out = rt
+            .block_on(handler.execute_by_name(
+                "causal_order",
+                &json!({"session_id": "42", "fact_a": 30125, "fact_b": 7}),
+            ))
+            .unwrap();
+
+        assert_eq!(out["comparable"], true);
+        assert_eq!(out["order"], "a_before_b");
+        assert_eq!(out["causally_related"], true);
+        assert_eq!(out["middle_chain"], json!([30125, 7]));
     }
 
     // =========================================================================
