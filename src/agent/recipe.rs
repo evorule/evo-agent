@@ -23,6 +23,15 @@ pub struct RetrievalConfig {
     /// 重要性权重
     #[serde(default = "default_w_importance")]
     pub w_importance: f32,
+    /// importance 内 confidence 权重（w_c，F-616 stable 面接通）
+    #[serde(default = "default_w_confidence")]
+    pub w_confidence: f32,
+    /// importance 内 usage 加成权重（w_u，k 封顶防垄断）
+    #[serde(default = "default_w_usage")]
+    pub w_usage: f32,
+    /// usage 计数封顶（k：min(usage,k) 防高频条目垄断排序）
+    #[serde(default = "default_usage_cap")]
+    pub usage_cap: u32,
     /// 半衰期（天）：情景/语义分型
     #[serde(default = "default_half_life")]
     pub half_life_days: HalfLifeDays,
@@ -36,6 +45,15 @@ fn default_w_recency() -> f32 {
 }
 fn default_w_importance() -> f32 {
     0.2
+}
+fn default_w_confidence() -> f32 {
+    1.0
+}
+fn default_w_usage() -> f32 {
+    0.2
+}
+fn default_usage_cap() -> u32 {
+    10
 }
 fn default_half_life() -> HalfLifeDays {
     HalfLifeDays {
@@ -262,6 +280,9 @@ impl Default for MemoryRecipe {
                 w_relevance: default_w_relevance(),
                 w_recency: default_w_recency(),
                 w_importance: default_w_importance(),
+                w_confidence: default_w_confidence(),
+                w_usage: default_w_usage(),
+                usage_cap: default_usage_cap(),
                 half_life_days: default_half_life(),
             },
             lifecycle: LifecycleConfig {
@@ -288,12 +309,19 @@ impl Default for MemoryRecipe {
 ///
 /// - `rel`：词法 bigram 命中数（R05，0..=cap 归一）
 /// - `recency`：半衰期指数衰减（0..1]
-/// - `importance`：v1=confidence（usage/实体度随 F-616 接入）
+/// - `importance`：w_c·confidence + w_u·min(usage,k)（F-616 stable 面接通；
+///   usage=存量计数+本会话增量，k 封顶防垄断；配方可调）
 #[derive(Debug, Clone)]
 pub struct RetrievalPolicy {
     pub w_relevance: f32,
     pub w_recency: f32,
     pub w_importance: f32,
+    /// importance 内 confidence 权重（w_c）
+    pub w_confidence: f32,
+    /// importance 内 usage 加成权重（w_u）
+    pub w_usage: f32,
+    /// usage 计数封顶（k）
+    pub usage_cap: u32,
     /// 情景半衰期（天）
     pub half_life_episodic_days: f64,
     /// 语义半衰期（天）
@@ -311,6 +339,9 @@ impl RetrievalPolicy {
             w_relevance: recipe.retrieval.w_relevance,
             w_recency: recipe.retrieval.w_recency,
             w_importance: recipe.retrieval.w_importance,
+            w_confidence: recipe.retrieval.w_confidence,
+            w_usage: recipe.retrieval.w_usage,
+            usage_cap: recipe.retrieval.usage_cap,
             half_life_episodic_days: recipe.retrieval.half_life_days.episodic,
             half_life_semantic_days: recipe.retrieval.half_life_days.semantic,
             degradation_order: recipe.budget.degradation_order.clone(),
@@ -324,6 +355,9 @@ impl RetrievalPolicy {
             w_relevance: 1.0,
             w_recency: 0.0,
             w_importance: 0.0,
+            w_confidence: 1.0,
+            w_usage: 0.2,
+            usage_cap: 10,
             half_life_episodic_days: 14.0,
             half_life_semantic_days: 90.0,
             degradation_order: default_degradation(),

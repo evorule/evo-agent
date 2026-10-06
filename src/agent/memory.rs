@@ -438,9 +438,11 @@ pub(crate) fn sort_stable_by_value(stable: &mut [MemoryRecord], goal: &str) {
 }
 
 /// 三因子加权排序（策略数据化通用版）：
-/// `S = w_r·rel_norm + w_t·recency + w_i·confidence`
+/// `S = w_r·rel_norm + w_t·recency + w_i·importance`
 /// rel_norm = 命中数/最大命中数（批内归一，避免绝对数尺度支配加权）；
 /// recency = 半衰期因子（0.5^(age_days/half_life)，语义分型）；
+/// importance = w_c·confidence + w_u·min(usage,k)（F-616 stable 面接通：
+/// usage=存量 usage_count+本会话 pending 增量，k 封顶防垄断，配方可调）；
 /// 全序 Tie-break：新鲜度 ▸ 置信度 ▸ key 字典序（确定性可回放）。
 pub(crate) fn sort_by_policy(
     stable: &mut [MemoryRecord],
@@ -448,7 +450,6 @@ pub(crate) fn sort_by_policy(
     policy: &crate::agent::recipe::RetrievalPolicy,
     usage: Option<&std::collections::HashMap<u64, u32>>,
 ) {
-    let _ = usage; // F-616:importance 的 usage 加成在 events 评分内联计算;stable 排序预留
     let mut goal_uniq = tokenize_for_match(goal);
     goal_uniq.sort();
     goal_uniq.dedup();
@@ -471,7 +472,16 @@ pub(crate) fn sort_by_policy(
                 policy.half_life_semantic_days
             };
             let recency = policy.recency_factor(age_days, half);
-            let importance = r.confidence.unwrap_or(0.5);
+            // F-616：importance 消费 usage——存量 usage_count + 本会话
+            // pending 增量（fact_id 查 usage map），k 封顶防垄断
+            let pending = r
+                .fact_id
+                .and_then(|fid| usage.and_then(|m| m.get(&fid)))
+                .copied()
+                .unwrap_or(0);
+            let usage_hits = r.usage_count.saturating_add(pending);
+            let importance = policy.w_confidence * r.confidence.unwrap_or(0.5)
+                + policy.w_usage * usage_hits.min(policy.usage_cap) as f32;
             policy.w_relevance * rel_norm
                 + policy.w_recency * recency
                 + policy.w_importance * importance
@@ -3054,6 +3064,69 @@ mod tests {
         ];
         sort_stable_by_value(&mut by_ts, "");
         assert_eq!(by_ts[0].key, "new");
+    }
+
+    #[test]
+    fn test_f616_stable_sort_consumes_usage() {
+        // F-616/11 号 P1-1:stable 排序消费 usage——usage=5 条目排序稳定
+        // 高于同 confidence 零使用条目(11 号验收判据①);tie-break 全序
+        // 不变(判据②);usage 缺省路径=legacy 行为(w_i=0 零影响)。
+        let policy = crate::agent::recipe::RetrievalPolicy::from_recipe(
+            &crate::agent::recipe::MemoryRecipe::default(),
+        );
+        let goal = "记忆预算";
+        let mk_usage = |key: &str, ts: u64, usage_count: u32, fact_id: Option<u64>| {
+            let mut r = MemoryRecord::new(key, "记忆预算裁剪规则", ts);
+            r.confidence = Some(0.6);
+            r.usage_count = usage_count;
+            r.fact_id = fact_id;
+            r
+        };
+        // 同分:同内容(相关同分)同新鲜同置信——usage 是唯一区分因子
+        let mut stable = vec![
+            mk_usage("stable.llm.m.zero", 100, 0, None),
+            mk_usage("stable.llm.m.used", 100, 5, None),
+        ];
+        sort_by_policy(&mut stable, goal, &policy, None);
+        assert_eq!(stable[0].key, "stable.llm.m.used", "usage=5 须排前");
+
+        // 本会话 pending 增量(fact_id 查 map)与存量计数同效
+        let mut pending = std::collections::HashMap::new();
+        pending.insert(7u64, 3u32);
+        let mut stable2 = vec![
+            mk_usage("stable.llm.m.zero", 100, 0, None),
+            mk_usage("stable.llm.m.pend", 100, 2, Some(7)),
+        ];
+        sort_by_policy(&mut stable2, goal, &policy, Some(&pending));
+        assert_eq!(
+            stable2[0].key, "stable.llm.m.pend",
+            "存量2+pending3=5 须排前"
+        );
+
+        // k 封顶:min(usage,k)——usage=50 与 usage=10 同分(同 ts/conf)→
+        // key 字典序兜底,垄断被截断
+        let mut capped = vec![
+            mk_usage("stable.llm.m.ka", 100, 10, None),
+            mk_usage("stable.llm.m.kb", 100, 50, None),
+        ];
+        sort_by_policy(&mut capped, goal, &policy, None);
+        assert_eq!(capped[0].key, "stable.llm.m.ka", "封顶后同分回 key 序");
+
+        // legacy 词法路径(w_i=0):usage 不影响评分,输出仅由全序兜底决定
+        // (同词法分→ts desc 同→conf 同→key asc:"used"<"zero" 恒前)
+        let legacy = crate::agent::recipe::RetrievalPolicy::default_lexical();
+        let mut stable3 = vec![
+            mk_usage("stable.llm.m.zero", 100, 0, None),
+            mk_usage("stable.llm.m.used", 100, 5, None),
+        ];
+        sort_by_policy(&mut stable3, goal, &legacy, None);
+        assert_eq!(stable3[0].key, "stable.llm.m.used");
+        let mut flipped = vec![
+            mk_usage("stable.llm.m.used", 100, 5, None),
+            mk_usage("stable.llm.m.zero", 100, 0, None),
+        ];
+        sort_by_policy(&mut flipped, goal, &legacy, None);
+        assert_eq!(flipped[0].key, "stable.llm.m.used");
     }
 
     #[test]
