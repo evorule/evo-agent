@@ -484,6 +484,19 @@ Agent 配置从 `agents/{type}.json` 加载：
 
 说明：键为 `application` 作用域，**工作区层不可覆盖**（防项目级配置私自扩权 agent 工具面）；关闭后 LLM 仍可辅助「人起草」（rule_to_transform / rule_to_conditional / rule_validate 纯计算，不出网不落盘），提交/晋升/发布权回到人（console-cloud 审批流）。真正的保密企业通常跑内网自有模型、数据不出内网，此开关默认不干预其全开形态。
 
+### 动态源工具开关（agentTools.mcp / agentTools.serviceProxy）
+
+MCP 远端工具与服务代理工具为运行期动态注册（非静态工具面），各绑一个来源级总开关，默认**全开**（向后兼容，现状零变化）：
+
+| 配置 | 效果 |
+|------|------|
+| `agentTools.mcp = true`（默认） | `mcp.servers` 配置握手注册的 MCP 远端工具全量可用 |
+| `agentTools.mcp = false` | **MCP 动态工具整体下线**，连 LLM 的工具 spec 都不出现 |
+| `agentTools.serviceProxy = true`（默认） | 治理服务对账注册的服务代理工具全量可用 |
+| `agentTools.serviceProxy = false` | **服务代理工具整体下线**，连 LLM 的工具 spec 都不出现 |
+
+说明：与治理写开关同作用域语义（`application`，工作区层不可覆盖）；工具要进入某个 agent 的会话仍须其 `def.tools` 逐名声明——开关是来源级总闸，`def.tools` 是会话级聚焦。
+
 ### 规则管理工具集（46 个）
 
 通过 `rule_management_toolkit` / `full_rule_toolkit` 组装，用于 `rule-copilot` Agent：

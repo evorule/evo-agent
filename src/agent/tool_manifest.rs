@@ -302,6 +302,17 @@ const SWITCH_GIT_WRITE: &str = "agentTools.gitWrite";
 /// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
 pub const AGENT_TOOLS_GOVERNANCE_WRITE: &str = "agentTools.governanceWrite";
 const SWITCH_GOVERNANCE_WRITE: &str = AGENT_TOOLS_GOVERNANCE_WRITE;
+/// agentTools.mcp（默认开；单键管 MCP 动态工具面全量）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+/// D6 裁定（2026-10-06 项目方批方案甲）：动态源绑定开关，关闭 = 该来源
+/// 动态工具连 LLM 契约一起下线（与治理写开关同语义）。
+pub const AGENT_TOOLS_MCP: &str = "agentTools.mcp";
+/// agentTools.serviceProxy（默认开；单键管服务代理动态工具面全量）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+/// D6 裁定同上。
+pub const AGENT_TOOLS_SERVICE_PROXY: &str = "agentTools.serviceProxy";
 
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
@@ -581,6 +592,15 @@ fn static_manifest_table() -> &'static std::collections::BTreeMap<String, ToolMa
 /// - 服务代理：description/parameters 来自服务对账清单（注册期已校验非敏感）；
 /// - MCP：description/inputSchema 来自远端 tools/list 透传；
 /// - `description` 为空视为丢字段（fail-fast，调用方拒注册）。
+///
+/// **D6 裁定（2026-10-06 项目方批方案甲）**：动态源绑定 `agentTools.mcp` /
+/// `agentTools.serviceProxy` 开关（默认开，向后兼容；消费点 =
+/// `build_filtered_toolkit_with_switches`，关闭 = 该来源工具面整体下线）。
+/// 裁决分级维持 Standard 属**等价期暂态**——D6 终态 = 动态源 Sensitive
+/// （意图必报），但 P2 派生查静态表（`is_governance_adjudication_tool`
+/// `lookup_static().unwrap_or(false)`），本函数的分级字段对 P2 尚无消费点；
+/// 终态须随 P2 查询点扩展（静态优先防降级 ∪ 动态按 runtime manifest）
+/// 一并落地（随 PR-3/5 择机，02号档 B1）。
 pub fn dynamic_manifest(
     name: &str,
     source: ToolSource,
@@ -599,9 +619,12 @@ pub fn dynamic_manifest(
              registration (manifest hard rule 3)"
         ));
     }
-    let domains = match source {
-        ToolSource::ServiceProxy => vec![CapDomain::Governance],
-        ToolSource::Mcp => vec![CapDomain::Process],
+    let (domains, default_switch) = match source {
+        ToolSource::ServiceProxy => (
+            vec![CapDomain::Governance],
+            sw(AGENT_TOOLS_SERVICE_PROXY, true),
+        ),
+        ToolSource::Mcp => (vec![CapDomain::Process], sw(AGENT_TOOLS_MCP, true)),
         _ => return Err(format!("unsupported dynamic tool source: {source:?}")),
     };
     Ok(ToolManifest {
@@ -614,7 +637,7 @@ pub fn dynamic_manifest(
         capability_domains: domains,
         adjudication_class: AdjudicationClass::Standard,
         approval_policy: ApprovalPolicy::AutoPolicy,
-        default_switch: None,
+        default_switch,
         sandbox_scope: SandboxScope::HostSandboxed,
         timeout_class: TimeoutClass::Default,
     })
@@ -921,5 +944,34 @@ mod tests {
         let (description, parameters) = m.resolve_spec().unwrap();
         assert_eq!(description, "a service tool");
         assert!(parameters.is_object());
+    }
+
+    #[test]
+    fn test_dynamic_manifest_binds_source_switches() {
+        // D6 裁定（2026-10-06 项目方批方案甲）：动态源绑定来源级开关，
+        // 默认开（向后兼容）；消费点 = build_filtered_toolkit_with_switches。
+        let mcp = dynamic_manifest(
+            "mcp_x",
+            ToolSource::Mcp,
+            "an mcp tool".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        let binding = mcp.default_switch.expect("mcp manifest must bind a switch");
+        assert_eq!(binding.key, AGENT_TOOLS_MCP);
+        assert!(binding.default_on, "mcp switch must default ON");
+
+        let svc = dynamic_manifest(
+            "svc_x",
+            ToolSource::ServiceProxy,
+            "a service tool".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        let binding = svc
+            .default_switch
+            .expect("service proxy manifest must bind a switch");
+        assert_eq!(binding.key, AGENT_TOOLS_SERVICE_PROXY);
+        assert!(binding.default_on, "service proxy switch must default ON");
     }
 }
