@@ -290,6 +290,36 @@ impl EvoruleApiClient {
         Ok(())
     }
 
+    /// 提交指令并同步等待结论（POST command?wait=true）。
+    ///
+    /// 响应 JSON 形态：`{success, fact_id, accepted: Option<bool>, violation?, code?}`——
+    /// `accepted=true/false` = 结论已落链（受理/被 enforce 拦截）；
+    /// `accepted` 缺失或 null = 等待窗口内结论未落定（WAIT_TIMEOUT 降级，
+    /// 或旧版 server 无 wait 支持），调用方应回退既有轮询判据。
+    pub async fn submit_command_wait(
+        &self,
+        session_id: &str,
+        command: &Value,
+    ) -> Result<Value, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/command?wait=true",
+            self.core.base_url(),
+            session_id
+        );
+
+        let body = serde_json::json!({ "instruction": command });
+        let resp = self
+            .core
+            .auth_header(self.core.client().post(&url))
+            .json(&body)
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+
+        let result: Value = resp.json().await?;
+        Ok(result)
+    }
+
     /// 回应会话的 IO 请求（POST io_response），`error` 非空表示 IO 执行失败。
     pub async fn submit_io_response(
         &self,
