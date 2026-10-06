@@ -26,7 +26,7 @@
 //!
 //! 分级口径（与现状行为等价，快照测试锁定）：
 //! - [`AdjudicationClass::Sentineled`]：P2 事前意图裁决 + 规则正本 enforce 已在场
-//!   （file_create/file_move/file_delete 的 out_of_sandbox enforce）；
+//!   （file_create/file_move/file_delete/file_write 的 out_of_sandbox enforce）；
 //! - [`AdjudicationClass::Sensitive`]：P2 事前意图裁决在通道（意图必报，暂无
 //!   enforce——git 写族 2 + 规则治理写族 19 + delegate 1）；
 //! - [`AdjudicationClass::Standard`]：不走 P2 裁决（机制层治理或纯落链）。
@@ -34,8 +34,10 @@
 //!   原 GOVERNANCE_ADJUDICATION_TOOLS 24 表；delegate 统一装配批兑现模块
 //!   注释承诺：delegate 升 Sensitive 并接 P2 通道（设计档 §3.2 终态），
 //!   派生集合演进为 25 条（重录快照须 diff 审；数量锁 67 不变——级别
-//!   变化不增减条目数）。file_write 的意图信号走 M5-c R1 通道（机制层，
-//!   由实现持有），不属 P2 分级面。
+//!   变化不增减条目数）。D1 兑现批（2026-10-07）：file_write 升 Sentineled
+//!   派生集合演进为 26 条（快照重录 diff 审；数量锁 74 不变）。
+//!   file_write 的意图信号与 M5-c R1 通道（pending_target_scope，机制层
+//!   由实现持有）并存互不干扰。
 //!
 //! **D6 终态（2026-10-06，B1 收官批）——P2 派生集合语义扩展**：从纯静态表
 //! 扩展为「静态表 ∪ 动态注册条目（class≠Standard）」，判定 =
@@ -43,8 +45,8 @@
 //! 注册不改变治理分级），静态未命中按 runtime manifest（MCP/ServiceProxy
 //! 默认 Sensitive 意图必报，人工分级降档走 settings 键
 //! `agentTools.mcpAdjudication` / `agentTools.serviceProxyAdjudication`，
-//! D7-A 方案一来源级）。`GOVERNANCE_SNAPSHOT` 25 条快照锁静态面不变；
-//! 本扩展零静态表变更（数量锁 67 不变）。
+//! D7-A 方案一来源级）。`GOVERNANCE_SNAPSHOT` 26 条快照锁静态面不变；
+//! 本扩展零静态表变更（数量锁现 74）。
 
 use serde::{Deserialize, Serialize};
 
@@ -404,6 +406,12 @@ fn builtin_manifests() -> Vec<ToolManifest> {
                 m.adjudication_class = AdjudicationClass::Sentineled;
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
+            // file_write：D1 兑现——规则正本第 4 条 enforce（out_of_sandbox）
+            // 在场，升 Sentineled；审批面不动（写面高频工具维持既有审批策略，
+            // 由 handler 内联沙箱检查 + 规则层 enforce 双层把守）
+            "file_write" => {
+                m.adjudication_class = AdjudicationClass::Sentineled;
+            }
             // git 写族：P2 裁决在通道；D1 建议上 enforce（PR-5 规则正本入库时
             // 追加，升级 Sentineled），manifest 先如实标 Sensitive；
             // 同为 candidate 审批模式
@@ -552,7 +560,8 @@ fn rule_manifests() -> Vec<ToolManifest> {
 fn delegate_manifest() -> ToolManifest {
     // delegate 统一装配批：级别演进 Standard→Sensitive（模块文档承诺兑现）——
     // delegate 自身调用接 P2 事前意图裁决通道（意图必报）。条目数不变
-    // （静态数量锁仍 67），仅级别字段演进；P2 派生集合 24→25（快照重录）。
+    // （test_static_manifest_count_locked 锁守），仅级别字段演进；P2 派生
+    // 集合 24→25（快照重录）。
     let mut m = base(
         "delegate",
         ToolSource::Delegate,
@@ -831,11 +840,13 @@ mod tests {
     /// 原 GOVERNANCE_ADJUDICATION_TOOLS 24 表快照（runner.rs 已改派生，
     /// 快照在此固化防漂移）；delegate 统一装配批 delegate 升 Sensitive 后
     /// 演进为 25 条（delegate 加入治理裁决集——快照重录须 diff 审，数量锁
-    /// 67 不变，级别变化不增减条目数）。
+    /// 不变，级别变化不增减条目数）。D1 兑现批 file_write 升 Sentineled
+    /// 后演进为 26 条（同款 diff 审纪律）。
     const GOVERNANCE_SNAPSHOT: &[&str] = &[
         "file_create",
         "file_move",
         "file_delete",
+        "file_write",
         "git_stage",
         "git_commit",
         "rule_create",
@@ -878,8 +889,8 @@ mod tests {
     #[test]
     fn test_delegate_manifest_is_sensitive_p2_adjudicated() {
         // delegate 统一装配批：级别演进 Standard→Sensitive（模块文档承诺
-        // 兑现）——delegate 自身调用接 P2 意图必报通道。条目数不变（静态
-        // 数量锁仍 67，test_static_manifest_count_locked 锁守），仅级别演进。
+        // 兑现）——delegate 自身调用接 P2 意图必报通道。条目数不变
+        // （test_static_manifest_count_locked 锁守），仅级别演进。
         let manifests = all();
         let m = manifests
             .iter()
@@ -899,7 +910,10 @@ mod tests {
             .map(|m| m.name.as_str())
             .collect();
         sentineled.sort_unstable();
-        assert_eq!(sentineled, vec!["file_create", "file_delete", "file_move"]);
+        assert_eq!(
+            sentineled,
+            vec!["file_create", "file_delete", "file_move", "file_write"]
+        );
     }
 
     /// 原 TOOL_SWITCH_KEYS 30 条快照（tool, key, default_on）

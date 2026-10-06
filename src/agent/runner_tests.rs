@@ -3108,6 +3108,43 @@ fn p2_file_move_intent_uses_both_path_fields() {
 }
 
 #[test]
+fn p2_file_write_intent_carries_scope_and_args() {
+    // D1 兑现批(2026-10-07):file_write 升 Sentineled,意图信号采集与
+    // file_delete/file_move 同构(path 字段)。
+    let b = m5c_boundary();
+    let intent = resolve_tool_intent(
+        "file_write",
+        &serde_json::json!({"path": "workspace/notes.md", "content": "hi"}),
+        Some(&b),
+        None,
+    )
+    .expect("file_write must produce intent (Sentineled)");
+    assert_eq!(intent["tool_name"], "file_write");
+    assert_eq!(intent["target_scope"], "in_sandbox");
+    assert_eq!(intent["args"]["path"], "workspace/notes.md");
+
+    let out = resolve_tool_intent(
+        "file_write",
+        &serde_json::json!({"path": "../escape.md", "content": "hi"}),
+        Some(&b),
+        None,
+    )
+    .unwrap();
+    assert_eq!(out["target_scope"], "out_of_sandbox");
+
+    // 无边界声明(人工面/未声明会话):意图仍采集,无 scope 字段
+    let nb = resolve_tool_intent(
+        "file_write",
+        &serde_json::json!({"path": "a.md", "content": "hi"}),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(nb["tool_name"], "file_write");
+    assert!(nb.get("target_scope").is_none());
+}
+
+#[test]
 fn p2_non_file_governance_tool_has_no_scope_but_args() {
     // 无边界声明:非 file 族治理工具仍上裁决(意图留痕),无 scope 字段
     let intent = resolve_tool_intent(
@@ -3149,15 +3186,18 @@ fn p2_adjudication_table_matches_design() {
     // 手工 const 表已由 manifest 派生取代(数量断言改静态表 P2 集合计数)。
     // delegate 统一装配批:delegate 升 Sensitive 加入治理裁决集,集合演进
     // 24→25(重录已 diff 审——数量锁 67 不变,级别变化不增减条目数)。
+    // D1 兑现批(2026-10-07):file_write 升 Sentineled,集合演进 25→26
+    // (数量锁 74 不变,级别变化不增减条目数)。
     let p2_count = crate::agent::tool_manifest::static_manifests()
         .iter()
         .filter(|m| m.is_p2_adjudicated())
         .count();
-    assert_eq!(p2_count, 25);
+    assert_eq!(p2_count, 26);
     for t in [
         "file_create",
         "file_move",
         "file_delete",
+        "file_write",
         "git_stage",
         "git_commit",
         "rule_activate",
@@ -3168,7 +3208,6 @@ fn p2_adjudication_table_matches_design() {
     }
     for t in [
         "file_read",
-        "file_write",
         "shell_exec",
         "grep_files",
         "publish_list",
