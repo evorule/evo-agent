@@ -14,7 +14,7 @@
 //!   （链式哈希链）确定，**非墙钟**；无直接因果路径时按链位
 //!   （logical_time，链上串行化序）定先后并如实标注 `causally_related:
 //!   false`；跨链域（非同一会话审计链）不可比，返回域说明——诚实边界
-//!   （设计档 §11.6 裁定③）；
+//!   （设计档 §11.6 域边界裁定）；
 //! - `lineage_of`：规则谱系两账拼接——版本链（workspace RuleVersionRecord）
 //!   + 晋升账（`00_constraint_promoted_*` 装载进 core_eval 后的
 //!   `metadata.promoted_from/promoted_at/promoted_by`）。
@@ -244,7 +244,7 @@ impl ToolFunction for CausalOrderTool {
             })
         };
 
-        // 域边界（裁定③）：任一事实不在本会话链上 → 不可比 + 域说明
+        // 域边界（设计档 §11.6）：任一事实不在本会话链上 → 不可比 + 域说明
         let has_a = entries.iter().any(|e| entry_fact_id(e) == Some(fact_a));
         let has_b = entries.iter().any(|e| entry_fact_id(e) == Some(fact_b));
         if !has_a || !has_b {
@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     fn causal_order_absent_fact_reports_honest_domain_boundary() {
-        // 裁定③诚实边界：事实不在本会话链上 → 不可比 + 域说明
+        // 诚实边界（设计档 §11.6 域边界裁定）：事实不在本会话链上 → 不可比 + 域说明
         let entries = json!([
             {"fact_id": 9, "fact_type": "io_response", "logical_time": 9, "cause": 8}
         ]);
