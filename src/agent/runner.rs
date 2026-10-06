@@ -2340,6 +2340,23 @@ impl AgentRunner {
         Ok(())
     }
 
+    /// 检索质量观测批(K-11 观测级):从 RecallContext 构建命中集条目
+    /// ("层@序:key",排序位=分位)。journal 在位才落(流式路径);
+    /// ground truth 判据列二期,先积累数据。
+    fn build_recall_set_hits(recall: &crate::agent::memory::RecallContext) -> Vec<String> {
+        let mut hits = Vec::new();
+        for (i, r) in recall.stable.iter().enumerate() {
+            hits.push(format!("stable@{}:{}", i + 1, r.key));
+        }
+        for (i, r) in recall.summaries.iter().enumerate() {
+            hits.push(format!("summaries@{}:{}", i + 1, r.key));
+        }
+        for (i, r) in recall.events.iter().enumerate() {
+            hits.push(format!("events@{}:{}", i + 1, r.key));
+        }
+        hits
+    }
+
     /// A2-2:绑定 memory_propose 会话锚(两 run 路径 create_session 后调用;
     /// 写件未注册时 no-op)。Shared 域写=写当前会话 payload,运行期才可绑定。
     fn bind_propose_anchor(&self, session_id: &str) {
@@ -4043,6 +4060,13 @@ impl AgentRunner {
                 ).await,
                 None => crate::agent::memory::RecallContext::default(),
             };
+            // 检索质量观测批(K-11 观测级):命中集落账(journal 在位才落)
+            if let Some(j) = runner.active_journal.as_deref() {
+                let hits = Self::build_recall_set_hits(&recall);
+                if let Some(sid) = runner.session_id.as_deref() {
+                    let _ = j.recall_set(sid, hits);
+                }
+            }
             // 元层先行批:组装执行器单一出口(run/流式两组装点收敛为同一段
             // 代码,双路径一致性由代码结构保证;槽位序/预算比例/分隔符由配方声明)
             let boundary_segment = runner
