@@ -827,6 +827,85 @@ service_tools = ["config_persist", "rule_sandbox"]
         assert!(!filtered.has_tool("nonexistent_tool"));
     }
 
+    /// 动态源开关测试用最小执行器桩（仅装配面，不触发 call）
+    struct DynamicStub;
+
+    #[async_trait::async_trait]
+    impl crate::io_handlers::tool_handler::ToolFunction for DynamicStub {
+        async fn call(&self, _args: &serde_json::Value) -> crate::io_handler::IoResult {
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    #[test]
+    fn test_dynamic_source_switches_gate_mcp_and_service_proxy_tools() {
+        // D6 裁定（2026-10-06 项目方批方案甲）：动态源（MCP/服务代理）
+        // 绑定 agentTools.mcp / agentTools.serviceProxy——关闭 = 该来源
+        // 工具连执行器与 LLM 契约一起下线（与静态开关同语义）。
+        let mut union = ToolHandler::new();
+        for (name, source) in [
+            (
+                "mcp_demo_echo",
+                crate::agent::tool_manifest::ToolSource::Mcp,
+            ),
+            (
+                "svc_demo_query",
+                crate::agent::tool_manifest::ToolSource::ServiceProxy,
+            ),
+        ] {
+            let manifest = crate::agent::tool_manifest::dynamic_manifest(
+                name,
+                source,
+                format!("dynamic tool {name}"),
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
+            .unwrap();
+            union.register(manifest, std::sync::Arc::new(DynamicStub));
+        }
+        let whitelist: Vec<String> =
+            vec!["mcp_demo_echo".to_string(), "svc_demo_query".to_string()];
+
+        // 默认(键缺失):绑定 default_on=true——两动态工具在面(向后兼容)
+        let filtered =
+            build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
+        assert!(filtered.has_tool("mcp_demo_echo"));
+        assert!(filtered.has_tool("svc_demo_query"));
+
+        // 双开:在面
+        let mut settings = serde_json::Map::new();
+        settings.insert("agentTools.mcp".to_string(), serde_json::json!(true));
+        settings.insert(
+            "agentTools.serviceProxy".to_string(),
+            serde_json::json!(true),
+        );
+        let filtered = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        assert!(filtered.has_tool("mcp_demo_echo"));
+        assert!(filtered.has_tool("svc_demo_query"));
+
+        // 双关:执行器+LLM 契约同步消失
+        settings.insert("agentTools.mcp".to_string(), serde_json::json!(false));
+        settings.insert(
+            "agentTools.serviceProxy".to_string(),
+            serde_json::json!(false),
+        );
+        let filtered = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        assert!(
+            !filtered.has_tool("mcp_demo_echo"),
+            "mcp switch off must remove dynamic tool"
+        );
+        assert!(
+            !filtered.has_tool("svc_demo_query"),
+            "service proxy switch off must remove dynamic tool"
+        );
+
+        // 单键独立:只关 mcp 不影响 serviceProxy
+        let mut settings = serde_json::Map::new();
+        settings.insert("agentTools.mcp".to_string(), serde_json::json!(false));
+        let filtered = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        assert!(!filtered.has_tool("mcp_demo_echo"));
+        assert!(filtered.has_tool("svc_demo_query"));
+    }
+
     #[test]
     fn test_build_filtered_toolkit_switches_gate_file_mutation_tools() {
         let (ws, ev) = make_clients();

@@ -228,6 +228,26 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.mcp",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 调用 MCP 远端工具（mcp.servers 配置握手后注册的动态工具全量；关闭 = 该来源工具连 LLM 契约一起下线，能力面不存在，非\"调用被拒\"）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "agentTools.serviceProxy",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 调用服务代理工具（治理服务对账清单注册的动态工具全量；关闭 = 该来源工具连 LLM 契约一起下线，能力面不存在，非\"调用被拒\"）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "search.maxResults",
             kind: SettingType::Number,
             default: json!(1000),
@@ -603,7 +623,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 20);
+        assert_eq!(settings.len(), 22);
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -617,6 +637,9 @@ mod tests {
         assert_eq!(settings["agentTools.gitWrite"], json!(false));
         // 治理写权开关:单键默认开 = 45 工具全量,零行为变化
         assert_eq!(settings["agentTools.governanceWrite"], json!(true));
+        // 动态源开关(D6 裁定方案甲):默认开 = 向后兼容,现状零行为变化
+        assert_eq!(settings["agentTools.mcp"], json!(true));
+        assert_eq!(settings["agentTools.serviceProxy"], json!(true));
         // search.* 全局搜索 4 键(B2 消费)
         assert_eq!(settings["search.maxResults"], json!(1000));
         assert_eq!(settings["search.smartCase"], json!(true));
