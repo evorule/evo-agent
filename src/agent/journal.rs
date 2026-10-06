@@ -225,6 +225,19 @@ pub enum JournalEvent {
         /// 命中集条目（"层@序:key" 格式）
         hits: Vec<String>,
     },
+    /// LexStore 缓存观测（补齐路线图 P2-1/TTL 窗口可见性；recall_set 同族
+    /// 观测级事件）：三计数器累计快照——「跨代理写不可见」的 TTL 窗口从
+    /// 已声明边界升级为可观测边界
+    LexCacheStats {
+        /// 会话 ID
+        session: String,
+        /// cached_facts 命中次数（读到 TTL 窗口内缓存）
+        hit: u64,
+        /// 缓存不可用次数（TTL 过期/从未拉取/读取失败）
+        expired: u64,
+        /// 全量拉取（replace_partition）执行次数
+        fetch: u64,
+    },
     /// 崩溃标记(P2 resume 检测到尾部无 turn_ended 后补写,运行时不写)
     SessionCrashed {
         /// 崩溃原因
@@ -649,6 +662,23 @@ impl JournalWriter {
         })
     }
 
+    /// LexStore 缓存观测落账（补齐路线图 P2-1；recall_set 同族观测级，
+    /// best-effort——调用方决定失败处置）
+    pub fn lex_cache_stats(
+        &self,
+        session: &str,
+        hit: u64,
+        expired: u64,
+        fetch: u64,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::LexCacheStats {
+            session: session.to_string(),
+            hit,
+            expired,
+            fetch,
+        })
+    }
+
     /// wire blob 过期标记落账(journal 体积治理批;离线 GC 经 writer 追加,
     /// 复用活跃写者锁=并发安全)。best-effort 调用方决定失败处置。
     pub fn wire_blob_expired(
@@ -1017,6 +1047,35 @@ mod tests {
     }
 
     #[test]
+    fn test_lex_cache_stats_event_roundtrip() {
+        // 补齐路线图 P2-1:LexStore 缓存观测三计数落账+读回(观测级,
+        // recall_set 同族 best-effort)
+        let dir = std::env::temp_dir().join(format!("jf-lexstats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-lexstats").unwrap();
+            w.lex_cache_stats("s-lexstats", 7, 2, 1).unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-lexstats")).unwrap();
+        let mut seen = Vec::new();
+        for l in lines {
+            if let JournalEvent::LexCacheStats {
+                session,
+                hit,
+                expired,
+                fetch,
+            } = l.event
+            {
+                seen.push((session, hit, expired, fetch));
+            }
+        }
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0], ("s-lexstats".to_string(), 7, 2, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_gc_wire_blobs_tiered_retention() {
         // 规格修正批批次四验收:构造含过期/中窗/新窗 wire_rendered 的 journal
         // → GC → 过期全文出账+expired 事件在账+中窗入旁路件+新窗不动
@@ -1220,6 +1279,12 @@ mod tests {
             JE::SessionResumed {
                 replay_seq: 9,
                 rebuilt: vec!["pending_approvals".into()],
+            },
+            JE::LexCacheStats {
+                session: "s-lex".into(),
+                hit: 7,
+                expired: 2,
+                fetch: 1,
             },
         ];
         for (i, ev) in events.iter().enumerate() {

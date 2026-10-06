@@ -1948,6 +1948,12 @@ impl MemoryManager {
         self.lex_store = Some(store);
     }
 
+    /// P2-1:LexStore 缓存观测三计数器透传(hit, expired, fetch);
+    /// 未注入 LexStore 时返回 None(journal 落账侧静默跳过)
+    pub fn lex_cache_stats(&self) -> Option<(u64, u64, u64)> {
+        self.lex_store.as_ref().map(|s| s.cache_stats())
+    }
+
     /// 阶段 2(F-610):注入 MemoryRecipe 策略规则集
     pub fn set_recipe(&mut self, recipe: crate::agent::recipe::MemoryRecipe) {
         self.recipe = Some(recipe);

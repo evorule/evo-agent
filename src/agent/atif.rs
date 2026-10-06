@@ -797,53 +797,6 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                 });
                 next_step_id += 1;
             }
-            JournalEvent::WireBlobExpired {
-                round,
-                content_hash,
-                wire_len,
-            } => {
-                // wire blob 过期——context_management 系统步(体积治理批)。
-                // 降级可见:hash+长度仍可校验完整性,全文级重建随窗口关闭降级
-                if let Some(a) = acc.take() {
-                    finalize_agent_step(
-                        a,
-                        &audit,
-                        sources.transcript,
-                        &assistant_msgs,
-                        &mut steps,
-                        &mut next_step_id,
-                        &mut total_prompt,
-                        &mut total_completion,
-                    );
-                }
-                steps.push(AtifStep {
-                    step_id: next_step_id,
-                    timestamp: Some(iso8601_from_unix_ms(line.ts)),
-                    source: "system".into(),
-                    model_name: None,
-                    message: "Wire blob expired".into(),
-                    tool_calls: None,
-                    observation: Some(AtifObservation {
-                        results: vec![AtifObservationResult {
-                            source_call_id: None,
-                            content: Some(format!(
-                                "round={round} wire_len={wire_len} hash={content_hash}"
-                            )),
-                        }],
-                    }),
-                    metrics: None,
-                    extra: Some(json!({
-                        "context_management": {
-                            "type": "wire_blob_expired",
-                            "round": round,
-                            "content_hash": content_hash,
-                            "wire_len": wire_len
-                        }
-                    })),
-                    llm_call_count: None,
-                });
-                next_step_id += 1;
-            }
             JournalEvent::RecallSet { session, hits } => {
                 // 召回集观测——context_management 系统步(检索质量观测批
                 // K-11 观测级;ground truth 判据列二期)
@@ -878,6 +831,55 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                             "type": "recall_set",
                             "session": session,
                             "hits": hits
+                        }
+                    })),
+                    llm_call_count: None,
+                });
+                next_step_id += 1;
+            }
+            JournalEvent::LexCacheStats {
+                session,
+                hit,
+                expired,
+                fetch,
+            } => {
+                // LexStore 缓存观测——context_management 系统步(补齐路线图
+                // P2-1/TTL 窗口可见性;recall_set 同族观测级)
+                if let Some(a) = acc.take() {
+                    finalize_agent_step(
+                        a,
+                        &audit,
+                        sources.transcript,
+                        &assistant_msgs,
+                        &mut steps,
+                        &mut next_step_id,
+                        &mut total_prompt,
+                        &mut total_completion,
+                    );
+                }
+                steps.push(AtifStep {
+                    step_id: next_step_id,
+                    timestamp: Some(iso8601_from_unix_ms(line.ts)),
+                    source: "system".into(),
+                    model_name: None,
+                    message: "Lex cache stats".into(),
+                    tool_calls: None,
+                    observation: Some(AtifObservation {
+                        results: vec![AtifObservationResult {
+                            source_call_id: None,
+                            content: Some(format!(
+                                "session={session} hit={hit} expired={expired} fetch={fetch}"
+                            )),
+                        }],
+                    }),
+                    metrics: None,
+                    extra: Some(json!({
+                        "context_management": {
+                            "type": "lex_cache_stats",
+                            "session": session,
+                            "hit": hit,
+                            "expired": expired,
+                            "fetch": fetch
                         }
                     })),
                     llm_call_count: None,
