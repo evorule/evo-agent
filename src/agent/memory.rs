@@ -2325,6 +2325,54 @@ impl MemoryManager {
                             .unwrap_or("receipt-ok");
                         rec.tags.push(format!("governance:{receipt_id}"));
                     }
+                    // A2-4 机器行权接线（缺省关=Draft 只存不动；策略数据化 promote_gate.auto_transition）：
+                    // 提议入账回执成功后，按声明尝试机器行权（服务端机器闸六检，
+                    // 全过放行 Active / 非全过 422 fail-visible——候选保持 Promoted-Draft 形态，
+                    // 人工追认通路不受影响）。
+                    if recipe.promote_gate.auto_transition {
+                        let receipt_id = receipt
+                            .get("entry_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        if !receipt_id.is_empty() {
+                            let tcause = format!(
+                                "memory lifecycle auto-transition: promote gate receipt {receipt_id}; source key {key}"
+                            );
+                            match self
+                                .evorule_client
+                                .transition_knowledge_entry(dataset, &receipt_id, &tcause)
+                                .await
+                            {
+                                Ok(treceipt) => {
+                                    let tier = treceipt
+                                        .get("tier")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown");
+                                    tracing::info!(
+                                        session_id = %session_id,
+                                        key = %key,
+                                        entry = %receipt_id,
+                                        tier = %tier,
+                                        "promote gate: auto-transition executed (machine gate released, human post-review follows T1)"
+                                    );
+                                    let cache_key = format!("shared::{key}");
+                                    if let Some(rec) = self.cache.get_mut(&cache_key) {
+                                        rec.tags.push(format!("governance:active:{tier}"));
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        key = %key,
+                                        entry = %receipt_id,
+                                        error = %e,
+                                        "promote gate: auto-transition rejected (machine gate fail-visible); candidate stays Draft for human review"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let stable_key =
                         format!("stable.llm.promoted.{}", key.replace(".events.", "."));
                     let mut p = MemoryRecord::new(&stable_key, &candidate.value, now_secs());
