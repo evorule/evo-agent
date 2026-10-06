@@ -71,8 +71,12 @@ impl EvoruleApiClient {
 
     /// GET /api/rules/l2-inventory —— L2 约束（元规则）只读清单投影
     ///
-    /// 返回 `{count, files:[{path,title,guard_for}]}`（服务端 fail-soft：任何扫描/解析
-    /// 失败均跳过，全失败返回空清单）。供 meta_summary 工具与前馈注入共用。
+    /// 返回 `{count, files:[{path,title,guard_for,promoted_from,promoted_at,
+    /// promoted_by}]}`（服务端 fail-soft：任何扫描/解析失败均跳过，全失败返回
+    /// 空清单）。供 meta_summary 工具与前馈注入共用；晋升条目
+    /// （`00_constraint_promoted_*`）的 `promoted_*` 三字段即晋升账，
+    /// `promoted_from` 形如 `rule_version:<版本id>`，与 workspace 规则版本链
+    /// 对账（lineage_of 第二账数据源）。
     pub async fn get_l2_inventory(&self) -> Result<Value, ApiError> {
         let url = self.core.url("/api/rules/l2-inventory");
         let resp = self
@@ -684,10 +688,9 @@ impl EvoruleApiClient {
     /// 获取当前生效的 core_eval 规则正本（GET /api/rules，014 合法 API #2）。
     ///
     /// 返回 `{count, core_eval: [...], tiers}` —— `core_eval` 数组按引擎
-    /// 求值序排列，`rule_index` 即该数组下标（Violation 事实归因锚）；
-    /// 晋升约束（`00_constraint_promoted_*`）装载后同样在此数组内，
-    /// 其 `metadata.promoted_from/promoted_at/promoted_by` 即晋升账
-    /// （lineage_of 第二账数据源）。
+    /// 求值序排列，`rule_index` 即该数组下标（Violation 事实归因锚）。
+    /// 注意：core_eval 节点为引擎侧执行语义投影，不携带规则 id/metadata
+    /// （晋升账改经 [`Self::get_l2_inventory`] 透出）。
     pub async fn get_rules(&self) -> Result<Value, ApiError> {
         let url = self.core.url("/api/rules");
         let resp = self

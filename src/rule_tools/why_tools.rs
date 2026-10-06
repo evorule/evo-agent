@@ -16,8 +16,8 @@
 //!   false`；跨链域（非同一会话审计链）不可比，返回域说明——诚实边界
 //!   （设计档 §11.6 域边界裁定）；
 //! - `lineage_of`：规则谱系两账拼接——版本链（workspace RuleVersionRecord）
-//!   + 晋升账（`00_constraint_promoted_*` 装载进 core_eval 后的
-//!   `metadata.promoted_from/promoted_at/promoted_by`）。
+//!   + 晋升账（l2-inventory 投影的 `00_constraint_promoted_*`
+//!   `promoted_from/promoted_at/promoted_by`，经 rule_version 锚与版本链对账）。
 //!
 //! 全部只读：仅 GET 审计链/规则正本/版本账，零写路径；server 侧零改动
 //! （全部消费既有端点，尽调结论 2026-10-06）。
@@ -370,33 +370,37 @@ impl ToolFunction for LineageOfTool {
             .await
             .map_err(|e| format!("rule versions fetch failed: {e}"))?;
 
-        // 账二：晋升账（晋升约束装载进 core_eval 后按 metadata.id 匹配）
-        let rules = self
+        // 账二：晋升账（l2-inventory 投影的晋升条目；join 锚 =
+        // promoted_from 的 rule_version:<版本id> 命中版本链任一版本 id。
+        // core_eval 节点为引擎执行语义投影，不携带 id/metadata——晋升账
+        // 权威在 L2 约束文件 metadata，经 l2-inventory 透出）
+        let l2 = self
             .ev
-            .get_rules()
+            .get_l2_inventory()
             .await
-            .map_err(|e| format!("rules fetch failed: {e}"))?;
-        let promoted_entry = rules
-            .get("core_eval")
+            .map_err(|e| format!("l2 inventory fetch failed: {e}"))?;
+        let promoted_entry = l2
+            .get("files")
             .and_then(|v| v.as_array())
-            .and_then(|arr| {
-                arr.iter().find(|r| {
-                    r.get("id").and_then(|v| v.as_str()) == Some(rule_id.as_str())
-                        || r.get("metadata")
-                            .and_then(|m| m.get("id"))
-                            .and_then(|v| v.as_str())
-                            == Some(rule_id.as_str())
+            .and_then(|files| {
+                files.iter().find(|f| {
+                    f.get("promoted_from")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.strip_prefix(PROMOTED_FROM_PREFIX))
+                        .is_some_and(|vid| versions.iter().any(|v| v.id == vid))
                 })
             })
-            .cloned();
-        let promotion = promoted_entry.as_ref().map(|e| {
-            let meta = e.get("metadata").unwrap_or(e);
-            json!({
-                "promoted_from": meta.get("promoted_from").cloned().unwrap_or(Value::Null),
-                "promoted_at": meta.get("promoted_at").cloned().unwrap_or(Value::Null),
-                "promoted_by": meta.get("promoted_by").cloned().unwrap_or(Value::Null),
-            })
-        });
+            .cloned()
+            .unwrap_or(Value::Null);
+        let promotion = if promoted_entry.is_null() {
+            None
+        } else {
+            Some(json!({
+                "promoted_from": promoted_entry.get("promoted_from").cloned().unwrap_or(Value::Null),
+                "promoted_at": promoted_entry.get("promoted_at").cloned().unwrap_or(Value::Null),
+                "promoted_by": promoted_entry.get("promoted_by").cloned().unwrap_or(Value::Null),
+            }))
+        };
         // 晋升源版本 id（promoted_from: "rule_version:<id>"）→ 版本链对齐标记
         let promoted_version_id = promotion.as_ref().and_then(|p| {
             p.get("promoted_from")
@@ -426,10 +430,11 @@ impl ToolFunction for LineageOfTool {
             "rule_state": rule_json.get("state").cloned().unwrap_or(Value::Null),
             "version_chain": version_chain,
             "promotion": promotion,
-            "notes": match (&promoted_entry, promoted_version_id) {
+            "notes": match (&promotion, promoted_version_id) {
                 (None, _) => vec![
-                    "no promoted (constraint-tier) entry matching this rule id in the effective \
-                     rule set — either not promoted or promoted under a different id",
+                    "no promoted constraint entry anchors to any version of this rule in the L2 \
+                     promotion ledger — either not promoted or promoted from a version outside \
+                     this rule's version chain",
                 ],
                 (Some(_), None) => vec![
                     "promotion entry found but its promoted_from carries no rule_version anchor",
@@ -914,14 +919,30 @@ mod tests {
             .to_string()
     }
 
+    fn l2_inventory_json() -> String {
+        // l2-inventory 投影 fixture：晋升条目 promoted_from 锚定版本链 id
+        r#"{
+          "count": 1,
+          "files": [
+            {"path": "00_constraint_promoted_65ad7d1b1910a98e.json",
+             "title": "协作验收规则（边界强制 + 实施前置 + 核收前置）",
+             "guard_for": [],
+             "promoted_from": "rule_version:01M3BDCC39Y5FQVGYHSE034R36",
+             "promoted_at": "2026-09-25T04:33:05Z",
+             "promoted_by": "console"}
+          ]
+        }"#
+        .to_string()
+    }
+
     #[test]
     fn lineage_of_stitches_version_chain_and_promotion_ledger() {
-        // 两账拼接：版本链（workspace）+ 晋升账（core_eval 晋升条目），
+        // 两账拼接：版本链（workspace）+ 晋升账（l2-inventory 晋升条目），
         // promoted_from 锚对齐版本 id → promotion_origin 标记
         let base = spawn_http_fixture(vec![
             (200, rule_record_json()),
             (200, versions_json()),
-            (200, rules_json()),
+            (200, l2_inventory_json()),
         ]);
         let rt = rt();
         let mut handler = ToolHandler::new();
@@ -958,7 +979,10 @@ mod tests {
         let base = spawn_http_fixture(vec![
             (200, rule_record_json()),
             (200, versions_json()),
-            (200, rules_json()), // core_eval 无匹配 id 的条目
+            (
+                200,
+                r#"{"count": 0, "files": []}"#.to_string(), // l2-inventory 无晋升条目
+            ),
         ]);
         let rt = rt();
         let mut handler = ToolHandler::new();
@@ -982,6 +1006,50 @@ mod tests {
         assert!(notes
             .iter()
             .any(|n| n.as_str().unwrap().contains("not promoted")));
+    }
+
+    #[test]
+    fn lineage_of_promotion_anchor_outside_version_chain_reports_honestly() {
+        // 晋升条目在场但其 promoted_from 锚不指向本规则版本链任一版本 id
+        // → 不强行拼接，promotion=null + notes 如实说明
+        let base = spawn_http_fixture(vec![
+            (200, rule_record_json()),
+            (200, versions_json()),
+            (
+                200,
+                r#"{
+                  "count": 1,
+                  "files": [
+                    {"path": "00_constraint_promoted_other.json", "title": "他者约束",
+                     "guard_for": [],
+                     "promoted_from": "rule_version:01OTHERAAAAAAAAAAAAAAAAAAAA",
+                     "promoted_at": "2026-09-26T00:00:00Z", "promoted_by": "console"}
+                  ]
+                }"#
+                .to_string(),
+            ),
+        ]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "lineage_of",
+            Arc::new(LineageOfTool::new(
+                WorkspaceApiClient::new(&base),
+                EvoruleApiClient::new(&base),
+            )),
+        );
+        let out = rt
+            .block_on(handler.execute_by_name(
+                "lineage_of",
+                &json!({"workspace_id": "ws1", "rule_id": "com.evorule.constraint.safety"}),
+            ))
+            .unwrap();
+
+        assert_eq!(out["promotion"], Value::Null);
+        let notes = out["notes"].as_array().unwrap();
+        assert!(notes
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("version chain")));
     }
 
     // =========================================================================
