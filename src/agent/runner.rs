@@ -4150,6 +4150,13 @@ impl AgentRunner {
                 let hits = Self::build_recall_set_hits(&recall);
                 if let Some(sid) = runner.session_id.as_deref() {
                     let _ = j.recall_set(sid, hits);
+                    // P2-1:LexStore 缓存观测三计数器落账(TTL 窗口可见性;
+                    // recall_set 同族观测级,best-effort)
+                    if let Some(mem) = runner.memory.as_ref() {
+                        if let Some((hit, expired, fetch)) = mem.lex_cache_stats() {
+                            let _ = j.lex_cache_stats(sid, hit, expired, fetch);
+                        }
+                    }
                 }
             }
             // 元层先行批:组装执行器单一出口(run/流式两组装点收敛为同一段

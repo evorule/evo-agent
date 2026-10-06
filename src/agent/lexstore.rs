@@ -104,6 +104,13 @@ pub struct CachedFact {
 /// LexStore:本地检索缓存(WAL;内部 Mutex 串行化——单写者纪律)
 pub struct LexStore {
     conn: Mutex<Connection>,
+    /// 缓存观测三计数器（补齐路线图 P2-1/TTL 窗口可见性）：
+    /// hit=cached_facts 命中（读到 TTL 窗口内缓存——跨代理新写不可见）；
+    /// expired=缓存不可用（TTL 过期或从未拉取，返回 None）；
+    /// fetch=replace_partition 全量拉取执行。累计口径，`cache_stats()` 读取。
+    cache_hit: std::sync::atomic::AtomicU64,
+    cache_expired: std::sync::atomic::AtomicU64,
+    cache_fetch: std::sync::atomic::AtomicU64,
 }
 
 fn now_secs() -> u64 {
@@ -212,7 +219,21 @@ impl LexStore {
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            cache_hit: std::sync::atomic::AtomicU64::new(0),
+            cache_expired: std::sync::atomic::AtomicU64::new(0),
+            cache_fetch: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// 缓存观测三计数器快照（累计：hit, expired, fetch）。
+    /// 「跨代理写不可见」的 TTL 窗口从已声明边界升级为可观测边界（P2-1）。
+    pub fn cache_stats(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.cache_hit.load(Relaxed),
+            self.cache_expired.load(Relaxed),
+            self.cache_fetch.load(Relaxed),
+        )
     }
 
     /// 整分区替换(全量拉取后调用):淘汰该前缀旧事实与倒排,写入新事实,
@@ -305,12 +326,28 @@ impl LexStore {
         )
         .map_err(|e| LexError(format!("upsert partition: {e}")))?;
         tx.commit().map_err(|e| LexError(format!("commit: {e}")))?;
+        // P2-1 观测:全量拉取(整分区替换)执行计数(仅成功路径计入)
+        self.cache_fetch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     /// TTL 内返回缓存事实(零网络);过期/无缓存返回 None(调用方走全量拉取
-    /// + replace_partition 刷新)。
+    /// + replace_partition 刷新)。P2-1:命中/不可用计数入 cache_stats——
+    /// 「跨代理写不可见」的 TTL 窗口可观测化(journal 落账由 runner 接线)。
     pub fn cached_facts(&self, prefix: &str, ttl_secs: u64) -> Option<Vec<CachedFact>> {
+        let out = self.cached_facts_probe(prefix, ttl_secs);
+        use std::sync::atomic::Ordering::Relaxed;
+        if out.is_some() {
+            self.cache_hit.fetch_add(1, Relaxed);
+        } else {
+            self.cache_expired.fetch_add(1, Relaxed);
+        }
+        out
+    }
+
+    /// cached_facts 原始探测逻辑(计数包装层之下,行为与历史逐字节一致)
+    fn cached_facts_probe(&self, prefix: &str, ttl_secs: u64) -> Option<Vec<CachedFact>> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let fetched_at: i64 = conn
             .query_row(
@@ -597,6 +634,27 @@ mod tests {
         assert_eq!(got.len(), 2);
         // TTL 过期 → None(调用方走全量刷新)
         assert!(store.cached_facts("shared.ns.stable.", 0).is_none());
+    }
+
+    #[test]
+    fn test_cache_stats_counters_p2_1() {
+        // 补齐路线图 P2-1:hit/expired/fetch 三计数器累计口径——
+        // 「跨代理写不可见」的 TTL 窗口可观测化
+        let path = temp_db("stats");
+        let store = LexStore::open(&path).unwrap();
+        assert_eq!(store.cache_stats(), (0, 0, 0));
+        // 从未拉取的分区探测 → expired(缓存不可用)
+        assert!(store.cached_facts("shared.ns.stable.", 60).is_none());
+        assert_eq!(store.cache_stats(), (0, 1, 0));
+        // 全量拉取(整分区替换成功) → fetch
+        store
+            .replace_partition("shared.ns.stable.", &facts()[..2])
+            .unwrap();
+        assert_eq!(store.cache_stats(), (0, 1, 1));
+        // TTL 内命中 → hit;TTL=0 过期 → expired
+        assert!(store.cached_facts("shared.ns.stable.", 60).is_some());
+        assert!(store.cached_facts("shared.ns.stable.", 0).is_none());
+        assert_eq!(store.cache_stats(), (1, 2, 1));
     }
 
     #[test]
