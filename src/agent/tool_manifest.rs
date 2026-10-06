@@ -600,7 +600,7 @@ fn static_manifest_table() -> &'static std::collections::BTreeMap<String, ToolMa
 /// （意图必报），但 P2 派生查静态表（`is_governance_adjudication_tool`
 /// `lookup_static().unwrap_or(false)`），本函数的分级字段对 P2 尚无消费点；
 /// 终态须随 P2 查询点扩展（静态优先防降级 ∪ 动态按 runtime manifest）
-/// 一并落地（随 PR-3/5 择机，02号档 B1）。
+/// 一并落地（随 PR-3/5 择机）。
 pub fn dynamic_manifest(
     name: &str,
     source: ToolSource,

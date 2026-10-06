@@ -864,8 +864,7 @@ pub struct AgentRunner {
     /// 摘要保真对照(规格修正批交付物 B):当前会话 journal 写者(流式路径
     /// 注入;CLI run 纯路径无 journal=只 warn 不落账)。G10 摘要替换时
     /// 自动对照落 summary_fidelity_scan 事件。
-    active_journal:
-        Option<std::sync::Arc<crate::agent::journal::JournalWriter>>,
+    active_journal: Option<std::sync::Arc<crate::agent::journal::JournalWriter>>,
 }
 
 /// 管道阶段⑦执行器：runner 的 call_service 通路

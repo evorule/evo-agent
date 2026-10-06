@@ -6,7 +6,7 @@
 //! 数据源：journal `llm_called` 事件——provider 真值 usage（`tokens.total`）
 //! 对照估算值（`tokens_est`），两账天然同源（真值优先入账已实现），报告件
 //! 只做聚合。挂点=独立 bin（`src/bin/budget_report.rs`）：journal schema
-//! 唯一事实源在本仓，避免跨仓复制漂移（24 号批次一"独立 bin"许可项）。
+//! 唯一事实源在本仓，避免跨仓复制漂移（"独立 bin"设计许可项）。
 //!
 //! 输出（确定性，同输入逐字节一致）：per-session 样本表 + 全体 P50/P95
 //! （nearest-rank）+ r 建议折算区间（附样本量）；偏离 ±50% 自动标注
@@ -111,7 +111,11 @@ pub fn render_report(sessions: &[SessionStats], skips: &[String], sources: &[Str
         all.extend_from_slice(&st.ratios);
         let mut sorted = st.ratios.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let vals = sorted.iter().map(|r| fmt4(*r)).collect::<Vec<_>>().join(", ");
+        let vals = sorted
+            .iter()
+            .map(|r| fmt4(*r))
+            .collect::<Vec<_>>()
+            .join(", ");
         out.push_str(&format!(
             "session {} samples={} ratios=[{}]\n",
             st.session,
@@ -148,7 +152,9 @@ pub fn render_report(sessions: &[SessionStats], skips: &[String], sources: &[Str
     if !skips.is_empty() {
         out.push_str(&format!("skipped: {}\n", skips.join("; ")));
     }
-    out.push_str("(注) 结论为建议档,不改默认值;token 为 provider 真值口径,估算为 tokens_est 口径\n");
+    out.push_str(
+        "(注) 结论为建议档,不改默认值;token 为 provider 真值口径,估算为 tokens_est 口径\n",
+    );
     out
 }
 
@@ -160,21 +166,29 @@ mod tests {
     fn write_fixture_journal(dir: &Path, session: &str, rows: &[(Option<u64>, Option<u64>)]) {
         let w = JournalWriter::open(dir, session).unwrap();
         for (truth_total, est) in rows {
-            let tokens = truth_total.map(|t| TokenRecord { prompt: t, completion: 0, total: t });
+            let tokens = truth_total.map(|t| TokenRecord {
+                prompt: t,
+                completion: 0,
+                total: t,
+            });
             w.llm_called_react("m", None, tokens, *est, 3, "r").unwrap();
         }
     }
 
     #[test]
     fn test_render_report_byte_level() {
-        // 合成 fixture journal → 期望报告逐字节（24 号批次一验收①）
+        // 合成 fixture journal → 期望报告逐字节（验收①）
         let dir = std::env::temp_dir().join(format!("budget-report-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         write_fixture_journal(
             &dir,
             "sess-a",
-            &[(Some(100), Some(90)), (Some(200), Some(220)), (None, Some(50))],
+            &[
+                (Some(100), Some(90)),
+                (Some(200), Some(220)),
+                (None, Some(50)),
+            ],
         );
         write_fixture_journal(&dir, "sess-b", &[(Some(400), Some(380))]);
 
@@ -189,22 +203,27 @@ mod tests {
         assert_eq!(header, "=== budget-report（est/true 预算偏差报告） ===");
         let all_line = lines.iter().find(|l| l.starts_with("全体: ")).unwrap();
         assert_eq!(
-            *all_line,
-            "全体: samples=3 P50=0.9500 P95=1.1000",
+            *all_line, "全体: samples=3 P50=0.9500 P95=1.1000",
             "P50/P95 nearest-rank 逐字节"
         );
-        let r_line = lines.iter().find(|l| l.starts_with("r 建议折算区间")).unwrap();
+        let r_line = lines
+            .iter()
+            .find(|l| l.starts_with("r 建议折算区间"))
+            .unwrap();
         assert_eq!(
             *r_line,
             "r 建议折算区间(基 0.25): [0.2273, 0.2632]（est/true<1=估算低估真实消耗偏高需上调;>1=估算偏高可下调;附样本量 3）"
         );
         // sess-a:est 缺失行跳过 → 恰 2 样本(0.9/1.1);sess-b 恰 1 样本(0.95)
-        let sa = lines.iter().find(|l| l.starts_with("session sess-a")).unwrap();
-        assert_eq!(
-            *sa,
-            "session sess-a samples=2 ratios=[0.9000, 1.1000]"
-        );
-        let sb = lines.iter().find(|l| l.starts_with("session sess-b")).unwrap();
+        let sa = lines
+            .iter()
+            .find(|l| l.starts_with("session sess-a"))
+            .unwrap();
+        assert_eq!(*sa, "session sess-a samples=2 ratios=[0.9000, 1.1000]");
+        let sb = lines
+            .iter()
+            .find(|l| l.starts_with("session sess-b"))
+            .unwrap();
         assert_eq!(*sb, "session sess-b samples=1 ratios=[0.9500]");
         // 同输入两次运行逐字节一致（确定性自证）
         let report2 = render_report(&sessions, &skips, &[dir.display().to_string()]);

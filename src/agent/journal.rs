@@ -840,7 +840,10 @@ pub fn gc_wire_blobs(
                     .to_string();
                 let age = now_ms.saturating_sub(ts);
                 if !full.is_empty() && age >= expire_ms {
-                    face.insert("full_text".to_string(), serde_json::Value::String(String::new()));
+                    face.insert(
+                        "full_text".to_string(),
+                        serde_json::Value::String(String::new()),
+                    );
                     let round = face.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
                     let hash = face
                         .get("content_hash")
@@ -853,7 +856,10 @@ pub fn gc_wire_blobs(
                     modified = true;
                 } else if !full.is_empty() && age >= wire_blob_ms {
                     archive_lines.push(line.to_string());
-                    face.insert("full_text".to_string(), serde_json::Value::String(String::new()));
+                    face.insert(
+                        "full_text".to_string(),
+                        serde_json::Value::String(String::new()),
+                    );
                     stats.wire_archived += 1;
                     modified = true;
                 }
@@ -871,8 +877,7 @@ pub fn gc_wire_blobs(
             }
         }
         if sidecar_path.exists() {
-            let sc_content =
-                std::fs::read_to_string(&sidecar_path).map_err(JournalError::Io)?;
+            let sc_content = std::fs::read_to_string(&sidecar_path).map_err(JournalError::Io)?;
             let mut kept: Vec<String> = Vec::new();
             for l in sc_content.lines() {
                 if l.trim().is_empty() {
@@ -893,8 +898,7 @@ pub fn gc_wire_blobs(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let len =
-                        obj.get("wire_len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let len = obj.get("wire_len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     expired_infos.push((round, hash, len));
                     stats.wire_expired += 1;
                 } else {
@@ -1000,7 +1004,12 @@ mod tests {
         let mut skeleton_ok = false;
         for l in &after {
             match &l.event {
-                JournalEvent::WireRendered { round, full_text, content_hash, .. } => {
+                JournalEvent::WireRendered {
+                    round,
+                    full_text,
+                    content_hash,
+                    ..
+                } => {
                     if *round == 3 {
                         assert!(full_text.starts_with("新窗全文"), "新窗不动");
                     } else {
@@ -1041,8 +1050,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         {
             let w = JournalWriter::open(&dir, "s-scan").unwrap();
-            w.summary_fidelity_scan("s-scan", 4, 6, 1, 0.1667, false).unwrap();
-            w.summary_fidelity_scan("s-scan", 2, 0, 0, 0.0, true).unwrap();
+            w.summary_fidelity_scan("s-scan", 4, 6, 1, 0.1667, false)
+                .unwrap();
+            w.summary_fidelity_scan("s-scan", 2, 0, 0, 0.0, true)
+                .unwrap();
         }
         let lines = read_all(&JournalWriter::path_for(&dir, "s-scan")).unwrap();
         let mut seen = Vec::new();
