@@ -59,6 +59,13 @@ pub const DEFAULT_MAX_DELEGATE_DEPTH: usize = 3;
 /// 数十至数百条；10,000 条 = 超长会话（多轮重试/长循环）的异常增长信号。
 const CHAIN_SIZE_WARN_ENTRIES: u64 = 10_000;
 
+/// 输出门禁（server 侧 io_guard）拒绝收尾后的纠偏重试上限（G11 同款 max_retries=2）
+const IO_GUARD_MAX_RETRIES: u32 = 2;
+
+/// 输出门禁纠偏回喂文本:server enforce 模式拒绝收尾时追加为 user 消息,
+/// LLM 下轮要么先调用相应工具获取真实结果,要么如实说明未执行该动作
+const IO_GUARD_CORRECTION_PROMPT: &str = "系统输出门禁反馈：上一条收尾输出中包含未实际执行的动作描述（如声称已执行命令、已写入文件或已提交代码，但本会话未调用对应工具）。请修正后重新收尾：要么先调用相应工具获取真实结果，要么如实说明当前未执行该动作、仅作说明性描述。";
+
 /// tool_result 回喂 LLM 前的默认字符上限已配方化
 /// (AssemblyRecipe::default() budget.tool_result_max_chars = 48000,约 12k
 /// tokens,ASCII 口径)
@@ -4476,6 +4483,8 @@ impl AgentRunner {
                                     .and_then(|v| v.as_f64())
                                     .unwrap_or(runner.config.temperature as f64);
                                 let mut react_round: u32 = 0;
+                                // 输出门禁（server io_guard）拒绝收尾的纠偏重试计数
+                                let mut guard_rejections: u32 = 0;
                                 'react: loop {
                                     // 首轮 LLM 调用已随 IoRequest 到达计过 step(L2508),回喂轮补计
                                     if react_round > 0 {
@@ -5016,6 +5025,42 @@ impl AgentRunner {
                                         .submit_io_response(&session_id, rid, &resp, None)
                                         .await
                                     {
+                                        // 输出门禁（server io_guard）enforce 模式以 422 拒绝收尾——
+                                        // 纠偏回喂:追加纠正性 user 消息后重试（LLM 下轮如实说明
+                                        // 或先调工具）,上限 IO_GUARD_MAX_RETRIES;超限以 error 应答
+                                        // 收敛引擎 io_request（error 标记不触门禁）并 fail-visible。
+                                        let is_guard_reject =
+                                            matches!(&e, ApiError::ApiError { status: 422, .. });
+                                        if is_guard_reject
+                                            && guard_rejections < IO_GUARD_MAX_RETRIES
+                                        {
+                                            guard_rejections += 1;
+                                            warn!(
+                                                %session_id,
+                                                request_id = rid,
+                                                round = guard_rejections,
+                                                "io_guard rejected final output; feeding back corrective turn"
+                                            );
+                                            messages.push(Message::User {
+                                                content: IO_GUARD_CORRECTION_PROMPT.to_string(),
+                                            });
+                                            continue 'react;
+                                        }
+                                        if is_guard_reject {
+                                            let err_str = format!(
+                                                "输出门禁拒绝收尾：纠正重试 {guard_rejections} 次后仍命中（IO_GUARD_REJECTED）"
+                                            );
+                                            let _ = runner.evorule_client
+                                                .submit_io_response(
+                                                    &session_id,
+                                                    rid,
+                                                    &serde_json::json!({"error": &err_str}),
+                                                    Some(err_str.as_str()),
+                                                )
+                                                .await;
+                                            yield Err(AgentError::EvoruleError(err_str));
+                                            return;
+                                        }
                                         yield Err(AgentError::EvoruleError(e.to_string()));
                                         return;
                                     }
