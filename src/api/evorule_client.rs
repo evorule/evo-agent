@@ -179,6 +179,30 @@ impl EvoruleApiClient {
         self.invoke_service("knowledge-propose", &args).await
     }
 
+    /// 机器行权知识候选（治理语义封装，对称 `propose_knowledge_entry`）
+    ///
+    /// 经服务编排层服务注册桥（`knowledge-transition`）→ 规则引擎服务端机器闸：
+    /// 现场六检执行 → 非全过 422 附 MachineGateReport 全文（fail-visible）；
+    /// 全过按状态机合法路径逐跳放行至 Active（gate=machine+tier 审计留痕，
+    /// T1 进人工追认队列——「机器行权，人工追认」）。行权上限=Active。
+    ///
+    /// - `entry_id`：候选条目 ID（propose 回执的 entry_id）；
+    /// - `cause`：行权 cause（必填溯源锚）。
+    pub async fn transition_knowledge_entry(
+        &self,
+        dataset_id: &str,
+        entry_id: &str,
+        cause: &str,
+    ) -> Result<Value, ApiError> {
+        let args = serde_json::json!({
+            "dataset_id": dataset_id,
+            "entry_id": entry_id,
+            "to": "active",
+            "cause": cause,
+        });
+        self.invoke_service("knowledge-transition", &args).await
+    }
+
     /// 平台用户令牌校验 —— GET /api/platform/auth/me
     ///
     /// 用调用者提交的 Bearer 令牌直接请求认证端点，换取平台用户名。
@@ -1589,6 +1613,61 @@ mod tests {
             "payload": {}, "schema_ref": "builtin:knowledge/fact"});
         assert!(client
             .propose_knowledge_entry("ds-a23", &entry, "c", None)
+            .await
+            .is_err());
+    }
+
+    // ===== 治理写通路：transition_knowledge_entry 封装（A2-4） =====
+
+    /// 请求形状：服务名固定 knowledge-transition，body = {dataset_id, entry_id,
+    /// to:"active", cause}；响应透传（transitioned 回执含 tier/report）
+    #[tokio::test]
+    async fn test_transition_knowledge_entry_request_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/services/knowledge-transition/invoke")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "dataset_id": "ds-a24",
+                "entry_id": "k-1",
+                "to": "active",
+                "cause": "E2E：机器行权"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"status":"transitioned","entry_id":"k-1","lifecycle":"Active","tier":"T0","post_review_required":false}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let resp = client
+            .transition_knowledge_entry("ds-a24", "k-1", "E2E：机器行权")
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "transitioned");
+        assert_eq!(resp["lifecycle"], "Active");
+        assert_eq!(resp["tier"], "T0");
+        mock.assert_async().await;
+    }
+
+    /// 错误翻译：机器闸未放行 422（MachineGateReport 全文）fail-fast 显式上抛
+    #[tokio::test]
+    async fn test_transition_knowledge_entry_gate_fail_fail_fast() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/services/knowledge-transition/invoke")
+            .with_status(422)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"error":{"code":"unprocessable_entity","message":"机器闸未放行（T2）: tier=T2 M1_schema=pass"}}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        assert!(client
+            .transition_knowledge_entry("ds-a24", "k-2", "c")
             .await
             .is_err());
     }

@@ -179,6 +179,11 @@ pub struct PromoteGateConfig {
     /// 治理层知识数据集 ID（提议入账目标；启用时必填，缺省视为未启用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset_id: Option<String>,
+    /// 提议入账后自动机器行权（A2-4 接线；缺省关=Draft 只存不动，保守起步）：
+    /// 开启后 propose 回执成功即调 transition_knowledge_entry（服务端机器闸六检，
+    /// 全过放行 Active，非全过 422 fail-visible 候选保持 Promoted-Draft 形态）。
+    #[serde(default)]
+    pub auto_transition: bool,
 }
 
 impl Default for PromoteGateConfig {
@@ -186,6 +191,7 @@ impl Default for PromoteGateConfig {
         Self {
             enabled: false,
             dataset_id: None,
+            auto_transition: false,
         }
     }
 }
