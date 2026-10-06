@@ -4654,10 +4654,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lc-ns-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let store = std::sync::Arc::new(crate::agent::lexstore::LexStore::open(
-            &dir.join("lc.db"),
-        )
-        .unwrap());
+        let store = std::sync::Arc::new(
+            crate::agent::lexstore::LexStore::open(&dir.join("lc.db")).unwrap(),
+        );
         let mut mgr = MemoryManager::new("ns", make_test_client());
         mgr.set_lex_store(store.clone());
         // 并发语义模型:同 path 两版本(版本号即链序)先后入索引
@@ -4688,14 +4687,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lc-iso-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let store_a = std::sync::Arc::new(crate::agent::lexstore::LexStore::open(
-            &dir.join("a.db"),
-        )
-        .unwrap());
-        let store_b = std::sync::Arc::new(crate::agent::lexstore::LexStore::open(
-            &dir.join("b.db"),
-        )
-        .unwrap());
+        let store_a =
+            std::sync::Arc::new(crate::agent::lexstore::LexStore::open(&dir.join("a.db")).unwrap());
+        let store_b =
+            std::sync::Arc::new(crate::agent::lexstore::LexStore::open(&dir.join("b.db")).unwrap());
         store_a
             .replace_partition(
                 "shared.a.stable.",
@@ -4736,11 +4731,8 @@ mod tests {
     fn test_tokenize_chinese_goal_regression_baseline() {
         // 检索质量观测批(K-12)防线:中文 goal 经分词必须产出 >1 token——
         // 单词兜底陷阱(整句吞成一个 token→检索永不命中)的回归基线
-        for goal in [
-            "部署服务",
-            "修复登录超时问题并验证",
-            "配置数据库连接池参数",
-        ] {
+        for goal in ["部署服务", "修复登录超时问题并验证", "配置数据库连接池参数"]
+        {
             let tokens = tokenize_for_match(goal);
             assert!(
                 tokens.len() > 1,
