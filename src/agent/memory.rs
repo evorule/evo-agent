@@ -4662,7 +4662,8 @@ mod tests {
         mgr.cache.insert("shared::events.e1".to_string(), rec);
         mgr.set_session_id("s1");
         let recipe_snapshot = mgr.recipe.clone().unwrap_or_default();
-        mgr.apply_lifecycle_transitions("s1", &recipe_snapshot).await;
+        mgr.apply_lifecycle_transitions("s1", &recipe_snapshot)
+            .await;
         let after = mgr.cache.get("shared::events.e1").unwrap();
         assert_eq!(after.lifecycle_state.as_deref(), Some("Promoted"));
     }
@@ -4685,7 +4686,8 @@ mod tests {
         mgr.cache.insert("shared::events.e2".to_string(), rec);
         mgr.set_session_id("s1");
         let recipe_snapshot = mgr.recipe.clone().unwrap_or_default();
-        mgr.apply_lifecycle_transitions("s1", &recipe_snapshot).await;
+        mgr.apply_lifecycle_transitions("s1", &recipe_snapshot)
+            .await;
         let after = mgr.cache.get("shared::events.e2").unwrap();
         assert_eq!(
             after.lifecycle_state.as_deref(),
@@ -4706,9 +4708,7 @@ mod tests {
             .mock("POST", "/api/services/knowledge-propose/invoke")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"status":"proposed","entry_id":"k-9","version":1,"lifecycle":"Draft"}"#,
-            )
+            .with_body(r#"{"status":"proposed","entry_id":"k-9","version":1,"lifecycle":"Draft"}"#)
             .create_async()
             .await;
         let mut mgr = MemoryManager::new(
@@ -4728,7 +4728,8 @@ mod tests {
         mgr.cache.insert("shared::events.e3".to_string(), rec);
         mgr.set_session_id("s1");
         let recipe_snapshot = mgr.recipe.clone().unwrap_or_default();
-        mgr.apply_lifecycle_transitions("s1", &recipe_snapshot).await;
+        mgr.apply_lifecycle_transitions("s1", &recipe_snapshot)
+            .await;
         let after = mgr.cache.get("shared::events.e3").unwrap();
         assert_eq!(after.lifecycle_state.as_deref(), Some("Promoted"));
         assert!(
@@ -4756,7 +4757,9 @@ mod tests {
             mgr.set_recipe(recipe);
             mgr
         };
-        let dropped = vec![Message::User { content: "部署".to_string() }];
+        let dropped = vec![Message::User {
+            content: "部署".to_string(),
+        }];
         let mut ctx_on = RecallContext::default();
         ctx_on.stable.push(MemoryRecord::new(
             "stable.llm.m.a",
@@ -4774,10 +4777,13 @@ mod tests {
         mgr_on.adjudicate_stable(&mut ctx_on).await;
         assert_eq!(ctx_on.stable.len(), 1, "败者退出 wire 呈现");
         assert_eq!(ctx_on.stable[0].value, "缓存开关默认开启");
-        assert!(ctx_on
-            .degradation_notices
-            .iter()
-            .any(|n| n.contains("[adjudication]")), "裁决须 fail-visible");
+        assert!(
+            ctx_on
+                .degradation_notices
+                .iter()
+                .any(|n| n.contains("[adjudication]")),
+            "裁决须 fail-visible"
+        );
 
         // 门控关:零影响(矛盾对原样呈现)
         let mut ctx_off = RecallContext::default();
@@ -4786,9 +4792,11 @@ mod tests {
             "缓存开关默认开启",
             1000,
         ));
-        ctx_off
-            .stable
-            .push(MemoryRecord::new("stable.llm.m.b", "缓存开关默认不开启", 2000));
+        ctx_off.stable.push(MemoryRecord::new(
+            "stable.llm.m.b",
+            "缓存开关默认不开启",
+            2000,
+        ));
         let mut mgr_off = mk(false);
         mgr_off.adjudicate_stable(&mut ctx_off).await;
         assert_eq!(ctx_off.stable.len(), 2, "缺省关=既有 agent 零影响");

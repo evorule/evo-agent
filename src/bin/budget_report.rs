@@ -12,7 +12,7 @@
 //! 样本，输出 per-session 表+全体 P50/P95+r 建议折算区间（确定性，同输入
 //! 逐字节一致）。**结论只出建议档，不直接改默认值**；偏离 ±50% 标注另呈批。
 //! 挂点说明：journal schema 唯一事实源在本仓，独立 bin 避免 schema 跨仓
-//! 复制漂移（24 号批次一许可项）。
+//! 复制漂移（设计许可项留痕）。
 use evo_agent::budget_report::analyze_dirs;
 use std::path::PathBuf;
 
@@ -25,7 +25,10 @@ fn main() {
     match analyze_dirs(&dirs) {
         Ok((sessions, skips)) => {
             let sources: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
-            print!("{}", evo_agent::budget_report::render_report(&sessions, &skips, &sources));
+            print!(
+                "{}",
+                evo_agent::budget_report::render_report(&sessions, &skips, &sources)
+            );
         }
         Err(e) => {
             eprintln!("分析失败: {e}");

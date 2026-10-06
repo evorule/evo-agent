@@ -37,7 +37,9 @@ fn authority_rank(record: &MemoryRecord) -> u8 {
 /// 词法极性：文本命中任一否定词=否定极性
 fn negative_polarity(text: &str, markers: &[String]) -> bool {
     let lower = text.to_lowercase();
-    markers.iter().any(|m| !m.is_empty() && lower.contains(&m.to_lowercase()))
+    markers
+        .iter()
+        .any(|m| !m.is_empty() && lower.contains(&m.to_lowercase()))
 }
 
 /// 词面相似度：分词集 Jaccard（确定性；零向量红线内）
@@ -76,17 +78,11 @@ fn is_contradiction_pair(
 /// 裁决：按维度序（Recipe.adjudication.order）比较，返回胜者下标。
 /// 维度值：authority=来源权威秩；confidence=自评置信；freshness=时间戳。
 /// 平局保持原序（先到者胜，确定性）。
-fn adjudicate_pair(
-    a: &MemoryRecord,
-    b: &MemoryRecord,
-    order: &[String],
-) -> usize {
+fn adjudicate_pair(a: &MemoryRecord, b: &MemoryRecord, order: &[String]) -> usize {
     use std::cmp::Ordering;
     for d in order {
         let ord = match d.as_str() {
-            "authority" => {
-                authority_rank(a).cmp(&authority_rank(b))
-            }
+            "authority" => authority_rank(a).cmp(&authority_rank(b)),
             "confidence" => a
                 .confidence
                 .unwrap_or(0.0)

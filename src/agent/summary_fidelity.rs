@@ -42,7 +42,9 @@ const TOOL_ANCHOR_MAX_CHARS: usize = 64;
 pub fn extract_anchors(dropped: &[Message]) -> Vec<String> {
     let mut anchors: Vec<String> = Vec::new();
     // goal 关键词：首条 user 消息分词 top-8（频次降序+字典序 tie-break）
-    if let Some(Message::User { content }) = dropped.iter().find(|m| matches!(m, Message::User { .. })) {
+    if let Some(Message::User { content }) =
+        dropped.iter().find(|m| matches!(m, Message::User { .. }))
+    {
         let mut freq: std::collections::BTreeMap<String, usize> = Default::default();
         for t in crate::agent::memory::tokenize_for_match(content) {
             *freq.entry(t).or_insert(0) += 1;
@@ -77,7 +79,10 @@ pub fn check_fidelity(summary: &str, anchors: &[String]) -> (usize, usize) {
         return (0, 0);
     }
     let hay = summary.to_lowercase();
-    let hit = anchors.iter().filter(|a| hay.contains(&a.to_lowercase())).count();
+    let hit = anchors
+        .iter()
+        .filter(|a| hay.contains(&a.to_lowercase()))
+        .count();
     (hit, anchors.len())
 }
 
@@ -106,16 +111,21 @@ mod tests {
     use super::*;
 
     fn msg_user(content: &str) -> Message {
-        Message::User { content: content.to_string() }
+        Message::User {
+            content: content.to_string(),
+        }
     }
 
     fn msg_tool(name: &str, content: &str) -> Message {
-        Message::Tool { content: content.to_string(), tool_name: name.to_string() }
+        Message::Tool {
+            content: content.to_string(),
+            tool_name: name.to_string(),
+        }
     }
 
     #[test]
     fn test_full_hit_ratio_one() {
-        // 全含 → ratio=1（24 号批次三验收例 1）
+        // 全含 → ratio=1（验收例 1）
         let dropped = vec![
             msg_user("部署服务并验证构建产物"),
             msg_tool("shell_exec", "build succeeded. 产物已生成"),
@@ -166,7 +176,9 @@ mod tests {
     fn test_goal_keywords_unique_capped() {
         // 分词器内部去重:CJK bigram/整词唯一化后按字典序取 8(确定性;
         // 12 词超上限恰取 8)
-        let dropped = vec![msg_user("迁移 迁移 迁移 校验 校验 备份 上线 监控 告警 回滚 文档 评审")];
+        let dropped = vec![msg_user(
+            "迁移 迁移 迁移 校验 校验 备份 上线 监控 告警 回滚 文档 评审",
+        )];
         let anchors = extract_anchors(&dropped);
         assert_eq!(anchors.len(), 8);
         let mut uniq = anchors.clone();
