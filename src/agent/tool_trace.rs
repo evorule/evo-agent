@@ -286,6 +286,12 @@ impl ToolTraceCollector {
         std::mem::take(&mut self.entries)
     }
 
+    /// 当前未 drain 轨迹的只读快照（查账工具族 PR-11a：query_trace/read_back
+    /// 消费口——查询不改账面，与 [`Self::drain`] 的清空消费语义相对）
+    pub fn snapshot(&self) -> Vec<Value> {
+        self.entries.clone()
+    }
+
     /// 提交失败计数(fail-soft 留痕;metrics 暴露前的观测口径)
     pub fn record_submit_failure(&mut self) {
         self.submit_failures += 1;
