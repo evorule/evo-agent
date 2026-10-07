@@ -62,6 +62,9 @@ pub struct SedimentConfig {
     pub enable_consolidation: bool,
     /// 是否启用双通道笔记事件驱动草稿（阶段 5 NB-2：确定性投影，零 LLM）
     pub enable_failure_drafts: bool,
+    /// 程序记忆素材收割（阶段 5 F-615/O-251:审批拒绝+治理拦截→procedural
+    /// 候选,材料→受治通道→程序记忆晋升;Recipe sources.materials 穿线,缺省关）
+    pub enable_material_harvest: bool,
     /// 是否启用 journal 摘要投影（跨源注册规格：确定性结构投影，零 LLM；
     /// Recipe sources.journal_digest 数据化开关，缺省关=既有 agent 零影响）
     pub enable_journal_digest: bool,
@@ -80,6 +83,7 @@ impl Default for SedimentConfig {
             min_messages_for_extraction: 4,
             enable_consolidation: true,
             enable_failure_drafts: false,
+            enable_material_harvest: false,
             enable_journal_digest: false,
         }
     }
@@ -131,6 +135,8 @@ pub struct SedimentResult {
     pub knowledge_consolidated: Vec<String>,
     /// 错误草稿笔记 key 列表（NB-2 事件驱动草稿）
     pub failure_drafts: Vec<String>,
+    /// 程序记忆素材候选 event_id 列表（F-615 收割器）
+    pub procedural_materials: Vec<String>,
     /// 会话收尾补写成功的离线积压事件数（CacheOnly→Persisted 对账闭环;
     /// 0=无积压或补写失败——与 stable_facts_cache_only 同款防虚报口径）
     pub flushed_events: usize,
@@ -247,10 +253,20 @@ pub async fn sediment(
         consolidate_knowledge_candidates(deps, cfg, session_id, &mut result).await;
     }
 
+    // journal 行单次取走——6.55/6.6/7 三消费者共享切片（修复:此前草稿
+    //    消费 mem::take 整表,摘要投影在同开两开关时被饿死空转）
+    let journal_lines = std::mem::take(&mut deps.journal_lines);
+
+    // 6.55 程序记忆素材收割（阶段 5 F-615/O-251）：审批拒绝+治理拦截 →
+    //    procedural 候选（Captured,材料→受治通道→程序记忆晋升）
+    if cfg.enable_material_harvest {
+        harvest_procedural_materials(&journal_lines, deps, session_id, &mut result).await;
+    }
+
     // 6.6 双通道笔记事件驱动草稿（阶段 5 NB-2）：journal 确定性投影 →
     //    failure 草稿笔记（Captured 状态，notes.failure.* 家族）
     if cfg.enable_failure_drafts {
-        generate_failure_drafts(deps, session_id, &mut result).await;
+        generate_failure_drafts(&journal_lines, deps, session_id, &mut result).await;
     }
 
     // 7. journal 摘要投影（跨源注册规格）：确定性结构投影（零 LLM）——
@@ -258,11 +274,10 @@ pub async fn sediment(
     //    journal 本体「唯一真相源、不进 prompt」纪律不变；检索可达的是
     //    有界派生品，逐字节引用仍以 journal 为准（digest 内附 session 回指）。
     if cfg.enable_journal_digest {
-        let lines = std::mem::take(&mut deps.journal_lines);
-        if lines.is_empty() {
+        if journal_lines.is_empty() {
             tracing::debug!(session_id = %session_id, "sediment: no journal lines; digest skipped");
         } else {
-            let digest = build_journal_digest(session_id, &lines);
+            let digest = build_journal_digest(session_id, &journal_lines);
             if deps.memory.write_journal_digest(session_id, &digest).await {
                 result.journal_digest_written = true;
             } else {
@@ -736,12 +751,128 @@ fn scan_failure_signals(lines: &[JournalLine]) -> Vec<(String, String)> {
 /// 前置 = `deps.journal_lines` 非空（由 runner 填充，与 F-613 同源）。
 /// 产出 = `shared.{ns}.notes.failure.{session_id}` Captured 事实，
 /// content.failures 列表每条携带 (call_id, 错误摘要) 供溯源回指。
-async fn generate_failure_drafts(
+/// 程序记忆素材收割（阶段 5 F-615/O-251 清偿）：四类已落账素材中账内可
+/// 及的两类——审批拒绝（ApprovalRequested×ApprovalResolved 配对）与治理
+/// 拦截（PolicyJudged blocked）——确定性投影为 procedural 候选事件
+/// （Captured，kind=procedural），走既有晋升通道（Captured→Promoted→
+/// 程序记忆），**零新特权通道**（材料→受治通道晋升，11 号 §七口径）。
+/// tool_traces（引擎侧审计链）与 stable 域（本即记忆）不在 journal 投影
+/// 可及面，如实声明为边界。候选单会话上限=有界投影（与 digest 同哲学）。
+const MATERIAL_HARVEST_CAP: usize = 5;
+async fn harvest_procedural_materials(
+    lines: &[JournalLine],
     deps: &mut SedimentDeps<'_>,
     session_id: &str,
     result: &mut SedimentResult,
 ) {
-    let lines = std::mem::take(&mut deps.journal_lines);
+    use std::collections::HashMap;
+    let mut requested: HashMap<String, (String, String)> = HashMap::new();
+    let mut candidates: Vec<(String, String)> = Vec::new(); // (类别, 摘要)
+    for line in lines {
+        match &line.event {
+            JournalEvent::ApprovalRequested {
+                approval_id,
+                tool,
+                payload,
+            } => {
+                requested.insert(approval_id.clone(), (tool.clone(), payload.clone()));
+            }
+            JournalEvent::ApprovalResolved {
+                approval_id,
+                decision,
+            } => {
+                if decision == "rejected" || decision == "auto_rejected" {
+                    let (tool, payload) = requested
+                        .get(approval_id)
+                        .cloned()
+                        .unwrap_or_else(|| (String::new(), String::new()));
+                    candidates.push((
+                        "approval_rejected".to_string(),
+                        format!("工具 {tool} 载荷摘要 {payload} 被拒（{decision}）"),
+                    ));
+                }
+            }
+            JournalEvent::PolicyJudged {
+                verdict, evidence, ..
+            } => {
+                if verdict == "blocked" {
+                    candidates.push((
+                        "policy_blocked".to_string(),
+                        format!("治理拦截: {evidence}"),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    candidates.dedup_by(|a, b| a.1 == b.1);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    for (seq, (category, summary)) in
+        candidates.into_iter().take(MATERIAL_HARVEST_CAP).enumerate()
+    {
+        let event_id = format!("PM-{}-{seq}", sanitize_model_id(session_id));
+        let mut event = crate::agent::memory_event::event::MemoryEvent::new_root(
+            &event_id,
+            crate::agent::memory_event::event::EventType::Custom(
+                "procedural_material".to_string(),
+            ),
+            now,
+            crate::agent::memory_event::event::EventSource::SystemObservation,
+        )
+        .with_confidence(0.6)
+        .with_tag("procedural")
+        .with_tag("material")
+        .with_session(session_id);
+        event.content = serde_json::json!({
+            "category": category,
+            "summary": summary,
+            "body": format!("程序记忆素材（{category}）：{summary}——提炼为可复用操作知识后经晋升通道沉淀"),
+        });
+        let value = match serde_json::to_string(&event) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let key = format!("events.{event_id}");
+        match deps
+            .memory
+            .set_scoped(MemoryScope::Shared, &key, &value)
+            .await
+        {
+            Ok(_) => {
+                result.procedural_materials.push(key.clone());
+                if let Some(store) = deps.event_store.as_mut() {
+                    if let Err(e) = store.write_event(event.clone()).await {
+                        tracing::warn!(
+                            error = %e,
+                            event_id = %event_id,
+                            "sediment: procedural material dual-write failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    event_id = %event_id,
+                    "sediment: procedural material write failed"
+                );
+            }
+        }
+    }
+}
+
+async fn generate_failure_drafts(
+    lines: &[JournalLine],
+    deps: &mut SedimentDeps<'_>,
+    session_id: &str,
+    result: &mut SedimentResult,
+) {
     if lines.is_empty() {
         return;
     }
@@ -1461,6 +1592,85 @@ mod tests {
         assert_eq!(out.knowledge_kind, "fact");
         // 空标题拒绝
         assert!(parse_consolidation(r#"{"title":"","body":"x"}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_harvest_procedural_materials_pairs_and_dedups() {
+        // F-615:审批拒绝配对+治理拦截→procedural 候选;重复摘要去重;离线降级
+        let mut mgr = MemoryManager::new("ns", make_test_client()).with_session_id("s-pm");
+        let mut cfg = SedimentConfig::default();
+        cfg.enable_material_harvest = true;
+        let llm = LlmHandler::mock("{}");
+        let auditor = AuditedLlm::new(make_test_client(), llm);
+        let mut deps = SedimentDeps {
+            memory: &mut mgr,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: Some(&auditor),
+            journal_lines: Vec::new(),
+        };
+        let lines = vec![
+            JournalLine { seq: 1, ts: 1, event: JournalEvent::ApprovalRequested {
+                approval_id: "ap1".into(), tool: "file_write".into(), payload: "敏感路径".into() } },
+            JournalLine { seq: 2, ts: 2, event: JournalEvent::ApprovalResolved {
+                approval_id: "ap1".into(), decision: "rejected".into() } },
+            JournalLine { seq: 3, ts: 3, event: JournalEvent::PolicyJudged {
+                judgement_id: "j1".into(), verdict: "blocked".into(), evidence: "shell 越界".into() } },
+            // 重复摘要(同工具同载荷同决定)→去重
+            JournalLine { seq: 4, ts: 4, event: JournalEvent::ApprovalRequested {
+                approval_id: "ap2".into(), tool: "file_write".into(), payload: "敏感路径".into() } },
+            JournalLine { seq: 5, ts: 5, event: JournalEvent::ApprovalResolved {
+                approval_id: "ap2".into(), decision: "rejected".into() } },
+        ];
+        let mut result = SedimentResult::default();
+        harvest_procedural_materials(&lines, &mut deps, "s-pm", &mut result).await;
+        assert_eq!(
+            result.procedural_materials.len(),
+            3,
+            "拒绝配对(2 连续去重后仍 2 条)+拦截(1): {:?}",
+            result.procedural_materials
+        );
+    }
+
+    #[tokio::test]
+    async fn test_journal_digest_not_starved_by_failure_drafts() {
+        // 回归:草稿与摘要投影同开时,journal 行单次取走共享——digest 不再饿死
+        let mut mgr =
+            MemoryManager::new("ns", make_test_client()).with_session_id("s-starve");
+        let mut cfg = SedimentConfig::default();
+        cfg.enable_failure_drafts = true;
+        cfg.enable_journal_digest = true;
+        let mut deps = SedimentDeps {
+            memory: &mut mgr,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: None,
+            journal_lines: vec![JournalLine { seq: 1, ts: 1, event: JournalEvent::ToolResult {
+                call_id: "t1".into(), status: "error".into(), size_bytes: 1,
+                content_digest: "blake3:aa".into() } }],
+        };
+        let result = sediment(
+            &mut deps,
+            &cfg,
+            "s-starve",
+            &[Message::User { content: "g".to_string() }],
+        )
+        .await;
+        // 离线可观测面:草稿经 set_scoped CacheOnly 落 cache——同开两开关时
+        // 草稿照常产出=journal 行到达了共享切片消费方。digest 侧的饿死防护
+        // 为结构性保证:journal 行单次 move+三消费方切片借用,双重 take 已
+        // 不可表示(修复前:草稿 mem::take 整表→摘要投影同开时饿死空转)。
+        assert_eq!(result.failure_drafts.len(), 1, "草稿照常产出(离线 CacheOnly)");
+        assert!(
+            result.procedural_materials.is_empty(),
+            "材料收割未开启时不产候选"
+        );
+        assert!(
+            mgr.cache_keys().iter().any(|k| k.contains("failure")),
+            "草稿 CacheOnly 落 cache 可观测"
+        );
     }
 
     #[tokio::test]

@@ -1215,16 +1215,21 @@ impl AgentRunner {
                 Ok(recipe) => {
                     let rollup = recipe.lifecycle.rollup_threshold;
                     let journal_digest = recipe.sources.journal_digest;
-                    let failure_drafts = recipe.sources.journal_digest;
+                    // 修复:failure_drafts 此前误接 journal_digest（复制粘贴错,
+                    // 草稿面从未被 Recipe 独立声明控制过）
+                    let failure_drafts = recipe.sources.failure_drafts;
+                    let material_harvest = recipe.sources.materials;
+                    let recipe_for_mem = recipe.clone();
                     if let Some(mem) = runner.memory.as_mut() {
-                        mem.set_recipe(recipe);
+                        mem.set_recipe(recipe_for_mem);
                     }
                     // Recipe.rollup_threshold 覆盖同名 def 配置（策略数据化）
                     runner.sediment_config.summary_rollup_threshold = rollup;
-                    // Recipe.sources.journal_digest 穿线（跨源注册规格策略面；
+                    // Recipe.sources 三源穿线（跨源注册规格策略面；
                     // 缺省关=既有 agent 零影响）
                     runner.sediment_config.enable_journal_digest = journal_digest;
                     runner.sediment_config.enable_failure_drafts = failure_drafts;
+                    runner.sediment_config.enable_material_harvest = material_harvest;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "MemoryRecipe 解析失败——召回走词法 legacy 路径");
@@ -1271,6 +1276,7 @@ impl AgentRunner {
             enable_consolidation: true,
             // 阶段 5 NB-2:双通道笔记事件驱动草稿(缺省关;Recipe sources 穿线于上)
             enable_failure_drafts: false,
+            enable_material_harvest: false,
         };
         // 阶段 3(F-611)+A2-2:自省记忆工具注册(声明面已在 step 2 按暴露条件
         // 预放行;此处声明了而条件不满足=配置矛盾,早失败)。置于 sediment_config
