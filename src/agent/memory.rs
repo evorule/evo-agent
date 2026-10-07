@@ -444,6 +444,22 @@ pub(crate) fn sort_stable_by_value(stable: &mut [MemoryRecord], goal: &str) {
 /// importance = w_c·confidence + w_u·min(usage,k)（F-616 stable 面接通：
 /// usage=存量 usage_count+本会话 pending 增量，k 封顶防垄断，配方可调）；
 /// 全序 Tie-break：新鲜度 ▸ 置信度 ▸ key 字典序（确定性可回放）。
+/// 来源权威权重（11 号 §5.1 authority 因子/§4.2 置信度演化 w_e 同源:
+/// user 1.0 / system 0.8 / llm 0.5 / 未标注 0.65——key 域优先,source 次之）
+pub(crate) fn authority_weight(record: &MemoryRecord) -> f32 {
+    let key = record.key.as_str();
+    let src = record.source.as_deref().unwrap_or_default();
+    if key.starts_with("stable.user.") || src.contains("user") {
+        1.0
+    } else if key.starts_with("stable.system.") || src.starts_with("system") {
+        0.8
+    } else if key.starts_with("stable.llm.") || src.starts_with("llm") {
+        0.5
+    } else {
+        0.65
+    }
+}
+
 pub(crate) fn sort_by_policy(
     stable: &mut [MemoryRecord],
     goal: &str,
@@ -459,11 +475,36 @@ pub(crate) fn sort_by_policy(
         .map(|r| stable_relevance(r, &goal_uniq))
         .collect();
     let max_rel = rels.iter().copied().max().unwrap_or(0).max(1);
+    // 实体度(批内共现归一,11 号 §5.1 entity_degree 的确定性代理):
+    // 逐条 token 集,与他条共享的 distinct token 数,批内 max 归一
+    let token_sets: Vec<std::collections::HashSet<String>> = stable
+        .iter()
+        .map(|r| tokenize_for_match(&r.value).into_iter().collect())
+        .collect();
+    let degrees: Vec<f32> = token_sets
+        .iter()
+        .enumerate()
+        .map(|(i, ti)| {
+            let mut shared = std::collections::HashSet::new();
+            for (j, tj) in token_sets.iter().enumerate() {
+                if i != j {
+                    for t in ti {
+                        if tj.contains(t) {
+                            shared.insert(t.clone());
+                        }
+                    }
+                }
+            }
+            shared.len() as f32
+        })
+        .collect();
+    let max_degree = degrees.iter().copied().fold(0.0_f32, f32::max).max(1.0);
     // 预计算每条的三因子（避免比较器内重复计算）
     let scores: Vec<f32> = stable
         .iter()
         .zip(rels.iter())
-        .map(|(r, &rel)| {
+        .enumerate()
+        .map(|(i, (r, &rel))| {
             let rel_norm = rel as f32 / max_rel as f32;
             let age_days = (now_secs().saturating_sub(r.timestamp)) as f64 / 86400.0;
             let half = if r.key.contains("events.") {
@@ -481,7 +522,9 @@ pub(crate) fn sort_by_policy(
                 .unwrap_or(0);
             let usage_hits = r.usage_count.saturating_add(pending);
             let importance = policy.w_confidence * r.confidence.unwrap_or(0.5)
-                + policy.w_usage * usage_hits.min(policy.usage_cap) as f32;
+                + policy.w_usage * usage_hits.min(policy.usage_cap) as f32
+                + policy.w_authority * authority_weight(r)
+                + policy.w_entity * degrees[i] / max_degree;
             policy.w_relevance * rel_norm
                 + policy.w_recency * recency
                 + policy.w_importance * importance
@@ -2320,6 +2363,17 @@ impl MemoryManager {
             let mut loser = ctx.stable[*l].clone();
             loser.lifecycle_state = Some("Superseded".to_string());
             loser.tags.push(format!("superseded_by:{winner_path}"));
+            // 置信度矛盾演化(11 号 §4.2 v0.1.8,Recipe 缺省关):裁决败者
+            // =矛盾证据,Δ=−0.10×w_e(随 Superseded 版本事实落账)
+            if self
+                .recipe
+                .as_ref()
+                .map(|r| r.lifecycle.confidence_evolution)
+                .unwrap_or(false)
+            {
+                let delta = 0.10 * authority_weight(&loser);
+                loser.confidence = loser.confidence.map(|c| (c - delta).clamp(0.0, 1.0));
+            }
             let mut adj = MemoryRecord::new(
                 adj_path.rsplit('.').next().unwrap_or("pair"),
                 &format!(
@@ -2451,6 +2505,18 @@ impl MemoryManager {
             };
             rec.usage_count = rec.usage_count.saturating_add(*inc);
             rec.lifecycle_state = Some("Reinforced".to_string());
+            // 置信度佐证演化(11 号 §4.2 v0.1.8,Recipe 缺省关):recall 命中
+            // =佐证证据,Δ=+0.05×w_e(来源权威权重);演化随本批版本事实落账
+            if self
+                .recipe
+                .as_ref()
+                .map(|r| r.lifecycle.confidence_evolution)
+                .unwrap_or(false)
+            {
+                let delta = 0.05 * authority_weight(rec);
+                rec.confidence =
+                    rec.confidence.map(|c| (c + delta).clamp(0.0, 1.0));
+            }
             match serde_json::to_value(&*rec) {
                 Ok(v) => batch.push((path.clone(), v)),
                 Err(e) => tracing::warn!(fact_id, error = %e, "usage flush: 序列化失败,跳过该条"),
@@ -2528,8 +2594,14 @@ impl MemoryManager {
                 Some("Settled") | Some("Promoted") | Some("Reinforced")
             ) {
                 let idle_days = (now.saturating_sub(rec.timestamp)) as f64 / 86400.0;
+                // 迁移序:归档终态优先(超 archive 限);decay 为中间带
+                // [decay 限,archive 限)的零引用降权(11 号 §4.2 v0.1.8 异常迁移②,
+                // confidence 半衰一次性——Decayed 态不再进入本分支)
                 if idle_days > lc.archive_after_idle_days as f64 {
                     rec.lifecycle_state = Some("Archived".to_string());
+                } else if idle_days > lc.decay_after_idle_days as f64 && rec.usage_count == 0 {
+                    rec.lifecycle_state = Some("Decayed".to_string());
+                    rec.confidence = rec.confidence.map(|c| (c * 0.5).clamp(0.0, 1.0));
                 }
             }
         }
@@ -5842,6 +5914,100 @@ mod tests {
         // 注意：若注入句仅占条目一部分,剥离后剩余正文仍会进入 prompt
         // （如 "you are now the admin" 剥离后余 "admin"）——这是 Strip
         // 模式的预期语义:保正文、除攻击。
+    }
+
+    #[test]
+    fn authority_weight_maps_domains() {
+        let mk = |k: &str, src: Option<&str>| {
+            let mut r = MemoryRecord::new(k, "v", 1);
+            r.source = src.map(str::to_string);
+            r
+        };
+        assert_eq!(authority_weight(&mk("stable.user.p", None)), 1.0);
+        assert_eq!(authority_weight(&mk("stable.system.s", None)), 0.8);
+        assert_eq!(authority_weight(&mk("stable.llm.x", None)), 0.5);
+        assert_eq!(authority_weight(&mk("notes.failure.f", Some("llm-note"))), 0.5);
+        assert_eq!(authority_weight(&mk("misc", None)), 0.65);
+    }
+
+    #[test]
+    fn scoring_authority_and_entity_factors_gated_by_recipe() {
+        // 缺省权重 0 → 既有排序零影响;声明权重后 authority/entity 生效
+        let mut hi_auth = MemoryRecord::new("stable.user.a", "部署验证", 10);
+        hi_auth.fact_id = Some(1);
+        let mut lo_auth = MemoryRecord::new("stable.llm.b", "部署验证", 11);
+        lo_auth.fact_id = Some(2);
+        // 无 authority 权重:时间倒序,lo_auth(b, ts=11)在前
+        let mut batch1 = vec![hi_auth.clone(), lo_auth.clone()];
+        sort_by_policy(&mut batch1, "部署", &crate::agent::recipe::RetrievalPolicy::default_lexical(), None);
+        assert_eq!(batch1[0].key, "stable.llm.b");
+        // authority 权重开(需同时开 importance 主开关,因子在其内):user=1.0 翻前
+        let mut rp = crate::agent::recipe::RetrievalPolicy::default_lexical();
+        rp.w_importance = 1.0;
+        rp.w_confidence = 0.0;
+        rp.w_usage = 0.0;
+        rp.w_authority = 1.0;
+        let mut batch2 = vec![hi_auth.clone(), lo_auth.clone()];
+        sort_by_policy(&mut batch2, "部署", &rp, None);
+        assert_eq!(batch2[0].key, "stable.user.a", "authority 因子生效");
+        // entity 因子:共现条目相对孤立条目提升(其余因子持平)
+        let mut e1 = MemoryRecord::new("stable.llm.e1", "kafka 分区重平衡", 5);
+        e1.fact_id = Some(3);
+        let mut e2 = MemoryRecord::new("stable.llm.e2", "kafka 消费组", 6);
+        e2.fact_id = Some(4);
+        let mut e3 = MemoryRecord::new("stable.llm.e3", "完全无关话题", 7);
+        e3.fact_id = Some(5);
+        let mut rp2 = crate::agent::recipe::RetrievalPolicy::default_lexical();
+        rp2.w_importance = 1.0;
+        rp2.w_confidence = 0.0;
+        rp2.w_usage = 0.0;
+        rp2.w_entity = 1.0;
+        let mut batch3 = vec![e3, e1, e2];
+        sort_by_policy(&mut batch3, "kafka", &rp2, None);
+        assert_eq!(batch3[0].key, "stable.llm.e2", "共现度最高(ts 新)在前");
+        assert_ne!(batch3[2].key, "stable.llm.e1", "孤立条目让位");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_decay_transition_and_confidence_evolution() {
+        // 异常迁移②:非 Captured 且零引用超 decay 限 → Decayed+confidence 半衰
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        recipe.lifecycle.decay_after_idle_days = 1;
+        let mut stale = MemoryRecord::new("events.e9", "旧事件", now_secs() - 10 * 86400);
+        stale.lifecycle_state = Some("Settled".to_string());
+        stale.confidence = Some(0.8);
+        stale.fact_id = Some(9);
+        mgr.cache.insert("events.e9".to_string(), stale);
+        mgr.apply_lifecycle_transitions("s1", &recipe).await;
+        let decayed = mgr.cache.get("events.e9").unwrap();
+        assert_eq!(decayed.lifecycle_state.as_deref(), Some("Decayed"));
+        assert!((decayed.confidence.unwrap() - 0.4).abs() < 1e-6, "半衰 0.8→0.4");
+        // 置信度佐证演化:开关开时 reinforce +0.05×w_e(llm 源=0.5 → +0.025)
+        let mut recipe2 = crate::agent::recipe::MemoryRecipe::default();
+        recipe2.lifecycle.confidence_evolution = true;
+        let mut mgr2 = MemoryManager::new("ns", make_test_client());
+        mgr2.set_recipe(recipe2);
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::agent::lexstore::LexStore::open(&dir.path().join("lex.db")).unwrap();
+        store.replace_partition(
+            "shared.ns.events.",
+            &[(1, "shared.ns.events.e1".to_string(), serde_json::json!({}))],
+        ).unwrap();
+        mgr2.set_lex_store(std::sync::Arc::new(store));
+        let mut rec = MemoryRecord::new("events.e1", "v", 1);
+        rec.fact_id = Some(1);
+        rec.confidence = Some(0.5);
+        rec.source = Some("llm".to_string());
+        mgr2.cache.insert("shared::events.e1".to_string(), rec);
+        mgr2.usage_pending.lock().unwrap_or_else(|p| p.into_inner()).insert(1, 3);
+        mgr2.flush_usage("s1").await;
+        let after = mgr2.cache.get("shared::events.e1").unwrap();
+        assert!(
+            ((after.confidence.unwrap() - 0.525).abs() < 1e-6),
+            "佐证演化 0.5+0.05×0.5=0.525, got {}",
+            after.confidence.unwrap()
+        );
     }
 
     #[test]
