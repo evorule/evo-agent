@@ -148,29 +148,65 @@ pub enum ComputeSpec {
     },
     // ----- v1.3 新增 24 函数（结果词表与错误语义总纲见 schema v1.3 description） -----
     /// 算术加（2..=8 输入，i64 依次累加，checked 溢出=节点失败）
-    Add { inputs: Vec<ComputeInput> },
+    Add {
+        /// 输入引用（2..=8 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 算术减（2..=8 输入，i64 依次累减）
-    Sub { inputs: Vec<ComputeInput> },
+    Sub {
+        /// 输入引用（2..=8 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 算术乘（2..=8 输入，i64 依次累乘）
-    Mul { inputs: Vec<ComputeInput> },
+    Mul {
+        /// 输入引用（2..=8 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 算术除（恰 2 输入，向零取整；除零/i64::MIN÷-1=节点失败）
-    Div { inputs: Vec<ComputeInput> },
+    Div {
+        /// 输入引用（恰 2 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 绝对值（恰 1 输入；i64::MIN 取绝对值溢出=节点失败）
-    Abs { inputs: Vec<ComputeInput> },
+    Abs {
+        /// 输入引用（恰 1 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 最小值（2..=8 输入，i64）
-    Min { inputs: Vec<ComputeInput> },
+    Min {
+        /// 输入引用（2..=8 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 最大值（2..=8 输入，i64）
-    Max { inputs: Vec<ComputeInput> },
+    Max {
+        /// 输入引用（2..=8 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 无分隔符拼接（2..=8 输入按序原样连接）
-    Concat { inputs: Vec<ComputeInput> },
+    Concat {
+        /// 输入引用（2..=8 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// Unicode 字符（char）数（恰 1 输入；空串→"0"）
-    Length { inputs: Vec<ComputeInput> },
+    Length {
+        /// 输入引用（恰 1 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 转大写（恰 1 输入；Unicode 全字符集映射，如 ß→SS）
-    Upper { inputs: Vec<ComputeInput> },
+    Upper {
+        /// 输入引用（恰 1 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 转小写（恰 1 输入）
-    Lower { inputs: Vec<ComputeInput> },
+    Lower {
+        /// 输入引用（恰 1 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 去首尾空白（恰 1 输入；中间空白不动）
-    Trim { inputs: Vec<ComputeInput> },
+    Trim {
+        /// 输入引用（恰 1 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 字面子串替换（恰 1 输入；find 非空加载期校验；find 不在场=原串原样）
     Replace {
         /// 输入引用（恰 1 个 = 原串）
@@ -206,9 +242,15 @@ pub enum ComputeSpec {
         separator: String,
     },
     /// Unix epoch 秒 → UTC 日期 YYYY-MM-DD（恰 1 输入；域 0000-01-01..=9999-12-31）
-    EpochToDate { inputs: Vec<ComputeInput> },
+    EpochToDate {
+        /// 输入引用（恰 1 个 = epoch 秒）
+        inputs: Vec<ComputeInput>,
+    },
     /// 两日期差整天数（恰 2 输入，严格 YYYY-MM-DD；inputs[1]−inputs[0]，可负）
-    DateDiffDays { inputs: Vec<ComputeInput> },
+    DateDiffDays {
+        /// 输入引用（恰 2 个 = [start, end]）
+        inputs: Vec<ComputeInput>,
+    },
     /// epoch 秒加天数偏移（恰 1 输入 + days 可负；输出 epoch 秒非日期串）
     EpochAddDays {
         /// 输入引用（恰 1 个 = epoch 秒）
@@ -217,13 +259,25 @@ pub enum ComputeSpec {
         days: i64,
     },
     /// 逻辑与（2..=8 输入，各值须在封闭布尔词表 true|false；全 true→true）
-    And { inputs: Vec<ComputeInput> },
+    And {
+        /// 输入引用（2..=8 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 逻辑或（2..=8 输入；任一 true→true）
-    Or { inputs: Vec<ComputeInput> },
+    Or {
+        /// 输入引用（2..=8 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 逻辑非（恰 1 输入；true↔false）
-    Not { inputs: Vec<ComputeInput> },
+    Not {
+        /// 输入引用（恰 1 个）
+        inputs: Vec<ComputeInput>,
+    },
     /// 条件选择器（恰 3 输入：[0]=条件（布尔词表），true→[1] 原样，false→[2] 原样）
-    IfElse { inputs: Vec<ComputeInput> },
+    IfElse {
+        /// 输入引用（恰 3 个 = [条件, true 分支, false 分支]）
+        inputs: Vec<ComputeInput>,
+    },
     /// 区间截断（恰 1 输入 + min_val/max_val；min_val>max_val 加载期拒载）
     Clamp {
         /// 输入引用（恰 1 个）
@@ -906,13 +960,14 @@ fn parse_i64_input(func: &str, s: &str) -> Result<i64, String> {
         .map_err(|_| format!("{func} 输入 '{s}' 整数解析失败(节点失败,无静默回退)"))
 }
 
-/// 布尔词表解析（封闭 true|false；不隐式真值化，词表外 = 节点失败）
+/// 布尔词表解析（封闭 true|false；不隐式真值化，词表外 = 节点失败；
+/// 首尾空白容忍——真实 LLM 输出常带空白噪声，trim 后仍须精确匹配）
 fn parse_bool_vocab(func: &str, s: &str) -> Result<bool, String> {
-    match s {
+    match s.trim() {
         "true" => Ok(true),
         "false" => Ok(false),
-        other => Err(format!(
-            "{func} 条件值 '{other}' 不在布尔词表 true|false(节点失败,无静默回退)"
+        _ => Err(format!(
+            "{func} 条件值 '{s}' 不在布尔词表 true|false(节点失败,无静默回退)"
         )),
     }
 }
@@ -944,10 +999,11 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 /// 严格 YYYY-MM-DD 解析（4 位零填充年份，proleptic Gregorian；形态不符=节点失败）
-/// 域校验（0000..=9999）由 4 位年份形态保证；月日按闰年规则校验
+/// 域校验（0000..=9999）由 4 位年份形态保证；月日按闰年规则校验；
+/// 首尾空白容忍——真实 LLM 输出常带空白噪声，trim 后仍须严格形态（拒绝消息保留原文）
 fn parse_date_str(func: &str, s: &str) -> Result<i64, String> {
     let reject = || format!("{func} 日期 '{s}' 形态不符(须严格 YYYY-MM-DD)(节点失败,无静默回退)");
-    let parts: Vec<&str> = s.split('-').collect();
+    let parts: Vec<&str> = s.trim().split('-').collect();
     if parts.len() != 3 {
         return Err(reject());
     }
@@ -2282,6 +2338,59 @@ mod tests {
             &r,
             "分隔符为空",
         );
+    }
+
+    #[test]
+    fn test_eval_compute_v13_input_whitespace_tolerance() {
+        // 真实 LLM 输出常带首尾空白噪声（2026-10-07 agent 面交叉验收 round2 实测：
+        // researcher 输出 "\n2026-10-14" 致 date_diff_days 拒收并连锁触发 replan 失败）。
+        // parse 边界统一 trim：日期/整数/布尔在 trim 后仍须严格形态（拒绝消息保留原文）；
+        // join/concat 等原样输出函数不在 parse 边界，输出保真不 trim。
+        let r = rmap(&[
+            ("d0", "2026-10-07"),
+            ("d1_ws", "\n2026-10-14"),
+            ("epoch_ws", "\t1791331200 "),
+            ("num_ws", " 6\n"),
+            ("bool_ws", " true "),
+        ]);
+        // date_diff_days[d0, d1_ws] = 2026-10-14 − 2026-10-07 = 7
+        let diff = ComputeSpec::DateDiffDays {
+            inputs: nodes_of(
+                &ComputeSpec::DateDiffDays { inputs: vec![] },
+                &["d0", "d1_ws"],
+            ),
+        };
+        assert_eq!(eval_compute(&diff, &r).unwrap(), "7");
+        // epoch_to_date[epoch_ws]（trim 后在日期域内）
+        let to_date = ComputeSpec::EpochToDate {
+            inputs: nodes_of(&ComputeSpec::EpochToDate { inputs: vec![] }, &["epoch_ws"]),
+        };
+        assert_eq!(eval_compute(&to_date, &r).unwrap(), "2026-10-07");
+        // add[num_ws, num_ws] = 12
+        let add_ws = ComputeSpec::Add {
+            inputs: nodes_of(&ComputeSpec::Add { inputs: vec![] }, &["num_ws", "num_ws"]),
+        };
+        assert_eq!(eval_compute(&add_ws, &r).unwrap(), "12");
+        // and[bool_ws, bool_ws]（trim 后在布尔词表内）
+        let and_ws = ComputeSpec::And {
+            inputs: nodes_of(
+                &ComputeSpec::And { inputs: vec![] },
+                &["bool_ws", "bool_ws"],
+            ),
+        };
+        assert_eq!(eval_compute(&and_ws, &r).unwrap(), "true");
+        // 输出保真：join 不在 parse 边界，原样拼接不 trim
+        let joined = ComputeSpec::Join {
+            inputs: nodes_of(
+                &ComputeSpec::Join {
+                    inputs: vec![],
+                    separator: String::new(),
+                },
+                &["num_ws", "d0"],
+            ),
+            separator: "|".to_string(),
+        };
+        assert_eq!(eval_compute(&joined, &r).unwrap(), " 6\n|2026-10-07");
     }
 
     #[test]
