@@ -117,7 +117,7 @@ pub struct MemoryEventStore {
     fact_to_event: HashMap<FactId, String>,
     /// 实体反向索引
     entity_index: EntityIndex,
-    /// 持久化失败的事件（O-309 CacheOnly：离线写入不丢失，flush 补写）
+    /// 持久化失败的事件（CacheOnly 语义：离线写入不丢失，flush 补写）
     pending_persist: Vec<(String, serde_json::Value)>,
 }
 
@@ -142,7 +142,7 @@ impl MemoryEventStore {
         self
     }
 
-    /// O-309:批量补写 pending 事件（CacheOnly → Persisted）。
+    /// 批量补写 pending 事件（CacheOnly → Persisted）。
     /// 经 update_payloads_batch 一次 HTTP；成功条从 pending 移除，
     /// 失败条保留（下次 flush 重试）。无 pending → no-op(返回 0)。
     pub async fn flush_pending_events(&mut self) -> usize {
@@ -262,11 +262,10 @@ impl MemoryEventStore {
                     .update_payload(session_id, &path, &value)
                     .await
                 {
-                    Ok(_) => {
-                        self.fetch_identity_fact_id(session_id, &path)
-                            .await
-                            .unwrap_or(0)
-                    }
+                    Ok(_) => self
+                        .fetch_identity_fact_id(session_id, &path)
+                        .await
+                        .unwrap_or(0),
                     Err(e) => {
                         tracing::warn!(
                             event_id = %event_id,
@@ -869,15 +868,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_only_and_flush() {
-        // O-309 验收:写失败 → CacheOnly 标记,flush 后补写成功
-        let dir = std::env::temp_dir().join(format!("o309-{}", std::process::id()));
+        // 验收:写失败 → CacheOnly 标记,flush 后补写成功
+        let dir = std::env::temp_dir().join(format!("memstore-flush-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // 不可达客户端 = 写失败 → pending
-        let mut store = MemoryEventStore::new(
-            "ns",
-            EvoruleApiClient::new("http://127.0.0.1:19999"),
-        );
+        let mut store =
+            MemoryEventStore::new("ns", EvoruleApiClient::new("http://127.0.0.1:19999"));
         store = store.with_session_id("s1");
         let ev = MemoryEvent::new_root(
             "E-T1",
@@ -889,7 +886,7 @@ mod tests {
         assert_eq!(fid, 0, "不可达 → fact_id=0(CacheOnly)");
         // flush 前有 pending
         assert!(store.pending_persist.len() > 0 || true); // pending 追踪在 write_event 内部
-        // 不可达 flush → 仍 pending
+                                                          // 不可达 flush → 仍 pending
         let flushed = store.flush_pending_events().await;
         assert_eq!(flushed, 0);
         let _ = std::fs::remove_dir_all(&dir);
