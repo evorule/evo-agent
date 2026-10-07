@@ -2921,6 +2921,11 @@ impl MemoryManager {
     fn audit_recall_section(&self, section: &str, records: &[MemoryRecord]) -> Vec<String> {
         let mut lines = Vec::with_capacity(records.len());
         for record in records {
+            // 墓碑过滤(F-614/I9):Tombstoned=视图不可见化,不进 prompt
+            // (账面仍可查询——append-only 原始数据永在)
+            if record.lifecycle_state.as_deref() == Some("Tombstoned") {
+                continue;
+            }
             // B5：stable 节按来源域标注（D1 标注注入 / D2 unclassified），
             // 让 LLM 与审计侧都能区分"LLM 提取"与"用户/系统写入"。
             let mut display_key = if section == "stable" {

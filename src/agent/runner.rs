@@ -2576,7 +2576,7 @@ impl AgentRunner {
     /// 后才可注册;G15 续跑幂等——已注册即跳过)。门控=Recipe.tools.expose
     /// 声明;best-effort 条件不满足=静默跳过(装配期已做一致性校验)。
     fn register_session_scoped_memory_tools(&mut self, session_id: &str) {
-        let (note_declared, link_declared, namespace, client, link_relations) =
+        let (note_declared, link_declared, forget_declared, namespace, client, link_relations) =
             match self.memory.as_ref() {
                 Some(mem) => {
                     let exposed = mem.exposed_introspection_tools();
@@ -2586,9 +2586,13 @@ impl AgentRunner {
                     let link_declared = exposed
                         .iter()
                         .any(|n| n == crate::agent::memory_tool::MEMORY_LINK_TOOL);
+                    let forget_declared = exposed
+                        .iter()
+                        .any(|n| n == crate::agent::memory_tool::MEMORY_FORGET_TOOL);
                     (
                         note_declared,
                         link_declared,
+                        forget_declared,
                         mem.namespace().to_string(),
                         mem.evorule_client.clone(),
                         mem.link_relations(),
@@ -2611,6 +2615,21 @@ impl AgentRunner {
             self.tool_handler
                 .register_static(crate::agent::memory_tool::NOTE_WRITE_TOOL, exec);
         }
+        if forget_declared
+            && !self
+                .tool_handler
+                .has_tool(crate::agent::memory_tool::MEMORY_FORGET_TOOL)
+        {
+            let exec: std::sync::Arc<dyn ToolFunction> = std::sync::Arc::new(
+                crate::agent::memory_tool::MemoryForgetTool::new(
+                    namespace.clone(),
+                    client.clone(),
+                    session_id.to_string(),
+                ),
+            );
+            self.tool_handler
+                .register_static(crate::agent::memory_tool::MEMORY_FORGET_TOOL, exec);
+        }
         if link_declared
             && !self
                 .tool_handler
@@ -2627,10 +2646,11 @@ impl AgentRunner {
             self.tool_handler
                 .register_static(crate::agent::memory_tool::MEMORY_LINK_TOOL, exec);
         }
-        if note_declared || link_declared {
+        if note_declared || link_declared || forget_declared {
             info!(
                 note = note_declared,
                 link = link_declared,
+                forget = forget_declared,
                 "memory write tools registered (session-scoped)"
             );
         }

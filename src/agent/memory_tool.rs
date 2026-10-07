@@ -70,6 +70,10 @@ pub const MEMORY_LINK_TOOL: &str = "memory_link";
 /// 声明即整体覆盖——A-MEM relation 类型白名单在 Recipe）
 pub const BUILTIN_LINK_RELATIONS: &[&str] = &["related", "derives", "supports", "contradicts"];
 
+/// `memory_forget` 遗忘工具（F-614：请求遗忘→归属复核→墓碑事实落账
+/// ——append-only 下原始数据永在账,墓碑=视图不可见化证明,I9 口径）
+pub const MEMORY_FORGET_TOOL: &str = "memory_forget";
+
 /// 自省族**读件**判定（读面数据前提=LexStore 检索缓存）
 pub fn is_introspection_read_tool(name: &str) -> bool {
     name == MEMORY_SEARCH_TOOL || name == MEMORY_GET_TOOL
@@ -78,7 +82,10 @@ pub fn is_introspection_read_tool(name: &str) -> bool {
 /// 自省族**写件**判定（A2-2：结构闸+旗标强制在工具实现内，治理闸在 A2-3/A2-4；
 /// note_write 落账 Captured 写不过闸、晋升受治——同属写面声明即可，不入治理闸族）
 pub fn is_introspection_write_tool(name: &str) -> bool {
-    name == MEMORY_PROPOSE_TOOL || name == NOTE_WRITE_TOOL || name == MEMORY_LINK_TOOL
+    name == MEMORY_PROPOSE_TOOL
+        || name == NOTE_WRITE_TOOL
+        || name == MEMORY_LINK_TOOL
+        || name == MEMORY_FORGET_TOOL
 }
 
 /// 已实现的自省记忆工具名判定（读两件+写两件）
@@ -287,6 +294,26 @@ pub fn memory_tool_specs() -> Vec<ToolSpec> {
                     r#type: "string".to_string(),
                     description: "Optional rationale for the link".to_string(),
                     required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: MEMORY_FORGET_TOOL.to_string(),
+            description: "Request to forget one of YOUR OWN memory entries (user/system                           authored entries are protected and cannot be forgotten). Writes a                           tombstone fact: the entry becomes view-invisible while the                           append-only ledger preserves history. A reason is mandatory and                           permanently attached."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "target".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Target memory ledger path or key (existing entry)".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "reason".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Why this entry should be forgotten (permanently attached to                                   the tombstone)"
+                        .to_string(),
+                    required: true,
                 },
             ],
         },
@@ -649,6 +676,7 @@ impl MemoryIntrospector {
                         .into_iter()
                         .filter(|(e, _)| idset.contains(&e.fact_id))
                         .filter_map(|(_, r)| r)
+                        .filter(|r| r.lifecycle_state.as_deref() != Some("Tombstoned"))
                         .collect()
                 }
                 Err(e) => {
@@ -664,6 +692,7 @@ impl MemoryIntrospector {
                     deduped
                         .into_iter()
                         .filter_map(|(_, r)| r)
+                        .filter(|r| r.lifecycle_state.as_deref() != Some("Tombstoned"))
                         .filter(|r| {
                             let text = format!("{} {}", r.key, r.value);
                             query_tokens
@@ -1165,6 +1194,141 @@ impl ToolFunction for MemoryLinkTool {
     }
 }
 
+/// 遗忘归属复核（纯函数,F-614 闸面）：agent 仅可遗忘**自身产出**的条目
+/// ——llm 来源域可遗忘;user/system 来源=治理受保护域,拒绝（受治边界:
+/// 遗忘权不越权到人类与系统的记忆）。
+pub(crate) fn forget_allowed(record: &MemoryRecord) -> Result<(), String> {
+    let key = record.key.as_str();
+    let src = record.source.as_deref().unwrap_or_default();
+    if key.starts_with("stable.user.") || src.contains("user") {
+        return Err(
+            "forget rejected: target is user-authored (protected domain; agent may only              forget its own outputs)"
+                .to_string(),
+        );
+    }
+    if key.starts_with("stable.system.") || src.starts_with("system") {
+        return Err(
+            "forget rejected: target is system-authored (protected domain; agent may only              forget its own outputs)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// `memory_forget` 执行器（F-614）：定位目标（账本全家族前缀一次拉取精确
+/// 匹配）→ 归属复核 → 同路径墓碑版本落账（append-only:原始数据永在账,
+/// 墓碑=视图不可见化证明,I9）→ 视图层由召回过滤与缓存刷新生效。
+///
+/// 治理:必过归属复核闸（user/system 域拒）;reason 必填（遗忘留痕）。
+pub(crate) async fn memory_forget_exec(
+    namespace: &str,
+    client: &EvoruleApiClient,
+    session_id: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing required param: target (ledger path or memory key)".to_string())?;
+    let reason = args
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "missing required param: reason (forgetting without a reason is not permitted;              the tombstone carries it permanently)"
+                .to_string()
+        })?;
+
+    // 目标定位:统一前缀一次拉取,精确匹配 path 或 path 尾段
+    let prefix = format!("shared.{namespace}.");
+    let facts = client
+        .get_shared_facts(Some(&prefix))
+        .await
+        .map_err(|e| format!("memory_forget: ledger unreachable ({e})"))?;
+    let norm_target = target.trim_start_matches("shared::").to_string();
+    let matched = facts
+        .iter()
+        .find(|f| {
+            f.path == format!("{prefix}{norm_target}")
+                || f.path == norm_target
+                || f.path.rsplit('.').next() == Some(norm_target.as_str())
+        })
+        .ok_or_else(|| format!("memory_forget: target '{target}' not found in ledger"))?;
+    if matched.path.contains(".tombstoned.") {
+        return Err(format!(
+            "memory_forget: target '{}' is already tombstoned",
+            matched.path
+        ));
+    }
+    // 载荷解析(与目录直读同款容错)→归属复核
+    let raw = matched
+        .value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| matched.value.to_string());
+    let record = match serde_json::from_str::<MemoryRecord>(&raw) {
+        Ok(mut r) => {
+            if r.key.is_empty() {
+                r.key = matched.path.rsplit('.').next().unwrap_or(&matched.path).to_string();
+            }
+            r
+        }
+        Err(_) => MemoryRecord::new(
+            matched.path.rsplit('.').next().unwrap_or(&matched.path),
+            &raw,
+            0,
+        ),
+    };
+    forget_allowed(&record)?;
+
+    // 墓碑版本(同路径 latest-wins):保留原值于账(append-only),状态=Tombstoned
+    let mut tombstone = record.clone();
+    tombstone.lifecycle_state = Some("Tombstoned".to_string());
+    tombstone.tags.push("tombstone".to_string());
+    tombstone.tags.push(format!("forget_reason:{reason}"));
+    tombstone.fact_id = None;
+    let payload = serde_json::to_value(&tombstone)
+        .map_err(|e| format!("memory_forget: tombstone serialize failed ({e})"))?;
+    client
+        .update_payload(session_id, &matched.path, &payload)
+        .await
+        .map_err(|e| format!("memory_forget: tombstone persist failed ({e})"))?;
+    Ok(json!({
+        "status": "ok",
+        "path": matched.path,
+        "lifecycle_state": "Tombstoned",
+        "visibility": "view-invisible (original data remains in append-only ledger;                        provable uninvisibility per I9)",
+        "reason": reason,
+    }))
+}
+
+/// `memory_forget` 执行器句柄（会话期注册）
+pub struct MemoryForgetTool {
+    namespace: String,
+    client: EvoruleApiClient,
+    session_id: String,
+}
+
+impl MemoryForgetTool {
+    pub fn new(namespace: String, client: EvoruleApiClient, session_id: String) -> Self {
+        Self {
+            namespace,
+            client,
+            session_id,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolFunction for MemoryForgetTool {
+    async fn call(&self, args: &Value) -> Result<Value, String> {
+        memory_forget_exec(&self.namespace, &self.client, &self.session_id, args).await
+    }
+}
+
 /// `memory_propose` 单批候选上限（A2-2 结构闸）
 const PROPOSE_MAX_ITEMS: usize = 5;
 
@@ -1454,6 +1618,24 @@ mod tests {
     fn memory_link_registered_in_write_family() {
         assert!(is_introspection_write_tool(MEMORY_LINK_TOOL));
         assert!(is_registered_memory_tool(MEMORY_LINK_TOOL));
+        assert!(is_introspection_write_tool(MEMORY_FORGET_TOOL));
+        assert!(is_registered_memory_tool(MEMORY_FORGET_TOOL));
+    }
+
+    #[test]
+    fn forget_ownership_gate_protects_user_and_system() {
+        let mk = |k: &str, src: Option<&str>| {
+            let mut r = MemoryRecord::new(k, "v", 1);
+            r.source = src.map(str::to_string);
+            r
+        };
+        // llm 产出可遗忘
+        assert!(forget_allowed(&mk("stable.llm.promoted.x", Some("llm-note"))).is_ok());
+        assert!(forget_allowed(&mk("notes.failure.f", None)).is_ok());
+        // user/system 域拒绝
+        assert!(forget_allowed(&mk("stable.user.prefs", None)).is_err());
+        assert!(forget_allowed(&mk("stable.system.rule", None)).is_err());
+        assert!(forget_allowed(&mk("misc", Some("user-upload"))).is_err());
     }
     use super::*;
 
@@ -1778,9 +1960,11 @@ mod tests {
     #[test]
     fn test_memory_tool_specs_shape() {
         let specs = memory_tool_specs();
-        assert_eq!(specs.len(), 5);
+        assert_eq!(specs.len(), 6);
         let link = specs.iter().find(|s| s.name == "memory_link").unwrap();
         assert_eq!(link.parameters.len(), 4);
+        let forget = specs.iter().find(|s| s.name == "memory_forget").unwrap();
+        assert_eq!(forget.parameters.len(), 2);
         let search = specs.iter().find(|s| s.name == "memory_search").unwrap();
         assert_eq!(search.parameters.len(), 3);
         assert!(search.parameters[0].required);
