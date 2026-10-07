@@ -60,6 +60,8 @@ pub struct SedimentConfig {
     /// 是否启用知识候选巩固（阶段 5 F-613 完整版第一增量：跨会话聚类→
     /// sidecar 合并提议→Consolidated 落账；缺省开，跟随最小版先例）
     pub enable_consolidation: bool,
+    /// 是否启用双通道笔记事件驱动草稿（阶段 5 NB-2：确定性投影，零 LLM）
+    pub enable_failure_drafts: bool,
     /// 是否启用 journal 摘要投影（跨源注册规格：确定性结构投影，零 LLM；
     /// Recipe sources.journal_digest 数据化开关，缺省关=既有 agent 零影响）
     pub enable_journal_digest: bool,
@@ -77,6 +79,7 @@ impl Default for SedimentConfig {
             enable_knowledge_extraction: true,
             min_messages_for_extraction: 4,
             enable_consolidation: true,
+            enable_failure_drafts: false,
             enable_journal_digest: false,
         }
     }
@@ -126,6 +129,8 @@ pub struct SedimentResult {
     pub journal_digest_written: bool,
     /// 巩固产物 event_id 列表（Consolidated 落账；阶段 5 F-613）
     pub knowledge_consolidated: Vec<String>,
+    /// 错误草稿笔记 key 列表（NB-2 事件驱动草稿）
+    pub failure_drafts: Vec<String>,
 }
 
 /// C1 主入口：会话结束时调用（best-effort，错误记日志不阻断）
@@ -237,6 +242,12 @@ pub async fn sediment(
     //    sidecar 合并提议 → Consolidated 落账（溯源=consolidates 清单）
     if cfg.enable_consolidation {
         consolidate_knowledge_candidates(deps, cfg, session_id, &mut result).await;
+    }
+
+    // 6.6 双通道笔记事件驱动草稿（阶段 5 NB-2）：journal 确定性投影 →
+    //    failure 草稿笔记（Captured 状态，notes.failure.* 家族）
+    if cfg.enable_failure_drafts {
+        generate_failure_drafts(deps, session_id, &mut result).await;
     }
 
     // 7. journal 摘要投影（跨源注册规格）：确定性结构投影（零 LLM）——
@@ -657,6 +668,121 @@ async fn consolidate_knowledge_candidates(
             Err(e) => {
                 tracing::warn!(error = %e, "sediment: consolidation write failed");
             }
+        }
+    }
+}
+
+// ===== 双通道笔记事件驱动草稿（阶段 5 NB-2）=====
+//
+// 18 号 §二 Q4 写面：系统自动记录（机械层）——journal 已有错误/停滞/
+// 审批拒绝原始事件，本函数把它们确定性投影为 failure 草稿笔记。
+// 溯源纪律：草稿 content.failures[].call_id 回指 journal 原始事件。
+// 语义边界：机械事实（发生了什么）=Q4 责任，不采信 LLM 转述；
+// 理由与教训（为什么）=Q3 责任（LLM 下一轮补根因）。
+
+/// 从 journal 行集扫描错误/停滞/审批拒绝三类信号并生成 failure 草稿（纯函数）
+fn scan_failure_signals(
+    lines: &[JournalLine],
+) -> Vec<(String, String)> {
+    // (tool_name/call_id, 错误摘要, 类别标签)
+    let mut out = Vec::new();
+    let mut stagnation_count = 0;
+    let mut rejection_count = 0;
+    for line in lines {
+        match &line.event {
+            JournalEvent::ToolResult { call_id, status, .. } => {
+                if status == "error" {
+                    out.push((call_id.clone(), "tool_error".to_string()));
+                }
+            }
+            JournalEvent::PolicyJudged { verdict, evidence, .. } => {
+                if verdict == "blocked" {
+                    stagnation_count += 1;
+                    out.push((format!("policy-{}", stagnation_count), evidence.clone()));
+                }
+            }
+            JournalEvent::ApprovalResolved { decision, .. } => {
+                if decision != "approved" {
+                    rejection_count += 1;
+                    out.push((format!("approval-{}", rejection_count), decision.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// NB-2 事件驱动草稿主入口（sediment 会话末调用；best-effort）
+///
+/// 门控 = `cfg.enable_failure_drafts`（缺省关=既有 agent 零影响）。
+/// 前置 = `deps.journal_lines` 非空（由 runner 填充，与 F-613 同源）。
+/// 产出 = `shared.{ns}.notes.failure.{session_id}` Captured 事实，
+/// content.failures 列表每条携带 (call_id, 错误摘要) 供溯源回指。
+async fn generate_failure_drafts(
+    deps: &mut SedimentDeps<'_>,
+    session_id: &str,
+    result: &mut SedimentResult,
+) {
+    let lines = std::mem::take(&mut deps.journal_lines);
+    if lines.is_empty() {
+        return;
+    }
+    let failures = scan_failure_signals(&lines);
+    if failures.is_empty() {
+        return;
+    }
+    let failures_json: Vec<serde_json::Value> = failures
+        .iter()
+        .map(|(call_id, summary)| {
+            serde_json::json!({"call_id": call_id, "summary": summary})
+        })
+        .collect();
+    let body = format!(
+        "会话 {} 检测到 {} 项错误/死路信号。\n逐条:\n{}\n(以上为机械投影,根因待 LLM 下一轮补齐)",
+        session_id,
+        failures.len(),
+        failures
+            .iter()
+            .map(|(cid, sum)| format!("  {cid}: {sum}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let mut draft = crate::agent::memory_event::event::MemoryEvent::new_root(
+        &format!("FD-{}", sanitize_model_id(session_id)),
+        crate::agent::memory_event::event::EventType::Custom(
+            "failure_draft".to_string(),
+        ),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        crate::agent::memory_event::event::EventSource::SystemObservation,
+    )
+    .with_confidence(0.7)
+    .with_tag("failure_draft")
+    .with_session(session_id);
+    draft.content = serde_json::json!({
+        "session": session_id,
+        "failures": failures_json,
+        "body": body,
+    });
+    let value = match serde_json::to_string(&draft) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let key = format!("notes.failure.draft.{}", sanitize_model_id(session_id));
+    match deps
+        .memory
+        .set_scoped(crate::agent::memory::MemoryScope::Shared, &key, &value)
+        .await
+    {
+        Ok(_) => {
+            result.failure_drafts.push(key.clone());
+            tracing::info!(session_id = %session_id, key = %key, "NB-2: failure draft captured");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "NB-2: failure draft write failed");
         }
     }
 }

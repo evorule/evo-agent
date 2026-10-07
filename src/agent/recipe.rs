@@ -262,6 +262,9 @@ pub struct SourcesSection {
     /// 材料源（procedural 型，随程序记忆统一批落地）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub materials: bool,
+    /// 双通道笔记事件驱动草稿源（work 型，sediment 确定性投影）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failure_drafts: bool,
 }
 
 fn default_degradation() -> Vec<String> {
