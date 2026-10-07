@@ -157,7 +157,35 @@ fn default_adjudication_order() -> Vec<String> {
     ]
 }
 
+/// 否定词表缺省值：数据文件外置（`data/negation_markers.json`，include_str!
+/// 编译期嵌入；解析失败回退内置保守表）——治理批扩词表改数据文件即可，
+/// 不动代码。
+///
+/// 扩充纪律（词法极性判定是子串包含匹配，`contains` 口径）：
+/// - 只收「良性碰撞率低 + 否定义无歧义」的词形；高频良性子串不入表
+///   （如 `非`⊂非常/非法、`别`⊂特别/级别、`未`⊂未来、`no`⊂node/now）——
+///   误翻极性的代价比漏检更高（I2 词法子集同款保守取向）。
+/// - 英文优先短语级（`must not`/`do not`），单字短词慎收。
+/// - 经验教训（补齐路线图 P1-3 实测）：否定词内插会打碎 CJK 双字 bigram
+///   相似度——词表 breadth 与相似度阈值需联调，一切以试运行探针实测为准。
 fn default_negation_markers() -> Vec<String> {
+    const EMBEDDED: &str = include_str!("data/negation_markers.json");
+    match serde_json::from_str::<serde_json::Value>(EMBEDDED) {
+        Ok(v) => v
+            .get("markers")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_else(|| fallback_negation_markers()),
+        Err(_) => fallback_negation_markers(),
+    }
+}
+
+/// 回退保守表（历史缺省；数据文件损坏时兜底，行为等同旧版）
+fn fallback_negation_markers() -> Vec<String> {
     vec![
         "不".to_string(),
         "无".to_string(),
@@ -393,6 +421,37 @@ mod tests {
         assert_eq!(
             r.budget.degradation_order,
             vec!["stable", "summaries", "events"]
+        );
+    }
+
+    #[test]
+    fn test_negation_markers_embedded_file_loads_p2_3() {
+        // 补齐路线图 P2-3:否定词表数据文件外置——嵌入文件可解析、
+        // 治理批扩充词在位、碰撞敏感词不入表、回退表=历史缺省
+        let markers = default_negation_markers();
+        assert!(markers.len() > 5, "治理批扩充后应多于历史 5 词");
+        for core in ["不", "无", "禁止", "not", "never"] {
+            assert!(markers.iter().any(|m| m == core), "核心词缺失: {core}");
+        }
+        // 扩充抽查（中英）
+        for added in ["严禁", "不得", "拒绝", "must not", "forbidden"] {
+            assert!(markers.iter().any(|m| m == added), "扩充词缺失: {added}");
+        }
+        // 高频良性碰撞子串不入表（contains 匹配下的误翻防护：
+        // 非⊂非常 / 别⊂特别 / 未⊂未来 / no⊂node）
+        for banned in ["非", "别", "未", "no"] {
+            assert!(
+                !markers.iter().any(|m| m == banned),
+                "碰撞敏感词不应入表: {banned}"
+            );
+        }
+        // 回退表=历史缺省（数据文件损坏时行为等同旧版）
+        assert_eq!(
+            fallback_negation_markers(),
+            vec!["不", "无", "禁止", "not", "never"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
         );
     }
 
