@@ -674,28 +674,30 @@ async fn consolidate_knowledge_candidates(
 
 // ===== 双通道笔记事件驱动草稿（阶段 5 NB-2）=====
 //
-// 18 号 §二 Q4 写面：系统自动记录（机械层）——journal 已有错误/停滞/
+// 双通道笔记「事件驱动草稿」写面：系统自动记录（机械层）——journal 已有错误/停滞/
 // 审批拒绝原始事件，本函数把它们确定性投影为 failure 草稿笔记。
 // 溯源纪律：草稿 content.failures[].call_id 回指 journal 原始事件。
 // 语义边界：机械事实（发生了什么）=Q4 责任，不采信 LLM 转述；
 // 理由与教训（为什么）=Q3 责任（LLM 下一轮补根因）。
 
 /// 从 journal 行集扫描错误/停滞/审批拒绝三类信号并生成 failure 草稿（纯函数）
-fn scan_failure_signals(
-    lines: &[JournalLine],
-) -> Vec<(String, String)> {
+fn scan_failure_signals(lines: &[JournalLine]) -> Vec<(String, String)> {
     // (tool_name/call_id, 错误摘要, 类别标签)
     let mut out = Vec::new();
     let mut stagnation_count = 0;
     let mut rejection_count = 0;
     for line in lines {
         match &line.event {
-            JournalEvent::ToolResult { call_id, status, .. } => {
+            JournalEvent::ToolResult {
+                call_id, status, ..
+            } => {
                 if status == "error" {
                     out.push((call_id.clone(), "tool_error".to_string()));
                 }
             }
-            JournalEvent::PolicyJudged { verdict, evidence, .. } => {
+            JournalEvent::PolicyJudged {
+                verdict, evidence, ..
+            } => {
                 if verdict == "blocked" {
                     stagnation_count += 1;
                     out.push((format!("policy-{}", stagnation_count), evidence.clone()));
@@ -734,9 +736,7 @@ async fn generate_failure_drafts(
     }
     let failures_json: Vec<serde_json::Value> = failures
         .iter()
-        .map(|(call_id, summary)| {
-            serde_json::json!({"call_id": call_id, "summary": summary})
-        })
+        .map(|(call_id, summary)| serde_json::json!({"call_id": call_id, "summary": summary}))
         .collect();
     let body = format!(
         "会话 {} 检测到 {} 项错误/死路信号。\n逐条:\n{}\n(以上为机械投影,根因待 LLM 下一轮补齐)",
@@ -750,9 +750,7 @@ async fn generate_failure_drafts(
     );
     let mut draft = crate::agent::memory_event::event::MemoryEvent::new_root(
         &format!("FD-{}", sanitize_model_id(session_id)),
-        crate::agent::memory_event::event::EventType::Custom(
-            "failure_draft".to_string(),
-        ),
+        crate::agent::memory_event::event::EventType::Custom("failure_draft".to_string()),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)

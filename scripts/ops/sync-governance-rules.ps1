@@ -6,11 +6,15 @@
 # VIA-PUBLISH 命中时做版本弱校验: 晋升产物版本高于正本=孤儿晋升/正本未回填(报 issue);
 # 正本高于晋升产物=修复后在途待再晋升(信息性, 不计 issue)。
 param(
-    [string]$RulesDir = 'D:\evorule-server\data\agent-governance\rules',
+    [string]$RulesDir = $env:EVORULE_RULES_DIR,
     [switch]$Check
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($RulesDir)) {
+    Write-Host "[ERROR] 未指定运行时规则目录: 请传 -RulesDir <路径> 或设置环境变量 EVORULE_RULES_DIR"
+    exit 1
+}
 $RepoDir = Join-Path $PSScriptRoot '..\..\rules\governance'
 $RepoDir = [System.IO.Path]::GetFullPath($RepoDir)
 
