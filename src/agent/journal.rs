@@ -541,9 +541,32 @@ impl JournalWriter {
         request_messages: usize,
         response_content: &str,
     ) -> Result<u64, JournalError> {
+        self.llm_called(
+            model,
+            "react",
+            evorule_request_id,
+            tokens,
+            tokens_est,
+            request_messages,
+            response_content,
+        )
+    }
+
+    /// llm_called 通用形态(sidecar 用途落账——语义精判等;purpose 透传,
+    /// ATIF 侧 sidecar 用途不映射步=既有口径)
+    pub fn llm_called(
+        &self,
+        model: &str,
+        purpose: &str,
+        evorule_request_id: Option<u64>,
+        tokens: Option<TokenRecord>,
+        tokens_est: Option<u64>,
+        request_messages: usize,
+        response_content: &str,
+    ) -> Result<u64, JournalError> {
         self.push(JournalEvent::LlmCalled {
             model: model.to_string(),
-            purpose: "react".to_string(),
+            purpose: purpose.to_string(),
             evorule_request_id,
             tokens,
             tokens_est,
@@ -1336,6 +1359,7 @@ mod tests {
                     section_b: "【能力边界声明】".into(),
                     excerpt_a: "禁止使用 web_search".into(),
                     excerpt_b: "可用工具:web_search".into(),
+                    semantic_verdict: None,
                 }],
             },
             JE::TurnEnded {

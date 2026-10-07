@@ -53,6 +53,186 @@ pub struct I2ConflictRecord {
     pub excerpt_a: String,
     /// 声明行摘录
     pub excerpt_b: String,
+    /// 语义精判结论(两级通路第二级;None=未精判——旧账面/语义级关闭/缓存外
+    /// 首轮失败,serde default 保旧 journal 反序列化兼容)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_verdict: Option<I2Verdict>,
+}
+
+/// 语义精判结论(裁决三态+理由;verdict 为观测注释不进控制流——I2 报告
+/// 定位继承,误判不改变 agent 行为)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct I2Verdict {
+    /// contradiction(真矛盾)| benign(良性共存/辖域不同/词形撞车)| uncertain(无法判定)
+    pub verdict: String,
+    /// 裁决理由(截断至 [`VERDICT_RATIONALE_MAX_CHARS`] 字符)
+    pub rationale: String,
+}
+
+/// 语义精判用途标签(AuditedLlm 审计链命令事实;journal LlmCalled.purpose
+/// 同值——sidecar 用途不映射 ATIF 步,既有口径)
+pub const I2_SEMANTIC_PURPOSE: &str = "i2_semantic";
+/// 语义精判 sidecar 整体超时(单候选裁决输入小,低于审计执行器默认 90s)
+pub const I2_SEMANTIC_TIMEOUT_SECS: u64 = 30;
+/// 裁决理由截断上限(字符)
+const VERDICT_RATIONALE_MAX_CHARS: usize = 120;
+
+impl I2Verdict {
+    /// 无法判定结论(sidecar 失败/超时/输出不可解析的统一兜底;fail-soft
+    /// 与字面级结论同兜底,会话不阻断)
+    pub fn uncertain(rationale: &str) -> Self {
+        Self {
+            verdict: "uncertain".to_string(),
+            rationale: truncate_chars(rationale, VERDICT_RATIONALE_MAX_CHARS),
+        }
+    }
+}
+
+/// 会话内裁决缓存键(确定性:六元组规范化序列化的 evorule-hash digest;
+/// 同候选对同键=每候选每会话至多一次语义精判)
+pub fn adjudication_cache_key(record: &I2ConflictRecord) -> String {
+    let normalized = [
+        record.kind.as_str(),
+        record.token.as_str(),
+        record.section_a.as_str(),
+        record.section_b.as_str(),
+        record.excerpt_a.as_str(),
+        record.excerpt_b.as_str(),
+    ]
+    .join("\u{1f}");
+    crate::agent::journal::evorule_digest(&normalized)
+}
+
+/// 语义精判调用参数构造(确定性纯函数:同候选对同字节;temperature=0 降方差;
+/// 严格 JSON 三态输出要求,自由文本仅 rationale 字段且截 120 字)
+pub fn build_adjudication_params(model: &str, record: &I2ConflictRecord) -> serde_json::Value {
+    let user_content = format!(
+        "上下文分区间疑似矛盾候选,请裁决是否为真实矛盾。\n\n\
+         候选 token(能力名):{token}\n\
+         冲突形态:{kind}\n\n\
+         文本甲(分区:{section_a}):\n{excerpt_a}\n\n\
+         文本乙(分区:{section_b}):\n{excerpt_b}\n\n\
+         分区背景:机制分区(以 ## 或【开头)是系统注入的权威面(记忆事实/边界/技能清单);\n\
+         (基底段)是代理定义声明面。\n\n\
+         裁决问题:文本乙对能力「{token}」的表述,是否与文本甲的限制构成真实矛盾\n\
+         (限制确实禁止了表述所授予的使用)?若限制有不同辖域/条件/语义,或仅为词形撞车,\n\
+         则为良性共存。\n\n\
+         只输出一个 JSON 对象,不要输出任何其他文本:\n\
+         {{\"verdict\":\"contradiction|benign|uncertain\",\"rationale\":\"不超过120字的理由\"}}",
+        token = record.token,
+        kind = record.kind,
+        section_a = record.section_a,
+        excerpt_a = record.excerpt_a,
+        section_b = record.section_b,
+        excerpt_b = record.excerpt_b,
+    );
+    serde_json::json!({
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": 300,
+        "messages": [
+            {"role": "system", "content": "你是上下文一致性审计员:对候选矛盾做中立裁决,只输出被要求的 JSON 对象。"},
+            {"role": "user", "content": user_content}
+        ]
+    })
+}
+
+/// 裁决响应解析(确定性:严格 JSON 三态;围栏包裹剥离;非法输出/越值
+/// verdict→uncertain 兜底——与 sidecar 失败同款 fail-soft)
+pub fn parse_adjudication_response(content: &str) -> I2Verdict {
+    let trimmed = content.trim();
+    // 剥离 markdown 代码围栏(模型偶发包裹 ```json ... ```)
+    let stripped = if trimmed.starts_with("```") {
+        let inner = trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```");
+        inner.trim()
+    } else {
+        trimmed
+    };
+    let parsed: Option<serde_json::Value> = serde_json::from_str(stripped)
+        .ok()
+        .or_else(|| {
+            // 容忍前后杂文:取首个 '{' 到末个 '}' 的窗口重试
+            let (a, b) = (stripped.find('{'), stripped.rfind('}'));
+            match (a, b) {
+                (Some(a), Some(b)) if a < b => serde_json::from_str(&stripped[a..=b]).ok(),
+                _ => None,
+            }
+        });
+    let verdict = parsed
+        .as_ref()
+        .and_then(|v| v.get("verdict"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let rationale = parsed
+        .as_ref()
+        .and_then(|v| v.get("rationale"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    match verdict {
+        "contradiction" | "benign" | "uncertain" => I2Verdict {
+            verdict: verdict.to_string(),
+            rationale: truncate_chars(rationale, VERDICT_RATIONALE_MAX_CHARS),
+        },
+        _ => I2Verdict::uncertain("语义裁决输出不可解析"),
+    }
+}
+
+/// 语义精判编排(两级通路第二级):候选逐个解析 verdict——缓存优先
+/// (命中零 LLM 调用),未命中走 fetch(sidecar 审计链内执行),失败→uncertain
+/// 兜底。verdict 并入候选记录后返回;fetch 成功时经 journal 落 sidecar
+/// token 账面(LlmCalled purpose=i2_semantic,失败不落——事件口径=成功完成时写)。
+pub async fn adjudicate_candidates<F, Fut>(
+    mut conflicts: Vec<I2ConflictRecord>,
+    cache: &std::sync::Mutex<std::collections::HashMap<String, I2Verdict>>,
+    model: &str,
+    mut fetch: F,
+    journal: Option<&crate::agent::journal::JournalWriter>,
+) -> Vec<I2ConflictRecord>
+where
+    F: FnMut(&I2ConflictRecord) -> Fut,
+    Fut: std::future::Future<Output = Result<(String, Option<crate::agent::journal::TokenRecord>), String>>,
+{
+    for rec in conflicts.iter_mut() {
+        let key = adjudication_cache_key(rec);
+        // 锁作用域收窄:命中判定先持锁取值,fetch 在锁外执行(不跨 await 持锁)
+        let cached = cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .cloned();
+        let verdict = match cached {
+            Some(v) => v,
+            None => {
+                let verdict = match fetch(rec).await {
+                    Ok((content, tokens)) => {
+                        if let Some(j) = journal {
+                            let _ = j.llm_called(
+                                model,
+                                I2_SEMANTIC_PURPOSE,
+                                None,
+                                tokens,
+                                None,
+                                1,
+                                &truncate_chars(&content, 200),
+                            );
+                        }
+                        parse_adjudication_response(&content)
+                    }
+                    Err(e) => I2Verdict::uncertain(&format!("语义裁决通路不可用: {e}")),
+                };
+                cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(key, verdict.clone());
+                verdict
+            }
+        };
+        rec.semantic_verdict = Some(verdict);
+    }
+    conflicts
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -161,6 +341,7 @@ pub fn inspect_system_sections(
                         section_b: name_b.clone(),
                         excerpt_a: excerpt_a.clone(),
                         excerpt_b,
+                        semantic_verdict: None,
                     });
                 }
             }
@@ -231,5 +412,163 @@ mod tests {
         let sp = "治理裁定:根据规约禁止调用 git_push 命令。\n\n## Stable Facts\n- 推荐使用 git_push 做推送";
         let r = inspect_system_sections(sp, &["git_push".to_string()]);
         assert_eq!(r.len(), 1, "{r:?}");
+    }
+    // ===== 语义精判(两级通路第二级) =====
+
+    fn sample_record() -> I2ConflictRecord {
+        I2ConflictRecord {
+            kind: "deny_vs_capability".to_string(),
+            token: "web_search".to_string(),
+            section_a: "(基底段)".to_string(),
+            section_b: "【能力边界声明】".to_string(),
+            excerpt_a: "禁止把 web_search 用于批量抓取".to_string(),
+            excerpt_b: "可用工具:web_search、file_read".to_string(),
+            semantic_verdict: None,
+        }
+    }
+
+    #[test]
+    fn adjudication_params_deterministic() {
+        // 确定性:同候选对同字节(temperature=0 固定,消息序固定)
+        let a = build_adjudication_params("m1", &sample_record());
+        let b = build_adjudication_params("m1", &sample_record());
+        assert_eq!(a, b);
+        assert_eq!(a["temperature"], serde_json::json!(0.0));
+        // 候选不同→参数不同
+        let mut other = sample_record();
+        other.token = "file_read".to_string();
+        assert_ne!(a, build_adjudication_params("m1", &other));
+    }
+
+    #[test]
+    fn adjudication_parse_three_states_and_garbage() {
+        // 三态直出
+        for v in ["contradiction", "benign", "uncertain"] {
+            let body = format!("{{\"verdict\":\"{v}\",\"rationale\":\"理由\"}}");
+            let got = parse_adjudication_response(&body);
+            assert_eq!(got.verdict, v);
+            assert_eq!(got.rationale, "理由");
+        }
+        // 围栏包裹剥离
+        let fenced = "```json
+{\"verdict\":\"benign\",\"rationale\":\"辖域不同\"}
+```";
+        assert_eq!(parse_adjudication_response(fenced).verdict, "benign");
+        // 前后杂文窗口提取
+        let noisy = "结论如下:{\"verdict\":\"contradiction\",\"rationale\":\"真矛盾\"} 以上。";
+        assert_eq!(parse_adjudication_response(noisy).verdict, "contradiction");
+        // 非法 JSON/越值 verdict→uncertain
+        assert_eq!(parse_adjudication_response("完全不是 JSON").verdict, "uncertain");
+        assert_eq!(
+            parse_adjudication_response("{\"verdict\":\"maybe\",\"rationale\":\"x\"}").verdict,
+            "uncertain"
+        );
+        // 理由截断 120 字符
+        let long = "长".repeat(300);
+        let body = format!("{{\"verdict\":\"benign\",\"rationale\":\"{long}\"}}");
+        let got = parse_adjudication_response(&body);
+        assert_eq!(got.rationale.chars().count(), 120);
+    }
+
+    #[test]
+    fn adjudication_cache_key_deterministic() {
+        assert_eq!(
+            adjudication_cache_key(&sample_record()),
+            adjudication_cache_key(&sample_record())
+        );
+        let mut other = sample_record();
+        other.excerpt_a = "不同的禁令行".to_string();
+        assert_ne!(
+            adjudication_cache_key(&sample_record()),
+            adjudication_cache_key(&other)
+        );
+    }
+
+    #[test]
+    fn record_serde_backward_compatible() {
+        // 旧账面(无 semantic_verdict 字段)反序列化→None;新形态round-trip
+        let old = r#"{"kind":"deny_vs_capability","token":"t","section_a":"a","section_b":"b","excerpt_a":"x","excerpt_b":"y"}"#;
+        let rec: I2ConflictRecord = serde_json::from_str(old).expect("old journal line parses");
+        assert!(rec.semantic_verdict.is_none());
+        let with_verdict = I2ConflictRecord {
+            semantic_verdict: Some(I2Verdict {
+                verdict: "benign".to_string(),
+                rationale: "辖域不同".to_string(),
+            }),
+            ..sample_record()
+        };
+        let ser = serde_json::to_string(&with_verdict).unwrap();
+        let de: I2ConflictRecord = serde_json::from_str(&ser).unwrap();
+        assert_eq!(de, with_verdict);
+        // None 序列化时字段不出现(账面瘦身)
+        let ser_none = serde_json::to_string(&sample_record()).unwrap();
+        assert!(!ser_none.contains("semantic_verdict"));
+    }
+
+    #[tokio::test]
+    async fn adjudicate_cache_hit_and_failsoft() {
+        use std::sync::Mutex as SM;
+        let cache: SM<std::collections::HashMap<String, I2Verdict>> = SM::new(std::collections::HashMap::new());
+        // 计数 fetch:成功返回 benign JSON
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let mut fetch = |_rec: &I2ConflictRecord| {
+            let c = calls_c.clone();
+            async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<(String, Option<crate::agent::journal::TokenRecord>), String>((
+                    "{\"verdict\":\"benign\",\"rationale\":\"辖域限定,非矛盾\"}".to_string(),
+                    Some(crate::agent::journal::TokenRecord { prompt: 10, completion: 5, total: 15 }),
+                ))
+            }
+        };
+        // 无 journal:成功路径 verdict 解析+缓存写入
+        let out = adjudicate_candidates(vec![sample_record()], &cache, "m", &mut fetch, None).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].semantic_verdict.as_ref().unwrap().verdict, "benign");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // 同候选再跑:缓存命中,fetch 零新增调用
+        let out2 = adjudicate_candidates(vec![sample_record()], &cache, "m", &mut fetch, None).await;
+        assert_eq!(out2[0].semantic_verdict.as_ref().unwrap().verdict, "benign");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "缓存命中零新增调用");
+        // 失败路径:Err→uncertain 兜底(fail-soft)
+        let mut fetch_err = |_rec: &I2ConflictRecord| {
+            async move { Err::<(String, Option<crate::agent::journal::TokenRecord>), String>("sidecar down".to_string()) }
+        };
+        let mut other = sample_record();
+        other.token = "another_tool".to_string();
+        let out3 = adjudicate_candidates(vec![other], &cache, "m", &mut fetch_err, None).await;
+        assert_eq!(out3[0].semantic_verdict.as_ref().unwrap().verdict, "uncertain");
+        assert!(out3[0].semantic_verdict.as_ref().unwrap().rationale.contains("sidecar down"));
+    }
+
+    #[tokio::test]
+    async fn adjudicate_journal_token_record_on_success() {
+        // sidecar token 账面:fetch 成功时 LlmCalled(purpose=i2_semantic) 落账;
+        // 失败不落(事件口径=成功完成时写)
+        use crate::agent::journal::{JournalWriter, TokenRecord};
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-i2").unwrap();
+        let cache: std::sync::Mutex<std::collections::HashMap<String, I2Verdict>> =
+            std::sync::Mutex::new(std::collections::HashMap::new());
+        let mut fetch = |_rec: &I2ConflictRecord| {
+            async move {
+                Ok::<(String, Option<TokenRecord>), String>((
+                    "{\"verdict\":\"contradiction\",\"rationale\":\"真矛盾\"}".to_string(),
+                    Some(TokenRecord { prompt: 10, completion: 5, total: 15 }),
+                ))
+            }
+        };
+        let out = adjudicate_candidates(vec![sample_record()], &cache, "test-model", &mut fetch, Some(&w)).await;
+        assert_eq!(out[0].semantic_verdict.as_ref().unwrap().verdict, "contradiction");
+        let lines = crate::agent::journal::read_all(&JournalWriter::path_for(dir.path(), "s-i2")).unwrap();
+        assert_eq!(lines.len(), 1, "恰一笔 sidecar 账");
+        let ok = matches!(
+            &lines[0].event,
+            crate::agent::journal::JournalEvent::LlmCalled { purpose, tokens, .. }
+                if purpose == "i2_semantic"
+                    && tokens.as_ref().map(|t| t.total) == Some(15)
+        );
+        assert!(ok, "LlmCalled(i2_semantic) 含 token 账面");
     }
 }
