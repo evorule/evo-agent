@@ -2228,6 +2228,56 @@ impl MemoryManager {
     }
 
     /// 阶段 2(F-610):注入 MemoryRecipe 策略规则集
+    /// 当前 Recipe 克隆(热重载后门控刷新读面)
+    pub(crate) fn current_recipe(&self) -> Option<crate::agent::recipe::MemoryRecipe> {
+        self.recipe.clone()
+    }
+
+    /// Recipe 指纹(资产化/LM-2:版本+内容 blake3;无 Recipe= None)
+    pub(crate) fn recipe_fingerprint(&self) -> Option<(String, String)> {
+        let recipe = self.recipe.as_ref()?;
+        let version = recipe.recipe_version.clone();
+        let json = serde_json::to_string(recipe).unwrap_or_default();
+        let hash = format!("blake3:{}", blake3::hash(json.as_bytes()).to_hex());
+        Some((version, hash))
+    }
+
+    /// Recipe 资产载荷(KnowledgeEntry 形态,经治理写通路入 evorule-rule
+    /// 数据集——「策略即规则集」的资产化字面实现:可版本/可审批/可包交换)
+    pub fn recipe_asset_payload(&self) -> Option<serde_json::Value> {
+        let recipe = self.recipe.as_ref()?;
+        let json = serde_json::to_string(recipe).ok()?;
+        let hash = format!("blake3:{}", blake3::hash(json.as_bytes()).to_hex());
+        Some(serde_json::json!({
+            "title": format!("memory-recipe-{}", recipe.recipe_version),
+            "body": json,
+            "confidence": 1.0,
+            "tags": ["memory-recipe", "strategy-asset", recipe.recipe_version.clone()],
+            "payload": json,
+            "provenance": format!("system:memory-recipe;fingerprint={hash}"),
+        }))
+    }
+
+    /// Recipe 热重载（LM-2 可热重载属性;运行体重解析+指纹审计留痕——
+    /// 新指纹随下一轮 effective_params 落链,回放可锚定实际生效版本）
+    pub fn reload_recipe(
+        &mut self,
+        recipe_json: &str,
+    ) -> Result<(String, String), String> {
+        let recipe: crate::agent::recipe::MemoryRecipe =
+            serde_json::from_str(recipe_json)
+                .map_err(|e| format!("recipe reload: parse failed ({e})"))?;
+        let version = recipe.recipe_version.clone();
+        let rollup = recipe.lifecycle.rollup_threshold;
+        // 指纹走重序列化规范形态(与 recipe_fingerprint 同口径:同内容同指纹,
+        // 与输入字节形态无关)
+        let canonical = serde_json::to_string(&recipe).unwrap_or_default();
+        let hash = format!("blake3:{}", blake3::hash(canonical.as_bytes()).to_hex());
+        self.set_recipe(recipe);
+        tracing::info!(version = %version, fingerprint = %hash, "memory recipe hot-reloaded");
+        Ok((version, hash))
+    }
+
     pub fn set_recipe(&mut self, recipe: crate::agent::recipe::MemoryRecipe) {
         self.recipe = Some(recipe);
     }
@@ -2995,6 +3045,11 @@ impl MemoryManager {
     }
 
     /// 当前 cache 大小
+    /// cache 键只读迭代（测试与观测面;不暴露可变句柄）
+    pub fn cache_keys(&self) -> Vec<String> {
+        self.cache.keys().cloned().collect()
+    }
+
     pub fn len(&self) -> usize {
         self.cache.len()
     }
@@ -6030,6 +6085,40 @@ mod tests {
             "佐证演化 0.5+0.05×0.5=0.525, got {}",
             after.confidence.unwrap()
         );
+    }
+
+    #[test]
+    fn recipe_fingerprint_asset_and_reload() {
+        // LM-2 资产化三面:指纹稳定/资产载荷含治理字段/热重载刷新+门控随动
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        assert!(mgr.recipe_fingerprint().is_none(), "无 Recipe=无指纹");
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        recipe.recipe_version = "memory-test-1".to_string();
+        mgr.set_recipe(recipe.clone());
+        let (v1, h1) = mgr.recipe_fingerprint().unwrap();
+        assert_eq!(v1, "memory-test-1");
+        // 同内容同指纹(内容寻址)
+        mgr.set_recipe(recipe.clone());
+        assert_eq!(mgr.recipe_fingerprint().unwrap().1, h1);
+        // 资产载荷:标题/provenance 指纹/tags 齐备
+        let asset = mgr.recipe_asset_payload().unwrap();
+        assert_eq!(asset["title"], "memory-recipe-memory-test-1");
+        assert!(
+            asset["provenance"]
+                .as_str()
+                .unwrap()
+                .contains(&h1),
+            "provenance 携带指纹"
+        );
+        // 热重载:新版本+新指纹;门控随动
+        let mut recipe2 = crate::agent::recipe::MemoryRecipe::default();
+        recipe2.recipe_version = "memory-test-2".to_string();
+        recipe2.sources.materials = true;
+        let json = serde_json::to_string(&recipe2).unwrap();
+        let (v2, h2) = mgr.reload_recipe(&json).unwrap();
+        assert_eq!(v2, "memory-test-2");
+        assert_ne!(h1, h2, "改配方即变指纹");
+        assert_eq!(mgr.current_recipe().unwrap().sources.materials, true);
     }
 
     #[test]
