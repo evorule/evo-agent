@@ -92,6 +92,12 @@ fn test_merge_delegate_tool() {
         workdir: None,
         // journal 目录(测试不落盘)
         journal_dir: None,
+        // 治理段下放(测试不注入)
+        governance_segment: None,
+        // 记忆下放(测试不开启)
+        propagate_memory: false,
+        // spawn 账(测试空账)
+        spawn_ledger: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     };
 
     let args = serde_json::json!({"query": "test"});

@@ -1021,6 +1021,12 @@ impl AgentRunner {
         &self.config
     }
 
+    /// 当前 evorule 会话 id(读访问;`create_session` 发生在 run/run_streaming
+    /// 内部,委托方在子 runner 流终止后经此读取子会话 id)
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
     /// G6:外部触发取消
     ///
     /// 触发后,`run()` / `run_streaming()` 会在下一个 SSE event 边界或 LLM chunk 边界
@@ -1396,6 +1402,40 @@ impl AgentRunner {
     /// 决策落账的观测面）。
     pub(crate) fn with_delegate_pipeline_entry(mut self) -> Self {
         self.pipeline_entry = crate::agent::pipeline::PipelineEntry::Delegate;
+        self
+    }
+
+    /// 委托子会话锚落账:drain spawn 账逐条落 journal 事件（delegate 工具
+    /// 结果写账前调用,事件序 tool_invoked → delegate_spawned → tool_result;
+    /// 无账/无记录均静默跳过——无 journal 时同样 drain 防跨调用残留）
+    fn flush_delegate_spawns(
+        &self,
+        journal: Option<&std::sync::Arc<crate::agent::journal::JournalWriter>>,
+    ) {
+        let Some(ctx) = &self.delegate_context else {
+            return;
+        };
+        let records = ctx.drain_spawn_records();
+        if records.is_empty() {
+            return;
+        }
+        let Some(j) = journal else {
+            return;
+        };
+        for r in records {
+            if let Err(e) =
+                j.delegate_spawned(&r.child_session_id, &r.agent_type, r.depth, &r.task_digest)
+            {
+                warn!(error = %e, "delegate_spawned journal failed");
+            }
+        }
+    }
+
+    /// 召回配额注入（delegate 子代理记忆声明下放用:与主装配同源取
+    /// definition.memory 召回配额;同 crate 内部装配面,非公开构造 API）
+    pub(crate) fn with_recall_quotas(mut self, max_summaries: usize, max_events: usize) -> Self {
+        self.sediment_config.max_session_summaries = max_summaries;
+        self.sediment_config.max_injected_events = max_events;
         self
     }
 
@@ -4993,6 +5033,11 @@ impl AgentRunner {
                                                         "result": serde_json::json!({"error": e.to_string()}).to_string(),
                                                     }),
                                                 });
+                                                // 委托子会话锚落账(delegate 工具:spawn 账 drain,
+                                                // 事件序 tool_invoked → delegate_spawned → tool_result)
+                                                if tc.name == "delegate" {
+                                                    runner.flush_delegate_spawns(journal.as_ref());
+                                                }
                                                 // B21:tool_result(error;内容与 transcript 回喂消息一致)
                                                 if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
                                                     if let Err(e) = j.tool_result(cid, "error", &err_content) {
@@ -5011,6 +5056,11 @@ impl AgentRunner {
                                         let tool_idx = messages.len();
                                         // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
                                         let raw_content = outcome.final_result.to_string();
+                                        // 委托子会话锚落账(delegate 工具:spawn 账 drain,
+                                        // 事件序 tool_invoked → delegate_spawned → tool_result)
+                                        if tc.name == "delegate" {
+                                            runner.flush_delegate_spawns(journal.as_ref());
+                                        }
                                         // B21:tool_result(ok;content = 工具输出全文与 transcript 一致)
                                         if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
                                             if let Err(e) = j.tool_result(cid, "ok", &raw_content) {

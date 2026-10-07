@@ -773,7 +773,7 @@ async fn run_agent(
     // 查账工具族接线（PR-11a）：以本会话态重绑 handler 内查账工具实例
     .wire_accounting(&state.workdir)
     // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位)
-    .with_governance_segment(governance_segment);
+    .with_governance_segment(governance_segment.clone());
     // G8:注入审批决策端(人工审查开合)——定义级 approval_mode=auto_policy 时
     // 走 PolicyApproval 判定式决策端(无人值守,理由必产);manual 态维持本端点
     // 既定行为(不注入=缺省拒绝,安全优先,行为零变化)
@@ -796,11 +796,17 @@ async fn run_agent(
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
         .with_journal_dir(state.workdir.join("data").join("sessions"))
         // 注入 delegate 上下文——serve 模式多代理委托通路接线
-        .with_delegate_context(crate::agent::delegate::DelegateContext::new(
-            &agent_type,
-            state.definitions.clone(),
-            state.evorule_client.clone(),
-        ));
+        // 治理门禁段随上下文下放(子代理 S2 槽位与主 runner 同源,治理
+        // 纪律无豁免面);journal 目录同源传入=子代理事件流落同目录
+        .with_delegate_context(
+            crate::agent::delegate::DelegateContext::new(
+                &agent_type,
+                state.definitions.clone(),
+                state.evorule_client.clone(),
+            )
+            .with_journal_dir(state.workdir.join("data").join("sessions"))
+            .with_governance_segment(governance_segment.clone()),
+        );
 
     // 改消费流式 ReAct 回路(delegate 同款修法,bb172b2 先例)——
     // 非流式 run() 是单发桥接(LLM 返 tool_calls 即返、工具不执行=能力面假象,
@@ -1457,6 +1463,9 @@ async fn get_atif(
         transcript: &transcript,
         audit_facts: &audit_facts,
         tool_definitions,
+        // 单会话端点不做父链路反查(父 journal 扫描属批量面);子轨迹
+        // 带链路标注走 journal::scan_delegate_spawns 发现+离线导出
+        parent_session_id: None,
     };
     let trajectory = crate::agent::atif::export(sources)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;

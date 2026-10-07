@@ -2134,7 +2134,10 @@ fn cmd_workflow(
         evo_agent::api::serve_tools::build_union_toolkit(workdir, &ws_client, &client);
     let mut ctx = DelegateContext::new("workflow_root", definitions, client.clone())
         .with_toolkit(union_toolkit, workdir)
-        .with_max_depth(max_depth);
+        .with_max_depth(max_depth)
+        // 子代理事件流与主会话同目录落账(serve 面同口径;未接线时子代理
+        // journal 缺位=子轨迹无账可查)
+        .with_journal_dir(workdir.join("data").join("sessions"));
     if max_concurrent > 0 {
         ctx = ctx.with_max_concurrent_delegates(max_concurrent);
     }
