@@ -122,6 +122,7 @@ const DEFAULT_EXPLICIT_PHRASES: &[&str] = &[
 /// 2. 检查关键词触发(消息包含"生日""分手"等)
 /// 3. 如有触发,调 LLM 提取结构化字段(temperature=0)
 /// 4. 返回 MemoryEvent(或 None)
+#[derive(Clone)]
 pub struct EventExtractor {
     /// LLM handler(从主 handler clone,共享 API key)
     llm: LlmHandler,

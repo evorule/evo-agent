@@ -925,6 +925,13 @@ pub struct AgentRunner {
     /// None，query_journal 如实报错）
     accounting_journal:
         std::sync::Arc<std::sync::RwLock<Option<crate::builtin_tools::accounting::JournalCtx>>>,
+    /// 自主交接 PR-H3:会话链共享运行态(None=根会话尚未发起过 spawn;首个
+    /// spawn 接线点惰性创建,经组件快照沿链传递同一 Arc——链 token 预算/
+    /// 停链标记/spawn 同签名观察全链共享)
+    chain: Option<std::sync::Arc<crate::agent::session_spawn_tool::ChainRuntimeState>>,
+    /// 自主交接 PR-H3:链熔断观察窗(仅派生子会话经组件快照携带;轮守卫
+    /// 创建时 move 注入 TurnEndGuard,根会话恒 None 不观察)
+    chain_watch: Option<crate::agent::session_spawn_tool::ChainWatch>,
 }
 
 /// 管道阶段⑦执行器：runner 的 call_service 通路
@@ -1003,6 +1010,8 @@ impl AgentRunner {
             semantic_i2_enabled: true,
             active_journal: None,
             accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            chain: None,
+            chain_watch: None,
         }
     }
 
@@ -2031,8 +2040,10 @@ impl AgentRunner {
         self.bind_propose_anchor(&session_id);
         // 双通道笔记批:note_write 会话期注册(payload 写,session_id 在手)
         self.register_session_scoped_memory_tools(&session_id);
-        // 自主交接批:handover 双工具会话期重绑(占位→wired,session_id 在手)
-        self.register_session_scoped_handover_tools(&session_id);
+        // 自主交接批:handover 双工具+session_spawn 会话期重绑(占位→wired,
+        // session_id 在手;run 纯路径无 journal,传 None——语义事件缺席如实
+        // 降级,调用镜像 tool_invoked/tool_result 仍在)
+        self.register_session_scoped_handover_tools(&session_id, None);
         // 跨源批 D:技能双层注册同步(声明面真账镜像+正文本地索引;
         // Recipe sources.skills_index 门控,缺省关=no-op;best-effort
         // 不阻塞会话)
@@ -2583,7 +2594,14 @@ impl AgentRunner {
     /// 开关 agentTools.handover 过滤后在场才重绑——开关关=占位未进面,LLM
     /// 契约同步缺席);G15 续跑幂等(重绑即覆盖注册)。memory 未启用时跳过
     /// (namespace 无权威源,占位保持 fail-visible 报错——不静默造 namespace)。
-    fn register_session_scoped_handover_tools(&mut self, session_id: &str) {
+    /// PR-H3 起兼接 session_spawn 接线(链态惰性初始化+子 runner 工厂注入;
+    /// journal 透传=停链 chain_halted 落账锚,None=无 journal 会话账面镜像
+    /// 如实降级)。
+    fn register_session_scoped_handover_tools(
+        &mut self,
+        session_id: &str,
+        journal: Option<std::sync::Arc<crate::agent::journal::JournalWriter>>,
+    ) {
         use crate::agent::handover_tool::{HandoverReadTool, HandoverWriteTool};
         let (namespace, client) = match self.memory.as_ref() {
             Some(mem) => (mem.namespace().to_string(), mem.evorule_client.clone()),
@@ -2610,7 +2628,160 @@ impl AgentRunner {
             };
             self.tool_handler.register_static(name, exec);
         }
+        // 自主开会话接线(自主交接设计 PR-H3):门控同 handover(启动期占位
+        // 在场才接线)。链态惰性初始化(发起方会话首个接线点创建);链 token
+        // 计量注入(既有 delegate 预算计数器在场时让位——链预算降级为仅计
+        // 链上子会话消耗,如实降级)。链态生命周期=发起方请求内(跨请求的
+        // 链续接由 server 侧 parent 链保深度权威,预算/熔断属请求内底线)。
+        if self
+            .tool_handler
+            .has_tool(crate::agent::session_spawn_tool::SESSION_SPAWN_TOOL)
+        {
+            let chain = match self.chain.clone() {
+                Some(c) => c,
+                None => {
+                    // K-06 口径:链预算=4×会话上下文窗口(常数族拍定值,随
+                    // budget-report 数据校准后调)
+                    let budget = (self.max_context_tokens as u64)
+                        .saturating_mul(crate::agent::session_spawn_tool::CHAIN_BUDGET_WINDOW_MULT);
+                    let c = std::sync::Arc::new(
+                        crate::agent::session_spawn_tool::ChainRuntimeState::new(budget),
+                    );
+                    self.chain = Some(c.clone());
+                    if self.token_counter.is_none() {
+                        self.token_counter = Some(c.token_counter());
+                    }
+                    c
+                }
+            };
+            let factory = self.spawn_factory(chain.clone());
+            let exec: std::sync::Arc<dyn ToolFunction> =
+                std::sync::Arc::new(crate::agent::session_spawn_tool::SessionSpawnTool::wired(
+                    session_id.to_string(),
+                    client.clone(),
+                    chain,
+                    journal,
+                    factory,
+                ));
+            self.tool_handler
+                .register_static(crate::agent::session_spawn_tool::SESSION_SPAWN_TOOL, exec);
+        }
         info!(%session_id, "handover tools re-bound (session-scoped)");
+    }
+
+    /// 自主交接 PR-H3:子会话 runner 工厂(SessionSpawnTool 接线用)
+    ///
+    /// 闭包构造期一次性克隆可 Clone 组件(组件快照);不可克隆项按同源输入
+    /// 重建:context_window=max_context_tokens+配方响应预留(与 from_definition
+    /// 同构)、output_validator=config.output_format、adjudicator=同源 client
+    /// 重挂;每会话可变态(消息缓冲/缓存/轨迹/停滞检测/取消令牌/格式指令
+    /// 落链去重槽)全新。子 runner 预置:session_id=child、chain=继承同一
+    /// Arc、chain_watch=新观察窗(仅子会话携带)、token_counter=链共享计量器
+    /// (全链 LLM 消耗向同一累加器归集,链预算口径)。
+    pub(crate) fn spawn_factory(
+        &self,
+        chain: std::sync::Arc<crate::agent::session_spawn_tool::ChainRuntimeState>,
+    ) -> std::sync::Arc<dyn Fn(&str) -> AgentRunner + Send + Sync> {
+        use crate::agent::session_spawn_tool::ChainWatch;
+        let config = self.config.clone();
+        let evorule_client = self.evorule_client.clone();
+        let llm_handler = self.llm_handler.clone();
+        let tool_handler = self.tool_handler.clone();
+        let memory = self.memory.clone();
+        let delegate_context = self.delegate_context.clone();
+        let message_persist_mode = self.message_persist_mode.clone();
+        let summary_model = self.summary_model.clone();
+        let summarizer = self.summarizer.clone();
+        let approval_callback = self.approval_callback.clone();
+        let metrics = self.metrics.clone();
+        let event_callbacks = self.event_callbacks.clone();
+        let memory_event_store = self.memory_event_store.clone();
+        let extractor = self.extractor.clone();
+        let sediment_config = self.sediment_config.clone();
+        let propose_anchor = self.propose_anchor.clone();
+        let max_context_tokens = self.max_context_tokens;
+        let assembly = self.assembly.clone();
+        let tool_result_max_chars = self.tool_result_max_chars;
+        let journal_dir = self.journal_dir.clone();
+        let acceptance_command = self.acceptance_command.clone();
+        let pipeline_entry = self.pipeline_entry.clone();
+        let assembly_scope_focus = self.assembly_scope_focus;
+        let semantic_i2_enabled = self.semantic_i2_enabled;
+        let reserve = max_context_tokens * self.assembly.reserve_for_response_pct() as usize / 100;
+        let chain_counter = chain.token_counter();
+        Arc::new(move |child_sid: &str| {
+            let agent_type = config.agent_type.clone();
+            let adjudicator_client = evorule_client.clone();
+            let output_validator = config.output_format.as_ref().and_then(|fmt| {
+                match OutputValidator::from_output_format(fmt) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "session_spawn: child output validator rebuild failed; validation disabled"
+                        );
+                        None
+                    }
+                }
+            });
+            let context_window = Some(ContextWindowManager::with_approx_counter(
+                max_context_tokens,
+                reserve,
+                TrimStrategy::KeepSystemKeepLast,
+            ));
+            AgentRunner {
+                config: config.clone(),
+                evorule_client: evorule_client.clone(),
+                llm_handler: llm_handler.clone(),
+                tool_handler: tool_handler.clone(),
+                memory: memory.clone(),
+                delegate_context: delegate_context.clone(),
+                session_id: Some(child_sid.to_string()),
+                message_persist_mode: message_persist_mode.clone(),
+                pending_messages: Vec::new(),
+                summary_model: summary_model.clone(),
+                context_window,
+                summarizer: summarizer.clone(),
+                cancel_token: CancellationToken::new(),
+                output_validator,
+                landed_format_instruction: std::sync::Mutex::new(None),
+                output_format_retries: 0,
+                approval_callback: approval_callback.clone(),
+                parallel_tool_cache: Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
+                metrics: metrics.clone(),
+                event_callbacks: event_callbacks.clone(),
+                memory_event_store: memory_event_store.clone(),
+                extractor: extractor.clone(),
+                sediment_config: sediment_config.clone(),
+                propose_anchor: propose_anchor.clone(),
+                max_context_tokens,
+                assembly: assembly.clone(),
+                tool_result_max_chars,
+                token_counter: Some(chain_counter.clone()),
+                adjudicator: tokio::sync::Mutex::new(
+                    crate::agent::adjudicator::AdjudicationChannel::new(
+                        adjudicator_client,
+                        &agent_type,
+                    ),
+                ),
+                tool_traces: Arc::new(std::sync::Mutex::new(
+                    crate::agent::tool_trace::ToolTraceCollector::default(),
+                )),
+                journal_dir: journal_dir.clone(),
+                acceptance_command: acceptance_command.clone(),
+                stagnation: crate::agent::stagnation::StagnationDetector::new(),
+                pipeline_entry: pipeline_entry.clone(),
+                assembly_scope_focus,
+                i2_verdict_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                semantic_i2_enabled,
+                active_journal: None,
+                accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                chain: Some(chain.clone()),
+                chain_watch: Some(ChainWatch::new(chain.clone())),
+            }
+        })
     }
 
     /// 组装随 LLM 请求下发的工具 OpenAI function schema。
@@ -3429,6 +3600,38 @@ impl AgentRunner {
         }
     }
 
+    /// 自主交接 PR-H3 批:session_spawn 成功落 journal session_spawned(镜像
+    /// server 侧 parent 因果链;调用镜像已在 tool_invoked/tool_result,本事件
+    /// 供链审计对账)。非 session_spawn/无 child 锚/无 journal = 不落(语义
+    /// 事件仅成功形态在场,失败由调用镜像覆盖)。
+    fn record_session_spawned(
+        journal: Option<&crate::agent::journal::JournalWriter>,
+        session_id: &str,
+        tool_name: &str,
+        result: &Value,
+    ) {
+        if tool_name != crate::agent::session_spawn_tool::SESSION_SPAWN_TOOL {
+            return;
+        }
+        let Some(j) = journal else {
+            return;
+        };
+        let child = result
+            .get("child_session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if child.is_empty() {
+            return;
+        }
+        let depth = result
+            .get("chain_depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        if let Err(e) = j.session_spawned(session_id, child, depth) {
+            tracing::warn!(error = %e, "session_spawned journal append failed");
+        }
+    }
+
     /// 阶段一(流式路径):执行工具并解析审批请求,不做决策
     ///
     /// 供 stream! 生成器在 yield ApprovalRequired **之前**调用 —— 帧必须在
@@ -3456,6 +3659,7 @@ impl AgentRunner {
                 .execute_tool_call_gated(session_id, tool_name, args, journal, Some(cached))
                 .await?;
             Self::record_handover_written(journal, session_id, tool_name, &final_result);
+            Self::record_session_spawned(journal, session_id, tool_name, &final_result);
             return Ok(ToolExecStage::Done(ToolExecOutcome {
                 final_result,
                 approval_record: None,
@@ -3484,6 +3688,7 @@ impl AgentRunner {
                 match parse_approval_request(session_id, tool_name, &first_args, &result_str) {
                     None => {
                         Self::record_handover_written(journal, session_id, tool_name, &tool_result);
+                        Self::record_session_spawned(journal, session_id, tool_name, &tool_result);
                         Ok(ToolExecStage::Done(ToolExecOutcome {
                             final_result: tool_result,
                             approval_record: None,
@@ -4446,6 +4651,10 @@ impl AgentRunner {
                 };
             // 摘要保真对照(交付物 B):journal 写者克隆挂 runner(摘要替换时落账)
             runner.active_journal = journal.clone();
+            // 自主交接 PR-H2/H3:handover 双工具+session_spawn 会话期重绑
+            // (与 run() 同钩位补挂——此前流式路径漏挂,handover 工具在 serve
+            // 流式会话恒 unwired;journal 在手后透传,派生/停链语义事件可落账)
+            runner.register_session_scoped_handover_tools(&session_id, journal.clone());
             // turn_started(轮顶;turn_seq 按 journal 内既有轮数递增,G15 续跑同文件续轮)。
             // turn_guard 保证所有终止路径(优雅显式 end / 异常 drop 补写 aborted)轮界闭合。
             let mut turn_guard = match &journal {
@@ -4458,6 +4667,15 @@ impl AgentRunner {
                 },
                 None => None,
             };
+            // 自主交接 PR-H3:链熔断观察窗挂接(仅派生子会话携带 chain_watch
+            // ——组件快照沿链注入,根会话恒 None 不观察)。守卫按轮新建,
+            // ChainWatch 随守卫 move(窗口判定=journal turn_seq,窗口外轮
+            // 关闭;链态生命周期=发起方请求内的 v1 口径见接线段注释)
+            if let Some(g) = turn_guard.as_mut() {
+                if let Some(w) = runner.chain_watch.take() {
+                    g.attach_chain_watch(w);
+                }
+            }
 
             // K-11/P2-1 观测落账(延迟点;recall 块已暂存 recall_hits/lex_stats,
             // 此处 journal 与 session_id 均已在位)。journal 序:turn_started →

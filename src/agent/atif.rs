@@ -922,6 +922,11 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             // HandoverWritten:交接点语义锚(写档动作镜像已在 tool_invoked/
             // tool_result);v1 忽略,跨会话链步映射待 session_spawn 接线后一并设计
             JournalEvent::HandoverWritten { .. } => {}
+            // SessionSpawned/ChainHalted(自主交接批):会话链派生/熔断语义锚
+            // ——派生因果权威在 server 侧 parent_session_id 链,熔断由 turn_ended
+            // 序列本身可见;v1 忽略,链级轨迹映射待跨会话步设计一并落
+            JournalEvent::SessionSpawned { .. } => {}
+            JournalEvent::ChainHalted { .. } => {}
         }
     }
     // 流末悬挂 agent 步(无 turn_ended 尾:crash/截断场景)
