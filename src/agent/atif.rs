@@ -919,6 +919,9 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             JournalEvent::DelegateSpawned { .. } => {}
             // SessionCrashed 已在循环头截断
             JournalEvent::SessionCrashed { .. } => {}
+            // HandoverWritten:交接点语义锚(写档动作镜像已在 tool_invoked/
+            // tool_result);v1 忽略,跨会话链步映射待 session_spawn 接线后一并设计
+            JournalEvent::HandoverWritten { .. } => {}
         }
     }
     // 流末悬挂 agent 步(无 turn_ended 尾:crash/截断场景)

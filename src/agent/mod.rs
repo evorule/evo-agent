@@ -17,6 +17,7 @@ pub mod context_window;
 pub mod definition;
 pub mod delegate;
 pub mod driver;
+pub mod handover_tool;
 pub mod journal;
 pub mod lexstore;
 pub mod materializer;
