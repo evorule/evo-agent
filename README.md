@@ -530,7 +530,7 @@ MCP 远端工具与服务代理工具为运行期动态注册（非静态工具�
 | skill 装配 | 1 | skill_pack_to_bundle（skill 规则壳 → 执行域快照包桥接，crate 算哈希+结构预检；恒出未验证 fail 包，pass 重出包走治理域通路） |
 | meta | 1 | meta_summary（L2 约束清单摘要） |
 | evolution | 2 | evolution_signals（进化信号拉取）+ rule_promote（约束层晋升提名） |
-| why/order | 3 | explain_denial（拒因解释+规则正本对账）+ causal_order（两事实因果序，链式哈希序）+ lineage_of（规则谱系=版本链+晋升账拼接），均只读 |
+| why/order | 3 | explain_denial（拒因解释+规则正本对账；io_guard 保留值拒因经事实自带命中记录闭环自证）+ causal_order（两事实因果序，链式哈希序）+ lineage_of（规则谱系=版本链+晋升账拼接），均只读 |
 
 ### MCP 工具接入
 
