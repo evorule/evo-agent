@@ -572,10 +572,11 @@ fn delegate_manifest() -> ToolManifest {
     m
 }
 
-/// 自省记忆工具 manifest（4 条，与 memory_tool_specs 名称集合相等——测试锁）
+/// 自省记忆工具 manifest（5 条，与 memory_tool_specs 名称集合相等——测试锁）
 fn memory_manifests() -> Vec<ToolManifest> {
     use crate::agent::memory_tool::{
-        MEMORY_GET_TOOL, MEMORY_PROPOSE_TOOL, MEMORY_SEARCH_TOOL, NOTE_WRITE_TOOL,
+        MEMORY_GET_TOOL, MEMORY_LINK_TOOL, MEMORY_PROPOSE_TOOL, MEMORY_SEARCH_TOOL,
+        NOTE_WRITE_TOOL,
     };
     vec![
         base(
@@ -598,6 +599,12 @@ fn memory_manifests() -> Vec<ToolManifest> {
         ),
         base(
             NOTE_WRITE_TOOL,
+            ToolSource::Memory,
+            SpecSource::Memory,
+            vec![CapDomain::Memory],
+        ),
+        base(
+            MEMORY_LINK_TOOL,
             ToolSource::Memory,
             SpecSource::Memory,
             vec![CapDomain::Memory],
@@ -723,12 +730,12 @@ mod tests {
 
     #[test]
     fn test_static_manifest_count_locked() {
-        // 内置 20 + 规则 49 + delegate 1 + memory 4 = 74
+        // 内置 20 + 规则 49 + delegate 1 + memory 5 = 75
         // （PR-11a 查账工具族 +4：16→20；PR-11b why/order 三工具 +3：
-        //   规则 46→49，数量锁 71→74）
+        //   规则 46→49，数量锁 71→74；memory_link +1：74→75）
         assert_eq!(builtin_manifests().len(), 20);
         assert_eq!(rule_manifests().len(), 49);
-        assert_eq!(all().len(), 74);
+        assert_eq!(all().len(), 75);
     }
 
     #[test]

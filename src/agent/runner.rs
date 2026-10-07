@@ -2576,39 +2576,64 @@ impl AgentRunner {
     /// 后才可注册;G15 续跑幂等——已注册即跳过)。门控=Recipe.tools.expose
     /// 声明;best-effort 条件不满足=静默跳过(装配期已做一致性校验)。
     fn register_session_scoped_memory_tools(&mut self, session_id: &str) {
-        let (declared, namespace, client) = match self.memory.as_ref() {
-            Some(mem) => {
-                let exposed = mem.exposed_introspection_tools();
-                let declared = exposed
-                    .iter()
-                    .any(|n| n == crate::agent::memory_tool::NOTE_WRITE_TOOL);
-                (
-                    declared,
-                    mem.namespace().to_string(),
-                    mem.evorule_client.clone(),
-                )
-            }
-            None => return,
-        };
-        if !declared
-            || self
+        let (note_declared, link_declared, namespace, client, link_relations) =
+            match self.memory.as_ref() {
+                Some(mem) => {
+                    let exposed = mem.exposed_introspection_tools();
+                    let note_declared = exposed
+                        .iter()
+                        .any(|n| n == crate::agent::memory_tool::NOTE_WRITE_TOOL);
+                    let link_declared = exposed
+                        .iter()
+                        .any(|n| n == crate::agent::memory_tool::MEMORY_LINK_TOOL);
+                    (
+                        note_declared,
+                        link_declared,
+                        mem.namespace().to_string(),
+                        mem.evorule_client.clone(),
+                        mem.link_relations(),
+                    )
+                }
+                None => return,
+            };
+        if note_declared
+            && !self
                 .tool_handler
                 .has_tool(crate::agent::memory_tool::NOTE_WRITE_TOOL)
         {
-            return;
+            let exec: std::sync::Arc<dyn ToolFunction> = std::sync::Arc::new(
+                crate::agent::memory_tool::MemoryNoteWriteTool::new(
+                    namespace.clone(),
+                    client.clone(),
+                    session_id.to_string(),
+                ),
+            );
+            self.tool_handler
+                .register_static(crate::agent::memory_tool::NOTE_WRITE_TOOL, exec);
         }
-        let exec: std::sync::Arc<dyn ToolFunction> =
-            std::sync::Arc::new(crate::agent::memory_tool::MemoryNoteWriteTool::new(
-                namespace,
-                client,
-                session_id.to_string(),
-            ));
-        self.tool_handler
-            .register_static(crate::agent::memory_tool::NOTE_WRITE_TOOL, exec);
-        info!(
-            tool = crate::agent::memory_tool::NOTE_WRITE_TOOL,
-            "note_write tool registered (session-scoped)"
-        );
+        if link_declared
+            && !self
+                .tool_handler
+                .has_tool(crate::agent::memory_tool::MEMORY_LINK_TOOL)
+        {
+            let exec: std::sync::Arc<dyn ToolFunction> = std::sync::Arc::new(
+                crate::agent::memory_tool::MemoryLinkTool::new(
+                    namespace.clone(),
+                    client.clone(),
+                    session_id.to_string(),
+                    link_relations.clone(),
+                ),
+            );
+            self.tool_handler
+                .register_static(crate::agent::memory_tool::MEMORY_LINK_TOOL, exec);
+        }
+        if note_declared || link_declared {
+            info!(
+                note = note_declared,
+                link = link_declared,
+                "memory write tools registered (session-scoped)"
+            );
+        }
     }
 
     /// 组装随 LLM 请求下发的工具 OpenAI function schema。

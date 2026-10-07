@@ -144,6 +144,10 @@ pub struct ToolsSection {
     /// 暴露的自省工具名集合（白名单语义；未知名在接线时 warn 跳过）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expose: Vec<String>,
+    /// memory_link 关系类型白名单（A-MEM 式关联；空=内建四类
+    /// related/derives/supports/contradicts，声明即整体覆盖）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_relations: Vec<String>,
 }
 
 /// 矛盾裁决配置（阶段 3 F-612，记忆设计档 §八 adjudication 节）。

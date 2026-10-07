@@ -62,6 +62,14 @@ pub const MEMORY_PROPOSE_TOOL: &str = "memory_propose";
 /// 笔记写入工具名（双通道笔记 Q3 写面：落账 Captured，写不过闸、晋升受治）
 pub const NOTE_WRITE_TOOL: &str = "note_write";
 
+/// `memory_link` 关联工具（双通道 Q3 写面扩展，A-MEM 式关联；轻闸=
+/// 形态+关系白名单校验，落账 Captured——A-MEM 可取项的受治实现）
+pub const MEMORY_LINK_TOOL: &str = "memory_link";
+
+/// 关系类型内建白名单（Recipe.tools.link_relations 未声明时的缺省集；
+/// 声明即整体覆盖——A-MEM relation 类型白名单在 Recipe）
+pub const BUILTIN_LINK_RELATIONS: &[&str] = &["related", "derives", "supports", "contradicts"];
+
 /// 自省族**读件**判定（读面数据前提=LexStore 检索缓存）
 pub fn is_introspection_read_tool(name: &str) -> bool {
     name == MEMORY_SEARCH_TOOL || name == MEMORY_GET_TOOL
@@ -70,7 +78,7 @@ pub fn is_introspection_read_tool(name: &str) -> bool {
 /// 自省族**写件**判定（A2-2：结构闸+旗标强制在工具实现内，治理闸在 A2-3/A2-4；
 /// note_write 落账 Captured 写不过闸、晋升受治——同属写面声明即可，不入治理闸族）
 pub fn is_introspection_write_tool(name: &str) -> bool {
-    name == MEMORY_PROPOSE_TOOL || name == NOTE_WRITE_TOOL
+    name == MEMORY_PROPOSE_TOOL || name == NOTE_WRITE_TOOL || name == MEMORY_LINK_TOOL
 }
 
 /// 已实现的自省记忆工具名判定（读两件+写两件）
@@ -248,6 +256,39 @@ pub fn memory_tool_specs() -> Vec<ToolSpec> {
                     .to_string(),
                 required: true,
             }],
+        },
+        ToolSpec {
+            name: MEMORY_LINK_TOOL.to_string(),
+            description: "Link two existing memories with a typed relation (A-MEM style                           association). Both source and target must be existing memory keys;                           the relation must be in the allowed whitelist. The link lands as a                           Captured ledger fact."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "relation".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Relation type (whitelisted: related | derives | supports |                                   contradicts, or Recipe-declared)"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "source".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Source memory key (existing entry)".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "target".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Target memory key (existing entry; must differ from source)"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "note".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Optional rationale for the link".to_string(),
+                    required: false,
+                },
+            ],
         },
         ToolSpec {
             name: NOTE_WRITE_TOOL.to_string(),
@@ -991,6 +1032,139 @@ impl ToolFunction for MemoryNoteWriteTool {
     }
 }
 
+/// `memory_link` 执行器（Q3 写面扩展：A-MEM 式关联，轻闸=schema 校验）。
+///
+/// 治理口径与 note_write 同族：落账 Captured 写不过闸、来源域=llm-note；
+/// relation 白名单=Recipe.tools.link_relations（未声明用内建四类）。
+/// path=`shared.{ns}.links.{relation}.{ymd}-{seq:03}`（date-seq 三位零填充，
+/// 同日多条按路径字典序即时间序）；账本不可达=如实报错交还 LLM。
+pub(crate) async fn memory_link_exec(
+    namespace: &str,
+    client: &EvoruleApiClient,
+    session_id: &str,
+    args: &Value,
+    relations: &[String],
+) -> Result<Value, String> {
+    let relation = args
+        .get("relation")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing required param: relation (non-empty string)".to_string())?;
+    if !relations.iter().any(|r| r == relation) {
+        return Err(format!(
+            "invalid relation '{relation}'; allowed: {}",
+            relations.join(", ")
+        ));
+    }
+    let source = args
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing required param: source (existing memory key/path tail)".to_string())?;
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing required param: target (existing memory key/path tail)".to_string())?;
+    if source == target {
+        return Err("self-link rejected: source and target must differ".to_string());
+    }
+    let note = args
+        .get("note")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+
+    let family = format!("shared.{namespace}.links.{relation}.");
+    let existing = client
+        .get_shared_facts(Some(&family))
+        .await
+        .map_err(|e| format!("memory_link: ledger unreachable, cannot allocate sequence ({e})"))?;
+    let ymd = utc_date_str(now_secs());
+    let date_marker = format!("{ymd}-");
+    let seq = existing
+        .iter()
+        .filter(|f| {
+            f.path
+                .rsplit('.')
+                .next()
+                .is_some_and(|t| t.starts_with(&date_marker))
+        })
+        .count()
+        + 1;
+    let path = format!("shared.{namespace}.links.{relation}.{ymd}-{seq:03}");
+    let key_tail = format!("link.{relation}.{ymd}-{seq:03}");
+
+    let mut value = serde_json::json!({
+        "source": source,
+        "target": target,
+        "relation": relation,
+    });
+    if !note.is_empty() {
+        value["note"] = serde_json::json!(note);
+    }
+    let value_str = serde_json::to_string(&value)
+        .map_err(|e| format!("memory_link: payload serialize failed ({e})"))?;
+    let mut record = MemoryRecord::new(&key_tail, &value_str, now_secs());
+    record.lifecycle_state = Some("Captured".to_string());
+    record.source = Some("llm-note".to_string());
+    record.confidence = Some(0.7);
+    record.tags = vec!["link".to_string(), relation.to_string()];
+    let payload = serde_json::to_value(&record)
+        .map_err(|e| format!("memory_link: record serialize failed ({e})"))?;
+    client
+        .update_payload(session_id, &path, &payload)
+        .await
+        .map_err(|e| format!("memory_link: persist failed ({e})"))?;
+    Ok(json!({
+        "status": "ok",
+        "path": path,
+        "key": key_tail,
+        "relation": relation,
+        "source": source,
+        "target": target,
+        "lifecycle_state": "Captured",
+    }))
+}
+
+/// `memory_link` 执行器句柄（会话期注册——session_id 在手；关系白名单
+/// 注册期固化为 Recipe 声明快照）
+pub struct MemoryLinkTool {
+    namespace: String,
+    client: EvoruleApiClient,
+    session_id: String,
+    relations: Vec<String>,
+}
+
+impl MemoryLinkTool {
+    pub fn new(namespace: String, client: EvoruleApiClient, session_id: String, relations: Vec<String>) -> Self {
+        Self {
+            namespace,
+            client,
+            session_id,
+            relations,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolFunction for MemoryLinkTool {
+    async fn call(&self, args: &Value) -> Result<Value, String> {
+        memory_link_exec(
+            &self.namespace,
+            &self.client,
+            &self.session_id,
+            args,
+            &self.relations,
+        )
+        .await
+    }
+}
+
 /// `memory_propose` 单批候选上限（A2-2 结构闸）
 const PROPOSE_MAX_ITEMS: usize = 5;
 
@@ -1236,6 +1410,51 @@ impl ToolFunction for MemoryProposeTool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn memory_link_validation_gate_before_network() {
+        // 轻闸(schema 校验)先于网络:非法 relation/自连/缺参一律在账本访问前拒
+        let client = EvoruleApiClient::new("http://127.0.0.1:1");
+        let relations = vec!["related".to_string(), "derives".to_string()];
+        // 非白名单 relation
+        let err = memory_link_exec(
+            "ns",
+            &client,
+            "s1",
+            &serde_json::json!({"relation": "hates", "source": "a", "target": "b"}),
+            &relations,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("invalid relation"), "{err}");
+        // 自连拒绝
+        let err = memory_link_exec(
+            "ns",
+            &client,
+            "s1",
+            &serde_json::json!({"relation": "related", "source": "a", "target": "a"}),
+            &relations,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("self-link rejected"), "{err}");
+        // 缺参
+        let err = memory_link_exec(
+            "ns",
+            &client,
+            "s1",
+            &serde_json::json!({"relation": "related", "source": "a"}),
+            &relations,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("missing required param: target"), "{err}");
+    }
+
+    #[test]
+    fn memory_link_registered_in_write_family() {
+        assert!(is_introspection_write_tool(MEMORY_LINK_TOOL));
+        assert!(is_registered_memory_tool(MEMORY_LINK_TOOL));
+    }
     use super::*;
 
     fn make_client() -> EvoruleApiClient {
@@ -1559,7 +1778,9 @@ mod tests {
     #[test]
     fn test_memory_tool_specs_shape() {
         let specs = memory_tool_specs();
-        assert_eq!(specs.len(), 4);
+        assert_eq!(specs.len(), 5);
+        let link = specs.iter().find(|s| s.name == "memory_link").unwrap();
+        assert_eq!(link.parameters.len(), 4);
         let search = specs.iter().find(|s| s.name == "memory_search").unwrap();
         assert_eq!(search.parameters.len(), 3);
         assert!(search.parameters[0].required);
