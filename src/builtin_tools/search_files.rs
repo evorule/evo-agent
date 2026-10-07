@@ -29,7 +29,7 @@ pub const DEFAULT_MAX_RESULTS: usize = 1000;
 
 /// 默认排除的目录名（walk 进入子目录前跳过；与 grep_files DEFAULT_EXCLUDE_GLOBS 对齐，
 /// 防全树搜索在含编译产物/依赖的大工作区超时）
-pub const DEFAULT_EXCLUDE_DIRS: &[&str] = &["target", "node_modules", ".git", ".evo-trash", "data"];
+pub const DEFAULT_EXCLUDE_DIRS: &[&str] = &["target", "node_modules", ".git", ".evo-trash"];
 
 /// `search_files` 工具
 #[derive(Clone)]

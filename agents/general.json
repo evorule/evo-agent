@@ -62,6 +62,7 @@
     "max_session_summaries": 3,
     "max_injected_events": 5,
     "enable_event_extraction": true,
-    "summary_model": "MiniMax-M2.5"
+    "summary_model": "MiniMax-M2.5",
+    "lex_store": "data/lex/general.db"
   }
 }
