@@ -6,6 +6,15 @@ use std::collections::BTreeMap;
 
 use super::*;
 
+#[tokio::test]
+async fn write_intent_advisory_fast_paths() {
+    // 无记忆面→None(快路径);非写族→None(提取层拒绝)
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    let args = serde_json::json!({"path": "src/main.rs"});
+    assert!(runner.write_intent_advisory("file_write", &args).await.is_none());
+    assert!(runner.write_intent_advisory("file_read", &args).await.is_none());
+}
+
 fn make_test_client() -> EvoruleApiClient {
     EvoruleApiClient::new("http://localhost:8080")
 }

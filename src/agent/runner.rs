@@ -916,6 +916,8 @@ pub struct AgentRunner {
     /// 双通道笔记强制回喂 R-2 触发闩(停滞 Warning/Exhausted、工具错误、
     /// 审批拒绝置位;下一轮 recall 消费——failure 笔记回喂进 S3,消费后复位)
     pending_note_feed: bool,
+    /// 写前置查询会话级路径去重(同路径重复写不再重复建议;R-4)
+    advised_paths: std::sync::Mutex<std::collections::HashSet<String>>,
     /// 摘要保真对照(规格修正批交付物 B):当前会话 journal 写者(流式路径
     /// 注入;CLI run 纯路径无 journal=只 warn 不落账)。G10 摘要替换时
     /// 自动对照落 summary_fidelity_scan 事件。
@@ -1002,6 +1004,7 @@ impl AgentRunner {
             i2_verdict_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             semantic_i2_enabled: true,
             pending_note_feed: false,
+            advised_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
             active_journal: None,
             accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
@@ -1460,6 +1463,36 @@ impl AgentRunner {
     pub fn with_semantic_i2(mut self, enabled: bool) -> Self {
         self.semantic_i2_enabled = enabled;
         self
+    }
+
+    /// 写前置查询（Q2 第四触发点 R-4）:写族意图→目标路径历史 advisory。
+    /// fail-soft 静默（拉取失败/无记忆面/无匹配/同路径已建议→None,写入
+    /// 不受影响——可用性优先于回喂,与 R-1 fail-visible 取向相反是设计使然）
+    pub(crate) async fn write_intent_advisory(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        let path = crate::agent::memory::extract_write_path(tool_name, args)?;
+        {
+            let mut seen = self.advised_paths.lock().unwrap_or_else(|p| p.into_inner());
+            if !seen.insert(path.clone()) {
+                return None; // 同路径本会话已建议过（降噪）
+            }
+        }
+        let mem = self.memory.as_ref()?;
+        let catalog = mem.fetch_advisory_catalog().await.ok()?;
+        let lines = crate::agent::memory::format_write_advisory(&path, &catalog, 3);
+        if lines.is_empty() {
+            return None;
+        }
+        info!(tool = %tool_name, %path, hits = lines.len(), "write-intent advisory attached");
+        Some(format!(
+            "⚠ 写入目标 {path} 的历史记录（写前置查询回喂）:
+{}",
+            lines.join("
+")
+        ))
     }
 
     /// 装配面聚焦（delegate 子代理装配路径）
@@ -5022,6 +5055,10 @@ impl AgentRunner {
                                         // 硬终止会让一次 knowledge_search 404 毁掉整个草稿回合
                                         // (两阶段:Pending 时先 yield ApprovalRequired 再等
                                         // 决策 —— 帧必须赶在 60s 审批窗口内到达前端)
+                                        // 写前置查询(Q2 R-4):写族意图→路径历史 advisory(执行前计算,随结果回喂)
+                                        let write_advisory = runner
+                                            .write_intent_advisory(&tc.name, &tc.arguments)
+                                            .await;
                                         let outcome_res = match runner
                                             .execute_tool_stage(&session_id, &tc.name, &tc.arguments, journal.as_deref())
                                             .await
@@ -5143,7 +5180,11 @@ impl AgentRunner {
                                         tool_calls.push(tc.name.clone());
                                         let tool_idx = messages.len();
                                         // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
-                                        let raw_content = outcome.final_result.to_string();
+                                        let mut raw_content = outcome.final_result.to_string();
+                                        if let Some(adv) = write_advisory {
+                                            raw_content.push('\n');
+                                            raw_content.push_str(&adv);
+                                        }
                                         // 委托子会话锚落账(delegate 工具:spawn 账 drain,
                                         // 事件序 tool_invoked → delegate_spawned → tool_result)
                                         if tc.name == "delegate" {
@@ -5371,6 +5412,9 @@ impl AgentRunner {
                                         }
                                     }
                                 }
+                                // 写前置查询(Q2 R-4):写族意图→路径历史 advisory(执行前计算,随结果回喂)
+                                let write_advisory =
+                                    runner.write_intent_advisory(&tool_name, &args).await;
                                 let outcome_res = match runner
                                     .execute_tool_stage(&session_id, &tool_name, &args, journal.as_deref())
                                     .await
@@ -5504,6 +5548,10 @@ impl AgentRunner {
                                 // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
                                 let mut raw_content = final_result.to_string();
                                 if let Some(adv) = gate_note_advisory.take() {
+                                    raw_content.push('\n');
+                                    raw_content.push_str(&adv);
+                                }
+                                if let Some(adv) = write_advisory {
                                     raw_content.push('\n');
                                     raw_content.push_str(&adv);
                                 }
