@@ -612,6 +612,60 @@ pub(crate) fn format_failure_feed(
     feed
 }
 
+/// 写族工具集合（Q2 第四触发点 R-4 写前置查询;常量可扩——shell_exec 写
+/// 不覆盖,v0 边界=文件工具族）
+pub const WRITE_INTENT_TOOLS: &[&str] = &["file_write", "file_create", "file_delete", "file_move"];
+
+/// 写意图判定+目标路径提取（确定性:写族×path 参数非空）
+pub fn extract_write_path(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    if !WRITE_INTENT_TOOLS.contains(&tool_name) {
+        return None;
+    }
+    args.get("path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// R-4 匹配+格式化纯函数面:路径 token × 条目文本重叠 Top-K 降序
+/// （全序 tie-break 同族口径）。空匹配=空 Vec——写前置无历史=零噪音
+/// 静默跳过（与 failure 回喂的可解释兜底相反,设计使然:写动作不欠解释）。
+pub(crate) fn format_write_advisory(
+    path: &str,
+    catalog: &[MemoryRecord],
+    limit: usize,
+) -> Vec<String> {
+    let path_tokens = tokenize_for_match(path);
+    if path_tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut matched: Vec<(usize, &MemoryRecord)> = Vec::new();
+    for rec in catalog {
+        let text_tokens = tokenize_for_match(&rec.value);
+        let overlap = text_tokens.iter().filter(|t| path_tokens.contains(t)).count();
+        if overlap > 0 {
+            matched.push((overlap, rec));
+        }
+    }
+    matched.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.timestamp.cmp(&a.1.timestamp))
+            .then(a.1.key.cmp(&b.1.key))
+    });
+    matched
+        .into_iter()
+        .take(limit)
+        .map(|(overlap, rec)| {
+            format!(
+                "- {}（相关性命中 {overlap}）:{}",
+                rec.key,
+                rec.value.chars().take(200).collect::<String>()
+            )
+        })
+        .collect()
+}
+
 /// C3: 记忆预算控制器
 #[derive(Debug, Clone)]
 pub struct ContextBudget {
@@ -2047,7 +2101,34 @@ impl MemoryManager {
     /// JSON（草稿为 MemoryEvent JSON——解析失败按原文条目保留,催写面需要）。
     /// 失败=Err(降级通知文案),调用方落 fail-visible 通知。
     pub async fn fetch_notes_catalog(&self) -> Result<Vec<MemoryRecord>, String> {
-        let prefix = format!("shared.{}.notes.", self.namespace);
+        self.fetch_family_catalog("notes").await
+    }
+
+    /// 写前置查询目录（Q2 R-4 内容源）:笔记族+事件族合并——事件族失败
+    /// 静默降级（advisory 非关键面,能拿多少用多少）;两族皆空/笔记族失败
+    /// 且事件族空 → Err（调用方 fail-soft 跳过）。
+    pub async fn fetch_advisory_catalog(&self) -> Result<Vec<MemoryRecord>, String> {
+        let notes = self.fetch_notes_catalog().await;
+        let events = self.fetch_family_catalog("events").await.unwrap_or_default();
+        match notes {
+            Ok(mut n) => {
+                n.extend(events);
+                Ok(n)
+            }
+            Err(e) => {
+                if events.is_empty() {
+                    Err(e)
+                } else {
+                    Ok(events)
+                }
+            }
+        }
+    }
+
+    /// 家族目录直读（账本权威面,绕检索缓存;载荷=MemoryRecord JSON,
+    /// 解析失败保留原始条目——匹配不丢数据）。
+    async fn fetch_family_catalog(&self, family: &str) -> Result<Vec<MemoryRecord>, String> {
+        let prefix = format!("shared.{}.{family}.", self.namespace);
         let facts = self
             .evorule_client
             .get_shared_facts(Some(&prefix))
@@ -5650,6 +5731,44 @@ mod tests {
         let feed_pos = prompt.find("[强制回喂]").expect("feed rendered");
         let todo_pos = prompt.find("待跟进验证").expect("note entry rendered");
         assert!(feed_pos < todo_pos, "事件回喂行先于常驻条目");
+    }
+
+    #[test]
+    fn write_intent_extraction_covers_write_family_only() {
+        let args = serde_json::json!({"path": "src/main.rs"});
+        for t in ["file_write", "file_create", "file_delete", "file_move"] {
+            assert_eq!(
+                extract_write_path(t, &args).as_deref(),
+                Some("src/main.rs"),
+                "写族 {t} 应提取 path"
+            );
+        }
+        // 非写族/缺 path/空白 path → None
+        assert_eq!(extract_write_path("file_read", &args), None);
+        assert_eq!(extract_write_path("file_write", &serde_json::json!({})), None);
+        assert_eq!(
+            extract_write_path("file_write", &serde_json::json!({"path": "   "})),
+            None
+        );
+    }
+
+    #[test]
+    fn write_advisory_matches_and_stays_silent_without_history() {
+        let mk = |k: &str, v: &str, ts: u64| MemoryRecord::new(k, v, ts);
+        let catalog = vec![
+            mk("notes.failure.failure.20261007-001", "main.rs 权限问题,根因:缺执行位", 3),
+            mk("notes.summary.summary.20261006-002", "无关教训:数据库锁竞争", 2),
+            mk("events.e9", "修改 main.rs 的部署脚本时踩过换行符坑", 4),
+        ];
+        let lines = format_write_advisory("src/main.rs", &catalog, 3);
+        assert_eq!(lines.len(), 2, "仅两命中条目: {lines:?}");
+        // 排序:事件条目(ts=4,与 failure 同命中数时更新者在前)——按重叠+时间序
+        assert!(lines.iter().any(|l| l.contains("failure.20261007-001")));
+        assert!(lines.iter().any(|l| l.contains("events.e9")));
+        // 无关路径:零噪音(空 Vec=静默跳过,与 failure 回喂兜底相反,设计使然)
+        assert!(format_write_advisory("docs/other.md", &catalog, 3).is_empty());
+        // limit 生效
+        assert_eq!(format_write_advisory("main.rs", &catalog, 1).len(), 1);
     }
 
     #[tokio::test]
