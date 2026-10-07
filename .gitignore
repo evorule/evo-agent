@@ -17,6 +17,9 @@ target/
 
 # 运行时数据（evorule-server 数据库等）
 data/
+# 例外：src/agent/data/ 是编译期嵌入数据文件（include_str! 资产），须入库
+!src/agent/data/
+!src/agent/data/negation_markers.json
 
 # 内部设计文档（不跟踪 git，仅供本地参考）
 _design_docs/
