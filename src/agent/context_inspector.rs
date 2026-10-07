@@ -18,7 +18,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 机制分区标记(权威源;F-201 R3 哨兵同源共用——新增机制分区须同步)
+/// 机制分区标记(权威源;F-201 哨兵同源共用——新增机制分区须同步;
+/// ## Notes=双通道笔记强制回喂分区,随该机制落成同步在案)
 pub const MECHANISM_SECTION_MARKERS: &[&str] = &[
     "## Stable Facts",
     "## Previous Sessions",
@@ -27,6 +28,7 @@ pub const MECHANISM_SECTION_MARKERS: &[&str] = &[
     "【能力边界声明】",
     "【可用技能清单】",
     "【规范入口索引】",
+    "## Notes",
 ];
 
 /// 禁令词形(确定性词表)
