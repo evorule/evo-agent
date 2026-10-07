@@ -47,6 +47,7 @@
     "skill_pack_to_bundle",
     "handover_write",
     "handover_read",
+    "session_spawn",
     "delegate"
   ],
   "skills": [

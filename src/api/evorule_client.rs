@@ -18,6 +18,18 @@ pub struct EvoruleApiClient {
     core: ApiCore,
 }
 
+/// 单会话元数据（GET /api/sessions/{id} 响应的客户端投影，只取会话链
+/// 因果面所需字段；完整响应含 idle_secs/phase 等运行态字段，按需再扩）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionMetadata {
+    /// 会话 ID
+    pub session_id: String,
+    /// 父会话 ID（派生会话才有；None = 根会话）
+    pub parent_session_id: Option<String>,
+    /// 反应器是否已结束
+    pub is_finished: bool,
+}
+
 impl EvoruleApiClient {
     /// Create new API client.
     /// If `EVORULE_AUTH_TOKEN` env var is set, use it as Bearer token.
@@ -296,6 +308,36 @@ impl EvoruleApiClient {
             .to_string();
 
         Ok(session_id)
+    }
+
+    /// 读单会话元数据（GET /api/sessions/{id}）。
+    ///
+    /// 会话链因果面（自主交接设计）：`parent_session_id` 为 `None` = 根会话；
+    /// 深度上溯链的权威在 server 侧（机制层 Session 持 parent_session_id 链）。
+    pub async fn get_session_metadata(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionMetadata, ApiError> {
+        let url = format!("{}/api/sessions/{}", self.core.base_url(), session_id);
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+
+        let result: Value = resp.json().await.map_err(|_| ApiError::InvalidResponse)?;
+        let sid = result["session_id"]
+            .as_u64()
+            .ok_or(ApiError::InvalidResponse)?
+            .to_string();
+        let parent = result["parent_session_id"].as_u64().map(|p| p.to_string());
+        let is_finished = result["is_finished"].as_bool().unwrap_or(false);
+        Ok(SessionMetadata {
+            session_id: sid,
+            parent_session_id: parent,
+            is_finished,
+        })
     }
 
     /// 向会话提交一条业务指令（POST command）。

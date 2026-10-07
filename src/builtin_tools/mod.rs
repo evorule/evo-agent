@@ -5,7 +5,7 @@
 //! file_move / file_delete / search_files / grep_files / shell_exec /
 //! http_get / git_status / git_diff / git_log / git_stage / git_commit /
 //! read_skill / query_journal / query_trace / read_back / diff_runs /
-//! handover_write / handover_read)
+//! handover_write / handover_read / session_spawn)
 //!
 //! 注:`read_skill`(skills 装配 B2)不在 default_safe_toolkit 静态注册——
 //! 其技能表来自 agent definition 的 skills 声明(声明非空时由 serve_tools::
@@ -183,6 +183,12 @@ pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
     handler.register_static(
         "handover_read",
         Arc::new(crate::agent::handover_tool::HandoverReadTool::unwired()),
+    );
+    // 自主开会话工具（自主交接设计 PR-H3）：同上占位/会话期重绑形态；
+    // 重绑时注入链共享态与子 runner 工厂（护栏三件+fork+自动驱动在执行体内）
+    handler.register_static(
+        crate::agent::session_spawn_tool::SESSION_SPAWN_TOOL,
+        Arc::new(crate::agent::session_spawn_tool::SessionSpawnTool::unwired()),
     );
     handler
 }
@@ -635,6 +641,20 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     .to_string(),
                 required: false,
             }],
+        },
+        ToolSpec {
+            name: "session_spawn".to_string(),
+            description: "Spawn a CHILD continuation session that keeps working on this task \
+                          chain after this session stops. Write the handover document first \
+                          (handover_write), then call this tool: the child is forked from the \
+                          current session (full causal chain recorded), auto-starts with a \
+                          self-check goal that reads the latest handover, and continues through \
+                          todo_next. Chain guards apply (max depth, cumulative token budget, \
+                          circuit breaker) and a rejected spawn states the reason. After a \
+                          successful spawn, close THIS session with a summary — do not keep \
+                          both sessions working on the same task."
+                .to_string(),
+            parameters: vec![],
         },
         ToolSpec {
             name: "query_journal".to_string(),

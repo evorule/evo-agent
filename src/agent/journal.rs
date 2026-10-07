@@ -276,6 +276,26 @@ pub enum JournalEvent {
         /// schema 校验结果(写侧 fail-visible 拒写,应恒 true;保留字段容错)
         schema_ok: bool,
     },
+    /// 子会话派生落账(自主交接设计 PR-H3):session_spawn 成功 fork 出子会话
+    /// 后落账。server 侧 parent_session_id 链入账为机制层权威,本事件为应用
+    /// 层派生锚——链对账/深度审计/派生时序取证消费。
+    SessionSpawned {
+        /// 父会话 ID(spawn 发起方)
+        parent: String,
+        /// 子会话 ID(fork 产物)
+        child: String,
+        /// 子会话链深度(根=0;深度硬顶护栏的审计面)
+        depth: u32,
+    },
+    /// 会话链熔断落账(自主交接设计 §3.4 护栏三件):新会话连续失败熔断或
+    /// spawn 同签名重复触发停链后落账。reason 为确定性判据描述(轮数/签名
+    /// 计数),停链后链上后续 spawn 预检拒绝(可查)。
+    ChainHalted {
+        /// 停链事件所在会话 ID
+        session: String,
+        /// 熔断判据(确定性:轮数/同签名计数/预算/深度)
+        reason: String,
+    },
 }
 
 /// 单行 journal 记录(读侧重放消费形态)
@@ -364,6 +384,8 @@ struct JournalInner {
     last_seq: u64,
     turn_count: u64,
     turn_open: bool,
+    /// 会话 ID(open 时登记;turn 守卫链熔断落账需要会话锚,免透传)
+    session_id: String,
 }
 
 /// journal 写入器(廉价 Clone,内部 Arc+Mutex;每会话一个实例)
@@ -442,10 +464,20 @@ impl JournalWriter {
                 last_seq,
                 turn_count,
                 turn_open: false,
+                session_id: session_id.to_string(),
             })),
             registry_key,
             file_path: path,
         })
+    }
+
+    /// 本写者对应的会话 ID(open 时登记)
+    pub fn session_id(&self) -> String {
+        self.core
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .session_id
+            .clone()
     }
 
     /// 读取全量 journal 行(会话收尾投影消费;与写者并存只读句柄)。
@@ -509,6 +541,7 @@ impl JournalWriter {
         Ok(TurnEndGuard {
             writer: self.clone(),
             turn_seq,
+            chain_watch: None,
         })
     }
 
@@ -781,6 +814,30 @@ impl JournalWriter {
         })
     }
 
+    /// 子会话派生落账(自主交接设计 PR-H3):session_spawn 成功 fork 后由
+    /// runner 侧按工具名分支调用(best-effort,与 handover_written 同风格)。
+    pub fn session_spawned(
+        &self,
+        parent: &str,
+        child: &str,
+        depth: u32,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::SessionSpawned {
+            parent: parent.to_string(),
+            child: child.to_string(),
+            depth,
+        })
+    }
+
+    /// 会话链熔断落账(自主交接设计 §3.4):连续失败熔断/spawn 同签名重复
+    /// 停链后落账(turn 守卫与 spawn 执行体两个触发源,自带会话锚)。
+    pub fn chain_halted(&self, session: &str, reason: &str) -> Result<u64, JournalError> {
+        self.push(JournalEvent::ChainHalted {
+            session: session.to_string(),
+            reason: reason.to_string(),
+        })
+    }
+
     pub fn policy_judged(&self, verdict: &str, evidence: &str) -> Result<u64, JournalError> {
         let evidence = evidence.to_string();
         self.push_with(|seq| JournalEvent::PolicyJudged {
@@ -855,6 +912,10 @@ pub struct TurnEndGuard {
     writer: JournalWriter,
     /// 本 guard 对应的轮序号(begin_turn 时分配,与 turn_started.turn_seq 一致)
     turn_seq: u64,
+    /// 会话链熔断观察(自主交接设计 §3.4 护栏三件;None = 非链成员会话,零开销)。
+    /// 显式 end 时观察轮结局;连续失败达阈值 → 共享链态置停链标记 + 本 journal
+    /// 落 chain_halted(链上后续 spawn 预检拒绝,停链可查)。
+    chain_watch: Option<crate::agent::session_spawn_tool::ChainWatch>,
 }
 
 impl TurnEndGuard {
@@ -863,9 +924,27 @@ impl TurnEndGuard {
         self.turn_seq
     }
 
+    /// 挂接会话链熔断观察(自主交接批;clone_for_spawn 构造的子会话 runner
+    /// 在 turn_guard 建立时挂入,链外会话不挂)
+    pub(crate) fn attach_chain_watch(
+        &mut self,
+        watch: crate::agent::session_spawn_tool::ChainWatch,
+    ) {
+        self.chain_watch = Some(watch);
+    }
+
     /// 显式收尾(消费守卫;此后 drop 不再补写)
-    pub fn end(self, status: &str, steps: u64, duration_ms: u64) {
+    pub fn end(mut self, status: &str, steps: u64, duration_ms: u64) {
         let _ = self.writer.end_turn(status, steps, duration_ms);
+        // take() 而非 move 字段:TurnEndGuard 实现 Drop,整体消费路径上
+        // 不可部分移出字段(E0509);take 后 drop 兜底路径不受影响
+        if let Some(mut watch) = self.chain_watch.take() {
+            if let Some(reason) = watch.observe(self.turn_seq, status) {
+                if let Err(e) = self.writer.chain_halted(&self.writer.session_id(), &reason) {
+                    tracing::warn!(error = %e, "chain_halted journal append failed");
+                }
+            }
+        }
     }
 }
 

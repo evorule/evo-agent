@@ -13,7 +13,7 @@
 //! 1. 无 manifest 拒绝注册：[`crate::io_handlers::tool_handler::ToolHandler::register`]
 //!    接收 `(manifest, handler)`；按名查不到静态条目且非动态源（服务代理/MCP）
 //!    的注册在启动期 panic（fail-fast）。
-//! 2. 静态层锁定：内置 22 + 规则 49 + delegate 1 + memory 4 的 manifest 为
+//! 2. 静态层锁定：内置 23 + 规则 49 + delegate 1 + memory 4 的 manifest 为
 //!    静态表（[`static_manifests`]）；测试断言数量、名称无重叠、spec 可解析、
 //!    派生视图与旧表快照一致——「union 42 vs 41」类注释漂移机制上不可能再现。
 //! 3. 动态层注册期补全：服务代理与 MCP 在注册期必须产出 spec
@@ -28,7 +28,7 @@
 //! - [`AdjudicationClass::Sentineled`]：P2 事前意图裁决 + 规则正本 enforce 已在场
 //!   （file_create/file_move/file_delete/file_write 的 out_of_sandbox enforce）；
 //! - [`AdjudicationClass::Sensitive`]：P2 事前意图裁决在通道（意图必报，暂无
-//!   enforce——git 写族 2 + 规则治理写族 19 + delegate 1）；
+//!   enforce——git 写族 2 + 规则治理写族 19 + delegate 1 + session_spawn 1）；
 //! - [`AdjudicationClass::Standard`]：不走 P2 裁决（机制层治理或纯落链）。
 //!   `is_governance_adjudication_tool` 改由 manifest 派生后，命中集合恰等于
 //!   原 GOVERNANCE_ADJUDICATION_TOOLS 24 表；delegate 统一装配批兑现模块
@@ -37,7 +37,8 @@
 //!   变化不增减条目数）。D1 兑现批（2026-10-07）：file_write 升 Sentineled
 //!   派生集合演进为 26 条（快照重录 diff 审；数量锁 74 不变）。
 //!   file_write 的意图信号与 M5-c R1 通道（pending_target_scope，机制层
-//!   由实现持有）并存互不干扰。
+//!   由实现持有）并存互不干扰。自主交接 PR-H3 批（2026-10-07）：session_spawn
+//!   落地 Sensitive（双闸叠加），派生集合演进为 27 条（数量锁 76→77）。
 //!
 //! **D6 终态（2026-10-06，B1 收官批）——P2 派生集合语义扩展**：从纯静态表
 //! 扩展为「静态表 ∪ 动态注册条目（class≠Standard）」，判定 =
@@ -363,7 +364,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（22 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（23 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -408,6 +409,11 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // default_switch 段）。spec 常驻 default_tool_specs（Builtin 源）。
         b("handover_write", vec![Memory]),
         b("handover_read", vec![Memory]),
+        // 自主开会话（自主交接设计 PR-H3）：子会话派生（fork，因果链权威在
+        // server 侧 parent 链）+ 首轮 goal 自动驱动。占位执行体启动期注册
+        // （default_safe_toolkit），runner 会话期接线重绑（handover 双工具
+        // 同款）。能力域=Delegate（语义最近：创建执行上下文）。
+        b("session_spawn", vec![CapDomain::Delegate]),
     ]
     .into_iter()
     .map(|mut m| {
@@ -433,6 +439,14 @@ fn builtin_manifests() -> Vec<ToolManifest> {
                 m.adjudication_class = AdjudicationClass::Sensitive;
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
+            // session_spawn（自主交接设计 PR-H3）：双闸叠加——Sensitive（P2
+            // 事前意图裁决：自主开会话意图必报）+ ManualDefault（candidate
+            // 审批模式首调出 needs_approval 提案）。职责不同非冗余：前者
+            // 治理意图留痕，后者给人工面默认否决点（自主交接设计 §四）
+            "session_spawn" => {
+                m.adjudication_class = AdjudicationClass::Sensitive;
+                m.approval_policy = ApprovalPolicy::ManualDefault;
+            }
             // 命令/网络 candidate 族：分类器判入 candidate 即出 needs_approval
             // 提案（PR-4 起经管道⑤评估臂单源），如实补标 ManualDefault
             // （此前默认 AutoPolicy 属盘点遗漏，行为等价修正）
@@ -451,9 +465,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             "grep_files" => sw(SWITCH_GREP, true),
             "git_status" | "git_diff" | "git_log" => sw(SWITCH_GIT_READ, true),
             "git_stage" | "git_commit" => sw(SWITCH_GIT_WRITE, false),
-            // 自主交接族：单键同绑同开同关（交接设计 §四；session_spawn 落地
-            // 时第三行同键接入）
-            "handover_write" | "handover_read" => sw(SWITCH_HANDOVER, true),
+            // 自主交接族：单键同绑同开同关（自主交接设计 §四；PR-H3 起
+            // session_spawn 第三行同键接入）
+            "handover_write" | "handover_read" | "session_spawn" => sw(SWITCH_HANDOVER, true),
             _ => None,
         };
         m
@@ -622,7 +636,7 @@ fn memory_manifests() -> Vec<ToolManifest> {
     ]
 }
 
-/// 全部静态 manifest（71 条；测试锁数量/唯一名/双侧集合相等）
+/// 全部静态 manifest（77 条；测试锁数量/唯一名/双侧集合相等）
 ///
 /// C1 性能收口（PR-3 顺手）：静态表在首次访问后经 OnceLock 缓存——
 /// 构造函数为纯函数（无常量/无环境依赖），行为零变化（调用面拿到的
@@ -740,12 +754,13 @@ mod tests {
 
     #[test]
     fn test_static_manifest_count_locked() {
-        // 内置 22 + 规则 49 + delegate 1 + memory 4 = 76
+        // 内置 23 + 规则 49 + delegate 1 + memory 4 = 77
         // （PR-11a 查账工具族 +4：16→20；PR-11b why/order 三工具 +3：
-        //   规则 46→49；自主交接双工具 +2：内置 20→22，数量锁 74→76）
-        assert_eq!(builtin_manifests().len(), 22);
+        //   规则 46→49；自主交接双工具 +2：内置 20→22，数量锁 74→76；
+        //   自主交接 PR-H3 session_spawn +1：内置 22→23，数量锁 76→77）
+        assert_eq!(builtin_manifests().len(), 23);
         assert_eq!(rule_manifests().len(), 49);
-        assert_eq!(all().len(), 76);
+        assert_eq!(all().len(), 77);
     }
 
     #[test]
@@ -858,7 +873,8 @@ mod tests {
     /// 快照在此固化防漂移）；delegate 统一装配批 delegate 升 Sensitive 后
     /// 演进为 25 条（delegate 加入治理裁决集——快照重录须 diff 审，数量锁
     /// 不变，级别变化不增减条目数）。D1 兑现批 file_write 升 Sentineled
-    /// 后演进为 26 条（同款 diff 审纪律）。
+    /// 后演进为 26 条（同款 diff 审纪律）。自主交接 PR-H3 批 session_spawn
+    /// 落地 Sensitive（双闸叠加），演进为 27 条（数量锁 76→77）。
     const GOVERNANCE_SNAPSHOT: &[&str] = &[
         "file_create",
         "file_move",
@@ -886,6 +902,7 @@ mod tests {
         "bundle_import_dry_run",
         "bundle_import",
         "delegate",
+        "session_spawn",
     ];
 
     #[test]
@@ -965,9 +982,11 @@ mod tests {
         ("bundle_export", "agentTools.governanceWrite", true),
         ("bundle_import_dry_run", "agentTools.governanceWrite", true),
         ("bundle_import", "agentTools.governanceWrite", true),
-        // 自主交接族（自主交接设计 PR-H2）：单键同绑
+        // 自主交接族（自主交接设计 PR-H2）：单键同绑；PR-H3 起 session_spawn
+        // 第三行同键
         ("handover_write", "agentTools.handover", true),
         ("handover_read", "agentTools.handover", true),
+        ("session_spawn", "agentTools.handover", true),
     ];
 
     #[test]

@@ -31,6 +31,7 @@ pub mod replan;
 pub mod runner;
 pub mod safety_auditor;
 pub mod sediment;
+pub mod session_spawn_tool;
 pub mod skill_store;
 pub mod skills_mirror;
 pub mod stagnation;
