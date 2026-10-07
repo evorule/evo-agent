@@ -5,10 +5,10 @@
 //!
 //! 判定代码已收编至 [`evorule-constitution`] 共享组件（0.2.0：schema 编译期
 //! 内嵌 + `Policy` 双模式降级策略，缺省 Strict）。属地执法义务要求判定代码
-//! 必须是组件、禁止复制第二份——本模块自此只是**接入层**：
-//! - workflow_dag 三版本分派（按文档形态分派，见 [`detect_workflow_dag_version`]）
+//! 必须**是**组件、禁止复制第二份——本模块自此只是**接入层**：
+//! - workflow_dag 四版本分派（按文档形态分派，见 [`detect_workflow_dag_version`]）
 //! - 校验结果形态转换（组件 `Violation` → 本仓 `Vec<String>`）
-//! - 统一加载入口 [`load_workflow`]（schema 校验 → v1.2 物化 / v1.0-v1.1 反序列化）
+//! - 统一加载入口 [`load_workflow`]（schema 校验 → v1.2/v1.3 物化 / v1.0-v1.1 反序列化）
 //!
 //! 组件以内嵌 schema + 缺省 Strict 运行：v1.x schema 编译期随组件携带，
 //! 部署/CI 零磁盘依赖，「宪法仓不可得」的整类环境缺陷不再存在；未知
@@ -36,15 +36,52 @@ pub fn validate_agent_def(body: &serde_json::Value) -> Result<(), Vec<String>> {
     validate_kind_version("agent_def", "v1.0", body)
 }
 
+/// workflow_dag v1.3 新增的 24 个 compute 函数（bare body 能力探测名单；
+/// v1.2 三函数 strcmp/numeric_cmp/regex_match 不在名单内——探测到即 v1.2）
+const COMPUTE_FUNCTIONS_V13: &[&str] = &[
+    // 算术
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "abs",
+    "min",
+    "max",
+    // 字符串
+    "concat",
+    "length",
+    "upper",
+    "lower",
+    "trim",
+    "replace",
+    "split_at",
+    "substr",
+    "join",
+    // 日期
+    "epoch_to_date",
+    "date_diff_days",
+    "epoch_add_days",
+    // 逻辑
+    "and",
+    "or",
+    "not",
+    "if_else",
+    "clamp",
+];
+
 /// 判定 workflow_dag 裸文档应按哪个版本校验（并存窗口）
 ///
 /// 分派规则（确定性：同输入必同分派）：
-/// 1. body 显式携带 `$schema` 字段 → 按声明分派（v1.2/v1.1，其余按 v1.0）
+/// 1. body 显式携带 `$schema` 字段 → 按声明分派（v1.3/v1.2/v1.1，其余按 v1.0）
 /// 2. 裸 body（运行时形态，无 `$schema`）→ 能力探测（有序）：
+///    任一节点 compute.function ∈ v1.3 名单 → v1.3（v1.3 相对 v1.2 的增量特征）；
 ///    顶层 `loops` 非空或任一节点含 `compute` → v1.2（v1.2 相对 v1.1 的增量特征）；
 ///    任一节点含 `run_when` → v1.1（v1.1 相对 v1.0 的唯一增量）；否则 v1.0
 fn detect_workflow_dag_version(body: &serde_json::Value) -> &'static str {
     if let Some(url) = body.get("$schema").and_then(|v| v.as_str()) {
+        if url.ends_with("/workflow_dag/v1.3.json") {
+            return "v1.3";
+        }
         if url.ends_with("/workflow_dag/v1.2.json") {
             return "v1.2";
         }
@@ -55,6 +92,17 @@ fn detect_workflow_dag_version(body: &serde_json::Value) -> &'static str {
         };
     }
     let nodes = body.get("nodes").and_then(|v| v.as_array());
+    let uses_v13 = nodes.is_some_and(|nodes| {
+        nodes.iter().any(|n| {
+            n.get("compute")
+                .and_then(|c| c.get("function"))
+                .and_then(|f| f.as_str())
+                .is_some_and(|f| COMPUTE_FUNCTIONS_V13.contains(&f))
+        })
+    });
+    if uses_v13 {
+        return "v1.3";
+    }
     let uses_v12 = body
         .get("loops")
         .and_then(|v| v.as_array())
@@ -71,18 +119,18 @@ fn detect_workflow_dag_version(body: &serde_json::Value) -> &'static str {
 
 /// 用 workflow_dag 校验裸文档（无壳 body）。
 ///
-/// 按 [`detect_workflow_dag_version`] 分派 v1.0/v1.1/v1.2 校验器（三版本并存窗口）。
+/// 按 [`detect_workflow_dag_version`] 分派 v1.0/v1.1/v1.2/v1.3 校验器（四版本并存窗口）。
 ///
-/// **v1.2 物化门**（原防呆拒载门，引擎 loop/compute 能力落地后翻转）：
-/// v1.2 文档通过 schema 校验后还须通过物化器 [`materializer::materialize_workflow_dag`]
+/// **v1.2/v1.3 物化门**（原防呆拒载门，引擎 loop/compute 能力落地后翻转）：
+/// v1.2/v1.3 文档通过 schema 校验后还须通过物化器 [`materializer::materialize_workflow_dag`]
 /// 的静态展开自检（引用文法 R1–R4、冻结限额、展开后 DAG 合法性）——
-/// `serde_json::from_value` 会静默忽略 `loops` 字段，物化门保证 v1.2 增量
+/// `serde_json::from_value` 会静默忽略 `loops` 字段，物化门保证 v1.2/v1.3 增量
 /// 语义被真正消费而非静默丢弃。
 pub fn validate_workflow_dag(body: &serde_json::Value) -> Result<(), Vec<String>> {
     let version = detect_workflow_dag_version(body);
     validate_kind_version("workflow_dag", version, body)?;
-    if version == "v1.2" {
-        // schema 已过；物化成功 = v1.2 增量语义可被完整消费
+    if version == "v1.2" || version == "v1.3" {
+        // schema 已过；物化成功 = v1.2/v1.3 增量语义可被完整消费
         materializer::materialize_workflow_dag(body).map(|_| ())
     } else {
         Ok(())
@@ -91,15 +139,15 @@ pub fn validate_workflow_dag(body: &serde_json::Value) -> Result<(), Vec<String>
 
 /// 校验并加载 workflow_dag 裸文档为可执行 [`Workflow`]。
 ///
-/// 统一入口（v1.0/v1.1/v1.2 三版本并存）：
+/// 统一入口（v1.0/v1.1/v1.2/v1.3 四版本并存）：
 /// - schema 校验（宪法内嵌 Strict）→ 失败即 Err
-/// - v1.2 → 物化器静态展开（loop 展开为线性副本链 + compute 节点就位）
+/// - v1.2/v1.3 → 物化器静态展开（loop 展开为线性副本链 + compute 节点就位）
 /// - v1.0/v1.1 → 直接反序列化
 pub fn load_workflow(body: &serde_json::Value) -> Result<Workflow, Vec<String>> {
     let version = detect_workflow_dag_version(body);
     validate_kind_version("workflow_dag", version, body)?;
     match version {
-        "v1.2" => materializer::materialize_workflow_dag(body),
+        "v1.2" | "v1.3" => materializer::materialize_workflow_dag(body),
         _ => serde_json::from_value(body.clone())
             .map_err(|e| vec![format!("workflow_dag {version} 文档反序列化失败: {e}")]),
     }
@@ -349,5 +397,70 @@ mod tests {
             "output_node": "b"
         });
         assert!(validate_workflow_dag(&v11).is_ok());
+    }
+
+    // ----- workflow_dag v1.3 四版本分派 + 物化门 -----
+
+    #[test]
+    fn test_detect_workflow_dag_v13() {
+        // 显式 $schema 按声明分派
+        let explicit_v13 = serde_json::json!({
+            "$schema": "https://evorule.org/schemas/workflow_dag/v1.3.json",
+            "workflow_id": "w", "nodes": [], "output_node": "x"
+        });
+        assert_eq!(detect_workflow_dag_version(&explicit_v13), "v1.3");
+        // 裸 body：任一节点 compute.function ∈ v1.3 名单 → v1.3（探测有序，优先于 v1.2 特征）
+        let bare_v13 = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [
+                {"id": "c", "compute": {"function": "add", "inputs": ["a", "a"]}},
+                {"id": "d", "compute": {"function": "strcmp", "inputs": ["c", "c"], "mode": "equal"}}
+            ],
+            "output_node": "d"
+        });
+        assert_eq!(detect_workflow_dag_version(&bare_v13), "v1.3");
+    }
+
+    #[test]
+    fn test_validate_workflow_v13_materializes_and_loads() {
+        // v1.3 物化门：schema + 物化双门通过即放行；bare body 能力探测分派 v1.3
+        let doc = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [
+                {"id": "a", "agent_type": "researcher", "task": "t"},
+                {"id": "sum", "depends_on": ["a"],
+                 "compute": {"function": "add", "inputs": ["a", "a"]}},
+                {"id": "out", "agent_type": "writer", "task_template": "v={sum}",
+                 "depends_on": ["sum"]}
+            ],
+            "output_node": "out"
+        });
+        assert_eq!(detect_workflow_dag_version(&doc), "v1.3");
+        assert!(validate_workflow_dag(&doc).is_ok(), "v1.3 双门后必须放行");
+        let wf = load_workflow(&doc).expect("v1.3 must materialize");
+        assert_eq!(wf.nodes.len(), 3);
+        // 回归：v1.2 函数（strcmp）在裸 body 下仍分派 v1.2
+        let v12_doc = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [
+                {"id": "c", "compute": {"function": "strcmp", "inputs": ["a", "a"], "mode": "equal"}}
+            ],
+            "output_node": "c"
+        });
+        assert_eq!(detect_workflow_dag_version(&v12_doc), "v1.2");
+    }
+
+    #[test]
+    fn test_validate_workflow_v13_schema_rejects_unknown_function() {
+        // v1.3 目录外函数被 schema 拒绝（目录封闭：新增 = 新版本 + 治理评审）
+        let bad = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [
+                {"id": "c", "compute": {"function": "pow", "inputs": ["a", "a"]}}
+            ],
+            "output_node": "c"
+        });
+        let errs = validate_workflow_dag(&bad).expect_err("unknown function must reject");
+        assert!(!errs.is_empty(), "应报 schema 违规: {errs:?}");
     }
 }
