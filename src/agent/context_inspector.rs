@@ -151,16 +151,14 @@ pub fn parse_adjudication_response(content: &str) -> I2Verdict {
     } else {
         trimmed
     };
-    let parsed: Option<serde_json::Value> = serde_json::from_str(stripped)
-        .ok()
-        .or_else(|| {
-            // 容忍前后杂文:取首个 '{' 到末个 '}' 的窗口重试
-            let (a, b) = (stripped.find('{'), stripped.rfind('}'));
-            match (a, b) {
-                (Some(a), Some(b)) if a < b => serde_json::from_str(&stripped[a..=b]).ok(),
-                _ => None,
-            }
-        });
+    let parsed: Option<serde_json::Value> = serde_json::from_str(stripped).ok().or_else(|| {
+        // 容忍前后杂文:取首个 '{' 到末个 '}' 的窗口重试
+        let (a, b) = (stripped.find('{'), stripped.rfind('}'));
+        match (a, b) {
+            (Some(a), Some(b)) if a < b => serde_json::from_str(&stripped[a..=b]).ok(),
+            _ => None,
+        }
+    });
     let verdict = parsed
         .as_ref()
         .and_then(|v| v.get("verdict"))
@@ -193,7 +191,9 @@ pub async fn adjudicate_candidates<F, Fut>(
 ) -> Vec<I2ConflictRecord>
 where
     F: FnMut(&I2ConflictRecord) -> Fut,
-    Fut: std::future::Future<Output = Result<(String, Option<crate::agent::journal::TokenRecord>), String>>,
+    Fut: std::future::Future<
+        Output = Result<(String, Option<crate::agent::journal::TokenRecord>), String>,
+    >,
 {
     for rec in conflicts.iter_mut() {
         let key = adjudication_cache_key(rec);
@@ -458,7 +458,10 @@ mod tests {
         let noisy = "结论如下:{\"verdict\":\"contradiction\",\"rationale\":\"真矛盾\"} 以上。";
         assert_eq!(parse_adjudication_response(noisy).verdict, "contradiction");
         // 非法 JSON/越值 verdict→uncertain
-        assert_eq!(parse_adjudication_response("完全不是 JSON").verdict, "uncertain");
+        assert_eq!(
+            parse_adjudication_response("完全不是 JSON").verdict,
+            "uncertain"
+        );
         assert_eq!(
             parse_adjudication_response("{\"verdict\":\"maybe\",\"rationale\":\"x\"}").verdict,
             "uncertain"
@@ -508,7 +511,8 @@ mod tests {
     #[tokio::test]
     async fn adjudicate_cache_hit_and_failsoft() {
         use std::sync::Mutex as SM;
-        let cache: SM<std::collections::HashMap<String, I2Verdict>> = SM::new(std::collections::HashMap::new());
+        let cache: SM<std::collections::HashMap<String, I2Verdict>> =
+            SM::new(std::collections::HashMap::new());
         // 计数 fetch:成功返回 benign JSON
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_c = calls.clone();
@@ -518,7 +522,11 @@ mod tests {
                 c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok::<(String, Option<crate::agent::journal::TokenRecord>), String>((
                     "{\"verdict\":\"benign\",\"rationale\":\"辖域限定,非矛盾\"}".to_string(),
-                    Some(crate::agent::journal::TokenRecord { prompt: 10, completion: 5, total: 15 }),
+                    Some(crate::agent::journal::TokenRecord {
+                        prompt: 10,
+                        completion: 5,
+                        total: 15,
+                    }),
                 ))
             }
         };
@@ -528,18 +536,33 @@ mod tests {
         assert_eq!(out[0].semantic_verdict.as_ref().unwrap().verdict, "benign");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         // 同候选再跑:缓存命中,fetch 零新增调用
-        let out2 = adjudicate_candidates(vec![sample_record()], &cache, "m", &mut fetch, None).await;
+        let out2 =
+            adjudicate_candidates(vec![sample_record()], &cache, "m", &mut fetch, None).await;
         assert_eq!(out2[0].semantic_verdict.as_ref().unwrap().verdict, "benign");
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "缓存命中零新增调用");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "缓存命中零新增调用"
+        );
         // 失败路径:Err→uncertain 兜底(fail-soft)
-        let mut fetch_err = |_rec: &I2ConflictRecord| {
-            async move { Err::<(String, Option<crate::agent::journal::TokenRecord>), String>("sidecar down".to_string()) }
+        let mut fetch_err = |_rec: &I2ConflictRecord| async move {
+            Err::<(String, Option<crate::agent::journal::TokenRecord>), String>(
+                "sidecar down".to_string(),
+            )
         };
         let mut other = sample_record();
         other.token = "another_tool".to_string();
         let out3 = adjudicate_candidates(vec![other], &cache, "m", &mut fetch_err, None).await;
-        assert_eq!(out3[0].semantic_verdict.as_ref().unwrap().verdict, "uncertain");
-        assert!(out3[0].semantic_verdict.as_ref().unwrap().rationale.contains("sidecar down"));
+        assert_eq!(
+            out3[0].semantic_verdict.as_ref().unwrap().verdict,
+            "uncertain"
+        );
+        assert!(out3[0]
+            .semantic_verdict
+            .as_ref()
+            .unwrap()
+            .rationale
+            .contains("sidecar down"));
     }
 
     #[tokio::test]
@@ -551,17 +574,30 @@ mod tests {
         let w = JournalWriter::open(dir.path(), "s-i2").unwrap();
         let cache: std::sync::Mutex<std::collections::HashMap<String, I2Verdict>> =
             std::sync::Mutex::new(std::collections::HashMap::new());
-        let mut fetch = |_rec: &I2ConflictRecord| {
-            async move {
-                Ok::<(String, Option<TokenRecord>), String>((
-                    "{\"verdict\":\"contradiction\",\"rationale\":\"真矛盾\"}".to_string(),
-                    Some(TokenRecord { prompt: 10, completion: 5, total: 15 }),
-                ))
-            }
+        let mut fetch = |_rec: &I2ConflictRecord| async move {
+            Ok::<(String, Option<TokenRecord>), String>((
+                "{\"verdict\":\"contradiction\",\"rationale\":\"真矛盾\"}".to_string(),
+                Some(TokenRecord {
+                    prompt: 10,
+                    completion: 5,
+                    total: 15,
+                }),
+            ))
         };
-        let out = adjudicate_candidates(vec![sample_record()], &cache, "test-model", &mut fetch, Some(&w)).await;
-        assert_eq!(out[0].semantic_verdict.as_ref().unwrap().verdict, "contradiction");
-        let lines = crate::agent::journal::read_all(&JournalWriter::path_for(dir.path(), "s-i2")).unwrap();
+        let out = adjudicate_candidates(
+            vec![sample_record()],
+            &cache,
+            "test-model",
+            &mut fetch,
+            Some(&w),
+        )
+        .await;
+        assert_eq!(
+            out[0].semantic_verdict.as_ref().unwrap().verdict,
+            "contradiction"
+        );
+        let lines =
+            crate::agent::journal::read_all(&JournalWriter::path_for(dir.path(), "s-i2")).unwrap();
         assert_eq!(lines.len(), 1, "恰一笔 sidecar 账");
         let ok = matches!(
             &lines[0].event,
