@@ -65,12 +65,8 @@ pub const TIMEOUT_SECS: u64 = 30;
 /// 出厂默认排除集(始终叠加;与 watcher 排除目录对齐)
 /// 注:不含 `data/` —— 该名字与源码子目录(如 src/agent/data)冲突,
 /// 名字级剪枝会误杀已入库文件;大 data 目录由调用方显式传 excludeGlobs。
-pub const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
-    ".git/**",
-    "target/**",
-    "node_modules/**",
-    ".evo-trash/**",
-];
+pub const DEFAULT_EXCLUDE_GLOBS: &[&str] =
+    &[".git/**", "target/**", "node_modules/**", ".evo-trash/**"];
 
 /// 搜索参数(REST body 与 agent 工具 args 共用一形;camelCase/snake_case 双认)
 #[derive(Debug, Clone)]
