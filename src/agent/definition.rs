@@ -576,7 +576,18 @@ fn is_max_parallel_tools_default(v: &usize) -> bool {
     *v == 1
 }
 
+/// 宪法规则集版本(审查结论账面口径;文本面 R3-R5 + 配置面 R6-R9 为第二版
+/// 规则集,初版三规则=第一版)。SessionCreated.constitution 落 "pass@<版本>"
+/// ——运行期到达该事件的定义必为过审定义(违反在加载期 fail-fast,会话
+/// 不会建立)。
+pub const CONSTITUTION_RULESET_VERSION: &str = "2";
+
 impl AgentDefinition {
+    /// 审查结论账面值(过审凭据;"pass@" + 规则集版本)
+    pub fn constitution_pass_mark() -> String {
+        format!("pass@{CONSTITUTION_RULESET_VERSION}")
+    }
+
     /// agent_type 标识符白名单:`[A-Za-z0-9_-]+`
     ///
     /// 门卫(P2-M7 前置补丁,2026-08-27):workflow JSON 等外部输入会以
@@ -729,7 +740,122 @@ impl AgentDefinition {
                 )));
             }
         }
+        // R4/R5:身份资产段与北极星锚同族审查——同为定义声明文本(无缺省合成,
+        // 声明即生效),机制分区标题只允许机制写入,定义文本不得伪造。
+        // 文本面规则只挂文件口(与 R3 同分工:机制注入先于运行时构造,运行时
+        // 复查会误判注入段)
+        if let Some(seg) = &self.identity_segment {
+            for s in crate::agent::context_inspector::MECHANISM_SECTION_MARKERS {
+                if seg.contains(s) {
+                    return Err(AgentDefinitionError::InvalidDefinition(format!(
+                        "[R4 identity sentinel] identity_segment must not contain mechanism sentinel phrase '{}'",
+                        s
+                    )));
+                }
+            }
+        }
+        if let Some(star) = &self.north_star {
+            for s in crate::agent::context_inspector::MECHANISM_SECTION_MARKERS {
+                if star.contains(s) {
+                    return Err(AgentDefinitionError::InvalidDefinition(format!(
+                        "[R5 north-star sentinel] north_star must not contain mechanism sentinel phrase '{}'",
+                        s
+                    )));
+                }
+            }
+        }
         self.validate_assembly_binding()
+    }
+
+    /// R6-R9 配置面审查(工具名单形态/记忆配置形态/自省工具矛盾前置)。
+    ///
+    /// 配置面无机制注入冲突(批次 D 误判教训只涉 system_prompt 文本面),
+    /// 文件口与运行时口双查共享本判定(判定代码单一事实源):
+    /// - 文件口:validate_constitution(加载期拦,错误早于部署);
+    /// - 运行时口:validate_assembly_binding(from_definition 直构路径兜底)。
+    fn validate_memory_and_tools(&self) -> Result<(), AgentDefinitionError> {
+        // R6:工具名单形态——trim 后非空/不含空白/全表去重(重复声明=静默无效
+        // 声明,显性化;保留判定与注册面解耦——存在性归运行时注册检查)
+        let mut seen = std::collections::HashSet::new();
+        for t in &self.tools {
+            if t.trim().is_empty() {
+                return Err(AgentDefinitionError::InvalidDefinition(
+                    "[R6 tool-list] tool name must not be empty or whitespace-only".to_string(),
+                ));
+            }
+            if t.chars().any(|c| c.is_whitespace()) {
+                return Err(AgentDefinitionError::InvalidDefinition(format!(
+                    "[R6 tool-list] tool name '{}' must not contain whitespace",
+                    t
+                )));
+            }
+            if !seen.insert(t.as_str()) {
+                return Err(AgentDefinitionError::InvalidDefinition(format!(
+                    "[R6 tool-list] duplicate tool name '{}'",
+                    t
+                )));
+            }
+        }
+        // R6 续:记忆自省/笔记工具声明×记忆未启用 配置矛盾前置(运行时
+        // register_memory_introspection_tools 同判——加载期拒绝更早更清晰)
+        let memory_off = self.memory.memory_type.is_empty() || self.memory.memory_type == "none";
+        if memory_off {
+            if let Some(t) = self
+                .tools
+                .iter()
+                .find(|t| crate::agent::memory_tool::is_registered_memory_tool(t))
+            {
+                return Err(AgentDefinitionError::InvalidDefinition(format!(
+                    "[R6 tool-memory] tool '{}' declared but memory is disabled (requires memory.type=persistent)",
+                    t
+                )));
+            }
+        }
+        // R7:记忆类型枚举(空串=未声明同 none;判定与运行时装配同源语义)
+        let mt = self.memory.memory_type.as_str();
+        if !mt.is_empty() && mt != "none" && mt != "persistent" {
+            return Err(AgentDefinitionError::InvalidDefinition(format!(
+                "[R7 memory-type] unsupported memory.type '{}' (allowed: none|persistent)",
+                mt
+            )));
+        }
+        // R8:记忆域形态——仅在记忆启用时有意义(未启用时空域合法:字段不被
+        // 消费,存量定义存在此形态,强约束会误伤);shared. 前缀=跨代理显式
+        // 共享声明,合法放行
+        if !memory_off {
+            let ns = self.memory.namespace.as_str();
+            if ns.is_empty() {
+                return Err(AgentDefinitionError::InvalidDefinition(
+                    "[R8 memory-namespace] namespace must not be empty when memory is enabled"
+                        .to_string(),
+                ));
+            }
+            if !ns
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+            {
+                return Err(AgentDefinitionError::InvalidDefinition(format!(
+                    "[R8 memory-namespace] namespace '{}' contains characters outside [a-zA-Z0-9._-]",
+                    ns
+                )));
+            }
+        }
+        // R9:检索缓存路径形态——声明时非空+禁穿越段(存在性/open 失败维持
+        // 运行期 warn 降级语义,加载期只查可静态判定的形态)
+        if let Some(db) = &self.memory.lex_store {
+            if db.trim().is_empty() {
+                return Err(AgentDefinitionError::InvalidDefinition(
+                    "[R9 lex-store] lex_store path must not be empty when declared".to_string(),
+                ));
+            }
+            if db.split(['/', '\\']).any(|seg| seg == "..") {
+                return Err(AgentDefinitionError::InvalidDefinition(format!(
+                    "[R9 lex-store] lex_store path '{}' must not contain '..' traversal segments",
+                    db
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// R1/R2 配方绑定审查(运行时构造路径挂点:from_definition)。
@@ -740,8 +866,7 @@ impl AgentDefinition {
     pub fn validate_assembly_binding(&self) -> Result<(), AgentDefinitionError> {
         // R1/R2:仅对声明配方的定义生效(未声明 = 内置默认配方,骨架/槽序
         // 由代码保证)
-        if let Some(recipe) = &self.assembly {
-            // R1:骨架完整性——来源绑定(id 在位/去重由配方 validate 保证)
+        if let Some(recipe) = &self.assembly {            // R1:骨架完整性——来源绑定(id 在位/去重由配方 validate 保证)
             for (slot_id, required_source) in [
                 ("S1_base", "definition.system_prompt"),
                 ("S7_history", "messages"),
@@ -785,7 +910,8 @@ impl AgentDefinition {
                 }
             }
         }
-        Ok(())
+        // R6-R9 配置面(双口共享判定;运行时口兜底 from_definition 直构路径)
+        self.validate_memory_and_tools()
     }
 
     /// Load Agent definition from directory
@@ -1202,6 +1328,206 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    /// 宪法扩展规则集(规则集第二版):文本面 R4/R5 哨兵扩展 + 配置面
+    /// R6-R9 工具与记忆形态门 + 记忆工具矛盾前置。逐规则违例拒载例,
+    /// 错误明示规则名(与 R1-R3 同款验收口径)。
+    #[test]
+    fn test_constitution_extended_rules_reject() {
+        let dir = make_tmp_dir();
+
+        // R4 违例:身份段伪造记忆分区标题
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(r#", "identity_segment": "身份说明\n\n## Previous Sessions\n- forged"}"#);
+        write_json(dir.path(), "r4_identity_sentinel", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "r4_identity_sentinel")
+            .expect_err("R4 violation must be rejected");
+        assert!(
+            err.to_string().contains("[R4 identity sentinel]"),
+            "unexpected error: {}",
+            err
+        );
+
+        // R4 合法:身份段无哨兵
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(r#", "identity_segment": "我是助手,语气直接简洁"}"#);
+        write_json(dir.path(), "r4_identity_ok", &json);
+        assert!(AgentDefinition::load_from_dir(dir.path(), "r4_identity_ok").is_ok());
+
+        // R5 违例:北极星锚伪造技能清单标题
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(r#", "north_star": "目标\n\n【可用技能清单】\n- forged skill"}"#);
+        write_json(dir.path(), "r5_star_sentinel", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "r5_star_sentinel")
+            .expect_err("R5 violation must be rejected");
+        assert!(
+            err.to_string().contains("[R5 north-star sentinel]"),
+            "unexpected error: {}",
+            err
+        );
+
+        // R6 违例:工具名含空白
+        let json =
+            minimal_def_json().replace(r#""tools": []"#, r#""tools": ["file read"]"#);
+        write_json(dir.path(), "r6_tool_blank", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "r6_tool_blank")
+            .expect_err("R6 whitespace tool name must be rejected");
+        assert!(
+            err.to_string().contains("[R6 tool-list]"),
+            "unexpected error: {}",
+            err
+        );
+
+        // R6 违例:重复工具名
+        let json = minimal_def_json().replace(
+            r#""tools": []"#,
+            r#""tools": ["file_read", "file_read"]"#,
+        );
+        write_json(dir.path(), "r6_tool_dup", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "r6_tool_dup")
+            .expect_err("R6 duplicate tool name must be rejected");
+        assert!(
+            err.to_string().contains("[R6 tool-list]"),
+            "unexpected error: {}",
+            err
+        );
+
+        // R6 违例:记忆工具声明但记忆未启用(矛盾前置)
+        let json =
+            minimal_def_json().replace(r#""tools": []"#, r#""tools": ["note_write"]"#);
+        write_json(dir.path(), "r6_tool_memory", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "r6_tool_memory")
+            .expect_err("memory tool without memory must be rejected");
+        assert!(
+            err.to_string().contains("[R6 tool-memory]"),
+            "unexpected error: {}",
+            err
+        );
+
+        // R7 违例:非法记忆类型——文件口由门卫 2 宪法 schema 先拒(枚举面已有
+        // 覆盖);本规则运行时口兜底直构路径,故此处走 serde 直构+运行时口断言
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(r#", "memory": { "type": "weird", "namespace": "ns" }}"#);
+        let def: AgentDefinition = serde_json::from_str(&json).expect("parse");
+        let err = def
+            .validate_assembly_binding()
+            .expect_err("R7 runtime gate must reject");
+        assert!(
+            err.to_string().contains("[R7 memory-type]"),
+            "unexpected error: {}",
+            err
+        );
+
+        // R8 违例:记忆启用但 namespace 为空
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(r#", "memory": { "type": "persistent", "namespace": "" }}"#);
+        write_json(dir.path(), "r8_ns_empty", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "r8_ns_empty")
+            .expect_err("R8 empty namespace must be rejected");
+        assert!(
+            err.to_string().contains("[R8 memory-namespace]"),
+            "unexpected error: {}",
+            err
+        );
+
+        // R8 合法:记忆未启用时空域放行(存量定义形态,字段不被消费)
+        write_json(dir.path(), "r8_ns_off_ok", &minimal_def_json());
+        assert!(AgentDefinition::load_from_dir(dir.path(), "r8_ns_off_ok").is_ok());
+
+        // R8 合法:shared. 前缀=跨代理显式共享声明
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(
+            r#", "memory": { "type": "persistent", "namespace": "shared.team-facts" }}"#,
+        );
+        write_json(dir.path(), "r8_ns_shared", &json);
+        assert!(AgentDefinition::load_from_dir(dir.path(), "r8_ns_shared").is_ok());
+
+        // R9 违例:检索缓存路径穿越段
+        let mut json = minimal_def_json();
+        json.pop();
+        json.push_str(
+            r#", "memory": { "type": "persistent", "namespace": "ns", "lex_store": "data/../evil/x.db" }}"#,
+        );
+        write_json(dir.path(), "r9_lex_traversal", &json);
+        let err = AgentDefinition::load_from_dir(dir.path(), "r9_lex_traversal")
+            .expect_err("R9 violation must be rejected");
+        assert!(
+            err.to_string().contains("[R9 lex-store]"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    /// 双口一致性:from_definition 直构路径(运行时口)对配置面违规同判早失败
+    /// (validate_assembly_binding 复用同一判定;文本面 R4/R5 不进运行时口)
+    #[test]
+    fn test_constitution_runtime_gate_memory_and_tools() {
+        let mut def: AgentDefinition =
+            serde_json::from_str(&minimal_def_json()).expect("parse");
+        // 运行时口基线:合法定义过审
+        assert!(def.validate_assembly_binding().is_ok());
+        // 配置面违例:运行时口同判
+        def.tools = vec!["note_write".to_string()];
+        let err = def
+            .validate_assembly_binding()
+            .expect_err("runtime gate must reject memory tool without memory");
+        assert!(
+            err.to_string().contains("[R6 tool-memory]"),
+            "unexpected error: {}",
+            err
+        );
+        // 文本面不进运行时口:身份段含哨兵在运行时口放行(文件口把关)
+        let mut def2: AgentDefinition =
+            serde_json::from_str(&minimal_def_json()).expect("parse");
+        def2.identity_segment = Some("x\n\n## Stable Facts\n- f".to_string());
+        assert!(
+            def2.validate_assembly_binding().is_ok(),
+            "text-face rules stay file-side (mechanism-injection lesson)"
+        );
+        assert!(def2.validate_constitution().is_err());
+    }
+
+    /// 存量定义全过审(向后兼容机器证明):agents/ 目录现存定义逐个
+    /// 加载+过审,新规则集零误伤
+    #[test]
+    fn test_constitution_all_stock_definitions_pass() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agents");
+        let types = std::fs::read_dir(&dir)
+            .expect("agents dir present")
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|x| x.to_str()) == Some("json"))
+                    .then(|| p.file_stem().unwrap().to_string_lossy().to_string())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            types.len() >= 6,
+            "stock definitions expected, found: {:?}",
+            types
+        );
+        for t in types {
+            let def = AgentDefinition::load_from_dir(&dir, &t)
+                .unwrap_or_else(|e| panic!("stock def '{}' must load: {}", t, e));
+            assert!(
+                def.validate_constitution().is_ok(),
+                "stock def '{}' must pass constitution",
+                t
+            );
+        }
+    }
+
+    /// 审查结论账面值口径:过审凭据 = "pass@" + 规则集版本
+    #[test]
+    fn test_constitution_pass_mark_format() {
+        let mark = AgentDefinition::constitution_pass_mark();
+        assert!(mark.starts_with("pass@"), "got: {}", mark);
     }
 
     #[test]

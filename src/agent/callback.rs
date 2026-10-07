@@ -186,6 +186,7 @@ impl EventCallback for LoggingCallback {
             AgentEvent::SessionCreated {
                 session_id,
                 memory_enabled: _,
+                ..
             } => {
                 tracing::info!(%session_id, "callback: session created");
             }
@@ -382,6 +383,7 @@ mod tests {
         let event = AgentEvent::SessionCreated {
             session_id: "s1".to_string(),
             memory_enabled: false,
+            constitution: None,
         };
         chain.dispatch(&event).await;
 
@@ -400,6 +402,7 @@ mod tests {
             .dispatch(&AgentEvent::SessionCreated {
                 session_id: "s1".to_string(),
                 memory_enabled: false,
+                constitution: None,
             })
             .await;
         chain.dispatch(&AgentEvent::Step { step: 1 }).await;
@@ -421,6 +424,7 @@ mod tests {
         let event = AgentEvent::SessionCreated {
             session_id: "s1".to_string(),
             memory_enabled: false,
+            constitution: None,
         };
         // Should not panic
         chain.dispatch(&event).await;
@@ -473,6 +477,7 @@ mod tests {
         let event = AgentEvent::SessionCreated {
             session_id: "s1".to_string(),
             memory_enabled: false,
+            constitution: None,
         };
         // Should not panic
         chain.dispatch(&event).await;
@@ -491,6 +496,7 @@ mod tests {
             AgentEvent::SessionCreated {
                 session_id: "s1".to_string(),
                 memory_enabled: false,
+                constitution: None,
             },
             AgentEvent::Step { step: 1 },
             AgentEvent::LlmDelta {
@@ -544,6 +550,7 @@ mod tests {
         cb.on_event(&AgentEvent::SessionCreated {
             session_id: "s1".to_string(),
             memory_enabled: false,
+            constitution: None,
         })
         .await;
         cb.on_event(&AgentEvent::Step { step: 1 }).await;

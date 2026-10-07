@@ -1181,10 +1181,12 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
         Ok(AgentEvent::SessionCreated {
             session_id,
             memory_enabled,
+            constitution,
         }) => Event::default().event("session_created").data(
             serde_json::json!({
                 "session_id": session_id,
                 "memory_enabled": memory_enabled,
+                "constitution": constitution,
             })
             .to_string(),
         ),
@@ -2296,6 +2298,7 @@ mod tests {
             Ok(AgentEvent::SessionCreated {
                 session_id: "sess-run-1".to_string(),
                 memory_enabled: false,
+                constitution: None,
             }),
             Ok(AgentEvent::Done(AgentResult::success(
                 "ok".to_string(),
@@ -2394,6 +2397,7 @@ mod tests {
         let ev = agent_event_to_sse(Ok(AgentEvent::SessionCreated {
             session_id: "s-123".to_string(),
             memory_enabled: false,
+            constitution: Some("pass@2".to_string()),
         }))
         .unwrap();
         let s = format!("{:?}", ev);

@@ -460,6 +460,9 @@ pub enum AgentEvent {
         session_id: String,
         /// 该 agent 是否启用记忆配置(memory_config 存在即 true)
         memory_enabled: bool,
+        /// 宪法审查结论(过审凭据 "pass@<规则集版本>";违反定义在加载期
+        /// fail-fast 不会到达会话建立,故运行期恒为过审值;None=旧版兼容)
+        constitution: Option<String>,
     },
     /// 进入第 N 步
     Step {
@@ -4419,6 +4422,10 @@ impl AgentRunner {
                     session_id: session_id.clone(),
                     // memory_config 存在(from_definition 已装 MemoryManager)即视为启用
                     memory_enabled: runner.memory.is_some(),
+                    // 宪法审查过审凭据(加载期已把关,违反定义不会到达此处)
+                    constitution: Some(
+                        crate::agent::definition::AgentDefinition::constitution_pass_mark(),
+                    ),
                 });
 
                 // 3. auto_recall(best-effort,不阻塞流)
