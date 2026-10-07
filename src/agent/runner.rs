@@ -906,6 +906,13 @@ pub struct AgentRunner {
     /// 进入允许面。false:注册面 ∪ 静态表(主路径行为等价口径不变,B2 断言
     /// 测试盯守)。
     assembly_scope_focus: bool,
+    /// 语义精判会话内缓存(两级通路第二级;键=候选六元组 digest,值=裁决
+    /// 结论——每候选每会话至多一次 sidecar 调用,重复候选零成本复用)
+    i2_verdict_cache:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, crate::agent::context_inspector::I2Verdict>>>,
+    /// 语义精判开关(true=默认:候选触发 sidecar 裁决;false=回退纯字面级,
+    /// 逐字节兼容旧行为)
+    semantic_i2_enabled: bool,
     /// 摘要保真对照(规格修正批交付物 B):当前会话 journal 写者(流式路径
     /// 注入;CLI run 纯路径无 journal=只 warn 不落账)。G10 摘要替换时
     /// 自动对照落 summary_fidelity_scan 事件。
@@ -989,6 +996,8 @@ impl AgentRunner {
             stagnation: crate::agent::stagnation::StagnationDetector::new(),
             pipeline_entry: crate::agent::pipeline::PipelineEntry::React,
             assembly_scope_focus: false,
+            i2_verdict_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            semantic_i2_enabled: true,
             active_journal: None,
             accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
@@ -1439,6 +1448,13 @@ impl AgentRunner {
     pub(crate) fn with_recall_quotas(mut self, max_summaries: usize, max_events: usize) -> Self {
         self.sediment_config.max_session_summaries = max_summaries;
         self.sediment_config.max_injected_events = max_events;
+        self
+    }
+
+    /// 语义精判开关（I2 两级通路第二级;true=默认开——候选触发 sidecar
+    /// 裁决+会话内缓存;false=回退纯字面级,逐字节兼容旧行为）
+    pub fn with_semantic_i2(mut self, enabled: bool) -> Self {
+        self.semantic_i2_enabled = enabled;
         self
     }
 
@@ -4390,19 +4406,70 @@ impl AgentRunner {
                 }
             }
 
-            // C-3/F-905 I2 检查器初版:组装后 system 分区间字面级冲突扫描
-            // (词法确定性子集);输出=报告落账(仅检出时),不阻断会话。
-            // 失败 fail-soft(与其它 journal 写入同风格)
+            // C-3/F-905 I2 检查器:组装后 system 分区间冲突扫描——两级通路:
+            // 第一级词法召回(确定性,零成本),第二级语义精判(sidecar 审计链
+            // 内裁决,候选触发+会话内缓存+短超时,失败→uncertain 兜底);
+            // verdict 为观测注释不进控制流。输出=报告落账(仅检出时),
+            // 不阻断会话。失败 fail-soft(与其它 journal 写入同风格)
             if let Some(j) = &journal {
                 let round = turn_guard.as_ref().map(|g| g.turn_seq()).unwrap_or(0);
                 let mut tokens: Vec<String> = runner.config.tool_names.clone();
                 if let Some(skills) = &runner.config.skills {
                     tokens.extend(skills.iter().map(|s| s.name.clone()));
                 }
-                let conflicts = crate::agent::context_inspector::inspect_system_sections(
+                let mut conflicts = crate::agent::context_inspector::inspect_system_sections(
                     &system_prompt,
                     &tokens,
                 );
+                if !conflicts.is_empty() && runner.semantic_i2_enabled {
+                    // 第二级:sidecar 审计链内裁决(purpose=i2_semantic;每候选
+                    // 每会话至多一次,缓存命中零调用)
+                    let auditor = crate::agent::audited_llm::AuditedLlm::new(
+                        runner.evorule_client.clone(),
+                        runner.llm_handler.clone(),
+                    )
+                    .with_timeout_secs(
+                        crate::agent::context_inspector::I2_SEMANTIC_TIMEOUT_SECS,
+                    );
+                    let model = runner.config.model.clone();
+                    conflicts =
+                        crate::agent::context_inspector::adjudicate_candidates(
+                            conflicts,
+                            &runner.i2_verdict_cache,
+                            &model,
+                            |rec| {
+                                let params = crate::agent::context_inspector::
+                                    build_adjudication_params(&model, rec);
+                                let auditor = auditor.clone();
+                                async move {
+                                    let resp =
+                                        auditor.execute(crate::agent::context_inspector::
+                                            I2_SEMANTIC_PURPOSE, &params).await?;
+                                    let content = resp
+                                        .get("content")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let tokens = resp
+                                        .get("token_usage")
+                                        .and_then(|v| {
+                                            serde_json::from_value::<
+                                                crate::agent::translator::TokenUsage,
+                                            >(v.clone())
+                                            .ok()
+                                        })
+                                        .map(|t| crate::agent::journal::TokenRecord {
+                                            prompt: t.prompt_tokens as u64,
+                                            completion: t.completion_tokens as u64,
+                                            total: t.total_tokens as u64,
+                                        });
+                                    Ok((content, tokens))
+                                }
+                            },
+                            journal.as_ref().map(|v| &**v),
+                        )
+                        .await;
+                }
                 if !conflicts.is_empty() {
                     if let Err(e) = j.i2_scan_report(round, conflicts) {
                         warn!(%session_id, error = %e, "i2_scan_report journal failed");
