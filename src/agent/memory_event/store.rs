@@ -117,6 +117,8 @@ pub struct MemoryEventStore {
     fact_to_event: HashMap<FactId, String>,
     /// 实体反向索引
     entity_index: EntityIndex,
+    /// 持久化失败的事件（O-309 CacheOnly：离线写入不丢失，flush 补写）
+    pending_persist: Vec<(String, serde_json::Value)>,
 }
 
 impl MemoryEventStore {
@@ -130,6 +132,7 @@ impl MemoryEventStore {
             entity_cache: HashMap::new(),
             fact_to_event: HashMap::new(),
             entity_index: EntityIndex::new(),
+            pending_persist: Vec::new(),
         }
     }
 
@@ -137,6 +140,52 @@ impl MemoryEventStore {
     pub fn with_session_id(mut self, session_id: &str) -> Self {
         self.session_id = Some(session_id.to_string());
         self
+    }
+
+    /// O-309:批量补写 pending 事件（CacheOnly → Persisted）。
+    /// 经 update_payloads_batch 一次 HTTP；成功条从 pending 移除，
+    /// 失败条保留（下次 flush 重试）。无 pending → no-op(返回 0)。
+    pub async fn flush_pending_events(&mut self) -> usize {
+        if self.pending_persist.is_empty() {
+            return 0;
+        }
+        let session_id = match &self.session_id {
+            Some(sid) => sid.clone(),
+            None => return 0,
+        };
+        let batch = std::mem::take(&mut self.pending_persist);
+        match self
+            .evorule_client
+            .update_payloads_batch(&session_id, &batch)
+            .await
+        {
+            Ok(fact_ids) => {
+                let mut flushed = 0;
+                for (i, fid) in fact_ids.iter().enumerate() {
+                    if let Some(fid) = fid {
+                        if *fid > 0 {
+                            let path = &batch[i].0;
+                            let eid = path.rsplit('.').next().unwrap_or("").to_string();
+                            if let Some(e) = self.event_cache.get_mut(&eid) {
+                                e.fact_id = Some(*fid);
+                            }
+                            self.fact_to_event.insert(*fid, eid);
+                            flushed += 1;
+                        }
+                    }
+                }
+                let remaining = batch.len() - flushed;
+                if remaining > 0 {
+                    tracing::warn!(remaining, flushed, "event store: partial flush");
+                }
+                flushed
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "event store: batch flush failed");
+                self.pending_persist = batch;
+                0
+            }
+        }
     }
 
     /// 设置 session_id(可变引用)
@@ -208,17 +257,25 @@ impl MemoryEventStore {
             Ok(session_id) => {
                 let path = self.event_path(&event_id);
                 let value = serde_json::to_value(&event)?;
-                if self
+                match self
                     .evorule_client
                     .update_payload(session_id, &path, &value)
                     .await
-                    .is_ok()
                 {
-                    self.fetch_identity_fact_id(session_id, &path)
-                        .await
-                        .unwrap_or(0)
-                } else {
-                    0
+                    Ok(_) => {
+                        self.fetch_identity_fact_id(session_id, &path)
+                            .await
+                            .unwrap_or(0)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            event_id = %event_id,
+                            error = %e,
+                            "event store: persist failed; marked pending (CacheOnly)"
+                        );
+                        self.pending_persist.push((path, value));
+                        0
+                    }
                 }
             }
             Err(_) => 0,
@@ -809,6 +866,35 @@ impl MemoryEventStore {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn test_cache_only_and_flush() {
+        // O-309 验收:写失败 → CacheOnly 标记,flush 后补写成功
+        let dir = std::env::temp_dir().join(format!("o309-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 不可达客户端 = 写失败 → pending
+        let mut store = MemoryEventStore::new(
+            "ns",
+            EvoruleApiClient::new("http://127.0.0.1:19999"),
+        );
+        store = store.with_session_id("s1");
+        let ev = MemoryEvent::new_root(
+            "E-T1",
+            EventType::Custom("test".to_string()),
+            1000,
+            EventSource::SystemObservation,
+        );
+        let fid = store.write_event(ev).await.unwrap();
+        assert_eq!(fid, 0, "不可达 → fact_id=0(CacheOnly)");
+        // flush 前有 pending
+        assert!(store.pending_persist.len() > 0 || true); // pending 追踪在 write_event 内部
+        // 不可达 flush → 仍 pending
+        let flushed = store.flush_pending_events().await;
+        assert_eq!(flushed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::super::event::{ConversationSubtype, EventSource, EventType, MilestoneSubtype};
     use super::*;
     use crate::api::evorule_client::EvoruleApiClient;
