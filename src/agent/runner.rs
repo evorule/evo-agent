@@ -1471,6 +1471,58 @@ impl AgentRunner {
         self
     }
 
+    /// Recipe 热重载（LM-2 可热重载属性;运行体重解析+指纹审计）:
+    /// 重解析→memory.set_recipe→sediment 门控随新 Recipe 刷新;新指纹随
+    /// 下一轮 effective_params 落链（回放可锚定）。
+    pub fn reload_memory_recipe(&mut self, recipe_json: &str) -> Result<(String, String), String> {
+        let (version, hash) = self
+            .memory
+            .as_mut()
+            .ok_or_else(|| "memory not enabled".to_string())?
+            .reload_recipe(recipe_json)?;
+        // sediment 门控随新 Recipe 刷新(三源穿线与 from_definition 同口径)
+        if let Some(mem) = self.memory.as_ref() {
+            if let Some(recipe) = mem.current_recipe() {
+                self.sediment_config.enable_journal_digest = recipe.sources.journal_digest;
+                self.sediment_config.enable_failure_drafts = recipe.sources.failure_drafts;
+                self.sediment_config.enable_material_harvest = recipe.sources.materials;
+                self.sediment_config.summary_rollup_threshold = recipe.lifecycle.rollup_threshold;
+            }
+        }
+        info!(version = %version, fingerprint = %hash, "memory recipe reloaded on runner");
+        Ok((version, hash))
+    }
+
+    /// Recipe 资产提案（LM-2 治理层接入:经治理写通路把当前 Recipe 作为
+    /// KnowledgeEntry 入 evorule-rule 数据集——可版本/可审批/可包交换;
+    /// offline/无 Recipe/无 dataset 如实报错,不静默）
+    pub async fn propose_memory_recipe_asset(
+        &self,
+        dataset_id: &str,
+        session_id: &str,
+    ) -> Result<Value, String> {
+        let payload = self
+            .memory
+            .as_ref()
+            .and_then(|m| m.recipe_asset_payload())
+            .ok_or_else(|| "memory recipe not configured".to_string())?;
+        let (version, fingerprint) = self
+            .memory
+            .as_ref()
+            .and_then(|m| m.recipe_fingerprint())
+            .ok_or_else(|| "memory recipe fingerprint unavailable".to_string())?;
+        let cause = format!(
+            "memory recipe asset proposal; version={version}; fingerprint={fingerprint}"
+        );
+        let receipt = self
+            .evorule_client
+            .propose_knowledge_entry(dataset_id, &payload, &cause, Some(session_id))
+            .await
+            .map_err(|e| format!("recipe asset proposal failed: {e}"))?;
+        info!(version = %version, %fingerprint, "memory recipe asset proposed");
+        Ok(receipt)
+    }
+
     /// 写前置查询（Q2 第四触发点 R-4）:写族意图→目标路径历史 advisory。
     /// fail-soft 静默（拉取失败/无记忆面/无匹配/同路径已建议→None,写入
     /// 不受影响——可用性优先于回喂,与 R-1 fail-visible 取向相反是设计使然）
@@ -2815,6 +2867,14 @@ impl AgentRunner {
             "assembly_recipe_version": recipe_version,
             "assembly_recipe_hash": recipe_hash,
         });
+        // LM-2 资产化:MemoryRecipe 指纹随首轮落链(有 Recipe 时)——回放可
+        // 锚定实际生效的记忆策略版本
+        if let Some((m_version, m_hash)) = self.memory.as_ref().and_then(|m| m.recipe_fingerprint()) {
+            params["effective_params"]["memory_recipe_version"] =
+                serde_json::json!(m_version);
+            params["effective_params"]["memory_recipe_hash"] =
+                serde_json::json!(m_hash);
+        }
         serde_json::json!({
             "type": "call_external",
             "params": params,
