@@ -2299,6 +2299,23 @@ impl MemoryManager {
     /// 注册步 missing 检查早失败,fail-visible);写件(memory_propose/
     /// note_write)不检索,声明即可(note_write 落账 Captured 写不过闸)。
     /// 未知名 warn 跳过(数据面笔误不致命,但要留痕可查)。
+    /// memory_link 关系白名单（Recipe 声明优先;空=内建四类）
+    pub(crate) fn link_relations(&self) -> Vec<String> {
+        let declared = self
+            .recipe
+            .as_ref()
+            .map(|r| r.tools.link_relations.clone())
+            .unwrap_or_default();
+        if declared.is_empty() {
+            crate::agent::memory_tool::BUILTIN_LINK_RELATIONS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            declared
+        }
+    }
+
     pub(crate) fn exposed_introspection_tools(&self) -> Vec<String> {
         let Some(recipe) = &self.recipe else {
             return Vec::new();
