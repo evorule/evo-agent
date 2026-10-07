@@ -10,6 +10,8 @@
 //! - `explain_denial`：给定会话内一次拒绝事实（Violation），返回结构化
 //!   拒因——`rule_index`/`reason`/被拒命令原文 + 命中的规则正本条目
 //!   （`GET /api/rules` 的 core_eval 数组按索引原样透出，对账即一致）；
+//!   io_guard 输出门禁拒绝（rule_index 保留值）不走规则下标对账，改由
+//!   事实自身携带的门禁命中记录（instruction）逐字透出，闭环自证；
 //! - `causal_order`：同会话审计链内两事实的因果序——序由 cause 指针
 //!   （链式哈希链）确定，**非墙钟**；无直接因果路径时按链位
 //!   （logical_time，链上串行化序）定先后并如实标注 `causally_related:
@@ -63,30 +65,50 @@ fn require_str(args: &Value, key: &str) -> Result<String, String> {
 
 /// 审计条目中抽取 Violation 事实的归因字段（content_json 宽容形态：
 /// 顶层或 payload 子对象；server 侧 Fact::to_json 的字段名以实测为准，
-/// E2E 校准点）
-fn violation_fields(content: &Value) -> Option<(u64, String, Option<u64>)> {
-    for probe in [content.clone(), content["payload"].clone()] {
-        let idx = probe
-            .get("rule_index")
-            .and_then(|v| v.as_u64())
-            .or_else(|| {
-                probe
-                    .get("rule_index")
-                    .and_then(|v| v.as_str()?.parse().ok())
-            });
-        let reason = probe
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        if let (Some(idx), Some(reason)) = (idx, reason) {
-            let cause = probe
-                .get("cause")
-                .and_then(|v| v.as_u64())
-                .or_else(|| probe.get("cause").and_then(|v| v.as_str()?.parse().ok()));
-            return Some((idx, reason, cause));
+/// E2E 校准点）。
+///
+/// 返回 `(rule_index 显示值, 是否保留值, reason, cause)`。rule_index 解析
+/// 宽容 u64/i64/整数字符串：保留值原样透出并标记 `reserved`——io_guard
+/// 输出门禁 Violation 的 rule_index=u64::MAX 经 server 侧 TCB `J::integer`
+/// (i64) 序列化落盘为 -1，两形态（-1 / 18446744073709551615）都不参与
+/// core_eval 下标对账。
+fn parse_rule_index(v: &Value) -> Option<(Value, bool)> {
+    let str_int = |s: &str| {
+        let s = s.trim();
+        s.parse::<u64>()
+            .ok()
+            .map(|n| json!(n))
+            .or_else(|| s.parse::<i64>().ok().map(|n| json!(n)))
+    };
+    match v {
+        Value::Number(_) => {
+            let reserved = v.as_u64() == Some(u64::MAX) || v.as_i64() == Some(-1);
+            Some((v.clone(), reserved))
         }
+        Value::String(s) => {
+            let t = s.trim();
+            let reserved = t == "-1" || t.parse::<u64>() == Ok(u64::MAX);
+            Some((str_int(s)?, reserved))
+        }
+        _ => None,
     }
-    None
+}
+
+fn violation_probe(probe: &Value) -> Option<(Value, bool, String, Option<u64>)> {
+    let (rule_index, reserved) = parse_rule_index(probe.get("rule_index")?)?;
+    let reason = probe
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)?;
+    let cause = probe
+        .get("cause")
+        .and_then(|v| v.as_u64())
+        .or_else(|| probe.get("cause").and_then(|v| v.as_str()?.parse().ok()));
+    Some((rule_index, reserved, reason, cause))
+}
+
+fn violation_fields(content: &Value) -> Option<(Value, bool, String, Option<u64>)> {
+    violation_probe(content).or_else(|| violation_probe(&content["payload"]))
 }
 
 fn is_violation_type(fact_type: &str) -> bool {
@@ -151,24 +173,63 @@ impl ToolFunction for ExplainDenialTool {
                  violation — explain_denial only explains denial (Violation) facts"
             ));
         }
-        let (rule_index, reason, cause) = violation_fields(&content).ok_or_else(|| {
-            format!(
-                "violation fact {fact_id} lacks structured rule_index/reason fields \
-                 (content shape mismatch — server-side fact shape needs calibration)"
-            )
-        })?;
+        let (rule_index, reserved_index, reason, cause) =
+            violation_fields(&content).ok_or_else(|| {
+                format!(
+                    "violation fact {fact_id} lacks structured rule_index/reason fields \
+                     (content shape mismatch — server-side fact shape needs calibration)"
+                )
+            })?;
 
-        // 2. 规则正本对账：core_eval[rule_index] 原样透出（GET /api/rules）
-        let rules = self
-            .ev
-            .get_rules()
-            .await
-            .map_err(|e| format!("rules fetch failed: {e}"))?;
-        let core_eval = rules
-            .get("core_eval")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| "GET /api/rules response has no core_eval array".to_string())?;
-        let matched_rule = core_eval.get(rule_index as usize).cloned();
+        // 2. 归因对账：常规拒绝 = core_eval[rule_index] 原样透出（GET /api/rules）；
+        // 保留值拒绝（io_guard 输出门禁，rule_index=u64::MAX 经 TCB i64 序列化
+        // 落盘为 -1）= 不拉规则正本——门禁命中记录由事实自身 instruction 携带
+        // （系统独占发射，闭环自证），逐字透出即为权威归因。
+        let (matched_rule, reconciliation, note) = if reserved_index {
+            let instr = content.get("instruction").cloned().unwrap_or(Value::Null);
+            let gate_record = instr.get("type").and_then(|v| v.as_str()) == Some("io_guard");
+            (
+                Some(instr),
+                gate_record,
+                if gate_record {
+                    "rule_index is the reserved sentinel for the io_guard output gate \
+                     (u64::MAX; serialized as -1 on the audit chain) — not a core_eval rule \
+                     index. matched_rule is the gate's own hit record carried verbatim in \
+                     the fact's instruction (system-exclusive emission, self-contained; \
+                     domain/phrase/mode under params). Reconcile the domain against the \
+                     deployed feature table 00_constraint_io_guard.json."
+                } else {
+                    "rule_index is a reserved sentinel value but the fact carries no io_guard \
+                     instruction record — matched_rule absent; check the emitting mechanism"
+                },
+            )
+        } else {
+            let rules = self
+                .ev
+                .get_rules()
+                .await
+                .map_err(|e| format!("rules fetch failed: {e}"))?;
+            let core_eval = rules
+                .get("core_eval")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| "GET /api/rules response has no core_eval array".to_string())?;
+            let matched = rule_index
+                .as_u64()
+                .and_then(|i| core_eval.get(i as usize))
+                .cloned();
+            let reconciliation = matched.is_some();
+            (
+                matched,
+                reconciliation,
+                if reconciliation {
+                    "matched_rule is the verbatim core_eval entry from GET /api/rules (canonical \
+                     effective rule set, indexed by the engine's rule_index)"
+                } else {
+                    "rule_index points outside the current core_eval array (rule set reloaded since \
+                     the denial?) — matched_rule absent, cross-check the rule set version"
+                },
+            )
+        };
 
         // 3. 被拒命令原文（cause 指向的事实）
         let denied_command = cause.and_then(|cid| {
@@ -187,15 +248,9 @@ impl ToolFunction for ExplainDenialTool {
                 "cause": cause,
             },
             "matched_rule": matched_rule,
-            "reconciliation": matched_rule.is_some(),
+            "reconciliation": reconciliation,
             "denied_command": denied_command,
-            "note": if matched_rule.is_some() {
-                "matched_rule is the verbatim core_eval entry from GET /api/rules (canonical \
-                 effective rule set, indexed by the engine's rule_index)"
-            } else {
-                "rule_index points outside the current core_eval array (rule set reloaded since \
-                 the denial?) — matched_rule absent, cross-check the rule set version"
-            },
+            "note": note,
         }))
     }
 }
@@ -471,7 +526,9 @@ pub fn specs() -> Vec<ToolSpec> {
                           fact on the session's hash-chained audit chain and return the \
                           structured denial (rule_index, reason), the verbatim effective rule \
                           entry it maps to (reconciled against GET /api/rules), and the denied \
-                          command's original content. Read-only."
+                          command's original content. Output-gate (io_guard) denials carry a \
+                          reserved rule_index and are explained via the gate's own hit record \
+                          carried in the fact itself. Read-only."
                 .to_string(),
             parameters: vec![
                 ParameterSpec {
@@ -762,6 +819,103 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("not a violation"), "应如实拒绝: {err}");
+    }
+
+    #[test]
+    fn explain_denial_io_guard_reserved_index_reads_gate_record() {
+        // io_guard 输出门禁 Violation：rule_index 保留值（u64::MAX 经 TCB i64
+        // 序列化落盘为 -1）+ instruction 携带门禁自产命中记录（domain/phrase/
+        // mode）——matched_rule 逐字透出 instruction（闭环自证），不误导为
+        // 「规则集重载」；保留值分支不依赖 GET /api/rules。
+        let entries = json!([
+            {"fact_id": 7, "fact_type": "io_response", "logical_time": 7, "cause": 6,
+             "content_json": {"type": "IoResponse", "id": 7}},
+            {"fact_id": 8, "fact_type": "violation", "logical_time": 8, "cause": 7,
+             "content_json": {"type": "Violation", "id": 8, "cause": 7, "rule_index": -1,
+              "reason": "输出门禁命中：收尾文本含「已执行」动作特征（shell_exec 域）",
+              "instruction": {"type": "io_guard", "params": {
+                  "domain": "shell_exec", "phrase": "已执行", "request_id": 5, "mode": "observe"}}}}
+        ]);
+        let base = spawn_http_fixture(vec![(200, audit_report_resp(entries))]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "explain_denial",
+            Arc::new(ExplainDenialTool::new(EvoruleApiClient::new(&base))),
+        );
+        let out = rt
+            .block_on(
+                handler
+                    .execute_by_name("explain_denial", &json!({"session_id": "42", "fact_id": 8})),
+            )
+            .unwrap();
+
+        assert_eq!(out["violation"]["rule_index"], -1);
+        assert_eq!(out["matched_rule"]["type"], "io_guard");
+        assert_eq!(out["matched_rule"]["params"]["domain"], "shell_exec");
+        assert_eq!(out["matched_rule"]["params"]["phrase"], "已执行");
+        assert_eq!(out["matched_rule"]["params"]["mode"], "observe");
+        assert_eq!(out["reconciliation"], true);
+        assert!(out["note"].as_str().unwrap().contains("reserved sentinel"));
+        // 被拒命令原文抽取（cause=7）不受分支影响
+        assert_eq!(out["denied_command"]["type"], "IoResponse");
+    }
+
+    #[test]
+    fn explain_denial_io_guard_reserved_index_unsigned_max_form() {
+        // 保留值无符号大数形态（18446744073709551615）同样走门禁分支——
+        // 数字面 -1 与 u64::MAX 两形态等价处理。
+        let entries = json!([
+            {"fact_id": 9, "fact_type": "Violation", "logical_time": 9, "cause": null,
+             "content_json": {"type": "Violation", "id": 9, "cause": null,
+              "rule_index": 18446744073709551615u64,
+              "reason": "输出门禁命中（enforce）",
+              "instruction": {"type": "io_guard", "params": {"domain": "file_write"}}}}
+        ]);
+        let base = spawn_http_fixture(vec![(200, audit_report_resp(entries))]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "explain_denial",
+            Arc::new(ExplainDenialTool::new(EvoruleApiClient::new(&base))),
+        );
+        let out = rt
+            .block_on(
+                handler
+                    .execute_by_name("explain_denial", &json!({"session_id": "42", "fact_id": 9})),
+            )
+            .unwrap();
+
+        assert_eq!(out["reconciliation"], true);
+        assert_eq!(out["matched_rule"]["params"]["domain"], "file_write");
+    }
+
+    #[test]
+    fn explain_denial_reserved_index_without_gate_record_reports_honestly() {
+        // 保留值但事实缺 io_guard instruction 记录：不强行归因，matched_rule
+        // 缺席 + note 如实说明。
+        let entries = json!([
+            {"fact_id": 4, "fact_type": "Violation", "logical_time": 4, "cause": null,
+             "content_json": {"type": "Violation", "id": 4, "cause": null,
+                              "rule_index": -1, "reason": "unknown reserved denial"}}
+        ]);
+        let base = spawn_http_fixture(vec![(200, audit_report_resp(entries))]);
+        let rt = rt();
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "explain_denial",
+            Arc::new(ExplainDenialTool::new(EvoruleApiClient::new(&base))),
+        );
+        let out = rt
+            .block_on(
+                handler
+                    .execute_by_name("explain_denial", &json!({"session_id": "42", "fact_id": 4})),
+            )
+            .unwrap();
+
+        assert_eq!(out["matched_rule"], Value::Null);
+        assert_eq!(out["reconciliation"], false);
+        assert!(out["note"].as_str().unwrap().contains("no io_guard"));
     }
 
     // =========================================================================
