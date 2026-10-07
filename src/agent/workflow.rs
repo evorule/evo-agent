@@ -117,7 +117,8 @@ pub enum NumericCmpMode {
 ///
 /// 执行形态约束：不经 delegate（不占 max_concurrent/max_depth）、execute 层循环
 /// 内同步内联求值、无 IO 无副作用、不产生 IoRequest；函数目录封闭
-/// （strcmp/numeric_cmp/regex_match），同输入必同输出。
+/// （v1.2 三种 strcmp/numeric_cmp/regex_match + v1.3 新增 24 种算术/字符串/日期/逻辑，
+/// 共 27 种），同输入必同输出。新增函数 = 新 schema 版本 + 治理评审。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "function", rename_all = "snake_case")]
 pub enum ComputeSpec {
@@ -145,6 +146,93 @@ pub enum ComputeSpec {
         /// 正则 pattern（加载期编译校验）
         pattern: String,
     },
+    // ----- v1.3 新增 24 函数（结果词表与错误语义总纲见 schema v1.3 description） -----
+    /// 算术加（2..=8 输入，i64 依次累加，checked 溢出=节点失败）
+    Add { inputs: Vec<ComputeInput> },
+    /// 算术减（2..=8 输入，i64 依次累减）
+    Sub { inputs: Vec<ComputeInput> },
+    /// 算术乘（2..=8 输入，i64 依次累乘）
+    Mul { inputs: Vec<ComputeInput> },
+    /// 算术除（恰 2 输入，向零取整；除零/i64::MIN÷-1=节点失败）
+    Div { inputs: Vec<ComputeInput> },
+    /// 绝对值（恰 1 输入；i64::MIN 取绝对值溢出=节点失败）
+    Abs { inputs: Vec<ComputeInput> },
+    /// 最小值（2..=8 输入，i64）
+    Min { inputs: Vec<ComputeInput> },
+    /// 最大值（2..=8 输入，i64）
+    Max { inputs: Vec<ComputeInput> },
+    /// 无分隔符拼接（2..=8 输入按序原样连接）
+    Concat { inputs: Vec<ComputeInput> },
+    /// Unicode 字符（char）数（恰 1 输入；空串→"0"）
+    Length { inputs: Vec<ComputeInput> },
+    /// 转大写（恰 1 输入；Unicode 全字符集映射，如 ß→SS）
+    Upper { inputs: Vec<ComputeInput> },
+    /// 转小写（恰 1 输入）
+    Lower { inputs: Vec<ComputeInput> },
+    /// 去首尾空白（恰 1 输入；中间空白不动）
+    Trim { inputs: Vec<ComputeInput> },
+    /// 字面子串替换（恰 1 输入；find 非空加载期校验；find 不在场=原串原样）
+    Replace {
+        /// 输入引用（恰 1 个 = 原串）
+        inputs: Vec<ComputeInput>,
+        /// 被替换子串（字面匹配非正则，非空）
+        find: String,
+        /// 替换为该串（可为空串=删除）
+        replacement: String,
+    },
+    /// 按分隔符分段取第 index 段（0 基；越界=节点失败）
+    SplitAt {
+        /// 输入引用（恰 1 个 = 原串）
+        inputs: Vec<ComputeInput>,
+        /// 分隔符（字面串非正则，非空）
+        separator: String,
+        /// 第几段（0 基）
+        index: u64,
+    },
+    /// 按字符索引取子串（start+length 越界=节点失败，无静默截断）
+    Substr {
+        /// 输入引用（恰 1 个 = 原串）
+        inputs: Vec<ComputeInput>,
+        /// 起始位置（char 索引，0 基；start==字符数 且 length==0 合法）
+        start: u64,
+        /// 取多少个字符（char 数）
+        length: u64,
+    },
+    /// 以分隔符连接（2..=8 输入；空字符串原样参与=连续分隔符属确定性语义）
+    Join {
+        /// 输入引用（2..=8 个）
+        inputs: Vec<ComputeInput>,
+        /// 连接分隔符（非空）
+        separator: String,
+    },
+    /// Unix epoch 秒 → UTC 日期 YYYY-MM-DD（恰 1 输入；域 0000-01-01..=9999-12-31）
+    EpochToDate { inputs: Vec<ComputeInput> },
+    /// 两日期差整天数（恰 2 输入，严格 YYYY-MM-DD；inputs[1]−inputs[0]，可负）
+    DateDiffDays { inputs: Vec<ComputeInput> },
+    /// epoch 秒加天数偏移（恰 1 输入 + days 可负；输出 epoch 秒非日期串）
+    EpochAddDays {
+        /// 输入引用（恰 1 个 = epoch 秒）
+        inputs: Vec<ComputeInput>,
+        /// 偏移天数（可负）
+        days: i64,
+    },
+    /// 逻辑与（2..=8 输入，各值须在封闭布尔词表 true|false；全 true→true）
+    And { inputs: Vec<ComputeInput> },
+    /// 逻辑或（2..=8 输入；任一 true→true）
+    Or { inputs: Vec<ComputeInput> },
+    /// 逻辑非（恰 1 输入；true↔false）
+    Not { inputs: Vec<ComputeInput> },
+    /// 条件选择器（恰 3 输入：[0]=条件（布尔词表），true→[1] 原样，false→[2] 原样）
+    IfElse { inputs: Vec<ComputeInput> },
+    /// 区间截断（恰 1 输入 + min_val/max_val；min_val>max_val 加载期拒载）
+    Clamp {
+        /// 输入引用（恰 1 个）
+        inputs: Vec<ComputeInput>,
+        /// 下界（i64）
+        min_val: i64,
+        /// 上界（i64）
+        max_val: i64,
+    },
 }
 
 impl ComputeSpec {
@@ -153,7 +241,31 @@ impl ComputeSpec {
         match self {
             ComputeSpec::Strcmp { inputs, .. }
             | ComputeSpec::NumericCmp { inputs, .. }
-            | ComputeSpec::RegexMatch { inputs, .. } => inputs,
+            | ComputeSpec::RegexMatch { inputs, .. }
+            | ComputeSpec::Add { inputs }
+            | ComputeSpec::Sub { inputs }
+            | ComputeSpec::Mul { inputs }
+            | ComputeSpec::Div { inputs }
+            | ComputeSpec::Abs { inputs }
+            | ComputeSpec::Min { inputs }
+            | ComputeSpec::Max { inputs }
+            | ComputeSpec::Concat { inputs }
+            | ComputeSpec::Length { inputs }
+            | ComputeSpec::Upper { inputs }
+            | ComputeSpec::Lower { inputs }
+            | ComputeSpec::Trim { inputs }
+            | ComputeSpec::Replace { inputs, .. }
+            | ComputeSpec::SplitAt { inputs, .. }
+            | ComputeSpec::Substr { inputs, .. }
+            | ComputeSpec::Join { inputs, .. }
+            | ComputeSpec::EpochToDate { inputs }
+            | ComputeSpec::DateDiffDays { inputs }
+            | ComputeSpec::EpochAddDays { inputs, .. }
+            | ComputeSpec::And { inputs }
+            | ComputeSpec::Or { inputs }
+            | ComputeSpec::Not { inputs }
+            | ComputeSpec::IfElse { inputs }
+            | ComputeSpec::Clamp { inputs, .. } => inputs,
         }
     }
 }
@@ -781,19 +893,146 @@ fn resolve_compute_input(input: &ComputeInput, results: &BTreeMap<String, String
     }
 }
 
-/// compute 纯函数求值(封闭目录三函数,交付物 4 §4;同输入必同输出)
+// ----- v1.3 compute 辅助（全部纯函数，确定性：同输入必同输出） -----
+
+/// 日期域 0000-01-01..=9999-12-31 的天数边界（days since 1970-01-01，UTC）
+const DATE_DOMAIN_MIN_DAYS: i64 = -719_528; // 0000-01-01T00:00:00Z = -62167219200 秒
+const DATE_DOMAIN_MAX_DAYS: i64 = 2_932_896; // 9999-12-31T00:00:00Z
+
+/// i64 输入解析（十进制整数；解析失败 = 节点失败 = 工作流终止）
+fn parse_i64_input(func: &str, s: &str) -> Result<i64, String> {
+    s.trim()
+        .parse::<i64>()
+        .map_err(|_| format!("{func} 输入 '{s}' 整数解析失败(节点失败,无静默回退)"))
+}
+
+/// 布尔词表解析（封闭 true|false；不隐式真值化，词表外 = 节点失败）
+fn parse_bool_vocab(func: &str, s: &str) -> Result<bool, String> {
+    match s {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "{func} 条件值 '{other}' 不在布尔词表 true|false(节点失败,无静默回退)"
+        )),
+    }
+}
+
+/// civil_from_days（Howard Hinnant 算法）：days since 1970-01-01 → (年, 月, 日)
+/// （proleptic Gregorian，UTC。evo-agent 无 chrono 依赖，手写实现保证确定性）
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]（u64）
+    (if m <= 2 { y + 1 } else { y }, m as u32, d)
+}
+
+/// days_from_civil（Howard Hinnant 算法）：(年, 月, 日) → days since 1970-01-01
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let mp = u64::from(if m > 2 { m - 3 } else { m + 9 }); // [0, 11]
+    let doy = (153 * mp + 2) / 5 + u64::from(d) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// 严格 YYYY-MM-DD 解析（4 位零填充年份，proleptic Gregorian；形态不符=节点失败）
+/// 域校验（0000..=9999）由 4 位年份形态保证；月日按闰年规则校验
+fn parse_date_str(func: &str, s: &str) -> Result<i64, String> {
+    let reject = || format!("{func} 日期 '{s}' 形态不符(须严格 YYYY-MM-DD)(节点失败,无静默回退)");
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return Err(reject());
+    }
+    let (y, m, d) = (parts[0], parts[1], parts[2]);
+    let dd = |p: &str| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit());
+    if y.len() != 4 || !y.bytes().all(|b| b.is_ascii_digit()) || !dd(m) || !dd(d) {
+        return Err(reject());
+    }
+    let y: i64 = y.parse().map_err(|_| reject())?;
+    let m: u32 = m.parse().map_err(|_| reject())?;
+    let d: u32 = d.parse().map_err(|_| reject())?;
+    if !(1..=12).contains(&m) {
+        return Err(reject());
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days_in_month = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ][(m - 1) as usize];
+    if d < 1 || d > days_in_month {
+        return Err(reject());
+    }
+    Ok(days_from_civil(y, m, d))
+}
+
+/// i64 多输入折叠求值（add/sub/mul/min/max 共用；数量 2..=8，checked 溢出=节点失败）
+fn eval_i64_fold(
+    func: &str,
+    resolved: &[String],
+    op: fn(i64, i64) -> Option<i64>,
+) -> Result<String, String> {
+    if resolved.len() < 2 || resolved.len() > 8 {
+        return Err(format!("{func} 需 2..=8 输入,实得 {}", resolved.len()));
+    }
+    let mut acc = parse_i64_input(func, &resolved[0])?;
+    for v in &resolved[1..] {
+        let v = parse_i64_input(func, v)?;
+        acc = op(acc, v).ok_or_else(|| format!("{func} 整数溢出(节点失败,无静默回退)"))?;
+    }
+    Ok(acc.to_string())
+}
+
+/// compute 纯函数求值(封闭目录 27 函数：v1.2 三种 + v1.3 新增 24 种;同输入必同输出)
 ///
-/// 输入数量/threshold 互斥/pattern 合法性已在 validate 期拦截,此处兜底防御
-/// (返回 Err 而非 panic);数值解析失败 = 节点失败 = 工作流终止(§4.5,无静默回退)。
-/// 结果词表:strcmp→equal|different / contained|not_contained;
-/// numeric_cmp→true|false;regex_match→match|no_match(§4.4 总表)。
+/// 输入数量/常量参数合法性已在 validate 期拦截,此处兜底防御(返回 Err 而非 panic);
+/// 错误语义总纲(v1.3 全目录统一,沿用 v1.2 numeric_cmp 既有口径):数值/整数解析失败、
+/// 除零、整数溢出、索引越界、日期域外、条件值不在词表、分隔符或查找串为空
+/// = 节点失败 = 工作流终止(无静默回退)。
+/// 结果词表总表(v1.3):strcmp→equal|different / contained|not_contained;
+/// numeric_cmp→true|false;regex_match→match|no_match;and/or/not→true|false;
+/// 算术族/length/date_diff_days/epoch_add_days→十进制整数字符串(可带负号);
+/// epoch_to_date→YYYY-MM-DD;concat/join/upper/lower/trim/replace/split_at/
+/// substr/if_else→原样字符串(无词表)。
 fn eval_compute(spec: &ComputeSpec, results: &BTreeMap<String, String>) -> Result<String, String> {
     let resolved: Vec<String> = spec
         .inputs()
         .iter()
         .map(|i| resolve_compute_input(i, results))
         .collect();
+    // 恰 1 输入形态的兜底解析(单输入函数共用)
+    let one = |func: &str| -> Result<&str, String> {
+        match resolved.as_slice() {
+            [a] => Ok(a.as_str()),
+            other => Err(format!("{func} 需恰 1 输入,实得 {}", other.len())),
+        }
+    };
+    // 2..=8 输入形态的数量兜底(多输入函数共用)
+    let multi = |func: &str| -> Result<(), String> {
+        if resolved.len() < 2 || resolved.len() > 8 {
+            return Err(format!("{func} 需 2..=8 输入,实得 {}", resolved.len()));
+        }
+        Ok(())
+    };
     match spec {
+        // ===== v1.2 三函数（词表沿用） =====
         ComputeSpec::Strcmp { mode, .. } => {
             let [a, b] = resolved.as_slice() else {
                 return Err(format!("strcmp 需恰 2 输入,实得 {}", resolved.len()));
@@ -869,84 +1108,309 @@ fn eval_compute(spec: &ComputeSpec, results: &BTreeMap<String, String>) -> Resul
                 .map_err(|e| format!("regex pattern '{pattern}' 编译失败: {e}"))?;
             Ok(if re.is_match(a) { "match" } else { "no_match" }.to_string())
         }
+        // ===== v1.3 算术（i64 域，checked 溢出=节点失败） =====
+        ComputeSpec::Add { .. } => eval_i64_fold("add", &resolved, i64::checked_add),
+        ComputeSpec::Sub { .. } => eval_i64_fold("sub", &resolved, i64::checked_sub),
+        ComputeSpec::Mul { .. } => eval_i64_fold("mul", &resolved, i64::checked_mul),
+        ComputeSpec::Min { .. } => eval_i64_fold("min", &resolved, |a, b| Some(a.min(b))),
+        ComputeSpec::Max { .. } => eval_i64_fold("max", &resolved, |a, b| Some(a.max(b))),
+        ComputeSpec::Div { .. } => {
+            let [a, b] = resolved.as_slice() else {
+                return Err(format!("div 需恰 2 输入,实得 {}", resolved.len()));
+            };
+            let (x, y) = (parse_i64_input("div", a)?, parse_i64_input("div", b)?);
+            // checked_div 同时覆盖除零与 i64::MIN ÷ -1 两类失败
+            let r = x.checked_div(y).ok_or_else(|| {
+                if y == 0 {
+                    "div 除数为 0(节点失败,无静默回退)".to_string()
+                } else {
+                    "div 溢出(i64::MIN ÷ -1)(节点失败,无静默回退)".to_string()
+                }
+            })?;
+            Ok(r.to_string())
+        }
+        ComputeSpec::Abs { .. } => {
+            let x = parse_i64_input("abs", one("abs")?)?;
+            let r = x
+                .checked_abs()
+                .ok_or_else(|| "abs 溢出(i64::MIN 取绝对值)(节点失败,无静默回退)".to_string())?;
+            Ok(r.to_string())
+        }
+        // ===== v1.3 字符串（Unicode char 计数/索引，字面操作非正则） =====
+        ComputeSpec::Concat { .. } => {
+            multi("concat")?;
+            Ok(resolved.concat())
+        }
+        ComputeSpec::Length { .. } => Ok(one("length")?.chars().count().to_string()),
+        ComputeSpec::Upper { .. } => Ok(one("upper")?.to_uppercase()),
+        ComputeSpec::Lower { .. } => Ok(one("lower")?.to_lowercase()),
+        ComputeSpec::Trim { .. } => Ok(one("trim")?.trim().to_string()),
+        ComputeSpec::Replace {
+            find, replacement, ..
+        } => {
+            let a = one("replace")?;
+            if find.is_empty() {
+                return Err("replace 查找串为空(节点失败,无静默回退)".to_string());
+            }
+            Ok(a.replace(find.as_str(), replacement))
+        }
+        ComputeSpec::SplitAt {
+            separator, index, ..
+        } => {
+            let a = one("split_at")?;
+            if separator.is_empty() {
+                return Err("split_at 分隔符为空(节点失败,无静默回退)".to_string());
+            }
+            let idx = usize::try_from(*index)
+                .map_err(|_| format!("split_at 段索引 {index} 越界(节点失败,无静默回退)"))?;
+            a.split(separator.as_str())
+                .nth(idx)
+                .map(str::to_string)
+                .ok_or_else(|| format!("split_at 段索引 {index} 越界(节点失败,无静默回退)"))
+        }
+        ComputeSpec::Substr { start, length, .. } => {
+            let a = one("substr")?;
+            let chars: Vec<char> = a.chars().collect();
+            let count = chars.len() as u64;
+            if *start > count {
+                return Err(format!(
+                    "substr 起始 {start} 越界(字符数 {count})(节点失败,无静默回退)"
+                ));
+            }
+            let end = start.checked_add(*length).ok_or_else(|| {
+                format!("substr 取值越界(start {start}+length {length})(节点失败,无静默回退)")
+            })?;
+            if end > count {
+                return Err(format!(
+                    "substr 取值越界(start {start}+length {length} > 字符数 {count})(节点失败,无静默回退)"
+                ));
+            }
+            Ok(chars[*start as usize..end as usize].iter().collect())
+        }
+        ComputeSpec::Join { separator, .. } => {
+            multi("join")?;
+            if separator.is_empty() {
+                return Err("join 分隔符为空(节点失败,无静默回退)".to_string());
+            }
+            Ok(resolved.join(separator.as_str()))
+        }
+        // ===== v1.3 日期（仅 UTC、仅显式入参、无当前时间函数——确定性红线） =====
+        ComputeSpec::EpochToDate { .. } => {
+            let e = parse_i64_input("epoch_to_date", one("epoch_to_date")?)?;
+            let days = e.div_euclid(86_400);
+            if !(DATE_DOMAIN_MIN_DAYS..=DATE_DOMAIN_MAX_DAYS).contains(&days) {
+                return Err(format!(
+                    "epoch_to_date 值 {e} 换算日期超出 0000-01-01..=9999-12-31(节点失败,无静默回退)"
+                ));
+            }
+            let (y, m, d) = civil_from_days(days);
+            Ok(format!("{y:04}-{m:02}-{d:02}"))
+        }
+        ComputeSpec::DateDiffDays { .. } => {
+            let [a, b] = resolved.as_slice() else {
+                return Err(format!(
+                    "date_diff_days 需恰 2 输入,实得 {}",
+                    resolved.len()
+                ));
+            };
+            let (d0, d1) = (
+                parse_date_str("date_diff_days", a)?,
+                parse_date_str("date_diff_days", b)?,
+            );
+            let diff = d1
+                .checked_sub(d0)
+                .ok_or_else(|| "date_diff_days 整数溢出(节点失败,无静默回退)".to_string())?;
+            Ok(diff.to_string())
+        }
+        ComputeSpec::EpochAddDays { days, .. } => {
+            let e = parse_i64_input("epoch_add_days", one("epoch_add_days")?)?;
+            let delta = days
+                .checked_mul(86_400)
+                .ok_or_else(|| "epoch_add_days 整数溢出(节点失败,无静默回退)".to_string())?;
+            let out = e
+                .checked_add(delta)
+                .ok_or_else(|| "epoch_add_days 整数溢出(节点失败,无静默回退)".to_string())?;
+            Ok(out.to_string())
+        }
+        // ===== v1.3 逻辑（封闭布尔词表 true|false，不隐式真值化） =====
+        ComputeSpec::And { .. } => {
+            multi("and")?;
+            let vals: Result<Vec<bool>, String> = resolved
+                .iter()
+                .map(|v| parse_bool_vocab("and", v))
+                .collect();
+            Ok(if vals?.iter().all(|&b| b) {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string())
+        }
+        ComputeSpec::Or { .. } => {
+            multi("or")?;
+            let vals: Result<Vec<bool>, String> =
+                resolved.iter().map(|v| parse_bool_vocab("or", v)).collect();
+            Ok(if vals?.iter().any(|&b| b) {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string())
+        }
+        ComputeSpec::Not { .. } => {
+            let v = parse_bool_vocab("not", one("not")?)?;
+            Ok(if v { "false" } else { "true" }.to_string())
+        }
+        ComputeSpec::IfElse { .. } => {
+            let [cond, t, f] = resolved.as_slice() else {
+                return Err(format!("if_else 需恰 3 输入,实得 {}", resolved.len()));
+            };
+            // 选择器语义:条件取封闭布尔词表,分支结果原样字符串(无词表)
+            if parse_bool_vocab("if_else", cond)? {
+                Ok(t.clone())
+            } else {
+                Ok(f.clone())
+            }
+        }
+        ComputeSpec::Clamp {
+            min_val, max_val, ..
+        } => {
+            let x = parse_i64_input("clamp", one("clamp")?)?;
+            // min_val > max_val 已在加载期拒载;此处用整体序运算防御直调 panic
+            Ok(x.max(*min_val).min(*max_val).to_string())
+        }
     }
 }
 
-/// compute 节点形态校验(封闭目录代码层校验,交付物 4 §4.6 双保险——schema oneOf
-/// 已表达 + 本校验兜底):输入数量、threshold 互斥、pattern 编译、inputs 引用存在性
+/// compute 形态公共校验(封闭目录 27 函数;schema oneOf 已表达,代码层双保险)
+///
+/// 只做**形态**校验:输入数量区间、常量参数合法值(threshold 互斥/pattern 编译/
+/// 非空分隔符与查找串/clamp 界序)。不含输入引用存在性(消费点各自持有 id_set)。
+/// 消费点:[`validate_compute_spec`](加载校验)与 materializer::check_compute_spec
+/// (物化器防御性再校验)——单一实现,禁复制第二份。
+pub fn check_spec_shape(spec: &ComputeSpec) -> Result<(), String> {
+    let count =
+        |inputs: &[ComputeInput], fname: &str, lo: usize, hi: usize| -> Result<(), String> {
+            if inputs.len() < lo || inputs.len() > hi {
+                return Err(format!(
+                    "{fname} requires {lo}..={hi} inputs, got {}",
+                    inputs.len()
+                ));
+            }
+            Ok(())
+        };
+    let exactly = |inputs: &[ComputeInput], fname: &str, n: usize| -> Result<(), String> {
+        if inputs.len() != n {
+            return Err(format!(
+                "{fname} requires exactly {n} inputs, got {}",
+                inputs.len()
+            ));
+        }
+        Ok(())
+    };
+    match spec {
+        // ===== v1.2 三函数 =====
+        ComputeSpec::Strcmp { inputs, .. } => exactly(inputs, "strcmp", 2),
+        ComputeSpec::NumericCmp {
+            inputs, threshold, ..
+        } => {
+            count(inputs, "numeric_cmp", 1, 2)?;
+            if inputs.len() == 1 && threshold.is_none() {
+                return Err("numeric_cmp single-input form requires threshold".to_string());
+            }
+            if inputs.len() == 2 && threshold.is_some() {
+                return Err("numeric_cmp two-input form forbids threshold".to_string());
+            }
+            Ok(())
+        }
+        ComputeSpec::RegexMatch { inputs, pattern } => {
+            exactly(inputs, "regex_match", 1)?;
+            if pattern.is_empty() {
+                return Err("regex pattern must be non-empty".to_string());
+            }
+            regex::Regex::new(pattern)
+                .map(|_| ())
+                .map_err(|e| format!("invalid regex pattern '{pattern}': {e}"))
+        }
+        // ===== v1.3 算术 =====
+        ComputeSpec::Add { inputs } => count(inputs, "add", 2, 8),
+        ComputeSpec::Sub { inputs } => count(inputs, "sub", 2, 8),
+        ComputeSpec::Mul { inputs } => count(inputs, "mul", 2, 8),
+        ComputeSpec::Div { inputs } => exactly(inputs, "div", 2),
+        ComputeSpec::Abs { inputs } => exactly(inputs, "abs", 1),
+        ComputeSpec::Min { inputs } => count(inputs, "min", 2, 8),
+        ComputeSpec::Max { inputs } => count(inputs, "max", 2, 8),
+        // ===== v1.3 字符串 =====
+        ComputeSpec::Concat { inputs } => count(inputs, "concat", 2, 8),
+        ComputeSpec::Length { inputs } => exactly(inputs, "length", 1),
+        ComputeSpec::Upper { inputs } => exactly(inputs, "upper", 1),
+        ComputeSpec::Lower { inputs } => exactly(inputs, "lower", 1),
+        ComputeSpec::Trim { inputs } => exactly(inputs, "trim", 1),
+        ComputeSpec::Replace { inputs, find, .. } => {
+            exactly(inputs, "replace", 1)?;
+            if find.is_empty() {
+                return Err("replace requires non-empty find".to_string());
+            }
+            Ok(())
+        }
+        ComputeSpec::SplitAt {
+            inputs, separator, ..
+        } => {
+            exactly(inputs, "split_at", 1)?;
+            if separator.is_empty() {
+                return Err("split_at requires non-empty separator".to_string());
+            }
+            Ok(())
+        }
+        ComputeSpec::Substr { inputs, .. } => exactly(inputs, "substr", 1),
+        ComputeSpec::Join { inputs, separator } => {
+            count(inputs, "join", 2, 8)?;
+            if separator.is_empty() {
+                return Err("join requires non-empty separator".to_string());
+            }
+            Ok(())
+        }
+        // ===== v1.3 日期 =====
+        ComputeSpec::EpochToDate { inputs } => exactly(inputs, "epoch_to_date", 1),
+        ComputeSpec::DateDiffDays { inputs } => exactly(inputs, "date_diff_days", 2),
+        ComputeSpec::EpochAddDays { inputs, .. } => exactly(inputs, "epoch_add_days", 1),
+        // ===== v1.3 逻辑 =====
+        ComputeSpec::And { inputs } => count(inputs, "and", 2, 8),
+        ComputeSpec::Or { inputs } => count(inputs, "or", 2, 8),
+        ComputeSpec::Not { inputs } => exactly(inputs, "not", 1),
+        ComputeSpec::IfElse { inputs } => exactly(inputs, "if_else", 3),
+        ComputeSpec::Clamp {
+            inputs,
+            min_val,
+            max_val,
+        } => {
+            exactly(inputs, "clamp", 1)?;
+            if min_val > max_val {
+                return Err("clamp requires min_val <= max_val".to_string());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// compute 节点校验(封闭目录代码层校验,交付物 4 §4.6 双保险——schema oneOf
+/// 已表达 + 本校验兜底):形态(公共实现 [`check_spec_shape`],与物化器防御性
+/// 再校验同源,禁复制第二份)+ inputs 引用存在性
 fn validate_compute_spec(
     wf_id: &str,
     node_id: &str,
     spec: &ComputeSpec,
     id_set: &HashSet<&str>,
 ) -> Result<(), String> {
-    let check_inputs = |spec_inputs: &[ComputeInput], expect: &str| -> Result<(), String> {
-        for i in spec_inputs {
-            if let ComputeInput::Node(name) = i {
-                if !id_set.contains(name.as_str()) {
-                    return Err(format!(
-                        "workflow '{wf_id}': compute node '{node_id}' input references unknown node '{name}'"
-                    ));
-                }
-            }
-        }
-        if spec_inputs.is_empty() {
-            return Err(format!(
-                "workflow '{wf_id}': compute node '{node_id}' ({expect}) requires inputs"
-            ));
-        }
-        Ok(())
-    };
-    match spec {
-        ComputeSpec::Strcmp { inputs, .. } => {
-            check_inputs(inputs, "strcmp")?;
-            if inputs.len() != 2 {
+    check_spec_shape(spec)
+        .map_err(|e| format!("workflow '{wf_id}': compute node '{node_id}' {e}"))?;
+    for i in spec.inputs() {
+        if let ComputeInput::Node(name) = i {
+            if !id_set.contains(name.as_str()) {
                 return Err(format!(
-                    "workflow '{wf_id}': compute node '{node_id}' strcmp requires exactly 2 inputs, got {}",
-                    inputs.len()
+                    "workflow '{wf_id}': compute node '{node_id}' input references unknown node '{name}'"
                 ));
             }
-        }
-        ComputeSpec::NumericCmp {
-            inputs, threshold, ..
-        } => {
-            check_inputs(inputs, "numeric_cmp")?;
-            if inputs.len() > 2 {
-                return Err(format!(
-                    "workflow '{wf_id}': compute node '{node_id}' numeric_cmp requires 1..=2 inputs, got {}",
-                    inputs.len()
-                ));
-            }
-            let single = inputs.len() == 1;
-            if single && threshold.is_none() {
-                return Err(format!(
-                    "workflow '{wf_id}': compute node '{node_id}' numeric_cmp single-input form requires threshold"
-                ));
-            }
-            if !single && threshold.is_some() {
-                return Err(format!(
-                    "workflow '{wf_id}': compute node '{node_id}' numeric_cmp two-input form forbids threshold"
-                ));
-            }
-        }
-        ComputeSpec::RegexMatch { inputs, pattern } => {
-            check_inputs(inputs, "regex_match")?;
-            if inputs.len() != 1 {
-                return Err(format!(
-                    "workflow '{wf_id}': compute node '{node_id}' regex_match requires exactly 1 input, got {}",
-                    inputs.len()
-                ));
-            }
-            if pattern.is_empty() {
-                return Err(format!(
-                    "workflow '{wf_id}': compute node '{node_id}' regex pattern must be non-empty"
-                ));
-            }
-            regex::Regex::new(pattern).map_err(|e| {
-                format!(
-                    "workflow '{wf_id}': compute node '{node_id}' invalid regex pattern '{pattern}': {e}"
-                )
-            })?;
         }
     }
     Ok(())
@@ -1389,6 +1853,580 @@ mod tests {
         // 跨 execute 累加（同一引擎再跑一次 → 6）
         engine.execute(&wf).await.expect("second run");
         assert_eq!(engine.executed_nodes(), 6);
+    }
+
+    // ===== v1.3 新增 24 函数（词表/确定性/fail-fast/形态四测） =====
+
+    fn rmap(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// 测试辅助：按名字构造节点引用（`_spec` 形参有意忽略——调用点以字面量
+    /// 自注所构造的函数形态，提升用例可读性；运行时只用 names）
+    fn nodes_of(_spec: &ComputeSpec, names: &[&str]) -> Vec<ComputeInput> {
+        names
+            .iter()
+            .map(|n| ComputeInput::Node(n.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_eval_compute_v13_result_vocabularies() {
+        // 算术族→十进制整数字符串(可带负号);div 向零取整
+        let r = rmap(&[("a", "2"), ("b", "3"), ("n", "-4"), ("x", "10"), ("y", "7")]);
+        let add = ComputeSpec::Add {
+            inputs: nodes_of(&ComputeSpec::Add { inputs: vec![] }, &["a", "b"]),
+        };
+        assert_eq!(eval_compute(&add, &r).unwrap(), "5");
+        let sub = ComputeSpec::Sub {
+            inputs: nodes_of(&ComputeSpec::Sub { inputs: vec![] }, &["x", "a", "a"]),
+        };
+        assert_eq!(eval_compute(&sub, &r).unwrap(), "6");
+        let mul = ComputeSpec::Mul {
+            inputs: nodes_of(&ComputeSpec::Mul { inputs: vec![] }, &["a", "n"]),
+        };
+        assert_eq!(eval_compute(&mul, &r).unwrap(), "-8");
+        let div = ComputeSpec::Div {
+            inputs: nodes_of(&ComputeSpec::Div { inputs: vec![] }, &["y", "a"]),
+        };
+        assert_eq!(eval_compute(&div, &r).unwrap(), "3");
+        let div_neg = ComputeSpec::Div {
+            inputs: nodes_of(&ComputeSpec::Div { inputs: vec![] }, &["n", "a"]),
+        };
+        assert_eq!(eval_compute(&div_neg, &r).unwrap(), "-2");
+        let abs = ComputeSpec::Abs {
+            inputs: nodes_of(&ComputeSpec::Abs { inputs: vec![] }, &["n"]),
+        };
+        assert_eq!(eval_compute(&abs, &r).unwrap(), "4");
+        let min = ComputeSpec::Min {
+            inputs: nodes_of(&ComputeSpec::Min { inputs: vec![] }, &["x", "y", "n"]),
+        };
+        assert_eq!(eval_compute(&min, &r).unwrap(), "-4");
+        let max = ComputeSpec::Max {
+            inputs: nodes_of(&ComputeSpec::Max { inputs: vec![] }, &["x", "y", "n"]),
+        };
+        assert_eq!(eval_compute(&max, &r).unwrap(), "10");
+        // clamp:越界截断到界内
+        let clamp_hi = ComputeSpec::Clamp {
+            inputs: nodes_of(
+                &ComputeSpec::Clamp {
+                    inputs: vec![],
+                    min_val: 0,
+                    max_val: 10,
+                },
+                &["x"],
+            ),
+            min_val: 0,
+            max_val: 10,
+        };
+        assert_eq!(eval_compute(&clamp_hi, &r).unwrap(), "10");
+        let clamp_lo = ComputeSpec::Clamp {
+            inputs: nodes_of(
+                &ComputeSpec::Clamp {
+                    inputs: vec![],
+                    min_val: 0,
+                    max_val: 10,
+                },
+                &["n"],
+            ),
+            min_val: 0,
+            max_val: 10,
+        };
+        assert_eq!(eval_compute(&clamp_lo, &r).unwrap(), "0");
+
+        // 字符串族→原样字符串(Unicode char 计数/索引);length→整数字符串
+        let s = rmap(&[
+            ("h", "héllo"),
+            ("sz", "ß"),
+            ("pad", "  hi  "),
+            ("csv", "a,b,c"),
+        ]);
+        let concat = ComputeSpec::Concat {
+            inputs: nodes_of(&ComputeSpec::Concat { inputs: vec![] }, &["h", "h"]),
+        };
+        assert_eq!(eval_compute(&concat, &s).unwrap(), "héllohéllo");
+        let length = ComputeSpec::Length {
+            inputs: nodes_of(&ComputeSpec::Length { inputs: vec![] }, &["h"]),
+        };
+        assert_eq!(eval_compute(&length, &s).unwrap(), "5");
+        let upper = ComputeSpec::Upper {
+            inputs: nodes_of(&ComputeSpec::Upper { inputs: vec![] }, &["sz"]),
+        };
+        assert_eq!(eval_compute(&upper, &s).unwrap(), "SS");
+        let lower = ComputeSpec::Lower {
+            inputs: nodes_of(&ComputeSpec::Lower { inputs: vec![] }, &["h"]),
+        };
+        assert_eq!(eval_compute(&lower, &s).unwrap(), "héllo");
+        let trim = ComputeSpec::Trim {
+            inputs: nodes_of(&ComputeSpec::Trim { inputs: vec![] }, &["pad"]),
+        };
+        assert_eq!(eval_compute(&trim, &s).unwrap(), "hi");
+        let replace = ComputeSpec::Replace {
+            inputs: nodes_of(
+                &ComputeSpec::Replace {
+                    inputs: vec![],
+                    find: String::new(),
+                    replacement: String::new(),
+                },
+                &["h"],
+            ),
+            find: "l".to_string(),
+            replacement: "L".to_string(),
+        };
+        assert_eq!(eval_compute(&replace, &s).unwrap(), "héLLo");
+        let split = ComputeSpec::SplitAt {
+            inputs: nodes_of(
+                &ComputeSpec::SplitAt {
+                    inputs: vec![],
+                    separator: String::new(),
+                    index: 1,
+                },
+                &["csv"],
+            ),
+            separator: ",".to_string(),
+            index: 1,
+        };
+        assert_eq!(eval_compute(&split, &s).unwrap(), "b");
+        let substr = ComputeSpec::Substr {
+            inputs: nodes_of(
+                &ComputeSpec::Substr {
+                    inputs: vec![],
+                    start: 1,
+                    length: 3,
+                },
+                &["h"],
+            ),
+            start: 1,
+            length: 3,
+        };
+        assert_eq!(eval_compute(&substr, &s).unwrap(), "éll");
+        let join = ComputeSpec::Join {
+            inputs: nodes_of(
+                &ComputeSpec::Join {
+                    inputs: vec![],
+                    separator: String::new(),
+                },
+                &["a", "b", "x"],
+            ),
+            separator: "|".to_string(),
+        };
+        assert_eq!(eval_compute(&join, &r).unwrap(), "2|3|10");
+
+        // 日期族:epoch_to_date→YYYY-MM-DD;date_diff_days→整数字符串(可负);epoch_add_days→epoch 秒
+        let d = rmap(&[
+            ("e", "1791331200"), // 2026-10-07T00:00:00Z
+            ("d0", "2026-01-01"),
+            ("d1", "2026-01-04"),
+        ]);
+        let to_date = ComputeSpec::EpochToDate {
+            inputs: nodes_of(&ComputeSpec::EpochToDate { inputs: vec![] }, &["e"]),
+        };
+        assert_eq!(eval_compute(&to_date, &d).unwrap(), "2026-10-07");
+        let diff = ComputeSpec::DateDiffDays {
+            inputs: nodes_of(&ComputeSpec::DateDiffDays { inputs: vec![] }, &["d0", "d1"]),
+        };
+        assert_eq!(eval_compute(&diff, &d).unwrap(), "3");
+        let diff_neg = ComputeSpec::DateDiffDays {
+            inputs: nodes_of(&ComputeSpec::DateDiffDays { inputs: vec![] }, &["d1", "d0"]),
+        };
+        assert_eq!(eval_compute(&diff_neg, &d).unwrap(), "-3");
+        let add_days = ComputeSpec::EpochAddDays {
+            inputs: nodes_of(
+                &ComputeSpec::EpochAddDays {
+                    inputs: vec![],
+                    days: 7,
+                },
+                &["e"],
+            ),
+            days: 7,
+        };
+        assert_eq!(eval_compute(&add_days, &d).unwrap(), "1791936000");
+        let add_days_neg = ComputeSpec::EpochAddDays {
+            inputs: nodes_of(
+                &ComputeSpec::EpochAddDays {
+                    inputs: vec![],
+                    days: -1,
+                },
+                &["e"],
+            ),
+            days: -1,
+        };
+        assert_eq!(eval_compute(&add_days_neg, &d).unwrap(), "1791244800");
+
+        // 逻辑族→true|false;if_else→分支原样字符串(选择器语义)
+        let b = rmap(&[("t", "true"), ("f", "false"), ("s1", "yes"), ("s2", "no")]);
+        let and = ComputeSpec::And {
+            inputs: nodes_of(&ComputeSpec::And { inputs: vec![] }, &["t", "t"]),
+        };
+        assert_eq!(eval_compute(&and, &b).unwrap(), "true");
+        let and_f = ComputeSpec::And {
+            inputs: nodes_of(&ComputeSpec::And { inputs: vec![] }, &["t", "f"]),
+        };
+        assert_eq!(eval_compute(&and_f, &b).unwrap(), "false");
+        let or = ComputeSpec::Or {
+            inputs: nodes_of(&ComputeSpec::Or { inputs: vec![] }, &["f", "t"]),
+        };
+        assert_eq!(eval_compute(&or, &b).unwrap(), "true");
+        let or_f = ComputeSpec::Or {
+            inputs: nodes_of(&ComputeSpec::Or { inputs: vec![] }, &["f", "f"]),
+        };
+        assert_eq!(eval_compute(&or_f, &b).unwrap(), "false");
+        let not = ComputeSpec::Not {
+            inputs: nodes_of(&ComputeSpec::Not { inputs: vec![] }, &["f"]),
+        };
+        assert_eq!(eval_compute(&not, &b).unwrap(), "true");
+        let if_t = ComputeSpec::IfElse {
+            inputs: nodes_of(&ComputeSpec::IfElse { inputs: vec![] }, &["t", "s1", "s2"]),
+        };
+        assert_eq!(eval_compute(&if_t, &b).unwrap(), "yes");
+        let if_f = ComputeSpec::IfElse {
+            inputs: nodes_of(&ComputeSpec::IfElse { inputs: vec![] }, &["f", "s1", "s2"]),
+        };
+        assert_eq!(eval_compute(&if_f, &b).unwrap(), "no");
+    }
+
+    #[test]
+    fn test_eval_compute_v13_deterministic_byte_identical() {
+        // v1.3 函数同输入重复求值逐字节一致(确定性红线)
+        let results = rmap(&[("e", "1791331200"), ("a", "6"), ("b", "7")]);
+        let specs: Vec<ComputeSpec> = vec![
+            ComputeSpec::EpochToDate {
+                inputs: nodes_of(&ComputeSpec::EpochToDate { inputs: vec![] }, &["e"]),
+            },
+            ComputeSpec::Add {
+                inputs: nodes_of(&ComputeSpec::Add { inputs: vec![] }, &["a", "b"]),
+            },
+            ComputeSpec::Mul {
+                inputs: nodes_of(&ComputeSpec::Mul { inputs: vec![] }, &["a", "b"]),
+            },
+        ];
+        for spec in &specs {
+            let first = eval_compute(spec, &results).unwrap();
+            for _ in 0..10 {
+                assert_eq!(eval_compute(spec, &results).unwrap(), first);
+            }
+        }
+    }
+
+    #[test]
+    fn test_eval_compute_v13_fail_fast_errors() {
+        // 错误语义总纲(fail-fast,无静默回退):解析失败/除零/溢出/越界/域外/词表外/空串参数
+        let r = rmap(&[
+            ("max", "9223372036854775807"),
+            ("min", "-9223372036854775808"),
+            ("neg", "-1"),
+            ("one", "1"),
+            ("zero", "0"),
+            ("float", "3.5"),
+            ("csv", "a,b"),
+            ("abc", "abc"),
+            ("big", "9999999999999"),
+            ("bad_date", "2026/01/01"),
+            ("bad_month", "2026-13-01"),
+            ("yes", "yes"),
+            ("num", "42"),
+        ]);
+        let expect_err = |spec: &ComputeSpec, results: &BTreeMap<String, String>, needle: &str| {
+            let err = eval_compute(spec, results).unwrap_err();
+            assert!(err.contains(needle), "expect '{needle}', got: {err}");
+        };
+        // 整数解析失败(3.5 非整数形态)
+        expect_err(
+            &ComputeSpec::Add {
+                inputs: nodes_of(&ComputeSpec::Add { inputs: vec![] }, &["one", "float"]),
+            },
+            &r,
+            "整数解析失败",
+        );
+        // 除零
+        expect_err(
+            &ComputeSpec::Div {
+                inputs: nodes_of(&ComputeSpec::Div { inputs: vec![] }, &["one", "zero"]),
+            },
+            &r,
+            "除数为 0",
+        );
+        // 溢出:i64::MAX+1;i64::MIN 取绝对值;i64::MIN ÷ -1;epoch_add_days 乘法溢出
+        expect_err(
+            &ComputeSpec::Add {
+                inputs: nodes_of(&ComputeSpec::Add { inputs: vec![] }, &["max", "one"]),
+            },
+            &r,
+            "整数溢出",
+        );
+        expect_err(
+            &ComputeSpec::Abs {
+                inputs: nodes_of(&ComputeSpec::Abs { inputs: vec![] }, &["min"]),
+            },
+            &r,
+            "溢出",
+        );
+        expect_err(
+            &ComputeSpec::Div {
+                inputs: nodes_of(&ComputeSpec::Div { inputs: vec![] }, &["min", "neg"]),
+            },
+            &r,
+            "溢出",
+        );
+        expect_err(
+            &ComputeSpec::EpochAddDays {
+                inputs: nodes_of(
+                    &ComputeSpec::EpochAddDays {
+                        inputs: vec![],
+                        days: 0,
+                    },
+                    &["max"],
+                ),
+                days: i64::MAX,
+            },
+            &r,
+            "整数溢出",
+        );
+        // 索引越界:split_at 段越界;substr 越界(无静默截断)
+        expect_err(
+            &ComputeSpec::SplitAt {
+                inputs: nodes_of(
+                    &ComputeSpec::SplitAt {
+                        inputs: vec![],
+                        separator: ",".into(),
+                        index: 5,
+                    },
+                    &["csv"],
+                ),
+                separator: ",".to_string(),
+                index: 5,
+            },
+            &r,
+            "越界",
+        );
+        expect_err(
+            &ComputeSpec::Substr {
+                inputs: nodes_of(
+                    &ComputeSpec::Substr {
+                        inputs: vec![],
+                        start: 1,
+                        length: 9,
+                    },
+                    &["abc"],
+                ),
+                start: 1,
+                length: 9,
+            },
+            &r,
+            "越界",
+        );
+        // 日期域外与形态不符
+        expect_err(
+            &ComputeSpec::EpochToDate {
+                inputs: nodes_of(&ComputeSpec::EpochToDate { inputs: vec![] }, &["big"]),
+            },
+            &r,
+            "超出 0000-01-01..=9999-12-31",
+        );
+        expect_err(
+            &ComputeSpec::DateDiffDays {
+                inputs: nodes_of(
+                    &ComputeSpec::DateDiffDays { inputs: vec![] },
+                    &["bad_date", "bad_month"],
+                ),
+            },
+            &r,
+            "形态不符",
+        );
+        // 布尔词表外(不隐式真值化)
+        expect_err(
+            &ComputeSpec::And {
+                inputs: nodes_of(&ComputeSpec::And { inputs: vec![] }, &["yes", "yes"]),
+            },
+            &r,
+            "布尔词表",
+        );
+        expect_err(
+            &ComputeSpec::Not {
+                inputs: nodes_of(&ComputeSpec::Not { inputs: vec![] }, &["num"]),
+            },
+            &r,
+            "布尔词表",
+        );
+        // 加载期已拦、eval 兜底防御:空查找串/空分隔符(直接构造直调 eval)
+        expect_err(
+            &ComputeSpec::Replace {
+                inputs: nodes_of(
+                    &ComputeSpec::Replace {
+                        inputs: vec![],
+                        find: String::new(),
+                        replacement: String::new(),
+                    },
+                    &["abc"],
+                ),
+                find: String::new(),
+                replacement: "x".to_string(),
+            },
+            &r,
+            "查找串为空",
+        );
+        expect_err(
+            &ComputeSpec::Join {
+                inputs: nodes_of(
+                    &ComputeSpec::Join {
+                        inputs: vec![],
+                        separator: String::new(),
+                    },
+                    &["abc", "csv"],
+                ),
+                separator: String::new(),
+            },
+            &r,
+            "分隔符为空",
+        );
+    }
+
+    #[test]
+    fn test_validate_compute_v13_shape_rejections() {
+        // v1.3 形态校验(公共 check_spec_shape,与物化器同源):数量/常量参数/界序/引用
+        let ctx = make_ctx();
+        let engine = WorkflowEngine::new(ctx);
+        let cases: Vec<(Workflow, &str)> = vec![
+            // add 1 输入(需 2..=8)
+            (
+                pure_compute_wf(
+                    vec![compute_node(
+                        "c",
+                        &[],
+                        ComputeSpec::Add {
+                            inputs: vec![ComputeInput::Node("c".into())],
+                        },
+                    )],
+                    "c",
+                ),
+                "add requires 2..=8 inputs",
+            ),
+            // div 3 输入(需恰 2)
+            (
+                pure_compute_wf(
+                    vec![compute_node(
+                        "c",
+                        &[],
+                        ComputeSpec::Div {
+                            inputs: vec![
+                                ComputeInput::Node("c".into()),
+                                ComputeInput::Node("c".into()),
+                                ComputeInput::Node("c".into()),
+                            ],
+                        },
+                    )],
+                    "c",
+                ),
+                "div requires exactly 2 inputs",
+            ),
+            // if_else 2 输入(需恰 3)
+            (
+                pure_compute_wf(
+                    vec![compute_node(
+                        "c",
+                        &[],
+                        ComputeSpec::IfElse {
+                            inputs: vec![
+                                ComputeInput::Node("c".into()),
+                                ComputeInput::Node("c".into()),
+                            ],
+                        },
+                    )],
+                    "c",
+                ),
+                "if_else requires exactly 3 inputs",
+            ),
+            // clamp min_val > max_val(拒载)
+            (
+                pure_compute_wf(
+                    vec![compute_node(
+                        "c",
+                        &[],
+                        ComputeSpec::Clamp {
+                            inputs: vec![ComputeInput::Node("c".into())],
+                            min_val: 10,
+                            max_val: 0,
+                        },
+                    )],
+                    "c",
+                ),
+                "clamp requires min_val <= max_val",
+            ),
+            // replace 空 find
+            (
+                pure_compute_wf(
+                    vec![compute_node(
+                        "c",
+                        &[],
+                        ComputeSpec::Replace {
+                            inputs: vec![ComputeInput::Node("c".into())],
+                            find: String::new(),
+                            replacement: "x".to_string(),
+                        },
+                    )],
+                    "c",
+                ),
+                "replace requires non-empty find",
+            ),
+            // join 空分隔符
+            (
+                pure_compute_wf(
+                    vec![compute_node(
+                        "c",
+                        &[],
+                        ComputeSpec::Join {
+                            inputs: vec![
+                                ComputeInput::Node("c".into()),
+                                ComputeInput::Node("c".into()),
+                            ],
+                            separator: String::new(),
+                        },
+                    )],
+                    "c",
+                ),
+                "join requires non-empty separator",
+            ),
+            // split_at 空分隔符
+            (
+                pure_compute_wf(
+                    vec![compute_node(
+                        "c",
+                        &[],
+                        ComputeSpec::SplitAt {
+                            inputs: vec![ComputeInput::Node("c".into())],
+                            separator: String::new(),
+                            index: 0,
+                        },
+                    )],
+                    "c",
+                ),
+                "split_at requires non-empty separator",
+            ),
+            // v1.3 函数引用未知节点
+            (
+                pure_compute_wf(
+                    vec![compute_node(
+                        "c",
+                        &[],
+                        ComputeSpec::Add {
+                            inputs: vec![
+                                ComputeInput::Node("ghost".into()),
+                                ComputeInput::Node("c".into()),
+                            ],
+                        },
+                    )],
+                    "c",
+                ),
+                "unknown node 'ghost'",
+            ),
+        ];
+        for (wf, expect) in cases {
+            let err = engine.validate(&wf).unwrap_err();
+            assert!(err.contains(expect), "expect '{expect}', got: {err}");
+        }
     }
 
     // ===== validate =====

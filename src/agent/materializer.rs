@@ -23,7 +23,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::agent::workflow::{ComputeInput, ComputeSpec, RunWhen, Workflow, WorkflowNode};
+use crate::agent::workflow::{
+    check_spec_shape, ComputeInput, ComputeSpec, RunWhen, Workflow, WorkflowNode,
+};
 
 /// 物化函数版本（semver；MVP 首发，记入 PlanFact.materializer_version 由外层驱动注入）
 pub const MATERIALIZER_VERSION: &str = "1.0.0";
@@ -687,52 +689,11 @@ fn step0_checks(ir: &Ir) -> Result<(), Vec<String>> {
     Ok(())
 }
 
-/// compute 签名防御性校验：输入数、threshold 互斥（schema oneOf 已表达，代码层双保险）
+/// compute 签名防御性校验：委托 workflow::check_spec_shape 公共实现
+/// （输入数、threshold 互斥、pattern 编译、非空分隔符/查找串、clamp 界序——
+/// schema oneOf 已表达，代码层双保险单一实现禁复制）
 fn check_compute_spec(c: &ComputeSpec, node_id: &str) -> Result<(), Vec<String>> {
-    match c {
-        ComputeSpec::Strcmp { inputs, .. } => {
-            if inputs.len() != 2 {
-                return Err(vec![format!(
-                    "compute 节点 '{node_id}' strcmp 须恰 2 个 inputs，实际 {}",
-                    inputs.len()
-                )]);
-            }
-        }
-        ComputeSpec::NumericCmp {
-            inputs, threshold, ..
-        } => {
-            if inputs.is_empty() || inputs.len() > 2 {
-                return Err(vec![format!(
-                    "compute 节点 '{node_id}' numeric_cmp 须 1..=2 个 inputs，实际 {}",
-                    inputs.len()
-                )]);
-            }
-            if inputs.len() == 1 && threshold.is_none() {
-                return Err(vec![format!(
-                    "compute 节点 '{node_id}' numeric_cmp 单输入形态必填 threshold"
-                )]);
-            }
-            if inputs.len() == 2 && threshold.is_some() {
-                return Err(vec![format!(
-                    "compute 节点 '{node_id}' numeric_cmp 双输入形态禁止 threshold"
-                )]);
-            }
-        }
-        ComputeSpec::RegexMatch { inputs, pattern } => {
-            if inputs.len() != 1 {
-                return Err(vec![format!(
-                    "compute 节点 '{node_id}' regex_match 须恰 1 个 inputs，实际 {}",
-                    inputs.len()
-                )]);
-            }
-            if regex::Regex::new(pattern).is_err() {
-                return Err(vec![format!(
-                    "compute 节点 '{node_id}' regex_match pattern 非法（Rust regex 语法，加载期拒载）: '{pattern}'"
-                )]);
-            }
-        }
-    }
-    Ok(())
+    check_spec_shape(c).map_err(|e| vec![format!("compute 节点 '{node_id}' 形态校验失败: {e}")])
 }
 
 /// 重写一个节点的显式依赖边（deps 面禁止 R2：跨迭代依赖由展开器隐式插入，反模式 A2）
@@ -848,6 +809,105 @@ fn rewrite_compute(c: &ComputeSpec, ctx: &RefCtx<'_>) -> Result<ComputeSpec, Str
             inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
             pattern: pattern.clone(),
         },
+        // ----- v1.3 新增 24 函数（只改写 inputs；常量参数原样拷贝） -----
+        ComputeSpec::Add { inputs } => ComputeSpec::Add {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Sub { inputs } => ComputeSpec::Sub {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Mul { inputs } => ComputeSpec::Mul {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Div { inputs } => ComputeSpec::Div {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Abs { inputs } => ComputeSpec::Abs {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Min { inputs } => ComputeSpec::Min {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Max { inputs } => ComputeSpec::Max {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Concat { inputs } => ComputeSpec::Concat {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Length { inputs } => ComputeSpec::Length {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Upper { inputs } => ComputeSpec::Upper {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Lower { inputs } => ComputeSpec::Lower {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Trim { inputs } => ComputeSpec::Trim {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Replace {
+            inputs,
+            find,
+            replacement,
+        } => ComputeSpec::Replace {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+            find: find.clone(),
+            replacement: replacement.clone(),
+        },
+        ComputeSpec::SplitAt {
+            inputs,
+            separator,
+            index,
+        } => ComputeSpec::SplitAt {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+            separator: separator.clone(),
+            index: *index,
+        },
+        ComputeSpec::Substr {
+            inputs,
+            start,
+            length,
+        } => ComputeSpec::Substr {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+            start: *start,
+            length: *length,
+        },
+        ComputeSpec::Join { inputs, separator } => ComputeSpec::Join {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+            separator: separator.clone(),
+        },
+        ComputeSpec::EpochToDate { inputs } => ComputeSpec::EpochToDate {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::DateDiffDays { inputs } => ComputeSpec::DateDiffDays {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::EpochAddDays { inputs, days } => ComputeSpec::EpochAddDays {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+            days: *days,
+        },
+        ComputeSpec::And { inputs } => ComputeSpec::And {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Or { inputs } => ComputeSpec::Or {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Not { inputs } => ComputeSpec::Not {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::IfElse { inputs } => ComputeSpec::IfElse {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+        },
+        ComputeSpec::Clamp {
+            inputs,
+            min_val,
+            max_val,
+        } => ComputeSpec::Clamp {
+            inputs: inputs.iter().map(map_input).collect::<Result<_, _>>()?,
+            min_val: *min_val,
+            max_val: *max_val,
+        },
     })
 }
 
@@ -947,12 +1007,8 @@ fn self_check(nodes: &[WorkflowNode], output_node: &str, ir: &Ir) -> Result<(), 
             }
         }
         if let Some(c) = &n.compute {
-            let inputs = match c {
-                ComputeSpec::Strcmp { inputs, .. }
-                | ComputeSpec::NumericCmp { inputs, .. }
-                | ComputeSpec::RegexMatch { inputs, .. } => inputs,
-            };
-            for i in inputs {
+            // 残留 prev. 形态检查（inputs 统一经 ComputeSpec::inputs() 取用）
+            for i in c.inputs() {
                 if let ComputeInput::Node(t) = i {
                     if t.starts_with("prev.") {
                         return Err(vec![format!(
@@ -984,12 +1040,7 @@ fn self_check(nodes: &[WorkflowNode], output_node: &str, ir: &Ir) -> Result<(), 
             }
         }
         if let Some(c) = &n.compute {
-            let inputs = match c {
-                ComputeSpec::Strcmp { inputs, .. }
-                | ComputeSpec::NumericCmp { inputs, .. }
-                | ComputeSpec::RegexMatch { inputs, .. } => inputs,
-            };
-            for i in inputs {
+            for i in c.inputs() {
                 if let ComputeInput::Node(t) = i {
                     if !ids.contains(t.as_str()) {
                         return Err(vec![format!(
@@ -1029,12 +1080,7 @@ fn self_check(nodes: &[WorkflowNode], output_node: &str, ir: &Ir) -> Result<(), 
             }
         }
         if let Some(c) = &n.compute {
-            let inputs = match c {
-                ComputeSpec::Strcmp { inputs, .. }
-                | ComputeSpec::NumericCmp { inputs, .. }
-                | ComputeSpec::RegexMatch { inputs, .. } => inputs,
-            };
-            for i in inputs {
+            for i in c.inputs() {
                 if let ComputeInput::Node(t) = i {
                     earlier(&n.id, t)?;
                 }
@@ -1605,7 +1651,8 @@ mod tests {
             "output_node": "c"
         });
         let errs = materialize_workflow_dag(&doc).expect_err("非法 pattern 须拒载");
-        assert!(errs[0].contains("pattern 非法"), "{errs:?}");
+        // 消息统一化：形态校验收口 check_spec_shape（与 workflow.rs 同源），regex 报错为英文
+        assert!(errs[0].contains("invalid regex pattern"), "{errs:?}");
     }
 
     // ----- PlanFact 唯一汇点派生（实现新明确点）-----

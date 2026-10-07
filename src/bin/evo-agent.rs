@@ -2092,8 +2092,8 @@ fn cmd_workflow(
         }
     };
 
-    // 3.5 校验并加载(宪法 jsonschema 全量校验 + v1.2 物化 / v1.0-v1.1 反序列化;
-    //     workflow_dag v1.0/v1.1/v1.2 按文档形态分派,失败 fail-fast 拒载)
+    // 3.5 校验并加载(宪法 jsonschema 全量校验 + v1.2/v1.3 物化 / v1.0-v1.1 反序列化;
+    //     workflow_dag v1.0/v1.1/v1.2/v1.3 按文档形态分派,失败 fail-fast 拒载)
     let wf: Workflow = match evo_agent::agent::constitution::load_workflow(&wf_value) {
         Ok(w) => w,
         Err(violations) => {

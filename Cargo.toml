@@ -54,7 +54,7 @@ similar = "2"
 # 宪法 schema 校验共享组件(属地执法统一实现;0.2.0 起 schema 编译期内嵌,
 # 运行时零磁盘依赖)。git 依赖 + rev 钉版:crate 未发 crates.io 前的受控消费,
 # 宪法演进须先推 system-rules 再随动升级 rev(演进 SOP)
-evorule-constitution = { git = "https://gitee.com/evorule/evorule-system-rules", rev = "706daa8e7c096debe8a2f29fa8c6dc04d5cba6b6" }
+evorule-constitution = { git = "https://gitee.com/evorule/evorule-system-rules", rev = "92a009acd3ddd949875d02d35d7ccf8fd8376ce4" }
 
 # 快照包类型+自洽校验(DatasetBundle/BundleImporter,TCB 纯函数库)——
 # skill pack → 执行域 bundle 桥接用;版本与 evorule-server 消费面同源对齐,
