@@ -29,6 +29,13 @@ pub struct RetrievalConfig {
     /// importance 内 usage 加成权重（w_u，k 封顶防垄断）
     #[serde(default = "default_w_usage")]
     pub w_usage: f32,
+    /// importance 内来源权威权重（w_a；缺省 0=既有行为零影响；
+    /// user 1.0/system 0.8/llm 0.5,与置信度演化 w_e 同源,11 号 §5.1）
+    #[serde(default)]
+    pub w_authority: f32,
+    /// importance 内实体度权重（w_e；批内实体共现度归一;缺省 0=零影响）
+    #[serde(default)]
+    pub w_entity: f32,
     /// usage 计数封顶（k：min(usage,k) 防高频条目垄断排序）
     #[serde(default = "default_usage_cap")]
     pub usage_cap: u32,
@@ -91,6 +98,14 @@ pub struct LifecycleConfig {
     /// rollup 阈值（现 def.memory.summary_rollup_threshold 的 Recipe 覆盖位）
     #[serde(default = "default_rollup_threshold")]
     pub rollup_threshold: usize,
+    /// 置信度演化开关（缺省关=既有 agent 零影响;开=reinforce 佐证 +0.05·w_e/
+    /// 裁决败者矛盾 −0.10·w_e,公式见 11 号 §4.2 v0.1.8）
+    #[serde(default)]
+    pub confidence_evolution: bool,
+    /// decay 闲置阈值（天）:非 Captured 且零引用超此限 → Decayed（缺省 90;
+    /// 需 < archive_after_idle_days 方有意义,否则归档先至）
+    #[serde(default = "default_decay_after_idle_days")]
+    pub decay_after_idle_days: u64,
 }
 
 fn default_promote_confidence() -> f32 {
@@ -101,6 +116,9 @@ fn default_promote_uses() -> u32 {
 }
 fn default_archive_idle() -> u64 {
     180
+}
+fn default_decay_after_idle_days() -> u64 {
+    90
 }
 fn default_rollup_threshold() -> usize {
     10
@@ -313,6 +331,8 @@ impl Default for MemoryRecipe {
                 w_importance: default_w_importance(),
                 w_confidence: default_w_confidence(),
                 w_usage: default_w_usage(),
+                w_authority: 0.0,
+                w_entity: 0.0,
                 usage_cap: default_usage_cap(),
                 half_life_days: default_half_life(),
             },
@@ -321,6 +341,8 @@ impl Default for MemoryRecipe {
                 promote_min_uses: default_promote_uses(),
                 archive_after_idle_days: default_archive_idle(),
                 rollup_threshold: default_rollup_threshold(),
+                confidence_evolution: false,
+                decay_after_idle_days: default_decay_after_idle_days(),
             },
             budget: BudgetConfig {
                 degradation_order: default_degradation(),
@@ -351,6 +373,10 @@ pub struct RetrievalPolicy {
     pub w_confidence: f32,
     /// importance 内 usage 加成权重（w_u）
     pub w_usage: f32,
+    /// importance 内来源权威权重（缺省 0=零影响）
+    pub w_authority: f32,
+    /// importance 内实体度权重（缺省 0=零影响）
+    pub w_entity: f32,
     /// usage 计数封顶（k）
     pub usage_cap: u32,
     /// 情景半衰期（天）
@@ -372,6 +398,8 @@ impl RetrievalPolicy {
             w_importance: recipe.retrieval.w_importance,
             w_confidence: recipe.retrieval.w_confidence,
             w_usage: recipe.retrieval.w_usage,
+            w_authority: recipe.retrieval.w_authority,
+            w_entity: recipe.retrieval.w_entity,
             usage_cap: recipe.retrieval.usage_cap,
             half_life_episodic_days: recipe.retrieval.half_life_days.episodic,
             half_life_semantic_days: recipe.retrieval.half_life_days.semantic,
@@ -388,6 +416,8 @@ impl RetrievalPolicy {
             w_importance: 0.0,
             w_confidence: 1.0,
             w_usage: 0.2,
+            w_authority: 0.0,
+            w_entity: 0.0,
             usage_cap: 10,
             half_life_episodic_days: 14.0,
             half_life_semantic_days: 90.0,
