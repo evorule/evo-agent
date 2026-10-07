@@ -291,13 +291,21 @@ evo-agent replay --session 123 --narrate
 
 ```bash
 evo-agent workflow research_and_write
+
+# 公式计算场景（v1.3）：LLM 节点只采集参数，求和/工期/日均/钳制全部由
+# compute 纯函数确定性核算（见 rules/workflows/budget_review.json）
+evo-agent workflow budget_review
 ```
 
-工作流 DSL 支持 workflow_dag v1.0/v1.1/v1.2 三版本并存（按文档形态自动分派）：
+工作流 DSL 支持 workflow_dag v1.0/v1.1/v1.2/v1.3 四版本并存（按文档形态自动分派）：
 v1.1 节点级条件分支 `run_when`（求值为假跳过，豁免级联）；v1.2 新增有界循环
 `loops`（加载时静态展开为线性副本链，展开后仍是纯 DAG）与纯函数节点 `compute`
 （封闭目录 `strcmp`/`numeric_cmp`/`regex_match`，不经 LLM、无 IO、无副作用，
-典型用法为循环收敛门控：结果与上一轮一致即提前退出）。
+典型用法为循环收敛门控：结果与上一轮一致即提前退出）；v1.3 将 compute 封闭
+目录扩展至 27 种（算术/字符串/日期/逻辑四族），同输入必同输出、全部 fail-fast
+（除零/溢出/越界/日期域外/词表外即节点失败终止），典型用法为公式计算场景：
+LLM 节点只采集参数，算术全部由 compute 节点确定性核算（示例
+`rules/workflows/budget_review.json`）。
 
 执行失败或预算耗尽时由外层驱动循环（`src/agent/driver.rs`）按 replan 判定函数
 决定是否触发重规划：丢弃式重规划——失败摘要 + 计划结构喂给 planner 产出下一版
