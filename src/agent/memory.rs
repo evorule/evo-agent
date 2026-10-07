@@ -524,6 +524,92 @@ pub struct RecallContext {
     /// 消灭"离线零证明"：审计侧可区分"agent 无记忆运行"与"召回降级运行"。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degradation_notices: Vec<String>,
+    /// 双通道笔记常驻面（Q2 强制回喂 R-1）：按分类×相关性×新鲜度确定性
+    /// 选取的笔记条目（上限见 NOTES_RECALL_LIMIT），渲染为 ## Notes 分区
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<MemoryRecord>,
+    /// 双通道笔记事件回喂面（Q2 强制回喂 R-2）：停滞/错误/审批拒绝触发的
+    /// 相关 failure 笔记与催写行（调用方触发后下一轮注入，渲染进 ## Notes
+    /// 分区头部）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub note_feed: Vec<String>,
+}
+
+/// R-1 常驻回喂的笔记选取上限（确定性选取在源头截断,不参与 ContextBudget
+/// 裁剪——与降级通知同款"小体量关键可靠性信号"口径）
+pub const NOTES_RECALL_LIMIT: usize = 5;
+
+/// R-1 确定性选取：分类×相关性×新鲜度——token 重叠数降序 ▸ 时间戳降序 ▸
+/// key 字典序（全序 tie-break,同输入同选取）。todo/failure 类自带权重加成
+/// （未完成事项与失败教训是回喂的核心价值面）。
+pub(crate) fn select_notes_for_goal(
+    catalog: &[MemoryRecord],
+    goal: &str,
+    limit: usize,
+) -> Vec<MemoryRecord> {
+    let goal_tokens = tokenize_for_match(goal);
+    let mut scored: Vec<(usize, bool, &MemoryRecord)> = catalog
+        .iter()
+        .map(|rec| {
+            let note_tokens = tokenize_for_match(&rec.value);
+            let overlap = note_tokens.iter().filter(|t| goal_tokens.contains(t)).count();
+            let weight_bonus = rec.key.contains("todo") || rec.key.contains("failure");
+            (overlap, weight_bonus, rec)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        let ka = (a.0 + if a.1 { 1 } else { 0 });
+        let kb = (b.0 + if b.1 { 1 } else { 0 });
+        kb.cmp(&ka)
+            .then(b.2.timestamp.cmp(&a.2.timestamp))
+            .then(a.2.key.cmp(&b.2.key))
+    });
+    scored.into_iter().take(limit).map(|(_, _, r)| r.clone()).collect()
+}
+
+/// R-2 事件回喂的纯格式化面（可单测）：failure 正体按 token 重叠匹配取
+/// Top-K,草稿条目转催写行;空结果回退一条可解释的空反馈（触发不静默）。
+pub(crate) fn format_failure_feed(
+    catalog: &[MemoryRecord],
+    context_text: &str,
+    limit: usize,
+) -> Vec<String> {
+    let mut feed: Vec<String> = Vec::new();
+    let mut matched: Vec<(usize, &MemoryRecord)> = Vec::new();
+    let ctx_tokens = tokenize_for_match(context_text);
+    for rec in catalog {
+        let is_draft = rec.key.contains("draft");
+        let is_failure = rec.key.contains("failure");
+        if !is_failure && !is_draft {
+            continue;
+        }
+        if is_draft {
+            // 催写（Q4↔Q3 闭环）：机械草稿缺根因,强制要求 LLM 补记转正
+            feed.push(format!(
+                "[强制回喂][催写] 笔记 {} 缺根因假设,请立即用 note_write(failure) 补记根因与防再踩措施后转正;草稿原文:{}",
+                rec.key,
+                rec.value.chars().take(160).collect::<String>()
+            ));
+            continue;
+        }
+        let note_tokens = tokenize_for_match(&rec.value);
+        let overlap = note_tokens.iter().filter(|t| ctx_tokens.contains(t)).count();
+        matched.push((overlap, rec));
+    }
+    matched.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.timestamp.cmp(&a.1.timestamp)));
+    for (overlap, rec) in matched.into_iter().take(limit) {
+        feed.push(format!(
+            "[强制回喂] 历史 failure 笔记 {}（相关性命中 {overlap}）:{}",
+            rec.key,
+            rec.value.chars().take(200).collect::<String>()
+        ));
+    }
+    if feed.is_empty() {
+        // 兜底:无草稿且无 failure 笔记=如实带一条空反馈（触发可解释,
+        // 不让"触发→无内容"变成静默）
+        feed.push("[强制回喂] 本次触发未匹配到历史 failure 笔记（尚无失败教训在账）.".to_string());
+    }
+    feed
 }
 
 /// C3: 记忆预算控制器
@@ -1940,7 +2026,70 @@ impl MemoryManager {
                 .collect();
         }
 
+        // 双通道笔记常驻面（Q2 强制回喂 R-1）：笔记目录直读账本（绕检索
+        // 缓存——"记了必被看到"语义要求同会话笔记即时可见，缓存 TTL 窗口
+        // 会吞掉刚写条目；每轮一 GET 成本有界），按分类×相关性×新鲜度
+        // 确定性选取。拉取失败 fail-visible（降级通知，与其它层同款）。
+        match self.fetch_notes_catalog().await {
+            Ok(catalog) => {
+                ctx.notes = select_notes_for_goal(&catalog, goal, NOTES_RECALL_LIMIT);
+            }
+            Err(notice) => {
+                ctx.degradation_notices.push(notice);
+            }
+        }
+
         ctx
+    }
+
+    /// 双通道笔记目录直读（账本权威面,绕 LexStore 缓存）：家族前缀
+    /// `shared.{ns}.notes.`（含八类正体与机械草稿）。payload=MemoryRecord
+    /// JSON（草稿为 MemoryEvent JSON——解析失败按原文条目保留,催写面需要）。
+    /// 失败=Err(降级通知文案),调用方落 fail-visible 通知。
+    pub async fn fetch_notes_catalog(&self) -> Result<Vec<MemoryRecord>, String> {
+        let prefix = format!("shared.{}.notes.", self.namespace);
+        let facts = self
+            .evorule_client
+            .get_shared_facts(Some(&prefix))
+            .await
+            .map_err(|e| {
+                format!(
+                    "notes recall degraded: ledger unreachable for '{prefix}' ({e})——本轮笔记回喂缺失"
+                )
+            })?;
+        let mut out = Vec::with_capacity(facts.len());
+        for f in facts {
+            // 记录 payload=MemoryRecord JSON（note_write/沉淀草稿同形）;
+            // 解析失败=保留为原始条目(键取 path 尾段,值取原文)——催写与
+            // 相关性匹配不丢数据
+            let raw = f.value.as_str().map(str::to_string).unwrap_or_else(|| f.value.to_string());
+            let record = match serde_json::from_str::<MemoryRecord>(&raw) {
+                Ok(mut r) => {
+                    if r.key.is_empty() {
+                        r.key = f.path.rsplit('.').next().unwrap_or(&f.path).to_string();
+                    }
+                    r
+                }
+                Err(_) => MemoryRecord::new(
+                    f.path.rsplit('.').next().unwrap_or(&f.path),
+                    &raw,
+                    0,
+                ),
+            };
+            out.push(record);
+        }
+        Ok(out)
+    }
+
+    /// 双通道笔记事件回喂面（Q2 强制回喂 R-2）：停滞/错误/审批拒绝触发后
+    /// 由 runner 调用——failure 类笔记按 token 重叠匹配（词法确定性）取
+    /// Top-K,草稿条目（key 含 draft）转催写行;无匹配时回退最近 failure
+    /// 条目（教训必须送达,不许静默空转）。
+    pub async fn build_failure_feed(&self, context_text: &str, limit: usize) -> Vec<String> {
+        match self.fetch_notes_catalog().await {
+            Ok(c) => format_failure_feed(&c, context_text, limit),
+            Err(notice) => vec![format!("[强制回喂][降级] {notice}")],
+        }
     }
 
     /// 阶段 1(F-618):注入 LexStore 检索缓存
@@ -2567,6 +2716,27 @@ impl MemoryManager {
         if !audited_events.is_empty() {
             prompt.push_str("\n## Relevant Events\n");
             for line in &audited_events {
+                prompt.push_str(line);
+            }
+        }
+
+        // 双通道笔记强制回喂面（Q2）：R-1 常驻选取条目 + R-2 事件触发回喂行
+        // 共用 ## Notes 机制分区（标记已同步进分区切分权威源）。事件回喂行
+        // 置于常驻条目之前（触发时刻的教训优先级最高）；同样过 L2 审计闸。
+        if !recall.notes.is_empty() || !recall.note_feed.is_empty() {
+            prompt.push_str("\n\n## Notes\n");
+            for line in &recall.note_feed {
+                let result = self.safety_auditor.audit(line);
+                match result.text {
+                    Some(clean) if !clean.trim().is_empty() => {
+                        prompt.push_str(clean.trim_start());
+                        prompt.push('\n');
+                    }
+                    _ => {}
+                }
+            }
+            let audited_notes = self.audit_recall_section("note", &recall.notes);
+            for line in &audited_notes {
                 prompt.push_str(line);
             }
         }
@@ -4672,8 +4842,8 @@ mod tests {
 
         assert_eq!(
             ctx.degradation_notices.len(),
-            3,
-            "三层召回失败应产生三条降级通知，got: {:?}",
+            4,
+            "三层召回+笔记层失败应产生四条降级通知，got: {:?}",
             ctx.degradation_notices
         );
         for (notice, layer) in ctx
@@ -5406,6 +5576,94 @@ mod tests {
         assert_eq!(b0.elastic_messages_max(&recall), 0);
     }
 
+    // ===== 双通道笔记强制回喂（Q2 三触发点） =====
+
+    #[test]
+    fn select_notes_deterministic_with_weight_and_tiebreak() {
+        let mk = |k: &str, v: &str, ts: u64| MemoryRecord::new(k, v, ts);
+        let catalog = vec![
+            mk("summary.001", "讨论部署部署部署", 5),
+            mk("notes.failure.failure.20261007-001", "部署脚本权限问题,根因:缺执行位", 3),
+            mk("notes.summary.summary.20261007-002", "部署完成回顾", 9),
+            mk("notes.todo.todo.20261007-003", "待跟进部署验证", 8),
+        ];
+        // 相关性:failure 与 todo 都命中"部署";failure/todo 有权重加成
+        let a = select_notes_for_goal(&catalog, "部署验证失败排查", 3);
+        assert_eq!(a.len(), 3);
+        // todo/failure 加成条目排前;同权重内按时间倒序(todo ts=8 > failure ts=3)
+        assert!(a[0].key.contains("todo"), "got {}", a[0].key);
+        assert!(a[1].key.contains("failure"), "got {}", a[1].key);
+        // 确定性:同输入同选取
+        let b = select_notes_for_goal(&catalog, "部署验证失败排查", 3);
+        assert_eq!(
+            a.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+            b.iter().map(|r| r.key.clone()).collect::<Vec<_>>()
+        );
+        // limit 生效
+        assert_eq!(select_notes_for_goal(&catalog, "部署", 2).len(), 2);
+    }
+
+    #[test]
+    fn failure_feed_formats_matches_cui_xie_and_empty_fallback() {
+        let mk = |k: &str, v: &str, ts: u64| MemoryRecord::new(k, v, ts);
+        let catalog = vec![
+            mk("notes.failure.draft.sess-9", "机械草稿:检测到 2 项错误", 3),
+            mk(
+                "notes.failure.failure.20261007-001",
+                "git_push 被治理拒,根因:分支保护,防再踩:先 rule_get",
+                4,
+            ),
+            mk("notes.failure.failure.20261006-002", "无关教训:数据库锁", 2),
+        ];
+        // 相关性匹配:上下文含 git_push → 该条排前
+        let feed = format_failure_feed(&catalog, "git_push 推送再次失败", 3);
+        assert!(
+            feed.iter().any(|l| l.contains("[催写]") && l.contains("draft.sess-9")),
+            "草稿转催写行: {feed:?}"
+        );
+        let hit = feed
+            .iter()
+            .find(|l| l.contains("20261007-001"))
+            .expect("matched failure present");
+        assert!(hit.contains("git_push"), "matched line: {hit}");
+        // 空目录:回退可解释空反馈
+        let empty = format_failure_feed(&[], "anything", 3);
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].contains("未匹配到历史 failure 笔记"));
+    }
+
+    #[test]
+    fn notes_section_renders_feed_first_and_audited() {
+        let mgr = MemoryManager::new("sec", make_test_client());
+        let mut recall = RecallContext::default();
+        recall.note_feed = vec!["[强制回喂] 历史 failure 笔记 f1:根因说明".to_string()];
+        recall.notes = vec![MemoryRecord::new(
+            "notes.todo.todo.20261007-003",
+            "待跟进验证",
+            7,
+        )];
+        let prompt = mgr.build_system_prompt_with_recall("BASE", &recall, &ContextBudget::new(100_000, 0.25));
+        assert!(prompt.contains("
+
+## Notes
+"), "mechanism section present: {prompt}");
+        let feed_pos = prompt.find("[强制回喂]").expect("feed rendered");
+        let todo_pos = prompt.find("待跟进验证").expect("note entry rendered");
+        assert!(feed_pos < todo_pos, "事件回喂行先于常驻条目");
+    }
+
+    #[tokio::test]
+    async fn notes_recall_offline_degrades_visibly() {
+        // 离线客户端:笔记目录拉取失败 → fail-visible 降级通知(与其它层同款)
+        let mgr = MemoryManager::new("sec", make_test_client());
+        let ctx = mgr.recall_context("goal", 3, 5).await;
+        assert!(
+            ctx.degradation_notices.iter().any(|n| n.contains("notes recall degraded")),
+            "notes 降级通知在账: {:?}",
+            ctx.degradation_notices
+        );
+    }
+
     // ===== L2 SafetyAuditor 召回污染防线测试（P1-F6/P2-V2 修复,2026-08-27）=====
 
     #[test]
@@ -5419,6 +5677,8 @@ mod tests {
                 2,
             )],
             degradation_notices: Vec::new(),
+            notes: Vec::new(),
+            note_feed: Vec::new(),
             events: vec![],
         };
         let budget = ContextBudget::new(100_000, 0.25);

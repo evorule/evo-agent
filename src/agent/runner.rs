@@ -913,6 +913,9 @@ pub struct AgentRunner {
     /// 语义精判开关(true=默认:候选触发 sidecar 裁决;false=回退纯字面级,
     /// 逐字节兼容旧行为)
     semantic_i2_enabled: bool,
+    /// 双通道笔记强制回喂 R-2 触发闩(停滞 Warning/Exhausted、工具错误、
+    /// 审批拒绝置位;下一轮 recall 消费——failure 笔记回喂进 S3,消费后复位)
+    pending_note_feed: bool,
     /// 摘要保真对照(规格修正批交付物 B):当前会话 journal 写者(流式路径
     /// 注入;CLI run 纯路径无 journal=只 warn 不落账)。G10 摘要替换时
     /// 自动对照落 summary_fidelity_scan 事件。
@@ -998,6 +1001,7 @@ impl AgentRunner {
             assembly_scope_focus: false,
             i2_verdict_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             semantic_i2_enabled: true,
+            pending_note_feed: false,
             active_journal: None,
             accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
@@ -4237,7 +4241,7 @@ impl AgentRunner {
             }
 
             // C2: 召回顺序修复 —— recall 在组装之前
-            let recall = match runner.memory.as_ref() {
+            let mut recall = match runner.memory.as_ref() {
                 Some(mem) => mem.recall_context(
                     &goal,
                     runner.sediment_config.max_session_summaries,
@@ -4245,6 +4249,14 @@ impl AgentRunner {
                 ).await,
                 None => crate::agent::memory::RecallContext::default(),
             };
+            // 笔记强制回喂 R-1 消费点:上一轮 R-2 触发闩在位=failure 教训/
+            // 催写行注入本轮 S3(消费即复位;无记忆面时闩复位不回喂)
+            if runner.pending_note_feed {
+                runner.pending_note_feed = false;
+                if let Some(mem) = runner.memory.as_ref() {
+                    recall.note_feed = mem.build_failure_feed(&goal, 3).await;
+                }
+            }
             // 检索质量观测批(K-11 观测级)+ P2-1 LexStore 缓存三计数器:
             // 此处只计算暂存,落账延迟到 turn_guard 建立之后——本块执行时
             // journal 写者尚未绑定(runner.active_journal 在下方 B21 journal
@@ -5072,6 +5084,8 @@ impl AgentRunner {
                                                     error = %e,
                                                     "本地 ReAct:工具执行失败,错误作为 tool 消息回喂"
                                                 );
+                                                // 笔记强制回喂 R-2:错误触发
+                                                runner.pending_note_feed = true;
                                                 tool_calls.push(tc.name.clone());
                                                 let err_content = serde_json::json!({
                                                     "error": e.to_string(),
@@ -5303,6 +5317,60 @@ impl AgentRunner {
                                         continue;
                                     }
                                 };
+                                // 笔记强制回喂 R-3 段末强制(task_done 判据门放行后):
+                                // 未完成事项(todo)+失败清单(failure 正体)+缺根因草稿
+                                // 非空 → advisory 附进工具结果(诚实分立:判据已过仍放行,
+                                // 清单随沉淀必然在账;草稿催写转正)
+                                let mut gate_note_advisory: Option<String> = None;
+                                if tool_name == "task_done" {
+                                    if let Some(mem) = runner.memory.as_ref() {
+                                        match mem.fetch_notes_catalog().await {
+                                            Ok(catalog) => {
+                                                let open: Vec<_> = catalog
+                                                    .iter()
+                                                    .filter(|r| {
+                                                        (r.key.contains("todo")
+                                                            || (r.key.contains("failure")
+                                                                && !r.key.contains("draft")))
+                                                    })
+                                                    .collect();
+                                                let drafts: Vec<_> = catalog
+                                                    .iter()
+                                                    .filter(|r| r.key.contains("draft"))
+                                                    .collect();
+                                                if !open.is_empty() || !drafts.is_empty() {
+                                                    warn!(
+                                                        %session_id,
+                                                        open = open.len(),
+                                                        drafts = drafts.len(),
+                                                        "段末强制回喂:task_done 时仍有未完成事项/未消化失败(判据放行,清单随结果回喂)"
+                                                    );
+                                                    let mut lines = vec![format!(
+                                                        "[段末强制回喂] 判据已过但账面仍有未完成事项 {} 项/缺根因草稿 {} 项(诚实分立;清单随本结果在目,草稿请补记转正):",
+                                                        open.len(),
+                                                        drafts.len()
+                                                    )];
+                                                    for r in open.iter().take(5) {
+                                                        let t: String =
+                                                            r.value.chars().take(150).collect();
+                                                        lines.push(format!("- {}: {}", r.key, t));
+                                                    }
+                                                    for d in drafts.iter().take(5) {
+                                                        lines.push(format!(
+                                                            "- [催写] {} 缺根因假设,请补记",
+                                                            d.key
+                                                        ));
+                                                    }
+                                                    gate_note_advisory = Some(lines.join("
+"));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(%session_id, error = %e, "段末笔记清单拉取失败(fail-soft,不阻塞放行)");
+                                            }
+                                        }
+                                    }
+                                }
                                 let outcome_res = match runner
                                     .execute_tool_stage(&session_id, &tool_name, &args, journal.as_deref())
                                     .await
@@ -5400,6 +5468,8 @@ impl AgentRunner {
                                         StagnationVerdict::Normal => {}
                                         StagnationVerdict::Warning { repeat_count } => {
                                             warn!(%session_id, tool = %tool_name, repeat_count, "stagnation warning (F2)");
+                                            // 笔记强制回喂 R-2:停滞触发,下一轮回喂相关 failure 教训
+                                            runner.pending_note_feed = true;
                                             if let Some(obj) = fr.as_object_mut() {
                                                 obj.insert(
                                                     "stagnation".to_string(),
@@ -5409,6 +5479,7 @@ impl AgentRunner {
                                         }
                                         StagnationVerdict::Exhausted => {
                                             warn!(%session_id, tool = %tool_name, "stagnation EXHAUSTED (F2)——按 H2 阻塞收尾指引");
+                                            runner.pending_note_feed = true;
                                             if let Some(obj) = fr.as_object_mut() {
                                                 obj.insert(
                                                     "stagnation".to_string(),
@@ -5431,7 +5502,11 @@ impl AgentRunner {
                                 tool_calls.push(tool_name.clone());
                                 let tool_idx = messages.len();
                                 // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
-                                let raw_content = final_result.to_string();
+                                let mut raw_content = final_result.to_string();
+                                if let Some(adv) = gate_note_advisory.take() {
+                                    raw_content.push('\n');
+                                    raw_content.push_str(&adv);
+                                }
                                 let tool_msg = Message::Tool {
                                     content: truncate_tool_result(
                                         raw_content.clone(),
