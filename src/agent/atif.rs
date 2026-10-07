@@ -29,8 +29,10 @@
 //!
 //! 已知边界(v1 留痕,02-实施日志同口径;现状随接线更新):
 //! - delegate 子代理 journal 已接线(DelegateContext.journal_dir 注入,
-//!   子代理事件流落 data/sessions/{sid}.jsonl)——子轨迹的 ATIF 独立导出
-//!   充实随二期;主轨迹中 delegate 仍呈现为普通工具调用(映射表 §六 v1 口径);
+//!   子代理事件流落 data/sessions/{sid}.jsonl)——子轨迹经既有导出通路
+//!   独立产出,父链路经 AtifSources.parent_session_id 标注(调用方经
+//!   journal::scan_delegate_spawns 反查传入);主轨迹中 delegate 仍呈现为
+//!   普通工具调用,委托锚事件(delegate_spawned)不映射为步(映射表 §六 v1 口径);
 //! - `compaction_performed` 运行时已接线(裁剪时落 journal),导出按映射表
 //!   §四.4 产出 context_management 系统步;
 //! - `session_crashed` 运行时不写(PR-2 resume 检测补写),导出遇此事件即截断。
@@ -73,6 +75,9 @@ pub struct AtifSources<'a> {
     pub audit_facts: &'a [Value],
     /// 工具定义(OpenAI function calling schema 数组;无则缺省)
     pub tool_definitions: Option<Value>,
+    /// 父会话链路(委托子轨迹标注;调用方经父 journal 扫描
+    /// `scan_delegate_spawns` 反查后传入,无则缺省——schema 零改动)
+    pub parent_session_id: Option<String>,
 }
 
 /// 导出错误(fail-visible,不静默产出半截轨迹)
@@ -139,6 +144,11 @@ pub struct AtifRootExtra {
     pub journal_seq_range: [u64; 2],
     /// 导出器标识
     pub exporter: String,
+    /// 父会话链路(委托子轨迹标注;journal 含委托锚事件时落值,
+    /// 无则缺省——ATIF v1.8 无父子轨迹字段,链路信息走 extra 扩展位,
+    /// schema 零改动)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 /// ATIF StepObject(RFC §StepObject)
@@ -903,6 +913,10 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             }
             // SessionResumed:PR-2 后接线(is_copied_context 重建历史步);v1 忽略
             JournalEvent::SessionResumed { .. } => {}
+            // 委托子会话锚:元数据事件不映射为步——主轨迹中 delegate 仍呈现为
+            // 普通工具调用(映射口径 v1 不变);链路经 root.extra.parent_session_id
+            // 在子轨迹侧标注
+            JournalEvent::DelegateSpawned { .. } => {}
             // SessionCrashed 已在循环头截断
             JournalEvent::SessionCrashed { .. } => {}
         }
@@ -950,6 +964,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             exported_at,
             journal_seq_range: [first_seq, last_seq],
             exporter: format!("evo-agent atif v{}", env!("CARGO_PKG_VERSION")),
+            parent_session_id: sources.parent_session_id.clone(),
         },
     })
 }
@@ -1253,6 +1268,7 @@ mod tests {
             transcript: &[],
             audit_facts: &[],
             tool_definitions: None,
+            parent_session_id: None,
         };
         assert!(export(src).is_err());
     }
@@ -1345,6 +1361,7 @@ mod tests {
             transcript: &transcript,
             audit_facts: &audit,
             tool_definitions: tools,
+            parent_session_id: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.schema_version, "ATIF-v1.8");
@@ -1445,6 +1462,7 @@ mod tests {
             transcript: &transcript,
             audit_facts: &[],
             tool_definitions: None,
+            parent_session_id: None,
         };
         let t = export(src).unwrap();
         // 步:system + user + agent(transcript 无对位 assistant 回退 journal 摘要?有 asst idx1 → 对位)
@@ -1557,6 +1575,7 @@ mod tests {
             transcript: &transcript,
             audit_facts: &audit,
             tool_definitions: None,
+            parent_session_id: None,
         };
         let t = export(src).unwrap();
         let agent_steps: Vec<&AtifStep> = t.steps.iter().filter(|s| s.source == "agent").collect();
@@ -1613,6 +1632,7 @@ mod tests {
             transcript: &transcript,
             audit_facts: &[],
             tool_definitions: None,
+            parent_session_id: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.steps.len(), 3, "system+user+agent,sidecar 不成步");
@@ -1658,6 +1678,7 @@ mod tests {
             transcript: &[msg(0, "system", "sys"), msg(1, "user", "g")],
             audit_facts: &[],
             tool_definitions: None,
+            parent_session_id: None,
         };
         let t = export(src).unwrap();
         // system + user + agent + compaction-system
@@ -1704,6 +1725,7 @@ mod tests {
             transcript: &[msg(0, "system", "sys"), msg(1, "user", "g")],
             audit_facts: &[],
             tool_definitions: None,
+            parent_session_id: None,
         };
         let t = export(src).unwrap();
         // system + user + i2_scan_report-system(turn 内无 LLM 步,agent 步不产生)
@@ -1753,6 +1775,7 @@ mod tests {
             transcript: &[msg(0, "system", "sys"), msg(1, "user", "g")],
             audit_facts: &[],
             tool_definitions: None,
+            parent_session_id: None,
         };
         let t = export(src).unwrap();
         // system + user + wire_rendered-system(turn 内无 LLM 步,agent 步不产生)
@@ -1812,6 +1835,7 @@ mod tests {
             transcript: &transcript,
             audit_facts: &audit,
             tool_definitions: None,
+            parent_session_id: None,
         };
         let t = export(src).unwrap();
         let a = t.steps.last().unwrap();
@@ -1865,6 +1889,7 @@ mod tests {
             transcript: &transcript,
             audit_facts: &[],
             tool_definitions: None,
+            parent_session_id: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.steps.len(), 3, "crash 截断:后续 turn_started 不入步");
@@ -1924,6 +1949,7 @@ mod tests {
             transcript: &transcript,
             audit_facts: &[],
             tool_definitions: None,
+            parent_session_id: None,
         };
         let t = export(src).unwrap();
         let a = t.steps.last().unwrap();
@@ -1967,6 +1993,7 @@ mod tests {
             transcript: &transcript,
             audit_facts: &audit,
             tool_definitions: None,
+            parent_session_id: None,
         };
         let a = serde_json::to_string(&export(mk()).unwrap()).unwrap();
         let b = serde_json::to_string(&export(mk()).unwrap()).unwrap();
@@ -2014,5 +2041,110 @@ mod tests {
         // 对象形态直通
         let tc2 = json!([{"function": {"name": "x", "arguments": {"k": 1}}}]);
         assert_eq!(arguments_from_transcript(&tc2, "x", 0), json!({"k": 1}));
+    }
+    #[test]
+    fn delegate_spawned_not_mapped_as_step() {
+        // 委托锚事件为元数据:主轨迹不产出步(delegate 仍呈现为普通工具
+        // 调用,映射口径 v1 不变);无锚事件时步序列不受影响
+        let mut j = JFix::new();
+        j.push(JE::TurnStarted {
+            turn_seq: 1,
+            goal: "delegate a task".into(),
+        });
+        j.push(JE::ToolInvoked {
+            call_id: "t1".into(),
+            tool: "delegate".into(),
+            args_digest: "blake3:aa".into(),
+            evorule_request_id: None,
+        });
+        j.push(JE::DelegateSpawned {
+            child_session_id: "child-7".into(),
+            agent_type: "researcher".into(),
+            depth: 1,
+            task_digest: "blake3:bb".into(),
+        });
+        j.push(JE::ToolResult {
+            call_id: "t1".into(),
+            status: "ok".into(),
+            size_bytes: 4,
+            content_digest: "blake3:cc".into(),
+        });
+        j.push(JE::TurnEnded {
+            status: "success".into(),
+            steps: 1,
+            duration_ms: 10,
+        });
+        let transcript = vec![msg(0, "system", "sys"), msg(1, "user", "delegate a task")];
+        let mk = || AtifSources {
+            session_id: "s",
+            journal: &j.lines,
+            transcript: &transcript,
+            audit_facts: &[],
+            tool_definitions: None,
+            parent_session_id: None,
+        };
+        let t = serde_json::to_value(export(mk()).unwrap()).unwrap();
+        let serialized = serde_json::to_string(&t).unwrap();
+        assert!(
+            !serialized.contains("child-7"),
+            "委托锚不进主轨迹任何字段(含 extra 之外的步/观察面)"
+        );
+        // 对照:同一事件流去掉锚事件后步数不变(锚=零步)
+        let mut j2 = JFix::new();
+        for l in &j.lines {
+            if !matches!(l.event, JE::DelegateSpawned { .. }) {
+                j2.push(l.event.clone());
+            }
+        }
+        let mk2 = || AtifSources {
+            session_id: "s",
+            journal: &j2.lines,
+            transcript: &transcript,
+            audit_facts: &[],
+            tool_definitions: None,
+            parent_session_id: None,
+        };
+        let a = serde_json::to_value(export(mk()).unwrap()).unwrap();
+        let b = serde_json::to_value(export(mk2()).unwrap()).unwrap();
+        assert_eq!(
+            a["steps"].as_array().unwrap().len(),
+            b["steps"].as_array().unwrap().len(),
+            "锚事件=零步,步序列与无锚事件流一致"
+        );
+    }
+
+    #[test]
+    fn parent_session_id_extra_field_semantics() {
+        // 子轨迹链路标注:Some → root.extra 落值;None → 字段缺省
+        let mut j = JFix::new();
+        j.push(JE::TurnStarted {
+            turn_seq: 1,
+            goal: "g".into(),
+        });
+        j.push(JE::TurnEnded {
+            status: "success".into(),
+            steps: 0,
+            duration_ms: 1,
+        });
+        let transcript = vec![msg(0, "system", "sys"), msg(1, "user", "g")];
+        let mk = |parent: Option<String>| AtifSources {
+            session_id: "child-7",
+            journal: &j.lines,
+            transcript: &transcript,
+            audit_facts: &[],
+            tool_definitions: None,
+            parent_session_id: parent,
+        };
+        let with_parent = serde_json::to_value(export(mk(Some("parent-3".into()))).unwrap())
+            .unwrap();
+        assert_eq!(
+            with_parent["extra"]["parent_session_id"], "parent-3",
+            "链路标注落 extra 扩展位"
+        );
+        let without = serde_json::to_value(export(mk(None)).unwrap()).unwrap();
+        assert!(
+            without["extra"].get("parent_session_id").is_none(),
+            "无链路=字段缺省(ATIF Optional 口径,不冒充空值)"
+        );
     }
 }

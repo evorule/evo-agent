@@ -28,6 +28,24 @@ use crate::io_handlers::tool_handler::ToolHandler;
 /// 委托任务的 boxed future 类型别名（降低 delegate_race 的类型复杂度）。
 type DelegateFuture = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
 
+/// 子代理委托观测记录（spawn 账条目;父 runner 在 delegate 工具结果写账时
+/// drain 落 journal 事件,子会话锚由此进入父账面）
+#[derive(Debug, Clone)]
+pub struct SpawnRecord {
+    /// 子 evorule 会话 id
+    pub child_session_id: String,
+    /// 子代理类型
+    pub agent_type: String,
+    /// 委托深度（父自身第 0 层）
+    pub depth: usize,
+    /// 委托任务文本 digest（evorule-hash 口径）
+    pub task_digest: String,
+}
+
+/// spawn 账共享句柄类型（整棵委托树同一本账:DelegateContext clone 共享
+/// 同一 Arc,嵌套/并行分支的子会话记录汇入同账,父侧统一 drain）
+pub(crate) type SpawnLedger = Arc<std::sync::Mutex<Vec<SpawnRecord>>>;
+
 /// G9:并行委托的默认并发上限(§9.6 风险缓解,默认 5)
 pub const DEFAULT_MAX_CONCURRENT_DELEGATES: usize = 5;
 
@@ -71,6 +89,14 @@ pub struct DelegateContext {
     pub workdir: Option<std::path::PathBuf>,
     /// journal 目录（Some = 子代理落 journal；serve 面从 workbench config 取）
     pub journal_dir: Option<std::path::PathBuf>,
+    /// 治理门禁段（Some = 下放给每个子 runner 的 S2 槽位;serve 构造点传入,
+    /// CLI 路径 None = 子代理与 CLI 主路径同口径无治理段）
+    pub governance_segment: Option<String>,
+    /// 记忆下放开关（true = `def.memory` 有声明的子代理装配 MemoryManager
+    /// 全量召回面;默认 false = 子代理无状态执行器,任务域自包含）
+    pub propagate_memory: bool,
+    /// spawn 账（子会话锚记录;clone 共享同一 Arc,父 runner drain 落账）
+    pub(crate) spawn_ledger: SpawnLedger,
 }
 
 impl DelegateContext {
@@ -91,6 +117,32 @@ impl DelegateContext {
             toolkit: None,
             workdir: None,
             journal_dir: None,
+            governance_segment: None,
+            propagate_memory: false,
+            spawn_ledger: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// 注入治理门禁段（下放给每个子 runner 的 S2 槽位;serve 构造点在
+    /// 主 runner 同源治理段算好后传入）
+    pub fn with_governance_segment(mut self, segment: Option<String>) -> Self {
+        self.governance_segment = segment;
+        self
+    }
+
+    /// 开启记忆下放（`def.memory` 有声明的子代理装配 MemoryManager 召回面;
+    /// 默认关闭——子代理默认无状态,防主会话记忆串染+确定成本）
+    pub fn with_memory_propagation(mut self) -> Self {
+        self.propagate_memory = true;
+        self
+    }
+
+    /// drain spawn 账（父 runner 在 delegate 工具结果写账前调用:
+    /// 取走全部记录落 journal 事件;无 journal 时同样取走防跨调用残留）
+    pub fn drain_spawn_records(&self) -> Vec<SpawnRecord> {
+        match self.spawn_ledger.lock() {
+            Ok(mut ledger) => std::mem::take(&mut *ledger),
+            Err(_) => Vec::new(),
         }
     }
 
@@ -216,6 +268,53 @@ impl DelegateContext {
             if let Some(dir) = &self.journal_dir {
                 runner = runner.with_journal_dir(dir.clone());
             }
+            // 治理门禁段下放（serve 构造点传入;CLI 路径 None=子代理与 CLI
+            // 主路径同口径。治理段为全局纪律前馈,子代理无豁免理由）
+            if let Some(gs) = &self.governance_segment {
+                runner = runner.with_governance_segment(Some(gs.clone()));
+            }
+            // 记忆声明下放（上下文开关 × def.memory 声明双条件;子代理默认
+            // 无状态执行器,显式开启+定义声明才装配召回面,ns=定义声明域,
+            // 与子会话天然隔离）。只读召回面:ttl/配方/LexStore/召回配额
+            // 与主装配同源;写侧沉淀件不随行（子代理短生命周期,沉淀由
+            // 主会话统一收口）
+            if self.propagate_memory
+                && !def.memory.memory_type.is_empty()
+                && def.memory.memory_type != "none"
+            {
+                let mut mem = crate::agent::memory::MemoryManager::new(
+                    &def.memory.namespace,
+                    self.evorule_client.clone(),
+                );
+                if let Some(ttl) = def.memory.ttl_secs {
+                    mem = mem.with_ttl_secs(ttl);
+                }
+                if let Some(rj) = &def.memory.recipe {
+                    match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone())
+                    {
+                        Ok(recipe) => mem.set_recipe(recipe),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "子代理记忆配方解析失败——召回走词法 legacy 路径");
+                        }
+                    }
+                }
+                if let Some(db) = &def.memory.lex_store {
+                    match crate::agent::lexstore::LexStore::open(std::path::Path::new(db)) {
+                        Ok(store) => mem.set_lex_store(std::sync::Arc::new(store)),
+                        Err(e) => {
+                            tracing::warn!(db = %db, error = %e, "子代理 LexStore open failed——召回走全量拉取降级路径");
+                        }
+                    }
+                }
+                if let Err(e) = mem.sync_from_evorule().await {
+                    tracing::warn!(error = %e, "子代理记忆同步失败——召回降级为空记忆起步");
+                }
+                runner = runner.with_recall_quotas(
+                    def.memory.max_session_summaries,
+                    def.memory.max_injected_events,
+                );
+                runner = runner.with_memory(mem);
+            }
 
             // 工具面 + 能力边界接线（对齐 serve 面 construct_runner / CLI
             // patrol_build_runner 模式）。委托 runner 此前零工具契约：LLM 无 tools
@@ -260,6 +359,19 @@ impl DelegateContext {
                     Ok(crate::agent::runner::AgentEvent::Done(r)) => {
                         final_result = Some(r);
                         break;
+                    }
+                    Ok(crate::agent::runner::AgentEvent::SessionCreated { session_id, .. }) => {
+                        // 子会话锚即刻入账(父 runner 在本委托调用的工具结果
+                        // 写账时 drain 落事件;先记后亡的取消分支也留锚——
+                        // 记录语义="实际创建的子会话")
+                        if let Ok(mut ledger) = self.spawn_ledger.lock() {
+                            ledger.push(SpawnRecord {
+                                child_session_id: session_id,
+                                agent_type: agent_type.to_string(),
+                                depth: self.current_depth + 1,
+                                task_digest: crate::agent::journal::evorule_digest(task),
+                            });
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -456,6 +568,84 @@ mod tests {
             ctx.max_concurrent.as_ref().unwrap(),
             ctx2.max_concurrent.as_ref().unwrap()
         ));
+    }
+
+    // ===== 治理段下放 + 记忆下放开关 + spawn 账 =====
+
+    #[test]
+    fn test_governance_segment_injection_and_default() {
+        // 缺省 None（CLI 口径=子代理与 CLI 主路径同口径无治理段）
+        let ctx = make_ctx();
+        assert!(ctx.governance_segment.is_none());
+        // serve 构造点传入后字段在位
+        let ctx2 = make_ctx().with_governance_segment(Some("L2 约束前馈合并段".to_string()));
+        assert_eq!(ctx2.governance_segment.as_deref(), Some("L2 约束前馈合并段"));
+    }
+
+    #[test]
+    fn test_memory_propagation_flag_default_off() {
+        // 缺省关——子代理默认无状态执行器
+        assert!(!make_ctx().propagate_memory);
+        // 显式开启后随 clone 延续（increment_depth 内部 clone）
+        let ctx = make_ctx().with_memory_propagation();
+        assert!(ctx.propagate_memory);
+        assert!(ctx.increment_depth().propagate_memory);
+    }
+
+    #[test]
+    fn test_governance_and_ledger_continue_through_clone() {
+        // 治理段与 spawn 账随 increment_depth 延续;账为整树同一本(Arc 指针相等)
+        let ctx = make_ctx().with_governance_segment(Some("seg".to_string()));
+        let child = ctx.increment_depth();
+        assert_eq!(child.governance_segment.as_deref(), Some("seg"));
+        assert!(Arc::ptr_eq(&ctx.spawn_ledger, &child.spawn_ledger));
+    }
+
+    #[test]
+    fn test_spawn_ledger_drain_clears_and_preserves_fields() {
+        // drain:全部取走+字段保真;二次 drain=空(无跨调用残留)
+        let ctx = make_ctx();
+        {
+            let mut ledger = ctx.spawn_ledger.lock().unwrap_or_else(|p| p.into_inner());
+            ledger.push(SpawnRecord {
+                child_session_id: "c1".to_string(),
+                agent_type: "planner".to_string(),
+                depth: 1,
+                task_digest: "blake3:aa".to_string(),
+            });
+            ledger.push(SpawnRecord {
+                child_session_id: "c2".to_string(),
+                agent_type: "worker".to_string(),
+                depth: 1,
+                task_digest: "blake3:bb".to_string(),
+            });
+        }
+        let drained = ctx.drain_spawn_records();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].child_session_id, "c1");
+        assert_eq!(drained[0].agent_type, "planner");
+        assert_eq!(drained[0].depth, 1);
+        assert_eq!(drained[1].child_session_id, "c2");
+        assert!(ctx.drain_spawn_records().is_empty(), "drain 后账清空");
+    }
+
+    #[test]
+    fn test_spawn_ledger_shared_across_tree() {
+        // 共享账:子上下文记录的条目从父上下文可见(drain 同账)
+        let parent = make_ctx();
+        let child = parent.increment_depth();
+        {
+            let mut ledger = child.spawn_ledger.lock().unwrap_or_else(|p| p.into_inner());
+            ledger.push(SpawnRecord {
+                child_session_id: "grandchild".to_string(),
+                agent_type: "worker".to_string(),
+                depth: 2,
+                task_digest: "blake3:cc".to_string(),
+            });
+        }
+        let drained = parent.drain_spawn_records();
+        assert_eq!(drained.len(), 1, "父 drain 取到子分支记录(整树同账)");
+        assert_eq!(drained[0].child_session_id, "grandchild");
     }
 
     #[test]

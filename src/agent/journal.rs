@@ -48,7 +48,7 @@ pub struct TokenRecord {
     pub total: u64,
 }
 
-/// journal 事件(14 种;schema 终版 = ATIF 映射表 §二增补)
+/// journal 事件(19 种;schema 终版 = ATIF 映射表 §二增补)
 ///
 /// 序列化形态:`{"type":"<event>","payload":{...}}`(adjacently tagged,
 /// 与文件行内 seq/ts 平铺后即全行)
@@ -237,6 +237,20 @@ pub enum JournalEvent {
         expired: u64,
         /// 全量拉取（replace_partition）执行次数
         fetch: u64,
+    },
+    /// 子代理委托观测（delegate 子代理上下文规格批）：父会话在 delegate 工具
+    /// 调用帧内实际创建的子会话锚——父→子链路唯一可发现锚点（子 journal
+    /// 文件以 child_session_id 命名,无本事件则子轨迹成孤儿）。主轨迹 ATIF
+    /// 导出跳过本事件（delegate 仍呈现为普通工具调用,映射口径不变）。
+    DelegateSpawned {
+        /// 子 evorule 会话 id
+        child_session_id: String,
+        /// 子代理类型
+        agent_type: String,
+        /// 委托深度（父自身为第 0 层,子代理为 current_depth+1）
+        depth: usize,
+        /// 委托任务文本 digest（evorule-hash 口径,与 args_digest 同源）
+        task_digest: String,
     },
     /// 崩溃标记(P2 resume 检测到尾部无 turn_ended 后补写,运行时不写)
     SessionCrashed {
@@ -724,6 +738,62 @@ impl JournalWriter {
             evidence: truncate_text(&evidence, 256),
         })
     }
+
+    /// 子代理委托观测落账（delegate 子代理上下文规格批;delegate 工具
+    /// ToolResult 写账前调用,best-effort 调用方决定失败处置）
+    pub fn delegate_spawned(
+        &self,
+        child_session_id: &str,
+        agent_type: &str,
+        depth: usize,
+        task_digest: &str,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::DelegateSpawned {
+            child_session_id: child_session_id.to_string(),
+            agent_type: agent_type.to_string(),
+            depth,
+            task_digest: task_digest.to_string(),
+        })
+    }
+}
+
+/// 委托树发现（纯函数）:单份 journal 内全部子代理委托锚,按 seq 升序。
+/// 消费面=子轨迹批量导出（父 journal 扫描即得全树 sid 清单,子轨迹
+/// 经既有导出通路逐个产出）。
+pub fn scan_delegate_spawns(journal: &[JournalLine]) -> Vec<DelegateSpawnRecord> {
+    journal
+        .iter()
+        .filter_map(|line| match &line.event {
+            JournalEvent::DelegateSpawned {
+                child_session_id,
+                agent_type,
+                depth,
+                task_digest,
+            } => Some(DelegateSpawnRecord {
+                seq: line.seq,
+                child_session_id: child_session_id.clone(),
+                agent_type: agent_type.clone(),
+                depth: *depth,
+                task_digest: task_digest.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 单条委托锚记录（scan_delegate_spawns 产物）
+#[derive(Debug, Clone, PartialEq)]
+pub struct DelegateSpawnRecord {
+    /// 事件序号（父 journal 内 seq,时序即此）
+    pub seq: u64,
+    /// 子 evorule 会话 id
+    pub child_session_id: String,
+    /// 子代理类型
+    pub agent_type: String,
+    /// 委托深度
+    pub depth: usize,
+    /// 委托任务文本 digest
+    pub task_digest: String,
 }
 
 /// turn 守卫:优雅终止路径显式 `end(status, steps, duration)`;异常终止路径
@@ -1466,5 +1536,75 @@ mod tests {
         assert_eq!(sanitize_session_id(""), "unknown");
         let long = "x".repeat(300);
         assert_eq!(sanitize_session_id(&long).len(), 128);
+    }
+
+    #[test]
+    fn delegate_spawned_event_order_and_fields() {
+        // 委托锚事件:写入序 tool_invoked → delegate_spawned → tool_result,
+        // 读回序一致且字段保真(seq 单调)
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-spawn").unwrap();
+        let call_id = w
+            .tool_invoked(
+                "delegate",
+                &serde_json::json!({"agent_type": "researcher", "task": "do research"}),
+                None,
+            )
+            .unwrap();
+        let spawn_seq = w
+            .delegate_spawned("child-9", "researcher", 1, &evorule_digest("do research"))
+            .unwrap();
+        let result_seq = w.tool_result(&call_id, "ok", "done").unwrap();
+        assert!(
+            spawn_seq < result_seq,
+            "事件序 delegate_spawned({spawn_seq}) < tool_result({result_seq})"
+        );
+        let lines = read_all(&JournalWriter::path_for(dir.path(), "s-spawn")).unwrap();
+        assert_eq!(lines.len(), 3);
+        assert!(
+            matches!(lines[0].event, JournalEvent::ToolInvoked { .. }),
+            "首事件=tool_invoked"
+        );
+        match &lines[1].event {
+            JournalEvent::DelegateSpawned {
+                child_session_id,
+                agent_type,
+                depth,
+                task_digest,
+            } => {
+                assert_eq!(child_session_id, "child-9");
+                assert_eq!(agent_type, "researcher");
+                assert_eq!(*depth, 1);
+                assert_eq!(task_digest, &evorule_digest("do research"));
+            }
+            other => panic!("expected delegate_spawned, got {other:?}"),
+        }
+        assert!(
+            matches!(&lines[2].event, JournalEvent::ToolResult { call_id: c, status, .. } if *c == call_id && status == "ok"),
+            "尾事件=配对 tool_result"
+        );
+    }
+
+    #[test]
+    fn scan_delegate_spawns_finds_only_spawn_events_in_order() {
+        // 发现面:混合事件流只取委托锚,seq 升序;空流=空清单
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-scan-spawn").unwrap();
+        let _guard = w.begin_turn("g").unwrap();
+        w.delegate_spawned("c1", "planner", 1, &evorule_digest("t1"))
+            .unwrap();
+        w.llm_called_react("m", None, None, Some(10), 2, "resp")
+            .unwrap();
+        w.delegate_spawned("c2", "worker", 1, &evorule_digest("t2"))
+            .unwrap();
+        w.end_turn("success", 3, 100).unwrap();
+        let lines = read_all(&JournalWriter::path_for(dir.path(), "s-scan-spawn")).unwrap();
+        let found = scan_delegate_spawns(&lines);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].child_session_id, "c1");
+        assert_eq!(found[0].agent_type, "planner");
+        assert_eq!(found[1].child_session_id, "c2");
+        assert!(found[0].seq < found[1].seq, "按 seq 升序");
+        assert_eq!(scan_delegate_spawns(&[]).len(), 0, "空流=空清单");
     }
 }
