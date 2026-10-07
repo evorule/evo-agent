@@ -221,6 +221,11 @@ impl ContextWindowManager {
         self.max_tokens.saturating_sub(self.reserve_for_response)
     }
 
+    /// 模型上下文窗口总大小(观测显示用;与 agent_api 暴露的窗口口径同源)
+    pub fn window_tokens(&self) -> usize {
+        self.max_tokens
+    }
+
     /// 估算 messages 的 token 数
     pub fn count(&self, messages: &[Message]) -> usize {
         self.counter.count_messages(messages)

@@ -23,6 +23,24 @@ fn test_agent_config_default() {
 }
 
 #[test]
+fn test_context_signal_line_threshold_and_format() {
+    // H1(自主交接设计):≤70% 静默(含零用量),>70% 出信号
+    assert_eq!(context_signal_line(0, 28_000, 38_000, 1), None);
+    assert_eq!(context_signal_line(19_600, 28_000, 38_000, 2), None); // 恰 70%
+                                                                      // 设计示例口径:73%（输入预算 28k/38k），回合 N
+    let line = context_signal_line(20_440, 28_000, 38_000, 7).unwrap(); // 73%
+    assert!(line.starts_with("\n\n"), "信号行以空行前缀追加: {line}");
+    assert!(line.contains("[context] 窗口使用 73%"), "{line}");
+    assert!(line.contains("输入预算 28k/38k"), "{line}");
+    assert!(line.contains("回合 7"), "{line}");
+    // 边界:71% 出信号
+    assert!(context_signal_line(19_881, 28_000, 38_000, 1).is_some());
+    // 零预算/零窗口守卫(未配置窗口口径不出信号)
+    assert_eq!(context_signal_line(999, 0, 38_000, 1), None);
+    assert_eq!(context_signal_line(999, 28_000, 0, 1), None);
+}
+
+#[test]
 fn test_agent_result_success() {
     let result = AgentResult::success("hello".to_string(), 3, 100, vec!["tool1".to_string()]);
     assert!(result.success);

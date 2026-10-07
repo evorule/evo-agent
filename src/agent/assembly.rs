@@ -1669,11 +1669,6 @@ mod tests {
                 None,
             )
             .unwrap();
-        // v1 断言维持:无治理段=CLI 形态输出与 golden v1 逐字节一致
-        assert_eq!(
-            assembly_out,
-            std::fs::read_to_string(GOLDEN_ASSEMBLY).unwrap()
-        );
 
         // ---- (b) serve 形态黄金 v2:治理段经 S2 槽位进组装(身份段前于治理段) ----
         // 三段构造与 serve_tools::build_governance_segment 同源同序:
@@ -1717,8 +1712,9 @@ mod tests {
 
         // ---- 写录/比对 ----
         if std::env::var("GOLDEN_REWRITE").is_ok() {
+            std::fs::write(GOLDEN_ASSEMBLY, &assembly_out).unwrap();
             std::fs::write(GOLDEN_FULL_V2, &full_v2).unwrap();
-            println!("[golden] rewritten: {GOLDEN_FULL_V2}");
+            println!("[golden] rewritten: {GOLDEN_ASSEMBLY} + {GOLDEN_FULL_V2}");
             return;
         }
         let expect_v2 = std::fs::read_to_string(GOLDEN_FULL_V2).unwrap_or_else(|e| {
@@ -1726,6 +1722,11 @@ mod tests {
                 "golden v2 缺失({e});重录=GOLDEN_REWRITE=1 cargo test --lib injection_order -- --nocapture"
             )
         });
+        // v1 断言维持:无治理段=CLI 形态输出与 golden v1 逐字节一致
+        assert_eq!(
+            assembly_out,
+            std::fs::read_to_string(GOLDEN_ASSEMBLY).unwrap()
+        );
         assert_eq!(
             full_v2, expect_v2,
             "golden v2 失配——注入序/配方/治理段变更必须显式重录(装配守护语义)"
