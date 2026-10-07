@@ -4149,20 +4149,17 @@ impl AgentRunner {
                 ).await,
                 None => crate::agent::memory::RecallContext::default(),
             };
-            // 检索质量观测批(K-11 观测级):命中集落账(journal 在位才落)
-            if let Some(j) = runner.active_journal.as_deref() {
-                let hits = Self::build_recall_set_hits(&recall);
-                if let Some(sid) = runner.session_id.as_deref() {
-                    let _ = j.recall_set(sid, hits);
-                    // P2-1:LexStore 缓存观测三计数器落账(TTL 窗口可见性;
-                    // recall_set 同族观测级,best-effort)
-                    if let Some(mem) = runner.memory.as_ref() {
-                        if let Some((hit, expired, fetch)) = mem.lex_cache_stats() {
-                            let _ = j.lex_cache_stats(sid, hit, expired, fetch);
-                        }
-                    }
-                }
-            }
+            // 检索质量观测批(K-11 观测级)+ P2-1 LexStore 缓存三计数器:
+            // 此处只计算暂存,落账延迟到 turn_guard 建立之后——本块执行时
+            // journal 写者尚未绑定(runner.active_journal 在下方 B21 journal
+            // open 处才赋值)、session_id 亦未定,原就地落账两门控恒空,
+            // 观测事件在 serve 流永不落账(2026-10-07 agent 面活体验收发现,
+            // 587/829/839 journal 实证:turn_started 在场而两事件恒缺)。
+            let recall_hits = Self::build_recall_set_hits(&recall);
+            let lex_stats = runner
+                .memory
+                .as_ref()
+                .and_then(|mem| mem.lex_cache_stats());
             // 元层先行批:组装执行器单一出口(run/流式两组装点收敛为同一段
             // 代码,双路径一致性由代码结构保证;槽位序/预算比例/分隔符由配方声明)
             let boundary_segment = runner
@@ -4292,6 +4289,16 @@ impl AgentRunner {
                 },
                 None => None,
             };
+
+            // K-11/P2-1 观测落账(延迟点;recall 块已暂存 recall_hits/lex_stats,
+            // 此处 journal 与 session_id 均已在位)。journal 序:turn_started →
+            // recall_set → lex_cache_stats。fail-soft 与其它 journal 写入同风格。
+            if let Some(j) = &journal {
+                let _ = j.recall_set(&session_id, recall_hits);
+                if let Some((hit, expired, fetch)) = lex_stats {
+                    let _ = j.lex_cache_stats(&session_id, hit, expired, fetch);
+                }
+            }
 
             // B-1:逐轮 wire 留痕(挂点=本轮 wire 组装完成+轮顶事件之后、首个 LLM
             // 调用之前;F-903 重建演示以此为逐字节比对基准)。失败 fail-soft
