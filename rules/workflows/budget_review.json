@@ -1,0 +1,58 @@
+{
+  "workflow_id": "budget_review",
+  "description": "公式计算场景(compute v1.3):LLM 节点只采集参数,全部算术由纯函数确定性核算(求和/工期/日均/钳制),数值形态不符即 fail-fast 终止——LLM 只产参数不做算术",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "cost_dev",
+      "agent_type": "researcher",
+      "task": "估算开发一个支持 Markdown 导入导出的备忘录 Web 应用的开发成本。先在内部推理,但最终答案必须只输出一个整数(单位:元),不要单位、不要千分位、不要标点、不要任何其他文字。",
+      "depends_on": []
+    },
+    {
+      "id": "cost_ops",
+      "agent_type": "researcher",
+      "task": "估算单节点 4C8G 云主机加每日一次数据库备份的年度运维成本。先在内部推理,但最终答案必须只输出一个整数(单位:元),不要单位、不要千分位、不要标点、不要任何其他文字。",
+      "depends_on": []
+    },
+    {
+      "id": "start_date",
+      "agent_type": "researcher",
+      "task": "项目开工日为 2026-11-02。只输出这个日期本身,格式 YYYY-MM-DD,不要任何其他文字。",
+      "depends_on": []
+    },
+    {
+      "id": "end_date",
+      "agent_type": "researcher",
+      "task": "项目收官日为 2026-12-24。只输出这个日期本身,格式 YYYY-MM-DD,不要任何其他文字。",
+      "depends_on": []
+    },
+    {
+      "id": "total_cost",
+      "compute": { "function": "add", "inputs": ["cost_dev", "cost_ops"] },
+      "depends_on": ["cost_dev", "cost_ops"]
+    },
+    {
+      "id": "duration_days",
+      "compute": { "function": "date_diff_days", "inputs": ["start_date", "end_date"] },
+      "depends_on": ["start_date", "end_date"]
+    },
+    {
+      "id": "daily_burn",
+      "compute": { "function": "div", "inputs": ["total_cost", "duration_days"] },
+      "depends_on": ["total_cost", "duration_days"]
+    },
+    {
+      "id": "capped_cost",
+      "compute": { "function": "clamp", "inputs": ["total_cost"], "min_val": 0, "max_val": 1000000 },
+      "depends_on": ["total_cost"]
+    },
+    {
+      "id": "report",
+      "agent_type": "writer",
+      "task_template": "基于以下确定性核算结果写一段不超过 150 字的预算结论:\n- 总成本(元): {total_cost}\n- 项目工期(天): {duration_days}\n- 日均消耗(元/天): {daily_burn}\n- 上限内成本(元,上限 1000000): {capped_cost}\n要求:先给结论(总成本是否在 1000000 元上限内),再逐项引用上述数字。不要重新计算,只引用给定数字。",
+      "depends_on": ["total_cost", "duration_days", "daily_burn", "capped_cost"]
+    }
+  ],
+  "output_node": "report"
+}

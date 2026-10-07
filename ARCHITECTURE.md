@@ -8,7 +8,7 @@ evo-agent 是在 evorule 反应式执行引擎之上构建的 AI Agent 编排层
 
 **库形态 vs 服务形态**:evorule 引擎上存在两种 Agent 形态——**库形态**的大脑主控运行时(同进程、共享类型、零 HTTP,见内部仓)与 evo-agent 的**服务形态** HTTP 解耦编排层(跨进程、JSON 通讯、40 个 evorule 端点方法透传)。两者都把 evorule 作为"身体",但绑定深度与适用场景不同。
 
-**项目状态**:`v0.2.0` (2026-09-27),1214 项测试通过(单元 1177 + 集成 34 + doc 3,0 失败),完整 Fact 闭环 + 三层记忆 + DAG 工作流 + plan-execute + 3 层安全模型 + 内置 IDE 工作台已落地。
+**项目状态**:`v0.2.0` (2026-09-27),1655 项测试通过(单元 1615 + 集成 37 + doc 3,0 失败),完整 Fact 闭环 + 三层记忆 + DAG 工作流 + plan-execute + 3 层安全模型 + 内置 IDE 工作台已落地。
 
 ---
 
@@ -69,7 +69,7 @@ evorule 引擎执行规则前必须加载一份 rule_set 作为运行宪法。**
 | **ToolRegistry / ToolHandler** | `src/agent/tool_registry.rs` / `src/io_handlers/tool_handler.rs` | 工具注册中心 + 动态调度 |
 | **DelegateContext** | `src/agent/delegate.rs` | Agent 嵌套(深度 + 并发限流) |
 | **WorkflowEngine** | `src/agent/workflow.rs` | DAG 拓扑编排多 agent（含 compute 纯函数节点内联求值） |
-| **WorkflowMaterializer** | `src/agent/materializer.rs` | workflow_dag v1.2 物化器:loop 静态展开为线性副本链（纯函数,同输入必同输出） |
+| **WorkflowMaterializer** | `src/agent/materializer.rs` | workflow_dag v1.2/v1.3 物化器:loop 静态展开为线性副本链（纯函数,同输入必同输出） |
 | **Replan** | `src/agent/replan.rs` | replan 触发判定纯函数 + 失败摘要/预算计数器结构（plan-execute 方案 D） |
 | **PlanLoopDriver** | `src/agent/driver.rs` | plan-execute 外层驱动循环:计划 → 执行 → 失败/预算 replan 重跑（丢弃式 D-02） |
 | **ContextWindowManager** | `src/agent/context_window.rs` | Token 计数 + 消息裁剪 |
@@ -185,7 +185,8 @@ DAG(有向无环图)拓扑编排多 agent,用 JSON DSL 定义:
    未声明的节点任一直接依赖被跳过即级联跳过
 3. 逐层执行:同层 LLM/工具节点并行(`delegate_parallel`);`compute` 节点(v1.2)
    在层循环内**同步内联求值**——不经 delegate(不占并发槽/不耗深度/无 IoRequest),
-   封闭目录三函数 `strcmp` / `numeric_cmp` / `regex_match`,纯函数同输入必同输出
+   封闭目录 27 函数(v1.3:算术/字符串/日期/逻辑四族;v1.2 三函数
+   `strcmp`/`numeric_cmp`/`regex_match`),纯函数同输入必同输出
 4. 模板渲染:下一层的 `task_template` 中 `{node_id}` 被上游结果替换
 5. 任一执行中节点失败 → 整个工作流终止,返回 `Err`
 6. 返回 `output_node` 的结果
@@ -197,8 +198,26 @@ DAG(有向无环图)拓扑编排多 agent,用 JSON DSL 定义:
 副本链(命名 `{loop_id}_iter{k}_{node_id}`),展开后仍是纯 DAG,Kahn 拓扑与环检测
 照常工作。跨迭代引用文法:`prev.X`(上一迭代)/`{loop_id}_iter{k}_{node_id}`(展开
 全名);iter0 的 `prev.X` 在三消费面(模板占位符/compute inputs/run_when 观察)统一
-消解为空串语义。加载统一走 `constitution::load_workflow`:schema 校验 → v1.2 物化
-/ v1.0-v1.1 直接反序列化。
+消解为空串语义。加载统一走 `constitution::load_workflow`:schema 校验 → v1.2/v1.3
+物化 / v1.0-v1.1 直接反序列化。
+
+**workflow_dag v1.3(compute 目录扩展至 27 函数)**:
+
+纯增量——在 v1.2 基础上把 compute 封闭目录从 3 函数扩到 27 函数四族:
+算术(`add`/`sub`/`mul`/`div`/`abs`/`min`/`max`,i64 checked 溢出即失败)、
+字符串(`concat`/`length`/`upper`/`lower`/`trim`/`replace`/`split_at`/`substr`/`join`)、
+日期(`epoch_to_date`/`date_diff_days`/`epoch_add_days`,仅 UTC,域
+0000-01-01..=9999-12-31,算法手写无 chrono 依赖)、逻辑(`and`/`or`/`not`/
+`if_else`/`clamp`,封闭布尔词表 true|false 不隐式真值化)。错误语义总纲
+fail-fast:解析失败/除零/溢出/越界/日期域外/词表外 = 节点失败 = 工作流终止,
+无静默回退。结果词表按函数族固定(逻辑族 true|false、算术/length/日期差为
+十进制整数字符串、epoch_to_date 为 YYYY-MM-DD、字符串族原样)。形态校验单一
+来源 `check_spec_shape`(`workflow.rs` 公共函数,`validate_compute_spec` 与
+物化器 `check_compute_spec` 共同委托,禁复制第二份)。典型用法:公式计算场景——
+LLM 节点只采集参数,算术全部由 compute 节点确定性核算(示例资产
+`rules/workflows/budget_review.json`;资产回归门
+`test_repo_workflow_assets_load_through_real_loader` 保证 `rules/workflows/*.json`
+全部过真实加载链)。
 
 **replan 触发判定(`src/agent/replan.rs`,plan-execute 方案 D)**:
 

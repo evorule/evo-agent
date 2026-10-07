@@ -463,4 +463,35 @@ mod tests {
         let errs = validate_workflow_dag(&bad).expect_err("unknown function must reject");
         assert!(!errs.is_empty(), "应报 schema 违规: {errs:?}");
     }
+
+    #[test]
+    fn test_repo_workflow_assets_load_through_real_loader() {
+        // 资产回归门：rules/workflows/*.json 全部过真实加载链（分派 → 内嵌
+        // schema 校验 → v1.2/v1.3 物化 / v1.0-v1.1 反序列化）。新增资产版本
+        // 形态变更时本测试先行暴露（与 system-rules check_evoagent_assets.py
+        // 双保险：彼为 jsonschema 真值回归，此为引擎真实加载路径）。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("rules/workflows");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("rules/workflows 必须存在") {
+            let path = entry.expect("read_dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).expect("asset readable");
+            let doc: serde_json::Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("{} 反序列化失败: {e}", path.display()));
+            if doc.get("workflow_id").is_none() {
+                continue; // 非工作流资产不在本门范围
+            }
+            let wf = load_workflow(&doc)
+                .unwrap_or_else(|errs| panic!("{} 加载失败: {errs:?}", path.display()));
+            assert!(
+                !wf.nodes.is_empty(),
+                "{} 物化/反序列化后不得为空",
+                path.display()
+            );
+            checked += 1;
+        }
+        assert!(checked >= 2, "至少应加载 2 个工作流资产,实得 {checked}");
+    }
 }
