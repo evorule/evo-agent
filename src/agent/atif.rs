@@ -1715,6 +1715,7 @@ mod tests {
                 section_b: "【能力边界声明】".into(),
                 excerpt_a: "禁止使用 web_search".into(),
                 excerpt_b: "可用工具:web_search".into(),
+                semantic_verdict: None,
             }],
         });
         j.push(JE::TurnEnded {
@@ -2138,8 +2139,8 @@ mod tests {
             tool_definitions: None,
             parent_session_id: parent,
         };
-        let with_parent = serde_json::to_value(export(mk(Some("parent-3".into()))).unwrap())
-            .unwrap();
+        let with_parent =
+            serde_json::to_value(export(mk(Some("parent-3".into()))).unwrap()).unwrap();
         assert_eq!(
             with_parent["extra"]["parent_session_id"], "parent-3",
             "链路标注落 extra 扩展位"

@@ -866,7 +866,8 @@ impl AgentDefinition {
     pub fn validate_assembly_binding(&self) -> Result<(), AgentDefinitionError> {
         // R1/R2:仅对声明配方的定义生效(未声明 = 内置默认配方,骨架/槽序
         // 由代码保证)
-        if let Some(recipe) = &self.assembly {            // R1:骨架完整性——来源绑定(id 在位/去重由配方 validate 保证)
+        if let Some(recipe) = &self.assembly {
+            // R1:骨架完整性——来源绑定(id 在位/去重由配方 validate 保证)
             for (slot_id, required_source) in [
                 ("S1_base", "definition.system_prompt"),
                 ("S7_history", "messages"),
@@ -1371,8 +1372,7 @@ mod tests {
         );
 
         // R6 违例:工具名含空白
-        let json =
-            minimal_def_json().replace(r#""tools": []"#, r#""tools": ["file read"]"#);
+        let json = minimal_def_json().replace(r#""tools": []"#, r#""tools": ["file read"]"#);
         write_json(dir.path(), "r6_tool_blank", &json);
         let err = AgentDefinition::load_from_dir(dir.path(), "r6_tool_blank")
             .expect_err("R6 whitespace tool name must be rejected");
@@ -1383,10 +1383,8 @@ mod tests {
         );
 
         // R6 违例:重复工具名
-        let json = minimal_def_json().replace(
-            r#""tools": []"#,
-            r#""tools": ["file_read", "file_read"]"#,
-        );
+        let json =
+            minimal_def_json().replace(r#""tools": []"#, r#""tools": ["file_read", "file_read"]"#);
         write_json(dir.path(), "r6_tool_dup", &json);
         let err = AgentDefinition::load_from_dir(dir.path(), "r6_tool_dup")
             .expect_err("R6 duplicate tool name must be rejected");
@@ -1397,8 +1395,7 @@ mod tests {
         );
 
         // R6 违例:记忆工具声明但记忆未启用(矛盾前置)
-        let json =
-            minimal_def_json().replace(r#""tools": []"#, r#""tools": ["note_write"]"#);
+        let json = minimal_def_json().replace(r#""tools": []"#, r#""tools": ["note_write"]"#);
         write_json(dir.path(), "r6_tool_memory", &json);
         let err = AgentDefinition::load_from_dir(dir.path(), "r6_tool_memory")
             .expect_err("memory tool without memory must be rejected");
@@ -1443,9 +1440,7 @@ mod tests {
         // R8 合法:shared. 前缀=跨代理显式共享声明
         let mut json = minimal_def_json();
         json.pop();
-        json.push_str(
-            r#", "memory": { "type": "persistent", "namespace": "shared.team-facts" }}"#,
-        );
+        json.push_str(r#", "memory": { "type": "persistent", "namespace": "shared.team-facts" }}"#);
         write_json(dir.path(), "r8_ns_shared", &json);
         assert!(AgentDefinition::load_from_dir(dir.path(), "r8_ns_shared").is_ok());
 
@@ -1469,8 +1464,7 @@ mod tests {
     /// (validate_assembly_binding 复用同一判定;文本面 R4/R5 不进运行时口)
     #[test]
     fn test_constitution_runtime_gate_memory_and_tools() {
-        let mut def: AgentDefinition =
-            serde_json::from_str(&minimal_def_json()).expect("parse");
+        let mut def: AgentDefinition = serde_json::from_str(&minimal_def_json()).expect("parse");
         // 运行时口基线:合法定义过审
         assert!(def.validate_assembly_binding().is_ok());
         // 配置面违例:运行时口同判
@@ -1484,8 +1478,7 @@ mod tests {
             err
         );
         // 文本面不进运行时口:身份段含哨兵在运行时口放行(文件口把关)
-        let mut def2: AgentDefinition =
-            serde_json::from_str(&minimal_def_json()).expect("parse");
+        let mut def2: AgentDefinition = serde_json::from_str(&minimal_def_json()).expect("parse");
         def2.identity_segment = Some("x\n\n## Stable Facts\n- f".to_string());
         assert!(
             def2.validate_assembly_binding().is_ok(),

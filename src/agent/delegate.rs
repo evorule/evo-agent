@@ -290,8 +290,7 @@ impl DelegateContext {
                     mem = mem.with_ttl_secs(ttl);
                 }
                 if let Some(rj) = &def.memory.recipe {
-                    match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone())
-                    {
+                    match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone()) {
                         Ok(recipe) => mem.set_recipe(recipe),
                         Err(e) => {
                             tracing::warn!(error = %e, "子代理记忆配方解析失败——召回走词法 legacy 路径");
@@ -579,7 +578,10 @@ mod tests {
         assert!(ctx.governance_segment.is_none());
         // serve 构造点传入后字段在位
         let ctx2 = make_ctx().with_governance_segment(Some("L2 约束前馈合并段".to_string()));
-        assert_eq!(ctx2.governance_segment.as_deref(), Some("L2 约束前馈合并段"));
+        assert_eq!(
+            ctx2.governance_segment.as_deref(),
+            Some("L2 约束前馈合并段")
+        );
     }
 
     #[test]

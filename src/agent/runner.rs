@@ -908,8 +908,11 @@ pub struct AgentRunner {
     assembly_scope_focus: bool,
     /// 语义精判会话内缓存(两级通路第二级;键=候选六元组 digest,值=裁决
     /// 结论——每候选每会话至多一次 sidecar 调用,重复候选零成本复用)
-    i2_verdict_cache:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, crate::agent::context_inspector::I2Verdict>>>,
+    i2_verdict_cache: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::agent::context_inspector::I2Verdict>,
+        >,
+    >,
     /// 语义精判开关(true=默认:候选触发 sidecar 裁决;false=回退纯字面级,
     /// 逐字节兼容旧行为)
     semantic_i2_enabled: bool,
