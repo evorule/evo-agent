@@ -176,6 +176,11 @@ impl SearchFilesTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required arg: pattern (string)".to_string())?;
 
+        // `**/` 语义对齐:本工具按文件名递归匹配(遍历自带跨目录),
+        // 常见 glob 惯用法 `**/name.ext` 的前缀要求路径分隔符,对纯文件名
+        // 匹配必败(LLM 侧高频误用)——剥除前缀段等效化
+        let pattern = pattern.strip_prefix("**/").unwrap_or(pattern);
+
         let dir = args.get("dir").and_then(|v| v.as_str()).unwrap_or(".");
 
         let max = args
@@ -417,6 +422,40 @@ mod tests {
 
         let count = result.get("count").unwrap().as_i64().unwrap();
         assert_eq!(count, 1, "自定义 exclude 应跳过 vendor/; got {:?}", result);
+    }
+
+    #[test]
+    fn test_glob_starstar_prefix_and_nested_data() {
+        // 回归:①`**/name.ext` 惯用法(前缀剥除等效化)②嵌套 data 子目录
+        // 不被名字级剪枝(已移出默认排除集)——两缺陷叠加曾致已入库文件搜不到
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src").join("agent").join("data")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("src")
+                .join("agent")
+                .join("data")
+                .join("markers.json"),
+            b"{}",
+        )
+        .unwrap();
+
+        let tool = SearchFilesTool::new(dir.path().to_path_buf());
+        for pattern in ["markers.json", "**/markers.json"] {
+            let result = tool
+                .call_sync(&Value::Object({
+                    let mut m = serde_json::Map::new();
+                    m.insert("pattern".to_string(), Value::from(pattern));
+                    m
+                }))
+                .unwrap();
+            let count = result.get("count").unwrap().as_i64().unwrap();
+            assert_eq!(
+                count, 1,
+                "pattern '{pattern}' 应命中嵌套 data 子目录文件; got {:?}",
+                result
+            );
+        }
     }
 
     // === 复现:多字节文件名 × '*' glob ===

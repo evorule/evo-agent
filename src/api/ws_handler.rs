@@ -652,6 +652,19 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         if let Some(ttl) = def.memory.ttl_secs {
             mem = mem.with_ttl_secs(ttl);
         }
+        // F-618 阶段1:LexStore 检索缓存注入(与 runner 构造路径同款;缺省
+        // 未声明=None=全量拉取路径零影响)。缺此注入时 serve 流即使定义
+        // 声明 lex_store 也不生效(缓存与 lex_cache_stats 观测同源失活)
+        if let Some(db) = &def.memory.lex_store {
+            match crate::agent::lexstore::LexStore::open(std::path::Path::new(db)) {
+                Ok(store) => mem.set_lex_store(std::sync::Arc::new(store)),
+                Err(e) => warn!(
+                    db = %db,
+                    error = %e,
+                    "LexStore open failed; recall falls back to full fetch"
+                ),
+            }
+        }
         if let Err(e) = mem.sync_from_evorule().await {
             warn!(
                 agent_type = %agent_type,

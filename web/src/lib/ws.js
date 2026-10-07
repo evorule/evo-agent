@@ -33,11 +33,17 @@ let pendingNotice = null; // newSession 清屏后需补显的提示(SessionCreat
 
 /**
  * 死会话检测:引擎侧会话已失效(evorule-server 重启或 30min 闲置 TTL 回收),
- * evo-agent serve 转发 REST 失败回灌的错误体携带 NOT_FOUND 特征。
+ * evo-agent serve 转发 REST 失败回灌的错误体为 404 形态
+ * ("Evorule error: API returned error: 404 {...\"message\":\"Not Found\"...}")。
  * 命中即自动新建会话(自愈),避免用户每条消息都秒回 404。
  */
 function looksLikeDeadSession(text) {
-  return text.includes('NOT_FOUND') || /"status":\s*404/.test(text);
+  return (
+    text.includes('NOT_FOUND') ||
+    /"status":\s*404/.test(text) ||
+    /returned error: 404/.test(text) ||
+    text.includes('"message":"Not Found"')
+  );
 }
 
 function recoverFromDeadSession(rawError) {
