@@ -646,6 +646,12 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         .with_skills(resolved_skills)
         // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位,不再内嵌基底)
         .with_governance_segment(governance_segment);
+    // PR-H4 验收修复:WS 流式路径此前从未消费 def.context_window_tokens——
+    // max_context_tokens 停在 AgentRunner::new 字段默认 8192,context_window
+    // 亦为 None(裁剪管路整体缺席;实测 session_spawn 链预算误判 32768=4×8192,
+    // 而定义声明窗口 204800)。与 from_definition 同口径接线(单一实现
+    // wire_definition_context_window),链预算基数与裁剪管路随之归真。
+    runner.wire_definition_context_window(def.context_window_tokens);
     // 记忆启用时构建 MemoryManager(TTL / 持久化模式按定义透传)
     if def.memory.memory_type != "none" && !def.memory.memory_type.is_empty() {
         let mut mem = MemoryManager::new(&def.memory.namespace, state.evorule_client().clone());

@@ -25,7 +25,7 @@
 //! 审计链：spawn 成功由 runner 侧按工具名分支落 journal `session_spawned`
 //! （镜像 server 因果链）；停链落 `chain_halted`（session 锚自带）。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -250,6 +250,12 @@ struct SpawnWiring {
     journal: Option<Arc<JournalWriter>>,
     /// 子 runner 工厂（runner.spawn_factory 产出；组件快照重建 + 链态注入）
     factory: Arc<dyn Fn(&str) -> crate::agent::runner::AgentRunner + Send + Sync>,
+    /// candidate 首调审批锚（PR-H4 验收修复）：本会话首次 spawn 实际执行前
+    /// 为 false——evaluate_proposal 据此出 needs_approval 提案；fork 成功
+    /// （spawn 真实发生）后置 true，同会话后续 spawn 不再提案（仍有护栏
+    /// 三件+P2 事前意图裁决）。拒绝后重试继续出提案——不给人拒后重试
+    /// 绕过审批的口子（fail-closed）。
+    first_spawn_done: AtomicBool,
 }
 
 impl SessionSpawnTool {
@@ -273,13 +279,42 @@ impl SessionSpawnTool {
                 chain,
                 journal,
                 factory,
+                first_spawn_done: AtomicBool::new(false),
             }),
+        }
+    }
+
+    /// 首次 spawn 真实执行后由 call() 标记（evaluate_proposal 停止出提案）
+    fn mark_first_spawn_done(&self) {
+        if let Some(w) = &self.wiring {
+            w.first_spawn_done.store(true, Ordering::Relaxed);
         }
     }
 }
 
 #[async_trait::async_trait]
 impl ToolFunction for SessionSpawnTool {
+    /// 管道⑤评估单源（PR-4 收编）——PR-H4 验收修复补实现：Sensitive+
+    /// ManualDefault 声明档（tool_manifest 双闸）的执行面兑现。candidate
+    /// 首调=needs_approval 提案（设计档 §四权限面口径）：本会话首次 spawn
+    /// 执行前每次调用都出提案（批准前重试不绕审批=fail-closed），fork 成功
+    /// 后同会话不再提案。unwired（启动期占位）返回 None——call 期
+    /// fail-visible 与占位语义一致。
+    fn evaluate_proposal(&self, _args: &Value) -> Option<Value> {
+        let w = self.wiring.as_ref()?;
+        if w.first_spawn_done.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(json!({
+            "status": "needs_approval",
+            "category": "candidate",
+            "description": "spawn a child session that continues the current task from the \
+                            latest handover document (autonomous handover chain)",
+            "risk": "opens a new agent session which auto-runs with this session's tool surface",
+            "alternative": "finish this session and open a new session manually"
+        }))
+    }
+
     async fn call(&self, args: &Value) -> Result<Value, String> {
         let Some(w) = &self.wiring else {
             return Err(format!(
@@ -305,6 +340,8 @@ impl ToolFunction for SessionSpawnTool {
             .create_session_fork(&w.session_id, None)
             .await
             .map_err(|e| format!("session_spawn: fork failed ({e})"))?;
+        // spawn 真实发生：candidate 首调审批锚落定（同会话后续调用不再提案）
+        self.mark_first_spawn_done();
 
         // B 全自主（项目方裁定）：子会话首轮 goal 自动驱动——组件快照重建
         // runner，run_continuation 注入首条 goal（读交接档自检），后台排水
@@ -502,5 +539,35 @@ mod tests {
         let t = SessionSpawnTool::unwired();
         let err = t.call(&json!({})).await.unwrap_err();
         assert!(err.contains("not wired"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unwired_proposal_is_none() {
+        // 占位态不产提案：call 期 fail-visible 与占位语义一致
+        let t = SessionSpawnTool::unwired();
+        assert!(t.evaluate_proposal(&json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn first_spawn_proposes_until_executed() {
+        // candidate 首调审批（PR-H4 验收修复）：首次执行前每次调用出
+        // needs_approval 提案（拒绝后重试不绕审批=fail-closed）；fork 成功
+        // （mark_first_spawn_done）后同会话不再提案。
+        let client = crate::api::evorule_client::EvoruleApiClient::new("http://localhost:1");
+        let chain = Arc::new(ChainRuntimeState::new(1_000));
+        let factory: Arc<dyn Fn(&str) -> crate::agent::runner::AgentRunner + Send + Sync> =
+            Arc::new(|sid| panic!("factory must not be invoked by evaluate_proposal (got {sid})"));
+        let t = SessionSpawnTool::wired("1".to_string(), client, chain, None, factory);
+        let p = t
+            .evaluate_proposal(&json!({}))
+            .expect("first call proposes");
+        assert_eq!(p["status"], "needs_approval");
+        assert_eq!(p["category"], "candidate");
+        assert!(p["description"].as_str().unwrap().contains("child session"));
+        // 拒绝后重试：提案持续在场（fail-closed）
+        assert!(t.evaluate_proposal(&json!({})).is_some());
+        // fork 成功标记后：同会话后续调用不再提案
+        t.mark_first_spawn_done();
+        assert!(t.evaluate_proposal(&json!({})).is_none());
     }
 }

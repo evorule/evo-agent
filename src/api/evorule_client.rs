@@ -278,20 +278,25 @@ impl EvoruleApiClient {
     }
 
     /// 从父会话 fork 出新会话，可选指定继承到的版本号。
+    ///
+    /// PR-H4 验收修复:改走 `POST /api/sessions/from/{parent_id}`——该端点
+    /// version 可选,缺省=父会话最新快照(governance `facts_log.snapshot()`
+    /// 口径,session_spawn 无版本 spawn 语义正需如此),且带声明继承与
+    /// IoSubscriber 完整接线。原 `/api/sessions/fork/` 端点的 handler 强制
+    /// version 必填(缺失即 400 空拒绝体),不适用无版本 spawn 调用。
     pub async fn create_session_fork(
         &self,
         parent_id: &str,
         version: Option<u64>,
     ) -> Result<String, ApiError> {
-        let url = if let Some(v) = version {
-            format!(
-                "{}/api/sessions/fork/{}?version={}",
+        let url = match version {
+            Some(v) => format!(
+                "{}/api/sessions/from/{}?version={}",
                 self.core.base_url(),
                 parent_id,
                 v
-            )
-        } else {
-            format!("{}/api/sessions/fork/{}", self.core.base_url(), parent_id)
+            ),
+            None => format!("{}/api/sessions/from/{}", self.core.base_url(), parent_id),
         };
 
         let resp = self

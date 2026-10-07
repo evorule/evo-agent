@@ -1315,30 +1315,11 @@ impl AgentRunner {
             r
         });
         let executor = crate::agent::assembly::AssemblyExecutor::new(recipe);
-        // G2:自动构造 ContextWindowManager(默认 8192 token,reserve 1/4)
-        // R11：默认值必须可见，不得静默——未显式设置时记忆区预算
-        // = 8192 × 25% = 2,048 token，约 60-80 条即饱和并开始裁剪（实测）。
-        let max_tokens = match def.context_window_tokens {
-            Some(t) => t,
-            None => {
-                warn!(
-                    "context_window_tokens 未显式设置,使用默认 8192(记忆区预算 = 8192 × 25% = 2048 token,约 60-80 条即饱和;生产部署建议显式声明)"
-                );
-                8192
-            }
-        };
-        // 响应预留:配方 budget.reserve_for_response_pct 声明(默认 25%,
-        // 整数算术与现状 max_tokens/4 逐值等价)
-        let reserve = max_tokens * executor.reserve_for_response_pct() as usize / 100;
-        let ctx_mgr = ContextWindowManager::with_approx_counter(
-            max_tokens,
-            reserve,
-            TrimStrategy::KeepSystemKeepLast,
-        );
-        runner = runner.with_context_window(ctx_mgr);
-        // C3:记录总窗口 token,供组装执行器作记忆区预算基准
-        runner.max_context_tokens = max_tokens;
         runner.assembly = executor;
+        // G2/R11/C3:上下文窗口接线(默认 8192,reserve 1/4;显式声明=单一
+        // 事实源)——PR-H4 验收批抽取为 wire_definition_context_window 单一
+        // 实现,WS 流式构造路径(construct_runner)复用同源逻辑
+        runner.wire_definition_context_window(def.context_window_tokens);
         runner.tool_result_max_chars = runner.assembly.tool_result_max_chars();
 
         // G11:从 def.output_format 构造 OutputValidator
@@ -1505,6 +1486,40 @@ impl AgentRunner {
     pub fn with_context_window(mut self, mgr: ContextWindowManager) -> Self {
         self.context_window = Some(mgr);
         self
+    }
+
+    /// G2/R11/C3:按定义接线上下文窗口(PR-H4 验收批抽取为单一实现)
+    ///
+    /// `from_definition` 与 WS 流式构造路径(ws_handler::construct_runner,
+    /// 走 AgentRunner::new 不经 from_definition)共用的唯一接线点:
+    /// 显式声明 `def.context_window_tokens` = 单一事实源;未显式设置时
+    /// warn 可见 + 8192 兜底(R11 默认值不得静默——记忆区预算
+    /// = 8192 × 25% = 2,048 token,约 60-80 条即饱和并开始裁剪(实测))。
+    /// 响应预留:配方 budget.reserve_for_response_pct 声明(默认 25%,
+    /// 整数算术与现状 max_tokens/4 逐值等价)。
+    ///
+    /// 调用前置:`self.assembly` 已就位(reserve pct 取自配方执行器)。
+    /// session_spawn 链预算基数(CHAIN_BUDGET_WINDOW_MULT ×
+    /// max_context_tokens)与记忆区预算基准随之同源归真。
+    pub(crate) fn wire_definition_context_window(&mut self, context_window_tokens: Option<usize>) {
+        let max_tokens = match context_window_tokens {
+            Some(t) => t,
+            None => {
+                warn!(
+                    "context_window_tokens 未显式设置,使用默认 8192(记忆区预算 = 8192 × 25% = 2048 token,约 60-80 条即饱和;生产部署建议显式声明)"
+                );
+                8192
+            }
+        };
+        let reserve = max_tokens * self.assembly.reserve_for_response_pct() as usize / 100;
+        let ctx_mgr = ContextWindowManager::with_approx_counter(
+            max_tokens,
+            reserve,
+            TrimStrategy::KeepSystemKeepLast,
+        );
+        self.context_window = Some(ctx_mgr);
+        // C3:记录总窗口 token,供组装执行器作记忆区预算基准
+        self.max_context_tokens = max_tokens;
     }
 
     /// G10:设置上下文摘要器(记忆压缩)
@@ -3805,6 +3820,13 @@ impl AgentRunner {
                 .await;
             Self::translate_pipeline_outcome(outcome, tool_name)?
         };
+
+        // PR-H4 验收修复:审批恢复路径的语义事件落账与常规路径同钩位——
+        // 此前单侧落点,走 G8 审批的 session_spawn 在 journal 缺
+        // session_spawned(server 因果链权威无损,账面镜像缺席;实测 844
+        // 直通路径有、847 审批路径无即此根因)。handover_write 同理对称补挂。
+        Self::record_handover_written(journal, session_id, tool_name, &final_result);
+        Self::record_session_spawned(journal, session_id, tool_name, &final_result);
 
         // 人工审查开合:决策事件入审计链(tool_trace 条目附加 approval 子对象;
         // 批准=重执行条目,拒绝=proposal 首调条目;candidate 始终串行无交错)
