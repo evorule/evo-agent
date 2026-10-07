@@ -278,6 +278,11 @@ impl CapabilityBoundary {
     /// 系统级边界段文本(会话建立稳定位置追加到 system_prompt 尾部;
     /// 首要读者 = LLM 自知——缺输入就地编造是「一本正经胡说八道」的机理,
     /// 显式供给边界是机制解法而非 prompt 恳求)
+    ///
+    /// 段内第二块=默认会话交接协议(自主交接设计 PR-H1,映射 S4_boundary 槽位,
+    /// 新注入面入表不游离):主动交接优于被动截断,交接档六要素+新会话首动作
+    /// 判据。工具可用性由 agentTools.handover 开关与裁决面独立管;协议文本
+    /// 默认在场(工具缺席时模型按纪律输出交接内容,不编造工具调用)。
     pub fn awareness_segment(&self) -> String {
         let mode_desc = if self.is_read_only() {
             "read_only(只读,你没有写文件能力)"
@@ -290,7 +295,17 @@ impl CapabilityBoundary {
              - 沙箱根目录:{}(一切文件路径相对该根解析)\n\
              - 边界内工具:{}\n\
              越出沙箱根的路径不可访问;尝试越界的操作会被拒绝并告知边界。\
-             若任务需要边界外的资源,如实说明边界限制,不要猜测或编造。",
+             若任务需要边界外的资源,如实说明边界限制,不要猜测或编造。\n\n\
+             【会话交接协议】\n\
+             - 主动交接优于被动截断:窗口余量紧张(见 [context] 余量信号)或\
+             任务将跨会话延续时,先写结构化交接档,再经 session_spawn 开启\
+             子会话续接(父子因果链入账,新会话按交接档起步)。\n\
+             - 交接档六要素:①任务目标(复述,防漂移)②已完成项+证据锚点\
+             (文件:行/commit/测试名)③下一步动作(按序,可执行粒度)④关键路径\
+             与关键决策理由⑤踩坑清单⑥环境状态(HEAD/测试基线/在途改动)。\n\
+             - 新会话首动作=读交接档并按其中的续接判据自检,确认续接成功后\
+             再继续任务;跳过读档直接开工,审计面可见。\n\
+             - 交接不是失败:任务半程主动交接是长程一致性的正规手段。",
             mode_desc,
             self.sandbox_root.display(),
             self.tools.join(", ")
@@ -1803,12 +1818,17 @@ mod tests {
         let j = b.to_json();
         assert_eq!(j["capability_boundary"]["mode"], "read_only");
         assert_eq!(j["capability_boundary"]["sandbox_root"], "D:/evo-agent");
-        // 系统级边界段:首要读者 LLM 自知——模式/根/工具三要素齐备
+        // 系统级边界段:首要读者 LLM 自知——模式/根/工具三要素齐备;
+        // 第二块=默认会话交接协议(自主交接设计 PR-H1,映射 S4_boundary 槽位)
         let seg = b.awareness_segment();
         assert!(seg.contains("能力边界声明"));
         assert!(seg.contains("read_only"));
         assert!(seg.contains("D:/evo-agent"));
         assert!(seg.contains("file_read"));
+        assert!(seg.contains("会话交接协议"));
+        assert!(seg.contains("session_spawn"));
+        assert!(seg.contains("踩坑清单"));
+        assert!(seg.contains("续接判据"));
     }
 
     // ===== G13: max_parallel_tools 测试 =====

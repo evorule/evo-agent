@@ -733,6 +733,26 @@ pub async fn submit_signal_and_await_verdict(
     Ok(false)
 }
 
+/// H1(自主交接设计):窗口余量信号行构造
+///
+/// 使用率>70% 才出信号,以下静默(固定每轮注入=固定 token 开销+注意力税,
+/// v1.2 优化口径,Q-SZ10 同源);纯聚焦信号不强制动作——护栏面(链深度/
+/// 预算硬顶)不在本行。预算/窗口为零(未配置窗口管理)不出信号。
+fn context_signal_line(used: usize, budget: usize, window: usize, step: usize) -> Option<String> {
+    if budget == 0 || window == 0 {
+        return None;
+    }
+    let pct = (used * 100) / budget;
+    if pct <= 70 {
+        return None;
+    }
+    Some(format!(
+        "\n\n[context] 窗口使用 {pct}%（输入预算 {}k/{}k），回合 {step}",
+        budget / 1000,
+        window / 1000,
+    ))
+}
+
 /// TODO: doc
 pub struct AgentRunner {
     config: AgentConfig,
@@ -2078,7 +2098,7 @@ impl AgentRunner {
                     // G6:clone token 避免 &mut self(handle_io_request) 与 &self(cancel_token) 借用冲突
                     let cancel_token = self.cancel_token.clone();
                     let result = tokio::select! {
-                        r = self.handle_io_request(&session_id, &event.payload, &mut messages, &mut tool_calls, goal) => match r {
+                        r = self.handle_io_request(&session_id, &event.payload, &mut messages, &mut tool_calls, goal, step_count) => match r {
                             Ok(r) => r,
                             // 处理失败(60s 超时/LLM 错误/工具错误/内部错误)也必须
                             // 回写 error io_response —— 否则 server 侧 io_request 永久挂起、
@@ -2660,6 +2680,7 @@ impl AgentRunner {
         messages: &mut Vec<Message>,
         tool_calls: &mut Vec<String>,
         goal: &str,
+        step: usize,
     ) -> Result<Value, AgentError> {
         let io_type = payload
             .get("io_type")
@@ -2670,7 +2691,7 @@ impl AgentRunner {
 
         match io_type {
             "call_external" => {
-                self.handle_call_external(session_id, &params, messages, goal)
+                self.handle_call_external(session_id, &params, messages, goal, step)
                     .await
             }
             "call_service" => {
@@ -2690,6 +2711,7 @@ impl AgentRunner {
         params: &Value,
         messages: &mut Vec<Message>,
         goal: &str,
+        step: usize,
     ) -> Result<Value, AgentError> {
         let model = params
             .get("model")
@@ -2733,6 +2755,21 @@ impl AgentRunner {
         } else {
             messages.clone()
         };
+
+        // H1(自主交接设计):窗口余量信号行——每轮请求前按当前发送集计数,
+        // 使用率>70% 才注入(以下静默,纯聚焦信号不强制动作);口径与 G2 裁剪
+        // /agent_api 暴露同源(零第二套计数),回合数=ReAct step。
+        if let Some(ctx) = &self.context_window {
+            let used = ctx.count(&messages_to_send);
+            if let Some(line) = context_signal_line(used, ctx.budget(), ctx.window_tokens(), step) {
+                for msg in &mut messages_to_send {
+                    if let Message::System { content } = msg {
+                        content.push_str(&line);
+                        break;
+                    }
+                }
+            }
+        }
 
         // G11:注入格式指令到 system prompt(只影响本次请求的 messages_to_send,不改原 messages)
         // R3-b/G-7 收口:指令落链(影响输出必落链,RL-A2);同指令去重;失败 best-effort 留痕
