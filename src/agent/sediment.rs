@@ -131,6 +131,9 @@ pub struct SedimentResult {
     pub knowledge_consolidated: Vec<String>,
     /// 错误草稿笔记 key 列表（NB-2 事件驱动草稿）
     pub failure_drafts: Vec<String>,
+    /// 会话收尾补写成功的离线积压事件数（CacheOnly→Persisted 对账闭环;
+    /// 0=无积压或补写失败——与 stable_facts_cache_only 同款防虚报口径）
+    pub flushed_events: usize,
 }
 
 /// C1 主入口：会话结束时调用（best-effort，错误记日志不阻断）
@@ -268,6 +271,18 @@ pub async fn sediment(
                     "sediment: journal digest write failed (best-effort)"
                 );
             }
+        }
+    }
+
+    // 8. 离线积压事件补写（CacheOnly→Persisted 对账闭环）:会话收尾网络
+    //    在位时把 pending_persist 队列批量补写入链——补写半若无生产挂点
+    //    则离线事件永远滞留内存（重启即失），CacheOnly 语义不闭合。
+    //    best-effort:补写失败不阻断（下次会话收尾再试），计数如实入账。
+    if let Some(store) = deps.event_store.as_mut() {
+        let flushed = store.flush_pending_events().await;
+        if flushed > 0 {
+            result.flushed_events = flushed;
+            tracing::info!(session_id = %session_id, flushed, "sediment: pending events flushed to ledger (CacheOnly closed)");
         }
     }
 

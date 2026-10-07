@@ -979,7 +979,8 @@ mod tests {
             source: None,
             confidence: None,
             tags: Vec::new(),
-            fact_id: None,
+            // 夹具代表账本来源条目(带锚);[unanchored] 标注走独立单测
+            fact_id: Some(1),
             usage_count: 0,
             lifecycle_state: None,
             cause_fact_id: None,
@@ -1301,7 +1302,8 @@ mod tests {
             source: None,
             confidence: None,
             tags: Vec::new(),
-            fact_id: None,
+            // 夹具代表账本来源条目(带锚);[unanchored] 标注走独立单测
+            fact_id: Some(1),
             usage_count: 0,
             lifecycle_state: None,
             cause_fact_id: None,
@@ -1635,19 +1637,25 @@ mod tests {
             1_700_000_000,
         );
         stable.source = Some("system".to_string());
+        // 夹具代表账本来源条目(带锚);[unanchored] 标注走独立单测
+        stable.fact_id = Some(1);
         recall.stable.push(stable);
+        let mut golden_session = crate::agent::memory::MemoryRecord::new(
+            "golden.session",
+            "固定会话摘要。",
+            1_700_000_100,
+        );
+        golden_session.fact_id = Some(2);
         recall
             .summaries
-            .push(crate::agent::memory::MemoryRecord::new(
-                "golden.session",
-                "固定会话摘要。",
-                1_700_000_100,
-            ));
-        recall.events.push(crate::agent::memory::MemoryRecord::new(
+            .push(golden_session);
+        let mut golden_event = crate::agent::memory::MemoryRecord::new(
             "golden.events.e1",
             "固定事件。",
             1_700_000_200,
-        ));
+        );
+        golden_event.fact_id = Some(3);
+        recall.events.push(golden_event);
         let mem = crate::agent::memory::MemoryManager::new(
             "golden-ns",
             crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:18080"),

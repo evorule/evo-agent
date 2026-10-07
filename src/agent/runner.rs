@@ -1916,6 +1916,7 @@ impl AgentRunner {
                     result.events.len(),
                     result.rollup_done,
                     result.knowledge_candidates.len(),
+                    result.flushed_events,
                 ) {
                     warn!(%session_id, error = %e, "sediment_performed journal failed");
                 }

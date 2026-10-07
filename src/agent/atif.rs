@@ -573,6 +573,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                 events_count,
                 rollup_done,
                 knowledge_candidates,
+                ..
             } => {
                 // 沉淀边界——context_management 系统步（四项持久化结果可对账）
                 if let Some(a) = acc.take() {
@@ -1712,6 +1713,7 @@ mod tests {
                 section_b: "【能力边界声明】".into(),
                 excerpt_a: "禁止使用 web_search".into(),
                 excerpt_b: "可用工具:web_search".into(),
+                semantic_verdict: None,
             }],
         });
         j.push(JE::TurnEnded {
