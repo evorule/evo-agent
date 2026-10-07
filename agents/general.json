@@ -45,6 +45,8 @@
     "causal_order",
     "lineage_of",
     "skill_pack_to_bundle",
+    "handover_write",
+    "handover_read",
     "delegate"
   ],
   "skills": [

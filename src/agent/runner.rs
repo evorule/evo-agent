@@ -2028,6 +2028,8 @@ impl AgentRunner {
         self.bind_propose_anchor(&session_id);
         // 双通道笔记批:note_write 会话期注册(payload 写,session_id 在手)
         self.register_session_scoped_memory_tools(&session_id);
+        // 自主交接批:handover 双工具会话期重绑(占位→wired,session_id 在手)
+        self.register_session_scoped_handover_tools(&session_id);
         // 跨源批 D:技能双层注册同步(声明面真账镜像+正文本地索引;
         // Recipe sources.skills_index 门控,缺省关=no-op;best-effort
         // 不阻塞会话)
@@ -2571,6 +2573,41 @@ impl AgentRunner {
             tool = crate::agent::memory_tool::NOTE_WRITE_TOOL,
             "note_write tool registered (session-scoped)"
         );
+    }
+
+    /// 自主交接批:会话期重绑 handover 双工具(启动期占位→wired;session_id
+    /// 在手;查账工具族 wire_accounting 同构)。门控=has_tool(启动期注册+
+    /// 开关 agentTools.handover 过滤后在场才重绑——开关关=占位未进面,LLM
+    /// 契约同步缺席);G15 续跑幂等(重绑即覆盖注册)。memory 未启用时跳过
+    /// (namespace 无权威源,占位保持 fail-visible 报错——不静默造 namespace)。
+    fn register_session_scoped_handover_tools(&mut self, session_id: &str) {
+        use crate::agent::handover_tool::{HandoverReadTool, HandoverWriteTool};
+        let (namespace, client) = match self.memory.as_ref() {
+            Some(mem) => (mem.namespace().to_string(), mem.evorule_client.clone()),
+            None => return,
+        };
+        for name in [
+            crate::agent::handover_tool::HANDOVER_WRITE_TOOL,
+            crate::agent::handover_tool::HANDOVER_READ_TOOL,
+        ] {
+            if !self.tool_handler.has_tool(name) {
+                continue;
+            }
+            let exec: std::sync::Arc<dyn ToolFunction> = match name {
+                crate::agent::handover_tool::HANDOVER_WRITE_TOOL => {
+                    std::sync::Arc::new(HandoverWriteTool::wired(
+                        namespace.clone(),
+                        client.clone(),
+                        session_id.to_string(),
+                    ))
+                }
+                _ => {
+                    std::sync::Arc::new(HandoverReadTool::wired(namespace.clone(), client.clone()))
+                }
+            };
+            self.tool_handler.register_static(name, exec);
+        }
+        info!(%session_id, "handover tools re-bound (session-scoped)");
     }
 
     /// 组装随 LLM 请求下发的工具 OpenAI function schema。
@@ -3360,6 +3397,35 @@ impl AgentRunner {
         }
     }
 
+    /// 自主交接批:handover_write 成功落 journal handover_written(结构化锚:
+    /// path/id;写档动作镜像已在 tool_invoked/tool_result,本事件供跨会话
+    /// 链对账)。非 handover_write/无 path 锚/无 journal = 不落(语义事件
+    /// 仅成功形态在场,失败由调用镜像覆盖)。
+    fn record_handover_written(
+        journal: Option<&crate::agent::journal::JournalWriter>,
+        session_id: &str,
+        tool_name: &str,
+        result: &Value,
+    ) {
+        if tool_name != crate::agent::handover_tool::HANDOVER_WRITE_TOOL {
+            return;
+        }
+        let Some(j) = journal else {
+            return;
+        };
+        let path = result.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        if path.is_empty() {
+            return;
+        }
+        let schema_ok = result
+            .get("schema_ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if let Err(e) = j.handover_written(session_id, path, schema_ok) {
+            tracing::warn!(error = %e, "handover_written journal append failed");
+        }
+    }
+
     /// 阶段一(流式路径):执行工具并解析审批请求,不做决策
     ///
     /// 供 stream! 生成器在 yield ApprovalRequired **之前**调用 —— 帧必须在
@@ -3386,6 +3452,7 @@ impl AgentRunner {
             let (final_result, _record) = self
                 .execute_tool_call_gated(session_id, tool_name, args, journal, Some(cached))
                 .await?;
+            Self::record_handover_written(journal, session_id, tool_name, &final_result);
             return Ok(ToolExecStage::Done(ToolExecOutcome {
                 final_result,
                 approval_record: None,
@@ -3412,11 +3479,14 @@ impl AgentRunner {
                 // 兼容臂:未收编工具自管协议遗留形态
                 let result_str = tool_result.to_string();
                 match parse_approval_request(session_id, tool_name, &first_args, &result_str) {
-                    None => Ok(ToolExecStage::Done(ToolExecOutcome {
-                        final_result: tool_result,
-                        approval_record: None,
-                        approval_flow: None,
-                    })),
+                    None => {
+                        Self::record_handover_written(journal, session_id, tool_name, &tool_result);
+                        Ok(ToolExecStage::Done(ToolExecOutcome {
+                            final_result: tool_result,
+                            approval_record: None,
+                            approval_flow: None,
+                        }))
+                    }
                     Some(req) => Ok(ToolExecStage::Pending(req)),
                 }
             }

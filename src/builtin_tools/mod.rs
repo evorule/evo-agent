@@ -4,7 +4,8 @@
 //! 内置工具(0.2.0:file_read / file_list / file_write / file_create /
 //! file_move / file_delete / search_files / grep_files / shell_exec /
 //! http_get / git_status / git_diff / git_log / git_stage / git_commit /
-//! read_skill / query_journal / query_trace / read_back / diff_runs)
+//! read_skill / query_journal / query_trace / read_back / diff_runs /
+//! handover_write / handover_read)
 //!
 //! 注:`read_skill`(skills 装配 B2)不在 default_safe_toolkit 静态注册——
 //! 其技能表来自 agent definition 的 skills 声明(声明非空时由 serve_tools::
@@ -171,6 +172,17 @@ pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
     handler.register_static(
         "diff_runs",
         Arc::new(accounting::DiffRunsTool::new(acc_deps)),
+    );
+    // 自主交接双工具（自主交接设计 PR-H2）：占位执行体启动期注册（未接线时
+    // 调用 fail-visible 如实报错）；runner 会话期重绑（wire_accounting 同构）——
+    // 开关 agentTools.handover 过滤 / 声明收紧 / LLM 契约三面自动工作
+    handler.register_static(
+        "handover_write",
+        Arc::new(crate::agent::handover_tool::HandoverWriteTool::unwired()),
+    );
+    handler.register_static(
+        "handover_read",
+        Arc::new(crate::agent::handover_tool::HandoverReadTool::unwired()),
     );
     handler
 }
@@ -541,6 +553,87 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                 description: "Skill name exactly as listed in the available-skills list"
                     .to_string(),
                 required: true,
+            }],
+        },
+        ToolSpec {
+            name: "handover_write".to_string(),
+            description: "Write a structured handover document so the NEXT session can \
+                          continue this task chain. Use it when the context-budget signal \
+                          approaches its limit, or when you judge the session should hand \
+                          off. All six fields are mandatory (schema fail-visible): goal \
+                          restates the task; done lists completed items with evidence \
+                          anchors (file:line / commit / test name); todo_next lists the \
+                          next actions in executable order; anchors captures key paths, \
+                          decisions and pitfalls; env_state captures HEAD, test baseline \
+                          and in-flight changes; verification states how the next session \
+                          confirms a successful continuation. The document is recorded in \
+                          the audit ledger."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "goal".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Task goal (restated; guards against drift)".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "done".to_string(),
+                    r#type: "array".to_string(),
+                    description: "Completed items with evidence anchors, e.g. \
+                                  [\"src/main.rs:42 handler wired (commit abc1234)\"]"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "todo_next".to_string(),
+                    r#type: "array".to_string(),
+                    description: "Next actions in executable order (actionable granularity)"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "anchors".to_string(),
+                    r#type: "object".to_string(),
+                    description: "Key context, e.g. {\"critical paths\": \"...\", \
+                                  \"decisions\": \"...\", \"pitfalls\": [\"...\"]}"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "env_state".to_string(),
+                    r#type: "object".to_string(),
+                    description: "Environment snapshot, e.g. {\"HEAD\": \"abc1234\", \
+                                  \"test_baseline\": \"all green\", \"in_flight\": [\"...\"]}"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "verification".to_string(),
+                    r#type: "string".to_string(),
+                    description: "First-action criterion: how the next session confirms \
+                                  it has successfully continued the chain"
+                        .to_string(),
+                    required: true,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "handover_read".to_string(),
+            description: "Read a handover document to continue a task chain from a previous \
+                          session. Without arguments returns the LATEST handover; pass \
+                          handover_id to read a specific one. Returns the document plus a \
+                          completeness check (missing_fields warning when any mandatory \
+                          field is absent). As a continuation session's FIRST action, read \
+                          the handover, verify the verification criterion, then work \
+                          through todo_next."
+                .to_string(),
+            parameters: vec![ParameterSpec {
+                name: "handover_id".to_string(),
+                r#type: "string".to_string(),
+                description: "Specific handover id (e.g. \"handover-20261007-101530\"); \
+                              omit for the latest"
+                    .to_string(),
+                required: false,
             }],
         },
         ToolSpec {

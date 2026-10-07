@@ -264,6 +264,18 @@ pub enum JournalEvent {
         /// 重建项列表(消息历史/pending 审批/Runaway 计数)
         rebuilt: Vec<String>,
     },
+    /// 自主交接落账(自主交接设计 PR-H2):handover_write 成功写交接档后落账。
+    /// 交接点=跨会话链的因果锚(续接会话首动作 handover_read 消费);写档
+    /// 动作镜像已在 tool_invoked/tool_result,本事件携带结构化锚(path/id)
+    /// 供跨会话链对账与死信可见性。
+    HandoverWritten {
+        /// 会话 ID(写方)
+        session: String,
+        /// 交接档 fact 路径(shared.{namespace}.handovers.{id})
+        path: String,
+        /// schema 校验结果(写侧 fail-visible 拒写,应恒 true;保留字段容错)
+        schema_ok: bool,
+    },
 }
 
 /// 单行 journal 记录(读侧重放消费形态)
@@ -750,6 +762,22 @@ impl JournalWriter {
             hit_n,
             ratio,
             summary_empty,
+        })
+    }
+
+    /// 自主交接落账(自主交接设计 PR-H2):handover_write 成功写交接档后落
+    /// handover_written(结构化锚:path/id;写档动作镜像已在 tool_invoked/
+    /// tool_result,本事件供跨会话链对账)。
+    pub fn handover_written(
+        &self,
+        session: &str,
+        path: &str,
+        schema_ok: bool,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::HandoverWritten {
+            session: session.to_string(),
+            path: path.to_string(),
+            schema_ok,
         })
     }
 

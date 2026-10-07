@@ -13,7 +13,7 @@
 //! 1. 无 manifest 拒绝注册：[`crate::io_handlers::tool_handler::ToolHandler::register`]
 //!    接收 `(manifest, handler)`；按名查不到静态条目且非动态源（服务代理/MCP）
 //!    的注册在启动期 panic（fail-fast）。
-//! 2. 静态层锁定：内置 16 + 规则 46 + delegate 1 + memory 4 的 manifest 为
+//! 2. 静态层锁定：内置 22 + 规则 49 + delegate 1 + memory 4 的 manifest 为
 //!    静态表（[`static_manifests`]）；测试断言数量、名称无重叠、spec 可解析、
 //!    派生视图与旧表快照一致——「union 42 vs 41」类注释漂移机制上不可能再现。
 //! 3. 动态层注册期补全：服务代理与 MCP 在注册期必须产出 spec
@@ -293,7 +293,7 @@ impl ToolManifest {
 }
 
 // =============================================================================
-// 静态表（硬规则 2：内置 20 + 规则 46 + delegate 1 + memory 4 = 71）
+// 静态表（硬规则 2：内置 22 + 规则 49 + delegate 1 + memory 4 = 76）
 // =============================================================================
 
 /// agentTools.fileCreate（默认开）
@@ -332,6 +332,13 @@ pub const AGENT_TOOLS_MCP_ADJUDICATION: &str = "agentTools.mcpAdjudication";
 /// agentTools.serviceProxyAdjudication（默认 sensitive；D7-A 同上，作用域
 /// = 服务代理来源）
 pub const AGENT_TOOLS_SERVICE_PROXY_ADJUDICATION: &str = "agentTools.serviceProxyAdjudication";
+/// agentTools.handover（默认开；单键管自主交接工具族全量——交接协议为整体）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+/// 交接设计 §四：三工具 manifest 各自绑定同键（对齐 governanceWrite 管族
+/// =列表枚举先例），同开同关；application 作用域（工作区层不可覆盖）。
+pub const AGENT_TOOLS_HANDOVER: &str = "agentTools.handover";
+const SWITCH_HANDOVER: &str = AGENT_TOOLS_HANDOVER;
 
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
@@ -356,7 +363,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（20 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（22 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -394,6 +401,13 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             SpecSource::Builtin,
             vec![Skill],
         ),
+        // 自主交接双工具（自主交接设计 PR-H2）：会话间状态的结构化读写。
+        // 占位执行体启动期注册（default_safe_toolkit），runner 会话期重绑
+        // （wire_accounting 同构）；Standard 免裁决（自用 Draft 性质，对齐
+        // note_write）+ AutoPolicy；开关=agentTools.handover 单键同绑（见
+        // default_switch 段）。spec 常驻 default_tool_specs（Builtin 源）。
+        b("handover_write", vec![Memory]),
+        b("handover_read", vec![Memory]),
     ]
     .into_iter()
     .map(|mut m| {
@@ -437,6 +451,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             "grep_files" => sw(SWITCH_GREP, true),
             "git_status" | "git_diff" | "git_log" => sw(SWITCH_GIT_READ, true),
             "git_stage" | "git_commit" => sw(SWITCH_GIT_WRITE, false),
+            // 自主交接族：单键同绑同开同关（交接设计 §四；session_spawn 落地
+            // 时第三行同键接入）
+            "handover_write" | "handover_read" => sw(SWITCH_HANDOVER, true),
             _ => None,
         };
         m
@@ -723,12 +740,12 @@ mod tests {
 
     #[test]
     fn test_static_manifest_count_locked() {
-        // 内置 20 + 规则 49 + delegate 1 + memory 4 = 74
+        // 内置 22 + 规则 49 + delegate 1 + memory 4 = 76
         // （PR-11a 查账工具族 +4：16→20；PR-11b why/order 三工具 +3：
-        //   规则 46→49，数量锁 71→74）
-        assert_eq!(builtin_manifests().len(), 20);
+        //   规则 46→49；自主交接双工具 +2：内置 20→22，数量锁 74→76）
+        assert_eq!(builtin_manifests().len(), 22);
         assert_eq!(rule_manifests().len(), 49);
-        assert_eq!(all().len(), 74);
+        assert_eq!(all().len(), 76);
     }
 
     #[test]
@@ -948,6 +965,9 @@ mod tests {
         ("bundle_export", "agentTools.governanceWrite", true),
         ("bundle_import_dry_run", "agentTools.governanceWrite", true),
         ("bundle_import", "agentTools.governanceWrite", true),
+        // 自主交接族（自主交接设计 PR-H2）：单键同绑
+        ("handover_write", "agentTools.handover", true),
+        ("handover_read", "agentTools.handover", true),
     ];
 
     #[test]

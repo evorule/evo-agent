@@ -730,7 +730,7 @@ mod tests {
         let (ws, ev) = make_clients();
         let handler = build_union_toolkit(Path::new("."), &ws, &ev);
 
-        // 15 个内置工具(10 文件/搜索/网络 + 5 git 族)
+        // 17 个内置工具(10 文件/搜索/网络 + 5 git 族 + 查账占位/交接占位)
         for name in [
             "file_read",
             "file_list",
@@ -747,6 +747,8 @@ mod tests {
             "git_log",
             "git_stage",
             "git_commit",
+            "handover_write",
+            "handover_read",
         ] {
             assert!(
                 handler.has_tool(name),
@@ -764,7 +766,7 @@ mod tests {
             );
         }
 
-        // 总数 = 15 + 30 = 45(逐个验证所有预期工具都在)
+        // 总数 = 17 + 30 = 47(逐个验证所有预期工具都在)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -781,12 +783,14 @@ mod tests {
             "git_log",
             "git_stage",
             "git_commit",
+            "handover_write",
+            "handover_read",
         ]
         .iter()
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 45, "expected 45 total tool names");
+        assert_eq!(all_names.len(), 47, "expected 47 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),
@@ -794,6 +798,30 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_handover_switch_off_gates_handover_tools() {
+        // 自主交接开关(交接设计 PR-H2):默认(键缺失)双工具在面;false = 交接
+        // 族整体下线(执行器+LLM 契约同步消失,能力面不存在)
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let whitelist = vec!["handover_write".to_string(), "handover_read".to_string()];
+        let open =
+            build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
+        assert!(open.has_tool("handover_write"), "handover must default ON");
+        assert!(open.has_tool("handover_read"), "handover must default ON");
+        let mut settings = serde_json::Map::new();
+        settings.insert("agentTools.handover".to_string(), serde_json::json!(false));
+        let closed = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        assert!(
+            !closed.has_tool("handover_write"),
+            "handover_write must be gated off"
+        );
+        assert!(
+            !closed.has_tool("handover_read"),
+            "handover_read must be gated off"
+        );
     }
 
     #[test]

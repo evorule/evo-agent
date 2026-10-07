@@ -228,6 +228,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.handover",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "自主交接工具（handover_write/handover_read）：会话收尾写结构化交接档、续接会话读档核对（关闭 = 交接族连 LLM 契约一起下线，长任务仅靠压缩兜底）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.mcp",
             kind: SettingType::Boolean,
             default: json!(true),
@@ -643,7 +653,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 24);
+        assert_eq!(settings.len(), 25);
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -666,6 +676,8 @@ mod tests {
             settings["agentTools.serviceProxyAdjudication"],
             json!("sensitive")
         );
+        // 自主交接开关(交接设计 PR-H2):默认开 = 交接族在面,零行为变化
+        assert_eq!(settings["agentTools.handover"], json!(true));
         // search.* 全局搜索 4 键(B2 消费)
         assert_eq!(settings["search.maxResults"], json!(1000));
         assert_eq!(settings["search.smartCase"], json!(true));
