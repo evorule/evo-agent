@@ -29,6 +29,27 @@ let ws = null;
 let streamMsgId = null; // 当前轮流式 assistant 气泡
 let lastToolMsgId = null; // 最近一个运行中工具气泡(按 name 匹配结果)
 let pendingWrite = null; // S4:进行中的 file_write {path, content}(ToolResult 成功即登记产物)
+let pendingNotice = null; // newSession 清屏后需补显的提示(SessionCreated 时补显)
+
+/**
+ * 死会话检测:引擎侧会话已失效(evorule-server 重启或 30min 闲置 TTL 回收),
+ * evo-agent serve 转发 REST 失败回灌的错误体携带 NOT_FOUND 特征。
+ * 命中即自动新建会话(自愈),避免用户每条消息都秒回 404。
+ */
+function looksLikeDeadSession(text) {
+  return text.includes('NOT_FOUND') || /"status":\s*404/.test(text);
+}
+
+function recoverFromDeadSession(rawError) {
+  finishStream();
+  turnActive.set(false);
+  pushMessage({
+    kind: 'error',
+    text: `消息发送失败:会话在引擎侧已失效(${String(rawError).slice(0, 100)})`,
+  });
+  pendingNotice = '已自动新建会话——请重发刚才的消息。';
+  newSession();
+}
 
 function wsUrl(sid) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -138,6 +159,10 @@ function handleFrame(f) {
         kind: 'info',
         text: `会话已建立${f.memory_enabled ? '(记忆已启用)' : ''}`,
       });
+      if (pendingNotice) {
+        pushMessage({ kind: 'info', text: pendingNotice });
+        pendingNotice = null;
+      }
       refreshSessions();
       pushPanelEvent('sys', { label: 'SessionCreated', detail: `会话 ${f.session_id} 已建立` });
       refreshGovBadges(f.session_id);
@@ -194,6 +219,10 @@ function handleFrame(f) {
     case 'Done': {
       finishStream();
       if (f.success === false && f.error) {
+        if (looksLikeDeadSession(String(f.error))) {
+          recoverFromDeadSession(f.error);
+          break;
+        }
         pushMessage({ kind: 'error', text: String(f.error) });
         pushPanelEvent('gov', { label: 'TurnFailed', detail: String(f.error), level: 'error' });
       } else {
@@ -204,6 +233,10 @@ function handleFrame(f) {
       break;
     }
     case 'Error':
+      if (looksLikeDeadSession(String(f.error))) {
+        recoverFromDeadSession(f.error);
+        break;
+      }
       finishStream();
       pushMessage({ kind: 'error', text: String(f.error) });
       pushPanelEvent('gov', { label: 'Error', detail: String(f.error), level: 'error' });

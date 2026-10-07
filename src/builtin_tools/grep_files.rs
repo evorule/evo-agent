@@ -6,8 +6,8 @@
 //! ## 安全模型(与 search_files 同款沙箱)
 //! - 路径**相对** workdir;绝对路径/`..` 段/canonicalize 越界一律拒绝
 //! - 默认排除集始终生效(`.git/**`/`target/**`/`node_modules/**`/
-//!   `.evo-trash/**`/`data/**`——与 watcher 排除目录对齐,不向结果泄露
-//!   工作台内部数据面)
+//!   `.evo-trash/**`——与 watcher 排除目录对齐;运行时数据目录由 gitignore
+//!   语义自然排除,不向结果泄露工作台内部数据面)
 //! - gitignore 尊重开关(默认开;无 git 仓时由 ignore crate 语义自然降级)
 //! - 二进制文件跳过(NUL 探测 quit 模式)
 //! - max_results 截断 + 30s 硬超时(返回已收集的 partial 结果)
@@ -63,12 +63,13 @@ pub const MAX_MAX_RESULTS: usize = 20_000;
 pub const TIMEOUT_SECS: u64 = 30;
 
 /// 出厂默认排除集(始终叠加;与 watcher 排除目录对齐)
+/// 注:不含 `data/` —— 该名字与源码子目录(如 src/agent/data)冲突,
+/// 名字级剪枝会误杀已入库文件;大 data 目录由调用方显式传 excludeGlobs。
 pub const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     ".git/**",
     "target/**",
     "node_modules/**",
     ".evo-trash/**",
-    "data/**",
 ];
 
 /// 搜索参数(REST body 与 agent 工具 args 共用一形;camelCase/snake_case 双认)
@@ -1110,12 +1111,23 @@ mod tests {
     #[test]
     fn test_default_excludes_always_applied() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
         std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(dir.path().join("target/artifact.txt"), "needle\n").unwrap();
         std::fs::write(dir.path().join("data/secret.txt"), "needle\n").unwrap();
         std::fs::write(dir.path().join("code.txt"), "needle\n").unwrap();
         let out = grep(dir.path(), literal_args("needle")).unwrap();
-        assert_eq!(out["fileCount"], 1, "data/** must stay excluded");
-        assert_eq!(out["groups"][0]["path"], "code.txt");
+        // data/ 已移出默认排除表(名字与源码子目录冲突,误杀已入库文件);
+        // target/ 仍在出厂排除集——非 git 目录(tempdir)下无 gitignore 兜底
+        assert_eq!(out["fileCount"], 2, "target/** must stay excluded");
+        let paths: Vec<&str> = out["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"data/secret.txt"), "data 内文件应可搜");
+        assert!(paths.contains(&"code.txt"));
     }
 
     #[test]
