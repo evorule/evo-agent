@@ -700,10 +700,12 @@ fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json::Val
         Ok(AgentEvent::SessionCreated {
             session_id,
             memory_enabled,
+            constitution,
         }) => serde_json::json!({
             "type": "SessionCreated",
             "session_id": session_id,
             "memory_enabled": memory_enabled,
+            "constitution": constitution,
         }),
         Ok(AgentEvent::Step { step }) => serde_json::json!({
             "type": "Step",
@@ -859,10 +861,12 @@ mod tests {
         let v = agent_event_to_json(Ok(AgentEvent::SessionCreated {
             session_id: "s-42".to_string(),
             memory_enabled: true,
+            constitution: Some("pass@2".to_string()),
         }));
         assert_eq!(v["type"], "SessionCreated");
         assert_eq!(v["session_id"], "s-42");
         assert_eq!(v["memory_enabled"], true);
+        assert_eq!(v["constitution"], "pass@2", "审查结论入站外面");
     }
 
     #[test]

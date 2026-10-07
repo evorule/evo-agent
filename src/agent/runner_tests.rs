@@ -913,6 +913,7 @@ fn test_agent_event_all_variants() {
     let e = AgentEvent::SessionCreated {
         session_id: "s1".to_string(),
         memory_enabled: false,
+        constitution: None,
     };
     assert!(matches!(e, AgentEvent::SessionCreated { session_id, .. } if session_id == "s1"));
 
