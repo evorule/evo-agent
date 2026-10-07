@@ -158,6 +158,9 @@ pub enum JournalEvent {
         /// 写入共享账本的知识候选数（serde default 保旧 journal 兼容）
         #[serde(default)]
         knowledge_candidates: usize,
+        /// 会话收尾补写成功的离线积压事件数（serde default 保旧 journal 兼容）
+        #[serde(default)]
+        flushed_events: usize,
     },
     /// B-1(收尾清偿批):逐轮 wire 留痕——本轮组装完成的完整上下文 wire 落账。
     /// 每轮全量(不裁剪)双写成本已裁定接受;F-903 重建演示以此为逐字节比对基准。
@@ -633,6 +636,7 @@ impl JournalWriter {
         events_count: usize,
         rollup_done: bool,
         knowledge_candidates: usize,
+        flushed_events: usize,
     ) -> Result<u64, JournalError> {
         self.push(JournalEvent::SedimentPerformed {
             summary_written,
@@ -641,6 +645,7 @@ impl JournalWriter {
             events_count,
             rollup_done,
             knowledge_candidates,
+            flushed_events,
         })
     }
 
@@ -1343,6 +1348,7 @@ mod tests {
                 events_count: 2,
                 rollup_done: false,
                 knowledge_candidates: 1,
+                flushed_events: 0,
             },
             JE::WireRendered {
                 round: 1,

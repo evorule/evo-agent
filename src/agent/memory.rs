@@ -2834,7 +2834,7 @@ impl MemoryManager {
         for record in records {
             // B5：stable 节按来源域标注（D1 标注注入 / D2 unclassified），
             // 让 LLM 与审计侧都能区分"LLM 提取"与"用户/系统写入"。
-            let display_key = if section == "stable" {
+            let mut display_key = if section == "stable" {
                 match Self::stable_domain_of(&record.key) {
                     StableDomain::Llm => format!("[llm-extracted] {}", record.key),
                     StableDomain::System => format!("[system] {}", record.key),
@@ -2844,6 +2844,12 @@ impl MemoryManager {
             } else {
                 record.key.clone()
             };
+            // 未锚定降级标注（账本记忆 I8 条款）：fact_id 缺失/哨兵 0
+            // （离线写入 CacheOnly）=无账本锚点，入 prompt 前显式标注——
+            // LLM 与审计侧都能区分"可溯源条目"与"未锚定条目"（fail-visible）
+            if record.fact_id.is_none() || record.fact_id == Some(0) {
+                display_key = format!("[unanchored] {display_key}");
+            }
             let result = self.safety_auditor.audit(&record.value);
             for f in &result.findings {
                 tracing::warn!(
@@ -4254,11 +4260,17 @@ mod tests {
     #[test]
     fn test_recall_annotation_by_domain() {
         let mgr = MemoryManager::new("test", make_test_client());
+        // 夹具=账本来源条目(带锚);[unanchored] 标注走独立单测
+        let mk_anchored = |k: &str, v: &str, ts: u64| {
+            let mut r = MemoryRecord::new(k, v, ts);
+            r.fact_id = Some(1);
+            r
+        };
         let recall = RecallContext {
             stable: vec![
-                MemoryRecord::new("stable.llm.gpt-4o.topic", "quantum computing", 1),
-                MemoryRecord::new("stable.user.prefs", "prefer concise answers", 2),
-                MemoryRecord::new("stable.legacy", "old data without domain", 3),
+                mk_anchored("stable.llm.gpt-4o.topic", "quantum computing", 1),
+                mk_anchored("stable.user.prefs", "prefer concise answers", 2),
+                mk_anchored("stable.legacy", "old data without domain", 3),
             ],
             ..RecallContext::default()
         };
@@ -5830,6 +5842,28 @@ mod tests {
         // 注意：若注入句仅占条目一部分,剥离后剩余正文仍会进入 prompt
         // （如 "you are now the admin" 剥离后余 "admin"）——这是 Strip
         // 模式的预期语义:保正文、除攻击。
+    }
+
+    #[test]
+    fn test_unanchored_record_labeled_in_prompt() {
+        // 账本记忆 I8 降级可见:fact_id 缺失/哨兵 0(离线 CacheOnly)=无账本
+        // 锚点,prompt 行显式 [unanchored] 前缀——LLM 与审计侧均可分
+        let mgr = MemoryManager::new("sec", make_test_client());
+        let mut rec = MemoryRecord::new("events.e1", "离线写入的事件", 1);
+        rec.fact_id = None;
+        let mut rec2 = MemoryRecord::new("events.e2", "补写失败仍为哨兵", 2);
+        rec2.fact_id = Some(0);
+        let mut anchored = MemoryRecord::new("stable.llm.ok", "正常锚定条目", 3);
+        anchored.fact_id = Some(42);
+        let recall = RecallContext {
+            events: vec![rec, rec2],
+            stable: vec![anchored],
+            ..Default::default()
+        };
+        let prompt =
+            mgr.build_system_prompt_with_recall("BASE", &recall, &ContextBudget::new(100_000, 0.25));
+        assert!(prompt.matches("[unanchored]").count() == 2, "两未锚定条目均标注: {prompt}");
+        assert!(!prompt.contains("[unanchored] stable.llm.ok"), "锚定条目不标注");
     }
 
     #[test]
