@@ -543,7 +543,7 @@ fn parse_candidate_face(
 }
 
 /// 主入口：跨会话候选巩固（best-effort，审计 sidecar 通路复用纪律①）
-async fn consolidate_knowledge_candidates(
+pub(crate) async fn consolidate_knowledge_candidates(
     deps: &mut SedimentDeps<'_>,
     cfg: &SedimentConfig,
     session_id: &str,
