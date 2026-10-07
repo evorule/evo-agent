@@ -1934,6 +1934,36 @@ impl AgentRunner {
     ///
     /// `memory` / `summarizer` / `extractor` 是 `AgentRunner` 的不同字段，
     /// Rust 允许同时借用不同字段（disjoint borrows），不会冲突。
+    /// 空闲巩固入口（sleep-time 触发变体转正,11 号 §六）:会话间隙外的
+    /// 空闲窗口可由调度器(运维/CLI/后续产品化)调用——仅重跑巩固阶段
+    /// (跨会话候选确定性聚类→sidecar 合并提议→Consolidated 落账),
+    /// 门控仍随 Recipe(consolidation 缺省开;无审计通路内部自动跳过)。
+    /// 返回本次巩固候选数(离线/不可用=如实 Err)。
+    pub async fn idle_consolidation(
+        &mut self,
+        session_id: &str,
+    ) -> Result<usize, String> {
+        let memory = self.memory.as_mut().ok_or("memory not enabled")?;
+        memory.flush_usage(session_id).await;
+        let mut deps = sediment::SedimentDeps {
+            memory,
+            summarizer: self.summarizer.as_ref(),
+            extractor: self.extractor.as_mut(),
+            event_store: self.memory_event_store.as_mut(),
+            auditor: self.summarizer.as_ref().and_then(|s| s.auditor()),
+            journal_lines: Vec::new(),
+        };
+        let mut result = sediment::SedimentResult::default();
+        sediment::consolidate_knowledge_candidates(
+            &mut deps,
+            &self.sediment_config,
+            session_id,
+            &mut result,
+        )
+        .await;
+        Ok(result.knowledge_consolidated.len())
+    }
+
     async fn sediment_session(
         &mut self,
         session_id: &str,
