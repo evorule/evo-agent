@@ -55,6 +55,8 @@ use crate::agent::replan::{
     lookup_agent_type, should_replan, BudgetCounters, BudgetThresholds, ReplanReason, ReplanState,
 };
 use crate::agent::workflow::{Workflow, WorkflowEngine};
+use crate::api::evorule_client::EvoruleApiClient;
+use crate::io_handlers::tool_handler::ToolHandler;
 
 /// 驱动模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,6 +378,100 @@ pub async fn run_plan_loop(
     }
 }
 
+/// serve 面 plan-execute 装配入口（serve 挂 driver）：单 planner 节点 probe DAG
+/// → constitution 校验链（fail-fast 拒载）→ DelegateContext（toolkit/治理段由
+/// 调用方注入）→ marks_session 创建（fail-fast——留痕是硬义务）→ run_plan_loop。
+///
+/// 与 CLI workflow 装配段（cmd_workflow）同构，差异仅两点：
+/// - toolkit 由调用方传入（serve 面 `build_filtered_toolkit_with_switches`
+///   产物，E1 安全隔离语义优先），不在本函数重建 CLI union toolkit；
+/// - 治理门禁段随上下文下放（serve 构造点与主路径同源——治理纪律无豁免面；
+///   CLI 面传 None 与 CLI 主路径同口径）。
+///
+/// 返回 `(PlanLoopOutcome, marks_session_id)`——session id 供响应面会话关联
+/// 收口（消费者可凭此查询权威面或工作台回放）。
+///
+/// `max_depth` / `max_concurrent` 与 CLI workflow 子命令缺省一致（3 / 5），
+/// 由调用方传入；驱动限额 `limits` 语义见 [`DriverLimits`]（阈值禁入 PlanFact）。
+pub async fn run_plan_execute(
+    evorule_client: EvoruleApiClient,
+    definitions: crate::agent::AgentDefinitionManager,
+    toolkit: ToolHandler,
+    workdir: &std::path::Path,
+    governance_segment: Option<String>,
+    goal: &str,
+    limits: DriverLimits,
+    max_depth: usize,
+    max_concurrent: usize,
+) -> Result<(PlanLoopOutcome, String), String> {
+    // ① probe DAG（单 planner 节点，task=goal）→ constitution 校验链（与 CLI
+    //    同一加载入口：schema 全量校验 + 物化，失败 fail-fast 拒载）
+    let probe = probe_workflow_value(goal);
+    let wf = crate::agent::constitution::load_workflow(&probe).map_err(|violations| {
+        format!(
+            "plan-execute probe workflow failed constitution validation/materialization: {}",
+            violations.join("; ")
+        )
+    })?;
+
+    // ② DelegateContext 构造（对齐 CLI：toolkit+workdir 成对注入——delegate 按
+    //    各子代理 def.tools 白名单过滤挂载；journal 同目录落账）
+    let mut ctx = DelegateContext::new("workflow_root", definitions, evorule_client.clone())
+        .with_toolkit(toolkit, workdir)
+        .with_max_depth(max_depth)
+        .with_journal_dir(workdir.join("data").join("sessions"))
+        .with_governance_segment(governance_segment);
+    if max_concurrent > 0 {
+        ctx = ctx.with_max_concurrent_delegates(max_concurrent);
+    }
+
+    // ③ marks_session 创建（fail-fast，与 CLI 同语义；workflow_run kind 锚定
+    //    本链路——节点完成信号与协作标记都落此会话）
+    let marks_session = evorule_client
+        .create_session(
+            Some(&json!({
+                "kind": "workflow_run",
+                "workflow_id": "serve_plan_execute",
+            })),
+            Some("llm"),
+        )
+        .await
+        .map_err(|e| format!("failed to create workflow marks session: {}", e))?;
+
+    // ④ seed_hash 锚 = probe DAG canonical JSON 的 BLAKE3（与 CLI「workflow 文件
+    //    原文 hash」同口径；serde_json BTreeMap 键序保证 canonical 确定性）
+    let probe_canonical = serde_json::to_string(&probe).map_err(|e| e.to_string())?;
+
+    let outcome = run_plan_loop(
+        ctx,
+        wf,
+        PlanMode::PlanExecute,
+        limits,
+        Some(plan_canonical_hash(&probe_canonical)),
+        Some(marks_session.clone()),
+    )
+    .await?;
+    Ok((outcome, marks_session))
+}
+
+/// serve 面 plan-execute probe DAG（单 planner 节点，task=goal）——构造与
+/// 校验分离（纯函数可测）；形态与 `rules/workflows/research_plan.json` 一致
+fn probe_workflow_value(goal: &str) -> Value {
+    json!({
+        "workflow_id": "serve_plan_execute",
+        "description": "serve plan-execute planning probe: single planner node, output PlanFact v1",
+        "nodes": [
+            {
+                "id": "planner",
+                "agent_type": "planner",
+                "task": goal,
+                "depends_on": []
+            }
+        ],
+        "output_node": "planner"
+    })
+}
+
 /// M5-b：协作节点完成信号指令形态（纯函数）
 ///
 /// 中性事件：`set meta_signal.node_done = <node_id>`。驱动只报告「某节点完成了」，
@@ -670,6 +766,25 @@ mod tests {
         assert_eq!(plan["plan_source"], "replan_after_failure");
         assert_eq!(plan["plan_version"], 2);
         assert_eq!(plan["parent_plan_hash"], parent.as_str());
+    }
+
+    // ----- serve 挂 driver：probe DAG 构造 + constitution 校验链 -----
+
+    #[test]
+    fn probe_workflow_passes_constitution_and_shape() {
+        let goal = "research the topic 'X' and produce a digest";
+        let probe = probe_workflow_value(goal);
+        let wf = crate::agent::constitution::load_workflow(&probe)
+            .expect("probe DAG passes constitution validation/materialization");
+        assert_eq!(wf.workflow_id, "serve_plan_execute");
+        assert_eq!(wf.nodes.len(), 1);
+        assert_eq!(wf.nodes[0].id, "planner");
+        assert_eq!(wf.nodes[0].agent_type, "planner");
+        assert_eq!(wf.nodes[0].task, goal);
+        assert!(wf.nodes[0].depends_on.is_empty());
+        assert_eq!(wf.output_node, "planner");
+        // canonical 确定性：同输入必同输出（键序由 BTreeMap 保证，seed_hash 锚稳定）
+        assert_eq!(probe, probe_workflow_value(goal));
     }
 
     // ----- build_plan_summary / build_replan_task（纲领 §9.4.3 摘要格式）-----
