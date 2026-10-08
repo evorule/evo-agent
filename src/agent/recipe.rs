@@ -450,6 +450,77 @@ impl RetrievalPolicy {
     }
 }
 
+// =============================================================================
+// 进程级策略快照槽（O-377① 批 1：bundle 内嵌 Recipe 快照的注入通路）
+// =============================================================================
+
+/// 进程级快照槽句柄类型
+pub type RecipeSlot = std::sync::Arc<std::sync::RwLock<Option<MemoryRecipe>>>;
+
+static RECIPE_SLOT: std::sync::OnceLock<RecipeSlot> = std::sync::OnceLock::new();
+
+/// 进程级快照槽（幂等单例）。
+///
+/// 架构事实：serve 模式 union toolkit 进程级单次组装（`serve_tools::build_union_toolkit`），
+/// `bundle_export` 工具在组装期取得读取面；发布面 = [`MemoryManager::set_recipe`]
+/// （初始注入与热重载的单一收口）。批 1 取「最后发布者生效」进程级语义——
+/// 同一进程的会话通常出自同一 recipe 定义源，槽内容与各会话实际策略一致；
+/// 多会话异策略的会话级归属细化随恢复接线批收。
+pub fn recipe_slot() -> RecipeSlot {
+    RECIPE_SLOT
+        .get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(None)))
+        .clone()
+}
+
+/// 发布面：策略在位时写入槽（`MemoryManager::set_recipe` 单点调用）
+pub fn publish_recipe(recipe: &MemoryRecipe) {
+    if let Ok(mut slot) = recipe_slot().write() {
+        *slot = Some(recipe.clone());
+    }
+}
+
+/// 消费面：打包时刻读取当前策略（None = 无策略在位，导出不带快照——
+/// 字节兼容缺省语义，与「无证据导出显式标注」同理：如实，不伪造）
+pub fn current_published_recipe() -> Option<MemoryRecipe> {
+    recipe_slot().read().ok().and_then(|slot| slot.clone())
+}
+
+/// 恢复侧校验原语（薄壳）：读进程槽取本地策略后走纯函数比对。
+///
+/// 批 1 落函数 + 单测；真实接线（bundle_import 恢复路径消费）随 O-376①② 批。
+pub fn verify_bundle_recipe_snapshot(bundled: &serde_json::Value) -> Result<(), String> {
+    let local =
+        current_published_recipe().ok_or_else(|| "本地无策略在位，无法校验包内快照".to_string())?;
+    verify_snapshot_against(bundled, &local)
+}
+
+/// 恢复侧校验纯函数：包内快照 vs 给定本地策略一致性。
+///
+/// 比对口径：`recipe_version` 相等 + `recipe` opaque 值级相等（serde_json
+/// 结构化相等，与序列化键序无关）。防篡改不在此处——bundle 全包哈希校验
+/// 由导入链 `verify_content_hash` 承担，本原语只回答「包内快照是否与本机
+/// 当前策略一致」（恢复决策输入，不构成安全边界）。
+pub fn verify_snapshot_against(
+    bundled: &serde_json::Value,
+    local: &MemoryRecipe,
+) -> Result<(), String> {
+    let bundled_version = bundled
+        .get("recipe_version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "包内快照缺 recipe_version 字段".to_string())?;
+    if bundled_version != local.recipe_version {
+        return Err(format!(
+            "策略版本不一致: bundle={bundled_version} local={}",
+            local.recipe_version
+        ));
+    }
+    let local_recipe = serde_json::to_value(local).map_err(|e| e.to_string())?;
+    if bundled.get("recipe") != Some(&local_recipe) {
+        return Err("策略内容不一致（opaque 值级比对失配）".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +605,42 @@ mod tests {
         let p = RetrievalPolicy::from_recipe(&recipe);
         assert_eq!(p.recipe_version, "memory-v1.0");
         assert_eq!(p.degradation_order.len(), 3);
+    }
+
+    #[test]
+    fn test_snapshot_slot_publish_and_consume() {
+        // 进程级槽机制冒烟：发布后槽在位（并行测试只替换不置空，is_some 无竞态；
+        // 等值断言不用于全局槽——多测试并行发布会互相覆盖，等值走纯函数测试）
+        let recipe = MemoryRecipe::default();
+        publish_recipe(&recipe);
+        assert!(current_published_recipe().is_some());
+    }
+
+    #[test]
+    fn test_verify_snapshot_against_green_and_red() {
+        let local = MemoryRecipe::default();
+        let bundled = serde_json::json!({
+            "recipe_version": local.recipe_version,
+            "recipe": serde_json::to_value(&local).unwrap(),
+            "snapshot_at": "2026-10-08T00:00:00Z"
+        });
+        // 一致 → 绿
+        assert!(verify_snapshot_against(&bundled, &local).is_ok());
+
+        // 版本篡改 → 红（伪造版本一致性负验证）
+        let mut tampered = bundled.clone();
+        tampered["recipe_version"] = serde_json::json!("memory-v9.9");
+        let err = verify_snapshot_against(&tampered, &local).unwrap_err();
+        assert!(err.contains("版本不一致"), "{err}");
+
+        // 内容篡改 → 红（opaque 值级比对失配）
+        let mut tampered = bundled.clone();
+        tampered["recipe"]["retrieval"]["w_relevance"] = serde_json::json!(0.99);
+        let err = verify_snapshot_against(&tampered, &local).unwrap_err();
+        assert!(err.contains("内容不一致"), "{err}");
+
+        // 缺字段 → 红（形状不完整显式拒绝，不静默）
+        let err = verify_snapshot_against(&serde_json::json!({}), &local).unwrap_err();
+        assert!(err.contains("recipe_version"), "{err}");
     }
 }

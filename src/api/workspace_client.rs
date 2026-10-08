@@ -753,7 +753,11 @@ impl WorkspaceApiClient {
     ///   违反 → 400 显式错误；
     /// - `verdict="fail"` 为显式"未验证"导出（无伪造风险，无 subset 要求）；
     /// - `trim` 为可选裁剪视图语法（`tag:core` / `domain:tax` / `ids:id1,id2`，
-    ///   多段以 `;` 分隔，交集）。
+    ///   多段以 `;` 分隔，交集）；
+    /// - `recipe_snapshot` 为可选策略快照（O-377① 批 1，RecipeSnapshot JSON 形态，
+    ///   由系统侧注入而非 LLM 传参——防伪造与「导出不伪造 verdict」同哲学；
+    ///   值形态以 evorule-bundle 契约为准，此处 Value 透传保持 api 层与契约
+    ///   类型解耦）。
     ///
     /// 走 check_response_full：证据形状校验失败的修复指引透出。
     pub async fn export_bundle(
@@ -763,6 +767,7 @@ impl WorkspaceApiClient {
         verdict: &str,
         subset: Vec<String>,
         trim: Option<&str>,
+        recipe_snapshot: Option<Value>,
     ) -> Result<Value, ApiError> {
         let url = self.core.url("/bundles/export");
         let body = serde_json::json!({
@@ -773,6 +778,7 @@ impl WorkspaceApiClient {
                 "subset": subset,
             },
             "subset": trim,
+            "recipe_snapshot": recipe_snapshot,
         });
         let resp = self
             .core

@@ -28,8 +28,8 @@ use serde_json::Value;
 
 use evorule_bundle::{
     BundleAudit, BundleDatasetMeta, BundleEntry, BundleError, BundleImporter, BundleTests,
-    DatasetBundle, DomainSchemaResolver, EntryKind, Provenance, TestVerdict, VersionSelection,
-    VersionSelectionMode, BUNDLE_SCHEMA_VERSION,
+    DatasetBundle, DomainSchemaResolver, EntryKind, Provenance, RecipeSnapshot, TestVerdict,
+    VersionSelection, VersionSelectionMode, BUNDLE_SCHEMA_VERSION,
 };
 
 use crate::api::evorule_client::EvoruleApiClient;
@@ -198,6 +198,32 @@ impl BundleExportTool {
     }
 }
 
+/// 系统侧策略快照构造（O-377① 批 1：bundle_export 注入通路）。
+///
+/// 快照来源 = 进程级策略槽（`agent::recipe::current_published_recipe`，由
+/// MemoryManager::set_recipe 单点发布）——**不开放 LLM 传参**，防伪造与
+/// 「导出不伪造 verdict」同哲学。返回序列化后的 RecipeSnapshot JSON
+/// （evorule-bundle 契约形态）；无策略在位 → None（导出不带快照，
+/// 字节兼容缺省语义）。序列化失败显式报错（fail-fast，不静默降级）。
+fn build_recipe_snapshot_value() -> Result<Option<Value>, String> {
+    match crate::agent::recipe::current_published_recipe() {
+        None => Ok(None),
+        Some(recipe) => Ok(Some(recipe_snapshot_value(&recipe)?)),
+    }
+}
+
+/// 快照序列化纯函数（给定策略 → RecipeSnapshot 契约 JSON；单测确定性入口）
+fn recipe_snapshot_value(recipe: &crate::agent::recipe::MemoryRecipe) -> Result<Value, String> {
+    let recipe_value =
+        serde_json::to_value(recipe).map_err(|e| format!("recipe serialize: {e}"))?;
+    let snapshot = RecipeSnapshot {
+        recipe_version: recipe.recipe_version.clone(),
+        recipe: recipe_value,
+        snapshot_at: rfc3339_utc_now(),
+    };
+    serde_json::to_value(&snapshot).map_err(|e| format!("snapshot serialize: {e}"))
+}
+
 #[async_trait::async_trait]
 impl ToolFunction for BundleExportTool {
     async fn call(&self, args: &Value) -> IoResult {
@@ -240,9 +266,11 @@ impl ToolFunction for BundleExportTool {
             );
         }
         let trim = args.get("trim").and_then(|v| v.as_str());
+        // 系统侧注入策略快照（非 LLM 传参——args 中同名字段一律忽略）
+        let recipe_snapshot = build_recipe_snapshot_value()?;
         let result = self
             .client
-            .export_bundle(dataset_id, version, verdict, subset, trim)
+            .export_bundle(dataset_id, version, verdict, subset, trim, recipe_snapshot)
             .await
             .map_err(|e| e.to_string())?;
         Ok(result.clone())
@@ -398,6 +426,11 @@ impl ToolFunction for SkillPackToBundleTool {
                 domain,
                 tags,
                 dependencies: Vec::new(),
+                // 知识资产化四字段（0.4.0 契约随行）：rule 壳条目均 None
+                knowledge_kind: None,
+                trust_level: None,
+                license_ref: None,
+                execution_contract: None,
             });
         }
 
@@ -421,6 +454,8 @@ impl ToolFunction for SkillPackToBundleTool {
             },
             entries,
             data_dependencies: None,
+            // skill 桥接无策略资产语境：不带快照（None 不序列化，字节兼容）
+            recipe_snapshot: None,
             tests: BundleTests {
                 subset: Vec::new(),
                 fixtures: Vec::new(),
@@ -876,6 +911,30 @@ mod tests {
 
     fn make_ev() -> EvoruleApiClient {
         EvoruleApiClient::new("http://localhost:0")
+    }
+
+    // =========================================================================
+    // 策略快照注入（O-377① 批 1）
+    // =========================================================================
+
+    #[test]
+    fn test_recipe_snapshot_value_shape() {
+        // 纯函数确定性测试：契约形态三字段齐备，recipe 为完整 opaque 载荷
+        let recipe = crate::agent::recipe::MemoryRecipe::default();
+        let snap = recipe_snapshot_value(&recipe).unwrap();
+        assert_eq!(snap["recipe_version"], "memory-v1.0");
+        assert!(snap["recipe"].is_object(), "recipe 应为完整策略 JSON 载荷");
+        assert_eq!(
+            snap["recipe"]["retrieval"]["w_relevance"],
+            serde_json::to_value(&recipe).unwrap()["retrieval"]["w_relevance"]
+        );
+        assert!(
+            !snap["snapshot_at"].as_str().unwrap().is_empty(),
+            "snapshot_at 应为导出时刻"
+        );
+        // 契约回读：序列化产物可反序列化为 evorule-bundle RecipeSnapshot（根路径导出）
+        let back: RecipeSnapshot = serde_json::from_value(snap).unwrap();
+        assert_eq!(back.recipe_version, "memory-v1.0");
     }
 
     // =========================================================================
