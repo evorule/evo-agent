@@ -36,6 +36,24 @@ pub fn evorule_digest(s: &str) -> String {
     format!("blake3:{}", blake3::hash(s.as_bytes()).to_hex())
 }
 
+/// 粒级检查点的结果内联阈值(字节):≤ 阈值直存检查点事件,超限全文走
+/// checkpoint_blob 专属事件——账本永久面不存大载荷(与 wire blob 同款
+/// 不膨胀口径)
+pub const CHECKPOINT_INLINE_LIMIT: usize = 4096;
+
+/// 粒级检查点的结果引用(≤ 阈值内联直存;超限 inline 缺省即 None,
+/// 全文在同账本 checkpoint_blob 事件,按 node_id+hash 配对检索)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointResultRef {
+    /// 全文 digest(evorule-hash 口径;"blake3:"+64hex)
+    pub hash: String,
+    /// 全文字节数
+    pub len: usize,
+    /// ≤ 阈值内联直存;超限 None(全文在同账本 checkpoint_blob 事件)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline: Option<String>,
+}
+
 /// token 计数三元组(provider 真值 `LlmResponse.token_usage` 映射;
 /// 估算 fallback 存总量,导出期按 7:3 拆分——ATIF 映射表 §四.3)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -110,6 +128,37 @@ pub enum JournalEvent {
         attempt: u64,
         /// 失败是否判定为瞬态(连接/超时类错误形态)
         transient: bool,
+    },
+    /// 粒级检查点(节点完成/跳过后、下一层规划前落账;账先于状态转移——
+    /// 账本状态 ≥ 内存状态)。恢复 = 回放本事件重建已完成/已跳过集合;
+    /// 计划锚不匹配 = 拒绝恢复(宁可重跑不可错续)。观测面,不参与步映射。
+    NodeCheckpointed {
+        /// 工作流 id(run 级账本会话以 planrun- 前缀按工作流 id+唯一指纹命名)
+        workflow_id: String,
+        /// 计划锚(物化 Workflow canonical JSON 的 64-hex hash,evorule-hash
+        /// 口径;防错版本续跑的关键闸)
+        plan_hash: String,
+        /// 节点 id
+        node_id: String,
+        /// completed|skipped
+        status: String,
+        /// 结果引用(completed 带产出引用;skipped 为零长引用)
+        result_ref: CheckpointResultRef,
+    },
+    /// 粒级检查点的大结果全文载体(结果超内联阈值时随行落账;与 wire blob
+    /// 同款机制:引用面只存 hash+len,全文在专属事件;全文级重建随保留策略
+    /// 降级时,hash+长度仍可校验完整性)。观测面,不参与步映射。
+    CheckpointBlob {
+        /// 配对检索键:与 NodeCheckpointed.plan_hash 同值
+        plan_hash: String,
+        /// 对应节点 id
+        node_id: String,
+        /// 全文 digest(evorule-hash 口径)
+        hash: String,
+        /// 全文字节数
+        len: usize,
+        /// 全文
+        full_text: String,
     },
     /// 审批请求开启(60s 窗口 / policy 判定前)
     ApprovalRequested {
@@ -637,6 +686,48 @@ impl JournalWriter {
             attempt,
             transient,
         })
+    }
+
+    /// 粒级检查点落账:NodeCheckpointed 事件 + 结果超内联阈值时自动追加
+    /// CheckpointBlob 全文载体事件。返回 (checkpoint_seq, blob_seq:Option)。
+    /// completed 传产出全文;skipped 传空串(引用=零长哈希,inline 直存)。
+    pub fn node_checkpointed(
+        &self,
+        workflow_id: &str,
+        plan_hash: &str,
+        node_id: &str,
+        status: &str,
+        result: &str,
+    ) -> Result<(u64, Option<u64>), JournalError> {
+        let rref = CheckpointResultRef {
+            hash: evorule_digest(result),
+            len: result.len(),
+            inline: if result.len() <= CHECKPOINT_INLINE_LIMIT {
+                Some(result.to_string())
+            } else {
+                None
+            },
+        };
+        let event = JournalEvent::NodeCheckpointed {
+            workflow_id: workflow_id.to_string(),
+            plan_hash: plan_hash.to_string(),
+            node_id: node_id.to_string(),
+            status: status.to_string(),
+            result_ref: rref,
+        };
+        let seq = self.push(event)?;
+        if result.len() > CHECKPOINT_INLINE_LIMIT {
+            let blob = JournalEvent::CheckpointBlob {
+                plan_hash: plan_hash.to_string(),
+                node_id: node_id.to_string(),
+                hash: evorule_digest(result),
+                len: result.len(),
+                full_text: result.to_string(),
+            };
+            let blob_seq = self.push(blob)?;
+            return Ok((seq, Some(blob_seq)));
+        }
+        Ok((seq, None))
     }
 
     /// llm_called(主循环 react 用途;provider token 真值优先,tokens_est 兜底)
@@ -1361,6 +1452,89 @@ mod tests {
         let after = read_all(&JournalWriter::path_for(&dir, "s-clean")).unwrap();
         assert_eq!(before.len(), after.len(), "干净尾部打开不得追加事件");
         assert_eq!(after.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_checkpoint_inline_and_blob_paths() {
+        // 粒级检查点:内联阈值分岔——小结果直存 inline,大结果 inline 缺省+
+        // checkpoint_blob 全文载体随行落账;读回 hash 一致
+        let dir = std::env::temp_dir().join(format!("jf-ckpt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = "x".repeat(CHECKPOINT_INLINE_LIMIT + 1);
+        {
+            let w = JournalWriter::open(&dir, "s-ckpt").unwrap();
+            let (seq1, blob1) = w
+                .node_checkpointed("wf", "planhash-small", "n1", "completed", "ok")
+                .unwrap();
+            assert!(blob1.is_none(), "小结果零 blob");
+            let (seq2, blob2) = w
+                .node_checkpointed("wf", "planhash-big", "n2", "completed", &big)
+                .unwrap();
+            assert!(blob2.is_some(), "大结果必带 blob 载体");
+            let (seq3, _) = w
+                .node_checkpointed("wf", "planhash-small", "n3", "skipped", "")
+                .unwrap();
+            assert!(seq3 > seq1 && seq2 > seq1);
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-ckpt")).unwrap();
+        assert_eq!(lines.len(), 4, "3 条检查点 + 1 条 blob 载体");
+        match &lines[0].event {
+            JournalEvent::NodeCheckpointed {
+                node_id,
+                status,
+                result_ref,
+                ..
+            } => {
+                assert_eq!(node_id, "n1");
+                assert_eq!(status, "completed");
+                assert_eq!(result_ref.inline.as_deref(), Some("ok"));
+                assert_eq!(result_ref.hash, evorule_digest("ok"));
+                assert_eq!(result_ref.len, 2);
+            }
+            other => panic!("expected node_checkpointed, got {other:?}"),
+        }
+        match &lines[1].event {
+            JournalEvent::NodeCheckpointed {
+                node_id,
+                result_ref,
+                ..
+            } => {
+                assert_eq!(node_id, "n2");
+                assert!(result_ref.inline.is_none(), "超限结果不内联");
+                assert_eq!(result_ref.len, big.len());
+            }
+            other => panic!("expected node_checkpointed, got {other:?}"),
+        }
+        match &lines[2].event {
+            JournalEvent::CheckpointBlob {
+                node_id,
+                hash,
+                len,
+                full_text,
+                ..
+            } => {
+                assert_eq!(node_id, "n2");
+                assert_eq!(full_text, &big);
+                assert_eq!(hash, &evorule_digest(&big));
+                assert_eq!(*len, big.len());
+            }
+            other => panic!("expected checkpoint_blob, got {other:?}"),
+        }
+        match &lines[3].event {
+            JournalEvent::NodeCheckpointed {
+                node_id,
+                status,
+                result_ref,
+                ..
+            } => {
+                assert_eq!(node_id, "n3");
+                assert_eq!(status, "skipped");
+                assert_eq!(result_ref.len, 0, "跳过节点=零长引用");
+            }
+            other => panic!("expected node_checkpointed, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

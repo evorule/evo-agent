@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use jsonschema::Validator;
 
 use crate::agent::delegate::DelegateContext;
+use crate::agent::journal::{evorule_digest, JournalEvent, JournalLine, JournalWriter};
 
 /// 条件谓词(workflow_dag v1.1 `run_when.op` 最小集,冻结于该版本)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -637,6 +638,28 @@ fn judge_verdict(judge: &JudgeSpec, output: &std::process::Output) -> (bool, Str
     (passed, detail)
 }
 
+/// run 级账本槽位(引擎自举语义:ctx.journal_dir 在场即按需建账,缺省开;
+/// 恢复面据此回放,`planrun-` 前缀会话与 delegate 子会话天然区分)
+#[derive(Clone)]
+enum RunLedgerSlot {
+    /// 未初始化:首个检查点写点按需自举(ctx.journal_dir 在场)或保持缺账
+    Uninitialized,
+    /// 显式关停(builder 注入;特殊场景不想落 run 账时用,自举不再发生)
+    Disabled,
+    /// 就绪句柄(自举产物或显式注入)
+    Ready(JournalWriter),
+}
+
+impl std::fmt::Debug for RunLedgerSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Uninitialized => f.write_str("Uninitialized"),
+            Self::Disabled => f.write_str("Disabled"),
+            Self::Ready(_) => f.write_str("Ready(<journal writer>)"),
+        }
+    }
+}
+
 /// 工作流引擎
 ///
 /// 持有 [`DelegateContext`],负责拓扑排序 + 并行执行 + 模板渲染。
@@ -656,6 +679,9 @@ pub struct WorkflowEngine {
     /// 判据执行容器（判据 v0 第二级；None = 宿主直执行）。serve 面经 run 请求
     /// container 字段传入（P1 执行桥同源），CLI 面恒 None（宿主语义）。
     judge_container: Option<String>,
+    /// run 级账本槽位(粒级检查点载体;Arc 共享保 Clone 同驱动循环语义,
+    /// Mutex 支撑 &self 执行路径上的按需自举)
+    run_ledger: std::sync::Arc<std::sync::Mutex<RunLedgerSlot>>,
 }
 
 impl WorkflowEngine {
@@ -667,7 +693,99 @@ impl WorkflowEngine {
             executed_node_ids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             phase_gate: None,
             judge_container: None,
+            run_ledger: std::sync::Arc::new(std::sync::Mutex::new(RunLedgerSlot::Uninitialized)),
         }
+    }
+
+    /// 显式注入 run 级账本句柄(外部装配/测试桩场景;注入后自举不再发生)
+    pub fn with_run_journal(mut self, writer: JournalWriter) -> Self {
+        *self.run_ledger.lock().unwrap_or_else(|p| p.into_inner()) = RunLedgerSlot::Ready(writer);
+        self
+    }
+
+    /// 显式关停 run 级账本(即使 ctx.journal_dir 在场也不自举;既有形态
+    /// 显式化——不想落 run 账的调用方用此关停)
+    pub fn without_run_journal(mut self) -> Self {
+        *self.run_ledger.lock().unwrap_or_else(|p| p.into_inner()) = RunLedgerSlot::Disabled;
+        self
+    }
+
+    /// run 级账本会话 id(自举后可得;恢复面据此回放。None=尚未建账/已关停)
+    pub fn run_ledger_session_id(&self) -> Option<String> {
+        let slot = self.run_ledger.lock().unwrap_or_else(|p| p.into_inner());
+        match &*slot {
+            RunLedgerSlot::Ready(w) => Some(w.session_id()),
+            _ => None,
+        }
+    }
+
+    /// run 级账本句柄按需就绪(自举:ctx.journal_dir 在场即建
+    /// `planrun-{workflow_id}-{指纹}` 会话;指纹=blake3(工作流 id+纳秒+
+    /// 进程内序号+pid) 截 16 hex——并行/同毫秒启动的多个 run 不串账,
+    /// 与计划锚正交成双闸:锚管版本错配,会话唯一性管跨 run 串账;
+    /// 本地派生会话名不耦合服务侧活性,恢复只读本地账本即可续)。
+    /// 开账失败=Err 显式上抛(账面硬义务,缺账降级只对无账域成立)。
+    fn run_ledger_for(&self, workflow_id: &str) -> Result<Option<JournalWriter>, String> {
+        let mut slot = self.run_ledger.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(*slot, RunLedgerSlot::Uninitialized) {
+            *slot = match self.ctx.journal_dir.clone() {
+                Some(dir) => {
+                    let sid = Self::bootstrap_session_id(workflow_id);
+                    let writer = JournalWriter::open(&dir, &sid)
+                        .map_err(|e| format!("run ledger open failed (session '{sid}'): {e}"))?;
+                    RunLedgerSlot::Ready(writer)
+                }
+                None => RunLedgerSlot::Disabled,
+            };
+        }
+        Ok(match &*slot {
+            RunLedgerSlot::Ready(w) => Some(w.clone()),
+            _ => None,
+        })
+    }
+
+    /// 自举会话名(planrun- 前缀 + 64bit 指纹;run 身份要求唯一性而非
+    /// 确定性——恢复路径按显式会话名回放)
+    fn bootstrap_session_id(workflow_id: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let digest = blake3::hash(format!("{workflow_id}:{nanos}:{seq}:{pid}").as_bytes());
+        format!("planrun-{}-{}", workflow_id, &digest.to_hex()[..16])
+    }
+
+    /// 计划锚:物化 Workflow canonical JSON 的 64-hex hash(与注入组锚同款
+    /// 口径,同源可复算;引擎级锚=执行工件本身,外层驱动级锚=注入后
+    /// PlanFact,两层各锚其所见)
+    pub fn workflow_plan_hash(wf: &Workflow) -> Result<String, String> {
+        let canonical = serde_json::to_string(wf).map_err(|e| e.to_string())?;
+        Ok(crate::agent::driver::plan_canonical_hash(&canonical))
+    }
+
+    /// 粒级检查点落账(账先于状态转移:调用方在本方法成功后才把结果置入
+    /// results/skipped——账写不掉=Err 上抛中止,节点保持未完成态=安全重跑
+    /// 方向,宁可重跑不可错续)。无账域(未注入且 ctx 无 journal_dir)=零
+    /// 账直通,既有形态零变更。
+    fn checkpoint_node(
+        &self,
+        wf: &Workflow,
+        node_id: &str,
+        status: &str,
+        result: &str,
+    ) -> Result<(), String> {
+        let Some(journal) = self.run_ledger_for(&wf.workflow_id)? else {
+            return Ok(());
+        };
+        let plan_hash = Self::workflow_plan_hash(wf)?;
+        journal
+            .node_checkpointed(&wf.workflow_id, &plan_hash, node_id, status, result)
+            .map_err(|e| format!("workflow checkpoint write failed (node '{node_id}'): {e}"))?;
+        Ok(())
     }
 
     /// M5-c:注入阶段前置裁决通道(驱动层按 marks_session 组装;未注入 =
@@ -764,6 +882,18 @@ impl WorkflowEngine {
     /// - 任一**执行中**节点失败(终止整个工作流;被跳过的节点不算失败)
     /// - `output_node` 被跳过(无静默空结果)
     pub async fn execute(&self, wf: &Workflow) -> Result<String, String> {
+        self.execute_with_resume(wf, NodeCheckpointReplay::default())
+            .await
+    }
+
+    /// 执行工作流(可恢复入口):`resumed` = run 级账本检查点的回放重建
+    /// (已完成粒零重执行、已跳过粒不再复判;空种子 = 全量跑,与 [`Self::execute`]
+    /// 等价)。检查点经 [`Self::checkpoint_node`] 账先于状态落账。
+    pub async fn execute_with_resume(
+        &self,
+        wf: &Workflow,
+        resumed: NodeCheckpointReplay,
+    ) -> Result<String, String> {
         // 1. 校验
         self.validate(wf)?;
 
@@ -778,11 +908,27 @@ impl WorkflowEngine {
         //     输入仅可引用更早拓扑层节点,自引用/同层/下游引用一律拒绝
         Self::check_compute_layers(wf, &layers)?;
 
-        // 3. 逐层规划 + 执行
-        let mut results: BTreeMap<String, String> = BTreeMap::new();
-        let mut skipped: HashSet<String> = HashSet::new();
+        // 3. 逐层规划 + 执行(种子态 = 恢复回放重建,空种子 = 全量跑)
+        let mut results: BTreeMap<String, String> = resumed.results;
+        let mut skipped: HashSet<String> = resumed.skipped;
         for (layer_idx, layer) in layers.iter().enumerate() {
-            let (to_run, newly_skipped) = plan_layer(layer, &results, &skipped);
+            let (mut to_run, newly_skipped) = plan_layer(layer, &results, &skipped);
+            // 恢复面:已完成粒零重执行——种子 results 已含的节点本层直接跳过
+            //(其结果原样供下游模板渲染;不重复计数不重复落账——崩溃前进程
+            // 已留账,恢复进程的计数器/注册表增量只含本进程新执行粒)
+            let restored: Vec<String> = to_run
+                .iter()
+                .filter(|n| results.contains_key(&n.id))
+                .map(|n| n.id.clone())
+                .collect();
+            to_run.retain(|n| !results.contains_key(&n.id));
+            for id in &restored {
+                tracing::info!(
+                    workflow_id = %wf.workflow_id,
+                    node_id = %id,
+                    "resume: node restored from checkpoint, skipping re-execution"
+                );
+            }
             for id in &newly_skipped {
                 tracing::info!(
                     workflow_id = %wf.workflow_id,
@@ -790,6 +936,12 @@ impl WorkflowEngine {
                     node_id = %id,
                     "workflow node skipped"
                 );
+            }
+            // 检查点(跳过):账先于状态;种子已含的跳过不重复落账
+            for id in &newly_skipped {
+                if !skipped.contains(id) {
+                    self.checkpoint_node(wf, id, "skipped", "")?;
+                }
             }
             skipped.extend(newly_skipped);
 
@@ -820,6 +972,8 @@ impl WorkflowEngine {
                             content_len = output.len(),
                             "workflow compute node evaluated"
                         );
+                        // 账先于状态:检查点落账成功后才置入 results
+                        self.checkpoint_node(wf, &node.id, "completed", &output)?;
                         results.insert(node.id.clone(), output);
                         self.executed_nodes
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -942,6 +1096,8 @@ impl WorkflowEngine {
                             content_len = content.len(),
                             "workflow node succeeded"
                         );
+                        // 账先于状态:检查点落账成功后才置入 results
+                        self.checkpoint_node(wf, &node.id, "completed", content)?;
                         results.insert(node.id.clone(), content.clone());
                         self.executed_nodes
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1795,6 +1951,93 @@ fn validate_compute_spec(
 /// `check_run_when_layers`),因此层内节点顺序不影响分划结果。
 ///
 /// 返回 (本层待执行节点[保持原序], 新增跳过节点 id 列表)
+/// 恢复种子:从 run 级账本回放重建的引擎入参状态(空值 = 全量跑)
+#[derive(Debug, Clone, Default)]
+pub struct NodeCheckpointReplay {
+    /// 已完成节点结果(键=节点 id;恢复后供下游模板渲染,不重复执行)
+    pub results: BTreeMap<String, String>,
+    /// 已判定跳过的节点 id(恢复后不再复判、不重复落账)
+    pub skipped: HashSet<String>,
+}
+
+/// 从 run 级账本回放粒级检查点,重建恢复种子(fail-closed:计划锚不匹配/
+/// blob 全文缺失/hash 校验不过,一律 Err 拒绝恢复——宁可重跑不可错续)。
+///
+/// 语义注记:计划锚按严格单值校验——账内出现任一其它计划锚的检查点即
+/// 拒绝(防错版本续跑的关键闸)。replan 多版本场景由外层驱动切片回放
+/// (最新计划检查点之后的检查点尾段属当前版本),本函数不做切片。
+pub fn replay_node_checkpoints(
+    lines: &[JournalLine],
+    plan_hash: &str,
+) -> Result<NodeCheckpointReplay, String> {
+    let mut out = NodeCheckpointReplay::default();
+    // blob 全文检索表先建满(blob 载体在检查点之后落账,单遍消费会扑空),
+    // 再逐检查点解析
+    let mut blobs: BTreeMap<(String, String), String> = BTreeMap::new();
+    for line in lines {
+        if let JournalEvent::CheckpointBlob {
+            node_id,
+            hash,
+            full_text,
+            ..
+        } = &line.event
+        {
+            blobs.insert((node_id.clone(), hash.clone()), full_text.clone());
+        }
+    }
+    for line in lines {
+        let JournalEvent::NodeCheckpointed {
+            plan_hash: found,
+            node_id,
+            status,
+            result_ref,
+            ..
+        } = &line.event
+        else {
+            continue;
+        };
+        if found != plan_hash {
+            return Err(format!(
+                "checkpoint plan hash mismatch (expected {plan_hash}, found {found}) \
+                 - refusing recovery (rerun is the safe direction)"
+            ));
+        }
+        let content = match &result_ref.inline {
+            Some(text) => text.clone(),
+            None => blobs
+                .get(&(node_id.clone(), result_ref.hash.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "checkpoint blob content unavailable for node '{node_id}' \
+                         - refusing recovery"
+                    )
+                })?,
+        };
+        if evorule_digest(&content) != result_ref.hash {
+            return Err(format!(
+                "checkpoint content hash mismatch for node '{node_id}' \
+                 - refusing recovery"
+            ));
+        }
+        match status.as_str() {
+            "completed" => {
+                out.results.insert(node_id.clone(), content);
+            }
+            "skipped" => {
+                out.skipped.insert(node_id.clone());
+            }
+            other => {
+                return Err(format!(
+                    "unknown checkpoint status '{other}' for node '{node_id}' \
+                     - refusing recovery"
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn plan_layer<'a>(
     layer: &[&'a WorkflowNode],
     results: &BTreeMap<String, String>,
@@ -1930,6 +2173,209 @@ mod tests {
             nodes,
             output_node: output.to_string(),
         }
+    }
+
+    // ===== 粒级检查点与恢复(run 级账本) =====
+
+    fn checkpoint_chain_wf() -> Workflow {
+        // 三粒全 compute 链:n1=""(空拼接) → n2=Length(n1)="0" →
+        // n3=Replace(n2,"0"→"zero")="zero"——终值非平凡,链路贯通可证
+        pure_compute_wf(
+            vec![
+                compute_node(
+                    "n1",
+                    &[],
+                    ComputeSpec::Concat {
+                        inputs: vec![ComputeInput::Empty, ComputeInput::Empty],
+                    },
+                ),
+                compute_node(
+                    "n2",
+                    &["n1"],
+                    ComputeSpec::Length {
+                        inputs: vec![ComputeInput::Node("n1".to_string())],
+                    },
+                ),
+                compute_node(
+                    "n3",
+                    &["n2"],
+                    ComputeSpec::Replace {
+                        inputs: vec![ComputeInput::Node("n2".to_string())],
+                        find: "0".to_string(),
+                        replacement: "zero".to_string(),
+                    },
+                ),
+            ],
+            "n3",
+        )
+    }
+
+    fn checkpoint_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wf-ckpt-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn find_planrun_sid(dir: &std::path::Path) -> Option<String> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .find_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with("planrun-")
+                    .then(|| name.trim_end_matches(".jsonl").to_string())
+            })
+    }
+
+    async fn run_chain_with_journal_dir(
+        dir: &std::path::Path,
+    ) -> (String, std::sync::Arc<WorkflowEngine>) {
+        let ctx = make_ctx().with_journal_dir(dir.to_path_buf());
+        let engine = std::sync::Arc::new(WorkflowEngine::new(ctx));
+        let wf = checkpoint_chain_wf();
+        let out = engine.execute(&wf).await.unwrap();
+        (out, engine)
+    }
+
+    #[tokio::test]
+    async fn checkpoint_resume_zero_reexecution_and_equivalent_result() {
+        // 三粒链:连续跑出基线;截断账本到「粒 2 检查点后」模拟崩溃;恢复跑
+        // 粒 1/2 零重执行(两代账本合并后每粒恰一条检查点)、粒 3 续跑、
+        // 终结果与连续执行等价
+        let dir = checkpoint_test_dir("resume");
+        let (baseline, _) = run_chain_with_journal_dir(&dir).await;
+        assert_eq!(baseline, "zero");
+        let wf = checkpoint_chain_wf();
+        let plan_hash = WorkflowEngine::workflow_plan_hash(&wf).unwrap();
+
+        // 崩溃模拟:取首代账本,截断到 n3 检查点之前(=粒 2 完成后进程死亡)
+        let sid = find_planrun_sid(&dir).expect("run ledger session must exist");
+        let path = JournalWriter::path_for(&dir, &sid);
+        let lines = crate::agent::journal::read_all(&path).unwrap();
+        assert_eq!(lines.len(), 3, "连续跑:三粒各一条检查点");
+        let cut = lines
+            .iter()
+            .position(
+                |l| matches!(&l.event, JournalEvent::NodeCheckpointed { node_id, .. } if node_id == "n3"),
+            )
+            .expect("n3 checkpoint must exist in baseline journal");
+        let truncated = &lines[..cut];
+
+        // 恢复跑:同 ctx 域新引擎,种子=截断账本回放
+        let replay = replay_node_checkpoints(truncated, &plan_hash).unwrap();
+        assert_eq!(replay.results.len(), 2, "粒 1/2 从检查点重建");
+        assert!(replay.skipped.is_empty());
+        let ctx2 = make_ctx().with_journal_dir(dir.clone());
+        let engine2 = std::sync::Arc::new(WorkflowEngine::new(ctx2));
+        let out2 = engine2.execute_with_resume(&wf, replay).await.unwrap();
+        assert_eq!(out2, baseline, "恢复跑终结果与连续执行等价");
+        assert_eq!(
+            engine2.executed_nodes(),
+            1,
+            "恢复进程计数器增量只含本进程新执行粒(粒 3)"
+        );
+
+        // 零重执行:恢复代账本只含粒 3 一条检查点(粒 1/2 未再执行)
+        let sid2 = engine2.run_ledger_session_id().unwrap();
+        let lines2 =
+            crate::agent::journal::read_all(&JournalWriter::path_for(&dir, &sid2)).unwrap();
+        assert_eq!(lines2.len(), 1, "恢复代只落粒 3 检查点=零重执行");
+        match &lines2[0].event {
+            JournalEvent::NodeCheckpointed { node_id, .. } => assert_eq!(node_id, "n3"),
+            other => panic!("expected node_checkpointed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_plan_hash_mismatch_refuses_recovery() {
+        // 计划锚不匹配 = 拒绝恢复(负例;宁可重跑不可错续)
+        let dir = checkpoint_test_dir("mismatch");
+        let _ = run_chain_with_journal_dir(&dir).await;
+        let sid = find_planrun_sid(&dir).unwrap();
+        let lines = crate::agent::journal::read_all(&JournalWriter::path_for(&dir, &sid)).unwrap();
+        let err = replay_node_checkpoints(&lines, "deadbeef-wrong-plan-hash").unwrap_err();
+        assert!(err.contains("plan hash mismatch"), "拒绝恢复: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_blob_rebuild_and_missing_refusal() {
+        // 大结果走 blob 引用且可重建(hash 校验);blob 缺失/被改 = 拒绝恢复
+        let dir = checkpoint_test_dir("blob");
+        let big = "y".repeat(crate::agent::journal::CHECKPOINT_INLINE_LIMIT + 16);
+        let writer = JournalWriter::open(&dir, "blob-sess").unwrap();
+        let plan_hash = WorkflowEngine::workflow_plan_hash(&checkpoint_chain_wf()).unwrap();
+        writer
+            .node_checkpointed("wf", &plan_hash, "n_big", "completed", &big)
+            .unwrap();
+        drop(writer);
+        let lines =
+            crate::agent::journal::read_all(&JournalWriter::path_for(&dir, "blob-sess")).unwrap();
+        let replay = replay_node_checkpoints(&lines, &plan_hash).unwrap();
+        assert_eq!(
+            replay.results.get("n_big").map(String::as_str),
+            Some(big.as_str())
+        );
+
+        // blob 缺失:仅保留检查点行(全文载体被裁)→ 拒绝
+        let without_blob: Vec<JournalLine> = lines
+            .iter()
+            .filter(|l| !matches!(l.event, JournalEvent::CheckpointBlob { .. }))
+            .cloned()
+            .collect();
+        let err = replay_node_checkpoints(&without_blob, &plan_hash).unwrap_err();
+        assert!(err.contains("blob content unavailable"), "拒绝恢复: {err}");
+
+        // blob 被改:全文与引用 hash 不一致 → 拒绝
+        let mut tampered = lines.clone();
+        if let Some(line) = tampered
+            .iter_mut()
+            .find(|l| matches!(l.event, JournalEvent::CheckpointBlob { .. }))
+        {
+            if let JournalEvent::CheckpointBlob { full_text, .. } = &mut line.event {
+                full_text.push('!');
+            }
+        }
+        let err = replay_node_checkpoints(&tampered, &plan_hash).unwrap_err();
+        assert!(err.contains("hash mismatch"), "拒绝恢复: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_disabled_and_journalless_paths_stay_ledger_free() {
+        // 无账域(ctx 无 journal_dir)与显式关停:行为不变且零 run 账落盘
+        let dir = checkpoint_test_dir("disabled");
+        let ctx = make_ctx(); // 无 journal_dir
+        let engine = WorkflowEngine::new(ctx);
+        let out = engine.execute(&checkpoint_chain_wf()).await.unwrap();
+        assert_eq!(out, "zero");
+        assert!(engine.run_ledger_session_id().is_none(), "无账域零建账");
+
+        let ctx2 = make_ctx().with_journal_dir(dir.clone());
+        let engine2 = WorkflowEngine::new(ctx2).without_run_journal();
+        let out2 = engine2.execute(&checkpoint_chain_wf()).await.unwrap();
+        assert_eq!(out2, "zero");
+        assert!(engine2.run_ledger_session_id().is_none(), "显式关停零建账");
+        let stray: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("planrun-"))
+            .collect();
+        assert!(stray.is_empty(), "关停后不得出现 planrun 账本: {stray:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_injected_session_id_readable() {
+        // 显式注入句柄的会话 id 直读(恢复面回放入口)
+        let dir = checkpoint_test_dir("bootstrap");
+        let ctx = make_ctx().with_journal_dir(dir.clone());
+        let writer = JournalWriter::open(&dir, "probe").unwrap();
+        let engine = WorkflowEngine::new(ctx).with_run_journal(writer);
+        assert_eq!(engine.run_ledger_session_id().as_deref(), Some("probe"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

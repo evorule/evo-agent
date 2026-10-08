@@ -88,4 +88,7 @@ pub use tool_manifest::{
     CapDomain, SandboxScope, SpecSource, SwitchBinding, TimeoutClass, ToolManifest, ToolSource,
 };
 pub use translator::{LlmResponse, Message, ToolCall};
-pub use workflow::{ComputeInput, ComputeSpec, Workflow, WorkflowEngine, WorkflowNode};
+pub use workflow::{
+    replay_node_checkpoints, ComputeInput, ComputeSpec, NodeCheckpointReplay, Workflow,
+    WorkflowEngine, WorkflowNode,
+};
