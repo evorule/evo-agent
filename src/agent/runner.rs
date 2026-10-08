@@ -144,7 +144,8 @@ pub struct AgentConfig {
     /// 治理门禁段(S2 槽位内容物;serve 三路径构造期算好传入,CLI=None;
     /// L2 约束前馈/进化信号感知/规范入口索引 合并段,v2 序=权威紧跟 S1)
     pub governance_segment: Option<String>,
-}
+    /// I2 词表声明(数据化;None=机制内建 v2 双语表——context_inspector)
+    pub i2_lexicon: Option<crate::agent::context_inspector::I2Lexicon>,}
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -166,6 +167,7 @@ impl Default for AgentConfig {
             north_star: None,
             handoff: None,
             governance_segment: None,
+            i2_lexicon: None,
         }
     }
 }
@@ -4604,9 +4606,16 @@ impl AgentRunner {
                 if let Some(skills) = &runner.config.skills {
                     tokens.extend(skills.iter().map(|s| s.name.clone()));
                 }
-                let mut conflicts = crate::agent::context_inspector::inspect_system_sections(
+                // I2 词表数据化:definition.i2_lexicon 声明覆盖,缺省内建 v2 双语表
+                let lexicon = runner
+                    .config
+                    .i2_lexicon
+                    .clone()
+                    .unwrap_or_default();
+                let mut conflicts = crate::agent::context_inspector::inspect_system_sections_with(
                     &system_prompt,
                     &tokens,
+                    &lexicon,
                 );
                 if !conflicts.is_empty() && runner.semantic_i2_enabled {
                     // 第二级:sidecar 审计链内裁决(purpose=i2_semantic;每候选
