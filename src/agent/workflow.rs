@@ -42,6 +42,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use jsonschema::Validator;
+
 use crate::agent::delegate::DelegateContext;
 
 /// 条件谓词(workflow_dag v1.1 `run_when.op` 最小集,冻结于该版本)
@@ -351,6 +353,14 @@ pub struct WorkflowNode {
     /// 禁止 agent_type/task/task_template(execute 层循环内同步内联求值,不走 delegate)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compute: Option<ComputeSpec>,
+    /// 粒间契约 JSON Schema(可选,契约 v0):本节点产出(LLM 与 compute 节点均适用)
+    /// 须为 JSON 文本且通过本 schema 校验,失败即接口失败(区别于粒失败,分类见
+    /// `replan::classify_node_failure`)。与 `AgentDefinition.output_format` 分层共存:
+    /// 本字段管**粒间契约**(占位符渲染输入与产出校验),output_format 管 LLM 输出
+    /// 格式重试。装载期门卫见 [`validate_granule_contracts`],运行期校验钩子在
+    /// [`WorkflowEngine::execute`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 /// 工作流定义
@@ -365,6 +375,119 @@ pub struct Workflow {
     pub nodes: Vec<WorkflowNode>,
     /// 输出节点 id(其结果作为整个工作流的返回值)
     pub output_node: String,
+}
+
+// ============================================================================
+// 粒间契约(契约 v0)——节点产出的 JSON Schema 校验与装载期门卫
+// ============================================================================
+
+/// 接口失败文本标记(契约 v0):节点产出违反粒间契约时,引擎上抛的工作流失败
+/// 文本携带此标记段;外层按 `replan::classify_node_failure` 将其区别于粒失败
+/// (分类随 WorkflowFailureRecord.failure_class 入摘要,路由消费面在后续批次)。
+pub const INTERFACE_CONTRACT_MARKER: &str = "interface contract violation";
+
+/// 构造接口失败文本(保持 `workflow node '<id>' failed: <error>` 包裹形态,
+/// 失败节点 id 可被外层 `parse_failed_node_id` 解析)
+pub fn interface_contract_error(node_id: &str, detail: &str) -> String {
+    format!("workflow node '{node_id}' failed: {INTERFACE_CONTRACT_MARKER}: {detail}")
+}
+
+/// 校验节点产出是否满足粒间契约 schema(契约 v0)
+///
+/// 产出必须为合法 JSON 文本且通过 schema 校验;`Err` 即接口失败。schema 编译
+/// 失败在此按防御性错误处理(装载期门卫 [`validate_granule_contracts`] 应已拦截)。
+pub fn validate_node_output_against_schema(
+    schema: &serde_json::Value,
+    content: &str,
+) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| format!("output is not valid JSON: {e}"))?;
+    let validator = Validator::new(schema).map_err(|e| format!("schema compile failed: {e}"))?;
+    if let Err(errors) = validator.validate(&value) {
+        let msgs: Vec<String> = errors
+            .map(|e| format!("{}: {:?}", e.instance_path, e.kind))
+            .collect();
+        return Err(msgs.join("; "));
+    }
+    Ok(())
+}
+
+/// 扫描模板中的 `{node_id}` 占位符引用(契约 v0 装载期门卫用,纯函数)
+///
+/// 仅内容全部为 `[A-Za-z0-9_-]` 且非空的花括号段计为引用(保序去重);
+/// JSON 字面量(`{"k":1}`)、路径式访问(`{prev.X}`)、含空格段不算引用,
+/// 未闭合花括号段忽略。
+fn extract_template_refs(tmpl: &str) -> Vec<String> {
+    let mut refs: Vec<String> = Vec::new();
+    let mut rest = tmpl;
+    while let Some(start) = rest.find('{') {
+        let after = &rest[start + 1..];
+        match after.find('}') {
+            Some(end) => {
+                let inner = &after[..end];
+                if !inner.is_empty()
+                    && inner
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    && !refs.iter().any(|r| r == inner)
+                {
+                    refs.push(inner.to_string());
+                }
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
+    refs
+}
+
+/// 粒间契约装载期门卫(契约 v0;fail-closed)
+///
+/// **契约态**才强制:工作流内任一节点声明了 `output_schema` 即进入契约态——
+/// - 铁律一:每个 `output_schema` 必须可编译为合法 JSON Schema(非法拒载)
+/// - 铁律二:契约态下,`task_template` 占位符引用的上游节点必须声明
+///   `output_schema`(缺契约不上阵——下游渲染输入无契约保证即拒载)
+///
+/// 未声明任何 `output_schema` 的工作流零影响(存量资产不受此门卫约束)。
+pub fn validate_granule_contracts(wf: &Workflow) -> Result<(), Vec<String>> {
+    if !wf.nodes.iter().any(|n| n.output_schema.is_some()) {
+        return Ok(());
+    }
+    let mut errors: Vec<String> = Vec::new();
+    for node in &wf.nodes {
+        if let Some(schema) = &node.output_schema {
+            if let Err(e) = Validator::new(schema) {
+                errors.push(format!(
+                    "节点 '{}' output_schema 编译失败(契约态拒载): {e}",
+                    node.id
+                ));
+            }
+        }
+    }
+    let ids: HashSet<&str> = wf.nodes.iter().map(|n| n.id.as_str()).collect();
+    for node in &wf.nodes {
+        if let Some(tmpl) = &node.task_template {
+            for r in extract_template_refs(tmpl) {
+                if ids.contains(r.as_str())
+                    && wf
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == r)
+                        .is_some_and(|upstream| upstream.output_schema.is_none())
+                {
+                    errors.push(format!(
+                        "契约态拒载:缺契约不上阵 —— 节点 '{}' 的模板引用 '{}',但后者未声明 output_schema",
+                        node.id, r
+                    ));
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// M5-c:阶段前置裁决通道(②③ 载体)——标记会话 + 客户端
@@ -562,6 +685,13 @@ impl WorkflowEngine {
                     Some(spec) => {
                         let output = eval_compute(spec, &results)
                             .map_err(|e| format!("workflow node '{}' failed: {}", node.id, e))?;
+                        // 粒间契约(契约 v0):产出须过 schema,失败=接口失败(fail-fast,
+                        // 不计 executed_nodes、不进 results)
+                        if let Some(schema) = &node.output_schema {
+                            if let Err(d) = validate_node_output_against_schema(schema, &output) {
+                                return Err(interface_contract_error(&node.id, &d));
+                            }
+                        }
                         tracing::info!(
                             workflow_id = %wf.workflow_id,
                             layer = layer_idx,
@@ -632,6 +762,13 @@ impl WorkflowEngine {
             for (node, result) in llm_nodes.iter().zip(layer_results.iter()) {
                 match result {
                     Ok(content) => {
+                        // 粒间契约(契约 v0):产出须过 schema,失败=接口失败(fail-fast,
+                        // 不计 executed_nodes、不进 results、不打成功标)
+                        if let Some(schema) = &node.output_schema {
+                            if let Err(d) = validate_node_output_against_schema(schema, content) {
+                                return Err(interface_contract_error(&node.id, &d));
+                            }
+                        }
                         tracing::info!(
                             workflow_id = %wf.workflow_id,
                             node_id = %node.id,
@@ -1529,6 +1666,7 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             run_when: None,
             compute: None,
+            output_schema: None,
         }
     }
 
@@ -1592,6 +1730,7 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             run_when: None,
             compute: Some(spec),
+            output_schema: None,
         }
     }
 
@@ -2673,6 +2812,7 @@ mod tests {
                 depends_on: deps,
                 run_when: None,
                 compute: Some(compute),
+                output_schema: None,
             });
         }
         let wf = Workflow {
@@ -2876,6 +3016,7 @@ mod tests {
             depends_on: vec!["a".to_string(), "b".to_string()],
             run_when: None,
             compute: None,
+            output_schema: None,
         };
         let mut results = BTreeMap::new();
         results.insert("a".to_string(), "rust-result".to_string());
@@ -2896,6 +3037,7 @@ mod tests {
             depends_on: vec![],
             run_when: None,
             compute: None,
+            output_schema: None,
         };
         let results = BTreeMap::new();
         let rendered = engine.render_task(&n, &results, &HashSet::new());
@@ -2915,6 +3057,7 @@ mod tests {
             depends_on: vec![],
             run_when: None,
             compute: None,
+            output_schema: None,
         };
         let mut results = BTreeMap::new();
         results.insert("x".to_string(), "VAL".to_string());
@@ -2935,6 +3078,7 @@ mod tests {
             depends_on: vec!["a".to_string()],
             run_when: None,
             compute: None,
+            output_schema: None,
         };
         let mut results = BTreeMap::new();
         results.insert("a".to_string(), "A".to_string());
@@ -2956,6 +3100,7 @@ mod tests {
             depends_on: vec!["b".to_string()],
             run_when: None,
             compute: None,
+            output_schema: None,
         };
         let mut results = BTreeMap::new();
         results.insert("a".to_string(), "A".to_string());
@@ -3317,5 +3462,111 @@ mod tests {
             assert_eq!(first.0[0].id, again.0[0].id);
             assert_eq!(first.1, again.1);
         }
+    }
+
+    // ===== 粒间契约（契约 v0）=====
+
+    #[test]
+    fn test_extract_template_refs_edges() {
+        assert!(extract_template_refs("no placeholders").is_empty());
+        assert_eq!(extract_template_refs("a {x} b {y} {x}"), vec!["x", "y"]);
+        // JSON 字面量 / 路径式 / 含空格 / 空 / 未闭合：均不算引用
+        assert!(extract_template_refs(r#"{"k": 1}"#).is_empty());
+        assert!(extract_template_refs("{prev.X} {a b} {} {unclosed").is_empty());
+        assert_eq!(extract_template_refs("{a_1}-{B-2}"), vec!["a_1", "B-2"]);
+    }
+
+    #[test]
+    fn test_validate_granule_contracts_non_contracted_ok() {
+        // 存量形态：无任何 output_schema → 零影响放行
+        let wf = Workflow {
+            workflow_id: "w".to_string(),
+            description: String::new(),
+            nodes: vec![node("a", "w", &[]), node("b", "w", &["a"])],
+            output_node: "b".to_string(),
+        };
+        assert!(validate_granule_contracts(&wf).is_ok());
+    }
+
+    #[test]
+    fn test_validate_granule_contracts_accepts_complete() {
+        let schema = serde_json::json!({"type": "object"});
+        let mut a = node("a", "w", &[]);
+        a.output_schema = Some(schema.clone());
+        let mut b = node("b", "w", &["a"]);
+        b.task_template = Some("based on: {a}".to_string());
+        b.output_schema = Some(schema);
+        let wf = Workflow {
+            workflow_id: "w".to_string(),
+            description: String::new(),
+            nodes: vec![a, b],
+            output_node: "b".to_string(),
+        };
+        assert!(validate_granule_contracts(&wf).is_ok());
+    }
+
+    #[test]
+    fn test_validate_granule_contracts_rejects_missing_upstream_schema() {
+        let mut b = node("b", "w", &["a"]);
+        b.task_template = Some("based on: {a}".to_string());
+        b.output_schema = Some(serde_json::json!({"type": "object"}));
+        let wf = Workflow {
+            workflow_id: "w".to_string(),
+            description: String::new(),
+            nodes: vec![node("a", "w", &[]), b],
+            output_node: "b".to_string(),
+        };
+        let errs = validate_granule_contracts(&wf).expect_err("缺契约不上阵须拒载");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("契约态拒载") && e.contains("'a'")),
+            "错误须指明缺口与被引用节点: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_granule_contracts_rejects_invalid_schema() {
+        let mut a = node("a", "w", &[]);
+        // jsonschema 应拒绝的非法 schema（type 值非法）
+        a.output_schema = Some(serde_json::json!({"type": 42}));
+        let wf = Workflow {
+            workflow_id: "w".to_string(),
+            description: String::new(),
+            nodes: vec![a],
+            output_node: "a".to_string(),
+        };
+        let errs = validate_granule_contracts(&wf).expect_err("非法 schema 须拒载");
+        assert!(errs[0].contains("output_schema 编译失败"), "{errs:?}");
+    }
+
+    #[test]
+    fn test_validate_node_output_against_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["verdict"],
+            "properties": {"verdict": {"type": "string"}}
+        });
+        // 合法 JSON 且过校验
+        assert!(validate_node_output_against_schema(&schema, r#"{"verdict": "ok"}"#).is_ok());
+        // 非 JSON
+        let err = validate_node_output_against_schema(&schema, "not json").unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
+        // JSON 但类型违规：消息含实例路径
+        let err = validate_node_output_against_schema(&schema, r#"{"verdict": 1}"#).unwrap_err();
+        assert!(err.contains("verdict"), "{err}");
+        // 缺必填字段
+        let err = validate_node_output_against_schema(&schema, r#"{}"#).unwrap_err();
+        assert!(err.contains("verdict"), "{err}");
+    }
+
+    #[test]
+    fn test_interface_contract_error_wraps_parseable_prefix() {
+        let text = interface_contract_error("s", "boom");
+        assert!(text.contains(INTERFACE_CONTRACT_MARKER), "{text}");
+        assert_eq!(
+            crate::agent::replan::parse_failed_node_id(&text).as_deref(),
+            Some("s"),
+            "包裹形态须可被外层失败解析"
+        );
     }
 }

@@ -141,15 +141,21 @@ pub fn validate_workflow_dag(body: &serde_json::Value) -> Result<(), Vec<String>
 ///
 /// 统一入口（v1.0/v1.1/v1.2/v1.3 四版本并存）：
 /// - schema 校验（宪法内嵌 Strict）→ 失败即 Err
-/// - v1.2/v1.3 → 物化器静态展开（loop 展开为线性副本链 + compute 节点就位）
-/// - v1.0/v1.1 → 直接反序列化
+/// - v1.2/v1.3 → 物化器静态展开（loop 展开为线性副本链 + compute 节点就位；
+///   展开尾部自带粒间契约门卫，契约 v0）
+/// - v1.0/v1.1 → 直接反序列化 + 粒间契约门卫（schema 容忍 `output_schema`
+///   直通，契约态强制由本仓门卫执法）
 pub fn load_workflow(body: &serde_json::Value) -> Result<Workflow, Vec<String>> {
     let version = detect_workflow_dag_version(body);
     validate_kind_version("workflow_dag", version, body)?;
     match version {
         "v1.2" | "v1.3" => materializer::materialize_workflow_dag(body),
         _ => serde_json::from_value(body.clone())
-            .map_err(|e| vec![format!("workflow_dag {version} 文档反序列化失败: {e}")]),
+            .map_err(|e| vec![format!("workflow_dag {version} 文档反序列化失败: {e}")])
+            .and_then(|wf| {
+                crate::agent::workflow::validate_granule_contracts(&wf)?;
+                Ok(wf)
+            }),
     }
 }
 
@@ -536,5 +542,43 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 2, "至少应加载 2 个工作流资产,实得 {checked}");
+    }
+
+    // ----- 粒间契约门卫（契约 v0：v1.0/v1.1 臂接入）-----
+
+    #[test]
+    fn test_v10_bare_doc_accepts_output_schema_passthrough() {
+        // v1.0 schema 容忍未知字段（直通）；装载后节点字段随行，契约态由本仓门卫执法
+        let doc = serde_json::json!({
+            "workflow_id": "w", "description": "",
+            "nodes": [
+                {"id": "a", "agent_type": "researcher", "task": "t",
+                 "output_schema": {"type": "object"}},
+                {"id": "b", "agent_type": "writer", "task_template": "v: {a}",
+                 "depends_on": ["a"], "output_schema": {"type": "object"}}
+            ],
+            "output_node": "b"
+        });
+        let wf = load_workflow(&doc).expect("v1.0 裸文档 output_schema 直通装载");
+        assert!(
+            wf.nodes[0].output_schema.is_some(),
+            "output_schema 须随行到节点"
+        );
+    }
+
+    #[test]
+    fn test_v10_contract_mode_rejects_missing_upstream_schema() {
+        // 负例：契约态缺契约 → 真实 loader 装载期拒（fail-closed）
+        let doc = serde_json::json!({
+            "workflow_id": "w", "description": "",
+            "nodes": [
+                {"id": "a", "agent_type": "researcher", "task": "t"},
+                {"id": "b", "agent_type": "writer", "task_template": "v: {a}",
+                 "depends_on": ["a"], "output_schema": {"type": "object"}}
+            ],
+            "output_node": "b"
+        });
+        let errs = load_workflow(&doc).expect_err("契约态缺上游契约须装载期拒");
+        assert!(errs.iter().any(|e| e.contains("契约态拒载")), "{errs:?}");
     }
 }
