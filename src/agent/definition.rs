@@ -1166,7 +1166,7 @@ mod tests {
     /// 元层先行批:assembly 内嵌段加载(字段正确透传)
     #[test]
     fn test_wall_clock_budget_passthrough() {
-        // H3 看门狗(16 号 §2.1):definition 声明 → AgentConfig 直拷;缺省 None=不启用
+        // H3 预算看门狗:definition 声明 → AgentConfig 直拷;缺省 None=不启用
         let dir = make_tmp_dir();
         let json = r#"{
             "agent_type": "longhorizon",

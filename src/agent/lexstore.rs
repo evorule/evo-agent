@@ -257,12 +257,17 @@ impl ColdStore {
             )
             .map_err(|e| LexError(format!("cold insert: {e}")))?;
         }
-        tx.commit().map_err(|e| LexError(format!("cold insert commit: {e}")))?;
+        tx.commit()
+            .map_err(|e| LexError(format!("cold insert commit: {e}")))?;
         Ok(rows.len())
     }
 
     /// 冷面显式查询(简化 contains 扫描;全 token AND,小写)
-    pub fn query_contains(&self, tokens: &[String], limit: usize) -> Result<Vec<ColdRow>, LexError> {
+    pub fn query_contains(
+        &self,
+        tokens: &[String],
+        limit: usize,
+    ) -> Result<Vec<ColdRow>, LexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = conn
             .prepare("SELECT path, value_json, mem_type, lifecycle_state FROM cold_entries")
@@ -457,13 +462,10 @@ impl LexStore {
         Ok(rows)
     }
 
-    /// 程序型记忆快照（17 号 T5/S3 第四分区注入面）：mem_type=procedural
+    /// 程序型记忆快照（程序型记忆分区注入面）：mem_type=procedural
     /// （前缀直证+行级覆盖）的非墓碑条目,近者先（rowid 倒序=入账序倒序,
     /// 确定性）。技能正文不入（read_skill 按需装载,分区只注入元数据/知识）。
-    pub fn procedural_snapshot(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<(String, String)>, LexError> {
+    pub fn procedural_snapshot(&self, limit: usize) -> Result<Vec<(String, String)>, LexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = conn
             .prepare(
@@ -488,11 +490,7 @@ impl LexStore {
     }
 
     /// 设定 timeline 生命周期标记（F-617 冷迁测试/运维面;确定性直写）
-    pub fn set_timeline_lifecycle(
-        &self,
-        fact_id: i64,
-        state: &str,
-    ) -> Result<(), LexError> {
+    pub fn set_timeline_lifecycle(&self, fact_id: i64, state: &str) -> Result<(), LexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
             "UPDATE timeline SET lifecycle_state=?1 WHERE fact_id=?2",
@@ -503,7 +501,10 @@ impl LexStore {
     }
 
     /// 冷迁落定(事务):删除热库 facts/postings/timeline 对应行
-    pub fn delete_cold_moved(&self, cands: &[crate::agent::lexstore::ColdCandidate]) -> Result<usize, LexError> {
+    pub fn delete_cold_moved(
+        &self,
+        cands: &[crate::agent::lexstore::ColdCandidate],
+    ) -> Result<usize, LexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let tx = conn
             .unchecked_transaction()
@@ -529,7 +530,8 @@ impl LexStore {
                 )
                 .map_err(|e| LexError(format!("cold del facts: {e}")))?;
         }
-        tx.commit().map_err(|e| LexError(format!("cold tx commit: {e}")))?;
+        tx.commit()
+            .map_err(|e| LexError(format!("cold tx commit: {e}")))?;
         Ok(n)
     }
 
@@ -955,8 +957,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hot = LexStore::open(&dir.join("hot.db")).unwrap();
         let facts: Vec<(u64, String, serde_json::Value)> = vec![
-            (1, "shared.ns.stable.a".into(), serde_json::json!("旧事实内容一")),
-            (2, "shared.ns.stable.b".into(), serde_json::json!("活跃事实二")),
+            (
+                1,
+                "shared.ns.stable.a".into(),
+                serde_json::json!("旧事实内容一"),
+            ),
+            (
+                2,
+                "shared.ns.stable.b".into(),
+                serde_json::json!("活跃事实二"),
+            ),
         ];
         hot.replace_partition("shared.ns.stable.", &facts).unwrap();
         // 标记 lifecycle:1=Archived(冷候选) 2=Settled(热)
@@ -970,7 +980,8 @@ mod tests {
             conn.execute(
                 "UPDATE timeline SET lifecycle_state='Settled' WHERE fact_id=2",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         // 冷候选扫描:仅 Archived
         let cands = hot.cold_candidates(&["Archived", "Decayed"]).unwrap();
@@ -988,7 +999,10 @@ mod tests {
         // 回源:冷删+热回插
         cold.delete_by_paths(&[cands[0].path.clone()]).unwrap();
         hot.replace_partition("shared.ns.stable.", &facts).unwrap();
-        assert!(cold.query_contains(&["旧事实".to_string()], 10).unwrap().is_empty());
+        assert!(cold
+            .query_contains(&["旧事实".to_string()], 10)
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -999,13 +1013,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let hot = LexStore::open(&dir.join("hot.db")).unwrap();
-        let facts: Vec<(u64, String, serde_json::Value)> = vec![
-            (1, "shared.ns.stable.a".into(), serde_json::json!("待归档内容")),
-        ];
+        let facts: Vec<(u64, String, serde_json::Value)> = vec![(
+            1,
+            "shared.ns.stable.a".into(),
+            serde_json::json!("待归档内容"),
+        )];
         hot.replace_partition("shared.ns.stable.", &facts).unwrap();
         {
             let conn = hot.conn.lock().unwrap_or_else(|p| p.into_inner());
-            conn.execute("UPDATE timeline SET lifecycle_state='Archived' WHERE fact_id=1", []).unwrap();
+            conn.execute(
+                "UPDATE timeline SET lifecycle_state='Archived' WHERE fact_id=1",
+                [],
+            )
+            .unwrap();
         }
         let cold_path = hot.cold_path();
         let cold = ColdStore::open(&cold_path).unwrap();
@@ -1020,7 +1040,11 @@ mod tests {
         hot.replace_partition("shared.ns.stable.", &facts).unwrap();
         {
             let conn = hot.conn.lock().unwrap_or_else(|p| p.into_inner());
-            conn.execute("UPDATE timeline SET lifecycle_state='Archived' WHERE fact_id=1", []).unwrap();
+            conn.execute(
+                "UPDATE timeline SET lifecycle_state='Archived' WHERE fact_id=1",
+                [],
+            )
+            .unwrap();
         }
         let cold2 = ColdStore::open(&cold_path).unwrap();
         let cands2 = hot.cold_candidates(&["Archived"]).unwrap();
