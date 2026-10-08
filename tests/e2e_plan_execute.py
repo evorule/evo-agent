@@ -61,6 +61,15 @@
     nodes_executed>=2、stdout 含修复产物（output_node 产出）；链上断言：
     report 分支零会话（条件跳过=零 LLM 成本）、repair 分支产物入链。
 
+  场景 H（节点判据演练，judge v0）：judge_drill 工作流（手写 DSL）——
+    writer 节点经 file_create 落判据锚文件 → 引擎执行 judge 命令
+    （findstr 锚串，退出码 0=过；判据不过=节点失败 fail-closed）→ 过 =
+    confirm 节点执行并作为产出。
+    断言：EXIT=0、plan_versions=1 replans=0、nodes_executed>=2、stdout 含
+    confirm 产出（judge passed）、锚文件真实落盘且含锚串（环境态验收非
+    LLM 自报）；链上断言：meta_signal.judge 中性信号落标记会话链且
+    acceptance_passed=true（判据结果可查账，处置知识在规则层）。
+
 # 前置（本脚本不进 CI——依赖真实 LLM key/运行中 server/已编译产物）
   1. .env 含 MINIMAX_API_KEY（evo-agent 只认进程环境变量，脚本负责注入）
   2. evorule-server 运行于 evo-agent.toml base_url（默认 http://127.0.0.1:18080），
@@ -235,6 +244,16 @@ RETRY_FEEDBACK_MARKER = "IMPORTANT: your previous response was not a valid PlanF
 REFEREE_REPORT_SKIP_MARKER = "referee-report-must-skip"
 # repair 节点指令要求的产物版本标记（修复产物锚：task 指令与产物输出均含此串）
 REFEREE_REPAIR_ARTIFACT = "version:1.0.0"
+
+# 判据演练锚（judge_drill.json 节点约定）
+# 锚文件落点：file_create 相对路径以 file 工具沙箱 workspace/ 为根
+# （judge 命令 cwd=引擎进程工作目录=仓库根——判据命令以 workspace\ 前缀跨两域差；
+# workspace/ 已 gitignore，不污染仓库）
+JUDGE_ANCHOR_FILE = REPO_ROOT / "workspace" / "data" / "judge_drill_anchor.txt"
+# 锚内容与 judge 命令 findstr 子串（writer 指令与 confirm 产出均含此串）
+JUDGE_ANCHOR_CONTENT = "JUDGE-ANCHOR-OK-12345"
+# confirm 节点指令要求的固定回复（output_node 产出锚）
+JUDGE_CONFIRM_OUTPUT = "judge passed"
 
 
 def find_replan_planner_sessions(base_url: str, sids: set) -> list:
@@ -879,6 +898,97 @@ def scenario_g(env: Dict[str, str], evidence_dir: Optional[Path], server_url: st
     return ok
 
 
+def scenario_h(env: Dict[str, str], evidence_dir: Optional[Path], server_url: str) -> bool:
+    """节点判据演练（judge v0）：环境态验收 + 中性信号入链。
+
+    断言五条：
+      ① EXIT=0 且 plan_versions=1 replans=0（手写 DSL 直接执行，无 planner 参与）；
+      ② nodes_executed>=2（writer 判据过后 confirm 才执行——粒不过不进下一粒）；
+      ③ stdout 含 confirm 产出（judge passed——判据过 = 下游粒正常执行）；
+      ④ 锚文件真实落盘且含锚串（判据对象是环境态，非 LLM 自报）；
+      ⑤ 链上：meta_signal.judge 中性信号落标记会话链且 acceptance_passed=true
+        （判据结果可查账；信号落链由引擎机制填写，处置知识在规则层）。
+    """
+    # 运行前清锚文件：保证判据命令面对"文件必须由本场景 writer 产出"的确定性
+    # （若残留旧锚，findstr 空过 = 判据形同虚设）
+    try:
+        JUDGE_ANCHOR_FILE.unlink()
+        print(f"  {YELLOW}···{RESET}  已清理残留锚文件 {JUDGE_ANCHOR_FILE.name}")
+    except FileNotFoundError:
+        pass
+
+    # 运行前快照会话集合，运行后 diff 圈定本场景新建会话（链上断言范围）
+    try:
+        before = session_ids(server_url)
+    except Exception as e:  # noqa: BLE001 — 会话列表不可读降级为空集（链断言将失败并给出原因）
+        print(f"  {YELLOW}···{RESET}  会话列表不可读（{e}），链上断言范围将为空")
+        before = set()
+
+    proc, ok = run_scenario(
+        "H: 节点判据演练（file_create 落锚→findstr 判据→过=confirm 执行）",
+        "scenarioH", ["judge_drill"], env, evidence_dir,
+    )
+    if proc is None:
+        return False
+    m = assert_stats_line(proc, "H")
+    ok = ok and m is not None
+    if m:
+        _, versions, replans, nodes, _, _, _, _ = m.groups()
+        ok = ok and check(
+            (versions, replans) == ("1", "0"),
+            "plan_versions=1 replans=0（手写 DSL 无 planner 参与）",
+            f"预期 plan_versions=1 replans=0，实得 {versions}/{replans}",
+        )
+        ok = ok and check(
+            int(nodes) >= 2,
+            "nodes_executed>=2（writer 判据过后 confirm 才执行）",
+            "nodes_executed<2（判据未过或下游粒未执行）",
+        )
+    ok = ok and check(
+        JUDGE_CONFIRM_OUTPUT in proc.stdout,
+        "stdout 含 confirm 产出（judge passed）",
+        "stdout 缺 confirm 产出（判据未过或 output_node 未输出）",
+    )
+    # 锚文件真实落盘（判据对象是环境态——引擎 findstr 而非 LLM 自报）
+    anchor_ok = JUDGE_ANCHOR_FILE.exists() and JUDGE_ANCHOR_CONTENT in (
+        JUDGE_ANCHOR_FILE.read_text(encoding="utf-8", errors="replace")
+    )
+    ok = ok and check(
+        anchor_ok,
+        "锚文件真实落盘且含锚串（环境态验收非 LLM 自报）",
+        f"锚文件缺失或内容不含锚串（{JUDGE_ANCHOR_FILE}）",
+    )
+    # 链上断言：meta_signal.judge 信号入 marks 会话链且 acceptance_passed=true
+    try:
+        after = session_ids(server_url)
+        new_ids = after - before
+        print(f"  {YELLOW}···{RESET}  本场景新建会话 {len(new_ids)} 个（{sorted(new_ids)}）")
+        signal_hit = 0
+        for sid in sorted(new_ids):
+            try:
+                hist = http_get_json(server_url, f"/api/sessions/{sid}/history")
+            except Exception as e:  # noqa: BLE001 — 诊断用途，跳过不可读会话
+                print(f"  {YELLOW}···{RESET}  会话 {sid} history 不可读（{e}），跳过")
+                continue
+            blob = json.dumps(hist, ensure_ascii=False)
+            # 指令可能以转义字符串内嵌于事件字段——先反序列化转义再匹配
+            # （容 Value 直嵌与字符串内嵌两种形态；true 匹配容忍空白差异）
+            flat = blob.replace('\\"', '"')
+            if "meta_signal.judge" in flat and re.search(
+                r'"acceptance_passed"\s*:\s*true', flat
+            ):
+                signal_hit += 1
+        ok = ok and check(
+            signal_hit >= 1,
+            "链上可查账：meta_signal.judge 信号落 marks 会话链且 acceptance_passed=true",
+            "新会话链上未见 meta_signal.judge/acceptance_passed=true（信号未落链）",
+        )
+    except Exception as e:  # noqa: BLE001 — 链断言失败需可见不吞
+        ok = False
+        print(f"  {RED}FAIL{RESET}  链上判据信号断言异常：{e}")
+    return ok
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="plan-execute 真实 LLM E2E")
     parser.add_argument(
@@ -889,13 +999,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--only",
-        choices=["A", "B", "C", "D", "E", "F", "G"],
+        choices=["A", "B", "C", "D", "E", "F", "G", "H"],
         default=None,
         help="只跑单个场景（调试用；缺省全量）",
     )
     args = parser.parse_args()
 
-    print("plan-execute 真实 LLM E2E 测试（IT 级；Phase 1-B A/B + Phase 2 C/D + 收官 B6 场景 E + serve 挂 driver 场景 F + compute 裁判场景 G）")
+    print("plan-execute 真实 LLM E2E 测试（IT 级；Phase 1-B A/B + Phase 2 C/D + 收官 B6 场景 E + serve 挂 driver 场景 F + compute 裁判场景 G + 节点判据场景 H）")
     print(f"  时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  env:  {ENV_PATH}")
 
@@ -921,10 +1031,11 @@ def main() -> int:
     ok_e = scenario_e(env, args.evidence_dir, server_url) if only in (None, "E") else True
     ok_f = scenario_f(env, args.evidence_dir) if only in (None, "F") else True
     ok_g = scenario_g(env, args.evidence_dir, server_url) if only in (None, "G") else True
+    ok_h = scenario_h(env, args.evidence_dir, server_url) if only in (None, "H") else True
 
-    total = ok_a and ok_b and ok_c and ok_d and ok_e and ok_f and ok_g
+    total = ok_a and ok_b and ok_c and ok_d and ok_e and ok_f and ok_g and ok_h
     print(f"\n{'=' * 60}")
-    print(f"结果: {'ALL PASS' if total else 'FAILED'}  (A={ok_a} B={ok_b} C={ok_c} D={ok_d} E={ok_e} F={ok_f} G={ok_g})")
+    print(f"结果: {'ALL PASS' if total else 'FAILED'}  (A={ok_a} B={ok_b} C={ok_c} D={ok_d} E={ok_e} F={ok_f} G={ok_g} H={ok_h})")
     print(f"{'=' * 60}")
     return 0 if total else 1
 

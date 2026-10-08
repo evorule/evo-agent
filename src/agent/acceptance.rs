@@ -104,8 +104,8 @@ async fn run_acceptance_command(cmd: &str) -> Result<std::process::Output, Strin
         .map_err(|e| format!("acceptance command spawn failed: {e}"))
 }
 
-/// 取字符串尾部 n 个字符(字符边界安全)
-fn tail_str(s: &str, n: usize) -> String {
+/// 取字符串尾部 n 个字符(字符边界安全;workflow 判据门禁复用)
+pub(crate) fn tail_str(s: &str, n: usize) -> String {
     if s.len() <= n {
         return s.to_string();
     }

@@ -128,6 +128,7 @@ pub async fn run_plan_loop(
     limits: DriverLimits,
     seed_hash: Option<String>,
     marks_session: Option<String>,
+    judge_container: Option<String>,
 ) -> Result<PlanLoopOutcome, String> {
     // tokens 埋点累加器（纲领 §8 Phase 2 交付物 7）：驱动注入 ctx，随每个
     // 子 runner 共享；仅供观测统计，不改变任何控制流。
@@ -136,7 +137,7 @@ pub async fn run_plan_loop(
     // M5-c:标记会话启用时同步注入阶段前置裁决通道(每个 LLM 节点 delegate
     // 前提交 phase 信号,由 00_constraint enforce 裁决前置条件——引擎不含
     // 协作纪律知识);None = 零变更
-    let mut engine = WorkflowEngine::new(ctx.clone());
+    let mut engine = WorkflowEngine::new(ctx.clone()).with_judge_container(judge_container); // 判据 v0:None = 宿主直执行（CLI 既有语义）
     if let Some(sid) = marks_session.as_deref() {
         engine = engine.with_phase_gate(crate::agent::workflow::PhaseGate {
             marks_session: sid.to_string(),
@@ -403,6 +404,7 @@ pub async fn run_plan_execute(
     limits: DriverLimits,
     max_depth: usize,
     max_concurrent: usize,
+    container: Option<String>,
 ) -> Result<(PlanLoopOutcome, String), String> {
     // ① probe DAG（单 planner 节点，task=goal）→ constitution 校验链（与 CLI
     //    同一加载入口：schema 全量校验 + 物化，失败 fail-fast 拒载）
@@ -449,6 +451,7 @@ pub async fn run_plan_execute(
         limits,
         Some(plan_canonical_hash(&probe_canonical)),
         Some(marks_session.clone()),
+        container, // 判据 v0：run 请求容器名透传（None = 宿主直执行）
     )
     .await?;
     Ok((outcome, marks_session))
@@ -803,6 +806,7 @@ mod tests {
                 run_when: None,
                 compute: None,
                 output_schema: None,
+                judge: None,
             }],
             output_node: "a".to_string(),
         };
@@ -958,6 +962,7 @@ mod tests {
             run_when: None,
             compute: None,
             output_schema: None,
+            judge: None,
         }
     }
 

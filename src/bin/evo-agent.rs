@@ -2191,6 +2191,7 @@ fn cmd_workflow(
         opts.limits,
         Some(seed_hash),
         marks_session,
+        None, // 判据执行容器：CLI workflow 宿主语义（容器域属 serve 面）
     ));
 
     match outcome {

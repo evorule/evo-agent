@@ -1,0 +1,24 @@
+{
+  "workflow_id": "judge_drill",
+  "description": "判据 v0 演练(JudgeNode):writer 节点经 file 工具落判据锚文件→引擎执行 judge 命令(findstr 退出码 0=过)→过=confirm 节点执行并作为产出;不过=writer 节点失败(粒不过不进下一粒)。验证判据门禁、中性信号入链与零 LLM 自报判据语义。两域对齐:file_create 相对路径落盘根=file 工具沙箱 workspace/,judge 命令 cwd=引擎进程工作目录(CLI=仓库根)——判据命令以 workspace\\ 前缀引用锚文件;findstr 为 Windows 宿主命令——容器域判据形态见 engine judge_container 通路",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "writer",
+      "agent_type": "general",
+      "task": "用 file_create 工具创建文件 data/judge_drill_anchor.txt,内容恰好一行:JUDGE-ANCHOR-OK-12345(若文件已存在,用 file_write 覆盖为同样内容)。完成后仅回复 created,不要输出其他内容。",
+      "judge": {
+        "command": "findstr JUDGE-ANCHOR-OK-12345 workspace\\data\\judge_drill_anchor.txt",
+        "expect_exit": 0
+      },
+      "depends_on": []
+    },
+    {
+      "id": "confirm",
+      "agent_type": "researcher",
+      "task_template": "上游判据已通过(锚文件含 JUDGE-ANCHOR-OK-12345)。仅回复:judge passed",
+      "depends_on": ["writer"]
+    }
+  ],
+  "output_node": "confirm"
+}

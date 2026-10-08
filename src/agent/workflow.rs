@@ -361,6 +361,35 @@ pub struct WorkflowNode {
     /// [`WorkflowEngine::execute`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
+    /// 节点判据声明（可选，判据 v0 第二级）：节点产出后由引擎在宿主/容器内
+    /// 执行判据命令，退出码与 stdout 形态符合期望才判过——判据不过=节点失败
+    /// （fail-closed：粒不过不进下一粒）。与 `compute` 互斥（compute 无 agent
+    /// 产出可判，见 `Self::validate` 门卫）。判据结果以中性信号沿 PhaseGate
+    /// 通路落标记会话链（acceptance_passed 同款强制注入字段，不采信 LLM 自报），
+    /// 执行机械见 [`WorkflowEngine::execute`]。serde default = 全版本兼容
+    /// （未声明的资产零影响；schema 对未知字段宽容，语义由本仓门卫执法）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<JudgeSpec>,
+}
+
+/// 节点判据声明（判据 v0 第二级）
+///
+/// 判据命令为静态文本（v0 不做占位符替换——产出形态校验走 `output_schema`
+/// （粒间契约），环境态验收走本字段，判据对象正交）。执行域：引擎持有容器
+/// 名时经 docker exec 进容器执行（P1 执行桥同款宿主侧 argv）；否则宿主直
+/// 执行（acceptance 门禁同款，cwd=引擎进程工作目录）。注意两域差：file 工具
+/// 相对路径以沙箱根 `workspace/` 为基——判据命令引用 file 工具产物须跨域
+/// 前缀（见 judge_drill 资产）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JudgeSpec {
+    /// 判据命令（如 `cargo build` / `findstr <needle> <file>`）
+    pub command: String,
+    /// 期望退出码（缺省 0）
+    #[serde(default)]
+    pub expect_exit: i64,
+    /// 期望 stdout 包含子串（可选；声明时 stdout 须包含该子串才判过）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_stdout: Option<String>,
 }
 
 /// 工作流定义
@@ -526,6 +555,81 @@ pub fn phase_signal(node_id: &str) -> serde_json::Value {
     })
 }
 
+/// 判据结果中性信号指令形态（纯函数；判据 v0 第二级）
+///
+/// `set meta_signal.judge = <node_id>`，params 携带 acceptance_passed 同款
+/// 强制注入字段（引擎侧机制填写，不采信 LLM 自报——G8 同款字段名；失败时
+/// 附 acceptance_detail）。判据过/不过的处置知识在规则层；引擎只报告事实。
+pub fn judge_signal(node_id: &str, passed: bool, detail: &str) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "attr": "meta_signal.judge",
+        "operation": "set",
+        "value": node_id,
+        "acceptance_passed": passed,
+    });
+    if !passed {
+        params["acceptance_detail"] = serde_json::json!(detail);
+    }
+    serde_json::json!({ "type": "set", "params": params })
+}
+
+/// 判据命令执行（判据 v0 第二级；tokio 异步执行不阻塞执行器线程）
+///
+/// 容器在位 = `docker exec <container> sh -c <cmd>`（P1 执行桥同款宿主侧 argv，
+/// 容器名过白名单校验防 argv 注入）；否则宿主直执行（acceptance 门禁同款：
+/// windows=cmd /C，其余=sh -c）。spawn 失败按判据不过处理（Err 携带原因）。
+async fn run_judge_command(
+    cmd: &str,
+    container: Option<&str>,
+) -> Result<std::process::Output, String> {
+    if let Some(c) = container {
+        crate::builtin_tools::shell_exec::validate_container_name(c)
+            .map_err(|e| format!("judge container name invalid: {e}"))?;
+        let mut command = tokio::process::Command::new("docker");
+        command.args(["exec", c, "sh", "-c", cmd]);
+        return command
+            .output()
+            .await
+            .map_err(|e| format!("judge command spawn failed: {e}"));
+    }
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = tokio::process::Command::new("cmd");
+        c.args(["/C", cmd]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    };
+    command
+        .output()
+        .await
+        .map_err(|e| format!("judge command spawn failed: {e}"))
+}
+
+/// 判据裁决（纯函数；判据 v0 第二级）
+///
+/// exit 码等于期望且 stdout 含期望子串（声明时）=过；`detail` 为审计文本
+/// （exit/stdout 尾/stderr 尾，acceptance 门禁同形态）。spawn 失败不经本函数
+/// （调用方按不过处理，Err 原文即 detail）。
+fn judge_verdict(judge: &JudgeSpec, output: &std::process::Output) -> (bool, String) {
+    let exit = output.status.code().map(i64::from).unwrap_or(-1);
+    let passed = exit == judge.expect_exit
+        && judge.expect_stdout.as_ref().map_or(true, |want| {
+            String::from_utf8_lossy(&output.stdout).contains(want.as_str())
+        });
+    let detail = format!(
+        "exit={} stdout_tail={} stderr_tail={}",
+        exit,
+        crate::agent::acceptance::tail_str(&String::from_utf8_lossy(&output.stdout), 400),
+        crate::agent::acceptance::tail_str(&String::from_utf8_lossy(&output.stderr), 400),
+    );
+    (passed, detail)
+}
+
 /// 工作流引擎
 ///
 /// 持有 [`DelegateContext`],负责拓扑排序 + 并行执行 + 模板渲染。
@@ -542,6 +646,9 @@ pub struct WorkflowEngine {
     executed_node_ids: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// M5-c:阶段前置裁决通道(None = 既有行为零变更)
     phase_gate: Option<PhaseGate>,
+    /// 判据执行容器（判据 v0 第二级；None = 宿主直执行）。serve 面经 run 请求
+    /// container 字段传入（P1 执行桥同源），CLI 面恒 None（宿主语义）。
+    judge_container: Option<String>,
 }
 
 impl WorkflowEngine {
@@ -552,6 +659,7 @@ impl WorkflowEngine {
             executed_nodes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             executed_node_ids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             phase_gate: None,
+            judge_container: None,
         }
     }
 
@@ -559,6 +667,12 @@ impl WorkflowEngine {
     /// 节点执行零额外链上往返,行为与 M5-b 前完全一致)
     pub fn with_phase_gate(mut self, gate: PhaseGate) -> Self {
         self.phase_gate = Some(gate);
+        self
+    }
+
+    /// 注入判据执行容器（判据 v0 第二级；None = 宿主直执行，既有行为零变更）
+    pub fn with_judge_container(mut self, container: Option<String>) -> Self {
+        self.judge_container = container;
         self
     }
 
@@ -769,6 +883,52 @@ impl WorkflowEngine {
                                 return Err(interface_contract_error(&node.id, &d));
                             }
                         }
+                        // 判据 v0 第二级(JudgeNode):环境态验收命令——exit 码/stdout
+                        // 形态判过(不采信 LLM 自报,G8 同款)。判据结果=中性信号沿
+                        // PhaseGate 通路落标记会话链(journal 可查账;None = 无链路面,
+                        // 门禁照常执行);判据不过=节点失败(fail-closed:粒不过不进
+                        // 下一粒,失败文本无接口契约标记→外层分类为粒失败)。通道
+                        // 故障=fail-fast;被 enforce 拦截=D-01 语义(外层不 replan)。
+                        if let Some(judge) = &node.judge {
+                            let (passed, detail) =
+                                run_judge_command(&judge.command, self.judge_container.as_deref())
+                                    .await
+                                    .map(|output| judge_verdict(judge, &output))
+                                    .unwrap_or_else(|e| (false, e));
+                            if let Some(gate) = &self.phase_gate {
+                                let allowed =
+                                    crate::agent::runner::submit_signal_and_await_verdict(
+                                        &gate.client,
+                                        &gate.marks_session,
+                                        &judge_signal(&node.id, passed, &detail),
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        format!(
+                                            "workflow judge signal failed (node '{}'): {}",
+                                            node.id, e
+                                        )
+                                    })?;
+                                if !allowed {
+                                    return Err(format!(
+                                        "enforce violation: workflow judge signal rejected by \
+                                         rule layer (node '{}', passed={passed}; {detail})",
+                                        node.id
+                                    ));
+                                }
+                            }
+                            if !passed {
+                                return Err(format!(
+                                    "workflow node '{}' failed: judge failed ({})",
+                                    node.id, detail
+                                ));
+                            }
+                            tracing::info!(
+                                workflow_id = %wf.workflow_id,
+                                node_id = %node.id,
+                                "workflow node judge passed"
+                            );
+                        }
                         tracing::info!(
                             workflow_id = %wf.workflow_id,
                             node_id = %node.id,
@@ -841,6 +1001,14 @@ impl WorkflowEngine {
             if !id_set.insert(n.id.as_str()) {
                 return Err(format!(
                     "workflow '{}' has duplicate node id: '{}'",
+                    wf.workflow_id, n.id
+                ));
+            }
+            // 门卫(判据 v0):judge 与 compute 互斥——compute 节点无 agent 产出可判
+            // (D-03:纯函数求值不经 delegate),judge 面向 LLM 粒产出的环境态验收
+            if n.compute.is_some() && n.judge.is_some() {
+                return Err(format!(
+                    "workflow '{}': node '{}' cannot declare both compute and judge",
                     wf.workflow_id, n.id
                 ));
             }
@@ -1667,6 +1835,7 @@ mod tests {
             run_when: None,
             compute: None,
             output_schema: None,
+            judge: None,
         }
     }
 
@@ -1731,6 +1900,7 @@ mod tests {
             run_when: None,
             compute: Some(spec),
             output_schema: None,
+            judge: None,
         }
     }
 
@@ -2813,6 +2983,7 @@ mod tests {
                 run_when: None,
                 compute: Some(compute),
                 output_schema: None,
+                judge: None,
             });
         }
         let wf = Workflow {
@@ -3017,6 +3188,7 @@ mod tests {
             run_when: None,
             compute: None,
             output_schema: None,
+            judge: None,
         };
         let mut results = BTreeMap::new();
         results.insert("a".to_string(), "rust-result".to_string());
@@ -3038,6 +3210,7 @@ mod tests {
             run_when: None,
             compute: None,
             output_schema: None,
+            judge: None,
         };
         let results = BTreeMap::new();
         let rendered = engine.render_task(&n, &results, &HashSet::new());
@@ -3058,6 +3231,7 @@ mod tests {
             run_when: None,
             compute: None,
             output_schema: None,
+            judge: None,
         };
         let mut results = BTreeMap::new();
         results.insert("x".to_string(), "VAL".to_string());
@@ -3079,6 +3253,7 @@ mod tests {
             run_when: None,
             compute: None,
             output_schema: None,
+            judge: None,
         };
         let mut results = BTreeMap::new();
         results.insert("a".to_string(), "A".to_string());
@@ -3101,6 +3276,7 @@ mod tests {
             run_when: None,
             compute: None,
             output_schema: None,
+            judge: None,
         };
         let mut results = BTreeMap::new();
         results.insert("a".to_string(), "A".to_string());
@@ -3567,6 +3743,199 @@ mod tests {
             crate::agent::replan::parse_failed_node_id(&text).as_deref(),
             Some("s"),
             "包裹形态须可被外层失败解析"
+        );
+    }
+
+    // ===== 节点判据（判据 v0 第二级）=====
+
+    #[test]
+    fn test_judge_signal_shape_pass_and_fail() {
+        // 过：acceptance_passed=true 恒带；无 detail 字段
+        let ok = judge_signal("n_writer", true, "ignored");
+        assert_eq!(ok["type"], "set");
+        assert_eq!(ok["params"]["attr"], "meta_signal.judge");
+        assert_eq!(ok["params"]["operation"], "set");
+        assert_eq!(ok["params"]["value"], "n_writer");
+        assert_eq!(ok["params"]["acceptance_passed"], true);
+        assert!(ok["params"].get("acceptance_detail").is_none());
+        // 不过：acceptance_passed=false + detail 强制注入（引擎报告事实，
+        // 处置知识在规则层——不采信 LLM 自报的机制同源）
+        let bad = judge_signal("n_writer", false, "exit=1 stdout_tail=boom");
+        assert_eq!(bad["params"]["acceptance_passed"], false);
+        assert_eq!(
+            bad["params"]["acceptance_detail"],
+            "exit=1 stdout_tail=boom"
+        );
+        // 确定性：同输入必同输出
+        assert_eq!(ok, judge_signal("n_writer", true, "ignored"));
+        assert_eq!(
+            bad,
+            judge_signal("n_writer", false, "exit=1 stdout_tail=boom")
+        );
+    }
+
+    fn judge_probe_output(cmd_args: &[&str]) -> std::process::Output {
+        #[cfg(windows)]
+        let mut c = std::process::Command::new("cmd");
+        #[cfg(windows)]
+        let c = c.args(["/C"]).args(cmd_args);
+        #[cfg(not(windows))]
+        let mut c = std::process::Command::new("sh");
+        #[cfg(not(windows))]
+        let c = c.args(["-c"]).args(cmd_args);
+        c.output().expect("判据裁决探针命令须可执行")
+    }
+
+    #[test]
+    fn test_judge_verdict_exit_and_stdout() {
+        // exit 7 + stdout "hello"：expect_exit=7 判过；expect_exit=0 判不过
+        let output = judge_probe_output(&["echo hello & exit 7"]);
+        let (passed, detail) = judge_verdict(
+            &JudgeSpec {
+                command: "probe".into(),
+                expect_exit: 7,
+                expect_stdout: None,
+            },
+            &output,
+        );
+        assert!(passed, "exit 匹配判过: {detail}");
+        assert!(detail.contains("exit=7"), "detail 含退出码审计: {detail}");
+        assert!(
+            detail.contains("hello"),
+            "detail 含 stdout 尾审计: {detail}"
+        );
+
+        let (passed, _) = judge_verdict(
+            &JudgeSpec {
+                command: "probe".into(),
+                expect_exit: 0,
+                expect_stdout: None,
+            },
+            &output,
+        );
+        assert!(!passed, "exit 不匹配判不过");
+
+        // expect_stdout contains 语义：声明子串在 stdout=过；不在=不过
+        let output = judge_probe_output(&["echo JUDGE-ANCHOR-OK-12345"]);
+        let (passed, _) = judge_verdict(
+            &JudgeSpec {
+                command: "probe".into(),
+                expect_exit: 0,
+                expect_stdout: Some("JUDGE-ANCHOR-OK".into()),
+            },
+            &output,
+        );
+        assert!(passed, "stdout 含期望子串判过");
+        let (passed, _) = judge_verdict(
+            &JudgeSpec {
+                command: "probe".into(),
+                expect_exit: 0,
+                expect_stdout: Some("MISSING-NEEDLE".into()),
+            },
+            &output,
+        );
+        assert!(!passed, "stdout 不含期望子串判不过（exit 匹配也不行）");
+    }
+
+    #[tokio::test]
+    async fn test_run_judge_command_host_direct() {
+        // 宿主直执行（None）：exit 0 / exit 7 语义
+        let out = run_judge_command("exit 0", None)
+            .await
+            .expect("exit 0 须成功 spawn");
+        assert_eq!(out.status.code(), Some(0));
+        let out = run_judge_command("exit 7", None)
+            .await
+            .expect("exit 7 须成功 spawn");
+        assert_eq!(out.status.code(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn test_run_judge_command_container_name_validated() {
+        // 容器名过白名单校验（防 argv 注入）：非法名 = Err 携带原因（判据不过路径）
+        let err = run_judge_command("exit 0", Some("bad name with spaces"))
+            .await
+            .expect_err("非法容器名须 Err");
+        assert!(
+            err.contains("judge container name invalid"),
+            "错误须指明容器名非法: {err}"
+        );
+    }
+
+    #[test]
+    fn test_workflow_deserialize_judge_spec() {
+        // 带 judge：解析为 Some(JudgeSpec)，expect_exit 缺省 0
+        let json = r#"{
+            "workflow_id": "judged",
+            "nodes": [
+                {"id": "build", "agent_type": "writer", "task": "t",
+                 "judge": {"command": "cargo build", "expect_stdout": "Finished"}}
+            ],
+            "output_node": "build"
+        }"#;
+        let wf: Workflow = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            wf.nodes[0].judge,
+            Some(JudgeSpec {
+                command: "cargo build".to_string(),
+                expect_exit: 0,
+                expect_stdout: Some("Finished".to_string()),
+            })
+        );
+        // 不带 judge（存量形态）：default = None，零影响
+        let json = r#"{
+            "workflow_id": "plain",
+            "nodes": [{"id": "only", "agent_type": "writer", "task": "t"}],
+            "output_node": "only"
+        }"#;
+        let wf: Workflow = serde_json::from_str(json).unwrap();
+        assert!(wf.nodes[0].judge.is_none());
+    }
+
+    #[test]
+    fn test_workflow_node_judge_serde_roundtrip() {
+        // judge=None 序列化不产生 "judge" 键（skip_serializing_if）
+        let n = node("a", "w", &[]);
+        let json = serde_json::to_value(&n).unwrap();
+        assert!(
+            json.get("judge").is_none(),
+            "None judge 不得出现在序列化产物"
+        );
+        // judge=Some 往返保真
+        let mut n = node("a", "w", &[]);
+        n.judge = Some(JudgeSpec {
+            command: "findstr needle data.txt".to_string(),
+            expect_exit: 0,
+            expect_stdout: None,
+        });
+        let back: WorkflowNode = serde_json::from_value(serde_json::to_value(&n).unwrap()).unwrap();
+        assert_eq!(back.judge, n.judge);
+    }
+
+    #[test]
+    fn test_validate_compute_and_judge_mutually_exclusive() {
+        // 互斥门卫：compute 与 judge 同节点声明 = 拒载
+        let mut n = node("a", "w", &[]);
+        n.compute = Some(ComputeSpec::Strcmp {
+            inputs: vec![ComputeInput::Node("a".to_string()), ComputeInput::Empty],
+            mode: StrcmpMode::Equal,
+        });
+        n.judge = Some(JudgeSpec {
+            command: "exit 0".to_string(),
+            expect_exit: 0,
+            expect_stdout: None,
+        });
+        let wf = Workflow {
+            workflow_id: "w".to_string(),
+            description: String::new(),
+            nodes: vec![n],
+            output_node: "a".to_string(),
+        };
+        let engine = WorkflowEngine::new(make_ctx());
+        let err = engine.validate(&wf).expect_err("compute/judge 互斥须拒载");
+        assert!(
+            err.contains("cannot declare both compute and judge"),
+            "错误须指明互斥: {err}"
         );
     }
 }
