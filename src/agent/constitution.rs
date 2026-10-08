@@ -471,6 +471,25 @@ mod tests {
         // 形态变更时本测试先行暴露（与 system-rules check_evoagent_assets.py
         // 双保险：彼为 jsonschema 真值回归，此为引擎真实加载路径）。
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("rules/workflows");
+        // agent_type 存在性闸：资产引用的 agent 必须能在 agents/ 目录解析
+        // （否则缺陷要到运行期才以 Agent type not found 暴露——budget_review
+        // 曾因引用从未存在的 writer 定义而整条工作流不可运行）。
+        let agents_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agents");
+        let mut agent_types = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&agents_dir).expect("agents/ 必须存在") {
+            let path = entry.expect("read_dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    agent_types.insert(stem.to_string());
+                }
+            }
+        }
+        assert!(!agent_types.is_empty(), "agents/ 至少应有一个 agent 定义");
+        // 蓄意失败演练资产豁免：以引用不存在 agent 制造运行期失败为设计意图
+        // （e2e_plan_execute.py scenarioD 等场景消费，验证 replan 硬上限判定序
+        // 终止/重规划行为），不在存在性闸范围内。
+        const INTENTIONAL_FAILURE_ASSETS: &[&str] =
+            &["ok_then_fail_drill.json", "replan_drill.json"];
         let mut checked = 0;
         for entry in std::fs::read_dir(&dir).expect("rules/workflows 必须存在") {
             let path = entry.expect("read_dir entry").path();
@@ -482,6 +501,30 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{} 反序列化失败: {e}", path.display()));
             if doc.get("workflow_id").is_none() {
                 continue; // 非工作流资产不在本门范围
+            }
+            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !INTENTIONAL_FAILURE_ASSETS.contains(&file_name) {
+                let mut node_docs: Vec<&serde_json::Value> = Vec::new();
+                if let Some(arr) = doc.get("nodes").and_then(|v| v.as_array()) {
+                    node_docs.extend(arr.iter());
+                }
+                if let Some(loops) = doc.get("loops").and_then(|v| v.as_array()) {
+                    for lp in loops {
+                        if let Some(body) = lp.get("body").and_then(|v| v.as_array()) {
+                            node_docs.extend(body.iter());
+                        }
+                    }
+                }
+                for node in node_docs {
+                    if let Some(at) = node.get("agent_type").and_then(|v| v.as_str()) {
+                        assert!(
+                            agent_types.contains(at),
+                            "{} 节点 {} 引用未定义 agent_type \"{at}\"（agents/ 现有: {agent_types:?}）",
+                            path.display(),
+                            node.get("id").and_then(|v| v.as_str()).unwrap_or("?")
+                        );
+                    }
+                }
             }
             let wf = load_workflow(&doc)
                 .unwrap_or_else(|errs| panic!("{} 加载失败: {errs:?}", path.display()));
