@@ -35,6 +35,7 @@
     "knowledge_datasets",
     "knowledge_search",
     "knowledge_entry_get",
+    "bundle_export",
     "audit_get",
     "rule_create",
     "rule_update",
