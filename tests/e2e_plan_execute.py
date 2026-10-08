@@ -52,6 +52,15 @@
     repeated_nodes=0 tokens_used>0）；session_id（marks_session）透出；
     content 非空。响应全文落盘证据。
 
+  场景 G（compute 裁判演练，referee pattern）：referee_drill 工作流（手写
+    DSL）——producer 指令性输出不合规固定文本（无版本标记）→ judge
+    （regex_match）判定 no_match → repair（run_when equals no_match）修复
+    产物（含 version:1.0.0）= output_node → report（run_when equals match）
+    预期跳过。
+    断言：EXIT=0、plan_versions=1 replans=0（手写 DSL 无 planner 参与）、
+    nodes_executed>=2、stdout 含修复产物（output_node 产出）；链上断言：
+    report 分支零会话（条件跳过=零 LLM 成本）、repair 分支产物入链。
+
 # 前置（本脚本不进 CI——依赖真实 LLM key/运行中 server/已编译产物）
   1. .env 含 MINIMAX_API_KEY（evo-agent 只认进程环境变量，脚本负责注入）
   2. evorule-server 运行于 evo-agent.toml base_url（默认 http://127.0.0.1:18080），
@@ -62,7 +71,7 @@
   cd <repo-root>(evo-agent 仓库根目录)
   python tests/e2e_plan_execute.py [--evidence-dir <目录>]
 
-  --evidence-dir 指定后，四场景 stdout/stderr 落盘该目录（核销证据留痕用）。
+  --evidence-dir 指定后，各场景 stdout/stderr 落盘该目录（核销证据留痕用）。
 """
 
 import argparse
@@ -220,6 +229,12 @@ REPLAN_TASK_MARKER = "COMPLETE new plan"
 RETRY_DRILL_MARKER = "__FLAKY_FIRST__"
 # driver.rs call_planner_with_retry 固定反馈文案前缀（重试任务 = 原任务 + 此段）
 RETRY_FEEDBACK_MARKER = "IMPORTANT: your previous response was not a valid PlanFact JSON"
+
+# 裁判演练锚（referee_drill.json 节点约定）
+# report 节点 task 内嵌的唯一标记——若其出现在新会话链上，说明预期跳过的分支被执行了
+REFEREE_REPORT_SKIP_MARKER = "referee-report-must-skip"
+# repair 节点指令要求的产物版本标记（修复产物锚：task 指令与产物输出均含此串）
+REFEREE_REPAIR_ARTIFACT = "version:1.0.0"
 
 
 def find_replan_planner_sessions(base_url: str, sids: set) -> list:
@@ -788,6 +803,82 @@ def scenario_f(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
             proc.wait(timeout=10)
 
 
+def scenario_g(env: Dict[str, str], evidence_dir: Optional[Path], server_url: str) -> bool:
+    """compute 裁判演练（referee pattern）：条件修复执行 + 条件分支零成本跳过。
+
+    断言五条：
+      ① EXIT=0 且 plan_versions=1 replans=0（手写 DSL 直接执行，无 planner 参与）；
+      ② nodes_executed>=2（producer+repair 执行；judge 为纯函数，report 预期跳过）；
+      ③ stdout 含修复产物 version:1.0.0（output_node=repair 产出）；
+      ④ 链上：report 分支零会话（run_when 预期跳过 = 零 LLM 成本）；
+      ⑤ 链上：repair 分支产物入链（version:1.0.0 出现在新会话链中）。
+    """
+    # 运行前快照会话集合，运行后 diff 圈定本场景新建会话（链上断言范围）
+    try:
+        before = session_ids(server_url)
+    except Exception as e:  # noqa: BLE001 — 会话列表不可读降级为空集（链断言将失败并给出原因）
+        print(f"  {YELLOW}···{RESET}  会话列表不可读（{e}），链上断言范围将为空")
+        before = set()
+
+    proc, ok = run_scenario(
+        "G: compute 裁判演练（产物→regex_match 判定→条件修复→预期跳过分支）",
+        "scenarioG", ["referee_drill"], env, evidence_dir,
+    )
+    if proc is None:
+        return False
+    m = assert_stats_line(proc, "G")
+    ok = ok and m is not None
+    if m:
+        _, versions, replans, nodes, _, _, _, _ = m.groups()
+        ok = ok and check(
+            (versions, replans) == ("1", "0"),
+            "plan_versions=1 replans=0（手写 DSL 无 planner 参与）",
+            f"预期 plan_versions=1 replans=0，实得 {versions}/{replans}",
+        )
+        ok = ok and check(
+            int(nodes) >= 2,
+            "nodes_executed>=2（producer+repair；judge 为纯函数，report 预期跳过）",
+            "nodes_executed<2（修复分支未执行）",
+        )
+    ok = ok and check(
+        REFEREE_REPAIR_ARTIFACT in proc.stdout,
+        "stdout 含修复产物（version:1.0.0——output_node=repair 产出）",
+        "stdout 缺修复产物（repair 未产出或未作为 output_node 输出）",
+    )
+    # 链上断言：report 分支零会话 + repair 分支产物入链
+    try:
+        after = session_ids(server_url)
+        new_ids = after - before
+        print(f"  {YELLOW}···{RESET}  本场景新建会话 {len(new_ids)} 个（{sorted(new_ids)}）")
+        report_hit = 0
+        repair_hit = 0
+        for sid in sorted(new_ids):
+            try:
+                hist = http_get_json(server_url, f"/api/sessions/{sid}/history")
+            except Exception as e:  # noqa: BLE001 — 诊断用途，跳过不可读会话
+                print(f"  {YELLOW}···{RESET}  会话 {sid} history 不可读（{e}），跳过")
+                continue
+            blob = json.dumps(hist, ensure_ascii=False)
+            if REFEREE_REPORT_SKIP_MARKER in blob:
+                report_hit += 1
+            if REFEREE_REPAIR_ARTIFACT in blob:
+                repair_hit += 1
+        ok = ok and check(
+            report_hit == 0,
+            "report 分支零会话（run_when 预期跳过=零 LLM 成本）",
+            f"report 分支出现 {report_hit} 个会话（预期跳过的节点被执行了）",
+        )
+        ok = ok and check(
+            repair_hit >= 1,
+            "repair 分支链上留痕（修复指令/产物入链）",
+            "repair 分支链上无痕迹（修复未执行或产物缺失）",
+        )
+    except Exception as e:  # noqa: BLE001 — 链断言失败需可见不吞
+        ok = False
+        print(f"  {RED}FAIL{RESET}  链上裁判断言异常：{e}")
+    return ok
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="plan-execute 真实 LLM E2E")
     parser.add_argument(
@@ -798,13 +889,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--only",
-        choices=["A", "B", "C", "D", "E", "F"],
+        choices=["A", "B", "C", "D", "E", "F", "G"],
         default=None,
         help="只跑单个场景（调试用；缺省全量）",
     )
     args = parser.parse_args()
 
-    print("plan-execute 真实 LLM E2E 测试（IT 级；Phase 1-B A/B + Phase 2 C/D + 收官 B6 场景 E + serve 挂 driver 场景 F）")
+    print("plan-execute 真实 LLM E2E 测试（IT 级；Phase 1-B A/B + Phase 2 C/D + 收官 B6 场景 E + serve 挂 driver 场景 F + compute 裁判场景 G）")
     print(f"  时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  env:  {ENV_PATH}")
 
@@ -829,10 +920,11 @@ def main() -> int:
     ok_d = scenario_d(env, args.evidence_dir) if only in (None, "D") else True
     ok_e = scenario_e(env, args.evidence_dir, server_url) if only in (None, "E") else True
     ok_f = scenario_f(env, args.evidence_dir) if only in (None, "F") else True
+    ok_g = scenario_g(env, args.evidence_dir, server_url) if only in (None, "G") else True
 
-    total = ok_a and ok_b and ok_c and ok_d and ok_e and ok_f
+    total = ok_a and ok_b and ok_c and ok_d and ok_e and ok_f and ok_g
     print(f"\n{'=' * 60}")
-    print(f"结果: {'ALL PASS' if total else 'FAILED'}  (A={ok_a} B={ok_b} C={ok_c} D={ok_d} E={ok_e} F={ok_f})")
+    print(f"结果: {'ALL PASS' if total else 'FAILED'}  (A={ok_a} B={ok_b} C={ok_c} D={ok_d} E={ok_e} F={ok_f} G={ok_g})")
     print(f"{'=' * 60}")
     return 0 if total else 1
 

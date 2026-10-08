@@ -1,0 +1,45 @@
+{
+  "workflow_id": "referee_drill",
+  "description": "compute 裁判模式演练(referee pattern):产物生成→regex_match 判定→条件修复(run_when equals no_match)=output_node→合规分支(run_when equals match)预期跳过;验证 run_when 条件跳过的零 LLM 成本语义",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "producer",
+      "agent_type": "researcher",
+      "task": "输出且仅输出以下固定文本,不要改写、不要解释、不要添加任何版本号或 JSON 结构:draft artifact placeholder",
+      "depends_on": []
+    },
+    {
+      "id": "judge",
+      "compute": {
+        "function": "regex_match",
+        "inputs": ["producer"],
+        "pattern": "version:1.0.0"
+      },
+      "depends_on": ["producer"]
+    },
+    {
+      "id": "repair",
+      "agent_type": "researcher",
+      "run_when": {
+        "node": "judge",
+        "op": "equals",
+        "value": "no_match"
+      },
+      "task_template": "裁判判定产物不合规(judge={judge}),缺少版本标记。修复以下产物:改写为恰好包含版本标记 version:1.0.0 的单句产物描述,输出修复后的完整产物,不要输出其他内容:\n{producer}",
+      "depends_on": ["judge"]
+    },
+    {
+      "id": "report",
+      "agent_type": "researcher",
+      "run_when": {
+        "node": "judge",
+        "op": "equals",
+        "value": "match"
+      },
+      "task": "这条节点预期被跳过(referee-report-must-skip):裁判判定产物合规(match)时才执行,而本演练产物故意不合规。如果你真的执行了,请输出 不应当执行 四个字。",
+      "depends_on": ["judge"]
+    }
+  ],
+  "output_node": "repair"
+}
