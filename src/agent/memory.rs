@@ -444,6 +444,22 @@ pub(crate) fn sort_stable_by_value(stable: &mut [MemoryRecord], goal: &str) {
 /// importance = w_c·confidence + w_u·min(usage,k)（F-616 stable 面接通：
 /// usage=存量 usage_count+本会话 pending 增量，k 封顶防垄断，配方可调）；
 /// 全序 Tie-break：新鲜度 ▸ 置信度 ▸ key 字典序（确定性可回放）。
+/// 来源权威权重（11 号 §5.1 authority 因子/§4.2 置信度演化 w_e 同源:
+/// user 1.0 / system 0.8 / llm 0.5 / 未标注 0.65——key 域优先,source 次之）
+pub(crate) fn authority_weight(record: &MemoryRecord) -> f32 {
+    let key = record.key.as_str();
+    let src = record.source.as_deref().unwrap_or_default();
+    if key.starts_with("stable.user.") || src.contains("user") {
+        1.0
+    } else if key.starts_with("stable.system.") || src.starts_with("system") {
+        0.8
+    } else if key.starts_with("stable.llm.") || src.starts_with("llm") {
+        0.5
+    } else {
+        0.65
+    }
+}
+
 pub(crate) fn sort_by_policy(
     stable: &mut [MemoryRecord],
     goal: &str,
@@ -459,11 +475,36 @@ pub(crate) fn sort_by_policy(
         .map(|r| stable_relevance(r, &goal_uniq))
         .collect();
     let max_rel = rels.iter().copied().max().unwrap_or(0).max(1);
+    // 实体度(批内共现归一,11 号 §5.1 entity_degree 的确定性代理):
+    // 逐条 token 集,与他条共享的 distinct token 数,批内 max 归一
+    let token_sets: Vec<std::collections::HashSet<String>> = stable
+        .iter()
+        .map(|r| tokenize_for_match(&r.value).into_iter().collect())
+        .collect();
+    let degrees: Vec<f32> = token_sets
+        .iter()
+        .enumerate()
+        .map(|(i, ti)| {
+            let mut shared = std::collections::HashSet::new();
+            for (j, tj) in token_sets.iter().enumerate() {
+                if i != j {
+                    for t in ti {
+                        if tj.contains(t) {
+                            shared.insert(t.clone());
+                        }
+                    }
+                }
+            }
+            shared.len() as f32
+        })
+        .collect();
+    let max_degree = degrees.iter().copied().fold(0.0_f32, f32::max).max(1.0);
     // 预计算每条的三因子（避免比较器内重复计算）
     let scores: Vec<f32> = stable
         .iter()
         .zip(rels.iter())
-        .map(|(r, &rel)| {
+        .enumerate()
+        .map(|(i, (r, &rel))| {
             let rel_norm = rel as f32 / max_rel as f32;
             let age_days = (now_secs().saturating_sub(r.timestamp)) as f64 / 86400.0;
             let half = if r.key.contains("events.") {
@@ -481,7 +522,9 @@ pub(crate) fn sort_by_policy(
                 .unwrap_or(0);
             let usage_hits = r.usage_count.saturating_add(pending);
             let importance = policy.w_confidence * r.confidence.unwrap_or(0.5)
-                + policy.w_usage * usage_hits.min(policy.usage_cap) as f32;
+                + policy.w_usage * usage_hits.min(policy.usage_cap) as f32
+                + policy.w_authority * authority_weight(r)
+                + policy.w_entity * degrees[i] / max_degree;
             policy.w_relevance * rel_norm
                 + policy.w_recency * recency
                 + policy.w_importance * importance
@@ -524,6 +567,146 @@ pub struct RecallContext {
     /// 消灭"离线零证明"：审计侧可区分"agent 无记忆运行"与"召回降级运行"。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degradation_notices: Vec<String>,
+    /// 双通道笔记常驻面（Q2 强制回喂 R-1）：按分类×相关性×新鲜度确定性
+    /// 选取的笔记条目（上限见 NOTES_RECALL_LIMIT），渲染为 ## Notes 分区
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<MemoryRecord>,
+    /// 双通道笔记事件回喂面（Q2 强制回喂 R-2）：停滞/错误/审批拒绝触发的
+    /// 相关 failure 笔记与催写行（调用方触发后下一轮注入，渲染进 ## Notes
+    /// 分区头部）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub note_feed: Vec<String>,
+}
+
+/// R-1 常驻回喂的笔记选取上限（确定性选取在源头截断,不参与 ContextBudget
+/// 裁剪——与降级通知同款"小体量关键可靠性信号"口径）
+pub const NOTES_RECALL_LIMIT: usize = 5;
+
+/// R-1 确定性选取：分类×相关性×新鲜度——token 重叠数降序 ▸ 时间戳降序 ▸
+/// key 字典序（全序 tie-break,同输入同选取）。todo/failure 类自带权重加成
+/// （未完成事项与失败教训是回喂的核心价值面）。
+pub(crate) fn select_notes_for_goal(
+    catalog: &[MemoryRecord],
+    goal: &str,
+    limit: usize,
+) -> Vec<MemoryRecord> {
+    let goal_tokens = tokenize_for_match(goal);
+    let mut scored: Vec<(usize, bool, &MemoryRecord)> = catalog
+        .iter()
+        .map(|rec| {
+            let note_tokens = tokenize_for_match(&rec.value);
+            let overlap = note_tokens.iter().filter(|t| goal_tokens.contains(t)).count();
+            let weight_bonus = rec.key.contains("todo") || rec.key.contains("failure");
+            (overlap, weight_bonus, rec)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        let ka = (a.0 + if a.1 { 1 } else { 0 });
+        let kb = (b.0 + if b.1 { 1 } else { 0 });
+        kb.cmp(&ka)
+            .then(b.2.timestamp.cmp(&a.2.timestamp))
+            .then(a.2.key.cmp(&b.2.key))
+    });
+    scored.into_iter().take(limit).map(|(_, _, r)| r.clone()).collect()
+}
+
+/// R-2 事件回喂的纯格式化面（可单测）：failure 正体按 token 重叠匹配取
+/// Top-K,草稿条目转催写行;空结果回退一条可解释的空反馈（触发不静默）。
+pub(crate) fn format_failure_feed(
+    catalog: &[MemoryRecord],
+    context_text: &str,
+    limit: usize,
+) -> Vec<String> {
+    let mut feed: Vec<String> = Vec::new();
+    let mut matched: Vec<(usize, &MemoryRecord)> = Vec::new();
+    let ctx_tokens = tokenize_for_match(context_text);
+    for rec in catalog {
+        let is_draft = rec.key.contains("draft");
+        let is_failure = rec.key.contains("failure");
+        if !is_failure && !is_draft {
+            continue;
+        }
+        if is_draft {
+            // 催写（Q4↔Q3 闭环）：机械草稿缺根因,强制要求 LLM 补记转正
+            feed.push(format!(
+                "[强制回喂][催写] 笔记 {} 缺根因假设,请立即用 note_write(failure) 补记根因与防再踩措施后转正;草稿原文:{}",
+                rec.key,
+                rec.value.chars().take(160).collect::<String>()
+            ));
+            continue;
+        }
+        let note_tokens = tokenize_for_match(&rec.value);
+        let overlap = note_tokens.iter().filter(|t| ctx_tokens.contains(t)).count();
+        matched.push((overlap, rec));
+    }
+    matched.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.timestamp.cmp(&a.1.timestamp)));
+    for (overlap, rec) in matched.into_iter().take(limit) {
+        feed.push(format!(
+            "[强制回喂] 历史 failure 笔记 {}（相关性命中 {overlap}）:{}",
+            rec.key,
+            rec.value.chars().take(200).collect::<String>()
+        ));
+    }
+    if feed.is_empty() {
+        // 兜底:无草稿且无 failure 笔记=如实带一条空反馈（触发可解释,
+        // 不让"触发→无内容"变成静默）
+        feed.push("[强制回喂] 本次触发未匹配到历史 failure 笔记（尚无失败教训在账）.".to_string());
+    }
+    feed
+}
+
+/// 写族工具集合（Q2 第四触发点 R-4 写前置查询;常量可扩——shell_exec 写
+/// 不覆盖,v0 边界=文件工具族）
+pub const WRITE_INTENT_TOOLS: &[&str] = &["file_write", "file_create", "file_delete", "file_move"];
+
+/// 写意图判定+目标路径提取（确定性:写族×path 参数非空）
+pub fn extract_write_path(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    if !WRITE_INTENT_TOOLS.contains(&tool_name) {
+        return None;
+    }
+    args.get("path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// R-4 匹配+格式化纯函数面:路径 token × 条目文本重叠 Top-K 降序
+/// （全序 tie-break 同族口径）。空匹配=空 Vec——写前置无历史=零噪音
+/// 静默跳过（与 failure 回喂的可解释兜底相反,设计使然:写动作不欠解释）。
+pub(crate) fn format_write_advisory(
+    path: &str,
+    catalog: &[MemoryRecord],
+    limit: usize,
+) -> Vec<String> {
+    let path_tokens = tokenize_for_match(path);
+    if path_tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut matched: Vec<(usize, &MemoryRecord)> = Vec::new();
+    for rec in catalog {
+        let text_tokens = tokenize_for_match(&rec.value);
+        let overlap = text_tokens.iter().filter(|t| path_tokens.contains(t)).count();
+        if overlap > 0 {
+            matched.push((overlap, rec));
+        }
+    }
+    matched.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.timestamp.cmp(&a.1.timestamp))
+            .then(a.1.key.cmp(&b.1.key))
+    });
+    matched
+        .into_iter()
+        .take(limit)
+        .map(|(overlap, rec)| {
+            format!(
+                "- {}（相关性命中 {overlap}）:{}",
+                rec.key,
+                rec.value.chars().take(200).collect::<String>()
+            )
+        })
+        .collect()
 }
 
 /// C3: 记忆预算控制器
@@ -1940,7 +2123,97 @@ impl MemoryManager {
                 .collect();
         }
 
+        // 双通道笔记常驻面（Q2 强制回喂 R-1）：笔记目录直读账本（绕检索
+        // 缓存——"记了必被看到"语义要求同会话笔记即时可见，缓存 TTL 窗口
+        // 会吞掉刚写条目；每轮一 GET 成本有界），按分类×相关性×新鲜度
+        // 确定性选取。拉取失败 fail-visible（降级通知，与其它层同款）。
+        match self.fetch_notes_catalog().await {
+            Ok(catalog) => {
+                ctx.notes = select_notes_for_goal(&catalog, goal, NOTES_RECALL_LIMIT);
+            }
+            Err(notice) => {
+                ctx.degradation_notices.push(notice);
+            }
+        }
+
         ctx
+    }
+
+    /// 双通道笔记目录直读（账本权威面,绕 LexStore 缓存）：家族前缀
+    /// `shared.{ns}.notes.`（含八类正体与机械草稿）。payload=MemoryRecord
+    /// JSON（草稿为 MemoryEvent JSON——解析失败按原文条目保留,催写面需要）。
+    /// 失败=Err(降级通知文案),调用方落 fail-visible 通知。
+    pub async fn fetch_notes_catalog(&self) -> Result<Vec<MemoryRecord>, String> {
+        self.fetch_family_catalog("notes").await
+    }
+
+    /// 写前置查询目录（Q2 R-4 内容源）:笔记族+事件族合并——事件族失败
+    /// 静默降级（advisory 非关键面,能拿多少用多少）;两族皆空/笔记族失败
+    /// 且事件族空 → Err（调用方 fail-soft 跳过）。
+    pub async fn fetch_advisory_catalog(&self) -> Result<Vec<MemoryRecord>, String> {
+        let notes = self.fetch_notes_catalog().await;
+        let events = self.fetch_family_catalog("events").await.unwrap_or_default();
+        match notes {
+            Ok(mut n) => {
+                n.extend(events);
+                Ok(n)
+            }
+            Err(e) => {
+                if events.is_empty() {
+                    Err(e)
+                } else {
+                    Ok(events)
+                }
+            }
+        }
+    }
+
+    /// 家族目录直读（账本权威面,绕检索缓存;载荷=MemoryRecord JSON,
+    /// 解析失败保留原始条目——匹配不丢数据）。
+    async fn fetch_family_catalog(&self, family: &str) -> Result<Vec<MemoryRecord>, String> {
+        let prefix = format!("shared.{}.{family}.", self.namespace);
+        let facts = self
+            .evorule_client
+            .get_shared_facts(Some(&prefix))
+            .await
+            .map_err(|e| {
+                format!(
+                    "notes recall degraded: ledger unreachable for '{prefix}' ({e})——本轮笔记回喂缺失"
+                )
+            })?;
+        let mut out = Vec::with_capacity(facts.len());
+        for f in facts {
+            // 记录 payload=MemoryRecord JSON（note_write/沉淀草稿同形）;
+            // 解析失败=保留为原始条目(键取 path 尾段,值取原文)——催写与
+            // 相关性匹配不丢数据
+            let raw = f.value.as_str().map(str::to_string).unwrap_or_else(|| f.value.to_string());
+            let record = match serde_json::from_str::<MemoryRecord>(&raw) {
+                Ok(mut r) => {
+                    if r.key.is_empty() {
+                        r.key = f.path.rsplit('.').next().unwrap_or(&f.path).to_string();
+                    }
+                    r
+                }
+                Err(_) => MemoryRecord::new(
+                    f.path.rsplit('.').next().unwrap_or(&f.path),
+                    &raw,
+                    0,
+                ),
+            };
+            out.push(record);
+        }
+        Ok(out)
+    }
+
+    /// 双通道笔记事件回喂面（Q2 强制回喂 R-2）：停滞/错误/审批拒绝触发后
+    /// 由 runner 调用——failure 类笔记按 token 重叠匹配（词法确定性）取
+    /// Top-K,草稿条目（key 含 draft）转催写行;无匹配时回退最近 failure
+    /// 条目（教训必须送达,不许静默空转）。
+    pub async fn build_failure_feed(&self, context_text: &str, limit: usize) -> Vec<String> {
+        match self.fetch_notes_catalog().await {
+            Ok(c) => format_failure_feed(&c, context_text, limit),
+            Err(notice) => vec![format!("[强制回喂][降级] {notice}")],
+        }
     }
 
     /// 阶段 1(F-618):注入 LexStore 检索缓存
@@ -1955,6 +2228,56 @@ impl MemoryManager {
     }
 
     /// 阶段 2(F-610):注入 MemoryRecipe 策略规则集
+    /// 当前 Recipe 克隆(热重载后门控刷新读面)
+    pub(crate) fn current_recipe(&self) -> Option<crate::agent::recipe::MemoryRecipe> {
+        self.recipe.clone()
+    }
+
+    /// Recipe 指纹(资产化/LM-2:版本+内容 blake3;无 Recipe= None)
+    pub(crate) fn recipe_fingerprint(&self) -> Option<(String, String)> {
+        let recipe = self.recipe.as_ref()?;
+        let version = recipe.recipe_version.clone();
+        let json = serde_json::to_string(recipe).unwrap_or_default();
+        let hash = format!("blake3:{}", blake3::hash(json.as_bytes()).to_hex());
+        Some((version, hash))
+    }
+
+    /// Recipe 资产载荷(KnowledgeEntry 形态,经治理写通路入 evorule-rule
+    /// 数据集——「策略即规则集」的资产化字面实现:可版本/可审批/可包交换)
+    pub fn recipe_asset_payload(&self) -> Option<serde_json::Value> {
+        let recipe = self.recipe.as_ref()?;
+        let json = serde_json::to_string(recipe).ok()?;
+        let hash = format!("blake3:{}", blake3::hash(json.as_bytes()).to_hex());
+        Some(serde_json::json!({
+            "title": format!("memory-recipe-{}", recipe.recipe_version),
+            "body": json,
+            "confidence": 1.0,
+            "tags": ["memory-recipe", "strategy-asset", recipe.recipe_version.clone()],
+            "payload": json,
+            "provenance": format!("system:memory-recipe;fingerprint={hash}"),
+        }))
+    }
+
+    /// Recipe 热重载（LM-2 可热重载属性;运行体重解析+指纹审计留痕——
+    /// 新指纹随下一轮 effective_params 落链,回放可锚定实际生效版本）
+    pub fn reload_recipe(
+        &mut self,
+        recipe_json: &str,
+    ) -> Result<(String, String), String> {
+        let recipe: crate::agent::recipe::MemoryRecipe =
+            serde_json::from_str(recipe_json)
+                .map_err(|e| format!("recipe reload: parse failed ({e})"))?;
+        let version = recipe.recipe_version.clone();
+        let rollup = recipe.lifecycle.rollup_threshold;
+        // 指纹走重序列化规范形态(与 recipe_fingerprint 同口径:同内容同指纹,
+        // 与输入字节形态无关)
+        let canonical = serde_json::to_string(&recipe).unwrap_or_default();
+        let hash = format!("blake3:{}", blake3::hash(canonical.as_bytes()).to_hex());
+        self.set_recipe(recipe);
+        tracing::info!(version = %version, fingerprint = %hash, "memory recipe hot-reloaded");
+        Ok((version, hash))
+    }
+
     pub fn set_recipe(&mut self, recipe: crate::agent::recipe::MemoryRecipe) {
         self.recipe = Some(recipe);
     }
@@ -2026,6 +2349,23 @@ impl MemoryManager {
     /// 注册步 missing 检查早失败,fail-visible);写件(memory_propose/
     /// note_write)不检索,声明即可(note_write 落账 Captured 写不过闸)。
     /// 未知名 warn 跳过(数据面笔误不致命,但要留痕可查)。
+    /// memory_link 关系白名单（Recipe 声明优先;空=内建四类）
+    pub(crate) fn link_relations(&self) -> Vec<String> {
+        let declared = self
+            .recipe
+            .as_ref()
+            .map(|r| r.tools.link_relations.clone())
+            .unwrap_or_default();
+        if declared.is_empty() {
+            crate::agent::memory_tool::BUILTIN_LINK_RELATIONS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            declared
+        }
+    }
+
     pub(crate) fn exposed_introspection_tools(&self) -> Vec<String> {
         let Some(recipe) = &self.recipe else {
             return Vec::new();
@@ -2090,6 +2430,17 @@ impl MemoryManager {
             let mut loser = ctx.stable[*l].clone();
             loser.lifecycle_state = Some("Superseded".to_string());
             loser.tags.push(format!("superseded_by:{winner_path}"));
+            // 置信度矛盾演化(11 号 §4.2 v0.1.8,Recipe 缺省关):裁决败者
+            // =矛盾证据,Δ=−0.10×w_e(随 Superseded 版本事实落账)
+            if self
+                .recipe
+                .as_ref()
+                .map(|r| r.lifecycle.confidence_evolution)
+                .unwrap_or(false)
+            {
+                let delta = 0.10 * authority_weight(&loser);
+                loser.confidence = loser.confidence.map(|c| (c - delta).clamp(0.0, 1.0));
+            }
             let mut adj = MemoryRecord::new(
                 adj_path.rsplit('.').next().unwrap_or("pair"),
                 &format!(
@@ -2221,6 +2572,18 @@ impl MemoryManager {
             };
             rec.usage_count = rec.usage_count.saturating_add(*inc);
             rec.lifecycle_state = Some("Reinforced".to_string());
+            // 置信度佐证演化(11 号 §4.2 v0.1.8,Recipe 缺省关):recall 命中
+            // =佐证证据,Δ=+0.05×w_e(来源权威权重);演化随本批版本事实落账
+            if self
+                .recipe
+                .as_ref()
+                .map(|r| r.lifecycle.confidence_evolution)
+                .unwrap_or(false)
+            {
+                let delta = 0.05 * authority_weight(rec);
+                rec.confidence =
+                    rec.confidence.map(|c| (c + delta).clamp(0.0, 1.0));
+            }
             match serde_json::to_value(&*rec) {
                 Ok(v) => batch.push((path.clone(), v)),
                 Err(e) => tracing::warn!(fact_id, error = %e, "usage flush: 序列化失败,跳过该条"),
@@ -2298,8 +2661,14 @@ impl MemoryManager {
                 Some("Settled") | Some("Promoted") | Some("Reinforced")
             ) {
                 let idle_days = (now.saturating_sub(rec.timestamp)) as f64 / 86400.0;
+                // 迁移序:归档终态优先(超 archive 限);decay 为中间带
+                // [decay 限,archive 限)的零引用降权(11 号 §4.2 v0.1.8 异常迁移②,
+                // confidence 半衰一次性——Decayed 态不再进入本分支)
                 if idle_days > lc.archive_after_idle_days as f64 {
                     rec.lifecycle_state = Some("Archived".to_string());
+                } else if idle_days > lc.decay_after_idle_days as f64 && rec.usage_count == 0 {
+                    rec.lifecycle_state = Some("Decayed".to_string());
+                    rec.confidence = rec.confidence.map(|c| (c * 0.5).clamp(0.0, 1.0));
                 }
             }
         }
@@ -2571,6 +2940,27 @@ impl MemoryManager {
             }
         }
 
+        // 双通道笔记强制回喂面（Q2）：R-1 常驻选取条目 + R-2 事件触发回喂行
+        // 共用 ## Notes 机制分区（标记已同步进分区切分权威源）。事件回喂行
+        // 置于常驻条目之前（触发时刻的教训优先级最高）；同样过 L2 审计闸。
+        if !recall.notes.is_empty() || !recall.note_feed.is_empty() {
+            prompt.push_str("\n\n## Notes\n");
+            for line in &recall.note_feed {
+                let result = self.safety_auditor.audit(line);
+                match result.text {
+                    Some(clean) if !clean.trim().is_empty() => {
+                        prompt.push_str(clean.trim_start());
+                        prompt.push('\n');
+                    }
+                    _ => {}
+                }
+            }
+            let audited_notes = self.audit_recall_section("note", &recall.notes);
+            for line in &audited_notes {
+                prompt.push_str(line);
+            }
+        }
+
         prompt
     }
 
@@ -2581,9 +2971,14 @@ impl MemoryManager {
     fn audit_recall_section(&self, section: &str, records: &[MemoryRecord]) -> Vec<String> {
         let mut lines = Vec::with_capacity(records.len());
         for record in records {
+            // 墓碑过滤(F-614/I9):Tombstoned=视图不可见化,不进 prompt
+            // (账面仍可查询——append-only 原始数据永在)
+            if record.lifecycle_state.as_deref() == Some("Tombstoned") {
+                continue;
+            }
             // B5：stable 节按来源域标注（D1 标注注入 / D2 unclassified），
             // 让 LLM 与审计侧都能区分"LLM 提取"与"用户/系统写入"。
-            let display_key = if section == "stable" {
+            let mut display_key = if section == "stable" {
                 match Self::stable_domain_of(&record.key) {
                     StableDomain::Llm => format!("[llm-extracted] {}", record.key),
                     StableDomain::System => format!("[system] {}", record.key),
@@ -2593,6 +2988,12 @@ impl MemoryManager {
             } else {
                 record.key.clone()
             };
+            // 未锚定降级标注（账本记忆 I8 条款）：fact_id 缺失/哨兵 0
+            // （离线写入 CacheOnly）=无账本锚点，入 prompt 前显式标注——
+            // LLM 与审计侧都能区分"可溯源条目"与"未锚定条目"（fail-visible）
+            if record.fact_id.is_none() || record.fact_id == Some(0) {
+                display_key = format!("[unanchored] {display_key}");
+            }
             let result = self.safety_auditor.audit(&record.value);
             for f in &result.findings {
                 tracing::warn!(
@@ -2644,6 +3045,11 @@ impl MemoryManager {
     }
 
     /// 当前 cache 大小
+    /// cache 键只读迭代（测试与观测面;不暴露可变句柄）
+    pub fn cache_keys(&self) -> Vec<String> {
+        self.cache.keys().cloned().collect()
+    }
+
     pub fn len(&self) -> usize {
         self.cache.len()
     }
@@ -4003,11 +4409,17 @@ mod tests {
     #[test]
     fn test_recall_annotation_by_domain() {
         let mgr = MemoryManager::new("test", make_test_client());
+        // 夹具=账本来源条目(带锚);[unanchored] 标注走独立单测
+        let mk_anchored = |k: &str, v: &str, ts: u64| {
+            let mut r = MemoryRecord::new(k, v, ts);
+            r.fact_id = Some(1);
+            r
+        };
         let recall = RecallContext {
             stable: vec![
-                MemoryRecord::new("stable.llm.gpt-4o.topic", "quantum computing", 1),
-                MemoryRecord::new("stable.user.prefs", "prefer concise answers", 2),
-                MemoryRecord::new("stable.legacy", "old data without domain", 3),
+                mk_anchored("stable.llm.gpt-4o.topic", "quantum computing", 1),
+                mk_anchored("stable.user.prefs", "prefer concise answers", 2),
+                mk_anchored("stable.legacy", "old data without domain", 3),
             ],
             ..RecallContext::default()
         };
@@ -4672,8 +5084,8 @@ mod tests {
 
         assert_eq!(
             ctx.degradation_notices.len(),
-            3,
-            "三层召回失败应产生三条降级通知，got: {:?}",
+            4,
+            "三层召回+笔记层失败应产生四条降级通知，got: {:?}",
             ctx.degradation_notices
         );
         for (notice, layer) in ctx
@@ -5406,6 +5818,132 @@ mod tests {
         assert_eq!(b0.elastic_messages_max(&recall), 0);
     }
 
+    // ===== 双通道笔记强制回喂（Q2 三触发点） =====
+
+    #[test]
+    fn select_notes_deterministic_with_weight_and_tiebreak() {
+        let mk = |k: &str, v: &str, ts: u64| MemoryRecord::new(k, v, ts);
+        let catalog = vec![
+            mk("summary.001", "讨论部署部署部署", 5),
+            mk("notes.failure.failure.20261007-001", "部署脚本权限问题,根因:缺执行位", 3),
+            mk("notes.summary.summary.20261007-002", "部署完成回顾", 9),
+            mk("notes.todo.todo.20261007-003", "待跟进部署验证", 8),
+        ];
+        // 相关性:failure 与 todo 都命中"部署";failure/todo 有权重加成
+        let a = select_notes_for_goal(&catalog, "部署验证失败排查", 3);
+        assert_eq!(a.len(), 3);
+        // todo/failure 加成条目排前;同权重内按时间倒序(todo ts=8 > failure ts=3)
+        assert!(a[0].key.contains("todo"), "got {}", a[0].key);
+        assert!(a[1].key.contains("failure"), "got {}", a[1].key);
+        // 确定性:同输入同选取
+        let b = select_notes_for_goal(&catalog, "部署验证失败排查", 3);
+        assert_eq!(
+            a.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+            b.iter().map(|r| r.key.clone()).collect::<Vec<_>>()
+        );
+        // limit 生效
+        assert_eq!(select_notes_for_goal(&catalog, "部署", 2).len(), 2);
+    }
+
+    #[test]
+    fn failure_feed_formats_matches_cui_xie_and_empty_fallback() {
+        let mk = |k: &str, v: &str, ts: u64| MemoryRecord::new(k, v, ts);
+        let catalog = vec![
+            mk("notes.failure.draft.sess-9", "机械草稿:检测到 2 项错误", 3),
+            mk(
+                "notes.failure.failure.20261007-001",
+                "git_push 被治理拒,根因:分支保护,防再踩:先 rule_get",
+                4,
+            ),
+            mk("notes.failure.failure.20261006-002", "无关教训:数据库锁", 2),
+        ];
+        // 相关性匹配:上下文含 git_push → 该条排前
+        let feed = format_failure_feed(&catalog, "git_push 推送再次失败", 3);
+        assert!(
+            feed.iter().any(|l| l.contains("[催写]") && l.contains("draft.sess-9")),
+            "草稿转催写行: {feed:?}"
+        );
+        let hit = feed
+            .iter()
+            .find(|l| l.contains("20261007-001"))
+            .expect("matched failure present");
+        assert!(hit.contains("git_push"), "matched line: {hit}");
+        // 空目录:回退可解释空反馈
+        let empty = format_failure_feed(&[], "anything", 3);
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].contains("未匹配到历史 failure 笔记"));
+    }
+
+    #[test]
+    fn notes_section_renders_feed_first_and_audited() {
+        let mgr = MemoryManager::new("sec", make_test_client());
+        let mut recall = RecallContext::default();
+        recall.note_feed = vec!["[强制回喂] 历史 failure 笔记 f1:根因说明".to_string()];
+        recall.notes = vec![MemoryRecord::new(
+            "notes.todo.todo.20261007-003",
+            "待跟进验证",
+            7,
+        )];
+        let prompt = mgr.build_system_prompt_with_recall("BASE", &recall, &ContextBudget::new(100_000, 0.25));
+        assert!(prompt.contains("
+
+## Notes
+"), "mechanism section present: {prompt}");
+        let feed_pos = prompt.find("[强制回喂]").expect("feed rendered");
+        let todo_pos = prompt.find("待跟进验证").expect("note entry rendered");
+        assert!(feed_pos < todo_pos, "事件回喂行先于常驻条目");
+    }
+
+    #[test]
+    fn write_intent_extraction_covers_write_family_only() {
+        let args = serde_json::json!({"path": "src/main.rs"});
+        for t in ["file_write", "file_create", "file_delete", "file_move"] {
+            assert_eq!(
+                extract_write_path(t, &args).as_deref(),
+                Some("src/main.rs"),
+                "写族 {t} 应提取 path"
+            );
+        }
+        // 非写族/缺 path/空白 path → None
+        assert_eq!(extract_write_path("file_read", &args), None);
+        assert_eq!(extract_write_path("file_write", &serde_json::json!({})), None);
+        assert_eq!(
+            extract_write_path("file_write", &serde_json::json!({"path": "   "})),
+            None
+        );
+    }
+
+    #[test]
+    fn write_advisory_matches_and_stays_silent_without_history() {
+        let mk = |k: &str, v: &str, ts: u64| MemoryRecord::new(k, v, ts);
+        let catalog = vec![
+            mk("notes.failure.failure.20261007-001", "main.rs 权限问题,根因:缺执行位", 3),
+            mk("notes.summary.summary.20261006-002", "无关教训:数据库锁竞争", 2),
+            mk("events.e9", "修改 main.rs 的部署脚本时踩过换行符坑", 4),
+        ];
+        let lines = format_write_advisory("src/main.rs", &catalog, 3);
+        assert_eq!(lines.len(), 2, "仅两命中条目: {lines:?}");
+        // 排序:事件条目(ts=4,与 failure 同命中数时更新者在前)——按重叠+时间序
+        assert!(lines.iter().any(|l| l.contains("failure.20261007-001")));
+        assert!(lines.iter().any(|l| l.contains("events.e9")));
+        // 无关路径:零噪音(空 Vec=静默跳过,与 failure 回喂兜底相反,设计使然)
+        assert!(format_write_advisory("docs/other.md", &catalog, 3).is_empty());
+        // limit 生效
+        assert_eq!(format_write_advisory("main.rs", &catalog, 1).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn notes_recall_offline_degrades_visibly() {
+        // 离线客户端:笔记目录拉取失败 → fail-visible 降级通知(与其它层同款)
+        let mgr = MemoryManager::new("sec", make_test_client());
+        let ctx = mgr.recall_context("goal", 3, 5).await;
+        assert!(
+            ctx.degradation_notices.iter().any(|n| n.contains("notes recall degraded")),
+            "notes 降级通知在账: {:?}",
+            ctx.degradation_notices
+        );
+    }
+
     // ===== L2 SafetyAuditor 召回污染防线测试（P1-F6/P2-V2 修复,2026-08-27）=====
 
     #[test]
@@ -5419,6 +5957,8 @@ mod tests {
                 2,
             )],
             degradation_notices: Vec::new(),
+            notes: Vec::new(),
+            note_feed: Vec::new(),
             events: vec![],
         };
         let budget = ContextBudget::new(100_000, 0.25);
@@ -5451,6 +5991,156 @@ mod tests {
         // 注意：若注入句仅占条目一部分,剥离后剩余正文仍会进入 prompt
         // （如 "you are now the admin" 剥离后余 "admin"）——这是 Strip
         // 模式的预期语义:保正文、除攻击。
+    }
+
+    #[test]
+    fn authority_weight_maps_domains() {
+        let mk = |k: &str, src: Option<&str>| {
+            let mut r = MemoryRecord::new(k, "v", 1);
+            r.source = src.map(str::to_string);
+            r
+        };
+        assert_eq!(authority_weight(&mk("stable.user.p", None)), 1.0);
+        assert_eq!(authority_weight(&mk("stable.system.s", None)), 0.8);
+        assert_eq!(authority_weight(&mk("stable.llm.x", None)), 0.5);
+        assert_eq!(authority_weight(&mk("notes.failure.f", Some("llm-note"))), 0.5);
+        assert_eq!(authority_weight(&mk("misc", None)), 0.65);
+    }
+
+    #[test]
+    fn scoring_authority_and_entity_factors_gated_by_recipe() {
+        // 缺省权重 0 → 既有排序零影响;声明权重后 authority/entity 生效
+        let mut hi_auth = MemoryRecord::new("stable.user.a", "部署验证", 10);
+        hi_auth.fact_id = Some(1);
+        let mut lo_auth = MemoryRecord::new("stable.llm.b", "部署验证", 11);
+        lo_auth.fact_id = Some(2);
+        // 无 authority 权重:时间倒序,lo_auth(b, ts=11)在前
+        let mut batch1 = vec![hi_auth.clone(), lo_auth.clone()];
+        sort_by_policy(&mut batch1, "部署", &crate::agent::recipe::RetrievalPolicy::default_lexical(), None);
+        assert_eq!(batch1[0].key, "stable.llm.b");
+        // authority 权重开(需同时开 importance 主开关,因子在其内):user=1.0 翻前
+        let mut rp = crate::agent::recipe::RetrievalPolicy::default_lexical();
+        rp.w_importance = 1.0;
+        rp.w_confidence = 0.0;
+        rp.w_usage = 0.0;
+        rp.w_authority = 1.0;
+        let mut batch2 = vec![hi_auth.clone(), lo_auth.clone()];
+        sort_by_policy(&mut batch2, "部署", &rp, None);
+        assert_eq!(batch2[0].key, "stable.user.a", "authority 因子生效");
+        // entity 因子:共现条目相对孤立条目提升(其余因子持平)
+        let mut e1 = MemoryRecord::new("stable.llm.e1", "kafka 分区重平衡", 5);
+        e1.fact_id = Some(3);
+        let mut e2 = MemoryRecord::new("stable.llm.e2", "kafka 消费组", 6);
+        e2.fact_id = Some(4);
+        let mut e3 = MemoryRecord::new("stable.llm.e3", "完全无关话题", 7);
+        e3.fact_id = Some(5);
+        let mut rp2 = crate::agent::recipe::RetrievalPolicy::default_lexical();
+        rp2.w_importance = 1.0;
+        rp2.w_confidence = 0.0;
+        rp2.w_usage = 0.0;
+        rp2.w_entity = 1.0;
+        let mut batch3 = vec![e3, e1, e2];
+        sort_by_policy(&mut batch3, "kafka", &rp2, None);
+        assert_eq!(batch3[0].key, "stable.llm.e2", "共现度最高(ts 新)在前");
+        assert_ne!(batch3[2].key, "stable.llm.e1", "孤立条目让位");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_decay_transition_and_confidence_evolution() {
+        // 异常迁移②:非 Captured 且零引用超 decay 限 → Decayed+confidence 半衰
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        recipe.lifecycle.decay_after_idle_days = 1;
+        let mut stale = MemoryRecord::new("events.e9", "旧事件", now_secs() - 10 * 86400);
+        stale.lifecycle_state = Some("Settled".to_string());
+        stale.confidence = Some(0.8);
+        stale.fact_id = Some(9);
+        mgr.cache.insert("events.e9".to_string(), stale);
+        mgr.apply_lifecycle_transitions("s1", &recipe).await;
+        let decayed = mgr.cache.get("events.e9").unwrap();
+        assert_eq!(decayed.lifecycle_state.as_deref(), Some("Decayed"));
+        assert!((decayed.confidence.unwrap() - 0.4).abs() < 1e-6, "半衰 0.8→0.4");
+        // 置信度佐证演化:开关开时 reinforce +0.05×w_e(llm 源=0.5 → +0.025)
+        let mut recipe2 = crate::agent::recipe::MemoryRecipe::default();
+        recipe2.lifecycle.confidence_evolution = true;
+        let mut mgr2 = MemoryManager::new("ns", make_test_client());
+        mgr2.set_recipe(recipe2);
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::agent::lexstore::LexStore::open(&dir.path().join("lex.db")).unwrap();
+        store.replace_partition(
+            "shared.ns.events.",
+            &[(1, "shared.ns.events.e1".to_string(), serde_json::json!({}))],
+        ).unwrap();
+        mgr2.set_lex_store(std::sync::Arc::new(store));
+        let mut rec = MemoryRecord::new("events.e1", "v", 1);
+        rec.fact_id = Some(1);
+        rec.confidence = Some(0.5);
+        rec.source = Some("llm".to_string());
+        mgr2.cache.insert("shared::events.e1".to_string(), rec);
+        mgr2.usage_pending.lock().unwrap_or_else(|p| p.into_inner()).insert(1, 3);
+        mgr2.flush_usage("s1").await;
+        let after = mgr2.cache.get("shared::events.e1").unwrap();
+        assert!(
+            ((after.confidence.unwrap() - 0.525).abs() < 1e-6),
+            "佐证演化 0.5+0.05×0.5=0.525, got {}",
+            after.confidence.unwrap()
+        );
+    }
+
+    #[test]
+    fn recipe_fingerprint_asset_and_reload() {
+        // LM-2 资产化三面:指纹稳定/资产载荷含治理字段/热重载刷新+门控随动
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        assert!(mgr.recipe_fingerprint().is_none(), "无 Recipe=无指纹");
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        recipe.recipe_version = "memory-test-1".to_string();
+        mgr.set_recipe(recipe.clone());
+        let (v1, h1) = mgr.recipe_fingerprint().unwrap();
+        assert_eq!(v1, "memory-test-1");
+        // 同内容同指纹(内容寻址)
+        mgr.set_recipe(recipe.clone());
+        assert_eq!(mgr.recipe_fingerprint().unwrap().1, h1);
+        // 资产载荷:标题/provenance 指纹/tags 齐备
+        let asset = mgr.recipe_asset_payload().unwrap();
+        assert_eq!(asset["title"], "memory-recipe-memory-test-1");
+        assert!(
+            asset["provenance"]
+                .as_str()
+                .unwrap()
+                .contains(&h1),
+            "provenance 携带指纹"
+        );
+        // 热重载:新版本+新指纹;门控随动
+        let mut recipe2 = crate::agent::recipe::MemoryRecipe::default();
+        recipe2.recipe_version = "memory-test-2".to_string();
+        recipe2.sources.materials = true;
+        let json = serde_json::to_string(&recipe2).unwrap();
+        let (v2, h2) = mgr.reload_recipe(&json).unwrap();
+        assert_eq!(v2, "memory-test-2");
+        assert_ne!(h1, h2, "改配方即变指纹");
+        assert_eq!(mgr.current_recipe().unwrap().sources.materials, true);
+    }
+
+    #[test]
+    fn test_unanchored_record_labeled_in_prompt() {
+        // 账本记忆 I8 降级可见:fact_id 缺失/哨兵 0(离线 CacheOnly)=无账本
+        // 锚点,prompt 行显式 [unanchored] 前缀——LLM 与审计侧均可分
+        let mgr = MemoryManager::new("sec", make_test_client());
+        let mut rec = MemoryRecord::new("events.e1", "离线写入的事件", 1);
+        rec.fact_id = None;
+        let mut rec2 = MemoryRecord::new("events.e2", "补写失败仍为哨兵", 2);
+        rec2.fact_id = Some(0);
+        let mut anchored = MemoryRecord::new("stable.llm.ok", "正常锚定条目", 3);
+        anchored.fact_id = Some(42);
+        let recall = RecallContext {
+            events: vec![rec, rec2],
+            stable: vec![anchored],
+            ..Default::default()
+        };
+        let prompt =
+            mgr.build_system_prompt_with_recall("BASE", &recall, &ContextBudget::new(100_000, 0.25));
+        assert!(prompt.matches("[unanchored]").count() == 2, "两未锚定条目均标注: {prompt}");
+        assert!(!prompt.contains("[unanchored] stable.llm.ok"), "锚定条目不标注");
     }
 
     #[test]

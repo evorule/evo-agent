@@ -573,6 +573,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                 events_count,
                 rollup_done,
                 knowledge_candidates,
+                ..
             } => {
                 // 沉淀边界——context_management 系统步（四项持久化结果可对账）
                 if let Some(a) = acc.take() {

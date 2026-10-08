@@ -594,6 +594,59 @@ impl LexStore {
 
 #[cfg(test)]
 mod tests {
+
+    // ===== F-620 一致性演练(I12 重建/I14 注错) =====
+
+    #[test]
+    fn i12_rebuild_from_ledger_replay_restores_index_byte_identical() {
+        // 删库重放演练:同账本事实切片两次 replace_partition 重建,检索
+        // 原语结果逐字节一致(索引=账本确定性视图的机器证明)
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rebuild.db");
+        let facts: Vec<(u64, String, serde_json::Value)> = vec![
+            (1, "shared.ns.stable.a".into(), serde_json::json!("kafka 分区重平衡策略")),
+            (2, "shared.ns.stable.b".into(), serde_json::json!("部署脚本权限修正")),
+            (3, "shared.ns.events.e1".into(), serde_json::json!("kafka 消费组迁移事件")),
+        ];
+        let query = "kafka";
+        let run = || -> Vec<String> {
+            let store = LexStore::open(&db).unwrap();
+            store.replace_partition("shared.ns.stable.", &facts[0..2]).unwrap();
+            store.replace_partition("shared.ns.events.", &facts[2..]).unwrap();
+            let mut out = store
+                .lookup_candidates_typed(
+                    &["shared.ns.stable.".to_string(), "shared.ns.events.".to_string()],
+                    query,
+                    10,
+                    &[],
+                )
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id.to_string())
+                .collect::<Vec<_>>();
+            out.sort();
+            out
+        };
+        let first = run();
+        assert!(!first.is_empty());
+        // 删库(连文件一起),重放同账本切片重建
+        std::fs::remove_file(&db).unwrap();
+        let second = run();
+        assert_eq!(first, second, "重建后检索结果逐字节复原");
+    }
+
+    #[test]
+    fn i14_corruption_fails_visible_not_silent() {
+        // 注错演练:库文件损坏 → open fail-visible(调用方降级全量路径的
+        // 前提是打开失败显式可见,不静默产出半库)
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("corrupt.db");
+        std::fs::write(&db, b"this is not sqlite\x00\xff garbage").unwrap();
+        assert!(
+            LexStore::open(&db).is_err(),
+            "损坏库必须显式打开失败(降级可见性的前提)"
+        );
+    }
     use super::*;
 
     fn temp_db(tag: &str) -> std::path::PathBuf {

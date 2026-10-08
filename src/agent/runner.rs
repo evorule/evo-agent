@@ -916,6 +916,11 @@ pub struct AgentRunner {
     /// 语义精判开关(true=默认:候选触发 sidecar 裁决;false=回退纯字面级,
     /// 逐字节兼容旧行为)
     semantic_i2_enabled: bool,
+    /// 双通道笔记强制回喂 R-2 触发闩(停滞 Warning/Exhausted、工具错误、
+    /// 审批拒绝置位;下一轮 recall 消费——failure 笔记回喂进 S3,消费后复位)
+    pending_note_feed: bool,
+    /// 写前置查询会话级路径去重(同路径重复写不再重复建议;R-4)
+    advised_paths: std::sync::Mutex<std::collections::HashSet<String>>,
     /// 摘要保真对照(规格修正批交付物 B):当前会话 journal 写者(流式路径
     /// 注入;CLI run 纯路径无 journal=只 warn 不落账)。G10 摘要替换时
     /// 自动对照落 summary_fidelity_scan 事件。
@@ -1008,6 +1013,8 @@ impl AgentRunner {
             assembly_scope_focus: false,
             i2_verdict_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             semantic_i2_enabled: true,
+            pending_note_feed: false,
+            advised_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
             active_journal: None,
             accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
             chain: None,
@@ -1220,16 +1227,21 @@ impl AgentRunner {
                 Ok(recipe) => {
                     let rollup = recipe.lifecycle.rollup_threshold;
                     let journal_digest = recipe.sources.journal_digest;
-                    let failure_drafts = recipe.sources.journal_digest;
+                    // 修复:failure_drafts 此前误接 journal_digest（复制粘贴错,
+                    // 草稿面从未被 Recipe 独立声明控制过）
+                    let failure_drafts = recipe.sources.failure_drafts;
+                    let material_harvest = recipe.sources.materials;
+                    let recipe_for_mem = recipe.clone();
                     if let Some(mem) = runner.memory.as_mut() {
-                        mem.set_recipe(recipe);
+                        mem.set_recipe(recipe_for_mem);
                     }
                     // Recipe.rollup_threshold 覆盖同名 def 配置（策略数据化）
                     runner.sediment_config.summary_rollup_threshold = rollup;
-                    // Recipe.sources.journal_digest 穿线（跨源注册规格策略面；
+                    // Recipe.sources 三源穿线（跨源注册规格策略面；
                     // 缺省关=既有 agent 零影响）
                     runner.sediment_config.enable_journal_digest = journal_digest;
                     runner.sediment_config.enable_failure_drafts = failure_drafts;
+                    runner.sediment_config.enable_material_harvest = material_harvest;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "MemoryRecipe 解析失败——召回走词法 legacy 路径");
@@ -1276,6 +1288,7 @@ impl AgentRunner {
             enable_consolidation: true,
             // 阶段 5 NB-2:双通道笔记事件驱动草稿(缺省关;Recipe sources 穿线于上)
             enable_failure_drafts: false,
+            enable_material_harvest: false,
         };
         // 阶段 3(F-611)+A2-2:自省记忆工具注册(声明面已在 step 2 按暴露条件
         // 预放行;此处声明了而条件不满足=配置矛盾,早失败)。置于 sediment_config
@@ -1449,6 +1462,89 @@ impl AgentRunner {
     pub fn with_semantic_i2(mut self, enabled: bool) -> Self {
         self.semantic_i2_enabled = enabled;
         self
+    }
+
+    /// Recipe 热重载（LM-2 可热重载属性;运行体重解析+指纹审计）:
+    /// 重解析→memory.set_recipe→sediment 门控随新 Recipe 刷新;新指纹随
+    /// 下一轮 effective_params 落链（回放可锚定）。
+    pub fn reload_memory_recipe(&mut self, recipe_json: &str) -> Result<(String, String), String> {
+        let (version, hash) = self
+            .memory
+            .as_mut()
+            .ok_or_else(|| "memory not enabled".to_string())?
+            .reload_recipe(recipe_json)?;
+        // sediment 门控随新 Recipe 刷新(三源穿线与 from_definition 同口径)
+        if let Some(mem) = self.memory.as_ref() {
+            if let Some(recipe) = mem.current_recipe() {
+                self.sediment_config.enable_journal_digest = recipe.sources.journal_digest;
+                self.sediment_config.enable_failure_drafts = recipe.sources.failure_drafts;
+                self.sediment_config.enable_material_harvest = recipe.sources.materials;
+                self.sediment_config.summary_rollup_threshold = recipe.lifecycle.rollup_threshold;
+            }
+        }
+        info!(version = %version, fingerprint = %hash, "memory recipe reloaded on runner");
+        Ok((version, hash))
+    }
+
+    /// Recipe 资产提案（LM-2 治理层接入:经治理写通路把当前 Recipe 作为
+    /// KnowledgeEntry 入 evorule-rule 数据集——可版本/可审批/可包交换;
+    /// offline/无 Recipe/无 dataset 如实报错,不静默）
+    pub async fn propose_memory_recipe_asset(
+        &self,
+        dataset_id: &str,
+        session_id: &str,
+    ) -> Result<Value, String> {
+        let payload = self
+            .memory
+            .as_ref()
+            .and_then(|m| m.recipe_asset_payload())
+            .ok_or_else(|| "memory recipe not configured".to_string())?;
+        let (version, fingerprint) = self
+            .memory
+            .as_ref()
+            .and_then(|m| m.recipe_fingerprint())
+            .ok_or_else(|| "memory recipe fingerprint unavailable".to_string())?;
+        let cause =
+            format!("memory recipe asset proposal; version={version}; fingerprint={fingerprint}");
+        let receipt = self
+            .evorule_client
+            .propose_knowledge_entry(dataset_id, &payload, &cause, Some(session_id))
+            .await
+            .map_err(|e| format!("recipe asset proposal failed: {e}"))?;
+        info!(version = %version, %fingerprint, "memory recipe asset proposed");
+        Ok(receipt)
+    }
+
+    /// 写前置查询（Q2 第四触发点 R-4）:写族意图→目标路径历史 advisory。
+    /// fail-soft 静默（拉取失败/无记忆面/无匹配/同路径已建议→None,写入
+    /// 不受影响——可用性优先于回喂,与 R-1 fail-visible 取向相反是设计使然）
+    pub(crate) async fn write_intent_advisory(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        let path = crate::agent::memory::extract_write_path(tool_name, args)?;
+        {
+            let mut seen = self.advised_paths.lock().unwrap_or_else(|p| p.into_inner());
+            if !seen.insert(path.clone()) {
+                return None; // 同路径本会话已建议过（降噪）
+            }
+        }
+        let mem = self.memory.as_ref()?;
+        let catalog = mem.fetch_advisory_catalog().await.ok()?;
+        let lines = crate::agent::memory::format_write_advisory(&path, &catalog, 3);
+        if lines.is_empty() {
+            return None;
+        }
+        info!(tool = %tool_name, %path, hits = lines.len(), "write-intent advisory attached");
+        Some(format!(
+            "⚠ 写入目标 {path} 的历史记录（写前置查询回喂）:
+{}",
+            lines.join(
+                "
+"
+            )
+        ))
     }
 
     /// 装配面聚焦（delegate 子代理装配路径）
@@ -1866,6 +1962,33 @@ impl AgentRunner {
     ///
     /// `memory` / `summarizer` / `extractor` 是 `AgentRunner` 的不同字段，
     /// Rust 允许同时借用不同字段（disjoint borrows），不会冲突。
+    /// 空闲巩固入口（sleep-time 触发变体转正,11 号 §六）:会话间隙外的
+    /// 空闲窗口可由调度器(运维/CLI/后续产品化)调用——仅重跑巩固阶段
+    /// (跨会话候选确定性聚类→sidecar 合并提议→Consolidated 落账),
+    /// 门控仍随 Recipe(consolidation 缺省开;无审计通路内部自动跳过)。
+    /// 返回本次巩固候选数(离线/不可用=如实 Err)。
+    pub async fn idle_consolidation(&mut self, session_id: &str) -> Result<usize, String> {
+        let memory = self.memory.as_mut().ok_or("memory not enabled")?;
+        memory.flush_usage(session_id).await;
+        let mut deps = sediment::SedimentDeps {
+            memory,
+            summarizer: self.summarizer.as_ref(),
+            extractor: self.extractor.as_mut(),
+            event_store: self.memory_event_store.as_mut(),
+            auditor: self.summarizer.as_ref().and_then(|s| s.auditor()),
+            journal_lines: Vec::new(),
+        };
+        let mut result = sediment::SedimentResult::default();
+        sediment::consolidate_knowledge_candidates(
+            &mut deps,
+            &self.sediment_config,
+            session_id,
+            &mut result,
+        )
+        .await;
+        Ok(result.knowledge_consolidated.len())
+    }
+
     async fn sediment_session(
         &mut self,
         session_id: &str,
@@ -1906,6 +2029,7 @@ impl AgentRunner {
                     result.events.len(),
                     result.rollup_done,
                     result.knowledge_candidates.len(),
+                    result.flushed_events,
                 ) {
                     warn!(%session_id, error = %e, "sediment_performed journal failed");
                 }
@@ -2569,39 +2693,81 @@ impl AgentRunner {
     /// 后才可注册;G15 续跑幂等——已注册即跳过)。门控=Recipe.tools.expose
     /// 声明;best-effort 条件不满足=静默跳过(装配期已做一致性校验)。
     fn register_session_scoped_memory_tools(&mut self, session_id: &str) {
-        let (declared, namespace, client) = match self.memory.as_ref() {
-            Some(mem) => {
-                let exposed = mem.exposed_introspection_tools();
-                let declared = exposed
-                    .iter()
-                    .any(|n| n == crate::agent::memory_tool::NOTE_WRITE_TOOL);
-                (
-                    declared,
-                    mem.namespace().to_string(),
-                    mem.evorule_client.clone(),
-                )
-            }
-            None => return,
-        };
-        if !declared
-            || self
+        let (note_declared, link_declared, forget_declared, namespace, client, link_relations) =
+            match self.memory.as_ref() {
+                Some(mem) => {
+                    let exposed = mem.exposed_introspection_tools();
+                    let note_declared = exposed
+                        .iter()
+                        .any(|n| n == crate::agent::memory_tool::NOTE_WRITE_TOOL);
+                    let link_declared = exposed
+                        .iter()
+                        .any(|n| n == crate::agent::memory_tool::MEMORY_LINK_TOOL);
+                    let forget_declared = exposed
+                        .iter()
+                        .any(|n| n == crate::agent::memory_tool::MEMORY_FORGET_TOOL);
+                    (
+                        note_declared,
+                        link_declared,
+                        forget_declared,
+                        mem.namespace().to_string(),
+                        mem.evorule_client.clone(),
+                        mem.link_relations(),
+                    )
+                }
+                None => return,
+            };
+        if note_declared
+            && !self
                 .tool_handler
                 .has_tool(crate::agent::memory_tool::NOTE_WRITE_TOOL)
         {
-            return;
+            let exec: std::sync::Arc<dyn ToolFunction> =
+                std::sync::Arc::new(crate::agent::memory_tool::MemoryNoteWriteTool::new(
+                    namespace.clone(),
+                    client.clone(),
+                    session_id.to_string(),
+                ));
+            self.tool_handler
+                .register_static(crate::agent::memory_tool::NOTE_WRITE_TOOL, exec);
         }
-        let exec: std::sync::Arc<dyn ToolFunction> =
-            std::sync::Arc::new(crate::agent::memory_tool::MemoryNoteWriteTool::new(
-                namespace,
-                client,
-                session_id.to_string(),
-            ));
-        self.tool_handler
-            .register_static(crate::agent::memory_tool::NOTE_WRITE_TOOL, exec);
-        info!(
-            tool = crate::agent::memory_tool::NOTE_WRITE_TOOL,
-            "note_write tool registered (session-scoped)"
-        );
+        if forget_declared
+            && !self
+                .tool_handler
+                .has_tool(crate::agent::memory_tool::MEMORY_FORGET_TOOL)
+        {
+            let exec: std::sync::Arc<dyn ToolFunction> =
+                std::sync::Arc::new(crate::agent::memory_tool::MemoryForgetTool::new(
+                    namespace.clone(),
+                    client.clone(),
+                    session_id.to_string(),
+                ));
+            self.tool_handler
+                .register_static(crate::agent::memory_tool::MEMORY_FORGET_TOOL, exec);
+        }
+        if link_declared
+            && !self
+                .tool_handler
+                .has_tool(crate::agent::memory_tool::MEMORY_LINK_TOOL)
+        {
+            let exec: std::sync::Arc<dyn ToolFunction> =
+                std::sync::Arc::new(crate::agent::memory_tool::MemoryLinkTool::new(
+                    namespace.clone(),
+                    client.clone(),
+                    session_id.to_string(),
+                    link_relations.clone(),
+                ));
+            self.tool_handler
+                .register_static(crate::agent::memory_tool::MEMORY_LINK_TOOL, exec);
+        }
+        if note_declared || link_declared || forget_declared {
+            info!(
+                note = note_declared,
+                link = link_declared,
+                forget = forget_declared,
+                "memory write tools registered (session-scoped)"
+            );
+        }
     }
 
     /// 自主交接批:会话期重绑 handover 双工具(启动期占位→wired;session_id
@@ -2754,6 +2920,8 @@ impl AgentRunner {
                 session_id: Some(child_sid.to_string()),
                 message_persist_mode: message_persist_mode.clone(),
                 pending_messages: Vec::new(),
+                pending_note_feed: false,
+                advised_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
                 summary_model: summary_model.clone(),
                 context_window,
                 summarizer: summarizer.clone(),
@@ -2952,6 +3120,13 @@ impl AgentRunner {
             "assembly_recipe_version": recipe_version,
             "assembly_recipe_hash": recipe_hash,
         });
+        // LM-2 资产化:MemoryRecipe 指纹随首轮落链(有 Recipe 时)——回放可
+        // 锚定实际生效的记忆策略版本
+        if let Some((m_version, m_hash)) = self.memory.as_ref().and_then(|m| m.recipe_fingerprint())
+        {
+            params["effective_params"]["memory_recipe_version"] = serde_json::json!(m_version);
+            params["effective_params"]["memory_recipe_hash"] = serde_json::json!(m_hash);
+        }
         serde_json::json!({
             "type": "call_external",
             "params": params,
@@ -4537,7 +4712,7 @@ impl AgentRunner {
             }
 
             // C2: 召回顺序修复 —— recall 在组装之前
-            let recall = match runner.memory.as_ref() {
+            let mut recall = match runner.memory.as_ref() {
                 Some(mem) => mem.recall_context(
                     &goal,
                     runner.sediment_config.max_session_summaries,
@@ -4545,6 +4720,14 @@ impl AgentRunner {
                 ).await,
                 None => crate::agent::memory::RecallContext::default(),
             };
+            // 笔记强制回喂 R-1 消费点:上一轮 R-2 触发闩在位=failure 教训/
+            // 催写行注入本轮 S3(消费即复位;无记忆面时闩复位不回喂)
+            if runner.pending_note_feed {
+                runner.pending_note_feed = false;
+                if let Some(mem) = runner.memory.as_ref() {
+                    recall.note_feed = mem.build_failure_feed(&goal, 3).await;
+                }
+            }
             // 检索质量观测批(K-11 观测级)+ P2-1 LexStore 缓存三计数器:
             // 此处只计算暂存,落账延迟到 turn_guard 建立之后——本块执行时
             // journal 写者尚未绑定(runner.active_journal 在下方 B21 journal
@@ -5323,6 +5506,10 @@ impl AgentRunner {
                                         // 硬终止会让一次 knowledge_search 404 毁掉整个草稿回合
                                         // (两阶段:Pending 时先 yield ApprovalRequired 再等
                                         // 决策 —— 帧必须赶在 60s 审批窗口内到达前端)
+                                        // 写前置查询(Q2 R-4):写族意图→路径历史 advisory(执行前计算,随结果回喂)
+                                        let write_advisory = runner
+                                            .write_intent_advisory(&tc.name, &tc.arguments)
+                                            .await;
                                         let outcome_res = match runner
                                             .execute_tool_stage(&session_id, &tc.name, &tc.arguments, journal.as_deref())
                                             .await
@@ -5385,6 +5572,8 @@ impl AgentRunner {
                                                     error = %e,
                                                     "本地 ReAct:工具执行失败,错误作为 tool 消息回喂"
                                                 );
+                                                // 笔记强制回喂 R-2:错误触发
+                                                runner.pending_note_feed = true;
                                                 tool_calls.push(tc.name.clone());
                                                 let err_content = serde_json::json!({
                                                     "error": e.to_string(),
@@ -5442,7 +5631,11 @@ impl AgentRunner {
                                         tool_calls.push(tc.name.clone());
                                         let tool_idx = messages.len();
                                         // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
-                                        let raw_content = outcome.final_result.to_string();
+                                        let mut raw_content = outcome.final_result.to_string();
+                                        if let Some(adv) = write_advisory {
+                                            raw_content.push('\n');
+                                            raw_content.push_str(&adv);
+                                        }
                                         // 委托子会话锚落账(delegate 工具:spawn 账 drain,
                                         // 事件序 tool_invoked → delegate_spawned → tool_result)
                                         if tc.name == "delegate" {
@@ -5616,6 +5809,63 @@ impl AgentRunner {
                                         continue;
                                     }
                                 };
+                                // 笔记强制回喂 R-3 段末强制(task_done 判据门放行后):
+                                // 未完成事项(todo)+失败清单(failure 正体)+缺根因草稿
+                                // 非空 → advisory 附进工具结果(诚实分立:判据已过仍放行,
+                                // 清单随沉淀必然在账;草稿催写转正)
+                                let mut gate_note_advisory: Option<String> = None;
+                                if tool_name == "task_done" {
+                                    if let Some(mem) = runner.memory.as_ref() {
+                                        match mem.fetch_notes_catalog().await {
+                                            Ok(catalog) => {
+                                                let open: Vec<_> = catalog
+                                                    .iter()
+                                                    .filter(|r| {
+                                                        (r.key.contains("todo")
+                                                            || (r.key.contains("failure")
+                                                                && !r.key.contains("draft")))
+                                                    })
+                                                    .collect();
+                                                let drafts: Vec<_> = catalog
+                                                    .iter()
+                                                    .filter(|r| r.key.contains("draft"))
+                                                    .collect();
+                                                if !open.is_empty() || !drafts.is_empty() {
+                                                    warn!(
+                                                        %session_id,
+                                                        open = open.len(),
+                                                        drafts = drafts.len(),
+                                                        "段末强制回喂:task_done 时仍有未完成事项/未消化失败(判据放行,清单随结果回喂)"
+                                                    );
+                                                    let mut lines = vec![format!(
+                                                        "[段末强制回喂] 判据已过但账面仍有未完成事项 {} 项/缺根因草稿 {} 项(诚实分立;清单随本结果在目,草稿请补记转正):",
+                                                        open.len(),
+                                                        drafts.len()
+                                                    )];
+                                                    for r in open.iter().take(5) {
+                                                        let t: String =
+                                                            r.value.chars().take(150).collect();
+                                                        lines.push(format!("- {}: {}", r.key, t));
+                                                    }
+                                                    for d in drafts.iter().take(5) {
+                                                        lines.push(format!(
+                                                            "- [催写] {} 缺根因假设,请补记",
+                                                            d.key
+                                                        ));
+                                                    }
+                                                    gate_note_advisory = Some(lines.join("
+        "));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(%session_id, error = %e, "段末笔记清单拉取失败(fail-soft,不阻塞放行)");
+                                            }
+                                        }
+                                    }
+                                }
+                                // 写前置查询(Q2 R-4):写族意图→路径历史 advisory(执行前计算,随结果回喂)
+                                let write_advisory =
+                                    runner.write_intent_advisory(&tool_name, &args).await;
                                 let outcome_res = match runner
                                     .execute_tool_stage(&session_id, &tool_name, &args, journal.as_deref())
                                     .await
@@ -5713,6 +5963,8 @@ impl AgentRunner {
                                         StagnationVerdict::Normal => {}
                                         StagnationVerdict::Warning { repeat_count } => {
                                             warn!(%session_id, tool = %tool_name, repeat_count, "stagnation warning (F2)");
+                                            // 笔记强制回喂 R-2:停滞触发,下一轮回喂相关 failure 教训
+                                            runner.pending_note_feed = true;
                                             if let Some(obj) = fr.as_object_mut() {
                                                 obj.insert(
                                                     "stagnation".to_string(),
@@ -5722,6 +5974,7 @@ impl AgentRunner {
                                         }
                                         StagnationVerdict::Exhausted => {
                                             warn!(%session_id, tool = %tool_name, "stagnation EXHAUSTED (F2)——按 H2 阻塞收尾指引");
+                                            runner.pending_note_feed = true;
                                             if let Some(obj) = fr.as_object_mut() {
                                                 obj.insert(
                                                     "stagnation".to_string(),
@@ -5744,7 +5997,15 @@ impl AgentRunner {
                                 tool_calls.push(tool_name.clone());
                                 let tool_idx = messages.len();
                                 // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
-                                let raw_content = final_result.to_string();
+                                let mut raw_content = final_result.to_string();
+                                if let Some(adv) = gate_note_advisory.take() {
+                                    raw_content.push('\n');
+                                    raw_content.push_str(&adv);
+                                }
+                                if let Some(adv) = write_advisory {
+                                    raw_content.push('\n');
+                                    raw_content.push_str(&adv);
+                                }
                                 let tool_msg = Message::Tool {
                                     content: truncate_tool_result(
                                         raw_content.clone(),
