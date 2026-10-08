@@ -576,11 +576,18 @@ pub struct RecallContext {
     /// 分区头部）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub note_feed: Vec<String>,
+    /// 程序型记忆分区（17 号 T5/S3 第四分区 ## Skills/Procedures）：
+    /// mem_type=procedural 的非墓碑条目（近者先,确定性选取）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub procedures: Vec<MemoryRecord>,
 }
 
 /// R-1 常驻回喂的笔记选取上限（确定性选取在源头截断,不参与 ContextBudget
 /// 裁剪——与降级通知同款"小体量关键可靠性信号"口径）
 pub const NOTES_RECALL_LIMIT: usize = 5;
+
+/// 程序型记忆分区选取上限（S3 第四分区;与笔记面同款源头截断口径）
+pub const PROCEDURAL_RECALL_LIMIT: usize = 5;
 
 /// R-1 确定性选取：分类×相关性×新鲜度——token 重叠数降序 ▸ 时间戳降序 ▸
 /// key 字典序（全序 tie-break,同输入同选取）。todo/failure 类自带权重加成
@@ -2149,6 +2156,35 @@ impl MemoryManager {
             }
         }
 
+        // 程序型记忆分区（17 号 T5 裁定落地面）：LexStore 内 procedural
+        // 型非墓碑条目近者先(LexStore 缺席=无程序型注入面,静默——程序型
+        // 数据源[技能镜像/材料]本就以 LexStore 在位为前提)
+        if let Some(store) = self.lex_store.as_ref() {
+            if let Ok(rows) = store.procedural_snapshot(PROCEDURAL_RECALL_LIMIT) {
+                ctx.procedures = rows
+                    .into_iter()
+                    .map(|(path, value)| {
+                        let mut rec = MemoryRecord::new(
+                            path.rsplit('.').next().unwrap_or(&path),
+                            &value,
+                            0,
+                        );
+                        // 载荷为 MemoryRecord JSON 时还原时间戳/键
+                        if let Ok(full) = serde_json::from_str::<MemoryRecord>(&value) {
+                            rec.timestamp = full.timestamp;
+                            rec.key = if full.key.is_empty() {
+                                path.rsplit('.').next().unwrap_or(&path).to_string()
+                            } else {
+                                full.key
+                            };
+                        }
+                        rec.fact_id = None; // 快照面不带锚,渲染层 [unanchored] 标注
+                        rec
+                    })
+                    .collect();
+            }
+        }
+
         ctx
     }
 
@@ -2247,6 +2283,93 @@ impl MemoryManager {
     /// 当前 Recipe 克隆(热重载后门控刷新读面)
     pub(crate) fn current_recipe(&self) -> Option<crate::agent::recipe::MemoryRecipe> {
         self.recipe.clone()
+    }
+
+    /// 冷迁（F-617 冷热分层,Recipe.storage.cold_tier 门控缺省关）：
+    /// 热库 Archived/Tombstoned/Decayed 行事务移入 lex-cold.db;
+    /// cache 镜像同步逐出（视图不可见化与 L1 一致）。返回冷迁行数。
+    pub async fn move_cold_tier(
+        &mut self,
+        recipe: &crate::agent::recipe::MemoryRecipe,
+    ) -> Result<usize, MemoryError> {
+        if !recipe.storage.cold_tier {
+            return Ok(0);
+        }
+        let Some(store) = self.lex_store.as_ref() else {
+            return Ok(0);
+        };
+        let mut states: Vec<&str> = vec!["Archived", "Decayed"];
+        if recipe.storage.cold_include_tombstones {
+            states.push("Tombstoned");
+        }
+        let cands = store
+            .cold_candidates(&states)
+            .map_err(|e| MemoryError::EvoruleError(format!("cold candidates: {e}")))?;
+        if cands.is_empty() {
+            return Ok(0);
+        }
+        let cold_db = crate::agent::lexstore::ColdStore::open(&store.cold_path())
+            .map_err(|e| MemoryError::EvoruleError(format!("cold open: {e}")))?;
+        // cache 镜像逐出(移走前记录键)
+        for c in &cands {
+            if let Some(cache_key) = self.path_to_cache_key(&c.path) {
+                self.cache.remove(&cache_key);
+            }
+        }
+        cold_db
+            .insert_moved(&cands)
+            .map_err(|e| MemoryError::EvoruleError(format!("cold insert: {e}")))?;
+        store
+            .delete_cold_moved(&cands)
+            .map_err(|e| MemoryError::EvoruleError(format!("cold delete: {e}")))?;
+        Ok(cands.len())
+    }
+
+    /// 冷面显式查询（回源/审计入口;词法 contains 简化扫描——冷层不进
+    /// 召回面,查询为显式运维/审计动作）。命中即回源:反向 move 回热层。
+    pub async fn query_cold(
+        &mut self,
+        tokens: &[String],
+        limit: usize,
+        rehydrate: bool,
+    ) -> Result<Vec<serde_json::Value>, MemoryError> {
+        let Some(store) = self.lex_store.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let cold = crate::agent::lexstore::ColdStore::open(&store.cold_path())
+            .map_err(|e| MemoryError::EvoruleError(format!("cold open: {e}")))?;
+        let rows = cold
+            .query_contains(tokens, limit)
+            .map_err(|e| MemoryError::EvoruleError(format!("cold query: {e}")))?;
+        let mut out = Vec::new();
+        for r in &rows {
+            out.push(serde_json::json!({
+                "path": r.path,
+                "value": r.value_json,
+                "lifecycle_state": r.lifecycle_state,
+            }));
+            if rehydrate {
+                // 回源:反向 move(冷删+热回插,新增版本事实 RL-A1)
+                if let Some(rec) =
+                    serde_json::from_str::<MemoryRecord>(&r.value_json).ok()
+                {
+                    self.cache
+                        .insert(format!("shared::{}", r.path.rsplit('.').next().unwrap_or("?")), rec.clone());
+                    if let Ok(payload) = serde_json::to_value(&rec) {
+                        let _ = self
+                            .evorule_client
+                            .update_payload(
+                                self.session_id.as_deref().unwrap_or(""),
+                                &r.path,
+                                &payload,
+                            )
+                            .await;
+                    }
+                }
+                let _ = cold.delete_by_paths(&[r.path.clone()]);
+            }
+        }
+        Ok(out)
     }
 
     /// Recipe 指纹(资产化/LM-2:版本+内容 blake3;无 Recipe= None)
@@ -2954,6 +3077,17 @@ impl MemoryManager {
         if !audited_events.is_empty() {
             prompt.push_str("\n## Relevant Events\n");
             for line in &audited_events {
+                prompt.push_str(line);
+            }
+        }
+
+        // 程序型记忆分区（17 号 T5 裁定落地面）：procedural 非墓碑条目，
+        // 逐条 [procedural] 来源域标注（权威=知识级+程序性,裁定原文口径）；
+        // 同过 L2 审计闸与 [unanchored] 标注（渲染层统一处理）。
+        if !recall.procedures.is_empty() {
+            prompt.push_str("\n\n## Skills/Procedures\n");
+            let audited_proc = self.audit_recall_section("procedure", &recall.procedures);
+            for line in &audited_proc {
                 prompt.push_str(line);
             }
         }
@@ -6065,6 +6199,7 @@ mod tests {
             degradation_notices: Vec::new(),
             notes: Vec::new(),
             note_feed: Vec::new(),
+            procedures: Vec::new(),
             events: vec![],
         };
         let budget = ContextBudget::new(100_000, 0.25);
@@ -6209,6 +6344,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn move_cold_tier_gated_and_moves() {
+        use crate::agent::recipe::StorageConfig;
+        // 门控关:零冷迁
+        let dir = std::env::temp_dir().join(format!("f617m-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hot = std::sync::Arc::new(
+            crate::agent::lexstore::LexStore::open(&dir.join("hot.db")).unwrap(),
+        );
+        hot.replace_partition(
+            "shared.ns.stable.",
+            &[(1, "shared.ns.stable.a".into(), serde_json::json!("归档内容"))],
+        )
+        .unwrap();
+        hot.set_timeline_lifecycle(1, "Archived").unwrap();
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        mgr.set_lex_store(hot.clone());
+        mgr.set_recipe(recipe.clone());
+        assert_eq!(mgr.move_cold_tier(&recipe).await.unwrap(), 0, "门控关=零冷迁");
+        // 门控开:Archived 行迁冷库+cache 逐出
+        recipe.storage.cold_tier = true;
+        mgr.set_recipe(recipe.clone());
+        let n = mgr.move_cold_tier(&recipe).await.unwrap();
+        assert_eq!(n, 1);
+        let cold = crate::agent::lexstore::ColdStore::open(&hot.cold_path()).unwrap();
+        assert_eq!(cold.count().unwrap(), 1);
+        assert!(
+            !mgr.cache_keys().iter().any(|k| k.contains("stable.a")),
+            "cache 镜像逐出"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn recipe_fingerprint_asset_and_reload() {
         // LM-2 资产化三面:指纹稳定/资产载荷含治理字段/热重载刷新+门控随动
@@ -6240,7 +6410,50 @@ mod tests {
         assert_eq!(mgr.current_recipe().unwrap().sources.materials, true);
     }
 
-    #[test]
+    #[tokio::test]
+    async fn procedural_partition_injected_with_annotation() {
+        // 17 号 T5 裁定落地面:procedural 条目注入 ## Skills/Procedures 分区
+        let dir = std::env::temp_dir().join(format!("proc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::agent::lexstore::LexStore::open(&dir.join("hot.db")).unwrap();
+        store
+            .replace_partition(
+                "shared.ns.procedural.skills.",
+                &[(1, "shared.ns.procedural.skills.deploy".into(), serde_json::json!({"key":"deploy","value":"部署手册:先 lint 后 build","timestamp":5}))],
+            )
+            .unwrap();
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        mgr.set_lex_store(std::sync::Arc::new(store));
+        let ctx = mgr.recall_context("部署", 3, 5).await;
+        assert!(!ctx.procedures.is_empty(), "程序型条目入分区");
+        let prompt =
+            mgr.build_system_prompt_with_recall("BASE", &ctx, &ContextBudget::new(100_000, 0.25));
+        assert!(prompt.contains("## Skills/Procedures"), "{prompt}");
+        assert!(prompt.contains("部署手册"), "条目内容渲染");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn procedural_partition_excludes_tombstoned() {
+        let dir = std::env::temp_dir().join(format!("proc2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::agent::lexstore::LexStore::open(&dir.join("hot.db")).unwrap();
+        store
+            .replace_partition(
+                "shared.ns.procedural.skills.",
+                &[(1, "shared.ns.procedural.skills.gone".into(), serde_json::json!({"key":"gone","value":"已遗忘程序","timestamp":2}))],
+            )
+            .unwrap();
+        store.set_timeline_lifecycle(1, "Tombstoned").unwrap();
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        mgr.set_lex_store(std::sync::Arc::new(store));
+        let ctx = mgr.recall_context("遗忘", 3, 5).await;
+        assert!(ctx.procedures.is_empty(), "墓碑不进注入面: {:?}", ctx.procedures);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn test_unanchored_record_labeled_in_prompt() {
         // 账本记忆 I8 降级可见:fact_id 缺失/哨兵 0(离线 CacheOnly)=无账本
         // 锚点,prompt 行显式 [unanchored] 前缀——LLM 与审计侧均可分

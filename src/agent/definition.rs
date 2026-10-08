@@ -492,6 +492,11 @@ pub struct AgentDefinition {
     /// v2 双语表。serde 缺省 None=既有定义零影响）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub i2_lexicon: Option<crate::agent::context_inspector::I2Lexicon>,
+    /// 全局时限预算（秒；H3 预算耗尽看门狗——长程无人值守场景的合法
+    /// 停机面之三。None=不启用（既有定义零影响）；触达=react 回喂循环头
+    /// 强制 H3 停机,不依赖 LLM 合作）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_clock_budget_secs: Option<u64>,
     /// G13:单轮内并行工具调用上限(可选,默认 1 = 串行)
     ///
     /// - `1`(默认):工具按顺序串行执行(向后兼容旧行为)
@@ -1022,6 +1027,8 @@ impl AgentDefinition {
             governance_segment: None,
             // I2 词表声明直拷(声明即覆盖;None=机制内建 v2 双语表)
             i2_lexicon: self.i2_lexicon.clone(),
+            // H3 时限预算直拷(数据化;None=不启用)
+            wall_clock_budget_secs: self.wall_clock_budget_secs,
         }
     }
 }
@@ -1157,6 +1164,34 @@ mod tests {
     }
 
     /// 元层先行批:assembly 内嵌段加载(字段正确透传)
+    #[test]
+    fn test_wall_clock_budget_passthrough() {
+        // H3 看门狗(16 号 §2.1):definition 声明 → AgentConfig 直拷;缺省 None=不启用
+        let dir = make_tmp_dir();
+        let json = r#"{
+            "agent_type": "longhorizon",
+            "version": "1.0.0",
+            "description": "d",
+            "system_prompt": "s",
+            "model": "m",
+            "temperature": 0.5,
+            "max_steps": 5,
+            "step_timeout_secs": 30,
+            "tools": [],
+            "wall_clock_budget_secs": 28800
+        }"#;
+        write_json(dir.path(), "longhorizon", json);
+        let def = AgentDefinition::load_from_dir(dir.path(), "longhorizon").expect("load");
+        assert_eq!(def.wall_clock_budget_secs, Some(28800));
+        let cfg = def.to_agent_config();
+        assert_eq!(cfg.wall_clock_budget_secs, Some(28800), "直拷透传");
+        // 缺省 None(无字段=不启用,既有定义零影响)
+        write_json(dir.path(), "plain", &minimal_def_json());
+        let def2 = AgentDefinition::load_from_dir(dir.path(), "plain").expect("load");
+        assert_eq!(def2.wall_clock_budget_secs, None);
+        assert_eq!(def2.to_agent_config().wall_clock_budget_secs, None);
+    }
+
     #[test]
     fn test_assembly_inline_loading() {
         let dir = make_tmp_dir();
@@ -1735,6 +1770,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             i2_lexicon: None,
+            wall_clock_budget_secs: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
@@ -2079,6 +2115,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             i2_lexicon: None,
+            wall_clock_budget_secs: None,
             max_parallel_tools: 1,
             capability_boundary: Some(CapabilityBoundary {
                 mode: mode.to_string(),
@@ -2241,6 +2278,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             i2_lexicon: None,
+            wall_clock_budget_secs: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
@@ -2401,6 +2439,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             i2_lexicon: None,
+            wall_clock_budget_secs: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,

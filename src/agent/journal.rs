@@ -241,6 +241,13 @@ pub enum JournalEvent {
         /// 全量拉取（replace_partition）执行次数
         fetch: u64,
     },
+    /// 冷迁落账（F-617 冷热分层）：沉淀收尾冷迁批次的事件计数——
+    /// 热库 Archived/Tombstoned/Decayed 行事务移入 lex-cold.db。
+    /// 账面事件不映射 ATIF 步（观测面）。
+    ColdMoved {
+        /// 本次冷迁行数
+        count: u64,
+    },
     /// 子代理委托观测（delegate 子代理上下文规格批）：父会话在 delegate 工具
     /// 调用帧内实际创建的子会话锚——父→子链路唯一可发现锚点（子 journal
     /// 文件以 child_session_id 命名,无本事件则子轨迹成孤儿）。主轨迹 ATIF
@@ -850,6 +857,11 @@ impl JournalWriter {
             verdict: verdict.to_string(),
             evidence: truncate_text(&evidence, 256),
         })
+    }
+
+    /// 冷迁计数落账(F-617;best-effort 调用方决定失败处置)
+    pub fn cold_moved(&self, count: u64) -> Result<u64, JournalError> {
+        self.push(JournalEvent::ColdMoved { count })
     }
 
     /// 子代理委托观测落账（delegate 子代理上下文规格批;delegate 工具
