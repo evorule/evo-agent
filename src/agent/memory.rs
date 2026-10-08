@@ -2291,6 +2291,8 @@ impl MemoryManager {
     }
 
     pub fn set_recipe(&mut self, recipe: crate::agent::recipe::MemoryRecipe) {
+        // O-377① 批 1：发布到进程级快照槽（bundle_export 打包时刻注入消费）
+        crate::agent::recipe::publish_recipe(&recipe);
         self.recipe = Some(recipe);
     }
 
