@@ -62,7 +62,7 @@ pub struct SedimentConfig {
     pub enable_consolidation: bool,
     /// 是否启用双通道笔记事件驱动草稿（阶段 5 NB-2：确定性投影，零 LLM）
     pub enable_failure_drafts: bool,
-    /// 程序记忆素材收割（阶段 5 F-615/O-251:审批拒绝+治理拦截→procedural
+    /// 程序记忆素材收割（阶段 5 F-615:审批拒绝+治理拦截→procedural
     /// 候选,材料→受治通道→程序记忆晋升;Recipe sources.materials 穿线,缺省关）
     pub enable_material_harvest: bool,
     /// 是否启用 journal 摘要投影（跨源注册规格：确定性结构投影，零 LLM；
@@ -257,7 +257,7 @@ pub async fn sediment(
     //    消费 mem::take 整表,摘要投影在同开两开关时被饿死空转）
     let journal_lines = std::mem::take(&mut deps.journal_lines);
 
-    // 6.55 程序记忆素材收割（阶段 5 F-615/O-251）：审批拒绝+治理拦截 →
+    // 6.55 程序记忆素材收割（阶段 5 F-615）：审批拒绝+治理拦截 →
     //    procedural 候选（Captured,材料→受治通道→程序记忆晋升）
     if cfg.enable_material_harvest {
         harvest_procedural_materials(&journal_lines, deps, session_id, &mut result).await;
@@ -751,11 +751,11 @@ fn scan_failure_signals(lines: &[JournalLine]) -> Vec<(String, String)> {
 /// 前置 = `deps.journal_lines` 非空（由 runner 填充，与 F-613 同源）。
 /// 产出 = `shared.{ns}.notes.failure.{session_id}` Captured 事实，
 /// content.failures 列表每条携带 (call_id, 错误摘要) 供溯源回指。
-/// 程序记忆素材收割（阶段 5 F-615/O-251 清偿）：四类已落账素材中账内可
+/// 程序记忆素材收割（阶段 5 F-615 清偿）：四类已落账素材中账内可
 /// 及的两类——审批拒绝（ApprovalRequested×ApprovalResolved 配对）与治理
 /// 拦截（PolicyJudged blocked）——确定性投影为 procedural 候选事件
 /// （Captured，kind=procedural），走既有晋升通道（Captured→Promoted→
-/// 程序记忆），**零新特权通道**（材料→受治通道晋升，11 号 §七口径）。
+/// 程序记忆），**零新特权通道**（材料→受治通道晋升，账本记忆设计档 §七口径）。
 /// tool_traces（引擎侧审计链）与 stable 域（本即记忆）不在 journal 投影
 /// 可及面，如实声明为边界。候选单会话上限=有界投影（与 digest 同哲学）。
 const MATERIAL_HARVEST_CAP: usize = 5;

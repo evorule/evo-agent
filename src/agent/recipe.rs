@@ -30,7 +30,7 @@ pub struct RetrievalConfig {
     #[serde(default = "default_w_usage")]
     pub w_usage: f32,
     /// importance 内来源权威权重（w_a；缺省 0=既有行为零影响；
-    /// user 1.0/system 0.8/llm 0.5,与置信度演化 w_e 同源,11 号 §5.1）
+    /// user 1.0/system 0.8/llm 0.5,与置信度演化 w_e 同源,账本记忆设计档 §5.1）
     #[serde(default)]
     pub w_authority: f32,
     /// importance 内实体度权重（w_e；批内实体共现度归一;缺省 0=零影响）
@@ -99,7 +99,7 @@ pub struct LifecycleConfig {
     #[serde(default = "default_rollup_threshold")]
     pub rollup_threshold: usize,
     /// 置信度演化开关（缺省关=既有 agent 零影响;开=reinforce 佐证 +0.05·w_e/
-    /// 裁决败者矛盾 −0.10·w_e,公式见 11 号 §4.2 v0.1.8）
+    /// 裁决败者矛盾 −0.10·w_e,公式见账本记忆设计档 §4.2）
     #[serde(default)]
     pub confidence_evolution: bool,
     /// decay 闲置阈值（天）:非 Captured 且零引用超此限 → Decayed（缺省 90;

@@ -444,7 +444,7 @@ pub(crate) fn sort_stable_by_value(stable: &mut [MemoryRecord], goal: &str) {
 /// importance = w_c·confidence + w_u·min(usage,k)（F-616 stable 面接通：
 /// usage=存量 usage_count+本会话 pending 增量，k 封顶防垄断，配方可调）；
 /// 全序 Tie-break：新鲜度 ▸ 置信度 ▸ key 字典序（确定性可回放）。
-/// 来源权威权重（11 号 §5.1 authority 因子/§4.2 置信度演化 w_e 同源:
+/// 来源权威权重（账本记忆设计档 §5.1 authority 因子/§4.2 置信度演化 w_e 同源:
 /// user 1.0 / system 0.8 / llm 0.5 / 未标注 0.65——key 域优先,source 次之）
 pub(crate) fn authority_weight(record: &MemoryRecord) -> f32 {
     let key = record.key.as_str();
@@ -475,7 +475,7 @@ pub(crate) fn sort_by_policy(
         .map(|r| stable_relevance(r, &goal_uniq))
         .collect();
     let max_rel = rels.iter().copied().max().unwrap_or(0).max(1);
-    // 实体度(批内共现归一,11 号 §5.1 entity_degree 的确定性代理):
+    // 实体度(批内共现归一,账本记忆设计档 §5.1 entity_degree 的确定性代理):
     // 逐条 token 集,与他条共享的 distinct token 数,批内 max 归一
     let token_sets: Vec<std::collections::HashSet<String>> = stable
         .iter()
@@ -2442,7 +2442,7 @@ impl MemoryManager {
             let mut loser = ctx.stable[*l].clone();
             loser.lifecycle_state = Some("Superseded".to_string());
             loser.tags.push(format!("superseded_by:{winner_path}"));
-            // 置信度矛盾演化(11 号 §4.2 v0.1.8,Recipe 缺省关):裁决败者
+            // 置信度矛盾演化(账本记忆设计档 §4.2,Recipe 缺省关):裁决败者
             // =矛盾证据,Δ=−0.10×w_e(随 Superseded 版本事实落账)
             if self
                 .recipe
@@ -2584,7 +2584,7 @@ impl MemoryManager {
             };
             rec.usage_count = rec.usage_count.saturating_add(*inc);
             rec.lifecycle_state = Some("Reinforced".to_string());
-            // 置信度佐证演化(11 号 §4.2 v0.1.8,Recipe 缺省关):recall 命中
+            // 置信度佐证演化(账本记忆设计档 §4.2,Recipe 缺省关):recall 命中
             // =佐证证据,Δ=+0.05×w_e(来源权威权重);演化随本批版本事实落账
             if self
                 .recipe
@@ -2673,7 +2673,7 @@ impl MemoryManager {
             ) {
                 let idle_days = (now.saturating_sub(rec.timestamp)) as f64 / 86400.0;
                 // 迁移序:归档终态优先(超 archive 限);decay 为中间带
-                // [decay 限,archive 限)的零引用降权(11 号 §4.2 v0.1.8 异常迁移②,
+                // [decay 限,archive 限)的零引用降权(账本记忆设计档 §4.2 异常迁移②,
                 // confidence 半衰一次性——Decayed 态不再进入本分支)
                 if idle_days > lc.archive_after_idle_days as f64 {
                     rec.lifecycle_state = Some("Archived".to_string());

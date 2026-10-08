@@ -1962,7 +1962,7 @@ impl AgentRunner {
     ///
     /// `memory` / `summarizer` / `extractor` 是 `AgentRunner` 的不同字段，
     /// Rust 允许同时借用不同字段（disjoint borrows），不会冲突。
-    /// 空闲巩固入口（sleep-time 触发变体转正,11 号 §六）:会话间隙外的
+    /// 空闲巩固入口（sleep-time 触发变体转正,账本记忆设计档 §六）:会话间隙外的
     /// 空闲窗口可由调度器(运维/CLI/后续产品化)调用——仅重跑巩固阶段
     /// (跨会话候选确定性聚类→sidecar 合并提议→Consolidated 落账),
     /// 门控仍随 Recipe(consolidation 缺省开;无审计通路内部自动跳过)。
