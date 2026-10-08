@@ -146,6 +146,8 @@ pub struct AgentConfig {
     pub governance_segment: Option<String>,
     /// I2 词表声明(数据化;None=机制内建 v2 双语表——context_inspector)
     pub i2_lexicon: Option<crate::agent::context_inspector::I2Lexicon>,
+    /// 全局时限预算秒(H3 看门狗;None=不启用——既有定义零影响)
+    pub wall_clock_budget_secs: Option<u64>,
 }
 
 impl Default for AgentConfig {
@@ -169,6 +171,7 @@ impl Default for AgentConfig {
             handoff: None,
             governance_segment: None,
             i2_lexicon: None,
+            wall_clock_budget_secs: None,
         }
     }
 }
@@ -2036,7 +2039,27 @@ impl AgentRunner {
                 ) {
                     warn!(%session_id, error = %e, "sediment_performed journal failed");
                 }
-            }
+
+            // 冷迁（F-617 冷热分层,Recipe storage.cold_tier 门控缺省关）:
+            // 生命周期迁移产物(Archived/Tombstoned/Decayed)事务移入 lex-cold.db,
+            // 计数入账(cold_moved 事件);cache 镜像同步逐出
+            if recipe.storage.cold_tier {
+                if let Some(mem) = self.memory.as_mut() {
+                    match mem.move_cold_tier(&recipe).await {
+                        Ok(n) if n > 0 => {
+                            if let Some(j) = journal {
+                                if let Err(e) = j.cold_moved(n as u64) {
+                                    warn!(%session_id, error = %e, "cold_moved journal failed");
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(%session_id, error = %e, "cold tier move failed (best-effort)");
+                        }
+                    }
+                }
+            }            }
             if !result.stable_facts_cache_only.is_empty() {
                 tracing::warn!(
                     session_id = %session_id,
@@ -4702,6 +4725,7 @@ impl AgentRunner {
         Box::pin(stream! {
             let mut runner = self;
             let start_time = std::time::Instant::now();
+        let wall_clock_budget_secs = runner.config.wall_clock_budget_secs;
 
             // 1. 构造 system_prompt(与 run() 同源:组装执行器单一出口)
             // B3: 召回前按节流间隔校验 cache 与真相源漂移（server wins 对齐）
@@ -5163,6 +5187,39 @@ impl AgentRunner {
                                 // 输出门禁（server io_guard）拒绝收尾的纠偏重试计数
                                 let mut guard_rejections: u32 = 0;
                                 'react: loop {
+                                    // H3 预算看门狗(16 号 §2.1):全局时限触达=合法停机
+                                    // 面之三——不依赖 LLM 合作,镜像 max_steps 熔断全序列
+                                    // (io_response 错误回写→Error 事件→turn_ended→flush
+                                    // →tool_traces→Done[blocked 语义 error 结果])
+                                    if let Some(budget_secs) = wall_clock_budget_secs {
+                                        if start_time.elapsed().as_secs() >= budget_secs {
+                                            let err = AgentError::Internal(format!(
+                                                "全局时限预算耗尽({budget_secs}s)——H3 合法停机(诚实退出优于空转)"
+                                            ));
+                                            if let Some(rid) = request_id {
+                                                let err_str = err.to_string();
+                                                if let Err(e) = runner.evorule_client
+                                                    .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
+                                                    .await
+                                                {
+                                                    tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (budget_exhausted) failed; io_request may hang on engine side");
+                                                }
+                                            }
+                                            yield Ok(AgentEvent::Error(err.clone()));
+                                            let duration = start_time.elapsed().as_millis() as u64;
+                                            if let Some(g) = turn_guard.take() {
+                                                g.end("error", step_count as u64, duration);
+                                            }
+                                            if let Err(e) = runner.flush_messages(&session_id).await {
+                                                tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                            }
+                                            runner.submit_tool_traces(&session_id).await;
+                                            yield Ok(AgentEvent::Done(AgentResult::error(
+                                                err.to_string(), step_count, duration,
+                                            )));
+                                            return;
+                                        }
+                                    }
                                     // 首轮 LLM 调用已随 IoRequest 到达计过 step(L2508),回喂轮补计
                                     if react_round > 0 {
                                         step_count += 1;
