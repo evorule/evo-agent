@@ -918,6 +918,8 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             // 普通工具调用(映射口径 v1 不变);链路经 root.extra.parent_session_id
             // 在子轨迹侧标注
             JournalEvent::DelegateSpawned { .. } => {}
+            // 冷迁计数:账面观测事件不映射步(观测面口径)
+            JournalEvent::ColdMoved { .. } => {}
             // SessionCrashed 已在循环头截断
             JournalEvent::SessionCrashed { .. } => {}
             // HandoverWritten:交接点语义锚(写档动作镜像已在 tool_invoked/

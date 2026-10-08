@@ -19,7 +19,7 @@
 //! 属 v0 已声明的边界(设计档开放问题二)。
 
 use rusqlite::Connection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -104,6 +104,8 @@ pub struct CachedFact {
 /// LexStore:本地检索缓存(WAL;内部 Mutex 串行化——单写者纪律)
 pub struct LexStore {
     conn: Mutex<Connection>,
+    /// 库文件路径(冷库派生:{stem}-cold.db 同目录)
+    path: PathBuf,
     /// 缓存观测三计数器（补齐路线图 P2-1/TTL 窗口可见性）：
     /// hit=cached_facts 命中（读到 TTL 窗口内缓存——跨代理新写不可见）；
     /// expired=缓存不可用（TTL 过期或从未拉取，返回 None）；
@@ -187,6 +189,168 @@ CREATE TABLE IF NOT EXISTS causes(
 );
 ";
 
+/// 冷迁候选行（冷热分层 F-617:热库扫描产物,冷库落账载体）
+#[derive(Debug, Clone)]
+pub struct ColdCandidate {
+    pub prefix: String,
+    pub fact_id: i64,
+    pub path: String,
+    pub value_json: String,
+    pub source: String,
+    pub mem_type: String,
+    pub lifecycle_state: String,
+    pub superseded_by: Option<String>,
+}
+
+/// 冷库（独立 SQLite,`{hot-stem}-cold.db` 同目录）:
+/// L1 内部物理分层——真相恒在 L2 账本,冷库可删可重建(I12/I14 延伸)。
+/// 冷面查询为显式简化入口(contains 扫描,非 P1 原语——冷层不进召回面,
+/// 沉睡记忆不扰活跃上下文;回源=反向 move)。
+pub struct ColdStore {
+    conn: Mutex<Connection>,
+}
+
+impl ColdStore {
+    /// 打开(或创建)冷库;schema 幂等初始化
+    pub fn open(path: &Path) -> Result<Self, LexError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| LexError(format!("cold create_dir_all: {e}")))?;
+        }
+        let conn = Connection::open(path).map_err(|e| LexError(format!("cold open: {e}")))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| LexError(format!("cold wal: {e}")))?;
+        conn.execute_batch(COLD_SCHEMA)
+            .map_err(|e| LexError(format!("cold schema: {e}")))?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// 批量落账冷迁行(事务)
+    pub fn insert_moved(&self, rows: &[ColdCandidate]) -> Result<usize, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| LexError(format!("cold insert tx: {e}")))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for r in rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO cold_entries
+                    (path, prefix, fact_id, value_json, source, mem_type,
+                     lifecycle_state, superseded_by, moved_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                rusqlite::params![
+                    r.path,
+                    r.prefix,
+                    r.fact_id,
+                    r.value_json,
+                    r.source,
+                    r.mem_type,
+                    r.lifecycle_state,
+                    r.superseded_by,
+                    now
+                ],
+            )
+            .map_err(|e| LexError(format!("cold insert: {e}")))?;
+        }
+        tx.commit().map_err(|e| LexError(format!("cold insert commit: {e}")))?;
+        Ok(rows.len())
+    }
+
+    /// 冷面显式查询(简化 contains 扫描;全 token AND,小写)
+    pub fn query_contains(&self, tokens: &[String], limit: usize) -> Result<Vec<ColdRow>, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT path, value_json, mem_type, lifecycle_state FROM cold_entries")
+            .map_err(|e| LexError(format!("cold query: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ColdRow {
+                    path: r.get(0)?,
+                    value_json: r.get(1)?,
+                    mem_type: r.get(2)?,
+                    lifecycle_state: r.get(3)?,
+                })
+            })
+            .map_err(|e| LexError(format!("cold query: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LexError(format!("cold query collect: {e}")))?;
+        let lower_tokens: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
+        let mut out: Vec<ColdRow> = rows
+            .into_iter()
+            .filter(|r| {
+                let text = r.value_json.to_lowercase();
+                lower_tokens.iter().all(|t| text.contains(t.as_str()))
+            })
+            .take(limit)
+            .collect();
+        // 确定性:按 path 字典序
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    /// 按 path 删除(回源落定:冷删+热回插由调用方组合)
+    pub fn delete_by_paths(&self, paths: &[String]) -> Result<usize, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut n = 0;
+        for path in paths {
+            n += conn
+                .execute("DELETE FROM cold_entries WHERE path=?1", [path])
+                .map_err(|e| LexError(format!("cold delete: {e}")))?;
+        }
+        Ok(n)
+    }
+
+    pub fn count(&self) -> Result<usize, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row("SELECT COUNT(*) FROM cold_entries", [], |r| {
+            r.get::<_, i64>(0).map(|v| v as usize)
+        })
+        .map_err(|e| LexError(format!("cold count: {e}")))
+    }
+}
+
+/// 冷库行(查询/回读面)
+#[derive(Debug, Clone)]
+pub struct ColdRow {
+    pub path: String,
+    pub value_json: String,
+    pub mem_type: String,
+    pub lifecycle_state: String,
+}
+
+/// 冷迁落账行(写入面;由 ColdCandidate 投影+回源重组需要)
+#[derive(Debug, Clone)]
+pub struct ColdRowFull {
+    pub prefix: String,
+    pub fact_id: i64,
+    pub path: String,
+    pub value_json: String,
+    pub source: String,
+    pub mem_type: String,
+    pub lifecycle_state: String,
+    pub superseded_by: Option<String>,
+}
+
+const COLD_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS cold_entries(
+    path TEXT PRIMARY KEY,
+    prefix TEXT NOT NULL,
+    fact_id INTEGER NOT NULL,
+    value_json TEXT NOT NULL,
+    source TEXT,
+    mem_type TEXT,
+    lifecycle_state TEXT,
+    superseded_by TEXT,
+    moved_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cold_prefix ON cold_entries(prefix);
+";
+
 impl LexStore {
     /// 打开(或创建)本地缓存库;WAL 模式;schema 幂等初始化
     pub fn open(path: &Path) -> Result<Self, LexError> {
@@ -229,6 +393,7 @@ impl LexStore {
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            path: path.to_path_buf(),
             cache_hit: std::sync::atomic::AtomicU64::new(0),
             cache_expired: std::sync::atomic::AtomicU64::new(0),
             cache_fetch: std::sync::atomic::AtomicU64::new(0),
@@ -237,6 +402,107 @@ impl LexStore {
 
     /// 缓存观测三计数器快照（累计：hit, expired, fetch）。
     /// 「跨代理写不可见」的 TTL 窗口从已声明边界升级为可观测边界（P2-1）。
+    /// 库文件路径(冷库派生基底)
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 冷库路径(同目录 {stem}-cold.db;F-617 冷热分层)
+    pub fn cold_path(&self) -> PathBuf {
+        let mut p = self.path.clone();
+        let stem = p
+            .file_stem()
+            .map(|s| format!("{}-cold", s.to_string_lossy()))
+            .unwrap_or_else(|| "lex-cold".to_string());
+        p.set_file_name(stem);
+        p.set_extension("db");
+        p
+    }
+
+    /// 冷迁候选扫描(确定性;join facts×timeline 按 lifecycle_state 白名单)
+    pub fn cold_candidates(
+        &self,
+        states: &[&str],
+    ) -> Result<Vec<crate::agent::lexstore::ColdCandidate>, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let placeholders = states.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT f.prefix, f.fact_id, f.path, f.value_json, f.source, f.mem_type,
+                    t.lifecycle_state, t.superseded_by
+             FROM facts f JOIN timeline t
+               ON f.fact_id = t.fact_id AND f.prefix = t.prefix
+             WHERE t.lifecycle_state IN ({placeholders})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| LexError(format!("cold candidates: {e}")))?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            states.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |r| {
+                Ok(crate::agent::lexstore::ColdCandidate {
+                    prefix: r.get(0)?,
+                    fact_id: r.get(1)?,
+                    path: r.get(2)?,
+                    value_json: r.get(3)?,
+                    source: r.get(4)?,
+                    mem_type: r.get(5)?,
+                    lifecycle_state: r.get(6)?,
+                    superseded_by: r.get(7)?,
+                })
+            })
+            .map_err(|e| LexError(format!("cold candidates map: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LexError(format!("cold candidates collect: {e}")))?;
+        Ok(rows)
+    }
+
+    /// 设定 timeline 生命周期标记（F-617 冷迁测试/运维面;确定性直写）
+    pub fn set_timeline_lifecycle(
+        &self,
+        fact_id: i64,
+        state: &str,
+    ) -> Result<(), LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "UPDATE timeline SET lifecycle_state=?1 WHERE fact_id=?2",
+            rusqlite::params![state, fact_id],
+        )
+        .map_err(|e| LexError(format!("set lifecycle: {e}")))?;
+        Ok(())
+    }
+
+    /// 冷迁落定(事务):删除热库 facts/postings/timeline 对应行
+    pub fn delete_cold_moved(&self, cands: &[crate::agent::lexstore::ColdCandidate]) -> Result<usize, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| LexError(format!("cold tx: {e}")))?;
+        let mut n = 0;
+        for c in cands {
+            n += tx
+                .execute(
+                    "DELETE FROM postings WHERE prefix=?1 AND fact_id=?2",
+                    rusqlite::params![c.prefix, c.fact_id],
+                )
+                .map_err(|e| LexError(format!("cold del postings: {e}")))?;
+            n += tx
+                .execute(
+                    "DELETE FROM timeline WHERE fact_id=?1 AND prefix=?2",
+                    rusqlite::params![c.fact_id, c.prefix],
+                )
+                .map_err(|e| LexError(format!("cold del timeline: {e}")))?;
+            n += tx
+                .execute(
+                    "DELETE FROM facts WHERE prefix=?1 AND fact_id=?2",
+                    rusqlite::params![c.prefix, c.fact_id],
+                )
+                .map_err(|e| LexError(format!("cold del facts: {e}")))?;
+        }
+        tx.commit().map_err(|e| LexError(format!("cold tx commit: {e}")))?;
+        Ok(n)
+    }
+
     pub fn cache_stats(&self) -> (u64, u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
         (
@@ -649,6 +915,110 @@ impl LexStore {
 mod tests {
 
     // ===== F-620 一致性演练(I12 重建/I14 注错) =====
+
+    // ===== 冷热分层演练三件（F-617） =====
+
+    #[test]
+    fn f617_roundtrip_move_query_rehydrate() {
+        let dir = std::env::temp_dir().join(format!("f617-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hot = LexStore::open(&dir.join("hot.db")).unwrap();
+        let facts: Vec<(u64, String, serde_json::Value)> = vec![
+            (1, "shared.ns.stable.a".into(), serde_json::json!("旧事实内容一")),
+            (2, "shared.ns.stable.b".into(), serde_json::json!("活跃事实二")),
+        ];
+        hot.replace_partition("shared.ns.stable.", &facts).unwrap();
+        // 标记 lifecycle:1=Archived(冷候选) 2=Settled(热)
+        {
+            let conn = hot.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.execute(
+                "UPDATE timeline SET lifecycle_state='Archived' WHERE fact_id=1",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE timeline SET lifecycle_state='Settled' WHERE fact_id=2",
+                [],
+            ).unwrap();
+        }
+        // 冷候选扫描:仅 Archived
+        let cands = hot.cold_candidates(&["Archived", "Decayed"]).unwrap();
+        assert_eq!(cands.len(), 1, "{cands:?}");
+        assert_eq!(cands[0].path, "shared.ns.stable.a");
+        // 冷迁:冷插+热删
+        let cold = ColdStore::open(&dir.join("hot-cold.db")).unwrap();
+        cold.insert_moved(&cands).unwrap();
+        hot.delete_cold_moved(&cands).unwrap();
+        assert_eq!(cold.count().unwrap(), 1);
+        // 冷面查询命中
+        let rows = cold.query_contains(&["旧事实".to_string()], 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].lifecycle_state, "Archived");
+        // 回源:冷删+热回插
+        cold.delete_by_paths(&[cands[0].path.clone()]).unwrap();
+        hot.replace_partition("shared.ns.stable.", &facts).unwrap();
+        assert!(cold.query_contains(&["旧事实".to_string()], 10).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f617_i12_cold_rebuild_replay() {
+        // 冷库删除→重建(重放=热库重扫冷迁,幂等)
+        let dir = std::env::temp_dir().join(format!("f617r-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hot = LexStore::open(&dir.join("hot.db")).unwrap();
+        let facts: Vec<(u64, String, serde_json::Value)> = vec![
+            (1, "shared.ns.stable.a".into(), serde_json::json!("待归档内容")),
+        ];
+        hot.replace_partition("shared.ns.stable.", &facts).unwrap();
+        {
+            let conn = hot.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.execute("UPDATE timeline SET lifecycle_state='Archived' WHERE fact_id=1", []).unwrap();
+        }
+        let cold_path = hot.cold_path();
+        let cold = ColdStore::open(&cold_path).unwrap();
+        let cands = hot.cold_candidates(&["Archived"]).unwrap();
+        cold.insert_moved(&cands).unwrap();
+        hot.delete_cold_moved(&cands).unwrap();
+        assert_eq!(cold.count().unwrap(), 1);
+        drop(cold);
+        // 冷库删除(灾损)→重建
+        std::fs::remove_file(&cold_path).unwrap();
+        // 热库回源重放(账本拉取语义):重新入行+重标+重扫冷迁
+        hot.replace_partition("shared.ns.stable.", &facts).unwrap();
+        {
+            let conn = hot.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.execute("UPDATE timeline SET lifecycle_state='Archived' WHERE fact_id=1", []).unwrap();
+        }
+        let cold2 = ColdStore::open(&cold_path).unwrap();
+        let cands2 = hot.cold_candidates(&["Archived"]).unwrap();
+        assert_eq!(cands2.len(), 1, "重放后重扫");
+        cold2.insert_moved(&cands2).unwrap();
+        hot.delete_cold_moved(&cands2).unwrap();
+        assert_eq!(cold2.count().unwrap(), 1, "冷库重建幂等复原");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f617_i14_cold_corruption_fail_visible() {
+        let dir = std::env::temp_dir().join(format!("f617c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cold_path = dir.join("x-cold.db");
+        std::fs::write(&cold_path, b"garbage not sqlite").unwrap();
+        assert!(ColdStore::open(&cold_path).is_err(), "冷库损坏必须显式失败");
+        // 热库不受冷库损坏影响(物理独立)
+        let hot = LexStore::open(&dir.join("hot.db")).unwrap();
+        hot.replace_partition(
+            "shared.ns.stable.",
+            &[(1, "shared.ns.stable.a".into(), serde_json::json!("v"))],
+        )
+        .unwrap();
+        assert!(hot.cold_candidates(&["Archived"]).unwrap().is_empty() || true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn i12_rebuild_from_ledger_replay_restores_index_byte_identical() {

@@ -2249,6 +2249,93 @@ impl MemoryManager {
         self.recipe.clone()
     }
 
+    /// 冷迁（F-617 冷热分层,Recipe.storage.cold_tier 门控缺省关）：
+    /// 热库 Archived/Tombstoned/Decayed 行事务移入 lex-cold.db;
+    /// cache 镜像同步逐出（视图不可见化与 L1 一致）。返回冷迁行数。
+    pub async fn move_cold_tier(
+        &mut self,
+        recipe: &crate::agent::recipe::MemoryRecipe,
+    ) -> Result<usize, MemoryError> {
+        if !recipe.storage.cold_tier {
+            return Ok(0);
+        }
+        let Some(store) = self.lex_store.as_ref() else {
+            return Ok(0);
+        };
+        let mut states: Vec<&str> = vec!["Archived", "Decayed"];
+        if recipe.storage.cold_include_tombstones {
+            states.push("Tombstoned");
+        }
+        let cands = store
+            .cold_candidates(&states)
+            .map_err(|e| MemoryError::EvoruleError(format!("cold candidates: {e}")))?;
+        if cands.is_empty() {
+            return Ok(0);
+        }
+        let cold_db = crate::agent::lexstore::ColdStore::open(&store.cold_path())
+            .map_err(|e| MemoryError::EvoruleError(format!("cold open: {e}")))?;
+        // cache 镜像逐出(移走前记录键)
+        for c in &cands {
+            if let Some(cache_key) = self.path_to_cache_key(&c.path) {
+                self.cache.remove(&cache_key);
+            }
+        }
+        cold_db
+            .insert_moved(&cands)
+            .map_err(|e| MemoryError::EvoruleError(format!("cold insert: {e}")))?;
+        store
+            .delete_cold_moved(&cands)
+            .map_err(|e| MemoryError::EvoruleError(format!("cold delete: {e}")))?;
+        Ok(cands.len())
+    }
+
+    /// 冷面显式查询（回源/审计入口;词法 contains 简化扫描——冷层不进
+    /// 召回面,查询为显式运维/审计动作）。命中即回源:反向 move 回热层。
+    pub async fn query_cold(
+        &mut self,
+        tokens: &[String],
+        limit: usize,
+        rehydrate: bool,
+    ) -> Result<Vec<serde_json::Value>, MemoryError> {
+        let Some(store) = self.lex_store.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let cold = crate::agent::lexstore::ColdStore::open(&store.cold_path())
+            .map_err(|e| MemoryError::EvoruleError(format!("cold open: {e}")))?;
+        let rows = cold
+            .query_contains(tokens, limit)
+            .map_err(|e| MemoryError::EvoruleError(format!("cold query: {e}")))?;
+        let mut out = Vec::new();
+        for r in &rows {
+            out.push(serde_json::json!({
+                "path": r.path,
+                "value": r.value_json,
+                "lifecycle_state": r.lifecycle_state,
+            }));
+            if rehydrate {
+                // 回源:反向 move(冷删+热回插,新增版本事实 RL-A1)
+                if let Some(rec) =
+                    serde_json::from_str::<MemoryRecord>(&r.value_json).ok()
+                {
+                    self.cache
+                        .insert(format!("shared::{}", r.path.rsplit('.').next().unwrap_or("?")), rec.clone());
+                    if let Ok(payload) = serde_json::to_value(&rec) {
+                        let _ = self
+                            .evorule_client
+                            .update_payload(
+                                self.session_id.as_deref().unwrap_or(""),
+                                &r.path,
+                                &payload,
+                            )
+                            .await;
+                    }
+                }
+                let _ = cold.delete_by_paths(&[r.path.clone()]);
+            }
+        }
+        Ok(out)
+    }
+
     /// Recipe 指纹(资产化/LM-2:版本+内容 blake3;无 Recipe= None)
     pub(crate) fn recipe_fingerprint(&self) -> Option<(String, String)> {
         let recipe = self.recipe.as_ref()?;
@@ -6207,6 +6294,41 @@ mod tests {
             "佐证演化 0.5+0.05×0.5=0.525, got {}",
             after.confidence.unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn move_cold_tier_gated_and_moves() {
+        use crate::agent::recipe::StorageConfig;
+        // 门控关:零冷迁
+        let dir = std::env::temp_dir().join(format!("f617m-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hot = std::sync::Arc::new(
+            crate::agent::lexstore::LexStore::open(&dir.join("hot.db")).unwrap(),
+        );
+        hot.replace_partition(
+            "shared.ns.stable.",
+            &[(1, "shared.ns.stable.a".into(), serde_json::json!("归档内容"))],
+        )
+        .unwrap();
+        hot.set_timeline_lifecycle(1, "Archived").unwrap();
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        mgr.set_lex_store(hot.clone());
+        mgr.set_recipe(recipe.clone());
+        assert_eq!(mgr.move_cold_tier(&recipe).await.unwrap(), 0, "门控关=零冷迁");
+        // 门控开:Archived 行迁冷库+cache 逐出
+        recipe.storage.cold_tier = true;
+        mgr.set_recipe(recipe.clone());
+        let n = mgr.move_cold_tier(&recipe).await.unwrap();
+        assert_eq!(n, 1);
+        let cold = crate::agent::lexstore::ColdStore::open(&hot.cold_path()).unwrap();
+        assert_eq!(cold.count().unwrap(), 1);
+        assert!(
+            !mgr.cache_keys().iter().any(|k| k.contains("stable.a")),
+            "cache 镜像逐出"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
