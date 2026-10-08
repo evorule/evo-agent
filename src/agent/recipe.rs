@@ -323,6 +323,10 @@ pub struct MemoryRecipe {
     /// 晋升治理门配置（F-609 完善；缺省关=机械复制既有行为）
     #[serde(default)]
     pub promote_gate: PromoteGateConfig,
+    /// LexStore 检索缓存 TTL（秒；存储设计档 §九.4——缓存参数迁 Recipe，
+    /// 机制不再藏策略参数。None=机制缺省 60s，既有 agent 零影响）
+    #[serde(default)]
+    pub lex_ttl_secs: Option<u64>,
 }
 
 impl Default for MemoryRecipe {
@@ -355,6 +359,7 @@ impl Default for MemoryRecipe {
             sources: SourcesSection::default(),
             adjudication: AdjudicationConfig::default(),
             promote_gate: PromoteGateConfig::default(),
+            lex_ttl_secs: None,
         }
     }
 }
