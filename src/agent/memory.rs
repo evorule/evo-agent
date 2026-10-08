@@ -576,11 +576,18 @@ pub struct RecallContext {
     /// 分区头部）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub note_feed: Vec<String>,
+    /// 程序型记忆分区（17 号 T5/S3 第四分区 ## Skills/Procedures）：
+    /// mem_type=procedural 的非墓碑条目（近者先,确定性选取）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub procedures: Vec<MemoryRecord>,
 }
 
 /// R-1 常驻回喂的笔记选取上限（确定性选取在源头截断,不参与 ContextBudget
 /// 裁剪——与降级通知同款"小体量关键可靠性信号"口径）
 pub const NOTES_RECALL_LIMIT: usize = 5;
+
+/// 程序型记忆分区选取上限（S3 第四分区;与笔记面同款源头截断口径）
+pub const PROCEDURAL_RECALL_LIMIT: usize = 5;
 
 /// R-1 确定性选取：分类×相关性×新鲜度——token 重叠数降序 ▸ 时间戳降序 ▸
 /// key 字典序（全序 tie-break,同输入同选取）。todo/failure 类自带权重加成
@@ -2149,6 +2156,35 @@ impl MemoryManager {
             }
         }
 
+        // 程序型记忆分区（17 号 T5 裁定落地面）：LexStore 内 procedural
+        // 型非墓碑条目近者先(LexStore 缺席=无程序型注入面,静默——程序型
+        // 数据源[技能镜像/材料]本就以 LexStore 在位为前提)
+        if let Some(store) = self.lex_store.as_ref() {
+            if let Ok(rows) = store.procedural_snapshot(PROCEDURAL_RECALL_LIMIT) {
+                ctx.procedures = rows
+                    .into_iter()
+                    .map(|(path, value)| {
+                        let mut rec = MemoryRecord::new(
+                            path.rsplit('.').next().unwrap_or(&path),
+                            &value,
+                            0,
+                        );
+                        // 载荷为 MemoryRecord JSON 时还原时间戳/键
+                        if let Ok(full) = serde_json::from_str::<MemoryRecord>(&value) {
+                            rec.timestamp = full.timestamp;
+                            rec.key = if full.key.is_empty() {
+                                path.rsplit('.').next().unwrap_or(&path).to_string()
+                            } else {
+                                full.key
+                            };
+                        }
+                        rec.fact_id = None; // 快照面不带锚,渲染层 [unanchored] 标注
+                        rec
+                    })
+                    .collect();
+            }
+        }
+
         ctx
     }
 
@@ -3041,6 +3077,17 @@ impl MemoryManager {
         if !audited_events.is_empty() {
             prompt.push_str("\n## Relevant Events\n");
             for line in &audited_events {
+                prompt.push_str(line);
+            }
+        }
+
+        // 程序型记忆分区（17 号 T5 裁定落地面）：procedural 非墓碑条目，
+        // 逐条 [procedural] 来源域标注（权威=知识级+程序性,裁定原文口径）；
+        // 同过 L2 审计闸与 [unanchored] 标注（渲染层统一处理）。
+        if !recall.procedures.is_empty() {
+            prompt.push_str("\n\n## Skills/Procedures\n");
+            let audited_proc = self.audit_recall_section("procedure", &recall.procedures);
+            for line in &audited_proc {
                 prompt.push_str(line);
             }
         }
@@ -6152,6 +6199,7 @@ mod tests {
             degradation_notices: Vec::new(),
             notes: Vec::new(),
             note_feed: Vec::new(),
+            procedures: Vec::new(),
             events: vec![],
         };
         let budget = ContextBudget::new(100_000, 0.25);
@@ -6362,7 +6410,50 @@ mod tests {
         assert_eq!(mgr.current_recipe().unwrap().sources.materials, true);
     }
 
-    #[test]
+    #[tokio::test]
+    async fn procedural_partition_injected_with_annotation() {
+        // 17 号 T5 裁定落地面:procedural 条目注入 ## Skills/Procedures 分区
+        let dir = std::env::temp_dir().join(format!("proc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::agent::lexstore::LexStore::open(&dir.join("hot.db")).unwrap();
+        store
+            .replace_partition(
+                "shared.ns.procedural.skills.",
+                &[(1, "shared.ns.procedural.skills.deploy".into(), serde_json::json!({"key":"deploy","value":"部署手册:先 lint 后 build","timestamp":5}))],
+            )
+            .unwrap();
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        mgr.set_lex_store(std::sync::Arc::new(store));
+        let ctx = mgr.recall_context("部署", 3, 5).await;
+        assert!(!ctx.procedures.is_empty(), "程序型条目入分区");
+        let prompt =
+            mgr.build_system_prompt_with_recall("BASE", &ctx, &ContextBudget::new(100_000, 0.25));
+        assert!(prompt.contains("## Skills/Procedures"), "{prompt}");
+        assert!(prompt.contains("部署手册"), "条目内容渲染");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn procedural_partition_excludes_tombstoned() {
+        let dir = std::env::temp_dir().join(format!("proc2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::agent::lexstore::LexStore::open(&dir.join("hot.db")).unwrap();
+        store
+            .replace_partition(
+                "shared.ns.procedural.skills.",
+                &[(1, "shared.ns.procedural.skills.gone".into(), serde_json::json!({"key":"gone","value":"已遗忘程序","timestamp":2}))],
+            )
+            .unwrap();
+        store.set_timeline_lifecycle(1, "Tombstoned").unwrap();
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        mgr.set_lex_store(std::sync::Arc::new(store));
+        let ctx = mgr.recall_context("遗忘", 3, 5).await;
+        assert!(ctx.procedures.is_empty(), "墓碑不进注入面: {:?}", ctx.procedures);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn test_unanchored_record_labeled_in_prompt() {
         // 账本记忆 I8 降级可见:fact_id 缺失/哨兵 0(离线 CacheOnly)=无账本
         // 锚点,prompt 行显式 [unanchored] 前缀——LLM 与审计侧均可分

@@ -457,6 +457,36 @@ impl LexStore {
         Ok(rows)
     }
 
+    /// 程序型记忆快照（17 号 T5/S3 第四分区注入面）：mem_type=procedural
+    /// （前缀直证+行级覆盖）的非墓碑条目,近者先（rowid 倒序=入账序倒序,
+    /// 确定性）。技能正文不入（read_skill 按需装载,分区只注入元数据/知识）。
+    pub fn procedural_snapshot(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.path, f.value_json
+                 FROM facts f
+                 LEFT JOIN timeline t
+                   ON f.fact_id = t.fact_id AND f.prefix = t.prefix
+                 WHERE f.mem_type = 'procedural'
+                   AND (t.lifecycle_state IS NULL OR t.lifecycle_state != 'Tombstoned')
+                 ORDER BY f.rowid DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| LexError(format!("procedural snapshot: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| LexError(format!("procedural snapshot map: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LexError(format!("procedural snapshot collect: {e}")))?;
+        Ok(rows)
+    }
+
     /// 设定 timeline 生命周期标记（F-617 冷迁测试/运维面;确定性直写）
     pub fn set_timeline_lifecycle(
         &self,
