@@ -957,6 +957,10 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             JournalEvent::ColdMoved { .. } => {}
             // 工具重试观测:不映射步(观测面口径;重试明细在 journal 事件)
             JournalEvent::ToolRetried { .. } => {}
+            // 粒级检查点及其大结果载体:不映射步(观测面口径;恢复面在
+            // journal 侧回放,轨迹步只反映对话粒)
+            JournalEvent::NodeCheckpointed { .. } => {}
+            JournalEvent::CheckpointBlob { .. } => {}
             // SessionCrashed 已在循环头截断
             JournalEvent::SessionCrashed { .. } => {}
             // HandoverWritten:交接点语义锚(写档动作镜像已在 tool_invoked/
