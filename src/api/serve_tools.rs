@@ -56,6 +56,12 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "knowledge_datasets",
     "knowledge_search",
     "knowledge_entry_get",
+    // bundles 部署闭环 (5,导入/导出/激活/清单)
+    "bundle_export",
+    "bundle_import_dry_run",
+    "bundle_import",
+    "bundle_active_list",
+    "bundle_imports_list",
     // skill 装配面 (1,纯本地转换:skill pack → 执行域快照包,非写工具)
     "skill_pack_to_bundle",
     // meta_tools (1,L2 约束只读消费面)
@@ -69,7 +75,7 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "lineage_of",
 ];
 
-/// 构建 union toolkit(内置 15 + 规则 30 = 45 工具,启动时一次组装)
+/// 构建 union toolkit(内置 15 + 规则 35 = 50 工具,启动时一次组装)
 ///
 /// 在 `cmd_serve` 启动时调用一次,结果存入 `AgentApiState.toolkit`。
 pub fn build_union_toolkit(
@@ -625,6 +631,29 @@ mod tests {
     }
 
     #[test]
+    fn test_union_whitelist_covers_bundles_deploy_tools() {
+        // bundles 部署闭环 5 工具必须在 serve union 白名单内——缺失=工具
+        // spec/full toolkit 在场但装配面缺席,工作台会话拿不到(历史断链面)
+        let w2_tools = [
+            "bundle_export",
+            "bundle_import_dry_run",
+            "bundle_import",
+            "bundle_active_list",
+            "bundle_imports_list",
+        ];
+        for name in w2_tools {
+            assert!(
+                RULE_TOOL_NAMES.contains(&name),
+                "W2 bundle tool '{name}' missing from serve union whitelist"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for name in RULE_TOOL_NAMES {
+            assert!(seen.insert(*name), "duplicate in union whitelist: {name}");
+        }
+    }
+
+    #[test]
     fn test_governance_write_switch_defaults_to_full_open() {
         // 默认(键缺失):21 写工具全部在面——治理写权默认全开,向后兼容锁
         let (ws, ev) = make_clients();
@@ -726,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_union_toolkit_registers_30_tools() {
+    fn test_build_union_toolkit_registers_rule_tools() {
         let (ws, ev) = make_clients();
         let handler = build_union_toolkit(Path::new("."), &ws, &ev);
 
@@ -766,7 +795,7 @@ mod tests {
             );
         }
 
-        // 总数 = 17 + 30 = 47(逐个验证所有预期工具都在)
+        // 总数 = 17 + 35 = 52(逐个验证所有预期工具都在)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -790,7 +819,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 47, "expected 47 total tool names");
+        assert_eq!(all_names.len(), 52, "expected 52 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),

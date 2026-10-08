@@ -130,7 +130,7 @@ service_tools = ["config_persist", "rule_sandbox"]
                 name
             );
         }
-        assert_eq!(tools.len(), 29, "expected 29 tools in rule-copilot.json");
+        assert_eq!(tools.len(), 34, "expected 34 tools in rule-copilot.json");
     }
 
     #[test]
