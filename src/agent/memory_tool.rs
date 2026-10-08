@@ -1091,13 +1091,17 @@ pub(crate) async fn memory_link_exec(
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "missing required param: source (existing memory key/path tail)".to_string())?;
+        .ok_or_else(|| {
+            "missing required param: source (existing memory key/path tail)".to_string()
+        })?;
     let target = args
         .get("target")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "missing required param: target (existing memory key/path tail)".to_string())?;
+        .ok_or_else(|| {
+            "missing required param: target (existing memory key/path tail)".to_string()
+        })?;
     if source == target {
         return Err("self-link rejected: source and target must differ".to_string());
     }
@@ -1170,7 +1174,12 @@ pub struct MemoryLinkTool {
 }
 
 impl MemoryLinkTool {
-    pub fn new(namespace: String, client: EvoruleApiClient, session_id: String, relations: Vec<String>) -> Self {
+    pub fn new(
+        namespace: String,
+        client: EvoruleApiClient,
+        session_id: String,
+        relations: Vec<String>,
+    ) -> Self {
         Self {
             namespace,
             client,
@@ -1272,7 +1281,12 @@ pub(crate) async fn memory_forget_exec(
     let record = match serde_json::from_str::<MemoryRecord>(&raw) {
         Ok(mut r) => {
             if r.key.is_empty() {
-                r.key = matched.path.rsplit('.').next().unwrap_or(&matched.path).to_string();
+                r.key = matched
+                    .path
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&matched.path)
+                    .to_string();
             }
             r
         }

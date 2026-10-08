@@ -813,15 +813,15 @@ async fn harvest_procedural_materials(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    for (seq, (category, summary)) in
-        candidates.into_iter().take(MATERIAL_HARVEST_CAP).enumerate()
+    for (seq, (category, summary)) in candidates
+        .into_iter()
+        .take(MATERIAL_HARVEST_CAP)
+        .enumerate()
     {
         let event_id = format!("PM-{}-{seq}", sanitize_model_id(session_id));
         let mut event = crate::agent::memory_event::event::MemoryEvent::new_root(
             &event_id,
-            crate::agent::memory_event::event::EventType::Custom(
-                "procedural_material".to_string(),
-            ),
+            crate::agent::memory_event::event::EventType::Custom("procedural_material".to_string()),
             now,
             crate::agent::memory_event::event::EventSource::SystemObservation,
         )
@@ -1611,17 +1611,50 @@ mod tests {
             journal_lines: Vec::new(),
         };
         let lines = vec![
-            JournalLine { seq: 1, ts: 1, event: JournalEvent::ApprovalRequested {
-                approval_id: "ap1".into(), tool: "file_write".into(), payload: "敏感路径".into() } },
-            JournalLine { seq: 2, ts: 2, event: JournalEvent::ApprovalResolved {
-                approval_id: "ap1".into(), decision: "rejected".into() } },
-            JournalLine { seq: 3, ts: 3, event: JournalEvent::PolicyJudged {
-                judgement_id: "j1".into(), verdict: "blocked".into(), evidence: "shell 越界".into() } },
+            JournalLine {
+                seq: 1,
+                ts: 1,
+                event: JournalEvent::ApprovalRequested {
+                    approval_id: "ap1".into(),
+                    tool: "file_write".into(),
+                    payload: "敏感路径".into(),
+                },
+            },
+            JournalLine {
+                seq: 2,
+                ts: 2,
+                event: JournalEvent::ApprovalResolved {
+                    approval_id: "ap1".into(),
+                    decision: "rejected".into(),
+                },
+            },
+            JournalLine {
+                seq: 3,
+                ts: 3,
+                event: JournalEvent::PolicyJudged {
+                    judgement_id: "j1".into(),
+                    verdict: "blocked".into(),
+                    evidence: "shell 越界".into(),
+                },
+            },
             // 重复摘要(同工具同载荷同决定)→去重
-            JournalLine { seq: 4, ts: 4, event: JournalEvent::ApprovalRequested {
-                approval_id: "ap2".into(), tool: "file_write".into(), payload: "敏感路径".into() } },
-            JournalLine { seq: 5, ts: 5, event: JournalEvent::ApprovalResolved {
-                approval_id: "ap2".into(), decision: "rejected".into() } },
+            JournalLine {
+                seq: 4,
+                ts: 4,
+                event: JournalEvent::ApprovalRequested {
+                    approval_id: "ap2".into(),
+                    tool: "file_write".into(),
+                    payload: "敏感路径".into(),
+                },
+            },
+            JournalLine {
+                seq: 5,
+                ts: 5,
+                event: JournalEvent::ApprovalResolved {
+                    approval_id: "ap2".into(),
+                    decision: "rejected".into(),
+                },
+            },
         ];
         let mut result = SedimentResult::default();
         harvest_procedural_materials(&lines, &mut deps, "s-pm", &mut result).await;
@@ -1636,8 +1669,7 @@ mod tests {
     #[tokio::test]
     async fn test_journal_digest_not_starved_by_failure_drafts() {
         // 回归:草稿与摘要投影同开时,journal 行单次取走共享——digest 不再饿死
-        let mut mgr =
-            MemoryManager::new("ns", make_test_client()).with_session_id("s-starve");
+        let mut mgr = MemoryManager::new("ns", make_test_client()).with_session_id("s-starve");
         let mut cfg = SedimentConfig::default();
         cfg.enable_failure_drafts = true;
         cfg.enable_journal_digest = true;
@@ -1647,22 +1679,35 @@ mod tests {
             extractor: None,
             event_store: None,
             auditor: None,
-            journal_lines: vec![JournalLine { seq: 1, ts: 1, event: JournalEvent::ToolResult {
-                call_id: "t1".into(), status: "error".into(), size_bytes: 1,
-                content_digest: "blake3:aa".into() } }],
+            journal_lines: vec![JournalLine {
+                seq: 1,
+                ts: 1,
+                event: JournalEvent::ToolResult {
+                    call_id: "t1".into(),
+                    status: "error".into(),
+                    size_bytes: 1,
+                    content_digest: "blake3:aa".into(),
+                },
+            }],
         };
         let result = sediment(
             &mut deps,
             &cfg,
             "s-starve",
-            &[Message::User { content: "g".to_string() }],
+            &[Message::User {
+                content: "g".to_string(),
+            }],
         )
         .await;
         // 离线可观测面:草稿经 set_scoped CacheOnly 落 cache——同开两开关时
         // 草稿照常产出=journal 行到达了共享切片消费方。digest 侧的饿死防护
         // 为结构性保证:journal 行单次 move+三消费方切片借用,双重 take 已
         // 不可表示(修复前:草稿 mem::take 整表→摘要投影同开时饿死空转)。
-        assert_eq!(result.failure_drafts.len(), 1, "草稿照常产出(离线 CacheOnly)");
+        assert_eq!(
+            result.failure_drafts.len(),
+            1,
+            "草稿照常产出(离线 CacheOnly)"
+        );
         assert!(
             result.procedural_materials.is_empty(),
             "材料收割未开启时不产候选"

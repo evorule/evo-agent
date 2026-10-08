@@ -1646,9 +1646,7 @@ mod tests {
             1_700_000_100,
         );
         golden_session.fact_id = Some(2);
-        recall
-            .summaries
-            .push(golden_session);
+        recall.summaries.push(golden_session);
         let mut golden_event = crate::agent::memory::MemoryRecord::new(
             "golden.events.e1",
             "固定事件。",
