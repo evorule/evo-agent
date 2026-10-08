@@ -301,6 +301,30 @@ fn default_degradation() -> Vec<String> {
 ///
 /// 来源三形态（同 AssemblyRecipe 先例）：definition 内嵌 / `$ref` 外部文件 /
 /// 默认常量。`recipe_version` 随召回结果落链（版本戳纪律，同 F-302）。
+/// 冷热分层存储配置（F-617：冷迁门控；缺省关）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// 是否启用冷迁（Archived/Tombstoned/Decayed 超窗 → lex-cold.db）
+    #[serde(default)]
+    pub cold_tier: bool,
+    /// Tombstoned 是否随迁（缺省随——墓碑留冷库可查,热库退出）
+    #[serde(default = "default_true_storage")]
+    pub cold_include_tombstones: bool,
+}
+
+fn default_true_storage() -> bool {
+    true
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            cold_tier: false,
+            cold_include_tombstones: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecipe {
     /// 配方版本（memory-v1.0 起）
@@ -327,6 +351,9 @@ pub struct MemoryRecipe {
     /// 机制不再藏策略参数。None=机制缺省 60s，既有 agent 零影响）
     #[serde(default)]
     pub lex_ttl_secs: Option<u64>,
+    /// 冷热分层存储门控（F-617:缺省关=既有 agent 零影响）
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 impl Default for MemoryRecipe {
@@ -351,6 +378,10 @@ impl Default for MemoryRecipe {
                 rollup_threshold: default_rollup_threshold(),
                 confidence_evolution: false,
                 decay_after_idle_days: default_decay_after_idle_days(),
+            },
+            storage: StorageConfig {
+                cold_tier: false,
+                cold_include_tombstones: true,
             },
             budget: BudgetConfig {
                 degradation_order: default_degradation(),
