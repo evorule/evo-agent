@@ -1,0 +1,15 @@
+{
+  "workflow_id": "capability_drill",
+  "description": "能力缺口路由演练(capability gap routing):gap_boom 声明 atomic=true 且使用不存在的 agent_type(必败)→--max-recut 0=重切空间空集→首败即判「切法空间内不可解」→能力缺口终止+marks 信号 meta_signal.capability_gap 落链+writeback 事件上报",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "gap_boom",
+      "agent_type": "ghost_agent",
+      "atomic": true,
+      "task": "这个节点使用不存在的 agent_type,预期失败——用于演练原子粒能力缺口路由(原子粒不可重拆,失败即上报能力缺口)",
+      "depends_on": []
+    }
+  ],
+  "output_node": "gap_boom"
+}

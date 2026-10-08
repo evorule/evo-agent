@@ -945,6 +945,7 @@ async fn run_plan_execute_request(
     // 驱动限额与 CLI workflow 子命令缺省一致（阈值禁入 PlanFact）
     let limits = crate::agent::driver::DriverLimits {
         max_replan: 3,
+        max_recuts: 3,
         max_wall_ms: Some(1_800_000),
         max_tokens: None,
     };

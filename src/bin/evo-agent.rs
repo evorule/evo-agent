@@ -206,6 +206,10 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         max_replan: u32,
 
+        /// 原子粒重切预算(分类路由缺省 3;0 = 原子粒失败即判能力缺口)
+        #[arg(long, default_value_t = 3)]
+        max_recut: u32,
+
         /// 墙钟预算毫秒(默认 1,800,000 = 30 分钟,交付物 6 §5.2)
         #[arg(long, default_value_t = 1_800_000)]
         max_wall_ms: u64,
@@ -355,6 +359,7 @@ fn main() -> ExitCode {
             max_concurrent,
             plan_execute,
             max_replan,
+            max_recut,
             max_wall_ms,
             max_tokens,
         } => cmd_workflow(
@@ -367,6 +372,7 @@ fn main() -> ExitCode {
                 plan_execute,
                 limits: DriverLimits {
                     max_replan,
+                    max_recuts: max_recut,
                     max_wall_ms: Some(max_wall_ms),
                     max_tokens,
                 },

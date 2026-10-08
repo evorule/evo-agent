@@ -91,10 +91,9 @@ pub enum ReplanReason {
     Budget,
 }
 
-/// 节点失败分类（契约 v0）：接口失败区别于粒失败
-///
-/// 路由消费面（按类别决定 replan/终止/反馈策略）在后续批次接入；本批次只
-/// 落分类判定与记录承载（`WorkflowFailureRecord.failure_class` 随摘要 JSON 形态）。
+/// 节点失败分类（分类路由）：接口失败区别于粒失败；漂移为分类学预留位
+/// （执行面标注源后置——v0 分类判定只产粒/接口两类，路由面预留其处置位）；
+/// 能力缺口为路由判定产物（非执行面标注——原子粒重切预算耗尽时由路由面改标）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeFailureClass {
@@ -102,6 +101,65 @@ pub enum NodeFailureClass {
     Granule,
     /// 接口失败：产出违反粒间契约（非 JSON / schema 校验不过，契约 v0）
     Interface,
+    /// 漂移：节点产出偏离任务语义（治漂手段为独立实验线，不并入本路由——
+    /// v0 无执行面标注源，路由面预留「不重拆」处置位）
+    Drift,
+    /// 原子粒-能力缺口：原子粒重切预算耗尽（切法空间内不可解——路由判定
+    /// 改标，随失败摘要与上报事件落账）
+    CapabilityGap,
+}
+
+/// 失败路由决策（分类路由表：由失败分类 + 原子粒标记 + 重切预算共同决定）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureRoute {
+    /// 粒失败 → replan 再拆（常规恢复）
+    ReplanSplit,
+    /// 接口失败 → replan 但不重拆：粒本身正确，拆小无益——契约缺口描述随
+    /// 失败摘要回喂，指令约束 planner 修复产出以满足粒间契约
+    ReplanRepairContract,
+    /// 漂移 → 不重拆（v0 显式终止不静默；治漂走独立实验线）
+    DriftHalt,
+    /// 原子粒-能力缺口 → 终止不再拆 + 上报（marks 链入账 + writeback 事件）
+    CapabilityGapHalt,
+}
+
+/// 失败路由输入（外层驱动按失败节点反查回填；纯函数显式输入——判定面
+/// 不引入 LLM/时钟/环境）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailureRouteInput {
+    /// 失败节点是否原子粒（当前版节点标记，或原子粒记忆命中——原子性是
+    /// 工作事实，一经标记跨版本持续有效）
+    pub atomic: bool,
+    /// 该节点已发生的重切次数（驱动按失败节点 id 计数）
+    pub recut_count: u32,
+    /// 重切预算 N（驱动配置，缺省 3）
+    pub max_recuts: u32,
+}
+
+/// 失败路由表（纯函数；同输入必同输出）
+///
+/// 判定顺序：分类优先（接口/漂移有专属路由），原子粒重切预算其次——粒失败
+/// 且原子粒标记且重切计数已达预算 → 能力缺口（不再拆）；其余粒失败 → 常规
+/// 再拆。能力缺口分类直接映射终止路由（防御性直通，正常流中该分类由本表
+/// 产出而非输入）。
+pub fn route_for_failure_class(
+    class: NodeFailureClass,
+    atomic: bool,
+    recut_count: u32,
+    max_recuts: u32,
+) -> FailureRoute {
+    match class {
+        NodeFailureClass::Interface => FailureRoute::ReplanRepairContract,
+        NodeFailureClass::Drift => FailureRoute::DriftHalt,
+        NodeFailureClass::CapabilityGap => FailureRoute::CapabilityGapHalt,
+        NodeFailureClass::Granule => {
+            if atomic && recut_count >= max_recuts {
+                FailureRoute::CapabilityGapHalt
+            } else {
+                FailureRoute::ReplanSplit
+            }
+        }
+    }
 }
 
 /// 按失败文本分类（纯函数）：携带接口契约标记 → Interface，否则 Granule
@@ -132,7 +190,8 @@ pub struct WorkflowFailureRecord {
     pub failed_node_id: Option<String>,
     /// 失败节点 agent 类型（外层按 failed_node_id 反查；反查不到为 None）
     pub agent_type: Option<String>,
-    /// 失败分类（契约 v0：接口失败区别于粒失败；路由消费面在后续批次）
+    /// 失败分类（分类路由：粒/接口/漂移/能力缺口；接口失败由执行面标注，
+    /// 能力缺口由路由判定改标——见 [`route_for_failure_class`]）
     pub failure_class: NodeFailureClass,
     /// G9 execute Err 全文
     pub error_message: String,
@@ -147,6 +206,8 @@ pub struct ReplanDecision {
     pub failure_record: Option<WorkflowFailureRecord>,
     /// 仅 Budget 触发时携带（触发时计数器快照）
     pub budget_snapshot: Option<BudgetCounters>,
+    /// 失败路由（分类路由表产物；Budget 触发无失败路由 = None）
+    pub route: Option<FailureRoute>,
 }
 
 /// replan 触发判定总函数（交付物 6 §2；纯函数，判定顺序写死）
@@ -155,13 +216,28 @@ pub fn should_replan(
     counters: &BudgetCounters,
     thresholds: &BudgetThresholds,
     replan_state: &ReplanState,
+    route_input: &FailureRouteInput,
 ) -> Option<ReplanDecision> {
     // 1. 硬上限终止（优先于一切，即使本次执行失败也不再 replan）
     if replan_state.replan_count >= thresholds.max_replan {
         return None;
     }
-    // 2. 失败优先于预算判定
+    // 2. 失败优先于预算判定；失败分类路由（粒→再拆 / 接口→修契约不重拆 /
+    //    漂移→终止 / 原子粒重切预算耗尽→能力缺口终止）
     if let Err(err_text) = outcome {
+        let failure_class = classify_node_failure(err_text);
+        let route = route_for_failure_class(
+            failure_class,
+            route_input.atomic,
+            route_input.recut_count,
+            route_input.max_recuts,
+        );
+        // 路由判为能力缺口 → 失败分类改标（摘要/上报事件随路由一致）
+        let record_class = if route == FailureRoute::CapabilityGapHalt {
+            NodeFailureClass::CapabilityGap
+        } else {
+            failure_class
+        };
         return Some(ReplanDecision {
             reason: ReplanReason::Failure,
             failure_record: Some(WorkflowFailureRecord {
@@ -170,10 +246,11 @@ pub fn should_replan(
                 failed_plan_hash: None,
                 failed_node_id: parse_failed_node_id(err_text),
                 agent_type: None, // 由外层驱动按 failed_node_id 反查后回填
-                failure_class: classify_node_failure(err_text),
+                failure_class: record_class,
                 error_message: err_text.clone(),
             }),
             budget_snapshot: None,
+            route: Some(route),
         });
     }
     // 3. 预算任一维度达到阈值（None 维度不参与）
@@ -185,6 +262,7 @@ pub fn should_replan(
             reason: ReplanReason::Budget,
             failure_record: None,
             budget_snapshot: Some(counters.clone()),
+            route: None,
         });
     }
     // 4. 其余不触发
@@ -217,6 +295,17 @@ pub fn lookup_agent_type(nodes: &[WorkflowNode], node_id: &str) -> Option<String
         .map(|n| n.agent_type.clone())
 }
 
+/// 按失败节点 id 反查原子粒标记（纯函数查表）
+///
+/// 查不到 = false 不猜测——能力缺口判定要求显式标记，缺标记按常规粒处理。
+pub fn lookup_node_atomic(nodes: &[WorkflowNode], node_id: &str) -> bool {
+    nodes
+        .iter()
+        .find(|n| n.id == node_id)
+        .map(|n| n.atomic)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +334,91 @@ mod tests {
         }
     }
 
+    fn route_input(atomic: bool, recut: u32, max: u32) -> FailureRouteInput {
+        FailureRouteInput {
+            atomic,
+            recut_count: recut,
+            max_recuts: max,
+        }
+    }
+
+    // ----- 失败路由表（分类路由：四类各一 UT；纯函数同输入同输出）-----
+
+    #[test]
+    fn route_granule_replans_split() {
+        // 粒失败（非原子粒 / 预算内）→ 常规再拆
+        assert_eq!(
+            route_for_failure_class(NodeFailureClass::Granule, false, 0, 3),
+            FailureRoute::ReplanSplit
+        );
+        assert_eq!(
+            route_for_failure_class(NodeFailureClass::Granule, true, 2, 3),
+            FailureRoute::ReplanSplit
+        );
+    }
+
+    #[test]
+    fn route_interface_repairs_contract_without_resplit() {
+        // 接口失败 → 不重拆，契约缺口回喂修复
+        assert_eq!(
+            route_for_failure_class(NodeFailureClass::Interface, false, 0, 3),
+            FailureRoute::ReplanRepairContract
+        );
+        assert_eq!(
+            route_for_failure_class(NodeFailureClass::Interface, true, 9, 3),
+            FailureRoute::ReplanRepairContract
+        );
+    }
+
+    #[test]
+    fn route_drift_halts_without_resplit() {
+        // 漂移 → 不重拆终止（治漂独立线，v0 显式不静默）
+        assert_eq!(
+            route_for_failure_class(NodeFailureClass::Drift, false, 0, 3),
+            FailureRoute::DriftHalt
+        );
+    }
+
+    #[test]
+    fn route_capability_gap_when_atomic_recut_budget_exhausted() {
+        // 原子粒 + 重切计数达预算 → 能力缺口（不再拆）；>= 语义等值触发
+        assert_eq!(
+            route_for_failure_class(NodeFailureClass::Granule, true, 3, 3),
+            FailureRoute::CapabilityGapHalt
+        );
+        // 非原子粒 → 永远常规再拆（能力缺口要求显式标记）
+        assert_eq!(
+            route_for_failure_class(NodeFailureClass::Granule, false, 9, 3),
+            FailureRoute::ReplanSplit
+        );
+    }
+
+    #[test]
+    fn route_is_deterministic() {
+        // 纯函数：同输入必同输出
+        let a = route_for_failure_class(NodeFailureClass::Granule, true, 1, 3);
+        let b = route_for_failure_class(NodeFailureClass::Granule, true, 1, 3);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn lookup_node_atomic_from_expanded_nodes() {
+        let nodes = vec![WorkflowNode {
+            id: "atomic_x".to_string(),
+            agent_type: "researcher".to_string(),
+            task: String::new(),
+            task_template: None,
+            depends_on: Vec::new(),
+            run_when: None,
+            compute: None,
+            output_schema: None,
+            judge: None,
+            atomic: true,
+        }];
+        assert!(lookup_node_atomic(&nodes, "atomic_x"));
+        assert!(!lookup_node_atomic(&nodes, "ghost")); // 查不到 = false 不猜测
+    }
+
     // ----- 判定顺序四分支（交付物 6 §2，顺序写死）-----
 
     #[test]
@@ -252,7 +426,13 @@ mod tests {
         // 1. replan_count >= max_replan → None（即使本次执行失败也不再 replan）
         let outcome: Result<String, String> = Err("workflow node 'a' failed: boom".to_string());
         assert_eq!(
-            should_replan(&outcome, &counters(99, 99_999), &thresholds(), &state(3)),
+            should_replan(
+                &outcome,
+                &counters(99, 99_999),
+                &thresholds(),
+                &state(3),
+                &route_input(false, 0, 3)
+            ),
             None
         );
     }
@@ -261,10 +441,17 @@ mod tests {
     fn decision_order_failure_precedes_budget() {
         // 2. Err 优先于预算判定：Err + 计数器双超 → Failure 而非 Budget
         let outcome: Result<String, String> = Err("workflow node 'a' failed: boom".to_string());
-        let d = should_replan(&outcome, &counters(99, 99_999), &thresholds(), &state(0))
-            .expect("failure must trigger");
+        let d = should_replan(
+            &outcome,
+            &counters(99, 99_999),
+            &thresholds(),
+            &state(0),
+            &route_input(false, 0, 3),
+        )
+        .expect("failure must trigger");
         assert_eq!(d.reason, ReplanReason::Failure);
         assert!(d.budget_snapshot.is_none());
+        assert_eq!(d.route, Some(FailureRoute::ReplanSplit));
         let record = d.failure_record.expect("failure record present");
         assert_eq!(record.trigger, "node_failure");
         assert_eq!(record.failed_plan_version, 1);
@@ -277,14 +464,22 @@ mod tests {
         // 3. 计数器各维度独立触发（Ok 但预算耗尽 → Budget）
         let ok: Result<String, String> = Ok("done".to_string());
         for c in [counters(10, 0), counters(0, 1_000)] {
-            let d = should_replan(&ok, &c, &thresholds(), &state(0)).expect("budget trigger");
+            let d = should_replan(&ok, &c, &thresholds(), &state(0), &route_input(false, 0, 3))
+                .expect("budget trigger");
             assert_eq!(d.reason, ReplanReason::Budget);
             assert!(d.failure_record.is_none());
+            assert!(d.route.is_none());
             assert_eq!(d.budget_snapshot, Some(c.clone()));
         }
         // 恰好低于阈值 → 不触发（>= 语义：等值触发）
         assert_eq!(
-            should_replan(&ok, &counters(9, 999), &thresholds(), &state(0)),
+            should_replan(
+                &ok,
+                &counters(9, 999),
+                &thresholds(),
+                &state(0),
+                &route_input(false, 0, 3)
+            ),
             None
         );
     }
@@ -300,7 +495,13 @@ mod tests {
             max_tokens: None,
         };
         assert_eq!(
-            should_replan(&ok, &counters(u64::MAX / 2, u64::MAX / 2), &t, &state(0)),
+            should_replan(
+                &ok,
+                &counters(u64::MAX / 2, u64::MAX / 2),
+                &t,
+                &state(0),
+                &route_input(false, 0, 3)
+            ),
             None
         );
     }
@@ -320,7 +521,8 @@ mod tests {
             wall_ms: 0,
             tokens_used: 50,
         };
-        let d = should_replan(&ok, &c, &t, &state(0)).expect("tokens budget trigger");
+        let d = should_replan(&ok, &c, &t, &state(0), &route_input(false, 0, 3))
+            .expect("tokens budget trigger");
         assert_eq!(d.reason, ReplanReason::Budget);
         assert!(d.failure_record.is_none());
         assert_eq!(d.budget_snapshot, Some(c));
@@ -330,15 +532,30 @@ mod tests {
             wall_ms: 0,
             tokens_used: 49,
         };
-        assert_eq!(should_replan(&ok, &under, &t, &state(0)), None);
+        assert_eq!(
+            should_replan(&ok, &under, &t, &state(0), &route_input(false, 0, 3)),
+            None
+        );
     }
 
     #[test]
     fn decision_is_deterministic() {
         // 纯函数：同输入必同输出
         let outcome: Result<String, String> = Err("workflow node 'x' failed: e".to_string());
-        let a = should_replan(&outcome, &counters(1, 1), &thresholds(), &state(0));
-        let b = should_replan(&outcome, &counters(1, 1), &thresholds(), &state(0));
+        let a = should_replan(
+            &outcome,
+            &counters(1, 1),
+            &thresholds(),
+            &state(0),
+            &route_input(true, 1, 3),
+        );
+        let b = should_replan(
+            &outcome,
+            &counters(1, 1),
+            &thresholds(),
+            &state(0),
+            &route_input(true, 1, 3),
+        );
         assert_eq!(a, b);
     }
 
@@ -375,6 +592,7 @@ mod tests {
             compute: None,
             output_schema: None,
             judge: None,
+            atomic: false,
         }];
         assert_eq!(
             lookup_agent_type(&nodes, "lp_iter0_s"),
@@ -444,15 +662,47 @@ mod tests {
                 "s",
                 "0: \"x\" is not of type \"object\"",
             ));
-        let d = should_replan(&outcome, &counters(0, 0), &thresholds(), &state(0))
-            .expect("failure must trigger");
+        let d = should_replan(
+            &outcome,
+            &counters(0, 0),
+            &thresholds(),
+            &state(0),
+            &route_input(false, 0, 3),
+        )
+        .expect("failure must trigger");
         let record = d.failure_record.expect("record present");
         assert_eq!(record.failure_class, NodeFailureClass::Interface);
         assert_eq!(record.failed_node_id.as_deref(), Some("s"));
+        assert_eq!(d.route, Some(FailureRoute::ReplanRepairContract));
         let json = serde_json::to_string_pretty(&record).unwrap();
         assert!(
             json.contains("\"failure_class\": \"interface\""),
             "摘要 JSON 须携带 interface 分类: {json}"
+        );
+    }
+
+    #[test]
+    fn should_replan_halts_capability_gap_and_relabels_class() {
+        // 原子粒重切预算耗尽 → 终止路由 + 失败分类改标 capability_gap（随摘要
+        // JSON 形态落账——上报事件与摘要分类一致）
+        let outcome: Result<String, String> = Err("workflow node 'a' failed: boom".to_string());
+        let d = should_replan(
+            &outcome,
+            &counters(0, 0),
+            &thresholds(),
+            &state(0),
+            &route_input(true, 3, 3),
+        )
+        .expect("halt decision must trigger");
+        assert_eq!(d.reason, ReplanReason::Failure);
+        assert_eq!(d.route, Some(FailureRoute::CapabilityGapHalt));
+        let record = d.failure_record.expect("record present");
+        assert_eq!(record.failure_class, NodeFailureClass::CapabilityGap);
+        assert_eq!(record.failed_node_id.as_deref(), Some("a"));
+        let json = serde_json::to_string_pretty(&record).unwrap();
+        assert!(
+            json.contains("\"failure_class\": \"capability_gap\""),
+            "摘要 JSON 须携带 capability_gap 分类: {json}"
         );
     }
 }

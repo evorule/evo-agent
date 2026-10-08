@@ -155,6 +155,8 @@ struct IrNode {
     output_schema: Option<serde_json::Value>,
     /// 节点判据声明（可选，判据 v0 第二级；DSL/PlanFact 两形态同构透传）
     judge: Option<crate::agent::workflow::JudgeSpec>,
+    /// 原子粒标记（可选，分类路由；DSL/PlanFact 两形态同构透传）
+    atomic: bool,
     /// 内联 depends_on（仅 DSL 形态；PlanFact 形态恒空，依赖由顶层 edges 表达）。
     /// 归一化后被收入 Ir.dep_edges，展开 pass 不再读本字段。
     deps: Vec<String>,
@@ -244,6 +246,12 @@ fn parse_dsl_node(v: &serde_json::Value) -> Result<IrNode, String> {
                 serde_json::from_value::<crate::agent::workflow::JudgeSpec>(j.clone())
                     .map_err(|e| format!("节点 '{id}' judge 解析失败: {e}"))?,
             ),
+        },
+        atomic: match v.get("atomic") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(b) => b
+                .as_bool()
+                .ok_or_else(|| format!("节点 '{id}' atomic 声明须为布尔"))?,
         },
         deps: depends_on_of(v, id)?,
     })
@@ -802,6 +810,7 @@ fn rewrite_node(
         compute,
         output_schema: src.output_schema.clone(),
         judge: src.judge.clone(),
+        atomic: src.atomic,
     })
 }
 

@@ -1,0 +1,26 @@
+{
+  "workflow_id": "contract_drill",
+  "description": "接口失败路由演练(interface failure routing):producer 指令性输出固定文本→checker(regex_match)产出纯文本但声明 object 契约→运行期契约校验必败=接口失败→外层路由「不重拆,修复输出契约」;v2 重产计划不带 output_schema(planner 不识)→契约消失→执行成功",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "producer",
+      "agent_type": "researcher",
+      "task": "输出且仅输出以下固定文本,不要改写、不要解释、不要添加任何版本号或 JSON 结构:draft artifact placeholder",
+      "depends_on": []
+    },
+    {
+      "id": "checker",
+      "compute": {
+        "function": "regex_match",
+        "inputs": ["producer"],
+        "pattern": "version:1.0.0"
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "depends_on": ["producer"]
+    }
+  ],
+  "output_node": "checker"
+}

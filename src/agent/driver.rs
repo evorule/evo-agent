@@ -52,7 +52,8 @@ use serde_json::{json, Value};
 use crate::agent::delegate::DelegateContext;
 use crate::agent::materializer::materialize_plan_fact;
 use crate::agent::replan::{
-    lookup_agent_type, should_replan, BudgetCounters, BudgetThresholds, ReplanReason, ReplanState,
+    lookup_agent_type, lookup_node_atomic, parse_failed_node_id, should_replan, BudgetCounters,
+    BudgetThresholds, FailureRoute, FailureRouteInput, ReplanReason, ReplanState,
 };
 use crate::agent::workflow::{Workflow, WorkflowEngine};
 use crate::api::evorule_client::EvoruleApiClient;
@@ -73,6 +74,8 @@ pub enum PlanMode {
 pub struct DriverLimits {
     /// replan 硬上限（纲领拍板默认 3）
     pub max_replan: u32,
+    /// 原子粒重切预算（分类路由，缺省 3；0 = 原子粒失败即判能力缺口）
+    pub max_recuts: u32,
     /// 墙钟预算毫秒（默认 1,800,000 = 30 分钟；None = 不限）
     pub max_wall_ms: Option<u64>,
     /// token 预算上限（累计 tokens_used ≥ 阈值触发 Budget；None = 不限，
@@ -157,6 +160,12 @@ pub async fn run_plan_loop(
     let mut goal: Option<String> = None;
     // 已执行注册表（跨版本累积 (node_id, agent_type)；R8-T03 静态拦截比对源）
     let mut executed_registry: Vec<(String, String)> = Vec::new();
+    // 原子粒工作事实记忆（分类路由）：曾携带 atomic 标记的节点 id 集合——
+    // 原子性一经标记跨版本持续有效（replan 重产计划不带 atomic 字段，记忆集
+    // 合补事实连续性）
+    let mut atomic_granules: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 按节点重切计数（分类路由：原子粒重切预算判定输入）
+    let mut recut_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     // v2+ 版本 token 消耗（replan 重复执行成本埋点，交付物 7 / D-02 判定源）
     let mut replan_tokens: u64 = 0;
     // 静态拦截命中累计（R8-T03 幂等重复告警计数）
@@ -248,6 +257,22 @@ pub async fn run_plan_loop(
         thresholds.max_wall_ms = limits.max_wall_ms;
         thresholds.max_tokens = limits.max_tokens;
 
+        // 分类路由输入：失败节点 id 反解 → atomic 判定（结构标记 ∨ 记忆
+        // 集合——原子性一经标记跨版本持续有效，replan 重产计划不带该字段）→
+        // 该节点重切计数。route_input 是 should_replan 纯函数的第 5 参。
+        let failed_node_id = result.as_ref().err().and_then(|e| parse_failed_node_id(e));
+        let route_input = FailureRouteInput {
+            atomic: failed_node_id
+                .as_ref()
+                .map(|id| lookup_node_atomic(&cur_wf.nodes, id) || atomic_granules.contains(id))
+                .unwrap_or(false),
+            recut_count: failed_node_id
+                .as_ref()
+                .map(|id| recut_counts.get(id).copied().unwrap_or(0))
+                .unwrap_or(0),
+            max_recuts: limits.max_recuts,
+        };
+
         let Some(mut decision) = should_replan(
             &result,
             &counters,
@@ -256,6 +281,7 @@ pub async fn run_plan_loop(
                 current_version: version,
                 replan_count,
             },
+            &route_input,
         ) else {
             // 到此必为： outcome Ok（无触发）或 replan 硬上限已耗尽（含 Err 情形——
             // 交付物 6 §2 判定序第 1 步优先返回 None）。Err 必须显式传播不静默。
@@ -302,6 +328,104 @@ pub async fn run_plan_loop(
             }
         }
 
+        // 分类路由分派：Failure 决策按 FailureRoute 处置——Split 走既有
+        // replan（原子粒附「同 id 保留 + 换维度重切」指令，重切计数递进）；
+        // RepairContract 走 replan 但注入「不重拆 + 契约修复」指令（契约缺口
+        // 描述已随 failure_record 入 trigger 回喂）；两类 Halt 显式终止不 replan
+        // （漂移走治漂独立线不并入；能力缺口=切法空间内不可解，上报后终止）。
+        let err_text = match &result {
+            Err(e) => e.clone(),
+            Ok(_) => String::new(), // Budget 触发：无失败文本（防御占位）
+        };
+        let mut route_guidance: Option<String> = None;
+        match (&decision.reason, decision.route) {
+            (ReplanReason::Budget, _) => {} // 预算触发无路由（既有行为零变更）
+            (ReplanReason::Failure, Some(FailureRoute::ReplanSplit)) => {
+                if let (true, Some(node_id)) = (route_input.atomic, failed_node_id.as_ref()) {
+                    atomic_granules.insert(node_id.clone()); // 记忆集：跨版本持续有效
+                    let k = recut_counts.entry(node_id.clone()).or_insert(0);
+                    let hint = recut_dimension_hint(*k);
+                    *k += 1;
+                    let attempt = *k;
+                    route_guidance = Some(format!(
+                        "ROUTING: failed node '{node_id}' is an ATOMIC granule (recut \
+                         {attempt}/{max}). Keep a node with the SAME id '{node_id}' covering \
+                         the same work in the new plan, but re-cut it along a DIFFERENT \
+                         dimension. Suggested dimension: {hint}.",
+                        max = limits.max_recuts,
+                    ));
+                }
+            }
+            (ReplanReason::Failure, Some(FailureRoute::ReplanRepairContract)) => {
+                if let Some(node_id) = &failed_node_id {
+                    route_guidance = Some(format!(
+                        "ROUTING: failed node '{node_id}' hit an interface failure — its \
+                         OUTPUT violates the inter-granule contract. Do NOT split this node \
+                         into smaller granules (the granule itself is correct); repair the \
+                         node's output to satisfy the contract described in the failure \
+                         record below."
+                    ));
+                }
+            }
+            (ReplanReason::Failure, Some(FailureRoute::DriftHalt)) => {
+                return Err(format!(
+                    "halted by drift-classified node failure (no resplit; drift handling is a \
+                     separate track; versions={} replans={}): {}",
+                    version, replan_count, err_text
+                ));
+            }
+            (ReplanReason::Failure, Some(FailureRoute::CapabilityGapHalt)) => {
+                let node_id = failed_node_id
+                    .clone()
+                    .unwrap_or_else(|| "(unknown)".to_string());
+                // marks 信号 fail-fast（留痕是硬义务，与 node_done 信号同纪律）
+                if let Some(sid) = marks_session.as_deref() {
+                    submit_signal(
+                        ctx_ref.evorule_client.clone(),
+                        sid,
+                        &capability_gap_signal(&node_id),
+                    )
+                    .await
+                    .map_err(|e| {
+                        format!("capability gap signal submit failed (node '{node_id}'): {e}")
+                    })?;
+                }
+                // writeback fail-soft：env 旗标开 → 直连 rule 收件端点上报能力缺口
+                // （不可达/非 2xx 仅 warn 不阻断——上报是观测面，终止语义不依赖送达）
+                match crate::agent::writeback::config_from_env() {
+                    Some(cfg) => {
+                        let agent_type_str = lookup_agent_type(&cur_wf.nodes, &node_id);
+                        let event = crate::agent::writeback::capability_gap_event(
+                            &cfg,
+                            &node_id,
+                            agent_type_str.as_deref(),
+                            version,
+                            route_input.recut_count,
+                            &err_text,
+                        );
+                        if let Err(e) = crate::agent::writeback::report_event(&cfg, &event).await {
+                            tracing::warn!(
+                                error = %e,
+                                "capability gap writeback report failed (fail-soft)"
+                            );
+                        }
+                    }
+                    None => {
+                        tracing::debug!("capability gap writeback disabled (env flag off)");
+                    }
+                }
+                return Err(format!(
+                    "halted by capability gap: atomic granule '{}' is unsolvable within the \
+                     recut space (budget {} exhausted); no further replanning (versions={} \
+                     replans={}): {}",
+                    node_id, limits.max_recuts, version, replan_count, err_text
+                ));
+            }
+            (ReplanReason::Failure, None) => {
+                return Err("internal: failure decision without route".to_string());
+            }
+        }
+
         // ② replan：调 planner（delegate 既有路径，IoRequest sidecar 入链）产 v(n+1)
         let next = version + 1;
         let trigger_json = match decision.reason {
@@ -321,6 +445,7 @@ pub async fn run_plan_loop(
             &build_plan_summary(&cur_wf, version),
             &trigger_json,
             next,
+            route_guidance.as_deref(),
         );
         // replan planner 调用（delegate 既有路径，IoRequest sidecar 入链）产 v(n+1)；
         // 调用自身 token 消耗也计入 replan_tokens（否则会夹在两版差值采样之间丢失）
@@ -490,18 +615,57 @@ pub fn node_done_signal(node_id: &str) -> Value {
     })
 }
 
-/// M5-b：向标记会话提交节点完成信号（submit_command 既有通道；成功即落链
-/// 为 StateTransition 事实，规则面在同一转换上求值 branch 壳并裁决标记）
+/// 分类路由：原子粒重切维度提示（四维度轮换纯函数）
+///
+/// 重切预算内逐次换维度，避免 planner 原地踏步（同维度重切 = 切法空间内重复
+/// 采样）；index 对 4 取模轮换，切法空间描述与「同 id 保留」指令一并注入
+/// replan 任务。
+const RECUT_DIMENSIONS: [&str; 4] = [
+    "by sequential steps of the work",
+    "by distinct objects or entities the work touches",
+    "by abstraction layers (goal, sub-tasks, concrete actions)",
+    "by verification surface (what can be independently checked)",
+];
+
+/// 原子粒重切维度提示（纯函数）：按重切序号轮换返回建议切法维度文案
+/// （四维度轮换取模；序号从 0 起——首次重切建议第一维度）
+pub fn recut_dimension_hint(recut_index: u32) -> &'static str {
+    RECUT_DIMENSIONS[(recut_index % RECUT_DIMENSIONS.len() as u32) as usize]
+}
+
+/// 分类路由：能力缺口信号指令形态（纯函数；中性事件同 node_done 纪律——
+/// 驱动只报告「某原子粒在切法空间内不可解」，处置知识在规则层/能力线）
+pub fn capability_gap_signal(node_id: &str) -> Value {
+    json!({
+        "type": "set",
+        "params": {
+            "attr": "meta_signal.capability_gap",
+            "operation": "set",
+            "value": node_id
+        }
+    })
+}
+
+/// 向标记会话提交信号指令（通用形态；node_done / capability_gap 信号共用
+/// submit_command 既有通道，成功即落链为 StateTransition 事实）
+async fn submit_signal(
+    client: crate::api::evorule_client::EvoruleApiClient,
+    session_id: &str,
+    instruction: &Value,
+) -> Result<(), String> {
+    client
+        .submit_command(session_id, instruction)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// M5-b：向标记会话提交节点完成信号（[`submit_signal`] 的节点完成信号 wrapper）
 async fn submit_node_signal(
     client: crate::api::evorule_client::EvoruleApiClient,
     session_id: &str,
     node_id: &str,
 ) -> Result<(), String> {
-    let cmd = node_done_signal(node_id);
-    client
-        .submit_command(session_id, &cmd)
-        .await
-        .map_err(|e| e.to_string())
+    submit_signal(client, session_id, &node_done_signal(node_id)).await
 }
 
 /// D-01 enforce 违规判别（纯函数；§9.5.1 选项 B）
@@ -682,17 +846,26 @@ pub fn build_plan_summary(wf: &Workflow, version: u32) -> Value {
 
 /// 构造 replan 任务文本（纲领 §9.4.3 摘要格式 + 丢弃式指令；`completed_nodes`
 /// 与 `executed_side_effects` 丢弃式置空，不进本任务文本）
+///
+/// `route_guidance`（分类路由）：Failure 路由的处置指令段（原子粒换维度
+/// 重切 / 接口失败契约修复）；`None`（Budget 触发或非原子粒）时不加段——
+/// 既有任务文本逐字节零变化。
 pub fn build_replan_task(
     goal: Option<&str>,
     summary: &Value,
     trigger_json: &str,
     next_version: u32,
+    route_guidance: Option<&str>,
 ) -> String {
+    let guidance_section = route_guidance
+        .map(|g| format!("Routing guidance:\n{g}\n\n"))
+        .unwrap_or_default();
     format!(
         "REPLAN REQUEST — produce plan v{next} as a single PlanFact JSON object.\n\n\
          Original goal:\n{goal}\n\n\
          Previous plan summary (v{prev}):\n{summary}\n\n\
          Trigger (why replanning):\n{trigger}\n\n\
+         {guidance_section}\
          Instructions:\n\
          - Discard semantics: the previous run is abandoned; produce a COMPLETE new plan from scratch.\n\
          - Avoid the failure cause shown in the trigger; you may drop or restructure nodes.\n\
@@ -807,6 +980,7 @@ mod tests {
                 compute: None,
                 output_schema: None,
                 judge: None,
+                atomic: false,
             }],
             output_node: "a".to_string(),
         };
@@ -827,14 +1001,65 @@ mod tests {
             &summary,
             "{\"trigger\":\"node_failure\"}",
             2,
+            None,
         );
         assert!(task.contains("plan v2"));
         assert!(task.contains("研究 X"));
         assert!(task.contains("node_failure"));
         assert!(task.contains("COMPLETE new plan"));
         // 无目标时的引导语
-        let task2 = build_replan_task(None, &summary, "{}", 3);
+        let task2 = build_replan_task(None, &summary, "{}", 3, None);
         assert!(task2.contains("infer it from the previous plan summary"));
+    }
+
+    // ----- 分类路由：重切维度轮换 + 能力缺口信号 + replan 任务路由指令段 -----
+
+    #[test]
+    fn recut_dimension_hint_rotates_deterministically() {
+        // 四维度轮换：连续 index 各不相同，回绕后与首轮一致（确定性纯函数）
+        let h = |i| recut_dimension_hint(i);
+        assert_ne!(h(0), h(1));
+        assert_ne!(h(1), h(2));
+        assert_ne!(h(2), h(3));
+        assert_ne!(h(3), h(0));
+        assert_eq!(h(4), h(0));
+        assert_eq!(h(9), h(1));
+        assert_eq!(h(2), h(2));
+    }
+
+    #[test]
+    fn capability_gap_signal_shape_is_neutral_set() {
+        // 中性信号形态：set meta_signal.capability_gap=<node_id>；处置知识不在驱动
+        let sig = capability_gap_signal("granule_x");
+        assert_eq!(sig["type"], "set");
+        assert_eq!(sig["params"]["attr"], "meta_signal.capability_gap");
+        assert_eq!(sig["params"]["operation"], "set");
+        assert_eq!(sig["params"]["value"], "granule_x");
+        assert_eq!(sig, capability_gap_signal("granule_x"));
+    }
+
+    #[test]
+    fn replan_task_route_guidance_inserted_only_when_present() {
+        let summary = json!({"plan_version": 1, "nodes": []});
+        // None：无路由指令段（Budget 触发形态，既有文本零变化）
+        let base = build_replan_task(Some("g"), &summary, "{}", 2, None);
+        assert!(!base.contains("Routing guidance"));
+        // Some：指令段在 Trigger 之后、Instructions 之前（顺序稳定）
+        let guided = build_replan_task(
+            Some("g"),
+            &summary,
+            "{}",
+            2,
+            Some("ROUTING: keep node 'a' with the same id."),
+        );
+        assert!(guided.contains("Routing guidance"));
+        assert!(guided.contains("ROUTING: keep node 'a' with the same id."));
+        let trigger_pos = guided
+            .find("Trigger (why replanning)")
+            .expect("trigger present");
+        let guidance_pos = guided.find("Routing guidance").expect("guidance present");
+        let instr_pos = guided.find("Instructions:").expect("instructions present");
+        assert!(trigger_pos < guidance_pos && guidance_pos < instr_pos);
     }
 
     // ----- M5-b：协作工作流完成信号（node_done_signal / submit_node_signal）-----
@@ -963,6 +1188,7 @@ mod tests {
             compute: None,
             output_schema: None,
             judge: None,
+            atomic: false,
         }
     }
 

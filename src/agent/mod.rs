@@ -42,6 +42,7 @@ pub mod tool_manifest;
 pub mod tool_trace;
 pub mod translator;
 pub mod workflow;
+pub mod writeback;
 
 pub use approval::{
     new_proposal_id, ApprovalCallback, ApprovalDecision, ApprovalRequest, AutoApprove, CliApproval,
