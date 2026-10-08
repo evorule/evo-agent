@@ -153,6 +153,8 @@ struct IrNode {
     run_when: Option<RunWhen>,
     /// 粒间契约 JSON Schema（可选，契约 v0；DSL/PlanFact 两形态同构透传）
     output_schema: Option<serde_json::Value>,
+    /// 节点判据声明（可选，判据 v0 第二级；DSL/PlanFact 两形态同构透传）
+    judge: Option<crate::agent::workflow::JudgeSpec>,
     /// 内联 depends_on（仅 DSL 形态；PlanFact 形态恒空，依赖由顶层 edges 表达）。
     /// 归一化后被收入 Ir.dep_edges，展开 pass 不再读本字段。
     deps: Vec<String>,
@@ -235,6 +237,13 @@ fn parse_dsl_node(v: &serde_json::Value) -> Result<IrNode, String> {
         output_schema: match v.get("output_schema") {
             None | Some(serde_json::Value::Null) => None,
             Some(s) => Some(s.clone()),
+        },
+        judge: match v.get("judge") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(j) => Some(
+                serde_json::from_value::<crate::agent::workflow::JudgeSpec>(j.clone())
+                    .map_err(|e| format!("节点 '{id}' judge 解析失败: {e}"))?,
+            ),
         },
         deps: depends_on_of(v, id)?,
     })
@@ -792,6 +801,7 @@ fn rewrite_node(
         run_when,
         compute,
         output_schema: src.output_schema.clone(),
+        judge: src.judge.clone(),
     })
 }
 
@@ -1842,5 +1852,70 @@ mod tests {
         let errs =
             materialize_plan_fact(&missing, "wf").expect_err("PlanFact 契约态缺上游契约须拒");
         assert!(errs[0].contains("契约态拒载"), "{errs:?}");
+    }
+
+    // ===== 节点判据（判据 v0 第二级）=====
+
+    #[test]
+    fn dsl_judge_passthrough() {
+        // DSL judge 声明随物化透传；无 judge 的节点保持 None
+        let doc = serde_json::json!({
+            "workflow_id": "judged",
+            "nodes": [
+                { "id": "build", "agent_type": "w", "task": "t",
+                  "judge": { "command": "cargo build", "expect_exit": 0,
+                             "expect_stdout": "Finished" } },
+                { "id": "next", "agent_type": "w", "task": "t2",
+                  "depends_on": ["build"] }
+            ],
+            "output_node": "next"
+        });
+        let wf = materialize_workflow_dag(&doc).expect("judge DSL 应物化成功");
+        assert_eq!(
+            wf.nodes[0].judge,
+            Some(crate::agent::workflow::JudgeSpec {
+                command: "cargo build".to_string(),
+                expect_exit: 0,
+                expect_stdout: Some("Finished".to_string()),
+            })
+        );
+        assert!(wf.nodes[1].judge.is_none(), "未声明 judge 保持 None");
+    }
+
+    #[test]
+    fn dsl_judge_malformed_rejects() {
+        // judge 形态非法（command 缺失）→ 装载期 fail-closed 拒载
+        let doc = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [
+                { "id": "a", "agent_type": "w", "task": "t", "judge": {} }
+            ],
+            "output_node": "a"
+        });
+        let errs = materialize_workflow_dag(&doc).expect_err("judge 缺 command 须拒载");
+        assert!(errs[0].contains("judge 解析失败"), "{errs:?}");
+    }
+
+    #[test]
+    fn plan_fact_judge_passthrough() {
+        // PlanFact 形态：planner 声明 judge（若其学会）→ 同走 parse_dsl_node 透传
+        let plan = serde_json::json!({
+            "plan_version": 1, "parent_plan_hash": null, "plan_source": "initial_planning",
+            "materializer_version": "1.0.0",
+            "nodes": [
+                { "id": "build", "type": "llm", "agent_type": "w", "task": "t",
+                  "judge": { "command": "cargo build", "expect_exit": 0 } }
+            ],
+            "edges": []
+        });
+        let wf = materialize_plan_fact(&plan, "judged_plan").expect("PlanFact judge 应物化成功");
+        assert_eq!(
+            wf.nodes[0].judge,
+            Some(crate::agent::workflow::JudgeSpec {
+                command: "cargo build".to_string(),
+                expect_exit: 0,
+                expect_stdout: None,
+            })
+        );
     }
 }

@@ -1,0 +1,81 @@
+{
+  "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
+  "kind": "rule_set",
+  "id": "com.evorule.business.judge_acceptance_marks",
+  "version": "1.0.0",
+  "metadata": {
+    "title": "工作流判据验收标记（meta_task.judge_*）",
+    "description": "留痕型业务规则（collab_task_marks 同款形态：branch 壳+set）。规则=程序模式，每转换全程序执行；set 无匹配域概念，故以 branch(domain) 壳条件化——仅当本转换的指令是工作流引擎发出的判据结果中性信号（set meta_signal.judge=<节点id>，params.acceptance_passed 由引擎强制注入、不采信 LLM 自报）时，才置对应 meta_task.judge_passed / meta_task.judge_failed 标记。判据门禁本身在机制层（引擎 fail-closed：判据不过=节点失败，粒不过不进下一粒）；本规则不承担拦截职责（拦截须 enforce 元规则，走治理链），只把判据结论落为会话态可查标记（审计/后续规则的求值域）。部署口径：tier=business，不经 agent-governance 约束同步链（与 collab_task_marks 同链路）。",
+    "authors": ["evorulelab@gmail.com"],
+    "created": "2026-10-09",
+    "updated": "2026-10-09",
+    "tags": ["business", "workflow", "acceptance", "judge", "meta-task"],
+    "license": "AGPL-3.0-or-later",
+    "tier": "business",
+    "provenance": { "source": "manual" }
+  },
+  "transform": [
+    {
+      "type": "branch",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            { "type": "instruction", "instruction_type": "set" },
+            {
+              "type": "eq",
+              "path": "instruction.params.attr",
+              "value": "meta_signal.judge"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.acceptance_passed",
+              "value": true
+            }
+          ]
+        },
+        "on_true": [
+          {
+            "type": "set",
+            "params": {
+              "attr": "meta_task.judge_passed",
+              "operation": "set",
+              "value": true
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "branch",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            { "type": "instruction", "instruction_type": "set" },
+            {
+              "type": "eq",
+              "path": "instruction.params.attr",
+              "value": "meta_signal.judge"
+            },
+            {
+              "type": "eq",
+              "path": "instruction.params.acceptance_passed",
+              "value": false
+            }
+          ]
+        },
+        "on_true": [
+          {
+            "type": "set",
+            "params": {
+              "attr": "meta_task.judge_failed",
+              "operation": "set",
+              "value": true
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

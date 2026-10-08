@@ -956,8 +956,9 @@ async fn run_plan_execute_request(
         governance_segment,
         &req.goal,
         limits,
-        3, // max_depth（与 CLI workflow 子命令缺省一致）
-        5, // max_concurrent（与 CLI workflow 子命令缺省一致，0=不限流）
+        3,                     // max_depth（与 CLI workflow 子命令缺省一致）
+        5,                     // max_concurrent（与 CLI workflow 子命令缺省一致，0=不限流）
+        req.container.clone(), // 判据 v0：run 请求容器名透传（P1 执行桥同源）
     )
     .await;
     let (outcome, marks_session) = match run {

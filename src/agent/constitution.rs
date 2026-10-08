@@ -145,6 +145,11 @@ pub fn validate_workflow_dag(body: &serde_json::Value) -> Result<(), Vec<String>
 ///   展开尾部自带粒间契约门卫，契约 v0）
 /// - v1.0/v1.1 → 直接反序列化 + 粒间契约门卫（schema 容忍 `output_schema`
 ///   直通，契约态强制由本仓门卫执法）
+///
+/// **版本推进口径**（判据 v0 实证）：组件内嵌 schema 仅至 v1.3，Strict 下
+/// 未知版本 fail-fast——`judge` 等增量字段不另立版本号，沿「schema 对未知
+/// 字段宽容直通 + 本仓门卫执法」路径落地（serde default 全版本兼容，门卫
+/// 见 `workflow::validate`）。
 pub fn load_workflow(body: &serde_json::Value) -> Result<Workflow, Vec<String>> {
     let version = detect_workflow_dag_version(body);
     validate_kind_version("workflow_dag", version, body)?;

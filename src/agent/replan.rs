@@ -374,6 +374,7 @@ mod tests {
             run_when: None,
             compute: None,
             output_schema: None,
+            judge: None,
         }];
         assert_eq!(
             lookup_agent_type(&nodes, "lp_iter0_s"),
