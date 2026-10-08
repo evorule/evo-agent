@@ -2040,26 +2040,27 @@ impl AgentRunner {
                     warn!(%session_id, error = %e, "sediment_performed journal failed");
                 }
 
-            // 冷迁（F-617 冷热分层,Recipe storage.cold_tier 门控缺省关）:
-            // 生命周期迁移产物(Archived/Tombstoned/Decayed)事务移入 lex-cold.db,
-            // 计数入账(cold_moved 事件);cache 镜像同步逐出
-            if recipe.storage.cold_tier {
-                if let Some(mem) = self.memory.as_mut() {
-                    match mem.move_cold_tier(&recipe).await {
-                        Ok(n) if n > 0 => {
-                            if let Some(j) = journal {
-                                if let Err(e) = j.cold_moved(n as u64) {
-                                    warn!(%session_id, error = %e, "cold_moved journal failed");
+                // 冷迁（F-617 冷热分层,Recipe storage.cold_tier 门控缺省关）:
+                // 生命周期迁移产物(Archived/Tombstoned/Decayed)事务移入 lex-cold.db,
+                // 计数入账(cold_moved 事件);cache 镜像同步逐出
+                if recipe.storage.cold_tier {
+                    if let Some(mem) = self.memory.as_mut() {
+                        match mem.move_cold_tier(&recipe).await {
+                            Ok(n) if n > 0 => {
+                                if let Some(j) = journal {
+                                    if let Err(e) = j.cold_moved(n as u64) {
+                                        warn!(%session_id, error = %e, "cold_moved journal failed");
+                                    }
                                 }
                             }
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!(%session_id, error = %e, "cold tier move failed (best-effort)");
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!(%session_id, error = %e, "cold tier move failed (best-effort)");
+                            }
                         }
                     }
                 }
-            }            }
+            }
             if !result.stable_facts_cache_only.is_empty() {
                 tracing::warn!(
                     session_id = %session_id,
@@ -5187,7 +5188,7 @@ impl AgentRunner {
                                 // 输出门禁（server io_guard）拒绝收尾的纠偏重试计数
                                 let mut guard_rejections: u32 = 0;
                                 'react: loop {
-                                    // H3 预算看门狗(16 号 §2.1):全局时限触达=合法停机
+                                    // H3 预算看门狗:全局时限触达=合法停机
                                     // 面之三——不依赖 LLM 合作,镜像 max_steps 熔断全序列
                                     // (io_response 错误回写→Error 事件→turn_ended→flush
                                     // →tool_traces→Done[blocked 语义 error 结果])
