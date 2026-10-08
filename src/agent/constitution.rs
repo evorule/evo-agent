@@ -498,9 +498,13 @@ mod tests {
         assert!(!agent_types.is_empty(), "agents/ 至少应有一个 agent 定义");
         // 蓄意失败演练资产豁免：以引用不存在 agent 制造运行期失败为设计意图
         // （e2e_plan_execute.py scenarioD 等场景消费，验证 replan 硬上限判定序
-        // 终止/重规划行为），不在存在性闸范围内。
-        const INTENTIONAL_FAILURE_ASSETS: &[&str] =
-            &["ok_then_fail_drill.json", "replan_drill.json"];
+        // 终止/重规划行为；capability_drill 另验分类路由能力缺口终止），
+        // 不在存在性闸范围内。
+        const INTENTIONAL_FAILURE_ASSETS: &[&str] = &[
+            "ok_then_fail_drill.json",
+            "replan_drill.json",
+            "capability_drill.json",
+        ];
         let mut checked = 0;
         for entry in std::fs::read_dir(&dir).expect("rules/workflows 必须存在") {
             let path = entry.expect("read_dir entry").path();

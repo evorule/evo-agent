@@ -39,6 +39,9 @@ url = "2"
 # G3: LLM 重试退避抖动所需
 rand = "0.8"
 
+# 回写上报（writeback）事件 occurred_at 的 ISO-8601 UTC 墙钟（server 转发器同款）
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
 # G7: 恒定时间比较(防时序攻击)
 subtle = "2"
 

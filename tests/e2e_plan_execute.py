@@ -70,6 +70,31 @@
     LLM 自报）；链上断言：meta_signal.judge 中性信号落标记会话链且
     acceptance_passed=true（判据结果可查账，处置知识在规则层）。
 
+  场景 I（接口失败路由演练，分类路由）：contract_drill 工作流（手写
+    DSL）——producer 指令性输出固定文本 → checker（compute regex_match）
+    产出纯文本但声明 object 契约（output_schema）→ 运行期契约校验必败 =
+    接口失败（纯函数确定性触发，非 LLM 抖动）→ 外层路由 RepairContract
+    （不重拆、修复输出契约）→ v2 重产计划（planner 不识 output_schema，
+    契约消失）→ 执行成功。
+    断言：EXIT=0、plan_versions=2 replans=1；链上断言：replan planner
+    会话 IoRequest 含接口路由指令段（Do NOT split this node——不重拆语义
+    入链）与接口契约失败标记（契约缺口描述随 failure_record 回喂），不含
+    原子粒路由指令段（接口失败≠粒失败——路由分类正确）；IoResponse 提取
+    出 PlanFact（v2 产出入链）。
+
+  场景 J（能力缺口路由演练，分类路由）：capability_drill 工作流（手写
+    DSL，gap_boom 声明 atomic=true 且 agent_type=ghost_agent 必败）+
+    --max-recut 0（重切预算空集）→ 首败即判「切法空间内不可解」→ 能力缺口
+    终止不 replan。断言：EXIT=1、stderr 含 'halted by capability gap' 与
+    'atomic granule 'gap_boom'' 与 'budget 0 exhausted'、全程无 replan；
+    链上断言：meta_signal.capability_gap 信号落标记会话链（marks 留痕硬
+    义务）、无 replan planner 会话（终止先于 planner 调用）；writeback
+    收件断言：脚本内嵌 HTTP sink 收到恰一个 POST /v1/writeback/rule_failure
+    （X-Api-Key 头 + RuleFailureEvent 形态：event_type=failure.type=
+    capability_gap、entry_id=workflow_node:gap_boom、缺省租户/数据集）——
+    evo-agent 侧直连上报线级实证（env 旗标 EVORULE_WRITEBACK_*；规则仓
+    收件面自身由其 handler UT 覆盖）。
+
 # 前置（本脚本不进 CI——依赖真实 LLM key/运行中 server/已编译产物）
   1. .env 含 MINIMAX_API_KEY（evo-agent 只认进程环境变量，脚本负责注入）
   2. evorule-server 运行于 evo-agent.toml base_url（默认 http://127.0.0.1:18080），
@@ -89,9 +114,11 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -254,6 +281,23 @@ JUDGE_ANCHOR_FILE = REPO_ROOT / "workspace" / "data" / "judge_drill_anchor.txt"
 JUDGE_ANCHOR_CONTENT = "JUDGE-ANCHOR-OK-12345"
 # confirm 节点指令要求的固定回复（output_node 产出锚）
 JUDGE_CONFIRM_OUTPUT = "judge passed"
+
+# ===== 分类路由演练锚（contract_drill.json / capability_drill.json 约定）=====
+# driver.rs 接口失败路由固定指令段（RepairContract 路由——链上识别锚）
+ROUTE_INTERFACE_GUIDANCE = "Do NOT split this node into smaller granules"
+# driver.rs 原子粒路由固定指令段（ReplanSplit 路由——同 id 保留+换维度重切；
+# 接口失败路由的负断言锚：接口失败≠粒失败）
+ROUTE_ATOMIC_GUIDANCE = "is an ATOMIC granule"
+# 引擎接口失败文本标记（workflow.rs INTERFACE_CONTRACT_MARKER——契约缺口描述回喂锚）
+INTERFACE_CONTRACT_MARKER = "interface contract violation"
+# 能力缺口终止固定文案（driver.rs CapabilityGapHalt——stderr 断言锚）
+CAPABILITY_GAP_HALT = "halted by capability gap"
+# 能力缺口 marks 信号属性（driver.rs capability_gap_signal 指令形态锚）
+CAPABILITY_GAP_SIGNAL_ATTR = "meta_signal.capability_gap"
+# writeback 收件端点路径与事件形态锚（RuleFailureEvent class 标签）
+WB_INBOX_PATH = "/v1/writeback/rule_failure"
+WB_EVENT_TYPE = "rule_failure"
+WB_FAILURE_CLASS = "capability_gap"
 
 
 def find_replan_planner_sessions(base_url: str, sids: set) -> list:
@@ -989,6 +1033,311 @@ def scenario_h(env: Dict[str, str], evidence_dir: Optional[Path], server_url: st
     return ok
 
 
+def find_replan_sessions_generic(base_url: str, sids: set) -> list:
+    """在新会话集合中找 replan planner 会话（场景 I 用通用形态）。
+
+    识别锚：会话链含 IoRequest 其 params 含 replan 指示词（COMPLETE new plan
+    ——driver.rs build_replan_task 固定文案）。返回 [(sid, history, req_blob), ...]，
+    req_blob = 命中 IoRequest 的 params JSON 文本（路由指令段断言对象）。
+    """
+    found = []
+    for sid in sorted(sids):
+        try:
+            hist = http_get_json(base_url, f"/api/sessions/{sid}/history")
+        except Exception as e:  # noqa: BLE001 — 诊断用途，跳过不可读会话
+            print(f"  {YELLOW}···{RESET}  会话 {sid} history 不可读（{e}），跳过")
+            continue
+        for ev in hist:
+            if ev.get("type") != "IoRequest":
+                continue
+            text = json.dumps(ev.get("params", {}), ensure_ascii=False)
+            if REPLAN_TASK_MARKER in text:
+                found.append((sid, hist, text))
+                break
+    return found
+
+
+def scenario_i(env: Dict[str, str], evidence_dir: Optional[Path], server_url: str) -> bool:
+    """接口失败路由演练（contract_drill）：不重拆+契约修复指令入链。
+
+    断言六条：
+      ① EXIT=0 且 plan_versions=2 replans=1（v1 接口失败→RepairContract→
+         v2 重产成功——重产计划不带 output_schema，契约消失）；
+      ② stdout 含 'replan materialized, re-executing'；
+      ③ 链上：恰 1 个 replan planner 会话，IoRequest 含接口路由指令段
+         （不重拆语义入链）；
+      ④ 链上：IoRequest 含接口契约失败标记（契约缺口描述随 failure_record 回喂）；
+      ⑤ 链上：IoRequest 不含原子粒路由指令段（接口失败≠粒失败——分类正确）；
+      ⑥ 链上：IoResponse 提取出 PlanFact（v2 计划产出入链）。
+    """
+    try:
+        before = session_ids(server_url)
+    except Exception as e:  # noqa: BLE001 — 会话列表不可读降级为空集（链断言将失败并给出原因）
+        print(f"  {YELLOW}···{RESET}  会话列表不可读（{e}），链上断言范围将为空")
+        before = set()
+
+    proc, ok = run_scenario(
+        "I: 接口失败路由（compute 契约必败→不重拆修复指令→v2 成功）",
+        "scenarioI", ["contract_drill"], env, evidence_dir,
+    )
+    if proc is None:
+        return False
+    m = assert_stats_line(proc, "I")
+    ok = ok and m is not None
+    if m:
+        _, versions, replans, _, _, _, _, replan_tokens = m.groups()
+        ok = ok and check(
+            (versions, replans) == ("2", "1"),
+            "plan_versions=2 replans=1（接口失败路由仍走 replan，非终止）",
+            f"预期 plan_versions=2 replans=1，实得 {versions}/{replans}",
+        )
+        ok = ok and check(
+            int(replan_tokens) > 0,
+            "replan_tokens>0（v2 成本埋点）", "replan_tokens=0（埋点未生效）",
+        )
+    ok = ok and check(
+        "replan materialized, re-executing" in proc.stdout,
+        "stdout 含 'replan materialized, re-executing'",
+        "stdout 缺 'replan materialized, re-executing'",
+    )
+    # 链上断言：路由指令段/契约缺口回喂/分类负断言/v2 产出入链
+    try:
+        after = session_ids(server_url)
+        new_ids = after - before
+        print(f"  {YELLOW}···{RESET}  本场景新建会话 {len(new_ids)} 个（{sorted(new_ids)}）")
+        planners = find_replan_sessions_generic(server_url, new_ids)
+        ok = ok and check(
+            len(planners) == 1,
+            f"链上恰 1 个 replan planner 会话（实得 {len(planners)}）",
+            f"预期恰 1 个 replan planner 会话，实得 {len(planners)}",
+        )
+        if not planners:
+            return ok
+        sid, hist, req_text = planners[0]
+        print(f"  {YELLOW}···{RESET}  planner 会话 id={sid}，链长={len(hist)}")
+        if evidence_dir is not None:
+            (evidence_dir / "scenarioI_chain_planner_session.json").write_text(
+                json.dumps({"session_id": sid, "history": hist}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"  {YELLOW}···{RESET}  链证据落盘 scenarioI_chain_planner_session.json")
+        ok = ok and check(
+            ROUTE_INTERFACE_GUIDANCE in req_text,
+            "IoRequest 含接口路由指令段（不重拆+修复输出契约——路由语义入链）",
+            "IoRequest 缺接口路由指令段（路由指令未注入 replan 任务）",
+        )
+        ok = ok and check(
+            INTERFACE_CONTRACT_MARKER in req_text,
+            "IoRequest 含接口契约失败标记（契约缺口描述随 failure_record 回喂）",
+            "IoRequest 缺接口契约失败标记（失败描述未入 replan 任务）",
+        )
+        ok = ok and check(
+            "'checker'" in req_text,
+            "IoRequest 含失败节点 id（checker——失败锚定到具体粒）",
+            "IoRequest 缺失败节点 id（失败记录不含 checker）",
+        )
+        ok = ok and check(
+            ROUTE_ATOMIC_GUIDANCE not in req_text,
+            "IoRequest 不含原子粒路由指令段（接口失败≠粒失败——路由分类正确）",
+            "IoRequest 出现原子粒路由指令段（分类错误：接口失败被当作粒失败）",
+        )
+        plan = extract_plan_fact_from_chain(hist)
+        ok = ok and check(
+            plan is not None,
+            "IoResponse 提取出 PlanFact（v2 计划产出入链）",
+            "IoResponse 提取不出 PlanFact（v2 产出未入链）",
+        )
+    except Exception as e:  # noqa: BLE001 — 链断言失败需可见不吞
+        ok = False
+        print(f"  {RED}FAIL{RESET}  链上接口路由断言异常：{e}")
+    return ok
+
+
+class _WritebackSinkHandler(BaseHTTPRequestHandler):
+    """writeback 收件 sink：记录请求后回 201（收件成功形态）。
+
+    线级收件箱实证——验证 evo-agent 直连上报契约（路径/X-Api-Key/事件形态）；
+    规则仓收件面（RuleFailureEvent 校验+落账）自身由其 handler UT 覆盖。
+    """
+
+    def do_POST(self):  # noqa: N802 — http.server 固定方法名
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        # requests 列表由 scenario_j 挂在 server 实例上
+        self.server.requests.append({  # type: ignore[attr-defined]
+            "path": self.path,
+            "api_key": self.headers.get("X-Api-Key"),
+            "body": body,
+        })
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *args):  # 静默默认访问日志
+        pass
+
+
+def scenario_j(env: Dict[str, str], evidence_dir: Optional[Path], server_url: str) -> bool:
+    """能力缺口路由演练（capability_drill + --max-recut 0=重切空间空集）。
+
+    断言七条：
+      ① EXIT=1 且 stderr 含 'halted by capability gap' 与 'atomic granule
+         'gap_boom'' 与 'budget 0 exhausted'（缺口终止语义）；
+      ② 全程无 replan（缺口=切法空间内不可解，不再拆）；
+      ③ 链上：meta_signal.capability_gap 信号落标记会话链（marks 留痕硬义务）；
+      ④ 链上：无 replan planner 会话（终止先于 planner 调用）；
+      ⑤ writeback：sink 收到恰一个 POST /v1/writeback/rule_failure，
+         X-Api-Key 头与 env EVORULE_WRITEBACK_KEY 一致；
+      ⑥ writeback：事件形态=RuleFailureEvent（event_type/failure.type=
+         capability_gap/entry_id=workflow_node:gap_boom/缺省租户与数据集/
+         occurred_at 在场）。
+    """
+    # 收件 sink 起于临时端口（env 旗标直连 = evo-agent → sink，收件箱线级实证）
+    sink = HTTPServer(("127.0.0.1", 0), _WritebackSinkHandler)
+    sink.requests = []  # type: ignore[attr-defined]
+    threading.Thread(target=sink.serve_forever, daemon=True).start()
+    wb_env = {
+        **env,
+        "EVORULE_WRITEBACK_URL": f"http://127.0.0.1:{sink.server_address[1]}",
+        "EVORULE_WRITEBACK_KEY": "e2e-writeback-key",
+        # TENANT/DATASET 不设——顺带验证缺省值（org-evorule / evo-agent-workflows）
+    }
+    try:
+        try:
+            before = session_ids(server_url)
+        except Exception as e:  # noqa: BLE001 — 会话列表不可读降级为空集
+            print(f"  {YELLOW}···{RESET}  会话列表不可读（{e}），链上断言范围将为空")
+            before = set()
+
+        proc, ok = run_scenario(
+            "J: 能力缺口路由（atomic 粒失败+--max-recut 0→缺口终止+信号+回写）",
+            "scenarioJ", ["capability_drill", "--max-recut", "0"], wb_env, evidence_dir,
+            expect_exit=1,
+        )
+        if proc is None:
+            return False
+        combined = proc.stdout + proc.stderr
+        ok = ok and check(
+            CAPABILITY_GAP_HALT in combined,
+            "含 'halted by capability gap'（缺口终止语义）",
+            "缺 'halted by capability gap'（未按能力缺口路由终止）",
+        )
+        ok = ok and check(
+            "atomic granule 'gap_boom'" in combined,
+            "含 atomic granule 'gap_boom'（缺口锚定到原子粒）",
+            "缺 atomic granule 'gap_boom'（原子粒标记未生效）",
+        )
+        ok = ok and check(
+            "budget 0 exhausted" in combined,
+            "含 'budget 0 exhausted'（--max-recut 0=重切空间空集，首败即判）",
+            "缺 'budget 0 exhausted'（重切预算判定未按 0 生效）",
+        )
+        ok = ok and check(
+            "replan materialized" not in combined,
+            "全程无 replan（能力缺口不再拆）",
+            "出现了 replan（缺口终止失效）",
+        )
+        # 链上断言：marks 信号落链 + 无 replan planner 会话
+        try:
+            after = session_ids(server_url)
+            new_ids = after - before
+            print(f"  {YELLOW}···{RESET}  本场景新建会话 {len(new_ids)} 个（{sorted(new_ids)}）")
+            signal_hit = 0
+            replan_hit = 0
+            for sid in sorted(new_ids):
+                try:
+                    hist = http_get_json(server_url, f"/api/sessions/{sid}/history")
+                except Exception as e:  # noqa: BLE001 — 诊断用途，跳过不可读会话
+                    print(f"  {YELLOW}···{RESET}  会话 {sid} history 不可读（{e}），跳过")
+                    continue
+                blob = json.dumps(hist, ensure_ascii=False)
+                # 指令可能以转义字符串内嵌于事件字段——先反序列化转义再匹配
+                flat = blob.replace('\\"', '"')
+                if CAPABILITY_GAP_SIGNAL_ATTR in flat and '"gap_boom"' in flat:
+                    signal_hit += 1
+                if REPLAN_TASK_MARKER in flat:
+                    replan_hit += 1
+            ok = ok and check(
+                signal_hit >= 1,
+                "链上可查账：meta_signal.capability_gap 信号落标记会话链",
+                "新会话链上未见 capability_gap 信号（marks 留痕硬义务未履行）",
+            )
+            ok = ok and check(
+                replan_hit == 0,
+                "无 replan planner 会话（终止先于 planner 调用）",
+                f"出现 {replan_hit} 个 replan 会话（缺口终止失效）",
+            )
+        except Exception as e:  # noqa: BLE001 — 链断言失败需可见不吞
+            ok = False
+            print(f"  {RED}FAIL{RESET}  链上缺口信号断言异常：{e}")
+        # writeback 收件断言（sink 已收请求——上报为同步先于进程退出）
+        try:
+            reqs = [r for r in sink.requests if r["path"] == WB_INBOX_PATH]
+            ok = ok and check(
+                len(reqs) == 1,
+                f"收件箱恰 1 个 {WB_INBOX_PATH} 事件（实得 {len(reqs)}）",
+                f"预期收件箱恰 1 个事件，实得 {len(reqs)}（直连上报未发生或重复）",
+            )
+            if reqs:
+                r = reqs[0]
+                ok = ok and check(
+                    r["api_key"] == "e2e-writeback-key",
+                    "X-Api-Key 头与 env EVORULE_WRITEBACK_KEY 一致",
+                    "X-Api-Key 头缺失或不一致",
+                )
+                try:
+                    ev = json.loads(r["body"])
+                except json.JSONDecodeError:
+                    ev = None
+                ok = ok and check(
+                    isinstance(ev, dict),
+                    "事件体为合法 JSON（RuleFailureEvent 形态）",
+                    "事件体非合法 JSON",
+                )
+                if isinstance(ev, dict):
+                    if evidence_dir is not None:
+                        evidence_dir.mkdir(parents=True, exist_ok=True)
+                        (evidence_dir / "scenarioJ_writeback_event.json").write_text(
+                            json.dumps(ev, ensure_ascii=False, indent=2), encoding="utf-8"
+                        )
+                        print(f"  {YELLOW}···{RESET}  收件证据落盘 scenarioJ_writeback_event.json")
+                    ok = ok and check(
+                        ev.get("event_type") == WB_EVENT_TYPE,
+                        f"event_type={WB_EVENT_TYPE}（事件族正确）",
+                        f"event_type={ev.get('event_type')}（预期 {WB_EVENT_TYPE}）",
+                    )
+                    failure = ev.get("failure") if isinstance(ev.get("failure"), dict) else {}
+                    ok = ok and check(
+                        failure.get("type") == WB_FAILURE_CLASS,
+                        "failure.type=capability_gap（class 标签入事件）",
+                        f"failure.type={failure.get('type')}（class 标签缺失或错误）",
+                    )
+                    ok = ok and check(
+                        ev.get("entry_id") == "workflow_node:gap_boom",
+                        "entry_id=workflow_node:gap_boom（缺口锚定到节点）",
+                        f"entry_id={ev.get('entry_id')}",
+                    )
+                    ok = ok and check(
+                        ev.get("tenant_id") == "org-evorule"
+                        and ev.get("dataset_id") == "evo-agent-workflows",
+                        "缺省租户/数据集（org-evorule / evo-agent-workflows）",
+                        f"tenant_id={ev.get('tenant_id')} dataset_id={ev.get('dataset_id')}",
+                    )
+                    ok = ok and check(
+                        bool(ev.get("occurred_at")),
+                        "occurred_at 在场（ISO-8601 UTC 墙钟）",
+                        "occurred_at 缺失",
+                    )
+        except Exception as e:  # noqa: BLE001 — 收件断言失败需可见不吞
+            ok = False
+            print(f"  {RED}FAIL{RESET}  writeback 收件断言异常：{e}")
+        return ok
+    finally:
+        sink.shutdown()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="plan-execute 真实 LLM E2E")
     parser.add_argument(
@@ -999,13 +1348,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--only",
-        choices=["A", "B", "C", "D", "E", "F", "G", "H"],
+        choices=["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"],
         default=None,
         help="只跑单个场景（调试用；缺省全量）",
     )
     args = parser.parse_args()
 
-    print("plan-execute 真实 LLM E2E 测试（IT 级；Phase 1-B A/B + Phase 2 C/D + 收官 B6 场景 E + serve 挂 driver 场景 F + compute 裁判场景 G + 节点判据场景 H）")
+    print("plan-execute 真实 LLM E2E 测试（IT 级；Phase 1-B A/B + Phase 2 C/D + 收官 B6 场景 E + serve 挂 driver 场景 F + compute 裁判场景 G + 节点判据场景 H + 分类路由场景 I/J）")
     print(f"  时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  env:  {ENV_PATH}")
 
@@ -1032,10 +1381,15 @@ def main() -> int:
     ok_f = scenario_f(env, args.evidence_dir) if only in (None, "F") else True
     ok_g = scenario_g(env, args.evidence_dir, server_url) if only in (None, "G") else True
     ok_h = scenario_h(env, args.evidence_dir, server_url) if only in (None, "H") else True
+    ok_i = scenario_i(env, args.evidence_dir, server_url) if only in (None, "I") else True
+    ok_j = scenario_j(env, args.evidence_dir, server_url) if only in (None, "J") else True
 
-    total = ok_a and ok_b and ok_c and ok_d and ok_e and ok_f and ok_g and ok_h
+    total = ok_a and ok_b and ok_c and ok_d and ok_e and ok_f and ok_g and ok_h and ok_i and ok_j
     print(f"\n{'=' * 60}")
-    print(f"结果: {'ALL PASS' if total else 'FAILED'}  (A={ok_a} B={ok_b} C={ok_c} D={ok_d} E={ok_e} F={ok_f} G={ok_g} H={ok_h})")
+    print(
+        f"结果: {'ALL PASS' if total else 'FAILED'}  "
+        f"(A={ok_a} B={ok_b} C={ok_c} D={ok_d} E={ok_e} F={ok_f} G={ok_g} H={ok_h} I={ok_i} J={ok_j})"
+    )
     print(f"{'=' * 60}")
     return 0 if total else 1
 

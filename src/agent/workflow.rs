@@ -370,6 +370,13 @@ pub struct WorkflowNode {
     /// （未声明的资产零影响；schema 对未知字段宽容，语义由本仓门卫执法）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge: Option<JudgeSpec>,
+    /// 原子粒标记（可选，分类路由）：声明本节点为不可再切的原子工作粒——
+    /// 粒失败且重切预算耗尽时路由判为能力缺口（终止不再拆 + 上报），见
+    /// `replan::route_for_failure_class`。serde default = 全版本兼容（未声明
+    /// 的资产零影响；schema 对未知字段宽容直通，语义由本仓门卫执法，
+    /// judge/output_schema 同款）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub atomic: bool,
 }
 
 /// 节点判据声明（判据 v0 第二级）
@@ -1836,6 +1843,7 @@ mod tests {
             compute: None,
             output_schema: None,
             judge: None,
+            atomic: false,
         }
     }
 
@@ -1901,6 +1909,7 @@ mod tests {
             compute: Some(spec),
             output_schema: None,
             judge: None,
+            atomic: false,
         }
     }
 
@@ -2984,6 +2993,7 @@ mod tests {
                 compute: Some(compute),
                 output_schema: None,
                 judge: None,
+                atomic: false,
             });
         }
         let wf = Workflow {
@@ -3189,6 +3199,7 @@ mod tests {
             compute: None,
             output_schema: None,
             judge: None,
+            atomic: false,
         };
         let mut results = BTreeMap::new();
         results.insert("a".to_string(), "rust-result".to_string());
@@ -3211,6 +3222,7 @@ mod tests {
             compute: None,
             output_schema: None,
             judge: None,
+            atomic: false,
         };
         let results = BTreeMap::new();
         let rendered = engine.render_task(&n, &results, &HashSet::new());
@@ -3232,6 +3244,7 @@ mod tests {
             compute: None,
             output_schema: None,
             judge: None,
+            atomic: false,
         };
         let mut results = BTreeMap::new();
         results.insert("x".to_string(), "VAL".to_string());
@@ -3254,6 +3267,7 @@ mod tests {
             compute: None,
             output_schema: None,
             judge: None,
+            atomic: false,
         };
         let mut results = BTreeMap::new();
         results.insert("a".to_string(), "A".to_string());
@@ -3277,6 +3291,7 @@ mod tests {
             compute: None,
             output_schema: None,
             judge: None,
+            atomic: false,
         };
         let mut results = BTreeMap::new();
         results.insert("a".to_string(), "A".to_string());
