@@ -217,6 +217,13 @@ enum Command {
         /// token 预算上限(累计 tokens_used 达到即触发 replan Budget;不指定 = 不限)
         #[arg(long)]
         max_tokens: Option<u64>,
+
+        /// 恢复此前中断的 plan-execute run(值为 run 级账本会话名,即 planrun-
+        /// 前缀 id,见于上次运行 stderr 的 "run ledger session:" 行)。从该账本
+        /// 回放计划状态+粒级进度后续跑,已完成粒零重执行。恢复仅经显式旗标
+        /// ——无人监督的自动续跑不做(续跑决策权在人)
+        #[arg(long)]
+        resume_session: Option<String>,
     },
 
     /// G15:REPL 交互模式(对话式,复用同一 evorule session)
@@ -362,6 +369,7 @@ fn main() -> ExitCode {
             max_recut,
             max_wall_ms,
             max_tokens,
+            resume_session,
         } => cmd_workflow(
             &cli.workdir,
             &workflow_id,
@@ -376,6 +384,7 @@ fn main() -> ExitCode {
                     max_wall_ms: Some(max_wall_ms),
                     max_tokens,
                 },
+                resume_session,
             },
         ),
         Command::Repl {
@@ -2038,6 +2047,8 @@ struct WorkflowRunOpts {
     plan_execute: bool,
     /// 驱动限额（replan 硬上限 + 墙钟预算 + token 预算）
     limits: DriverLimits,
+    /// 恢复会话名(run 级账本;None = 全新跑)
+    resume_session: Option<String>,
 }
 
 /// G9:执行多 agent 工作流(DAG 编排)
@@ -2173,24 +2184,57 @@ fn cmd_workflow(
     // M5-b：协作工作流标记会话——驱动每个节点完成后向本会话提交中性完成信号
     // (set meta_signal.node_done=<node_id>)，规则面 branch 壳+set 业务规则裁决
     // 写 meta_task.* 任务标记(引擎不忘，链上可查)。创建失败 fail-fast。
-    let marks_session = match runtime.block_on(client.create_session(
-        Some(&serde_json::json!({
-            "kind": "workflow_run",
-            "workflow_id": workflow_id,
-        })),
-        Some("llm"),
-    )) {
-        Ok(sid) => {
-            eprintln!("workflow marks session: {}", sid);
-            Some(sid)
-        }
-        Err(e) => {
-            eprintln!("failed to create workflow marks session: {}", e);
-            return ExitCode::from(1);
+    // 恢复路径不新建:标记会话是 run 的治理身份,从账面恢复复用同会话
+    // (全新标记会话会让下一节点的 phase 前置门查不到前置标记而误拦)。
+    let marks_session = if opts.resume_session.is_some() {
+        eprintln!("resume path: marks session restored from run journal");
+        None
+    } else {
+        match runtime.block_on(client.create_session(
+            Some(&serde_json::json!({
+                "kind": "workflow_run",
+                "workflow_id": workflow_id,
+            })),
+            Some("llm"),
+        )) {
+            Ok(sid) => {
+                eprintln!("workflow marks session: {}", sid);
+                Some(sid)
+            }
+            Err(e) => {
+                eprintln!("failed to create workflow marks session: {}", e);
+                return ExitCode::from(1);
+            }
         }
     };
 
-    let outcome = runtime.block_on(run_plan_loop(
+    // 恢复装配(人类显式持剑:续跑仅经 --resume-session 旗标,不自动恢复):
+    // 回放最新计划检查点+其后检查点尾段,状态不齐/锚不过即显式失败
+    let plan_resume = match opts.resume_session.as_deref() {
+        Some(sid) => {
+            let sessions_dir = workdir.join("data").join("sessions");
+            match evo_agent::agent::driver::build_plan_loop_resume(&sessions_dir, sid) {
+                Ok(r) => {
+                    eprintln!(
+                        "resuming plan run '{}': version={} replans={} restored_nodes={} registry_entries={}",
+                        sid,
+                        r.state.version,
+                        r.state.replan_count,
+                        r.node_replay.results.len(),
+                        r.state.executed_registry.len()
+                    );
+                    Some(r)
+                }
+                Err(e) => {
+                    eprintln!("failed to build resume from run journal '{}': {}", sid, e);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        None => None,
+    };
+
+    let outcome = runtime.block_on(evo_agent::agent::driver::run_plan_loop_with_resume(
         ctx,
         wf,
         mode,
@@ -2198,6 +2242,7 @@ fn cmd_workflow(
         Some(seed_hash),
         marks_session,
         None, // 判据执行容器：CLI workflow 宿主语义（容器域属 serve 面）
+        plan_resume,
     ));
 
     match outcome {
@@ -2207,6 +2252,9 @@ fn cmd_workflow(
                 workflow_id, o.stats.plan_versions, o.stats.replans, o.stats.nodes_executed,
                 o.stats.wall_ms, o.stats.repeated_nodes, o.stats.tokens_used, o.stats.replan_tokens
             );
+            if let Some(sid) = &o.run_session_id {
+                eprintln!("run ledger session: {sid}");
+            }
             println!("{}", o.content);
             ExitCode::SUCCESS
         }

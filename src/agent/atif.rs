@@ -961,6 +961,8 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             // journal 侧回放,轨迹步只反映对话粒)
             JournalEvent::NodeCheckpointed { .. } => {}
             JournalEvent::CheckpointBlob { .. } => {}
+            // 计划循环检查点:不映射步(观测面口径;驱动状态在 journal 侧回放)
+            JournalEvent::PlanLoopCheckpointed { .. } => {}
             // SessionCrashed 已在循环头截断
             JournalEvent::SessionCrashed { .. } => {}
             // HandoverWritten:交接点语义锚(写档动作镜像已在 tool_invoked/
