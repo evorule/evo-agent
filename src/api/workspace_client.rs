@@ -743,10 +743,14 @@ impl WorkspaceApiClient {
 
     // ===== bundles 部署闭环（治理域导出，部署链上游） =====
 
-    /// POST /bundles/export — 带真实闸门一证据的导出（T0 决策：POST 承载 tests 数组）
+    /// POST /api/bundles/export — 带真实闸门一证据的导出（T0 决策：POST 承载 tests 数组）
     ///
     /// 闭环链路：本方法导出 DatasetBundle → 执行域 `bundle_import_dry_run`
     /// 预检 → `bundle_import` 落盘激活。
+    ///
+    /// server 侧语义（workspace 治理域）：`dataset_id` = workspace_id（与发布
+    /// 链同口径）；`version` 仅支持 `"current"`（活规则集导出，workspace 域无
+    /// 历史版本快照链，其他值 → 400 显式错误）。
     ///
     /// - `verdict="pass"` 时 `subset` 必须非空且每项以 `sandbox:<id>`（机器背书）
     ///   或 `human:<actor>`（人工降级）开头——治理域证据形状校验（回归验证 B1），
@@ -754,10 +758,10 @@ impl WorkspaceApiClient {
     /// - `verdict="fail"` 为显式"未验证"导出（无伪造风险，无 subset 要求）；
     /// - `trim` 为可选裁剪视图语法（`tag:core` / `domain:tax` / `ids:id1,id2`，
     ///   多段以 `;` 分隔，交集）；
-    /// - `recipe_snapshot` 为可选策略快照（O-377① 批 1，RecipeSnapshot JSON 形态，
-    ///   由系统侧注入而非 LLM 传参——防伪造与「导出不伪造 verdict」同哲学；
-    ///   值形态以 evorule-bundle 契约为准，此处 Value 透传保持 api 层与契约
-    ///   类型解耦）。
+    /// - `recipe_snapshot` 为可选策略快照（策略快照固化批，RecipeSnapshot JSON
+    ///   形态，由系统侧注入而非 LLM 传参——防伪造与「导出不伪造 verdict」同
+    ///   哲学；值形态以 evorule-bundle 契约为准，此处 Value 透传保持 api 层
+    ///   与契约类型解耦）。
     ///
     /// 走 check_response_full：证据形状校验失败的修复指引透出。
     pub async fn export_bundle(
@@ -769,7 +773,7 @@ impl WorkspaceApiClient {
         trim: Option<&str>,
         recipe_snapshot: Option<Value>,
     ) -> Result<Value, ApiError> {
-        let url = self.core.url("/bundles/export");
+        let url = self.core.url("/api/bundles/export");
         let body = serde_json::json!({
             "dataset_id": dataset_id,
             "version": version,

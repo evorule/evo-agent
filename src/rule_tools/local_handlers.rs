@@ -719,21 +719,24 @@ pub fn specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "bundle_export".to_string(),
             description: "Export a dataset bundle with sandbox test evidence from the \
-                          governance domain (POST /bundles/export). Returns the DatasetBundle \
-                          JSON to pass to bundle_import_dry_run / bundle_import."
+                          workspace governance domain (POST /api/bundles/export). dataset_id \
+                          is the workspace id. Returns the DatasetBundle JSON to pass to \
+                          bundle_import_dry_run / bundle_import."
                 .to_string(),
             parameters: vec![
                 ParameterSpec {
                     name: "dataset_id".to_string(),
                     r#type: "string".to_string(),
-                    description: "Dataset id to export.".to_string(),
+                    description: "Dataset id to export (the workspace id).".to_string(),
                     required: true,
                 },
                 ParameterSpec {
                     name: "version".to_string(),
                     r#type: "string".to_string(),
-                    description: "Dataset version to export (current version uses live \
-                                  entries; historical versions rebuilt from snapshots)."
+                    description: "Use \"current\": exports the workspace's live (Active) \
+                                  rules. Historical versions are not available in the \
+                                  workspace governance domain (other values are rejected \
+                                  with 400)."
                         .to_string(),
                     required: true,
                 },
