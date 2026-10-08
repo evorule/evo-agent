@@ -1306,6 +1306,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             output_format: None,
             context_window_tokens: None,
             acceptance_command: None,
+            i2_lexicon: None,
             max_parallel_tools: 1,
             capability_boundary: boundary,
             approval_mode: None,

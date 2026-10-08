@@ -31,12 +31,79 @@ pub const MECHANISM_SECTION_MARKERS: &[&str] = &[
     "## Notes",
 ];
 
-/// 禁令词形(确定性词表)
-const PROHIBITION_MARKS: &[&str] = &["禁止", "不得", "不要", "不能", "不允许", "禁用"];
-/// 声明词形(确定性词表)
-const AFFIRMATION_MARKS: &[&str] = &["可以", "允许", "应当", "应该", "支持", "推荐"];
-/// 禁令/声明词与 token 的邻近窗口(字符数)
+/// 禁令词形 v2(双语对称扩充,行为变更批:英文词形以词边界匹配,窗口适配)
+const PROHIBITION_MARKS: &[&str] = &[
+    "禁止", "不得", "不要", "不能", "不允许", "禁用", "严禁", "切勿", "不可", "拒绝", "never",
+    "must not", "do not", "should not", "cannot", "forbidden", "prohibited", "avoid",
+];
+/// 声明词形 v2(双语对称扩充)
+const AFFIRMATION_MARKS: &[&str] = &[
+    "可以", "允许", "应当", "应该", "支持", "推荐", "必须", "务必", "建议", "能够", "must",
+    "should", "can", "may", "allowed", "supported", "recommended", "enabled",
+];
+/// 禁令/声明词与 token 的邻近窗口:中文形 12 字符(历史口径不变)/英文形 24
+/// 字符(英文词距更长,窗口适配;行为变更点之二)
 const MARK_WINDOW_CHARS: usize = 12;
+const MARK_WINDOW_CHARS_ASCII: usize = 24;
+
+/// I2 词表（数据化载体）：机制内建 v2 双语表为缺省；definition.i2_lexicon
+/// 声明即整体覆盖（per-agent 语言风格适配）。确定性纯数据。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct I2Lexicon {
+    /// 禁令词形（空 = 内建 v2 表）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prohibition: Vec<String>,
+    /// 声明词形（空 = 内建 v2 表）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affirmation: Vec<String>,
+}
+
+impl I2Lexicon {
+    /// 机制内建 v2 双语表
+    pub fn builtin() -> Self {
+        Self {
+            prohibition: PROHIBITION_MARKS.iter().map(|s| s.to_string()).collect(),
+            affirmation: AFFIRMATION_MARKS.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+/// 词形命中判定（词边界感知）：ASCII 边缘词形（英文）要求首尾字符非
+/// ASCII 字母数字——"can" 不得命中 "scan"；非 ASCII 词形（中文）维持
+/// 子串语义（无词边界概念，历史行为逐字节保真）。
+fn contains_mark(window: &str, mark: &str) -> bool {
+    if !mark.is_ascii() {
+        return window.contains(mark);
+    }
+    // 英文形大小写不敏感(Never/never 同义;大小写即书写风格非语义)
+    let (window_l, mark_l) = (window.to_lowercase(), mark.to_lowercase());
+    let window = window_l.as_str();
+    let mark = mark_l.as_str();
+    let bytes = window.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = window[search_from..].find(mark) {
+        let start = search_from + rel;
+        let end = start + mark.len();
+        let before_ok = start == 0
+            || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = end >= bytes.len()
+            || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
+}
+
+/// 词形窗口（按词形语言分型：ASCII=24 字符 / 中文=12 字符）
+fn window_chars_for(mark: &str) -> usize {
+    if mark.is_ascii() {
+        MARK_WINDOW_CHARS_ASCII
+    } else {
+        MARK_WINDOW_CHARS
+    }
+}
 /// 冲突摘录上限(字符)
 const EXCERPT_MAX_CHARS: usize = 80;
 
@@ -290,10 +357,14 @@ fn find_marked_line(text: &str, token: &str, marks: &[&str]) -> Option<String> {
         while let Some(rel) = line[search_from..].find(token) {
             let tok_start = search_from + rel;
             let tok_end = tok_start + token.len();
-            let win_start = floor_char_boundary(line, tok_start.saturating_sub(MARK_WINDOW_CHARS));
-            let win_end = ceil_char_boundary(line, (tok_end + MARK_WINDOW_CHARS).min(line.len()));
-            let window = &line[win_start..win_end];
-            if marks.iter().any(|m| window.contains(m)) {
+            // 词形命中:逐词形独立窗口(ASCII 形 24/中文形 12)+词边界判定
+            let hit = marks.iter().any(|m| {
+                let w = window_chars_for(m);
+                let ws = floor_char_boundary(line, tok_start.saturating_sub(w));
+                let we = ceil_char_boundary(line, (tok_end + w).min(line.len()));
+                contains_mark(&line[ws..we], m)
+            });
+            if hit {
                 return Some(truncate_chars(line.trim(), EXCERPT_MAX_CHARS));
             }
             search_from = tok_end;
@@ -315,14 +386,26 @@ pub fn inspect_system_sections(
     system_prompt: &str,
     capability_tokens: &[String],
 ) -> Vec<I2ConflictRecord> {
+    inspect_system_sections_with(system_prompt, capability_tokens, &I2Lexicon::builtin())
+}
+
+/// 同上（数据化入参版）：词表由调用方注入（definition.i2_lexicon 声明
+/// 覆盖,或机制内建 v2 表）。
+pub fn inspect_system_sections_with(
+    system_prompt: &str,
+    capability_tokens: &[String],
+    lexicon: &I2Lexicon,
+) -> Vec<I2ConflictRecord> {
     let sections = split_sections(system_prompt);
+    let prohibition: Vec<&str> = lexicon.prohibition.iter().map(String::as_str).collect();
+    let affirmation: Vec<&str> = lexicon.affirmation.iter().map(String::as_str).collect();
     let mut out = Vec::new();
     for token in capability_tokens {
         if token.trim().is_empty() {
             continue;
         }
         for (ai, (name_a, text_a)) in sections.iter().enumerate() {
-            let Some(excerpt_a) = find_marked_line(text_a, token, PROHIBITION_MARKS) else {
+            let Some(excerpt_a) = find_marked_line(text_a, token, &prohibition) else {
                 continue;
             };
             for (bi, (name_b, text_b)) in sections.iter().enumerate() {
@@ -332,7 +415,7 @@ pub fn inspect_system_sections(
                 let hit_b = if is_capability_section(name_b) {
                     first_line_with(text_b, token).map(|e| ("deny_vs_capability", e))
                 } else {
-                    find_marked_line(text_b, token, AFFIRMATION_MARKS)
+                    find_marked_line(text_b, token, &affirmation)
                         .map(|e| ("deny_vs_affirmation", e))
                 };
                 if let Some((kind, excerpt_b)) = hit_b {
@@ -406,6 +489,70 @@ mod tests {
         let a = inspect_system_sections(sp, &["web_search".to_string()]);
         let b = inspect_system_sections(sp, &["web_search".to_string()]);
         assert_eq!(a, b);
+    }
+
+    // ===== 词表扩充 v2（双语+词边界+窗口+数据化） =====
+
+    #[test]
+    fn english_prohibition_and_affirmation_detected() {
+        // 双语补齐:英文词形进入候选(此前中文-only=对英文语料盲扫)
+        let sp = "Never use web_search without approval.
+
+【能力边界声明】
+可用工具:web_search";
+        let r = inspect_system_sections_with(sp, &["web_search".to_string()], &I2Lexicon::builtin());
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!(r[0].excerpt_a.contains("Never"), "{r:?}");
+
+        let sp2 = "You must not call git_push on protected branches.
+
+## Stable Facts
+- 推荐 git_push 做推送";
+        let r2 = inspect_system_sections_with(sp2, &["git_push".to_string()], &I2Lexicon::builtin());
+        assert_eq!(r2.len(), 1, "must not × 推荐配对: {r2:?}");
+    }
+
+    #[test]
+    fn english_word_boundary_rejects_interior_matches() {
+        // 词边界:英文词形不得内嵌命中
+        let sp = "scanner allowed for diagnostics.
+
+【能力边界声明】
+- scanner";
+        let r = inspect_system_sections_with(sp, &["scanner".to_string()], &I2Lexicon::builtin());
+        assert!(r.is_empty(), "无禁令=无配对(内嵌词形不伪命中): {r:?}");
+    }
+
+    #[test]
+    fn english_window_adapted_for_ascii_marks() {
+        // 窗口适配:ASCII 词形 24 字符——长英文禁令距 token 超过旧 12 窗仍检出
+        let sp = "web_search is prohibited from being used in production clusters.
+
+【能力边界声明】
+- web_search";
+        let r = inspect_system_sections_with(sp, &["web_search".to_string()], &I2Lexicon::builtin());
+        assert_eq!(r.len(), 1, "24 字符窗口检出长距英文禁令: {r:?}");
+    }
+
+    #[test]
+    fn lexicon_override_is_wholesale() {
+        // 数据化:词表声明即整体覆盖(声明集外的内建词形失效)
+        let custom = I2Lexicon {
+            prohibition: vec!["封禁".to_string()],
+            affirmation: vec!["开放".to_string()],
+        };
+        let sp = "封禁使用 web_search。开放调试。
+
+【能力边界声明】
+- web_search";
+        let r = inspect_system_sections_with(sp, &["web_search".to_string()], &custom);
+        assert_eq!(r.len(), 1, "自定义词形配对: {r:?}");
+        // 内建词形在覆盖后失效
+        let sp2 = "禁止使用 web_search。
+
+【能力边界声明】
+- web_search";
+        assert!(inspect_system_sections_with(sp2, &["web_search".to_string()], &custom).is_empty());
     }
 
     #[test]
