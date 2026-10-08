@@ -50,6 +50,7 @@
 use serde_json::{json, Value};
 
 use crate::agent::delegate::DelegateContext;
+use crate::agent::journal::JournalWriter;
 use crate::agent::materializer::materialize_plan_fact;
 use crate::agent::replan::{
     lookup_agent_type, lookup_node_atomic, parse_failed_node_id, should_replan, BudgetCounters,
@@ -111,6 +112,156 @@ pub struct PlanLoopOutcome {
     pub content: String,
     /// 全程统计（版本数/replan 数/节点数/墙钟）
     pub stats: PlanLoopStats,
+    /// run 级账本会话名(恢复面凭此回放续跑;None = 无账域/显式关停。
+    /// 调用方[如评测 harness]留存此值即可在进程死亡后显式恢复)
+    pub run_session_id: Option<String>,
+}
+
+/// 计划循环检查点的账面状态(最新 PlanLoopCheckpointed 的投影;
+/// `cur_workflow` 为序列化 Workflow JSON,重建时反序列化)
+#[derive(Debug, Clone)]
+pub struct PlanLoopCheckpointState {
+    /// 当前计划版本(v1 起)
+    pub version: u32,
+    /// 已发生 replan 次数
+    pub replan_count: u32,
+    /// 已执行注册表 (node_id, agent_type) 跨版本累积
+    pub executed_registry: Vec<(String, String)>,
+    /// 预算计数器(跨版本累计,恢复不得清零)
+    pub counters: BudgetCounters,
+    /// 计划形态锚(注入后 PlanFact canonical JSON 的 64-hex hash;Dsl None)
+    pub cur_canonical_hash: Option<String>,
+    /// 原始目标文本(replan 任务构造输入)
+    pub goal: Option<String>,
+    /// 当前版工作流(序列化 JSON)
+    pub cur_workflow: String,
+    /// 协作标记会话 id(run 的治理身份;恢复必须复用同会话——全新标记会话
+    /// 会让下一节点的 phase 前置门查不到前置标记而误拦)
+    pub marks_session: Option<String>,
+}
+
+/// 驱动循环恢复入参(从 run 级账本回放装配;见 [`build_plan_loop_resume`])
+#[derive(Debug, Clone)]
+pub struct PlanLoopResume {
+    /// 计划状态(版本/计数/注册表/预算计数器/锚/目标/当前版工作流)
+    pub state: PlanLoopCheckpointState,
+    /// 粒级进度种子(最新计划检查点之后检查点尾段的回放重建;
+    /// 已完成粒零重执行)
+    pub node_replay: crate::agent::workflow::NodeCheckpointReplay,
+    /// run 级账本会话名(恢复续写同一账本)
+    pub run_session_id: String,
+}
+
+/// 从 run 级账本回放最新计划循环检查点(纯账面投影;不做粒级回放——
+/// 调用方拿尾部索引自 [`PlanLoopCheckpointState`] 对应工作流的
+/// 计划锚切片后走粒级回放,多版本不混切)。
+///
+/// 返回 `(状态, 尾段起始行索引)`;账内无计划检查点 = `Ok(None)`
+/// (该账本不具备驱动级恢复条件,调用方显式报错)。
+pub fn replay_plan_loop_checkpoint(
+    lines: &[crate::agent::journal::JournalLine],
+) -> Result<Option<(PlanLoopCheckpointState, usize)>, String> {
+    use crate::agent::journal::{BudgetCountersSnapshot, JournalEvent};
+    let mut found: Option<(PlanLoopCheckpointState, usize)> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        if let JournalEvent::PlanLoopCheckpointed {
+            version,
+            replan_count,
+            executed_registry,
+            counters:
+                BudgetCountersSnapshot {
+                    nodes_executed,
+                    wall_ms,
+                    tokens_used,
+                },
+            cur_canonical_hash,
+            goal,
+            marks_session,
+            cur_workflow,
+        } = &line.event
+        {
+            found = Some((
+                PlanLoopCheckpointState {
+                    version: *version,
+                    replan_count: *replan_count,
+                    executed_registry: executed_registry.clone(),
+                    counters: BudgetCounters {
+                        nodes_executed: *nodes_executed,
+                        wall_ms: *wall_ms,
+                        tokens_used: *tokens_used,
+                    },
+                    cur_canonical_hash: cur_canonical_hash.clone(),
+                    goal: goal.clone(),
+                    cur_workflow: cur_workflow.clone(),
+                    marks_session: marks_session.clone(),
+                },
+                idx + 1,
+            ));
+        }
+    }
+    Ok(found)
+}
+
+/// 从 run 级账本装配驱动恢复入参:最新计划检查点状态 + 其后检查点尾段的
+/// 粒级回放(按当前版工作流的计划锚严格校验,锚不匹配/blob 缺失/hash 不过
+/// 一律拒绝——宁可重跑不可错续)。
+pub fn build_plan_loop_resume(
+    dir: &std::path::Path,
+    session_id: &str,
+) -> Result<PlanLoopResume, String> {
+    use crate::agent::journal::{read_all, JournalWriter};
+    let path = JournalWriter::path_for(dir, session_id);
+    let lines =
+        read_all(&path).map_err(|e| format!("run journal read failed ('{session_id}'): {e}"))?;
+    let (state, tail_start) = replay_plan_loop_checkpoint(&lines)?.ok_or_else(|| {
+        format!("no plan loop checkpoint in run journal '{session_id}' - nothing to resume from")
+    })?;
+    let cur_workflow: Workflow = serde_json::from_str(&state.cur_workflow)
+        .map_err(|e| format!("checkpoint workflow deserialize failed: {e}"))?;
+    let plan_hash = WorkflowEngine::workflow_plan_hash(&cur_workflow)?;
+    let node_replay =
+        crate::agent::workflow::replay_node_checkpoints(&lines[tail_start..], &plan_hash)?;
+    Ok(PlanLoopResume {
+        state,
+        node_replay,
+        run_session_id: session_id.to_string(),
+    })
+}
+
+/// 计划循环检查点落账(内部辅助:账写不掉 = Err 上抛,驱动中止——账面硬义务)
+#[allow(clippy::too_many_arguments)]
+fn write_plan_loop_checkpoint(
+    journal: Option<&JournalWriter>,
+    version: u32,
+    replan_count: u32,
+    executed_registry: &[(String, String)],
+    counters: &BudgetCounters,
+    cur_canonical_hash: Option<&str>,
+    goal: Option<&str>,
+    marks_session: Option<&str>,
+    cur_wf: &Workflow,
+) -> Result<(), String> {
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+    let cur_workflow = serde_json::to_string(cur_wf).map_err(|e| e.to_string())?;
+    journal
+        .plan_loop_checkpointed(
+            version,
+            replan_count,
+            executed_registry.to_vec(),
+            crate::agent::journal::BudgetCountersSnapshot {
+                nodes_executed: counters.nodes_executed,
+                wall_ms: counters.wall_ms,
+                tokens_used: counters.tokens_used,
+            },
+            cur_canonical_hash.map(str::to_string),
+            goal.map(str::to_string),
+            marks_session.map(str::to_string),
+            &cur_workflow,
+        )
+        .map_err(|e| format!("plan loop checkpoint write failed: {e}"))?;
+    Ok(())
 }
 
 /// plan-execute 外层驱动主循环（见模块文档；每版执行 = 全新 `execute`，丢弃式）
@@ -133,10 +284,46 @@ pub async fn run_plan_loop(
     marks_session: Option<String>,
     judge_container: Option<String>,
 ) -> Result<PlanLoopOutcome, String> {
+    run_plan_loop_with_resume(
+        ctx,
+        initial,
+        mode,
+        limits,
+        seed_hash,
+        marks_session,
+        judge_container,
+        None,
+    )
+    .await
+}
+
+/// 驱动循环恢复入口:`resume = Some` 时从 run 级账本回放态续跑(计划状态+
+/// 粒级进度,已完成粒零重执行);`None` = 既有行为零变更。计划级检查点仅
+/// PlanExecute 模式落账(Dsl 工作流由入参可复建,粒级检查点已覆盖)。
+pub async fn run_plan_loop_with_resume(
+    ctx: DelegateContext,
+    initial: Workflow,
+    mode: PlanMode,
+    limits: DriverLimits,
+    seed_hash: Option<String>,
+    marks_session: Option<String>,
+    judge_container: Option<String>,
+    resume: Option<PlanLoopResume>,
+) -> Result<PlanLoopOutcome, String> {
     // tokens 埋点累加器（纲领 §8 Phase 2 交付物 7）：驱动注入 ctx，随每个
     // 子 runner 共享；仅供观测统计，不改变任何控制流。
     let token_arc = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ctx = ctx.with_token_counter(token_arc.clone());
+    // 恢复态解包(先行;marks_session 以恢复态为准——run 的治理身份必须
+    // 跨进程复用,见 PlanLoopCheckpointState 注)
+    let (resumed_state, node_replay, run_session_id) = match resume {
+        Some(r) => (Some(r.state), Some(r.node_replay), Some(r.run_session_id)),
+        None => (None, None, None),
+    };
+    let marks_session = resumed_state
+        .as_ref()
+        .and_then(|s| s.marks_session.clone())
+        .or(marks_session);
     // M5-c:标记会话启用时同步注入阶段前置裁决通道(每个 LLM 节点 delegate
     // 前提交 phase 信号,由 00_constraint enforce 裁决前置条件——引擎不含
     // 协作纪律知识);None = 零变更
@@ -149,35 +336,77 @@ pub async fn run_plan_loop(
     }
     let initial_id = initial.workflow_id.clone();
 
+    // run 级账本:PlanExecute 由驱动持有句柄并注入引擎(计划级检查点落账 +
+    // 引擎粒级检查点同账续写;恢复时续写同一会话);Dsl/无账域 = 引擎自举
+    // 语义不变(粒级检查点仍落,计划级检查点不落)。开账失败 = fail-fast。
+    let run_journal: Option<JournalWriter> = if mode == PlanMode::PlanExecute {
+        match ctx.journal_dir.clone() {
+            Some(dir) => {
+                let sid = match &run_session_id {
+                    Some(sid) => sid.clone(),
+                    None => WorkflowEngine::new_run_session_id(&initial_id),
+                };
+                let writer = JournalWriter::open(&dir, &sid)
+                    .map_err(|e| format!("run ledger open failed (session '{sid}'): {e}"))?;
+                engine = engine.with_run_journal(writer.clone());
+                Some(writer)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // 当前计划版本（v1 起；Dsl v1 = 手写 workflow，PlanExecute v1 = probe 产出 PlanFact）
-    let mut version: u32 = 1;
-    let mut replan_count: u32 = 0_u32;
-    let mut counters = BudgetCounters::default();
-    let mut cur_wf = initial;
-    // 当前 PlanFact 注入后 canonical JSON（Dsl v1 = None，replan 时锚回退 seed_hash）
-    let mut cur_canonical: Option<String> = None;
+    // 恢复态在场时全量取自账面(计数器/注册表/版本不得清零——恢复即续算)
+    let mut version: u32 = resumed_state.as_ref().map_or(1, |s| s.version);
+    let mut replan_count: u32 = resumed_state.as_ref().map_or(0, |s| s.replan_count);
+    let mut counters = resumed_state
+        .as_ref()
+        .map(|s| s.counters.clone())
+        .unwrap_or_default();
+    let mut cur_wf = match resumed_state.as_ref() {
+        Some(s) => serde_json::from_str::<Workflow>(&s.cur_workflow)
+            .map_err(|e| format!("checkpoint workflow deserialize failed: {e}"))?,
+        None => initial,
+    };
+    // 当前版计划形态锚(注入后 PlanFact canonical JSON 的 64-hex;Dsl v1 = None,
+    // replan 时锚回退 seed_hash。恢复态直接取账面 hash——原 canonical 串仅被
+    // 求哈希,存 hash 即等价)
+    let mut cur_canonical_hash: Option<String> = resumed_state
+        .as_ref()
+        .and_then(|s| s.cur_canonical_hash.clone());
     // 原始目标（PlanExecute = probe planner 节点 task；Dsl = None，摘要引导）
-    let mut goal: Option<String> = None;
-    // 已执行注册表（跨版本累积 (node_id, agent_type)；R8-T03 静态拦截比对源）
-    let mut executed_registry: Vec<(String, String)> = Vec::new();
+    let mut goal: Option<String> = resumed_state.as_ref().and_then(|s| s.goal.clone());
+    // 已执行注册表（跨版本累积 (node_id, agent_type)；R8-T03 静态拦截比对源；
+    // 恢复态取账面——不重置不重复）
+    let mut executed_registry: Vec<(String, String)> = resumed_state
+        .as_ref()
+        .map(|s| s.executed_registry.clone())
+        .unwrap_or_default();
     // 原子粒工作事实记忆（分类路由）：曾携带 atomic 标记的节点 id 集合——
     // 原子性一经标记跨版本持续有效（replan 重产计划不带 atomic 字段，记忆集
     // 合补事实连续性）
     let mut atomic_granules: std::collections::HashSet<String> = std::collections::HashSet::new();
     // 按节点重切计数（分类路由：原子粒重切预算判定输入）
     let mut recut_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    // v2+ 版本 token 消耗（replan 重复执行成本埋点，交付物 7 / D-02 判定源）
+    // v2+ 版本 token 消耗（replan 重复执行成本埋点，交付物 7 / D-02 判定源;
+    // 跨进程成本统计不入账——恢复后从本进程增量起算,诚实面:成本统计为部分值)
     let mut replan_tokens: u64 = 0;
     // 静态拦截命中累计（R8-T03 幂等重复告警计数）
     let mut repeated_nodes: u64 = 0;
+    // 恢复首版标记(首版执行带粒级种子;replan 后版本全新执行)
+    let mut first_version_node_replay = node_replay;
     // 借用先行（replan 站点闭包 async move 按值捕获会 move 非 Copy 的 ctx；
     // 借引用则 Copy 复制进 future，跨 loop 轮次复用同一借用）
     let ctx_ref = &ctx;
 
-    if mode == PlanMode::PlanExecute {
+    if mode == PlanMode::PlanExecute && resumed_state.is_none() {
         // ① planning probe：跑载入 DAG（单 planner 节点），产出 PlanFact v1。
         //    probe 失败 = 尚无计划可 replan，直接失败（R1-T03 重试面在
         //    call_planner_with_retry 内：提取失败带反馈重试 1 次）。
+        //    恢复态在场 = 计划状态取自账面,跳过 probe(probe 产 v1 依赖非确定
+        //    LLM 输出,重跑即漂移;账面 cur_workflow 是唯一确定性重建源)。
         let probe_out = engine
             .execute(&cur_wf)
             .await
@@ -201,15 +430,32 @@ pub async fn run_plan_loop(
         let canonical = serde_json::to_string(&plan).map_err(|e| e.to_string())?;
         cur_wf = materialize_plan_fact(&plan, &format!("{}_plan_v1", initial_id))
             .map_err(|errs| format!("plan v1 materialization failed: {}", errs.join("; ")))?;
-        cur_canonical = Some(canonical);
+        cur_canonical_hash = Some(plan_canonical_hash(&canonical));
         tracing::info!(plan_version = 1, "plan-execute: plan v1 materialized");
+        // 计划级检查点(写点 A:每版计划物化后——账先于状态,此点之后任意
+        // 时刻崩溃,v1 计划可从账面确定性重建)
+        write_plan_loop_checkpoint(
+            run_journal.as_ref(),
+            version,
+            replan_count,
+            &executed_registry,
+            &counters,
+            cur_canonical_hash.as_deref(),
+            goal.as_deref(),
+            marks_session.as_deref(),
+            &cur_wf,
+        )?;
     }
 
     loop {
         // 每版 = 全新 execute（丢弃式 D-02：v(n) 结果不注入 v(n+1)，results 表随栈帧析构）
+        // 恢复首版 = execute_with_resume(粒级种子):已完成粒零重执行
         let tokens_before = token_arc.load(std::sync::atomic::Ordering::Relaxed);
         let started = std::time::Instant::now();
-        let result = engine.execute(&cur_wf).await;
+        let result = match first_version_node_replay.take() {
+            Some(replay) => engine.execute_with_resume(&cur_wf, replay).await,
+            None => engine.execute(&cur_wf).await,
+        };
         counters.wall_ms += started.elapsed().as_millis() as u64;
         counters.nodes_executed += engine.executed_nodes();
 
@@ -238,6 +484,21 @@ pub async fn run_plan_loop(
                     })?;
             }
         }
+
+        // 计划级检查点(写点 C:每轮计数器/注册表落定处——账先于状态,此点
+        // 之后 replan 决策/planner 调用/物化全链崩溃均可恢复;预算阈值越限
+        // 形态亦被本点覆盖)
+        write_plan_loop_checkpoint(
+            run_journal.as_ref(),
+            version,
+            replan_count,
+            &executed_registry,
+            &counters,
+            cur_canonical_hash.as_deref(),
+            goal.as_deref(),
+            marks_session.as_deref(),
+            &cur_wf,
+        )?;
 
         // D-01 enforce 判别（§9.5.1 选项 B）：宪法违规是系统性错误，一票否决
         // ——终止整个循环且不 replan（不开「换计划再试」通道）。
@@ -305,6 +566,7 @@ pub async fn run_plan_loop(
                     replan_tokens,
                     repeated_nodes,
                 },
+                run_session_id: run_session_id.or_else(|| engine.run_ledger_session_id()),
             });
         };
 
@@ -314,10 +576,7 @@ pub async fn run_plan_loop(
         }
 
         // 失败记录回填计划形态 hash（锚定失败到具体计划版本，交付物 6 §3.1）
-        let cur_hash = cur_canonical
-            .as_deref()
-            .map(plan_canonical_hash)
-            .or_else(|| seed_hash.clone());
+        let cur_hash = cur_canonical_hash.clone().or_else(|| seed_hash.clone());
         if let Some(rec) = decision.failure_record.as_mut() {
             rec.failed_plan_hash = cur_hash.clone();
             // agent_type 外层反查回填（交付物 6 §3.1；查不到保持 None 不猜测）
@@ -494,13 +753,26 @@ pub async fn run_plan_loop(
             );
         }
 
-        cur_canonical = Some(canonical);
+        cur_canonical_hash = Some(plan_canonical_hash(&canonical));
         version = next;
         replan_count += 1;
         tracing::info!(
             plan_version = next,
             "plan-execute: replan materialized, re-executing"
         );
+        // 计划级检查点(写点 B:每次 replan 物化后——此后到下轮写点 C 之间
+        // 崩溃,恢复取本点,新版本从头执行,已完成粒由粒级检查点护栏)
+        write_plan_loop_checkpoint(
+            run_journal.as_ref(),
+            version,
+            replan_count,
+            &executed_registry,
+            &counters,
+            cur_canonical_hash.as_deref(),
+            goal.as_deref(),
+            marks_session.as_deref(),
+            &cur_wf,
+        )?;
     }
 }
 
@@ -1237,5 +1509,285 @@ mod tests {
             { "id": "l", "type": "llm", "agent_type": "w", "task": "t" }
         ]});
         assert!(find_non_idempotent_writes(&clean).is_empty());
+    }
+
+    // ----- 计划循环检查点与恢复(驱动级) -----
+
+    use crate::agent::delegate::DelegateContext;
+    use crate::agent::journal::{
+        read_all, BudgetCountersSnapshot, JournalEvent, JournalLine, JournalWriter,
+    };
+    use crate::agent::workflow::{ComputeInput, ComputeSpec};
+    use crate::api::evorule_client::EvoruleApiClient;
+
+    fn resume_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("drv-r4-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn resume_ctx(dir: &std::path::Path) -> DelegateContext {
+        DelegateContext::new(
+            "parent",
+            crate::agent::definition::AgentDefinitionManager::with_default_dir(),
+            EvoruleApiClient::new("http://127.0.0.1:1"),
+        )
+        .with_journal_dir(dir.to_path_buf())
+    }
+
+    fn compute_node(id: &str, deps: &[&str], spec: ComputeSpec) -> WorkflowNode {
+        WorkflowNode {
+            id: id.to_string(),
+            agent_type: String::new(),
+            task: String::new(),
+            task_template: None,
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            run_when: None,
+            compute: Some(spec),
+            output_schema: None,
+            judge: None,
+            atomic: false,
+        }
+    }
+
+    fn resume_chain_wf() -> Workflow {
+        // 三粒全 compute 链:n1=""(空拼接) → n2=Length(n1)="0" →
+        // n3=Replace(n2,"0"→"zero")="zero";无 LLM,驱动循环全程离线可跑
+        Workflow {
+            workflow_id: "resume_wf".to_string(),
+            description: String::new(),
+            nodes: vec![
+                compute_node(
+                    "n1",
+                    &[],
+                    ComputeSpec::Concat {
+                        inputs: vec![ComputeInput::Empty, ComputeInput::Empty],
+                    },
+                ),
+                compute_node(
+                    "n2",
+                    &["n1"],
+                    ComputeSpec::Length {
+                        inputs: vec![ComputeInput::Node("n1".to_string())],
+                    },
+                ),
+                compute_node(
+                    "n3",
+                    &["n2"],
+                    ComputeSpec::Replace {
+                        inputs: vec![ComputeInput::Node("n2".to_string())],
+                        find: "0".to_string(),
+                        replacement: "zero".to_string(),
+                    },
+                ),
+            ],
+            output_node: "n3".to_string(),
+        }
+    }
+
+    #[test]
+    fn plan_checkpoint_replay_latest_state_not_reset() {
+        // 计划级回放:最新 PlanLoopCheckpointed 胜出;计数器/注册表/版本取账面
+        // (不重置);尾段起始行 = 最新事件之后(粒级切片位)
+        let lines = vec![
+            JournalLine {
+                seq: 1,
+                ts: 1,
+                event: JournalEvent::NodeCheckpointed {
+                    workflow_id: "wf".into(),
+                    plan_hash: "ph".into(),
+                    node_id: "n0".into(),
+                    status: "completed".into(),
+                    result_ref: crate::agent::journal::CheckpointResultRef {
+                        hash: "blake3:x".into(),
+                        len: 0,
+                        inline: None,
+                    },
+                },
+            },
+            JournalLine {
+                seq: 2,
+                ts: 2,
+                event: JournalEvent::PlanLoopCheckpointed {
+                    version: 1,
+                    replan_count: 0,
+                    executed_registry: vec![],
+                    counters: BudgetCountersSnapshot {
+                        nodes_executed: 1,
+                        wall_ms: 10,
+                        tokens_used: 20,
+                    },
+                    cur_canonical_hash: None,
+                    goal: None,
+                    marks_session: None,
+                    cur_workflow: "{}".into(),
+                },
+            },
+            JournalLine {
+                seq: 3,
+                ts: 3,
+                event: JournalEvent::PlanLoopCheckpointed {
+                    version: 2,
+                    replan_count: 1,
+                    executed_registry: vec![
+                        ("n1".into(), "researcher".into()),
+                        ("n2".into(), "researcher".into()),
+                    ],
+                    counters: BudgetCountersSnapshot {
+                        nodes_executed: 5,
+                        wall_ms: 600,
+                        tokens_used: 700,
+                    },
+                    cur_canonical_hash: Some("blake3:abc".into()),
+                    goal: Some("goal text".into()),
+                    marks_session: Some("marks-1".into()),
+                    cur_workflow: r#"{"workflow_id":"wf"}"#.into(),
+                },
+            },
+            JournalLine {
+                seq: 4,
+                ts: 4,
+                event: JournalEvent::NodeCheckpointed {
+                    workflow_id: "wf".into(),
+                    plan_hash: "ph2".into(),
+                    node_id: "n3".into(),
+                    status: "completed".into(),
+                    result_ref: crate::agent::journal::CheckpointResultRef {
+                        hash: "blake3:y".into(),
+                        len: 0,
+                        inline: None,
+                    },
+                },
+            },
+        ];
+        let (state, tail_start) = replay_plan_loop_checkpoint(&lines)
+            .unwrap()
+            .expect("latest checkpoint must be found");
+        assert_eq!(state.version, 2, "最新版本胜出");
+        assert_eq!(state.replan_count, 1, "replan 计数取账面(不重置)");
+        assert_eq!(state.counters.nodes_executed, 5, "计数器取账面(不清零)");
+        assert_eq!(state.counters.tokens_used, 700);
+        assert_eq!(state.executed_registry.len(), 2, "注册表取账面(不重建)");
+        assert_eq!(state.cur_canonical_hash.as_deref(), Some("blake3:abc"));
+        assert_eq!(state.goal.as_deref(), Some("goal text"));
+        assert_eq!(state.marks_session.as_deref(), Some("marks-1"));
+        assert_eq!(tail_start, 3, "尾段自最新计划检查点之后起(含粒级检查点)");
+    }
+
+    #[test]
+    fn plan_checkpoint_replay_none_when_absent() {
+        let lines: Vec<JournalLine> = vec![];
+        assert!(replay_plan_loop_checkpoint(&lines).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dsl_resume_equivalence_zero_reexecution_and_counter_continuity() {
+        // Dsl 三粒链双跑:连续跑出基线;手工装配恢复态(计数器=崩溃前真值 2,
+        // 注册表含 n1)从截断账本恢复——终结果与 nodes_executed 与连续路径
+        // 等价,同会话账本合并后每粒恰一条检查点(零重执行)
+        let dir = resume_test_dir("dsl");
+        let wf = resume_chain_wf();
+        let limits = DriverLimits {
+            max_replan: 3,
+            max_recuts: 3,
+            max_wall_ms: None,
+            max_tokens: None,
+        };
+        let outcome1 = run_plan_loop(
+            resume_ctx(&dir),
+            wf.clone(),
+            PlanMode::Dsl,
+            limits,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome1.content, "zero");
+        assert_eq!(outcome1.stats.nodes_executed, 3);
+        let sid = outcome1
+            .run_session_id
+            .expect("engine bootstrapped session id surfaced");
+        let path = JournalWriter::path_for(&dir, &sid);
+        let lines = read_all(&path).unwrap();
+        assert_eq!(lines.len(), 3, "连续跑:三粒各一条检查点");
+
+        // 崩溃模拟:截断到 n3 检查点之前(粒 2 完成后进程死亡)
+        let cut = lines
+            .iter()
+            .position(
+                |l| matches!(&l.event, JournalEvent::NodeCheckpointed { node_id, .. } if node_id == "n3"),
+            )
+            .unwrap();
+        let truncated = &lines[..cut];
+        let plan_hash = WorkflowEngine::workflow_plan_hash(&wf).unwrap();
+        let node_replay =
+            crate::agent::workflow::replay_node_checkpoints(truncated, &plan_hash).unwrap();
+        assert_eq!(node_replay.results.len(), 2);
+
+        // 恢复态:计数器/注册表 = 崩溃前真值(粒 1/2 已计入),工作流全文入参
+        let state = PlanLoopCheckpointState {
+            version: 1,
+            replan_count: 0,
+            executed_registry: vec![("n1".to_string(), String::new())],
+            counters: BudgetCounters {
+                nodes_executed: 2,
+                wall_ms: 5,
+                tokens_used: 0,
+            },
+            cur_canonical_hash: None,
+            goal: None,
+            cur_workflow: serde_json::to_string(&wf).unwrap(),
+            marks_session: None,
+        };
+        let resume = PlanLoopResume {
+            state,
+            node_replay,
+            run_session_id: sid.clone(),
+        };
+        let outcome2 = run_plan_loop_with_resume(
+            resume_ctx(&dir),
+            wf.clone(),
+            PlanMode::Dsl,
+            limits,
+            None,
+            None,
+            None,
+            Some(resume),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome2.content, outcome1.content,
+            "恢复跑终结果与连续路径等价"
+        );
+        assert_eq!(
+            outcome2.stats.nodes_executed, 3,
+            "恢复计数器=账面 2+本进程 1,与连续路径等价(不重置不重复)"
+        );
+        assert_eq!(outcome2.run_session_id.as_deref(), Some(sid.as_str()));
+
+        // 零重执行:同会话账本合并后三粒各恰一条检查点
+        let merged = read_all(&path).unwrap();
+        let mut ckpt_nodes: Vec<String> = merged
+            .iter()
+            .filter_map(|l| match &l.event {
+                JournalEvent::NodeCheckpointed { node_id, .. } => Some(node_id.clone()),
+                _ => None,
+            })
+            .collect();
+        ckpt_nodes.sort();
+        assert_eq!(
+            ckpt_nodes,
+            vec!["n1".to_string(), "n2".to_string(), "n3".to_string()],
+            "三粒各恰一条检查点=零重执行"
+        );
+
+        // 注册表恢复后静态拦截仍生效:恢复态注册表含 n1 → 重复提案被点名
+        let repeats = detect_repeated_nodes(&wf.nodes, &[("n1".to_string(), String::new())]);
+        assert_eq!(repeats, vec!["n1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

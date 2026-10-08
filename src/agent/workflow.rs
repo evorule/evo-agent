@@ -759,6 +759,12 @@ impl WorkflowEngine {
         format!("planrun-{}-{}", workflow_id, &digest.to_hex()[..16])
     }
 
+    /// 生成新的 run 级账本会话名(驱动装配面用:驱动持有句柄注入引擎,
+    /// 会话名与引擎自举同一套命名策略;恢复面凭会话名回放续写)
+    pub fn new_run_session_id(workflow_id: &str) -> String {
+        Self::bootstrap_session_id(workflow_id)
+    }
+
     /// 计划锚:物化 Workflow canonical JSON 的 64-hex hash(与注入组锚同款
     /// 口径,同源可复算;引擎级锚=执行工件本身,外层驱动级锚=注入后
     /// PlanFact,两层各锚其所见)

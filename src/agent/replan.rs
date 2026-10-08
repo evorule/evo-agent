@@ -28,7 +28,7 @@
 //! - 阈值来自驱动配置禁止进 PlanFact（§5.1）：PlanFact 是 planner LLM 产出，
 //!   阈值可入即等于 LLM 可为自己写预算上限。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::workflow::WorkflowNode;
 
@@ -44,7 +44,7 @@ pub struct ReplanState {
 /// 预算计数器（外层驱动内存状态，每节点完成时累加；交付物 6 §4.1）
 ///
 /// `tokens_used` 经交付物 7 埋点真实累加（Phase 2 已落地）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetCounters {
     /// 已成功完成节点数（含 compute 与 LLM 节点，跳过不计）
     pub nodes_executed: u64,

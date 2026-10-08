@@ -54,6 +54,18 @@ pub struct CheckpointResultRef {
     pub inline: Option<String>,
 }
 
+/// 计划循环检查点的预算计数器快照(驱动预算四维的三计数器投影;
+/// 与驱动内存态同构,字段语义见驱动侧定义)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BudgetCountersSnapshot {
+    /// 已成功完成节点数
+    pub nodes_executed: u64,
+    /// 累计墙钟毫秒
+    pub wall_ms: u64,
+    /// 累计 token
+    pub tokens_used: u64,
+}
+
 /// token 计数三元组(provider 真值 `LlmResponse.token_usage` 映射;
 /// 估算 fallback 存总量,导出期按 7:3 拆分——ATIF 映射表 §四.3)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -159,6 +171,31 @@ pub enum JournalEvent {
         len: usize,
         /// 全文
         full_text: String,
+    },
+    /// 计划循环检查点(外层驱动状态:版本/replan 计数/已执行注册表/预算计数器/
+    /// 计划形态锚/当前版工作流全文)。写点:每版计划物化后+每次 replan 物化后+
+    /// 每轮执行后计数器注册表落定处。恢复 = 回放最新本事件重建驱动状态、
+    /// 其后检查点尾段回放粒级进度。观测面,不参与步映射。
+    PlanLoopCheckpointed {
+        /// 当前计划版本(v1 起)
+        version: u32,
+        /// 已发生 replan 次数
+        replan_count: u32,
+        /// 已执行注册表 (node_id, agent_type) 跨版本累积(静态拦截比对源)
+        executed_registry: Vec<(String, String)>,
+        /// 预算计数器(节点数/墙钟毫秒/token)
+        counters: BudgetCountersSnapshot,
+        /// 计划形态锚(注入后 PlanFact canonical JSON 的 64-hex hash;Dsl 形态
+        /// None——Dsl 工作流由调用方入参可复建,不落本事件)
+        cur_canonical_hash: Option<String>,
+        /// 原始目标文本(replan 任务构造的输入;None = 无目标形态)
+        goal: Option<String>,
+        /// 协作标记会话 id(run 的治理身份;恢复必须复用同会话,全新标记
+        /// 会话会让 phase 前置门误拦;None = 未启用标记)
+        marks_session: Option<String>,
+        /// 当前版工作流全文(replan 产物源自非确定 LLM 输出,不落全文即不可
+        /// 确定性重建——这是恢复面唯一的状态载体)
+        cur_workflow: String,
     },
     /// 审批请求开启(60s 窗口 / policy 判定前)
     ApprovalRequested {
@@ -728,6 +765,32 @@ impl JournalWriter {
             return Ok((seq, Some(blob_seq)));
         }
         Ok((seq, None))
+    }
+
+    /// 计划循环检查点落账(驱动状态全量投影;恢复面回放最新一条重建,
+    /// 其后检查点尾段回放粒级进度)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_loop_checkpointed(
+        &self,
+        version: u32,
+        replan_count: u32,
+        executed_registry: Vec<(String, String)>,
+        counters: BudgetCountersSnapshot,
+        cur_canonical_hash: Option<String>,
+        goal: Option<String>,
+        marks_session: Option<String>,
+        cur_workflow: &str,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::PlanLoopCheckpointed {
+            version,
+            replan_count,
+            executed_registry,
+            counters,
+            cur_canonical_hash,
+            goal,
+            marks_session,
+            cur_workflow: cur_workflow.to_string(),
+        })
     }
 
     /// llm_called(主循环 react 用途;provider token 真值优先,tokens_est 兜底)
