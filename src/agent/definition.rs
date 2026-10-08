@@ -488,6 +488,10 @@ pub struct AgentDefinition {
     /// **判据不过不存在 done 退出路径**。未配置时不拦截（非长程运行零影响）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance_command: Option<String>,
+    /// I2 词表声明（数据化：definition 级语言风格覆盖；None=机制内建
+    /// v2 双语表。serde 缺省 None=既有定义零影响）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i2_lexicon: Option<crate::agent::context_inspector::I2Lexicon>,
     /// G13:单轮内并行工具调用上限(可选,默认 1 = 串行)
     ///
     /// - `1`(默认):工具按顺序串行执行(向后兼容旧行为)
@@ -1016,6 +1020,8 @@ impl AgentDefinition {
             // 治理门禁段不在此复制——serve 三路径构造期经
             // with_governance_segment 注入(非 definition 数据)
             governance_segment: None,
+            // I2 词表声明直拷(声明即覆盖;None=机制内建 v2 双语表)
+            i2_lexicon: self.i2_lexicon.clone(),
         }
     }
 }
@@ -1728,6 +1734,7 @@ mod tests {
             output_format: None,
             context_window_tokens: None,
             acceptance_command: None,
+            i2_lexicon: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
@@ -2071,6 +2078,7 @@ mod tests {
             output_format: None,
             context_window_tokens: None,
             acceptance_command: None,
+            i2_lexicon: None,
             max_parallel_tools: 1,
             capability_boundary: Some(CapabilityBoundary {
                 mode: mode.to_string(),
@@ -2232,6 +2240,7 @@ mod tests {
             output_format: None,
             context_window_tokens: None,
             acceptance_command: None,
+            i2_lexicon: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
@@ -2391,6 +2400,7 @@ mod tests {
             output_format: None,
             context_window_tokens: None,
             acceptance_command: None,
+            i2_lexicon: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
