@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS facts(
     value_json TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'ledger',
     mem_type TEXT NOT NULL DEFAULT 'semantic',
+    content_hash TEXT NOT NULL DEFAULT '',
     PRIMARY KEY(prefix, fact_id)
 );
 CREATE TABLE IF NOT EXISTS postings(
@@ -217,6 +218,15 @@ impl LexStore {
             "mem_type",
             "mem_type TEXT NOT NULL DEFAULT 'semantic'",
         )?;
+        // 内容哈希去重列（存储设计档 §十启发回填：evorule-rule store 层
+        // content_hash() 同族——BLAKE3 与生态哈希纪律一致；DEFAULT 兜底
+        // 存量行,写入路径即算即存,读时去重视图消费）
+        ensure_column(
+            &conn,
+            "facts",
+            "content_hash",
+            "content_hash TEXT NOT NULL DEFAULT ''",
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
             cache_hit: std::sync::atomic::AtomicU64::new(0),
@@ -264,16 +274,20 @@ impl LexStore {
             let value_json =
                 serde_json::to_string(value).map_err(|e| LexError(format!("serialize: {e}")))?;
             let mem_type = row_mem_type(value, prefix);
+            // 内容哈希（BLAKE3，生态哈希纪律同源）：同内容跨 fact_id 的
+            // 去重视图基础（存储设计档 §十——去重从巩固管线下沉到存储层）
+            let content_hash = blake3::hash(value_json.as_bytes()).to_string();
             tx.execute(
-                "INSERT INTO facts(prefix, fact_id, path, value_json, source, mem_type)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO facts(prefix, fact_id, path, value_json, source, mem_type, content_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     prefix,
                     *fact_id as i64,
                     path,
                     value_json,
                     row_source::LEDGER,
-                    mem_type
+                    mem_type,
+                    content_hash
                 ],
             )
             .map_err(|e| LexError(format!("insert fact: {e}")))?;
@@ -441,6 +455,45 @@ impl LexStore {
             });
         }
         Some(out)
+    }
+
+    /// 内容哈希去重视图（存储设计档 §十启发回填落地）：同 content_hash
+    /// （BLAKE3(value_json)）的重复事实只保留账本位置最新（fact_id 最大）
+    /// 的一条——「重复记忆条目零存储」的读时形态；写时零存储（内容表
+    /// 拆分重构）为后续形态,不在 v0。巩固管线/召回视图可复用本视图。
+    pub fn content_dedup_view(&self, prefix: &str) -> Result<Vec<CachedFact>, LexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.fact_id, f.path, f.value_json FROM facts f \
+                 WHERE f.prefix = ?1 AND f.content_hash != '' AND f.fact_id = (\
+                 SELECT MAX(g.fact_id) FROM facts g \
+                 WHERE g.prefix = f.prefix AND g.content_hash = f.content_hash) \
+                 ORDER BY f.fact_id",
+            )
+            .map_err(|e| LexError(format!("dedup_view: {e}")))?;
+        let rows = stmt
+            .query_map([prefix], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| LexError(format!("dedup_view query: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (fact_id, path, value_json) =
+                row.map_err(|e| LexError(format!("dedup_view row: {e}")))?;
+            let value = serde_json::from_str(&value_json)
+                .map_err(|e| LexError(format!("dedup_view parse: {e}")))?;
+            out.push(CachedFact {
+                fact_id: fact_id as u64,
+                path,
+                value,
+            });
+        }
+        Ok(out)
     }
 
     /// P2 实体检索原语：按实体名直查候选集。
@@ -727,6 +780,51 @@ mod tests {
         assert!(store.cached_facts("shared.ns.stable.", 60).is_some());
         assert!(store.cached_facts("shared.ns.stable.", 0).is_none());
         assert_eq!(store.cache_stats(), (1, 2, 1));
+    }
+
+    #[test]
+    fn test_content_hash_dedup_view() {
+        // 存储设计档 §十启发回填落地:同内容跨 fact_id → 去重视图只留
+        // 账本位置最新一条;不同内容互不吞并;hash 可复算(重放一致)
+        let path = temp_db("chash");
+        let store = LexStore::open(&path).unwrap();
+        let v = serde_json::json!({"k": "same-content", "v": 1});
+        let facts = vec![
+            (10u64, "shared.ns.stable.a".to_string(), v.clone()),
+            (20u64, "shared.ns.stable.b".to_string(), v.clone()),
+            (
+                30u64,
+                "shared.ns.stable.c".to_string(),
+                serde_json::json!({"k": "other"}),
+            ),
+        ];
+        store
+            .replace_partition("shared.ns.stable.", &facts)
+            .unwrap();
+        let view = store.content_dedup_view("shared.ns.stable.").unwrap();
+        assert_eq!(view.len(), 2, "同内容两条应去重为一条");
+        assert_eq!(view[0].fact_id, 20, "同内容组保留最新账本位置");
+        assert_eq!(view[1].fact_id, 30, "不同内容独立保留");
+        // 哈希确定性:同内容重放同 hash(BLAKE3 可复算直证)
+        let h1 = blake3::hash(serde_json::to_string(&v).unwrap().as_bytes()).to_string();
+        // 哈希确定性:重放后同内容组仍可去重(hash 稳定直证)
+        let replay = vec![
+            (10u64, "shared.ns.stable.a".to_string(), v.clone()),
+            (20u64, "shared.ns.stable.b".to_string(), v.clone()),
+            (
+                30u64,
+                "shared.ns.stable.c".to_string(),
+                serde_json::json!({"k": "other"}),
+            ),
+        ];
+        store
+            .replace_partition("shared.ns.stable.", &replay)
+            .unwrap();
+        let again = store.content_dedup_view("shared.ns.stable.").unwrap();
+        assert_eq!(again.len(), 2);
+        assert_eq!(again[0].fact_id, 20);
+        assert_eq!(again[1].fact_id, 30);
+        assert_eq!(h1.len(), 64, "BLAKE3 hex 长度");
     }
 
     #[test]

@@ -2817,10 +2817,15 @@ impl MemoryManager {
         goal: &str,
         notices: &mut Vec<String>,
     ) -> Option<Vec<crate::api::evorule_client::SharedFactEntry>> {
-        const RECALL_TTL_SECS: u64 = 60;
+        // TTL 迁 Recipe（存储设计档 §九.4）：配方声明优先，机制缺省 60s
+        let ttl = self
+            .recipe
+            .as_ref()
+            .and_then(|r| r.lex_ttl_secs)
+            .unwrap_or(60);
         let _ = goal;
         if let Some(store) = &self.lex_store {
-            if let Some(cached) = store.cached_facts(prefix, RECALL_TTL_SECS) {
+            if let Some(cached) = store.cached_facts(prefix, ttl) {
                 return Some(
                     cached
                         .into_iter()
@@ -3309,6 +3314,67 @@ impl std::fmt::Debug for MemoryManager {
 mod tests {
     use super::*;
     use crate::agent::safety_auditor::AuditAction;
+
+    // ===== I13 黄金样本回归（存储设计档 §七特别纪律 v0.2.1：检索确定性）=====
+
+    fn gold_rec(key: &str, value: &str, conf: Option<f32>) -> MemoryRecord {
+        let mut r = MemoryRecord::new(key, value, 1_700_000_000);
+        r.confidence = conf;
+        r
+    }
+
+    #[test]
+    fn i13_golden_sample_sort_is_reproducible() {
+        // 黄金样本：固定事实集 × 固定检索词 → 全序逐字节可复算。
+        // 覆盖裁决链全部分支（legacy 词法策略 w_relevance=1 其余 0，
+        // score=rel_norm 批内归一）：相关性 desc ▸（同分）timestamp desc ▸
+        // （同分）confidence desc（None=0.5）▸（同分）key 字典序 asc。
+        // 时钟无关：同层条目共用同 timestamp 且 w_recency=0，断言不随
+        // now_secs() 漂移；key 用下划线整体 token，不与 goal 词元相交。
+        let mut stable = vec![
+            gold_rec("g_gamma", "deploy pipeline", Some(0.1)),
+            gold_rec("g_eta_b", "unrelated stuff", None),
+            gold_rec("g_alpha", "deploy pipeline rollout rollback", Some(0.1)),
+            gold_rec("g_zeta2", "quota", None),
+            gold_rec("g_beta", "deploy pipeline rollout", Some(0.1)),
+            gold_rec("g_delta", "quota", Some(0.6)),
+            gold_rec("g_eta_a", "unrelated stuff", None),
+            gold_rec("g_zeta", "quota", Some(0.8)),
+        ];
+        let goal = "deploy pipeline rollout rollback quota limit unused term";
+        sort_stable_by_value(&mut stable, goal);
+        let keys: Vec<&str> = stable.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "g_alpha", // rel 4/4 → score 1.0
+                "g_beta",  // rel 3
+                "g_gamma", // rel 2
+                "g_zeta",  // rel 1 层：conf 0.8 > 0.6 > None
+                "g_delta", "g_zeta2", // None 视为 0.5 中位
+                "g_eta_a", // rel 0 层：同刻同 conf → key 字典序
+                "g_eta_b",
+            ],
+            "I13 黄金样本全序偏离——三因子排序或裁决链发生行为变更"
+        );
+        // 双跑直证：同输入第二遍重排，输出逐条目逐字段一致
+        let mut rerun = vec![
+            gold_rec("g_gamma", "deploy pipeline", Some(0.1)),
+            gold_rec("g_eta_b", "unrelated stuff", None),
+            gold_rec("g_alpha", "deploy pipeline rollout rollback", Some(0.1)),
+            gold_rec("g_zeta2", "quota", None),
+            gold_rec("g_beta", "deploy pipeline rollout", Some(0.1)),
+            gold_rec("g_delta", "quota", Some(0.6)),
+            gold_rec("g_eta_a", "unrelated stuff", None),
+            gold_rec("g_zeta", "quota", Some(0.8)),
+        ];
+        sort_stable_by_value(&mut rerun, goal);
+        for (a, b) in stable.iter().zip(rerun.iter()) {
+            assert_eq!(a.key, b.key);
+            assert_eq!(a.confidence, b.confidence);
+            assert_eq!(a.timestamp, b.timestamp);
+        }
+    }
 
     fn make_test_client() -> EvoruleApiClient {
         EvoruleApiClient::new("http://localhost:8080")

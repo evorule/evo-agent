@@ -70,3 +70,9 @@ sleep_worker/
 
 # CodeGraph 工具本地数据(自忽略声明文件属于工具,不入库)
 .codegraph/
+
+# LexStore 本地检索缓存库(索引皆视图,可由账本重放重建,本机私有不入库;
+# 路径为 agent 配置声明制——建议按 *.lex.db 命名,本忽略节按该形态覆盖)
+*.lex.db
+*.lex.db-shm
+*.lex.db-wal
