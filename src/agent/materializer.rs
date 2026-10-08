@@ -151,6 +151,8 @@ struct IrNode {
     task_template: Option<String>,
     compute: Option<ComputeSpec>,
     run_when: Option<RunWhen>,
+    /// 粒间契约 JSON Schema（可选，契约 v0；DSL/PlanFact 两形态同构透传）
+    output_schema: Option<serde_json::Value>,
     /// 内联 depends_on（仅 DSL 形态；PlanFact 形态恒空，依赖由顶层 edges 表达）。
     /// 归一化后被收入 Ir.dep_edges，展开 pass 不再读本字段。
     deps: Vec<String>,
@@ -230,6 +232,10 @@ fn parse_dsl_node(v: &serde_json::Value) -> Result<IrNode, String> {
             .map(String::from),
         compute,
         run_when: parse_run_when_opt(v, id)?,
+        output_schema: match v.get("output_schema") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(s) => Some(s.clone()),
+        },
         deps: depends_on_of(v, id)?,
     })
 }
@@ -587,6 +593,16 @@ fn expand(ir: Ir) -> Result<Workflow, Vec<String>> {
         );
     }
 
+    // ---- 粒间契约门卫（契约 v0）：契约态下 schema 合法性与引用完备性在
+    //      展开终态上把关（DSL 与 PlanFact 两形态共用此收敛点；占位符引用
+    //      此时已是展开全名，与展开后节点 id 精确匹配）----
+    crate::agent::workflow::validate_granule_contracts(&Workflow {
+        workflow_id: ir.workflow_id.clone(),
+        description: ir.description.clone(),
+        nodes: nodes.clone(),
+        output_node: output_node.clone(),
+    })?;
+
     Ok(Workflow {
         workflow_id: ir.workflow_id,
         description: ir.description,
@@ -775,6 +791,7 @@ fn rewrite_node(
         depends_on: deps,
         run_when,
         compute,
+        output_schema: src.output_schema.clone(),
     })
 }
 
@@ -1772,5 +1789,58 @@ mod tests {
             avg < std::time::Duration::from_secs(10),
             "物化 512 节点平均耗时 {avg:?} 异常（疑似复杂度回归）"
         );
+    }
+
+    // ----- 粒间契约门卫（契约 v0：expand 尾部收敛点）-----
+
+    #[test]
+    fn dsl_output_schema_flows_through_materialization() {
+        let doc = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [
+                { "id": "a", "agent_type": "w", "task": "t",
+                  "output_schema": {"type": "object"} },
+                { "id": "b", "agent_type": "w", "task_template": "v: {a}",
+                  "depends_on": ["a"], "output_schema": {"type": "object"} }
+            ],
+            "output_node": "b"
+        });
+        let wf = materialize_workflow_dag(&doc).expect("全齐契约态应放行");
+        assert!(
+            wf.nodes[0].output_schema.is_some(),
+            "output_schema 须随物化透传"
+        );
+        assert!(wf.nodes[1].output_schema.is_some());
+    }
+
+    #[test]
+    fn dsl_contract_mode_rejects_missing_upstream_schema() {
+        let doc = serde_json::json!({
+            "workflow_id": "w",
+            "nodes": [
+                { "id": "a", "agent_type": "w", "task": "t" },
+                { "id": "b", "agent_type": "w", "task_template": "v: {a}",
+                  "depends_on": ["a"], "output_schema": {"type": "object"} }
+            ],
+            "output_node": "b"
+        });
+        let errs = materialize_workflow_dag(&doc).expect_err("契约态缺上游契约须拒载");
+        assert!(errs[0].contains("契约态拒载"), "{errs:?}");
+    }
+
+    #[test]
+    fn plan_fact_contract_gate_applies() {
+        // PlanFact 形态同过 expand 尾部门卫（引用完备性在展开终态把关）
+        let missing = serde_json::json!({
+            "nodes": [
+                { "id": "a", "type": "llm", "agent_type": "w", "task": "t" },
+                { "id": "b", "type": "llm", "agent_type": "w",
+                  "task_template": "v: {a}", "output_schema": {"type": "object"} }
+            ],
+            "edges": [["a", "b"]]
+        });
+        let errs =
+            materialize_plan_fact(&missing, "wf").expect_err("PlanFact 契约态缺上游契约须拒");
+        assert!(errs[0].contains("契约态拒载"), "{errs:?}");
     }
 }

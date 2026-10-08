@@ -802,6 +802,7 @@ mod tests {
                 depends_on: Vec::new(),
                 run_when: None,
                 compute: None,
+                output_schema: None,
             }],
             output_node: "a".to_string(),
         };
@@ -956,6 +957,7 @@ mod tests {
             depends_on: Vec::new(),
             run_when: None,
             compute: None,
+            output_schema: None,
         }
     }
 

@@ -91,6 +91,28 @@ pub enum ReplanReason {
     Budget,
 }
 
+/// 节点失败分类（契约 v0）：接口失败区别于粒失败
+///
+/// 路由消费面（按类别决定 replan/终止/反馈策略）在后续批次接入；本批次只
+/// 落分类判定与记录承载（`WorkflowFailureRecord.failure_class` 随摘要 JSON 形态）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeFailureClass {
+    /// 粒失败：agent/compute 执行本身失败
+    Granule,
+    /// 接口失败：产出违反粒间契约（非 JSON / schema 校验不过，契约 v0）
+    Interface,
+}
+
+/// 按失败文本分类（纯函数）：携带接口契约标记 → Interface，否则 Granule
+pub fn classify_node_failure(error_message: &str) -> NodeFailureClass {
+    if error_message.contains(crate::agent::workflow::INTERFACE_CONTRACT_MARKER) {
+        NodeFailureClass::Interface
+    } else {
+        NodeFailureClass::Granule
+    }
+}
+
 /// 工作流失败事件记录（外层驱动内存结构 + 摘要 JSON 形态；交付物 6 §3.1）
 ///
 /// 本结构是**索引与摘要载体，不是新 Fact 类型**（§3.1 链上事实澄清）：失败节点
@@ -110,6 +132,8 @@ pub struct WorkflowFailureRecord {
     pub failed_node_id: Option<String>,
     /// 失败节点 agent 类型（外层按 failed_node_id 反查；反查不到为 None）
     pub agent_type: Option<String>,
+    /// 失败分类（契约 v0：接口失败区别于粒失败；路由消费面在后续批次）
+    pub failure_class: NodeFailureClass,
     /// G9 execute Err 全文
     pub error_message: String,
 }
@@ -146,6 +170,7 @@ pub fn should_replan(
                 failed_plan_hash: None,
                 failed_node_id: parse_failed_node_id(err_text),
                 agent_type: None, // 由外层驱动按 failed_node_id 反查后回填
+                failure_class: classify_node_failure(err_text),
                 error_message: err_text.clone(),
             }),
             budget_snapshot: None,
@@ -348,6 +373,7 @@ mod tests {
             depends_on: Vec::new(),
             run_when: None,
             compute: None,
+            output_schema: None,
         }];
         assert_eq!(
             lookup_agent_type(&nodes, "lp_iter0_s"),
@@ -375,6 +401,7 @@ mod tests {
             failed_plan_hash: Some("a".repeat(64)),
             failed_node_id: Some("research_iter1_search".to_string()),
             agent_type: Some("researcher".to_string()),
+            failure_class: NodeFailureClass::Granule,
             error_message: "workflow node 'research_iter1_search' failed: boom".to_string(),
         };
         let json = serde_json::to_value(&record).unwrap();
@@ -385,9 +412,46 @@ mod tests {
             "failed_plan_hash",
             "failed_node_id",
             "agent_type",
+            "failure_class",
             "error_message",
         ] {
             assert!(json.get(key).is_some(), "missing key {key}: {json}");
         }
+        assert_eq!(json["failure_class"], "granule");
+    }
+
+    // ----- 失败分类（契约 v0：接口失败区别于粒失败）-----
+
+    #[test]
+    fn classify_node_failure_by_marker() {
+        let interface_text =
+            crate::agent::workflow::interface_contract_error("a", "output is not valid JSON: boom");
+        assert_eq!(
+            classify_node_failure(&interface_text),
+            NodeFailureClass::Interface
+        );
+        assert_eq!(
+            classify_node_failure("workflow node 'a' failed: boom"),
+            NodeFailureClass::Granule
+        );
+    }
+
+    #[test]
+    fn should_replan_records_interface_class() {
+        let outcome: Result<String, String> =
+            Err(crate::agent::workflow::interface_contract_error(
+                "s",
+                "0: \"x\" is not of type \"object\"",
+            ));
+        let d = should_replan(&outcome, &counters(0, 0), &thresholds(), &state(0))
+            .expect("failure must trigger");
+        let record = d.failure_record.expect("record present");
+        assert_eq!(record.failure_class, NodeFailureClass::Interface);
+        assert_eq!(record.failed_node_id.as_deref(), Some("s"));
+        let json = serde_json::to_string_pretty(&record).unwrap();
+        assert!(
+            json.contains("\"failure_class\": \"interface\""),
+            "摘要 JSON 须携带 interface 分类: {json}"
+        );
     }
 }
