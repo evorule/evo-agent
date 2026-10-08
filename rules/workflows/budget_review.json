@@ -49,7 +49,7 @@
     },
     {
       "id": "report",
-      "agent_type": "writer",
+      "agent_type": "researcher",
       "task_template": "基于以下确定性核算结果写一段不超过 150 字的预算结论:\n- 总成本(元): {total_cost}\n- 项目工期(天): {duration_days}\n- 日均消耗(元/天): {daily_burn}\n- 上限内成本(元,上限 1000000): {capped_cost}\n要求:先给结论(总成本是否在 1000000 元上限内),再逐项引用上述数字。不要重新计算,只引用给定数字。",
       "depends_on": ["total_cost", "duration_days", "daily_burn", "capped_cost"]
     }

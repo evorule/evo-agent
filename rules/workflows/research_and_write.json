@@ -17,7 +17,7 @@
     },
     {
       "id": "write_report",
-      "agent_type": "writer",
+      "agent_type": "researcher",
       "task_template": "基于以下两份调研结果,写一份 Rust 与 Python 异步生态的对比报告:\n\n=== Rust 调研 ===\n{research_rust}\n\n=== Python 调研 ===\n{research_python}\n\n要求:结构化对比(运行时模型/语法/性能/生态),给出选型建议。",
       "depends_on": ["research_rust", "research_python"]
     }
