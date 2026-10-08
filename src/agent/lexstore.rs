@@ -604,18 +604,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("rebuild.db");
         let facts: Vec<(u64, String, serde_json::Value)> = vec![
-            (1, "shared.ns.stable.a".into(), serde_json::json!("kafka 分区重平衡策略")),
-            (2, "shared.ns.stable.b".into(), serde_json::json!("部署脚本权限修正")),
-            (3, "shared.ns.events.e1".into(), serde_json::json!("kafka 消费组迁移事件")),
+            (
+                1,
+                "shared.ns.stable.a".into(),
+                serde_json::json!("kafka 分区重平衡策略"),
+            ),
+            (
+                2,
+                "shared.ns.stable.b".into(),
+                serde_json::json!("部署脚本权限修正"),
+            ),
+            (
+                3,
+                "shared.ns.events.e1".into(),
+                serde_json::json!("kafka 消费组迁移事件"),
+            ),
         ];
         let query = "kafka";
         let run = || -> Vec<String> {
             let store = LexStore::open(&db).unwrap();
-            store.replace_partition("shared.ns.stable.", &facts[0..2]).unwrap();
-            store.replace_partition("shared.ns.events.", &facts[2..]).unwrap();
+            store
+                .replace_partition("shared.ns.stable.", &facts[0..2])
+                .unwrap();
+            store
+                .replace_partition("shared.ns.events.", &facts[2..])
+                .unwrap();
             let mut out = store
                 .lookup_candidates_typed(
-                    &["shared.ns.stable.".to_string(), "shared.ns.events.".to_string()],
+                    &[
+                        "shared.ns.stable.".to_string(),
+                        "shared.ns.events.".to_string(),
+                    ],
                     query,
                     10,
                     &[],

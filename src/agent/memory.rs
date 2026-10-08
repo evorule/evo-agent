@@ -595,7 +595,10 @@ pub(crate) fn select_notes_for_goal(
         .iter()
         .map(|rec| {
             let note_tokens = tokenize_for_match(&rec.value);
-            let overlap = note_tokens.iter().filter(|t| goal_tokens.contains(t)).count();
+            let overlap = note_tokens
+                .iter()
+                .filter(|t| goal_tokens.contains(t))
+                .count();
             let weight_bonus = rec.key.contains("todo") || rec.key.contains("failure");
             (overlap, weight_bonus, rec)
         })
@@ -607,7 +610,11 @@ pub(crate) fn select_notes_for_goal(
             .then(b.2.timestamp.cmp(&a.2.timestamp))
             .then(a.2.key.cmp(&b.2.key))
     });
-    scored.into_iter().take(limit).map(|(_, _, r)| r.clone()).collect()
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, r)| r.clone())
+        .collect()
 }
 
 /// R-2 事件回喂的纯格式化面（可单测）：failure 正体按 token 重叠匹配取
@@ -636,7 +643,10 @@ pub(crate) fn format_failure_feed(
             continue;
         }
         let note_tokens = tokenize_for_match(&rec.value);
-        let overlap = note_tokens.iter().filter(|t| ctx_tokens.contains(t)).count();
+        let overlap = note_tokens
+            .iter()
+            .filter(|t| ctx_tokens.contains(t))
+            .count();
         matched.push((overlap, rec));
     }
     matched.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.timestamp.cmp(&a.1.timestamp)));
@@ -686,7 +696,10 @@ pub(crate) fn format_write_advisory(
     let mut matched: Vec<(usize, &MemoryRecord)> = Vec::new();
     for rec in catalog {
         let text_tokens = tokenize_for_match(&rec.value);
-        let overlap = text_tokens.iter().filter(|t| path_tokens.contains(t)).count();
+        let overlap = text_tokens
+            .iter()
+            .filter(|t| path_tokens.contains(t))
+            .count();
         if overlap > 0 {
             matched.push((overlap, rec));
         }
@@ -2152,7 +2165,10 @@ impl MemoryManager {
     /// 且事件族空 → Err（调用方 fail-soft 跳过）。
     pub async fn fetch_advisory_catalog(&self) -> Result<Vec<MemoryRecord>, String> {
         let notes = self.fetch_notes_catalog().await;
-        let events = self.fetch_family_catalog("events").await.unwrap_or_default();
+        let events = self
+            .fetch_family_catalog("events")
+            .await
+            .unwrap_or_default();
         match notes {
             Ok(mut n) => {
                 n.extend(events);
@@ -2186,7 +2202,11 @@ impl MemoryManager {
             // 记录 payload=MemoryRecord JSON（note_write/沉淀草稿同形）;
             // 解析失败=保留为原始条目(键取 path 尾段,值取原文)——催写与
             // 相关性匹配不丢数据
-            let raw = f.value.as_str().map(str::to_string).unwrap_or_else(|| f.value.to_string());
+            let raw = f
+                .value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| f.value.to_string());
             let record = match serde_json::from_str::<MemoryRecord>(&raw) {
                 Ok(mut r) => {
                     if r.key.is_empty() {
@@ -2194,11 +2214,7 @@ impl MemoryManager {
                     }
                     r
                 }
-                Err(_) => MemoryRecord::new(
-                    f.path.rsplit('.').next().unwrap_or(&f.path),
-                    &raw,
-                    0,
-                ),
+                Err(_) => MemoryRecord::new(f.path.rsplit('.').next().unwrap_or(&f.path), &raw, 0),
             };
             out.push(record);
         }
@@ -2260,13 +2276,9 @@ impl MemoryManager {
 
     /// Recipe 热重载（LM-2 可热重载属性;运行体重解析+指纹审计留痕——
     /// 新指纹随下一轮 effective_params 落链,回放可锚定实际生效版本）
-    pub fn reload_recipe(
-        &mut self,
-        recipe_json: &str,
-    ) -> Result<(String, String), String> {
-        let recipe: crate::agent::recipe::MemoryRecipe =
-            serde_json::from_str(recipe_json)
-                .map_err(|e| format!("recipe reload: parse failed ({e})"))?;
+    pub fn reload_recipe(&mut self, recipe_json: &str) -> Result<(String, String), String> {
+        let recipe: crate::agent::recipe::MemoryRecipe = serde_json::from_str(recipe_json)
+            .map_err(|e| format!("recipe reload: parse failed ({e})"))?;
         let version = recipe.recipe_version.clone();
         let rollup = recipe.lifecycle.rollup_threshold;
         // 指纹走重序列化规范形态(与 recipe_fingerprint 同口径:同内容同指纹,
@@ -2581,8 +2593,7 @@ impl MemoryManager {
                 .unwrap_or(false)
             {
                 let delta = 0.05 * authority_weight(rec);
-                rec.confidence =
-                    rec.confidence.map(|c| (c + delta).clamp(0.0, 1.0));
+                rec.confidence = rec.confidence.map(|c| (c + delta).clamp(0.0, 1.0));
             }
             match serde_json::to_value(&*rec) {
                 Ok(v) => batch.push((path.clone(), v)),
@@ -5825,7 +5836,11 @@ mod tests {
         let mk = |k: &str, v: &str, ts: u64| MemoryRecord::new(k, v, ts);
         let catalog = vec![
             mk("summary.001", "讨论部署部署部署", 5),
-            mk("notes.failure.failure.20261007-001", "部署脚本权限问题,根因:缺执行位", 3),
+            mk(
+                "notes.failure.failure.20261007-001",
+                "部署脚本权限问题,根因:缺执行位",
+                3,
+            ),
             mk("notes.summary.summary.20261007-002", "部署完成回顾", 9),
             mk("notes.todo.todo.20261007-003", "待跟进部署验证", 8),
         ];
@@ -5860,7 +5875,8 @@ mod tests {
         // 相关性匹配:上下文含 git_push → 该条排前
         let feed = format_failure_feed(&catalog, "git_push 推送再次失败", 3);
         assert!(
-            feed.iter().any(|l| l.contains("[催写]") && l.contains("draft.sess-9")),
+            feed.iter()
+                .any(|l| l.contains("[催写]") && l.contains("draft.sess-9")),
             "草稿转催写行: {feed:?}"
         );
         let hit = feed
@@ -5884,11 +5900,20 @@ mod tests {
             "待跟进验证",
             7,
         )];
-        let prompt = mgr.build_system_prompt_with_recall("BASE", &recall, &ContextBudget::new(100_000, 0.25));
-        assert!(prompt.contains("
+        let prompt = mgr.build_system_prompt_with_recall(
+            "BASE",
+            &recall,
+            &ContextBudget::new(100_000, 0.25),
+        );
+        assert!(
+            prompt.contains(
+                "
 
 ## Notes
-"), "mechanism section present: {prompt}");
+"
+            ),
+            "mechanism section present: {prompt}"
+        );
         let feed_pos = prompt.find("[强制回喂]").expect("feed rendered");
         let todo_pos = prompt.find("待跟进验证").expect("note entry rendered");
         assert!(feed_pos < todo_pos, "事件回喂行先于常驻条目");
@@ -5906,7 +5931,10 @@ mod tests {
         }
         // 非写族/缺 path/空白 path → None
         assert_eq!(extract_write_path("file_read", &args), None);
-        assert_eq!(extract_write_path("file_write", &serde_json::json!({})), None);
+        assert_eq!(
+            extract_write_path("file_write", &serde_json::json!({})),
+            None
+        );
         assert_eq!(
             extract_write_path("file_write", &serde_json::json!({"path": "   "})),
             None
@@ -5917,8 +5945,16 @@ mod tests {
     fn write_advisory_matches_and_stays_silent_without_history() {
         let mk = |k: &str, v: &str, ts: u64| MemoryRecord::new(k, v, ts);
         let catalog = vec![
-            mk("notes.failure.failure.20261007-001", "main.rs 权限问题,根因:缺执行位", 3),
-            mk("notes.summary.summary.20261006-002", "无关教训:数据库锁竞争", 2),
+            mk(
+                "notes.failure.failure.20261007-001",
+                "main.rs 权限问题,根因:缺执行位",
+                3,
+            ),
+            mk(
+                "notes.summary.summary.20261006-002",
+                "无关教训:数据库锁竞争",
+                2,
+            ),
             mk("events.e9", "修改 main.rs 的部署脚本时踩过换行符坑", 4),
         ];
         let lines = format_write_advisory("src/main.rs", &catalog, 3);
@@ -5938,7 +5974,9 @@ mod tests {
         let mgr = MemoryManager::new("sec", make_test_client());
         let ctx = mgr.recall_context("goal", 3, 5).await;
         assert!(
-            ctx.degradation_notices.iter().any(|n| n.contains("notes recall degraded")),
+            ctx.degradation_notices
+                .iter()
+                .any(|n| n.contains("notes recall degraded")),
             "notes 降级通知在账: {:?}",
             ctx.degradation_notices
         );
@@ -6003,7 +6041,10 @@ mod tests {
         assert_eq!(authority_weight(&mk("stable.user.p", None)), 1.0);
         assert_eq!(authority_weight(&mk("stable.system.s", None)), 0.8);
         assert_eq!(authority_weight(&mk("stable.llm.x", None)), 0.5);
-        assert_eq!(authority_weight(&mk("notes.failure.f", Some("llm-note"))), 0.5);
+        assert_eq!(
+            authority_weight(&mk("notes.failure.f", Some("llm-note"))),
+            0.5
+        );
         assert_eq!(authority_weight(&mk("misc", None)), 0.65);
     }
 
@@ -6016,7 +6057,12 @@ mod tests {
         lo_auth.fact_id = Some(2);
         // 无 authority 权重:时间倒序,lo_auth(b, ts=11)在前
         let mut batch1 = vec![hi_auth.clone(), lo_auth.clone()];
-        sort_by_policy(&mut batch1, "部署", &crate::agent::recipe::RetrievalPolicy::default_lexical(), None);
+        sort_by_policy(
+            &mut batch1,
+            "部署",
+            &crate::agent::recipe::RetrievalPolicy::default_lexical(),
+            None,
+        );
         assert_eq!(batch1[0].key, "stable.llm.b");
         // authority 权重开(需同时开 importance 主开关,因子在其内):user=1.0 翻前
         let mut rp = crate::agent::recipe::RetrievalPolicy::default_lexical();
@@ -6059,7 +6105,10 @@ mod tests {
         mgr.apply_lifecycle_transitions("s1", &recipe).await;
         let decayed = mgr.cache.get("events.e9").unwrap();
         assert_eq!(decayed.lifecycle_state.as_deref(), Some("Decayed"));
-        assert!((decayed.confidence.unwrap() - 0.4).abs() < 1e-6, "半衰 0.8→0.4");
+        assert!(
+            (decayed.confidence.unwrap() - 0.4).abs() < 1e-6,
+            "半衰 0.8→0.4"
+        );
         // 置信度佐证演化:开关开时 reinforce +0.05×w_e(llm 源=0.5 → +0.025)
         let mut recipe2 = crate::agent::recipe::MemoryRecipe::default();
         recipe2.lifecycle.confidence_evolution = true;
@@ -6067,17 +6116,22 @@ mod tests {
         mgr2.set_recipe(recipe2);
         let dir = tempfile::tempdir().unwrap();
         let store = crate::agent::lexstore::LexStore::open(&dir.path().join("lex.db")).unwrap();
-        store.replace_partition(
-            "shared.ns.events.",
-            &[(1, "shared.ns.events.e1".to_string(), serde_json::json!({}))],
-        ).unwrap();
+        store
+            .replace_partition(
+                "shared.ns.events.",
+                &[(1, "shared.ns.events.e1".to_string(), serde_json::json!({}))],
+            )
+            .unwrap();
         mgr2.set_lex_store(std::sync::Arc::new(store));
         let mut rec = MemoryRecord::new("events.e1", "v", 1);
         rec.fact_id = Some(1);
         rec.confidence = Some(0.5);
         rec.source = Some("llm".to_string());
         mgr2.cache.insert("shared::events.e1".to_string(), rec);
-        mgr2.usage_pending.lock().unwrap_or_else(|p| p.into_inner()).insert(1, 3);
+        mgr2.usage_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(1, 3);
         mgr2.flush_usage("s1").await;
         let after = mgr2.cache.get("shared::events.e1").unwrap();
         assert!(
@@ -6104,10 +6158,7 @@ mod tests {
         let asset = mgr.recipe_asset_payload().unwrap();
         assert_eq!(asset["title"], "memory-recipe-memory-test-1");
         assert!(
-            asset["provenance"]
-                .as_str()
-                .unwrap()
-                .contains(&h1),
+            asset["provenance"].as_str().unwrap().contains(&h1),
             "provenance 携带指纹"
         );
         // 热重载:新版本+新指纹;门控随动
@@ -6137,10 +6188,19 @@ mod tests {
             stable: vec![anchored],
             ..Default::default()
         };
-        let prompt =
-            mgr.build_system_prompt_with_recall("BASE", &recall, &ContextBudget::new(100_000, 0.25));
-        assert!(prompt.matches("[unanchored]").count() == 2, "两未锚定条目均标注: {prompt}");
-        assert!(!prompt.contains("[unanchored] stable.llm.ok"), "锚定条目不标注");
+        let prompt = mgr.build_system_prompt_with_recall(
+            "BASE",
+            &recall,
+            &ContextBudget::new(100_000, 0.25),
+        );
+        assert!(
+            prompt.matches("[unanchored]").count() == 2,
+            "两未锚定条目均标注: {prompt}"
+        );
+        assert!(
+            !prompt.contains("[unanchored] stable.llm.ok"),
+            "锚定条目不标注"
+        );
     }
 
     #[test]
