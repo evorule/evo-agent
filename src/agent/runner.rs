@@ -145,7 +145,8 @@ pub struct AgentConfig {
     /// L2 约束前馈/进化信号感知/规范入口索引 合并段,v2 序=权威紧跟 S1)
     pub governance_segment: Option<String>,
     /// I2 词表声明(数据化;None=机制内建 v2 双语表——context_inspector)
-    pub i2_lexicon: Option<crate::agent::context_inspector::I2Lexicon>,}
+    pub i2_lexicon: Option<crate::agent::context_inspector::I2Lexicon>,
+}
 
 impl Default for AgentConfig {
     fn default() -> Self {
