@@ -603,10 +603,10 @@ fn delegate_manifest() -> ToolManifest {
     m
 }
 
-/// 自省记忆工具 manifest（4 条，与 memory_tool_specs 名称集合相等——测试锁）
+/// 自省记忆工具 manifest（6 条，与 memory_tool_specs 名称集合相等——测试锁）
 fn memory_manifests() -> Vec<ToolManifest> {
     use crate::agent::memory_tool::{
-        MEMORY_GET_TOOL, MEMORY_PROPOSE_TOOL, MEMORY_SEARCH_TOOL, NOTE_WRITE_TOOL,
+        MEMORY_GET_TOOL, MEMORY_LINK_TOOL, MEMORY_PROPOSE_TOOL, MEMORY_SEARCH_TOOL, NOTE_WRITE_TOOL,
     };
     vec![
         base(
@@ -629,6 +629,18 @@ fn memory_manifests() -> Vec<ToolManifest> {
         ),
         base(
             NOTE_WRITE_TOOL,
+            ToolSource::Memory,
+            SpecSource::Memory,
+            vec![CapDomain::Memory],
+        ),
+        base(
+            MEMORY_LINK_TOOL,
+            ToolSource::Memory,
+            SpecSource::Memory,
+            vec![CapDomain::Memory],
+        ),
+        base(
+            crate::agent::memory_tool::MEMORY_FORGET_TOOL,
             ToolSource::Memory,
             SpecSource::Memory,
             vec![CapDomain::Memory],
@@ -754,13 +766,15 @@ mod tests {
 
     #[test]
     fn test_static_manifest_count_locked() {
-        // 内置 23 + 规则 49 + delegate 1 + memory 4 = 77
+        // 内置 23 + 规则 49 + delegate 1 + memory 6 = 79
         // （PR-11a 查账工具族 +4：16→20；PR-11b why/order 三工具 +3：
         //   规则 46→49；自主交接双工具 +2：内置 20→22，数量锁 74→76；
-        //   自主交接 PR-H3 session_spawn +1：内置 22→23，数量锁 76→77）
+        //   自主交接 PR-H3 session_spawn +1：内置 22→23，数量锁 76→77；
+        //   账本记忆收口（ai/queue14 合并）：memory_link +1、memory_forget +1
+        //   → memory 4→6，数量锁 77→79）
         assert_eq!(builtin_manifests().len(), 23);
         assert_eq!(rule_manifests().len(), 49);
-        assert_eq!(all().len(), 77);
+        assert_eq!(all().len(), 79);
     }
 
     #[test]
