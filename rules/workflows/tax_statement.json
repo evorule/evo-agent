@@ -1,0 +1,36 @@
+{
+  "workflow_id": "tax_statement",
+  "description": "缴税通知单场景(与 UDF 宏/template_render 协同的选型示例):工作流内由 compute 承担简单封闭计算(应税所得核定=采集值相减并钳制非负);税档级联(UDF 宏 udf_finance_tax_bracket)与文档生成(template_render)经 call_service 由 agent 会话消费——三者在同一业务场景各就其位。LLM 节点只采集参数不做算术,数值形态不符即 fail-fast 终止",
+  "license": "AGPL-3.0-or-later",
+  "nodes": [
+    {
+      "id": "gross_income",
+      "agent_type": "researcher",
+      "task": "某员工年度税前总收入为 680000 元。只输出一个整数:该金额换算为分(1 元 = 100 分)的数值。不要单位、不要千分位、不要任何其他文字。",
+      "depends_on": []
+    },
+    {
+      "id": "deduction",
+      "agent_type": "researcher",
+      "task": "该员工年度各项扣除合计 60000 元。只输出一个整数:该金额换算为分(1 元 = 100 分)的数值。不要单位、不要千分位、不要任何其他文字。",
+      "depends_on": []
+    },
+    {
+      "id": "taxable",
+      "compute": { "function": "sub", "inputs": ["gross_income", "deduction"] },
+      "depends_on": ["gross_income", "deduction"]
+    },
+    {
+      "id": "taxable_clamped",
+      "compute": { "function": "clamp", "inputs": ["taxable"], "min_val": 0, "max_val": 9223372036854775807 },
+      "depends_on": ["taxable"]
+    },
+    {
+      "id": "report",
+      "agent_type": "researcher",
+      "task_template": "基于以下确定性核算结果写一段不超过 120 字的缴税通知单导语:\n- 年度税前总收入(分): {gross_income}\n- 年度扣除合计(分): {deduction}\n- 年度应税所得(分): {taxable}\n- 应税所得(非负钳制后,分): {taxable_clamped}\n要求:先给结论(应税所得核定值),再逐项引用上述数字。不要重新计算,只引用给定数字;税额计算由税档级联服务另行完成,本导语不涉及税额。",
+      "depends_on": ["gross_income", "deduction", "taxable", "taxable_clamped"]
+    }
+  ],
+  "output_node": "report"
+}
