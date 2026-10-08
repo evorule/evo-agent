@@ -101,6 +101,16 @@ pub enum JournalEvent {
         /// 输出全文 digest(evorule-hash 口径)
         content_digest: String,
     },
+    /// 工具执行重试落账(幂等类工具遇瞬态故障自动重试;每次重试独立一条,
+    /// 首次执行不落此事件——观测面,不参与步映射)
+    ToolRetried {
+        /// 工具名
+        tool: String,
+        /// 重试次序(从 1 计:第 attempt 次重试)
+        attempt: u64,
+        /// 失败是否判定为瞬态(连接/超时类错误形态)
+        transient: bool,
+    },
     /// 审批请求开启(60s 窗口 / policy 判定前)
     ApprovalRequested {
         /// 审批提案 id(proposal_id)
@@ -434,6 +444,11 @@ impl JournalWriter {
         let path = Self::path_for(dir, session_id);
         let mut last_seq = 0u64;
         let mut turn_count = 0u64;
+        // 尾部悬挂检测:turn_started 无配对 turn_ended = 上一进程死前轮未收尾。
+        // 崩溃标记只在打开时补写(进程死亡瞬间什么也写不了,运行时不产生此
+        // 事件);末事件已是崩溃标记则不重复补写(重复打开幂等)。
+        let mut tail_hung = false;
+        let mut last_was_crash = false;
         if path.exists() {
             let mut expected = 1u64;
             for line in BufReader::new(File::open(&path)?).lines() {
@@ -452,7 +467,11 @@ impl JournalWriter {
                 last_seq = parsed.seq;
                 if matches!(parsed.event, JournalEvent::TurnStarted { .. }) {
                     turn_count += 1;
+                    tail_hung = true;
+                } else if matches!(parsed.event, JournalEvent::TurnEnded { .. }) {
+                    tail_hung = false;
                 }
+                last_was_crash = matches!(parsed.event, JournalEvent::SessionCrashed { .. });
             }
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -468,7 +487,7 @@ impl JournalWriter {
                 return Err(JournalError::WriterActive(registry_key));
             }
         }
-        Ok(JournalWriter {
+        let writer = JournalWriter {
             core: Arc::new(Mutex::new(JournalInner {
                 file,
                 last_seq,
@@ -478,7 +497,13 @@ impl JournalWriter {
             })),
             registry_key,
             file_path: path,
-        })
+        };
+        if tail_hung && !last_was_crash {
+            writer.push(JournalEvent::SessionCrashed {
+                reason: "unclean_tail".to_string(),
+            })?;
+        }
+        Ok(writer)
     }
 
     /// 本写者对应的会话 ID(open 时登记)
@@ -584,6 +609,34 @@ impl JournalWriter {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .turn_open
+    }
+
+    /// 续跑恢复标记:恢复路径入口落账。replay_seq = 重建所回放到的账目
+    /// seq;rebuilt = 重建项清单(消息历史/pending 审批/Runaway 计数等条目)。
+    pub fn session_resumed(
+        &self,
+        replay_seq: u64,
+        rebuilt: Vec<String>,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::SessionResumed {
+            replay_seq,
+            rebuilt,
+        })
+    }
+
+    /// 工具执行重试落账(attempt 从 1 计:第 attempt 次重试;幂等类工具
+    /// 遇瞬态故障的重试面观测事件)。
+    pub fn tool_retried(
+        &self,
+        tool: &str,
+        attempt: u64,
+        transient: bool,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::ToolRetried {
+            tool: tool.to_string(),
+            attempt,
+            transient,
+        })
     }
 
     /// llm_called(主循环 react 用途;provider token 真值优先,tokens_est 兜底)
@@ -1230,6 +1283,141 @@ fn truncate_text(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_unclean_tail_appends_crash_marker() {
+        // 尾部悬挂检测:上一进程死前 turn 未收尾(直写 turn_started,无配对
+        // turn_ended,不触轮守卫)→ 打开即补写崩溃标记,seq 顺延
+        let dir = std::env::temp_dir().join(format!("jf-hang-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-hang").unwrap();
+            w.push(JournalEvent::TurnStarted {
+                turn_seq: 1,
+                goal: "g1".into(),
+            })
+            .unwrap();
+        }
+        {
+            // 重开(崩溃检测补写点;上一写者已 drop、注册表已释放)
+            let _w = JournalWriter::open(&dir, "s-hang").unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-hang")).unwrap();
+        assert_eq!(lines.len(), 2, "turn_started + 补写的 crash 标记");
+        assert_eq!(lines[1].seq, 2);
+        match &lines[1].event {
+            JournalEvent::SessionCrashed { reason } => {
+                assert_eq!(reason, "unclean_tail");
+            }
+            other => panic!("expected session_crashed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_crash_marker_not_duplicated_on_reopen() {
+        // 重复打开已补写崩溃标记的悬挂 journal:不二次补写(幂等)
+        let dir = std::env::temp_dir().join(format!("jf-hang2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-hang2").unwrap();
+            w.push(JournalEvent::TurnStarted {
+                turn_seq: 1,
+                goal: "g1".into(),
+            })
+            .unwrap();
+        }
+        let first = {
+            // 首次重开:补写崩溃标记
+            let _w = JournalWriter::open(&dir, "s-hang2").unwrap();
+            read_all(&JournalWriter::path_for(&dir, "s-hang2")).unwrap()
+        };
+        {
+            // 再次打开:末事件已是崩溃标记,不二次补写
+            let _w2 = JournalWriter::open(&dir, "s-hang2").unwrap();
+        }
+        let second = read_all(&JournalWriter::path_for(&dir, "s-hang2")).unwrap();
+        assert_eq!(first.len(), second.len(), "重复打开不得追加新事件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_clean_tail_open_appends_nothing() {
+        // 正常收尾(turn 成对)后打开:零新事件(负例)
+        let dir = std::env::temp_dir().join(format!("jf-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-clean").unwrap();
+            w.begin_turn("g1").unwrap();
+            w.end_turn("ok", 1, 10).unwrap();
+        }
+        let before = read_all(&JournalWriter::path_for(&dir, "s-clean")).unwrap();
+        {
+            let _w = JournalWriter::open(&dir, "s-clean").unwrap();
+        }
+        let after = read_all(&JournalWriter::path_for(&dir, "s-clean")).unwrap();
+        assert_eq!(before.len(), after.len(), "干净尾部打开不得追加事件");
+        assert_eq!(after.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_session_resumed_and_tool_retried_roundtrip() {
+        // 恢复标记+工具重试观测事件:落账+读回
+        let dir = std::env::temp_dir().join(format!("jf-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-resume").unwrap();
+            w.session_resumed(
+                7,
+                vec!["messages".to_string(), "pending_approvals".to_string()],
+            )
+            .unwrap();
+            w.tool_retried("grep_files", 1, true).unwrap();
+            w.tool_retried("shell_exec", 1, false).unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-resume")).unwrap();
+        assert_eq!(lines.len(), 3);
+        match &lines[0].event {
+            JournalEvent::SessionResumed {
+                replay_seq,
+                rebuilt,
+            } => {
+                assert_eq!(*replay_seq, 7);
+                assert_eq!(rebuilt.len(), 2);
+            }
+            other => panic!("expected session_resumed, got {other:?}"),
+        }
+        match &lines[1].event {
+            JournalEvent::ToolRetried {
+                tool,
+                attempt,
+                transient,
+            } => {
+                assert_eq!(tool, "grep_files");
+                assert_eq!(*attempt, 1);
+                assert!(*transient);
+            }
+            other => panic!("expected tool_retried, got {other:?}"),
+        }
+        match &lines[2].event {
+            JournalEvent::ToolRetried {
+                tool,
+                attempt,
+                transient,
+            } => {
+                assert_eq!(tool, "shell_exec");
+                assert_eq!(*attempt, 1);
+                assert!(!*transient);
+            }
+            other => panic!("expected tool_retried, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_recall_set_event_roundtrip() {

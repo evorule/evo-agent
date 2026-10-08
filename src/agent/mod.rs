@@ -39,6 +39,7 @@ pub mod summarizer;
 pub mod summary_fidelity;
 pub mod tool_intent;
 pub mod tool_manifest;
+pub mod tool_retry;
 pub mod tool_trace;
 pub mod translator;
 pub mod workflow;

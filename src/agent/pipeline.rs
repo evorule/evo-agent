@@ -154,11 +154,17 @@ pub trait PipelineExecutor: Sync {
 pub trait PolicyJudgedSink {
     /// 记录一次意图裁决输出（verdict = allowed/blocked）
     fn policy_judged(&self, verdict: &str, evidence: &str) -> Result<u64, JournalError>;
+    /// 记录一次工具执行重试（attempt 从 1 计；幂等类工具瞬态故障重试面）
+    fn tool_retried(&self, tool: &str, attempt: u64, transient: bool) -> Result<u64, JournalError>;
 }
 
 impl PolicyJudgedSink for JournalWriter {
     fn policy_judged(&self, verdict: &str, evidence: &str) -> Result<u64, JournalError> {
         JournalWriter::policy_judged(self, verdict, evidence)
+    }
+
+    fn tool_retried(&self, tool: &str, attempt: u64, transient: bool) -> Result<u64, JournalError> {
+        JournalWriter::tool_retried(self, tool, attempt, transient)
     }
 }
 
@@ -186,6 +192,9 @@ pub struct PipelineDeps<'a> {
     pub traces: Option<&'a std::sync::Mutex<ToolTraceCollector>>,
     /// 指标桥（G17 既有观测点）
     pub metrics: Option<&'a Metrics>,
+    /// 幂等类工具瞬态故障重试的回退基数（第 n 次重试等待 = 基数 × n；
+    /// 生产装配 = 1s 与 LLM 传输层同量级，测试注入极短值）
+    pub retry_backoff: std::time::Duration,
 }
 
 // =============================================================================
@@ -703,11 +712,51 @@ impl ToolExecutionPipeline {
         // ── ⑦ 执行（真实结局采集：metrics + 轨迹，G17 同点同规格）──
         // precomputed=缓存命中（G13 收口）：⑦免重执行直接采信已过闸产物，
         // 观测照常（时长≈0 的真实结局——本次调用确实被服务完成）。
+        // 瞬态故障重试面（执行阶段内部循环，治理段 ①-⑥ 每调用只走一次）：
+        // 幂等类工具遇连接/超时类错误形态自动重试（有限次、线性回退，与
+        // LLM 传输层重试面同参数量级）；非幂等工具不自动重试——盲重试写
+        // 操作是漂移风险源，失败显式回喂。每次重试先落账再推进。
         let pre = req.precomputed.clone();
         let tool_start = Instant::now();
         let raw = match pre {
             Some(cached) => Ok(cached),
-            None => deps.executor.execute_tool(req.tool_name, req.args).await,
+            None => {
+                let mut outcome = deps.executor.execute_tool(req.tool_name, req.args).await;
+                let mut retry_no: u32 = 0;
+                while let Err(err) = &outcome {
+                    if retry_no >= crate::agent::tool_retry::MAX_TOOL_RETRIES {
+                        break;
+                    }
+                    let transient = crate::agent::tool_retry::is_transient_error(&err.to_string());
+                    let retryable = matches!(
+                        crate::agent::tool_retry::retry_class(req.tool_name),
+                        crate::agent::tool_retry::RetryClass::IdempotentRead
+                            | crate::agent::tool_retry::RetryClass::IdempotentWrite
+                    );
+                    if !(transient && retryable) {
+                        break;
+                    }
+                    retry_no += 1;
+                    if let Some(sink) = deps.journal {
+                        if let Err(e) =
+                            sink.tool_retried(req.tool_name, u64::from(retry_no), transient)
+                        {
+                            // fail-visible 同款语义：账写不掉 = 错误显式化
+                            ledger.denial = Some(DenialStage::Ledger);
+                            return PipelineOutcome {
+                                result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                                    DenialStage::Ledger,
+                                    format!("journal tool_retried write failed: {e}"),
+                                ))),
+                                ledger,
+                            };
+                        }
+                    }
+                    tokio::time::sleep(deps.retry_backoff * retry_no).await;
+                    outcome = deps.executor.execute_tool(req.tool_name, req.args).await;
+                }
+                outcome
+            }
         };
         let tool_duration = tool_start.elapsed();
         let tool_ok = raw.is_ok();
@@ -818,6 +867,44 @@ mod tests {
         }
     }
 
+    /// 计数执行桩:前 `fails_left` 次返回固定错误文本,此后成功;记录总调用数
+    /// (重试面验收:调用计数=首次执行+实际发生的重试次数)
+    struct FlakyExecutor {
+        fails_left: std::sync::atomic::AtomicUsize,
+        err: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl FlakyExecutor {
+        fn failing_times(n: usize, err: &str) -> Self {
+            Self {
+                fails_left: std::sync::atomic::AtomicUsize::new(n),
+                err: err.to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl PipelineExecutor for FlakyExecutor {
+        fn execute_tool(
+            &self,
+            _tool_name: &str,
+            _args: &Value,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, AgentError>> + Send + '_>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let fails_left = &self.fails_left;
+            let err = self.err.clone();
+            Box::pin(async move {
+                if fails_left.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    Err(AgentError::ToolError(err))
+                } else {
+                    Ok(Value::from("executed"))
+                }
+            })
+        }
+    }
+
     /// 不应到达⑦的执行器（到达即 panic）
     struct UnreachableExecutor;
     impl PipelineExecutor for UnreachableExecutor {
@@ -834,6 +921,15 @@ mod tests {
     struct FailingJournal;
     impl PolicyJudgedSink for FailingJournal {
         fn policy_judged(&self, _verdict: &str, _evidence: &str) -> Result<u64, JournalError> {
+            Err(JournalError::Corrupt("injected write failure".to_string()))
+        }
+
+        fn tool_retried(
+            &self,
+            _tool: &str,
+            _attempt: u64,
+            _transient: bool,
+        ) -> Result<u64, JournalError> {
             Err(JournalError::Corrupt("injected write failure".to_string()))
         }
     }
@@ -869,6 +965,7 @@ mod tests {
             boundary: None,
             traces: None,
             metrics: None,
+            retry_backoff: std::time::Duration::from_millis(1),
         }
     }
 
@@ -993,6 +1090,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_failure_retries_idempotent_read_and_records_attempt() {
+        // 幂等读类+瞬态错误:自动重试一次后成功;每次重试独立落账
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["grep_files"]);
+        let args = Value::Null;
+        let exec = FlakyExecutor::failing_times(1, "operation timed out");
+        let journal = RecordingJournal(std::sync::Mutex::new(Vec::new()));
+        let mut deps = deps_for(&exec, &adj, &manifests);
+        deps.journal = Some(&journal);
+        let out = ToolExecutionPipeline
+            .execute(req_for("grep_files", &args, &focus), deps)
+            .await;
+        assert!(out.result.is_ok(), "瞬态失败必须在重试后恢复");
+        assert_eq!(exec.call_count(), 2, "首次执行+1 次重试");
+        let rec = journal.0.lock().unwrap();
+        assert_eq!(rec.len(), 1, "恰好一条重试落账");
+        assert_eq!(rec[0].0, "tool_retried");
+        assert_eq!(rec[0].1, "grep_files/1/transient=true");
+    }
+
+    #[tokio::test]
+    async fn non_retryable_class_never_auto_retries() {
+        // 非幂等类(网络调用族):瞬态错误也不自动重试——失败显式回喂(负例)
+        //(选 http_get:不在治理裁决面、无 candidate 形态,可直达⑦)
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["http_get"]);
+        let args = serde_json::json!({"url": "http://127.0.0.1:1/x"});
+        let exec = FlakyExecutor::failing_times(5, "operation timed out");
+        let journal = RecordingJournal(std::sync::Mutex::new(Vec::new()));
+        let mut deps = deps_for(&exec, &adj, &manifests);
+        deps.journal = Some(&journal);
+        let out = ToolExecutionPipeline
+            .execute(req_for("http_get", &args, &focus), deps)
+            .await;
+        assert!(out.result.is_err(), "执行失败必须显式回喂");
+        assert_eq!(exec.call_count(), 1, "非幂等类零自动重试");
+        assert!(journal.0.lock().unwrap().is_empty(), "零重试零落账");
+    }
+
+    #[tokio::test]
+    async fn non_transient_failure_does_not_retry() {
+        // 幂等类+非瞬态错误(参数形态):不自动重试
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["grep_files"]);
+        let args = Value::Null;
+        let exec = FlakyExecutor::failing_times(5, "invalid arguments: missing field `path`");
+        let deps = deps_for(&exec, &adj, &manifests);
+        let out = ToolExecutionPipeline
+            .execute(req_for("grep_files", &args, &focus), deps)
+            .await;
+        assert!(out.result.is_err());
+        assert_eq!(exec.call_count(), 1, "非瞬态失败零自动重试");
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_stops_at_cap() {
+        // 重试耗尽即透传终错;每次重试都留账(attempt 连续递增)
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["grep_files"]);
+        let args = Value::Null;
+        let exec = FlakyExecutor::failing_times(10, "connection refused");
+        let journal = RecordingJournal(std::sync::Mutex::new(Vec::new()));
+        let mut deps = deps_for(&exec, &adj, &manifests);
+        deps.journal = Some(&journal);
+        let out = ToolExecutionPipeline
+            .execute(req_for("grep_files", &args, &focus), deps)
+            .await;
+        assert!(out.result.is_err(), "重试耗尽必须透传终错");
+        assert_eq!(
+            exec.call_count(),
+            1 + crate::agent::tool_retry::MAX_TOOL_RETRIES as usize,
+            "首次执行+重试次数封顶"
+        );
+        let rec = journal.0.lock().unwrap();
+        assert_eq!(rec.len(), 2);
+        assert_eq!(rec[0].1, "grep_files/1/transient=true");
+        assert_eq!(rec[1].1, "grep_files/2/transient=true");
+    }
+
+    #[tokio::test]
+    async fn retry_ledger_write_failure_is_fail_visible() {
+        // 重试落账失败 = 显式拒绝(Ledger 阶段);落账失败即断,不带账缺口重试
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["grep_files"]);
+        let args = Value::Null;
+        let exec = FlakyExecutor::failing_times(5, "operation timed out");
+        let deps = PipelineDeps {
+            journal: Some(&FailingJournal),
+            ..deps_for(&exec, &adj, &manifests)
+        };
+        let out = ToolExecutionPipeline
+            .execute(req_for("grep_files", &args, &focus), deps)
+            .await;
+        let denial = denial_of(&out);
+        assert_eq!(denial.stage, DenialStage::Ledger);
+        assert_eq!(exec.call_count(), 1, "落账失败即断,不得带账缺口推进");
+    }
+
+    #[tokio::test]
     async fn channel_failure_is_fail_closed() {
         // ③④裁决通道故障 = 显式上抛（fail-closed 镜像；原 map_err(Internal) 语义）
         let adj = dummy_adjudicator();
@@ -1071,6 +1272,21 @@ mod tests {
         fn policy_judged(&self, verdict: &str, evidence: &str) -> Result<u64, JournalError> {
             if let Ok(mut seq) = self.0.lock() {
                 seq.push((verdict.to_string(), evidence.to_string()));
+            }
+            Ok(0)
+        }
+
+        fn tool_retried(
+            &self,
+            tool: &str,
+            attempt: u64,
+            transient: bool,
+        ) -> Result<u64, JournalError> {
+            if let Ok(mut seq) = self.0.lock() {
+                seq.push((
+                    "tool_retried".to_string(),
+                    format!("{tool}/{attempt}/transient={transient}"),
+                ));
             }
             Ok(0)
         }

@@ -3725,6 +3725,7 @@ impl AgentRunner {
             boundary: self.config.capability_boundary.as_ref(),
             traces: Some(&self.tool_traces),
             metrics: self.metrics.as_deref(),
+            retry_backoff: std::time::Duration::from_secs(1),
         };
         let req = crate::agent::pipeline::PipelineRequest {
             tool_name,
