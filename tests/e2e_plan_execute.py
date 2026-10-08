@@ -44,6 +44,14 @@
     前提）、P2 IoRequest 含 IMPORTANT 错误反馈文案（反馈入链）、P2
     IoResponse 提取出结构合法 PlanFact（重试成功）。
 
+  场景 F（serve 挂 driver，HTTP 等价链路）：evo-agent serve 起于 18091 端口，
+    POST /agents/general/run 携带 execution.mode=plan_execute（goal=场景 A
+    同一研究任务的等价形态），外层驱动循环在 serve 面完成 probe→PlanFact
+    v1→物化→执行。断言：非法 mode→HTTP 400；HTTP 200 且 success=true；
+    plan_stats 七项透出（plan_versions=1 replans=0 nodes_executed>=1
+    repeated_nodes=0 tokens_used>0）；session_id（marks_session）透出；
+    content 非空。响应全文落盘证据。
+
 # 前置（本脚本不进 CI——依赖真实 LLM key/运行中 server/已编译产物）
   1. .env 含 MINIMAX_API_KEY（evo-agent 只认进程环境变量，脚本负责注入）
   2. evorule-server 运行于 evo-agent.toml base_url（默认 http://127.0.0.1:18080），
@@ -64,6 +72,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Dict, Optional
@@ -637,6 +646,148 @@ def scenario_d(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
     return ok
 
 
+# ===== 场景 F：serve 挂 driver（HTTP execution.mode=plan_execute 等价链路）=====
+
+SERVE_PORT = 18091
+SERVE_BASE = f"http://127.0.0.1:{SERVE_PORT}"
+
+# 与场景 A 同一研究任务的等价形态（serve 面 probe planner task=goal，逐字对齐
+# research_plan.json 节点 task——PlanFact 指示词随 goal 携带）
+SCENARIO_F_GOAL = (
+    "Goal: research the topic 'evorule deterministic workflow engine design' and produce "
+    "a research digest. Produce a PlanFact JSON for this goal: 2-4 llm nodes with "
+    'agent_type "researcher" (collect key facts, then synthesize a structured digest), '
+    "exactly one sink node. Output ONLY the PlanFact JSON object."
+)
+
+
+def wait_serve_health(timeout_s: float = 60.0) -> Optional[str]:
+    """轮询 evo-agent serve /health；返回 None=OK，否则错误文本"""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{SERVE_BASE}/health", timeout=3) as resp:
+                if resp.status == 200:
+                    return None
+        except Exception:  # noqa: BLE001 — 轮询期连接拒绝/超时均属预期
+            pass
+        time.sleep(0.5)
+    return f"serve health 未就绪（{timeout_s}s 超时）"
+
+
+def scenario_f(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
+    """S-1 serve 挂 driver：HTTP run 端点 execution.mode=plan_execute 等价链路。
+
+    断言五条：
+      ① execution.mode 非法 → HTTP 400（模式白名单）；
+      ② plan_execute 请求 → HTTP 200 且 success=true（probe→PlanFact v1→物化→执行）；
+      ③ plan_stats 七项透出：plan_versions=1 replans=0 nodes_executed>=1
+         repeated_nodes=0 tokens_used>0（与场景 A 统计口径一致）；
+      ④ session_id 透出（marks_session 会话关联收口）；
+      ⑤ content 非空（output_node 产出）。
+    """
+    print(f"\n=== 场景 F: serve 挂 driver（HTTP execution.mode=plan_execute 等价链路） ===")
+    if not BINARY.exists():
+        print(f"  {RED}FAIL{RESET}  编译产物缺失: {BINARY}")
+        return False
+
+    proc_env = {**os.environ, **env}
+    proc = subprocess.Popen(
+        [str(BINARY), "serve", "--workdir", str(REPO_ROOT),
+         "--host", "127.0.0.1", "--port", str(SERVE_PORT), "--no-auth"],
+        cwd=str(REPO_ROOT), env=proc_env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        err = wait_serve_health()
+        if err:
+            print(f"  {RED}FAIL{RESET}  evo-agent serve 启动失败: {err}")
+            return False
+        print(f"  {GREEN}PASS{RESET}  serve 健康（{SERVE_BASE}/health）")
+
+        # ① 非法 mode → 400（无 LLM 成本）
+        bad = urllib.request.Request(
+            f"{SERVE_BASE}/agents/general/run",
+            data=json.dumps({
+                "agent_type": "general", "goal": "g",
+                "execution": {"mode": "bogus"},
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(bad, timeout=30) as resp:
+                status_bad = resp.status
+        except urllib.error.HTTPError as e:
+            status_bad = e.code
+        ok = check(status_bad == 400, "非法 execution.mode → HTTP 400",
+                   f"预期 400，实得 {status_bad}")
+
+        # ②-⑤ plan_execute 真实链路（真实 LLM；与场景 A 同一目标等价形态）
+        req = urllib.request.Request(
+            f"{SERVE_BASE}/agents/general/run",
+            data=json.dumps({
+                "agent_type": "general", "goal": SCENARIO_F_GOAL,
+                "execution": {"mode": "plan_execute"},
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        start = time.time()
+        with urllib.request.urlopen(req, timeout=900) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            status = resp.status
+        duration = time.time() - start
+        if evidence_dir is not None:
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            (evidence_dir / "scenarioF_response.json").write_text(
+                json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"  {YELLOW}···{RESET}  证据落盘 {evidence_dir}/scenarioF_response.json")
+
+        ok = ok and check(status == 200, f"HTTP 200（{duration:.1f}s）", f"HTTP {status}")
+        ok = ok and check(
+            body.get("success") is True,
+            "success=true（plan_execute 全链路完成）",
+            f"success={body.get('success')} error={body.get('error')}",
+        )
+        stats = body.get("plan_stats")
+        ok = ok and check(
+            isinstance(stats, dict), "plan_stats 透出（七项统计）", "plan_stats 缺失",
+        )
+        if isinstance(stats, dict):
+            print(f"  {YELLOW}···{RESET}  plan_stats: {stats}")
+            ok = ok and check(
+                stats.get("plan_versions") == 1 and stats.get("replans") == 0,
+                "plan_versions=1 replans=0（与场景 A 口径一致）",
+                f"预期 plan_versions=1 replans=0，实得 {stats.get('plan_versions')}/{stats.get('replans')}",
+            )
+            ok = ok and check(
+                int(stats.get("nodes_executed", 0)) >= 1,
+                "nodes_executed>=1", "nodes_executed=0（应有节点完成）",
+            )
+            ok = ok and check(
+                int(stats.get("repeated_nodes", -1)) == 0,
+                "repeated_nodes=0", "repeated_nodes 非 0",
+            )
+            ok = ok and check(
+                int(stats.get("tokens_used", 0)) > 0,
+                "tokens_used>0（真实 LLM 消耗）", "tokens_used=0（埋点未生效）",
+            )
+        ok = ok and check(
+            bool(body.get("session_id")),
+            "session_id 透出（marks_session 关联收口）", "session_id 缺失",
+        )
+        ok = ok and check(
+            bool(body.get("content")), "content 非空（output_node 产出）", "content 为空",
+        )
+        return ok
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="plan-execute 真实 LLM E2E")
     parser.add_argument(
@@ -647,13 +798,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--only",
-        choices=["A", "B", "C", "D", "E"],
+        choices=["A", "B", "C", "D", "E", "F"],
         default=None,
         help="只跑单个场景（调试用；缺省全量）",
     )
     args = parser.parse_args()
 
-    print("plan-execute 真实 LLM E2E 测试（IT 级；Phase 1-B A/B + Phase 2 C/D + 收官 B6 场景 E）")
+    print("plan-execute 真实 LLM E2E 测试（IT 级；Phase 1-B A/B + Phase 2 C/D + 收官 B6 场景 E + serve 挂 driver 场景 F）")
     print(f"  时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  env:  {ENV_PATH}")
 
@@ -677,10 +828,11 @@ def main() -> int:
     ok_c = scenario_c(env, args.evidence_dir) if only in (None, "C") else True
     ok_d = scenario_d(env, args.evidence_dir) if only in (None, "D") else True
     ok_e = scenario_e(env, args.evidence_dir, server_url) if only in (None, "E") else True
+    ok_f = scenario_f(env, args.evidence_dir) if only in (None, "F") else True
 
-    total = ok_a and ok_b and ok_c and ok_d and ok_e
+    total = ok_a and ok_b and ok_c and ok_d and ok_e and ok_f
     print(f"\n{'=' * 60}")
-    print(f"结果: {'ALL PASS' if total else 'FAILED'}  (A={ok_a} B={ok_b} C={ok_c} D={ok_d} E={ok_e})")
+    print(f"结果: {'ALL PASS' if total else 'FAILED'}  (A={ok_a} B={ok_b} C={ok_c} D={ok_d} E={ok_e} F={ok_f})")
     print(f"{'=' * 60}")
     return 0 if total else 1
 

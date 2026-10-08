@@ -40,6 +40,15 @@ use crate::io_handlers::tool_handler::ToolHandler;
 /// 同步 `.map()` 闭包中无法 `await` `tokio::sync::Mutex` 的问题。
 pub type SessionStore = Arc<Mutex<HashMap<String, CancellationToken>>>;
 
+/// plan-execute 执行模式声明（可选扩展字段）
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExecutionSpec {
+    /// 执行模式：`react`（缺省）| `plan_execute`——plan_execute 走外层驱动
+    /// 循环（planning probe → PlanFact v1 → 物化执行 → replan），
+    /// react = 既有单代理 ReAct 行为零变化
+    pub mode: String,
+}
+
 /// Agent run request
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentRunRequest {
@@ -64,6 +73,12 @@ pub struct AgentRunRequest {
     /// 删字段即下线)。LLM 面不可见该字段——仅 HTTP 请求方可设。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// plan-execute 执行模式扩展字段(可选):mode=plan_execute 时请求由外层
+    /// 驱动循环执行,None/缺省/react = 既有单代理 ReAct 行为零变化
+    /// (参赛兼容层三原则②:删配置即下线)。LLM 面不可见该字段——仅 HTTP
+    /// 请求方可设。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionSpec>,
 }
 
 /// Agent run response
@@ -83,6 +98,29 @@ pub struct AgentRunResponse {
     /// 消费者可凭此查询 18080 权威面或工作台回放,旧消费者不受影响)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// plan-execute 驱动循环统计(mode=plan_execute 时透出;react/缺省不序列化,
+    /// 字段语义见 `driver::PlanLoopStats`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_stats: Option<PlanStatsResponse>,
+}
+
+/// plan-execute 驱动循环统计(stats 七项透出;字段语义见 `driver::PlanLoopStats`)
+#[derive(Debug, Serialize)]
+pub struct PlanStatsResponse {
+    /// 执行过的计划版本数(Dsl 无 replan = 1;plan-execute = 1 + replans)
+    pub plan_versions: u32,
+    /// 实际发生的 replan 次数
+    pub replans: u32,
+    /// 全部版本累计完成节点数
+    pub nodes_executed: u64,
+    /// 全部版本累计墙钟毫秒
+    pub wall_ms: u64,
+    /// 静态拦截命中的重复执行节点数(幂等重复放行,仅埋点)
+    pub repeated_nodes: u64,
+    /// 全部版本累计 token
+    pub tokens_used: u64,
+    /// v2+ 版本消耗 token(replan 重复执行成本埋点)
+    pub replan_tokens: u64,
 }
 
 /// Agent list response
@@ -711,6 +749,28 @@ async fn run_agent(
 ) -> Result<Json<AgentRunResponse>, (StatusCode, String)> {
     let mut def = load_serve_definition(&state, &agent_type)?;
 
+    // 执行模式分流（先于 per-request 覆盖——覆盖块按值取走 req 字段；plan_execute
+    // 分支不消费 def，行为等价于「覆盖之后、AgentRunner 构造之前」）：
+    // mode=plan_execute 走外层驱动循环（plan-execute 挂 driver），react（缺省/
+    // None）走既有单代理路径（下方逐字节不动）。未知 mode = 400。
+    match req
+        .execution
+        .as_ref()
+        .map(|e| e.mode.as_str())
+        .unwrap_or("react")
+    {
+        "react" => {} // 现路径零变化
+        "plan_execute" => return run_plan_execute_request(&state, &agent_type, &req).await,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown execution.mode '{other}' (expected \"react\" or \"plan_execute\")"
+                ),
+            ))
+        }
+    }
+
     // E1:per-request 覆盖直接改 def(from_definition 内部会调 to_agent_config)
     if let Some(max_steps) = req.max_steps {
         def.max_steps = max_steps;
@@ -852,6 +912,107 @@ async fn run_agent(
         duration_ms: result.duration_ms,
         error: result.error,
         session_id,
+        plan_stats: None,
+    }))
+}
+
+/// plan-execute 模式请求处理（serve 挂 driver）：serve 面 toolkit + 治理门禁段
+/// 装配 → 外层驱动循环 → 响应映射。
+///
+/// - 成功：`session_id` = marks_session（会话关联收口），`plan_stats` 透出七项；
+/// - 失败：与 react 路径执行失败同封套（HTTP 200 + success=false + error 原文），
+///   消费者处理口径统一；marks_session 创建失败即断（fail-fast，留痕是硬义务）。
+async fn run_plan_execute_request(
+    state: &AgentApiState,
+    agent_type: &str,
+    req: &AgentRunRequest,
+) -> Result<Json<AgentRunResponse>, (StatusCode, String)> {
+    let started = std::time::Instant::now();
+    // serve 安全隔离语义优先：E1 union + agentTools.* 开关裁剪（白名单传全量
+    // =仅裁开关；delegate 子代理再按各自 def.tools 白名单过滤），不重建 CLI
+    // union toolkit
+    let (merged_settings, _) = state.workbench_settings().merged();
+    let all_tools = state.toolkit.tool_names();
+    let delegate_toolkit = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+        &state.toolkit,
+        &all_tools,
+        &merged_settings,
+    );
+    // 治理门禁段随上下文下放（与 react 路径 DelegateContext 同源——治理纪律
+    // 无豁免面）；L2 前馈按 serve union 全量工具面触发
+    let governance_segment =
+        crate::api::serve_tools::build_governance_segment(&state.evorule_client, &all_tools).await;
+    // 驱动限额与 CLI workflow 子命令缺省一致（阈值禁入 PlanFact）
+    let limits = crate::agent::driver::DriverLimits {
+        max_replan: 3,
+        max_wall_ms: Some(1_800_000),
+        max_tokens: None,
+    };
+    let run = crate::agent::driver::run_plan_execute(
+        state.evorule_client.clone(),
+        state.definitions.clone(),
+        delegate_toolkit,
+        &state.workdir,
+        governance_segment,
+        &req.goal,
+        limits,
+        3, // max_depth（与 CLI workflow 子命令缺省一致）
+        5, // max_concurrent（与 CLI workflow 子命令缺省一致，0=不限流）
+    )
+    .await;
+    let (outcome, marks_session) = match run {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(
+                agent_type = agent_type,
+                error = %e,
+                "plan-execute execution failed"
+            );
+            return Ok(Json(AgentRunResponse {
+                success: false,
+                content: String::new(),
+                steps: 0,
+                duration_ms: started.elapsed().as_millis() as u64,
+                error: Some(e),
+                session_id: None,
+                plan_stats: None,
+            }));
+        }
+    };
+    info!(
+        agent_type = agent_type,
+        plan_versions = outcome.stats.plan_versions,
+        replans = outcome.stats.replans,
+        nodes_executed = outcome.stats.nodes_executed,
+        "plan-execute execution completed"
+    );
+    // 会话关联收口：marks_session 挂工作台本地索引（与 react 路径同口径，fail-soft）
+    let index_title: String = req.goal.chars().take(60).collect();
+    state
+        .session_index()
+        .record(&crate::api::session_index::SessionIndexEntry {
+            session_id: marks_session.clone(),
+            agent_type: agent_type.to_string(),
+            created_at: crate::api::session_index::unix_now(),
+            last_active: crate::api::session_index::unix_now(),
+            title: index_title,
+        });
+    Ok(Json(AgentRunResponse {
+        success: true,
+        content: outcome.content,
+        steps: outcome.stats.nodes_executed as usize,
+        duration_ms: started.elapsed().as_millis() as u64,
+        error: None,
+        session_id: Some(marks_session),
+        plan_stats: Some(PlanStatsResponse {
+            plan_versions: outcome.stats.plan_versions,
+            replans: outcome.stats.replans,
+            nodes_executed: outcome.stats.nodes_executed,
+            wall_ms: outcome.stats.wall_ms,
+            repeated_nodes: outcome.stats.repeated_nodes,
+            tokens_used: outcome.stats.tokens_used,
+            replan_tokens: outcome.stats.replan_tokens,
+        }),
     }))
 }
 
@@ -2200,6 +2361,7 @@ mod tests {
             model: None,
             container: None,
             workspace: None,
+            execution: None,
         };
 
         let response = app
@@ -2374,6 +2536,7 @@ mod tests {
             duration_ms: 100,
             error: None,
             session_id: Some("sess-1".to_string()),
+            plan_stats: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("success"));
@@ -2385,8 +2548,57 @@ mod tests {
         };
         let bare_json = serde_json::to_string(&bare).unwrap();
         assert!(!bare_json.contains("session_id"));
+        assert!(
+            !bare_json.contains("plan_stats"),
+            "react/缺省不透出 plan_stats"
+        );
         assert!(json.contains("hello"));
         assert!(json.contains("3"));
+    }
+
+    #[test]
+    fn test_agent_run_response_plan_stats_serialize() {
+        // plan_execute 成功响应:plan_stats 七项透出 + session_id=marks_session
+        let resp = AgentRunResponse {
+            success: true,
+            content: "digest".to_string(),
+            steps: 2,
+            duration_ms: 5000,
+            error: None,
+            session_id: Some("marks-1".to_string()),
+            plan_stats: Some(PlanStatsResponse {
+                plan_versions: 1,
+                replans: 0,
+                nodes_executed: 2,
+                wall_ms: 4800,
+                repeated_nodes: 0,
+                tokens_used: 1024,
+                replan_tokens: 0,
+            }),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["plan_stats"]["plan_versions"], 1);
+        assert_eq!(v["plan_stats"]["replans"], 0);
+        assert_eq!(v["plan_stats"]["nodes_executed"], 2);
+        assert_eq!(v["plan_stats"]["wall_ms"], 4800);
+        assert_eq!(v["plan_stats"]["repeated_nodes"], 0);
+        assert_eq!(v["plan_stats"]["tokens_used"], 1024);
+        assert_eq!(v["plan_stats"]["replan_tokens"], 0);
+        assert_eq!(v["session_id"], "marks-1");
+    }
+
+    #[test]
+    fn test_execution_mode_request_deserialization() {
+        // execution 扩展字段反序列化面:显式 mode 可读出,缺省 = None(react);
+        // 分流行为(未知 mode=400/plan_execute 挂 driver)由 e2e_plan_execute 场景 F 覆盖
+        let raw = r#"{"agent_type":"general","goal":"g","execution":{"mode":"plan_execute"}}"#;
+        let req: AgentRunRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.execution.unwrap().mode, "plan_execute");
+        // None/缺省 = react
+        let bare: AgentRunRequest =
+            serde_json::from_str(r#"{"agent_type":"general","goal":"g"}"#).unwrap();
+        assert!(bare.execution.is_none());
     }
 
     // ===== G4 SSE 测试 =====
@@ -2506,6 +2718,7 @@ mod tests {
             model: None,
             container: None,
             workspace: None,
+            execution: None,
         };
         let response = rt.block_on(async {
             app.oneshot(
