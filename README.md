@@ -295,6 +295,10 @@ evo-agent workflow research_and_write
 # 公式计算场景（v1.3）：LLM 节点只采集参数，求和/工期/日均/钳制全部由
 # compute 纯函数确定性核算（见 rules/workflows/budget_review.json）
 evo-agent workflow budget_review
+
+# 缴税通知单场景：compute 承担简单封闭计算（应税所得核定）；税档级联走
+# UDF 宏（call_service）、文档生成走 template_render——三者选型边界见
+# evorule-server docs/WASM_UDF_GUIDE.md §5.1（见 rules/workflows/tax_statement.json）
 ```
 
 工作流 DSL 支持 workflow_dag v1.0/v1.1/v1.2/v1.3 四版本并存（按文档形态自动分派）：
