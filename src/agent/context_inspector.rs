@@ -33,13 +33,45 @@ pub const MECHANISM_SECTION_MARKERS: &[&str] = &[
 
 /// 禁令词形 v2(双语对称扩充,行为变更批:英文词形以词边界匹配,窗口适配)
 const PROHIBITION_MARKS: &[&str] = &[
-    "禁止", "不得", "不要", "不能", "不允许", "禁用", "严禁", "切勿", "不可", "拒绝", "never",
-    "must not", "do not", "should not", "cannot", "forbidden", "prohibited", "avoid",
+    "禁止",
+    "不得",
+    "不要",
+    "不能",
+    "不允许",
+    "禁用",
+    "严禁",
+    "切勿",
+    "不可",
+    "拒绝",
+    "never",
+    "must not",
+    "do not",
+    "should not",
+    "cannot",
+    "forbidden",
+    "prohibited",
+    "avoid",
 ];
 /// 声明词形 v2(双语对称扩充)
 const AFFIRMATION_MARKS: &[&str] = &[
-    "可以", "允许", "应当", "应该", "支持", "推荐", "必须", "务必", "建议", "能够", "must",
-    "should", "can", "may", "allowed", "supported", "recommended", "enabled",
+    "可以",
+    "允许",
+    "应当",
+    "应该",
+    "支持",
+    "推荐",
+    "必须",
+    "务必",
+    "建议",
+    "能够",
+    "must",
+    "should",
+    "can",
+    "may",
+    "allowed",
+    "supported",
+    "recommended",
+    "enabled",
 ];
 /// 禁令/声明词与 token 的邻近窗口:中文形 12 字符(历史口径不变)/英文形 24
 /// 字符(英文词距更长,窗口适配;行为变更点之二)
@@ -84,10 +116,8 @@ fn contains_mark(window: &str, mark: &str) -> bool {
     while let Some(rel) = window[search_from..].find(mark) {
         let start = search_from + rel;
         let end = start + mark.len();
-        let before_ok = start == 0
-            || !bytes[start - 1].is_ascii_alphanumeric();
-        let after_ok = end >= bytes.len()
-            || !bytes[end].is_ascii_alphanumeric();
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
         if before_ok && after_ok {
             return true;
         }
@@ -500,7 +530,8 @@ mod tests {
 
 【能力边界声明】
 可用工具:web_search";
-        let r = inspect_system_sections_with(sp, &["web_search".to_string()], &I2Lexicon::builtin());
+        let r =
+            inspect_system_sections_with(sp, &["web_search".to_string()], &I2Lexicon::builtin());
         assert_eq!(r.len(), 1, "{r:?}");
         assert!(r[0].excerpt_a.contains("Never"), "{r:?}");
 
@@ -508,7 +539,8 @@ mod tests {
 
 ## Stable Facts
 - 推荐 git_push 做推送";
-        let r2 = inspect_system_sections_with(sp2, &["git_push".to_string()], &I2Lexicon::builtin());
+        let r2 =
+            inspect_system_sections_with(sp2, &["git_push".to_string()], &I2Lexicon::builtin());
         assert_eq!(r2.len(), 1, "must not × 推荐配对: {r2:?}");
     }
 
@@ -530,7 +562,8 @@ mod tests {
 
 【能力边界声明】
 - web_search";
-        let r = inspect_system_sections_with(sp, &["web_search".to_string()], &I2Lexicon::builtin());
+        let r =
+            inspect_system_sections_with(sp, &["web_search".to_string()], &I2Lexicon::builtin());
         assert_eq!(r.len(), 1, "24 字符窗口检出长距英文禁令: {r:?}");
     }
 
