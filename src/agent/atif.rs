@@ -149,6 +149,10 @@ pub struct AtifRootExtra {
     /// schema 零改动)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// 轨迹是否为崩溃后续接(恢复标记在账时为 true;extra 扩展位,
+    /// 既有导出恒 false 不序列化,字节不变)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub resumed_after_crash: bool,
 }
 
 /// ATIF StepObject(RFC §StepObject)
@@ -369,6 +373,8 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
     let mut total_completion: u64 = 0;
 
     // system 步(首步;transcript 无 system 消息则不产出,RFC 不强制)
+    // system 步是否已产出(恢复点打标跳过 system 步用;system_msg 随步构造 move)
+    let has_system_step = system_msg.is_some();
     if let Some(sys) = system_msg {
         steps.push(AtifStep {
             step_id: next_step_id,
@@ -385,9 +391,21 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
         next_step_id += 1;
     }
 
+    // 崩溃后是否续跑:journal 含恢复标记 = 截断点后还有续接段(导出两段);
+    // 纯崩溃轨迹维持截断导出语义(恢复标记缺席即在此截断)。
+    let resumed_after_crash = sources
+        .journal
+        .iter()
+        .any(|l| matches!(l.event, JournalEvent::SessionResumed { .. }));
+
     for line in sources.journal {
-        // session_crashed = 轨迹截断点(映射表 §四.5/§六)
+        // session_crashed = 轨迹截断点(映射表 §四.5/§六);续接轨迹不在此
+        // 截断——恢复点之后的续接段照常映射,此前的对话步在恢复点整体
+        // 标记重建历史(is_copied_context,SFT 过滤面)
         if matches!(line.event, JournalEvent::SessionCrashed { .. }) {
+            if resumed_after_crash {
+                continue;
+            }
             break;
         }
         match &line.event {
@@ -912,14 +930,33 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                     );
                 }
             }
-            // SessionResumed:PR-2 后接线(is_copied_context 重建历史步);v1 忽略
-            JournalEvent::SessionResumed { .. } => {}
+            // SessionResumed:恢复点——此前全部对话步=重建历史(重建时原样
+            // 回喂进续跑上下文,非本段新鲜产出),整体标 is_copied_context
+            //(SFT 过滤面);system 步为持久脚手架不属重建历史,不标
+            JournalEvent::SessionResumed { .. } => {
+                let skip = usize::from(has_system_step);
+                for s in steps.iter_mut().skip(skip) {
+                    let mut extra = s
+                        .extra
+                        .take()
+                        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+                    if let Some(obj) = extra.as_object_mut() {
+                        obj.insert(
+                            "is_copied_context".to_string(),
+                            serde_json::Value::Bool(true),
+                        );
+                    }
+                    s.extra = Some(extra);
+                }
+            }
             // 委托子会话锚:元数据事件不映射为步——主轨迹中 delegate 仍呈现为
             // 普通工具调用(映射口径 v1 不变);链路经 root.extra.parent_session_id
             // 在子轨迹侧标注
             JournalEvent::DelegateSpawned { .. } => {}
             // 冷迁计数:账面观测事件不映射步(观测面口径)
             JournalEvent::ColdMoved { .. } => {}
+            // 工具重试观测:不映射步(观测面口径;重试明细在 journal 事件)
+            JournalEvent::ToolRetried { .. } => {}
             // SessionCrashed 已在循环头截断
             JournalEvent::SessionCrashed { .. } => {}
             // HandoverWritten:交接点语义锚(写档动作镜像已在 tool_invoked/
@@ -976,6 +1013,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             journal_seq_range: [first_seq, last_seq],
             exporter: format!("evo-agent atif v{}", env!("CARGO_PKG_VERSION")),
             parent_session_id: sources.parent_session_id.clone(),
+            resumed_after_crash,
         },
     })
 }
@@ -1906,6 +1944,132 @@ mod tests {
         let t = export(src).unwrap();
         assert_eq!(t.steps.len(), 3, "crash 截断:后续 turn_started 不入步");
         assert!(!t.steps.iter().any(|s| s.message == "later"));
+    }
+
+    #[test]
+    fn session_resumed_exports_both_segments_with_copied_marks() {
+        // 续接轨迹:crash 断点不截断,恢复点前对话步整体标 is_copied_context
+        //(重建历史,SFT 过滤面;system 步不标),续接段照常映射,
+        // root.extra 显式标记续接
+        let mut j = JFix::new();
+        // 崩溃前:turn 1 完整一轮
+        j.push(JE::TurnStarted {
+            turn_seq: 1,
+            goal: "g".into(),
+        });
+        j.push(JE::LlmCalled {
+            model: "m".into(),
+            purpose: "react".into(),
+            evorule_request_id: None,
+            tokens: tok(1, 1),
+            tokens_est: None,
+            request: 2,
+            response: "a1".into(),
+        });
+        j.push(JE::TurnEnded {
+            status: "success".into(),
+            steps: 1,
+            duration_ms: 1,
+        });
+        j.push(JE::SessionCrashed {
+            reason: "unclean_tail".into(),
+        });
+        j.push(JE::SessionResumed {
+            replay_seq: 4,
+            rebuilt: vec!["messages".into()],
+        });
+        // 续接段:turn 2
+        j.push(JE::TurnStarted {
+            turn_seq: 2,
+            goal: "g2".into(),
+        });
+        j.push(JE::LlmCalled {
+            model: "m".into(),
+            purpose: "react".into(),
+            evorule_request_id: None,
+            tokens: tok(1, 1),
+            tokens_est: None,
+            request: 4,
+            response: "a2".into(),
+        });
+        j.push(JE::TurnEnded {
+            status: "success".into(),
+            steps: 1,
+            duration_ms: 1,
+        });
+        let transcript = vec![
+            msg(0, "system", "sys"),
+            msg(1, "user", "g"),
+            msg(2, "assistant", "a1"),
+            msg(3, "user", "g2"),
+            msg(4, "assistant", "a2"),
+        ];
+        let src = AtifSources {
+            session_id: "s",
+            journal: &j.lines,
+            transcript: &transcript,
+            audit_facts: &[],
+            tool_definitions: None,
+            parent_session_id: None,
+        };
+        let t = export(src).unwrap();
+        assert_eq!(t.steps.len(), 5, "两段都入步:system+崩溃前 2 步+续接 2 步");
+        assert!(t.extra.resumed_after_crash, "root.extra 续接标记");
+        let copied = |s: &AtifStep| {
+            s.extra
+                .as_ref()
+                .and_then(|e| e.get("is_copied_context"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
+        assert!(!copied(&t.steps[0]), "system 步不标(持久脚手架)");
+        assert!(copied(&t.steps[1]), "崩溃前 user 步=重建历史");
+        assert!(copied(&t.steps[2]), "崩溃前 agent 步=重建历史");
+        assert!(!copied(&t.steps[3]), "续接段 user 步=新鲜产出");
+        assert!(!copied(&t.steps[4]), "续接段 agent 步=新鲜产出");
+        // 序数对齐:续接轮消费 transcript 对位消息(重建历史不重复入 transcript)
+        assert_eq!(t.steps[3].message, "g2");
+        assert_eq!(t.steps[4].message, "a2");
+    }
+
+    #[test]
+    fn tool_retried_event_maps_to_no_step() {
+        // 工具重试观测事件不映射步(观测面口径),导出零影响
+        let mut j = JFix::new();
+        j.push(JE::TurnStarted {
+            turn_seq: 1,
+            goal: "g".into(),
+        });
+        j.push(JE::LlmCalled {
+            model: "m".into(),
+            purpose: "react".into(),
+            evorule_request_id: None,
+            tokens: tok(1, 1),
+            tokens_est: None,
+            request: 2,
+            response: "r".into(),
+        });
+        j.push(JE::ToolRetried {
+            tool: "grep_files".into(),
+            attempt: 1,
+            transient: true,
+        });
+        j.push(JE::TurnEnded {
+            status: "success".into(),
+            steps: 1,
+            duration_ms: 1,
+        });
+        let transcript = vec![msg(0, "system", "sys"), msg(1, "user", "g")];
+        let src = AtifSources {
+            session_id: "s",
+            journal: &j.lines,
+            transcript: &transcript,
+            audit_facts: &[],
+            tool_definitions: None,
+            parent_session_id: None,
+        };
+        let t = export(src).unwrap();
+        assert_eq!(t.steps.len(), 3, "system+user+agent 三步,重试事件不产生步");
     }
 
     #[test]
