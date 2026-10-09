@@ -45,6 +45,7 @@
   "memory": {
     "type": "persistent",
     "namespace": "tb-agent",
+    "lex_store": "D:/evo-agent/data/lex/tb-agent.db",
     "summary_model": "MiniMax-M2.5",
     "recipe": {
       "recipe_version": "memory-v1.1",
