@@ -590,6 +590,11 @@ async fn run_judge_command(
     cmd: &str,
     container: Option<&str>,
 ) -> Result<std::process::Output, String> {
+    // H2 运行期闸:spawn 前白名单校验(物化期闸防 PlanFact 面;此处防手写
+    // DSL v1.2 workflow json 绕过物化器校验的路径——materialize_workflow_dag
+    // 也走物化期闸,此闸对直列 JudgeSpec 的调用面兜底,双闸纵深)
+    crate::agent::judge_guard::validate_judge_command(cmd)
+        .map_err(|e| format!("judge command blocked by H2 guard: {e}"))?;
     if let Some(c) = container {
         crate::builtin_tools::shell_exec::validate_container_name(c)
             .map_err(|e| format!("judge container name invalid: {e}"))?;
@@ -4306,21 +4311,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_judge_command_host_direct() {
-        // 宿主直执行（None）：exit 0 / exit 7 语义
-        let out = run_judge_command("exit 0", None)
+        // 宿主直执行（None）：exit 0 / exit 7 语义（H2 门卫后:探针命令须在
+        // 白名单——用 echo + cmd 语义等价探针;exit 改经 sh -c 复合)
+        let out = run_judge_command("echo ok", None)
             .await
-            .expect("exit 0 须成功 spawn");
+            .expect("echo 须成功 spawn");
         assert_eq!(out.status.code(), Some(0));
-        let out = run_judge_command("exit 7", None)
+        assert!(String::from_utf8_lossy(&out.stdout).contains("ok"));
+        let out = run_judge_command("sh -c 'exit 7'", None)
             .await
-            .expect("exit 7 须成功 spawn");
+            .expect("sh -c 复合须成功 spawn");
         assert_eq!(out.status.code(), Some(7));
     }
 
     #[tokio::test]
     async fn test_run_judge_command_container_name_validated() {
         // 容器名过白名单校验（防 argv 注入）：非法名 = Err 携带原因（判据不过路径）
-        let err = run_judge_command("exit 0", Some("bad name with spaces"))
+        // H2 门卫后:探针命令须在白名单内,否则错误文本混入 H2 拒绝(测不到容器名闸)
+        let err = run_judge_command("echo probe", Some("bad name with spaces"))
             .await
             .expect_err("非法容器名须 Err");
         assert!(

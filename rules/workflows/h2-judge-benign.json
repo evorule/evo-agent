@@ -1,0 +1,17 @@
+{
+  "workflow_id": "h2-e2e-benign-judge",
+  "description": "H2 E2E: whitelisted judge command must execute and pass",
+  "nodes": [
+    {
+      "id": "victim",
+      "agent_type": "general",
+      "task": "回复 OK 即可",
+      "judge": {
+        "command": "echo H2-PROBE-OK-12345",
+        "expect_exit": 0,
+        "expect_stdout": "H2-PROBE-OK"
+      }
+    }
+  ],
+  "output_node": "victim"
+}
