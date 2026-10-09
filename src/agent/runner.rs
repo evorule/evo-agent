@@ -5359,6 +5359,55 @@ impl AgentRunner {
                                     messages.clone()
                                 };
 
+                                // G11(S1 双路径收敛):注入格式指令到 system prompt
+                                // (只影响本次请求的 messages_to_send,不改原 messages)——
+                                // 语义与非流式 run() :3282 一致;R3-b/G-7 指令落链
+                                // (同指令去重,best-effort 留痕)
+                                let mut messages_to_send = messages_to_send;
+                                if let Some(validator) = &runner.output_validator {
+                                    let instruction = validator.instruction();
+                                    if !instruction.is_empty() {
+                                        for msg in &mut messages_to_send {
+                                            if let Message::System { content } = msg {
+                                                content.push_str(instruction);
+                                                break;
+                                            }
+                                        }
+                                        let needs_land = {
+                                            let landed = runner
+                                                .landed_format_instruction
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner());
+                                            landed.as_deref() != Some(instruction)
+                                        };
+                                        if needs_land {
+                                            match runner
+                                                .evorule_client
+                                                .update_payload(
+                                                    &session_id,
+                                                    "__context__.format_instruction",
+                                                    &serde_json::json!({ "format_instruction": instruction }),
+                                                )
+                                                .await
+                                            {
+                                                Ok(_fact_id) => {
+                                                    let mut landed = runner
+                                                        .landed_format_instruction
+                                                        .lock()
+                                                        .unwrap_or_else(|p| p.into_inner());
+                                                    *landed = Some(instruction.to_owned());
+                                                    info!(%session_id, "R3: format instruction landed (G-7 closed, streaming)");
+                                                }
+                                                Err(e) => warn!(
+                                                    %session_id,
+                                                    error = %e,
+                                                    "R3: format instruction landing failed (best-effort)——G-7 divergence, doctor flags"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let serde_messages = match serde_json::to_value(&messages_to_send) {
                                     Ok(v) => v,
                                     Err(e) => {
@@ -5575,13 +5624,123 @@ impl AgentRunner {
                                     }
                                 }
 
-                                // 持久化 assistant 消息(同 handle_call_external)
-                                let assistant_idx = messages.len();
-                                let assistant_msg = Message::Assistant {
-                                    content: full_content.clone(),
-                                    tool_calls: full_tool_calls.clone(),
-                                };
-                                messages.push(assistant_msg.clone());
+                                                                // ===== ReAct 分叉:有 tool_calls → 本地执行回喂;无 → 提交收尾 =====
+                                let has_tool_calls = full_tool_calls
+                                    .as_ref()
+                                    .map(|tcs| !tcs.is_empty())
+                                    .unwrap_or(false);
+
+// 持久化 assistant 消息(同 handle_call_external)
+                                                                // G11(S1 双路径收敛):无 tool_calls 收尾前做结构化输出
+                                                                // 校验——语义与非流式 run() :3365 完全一致:
+                                                                // clean→validate→失败推原始 assistant+System 校正消息
+                                                                // →continue 'react 重试;重试耗尽降级接受 cleaned
+                                                                // (fail-visible,不毁回合)。注意:仅收尾轮校验;
+                                                                // 中间轮(tool_calls 在场)不校验,同 run() 行为。
+                                                                let g11_validated_content: String = if has_tool_calls {
+                                                                    // 中间轮(工具调用在场):不校验,原样透传——同 run() 行为
+                                                                    full_content.clone()
+                                                                } else {
+                                                                    let validation_outcome =
+                                                                        if let Some(validator) = &runner.output_validator {
+                                                                            let cleaned =
+                                                                                validator.clean_output(&full_content);
+                                                                            let max_retries = validator.max_retries();
+                                                                            let result = validator.validate(&cleaned);
+                                                                            Some((cleaned, result, max_retries))
+                                                                        } else {
+                                                                            None
+                                                                        };
+                                                                    match validation_outcome {
+                                                                        None => full_content.clone(),
+                                                                        Some((cleaned, Ok(()), _)) => {
+                                                                            runner.output_format_retries = 0;
+                                                                            cleaned
+                                                                        }
+                                                                        Some((cleaned, Err(err_msg), max_retries)) => {
+                                                                            if runner.output_format_retries < max_retries {
+                                                                                runner.output_format_retries += 1;
+                                                                                let retry_count = runner.output_format_retries;
+                                                                                // 推原始(未清洗) assistant 到审计链
+                                                                                let a_idx = messages.len();
+                                                                                let a_msg = Message::Assistant {
+                                                                                    content: full_content.clone(),
+                                                                                    tool_calls: None,
+                                                                                };
+                                                                                messages.push(a_msg.clone());
+                                                                                if let Err(pe) = runner
+                                                                                    .persist_message(&session_id, a_idx, a_msg)
+                                                                                    .await
+                                                                                {
+                                                                                    if let Some(rid) = request_id {
+                                                                                        let pe_str = pe.to_string();
+                                                                                        let _ = runner.evorule_client
+                                                                                            .submit_io_response(
+                                                                                                &session_id,
+                                                                                                rid,
+                                                                                                &serde_json::json!({"error": &pe_str}),
+                                                                                                Some(pe_str.as_str()),
+                                                                                            )
+                                                                                            .await;
+                                                                                    }
+                                                                                    yield Err(pe);
+                                                                                    return;
+                                                                                }
+                                                                                // 推 System 校正消息(同 run() 模板)
+                                                                                let c_idx = messages.len();
+                                                                                let c_msg = Message::System {
+                                                                                    content: format!(
+                                                                                        "你的上一次输出不符合要求的格式。校验错误:\n{}\n\n\
+                                                                                         请重新输出,严格符合 JSON Schema 要求,不要包含 markdown 代码块标记。",
+                                                                                        err_msg
+                                                                                    ),
+                                                                                };
+                                                                                messages.push(c_msg.clone());
+                                                                                if let Err(pe) = runner
+                                                                                    .persist_message(&session_id, c_idx, c_msg)
+                                                                                    .await
+                                                                                {
+                                                                                    if let Some(rid) = request_id {
+                                                                                        let pe_str = pe.to_string();
+                                                                                        let _ = runner.evorule_client
+                                                                                            .submit_io_response(
+                                                                                                &session_id,
+                                                                                                rid,
+                                                                                                &serde_json::json!({"error": &pe_str}),
+                                                                                                Some(pe_str.as_str()),
+                                                                                            )
+                                                                                            .await;
+                                                                                    }
+                                                                                    yield Err(pe);
+                                                                                    return;
+                                                                                }
+                                                                                info!(
+                                                                                    %session_id,
+                                                                                    retry = retry_count,
+                                                                                    max_retries,
+                                                                                    "G11(streaming): output validation failed, requesting LLM retry"
+                                                                                );
+                                                                                continue 'react;
+                                                                            } else {
+                                                                                info!(
+                                                                                    %session_id,
+                                                                                    max_retries,
+                                                                                    "G11(streaming): max retries exhausted, accepting degraded output"
+                                                                                );
+                                                                                runner.output_format_retries = 0;
+                                                                                cleaned
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                };
+                                                                let full_content = g11_validated_content;
+
+                                                                let assistant_idx = messages.len();
+                                                                let assistant_msg = Message::Assistant {
+                                                                    content: full_content.clone(),
+                                                                    tool_calls: full_tool_calls.clone(),
+                                                                };
+                                                                messages.push(assistant_msg.clone());
                                 if let Err(e) = runner.persist_message(&session_id, assistant_idx, assistant_msg).await {
                                     // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                     if let Some(rid) = request_id {
@@ -5598,10 +5757,6 @@ impl AgentRunner {
                                 }
 
                                 // ===== ReAct 分叉:有 tool_calls → 本地执行回喂;无 → 提交收尾 =====
-                                let has_tool_calls = full_tool_calls
-                                    .as_ref()
-                                    .map(|tcs| !tcs.is_empty())
-                                    .unwrap_or(false);
                                 if has_tool_calls {
                                     // 有 tool_calls:本地执行每个工具(审批/缓存经 helper),
                                     // tool 消息入列后 continue 'react 发起回喂轮

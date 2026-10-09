@@ -1,0 +1,36 @@
+{
+  "agent_type": "l1-g11-retry",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "S1 G11 retry-loop probe: force validation failure then correction",
+  "model": "MiniMax-M2.5",
+  "context_window_tokens": 200000,
+  "max_steps": 8,
+  "system_prompt": "你是测试代理。不要调用任何工具。直接回答:你好。回答必须是一句纯中文文本,禁止任何 JSON、大括号、引号包裹。",
+  "temperature": 0.3,
+  "step_timeout_secs": 120,
+  "output_format": {
+    "type": "json",
+    "schema": {
+      "type": "object",
+      "required": [
+        "zzz_nonexistent_field"
+      ],
+      "properties": {
+        "zzz_nonexistent_field": {
+          "type": "integer"
+        }
+      }
+    },
+    "max_retries": 2
+  },
+  "memory": {
+    "type": "persistent",
+    "namespace": "l1-g11-retry",
+    "summary_model": "MiniMax-M2.5"
+  },
+  "tools": [
+    "file_read",
+    "file_list"
+  ]
+}
