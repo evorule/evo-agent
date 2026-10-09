@@ -2329,6 +2329,11 @@ impl AgentRunner {
                 if let Err(e) = self.flush_messages(&session_id).await {
                     tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                 }
+                // 条 6(25 号档):取消路径补 sediment——代谢出口堵洞。已发生
+                // 的对话/事件/usage 不随取消流失(best-effort,与 Error 路径同款)
+                if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
+                    tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                }
                 self.submit_tool_traces(&session_id).await;
                 let duration = start_time.elapsed().as_millis() as u64;
                 return Ok(AgentResult::cancelled(
@@ -2607,6 +2612,11 @@ impl AgentRunner {
         // 流关闭前也尝试刷写
         if let Err(e) = self.flush_messages(&session_id).await {
             tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+        }
+        // 条 6(25 号档):断流路径补 sediment——网络/引擎断流不吞已捕获的
+        // 会话经验(与 Stable 正常收尾同款 best-effort)
+        if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
+            tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
         }
         self.submit_tool_traces(&session_id).await;
         // D-01 二次保险（B2）：断流可能吞掉 Violation 帧，查 evolution-signals
@@ -5175,6 +5185,10 @@ impl AgentRunner {
                         if let Err(e) = runner.flush_messages(&session_id).await {
                             tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                         }
+                        // 条 6(25 号档):取消路径补 sediment(流式镜像)
+                        if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                        }
                         runner.submit_tool_traces(&session_id).await;
                         let duration = start_time.elapsed().as_millis() as u64;
                         // B21:turn_ended(cancelled)
@@ -6481,6 +6495,10 @@ impl AgentRunner {
             let duration = start_time.elapsed().as_millis() as u64;
             if let Err(e) = runner.flush_messages(&session_id).await {
                             tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                        }
+            // 条 6(25 号档):断流路径补 sediment(流式镜像)
+            if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
                         }
             runner.submit_tool_traces(&session_id).await;
             // B21:turn_ended(error)
