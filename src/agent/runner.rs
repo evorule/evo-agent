@@ -967,6 +967,34 @@ impl crate::agent::pipeline::PipelineExecutor for AgentRunner {
     }
 }
 
+/// 悬挂工具处置动作(L1 分类路由)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DanglingAction {
+    /// 幂等读类:经管道重执行,回喂真实结果(无损恢复)
+    Reexecute,
+    /// 幂等写/非幂等:不盲重执行,回喂崩溃观察(LLM 自行决定重试)
+    CrashObservation,
+}
+
+/// 悬挂处置报告(恢复标记 rebuilt 清单的数据源)
+#[derive(Debug, Clone, Copy, Default)]
+struct DanglingRepairReport {
+    dangling: usize,
+    reexecuted: usize,
+    observed: usize,
+}
+
+/// 会话流式入口的恢复模式(react 面恢复语义的载体)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryMode {
+    /// 全新会话(既有 run_streaming 语义)
+    Fresh,
+    /// 多轮续跑(既有 run_continuation 语义;要求新 user 输入)
+    Continuation,
+    /// 崩溃恢复(resume_crashed;无新输入,悬挂工具处置后续完当前 turn)
+    CrashResume,
+}
+
 impl AgentRunner {
     /// TODO: doc
     pub fn new(config: AgentConfig, evorule_client: EvoruleApiClient) -> Self {
@@ -4519,6 +4547,114 @@ impl AgentRunner {
         Ok(rewind_version)
     }
 
+    /// 悬挂工具处置计划(纯函数):定位历史尾部未配对的 assistant tool_calls。
+    /// 判定:最后一个带非空 tool_calls 的 assistant 之后无任何 Tool 消息=
+    /// 该批 calls 全部悬挂(按 L1 幂等分类路由);有 Tool 跟随=视作已配对
+    /// (并行部分完成的边角留待后续精化)。返回 (工具名, 参数, 动作) 列表。
+    fn plan_dangling_repair(
+        messages: &[Message],
+    ) -> Vec<(String, serde_json::Value, DanglingAction)> {
+        let mut last_calls: Option<&Vec<crate::agent::translator::ToolCall>> = None;
+        for m in messages.iter() {
+            if let Message::Assistant {
+                tool_calls: Some(calls),
+                ..
+            } = m
+            {
+                if !calls.is_empty() {
+                    last_calls = Some(calls);
+                }
+            }
+        }
+        let Some(calls) = last_calls else {
+            return Vec::new();
+        };
+        // 尾部配对检查:最后一个 tool_calls assistant 之后不能再有 Tool 消息
+        let last_assistant_idx = messages
+            .iter()
+            .rposition(
+                |m| matches!(m, Message::Assistant { tool_calls: Some(c), .. } if !c.is_empty()),
+            )
+            .unwrap_or(0);
+        if messages[last_assistant_idx + 1..]
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. }))
+        {
+            return Vec::new();
+        }
+        calls
+            .iter()
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    c.arguments.clone(),
+                    match crate::agent::tool_retry::retry_class(&c.name) {
+                        crate::agent::tool_retry::RetryClass::IdempotentRead => {
+                            DanglingAction::Reexecute
+                        }
+                        _ => DanglingAction::CrashObservation,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// 悬挂工具处置执行(恢复面):按 [`Self::plan_dangling_repair`] 的计划逐
+    /// call 处置——幂等读经既有管道重执行(治理面全程在闸),结果与观察均作为
+    /// Tool 消息回填历史并持久化(transcript 权威面同步),历史配对自此完整。
+    async fn repair_dangling_tail(
+        &mut self,
+        session_id: &str,
+        messages: &mut Vec<Message>,
+        journal: Option<&crate::agent::journal::JournalWriter>,
+    ) -> Result<DanglingRepairReport, String> {
+        let plan = Self::plan_dangling_repair(messages);
+        let mut report = DanglingRepairReport::default();
+        for (name, arguments, action) in plan {
+            report.dangling += 1;
+            let content = match action {
+                DanglingAction::Reexecute => {
+                    match self
+                        .execute_tool_call_gated(session_id, &name, &arguments, journal, None)
+                        .await
+                    {
+                        Ok((result, _)) => {
+                            report.reexecuted += 1;
+                            truncate_tool_result(result.to_string(), self.tool_result_max_chars)
+                        }
+                        Err(e) => {
+                            report.observed += 1;
+                            serde_json::json!({
+                                "status": "error",
+                                "error": "process crashed before this tool executed; re-issue if needed",
+                                "retry_error": e.to_string(),
+                            })
+                            .to_string()
+                        }
+                    }
+                }
+                DanglingAction::CrashObservation => {
+                    report.observed += 1;
+                    serde_json::json!({
+                        "status": "error",
+                        "error": "process crashed before this tool executed; re-issue if needed",
+                    })
+                    .to_string()
+                }
+            };
+            let msg = Message::Tool {
+                content,
+                tool_name: name,
+            };
+            let idx = messages.len();
+            messages.push(msg.clone());
+            self.persist_message(session_id, idx, msg)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(report)
+    }
+
     /// G15:从 evorule payload 加载历史消息(continuation 模式用)
     ///
     /// 路径:`payload["__memory__"][namespace]["session_{session_id}"]["messages"]`
@@ -4661,13 +4797,36 @@ impl AgentRunner {
     /// - 不支持 delegate_context(子 agent 委托时改用 `run()`)
     /// - 消息持久化在流式下仍走 `persist_message`,`PerReactRound` 模式适配流式
     ///   (在 IoRequest 处理前批量 flush,而非每 delta 后 flush)
+
+    /// 崩溃恢复入口(react 面):无新输入——加载历史(权威面=evorule payload)
+    /// → 悬挂工具处置(L1 分类路由:幂等读经管道重执行回喂真结果,写类回喂
+    /// 崩溃观察)→ 发射恢复标记 → LLM 自然续完当前 turn。恢复路径的 journal
+    /// 重开自动触发尾部悬挂检测补写(账面序列=崩溃标记→恢复标记)。
+    pub fn resume_crashed(
+        self,
+        session_id: String,
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
+        let callbacks = self.event_callbacks.clone();
+        let inner =
+            self.run_streaming_inner(String::new(), Some(session_id), RecoveryMode::CrashResume);
+        Box::pin(async_stream::stream! {
+            let mut inner = inner;
+            while let Some(result) = inner.next().await {
+                if let Ok(ref event) = result {
+                    callbacks.dispatch(event).await;
+                }
+                yield result;
+            }
+        })
+    }
+
     pub fn run_streaming(
         self,
         goal: String,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         // G18:提取回调链(Arc clone),在 inner stream 之外包装 dispatch
         let callbacks = self.event_callbacks.clone();
-        let inner = self.run_streaming_inner(goal, None);
+        let inner = self.run_streaming_inner(goal, None, RecoveryMode::Fresh);
         Box::pin(async_stream::stream! {
             let mut inner = inner;
             while let Some(result) = inner.next().await {
@@ -4700,7 +4859,8 @@ impl AgentRunner {
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         // G18:提取回调链(Arc clone),在 inner stream 之外包装 dispatch
         let callbacks = self.event_callbacks.clone();
-        let inner = self.run_streaming_inner(user_input, Some(session_id));
+        let inner =
+            self.run_streaming_inner(user_input, Some(session_id), RecoveryMode::Continuation);
         Box::pin(async_stream::stream! {
             let mut inner = inner;
             while let Some(result) = inner.next().await {
@@ -4723,6 +4883,7 @@ impl AgentRunner {
         self,
         goal: String,
         existing_session_id: Option<String>,
+        recovery: RecoveryMode,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         Box::pin(stream! {
             let mut runner = self;
@@ -4889,6 +5050,19 @@ impl AgentRunner {
             // (与 run() 同钩位补挂——此前流式路径漏挂,handover 工具在 serve
             // 流式会话恒 unwired;journal 在手后透传,派生/停链语义事件可落账)
             runner.register_session_scoped_handover_tools(&session_id, journal.clone());
+            // 崩溃恢复 server 侧预检:崩溃早于首轮落账的会话在 server 无状态
+            // 文档(get_state 404)——无进展可保,显式指引重发,而非裸 404。
+            // 预检在 journal 开立之后:崩溃标记已补写,拒绝恢复的会话以
+            // crashed 态自我排除出扫尾列表(账面诚实)
+            if recovery == RecoveryMode::CrashResume {
+                if let Err(e) = runner.evorule_client.get_state(&session_id).await {
+                    yield Err(AgentError::Internal(format!(
+                        "crash recovery: no server-side state for session '{session_id}'                          (crash before first round persist) - nothing to recover, start a                          fresh run: {e}"
+                    )));
+                    return;
+                }
+            }
+
             // turn_started(轮顶;turn_seq 按 journal 内既有轮数递增,G15 续跑同文件续轮)。
             // turn_guard 保证所有终止路径(优雅显式 end / 异常 drop 补写 aborted)轮界闭合。
             let mut turn_guard = match &journal {
@@ -5069,6 +5243,58 @@ impl AgentRunner {
                         warn!(%session_id, error = %e, "G15: failed to load historical messages, starting fresh");
                     }
                 }
+
+                if recovery == RecoveryMode::CrashResume {
+                    // 崩溃恢复:历史缺失=无可恢复对象(显式失败);悬挂工具处置
+                    // (L1 分类路由)+恢复标记发射(崩溃标记已随 journal 重开补写,
+                    // 账面序列=崩溃标记→恢复标记)
+                    if messages.is_empty() {
+                        yield Err(AgentError::Internal(format!(
+                            "crash recovery: session '{session_id}' has no recoverable history"
+                        )));
+                        return;
+                    }
+                    match runner
+                        .repair_dangling_tail(&session_id, &mut messages, journal.as_deref())
+                        .await
+                    {
+                        Ok(report) => {
+                            info!(
+                                %session_id,
+                                dangling = report.dangling,
+                                reexecuted = report.reexecuted,
+                                observed = report.observed,
+                                "crash recovery: dangling tool tail repaired"
+                            );
+                            if let Some(j) = journal.as_ref() {
+                                let replay_seq = j
+                                    .read_lines()
+                                    .map(|ls| ls.last().map(|l| l.seq).unwrap_or(0))
+                                    .unwrap_or(0);
+                                if let Err(e) = j.session_resumed(
+                                    replay_seq,
+                                    vec![
+                                        format!("messages:{}", messages.len()),
+                                        format!(
+                                            "dangling_tools:{} reexecuted:{} observed:{}",
+                                            report.dangling, report.reexecuted, report.observed
+                                        ),
+                                        "pending_approvals:lost".to_string(),
+                                        "runaway_counters:reset".to_string(),
+                                    ],
+                                ) {
+                                    warn!(%session_id, error = %e, "crash recovery: resumed marker write failed");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(AgentError::Internal(format!(
+                                "crash recovery: dangling tail repair failed: {e}"
+                            )));
+                            return;
+                        }
+                    }
+                }
             }
 
             if messages.is_empty() {
@@ -5084,14 +5310,17 @@ impl AgentRunner {
                     }
                 }
             }
-            let user_idx = messages.len();
-            messages.push(Message::User { content: goal.clone() });
-            if let Err(e) = runner
-                .persist_message(&session_id, user_idx, Message::User { content: goal.clone() })
-                .await
-            {
-                yield Err(e);
-                return;
+            // 崩溃恢复不注入新 user 输入:悬挂处置完毕后 LLM 自然续完当前 turn
+            if recovery != RecoveryMode::CrashResume {
+                let user_idx = messages.len();
+                messages.push(Message::User { content: goal.clone() });
+                if let Err(e) = runner
+                    .persist_message(&session_id, user_idx, Message::User { content: goal.clone() })
+                    .await
+                {
+                    yield Err(e);
+                    return;
+                }
             }
 
             // 8. SSE 事件循环(同 run(),但 call_external 分支用 execute_stream)
