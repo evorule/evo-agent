@@ -2686,11 +2686,17 @@ impl MemoryManager {
                 count = pending.len(),
                 "usage flush: no LexStore——增量仅本地保留,不回写"
             );
+            // 回滚:增量原样归还 pending(下轮 flush 重试;修复前 drain 后即返回,增量丢失)
+            let mut map = self.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
+            for (fact_id, inc) in &pending {
+                *map.entry(*fact_id).or_insert(0) += *inc;
+            }
             return;
         };
         let fact_ids: Vec<u64> = pending.iter().map(|(f, _)| *f).collect();
         let paths = store.paths_by_fact_ids(&fact_ids);
         let mut batch: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut batched: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for (fact_id, inc) in &pending {
             let Some(path) = paths.get(fact_id) else {
                 tracing::warn!(fact_id, "usage flush: path 未定位,跳过该条");
@@ -2718,7 +2724,10 @@ impl MemoryManager {
                 rec.confidence = rec.confidence.map(|c| (c + delta).clamp(0.0, 1.0));
             }
             match serde_json::to_value(&*rec) {
-                Ok(v) => batch.push((path.clone(), v)),
+                Ok(v) => {
+                    batch.push((path.clone(), v));
+                    batched.insert(*fact_id);
+                }
                 Err(e) => tracing::warn!(fact_id, error = %e, "usage flush: 序列化失败,跳过该条"),
             }
         }
@@ -2731,8 +2740,16 @@ impl MemoryManager {
             .update_payloads_batch(session_id, &batch)
             .await
         {
-            tracing::warn!(session_id = %session_id, error = %e, "usage flush batch failed;增量保留于 cache,下轮重试");
-            // 回滚 pending(把 batch 内容重新登记,保下次重试)——简化:失败即放弃本轮增量(诚实降级)
+            tracing::warn!(session_id = %session_id, error = %e, "usage flush batch failed;增量回滚 pending,下轮重试");
+            // 回滚:已入 batch 的增量原样归还 pending(下轮 flush 重试;修复前
+            // 已 drain 的增量被静默丢弃,与保留语义相悖)。cache 镜像本次已先
+            // 累加——真相在 evorule,镜像漂移由 B3 对账补偿,不在此处逆向回退。
+            let mut map = self.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
+            for (fact_id, inc) in &pending {
+                if batched.contains(fact_id) {
+                    *map.entry(*fact_id).or_insert(0) += *inc;
+                }
+            }
         }
     }
 
@@ -6380,6 +6397,62 @@ mod tests {
             "佐证演化 0.5+0.05×0.5=0.525, got {}",
             after.confidence.unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_flush_usage_no_lexstore_rolls_back_pending() {
+        // 回滚语义:无 LexStore 分支修复前 drain 后即返回,增量静默丢失;
+        // 修复后增量归还 pending(下轮 flush 重试)
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        mgr.set_session_id("s1");
+        mgr.usage_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(7, 3);
+        mgr.flush_usage("s1").await;
+        assert_eq!(
+            mgr.usage_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&7),
+            Some(&3),
+            "无 LexStore 增量回滚 pending(下轮重试)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_usage_http_failure_rolls_back_batched() {
+        // 回滚语义:HTTP 失败分支修复前已 drain 的增量被丢弃(与保留语义相悖);
+        // 修复后已入 batch 的增量归还 pending。client 不可达 → batch 必失败。
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        mgr.set_session_id("s1");
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::agent::lexstore::LexStore::open(&dir.path().join("lex.db")).unwrap();
+        store
+            .replace_partition(
+                "shared.ns.events.",
+                &[(1, "shared.ns.events.e1".to_string(), serde_json::json!({}))],
+            )
+            .unwrap();
+        mgr.set_lex_store(std::sync::Arc::new(store));
+        let mut rec = MemoryRecord::new("events.e1", "v", 1);
+        rec.fact_id = Some(1);
+        mgr.cache.insert("shared::events.e1".to_string(), rec);
+        mgr.usage_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(1, 3);
+        mgr.flush_usage("s1").await;
+        assert_eq!(
+            mgr.usage_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&1),
+            Some(&3),
+            "HTTP 失败增量回滚 pending(下轮重试)"
+        );
+        let after = mgr.cache.get("shared::events.e1").unwrap();
+        assert_eq!(after.usage_count, 3, "cache 镜像本次已累加(漂移由 B3 对账)");
     }
 
     #[tokio::test]
