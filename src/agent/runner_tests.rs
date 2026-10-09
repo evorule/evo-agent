@@ -3640,3 +3640,40 @@ fn test_register_note_write_without_memory_errors() {
     let err = runner.register_memory_introspection_tools().unwrap_err();
     assert!(err.to_string().contains("note_write"), "{err}");
 }
+
+// ===== H1:连续回退预算状态机(25 号档 H1【高】——rewind 无界循环封顶)=====
+
+#[test]
+fn test_rewind_budget_decrement_and_exhaustion() {
+    // 32 次连续 Error 消费到 0;此后 consume()=false(熔断,fail-visible)
+    let mut b = RewindBudget::new(32);
+    for i in 0..32 {
+        assert!(b.consume(), "第 {} 次须放行", i + 1);
+    }
+    assert!(!b.consume(), "第 33 次须熔断");
+    assert!(!b.consume(), "熔断后持续 false(幂等)");
+    assert_eq!(b.remaining, 0);
+}
+
+#[test]
+fn test_rewind_budget_reset_on_progress() {
+    // 正常推进(StateTransition)清零复活——只罚连续失败,不罚间歇错误
+    let mut b = RewindBudget::new(32);
+    for _ in 0..31 {
+        assert!(b.consume());
+    }
+    assert!(b.consume(), "第 32 次仍放行");
+    b.reset(32);
+    assert!(b.consume(), "reset 后复活");
+    assert_eq!(b.remaining, 31);
+}
+
+#[test]
+fn test_rewind_budget_intermittent_errors_never_exhaust() {
+    // 间歇错误(Error→正常→Error→正常…)永不熔断——模拟 1000 轮混合流
+    let mut b = RewindBudget::new(32);
+    for i in 0..1000 {
+        assert!(b.consume(), "第 {} 轮 Error 须放行(前有正常推进)", i);
+        b.reset(32); // StateTransition 事件
+    }
+}
