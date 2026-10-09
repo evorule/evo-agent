@@ -4311,17 +4311,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_judge_command_host_direct() {
-        // 宿主直执行（None）：exit 0 / exit 7 语义（H2 门卫后:探针命令须在
-        // 白名单——用 echo + cmd 语义等价探针;exit 改经 sh -c 复合)
+        // 宿主直执行（None）：exit 0 / 非零退出透传语义（H2 门卫后:探针命令
+        // 须在白名单——用 echo + cmd 语义等价探针。非 Windows 用 sh -c "exit 7"
+        // 验证复合退出码;Windows 宿主通常无 sh,改用白名单内 where 对不存在
+        // 工具的确定性 exit 1 探针——透传机制同质,退出码值无关紧要）
         let out = run_judge_command("echo ok", None)
             .await
             .expect("echo 须成功 spawn");
         assert_eq!(out.status.code(), Some(0));
         assert!(String::from_utf8_lossy(&out.stdout).contains("ok"));
-        let out = run_judge_command("sh -c 'exit 7'", None)
-            .await
-            .expect("sh -c 复合须成功 spawn");
-        assert_eq!(out.status.code(), Some(7));
+        #[cfg(windows)]
+        {
+            let out = run_judge_command("where no-such-tool-9q8z7", None)
+                .await
+                .expect("where 须成功 spawn");
+            assert_eq!(out.status.code(), Some(1), "非零退出须透传");
+        }
+        #[cfg(not(windows))]
+        {
+            let out = run_judge_command("sh -c \"exit 7\"", None)
+                .await
+                .expect("sh -c 复合须成功 spawn");
+            assert_eq!(out.status.code(), Some(7), "非零退出须透传");
+        }
     }
 
     #[tokio::test]
