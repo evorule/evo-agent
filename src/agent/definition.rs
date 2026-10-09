@@ -547,6 +547,13 @@ pub struct AgentDefinition {
     /// 配对、永不合并存储。None = 不注入(既有 agent 零影响)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<HandoffPackage>,
+    /// 治理知识数据集声明(可选。None/空 = 不注入,既有定义零影响;声明后
+    /// runner 组装期实时拉取各数据集 Active 条目,经 S2b_knowledge 独立槽位
+    /// 自动注入 system prompt——声明即生效,不依赖调用方接线,任何 runner
+    /// 路径(serve/CLI/delegate 子代理)同口径。拉取 fail-soft:失败 warn
+    /// 跳过,绝不阻断会话)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_datasets: Option<Vec<String>>,
 }
 
 /// 交接底座包(上下文延续归一件:确定性包=底座,sidecar 摘要=语义面)。
@@ -1029,6 +1036,9 @@ impl AgentDefinition {
             i2_lexicon: self.i2_lexicon.clone(),
             // H3 时限预算直拷(数据化;None=不启用)
             wall_clock_budget_secs: self.wall_clock_budget_secs,
+            // 治理知识数据集声明直拷(声明面数据,同身份段口径——声明即生效;
+            // 拉取渲染在 runner 组装期做,运行时产物不进 definition)
+            knowledge_datasets: self.knowledge_datasets.clone(),
         }
     }
 }
@@ -1190,6 +1200,42 @@ mod tests {
         let def2 = AgentDefinition::load_from_dir(dir.path(), "plain").expect("load");
         assert_eq!(def2.wall_clock_budget_secs, None);
         assert_eq!(def2.to_agent_config().wall_clock_budget_secs, None);
+    }
+
+    /// 治理知识数据集声明:definition 解析 → AgentConfig 直拷;缺省 None=不注入
+    #[test]
+    fn test_knowledge_datasets_passthrough() {
+        let dir = make_tmp_dir();
+        // 声明即生效(直拷透传)
+        let json = r#"{
+            "agent_type": "kdecl",
+            "version": "1.0.0",
+            "description": "d",
+            "system_prompt": "s",
+            "model": "m",
+            "temperature": 0.5,
+            "max_steps": 5,
+            "step_timeout_secs": 30,
+            "tools": [],
+            "knowledge_datasets": ["tb-contracts"]
+        }"#;
+        write_json(dir.path(), "kdecl", json);
+        let def = AgentDefinition::load_from_dir(dir.path(), "kdecl").expect("load");
+        assert_eq!(
+            def.knowledge_datasets,
+            Some(vec!["tb-contracts".to_string()])
+        );
+        let cfg = def.to_agent_config();
+        assert_eq!(
+            cfg.knowledge_datasets,
+            Some(vec!["tb-contracts".to_string()]),
+            "直拷透传"
+        );
+        // 缺省 None(无字段=不注入,既有定义零影响)
+        write_json(dir.path(), "plain", &minimal_def_json());
+        let def2 = AgentDefinition::load_from_dir(dir.path(), "plain").expect("load");
+        assert_eq!(def2.knowledge_datasets, None);
+        assert_eq!(def2.to_agent_config().knowledge_datasets, None);
     }
 
     #[test]
@@ -1771,6 +1817,7 @@ mod tests {
             acceptance_command: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
+            knowledge_datasets: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
@@ -2116,6 +2163,7 @@ mod tests {
             acceptance_command: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
+            knowledge_datasets: None,
             max_parallel_tools: 1,
             capability_boundary: Some(CapabilityBoundary {
                 mode: mode.to_string(),
@@ -2279,6 +2327,7 @@ mod tests {
             acceptance_command: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
+            knowledge_datasets: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
@@ -2440,6 +2489,7 @@ mod tests {
             acceptance_command: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
+            knowledge_datasets: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,

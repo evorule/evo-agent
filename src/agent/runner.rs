@@ -29,7 +29,9 @@ use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
 /// F-302:组装策略版本——组装行为(分层方式/预算口径/记忆注入)的协议级版本标识。
 /// 版本变更=组装行为变更=历史重建需切版本（RL-B3 落地）。
 /// v2:组装路径由配方数据驱动(AssemblyExecutor 取代硬编码分层),配方三元落账链上。
-pub const ASSEMBLY_PROTOCOL_VERSION: &str = "assembly-v2";
+/// v3:S2b_knowledge 治理知识契约槽位加入(定义声明 knowledge_datasets 驱动,
+/// 组装期实时拉取渲染;新增槽位来源=执行器升级=major)。
+pub const ASSEMBLY_PROTOCOL_VERSION: &str = "assembly-v3";
 
 use crate::agent::acceptance::{apply_acceptance_gate, GateOutcome};
 use crate::agent::definition::{AgentDefinition, OutputFormat};
@@ -144,6 +146,10 @@ pub struct AgentConfig {
     /// 治理门禁段(S2 槽位内容物;serve 三路径构造期算好传入,CLI=None;
     /// L2 约束前馈/进化信号感知/规范入口索引 合并段,v2 序=权威紧跟 S1)
     pub governance_segment: Option<String>,
+    /// 治理知识数据集声明(声明面数据,definition 直拷;None/空 = 不注入 =
+    /// 既有定义零影响。拉取渲染在 runner 组装期做——build_knowledge_segment
+    /// fail-soft,产物进 S2b_knowledge 独立槽位,任何 runner 路径同口径)
+    pub knowledge_datasets: Option<Vec<String>>,
     /// I2 词表声明(数据化;None=机制内建 v2 双语表——context_inspector)
     pub i2_lexicon: Option<crate::agent::context_inspector::I2Lexicon>,
     /// 全局时限预算秒(H3 看门狗;None=不启用——既有定义零影响)
@@ -170,6 +176,7 @@ impl Default for AgentConfig {
             north_star: None,
             handoff: None,
             governance_segment: None,
+            knowledge_datasets: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
         }
@@ -2177,6 +2184,16 @@ impl AgentRunner {
             .capability_boundary
             .as_ref()
             .map(|b| b.awareness_segment());
+        // 治理知识契约段(S2b 槽位内容物;定义声明 knowledge_datasets 驱动,
+        // runner 内实时拉取渲染——声明即生效,任何 runner 路径同口径。
+        // fail-soft:数据集拉取失败 warn 跳过,绝不阻断会话)
+        let knowledge_segment = match self.config.knowledge_datasets.as_deref() {
+            Some(datasets) if !datasets.is_empty() => {
+                crate::api::serve_tools::build_knowledge_segment(&self.evorule_client, datasets)
+                    .await
+            }
+            _ => None,
+        };
         let system_prompt = self
             .assembly
             .assemble(
@@ -2190,6 +2207,7 @@ impl AgentRunner {
                 self.config.skills.as_deref(),
                 self.config.handoff.as_ref(),
                 self.config.governance_segment.as_deref(),
+                knowledge_segment.as_deref(),
             )
             .map_err(AgentError::Internal)?;
 
@@ -4823,6 +4841,18 @@ impl AgentRunner {
                 .capability_boundary
                 .as_ref()
                 .map(|b| b.awareness_segment());
+            // 治理知识契约段(S2b 槽位内容物;同 run() 组装点口径——定义声明
+            // 驱动+runner 内拉取+fail-soft,双路径一致性由代码结构保证)
+            let knowledge_segment = match runner.config.knowledge_datasets.as_deref() {
+                Some(datasets) if !datasets.is_empty() => {
+                    crate::api::serve_tools::build_knowledge_segment(
+                        &runner.evorule_client,
+                        datasets,
+                    )
+                    .await
+                }
+                _ => None,
+            };
             let system_prompt = match runner.assembly.assemble(
                 &runner.config.system_prompt,
                 runner.config.identity_segment.as_deref(),
@@ -4834,6 +4864,7 @@ impl AgentRunner {
                 runner.config.skills.as_deref(),
                 runner.config.handoff.as_ref(),
                 runner.config.governance_segment.as_deref(),
+                knowledge_segment.as_deref(),
             ) {
                 Ok(p) => p,
                 Err(e) => {

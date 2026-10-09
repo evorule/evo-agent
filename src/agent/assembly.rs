@@ -28,6 +28,7 @@ pub const DEFAULT_RECIPE_VERSION: &str = "recipe-v1.0";
 pub const SLOT_SOURCES: &[&str] = &[
     "definition.system_prompt",
     "governance_segment",
+    "knowledge_segment",
     "recall",
     "definition.capability_boundary.awareness_segment",
     "manifest",
@@ -213,6 +214,19 @@ fn default_slots() -> Vec<SlotSpec> {
         SlotSpec {
             id: "S2_governance".to_string(),
             source: "governance_segment".to_string(),
+            degradable: false,
+            optional: true,
+            enabled: true,
+            budget: None,
+            degradation_order: None,
+            sections: None,
+            separator: None,
+            role: None,
+            trim: None,
+        },
+        SlotSpec {
+            id: "S2b_knowledge".to_string(),
+            source: "knowledge_segment".to_string(),
             degradable: false,
             optional: true,
             enabled: true,
@@ -641,6 +655,8 @@ impl AssemblyExecutor {
     ///   扣除响应预留后作基数;显式 `base: total_window` 直接作基数=兼容口径)
     /// - `boundary_segment`:S4_boundary 源(None = 未声明边界,槽位跳过)
     /// - `skills`:S4b_skills 源(None/空 = 未声明技能,槽位跳过 = 历史行为)
+    /// - `knowledge_segment`:S2b_knowledge 源(None/空 = 未声明治理知识
+    ///   数据集,槽位跳过 = 既有定义零影响)
     ///
     /// Err 仅当配方声明了执行器不认识的预算基准(budget.base——validate 白名单
     /// 应已拦截,此处运行时兜底 fail-fast),不做静默降级。
@@ -656,6 +672,7 @@ impl AssemblyExecutor {
         skills: Option<&[crate::agent::definition::SkillManifestEntry]>,
         handoff: Option<&crate::agent::definition::HandoffPackage>,
         governance_segment: Option<&str>,
+        knowledge_segment: Option<&str>,
     ) -> Result<String, String> {
         let mut prompt = String::new();
         for slot in &self.recipe.slots {
@@ -682,6 +699,17 @@ impl AssemblyExecutor {
                 // 不可降级)。v2 序=权威最高者紧跟 S1 之后(装配序设计 §5.1)
                 "governance_segment" => {
                     if let Some(seg) = governance_segment {
+                        if !seg.trim().is_empty() {
+                            prompt.push_str("\n\n");
+                            prompt.push_str(seg);
+                        }
+                    }
+                }
+                // S2b_knowledge:治理知识契约段(runner 组装期按定义声明实时
+                // 拉取渲染;authority=治理知识条目,独立分区不可降级。None/
+                // 空 = 未声明数据集,槽位跳过 = 既有定义零影响)
+                "knowledge_segment" => {
+                    if let Some(seg) = knowledge_segment {
                         if !seg.trim().is_empty() {
                             prompt.push_str("\n\n");
                             prompt.push_str(seg);
@@ -754,6 +782,7 @@ impl AssemblyExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::memory::RecallContext;
 
     /// 等价迁移铁律的机械执行:Default 逐字段 = 现状硬编码值对照表
     /// （锚点:memory.rs ContextBudget::new/fit_recall/build_system_prompt_with_recall、
@@ -769,6 +798,7 @@ mod tests {
             [
                 "S1_base",
                 "S2_governance",
+                "S2b_knowledge",
                 "S3_memory",
                 "S4_boundary",
                 "S4b_skills",
@@ -782,8 +812,13 @@ mod tests {
         assert_eq!(s2.id, "S2_governance");
         assert!(!s2.degradable);
         assert!(s2.optional);
+        // S2b 治理知识契约:同 S2 形态(不可降级,缺席合法)
+        let s2b = &r.slots[2];
+        assert_eq!(s2b.id, "S2b_knowledge");
+        assert!(!s2b.degradable);
+        assert!(s2b.optional);
         // S3 记忆区:C3 默认 0.25 + clamp(0.1,0.5) + 降级序 stable>summaries>events + notices 置前
-        let s3 = &r.slots[2];
+        let s3 = &r.slots[3];
         assert_eq!(s3.source, "recall");
         assert!(s3.degradable);
         let b = s3.budget.as_ref().unwrap();
@@ -796,16 +831,16 @@ mod tests {
         );
         assert!(s3.sections.unwrap().notices_first);
         // S4 边界段:optional + "\n\n"
-        assert!(r.slots[3].optional);
-        assert_eq!(r.slots[3].separator.as_deref(), Some("\n\n"));
-        // S4b:B2 启用(optional + skills 未声明时跳过 = 预留期行为逐字节一致)
-        assert!(r.slots[4].enabled);
-        assert!(r.slots[3].optional);
+        assert!(r.slots[4].optional);
         assert_eq!(r.slots[4].separator.as_deref(), Some("\n\n"));
+        // S4b:B2 启用(optional + skills 未声明时跳过 = 预留期行为逐字节一致)
+        assert!(r.slots[5].enabled);
+        assert!(r.slots[4].optional);
+        assert_eq!(r.slots[5].separator.as_deref(), Some("\n\n"));
         // S5 任务:user 角色
-        assert_eq!(r.slots[5].role.as_deref(), Some("user"));
+        assert_eq!(r.slots[6].role.as_deref(), Some("user"));
         // S7 裁剪:KeepSystemKeepLast + buffer 5% + hint 15
-        let t = r.slots[7].trim.as_ref().unwrap();
+        let t = r.slots[8].trim.as_ref().unwrap();
         assert_eq!(t.strategy, "KeepSystemKeepLast");
         assert_eq!(t.buffer_pct, 5);
         assert_eq!(t.hint_budget_tokens, 15);
@@ -836,11 +871,77 @@ mod tests {
             .expect("default recipe must be valid");
     }
 
+    /// S2b_knowledge:治理知识契约槽位在位(默认配方;槽位序 S2 之后 S3 之前)
+    #[test]
+    fn test_default_recipe_contains_knowledge_slot() {
+        let recipe = AssemblyRecipe::default();
+        recipe.validate().expect("default recipe must be valid");
+        let ids: Vec<&str> = recipe.slots.iter().map(|s| s.id.as_str()).collect();
+        let s2 = ids.iter().position(|&i| i == "S2_governance").unwrap();
+        let s2b = ids.iter().position(|&i| i == "S2b_knowledge").unwrap();
+        let s3 = ids.iter().position(|&i| i == "S3_memory").unwrap();
+        assert!(
+            s2 < s2b && s2b < s3,
+            "S2b_knowledge must sit between S2 and S3, got: {ids:?}"
+        );
+    }
+
+    /// S2b_knowledge 渲染:Some → 紧随治理段之后;None → 槽位跳过(既有行为零变化)
+    #[test]
+    fn test_assemble_knowledge_segment_slot_order() {
+        let exec = AssemblyExecutor::default_executor();
+        let out = exec
+            .assemble(
+                "BASE",
+                None,
+                None,
+                None,
+                &RecallContext::default(),
+                0,
+                None,
+                None,
+                None,
+                Some("GOV"),
+                Some("KNOW"),
+            )
+            .unwrap();
+        assert!(out.starts_with("BASE"));
+        let gov = out.find("GOV").expect("governance segment present");
+        let know = out.find("KNOW").expect("knowledge segment present");
+        assert!(gov < know, "knowledge segment must follow governance segment");
+
+        // None → 槽位跳过(未声明数据集的既有定义零影响)
+        let out2 = exec
+            .assemble(
+                "BASE",
+                None,
+                None,
+                None,
+                &RecallContext::default(),
+                0,
+                None,
+                None,
+                None,
+                Some("GOV"),
+                None,
+            )
+            .unwrap();
+        assert!(out2.contains("GOV"));
+        assert!(!out2.contains("KNOW"));
+    }
+
     /// ratio 越声明 clamp 区间:fail-fast
     #[test]
     fn test_validate_rejects_ratio_out_of_clamp() {
         let mut r = AssemblyRecipe::default();
-        r.slots[2].budget.as_mut().unwrap().ratio = 0.9;
+        r.slots
+            .iter_mut()
+            .find(|s| s.id == "S3_memory")
+            .unwrap()
+            .budget
+            .as_mut()
+            .unwrap()
+            .ratio = 0.9;
         let err = r.validate().unwrap_err();
         assert!(err.contains("budget.ratio"), "got: {}", err);
     }
@@ -849,7 +950,14 @@ mod tests {
     #[test]
     fn test_validate_rejects_invalid_clamp() {
         let mut r = AssemblyRecipe::default();
-        r.slots[2].budget.as_mut().unwrap().clamp = [0.5, 0.1];
+        r.slots
+            .iter_mut()
+            .find(|s| s.id == "S3_memory")
+            .unwrap()
+            .budget
+            .as_mut()
+            .unwrap()
+            .clamp = [0.5, 0.1];
         assert!(r.validate().unwrap_err().contains("clamp"));
     }
 
@@ -874,7 +982,13 @@ mod tests {
     #[test]
     fn test_validate_rejects_unknown_degradation_layer() {
         let mut r = AssemblyRecipe::default();
-        r.slots[2].degradation_order.as_mut().unwrap()[0] = "chat_history".to_string();
+        r.slots
+            .iter_mut()
+            .find(|s| s.id == "S3_memory")
+            .unwrap()
+            .degradation_order
+            .as_mut()
+            .unwrap()[0] = "chat_history".to_string();
         assert!(r.validate().unwrap_err().contains("unknown layer"));
     }
 
@@ -882,7 +996,14 @@ mod tests {
     #[test]
     fn test_validate_rejects_unknown_trim_strategy() {
         let mut r = AssemblyRecipe::default();
-        r.slots[7].trim.as_mut().unwrap().strategy = "DropEverything".to_string();
+        r.slots
+            .iter_mut()
+            .find(|s| s.id == "S7_history")
+            .unwrap()
+            .trim
+            .as_mut()
+            .unwrap()
+            .strategy = "DropEverything".to_string();
         assert!(r.validate().unwrap_err().contains("trim.strategy"));
     }
 
@@ -1016,6 +1137,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1032,6 +1154,7 @@ mod tests {
                 Some(&mem),
                 &recall,
                 60,
+                None,
                 None,
                 None,
                 None,
@@ -1061,6 +1184,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1087,6 +1211,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(out_none, "base");
@@ -1100,6 +1225,7 @@ mod tests {
                 &Default::default(),
                 0,
                 Some("【能力边界声明】boundary"),
+                None,
                 None,
                 None,
                 None,
@@ -1118,6 +1244,7 @@ mod tests {
                 None,
                 &Default::default(),
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -1159,6 +1286,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1194,6 +1322,7 @@ mod tests {
                 Some(&skills),
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(out.starts_with("base\n\n"));
@@ -1223,6 +1352,7 @@ mod tests {
                 0,
                 Some("【能力边界声明】boundary"),
                 Some(&skills),
+                None,
                 None,
                 None,
             )
@@ -1260,6 +1390,7 @@ mod tests {
                 Some(&skills),
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1279,6 +1410,7 @@ mod tests {
                 0,
                 None,
                 Some(&[]),
+                None,
                 None,
                 None,
             )
@@ -1333,6 +1465,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         // 显式兼容口径(base=total_window,历史行为)
@@ -1352,6 +1485,7 @@ mod tests {
                 Some(&mem),
                 &recall,
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -1408,6 +1542,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         // 新配方:加载 → validate → 字段落位
@@ -1433,6 +1568,7 @@ mod tests {
                 None,
                 &Default::default(),
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -1537,6 +1673,7 @@ mod tests {
                 None,
                 Some(&handoff),
                 None,
+                None,
             )
             .unwrap();
         let stable_pos = out1
@@ -1559,6 +1696,7 @@ mod tests {
                 None,
                 Some(&handoff),
                 None,
+                None,
             )
             .unwrap();
         assert!(out2.contains("## Handoff Base"));
@@ -1573,6 +1711,7 @@ mod tests {
                 None,
                 &RecallContext::default(),
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -1673,6 +1812,7 @@ mod tests {
                 Some(&skills),
                 Some(&handoff),
                 None,
+                None,
             )
             .unwrap();
 
@@ -1713,6 +1853,7 @@ mod tests {
                 Some(&skills),
                 Some(&handoff),
                 Some(&governance),
+                None,
             )
             .unwrap();
 

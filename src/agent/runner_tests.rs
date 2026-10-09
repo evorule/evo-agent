@@ -154,7 +154,7 @@ fn test_effective_params_records_assembly_recipe_triple() {
 
     let command = runner.build_call_external_command("sys", "goal", None);
     let eff = &command["params"]["effective_params"];
-    assert_eq!(eff["assembly_protocol_version"], "assembly-v2");
+    assert_eq!(eff["assembly_protocol_version"], "assembly-v3");
     // 默认配方(AgentRunner::new → default_executor → recipe-v1.0)
     assert_eq!(eff["assembly_recipe_version"], "recipe-v1.0");
     let hash = eff["assembly_recipe_hash"].as_str().unwrap();
@@ -205,7 +205,7 @@ fn test_external_recipe_v1_1_recorded_on_wire() {
 
     let command = runner.build_call_external_command("sys", "goal", None);
     let eff = &command["params"]["effective_params"];
-    assert_eq!(eff["assembly_protocol_version"], "assembly-v2");
+    assert_eq!(eff["assembly_protocol_version"], "assembly-v3");
     assert_eq!(eff["assembly_recipe_version"], "recipe-v1.1");
     let hash = eff["assembly_recipe_hash"].as_str().unwrap();
     assert!(hash.starts_with("blake3:") && hash.len() == "blake3:".len() + 64);
@@ -677,6 +677,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         identity_segment: None,
         north_star: None,
         handoff: None,
+        knowledge_datasets: None,
     }
 }
 
