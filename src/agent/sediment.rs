@@ -606,7 +606,9 @@ pub(crate) async fn consolidate_knowledge_candidates(
             serde_json::Value::String(cfg.llm_model_id.clone()),
         );
         params_map.insert("temperature".to_string(), serde_json::json!(0.0));
-        params_map.insert("max_tokens".to_string(), serde_json::json!(1024));
+        // max_tokens: 1024 实测截断合并输出（Battle B r5 同族实录：候选 JSON
+        // 在 column 2267 EOF——知识候选/合并输出长于事件 JSON，4096 给足余量）
+        params_map.insert("max_tokens".to_string(), serde_json::json!(4096));
         params_map.insert(
             "messages".to_string(),
             serde_json::json!([
@@ -1149,7 +1151,9 @@ async fn extract_knowledge_candidates(
         "temperature".to_string(),
         serde_json::json!(0.0), // temperature=0 保证最大确定性（对齐事件提取）
     );
-    params_map.insert("max_tokens".to_string(), serde_json::json!(1024));
+    // max_tokens: 1024 同族截断风险（Battle B r5：候选提取 JSON 在 column 2267
+    // EOF）——知识候选五类提取输出较长，4096 给足余量
+    params_map.insert("max_tokens".to_string(), serde_json::json!(4096));
     params_map.insert(
         "messages".to_string(),
         serde_json::Value::Array(messages_vec),
@@ -1373,7 +1377,9 @@ async fn extract_and_store_events(
             Ok(None) => {}
             Err(e) => {
                 if e.contains("no event") {
-                    tracing::debug!(event_id = %event_id, "sediment: no event extracted");
+                    // info 级:LLM 判「无事件」是正常分支但需可观测（Battle B r6
+                    // 教训:debug 级静默导致任务对话被全判 none 长期无感）
+                    tracing::info!(event_id = %event_id, "sediment: no event extracted");
                 } else {
                     tracing::warn!(
                         error = %e,
