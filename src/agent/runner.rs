@@ -1248,6 +1248,16 @@ impl AgentRunner {
                     runner.sediment_config.enable_journal_digest = journal_digest;
                     runner.sediment_config.enable_failure_drafts = failure_drafts;
                     runner.sediment_config.enable_material_harvest = material_harvest;
+                    // 战役 B：任务域事件触发词穿线（Recipe sources.task_event_keywords
+                    // → extractor config.task_keywords；缺省空=既有 agent 零影响。
+                    // extract_from_conversation 内部复检 detect_trigger，
+                    // 故必须在 extractor config 层注入而非仅外层放行）
+                    if !recipe.sources.task_event_keywords.is_empty() {
+                        if let Some(extractor) = runner.extractor.as_mut() {
+                            extractor
+                                .set_task_keywords(recipe.sources.task_event_keywords.clone());
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "MemoryRecipe 解析失败——召回走词法 legacy 路径");

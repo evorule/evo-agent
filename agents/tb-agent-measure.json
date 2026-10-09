@@ -47,7 +47,7 @@
     "namespace": "tb-agent",
     "summary_model": "MiniMax-M2.5",
     "recipe": {
-      "recipe_version": "memory-v1.0",
+      "recipe_version": "memory-v1.1",
       "retrieval": {},
       "budget": {},
       "promote_gate": {
@@ -57,6 +57,9 @@
       },
       "lifecycle": {
         "confidence_evolution": true
+      },
+      "sources": {
+        "task_event_keywords": ["create", "write", "verify", "aggregate", "process", "task"]
       }
     }
   },
