@@ -193,6 +193,12 @@ pub enum JournalEvent {
         /// 协作标记会话 id(run 的治理身份;恢复必须复用同会话,全新标记
         /// 会话会让 phase 前置门误拦;None = 未启用标记)
         marks_session: Option<String>,
+        /// 原子粒记忆集(曾携带 atomic 标记的节点 id;原子性跨版本持续有效
+        /// ——replan 重产计划不带该字段,记忆集合补事实连续性;恢复不归零)
+        atomic_granules: Vec<String>,
+        /// 按节点重切计数(原子粒重切预算判定的跨版本累计输入;恢复不归零
+        /// ——归零=恢复 run 至多多切 N 次,预算面方差)
+        recut_counts: Vec<(String, u32)>,
         /// 当前版工作流全文(replan 产物源自非确定 LLM 输出,不落全文即不可
         /// 确定性重建——这是恢复面唯一的状态载体)
         cur_workflow: String,
@@ -786,6 +792,8 @@ impl JournalWriter {
         cur_canonical_hash: Option<String>,
         goal: Option<String>,
         marks_session: Option<String>,
+        atomic_granules: Vec<String>,
+        recut_counts: Vec<(String, u32)>,
         cur_workflow: &str,
     ) -> Result<u64, JournalError> {
         self.push(JournalEvent::PlanLoopCheckpointed {
@@ -796,6 +804,8 @@ impl JournalWriter {
             cur_canonical_hash,
             goal,
             marks_session,
+            atomic_granules,
+            recut_counts,
             cur_workflow: cur_workflow.to_string(),
         })
     }

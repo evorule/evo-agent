@@ -950,6 +950,7 @@ async fn run_agent(
 /// - 成功：`session_id` = marks_session（会话关联收口），`plan_stats` 透出七项；
 /// - 失败：与 react 路径执行失败同封套（HTTP 200 + success=false + error 原文），
 ///   消费者处理口径统一；marks_session 创建失败即断（fail-fast，留痕是硬义务）。
+///
 /// 扫尾查询:可恢复 run 列表(只读投影;恢复仅经显式 resume_session_id,
 /// 不自动续跑)。单文件读败跳过并告警——列表面健壮性优先。
 async fn list_resumable_runs(

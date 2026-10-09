@@ -115,17 +115,29 @@ def journal_events(path: Path) -> list[dict]:
     return out
 
 
-def newest_planrun_session() -> Optional[str]:
-    """最新 planrun-*.jsonl 的会话名（无则 None）"""
+def existing_planrun_sessions() -> set:
+    """当前全部 planrun 会话名（场景隔离基线：轮询只认本场景新增的会话）"""
+    if not SESSIONS_DIR.exists():
+        return set()
+    return {p.stem for p in SESSIONS_DIR.glob("planrun-*.jsonl")}
+
+
+def newest_planrun_session(exclude: Optional[set] = None) -> Optional[str]:
+    """最新 planrun-*.jsonl 的会话名（可排除既有集合；无则 None）"""
     if not SESSIONS_DIR.exists():
         return None
     candidates = sorted(
-        (p for p in SESSIONS_DIR.glob("planrun-*.jsonl")),
+        (p for p in SESSIONS_DIR.glob("planrun-*.jsonl") if p.stem not in (exclude or set())),
         key=lambda p: p.stat().st_mtime,
     )
     if not candidates:
         return None
     return candidates[-1].stem
+
+
+def journal_has_terminal(path: Path) -> bool:
+    """账本是否已落终态标记（已完成/已终断 run 不构成注入窗口）"""
+    return any(e.get("type") == "plan_loop_finished" for e in journal_events(path))
 
 
 def count_events(events: list[dict], kind: str) -> int:
@@ -145,38 +157,56 @@ def scenario_k(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
     proc_env = {**os.environ, **env}
     started_at = time.time()
 
-    # ① 首跑(后台):与场景 A 同一 plan-execute 工作流
+    # ① 首跑(后台):与场景 A 同一 plan-execute 工作流。
+    # 子进程输出落文件(不接 PIPE——tracing 日志量大,管道缓冲灌满后子进程
+    # 阻塞在写 stderr 上永不推进,注入窗口永不到达;落文件顺带成为证据)
+    evidence_dir = evidence_dir or REPO_ROOT / "data" / "e2e_evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    first_out = open(evidence_dir / "scenarioK_first_stdout.txt", "w", encoding="utf-8")
+    first_err = open(evidence_dir / "scenarioK_first_stderr.txt", "w", encoding="utf-8")
     proc = subprocess.Popen(
         [str(BINARY), "workflow", WORKFLOW_ID, "--plan-execute"],
         cwd=str(REPO_ROOT),
         env=proc_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=first_out,
+        stderr=first_err,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
     print(f"  ···  首跑已启动 pid={proc.pid}（等待执行中段窗口后强杀）")
 
-    # ② 轮询账本:v1 计划已物化 + ≥2 粒完成
+    # ② 轮询账本:本场景新增会话 + v1 计划已物化 + ≥2 粒完成 + 无终态
+    #(场景隔离:既有会话一律排除,防止旧 run 满足窗口造成假注入)
+    before = existing_planrun_sessions()
     sid: Optional[str] = None
     deadline = time.time() + POLL_TIMEOUT_SECS
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            print(f"  {RED}FAIL{RESET}  首跑在注入前自行退出（exit={proc.returncode}）")
+    try:
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                print(f"  {RED}FAIL{RESET}  首跑在注入前自行退出（exit={proc.returncode}）")
+                return False
+            sid = newest_planrun_session(exclude=before)
+            if sid:
+                journal_path = SESSIONS_DIR / f"{sid}.jsonl"
+                if not journal_has_terminal(journal_path):
+                    events = journal_events(journal_path)
+                    # ≥1 粒即可:run 账本自 plan v1 起(probe 不入账),首粒完成
+                    # =执行中段真实窗口;若按 v1 全粒数等,两粒工作流的窗口与
+                    # 自然完成瞬间重合,注入永远赶不上
+                    if count_events(events, "plan_loop_checkpointed") >= 1 and count_events(
+                        events, "node_checkpointed"
+                    ) >= 1:
+                        break
+                sid = None
+            time.sleep(POLL_INTERVAL_SECS)
+        else:
+            kill_hard(proc.pid)
+            print(f"  {RED}FAIL{RESET}  轮询超时（{POLL_TIMEOUT_SECS}s）未达注入窗口，已强杀")
             return False
-        sid = newest_planrun_session()
-        if sid:
-            events = journal_events(SESSIONS_DIR / f"{sid}.jsonl")
-            if count_events(events, "plan_loop_checkpointed") >= 1 and count_events(
-                events, "node_checkpointed"
-            ) >= 2:
-                break
-        time.sleep(POLL_INTERVAL_SECS)
-    else:
-        kill_hard(proc.pid)
-        print(f"  {RED}FAIL{RESET}  轮询超时（{POLL_TIMEOUT_SECS}s）未达注入窗口，已强杀")
-        return False
+    finally:
+        first_out.close()
+        first_err.close()
     window_secs = time.time() - started_at
     events = journal_events(SESSIONS_DIR / f"{sid}.jsonl")
     print(
@@ -315,13 +345,17 @@ def scenario_l(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
         print(f"  {RED}FAIL{RESET}  编译产物缺失: {BINARY}")
         return False
     proc_env = {**os.environ, **env}
+    evidence_dir = evidence_dir or REPO_ROOT / "data" / "e2e_evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
 
     def spawn_serve() -> subprocess.Popen:
+        # serve 输出落文件(不接 DEVNULL——健康检查失败时无据可查)
+        out = open(evidence_dir / "scenarioL_serve_stderr.log", "a", encoding="utf-8")
         return subprocess.Popen(
             [str(BINARY), "serve", "--workdir", str(REPO_ROOT),
              "--host", "127.0.0.1", "--port", str(SERVE_PORT), "--no-auth"],
             cwd=str(REPO_ROOT), env=proc_env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=out, stderr=out,
         )
 
     serve = spawn_serve()
@@ -348,7 +382,8 @@ def scenario_l(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
     )
     thread.start()
 
-    # ② 轮询注入窗口:v1 计划在账 + ≥1 粒完成
+    # ② 轮询注入窗口:本场景新增会话 + v1 计划在账 + ≥1 粒完成 + 无终态
+    before = existing_planrun_sessions()
     sid: Optional[str] = None
     deadline = time.time() + POLL_TIMEOUT_SECS
     while time.time() < deadline:
@@ -356,13 +391,16 @@ def scenario_l(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
             print(f"  {RED}FAIL{RESET}  run 在注入窗口前自行完成（无法注入）")
             kill_hard(serve.pid)
             return False
-        sid = newest_planrun_session()
+        sid = newest_planrun_session(exclude=before)
         if sid:
-            events = journal_events(SESSIONS_DIR / f"{sid}.jsonl")
-            if count_events(events, "plan_loop_checkpointed") >= 1 and count_events(
-                events, "node_checkpointed"
-            ) >= 1:
-                break
+            journal_path = SESSIONS_DIR / f"{sid}.jsonl"
+            if not journal_has_terminal(journal_path):
+                events = journal_events(journal_path)
+                if count_events(events, "plan_loop_checkpointed") >= 1 and count_events(
+                    events, "node_checkpointed"
+                ) >= 1:
+                    break
+            sid = None
         time.sleep(POLL_INTERVAL_SECS)
     else:
         kill_hard(serve.pid)
@@ -445,6 +483,12 @@ def main() -> int:
         default=None,
         help="stdout/stderr 证据落盘目录（可选）",
     )
+    parser.add_argument(
+        "--only",
+        choices=["K", "L"],
+        default=None,
+        help="只跑单个场景（调试用；缺省 K+L 全量）",
+    )
     args = parser.parse_args()
 
     print("plan-execute 中断恢复 E2E（真 kill 注入 + 显式恢复双跑；跨平台终止原语双形态）")
@@ -459,15 +503,11 @@ def main() -> int:
     if not SESSIONS_DIR.exists():
         print(f"  ···  账本目录不存在，首跑将创建: {SESSIONS_DIR}")
 
-    only = None
-    if "--only" in sys.argv:
-        only = sys.argv[sys.argv.index("--only") + 1]
-    if only == "L":
-        ok = scenario_l(env, args.evidence_dir)
-    else:
+    ok = True
+    if args.only in (None, "K"):
         ok = scenario_k(env, args.evidence_dir)
-        if only in (None, "L"):
-            ok = scenario_l(env, args.evidence_dir) and ok
+    if args.only in (None, "L") and (ok or args.only == "L"):
+        ok = scenario_l(env, args.evidence_dir) and ok
     print(f"\n{'=' * 60}")
     print(f"结果: {'ALL PASS' if ok else 'FAILED'}")
     return 0 if ok else 1
