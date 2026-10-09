@@ -2671,7 +2671,7 @@ impl MemoryManager {
     /// - 逐 fact_id:cache 镜像记录 usage_count 累加 + 状态升 Reinforced
     ///   (新版本事实,latest-wins);路径经 LexStore facts 表反查;
     /// - 无 LexStore/无镜像 → 本地计数保留,诚实降级(warn);
-    /// - 批量端点一次 HTTP(跨仓挂账二通路);全程 best-effort。
+    /// - 批量端点一次 HTTP(evorule-server POST /api/sessions/{id}/payloads 已建成);全程 best-effort。
     pub async fn flush_usage(&mut self, session_id: &str) {
         let pending: Vec<(u64, u32)> = {
             let mut map = self.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
@@ -2767,8 +2767,7 @@ impl MemoryManager {
         let mut to_promote: Vec<(String, String, MemoryRecord)> = Vec::new();
         let mut gated: Vec<(String, MemoryRecord)> = Vec::new();
         for rec in self.cache.values_mut() {
-            if rec.lifecycle_state.as_deref() == Some("Captured") && rec.key.starts_with("events.")
-            {
+            if rec.lifecycle_state.as_deref() == Some("Captured") && rec.key.contains(".events.") {
                 let conf = rec.confidence.unwrap_or(0.5);
                 if conf >= lc.promote_min_confidence && rec.usage_count >= lc.promote_min_uses {
                     if gate_enabled {
@@ -3606,12 +3605,13 @@ mod tests {
         let recipe = crate::agent::recipe::MemoryRecipe::default();
         let now = now_secs();
         // 高置信+高使用事件 → 应晋升
-        let mut hot = MemoryRecord::new("events.E-hot", "{\"conf\":1}", now);
-        hot.key = "events.E-hot".to_string();
+        let mut hot = MemoryRecord::new("shared.ns.events.E-hot", "{\"conf\":1}", now);
+        hot.key = "shared.ns.events.E-hot".to_string();
         hot.confidence = Some(0.9);
         hot.usage_count = 5;
         hot.lifecycle_state = Some("Captured".to_string());
-        mgr.cache.insert("shared::events.E-hot".to_string(), hot);
+        mgr.cache
+            .insert("shared::shared.ns.events.E-hot".to_string(), hot);
         // 闲置非 Captured → Archived
         let mut stale = MemoryRecord::new("stable.old", "v", now - 400 * 86400);
         stale.lifecycle_state = Some("Settled".to_string());
@@ -3621,7 +3621,7 @@ mod tests {
             mgr.apply_lifecycle_transitions("s1", &recipe).await;
         });
 
-        let promoted = mgr.cache.get("shared::events.E-hot").unwrap();
+        let promoted = mgr.cache.get("shared::shared.ns.events.E-hot").unwrap();
         assert_eq!(promoted.lifecycle_state, Some("Promoted".to_string()));
         // 晋升产生了 stable.llm.promoted 镜像事实
         let promoted_key = mgr
@@ -5504,6 +5504,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_gate_sees_captured_via_real_set_scoped_path() {
+        // 防再发(判据对齐):走真实 set_scoped 写入路径——key 含 ".events."
+        // (memory 工具 prefix_for 生产形态),落标 Captured 后晋升判据必须可见。
+        // 修复前判据用 starts_with("events."),与生产 key 形态(完整 path,
+        // shared. 开头)互斥,gate 永远无输入;测试手工注入掩盖了断裂。
+        let mut mgr = MemoryManager::new("ns", make_test_client());
+        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        recipe.lifecycle.promote_min_confidence = 0.5;
+        recipe.lifecycle.promote_min_uses = 0;
+        mgr.set_recipe(recipe);
+        mgr.set_session_id("s1");
+        let key = "shared.ns.events.e1";
+        let value = serde_json::json!({ "confidence": 0.8, "text": "合格候选" }).to_string();
+        // 持久化失败不阻断(cache 总是更新)——本测试只验证本地落标+判据可见性
+        let _ = mgr.set_scoped(MemoryScope::Shared, key, &value).await;
+        let rec = mgr
+            .cache
+            .values()
+            .find(|r| r.key == key)
+            .expect("written record must be cached");
+        assert_eq!(rec.lifecycle_state.as_deref(), Some("Captured"));
+        assert_eq!(rec.confidence, Some(0.8));
+        let recipe_snapshot = mgr.recipe.clone().unwrap_or_default();
+        mgr.apply_lifecycle_transitions("s1", &recipe_snapshot)
+            .await;
+        let rec = mgr
+            .cache
+            .values()
+            .find(|r| r.key == key)
+            .expect("record still cached");
+        assert_eq!(
+            rec.lifecycle_state.as_deref(),
+            Some("Promoted"),
+            "promotion must see Captured entries written via real set_scoped path"
+        );
+    }
+
+    #[tokio::test]
     async fn test_promote_gate_disabled_is_mechanical() {
         // 门控关(缺省)=机械复制既有行为:合格 Captured 直接 Promoted
         let mut mgr = MemoryManager::new("ns", make_test_client());
@@ -5511,16 +5549,17 @@ mod tests {
         recipe.lifecycle.promote_min_confidence = 0.5;
         recipe.lifecycle.promote_min_uses = 1;
         mgr.set_recipe(recipe);
-        let mut rec = MemoryRecord::new("events.e1", "合格候选", now_secs() - 3600);
+        let mut rec = MemoryRecord::new("shared.ns.events.e1", "合格候选", now_secs() - 3600);
         rec.lifecycle_state = Some("Captured".to_string());
         rec.confidence = Some(0.8);
         rec.usage_count = 3;
-        mgr.cache.insert("shared::events.e1".to_string(), rec);
+        mgr.cache
+            .insert("shared::shared.ns.events.e1".to_string(), rec);
         mgr.set_session_id("s1");
         let recipe_snapshot = mgr.recipe.clone().unwrap_or_default();
         mgr.apply_lifecycle_transitions("s1", &recipe_snapshot)
             .await;
-        let after = mgr.cache.get("shared::events.e1").unwrap();
+        let after = mgr.cache.get("shared::shared.ns.events.e1").unwrap();
         assert_eq!(after.lifecycle_state.as_deref(), Some("Promoted"));
     }
 
@@ -5535,23 +5574,24 @@ mod tests {
         recipe.promote_gate.enabled = true;
         recipe.promote_gate.dataset_id = Some("ds-gate".to_string());
         mgr.set_recipe(recipe);
-        let mut rec = MemoryRecord::new("events.e2", "门控候选", now_secs() - 3600);
+        let mut rec = MemoryRecord::new("shared.ns.events.e2", "门控候选", now_secs() - 3600);
         rec.lifecycle_state = Some("Captured".to_string());
         rec.confidence = Some(0.8);
         rec.usage_count = 3;
-        mgr.cache.insert("shared::events.e2".to_string(), rec);
+        mgr.cache
+            .insert("shared::shared.ns.events.e2".to_string(), rec);
         mgr.set_session_id("s1");
         let recipe_snapshot = mgr.recipe.clone().unwrap_or_default();
         mgr.apply_lifecycle_transitions("s1", &recipe_snapshot)
             .await;
-        let after = mgr.cache.get("shared::events.e2").unwrap();
+        let after = mgr.cache.get("shared::shared.ns.events.e2").unwrap();
         assert_eq!(
             after.lifecycle_state.as_deref(),
             Some("Captured"),
             "提议失败保持 Captured(fail-visible 留待下次批)"
         );
         assert!(
-            !mgr.cache.contains_key("shared::stable.llm.promoted.e2"),
+            !mgr.cache.keys().any(|k| k.contains("stable.llm.promoted")),
             "无凭据不写稳定副本"
         );
     }
@@ -5577,26 +5617,27 @@ mod tests {
         recipe.promote_gate.enabled = true;
         recipe.promote_gate.dataset_id = Some("ds-gate".to_string());
         mgr.set_recipe(recipe);
-        let mut rec = MemoryRecord::new("events.e3", "门控成功候选", now_secs() - 3600);
+        let mut rec = MemoryRecord::new("shared.ns.events.e3", "门控成功候选", now_secs() - 3600);
         rec.lifecycle_state = Some("Captured".to_string());
         rec.confidence = Some(0.8);
         rec.usage_count = 3;
-        mgr.cache.insert("shared::events.e3".to_string(), rec);
+        mgr.cache
+            .insert("shared::shared.ns.events.e3".to_string(), rec);
         mgr.set_session_id("s1");
         let recipe_snapshot = mgr.recipe.clone().unwrap_or_default();
         mgr.apply_lifecycle_transitions("s1", &recipe_snapshot)
             .await;
-        let after = mgr.cache.get("shared::events.e3").unwrap();
+        let after = mgr.cache.get("shared::shared.ns.events.e3").unwrap();
         assert_eq!(after.lifecycle_state.as_deref(), Some("Promoted"));
         assert!(
             after.tags.iter().any(|t| t.starts_with("governance:k-9")),
             "治理凭据 tag(入账回执 entry_id)"
         );
         // 稳定副本来源=治理门通道
-        // (键形态=key.replace(".events.",".") 既有语义;无前导点时保留 events 段)
+        // (键形态=key.replace(".events.",".") 既有语义;生产 key 的 .events. 段被替换)
         let stable = mgr
             .cache
-            .get("shared::stable.llm.promoted.events.e3")
+            .get("shared::stable.llm.promoted.shared.ns.e3")
             .unwrap();
         assert_eq!(stable.source.as_deref(), Some("system:promote-gated"));
         mock.assert_async().await;
