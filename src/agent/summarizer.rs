@@ -92,10 +92,34 @@ pub struct StableFactOut {
     /// 事实 key（如 "preferred_language"、"timezone"）
     pub key: String,
     /// 事实 value（如 "zh-CN"、"Asia/Shanghai"）
+    ///
+    /// 宽容反序列化：LLM 固有输出不确定性——Battle B r4 实测 MiniMax-M2.5
+    /// 输出 {"key": "max_response_time_ms", "value": 500}（数字而非字符串），
+    /// 严格 String 反序列化导致整条摘要解析失败（summary_written=false）。
+    /// 数字/布尔/null/嵌套值一律字符串化收纳。
+    #[serde(deserialize_with = "deserialize_flexible_string")]
     pub value: String,
     /// 置信度 0.0-1.0（LLM 自评，缺失时默认 0.0）
     #[serde(default)]
     pub confidence: f32,
+}
+
+/// 宽容字符串反序列化：string 原样，number/bool/null 字符串化，
+/// 数组/对象 serde_json 字符串化（LLM 输出类型漂移的兜底，
+/// 见 Battle B r4 stable_facts value=500 实录）
+fn deserialize_flexible_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let v = serde_json::Value::deserialize(deserializer)?;
+    Ok(match v {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    })
 }
 
 /// G10:摘要系统提示(中文,引导 LLM 生成结构化摘要)

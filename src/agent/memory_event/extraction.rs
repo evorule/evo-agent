@@ -320,7 +320,10 @@ impl EventExtractor {
             "temperature".to_string(),
             serde_json::json!(0.0), // temperature=0 保证最大确定性
         );
-        params_map.insert("max_tokens".to_string(), serde_json::json!(512));
+        // max_tokens: 512 实测不足以容纳完整事件 JSON（Battle B r4：
+        // MiniMax-M2.5 输出在第 34 列即 EOF——"EOF while parsing a string"），
+        // 2048 给足余量（事件 JSON 通常 <800 token）
+        params_map.insert("max_tokens".to_string(), serde_json::json!(2048));
         params_map.insert(
             "messages".to_string(),
             serde_json::Value::Array(messages_vec),
