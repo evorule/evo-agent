@@ -1673,14 +1673,16 @@ impl AgentRunner {
             let result =
                 sediment::sediment(&mut deps, &self.sediment_config, session_id, messages).await;
             if let Some(j) = journal {
-                let _ = j.sediment_performed(
+                if let Err(e) = j.sediment_performed(
                     result.summary_written,
                     result.stable_facts.clone(),
                     result.stable_facts_cache_only.clone(),
                     result.events.len(),
                     result.rollup_done,
                     result.knowledge_candidates.len(),
-                );
+                ) {
+                    warn!(%session_id, error = %e, "sediment_performed journal failed");
+                }
             }
             if !result.stable_facts_cache_only.is_empty() {
                 tracing::warn!(
@@ -1811,7 +1813,9 @@ impl AgentRunner {
         if let Some(store) = self.memory_event_store.as_mut() {
             store.set_session_id(&session_id);
             // best-effort 从 evorule 同步已有事件(HTTP 失败不阻塞)
-            let _ = store.sync_from_evorule().await;
+            if let Err(e) = store.sync_from_evorule().await {
+                tracing::warn!(session_id = %session_id, error = %e, "sync_from_evorule failed; memory event store may be incomplete");
+            }
         }
         // 修复(2026-09-29 实测):此前注释承诺"session_id 通过 set_session_id 设置"
         // 但从未调用 → sediment 写 Shared 域全部 SessionNotSet。
@@ -1961,14 +1965,17 @@ impl AgentRunner {
                             Err(e) => {
                                 if let Some(rid) = event.payload.get("id").and_then(|v| v.as_u64()) {
                                     let err_str = e.to_string();
-                                    let _ = self.evorule_client
+                                    if let Err(ie) = self.evorule_client
                                         .submit_io_response(
                                             &session_id,
                                             rid,
                                             &serde_json::json!({"error": &err_str}),
                                             Some(err_str.as_str()),
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (error) failed; io_request may hang on engine side");
+                                    }
                                 }
                                 if let Err(e) = self.flush_messages(&session_id).await {
                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
@@ -1981,14 +1988,17 @@ impl AgentRunner {
                             info!(%session_id, "Cancelled during io_request, cleaning up");
                             // 提交 error io_response 防止 evorule 卡死等 IoResponse
                             if let Some(rid) = event.payload.get("id").and_then(|v| v.as_u64()) {
-                                let _ = self.evorule_client
+                                if let Err(e) = self.evorule_client
                                     .submit_io_response(
                                         &session_id,
                                         rid,
                                         &serde_json::json!({"error": "cancelled"}),
                                         Some("cancelled"),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (cancel) failed; io_request may hang on engine side");
+                                }
                             }
                             if let Err(e) = self.flush_messages(&session_id).await {
                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
@@ -2027,7 +2037,9 @@ impl AgentRunner {
                     // 确保所有缓冲的消息都写入 evorule（EveryN/PerReactRound 模式）
                     self.flush_messages(&session_id).await?;
                     // C1:会话沉淀（best-effort，摘要+稳定事实→共享空间）
-                    let _ = self.sediment_session(&session_id, &messages, None).await;
+                    if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
+                        tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                    }
                     // R2-T04 链体积观测（B3）：会话收尾时 best-effort 查审计链长告警
                     self.check_chain_size(&session_id).await;
                     let state = self.evorule_client.get_state(&session_id).await?;
@@ -2127,7 +2139,9 @@ impl AgentRunner {
                         tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                     }
                     // C1:会话沉淀（best-effort，即使出错也尝试沉淀已收集的对话）
-                    let _ = self.sediment_session(&session_id, &messages, None).await;
+                    if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
+                        tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                    }
                     self.submit_tool_traces(&session_id).await;
                     return Ok(AgentResult::error(
                         error_msg.to_string(),
@@ -2155,7 +2169,9 @@ impl AgentRunner {
                     if let Err(e) = self.flush_messages(&session_id).await {
                         tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                     }
-                    let _ = self.sediment_session(&session_id, &messages, None).await;
+                    if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
+                        tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                    }
                     self.submit_tool_traces(&session_id).await;
                     let duration = start_time.elapsed().as_millis() as u64;
                     return Ok(AgentResult::error(
@@ -4164,7 +4180,9 @@ impl AgentRunner {
                 });
 
                 // 3. auto_recall(best-effort,不阻塞流)
-                let _ = runner.auto_recall(&session_id).await;
+                if let Err(e) = runner.auto_recall(&session_id).await {
+                    tracing::warn!(session_id = %session_id, error = %e, "auto_recall failed; session continues without recalled facts");
+                }
             }
 
             // 5. 订阅 SSE(必须在 submit_command 之前,否则错过 io_request)
@@ -4331,9 +4349,12 @@ impl AgentRunner {
                                             ));
                                             if let Some(rid) = request_id {
                                                 let err_str = err.to_string();
-                                                let _ = runner.evorule_client
+                                                if let Err(e) = runner.evorule_client
                                                     .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
-                                                    .await;
+                                                    .await
+                                                {
+                                                    tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (max_steps) failed; io_request may hang on engine side");
+                                                }
                                             }
                                             yield Ok(AgentEvent::Error(err.clone()));
                                             let duration = start_time.elapsed().as_millis() as u64;
@@ -4397,7 +4418,9 @@ impl AgentRunner {
                                         if let Some(j) = &journal {
                                             let before: usize = messages.iter().map(|m| m.content().len()).sum();
                                             let after: usize = trim_result.messages.iter().map(|m| m.content().len()).sum();
-                                            let _ = j.compaction_performed(before, after, true);
+                                            if let Err(e) = j.compaction_performed(before, after, true) {
+                                                warn!(%session_id, error = %e, "compaction_performed journal failed");
+                                            }
                                         }
                                     }
                                     trim_result.messages
@@ -4451,13 +4474,16 @@ impl AgentRunner {
                                         _ = cancel_token.cancelled() => {
                                             info!("Cancelled during LLM streaming, cleaning up");
                                             if let Some(rid) = request_id {
-                                                let _ = runner.evorule_client
+                                                if let Err(e) = runner.evorule_client
                                                     .submit_io_response(
                                                         &session_id, rid,
                                                         &serde_json::json!({"content": "", "error": "cancelled"}),
                                                         Some("cancelled"),
                                                     )
-                                                    .await;
+                                                    .await
+                                                {
+                                                    tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (cancel) failed; io_request may hang on engine side");
+                                                }
                                             }
                                             if let Err(e) = runner.flush_messages(&session_id).await {
                             tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
@@ -4537,9 +4563,12 @@ impl AgentRunner {
                                             // 提交 error io_response 防止 evorule 卡死
                                             if let Some(rid) = request_id {
                                                 let err_resp = serde_json::json!({"content": "", "error": &e});
-                                                let _ = runner.evorule_client
+                                                if let Err(ie) = runner.evorule_client
                                                     .submit_io_response(&session_id, rid, &err_resp, Some(e.as_str()))
-                                                    .await;
+                                                    .await
+                                                {
+                                                    tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (llm_error) failed; io_request may hang on engine side");
+                                                }
                                             }
                                             let err = AgentError::LlmError(e);
                                             yield Ok(AgentEvent::Error(err.clone()));
@@ -4626,9 +4655,12 @@ impl AgentRunner {
                                     // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                     if let Some(rid) = request_id {
                                         let err_str = e.to_string();
-                                        let _ = runner.evorule_client
+                                        if let Err(ie) = runner.evorule_client
                                             .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
-                                            .await;
+                                            .await
+                                        {
+                                            tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
+                                        }
                                     }
                                     yield Err(e);
                                     return;
@@ -4676,11 +4708,13 @@ impl AgentRunner {
                                                 });
                                                 // B21:approval_requested(60s 审批窗开启)
                                                 if let Some(j) = &journal {
-                                                    let _ = j.approval_requested(
+                                                    if let Err(e) = j.approval_requested(
                                                         &req.proposal_id,
                                                         &tc.name,
                                                         &req.command,
-                                                    );
+                                                    ) {
+                                                        warn!(%session_id, tool = %tc.name, error = %e, "approval_requested journal failed");
+                                                    }
                                                 }
                                                 let res = runner
                                                     .resolve_approval(&session_id, &tc.name, &tc.arguments, req, journal.as_deref())
@@ -4702,7 +4736,9 @@ impl AgentRunner {
                                                             } else {
                                                                 "rejected"
                                                             };
-                                                            let _ = j.approval_resolved(&req0.proposal_id, label);
+                                                            if let Err(e) = j.approval_resolved(&req0.proposal_id, label) {
+                                                                warn!(%session_id, error = %e, "approval_resolved journal failed");
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -4736,9 +4772,12 @@ impl AgentRunner {
                                                     // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                                     if let Some(rid) = request_id {
                                                         let pe_str = pe.to_string();
-                                                        let _ = runner.evorule_client
+                                                        if let Err(ie) = runner.evorule_client
                                                             .submit_io_response(&session_id, rid, &serde_json::json!({"error": &pe_str}), Some(pe_str.as_str()))
-                                                            .await;
+                                                            .await
+                                                        {
+                                                            tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
+                                                        }
                                                     }
                                                     yield Err(pe);
                                                     return;
@@ -4752,7 +4791,9 @@ impl AgentRunner {
                                                 });
                                                 // B21:tool_result(error;内容与 transcript 回喂消息一致)
                                                 if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                    let _ = j.tool_result(cid, "error", &err_content);
+                                                    if let Err(e) = j.tool_result(cid, "error", &err_content) {
+                                                        warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
+                                                    }
                                                 }
                                                 continue;
                                             }
@@ -4768,7 +4809,9 @@ impl AgentRunner {
                                         let raw_content = outcome.final_result.to_string();
                                         // B21:tool_result(ok;content = 工具输出全文与 transcript 一致)
                                         if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                            let _ = j.tool_result(cid, "ok", &raw_content);
+                                            if let Err(e) = j.tool_result(cid, "ok", &raw_content) {
+                                                warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
+                                            }
                                         }
                                         let tool_msg = Message::Tool {
                                             content: truncate_tool_result(
@@ -4792,9 +4835,12 @@ impl AgentRunner {
                                             // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                             if let Some(rid) = request_id {
                                                 let err_str = e.to_string();
-                                                let _ = runner.evorule_client
+                                                if let Err(ie) = runner.evorule_client
                                                     .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
-                                                    .await;
+                                                    .await
+                                                {
+                                                    tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
+                                                }
                                             }
                                             yield Err(e);
                                             return;
@@ -4869,7 +4915,9 @@ impl AgentRunner {
                                     GateOutcome::Reject(detail) => {
                                         warn!(%session_id, %detail, "acceptance gate rejected instruction submission");
                                         if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                            let _ = j.tool_result(cid, "rejected", &detail);
+                                            if let Err(e) = j.tool_result(cid, "rejected", &detail) {
+                                                warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
+                                            }
                                         }
                                         tool_calls.push(tool_name.clone());
                                         let tool_idx = messages.len();
@@ -4907,7 +4955,9 @@ impl AgentRunner {
                                         });
                                         // B21:approval_requested(60s 审批窗开启)
                                         if let Some(j) = &journal {
-                                            let _ = j.approval_requested(&req.proposal_id, &tool_name, &req.command);
+                                            if let Err(e) = j.approval_requested(&req.proposal_id, &tool_name, &req.command) {
+                                                warn!(%session_id, tool = %tool_name, error = %e, "approval_requested journal failed");
+                                            }
                                         }
                                         let res = runner
                                             .resolve_approval(&session_id, &tool_name, &args, req, journal.as_deref())
@@ -4929,7 +4979,9 @@ impl AgentRunner {
                                                     } else {
                                                         "rejected"
                                                     };
-                                                    let _ = j.approval_resolved(&req0.proposal_id, label);
+                                                    if let Err(e) = j.approval_resolved(&req0.proposal_id, label) {
+                                                        warn!(%session_id, error = %e, "approval_resolved journal failed");
+                                                    }
                                                 }
                                             }
                                         }
@@ -4942,14 +4994,19 @@ impl AgentRunner {
                                         if let Some(rid) = request_id {
                                             let err_str = e.to_string();
                                             let err_resp = serde_json::json!({"error": &err_str});
-                                            let _ = runner.evorule_client
+                                            if let Err(ie) = runner.evorule_client
                                                 .submit_io_response(&session_id, rid, &err_resp, Some(err_str.as_str()))
-                                                .await;
+                                                .await
+                                            {
+                                                tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (tool_exec_error) failed; io_request may hang on engine side");
+                                            }
                                         }
                                         yield Ok(AgentEvent::Error(e.clone()));
                                         // B21:tool_result(error;工具尝试已失败,补记保重放完整)
                                         if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                            let _ = j.tool_result(cid, "error", &e.to_string());
+                                            if let Err(je) = j.tool_result(cid, "error", &e.to_string()) {
+                                                warn!(%session_id, call_id = %cid, error = %je, "tool_result journal failed");
+                                            }
                                         }
                                         let duration = start_time.elapsed().as_millis() as u64;
                                         if let Err(e) = runner.flush_messages(&session_id).await {
@@ -5001,7 +5058,9 @@ impl AgentRunner {
 
                                 // B21:tool_result(ok;content = 工具输出全文与 io_response 一致)
                                 if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                    let _ = j.tool_result(cid, "ok", &final_result.to_string());
+                                    if let Err(e) = j.tool_result(cid, "ok", &final_result.to_string()) {
+                                        warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
+                                    }
                                 }
 
                                 // 3. 记录 tool_calls + 持久化 tool 消息(同 handle_call_service)
@@ -5031,9 +5090,12 @@ impl AgentRunner {
                                     // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                     if let Some(rid) = request_id {
                                         let err_str = e.to_string();
-                                        let _ = runner.evorule_client
+                                        if let Err(ie) = runner.evorule_client
                                             .submit_io_response(&session_id, rid, &serde_json::json!({"error": &err_str}), Some(err_str.as_str()))
-                                            .await;
+                                            .await
+                                        {
+                                            tracing::warn!(session_id = %session_id, request_id = rid, error = %ie, "submit_io_response (persist_failed) failed; io_request may hang on engine side");
+                                        }
                                     }
                                     // 工具已执行、轨迹已采集：终止前补提交，避免审计链缺口（fail-soft）
                                     runner.submit_tool_traces(&session_id).await;
@@ -5068,9 +5130,12 @@ impl AgentRunner {
                             _ => {
                                 // 未知 io_type:提交错误 io_response 防止卡死
                                 if let Some(rid) = request_id {
-                                    let _ = runner.evorule_client
+                                    if let Err(e) = runner.evorule_client
                                         .submit_io_response(&session_id, rid, &serde_json::json!({"error": "unsupported io_type"}), Some("unsupported io_type"))
-                                        .await;
+                                        .await
+                                    {
+                                        tracing::warn!(session_id = %session_id, request_id = rid, error = %e, "submit_io_response (unsupported_io_type) failed; io_request may hang on engine side");
+                                    }
                                 }
                                 yield Ok(AgentEvent::Info(format!("Unknown io_type: {}", io_type)));
                             }
@@ -5082,7 +5147,9 @@ impl AgentRunner {
                             tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                         }
                         // C1:会话沉淀（best-effort，摘要+稳定事实→共享空间）
-                        let _ = runner.sediment_session(&session_id, &messages, journal.as_deref()).await;
+                        if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                        }
                         // R2-T04 链体积观测（B3）：会话收尾时 best-effort 查审计链长告警
                         runner.check_chain_size(&session_id).await;
                         let state = match runner.evorule_client.get_state(&session_id).await {
@@ -5130,7 +5197,9 @@ impl AgentRunner {
                             tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                         }
                         // C1:会话沉淀（best-effort，即使出错也尝试沉淀已收集的对话）
-                        let _ = runner.sediment_session(&session_id, &messages, journal.as_deref()).await;
+                        if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                        }
                         runner.submit_tool_traces(&session_id).await;
                         // B21:turn_ended(error)
                         if let Some(g) = turn_guard.take() {
@@ -5154,7 +5223,9 @@ impl AgentRunner {
                         if let Err(e) = runner.flush_messages(&session_id).await {
                             tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                         }
-                        let _ = runner.sediment_session(&session_id, &messages, journal.as_deref()).await;
+                        if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                        }
                         runner.submit_tool_traces(&session_id).await;
                         // B21:turn_ended(error)
                         if let Some(g) = turn_guard.take() {
