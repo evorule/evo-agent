@@ -50,7 +50,7 @@
 use serde_json::{json, Value};
 
 use crate::agent::delegate::DelegateContext;
-use crate::agent::journal::{read_all, JournalWriter};
+use crate::agent::journal::{read_all, read_all_tolerant, JournalWriter};
 use crate::agent::materializer::materialize_plan_fact;
 use crate::agent::replan::{
     lookup_agent_type, lookup_node_atomic, parse_failed_node_id, should_replan, BudgetCounters,
@@ -217,10 +217,10 @@ pub fn build_plan_loop_resume(
     dir: &std::path::Path,
     session_id: &str,
 ) -> Result<PlanLoopResume, String> {
-    use crate::agent::journal::{read_all, JournalWriter};
+    use crate::agent::journal::{read_all, read_all_tolerant, JournalWriter};
     let path = JournalWriter::path_for(dir, session_id);
-    let lines =
-        read_all(&path).map_err(|e| format!("run journal read failed ('{session_id}'): {e}"))?;
+    let lines = read_all_tolerant(&path)
+        .map_err(|e| format!("run journal read failed ('{session_id}'): {e}"))?;
     let (state, tail_start) = replay_plan_loop_checkpoint(&lines)?.ok_or_else(|| {
         format!("no plan loop checkpoint in run journal '{session_id}' - nothing to resume from")
     })?;
@@ -375,6 +375,9 @@ impl Drop for PlanFinishGuard {
 pub struct ResumableRunInfo {
     /// run 级账本会话名(resume 调用方凭此显式恢复)
     pub session_id: String,
+    /// 账本种类:plan=计划级 run(planrun- 前缀)/react=单代理会话(悬挂 turn
+    /// 的崩溃会话;react 条目的计划域字段为占位零值)
+    pub kind: String,
     /// 计划版本(最新计划检查点)
     pub version: u32,
     /// 已发生 replan 次数
@@ -395,19 +398,38 @@ pub struct ResumableRunInfo {
 /// 人类持剑:本函数只列不改——续跑决策权在显式 resume 调用方,不自动续跑。
 /// 单文件读败跳过并告警(列表面健壮性优先;账面损坏由打开路径 fail-visible)。
 pub fn scan_resumable_runs(dir: &std::path::Path) -> Result<Vec<ResumableRunInfo>, String> {
+    use crate::agent::journal::JournalEvent;
     let mut out = Vec::new();
+    let mut delegate_children: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut react_candidates: Vec<(String, Vec<crate::agent::journal::JournalLine>)> = Vec::new();
     let entries = std::fs::read_dir(dir).map_err(|e| format!("scan dir failed: {e}"))?;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("planrun-") || !name.ends_with(".jsonl") {
+        if !name.ends_with(".jsonl") {
             continue;
         }
         let session_id = name.trim_end_matches(".jsonl").to_string();
-        let path = JournalWriter::path_for(dir, &session_id);
-        let Ok(lines) = read_all(&path) else {
+        let path = dir.join(&name);
+        // 容忍尾部半行(强杀崩溃的自然产物):整本判废会把崩溃会话排除出
+        // 可恢复列表——恰是恢复面最需要覆盖的对象
+        let Ok(lines) = read_all_tolerant(&path) else {
             tracing::warn!(session = %session_id, "resumable scan: journal unreadable, skipped");
             continue;
         };
+        // 委托子会话排除集:被任何账本的委托锚引用的会话不是独立可恢复主体
+        //(其恢复主体是父 run)
+        for l in &lines {
+            if let JournalEvent::DelegateSpawned {
+                child_session_id, ..
+            } = &l.event
+            {
+                delegate_children.insert(child_session_id.clone());
+            }
+        }
+        if !name.starts_with("planrun-") {
+            react_candidates.push((session_id, lines));
+            continue;
+        }
         let has_checkpoint = lines.iter().any(|l| {
             matches!(
                 l.event,
@@ -443,6 +465,7 @@ pub fn scan_resumable_runs(dir: &std::path::Path) -> Result<Vec<ResumableRunInfo
             })
             .count();
         out.push(ResumableRunInfo {
+            kind: "plan".to_string(),
             session_id,
             version: state.version,
             replan_count: state.replan_count,
@@ -452,6 +475,36 @@ pub fn scan_resumable_runs(dir: &std::path::Path) -> Result<Vec<ResumableRunInfo
             wall_ms: state.counters.wall_ms,
             last_seq: lines.last().map(|l| l.seq).unwrap_or(0),
         });
+    }
+    // react 面:悬挂 turn(turn_started 无配对收尾)且末事件非崩溃标记的根
+    // 会话 = 崩溃恢复候选;委托子会话排除(其恢复主体是父 run)
+    for (session_id, lines) in react_candidates {
+        if delegate_children.contains(&session_id) {
+            continue;
+        }
+        let mut turn_open = false;
+        let mut last_was_crash = false;
+        for l in &lines {
+            match &l.event {
+                JournalEvent::TurnStarted { .. } => turn_open = true,
+                JournalEvent::TurnEnded { .. } => turn_open = false,
+                _ => {}
+            }
+            last_was_crash = matches!(l.event, JournalEvent::SessionCrashed { .. });
+        }
+        if turn_open && !last_was_crash {
+            out.push(ResumableRunInfo {
+                kind: "react".to_string(),
+                session_id,
+                version: 0,
+                replan_count: 0,
+                executed_registry_len: 0,
+                checkpointed_nodes: 0,
+                workflow_id: String::new(),
+                wall_ms: 0,
+                last_seq: lines.last().map(|l| l.seq).unwrap_or(0),
+            });
+        }
     }
     out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
     Ok(out)
@@ -2222,6 +2275,50 @@ mod tests {
             .collect();
         assert!(ledgers.is_empty(), "probe 失败零 run 账本: {ledgers:?}");
         assert!(scan_resumable_runs(&dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_resumable_covers_react_hung_tails_and_excludes_delegates() {
+        // react 扫尾判定:根会话悬挂 turn=可恢复(kind=react);委托子会话排除;
+        // 干净收尾排除。悬挂夹具=泄漏轮守卫(drop 会补写 aborted 收尾);
+        // 泄漏的写者句柄使目录清理失败属预期(清理容忍)
+        let dir = resume_test_dir("scanreact");
+        // A: react 根会话悬挂 turn → 列出
+        {
+            let w = JournalWriter::open(&dir, "sess-root").unwrap();
+            let guard = w.begin_turn("g").unwrap();
+            std::mem::forget(guard);
+        }
+        // B: 委托子会话悬挂 → 排除(恢复主体是父 run)
+        {
+            let p = JournalWriter::open(&dir, "sess-parent").unwrap();
+            p.begin_turn("g").unwrap();
+            p.delegate_spawned("sess-child", "researcher", 1, "digest")
+                .unwrap();
+            p.end_turn("ok", 1, 1).unwrap();
+            let c = JournalWriter::open(&dir, "sess-child").unwrap();
+            let child_guard = c.begin_turn("sub").unwrap();
+            std::mem::forget(child_guard);
+        }
+        // C: 干净收尾 → 排除
+        {
+            let w = JournalWriter::open(&dir, "sess-clean").unwrap();
+            w.begin_turn("g").unwrap();
+            w.end_turn("ok", 1, 1).unwrap();
+        }
+        let runs = scan_resumable_runs(&dir).unwrap();
+        let react: Vec<_> = runs.iter().filter(|r| r.kind == "react").collect();
+        assert_eq!(react.len(), 1, "恰一个 react 恢复候选: {runs:?}");
+        assert_eq!(react[0].session_id, "sess-root");
+        assert!(
+            !runs.iter().any(|r| r.session_id == "sess-child"),
+            "委托子会话排除"
+        );
+        assert!(
+            !runs.iter().any(|r| r.session_id == "sess-clean"),
+            "干净收尾排除"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

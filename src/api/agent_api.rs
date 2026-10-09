@@ -770,16 +770,8 @@ async fn run_agent(
     // 分支不消费 def，行为等价于「覆盖之后、AgentRunner 构造之前」）：
     // mode=plan_execute 走外层驱动循环（plan-execute 挂 driver），react（缺省/
     // None）走既有单代理路径（下方逐字节不动）。未知 mode = 400。
-    // 恢复旗标仅对 plan_execute 有意义:react 面带 resume_session_id = 400
-    // (误配置显式化,不静默忽略)。
-    if req.resume_session_id.is_some()
-        && !matches!(req.execution.as_ref().map(|e| e.mode.as_str()), Some(m) if m == "plan_execute")
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "resume_session_id requires execution.mode=\"plan_execute\"".to_string(),
-        ));
-    }
+    // 恢复旗标两态合法:plan_execute=计划级恢复;react/缺省=会话崩溃恢复
+    //(无新输入,悬挂工具处置后续完当前 turn)。恢复仅经显式入参,不自动续跑。
     match req
         .execution
         .as_ref()
@@ -905,7 +897,15 @@ async fn run_agent(
     // 捕获流中 SessionCreated 的会话 ID,挂工作台本地索引(与 WS 面同
     // 口径,fail-soft;record 读时去重合并)+ 响应携带 session_id(会话关联收口)。
     let index_title: String = req.goal.chars().take(60).collect();
-    let (result, session_id) = consume_to_done(runner.run_streaming(req.goal)).await;
+    // 恢复旗标(react 面):resume_session_id 在场=崩溃恢复——无新输入
+    //(goal 字段忽略),悬挂工具处置后自然续完当前 turn;响应 session_id
+    // 取恢复会话名(continuation 不发 SessionCreated)
+    let (result, session_id) = if let Some(sid) = &req.resume_session_id {
+        let (r, _) = consume_to_done(runner.resume_crashed(sid.clone())).await;
+        (r, Some(sid.clone()))
+    } else {
+        consume_to_done(runner.run_streaming(req.goal)).await
+    };
     if let Some(sid) = &session_id {
         state
             .session_index()

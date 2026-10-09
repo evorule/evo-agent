@@ -328,6 +328,9 @@ def http_json(method: str, url: str, body: Optional[dict] = None, timeout: float
             return e.code, json.loads(text), text
         except ValueError:
             return e.code, None, text
+    except (ConnectionError, TimeoutError, OSError) as e:
+        # serve 被杀瞬间的连接重置属预期(被杀 run 的后台线程)——静默哨兵
+        return 0, None, f"connection error: {e}"
 
 
 def scenario_l(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
@@ -475,6 +478,213 @@ def scenario_l(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
     return ok
 
 
+
+
+# ===== 场景 M:react 会话 kill 注入 + 扫尾 + 显式恢复(悬挂工具处置面) =====
+
+def newest_react_journal(exclude: set) -> Optional[str]:
+    """最新非 planrun 的会话账本名(排除既有集合;无则 None)"""
+    if not SESSIONS_DIR.exists():
+        return None
+    candidates = sorted(
+        (p for p in SESSIONS_DIR.glob("*.jsonl") if not p.name.startswith("planrun-")
+         and p.stem not in exclude),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not candidates:
+        return None
+    return candidates[-1].stem
+
+
+def scenario_m(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
+    """react 会话崩溃恢复:kill 注入 → 扫尾列表(kind=react)→ 显式恢复。
+
+    断言四条：
+      ① kill serve 进程树后重启,GET /api/sessions/resumable 列出该会话
+         (kind=react,悬挂 turn 在账);
+      ② 带 resume_session_id 重放(无 execution 字段=react 分支)→ HTTP 200
+         且 success=true;
+      ③ session_id 同会话(续写同一账本)且账内 session_resumed 在账;
+      ④ content 非空。
+    """
+    print("\n=== 场景 M: react 会话 kill 注入 + 扫尾 + 显式恢复 ===")
+    if not BINARY.exists():
+        print(f"  {RED}FAIL{RESET}  编译产物缺失: {BINARY}")
+        return False
+    proc_env = {**os.environ, **env}
+    evidence_dir = evidence_dir or REPO_ROOT / "data" / "e2e_evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    serve_port = 18093
+    serve_base = f"http://127.0.0.1:{serve_port}"
+
+    def spawn_serve() -> subprocess.Popen:
+        out = open(evidence_dir / "scenarioM_serve_stderr.log", "a", encoding="utf-8")
+        return subprocess.Popen(
+            [str(BINARY), "serve", "--workdir", str(REPO_ROOT),
+             "--host", "127.0.0.1", "--port", str(serve_port), "--no-auth"],
+            cwd=str(REPO_ROOT), env=proc_env, stdout=out, stderr=out,
+        )
+
+    def wait_health(timeout_s: float = 60.0) -> Optional[str]:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{serve_base}/health", timeout=3) as resp:
+                    if resp.status == 200:
+                        return None
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.5)
+        return f"serve health 未就绪（{timeout_s}s 超时）"
+
+    serve = spawn_serve()
+    err = wait_health()
+    if err:
+        kill_hard(serve.pid)
+        print(f"  {RED}FAIL{RESET}  serve 启动失败: {err}")
+        return False
+    print(f"  {GREEN}PASS{RESET}  serve 健康（{serve_base}/health）")
+
+    # ① 后台发起 react run(默认模式)。goal 强制工具轮(读文件——LLM 裸答
+    # 不调工具的非确定性会让注入窗口失效;file_read 属幂等读,悬挂时恰好
+    # 走重执行恢复路径)。
+    react_goal = (
+        "Use the file_read tool to read the file README.md in the workspace root, "
+        "then answer: what is this project about? You MUST call file_read first."
+    )
+    before = {p.stem for p in SESSIONS_DIR.glob("*.jsonl")} if SESSIONS_DIR.exists() else set()
+    # 基线快照=全部账本文件(react 会话是非 planrun 的数字命名,旧残留会话
+    # 若不排除会被误认成本场景新会话)
+    before = {p.stem for p in SESSIONS_DIR.glob("*.jsonl")} if SESSIONS_DIR.exists() else set()
+    run_result: dict = {}
+
+    def do_run() -> None:
+        run_result["r"] = http_json(
+            "POST", f"{serve_base}/agents/general/run",
+            body={"agent_type": "general", "goal": react_goal},
+        )
+
+    thread = threading.Thread(target=do_run, daemon=True)
+    thread.start()
+
+    # ② 轮询注入窗口:新增 react 会话账本出现工具轮(≥1 tool_invoked)
+    sid: Optional[str] = None
+    deadline = time.time() + POLL_TIMEOUT_SECS
+    while time.time() < deadline:
+        if not thread.is_alive():
+            print(f"  {RED}FAIL{RESET}  run 在注入窗口前自行完成（无法注入）")
+            kill_hard(serve.pid)
+            return False
+        # 新 react 会话账本 = 非 planrun 且不在 run 前快照里的新文件
+        candidates = []
+        if SESSIONS_DIR.exists():
+            for p in SESSIONS_DIR.glob("*.jsonl"):
+                if p.name.startswith("planrun-") or p.stem in before:
+                    continue
+                candidates.append(p)
+        candidates.sort(key=lambda p: p.stat().st_mtime)
+        if candidates:
+            journal_path = candidates[-1]
+            events = journal_events(journal_path)
+            if count_events(events, "tool_invoked") >= 1:
+                sid = journal_path.stem
+                break
+        time.sleep(POLL_INTERVAL_SECS)
+    else:
+        kill_hard(serve.pid)
+        print(f"  {RED}FAIL{RESET}  轮询超时未达注入窗口")
+        return False
+    print(f"  ···  注入窗口到达: react 会话 {sid}")
+
+    # ②.5 前提落定:等 server 侧会话状态出现(崩溃早于首轮落账的会话无
+    # server 状态,不可恢复——恢复面语义=显式指引重发)。注入窗口选在
+    # server 状态落定之后,保证被杀会话处于「可恢复」象限
+    state_deadline = time.time() + 300
+    state_ok = False
+    while time.time() < state_deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:18080/api/sessions/{sid}/state", timeout=5
+            ) as resp:
+                if resp.status == 200:
+                    state_ok = True
+                    break
+        except Exception:  # noqa: BLE001 — 未落定/连接问题均属轮询预期
+            pass
+        if not thread.is_alive():
+            break
+        time.sleep(POLL_INTERVAL_SECS)
+    ok_premise = check(
+        state_ok,
+        "注入前提:server 侧会话状态已落定(state 200)",
+        "server 侧状态 300s 未落定(会话处于不可恢复象限,场景前提不成立)",
+    )
+    if not ok_premise:
+        kill_hard(serve.pid)
+        return False
+
+    # ③ 强杀 serve → 重启(watchdog 拉起等价)
+    kill_hard(serve.pid)
+    serve.wait(timeout=30)
+    thread.join(timeout=10)
+    print(f"  {GREEN}PASS{RESET}  serve 已强杀（{'taskkill /F' if os.name == 'nt' else 'kill -9'} 树杀）")
+    serve = spawn_serve()
+    err = wait_health()
+    if err:
+        print(f"  {RED}FAIL{RESET}  serve 重启失败: {err}")
+        return False
+    print(f"  {GREEN}PASS{RESET}  serve 已重启")
+
+    ok = True
+    try:
+        # ④ 扫尾:该会话以 kind=react 列出
+        status, parsed, _ = http_json("GET", f"{serve_base}/api/sessions/resumable", timeout=30)
+        listed = [
+            r for r in (parsed or {}).get("resumable", [])
+            if r.get("session_id") == sid and r.get("kind") == "react"
+        ]
+        ok = check(
+            status == 200 and listed,
+            "扫尾列表列出被杀 react 会话(kind=react)",
+            f"react 会话未在扫尾列表: status={status} parsed={parsed}",
+        ) and ok
+
+        # ⑤ 显式恢复(react 分支:无 execution 字段+resume_session_id)
+        status, parsed, raw = http_json(
+            "POST", f"{serve_base}/agents/general/run",
+            body={"agent_type": "general", "goal": "",
+                  "resume_session_id": sid},
+        )
+        if evidence_dir is not None:
+            (evidence_dir / "scenarioM_resume_response.json").write_text(raw, encoding="utf-8")
+        ok = check(
+            status == 200 and (parsed or {}).get("success") is True,
+            f"恢复跑 HTTP 200 且 success=true（status={status}）",
+            f"恢复跑失败: status={status} body={raw[:300]}",
+        ) and ok
+        ok = check(
+            (parsed or {}).get("session_id") == sid,
+            "恢复跑续写同一会话",
+            f"会话不一致: {(parsed or {}).get('session_id')}",
+        ) and ok
+        ok = check(
+            (parsed or {}).get("content", "") != "",
+            "恢复跑产出非空 content",
+            "恢复跑 content 为空",
+        ) and ok
+
+        # ⑥ 账面:session_resumed 在账
+        merged = journal_events(SESSIONS_DIR / f"{sid}.jsonl")
+        ok = check(
+            count_events(merged, "session_resumed") >= 1,
+            "账内 session_resumed 在账(恢复标记)",
+            "账内无恢复标记",
+        ) and ok
+    finally:
+        kill_hard(serve.pid)
+    return ok
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="plan-execute 中断恢复 E2E（kill 注入+恢复双跑）")
     parser.add_argument(
@@ -485,9 +695,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--only",
-        choices=["K", "L"],
+        choices=["K", "L", "M"],
         default=None,
-        help="只跑单个场景（调试用；缺省 K+L 全量）",
+        help="只跑单个场景（调试用；缺省 K+L+M 全量）",
     )
     args = parser.parse_args()
 
@@ -506,8 +716,10 @@ def main() -> int:
     ok = True
     if args.only in (None, "K"):
         ok = scenario_k(env, args.evidence_dir)
-    if args.only in (None, "L") and (ok or args.only == "L"):
+    if args.only in (None, "L") and (ok or args.only in ("L", "M")):
         ok = scenario_l(env, args.evidence_dir) and ok
+    if args.only in (None, "M") and (ok or args.only == "M"):
+        ok = scenario_m(env, args.evidence_dir) and ok
     print(f"\n{'=' * 60}")
     print(f"结果: {'ALL PASS' if ok else 'FAILED'}")
     return 0 if ok else 1
