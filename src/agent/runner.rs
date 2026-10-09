@@ -2316,6 +2316,12 @@ impl AgentRunner {
         .await?;
 
         info!(%session_id, "Starting SSE event loop");
+        // H1:连续 Error→auto_rewind→continue 回退预算(25 号档 H1【高】)。
+        // rewind 后 continue 不耗 step_count——引擎/网络持续 Error 时无界
+        // 重试=不可终止回退循环。预算熔断后走 Error 收尾路径(flush/sediment/
+        // tool_traces/error 结果),fail-visible 不静默。重置语义:任意非 Error
+        // 事件(正常推进)即清零——只惩罚"连续"失败,不惩罚间歇错误。
+        let mut rewind_budget = RewindBudget::new(32);
         while let Some(event) = event_stream.next().await {
             // G6:取消检查(event 边界 — 即使 LLM 调用已返回,也在此处响应取消)
             if self.cancel_token.is_cancelled() {
@@ -2522,6 +2528,7 @@ impl AgentRunner {
                 }
                 "StateTransition" => {
                     info!(%session_id, "State transition occurred");
+                    rewind_budget.reset(32); // H1:正常推进即清零(只罚连续失败)
                 }
                 "Error" => {
                     let error_msg = event
@@ -2531,9 +2538,16 @@ impl AgentRunner {
                         .unwrap_or("unknown error");
                     let duration = start_time.elapsed().as_millis() as u64;
 
+                    // H1:回退预算执法——连续 Error 超预算即熔断(rewind 不计步的
+                    // 无界循环封顶;耗尽后落 Error 收尾,与 rewind 本身失败同路)
                     if let Ok(rewind_result) = self.auto_rewind(&session_id).await {
-                        info!(%session_id, "Auto-rewind successful, retrying from version {}", rewind_result);
-                        continue;
+                        if rewind_budget.consume() {
+                            info!(%session_id, remaining = rewind_budget.remaining,
+                                "Auto-rewind successful, retrying from version {}", rewind_result);
+                            continue;
+                        }
+                        warn!(%session_id, remaining = 0,
+                            "H1 rewind budget exhausted: 连续 Error 回退达上限(32),熔断为 fail-visible 错误结果");
                     }
 
                     // 错误返回前尝试刷写缓冲消息（best-effort，忽略 flush 错误）
@@ -5146,6 +5160,10 @@ impl AgentRunner {
             // G6:用 select! 监听取消,使等待 event 时也能即时响应
             let cancel_token = runner.cancel_token.clone();
             let mut last_llm_content = String::new(); // 追踪最近一次 LLM 输出(Stable 时 fallback)
+            // H1:连续 Error→auto_rewind→continue 回退预算(25 号档 H1【高】,非流式
+            // run() 同款镜像)——rewind 不计步的无界回退循环在此封顶。重置语义:
+            // 任意非 Error 事件(正常推进)即清零,只惩罚连续失败。
+            let mut rewind_budget = RewindBudget::new(32);
             loop {
                 let event = tokio::select! {
                     ev = event_stream.next() => match ev {
@@ -6394,13 +6412,19 @@ impl AgentRunner {
                     }
                     "StateTransition" => {
                         // 状态转换,继续循环
+                        rewind_budget.reset(32); // H1:正常推进即清零(只罚连续失败)
                     }
                     "Error" => {
                         let msg = event.payload.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                        // H1:回退预算执法——超预算熔断为 fail-visible(与非流式同语义)
                         // 尝试 auto_rewind
                         if let Ok(rewind_version) = runner.auto_rewind(&session_id).await {
-                            yield Ok(AgentEvent::Info(format!("Auto-rewind to version {}", rewind_version)));
-                            continue;
+                            if rewind_budget.consume() {
+                                yield Ok(AgentEvent::Info(format!("Auto-rewind to version {}", rewind_version)));
+                                continue;
+                            }
+                            tracing::warn!(session_id = %session_id, remaining = 0,
+                                "H1 rewind budget exhausted: 连续 Error 回退达上限(32),熔断为 fail-visible 错误结果");
                         }
                         let duration = start_time.elapsed().as_millis() as u64;
                         if let Err(e) = runner.flush_messages(&session_id).await {
@@ -6531,6 +6555,41 @@ pub fn merge_delegate_tool(
     }
     merged
 }
+
+/// H1:连续 Error→auto_rewind→continue 回退预算状态机(25 号档 H1【高】)。
+///
+/// rewind 路径不耗 step_count——引擎/网络持续 Error 时无界回退循环在此封顶。
+/// 语义:Error 事件调用 `consume()`——预算>0 递减返回 true(允许 rewind+continue);
+/// 预算耗尽返回 false(熔断:走 Error 收尾路径 fail-visible,不静默)。任意非 Error
+/// 事件(正常推进,如 StateTransition)调用 `reset()` 回满——只惩罚"连续"失败,
+/// 不惩罚间歇错误。默认 32(与 retry 生态上限同量级;非配置面——引擎侧熔断属
+/// 可靠性底线,不交由 agent 配置放开)。
+#[derive(Debug)]
+struct RewindBudget {
+    remaining: u32,
+}
+
+impl RewindBudget {
+    fn new(limit: u32) -> Self {
+        Self { remaining: limit }
+    }
+
+    /// Error 事件消费一份预算;返回是否仍允许 rewind+continue
+    fn consume(&mut self) -> bool {
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 正常推进(任意非 Error 事件)——预算回满
+    fn reset(&mut self, limit: u32) {
+        self.remaining = limit;
+    }
+}
+
 
 #[cfg(test)]
 #[path = "runner_tests.rs"]
