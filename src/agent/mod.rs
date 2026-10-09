@@ -19,6 +19,7 @@ pub mod delegate;
 pub mod driver;
 pub mod handover_tool;
 pub mod journal;
+pub mod judge_guard;
 pub mod lexstore;
 pub mod materializer;
 pub mod memory;
