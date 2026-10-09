@@ -1,0 +1,29 @@
+{
+  "agent_type": "l1-g11-test",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "S1 G11 streaming-path E2E probe: output_format validation in run_streaming",
+  "model": "MiniMax-M2.5",
+  "context_window_tokens": 200000,
+  "max_steps": 8,
+  "system_prompt": "你是一个测试代理。收到问题后,先调用 file_list 工具查看目录,然后用纯文本回答问题。不要输出 JSON,不要用代码块,用一句中文自然语言回答。",
+  "temperature": 0.3,
+  "step_timeout_secs": 120,
+  "output_format": {
+    "type": "json",
+    "schema": {
+      "type": "object",
+      "required": ["answer"],
+      "properties": {
+        "answer": { "type": "string" }
+      }
+    },
+    "max_retries": 2
+  },
+  "memory": {
+    "type": "persistent",
+    "namespace": "l1-g11-test",
+    "summary_model": "MiniMax-M2.5"
+  },
+  "tools": ["file_read", "file_list"]
+}
