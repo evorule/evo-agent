@@ -527,10 +527,25 @@ fn cmd_run(
             }
         }
 
-        AgentRunner::from_definition(def, client, tool_handler, Some(llm_handler))
+        AgentRunner::from_definition(def, client.clone(), tool_handler, Some(llm_handler))
             .await
             .map(|r| {
                 r.with_capability_boundary(capability_boundary)
+                    // 条 5(25 号档):CLI run 主路径 delegate+journal 接线——serve 面
+                    // (agent_api.rs run 端点)完整先例的镜像。此前 CLI 只接
+                    // capability_boundary+wire_accounting:general.json 等声明了
+                    // "delegate" 工具但执行能力未注册(tool_call 无处解析),
+                    // journal=None(子轨迹无账)——CLI/serve 不对称。
+                    // 治理段同源下放(子代理 S2 槽位与主 runner 同源,纪律无豁免面)。
+                    .with_journal_dir(workdir.join("data").join("sessions"))
+                    .with_delegate_context(
+                        evo_agent::agent::delegate::DelegateContext::new(
+                            agent_name,
+                            mgr.clone(),
+                            client,
+                        )
+                        .with_journal_dir(workdir.join("data").join("sessions")),
+                    )
                     .wire_accounting(workdir)
             })
     });
