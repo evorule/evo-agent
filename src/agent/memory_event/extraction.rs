@@ -294,6 +294,18 @@ impl EventExtractor {
                \"tags\": [\"important\"]\n\
              }}\n\n\
              可用的 event_type kind: Conversation, Relationship, Milestone, Habit, Health, EmotionEvent, Location, Item, IOTrigger, SystemObservation, Custom\n\
+             subtype 必须严格使用下表枚举值之一(大小写敏感,禁止自造):\n\
+             - Conversation: FirstInteraction|Apology|Confession|Farewell|Conflict|Reconciliation|Routine\n\
+             - Relationship: Met|BecameClose|DriftedApart|Reconnected|Lost\n\
+             - Milestone: Birthday|Graduation|FirstJob|NewJob|Leaving|Achievement\n\
+             - Habit: Started|CheckedIn|Missed|Streak|Broken|Resumed\n\
+             - Health: Symptom|Diagnosis|Treatment|Recovery\n\
+             - Location: Arrived|Left|Visited\n\
+             - Item: Acquired|Lost|Gifted|Discarded\n\
+             - IOTrigger/SystemObservation/EmotionEvent: 自由字符串\n\
+             - Custom: task_event|none|自由字符串\n\
+             信息告知/知识分享类对话若不属于上述 Conversation 子类,提取为 {{\"kind\": \"Custom\", \"subtype\": \"information_sharing\"}}。\n\
+             emotion 字段:若无明确情绪,输出 null(不要输出空对象);subject 枚举仅允许 \"User\"|\"Entity\"|\"Collective\"(禁止空字符串);valence/arousal 取值范围 [-1,1]。\n\
              任务执行类对话（编程任务/文件处理/系统操作等）也是事件:若对话中任务被执行(工具调用/文件创建/验证完成/部署等),提取为 {{\"kind\": \"Custom\", \"subtype\": \"task_event\"}},content.summary 写明做了什么任务与结果(成功/失败/产出物)。Battle B 经验:任务对话常被误判为无事件,凡有实际任务动作就不应返回 none。\n\
              只有对话确实不含任何可记录内容(纯寒暄/无实质动作)时才返回: {{\"event_type\": {{\"kind\": \"Custom\", \"subtype\": \"none\"}}}}\n\
              只输出 JSON,不要输出其他内容。",

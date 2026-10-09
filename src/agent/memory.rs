@@ -1093,6 +1093,12 @@ pub struct MemoryManager {
     /// 阶段 2(F-616):未回写 usage 增量(fact_id → 本会话命中次数);
     /// 会话末批量回写(一次批量 payload 更新)
     pub(crate) usage_pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, u32>>>,
+    /// L1 修复(断点5-水合):events 召回事实暂存区——recall_context(&self)不能
+    /// 写 cache,先暂存;apply_lifecycle_transitions(&mut self)开头统一吸收进
+    /// cache(or_insert,不覆盖本地新写)。跨会话晋升链的关键接线。
+    /// Mutex 而非 RefCell:MemoryManager 需跨线程(axum State 要求 Sync)。
+    pub(crate) hydration_pending:
+        std::sync::Arc<std::sync::Mutex<Vec<(String, MemoryRecord)>>>,
     session_id: Option<String>,
     cache: BTreeMap<String, MemoryRecord>,
     /// 记忆过期时间（秒，用户决策 5：TTL）
@@ -1142,6 +1148,7 @@ impl MemoryManager {
             usage_pending: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            hydration_pending: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             session_id: None,
             cache: BTreeMap::new(),
             ttl_secs: None,
@@ -1308,16 +1315,22 @@ impl MemoryManager {
 
         let timestamp = now_secs();
         let mut record = MemoryRecord::new(key, value, timestamp);
-        // F-609：生命周期落标——events 前缀=情景记忆 Captured；其余=Settled
+        // F-609：生命周期落标——events 域=情景记忆 Captured；其余=Settled
         // （状态迁移=新增版本事实，不改写本字段；RL-A1）
-        record.lifecycle_state = Some(if key.contains(".events.") {
+        // L1 修复(23 号档断点5):sediment 实写 key 形态=「events.{event_id}」(顶域,
+        // 无前导点)——旧判 contains(".events.") 恒 False → 事件全被标 Settled,
+        // 永远进不了晋升遍历。改为顶域判定:events. 开头(顶域形态)或含 .events.
+        // (嵌套形态)均判情景域。单测用嵌套形态 mock 对上了实现、没对上真实写入方
+        // ——本修复后两种形态均覆盖。
+        let is_episodic = key.starts_with("events.") || key.contains(".events.");
+        record.lifecycle_state = Some(if is_episodic {
             "Captured".to_string()
         } else {
             "Settled".to_string()
         });
         // F-609:事件载荷 confidence 浮面（晋升阈值判读用；确定性字段拷贝；
         // value 为序列化 JSON 字符串,解析失败即不浮面)
-        if key.contains(".events.") {
+        if is_episodic {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(value) {
                 if let Some(conf) = v.get("confidence").and_then(|c| c.as_f64()) {
                     record.confidence = Some(conf as f32);
@@ -2080,6 +2093,32 @@ impl MemoryManager {
             .recall_facts_cached(&events_prefix, "events", goal, &mut ctx.degradation_notices)
             .await
         {
+            // L1 修复(断点5-水合):events 召回事实回填 cache——晋升遍历读 cache,
+            // 旧实现只填 ctx 不回填 → 跨进程/跨会话的 Captured 事件永远无人
+            // 生命周期检查(cache 进程局部,新进程为空)。回填后:同会话召回即
+            // 水合,会话末 apply_lifecycle_transitions 可见历史事件,治理门
+            // 跨会话可触发。仅补缺(缺 cache 镜像才插,不覆盖本地新写);
+            // path→cache_key 与 path_to_cache_key 同构(Shared 域)。
+            for f in &facts {
+                if let Some(ck) = self.path_to_cache_key(&f.path) {
+                    if let Ok(mut r) =
+                        serde_json::from_value::<MemoryRecord>(f.value.clone())
+                    {
+                        // fact_id 由服务端分配,存储的 MemoryRecord JSON 不含它——
+                        // 必须从 SharedFactEntry 补进镜像,否则 flush_usage 按
+                        // fact_id 匹配 cache 落增量时永不命中(断点5 收尾)。
+                        r.fact_id = Some(f.fact_id);
+                        // L1 修复(断点5-水合):recall 拉取的 events 事实先存入
+                        // 暂存区——recall_context 是 &self,不能直接写 cache;
+                        // flush_usage/apply_lifecycle_transitions(&mut self)开头
+                        // 统一吸收(or_insert,不覆盖本地新写)。
+                        self.hydration_pending
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push((ck, r));
+                    }
+                }
+            }
             let mut events: Vec<(MemoryRecord, f32)> = facts
                 .into_iter()
                 .filter_map(|f| {
@@ -2673,6 +2712,41 @@ impl MemoryManager {
     /// - 无 LexStore/无镜像 → 本地计数保留,诚实降级(warn);
     /// - 批量端点一次 HTTP(evorule-server POST /api/sessions/{id}/payloads 已建成);全程 best-effort。
     pub async fn flush_usage(&mut self, session_id: &str) {
+        // L1 修复(断点5-水合,后半):先吸收 hydration 暂存——flush_usage 早于
+        // apply_lifecycle 执行,若不在此吸收,召回的历史事件不在 cache,
+        // 「cache 无镜像记录,跳过回写」→ usage 增量永远落不到事件上,
+        // 晋升条件 usage_count>=1 永不满足(or_insert 不覆盖本地新写)。
+        // 吸收时同步矫正历史数据缺陷(state=Settled/conf=None——与
+        // apply_lifecycle 吸收块同款矫正,两处吸收点都过一遍)。
+        {
+            let pending: Vec<(String, MemoryRecord)> = std::mem::take(
+                &mut *self
+                    .hydration_pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+            );
+            for (ck, mut r) in pending {
+                let is_epi = r.key.starts_with("events.") || r.key.contains(".events.");
+                if is_epi {
+                    if !matches!(
+                        r.lifecycle_state.as_deref(),
+                        Some("Captured") | Some("Reinforced") | Some("Promoted")
+                    ) {
+                        r.lifecycle_state = Some("Captured".to_string());
+                    }
+                    if r.confidence.is_none() {
+                        let mut conf = 0.6f32;
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&r.value) {
+                            if let Some(c) = v.get("confidence").and_then(|c| c.as_f64()) {
+                                conf = c as f32;
+                            }
+                        }
+                        r.confidence = Some(conf);
+                    }
+                }
+                self.cache.entry(ck).or_insert(r);
+            }
+        }
         let pending: Vec<(u64, u32)> = {
             let mut map = self.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
             map.drain().collect()
@@ -2686,10 +2760,38 @@ impl MemoryManager {
                 count = pending.len(),
                 "usage flush: no LexStore——增量仅本地保留,不回写"
             );
-            // 回滚:增量原样归还 pending(下轮 flush 重试;修复前 drain 后即返回,增量丢失)
+            // L1 修复(断点5-usage):无 LexStore 降级路径——usage 增量虽不能回写
+            // 服务端,但必须落到本地 cache 镜像(晋升判定读 cache.usage_count;
+            // 修复前提前 return → 事件 usage_count 恒 0,治理门在无 LexStore
+            // 配置下结构性永不触发)。fact_id→cache_key 经 LexStore paths 反查,
+            // 降级路径改按 fact_id 匹配 cache 记录(镜像里有 fact_id 字段)。
+            // 服务端真相账不动(usage 回写仍需 LexStore),仅本地镜像累加。
+            for (fact_id, inc) in &pending {
+                let mut hit = false;
+                for rec in self.cache.values_mut() {
+                    if rec.fact_id == Some(*fact_id) {
+                        rec.usage_count = rec.usage_count.saturating_add(*inc);
+                        if rec.lifecycle_state.as_deref() == Some("Captured") {
+                            rec.lifecycle_state = Some("Reinforced".to_string());
+                        }
+                        hit = true;
+                    }
+                }
+                if !hit {
+                    tracing::debug!(fact_id, "usage flush(降级): cache 无镜像记录,该条增量保留 pending 重试");
+                }
+            }
+            // 回滚:未命中的增量原样归还 pending(下轮 flush 重试;修复前
+            // drain 后即返回,增量丢失)。
             let mut map = self.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
             for (fact_id, inc) in &pending {
-                *map.entry(*fact_id).or_insert(0) += *inc;
+                let hit = self
+                    .cache
+                    .values()
+                    .any(|r| r.fact_id == Some(*fact_id));
+                if !hit {
+                    *map.entry(*fact_id).or_insert(0) += *inc;
+                }
             }
             return;
         };
@@ -2767,7 +2869,78 @@ impl MemoryManager {
         session_id: &str,
         recipe: &crate::agent::recipe::MemoryRecipe,
     ) {
+        // L1 修复(断点5-水合):先吸收 recall 暂存的 events 事实进 cache——
+        // 晋升遍历读 cache,跨会话召回的历史事件必须先进 cache 才能受检。
+        // or_insert 语义:本地新写(cache 已有)优先,不覆盖。
+        {
+            let pending: Vec<(String, MemoryRecord)> = std::mem::take(
+                &mut *self
+                    .hydration_pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+            );
+            if !pending.is_empty() {
+                tracing::debug!(
+                    count = pending.len(),
+                    "lifecycle: hydration absorbed into cache"
+                );
+                for (ck, mut r) in pending {
+                    // L1 修复(断点5-遗留数据矫正):历史事件可能带旧缺陷——
+                    // state=Settled(前缀 bug 时代写入)或 conf=None(未浮面)。
+                    // events 域语义上就是 Captured(情景记忆),此处矫正:
+                    // 非 Captured/Reinforced 的 episodic → Captured;
+                    // conf 缺失 → 从 value JSON 浮面,再兜底 0.6(显式触发=1.0,
+                    // 关键词=0.8,提取失败不可知时 0.6 保守值)。
+                    let is_epi = r.key.starts_with("events.") || r.key.contains(".events.");
+                    if is_epi {
+                        if !matches!(
+                            r.lifecycle_state.as_deref(),
+                            Some("Captured") | Some("Reinforced") | Some("Promoted")
+                        ) {
+                            r.lifecycle_state = Some("Captured".to_string());
+                        }
+                        if r.confidence.is_none() {
+                            let mut conf = 0.6f32;
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&r.value) {
+                                if let Some(c) = v.get("confidence").and_then(|c| c.as_f64()) {
+                                    conf = c as f32;
+                                }
+                            }
+                            r.confidence = Some(conf);
+                        }
+                    }
+                    self.cache.entry(ck).or_insert(r);
+                }
+            }
+        }
         let lc = &recipe.lifecycle;
+        // L1 诊断(临时,INFO 级):治理门观察窗——cache 规模/episodic 记录状态分布
+        {
+            let total = self.cache.len();
+            let episodic: Vec<&crate::agent::memory::MemoryRecord> = self
+                .cache
+                .values()
+                .filter(|r| r.key.starts_with("events.") || r.key.contains(".events."))
+                .collect();
+            let capt = episodic.iter().filter(|r| r.lifecycle_state.as_deref() == Some("Captured")).count();
+            let rein = episodic.iter().filter(|r| r.lifecycle_state.as_deref() == Some("Reinforced")).count();
+            let mut detail = Vec::new();
+            for r in episodic.iter().take(5) {
+                detail.push(format!(
+                    "[key={} state={:?} conf={:?} usage={} fid={:?}]",
+                    r.key, r.lifecycle_state, r.confidence, r.usage_count, r.fact_id
+                ));
+            }
+            tracing::info!(
+                total_cache = total,
+                episodic = episodic.len(),
+                captured = capt,
+                reinforced = rein,
+                gate_enabled = recipe.promote_gate.enabled,
+                sample = ?detail,
+                "L1-DIAG lifecycle scan"
+            );
+        }
         let gate_dataset = recipe
             .promote_gate
             .dataset_id
@@ -2783,8 +2956,54 @@ impl MemoryManager {
         let now = now_secs();
         let mut to_promote: Vec<(String, String, MemoryRecord)> = Vec::new();
         let mut gated: Vec<(String, MemoryRecord)> = Vec::new();
+        // L1 修复(跨会话查重):stable.llm.promoted.* 标记随治理门提案写入并落
+        // 服务端,跨会话水合拉回——标记存在=对应事件已提案过治理门(slug 含
+        // session_id,重复提案=每会话一条新 Draft)。将标记映射回事件(去掉
+        // stable.llm.promoted. 前缀、shared:: 归一),对应 cache 事件标 Promoted。
+        {
+            let mut promoted_events: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for k in self.cache.keys() {
+                let nk = k.strip_prefix("shared::").unwrap_or(k);
+                if let Some(ev) = nk.strip_prefix("stable.llm.promoted.") {
+                    promoted_events.insert(ev.to_string());
+                }
+            }
+            if !promoted_events.is_empty() {
+                let keys: Vec<String> = self.cache.keys().cloned().collect();
+                for k in keys {
+                    let nk = k.strip_prefix("shared::").unwrap_or(&k).to_string();
+                    if promoted_events.contains(&nk) {
+                        if let Some(rec) = self.cache.get_mut(&k) {
+                            if matches!(
+                                rec.lifecycle_state.as_deref(),
+                                Some("Captured") | Some("Reinforced")
+                            ) {
+                                rec.lifecycle_state = Some("Promoted".to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for rec in self.cache.values_mut() {
-            if rec.lifecycle_state.as_deref() == Some("Captured") && rec.key.contains(".events.") {
+            // L1 修复(断点5-资格):flush_usage 回写时会把命中条目标 Reinforced——
+            // 旧判定只认 Captured → usage 达标(恰是晋升条件)反而丧失资格,自相矛盾。
+            // 修正:Reinforced 视同 Captured 参与晋升遍历(状态机 Captured→Reinforced
+            // 是 usage 回写语义,不是生命周期终态;晋升资格保留)。
+            let promotable_state = matches!(
+                rec.lifecycle_state.as_deref(),
+                Some("Captured") | Some("Reinforced")
+            );
+            // L1 修复(标记污染):stable.llm.promoted.* 是晋升标记事实(其 key 含
+            // .events. 子串),不是事件——不排除会被当事件反复提案(标记的标记
+            // 指数繁殖);Promoted 状态本身=已晋升查重信号,本地已标/水合拉回
+            // (本修复同批:Promoted 事实存服务端)均跳过。
+            let is_promotion_marker = rec.key.starts_with("stable.llm.promoted.");
+            if promotable_state
+                && !is_promotion_marker
+                && (rec.key.starts_with("events.") || rec.key.contains(".events."))
+            {
                 let conf = rec.confidence.unwrap_or(0.5);
                 if conf >= lc.promote_min_confidence && rec.usage_count >= lc.promote_min_uses {
                     if gate_enabled {
@@ -2824,11 +3043,33 @@ impl MemoryManager {
         // 治理门路径:提议入账(资格凭据)成功才晋升+稳定副本;失败保持 Captured
         for (key, candidate) in &gated {
             let dataset = gate_dataset.as_deref().unwrap_or_default();
+            // L1 链路修复(23 号档 §二断点1):契约对齐 evorule-rule
+            // ProposeKnowledgeEntryReq.entry(AddKnowledgeEntryReq)——必填
+            // entry_id/version/payload/schema_ref;旧形态 {title,body,confidence}
+            // 在 rule 侧反序列化即 400(missing field entry_id),治理门全程 404 级断链。
+            // payload 按 builtin:knowledge/fact 契约(statement 必填),原始
+            // title/confidence 保留在 payload 附带字段(additionalProperties:true)
+            // +tags,零信息丢失;entry_id 用确定性 slug(key 含 :: / 等 NSC 字符)。
+            let entry_id = {
+                // deterministic slug: hex of fnv1a64 over key+session, stable per
+                // (candidate,session) pair, collision-safe enough for gate entries
+                let mut h: u64 = 0xcbf29ce484222325;
+                for b in (format!("{}|{}", candidate.key, session_id)).as_bytes() {
+                    h ^= *b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                format!("mem-{:016x}", h)
+            };
             let entry = serde_json::json!({
-                "title": candidate.key.clone(),
-                "body": candidate.value.clone(),
-                "confidence": candidate.confidence,
+                "entry_id": entry_id,
+                "version": 1,
                 "tags": ["memory-promote"],
+                "payload": {
+                    "statement": candidate.value.clone(),
+                    "title": candidate.key.clone(),
+                    "confidence": candidate.confidence,
+                },
+                "schema_ref": "builtin:knowledge/fact",
             });
             let cause = format!(
                 "memory lifecycle promotion: captured fact met promote thresholds; source key {}",
