@@ -50,7 +50,7 @@
 use serde_json::{json, Value};
 
 use crate::agent::delegate::DelegateContext;
-use crate::agent::journal::JournalWriter;
+use crate::agent::journal::{read_all, JournalWriter};
 use crate::agent::materializer::materialize_plan_fact;
 use crate::agent::replan::{
     lookup_agent_type, lookup_node_atomic, parse_failed_node_id, should_replan, BudgetCounters,
@@ -297,9 +297,149 @@ pub async fn run_plan_loop(
     .await
 }
 
+/// 驱动终态落账守卫:任意出口(Ok/Err/`?` 传播)落地 plan_loop_finished——
+/// 扫尾面凭终态事件把已终局 run 排除出可恢复列表(无终态且计划检查点在账
+/// = 中断 run)。Ok 路径先 [`Self::finish_ok`] 再返回;其余出口 drop 落
+/// "error"。账写失败 best-effort(error 日志):主产物优先不因终态标记失败
+/// 而翻报——退化面=该 run 被列可恢复,后续恢复尝试按账面状态快进,不产生
+/// 粒级重执行(粒级检查点护栏)。
+struct PlanFinishGuard {
+    journal: std::sync::Mutex<Option<JournalWriter>>,
+    done: std::cell::Cell<bool>,
+}
+
+impl PlanFinishGuard {
+    fn new() -> Self {
+        Self {
+            journal: std::sync::Mutex::new(None),
+            done: std::cell::Cell::new(false),
+        }
+    }
+
+    /// 绑定 run 账本句柄(账本开立后调用;Dsl/无账域不绑定=守卫空转)
+    fn attach(&self, writer: &JournalWriter) {
+        *self.journal.lock().unwrap_or_else(|p| p.into_inner()) = Some(writer.clone());
+    }
+
+    /// Ok 出口:落 "ok" 终态并解除 drop 侧写
+    fn finish_ok(&self) {
+        self.write("ok");
+        self.done.set(true);
+    }
+
+    fn write(&self, status: &str) {
+        let writer = self
+            .journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(j) = writer {
+            if let Err(e) = j.plan_loop_finished(status) {
+                tracing::error!("plan loop finish marker write failed: {e}");
+            }
+        }
+    }
+}
+
+impl Drop for PlanFinishGuard {
+    fn drop(&mut self) {
+        self.write("error");
+    }
+}
+
+/// 可恢复 run 信息(扫尾投影;authoritative:false 投影视图,真相源=run 账本)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResumableRunInfo {
+    /// run 级账本会话名(resume 调用方凭此显式恢复)
+    pub session_id: String,
+    /// 计划版本(最新计划检查点)
+    pub version: u32,
+    /// 已发生 replan 次数
+    pub replan_count: u32,
+    /// 已执行注册表条目数
+    pub executed_registry_len: usize,
+    /// 恢复可跳过的已完成粒数(最新计划检查点之后尾段的粒级检查点数)
+    pub checkpointed_nodes: usize,
+    /// 工作流 id(自检查点工作流全文提取)
+    pub workflow_id: String,
+    /// 累计墙钟毫秒(恢复面剩余预算判断输入)
+    pub wall_ms: u64,
+    /// 账本末事件 seq
+    pub last_seq: u64,
+}
+
+/// 扫尾:扫 run 级账本目录,列可恢复 run(计划检查点在账且无终态标记)。
+/// 人类持剑:本函数只列不改——续跑决策权在显式 resume 调用方,不自动续跑。
+/// 单文件读败跳过并告警(列表面健壮性优先;账面损坏由打开路径 fail-visible)。
+pub fn scan_resumable_runs(dir: &std::path::Path) -> Result<Vec<ResumableRunInfo>, String> {
+    let mut out = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("scan dir failed: {e}"))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("planrun-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let session_id = name.trim_end_matches(".jsonl").to_string();
+        let path = JournalWriter::path_for(dir, &session_id);
+        let Ok(lines) = read_all(&path) else {
+            tracing::warn!(session = %session_id, "resumable scan: journal unreadable, skipped");
+            continue;
+        };
+        let has_checkpoint = lines.iter().any(|l| {
+            matches!(
+                l.event,
+                crate::agent::journal::JournalEvent::PlanLoopCheckpointed { .. }
+            )
+        });
+        let finished = lines.iter().any(|l| {
+            matches!(
+                l.event,
+                crate::agent::journal::JournalEvent::PlanLoopFinished { .. }
+            )
+        });
+        if !has_checkpoint || finished {
+            continue;
+        }
+        let Some((state, tail_start)) = replay_plan_loop_checkpoint(&lines)? else {
+            continue;
+        };
+        let workflow_id = serde_json::from_str::<serde_json::Value>(&state.cur_workflow)
+            .ok()
+            .and_then(|v| {
+                v.get("workflow_id")
+                    .and_then(|w| w.as_str().map(str::to_string))
+            })
+            .unwrap_or_default();
+        let checkpointed_nodes = lines[tail_start..]
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l.event,
+                    crate::agent::journal::JournalEvent::NodeCheckpointed { .. }
+                )
+            })
+            .count();
+        out.push(ResumableRunInfo {
+            session_id,
+            version: state.version,
+            replan_count: state.replan_count,
+            executed_registry_len: state.executed_registry.len(),
+            checkpointed_nodes,
+            workflow_id,
+            wall_ms: state.counters.wall_ms,
+            last_seq: lines.last().map(|l| l.seq).unwrap_or(0),
+        });
+    }
+    out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    Ok(out)
+}
+
 /// 驱动循环恢复入口:`resume = Some` 时从 run 级账本回放态续跑(计划状态+
 /// 粒级进度,已完成粒零重执行);`None` = 既有行为零变更。计划级检查点仅
 /// PlanExecute 模式落账(Dsl 工作流由入参可复建,粒级检查点已覆盖)。
+///
+/// 恢复态剩余预算闸:恢复态累计墙钟已 ≥ 本跑限额 = 预算已耗尽,恢复无意义
+/// ——快速失败(errored 但省 token,诚实面:中断时点已注定无法在限内完成)。
 pub async fn run_plan_loop_with_resume(
     ctx: DelegateContext,
     initial: Workflow,
@@ -320,6 +460,20 @@ pub async fn run_plan_loop_with_resume(
         Some(r) => (Some(r.state), Some(r.node_replay), Some(r.run_session_id)),
         None => (None, None, None),
     };
+    // 恢复态剩余预算闸(账先于一切推进:预算耗尽的恢复=注定超限,快速失败)
+    if let (Some(state), Some(max_wall)) = (resumed_state.as_ref(), limits.max_wall_ms) {
+        if state.counters.wall_ms >= max_wall {
+            return Err(format!(
+                "resumed run wall budget already exhausted (wall_ms={} >= limit {}) \
+                 - failing fast (resuming cannot finish within budget)",
+                state.counters.wall_ms, max_wall
+            ));
+        }
+    }
+    // 驱动终态守卫:任意出口(Ok/Err/传播)落地 plan_loop_finished——扫尾面
+    // 凭终态事件把已终局 run 排除出可恢复列表。Ok 路径先 finish_ok 再返回,
+    // 其余出口 drop 落 "error"。
+    let finish = PlanFinishGuard::new();
     let marks_session = resumed_state
         .as_ref()
         .and_then(|s| s.marks_session.clone())
@@ -348,6 +502,7 @@ pub async fn run_plan_loop_with_resume(
                 };
                 let writer = JournalWriter::open(&dir, &sid)
                     .map_err(|e| format!("run ledger open failed (session '{sid}'): {e}"))?;
+                finish.attach(&writer);
                 engine = engine.with_run_journal(writer.clone());
                 Some(writer)
             }
@@ -555,6 +710,8 @@ pub async fn run_plan_loop_with_resume(
                     ))
                 }
             };
+            // 终态落账(ok):完成 run 从可恢复列表排除
+            finish.finish_ok();
             return Ok(PlanLoopOutcome {
                 content,
                 stats: PlanLoopStats {
@@ -791,6 +948,13 @@ pub async fn run_plan_loop_with_resume(
 ///
 /// `max_depth` / `max_concurrent` 与 CLI workflow 子命令缺省一致（3 / 5），
 /// 由调用方传入；驱动限额 `limits` 语义见 [`DriverLimits`]（阈值禁入 PlanFact）。
+///
+/// `resume_session`:恢复此前中断的 plan-execute run(值为 run 级账本会话名,
+/// 由 `PlanLoopOutcome.run_session_id` 透出或扫尾端点列出)。恢复仅经显式
+/// 入参,不自动续跑(人类持剑);恢复路径:计划状态/治理标记身份取自账面,
+/// probe 不重跑(非确定 LLM 输出,重跑即漂移),恢复路径入口发射续跑标记
+/// (账面序列=崩溃标记→续跑标记),剩余预算闸在驱动入口判定。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_plan_execute(
     evorule_client: EvoruleApiClient,
     definitions: crate::agent::AgentDefinitionManager,
@@ -802,53 +966,100 @@ pub async fn run_plan_execute(
     max_depth: usize,
     max_concurrent: usize,
     container: Option<String>,
+    resume_session: Option<&str>,
 ) -> Result<(PlanLoopOutcome, String), String> {
-    // ① probe DAG（单 planner 节点，task=goal）→ constitution 校验链（与 CLI
-    //    同一加载入口：schema 全量校验 + 物化，失败 fail-fast 拒载）
-    let probe = probe_workflow_value(goal);
-    let wf = crate::agent::constitution::load_workflow(&probe).map_err(|violations| {
-        format!(
-            "plan-execute probe workflow failed constitution validation/materialization: {}",
-            violations.join("; ")
-        )
-    })?;
+    let sessions_dir = workdir.join("data").join("sessions");
+    // 恢复装配:回放最新计划检查点+其后检查点尾段;锚不齐/blob 缺失/hash
+    // 不过一律拒绝(fail-closed)。发射续跑标记(先开-发射-落:驱动随后自开
+    // 同会话续写,写者注册表在落时释放;open 内崩溃检测先补写崩溃标记,
+    // 账面序列=crashed→resumed)
+    let plan_resume = match resume_session {
+        Some(sid) => {
+            let r = build_plan_loop_resume(&sessions_dir, sid)?;
+            let writer = JournalWriter::open(&sessions_dir, sid)
+                .map_err(|e| format!("run journal reopen failed ('{sid}'): {e}"))?;
+            let replay_seq = writer
+                .read_lines()
+                .ok()
+                .and_then(|ls| ls.last().map(|l| l.seq))
+                .unwrap_or(0);
+            writer
+                .session_resumed(
+                    replay_seq,
+                    vec![
+                        format!("plan_state:v{}", r.state.version),
+                        format!("registry:{}", r.state.executed_registry.len()),
+                        format!("nodes:{}", r.node_replay.results.len()),
+                    ],
+                )
+                .map_err(|e| format!("session resumed marker write failed: {e}"))?;
+            drop(writer);
+            Some(r)
+        }
+        None => None,
+    };
+
+    let (wf, marks_session, seed_hash) = match &plan_resume {
+        Some(r) => {
+            // 恢复路径:计划与治理身份取自账面;标记会话缺席=治理身份不可
+            // 恢复,显式失败(全新标记会话会让阶段前置门误拦)
+            let marks = r.state.marks_session.clone().ok_or_else(|| {
+                "resumed run checkpoint lacks marks session - governance identity unrestorable"
+                    .to_string()
+            })?;
+            let wf = serde_json::from_str::<Workflow>(&r.state.cur_workflow)
+                .map_err(|e| format!("checkpoint workflow deserialize failed: {e}"))?;
+            (wf, marks, None)
+        }
+        None => {
+            // ① probe DAG（单 planner 节点，task=goal）→ constitution 校验链（与 CLI
+            //    同一加载入口：schema 全量校验 + 物化，失败 fail-fast 拒载）
+            let probe = probe_workflow_value(goal);
+            let wf = crate::agent::constitution::load_workflow(&probe).map_err(|violations| {
+                format!(
+                    "plan-execute probe workflow failed constitution validation/materialization: {}",
+                    violations.join("; ")
+                )
+            })?;
+            // ③ marks_session 创建（fail-fast，与 CLI 同语义；workflow_run kind 锚定
+            //    本链路——节点完成信号与协作标记都落此会话）
+            let marks = evorule_client
+                .create_session(
+                    Some(&json!({
+                        "kind": "workflow_run",
+                        "workflow_id": "serve_plan_execute",
+                    })),
+                    Some("llm"),
+                )
+                .await
+                .map_err(|e| format!("failed to create workflow marks session: {}", e))?;
+            // ④ seed_hash 锚 = probe DAG canonical JSON 的 BLAKE3（与 CLI「workflow 文件
+            //    原文 hash」同口径；serde_json BTreeMap 键序保证 canonical 确定性）
+            let probe_canonical = serde_json::to_string(&probe).map_err(|e| e.to_string())?;
+            (wf, marks, Some(plan_canonical_hash(&probe_canonical)))
+        }
+    };
 
     // ② DelegateContext 构造（对齐 CLI：toolkit+workdir 成对注入——delegate 按
     //    各子代理 def.tools 白名单过滤挂载；journal 同目录落账）
     let mut ctx = DelegateContext::new("workflow_root", definitions, evorule_client.clone())
         .with_toolkit(toolkit, workdir)
         .with_max_depth(max_depth)
-        .with_journal_dir(workdir.join("data").join("sessions"))
+        .with_journal_dir(sessions_dir)
         .with_governance_segment(governance_segment);
     if max_concurrent > 0 {
         ctx = ctx.with_max_concurrent_delegates(max_concurrent);
     }
 
-    // ③ marks_session 创建（fail-fast，与 CLI 同语义；workflow_run kind 锚定
-    //    本链路——节点完成信号与协作标记都落此会话）
-    let marks_session = evorule_client
-        .create_session(
-            Some(&json!({
-                "kind": "workflow_run",
-                "workflow_id": "serve_plan_execute",
-            })),
-            Some("llm"),
-        )
-        .await
-        .map_err(|e| format!("failed to create workflow marks session: {}", e))?;
-
-    // ④ seed_hash 锚 = probe DAG canonical JSON 的 BLAKE3（与 CLI「workflow 文件
-    //    原文 hash」同口径；serde_json BTreeMap 键序保证 canonical 确定性）
-    let probe_canonical = serde_json::to_string(&probe).map_err(|e| e.to_string())?;
-
-    let outcome = run_plan_loop(
+    let outcome = run_plan_loop_with_resume(
         ctx,
         wf,
         PlanMode::PlanExecute,
         limits,
-        Some(plan_canonical_hash(&probe_canonical)),
+        seed_hash,
         Some(marks_session.clone()),
         container, // 判据 v0：run 请求容器名透传（None = 宿主直执行）
+        plan_resume,
     )
     .await?;
     Ok((outcome, marks_session))
@@ -1788,6 +1999,170 @@ mod tests {
         // 注册表恢复后静态拦截仍生效:恢复态注册表含 n1 → 重复提案被点名
         let repeats = detect_repeated_nodes(&wf.nodes, &[("n1".to_string(), String::new())]);
         assert_eq!(repeats, vec!["n1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_resumable_lists_interrupted_and_excludes_finished() {
+        // 扫尾判据:计划检查点在账且无终态=可恢复;有终态/无计划检查点/
+        // 非 planrun 文件一律排除;坏文件跳过不炸
+        let dir = resume_test_dir("scan");
+        // A:中断 run(计划检查点在账,无终态)
+        {
+            let w = JournalWriter::open(&dir, "planrun-wf-aaa").unwrap();
+            w.plan_loop_checkpointed(
+                2,
+                1,
+                vec![("n1".to_string(), "researcher".to_string())],
+                BudgetCountersSnapshot {
+                    nodes_executed: 3,
+                    wall_ms: 120,
+                    tokens_used: 45,
+                },
+                Some("blake3:ph".into()),
+                Some("goal".into()),
+                Some("marks-1".into()),
+                r#"{"workflow_id":"wf_scan"}"#,
+            )
+            .unwrap();
+        }
+        // B:已完成 run(有终态)→ 排除
+        {
+            let w = JournalWriter::open(&dir, "planrun-wf-bbb").unwrap();
+            w.plan_loop_checkpointed(
+                1,
+                0,
+                vec![],
+                BudgetCountersSnapshot::default(),
+                None,
+                None,
+                None,
+                r#"{"workflow_id":"wf_done"}"#,
+            )
+            .unwrap();
+            w.plan_loop_finished("ok").unwrap();
+        }
+        // C:无计划检查点(仅粒级)→ 排除
+        {
+            let w = JournalWriter::open(&dir, "planrun-wf-ccc").unwrap();
+            w.node_checkpointed("wf", "ph", "n1", "completed", "x")
+                .unwrap();
+        }
+        // 非 planrun 文件 → 忽略;坏文件 → 跳过
+        std::fs::write(
+            dir.join("s-plain.jsonl"),
+            "{}
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("planrun-wf-bad.jsonl"),
+            "not a journal line
+",
+        )
+        .unwrap();
+
+        let runs = scan_resumable_runs(&dir).unwrap();
+        assert_eq!(runs.len(), 1, "恰一个可恢复 run");
+        let a = &runs[0];
+        assert_eq!(a.session_id, "planrun-wf-aaa");
+        assert_eq!(a.version, 2);
+        assert_eq!(a.replan_count, 1);
+        assert_eq!(a.executed_registry_len, 1);
+        assert_eq!(a.workflow_id, "wf_scan");
+        assert_eq!(a.wall_ms, 120);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resume_wall_budget_exhaustion_fails_fast() {
+        // 剩余预算闸:恢复态累计墙钟已 ≥ 限额 = 快速失败(errored 但省 token)
+        let dir = resume_test_dir("wallgate");
+        let wf = resume_chain_wf();
+        let state = PlanLoopCheckpointState {
+            version: 1,
+            replan_count: 0,
+            executed_registry: vec![],
+            counters: BudgetCounters {
+                nodes_executed: 1,
+                wall_ms: 1_000,
+                tokens_used: 0,
+            },
+            cur_canonical_hash: None,
+            goal: None,
+            cur_workflow: serde_json::to_string(&wf).unwrap(),
+            marks_session: None,
+        };
+        let resume = PlanLoopResume {
+            state,
+            node_replay: crate::agent::workflow::NodeCheckpointReplay::default(),
+            run_session_id: "planrun-gate".to_string(),
+        };
+        let limits = DriverLimits {
+            max_replan: 3,
+            max_recuts: 3,
+            max_wall_ms: Some(500),
+            max_tokens: None,
+        };
+        let err = run_plan_loop_with_resume(
+            resume_ctx(&dir),
+            wf,
+            PlanMode::Dsl,
+            limits,
+            None,
+            None,
+            None,
+            Some(resume),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("wall budget already exhausted"),
+            "快速失败: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn plan_loop_finish_marker_written_on_error_exit() {
+        // 终态守卫 Err 路径:PlanExecute probe 失败(planner delegate 不可达)
+        // → run 以 error 终态落地,扫尾不列该 run
+        let dir = resume_test_dir("finish");
+        let wf = resume_chain_wf();
+        let limits = DriverLimits {
+            max_replan: 3,
+            max_recuts: 3,
+            max_wall_ms: None,
+            max_tokens: None,
+        };
+        let result = run_plan_loop(
+            resume_ctx(&dir),
+            wf,
+            PlanMode::PlanExecute,
+            limits,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "planner 不可达必须显式失败");
+        let fname = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .find(|n| n.starts_with("planrun-"))
+            .expect("run journal must exist (opened before probe)");
+        let sid = fname.trim_end_matches(".jsonl");
+        let lines = read_all(&JournalWriter::path_for(&dir, sid)).unwrap();
+        let finished = lines.iter().any(|l| {
+            matches!(
+                l.event,
+                JournalEvent::PlanLoopFinished { ref status } if status == "error"
+            )
+        });
+        assert!(finished, "Err 出口必须落地 error 终态");
+        let runs = scan_resumable_runs(&dir).unwrap();
+        assert!(runs.is_empty(), "已终局 run 不列可恢复: {runs:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

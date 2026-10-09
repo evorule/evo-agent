@@ -197,6 +197,13 @@ pub enum JournalEvent {
         /// 确定性重建——这是恢复面唯一的状态载体)
         cur_workflow: String,
     },
+    /// 计划循环终态标记(驱动循环任意出口落地:ok=完成,error=终断)。恢复面
+    /// 凭本事件判别「已完成/已终断,不再列可恢复」;无终态标记且计划检查点
+    /// 在账 = 中断 run(可恢复候选)。观测面,不参与步映射。
+    PlanLoopFinished {
+        /// ok|error
+        status: String,
+    },
     /// 审批请求开启(60s 窗口 / policy 判定前)
     ApprovalRequested {
         /// 审批提案 id(proposal_id)
@@ -790,6 +797,14 @@ impl JournalWriter {
             goal,
             marks_session,
             cur_workflow: cur_workflow.to_string(),
+        })
+    }
+
+    /// 计划循环终态标记(ok=完成/error=终断;扫尾面凭此把已终局 run 排除出
+    /// 可恢复列表)
+    pub fn plan_loop_finished(&self, status: &str) -> Result<u64, JournalError> {
+        self.push(JournalEvent::PlanLoopFinished {
+            status: status.to_string(),
         })
     }
 
