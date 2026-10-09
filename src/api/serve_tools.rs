@@ -161,6 +161,114 @@ pub async fn build_governance_segment(ev: &EvoruleApiClient, tools: &[String]) -
     }
 }
 
+// =============================================================================
+// 治理知识契约自动注入(S2b_knowledge 槽位内容物;定义声明面驱动——
+// agent 定义声明 knowledge_datasets 即生效,不依赖调用方接线)
+// =============================================================================
+
+/// serve/runner 共用：治理知识契约段构造（定义声明 `knowledge_datasets` 驱动）
+///
+/// - 触发条件：definition `knowledge_datasets` 非空（声明即生效,任何 runner
+///   路径同口径——拉取渲染在 runner 组装期做,不依赖 serve 接线点）；
+/// - 注入位置：S2b_knowledge 独立槽位(S2 治理门禁段之后、S3 记忆区之前)；
+/// - fail-soft：单个数据集拉取失败 → warn 留痕跳过该数据集,绝不阻断会话；
+///   全部数据集均无内容 → None(槽位跳过)；
+/// - 时效：每次 runner 组装实时拉取(无缓存)——契约增删下一会话即反映。
+pub async fn build_knowledge_segment(
+    ev: &EvoruleApiClient,
+    datasets: &[String],
+) -> Option<String> {
+    if datasets.is_empty() {
+        return None;
+    }
+    let mut seg = String::new();
+    for ds in datasets {
+        match ev.knowledge_entries(ds, None, None, None).await {
+            Ok(resp) => {
+                let rendered = render_knowledge_dataset(ds, &resp);
+                if !rendered.is_empty() {
+                    if !seg.is_empty() {
+                        seg.push_str("\n\n");
+                    }
+                    seg.push_str(&rendered);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dataset = %ds,
+                    error = %e,
+                    "knowledge segment: dataset fetch failed; continuing without it"
+                );
+            }
+        }
+    }
+    let trimmed = seg.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// 单数据集条目渲染（确定性纯函数,便于单测）
+///
+/// 条目取 `payload.title/statement/steps` + `entry_id/domain/source_version`
+/// 元数据;字段缺失逐项跳过(防御式)。status 字段在场且非 active 时跳过该
+/// 条目(服务端 entries 端点通常已过滤,此处兜底)。无有效条目 → 空串。
+fn render_knowledge_dataset(dataset: &str, resp: &serde_json::Value) -> String {
+    let entries = match resp.get("entries").and_then(|v| v.as_array()) {
+        Some(e) if !e.is_empty() => e,
+        _ => return String::new(),
+    };
+    let mut out = format!(
+        "【治理知识契约】(数据集 {dataset};以下条目为权威契约,执行相关任务时遵循)"
+    );
+    for entry in entries {
+        if let Some(status) = entry.get("status").and_then(|v| v.as_str()) {
+            if !status.eq_ignore_ascii_case("active") {
+                continue;
+            }
+        }
+        let payload = entry.get("payload");
+        let title = payload
+            .and_then(|p| p.get("title"))
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.get("entry_id").and_then(|v| v.as_str()))
+            .unwrap_or("(untitled)");
+        out.push_str("\n◆ ");
+        out.push_str(title);
+        if let Some(stmt) = payload
+            .and_then(|p| p.get("statement"))
+            .and_then(|v| v.as_str())
+        {
+            out.push('\n');
+            out.push_str(stmt);
+        }
+        let steps: Vec<&str> = payload
+            .and_then(|p| p.get("steps"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        if !steps.is_empty() {
+            out.push_str("\n步骤:");
+            for (i, s) in steps.iter().enumerate() {
+                out.push_str(&format!("\n{}. {}", i + 1, s));
+            }
+        }
+        let mut meta: Vec<String> = Vec::new();
+        if let Some(d) = entry.get("domain").and_then(|v| v.as_str()) {
+            meta.push(format!("域:{d}"));
+        }
+        if let Some(v) = entry.get("source_version").and_then(|v| v.as_str()) {
+            meta.push(format!("版本:{v}"));
+        }
+        if !meta.is_empty() {
+            out.push_str(&format!("\n({})", meta.join(" · ")));
+        }
+    }
+    out
+}
+
 pub async fn apply_l2_feed_forward(
     ev: &EvoruleApiClient,
     tools: &[String],
@@ -1263,6 +1371,67 @@ service_tools = ["config_persist", "rule_sandbox"]
         assert_eq!(prompt2, "base prompt", "未命中起草族不得改动 system_prompt");
     }
 
+    // ===== 治理知识契约段测试(S2b_knowledge 槽位内容物) =====
+
+    #[tokio::test]
+    async fn test_build_knowledge_segment_empty_fast_path() {
+        // 空 datasets → None(快路径,无网络调用;端点不可达也走不到请求)
+        let ev = EvoruleApiClient::new("http://localhost:0");
+        assert!(build_knowledge_segment(&ev, &[]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_knowledge_segment_fail_soft() {
+        // 端点不可达 → 拉取失败 warn 跳过,不 panic,返回 None(槽位跳过)
+        let ev = EvoruleApiClient::new("http://localhost:0");
+        let datasets = vec!["some-dataset".to_string()];
+        assert!(build_knowledge_segment(&ev, &datasets).await.is_none());
+    }
+
+    #[test]
+    fn test_render_knowledge_dataset() {
+        // 正常条目(title/statement/steps/元数据全字段)+ 非 active 条目跳过
+        let resp: serde_json::Value = serde_json::json!({
+            "dataset_id": "tb-contracts",
+            "entries": [
+                {
+                    "entry_id": "tb-contract-verifier-env-preflight",
+                    "status": "archived",
+                    "payload": {"title": " archived", "statement": "gone"}
+                },
+                {
+                    "entry_id": "tb-contract-verifier-output-layout",
+                    "payload": {
+                        "title": "判分产出落位契约",
+                        "statement": "TB 判分题的 agent 产出必须落判分器约定的固定路径与格式",
+                        "steps": ["读题面 verifier 约定", "按约定路径落产出"]
+                    },
+                    "domain": "tb",
+                    "source_version": "v1"
+                }
+            ]
+        });
+        let seg = render_knowledge_dataset("tb-contracts", &resp);
+        assert!(seg.starts_with("【治理知识契约】(数据集 tb-contracts"));
+        assert!(seg.contains("◆ 判分产出落位契约"));
+        assert!(seg.contains("1. 读题面 verifier 约定"));
+        assert!(seg.contains("2. 按约定路径落产出"));
+        assert!(seg.contains("(域:tb · 版本:v1)"));
+        assert!(!seg.contains("gone"), "非 active 条目应跳过");
+
+        // title 缺失 → entry_id 兜底;statement/steps/元数据全缺 → 只渲染标题行
+        let minimal: serde_json::Value = serde_json::json!({
+            "entries": [{"entry_id": "bare-entry", "payload": {}}]
+        });
+        let seg2 = render_knowledge_dataset("ds", &minimal);
+        assert!(seg2.contains("◆ bare-entry"));
+        assert!(!seg2.contains("步骤:"));
+
+        // 空 entries/非法结构 → 空串(调用侧不拼段)
+        assert_eq!(render_knowledge_dataset("ds", &serde_json::json!({"entries": []})), "");
+        assert_eq!(render_knowledge_dataset("ds", &serde_json::json!({})), "");
+    }
+
     #[test]
     fn test_union_toolkit_contains_evolution_signals() {
         let (ws, ev) = make_clients();
@@ -1373,6 +1542,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             identity_segment: None,
             north_star: None,
             handoff: None,
+            knowledge_datasets: None,
         }
     }
 
