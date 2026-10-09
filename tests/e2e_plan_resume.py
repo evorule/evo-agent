@@ -35,11 +35,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import os
 import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -247,6 +250,193 @@ def scenario_k(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
     return ok
 
 
+
+
+# ===== 场景 L:serve 面 kill 注入 + 扫尾 + 显式恢复(人类持剑全链) =====
+
+SERVE_PORT = 18092
+SERVE_BASE = f"http://127.0.0.1:{SERVE_PORT}"
+
+# 与 e2e_plan_execute.py 场景 F 同一研究任务的等价形态(PlanFact 指示词随 goal 携带)
+SCENARIO_L_GOAL = (
+    "Goal: research the topic 'evorule deterministic workflow engine design' and produce "
+    "a research digest. Produce a PlanFact JSON for this goal: 2-4 llm nodes with "
+    'agent_type "researcher" (collect key facts, then synthesize a structured digest), '
+    "exactly one sink node. Output ONLY the PlanFact JSON object."
+)
+
+
+def wait_serve_health(timeout_s: float = 60.0) -> Optional[str]:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{SERVE_BASE}/health", timeout=3) as resp:
+                if resp.status == 200:
+                    return None
+        except Exception:  # noqa: BLE001 — 轮询期连接拒绝/超时均属预期
+            pass
+        time.sleep(0.5)
+    return f"serve health 未就绪（{timeout_s}s 超时）"
+
+
+def http_json(method: str, url: str, body: Optional[dict] = None, timeout: float = 900) -> tuple:
+    """HTTP JSON 请求;返回 (status, parsed|None, raw_text)"""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            try:
+                return resp.status, json.loads(text), text
+            except ValueError:
+                return resp.status, None, text
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", errors="replace")
+        try:
+            return e.code, json.loads(text), text
+        except ValueError:
+            return e.code, None, text
+
+
+def scenario_l(env: Dict[str, str], evidence_dir: Optional[Path]) -> bool:
+    """serve 面 kill 注入 + 扫尾 + 显式恢复。
+
+    断言五条：
+      ① kill serve 进程(taskkill /F 树杀)后重启(watchdog 拉起的脚本等价物)；
+      ② GET /api/sessions/resumable 列出被杀 run(计划检查点在账且无终态)；
+      ③ 带 resume_session_id 重放 → HTTP 200 且 success=true；
+      ④ run_session_id 同会话续写;合并账本每粒至多一条检查点(零重执行)；
+      ⑤ content 非空。
+    """
+    print("\n=== 场景 L: serve 面 kill 注入 + 扫尾 + 显式恢复 ===")
+    if not BINARY.exists():
+        print(f"  {RED}FAIL{RESET}  编译产物缺失: {BINARY}")
+        return False
+    proc_env = {**os.environ, **env}
+
+    def spawn_serve() -> subprocess.Popen:
+        return subprocess.Popen(
+            [str(BINARY), "serve", "--workdir", str(REPO_ROOT),
+             "--host", "127.0.0.1", "--port", str(SERVE_PORT), "--no-auth"],
+            cwd=str(REPO_ROOT), env=proc_env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    serve = spawn_serve()
+    err = wait_serve_health()
+    if err:
+        kill_hard(serve.pid)
+        print(f"  {RED}FAIL{RESET}  serve 启动失败: {err}")
+        return False
+    print(f"  {GREEN}PASS{RESET}  serve 健康（{SERVE_BASE}/health）")
+
+    # ① 后台发起 plan-execute run
+    run_result: dict = {}
+
+    def do_run(tag: str, body: dict) -> None:
+        run_result[tag] = http_json(
+            "POST", f"{SERVE_BASE}/agents/general/run", body
+        )
+
+    thread = threading.Thread(
+        target=do_run,
+        args=("initial", {"agent_type": "general", "goal": SCENARIO_L_GOAL,
+                          "execution": {"mode": "plan_execute"}}),
+        daemon=True,
+    )
+    thread.start()
+
+    # ② 轮询注入窗口:v1 计划在账 + ≥1 粒完成
+    sid: Optional[str] = None
+    deadline = time.time() + POLL_TIMEOUT_SECS
+    while time.time() < deadline:
+        if not thread.is_alive():
+            print(f"  {RED}FAIL{RESET}  run 在注入窗口前自行完成（无法注入）")
+            kill_hard(serve.pid)
+            return False
+        sid = newest_planrun_session()
+        if sid:
+            events = journal_events(SESSIONS_DIR / f"{sid}.jsonl")
+            if count_events(events, "plan_loop_checkpointed") >= 1 and count_events(
+                events, "node_checkpointed"
+            ) >= 1:
+                break
+        time.sleep(POLL_INTERVAL_SECS)
+    else:
+        kill_hard(serve.pid)
+        print(f"  {RED}FAIL{RESET}  轮询超时未达注入窗口")
+        return False
+    print(f"  ···  注入窗口到达: 会话 {sid}")
+
+    # ③ 强杀 serve 进程树(watchdog 拉起的脚本等价物=重启 serve)
+    kill_hard(serve.pid)
+    serve.wait(timeout=30)
+    thread.join(timeout=10)
+    print(f"  {GREEN}PASS{RESET}  serve 已强杀（{'taskkill /F' if os.name == 'nt' else 'kill -9'} 树杀）")
+
+    serve = spawn_serve()
+    err = wait_serve_health()
+    if err:
+        print(f"  {RED}FAIL{RESET}  serve 重启失败: {err}")
+        return False
+    print(f"  {GREEN}PASS{RESET}  serve 已重启（watchdog 拉起等价）")
+
+    ok = True
+    try:
+        # ④ 扫尾:被杀 run 必须在列
+        status, parsed, _ = http_json("GET", f"{SERVE_BASE}/api/sessions/resumable", timeout=30)
+        listed = [
+            r for r in (parsed or {}).get("resumable", [])
+            if r.get("session_id") == sid
+        ]
+        ok = check(
+            status == 200 and listed,
+            "GET /api/sessions/resumable 列出被杀 run",
+            f"被杀 run 未在扫尾列表: status={status} parsed={parsed}",
+        ) and ok
+
+        # ⑤ 显式恢复(人类持剑:续跑仅经 resume_session_id)
+        status, parsed, raw = http_json(
+            "POST", f"{SERVE_BASE}/agents/general/run",
+            body={"agent_type": "general", "goal": SCENARIO_L_GOAL,
+                  "execution": {"mode": "plan_execute"},
+                  "resume_session_id": sid},
+        )
+        if evidence_dir is not None:
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            (evidence_dir / "scenarioL_resume_response.json").write_text(raw, encoding="utf-8")
+        ok = check(
+            status == 200 and (parsed or {}).get("success") is True,
+            f"恢复跑 HTTP 200 且 success=true（status={status}）",
+            f"恢复跑失败: status={status} body={raw[:300]}",
+        ) and ok
+        ok = check(
+            (parsed or {}).get("run_session_id") == sid,
+            "恢复跑续写同一 run 会话（run_session_id 透出）",
+            f"会话不一致: {(parsed or {}).get('run_session_id')}",
+        ) and ok
+        ok = check(
+            (parsed or {}).get("content", "") != "",
+            "恢复跑产出非空 content",
+            "恢复跑 content 为空",
+        ) and ok
+
+        # ⑥ 零重执行:合并账本每粒至多一条检查点
+        merged = journal_events(SESSIONS_DIR / f"{sid}.jsonl")
+        ckpt_nodes = checkpoint_node_ids(merged)
+        duplicates = sorted({n for n in ckpt_nodes if ckpt_nodes.count(n) > 1})
+        ok = check(
+            not duplicates,
+            f"零重执行:每粒至多一条检查点（共 {len(ckpt_nodes)} 条）",
+            f"发现重复检查点粒: {duplicates}",
+        ) and ok
+    finally:
+        kill_hard(serve.pid)
+    return ok
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="plan-execute 中断恢复 E2E（kill 注入+恢复双跑）")
     parser.add_argument(
@@ -269,7 +459,15 @@ def main() -> int:
     if not SESSIONS_DIR.exists():
         print(f"  ···  账本目录不存在，首跑将创建: {SESSIONS_DIR}")
 
-    ok = scenario_k(env, args.evidence_dir)
+    only = None
+    if "--only" in sys.argv:
+        only = sys.argv[sys.argv.index("--only") + 1]
+    if only == "L":
+        ok = scenario_l(env, args.evidence_dir)
+    else:
+        ok = scenario_k(env, args.evidence_dir)
+        if only in (None, "L"):
+            ok = scenario_l(env, args.evidence_dir) and ok
     print(f"\n{'=' * 60}")
     print(f"结果: {'ALL PASS' if ok else 'FAILED'}")
     return 0 if ok else 1

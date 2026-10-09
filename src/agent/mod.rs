@@ -62,8 +62,8 @@ pub use delegate::{DelegateContext, DEFAULT_MAX_CONCURRENT_DELEGATES};
 pub use driver::{
     build_plan_loop_resume, build_plan_summary, build_replan_task, extract_plan_json,
     inject_plan_meta, plan_canonical_hash, replay_plan_loop_checkpoint, run_plan_loop,
-    run_plan_loop_with_resume, DriverLimits, PlanLoopCheckpointState, PlanLoopOutcome,
-    PlanLoopResume, PlanLoopStats, PlanMode,
+    run_plan_loop_with_resume, scan_resumable_runs, DriverLimits, PlanLoopCheckpointState,
+    PlanLoopOutcome, PlanLoopResume, PlanLoopStats, PlanMode, ResumableRunInfo,
 };
 pub use materializer::{materialize_plan_fact, materialize_workflow_dag, MATERIALIZER_VERSION};
 pub use memory::{MemoryError, MemoryManager};

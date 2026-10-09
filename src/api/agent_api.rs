@@ -79,6 +79,13 @@ pub struct AgentRunRequest {
     /// 请求方可设。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecutionSpec>,
+    /// 恢复此前中断的 plan-execute run(可选;值为 run 级账本会话名,即
+    /// planrun- 前缀 id,由上次响应 run_session_id 透出或
+    /// GET /api/sessions/resumable 列出)。恢复仅经显式入参——无人监督的
+    /// 自动续跑不做(人类持剑);仅 execution.mode=plan_execute 时合法,
+    /// react 面携带 = 400。LLM 面不可见该字段——仅 HTTP 请求方可设。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_session_id: Option<String>,
 }
 
 /// Agent run response
@@ -102,6 +109,10 @@ pub struct AgentRunResponse {
     /// 字段语义见 `driver::PlanLoopStats`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_stats: Option<PlanStatsResponse>,
+    /// run 级账本会话名(plan-execute 面透出;调用方留存即可在中断后凭
+    /// resume_session_id 显式恢复。react/缺省不序列化)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_session_id: Option<String>,
 }
 
 /// plan-execute 驱动循环统计(stats 七项透出;字段语义见 `driver::PlanLoopStats`)
@@ -461,6 +472,12 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         )
         // 对话与历史:会话枚举(本地索引)+ 消息历史投影(evorule facts 权威读)
         .route("/api/sessions", axum::routing::get(list_sessions))
+        // 扫尾查询:可恢复 run 列表(计划检查点在账且无终态标记;人类持剑——
+        // 只列不续,续跑决策权在显式 resume 调用方)
+        .route(
+            "/api/sessions/resumable",
+            axum::routing::get(list_resumable_runs),
+        )
         .route(
             "/api/sessions/{id}/transcript",
             axum::routing::get(get_transcript),
@@ -753,6 +770,16 @@ async fn run_agent(
     // 分支不消费 def，行为等价于「覆盖之后、AgentRunner 构造之前」）：
     // mode=plan_execute 走外层驱动循环（plan-execute 挂 driver），react（缺省/
     // None）走既有单代理路径（下方逐字节不动）。未知 mode = 400。
+    // 恢复旗标仅对 plan_execute 有意义:react 面带 resume_session_id = 400
+    // (误配置显式化,不静默忽略)。
+    if req.resume_session_id.is_some()
+        && !matches!(req.execution.as_ref().map(|e| e.mode.as_str()), Some(m) if m == "plan_execute")
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "resume_session_id requires execution.mode=\"plan_execute\"".to_string(),
+        ));
+    }
     match req
         .execution
         .as_ref()
@@ -913,6 +940,7 @@ async fn run_agent(
         error: result.error,
         session_id,
         plan_stats: None,
+        run_session_id: None,
     }))
 }
 
@@ -922,6 +950,18 @@ async fn run_agent(
 /// - 成功：`session_id` = marks_session（会话关联收口），`plan_stats` 透出七项；
 /// - 失败：与 react 路径执行失败同封套（HTTP 200 + success=false + error 原文），
 ///   消费者处理口径统一；marks_session 创建失败即断（fail-fast，留痕是硬义务）。
+/// 扫尾查询:可恢复 run 列表(只读投影;恢复仅经显式 resume_session_id,
+/// 不自动续跑)。单文件读败跳过并告警——列表面健壮性优先。
+async fn list_resumable_runs(
+    State(state): State<AgentApiState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let dir = state.workdir.join("data").join("sessions");
+    match crate::agent::driver::scan_resumable_runs(&dir) {
+        Ok(runs) => Ok(Json(serde_json::json!({ "resumable": runs }))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
 async fn run_plan_execute_request(
     state: &AgentApiState,
     agent_type: &str,
@@ -957,9 +997,10 @@ async fn run_plan_execute_request(
         governance_segment,
         &req.goal,
         limits,
-        3,                     // max_depth（与 CLI workflow 子命令缺省一致）
+        3,                                // max_depth（与 CLI workflow 子命令缺省一致）
         5,                     // max_concurrent（与 CLI workflow 子命令缺省一致，0=不限流）
         req.container.clone(), // 判据 v0：run 请求容器名透传（P1 执行桥同源）
+        req.resume_session_id.as_deref(), // 恢复旗标（None = 全新跑）
     )
     .await;
     let (outcome, marks_session) = match run {
@@ -978,6 +1019,7 @@ async fn run_plan_execute_request(
                 error: Some(e),
                 session_id: None,
                 plan_stats: None,
+                run_session_id: None,
             }));
         }
     };
@@ -1006,6 +1048,7 @@ async fn run_plan_execute_request(
         duration_ms: started.elapsed().as_millis() as u64,
         error: None,
         session_id: Some(marks_session),
+        run_session_id: outcome.run_session_id.clone(),
         plan_stats: Some(PlanStatsResponse {
             plan_versions: outcome.stats.plan_versions,
             replans: outcome.stats.replans,
@@ -2364,6 +2407,7 @@ mod tests {
             container: None,
             workspace: None,
             execution: None,
+            resume_session_id: None,
         };
 
         let response = app
@@ -2539,6 +2583,7 @@ mod tests {
             error: None,
             session_id: Some("sess-1".to_string()),
             plan_stats: None,
+            run_session_id: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("success"));
@@ -2577,6 +2622,7 @@ mod tests {
                 tokens_used: 1024,
                 replan_tokens: 0,
             }),
+            run_session_id: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2721,6 +2767,7 @@ mod tests {
             container: None,
             workspace: None,
             execution: None,
+            resume_session_id: None,
         };
         let response = rt.block_on(async {
             app.oneshot(
