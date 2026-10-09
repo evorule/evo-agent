@@ -1,0 +1,32 @@
+{
+  "agent_type": "l1-test",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "L1 链路 E2E 验证专用（governor 2026-10-09）：显式触发事件提取→治理门晋升→evorule-rule 入账全链 MiniMax 实测",
+  "model": "MiniMax-M2.5",
+  "context_window_tokens": 128000,
+  "max_steps": 8,
+  "system_prompt": "You are a minimal test agent for L1 chain verification. Answer briefly in the user's language. No tool calls unless explicitly asked.",
+  "temperature": 0.3,
+  "step_timeout_secs": 60,
+  "memory": {
+    "type": "persistent",
+    "namespace": "l1-test",
+    "summary_model": "MiniMax-M2.5",
+    "recipe": {
+      "recipe_version": "memory-v1.0",
+      "retrieval": {},
+      "budget": {},
+      "promote_gate": {
+        "enabled": true,
+        "dataset_id": "tb-gate-v1",
+        "auto_transition": false
+      },
+      "lifecycle": {
+        "promote_min_confidence": 0.8,
+        "promote_min_uses": 1
+      }
+    }
+  },
+  "tools": ["file_read", "file_list", "search_files"]
+}

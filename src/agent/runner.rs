@@ -2014,12 +2014,12 @@ impl AgentRunner {
         if let Some(memory) = self.memory.as_mut() {
             // F-616:usage 增量批量回写(sediment 前刷,批量端点一次 HTTP)
             memory.flush_usage(session_id).await;
-            // F-609 执行器:生命周期规则应用(晋升/归档,Recipe 阈值)
-            // (async fn 必须显式 .await——不 await 则 Future 被 drop 静默不执行)
+            // L1 修复(断点5-时序):apply_lifecycle_transitions 移至 sediment 之后。
+            // 旧序:lifecycle→sediment——本会话新捕获的 Captured 事件必然缺席
+            // 本次生命周期检查(sediment 还没跑),单次会话模式下永远等不到
+            // 「下一次」检查。新序:sediment 先捕获→lifecycle 紧随检查,事件
+            // 出生即受检;已水合的历史事件同批受检(断点5-水合配合)。
             let recipe = memory.recipe.clone().unwrap_or_default();
-            memory
-                .apply_lifecycle_transitions(session_id, &recipe)
-                .await;
             let mut deps = sediment::SedimentDeps {
                 memory,
                 summarizer: self.summarizer.as_ref(),
@@ -2078,6 +2078,15 @@ impl AgentRunner {
                     persisted = result.stable_facts.len(),
                     "sediment: 部分 stable 事实仅本地 cache（持久化失败），由 B3 对账补偿"
                 );
+            }
+            // L1 修复(断点5-时序,后半):sediment 完成后执行生命周期检查——
+            // 本会话新捕获的 Captured 事件与已水合的历史事件在此同批受检。
+            // (冷迁仍在其后,保持 F-617 原序)
+            {
+                let mem = self.memory.as_mut().unwrap();
+                let recipe = mem.recipe.clone().unwrap_or_default();
+                mem.apply_lifecycle_transitions(session_id, &recipe)
+                    .await;
             }
         }
         Ok(())
@@ -4400,6 +4409,35 @@ impl AgentRunner {
         info!(%session_id, fact_count = recalled_ids.len(), "Auto-recalled shared facts");
 
         if let Some(mem) = self.memory.as_mut() {
+            // L1 修复(断点5-水合,CLI 路径):auto_recall 是 CLI 模式的召回主路径
+            // (不走 recall_context)——events 分区事实在此注入水合暂存区,
+            // 会话末 flush_usage/apply_lifecycle 吸收进 cache,跨会话晋升链
+            // 在 CLI 模式闭合。fact_id 从 SharedFactEntry 带入(镜像匹配键)。
+            {
+                let mut hp = mem
+                    .hydration_pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                for (fact, _) in &latest {
+                    if fact.path.contains(".events.") || fact.path.contains("shared.") && fact.path.contains(".events") {
+                        // path 形如 shared.{ns}.events.{event_id} → cache_key=shared::{ns}.events.{id}
+                        // 与 path_to_cache_key 同构(Shared 域 strip 前缀)
+                        let ns = &self.sediment_config.namespace;
+                        if let Some(key) = fact
+                            .path
+                            .strip_prefix(&format!("shared.{ns}."))
+                            .map(|k| format!("shared::{k}"))
+                        {
+                            if let Ok(mut r) =
+                                serde_json::from_value::<crate::agent::memory::MemoryRecord>(fact.value.clone())
+                            {
+                                r.fact_id = Some(fact.fact_id);
+                                hp.push((key, r));
+                            }
+                        }
+                    }
+                }
+            }
             // 直写主体 cache——原实现 clone 后写,server 有写但主体
             // cache 永不含该条目(靠 B3 对账回填,对账前视图不一致)
             mem.set("auto_recall_context", &recalled_content).await?;
