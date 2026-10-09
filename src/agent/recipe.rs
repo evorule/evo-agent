@@ -287,6 +287,11 @@ pub struct SourcesSection {
     /// 双通道笔记事件驱动草稿源（work 型，sediment 确定性投影）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub failure_drafts: bool,
+    /// 任务域事件触发词（战役 B：英文任务型会话的事件提取触发补口；
+    /// 穿线至 extractor config.task_keywords，命中按 Keyword 通道放行
+    /// ——confidence 0.8 语义，零新增置信语义；缺省空=既有 agent 零影响）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_event_keywords: Vec<String>,
 }
 
 fn default_degradation() -> Vec<String> {

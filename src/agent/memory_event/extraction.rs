@@ -52,6 +52,10 @@ pub struct ExtractionConfig {
     pub explicit_phrases: Vec<String>,
     /// 提取模型名称(None = fallback 到主模型)
     pub extraction_model: Option<String>,
+    /// 任务域触发词（战役 B：英文任务型会话对人生事件词表零覆盖的补口；
+    /// 由 runner 从 Recipe sources.task_event_keywords 注入，缺省空=零影响；
+    /// 命中按 Keyword 通道放行——confidence 沿用 0.8 语义）
+    pub task_keywords: Vec<String>,
 }
 
 impl Default for ExtractionConfig {
@@ -63,6 +67,7 @@ impl Default for ExtractionConfig {
                 .map(|s| s.to_string())
                 .collect(),
             extraction_model: None,
+            task_keywords: Vec::new(),
         }
     }
 }
@@ -136,6 +141,12 @@ impl EventExtractor {
         Self { llm, config }
     }
 
+    /// 注入任务域触发词（战役 B：Recipe sources.task_event_keywords 穿线；
+    /// runner 在 recipe 解析后调用——extractor 构造先于 recipe 解析）
+    pub fn set_task_keywords(&mut self, keywords: Vec<String>) {
+        self.config.task_keywords = keywords;
+    }
+
     /// 从默认配置创建
     pub fn with_defaults(llm: LlmHandler) -> Self {
         Self::new(llm, ExtractionConfig::default())
@@ -147,20 +158,30 @@ impl EventExtractor {
         self
     }
 
-    /// 检测触发类型(不调 LLM,纯文本匹配)
+    /// 检测触发类型(不调 LLM,纯文本匹配,大小写不敏感——英文任务描述
+    /// 句首大写 "Create" 须命中小写触发词 "create";中文无大小写零影响)
     ///
     /// 优先级:显式 > 关键词
     pub fn detect_trigger(&self, user_message: &str) -> Option<ExtractionTrigger> {
+        let msg_lc = user_message.to_lowercase();
         // 1. 显式触发
         for phrase in &self.config.explicit_phrases {
-            if user_message.contains(phrase) {
+            if msg_lc.contains(&phrase.to_lowercase()) {
                 return Some(ExtractionTrigger::Explicit);
             }
         }
 
         // 2. 关键词触发
         for keyword in &self.config.keywords {
-            if user_message.contains(keyword) {
+            if msg_lc.contains(&keyword.to_lowercase()) {
+                return Some(ExtractionTrigger::Keyword(keyword.clone()));
+            }
+        }
+
+        // 3. 任务域触发（Recipe sources.task_event_keywords 注入，缺省空；
+        //    Keyword 同通道——confidence 0.8 语义）
+        for keyword in &self.config.task_keywords {
+            if msg_lc.contains(&keyword.to_lowercase()) {
                 return Some(ExtractionTrigger::Keyword(keyword.clone()));
             }
         }
@@ -467,6 +488,23 @@ mod tests {
         );
         // 默认关键词不生效
         assert_eq!(extractor.detect_trigger("今天是我生日"), None);
+    }
+
+    #[test]
+    fn test_task_keywords_trigger() {
+        // 战役 B：任务域触发词独立通道（Recipe sources.task_event_keywords 注入），
+        // 缺省空=既有 agent 零影响；命中走 Keyword 通道（confidence 0.8 语义）
+        let mut extractor = EventExtractor::with_defaults(LlmHandler::mock(""));
+        // 缺省空：英文任务描述不触发
+        assert_eq!(
+            extractor.detect_trigger("Create /app/summary.csv that aggregates sales by product"),
+            None
+        );
+        extractor.set_task_keywords(vec!["create".to_string()]);
+        assert_eq!(
+            extractor.detect_trigger("Create /app/summary.csv that aggregates sales by product"),
+            Some(ExtractionTrigger::Keyword("create".to_string()))
+        );
     }
 
     #[tokio::test]

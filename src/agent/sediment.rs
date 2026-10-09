@@ -228,8 +228,9 @@ pub async fn sediment(
     // `shared.{ns}.events.*`（与召回层 `recall_context` 读取前缀一致——
     // 报告 §6.3 增量结论：仅接线 extractor 而不改写入目标，事件层仍不可达）。
     if cfg.enable_event_extraction {
-        if let Some(extractor) = deps.extractor.take() {
-            extract_and_store_events(extractor, deps, session_id, messages, &mut result).await;
+        if let Some(mut extractor) = deps.extractor.take() {
+            extract_and_store_events(&mut extractor, deps, session_id, messages, &mut result)
+                .await;
         }
     }
 
@@ -1311,7 +1312,10 @@ async fn extract_and_store_events(
         let Message::User { content } = msg else {
             continue;
         };
-        // 触发检测（显式/关键词，纯文本匹配，不调 LLM）
+        // 触发检测（显式/关键词/任务域词，纯文本匹配，不调 LLM）
+        // 战役 B 补口：任务域触发词由 runner 从 Recipe sources.task_event_keywords
+        // 注入 extractor config——detect_trigger 统一扩展（含 extract_from_conversation
+        // 内部复检），Keyword 通道放行——confidence 沿用 0.8 语义，零新增置信语义
         if extractor.detect_trigger(content).is_none() {
             continue;
         }
