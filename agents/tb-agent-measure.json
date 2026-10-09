@@ -42,10 +42,11 @@
     "causal_order",
     "lineage_of"
   ],
+  "knowledge_datasets": ["tb-contracts"],
   "memory": {
     "type": "persistent",
-    "namespace": "tb-agent",
-    "lex_store": "D:/evo-agent/data/lex/tb-agent.db",
+    "namespace": "tb-agent-rerun",
+    "lex_store": "D:/evo-agent/data/lex/tb-agent-rerun.db",
     "summary_model": "MiniMax-M2.5",
     "recipe": {
       "recipe_version": "memory-v1.1",
