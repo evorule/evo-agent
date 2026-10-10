@@ -808,6 +808,60 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// GET /api/rules/hit-stats —— 规则命中统计清单（装备代谢数据源，39 号批 B3）
+    ///
+    /// 返回 `{ruleset_version, total_rules, generated_at_ms,
+    /// entries:[{source,index,instr_type,hit_count,first_hit_seq,last_hit_seq,
+    /// last_hit_at_ms}], zero_hits:[{source,index,instr_type}]}`。
+    /// `filter`：None=all（默认，命中清单+零命中清单）| Some("hits")=仅命中 |
+    /// Some("zero")=仅零命中（死规则候选）；非法值 → 400。`version` 缺省 =
+    /// 当前版本，超出保留窗口 → 404。
+    pub async fn get_hit_stats(
+        &self,
+        version: Option<&str>,
+        filter: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        let mut url = self.core.url("/api/rules/hit-stats");
+        let mut params: Vec<String> = Vec::new();
+        if let Some(v) = version {
+            params.push(format!("version={}", urlencode(v)));
+        }
+        if let Some(f) = filter {
+            params.push(format!("filter={}", urlencode(f)));
+        }
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// GET /api/rules/hit-stats/{rule_key} —— 单规则跨版本命中切片（39 号批 B3）
+    ///
+    /// `rule_key` 形如 `{index}@{source}`：`index` 为合并规则列表下标，`source`
+    /// 为来源标签（宪法规则集为 `core_eval`，业务规则为 rules_dir 相对路径）。
+    /// 本方法对 rule_key 整体百分号编码（`/` → `%2F`），调用方传原始形态即可。
+    /// 返回 `{source,index,instr_type,hit_total,series:[{ruleset_version,
+    /// hit_count,...}]}`（无统计的已知版本计 0）。
+    pub async fn get_hit_stats_series(&self, rule_key: &str) -> Result<Value, ApiError> {
+        let url = self
+            .core
+            .url(&format!("/api/rules/hit-stats/{}", urlencode(rule_key)));
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// **已废弃**：使用 `verify_audit_typed` 替代。此方法字段名已修正（valid→verified）。
     pub async fn verify_audit(&self, session_id: &str) -> Result<bool, ApiError> {
         let url = format!(
@@ -1750,5 +1804,99 @@ mod tests {
             .transition_knowledge_entry("ds-a24", "k-2", "c")
             .await
             .is_err());
+    }
+
+    // ===== B3：规则命中统计（39 号批）=====
+
+    /// 请求形状：query 带 version+filter（urlencode）；响应透传
+    #[tokio::test]
+    async fn test_get_hit_stats_request_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/rules/hit-stats")
+            .match_query("version=v-abc123&filter=zero")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ruleset_version":"v-abc123","total_rules":3,"generated_at_ms":1700000000000,
+                    "entries":[],"zero_hits":[{"source":"core_eval","index":2,"instr_type":"branch"}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let resp = client
+            .get_hit_stats(Some("v-abc123"), Some("zero"))
+            .await
+            .unwrap();
+        assert_eq!(resp["ruleset_version"], "v-abc123");
+        assert_eq!(resp["zero_hits"][0]["index"], 2);
+        mock.assert_async().await;
+    }
+
+    /// 缺省形状：version/filter 均为 None 时不带 query
+    #[tokio::test]
+    async fn test_get_hit_stats_default_no_query() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/rules/hit-stats")
+            .match_query(mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ruleset_version":"v1","total_rules":0,"entries":[],"zero_hits":[]}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        client.get_hit_stats(None, None).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    /// 错误透出：filter 非法 → 400 上抛（check_response 口径）
+    #[tokio::test]
+    async fn test_get_hit_stats_invalid_filter_error() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/rules/hit-stats")
+            .match_query("filter=bogus")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"invalid filter"}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        assert!(client.get_hit_stats(None, Some("bogus")).await.is_err());
+    }
+
+    /// 请求形状：rule_key 整体百分号编码（`/` → %2F）落到 path
+    #[tokio::test]
+    async fn test_get_hit_stats_series_url_encoded() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                // 线上形态断言：@→%40、/→%2F（urlencode 全保留字编码口径）
+                mockito::Matcher::Regex(
+                    r"^/api/rules/hit-stats/2%40rules%2Fbundles%2Fexpenses\.json$".to_string(),
+                ),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"source":"rules/bundles/expenses.json","index":2,"instr_type":"io_request",
+                    "hit_total":7,"series":[{"ruleset_version":"v1","hit_count":7}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let resp = client
+            .get_hit_stats_series("2@rules/bundles/expenses.json")
+            .await
+            .unwrap();
+        assert_eq!(resp["hit_total"], 7);
+        assert_eq!(resp["series"][0]["hit_count"], 7);
+        mock.assert_async().await;
     }
 }

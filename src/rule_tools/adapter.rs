@@ -1385,7 +1385,55 @@ pub static KNOWLEDGE_ENTRY_GET: EndpointBinding = EndpointBinding {
 };
 
 // =============================================================================
-// 全量透传 binding 表（40 个 = D-1 分类表纯透传族全集）
+// hit-stats 族（2，只读观测面）—— 装备代谢数据源（39 号批 B3）
+// =============================================================================
+
+pub static HIT_STATS: EndpointBinding = EndpointBinding {
+    name: "hit_stats",
+    client: ClientKind::Evorule,
+    path: "/api/rules/hit-stats",
+    description: "List rule hit statistics for the current (or a historical) ruleset \
+                  version (GET /api/rules/hit-stats). filter=hits returns hit \
+                  entries only, filter=zero returns zero-hit dead-rule candidates.",
+    params: &[
+        ParamBinding {
+            name: "version",
+            loc: Loc::Query,
+            url_encode: true,
+            description: "Ruleset version (default: current); versions outside the \
+                          retention window are rejected with 404.",
+            ..PARAM_DEFAULTS
+        },
+        ParamBinding {
+            name: "filter",
+            loc: Loc::Query,
+            url_encode: true,
+            description: "all (default) | hits | zero.",
+            ..PARAM_DEFAULTS
+        },
+    ],
+    ..BINDING_DEFAULTS
+};
+
+pub static HIT_STATS_SERIES: EndpointBinding = EndpointBinding {
+    name: "hit_stats_series",
+    client: ClientKind::Evorule,
+    path: "/api/rules/hit-stats/{rule_key}",
+    description: "Per-rule cross-version hit series (GET \
+                  /api/rules/hit-stats/{rule_key}). rule_key format: {index}@{source}, \
+                  e.g. 0@core_eval or 2@rules%2Fbundles%2Fexpenses.json.",
+    params: &[ParamBinding {
+        name: "rule_key",
+        loc: Loc::Path,
+        required: true,
+        description: "Rule key: {index}@{source} (source URL-encoded).",
+        ..PARAM_DEFAULTS
+    }],
+    ..BINDING_DEFAULTS
+};
+
+// =============================================================================
+// 全量透传 binding 表（42 个 = D-1 分类表纯透传族全集 + hit-stats 2）
 // =============================================================================
 
 /// 全部透传工具的端点绑定（顺序 = 原手写 specs 组装顺序，便于对照）。
@@ -1442,6 +1490,9 @@ pub static ALL_TRANSPARENT_BINDINGS: &[&EndpointBinding] = &[
     &KNOWLEDGE_DATASETS,
     &KNOWLEDGE_SEARCH,
     &KNOWLEDGE_ENTRY_GET,
+    // hit-stats 2（39 号批 B3，只读观测面）
+    &HIT_STATS,
+    &HIT_STATS_SERIES,
 ];
 
 #[cfg(test)]
@@ -1478,7 +1529,7 @@ mod tests {
 
     #[test]
     fn test_all_bindings_count_and_names_unique() {
-        assert_eq!(ALL_TRANSPARENT_BINDINGS.len(), 40);
+        assert_eq!(ALL_TRANSPARENT_BINDINGS.len(), 42);
         let mut names: Vec<&str> = ALL_TRANSPARENT_BINDINGS.iter().map(|b| b.name).collect();
         names.sort_unstable();
         names.dedup();

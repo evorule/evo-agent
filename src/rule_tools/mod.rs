@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn test_rule_tool_specs_count() {
         let specs = rule_tool_specs();
-        assert_eq!(specs.len(), 49, "expected 49 rule tool specs");
+        assert_eq!(specs.len(), 51, "expected 51 rule tool specs");
     }
 
     #[test]
@@ -215,7 +215,7 @@ service_tools = ["config_persist", "rule_sandbox"]
 
     #[test]
     fn test_full_rule_toolkit_registers_all_45() {
-        // 验证 full_rule_toolkit 注册了全部 49 个工具（40 透传 + 6 本地逻辑 +
+        // 验证 full_rule_toolkit 注册了全部 51 个工具（42 透传 + 6 本地逻辑 +
         // 3 why/order，has_tool 逐个校验；计数与 rule_tool_specs 对齐）
         let ws = WorkspaceApiClient::new("http://localhost:0");
         let ev = EvoruleApiClient::new("http://localhost:0");
@@ -273,6 +273,9 @@ service_tools = ["config_persist", "rule_sandbox"]
             "knowledge_datasets",
             "knowledge_search",
             "knowledge_entry_get",
+            // hit-stats 2（39 号批 B3，只读观测面）
+            "hit_stats",
+            "hit_stats_series",
             // meta 1（L2 约束只读消费面）
             "meta_summary",
             // evolution 2（进化信号只读消费面 + 约束层晋升提名）
@@ -283,7 +286,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             "causal_order",
             "lineage_of",
         ];
-        assert_eq!(all_tools.len(), 48);
+        assert_eq!(all_tools.len(), 50);
         for name in &all_tools {
             assert!(
                 h.has_tool(name),
