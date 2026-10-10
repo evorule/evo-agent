@@ -42,7 +42,7 @@
 | **会话沉淀** | 会话结束时自动写入摘要 + 稳定事实到共享空间 |
 | **工具注册中心** | `ToolRegistry` + `ToolFunction` trait，任何 `async fn(JsonValue) -> Result<JsonValue, String>` 都能注册 |
 | **3 层安全模型** | active（白名单）/ candidate（待批）/ blocked（永不），含 SSRF 防护 + 工作目录沙箱 |
-| **规则管理工具集** | 53 个工具（spec 数，测试锁定；serve 面默认暴露 56 = 内置 17 + 规则 39，sandbox/dataset/publish/production 共 14 个为已定义未入 serve 面的高级工具）：workspace 2 + rule 12 + translate 3 + audit 4 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + facts/version 1 + hit-stats 2 + skill 装配 1 + meta 1 + evolution 2 + why/order 3 |
+| **规则管理工具集** | 58 个工具（spec 数，测试锁定；serve 面默认暴露 61 = 内置 17 + 规则 44，sandbox/dataset/publish/production 共 14 个为已定义未入 serve 面的高级工具）：workspace 2 + rule 12 + translate 3 + audit 4 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + facts/version 1 + fact 追溯 2 + debug 观测 3 + hit-stats 2 + skill 装配 1 + meta 1 + evolution 2 + why/order 3 |
 | **工作流引擎** | DAG 拓扑编排多 Agent，同层并行 + 跨层串行 + 模板渲染 |
 | **MCP 客户端** | 接入 Model Context Protocol 工具生态（stdio 传输） |
 | **上下文窗口管理** | 按 token 数裁剪历史消息，保留 system + 最近若干轮 |

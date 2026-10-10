@@ -524,7 +524,7 @@ const RULE_P2_ADJUDICATED_TOOLS: &[&str] = &[
     "bundle_import",
 ];
 
-/// 规则工具 manifest（53 条 = 透传 44 + 本地逻辑 6 + why/order 3，名称集合与
+/// 规则工具 manifest（58 条 = 透传 49 + 本地逻辑 6 + why/order 3，名称集合与
 /// rule_tool_specs() 相等——测试锁）
 fn rule_manifests() -> Vec<ToolManifest> {
     let mut manifests: Vec<ToolManifest> = crate::rule_tools::adapter::ALL_TRANSPARENT_BINDINGS
@@ -766,7 +766,8 @@ mod tests {
 
     #[test]
     fn test_static_manifest_count_locked() {
-        // 内置 23 + 规则 53 + delegate 1 + memory 6 = 83
+        // 内置 23 + 规则 58 + delegate 1 + memory 6 = 88
+        // （39 号批 A 类断头线 5 工具：透传 44→49，规则 53→58，数量锁 83→88；
         // （39 号批 B5 facts_version +1：透传 43→44，规则 52→53，数量锁 82→83；
         // （39 号批 B4 audit_export +1：透传 42→43，规则 51→52，数量锁 81→82；
         // （39 号批 B3 hit-stats 双工具 +2：透传 40→42，规则 49→51，数量锁 79→81；
@@ -776,8 +777,8 @@ mod tests {
         //   账本记忆收口（ai/queue14 合并）：memory_link +1、memory_forget +1
         //   → memory 4→6，数量锁 77→79）
         assert_eq!(builtin_manifests().len(), 23);
-        assert_eq!(rule_manifests().len(), 53);
-        assert_eq!(all().len(), 83);
+        assert_eq!(rule_manifests().len(), 58);
+        assert_eq!(all().len(), 88);
     }
 
     #[test]
