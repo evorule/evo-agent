@@ -608,7 +608,11 @@ async fn run_judge_command(
     #[cfg(windows)]
     let mut command = {
         let mut c = tokio::process::Command::new("cmd");
-        c.args(["/C", cmd]);
+        // raw_arg 直传判据串：arg() 按 MSVCRT 约定对内层引号做反斜杠转义，
+        // 而 cmd 不认转义——含引号判据串经 arg() 必被搅碎（实锤：探针
+        // python -c "exit(7)" 返 0）；直传让 cmd 收到与声明一致的串，
+        // 引号语义交给 cmd 原生规则，与人工在终端输入完全同形
+        c.raw_arg("/C").raw_arg(cmd);
         c
     };
     #[cfg(not(windows))]
@@ -4313,9 +4317,9 @@ mod tests {
     async fn test_run_judge_command_host_direct() {
         // 宿主直执行（None）：exit 0 / 非零透传语义（H2 门卫后:探针命令须在
         // 白名单——统一探针用 git rev-parse --verify 不存在 ref:白名单内
-        // （只读）、双平台确定 exit 128、无引号无括号、不依赖 PATH 有无 sh。
-        // 引号约束:cmd /C 路径判据串含双引号会被搅碎（tokio 反斜杠转义 +
-        // cmd 不认转义），探针须避开引号）
+        // （只读）、双平台确定 exit 128、无引号无括号、不依赖 PATH 有无
+        // sh/python。引号搅碎缺陷已由 raw_arg 直传修复（Windows 引号保真
+        // 回归见下一测试）；本探针保持无引号只为跨平台极简）
         let out = run_judge_command("echo ok", None)
             .await
             .expect("echo 须成功 spawn");
@@ -4325,6 +4329,19 @@ mod tests {
             .await
             .expect("git 须成功 spawn");
         assert_eq!(out.status.code(), Some(128));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_run_judge_command_host_direct_quote_preserved() {
+        // Windows 宿主直执行引号保真回归：判据串内层双引号必须原样抵达
+        // 子进程。此前 arg() 转义 × cmd 不认转义把引号搅碎（同探针实测返
+        // 0/返 1），raw_arg 直传修复后应得真实退出码 7（python 在 PATH 的
+        // Windows 宿主上确定成立）
+        let out = run_judge_command("python -c \"exit(7)\"", None)
+            .await
+            .expect("python 须成功 spawn");
+        assert_eq!(out.status.code(), Some(7));
     }
 
     #[tokio::test]
