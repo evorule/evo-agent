@@ -3690,3 +3690,14 @@ async fn test_interrupt_evorule_session_best_effort_fail_soft() {
     );
     runner.interrupt_evorule_session_best_effort("42").await;
 }
+
+/// B2:健康声明 fail-soft 契约——client 失败（不可达端口=旧 server/连不通）
+/// 不冒泡不 panic;成功路径形状由 evorule_client mockito UT 锁定。
+#[tokio::test]
+async fn test_log_session_invariants_best_effort_fail_soft() {
+    let runner = AgentRunner::new(
+        AgentConfig::default(),
+        EvoruleApiClient::new("http://127.0.0.1:1"),
+    );
+    runner.log_session_invariants_best_effort("42").await;
+}
