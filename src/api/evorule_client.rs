@@ -1109,6 +1109,23 @@ impl EvoruleApiClient {
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
+    /// 读会话结构不变式自检计数（GET invariants，语义不变量三性面健康声明）。
+    /// 返回 `{session_id, structural_invariant_violations}`；404 = 会话不存在。
+    pub async fn get_session_invariants(&self, session_id: &str) -> Result<Value, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/invariants",
+            self.core.base_url(),
+            session_id
+        );
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// 全量重放会话 Fact 流（GET replay，按版本序返回 Fact JSON 列表）。
     pub async fn replay(&self, session_id: &str) -> Result<Vec<Value>, ApiError> {
         let url = format!(
@@ -2200,5 +2217,39 @@ mod tests {
 
         let client = EvoruleApiClient::new(&server.url());
         assert!(client.abort_session("42").await.is_err());
+    }
+
+    /// invariants 响应形状：`{session_id, structural_invariant_violations}` 透传
+    #[tokio::test]
+    async fn test_get_session_invariants_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/sessions/42/invariants")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"session_id":42,"structural_invariant_violations":0}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let resp = client.get_session_invariants("42").await.unwrap();
+        assert_eq!(resp["structural_invariant_violations"], 0);
+        mock.assert_async().await;
+    }
+
+    /// 404（会话不存在）按错误上抛——fail-soft 判定在消费挂点侧
+    #[tokio::test]
+    async fn test_get_session_invariants_404_error() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/sessions/42/invariants")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"not found"}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        assert!(client.get_session_invariants("42").await.is_err());
     }
 }

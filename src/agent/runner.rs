@@ -1968,6 +1968,36 @@ impl AgentRunner {
         }
     }
 
+    /// 会话健康声明（39 号批 B2）：IO 契约协商+建会话后拉取一次语义不变量
+    /// 自检计数（三性面），违规非零即 warn 留痕——只声明不执法。fail-soft：
+    /// 404/连不通（旧 server 无端点）仅 warn 通过，不阻塞会话。
+    async fn log_session_invariants_best_effort(&self, session_id: &str) {
+        match self.evorule_client.get_session_invariants(session_id).await {
+            Ok(v) => {
+                let violations = v
+                    .get("structural_invariant_violations")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                if violations == 0 {
+                    info!(%session_id, "session invariants clean (health declaration)");
+                } else {
+                    warn!(
+                        %session_id,
+                        violations,
+                        "session invariants violations detected (health declaration, advisory only)"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    %session_id,
+                    error = %e,
+                    "session invariants fetch failed (old server without endpoint?); health declaration skipped"
+                );
+            }
+        }
+    }
+
     async fn persist_message(
         &mut self,
         session_id: &str,
@@ -2285,6 +2315,8 @@ impl AgentRunner {
         self.session_id = Some(session_id.clone());
         self.sync_accounting_journal();
         info!(%session_id, "Created evorule session");
+        // B2:健康声明拉取一次（协商+建会话后，fail-soft）
+        self.log_session_invariants_best_effort(&session_id).await;
 
         // G14:同步 session_id 到 MemoryEventStore(若已注入)
         if let Some(store) = self.memory_event_store.as_mut() {
@@ -5146,6 +5178,8 @@ impl AgentRunner {
                         }
                     };
 
+                    // B2:健康声明拉取一次（协商+建会话后，fail-soft；与 run() 同钩位）
+                    runner.log_session_invariants_best_effort(&session_id).await;
                     // 修复(2026-09-29 实测):MemoryManager.session_id 同步(与 run() 对齐),
                     // sediment Shared 域写入依赖此绑定。
                     if let Some(mem) = runner.memory.as_mut() {
