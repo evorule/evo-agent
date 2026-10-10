@@ -974,11 +974,18 @@ async fn run_plan_execute_request(
     // union toolkit
     let (merged_settings, _) = state.workbench_settings().merged();
     let all_tools = state.toolkit.tool_names();
-    let delegate_toolkit = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+    let mut delegate_toolkit = crate::api::serve_tools::build_filtered_toolkit_with_switches(
         &state.toolkit,
         &all_tools,
         &merged_settings,
     );
+    // Delegate-node exec bridge: with a run-request container name, delegate
+    // nodes' shell_exec follows the same docker-exec backend as the react path
+    // (per-agent filtered copies inherit the backend through entry cloning);
+    // None = host backend, existing behavior unchanged.
+    if let Some(container) = &req.container {
+        crate::api::serve_tools::with_shell_exec_backend(&mut delegate_toolkit, container);
+    }
     // 治理门禁段随上下文下放（与 react 路径 DelegateContext 同源——治理纪律
     // 无豁免面）；L2 前馈按 serve union 全量工具面触发
     let governance_segment =

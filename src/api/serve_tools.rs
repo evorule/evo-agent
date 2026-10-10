@@ -1883,6 +1883,46 @@ service_tools = ["config_persist", "rule_sandbox"]
         );
     }
 
+    // ===== P1 执行桥:delegate 节点工具面容器后端继承 =====
+
+    #[tokio::test]
+    async fn test_shell_exec_backend_inherits_through_filtered_toolkit() {
+        // plan-execute delegate 通路:union 面 with_shell_exec_backend 后,按
+        // def.tools 白名单过滤出的 per-agent 面必须继承 docker-exec 后端
+        // (register_entry_from 经 Arc 克隆共享执行器实例)。判别器与 docker
+        // 环境解耦:良性命令若仍走宿主后端会本机执行;走容器后端则宿主侧
+        // 程序=docker CLI——docker 缺席时以 spawn 失败形态暴露,在位时以
+        // backend 执行事实暴露。两臂均证明后端已随过滤面继承。
+        let mut union = ToolHandler::new();
+        union.register_static(
+            "shell_exec",
+            std::sync::Arc::new(crate::builtin_tools::shell_exec::ShellExecTool::new()),
+        );
+        with_shell_exec_backend(&mut union, "no-such-container-xyz");
+        let filtered = build_filtered_toolkit(&union, &["shell_exec".to_string()]);
+        assert!(filtered.has_tool("shell_exec"), "过滤面须保留 shell_exec");
+        let result = filtered
+            .execute_by_name(
+                "shell_exec",
+                &serde_json::json!({"command": "echo backend-probe"}),
+            )
+            .await;
+        match result {
+            Ok(v) => assert_eq!(
+                v.get("backend").and_then(|b| b.as_str()),
+                Some("docker-exec"),
+                "filtered copy must execute through the docker backend: {v}"
+            ),
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("failed to spawn 'docker'"),
+                    "host-side program must be the docker CLI (backend inherited), got: {msg}"
+                );
+            }
+        }
+    }
+
     // =========================================================================
     // B2 wire_skills 接线测试
     // =========================================================================
