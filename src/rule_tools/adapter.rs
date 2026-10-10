@@ -1449,8 +1449,21 @@ pub static HIT_STATS_SERIES: EndpointBinding = EndpointBinding {
     ..BINDING_DEFAULTS
 };
 
+pub static FACTS_VERSION: EndpointBinding = EndpointBinding {
+    name: "facts_version",
+    client: ClientKind::Evorule,
+    path: "/api/shared/facts/version",
+    description: "Read the shared-facts version and history length (GET \
+                  /api/shared/facts/version). Concurrency cross-check for \
+                  cross-session fact reuse: compare the version observed at \
+                  read time against a later read to detect concurrent writers.",
+    params: &[],
+    ..BINDING_DEFAULTS
+};
+
 // =============================================================================
-// 全量透传 binding 表（43 个 = D-1 分类表纯透传族全集 + hit-stats 2 + audit_export 1）
+// 全量透传 binding 表（44 个 = D-1 分类表纯透传族全集 + hit-stats 2 + audit_export 1
+// + facts_version 1）
 // =============================================================================
 
 /// 全部透传工具的端点绑定（顺序 = 原手写 specs 组装顺序，便于对照）。
@@ -1508,6 +1521,8 @@ pub static ALL_TRANSPARENT_BINDINGS: &[&EndpointBinding] = &[
     &KNOWLEDGE_DATASETS,
     &KNOWLEDGE_SEARCH,
     &KNOWLEDGE_ENTRY_GET,
+    // facts/version 1（39 号批 B5，只读并发核对面）
+    &FACTS_VERSION,
     // hit-stats 2（39 号批 B3，只读观测面）
     &HIT_STATS,
     &HIT_STATS_SERIES,
@@ -1547,7 +1562,7 @@ mod tests {
 
     #[test]
     fn test_all_bindings_count_and_names_unique() {
-        assert_eq!(ALL_TRANSPARENT_BINDINGS.len(), 43);
+        assert_eq!(ALL_TRANSPARENT_BINDINGS.len(), 44);
         let mut names: Vec<&str> = ALL_TRANSPARENT_BINDINGS.iter().map(|b| b.name).collect();
         names.sort_unstable();
         names.dedup();

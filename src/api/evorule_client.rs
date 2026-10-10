@@ -614,6 +614,19 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 读共享事实版本号与历史长度（GET /api/shared/facts/version，并发核对用）。
+    /// 返回 `{version, history_len}`。
+    pub async fn get_shared_facts_version(&self) -> Result<Value, ApiError> {
+        let url = format!("{}/api/shared/facts/version", self.core.base_url());
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// `POST /api/shared/facts/rollup` — 标记一批共享事实为已 rollup
     ///
     /// 用于 C1 sediment 的 C4 rollup：把被合并的旧会话摘要标记成 `rolled_up`，
@@ -2251,5 +2264,24 @@ mod tests {
 
         let client = EvoruleApiClient::new(&server.url());
         assert!(client.get_session_invariants("42").await.is_err());
+    }
+
+    /// facts/version 响应形状：`{version, history_len}` 透传（39 号批 B5）
+    #[tokio::test]
+    async fn test_get_shared_facts_version_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/shared/facts/version")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"version":7,"history_len":42}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let resp = client.get_shared_facts_version().await.unwrap();
+        assert_eq!(resp["version"], 7);
+        assert_eq!(resp["history_len"], 42);
+        mock.assert_async().await;
     }
 }
