@@ -11,11 +11,15 @@ EvoRule 审计锚点独立验证器（V-2）——零依赖单文件（仅 Pytho
 
 诚实边界（V-2 不验证的，须由 evorule verify 端点背书）：
   - 事实链 BLAKE3 逐条哈希重算（内嵌整棵哈希树超零依赖边界）
-  - 中间锚点载荷字段篡改的检出（签名目标=anchor_hash；篡改载荷而
-    anchor_hash 不动时签名仍成立——evorule verify 端点以 blake3 重算
-    覆盖此面。anchor_format/2 提案：签名目标改载荷串接，摆脱该依赖）
+  - 锚点哈希链（blake3）重算——A2 截断/fork 检出面由 evorule verify
+    端点背书（v2 签名载荷串接已覆盖单锚点全部防伪造字段，
+    篡改任何载荷字段即验签失败）
   - 锚点签名者身份（公钥本身的真实性属分发面信任）
   - 「当时真跑了」（事件层不可复现）
+
+锚点格式：evorule-anchor/2（governance ≥0.8.2；签名目标=载荷字段串接字节，
+零依赖可验）。0.8.1 的 v1 锚点（签 anchor_hash）不兼容——验证器拒绝而非
+静默混验。
 
 输入文件：
   --atif PATH     ATIF v1.8 导出 JSON（evo-agent /api/sessions/{id}/atif）
@@ -130,15 +134,25 @@ def _hex_ok(s: str, n: int) -> bool:
     return len(s) == n and all(c in "0123456789abcdefABCDEF" for c in s)
 
 
-def anchor_payload_bytes(anchor: dict) -> bytes:
-    """锚点签名目标（与 evorule-governance anchor.rs `seal` 对齐）：
-    ed25519 直接对 `anchor_hash`（blake3 hex 字符串）的 UTF-8 字节签名。
+def anchor_payload_v2(anchor: dict) -> bytes:
+    """evorule-anchor/2 签名载荷（与 governance `signature_payload_v2` 同构）。
 
-    anchor_hash 本身由锚点九字段 blake3 算出（含前锚哈希=链式）——
-    独立验证器不重算 blake3（零依赖边界），锚点哈希链完整性由
+    `{ANCHOR_FORMAT}|{session_id}|{seq}|{lo}|{hi}|{chain_head}|{key_id}|{engine_id}|{logical_time}`
+    ——字段串接字节直接可重构，零依赖可验；anchor_hash 链（blake3）仍由
     evorule verify 端点背书（诚实边界，见模块文档）。
     """
-    return anchor["anchor_hash"].encode()
+    fr = anchor["fact_range"]
+    parts = [
+        "evorule-anchor/2",
+        anchor["session_id"],
+        str(anchor["seq"]),
+        str(fr["lo"]), str(fr["hi"]),
+        anchor["chain_head"],
+        anchor["key_id"],
+        anchor["engine_id"],
+        str(anchor["logical_time"]),
+    ]
+    return "|".join(parts).encode()
 
 
 def verify(atif: dict, anchors_doc: dict, pubkey_hex: str) -> int:
@@ -184,7 +198,7 @@ def verify(atif: dict, anchors_doc: dict, pubkey_hex: str) -> int:
         sig_hex = a.get("signature", "")
         if not _hex_ok(sig_hex, 128):
             return _fail("T1", f"锚点 seq={a['seq']} 签名非 128-hex")
-        ok = ed25519_verify(pub, anchor_payload_bytes(a), bytes.fromhex(sig_hex))
+        ok = ed25519_verify(pub, anchor_payload_v2(a), bytes.fromhex(sig_hex))
         if not ok:
             return _fail("T1", f"锚点 seq={a['seq']} ed25519 验签失败")
     print(f"T1 验签: PASS（{len(anchors)} 锚点全部通过）")
