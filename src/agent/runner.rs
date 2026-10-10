@@ -1312,11 +1312,14 @@ impl AgentRunner {
             // 阶段 5 NB-2:双通道笔记事件驱动草稿(缺省关;Recipe sources 穿线于上)
             enable_failure_drafts: false,
             enable_material_harvest: false,
-            // S-5 收尾批:知识候选自动出口(缺省关+dataset 未配=off 双保险;
-            // 治理数据集接线属运营配置面,定义 schema 本批不扩)
-            enable_knowledge_propose: false,
-            knowledge_propose_dataset: None,
-            knowledge_propose_min_confidence: 0.7,
+            // S-5 收尾批+运营接线批:知识候选自动出口(dataset 配置即启用,
+            // 缺省 None=off;SedimentConfig 内闸不动=双保险;门限缺省 0.7)
+            enable_knowledge_propose: def.memory.knowledge_propose_dataset.is_some(),
+            knowledge_propose_dataset: def.memory.knowledge_propose_dataset.clone(),
+            knowledge_propose_min_confidence: def
+                .memory
+                .knowledge_propose_min_confidence
+                .unwrap_or(0.7),
         };
         // 阶段 3(F-611)+A2-2:自省记忆工具注册(声明面已在 step 2 按暴露条件
         // 预放行;此处声明了而条件不满足=配置矛盾,早失败)。置于 sediment_config
