@@ -3677,3 +3677,16 @@ fn test_rewind_budget_intermittent_errors_never_exhaust() {
         b.reset(32); // StateTransition 事件
     }
 }
+
+// ===== B1:会话即时终止面(39 号批)=====
+
+/// 轮错误收尾中断面 fail-soft 契约:client 失败(此处不可达端口)不冒泡不 panic;
+/// 成功路径请求形状由 evorule_client mockito UT 锁定(interrupt/abort 形状+404 口径)。
+#[tokio::test]
+async fn test_interrupt_evorule_session_best_effort_fail_soft() {
+    let runner = AgentRunner::new(
+        AgentConfig::default(),
+        EvoruleApiClient::new("http://127.0.0.1:1"),
+    );
+    runner.interrupt_evorule_session_best_effort("42").await;
+}

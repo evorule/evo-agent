@@ -1954,6 +1954,20 @@ impl AgentRunner {
         });
     }
 
+    /// 会话即时终止面（39 号批 B1）：轮错误收尾路径 best-effort 中断 server 侧
+    /// 反应器，不留「agent 已终、反应器空转到 TTL 收割」的悬挂会话（恢复模式
+    /// 断点续做场景的即时终止面——38 号档 B1）。fail-soft：中断失败仅 warn
+    /// 留痕，不阻塞错误上抛。
+    async fn interrupt_evorule_session_best_effort(&self, session_id: &str) {
+        if let Err(e) = self.evorule_client.interrupt_session(session_id).await {
+            warn!(
+                %session_id,
+                error = %e,
+                "interrupt_session (error finalize) failed; server session left to TTL reap"
+            );
+        }
+    }
+
     async fn persist_message(
         &mut self,
         session_id: &str,
@@ -2459,6 +2473,9 @@ impl AgentRunner {
                                 tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                             }
                                 self.submit_tool_traces(&session_id).await;
+                                // B1:轮错误收尾 best-effort 中断 server 反应器（fail-soft，
+                                // 不留悬挂会话空转到 TTL 收割）
+                                self.interrupt_evorule_session_best_effort(&session_id).await;
                                 return Err(e);
                             }
                         },
@@ -2629,6 +2646,9 @@ impl AgentRunner {
                         tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
                     }
                     self.submit_tool_traces(&session_id).await;
+                    // B1:Error 熔断收尾 best-effort 中断 server 反应器（fail-soft）
+                    self.interrupt_evorule_session_best_effort(&session_id)
+                        .await;
                     return Ok(AgentResult::error(
                         error_msg.to_string(),
                         step_count,
@@ -6745,6 +6765,8 @@ impl AgentRunner {
                                     tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
                                 }
                                 runner.submit_tool_traces(&session_id).await;
+                                // B1:Error 熔断收尾 best-effort 中断 server 反应器（fail-soft）
+                                runner.interrupt_evorule_session_best_effort(&session_id).await;
                                 // B21:turn_ended(error)
                                 if let Some(g) = turn_guard.take() {
                                     g.end("error", step_count as u64, duration);
