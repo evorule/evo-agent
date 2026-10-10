@@ -1949,7 +1949,8 @@ mod tests {
         });
         let errs = materialize_workflow_dag(&doc).expect_err("任意 shell 须拒载");
         assert!(
-            errs.iter().any(|e| e.contains("judge.command 校验失败") && e.contains("H2 门卫")),
+            errs.iter()
+                .any(|e| e.contains("judge.command 校验失败") && e.contains("H2 门卫")),
             "{errs:?}"
         );
     }
@@ -1969,7 +1970,8 @@ mod tests {
         });
         let errs = materialize_plan_fact(&plan, "p").expect_err("rm 须拒载");
         assert!(
-            errs.iter().any(|e| e.contains("节点 'n1'") && e.contains("白名单")),
+            errs.iter()
+                .any(|e| e.contains("节点 'n1'") && e.contains("白名单")),
             "{errs:?}"
         );
     }
@@ -1977,8 +1979,13 @@ mod tests {
     #[test]
     fn judge_h2_whitelist_accepts_engineering_domain() {
         // 白名单内工程命令放行(参数自由——同一信任域)
-        for ok in ["cargo test --lib", "python verify.py --strict", "grep needle out.txt",
-                   "findstr /C:\"OK\" report.txt", "git diff --stat"] {
+        for ok in [
+            "cargo test --lib",
+            "python verify.py --strict",
+            "grep needle out.txt",
+            "findstr /C:\"OK\" report.txt",
+            "git diff --stat",
+        ] {
             let doc = serde_json::json!({
                 "workflow_id": "w",
                 "nodes": [

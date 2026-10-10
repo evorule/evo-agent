@@ -174,10 +174,7 @@ pub async fn build_governance_segment(ev: &EvoruleApiClient, tools: &[String]) -
 /// - fail-soft：单个数据集拉取失败 → warn 留痕跳过该数据集,绝不阻断会话；
 ///   全部数据集均无内容 → None(槽位跳过)；
 /// - 时效：每次 runner 组装实时拉取(无缓存)——契约增删下一会话即反映。
-pub async fn build_knowledge_segment(
-    ev: &EvoruleApiClient,
-    datasets: &[String],
-) -> Option<String> {
+pub async fn build_knowledge_segment(ev: &EvoruleApiClient, datasets: &[String]) -> Option<String> {
     if datasets.is_empty() {
         return None;
     }
@@ -220,9 +217,8 @@ fn render_knowledge_dataset(dataset: &str, resp: &serde_json::Value) -> String {
         Some(e) if !e.is_empty() => e,
         _ => return String::new(),
     };
-    let mut out = format!(
-        "【治理知识契约】(数据集 {dataset};以下条目为权威契约,执行相关任务时遵循)"
-    );
+    let mut out =
+        format!("【治理知识契约】(数据集 {dataset};以下条目为权威契约,执行相关任务时遵循)");
     for entry in entries {
         if let Some(status) = entry.get("status").and_then(|v| v.as_str()) {
             if !status.eq_ignore_ascii_case("active") {
@@ -1428,7 +1424,10 @@ service_tools = ["config_persist", "rule_sandbox"]
         assert!(!seg2.contains("步骤:"));
 
         // 空 entries/非法结构 → 空串(调用侧不拼段)
-        assert_eq!(render_knowledge_dataset("ds", &serde_json::json!({"entries": []})), "");
+        assert_eq!(
+            render_knowledge_dataset("ds", &serde_json::json!({"entries": []})),
+            ""
+        );
         assert_eq!(render_knowledge_dataset("ds", &serde_json::json!({})), "");
     }
 

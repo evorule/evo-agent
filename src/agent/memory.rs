@@ -1097,8 +1097,7 @@ pub struct MemoryManager {
     /// 写 cache,先暂存;apply_lifecycle_transitions(&mut self)开头统一吸收进
     /// cache(or_insert,不覆盖本地新写)。跨会话晋升链的关键接线。
     /// Mutex 而非 RefCell:MemoryManager 需跨线程(axum State 要求 Sync)。
-    pub(crate) hydration_pending:
-        std::sync::Arc<std::sync::Mutex<Vec<(String, MemoryRecord)>>>,
+    pub(crate) hydration_pending: std::sync::Arc<std::sync::Mutex<Vec<(String, MemoryRecord)>>>,
     session_id: Option<String>,
     cache: BTreeMap<String, MemoryRecord>,
     /// 记忆过期时间（秒，用户决策 5：TTL）
@@ -2101,9 +2100,7 @@ impl MemoryManager {
             // path→cache_key 与 path_to_cache_key 同构(Shared 域)。
             for f in &facts {
                 if let Some(ck) = self.path_to_cache_key(&f.path) {
-                    if let Ok(mut r) =
-                        serde_json::from_value::<MemoryRecord>(f.value.clone())
-                    {
+                    if let Ok(mut r) = serde_json::from_value::<MemoryRecord>(f.value.clone()) {
                         // fact_id 由服务端分配,存储的 MemoryRecord JSON 不含它——
                         // 必须从 SharedFactEntry 补进镜像,否则 flush_usage 按
                         // fact_id 匹配 cache 落增量时永不命中(断点5 收尾)。
@@ -2778,17 +2775,17 @@ impl MemoryManager {
                     }
                 }
                 if !hit {
-                    tracing::debug!(fact_id, "usage flush(降级): cache 无镜像记录,该条增量保留 pending 重试");
+                    tracing::debug!(
+                        fact_id,
+                        "usage flush(降级): cache 无镜像记录,该条增量保留 pending 重试"
+                    );
                 }
             }
             // 回滚:未命中的增量原样归还 pending(下轮 flush 重试;修复前
             // drain 后即返回,增量丢失)。
             let mut map = self.usage_pending.lock().unwrap_or_else(|p| p.into_inner());
             for (fact_id, inc) in &pending {
-                let hit = self
-                    .cache
-                    .values()
-                    .any(|r| r.fact_id == Some(*fact_id));
+                let hit = self.cache.values().any(|r| r.fact_id == Some(*fact_id));
                 if !hit {
                     *map.entry(*fact_id).or_insert(0) += *inc;
                 }
@@ -2922,8 +2919,14 @@ impl MemoryManager {
                 .values()
                 .filter(|r| r.key.starts_with("events.") || r.key.contains(".events."))
                 .collect();
-            let capt = episodic.iter().filter(|r| r.lifecycle_state.as_deref() == Some("Captured")).count();
-            let rein = episodic.iter().filter(|r| r.lifecycle_state.as_deref() == Some("Reinforced")).count();
+            let capt = episodic
+                .iter()
+                .filter(|r| r.lifecycle_state.as_deref() == Some("Captured"))
+                .count();
+            let rein = episodic
+                .iter()
+                .filter(|r| r.lifecycle_state.as_deref() == Some("Reinforced"))
+                .count();
             let mut detail = Vec::new();
             for r in episodic.iter().take(5) {
                 detail.push(format!(

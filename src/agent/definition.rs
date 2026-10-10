@@ -2029,9 +2029,8 @@ mod tests {
         );
         assert_eq!(cfg.knowledge_propose_min_confidence, Some(0.85));
 
-        let off: MemoryConfig =
-            serde_json::from_str(r#"{"type":"persistent","namespace":"n"}"#)
-                .expect("parse default off");
+        let off: MemoryConfig = serde_json::from_str(r#"{"type":"persistent","namespace":"n"}"#)
+            .expect("parse default off");
         assert!(off.knowledge_propose_dataset.is_none());
         assert!(off.knowledge_propose_min_confidence.is_none());
 
