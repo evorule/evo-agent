@@ -193,9 +193,22 @@ pub enum JournalEvent {
         /// 协作标记会话 id(run 的治理身份;恢复必须复用同会话,全新标记
         /// 会话会让 phase 前置门误拦;None = 未启用标记)
         marks_session: Option<String>,
+        /// 原子粒记忆集(曾携带 atomic 标记的节点 id;原子性跨版本持续有效
+        /// ——replan 重产计划不带该字段,记忆集合补事实连续性;恢复不归零)
+        atomic_granules: Vec<String>,
+        /// 按节点重切计数(原子粒重切预算判定的跨版本累计输入;恢复不归零
+        /// ——归零=恢复 run 至多多切 N 次,预算面方差)
+        recut_counts: Vec<(String, u32)>,
         /// 当前版工作流全文(replan 产物源自非确定 LLM 输出,不落全文即不可
         /// 确定性重建——这是恢复面唯一的状态载体)
         cur_workflow: String,
+    },
+    /// 计划循环终态标记(驱动循环任意出口落地:ok=完成,error=终断)。恢复面
+    /// 凭本事件判别「已完成/已终断,不再列可恢复」;无终态标记且计划检查点
+    /// 在账 = 中断 run(可恢复候选)。观测面,不参与步映射。
+    PlanLoopFinished {
+        /// ok|error
+        status: String,
     },
     /// 审批请求开启(60s 窗口 / policy 判定前)
     ApprovalRequested {
@@ -535,14 +548,28 @@ impl JournalWriter {
         // 事件);末事件已是崩溃标记则不重复补写(重复打开幂等)。
         let mut tail_hung = false;
         let mut last_was_crash = false;
+        // 尾部半行物理截断目标(None=文件不存在无需截断)
+        let mut truncate_to: Option<u64> = None;
         if path.exists() {
+            // 尾部半行容忍:强杀可能切在写入中间,最后一个不完整行是崩溃的
+            // 自然产物——物理截断到最后一完整行(仅在内存忽略则写者追加会与
+            // 半行拼接,账面永久损坏);中间损坏仍 fail-visible
+            let bytes = std::fs::read(&path)?;
+            let valid_len = bytes
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map(|pos| pos + 1)
+                .unwrap_or(0);
+            let raw_lines: Vec<String> = String::from_utf8_lossy(&bytes[..valid_len])
+                .lines()
+                .map(str::to_string)
+                .collect();
             let mut expected = 1u64;
-            for line in BufReader::new(File::open(&path)?).lines() {
-                let line = line?;
+            for line in &raw_lines {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let parsed = decode_line(&line)?;
+                let parsed = decode_line(line)?;
                 if parsed.seq != expected {
                     return Err(JournalError::SeqGap {
                         expected,
@@ -559,10 +586,19 @@ impl JournalWriter {
                 }
                 last_was_crash = matches!(parsed.event, JournalEvent::SessionCrashed { .. });
             }
+            if valid_len < bytes.len() {
+                tracing::warn!(
+                    session = %session_id,
+                    truncated_bytes = bytes.len() - valid_len,
+                    "journal tail has a partial line (crash artifact) - physically truncated"
+                );
+            }
+            truncate_to = Some(valid_len as u64);
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         // 占位进程内活跃写者——同会话第二个写者在此 fail-fast,
-        // 不再出现两写者各自恢复 last_seq 后交错 append(seq 重复/空洞=账面损坏)
+        // 不再出现两写者各自恢复 last_seq 后交错 append(seq 重复/空洞=账面损坏)。
+        // 物理截断在注册表闸之后执行:被闸拒绝的 open 不得动活动写者的账本文件
         let registry_key = sanitize_session_id(session_id);
         {
             let mut guard = ACTIVE_WRITERS
@@ -572,6 +608,14 @@ impl JournalWriter {
             if !set.insert(registry_key.clone()) {
                 return Err(JournalError::WriterActive(registry_key));
             }
+        }
+        if let Some(len) = truncate_to {
+            // 独立写句柄执行截断(append 句柄在 Windows 上无 SetEndOfFile 权限);
+            // 截断后后续写从新 EOF 追加
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_len(len)?;
         }
         let writer = JournalWriter {
             core: Arc::new(Mutex::new(JournalInner {
@@ -779,6 +823,8 @@ impl JournalWriter {
         cur_canonical_hash: Option<String>,
         goal: Option<String>,
         marks_session: Option<String>,
+        atomic_granules: Vec<String>,
+        recut_counts: Vec<(String, u32)>,
         cur_workflow: &str,
     ) -> Result<u64, JournalError> {
         self.push(JournalEvent::PlanLoopCheckpointed {
@@ -789,7 +835,17 @@ impl JournalWriter {
             cur_canonical_hash,
             goal,
             marks_session,
+            atomic_granules,
+            recut_counts,
             cur_workflow: cur_workflow.to_string(),
+        })
+    }
+
+    /// 计划循环终态标记(ok=完成/error=终断;扫尾面凭此把已终局 run 排除出
+    /// 可恢复列表)
+    pub fn plan_loop_finished(&self, status: &str) -> Result<u64, JournalError> {
+        self.push(JournalEvent::PlanLoopFinished {
+            status: status.to_string(),
         })
     }
 
@@ -1179,6 +1235,39 @@ impl Drop for TurnEndGuard {
     }
 }
 
+/// 容忍尾部半行的顺序重放(扫尾/恢复装配用):强杀切在写入中间的最后一个
+/// 不完整行是崩溃的自然产物,截断忽略;中间损坏仍 fail-visible。
+pub fn read_all_tolerant(path: &Path) -> Result<Vec<JournalLine>, JournalError> {
+    let ends_with_newline = std::fs::read(path)
+        .map(|bytes| bytes.last().map(|b| *b == b'\n').unwrap_or(false))
+        .unwrap_or(false);
+    let raw_lines: Vec<String> = BufReader::new(File::open(path)?)
+        .lines()
+        .collect::<Result<Vec<_>, _>>()?;
+    let complete_count = if ends_with_newline {
+        raw_lines.len()
+    } else {
+        raw_lines.len().saturating_sub(1)
+    };
+    let mut out = Vec::new();
+    let mut expected = 1u64;
+    for line in raw_lines.into_iter().take(complete_count) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed = decode_line(&line)?;
+        if parsed.seq != expected {
+            return Err(JournalError::SeqGap {
+                expected,
+                found: parsed.seq,
+            });
+        }
+        expected += 1;
+        out.push(parsed);
+    }
+    Ok(out)
+}
+
 /// 顺序重放:逐行解析 + seq 连续性校验(空洞/重复 = 日志损坏,fail-visible)
 pub fn read_all(path: &Path) -> Result<Vec<JournalLine>, JournalError> {
     let file = File::open(path)?;
@@ -1515,6 +1604,50 @@ mod tests {
         let after = read_all(&JournalWriter::path_for(&dir, "s-clean")).unwrap();
         assert_eq!(before.len(), after.len(), "干净尾部打开不得追加事件");
         assert_eq!(after.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_tolerates_trailing_partial_line() {
+        // 强杀半行:完整行 + 无换行结尾的半行 → open 截断成功,续写 seq 顺延
+        let dir = std::env::temp_dir().join(format!("jf-half-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let valid = r#"{"seq":1,"ts":1,"type":"turn_started","payload":{"turn_seq":1,"goal":"g"}}"#;
+        let path = JournalWriter::path_for(&dir, "s-half");
+        let partial = "{\"seq\":2,\"ts\":2,\"type\":\"llm_ca";
+        std::fs::write(&path, format!("{valid}\n{partial}")).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-half").unwrap();
+            w.tool_retried("grep_files", 1, true).unwrap();
+        }
+        let lines = read_all(&path).unwrap();
+        assert_eq!(
+            lines.len(),
+            3,
+            "完整行+崩溃标记(R-1 悬挂检测)+续写行,半行已物理截断"
+        );
+        assert!(
+            matches!(lines[1].event, JournalEvent::SessionCrashed { .. }),
+            "悬挂 turn 补写崩溃标记"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_fails_on_middle_corruption() {
+        // 中间损坏(半行夹在两完整行之间)仍 fail-visible(截断容忍只属尾部)
+        let dir = std::env::temp_dir().join(format!("jf-mid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v1 = r#"{"seq":1,"ts":1,"type":"turn_started","payload":{"turn_seq":1,"goal":"g"}}"#;
+        let v2 = r#"{"seq":2,"ts":2,"type":"turn_ended","payload":{"status":"ok","steps":1,"duration_ms":1}}"#;
+        let path = JournalWriter::path_for(&dir, "s-mid");
+        std::fs::write(&path, format!("{v1}\n garbage middle\n{v2}\n")).unwrap();
+        assert!(
+            JournalWriter::open(&dir, "s-mid").is_err(),
+            "中间损坏必须显式失败"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
