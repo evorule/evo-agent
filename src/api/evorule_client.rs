@@ -1077,6 +1077,38 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 中断会话（POST interrupt，server 常挂载）——请求反应器在下一个
+    /// checkpoint 停止。返回 `{session_id, success, message}`；404 = 会话不存在。
+    pub async fn interrupt_session(&self, session_id: &str) -> Result<Value, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/interrupt",
+            self.core.base_url(),
+            session_id
+        );
+        let resp = self
+            .core
+            .auth_header(self.core.client().post(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// 强制中止会话（POST abort，**破坏性**：直接中止反应器任务，不等 checkpoint）。
+    ///
+    /// 双保险：server 未开 `--allow-abort`/`EVORULE_ALLOW_ABORT=1` 时该端点
+    /// 不挂载（404）——错误原样上抛，由调用方判定是否为开关未开。
+    pub async fn abort_session(&self, session_id: &str) -> Result<Value, ApiError> {
+        let url = format!("{}/api/sessions/{}/abort", self.core.base_url(), session_id);
+        let resp = self
+            .core
+            .auth_header(self.core.client().post(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// 全量重放会话 Fact 流（GET replay，按版本序返回 Fact JSON 列表）。
     pub async fn replay(&self, session_id: &str) -> Result<Vec<Value>, ApiError> {
         let url = format!(
@@ -2111,5 +2143,62 @@ mod tests {
         assert_eq!(resp["hit_total"], 7);
         assert_eq!(resp["series"][0]["hit_count"], 7);
         mock.assert_async().await;
+    }
+
+    // ===== B1：会话即时终止面（39 号批）=====
+
+    /// interrupt 请求形状：POST 无 body；响应 `{session_id,success,message}` 透传
+    #[tokio::test]
+    async fn test_interrupt_session_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/sessions/42/interrupt")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"session_id":42,"success":true,"message":"Interrupt requested, reactor will respond at next checkpoint"}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let resp = client.interrupt_session("42").await.unwrap();
+        assert_eq!(resp["session_id"], 42);
+        assert_eq!(resp["success"], true);
+        mock.assert_async().await;
+    }
+
+    /// abort 成功形状（server 开 `--allow-abort` 时可达）
+    #[tokio::test]
+    async fn test_abort_session_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/sessions/42/abort")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"session_id":42,"success":true,"message":"aborted"}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let resp = client.abort_session("42").await.unwrap();
+        assert_eq!(resp["success"], true);
+        mock.assert_async().await;
+    }
+
+    /// 双保险口径：server 未开 `--allow-abort` → 端点不挂载（404）原样上抛
+    #[tokio::test]
+    async fn test_abort_session_gated_404_error() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/sessions/42/abort")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"not found"}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        assert!(client.abort_session("42").await.is_err());
     }
 }
