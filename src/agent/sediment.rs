@@ -68,6 +68,15 @@ pub struct SedimentConfig {
     /// 是否启用 journal 摘要投影（跨源注册规格：确定性结构投影，零 LLM；
     /// Recipe sources.journal_digest 数据化开关，缺省关=既有 agent 零影响）
     pub enable_journal_digest: bool,
+    /// S-5 收尾批：是否启用知识候选自动出口（会话收尾巩固后，达标候选
+    /// propose 到治理数据集 Draft；缺省关=既有 agent 零影响）
+    pub enable_knowledge_propose: bool,
+    /// S-5 收尾批：提议目标治理数据集（如 tb-contracts；None=off，
+    /// 与开关构成双保险——任一未满足即整步跳过）
+    pub knowledge_propose_dataset: Option<String>,
+    /// S-5 收尾批：提议达标门——候选 confidence 下限（缺省 0.7；
+    /// 达标门与「未提议过」双条件缺一不提）
+    pub knowledge_propose_min_confidence: f32,
 }
 
 impl Default for SedimentConfig {
@@ -85,6 +94,9 @@ impl Default for SedimentConfig {
             enable_failure_drafts: false,
             enable_material_harvest: false,
             enable_journal_digest: false,
+            enable_knowledge_propose: false,
+            knowledge_propose_dataset: None,
+            knowledge_propose_min_confidence: 0.7,
         }
     }
 }
@@ -140,6 +152,9 @@ pub struct SedimentResult {
     /// 会话收尾补写成功的离线积压事件数（CacheOnly→Persisted 对账闭环;
     /// 0=无积压或补写失败——与 stable_facts_cache_only 同款防虚报口径）
     pub flushed_events: usize,
+    /// S-5 收尾批：成功提议到治理数据集的候选 event_id 列表
+    /// （Draft 回执=提议凭据；失败/不达标候选不在此列，保持原态下批重试）
+    pub knowledge_proposed: Vec<String>,
 }
 
 /// C1 主入口：会话结束时调用（best-effort，错误记日志不阻断）
@@ -229,8 +244,7 @@ pub async fn sediment(
     // 报告 §6.3 增量结论：仅接线 extractor 而不改写入目标，事件层仍不可达）。
     if cfg.enable_event_extraction {
         if let Some(mut extractor) = deps.extractor.take() {
-            extract_and_store_events(&mut extractor, deps, session_id, messages, &mut result)
-                .await;
+            extract_and_store_events(&mut extractor, deps, session_id, messages, &mut result).await;
         }
     }
 
@@ -252,6 +266,15 @@ pub async fn sediment(
     //    sidecar 合并提议 → Consolidated 落账（溯源=consolidates 清单）
     if cfg.enable_consolidation {
         consolidate_knowledge_candidates(deps, cfg, session_id, &mut result).await;
+    }
+
+    // 6.58 知识候选自动出口（S-5 收尾批）：巩固后的达标候选 → 治理数据集
+    //    propose（Draft 落账=提议凭据）。治理语义红线：只 propose 不行权，
+    //    晋升走人工 T1/机器 T2 闸。开关+dataset 双保险，缺省关。
+    if cfg.enable_knowledge_propose {
+        if let Some(dataset) = cfg.knowledge_propose_dataset.as_deref() {
+            propose_ready_candidates(deps, cfg, session_id, dataset, &mut result).await;
+        }
     }
 
     // journal 行单次取走——6.55/6.6/7 三消费者共享切片（修复:此前草稿
@@ -433,6 +456,9 @@ struct CandidateFace {
     knowledge_kind: String,
     title: String,
     body: String,
+    /// 候选置信度（MemoryEvent 顶层；payload 包裹形态回落 face 层；
+    /// 缺失回落 0.5 提取性缺省——S-5 提议达标门消费）
+    confidence: f32,
     /// 账本 fact_id（整数 cause 链接用）
     fact_id: u64,
 }
@@ -534,6 +560,12 @@ fn parse_candidate_face(
     Some(CandidateFace {
         event_id,
         fact_id,
+        confidence: value
+            .get("confidence")
+            .or_else(|| face.get("confidence"))
+            .and_then(|v| v.as_f64())
+            .map(|c| c as f32)
+            .unwrap_or_else(default_candidate_confidence),
         knowledge_kind: content
             .get("knowledge_kind")
             .and_then(|v| v.as_str())?
@@ -700,6 +732,166 @@ pub(crate) async fn consolidate_knowledge_candidates(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "sediment: consolidation write failed");
+            }
+        }
+    }
+}
+
+// ===== 知识候选自动出口（S-5 收尾批）=====
+//
+// 候选止步 memory/journal 层的收尾差口补齐：巩固后把达标候选自动提议到
+// 治理数据集（propose → Draft，人类持剑 gate 兜底）。治理语义红线：只
+// propose，不做 auto_transition——晋升走人工 T1/机器 T2 闸，三向终审
+// 语义不容旁路。fail-soft：治理侧拒绝只 warn 留痕，候选保持原态下批重试。
+
+/// 确定性 entry_id slug（fnv1a64 over 候选 event_id+session_id，沿
+/// memory.rs 生命周期晋升门先例；同候选重提议得同 ID=幂等锚，治理侧
+/// 同 entry_id 重提议不产生重复条目）
+fn knowledge_propose_entry_id(candidate_event_id: &str, session_id: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in format!("{}|{}", candidate_event_id, session_id).as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("kc-{:016x}", h)
+}
+
+/// 提议标记 key（幂等锚，沿 consolidated 标记先例：落账后同候选收尾
+/// 不再重复提议）
+fn knowledge_proposed_marker_key(candidate_event_id: &str) -> String {
+    format!("knowledge_candidates.proposed.{}", candidate_event_id)
+}
+
+/// 主入口：达标候选自动提议到治理数据集（best-effort，fail-soft）
+///
+/// 流程：
+/// 1. 加载候选族 `shared.{ns}.knowledge_candidates.*`（提取路 KC- 与
+///    巩固路 CC- 产物同资格）；
+/// 2. 达标门双条件：confidence ≥ `knowledge_propose_min_confidence` 且
+///    无 proposed 标记（幂等）；
+/// 3. 逐条 propose（确定性 entry_id slug；五类直映 `builtin:knowledge/{kind}`，
+///    payload 形态沿 memory.rs 晋升门先例：statement/title/confidence）；
+/// 4. 成功即落 proposed 标记+回执 Draft 入 result；失败 warn 保持原态，
+///    绝不阻塞会话收尾。
+pub(crate) async fn propose_ready_candidates(
+    deps: &mut SedimentDeps<'_>,
+    cfg: &SedimentConfig,
+    session_id: &str,
+    dataset: &str,
+    result: &mut SedimentResult,
+) {
+    let prefix = format!("shared.{}.knowledge_candidates.", deps.memory.namespace());
+    let facts = match deps
+        .memory
+        .evorule_client
+        .get_shared_facts(Some(&prefix))
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "sediment: knowledge propose candidate load failed (best-effort skip)"
+            );
+            return;
+        }
+    };
+    // 幂等集：已提议标记（knowledge_candidates.proposed.{event_id}）
+    let already_proposed: std::collections::HashSet<String> = facts
+        .iter()
+        .filter(|f| f.path.contains(".proposed."))
+        .filter_map(|f| f.path.rsplit('.').next().map(|s| s.to_string()))
+        .collect();
+    // 达标候选收集（提议序=event_id 字典序，确定性）
+    let mut ready: Vec<CandidateFace> = Vec::new();
+    for f in &facts {
+        if f.path.contains(".proposed.") {
+            continue; // 提议标记非候选
+        }
+        if let Some(face) = parse_candidate_face(&f.path, f.fact_id, &f.value) {
+            if !is_valid_knowledge_kind(&face.knowledge_kind)
+                || face.confidence < cfg.knowledge_propose_min_confidence
+                || already_proposed.contains(&face.event_id)
+            {
+                continue;
+            }
+            ready.push(face);
+        }
+    }
+    if ready.is_empty() {
+        return;
+    }
+    ready.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    for face in &ready {
+        let entry_id = knowledge_propose_entry_id(&face.event_id, session_id);
+        let entry = serde_json::json!({
+            "entry_id": entry_id,
+            "version": 1,
+            "tags": ["knowledge-propose", face.knowledge_kind.clone()],
+            "payload": {
+                "statement": face.body.clone(),
+                "title": face.title.clone(),
+                "confidence": face.confidence,
+            },
+            "schema_ref": format!("builtin:knowledge/{}", face.knowledge_kind),
+        });
+        let cause = format!(
+            "sediment knowledge auto-propose: candidate {} (kind {}) met confidence gate; session {}",
+            face.event_id, face.knowledge_kind, session_id
+        );
+        match deps
+            .memory
+            .evorule_client
+            .propose_knowledge_entry(dataset, &entry, &cause, Some(session_id))
+            .await
+        {
+            Ok(receipt) => {
+                let lifecycle = receipt
+                    .get("lifecycle")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Draft");
+                tracing::info!(
+                    session_id = %session_id,
+                    candidate = %face.event_id,
+                    entry_id = %entry_id,
+                    lifecycle = %lifecycle,
+                    "sediment: knowledge candidate auto-proposed (Draft receipt = qualification evidence)"
+                );
+                // proposed 标记落账（幂等锚；写失败仅 warn——确定性 entry_id
+                // 保证下批重提议不产生重复条目）
+                let marker = serde_json::json!({
+                    "candidate_event_id": face.event_id,
+                    "entry_id": entry_id,
+                    "dataset": dataset,
+                    "lifecycle": lifecycle,
+                });
+                let value = marker.to_string();
+                if let Err(e) = deps
+                    .memory
+                    .set_scoped(
+                        MemoryScope::Shared,
+                        &knowledge_proposed_marker_key(&face.event_id),
+                        &value,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        candidate = %face.event_id,
+                        "sediment: knowledge propose marker write failed (best-effort)"
+                    );
+                }
+                result.knowledge_proposed.push(face.event_id.clone());
+            }
+            Err(e) => {
+                // fail-soft：治理侧拒绝不阻塞会话收尾，候选保持原态下批重试
+                tracing::warn!(
+                    session_id = %session_id,
+                    candidate = %face.event_id,
+                    error = %e,
+                    "sediment: knowledge auto-propose failed (candidate kept for retry)"
+                );
             }
         }
     }
@@ -1568,6 +1760,7 @@ mod tests {
             knowledge_kind: kind.to_string(),
             title: title.to_string(),
             body: body.to_string(),
+            confidence: 0.9,
             fact_id: 0,
         };
         let cands = vec![
@@ -2308,5 +2501,340 @@ mod tests {
         assert_eq!(result.knowledge_candidates.len(), 1);
         assert!(result.knowledge_candidates[0].starts_with("KC-s1-"));
         m1.assert_async().await;
+    }
+
+    // ===== 知识候选自动出口（S-5 收尾批） =====
+
+    /// 账本候选事实构造（顶层 MemoryEvent 形态，与提取路/巩固路落账同构；
+    /// source_session_id/version 为 SharedFactEntry 必填字段）
+    fn kc_fact(fact_id: u64, path: &str, confidence: f64) -> serde_json::Value {
+        serde_json::json!({
+            "fact_id": fact_id,
+            "path": path,
+            "source_session_id": 1,
+            "version": 1,
+            "value": {
+                "event_id": path.rsplit('.').next().unwrap_or(""),
+                "event_type": {"kind": "Custom", "subtype": "knowledge_candidate"},
+                "confidence": confidence,
+                "content": {
+                    "knowledge_kind": "fact",
+                    "title": "登录超时阈值",
+                    "body": "登录超时阈值为 30 秒"
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn test_knowledge_propose_entry_id_deterministic() {
+        // 确定性 slug：同输入同 ID（幂等锚），异输入异 ID
+        let a = knowledge_propose_entry_id("KC-s1-100-0", "s1");
+        let b = knowledge_propose_entry_id("KC-s1-100-0", "s1");
+        assert_eq!(a, b);
+        assert!(a.starts_with("kc-"));
+        assert_ne!(
+            a,
+            knowledge_propose_entry_id("KC-s1-100-1", "s1"),
+            "不同候选不同 slug"
+        );
+        assert_ne!(
+            a,
+            knowledge_propose_entry_id("KC-s1-100-0", "s2"),
+            "同候选异会话不同 slug"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_knowledge_propose_ready_candidates_payload_shape() {
+        // J-EXP-1：达标候选 propose 调用形态四要素（entry_id/payload/schema_ref/cause）；
+        // 不达标候选（confidence < 门限）不提议；提议标记落账
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("ns", client).with_session_id("s-prop");
+
+        let mut cfg = SedimentConfig::default();
+        cfg.enable_knowledge_propose = true;
+        cfg.knowledge_propose_dataset = Some("tb-contracts".to_string());
+        cfg.knowledge_propose_min_confidence = 0.7;
+
+        let facts = serde_json::json!([
+            kc_fact(1, "shared.ns.knowledge_candidates.KC-s-prop-100-0", 0.75),
+            kc_fact(2, "shared.ns.knowledge_candidates.KC-s-prop-100-1", 0.4),
+        ]);
+        let m_get = server
+            .mock(
+                "GET",
+                "/api/shared/facts?prefix=shared.ns.knowledge_candidates.",
+            )
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(facts.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        // 调用形态断言：PartialJson 子集匹配（键序无关）——四要素逐字段锚定
+        let expected_entry_id = knowledge_propose_entry_id("KC-s-prop-100-0", "s-prop");
+        let m_invoke = server
+            .mock("POST", "/api/services/knowledge-propose/invoke")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "dataset_id": "tb-contracts",
+                "cause": "sediment knowledge auto-propose: candidate KC-s-prop-100-0 (kind fact) met confidence gate; session s-prop",
+                "entry": {
+                    "entry_id": expected_entry_id,
+                    "version": 1,
+                    "payload": {
+                        "statement": "登录超时阈值为 30 秒",
+                        "title": "登录超时阈值",
+                        "confidence": 0.75,
+                    },
+                    "schema_ref": "builtin:knowledge/fact",
+                },
+            })))
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(r#"{"entry_id":"kc-receipt","lifecycle":"Draft","version":1}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // 提议标记落账（幂等锚）：key 落 proposed 域+value 携带确定性 entry_id
+        let m_marker = server
+            .mock("POST", "/api/sessions/s-prop/payload")
+            .with_status(200)
+            .match_body(mockito::Matcher::Regex(
+                r#"knowledge_candidates\.proposed\.KC-s-prop-100-0[\s\S]*kc-"#.to_string(),
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut deps = SedimentDeps {
+            memory: &mut memory,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: None,
+            journal_lines: Vec::new(),
+        };
+        let mut result = SedimentResult::default();
+        propose_ready_candidates(&mut deps, &cfg, "s-prop", "tb-contracts", &mut result).await;
+
+        m_get.assert_async().await;
+        m_invoke.assert_async().await;
+        m_marker.assert_async().await;
+        assert_eq!(
+            result.knowledge_proposed,
+            vec!["KC-s-prop-100-0".to_string()],
+            "仅达标候选被提议"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_knowledge_propose_idempotent_skips_marked() {
+        // J-EXP-2：幂等——已提议候选（proposed 标记在账）二次收尾不重复提议
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("ns", client).with_session_id("s-prop");
+
+        let mut cfg = SedimentConfig::default();
+        cfg.enable_knowledge_propose = true;
+        cfg.knowledge_propose_dataset = Some("tb-contracts".to_string());
+
+        let facts = serde_json::json!([
+            kc_fact(1, "shared.ns.knowledge_candidates.KC-s-prop-100-0", 0.9),
+            {
+                "fact_id": 9,
+                "path": "shared.ns.knowledge_candidates.proposed.KC-s-prop-100-0",
+                "source_session_id": 1,
+                "version": 1,
+                "value": {
+                    "candidate_event_id": "KC-s-prop-100-0",
+                    "entry_id": "kc-deadbeefdeadbeef",
+                    "dataset": "tb-contracts",
+                    "lifecycle": "Draft"
+                }
+            },
+        ]);
+        let m_get = server
+            .mock(
+                "GET",
+                "/api/shared/facts?prefix=shared.ns.knowledge_candidates.",
+            )
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(facts.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let m_invoke = server
+            .mock("POST", "/api/services/knowledge-propose/invoke")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let m_marker = server
+            .mock("POST", "/api/sessions/s-prop/payload")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut deps = SedimentDeps {
+            memory: &mut memory,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: None,
+            journal_lines: Vec::new(),
+        };
+        let mut result = SedimentResult::default();
+        propose_ready_candidates(&mut deps, &cfg, "s-prop", "tb-contracts", &mut result).await;
+
+        assert!(
+            result.knowledge_proposed.is_empty(),
+            "已提议候选不得重复提议"
+        );
+        m_get.assert_async().await;
+        m_invoke.assert_async().await;
+        m_marker.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_knowledge_propose_fail_soft_keeps_candidate() {
+        // J-EXP-3：fail-soft——治理侧拒绝（403）→ warn 留痕+候选保持（无提议
+        // 标记落账），且会话收尾管线不中断（sediment 主入口正常返回）
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("ns", client).with_session_id("s-soft");
+
+        let mut cfg = SedimentConfig {
+            namespace: "ns".to_string(),
+            ..Default::default()
+        };
+        cfg.enable_event_extraction = false;
+        cfg.enable_knowledge_extraction = false;
+        cfg.enable_consolidation = false;
+        cfg.enable_knowledge_propose = true;
+        cfg.knowledge_propose_dataset = Some("tb-contracts".to_string());
+
+        let facts = serde_json::json!([kc_fact(
+            1,
+            "shared.ns.knowledge_candidates.KC-s-soft-100-0",
+            0.9
+        ),]);
+        let m_get = server
+            .mock(
+                "GET",
+                "/api/shared/facts?prefix=shared.ns.knowledge_candidates.",
+            )
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(facts.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let m_invoke = server
+            .mock("POST", "/api/services/knowledge-propose/invoke")
+            .with_status(403)
+            .expect(1)
+            .create_async()
+            .await;
+        // 候选保持：无提议标记写入
+        let m_marker = server
+            .mock("POST", "/api/sessions/s-soft/payload")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut deps = SedimentDeps {
+            memory: &mut memory,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: None,
+            journal_lines: Vec::new(),
+        };
+        let messages = vec![
+            Message::User {
+                content: "第一条".to_string(),
+            },
+            Message::Assistant {
+                content: "回复一".to_string(),
+                tool_calls: None,
+            },
+        ];
+        // 全管线入口（非仅出口步骤）：治理侧拒绝不得中断会话收尾
+        let result = sediment(&mut deps, &cfg, "s-soft", &messages).await;
+        m_get.assert_async().await;
+        m_invoke.assert_async().await;
+        m_marker.assert_async().await;
+        assert!(result.knowledge_proposed.is_empty(), "拒绝时不得虚报成功");
+    }
+
+    #[tokio::test]
+    async fn test_sediment_knowledge_propose_disabled_by_default() {
+        // J-EXP-4（缺省关）：开关缺省关、或开关开而 dataset 未配（双保险）——
+        // 均零外呼（不加载候选、不提议），行为与现状一致
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("ns", client).with_session_id("s-off");
+
+        let mut cfg_off = SedimentConfig {
+            namespace: "ns".to_string(),
+            ..Default::default()
+        };
+        cfg_off.enable_event_extraction = false;
+        cfg_off.enable_knowledge_extraction = false;
+        cfg_off.enable_consolidation = false;
+        let cfg_no_dataset = {
+            let mut c = cfg_off.clone();
+            c.enable_knowledge_propose = true; // dataset 仍 None——双保险关
+            c
+        };
+
+        let m_get = server
+            .mock(
+                "GET",
+                "/api/shared/facts?prefix=shared.ns.knowledge_candidates.",
+            )
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let m_invoke = server
+            .mock("POST", "/api/services/knowledge-propose/invoke")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut deps = SedimentDeps {
+            memory: &mut memory,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: None,
+            journal_lines: Vec::new(),
+        };
+        let messages = vec![
+            Message::User {
+                content: "第一条".to_string(),
+            },
+            Message::Assistant {
+                content: "回复一".to_string(),
+                tool_calls: None,
+            },
+        ];
+        let r1 = sediment(&mut deps, &cfg_off, "s-off", &messages).await;
+        let r2 = sediment(&mut deps, &cfg_no_dataset, "s-off", &messages).await;
+        assert!(r1.knowledge_proposed.is_empty());
+        assert!(r2.knowledge_proposed.is_empty());
+        m_get.assert_async().await;
+        m_invoke.assert_async().await;
     }
 }
