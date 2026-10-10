@@ -1,4 +1,4 @@
-//! E-8 两仓 E2E：evo-agent 协商握手 × evorule-server 契约端点（34 号档 B3）
+//! 两仓 E2E：evo-agent 协商握手 × evorule-server 契约端点
 //!
 //! **测试对象**：B2 的协商链路（EvoruleApiClient::fetch_io_contract →
 //! negotiate_io_contract）的三个场景端到端实证：
