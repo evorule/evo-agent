@@ -91,7 +91,10 @@ impl std::fmt::Display for IoContractError {
 /// `+ Send` 因 runner stream 需跨线程 spawn）。
 pub async fn negotiate_io_contract(
     fetch_json: impl FnOnce() -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<serde_json::Value, NegotiationFetchError>> + Send>,
+        Box<
+            dyn std::future::Future<Output = Result<serde_json::Value, NegotiationFetchError>>
+                + Send,
+        >,
     >,
 ) -> Result<IoContractNegotiation, IoContractError> {
     let raw = match fetch_json().await {
@@ -104,8 +107,8 @@ pub async fn negotiate_io_contract(
             return Ok(IoContractNegotiation::LegacyServer);
         }
     };
-    let contract: IoContract = serde_json::from_value(raw)
-        .map_err(|e| IoContractError::Malformed(e.to_string()))?;
+    let contract: IoContract =
+        serde_json::from_value(raw).map_err(|e| IoContractError::Malformed(e.to_string()))?;
     if !IO_CONTRACT_SUPPORTED.contains(&contract.contract_version) {
         return Err(IoContractError::VersionMismatch {
             server_version: contract.contract_version,
@@ -142,8 +145,9 @@ pub fn params_match_shape(spec: &IoShapeSpec, io_type: &str, params: &serde_json
 /// 读仓内 pinned 契约副本（交叉锁测用；来源=evorule-server 快照导出，
 /// 双仓同步由 CI 级脚本核哈希——34 号档 §2.3）。
 pub fn pinned_contract() -> Result<IoContract, IoContractError> {
-    let raw: serde_json::Value = serde_json::from_str(include_str!("../../assets/io-contract-v1.json"))
-        .map_err(|e| IoContractError::Malformed(format!("pinned asset: {e}")))?;
+    let raw: serde_json::Value =
+        serde_json::from_str(include_str!("../../assets/io-contract-v1.json"))
+            .map_err(|e| IoContractError::Malformed(format!("pinned asset: {e}")))?;
     serde_json::from_value(raw).map_err(|e| IoContractError::Malformed(e.to_string()))
 }
 
@@ -168,7 +172,9 @@ mod tests {
     #[tokio::test]
     async fn test_negotiate_version_ok() {
         let json = serde_json::to_value(pinned()).unwrap();
-        let r = negotiate_io_contract(|| Box::pin(async move { Ok(json) })).await.unwrap();
+        let r = negotiate_io_contract(|| Box::pin(async move { Ok(json) }))
+            .await
+            .unwrap();
         match r {
             IoContractNegotiation::Ok(c) => assert_eq!(c.contract_version, 1),
             other => panic!("expected Ok, got {other:?}"),
@@ -177,11 +183,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_negotiate_404_legacy_pass() {
-        let r = negotiate_io_contract(|| {
-            Box::pin(async { Err(NegotiationFetchError::NotFound) })
-        })
-        .await
-        .unwrap();
+        let r = negotiate_io_contract(|| Box::pin(async { Err(NegotiationFetchError::NotFound) }))
+            .await
+            .unwrap();
         assert!(matches!(r, IoContractNegotiation::LegacyServer));
     }
 
