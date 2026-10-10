@@ -8,7 +8,7 @@
   "temperature": 0.3,
   "max_steps": 500,
   "context_window_tokens": 204800,
-  "step_timeout_secs": 600,
+  "step_timeout_secs": 1300,
   "approval_mode": "auto_policy",
   "tools": [
     "file_read",
