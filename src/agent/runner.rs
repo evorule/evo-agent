@@ -2247,6 +2247,19 @@ impl AgentRunner {
             )
             .map_err(AgentError::Internal)?;
 
+        // E-8:建会话前 IO 形状契约协商(34 号档)——404/连不通=旧 server warn
+        // 通过;端点在但版本不匹配=hard fail(未验证升级行为宁停不错)。
+        // client clone 进闭包达 'static(共享 reqwest 连接池,无额外开销)。
+        let io_client = self.evorule_client.clone();
+        if let Err(e) = crate::api::io_contract::negotiate_io_contract(move || {
+            Box::pin(async move { io_client.fetch_io_contract().await })
+        })
+        .await
+        {
+            return Err(AgentError::EvoruleError(format!(
+                "io-contract negotiation failed: {e}"
+            )));
+        }
         // M5-a:边界声明经 create_session initial_content 既有载体进会话事实
         let boundary_json = self
             .config
@@ -5075,6 +5088,20 @@ impl AgentRunner {
                 info!(%id, "G15: continuing existing session");
                 id
             } else {
+                // E-8:建会话前 IO 形状契约协商(34 号档)——同 run() 路径口径:
+                // 404/连不通=旧 server warn 通过;版本不匹配=hard fail。
+                // client clone 进闭包达 'static(共享 reqwest 连接池)。
+                let io_client = runner.evorule_client.clone();
+                if let Err(e) = crate::api::io_contract::negotiate_io_contract(move || {
+                    Box::pin(async move { io_client.fetch_io_contract().await })
+                })
+                .await
+                {
+                    yield Err(AgentError::EvoruleError(format!(
+                        "io-contract negotiation failed: {e}"
+                    )));
+                    return;
+                }
                 // 新建 session(原 run_streaming 逻辑)
                 // M5-a:边界声明经 initial_content 既有载体进会话事实
                 let boundary_json = runner.config.capability_boundary.as_ref().map(|b| b.to_json());
