@@ -1461,9 +1461,96 @@ pub static FACTS_VERSION: EndpointBinding = EndpointBinding {
     ..BINDING_DEFAULTS
 };
 
+pub static FACT_USED_BY: EndpointBinding = EndpointBinding {
+    name: "fact_used_by",
+    client: ClientKind::Evorule,
+    path: "/api/shared/facts/{fact_id}/used_by",
+    description: "List the sessions that have used a shared fact (GET \
+                  /api/shared/facts/{fact_id}/used_by). Dependency observation \
+                  for memory metabolism: who relies on this fact.",
+    params: &[ParamBinding {
+        name: "fact_id",
+        kind: ParamKind::Int,
+        loc: Loc::Path,
+        required: true,
+        non_negative: true,
+        description: "Shared fact ID.",
+        ..PARAM_DEFAULTS
+    }],
+    ..BINDING_DEFAULTS
+};
+
+pub static SESSION_USED_AT_STARTUP: EndpointBinding = EndpointBinding {
+    name: "session_used_at_startup",
+    client: ClientKind::Evorule,
+    path: "/api/sessions/{session_id}/used_at_startup",
+    description: "List the shared fact IDs a session consumed at startup (GET \
+                  /api/sessions/{session_id}/used_at_startup). Read side of the \
+                  reuse loop: startup fact-replay evidence.",
+    params: &[ParamBinding {
+        name: "session_id",
+        loc: Loc::Path,
+        required: true,
+        description: "Session ID.",
+        ..PARAM_DEFAULTS
+    }],
+    ..BINDING_DEFAULTS
+};
+
+pub static DEBUG_PHASE: EndpointBinding = EndpointBinding {
+    name: "debug_phase",
+    client: ClientKind::Evorule,
+    path: "/api/sessions/{session_id}/debug/phase",
+    description: "Inspect the reactor phase of a session (GET \
+                  /api/sessions/{session_id}/debug/phase). Runtime observation \
+                  for long tool turns.",
+    params: &[ParamBinding {
+        name: "session_id",
+        loc: Loc::Path,
+        required: true,
+        description: "Session ID.",
+        ..PARAM_DEFAULTS
+    }],
+    ..BINDING_DEFAULTS
+};
+
+pub static DEBUG_QUEUE: EndpointBinding = EndpointBinding {
+    name: "debug_queue",
+    client: ClientKind::Evorule,
+    path: "/api/sessions/{session_id}/debug/queue",
+    description: "Inspect the instruction queue of a session (GET \
+                  /api/sessions/{session_id}/debug/queue). Runtime observation \
+                  for long tool turns.",
+    params: &[ParamBinding {
+        name: "session_id",
+        loc: Loc::Path,
+        required: true,
+        description: "Session ID.",
+        ..PARAM_DEFAULTS
+    }],
+    ..BINDING_DEFAULTS
+};
+
+pub static DEBUG_PENDING_IO: EndpointBinding = EndpointBinding {
+    name: "debug_pending_io",
+    client: ClientKind::Evorule,
+    path: "/api/sessions/{session_id}/debug/pending_io",
+    description: "Inspect the IO requests awaiting a response (GET \
+                  /api/sessions/{session_id}/debug/pending_io). Runtime \
+                  observation for stalled-io diagnosis.",
+    params: &[ParamBinding {
+        name: "session_id",
+        loc: Loc::Path,
+        required: true,
+        description: "Session ID.",
+        ..PARAM_DEFAULTS
+    }],
+    ..BINDING_DEFAULTS
+};
+
 // =============================================================================
-// 全量透传 binding 表（44 个 = D-1 分类表纯透传族全集 + hit-stats 2 + audit_export 1
-// + facts_version 1）
+// 全量透传 binding 表（49 个 = D-1 分类表纯透传族全集 + hit-stats 2 + audit_export 1
+// + facts_version 1 + 事实追溯/启动回读 2 + debug 观测 3）
 // =============================================================================
 
 /// 全部透传工具的端点绑定（顺序 = 原手写 specs 组装顺序，便于对照）。
@@ -1523,6 +1610,13 @@ pub static ALL_TRANSPARENT_BINDINGS: &[&EndpointBinding] = &[
     &KNOWLEDGE_ENTRY_GET,
     // facts/version 1（39 号批 B5，只读并发核对面）
     &FACTS_VERSION,
+    // 事实追溯/启动回读 2（39 号批 A2/A3，只读断头线接通）
+    &FACT_USED_BY,
+    &SESSION_USED_AT_STARTUP,
+    // debug 观测三件套（39 号批 A4，只读；E-9 形态运行时观测面）
+    &DEBUG_PHASE,
+    &DEBUG_QUEUE,
+    &DEBUG_PENDING_IO,
     // hit-stats 2（39 号批 B3，只读观测面）
     &HIT_STATS,
     &HIT_STATS_SERIES,
@@ -1562,7 +1656,7 @@ mod tests {
 
     #[test]
     fn test_all_bindings_count_and_names_unique() {
-        assert_eq!(ALL_TRANSPARENT_BINDINGS.len(), 44);
+        assert_eq!(ALL_TRANSPARENT_BINDINGS.len(), 49);
         let mut names: Vec<&str> = ALL_TRANSPARENT_BINDINGS.iter().map(|b| b.name).collect();
         names.sort_unstable();
         names.dedup();
