@@ -564,6 +564,27 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    /// 会话全量事实（崩溃恢复的挂起 io 对账数据源：IoRequest/IoResponse 按
+    /// id 差集即未响应请求）。响应为 `Vec<FactEnvelope>` JSON 数组
+    /// （`type` 判别七种变体，元素含 `version`）。
+    pub async fn get_session_history(&self, session_id: &str) -> Result<Value, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/history",
+            self.core.base_url(),
+            session_id
+        );
+
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+
+        let result: Value = resp.json().await?;
+        Ok(result)
+    }
+
     /// 获取会话 Fact 列表，`prefix` 可选按 path 前缀过滤。
     pub async fn get_facts(
         &self,

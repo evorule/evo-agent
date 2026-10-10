@@ -2333,6 +2333,16 @@ async fn test_g15_run_continuation_does_not_create_session() {
         .create_async()
         .await;
 
+    // mock persist_message 的 payload 写(历史段前移后 persist 先于订阅;
+    // 未 mock 会 404 → yield Err 提前终止流,订阅断言失配)
+    let payload_mock = server
+        .mock("POST", "/api/sessions/s42/payload")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"success":true,"fact_id":1}"#)
+        .create_async()
+        .await;
+
     // mock subscribe_events(返回空 SSE 流 — 立即关闭)
     let events_mock = server
         .mock("GET", "/api/sessions/s42/events")
@@ -2374,6 +2384,7 @@ async fn test_g15_run_continuation_does_not_create_session() {
     state_mock.assert_async().await;
     events_mock.assert_async().await;
     command_mock.assert_async().await;
+    let _ = payload_mock; // 命中数不限(persist 按消息数)
 }
 
 /// G15:验证 run_streaming(新建模式)调用 create_session
@@ -3704,4 +3715,35 @@ async fn test_log_session_invariants_best_effort_fail_soft() {
         EvoruleApiClient::new("http://127.0.0.1:1"),
     );
     runner.log_session_invariants_best_effort("42").await;
+}
+
+#[test]
+fn pending_resolution_reconciles_io_request_response_diff() {
+    // 对账差集:IoRequest 与 IoResponse 按 id 差集=未响应请求;
+    // 多挂起取 id 最大者;全已解析=None
+    let req = |id: u64| serde_json::json!({"type": "IoRequest", "id": id, "io_type": "call_external", "params": {}});
+    let resp = |rid: u64| serde_json::json!({"type": "IoResponse", "id": rid + 100, "request_id": rid, "result": {}, "error": null});
+
+    // 恰一挂起
+    let history = serde_json::json!([req(7), resp(7), req(9)]);
+    let (rid, io_type, _) = AgentRunner::plan_pending_resolution(&history).unwrap();
+    assert_eq!(rid, 9);
+    assert_eq!(io_type, "call_external");
+
+    // 全已解析 → None
+    let history = serde_json::json!([req(7), resp(7)]);
+    assert!(AgentRunner::plan_pending_resolution(&history).is_none());
+
+    // 多挂起取最新(id 最大)
+    let history = serde_json::json!([req(7), req(9)]);
+    let (rid, _, _) = AgentRunner::plan_pending_resolution(&history).unwrap();
+    assert_eq!(rid, 9);
+
+    // Object 包装(facts 键)同构
+    let history = serde_json::json!({"facts": [req(7), req(9), resp(9)]});
+    let (rid, _, _) = AgentRunner::plan_pending_resolution(&history).unwrap();
+    assert_eq!(rid, 7);
+
+    // 空账 → None
+    assert!(AgentRunner::plan_pending_resolution(&serde_json::json!([])).is_none());
 }
