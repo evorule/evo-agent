@@ -42,7 +42,7 @@
 | **会话沉淀** | 会话结束时自动写入摘要 + 稳定事实到共享空间 |
 | **工具注册中心** | `ToolRegistry` + `ToolFunction` trait，任何 `async fn(JsonValue) -> Result<JsonValue, String>` 都能注册 |
 | **3 层安全模型** | active（白名单）/ candidate（待批）/ blocked（永不），含 SSRF 防护 + 工作目录沙箱 |
-| **规则管理工具集** | 51 个工具（spec 数，测试锁定；serve 面默认暴露 54 = 内置 17 + 规则 37，sandbox/dataset/publish/production 共 14 个为已定义未入 serve 面的高级工具）：workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + hit-stats 2 + skill 装配 1 + meta 1 + evolution 2 + why/order 3 |
+| **规则管理工具集** | 52 个工具（spec 数，测试锁定；serve 面默认暴露 55 = 内置 17 + 规则 38，sandbox/dataset/publish/production 共 14 个为已定义未入 serve 面的高级工具）：workspace 2 + rule 12 + translate 3 + audit 4 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + hit-stats 2 + skill 装配 1 + meta 1 + evolution 2 + why/order 3 |
 | **工作流引擎** | DAG 拓扑编排多 Agent，同层并行 + 跨层串行 + 模板渲染 |
 | **MCP 客户端** | 接入 Model Context Protocol 工具生态（stdio 传输） |
 | **上下文窗口管理** | 按 token 数裁剪历史消息，保留 system + 最近若干轮 |
@@ -523,7 +523,7 @@ MCP 远端工具与服务代理工具为运行期动态注册（非静态工具�
 
 说明：同 `application` 作用域；分级键只作用于动态源条目——静态工具的治理分级以静态表为准，不受此键影响。
 
-### 规则管理工具集（51 个）
+### 规则管理工具集（52 个）
 
 通过 `rule_management_toolkit` / `full_rule_toolkit` 组装，用于 `rule-copilot` Agent：
 
@@ -532,7 +532,7 @@ MCP 远端工具与服务代理工具为运行期动态注册（非静态工具�
 | workspace | 2 | ws_list, ws_create |
 | rule | 12 | rule_list, rule_get, rule_create, rule_update, rule_versions, rule_version_get, rule_submit, rule_activate, rule_block, rule_archive, rule_fork, rule_reload |
 | translate | 3 | rule_to_transform, rule_to_conditional, rule_validate |
-| audit | 3 | audit_get, audit_verify, session_rewind |
+| audit | 4 | audit_get, audit_verify, session_rewind, audit_export |
 | sandbox | 5 | 沙盒编排（fork + 合成数据 + 测试报告） |
 | dataset | 2 | 数据集管理 |
 | publish | 5 | 发布队列 + 三级权限 |
@@ -859,7 +859,7 @@ evo-agent/
 | Runner 拆分（Phase 2） | ⏳ | `runner.rs` 仍为约 4000 行单文件，未拆为子模块 |
 | 编译告警 | ⚠️ | 主体为 `missing_docs`；另有少量 clippy 代码质量 lint 待清理 |
 
-> 规则管理工具集总数为 **51 个**（workspace 2 + rule 12 + translate 3 + audit 3 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + hit-stats 2 + skill 装配 1 + meta 1 + evolution 2 + why/order 3），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
+> 规则管理工具集总数为 **52 个**（workspace 2 + rule 12 + translate 3 + audit 4 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + hit-stats 2 + skill 装配 1 + meta 1 + evolution 2 + why/order 3），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
 
 ## 依赖关系
 
