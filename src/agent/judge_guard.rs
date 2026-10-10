@@ -40,10 +40,8 @@ pub const DEFAULT_JUDGE_COMMAND_WHITELIST: &[&str] = &[
     // 文本探针
     "grep", "findstr", "rg", "find", "ls", "dir", "cat", "type", "test", "echo", "wc",
     // git 只读统计
-    "git",
-    // 容器内判据/复合脚本
-    "sh", "bash",
-    // Windows 探针
+    "git", // 容器内判据/复合脚本
+    "sh", "bash", // Windows 探针
     "where", "fc", "find",
 ];
 
@@ -103,10 +101,7 @@ pub fn validate_judge_command(cmd: &str) -> Result<(), String> {
     if allow_any() {
         return Ok(());
     }
-    let head = cmd
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
+    let head = cmd.split_whitespace().next().unwrap_or("");
     if head.is_empty() {
         return Err("judge command 为空（白名单门卫拒绝：判据命令不可为空）".to_string());
     }
@@ -129,9 +124,17 @@ mod tests {
     #[test]
     fn test_whitelist_accepts_engineering_commands() {
         for ok in [
-            "cargo build", "cargo build --release", "pytest -x", "python check.py",
-            "node verify.js", "grep needle file.txt", "findstr needle file.txt",
-            "git log --oneline", "echo done", "sh -c 'cargo test'", "bash run.sh",
+            "cargo build",
+            "cargo build --release",
+            "pytest -x",
+            "python check.py",
+            "node verify.js",
+            "grep needle file.txt",
+            "findstr needle file.txt",
+            "git log --oneline",
+            "echo done",
+            "sh -c 'cargo test'",
+            "bash run.sh",
         ] {
             assert!(validate_judge_command(ok).is_ok(), "应放行: {ok}");
         }

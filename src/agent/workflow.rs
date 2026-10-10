@@ -707,14 +707,14 @@ impl WorkflowEngine {
     }
 
     /// 显式注入 run 级账本句柄(外部装配/测试桩场景;注入后自举不再发生)
-    pub fn with_run_journal(mut self, writer: JournalWriter) -> Self {
+    pub fn with_run_journal(self, writer: JournalWriter) -> Self {
         *self.run_ledger.lock().unwrap_or_else(|p| p.into_inner()) = RunLedgerSlot::Ready(writer);
         self
     }
 
     /// 显式关停 run 级账本(即使 ctx.journal_dir 在场也不自举;既有形态
     /// 显式化——不想落 run 账的调用方用此关停)
-    pub fn without_run_journal(mut self) -> Self {
+    pub fn without_run_journal(self) -> Self {
         *self.run_ledger.lock().unwrap_or_else(|p| p.into_inner()) = RunLedgerSlot::Disabled;
         self
     }
@@ -1978,9 +1978,10 @@ pub struct NodeCheckpointReplay {
 /// 从 run 级账本回放粒级检查点,重建恢复种子(fail-closed:计划锚不匹配/
 /// blob 全文缺失/hash 校验不过,一律 Err 拒绝恢复——宁可重跑不可错续)。
 ///
-/// 语义注记:计划锚按严格单值校验——账内出现任一其它计划锚的检查点即
-/// 拒绝(防错版本续跑的关键闸)。replan 多版本场景由外层驱动切片回放
-/// (最新计划检查点之后的检查点尾段属当前版本),本函数不做切片。
+/// 语义注记:计划锚按「采纳匹配、异版跳过」——账内同锚检查点全部采纳,
+/// 其它计划锚的检查点跳过(各归各版本的恢复域;同锚粒无论落在哪个计划
+/// 检查点前后都有效,二次恢复不丢粒级进度);调用方锚定了一个账内不存在的
+/// 版本(匹配数 0 而账内有检查点)=拒绝,防错版本续跑。
 pub fn replay_node_checkpoints(
     lines: &[JournalLine],
     plan_hash: &str,
@@ -2000,6 +2001,8 @@ pub fn replay_node_checkpoints(
             blobs.insert((node_id.clone(), hash.clone()), full_text.clone());
         }
     }
+    let mut matched = 0usize;
+    let mut foreign = 0usize;
     for line in lines {
         let JournalEvent::NodeCheckpointed {
             plan_hash: found,
@@ -2012,11 +2015,12 @@ pub fn replay_node_checkpoints(
             continue;
         };
         if found != plan_hash {
-            return Err(format!(
-                "checkpoint plan hash mismatch (expected {plan_hash}, found {found}) \
-                 - refusing recovery (rerun is the safe direction)"
-            ));
+            // 异版本粒归各自版本的恢复域:跳过不拒绝(同锚粒无论落在哪个
+            // 计划检查点前后都有效——二次恢复不丢粒级进度)
+            foreign += 1;
+            continue;
         }
+        matched += 1;
         let content = match &result_ref.inline {
             Some(text) => text.clone(),
             None => blobs
@@ -2049,6 +2053,11 @@ pub fn replay_node_checkpoints(
                 ))
             }
         }
+    }
+    if matched == 0 && foreign > 0 {
+        return Err(format!(
+            "checkpoint plan hash mismatch: expected {plan_hash}, found {foreign} checkpoint(s) of other plan versions - refusing recovery (rerun is the safe direction)"
+        ));
     }
     Ok(out)
 }
@@ -2311,6 +2320,44 @@ mod tests {
         let sid = find_planrun_sid(&dir).unwrap();
         let lines = crate::agent::journal::read_all(&JournalWriter::path_for(&dir, &sid)).unwrap();
         let err = replay_node_checkpoints(&lines, "deadbeef-wrong-plan-hash").unwrap_err();
+        assert!(err.contains("plan hash mismatch"), "拒绝恢复: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_cross_version_replay_adopts_matching_skips_foreign() {
+        // 跨版本混账:同锚粒采纳、异版粒跳过(二次恢复不丢进度);
+        // 锚全无匹配而账内有检查点=拒绝(fail-closed 负例判据保留)
+        let dir = crate::agent::journal::JournalWriter::path_for(&std::env::temp_dir(), "xv-probe");
+        let dir = dir
+            .parent()
+            .unwrap()
+            .join(format!("wf-xv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wf = checkpoint_chain_wf();
+        let plan_hash = WorkflowEngine::workflow_plan_hash(&wf).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "xv").unwrap();
+            // 异版本粒(其它计划锚)
+            w.node_checkpointed("wf", "other-plan-hash", "old_node", "completed", "old")
+                .unwrap();
+            // 同锚粒(本版本,含大结果走 blob)
+            let big = "z".repeat(crate::agent::journal::CHECKPOINT_INLINE_LIMIT + 8);
+            w.node_checkpointed("wf", &plan_hash, "n_big", "completed", &big)
+                .unwrap();
+            w.node_checkpointed("wf", &plan_hash, "n1", "completed", "")
+                .unwrap();
+        }
+        let lines = crate::agent::journal::read_all(&JournalWriter::path_for(&dir, "xv")).unwrap();
+        let replay = replay_node_checkpoints(&lines, &plan_hash).unwrap();
+        assert_eq!(replay.results.len(), 2, "同锚两粒采纳,异版粒跳过");
+        assert!(replay.results.contains_key("n_big"));
+        assert!(replay.results.contains_key("n1"));
+        assert!(!replay.results.contains_key("old_node"));
+
+        // 锚全无匹配 → 拒绝
+        let err = replay_node_checkpoints(&lines, "totally-wrong-hash").unwrap_err();
         assert!(err.contains("plan hash mismatch"), "拒绝恢复: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -115,7 +115,7 @@ async fn test_e2e_unreachable_warn_pass() {
 fn live_server_base() -> String {
     std::env::var("EVORULE_TEST_SERVER")
         .ok()
-                .filter(|v| !v.is_empty())
+        .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:18080".to_string())
 }
 
@@ -126,8 +126,7 @@ async fn test_e2e_live_server_contract_negotiation_ok() {
     match client.fetch_io_contract().await {
         Ok(v) => {
             // 端点在：协商必须过且与 pinned 形状一致
-            let contract: IoContract =
-                serde_json::from_value(v).expect("live contract parses");
+            let contract: IoContract = serde_json::from_value(v).expect("live contract parses");
             assert_same_v1_shape(&pinned(), &contract);
         }
         Err(NegotiationFetchError::NotFound) => {
