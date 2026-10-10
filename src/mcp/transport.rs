@@ -51,6 +51,7 @@ use tracing::{debug, warn};
 ///
 /// P1 只实现 [`StdioTransport`](StdioTransport);P2 可加 SseTransport。
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait 宏生成的 must_use 与 Boxed Future 类型语义重复,源上无法消
 pub trait McpTransport: Send + Sync {
     /// 发送一条 JSON-RPC 请求,等待响应
     ///

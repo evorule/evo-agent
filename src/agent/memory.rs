@@ -430,6 +430,7 @@ fn stable_relevance(record: &MemoryRecord, goal_uniq_sorted: &[String]) -> usize
 /// 全序 Tie-break：key 字典序 asc——同分同新鲜同置信时输出仍确定。
 /// 词法评分在检索红线内（确定性词法，禁向量库）。排序须在
 /// `fit_recall` 前缀截断之前完成，截断即优先淘汰低价值条目（I6）。
+#[allow(dead_code)] // 仅 cfg(test) 排序单测引用,lib 构建无调用方
 pub(crate) fn sort_stable_by_value(stable: &mut [MemoryRecord], goal: &str) {
     // 阶段 2（策略数据化）：无 Recipe 场景 = 词法 legacy（w_r=1，行为与历史逐字节一致）；
     // Recipe 在位时召回入口应走 sort_by_policy（三因子加权）
@@ -469,7 +470,7 @@ pub(crate) fn sort_by_policy(
     let mut goal_uniq = tokenize_for_match(goal);
     goal_uniq.sort();
     goal_uniq.dedup();
-    let now = now_secs() as f64;
+    let _now = now_secs() as f64;
     let rels: Vec<usize> = stable
         .iter()
         .map(|r| stable_relevance(r, &goal_uniq))
@@ -545,7 +546,7 @@ pub(crate) fn sort_by_policy(
             .then(stable[i].key.cmp(&stable[j].key))
     });
     let sorted: Vec<MemoryRecord> = idx.into_iter().map(|k| stable[k].clone()).collect();
-    for (slot, rec) in stable.iter_mut().zip(sorted.into_iter()) {
+    for (slot, rec) in stable.iter_mut().zip(sorted) {
         *slot = rec;
     }
 }
@@ -611,8 +612,8 @@ pub(crate) fn select_notes_for_goal(
         })
         .collect();
     scored.sort_by(|a, b| {
-        let ka = (a.0 + if a.1 { 1 } else { 0 });
-        let kb = (b.0 + if b.1 { 1 } else { 0 });
+        let ka = a.0 + if a.1 { 1 } else { 0 };
+        let kb = b.0 + if b.1 { 1 } else { 0 };
         kb.cmp(&ka)
             .then(b.2.timestamp.cmp(&a.2.timestamp))
             .then(a.2.key.cmp(&b.2.key))
@@ -2383,7 +2384,7 @@ impl MemoryManager {
             }));
             if rehydrate {
                 // 回源:反向 move(冷删+热回插,新增版本事实 RL-A1)
-                if let Some(rec) = serde_json::from_str::<MemoryRecord>(&r.value_json).ok() {
+                if let Ok(rec) = serde_json::from_str::<MemoryRecord>(&r.value_json) {
                     self.cache.insert(
                         format!("shared::{}", r.path.rsplit('.').next().unwrap_or("?")),
                         rec.clone(),
@@ -2399,7 +2400,7 @@ impl MemoryManager {
                             .await;
                     }
                 }
-                let _ = cold.delete_by_paths(&[r.path.clone()]);
+                let _ = cold.delete_by_paths(std::slice::from_ref(&r.path));
             }
         }
         Ok(out)
@@ -2436,7 +2437,7 @@ impl MemoryManager {
         let recipe: crate::agent::recipe::MemoryRecipe = serde_json::from_str(recipe_json)
             .map_err(|e| format!("recipe reload: parse failed ({e})"))?;
         let version = recipe.recipe_version.clone();
-        let rollup = recipe.lifecycle.rollup_threshold;
+        let _rollup = recipe.lifecycle.rollup_threshold;
         // 指纹走重序列化规范形态(与 recipe_fingerprint 同口径:同内容同指纹,
         // 与输入字节形态无关)
         let canonical = serde_json::to_string(&recipe).unwrap_or_default();
@@ -2446,6 +2447,7 @@ impl MemoryManager {
         Ok((version, hash))
     }
 
+    /// 设置记忆 Recipe（发布进程级快照槽并落本地槽位；热重载终态入口）
     pub fn set_recipe(&mut self, recipe: crate::agent::recipe::MemoryRecipe) {
         // O-377① 批 1：发布到进程级快照槽（bundle_export 打包时刻注入消费）
         crate::agent::recipe::publish_recipe(&recipe);
@@ -2860,6 +2862,7 @@ impl MemoryManager {
     ///   (零 LLM,受信通道,Settled 落标),原事件标 Promoted;
     /// - 归档:非 Captured 条目闲置超 archive_after_idle_days → 本地标
     ///   Archived(视图层语义,持久随下次自然重写——写放大 v1 规避)。
+    ///
     /// 确定性:阈值判读纯函数;RL-A1:只增不改(晋升=新增事实)。
     pub async fn apply_lifecycle_transitions(
         &mut self,
@@ -3453,12 +3456,12 @@ impl MemoryManager {
         Ok(manager)
     }
 
-    /// 当前 cache 大小
     /// cache 键只读迭代（测试与观测面;不暴露可变句柄）
     pub fn cache_keys(&self) -> Vec<String> {
         self.cache.keys().cloned().collect()
     }
 
+    /// cache 当前条目数
     pub fn len(&self) -> usize {
         self.cache.len()
     }
@@ -5673,7 +5676,7 @@ mod tests {
         let mk = |v: u64, val: &str| {
             (
                 v,
-                format!("shared.ns.stable.k",),
+                "shared.ns.stable.k".to_string(),
                 serde_json::json!({"key": "k", "value": val, "timestamp": 1000 + v}),
             )
         };
@@ -5704,7 +5707,7 @@ mod tests {
         store_a
             .replace_partition(
                 "shared.a.stable.",
-                &vec![(
+                &[(
                     1u64,
                     "shared.a.stable.k".to_string(),
                     serde_json::json!({"key": "k", "value": "甲的机密", "timestamp": 1}),
@@ -5714,7 +5717,7 @@ mod tests {
         store_b
             .replace_partition(
                 "shared.b.stable.",
-                &vec![(
+                &[(
                     2u64,
                     "shared.b.stable.k".to_string(),
                     serde_json::json!({"key": "k", "value": "乙的内容", "timestamp": 2}),
@@ -5931,7 +5934,7 @@ mod tests {
         // 门控开:矛盾对被裁决——user 权威(未标注按 0? 首 条 source None=0,败者 llm=1)
         // 权威平局时按 confidence/freshness——构造:前者 source=user 胜
         ctx_on.stable[0].source = Some("user".to_string());
-        let mut mgr_on = mk(true);
+        let mgr_on = mk(true);
         mgr_on.adjudicate_stable(&mut ctx_on).await;
         assert_eq!(ctx_on.stable.len(), 1, "败者退出 wire 呈现");
         assert_eq!(ctx_on.stable[0].value, "缓存开关默认开启");
@@ -5955,7 +5958,7 @@ mod tests {
             "缓存开关默认不开启",
             2000,
         ));
-        let mut mgr_off = mk(false);
+        let mgr_off = mk(false);
         mgr_off.adjudicate_stable(&mut ctx_off).await;
         assert_eq!(ctx_off.stable.len(), 2, "缺省关=既有 agent 零影响");
         let _ = dropped; // goal 锚点由用户消息构造(此处不参与断言)
@@ -6394,13 +6397,15 @@ mod tests {
     #[test]
     fn notes_section_renders_feed_first_and_audited() {
         let mgr = MemoryManager::new("sec", make_test_client());
-        let mut recall = RecallContext::default();
-        recall.note_feed = vec!["[强制回喂] 历史 failure 笔记 f1:根因说明".to_string()];
-        recall.notes = vec![MemoryRecord::new(
-            "notes.todo.todo.20261007-003",
-            "待跟进验证",
-            7,
-        )];
+        let recall = RecallContext {
+            note_feed: vec!["[强制回喂] 历史 failure 笔记 f1:根因说明".to_string()],
+            notes: vec![MemoryRecord::new(
+                "notes.todo.todo.20261007-003",
+                "待跟进验证",
+                7,
+            )],
+            ..Default::default()
+        };
         let prompt = mgr.build_system_prompt_with_recall(
             "BASE",
             &recall,
@@ -6701,7 +6706,6 @@ mod tests {
 
     #[tokio::test]
     async fn move_cold_tier_gated_and_moves() {
-        use crate::agent::recipe::StorageConfig;
         // 门控关:零冷迁
         let dir = std::env::temp_dir().join(format!("f617m-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6747,8 +6751,10 @@ mod tests {
         // LM-2 资产化三面:指纹稳定/资产载荷含治理字段/热重载刷新+门控随动
         let mut mgr = MemoryManager::new("ns", make_test_client());
         assert!(mgr.recipe_fingerprint().is_none(), "无 Recipe=无指纹");
-        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
-        recipe.recipe_version = "memory-test-1".to_string();
+        let recipe = crate::agent::recipe::MemoryRecipe {
+            recipe_version: "memory-test-1".to_string(),
+            ..Default::default()
+        };
         mgr.set_recipe(recipe.clone());
         let (v1, h1) = mgr.recipe_fingerprint().unwrap();
         assert_eq!(v1, "memory-test-1");
@@ -6763,14 +6769,19 @@ mod tests {
             "provenance 携带指纹"
         );
         // 热重载:新版本+新指纹;门控随动
-        let mut recipe2 = crate::agent::recipe::MemoryRecipe::default();
-        recipe2.recipe_version = "memory-test-2".to_string();
-        recipe2.sources.materials = true;
+        let recipe2 = crate::agent::recipe::MemoryRecipe {
+            recipe_version: "memory-test-2".to_string(),
+            sources: crate::agent::recipe::SourcesSection {
+                materials: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let json = serde_json::to_string(&recipe2).unwrap();
         let (v2, h2) = mgr.reload_recipe(&json).unwrap();
         assert_eq!(v2, "memory-test-2");
         assert_ne!(h1, h2, "改配方即变指纹");
-        assert_eq!(mgr.current_recipe().unwrap().sources.materials, true);
+        assert!(mgr.current_recipe().unwrap().sources.materials);
     }
 
     #[tokio::test]
@@ -6823,36 +6834,6 @@ mod tests {
             ctx.procedures
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn test_unanchored_record_labeled_in_prompt() {
-        // 账本记忆 I8 降级可见:fact_id 缺失/哨兵 0(离线 CacheOnly)=无账本
-        // 锚点,prompt 行显式 [unanchored] 前缀——LLM 与审计侧均可分
-        let mgr = MemoryManager::new("sec", make_test_client());
-        let mut rec = MemoryRecord::new("events.e1", "离线写入的事件", 1);
-        rec.fact_id = None;
-        let mut rec2 = MemoryRecord::new("events.e2", "补写失败仍为哨兵", 2);
-        rec2.fact_id = Some(0);
-        let mut anchored = MemoryRecord::new("stable.llm.ok", "正常锚定条目", 3);
-        anchored.fact_id = Some(42);
-        let recall = RecallContext {
-            events: vec![rec, rec2],
-            stable: vec![anchored],
-            ..Default::default()
-        };
-        let prompt = mgr.build_system_prompt_with_recall(
-            "BASE",
-            &recall,
-            &ContextBudget::new(100_000, 0.25),
-        );
-        assert!(
-            prompt.matches("[unanchored]").count() == 2,
-            "两未锚定条目均标注: {prompt}"
-        );
-        assert!(
-            !prompt.contains("[unanchored] stable.llm.ok"),
-            "锚定条目不标注"
-        );
     }
 
     #[test]

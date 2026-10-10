@@ -76,7 +76,6 @@ const IO_GUARD_CORRECTION_PROMPT: &str = "系统输出门禁反馈：上一条�
 /// 从尾部保留区挤出。截断仅作用于回喂 LLM 的 messages 入列值;审计链
 /// persist_message / ToolResult 事件保留原始全文(事实记录不动,与 trim
 /// 不改写原 messages 的哲学一致)。生效值见 `AgentRunner::tool_result_max_chars`。
-
 /// 截断过长的 tool_result:保留头尾各半,中间插入截断标注;未超限原样归还
 ///
 /// 元层先行批:上限由配方 budget.tool_result_max_chars 声明(默认 48000 =
@@ -3084,7 +3083,7 @@ impl AgentRunner {
         let tool_result_max_chars = self.tool_result_max_chars;
         let journal_dir = self.journal_dir.clone();
         let acceptance_command = self.acceptance_command.clone();
-        let pipeline_entry = self.pipeline_entry.clone();
+        let pipeline_entry = self.pipeline_entry;
         let assembly_scope_focus = self.assembly_scope_focus;
         let semantic_i2_enabled = self.semantic_i2_enabled;
         let reserve = max_context_tokens * self.assembly.reserve_for_response_pct() as usize / 100;
@@ -3154,7 +3153,7 @@ impl AgentRunner {
                 journal_dir: journal_dir.clone(),
                 acceptance_command: acceptance_command.clone(),
                 stagnation: crate::agent::stagnation::StagnationDetector::new(),
-                pipeline_entry: pipeline_entry.clone(),
+                pipeline_entry,
                 assembly_scope_focus,
                 i2_verdict_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 semantic_i2_enabled,
@@ -4951,29 +4950,6 @@ impl AgentRunner {
         }))
     }
 
-    /// G4:流式运行 Agent
-    ///
-    /// 与 `run()` 相同的 ReAct 循环,但 LLM 调用使用 `execute_stream`(G1),
-    /// 逐 token 产出 `AgentEvent::LlmDelta`,使调用方能实时显示 LLM 输出。
-    ///
-    /// 事件流顺序(典型):
-    /// ```text
-    /// SessionCreated → Step → LlmDelta* → LlmDone → (ToolCall → ToolResult)* → ... → Done
-    /// ```
-    ///
-    /// G18:每个 `Ok(AgentEvent)` 在 yield 前被 `event_callbacks.dispatch()` 调用
-    /// (同步 await + 1s 超时 + panic 保护)。`Err` 事件不触发回调。
-    ///
-    /// 错误处理:
-    /// - LLM 流中断:提交 error io_response(防止 evorule 卡死),yield Error + Done
-    /// - evorule Error 事件:尝试 auto_rewind,yield Info;失败则 yield Done(error)
-    /// - max_steps 超限:yield Error + Done
-    ///
-    /// 边界:
-    /// - 不支持 delegate_context(子 agent 委托时改用 `run()`)
-    /// - 消息持久化在流式下仍走 `persist_message`,`PerReactRound` 模式适配流式
-    ///   (在 IoRequest 处理前批量 flush,而非每 delta 后 flush)
-
     /// 崩溃恢复入口(react 面):无新输入——加载历史(权威面=evorule payload)
     /// → 悬挂工具处置(L1 分类路由:幂等读经管道重执行回喂真结果,写类回喂
     /// 崩溃观察)→ 发射恢复标记 → LLM 自然续完当前 turn。恢复路径的 journal
@@ -4996,6 +4972,28 @@ impl AgentRunner {
         })
     }
 
+    /// G4:流式运行 Agent
+    ///
+    /// 与 `run()` 相同的 ReAct 循环,但 LLM 调用使用 `execute_stream`(G1),
+    /// 逐 token 产出 `AgentEvent::LlmDelta`,使调用方能实时显示 LLM 输出。
+    ///
+    /// 事件流顺序(典型):
+    /// ```text
+    /// SessionCreated → Step → LlmDelta* → LlmDone → (ToolCall → ToolResult)* → ... → Done
+    /// ```
+    ///
+    /// G18:每个 `Ok(AgentEvent)` 在 yield 前被 `event_callbacks.dispatch()` 调用
+    /// (同步 await + 1s 超时 + panic 保护)。`Err` 事件不触发回调。
+    ///
+    /// 错误处理:
+    /// - LLM 流中断:提交 error io_response(防止 evorule 卡死),yield Error + Done
+    /// - evorule Error 事件:尝试 auto_rewind,yield Info;失败则 yield Done(error)
+    /// - max_steps 超限:yield Error + Done
+    ///
+    /// 边界:
+    /// - 不支持 delegate_context(子 agent 委托时改用 `run()`)
+    /// - 消息持久化在流式下仍走 `persist_message`,`PerReactRound` 模式适配流式
+    ///   (在 IoRequest 处理前批量 flush,而非每 delta 后 flush)
     pub fn run_streaming(
         self,
         goal: String,
@@ -5377,7 +5375,7 @@ impl AgentRunner {
                                             Ok((content, tokens))
                                         }
                                     },
-                                    journal.as_ref().map(|v| &**v),
+                                    journal.as_deref(),
                                 )
                                 .await;
                         }
@@ -6487,9 +6485,9 @@ impl AgentRunner {
                                                         let open: Vec<_> = catalog
                                                             .iter()
                                                             .filter(|r| {
-                                                                (r.key.contains("todo")
+                                                                r.key.contains("todo")
                                                                     || (r.key.contains("failure")
-                                                                        && !r.key.contains("draft")))
+                                                                        && !r.key.contains("draft"))
                                                             })
                                                             .collect();
                                                         let drafts: Vec<_> = catalog
@@ -6887,6 +6885,7 @@ impl AgentRunner {
 /// - 未知 role(非 system/user/assistant/tool)
 /// - assistant 的 tool_calls 反序列化失败(降级为无 tool_calls)
 /// - tool 消息缺少 tool_name
+///
 /// 元层先行批:max_chars 由调用方从配方生效值传入(runner.tool_result_max_chars)
 fn rec_to_message(rec: &MessageRecord, max_chars: usize) -> Option<Message> {
     match rec.role.as_str() {

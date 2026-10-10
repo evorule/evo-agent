@@ -10,6 +10,7 @@ pub type IoResult = Result<Value, String>;
 
 /// I/O Handler trait -- defines I/O execution interface
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)] // async_trait 宏生成的 must_use 与 Boxed Future 类型语义重复,源上无法消
 pub trait IoHandler: Send + Sync {
     /// Execute I/O operation
     async fn execute(&self, params: &Value) -> IoResult;

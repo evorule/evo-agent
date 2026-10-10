@@ -7,6 +7,7 @@
 //! - Warning 后仍重复,累计 `EXHAUST_AFTER_WARNINGS` 次警告 →
 //!   [`StagnationVerdict::Exhausted`]:按 H2 不可恢复阻塞收尾
 //!   (诚实退出优于空转烧预算)。
+//!
 //! 任一出现新 digest → 计数全部重置(有真实进展即不是空转)。
 
 /// 连续重复多少次后发出换策略警告
@@ -19,7 +20,10 @@ pub enum StagnationVerdict {
     /// 有进展或未达阈值
     Normal,
     /// 连续重复达阈值:在 tool 结果上追加换策略指令
-    Warning { repeat_count: u32 },
+    Warning {
+        /// 触发本次警告时的连续重复次数
+        repeat_count: u32,
+    },
     /// 换策略后仍重复:按 H2 不可恢复阻塞收尾
     Exhausted,
 }
@@ -33,6 +37,7 @@ pub struct StagnationDetector {
 }
 
 impl StagnationDetector {
+    /// 创建检测器（无历史 digest,首轮观察即为有进展）
     pub fn new() -> Self {
         Self::default()
     }

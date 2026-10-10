@@ -660,6 +660,7 @@ impl AssemblyExecutor {
     ///
     /// Err 仅当配方声明了执行器不认识的预算基准(budget.base——validate 白名单
     /// 应已拦截,此处运行时兜底 fail-fast),不做静默降级。
+    #[allow(clippy::too_many_arguments)] // 槽位源逐一声明的组装面,收拢为参数对象反损槽位可读性
     pub fn assemble(
         &self,
         base_prompt: &str,
@@ -1111,20 +1112,22 @@ mod tests {
             evidence: None,
         };
         let base = "你是测试助手,负责回答关于项目的问题。";
-        let mut recall = RecallContext::default();
-        recall.stable = vec![
-            mk("fact_lang", "项目主语言为 Rust,前端使用 Svelte 4。"),
-            mk("fact_rule", "宪法规则 RL-B1 要求单一真相源,禁止双写。"),
-            mk("fact_style", "回复使用中文,代码注释保持确定性口径描述。"),
-        ];
-        recall.summaries = vec![
-            mk("sum_1", "上次会话完成了上下文窗口裁剪策略的回归测试。"),
-            mk("sum_2", "此前一轮讨论了记忆区预算比例与弹性归还机制。"),
-        ];
-        recall.events = vec![
-            mk("ev_1", "用户批准了元层先行批设计稿并下达开工指令。"),
-            mk("ev_2", "PR-1 组装配方 schema 已推送并通过全部测试。"),
-        ];
+        let recall = RecallContext {
+            stable: vec![
+                mk("fact_lang", "项目主语言为 Rust,前端使用 Svelte 4。"),
+                mk("fact_rule", "宪法规则 RL-B1 要求单一真相源,禁止双写。"),
+                mk("fact_style", "回复使用中文,代码注释保持确定性口径描述。"),
+            ],
+            summaries: vec![
+                mk("sum_1", "上次会话完成了上下文窗口裁剪策略的回归测试。"),
+                mk("sum_2", "此前一轮讨论了记忆区预算比例与弹性归还机制。"),
+            ],
+            events: vec![
+                mk("ev_1", "用户批准了元层先行批设计稿并下达开工指令。"),
+                mk("ev_2", "PR-1 组装配方 schema 已推送并通过全部测试。"),
+            ],
+            ..Default::default()
+        };
         let exec = AssemblyExecutor::default_executor();
 
         // 场景 1:CJK 长记忆(正常预算 8192×0.25,无降级)
@@ -1448,12 +1451,14 @@ mod tests {
         // cap(8192-25%=6144;6144×0.25=1536)与 total_window 口径
         // cap(8192×0.25=2048)之间——两侧裁剪行为必然分叉
         let long_fact = "长".repeat(600);
-        let mut recall = RecallContext::default();
-        recall.stable = vec![
-            mk("f1", &long_fact),
-            mk("f2", &long_fact),
-            mk("f3", &long_fact),
-        ];
+        let recall = RecallContext {
+            stable: vec![
+                mk("f1", &long_fact),
+                mk("f2", &long_fact),
+                mk("f3", &long_fact),
+            ],
+            ..Default::default()
+        };
 
         // 默认配方(基数=input,完全切换后口径)
         let out_input = AssemblyExecutor::new(AssemblyRecipe::default())
@@ -1744,7 +1749,7 @@ mod tests {
         // golden v1 双件(assembly/full)留档为回滚对照基线,不再断言。
         // 重录方式:GOLDEN_REWRITE=1 cargo test --lib injection_order -- --nocapture
         use crate::agent::definition::{CapabilityBoundary, HandoffPackage, SkillManifestEntry};
-        use crate::api::serve_tools::build_governance_segment;
+
         use crate::rule_tools::local_handlers::render_l2_inventory_summary;
         use std::path::PathBuf;
 

@@ -885,8 +885,8 @@ mod tests {
         let fid = store.write_event(ev).await.unwrap();
         assert_eq!(fid, 0, "不可达 → fact_id=0(CacheOnly)");
         // flush 前有 pending
-        assert!(store.pending_persist.len() > 0 || true); // pending 追踪在 write_event 内部
-                                                          // 不可达 flush → 仍 pending
+        assert!(!store.pending_persist.is_empty() || true); // pending 追踪在 write_event 内部
+                                                            // 不可达 flush → 仍 pending
         let flushed = store.flush_pending_events().await;
         assert_eq!(flushed, 0);
         let _ = std::fs::remove_dir_all(&dir);

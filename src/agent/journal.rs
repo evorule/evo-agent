@@ -872,6 +872,7 @@ impl JournalWriter {
 
     /// llm_called 通用形态(sidecar 用途落账——语义精判等;purpose 透传,
     /// ATIF 侧 sidecar 用途不映射步=既有口径)
+    #[allow(clippy::too_many_arguments)] // 落账事件字段平铺,拆参反损可读性
     pub fn llm_called(
         &self,
         model: &str,
@@ -943,6 +944,7 @@ impl JournalWriter {
     }
 
     /// sediment 结果落 journal（受信通道持久化信号 + 沉淀结果对账依据）
+    #[allow(clippy::too_many_arguments)] // 落账事件字段平铺,拆参反损可读性
     pub fn sediment_performed(
         &self,
         summary_written: bool,
@@ -1113,6 +1115,7 @@ impl JournalWriter {
         })
     }
 
+    /// 策略裁决落账(judgement_id 按序号生成;evidence 截断 256)
     pub fn policy_judged(&self, verdict: &str, evidence: &str) -> Result<u64, JournalError> {
         let evidence = evidence.to_string();
         self.push_with(|seq| JournalEvent::PolicyJudged {
@@ -1353,7 +1356,7 @@ pub fn gc_wire_blobs(
         {
             let active = ACTIVE_WRITERS
                 .lock()
-                .map(|g| g.as_ref().map_or(false, |set| set.contains(&stem)))
+                .map(|g| g.as_ref().is_some_and(|set| set.contains(&stem)))
                 .unwrap_or(false);
             if active {
                 return Err(JournalError::WriterActive(stem));
@@ -1496,6 +1499,8 @@ pub fn gc_wire_blobs(
     Ok(stats)
 }
 
+/// 会话 ID 净化:仅保留字母数字与 `-_.`,其余替换为 `_`;截断至 128 字符,
+/// 净化后为空回落 "unknown"
 pub fn sanitize_session_id(sid: &str) -> String {
     let cleaned: String = sid
         .chars()
@@ -1869,12 +1874,10 @@ mod tests {
                 text.len()
             )
         };
-        let lines = vec![
-            format!("{{\"seq\":1,\"ts\":{},\"type\":\"turn_started\",\"payload\":{{\"turn_seq\":1,\"goal\":\"g\"}}}}", now - 100 * day),
+        let lines = [format!("{{\"seq\":1,\"ts\":{},\"type\":\"turn_started\",\"payload\":{{\"turn_seq\":1,\"goal\":\"g\"}}}}", now - 100 * day),
             mk_wire(2, now - 100 * day, 1, "过期全文"),
             mk_wire(3, now - 30 * day, 2, "中窗全文"),
-            mk_wire(4, now - 1 * day, 3, "新窗全文"),
-        ];
+            mk_wire(4, now - day, 3, "新窗全文")];
         std::fs::write(dir.join("s-gc.jsonl"), lines.join("\n") + "\n").unwrap();
         // GC:7d 入旁路,90d 过期
         let stats = gc_wire_blobs(&dir, now, 7, 90).unwrap();

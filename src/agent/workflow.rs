@@ -635,9 +635,10 @@ async fn run_judge_command(
 fn judge_verdict(judge: &JudgeSpec, output: &std::process::Output) -> (bool, String) {
     let exit = output.status.code().map(i64::from).unwrap_or(-1);
     let passed = exit == judge.expect_exit
-        && judge.expect_stdout.as_ref().map_or(true, |want| {
-            String::from_utf8_lossy(&output.stdout).contains(want.as_str())
-        });
+        && judge
+            .expect_stdout
+            .as_ref()
+            .is_none_or(|want| String::from_utf8_lossy(&output.stdout).contains(want.as_str()));
     let detail = format!(
         "exit={} stdout_tail={} stderr_tail={}",
         exit,

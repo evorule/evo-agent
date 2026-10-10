@@ -96,8 +96,11 @@ impl std::error::Error for LexError {}
 /// 缓存事实(fact_id / path / 反序列化后的值)
 #[derive(Debug, Clone)]
 pub struct CachedFact {
+    /// 事实全局唯一 ID(账本分配;本地源合成 id 带 bit63 标记位)
     pub fact_id: u64,
+    /// 事实路径(点分层级键)
     pub path: String,
+    /// 反序列化后的值 JSON
     pub value: serde_json::Value,
 }
 
@@ -192,13 +195,21 @@ CREATE TABLE IF NOT EXISTS causes(
 /// 冷迁候选行（冷热分层 F-617:热库扫描产物,冷库落账载体）
 #[derive(Debug, Clone)]
 pub struct ColdCandidate {
+    /// 分区前缀(热库命名空间标识)
     pub prefix: String,
+    /// 事实全局唯一 ID(账本分配)
     pub fact_id: i64,
+    /// 事实路径(点分层级键)
     pub path: String,
+    /// 值 JSON 字符串(原样落账)
     pub value_json: String,
+    /// 来源标记(账本行恒为 row_source::LEDGER)
     pub source: String,
+    /// 记忆类型(semantic/episodic 等;值缺失时按前缀推导)
     pub mem_type: String,
+    /// 生命周期状态(如 Settled)
     pub lifecycle_state: String,
+    /// 后继事实路径(被取代标记;None=未被取代)
     pub superseded_by: Option<String>,
 }
 
@@ -310,6 +321,7 @@ impl ColdStore {
         Ok(n)
     }
 
+    /// 冷库条目总数(cold_entries 行数)
     pub fn count(&self) -> Result<usize, LexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row("SELECT COUNT(*) FROM cold_entries", [], |r| {
@@ -322,22 +334,34 @@ impl ColdStore {
 /// 冷库行(查询/回读面)
 #[derive(Debug, Clone)]
 pub struct ColdRow {
+    /// 事实路径(cold_entries 主键)
     pub path: String,
+    /// 值 JSON 字符串(查询面原样返回)
     pub value_json: String,
+    /// 记忆类型(semantic/episodic 等)
     pub mem_type: String,
+    /// 生命周期状态(如 Settled)
     pub lifecycle_state: String,
 }
 
 /// 冷迁落账行(写入面;由 ColdCandidate 投影+回源重组需要)
 #[derive(Debug, Clone)]
 pub struct ColdRowFull {
+    /// 分区前缀(热库命名空间标识)
     pub prefix: String,
+    /// 事实全局唯一 ID(账本分配)
     pub fact_id: i64,
+    /// 事实路径(点分层级键)
     pub path: String,
+    /// 值 JSON 字符串(原样落账)
     pub value_json: String,
+    /// 来源标记(账本行恒为 row_source::LEDGER)
     pub source: String,
+    /// 记忆类型(semantic/episodic 等)
     pub mem_type: String,
+    /// 生命周期状态(如 Settled)
     pub lifecycle_state: String,
+    /// 后继事实路径(被取代标记;None=未被取代)
     pub superseded_by: Option<String>,
 }
 
@@ -535,6 +559,7 @@ impl LexStore {
         Ok(n)
     }
 
+    /// 缓存观测三计数:(hit, expired, fetch)累计值,语义见结构体字段注释
     pub fn cache_stats(&self) -> (u64, u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
         (
@@ -645,7 +670,7 @@ impl LexStore {
     }
 
     /// TTL 内返回缓存事实(零网络);过期/无缓存返回 None(调用方走全量拉取
-    /// + replace_partition 刷新)。P2-1:命中/不可用计数入 cache_stats——
+    /// 后 replace_partition 刷新)。P2-1:命中/不可用计数入 cache_stats——
     /// 「跨代理写不可见」的 TTL 窗口可观测化(journal 落账由 runner 接线)。
     pub fn cached_facts(&self, prefix: &str, ttl_secs: u64) -> Option<Vec<CachedFact>> {
         let out = self.cached_facts_probe(prefix, ttl_secs);

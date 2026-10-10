@@ -50,7 +50,7 @@
 use serde_json::{json, Value};
 
 use crate::agent::delegate::DelegateContext;
-use crate::agent::journal::{read_all, read_all_tolerant, JournalWriter};
+use crate::agent::journal::{read_all_tolerant, JournalWriter};
 use crate::agent::materializer::materialize_plan_fact;
 use crate::agent::replan::{
     lookup_agent_type, lookup_node_atomic, parse_failed_node_id, should_replan, BudgetCounters,
@@ -217,7 +217,7 @@ pub fn build_plan_loop_resume(
     dir: &std::path::Path,
     session_id: &str,
 ) -> Result<PlanLoopResume, String> {
-    use crate::agent::journal::{read_all, read_all_tolerant, JournalWriter};
+    use crate::agent::journal::{read_all_tolerant, JournalWriter};
     let path = JournalWriter::path_for(dir, session_id);
     let lines = read_all_tolerant(&path)
         .map_err(|e| format!("run journal read failed ('{session_id}'): {e}"))?;
@@ -516,6 +516,7 @@ pub fn scan_resumable_runs(dir: &std::path::Path) -> Result<Vec<ResumableRunInfo
 ///
 /// 恢复态剩余预算闸:恢复态累计墙钟已 ≥ 本跑限额 = 预算已耗尽,恢复无意义
 /// ——快速失败(errored 但省 token,诚实面:中断时点已注定无法在限内完成)。
+#[allow(clippy::too_many_arguments)] // 恢复入口编排参数平铺,收拢反损调用点对位可读性
 pub async fn run_plan_loop_with_resume(
     ctx: DelegateContext,
     initial: Workflow,

@@ -71,15 +71,25 @@ pub const DEFAULT_EXCLUDE_GLOBS: &[&str] =
 /// 搜索参数(REST body 与 agent 工具 args 共用一形;camelCase/snake_case 双认)
 #[derive(Debug, Clone)]
 pub struct GrepParams {
+    /// 搜索串(必填;is_regex 开时按正则解释)
     pub query: String,
+    /// 正则模式开关(缺省 false=字面子串)
     pub is_regex: bool,
+    /// 大小写敏感开关(缺省 false=不敏感)
     pub case_sensitive: bool,
+    /// 全词匹配开关(缺省 false)
     pub whole_word: bool,
+    /// 智能大小写开关(缺省 true)
     pub smart_case: bool,
+    /// 搜索根目录(workdir 相对;缺省 ".";越界路径拒绝)
     pub dir: String,
+    /// 包含 glob 集(空=不按包含过滤)
     pub include_globs: Vec<String>,
+    /// 排除 glob 集(空=仅出厂排除集)
     pub exclude_globs: Vec<String>,
+    /// 尊重忽略文件(.gitignore 等;缺省 true)
     pub use_ignore_files: bool,
+    /// 结果数上限(clamp 到 [1, MAX_MAX_RESULTS];缺省 DEFAULT_MAX_RESULTS)
     pub max_results: usize,
 }
 

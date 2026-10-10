@@ -107,7 +107,7 @@ mod tests {
             "args": {"path": "a.txt"},
             "session_ref": "42"
         });
-        let v = serde_json::to_value(&ToolIntentV1::from_resolved(&resolved))
+        let v = serde_json::to_value(ToolIntentV1::from_resolved(&resolved))
             .expect("contract must serialize");
         // 字段集锁定：可选字段在场时恰为 v1 六字段（键序经 serde_json
         // 规范化，契约锁字段集与取值，不锁 Map 迭代序）
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn contract_omits_absent_optional_fields() {
         let resolved = serde_json::json!({"tool_name": "git_stage", "args": {"files": ["a"]}});
-        let v = serde_json::to_value(&ToolIntentV1::from_resolved(&resolved)).expect("serialize");
+        let v = serde_json::to_value(ToolIntentV1::from_resolved(&resolved)).expect("serialize");
         let mut keys: Vec<&str> = v
             .as_object()
             .expect("object")

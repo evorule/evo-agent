@@ -17,8 +17,8 @@
 //!   （logical_time，链上串行化序）定先后并如实标注 `causally_related:
 //!   false`；跨链域（非同一会话审计链）不可比，返回域说明——诚实边界
 //!   （设计档 §11.6 域边界裁定）；
-//! - `lineage_of`：规则谱系两账拼接——版本链（workspace RuleVersionRecord）
-//!   + 晋升账（l2-inventory 投影的 `00_constraint_promoted_*`
+//! - `lineage_of`：规则谱系两账拼接——版本链（workspace RuleVersionRecord）+
+//!   晋升账（l2-inventory 投影的 `00_constraint_promoted_*`
 //!   `promoted_from/promoted_at/promoted_by`，经 rule_version 锚与版本链对账）。
 //!
 //! 全部只读：仅 GET 审计链/规则正本/版本账，零写路径；server 侧零改动
@@ -622,7 +622,7 @@ mod tests {
             for (status, body) in responses {
                 let (stream, _) = listener.accept().unwrap();
                 let mut stream = stream;
-                let mut req_body = Vec::new();
+                let mut req_body;
                 {
                     let mut reader = BufReader::new(&stream);
                     let mut line = String::new();

@@ -26,18 +26,25 @@ pub const IO_CONTRACT_SUPPORTED: &[u32] = &[1];
 /// 字段不参与判定，从简略去）。
 #[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 pub struct IoShapeSpec {
+    /// 形状标识名(契约形状键)
     pub shape: String,
+    /// IO 类型标识(request/response 等)
     pub io_type: String,
+    /// 载荷必备键集(缺失即判不合规)
     pub required_keys: Vec<String>,
+    /// 载荷禁用键集(出现即判不合规)
     pub forbidden_keys: Vec<String>,
 }
 
 /// 契约导出体（`GET /api/io-contract` 响应）。
 #[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 pub struct IoContract {
+    /// 契约版本号(协商判定依据)
     pub contract_version: u32,
+    /// server 声明的支持版本集(本端不消费,原样保留)
     #[allow(dead_code)]
     pub supported_versions: Vec<u32>,
+    /// 形状规格列表(形状自检依据)
     pub shapes: Vec<IoShapeSpec>,
 }
 
@@ -55,8 +62,11 @@ pub enum IoContractNegotiation {
 pub enum IoContractError {
     /// 端点在，但版本不在支持集——fail-closed，附双方版本便于诊断
     VersionMismatch {
+        /// server 端报告的契约版本
         server_version: u32,
+        /// server 端声明的支持版本集
         server_supported: Vec<u32>,
+        /// 本端支持版本集(IO_CONTRACT_SUPPORTED)
         agent_supported: Vec<u32>,
     },
     /// 契约体解析失败（形态异常，视为不可信——fail-closed）

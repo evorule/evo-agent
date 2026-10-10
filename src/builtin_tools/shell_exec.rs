@@ -558,7 +558,10 @@ pub enum ExecBackend {
     /// 宿主直接执行(默认):3 层分类 + metachar 拒绝语义不变
     Local,
     /// `docker exec` 进任务容器执行:容器域 = 任务沙箱(一次性环境)
-    DockerExec { container: String },
+    DockerExec {
+        /// 目标任务容器名(serve run 请求传入;经 validate_container_name 校验)
+        container: String,
+    },
 }
 
 /// 校验 docker 容器名(防 argv 注入:容器名以 `-` 开头会被 docker 解析为 flag)
@@ -861,25 +864,15 @@ impl ShellExecTool {
         }
 
         match self.run_family(cmd, self.timeout) {
-            FamilyOutcome::Failed(e) => {
-                return Err(format!(
-                    "failed to spawn '{}': {} (is it installed and in PATH?)",
-                    program, e
-                ));
-            }
+            FamilyOutcome::Failed(e) => Err(format!(
+                "failed to spawn '{}': {} (is it installed and in PATH?)",
+                program, e
+            )),
             FamilyOutcome::Terminated {
                 output,
                 pid,
                 verified,
-            } => {
-                return Self::report_terminated(
-                    original_cmd,
-                    pid,
-                    &output.status,
-                    self.timeout,
-                    verified,
-                );
-            }
+            } => Self::report_terminated(original_cmd, pid, &output.status, self.timeout, verified),
             FamilyOutcome::Completed(output) => {
                 Self::completed_result(original_cmd, program, &output, self.max_output_bytes)
             }

@@ -279,6 +279,8 @@ fn render_knowledge_dataset(dataset: &str, resp: &serde_json::Value) -> String {
     out
 }
 
+/// L2 前馈注入（serve 三路径共用）：命中起草族工具时拉取 L2 清单,
+/// 将摘要段追加到 system_prompt;拉取失败仅 warn 降级,不阻塞注入
 pub async fn apply_l2_feed_forward(
     ev: &EvoruleApiClient,
     tools: &[String],

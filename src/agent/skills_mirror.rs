@@ -34,10 +34,15 @@ pub const LOCAL_SKILLS_PREFIX: &str = "local.skills.";
 /// 同步结果（观测面；skipped=门控关，degraded=账本不可达诚实降级）
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct SkillsMirrorStats {
+    /// 门控关闭未执行（`sources.skills_index` 为 false）
     pub skipped: bool,
+    /// 账本不可达/会话未就绪的诚实降级（不阻塞会话）
     pub degraded: bool,
+    /// 成功写入的声明元数据事实条数
     pub metadata_written: usize,
+    /// 摘除的过期镜像事实（墓碑）条数
     pub tombstoned: usize,
+    /// 正文索引写入的分段条数
     pub body_sections: usize,
 }
 
@@ -159,7 +164,7 @@ fn rebuild_body_index(store: &LexStore, skills: &[SkillManifestEntry], now: u64)
             continue;
         };
         let body = strip_frontmatter(&content);
-        for (i, section) in split_skill_sections(&body).into_iter().enumerate() {
+        for (i, section) in split_skill_sections(body).into_iter().enumerate() {
             let anchor = format!("{}#{}", s.path.display(), i + 1);
             let fact_id = synthetic_fact_id(&anchor);
             let value = json!({

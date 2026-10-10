@@ -1107,7 +1107,7 @@ async fn test_react_loop_llm_request_carries_tools_schema() {
         .with_body(r#"{"session_id":888}"#)
         .create_async()
         .await;
-    let adj_state = server
+    let _adj_state = server
         .mock("GET", "/api/sessions/888/state")
         .with_status(200)
         .with_body(r#"{"version":1}"#)
