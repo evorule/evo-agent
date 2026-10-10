@@ -81,6 +81,34 @@ impl EvoruleApiClient {
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
+    /// GET /api/io-contract —— evorule-server IO 形状契约拉取（E-8 协商，34 号档）。
+    ///
+    /// 错误分类给 [`crate::api::io_contract::negotiate_io_contract`] 消费：
+    /// 404 → `NotFound`（旧 server，warn 通过）；其余传输/解析错误 →
+    /// `Unavailable`（与 404 同判 warn 通过——部署期网络未起是常态）。
+    pub async fn fetch_io_contract(
+        &self,
+    ) -> Result<serde_json::Value, crate::api::io_contract::NegotiationFetchError> {
+        let url = self.core.url("/api/io-contract");
+        let resp = match self.core.auth_header(self.core.client().get(&url)).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(crate::api::io_contract::NegotiationFetchError::Unavailable(
+                    e.to_string(),
+                ))
+            }
+        };
+        if resp.status().as_u16() == 404 {
+            return Err(crate::api::io_contract::NegotiationFetchError::NotFound);
+        }
+        match resp.json::<serde_json::Value>().await {
+            Ok(v) => Ok(v),
+            Err(e) => Err(crate::api::io_contract::NegotiationFetchError::Unavailable(
+                e.to_string(),
+            )),
+        }
+    }
+
     /// GET /api/rules/l2-inventory —— L2 约束（元规则）只读清单投影
     ///
     /// 返回 `{count, files:[{path,title,guard_for,promoted_from,promoted_at,
