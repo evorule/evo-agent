@@ -4830,6 +4830,48 @@ impl AgentRunner {
         Ok(report)
     }
 
+    /// 挂起 io_request 对账(纯函数):history 事实数组中 IoRequest 与
+    /// IoResponse 按 id 差集 = 未响应请求。多个挂起取 id 最大者(引擎串行
+    /// 处理,同时至多一个挂起)。返回 None = 无挂起(崩溃落在轮界)。
+    fn plan_pending_resolution(
+        history: &serde_json::Value,
+    ) -> Option<(u64, String, serde_json::Value)> {
+        let facts: &[serde_json::Value] = match history {
+            serde_json::Value::Array(a) => a,
+            serde_json::Value::Object(o) => o.get("facts").and_then(|f| f.as_array())?,
+            _ => return None,
+        };
+        let mut requested: Vec<(u64, String, serde_json::Value)> = Vec::new();
+        let mut responded: Vec<u64> = Vec::new();
+        for f in facts {
+            let typ = f.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match typ {
+                "IoRequest" => {
+                    if let Some(id) = f.get("id").and_then(|v| v.as_u64()) {
+                        requested.push((
+                            id,
+                            f.get("io_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            f.get("params").cloned().unwrap_or(serde_json::Value::Null),
+                        ));
+                    }
+                }
+                "IoResponse" => {
+                    if let Some(rid) = f.get("request_id").and_then(|v| v.as_u64()) {
+                        responded.push(rid);
+                    }
+                }
+                _ => {}
+            }
+        }
+        requested.reverse(); // 最新优先(引擎串行,至多一个挂起;防御性取最新)
+        requested
+            .into_iter()
+            .find(|(id, _, _)| !responded.contains(id))
+    }
+
     /// G15:从 evorule payload 加载历史消息(continuation 模式用)
     ///
     /// 路径:`payload["__memory__"][namespace]["session_{session_id}"]["messages"]`
@@ -5410,24 +5452,9 @@ impl AgentRunner {
                         }
                     }
 
-                    // 5. 订阅 SSE(必须在 submit_command 之前,否则错过 io_request)
-                    let mut event_stream = match runner.evorule_client.subscribe_events(&session_id).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            yield Err(AgentError::EvoruleError(e.to_string()));
-                            return;
-                        }
-                    };
-
-                    // 6. 提交 call_external 命令(携带工具 OpenAI schema)
-                    let command =
-                        runner.build_call_external_command(&system_prompt, &goal, runner.openai_tools_payload());
-                    if let Err(e) = runner.evorule_client.submit_command(&session_id, &command).await {
-                        yield Err(AgentError::EvoruleError(e.to_string()));
-                        return;
-                    }
-
-                    // 7. 初始化消息历史
+                    // 7(前移). 初始化消息历史(崩溃恢复的本地修复须先于订阅/
+                    // 解析——修复后的 messages 是重放轮 LLM 请求的内容)
+                    let mut report_recovery = DanglingRepairReport::default();
                     let mut messages: Vec<Message> = Vec::new();
                     let mut step_count = 0;
                     let mut tool_calls: Vec<String> = Vec::new();
@@ -5462,6 +5489,7 @@ impl AgentRunner {
                                 .await
                             {
                                 Ok(report) => {
+                                    report_recovery = report;
                                     info!(
                                         %session_id,
                                         dangling = report.dangling,
@@ -5522,6 +5550,75 @@ impl AgentRunner {
                             .await
                         {
                             yield Err(e);
+                            return;
+                        }
+                    }
+
+                    // 5. 订阅 SSE(必须在 submit_command 之前,否则错过 io_request)
+                    let mut event_stream = match runner.evorule_client.subscribe_events(&session_id).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            yield Err(AgentError::EvoruleError(e.to_string()));
+                            return;
+                        }
+                    };
+
+                    // 挂起 io 对账+解析(崩溃恢复):订阅先行——解析触发的重放
+                    // IoRequest 经已开订阅送达。解析结果=恢复汇总(error=None
+                    // 保重放,server 重放缓存指令驱动续跑);无挂起(轮界崩溃)=
+                    // 重振指令,走下方 submit_command。幂等读已在本地修复段
+                    // 重执行,两本账(server 事实链/本地 transcript)记同一处置
+                    let mut pending_resolved = false;
+                    if recovery == RecoveryMode::CrashResume {
+                        match runner.evorule_client.get_session_history(&session_id).await {
+                            Ok(history) => match Self::plan_pending_resolution(&history) {
+                                Some((rid, io_type, _params)) => {
+                                    let summary = serde_json::json!({
+                                        "success": true,
+                                        "content": format!(
+                                            "session recovered after crash: dangling tool call(s) resolved ({} re-executed, {} crash observations); turn resumes from repaired message state",
+                                            report_recovery.reexecuted, report_recovery.observed
+                                        ),
+                                        "steps": 0,
+                                        "duration_ms": 0,
+                                        "tool_calls": [],
+                                        "error": null,
+                                        "cancelled": false,
+                                    });
+                                    if let Err(e) = runner
+                                        .evorule_client
+                                        .submit_io_response(&session_id, rid, &summary, None)
+                                        .await
+                                    {
+                                        yield Err(AgentError::Internal(format!(
+                                            "crash recovery: pending io_response submit failed (request {rid}, {io_type}): {e}"
+                                        )));
+                                        return;
+                                    }
+                                    pending_resolved = true;
+                                    info!(%session_id, request_id = rid, io_type = %io_type, "crash recovery: pending io_request resolved, engine will replay instruction");
+                                }
+                                None => {
+                                    info!(%session_id, "crash recovery: no pending io_request (turn-boundary crash), re-arming with fresh command");
+                                }
+                            },
+                            Err(e) => {
+                                yield Err(AgentError::Internal(format!(
+                                    "crash recovery: pending io reconciliation failed: {e}"
+                                )));
+                                return;
+                            }
+                        }
+                    }
+
+                    // 6. 提交 call_external 命令。挂起已解析时跳过——server
+                    // 重放缓存指令即驱动;挂起期间新命令只入队不执行(执行
+                    // 门控 pending_io_count==0)
+                    if !(recovery == RecoveryMode::CrashResume && pending_resolved) {
+                        let command = runner
+                            .build_call_external_command(&system_prompt, &goal, runner.openai_tools_payload());
+                        if let Err(e) = runner.evorule_client.submit_command(&session_id, &command).await {
+                            yield Err(AgentError::EvoruleError(e.to_string()));
                             return;
                         }
                     }
