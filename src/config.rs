@@ -1373,9 +1373,11 @@ command = "echo"
         std::env::set_var("EVO_AGENT_LLM__API_KEY", "env-key");
         std::env::set_var("EVO_AGENT_LLM__MODEL", "env-model");
 
-        let mut base = LlmConfig::default();
-        base.api_key = "toml-key".to_string();
-        base.model = "toml-model".to_string();
+        let base = LlmConfig {
+            api_key: "toml-key".to_string(),
+            model: "toml-model".to_string(),
+            ..Default::default()
+        };
 
         let resolved = LlmConfig::resolve(base);
         assert_eq!(resolved.api_key, "env-key");
@@ -1389,9 +1391,11 @@ command = "echo"
         let _lock = ENV_LOCK.lock().unwrap();
         let env_snap = clear_llm_env();
 
-        let mut base = LlmConfig::default();
-        base.api_key = "toml-key".to_string();
-        base.model = "toml-model".to_string();
+        let base = LlmConfig {
+            api_key: "toml-key".to_string(),
+            model: "toml-model".to_string(),
+            ..Default::default()
+        };
 
         let resolved = LlmConfig::resolve(base);
         assert_eq!(resolved.api_key, "toml-key");
@@ -1439,8 +1443,10 @@ command = "echo"
         let env_snap = clear_llm_env();
         std::env::set_var("MINIMAX_API_KEY", "sk-bare");
 
-        let mut base = LlmConfig::default();
-        base.model = "custom-model".to_string();
+        let base = LlmConfig {
+            model: "custom-model".to_string(),
+            ..Default::default()
+        };
         let resolved = LlmConfig::resolve(base);
         assert_eq!(resolved.api_key, "sk-bare");
         assert_eq!(resolved.model, "custom-model");

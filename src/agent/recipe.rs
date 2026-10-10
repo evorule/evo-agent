@@ -69,6 +69,7 @@ fn default_half_life() -> HalfLifeDays {
     }
 }
 
+/// 半衰期配置（按记忆类型分型；recency 新鲜度因子的衰减基准）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HalfLifeDays {
     /// 情景记忆半衰期（天）
@@ -201,7 +202,7 @@ fn default_negation_markers() -> Vec<String> {
                     .filter_map(|x| x.as_str().map(str::to_string))
                     .collect()
             })
-            .unwrap_or_else(|| fallback_negation_markers()),
+            .unwrap_or_else(fallback_negation_markers),
         Err(_) => fallback_negation_markers(),
     }
 }
@@ -239,7 +240,7 @@ impl Default for AdjudicationConfig {
 /// 全闸链：入账契约+领域 schema+LLM 边界+凭据扫描，Draft 落账=资格
 /// 凭据），回执成功才打 Promoted；提议失败保持 Captured 留待下次批
 /// （M3 重复提案拒绝=天然幂等防护）。缺省关=机械复制既有行为零影响。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct PromoteGateConfig {
     /// 是否启用晋升治理门（缺省关=机械复制既有行为）
     #[serde(default)]
@@ -252,16 +253,6 @@ pub struct PromoteGateConfig {
     /// 全过放行 Active，非全过 422 fail-visible 候选保持 Promoted-Draft 形态）。
     #[serde(default)]
     pub auto_transition: bool,
-}
-
-impl Default for PromoteGateConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            dataset_id: None,
-            auto_transition: false,
-        }
-    }
 }
 
 /// 跨源检索源启用开关（跨源注册规格策略面）。
@@ -330,6 +321,7 @@ impl Default for StorageConfig {
     }
 }
 
+/// 记忆配方规则集（F-610）：召回权重/生命周期/预算/源启用的策略声明面
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecipe {
     /// 配方版本（memory-v1.0 起）
@@ -411,8 +403,11 @@ impl Default for MemoryRecipe {
 ///   usage=存量计数+本会话增量，k 封顶防垄断；配方可调）
 #[derive(Debug, Clone)]
 pub struct RetrievalPolicy {
+    /// 相关性权重（w_r；R05 词法命中批内归一化）
     pub w_relevance: f32,
+    /// 新鲜度权重（w_t；半衰期指数衰减因子）
     pub w_recency: f32,
+    /// 重要度权重（w_i；confidence+usage 加成合成）
     pub w_importance: f32,
     /// importance 内 confidence 权重（w_c）
     pub w_confidence: f32,

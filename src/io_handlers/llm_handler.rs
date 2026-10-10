@@ -1041,7 +1041,7 @@ mod tests {
         assert_eq!(h.worst_case_budget_secs(), 300 * 4 + 80 + 10);
         // 零重试口径: 单次请求 + 10
         let h = h.with_retry_config(0, 1.0, 30.0);
-        assert_eq!(h.worst_case_budget_secs(), 300 + 0 + 10);
+        assert_eq!(h.worst_case_budget_secs(), 300 + 10);
     }
 
     /// 失配判定（600=失配口径必红,1300=修复口径必绿）
@@ -1049,7 +1049,10 @@ mod tests {
     fn test_step_budget_mismatch_e7() {
         let h = LlmHandler::new("m", "https://x", None); // budget=1225
         assert!(h.step_budget_mismatch(600).is_err());
-        assert!(h.step_budget_mismatch(600).unwrap_err().contains("step budget mismatch"));
+        assert!(h
+            .step_budget_mismatch(600)
+            .unwrap_err()
+            .contains("step budget mismatch"));
         assert!(h.step_budget_mismatch(1300).is_ok());
     }
 

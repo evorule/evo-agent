@@ -355,20 +355,18 @@ impl ToolFunction for ReadBackTool {
         for e in &entries {
             let tool = e.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
             let paths = touched_paths(e);
-            let is_read = READ_TOOLS.contains(&tool) && paths.iter().any(|p| *p == norm);
-            let is_write = WRITE_TOOLS.contains(&tool) && paths.iter().any(|p| *p == norm);
+            let is_read = READ_TOOLS.contains(&tool) && paths.contains(&norm);
+            let is_write = WRITE_TOOLS.contains(&tool) && paths.contains(&norm);
             let entry_seq = e.get("seq").and_then(|v| v.as_i64()).unwrap_or(-1);
             if is_read {
                 last_read = Some(entry_seq);
                 // 读本身刷新判定基线；其后的写才构成 stale
                 writes_after.clear();
-            } else if is_write {
-                if last_read.is_some() {
-                    writes_after.push(json!({
-                        "trace_seq": entry_seq,
-                        "tool": tool,
-                    }));
-                }
+            } else if is_write && last_read.is_some() {
+                writes_after.push(json!({
+                    "trace_seq": entry_seq,
+                    "tool": tool,
+                }));
             }
         }
         let is_stale = !writes_after.is_empty();

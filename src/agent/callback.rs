@@ -54,6 +54,7 @@ const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(1);
 /// - `on_event` 不应阻塞主流程;重操作(如 HTTP webhook)应内部 spawn task 或用 channel 缓冲
 /// - panic 会被 [`CallbackChain::dispatch`] 的 `catch_unwind` 捕获,不会中断 agent
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)] // async_trait 宏生成的 must_use 与 Boxed Future 类型语义重复,源上无法消
 pub trait EventCallback: Send + Sync {
     /// 收到一个 agent 事件
     async fn on_event(&self, event: &AgentEvent);
@@ -183,11 +184,7 @@ impl Default for LoggingCallback {
 impl EventCallback for LoggingCallback {
     async fn on_event(&self, event: &AgentEvent) {
         match event {
-            AgentEvent::SessionCreated {
-                session_id,
-                memory_enabled: _,
-                ..
-            } => {
+            AgentEvent::SessionCreated { session_id, .. } => {
                 tracing::info!(%session_id, "callback: session created");
             }
             AgentEvent::Step { step } => {

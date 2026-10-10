@@ -57,7 +57,7 @@ use clap::{Parser, Subcommand, ValueHint};
 
 use evo_agent::agent::definition::AgentDefinitionManager;
 use evo_agent::agent::delegate::DelegateContext;
-use evo_agent::agent::driver::{run_plan_loop, DriverLimits, PlanMode};
+use evo_agent::agent::driver::{DriverLimits, PlanMode};
 use evo_agent::agent::runner::AgentRunner;
 use evo_agent::api::agent_api::AgentApiState;
 use evo_agent::api::evorule_client::EvoruleApiClient;

@@ -334,7 +334,7 @@ pub fn spawn_watcher(workdir: &Path, hub: FsEventHub) -> Result<(), String> {
             hub.publish(batch);
         },
         // 显式 NoCache:禁用 FileIdMap 建根递归预扫(见函数级 doc,29 号档任务A)
-        NoCache::default(),
+        NoCache,
         notify::Config::default(),
     )
     .map_err(|e| format!("failed to create file watcher: {e}"))?;

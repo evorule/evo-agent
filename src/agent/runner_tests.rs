@@ -181,8 +181,10 @@ fn test_assembly_recipe_hash_deterministic_and_content_bound() {
 
     // 配方内容变更(不改码):bump recipe_version → 指纹随之变化
     let mut c = AgentRunner::new(AgentConfig::default(), make_test_client());
-    let mut bumped = crate::agent::assembly::AssemblyRecipe::default();
-    bumped.recipe_version = "recipe-v1.1".to_string();
+    let bumped = crate::agent::assembly::AssemblyRecipe {
+        recipe_version: "recipe-v1.1".to_string(),
+        ..Default::default()
+    };
     c.assembly = crate::agent::assembly::AssemblyExecutor::new(bumped);
     assert_ne!(hash_a, command_hash(&c), "配方变更必须改变指纹(内容寻址)");
 }
@@ -191,8 +193,10 @@ fn test_assembly_recipe_hash_deterministic_and_content_bound() {
 fn test_external_recipe_v1_1_recorded_on_wire() {
     // PR-4 演示闭环:外置 v1.1 配方(base=input,A-1 修正口径,数据)注入 runner
     // → effective_params 落账可查(协议版本不变,配方版本/指纹随数据演进)
-    let mut recipe = crate::agent::assembly::AssemblyRecipe::default();
-    recipe.recipe_version = "recipe-v1.1".to_string();
+    let mut recipe = crate::agent::assembly::AssemblyRecipe {
+        recipe_version: "recipe-v1.1".to_string(),
+        ..Default::default()
+    };
     for s in &mut recipe.slots {
         if s.id == "S3_memory" {
             if let Some(b) = s.budget.as_mut() {

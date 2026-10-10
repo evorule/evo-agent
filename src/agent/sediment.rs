@@ -243,8 +243,8 @@ pub async fn sediment(
     // `shared.{ns}.events.*`（与召回层 `recall_context` 读取前缀一致——
     // 报告 §6.3 增量结论：仅接线 extractor 而不改写入目标，事件层仍不可达）。
     if cfg.enable_event_extraction {
-        if let Some(mut extractor) = deps.extractor.take() {
-            extract_and_store_events(&mut extractor, deps, session_id, messages, &mut result).await;
+        if let Some(extractor) = deps.extractor.take() {
+            extract_and_store_events(extractor, deps, session_id, messages, &mut result).await;
         }
     }
 
@@ -459,8 +459,6 @@ struct CandidateFace {
     /// 候选置信度（MemoryEvent 顶层；payload 包裹形态回落 face 层；
     /// 缺失回落 0.5 提取性缺省——S-5 提议达标门消费）
     confidence: f32,
-    /// 账本 fact_id（整数 cause 链接用）
-    fact_id: u64,
 }
 
 /// 贪心聚类（确定性）：按 (kind, event_id) 序遍历，未分配者成种子，
@@ -546,11 +544,7 @@ fn parse_consolidation(json_str: &str) -> Result<ConsolidationOut, String> {
 }
 
 /// 从账本行解析候选面（MemoryEvent JSON；payload 包裹与顶层双兼容）
-fn parse_candidate_face(
-    path: &str,
-    fact_id: u64,
-    value: &serde_json::Value,
-) -> Option<CandidateFace> {
+fn parse_candidate_face(path: &str, value: &serde_json::Value) -> Option<CandidateFace> {
     let face = value
         .get("payload")
         .and_then(|v| v.as_object())
@@ -559,7 +553,6 @@ fn parse_candidate_face(
     let event_id = path.rsplit('.').next()?.to_string();
     Some(CandidateFace {
         event_id,
-        fact_id,
         confidence: value
             .get("confidence")
             .or_else(|| face.get("confidence"))
@@ -611,7 +604,7 @@ pub(crate) async fn consolidate_knowledge_candidates(
     };
     let mut faces: Vec<CandidateFace> = Vec::new();
     for f in &facts {
-        if let Some(face) = parse_candidate_face(&f.path, f.fact_id, &f.value) {
+        if let Some(face) = parse_candidate_face(&f.path, &f.value) {
             faces.push(face);
         }
     }
@@ -809,7 +802,7 @@ pub(crate) async fn propose_ready_candidates(
         if f.path.contains(".proposed.") {
             continue; // 提议标记非候选
         }
-        if let Some(face) = parse_candidate_face(&f.path, f.fact_id, &f.value) {
+        if let Some(face) = parse_candidate_face(&f.path, &f.value) {
             if !is_valid_knowledge_kind(&face.knowledge_kind)
                 || face.confidence < cfg.knowledge_propose_min_confidence
                 || already_proposed.contains(&face.event_id)
@@ -928,11 +921,9 @@ fn scan_failure_signals(lines: &[JournalLine]) -> Vec<(String, String)> {
                     out.push((format!("policy-{}", stagnation_count), evidence.clone()));
                 }
             }
-            JournalEvent::ApprovalResolved { decision, .. } => {
-                if decision != "approved" {
-                    rejection_count += 1;
-                    out.push((format!("approval-{}", rejection_count), decision.clone()));
-                }
+            JournalEvent::ApprovalResolved { decision, .. } if decision != "approved" => {
+                rejection_count += 1;
+                out.push((format!("approval-{}", rejection_count), decision.clone()));
             }
             _ => {}
         }
@@ -989,13 +980,11 @@ async fn harvest_procedural_materials(
             }
             JournalEvent::PolicyJudged {
                 verdict, evidence, ..
-            } => {
-                if verdict == "blocked" {
-                    candidates.push((
-                        "policy_blocked".to_string(),
-                        format!("治理拦截: {evidence}"),
-                    ));
-                }
+            } if verdict == "blocked" => {
+                candidates.push((
+                    "policy_blocked".to_string(),
+                    format!("治理拦截: {evidence}"),
+                ));
             }
             _ => {}
         }
@@ -1071,7 +1060,7 @@ async fn generate_failure_drafts(
     if lines.is_empty() {
         return;
     }
-    let failures = scan_failure_signals(&lines);
+    let failures = scan_failure_signals(lines);
     if failures.is_empty() {
         return;
     }
@@ -1761,7 +1750,6 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
             confidence: 0.9,
-            fact_id: 0,
         };
         let cands = vec![
             face(
@@ -1800,9 +1788,8 @@ mod tests {
     #[tokio::test]
     async fn test_harvest_procedural_materials_pairs_and_dedups() {
         // F-615:审批拒绝配对+治理拦截→procedural 候选;重复摘要去重;离线降级
+        // (直调内层函数,绕过 sediment() 的 enable_material_harvest 门控)
         let mut mgr = MemoryManager::new("ns", make_test_client()).with_session_id("s-pm");
-        let mut cfg = SedimentConfig::default();
-        cfg.enable_material_harvest = true;
         let llm = LlmHandler::mock("{}");
         let auditor = AuditedLlm::new(make_test_client(), llm);
         let mut deps = SedimentDeps {
@@ -1873,9 +1860,11 @@ mod tests {
     async fn test_journal_digest_not_starved_by_failure_drafts() {
         // 回归:草稿与摘要投影同开时,journal 行单次取走共享——digest 不再饿死
         let mut mgr = MemoryManager::new("ns", make_test_client()).with_session_id("s-starve");
-        let mut cfg = SedimentConfig::default();
-        cfg.enable_failure_drafts = true;
-        cfg.enable_journal_digest = true;
+        let cfg = SedimentConfig {
+            enable_failure_drafts: true,
+            enable_journal_digest: true,
+            ..Default::default()
+        };
         let mut deps = SedimentDeps {
             memory: &mut mgr,
             summarizer: None,
@@ -1925,10 +1914,12 @@ mod tests {
     async fn test_consolidate_skips_small_candidate_set() {
         // 候选 <2 → 无合并对象直接返回(不调 LLM 不写账;离线客户端安全)
         let mut mgr = MemoryManager::new("ns", make_test_client());
-        let mut recipe = crate::agent::recipe::MemoryRecipe::default();
+        let recipe = crate::agent::recipe::MemoryRecipe::default();
         mgr.set_recipe(recipe.clone());
-        let mut cfg = SedimentConfig::default();
-        cfg.enable_consolidation = true;
+        let cfg = SedimentConfig {
+            enable_consolidation: true,
+            ..Default::default()
+        };
         let llm = LlmHandler::mock(r#"{"title":"x","body":"y"}"#);
         let auditor = AuditedLlm::new(make_test_client(), llm);
         let mut deps = SedimentDeps {
@@ -2554,10 +2545,12 @@ mod tests {
         let client = EvoruleApiClient::new(&server.url());
         let mut memory = MemoryManager::new("ns", client).with_session_id("s-prop");
 
-        let mut cfg = SedimentConfig::default();
-        cfg.enable_knowledge_propose = true;
-        cfg.knowledge_propose_dataset = Some("tb-contracts".to_string());
-        cfg.knowledge_propose_min_confidence = 0.7;
+        let cfg = SedimentConfig {
+            enable_knowledge_propose: true,
+            knowledge_propose_dataset: Some("tb-contracts".to_string()),
+            knowledge_propose_min_confidence: 0.7,
+            ..Default::default()
+        };
 
         let facts = serde_json::json!([
             kc_fact(1, "shared.ns.knowledge_candidates.KC-s-prop-100-0", 0.75),
@@ -2638,9 +2631,11 @@ mod tests {
         let client = EvoruleApiClient::new(&server.url());
         let mut memory = MemoryManager::new("ns", client).with_session_id("s-prop");
 
-        let mut cfg = SedimentConfig::default();
-        cfg.enable_knowledge_propose = true;
-        cfg.knowledge_propose_dataset = Some("tb-contracts".to_string());
+        let cfg = SedimentConfig {
+            enable_knowledge_propose: true,
+            knowledge_propose_dataset: Some("tb-contracts".to_string()),
+            ..Default::default()
+        };
 
         let facts = serde_json::json!([
             kc_fact(1, "shared.ns.knowledge_candidates.KC-s-prop-100-0", 0.9),

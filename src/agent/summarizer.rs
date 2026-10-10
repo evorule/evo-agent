@@ -248,6 +248,7 @@ impl SummarizeOutcome {
 /// - goal 命中：1 + 0.5×命中比（R05 词法，cap 1.0）
 ///
 /// 最终 = 基权 × (0.6+0.4×长度因子) × (1.0+0.5×命中比)——仅用于相对分档。
+#[allow(dead_code)] // 仅 cfg(test) F-702 单测引用,lib 构建无调用方
 pub(crate) fn observation_value_weight(tool_name: &str, output: &str, goal: &str) -> f32 {
     const TABLE: &[(&str, f32)] = &[
         ("write", 0.9),
@@ -300,6 +301,7 @@ pub(crate) fn observation_value_weight(tool_name: &str, output: &str, goal: &str
 /// 对 dropped 中的 Tool 消息逐条计权重,降序分档列出（高≥0.9/中≥0.7/低）。
 /// 同分按行字典序（确定性）。无 Tool 消息或 goal 为空时不产标注段
 /// （goal 空即旧调用路径,行为字节级兼容）。
+#[allow(dead_code)] // 仅 cfg(test) F-702 单测引用,lib 构建无调用方
 fn observation_annotations(dropped: &[Message], goal: &str) -> String {
     if goal.is_empty() {
         return String::new();
@@ -346,7 +348,6 @@ fn observation_annotations(dropped: &[Message], goal: &str) -> String {
 /// # 参数
 ///
 /// - `dropped`:`trim_detailed()` 返回的被裁剪消息列表
-
 impl ContextSummarizer {
     /// 创建摘要器
     ///
@@ -418,6 +419,7 @@ impl ContextSummarizer {
         self.summary_model.as_deref()
     }
 
+    /// 被裁剪消息摘要便捷入口(不携带落链元数据;goal 空=不产观察价值标注)
     pub async fn summarize_dropped(&self, dropped: &[Message]) -> Result<String, String> {
         // F-702:goal 空串=不产观察价值标注(旧调用路径行为字节级兼容)
         match self.summarize_dropped_with_metadata(dropped, "").await? {
@@ -438,7 +440,7 @@ impl ContextSummarizer {
     pub async fn summarize_dropped_with_metadata(
         &self,
         dropped: &[Message],
-        goal: &str,
+        _goal: &str,
     ) -> Result<SummarizeOutcome, String> {
         // 空列表:无需摘要
         if dropped.is_empty() {

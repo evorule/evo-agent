@@ -91,6 +91,7 @@ pub struct PendingApproval {
 /// runner 在 `maybe_handle_approval` 中调用 `request_approval()`,
 /// 该方法阻塞直到用户做出决定(或超时)。
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait 宏生成的 must_use 与 Boxed Future 类型语义重复,源上无法消
 pub trait ApprovalCallback: Send + Sync {
     /// 问用户是否批准。返回 [`ApprovalDecision`](带决策者身份),决定执行与否
     async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision;

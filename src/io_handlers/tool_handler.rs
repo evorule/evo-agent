@@ -20,6 +20,7 @@ use crate::io_handler::{IoHandler, IoResult};
 /// **破坏性变更**(G13):从 `fn call(&self, args) -> IoResult` 改为 `async fn call`。
 /// 旧代码需给 `impl ToolFunction` 加 `#[async_trait::async_trait]` 并把 `fn call` 改 `async fn call`。
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)] // async_trait 宏生成的 must_use 与 Boxed Future 类型语义重复,源上无法消
 pub trait ToolFunction: Send + Sync {
     /// 执行工具(异步)
     ///

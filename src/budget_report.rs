@@ -192,12 +192,12 @@ mod tests {
         );
         write_fixture_journal(&dir, "sess-b", &[(Some(400), Some(380))]);
 
-        let (sessions, skips) = analyze_dirs(&[dir.clone()]).unwrap();
+        let (sessions, skips) = analyze_dirs(std::slice::from_ref(&dir)).unwrap();
         assert_eq!(skips.len(), 0);
         assert_eq!(sessions.len(), 2);
         let report = render_report(&sessions, &skips, &[dir.display().to_string()]);
 
-        let mut lines = report.lines().collect::<Vec<_>>();
+        let lines = report.lines().collect::<Vec<_>>();
         // 会话行按路径排序——与本机序无关地校验业务字段行(逐字节)
         let header = lines[0];
         assert_eq!(header, "=== budget-report（est/true 预算偏差报告） ===");
