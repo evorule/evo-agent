@@ -247,7 +247,7 @@ impl LlmHandler {
         self
     }
 
-    /// E-7（31 号档 F1）：预算失配详情（供 runner 启动断言消费；
+    /// 预算失配详情（供 runner 启动断言消费；
     /// Ok=匹配,Err=人读详情——公式同 worst_case_budget_secs 实算）。
     pub fn step_budget_mismatch(&self, step_timeout_secs: u64) -> Result<(), String> {
         let budget = self.worst_case_budget_secs();
@@ -257,12 +257,12 @@ impl LlmHandler {
         Err(format!(
             "step_timeout ({}s) < LLM worst-case budget ({}s = request_timeout {}s × {} attempts \
              + backoff + 10s margin): LLM 端点慢时 step_timeout 先炸,报 call_external timeout \
-             掩盖真因(31号档 E-7);调大 step_timeout_secs 或调小 llm.max_retries/request_timeout",
+             掩盖真因(step budget mismatch);调大 step_timeout_secs 或调小 llm.max_retries/request_timeout",
             step_timeout_secs, budget, self.request_timeout_secs, 1 + self.max_retries
         ))
     }
 
-    /// E-7（31 号档 F1，34 号档实施）：最坏耗时预算——**预算公式唯一真相源**。
+    /// 最坏耗时预算——**预算公式唯一真相源**。
     ///
     /// request_timeout × 尝试次数(1+max_retries) + 退避和上界 + 连接建立余量。
     /// 退避按无 jitter 上界（cap=max_backoff）求和：base·(2^n -1) 封顶
@@ -1030,7 +1030,7 @@ mod tests {
     use super::*;
     use crate::io_handler::IoHandler;
 
-    /// E-7（31 号档 F1）：最坏预算公式锁定
+    /// 最坏预算公式锁定
     #[test]
     fn test_worst_case_budget_formula_e7() {
         // 默认口径: 300s×4 attempts + backoff(1+2+4=7,cap 30 不触) + 10 = 1217
@@ -1044,12 +1044,12 @@ mod tests {
         assert_eq!(h.worst_case_budget_secs(), 300 + 0 + 10);
     }
 
-    /// E-7：失配判定（600=实锤口径必红,1300=修复口径必绿）
+    /// 失配判定（600=失配口径必红,1300=修复口径必绿）
     #[test]
     fn test_step_budget_mismatch_e7() {
         let h = LlmHandler::new("m", "https://x", None); // budget=1225
         assert!(h.step_budget_mismatch(600).is_err());
-        assert!(h.step_budget_mismatch(600).unwrap_err().contains("31号档 E-7"));
+        assert!(h.step_budget_mismatch(600).unwrap_err().contains("step budget mismatch"));
         assert!(h.step_budget_mismatch(1300).is_ok());
     }
 

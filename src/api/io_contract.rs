@@ -1,4 +1,4 @@
-//! evorule-server IO 形状契约——消费方（evo-agent）侧协商模块（E-8，34 号档）
+//! evorule-server IO 形状契约——消费方（evo-agent）侧协商模块
 //!
 //! **契约背景**：evo-agent 与 evorule-server 的集成契约核心是三个参数形状
 //! 约定（server 侧 skip 谓词：llm_audit / agent_tool / flow_probe）。历史上
@@ -10,7 +10,7 @@
 //! 1. **启动协商**（[`negotiate_io_contract`]）：建会话前拉取契约——
 //!    端点 404/连不通 = 旧 server（v0 未固化期）→ **warn 通过**（两仓独立
 //!    演进的部署现实，不能一升全断）；端点在但版本 ∉ 自家支持集 →
-//!    **hard fail**（fail-closed：未验证的升级行为宁停不错，34 号档 §2.2）。
+//!    **hard fail**（fail-closed：未验证的升级行为宁停不错）。
 //! 2. **交叉锁测**（`test_io_shape_contract_alignment`）：对自家真实产物
 //!    （build_call_external_command / call_service 指令形状）跑契约形状
 //!    断言——本仓产物若漂移出契约形状，测试期即红，而非生产断链。
@@ -140,7 +140,7 @@ pub fn params_match_shape(spec: &IoShapeSpec, io_type: &str, params: &serde_json
 }
 
 /// 读仓内 pinned 契约副本（交叉锁测用；来源=evorule-server 快照导出，
-/// 双仓同步由 CI 级脚本核哈希——34 号档 §2.3）。
+/// 双仓同步由 CI 级脚本核哈希）。
 pub fn pinned_contract() -> Result<IoContract, IoContractError> {
     let raw: serde_json::Value = serde_json::from_str(include_str!("../../assets/io-contract-v1.json"))
         .map_err(|e| IoContractError::Malformed(format!("pinned asset: {e}")))?;
@@ -220,7 +220,7 @@ mod tests {
         ));
     }
 
-    // --- 交叉锁测：本仓真实产物 vs 契约形状（E-8 核心）---
+    // --- 交叉锁测：本仓真实产物 vs 契约形状 ---
 
     #[test]
     fn test_io_shape_contract_alignment_llm_audit() {

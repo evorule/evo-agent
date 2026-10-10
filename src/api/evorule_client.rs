@@ -81,7 +81,7 @@ impl EvoruleApiClient {
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
-    /// GET /api/io-contract —— evorule-server IO 形状契约拉取（E-8 协商，34 号档）。
+    /// GET /api/io-contract —— evorule-server IO 形状契约拉取（启动期协商）。
     ///
     /// 错误分类给 [`crate::api::io_contract::negotiate_io_contract`] 消费：
     /// 404 → `NotFound`（旧 server，warn 通过）；其余传输/解析错误 →
