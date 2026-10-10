@@ -1224,6 +1224,18 @@ impl AgentRunner {
         // 4. LLM handler(默认从 env 读)
         let llm = llm_handler.unwrap_or_else(LlmHandler::with_defaults);
 
+        // step_timeout ≥ LLM 最坏预算断言（预算失配会让 step_timeout 先炸,
+        // 掩盖 LLM 端点慢的真因——错误归因指向编排层）。
+        // 默认 warn（既有配置面广,60~300s 常见）;EVORULE_STEP_BUDGET_ENFORCE=1
+        // 时硬 fail（生产/竞赛口径,防 step_timeout 先炸掩盖 LLM 慢的误归因）。
+        // 预算公式唯一真相源=LlmHandler::step_budget_mismatch（同实例实算）。
+        if let Err(msg) = llm.step_budget_mismatch(config.step_timeout.as_secs()) {
+            if std::env::var("EVORULE_STEP_BUDGET_ENFORCE").as_deref() == Ok("1") {
+                return Err(AgentError::Internal(msg));
+            }
+            tracing::warn!(msg = %msg, "step budget mismatch (warn; enforce via EVORULE_STEP_BUDGET_ENFORCE=1)");
+        }
+
         // 5. 组装
         let mut runner = Self::new(config, client)
             .with_llm_handler(llm)
@@ -2289,7 +2301,7 @@ impl AgentRunner {
             )
             .map_err(AgentError::Internal)?;
 
-        // E-8:建会话前 IO 形状契约协商(34 号档)——404/连不通=旧 server warn
+        // 建会话前 IO 形状契约协商——404/连不通=旧 server warn
         // 通过;端点在但版本不匹配=hard fail(未验证升级行为宁停不错)。
         // client clone 进闭包达 'static(共享 reqwest 连接池,无额外开销)。
         let io_client = self.evorule_client.clone();
@@ -5141,7 +5153,7 @@ impl AgentRunner {
                         info!(%id, "G15: continuing existing session");
                         id
                     } else {
-                        // E-8:建会话前 IO 形状契约协商(34 号档)——同 run() 路径口径:
+                        // 建会话前 IO 形状契约协商——同 run() 路径口径:
                         // 404/连不通=旧 server warn 通过;版本不匹配=hard fail。
                         // client clone 进闭包达 'static(共享 reqwest 连接池)。
                         let io_client = runner.evorule_client.clone();

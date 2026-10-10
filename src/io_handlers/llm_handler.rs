@@ -247,6 +247,39 @@ impl LlmHandler {
         self
     }
 
+    /// 预算失配详情（供 runner 启动断言消费；
+    /// Ok=匹配,Err=人读详情——公式同 worst_case_budget_secs 实算）。
+    pub fn step_budget_mismatch(&self, step_timeout_secs: u64) -> Result<(), String> {
+        let budget = self.worst_case_budget_secs();
+        if step_timeout_secs >= budget {
+            return Ok(());
+        }
+        Err(format!(
+            "step_timeout ({}s) < LLM worst-case budget ({}s = request_timeout {}s × {} attempts \
+             + backoff + 10s margin): LLM 端点慢时 step_timeout 先炸,报 call_external timeout \
+             掩盖真因(step budget mismatch);调大 step_timeout_secs 或调小 llm.max_retries/request_timeout",
+            step_timeout_secs, budget, self.request_timeout_secs, 1 + self.max_retries
+        ))
+    }
+
+    /// 最坏耗时预算——**预算公式唯一真相源**。
+    ///
+    /// request_timeout × 尝试次数(1+max_retries) + 退避和上界 + 连接建立余量。
+    /// 退避按无 jitter 上界（cap=max_backoff）求和：base·(2^n -1) 封顶
+    /// max_backoff×n。连接余量取 10s（connect_timeout 与首字节外的排队）。
+    ///
+    /// 消费方：`AgentRunner::from_definition` 启动断言 step_timeout ≥ 本值
+    /// （fail-fast，防「step_timeout 先炸掩盖 LLM 慢」的误归因）。
+    pub fn worst_case_budget_secs(&self) -> u64 {
+        let attempts = 1 + self.max_retries as u64;
+        let mut backoff_sum = 0f64;
+        for attempt in 0..self.max_retries {
+            let exp = self.base_backoff_secs * 2f64.powi(attempt as i32);
+            backoff_sum += exp.min(self.max_backoff_secs);
+        }
+        attempts * self.request_timeout_secs + backoff_sum.ceil() as u64 + 10
+    }
+
     /// Create a mock LLM handler for tests.
     ///
     /// Returns a deterministic `LlmResponse`-shaped JSON regardless of input.
@@ -996,6 +1029,29 @@ fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
 mod tests {
     use super::*;
     use crate::io_handler::IoHandler;
+
+    /// 最坏预算公式锁定
+    #[test]
+    fn test_worst_case_budget_formula_e7() {
+        // 默认口径: 300s×4 attempts + backoff(1+2+4=7,cap 30 不触) + 10 = 1217
+        let h = LlmHandler::new("m", "https://x", None);
+        assert_eq!(h.worst_case_budget_secs(), 300 * 4 + 7 + 10);
+        // cap 生效口径: base=20 → 20+30+30=80
+        let h = h.with_retry_config(3, 20.0, 30.0);
+        assert_eq!(h.worst_case_budget_secs(), 300 * 4 + 80 + 10);
+        // 零重试口径: 单次请求 + 10
+        let h = h.with_retry_config(0, 1.0, 30.0);
+        assert_eq!(h.worst_case_budget_secs(), 300 + 0 + 10);
+    }
+
+    /// 失配判定（600=失配口径必红,1300=修复口径必绿）
+    #[test]
+    fn test_step_budget_mismatch_e7() {
+        let h = LlmHandler::new("m", "https://x", None); // budget=1225
+        assert!(h.step_budget_mismatch(600).is_err());
+        assert!(h.step_budget_mismatch(600).unwrap_err().contains("step budget mismatch"));
+        assert!(h.step_budget_mismatch(1300).is_ok());
+    }
 
     /// 实际生效参数:显式值原样透传,兜底值 0.7/4096,stream 恒 true
     #[test]
