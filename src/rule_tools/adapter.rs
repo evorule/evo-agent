@@ -839,6 +839,23 @@ pub static SESSION_REWIND: EndpointBinding = EndpointBinding {
     ..BINDING_DEFAULTS
 };
 
+pub static AUDIT_EXPORT: EndpointBinding = EndpointBinding {
+    name: "audit_export",
+    client: ClientKind::Evorule,
+    path: "/api/sessions/{session_id}/audit/export",
+    description: "Export the full audit chain of a session as JSON (read-only; the \
+                  server audits pending facts first so the export includes the latest \
+                  entries).",
+    params: &[ParamBinding {
+        name: "session_id",
+        loc: Loc::Path,
+        required: true,
+        description: "Session id.",
+        ..PARAM_DEFAULTS
+    }],
+    ..BINDING_DEFAULTS
+};
+
 // =============================================================================
 // sandbox 族（5）
 // =============================================================================
@@ -1433,7 +1450,7 @@ pub static HIT_STATS_SERIES: EndpointBinding = EndpointBinding {
 };
 
 // =============================================================================
-// 全量透传 binding 表（42 个 = D-1 分类表纯透传族全集 + hit-stats 2）
+// 全量透传 binding 表（43 个 = D-1 分类表纯透传族全集 + hit-stats 2 + audit_export 1）
 // =============================================================================
 
 /// 全部透传工具的端点绑定（顺序 = 原手写 specs 组装顺序，便于对照）。
@@ -1460,9 +1477,10 @@ pub static ALL_TRANSPARENT_BINDINGS: &[&EndpointBinding] = &[
     &RULE_TO_TRANSFORM,
     &RULE_TO_CONDITIONAL,
     &RULE_VALIDATE,
-    // audit 2（audit_verify 本地逻辑除外）
+    // audit 3（audit_verify 本地逻辑除外）+ audit_export（39 号批 B4）
     &AUDIT_GET,
     &SESSION_REWIND,
+    &AUDIT_EXPORT,
     // sandbox 5
     &SANDBOX_START,
     &SANDBOX_LIST,
@@ -1529,7 +1547,7 @@ mod tests {
 
     #[test]
     fn test_all_bindings_count_and_names_unique() {
-        assert_eq!(ALL_TRANSPARENT_BINDINGS.len(), 42);
+        assert_eq!(ALL_TRANSPARENT_BINDINGS.len(), 43);
         let mut names: Vec<&str> = ALL_TRANSPARENT_BINDINGS.iter().map(|b| b.name).collect();
         names.sort_unstable();
         names.dedup();

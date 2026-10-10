@@ -5,7 +5,7 @@
 //! 规则管理工具集 —— 把 WorkspaceApiClient/EvoruleApiClient 封装成 ToolFunction 工具
 //!
 //! 组装结构（理顺批 P1 适配器化后）：
-//! - 40 个纯透传工具 → `adapter` 表驱动（ALL_TRANSPARENT_BINDINGS 声明式映射）；
+//! - 43 个纯透传工具 → `adapter` 表驱动（ALL_TRANSPARENT_BINDINGS 声明式映射）；
 //! - 6 个本地逻辑工具（audit_verify / bundle_export / skill_pack_to_bundle /
 //!   meta_summary / evolution_signals / rule_promote）→ `local_handlers` 统一外置；
 //! - 3 个查账 why/order 工具（explain_denial / causal_order / lineage_of，
@@ -20,7 +20,7 @@ use crate::api::workspace_client::WorkspaceApiClient;
 use crate::builtin_tools::ToolSpec;
 use crate::io_handlers::tool_handler::ToolHandler;
 
-/// 组装完整规则工具集（透传 40 + 本地逻辑 6 + why/order 3 = 49 工具）
+/// 组装完整规则工具集（透传 43 + 本地逻辑 6 + why/order 3 = 52 工具）
 pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
     let mut h = ToolHandler::new();
     adapter::register_bindings(&mut h, ws, ev, adapter::ALL_TRANSPARENT_BINDINGS);
@@ -29,7 +29,7 @@ pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> Tool
     h
 }
 
-/// 全部规则工具 spec（49 个）
+/// 全部规则工具 spec（52 个）
 pub fn rule_tool_specs() -> Vec<ToolSpec> {
     let mut specs = adapter::specs_from(adapter::ALL_TRANSPARENT_BINDINGS);
     specs.extend(local_handlers::specs());
@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn test_rule_tool_specs_count() {
         let specs = rule_tool_specs();
-        assert_eq!(specs.len(), 51, "expected 51 rule tool specs");
+        assert_eq!(specs.len(), 52, "expected 52 rule tool specs");
     }
 
     #[test]
@@ -214,8 +214,8 @@ service_tools = ["config_persist", "rule_sandbox"]
     }
 
     #[test]
-    fn test_full_rule_toolkit_registers_all_45() {
-        // 验证 full_rule_toolkit 注册了全部 51 个工具（42 透传 + 6 本地逻辑 +
+    fn test_full_rule_toolkit_registers_all_52() {
+        // 验证 full_rule_toolkit 注册了全部 52 个工具（43 透传 + 6 本地逻辑 +
         // 3 why/order，has_tool 逐个校验；计数与 rule_tool_specs 对齐）
         let ws = WorkspaceApiClient::new("http://localhost:0");
         let ev = EvoruleApiClient::new("http://localhost:0");
@@ -245,6 +245,8 @@ service_tools = ["config_persist", "rule_sandbox"]
             "audit_get",
             "audit_verify",
             "session_rewind",
+            // audit_export（39 号批 B4，只读；import 破坏性不上工具面）
+            "audit_export",
             // sandbox 5
             "sandbox_start",
             "sandbox_list",
@@ -263,8 +265,9 @@ service_tools = ["config_persist", "rule_sandbox"]
             // production 2
             "prod_state",
             "prod_audit",
-            // bundles 5
+            // bundles 6（bundle_export / skill_pack_to_bundle 为本地逻辑工具）
             "bundle_export",
+            "skill_pack_to_bundle",
             "bundle_import_dry_run",
             "bundle_import",
             "bundle_active_list",
@@ -286,7 +289,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             "causal_order",
             "lineage_of",
         ];
-        assert_eq!(all_tools.len(), 50);
+        assert_eq!(all_tools.len(), 52);
         for name in &all_tools {
             assert!(
                 h.has_tool(name),

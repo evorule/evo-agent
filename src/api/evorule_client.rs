@@ -955,6 +955,108 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
+    // =========================================================================
+    // 审计链导出/导入（39 号批 B4）—— V-1/V-2 抗篡改线「接导出非造轮子」对接面。
+    // 导出只读；导入破坏性（完全覆盖目标会话审计链），由调用方把守授权。
+    // =========================================================================
+
+    /// GET /api/sessions/{id}/audit/export —— 审计链导出（JSON 全文）
+    ///
+    /// 返回审计链 JSON（导出前 server 先审计新事实，含最新条目）。
+    /// 404 = 会话不存在。
+    pub async fn export_audit_chain(&self, session_id: &str) -> Result<Value, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/audit/export",
+            self.core.base_url(),
+            session_id
+        );
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// POST /api/sessions/{id}/audit/import —— 审计链导入（**破坏性**：覆盖现有审计链）
+    ///
+    /// `data` 为 [`Self::export_audit_chain`] 导出的审计链 JSON 原样。
+    /// 返回 `{session_id, imported, verify_ok, status}`（status: "ok" |
+    /// "verify_failed"——导入成功但链验证失败时如实上报，不视为传输错误）。
+    /// 400 = 数据解析失败；404 = 会话不存在。
+    pub async fn import_audit_chain(
+        &self,
+        session_id: &str,
+        data: &Value,
+    ) -> Result<Value, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/audit/import",
+            self.core.base_url(),
+            session_id
+        );
+        let resp = self
+            .core
+            .auth_header(self.core.client().post(&url))
+            .json(data)
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// GET /api/sessions/{id}/audit/export/compressed —— 审计链压缩导出（gzip 二进制）
+    ///
+    /// 返回 `application/gzip` 原始字节（体积通常为 JSON 的 5-10%），落盘/传输由
+    /// 调用方处置。404 = 会话不存在；500 = server 压缩失败。
+    pub async fn export_audit_chain_compressed(
+        &self,
+        session_id: &str,
+    ) -> Result<bytes::Bytes, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/audit/export/compressed",
+            self.core.base_url(),
+            session_id
+        );
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.bytes().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// POST /api/sessions/{id}/audit/import/compressed —— 审计链压缩导入（**破坏性**）
+    ///
+    /// `gz` 为 gzip 二进制（`Content-Type: application/gzip`），解压后语义同
+    /// [`Self::import_audit_chain`]，导入成功后 server 自动 verify。
+    /// 返回 `{session_id, imported, verify_ok, status, format:"gzip"}`。
+    pub async fn import_audit_chain_compressed(
+        &self,
+        session_id: &str,
+        gz: &[u8],
+    ) -> Result<Value, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/audit/import/compressed",
+            self.core.base_url(),
+            session_id
+        );
+        let resp = self
+            .core
+            .auth_header(
+                self.core
+                    .client()
+                    .post(&url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/gzip"),
+            )
+            .body(gz.to_vec())
+            .send()
+            .await?;
+        self.core.check_response(&resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// 回退会话到指定版本（GET rewind）。
     pub async fn rewind(&self, session_id: &str, version: u64) -> Result<Value, ApiError> {
         let url = format!(
@@ -1804,6 +1906,117 @@ mod tests {
             .transition_knowledge_entry("ds-a24", "k-2", "c")
             .await
             .is_err());
+    }
+
+    // ===== B4：审计链导出/导入（39 号批）=====
+
+    /// 请求形状：GET export → JSON 透传
+    #[tokio::test]
+    async fn test_export_audit_chain_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/sessions/42/audit/export")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"session_id":42,"entries":[{"seq":1}],"verified":true}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let chain = client.export_audit_chain("42").await.unwrap();
+        assert_eq!(chain["session_id"], 42);
+        assert_eq!(chain["verified"], true);
+        mock.assert_async().await;
+    }
+
+    /// 请求形状：POST import → body=审计链 JSON 原样；verify_failed 如实透传（200）
+    #[tokio::test]
+    async fn test_import_audit_chain_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/sessions/42/audit/import")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "entries": [{"seq": 1}]
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"session_id":42,"imported":true,"verify_ok":false,"status":"verify_failed"}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let data = serde_json::json!({"entries": [{"seq": 1}]});
+        let resp = client.import_audit_chain("42", &data).await.unwrap();
+        assert_eq!(resp["imported"], true);
+        assert_eq!(resp["status"], "verify_failed");
+        mock.assert_async().await;
+    }
+
+    /// 错误透出：导入数据非法 → 400 上抛
+    #[tokio::test]
+    async fn test_import_audit_chain_bad_request() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/sessions/42/audit/import")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"bad request"}"#)
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        assert!(client
+            .import_audit_chain("42", &serde_json::json!({}))
+            .await
+            .is_err());
+    }
+
+    /// 压缩导出：返回 gzip 二进制原样（非 JSON 通路）
+    #[tokio::test]
+    async fn test_export_audit_chain_compressed_bytes() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/sessions/42/audit/export/compressed")
+            .with_status(200)
+            .with_header("content-type", "application/gzip")
+            .with_body(b"GZIP-FAKE-PAYLOAD")
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let gz = client.export_audit_chain_compressed("42").await.unwrap();
+        assert_eq!(&gz[..], b"GZIP-FAKE-PAYLOAD");
+        mock.assert_async().await;
+    }
+
+    /// 压缩导入：body=gzip 二进制 + Content-Type: application/gzip；响应 JSON
+    #[tokio::test]
+    async fn test_import_audit_chain_compressed_shape() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/sessions/42/audit/import/compressed")
+            .match_header("content-type", "application/gzip")
+            .match_body(mockito::Matcher::Exact(
+                "GZIP-FAKE-PAYLOAD".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"session_id":42,"imported":true,"verify_ok":true,"status":"ok","format":"gzip"}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = EvoruleApiClient::new(&server.url());
+        let resp = client
+            .import_audit_chain_compressed("42", b"GZIP-FAKE-PAYLOAD")
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["format"], "gzip");
+        mock.assert_async().await;
     }
 
     // ===== B3：规则命中统计（39 号批）=====

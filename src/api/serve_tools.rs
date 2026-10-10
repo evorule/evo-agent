@@ -52,6 +52,8 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "audit_get",
     "audit_verify",
     "session_rewind",
+    // audit_export (1,39 号批 B4,只读;import 破坏性不上工具面)
+    "audit_export",
     // knowledge_tools (3,只读消费面)
     "knowledge_datasets",
     "knowledge_search",
@@ -78,7 +80,7 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "lineage_of",
 ];
 
-/// 构建 union toolkit(内置 17 + 规则 37 = 54 工具,启动时一次组装)
+/// 构建 union toolkit(内置 17 + 规则 38 = 55 工具,启动时一次组装)
 ///
 /// 在 `cmd_serve` 启动时调用一次,结果存入 `AgentApiState.toolkit`。
 pub fn build_union_toolkit(
@@ -791,7 +793,7 @@ mod tests {
         let (ws, ev) = make_clients();
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
         let all = all_rule_tool_names();
-        assert_eq!(all.len(), 51, "rule tool spec count drift");
+        assert_eq!(all.len(), 52, "rule tool spec count drift");
         let mut settings = serde_json::Map::new();
         settings.insert(
             "agentTools.governanceWrite".to_string(),
@@ -811,10 +813,10 @@ mod tests {
             .collect();
         assert_eq!(
             keep.len(),
-            30,
-            "readonly surface must keep exactly 30 tools"
+            31,
+            "readonly surface must keep exactly 31 tools"
         );
-        // 30 只读 spec 中不在 serve union 面者本就不被 serve(与开关无关),
+        // 31 只读 spec 中不在 serve union 面者本就不被 serve(与开关无关),
         // 只断言 union 内只读工具全保留
         for name in &keep {
             if !RULE_TOOL_NAMES.contains(name) {
@@ -893,7 +895,7 @@ mod tests {
             );
         }
 
-        // 30 个规则工具(=RULE_TOOL_NAMES 白名单)
+        // 38 个规则工具(=RULE_TOOL_NAMES 白名单)
         for name in RULE_TOOL_NAMES {
             assert!(
                 handler.has_tool(name),
@@ -902,7 +904,7 @@ mod tests {
             );
         }
 
-        // 总数 = 17 + 37 = 54(逐个验证所有预期工具都在)
+        // 总数 = 17 + 38 = 55(逐个验证所有预期工具都在)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -926,7 +928,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 54, "expected 54 total tool names");
+        assert_eq!(all_names.len(), 55, "expected 55 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),
