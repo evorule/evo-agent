@@ -178,6 +178,17 @@ pub struct MemoryConfig {
     /// 自动跳过（纪律①）。
     #[serde(default = "default_true")]
     pub enable_knowledge_extraction: bool,
+    /// 知识候选自动出口：治理数据集名（可选；缺省 None=出口关闭）
+    ///
+    /// 会话收尾 sediment 巩固后，达标候选（置信度达门限且未提议过）
+    /// 经 knowledge-propose 服务自动提议至该数据集（仅 Draft，不自动
+    /// 晋升——晋升走人工 T1/机器 T2 闸）。配置即启用，治理侧拒绝仅
+    /// warn 不阻塞收尾；不配则出口关闭（双保险内闸不动）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_propose_dataset: Option<String>,
+    /// 知识候选自动出口的置信度门限（可选，缺省 0.7）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_propose_min_confidence: Option<f32>,
 }
 
 fn default_memory_budget_ratio() -> f32 {
@@ -215,6 +226,8 @@ impl Default for MemoryConfig {
             summary_rollup_threshold: default_summary_rollup_threshold(),
             enable_event_extraction: default_true(),
             enable_knowledge_extraction: default_true(),
+            knowledge_propose_dataset: None,
+            knowledge_propose_min_confidence: None,
         }
     }
 }
@@ -1998,6 +2011,32 @@ mod tests {
         assert_eq!(cfg.message_persist.mode, "every_message");
         assert!(cfg.ttl_secs.is_none());
         assert!(cfg.summary_model.is_none());
+    }
+
+    #[test]
+    fn test_memory_config_knowledge_propose_wiring() {
+        // 运营接线批：dataset 配置即启用出口；不配=None=off（缺省关）
+        let json = r#"{
+            "type": "persistent",
+            "namespace": "researcher",
+            "knowledge_propose_dataset": "tb-contracts",
+            "knowledge_propose_min_confidence": 0.85
+        }"#;
+        let cfg: MemoryConfig = serde_json::from_str(json).expect("parse propose wiring");
+        assert_eq!(
+            cfg.knowledge_propose_dataset,
+            Some("tb-contracts".to_string())
+        );
+        assert_eq!(cfg.knowledge_propose_min_confidence, Some(0.85));
+
+        let off: MemoryConfig = serde_json::from_str(r#"{"type":"persistent","namespace":"n"}"#)
+            .expect("parse default off");
+        assert!(off.knowledge_propose_dataset.is_none());
+        assert!(off.knowledge_propose_min_confidence.is_none());
+
+        // 序列化缺省不出现（skip_serializing_if）
+        let serialized = serde_json::to_string(&off).expect("serialize");
+        assert!(!serialized.contains("knowledge_propose"));
     }
 
     #[test]

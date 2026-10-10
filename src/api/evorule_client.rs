@@ -90,7 +90,12 @@ impl EvoruleApiClient {
         &self,
     ) -> Result<serde_json::Value, crate::api::io_contract::NegotiationFetchError> {
         let url = self.core.url("/api/io-contract");
-        let resp = match self.core.auth_header(self.core.client().get(&url)).send().await {
+        let resp = match self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 return Err(crate::api::io_contract::NegotiationFetchError::Unavailable(

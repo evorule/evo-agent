@@ -908,7 +908,10 @@ mod tests {
         assert!(out.starts_with("BASE"));
         let gov = out.find("GOV").expect("governance segment present");
         let know = out.find("KNOW").expect("knowledge segment present");
-        assert!(gov < know, "knowledge segment must follow governance segment");
+        assert!(
+            gov < know,
+            "knowledge segment must follow governance segment"
+        );
 
         // None → 槽位跳过(未声明数据集的既有定义零影响)
         let out2 = exec
