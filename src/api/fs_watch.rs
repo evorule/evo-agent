@@ -4,8 +4,9 @@
 #![forbid(unsafe_code)]
 //! 工作台文件树实时刷新 —— workdir 文件系统监听与 WS 广播
 //!
-//! serve 启动时对 workdir 递归 watch(notify RecommendedWatcher,
-//! Windows = ReadDirectoryChangesW),经 400ms 去抖合并后规整为批量事件
+//! serve 启动时对 workdir 建 watch(单根 Recursive;notify
+//! RecommendedWatcher,Windows = ReadDirectoryChangesW,debouncer 缓存
+//! 显式 NoCache 跳过建根预扫),经 400ms 去抖合并后规整为批量事件
 //! [`FsEventBatch`](相对 workdir 路径),经 [`FsEventHub`](tokio broadcast)
 //! 向所有 WS 连接广播,帧形如:
 //!
@@ -31,7 +32,7 @@ use std::time::Duration;
 
 use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecursiveMode};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, DebouncedEvent, NoCache};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -289,7 +290,17 @@ impl Default for FsEventHub {
 // watcher 启动
 // =============================================================================
 
-/// 启动 workdir 递归监听(serve 启动时调用一次)。
+/// 启动 workdir 文件监听(serve 启动时调用一次):单根 Recursive 建全树
+/// watch,排除口径(`.` 开头首段与 [`EXCLUDED_FIRST_SEGMENTS`])由规整层
+/// [`excluded`] 在事件面完成,建根不做子树剪枝。
+///
+/// debouncer 缓存必须显式 [`NoCache`]:`new_debouncer` 默认装
+/// RecommendedCache(Windows 上为 FileIdMap),会在 `watch()` 建根时对整棵
+/// 监视子树**递归预扫**建 file-id 映射——主仓 target/ 巨型子树下 watch()
+/// 分钟级不返回,serve 卡死在 bind 之前(29 号档任务A 实锤,证据
+/// data/probe-serve-18191.err);NoCache 跳过预扫,建根 O(1)。代价仅
+/// file-id 级 rename 消歧失效:Windows 原生 RenameMode::Both 配对不受
+/// 影响,失配场景降级为 added+removed 两条事件,规整层语义兼容。
 ///
 /// 事件经 400ms 去抖 + [`normalize`] 规整后经 `hub` 广播。debouncer 以
 /// `std::mem::forget` 主动泄漏——serve 进程生命周期即 watcher 生命周期,
@@ -302,8 +313,9 @@ pub fn spawn_watcher(workdir: &Path, hub: FsEventHub) -> Result<(), String> {
     let wd = std::fs::canonicalize(workdir)
         .map_err(|e| format!("failed to resolve workdir {}: {e}", workdir.display()))?;
     let wd_for_norm = wd.clone();
-    let mut debouncer = new_debouncer(
+    let mut debouncer = new_debouncer_opt::<_, notify::RecommendedWatcher, _>(
         Duration::from_millis(FS_DEBOUNCE_MS),
+        // tick_rate 缺省(None):取 timeout/4 轮询,与原 new_debouncer 行为一致
         None,
         move |result: DebounceEventResult| {
             let events = match result {
@@ -321,6 +333,9 @@ pub fn spawn_watcher(workdir: &Path, hub: FsEventHub) -> Result<(), String> {
             let batch = normalize(&wd_for_norm, &raw);
             hub.publish(batch);
         },
+        // 显式 NoCache:禁用 FileIdMap 建根递归预扫(见函数级 doc,29 号档任务A)
+        NoCache::default(),
+        notify::Config::default(),
     )
     .map_err(|e| format!("failed to create file watcher: {e}"))?;
     debouncer
