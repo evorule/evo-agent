@@ -78,6 +78,9 @@ pub struct AtifSources<'a> {
     /// 父会话链路(委托子轨迹标注;调用方经父 journal 扫描
     /// `scan_delegate_spawns` 反查后传入,无则缺省——schema 零改动)
     pub parent_session_id: Option<String>,
+    /// 审计锚点列表(server ≥0.9.2 `/anchors` 产物整包;无锚点/旧 server
+    /// 传 None——extra 扩展位承载,schema 零改动)
+    pub audit_anchors: Option<&'a Value>,
 }
 
 /// 导出错误(fail-visible,不静默产出半截轨迹)
@@ -153,6 +156,43 @@ pub struct AtifRootExtra {
     /// 既有导出恒 false 不序列化,字节不变)
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub resumed_after_crash: bool,
+    /// 事实链(审计链)末哈希——锚点绑定基准;receipt `audit_chain_head` 同源
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_chain_head: Option<String>,
+    /// 审计锚点背书(末锚点签名段;V-1 抗篡改扩展位,格式版本自标)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_anchor: Option<AtifAnchorEndorsement>,
+    /// 脱敏器执行记录(命中数>0 才序列化;零命中=原文导出字节不变)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sanitized: Option<AtifSanitizeReport>,
+}
+
+/// 末锚点签名段(extra.audit_anchor;数据来自 server `/anchors` 末元素)
+#[derive(Debug, Clone, Serialize)]
+pub struct AtifAnchorEndorsement {
+    /// 锚点格式版本(独立于 ATIF schema_version 自标)
+    pub anchor_format: String,
+    /// 锚点序号
+    pub seq: u64,
+    /// 覆盖事实区间
+    pub fact_range: [u64; 2],
+    /// 签名密钥标识
+    pub key_id: String,
+    /// 引擎/部署标识
+    pub engine_id: String,
+    /// 锚点哈希(载荷哈希)
+    pub anchor_hash: String,
+    /// ed25519 签名(hex)
+    pub signature: String,
+}
+
+/// 脱敏执行报告(extra.sanitized)
+#[derive(Debug, Clone, Serialize)]
+pub struct AtifSanitizeReport {
+    /// 命中的秘密模式计数(按模式)
+    pub hits: std::collections::BTreeMap<String, u64>,
+    /// 总替换次数
+    pub total_replaced: u64,
 }
 
 /// ATIF StepObject(RFC §StepObject)
@@ -996,6 +1036,14 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
     let exported_at = iso8601_from_unix_ms(sources.journal.last().map(|l| l.ts).unwrap_or(0));
     let model_name = assistant_model_of(sources.journal);
 
+    // V-1:末锚点签名段与事实链头(来自 server `/anchors`;无锚点全缺省——
+    // 既有导出路径字节不变)。链头取末锚点 chain_head(锚点绑定基准)。
+    let (audit_chain_head, audit_anchor) = anchor_endorsement_of(sources.audit_anchors);
+
+    // V-1:脱敏器——steps 文本面秘密扫描(零命中=报告 None,字节不变;
+    // 命中即替换并落 extra.sanitized,秘密零漏出断言由测试背书)
+    let sanitized = sanitize_trajectory(&mut steps);
+
     Ok(AtifTrajectory {
         schema_version: ATIF_SCHEMA_VERSION.to_string(),
         session_id: sources.session_id.to_string(),
@@ -1022,8 +1070,155 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             exporter: format!("evo-agent atif v{}", env!("CARGO_PKG_VERSION")),
             parent_session_id: sources.parent_session_id.clone(),
             resumed_after_crash,
+            audit_chain_head,
+            audit_anchor,
+            sanitized,
         },
     })
+}
+
+/// 脱敏器(V-1):导出前秘密模式扫描与替换
+///
+/// 范围:`steps[].message` + `steps[].observation[].results[].content`
+/// (transcript 与 journal 事件的人类可读投影面;结构化字段不扫——
+/// 工具 schema/审计哈希属非秘密)。命中替换为 `[REDACTED:<mode>]` 并计数;
+/// 零命中返回 None(extra.sanitized 不序列化,导出字节不变)。
+///
+/// 模式集(保守白名单式,宁漏报不误伤正文):
+/// - `sk-` 前缀 token(OpenAI 风格,20+ 连续词字符)
+/// - `Bearer <token>`(HTTP 授权头)
+/// - `EVORULE_ANCHOR_SEED` 环境变量赋值形态
+/// - 长 hex 串(64 位,密钥种子形态)
+fn sanitize_trajectory(steps: &mut [AtifStep]) -> Option<AtifSanitizeReport> {
+    use std::collections::BTreeMap;
+    let mut hits: BTreeMap<String, u64> = BTreeMap::new();
+    let replace = |s: &mut String, hits: &mut BTreeMap<String, u64>| {
+        let orig_len = s.len();
+        let (out, n) = sanitize_text(s, hits);
+        *s = out;
+        orig_len != s.len() || n > 0
+    };
+    for step in steps.iter_mut() {
+        replace(&mut step.message, &mut hits);
+        if let Some(obs) = step.observation.as_mut() {
+            for r in obs.results.iter_mut() {
+                if let Some(c) = r.content.as_mut() {
+                    replace(c, &mut hits);
+                }
+            }
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    let total_replaced = hits.values().sum();
+    Some(AtifSanitizeReport { hits, total_replaced })
+}
+
+/// 单串秘密扫描(返回替换后文本与命中计数)
+fn sanitize_text(
+    input: &str,
+    hits: &mut std::collections::BTreeMap<String, u64>,
+) -> (String, u64) {
+    let mut out = input.to_string();
+    let mut total: u64 = 0;
+    // sk- token:前缀锚定,20+ 词字符
+    let (o, n) = replace_pattern(&out, "sk-token", r"sk-[A-Za-z0-9_-]{20,}", hits);
+    out = o;
+    total += n;
+    // Bearer token
+    let (o, n) = replace_pattern(&out, "bearer", r"(?i)bearer\s+[A-Za-z0-9._~+/-]{16,}", hits);
+    out = o;
+    total += n;
+    // 种子环境变量赋值
+    let (o, n) = replace_pattern(
+        &out,
+        "anchor-seed",
+        r"EVORULE_ANCHOR_SEED\s*[=:]\s*[0-9a-fA-F]{64}",
+        hits,
+    );
+    out = o;
+    total += n;
+    // 裸 64-hex(密钥种子形态;前后须非 hex 字符防截长哈希误伤——链哈希常见 64hex,
+    // 但链哈希只出现在结构化字段不在扫面,此处文本面命中即按秘密处理)
+    let (o, n) = replace_pattern(&out, "hex64", r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])", hits);
+    out = o;
+    total += n;
+    (out, total)
+}
+
+/// 正则替换并按模式计数(依赖由 atif 模块顶部 `use` 引入 regex——
+/// Cargo 既有依赖,零新增)
+fn replace_pattern(
+    input: &str,
+    mode: &str,
+    pattern: &str,
+    hits: &mut std::collections::BTreeMap<String, u64>,
+) -> (String, u64) {
+    let re = match regex::Regex::new(pattern) {
+        Ok(r) => r,
+        Err(_) => return (input.to_string(), 0),
+    };
+    let n = re.find_iter(input).count() as u64;
+    if n == 0 {
+        return (input.to_string(), 0);
+    }
+    *hits.entry(mode.to_string()).or_insert(0) += n;
+    (re.replace_all(input, regex::NoExpand(&format!("[REDACTED:{mode}]"))).to_string(), n)
+}
+
+/// 末锚点签名段提取(V-1)
+///
+/// 输入为 server `/anchors` 响应(`{count, anchors: [...]}`)或 anchors 数组本体;
+/// 返回 (链头, 末锚点段)。无锚点/字段缺失 → (None, None)——诚实降级,不虚构。
+fn anchor_endorsement_of(
+    anchors: Option<&Value>,
+) -> (Option<String>, Option<AtifAnchorEndorsement>) {
+    let arr = anchors
+        .map(|v| {
+            v.get("anchors")
+                .and_then(|a| a.as_array())
+                .cloned()
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let last = match arr.last() {
+        Some(a) => a,
+        None => return (None, None),
+    };
+    let chain_head = last
+        .get("chain_head")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let endorsement = AtifAnchorEndorsement {
+        anchor_format: "evorule-anchor/1".to_string(),
+        seq: last.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
+        fact_range: [
+            last.pointer("/fact_range/lo").and_then(|v| v.as_u64()).unwrap_or(0),
+            last.pointer("/fact_range/hi").and_then(|v| v.as_u64()).unwrap_or(0),
+        ],
+        key_id: last
+            .get("key_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        engine_id: last
+            .get("engine_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        anchor_hash: last
+            .get("anchor_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        signature: last
+            .get("signature")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    };
+    (chain_head, Some(endorsement))
 }
 
 /// 首个 react llm_called 的 model(root.agent.model_name)
@@ -1326,6 +1521,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         assert!(export(src).is_err());
     }
@@ -1419,6 +1615,7 @@ mod tests {
             audit_facts: &audit,
             tool_definitions: tools,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.schema_version, "ATIF-v1.8");
@@ -1520,6 +1717,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         // 步:system + user + agent(transcript 无对位 assistant 回退 journal 摘要?有 asst idx1 → 对位)
@@ -1633,6 +1831,7 @@ mod tests {
             audit_facts: &audit,
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         let agent_steps: Vec<&AtifStep> = t.steps.iter().filter(|s| s.source == "agent").collect();
@@ -1690,6 +1889,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.steps.len(), 3, "system+user+agent,sidecar 不成步");
@@ -1736,6 +1936,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         // system + user + agent + compaction-system
@@ -1784,6 +1985,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         // system + user + i2_scan_report-system(turn 内无 LLM 步,agent 步不产生)
@@ -1834,6 +2036,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         // system + user + wire_rendered-system(turn 内无 LLM 步,agent 步不产生)
@@ -1894,6 +2097,7 @@ mod tests {
             audit_facts: &audit,
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         let a = t.steps.last().unwrap();
@@ -1948,6 +2152,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.steps.len(), 3, "crash 截断:后续 turn_started 不入步");
@@ -2019,6 +2224,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.steps.len(), 5, "两段都入步:system+崩溃前 2 步+续接 2 步");
@@ -2075,6 +2281,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.steps.len(), 3, "system+user+agent 三步,重试事件不产生步");
@@ -2134,6 +2341,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = export(src).unwrap();
         let a = t.steps.last().unwrap();
@@ -2145,6 +2353,97 @@ mod tests {
     }
 
     #[test]
+    // ===== V-1:锚点背书+脱敏器 =====
+
+    #[test]
+    fn v1_anchor_endorsement_extracted() {
+        // server /anchors 响应 → extra.audit_anchor + audit_chain_head
+        let anchors = serde_json::json!({
+            "count": 2,
+            "anchors": [
+                {"seq": 0, "fact_range": {"lo": 0, "hi": 5}, "chain_head": "aa",
+                 "key_id": "k1", "engine_id": "eng", "anchor_hash": "h0", "signature": "s0"},
+                {"seq": 1, "fact_range": {"lo": 5, "hi": 7}, "chain_head": "bb",
+                 "key_id": "k1", "engine_id": "eng", "anchor_hash": "h1", "signature": "s1"}
+            ]
+        });
+        let (head, endo) = anchor_endorsement_of(Some(&anchors));
+        assert_eq!(head.as_deref(), Some("bb"), "链头必须取末锚点");
+        let e = endo.expect("末锚点段必须在");
+        assert_eq!(e.seq, 1);
+        assert_eq!(e.fact_range, [5, 7]);
+        assert_eq!(e.signature, "s1");
+        assert_eq!(e.anchor_format, "evorule-anchor/1");
+    }
+
+    #[test]
+    fn v1_anchor_none_when_absent() {
+        assert!(anchor_endorsement_of(None).0.is_none());
+        assert!(anchor_endorsement_of(None).1.is_none());
+        let empty = serde_json::json!({"count": 0, "anchors": []});
+        assert!(anchor_endorsement_of(Some(&empty)).1.is_none());
+    }
+
+    #[test]
+    fn v1_sanitize_catches_secrets() {
+        let mut hits = std::collections::BTreeMap::new();
+        let (out, n) = sanitize_text(
+            "call with sk-abcdefghijklmnopqrstuvwx and Bearer abcdef0123456789abcdef",
+            &mut hits,
+        );
+        assert!(out.contains("[REDACTED:sk-token]"), "out={out}");
+        assert!(out.contains("[REDACTED:bearer]"), "out={out}");
+        assert_eq!(n, 2);
+        assert_eq!(hits.get("sk-token"), Some(&1));
+    }
+
+    #[test]
+    fn v1_sanitize_clean_text_untouched() {
+        let mut hits = std::collections::BTreeMap::new();
+        let (out, n) = sanitize_text("普通正文,无秘密", &mut hits);
+        assert_eq!(out, "普通正文,无秘密");
+        assert_eq!(n, 0);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn v1_export_sanitizes_end_to_end() {
+        // 端到端:transcript 含 sk- 秘密 → 导出全文本零漏出 + sanitized 落账
+        let mut j = JFix::new();
+        j.push(JE::TurnStarted { turn_seq: 1, goal: "g".into() });
+        j.push(JE::TurnEnded { status: "success".into(), steps: 1, duration_ms: 1 });
+        let transcript = vec![
+            msg(0, "system", "sys"),
+            msg(1, "user", "key is sk-abcdefghijklmnopqrstuvwx ok?"),
+        ];
+        let src = AtifSources {
+            session_id: "s",
+            journal: &j.lines,
+            transcript: &transcript,
+            audit_facts: &[],
+            tool_definitions: None,
+            parent_session_id: None,
+            audit_anchors: None,
+        };
+        let t = export(src).expect("导出须成功");
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("sk-abcdefghijklmnopqrstuvwx"), "秘密漏出!");
+        assert!(json.contains("[REDACTED:sk-token]"));
+        let sani = t.extra.sanitized.expect("脱敏报告须在");
+        assert_eq!(sani.total_replaced, 1);
+    }
+
+    #[test]
+    fn v1_sanitize_seed_env_form() {
+        let mut hits = std::collections::BTreeMap::new();
+        let (out, n) = sanitize_text(
+            "EVORULE_ANCHOR_SEED=abababababababababababababababababababababababababababababababab",
+            &mut hits,
+        );
+        assert_eq!(n, 1);
+        assert!(out.contains("[REDACTED:"), "out={out}");
+    }
+
     fn export_is_byte_idempotent() {
         // 验收 #7:同 session 重导两次逐字节一致(exported_at 由 journal 尾 ts 派生)
         let mut j = JFix::new();
@@ -2178,6 +2477,7 @@ mod tests {
             audit_facts: &audit,
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let a = serde_json::to_string(&export(mk()).unwrap()).unwrap();
         let b = serde_json::to_string(&export(mk()).unwrap()).unwrap();
@@ -2266,6 +2566,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let t = serde_json::to_value(export(mk()).unwrap()).unwrap();
         let serialized = serde_json::to_string(&t).unwrap();
@@ -2287,6 +2588,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            audit_anchors: None,
         };
         let a = serde_json::to_value(export(mk()).unwrap()).unwrap();
         let b = serde_json::to_value(export(mk2()).unwrap()).unwrap();
@@ -2318,6 +2620,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: parent,
+            audit_anchors: None,
         };
         let with_parent =
             serde_json::to_value(export(mk(Some("parent-3".into()))).unwrap()).unwrap();

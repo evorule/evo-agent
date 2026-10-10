@@ -973,6 +973,33 @@ impl EvoruleApiClient {
     // 导出只读；导入破坏性（完全覆盖目标会话审计链），由调用方把守授权。
     // =========================================================================
 
+    /// GET /api/sessions/{id}/anchors —— 已封审计锚点列表（server ≥0.9.2）
+    ///
+    /// 返回 `{session_id, count, anchors: [...]}`；空列表或 404（旧 server 无此
+    /// 端点/未启用锚点链）均降级为 None——锚点属增强背书，缺失不构成导出失败。
+    pub async fn get_anchors(&self, session_id: &str) -> Result<Option<Value>, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/anchors",
+            self.core.base_url(),
+            session_id
+        );
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        self.core.check_response(&resp).await?;
+        let v: Value = resp.json().await.map_err(|_| ApiError::InvalidResponse)?;
+        // count=0 视同无锚点（统一 None 语义：调用方零分支）
+        if v.get("count").and_then(|c| c.as_u64()).unwrap_or(0) == 0 {
+            return Ok(None);
+        }
+        Ok(Some(v))
+    }
+
     /// GET /api/sessions/{id}/audit/export —— 审计链导出（JSON 全文）
     ///
     /// 返回审计链 JSON（导出前 server 先审计新事实，含最新条目）。

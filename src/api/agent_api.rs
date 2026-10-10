@@ -1652,6 +1652,13 @@ async fn get_atif(
             )
         })?;
 
+    // 2b. 审计锚点(V-1:server ≥0.9.2;旧 server/未启用 → None 诚实降级)
+    let audit_anchors = state
+        .evorule_client()
+        .get_anchors(&session_id)
+        .await
+        .unwrap_or(None);
+
     // 3. transcript 消息投影
     let namespace = resolve_memory_namespace(&state, &agent_type);
     let transcript =
@@ -1682,6 +1689,7 @@ async fn get_atif(
         // 单会话端点不做父链路反查(父 journal 扫描属批量面);子轨迹
         // 带链路标注走 journal::scan_delegate_spawns 发现+离线导出
         parent_session_id: None,
+        audit_anchors: audit_anchors.as_ref(),
     };
     let trajectory = crate::agent::atif::export(sources)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
