@@ -16,6 +16,10 @@ Configuration (constructor kwargs override environment variables):
   (default ``tb-agent``).
 - ``timeout_secs`` / ``EVO_AGENT_TIMEOUT_SECS``: HTTP timeout for a full
   task run (default 3600).
+- ``execution_mode`` / ``EVO_AGENT_EXECUTION_MODE``: optional execution
+  mode forwarded in the run request (``plan_execute`` routes the run
+  through the engine's outer plan-execute driver loop; unset/``react``
+  keeps the default single-agent ReAct path).
 
 Per-task rule declaration (optional; disabled unless ``rules_dir`` is set):
 
@@ -74,6 +78,10 @@ class EvoRuleAgent(BaseAgent):
                 "timeout_secs", os.environ.get("EVO_AGENT_TIMEOUT_SECS", "3600")
             )
         )
+        execution_mode = kwargs.get(
+            "execution_mode", os.environ.get("EVO_AGENT_EXECUTION_MODE")
+        )
+        self._execution_mode = str(execution_mode) if execution_mode else None
         rules_dir = kwargs.get("rules_dir", os.environ.get("EVO_AGENT_RULES_DIR"))
         self._rules_dir = str(rules_dir) if rules_dir else None
         self._evorule_server_url = str(
@@ -315,13 +323,16 @@ class EvoRuleAgent(BaseAgent):
                 )
 
         try:
+            payload = {
+                "agent_type": self._agent_type,
+                "goal": instruction,
+                "container": container_name,
+            }
+            if self._execution_mode:
+                payload["execution"] = {"mode": self._execution_mode}
             response = requests.post(
                 f"{self._server_url}/agents/{self._agent_type}/run",
-                json={
-                    "agent_type": self._agent_type,
-                    "goal": instruction,
-                    "container": container_name,
-                },
+                json=payload,
                 timeout=self._timeout_secs,
             )
             response.raise_for_status()
