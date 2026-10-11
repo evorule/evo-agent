@@ -25,6 +25,7 @@ use crate::agent::approval::{
 };
 use crate::agent::callback::CallbackChain;
 use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
+use crate::agent::journal::REWIND_BUDGET_LIMIT;
 
 /// F-302:组装策略版本——组装行为(分层方式/预算口径/记忆注入)的协议级版本标识。
 /// 版本变更=组装行为变更=历史重建需切版本（RL-B3 落地）。
@@ -2443,7 +2444,7 @@ impl AgentRunner {
         // 重试=不可终止回退循环。预算熔断后走 Error 收尾路径(flush/sediment/
         // tool_traces/error 结果),fail-visible 不静默。重置语义:任意非 Error
         // 事件(正常推进)即清零——只惩罚"连续"失败,不惩罚间歇错误。
-        let mut rewind_budget = RewindBudget::new(32);
+        let mut rewind_budget = RewindBudget::new(REWIND_BUDGET_LIMIT);
         while let Some(event) = event_stream.next().await {
             // G6:取消检查(event 边界 — 即使 LLM 调用已返回,也在此处响应取消)
             if self.cancel_token.is_cancelled() {
@@ -2658,7 +2659,7 @@ impl AgentRunner {
                 }
                 "StateTransition" => {
                     info!(%session_id, "State transition occurred");
-                    rewind_budget.reset(32); // H1:正常推进即清零(只罚连续失败)
+                    rewind_budget.reset(REWIND_BUDGET_LIMIT); // H1:正常推进即回满(只罚连续失败)
                 }
                 "Error" => {
                     let error_msg = event
@@ -5458,6 +5459,9 @@ impl AgentRunner {
                     let mut messages: Vec<Message> = Vec::new();
                     let mut step_count = 0;
                     let mut tool_calls: Vec<String> = Vec::new();
+                    // H1 护栏跨重启连续:崩溃恢复分支重放回填的回退预算余额
+                    // (None=非恢复路径或无从回填,按满额起算)
+                    let mut resume_rewind_remaining: Option<u32> = None;
 
                     if existing_session_id.is_some() {
                         // G15:continuation — 从 evorule payload 加载历史消息(best-effort)
@@ -5502,6 +5506,11 @@ impl AgentRunner {
                                             .read_lines()
                                             .map(|ls| ls.last().map(|l| l.seq).unwrap_or(0))
                                             .unwrap_or(0);
+                                        // H1 护栏跨重启连续:重放回填回退预算余额
+                                        // (替换旧 runaway_counters:reset 语义——护栏
+                                        // 计数不因进程边界清零,重启不可绕过护栏)
+                                        let rewind_remaining = j.replay_rewind_budget_remaining();
+                                        resume_rewind_remaining = Some(rewind_remaining);
                                         if let Err(e) = j.session_resumed(
                                             replay_seq,
                                             vec![
@@ -5511,7 +5520,7 @@ impl AgentRunner {
                                                     report.dangling, report.reexecuted, report.observed
                                                 ),
                                                 "pending_approvals:lost".to_string(),
-                                                "runaway_counters:reset".to_string(),
+                                                format!("rewind_budget:remaining={rewind_remaining}"),
                                             ],
                                         ) {
                                             warn!(%session_id, error = %e, "crash recovery: resumed marker write failed");
@@ -5630,7 +5639,11 @@ impl AgentRunner {
                     // 连续 Error→auto_rewind→continue 回退预算(非流式
                     // run() 同款镜像)——rewind 不计步的无界回退循环在此封顶。重置语义:
                     // 任意非 Error 事件(正常推进)即清零,只惩罚连续失败。
-                    let mut rewind_budget = RewindBudget::new(32);
+                    // 崩溃恢复时按 journal 末次余额回填(H1 护栏跨重启连续)。
+                    let mut rewind_budget = match resume_rewind_remaining {
+                        Some(r) => RewindBudget::restored(r),
+                        None => RewindBudget::new(REWIND_BUDGET_LIMIT),
+                    };
                     loop {
                         let event = tokio::select! {
                             ev = event_stream.next() => match ev {
@@ -6883,7 +6896,7 @@ impl AgentRunner {
                             }
                             "StateTransition" => {
                                 // 状态转换,继续循环
-                                rewind_budget.reset(32); // H1:正常推进即清零(只罚连续失败)
+                                rewind_budget.reset(REWIND_BUDGET_LIMIT); // H1:正常推进即回满(只罚连续失败)
                             }
                             "Error" => {
                                 let msg = event.payload.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
@@ -6891,6 +6904,19 @@ impl AgentRunner {
                                 // 尝试 auto_rewind
                                 if let Ok(rewind_version) = runner.auto_rewind(&session_id).await {
                                     if rewind_budget.consume() {
+                                        // H1:护栏跨重启连续——消费落账(余额快照),
+                                        // 崩溃恢复重放回填,护栏计数不因进程边界清零
+                                        if let Some(j) = journal.as_ref() {
+                                            if let Err(e) = j
+                                                .rewind_budget_consumed(rewind_budget.remaining)
+                                            {
+                                                tracing::warn!(
+                                                    session_id = %session_id,
+                                                    error = %e,
+                                                    "rewind_budget_consumed journal failed"
+                                                );
+                                            }
+                                        }
                                         yield Ok(AgentEvent::Info(format!("Auto-rewind to version {}", rewind_version)));
                                         continue;
                                     }
@@ -7040,8 +7066,9 @@ pub fn merge_delegate_tool(
 /// 语义:Error 事件调用 `consume()`——预算>0 递减返回 true(允许 rewind+continue);
 /// 预算耗尽返回 false(熔断:走 Error 收尾路径 fail-visible,不静默)。任意非 Error
 /// 事件(正常推进,如 StateTransition)调用 `reset()` 回满——只惩罚"连续"失败,
-/// 不惩罚间歇错误。默认 32(与 retry 生态上限同量级;非配置面——引擎侧熔断属
-/// 可靠性底线,不交由 agent 配置放开)。
+/// 不惩罚间歇错误。默认 REWIND_BUDGET_LIMIT=32(与 retry 生态上限同量级;非配置面
+/// ——引擎侧熔断属可靠性底线,不交由 agent 配置放开)。崩溃恢复时经 `restored()`
+/// 按 journal 末次余额回填(护栏跨重启连续,重启不可绕过护栏)。
 #[derive(Debug)]
 struct RewindBudget {
     remaining: u32,
@@ -7050,6 +7077,11 @@ struct RewindBudget {
 impl RewindBudget {
     fn new(limit: u32) -> Self {
         Self { remaining: limit }
+    }
+
+    /// 崩溃恢复回填:按 journal 末次 RewindBudgetConsumed 余额恢复
+    fn restored(remaining: u32) -> Self {
+        Self { remaining }
     }
 
     /// Error 事件消费一份预算;返回是否仍允许 rewind+continue

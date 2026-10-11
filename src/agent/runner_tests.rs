@@ -3695,6 +3695,22 @@ fn test_rewind_budget_intermittent_errors_never_exhaust() {
     }
 }
 
+#[test]
+fn test_rewind_budget_restored_from_journal_balance() {
+    // 崩溃恢复回填(H1 护栏跨重启连续):按 journal 末次余额续算,不回满
+    // ——重启不重置护栏,余额内放行,耗尽即熔断
+    let mut b = RewindBudget::restored(5);
+    assert_eq!(b.remaining, 5);
+    for i in 0..5 {
+        assert!(b.consume(), "恢复后第 {} 次须放行(余额内)", i + 1);
+    }
+    assert!(!b.consume(), "恢复余额耗尽即熔断——重启不可绕过护栏");
+    // 回满路径:恢复后正常推进 reset(REWIND_BUDGET_LIMIT) 复活
+    b.reset(REWIND_BUDGET_LIMIT);
+    assert!(b.consume(), "回满后复活");
+    assert_eq!(b.remaining, REWIND_BUDGET_LIMIT - 1);
+}
+
 // ===== 会话即时终止面 =====
 
 /// 轮错误收尾中断面 fail-soft 契约:client 失败(此处不可达端口)不冒泡不 panic;
