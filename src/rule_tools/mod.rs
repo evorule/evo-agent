@@ -6,8 +6,9 @@
 //!
 //! 组装结构（理顺批 P1 适配器化后）：
 //! - 49 个纯透传工具 → `adapter` 表驱动（ALL_TRANSPARENT_BINDINGS 声明式映射）；
-//! - 6 个本地逻辑工具（audit_verify / bundle_export / skill_pack_to_bundle /
-//!   meta_summary / evolution_signals / rule_promote）→ `local_handlers` 统一外置；
+//! - 7 个本地逻辑工具（audit_verify / bundle_export / skill_pack_to_bundle /
+//!   meta_summary / evolution_signals / rule_promote / verdict_submit）→
+//!   `local_handlers` 统一外置；
 //! - 3 个查账 why/order 工具（explain_denial / causal_order / lineage_of，
 //!   PR-11b）→ `why_tools`（因果查询面，只读）。
 
@@ -20,7 +21,7 @@ use crate::api::workspace_client::WorkspaceApiClient;
 use crate::builtin_tools::ToolSpec;
 use crate::io_handlers::tool_handler::ToolHandler;
 
-/// 组装完整规则工具集（透传 49 + 本地逻辑 6 + why/order 3 = 58 工具）
+/// 组装完整规则工具集（透传 49 + 本地逻辑 7 + why/order 3 = 59 工具）
 pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> ToolHandler {
     let mut h = ToolHandler::new();
     adapter::register_bindings(&mut h, ws, ev, adapter::ALL_TRANSPARENT_BINDINGS);
@@ -29,7 +30,7 @@ pub fn full_rule_toolkit(ws: &WorkspaceApiClient, ev: &EvoruleApiClient) -> Tool
     h
 }
 
-/// 全部规则工具 spec（58 个）
+/// 全部规则工具 spec（59 个）
 pub fn rule_tool_specs() -> Vec<ToolSpec> {
     let mut specs = adapter::specs_from(adapter::ALL_TRANSPARENT_BINDINGS);
     specs.extend(local_handlers::specs());
@@ -44,7 +45,7 @@ mod tests {
     #[test]
     fn test_rule_tool_specs_count() {
         let specs = rule_tool_specs();
-        assert_eq!(specs.len(), 58, "expected 58 rule tool specs");
+        assert_eq!(specs.len(), 59, "expected 59 rule tool specs");
     }
 
     #[test]

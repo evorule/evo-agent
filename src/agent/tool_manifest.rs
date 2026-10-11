@@ -475,7 +475,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
     .collect()
 }
 
-/// 规则治理写族（agentTools.governanceWrite 单键管全量，21 个）
+/// 规则治理写族（agentTools.governanceWrite 单键管全量，22 个）
 const GOVERNANCE_WRITE_TOOLS: &[&str] = &[
     "rule_create",
     "rule_update",
@@ -486,6 +486,7 @@ const GOVERNANCE_WRITE_TOOLS: &[&str] = &[
     "rule_fork",
     "rule_reload",
     "rule_promote",
+    "verdict_submit",
     "ws_create",
     "sandbox_start",
     "sandbox_close",
@@ -512,6 +513,7 @@ const RULE_P2_ADJUDICATED_TOOLS: &[&str] = &[
     "rule_fork",
     "rule_reload",
     "rule_promote",
+    "verdict_submit",
     "ws_create",
     "sandbox_start",
     "sandbox_close",
@@ -524,7 +526,7 @@ const RULE_P2_ADJUDICATED_TOOLS: &[&str] = &[
     "bundle_import",
 ];
 
-/// 规则工具 manifest（58 条 = 透传 49 + 本地逻辑 6 + why/order 3，名称集合与
+/// 规则工具 manifest（59 条 = 透传 49 + 本地逻辑 7 + why/order 3，名称集合与
 /// rule_tool_specs() 相等——测试锁）
 fn rule_manifests() -> Vec<ToolManifest> {
     let mut manifests: Vec<ToolManifest> = crate::rule_tools::adapter::ALL_TRANSPARENT_BINDINGS
@@ -546,7 +548,7 @@ fn rule_manifests() -> Vec<ToolManifest> {
             m
         })
         .collect();
-    // 本地逻辑 6（rule_tools::local_handlers::register 的注册名）
+    // 本地逻辑 7（rule_tools::local_handlers::register 的注册名）
     for name in [
         "audit_verify",
         "bundle_export",
@@ -554,6 +556,7 @@ fn rule_manifests() -> Vec<ToolManifest> {
         "meta_summary",
         "evolution_signals",
         "rule_promote",
+        "verdict_submit",
     ] {
         let mut m = base(
             name,
@@ -776,9 +779,10 @@ mod tests {
         //   自主交接 PR-H3 session_spawn +1：内置 22→23，数量锁 76→77；
         //   账本记忆收口（ai/queue14 合并）：memory_link +1、memory_forget +1
         //   → memory 4→6，数量锁 77→79）
+        //   （判定事实治理登记批：verdict_submit +1，规则 58→59，数量锁 88→89）
         assert_eq!(builtin_manifests().len(), 23);
-        assert_eq!(rule_manifests().len(), 58);
-        assert_eq!(all().len(), 88);
+        assert_eq!(rule_manifests().len(), 59);
+        assert_eq!(all().len(), 89);
     }
 
     #[test]
@@ -909,6 +913,7 @@ mod tests {
         "rule_fork",
         "rule_reload",
         "rule_promote",
+        "verdict_submit",
         "ws_create",
         "sandbox_start",
         "sandbox_close",
@@ -988,6 +993,7 @@ mod tests {
         ("rule_fork", "agentTools.governanceWrite", true),
         ("rule_reload", "agentTools.governanceWrite", true),
         ("rule_promote", "agentTools.governanceWrite", true),
+        ("verdict_submit", "agentTools.governanceWrite", true),
         ("ws_create", "agentTools.governanceWrite", true),
         ("sandbox_start", "agentTools.governanceWrite", true),
         ("sandbox_close", "agentTools.governanceWrite", true),
