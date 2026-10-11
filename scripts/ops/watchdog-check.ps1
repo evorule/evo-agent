@@ -49,6 +49,46 @@ try {
             Write-OpsLog -LogDir $cfg.log_dir -Message "[watchdog] 北极星巡检执行异常: $($_.Exception.Message)"
         }
     }
+
+    # main CI 红巡检触点（2026-10-11 接线）：只核对告警不做修复。30 分钟节流
+    # （GitHub 匿名 API 限额 60 次/时，两仓各一次远低于限额），覆盖写
+    # last-ci-status.txt（现态可查不刷日志），有红另记 watchdog.log。
+    # PENDING/UNKNOWN/无 check runs 均不告警（push 窗口与网络抖动不当红处理）。
+    $ciMarker = Join-Path $cfg.log_dir 'last-ci-check.txt'
+    $ciDue = $true
+    if (Test-Path $ciMarker) {
+        try { $ciDue = ((Get-Date).Ticks - [int64](Get-Content $ciMarker)) -ge 18000000000 } catch { $ciDue = $true }
+    }
+    if ($ciDue) {
+        Set-Content -Path $ciMarker -Value (Get-Date).Ticks -Encoding UTF8
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+        $ciLines = @()
+        $ciRed = $false
+        foreach ($repo in @('evorule/evorule', 'evorule/evo-agent')) {
+            $state = 'UNKNOWN'; $detail = ''
+            try {
+                $cr = Invoke-RestMethod -Uri ("https://api.github.com/repos/{0}/commits/main/check-runs" -f $repo) -TimeoutSec 20
+                $runs = @($cr.check_runs)
+                $bad = @($runs | Where-Object { $_.conclusion -eq 'failure' })
+                $running = @($runs | Where-Object { -not $_.conclusion })
+                if ($bad.Count -gt 0) {
+                    $state = 'FAIL'; $detail = ($bad | ForEach-Object { $_.name }) -join ', '
+                } elseif ($running.Count -gt 0) {
+                    $state = 'PENDING'; $detail = ($running | ForEach-Object { $_.name }) -join ', '
+                } elseif ($runs.Count -eq 0) {
+                    $state = 'NONE'; $detail = 'no check runs on main'
+                } else {
+                    $state = 'PASS'; $detail = ('{0} checks all success' -f $runs.Count)
+                }
+            } catch { $state = 'UNKNOWN'; $detail = $_.Exception.Message }
+            $ciLines += ('{0} = {1} ({2})' -f $repo, $state, $detail)
+            if ($state -eq 'FAIL') { $ciRed = $true }
+        }
+        Set-Content -Path (Join-Path $cfg.log_dir 'last-ci-status.txt') -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + "`r`n" + ($ciLines -join "`r`n")) -Encoding UTF8
+        if ($ciRed) {
+            Write-OpsLog -LogDir $cfg.log_dir -Message '[watchdog] main CI 红——详见 last-ci-status.txt'
+        }
+    }
 } finally {
     if ($created) { $mutex.ReleaseMutex() | Out-Null }
     $mutex.Dispose()
