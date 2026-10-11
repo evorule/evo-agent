@@ -1953,7 +1953,7 @@ impl AgentRunner {
     /// B21 D3 主动 compaction:阈值驱动的窗口压力管理(被动 trim 的前置层)。
     ///
     /// 触发:本轮 LLM 调用前,上下文用量(count)≥ 窗口×thresholdPct 时执行。
-    /// 动作(21 号 D3):①近摘要区 = system 前缀 + 最近
+    /// 动作(设计 D3):①近摘要区 = system 前缀 + 最近
     /// [`COMPACTION_KEEP_ROUNDS`] 轮之外的全部消息;②近摘要区滚动摘要
     /// (purpose=compaction,经 audited_llm 留痕,复用保真对照+记忆落链);
     /// ③区内大块工具结果原文以 `[cleared: 工具名]` 引用替代(按原文长度
@@ -7225,7 +7225,7 @@ impl RewindBudget {
     }
 }
 
-/// B21 D3:主动压缩保留轮数(21 号设计 N=6 默认,非配置面——压缩窗口结构
+/// B21 D3:主动压缩保留轮数(设计默认 N=6,非配置面——压缩窗口结构
 /// 参数,与 rewind 预算同属可靠性底线)
 const COMPACTION_KEEP_ROUNDS: usize = 6;
 
