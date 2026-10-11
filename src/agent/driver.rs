@@ -1069,6 +1069,7 @@ pub async fn run_plan_execute(
     max_concurrent: usize,
     container: Option<String>,
     resume_session: Option<&str>,
+    step_timeout_override: Option<std::time::Duration>,
 ) -> Result<(PlanLoopOutcome, String), String> {
     let sessions_dir = workdir.join("data").join("sessions");
     // 恢复装配:回放最新计划检查点+其后检查点尾段;锚不齐/blob 缺失/hash
@@ -1148,7 +1149,8 @@ pub async fn run_plan_execute(
         .with_toolkit(toolkit, workdir)
         .with_max_depth(max_depth)
         .with_journal_dir(sessions_dir)
-        .with_governance_segment(governance_segment);
+        .with_governance_segment(governance_segment)
+        .with_step_timeout_override(step_timeout_override);
     if max_concurrent > 0 {
         ctx = ctx.with_max_concurrent_delegates(max_concurrent);
     }

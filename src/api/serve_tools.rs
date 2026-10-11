@@ -1914,7 +1914,7 @@ service_tools = ["config_persist", "rule_sandbox"]
                 "filtered copy must execute through the docker backend: {v}"
             ),
             Err(e) => {
-                let msg = format!("{e}");
+                let msg = e.to_string();
                 assert!(
                     msg.contains("failed to spawn 'docker'"),
                     "host-side program must be the docker CLI (backend inherited), got: {msg}"
