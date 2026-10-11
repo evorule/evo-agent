@@ -28,10 +28,10 @@ try {
 
     # 北极星部署态巡检门禁（2026-10-11 接线）：只巡检告警不做拉起（服务探活由上方循环负责）。
     # 每次覆盖写 last-patrol-status.txt（现态可查不刷日志），FAIL 另记 watchdog.log。
-    $G1Dir = 'D:\knowledge\参赛\专项\G1-适配器'
-    $patrol = Join-Path $G1Dir 'northstar_patrol.py'
-    if (Test-Path $patrol) {
-        $py = Join-Path $G1Dir '.venv\Scripts\python.exe'
+    # 巡检件目录由本地配置提供（ops.local.json g1_adapter_dir，不入库）——公开仓不落私有路径。
+    $patrol = if ($cfg.g1_adapter_dir) { Join-Path $cfg.g1_adapter_dir 'northstar_patrol.py' } else { $null }
+    if ($patrol -and (Test-Path $patrol)) {
+        $py = Join-Path $cfg.g1_adapter_dir '.venv\Scripts\python.exe'
         if (-not (Test-Path $py)) { $py = 'python' }
         try {
             # 任务上下文无 PYTHONUTF8，管道输出退回 GBK——自检子件含 ↔/✓ 等字符即 UnicodeEncodeError 崩溃，统一 UTF-8。
