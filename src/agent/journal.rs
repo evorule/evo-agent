@@ -41,6 +41,10 @@ pub fn evorule_digest(s: &str) -> String {
 /// 不膨胀口径)
 pub const CHECKPOINT_INLINE_LIMIT: usize = 4096;
 
+/// H1 连续 Error→auto_rewind 回退预算上限(护栏跨重启连续的唯一权威值:
+/// 运行侧 new/reset 与恢复侧回填共用,防两处硬编码漂移)
+pub const REWIND_BUDGET_LIMIT: u32 = 32;
+
 /// 粒级检查点的结果引用(≤ 阈值内联直存;超限 inline 缺省即 None,
 /// 全文在同账本 checkpoint_blob 事件,按 node_id+hash 配对检索)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,6 +419,15 @@ pub enum JournalEvent {
         /// 熔断判据(确定性:轮数/同签名计数/预算/深度)
         reason: String,
     },
+    /// 回退预算消费落账(H1 连续 Error→auto_rewind 预算,护栏跨重启连续):
+    /// 每次 rewind 消费成功后落账,携带消费后余额。崩溃恢复时重放本事件
+    /// 回填预算(护栏计数不因进程边界清零);其余事件为消费后正常推进的
+    /// 连续性断裂证据(见 replay_rewind_budget_remaining)。观测面,不参与
+    /// 步映射。
+    RewindBudgetConsumed {
+        /// 消费后剩余预算
+        remaining: u32,
+    },
 }
 
 /// 单行 journal 记录(读侧重放消费形态)
@@ -649,6 +662,33 @@ impl JournalWriter {
     /// 读取失败如实上抛(调用方 best-effort 降级)。
     pub fn read_lines(&self) -> Result<Vec<JournalLine>, JournalError> {
         read_all(&self.file_path)
+    }
+
+    /// 崩溃恢复的回退预算回填(H1 护栏跨重启连续):取末次 RewindBudgetConsumed
+    /// 余额;其后若出现任何实质推进事件(新轮/成功 LLM 调用/工具/审批/轮收尾
+    /// 等,见 is_progress_event)则连续失败链已断,回满。无记录或读取失败=无从
+    /// 回填,回满(护栏宁可宽松,不误伤正常恢复)。
+    pub fn replay_rewind_budget_remaining(&self) -> u32 {
+        let lines = match self.read_lines() {
+            Ok(l) => l,
+            Err(_) => return REWIND_BUDGET_LIMIT,
+        };
+        let mut last_remaining: Option<u32> = None;
+        let mut progressed_after = false;
+        for l in &lines {
+            match &l.event {
+                JournalEvent::RewindBudgetConsumed { remaining } => {
+                    last_remaining = Some(*remaining);
+                    progressed_after = false;
+                }
+                e if is_progress_event(e) => progressed_after = true,
+                _ => {}
+            }
+        }
+        match (last_remaining, progressed_after) {
+            (Some(r), false) => r,
+            _ => REWIND_BUDGET_LIMIT,
+        }
     }
 
     /// 会话 journal 文件路径(`{dir}/{session_id}.jsonl`,session_id 消毒防路径注入)
@@ -985,6 +1025,13 @@ impl JournalWriter {
         self.push(JournalEvent::I2ScanReport { round, conflicts })
     }
 
+    /// H1 回退预算消费落账(护栏跨重启连续):rewind 消费成功后调用,
+    /// remaining 为消费后余额(与运行日志 info! 同点,崩溃窗口的末次
+    /// 消耗可能未及落账,账面 ≤ 实际消耗,如实口径)
+    pub fn rewind_budget_consumed(&self, remaining: u32) -> Result<u64, JournalError> {
+        self.push(JournalEvent::RewindBudgetConsumed { remaining })
+    }
+
     /// 审批请求开启
     pub fn approval_requested(
         &self,
@@ -1146,6 +1193,35 @@ impl JournalWriter {
             task_digest: task_digest.to_string(),
         })
     }
+}
+
+/// 实质推进事件判据(H1 回退预算连续性):末次预算消费之后出现本集合事件
+/// 即说明有正常轮转,连续失败链已断,恢复时预算回满。观测面事件(WireRendered/
+/// ToolRetried/RecallSet/SessionCrashed 等)不算推进——它们不构成「连续失败
+/// 链断裂」的证据。口径注记:H1 运行态回满条件为 StateTransition,journal
+/// 无该事件,以成功轮转事件近似(偏松方向,不误伤正常恢复)。
+fn is_progress_event(e: &JournalEvent) -> bool {
+    matches!(
+        e,
+        JournalEvent::TurnStarted { .. }
+            | JournalEvent::LlmCalled { .. }
+            | JournalEvent::ToolInvoked { .. }
+            | JournalEvent::ToolResult { .. }
+            | JournalEvent::NodeCheckpointed { .. }
+            | JournalEvent::CheckpointBlob { .. }
+            | JournalEvent::PlanLoopCheckpointed { .. }
+            | JournalEvent::PlanLoopFinished { .. }
+            | JournalEvent::ApprovalRequested { .. }
+            | JournalEvent::ApprovalResolved { .. }
+            | JournalEvent::PolicyJudged { .. }
+            | JournalEvent::CompactionPerformed { .. }
+            | JournalEvent::SedimentPerformed { .. }
+            | JournalEvent::TurnEnded { .. }
+            | JournalEvent::SessionResumed { .. }
+            | JournalEvent::SessionSpawned { .. }
+            | JournalEvent::HandoverWritten { .. }
+            | JournalEvent::DelegateSpawned { .. }
+    )
 }
 
 /// 委托树发现（纯函数）:单份 journal 内全部子代理委托锚,按 seq 升序。
@@ -2316,5 +2392,72 @@ mod tests {
         assert_eq!(found[1].child_session_id, "c2");
         assert!(found[0].seq < found[1].seq, "按 seq 升序");
         assert_eq!(scan_delegate_spawns(&[]).len(), 0, "空流=空清单");
+    }
+
+    #[test]
+    fn rewind_budget_consumed_event_roundtrip() {
+        // H1 护栏跨重启:消费事件落账读回,余额字段保真(多次消费取末次)
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let w = JournalWriter::open(dir.path(), "s-rewind-rt").unwrap();
+            w.rewind_budget_consumed(17).unwrap();
+            w.rewind_budget_consumed(3).unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(dir.path(), "s-rewind-rt")).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].event, JE::RewindBudgetConsumed { remaining: 17 });
+        assert_eq!(lines[1].event, JE::RewindBudgetConsumed { remaining: 3 });
+    }
+
+    #[test]
+    fn replay_rewind_budget_without_record_returns_full() {
+        // 无消费记录(纯正常轮转/空账)→ 回满:无从回填,护栏宁可宽松不误伤
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let w = JournalWriter::open(dir.path(), "s-rewind-full").unwrap();
+            let g = w.begin_turn("g").unwrap();
+            w.llm_called_react("m", None, None, Some(10), 1, "resp")
+                .unwrap();
+            g.end("success", 1, 10);
+        }
+        let r = JournalWriter::open(dir.path(), "s-rewind-full").unwrap();
+        assert_eq!(r.replay_rewind_budget_remaining(), REWIND_BUDGET_LIMIT);
+    }
+
+    #[test]
+    fn replay_rewind_budget_consumed_without_progress_returns_remaining() {
+        // 消费后进程死亡(其后无任何推进事件,直写 turn_started 模拟未收尾
+        // ——重开补写 SessionCrashed 标记,非推进事件)→ 回填末次余额
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let w = JournalWriter::open(dir.path(), "s-rewind-hold").unwrap();
+            w.push(JE::TurnStarted {
+                turn_seq: 1,
+                goal: "g".into(),
+            })
+            .unwrap();
+            w.rewind_budget_consumed(5).unwrap();
+            w.rewind_budget_consumed(2).unwrap();
+            // 模拟崩溃:turn 未收尾,写者直接 drop
+        }
+        let r = JournalWriter::open(dir.path(), "s-rewind-hold").unwrap();
+        assert_eq!(r.replay_rewind_budget_remaining(), 2);
+    }
+
+    #[test]
+    fn replay_rewind_budget_consumed_then_progress_returns_full() {
+        // 消费后正常推进(新一轮轮转:turn 开始/LLM 调用/收尾)→ 连续失败链
+        // 已断,恢复回满(与运行态 reset 语义同向)
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let w = JournalWriter::open(dir.path(), "s-rewind-progress").unwrap();
+            w.rewind_budget_consumed(2).unwrap();
+            let g = w.begin_turn("g").unwrap();
+            w.llm_called_react("m", None, None, Some(10), 1, "resp")
+                .unwrap();
+            g.end("success", 1, 10);
+        }
+        let r = JournalWriter::open(dir.path(), "s-rewind-progress").unwrap();
+        assert_eq!(r.replay_rewind_budget_remaining(), REWIND_BUDGET_LIMIT);
     }
 }
