@@ -52,22 +52,22 @@ const RULE_TOOL_NAMES: &[&str] = &[
     "audit_get",
     "audit_verify",
     "session_rewind",
-    // audit_export (1,39 号批 B4,只读;import 破坏性不上工具面)
+    // audit_export (1,只读;import 破坏性不上工具面)
     "audit_export",
     // knowledge_tools (3,只读消费面)
     "knowledge_datasets",
     "knowledge_search",
     "knowledge_entry_get",
-    // facts/version (1,39 号批 B5,只读并发核对面)
+    // facts/version (1,只读并发核对面)
     "facts_version",
-    // 事实追溯/启动回读 (2,39 号批 A2/A3,只读断头线接通)
+    // 事实追溯/启动回读 (2,只读断头线接通)
     "fact_used_by",
     "session_used_at_startup",
-    // debug 观测三件套 (3,39 号批 A4,只读;E-9 形态运行时观测面)
+    // debug 观测三件套 (3,只读;E-9 形态运行时观测面)
     "debug_phase",
     "debug_queue",
     "debug_pending_io",
-    // hit-stats 观测面 (2,39 号批 B3,只读)
+    // hit-stats 观测面 (2,只读)
     "hit_stats",
     "hit_stats_series",
     // bundles 部署闭环 (5,导入/导出/激活/清单)

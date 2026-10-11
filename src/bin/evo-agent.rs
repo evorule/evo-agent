@@ -531,7 +531,7 @@ fn cmd_run(
             .await
             .map(|r| {
                 r.with_capability_boundary(capability_boundary)
-                    // 条 5(25 号档):CLI run 主路径 delegate+journal 接线——serve 面
+                    // CLI run 主路径 delegate+journal 接线——serve 面
                     // (agent_api.rs run 端点)完整先例的镜像。此前 CLI 只接
                     // capability_boundary+wire_accounting:general.json 等声明了
                     // "delegate" 工具但执行能力未注册(tool_call 无处解析),

@@ -1965,9 +1965,9 @@ impl AgentRunner {
         });
     }
 
-    /// 会话即时终止面（39 号批 B1）：轮错误收尾路径 best-effort 中断 server 侧
+    /// 会话即时终止面：轮错误收尾路径 best-effort 中断 server 侧
     /// 反应器，不留「agent 已终、反应器空转到 TTL 收割」的悬挂会话（恢复模式
-    /// 断点续做场景的即时终止面——38 号档 B1）。fail-soft：中断失败仅 warn
+    /// 断点续做场景的即时终止面）。fail-soft：中断失败仅 warn
     /// 留痕，不阻塞错误上抛。
     async fn interrupt_evorule_session_best_effort(&self, session_id: &str) {
         if let Err(e) = self.evorule_client.interrupt_session(session_id).await {
@@ -1979,7 +1979,7 @@ impl AgentRunner {
         }
     }
 
-    /// 会话健康声明（39 号批 B2）：IO 契约协商+建会话后拉取一次语义不变量
+    /// 会话健康声明：IO 契约协商+建会话后拉取一次语义不变量
     /// 自检计数（三性面），违规非零即 warn 留痕——只声明不执法。fail-soft：
     /// 404/连不通（旧 server 无端点）仅 warn 通过，不阻塞会话。
     async fn log_session_invariants_best_effort(&self, session_id: &str) {
@@ -2438,7 +2438,7 @@ impl AgentRunner {
         .await?;
 
         info!(%session_id, "Starting SSE event loop");
-        // H1:连续 Error→auto_rewind→continue 回退预算(25 号档 H1【高】)。
+        // 连续 Error→auto_rewind→continue 回退预算(有界封顶)。
         // rewind 后 continue 不耗 step_count——引擎/网络持续 Error 时无界
         // 重试=不可终止回退循环。预算熔断后走 Error 收尾路径(flush/sediment/
         // tool_traces/error 结果),fail-visible 不静默。重置语义:任意非 Error
@@ -2451,7 +2451,7 @@ impl AgentRunner {
                 if let Err(e) = self.flush_messages(&session_id).await {
                     tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                 }
-                // 条 6(25 号档):取消路径补 sediment——代谢出口堵洞。已发生
+                // 取消路径补 sediment——代谢出口堵洞。已发生
                 // 的对话/事件/usage 不随取消流失(best-effort,与 Error 路径同款)
                 if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
                     tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
@@ -2741,7 +2741,7 @@ impl AgentRunner {
         if let Err(e) = self.flush_messages(&session_id).await {
             tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
         }
-        // 条 6(25 号档):断流路径补 sediment——网络/引擎断流不吞已捕获的
+        // 断流路径补 sediment——网络/引擎断流不吞已捕获的
         // 会话经验(与 Stable 正常收尾同款 best-effort)
         if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
             tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
@@ -5627,7 +5627,7 @@ impl AgentRunner {
                     // G6:用 select! 监听取消,使等待 event 时也能即时响应
                     let cancel_token = runner.cancel_token.clone();
                     let mut last_llm_content = String::new(); // 追踪最近一次 LLM 输出(Stable 时 fallback)
-                    // H1:连续 Error→auto_rewind→continue 回退预算(25 号档 H1【高】,非流式
+                    // 连续 Error→auto_rewind→continue 回退预算(非流式
                     // run() 同款镜像)——rewind 不计步的无界回退循环在此封顶。重置语义:
                     // 任意非 Error 事件(正常推进)即清零,只惩罚连续失败。
                     let mut rewind_budget = RewindBudget::new(32);
@@ -5642,7 +5642,7 @@ impl AgentRunner {
                                 if let Err(e) = runner.flush_messages(&session_id).await {
                                     tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                                 }
-                                // 条 6(25 号档):取消路径补 sediment(流式镜像)
+                                // 取消路径补 sediment(流式镜像)
                                 if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
                                     tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
                                 }
@@ -6955,7 +6955,7 @@ impl AgentRunner {
                     if let Err(e) = runner.flush_messages(&session_id).await {
                                     tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                                 }
-                    // 条 6(25 号档):断流路径补 sediment(流式镜像)
+                    // 断流路径补 sediment(流式镜像)
                     if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
                                     tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
                                 }
@@ -7034,7 +7034,7 @@ pub fn merge_delegate_tool(
     merged
 }
 
-/// H1:连续 Error→auto_rewind→continue 回退预算状态机(25 号档 H1【高】)。
+/// 连续 Error→auto_rewind→continue 回退预算状态机(有界封顶)。
 ///
 /// rewind 路径不耗 step_count——引擎/网络持续 Error 时无界回退循环在此封顶。
 /// 语义:Error 事件调用 `consume()`——预算>0 递减返回 true(允许 rewind+continue);

@@ -1,6 +1,6 @@
 //! 判据命令门卫(H2:judge 任意 shell 执行面封堵)。
 //!
-//! 背景(23 号档 H2【高·TB 参赛前必修】):planner LLM 产出的 PlanFact 节点
+//! 背景(TB 参赛前必修):planner LLM 产出的 PlanFact 节点
 //! judge.command 经物化器透传,`run_judge_command` 无 container 时宿主
 //! `sh -c`/`cmd /C` 直执行——提示注入→宿主任意命令。物化器对 type/agent_type/
 //! depends_on 有 J1-J7/C9 白名单,但 judge.command 是唯一未经校验直达宿主

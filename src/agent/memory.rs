@@ -1317,7 +1317,7 @@ impl MemoryManager {
         let mut record = MemoryRecord::new(key, value, timestamp);
         // F-609：生命周期落标——events 域=情景记忆 Captured；其余=Settled
         // （状态迁移=新增版本事实，不改写本字段；RL-A1）
-        // L1 修复(23 号档断点5):sediment 实写 key 形态=「events.{event_id}」(顶域,
+        // L1 修复:sediment 实写 key 形态=「events.{event_id}」(顶域,
         // 无前导点)——旧判 contains(".events.") 恒 False → 事件全被标 Settled,
         // 永远进不了晋升遍历。改为顶域判定:events. 开头(顶域形态)或含 .events.
         // (嵌套形态)均判情景域。单测用嵌套形态 mock 对上了实现、没对上真实写入方
@@ -3049,7 +3049,7 @@ impl MemoryManager {
         // 治理门路径:提议入账(资格凭据)成功才晋升+稳定副本;失败保持 Captured
         for (key, candidate) in &gated {
             let dataset = gate_dataset.as_deref().unwrap_or_default();
-            // L1 链路修复(23 号档 §二断点1):契约对齐 evorule-rule
+            // L1 链路修复:契约对齐 evorule-rule
             // ProposeKnowledgeEntryReq.entry(AddKnowledgeEntryReq)——必填
             // entry_id/version/payload/schema_ref;旧形态 {title,body,confidence}
             // 在 rule 侧反序列化即 400(missing field entry_id),治理门全程 404 级断链。

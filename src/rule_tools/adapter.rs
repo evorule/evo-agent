@@ -1402,7 +1402,7 @@ pub static KNOWLEDGE_ENTRY_GET: EndpointBinding = EndpointBinding {
 };
 
 // =============================================================================
-// hit-stats 族（2，只读观测面）—— 装备代谢数据源（39 号批 B3）
+// hit-stats 族（2，只读观测面）—— 装备代谢数据源
 // =============================================================================
 
 pub static HIT_STATS: EndpointBinding = EndpointBinding {
@@ -1577,7 +1577,7 @@ pub static ALL_TRANSPARENT_BINDINGS: &[&EndpointBinding] = &[
     &RULE_TO_TRANSFORM,
     &RULE_TO_CONDITIONAL,
     &RULE_VALIDATE,
-    // audit 3（audit_verify 本地逻辑除外）+ audit_export（39 号批 B4）
+    // audit 3（audit_verify 本地逻辑除外）+ audit_export
     &AUDIT_GET,
     &SESSION_REWIND,
     &AUDIT_EXPORT,
@@ -1608,16 +1608,16 @@ pub static ALL_TRANSPARENT_BINDINGS: &[&EndpointBinding] = &[
     &KNOWLEDGE_DATASETS,
     &KNOWLEDGE_SEARCH,
     &KNOWLEDGE_ENTRY_GET,
-    // facts/version 1（39 号批 B5，只读并发核对面）
+    // facts/version 1（只读并发核对面）
     &FACTS_VERSION,
-    // 事实追溯/启动回读 2（39 号批 A2/A3，只读断头线接通）
+    // 事实追溯/启动回读 2（只读断头线接通）
     &FACT_USED_BY,
     &SESSION_USED_AT_STARTUP,
-    // debug 观测三件套（39 号批 A4，只读；E-9 形态运行时观测面）
+    // debug 观测三件套（只读；E-9 形态运行时观测面）
     &DEBUG_PHASE,
     &DEBUG_QUEUE,
     &DEBUG_PENDING_IO,
-    // hit-stats 2（39 号批 B3，只读观测面）
+    // hit-stats 2（只读观测面）
     &HIT_STATS,
     &HIT_STATS_SERIES,
 ];

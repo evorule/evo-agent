@@ -842,7 +842,7 @@ impl EvoruleApiClient {
         Ok(result)
     }
 
-    /// GET /api/rules/hit-stats —— 规则命中统计清单（装备代谢数据源，39 号批 B3）
+    /// GET /api/rules/hit-stats —— 规则命中统计清单（装备代谢数据源）
     ///
     /// 返回 `{ruleset_version, total_rules, generated_at_ms,
     /// entries:[{source,index,instr_type,hit_count,first_hit_seq,last_hit_seq,
@@ -876,7 +876,7 @@ impl EvoruleApiClient {
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
-    /// GET /api/rules/hit-stats/{rule_key} —— 单规则跨版本命中切片（39 号批 B3）
+    /// GET /api/rules/hit-stats/{rule_key} —— 单规则跨版本命中切片
     ///
     /// `rule_key` 形如 `{index}@{source}`：`index` 为合并规则列表下标，`source`
     /// 为来源标签（宪法规则集为 `core_eval`，业务规则为 rules_dir 相对路径）。
@@ -990,7 +990,7 @@ impl EvoruleApiClient {
     }
 
     // =========================================================================
-    // 审计链导出/导入（39 号批 B4）—— V-1/V-2 抗篡改线「接导出非造轮子」对接面。
+    // 审计链导出/导入—— V-1/V-2 抗篡改线「接导出非造轮子」对接面。
     // 导出只读；导入破坏性（完全覆盖目标会话审计链），由调用方把守授权。
     // =========================================================================
 
@@ -1991,7 +1991,7 @@ mod tests {
             .is_err());
     }
 
-    // ===== B4：审计链导出/导入（39 号批）=====
+    // ===== 审计链导出/导入 =====
 
     /// 请求形状：GET export → JSON 透传
     #[tokio::test]
@@ -2102,7 +2102,7 @@ mod tests {
         mock.assert_async().await;
     }
 
-    // ===== B3：规则命中统计（39 号批）=====
+    // ===== 规则命中统计 =====
 
     /// 请求形状：query 带 version+filter（urlencode）；响应透传
     #[tokio::test]
@@ -2196,7 +2196,7 @@ mod tests {
         mock.assert_async().await;
     }
 
-    // ===== B1：会话即时终止面（39 号批）=====
+    // ===== 会话即时终止面 =====
 
     /// interrupt 请求形状：POST 无 body；响应 `{session_id,success,message}` 透传
     #[tokio::test]
@@ -2287,7 +2287,7 @@ mod tests {
         assert!(client.get_session_invariants("42").await.is_err());
     }
 
-    /// facts/version 响应形状：`{version, history_len}` 透传（39 号批 B5）
+    /// facts/version 响应形状：`{version, history_len}` 透传
     #[tokio::test]
     async fn test_get_shared_facts_version_shape() {
         let mut server = mockito::Server::new_async().await;
