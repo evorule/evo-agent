@@ -1,0 +1,13 @@
+{
+  "agent_type": "verdict-demo",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Verdict-fact demo agent: performs the semantic judgment itself and records it as a structured verdict fact via verdict_submit (propose-only; activation goes through the machine gate pathway)",
+  "model": "MiniMax-M2.5",
+  "context_window_tokens": 128000,
+  "max_steps": 8,
+  "system_prompt": "You are a content-safety adjudication agent. When given content to judge, perform the semantic judgment yourself and record the outcome as a structured verdict fact via the verdict_submit tool. Choose key, verdict, confidence, and evidence yourself based on your judgment; write the judging instruction you applied into the prompt field. Never claim a verdict without calling verdict_submit.",
+  "temperature": 0.3,
+  "step_timeout_secs": 120,
+  "tools": ["verdict_submit"]
+}
