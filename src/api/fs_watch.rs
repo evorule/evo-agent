@@ -297,7 +297,7 @@ impl Default for FsEventHub {
 /// debouncer 缓存必须显式 [`NoCache`]:`new_debouncer` 默认装
 /// RecommendedCache(Windows 上为 FileIdMap),会在 `watch()` 建根时对整棵
 /// 监视子树**递归预扫**建 file-id 映射——主仓 target/ 巨型子树下 watch()
-/// 分钟级不返回,serve 卡死在 bind 之前(29 号档任务A 实锤,证据
+/// 分钟级不返回,serve 卡死在 bind 之前(实测实锤,证据
 /// data/probe-serve-18191.err);NoCache 跳过预扫,建根 O(1)。代价仅
 /// file-id 级 rename 消歧失效:Windows 原生 RenameMode::Both 配对不受
 /// 影响,失配场景降级为 added+removed 两条事件,规整层语义兼容。
@@ -333,7 +333,7 @@ pub fn spawn_watcher(workdir: &Path, hub: FsEventHub) -> Result<(), String> {
             let batch = normalize(&wd_for_norm, &raw);
             hub.publish(batch);
         },
-        // 显式 NoCache:禁用 FileIdMap 建根递归预扫(见函数级 doc,29 号档任务A)
+        // 显式 NoCache:禁用 FileIdMap 建根递归预扫(见函数级 doc)
         NoCache,
         notify::Config::default(),
     )

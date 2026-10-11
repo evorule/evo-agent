@@ -3656,7 +3656,7 @@ fn test_register_note_write_without_memory_errors() {
     assert!(err.to_string().contains("note_write"), "{err}");
 }
 
-// ===== H1:连续回退预算状态机(25 号档 H1【高】——rewind 无界循环封顶)=====
+// ===== 连续回退预算状态机(rewind 无界循环封顶)=====
 
 #[test]
 fn test_rewind_budget_decrement_and_exhaustion() {
@@ -3693,7 +3693,7 @@ fn test_rewind_budget_intermittent_errors_never_exhaust() {
     }
 }
 
-// ===== B1:会话即时终止面(39 号批)=====
+// ===== 会话即时终止面 =====
 
 /// 轮错误收尾中断面 fail-soft 契约:client 失败(此处不可达端口)不冒泡不 panic;
 /// 成功路径请求形状由 evorule_client mockito UT 锁定(interrupt/abort 形状+404 口径)。
