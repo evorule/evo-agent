@@ -25,6 +25,30 @@ try {
             Write-OpsLog -LogDir $cfg.log_dir -Message "[watchdog] $name 拉起失败: $($_.Exception.Message)"
         }
     }
+
+    # 北极星部署态巡检门禁（2026-10-11 接线）：只巡检告警不做拉起（服务探活由上方循环负责）。
+    # 每次覆盖写 last-patrol-status.txt（现态可查不刷日志），FAIL 另记 watchdog.log。
+    $G1Dir = 'D:\knowledge\参赛\专项\G1-适配器'
+    $patrol = Join-Path $G1Dir 'northstar_patrol.py'
+    if (Test-Path $patrol) {
+        $py = Join-Path $G1Dir '.venv\Scripts\python.exe'
+        if (-not (Test-Path $py)) { $py = 'python' }
+        try {
+            # 任务上下文无 PYTHONUTF8，管道输出退回 GBK——自检子件含 ↔/✓ 等字符即 UnicodeEncodeError 崩溃，统一 UTF-8。
+            $env:PYTHONUTF8 = '1'
+            try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+            $out = & $py $patrol 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $summary = "$stamp exit=$code"
+            Set-Content -Path (Join-Path $cfg.log_dir 'last-patrol-status.txt') -Value ($summary + "`r`n" + $out.Trim()) -Encoding UTF8
+            if ($code -ne 0) {
+                Write-OpsLog -LogDir $cfg.log_dir -Message "[watchdog] 北极星巡检 FAIL (exit=$code)——详见 last-patrol-status.txt"
+            }
+        } catch {
+            Write-OpsLog -LogDir $cfg.log_dir -Message "[watchdog] 北极星巡检执行异常: $($_.Exception.Message)"
+        }
+    }
 } finally {
     if ($created) { $mutex.ReleaseMutex() | Out-Null }
     $mutex.Dispose()
