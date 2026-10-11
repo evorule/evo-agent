@@ -79,18 +79,20 @@ pub struct AgentRunRequest {
     /// 请求方可设。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecutionSpec>,
-    /// 恢复此前中断的 plan-execute run(可选;值为 run 级账本会话名,即
-    /// planrun- 前缀 id,由上次响应 run_session_id 透出或
-    /// GET /api/sessions/resumable 列出)。恢复仅经显式入参——无人监督的
-    /// 自动续跑不做(人类持剑);仅 execution.mode=plan_execute 时合法,
-    /// react 面携带 = 400。LLM 面不可见该字段——仅 HTTP 请求方可设。
+    /// 恢复此前中断的 run(可选),按 execution.mode 分流:plan_execute =
+    /// 恢复 planrun- 前缀的 run 级账本(值由上次响应 run_session_id 透出或
+    /// GET /api/sessions/resumable 列出);react/缺省 = 崩溃恢复(值为普通
+    /// 会话名,走 resume_crashed 管线——无新输入,加载历史+悬挂工具处置后
+    /// 自然续完中断轮;WS 面等价入口为 {"type":"resume"} 帧)。恢复仅经
+    /// 显式入参——无人监督的自动续跑不做(人类持剑)。LLM 面不可见该
+    /// 字段——仅 HTTP 请求方可设。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
     /// plan-execute 粒执行器步超时覆写(可选;秒)。粒定义步超时
     /// (如 general 300s)小于容器命令预算 600s 时,超时长的容器内命令
     /// (pip/构建类)被步超时先杀——请求级覆写粒定义 step_timeout_secs。
     /// 仅 execution.mode=plan_execute 路径消费,react 面携带忽略(语义
-    /// 无冲突故不报 400,与 resume_session_id 的非法携带=400 分档)。
+    /// 无冲突故不报 400)。
     /// None = 粒定义值零变化(删配置即下线)。LLM 面不可见该字段——仅
     /// HTTP 请求方可设。
     #[serde(default, skip_serializing_if = "Option::is_none")]

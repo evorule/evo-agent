@@ -13,8 +13,8 @@
     artifacts,
     openFile,
   } from '../lib/stores.js';
-  import { sendMessage, interrupt, newSession, openSession } from '../lib/ws.js';
-  import { approveProposal } from '../lib/api.js';
+  import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
+  import { approveProposal, listResumableRuns } from '../lib/api.js';
   import { onMount } from 'svelte';
 
   // Svelte 5:组件用了 $effect 等 rune 即进入 runes 模式,
@@ -22,10 +22,23 @@
   let draft = $state('');
   let listEl = $state(null);
   let showHistory = $state(false);
+  // 可恢复崩溃会话集合(扫尾端点投影;与历史索引交集后展示「恢复」入口)
+  let resumableIds = $state(new Set());
 
   onMount(() => {
     refreshSessions();
+    loadResumable();
   });
+
+  async function loadResumable() {
+    try {
+      const res = await listResumableRuns();
+      resumableIds = new Set((res.resumable || []).map((r) => r.session_id));
+    } catch {
+      // fail-soft:扫尾端点不可用时不展示恢复入口(历史继续对话不受影响)
+      resumableIds = new Set();
+    }
+  }
 
   function fmtTime(unix) {
     if (!unix) return '';
@@ -36,7 +49,19 @@
 
   function toggleHistory() {
     showHistory = !showHistory;
-    if (showHistory) refreshSessions();
+    if (showHistory) {
+      refreshSessions();
+      loadResumable();
+    }
+  }
+
+  // 恢复前确认(提示条):挂起审批不恢复的明示是恢复入口的硬性文案
+  const RESUME_DISCLOSURE =
+    'agent 将加载会话历史并续完中断的轮次;挂起的人工审批不会被恢复,须重走审批。';
+  function askResume(sid) {
+    const target = sid ? `会话 ${sid}` : '当前会话';
+    if (!confirm(`恢复${target}?${RESUME_DISCLOSURE}`)) return;
+    resumeSession(sid);
   }
 
   // 消息变化时滚动到底部
@@ -89,6 +114,9 @@
     <span class="title">对话</span>
     <div class="header-actions">
       <button class="new-btn" class:active={showHistory} onclick={toggleHistory} title="历史会话">历史</button>
+      {#if $sessionId}
+        <button class="new-btn" onclick={() => askResume()} title="恢复当前崩溃会话(加载历史并续完中断轮)">恢复</button>
+      {/if}
       <button class="new-btn" onclick={newSession} title="断开并新建会话">新建会话</button>
     </div>
   </div>
@@ -99,15 +127,24 @@
         <div class="session-empty">暂无历史会话</div>
       {:else}
         {#each $sessions as s (s.session_id)}
-          <button
-            class="session-item"
-            class:current={s.session_id === $sessionId}
-            onclick={() => openSession(s.session_id)}
-            title={s.session_id}
-          >
-            <span class="s-title">{s.title || '(无标题)'}</span>
-            <span class="s-time mono">{fmtTime(s.last_active)}</span>
-          </button>
+          <div class="session-row">
+            <button
+              class="session-item"
+              class:current={s.session_id === $sessionId}
+              onclick={() => openSession(s.session_id)}
+              title={s.session_id}
+            >
+              <span class="s-title">{s.title || '(无标题)'}</span>
+              <span class="s-time mono">{fmtTime(s.last_active)}</span>
+            </button>
+            {#if resumableIds.has(s.session_id)}
+              <button
+                class="resume-btn"
+                onclick={() => askResume(s.session_id)}
+                title="恢复崩溃会话(挂起审批不恢复,须重走审批)"
+              >恢复</button>
+            {/if}
+          </div>
         {/each}
       {/if}
     </div>
@@ -288,6 +325,28 @@
   .session-item.current {
     background: rgba(29, 99, 237, 0.18);
     box-shadow: inset 2px 0 0 var(--brand);
+  }
+  .session-row {
+    display: flex;
+    align-items: stretch;
+    gap: 2px;
+  }
+  .session-row .session-item {
+    flex: 1;
+    min-width: 0;
+  }
+  .resume-btn {
+    flex-shrink: 0;
+    font-size: var(--fs-xs);
+    color: var(--brand);
+    padding: 0 var(--sp-sm);
+    border-radius: var(--r-sm);
+    border: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .resume-btn:hover {
+    border-color: var(--brand);
+    background: var(--sidebar-hover);
   }
   .s-title {
     font-size: var(--fs-xs);

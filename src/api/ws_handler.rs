@@ -22,6 +22,7 @@
 //! {"type":"message","content":"帮我查天气"}
 //! {"type":"interrupt"}
 //! {"type":"rewind","version":5}
+//! {"type":"resume"}
 //! ```
 //!
 //! **Server → Client**(PascalCase `type`,复用 G4 AgentEvent 序列化):
@@ -41,7 +42,9 @@
 //! 3. 服务端把 AgentEvent 流逐个序列化为 JSON 文本帧推给客户端。
 //! 4. 客户端可在任意时刻发 `interrupt` → 服务端 cancel 当前 runner 的 CancellationToken。
 //! 5. 客户端发 `rewind` → 服务端调 evorule `rewind` API(需在无活跃轮次时)。
-//! 6. 任一方关闭 WebSocket → 连接结束(session 保留在 evorule,可重连续用)。
+//! 6. 客户端发 `resume` → 服务端对当前会话走崩溃恢复管线(`resume_crashed`,
+//!    无新输入:加载历史+悬挂工具处置+LLM 自然续完中断轮;挂起审批不恢复)。
+//! 7. 任一方关闭 WebSocket → 连接结束(session 保留在 evorule,可重连续用)。
 
 #![forbid(unsafe_code)]
 
@@ -94,6 +97,10 @@ enum ClientMessage {
         /// 目标版本号
         version: u64,
     },
+    /// 恢复崩溃会话(C3 前端恢复接线)——无新输入,服务端加载历史+悬挂工具
+    /// 处置后 LLM 自然续完中断轮(与 react 面 resume_session_id 同一管线;
+    /// 挂起的人工审批不恢复,由前端提示条明示)
+    Resume,
 }
 
 /// 服务端 → 客户端的内部事件(用于区分 AgentEvent 和轮次结束信号)
@@ -168,7 +175,7 @@ pub async fn ws_handler(
 /// WebSocket 双向消息循环
 ///
 /// 使用 `tokio::select!` 并发处理:
-/// - **客户端消息**(WS receiver):`message` / `interrupt` / `rewind`
+/// - **客户端消息**(WS receiver):`message` / `interrupt` / `rewind` / `resume`
 /// - **Agent 事件**(通过 mpsc channel 转发):序列化为 JSON 推给客户端
 ///
 /// 每轮 agent 执行在独立 spawn 的 task 中运行,事件通过 channel 转发给主循环。
@@ -354,6 +361,72 @@ async fn handle_ws(
                                             "error": "no session to rewind"
                                         }),
                                     ).await;
+                                }
+                            }
+                            Ok(ClientMessage::Resume) => {
+                                if turn_active {
+                                    if let Err(e) = send_ws_json(
+                                        &mut sender,
+                                        serde_json::json!({
+                                            "type": "Error",
+                                            "error": "a turn is already active; send interrupt first"
+                                        }),
+                                    ).await {
+                                        debug!(error = %e, "ws send Error(turn_active) failed; client likely disconnected");
+                                    }
+                                    continue;
+                                }
+                                // 崩溃恢复(无新输入):与 react 面 resume_session_id
+                                // 同一 resume_crashed 管线。会话索引口径与 continuation
+                                // 一致——恢复路径不发 SessionCreated(既有会话),不手置
+                                // session_established,Done success 才落索引:恢复失败
+                                //(如引擎侧无状态)不产生幽灵条目;索引合并 title 取首个
+                                // 非空,恢复轮无新标题不抹既有标题。
+                                match current_session.clone() {
+                                    Some(sid) => {
+                                        let runner = match construct_runner(&state, &agent_type).await {
+                                            Some(r) => r,
+                                            None => {
+                                                let _ = send_ws_json(
+                                                    &mut sender,
+                                                    serde_json::json!({
+                                                        "type": "Error",
+                                                        "error": format!("agent '{}' not found", agent_type)
+                                                    }),
+                                                ).await;
+                                                continue;
+                                            }
+                                        };
+                                        let cancel = runner.cancel_token().clone();
+                                        current_cancel = Some(cancel);
+                                        turn_active = true;
+                                        turn_succeeded = false;
+                                        info!(session_id = %sid, "G16: crash-resume turn");
+                                        let event_stream = runner.resume_crashed(sid);
+                                        let tx = event_tx.clone();
+                                        tokio::spawn(async move {
+                                            let mut stream = event_stream;
+                                            while let Some(ev) = stream.next().await {
+                                                if tx.send(WsEvent::Agent(ev)).await.is_err() {
+                                                    // 主循环已退出(receiver drop),停止转发
+                                                    return;
+                                                }
+                                            }
+                                            // 事件流结束 → 发 TurnEnd 信号
+                                            if let Err(e) = tx.send(WsEvent::TurnEnd).await {
+                                                debug!(error = %e, "TurnEnd send failed; main ws loop already exited");
+                                            }
+                                        });
+                                    }
+                                    None => {
+                                        let _ = send_ws_json(
+                                            &mut sender,
+                                            serde_json::json!({
+                                                "type": "Error",
+                                                "error": "no session to resume; connect with a session id first"
+                                            }),
+                                        ).await;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -827,6 +900,13 @@ mod tests {
             ClientMessage::Rewind { version } => assert_eq!(version, 5),
             _ => panic!("expected Rewind variant"),
         }
+    }
+
+    #[test]
+    fn test_client_resume_deserialize() {
+        let json = r#"{"type":"resume"}"#;
+        let msg: ClientMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ClientMessage::Resume));
     }
 
     #[test]

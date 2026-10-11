@@ -30,6 +30,7 @@ let streamMsgId = null; // 当前轮流式 assistant 气泡
 let lastToolMsgId = null; // 最近一个运行中工具气泡(按 name 匹配结果)
 let pendingWrite = null; // S4:进行中的 file_write {path, content}(ToolResult 成功即登记产物)
 let pendingNotice = null; // newSession 清屏后需补显的提示(SessionCreated 时补显)
+let pendingResume = false; // 恢复意图待发旗标(连接就绪 onopen 时补发 resume 帧)
 
 /**
  * 死会话检测:引擎侧会话已失效(evorule-server 重启或 30min 闲置 TTL 回收),
@@ -71,7 +72,14 @@ export function connect(sid) {
   connStatus.set('connecting');
   ws = new WebSocket(wsUrl(sid));
 
-  ws.onopen = () => connStatus.set('online');
+  ws.onopen = () => {
+    connStatus.set('online');
+    // 恢复意图待发:resume 换线(openSession)后连接刚建立,此处补发恢复帧
+    if (pendingResume) {
+      pendingResume = false;
+      sendResume();
+    }
+  };
   ws.onclose = () => {
     connStatus.set('offline');
     turnActive.set(false);
@@ -119,6 +127,7 @@ export function interrupt() {
 
 /** 新建会话:断开当前连接并以 "new" 重连 */
 export function newSession() {
+  pendingResume = false;
   sessionId.set(null);
   localStorage.removeItem('evo_session_id');
   messages.set([]);
@@ -129,6 +138,7 @@ export function newSession() {
 /** 打开历史会话:断开 → 回灌消息 → 以该会话 id 重连(继续对话) */
 export async function openSession(sid) {
   if (!sid || sid === get(sessionId)) return;
+  pendingResume = false;
   sessionId.set(sid);
   localStorage.setItem('evo_session_id', sid);
   loadArtifacts(sid); // S4:恢复该会话的产物留痕(草稿基线/定稿状态)
@@ -154,6 +164,35 @@ export async function openSession(sid) {
     });
   }
   connect(sid);
+}
+
+/**
+ * 恢复崩溃会话(C3 前端恢复接线):发 resume 帧——无新输入,服务端加载
+ * 历史+悬挂工具处置+LLM 自然续完中断轮。挂起的人工审批不会被恢复(须
+ * 重走审批),发送前 info 提示明示。
+ * 目标非当前会话时先换线(openSession 回灌历史),连接就绪(onopen)补发。
+ * @param {string} [sid] 目标会话 id;缺省=当前会话
+ */
+export async function resumeSession(sid) {
+  if (sid && sid !== get(sessionId)) {
+    await openSession(sid);
+  }
+  pendingResume = true;
+  // 已就绪立即发(并消费旗标);未就绪(CONNECTING)由 onopen 补发
+  sendResume();
+}
+
+function sendResume() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  pendingResume = false;
+  pushMessage({
+    kind: 'info',
+    text: '正在恢复会话——agent 将加载历史并续完中断的轮次;挂起的人工审批不会被恢复,须重走审批。',
+  });
+  streamMsgId = pushMessage({ kind: 'assistant', text: '', streaming: true });
+  stepCount.set(0);
+  turnActive.set(true);
+  ws.send(JSON.stringify({ type: 'resume' }));
 }
 
 function handleFrame(f) {
