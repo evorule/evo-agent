@@ -95,7 +95,7 @@ pub struct DelegateContext {
     /// 记忆下放开关（true = `def.memory` 有声明的子代理装配 MemoryManager
     /// 全量召回面;默认 false = 子代理无状态执行器,任务域自包含）
     pub propagate_memory: bool,
-    /// 粒执行器步超时覆写（O-409:plan_execute 粒定义 step_timeout_secs=300
+    /// 粒执行器步超时覆写（plan_execute 粒定义 step_timeout_secs=300
     /// < 容器命令预算 600s,超 300s 容器命令被步超时先杀——请求级覆写粒定义
     /// 值。`None` = 定义值零变化;仅 serve plan_execute 构造点传入,CLI/react
     /// 路径不触）
@@ -143,7 +143,7 @@ impl DelegateContext {
         self
     }
 
-    /// 注入粒执行器步超时覆写（O-409:仅 serve plan_execute 构造点传入;
+    /// 注入粒执行器步超时覆写（仅 serve plan_execute 构造点传入;
     /// `None` = 子代理按各自定义 step_timeout_secs 执行,既有行为零变化）
     pub fn with_step_timeout_override(mut self, timeout: Option<std::time::Duration>) -> Self {
         self.step_timeout_override = timeout;
@@ -264,7 +264,7 @@ impl DelegateContext {
             })?;
 
             let mut config = def.to_agent_config();
-            // O-409:请求级步超时覆写（Some=覆写定义值;None=定义值零变化）
+            // 请求级步超时覆写（Some=覆写定义值;None=定义值零变化）
             if let Some(t) = self.step_timeout_override {
                 config.step_timeout = t;
             }
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn test_delegate_context_step_timeout_override() {
-        // O-409:缺省 None = 粒定义值零变化;builder 注入后按值携带
+        // 缺省 None = 粒定义值零变化;builder 注入后按值携带
         let ctx = make_ctx();
         assert!(ctx.step_timeout_override.is_none());
         let ctx = ctx.with_step_timeout_override(Some(std::time::Duration::from_secs(1300)));
