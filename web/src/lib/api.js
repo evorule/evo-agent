@@ -113,6 +113,11 @@ export function listSessions() {
   return fetch('/api/sessions', { headers: headers() }).then(unwrap);
 }
 
+/** 可恢复 run 扫尾列表(崩溃会话,只读投影;恢复须显式触发,无自动续跑) */
+export function listResumableRuns() {
+  return fetch('/api/sessions/resumable', { headers: headers() }).then(unwrap);
+}
+
 /** 会话消息历史(活投影 source=live;TTL 回收后回落本地快照 source=snapshot) */
 export function getTranscript(sessionId) {
   return fetch(`/api/sessions/${encodeURIComponent(sessionId)}/transcript`, {
