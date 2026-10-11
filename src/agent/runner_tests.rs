@@ -3250,11 +3250,14 @@ fn p2_adjudication_table_matches_design() {
     // (数量锁 74 不变,级别变化不增减条目数)。
     // 自主交接 PR-H3 批(2026-10-07):session_spawn 落地 Sensitive(双闸
     // 叠加),集合演进 26→27(数量锁 76→77,新增条目已 diff 审)。
+    // 判定事实治理登记批(2026-10-11):verdict_submit 落地 Sensitive
+    // (治理写族单键管理一致性;治理终审在 evorule-rule 机器闸,agent 面
+    // 仅运行时审批),集合演进 27→28(数量锁 89,新增条目已 diff 审)。
     let p2_count = crate::agent::tool_manifest::static_manifests()
         .iter()
         .filter(|m| m.is_p2_adjudicated())
         .count();
-    assert_eq!(p2_count, 27);
+    assert_eq!(p2_count, 28);
     for t in [
         "file_create",
         "file_move",

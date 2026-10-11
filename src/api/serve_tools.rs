@@ -83,13 +83,15 @@ const RULE_TOOL_NAMES: &[&str] = &[
     // evolution_tools (2,进化信号只读消费面 + 约束层晋升提名)
     "evolution_signals",
     "rule_promote",
+    // verdict_submit (1,LLM 判定事实治理登记:机器提案通路产出侧,治理写)
+    "verdict_submit",
     // why/order_tools (3,查账因果查询面,PR-11b,只读)
     "explain_denial",
     "causal_order",
     "lineage_of",
 ];
 
-/// 构建 union toolkit(内置 17 + 规则 44 = 61 工具,启动时一次组装)
+/// 构建 union toolkit(内置 17 + 规则 45 = 62 工具,启动时一次组装)
 ///
 /// 在 `cmd_serve` 启动时调用一次,结果存入 `AgentApiState.toolkit`。
 pub fn build_union_toolkit(
@@ -718,7 +720,7 @@ mod tests {
         )
     }
 
-    /// 治理写权开关门控的 21 个写工具(与 TOOL_SWITCH_KEYS 治理段同源)
+    /// 治理写权开关门控的 22 个写工具(与 manifest governanceWrite 绑定同源)
     const GOVERNANCE_WRITE_TOOLS: &[&str] = &[
         "rule_create",
         "rule_update",
@@ -729,6 +731,7 @@ mod tests {
         "rule_fork",
         "rule_reload",
         "rule_promote",
+        "verdict_submit",
         "ws_create",
         "sandbox_start",
         "sandbox_close",
@@ -800,11 +803,11 @@ mod tests {
 
     #[test]
     fn test_governance_write_switch_off_gates_exactly_21_write_tools() {
-        // false:21 写工具下线(执行器+LLM 契约同步消失),其余 30 只读保留
+        // false:22 写工具下线(执行器+LLM 契约同步消失),其余只读保留
         let (ws, ev) = make_clients();
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
         let all = all_rule_tool_names();
-        assert_eq!(all.len(), 58, "rule tool spec count drift");
+        assert_eq!(all.len(), 59, "rule tool spec count drift");
         let mut settings = serde_json::Map::new();
         settings.insert(
             "agentTools.governanceWrite".to_string(),
@@ -939,7 +942,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 61, "expected 61 total tool names");
+        assert_eq!(all_names.len(), 62, "expected 62 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),

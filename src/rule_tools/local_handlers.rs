@@ -686,7 +686,174 @@ impl ToolFunction for RulePromoteTool {
 // register / specs
 // =============================================================================
 
-/// 注册全部本地逻辑工具（6 个）
+// =============================================================================
+// verdict_submit —— LLM 判定事实治理登记（机器提案通路产出侧）
+// =============================================================================
+
+/// 组装 llm_verdict 判定事实载荷（九字段契约；权威结构=
+/// evorule-system-rules `_shared/v1.0#/$defs/llm_verdict`，本地不复制严格
+/// 校验——壳/服务端闸把关，此处只做入参门面预检）。
+///
+/// 判定结果三形态：boolean / `"pass"`|`"fail"` / `"value"`（须携带 value）。
+/// prompt_hash = BLAKE3(判定 prompt 原文)，存储口径带 `blake3:` 前缀——
+/// 保「判了什么/依据什么」可溯源，不承诺判定可复现（与 confidence 同哲学：
+/// 不确定性不进确定性求值面，载荷消费由规则面 exists/eq 原子完成）。
+fn build_verdict_payload(
+    key: &str,
+    verdict: &Value,
+    value: Option<&Value>,
+    confidence: Option<f64>,
+    evidence: Option<&str>,
+    prompt: &str,
+    model: &str,
+) -> Result<Value, String> {
+    let key_ok = {
+        let b = key.as_bytes();
+        !key.is_empty()
+            && (b[0].is_ascii_lowercase() || b[0] == b'_')
+            && b.iter().all(|c| {
+                c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || *c == b'_'
+                    || *c == b'.'
+                    || *c == b'-'
+            })
+    };
+    if !key_ok {
+        return Err(format!(
+            "key must match ^[a-z0-9_][a-z0-9_.\\-]*$, got {key:?}"
+        ));
+    }
+    let verdict_value = match verdict {
+        Value::Bool(_) => verdict.clone(),
+        Value::String(s) if s == "pass" || s == "fail" => verdict.clone(),
+        Value::String(s) if s == "value" => {
+            if value.is_none() {
+                return Err("verdict=\"value\" requires the value field".into());
+            }
+            verdict.clone()
+        }
+        other => {
+            return Err(format!(
+                "verdict must be boolean or \"pass\"/\"fail\"/\"value\", got {other}"
+            ))
+        }
+    };
+    if let Some(c) = confidence {
+        if !(0.0..=1.0).contains(&c) {
+            return Err(format!("confidence must be within [0,1], got {c}"));
+        }
+    }
+    let mut payload = serde_json::json!({
+        "kind": "llm_verdict",
+        "key": key,
+        "verdict": verdict_value,
+        "prompt_hash": evorule_hash::prefixed(&evorule_hash::digest(prompt.as_bytes())),
+        "model": model,
+        "origin": "llm",
+    });
+    if verdict.as_str() == Some("value") {
+        payload["value"] = value.cloned().expect("checked above");
+    }
+    if let Some(c) = confidence {
+        payload["confidence"] = serde_json::json!(c);
+    }
+    if let Some(e) = evidence {
+        payload["evidence"] = serde_json::json!(e);
+    }
+    Ok(payload)
+}
+
+/// 由 key 派生 slug 形态 entry_id（新条目 version=1；短 hash 尾防同 key 覆撞）
+fn derive_verdict_entry_id(key: &str, prompt: &str) -> String {
+    let slug: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let tail = &evorule_hash::digest(prompt.as_bytes())[..8];
+    format!("verdict-{}-{tail}", slug.trim_matches('-'))
+}
+
+#[derive(Clone)]
+pub struct VerdictSubmitTool {
+    client: EvoruleApiClient,
+}
+
+impl VerdictSubmitTool {
+    pub fn new(client: EvoruleApiClient) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolFunction for VerdictSubmitTool {
+    /// LLM 判定事实登记：组 llm_verdict 载荷 → 知识条目（verdict 谱系 +
+    /// trust_level="llm"）→ 机器提案通路入账（服务端强制 llm_generated
+    /// 溯源 + 全闸链，入账一律 Draft）。行权（Draft→Active）不在本工具——
+    /// 走机器行权通路（knowledge-transition），治理强度由机器闸梯位裁决。
+    async fn call(&self, args: &Value) -> IoResult {
+        let req = (|| -> Result<_, String> {
+            let get_str = |name: &str| {
+                args.get(name)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("missing required parameter: {name}"))
+            };
+            Ok((
+                get_str("dataset_id")?,
+                get_str("key")?,
+                args.get("verdict")
+                    .ok_or_else(|| "missing required parameter: verdict".to_string())?
+                    .clone(),
+                args.get("value"),
+                args.get("confidence").and_then(|v| v.as_f64()),
+                args.get("evidence").and_then(|v| v.as_str()),
+                get_str("prompt")?,
+                get_str("model")?,
+                get_str("cause")?,
+                args.get("source_session_id").and_then(|v| v.as_str()),
+            ))
+        })()
+        .map_err(|e: String| e)?;
+        let (
+            dataset_id,
+            key,
+            verdict,
+            value,
+            confidence,
+            evidence,
+            prompt,
+            model,
+            cause,
+            source_session_id,
+        ) = req;
+        let payload =
+            build_verdict_payload(&key, &verdict, value, confidence, evidence, &prompt, &model)?;
+        let entry = serde_json::json!({
+            "entry_id": derive_verdict_entry_id(&key, &prompt),
+            "version": 1,
+            "tags": ["llm-verdict"],
+            "payload": payload,
+            "schema_ref": "builtin:knowledge/verdict",
+            "knowledge_kind": "verdict",
+            "trust_level": "llm",
+        });
+        let receipt = self
+            .client
+            .propose_knowledge_entry(&dataset_id, &entry, &cause, source_session_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(receipt)
+    }
+}
+
+/// 注册全部本地逻辑工具（7 个）
 pub fn register(h: &mut ToolHandler, ws: &WorkspaceApiClient, ev: &EvoruleApiClient) {
     h.register_static("audit_verify", Arc::new(AuditVerifyTool::new(ev.clone())));
     h.register_static("bundle_export", Arc::new(BundleExportTool::new(ws.clone())));
@@ -700,6 +867,10 @@ pub fn register(h: &mut ToolHandler, ws: &WorkspaceApiClient, ev: &EvoruleApiCli
         Arc::new(EvolutionSignalsTool::new(ev.clone())),
     );
     h.register_static("rule_promote", Arc::new(RulePromoteTool::new(ws.clone())));
+    h.register_static(
+        "verdict_submit",
+        Arc::new(VerdictSubmitTool::new(ev.clone())),
+    );
 }
 
 /// 全部本地逻辑工具 spec（5 个）
@@ -900,6 +1071,87 @@ pub fn specs() -> Vec<ToolSpec> {
                 },
             ],
         },
+        ToolSpec {
+            name: "verdict_submit".to_string(),
+            description: "Register an LLM verdict fact (governed knowledge entry) via the \
+                          machine-proposal channel. Payload follows the llm_verdict contract \
+                          (kind/key/verdict/prompt_hash/model/origin); prompt_hash is computed \
+                          locally from the `prompt` argument (BLAKE3, prefixed). The entry \
+                          lands as a Draft in the knowledge dataset — promotion to Active is \
+                          the machine gate's decision (transition channel), never this tool's."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "dataset_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Knowledge dataset id to propose into.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "key".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Verdict key consumed by rule conditions via payload \
+                                  injection (e.g. \"content.safety\"); lowercase dot form."
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "verdict".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Verdict result: boolean, or \"pass\"/\"fail\", or \
+                                  \"value\" (requires the value argument)."
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "value".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Structured verdict value (required when verdict=\"value\")."
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "confidence".to_string(),
+                    r#type: "number".to_string(),
+                    description: "Optional confidence within [0,1]; observation-only, never \
+                                  consumed by rule conditions."
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "evidence".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Optional evidence excerpt backing the verdict.".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "prompt".to_string(),
+                    r#type: "string".to_string(),
+                    description: "The judging prompt text (hashed into prompt_hash for \
+                                  provenance)."
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "model".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Model identifier that produced the verdict.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "cause".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Proposal cause (mandatory audit anchor).".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "source_session_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Optional source session id (audit replay anchor).".to_string(),
+                    required: false,
+                },
+            ],
+        },
     ]
 }
 
@@ -1008,6 +1260,123 @@ mod tests {
     }
 
     #[test]
+    fn test_verdict_payload_boolean_form() {
+        let p = build_verdict_payload(
+            "content.safety",
+            &serde_json::json!(true),
+            None,
+            Some(0.9),
+            Some("经安全准则逐条比对"),
+            "请判定输入内容是否安全",
+            "MiniMax-M2.5",
+        )
+        .expect("boolean 形态应通过");
+        assert_eq!(p["kind"], "llm_verdict");
+        assert_eq!(p["key"], "content.safety");
+        assert_eq!(p["verdict"], true);
+        assert_eq!(p["origin"], "llm");
+        assert_eq!(p["confidence"], 0.9);
+        let h = p["prompt_hash"].as_str().unwrap();
+        assert!(h.starts_with("blake3:") && h.len() == 71, "hash={h}");
+        // 同 prompt 同 hash（溯源稳定）；不同 prompt 异 hash
+        let p2 = build_verdict_payload(
+            "content.safety",
+            &serde_json::json!(true),
+            None,
+            None,
+            None,
+            "请判定输入内容是否安全",
+            "MiniMax-M2.5",
+        )
+        .unwrap();
+        assert_eq!(p["prompt_hash"], p2["prompt_hash"]);
+        let p3 = build_verdict_payload(
+            "content.safety",
+            &serde_json::json!(true),
+            None,
+            None,
+            None,
+            "另一个 prompt",
+            "MiniMax-M2.5",
+        )
+        .unwrap();
+        assert_ne!(p["prompt_hash"], p3["prompt_hash"]);
+    }
+
+    #[test]
+    fn test_verdict_payload_value_form_and_rejections() {
+        // value 形态：携带 value 通过并落载荷
+        let p = build_verdict_payload(
+            "toxicity.score",
+            &serde_json::json!("value"),
+            Some(&serde_json::json!(0.92)),
+            None,
+            None,
+            "prompt",
+            "m",
+        )
+        .expect("value 形态应通过");
+        assert_eq!(p["verdict"], "value");
+        assert_eq!(p["value"], 0.92);
+        // value 形态缺 value → 拒绝
+        assert!(build_verdict_payload(
+            "k",
+            &serde_json::json!("value"),
+            None,
+            None,
+            None,
+            "p",
+            "m"
+        )
+        .is_err());
+        // 非法 verdict 字符串 → 拒绝
+        assert!(build_verdict_payload(
+            "k",
+            &serde_json::json!("maybe"),
+            None,
+            None,
+            None,
+            "p",
+            "m"
+        )
+        .is_err());
+        // confidence 越界 → 拒绝
+        assert!(build_verdict_payload(
+            "k",
+            &serde_json::json!(true),
+            None,
+            Some(1.5),
+            None,
+            "p",
+            "m"
+        )
+        .is_err());
+        // 大写/空格 key → 拒绝
+        assert!(build_verdict_payload(
+            "Content.Safety",
+            &serde_json::json!(true),
+            None,
+            None,
+            None,
+            "p",
+            "m"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_derive_verdict_entry_id_slug() {
+        let id = derive_verdict_entry_id("content.safety", "prompt-text");
+        assert!(id.starts_with("verdict-content-safety-"), "id={id}");
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        // 同 key 不同 prompt → 不同 entry_id（短 hash 尾防撞）
+        let id2 = derive_verdict_entry_id("content.safety", "另一段 prompt");
+        assert_ne!(id, id2);
+    }
+
+    #[test]
     fn test_render_contains_signals_and_queue() {
         let text = render_evolution_signals_summary(&sample_response()).expect("有信号应渲染");
         assert!(text.contains("会话 42"));
@@ -1048,7 +1417,7 @@ mod tests {
 
     #[test]
     fn test_specs_count() {
-        assert_eq!(specs().len(), 6);
+        assert_eq!(specs().len(), 7);
     }
 
     #[test]
