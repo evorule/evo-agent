@@ -86,6 +86,15 @@ pub struct AgentRunRequest {
     /// react 面携带 = 400。LLM 面不可见该字段——仅 HTTP 请求方可设。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
+    /// plan-execute 粒执行器步超时覆写(可选;秒)。O-409:粒定义步超时
+    /// (如 general 300s)小于容器命令预算 600s 时,超时长的容器内命令
+    /// (pip/构建类)被步超时先杀——请求级覆写粒定义 step_timeout_secs。
+    /// 仅 execution.mode=plan_execute 路径消费,react 面携带忽略(语义
+    /// 无冲突故不报 400,与 resume_session_id 的非法携带=400 分档)。
+    /// None = 粒定义值零变化(删配置即下线)。LLM 面不可见该字段——仅
+    /// HTTP 请求方可设。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_timeout_secs: Option<u64>,
 }
 
 /// Agent run response
@@ -997,6 +1006,18 @@ async fn run_plan_execute_request(
         max_wall_ms: Some(1_800_000),
         max_tokens: None,
     };
+    // O-409:粒执行器步超时请求级覆写(秒→Duration;0=立即超时无意义,拒绝;
+    // None = 粒定义值零变化)
+    let step_timeout_override = match req.step_timeout_secs {
+        None => None,
+        Some(0) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "step_timeout_secs must be >= 1".to_string(),
+            ));
+        }
+        Some(secs) => Some(std::time::Duration::from_secs(secs)),
+    };
     let run = crate::agent::driver::run_plan_execute(
         state.evorule_client.clone(),
         state.definitions.clone(),
@@ -1009,6 +1030,7 @@ async fn run_plan_execute_request(
         5,                     // max_concurrent（与 CLI workflow 子命令缺省一致，0=不限流）
         req.container.clone(), // 判据 v0：run 请求容器名透传（P1 执行桥同源）
         req.resume_session_id.as_deref(), // 恢复旗标（None = 全新跑）
+        step_timeout_override, // O-409：粒执行器步超时覆写（None = 定义值零变化）
     )
     .await;
     let (outcome, marks_session) = match run {
@@ -2416,6 +2438,7 @@ mod tests {
             workspace: None,
             execution: None,
             resume_session_id: None,
+            step_timeout_secs: None,
         };
 
         let response = app
@@ -2776,6 +2799,7 @@ mod tests {
             workspace: None,
             execution: None,
             resume_session_id: None,
+            step_timeout_secs: None,
         };
         let response = rt.block_on(async {
             app.oneshot(

@@ -20,6 +20,10 @@ Configuration (constructor kwargs override environment variables):
   mode forwarded in the run request (``plan_execute`` routes the run
   through the engine's outer plan-execute driver loop; unset/``react``
   keeps the default single-agent ReAct path).
+- ``step_timeout_secs`` / ``EVO_AGENT_STEP_TIMEOUT_SECS``: optional
+  per-step timeout override (seconds) for plan-execute delegate nodes,
+  forwarded in the run request; unset keeps each node's definition
+  default (only consumed on the plan-execute path).
 
 Per-task rule declaration (optional; disabled unless ``rules_dir`` is set):
 
@@ -82,6 +86,10 @@ class EvoRuleAgent(BaseAgent):
             "execution_mode", os.environ.get("EVO_AGENT_EXECUTION_MODE")
         )
         self._execution_mode = str(execution_mode) if execution_mode else None
+        step_timeout = kwargs.get(
+            "step_timeout_secs", os.environ.get("EVO_AGENT_STEP_TIMEOUT_SECS")
+        )
+        self._step_timeout_secs = int(step_timeout) if step_timeout else None
         rules_dir = kwargs.get("rules_dir", os.environ.get("EVO_AGENT_RULES_DIR"))
         self._rules_dir = str(rules_dir) if rules_dir else None
         self._evorule_server_url = str(
@@ -330,6 +338,8 @@ class EvoRuleAgent(BaseAgent):
             }
             if self._execution_mode:
                 payload["execution"] = {"mode": self._execution_mode}
+            if self._step_timeout_secs:
+                payload["step_timeout_secs"] = self._step_timeout_secs
             response = requests.post(
                 f"{self._server_url}/agents/{self._agent_type}/run",
                 json=payload,

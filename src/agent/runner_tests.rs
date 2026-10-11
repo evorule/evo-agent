@@ -111,6 +111,8 @@ fn test_merge_delegate_tool() {
         governance_segment: None,
         // 记忆下放(测试不开启)
         propagate_memory: false,
+        // O-409 步超时覆写(测试不覆写)
+        step_timeout_override: None,
         // spawn 账(测试空账)
         spawn_ledger: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     };

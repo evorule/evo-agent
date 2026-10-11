@@ -95,6 +95,11 @@ pub struct DelegateContext {
     /// 记忆下放开关（true = `def.memory` 有声明的子代理装配 MemoryManager
     /// 全量召回面;默认 false = 子代理无状态执行器,任务域自包含）
     pub propagate_memory: bool,
+    /// 粒执行器步超时覆写（O-409:plan_execute 粒定义 step_timeout_secs=300
+    /// < 容器命令预算 600s,超 300s 容器命令被步超时先杀——请求级覆写粒定义
+    /// 值。`None` = 定义值零变化;仅 serve plan_execute 构造点传入,CLI/react
+    /// 路径不触）
+    pub step_timeout_override: Option<std::time::Duration>,
     /// spawn 账（子会话锚记录;clone 共享同一 Arc,父 runner drain 落账）
     pub(crate) spawn_ledger: SpawnLedger,
 }
@@ -119,6 +124,7 @@ impl DelegateContext {
             journal_dir: None,
             governance_segment: None,
             propagate_memory: false,
+            step_timeout_override: None,
             spawn_ledger: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -134,6 +140,13 @@ impl DelegateContext {
     /// 默认关闭——子代理默认无状态,防主会话记忆串染+确定成本）
     pub fn with_memory_propagation(mut self) -> Self {
         self.propagate_memory = true;
+        self
+    }
+
+    /// 注入粒执行器步超时覆写（O-409:仅 serve plan_execute 构造点传入;
+    /// `None` = 子代理按各自定义 step_timeout_secs 执行,既有行为零变化）
+    pub fn with_step_timeout_override(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.step_timeout_override = timeout;
         self
     }
 
@@ -250,7 +263,11 @@ impl DelegateContext {
                 )
             })?;
 
-            let config = def.to_agent_config();
+            let mut config = def.to_agent_config();
+            // O-409:请求级步超时覆写（Some=覆写定义值;None=定义值零变化）
+            if let Some(t) = self.step_timeout_override {
+                config.step_timeout = t;
+            }
 
             // 统一装配（delegate 统一装配批）：子代理 runner 构建期标记
             // 管道入口类=Delegate（子代理工具调用账面可分，聚焦决策落账），
@@ -525,6 +542,20 @@ mod tests {
         assert_eq!(ctx.parent_agent_type, "parent");
         assert_eq!(ctx.max_depth, DEFAULT_MAX_DELEGATE_DEPTH);
         assert!(ctx.max_concurrent.is_none());
+    }
+
+    #[test]
+    fn test_delegate_context_step_timeout_override() {
+        // O-409:缺省 None = 粒定义值零变化;builder 注入后按值携带
+        let ctx = make_ctx();
+        assert!(ctx.step_timeout_override.is_none());
+        let ctx = ctx.with_step_timeout_override(Some(std::time::Duration::from_secs(1300)));
+        assert_eq!(
+            ctx.step_timeout_override,
+            Some(std::time::Duration::from_secs(1300))
+        );
+        let ctx = ctx.with_step_timeout_override(None);
+        assert!(ctx.step_timeout_override.is_none());
     }
 
     #[test]
