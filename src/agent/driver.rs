@@ -1413,6 +1413,12 @@ pub fn plan_canonical_hash(canonical: &str) -> String {
 
 /// v(n) 计划摘要（纲领 §9.4.3 `v1_plan_summary`；从展开后 DAG 生成——
 /// loop 副本全名天然携带循环结构，无需单独字段）
+///
+/// 机械声明字段（`compute`/`run_when`）原样回传：摘要若只回传骨架
+/// （id/agent_type/depends_on），planner 对 compute 节点既不知其形态也无法
+/// 复原规范，只能幻觉（字符串形态 compute 物化必败）；二者为同输入同输出
+/// 的确定性声明（非创造性内容），保真往返 = replan 不丢失机制语义。
+/// 无声明的节点不写键——纯 LLM 计划的摘要形态逐字节兼容既有口径。
 pub fn build_plan_summary(wf: &Workflow, version: u32) -> Value {
     json!({
         "plan_version": version,
@@ -1420,11 +1426,22 @@ pub fn build_plan_summary(wf: &Workflow, version: u32) -> Value {
             .nodes
             .iter()
             .map(|n| {
-                json!({
+                let mut node = json!({
                     "id": n.id,
                     "agent_type": n.agent_type,
                     "depends_on": n.depends_on,
-                })
+                });
+                if let Ok(v) = serde_json::to_value(&n.compute) {
+                    if !v.is_null() {
+                        node["compute"] = v;
+                    }
+                }
+                if let Ok(v) = serde_json::to_value(&n.run_when) {
+                    if !v.is_null() {
+                        node["run_when"] = v;
+                    }
+                }
+                node
             })
             .collect::<Vec<_>>(),
         "output_node": wf.output_node,
@@ -1456,6 +1473,7 @@ pub fn build_replan_task(
          Instructions:\n\
          - Discard semantics: the previous run is abandoned; produce a COMPLETE new plan from scratch.\n\
          - Avoid the failure cause shown in the trigger; you may drop or restructure nodes.\n\
+         - If a node in the previous plan summary carries a \"compute\" or \"run_when\" field, reproduce that field EXACTLY as given in your new plan — \"compute\" is a JSON object with a \"function\" key, NEVER a bare string.\n\
          - Follow the PlanFact schema and rules from your system prompt (node id grammar, agent_type whitelist, single sink, limits).\n\
          - Output ONLY the PlanFact JSON object. No markdown fences, no explanations.\n",
         next = next_version,
@@ -1581,6 +1599,65 @@ mod tests {
     }
 
     #[test]
+    fn plan_summary_carries_compute_and_run_when_specs() {
+        use crate::agent::workflow::{ComputeInput, ComputeSpec, ConditionOp, RunWhen};
+        let plain = |id: &str, agent: &str| WorkflowNode {
+            id: id.to_string(),
+            agent_type: agent.to_string(),
+            task: "t".to_string(),
+            task_template: None,
+            depends_on: Vec::new(),
+            run_when: None,
+            compute: None,
+            output_schema: None,
+            judge: None,
+            atomic: false,
+        };
+        let wf = Workflow {
+            workflow_id: "wf".to_string(),
+            description: String::new(),
+            nodes: vec![
+                plain("draft", "researcher"),
+                WorkflowNode {
+                    id: "judge".to_string(),
+                    agent_type: String::new(),
+                    task: String::new(),
+                    task_template: None,
+                    depends_on: vec!["draft".to_string()],
+                    run_when: None,
+                    compute: Some(ComputeSpec::RegexMatch {
+                        inputs: vec![ComputeInput::Node("draft".to_string())],
+                        pattern: "version:".to_string(),
+                    }),
+                    output_schema: None,
+                    judge: None,
+                    atomic: false,
+                },
+                WorkflowNode {
+                    run_when: Some(RunWhen {
+                        node: "judge".to_string(),
+                        op: ConditionOp::Equals,
+                        value: "no_match".to_string(),
+                    }),
+                    ..plain("repair", "researcher")
+                },
+            ],
+            output_node: "repair".to_string(),
+        };
+        let summary = build_plan_summary(&wf, 2);
+        // compute 规范保真回传（function 标签对象形态，与 PlanFact 声明同构）
+        assert_eq!(summary["nodes"][1]["compute"]["function"], "regex_match");
+        assert_eq!(summary["nodes"][1]["compute"]["pattern"], "version:");
+        assert_eq!(summary["nodes"][1]["compute"]["inputs"][0], "draft");
+        // run_when 原样回传
+        assert_eq!(summary["nodes"][2]["run_when"]["node"], "judge");
+        assert_eq!(summary["nodes"][2]["run_when"]["op"], "equals");
+        // 无声明的节点不写键（纯 LLM 计划摘要形态逐字节兼容）
+        assert!(summary["nodes"][0].get("compute").is_none());
+        assert!(summary["nodes"][0].get("run_when").is_none());
+    }
+
+    #[test]
     fn replan_task_contains_summary_trigger_and_version() {
         let summary = json!({"plan_version": 1, "nodes": []});
         let task = build_replan_task(
@@ -1594,6 +1671,8 @@ mod tests {
         assert!(task.contains("研究 X"));
         assert!(task.contains("node_failure"));
         assert!(task.contains("COMPLETE new plan"));
+        // 机械声明保真回传指令（replan 摘要 compute 缺口的任务面护栏）
+        assert!(task.contains("NEVER a bare string"));
         // 无目标时的引导语
         let task2 = build_replan_task(None, &summary, "{}", 3, None);
         assert!(task2.contains("infer it from the previous plan summary"));
