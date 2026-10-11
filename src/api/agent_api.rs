@@ -883,6 +883,11 @@ async fn run_agent(
         .with_metrics(state.metrics.clone())
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
         .with_journal_dir(state.workdir.join("data").join("sessions"))
+        // B21 D3:注入主动压缩策略(longSession.compaction.* 设置映射;
+        // CLI 面不读设置=None=不启用,行为零变化)
+        .with_compaction_policy(crate::agent::runner::CompactionPolicy::from_settings(
+            &merged_settings,
+        ))
         // 注入 delegate 上下文——serve 模式多代理委托通路接线
         // 治理门禁段随上下文下放(子代理 S2 槽位与主 runner 同源,治理
         // 纪律无豁免面);journal 目录同源传入=子代理事件流落同目录
@@ -1178,7 +1183,11 @@ async fn run_agent_stream(
     // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
     .with_metrics(state.metrics.clone())
     // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
-    .with_journal_dir(state.workdir.join("data").join("sessions"));
+    .with_journal_dir(state.workdir.join("data").join("sessions"))
+    // B21 D3:注入主动压缩策略(longSession.compaction.* 设置映射;同 run_agent 口径)
+    .with_compaction_policy(crate::agent::runner::CompactionPolicy::from_settings(
+        &merged_settings,
+    ));
 
     // 执行桥后端上下文注入轨迹采集器(同 run_agent 口径):请求携带容器名
     // (docker-exec 后端)时 shell_exec 轨迹成形分流 program 旗标(分流≠删检);

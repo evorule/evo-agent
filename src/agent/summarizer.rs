@@ -440,7 +440,20 @@ impl ContextSummarizer {
     pub async fn summarize_dropped_with_metadata(
         &self,
         dropped: &[Message],
+        goal: &str,
+    ) -> Result<SummarizeOutcome, String> {
+        self.summarize_dropped_with_purpose(dropped, goal, "summarize")
+            .await
+    }
+
+    /// purpose 可变的通用摘要形态（B21 D3 主动压缩经此以 purpose=compaction
+    /// 调用，走 audited_llm 留痕；摘要机制/滚动缓存/落链元数据与
+    /// [`Self::summarize_dropped_with_metadata`] 全量同构，仅审计用途标签不同）。
+    pub async fn summarize_dropped_with_purpose(
+        &self,
+        dropped: &[Message],
         _goal: &str,
+        purpose: &str,
     ) -> Result<SummarizeOutcome, String> {
         // 空列表:无需摘要
         if dropped.is_empty() {
@@ -528,7 +541,7 @@ impl ContextSummarizer {
         let params = params_json.clone();
 
         // 调用 LLM（经审计链或直连，见 call_llm 分流说明）
-        let result = self.call_llm("summarize", &params).await?;
+        let result = self.call_llm(purpose, &params).await?;
 
         // 解析响应为 LlmResponse
         let response: LlmResponse = serde_json::from_str(&result.to_string())

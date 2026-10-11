@@ -897,6 +897,9 @@ pub struct AgentRunner {
     /// ——CLI/子代理路径零改动)。run_streaming_inner 创建会话时在此目录建
     /// `{session_id}.jsonl` 事件流(会话唯一真相源,见 crate::agent::journal)
     journal_dir: Option<std::path::PathBuf>,
+    /// B21 D3:主动压缩策略(serve 面从 `longSession.compaction.*` 工作台设置
+    /// 构造注入;None=不启用——CLI 路径与未注入面行为零变化,被动 trim 独任)
+    compaction_policy: Option<CompactionPolicy>,
     /// 验收判据自检命令(可选;长程/TB 模式)。task_done 提交前
     /// runner 强制执行,exit 0=通过放行,非 0=门禁拒绝(不存在 done 退出路径)。
     /// None=不拦截(非长程运行零影响)。由 from_definition 从 def 穿线。
@@ -1048,6 +1051,7 @@ impl AgentRunner {
                 crate::agent::tool_trace::ToolTraceCollector::default(),
             )),
             journal_dir: None,
+            compaction_policy: None,
             acceptance_command: None,
             stagnation: crate::agent::stagnation::StagnationDetector::new(),
             pipeline_entry: crate::agent::pipeline::PipelineEntry::React,
@@ -1743,6 +1747,13 @@ impl AgentRunner {
         self
     }
 
+    /// B21 D3:注入主动压缩策略(serve 面;`longSession.compaction.*` 设置映射,
+    /// 见 [`CompactionPolicy::from_settings`]。不注入=None=不启用,行为零变化)
+    pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
+        self.compaction_policy = Some(policy);
+        self
+    }
+
     /// 查账工具接线（工具面统一架构 PR-11a）：以本 runner 会话态重绑
     /// handler 内已注册的查账工具实例（进程级 toolkit 中的共享占位实例 →
     /// per-runner 实例，与 delegate 定义级注册同型）。
@@ -1864,9 +1875,10 @@ impl AgentRunner {
         dropped: &[Message],
         trim_messages: &mut [Message],
         goal: &str,
+        purpose: &str,
     ) -> Result<(), AgentError> {
         let outcome = summarizer
-            .summarize_dropped_with_metadata(dropped, goal)
+            .summarize_dropped_with_purpose(dropped, goal, purpose)
             .await
             .map_err(AgentError::Internal)?;
         // 摘要保真对照(规格修正批交付物 B):被裁剪消息确定性锚点 vs 摘要
@@ -1936,6 +1948,103 @@ impl AgentRunner {
             }
         }
         Ok(())
+    }
+
+    /// B21 D3 主动 compaction:阈值驱动的窗口压力管理(被动 trim 的前置层)。
+    ///
+    /// 触发:本轮 LLM 调用前,上下文用量(count)≥ 窗口×thresholdPct 时执行。
+    /// 动作(21 号 D3):①近摘要区 = system 前缀 + 最近
+    /// [`COMPACTION_KEEP_ROUNDS`] 轮之外的全部消息;②近摘要区滚动摘要
+    /// (purpose=compaction,经 audited_llm 留痕,复用保真对照+记忆落链);
+    /// ③区内大块工具结果原文以 `[cleared: 工具名]` 引用替代(按原文长度
+    /// 从大到小,条数受 maxClearToolResults 约束);④摘要块回注区前 +
+    /// compaction_performed 落 journal。
+    ///
+    /// 返回 `Some(压缩后序列)` 交被动 trim 继续兜底(trim 仍是最后防线);
+    /// `None` = 未启用/未触发/无 summarizer/无窗口/近摘要区空——调用方按
+    /// 原消息走被动 trim。可恢复原则:被清原文完整留存 journal(tool_result
+    /// 直写),消息层仅留结构化引用;口径注记:设计档「[cleared: call_id]」
+    /// 的 call_id 在消息层不存在(Message::Tool 无 call_id 标识),以工具名
+    /// 引用替代——call_id 级对账在 journal 侧(t{seq} 合成键)成立。
+    async fn active_compaction(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+        goal: &str,
+        journal: Option<&std::sync::Arc<crate::agent::journal::JournalWriter>>,
+    ) -> Option<Vec<Message>> {
+        let policy = self.compaction_policy.as_ref()?;
+        if !policy.enabled {
+            return None;
+        }
+        let ctx = self.context_window.as_ref()?;
+        let summarizer = self.summarizer.as_ref()?;
+        let threshold = ctx
+            .window_tokens()
+            .saturating_mul(policy.threshold_pct as usize)
+            / 100;
+        if threshold == 0 || ctx.count(messages) < threshold {
+            return None;
+        }
+        let (system_end, split) = compaction_region_bounds(messages, COMPACTION_KEEP_ROUNDS)?;
+        if split <= system_end {
+            return None;
+        }
+        let region = &messages[system_end..split];
+        // ③工具结果引用替代(近摘要区内;保留尾段不动=近期工作记忆全量保真)
+        let (cleared_region, cleared_n) = clear_tool_results(region, policy.max_clear_tool_results);
+        // ④摘要块占位回注区前(handle_summary_outcome 把首条 [earlier 开头的
+        // System 消息替换为摘要文本;摘要未产(Empty/失败)时占位保留=结构化
+        // 提示,工具结果清除的降压不受影响)
+        let mut body: Vec<Message> = vec![Message::System {
+            content: format!(
+                "[earlier {} messages compacted due to context window pressure]",
+                region.len()
+            ),
+        }];
+        body.extend(cleared_region);
+        // ②滚动摘要(purpose=compaction;保真对照/记忆落链在 helper 内)
+        if let Err(e) = self
+            .handle_summary_outcome(
+                session_id,
+                summarizer,
+                region,
+                &mut body,
+                goal,
+                "compaction",
+            )
+            .await
+        {
+            warn!(
+                %session_id,
+                error = %e,
+                "D3: compaction summary failed, keeping placeholder hint"
+            );
+        }
+        let summary_generated = matches!(
+            &body[0],
+            Message::System { content } if content.starts_with("[earlier conversation summary]")
+        );
+        let mut compacted: Vec<Message> = messages[..system_end].to_vec();
+        compacted.extend(body);
+        compacted.extend_from_slice(&messages[split..]);
+        // F-902:主动压缩事件落 journal(观测面;before/after=全量消息字符数,
+        // 与被动 trim 落账同口径)
+        if let Some(j) = journal {
+            let before: usize = messages.iter().map(|m| m.content().len()).sum();
+            let after: usize = compacted.iter().map(|m| m.content().len()).sum();
+            if let Err(e) = j.compaction_performed(before, after, summary_generated) {
+                warn!(%session_id, error = %e, "compaction_performed journal failed (active)");
+            }
+        }
+        info!(
+            %session_id,
+            region = region.len(),
+            cleared = cleared_n,
+            summary_generated,
+            "D3: active compaction performed (threshold-driven)"
+        );
+        Some(compacted)
     }
 
     /// 会话终态标记（PayloadUpdate，append-only 不改既有事实）。
@@ -3124,6 +3233,7 @@ impl AgentRunner {
                 summary_model: summary_model.clone(),
                 context_window,
                 summarizer: summarizer.clone(),
+                compaction_policy: None,
                 cancel_token: CancellationToken::new(),
                 output_validator,
                 landed_format_instruction: std::sync::Mutex::new(None),
@@ -3403,6 +3513,7 @@ impl AgentRunner {
                             &trim_result.dropped,
                             &mut trim_result.messages,
                             goal,
+                            "summarize",
                         )
                         .await
                     {
@@ -5818,7 +5929,20 @@ impl AgentRunner {
                                         // G2+G10:裁剪 messages(同 handle_call_external)
                                         // G10:如果有 summarizer,裁剪掉的消息生成摘要替换 hint
                                         let messages_to_send = if let Some(ctx) = &runner.context_window {
-                                            let mut trim_result = ctx.trim_detailed(&messages);
+                                            // B21 D3:主动 compaction(阈值触发,先于被动 trim;
+                                            // None=未启用/未触发/无 summarizer——原消息直接走被动 trim)
+                                            let mut trim_result = match runner
+                                                .active_compaction(
+                                                    &session_id,
+                                                    &messages,
+                                                    &goal,
+                                                    journal.as_ref(),
+                                                )
+                                                .await
+                                            {
+                                                Some(compacted) => ctx.trim_detailed(&compacted),
+                                                None => ctx.trim_detailed(&messages),
+                                            };
                                             if !trim_result.dropped.is_empty() {
                                                 info!(
                                                     dropped = trim_result.dropped.len(),
@@ -5835,6 +5959,7 @@ impl AgentRunner {
                                                             &trim_result.dropped,
                                                             &mut trim_result.messages,
                                                             &goal,
+                                                            "summarize",
                                                         )
                                                         .await
                                                     {
@@ -7098,6 +7223,115 @@ impl RewindBudget {
     fn reset(&mut self, limit: u32) {
         self.remaining = limit;
     }
+}
+
+/// B21 D3:主动压缩保留轮数(21 号设计 N=6 默认,非配置面——压缩窗口结构
+/// 参数,与 rewind 预算同属可靠性底线)
+const COMPACTION_KEEP_ROUNDS: usize = 6;
+
+/// B21 D3:主动压缩策略(`longSession.compaction.*` 工作台设置键映射)。
+///
+/// serve 面经 [`AgentRunner::with_compaction_policy`] 注入;CLI 路径不读
+/// 设置(None)=不启用,行为零变化。阈值语义:上下文用量(count,CJK 校准
+/// 计数)≥ 窗口×thresholdPct 即触发——被动 trim(超 budget 才裁)的前置层。
+#[derive(Debug, Clone)]
+pub struct CompactionPolicy {
+    /// 是否启用主动压缩(关=仅被动 trim,现状行为)
+    pub enabled: bool,
+    /// 触发阈值:上下文用量占窗口百分比(50..=95,默认 70)
+    pub threshold_pct: u32,
+    /// 单次压缩最多清除的工具结果条数(0..=200,默认 20;0=不清除,仅摘要)
+    pub max_clear_tool_results: usize,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold_pct: 70,
+            max_clear_tool_results: 20,
+        }
+    }
+}
+
+impl CompactionPolicy {
+    /// 从工作台合并设置构造(schema 默认值兜底+越界钳制;键缺失/类型不符
+    /// =默认值——设置读取面宁缺毋错,与 merged 层默认值双保险)
+    pub fn from_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Self {
+        let mut p = Self::default();
+        if let Some(v) = settings
+            .get("longSession.compaction.enabled")
+            .and_then(serde_json::Value::as_bool)
+        {
+            p.enabled = v;
+        }
+        if let Some(v) = settings
+            .get("longSession.compaction.thresholdPct")
+            .and_then(serde_json::Value::as_f64)
+        {
+            p.threshold_pct = (v.round() as i64).clamp(50, 95) as u32;
+        }
+        if let Some(v) = settings
+            .get("longSession.compaction.maxClearToolResults")
+            .and_then(serde_json::Value::as_f64)
+        {
+            p.max_clear_tool_results = (v.round() as i64).clamp(0, 200) as usize;
+        }
+        p
+    }
+}
+
+/// B21 D3 近摘要区边界(纯函数):返回 `(system_end, split)`——
+/// `messages[system_end..split]` 为近摘要区,`messages[split..]` 为保留的
+/// 最近 `keep_rounds` 轮(轮=User 消息发起;system 前缀=头部连续 System 段)。
+/// User 轮数 ≤ keep_rounds 时无近摘要区(全量保留)→ `None`。
+fn compaction_region_bounds(messages: &[Message], keep_rounds: usize) -> Option<(usize, usize)> {
+    let system_end = messages
+        .iter()
+        .take_while(|m| matches!(m, Message::System { .. }))
+        .count();
+    let user_idxs: Vec<usize> = messages[system_end..]
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, Message::User { .. }))
+        .map(|(i, _)| i + system_end)
+        .collect();
+    if user_idxs.len() <= keep_rounds {
+        return None;
+    }
+    Some((system_end, user_idxs[user_idxs.len() - keep_rounds]))
+}
+
+/// B21 D3 工具结果引用替代(纯函数):按原文长度从大到小清除至多 `max_clear`
+/// 条 tool 消息,原文以 `[cleared: 工具名]` 引用替代(完整原文留存 journal,
+/// 可恢复原则)。返回 `(清除后的消息副本, 实际清除条数)`。
+fn clear_tool_results(region: &[Message], max_clear: usize) -> (Vec<Message>, usize) {
+    if max_clear == 0 {
+        return (region.to_vec(), 0);
+    }
+    let mut tool_idxs: Vec<usize> = region
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, Message::Tool { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    if tool_idxs.is_empty() {
+        return (region.to_vec(), 0);
+    }
+    tool_idxs.sort_by_key(|&i| std::cmp::Reverse(region[i].content().len()));
+    let clear_set: std::collections::HashSet<usize> =
+        tool_idxs.into_iter().take(max_clear).collect();
+    let mut out = region.to_vec();
+    let mut cleared = 0usize;
+    for (i, msg) in out.iter_mut().enumerate() {
+        if clear_set.contains(&i) {
+            if let Message::Tool { content, tool_name } = msg {
+                *content = format!("[cleared: {tool_name}]");
+                cleared += 1;
+            }
+        }
+    }
+    (out, cleared)
 }
 
 #[cfg(test)]

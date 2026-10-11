@@ -343,6 +343,36 @@ pub fn schema() -> Vec<SettingEntry> {
             description: "Markdown 轻量校验（标题跳级/重复、代码围栏配对、行尾空白；关闭即清除现有标记）",
             scope: "window",
         },
+        SettingEntry {
+            key: "longSession.compaction.enabled",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "长会话",
+            description: "长会话主动压缩：上下文用量达到阈值比例时，把近期轮次之外的早期对话生成滚动摘要，并清除区内大块工具结果原文（被清原文以 [cleared: 工具名] 引用替代，完整留存于会话 journal 可查；被动裁剪仍为最后防线）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "longSession.compaction.thresholdPct",
+            kind: SettingType::Number,
+            default: json!(70),
+            enum_values: None,
+            range: Some([50, 95]),
+            category: "长会话",
+            description: "触发主动压缩的上下文用量阈值（占上下文窗口的百分比，默认 70%；宁可早压缩，避免逼近窗口上限才被动裁剪）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "longSession.compaction.maxClearToolResults",
+            kind: SettingType::Number,
+            default: json!(20),
+            enum_values: None,
+            range: Some([0, 200]),
+            category: "长会话",
+            description: "单次主动压缩最多清除的工具结果条数（按原文长度从大到小清除，0 = 只生成摘要不清除原文）",
+            scope: "window",
+        },
     ]
 }
 
@@ -653,7 +683,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 25);
+        assert_eq!(settings.len(), 28);
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -695,6 +725,13 @@ mod tests {
         // problems.* 诊断面 2 键(问题面板/编辑器校验开关)
         assert_eq!(settings["problems.json.validate"], json!(true));
         assert_eq!(settings["problems.markdown.lint"], json!(true));
+        // longSession.compaction.* 3 键(B21 D3):默认开+70%+20 条
+        assert_eq!(settings["longSession.compaction.enabled"], json!(true));
+        assert_eq!(settings["longSession.compaction.thresholdPct"], json!(70));
+        assert_eq!(
+            settings["longSession.compaction.maxClearToolResults"],
+            json!(20)
+        );
         for (k, v) in &sources {
             assert_eq!(v, &json!("default"), "key {k} should be default");
         }

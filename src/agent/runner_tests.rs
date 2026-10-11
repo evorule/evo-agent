@@ -3711,6 +3711,131 @@ fn test_rewind_budget_restored_from_journal_balance() {
     assert_eq!(b.remaining, REWIND_BUDGET_LIMIT - 1);
 }
 
+// ===== B21 D3 主动压缩(近摘要区/工具结果引用替代/策略映射)=====
+
+fn user_msg(content: &str) -> Message {
+    Message::User {
+        content: content.to_string(),
+    }
+}
+
+fn tool_msg(name: &str, content: &str) -> Message {
+    Message::Tool {
+        content: content.to_string(),
+        tool_name: name.to_string(),
+    }
+}
+
+#[test]
+fn test_compaction_region_bounds_keeps_recent_rounds() {
+    // 8 轮 > KEEP 6:近摘要区 = system 之后到第 3 个 User(8-6)前,
+    // split = 第 6 个(自尾数)User 索引
+    let mut msgs: Vec<Message> = vec![Message::System {
+        content: "sys".into(),
+    }];
+    for i in 0..8 {
+        msgs.push(user_msg(&format!("u{i}")));
+        msgs.push(Message::Assistant {
+            content: String::new(),
+            tool_calls: None,
+        });
+        msgs.push(tool_msg("t", "x"));
+    }
+    let (system_end, split) = compaction_region_bounds(&msgs, COMPACTION_KEEP_ROUNDS).unwrap();
+    assert_eq!(system_end, 1);
+    // split = 自尾数第 6 个 User = 第 3 个 User(索引 1+2*3=7):7 之前全入近摘要区
+    assert_eq!(split, 7);
+    assert!(matches!(&msgs[split], Message::User { content } if content == "u2"));
+    assert_eq!(msgs.len() - split, 18, "保留 6 轮×3 消息");
+}
+
+#[test]
+fn test_compaction_region_bounds_no_region_when_few_rounds() {
+    // 轮数 ≤ keep_rounds:无近摘要区(全量保留)
+    let msgs: Vec<Message> = vec![
+        Message::System {
+            content: "sys".into(),
+        },
+        user_msg("u0"),
+        Message::Assistant {
+            content: String::new(),
+            tool_calls: None,
+        },
+        user_msg("u1"),
+    ];
+    assert!(compaction_region_bounds(&msgs, COMPACTION_KEEP_ROUNDS).is_none());
+}
+
+#[test]
+fn test_clear_tool_results_largest_first_within_cap() {
+    // 3 条 tool 结果,上限 2:清最长两条,短条保留原文
+    let region = vec![
+        tool_msg("a", &"x".repeat(10)),
+        user_msg("u"),
+        tool_msg("b", &"y".repeat(100)),
+        tool_msg("c", &"z".repeat(50)),
+    ];
+    let (out, cleared) = clear_tool_results(&region, 2);
+    assert_eq!(cleared, 2);
+    assert_eq!(out[0].content(), region[0].content(), "短条保留");
+    assert_eq!(out[2].content(), "[cleared: b]");
+    assert_eq!(out[3].content(), "[cleared: c]");
+    // 非 tool 消息不受影响
+    assert_eq!(out[1].content(), "u");
+}
+
+#[test]
+fn test_clear_tool_results_zero_cap_and_no_tools() {
+    let region = vec![user_msg("u"), tool_msg("a", "x")];
+    let (out, cleared) = clear_tool_results(&region, 0);
+    assert_eq!(cleared, 0);
+    assert_eq!(out[1].content(), "x", "上限 0 = 不清除");
+    let (out2, cleared2) = clear_tool_results(&[user_msg("u")], 5);
+    assert_eq!(cleared2, 0);
+    assert_eq!(out2.len(), 1);
+}
+
+#[test]
+fn test_compaction_policy_from_settings() {
+    // 键缺失 = 默认值;显式覆盖生效;越界钳制
+    let empty = serde_json::Map::new();
+    let d = CompactionPolicy::from_settings(&empty);
+    assert!(d.enabled);
+    assert_eq!(d.threshold_pct, 70);
+    assert_eq!(d.max_clear_tool_results, 20);
+
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "longSession.compaction.enabled".into(),
+        serde_json::json!(false),
+    );
+    m.insert(
+        "longSession.compaction.thresholdPct".into(),
+        serde_json::json!(80),
+    );
+    m.insert(
+        "longSession.compaction.maxClearToolResults".into(),
+        serde_json::json!(5),
+    );
+    let p = CompactionPolicy::from_settings(&m);
+    assert!(!p.enabled);
+    assert_eq!(p.threshold_pct, 80);
+    assert_eq!(p.max_clear_tool_results, 5);
+
+    let mut m2 = serde_json::Map::new();
+    m2.insert(
+        "longSession.compaction.thresholdPct".into(),
+        serde_json::json!(10),
+    );
+    m2.insert(
+        "longSession.compaction.maxClearToolResults".into(),
+        serde_json::json!(9999),
+    );
+    let p2 = CompactionPolicy::from_settings(&m2);
+    assert_eq!(p2.threshold_pct, 50, "下界钳制");
+    assert_eq!(p2.max_clear_tool_results, 200, "上界钳制");
+}
+
 // ===== 会话即时终止面 =====
 
 /// 轮错误收尾中断面 fail-soft 契约:client 失败(此处不可达端口)不冒泡不 panic;

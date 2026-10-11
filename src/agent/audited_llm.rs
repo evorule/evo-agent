@@ -154,7 +154,8 @@ impl AuditedLlm {
 
     /// 在审计链内执行一次 LLM 调用
     ///
-    /// - `purpose`：用途标签（summarize / session_summary / rollup），作为
+    /// - `purpose`：用途标签（summarize / session_summary / rollup /
+    ///   compaction——B21 D3 主动压缩），作为
     ///   `audit_purpose` 写入命令事实，供审计侧区分调用类别
     /// - `params`：`call_external` 参数对象（model / temperature / max_tokens /
     ///   messages），与直连路径构造方式完全一致；经命令事实进入审计链
