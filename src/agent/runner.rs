@@ -7247,7 +7247,9 @@ pub struct CompactionPolicy {
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // 默认关:被动裁剪(机器确定性面)为缺省路径;LLM 滚动摘要属
+            // LLM 精力开销,需要时由工作台设置显式开启
+            enabled: false,
             threshold_pct: 70,
             max_clear_tool_results: 20,
         }

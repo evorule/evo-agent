@@ -3797,10 +3797,10 @@ fn test_clear_tool_results_zero_cap_and_no_tools() {
 
 #[test]
 fn test_compaction_policy_from_settings() {
-    // 键缺失 = 默认值;显式覆盖生效;越界钳制
+    // 键缺失 = 默认值(默认关,启用属 LLM 精力开销);显式覆盖生效;越界钳制
     let empty = serde_json::Map::new();
     let d = CompactionPolicy::from_settings(&empty);
-    assert!(d.enabled);
+    assert!(!d.enabled);
     assert_eq!(d.threshold_pct, 70);
     assert_eq!(d.max_clear_tool_results, 20);
 
