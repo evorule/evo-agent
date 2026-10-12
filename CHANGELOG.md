@@ -36,6 +36,10 @@
 
 ## [Unreleased]
 
+### 🔒 安全
+
+- **bundle 导出证据闸收紧为 sandbox:-only** — `bundle_export` 工具的前置形状校验（与治理域导出端点同口径）不再接受 `human:<actor>` 人工降级标记：自由文本 actor 可被任意伪造，构成无沙盒验证的 pass 证据导出面。verdict=pass 的 subset 现仅接受 `sandbox:<id>` 机器背书（沙盒报告引用，导入侧可深度校验存在性与报告一致性）；工具 spec 描述与错误文案随动，新增 human: 前缀拒绝回归测试
+
 ### 🆕 新增
 
 - **判定事实演示 agent 定义（verdict-demo）** — `agents/` 新增最小演示定义：单工具面 verdict_submit，由 LLM 自行执行语义判定并以结构化判定事实登记（提案通路口径：入账一律草案态，晋升走机器行权通路）；配合判定事实消费规则可完成「判定→登记→激活→规则条件消费」端到端演示

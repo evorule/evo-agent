@@ -254,14 +254,11 @@ impl ToolFunction for BundleExportTool {
             })
             .unwrap_or_default();
         if verdict == "pass"
-            && (subset.is_empty()
-                || !subset
-                    .iter()
-                    .all(|s| s.starts_with("sandbox:") || s.starts_with("human:")))
+            && (subset.is_empty() || !subset.iter().all(|s| s.starts_with("sandbox:")))
         {
             return Err(
                 "verdict=pass requires traceable evidence: subset must be non-empty and each \
-                 item must start with \"sandbox:<id>\" or \"human:<actor>\""
+                 item must start with \"sandbox:<id>\" (machine attestation sandbox report ref)"
                     .to_string(),
             );
         }
@@ -924,8 +921,7 @@ pub fn specs() -> Vec<ToolSpec> {
                     r#type: "array".to_string(),
                     description: "Traceable test evidence refs (array of strings). Required \
                                   for verdict=pass: each item must be \"sandbox:<id>\" \
-                                  (machine attestation) or \"human:<actor>\" (explicit \
-                                  human downgrade)."
+                                  (machine attestation sandbox report ref)."
                         .to_string(),
                     required: false,
                 },
@@ -1514,7 +1510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bundle_export_pass_with_bad_prefix_rejected() {
-        // pass + subset 存在但前缀不是 sandbox:/human: → 拒绝
+        // pass + subset 存在但前缀不是 sandbox: → 拒绝
         let tool = BundleExportTool::new(make_ws());
         let mut m = serde_json::Map::new();
         m.insert("dataset_id".to_string(), Value::from("ds1"));
@@ -1523,6 +1519,26 @@ mod tests {
         m.insert(
             "subset".to_string(),
             Value::Array(vec![Value::from("opaque-ref")]),
+        );
+        let args = Value::Object(m);
+        let result = tool.call(&args).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("verdict=pass requires traceable evidence"));
+    }
+
+    #[tokio::test]
+    async fn test_bundle_export_pass_with_human_prefix_rejected() {
+        // human:<actor> 人工背书通路已下线（sandbox:-only）：前缀闸直接拒绝
+        let tool = BundleExportTool::new(make_ws());
+        let mut m = serde_json::Map::new();
+        m.insert("dataset_id".to_string(), Value::from("ds1"));
+        m.insert("version".to_string(), Value::from("v1"));
+        m.insert("verdict".to_string(), Value::from("pass"));
+        m.insert(
+            "subset".to_string(),
+            Value::Array(vec![Value::from("human:actor-01")]),
         );
         let args = Value::Object(m);
         let result = tool.call(&args).await;
