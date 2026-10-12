@@ -753,8 +753,8 @@ impl WorkspaceApiClient {
     /// 历史版本快照链，其他值 → 400 显式错误）。
     ///
     /// - `verdict="pass"` 时 `subset` 必须非空且每项以 `sandbox:<id>`（机器背书）
-    ///   或 `human:<actor>`（人工降级）开头——治理域证据形状校验（回归验证 B1），
-    ///   违反 → 400 显式错误；
+    ///   开头——治理域证据形状校验（回归验证 B1，sandbox:-only），违反 → 400
+    ///   显式错误；
     /// - `verdict="fail"` 为显式"未验证"导出（无伪造风险，无 subset 要求）；
     /// - `trim` 为可选裁剪视图语法（`tag:core` / `domain:tax` / `ids:id1,id2`，
     ///   多段以 `;` 分隔，交集）；
