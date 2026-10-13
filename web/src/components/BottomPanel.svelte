@@ -153,9 +153,12 @@
 
   {#if $panelVisible}
     <div class="panel-body" bind:this={listEl} style={`height:${bodyHeight}px`}>
-      {#if $panelTab === 'terminal'}
+      <!-- 终端视图常挂载(display 切换):切 tab 销毁会杀掉全部 PTY 会话,
+           其余 tab 才走 if/else 挂载 -->
+      <div class="panel-slot" style:display={$panelTab === 'terminal' ? '' : 'none'}>
         <TerminalView />
-      {:else if $panelTab === 'output'}
+      </div>
+      {#if $panelTab === 'output'}
         {#if $sysEvents.length === 0}
           <div class="empty">暂无输出。与 agent 对话后,系统事件(SessionCreated / Done / Info 等)在此流水呈现。</div>
         {:else}
@@ -257,6 +260,10 @@
   .collapse-btn:hover {
     color: var(--text-primary);
     background: var(--bg-hover);
+  }
+  .panel-slot {
+    height: 100%;
+    min-height: 0;
   }
   .panel-body {
     overflow-y: auto;

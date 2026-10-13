@@ -1284,12 +1284,53 @@ GET /api/lsp/ws?lang=rust|typescript&token={token}
 
 ---
 
+## 16. 工作台终端面
+
+工作台集成终端（人的终端，PTY）。治理分级（人机双轨）：终端是**用户自有通道**——
+会话创建/关闭以治理事件留痕（展示层，经 WS 控制帧下发前端治理流水），**会话内命令
+零审批零拦截**（UI 明示）；agent 的命令执行走命令执行工具的既有三层审批，两通道互不
+相通。PTY 字节流不进 agent 审计链、不进 LLM 上下文。挂鉴权中间件，`?token=` fallback
+与会话 WS 同口径。
+
+### 16.1 WS 终端流
+
+```
+GET /api/pty/ws?term={id}&cols={n}&rows={n}&token={token}
+```
+
+- 初始尺寸来自前端 fit 实测（ConPTY 零尺寸坑）；每终端单连接，并发上限 8（超限 409）
+- shell 发现序：Windows PowerShell→CMD→Git Bash；unix `$SHELL`→bash→sh；设置
+  `terminal.shell` 指定路径时直接采用
+
+**上行**：
+
+- **Binary** = 键盘字节（透传 shell）
+- **Text** 控制帧（白名单外丢弃）：
+  - `{"type":"resize","cols":n,"rows":n}`
+  - `{"type":"pause"}` / `{"type":"resume"}`（背压：前端写队列 100KB/10KB 水位）
+
+**下行**：
+
+- **Binary** = PTY 输出
+- **Text** 控制帧：
+  - `{"type":"gov_event","event":{"action":"pty.created","termId",...,"approver":"human"}}`
+  - `{"type":"gov_event","event":{"action":"pty.closed","termId","reason","exitCode"}}`
+    （reason: `exited` 正常退出 / `client-closed` 断连回收 / `writer-gone`）
+  - `{"type":"exit","code":n}`（shell 退出码；前端灰置+重启按钮）
+  - `{"type":"error","hint":"..."}`（spawn 失败引导）
+
+**生命周期**：WS 断开即树级回收进程（Windows `taskkill /T`，unix 进程组 kill）——防孤儿。
+
+---
+
 ## 版本变更日志
 
 ### Unreleased (2026-10-13)
 
 - 新增工作台 LSP 面（§15）：`GET /api/lsp/status` 语言门检测与 `GET /api/lsp/ws`
   透明转发（每语言单连接单实例、退避重启治理、evoPath 诊断桥）
+- 新增工作台终端面（§16）：`GET /api/pty/ws` 真实 PTY 流（人机双轨治理分级：
+  会话留痕+会话内零拦截；并发上限 8；断连树级回收）
 
 ### v0.2.0 (2026-09-27)
 

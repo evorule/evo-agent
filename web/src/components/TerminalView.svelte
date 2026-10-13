@@ -9,6 +9,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
   import { terminalIntent } from '../lib/panel.js';
   import {
     createTerminalSession,
+    peekNextTerminalId,
     disposeTerminalSession,
     killTerminalSession,
     listTerminalSessions,
@@ -20,41 +21,52 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     instances,
   } from '../lib/pty.js';
 
-  /** termId 清单(pty.js 变更回调驱动刷新) */
-  let ids = [];
-  let activeId = null;
-  let containerWrap = null;
+  // runes 模式($state/$derived/$effect):legacy $: 在本组件的创建流程上
+  // 响应性不可靠(真机实证:第二实例 slots 不更新),runes 语义确定
+  let ids = $state([]);
+  let activeId = $state(null);
+  let creatingId = $state(null);
+  let containerWrap = $state(null);
   /** 每实例 DOM 挂载点(termId → node;use:action 注册) */
   const mounts = new Map();
-  let showSearch = false;
-  let searchQuery = '';
+  let showSearch = $state(false);
+  let searchQuery = $state('');
 
-  $: ids = listTerminalSessions().map((s) => s.termId);
-  $: if (activeId && activeId !== '__pending__' && !instances.has(activeId)) {
-    activeId = ids.length ? ids[ids.length - 1] : null;
-  }
+  const slots = $derived([...new Set(creatingId ? [...ids, creatingId] : ids)]);
 
   function refresh() {
     ids = listTerminalSessions().map((s) => s.termId);
-    if (activeId && activeId !== '__pending__' && !instances.has(activeId)) {
+    if (activeId && !instances.has(activeId) && activeId !== creatingId) {
       activeId = ids.length ? ids[ids.length - 1] : null;
     }
   }
 
-  /** 新建:'__pending__' 槽位挂载时由 action 真正创建(等容器可测尺寸) */
+  // 活动实例被关:回落到末位
+  $effect(() => {
+    if (activeId && !instances.has(activeId) && activeId !== creatingId) {
+      activeId = ids.length ? ids[ids.length - 1] : null;
+    }
+  });
+
+  /** 新建:先定 id 渲染槽位,action 里创建(keyed each 保元素) */
   function newTerminal() {
-    if (activeId === '__pending__') return;
-    activeId = '__pending__';
+    window.__nt = (window.__nt || 0) + 1;
+    console.log('[termdbg] newTerminal called, creatingId was', creatingId);
+    if (creatingId) return;
+    creatingId = peekNextTerminalId();
+    activeId = creatingId;
+    console.log('[termdbg] creatingId set to', creatingId);
   }
+  window.__termDebug = { newTerminal, refresh: () => refresh() };
 
   function mountAction(node, id) {
     mounts.set(id, node);
-    if (id === '__pending__') {
-      const inst = createTerminalSession(node);
+    if (id === creatingId) {
+      const inst = createTerminalSession(node, id);
       inst.onSearchIntent = () => (showSearch = true);
-      activeId = inst.termId;
       attachWebgl(inst);
       requestAnimationFrame(() => refitTerminal(inst));
+      creatingId = null;
     }
     return {
       destroy() {
@@ -112,22 +124,30 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
 
   // 命令意图消费(一次性):terminal.new/kill/clear → 本视图动作
   let lastIntent = null;
-  $: if ($terminalIntent && $terminalIntent !== lastIntent) {
-    lastIntent = $terminalIntent;
-    if ($terminalIntent === 'new') newTerminal();
-    else if ($terminalIntent === 'kill') closeTerminal(activeId);
-    else if ($terminalIntent === 'clear') clearActive();
-    terminalIntent.set(null);
-  }
+  $effect(() => {
+    if ($terminalIntent && $terminalIntent !== lastIntent) {
+      lastIntent = $terminalIntent;
+      if ($terminalIntent === 'new') newTerminal();
+      else if ($terminalIntent === 'kill') closeTerminal(activeId);
+      else if ($terminalIntent === 'clear') clearActive();
+      terminalIntent.set(null);
+    }
+  });
 
   onMount(() => {
     setTerminalNotify(refresh);
-    // 面板尺寸变化(sash 拖拽/窗口缩放)→ refit active 实例
+  });
+
+  // 面板尺寸变化(sash 拖拽/窗口缩放/切实例)→ refit active 实例
+  $effect(() => {
+    if (!containerWrap) return;
+    const inst = getTerminalSession(activeId);
     const ro = new ResizeObserver(() => {
-      const inst = getTerminalSession(activeId);
-      if (inst) refitTerminal(inst);
+      const cur = getTerminalSession(activeId);
+      if (cur) refitTerminal(cur);
     });
-    if (containerWrap) ro.observe(containerWrap);
+    ro.observe(containerWrap);
+    if (inst) refitTerminal(inst);
     return () => ro.disconnect();
   });
 
@@ -140,20 +160,17 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
 <div class="terminal-view" bind:this={containerWrap}>
   <div class="term-toolbar">
     <div class="chips">
-      {#each ids as id (id)}
+      {#each slots as id (id)}
         <button class="chip" class:active={id === activeId} onclick={() => activate(id)}>
           <span class="dot" class:exited={getTerminalSession(id)?.state === 'exited'}>●</span>
           {id}
         </button>
       {/each}
-      {#if activeId === '__pending__'}
-        <button class="chip active"><span class="dot">●</span>连接中…</button>
-      {/if}
     </div>
     <div class="actions">
       <button class="tbtn" onclick={newTerminal} title="新建终端">＋</button>
-      <button class="tbtn" onclick={clearActive} title="清屏" disabled={!activeId || activeId === '__pending__'}>清屏</button>
-      <button class="tbtn" onclick={() => closeTerminal(activeId)} title="关闭当前终端" disabled={!activeId || activeId === '__pending__'}>×</button>
+      <button class="tbtn" onclick={clearActive} title="清屏" disabled={!activeId}>清屏</button>
+      <button class="tbtn" onclick={() => closeTerminal(activeId)} title="关闭当前终端" disabled={!activeId}>×</button>
     </div>
   </div>
 
@@ -175,25 +192,20 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
   {/if}
 
   <div class="term-body">
-    {#if ids.length === 0 && activeId !== '__pending__'}
+    {#if slots.length === 0}
       <div class="term-empty">
         <div>暂无终端会话。</div>
         <button class="new-btn" onclick={newTerminal}>新建终端</button>
         <div class="gov-note">用户自有终端：命令不经过审批，会话留痕于治理日志（审计 tab 可见）。</div>
       </div>
     {:else}
-      {#each ids as id (id)}
-        {#if id === activeId || getTerminalSession(id)}
-          <div class="term-slot" style:display={id === activeId ? '' : 'none'} use:mountAction={id}></div>
-        {/if}
+      {#each slots as id (id)}
+        <div class="term-slot" style:display={id === activeId ? '' : 'none'} use:mountAction={id}></div>
       {/each}
-      {#if activeId === '__pending__'}
-        <div class="term-slot" use:mountAction={'__pending__'}></div>
-      {/if}
     {/if}
   </div>
 
-  {#if activeId && activeId !== '__pending__' && getTerminalSession(activeId)?.state === 'exited'}
+  {#if activeId && getTerminalSession(activeId)?.state === 'exited'}
     <div class="exit-overlay">
       <span>
         终端已退出{getTerminalSession(activeId)?.exitCode != null
@@ -203,7 +215,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
       <button class="new-btn" onclick={restartTerminal}>重启终端</button>
     </div>
   {/if}
-  {#if activeId && activeId !== '__pending__' && getTerminalSession(activeId)?.state === 'error'}
+  {#if activeId && getTerminalSession(activeId)?.state === 'error'}
     <div class="exit-overlay">
       <span>{getTerminalSession(activeId)?.hint || '终端启动失败'}</span>
       <button class="new-btn" onclick={restartTerminal}>重试</button>
