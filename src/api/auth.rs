@@ -127,6 +127,85 @@ impl AuthConfig {
     }
 }
 
+// =============================================================================
+// SG-0 fail-closed:serve 启动期鉴权姿态决策
+// =============================================================================
+//
+// 改造前(G7 旧缺省):无任何鉴权配置 -> AuthConfig::disabled(),静默放行。
+// 后果:启动横幅照样把每个端点标成 `(auth)`,但实际全开 —— 横幅与事实相反,
+// 且 `serve --port 8081` 这类裸命令把整个 agent API 暴露给本机任何进程。
+//
+// 改造后(SG-0):缺省不再是「静默 disabled」,而是按**绑定面**分流:
+//   - 已配 token            -> Enabled          (正常)
+//   - 显式 `--no-auth`      -> ExplicitNoAuth   (本地开发豁免,告警不拦)
+//   - 缺省无 token + 回环   -> LoopbackDegraded (降级放行 + 显著告警)
+//   - 缺省无 token + 对外   -> RefuseExternalBind (**拒起**)
+// 决策是纯函数(无 IO、无 DNS),启动期单测可直接覆盖。
+
+/// 判定监听地址是否属于回环(loopback)。
+///
+/// SG-0 fail-closed 的判据:缺省无鉴权时,只有绑定回环才是「仅本机可达」的
+/// 可降级形态;`0.0.0.0` / `::` / 任何具体对外 IP 一律视为对外暴露。
+///
+/// 空字符串按 CLI 缺省(= `127.0.0.1`)处理,视为回环。
+/// 主机名只认 `localhost`;不做 DNS 解析(避免启动期网络依赖与 TOCTOU)。
+pub fn is_loopback_bind(host: &str) -> bool {
+    let h = host.trim();
+    if h.is_empty() {
+        return true;
+    }
+    // IPv6 字面量可能带方括号:`[::1]`
+    let h = h.trim_start_matches('[').trim_end_matches(']');
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    h.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// serve 启动期的鉴权姿态(SG-0 fail-closed 决策产物)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthPosture {
+    /// 鉴权已开启,正常放行。
+    Enabled,
+    /// 显式 `--no-auth`:本地开发豁免。显著告警但不拦。
+    ExplicitNoAuth,
+    /// 缺省无鉴权 + 回环绑定:降级放行 + 显著告警(仅本机可达)。
+    LoopbackDegraded,
+    /// 缺省无鉴权 + 对外绑定:fail-closed 的真正收口 —— **拒起**。
+    RefuseExternalBind {
+        /// 触发拒起的监听地址(诊断用)
+        host: String,
+    },
+}
+
+/// SG-0 fail-closed 决策。
+///
+/// - `auth_enabled`     : 最终解析出的鉴权是否开启(--no-auth / --auth-token / 配置文件)
+/// - `explicit_no_auth` : 是否由 CLI 显式传入 `--no-auth`(开发豁免,不看绑定面)
+/// - `host`             : 监听地址(仅 host,不含端口)
+pub fn decide_auth_posture(
+    auth_enabled: bool,
+    explicit_no_auth: bool,
+    host: &str,
+) -> AuthPosture {
+    if auth_enabled {
+        return AuthPosture::Enabled;
+    }
+    if explicit_no_auth {
+        // 显式旗标 = 人的明确决定,豁免 fail-closed(但仍告警)
+        return AuthPosture::ExplicitNoAuth;
+    }
+    if is_loopback_bind(host) {
+        AuthPosture::LoopbackDegraded
+    } else {
+        AuthPosture::RefuseExternalBind {
+            host: host.to_string(),
+        }
+    }
+}
+
 /// 从请求中提取 token
 ///
 /// 优先级:
@@ -489,5 +568,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // =====================================================================
+    // SG-0 fail-closed:姿态决策
+    // =====================================================================
+
+    #[test]
+    fn test_loopback_recognized() {
+        for h in [
+            "127.0.0.1",
+            "127.0.0.53",
+            "127.1.2.3", // 整个 127.0.0.0/8 都是回环
+            "::1",
+            "[::1]",
+            "localhost",
+            "LocalHost",
+            "  127.0.0.1  ",
+            "", // CLI 缺省 = 127.0.0.1
+        ] {
+            assert!(is_loopback_bind(h), "should be loopback: {h:?}");
+        }
+    }
+
+    #[test]
+    fn test_non_loopback_rejected() {
+        for h in [
+            "0.0.0.0",     // 监听全部网卡 = 对外暴露
+            "::",          // IPv6 全部网卡
+            "[::]",
+            "192.168.1.5",
+            "10.0.0.3",
+            "example.com", // 非 localhost 的主机名,不做 DNS 解析,一律判对外
+        ] {
+            assert!(!is_loopback_bind(h), "should NOT be loopback: {h:?}");
+        }
+    }
+
+    #[test]
+    fn test_posture_enabled_when_auth_on() {
+        // 有 token 时,绑定面无关,一律 Enabled(哪怕对外绑定)
+        assert_eq!(decide_auth_posture(true, false, "0.0.0.0"), AuthPosture::Enabled);
+        assert_eq!(decide_auth_posture(true, false, "127.0.0.1"), AuthPosture::Enabled);
+    }
+
+    #[test]
+    fn test_posture_default_loopback_degraded_not_refused() {
+        // 关键回归:改造前这条路径静默 disabled 全开;
+        // 改造后仍放行(比赛线/本机开发不被打断),但必须进入可告警姿态。
+        assert_eq!(
+            decide_auth_posture(false, false, "127.0.0.1"),
+            AuthPosture::LoopbackDegraded
+        );
+    }
+
+    #[test]
+    fn test_posture_default_external_bind_refuses_startup() {
+        // 真正的收口:缺省无 token + 对外绑定 = 拒起
+        assert_eq!(
+            decide_auth_posture(false, false, "0.0.0.0"),
+            AuthPosture::RefuseExternalBind {
+                host: "0.0.0.0".to_string()
+            }
+        );
+        assert_eq!(
+            decide_auth_posture(false, false, "::"),
+            AuthPosture::RefuseExternalBind {
+                host: "::".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_posture_explicit_no_auth_overrides_external_bind() {
+        // 显式 --no-auth 是人的明确决定,豁免拒起(本地开发要能 0.0.0.0 起)
+        assert_eq!(
+            decide_auth_posture(false, true, "0.0.0.0"),
+            AuthPosture::ExplicitNoAuth
+        );
     }
 }

@@ -1629,7 +1629,13 @@ fn cmd_config(workdir: &Path) -> ExitCode {
 /// - `POST /agents/{t}/cancel?session_id=xxx` — 取消正在运行的 session(G6,G7:需鉴权)
 /// - `POST /agents/{t}/approve` — 审批 candidate 工具调用(G8,G7:需鉴权)
 ///
-/// G7 鉴权配置优先级:CLI `--auth-token`/`--no-auth` > 环境变量 > 配置文件 > 默认(disabled)
+/// G7 鉴权配置优先级:CLI `--auth-token`/`--no-auth` > 环境变量 > 配置文件 > 缺省
+///
+/// **SG-0 fail-closed(SG 批施工)**:缺省不再是「静默 disabled」。无 token 时按绑定面分流:
+/// - 回环绑定(默认 `--host 127.0.0.1`)→ 降级放行 + 显著告警(本机开发/比赛线不被打断)
+/// - 对外绑定(`0.0.0.0` / `::` / 具体 IP)→ **拒起,exit 1**
+///
+/// 显式 `--no-auth` 保留为本地开发豁免旗标(告警但不拦)。
 ///
 /// 优雅关闭:Ctrl+C / SIGTERM → 停止接受新连接,等待在途请求完成。
 fn cmd_serve(
@@ -1640,7 +1646,7 @@ fn cmd_serve(
     no_auth: bool,
 ) -> ExitCode {
     use evo_agent::api::agent_api;
-    use evo_agent::api::auth::AuthConfig;
+    use evo_agent::api::auth::{AuthConfig, AuthPosture};
     use tower_http::cors::CorsLayer;
     use tower_http::limit::RequestBodyLimitLayer;
 
@@ -1698,13 +1704,73 @@ fn cmd_serve(
         config.auth.to_auth_config()
     };
 
+    // 鉴权是否开启在此固化一次：auth_config 稍后会被 move 进 router
+    // (router_with_auth 接管所有权),横幅不能再借用它。
+    let auth_enabled = auth_config.enabled();
+
+    // 3.1 SG-0 fail-closed:无任何鉴权配置不再是「静默 disabled」。
+    //     改造前此处只有一行 `[auth] HTTP API authentication disabled`,而下方横幅
+    //     仍把每个端点标成 `(auth)` —— 横幅与事实相反,且裸 `serve --port 8081`
+    //     会把 agent API 全开。现在按**绑定面**分流:
+    //       已配 token          -> 正常放行
+    //       显式 --no-auth      -> 豁免(本地开发),显著告警
+    //       缺省无 token + 回环 -> 降级放行 + 显著告警(比赛线/本机开发不被打断)
+    //       缺省无 token + 对外 -> **拒起**
+    //     决策本身是 auth::decide_auth_posture 纯函数,单测覆盖全部分支。
+    let posture = evo_agent::api::auth::decide_auth_posture(auth_config.enabled(), no_auth, host);
+
     if auth_config.enabled() {
         eprintln!(
             "[auth] HTTP API authentication enabled ({} token(s))",
             auth_tokens.len().max(config.auth.tokens.len())
         );
     } else {
-        eprintln!("[auth] HTTP API authentication disabled");
+        match &posture {
+            AuthPosture::ExplicitNoAuth => {
+                eprintln!(
+                    "[auth] WARNING: authentication DISABLED by explicit --no-auth flag (bind {})",
+                    host
+                );
+                eprintln!(
+                    "[auth] WARNING: every agent API endpoint is OPEN to anyone who can reach {}. \
+                     Local development only - never on a shared host or an exposed interface.",
+                    host
+                );
+            }
+            AuthPosture::LoopbackDegraded => {
+                eprintln!(
+                    "[auth] WARNING: no auth token configured (fail-closed degraded mode), \
+                     bound to loopback {} - reachable from this machine only.",
+                    host
+                );
+                eprintln!(
+                    "[auth] WARNING: every agent API endpoint is OPEN to any local process. \
+                     Set a token via --auth-token / [auth] tokens in evo-agent.toml / \
+                     EVO_AGENT_AUTH__TOKENS, or pass --no-auth to acknowledge this explicitly."
+                );
+            }
+            AuthPosture::RefuseExternalBind { host: h } => {
+                eprintln!(
+                    "[auth] REFUSING TO START: no auth token configured, but binding to \
+                     non-loopback address {}.",
+                    h
+                );
+                eprintln!(
+                    "[auth] Refusing because that would expose the agent API \
+                     (agents / run / cancel / approve / llm-status) to the network with NO authentication."
+                );
+                eprintln!(
+                    "[auth] Fix one of:\n\
+                     \x20             (a) provide a token: --auth-token <secret>  |  \
+                     [auth] tokens in evo-agent.toml  |  EVO_AGENT_AUTH__TOKENS=<secret>\n\
+                     \x20             (b) bind loopback only: --host 127.0.0.1\n\
+                     \x20             (c) local dev only, acknowledge explicitly: --no-auth"
+                );
+                return ExitCode::from(1);
+            }
+            // auth_config.enabled() 为真时上面已分支,不会落到这里
+            AuthPosture::Enabled => unreachable!("Enabled posture handled by the if-branch above"),
+        }
     }
 
     // 4. 构造 API state
@@ -1982,16 +2048,23 @@ fn cmd_serve(
         }
     };
 
+    // SG-0:横幅必须说真话。改造前这里硬编码 "(auth)",但 auth 关闭时端点其实全开,
+    // 排障时横幅会把人引向错误结论。守卫标签按**实际**鉴权状态渲染。
+    let guard = if auth_enabled {
+        "auth"
+    } else {
+        "OPEN, NO AUTH"
+    };
     eprintln!("evo-agent HTTP server listening on http://{}", addr);
     eprintln!("  GET  /                       (workbench UI, web/dist)");
-    eprintln!("  GET  /health                  (no auth)");
-    eprintln!("  GET  /metrics                 (no auth, Prometheus G17)");
-    eprintln!("  GET  /admin/llm-status        (auth, masked LLM config status)");
-    eprintln!("  GET  /agents                  (auth)");
-    eprintln!("  POST /agents/{{type}}/run          (auth)");
-    eprintln!("  POST /agents/{{type}}/run/stream   (auth, SSE)");
-    eprintln!("  POST /agents/{{type}}/cancel       (auth)");
-    eprintln!("  POST /agents/{{type}}/approve      (auth, G8)");
+    eprintln!("  GET  /health                  (public)");
+    eprintln!("  GET  /metrics                 (public, Prometheus G17)");
+    eprintln!("  GET  /admin/llm-status        ({guard}, masked LLM config status)");
+    eprintln!("  GET  /agents                  ({guard})");
+    eprintln!("  POST /agents/{{type}}/run          ({guard})");
+    eprintln!("  POST /agents/{{type}}/run/stream   ({guard}, SSE)");
+    eprintln!("  POST /agents/{{type}}/cancel       ({guard})");
+    eprintln!("  POST /agents/{{type}}/approve      ({guard}, G8)");
     eprintln!("press Ctrl+C to shut down");
 
     runtime.block_on(async {
