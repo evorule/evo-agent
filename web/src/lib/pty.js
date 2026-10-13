@@ -40,9 +40,24 @@ function ptyUrl(termId, cols, rows) {
   return `${proto}://${location.host}/api/pty/ws?term=${encodeURIComponent(termId)}&cols=${cols}&rows=${rows}${token() ? `&token=${encodeURIComponent(token())}` : ''}`;
 }
 
-/** 创建一个终端实例并连接 PTY。container 为 xterm 挂载节点。 */
-export function createTerminalSession(container) {
-  const termId = `term-${++counter}`;
+/** 预取下一个实例 id(视图层先渲染槽位再创建,防 DOM 换键重建) */
+export function peekNextTerminalId() {
+  return `term-${counter + 1}`;
+}
+
+
+/** 创建一个终端实例并连接 PTY。container 为 xterm 挂载节点;id 可预指定。 */
+export function createTerminalSession(container, forcedId) {
+  let termId;
+  if (forcedId) {
+    termId = forcedId;
+    // 计数器与预指定 id 对齐(peek 语义:term-N → counter=N),否则 peek 恒返回
+    // 同一 id,第二次创建会同 key 覆盖首实例(真机实证)
+    const n = parseInt(String(forcedId).replace('term-', ''), 10);
+    if (Number.isFinite(n) && n > counter) counter = n;
+  } else {
+    termId = `term-${++counter}`;
+  }
   const fontSize = Number(getSetting('terminal.fontSize') ?? 14);
   const scrollback = Number(getSetting('terminal.scrollback') ?? 1000);
 
@@ -59,7 +74,12 @@ export function createTerminalSession(container) {
   term.loadAddon(fit);
   term.loadAddon(search);
   term.loadAddon(new Unicode11Addon());
-  term.unicode.activeVersion = 'unicode11';
+  // xterm 6 改名:activeVersion(v5)→activeProvider(v6);失败回落默认宽度处理
+  try {
+    term.unicode.activeProvider = 'unicode11';
+  } catch {
+    /* CJK 宽度修正不可用 */
+  }
   term.open(container);
   try {
     fit.fit();
