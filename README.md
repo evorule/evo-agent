@@ -772,6 +772,7 @@ evo-agent/
 ├── docs/
 │   ├── API.md
 │   ├── RELEASE_PROCESS.md           # 发布流程
+│   ├── TELEMETRY.md                 # 遥测透明度声明
 │   └── security/                    # 安全设计文档
 ├── src/
 │   ├── lib.rs                       # 入口 + 公共契约面登记
