@@ -249,6 +249,8 @@ pub struct AgentApiState {
     fs_events: crate::api::fs_watch::FsEventHub,
     /// 人工审计账(HumanGate 写面操作 JSONL;data/human_gate_ledger.jsonl)
     human_gate: Arc<crate::api::human_gate::HumanGateLedger>,
+    /// LSP 语言服务器活动连接注册表(每语言单连接单实例)
+    lsp_registry: Arc<crate::lsp::LangRegistry>,
 }
 
 impl AgentApiState {
@@ -305,6 +307,7 @@ impl AgentApiState {
                     .unwrap_or_else(|e| panic!("failed to init workbench settings store: {e}")),
             ),
             human_gate: Arc::new(crate::api::human_gate::HumanGateLedger::new(&workdir)),
+            lsp_registry: Arc::new(crate::lsp::LangRegistry::new()),
             fs_events: crate::api::fs_watch::FsEventHub::new(),
             workdir,
             workspace_client,
@@ -403,6 +406,11 @@ impl AgentApiState {
     /// HumanGate:获取人工审计账的引用(写面操作/拒绝留痕)
     pub fn human_gate(&self) -> &crate::api::human_gate::HumanGateLedger {
         &self.human_gate
+    }
+
+    /// LSP:获取语言服务器活动连接注册表的引用(每语言单连接单实例)
+    pub fn lsp_registry(&self) -> &crate::lsp::LangRegistry {
+        &self.lsp_registry
     }
 
     /// G16:获取 AgentDefinitionManager 的引用(WebSocket handler 构造 runner)
@@ -551,6 +559,16 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route(
             "/api/files/replace",
             axum::routing::post(crate::api::file_api::replace_files),
+        )
+        // LSP 代理面(人工编辑辅助,零 agent 工具面):两语言门状态检测 + WS
+        // 透明转发(每语言单连接单实例);G16 中间件自动覆盖,WS 内二次校验
+        .route(
+            "/api/lsp/status",
+            axum::routing::get(crate::api::lsp_api::status),
+        )
+        .route(
+            "/api/lsp/ws",
+            axum::routing::get(crate::api::lsp_api::lsp_ws),
         )
         // 工作台 Git 面(B3,人工面):SCM 视图/diff/暂存/丢弃/提交 —— 薄委托
         // git::GitOps 核心层;身份缺失只引导不代写 config;G16 中间件自动覆盖

@@ -344,6 +344,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "window",
         },
         SettingEntry {
+            key: "lsp.enabled",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "语言服务器",
+            description: "LSP 语言服务器接入（rust-analyzer / typescript-language-server，PATH 检测，缺失自动灰置；关闭即断开连接并清除全部 lsp.* 诊断）",
+            scope: "window",
+        },
+        SettingEntry {
             key: "longSession.compaction.enabled",
             kind: SettingType::Boolean,
             default: json!(false),
@@ -683,7 +693,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 28);
+        assert_eq!(settings.len(), 29); // 计数锁:新增键须同步(scheme 单源纪律)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
