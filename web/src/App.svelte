@@ -198,6 +198,9 @@
 
   onMount(() => {
     restoreSplit(); // 恢复上次分屏状态(路径元数据,localStorage)
+    window.addEventListener('unhandledrejection', (e) => {
+      try { localStorage.setItem('dbg_rej', String(e.reason).slice(0, 250)); } catch {}
+    });
     registerCommand({
       id: 'workbench.action.showCommands',
       title: '显示全部命令',

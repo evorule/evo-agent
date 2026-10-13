@@ -66,15 +66,20 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随后续批
           return; // 读取失败:静默(副组不建错误占位)
         }
       }
-      model = monaco.editor.createModel(
-        content,
-        langOf(path),
-        monaco.Uri.parse(uriSpecFor(path)),
-      );
+      try {
+        model = monaco.editor.createModel(
+          content,
+          langOf(path),
+          monaco.Uri.parse(uriSpecFor(path)),
+        );
+      } catch (e) {
+        model = monaco.editor.getModel(monaco.Uri.parse(uriSpecFor(path))) || null;
+      }
+      if (!model) return;
       model.updateOptions({ tabSize: appearance().tabSize });
       registerModel(path, model);
       if (!hasBaseline(path)) setBaseline(path, content);
-      model.onDidChangeModelContent(() => {
+      model.onDidChangeContent(() => {
         if (get(splitPath) === path) {
           markDirty(path, model.getValue() !== getBaseline(path));
         }
@@ -144,19 +149,11 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随后续批
         markDirty(path, model.getValue() !== getBaseline(path));
       }
     });
-    if ($splitPath) openInSplit($splitPath);
-    const unsub = splitPath.subscribe((p) => {
-      if (p && editor) openInSplit(p);
-    });
-    const unsubPersist = splitOpen.subscribe(() => persistSplit());
     window.addEventListener('keydown', onKeydown);
-    return () => {
-      unsub();
-      unsubPersist();
-      window.removeEventListener('keydown', onKeydown);
-      persistSplit();
-    };
   });
+
+  // 三者就绪即开(hostEl 绑定/editor 实例/路径)——单一响应语句,免订阅时序耦合
+  $: if (hostEl && editor && $splitPath) openInSplit($splitPath);
 
   onDestroy(() => {
     if (editor) editor.dispose();

@@ -42,6 +42,7 @@
   import { initLsp, notifySaved } from '../lib/lsp/index.js';
   import {
     getModelForPath,
+    hasModel,
     registerModel,
     releaseModel,
     allModels,
