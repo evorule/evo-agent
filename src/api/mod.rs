@@ -23,6 +23,7 @@ pub mod session_index;
 pub mod settings;
 pub mod skill_api;
 pub mod snapshots;
+pub mod task_api;
 pub mod workspace_client;
 pub mod ws_handler;
 

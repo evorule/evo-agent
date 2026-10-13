@@ -253,6 +253,8 @@ pub struct AgentApiState {
     lsp_registry: Arc<crate::lsp::LangRegistry>,
     /// PTY 终端会话计数护栏(并发上限 8)
     pty_registry: Arc<crate::pty::PtyRegistry>,
+    /// 任务运行注册表(run_id→运行记录;并发上限 4)
+    task_manager: Arc<crate::tasks::TaskManager>,
 }
 
 impl AgentApiState {
@@ -311,6 +313,7 @@ impl AgentApiState {
             human_gate: Arc::new(crate::api::human_gate::HumanGateLedger::new(&workdir)),
             lsp_registry: Arc::new(crate::lsp::LangRegistry::new()),
             pty_registry: Arc::new(crate::pty::PtyRegistry::new()),
+            task_manager: Arc::new(crate::tasks::TaskManager::new()),
             fs_events: crate::api::fs_watch::FsEventHub::new(),
             workdir,
             workspace_client,
@@ -419,6 +422,11 @@ impl AgentApiState {
     /// PTY:获取终端会话计数护栏的引用(并发上限)
     pub fn pty_registry(&self) -> &crate::pty::PtyRegistry {
         &self.pty_registry
+    }
+
+    /// 任务:获取运行注册表的共享句柄(run_id→运行记录)
+    pub fn task_manager(&self) -> Arc<crate::tasks::TaskManager> {
+        self.task_manager.clone()
     }
 
     /// G16:获取 AgentDefinitionManager 的引用(WebSocket handler 构造 runner)
@@ -583,6 +591,24 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route(
             "/api/pty/ws",
             axum::routing::get(crate::api::pty_api::pty_ws),
+        )
+        // 工作台任务面(人的显式动作,永不自动运行;两段式取消+树杀;G16 中间件
+        // 自动覆盖,WS 内二次校验)
+        .route(
+            "/api/tasks",
+            axum::routing::get(crate::api::task_api::list_tasks),
+        )
+        .route(
+            "/api/tasks/run",
+            axum::routing::post(crate::api::task_api::run_task),
+        )
+        .route(
+            "/api/tasks/{run_id}/cancel",
+            axum::routing::post(crate::api::task_api::cancel_task),
+        )
+        .route(
+            "/api/tasks/ws",
+            axum::routing::get(crate::api::task_api::task_ws),
         )
         // 工作台 Git 面(B3,人工面):SCM 视图/diff/暂存/丢弃/提交 —— 薄委托
         // git::GitOps 核心层;身份缺失只引导不代写 config;G16 中间件自动覆盖
