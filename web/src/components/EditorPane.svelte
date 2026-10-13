@@ -40,6 +40,17 @@
     saveWorkspaceSettingsDoc,
   } from '../lib/settings.js';
   import { initLsp, notifySaved } from '../lib/lsp/index.js';
+  import {
+    getModelForPath,
+    registerModel,
+    releaseModel,
+    allModels,
+    renameModelKey,
+    getBaseline,
+    setBaseline,
+    deleteBaseline,
+    renameBaseline,
+  } from '../lib/modelRegistry.js';
 
   const welcomeText = `# evo-agent 工作台
 
@@ -71,9 +82,7 @@
   /** LSP 装配清理函数(onMount 异步赋值;onDestroy 调用) */
   let disposeLsp = null;
   /** path → monaco model(含 undo 栈与编辑状态) */
-  const models = new Map();
   /** path → 保存基线内容(对比判 dirty) */
-  const baseline = new Map();
   /** path → 打开失败的错误占位 model(缓存防重复创建) */
   const errorModels = new Map();
   /** path → agent 草稿基线 model(diff 视图左栏) */
@@ -116,7 +125,7 @@
   }
 
   function modelFor(tab) {
-    if (models.has(tab.path)) return models.get(tab.path);
+    if (hasModel(tab.path)) return getModelForPath(tab.path);
     // 正式文件 model 挂规约 Uri(诊断按 path 关联 model 的前提;设置虚拟路径
     // 原样透传使设置 Schema 的 fileMatch 真正命中)。重复打开同 path 由上方
     // 缓存键拦截,同 Uri 二次 createModel 不会发生。
@@ -126,8 +135,8 @@
       monaco.Uri.parse(uriSpecFor(tab.path)),
     );
     model.updateOptions({ tabSize: tabSizeValue() });
-    baseline.set(tab.path, tab.content);
-    models.set(tab.path, model);
+    setBaseline(tab.path, tab.content);
+    registerModel(tab.path, model);
     if (model.getLanguageId() === 'markdown') lintMarkdownModel(tab.path, model); // 初次内容即校验
     return model;
   }
@@ -246,7 +255,7 @@
 
   /** problems.markdown.lint 联动:关→清全部 markdown 标记;开→全量重算(纯文本扫描,代价小) */
   function syncMarkdownLint() {
-    for (const [path, model] of models.entries()) {
+    for (const [path, model] of allModels()) {
       if (model.getLanguageId() !== 'markdown') continue;
       if (markdownLintEnabled()) lintMarkdownModel(path, model);
       else setDiagnostics(path, 'markdown.lint', []);
@@ -278,7 +287,7 @@
     const ts = tabSizeValue();
     if (editor) editor.updateOptions({ ...o });
     if (diffEditor) diffEditor.updateOptions({ ...o });
-    for (const m of models.values()) m.updateOptions({ tabSize: ts });
+
     for (const m of draftModels.values()) m.updateOptions({ tabSize: ts });
     for (const pair of gitDiffModels.values()) {
       pair.original.updateOptions({ tabSize: ts });
@@ -377,7 +386,7 @@
     const r = get(pendingReveal);
     if (!r || !editor) return;
     if (r.path !== get(activePath)) return;
-    const model = models.get(r.path);
+    const model = getModelForPath(r.path);
     if (!model || editor.getModel() !== model) return;
     const line = Math.max(1, r.line);
     editor.revealLineInCenter(line);
@@ -400,26 +409,26 @@
   async function saveActive() {
     const path = $activePath;
     if (!path || !editor) return;
-    const model = models.get(path);
+    const model = getModelForPath(path);
     if (!model) return;
     const content = model.getValue();
     // 设置 JSON 双模式:保存链分叉(不走文件通道)
     if (path === USER_SETTINGS_URI || path === WORKSPACE_SETTINGS_URI) {
-      const base = baseline.get(path) ?? '';
+      const base = getBaseline(path) ?? '';
       const err =
         path === USER_SETTINGS_URI
           ? await saveUserSettingsDoc(content, base)
           : await saveWorkspaceSettingsDoc(content);
       saveError = err || '';
       if (!saveError) {
-        baseline.set(path, content);
+        setBaseline(path, content);
         markSaved(path, content);
       }
       return;
     }
     saveError = (await saveTab(path, content)) || '';
     if (!saveError) {
-      baseline.set(path, content);
+      setBaseline(path, content);
       notifySaved(path); // LSP didSave(flycheck 类服务器依赖保存触发)
     }
   }
@@ -456,9 +465,9 @@
     });
     editor.onDidChangeModelContent(() => {
       const path = $activePath;
-      const model = models.get(path);
+      const model = getModelForPath(path);
       if (model && editor.getModel() === model) {
-        markDirty(path, model.getValue() !== baseline.get(path));
+        markDirty(path, model.getValue() !== getBaseline(path));
         scheduleMarkdownLint(path, model); // markdown 去抖校验(非 markdown 直接跳过)
       }
     });
@@ -505,8 +514,9 @@
           map.delete(from);
         }
       };
-      moveKey(models);
-      moveKey(baseline);
+      // ModelRegistry/基线跨组共享:键重命名经 registry(undo 栈随 model 保留)
+      renameModelKey(from, to);
+      renameBaseline(from, to);
       moveKey(errorModels);
       moveKey(draftModels);
     };
@@ -527,7 +537,7 @@
       for (const p of prevTabPaths) {
         if (next.has(p)) continue;
         cancelMarkdownLint(p); // 防去抖计时器在关闭后对已消亡 path 回写缓存
-        const m = models.get(p);
+        const m = getModelForPath(p);
         const dm = draftModels.get(p);
         // 若关闭的是当前显示中的 model,先切回欢迎页/清空 diff,防悬挂引用
         if (editor && m && editor.getModel() === m) editor.setModel(welcomeModel);
@@ -539,9 +549,8 @@
           diffEditor.setModel(null);
         }
         if (m) {
-          m.dispose();
-          models.delete(p);
-          baseline.delete(p);
+          releaseModel(p).dispose();
+          deleteBaseline(p);
         }
         if (dm) {
           dm.dispose();
@@ -588,7 +597,7 @@
 
   onDestroy(() => {
     for (const t of lintTimers.values()) clearTimeout(t);
-    for (const m of models.values()) m.dispose();
+
     for (const m of draftModels.values()) m.dispose();
     for (const m of errorModels.values()) m.dispose();
     for (const pair of gitDiffModels.values()) {
