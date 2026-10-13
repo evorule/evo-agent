@@ -344,6 +344,36 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "window",
         },
         SettingEntry {
+            key: "terminal.shell",
+            kind: SettingType::String,
+            default: json!("auto"),
+            enum_values: None,
+            range: None,
+            category: "终端",
+            description: "终端 shell 可执行路径（auto = 按平台发现序：Windows PowerShell→CMD→Git Bash，unix $SHELL；指定路径则直接采用）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "terminal.fontSize",
+            kind: SettingType::Number,
+            default: json!(14),
+            enum_values: None,
+            range: Some([8, 32]),
+            category: "终端",
+            description: "终端字体大小",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "terminal.scrollback",
+            kind: SettingType::Number,
+            default: json!(1000),
+            enum_values: None,
+            range: Some([100, 10000]),
+            category: "终端",
+            description: "终端回滚行数上限（内存护栏）",
+            scope: "window",
+        },
+        SettingEntry {
             key: "lsp.enabled",
             kind: SettingType::Boolean,
             default: json!(true),
@@ -693,7 +723,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 29); // 计数锁:新增键须同步(scheme 单源纪律)
+        assert_eq!(settings.len(), 32); // 计数锁:新增键须同步(scheme 单源纪律)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
