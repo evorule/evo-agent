@@ -39,8 +39,28 @@
 evo-agent serve
 
 # 指定地址和端口
-evo-agent serve --host 0.0.0.0 --port 9000
+evo-agent serve --host 127.0.0.1 --port 9000
+
+# 对外绑定必须同时提供 token（SG-0 fail-closed：无 token + 非回环 = 拒起，exit 1）
+evo-agent serve --host 0.0.0.0 --port 9000 --auth-token <secret>
+
+# 本地开发显式豁免（仅限本机，勿用于共享主机或已暴露网卡）
+evo-agent serve --host 0.0.0.0 --port 9000 --no-auth
 ```
+
+### 鉴权缺省行为（SG-0 fail-closed）
+
+`serve` **不再**以「静默 disabled」缺省。无任何鉴权配置时按绑定面分流：
+
+| 鉴权配置 | 绑定 | 行为 |
+|---|---|---|
+| 已配 token（`--auth-token` / `[auth]` / `EVO_AGENT_AUTH__TOKENS`） | 任意 | 正常放行，鉴权开启 |
+| 显式 `--no-auth` | 任意 | 豁免拒起，**显著告警**（本地开发用） |
+| 无 token（缺省） | 回环（`127.0.0.1` / `::1` / `localhost`） | 降级放行 + **显著告警**（仅本机可达） |
+| 无 token（缺省） | 非回环（`0.0.0.0` / `::` / 具体 IP） | **拒起，exit 1** |
+
+> 启动横幅中的 `(auth)` 标签按**实际**鉴权状态渲染；鉴权关闭时显示 `(OPEN, NO AUTH)`，
+> 不再出现「横幅说需要鉴权、实际却全开」的误导。
 
 启动后输出：
 
