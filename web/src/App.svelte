@@ -48,6 +48,8 @@
   import TaskPicker from './components/TaskPicker.svelte';
   import ConfirmRunDialog from './components/ConfirmRunDialog.svelte';
   import { taskList, refreshTaskList, runTaskWithConfirm, cancelTaskRun, lastTaskLabel } from './lib/tasks.js';
+  import GroupPane from './components/GroupPane.svelte';
+  import { splitOpen, toggleSplit, closeSplit, splitPath, splitWidth } from './lib/editorGroups.js';
   import { lspBanner, restartGate, gateSnapshot } from './lib/lsp/index.js';
   import { pushPanelEvent } from './lib/stores.js';
 
@@ -88,6 +90,8 @@
     'workbench.action.tasks.rerunLast',
     'workbench.action.tasks.terminate',
     'workbench.action.tasks.build',
+    'view.splitEditor',
+    'view.closeSplit',
   ];
   let cleanupTracking = null;
 
@@ -352,6 +356,19 @@
       run: () => gotoProblem({ inFile: true }),
     });
     registerCommand({
+      id: 'view.splitEditor',
+      title: '视图: 分屏(开关副组)',
+      category: '视图',
+      keybinding: 'ctrl+\\',
+      run: () => toggleSplit(get(activePath)),
+    });
+    registerCommand({
+      id: 'view.closeSplit',
+      title: '视图: 关闭分屏',
+      category: '视图',
+      run: () => closeSplit(),
+    });
+    registerCommand({
       id: 'workbench.action.tasks.run',
       title: '任务: 运行任务',
       category: '任务',
@@ -501,7 +518,14 @@
           <button class="lsp-banner-dismiss" onclick={() => lspBanner.set(null)} aria-label="关闭提示">×</button>
         </div>
       {/if}
-      <EditorPane />
+      <div class="editors-row">
+        <EditorPane />
+        {#if $splitOpen}
+          <div class="split-pane" style:width={`${Math.round($splitWidth * 100)}%`}>
+            <GroupPane />
+          </div>
+        {/if}
+      </div>
       <BottomPanel />
     </div>
     <div style:display={$chatVisible ? 'contents' : 'none'}>
@@ -535,6 +559,17 @@
     display: flex;
     flex-direction: column;
     background: var(--bg-card);
+  }
+  .editors-row {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .editors-row :global(.editor-pane) {
+    flex: 1;
+    min-width: 0;
   }
   .lsp-banner {
     display: flex;
