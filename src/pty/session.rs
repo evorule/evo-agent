@@ -46,16 +46,27 @@ pub struct PtySessionHandle {
 
 /// 入向消息(单通道复用,避免双通道 select)
 pub enum PtyMsg {
+    /// 键盘字节(透传 shell)
     Input(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
+    /// 终端尺寸变更
+    Resize {
+        /// 列数
+        cols: u16,
+        /// 行数
+        rows: u16,
+    },
+    /// 终止会话(树级)
     Kill,
 }
 
 /// shell 发现结果
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShellChoice {
+    /// 可执行名(PATH 发现)
     pub program: String,
+    /// 启动参数
     pub args: Vec<String>,
+    /// 展示标签(治理事件)
     pub label: String,
 }
 

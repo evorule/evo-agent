@@ -44,6 +44,7 @@ pub mod pty;
 pub mod rule_tools;
 #[doc(hidden)]
 pub mod service_tools;
+pub mod tasks;
 
 /// 审计链旁路调用的全局指标桥（P2-V3 引入，P2-V3 结构性修复后语义已收窄）
 ///
