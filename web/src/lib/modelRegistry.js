@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-// 全局 ModelRegistry:path → Monaco model 单源(B9 基建,07 号 evofile:/// Uri
-// 规约的落地载体)。同文件多编辑器实例挂同一 model——内容/undo 栈自动同步。
+// 全局 ModelRegistry:path → Monaco model 单源(编辑器分屏共享同一 model 的
+// 落地载体,model 挂 evofile:/// 规约 Uri)。同文件多编辑器实例挂同一
+// model——内容/undo 栈自动同步。
 //
 // 职责边界:本模块只持「存活 model 的 path 键映射」与 baseline(编辑基线,
 // dirty 判定用);model 的创建参数(uriSpecFor/langOf)与 dispose 时机归调用方
