@@ -47,6 +47,7 @@ evo-agent.toml
 scripts/ops/ops.local.json
 
 # 工作台前端(web/):依赖与构建产物不跟踪,源码正常入库
+node_modules/
 web/node_modules/
 web/dist/
 
