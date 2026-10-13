@@ -1323,6 +1323,61 @@ GET /api/pty/ws?term={id}&cols={n}&rows={n}&token={token}
 
 ---
 
+## 17. 工作台任务面
+
+工作区任务运行（构建/检查等一次性命令）。治理分级：任务由**人的显式动作发起**
+（永不自动运行——无 folderOpen/无 watcher/无 agent 触发）；首跑确认在前端
+（命令原文一次性信任）；`task.started/ended/cancelled`（含命令原文）经 WS
+gov_event 留痕（record-only）。任务命令**无 TTY 直接 spawn**（stdout/stderr
+分捕合流），与 PTY（交互导向）是两条通道；agent 跑命令走命令执行工具既有
+三层审批，互不相通。挂鉴权中间件。
+
+### 17.1 列任务
+
+```
+GET /api/tasks
+```
+
+读取工作区 `.evo/tasks.json`（对齐 VS Code 字段名的简化集：label/type(process|
+shell)/command/args/options{cwd,env}/group/presentation/problemMatcher）。
+未创建时返回空清单+引导 hint；解析失败返回 error。
+
+### 17.2 运行任务
+
+```
+POST /api/tasks/run   {"label": "..."}
+```
+
+校验存在性/并发上限（4）/同 label 互斥 → spawn → `{runId, pid}`。
+cwd 可经 options.cwd 覆盖（锁工作区内，逃逸 400）。
+
+### 17.3 取消
+
+```
+POST /api/tasks/{run_id}/cancel
+```
+
+两段式：第一段优雅终止（unix SIGINT / Windows taskkill），5s 未退→第二段
+强杀树（`taskkill /F /T` / 进程组 kill）。
+
+### 17.4 WS 事件流
+
+```
+GET /api/tasks/ws?run_id={id}&token={token}
+```
+
+连接即回放缓冲（最近 2000 事件）后转活播。下行事件：
+
+- `{"type":"started","runId","label","command"}`
+- `{"type":"output","runId","stream":"stdout|stderr","line"}`
+- `{"type":"diagnostics","runId","owner":"task.<label>","items":[{path,line,col,severity,code,msg}]}`
+  （内置 matcher：`$rustc`=gcc 形〔cargo 配 --message-format=short〕/`$tsc`；行增量解析）
+- `{"type":"ended","runId","exitCode","durationMs","cancelled"}`
+- `{"type":"gov_event","event":{...}}`（task.started/ended/cancelled 留痕）
+- `{"type":"error","hint"}`
+
+---
+
 ## 版本变更日志
 
 ### Unreleased (2026-10-13)
@@ -1331,6 +1386,8 @@ GET /api/pty/ws?term={id}&cols={n}&rows={n}&token={token}
   透明转发（每语言单连接单实例、退避重启治理、evoPath 诊断桥）
 - 新增工作台终端面（§16）：`GET /api/pty/ws` 真实 PTY 流（人机双轨治理分级：
   会话留痕+会话内零拦截；并发上限 8；断连树级回收）
+- 新增工作台任务面（§17）：`GET /api/tasks`+`run`+`cancel`+`ws`（无 TTY spawn、
+  两段式取消、内置 rustc/tsc matcher、永不自动运行治理红线）
 
 ### v0.2.0 (2026-09-27)
 
