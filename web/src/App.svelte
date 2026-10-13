@@ -44,7 +44,10 @@
   import { getEffectiveRules, resolveKeybinding, migrateKeybindings } from './lib/keybindings.js';
   import { gitStage } from './lib/api.js';
   import { nextProblem, markerToReveal } from './lib/diagnostics.js';
-  import { openBottomPanel, terminalIntent } from './lib/panel.js';
+  import { openBottomPanel, terminalIntent, outputChannel } from './lib/panel.js';
+  import TaskPicker from './components/TaskPicker.svelte';
+  import ConfirmRunDialog from './components/ConfirmRunDialog.svelte';
+  import { taskList, refreshTaskList, runTaskWithConfirm, cancelTaskRun, lastTaskLabel } from './lib/tasks.js';
   import { lspBanner, restartGate, gateSnapshot } from './lib/lsp/index.js';
   import { pushPanelEvent } from './lib/stores.js';
 
@@ -81,12 +84,90 @@
     'workbench.action.terminal.kill',
     'workbench.action.terminal.clear',
     'workbench.action.terminal.focus',
+    'workbench.action.tasks.run',
+    'workbench.action.tasks.rerunLast',
+    'workbench.action.tasks.terminate',
+    'workbench.action.tasks.build',
   ];
   let cleanupTracking = null;
 
   /** 活动栏条目分发(设置等非文件树视图的宿主接线路由) */
   function handleActivityItem(id) {
     if (id === 'settings') openSettingsTab();
+  }
+
+  // ---- 任务面(B10):选择器/首跑确认/运行编排 ----
+  let taskPickerOpen = false;
+  let confirmTask = null;
+  let confirmResolve = null;
+
+  async function openTaskPicker() {
+    await refreshTaskList();
+    taskPickerOpen = true;
+  }
+
+  async function runByLabel(label) {
+    await refreshTaskList();
+    const task = (get(taskList).tasks || []).find((t) => t.label === label);
+    if (!task) {
+      pushPanelEvent('sys', { label: '[task]', detail: `任务不存在: ${label}`, level: 'error' });
+      return;
+    }
+    executeRun(task);
+  }
+
+  async function runDefaultBuild() {
+    await refreshTaskList();
+    const builds = (get(taskList).tasks || []).filter((t) => t.group === 'build');
+    const target = builds.find((t) => t.isDefault) || builds[0];
+    if (!target) {
+      pushPanelEvent('sys', { label: '[task]', detail: '未配置构建任务(group=build)', level: 'warn' });
+      await refreshTaskList();
+      taskPickerOpen = true;
+      return;
+    }
+    executeRun(target);
+  }
+
+  function executeRun(task) {
+    openBottomPanel('output');
+    outputChannel.set(`task:${task.label}`);
+    runTaskWithConfirm(task, {
+      onConfirm: (t) =>
+        new Promise((resolve) => {
+          confirmTask = t;
+          confirmResolve = resolve;
+        }),
+    })
+      .then((runId) => {
+        if (runId) refreshTaskList();
+      })
+      .catch((e) => {
+        pushPanelEvent('sys', { label: '[task]', detail: String(e?.message || e), level: 'error' });
+      });
+  }
+
+  function onTaskPicked(e) {
+    taskPickerOpen = false;
+    const task = e.detail;
+    openBottomPanel('output');
+    outputChannel.set(`task:${task.label}`);
+    executeRun(task);
+  }
+
+  function onConfirmRun(e) {
+    confirmResolve?.(true);
+    confirmResolve = null;
+    confirmTask = null;
+    if (!e.detail.remember) {
+      // 仅本次:立即可再确认(不做持久化)
+    }
+  }
+
+  function onCancelConfirm() {
+    confirmResolve?.(false);
+    confirmResolve = null;
+    confirmTask = null;
   }
 
   /** 搜索视图入口:切视图 + 保证侧栏可见 + 发一次性意图信号(SearchPanel 消费) */
@@ -271,6 +352,37 @@
       run: () => gotoProblem({ inFile: true }),
     });
     registerCommand({
+      id: 'workbench.action.tasks.run',
+      title: '任务: 运行任务',
+      category: '任务',
+      run: () => openTaskPicker(),
+    });
+    registerCommand({
+      id: 'workbench.action.tasks.rerunLast',
+      title: '任务: 重新运行上次任务',
+      category: '任务',
+      run: () => {
+        const last = get(lastTaskLabel);
+        if (last) runByLabel(last);
+      },
+    });
+    registerCommand({
+      id: 'workbench.action.tasks.terminate',
+      title: '任务: 终止运行中任务',
+      category: '任务',
+      run: () => {
+        const runId = newestActiveRun();
+        if (runId) cancelTaskRun(runId).catch((e) => pushPanelEvent('sys', { label: '[task]', detail: String(e?.message || e), level: 'error' }));
+      },
+    });
+    registerCommand({
+      id: 'workbench.action.tasks.build',
+      title: '任务: 运行生成任务',
+      category: '任务',
+      keybinding: 'ctrl+shift+b',
+      run: () => runDefaultBuild(),
+    });
+    registerCommand({
       id: 'workbench.action.lsp.restart',
       title: 'LSP: 重启语言服务器',
       category: '语言服务器',
@@ -396,6 +508,12 @@
       <ChatSidebar />
     </div>
   </div>
+  {#if taskPickerOpen}
+    <TaskPicker tasks={get(taskList).tasks || []} on:pick={onTaskPicked} on:close={() => (taskPickerOpen = false)} />
+  {/if}
+  {#if confirmTask}
+    <ConfirmRunDialog task={confirmTask} on:confirm={onConfirmRun} on:cancel={onCancelConfirm} />
+  {/if}
   <CommandPalette />
 </div>
 

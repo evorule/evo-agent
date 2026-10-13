@@ -18,3 +18,6 @@ export function openBottomPanel(tab) {
 
 /** 终端意图信号(一次性):命令入口(terminal.new/kill/clear)→ TerminalView 消费 */
 export const terminalIntent = writable(null);
+
+/** 输出面板当前 channel('syslog' | 'task:<label>'):多 channel 下拉共享态 */
+export const outputChannel = writable('syslog');

@@ -71,6 +71,7 @@ pub async fn list_tasks(State(state): State<AgentApiState>) -> Response {
                         "label": t.label,
                         "type": if t.is_shell() { "shell" } else { "process" },
                         "commandDisplay": t.command_display(),
+                        "group": t.group,
                         "matchers": t.matchers(),
                     })
                 })
