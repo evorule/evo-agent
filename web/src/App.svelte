@@ -49,7 +49,7 @@
   import ConfirmRunDialog from './components/ConfirmRunDialog.svelte';
   import { taskList, refreshTaskList, runTaskWithConfirm, cancelTaskRun, lastTaskLabel } from './lib/tasks.js';
   import GroupPane from './components/GroupPane.svelte';
-  import { splitOpen, toggleSplit, closeSplit, splitPath, splitWidth } from './lib/editorGroups.js';
+  import { splitOpen, toggleSplit, closeSplit, splitPath, splitWidth, restoreSplit } from './lib/editorGroups.js';
   import { lspBanner, restartGate, gateSnapshot } from './lib/lsp/index.js';
   import { pushPanelEvent } from './lib/stores.js';
 
@@ -197,6 +197,7 @@
   }
 
   onMount(() => {
+    restoreSplit(); // 恢复上次分屏状态(路径元数据,localStorage)
     registerCommand({
       id: 'workbench.action.showCommands',
       title: '显示全部命令',

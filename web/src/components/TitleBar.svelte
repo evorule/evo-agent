@@ -8,6 +8,8 @@
   import { problems } from '../lib/diagnostics.js';
   import { openBottomPanel } from '../lib/panel.js';
   import { taskRuns } from '../lib/tasks.js';
+  import { activePath } from '../lib/stores.js';
+  import { toggleSplit, splitOpen } from '../lib/editorGroups.js';
 
   const statusText = {
     connecting: '连接中',
@@ -89,6 +91,14 @@
       信号 {$signalCount === null ? '—' : $signalCount}
     </span>
     {#if $sessionId}
+      <button
+        class="gov-chip mono"
+        class:alert={$splitOpen}
+        title="分屏:把当前文件放到副组并排编辑"
+        onclick={() => toggleSplit($activePath)}
+      >
+        分屏
+      </button>
       {#if runningCount > 0}
         <button class="gov-chip mono task-chip" title={`任务运行中 ${runningCount}(点击打开输出面板)`} onclick={() => openBottomPanel('output')}>
           <span class="spin">◌</span> 任务 {runningCount}
