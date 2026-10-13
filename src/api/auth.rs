@@ -185,11 +185,7 @@ pub enum AuthPosture {
 /// - `auth_enabled`     : 最终解析出的鉴权是否开启(--no-auth / --auth-token / 配置文件)
 /// - `explicit_no_auth` : 是否由 CLI 显式传入 `--no-auth`(开发豁免,不看绑定面)
 /// - `host`             : 监听地址(仅 host,不含端口)
-pub fn decide_auth_posture(
-    auth_enabled: bool,
-    explicit_no_auth: bool,
-    host: &str,
-) -> AuthPosture {
+pub fn decide_auth_posture(auth_enabled: bool, explicit_no_auth: bool, host: &str) -> AuthPosture {
     if auth_enabled {
         return AuthPosture::Enabled;
     }
@@ -594,8 +590,8 @@ mod tests {
     #[test]
     fn test_non_loopback_rejected() {
         for h in [
-            "0.0.0.0",     // 监听全部网卡 = 对外暴露
-            "::",          // IPv6 全部网卡
+            "0.0.0.0", // 监听全部网卡 = 对外暴露
+            "::",      // IPv6 全部网卡
             "[::]",
             "192.168.1.5",
             "10.0.0.3",
@@ -608,8 +604,14 @@ mod tests {
     #[test]
     fn test_posture_enabled_when_auth_on() {
         // 有 token 时,绑定面无关,一律 Enabled(哪怕对外绑定)
-        assert_eq!(decide_auth_posture(true, false, "0.0.0.0"), AuthPosture::Enabled);
-        assert_eq!(decide_auth_posture(true, false, "127.0.0.1"), AuthPosture::Enabled);
+        assert_eq!(
+            decide_auth_posture(true, false, "0.0.0.0"),
+            AuthPosture::Enabled
+        );
+        assert_eq!(
+            decide_auth_posture(true, false, "127.0.0.1"),
+            AuthPosture::Enabled
+        );
     }
 
     #[test]
