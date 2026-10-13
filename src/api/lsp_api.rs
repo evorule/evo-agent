@@ -68,45 +68,58 @@ pub struct LspWsQuery {
     pub token: Option<String>,
 }
 
-/// 探测一个命令的可用性与版本(`<prog> --version`,5s 超时)。
+/// 探测一个命令的可用性与版本(`<prog> --version`,5s 超时;候选名同 spawn)。
 async fn probe_version(program: &str, args: &[&str]) -> GateStatus {
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio::process::Command::new(program).args(args).output(),
-    )
-    .await;
-    match output {
-        Ok(Ok(out)) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let version = text
-                .lines()
-                .next()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty());
-            GateStatus {
-                available: true,
-                version,
-                hint: None,
+    use crate::lsp::process::program_candidates;
+    let mut last_err_text = String::new();
+    for candidate in program_candidates(program) {
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::process::Command::new(&candidate).args(args).output(),
+        )
+        .await;
+        match output {
+            Ok(Ok(out)) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let version = text
+                    .lines()
+                    .next()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty());
+                return GateStatus {
+                    available: true,
+                    version,
+                    hint: None,
+                };
+            }
+            Ok(Ok(out)) => {
+                // 命令存在但退出码非零:候选名命中,不再尝试其余形态
+                return GateStatus {
+                    available: false,
+                    version: None,
+                    hint: Some(format!(
+                        "{program} 存在但退出码非零({});检查安装完整性",
+                        out.status
+                    )),
+                };
+            }
+            Ok(Err(e)) => {
+                last_err_text = e.to_string(); // NotFound:试下一候选
+            }
+            Err(_) => {
+                return GateStatus {
+                    available: false,
+                    version: None,
+                    hint: Some(format!("{program} --version 探测超时(5s);检查安装")),
+                };
             }
         }
-        Ok(Ok(out)) => GateStatus {
-            available: false,
-            version: None,
-            hint: Some(format!(
-                "{program} 存在但退出码非零({});检查安装完整性",
-                out.status
-            )),
-        },
-        Ok(Err(_)) => GateStatus {
-            available: false,
-            version: None,
-            hint: Some(install_hint(program)),
-        },
-        Err(_) => GateStatus {
-            available: false,
-            version: None,
-            hint: Some(format!("{program} --version 探测超时(5s);检查安装")),
-        },
+    }
+    let _ = last_err_text;
+    GateStatus {
+        available: false,
+        version: None,
+        hint: Some(install_hint(program)),
     }
 }
 
@@ -124,8 +137,22 @@ pub async fn status(State(state): State<AgentApiState>) -> Json<LspStatusRespons
         probe_version("rust-analyzer", &["--version"]),
         probe_version("typescript-language-server", &["--version"]),
     );
-    let workdir = state.workdir().to_string_lossy().replace('\\', "/");
-    Json(LspStatusResponse { rust, typescript, workdir })
+    // 绝对化:相对 workdir(如 ".")对前端 file:// URI 构造不可用;Windows
+    // canonicalize 产生 `\\?\` verbatim 前缀,按 fs_watch 同款口径剥除
+    let workdir_abs = state
+        .workdir()
+        .canonicalize()
+        .unwrap_or_else(|_| state.workdir().to_path_buf());
+    let workdir_raw = workdir_abs.to_string_lossy().to_string();
+    let workdir = workdir_raw
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&workdir_raw)
+        .replace('\\', "/");
+    Json(LspStatusResponse {
+        rust,
+        typescript,
+        workdir,
+    })
 }
 
 /// `GET /api/lsp/ws?lang=...&token=...` — WS 升级

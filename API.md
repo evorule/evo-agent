@@ -1,6 +1,6 @@
 # Evo-Agent API 接口文档
 
-> 版本 0.2.0 | 最后更新 2026-09-27
+> 版本 0.2.0 | 最后更新 2026-10-13
 
 ---
 
@@ -1236,7 +1236,60 @@ POST /ops/{operation}
 
 ---
 
+## 15. 工作台 LSP 面
+
+服务 IDE 工作台的语言服务器接入（代码智能链）。serve 为**纯透明转发**代理：
+spawn 长驻语言服务器子进程（rust-analyzer / typescript-language-server，PATH 硬发现），
+WS↔stdio 双向泵，仅两个出向拦截点（`window/logMessage` 分流到工作台输出通道；
+`textDocument/publishDiagnostics` 附加工作区相对路径 `evoPath` 字段），能力协商与
+扩展全保真穿透。生命周期治理：每语言单连接单实例；进程意外退出按 60 秒窗口
+3 次退避重启（1s/2s/4s），超限进 Failed（WS 推 `{"type":"lsp_state","state":"failed"}`）；
+WS 断开即 kill 子进程。挂鉴权中间件，`?token=` fallback 与会话 WS 同口径。
+
+### 15.1 语言门状态
+
+```
+GET /api/lsp/status
+```
+
+**响应:**
+```json
+{
+  "rust": { "available": true, "version": "rust-analyzer 0.3.x", "hint": null },
+  "typescript": { "available": false, "version": null, "hint": "typescript-language-server 未安装:..." },
+  "workdir": "D:/work/proj"
+}
+```
+
+`workdir` 为工作区根绝对路径（POSIX 风格），前端据此构造真实 `file://` 文档 URI
+与 `rootUri`；仅鉴权面内暴露（与 `/version` 同口径）。
+
+### 15.2 WS 透明转发
+
+```
+GET /api/lsp/ws?lang=rust|typescript&token={token}
+```
+
+升级后客户端在该连接上收发**裸 JSON-RPC 消息文本**（非 Content-Length 帧——
+帧编解码由 serve 承担）。server→client 方向的控制帧（与 JSON-RPC 帧混排）：
+
+| 控制帧 | 语义 |
+|---|---|
+| `{"type":"lsp_state","state":"starting\|restarting\|stopped\|failed","detail":...}` | 语言服务器生命周期 |
+| `{"type":"lsp_log","level":"error\|warning\|info\|log","message":...}` | `window/logMessage` 分流 |
+| `{"type":"lsp_unavailable","hint":...}` | 服务器不可用（spawn 失败），前端灰置 |
+
+`publishDiagnostics` 推送附加 `params.evoPath`（工作区相对路径；工作区外为 `null`，
+前端灰置不呈现）。
+
+---
+
 ## 版本变更日志
+
+### Unreleased (2026-10-13)
+
+- 新增工作台 LSP 面（§15）：`GET /api/lsp/status` 语言门检测与 `GET /api/lsp/ws`
+  透明转发（每语言单连接单实例、退避重启治理、evoPath 诊断桥）
 
 ### v0.2.0 (2026-09-27)
 

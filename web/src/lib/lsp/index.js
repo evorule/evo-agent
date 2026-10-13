@@ -139,6 +139,13 @@ function ensureClient(lang) {
   });
   cleanupFns.push(disposeFeatures);
   updateGateSnapshot(lang);
+  // 既有 model 补注册:onDidCreateModel 只在创建时发一次,重启/重建 client
+  // 后已打开的文档不会再次触发——不补注册则重启丢失全部文档跟踪(didOpen
+  // 与后续 didChange 都无从谈起)
+  for (const m of monacoSingleton.editor.getModels()) {
+    const path = pathFromUri(m.uri);
+    if (path && gateOfLanguage(m.getLanguageId()) === lang) client.trackModel(m);
+  }
   return client;
 }
 
@@ -247,10 +254,11 @@ export async function initLsp() {
 /** 手动重启某语言门(Failed 横幅按钮/`LSP: 重启` 命令) */
 export function restartGate(lang) {
   teardownGate(lang);
-  // 重启策略计数随新连接归零(serve 侧注册表释放后新连接全新预算)
+  // 延迟重连:serve 侧旧桥的「断连收尸→注册表释放」与关闭回包存在毫秒级
+  // 竞态,立即重连会撞 409(连接即断,门卡死在 stopped);800ms 足够收尾
   setTimeout(() => {
     if (enabled) ensureClient(lang);
-  }, 0);
+  }, 800);
 }
 
 /** 保存完成转发(didSave;flycheck 类服务器依赖)——saveActive 成功路径调用 */

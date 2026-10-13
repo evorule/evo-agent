@@ -235,7 +235,7 @@ pub async fn run_bridge(
     mut outgoing: mpsc::Sender<BridgeEvent>,
 ) {
     let spec = lang.spec();
-    let wd = workdir.canonicalize().unwrap_or_else(|_| workdir.clone());
+    let wd = canonicalized_workdir(&workdir);
     let mut policy = RestartPolicy::new();
 
     loop {
@@ -355,6 +355,21 @@ fn incoming_terminated(incoming: &mut mpsc::Receiver<String>) -> impl Future<Out
 
 use std::future::Future;
 
+/// 工作区根规整:绝对化(相对 workdir 如 "." 无法做 URI 前缀截取)并剥除
+/// Windows canonicalize 的 `\\?\` verbatim 前缀——语言服务器推送的 file:// URI
+/// 还原出的路径是非 verbatim 形态,前缀不齐则 evoPath 换算恒失败
+/// (fs_watch 同族教训;UNC `\\?\UNC\` 形态本项目工作区不涉及,不做展开)。
+fn canonicalized_workdir(workdir: &Path) -> PathBuf {
+    let abs = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf());
+    let raw = abs.to_string_lossy().to_string();
+    match raw.strip_prefix(r"\\?\") {
+        Some(stripped) => PathBuf::from(stripped),
+        None => abs,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +460,20 @@ mod tests {
             process_out_frame(b"not-json", Path::new(TEST_WORKDIR)),
             OutAction::Ignore
         );
+    }
+
+    #[test]
+    fn canonicalized_workdir_strips_verbatim_and_absolutizes() {
+        let wd = canonicalized_workdir(Path::new("."));
+        assert!(wd.is_absolute());
+        let raw = wd.to_string_lossy();
+        assert!(
+            !raw.contains(r"\?\"),
+            "verbatim prefix must be stripped: {raw}"
+        );
+        // URI 还原路径可直接前缀截取(strip_prefix 语义等价)
+        let p = wd.join("src").join("main.rs");
+        assert!(p.strip_prefix(&wd).is_ok());
     }
 
     #[test]
@@ -604,7 +633,7 @@ mod e2e {
         let (bridge_end, mut ls_end) = duplex(65536);
         let (b_read, mut b_write) = split(bridge_end);
         let (in_tx, mut in_rx) = mpsc::channel::<String>(16);
-        let (mut out_tx, out_rx) = mpsc::channel::<BridgeEvent>(16);
+        let (mut out_tx, _out_rx) = mpsc::channel::<BridgeEvent>(16);
         let mut frame_reader = FrameReader::new(b_read);
         ls_end.shutdown().await.unwrap();
         drop(ls_end);

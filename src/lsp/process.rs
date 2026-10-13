@@ -51,6 +51,17 @@ pub const TYPESCRIPT_SERVER: ServerSpec = ServerSpec {
     args: &["--stdio"],
 };
 
+/// spawn 候选名:Windows 下 npm 全局安装的可执行是 `.cmd` shim(无 `.exe`),
+/// 而 CreateProcess 只认确切名——按「原名 → `.cmd`」顺序尝试(Rust 对 `.cmd`
+/// 经 cmd.exe 包装启动,含参数转义加固);POSIX 只试原名。
+pub fn program_candidates(program: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec![program.to_string(), format!("{program}.cmd")]
+    } else {
+        vec![program.to_string()]
+    }
+}
+
 /// 一个已 spawn 的语言服务器进程句柄。
 ///
 /// 字段按「拿走所有权进泵循环」设计:stdin 交给写入端,stdout 包成
@@ -71,45 +82,56 @@ pub struct LspServerProcess {
 impl LspServerProcess {
     /// spawn 语言服务器(no-shell/argv/workdir 锁定)。
     ///
-    /// stderr 管线化进环形缓冲任务;spawn 失败(不在 PATH 等)原样返回错误,
-    /// 由上层转灰置/降级语义。
+    /// stderr 管线化进环形缓冲任务;全部候选名都 spawn 失败(不在 PATH 等)
+    /// 返回最后一个错误,由上层转灰置/降级语义。
     pub async fn spawn(spec: &ServerSpec, workdir: &Path) -> std::io::Result<Self> {
-        let mut cmd = tokio::process::Command::new(spec.program);
-        cmd.args(spec.args)
-            .current_dir(workdir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // Windows GUI 子系统下抑制控制台窗口;POSIX 无此概念(该 cfg 静默)
-        #[cfg(windows)]
-        {
-            #[allow(deprecated)]
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let candidates = program_candidates(spec.program);
+        let mut last_err: Option<std::io::Error> = None;
+        for program in &candidates {
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(spec.args)
+                .current_dir(workdir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // Windows GUI 子系统下抑制控制台窗口;POSIX 无此概念(该 cfg 静默)
+            #[cfg(windows)]
+            {
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let pid = child.id();
+                    let stdin = child
+                        .stdin
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("child stdin unavailable"))?;
+                    let stdout = child
+                        .stdout
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("child stdout unavailable"))?;
+                    let stderr = child
+                        .stderr
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("child stderr unavailable"))?;
+                    let ring = Arc::new(StderrRing::new());
+                    tokio::spawn(stderr_drain(stderr, Arc::clone(&ring)));
+                    debug!(program = %program, pid = pid, "language server spawned");
+                    return Ok(Self {
+                        child,
+                        stdin,
+                        stdout: FrameReader::new(stdout),
+                        stderr_ring: ring,
+                        pid,
+                    });
+                }
+                Err(e) => {
+                    debug!(program = %program, error = %e, "spawn candidate failed");
+                    last_err = Some(e);
+                }
+            }
         }
-        let mut child = cmd.spawn()?;
-        let pid = child.id();
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("child stdin unavailable"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| std::io::Error::other("child stdout unavailable"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| std::io::Error::other("child stderr unavailable"))?;
-        let ring = Arc::new(StderrRing::new());
-        tokio::spawn(stderr_drain(stderr, Arc::clone(&ring)));
-        debug!(program = spec.program, pid = pid, "language server spawned");
-        Ok(Self {
-            child,
-            stdin,
-            stdout: FrameReader::new(stdout),
-            stderr_ring: ring,
-            pid,
-        })
+        Err(last_err.unwrap_or_else(|| std::io::Error::other("no spawn candidate")))
     }
 
     /// 请求终止(kill 语义;语言服务器不响应优雅关闭时兜底)。
