@@ -45,6 +45,8 @@
   import { gitStage } from './lib/api.js';
   import { nextProblem, markerToReveal } from './lib/diagnostics.js';
   import { openBottomPanel } from './lib/panel.js';
+  import { lspBanner, restartGate, gateSnapshot } from './lib/lsp/index.js';
+  import { pushPanelEvent } from './lib/stores.js';
 
   reconnectFromStorage();
 
@@ -73,6 +75,8 @@
     'workbench.action.problems.next',
     'workbench.action.problems.prev',
     'workbench.action.problems.nextInFile',
+    'workbench.action.lsp.restart',
+    'workbench.action.lsp.status',
   ];
   let cleanupTracking = null;
 
@@ -262,6 +266,42 @@
       category: '问题',
       run: () => gotoProblem({ inFile: true }),
     });
+    registerCommand({
+      id: 'workbench.action.lsp.restart',
+      title: 'LSP: 重启语言服务器',
+      category: '语言服务器',
+      run: () => {
+        // 无参调用(命令面板/横幅按钮):重启所有已建连的语言门
+        const gates = gateSnapshot();
+        let restarted = 0;
+        for (const [lang, info] of Object.entries(gates)) {
+          if (info && (info.state !== 'idle' || info.pathAvailable)) {
+            restartGate(lang);
+            restarted++;
+          }
+        }
+        if (!restarted) {
+          pushPanelEvent('sys', { label: '[lsp]', detail: '无活动语言门(打开对应语言文件后可重启)' });
+        }
+      },
+    });
+    registerCommand({
+      id: 'workbench.action.lsp.status',
+      title: 'LSP: 语言服务器状态',
+      category: '语言服务器',
+      run: () => {
+        const gates = gateSnapshot();
+        for (const [lang, info] of Object.entries(gates)) {
+          if (info) {
+            pushPanelEvent('sys', {
+              label: '[lsp]',
+              detail: `${lang}: state=${info.state} PATH=${info.pathAvailable ? 'ok' : 'missing'}${info.version ? ` (${info.version})` : ''} docs=${info.docs}`,
+            });
+          }
+        }
+        openBottomPanel('output');
+      },
+    });
     loadSettings(); // 设置快照加载(失败降级缓存只读;编辑器参数订阅在 EditorPane)
     migrateKeybindings(); // 旧键位覆盖层一次性迁移(失败保留旧键,下次启动重试)
     cleanupTracking = initContextTracking();
@@ -301,6 +341,15 @@
       {/if}
     </div>
     <div class="center">
+      {#if $lspBanner}
+        <div class="lsp-banner" role="alert">
+          <span class="lsp-banner-text">
+            语言服务器失败（{$lspBanner.serverName}）：{$lspBanner.detail}
+          </span>
+          <button class="lsp-banner-retry" onclick={() => restartGate($lspBanner.lang)}>重启</button>
+          <button class="lsp-banner-dismiss" onclick={() => lspBanner.set(null)} aria-label="关闭提示">×</button>
+        </div>
+      {/if}
       <EditorPane />
       <BottomPanel />
     </div>
@@ -329,5 +378,41 @@
     display: flex;
     flex-direction: column;
     background: var(--bg-card);
+  }
+  .lsp-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--warn-bg, #3d2e00);
+    border-bottom: 1px solid var(--border, #30363d);
+    color: var(--warn-fg, #f0c674);
+    font-size: 12px;
+    flex-shrink: 0;
+  }
+  .lsp-banner-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .lsp-banner-retry {
+    background: transparent;
+    border: 1px solid currentcolor;
+    border-radius: 4px;
+    color: inherit;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 10px;
+  }
+  .lsp-banner-dismiss {
+    background: transparent;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 6px;
   }
 </style>
