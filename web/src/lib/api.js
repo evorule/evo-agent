@@ -158,6 +158,11 @@ export function getWorkbenchSettingsSchema() {
   return fetch('/api/workbench/settings/schema', { headers: headers() }).then(unwrap);
 }
 
+/** LSP 两语言门状态(可用性/版本/安装引导 + 工作区根) */
+export function getLspStatus() {
+  return fetch('/api/lsp/status', { headers: headers() }).then(unwrap);
+}
+
 /** LLM 配置只读快照(脱敏;响应体不携带任何密钥内容) */
 export function getLlmStatus() {
   return fetch('/admin/llm-status', { headers: headers() }).then(unwrap);

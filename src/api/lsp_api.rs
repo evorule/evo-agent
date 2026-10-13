@@ -54,6 +54,9 @@ pub struct LspStatusResponse {
     pub rust: GateStatus,
     /// TypeScript 门(typescript-language-server,兼管 javascript)
     pub typescript: GateStatus,
+    /// 工作区根绝对路径(POSIX 风格;前端构造真实 file:// 文档 URI 与 rootUri 用;
+    /// 与 /version 同口径,仅鉴权面内暴露)
+    pub workdir: String,
 }
 
 /// WS 连接 query 参数
@@ -116,12 +119,13 @@ fn install_hint(program: &str) -> String {
 }
 
 /// `GET /api/lsp/status` — 两语言门检测(每次调用实时探测;轻量子进程,低频面)
-pub async fn status(State(_state): State<AgentApiState>) -> Json<LspStatusResponse> {
+pub async fn status(State(state): State<AgentApiState>) -> Json<LspStatusResponse> {
     let (rust, typescript) = tokio::join!(
         probe_version("rust-analyzer", &["--version"]),
         probe_version("typescript-language-server", &["--version"]),
     );
-    Json(LspStatusResponse { rust, typescript })
+    let workdir = state.workdir().to_string_lossy().replace('\\', "/");
+    Json(LspStatusResponse { rust, typescript, workdir })
 }
 
 /// `GET /api/lsp/ws?lang=...&token=...` — WS 升级

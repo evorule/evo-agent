@@ -39,6 +39,7 @@
     saveUserSettingsDoc,
     saveWorkspaceSettingsDoc,
   } from '../lib/settings.js';
+  import { initLsp, notifySaved } from '../lib/lsp/index.js';
 
   const welcomeText = `# evo-agent 工作台
 
@@ -67,6 +68,8 @@
   let editor = null;
   let diffEditor = null;
   let welcomeModel = null;
+  /** LSP 装配清理函数(onMount 异步赋值;onDestroy 调用) */
+  let disposeLsp = null;
   /** path → monaco model(含 undo 栈与编辑状态) */
   const models = new Map();
   /** path → 保存基线内容(对比判 dirty) */
@@ -415,7 +418,10 @@
       return;
     }
     saveError = (await saveTab(path, content)) || '';
-    if (!saveError) baseline.set(path, content);
+    if (!saveError) {
+      baseline.set(path, content);
+      notifySaved(path); // LSP didSave(flycheck 类服务器依赖保存触发)
+    }
   }
 
   function fmtTime(ts) {
@@ -427,6 +433,9 @@
   onMount(() => {
     setupMonaco();
     const disposeDiagnostics = initDiagnostics(monaco); // 诊断单源(model 生命周期/聚合/F8)
+    initLsp().then((fn) => {
+      disposeLsp = fn; // LSP 装配(异步:status 探测后建订阅;懒连接零启动开销)
+    });
     welcomeModel = monaco.editor.createModel(welcomeText, 'markdown');
     welcomeModel.updateOptions({ tabSize: tabSizeValue() });
     const o = appearanceOptions();
@@ -590,6 +599,7 @@
     if (editor) editor.dispose();
     if (diffEditor) diffEditor.dispose();
     unmountSettingsSchema();
+    disposeLsp?.(); // LSP 装配清理(断连/摘订阅)
   });
 </script>
 
