@@ -202,6 +202,7 @@ cargo run --release -- serve --port 8081
 - 对话历史：「历史」面板列出近期会话（serve 本地索引），点击恢复完整消息记录（见 API.md §11），离开工作台再回来历史完整可见；每轮结束自动落本地消息快照（`data/snapshots/YYYY/MM/DD/`），引擎会话闲置 30 分钟被 TTL 回收后恢复自动回落快照并明示来源；「历史」面板顶部可配置快照保留期（1 天/1 个月/3 个月/半年/1 年/长期，缺省 3 个月，见 API.md §11.3）。快照为展示层非权威副本，审计真相源仍是 evorule FactsLog（永不删除）
 - 左侧文件树浏览工作目录（懒加载展开），点击文件在中栏编辑器打开
 - **语言服务器接入（LSP）**：打开 `.rs`/`.ts`/`.js` 文件自动接入对应语言服务器（rust-analyzer / typescript-language-server，PATH 检测，缺失灰置并给安装引导），提供补全 / hover / 跳转定义 / 文档符号 / 实时诊断（进问题面板与顶栏计数，与 JSON/Markdown 校验同源）；崩溃自动退避重启（60s 窗口 3 次），超限出横幅并可在命令面板 `LSP: 重启` 恢复；设置 `lsp.enabled` 总开关；语言服务器经本地 stdio 通信、零外发（见 docs/TELEMETRY.md）
+- **任务运行**：工作区 `.evo/tasks.json` 定义任务（对齐 VS Code 字段名的简化集），底部「输出」面板多通道呈现（系统流水+每任务通道，file:line:col 错误行点击直达编辑器，内置 rustc/tsc 错误解析进问题面板）；首跑确认框列明命令原文（一次性信任）；**任务永不自动运行**、仅由人的显式动作发起（命令原文全留痕治理日志）；两段式取消（优雅→超时强杀树）；Ctrl+Shift+B 运行生成任务
 - **集成终端**：底部「终端」tab，xterm 6 多实例（chips 切换/新建/关闭/清屏），真实 PTY（Windows PowerShell→CMD→Git Bash 发现序，unix `$SHELL`；`terminal.shell` 可指定）；选区 Ctrl+C=复制否则中断、Ctrl+F 查找、右键/粘贴、中文宽度修正、WebGL 渲染；输出风暴背压不卡 UI；关闭/断连即回收进程树；**治理分级（人机双轨）**：终端是用户自有通道——会话创建/关闭留痕治理日志（审计 tab 可见），会话内命令不经过审批（UI 明示）；agent 的命令执行仍走既有三层审批，两通道互不相通
 - 编辑器多 tab（Monaco 内核），`Ctrl+S` 保存落盘——与 agent 写文件走同一 file 工具实现（同 workdir 沙箱与安全校验，见 API.md §7）
 - 底部多 tab 面板（中栏底部、拖拽调高、可折叠）：「输出」呈现系统事件流水、「审计」呈现当前会话治理事件流（工具调用/审批/错误）并提供「在审计页查看」深链跳转 console 审计页（`?session=<id>` 定位；默认 `http://localhost:5174`，localStorage `evo_console_origin` 可改）；终端（PTY）/问题/控制台日志/时光机器/记忆为占位待后续阶段。深链点击前自动探活——console 未运行时就地明示引导，不跳死链
