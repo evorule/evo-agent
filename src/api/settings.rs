@@ -344,6 +344,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "window",
         },
         SettingEntry {
+            key: "task.autoRevealProblems",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "任务",
+            description: "任务结束时自动打开问题面板（扫出问题/非零退出码时；跟随 onProblem 语义）",
+            scope: "window",
+        },
+        SettingEntry {
             key: "terminal.shell",
             kind: SettingType::String,
             default: json!("auto"),
@@ -723,7 +733,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 32); // 计数锁:新增键须同步(scheme 单源纪律)
+        assert_eq!(settings.len(), 33); // 计数锁:新增键须同步(scheme 单源纪律)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));

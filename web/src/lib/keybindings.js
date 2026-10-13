@@ -29,6 +29,7 @@ export const DEFAULT_KEYBINDINGS = [
   { key: 'ctrl+alt+c', command: 'workbench.action.view.toggleChat', when: '!inPalette' },
   { key: 'ctrl+j', command: 'workbench.action.view.togglePanel', when: '!inPalette' },
   { key: 'ctrl+shift+f', command: 'workbench.action.search.show', when: '!inPalette' },
+  { key: 'ctrl+shift+b', command: 'workbench.action.tasks.build', when: '!inPalette' },
   { key: 'ctrl+shift+h', command: 'workbench.action.search.replace', when: '!inPalette' },
   { key: 'f2', command: 'explorer.rename', when: 'explorerFocus' },
   { key: 'f8', command: 'workbench.action.problems.next', when: '!inPalette' },

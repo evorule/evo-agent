@@ -8,10 +8,11 @@
      激活 tab 为全局 store(panel.js):计数 chip/命令跨组件直达指定 tab。
      纯展示层状态,不落盘、不冒充审计链。 -->
 <script>
-  import { sysEvents, govEvents, sessionId, panelVisible } from '../lib/stores.js';
-  import { panelTab, openBottomPanel } from '../lib/panel.js';
+  import { sysEvents, govEvents, sessionId, panelVisible, openFile } from '../lib/stores.js';
+  import { panelTab, openBottomPanel, outputChannel } from '../lib/panel.js';
   import ProblemsView from './ProblemsView.svelte';
   import TerminalView from './TerminalView.svelte';
+  import { taskChannelIds, taskBufferVersion, taskLines, clearTaskChannel } from '../lib/tasks.js';
 
   // tabs:标准 IDE 标配 4 + evorule 专有 3(设计输入见立项文档)
   const tabs = [
@@ -89,6 +90,37 @@
     requestAnimationFrame(() => listEl && listEl.scrollTo({ top: listEl.scrollHeight }));
   }
 
+  // ---- 输出面板多 channel:贴底跟随/链接化(B10) ----
+  let outBodyEl = null;
+  let outFollow = true;
+
+  function onOutScroll() {
+    if (!outBodyEl) return;
+    const nearBottom = outBodyEl.scrollHeight - outBodyEl.scrollTop - outBodyEl.clientHeight < 24;
+    outFollow = nearBottom;
+  }
+
+  function scrollFollow(force = false) {
+    outFollow = true;
+    if (outBodyEl) outBodyEl.scrollTop = outBodyEl.scrollHeight;
+    if (force) taskBufferVersion.update((n) => n + 1); // 触发重渲染滚底
+  }
+
+  /** file:line(:col)? 链接识别(行首匹配,ANSI 已由无 TTY 天然关色兜底) */
+  function linkifyMatch(text) {
+    const m = /^([^\s:][^:]*?:\d+(?::\d+)?)/.exec(text);
+    if (!m) return null;
+    return m;
+  }
+
+  function jumpFromLink(m) {
+    const parts = m[0].split(':');
+    const col = parts.length >= 3 ? parseInt(parts[parts.length - 1], 10) : 1;
+    const line = parseInt(parts[parts.length - 2], 10);
+    const path = parts.slice(0, parts.length - 2).join(':');
+    if (path && line > 0) openFile(path, { line, col: Math.max(0, col - 1), endCol: col });
+  }
+
   function fmtTime(ts) {
     const d = new Date(ts);
     const pad = (n) => String(n).padStart(2, '0');
@@ -159,17 +191,57 @@
         <TerminalView />
       </div>
       {#if $panelTab === 'output'}
-        {#if $sysEvents.length === 0}
-          <div class="empty">暂无输出。与 agent 对话后,系统事件(SessionCreated / Done / Info 等)在此流水呈现。</div>
-        {:else}
-          {#each $sysEvents as ev (ev.id)}
-            <div class="ev-row">
-              <span class="ev-time mono">{fmtTime(ev.time)}</span>
-              <span class="ev-label mono">{ev.label}</span>
-              <span class="ev-detail">{ev.detail}</span>
-            </div>
-          {/each}
-        {/if}
+        <div class="out-head">
+          <select class="out-channel" bind:value={$outputChannel} aria-label="输出通道">
+            <option value="syslog">系统流水</option>
+            {#each $taskChannelIds as ch (ch)}
+              <option value={ch}>任务: {ch.slice('task:'.length)}</option>
+            {/each}
+          </select>
+          {#if $outputChannel !== 'syslog'}
+            <button class="out-act" onclick={() => clearTaskChannel($outputChannel.slice('task:'.length))}>清空</button>
+          {/if}
+          {#if !outFollow}
+            <button class="out-act follow" onclick={() => scrollFollow(true)}>↓ 跟随</button>
+          {/if}
+        </div>
+        <div class="out-body" bind:this={outBodyEl}>
+          {#if $outputChannel === 'syslog'}
+            {#if $sysEvents.length === 0}
+              <div class="empty">暂无输出。与 agent 对话后,系统事件(SessionCreated / Done / Info 等)在此流水呈现。</div>
+            {:else}
+              {#each $sysEvents as ev (ev.id)}
+                <div class="ev-row">
+                  <span class="ev-time mono">{fmtTime(ev.time)}</span>
+                  <span class="ev-label mono">{ev.label}</span>
+                  <span class="ev-detail">{ev.detail}</span>
+                </div>
+              {/each}
+            {/if}
+          {:else}
+            {#if $taskLines.length === 0}
+              <div class="empty">暂无输出。运行任务后 stdout/stderr 行流在此呈现(诊断经 matcher 进问题面板)。</div>
+            {:else}
+              {#each $taskLines as row, i (i)}
+                <div class="out-row mono">
+                  <span class="ev-time mono">{fmtTime(row.time)}</span>
+                  {#if row.stream === 'stderr'}<span class="out-stream err">ERR</span>{:else if row.stream === 'sys'}<span class="out-stream">SYS</span>{:else}<span class="out-stream">OUT</span>{/if}
+                  <span class="out-text">
+                    {#if row.link}
+                      <a
+                        class="out-link mono"
+                        href="#"
+                        onclick={(e) => { e.preventDefault(); openFile(row.link.path, { line: row.link.line, col: row.link.col, endCol: row.link.endCol }); }}
+                      >{row.link.linkText}</a>{row.text.slice(row.link.linkText.length)}
+                    {:else}
+                      {row.text}
+                    {/if}
+                  </span>
+                </div>
+              {/each}
+            {/if}
+          {/if}
+        </div>
       {:else if $panelTab === 'problems'}
         <ProblemsView />
       {:else if $panelTab === 'audit'}
@@ -260,6 +332,74 @@
   .collapse-btn:hover {
     color: var(--text-primary);
     background: var(--bg-hover);
+  }
+  .out-head {
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 8px;
+    padding: 4px 8px;
+    flex-shrink: 0;
+  }
+  .out-channel {
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg);
+    font-size: 12px;
+    max-width: 260px;
+    padding: 2px 6px;
+  }
+  .out-act {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg-dim);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 8px;
+  }
+  .out-act.follow {
+    border-color: var(--accent);
+    color: var(--fg);
+  }
+  .out-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 4px 8px;
+  }
+  .out-row {
+    align-items: baseline;
+    color: var(--fg);
+    display: flex;
+    font-size: 12px;
+    gap: 8px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .out-row .ev-time {
+    flex-shrink: 0;
+  }
+  .out-stream {
+    color: var(--fg-dim);
+    flex-shrink: 0;
+    font-size: 10px;
+    width: 26px;
+  }
+  .out-stream.err {
+    color: #f85149;
+  }
+  .out-link {
+    color: #58a6ff;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  .out-truncated {
+    color: var(--fg-dim);
+    font-size: 11px;
+    padding: 2px 0;
   }
   .panel-slot {
     height: 100%;

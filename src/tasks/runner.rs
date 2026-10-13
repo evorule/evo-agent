@@ -34,6 +34,8 @@ pub struct TaskSpec {
     #[serde(default)]
     pub options: TaskOptions,
     #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
     pub problem_matcher: Vec<String>,
     #[serde(rename = "problemMatcher")]
     pub problem_matcher_alias: Option<Vec<String>>,

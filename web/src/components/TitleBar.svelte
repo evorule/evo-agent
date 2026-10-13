@@ -7,6 +7,7 @@
   import { connStatus, sessionId, stepCount, turnActive, toolWhitelist, signalCount, refreshGovBadges } from '../lib/stores.js';
   import { problems } from '../lib/diagnostics.js';
   import { openBottomPanel } from '../lib/panel.js';
+  import { taskRuns } from '../lib/tasks.js';
 
   const statusText = {
     connecting: '连接中',
@@ -36,6 +37,8 @@
       window.removeEventListener('focus', onVisible);
     };
   });
+  // 任务 chip:运行中数量
+  $: runningCount = Object.values($taskRuns).filter((r) => r.state === 'running').length;
 </script>
 
 <header class="header">
@@ -86,6 +89,11 @@
       信号 {$signalCount === null ? '—' : $signalCount}
     </span>
     {#if $sessionId}
+      {#if runningCount > 0}
+        <button class="gov-chip mono task-chip" title={`任务运行中 ${runningCount}(点击打开输出面板)`} onclick={() => openBottomPanel('output')}>
+          <span class="spin">◌</span> 任务 {runningCount}
+        </button>
+      {/if}
       <span class="session-chip mono" title="当前会话 id">{$sessionId}</span>
     {/if}
     <span class="conn {statusClass[$connStatus]}">
