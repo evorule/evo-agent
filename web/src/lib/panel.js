@@ -15,3 +15,6 @@ export function openBottomPanel(tab) {
   panelTab.set(tab);
   panelVisible.set(true);
 }
+
+/** 终端意图信号(一次性):命令入口(terminal.new/kill/clear)→ TerminalView 消费 */
+export const terminalIntent = writable(null);

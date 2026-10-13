@@ -44,7 +44,7 @@
   import { getEffectiveRules, resolveKeybinding, migrateKeybindings } from './lib/keybindings.js';
   import { gitStage } from './lib/api.js';
   import { nextProblem, markerToReveal } from './lib/diagnostics.js';
-  import { openBottomPanel } from './lib/panel.js';
+  import { openBottomPanel, terminalIntent } from './lib/panel.js';
   import { lspBanner, restartGate, gateSnapshot } from './lib/lsp/index.js';
   import { pushPanelEvent } from './lib/stores.js';
 
@@ -77,6 +77,10 @@
     'workbench.action.problems.nextInFile',
     'workbench.action.lsp.restart',
     'workbench.action.lsp.status',
+    'workbench.action.terminal.new',
+    'workbench.action.terminal.kill',
+    'workbench.action.terminal.clear',
+    'workbench.action.terminal.focus',
   ];
   let cleanupTracking = null;
 
@@ -283,6 +287,41 @@
         if (!restarted) {
           pushPanelEvent('sys', { label: '[lsp]', detail: '无活动语言门(打开对应语言文件后可重启)' });
         }
+      },
+    });
+    registerCommand({
+      id: 'workbench.action.terminal.new',
+      title: '终端: 新建终端',
+      category: '终端',
+      run: () => {
+        terminalIntent.set('new');
+        openBottomPanel('terminal');
+      },
+    });
+    registerCommand({
+      id: 'workbench.action.terminal.kill',
+      title: '终端: 关闭当前终端',
+      category: '终端',
+      run: () => {
+        terminalIntent.set('kill');
+        openBottomPanel('terminal');
+      },
+    });
+    registerCommand({
+      id: 'workbench.action.terminal.clear',
+      title: '终端: 清屏',
+      category: '终端',
+      run: () => {
+        terminalIntent.set('clear');
+        openBottomPanel('terminal');
+      },
+    });
+    registerCommand({
+      id: 'workbench.action.terminal.focus',
+      title: '终端: 聚焦终端',
+      category: '终端',
+      run: () => {
+        openBottomPanel('terminal');
       },
     });
     registerCommand({

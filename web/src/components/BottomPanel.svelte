@@ -11,10 +11,11 @@
   import { sysEvents, govEvents, sessionId, panelVisible } from '../lib/stores.js';
   import { panelTab, openBottomPanel } from '../lib/panel.js';
   import ProblemsView from './ProblemsView.svelte';
+  import TerminalView from './TerminalView.svelte';
 
   // tabs:标准 IDE 标配 4 + evorule 专有 3(设计输入见立项文档)
   const tabs = [
-    { id: 'terminal', label: '终端', disabled: true, tip: '真实终端(PTY)将拆独立子阶段接入' },
+    { id: 'terminal', label: '终端' },
     { id: 'output', label: '输出' },
     { id: 'problems', label: '问题' },
     { id: 'console', label: '控制台日志', disabled: true, tip: 'serve 日志流在后续阶段接入' },
@@ -152,7 +153,9 @@
 
   {#if $panelVisible}
     <div class="panel-body" bind:this={listEl} style={`height:${bodyHeight}px`}>
-      {#if $panelTab === 'output'}
+      {#if $panelTab === 'terminal'}
+        <TerminalView />
+      {:else if $panelTab === 'output'}
         {#if $sysEvents.length === 0}
           <div class="empty">暂无输出。与 agent 对话后,系统事件(SessionCreated / Done / Info 等)在此流水呈现。</div>
         {:else}

@@ -251,6 +251,8 @@ pub struct AgentApiState {
     human_gate: Arc<crate::api::human_gate::HumanGateLedger>,
     /// LSP 语言服务器活动连接注册表(每语言单连接单实例)
     lsp_registry: Arc<crate::lsp::LangRegistry>,
+    /// PTY 终端会话计数护栏(并发上限 8)
+    pty_registry: Arc<crate::pty::PtyRegistry>,
 }
 
 impl AgentApiState {
@@ -308,6 +310,7 @@ impl AgentApiState {
             ),
             human_gate: Arc::new(crate::api::human_gate::HumanGateLedger::new(&workdir)),
             lsp_registry: Arc::new(crate::lsp::LangRegistry::new()),
+            pty_registry: Arc::new(crate::pty::PtyRegistry::new()),
             fs_events: crate::api::fs_watch::FsEventHub::new(),
             workdir,
             workspace_client,
@@ -411,6 +414,11 @@ impl AgentApiState {
     /// LSP:获取语言服务器活动连接注册表的引用(每语言单连接单实例)
     pub fn lsp_registry(&self) -> &crate::lsp::LangRegistry {
         &self.lsp_registry
+    }
+
+    /// PTY:获取终端会话计数护栏的引用(并发上限)
+    pub fn pty_registry(&self) -> &crate::pty::PtyRegistry {
+        &self.pty_registry
     }
 
     /// G16:获取 AgentDefinitionManager 的引用(WebSocket handler 构造 runner)
@@ -569,6 +577,12 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route(
             "/api/lsp/ws",
             axum::routing::get(crate::api::lsp_api::lsp_ws),
+        )
+        // 工作台终端面(人的终端,治理分级=会话留痕+会话内零拦截;独立端点
+        // 与会话 WS/LSP WS 互不牵连;G16 中间件自动覆盖,WS 内二次校验)
+        .route(
+            "/api/pty/ws",
+            axum::routing::get(crate::api::pty_api::pty_ws),
         )
         // 工作台 Git 面(B3,人工面):SCM 视图/diff/暂存/丢弃/提交 —— 薄委托
         // git::GitOps 核心层;身份缺失只引导不代写 config;G16 中间件自动覆盖
