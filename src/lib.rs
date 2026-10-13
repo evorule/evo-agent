@@ -36,6 +36,7 @@ pub mod git;
 pub mod io_dispatcher;
 pub mod io_handler;
 pub mod io_handlers;
+pub mod lsp;
 #[doc(hidden)]
 pub mod mcp;
 #[doc(hidden)]
