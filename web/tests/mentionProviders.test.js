@@ -18,14 +18,22 @@ vi.mock('../src/lib/api.js', () => ({
 
 vi.mock('../src/lib/lsp/index.js', async () => {
   const { writable } = await import('svelte/store');
-  return { symbolStore: writable(new Map()) };
+  return {
+    symbolStore: writable(new Map()),
+    requestWorkspaceSymbol: vi.fn(async () => null),
+  };
 });
 
 import { listDir, readFile } from '../src/lib/api.js';
-import { registerMentionProviders, rankFiles, reconcileMentions } from '../src/lib/mentionProviders.js';
+import {
+  registerMentionProviders,
+  rankFiles,
+  reconcileMentions,
+  isSensitivePath,
+} from '../src/lib/mentionProviders.js';
 import { getProvider, assembleContext } from '../src/lib/mentions.js';
 import { registerModel, releaseModel } from '../src/lib/modelRegistry.js';
-import { symbolStore } from '../src/lib/lsp/index.js';
+import { symbolStore, requestWorkspaceSymbol } from '../src/lib/lsp/index.js';
 
 const INDEX = [
   { path: 'docs/readme.md', name: 'readme.md', isDir: false },
@@ -98,7 +106,10 @@ describe('file/folder provider', () => {
   afterEach(() => {
     releaseModel('live.js');
     releaseModel('win.js');
+    releaseModel('sym.js');
     symbolStore.set(new Map());
+    vi.mocked(requestWorkspaceSymbol).mockReset();
+    vi.mocked(requestWorkspaceSymbol).mockResolvedValue(null);
   });
 
   it('file 与 folder 注册同一实例(候选去重前提)', () => {
@@ -264,5 +275,100 @@ describe('reconcileMentions(发送前对账)', () => {
     const { kept, added } = await reconcileMentions('@readme.md 再看一遍', [m]);
     expect(kept).toEqual([m]);
     expect(added).toEqual([]);
+  });
+});
+
+describe('symbol provider', () => {
+  beforeEach(() => {
+    registerMentionProviders();
+  });
+
+  afterEach(() => {
+    releaseModel('sym.js');
+    symbolStore.set(new Map());
+    vi.mocked(requestWorkspaceSymbol).mockReset();
+    vi.mocked(requestWorkspaceSymbol).mockResolvedValue(null);
+  });
+
+  it('空查询不出候选;活查询命中归一化结果', async () => {
+    const p = getProvider('symbol');
+    expect(await p.candidates('')).toEqual([]);
+    vi.mocked(requestWorkspaceSymbol).mockResolvedValueOnce([
+      { name: 'main', kind: 12, path: 'src/main.rs', line: 10 },
+      { name: 'unused', kind: 13, path: 'src/other.rs', line: 3 },
+    ]);
+    const got = await p.candidates('main');
+    expect(got).toHaveLength(1);
+    expect(got[0]).toMatchObject({
+      type: 'symbol',
+      ref: 'src/main.rs:10',
+      label: 'main',
+      detail: 'src/main.rs:10',
+    });
+  });
+
+  it('无可用门(null)→ symbolStore 本地兜底过滤', async () => {
+    symbolStore.set(
+      new Map([['src/lib/fuzzy.js', [
+        { name: 'fuzzyMatch', kind: 12, range: { start: { line: 20 } } },
+        { name: 'helper', kind: 12, children: [{ name: 'inner', kind: 13, range: { start: { line: 30 } } }] },
+      ]]]),
+    );
+    const got = await getProvider('symbol').candidates('match');
+    expect(got).toHaveLength(1);
+    expect(got[0].ref).toBe('src/lib/fuzzy.js:21');
+  });
+
+  it('活查询与本地皆无结果 → 空候选(分组隐藏)', async () => {
+    const got = await getProvider('symbol').candidates('nope');
+    expect(got).toEqual([]);
+  });
+
+  it('collect:读盘取符号行 ±30 行;serialize 产 symbol_context 块', async () => {
+    const lines = Array.from({ length: 100 }, (_, i) => `L${i + 1}`);
+    vi.mocked(readFile).mockResolvedValueOnce({ content: lines.join('\n') });
+    const p = getProvider('symbol');
+    const c = await p.collect({ type: 'symbol', ref: 'src/big.rs:50' });
+    expect(c.startLine).toBe(20);
+    expect(c.endLine).toBe(80);
+    expect(c.content.split('\n')).toHaveLength(61);
+    const s = p.serialize({ type: 'symbol' }, c);
+    expect(s.xml).toBe(
+      '<symbol_context path="src/big.rs" lines="20-80" total_lines="100">\nL20\n…\nL80\n</symbol_context>'
+        .replace('L20\n…\nL80', 'L20\nL21\nL22\nL23\nL24\nL25\nL26\nL27\nL28\nL29\nL30\nL31\nL32\nL33\nL34\nL35\nL36\nL37\nL38\nL39\nL40\nL41\nL42\nL43\nL44\nL45\nL46\nL47\nL48\nL49\nL50\nL51\nL52\nL53\nL54\nL55\nL56\nL57\nL58\nL59\nL60\nL61\nL62\nL63\nL64\nL65\nL66\nL67\nL68\nL69\nL70\nL71\nL72\nL73\nL74\nL75\nL76\nL77\nL78\nL79\nL80'),
+    );
+    expect(s.summary).toBe('src/big.rs:20-80/100(符号上下文)');
+  });
+
+  it('collect:已打开文件走编辑器实况;ref 非法返回 null', async () => {
+    registerModel('sym.js', fakeModel({ lines: ['a', 'b', 'c'] }));
+    const c = await getProvider('symbol').collect({ type: 'symbol', ref: 'sym.js:2' });
+    expect(c.content).toBe('a\nb\nc');
+    expect(c.startLine).toBe(1);
+    await expect(getProvider('symbol').collect({ type: 'symbol', ref: 'badformat' })).resolves.toBeNull();
+  });
+});
+
+describe('敏感文件 ⚠ 标记', () => {
+  it('isSensitivePath 命中密钥/凭据类文件名', () => {
+    expect(isSensitivePath('.env')).toBe(true);
+    expect(isSensitivePath('config/server.pem')).toBe(true);
+    expect(isSensitivePath('keys/id_rsa')).toBe(true);
+    expect(isSensitivePath('a/credentials.json')).toBe(true);
+    expect(isSensitivePath('a/token_store.js')).toBe(true);
+    expect(isSensitivePath('src/lib/fuzzy.js')).toBe(false);
+    expect(isSensitivePath('README.md')).toBe(false);
+  });
+
+  it('文件候选带 warn 标记(可见可选不拦)', () => {
+    const out = rankFiles(
+      [
+        { path: '.env', name: '.env', isDir: false },
+        { path: 'src/app.rs', name: 'app.rs', isDir: false },
+      ],
+      '',
+    );
+    expect(out.find((c) => c.ref === '.env').warn).toBe(true);
+    expect(out.find((c) => c.ref === 'src/app.rs').warn).toBeUndefined();
   });
 });

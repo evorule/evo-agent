@@ -443,6 +443,26 @@ pub fn schema() -> Vec<SettingEntry> {
             description: "单次主动压缩最多清除的工具结果条数（按原文长度从大到小清除，0 = 只生成摘要不清除原文）",
             scope: "window",
         },
+        SettingEntry {
+            key: "mentions.maxFileLines",
+            kind: SettingType::Number,
+            default: json!(600),
+            enum_values: None,
+            range: Some([50, 2000]),
+            category: "对话",
+            description: "@引用文件携带的全文行数上限（未打开且超限的文件降级为符号大纲并标注截断）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "mentions.terminalLines",
+            kind: SettingType::Number,
+            default: json!(200),
+            enum_values: None,
+            range: Some([20, 1000]),
+            category: "对话",
+            description: "@引用终端时携带的输出尾部行数",
+            scope: "window",
+        },
     ]
 }
 
@@ -753,7 +773,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 35); // 计数锁:新增键须同步(scheme 单源纪律)
+        assert_eq!(settings.len(), 37); // 计数锁:新增键须同步(scheme 单源纪律)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -803,6 +823,9 @@ mod tests {
             settings["longSession.compaction.maxClearToolResults"],
             json!(20)
         );
+        // mentions.* @上下文引用 2 键(B13 消费:文件降级大纲/终端尾部行数)
+        assert_eq!(settings["mentions.maxFileLines"], json!(600));
+        assert_eq!(settings["mentions.terminalLines"], json!(200));
         for (k, v) in &sources {
             assert_eq!(v, &json!("default"), "key {k} should be default");
         }
