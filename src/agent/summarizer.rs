@@ -1348,8 +1348,12 @@ mod tests {
     }
 
     fn openai_body(content: &str) -> String {
+        // SG-1 件1:mock 服务器扮演执行体,返回四键归一形状
         serde_json::json!({
-            "choices": [{"message": {"role": "assistant", "content": content}}]
+            "content": content,
+            "tool_calls": null,
+            "finish_reason": "stop",
+            "token_usage": null
         })
         .to_string()
     }
@@ -1365,7 +1369,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let llm = LlmHandler::new("m", &server.url(), None).with_max_retries(0);
+        let llm = LlmHandler::new("m", &server.url()).with_max_retries(0);
         let s = ContextSummarizer::new(llm, None).with_threshold(2);
         let dropped = make_dropped(3);
         let first = s.summarize_dropped(&dropped).await.unwrap();
@@ -1402,7 +1406,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let llm = LlmHandler::new("m", &server.url(), None).with_max_retries(0);
+        let llm = LlmHandler::new("m", &server.url()).with_max_retries(0);
         let s = ContextSummarizer::new(llm, None).with_threshold(2);
         let dropped = marker_msgs("old", 5);
         let first = s.summarize_dropped(&dropped).await.unwrap();
@@ -1447,7 +1451,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let llm = LlmHandler::new("m", &server.url(), None).with_max_retries(0);
+        let llm = LlmHandler::new("m", &server.url()).with_max_retries(0);
         let s = ContextSummarizer::new(llm, None).with_threshold(2);
         let dropped = marker_msgs("old", 5);
 
@@ -1485,7 +1489,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let llm = LlmHandler::new("m", &server.url(), None).with_max_retries(0);
+        let llm = LlmHandler::new("m", &server.url()).with_max_retries(0);
         let s = ContextSummarizer::new(llm, None).with_threshold(2);
 
         // 第一代：frozen 0→3，gen=1，parent=None
@@ -1530,7 +1534,7 @@ mod tests {
     #[test]
     fn test_r3_seed_cache_closes_g3_without_llm() {
         // G-3 关闭证明：payload 回读种子后，同 frozen 长度调用零 LLM 直接命中
-        let llm = LlmHandler::new("m", "http://127.0.0.1:9", None).with_max_retries(0);
+        let llm = LlmHandler::new("m", "http://127.0.0.1:9").with_max_retries(0);
         let s = ContextSummarizer::new(llm, None).with_threshold(2);
         // 模拟从 payload 回读（gen=2，frozen=5）
         s.seed_cache(5, "SEEDED-FROM-PAYLOAD".to_string(), 2);
@@ -1557,7 +1561,7 @@ mod tests {
 
     #[test]
     fn test_r3_seed_ignores_stale_gen() {
-        let llm = LlmHandler::new("m", "http://127.0.0.1:9", None).with_max_retries(0);
+        let llm = LlmHandler::new("m", "http://127.0.0.1:9").with_max_retries(0);
         let s = ContextSummarizer::new(llm, None).with_threshold(2);
         s.seed_cache(5, "NEWER".to_string(), 3);
         s.seed_cache(2, "STALE".to_string(), 2); // 旧账回灌防御

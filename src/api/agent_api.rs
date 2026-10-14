@@ -319,8 +319,8 @@ impl AgentApiState {
             workspace_client,
             toolkit,
             llm_status: Arc::new(LlmStatusSnapshot::unconfigured()),
-            // 默认态:api_key 置空(from_config 视空为未配置),待 cmd_serve
-            // 注入经统一解析的完整配置
+            // 默认态:api_key 置空(SG-1 件1 key 归边后 handler 不消费此字段,
+            // 仅配置层脱敏回显保留),待 cmd_serve 注入经统一解析的完整配置
             llm_config: Arc::new(LlmConfig {
                 api_key: String::new(),
                 ..LlmConfig::default()

@@ -60,6 +60,11 @@ pub struct LlmConfig {
     /// API endpoint
     #[serde(default = "LlmConfig::default_api_base")]
     pub api_base: String,
+    /// 执行体端点(SG-1 件1 key 归边):LLM 出站统一 POST 到此 URL,
+    /// 支持 `${ENV:VAR_NAME}` 占位符;配置文件未提供时回落 env
+    /// `EVORULE_LLM_EXECUTOR_URL`,再回落 `http://127.0.0.1:9130/llm/execute`
+    #[serde(default = "LlmConfig::default_executor_url")]
+    pub executor_url: String,
     /// 请求超时(秒)
     #[serde(default = "default_llm_timeout")]
     pub timeout_secs: u64,
@@ -84,6 +89,12 @@ impl LlmConfig {
     /// 默认 api_base(国际版;api.minimax.io 为国内版域名,sk-cp- 国际版 key 无效)
     pub fn default_api_base() -> String {
         "https://api.minimaxi.com/v1/text/chatcompletion_v2".to_string()
+    }
+    /// 默认执行体端点(SG-1 件1):env `EVORULE_LLM_EXECUTOR_URL` 优先,
+    /// 回落本机 ai-plugin 扩展执行体
+    pub fn default_executor_url() -> String {
+        std::env::var("EVORULE_LLM_EXECUTOR_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:9130/llm/execute".to_string())
     }
 }
 
@@ -312,6 +323,7 @@ impl Default for LlmConfig {
             api_key: Self::default_api_key(),
             model: Self::default_model(),
             api_base: Self::default_api_base(),
+            executor_url: Self::default_executor_url(),
             timeout_secs: default_llm_timeout(),
             max_retries: default_max_retries(),
         }

@@ -627,7 +627,7 @@ mod tests {
     async fn test_execute_llm_failure_writes_error_io_response() {
         let mut server = mockito::Server::new_async().await;
         // LLM 指向不可达地址 → llm.execute 必失败
-        let failing_llm = LlmHandler::new("mm", "http://127.0.0.1:1", None).with_max_retries(0);
+        let failing_llm = LlmHandler::new("mm", "http://127.0.0.1:1").with_max_retries(0);
 
         let audited = AuditedLlm::new(EvoruleApiClient::new(&server.url()), failing_llm);
 
