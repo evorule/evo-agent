@@ -13,7 +13,6 @@
 
 #![forbid(unsafe_code)]
 
-use axum::response::Html;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -24,7 +23,6 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::agent_api::AgentApiState;
-use axum::response::IntoResponse as _;
 
 #[cfg(test)]
 mod tests {
@@ -66,7 +64,7 @@ pub struct CompletionRequest {
     /// 光标后文本
     #[serde(default)]
     pub suffix: String,
-    /// 语言 id(v1 通用 PSM 形态不按语言分化)
+    /// 语言 id(补全 prompt 上下文)
     #[serde(default)]
     pub lang: Option<String>,
 }
@@ -128,7 +126,7 @@ async fn openai_compatible_call(
     .map_err(|e| format!("LLM 请求失败: {e}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let _ = resp.text().await.unwrap_or_default();
         // 日志脱敏:仅状态码与响应头长度,不记响应正文(可能含用户代码)
         return Err(format!("LLM HTTP {status}"));
     }
@@ -163,17 +161,24 @@ pub async fn completion(
     };
     let suffix: String = req.suffix.chars().take(SUFFIX_BUDGET_CHARS).collect();
 
-    // FIM 形态:通用 PSM 拼接(DeepSeek chat 端点无原生 FIM 参数,chat 形态用
-    // prefill 指令;stop 用常见 EOS 序列防续写)
+    // 补全形态:自然语言指令(设计偏离——PSM token 形态经 MiniMax-M2.5 真机
+    // 实测返回空,对话型模型不认识 FIM token;chat 指令形态实测有效,详见
+    // 13 号设计变更记录)。suffix 作为续写上下文给出,不直接拼接。
     let messages = vec![
         json!({
             "role": "system",
-            "content": "你是代码补全引擎。只输出光标处应续写的代码片段,不要重复已有代码,不要解释,不要 markdown 代码围栏。若无需补全,输出空。"
+            "content": "你是代码补全引擎。给定光标前的代码与光标后的代码,只输出光标处应续写的代码片段:不要重复已有代码,不要解释,不要 markdown 代码围栏。通常 1-5 行。"
         }),
         json!({
             "role": "user",
             "content": format!(
-                "<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_hole|>"
+                "光标前的代码:
+{prefix}
+
+光标后的代码:
+{suffix}
+
+只输出光标处应续写的代码片段。"
             )
         }),
     ];
