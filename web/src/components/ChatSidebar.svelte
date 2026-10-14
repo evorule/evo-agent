@@ -18,9 +18,9 @@
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
   import { approveProposal, listResumableRuns } from '../lib/api.js';
   import { onMount, tick } from 'svelte';
-  import { collectCandidates, MENTION_GROUP_LABELS } from '../lib/mentions.js';
+  import { collectCandidates, MENTION_GROUP_LABELS, estimateTokens, tokenLevel } from '../lib/mentions.js';
   import { highlightSegments } from '../lib/fuzzy.js';
-  import { registerMentionProviders } from '../lib/mentionProviders.js';
+  import { registerMentionProviders, reconcileMentions } from '../lib/mentionProviders.js';
   import {
     registerMentionSourceProviders,
     getActiveSelection,
@@ -238,13 +238,15 @@
     composerMentions.update((arr) => arr.filter((_, idx) => idx !== i));
   }
 
-  function submit() {
+  async function submit() {
     const text = draft.trim();
     if (!text || $turnActive) return;
+    // 先清输入(防 await 窗口内重复提交),再对账,最后交 ws.js 组装发送
     draft = '';
     closeMention();
+    const { kept } = await reconcileMentions(text, $composerMentions);
     composerMentions.set([]);
-    sendMessage(text);
+    sendMessage(text, kept);
   }
 
   function onKeydown(e) {
@@ -357,7 +359,32 @@
     {/if}
     {#each $messages as m (m.id)}
       {#if m.kind === 'user'}
-        <div class="row user"><div class="bubble user-bubble">{m.text}</div></div>
+        <div class="row user">
+          <div class="user-col">
+            <div class="bubble user-bubble">{m.text}</div>
+            {#if (m.mentions && m.mentions.length > 0) || (m.dropped && m.dropped.length > 0)}
+              <div class="used-refs">
+                <span class="ur-label">引用</span>
+                {#each m.mentions as u}
+                  <span class="used-chip" title={u.summary}>
+                    <span class="ur-kind">{MENTION_GROUP_LABELS[u.type] || u.type}</span>
+                    <span class="ur-ref mono">{u.ref}</span>
+                  </span>
+                {/each}
+                {#each m.dropped as d}
+                  <span
+                    class="used-chip dropped"
+                    title="发送时未能取得该引用:{d.reason}"
+                  >
+                    <span class="ur-kind">{MENTION_GROUP_LABELS[d.type] || d.type}</span>
+                    <span class="ur-ref mono">{d.ref}</span>
+                    <span class="ur-note">未带上</span>
+                  </span>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        </div>
       {:else if m.kind === 'assistant'}
         <div class="row">
           <div class="bubble assistant-bubble">
@@ -470,6 +497,11 @@
       onblur={closeMention}
       disabled={$connStatus !== 'online'}
     ></textarea>
+    <div class="composer-meta">
+      <span class="token-est {tokenLevel(estimateTokens(draft))}">
+        ≈ {estimateTokens(draft)} tokens
+      </span>
+    </div>
     <div class="composer-actions">
       {#if $turnActive}
         <button class="btn danger" onclick={interrupt}>中断</button>
@@ -959,6 +991,66 @@
   .composer-actions {
     display: flex;
     justify-content: flex-end;
+  }
+  .composer-meta {
+    display: flex;
+    justify-content: flex-end;
+  }
+  .token-est {
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+  .token-est.warn {
+    color: var(--warning);
+  }
+  .token-est.over {
+    color: var(--danger);
+  }
+  .user-col {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    max-width: 88%;
+  }
+  .used-refs {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 4px;
+  }
+  .ur-label {
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+  .used-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 6px;
+    font-size: 10px;
+    max-width: 220px;
+  }
+  .used-chip.dropped {
+    opacity: 0.7;
+    border-style: dashed;
+  }
+  .ur-kind {
+    color: var(--brand);
+    flex-shrink: 0;
+  }
+  .ur-ref {
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ur-note {
+    color: var(--danger);
+    flex-shrink: 0;
   }
   .btn {
     height: 30px;

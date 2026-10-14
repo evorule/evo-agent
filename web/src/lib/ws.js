@@ -24,6 +24,7 @@ import {
   refreshGitStatus,
 } from './stores.js';
 import { getTranscript } from './api.js';
+import { assembleContext } from './mentions.js';
 
 let ws = null;
 let streamMsgId = null; // 当前轮流式 assistant 气泡
@@ -110,13 +111,43 @@ export function disconnect() {
   }
 }
 
-export function sendMessage(content) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  pushMessage({ kind: 'user', text: content });
+/**
+ * 发送消息。mentions 可选(composer @引用元数据):发送前 assembleContext
+ * 逐个抓取拼成 <evo-context> XML 追加在正文之后——WS 帧形状不变,扩展全部
+ * 在 content 字符串内。单个 mention 失败仅记 dropped(随用户消息回显),
+ * 不阻断发送。
+ * @returns {Promise<{used: Array, dropped: Array} | null>} null=连接不可用
+ */
+export async function sendMessage(content, mentions = []) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return null;
+  let xml = '';
+  let used = [];
+  let dropped = [];
+  if (Array.isArray(mentions) && mentions.length > 0) {
+    try {
+      const res = await assembleContext(mentions, {});
+      xml = res.xml;
+      used = res.used;
+      dropped = res.dropped;
+    } catch {
+      xml = ''; // 组装异常按无上下文发送(正文不受影响)
+    }
+    // 治理留痕:同 type:ref 计次;带 dropped 数
+    if (used.length > 0 || dropped.length > 0) {
+      const counts = new Map();
+      for (const u of used) counts.set(`${u.type}:${u.ref}`, (counts.get(`${u.type}:${u.ref}`) || 0) + 1);
+      const detail =
+        [...counts].map(([k, n]) => (n > 1 ? `${k}×${n}` : k)).join(',') +
+        (dropped.length > 0 ? `(dropped=${dropped.length})` : '');
+      pushPanelEvent('gov', { label: 'MentionSent', detail, level: 'info' });
+    }
+  }
+  pushMessage({ kind: 'user', text: content, mentions: used, dropped });
   streamMsgId = pushMessage({ kind: 'assistant', text: '', streaming: true });
   stepCount.set(0);
   turnActive.set(true);
-  ws.send(JSON.stringify({ type: 'message', content }));
+  ws.send(JSON.stringify({ type: 'message', content: xml ? `${content}\n\n${xml}` : content }));
+  return { used, dropped };
 }
 
 export function interrupt() {
