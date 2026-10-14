@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 EvoRule Project
+import { describe, it, expect } from 'vitest';
+import {
+  MENTION_GROUPS,
+  registerProvider,
+  getProvider,
+  registeredTypes,
+  assembleContext,
+  xmlEscape,
+  xmlBlock,
+  estimateTokens,
+  tokenLevel,
+  TOKEN_LIMITS,
+} from '../src/lib/mentions.js';
+
+// 假 provider:ref='missing.rs' 时 collect 失败,ctx 原样透传断言
+function makeFileProvider() {
+  return {
+    seenCtx: null,
+    candidates() {
+      return [];
+    },
+    async collect(m, ctx) {
+      this.seenCtx = ctx;
+      return m.ref === 'missing.rs' ? null : { content: 'hello' };
+    },
+    serialize(m, c) {
+      return {
+        xml: xmlBlock('file_content', { path: m.ref }, c.content),
+        summary: `${m.ref}(5 行)`,
+      };
+    },
+  };
+}
+
+describe('provider 注册表', () => {
+  it('三接口齐全才允许注册', () => {
+    expect(registerProvider('good', makeFileProvider())).toBe(true);
+    expect(registerProvider('bad1', { collect: () => {} })).toBe(false);
+    expect(registerProvider('bad2', { candidates: () => {}, serialize: () => {} })).toBe(false);
+    expect(registerProvider('', {})).toBe(false);
+    expect(registerProvider(null, makeFileProvider())).toBe(false);
+    expect(getProvider('bad1')).toBeNull();
+    expect(getProvider('good')).not.toBeNull();
+    expect(registeredTypes()).toContain('good');
+  });
+
+  it('同类型重复注册时替换', () => {
+    const a = makeFileProvider();
+    const b = makeFileProvider();
+    expect(registerProvider('dup', a)).toBe(true);
+    expect(registerProvider('dup', b)).toBe(true);
+    expect(getProvider('dup')).toBe(b);
+  });
+
+  it('分组顺序固定且含六组', () => {
+    expect(MENTION_GROUPS.map((g) => g.type)).toEqual([
+      'file',
+      'folder',
+      'symbol',
+      'selection',
+      'terminal',
+      'problems',
+    ]);
+  });
+});
+
+describe('assembleContext', () => {
+  it('按 mentions 顺序组装 <evo-context>,used 带回显摘要', async () => {
+    registerProvider('file', makeFileProvider());
+    const { xml, used, dropped } = await assembleContext(
+      [
+        { type: 'file', ref: 'b.rs' },
+        { type: 'file', ref: 'a.rs' },
+      ],
+      { fileIndex: [] },
+    );
+    expect(xml).toContain('<evo-context>');
+    const iB = xml.indexOf('<file_content path="b.rs">');
+    const iA = xml.indexOf('<file_content path="a.rs">');
+    expect(iB).toBeGreaterThan(-1);
+    expect(iA).toBeGreaterThan(iB); // 顺序保持
+    expect(used).toEqual([
+      { type: 'file', ref: 'b.rs', summary: 'b.rs(5 行)' },
+      { type: 'file', ref: 'a.rs', summary: 'a.rs(5 行)' },
+    ]);
+    expect(dropped).toEqual([]);
+  });
+
+  it('ctx 透传给 provider.collect', async () => {
+    const p = makeFileProvider();
+    registerProvider('ctxprobe', p);
+    const ctx = { fileIndex: ['x.rs'] };
+    await assembleContext([{ type: 'ctxprobe', ref: 'x.rs' }], ctx);
+    expect(p.seenCtx).toBe(ctx);
+  });
+
+  it('collect 失败降级:记入 dropped,不阻断其余 mention', async () => {
+    registerProvider('file', makeFileProvider());
+    const { xml, used, dropped } = await assembleContext([
+      { type: 'file', ref: 'missing.rs' },
+      { type: 'file', ref: 'ok.rs' },
+    ]);
+    expect(dropped).toEqual([{ type: 'file', ref: 'missing.rs', reason: 'collect_failed' }]);
+    expect(used.map((u) => u.ref)).toEqual(['ok.rs']);
+    expect(xml).not.toContain('missing.rs');
+  });
+
+  it('未知类型记 no_provider,畸形 mention 记 malformed', async () => {
+    const { dropped } = await assembleContext([
+      { type: 'ghost', ref: 'x' },
+      { type: 'file' },
+      null,
+    ]);
+    expect(dropped.map((d) => d.reason)).toEqual(['no_provider', 'malformed', 'malformed']);
+  });
+
+  it('全部失败时 xml 为空串', async () => {
+    registerProvider('file', makeFileProvider());
+    const { xml, used } = await assembleContext([{ type: 'file', ref: 'missing.rs' }]);
+    expect(xml).toBe('');
+    expect(used).toEqual([]);
+  });
+
+  it('serialize 抛异常按 empty 降级', async () => {
+    registerProvider('boom', {
+      candidates: () => [],
+      collect: async () => ({}),
+      serialize: () => {
+        throw new Error('x');
+      },
+    });
+    const { dropped } = await assembleContext([{ type: 'boom', ref: 'y' }]);
+    expect(dropped).toEqual([{ type: 'boom', ref: 'y', reason: 'empty' }]);
+  });
+
+  it('空 mentions 返回空 xml', async () => {
+    const { xml, used, dropped } = await assembleContext([]);
+    expect(xml).toBe('');
+    expect(used).toEqual([]);
+    expect(dropped).toEqual([]);
+  });
+});
+
+describe('xml 工具', () => {
+  it('xmlEscape 转义四类字符', () => {
+    expect(xmlEscape('a<b>&"c"d')).toBe('a&lt;b&gt;&amp;&quot;c&quot;d');
+  });
+
+  it('xmlBlock 有 body 时换行包体', () => {
+    expect(xmlBlock('file_content', { path: 'a.rs' }, 'hi')).toBe(
+      '<file_content path="a.rs">\nhi\n</file_content>',
+    );
+  });
+
+  it('xmlBlock 空 body 自闭合', () => {
+    expect(xmlBlock('terminal_output', { lines: '1-2' }, '')).toBe('<terminal_output lines="1-2"/>');
+  });
+
+  it('xmlBlock 属性值转义且 null 属性省略', () => {
+    expect(xmlBlock('t', { p: 'a"b', q: null }, 'x')).toBe('<t p="a&quot;b">\nx\n</t>');
+  });
+});
+
+describe('token 估算', () => {
+  it('estimateTokens ≈ 4 字符/token,向上取整', () => {
+    expect(estimateTokens('')).toBe(0);
+    expect(estimateTokens(null)).toBe(0);
+    expect(estimateTokens('abcd')).toBe(1);
+    expect(estimateTokens('abcde')).toBe(2);
+  });
+
+  it('tokenLevel 分段边界', () => {
+    expect(tokenLevel(TOKEN_LIMITS.safe - 1)).toBe('safe');
+    expect(tokenLevel(TOKEN_LIMITS.safe)).toBe('warn');
+    expect(tokenLevel(TOKEN_LIMITS.warn)).toBe('warn');
+    expect(tokenLevel(TOKEN_LIMITS.warn + 1)).toBe('over');
+  });
+});
