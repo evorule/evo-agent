@@ -1,7 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! LLM I/O Handler -- invokes external LLM API
+//! LLM I/O Handler -- 经执行体中继调用外部 LLM API
+//!
+//! ## SG-1 件1:执行体中继(key 归边)
+//!
+//! 本 handler 不再直连 provider:所有 LLM 出站统一 POST 到
+//! ai-plugin 扩展型执行体端点(`executor_url`,默认
+//! `http://127.0.0.1:9130/llm/execute`),请求体形状与原 provider
+//! 请求一致(model/messages/temperature/max_tokens/stream/tools/tool_choice,
+//! 由执行体原样透传)。API key 由执行体(server 侧)持有,agent 侧
+//! 不携带任何凭据。响应为执行体归一后的四键形状
+//! `{content, tool_calls:[{tool_name,args}], finish_reason, token_usage}`
+//! (与 agent `LlmResponse` 同构;流式请求由执行体做 SSE 聚合后整包返回)。
 //!
 //! ## G3:重试机制
 //!
@@ -12,18 +23,16 @@
 //! 不重试:400 / 401 / 403(客户端错误,重试无意义)。
 //! 退避算法:`min(base * 2^attempt, max)`,叠加 ±20% 抖动。
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_stream::stream;
 use futures_core::Stream;
-use futures_util::StreamExt;
 use rand::Rng;
 use serde_json;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::agent::translator::{LlmResponse, TokenUsage, ToolCall};
+use crate::agent::translator::{LlmResponse, TokenUsage};
 use crate::io_handler::{IoHandler, IoResult};
 
 /// 默认最大重试次数
@@ -75,39 +84,12 @@ pub enum StreamChunk {
     Warn(String),
 }
 
-/// G1:tool_call 聚合器(按 SSE index 累积)
-#[derive(Debug, Default)]
-struct ToolCallAccumulator {
-    id: Option<String>,
-    name: Option<String>,
-    /// arguments 分片累积(OpenAI 分多帧发)
-    arguments: String,
-}
-
-impl ToolCallAccumulator {
-    /// 把累积结果转为 `ToolCall`(translator.rs 的类型)
-    ///
-    /// arguments 是分片拼接的字符串,最终解析为 JSON Value。
-    /// 如果拼接后不是合法 JSON,fallback 到空对象 `{}`。
-    fn to_tool_call(&self) -> Option<ToolCall> {
-        let name = self.name.clone()?;
-        let args_str = if self.arguments.is_empty() {
-            "{}".to_string()
-        } else {
-            self.arguments.clone()
-        };
-        let arguments: serde_json::Value =
-            serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
-        Some(ToolCall { name, arguments })
-    }
-}
-
-/// LLM I/O Handler -- invokes external LLM API
+/// LLM I/O Handler -- 经执行体中继调用外部 LLM API
 #[derive(Debug, Clone)]
 pub struct LlmHandler {
     default_model: String,
-    api_base: String,
-    api_key: Option<String>,
+    /// 执行体端点(SG-1 件1 key 归边):所有 LLM 出站统一 POST 到此 URL
+    executor_url: String,
     /// If set, skip HTTP and return a canned LlmResponse-format JSON.
     /// Used by tests to avoid hitting a real LLM API.
     mock_content: Option<String>,
@@ -125,11 +107,13 @@ pub struct LlmHandler {
 
 impl LlmHandler {
     /// Create new LLM handler
-    pub fn new(default_model: &str, api_base: &str, api_key: Option<String>) -> Self {
+    ///
+    /// `executor_url` 为 ai-plugin 扩展型执行体端点(不直连 provider,
+    /// agent 侧不持 API key)。
+    pub fn new(default_model: &str, executor_url: &str) -> Self {
         Self {
             default_model: default_model.to_string(),
-            api_base: api_base.to_string(),
-            api_key,
+            executor_url: executor_url.to_string(),
             mock_content: None,
             max_retries: DEFAULT_MAX_RETRIES,
             base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
@@ -153,78 +137,35 @@ impl LlmHandler {
 
     /// Create LLM handler with default config
     ///
-    /// Priority: MiniMax > DeepSeek > OpenAI
+    /// SG-1 件1(key 归边):agent 侧不再读 `*_API_KEY` 凭据,出站统一
+    /// 指向执行体端点——优先 env `EVORULE_LLM_EXECUTOR_URL`,回落
+    /// `http://127.0.0.1:9130/llm/execute`(ai-plugin 默认监听)。
+    /// 模型名仍可经 env `MINIMAX_MODEL` 覆盖,回落 `MiniMax-M2.5`
+    /// (须在执行体白名单内,越界由执行体拒绝)。
     pub fn with_defaults() -> Self {
-        if let Ok(api_key) = std::env::var("MINIMAX_API_KEY") {
-            Self {
-                default_model: std::env::var("MINIMAX_MODEL")
-                    .unwrap_or_else(|_| "MiniMax-M2.5".to_string()),
-                api_base: std::env::var("MINIMAX_API_BASE").unwrap_or_else(|_| {
-                    "https://api.minimaxi.com/v1/text/chatcompletion_v2".to_string()
-                }),
-                api_key: Some(api_key),
-                mock_content: None,
-                max_retries: DEFAULT_MAX_RETRIES,
-                base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
-                max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
-                connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
-                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            }
-        } else if let Ok(api_key) = std::env::var("DEEPSEEK_API_KEY") {
-            Self {
-                default_model: std::env::var("DEEPSEEK_MODEL")
-                    .unwrap_or_else(|_| "deepseek-chat".to_string()),
-                api_base: std::env::var("DEEPSEEK_API_BASE")
-                    .unwrap_or_else(|_| "https://api.deepseek.com/v1/chat/completions".to_string()),
-                api_key: Some(api_key),
-                mock_content: None,
-                max_retries: DEFAULT_MAX_RETRIES,
-                base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
-                max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
-                connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
-                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            }
-        } else if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-            Self {
-                default_model: std::env::var("OPENAI_MODEL")
-                    .unwrap_or_else(|_| "gpt-4o-mini".to_string()),
-                api_base: std::env::var("OPENAI_API_BASE")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string()),
-                api_key: Some(api_key),
-                mock_content: None,
-                max_retries: DEFAULT_MAX_RETRIES,
-                base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
-                max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
-                connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
-                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            }
-        } else {
-            Self {
-                default_model: "MiniMax-M2.5".to_string(),
-                api_base: "https://api.minimaxi.com/v1/text/chatcompletion_v2".to_string(),
-                api_key: None,
-                mock_content: None,
-                max_retries: DEFAULT_MAX_RETRIES,
-                base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
-                max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
-                connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
-                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            }
+        Self {
+            default_model: std::env::var("MINIMAX_MODEL")
+                .unwrap_or_else(|_| "MiniMax-M2.5".to_string()),
+            executor_url: std::env::var("EVORULE_LLM_EXECUTOR_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:9130/llm/execute".to_string()),
+            mock_content: None,
+            max_retries: DEFAULT_MAX_RETRIES,
+            base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
+            max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
+            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
         }
     }
 
     /// G3:从 `LlmConfig` 构造 handler(由 CLI `cmd_run` 调用)
     ///
     /// 把 `config.llm.max_retries` 真正接到 handler 上,复活死代码。
+    /// `executor_url` 映射自 `config.llm.executor_url`;配置中的 `api_key`
+    /// 字段不再消费(key 归边,凭据仅存于执行体侧)。
     pub fn from_config(config: &crate::config::LlmConfig) -> Self {
         Self {
             default_model: config.model.clone(),
-            api_base: config.api_base.clone(),
-            api_key: if config.api_key.is_empty() {
-                None
-            } else {
-                Some(config.api_key.clone())
-            },
+            executor_url: config.executor_url.clone(),
             mock_content: None,
             max_retries: config.max_retries,
             base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
@@ -289,8 +230,7 @@ impl LlmHandler {
     pub fn mock(content: &str) -> Self {
         Self {
             default_model: "mock".to_string(),
-            api_base: "mock://".to_string(),
-            api_key: None,
+            executor_url: "mock://".to_string(),
             mock_content: Some(content.to_string()),
             max_retries: 0, // mock 不重试
             base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
@@ -381,7 +321,8 @@ impl LlmHandler {
     /// G3:发起单次 HTTP 请求(不含重试逻辑)
     ///
     /// 返回 `Ok(resp)` 表示请求成功送达(不代表业务成功,状态码可能 4xx/5xx),
-    /// 返回 `Err(e)` 表示网络层错误。
+    /// 返回 `Err(e)` 表示网络层错误。SG-1 件1:请求指向执行体端点,
+    /// 不携带任何 Authorization(key 归边,凭据由执行体持有)。
     async fn do_http_call(
         &self,
         body: &serde_json::Value,
@@ -392,145 +333,44 @@ impl LlmHandler {
             .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        let mut request = client.post(&self.api_base).json(body);
-
-        if let Some(api_key) = &self.api_key {
-            request = request.header("Authorization", format!("Bearer {}", api_key));
-        }
-
-        request.send().await
+        client.post(&self.executor_url).json(body).send().await
     }
 
     /// G3:解析 2xx 响应为 LlmResponse 格式 JSON
     ///
-    /// 把 OpenAI 兼容的响应格式转换为内部统一的 LlmResponse 结构:
-    /// - `choices[0].message.content`   → content
-    /// - `choices[0].message.tool_calls` → tool_calls
-    /// - `choices[0].finish_reason`     → finish_reason
-    /// - `usage`                        → token_usage
+    /// SG-1 件1:执行体(`POST /llm/execute`)返回的是已归一的四键形状
+    /// `{content, tool_calls:[{tool_name,args}], finish_reason, token_usage}`
+    /// (与 agent `LlmResponse` 同构)。本方法做**宽松透传归一**:
+    /// - 缺键/空值兜底(content→"",tool_calls→null)
+    /// - `token_usage` 逐值 try-parse 为 `TokenUsage`,形状不符(如
+    ///   provider raw usage 缺字段)时降级为 null——禁止因 usage 形状
+    ///   偏差导致整个 LlmResponse 反序列化失败
+    /// - 业务层错误(provider HTTP 200 + JSON 错误体)已由执行体显式
+    ///   转为非 2xx,此处收到的 2xx 响应必为四键形状
     async fn parse_success_response(&self, resp: reqwest::Response) -> Result<Value, String> {
         let json: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| format!("LLM API response parse error: {}", e))?;
-
-        // 业务层错误体检测(与流式路径 execute_stream 对称):OpenAI 兼容端点
-        // (如 MiniMax)对业务层错误(无效 key/额度不足)返回 HTTP 200 + JSON
-        // 错误体({"base_resp":{"status_code":1004,...}},无 choices)。若照常
-        // 解析,content 会 unwrap 成空串 → runner 侧 Stable 判 success("") →
-        // workflow 节点假绿。此处显式转错误。
-        if let Some(base_resp) = json.get("base_resp") {
-            let status_code = base_resp.get("status_code").and_then(|v| v.as_i64());
-            let is_error = match status_code {
-                Some(code) => code != 0,
-                // 有 base_resp 但无 status_code:形态异常,按错误处理(附摘要)
-                None => true,
-            };
-            if is_error {
-                let status_msg = base_resp
-                    .get("status_msg")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(no status_msg)");
-                return Err(format!(
-                    "LLM API business error (status_code={:?}): {}",
-                    status_code, status_msg
-                ));
-            }
-        }
-        let has_choices = json
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .map(|a| !a.is_empty())
-            .unwrap_or(false);
-        if !has_choices {
-            let snippet: String = json.to_string().chars().take(300).collect();
-            return Err(format!("LLM API response missing choices: {}", snippet));
-        }
-
-        let choice = json
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|c| c.first());
-
-        let content = choice
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        // OpenAI wire 形状 → 内部 ToolCall 形状({tool_name, args})
-        // 与流式路径(build_tool_calls / ToolCallAccumulator::to_tool_call)保持一致,
-        // 否则 handle_call_external 反序列化 LlmResponse 时必然失败
-        // (OpenAI 形状无 tool_name 字段)。arguments 是 JSON 字符串,解析为对象;
-        // 解析失败 fallback 到 {} 与流式路径行为一致。
-        let tool_calls = choice
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("tool_calls"))
-            .and_then(|tc| tc.as_array())
-            .map(|arr| {
-                let normalized: Vec<serde_json::Value> = arr
-                    .iter()
-                    .filter_map(|tc| {
-                        let name = tc
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str())
-                            // 兼容已归一形状(直接携带 tool_name)
-                            .or_else(|| tc.get("tool_name").and_then(|n| n.as_str()))
-                            .map(|s| s.to_string())?;
-                        let args = match tc.get("function").and_then(|f| f.get("arguments")) {
-                            Some(serde_json::Value::String(s)) => {
-                                serde_json::from_str::<serde_json::Value>(s)
-                                    .unwrap_or(serde_json::json!({}))
-                            }
-                            // 兼容部分厂商直接返回对象
-                            Some(v @ serde_json::Value::Object(_)) => v.clone(),
-                            _ => serde_json::json!({}),
-                        };
-                        Some(serde_json::json!({"tool_name": name, "args": args}))
-                    })
-                    .collect();
-                serde_json::Value::Array(normalized)
-            });
-
-        let finish_reason = choice
-            .and_then(|c| c.get("finish_reason"))
-            .and_then(|r| r.as_str())
-            .map(|s| s.to_string());
-
-        let token_usage = json.get("usage").cloned();
-
-        let response_json = serde_json::json!({
-            "content": content,
-            "tool_calls": tool_calls,
-            "finish_reason": finish_reason,
-            "token_usage": token_usage,
-        });
-
-        debug!(
-            content_len = content.len(),
-            finish_reason = ?finish_reason,
-            tool_calls = ?tool_calls,
-            "LLM API response parsed"
-        );
-        Ok(response_json.clone())
+        normalize_executor_response(json)
     }
 
-    /// G1:流式调用 LLM API(OpenAI 兼容 SSE)
+    /// G1:流式调用 LLM API(经执行体中继)
     ///
-    /// 返回一个 `Stream`,依次产出:
+    /// SG-1 件1:流式 SSE 解析与聚合已上移至执行体(`POST /llm/execute`
+    /// 收到 `stream:true` 后对 provider SSE 做服务端聚合),agent 收到的
+    /// 是聚合完成的四键 JSON 整包。本方法把整包合成为流式事件序列:
+    ///
     /// ```text
-    /// Delta(text) * N  →  (ToolCallDelta * N)?  →  Done(LlmResponse)
+    /// (content 非空时) Delta(content)  →  Done(LlmResponse)
     /// ```
     ///
-    /// 即使 LLM 中途返回 tool_calls,本方法也会在 `Done` 里返回
-    /// 完整聚合的 `LlmResponse`,与 `execute()` 输出格式一致。
+    /// `Done` 携带完整聚合的 `LlmResponse`,与 `execute()` 输出格式一致。
     ///
     /// ## 不重试
     ///
-    /// SSE 流中断后不重试(会重复输出)。调用方收到 `Err` 后,
-    /// 可 fallback 到非流式 `execute()`(带 G3 重试)。
+    /// 流式请求失败不重试。调用方收到 `Err` 后,可 fallback 到非流式
+    /// `execute()`(带 G3 重试)。
     ///
     /// ## Mock
     ///
@@ -540,8 +380,7 @@ impl LlmHandler {
         params: &Value,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, String>> + Send>> {
         let body_result = self.build_request_body(params);
-        let api_base = self.api_base.clone();
-        let api_key = self.api_key.clone();
+        let executor_url = self.executor_url.clone();
         let mock_content = self.mock_content.clone();
         // 超时值提升为局部量（stream! 块内不持有 &self）
         let connect_secs = self.connect_timeout_secs;
@@ -560,7 +399,7 @@ impl LlmHandler {
                 return;
             }
 
-            // === 构造请求体(加 stream: true) ===
+            // === 构造请求体(加 stream: true——执行体按此走 SSE 聚合) ===
             let mut body = match body_result {
                 Ok(b) => b,
                 Err(e) => {
@@ -572,19 +411,15 @@ impl LlmHandler {
                 obj.insert("stream".to_string(), serde_json::Value::Bool(true));
             }
 
-            // === HTTP 请求 ===
+            // === HTTP 请求(执行体端点,无 Authorization——key 归边) ===
             // streaming path same dual timeout
             let client = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(connect_secs))
                 .timeout(std::time::Duration::from_secs(request_secs))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new());
-            let mut request = client.post(&api_base).json(&body);
-            if let Some(key) = &api_key {
-                request = request.header("Authorization", format!("Bearer {}", key));
-            }
 
-            let resp = match request.send().await {
+            let resp = match client.post(&executor_url).json(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     yield Err(format!("LLM stream request failed: {}", e));
@@ -599,215 +434,98 @@ impl LlmHandler {
                 return;
             }
 
-            // 200 但 content-type 是 JSON 而非 SSE:OpenAI 兼容端点(如 MiniMax)
-            // 对业务层错误(无效 key/额度不足)返回 HTTP 200 + JSON 错误体
-            // ({"base_resp":{"status_code":1004,...}})。若照常按 SSE 解析,
-            // 收不到任何 data 帧,会静默变成"空响应成功"——此处显式转错误。
-            if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
-                let ct_str = ct.to_str().unwrap_or("");
-                if ct_str.contains("application/json") {
-                    let text = resp.text().await.unwrap_or_default();
-                    yield Err(format!(
-                        "LLM API returned JSON instead of SSE stream: {}",
-                        text
-                    ));
+            // === 整包解析(执行体聚合结果,四键 JSON) ===
+            let json: serde_json::Value = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    yield Err(format!("LLM API response parse error: {}", e));
                     return;
                 }
-            }
-
-            // === SSE 解析 ===
-            let mut byte_stream = resp.bytes_stream();
-            let mut buf = String::new();
-            let mut byte_buf: Vec<u8> = Vec::new(); // 跨 chunk 的未完成 UTF-8 字节
-            let mut content_acc = String::new();
-            let mut tool_calls_acc: BTreeMap<usize, ToolCallAccumulator> = BTreeMap::new();
-            let mut finish_reason: Option<String> = None;
-            let mut token_usage: Option<TokenUsage> = None;
-            let mut saw_data_frame = false;
-
-            while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = match chunk_result {
-                    Ok(c) => c,
-                    Err(e) => {
-                        yield Err(format!("LLM stream interrupted: {}", e));
-                        return;
-                    }
-                };
-
-                // 追加到字节缓冲区,然后安全解码(处理跨 chunk 的多字节 UTF-8 字符)
-                byte_buf.extend_from_slice(&chunk);
-                match std::str::from_utf8(&byte_buf) {
-                    Ok(s) => {
-                        buf.push_str(s);
-                        byte_buf.clear();
-                    }
-                    Err(e) => {
-                        let safe_len = e.valid_up_to();
-                        if safe_len > 0 {
-                            let safe_part = std::str::from_utf8(&byte_buf[..safe_len]).unwrap();
-                            buf.push_str(safe_part);
-                            byte_buf = byte_buf[safe_len..].to_vec();
-                        }
-                        // safe_len == 0 表示字节不足一个完整字符,等待下一个 chunk
-                    }
+            };
+            let normalized = match normalize_executor_response(json) {
+                Ok(v) => v,
+                Err(e) => {
+                    yield Err(e);
+                    return;
                 }
+            };
 
-                // 提取完整帧(以 \n\n 分隔)
-                while let Some(pos) = buf.find("\n\n") {
-                    let frame: String = buf.drain(..pos + 2).collect();
-                    let frame_str = frame.trim_end_matches('\n').trim_end_matches('\r');
-
-                    // 提取 data: 行
-                    let data: String = frame_str
-                        .lines()
-                        .filter_map(|line| line.strip_prefix("data:").map(|s| s.trim_start()))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    if data.is_empty() {
-                        continue;
-                    }
-                    saw_data_frame = true;
-
-                    // 检查 [DONE]
-                    if data.trim() == "[DONE]" {
-                        let tool_calls = build_tool_calls(&tool_calls_acc);
-                        yield Ok(StreamChunk::Done(LlmResponse {
-                            content: content_acc.clone(),
-                            tool_calls,
-                            finish_reason: finish_reason.take().or_else(|| Some("stop".to_string())),
-                            token_usage: token_usage.take(),
-                        }));
-                        return;
-                    }
-
-                    // 解析 JSON
-                    let json: serde_json::Value = match serde_json::from_str(&data) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            yield Ok(StreamChunk::Warn(format!(
-                                "failed to parse SSE frame: {}",
-                                e
-                            )));
-                            continue;
-                        }
-                    };
-
-                    // 提取 choices[0]
-                    let choice = json
-                        .get("choices")
-                        .and_then(|c| c.as_array())
-                        .and_then(|c| c.first());
-
-                    if let Some(choice) = choice {
-                        let delta = choice.get("delta");
-
-                        // Content delta
-                        if let Some(content) = delta
-                            .and_then(|d| d.get("content"))
-                            .and_then(|c| c.as_str())
-                        {
-                            if !content.is_empty() {
-                                content_acc.push_str(content);
-                                yield Ok(StreamChunk::Delta(content.to_string()));
-                            }
-                        }
-
-                        // Tool call deltas
-                        if let Some(tcs) = delta
-                            .and_then(|d| d.get("tool_calls"))
-                            .and_then(|c| c.as_array())
-                        {
-                            for tc in tcs {
-                                let index = tc
-                                    .get("index")
-                                    .and_then(|i| i.as_u64())
-                                    .unwrap_or(0) as usize;
-                                let entry = tool_calls_acc.entry(index).or_default();
-
-                                if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
-                                    entry.id = Some(id.to_string());
-                                }
-                                if let Some(func) = tc.get("function") {
-                                    if let Some(name) =
-                                        func.get("name").and_then(|n| n.as_str())
-                                    {
-                                        entry.name = Some(name.to_string());
-                                    }
-                                    if let Some(args) =
-                                        func.get("arguments").and_then(|a| a.as_str())
-                                    {
-                                        entry.arguments.push_str(args);
-                                        yield Ok(StreamChunk::ToolCallDelta {
-                                            index,
-                                            fragment: args.to_string(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-
-                        // Finish reason
-                        if let Some(fr) = choice
-                            .get("finish_reason")
-                            .and_then(|f| f.as_str())
-                        {
-                            finish_reason = Some(fr.to_string());
-                        }
-                    }
-
-                    // Usage(部分 provider 在最后一帧带 usage)
-                    if let Some(usage) = json.get("usage") {
-                        // 尝试解析为 TokenUsage(字段不匹配时保留 None)
-                        if let Ok(tu) = serde_json::from_value::<TokenUsage>(usage.clone()) {
-                            token_usage = Some(tu);
-                        }
-                    }
-                }
+            // === 整包合成:单 Delta(content 非空时)+ Done ===
+            let content = normalized
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !content.is_empty() {
+                yield Ok(StreamChunk::Delta(content.clone()));
             }
-
-            // 流自然结束(未收到 [DONE],部分 provider 不发)
-            let tool_calls = build_tool_calls(&tool_calls_acc);
-
-            // 零帧兜底:HTTP 200 且 content-type 非 JSON,但整个 body 没有任何
-            // SSE data 帧——错误体被网关以 text/* 包装时会走到这里。剩余缓冲
-            // 非空则按原始 body 显式报错,为空则报空流。禁止静默变"空响应成功"
-            // (fail-fast:执行异常必须显式浮出,不得写入假"成功"审计事实)。
-            if !saw_data_frame {
-                let leftover = buf.trim();
-                if leftover.is_empty() {
-                    yield Err("LLM stream contained no SSE frames (empty body)".to_string());
-                } else {
-                    let preview: String = leftover.chars().take(500).collect();
-                    yield Err(format!(
-                        "LLM stream contained no SSE frames; raw body: {}",
-                        preview
-                    ));
-                }
-                return;
-            }
-
-            yield Ok(StreamChunk::Done(LlmResponse {
-                content: content_acc.clone(),
-                tool_calls,
-                finish_reason: finish_reason.take().or_else(|| Some("stop".to_string())),
-                token_usage: token_usage.take(),
-            }));
+            let llm_response: LlmResponse = serde_json::from_value(normalized)
+                .unwrap_or_else(|_| LlmResponse {
+                    content,
+                    tool_calls: None,
+                    finish_reason: Some("stop".to_string()),
+                    token_usage: None,
+                });
+            yield Ok(StreamChunk::Done(llm_response));
         })
     }
 }
 
-/// G1:把 tool_call 聚合器转为 `LlmResponse` 期望的 `Vec<ToolCall>`
-fn build_tool_calls(acc: &BTreeMap<usize, ToolCallAccumulator>) -> Option<Vec<ToolCall>> {
-    if acc.is_empty() {
-        return None;
-    }
-    let result: Vec<ToolCall> = acc.values().filter_map(|tc| tc.to_tool_call()).collect();
-    if result.is_empty() {
-        None
-    } else {
-        Some(result)
-    }
+/// SG-1 件1:执行体四键响应的宽松透传归一(自由函数,`execute` 与
+/// `execute_stream` 共用)。
+///
+/// - `content`:缺键/非字符串 → ""
+/// - `tool_calls`:缺键/null → None;数组项缺 `tool_name` 跳过;
+///   `args` 缺失 fallback `{}`
+/// - `finish_reason`:缺键/null → None;字符串原样保留
+/// - `token_usage`:try-parse 为 `TokenUsage`,形状不符 → None
+///   (与旧流式路径 usage 解析语义逐值同构,防止 provider usage
+///   缺字段导致整个 LlmResponse 反序列化失败)
+fn normalize_executor_response(json: Value) -> Result<Value, String> {
+    let content = json
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let tool_calls = json
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            let normalized: Vec<serde_json::Value> = arr
+                .iter()
+                .filter_map(|tc| {
+                    let name = tc.get("tool_name").and_then(|n| n.as_str())?;
+                    let args = tc.get("args").cloned().unwrap_or(serde_json::json!({}));
+                    Some(serde_json::json!({"tool_name": name, "args": args}))
+                })
+                .collect();
+            serde_json::Value::Array(normalized)
+        })
+        .filter(|arr| !arr.as_array().unwrap().is_empty());
+
+    let finish_reason = json
+        .get("finish_reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let token_usage = json
+        .get("token_usage")
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<TokenUsage>(v.clone()).ok());
+
+    debug!(
+        content_len = content.len(),
+        finish_reason = ?finish_reason,
+        tool_calls = ?tool_calls,
+        "LLM executor response normalized"
+    );
+    Ok(serde_json::json!({
+        "content": content,
+        "tool_calls": tool_calls,
+        "finish_reason": finish_reason,
+        "token_usage": token_usage,
+    }))
 }
 
 /// 把内部消息历史转换为 OpenAI wire 形状（出站边界转换）:
@@ -1029,12 +747,13 @@ fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
 mod tests {
     use super::*;
     use crate::io_handler::IoHandler;
+    use futures_util::StreamExt;
 
     /// 最坏预算公式锁定
     #[test]
     fn test_worst_case_budget_formula_e7() {
         // 默认口径: 300s×4 attempts + backoff(1+2+4=7,cap 30 不触) + 10 = 1217
-        let h = LlmHandler::new("m", "https://x", None);
+        let h = LlmHandler::new("m", "https://x");
         assert_eq!(h.worst_case_budget_secs(), 300 * 4 + 7 + 10);
         // cap 生效口径: base=20 → 20+30+30=80
         let h = h.with_retry_config(3, 20.0, 30.0);
@@ -1047,7 +766,7 @@ mod tests {
     /// 失配判定（600=失配口径必红,1300=修复口径必绿）
     #[test]
     fn test_step_budget_mismatch_e7() {
-        let h = LlmHandler::new("m", "https://x", None); // budget=1225
+        let h = LlmHandler::new("m", "https://x"); // budget=1225
         assert!(h.step_budget_mismatch(600).is_err());
         assert!(h
             .step_budget_mismatch(600)
@@ -1132,10 +851,9 @@ mod tests {
 
     #[test]
     fn test_llm_handler_new() {
-        let handler = LlmHandler::new("gpt-4", "https://api.example.com", Some("key".to_string()));
+        let handler = LlmHandler::new("gpt-4", "https://api.example.com");
         assert_eq!(handler.default_model, "gpt-4");
-        assert_eq!(handler.api_base, "https://api.example.com");
-        assert!(handler.api_key.is_some());
+        assert_eq!(handler.executor_url, "https://api.example.com");
         // G3:默认重试参数
         assert_eq!(handler.max_retries, DEFAULT_MAX_RETRIES);
         assert_eq!(handler.base_backoff_secs, DEFAULT_BASE_BACKOFF_SECS);
@@ -1145,10 +863,8 @@ mod tests {
     fn test_llm_handler_with_defaults() {
         let handler = LlmHandler::with_defaults();
         assert_eq!(handler.default_model, "MiniMax-M2.5");
-        assert_eq!(
-            handler.api_base,
-            "https://api.minimaxi.com/v1/text/chatcompletion_v2"
-        );
+        // SG-1 件1:出站统一指向执行体端点(key 归边,无 provider 直连)
+        assert_eq!(handler.executor_url, "http://127.0.0.1:9130/llm/execute");
         assert!(!handler.is_mock());
     }
 
@@ -1158,18 +874,18 @@ mod tests {
         use crate::config::LlmConfig;
         let cfg = LlmConfig {
             max_retries: 5,
-            api_key: "test-key".to_string(),
+            executor_url: "http://127.0.0.1:19999/llm/execute".to_string(),
             ..LlmConfig::default()
         };
         let handler = LlmHandler::from_config(&cfg);
         assert_eq!(handler.max_retries, 5);
-        assert_eq!(handler.api_key, Some("test-key".to_string()));
+        assert_eq!(handler.executor_url, "http://127.0.0.1:19999/llm/execute");
         assert_eq!(handler.default_model, cfg.model);
     }
 
     #[test]
     fn test_llm_handler_with_retry_config_builder() {
-        let handler = LlmHandler::new("m", "https://x", None).with_retry_config(10, 0.5, 5.0);
+        let handler = LlmHandler::new("m", "https://x").with_retry_config(10, 0.5, 5.0);
         assert_eq!(handler.max_retries, 10);
         assert_eq!(handler.base_backoff_secs, 0.5);
         assert_eq!(handler.max_backoff_secs, 5.0);
@@ -1199,10 +915,10 @@ mod tests {
     }
 
     #[test]
-    fn test_llm_handler_mock_does_not_require_api_key() {
+    fn test_llm_handler_mock_skips_http() {
         let handler = LlmHandler::mock("anything");
-        assert!(handler.api_key.is_none());
-        assert_eq!(handler.api_base, "mock://");
+        assert_eq!(handler.executor_url, "mock://");
+        assert!(handler.is_mock());
     }
 
     // ========== G3 重试机制单元测试 ==========
@@ -1283,14 +999,14 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{}}"#,
+                // 执行体四键归一形状(SG-1 件1)
+                r#"{"content":"ok","tool_calls":null,"finish_reason":"stop","token_usage":null}"#,
             )
             .create_async()
             .await;
 
         // 极小退避,避免测试拖慢
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
-            .with_retry_config(5, 0.001, 0.01);
+        let handler = LlmHandler::new("m", &server.url()).with_retry_config(5, 0.001, 0.01);
 
         let params = Value::Object(Default::default());
         let result = handler
@@ -1302,14 +1018,12 @@ mod tests {
         assert_eq!(parsed["content"], "ok");
     }
 
-    /// tool_calls 归一化:OpenAI wire 形状 → 内部 {tool_name, args}
-    ///
-    /// 回归保护:execute() 输出必须可被 handle_call_external 反序列化为
-    /// LlmResponse { tool_calls: Vec<ToolCall{tool_name,args}> }。
-    /// 修复前此处透传 OpenAI 原始形状(无 tool_name 字段),真实 LLM
-    /// 返回 tool_calls 时 run() 必然报 "parse LLM response" 错误。
+    /// 四键透传:执行体已归一的 {tool_name,args} 形状经 normalize 保真,
+    /// 且 execute() 输出可被 handle_call_external 反序列化为 LlmResponse。
+    /// (SG-1 件1:OpenAI wire→内部形状的归一已上移执行体,agent 只做
+    /// 宽松透传与 token_usage try-parse)
     #[tokio::test]
-    async fn test_execute_normalizes_openai_tool_calls() {
+    async fn test_execute_passes_through_normalized_tool_calls() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("POST", "/")
@@ -1317,24 +1031,18 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(
                 r#"{
-                    "choices":[{
-                        "message":{
-                            "content":"",
-                            "tool_calls":[{
-                                "id":"call_1","type":"function",
-                                "function":{"name":"file_read","arguments":"{\"path\":\"/tmp/a.txt\"}"}
-                            }]
-                        },
-                        "finish_reason":"tool_calls"
-                    }],
-                    "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+                    "content":"",
+                    "tool_calls":[
+                        {"tool_name":"file_read","args":{"path":"/tmp/a.txt"}}
+                    ],
+                    "finish_reason":"tool_calls",
+                    "token_usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
                 }"#,
             )
             .create_async()
             .await;
 
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
-            .with_retry_config(0, 0.001, 0.01);
+        let handler = LlmHandler::new("m", &server.url()).with_retry_config(0, 0.001, 0.01);
         let params = Value::Object(Default::default());
         let result = handler
             .execute(&params)
@@ -1380,8 +1088,7 @@ mod tests {
             .create_async()
             .await;
 
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
-            .with_retry_config(5, 0.001, 0.01);
+        let handler = LlmHandler::new("m", &server.url()).with_retry_config(5, 0.001, 0.01);
 
         let params = Value::Object(Default::default());
         let result = handler.execute(&params).await;
@@ -1408,8 +1115,7 @@ mod tests {
             .create_async()
             .await;
 
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
-            .with_retry_config(2, 0.001, 0.01);
+        let handler = LlmHandler::new("m", &server.url()).with_retry_config(2, 0.001, 0.01);
 
         let params = Value::Object(Default::default());
         let result = handler.execute(&params).await;
@@ -1431,8 +1137,7 @@ mod tests {
             .create_async()
             .await;
 
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
-            .with_retry_config(0, 0.001, 0.01);
+        let handler = LlmHandler::new("m", &server.url()).with_retry_config(0, 0.001, 0.01);
 
         let params = Value::Object(Default::default());
         let result = handler.execute(&params).await;
@@ -1456,13 +1161,12 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{}}"#,
+                r#"{"content":"ok","tool_calls":null,"finish_reason":"stop","token_usage":null}"#,
             )
             .create_async()
             .await;
 
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()))
-            .with_retry_config(3, 100.0, 200.0); // 故意设大,验证 Retry-After 优先
+        let handler = LlmHandler::new("m", &server.url()).with_retry_config(3, 100.0, 200.0); // 故意设大,验证 Retry-After 优先
 
         let params = Value::Object(Default::default());
         // 如果不读 Retry-After,会 sleep 100s 导致测试超时
@@ -1506,28 +1210,23 @@ mod tests {
         }
     }
 
-    /// G1:mockito SSE 服务器,验证多帧 delta 正确解析
+    /// G1(SG-1 件1):执行体聚合整包 JSON → 单 Delta + Done
     #[tokio::test]
-    async fn test_stream_sse_multiple_delta_chunks() {
+    async fn test_stream_executor_json_single_delta_and_done() {
         let mut server = mockito::Server::new_async().await;
-        // OpenAI 兼容 SSE 格式
-        let sse_body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}\n\n",
-            "data: [DONE]\n\n",
-        );
+        // 执行体对 stream:true 请求做 SSE 聚合后返回四键 JSON 整包
         let _mock = server
             .mock("POST", "/")
             .with_status(200)
-            .with_header("content-type", "text/event-stream")
-            .with_body(sse_body)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"content":"Hello world!","tool_calls":null,"finish_reason":"stop",
+                    "token_usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}"#,
+            )
             .create_async()
             .await;
 
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
+        let handler = LlmHandler::new("m", &server.url());
         let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 
@@ -1540,15 +1239,17 @@ mod tests {
                     done_response = Some(resp);
                 }
                 Ok(StreamChunk::Warn(msg)) => panic!("unexpected Warn: {}", msg),
-                Ok(StreamChunk::ToolCallDelta { .. }) => {}
+                // 整包路径不再产出 tool_call 增量(聚合已上移执行体)
+                Ok(StreamChunk::ToolCallDelta { .. }) => {
+                    panic!("ToolCallDelta must not be produced by whole-payload path")
+                }
                 Err(e) => panic!("stream error: {}", e),
             }
         }
 
-        // 验证 delta 顺序
-        assert_eq!(deltas, vec!["Hello", " world", "!"]);
+        // 整包合成:content 非空 → 恰好一个 Delta(全量,非增量)
+        assert_eq!(deltas, vec!["Hello world!"]);
 
-        // 验证 Done 的聚合内容
         let resp = done_response.expect("should have Done");
         assert_eq!(resp.content, "Hello world!");
         assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
@@ -1556,37 +1257,30 @@ mod tests {
         assert_eq!(usage.total_tokens, 13);
     }
 
-    /// G1:tool_calls 跨帧聚合
+    /// G1(SG-1 件1):执行体整包携带归一 tool_calls → Done 承载全量
     #[tokio::test]
-    async fn test_stream_sse_tool_calls_aggregation() {
+    async fn test_stream_executor_json_with_tool_calls() {
         let mut server = mockito::Server::new_async().await;
-        // OpenAI tool_calls 分片格式
-        let sse_body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\":\"}}]},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"rust\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
-            "data: [DONE]\n\n",
-        );
         let _mock = server
             .mock("POST", "/")
             .with_status(200)
-            .with_header("content-type", "text/event-stream")
-            .with_body(sse_body)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"content":"","tool_calls":[{"tool_name":"search","args":{"q":"rust"}}],
+                    "finish_reason":"tool_calls","token_usage":null}"#,
+            )
             .create_async()
             .await;
 
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
+        let handler = LlmHandler::new("m", &server.url());
         let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 
-        let mut tool_call_fragments: Vec<String> = Vec::new();
+        let mut delta_count = 0;
         let mut done_response: Option<LlmResponse> = None;
         while let Some(item) = stream.next().await {
             match item {
-                Ok(StreamChunk::ToolCallDelta { fragment, .. }) => {
-                    tool_call_fragments.push(fragment);
-                }
+                Ok(StreamChunk::Delta(_)) => delta_count += 1,
                 Ok(StreamChunk::Done(resp)) => {
                     done_response = Some(resp);
                 }
@@ -1595,20 +1289,14 @@ mod tests {
             }
         }
 
-        // 验证 tool_call 分片
-        assert_eq!(
-            tool_call_fragments,
-            vec!["", "{\"q\":", "\"rust\"}"],
-            "fragments should be in order"
-        );
+        // content 为空 → 不产出 Delta,仅 Done
+        assert_eq!(delta_count, 0, "empty content must not yield Delta");
 
-        // 验证 Done 中聚合的 tool_calls
         let resp = done_response.expect("should have Done");
         let tool_calls = resp.tool_calls.expect("should have tool_calls");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].name, "search");
-        // arguments 应该是 {"q":"rust"}
-        assert_eq!(resp.content, ""); // content 为 null → 空字符串
+        assert_eq!(tool_calls[0].arguments["q"], "rust");
         assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
     }
 
@@ -1623,7 +1311,7 @@ mod tests {
             .create_async()
             .await;
 
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
+        let handler = LlmHandler::new("m", &server.url());
         let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 
@@ -1639,124 +1327,24 @@ mod tests {
         assert!(second.is_none(), "stream should end after error");
     }
 
-    /// 回归(demo 资产实测抓出):MiniMax 等端点对无效 key 返回 HTTP 200 +
-    /// JSON 错误体({"base_resp":{...}}),content-type=application/json。
-    /// 修复前:按 SSE 解析收不到任何 data 帧,静默变成"空响应成功"。
-    /// 修复后:必须显式 yield Err。
-    #[tokio::test]
-    async fn test_stream_json_error_body_yields_err() {
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"base_resp":{"status_code":1004,"status_msg":"login fail"}}"#)
-            .create_async()
-            .await;
-
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
-        let params = Value::Object(Default::default());
-        let mut stream = handler.execute_stream(&params);
-
-        let first = stream.next().await;
-        match first {
-            Some(Err(e)) => {
-                assert!(
-                    e.contains("JSON instead of SSE") && e.contains("login fail"),
-                    "error should surface the JSON error body: {}",
-                    e
-                );
-            }
-            other => panic!("expected Err, got {:?}", other),
-        }
-        let second = stream.next().await;
-        assert!(second.is_none(), "stream should end after error");
-    }
-
-    /// 零帧兜底:200 + 非 JSON content-type,但 body 没有任何 SSE data 帧
-    /// (网关以 text/* 包装错误体)。修复前静默"空响应成功",修复后显式报错。
-    #[tokio::test]
-    async fn test_stream_zero_sse_frames_yields_err() {
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_header("content-type", "text/plain")
-            .with_body("gateway error: upstream unavailable")
-            .create_async()
-            .await;
-
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
-        let params = Value::Object(Default::default());
-        let mut stream = handler.execute_stream(&params);
-
-        let first = stream.next().await;
-        match first {
-            Some(Err(e)) => {
-                assert!(
-                    e.contains("no SSE frames") && e.contains("gateway error"),
-                    "error should surface the raw body: {}",
-                    e
-                );
-            }
-            other => panic!("expected Err, got {:?}", other),
-        }
-        let second = stream.next().await;
-        assert!(second.is_none(), "stream should end after error");
-    }
-
-    /// G1:流自然结束(无 [DONE] 终止符,部分 provider 不发)
-    #[tokio::test]
-    async fn test_stream_natural_end_without_done_marker() {
-        let mut server = mockito::Server::new_async().await;
-        // 没有 data: [DONE] 帧,流自然结束
-        let sse_body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\" there\"},\"finish_reason\":\"stop\"}]}\n\n",
-        );
-        let _mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_header("content-type", "text/event-stream")
-            .with_body(sse_body)
-            .create_async()
-            .await;
-
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
-        let params = Value::Object(Default::default());
-        let mut stream = handler.execute_stream(&params);
-
-        let mut deltas = Vec::new();
-        let mut done_count = 0;
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(StreamChunk::Delta(text)) => deltas.push(text),
-                Ok(StreamChunk::Done(_)) => done_count += 1,
-                Ok(other) => panic!("unexpected: {:?}", other),
-                Err(e) => panic!("stream error: {}", e),
-            }
-        }
-
-        assert_eq!(deltas, vec!["hi", " there"]);
-        assert_eq!(done_count, 1, "should yield exactly one Done");
-    }
-
-    /// G1:请求体包含 stream: true
+    /// G1:请求体包含 stream: true(执行体按此走 SSE 聚合)
     #[tokio::test]
     async fn test_stream_request_body_includes_stream_true() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
             .with_status(200)
-            .with_header("content-type", "text/event-stream")
-            .with_body("data: [DONE]\n\n")
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"content":"","tool_calls":null,"finish_reason":"stop","token_usage":null}"#,
+            )
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
                 "stream": true
             })))
             .create_async()
             .await;
 
-        let handler = LlmHandler::new("m", &server.url(), Some("k".to_string()));
+        let handler = LlmHandler::new("m", &server.url());
         let params = Value::Object(Default::default());
         let mut stream = handler.execute_stream(&params);
 

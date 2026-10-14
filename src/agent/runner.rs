@@ -3403,6 +3403,11 @@ impl AgentRunner {
                 { "role": "system", "content": system_prompt },
                 { "role": "user", "content": goal },
             ],
+            // SG-1 件1:LLM 事实通道协调位——call_external 的 LLM 执行经
+            // server 侧 ai-plugin 扩展型执行体(/llm/execute)中继(key 归边)。
+            // 仅落链留痕与审计路由用,不影响 core_eval 判定(journal LlmCalled
+            // 不含命令 params)。
+            "executor": "server",
         });
         if let Some(tools) = tools {
             params["tools"] = Value::Array(tools);
@@ -4623,10 +4628,9 @@ impl AgentRunner {
     }
 
     async fn execute_llm_request(&self, params: &Value) -> Result<Value, AgentError> {
-        // Actually invoke LlmHandler (uses reqwest to call real HTTP API)
-        // - Read MINIMAX_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY env vars
-        // - Supports messages / tools / temperature / max_tokens
-        // - Returns full OpenAI-compatible JSON response
+        // Actually invoke LlmHandler (SG-1 件1:经 ai-plugin 扩展型执行体
+        // 中继,key 归边;支持 messages / tools / temperature / max_tokens,
+        // 返回执行体归一的四键 JSON 响应)
         self.llm_handler
             .execute(params)
             .await

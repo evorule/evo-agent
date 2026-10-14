@@ -528,10 +528,10 @@ async fn test_multi_turn_react_loop_with_tool_call() {
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(
-            r#"{"choices":[{"message":{"content":"","tool_calls":[
-                {"id":"c1","type":"function",
-                 "function":{"name":"lookup","arguments":"{\"q\":\"evorule\"}"}}]},
-                "finish_reason":"tool_calls"}]}"#,
+            // 执行体四键归一形状(mock 扮演执行体,SG-1 件1)
+            r#"{"content":"","tool_calls":[
+                {"tool_name":"lookup","args":{"q":"evorule"}}],
+                "finish_reason":"tool_calls","token_usage":null}"#,
         )
         .create_async()
         .await;
@@ -541,7 +541,7 @@ async fn test_multi_turn_react_loop_with_tool_call() {
         .match_body(mockito::Matcher::Regex("TOOL_RESULT_MARKER".to_string()))
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"choices":[{"message":{"content":"final answer"},"finish_reason":"stop"}]}"#)
+        .with_body(r#"{"content":"final answer","tool_calls":null,"finish_reason":"stop","token_usage":null}"#)
         .create_async()
         .await;
 
@@ -570,8 +570,7 @@ async fn test_multi_turn_react_loop_with_tool_call() {
 
     // ── runner:真实 LlmHandler(HTTP) + 自定义工具 ──
     let client = EvoruleApiClient::new(&server.url());
-    let llm = LlmHandler::new("mock-model", &llm_server.url(), Some("k".to_string()))
-        .with_retry_config(0, 0.001, 0.01);
+    let llm = LlmHandler::new("mock-model", &llm_server.url()).with_retry_config(0, 0.001, 0.01);
     let calls = Arc::new(AtomicUsize::new(0));
     let mut tools: BTreeMap<String, Arc<dyn ToolFunction>> = BTreeMap::new();
     tools.insert(
@@ -636,8 +635,7 @@ async fn test_io_request_failure_submits_error_io_response() {
 
     let client = EvoruleApiClient::new(&server.url());
     // LLM 指向保留端口且零重试 → call_external 立即失败（LlmError）
-    let llm =
-        LlmHandler::new("mock-model", "http://127.0.0.1:1", None).with_retry_config(0, 0.001, 0.01);
+    let llm = LlmHandler::new("mock-model", "http://127.0.0.1:1").with_retry_config(0, 0.001, 0.01);
     let mut runner = AgentRunner::new(AgentConfig::default(), client).with_llm_handler(llm);
 
     let result = runner.run("trigger llm failure").await;
@@ -682,8 +680,7 @@ async fn test_llm_http_401_propagates_as_run_error() {
         .await;
 
     let client = EvoruleApiClient::new(&server.url());
-    let llm = LlmHandler::new("mock-model", &llm_server.url(), Some("k".to_string()))
-        .with_retry_config(0, 0.001, 0.01);
+    let llm = LlmHandler::new("mock-model", &llm_server.url()).with_retry_config(0, 0.001, 0.01);
     let mut runner = AgentRunner::new(AgentConfig::default(), client).with_llm_handler(llm);
 
     let result = runner.run("trigger http 401").await;
@@ -691,20 +688,20 @@ async fn test_llm_http_401_propagates_as_run_error() {
     io_resp_err.assert_async().await;
 }
 
-/// 突变验证（业务层，修复主验）：OpenAI 兼容端点（MiniMax）对业务层
-/// 错误（无效 key/额度不足）返回 HTTP 200 + `{"base_resp":{"status_code":1004}}`
-/// 错误体（无 choices）。修复前 parse_success_response 对该形态 unwrap 出
-/// 空 content → io_response 正常提交 → Stable 判 success("") → workflow 节点
-/// 假绿（M5-b 首跑三联指纹：tokens=0+亚秒+content_len=0）。修复后显式转
-/// Err → run() Err + error io_response 回写。
+/// 突变验证（执行体错误面）：执行体对 provider 业务层错误（HTTP 200 +
+/// `{"base_resp":{"status_code":1004}}`，无效 key/额度不足）显式转 502
+/// (SG-1 件1:该转错已上移执行体)。修复前 agent 直连时 200 错误体
+/// unwrap 出空 content → Stable 判 success("") → workflow 节点假绿
+/// （M5-b 首跑三联指纹：tokens=0+亚秒+content_len=0）。中继后 agent
+/// 收到 502 → 显式 Err → run() Err + error io_response 回写。
 #[tokio::test]
 async fn test_llm_business_error_body_propagates_as_run_error() {
     let mut llm_server = Server::new_async().await;
     llm_server
         .mock("POST", "/")
-        .with_status(200)
+        .with_status(502)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"base_resp":{"status_code":1004,"status_msg":"invalid api key"}}"#)
+        .with_body(r#"{"error":"LLM provider business error (status_code=1004): invalid api key"}"#)
         .create_async()
         .await;
 
@@ -729,8 +726,7 @@ async fn test_llm_business_error_body_propagates_as_run_error() {
         .await;
 
     let client = EvoruleApiClient::new(&server.url());
-    let llm = LlmHandler::new("mock-model", &llm_server.url(), Some("k".to_string()))
-        .with_retry_config(0, 0.001, 0.01);
+    let llm = LlmHandler::new("mock-model", &llm_server.url()).with_retry_config(0, 0.001, 0.01);
     let mut runner = AgentRunner::new(AgentConfig::default(), client).with_llm_handler(llm);
 
     let result = runner.run("trigger business error body").await;
@@ -752,10 +748,9 @@ async fn test_approval_denied_by_default_in_loop() {
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(
-            r#"{"choices":[{"message":{"content":"","tool_calls":[
-                {"id":"c1","type":"function",
-                 "function":{"name":"risky_delete","arguments":"{\"path\":\"/tmp/x\"}"}}]},
-                "finish_reason":"tool_calls"}]}"#,
+            r#"{"content":"","tool_calls":[
+                {"tool_name":"risky_delete","args":{"path":"/tmp/x"}}],
+                "finish_reason":"tool_calls","token_usage":null}"#,
         )
         .create_async()
         .await;
@@ -787,8 +782,7 @@ async fn test_approval_denied_by_default_in_loop() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let client = EvoruleApiClient::new(&server.url());
-    let llm = LlmHandler::new("mock-model", &llm_server.url(), Some("k".to_string()))
-        .with_retry_config(0, 0.001, 0.01);
+    let llm = LlmHandler::new("mock-model", &llm_server.url()).with_retry_config(0, 0.001, 0.01);
     let mut tools: BTreeMap<String, Arc<dyn ToolFunction>> = BTreeMap::new();
     tools.insert(
         "risky_delete".to_string(),
@@ -826,10 +820,9 @@ async fn test_approval_auto_approved_reexecutes_with_flag() {
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(
-            r#"{"choices":[{"message":{"content":"","tool_calls":[
-                {"id":"c1","type":"function",
-                 "function":{"name":"risky_delete","arguments":"{}"}}]},
-                "finish_reason":"tool_calls"}]}"#,
+            r#"{"content":"","tool_calls":[
+                {"tool_name":"risky_delete","args":{}}],
+                "finish_reason":"tool_calls","token_usage":null}"#,
         )
         .create_async()
         .await;
@@ -863,8 +856,7 @@ async fn test_approval_auto_approved_reexecutes_with_flag() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let client = EvoruleApiClient::new(&server.url());
-    let llm = LlmHandler::new("mock-model", &llm_server.url(), Some("k".to_string()))
-        .with_retry_config(0, 0.001, 0.01);
+    let llm = LlmHandler::new("mock-model", &llm_server.url()).with_retry_config(0, 0.001, 0.01);
     let mut tools: BTreeMap<String, Arc<dyn ToolFunction>> = BTreeMap::new();
     tools.insert(
         "risky_delete".to_string(),
@@ -1035,10 +1027,9 @@ async fn test_react_loop_llm_request_carries_tools_schema() {
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(
-            r#"{"choices":[{"message":{"content":"","tool_calls":[
-                {"id":"c1","type":"function",
-                 "function":{"name":"file_write","arguments":"{\"path\":\"workspace/expenses_2026.json\",\"content\":\"amount=45.50\"}"}}]},
-                "finish_reason":"tool_calls"}]}"#,
+            r#"{"content":"","tool_calls":[
+                {"tool_name":"file_write","args":{"path":"workspace/expenses_2026.json","content":"amount=45.50"}}],
+                "finish_reason":"tool_calls","token_usage":null}"#,
         )
         .create_async()
         .await;
@@ -1049,7 +1040,7 @@ async fn test_react_loop_llm_request_carries_tools_schema() {
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(
-            r#"{"choices":[{"message":{"content":"Wrote workspace/expenses_2026.json (amount=45.50)"},"finish_reason":"stop"}]}"#,
+            r#"{"content":"Wrote workspace/expenses_2026.json (amount=45.50)","tool_calls":null,"finish_reason":"stop","token_usage":null}"#,
         )
         .create_async()
         .await;
@@ -1142,8 +1133,7 @@ async fn test_react_loop_llm_request_carries_tools_schema() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     std::fs::create_dir(dir.path().join("workspace")).expect("workspace dir");
     let client = EvoruleApiClient::new(&server.url());
-    let llm = LlmHandler::new("mock-model", &llm_server.url(), Some("k".to_string()))
-        .with_retry_config(0, 0.001, 0.01);
+    let llm = LlmHandler::new("mock-model", &llm_server.url()).with_retry_config(0, 0.001, 0.01);
     let mut runner = AgentRunner::new(AgentConfig::default(), client)
         .with_llm_handler(llm)
         .with_tool_handler(evo_agent::builtin_tools::default_safe_toolkit(dir.path()));

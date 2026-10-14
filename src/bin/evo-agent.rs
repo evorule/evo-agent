@@ -1677,22 +1677,12 @@ fn cmd_serve(
         );
     }
 
-    // 2.5 启动期告警:三个 provider 密钥全缺失时显式提示,避免 LLM 失联假故障被误判
-    let has_llm_key = ["MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"]
-        .iter()
-        .any(|k| {
-            std::env::var(k)
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false)
-        });
-    if !has_llm_key {
-        eprintln!(
-            "[llm] WARNING: no LLM API key env found (MINIMAX_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY)"
-        );
-        eprintln!(
-            "[llm] WARNING: agent LLM calls will fail; set env vars or place a .env in the serve workdir (auto-loaded at startup)"
-        );
-    }
+    // 2.5 SG-1 件1(key 归边):agent 不再持有 provider 凭据,LLM 出站
+    //     统一经 ai-plugin 扩展型执行体中继。执行体未就绪在首次调用时
+    //     显式报错(连接拒绝),启动期不做网络探测(避免拖慢 serve 启动)。
+    let executor_url = std::env::var("EVORULE_LLM_EXECUTOR_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:9130/llm/execute".to_string());
+    eprintln!("[llm] LLM executor (SG-1 relay): {}", executor_url);
 
     // 3. G7:构造鉴权配置
     //    优先级:--no-auth > --auth-token > 配置文件/环境变量
@@ -2148,9 +2138,12 @@ struct WorkflowRunOpts {
 /// # 子 agent 配置
 ///
 /// 子 agent 通过 `DelegateContext::delegate()` 执行,内部用 `AgentRunner::new`
-/// + `LlmHandler::with_defaults()`(读环境变量 API key)。因此执行前需确保:
+/// + `LlmHandler::with_defaults()`(SG-1 件1 key 归边:出站走执行体中继)。
+///
+/// 因此执行前需确保:
 /// - evorule server 可达(`config.evorule.base_url`)
-/// - LLM API key 环境变量已设置(`MINIMAX_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`)
+/// - LLM 执行体已就绪(env `EVORULE_LLM_EXECUTOR_URL` 或默认
+///   `http://127.0.0.1:9130/llm/execute`;provider 凭据由执行体持有)
 /// - 各 `agent_type` 对应的 `agents/<type>.json` 已定义(replan/plan-execute 需 `planner`)
 fn cmd_workflow(
     workdir: &Path,
