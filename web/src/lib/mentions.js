@@ -21,6 +21,11 @@ export const MENTION_GROUPS = [
   { type: 'problems', label: '问题' },
 ];
 
+/** type → 中文分组文案(chip 托盘/回显用) */
+export const MENTION_GROUP_LABELS = Object.fromEntries(
+  MENTION_GROUPS.map((g) => [g.type, g.label]),
+);
+
 const providers = new Map();
 
 /**
@@ -48,6 +53,11 @@ export function getProvider(type) {
 
 export function registeredTypes() {
   return [...providers.keys()];
+}
+
+/** 清空注册表(测试辅助;生产运行期勿用) */
+export function resetProviders() {
+  providers.clear();
 }
 
 /**
@@ -99,6 +109,50 @@ export async function assembleContext(mentions, ctx = {}) {
   const xml =
     blocks.length > 0 ? `<evo-context>\n${blocks.join('\n')}\n</evo-context>` : '';
   return { xml, used, dropped };
+}
+
+/**
+ * 汇总各 provider 候选并按 MENTION_GROUPS 顺序分组;全局截取 limit 条,
+ * 超出置 truncated(弹层「继续输入缩小范围」提示)。同一 provider 实例多类型
+ * 注册(file/folder 共用)只询问一次,防重复候选。
+ * @returns {Promise<{groups: Array<{type, label, items}>, total: number, truncated: boolean}>}
+ */
+export async function collectCandidates(query, ctx = {}, limit = 50) {
+  const byType = new Map();
+  let total = 0;
+  const seen = new Set();
+  for (const type of providers.keys()) {
+    const p = providers.get(type);
+    if (!p || seen.has(p) || typeof p.candidates !== 'function') continue;
+    seen.add(p);
+    let items = [];
+    try {
+      items = await p.candidates(query, ctx);
+    } catch {
+      items = [];
+    }
+    for (const it of items) {
+      if (!it || typeof it.type !== 'string' || typeof it.ref !== 'string') continue;
+      if (!byType.has(it.type)) byType.set(it.type, []);
+      byType.get(it.type).push(it);
+      total++;
+    }
+  }
+  const known = new Set(MENTION_GROUPS.map((g) => g.type));
+  const order = [
+    ...MENTION_GROUPS,
+    ...[...byType.keys()].filter((t) => !known.has(t)).map((t) => ({ type: t, label: t })),
+  ];
+  let budget = limit;
+  const groups = [];
+  for (const g of order) {
+    const items = byType.get(g.type);
+    if (!items || items.length === 0 || budget <= 0) continue;
+    const take = items.slice(0, budget);
+    budget -= take.length;
+    groups.push({ type: g.type, label: g.label, items: take });
+  }
+  return { groups, total, truncated: total > limit };
 }
 
 // ---- XML 组块工具(provider.serialize 共用) ----

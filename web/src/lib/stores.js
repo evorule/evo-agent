@@ -3,6 +3,7 @@
 import { writable, get } from 'svelte/store';
 import {
   listSessions,
+  listDir,
   readFile,
   writeFile,
   getAgentDef,
@@ -191,6 +192,93 @@ export function closeTab(path) {
  *  值被消费后由订阅方置 null(一次性信号),形如
  *  {added:[], updated:[], removed:[], moved:[{from,to}]}(相对 workdir 路径) */
 export const fsEvents = writable(null);
+
+// ---- @上下文文件索引(B13;懒 BFS,fs_events 失效,2000 条上限) ----
+
+/** 文件索引快照 [{path, name, isDir}](相对 workdir,路径升序)。
+ *  懒构建:弹层打开时经 ensureFileIndex 触发;fs_events 触发后置陈旧,下次重建 */
+export const fileIndex = writable([]);
+
+/** 索引是否已构建过(至少完成一次 BFS) */
+export const fileIndexReady = writable(false);
+
+/** @上下文 mention 元数据(composer chip 托盘)。
+ *  元素:{type, ref, insertAt, token}——type 见 mentions.js MENTION_GROUPS,
+ *  ref 为实体标识(文件=相对路径),insertAt 为 draft 中 @token 起始偏移,
+ *  token 为文本内 @token 原文(供 chip 删除与发送前对账) */
+export const composerMentions = writable([]);
+
+const FILE_INDEX_LIMIT = 2000;
+// 高频/体积大的目录不遍历(目录条目本身保留在索引,可被 @ 搜到)
+const FILE_INDEX_SKIP_DIRS = new Set([
+  'node_modules',
+  '.git',
+  '.svn',
+  '.hg',
+  'dist',
+  'build',
+  'target',
+  'out',
+  '.next',
+  '.nuxt',
+  '.cache',
+  '__pycache__',
+  '.venv',
+  'venv',
+  'coverage',
+  '.idea',
+]);
+
+let indexBuilding = null;
+let indexStale = false;
+
+/** 构建/刷新文件索引(懒 BFS)。
+ *  force=true 强制重建;无 force 时:在途复用,已就绪且未陈旧则直接返回快照 */
+export function ensureFileIndex(force = false) {
+  if (!force) {
+    if (indexBuilding) return indexBuilding;
+    if (!indexStale && get(fileIndexReady)) return Promise.resolve(get(fileIndex));
+  }
+  indexStale = false;
+  const p = (async () => {
+    try {
+      const out = [];
+      const visited = new Set(['']);
+      const queue = [''];
+      while (queue.length > 0 && out.length < FILE_INDEX_LIMIT) {
+        const dir = queue.shift();
+        let res;
+        try {
+          res = await listDir(dir || undefined);
+        } catch {
+          continue; // 目录读取失败(权限/竞态删除)跳过,不致命
+        }
+        for (const e of res.entries || []) {
+          if (out.length >= FILE_INDEX_LIMIT) break;
+          const path = dir ? `${dir}/${e.name}` : e.name;
+          out.push({ path, name: e.name, isDir: e.kind === 'dir' });
+          if (e.kind === 'dir' && !FILE_INDEX_SKIP_DIRS.has(e.name) && !visited.has(path)) {
+            visited.add(path);
+            queue.push(path);
+          }
+        }
+      }
+      out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+      fileIndex.set(out);
+      fileIndexReady.set(true);
+      return out;
+    } finally {
+      if (indexBuilding === p) indexBuilding = null;
+    }
+  })();
+  return p;
+}
+
+// 索引失效钩子:fs_events 一次性信号,多订阅方各自消费互不影响
+// (Svelte store 同步广播,Explorer 等订阅方 set(null) 不吞掉本钩子的事件)
+fsEvents.subscribe((ev) => {
+  if (ev) indexStale = true;
+});
 
 // ---- Git 状态(B3;单状态源:SCM 视图与 Explorer 装饰共同订阅) ----
 

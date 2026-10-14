@@ -12,10 +12,15 @@
     updateMessage,
     artifacts,
     openFile,
+    composerMentions,
+    activePath,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
   import { approveProposal, listResumableRuns } from '../lib/api.js';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import { collectCandidates, MENTION_GROUP_LABELS } from '../lib/mentions.js';
+  import { highlightSegments } from '../lib/fuzzy.js';
+  import { registerMentionProviders } from '../lib/mentionProviders.js';
 
   // Svelte 5:组件用了 $effect 等 rune 即进入 runes 模式,
   // 顶层状态必须 $state() 声明,普通 let 不具备响应性(历史面板/发送按钮会失效)
@@ -26,6 +31,7 @@
   let resumableIds = $state(new Set());
 
   onMount(() => {
+    registerMentionProviders();
     refreshSessions();
     loadResumable();
   });
@@ -72,14 +78,148 @@
     }
   });
 
+  // ---- @上下文 mention(B13)----
+  // 触发:光标前缀形如 (^|\s)@<query>,300ms 防抖后汇总 provider 候选;
+  // 键盘:↑↓ 导航 / Enter 选中 / Esc 关闭;选中即插 @token + 登记元数据(chip)
+
+  let draftEl = $state(null);
+  let popupEl = $state(null);
+  // 弹层状态:{query, insertAt, groups:[{type,label,items:[{...,idx}]}], truncated, sel}
+  let mp = $state(null);
+  let mpTimer = null;
+  let mpSeq = 0;
+
+  const flatCandidates = $derived(mp ? mp.groups.flatMap((g) => g.items) : []);
+
+  // 选中行滚入可视区
+  $effect(() => {
+    if (!mp) return;
+    mp.sel;
+    popupEl?.querySelector('.m-row.sel')?.scrollIntoView({ block: 'nearest' });
+  });
+
+  function detectMention() {
+    const el = draftEl;
+    if (!el) return;
+    const pos = el.selectionStart ?? draft.length;
+    const m = draft.slice(0, pos).match(/(^|\s)@([^\s@]*)$/);
+    if (!m) {
+      closeMention();
+      return;
+    }
+    openMention(m[2], pos - m[2].length - 1);
+  }
+
+  function openMention(query, insertAt) {
+    const seq = ++mpSeq;
+    if (mpTimer) clearTimeout(mpTimer);
+    mpTimer = setTimeout(async () => {
+      try {
+        const res = await collectCandidates(query, {});
+        if (seq !== mpSeq) return; // 过期响应丢弃
+        const groups = withQuickItems(res.groups);
+        let idx = 0;
+        for (const g of groups) g.items = g.items.map((it) => ({ ...it, idx: idx++ }));
+        mp = { query, insertAt, groups, truncated: res.truncated, sel: 0 };
+      } catch {
+        mp = null;
+      }
+    }, 300);
+  }
+
+  function closeMention() {
+    if (mpTimer) {
+      clearTimeout(mpTimer);
+      mpTimer = null;
+    }
+    mpSeq++;
+    mp = null;
+  }
+
+  // 空查询快捷项:当前文件(选区/终端快捷项随对应 provider 接线)
+  function withQuickItems(groups) {
+    const ap = $activePath;
+    if (!ap) return groups;
+    const item = {
+      type: 'file',
+      ref: ap,
+      label: ap.split('/').pop() || ap,
+      detail: `${ap}(当前文件)`,
+      positions: [],
+    };
+    const g0 = groups.find((g) => g.type === 'file');
+    if (g0) g0.items.unshift(item);
+    else groups.unshift({ type: 'file', label: '文件', items: [item] });
+    return groups;
+  }
+
+  async function pickCandidate(c) {
+    if (!mp) return;
+    const token = `@${c.label}`;
+    const start = mp.insertAt;
+    const cursor = draftEl?.selectionStart ?? draft.length;
+    draft = draft.slice(0, start) + token + ' ' + draft.slice(cursor);
+    composerMentions.update((arr) => [...arr, { type: c.type, ref: c.ref, insertAt: start, token }]);
+    closeMention();
+    const caret = start + token.length + 1;
+    await tick();
+    if (draftEl) {
+      draftEl.focus();
+      draftEl.selectionStart = draftEl.selectionEnd = caret;
+    }
+  }
+
+  // chip 删除:同步移除 draft 中的 @token(insertAt 漂移时全局找首处兜底)
+  function removeMention(i) {
+    const m = $composerMentions[i];
+    if (!m) return;
+    let d = draft;
+    if (m.token) {
+      if (d.startsWith(m.token, m.insertAt)) {
+        d = d.slice(0, m.insertAt) + d.slice(m.insertAt + m.token.length);
+      } else {
+        const at = d.indexOf(m.token);
+        if (at >= 0) d = d.slice(0, at) + d.slice(at + m.token.length);
+      }
+    }
+    draft = d;
+    composerMentions.update((arr) => arr.filter((_, idx) => idx !== i));
+  }
+
   function submit() {
     const text = draft.trim();
     if (!text || $turnActive) return;
     draft = '';
+    closeMention();
+    composerMentions.set([]);
     sendMessage(text);
   }
 
   function onKeydown(e) {
+    if (mp) {
+      const n = flatCandidates.length;
+      if (e.key === 'ArrowDown' && n > 0) {
+        e.preventDefault();
+        mp.sel = (mp.sel + 1) % n;
+        return;
+      }
+      if (e.key === 'ArrowUp' && n > 0) {
+        e.preventDefault();
+        mp.sel = (mp.sel - 1 + n) % n;
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (n > 0) pickCandidate(flatCandidates[mp.sel]);
+        else closeMention();
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeMention();
+        return;
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       submit();
@@ -227,12 +367,54 @@
   </div>
 
   <div class="composer">
+    {#if mp}
+      <div class="mention-pop" bind:this={popupEl}>
+        {#each mp.groups as g (g.type)}
+          <div class="m-label">{g.label}</div>
+          {#each g.items as c (c.idx)}
+            <button
+              class="m-row"
+              class:sel={mp.sel === c.idx}
+              onmousedown={(e) => e.preventDefault()}
+              onclick={() => pickCandidate(c)}
+            >
+              <span class="m-path mono">
+                {#each highlightSegments(c.detail || c.ref, c.positions) as seg}
+                  <span class:hit={seg.hit}>{seg.text}</span>
+                {/each}
+              </span>
+              <span class="m-kind">{MENTION_GROUP_LABELS[c.type] || c.type}</span>
+            </button>
+          {/each}
+        {/each}
+        {#if flatCandidates.length === 0}
+          <div class="m-empty">无匹配候选</div>
+        {/if}
+        {#if mp.truncated}
+          <div class="m-more">候选较多,仅显示前 50——继续输入可缩小范围</div>
+        {/if}
+      </div>
+    {/if}
+    {#if $composerMentions.length > 0}
+      <div class="chip-tray">
+        {#each $composerMentions as cm, i}
+          <span class="chip">
+            <span class="chip-kind">{MENTION_GROUP_LABELS[cm.type] || cm.type}</span>
+            <span class="chip-ref mono" title={cm.ref}>{cm.ref}</span>
+            <button class="chip-x" title="移除该引用" onclick={() => removeMention(i)}>×</button>
+          </span>
+        {/each}
+      </div>
+    {/if}
     <textarea
       class="draft"
       rows="2"
-      placeholder={$turnActive ? 'agent 执行中…(可中断)' : '输入任务,Enter 发送,Shift+Enter 换行'}
+      placeholder={$turnActive ? 'agent 执行中…(可中断)' : '输入任务,@ 引用文件/上下文,Enter 发送'}
       bind:value={draft}
+      bind:this={draftEl}
+      oninput={detectMention}
       onkeydown={onKeydown}
+      onblur={closeMention}
       disabled={$connStatus !== 'online'}
     ></textarea>
     <div class="composer-actions">
@@ -577,12 +759,124 @@
     color: var(--danger);
   }
   .composer {
+    position: relative;
     flex-shrink: 0;
     border-top: 1px solid rgba(255, 255, 255, 0.08);
     padding: var(--sp-sm);
     display: flex;
     flex-direction: column;
     gap: var(--sp-sm);
+  }
+  .mention-pop {
+    position: absolute;
+    bottom: calc(100% - 4px);
+    left: var(--sp-sm);
+    right: var(--sp-sm);
+    max-height: 260px;
+    overflow-y: auto;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    padding: var(--sp-xs);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .m-label {
+    font-size: 10px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 4px var(--sp-sm) 2px;
+  }
+  .m-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-sm);
+    width: 100%;
+    padding: 4px var(--sp-sm);
+    border: none;
+    background: transparent;
+    color: var(--sidebar-text);
+    cursor: pointer;
+    text-align: left;
+    border-radius: var(--r-sm);
+    font-size: var(--fs-xs);
+  }
+  .m-row:hover {
+    background: var(--sidebar-hover);
+  }
+  .m-row.sel {
+    background: rgba(29, 99, 237, 0.18);
+    box-shadow: inset 2px 0 0 var(--brand);
+  }
+  .m-path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .m-path .hit {
+    color: var(--brand);
+    font-weight: var(--fw-sb);
+  }
+  .m-kind {
+    flex-shrink: 0;
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+  .m-empty {
+    padding: var(--sp-sm);
+    text-align: center;
+    color: var(--text-muted);
+    font-size: var(--fs-xs);
+  }
+  .m-more {
+    padding: 4px var(--sp-sm);
+    color: var(--text-muted);
+    font-size: 10px;
+  }
+  .chip-tray {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-xs);
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    border-radius: 999px;
+    padding: 2px 4px 2px 8px;
+    font-size: var(--fs-xs);
+    max-width: 100%;
+  }
+  .chip-kind {
+    color: var(--brand);
+    font-size: 10px;
+    flex-shrink: 0;
+  }
+  .chip-ref {
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 180px;
+  }
+  .chip-x {
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 0 4px;
+    font-size: 12px;
+    line-height: 1;
+  }
+  .chip-x:hover {
+    color: var(--danger);
   }
   .draft {
     width: 100%;
