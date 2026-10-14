@@ -14,12 +14,17 @@ use serde::Serialize;
 /// 解析出的单条诊断(行列 1-based,与诊断单源契约对齐)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MatchedDiag {
+    /// 工作区相对路径
     pub path: String,
+    /// 行号(1-based)
     pub line: u32,
+    /// 列号(1-based)
     pub col: u32,
     /// 1=Hint 2=Info 4=Warning 8=Error(Monaco severity 值,免前端换算)
     pub severity: u8,
+    /// 诊断代码(rustc error code / tsc 的 TSxxxx 形)
     pub code: String,
+    /// 诊断消息原文
     pub msg: String,
 }
 

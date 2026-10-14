@@ -25,18 +25,26 @@ pub const GRACE_KILL_WINDOW: std::time::Duration = std::time::Duration::from_sec
 /// 任务定义(tasks.json 简化集,对齐 VS Code 字段名)
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskSpec {
+    /// 任务唯一标识(前端展示与诊断 owner 命名)
     pub label: String,
+    /// 任务类型(process=默认直 spawn | shell=经 shell 解释)
     #[serde(rename = "type")]
     pub kind: Option<String>, // process(默认) | shell
+    /// 可执行文件或 shell 命令行
     pub command: String,
+    /// 参数列表
     #[serde(default)]
     pub args: Vec<String>,
+    /// cwd/env 运行选项
     #[serde(default)]
     pub options: TaskOptions,
+    /// 分组名(仅展示归类用途)
     #[serde(default)]
     pub group: Option<String>,
+    /// matcher 集(snake 形,宽容读)
     #[serde(default)]
     pub problem_matcher: Vec<String>,
+    /// matcher 集(problemMatcher 驼峰正式形,优先于 snake 形)
     #[serde(rename = "problemMatcher")]
     pub problem_matcher_alias: Option<Vec<String>>,
 }
@@ -49,6 +57,7 @@ impl TaskSpec {
             .unwrap_or(&self.problem_matcher)
     }
 
+    /// 是否经 shell 解释执行(决定 command_display 拼接形态)
     pub fn is_shell(&self) -> bool {
         self.kind.as_deref() == Some("shell")
     }
@@ -65,10 +74,13 @@ impl TaskSpec {
     }
 }
 
+/// 任务运行选项(tasks.json options 子集)
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TaskOptions {
+    /// 工作目录(相对路径基于工作区根;经 resolve_cwd 解析锁定防逃逸)
     #[serde(default)]
     pub cwd: Option<String>,
+    /// 进程环境变量增量(逐项叠加在继承环境之上)
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
 }
