@@ -49,7 +49,7 @@
   import ConfirmRunDialog from './components/ConfirmRunDialog.svelte';
   import { taskList, refreshTaskList, runTaskWithConfirm, cancelTaskRun, lastTaskLabel } from './lib/tasks.js';
   import GroupPane from './components/GroupPane.svelte';
-  import { splitOpen, toggleSplit, closeSplit, splitPath, splitWidth, restoreSplit } from './lib/editorGroups.js';
+  import { splitOpen, toggleSplit, closeSplit, secondaryGroups, activeGroupId, addSecondaryGroup, closeSecondaryGroup, moveActiveTabTarget, groupRemovePath, evenWidths as doEvenWidths, groupFocusSignal, restoreGroups, maximizedGroupId, toggleMaximize } from './lib/editorGroups.js';
   import { lspBanner, restartGate, gateSnapshot } from './lib/lsp/index.js';
   import { pushPanelEvent } from './lib/stores.js';
 
@@ -92,6 +92,11 @@
     'workbench.action.tasks.build',
     'view.splitEditor',
     'view.closeSplit',
+    'view.moveTabToNextGroup',
+    'view.evenWidths',
+    'view.focusGroup1',
+    'view.focusGroup2',
+    'view.focusGroup3',
   ];
   let cleanupTracking = null;
 
@@ -197,7 +202,7 @@
   }
 
   onMount(() => {
-    restoreSplit(); // 恢复上次分屏状态(路径元数据,localStorage)
+    restoreGroups(); // 恢复上次分屏状态(组结构+成员路径,localStorage)
     window.addEventListener('unhandledrejection', (e) => {
       try { localStorage.setItem('dbg_rej', String(e.reason).slice(0, 250)); } catch {}
     });
@@ -373,6 +378,63 @@
       run: () => closeSplit(),
     });
     registerCommand({
+      id: 'view.moveTabToNextGroup',
+      title: '视图: 当前 tab 移至相邻组',
+      category: '视图',
+      keybinding: 'ctrl+alt+arrowright',
+      run: () => {
+        const mv = moveActiveTabTarget(get(activePath));
+        if (!mv) return;
+        if (mv.fromId === 'primary') {
+          // 主组成员不登记在 groups(主组 tab 面自管):关主组 tab、副组打开
+          groupOpenPath(mv.toId, mv.path);
+          closeTab(mv.path);
+        } else {
+          groupRemovePath(mv.fromId, mv.path);
+          if (mv.toId === 'primary') {
+            openFile(mv.path);
+          } else {
+            groupOpenPath(mv.toId, mv.path);
+          }
+        }
+      },
+    });
+    registerCommand({
+      id: 'view.evenWidths',
+      title: '视图: 均分各组宽度',
+      category: '视图',
+      run: () => doEvenWidths(),
+    });
+    registerCommand({
+      id: 'view.maximize',
+      title: '视图: 最大化/还原当前组',
+      category: '视图',
+      run: () => {
+        const active = get(activeGroupId);
+        toggleMaximize(active === 'primary' && !get(maximizedGroupId) ? 'primary' : active);
+      },
+    });
+    for (const n of [1, 2, 3]) {
+      registerCommand({
+        id: `view.focusGroup${n}`,
+        title: `视图: 聚焦编辑器组 ${n}`,
+        category: '视图',
+        keybinding: `ctrl+${n}`,
+        run: () => {
+          if (n === 1) {
+            activeGroupId.set('primary');
+            return;
+          }
+          const groups = get(secondaryGroups);
+          const target = groups[n - 2]?.id;
+          if (target) {
+            activeGroupId.set(target);
+            groupFocusSignal.update((s) => ({ id: target, n: s.n + 1 }));
+          }
+        },
+      });
+    }
+    registerCommand({
       id: 'workbench.action.tasks.run',
       title: '任务: 运行任务',
       category: '任务',
@@ -523,12 +585,16 @@
         </div>
       {/if}
       <div class="editors-row">
-        <EditorPane />
-        {#if $splitOpen}
-          <div class="split-pane" style:width={`${Math.round($splitWidth * 100)}%`}>
-            <GroupPane />
-          </div>
-        {/if}
+        <div style:display={$maximizedGroupId && $maximizedGroupId !== 'primary' ? 'none' : ''} class="editor-slot">
+          <EditorPane />
+        </div>
+        {#each $secondaryGroups as g (g.id)}
+          {#if !$maximizedGroupId || $maximizedGroupId === g.id}
+            <div class="split-pane" style:width={$maximizedGroupId === g.id ? '100%' : g.width}>
+              <GroupPane group={g} />
+            </div>
+          {/if}
+        {/each}
       </div>
       <BottomPanel />
     </div>
@@ -572,6 +638,17 @@
     overflow: hidden;
   }
   .editors-row :global(.editor-pane) {
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+  }
+  .editor-slot {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+  }
+  .editor-slot :global(.editor-pane) {
     flex: 1;
     min-width: 0;
   }

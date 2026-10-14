@@ -37,6 +37,12 @@ export function allModels() {
   return [...models.entries()];
 }
 
+/** model → 注册 path 反查(未注册返回 null) */
+export function pathOfModel(model) {
+  for (const [p, m] of models) if (m === model) return p;
+  return null;
+}
+
 /** model 存活键重命名(文件重命名/移动:undo 栈随 model 保留) */
 export function renameModelKey(from, to) {
   const m = models.get(from);
