@@ -21,6 +21,12 @@
   import { collectCandidates, MENTION_GROUP_LABELS } from '../lib/mentions.js';
   import { highlightSegments } from '../lib/fuzzy.js';
   import { registerMentionProviders } from '../lib/mentionProviders.js';
+  import {
+    registerMentionSourceProviders,
+    getActiveSelection,
+    activeTerminalRef,
+    problemsTotal,
+  } from '../lib/mentionSources.js';
 
   // Svelte 5:组件用了 $effect 等 rune 即进入 runes 模式,
   // 顶层状态必须 $state() 声明,普通 let 不具备响应性(历史面板/发送按钮会失效)
@@ -32,6 +38,7 @@
 
   onMount(() => {
     registerMentionProviders();
+    registerMentionSourceProviders();
     refreshSessions();
     loadResumable();
   });
@@ -89,7 +96,11 @@
   let mpTimer = null;
   let mpSeq = 0;
 
-  const flatCandidates = $derived(mp ? mp.groups.flatMap((g) => g.items) : []);
+  // 键盘导航与 Enter 只走可用候选;置灰行(状态不可得)仅展示
+  const flatCandidates = $derived(mp ? mp.enabled : []);
+  const totalRendered = $derived(
+    mp ? mp.groups.reduce((n, g) => n + g.items.length, 0) : 0,
+  );
 
   // 选中行滚入可视区
   $effect(() => {
@@ -119,8 +130,15 @@
         if (seq !== mpSeq) return; // 过期响应丢弃
         const groups = withQuickItems(res.groups);
         let idx = 0;
-        for (const g of groups) g.items = g.items.map((it) => ({ ...it, idx: idx++ }));
-        mp = { query, insertAt, groups, truncated: res.truncated, sel: 0 };
+        const enabled = [];
+        for (const g of groups) {
+          g.items = g.items.map((it) => {
+            const row = { ...it, idx: idx++ };
+            if (!row.disabled) enabled.push(row);
+            return row;
+          });
+        }
+        mp = { query, insertAt, groups, truncated: res.truncated, sel: 0, enabled };
       } catch {
         mp = null;
       }
@@ -136,25 +154,59 @@
     mp = null;
   }
 
-  // 空查询快捷项:当前文件(选区/终端快捷项随对应 provider 接线)
+  // 空查询快捷项:当前文件/当前选区/当前终端/全部问题(状态不可得时置灰)
   function withQuickItems(groups) {
-    const ap = $activePath;
-    if (!ap) return groups;
-    const item = {
-      type: 'file',
-      ref: ap,
-      label: ap.split('/').pop() || ap,
-      detail: `${ap}(当前文件)`,
-      positions: [],
+    const put = (item) => {
+      const g0 = groups.find((g) => g.type === item.type);
+      if (g0) g0.items.unshift(item);
+      else
+        groups.push({
+          type: item.type,
+          label: MENTION_GROUP_LABELS[item.type] || item.type,
+          items: [item],
+        });
     };
-    const g0 = groups.find((g) => g.type === 'file');
-    if (g0) g0.items.unshift(item);
-    else groups.unshift({ type: 'file', label: '文件', items: [item] });
+    const ap = $activePath;
+    put({
+      type: 'file',
+      ref: ap || 'file',
+      label: ap ? ap.split('/').pop() || ap : '文件',
+      detail: ap ? `${ap}(当前文件)` : '无打开文件',
+      positions: [],
+      disabled: !ap,
+    });
+    const sel = getActiveSelection();
+    put({
+      type: 'selection',
+      ref: sel ? `${sel.path}:${sel.startLine}-${sel.endLine}` : 'selection',
+      label: '选区',
+      detail: sel ? `${sel.path} 选区 ${sel.endLine - sel.startLine + 1} 行` : '无选区',
+      positions: [],
+      disabled: !sel,
+    });
+    const tid = activeTerminalRef();
+    put({
+      type: 'terminal',
+      ref: tid || 'terminal',
+      label: '终端',
+      detail: tid ? `${tid}(当前终端)` : '无活动终端',
+      positions: [],
+      disabled: !tid,
+    });
+    const pn = problemsTotal();
+    put({
+      type: 'problems',
+      ref: pn > 0 ? '*' : 'problems',
+      label: '问题',
+      detail: pn > 0 ? `全部 ${pn} 条(工作区)` : '无诊断',
+      positions: [],
+      disabled: pn === 0,
+    });
     return groups;
   }
 
   async function pickCandidate(c) {
-    if (!mp) return;
+    if (!mp || c.disabled) return;
     const token = `@${c.label}`;
     const start = mp.insertAt;
     const cursor = draftEl?.selectionStart ?? draft.length;
@@ -375,6 +427,7 @@
             <button
               class="m-row"
               class:sel={mp.sel === c.idx}
+              class:dis={c.disabled}
               onmousedown={(e) => e.preventDefault()}
               onclick={() => pickCandidate(c)}
             >
@@ -387,7 +440,7 @@
             </button>
           {/each}
         {/each}
-        {#if flatCandidates.length === 0}
+        {#if totalRendered === 0}
           <div class="m-empty">无匹配候选</div>
         {/if}
         {#if mp.truncated}
@@ -812,6 +865,13 @@
   .m-row.sel {
     background: rgba(29, 99, 237, 0.18);
     box-shadow: inset 2px 0 0 var(--brand);
+  }
+  .m-row.dis,
+  .m-row.dis:hover {
+    color: var(--text-muted);
+    opacity: 0.55;
+    cursor: default;
+    background: transparent;
   }
   .m-path {
     overflow: hidden;

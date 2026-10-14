@@ -14,6 +14,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     killTerminalSession,
     listTerminalSessions,
     getTerminalSession,
+    setActiveTerminal,
     setTerminalNotify,
     refitTerminal,
     attachWebgl,
@@ -45,6 +46,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
   $effect(() => {
     if (activeId && !instances.has(activeId) && activeId !== creatingId) {
       activeId = ids.length ? ids[ids.length - 1] : null;
+      setActiveTerminal(activeId);
     }
   });
 
@@ -65,6 +67,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
       const inst = createTerminalSession(node, id);
       inst.onSearchIntent = () => (showSearch = true);
       attachWebgl(inst);
+      setActiveTerminal(id);
       requestAnimationFrame(() => refitTerminal(inst));
       creatingId = null;
     }
@@ -80,6 +83,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     const prev = getTerminalSession(activeId);
     if (prev) detachWebgl(prev);
     activeId = id;
+    setActiveTerminal(id);
     tick().then(() => {
       const inst = getTerminalSession(id);
       if (inst) {
