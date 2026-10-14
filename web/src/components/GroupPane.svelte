@@ -25,6 +25,7 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
     setBaseline,
   } from '../lib/modelRegistry.js';
   import { uriSpecFor } from '../lib/diagnostics.js';
+  import { resolveMode } from '../lib/theme.js';
   import { notifySaved } from '../lib/lsp/index.js';
 
   /** 组对象({id, paths, activePath, width})——父层 each 传键控引用 */
@@ -63,7 +64,7 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
   function appearance() {
     const s = get(settingsState).settings;
     return {
-      theme: s['workbench.theme'] || 'evorule-dark',
+      theme: resolveMode(s['workbench.theme'] || 'auto') === 'light' ? 'evorule-light' : 'evorule-dark',
       fontSize: typeof s['editor.fontSize'] === 'number' ? s['editor.fontSize'] : 14,
       minimap: { enabled: s['editor.minimap'] != null ? !!s['editor.minimap'] : false },
       wordWrap: s['editor.wordWrap'] === 'on' ? 'on' : 'off',

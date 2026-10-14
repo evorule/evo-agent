@@ -131,10 +131,10 @@ pub fn schema() -> Vec<SettingEntry> {
             key: "workbench.theme",
             kind: SettingType::Enum,
             default: json!("evorule-dark"),
-            enum_values: Some(vec!["evorule-dark"]),
+            enum_values: Some(vec!["auto", "evorule-dark", "evorule-light"]),
             range: None,
             category: "工作台",
-            description: "工作台配色主题（当前仅深色；明暗切换随主题板块扩展）",
+            description: "工作台配色主题（auto=跟随系统深浅；evorule-dark=深色；evorule-light=浅色）",
             scope: "window",
         },
         SettingEntry {
@@ -890,6 +890,8 @@ mod tests {
         assert!(validate_put("editor.wordWrap", Some(&json!("auto"))).is_err());
         assert!(validate_put("editor.wordWrap", Some(&json!("on"))).is_ok());
         assert!(validate_put("workbench.theme", Some(&json!("light"))).is_err());
+        assert!(validate_put("workbench.theme", Some(&json!("auto"))).is_ok());
+        assert!(validate_put("workbench.theme", Some(&json!("evorule-light"))).is_ok());
         // boolean
         assert!(validate_put("editor.minimap", Some(&json!("yes"))).is_err());
         assert!(validate_put("editor.minimap", Some(&json!(true))).is_ok());
