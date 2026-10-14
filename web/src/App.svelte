@@ -559,11 +559,30 @@
     migrateKeybindings(); // 旧键位覆盖层一次性迁移(失败保留旧键,下次启动重试)
     cleanupTracking = initContextTracking();
     refreshGitStatus(0); // git 状态启动加载(B3;后续 fs_events 防抖自愈)
+    // 主题接线(B11):设置快照变化 -> applyTheme(Monaco+CSS 变量+订阅者);
+    // storage 事件跨标签页同步;auto 模式由 applyTheme 内部 matchMedia 解析
+    let lastThemeSetting = null;
+    const unsubTheme = settingsState.subscribe((s) => {
+      const t = s.settings['workbench.theme'];
+      if (t && t !== lastThemeSetting) {
+        lastThemeSetting = t;
+        applyTheme(t, monaco);
+        try {
+          localStorage.setItem('evo_theme_mode', t);
+        } catch {
+          /* 存储不可用:仅影响 FOUC 镜像 */
+        }
+      }
+    });
+    const onThemeStorage = (e) => {
+      if (e.key === 'evo_theme_mode') applyTheme(readStoredMode(), monaco);
+    };
+    window.addEventListener('storage', onThemeStorage);
     return () => {
       for (const id of OWNED_COMMANDS) unregisterCommand(id);
       if (cleanupTracking) cleanupTracking();
-      window.__unsubTheme?.();
-      window.__unsubStorage?.();
+      unsubTheme();
+      window.removeEventListener('storage', onThemeStorage);
     };
   });
 
