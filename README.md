@@ -205,7 +205,7 @@ cargo run --release -- serve --port 8081
 - **任务运行**：工作区 `.evo/tasks.json` 定义任务（对齐 VS Code 字段名的简化集），底部「输出」面板多通道呈现（系统流水+每任务通道，file:line:col 错误行点击直达编辑器，内置 rustc/tsc 错误解析进问题面板）；首跑确认框列明命令原文（一次性信任）；**任务永不自动运行**、仅由人的显式动作发起（命令原文全留痕治理日志）；两段式取消（优雅→超时强杀树）；Ctrl+Shift+B 运行生成任务
 - **集成终端**：底部「终端」tab，xterm 6 多实例（chips 切换/新建/关闭/清屏），真实 PTY（Windows PowerShell→CMD→Git Bash 发现序，unix `$SHELL`；`terminal.shell` 可指定）；选区 Ctrl+C=复制否则中断、Ctrl+F 查找、右键/粘贴、中文宽度修正、WebGL 渲染；输出风暴背压不卡 UI；关闭/断连即回收进程树；**治理分级（人机双轨）**：终端是用户自有通道——会话创建/关闭留痕治理日志（审计 tab 可见），会话内命令不经过审批（UI 明示）；agent 的命令执行仍走既有三层审批，两通道互不相通
 - 编辑器多 tab（Monaco 内核），`Ctrl+S` 保存落盘——与 agent 写文件走同一 file 工具实现（同 workdir 沙箱与安全校验，见 API.md §7）
-- 底部多 tab 面板（中栏底部、拖拽调高、可折叠）：「输出」呈现系统事件流水、「审计」呈现当前会话治理事件流（工具调用/审批/错误）并提供「在审计页查看」深链跳转 console 审计页（`?session=<id>` 定位；默认 `http://localhost:5174`，localStorage `evo_console_origin` 可改）；终端（PTY）/问题/控制台日志/时光机器/记忆为占位待后续阶段。深链点击前自动探活——console 未运行时就地明示引导，不跳死链
+- 底部多 tab 面板（中栏底部、拖拽调高、可折叠）：「输出」呈现系统事件流水、「审计」呈现当前会话治理事件流（工具调用/审批/错误）并提供「在审计页查看」深链跳转 console 审计页（`?session=<id>` 定位；默认 `http://localhost:5174`，localStorage `evo_console_origin` 可改）；控制台日志/时光机器/记忆为占位待后续阶段（集成终端与问题面板已上线，见上）。深链点击前自动探活——console 未运行时就地明示引导，不跳死链
 - **console 审计页自动拉起（可选配置）**：在 `evo-agent.toml` 配置 `[workbench] console_dir = "<console-cloud 仓目录>"`（可选 `console_port`，缺省 5174）后，serve 启动期检测该端口未监听时自动以子进程拉起 console dev server（fail-soft：目录无效/依赖缺失/端口占用仅告警；子进程输出落 `data/console_sidecar.log`）。缺省不配置 = 无任何副作用
 - 审批卡交互：agent 触发候选工具审批时，对话侧栏审批卡可直接「批准/拒绝」（走 §4.4 既有审批通道，60s 超时自动拒绝；WS 审批帧两阶段时序见 API.md §12.2）
 - **agent 产物协作编辑**：agent `file_write` 写文件成功后，产物自动在编辑器打开并登记（对话侧栏出现「agent 产物」卡，可随时点回编辑器）；编辑器顶部出现产物条——「查看与草稿差异」切 diff 视图（左=agent 草稿基线、右=当前可编辑），直接增删改，`Ctrl+S` 保存即定稿（产物条与产物卡实时显示草稿/已定稿状态与时间）；草稿基线与定稿留痕为工作台展示层记录（localStorage，不入审计链），按会话持久化、切会话自动载入
