@@ -40,6 +40,9 @@
     saveWorkspaceSettingsDoc,
   } from '../lib/settings.js';
   import { initLsp, notifySaved } from '../lib/lsp/index.js';
+  import { registerAiCompletion, refreshAiEvoignore } from '../lib/ai-completion.js';
+  import { openInlineChat, inlineChat } from '../lib/inlineChat.js';
+  import InlineChatWidget from './InlineChatWidget.svelte';
   import { applyTheme, resolveMode } from '../lib/theme.js';
   import {
     getModelForPath,
@@ -83,6 +86,7 @@
   let welcomeModel = null;
   /** LSP 装配清理函数(onMount 异步赋值;onDestroy 调用) */
   let disposeLsp = null;
+  let disposeAi = null;
   /** path → monaco model(含 undo 栈与编辑状态) */
   /** path → 保存基线内容(对比判 dirty) */
   /** path → 打开失败的错误占位 model(缓存防重复创建) */
@@ -450,6 +454,13 @@
     });
     welcomeModel = monaco.editor.createModel(welcomeText, 'markdown');
     welcomeModel.updateOptions({ tabSize: tabSizeValue() });
+    // AI 补全 provider(多语言清单;设置 completion.enabled 运行时守卫)
+    const AI_LANGS = [
+      'rust', 'typescript', 'javascript', 'python', 'go', 'java',
+      'markdown', 'json', 'yaml', 'shell', 'sql',
+    ];
+    disposeAi = registerAiCompletion(editor, AI_LANGS);
+    refreshAiEvoignore();
     const o = appearanceOptions();
     editor = monaco.editor.create(editorEl, {
       model: welcomeModel,
@@ -484,6 +495,29 @@
       keybinding: 'ctrl+s',
       when: 'editorFocus || tabsOpen',
       run: saveActive,
+    });
+    registerCommand({
+      id: 'ai.inlineChat',
+      title: 'AI: Inline Chat(Ctrl+K)',
+      category: 'AI',
+      keybinding: 'ctrl+k',
+      when: 'editorFocus',
+      run: () => {
+        if (get(settingsState).settings['inlineChat.enabled'] === false) return; // 治理开关
+        const path = $activePath;
+        if (path && !hasModel(path)) return; // 欢迎/错误占位不唤起
+        openInlineChat(editor, getModelForPath(path));
+      },
+    });
+    registerCommand({
+      id: 'ai.toggleCompletion',
+      title: 'AI: 切换行内补全',
+      category: 'AI',
+      run: () => {
+        // 设置页为权威开关;此处快捷翻转 completion.enabled
+        const cur = get(settingsState).settings['completion.enabled'] !== false;
+        import('../lib/settings.js').then((m) => m.setSetting('completion.enabled', !cur).catch(() => {}));
+      },
     });
     registerCommand({
       id: 'editor.action.toggleDiff',
@@ -599,6 +633,7 @@
   });
 
   onDestroy(() => {
+    disposeAi?.();
     for (const t of lintTimers.values()) clearTimeout(t);
 
     for (const m of draftModels.values()) m.dispose();
@@ -614,6 +649,10 @@
     disposeLsp?.(); // LSP 装配清理(断连/摘订阅)
   });
 </script>
+
+{#if $inlineChat}
+  <InlineChatWidget />
+{/if}
 
 <div class="editor-pane">
   <div class="tabbar">
