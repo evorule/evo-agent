@@ -49,7 +49,7 @@ pub use chunker::{collect_workspace_files, DEFAULT_EXCLUDES, SKIP_EXTS};
 pub use store::{FileHash, IndexStore, RefRow, SymbolMin, SymbolRow};
 
 /// watcher 去抖窗口（毫秒；fs_watch 400ms 的编辑场景近似值，索引侧收敛略缓）
-const INDEX_DEBOUNCE_MS: u64 = 500;
+pub const INDEX_DEBOUNCE_MS: u64 = 500;
 /// 增量更新并发批上限（超出即丢弃当批——store 单写者队列防积压；
 /// 丢批由下次全量对账兜底校正）
 const MAX_IN_FLIGHT: u64 = 4;

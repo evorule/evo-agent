@@ -42,7 +42,7 @@
   import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
   import { initContextTracking } from './lib/context-keys.js';
   import { getEffectiveRules, resolveKeybinding, migrateKeybindings } from './lib/keybindings.js';
-  import { gitStage } from './lib/api.js';
+  import { gitStage, indexStatus, indexRebuild } from './lib/api.js';
   import { setSetting } from './lib/settings.js';
   import { nextProblem, markerToReveal } from './lib/diagnostics.js';
   import { openBottomPanel, terminalIntent, outputChannel } from './lib/panel.js';
@@ -553,6 +553,41 @@
           }
         }
         openBottomPanel('output');
+      },
+    });
+    registerCommand({
+      id: 'workbench.action.index.status',
+      title: '索引: 查看代码库索引状态',
+      category: '索引',
+      run: () => {
+        // 关闭态(index.enabled=false)服务端 503 → 错误事件明示开启路径
+        indexStatus()
+          .then((s) => {
+            pushPanelEvent('sys', {
+              label: '[index]',
+              detail: `files=${s.files} symbols=${s.symbols} refs=${s.refs} ${s.building ? 'building' : s.ready ? 'ready' : 'empty'}`,
+            });
+          })
+          .catch((e) => pushPanelEvent('sys', { label: '[index]', detail: String(e?.message || e), level: 'error' }));
+        openBottomPanel('output');
+      },
+    });
+    registerCommand({
+      id: 'workbench.action.index.rebuild',
+      title: '索引: 全量重建代码库符号索引',
+      category: '索引',
+      run: () => {
+        // 同步重建(blocking 池执行):大仓数秒级,起止均落事件流水
+        pushPanelEvent('sys', { label: '[index]', detail: 'rebuild started (全量重建进行中,大仓可能需数秒)' });
+        openBottomPanel('output');
+        indexRebuild()
+          .then((s) => {
+            pushPanelEvent('sys', {
+              label: '[index]',
+              detail: `rebuild done: files=${s.files} symbols=${s.symbols} refs=${s.refs}`,
+            });
+          })
+          .catch((e) => pushPanelEvent('sys', { label: '[index]', detail: `rebuild failed: ${String(e?.message || e)}`, level: 'error' }));
       },
     });
     loadSettings(); // 设置快照加载(失败降级缓存只读;编辑器参数订阅在 EditorPane)
