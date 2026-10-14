@@ -20,6 +20,7 @@
 //! 索引库为可丢弃派生缓存（`rebuild` 随时重建），不是第二真相源。
 
 pub mod chunker;
+pub mod symbols;
 pub mod store;
 
 use std::path::{Path, PathBuf};
