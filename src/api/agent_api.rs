@@ -610,6 +610,16 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/tasks/ws",
             axum::routing::get(crate::api::task_api::task_ws),
         )
+        // AI 补全/Inline Chat(B12,人的显式/半显式触发;LLM 外发面,G16 中间件
+        // 覆盖;prompt 边界与 .evoignore 排除在前端组装层执行)
+        .route(
+            "/api/completion",
+            axum::routing::post(crate::api::completion_api::completion),
+        )
+        .route(
+            "/api/inline-chat",
+            axum::routing::post(crate::api::completion_api::inline_chat),
+        )
         // 工作台 Git 面(B3,人工面):SCM 视图/diff/暂存/丢弃/提交 —— 薄委托
         // git::GitOps 核心层;身份缺失只引导不代写 config;G16 中间件自动覆盖
         .route(
