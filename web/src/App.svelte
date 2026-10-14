@@ -43,6 +43,7 @@
   import { initContextTracking } from './lib/context-keys.js';
   import { getEffectiveRules, resolveKeybinding, migrateKeybindings } from './lib/keybindings.js';
   import { gitStage } from './lib/api.js';
+  import { setSetting } from './lib/settings.js';
   import { nextProblem, markerToReveal } from './lib/diagnostics.js';
   import { openBottomPanel, terminalIntent, outputChannel } from './lib/panel.js';
   import TaskPicker from './components/TaskPicker.svelte';
@@ -97,6 +98,8 @@
     'view.focusGroup1',
     'view.focusGroup2',
     'view.focusGroup3',
+    'workbench.toggleTheme',
+    'workbench.selectTheme',
   ];
   let cleanupTracking = null;
 
@@ -406,6 +409,22 @@
       run: () => doEvenWidths(),
     });
     registerCommand({
+      id: 'workbench.toggleTheme',
+      title: '视图: 明暗主题切换',
+      category: '视图',
+      run: () => {
+        const cur = resolveMode(get(settingsState).settings['workbench.theme'] || 'auto');
+        const next = cur === 'light' ? 'evorule-dark' : 'evorule-light';
+        setSetting('workbench.theme', next).catch((e) => pushPanelEvent('sys', { label: '[theme]', detail: String(e?.message || e), level: 'error' }));
+      },
+    });
+    registerCommand({
+      id: 'workbench.selectTheme',
+      title: '视图: 打开主题设置',
+      category: '视图',
+      run: () => openSettingsTab(),
+    });
+    registerCommand({
       id: 'view.maximize',
       title: '视图: 最大化/还原当前组',
       category: '视图',
@@ -543,6 +562,8 @@
     return () => {
       for (const id of OWNED_COMMANDS) unregisterCommand(id);
       if (cleanupTracking) cleanupTracking();
+      window.__unsubTheme?.();
+      window.__unsubStorage?.();
     };
   });
 

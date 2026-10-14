@@ -40,6 +40,7 @@
     saveWorkspaceSettingsDoc,
   } from '../lib/settings.js';
   import { initLsp, notifySaved } from '../lib/lsp/index.js';
+  import { applyTheme, resolveMode } from '../lib/theme.js';
   import {
     getModelForPath,
     hasModel,
@@ -275,7 +276,7 @@
   function appearanceOptions() {
     const s = get(settingsState).settings;
     return {
-      theme: s['workbench.theme'] || 'evorule-dark',
+      theme: resolveMode(s['workbench.theme'] || 'auto') === 'light' ? 'evorule-light' : 'evorule-dark',
       fontSize: typeof s['editor.fontSize'] === 'number' ? s['editor.fontSize'] : 14,
       minimap: { enabled: s['editor.minimap'] != null ? !!s['editor.minimap'] : false },
       wordWrap: s['editor.wordWrap'] === 'on' ? 'on' : 'off',
@@ -286,7 +287,8 @@
   function applySettingsToEditors() {
     const o = appearanceOptions();
     const ts = tabSizeValue();
-    if (editor) editor.updateOptions({ ...o });
+    applyTheme(o.theme, monaco); // 主题全局切换(token 表三通道;实例 options 只剩字号/折行/小地图)
+    if (editor) editor.updateOptions({ fontSize: o.fontSize, minimap: o.minimap, wordWrap: o.wordWrap });
     if (diffEditor) diffEditor.updateOptions({ ...o });
 
     for (const m of draftModels.values()) m.updateOptions({ tabSize: ts });

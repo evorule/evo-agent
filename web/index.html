@@ -4,6 +4,26 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>evo-agent 工作台</title>
+  <script id="evo-theme-fouc">
+      // FOUC 防护:先于首帧设 data-theme(localStorage 镜像→auto 跟随系统)
+      (function () {
+        try {
+          var m = localStorage.getItem('evo_theme_mode') || 'auto';
+          var t =
+            m === 'evorule-light'
+              ? 'light'
+              : m === 'evorule-dark'
+                ? 'dark'
+                : window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches
+                  ? 'light'
+                  : 'dark';
+          document.documentElement.dataset.theme = t;
+          document.documentElement.style.colorScheme = t;
+        } catch (e) {
+          document.documentElement.dataset.theme = 'dark';
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>
