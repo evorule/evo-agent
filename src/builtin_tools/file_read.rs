@@ -187,7 +187,21 @@ mod tests {
             // Windows 创建符号链接需要 SeCreateSymbolicLinkPrivilege 特权
             // （管理员或开发者模式），无特权环境错误码 1314，直接跳过
             match std::os::windows::fs::symlink_file(&outside_file, &link_path) {
-                Ok(()) => {}
+                Ok(()) => {
+                    // P02 教训(对齐 file_write 同款判据):不信 Ok(()) —— 本机存在
+                    // symlink 假 Ok 的中介层,必须核验链接真的创建了,否则该测试
+                    // 什么都没测到(链接被物化成普通文件,逃逸无从发生)
+                    match std::fs::symlink_metadata(&link_path) {
+                        Ok(m) if m.file_type().is_symlink() => {}
+                        _ => {
+                            eprintln!(
+                                "skip: symlink_file returned Ok but no symlink created (env intermediary)"
+                            );
+                            let _ = std::fs::remove_file(&link_path);
+                            return;
+                        }
+                    }
+                }
                 Err(e) if e.raw_os_error() == Some(1314) => {
                     eprintln!("skip: no symlink privilege on this Windows env");
                     return;
