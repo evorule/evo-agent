@@ -93,16 +93,22 @@ fn parser_for(lang: Lang) -> Option<Parser> {
 fn is_def(lang: Lang, kind: &str) -> bool {
     matches!(
         (lang, kind),
-        (Lang::Rust, "function_item" | "function_signature_item" | "struct_item" | "enum_item" | "trait_item")
-            | (
-                Lang::TypeScript,
-                "function_declaration"
-                    | "class_declaration"
-                    | "abstract_class_declaration"
-                    | "method_definition"
-                    | "interface_declaration"
-                    | "type_alias_declaration"
-            )
+        (
+            Lang::Rust,
+            "function_item"
+                | "function_signature_item"
+                | "struct_item"
+                | "enum_item"
+                | "trait_item"
+        ) | (
+            Lang::TypeScript,
+            "function_declaration"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "method_definition"
+                | "interface_declaration"
+                | "type_alias_declaration"
+        )
     )
 }
 
@@ -127,7 +133,10 @@ fn is_container(lang: Lang, kind: &str) -> bool {
     matches!(
         (lang, kind),
         (Lang::Rust, "trait_item")
-            | (Lang::TypeScript, "class_declaration" | "abstract_class_declaration")
+            | (
+                Lang::TypeScript,
+                "class_declaration" | "abstract_class_declaration"
+            )
     )
 }
 
@@ -231,7 +240,14 @@ fn descend(
 }
 
 impl Extracted {
-    fn push_symbol(&mut self, kind: &str, name: String, start: usize, end: usize, parent: Option<String>) {
+    fn push_symbol(
+        &mut self,
+        kind: &str,
+        name: String,
+        start: usize,
+        end: usize,
+        parent: Option<String>,
+    ) {
         self.symbols.push(SymEntry {
             row: SymbolRow {
                 kind: kind.to_string(),
@@ -287,7 +303,12 @@ pub struct CodeChunk {
 /// 组装富化 chunk：每个符号一个 chunk，超 [`MAX_CHUNK_TOKENS`] 按行均分为多段
 ///
 /// `imports` 来自 [`extract`]；源码行按 1-based 行号区间回读自 `src`。
-pub fn build_chunks(file: &str, src: &str, entries: &[SymEntry], imports: &[String]) -> Vec<CodeChunk> {
+pub fn build_chunks(
+    file: &str,
+    src: &str,
+    entries: &[SymEntry],
+    imports: &[String],
+) -> Vec<CodeChunk> {
     let lines: Vec<&str> = src.lines().collect();
     let mut chunks = Vec::new();
     for e in entries {
@@ -311,7 +332,9 @@ pub fn build_chunks(file: &str, src: &str, entries: &[SymEntry], imports: &[Stri
                 h
             }
         };
-        let budget = MAX_CHUNK_TOKENS.saturating_mul(4).saturating_sub(head.len() / 4);
+        let budget = MAX_CHUNK_TOKENS
+            .saturating_mul(4)
+            .saturating_sub(head.len() / 4);
         if budget == 0 {
             continue;
         }
@@ -341,7 +364,10 @@ pub fn build_chunks(file: &str, src: &str, entries: &[SymEntry], imports: &[Stri
             } else {
                 // 段首/段尾行回定位（行内容在区间内唯一性不足时按首/尾匹配）
                 let first = seg[0];
-                let off_head = body.iter().position(|l| std::ptr::eq(*l, first)).unwrap_or(0);
+                let off_head = body
+                    .iter()
+                    .position(|l| std::ptr::eq(*l, first))
+                    .unwrap_or(0);
                 let last = *seg.last().unwrap();
                 let off_tail = body
                     .iter()
@@ -501,7 +527,9 @@ export function boot(opts: Options): Loader {
 
     #[test]
     fn oversized_symbol_splits_into_contiguous_segments() {
-        let body: String = (0..300).map(|i| format!("    let v{i} = {i}; // pad\n")).collect();
+        let body: String = (0..300)
+            .map(|i| format!("    let v{i} = {i}; // pad\n"))
+            .collect();
         let src = format!("pub fn big() {{\n{body}}}\n");
         let ex = extract(Lang::Rust, &src);
         assert_eq!(ex.symbols.len(), 1);

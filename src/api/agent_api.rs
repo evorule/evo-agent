@@ -255,6 +255,9 @@ pub struct AgentApiState {
     pty_registry: Arc<crate::pty::PtyRegistry>,
     /// 任务运行注册表(run_id→运行记录;并发上限 4)
     task_manager: Arc<crate::tasks::TaskManager>,
+    /// B14 语义索引服务(代码库符号图谱;serve 按 `index.enabled` 注入,
+    /// None = 关闭态,/api/index/* 一律 503)
+    index: Option<Arc<crate::index::IndexService>>,
 }
 
 impl AgentApiState {
@@ -314,6 +317,8 @@ impl AgentApiState {
             lsp_registry: Arc::new(crate::lsp::LangRegistry::new()),
             pty_registry: Arc::new(crate::pty::PtyRegistry::new()),
             task_manager: Arc::new(crate::tasks::TaskManager::new()),
+            // B14 索引服务缺省不注入(关闭态 503);serve 启动按设置 with_index
+            index: None,
             fs_events: crate::api::fs_watch::FsEventHub::new(),
             workdir,
             workspace_client,
@@ -458,6 +463,18 @@ impl AgentApiState {
     pub fn with_auth_config(mut self, auth_config: AuthConfig) -> Self {
         self.auth_config = auth_config;
         self
+    }
+
+    /// B14:注入语义索引服务(builder pattern,供 serve 启动按 `index.enabled` 调用;
+    /// 未注入 = 关闭态,/api/index/* 一律 503)
+    pub fn with_index(mut self, index: Arc<crate::index::IndexService>) -> Self {
+        self.index = Some(index);
+        self
+    }
+
+    /// B14:获取语义索引服务(关闭态为 None)
+    pub fn index(&self) -> Option<&Arc<crate::index::IndexService>> {
+        self.index.as_ref()
     }
 }
 
@@ -619,6 +636,20 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route(
             "/api/inline-chat",
             axum::routing::post(crate::api::completion_api::inline_chat),
+        )
+        // B14 语义索引(结构面 v1):符号检索/就绪度/全量重建 —— 索引服务未注入
+        // (index.enabled 关)时一律 503;人工触发的重建写面,无 agent 工具接点
+        .route(
+            "/api/index/search",
+            axum::routing::get(crate::index::search_api::search),
+        )
+        .route(
+            "/api/index/status",
+            axum::routing::get(crate::index::search_api::status),
+        )
+        .route(
+            "/api/index/rebuild",
+            axum::routing::post(crate::index::search_api::rebuild),
         )
         // 工作台 Git 面(B3,人工面):SCM 视图/diff/暂存/丢弃/提交 —— 薄委托
         // git::GitOps 核心层;身份缺失只引导不代写 config;G16 中间件自动覆盖

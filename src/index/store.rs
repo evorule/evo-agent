@@ -4,12 +4,14 @@
 #![forbid(unsafe_code)]
 //! 索引库持久层（B14 结构面）—— SQLite（rusqlite bundled / WAL）
 //!
-//! 表结构（15 号 §3.1）：
+//! 表结构（15 号 §3.1，v2 语义）：
 //! - `files`：path（相对工作区根，`/` 分隔）+ content_hash（blake3 hex）+ mtime
 //!   + size —— 增量对账键（启动哈希对账 / notify 增量判定）；
 //! - `symbols`：file/kind/name/line_start/line_end —— 符号抽取产物；
-//! - `refs`：from_file/to_symbol/weight —— 引用边（PageRank 图谱输入，
-//!   weight=√出现次数，Aider repomap 口径）。
+//! - `idents`：file/name/count —— 标识符出现计数（name 级原始事实，按文件聚合）；
+//! - `refs`：from_file/to_file/weight —— 文件级引用边（PageRank 图谱直接输入，
+//!   派生物化视图：idents ∩ def 名集合 → owner 归属，weight=Σ√count）；
+//!   name 级原始事实保留在 `idents`，可随时重刷，无信息损失。
 //!
 //! 并发纪律（15 号 §八风险 5 裁决）：单连接 + `Mutex` 串行写；WAL 允许读并发。
 //! 落盘边界（D8）：源码内容不落索引库——只存哈希 + 符号 + 元数据，展示时按需
@@ -18,13 +20,18 @@
 //! 与 LexStore（[`crate::agent::lexstore`]）同款单写者形态；差异在定位：索引库
 //! 是 serve 本地派生缓存（可随时 rebuild 重建），非第二真相源。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection};
 
 /// schema 版本（迁移判据；破坏性变更须升版并写迁移路径）
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// v2：新增 `idents`（标识符出现计数，按文件聚合落库）——refs 升格为派生
+/// 物化视图（idents ∩ def 名集合，`refresh_refs` 全量重刷），无内存态、
+/// 重启自愈、增量天然正确。
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS files (
@@ -43,14 +50,21 @@ CREATE TABLE IF NOT EXISTS symbols (
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+CREATE TABLE IF NOT EXISTS idents (
+    file  TEXT NOT NULL,
+    name  TEXT NOT NULL,
+    count INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_idents_name ON idents(name);
+CREATE INDEX IF NOT EXISTS idx_idents_file ON idents(file);
 CREATE TABLE IF NOT EXISTS refs (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     from_file TEXT NOT NULL,
-    to_symbol TEXT NOT NULL,
+    to_file   TEXT NOT NULL,
     weight    REAL NOT NULL DEFAULT 1.0
 );
 CREATE INDEX IF NOT EXISTS idx_refs_from ON refs(from_file);
-CREATE INDEX IF NOT EXISTS idx_refs_to   ON refs(to_symbol);
+CREATE INDEX IF NOT EXISTS idx_refs_to   ON refs(to_file);
 ";
 
 /// 索引库错误（存储层错误不携带链上语义）
@@ -78,12 +92,14 @@ pub struct SymbolRow {
     pub line_end: u32,
 }
 
-/// 引用行（所属文件由写入 API 的 `path` 参数承载）
+/// 引用边（文件级派生物化——`refresh_refs` 重刷；to_file = 被引符号 owner 文件）
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefRow {
-    /// 被引符号名（name 级匹配，Aider repomap 口径）
-    pub to_symbol: String,
-    /// 边权（√出现次数）
+    /// 引用来源文件
+    pub from_file: String,
+    /// 被引符号 owner 文件（同名多 def 取首见，file 升序）
+    pub to_file: String,
+    /// 边权（Σ√出现次数）
     pub weight: f64,
 }
 
@@ -96,6 +112,21 @@ pub struct FileHash {
     pub content_hash: String,
     /// 修改时间（UNIX 秒）
     pub mtime: i64,
+}
+
+/// 符号最小读出行（检索匹配 / owner 映射用）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolMin {
+    /// 所属文件（相对路径，`/` 分隔）
+    pub file: String,
+    /// 符号类别
+    pub kind: String,
+    /// 符号名
+    pub name: String,
+    /// 起始行（1 起）
+    pub line_start: u32,
+    /// 结束行（含）
+    pub line_end: u32,
 }
 
 /// 索引库（单连接 + `Mutex` 串行写；WAL）
@@ -132,9 +163,10 @@ impl IndexStore {
         })
     }
 
-    /// 整文件替换（事务内：删旧 symbols/refs → upsert files → 插新行）
+    /// 整文件替换（事务内：删旧 symbols/refs/idents → upsert files → 插新行）
     ///
     /// 单文件增量更新的原子入口：解析失败/中途出错整事务回滚，库内不残留半新半旧。
+    /// 调用方随后应调 [`IndexStore::refresh_refs`] 重刷派生 refs。
     pub fn replace_file(
         &self,
         path: &str,
@@ -142,14 +174,14 @@ impl IndexStore {
         mtime: i64,
         size: i64,
         symbols: &[SymbolRow],
-        refs: &[RefRow],
+        idents: &[(String, u32)],
     ) -> Result<(), IndexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| IndexError(format!("replace tx: {e}")))?;
-        tx.execute("DELETE FROM refs WHERE from_file = ?1", params![path])
-            .map_err(|e| IndexError(format!("replace del refs: {e}")))?;
+        tx.execute("DELETE FROM idents WHERE file = ?1", params![path])
+            .map_err(|e| IndexError(format!("replace del idents: {e}")))?;
         tx.execute("DELETE FROM symbols WHERE file = ?1", params![path])
             .map_err(|e| IndexError(format!("replace del symbols: {e}")))?;
         tx.execute(
@@ -166,12 +198,12 @@ impl IndexStore {
             )
             .map_err(|e| IndexError(format!("replace insert symbol: {e}")))?;
         }
-        for r in refs {
+        for (name, count) in idents {
             tx.execute(
-                "INSERT INTO refs(from_file, to_symbol, weight) VALUES(?1, ?2, ?3)",
-                params![path, r.to_symbol, r.weight],
+                "INSERT INTO idents(file, name, count) VALUES(?1, ?2, ?3)",
+                params![path, name, count],
             )
-            .map_err(|e| IndexError(format!("replace insert ref: {e}")))?;
+            .map_err(|e| IndexError(format!("replace insert ident: {e}")))?;
         }
         tx.commit()
             .map_err(|e| IndexError(format!("replace commit: {e}")))?;
@@ -186,6 +218,8 @@ impl IndexStore {
             .map_err(|e| IndexError(format!("remove tx: {e}")))?;
         tx.execute("DELETE FROM refs WHERE from_file = ?1", params![path])
             .map_err(|e| IndexError(format!("remove del refs: {e}")))?;
+        tx.execute("DELETE FROM idents WHERE file = ?1", params![path])
+            .map_err(|e| IndexError(format!("remove del idents: {e}")))?;
         tx.execute("DELETE FROM symbols WHERE file = ?1", params![path])
             .map_err(|e| IndexError(format!("remove del symbols: {e}")))?;
         tx.execute("DELETE FROM files WHERE path = ?1", params![path])
@@ -232,6 +266,142 @@ impl IndexStore {
         ))
     }
 
+    /// 重刷派生 refs：`idents ∩ def 名集合`（同名多 def 取首见文件为 owner），
+    /// 自环剔除，weight=√出现次数。返回写入边数。
+    ///
+    /// 全量集合运算（单连接内两读一写）；rebuild 后与每次增量替换后调用。
+    pub fn refresh_refs(&self) -> Result<usize, IndexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        // def 名 → owner 文件（首见，file 升序稳定）
+        let mut stmt = conn
+            .prepare("SELECT name, file FROM symbols ORDER BY file")
+            .map_err(|e| IndexError(format!("refresh_refs owner prepare: {e}")))?;
+        let mut owner: HashMap<String, String> = HashMap::new();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| IndexError(format!("refresh_refs owner query: {e}")))?;
+        for row in rows {
+            let (name, file) =
+                row.map_err(|e| IndexError(format!("refresh_refs owner row: {e}")))?;
+            owner.entry(name).or_insert(file);
+        }
+        drop(stmt);
+        // idents → 文件级边
+        let mut stmt = conn
+            .prepare("SELECT file, name, count FROM idents")
+            .map_err(|e| IndexError(format!("refresh_refs idents prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| IndexError(format!("refresh_refs idents query: {e}")))?;
+        let mut edges: HashMap<(String, String), f64> = HashMap::new();
+        for row in rows {
+            let (from, name, count) =
+                row.map_err(|e| IndexError(format!("refresh_refs idents row: {e}")))?;
+            if let Some(to) = owner.get(&name) {
+                if *to == from {
+                    continue; // 自环（def 文件内的自引用不成边）
+                }
+                *edges.entry((from, to.clone())).or_insert(0.0) += (count.max(0) as f64).sqrt();
+            }
+        }
+        drop(stmt);
+        // 物化写回（文件级边：to_file = owner）
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| IndexError(format!("refresh_refs tx: {e}")))?;
+        tx.execute("DELETE FROM refs", [])
+            .map_err(|e| IndexError(format!("refresh_refs clear: {e}")))?;
+        let n = edges.len();
+        for ((from, to), weight) in &edges {
+            tx.execute(
+                "INSERT INTO refs(from_file, to_file, weight) VALUES(?1, ?2, ?3)",
+                params![from, to, weight],
+            )
+            .map_err(|e| IndexError(format!("refresh_refs insert: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| IndexError(format!("refresh_refs commit: {e}")))?;
+        Ok(n)
+    }
+
+    /// 全部 refs 边（PageRank 图谱直接输入；文件级）
+    pub fn all_refs(&self) -> Result<Vec<RefRow>, IndexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT from_file, to_file, weight FROM refs")
+            .map_err(|e| IndexError(format!("all_refs prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(RefRow {
+                    from_file: r.get(0)?,
+                    to_file: r.get(1)?,
+                    weight: r.get(2)?,
+                })
+            })
+            .map_err(|e| IndexError(format!("all_refs query: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| IndexError(format!("all_refs row: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    /// 全部符号最小行集（file 升序；万级文件量级单读可承受）
+    pub fn all_symbols_min(&self) -> Result<Vec<SymbolMin>, IndexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT file, kind, name, line_start, line_end FROM symbols ORDER BY file")
+            .map_err(|e| IndexError(format!("all_symbols_min prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SymbolMin {
+                    file: r.get(0)?,
+                    kind: r.get(1)?,
+                    name: r.get(2)?,
+                    line_start: r.get(3)?,
+                    line_end: r.get(4)?,
+                })
+            })
+            .map_err(|e| IndexError(format!("all_symbols_min query: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| IndexError(format!("all_symbols_min row: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    /// 指定文件的符号行（检索结果附符号；file 升序）
+    pub fn file_symbols(&self, file: &str) -> Result<Vec<SymbolRow>, IndexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, name, line_start, line_end FROM symbols
+                 WHERE file = ?1 ORDER BY line_start",
+            )
+            .map_err(|e| IndexError(format!("file_symbols prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![file], |r| {
+                Ok(SymbolRow {
+                    kind: r.get(0)?,
+                    name: r.get(1)?,
+                    line_start: r.get(2)?,
+                    line_end: r.get(3)?,
+                })
+            })
+            .map_err(|e| IndexError(format!("file_symbols query: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| IndexError(format!("file_symbols row: {e}")))?);
+        }
+        Ok(out)
+    }
+
     /// 清空全部索引数据（rebuild 全量重建前；表结构保留）
     pub fn clear(&self) -> Result<(), IndexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -240,6 +410,7 @@ impl IndexStore {
             .map_err(|e| IndexError(format!("clear tx: {e}")))?;
         for sql in [
             "DELETE FROM refs",
+            "DELETE FROM idents",
             "DELETE FROM symbols",
             "DELETE FROM files",
         ] {
@@ -304,25 +475,99 @@ mod tests {
                 line_end: 2,
             }]
         };
-        let refs = |n: &str| {
-            vec![RefRow {
-                to_symbol: n.into(),
-                weight: 1.0,
-            }]
-        };
-        s.replace_file("a.rs", "hash-a", 100, 10, &syms("alpha"), &refs("beta"))
-            .unwrap();
+        // a.rs 定义 alpha 并引用 beta（b.rs 定义）→ 重刷后成 1 条边
+        s.replace_file(
+            "a.rs",
+            "hash-a",
+            100,
+            10,
+            &syms("alpha"),
+            &[("beta".into(), 3)],
+        )
+        .unwrap();
         s.replace_file("b.rs", "hash-b", 200, 20, &syms("beta"), &[])
             .unwrap();
+        assert_eq!(s.refresh_refs().unwrap(), 1);
         assert_eq!(s.counts().unwrap(), (2, 2, 1));
-        // 同文件重写：旧 symbols/refs 整体淘汰，不重复堆积
+        let refs = s.all_refs().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].from_file, "a.rs");
+        assert_eq!(refs[0].to_file, "b.rs");
+        assert!((refs[0].weight - 3.0f64.sqrt()).abs() < 1e-9);
+        // 同文件重写：旧 symbols/idents 整体淘汰，重刷后旧边不残留
         s.replace_file("a.rs", "hash-a2", 300, 11, &syms("alpha2"), &[])
             .unwrap();
+        assert_eq!(s.refresh_refs().unwrap(), 0);
         assert_eq!(s.counts().unwrap(), (2, 2, 0));
         let hs = s.file_hashes().unwrap();
         let a = hs.iter().find(|h| h.path == "a.rs").unwrap();
         assert_eq!(a.content_hash, "hash-a2");
         assert_eq!(a.mtime, 300);
+    }
+
+    #[test]
+    fn refresh_refs_owner_map_and_self_edge_exclusion() {
+        let (_td, s) = store();
+        let syms = |name: &str| {
+            vec![SymbolRow {
+                kind: "fn".into(),
+                name: name.into(),
+                line_start: 1,
+                line_end: 1,
+            }]
+        };
+        // a.rs 定义 alpha+dup；b.rs 定义 beta+dup；dup 的 owner 取首见文件（file 升序 = a.rs）
+        s.replace_file(
+            "a.rs",
+            "h",
+            1,
+            1,
+            &syms("alpha"),
+            &[
+                ("alpha".into(), 2), // 自环剔除
+                ("beta".into(), 4),  // → b.rs，weight=√4=2
+                ("dup".into(), 1),   // owner=a.rs，自环剔除
+            ],
+        )
+        .unwrap();
+        s.replace_file(
+            "b.rs",
+            "h",
+            1,
+            1,
+            &syms("beta"),
+            &[
+                ("beta".into(), 1),  // 自环剔除
+                ("alpha".into(), 9), // → a.rs，weight=√9=3
+            ],
+        )
+        .unwrap();
+        s.replace_file(
+            "c.rs",
+            "h",
+            1,
+            1,
+            &[],
+            &[
+                ("alpha".into(), 2), // → a.rs，√2
+                ("beta".into(), 2),  // → b.rs，√2
+                ("ghost".into(), 5), // 无 def，不成边
+            ],
+        )
+        .unwrap();
+        assert_eq!(s.refresh_refs().unwrap(), 4);
+        let refs = s.all_refs().unwrap();
+        let w = |from: &str, to: &str| -> f64 {
+            refs.iter()
+                .find(|r| r.from_file == from && r.to_file == to)
+                .map(|r| r.weight)
+                .unwrap_or_else(|| panic!("missing edge {from} -> {to}"))
+        };
+        assert!((w("a.rs", "b.rs") - 2.0).abs() < 1e-9);
+        assert!((w("b.rs", "a.rs") - 3.0).abs() < 1e-9);
+        assert!((w("c.rs", "a.rs") - 2.0f64.sqrt()).abs() < 1e-9);
+        assert!((w("c.rs", "b.rs") - 2.0f64.sqrt()).abs() < 1e-9);
+        assert!(!refs.iter().any(|r| r.from_file == r.to_file));
     }
 
     #[test]
@@ -339,12 +584,11 @@ mod tests {
                 line_start: 1,
                 line_end: 1,
             }],
-            &[RefRow {
-                to_symbol: "g".into(),
-                weight: 1.0,
-            }],
+            &[("g".into(), 2)],
         )
         .unwrap();
+        // g 无 def，重刷不成边
+        assert_eq!(s.refresh_refs().unwrap(), 0);
         s.remove_file("a.rs").unwrap();
         assert_eq!(s.counts().unwrap(), (0, 0, 0));
         // 幂等：重复删除不报错
