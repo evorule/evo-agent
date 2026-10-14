@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // Inline Chat 编排:Ctrl+K → 输入条 → POST /api/inline-chat → diff 预览 →
-// Accept(applyEdits+undo stop)/Discard。设计档 13 号 §3.3(v1 Cursor 式单模式)。
+// Accept(applyEdits+undo stop)/Discard。补全设计档 §3.3(v1 Cursor 式单模式)。
 // 治理:每次调用 pushPanelEvent gov 留痕(指令摘要+path+accepted);.evoignore
 // 命中直接拒绝并明示(零外发)。
 

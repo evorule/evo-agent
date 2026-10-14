@@ -2,7 +2,7 @@
 // Copyright (C) 2026 EvoRule Project
 // .evoignore 工作区排除文件解析(v1 gitignore 子集:注释/空行/目录前缀
 // `dir/`/扩展名 `*.ext`/简式 glob `a/*/c`)+ 路径匹配。
-// 命中文件内容零外发(拦在 prompt 组装层——治理接点,设计档 13 号 §四)。
+// 命中文件内容零外发(拦在 prompt 组装层——治理接点,补全设计档 §四)。
 
 const RULE = { NONE: 0, DIR: 1, GLOB: 2 };
 
