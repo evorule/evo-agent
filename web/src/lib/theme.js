@@ -3,7 +3,7 @@
 // 主题唯一真相源:颜色类 token 明暗两值——CSS 变量(data-theme)/Monaco
 // defineTheme/xterm theme 三通道全部从此派生(消除 monaco-setup 手工双源)。
 //
-// 纪律:dark 值=app.css :root 现值原样(106 号铁律:不改动现有深色视觉);
+// 纪律:dark 值=app.css :root 现值原样(不改动现有深色视觉);
 // light 为独立重设计(非反转;品牌色不动;语义色 hue 一致;WCAG 校验)。
 // Monaco 永不读 DOM CSS 变量(colors 仅收 hex)。
 
@@ -149,7 +149,7 @@ export function cssVariablesFor(mode) {
     .join('\n');
 }
 
-/** xterm 主题(09 号挂点;从 token 表派生)。mode 传已解析的 'dark'|'light' */
+/** xterm 主题(集成终端挂点;从 token 表派生)。mode 传已解析的 'dark'|'light' */
 export function xtermThemeFor(resolved) {
   const t = COLOR_TOKENS[resolved] || COLOR_TOKENS.dark;
   return {
@@ -181,7 +181,7 @@ export function storeMode(mode) {
   }
 }
 
-/** xterm 主题变化订阅者(GroupPane 终端无;09 号预留——B8 终端若需要可注册) */
+/** xterm 主题变化订阅者(集成终端挂点预留) */
 const themeChangeSubscribers = new Set();
 
 export function onThemeChange(fn) {
