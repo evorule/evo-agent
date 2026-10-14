@@ -1,19 +1,25 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later
 Copyright (C) 2026 EvoRule Project
 This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-分屏副组:普通文件 tab 的第二编辑器实例。与主组共享同一 model(ModelRegistry
-按 evofile:/// Uri 单源)——同文件两组编辑内容/undo 实时同步;view state 独立。
-diff/产物/设置页留在主组(轻量实现边界,完整组模型随后续批次)。 -->
+分屏副组(普通文件 tab):与主组共享同一 model(ModelRegistry 按 evofile:/// Uri
+单源)——同文件两组编辑内容/undo 实时同步;view state 按组×path 独立。
+diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 EditorGroups 重构)。 -->
 <script>
   import { onMount, onDestroy, tick } from 'svelte';
   import { get } from 'svelte/store';
   import { setupMonaco, monaco } from '../lib/monaco-setup.js';
-  import { splitPath, splitWidth, closeSplit, persistSplit, splitOpen } from '../lib/editorGroups.js';
-  import { saveTab, markDirty, markSaved, tabs } from '../lib/stores.js';
+  import { saveTab, markDirty, markSaved, tabs, closeTab, ensureTabOpen } from '../lib/stores.js';
   import { settingsState } from '../lib/settings.js';
+  import {
+    groupOpenPath,
+    groupClosePath,
+    groupFocusSignal,
+    activeGroupId,
+  } from '../lib/editorGroups.js';
   import {
     getModelForPath,
     hasModel,
+    pathOfModel,
     registerModel,
     getBaseline,
     setBaseline,
@@ -21,12 +27,26 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随后续批
   import { uriSpecFor } from '../lib/diagnostics.js';
   import { notifySaved } from '../lib/lsp/index.js';
 
+  /** 组对象({id, paths, activePath, width})——父层 each 传键控引用 */
+  export let group;
+
   let hostEl = null;
   let editor = null;
-  /** 本组 view state(path → saveViewState 快照) */
+  let hostReady = false;
+  /** 组×path view state 独立(设计档 §3.1) */
   const viewStates = new Map();
-  /** 当前挂载的 model(切走时 save view state) */
+  /** 已挂 hook 的 model(同 model 多组引用时防重复订阅) */
+  const hookedModels = new Set();
   let currentPath = null;
+  let activePathLocal = group.activePath || null;
+  let groupPaths = group.paths || [];
+
+  $: syncFromStore(group);
+  function syncFromStore(g) {
+    if (!g) return;
+    groupPaths = g.paths || [];
+    activePathLocal = g.activePath || null;
+  }
 
   function langOf(path) {
     if (path.startsWith('evo://settings/')) return 'json';
@@ -51,44 +71,57 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随后续批
     };
   }
 
-  /** 打开路径:共享 model(ModelRegistry 单源,主组已开则直接挂;否则读文件建) */
-  async function openInSplit(path) {
-    if (!path) return;
-    let model = getModelForPath(path);
-    if (!model) {
-      const tab = get(tabs).find((t) => t.path === path);
-      let content = tab?.content ?? '';
-      if (!tab) {
-        try {
-          const res = await fetch(`/api/files/read?path=${encodeURIComponent(path)}`, { headers: {} }).then((r) => r.json());
-          content = res.content ?? '';
-        } catch (e) {
-          return; // 读取失败:静默(副组不建错误占位)
-        }
+  // ---- 跨组共享建模(模块级 pending 去重:并发同路径只建一次) ----
+
+  const pendingCreations = new Map();
+
+  async function getOrCreateSharedModel(path) {
+    if (hasModel(path)) return getModelForPath(path);
+    const pending = pendingCreations.get(path);
+    if (pending) return pending;
+    const p = (async () => {
+      const tab = await ensureTabOpen(path);
+      let model = getModelForPath(path);
+      if (model) return model;
+      if (tab.error) {
+        model = monaco.editor.createModel(`无法打开文件:${path}\n\n${tab.error}`, 'plaintext');
+        registerModel(path, model);
+        setBaseline(path, '');
+        return model;
       }
+      const uri = monaco.Uri.parse(uriSpecFor(path));
       try {
-        model = monaco.editor.createModel(
-          content,
-          langOf(path),
-          monaco.Uri.parse(uriSpecFor(path)),
-        );
-      } catch (e) {
-        model = monaco.editor.getModel(monaco.Uri.parse(uriSpecFor(path))) || null;
+        model = monaco.editor.createModel(tab.content, langOf(path), uri);
+      } catch {
+        model = monaco.editor.getModel(uri) || null; // 并发建同 URI:复用
       }
-      if (!model) return;
-      model.updateOptions({ tabSize: appearance().tabSize });
+      if (!model) return null;
       registerModel(path, model);
-      if (!hasBaseline(path)) setBaseline(path, content);
+      setBaseline(path, tab.content);
+      return model;
+    })();
+    pendingCreations.set(path, p);
+    try {
+      return await p;
+    } finally {
+      pendingCreations.delete(path);
+    }
+  }
+
+  async function openInGroup(path) {
+    if (!path || !editor) return;
+    const model = await getOrCreateSharedModel(path);
+    if (!model) return;
+    if (!hookedModels.has(model)) {
+      hookedModels.add(model);
       model.onDidChangeContent(() => {
-        if (get(splitPath) === path) {
-          markDirty(path, model.getValue() !== getBaseline(path));
-        }
+        const p = pathOfModel(model);
+        if (p) markDirty(p, model.getValue() !== getBaseline(p));
       });
       model.onWillDispose(() => {
         if (editor && editor.getModel() === model) editor.setModel(null);
       });
     }
-    // 切 model 前 save 旧 view state,后 restore 新(组×path 独立)
     if (currentPath && editor.getModel()) {
       viewStates.set(currentPath, editor.saveViewState());
     }
@@ -99,12 +132,12 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随后续批
     editor.focus();
   }
 
-  function hasBaseline(path) {
-    return getBaseline(path) !== '';
+  function pathFromModel(model) {
+    return pathOfModel(model);
   }
 
   async function saveActive() {
-    const path = get(splitPath);
+    const path = group.activePath;
     if (!path || !editor) return;
     const model = getModelForPath(path);
     if (!model) return;
@@ -117,14 +150,45 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随后续批
     }
   }
 
-  function onKeydown(e) {
-    // 副组聚焦时 Ctrl+S 保存(主组实例级 addCommand 不覆盖副组)
-    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-      if (document.activeElement && hostEl?.contains(document.activeElement)) {
-        e.preventDefault();
-        saveActive();
-      }
+  function closeGroupTab(path) {
+    const { wasLastRef } = groupClosePath(group.id, path);
+    if (wasLastRef) {
+      if (currentPath === path) currentPath = null;
+      closeTab(path); // 全局最后一个引用:真正关 tab(注册表释放随 tabs.subscribe)
     }
+  }
+
+  function closeThisGroup() {
+    for (const p of [...groupPaths]) {
+      const { wasLastRef } = groupClosePath(group.id, p);
+      if (wasLastRef) closeTab(p);
+    }
+  }
+
+  function activateTab(path) {
+    groupOpenPath(group.id, path);
+    groupFocusSignal.update((s) => ({ id: group.id, n: s.n + 1 }));
+  }
+
+  function focusEditor() {
+    activeGroupId.set(group.id);
+    tick().then(() => editor?.focus());
+  }
+
+  // 焦点信号:轮到本组→聚焦编辑器
+  let lastFocusN = 0;
+  $: if ($groupFocusSignal && $groupFocusSignal.id === group.id && $groupFocusSignal.n !== lastFocusN) {
+    lastFocusN = $groupFocusSignal.n;
+    tick().then(() => editor?.focus());
+  }
+  // 成为激活组→聚焦
+  let wasActive = false;
+  $: {
+    const isActive = $activeGroupId === group.id;
+    if (isActive && !wasActive && hostReady) {
+      tick().then(() => editor?.focus());
+    }
+    wasActive = isActive;
   }
 
   onMount(() => {
@@ -143,29 +207,45 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随后续批
       scrollBeyondLastLine: false,
     });
     editor.onDidChangeModelContent(() => {
-      const path = get(splitPath);
+      const path = currentPath;
       const model = getModelForPath(path);
       if (model && editor.getModel() === model) {
         markDirty(path, model.getValue() !== getBaseline(path));
       }
     });
-    window.addEventListener('keydown', onKeydown);
+    hostReady = true;
+    if (group.activePath) openInGroup(group.activePath);
   });
 
-  // 三者就绪即开(hostEl 绑定/editor 实例/路径)——单一响应语句,免订阅时序耦合
-  $: if (hostEl && editor && $splitPath) openInSplit($splitPath);
+  // 组内激活路径变化(父层 store 驱动)→ 打开该路径
+  $: if (hostReady && group && group.activePath && group.activePath !== currentPath) {
+    openInGroup(group.activePath);
+  }
 
   onDestroy(() => {
     if (editor) editor.dispose();
   });
 </script>
 
-<svelte:window on:keydown={(e) => { if ((e.ctrlKey || e.metaKey) && e.key === 's' && hostEl?.contains(document.activeElement)) { e.preventDefault(); saveActive(); } }} />
-
-<div class="group-pane">
+<div class="group-pane" onmousedown={() => focusEditor()} role="presentation">
   <div class="gp-tabbar">
-    <span class="gp-title mono">{$splitPath ? ($splitPath.split('/').pop() || $splitPath) : '空'}</span>
-    <button class="gp-close" onclick={() => closeSplit()} title="关闭分屏">×</button>
+    <div class="gp-tabs">
+      {#each groupPaths as p (p)}
+        <button class="gp-tab" class:active={p === activePathLocal} onclick={() => activateTab(p)} title={p}>
+          {(p.split('/').pop() || p)}
+          {#if $tabs.find((t) => t.path === p)?.dirty}<span class="gp-dirty">●</span>{/if}
+          <span
+            class="gp-tab-close"
+            role="button"
+            tabindex="-1"
+            title="关闭"
+            onclick={(e) => { e.stopPropagation(); closeGroupTab(p); }}
+            onkeydown={(e) => e.key === 'Enter' && closeGroupTab(p)}
+          >×</span>
+        </button>
+      {/each}
+    </div>
+    <button class="gp-group-close" onclick={closeThisGroup} title="关闭本组">×</button>
   </div>
   <div class="gp-host" bind:this={hostEl}></div>
 </div>
@@ -185,25 +265,52 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随后续批
     border-bottom: 1px solid var(--accent);
     display: flex;
     flex-shrink: 0;
+    gap: 6px;
     justify-content: space-between;
     padding: 3px 8px;
   }
-  .gp-title {
-    color: var(--fg);
+  .gp-tabs {
+    display: flex;
+    gap: 4px;
+    min-width: 0;
+    overflow-x: auto;
+  }
+  .gp-tab {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg-dim);
+    cursor: pointer;
     font-size: 12px;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    padding: 2px 8px;
     white-space: nowrap;
   }
-  .gp-close {
+  .gp-tab.active {
+    border-color: var(--accent);
+    color: var(--fg);
+  }
+  .gp-dirty {
+    color: #e3b341;
+    font-size: 9px;
+    margin-left: 2px;
+  }
+  .gp-tab-close {
+    color: var(--fg-dim);
+    cursor: pointer;
+    margin-left: 6px;
+  }
+  .gp-tab-close:hover {
+    color: #f85149;
+  }
+  .gp-group-close {
     background: transparent;
     border: none;
     color: var(--fg-dim);
     cursor: pointer;
     font-size: 14px;
   }
-  .gp-close:hover {
-    color: var(--fg);
+  .gp-group-close:hover {
+    color: #f85149;
   }
   .gp-host {
     flex: 1;

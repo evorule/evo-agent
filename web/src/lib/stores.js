@@ -149,6 +149,30 @@ export async function openFile(path, reveal = null) {
   }
 }
 
+/** 确保全局 tab 存在(不激活主组;分屏副组开文件用)。返回 tab 对象或错误占位 */
+export async function ensureTabOpen(path) {
+  const existing = get(tabs).find((t) => t.path === path);
+  if (existing) return existing;
+  const name = path.split('/').pop() || path;
+  try {
+    const res = await readFile(path);
+    const content = res.content ?? '';
+    let added = null;
+    tabs.update((list) => {
+      added = { path, name, content, dirty: false, error: null };
+      return [...list, added];
+    });
+    return added;
+  } catch (e) {
+    let added = null;
+    tabs.update((list) => {
+      added = { path, name, content: '', dirty: false, error: String(e?.message || e) };
+      return [...list, added];
+    });
+    return added;
+  }
+}
+
 /** 关闭 tab:返回相邻 tab 路径(若关的是激活 tab) */
 export function closeTab(path) {
   let next = null;
