@@ -248,3 +248,19 @@ export function gitCommit(message) {
 export function gitIdentity() {
   return fetch('/api/git/identity', { headers: headers() }).then(unwrap);
 }
+
+/** B14 语义索引:符号名检索(PageRank 排序;q 必填,limit 缺省 20 封顶 100) */
+export function indexSearch(q, limit = 20) {
+  const p = new URLSearchParams({ q, limit: String(limit) });
+  return fetch(`/api/index/search?${p}`, { headers: headers() }).then(unwrap);
+}
+
+/** B14 语义索引:就绪度与计数({files, symbols, refs, building, ready, ...}) */
+export function indexStatus() {
+  return fetch('/api/index/status', { headers: headers() }).then(unwrap);
+}
+
+/** B14 语义索引:全量重建(同步;在建 409) */
+export function indexRebuild() {
+  return fetch('/api/index/rebuild', { method: 'POST', headers: headers() }).then(unwrap);
+}

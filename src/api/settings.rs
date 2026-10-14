@@ -463,6 +463,16 @@ pub fn schema() -> Vec<SettingEntry> {
             description: "@引用终端时携带的输出尾部行数",
             scope: "window",
         },
+        SettingEntry {
+            key: "index.enabled",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "工作台",
+            description: "代码库语义索引（符号图谱检索，/api/index/*；默认关——开启后 serve 启动时对工作区建索引并持续增量维护，重启生效）",
+            scope: "window",
+        },
     ]
 }
 
@@ -773,7 +783,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 37); // 计数锁:新增键须同步(scheme 单源纪律)
+        assert_eq!(settings.len(), 38); // 计数锁:新增键须同步(scheme 单源纪律)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -826,6 +836,8 @@ mod tests {
         // mentions.* @上下文引用 2 键(B13 消费:文件降级大纲/终端尾部行数)
         assert_eq!(settings["mentions.maxFileLines"], json!(600));
         assert_eq!(settings["mentions.terminalLines"], json!(200));
+        // index.enabled 默认关:后台索引为重资源行为,显式开启(重启生效)
+        assert_eq!(settings["index.enabled"], json!(false));
         for (k, v) in &sources {
             assert_eq!(v, &json!("default"), "key {k} should be default");
         }

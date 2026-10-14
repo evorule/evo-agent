@@ -1870,7 +1870,7 @@ fn cmd_serve(
             evo_agent::Metrics::inc_safety_audit_hit(&m, rule);
         });
     }
-    let state = AgentApiState::new_with_metrics(
+    let mut state = AgentApiState::new_with_metrics(
         definitions,
         evorule_client,
         metrics,
@@ -1888,6 +1888,53 @@ fn cmd_serve(
     // serve 面各请求路径的 handler 构造与 CLI 共用同一解析产物,
     // 不再绕过配置体系直读裸环境变量
     .with_llm_config(config.llm.clone());
+
+    // B14 语义索引:按 index.enabled 设置键决定是否启动(默认关,显式开启;
+    // 重启生效——服务与 watcher 均 serve 生命周期一次性装配)
+    {
+        let (merged, _) = state.workbench_settings().merged();
+        let index_enabled = merged
+            .get("index.enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if index_enabled {
+            match evo_agent::index::IndexService::open(workdir) {
+                Ok(svc) => {
+                    let svc = std::sync::Arc::new(svc);
+                    // 启动对账(全盘哈希+解析可能秒级):后台线程执行,不阻塞 bind;
+                    // 差量对账复用 reconcile_sync(首启空库=全量灌入)
+                    {
+                        let bg = std::sync::Arc::clone(&svc);
+                        let spawned = std::thread::Builder::new()
+                            .name("index-reconcile".into())
+                            .spawn(move || match bg.reconcile_sync() {
+                                Ok((a, u, r)) => {
+                                    eprintln!("[index] startup reconcile: +{a} ~{u} -{r}")
+                                }
+                                Err(e) => eprintln!("[index] startup reconcile failed: {e}"),
+                            });
+                        if spawned.is_err() {
+                            eprintln!("[index] startup reconcile thread spawn failed");
+                        }
+                    }
+                    match svc.spawn_watcher() {
+                        Ok(()) => eprintln!(
+                            "[index] watcher started (debounce {}ms)",
+                            evo_agent::index::INDEX_DEBOUNCE_MS
+                        ),
+                        Err(e) => {
+                            eprintln!("[index] watcher start failed (incremental disabled): {e}")
+                        }
+                    }
+                    state = state.with_index(svc);
+                    eprintln!("[index] semantic index enabled (index.enabled=true)");
+                }
+                Err(e) => eprintln!("[index] service init failed (index disabled): {e}"),
+            }
+        } else {
+            eprintln!("[index] disabled (index.enabled=false, /api/index/* returns 503)");
+        }
+    }
 
     // 工作台文件树实时刷新:启动 workdir 递归监听(400ms 去抖 + 规整),
     // 变更经 WS 广播(fs_events 帧)。fail-soft:启动失败仅告警,文件树
