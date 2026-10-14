@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // AI 行内补全:Monaco inline completions provider + 200ms debounce + 抑制矩阵
-// + 去重缓存 + .evoignore 排除(设计档 13 号 §3.3)。
+// + 去重缓存 + .evoignore 排除(补全设计档 §3.3)。
 //
 // 交互收敛三键:Tab 接受/Esc 拒/继续打字作废(抑制矩阵:粘贴·撤销·仅空白
 // 变化跳过;IntelliSense 弹出由 suggestWidgetVisible 让位)。

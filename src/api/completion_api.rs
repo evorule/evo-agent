@@ -163,7 +163,7 @@ pub async fn completion(
 
     // 补全形态:自然语言指令(设计偏离——PSM token 形态经 MiniMax-M2.5 真机
     // 实测返回空,对话型模型不认识 FIM token;chat 指令形态实测有效,详见
-    // 13 号设计变更记录)。suffix 作为续写上下文给出,不直接拼接。
+    // 补全设计档的实施期变更记录)。suffix 作为续写上下文给出,不直接拼接。
     let messages = vec![
         json!({
             "role": "system",
