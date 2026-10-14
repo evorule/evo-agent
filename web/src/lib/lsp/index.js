@@ -19,6 +19,7 @@ import {
   diagnosticsToMarkers,
   makeKindResolver,
   setWorkdirBase,
+  uriToRelativeForJump,
 } from './features.js';
 
 /** Failed 态横幅({lang, serverName, detail} | null):App.svelte 消费 */
@@ -286,6 +287,35 @@ export async function requestDocumentSymbol(path, model) {
   } catch {
     return null;
   }
+}
+
+/**
+ * workspace/symbol 按需查询(@上下文符号候选消费):遍历已就绪语言门并发
+ * 查询,SymbolInformation 归一化为 {name, kind, path, line}(path 经
+ * workdirBase 截取为工作区相对路径,line 1-based)。
+ * 返回 null = 无可用门(lsp.enabled=false 或无就绪 client,调用方走
+ * symbolStore 本地兜底);[] = 门就绪但无结果。
+ */
+export async function requestWorkspaceSymbol(query) {
+  if (!enabled) return null;
+  const ready = [...clients.values()].filter((c) => c.state === LSP_STATES.READY);
+  if (!ready.length) return null;
+  const out = [];
+  for (const client of ready) {
+    try {
+      const syms = await client.rpc.request('workspace/symbol', { query }, 8_000);
+      if (!Array.isArray(syms)) continue;
+      for (const s of syms) {
+        const path = uriToRelativeForJump(s?.location?.uri);
+        const ln = s?.location?.range?.start?.line;
+        if (!path || typeof s?.name !== 'string' || !Number.isFinite(ln)) continue;
+        out.push({ name: s.name, kind: s.kind, path, line: ln + 1 });
+      }
+    } catch {
+      /* 单门失败不阻断其他门 */
+    }
+  }
+  return out;
 }
 
 export { LSP_STATES, pathToFileUri };

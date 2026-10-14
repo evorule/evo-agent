@@ -17,7 +17,8 @@
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
   import { approveProposal, listResumableRuns } from '../lib/api.js';
-  import { onMount, tick } from 'svelte';
+  import { onMount, onDestroy, tick } from 'svelte';
+  import { registerCommand, unregisterCommand } from '../lib/commands.js';
   import { collectCandidates, MENTION_GROUP_LABELS, estimateTokens, tokenLevel } from '../lib/mentions.js';
   import { highlightSegments } from '../lib/fuzzy.js';
   import { registerMentionProviders, reconcileMentions } from '../lib/mentionProviders.js';
@@ -39,9 +40,27 @@
   onMount(() => {
     registerMentionProviders();
     registerMentionSourceProviders();
+    registerCommand({
+      id: 'chat.addContext',
+      title: '聊天:插入 @ 上下文引用',
+      category: '聊天',
+      run: openMentionPopup,
+    });
     refreshSessions();
     loadResumable();
   });
+
+  onDestroy(() => {
+    unregisterCommand('chat.addContext');
+  });
+
+  /** 命令入口:聚焦输入框并打开 @ 弹层(空查询=快捷项视角) */
+  function openMentionPopup() {
+    const el = draftEl;
+    if (!el) return;
+    el.focus();
+    openMention('', el.selectionStart ?? draft.length);
+  }
 
   async function loadResumable() {
     try {
@@ -463,6 +482,9 @@
                   <span class:hit={seg.hit}>{seg.text}</span>
                 {/each}
               </span>
+              {#if c.warn}
+                <span class="m-warn" title="疑似敏感文件(密钥/凭据),引用前请自行确认">⚠</span>
+              {/if}
               <span class="m-kind">{MENTION_GROUP_LABELS[c.type] || c.type}</span>
             </button>
           {/each}
@@ -918,6 +940,11 @@
     flex-shrink: 0;
     font-size: 10px;
     color: var(--text-muted);
+  }
+  .m-warn {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--warning);
   }
   .m-empty {
     padding: var(--sp-sm);

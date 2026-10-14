@@ -17,7 +17,7 @@ import { ensureFileIndex } from './stores.js';
 import { registerProvider, xmlBlock } from './mentions.js';
 import { fuzzyMatchPath } from './fuzzy.js';
 import { getModelForPath } from './modelRegistry.js';
-import { symbolStore } from './lsp/index.js';
+import { requestWorkspaceSymbol, symbolStore } from './lsp/index.js';
 import { getSetting } from './settings.js';
 
 const CANDIDATE_LIMIT = 50;
@@ -46,6 +46,18 @@ const SYM_KIND = {
   14: 'const',
 };
 
+// 符号候选:上限与上下文窗口(@符号 = 符号行 ±SYMBOL_CONTEXT 行)
+const SYMBOL_LIMIT = 30;
+const SYMBOL_CONTEXT = 30;
+
+/** 敏感文件名模式(命中仅标 ⚠ 提示,可见可选不拦) */
+const SENSITIVE_RE = /(^|[/\\.])(\.env|id_rsa|credential|secret|token)|\.pem$/i;
+
+/** 路径是否命中敏感文件名(候选标 ⚠;判断口径:名段或扩展名关键词) */
+export function isSensitivePath(path) {
+  return SENSITIVE_RE.test(String(path || ''));
+}
+
 /** 纯排序:对索引做模糊匹配打分(basename 加权,路径短 tiebreak),截取前 limit。
  *  空查询按路径字典序取前 limit(让位给弹层快捷项) */
 export function rankFiles(index, query, limit = CANDIDATE_LIMIT) {
@@ -63,13 +75,15 @@ export function rankFiles(index, query, limit = CANDIDATE_LIMIT) {
 }
 
 function toCandidate(e) {
-  return {
+  const c = {
     type: e.isDir ? 'folder' : 'file',
     ref: e.path,
     label: e.name,
     detail: e.path,
     positions: [],
   };
+  if (!e.isDir && isSensitivePath(e.path)) c.warn = true;
+  return c;
 }
 
 async function candidates(query) {
@@ -230,10 +244,96 @@ async function collectFolder(m) {
 
 const provider = { candidates, collect, serialize };
 
+// ---- 符号 provider(@上下文符号引用) ----
+
+/** symbolStore 存档(DocumentSymbol 树)→ 扁平 {name, kind, path, line} 列表 */
+function collectLocalSymbols(syms, path, depth, out) {
+  if (depth > 3 || out.length > 500) return;
+  for (const s of Array.isArray(syms) ? syms : []) {
+    if (!s || typeof s.name !== 'string') continue;
+    const range = s.range || s.location?.range;
+    const line = range?.start?.line != null ? range.start.line + 1 : 1;
+    out.push({ name: s.name, kind: s.kind, path, line });
+    if (Array.isArray(s.children)) collectLocalSymbols(s.children, path, depth + 1, out);
+  }
+}
+
+async function symbolCandidates(query) {
+  const q = String(query || '').trim();
+  if (!q) return [];
+  // 首选:语言门 workspace/symbol 活查询;无可用门 → symbolStore 本地兜底
+  let hits = await requestWorkspaceSymbol(q);
+  if (!hits) {
+    hits = [];
+    for (const [path, syms] of get(symbolStore)) collectLocalSymbols(syms, path, 0, hits);
+  }
+  const scored = [];
+  for (const s of hits) {
+    const hit = fuzzyMatchPath(q, s.name);
+    if (hit) scored.push({ s, hit });
+  }
+  scored.sort((a, b) => b.hit.score - a.hit.score || (a.s.path < b.s.path ? -1 : 1));
+  return scored.slice(0, SYMBOL_LIMIT).map(({ s, hit }) => ({
+    type: 'symbol',
+    ref: `${s.path}:${s.line}`,
+    label: s.name,
+    detail: `${s.path}:${s.line}`,
+    positions: hit.positions,
+  }));
+}
+
+/** 符号上下文抓取:ref = `${path}:${line}`,取符号行 ±SYMBOL_CONTEXT 行 */
+async function collectSymbol(m) {
+  const at = String(m.ref || '').lastIndexOf(':');
+  if (at <= 0) return null;
+  const path = m.ref.slice(0, at);
+  const line = parseInt(m.ref.slice(at + 1), 10);
+  if (!Number.isFinite(line) || line < 1) return null;
+  // 已打开走编辑器实况(未保存内容可见);否则读盘
+  let allLines = null;
+  const model = getModelForPath(path);
+  if (model?.getLineCount) {
+    const n = model.getLineCount();
+    allLines = [];
+    for (let ln = 1; ln <= n; ln++) allLines.push(model.getLineContent(ln));
+  } else {
+    const res = await readFile(path);
+    allLines = (res.content ?? '') ? res.content.split('\n') : [];
+  }
+  if (!allLines.length) return null;
+  const from = Math.max(1, line - SYMBOL_CONTEXT);
+  const to = Math.min(allLines.length, line + SYMBOL_CONTEXT);
+  return {
+    path,
+    content: allLines.slice(from - 1, to).join('\n'),
+    startLine: from,
+    endLine: to,
+    lineCount: allLines.length,
+  };
+}
+
+function serializeSymbol(m, c) {
+  return {
+    xml: xmlBlock(
+      'symbol_context',
+      { path: c.path, lines: `${c.startLine}-${c.endLine}`, total_lines: c.lineCount },
+      c.content,
+    ),
+    summary: `${c.path}:${c.startLine}-${c.endLine}/${c.lineCount}(符号上下文)`,
+  };
+}
+
+const symbolProvider = {
+  candidates: symbolCandidates,
+  collect: collectSymbol,
+  serialize: serializeSymbol,
+};
+
 /** 注册内置 provider(ChatSidebar 挂载时调用;重复调用按注册表语义幂等替换) */
 export function registerMentionProviders() {
   registerProvider('file', provider);
   registerProvider('folder', provider);
+  registerProvider('symbol', symbolProvider);
 }
 
 // ---- 发送前对账(文本 × mentions 元数据) ----
