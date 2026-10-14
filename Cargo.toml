@@ -110,6 +110,9 @@ notify-debouncer-full = "0.5"
 # B3 Git 基础面:libgit2 官方绑定(statuses 双态/rename/blob 读取/stage/reset_default/
 # checkout_index/commit);hooks 保真走 git CLI 子进程回退(见 src/git/mod.rs)
 git2 = "0.20"
+tree-sitter = "0.27.1"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
 
 [dependencies.serde_with]
 version = "3"
