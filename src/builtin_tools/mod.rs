@@ -46,6 +46,7 @@
 
 pub mod accounting;
 pub mod delegate_tool;
+pub mod exfil_scan;
 pub mod file_create;
 pub mod file_delete;
 pub mod file_list;
@@ -58,8 +59,8 @@ pub mod grep_files;
 pub mod http_get;
 pub mod net_guard;
 pub mod search_files;
-pub mod shell_net_guard;
 pub mod shell_exec;
+pub mod shell_net_guard;
 pub mod skill_read;
 
 use std::path::Path;
