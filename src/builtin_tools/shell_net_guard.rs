@@ -104,7 +104,9 @@ pub const SHELL_NET_ALLOWED_DOMAINS: &[&str] = &[
 /// 单次网络命令命中：命令词形 + 提取的目标域（`unresolved`＝零目标可提取）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellNetHit {
+    /// 命中命令词形（首 token，如 curl/wget/nc）
     pub command: String,
+    /// 提取的目标域（`unresolved`＝零目标可提取）
     pub target: String,
 }
 
@@ -166,7 +168,7 @@ fn trim_shell_noise(s: &str) -> &str {
     s.trim_matches(|c| {
         matches!(
             c,
-            '"' | '\'' | '`' | ';' | '&' | '|' | '(' | ')' | '<' | '>' | ',' | ';'
+            '"' | '\'' | '`' | ';' | '&' | '|' | '(' | ')' | '<' | '>' | ','
         )
     })
 }
@@ -176,9 +178,7 @@ fn trim_shell_noise(s: &str) -> &str {
 pub(crate) fn extract_url_host(token: &str) -> Option<String> {
     let pos = token.find("://")?;
     let rest = &token[pos + 3..];
-    let end = rest
-        .find(|c| c == '/' || c == '?' || c == '#' || c == '\\')
-        .unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
     let auth = trim_shell_noise(&rest[..end]);
     // userinfo：取最后 @ 之后
     let host = auth.rsplit('@').next().unwrap_or(auth);

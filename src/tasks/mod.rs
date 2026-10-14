@@ -66,10 +66,12 @@ impl TaskRun {
         self.finished.store(true, Ordering::SeqCst);
     }
 
+    /// 是否已达终态(finish 后恒真)
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::SeqCst)
     }
 
+    /// 退出码(未达终态返回 None)
     pub fn exit_code(&self) -> Option<i32> {
         if self.is_finished() {
             Some(self.exit_code.load(Ordering::SeqCst))
@@ -78,6 +80,7 @@ impl TaskRun {
         }
     }
 
+    /// 终态是否经由取消路径进入(非取消的正常收尾=false)
     pub fn was_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
