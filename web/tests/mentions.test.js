@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import {
   MENTION_GROUPS,
   registerProvider,
   getProvider,
   registeredTypes,
+  resetProviders,
   assembleContext,
+  collectCandidates,
   xmlEscape,
   xmlBlock,
   estimateTokens,
@@ -160,6 +162,81 @@ describe('xml 工具', () => {
 
   it('xmlBlock 属性值转义且 null 属性省略', () => {
     expect(xmlBlock('t', { p: 'a"b', q: null }, 'x')).toBe('<t p="a&quot;b">\nx\n</t>');
+  });
+});
+
+describe('collectCandidates', () => {
+  // 注册表为模块单例:本组涉及全局截取/分组顺序断言,先清场保证隔离
+  beforeEach(() => {
+    resetProviders();
+  });
+
+  function staticProvider(items) {
+    return {
+      calls: 0,
+      async candidates() {
+        this.calls++;
+        return items;
+      },
+      async collect() {
+        return null;
+      },
+      serialize() {
+        return null;
+      },
+    };
+  }
+
+  it('同实例多类型注册只询问一次,分组按 MENTION_GROUPS 顺序', async () => {
+    const p = staticProvider([
+      { type: 'folder', ref: 'src', label: 'src', detail: 'src', positions: [] },
+      { type: 'file', ref: 'a.rs', label: 'a.rs', detail: 'a.rs', positions: [] },
+    ]);
+    registerProvider('file', p);
+    registerProvider('folder', p);
+    const { groups } = await collectCandidates('a');
+    expect(p.calls).toBe(1);
+    expect(groups.map((g) => g.type)).toEqual(['file', 'folder']);
+    expect(groups[0].label).toBe('文件');
+    expect(groups[0].items[0].ref).toBe('a.rs');
+  });
+
+  it('全局 limit 截取并置 truncated', async () => {
+    const items = Array.from({ length: 60 }, (_, i) => ({
+      type: 'file',
+      ref: `f${i}.rs`,
+      label: `f${i}`,
+      detail: '',
+      positions: [],
+    }));
+    registerProvider('solo', staticProvider(items));
+    const { groups, total, truncated } = await collectCandidates('', {}, 50);
+    expect(total).toBe(60);
+    expect(truncated).toBe(true);
+    expect(groups[0].items).toHaveLength(50);
+  });
+
+  it('candidates 抛错的 provider 不阻断其余', async () => {
+    registerProvider('boom2', {
+      candidates() {
+        throw new Error('x');
+      },
+      collect: async () => null,
+      serialize: () => null,
+    });
+    registerProvider('calm', staticProvider([{ type: 'file', ref: 'b.rs', label: 'b', detail: '', positions: [] }]));
+    const { groups, total } = await collectCandidates('');
+    expect(total).toBeGreaterThanOrEqual(1);
+    expect(groups.some((g) => g.items.some((it) => it.ref === 'b.rs'))).toBe(true);
+  });
+
+  it('未注册进 MENTION_GROUPS 的类型排在已知组之后,标签用 type 原文', async () => {
+    registerProvider('widgets', staticProvider([{ type: 'widget', ref: 'w1', label: 'w', detail: '', positions: [] }]));
+    const { groups } = await collectCandidates('');
+    const w = groups.find((g) => g.type === 'widget');
+    expect(w).toBeTruthy();
+    expect(w.label).toBe('widget');
+    expect(groups[groups.length - 1].type).toBe('widget');
   });
 });
 

@@ -7,6 +7,7 @@ import { get } from 'svelte/store';
 
 vi.mock('../src/lib/api.js', () => ({
   listSessions: vi.fn(async () => []),
+  listDir: vi.fn(async () => ({ entries: [] })),
   readFile: vi.fn(async () => ({ content: '' })),
   writeFile: vi.fn(async () => ({})),
   getAgentDef: vi.fn(async () => ({})),
@@ -16,8 +17,18 @@ vi.mock('../src/lib/api.js', () => ({
   putWorkbenchSetting: vi.fn(async () => ({})),
 }));
 
-import { sidebarView, pendingReveal, openFile, tabs, activePath } from '../src/lib/stores.js';
-import { readFile } from '../src/lib/api.js';
+import {
+  sidebarView,
+  pendingReveal,
+  openFile,
+  tabs,
+  activePath,
+  fileIndex,
+  fileIndexReady,
+  ensureFileIndex,
+  fsEvents,
+} from '../src/lib/stores.js';
+import { readFile, listDir } from '../src/lib/api.js';
 
 // stores 为模块单例,跨用例重置本组涉及的状态
 beforeEach(() => {
@@ -65,5 +76,67 @@ describe('openFile reveal 信号', () => {
     expect(get(tabs)).toHaveLength(1);
     expect(get(tabs)[0].error).toBe('boom');
     expect(get(pendingReveal)).toBeNull();
+  });
+});
+
+// ---- @上下文文件索引(B13)----
+
+function mockTree(tree) {
+  vi.mocked(listDir).mockImplementation(async (dir = '') => ({ entries: tree[dir] || [] }));
+}
+
+describe('ensureFileIndex', () => {
+  it('懒 BFS 建索引:排除目录只留入口不下钻', async () => {
+    mockTree({
+      '': [
+        { name: 'src', kind: 'dir' },
+        { name: 'node_modules', kind: 'dir' },
+        { name: 'README.md', kind: 'file' },
+      ],
+      src: [
+        { name: 'lib', kind: 'dir' },
+        { name: 'main.rs', kind: 'file' },
+      ],
+      'src/lib': [{ name: 'fuzzy.js', kind: 'file' }],
+      node_modules: [{ name: 'x.js', kind: 'file' }],
+    });
+    const idx = await ensureFileIndex(true);
+    const paths = idx.map((e) => e.path);
+    expect(paths).toContain('README.md');
+    expect(paths).toContain('src');
+    expect(paths).toContain('src/lib/fuzzy.js');
+    expect(paths).toContain('node_modules'); // 入口保留,可被 @ 搜到
+    expect(paths).not.toContain('node_modules/x.js'); // 但不下钻
+    expect(idx.find((e) => e.path === 'src/lib').isDir).toBe(true);
+    expect(get(fileIndexReady)).toBe(true);
+    expect(get(fileIndex)).toEqual(idx);
+  });
+
+  it('已就绪且未陈旧时直接复用快照(不再列目录)', async () => {
+    mockTree({ '': [{ name: 'a.rs', kind: 'file' }] });
+    await ensureFileIndex(true);
+    const calls = vi.mocked(listDir).mock.calls.length;
+    await ensureFileIndex();
+    expect(vi.mocked(listDir).mock.calls.length).toBe(calls);
+  });
+
+  it('fs_events 触发后置陈旧,下次 ensure 重建', async () => {
+    mockTree({ '': [{ name: 'a.rs', kind: 'file' }] });
+    await ensureFileIndex(true);
+    const calls = vi.mocked(listDir).mock.calls.length;
+    fsEvents.set({ added: ['b.rs'], updated: [], removed: [], moved: [] });
+    fsEvents.set(null); // 消费方置空(一次性信号)
+    await ensureFileIndex();
+    expect(vi.mocked(listDir).mock.calls.length).toBeGreaterThan(calls);
+  });
+
+  it('目录读取失败跳过不致命', async () => {
+    vi.mocked(listDir).mockImplementation(async (dir = '') => {
+      if (dir === 'bad') throw new Error('denied');
+      return { entries: dir === '' ? [{ name: 'bad', kind: 'dir' }, { name: 'ok.rs', kind: 'file' }] : [] };
+    });
+    const idx = await ensureFileIndex(true);
+    expect(idx.map((e) => e.path)).toContain('ok.rs');
+    expect(idx.map((e) => e.path)).toContain('bad');
   });
 });
