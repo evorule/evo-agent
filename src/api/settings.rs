@@ -344,6 +344,26 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "window",
         },
         SettingEntry {
+            key: "completion.enabled",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "AI",
+            description: "AI 行内补全（ghost text；打字停顿自动触发，内容外发至当前 LLM 配置端点；.evoignore 命中文件零外发）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "inlineChat.enabled",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "AI",
+            description: "AI Inline Chat（编辑器内 Ctrl+K 显式触发改写；每次调用留痕治理日志；.evoignore 命中文件零外发）",
+            scope: "window",
+        },
+        SettingEntry {
             key: "task.autoRevealProblems",
             kind: SettingType::Boolean,
             default: json!(true),
@@ -733,7 +753,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 33); // 计数锁:新增键须同步(scheme 单源纪律)
+        assert_eq!(settings.len(), 35); // 计数锁:新增键须同步(scheme 单源纪律)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));

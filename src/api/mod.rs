@@ -7,6 +7,7 @@
 pub mod agent_api;
 pub mod api_core;
 pub mod auth;
+pub mod completion_api;
 pub mod console_sidecar;
 pub mod evorule_client;
 pub mod file_api;
