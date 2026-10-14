@@ -2,14 +2,15 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! 代码库语义索引（B14，v1 结构面）—— 对工作区源码建符号图谱并提供统一
-//! 检索入口 `/api/index/*`（search/status/rebuild）。
+//! 代码库语义索引（B14，结构面 v1 + 语义面 v1.x）—— 对工作区源码建符号图谱
+//! 与 chunk 向量面，并提供统一检索入口 `/api/index/*`（search/status/rebuild）。
 //!
-//! 模块五件（15 号 §3.2，与 [`crate::mcp`] 独立子系统先例同款组织）：
-//! - [`store`]：SQLite 持久层（files/symbols/idents/refs，单写者纪律）；
+//! 模块六件（15 号 §3.2 + PR-5 语义面，与 [`crate::mcp`] 独立子系统先例同款组织）：
+//! - [`store`]：SQLite 持久层（files/symbols/idents/refs/chunks/vectors，单写者纪律）；
 //! - [`chunker`]：工作区遍历（双层 ignore）+ 内容哈希；
 //! - [`symbols`]：tree-sitter 符号抽取 + chunk 切分；
 //! - [`graph`]：PageRank 图谱检索排序；
+//! - [`embedder`]：语义面文本嵌入器抽象（fastembed 实现随 PR-5b 落地）；
 //! - [`search_api`]：HTTP 处理器；本文件承载 [`IndexService`] 编排层。
 //!
 //! 治理面（15 号 §四）：serve 本地后台行为，无 agent 工具执行、无 shell/写
@@ -29,6 +30,7 @@
 //! 等价生效（SKIP_EXTS 与密钥类扩展均不在语言路由表内，天然双拦）。
 
 pub mod chunker;
+pub mod embedder;
 pub mod graph;
 pub mod search_api;
 pub mod store;
@@ -42,11 +44,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::index::chunker::{FileEntry, MAX_FILE_BYTES};
+use crate::index::embedder::TextEmbedder;
 use crate::index::graph::SymbolGraph;
-use crate::index::store::IndexError;
+use crate::index::store::{ChunkRow, IndexError};
 
 pub use chunker::{collect_workspace_files, DEFAULT_EXCLUDES, SKIP_EXTS};
-pub use store::{FileHash, IndexStore, RefRow, SymbolMin, SymbolRow};
+pub use store::{ChunkVectorRow, FileHash, IndexStore, RefRow, SymbolMin, SymbolRow};
 
 /// watcher 去抖窗口（毫秒；fs_watch 400ms 的编辑场景近似值，索引侧收敛略缓）
 pub const INDEX_DEBOUNCE_MS: u64 = 500;
@@ -86,6 +89,10 @@ pub struct IndexStatusSnapshot {
     pub symbols: u64,
     /// 引用边数
     pub refs: u64,
+    /// chunk 总数（边界元数据；语义面就绪度输入）
+    pub chunks: u64,
+    /// 已产出向量数
+    pub vectors: u64,
     /// 重建进行中
     pub building: bool,
     /// 图谱已就绪（可检索）
@@ -115,6 +122,8 @@ pub struct IndexService {
     store: IndexStore,
     /// 图谱不可变快照（重建即整体替换；读侧克隆 `Arc` 无锁滞留）
     graph: RwLock<Arc<SymbolGraph>>,
+    /// 语义面嵌入器（None = 语义面关闭：chunk 照常落库，向量留空）
+    embedder: Option<Arc<dyn TextEmbedder>>,
     /// 全量重建进行中（并发护栏）
     building: AtomicBool,
     /// 在途增量批计数（防事件风暴下线程堆积）
@@ -147,10 +156,22 @@ impl IndexService {
             workdir: workdir.to_path_buf(),
             store,
             graph: RwLock::new(Arc::new(SymbolGraph::build(&[], &[], &HashMap::new()))),
+            embedder: None,
             building: AtomicBool::new(false),
             in_flight: AtomicU64::new(0),
             slow: Mutex::new(SlowState::default()),
         })
+    }
+
+    /// 注入语义面嵌入器（开启语义面；随 serve 启动按设置键装配）
+    pub fn with_embedder(mut self, embedder: Arc<dyn TextEmbedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// 语义面嵌入器（None = 语义面关闭）
+    pub fn embedder(&self) -> Option<&Arc<dyn TextEmbedder>> {
+        self.embedder.as_ref()
     }
 
     /// 持久层引用（对账/计数复用）
@@ -176,6 +197,8 @@ impl IndexService {
             files,
             symbols,
             refs,
+            chunks: self.store.chunk_count().unwrap_or(0),
+            vectors: self.store.vector_count().unwrap_or(0),
             building: self.building.load(Ordering::SeqCst),
             ready: !self.graph().is_empty(),
             last_build_epoch: slow.last_build_epoch,
@@ -183,7 +206,7 @@ impl IndexService {
         }
     }
 
-    /// 单文件入库：读源码 → 抽取 → 整文件替换
+    /// 单文件入库：读源码 → 抽取 → chunk 切分（语义面嵌入）→ 整文件替换
     ///
     /// 返回 `Ok(false)` = 不入库（语言不路由 / 文件已消失）；
     /// `Ok(true)` = 已入库（调用方须随后 [`Self::refresh_derived`]）。
@@ -197,6 +220,67 @@ impl IndexService {
         let src = String::from_utf8_lossy(&bytes);
         let extracted = symbols::extract(lang, &src);
         let rows: Vec<SymbolRow> = extracted.symbols.iter().map(|s| s.row.clone()).collect();
+        // chunk 面（D8：文本不落库——落边界元数据 + 完整富化文本哈希）
+        let built = symbols::build_chunks(
+            &entry.rel_path,
+            &src,
+            &extracted.symbols,
+            &extracted.imports,
+        );
+        let mut chunk_rows: Vec<ChunkRow> = Vec::with_capacity(built.len());
+        let mut text_by_hash: HashMap<String, String> = HashMap::new();
+        for (i, c) in built.iter().enumerate() {
+            let hash = blake3::hash(c.text.as_bytes()).to_hex().to_string();
+            text_by_hash
+                .entry(hash.clone())
+                .or_insert_with(|| c.text.clone());
+            chunk_rows.push(ChunkRow {
+                ord: i as u32,
+                symbol: c.symbol.clone(),
+                kind: c.kind.clone(),
+                start_line: c.start_line,
+                end_line: c.end_line,
+                chunk_hash: hash,
+            });
+        }
+        // 向量面（D6 缓存）：旧向量哈希相同者复用，仅缺量新嵌入；语义面关闭
+        // （无嵌入器）时向量留空、vectorized=0，补嵌入由对账判据驱动
+        let old_vectors: HashMap<String, Vec<f32>> = self
+            .store
+            .file_vectors(&entry.rel_path)?
+            .into_iter()
+            .collect();
+        let mut vectors: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut vectorized = false;
+        if let Some(embedder) = &self.embedder {
+            let mut reused: Vec<(String, Vec<f32>)> = Vec::new();
+            let mut missing: Vec<String> = Vec::new();
+            for c in &chunk_rows {
+                if let Some(v) = old_vectors.get(&c.chunk_hash) {
+                    if !reused.iter().any(|(h, _)| h == &c.chunk_hash) {
+                        reused.push((c.chunk_hash.clone(), v.clone()));
+                    }
+                } else if !missing.contains(&c.chunk_hash) {
+                    missing.push(c.chunk_hash.clone());
+                }
+            }
+            if !missing.is_empty() {
+                let texts: Vec<String> = missing.iter().map(|h| text_by_hash[h].clone()).collect();
+                let embeddings = embedder.embed(&texts)?;
+                if embeddings.len() != missing.len() {
+                    return Err(IndexError(format!(
+                        "embedder returned {} vectors for {} chunks",
+                        embeddings.len(),
+                        missing.len()
+                    )));
+                }
+                vectors = reused;
+                vectors.extend(missing.into_iter().zip(embeddings));
+            } else {
+                vectors = reused;
+            }
+            vectorized = true;
+        }
         self.store.replace_file(
             &entry.rel_path,
             &entry.content_hash,
@@ -204,6 +288,9 @@ impl IndexService {
             entry.size as i64,
             &rows,
             &extracted.ident_counts,
+            &chunk_rows,
+            &vectors,
+            vectorized,
         )?;
         Ok(true)
     }
@@ -257,11 +344,11 @@ impl IndexService {
     /// 单文件 ingest 失败 fail-soft（warn 留痕跳过，不毁整批）。
     pub fn reconcile_sync(&self) -> Result<(usize, usize, usize), IndexError> {
         let disk = collect_workspace_files(&self.workdir)?;
-        let db_hashes: HashMap<String, String> = self
+        let db_hashes: HashMap<String, FileHash> = self
             .store
             .file_hashes()?
             .into_iter()
-            .map(|h| (h.path, h.content_hash))
+            .map(|h| (h.path.clone(), h))
             .collect();
         let mut added = 0usize;
         let mut updated = 0usize;
@@ -272,7 +359,12 @@ impl IndexService {
                     added += 1;
                     true
                 }
-                Some(h) if *h != entry.content_hash => {
+                Some(h) if h.content_hash != entry.content_hash => {
+                    updated += 1;
+                    true
+                }
+                // 内容未变但语义面开启且向量未齐 → 补嵌入重灌（开关后自愈路径）
+                Some(h) if self.embedder.is_some() && !h.vectorized => {
                     updated += 1;
                     true
                 }
@@ -310,11 +402,11 @@ impl IndexService {
         if rel_paths.is_empty() {
             return Ok(0);
         }
-        let db_hashes: HashMap<String, String> = self
+        let db_hashes: HashMap<String, FileHash> = self
             .store
             .file_hashes()?
             .into_iter()
-            .map(|h| (h.path, h.content_hash))
+            .map(|h| (h.path.clone(), h))
             .collect();
         let mut n = 0usize;
         let mut dirty = false;
@@ -336,8 +428,10 @@ impl IndexService {
                 continue;
             }
             let content_hash = blake3::hash(&bytes).to_hex().to_string();
-            if db_hashes.get(&rel).is_some_and(|h| *h == content_hash) {
-                continue; // 内容未变（非内容性触碰）
+            if db_hashes.get(&rel).is_some_and(|h| {
+                h.content_hash == content_hash && (self.embedder.is_none() || h.vectorized)
+            }) {
+                continue; // 内容未变且向量已齐（语义面关闭时不判向量）——非内容性触碰零成本
             }
             let meta = std::fs::metadata(&abs).ok();
             let entry = FileEntry {
@@ -484,6 +578,7 @@ fn now_epoch() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn index_db_path_is_scoped_by_workspace_hash() {
@@ -619,5 +714,123 @@ mod tests {
             RebuildOutcome::Completed(s) => assert_eq!(s.files, 1),
             other => panic!("expected completed, got {other:?}"),
         }
+    }
+
+    /// 假嵌入器（确定性向量=文本哈希派生；计数调用与嵌入文本量，供复用断言）
+    struct FakeEmbedder {
+        dim: usize,
+        calls: AtomicUsize,
+        embedded: AtomicUsize,
+    }
+
+    impl FakeEmbedder {
+        fn new(dim: usize) -> Self {
+            Self {
+                dim,
+                calls: AtomicUsize::new(0),
+                embedded: AtomicUsize::new(0),
+            }
+        }
+        fn embedded(&self) -> usize {
+            self.embedded.load(Ordering::SeqCst)
+        }
+    }
+
+    impl TextEmbedder for FakeEmbedder {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, IndexError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.embedded.fetch_add(texts.len(), Ordering::SeqCst);
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let h = blake3::hash(t.as_bytes());
+                    (0..self.dim)
+                        .map(|i| h.as_bytes()[i % h.as_bytes().len()] as i8 as f32 / 128.0)
+                        .collect()
+                })
+                .collect())
+        }
+        fn model_name(&self) -> String {
+            "fake-test-model".into()
+        }
+    }
+
+    #[test]
+    fn semantic_ingest_embeds_and_reuses_unchanged_chunks() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.rs"), "fn alpha() { beta(); }").unwrap();
+        let emb = Arc::new(FakeEmbedder::new(8));
+        let svc = IndexService::open(root).unwrap().with_embedder(emb.clone());
+        match svc.rebuild_sync() {
+            RebuildOutcome::Completed(s) => {
+                assert!(s.chunks > 0);
+                assert_eq!(s.vectors, s.chunks);
+            }
+            other => panic!("expected completed, got {other:?}"),
+        }
+        let first = emb.embedded();
+        assert!(first > 0);
+        // 追加新函数：alpha 的 chunk 文本未变 → 仅新增 chunk 重嵌入（D6 复用）
+        std::fs::write(
+            root.join("a.rs"),
+            "fn alpha() { beta(); }\nfn beta() {}\nfn gamma() {}\n",
+        )
+        .unwrap();
+        let n = svc.update_files_sync(&["a.rs".to_string()]).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(svc.status().vectors, svc.status().chunks);
+        let second_call_texts = emb.embedded() - first;
+        assert!(
+            second_call_texts < 3,
+            "expected chunk reuse, embedded {second_call_texts}"
+        );
+        // 快照读出：元数据齐 + 维度一致
+        let all = svc.store().all_vectors().unwrap();
+        assert!(all.len() >= 3);
+        assert!(all.iter().all(|c| c.vector.len() == 8));
+    }
+
+    #[test]
+    fn semantic_disabled_keeps_vectors_empty_but_chunks_stored() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.rs"), "fn alpha() {}").unwrap();
+        let svc = IndexService::open(root).unwrap();
+        match svc.rebuild_sync() {
+            RebuildOutcome::Completed(s) => {
+                assert!(s.chunks > 0);
+                assert_eq!(s.vectors, 0);
+            }
+            other => panic!("expected completed, got {other:?}"),
+        }
+        assert!(svc.embedder().is_none());
+    }
+
+    #[test]
+    fn backfill_reingests_unvectorized_files_when_embedder_present() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.rs"), "fn alpha() {}").unwrap();
+        // 关闭态先建库：chunk 在档、向量空
+        {
+            let svc = IndexService::open(root).unwrap();
+            match svc.rebuild_sync() {
+                RebuildOutcome::Completed(s) => assert_eq!(s.vectors, 0),
+                other => panic!("expected completed, got {other:?}"),
+            }
+        }
+        // 开启态重开同一库 → 对账补嵌入
+        let emb = Arc::new(FakeEmbedder::new(4));
+        let svc = IndexService::open(root).unwrap().with_embedder(emb.clone());
+        let (added, updated, removed) = svc.reconcile_sync().unwrap();
+        assert_eq!((added, updated, removed), (0, 1, 0));
+        assert!(emb.embedded() > 0);
+        assert_eq!(svc.status().vectors, svc.status().chunks);
+        // 再对账：向量已齐 → 零重灌
+        let before = emb.embedded();
+        let (added, updated, removed) = svc.reconcile_sync().unwrap();
+        assert_eq!((added, updated, removed), (0, 0, 0));
+        assert_eq!(emb.embedded(), before);
     }
 }

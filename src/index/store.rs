@@ -4,14 +4,18 @@
 #![forbid(unsafe_code)]
 //! 索引库持久层（B14 结构面）—— SQLite（rusqlite bundled / WAL）
 //!
-//! 表结构（15 号 §3.1，v2 语义）：
-//! - `files`：path（相对工作区根，`/` 分隔）+ content_hash（blake3 hex）+ mtime
-//!   + size —— 增量对账键（启动哈希对账 / notify 增量判定）；
+//! 表结构（15 号 §3.1，v3 语义）：
+//! - `files`：path（相对工作区根，`/` 分隔）+ content_hash（blake3 hex）+ mtime + size + vectorized（chunk 向量是否已随当前内容产出，语义面补嵌入判据）—— 增量对账键（启动哈希对账 / notify 增量判定）；
 //! - `symbols`：file/kind/name/line_start/line_end —— 符号抽取产物；
 //! - `idents`：file/name/count —— 标识符出现计数（name 级原始事实，按文件聚合）；
 //! - `refs`：from_file/to_file/weight —— 文件级引用边（PageRank 图谱直接输入，
 //!   派生物化视图：idents ∩ def 名集合 → owner 归属，weight=Σ√count）；
-//!   name 级原始事实保留在 `idents`，可随时重刷，无信息损失。
+//!   name 级原始事实保留在 `idents`，可随时重刷，无信息损失；
+//! - `chunks`：file/ord/symbol/kind/start_line/end_line/chunk_hash —— chunk 边界
+//!   元数据（D8：chunk 文本不落库，展示按行区间回读源文件；chunk_hash = 完整
+//!   富化文本哈希，即向量复用键 D6）；
+//! - `vectors`：chunk_id/dim/blob —— chunk 嵌入向量（f32 LE 序；向量不可逆推
+//!   源码，D8 落盘边界允许）。
 //!
 //! 并发纪律（15 号 §八风险 5 裁决）：单连接 + `Mutex` 串行写；WAL 允许读并发。
 //! 落盘边界（D8）：源码内容不落索引库——只存哈希 + 符号 + 元数据，展示时按需
@@ -31,14 +35,18 @@ use rusqlite::{params, Connection};
 /// v2：新增 `idents`（标识符出现计数，按文件聚合落库）——refs 升格为派生
 /// 物化视图（idents ∩ def 名集合，`refresh_refs` 全量重刷），无内存态、
 /// 重启自愈、增量天然正确。
-pub const SCHEMA_VERSION: i64 = 2;
+/// v3：新增 `chunks`（chunk 边界元数据）+ `vectors`（嵌入向量）+
+/// `files.vectorized`（语义面补嵌入判据）——v1.x 语义面存面（PR-5）；
+/// 旧库迁移 = 幂等建表 + files 补列（索引库为可丢弃派生缓存，迁移尽力而为）。
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS files (
     path         TEXT PRIMARY KEY,
     content_hash TEXT NOT NULL,
     mtime        INTEGER NOT NULL,
-    size         INTEGER NOT NULL
+    size         INTEGER NOT NULL,
+    vectorized   INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS symbols (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +73,23 @@ CREATE TABLE IF NOT EXISTS refs (
 );
 CREATE INDEX IF NOT EXISTS idx_refs_from ON refs(from_file);
 CREATE INDEX IF NOT EXISTS idx_refs_to   ON refs(to_file);
+CREATE TABLE IF NOT EXISTS chunks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    file       TEXT NOT NULL,
+    ord        INTEGER NOT NULL,
+    symbol     TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line   INTEGER NOT NULL,
+    chunk_hash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file);
+CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(chunk_hash);
+CREATE TABLE IF NOT EXISTS vectors (
+    chunk_id INTEGER PRIMARY KEY,
+    dim      INTEGER NOT NULL,
+    blob     BLOB NOT NULL
+);
 ";
 
 /// 索引库错误（存储层错误不携带链上语义）
@@ -112,6 +137,8 @@ pub struct FileHash {
     pub content_hash: String,
     /// 修改时间（UNIX 秒）
     pub mtime: i64,
+    /// chunk 向量是否已随当前内容产出（语义面补嵌入判据）
+    pub vectorized: bool,
 }
 
 /// 符号最小读出行（检索匹配 / owner 映射用）
@@ -127,6 +154,65 @@ pub struct SymbolMin {
     pub line_start: u32,
     /// 结束行（含）
     pub line_end: u32,
+}
+
+/// chunk 边界行（D8：文本不落库——落边界元数据 + 完整富化文本哈希）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkRow {
+    /// 文件内序号（0 起，源码出现序）
+    pub ord: u32,
+    /// 所属符号名（顶层文件级 chunk 为空串）
+    pub symbol: String,
+    /// 符号类别
+    pub kind: String,
+    /// 起始行（1 起，含）
+    pub start_line: u32,
+    /// 结束行（含）
+    pub end_line: u32,
+    /// 完整富化文本哈希（blake3 hex；向量复用键，D6）
+    pub chunk_hash: String,
+}
+
+/// 带向量的 chunk 读出行（语义检索快照输入）
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkVectorRow {
+    /// 所属文件（相对路径，`/` 分隔）
+    pub file: String,
+    /// 文件内序号
+    pub ord: u32,
+    /// 所属符号名
+    pub symbol: String,
+    /// 符号类别
+    pub kind: String,
+    /// 起始行（1 起，含）
+    pub start_line: u32,
+    /// 结束行（含）
+    pub end_line: u32,
+    /// 嵌入向量
+    pub vector: Vec<f32>,
+}
+
+/// f32 向量 → LE 字节序 blob（vectors.blob 存储形态）
+fn f32_to_le_blob(v: &[f32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        blob.extend_from_slice(&x.to_le_bytes());
+    }
+    blob
+}
+
+/// LE 字节序 blob → f32 向量（dim 不符返回 None——防御性校验）
+fn le_blob_to_f32(blob: &[u8], dim: usize) -> Option<Vec<f32>> {
+    if dim == 0 || blob.len() != dim * 4 {
+        return None;
+    }
+    Some(
+        blob.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect(),
+    )
 }
 
 /// 索引库（单连接 + `Mutex` 串行写；WAL）
@@ -156,6 +242,21 @@ impl IndexStore {
         }
         conn.execute_batch(SCHEMA)
             .map_err(|e| IndexError(format!("schema: {e}")))?;
+        // v2 → v3 迁移：files 补 vectorized 列（新库由 SCHEMA 建列，此 ALTER 仅旧库生效）
+        let has_vectorized: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'vectorized'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| IndexError(format!("check files.vectorized: {e}")))?;
+        if has_vectorized == 0 {
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN vectorized INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| IndexError(format!("migrate files.vectorized: {e}")))?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| IndexError(format!("set user_version: {e}")))?;
         Ok(Self {
@@ -163,10 +264,15 @@ impl IndexStore {
         })
     }
 
-    /// 整文件替换（事务内：删旧 symbols/refs/idents → upsert files → 插新行）
+    /// 整文件替换（事务内：删旧 chunks/vectors/symbols/refs/idents → upsert files
+    /// → 插新行）
     ///
     /// 单文件增量更新的原子入口：解析失败/中途出错整事务回滚，库内不残留半新半旧。
     /// 调用方随后应调 [`IndexStore::refresh_refs`] 重刷派生 refs。
+    /// 向量复用（D6）由调用方编排：替换前经 [`IndexStore::file_vectors`] 读出旧
+    /// 向量，哈希相同者回传 `vectors`，仅缺量新嵌入——本方法只落库。
+    /// `vectorized` = 本文件 chunk 向量是否已齐（语义面补嵌入判据）。
+    #[allow(clippy::too_many_arguments)]
     pub fn replace_file(
         &self,
         path: &str,
@@ -175,6 +281,9 @@ impl IndexStore {
         size: i64,
         symbols: &[SymbolRow],
         idents: &[(String, u32)],
+        chunks: &[ChunkRow],
+        vectors: &[(String, Vec<f32>)],
+        vectorized: bool,
     ) -> Result<(), IndexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let tx = conn
@@ -185,10 +294,18 @@ impl IndexStore {
         tx.execute("DELETE FROM symbols WHERE file = ?1", params![path])
             .map_err(|e| IndexError(format!("replace del symbols: {e}")))?;
         tx.execute(
-            "INSERT INTO files(path, content_hash, mtime, size) VALUES(?1, ?2, ?3, ?4)
+            "DELETE FROM vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE file = ?1)",
+            params![path],
+        )
+        .map_err(|e| IndexError(format!("replace del vectors: {e}")))?;
+        tx.execute("DELETE FROM chunks WHERE file = ?1", params![path])
+            .map_err(|e| IndexError(format!("replace del chunks: {e}")))?;
+        tx.execute(
+            "INSERT INTO files(path, content_hash, mtime, size, vectorized) VALUES(?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(path) DO UPDATE SET
-             content_hash = excluded.content_hash, mtime = excluded.mtime, size = excluded.size",
-            params![path, content_hash, mtime, size],
+             content_hash = excluded.content_hash, mtime = excluded.mtime, size = excluded.size,
+             vectorized = excluded.vectorized",
+            params![path, content_hash, mtime, size, vectorized as i64],
         )
         .map_err(|e| IndexError(format!("replace upsert file: {e}")))?;
         for s in symbols {
@@ -205,12 +322,37 @@ impl IndexStore {
             )
             .map_err(|e| IndexError(format!("replace insert ident: {e}")))?;
         }
+        for c in chunks {
+            tx.execute(
+                "INSERT INTO chunks(file, ord, symbol, kind, start_line, end_line, chunk_hash)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    path,
+                    c.ord,
+                    c.symbol,
+                    c.kind,
+                    c.start_line,
+                    c.end_line,
+                    c.chunk_hash
+                ],
+            )
+            .map_err(|e| IndexError(format!("replace insert chunk: {e}")))?;
+        }
+        // 向量按 chunk_hash 挂接：同文件同哈希多 chunk 各挂同向量（同文本同向量）
+        for (hash, vec) in vectors {
+            tx.execute(
+                "INSERT INTO vectors(chunk_id, dim, blob)
+                 SELECT id, ?2, ?3 FROM chunks WHERE file = ?1 AND chunk_hash = ?4",
+                params![path, vec.len() as i64, f32_to_le_blob(vec), hash],
+            )
+            .map_err(|e| IndexError(format!("replace insert vector: {e}")))?;
+        }
         tx.commit()
             .map_err(|e| IndexError(format!("replace commit: {e}")))?;
         Ok(())
     }
 
-    /// 移除文件及其符号/引用（删除文件或重建剔除时）
+    /// 移除文件及其符号/引用/chunk 面（删除文件或重建剔除时）
     pub fn remove_file(&self, path: &str) -> Result<(), IndexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let tx = conn
@@ -218,6 +360,13 @@ impl IndexStore {
             .map_err(|e| IndexError(format!("remove tx: {e}")))?;
         tx.execute("DELETE FROM refs WHERE from_file = ?1", params![path])
             .map_err(|e| IndexError(format!("remove del refs: {e}")))?;
+        tx.execute(
+            "DELETE FROM vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE file = ?1)",
+            params![path],
+        )
+        .map_err(|e| IndexError(format!("remove del vectors: {e}")))?;
+        tx.execute("DELETE FROM chunks WHERE file = ?1", params![path])
+            .map_err(|e| IndexError(format!("remove del chunks: {e}")))?;
         tx.execute("DELETE FROM idents WHERE file = ?1", params![path])
             .map_err(|e| IndexError(format!("remove del idents: {e}")))?;
         tx.execute("DELETE FROM symbols WHERE file = ?1", params![path])
@@ -229,11 +378,12 @@ impl IndexStore {
         Ok(())
     }
 
-    /// 全部文件哈希行（启动对账：磁盘实况 vs 库内清单，差集决定增删）
+    /// 全部文件哈希行（启动对账：磁盘实况 vs 库内清单，差集决定增删；
+    /// vectorized 供语义面开启后的补嵌入判据）
     pub fn file_hashes(&self) -> Result<Vec<FileHash>, IndexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = conn
-            .prepare("SELECT path, content_hash, mtime FROM files ORDER BY path")
+            .prepare("SELECT path, content_hash, mtime, vectorized FROM files ORDER BY path")
             .map_err(|e| IndexError(format!("file_hashes prepare: {e}")))?;
         let rows = stmt
             .query_map([], |r| {
@@ -241,6 +391,7 @@ impl IndexStore {
                     path: r.get(0)?,
                     content_hash: r.get(1)?,
                     mtime: r.get(2)?,
+                    vectorized: r.get::<_, i64>(3)? != 0,
                 })
             })
             .map_err(|e| IndexError(format!("file_hashes query: {e}")))?;
@@ -402,6 +553,94 @@ impl IndexStore {
         Ok(out)
     }
 
+    /// 指定文件的 chunk 向量（哈希 → 向量；供替换前复用读出，D6）
+    pub fn file_vectors(&self, path: &str) -> Result<Vec<(String, Vec<f32>)>, IndexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.chunk_hash, v.dim, v.blob FROM chunks c
+                 JOIN vectors v ON v.chunk_id = c.id WHERE c.file = ?1 ORDER BY c.ord",
+            )
+            .map_err(|e| IndexError(format!("file_vectors prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![path], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|e| IndexError(format!("file_vectors query: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (hash, dim, blob) =
+                row.map_err(|e| IndexError(format!("file_vectors row: {e}")))?;
+            if let Some(v) = le_blob_to_f32(&blob, dim as usize) {
+                out.push((hash, v));
+            } // dim 不符防御性丢弃（模型换挡残迹，随下次重嵌入自愈）
+        }
+        Ok(out)
+    }
+
+    /// 全部带向量 chunk（语义检索快照输入；file/ord 升序）
+    pub fn all_vectors(&self) -> Result<Vec<ChunkVectorRow>, IndexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.file, c.ord, c.symbol, c.kind, c.start_line, c.end_line, v.dim, v.blob
+                 FROM chunks c JOIN vectors v ON v.chunk_id = c.id ORDER BY c.file, c.ord",
+            )
+            .map_err(|e| IndexError(format!("all_vectors prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, Vec<u8>>(7)?,
+                ))
+            })
+            .map_err(|e| IndexError(format!("all_vectors query: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (file, ord, symbol, kind, start_line, end_line, dim, blob) =
+                row.map_err(|e| IndexError(format!("all_vectors row: {e}")))?;
+            let Some(vector) = le_blob_to_f32(&blob, dim as usize) else {
+                continue; // dim 不符防御性丢弃（同 file_vectors）
+            };
+            out.push(ChunkVectorRow {
+                file,
+                ord: ord.max(0) as u32,
+                symbol,
+                kind,
+                start_line: start_line.max(0) as u32,
+                end_line: end_line.max(0) as u32,
+                vector,
+            });
+        }
+        Ok(out)
+    }
+
+    /// chunk 总数（status 面展示）
+    pub fn chunk_count(&self) -> Result<u64, IndexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get::<_, i64>(0))
+            .map(|n| n.max(0) as u64)
+            .map_err(|e| IndexError(format!("chunk_count: {e}")))
+    }
+
+    /// 向量总数（status 面展示）
+    pub fn vector_count(&self) -> Result<u64, IndexError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get::<_, i64>(0))
+            .map(|n| n.max(0) as u64)
+            .map_err(|e| IndexError(format!("vector_count: {e}")))
+    }
+
     /// 清空全部索引数据（rebuild 全量重建前；表结构保留）
     pub fn clear(&self) -> Result<(), IndexError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -409,6 +648,8 @@ impl IndexStore {
             .unchecked_transaction()
             .map_err(|e| IndexError(format!("clear tx: {e}")))?;
         for sql in [
+            "DELETE FROM vectors",
+            "DELETE FROM chunks",
             "DELETE FROM refs",
             "DELETE FROM idents",
             "DELETE FROM symbols",
@@ -431,6 +672,18 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let s = IndexStore::open(&td.path().join("idx").join("index.db")).unwrap();
         (td, s)
+    }
+
+    /// chunk 测试行工厂（ord/符号/行区间/哈希）
+    fn chunk_row(ord: u32, symbol: &str, start: u32, end: u32, hash: &str) -> ChunkRow {
+        ChunkRow {
+            ord,
+            symbol: symbol.into(),
+            kind: "fn".into(),
+            start_line: start,
+            end_line: end,
+            chunk_hash: hash.into(),
+        }
     }
 
     #[test]
@@ -483,10 +736,23 @@ mod tests {
             10,
             &syms("alpha"),
             &[("beta".into(), 3)],
+            &[],
+            &[],
+            false,
         )
         .unwrap();
-        s.replace_file("b.rs", "hash-b", 200, 20, &syms("beta"), &[])
-            .unwrap();
+        s.replace_file(
+            "b.rs",
+            "hash-b",
+            200,
+            20,
+            &syms("beta"),
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
         assert_eq!(s.refresh_refs().unwrap(), 1);
         assert_eq!(s.counts().unwrap(), (2, 2, 1));
         let refs = s.all_refs().unwrap();
@@ -495,8 +761,18 @@ mod tests {
         assert_eq!(refs[0].to_file, "b.rs");
         assert!((refs[0].weight - 3.0f64.sqrt()).abs() < 1e-9);
         // 同文件重写：旧 symbols/idents 整体淘汰，重刷后旧边不残留
-        s.replace_file("a.rs", "hash-a2", 300, 11, &syms("alpha2"), &[])
-            .unwrap();
+        s.replace_file(
+            "a.rs",
+            "hash-a2",
+            300,
+            11,
+            &syms("alpha2"),
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
         assert_eq!(s.refresh_refs().unwrap(), 0);
         assert_eq!(s.counts().unwrap(), (2, 2, 0));
         let hs = s.file_hashes().unwrap();
@@ -528,6 +804,9 @@ mod tests {
                 ("beta".into(), 4),  // → b.rs，weight=√4=2
                 ("dup".into(), 1),   // owner=a.rs，自环剔除
             ],
+            &[],
+            &[],
+            false,
         )
         .unwrap();
         s.replace_file(
@@ -540,6 +819,9 @@ mod tests {
                 ("beta".into(), 1),  // 自环剔除
                 ("alpha".into(), 9), // → a.rs，weight=√9=3
             ],
+            &[],
+            &[],
+            false,
         )
         .unwrap();
         s.replace_file(
@@ -553,6 +835,9 @@ mod tests {
                 ("beta".into(), 2),  // → b.rs，√2
                 ("ghost".into(), 5), // 无 def，不成边
             ],
+            &[],
+            &[],
+            false,
         )
         .unwrap();
         assert_eq!(s.refresh_refs().unwrap(), 4);
@@ -585,12 +870,19 @@ mod tests {
                 line_end: 1,
             }],
             &[("g".into(), 2)],
+            &[chunk_row(0, "f", 1, 1, "ch-a")],
+            &[("ch-a".into(), vec![1.0, 2.0])],
+            true,
         )
         .unwrap();
         // g 无 def，重刷不成边
         assert_eq!(s.refresh_refs().unwrap(), 0);
+        assert_eq!(s.chunk_count().unwrap(), 1);
+        assert_eq!(s.vector_count().unwrap(), 1);
         s.remove_file("a.rs").unwrap();
         assert_eq!(s.counts().unwrap(), (0, 0, 0));
+        assert_eq!(s.chunk_count().unwrap(), 0);
+        assert_eq!(s.vector_count().unwrap(), 0);
         // 幂等：重复删除不报错
         s.remove_file("a.rs").unwrap();
     }
@@ -598,10 +890,173 @@ mod tests {
     #[test]
     fn clear_empties_but_keeps_schema() {
         let (_td, s) = store();
-        s.replace_file("a.rs", "h", 1, 1, &[], &[]).unwrap();
+        s.replace_file("a.rs", "h", 1, 1, &[], &[], &[], &[], false)
+            .unwrap();
         s.clear().unwrap();
         assert_eq!(s.counts().unwrap(), (0, 0, 0));
-        s.replace_file("b.rs", "h", 1, 1, &[], &[]).unwrap();
+        s.replace_file("b.rs", "h", 1, 1, &[], &[], &[], &[], false)
+            .unwrap();
         assert_eq!(s.counts().unwrap(), (1, 0, 0));
+    }
+
+    #[test]
+    fn chunks_and_vectors_roundtrip() {
+        let (_td, s) = store();
+        let chunks = vec![
+            chunk_row(0, "alpha", 1, 10, "h-1"),
+            chunk_row(1, "beta", 11, 20, "h-2"),
+        ];
+        let vectors = vec![
+            ("h-1".to_string(), vec![0.5f32, -1.25, 2.0]),
+            ("h-2".to_string(), vec![1.0f32; 4]),
+        ];
+        s.replace_file("a.rs", "hash", 1, 10, &[], &[], &chunks, &vectors, true)
+            .unwrap();
+        assert_eq!(s.chunk_count().unwrap(), 2);
+        assert_eq!(s.vector_count().unwrap(), 2);
+        // 复用读出：哈希 → 向量（LE 序无损往返）
+        let fv = s.file_vectors("a.rs").unwrap();
+        assert_eq!(fv.len(), 2);
+        assert!(fv
+            .iter()
+            .any(|(h, v)| h == "h-1" && v == &vec![0.5, -1.25, 2.0]));
+        assert!(fv.iter().any(|(h, v)| h == "h-2" && v == &vec![1.0f32; 4]));
+        // 快照读出：file/ord 升序 + 元数据齐
+        let all = s.all_vectors().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].file, "a.rs");
+        assert_eq!(all[0].ord, 0);
+        assert_eq!(all[0].symbol, "alpha");
+        assert_eq!(all[0].start_line, 1);
+        assert_eq!(all[0].vector, vec![0.5, -1.25, 2.0]);
+        assert_eq!(all[1].symbol, "beta");
+        // vectorized 标记在 file_hashes 可读
+        let hs = s.file_hashes().unwrap();
+        let a = hs.iter().find(|h| h.path == "a.rs").unwrap();
+        assert!(a.vectorized);
+    }
+
+    #[test]
+    fn replace_swaps_chunks_atomically_and_drops_stale_vectors() {
+        let (_td, s) = store();
+        let v1 = vec![("h-1".to_string(), vec![1.0f32; 3])];
+        s.replace_file(
+            "a.rs",
+            "h1",
+            1,
+            1,
+            &[],
+            &[],
+            &[chunk_row(0, "alpha", 1, 5, "h-1")],
+            &v1,
+            true,
+        )
+        .unwrap();
+        // 重写：旧 chunk h-1 消失 → 其向量随之淘汰；新 chunk h-2 无向量
+        s.replace_file(
+            "a.rs",
+            "h2",
+            2,
+            1,
+            &[],
+            &[],
+            &[chunk_row(0, "alpha2", 6, 9, "h-2")],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(s.chunk_count().unwrap(), 1);
+        assert_eq!(s.vector_count().unwrap(), 0);
+        assert!(s.file_vectors("a.rs").unwrap().is_empty());
+        let hs = s.file_hashes().unwrap();
+        assert!(!hs.iter().find(|h| h.path == "a.rs").unwrap().vectorized);
+    }
+
+    #[test]
+    fn same_hash_chunks_share_vector_blob() {
+        let (_td, s) = store();
+        let chunks = vec![
+            chunk_row(0, "dup", 1, 2, "h-dup"),
+            chunk_row(1, "dup", 3, 4, "h-dup"),
+        ];
+        s.replace_file(
+            "a.rs",
+            "h",
+            1,
+            1,
+            &[],
+            &[],
+            &chunks,
+            &[("h-dup".to_string(), vec![2.5f32; 2])],
+            true,
+        )
+        .unwrap();
+        // 同哈希两行各挂同向量
+        assert_eq!(s.vector_count().unwrap(), 2);
+        let all = s.all_vectors().unwrap();
+        assert_eq!(all[0].vector, all[1].vector);
+    }
+
+    #[test]
+    fn v2_database_migrates_to_v3() {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("index.db");
+        // 手造 v2 形态库：files 无 vectorized 列，无 chunks/vectors 表
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    path TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+                    mtime INTEGER NOT NULL, size INTEGER NOT NULL);
+                 CREATE TABLE symbols (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, file TEXT NOT NULL,
+                    kind TEXT NOT NULL, name TEXT NOT NULL,
+                    line_start INTEGER NOT NULL, line_end INTEGER NOT NULL);
+                 CREATE TABLE idents (file TEXT NOT NULL, name TEXT NOT NULL, count INTEGER NOT NULL);
+                 CREATE TABLE refs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, from_file TEXT NOT NULL,
+                    to_file TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1.0);
+                 INSERT INTO files VALUES('old.rs', 'h', 1, 1);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let s = IndexStore::open(&db).unwrap();
+        // 旧数据保留 + 补列缺省 0
+        let hs = s.file_hashes().unwrap();
+        assert_eq!(hs.len(), 1);
+        assert!(!hs[0].vectorized);
+        // 迁移后可正常写入 chunk 面
+        s.replace_file(
+            "new.rs",
+            "h",
+            1,
+            1,
+            &[],
+            &[],
+            &[chunk_row(0, "f", 1, 1, "ch")],
+            &[("ch".to_string(), vec![1.0f32; 2])],
+            true,
+        )
+        .unwrap();
+        assert_eq!(s.vector_count().unwrap(), 1);
+        // user_version 升至 3
+        let conn = s.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn blob_roundtrip_and_dim_guard() {
+        let v = vec![0.1f32, -2.5, 3.75, 1e-9];
+        let blob = f32_to_le_blob(&v);
+        assert_eq!(blob.len(), 16);
+        assert_eq!(le_blob_to_f32(&blob, 4).unwrap(), v);
+        // dim 不符 → None（防御）
+        assert!(le_blob_to_f32(&blob, 3).is_none());
+        assert!(le_blob_to_f32(&blob, 0).is_none());
+        assert!(le_blob_to_f32(&[], 1).is_none());
     }
 }
