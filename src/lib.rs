@@ -32,6 +32,7 @@ pub mod builtin_tools;
 pub mod config;
 pub mod dotenv;
 pub mod git;
+pub mod index;
 #[doc(hidden)]
 pub mod io_dispatcher;
 pub mod io_handler;
