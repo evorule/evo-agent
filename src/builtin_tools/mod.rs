@@ -58,6 +58,7 @@ pub mod grep_files;
 pub mod http_get;
 pub mod net_guard;
 pub mod search_files;
+pub mod shell_net_guard;
 pub mod shell_exec;
 pub mod skill_read;
 
