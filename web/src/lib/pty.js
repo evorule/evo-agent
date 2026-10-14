@@ -31,6 +31,20 @@ let counter = 0;
 /** 实例清单变更回调(视图层订阅刷新 chips) */
 let notify = () => {};
 
+/** 活动终端 id(视图层激活/创建时上报;chat「当前终端」引用定位用) */
+let activeTermId = null;
+
+/** 视图层激活某实例时上报(null = 无活动) */
+export function setActiveTerminal(termId) {
+  activeTermId = termId || null;
+}
+
+/** 当前活动实例(无活动或已销毁返回 null;语义从严不回落兜底) */
+export function getActiveTerminal() {
+  if (activeTermId && instances.has(activeTermId)) return instances.get(activeTermId);
+  return null;
+}
+
 function token() {
   return localStorage.getItem('evo_agent_token') || '';
 }
