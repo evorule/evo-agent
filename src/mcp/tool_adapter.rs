@@ -46,23 +46,39 @@ pub struct McpToolAdapter {
     client: Arc<McpClient>,
     /// MCP server 内的工具名(不含 `mcp_{server}_` 前缀)
     tool_name: String,
+    /// 单次调用超时秒数(B16;0 = 不限时;缺省 60)
+    timeout_secs: u64,
 }
 
 impl std::fmt::Debug for McpToolAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpToolAdapter")
             .field("tool_name", &self.tool_name)
+            .field("timeout_secs", &self.timeout_secs)
             .finish()
     }
 }
 
 impl McpToolAdapter {
-    /// 创建一个 MCP 工具适配器
+    /// 创建一个 MCP 工具适配器(缺省 60s 调用超时)
     ///
     /// `client` 是已连接的 MCP client(多个 adapter 共享)。
     /// `tool_name` 是 MCP server 暴露的工具名(不含前缀)。
     pub fn new(client: Arc<McpClient>, tool_name: String) -> Self {
-        Self { client, tool_name }
+        Self {
+            client,
+            tool_name,
+            timeout_secs: 60,
+        }
+    }
+
+    /// 创建带显式调用超时的适配器(B16:`mcp.servers[].timeout_secs` 覆盖)
+    pub fn with_timeout(client: Arc<McpClient>, tool_name: String, timeout_secs: u64) -> Self {
+        Self {
+            client,
+            tool_name,
+            timeout_secs,
+        }
     }
 
     /// 只读访问工具名(MCP server 内的原始名)
@@ -83,15 +99,76 @@ impl ToolFunction for McpToolAdapter {
             "MCP tool adapter invoked"
         );
 
-        let result = self
-            .client
-            .call_tool(&self.tool_name, &args_json)
-            .await
-            .map_err(|e| format!("MCP tool '{}' failed: {}", self.tool_name, e))?;
+        let call = self.client.call_tool(&self.tool_name, &args_json);
+        let result = if self.timeout_secs == 0 {
+            call.await
+        } else {
+            match tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), call)
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(format!(
+                    "MCP tool '{}' timed out after {}s",
+                    self.tool_name, self.timeout_secs
+                )),
+            }
+        };
+
+        let result = result.map_err(|e| format!("MCP tool '{}' failed: {}", self.tool_name, e))?;
 
         // MCP 返回的是 text 字符串,包装成 Value::string
         Ok(Value::from(result))
     }
+}
+
+/// 把一个已连接 MCP client 的工具列表注册进 ToolHandler(B16 抽出共用)
+///
+/// CLI(`register_mcp_tools`)与 serve(`mcp::manager`)两条路径共用:
+/// 逐工具 `mcp_{server}_{tool}` 命名 → manifest 契约校验(description/
+/// inputSchema 透传,一表硬规则 3)→ `McpToolAdapter` 注册(带超时覆盖)。
+pub fn register_client_tools(
+    tool_handler: &mut crate::io_handlers::tool_handler::ToolHandler,
+    server_name: &str,
+    client: &Arc<McpClient>,
+    tools: &[crate::mcp::client::McpToolSpec],
+    timeout_secs: u64,
+) -> Result<usize, String> {
+    for tool in tools {
+        let registered_name = mcp_tool_name(server_name, &tool.name);
+        tracing::info!(
+            server = %server_name,
+            mcp_tool = %tool.name,
+            registered_as = %registered_name,
+            "registering MCP tool"
+        );
+        // 一表硬规则 3:MCP 握手后 tools/list 的 description/inputSchema 透传
+        // 进 manifest(Inline 契约)——丢字段即注册失败(设计档 §3.1,消灭
+        // MCP 空 schema 降级)
+        let manifest = crate::agent::tool_manifest::dynamic_manifest(
+            &registered_name,
+            crate::agent::tool_manifest::ToolSource::Mcp,
+            tool.description.clone(),
+            tool.input_schema.clone(),
+        )
+        .map_err(|e| {
+            tracing::warn!(
+                server = %server_name,
+                mcp_tool = %tool.name,
+                error = %e,
+                "MCP tool registration rejected by manifest contract"
+            );
+            e
+        })?;
+        tool_handler.register(
+            manifest,
+            Arc::new(McpToolAdapter::with_timeout(
+                client.clone(),
+                tool.name.clone(),
+                timeout_secs,
+            )),
+        );
+    }
+    Ok(tools.len())
 }
 
 /// G12:把配置中的所有 MCP server 连上,把它们的工具注册到 `ToolHandler`
@@ -159,41 +236,13 @@ async fn connect_and_register_one(
     let client = Arc::new(McpClient::connect(Arc::new(transport)).await?);
 
     let tools = client.list_tools().await?;
-    let tool_count = tools.len();
-
-    for tool in tools {
-        let registered_name = mcp_tool_name(&server_cfg.name, &tool.name);
-        tracing::info!(
-            server = %server_cfg.name,
-            mcp_tool = %tool.name,
-            registered_as = %registered_name,
-            "registering MCP tool"
-        );
-        // 一表硬规则 3:MCP 握手后 tools/list 的 description/inputSchema 透传
-        // 进 manifest(Inline 契约)——丢字段即注册失败(设计档 §3.1,消灭
-        // MCP 空 schema 降级;现状缺陷:两字段全丢,mcp/tool_adapter.rs:172)
-        let manifest = crate::agent::tool_manifest::dynamic_manifest(
-            &registered_name,
-            crate::agent::tool_manifest::ToolSource::Mcp,
-            tool.description.clone(),
-            tool.input_schema.clone(),
-        )
-        .map_err(|e| {
-            tracing::warn!(
-                server = %server_cfg.name,
-                mcp_tool = %tool.name,
-                error = %e,
-                "MCP tool registration rejected by manifest contract"
-            );
-            e
-        })?;
-        tool_handler.register(
-            manifest,
-            Arc::new(McpToolAdapter::new(client.clone(), tool.name)),
-        );
-    }
-
-    Ok(tool_count)
+    register_client_tools(
+        tool_handler,
+        &server_cfg.name,
+        &client,
+        &tools,
+        server_cfg.timeout_secs,
+    )
 }
 
 #[cfg(test)]
@@ -359,6 +408,9 @@ mod tests {
                 command: "this-command-does-not-exist-xyz999".to_string(),
                 args: vec![],
                 env: std::collections::HashMap::new(),
+                disabled: false,
+                timeout_secs: 60,
+                always_allow: vec![],
             }],
         };
         let count = register_mcp_tools(&mut handler, &config).await;
