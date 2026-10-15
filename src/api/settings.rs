@@ -279,6 +279,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.audit_query",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "审计查询工具（audit_query，只读）：三 scope 入口——gov 治理留痕（含批准先例卡）/session 会话审计与因果链/journal 事件流（关闭 = 工具连 LLM 契约一起下线，agent 无法主动查询治理留痕与会话审计）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.mcp",
             kind: SettingType::Boolean,
             default: json!(true),
@@ -867,7 +877,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 44); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall)
+        assert_eq!(settings.len(), 45); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));

@@ -196,6 +196,13 @@ pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
         crate::agent::memory_recall_tool::MEMORY_RECALL_TOOL,
         Arc::new(crate::agent::memory_recall_tool::MemoryRecallTool::unwired()),
     );
+    // B22 审计查询（23 号设计 §3.2）：三 scope 只读入口（gov 治理留痕/
+    // session 审计/journal 事件流）；占位/会话期重绑同构，开关
+    // agentTools.audit_query 过滤三面自动工作
+    handler.register_static(
+        crate::agent::audit_query_tool::AUDIT_QUERY_TOOL,
+        Arc::new(crate::agent::audit_query_tool::AuditQueryTool::unwired()),
+    );
     // 自主开会话工具（自主交接设计 PR-H3）：同上占位/会话期重绑形态；
     // 重绑时注入链共享态与子 runner 工厂（护栏三件+fork+自动驱动在执行体内）
     handler.register_static(
@@ -727,6 +734,89 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                           both sessions working on the same task."
                 .to_string(),
             parameters: vec![],
+        },
+        ToolSpec {
+            name: "audit_query".to_string(),
+            description: "Read-only audit query across three scopes. scope=gov: governance \
+                          ledger events (approvals, policy verdicts, S4 publications, \
+                          terminal sessions, journal milestones); pass precedent=true to \
+                          get approval precedent cards (tool + params summary + approver + \
+                          decision + time) — useful to reference past in-session approval \
+                          precedents. scope=session: session facts list, or the causal \
+                          chain of a specific fact_id, or chain integrity verification \
+                          (verify=true). scope=journal: this session's journal event \
+                          stream. The tool never writes."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "scope".to_string(),
+                    r#type: "string".to_string(),
+                    description: "\"gov\" | \"session\" | \"journal\"".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "kind".to_string(),
+                    r#type: "string".to_string(),
+                    description: "(gov) filter by event kind: approval_requested | \
+                                  approval_resolved | policy_verdict | s4_publish | \
+                                  terminal_session_create | terminal_session_close | \
+                                  b21_journal_milestone"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "precedent".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "(gov) true = return approval precedent cards instead of \
+                                  raw events (requested+resolved paired by approval_id)"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "session_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "(session) target session; defaults to this session"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "fact_id".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "(session) trace the causal chain of this fact instead of \
+                                  listing facts"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "verify".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "(session) true = run audit chain integrity verification"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "type".to_string(),
+                    r#type: "string".to_string(),
+                    description: "(journal) filter by journal event type"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "since_seq".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "(journal) only events with seq >= this value"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "limit".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "(gov/journal) max entries (gov 1..=100 default 20; \
+                                  journal 1..=500 default 100)"
+                        .to_string(),
+                    required: false,
+                },
+            ],
         },
         ToolSpec {
             name: "query_journal".to_string(),

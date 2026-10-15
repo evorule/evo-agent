@@ -3138,16 +3138,35 @@ impl AgentRunner {
         // 过滤后不在场则跳过）；只读工具无 session_id 依赖（namespace+client
         // 在手即完整）；memory 未启用时跳过（namespace 无权威源，占位保持
         // fail-visible 报错——不静默造 namespace）。
-        if self.tool_handler.has_tool(crate::agent::memory_recall_tool::MEMORY_RECALL_TOOL) {
-            let exec: std::sync::Arc<dyn ToolFunction> = std::sync::Arc::new(
-                crate::agent::memory_recall_tool::MemoryRecallTool::wired(
+        if self
+            .tool_handler
+            .has_tool(crate::agent::memory_recall_tool::MEMORY_RECALL_TOOL)
+        {
+            let exec: std::sync::Arc<dyn ToolFunction> =
+                std::sync::Arc::new(crate::agent::memory_recall_tool::MemoryRecallTool::wired(
                     namespace.clone(),
                     client.clone(),
-                ),
-            );
+                ));
             self.tool_handler
                 .register_static(crate::agent::memory_recall_tool::MEMORY_RECALL_TOOL, exec);
             tracing::debug!("memory_recall tool re-bound (session-scoped, read-only)");
+        }
+        // B22 审计查询接线（23 号设计 §3.2）：audit_query 占位→wired。门控同上；
+        // journal 句柄透传（None=journal scope 调用时 fail-visible 如实报错，
+        // gov/session scope 不受影响）。
+        if self
+            .tool_handler
+            .has_tool(crate::agent::audit_query_tool::AUDIT_QUERY_TOOL)
+        {
+            let exec: std::sync::Arc<dyn ToolFunction> =
+                std::sync::Arc::new(crate::agent::audit_query_tool::AuditQueryTool::wired(
+                    session_id.to_string(),
+                    client.clone(),
+                    journal.clone(),
+                ));
+            self.tool_handler
+                .register_static(crate::agent::audit_query_tool::AUDIT_QUERY_TOOL, exec);
+            tracing::debug!("audit_query tool re-bound (session-scoped, read-only)");
         }
         // 自主开会话接线(自主交接设计 PR-H3):门控同 handover(启动期占位
         // 在场才接线)。链态惰性初始化(发起方会话首个接线点创建);链 token

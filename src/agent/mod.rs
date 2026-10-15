@@ -10,6 +10,7 @@ pub mod approval;
 pub mod approval_policy;
 pub mod assembly;
 pub mod atif;
+pub mod audit_query_tool;
 pub mod audited_llm;
 pub mod callback;
 pub mod constitution;
