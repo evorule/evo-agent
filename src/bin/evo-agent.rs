@@ -563,27 +563,35 @@ fn cmd_run(
     // 判定理由必产+决策入审计链);approval_mode=policy → PolicyReview 评审式
     // (独立评审对照条件清单逐条判定,判定不可信一律降级人工;条件文件加载失败
     // fail-visible 降 CliApproval 显式留痕);否则 CliApproval stdin 交互(manual 态)
-    let callback: std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback> =
-        if approval_auto || auto_approve_candidates {
-            std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval)
-        } else if def.approval_mode.as_deref() == Some("policy") {
-            let policy_path = workdir.join(".evo").join("approval-policy.toml");
-            match evo_agent::agent::approval_policy::ApprovalPolicyFile::load(&policy_path) {
-                Ok(policy) => {
-                    let override_flag =
-                        evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
-                            .map(|s| {
-                                s.merged()
-                                    .0
-                                    .get("approval.exemptionOverride")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false)
-                            })
-                            .unwrap_or(false);
-                    let audited = evo_agent::agent::audited_llm::AuditedLlm::new(
-                        client.clone(),
-                        evo_agent::io_handlers::LlmHandler::from_config(&config.llm),
-                    );
+    // 同一次加载双产出 Runaway 护栏策略(18 号 PR-3;CLI run() 为非流式路径,
+    // 护栏挂点在流式面,此处注入随定义路由空转——面一致性优先,偏离记在案)
+    let (callback, runaway_policy): (
+        std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>,
+        Option<evo_agent::agent::runner::RunawayPolicy>,
+    ) = if approval_auto || auto_approve_candidates {
+        (
+            std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+            None,
+        )
+    } else if def.approval_mode.as_deref() == Some("policy") {
+        let policy_path = workdir.join(".evo").join("approval-policy.toml");
+        match evo_agent::agent::approval_policy::ApprovalPolicyFile::load(&policy_path) {
+            Ok(policy) => {
+                let override_flag = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+                    .map(|s| {
+                        s.merged()
+                            .0
+                            .get("approval.exemptionOverride")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                let audited = evo_agent::agent::audited_llm::AuditedLlm::new(
+                    client.clone(),
+                    evo_agent::io_handlers::LlmHandler::from_config(&config.llm),
+                );
+                let runaway = evo_agent::agent::runner::RunawayPolicy::from_policy_file(&policy);
+                (
                     std::sync::Arc::new(evo_agent::agent::approval_policy::PolicyReview::new(
                         policy,
                         std::sync::Arc::new(
@@ -593,24 +601,34 @@ fn cmd_run(
                             auto_approve: false,
                         }),
                         override_flag,
-                    ))
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[approval-policy] 条件文件加载失败,policy 档降级人工审批: {e} ({})",
-                        policy_path.display()
-                    );
+                    )),
+                    Some(runaway),
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "[approval-policy] 条件文件加载失败,policy 档降级人工审批: {e} ({})",
+                    policy_path.display()
+                );
+                (
                     std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                         auto_approve: false,
-                    })
-                }
+                    }),
+                    None,
+                )
             }
-        } else {
+        }
+    } else {
+        (
             std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                 auto_approve: false,
-            })
-        };
-    let runner = runner.with_approval_callback(callback);
+            }),
+            None,
+        )
+    };
+    let runner = runner
+        .with_approval_callback(callback)
+        .with_runaway_policy(runaway_policy);
 
     // 6. 跑
     eprintln!(
@@ -2821,27 +2839,34 @@ fn run_repl_turn(
     // approval_mode=policy → PolicyReview 评审式(独立评审对照条件清单逐条判定,
     // 判定不可信一律降级人工;条件文件加载失败 fail-visible 降 CliApproval 显式留痕);
     // 否则 CliApproval stdin 交互(manual 态,现状行为)
-    let callback: std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback> =
-        if auto_approve_candidates || def.approval_mode.as_deref() == Some("auto_policy") {
-            std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval)
-        } else if def.approval_mode.as_deref() == Some("policy") {
-            let policy_path = workdir.join(".evo").join("approval-policy.toml");
-            match evo_agent::agent::approval_policy::ApprovalPolicyFile::load(&policy_path) {
-                Ok(policy) => {
-                    let override_flag =
-                        evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
-                            .map(|s| {
-                                s.merged()
-                                    .0
-                                    .get("approval.exemptionOverride")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false)
-                            })
-                            .unwrap_or(false);
-                    let audited = evo_agent::agent::audited_llm::AuditedLlm::new(
-                        client.clone(),
-                        evo_agent::io_handlers::LlmHandler::from_config(&config.llm),
-                    );
+    // 同一次加载双产出 Runaway 护栏策略(18 号 PR-3):REPL 走流式面即生效
+    let (callback, runaway_policy): (
+        std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>,
+        Option<evo_agent::agent::runner::RunawayPolicy>,
+    ) = if auto_approve_candidates || def.approval_mode.as_deref() == Some("auto_policy") {
+        (
+            std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+            None,
+        )
+    } else if def.approval_mode.as_deref() == Some("policy") {
+        let policy_path = workdir.join(".evo").join("approval-policy.toml");
+        match evo_agent::agent::approval_policy::ApprovalPolicyFile::load(&policy_path) {
+            Ok(policy) => {
+                let override_flag = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+                    .map(|s| {
+                        s.merged()
+                            .0
+                            .get("approval.exemptionOverride")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                let audited = evo_agent::agent::audited_llm::AuditedLlm::new(
+                    client.clone(),
+                    evo_agent::io_handlers::LlmHandler::from_config(&config.llm),
+                );
+                let runaway = evo_agent::agent::runner::RunawayPolicy::from_policy_file(&policy);
+                (
                     std::sync::Arc::new(evo_agent::agent::approval_policy::PolicyReview::new(
                         policy,
                         std::sync::Arc::new(
@@ -2851,24 +2876,34 @@ fn run_repl_turn(
                             auto_approve: false,
                         }),
                         override_flag,
-                    ))
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[approval-policy] 条件文件加载失败,policy 档降级人工审批: {e} ({})",
-                        policy_path.display()
-                    );
+                    )),
+                    Some(runaway),
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "[approval-policy] 条件文件加载失败,policy 档降级人工审批: {e} ({})",
+                    policy_path.display()
+                );
+                (
                     std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                         auto_approve: false,
-                    })
-                }
+                    }),
+                    None,
+                )
             }
-        } else {
+        }
+    } else {
+        (
             std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                 auto_approve: false,
-            })
-        };
-    let runner = runner.with_approval_callback(callback);
+            }),
+            None,
+        )
+    };
+    let runner = runner
+        .with_approval_callback(callback)
+        .with_runaway_policy(runaway_policy);
 
     // G6:Ctrl+C → cancel_token
     let cancel_token = runner.cancel_token().clone();

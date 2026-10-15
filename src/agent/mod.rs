@@ -89,6 +89,7 @@ pub use replan::{
     should_replan, BudgetCounters, BudgetThresholds, ReplanDecision, ReplanReason, ReplanState,
     WorkflowFailureRecord,
 };
+pub use runner::RunawayPolicy;
 pub use runner::{
     merge_delegate_tool, AgentConfig, AgentError, AgentEvent, AgentResult, AgentRunner,
     DEFAULT_MAX_DELEGATE_DEPTH,

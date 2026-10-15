@@ -978,6 +978,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             // 回退预算消费(H1 护栏跨重启):观测面事件不映射步——护栏计数
             // 是可靠性内部状态,非对话轨迹内容(变体文档口径一致)
             JournalEvent::RewindBudgetConsumed { .. } => {}
+            JournalEvent::RunawayGuardTripped { .. } => {}
         }
     }
     // 流末悬挂 agent 步(无 turn_ended 尾:crash/截断场景)

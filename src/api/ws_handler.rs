@@ -619,13 +619,20 @@ async fn handle_ws(
 ///   绝不静默按无条件放行处理）；评审调用经 AuditedLlm sidecar（评审 prompt
 ///   与判定全文入审计链），fallback 为 HttpApproval 60s 人工审批窗
 /// - 其余（manual/缺省）:HttpApproval（现状行为零变化）
+///
+/// 返回 `(决策端, Runaway 护栏策略)`:policy 模式加载成功时同时产出
+/// [`RunawayPolicy`]（18 号 PR-3 护栏注入面——计数阈值+复述条件清单复用
+/// 同一份加载结果）；其余模式护栏为 None（不启用，行为零变化）。
 fn build_approval_callback(
     state: &AgentApiState,
     mode: Option<&str>,
-) -> Arc<dyn crate::agent::approval::ApprovalCallback> {
+) -> (
+    Arc<dyn crate::agent::approval::ApprovalCallback>,
+    Option<crate::agent::runner::RunawayPolicy>,
+) {
     use crate::agent::approval_policy::{ApprovalPolicyFile, AuditedReviewInvoker, PolicyReview};
     if mode == Some("auto_policy") {
-        return Arc::new(crate::agent::approval::PolicyApproval);
+        return (Arc::new(crate::agent::approval::PolicyApproval), None);
     }
     if mode == Some("policy") {
         let policy_path = state.workdir().join(".evo").join("approval-policy.toml");
@@ -642,14 +649,18 @@ fn build_approval_callback(
                     state.evorule_client().clone(),
                     crate::io_handlers::LlmHandler::from_config(state.llm_config()),
                 );
-                return Arc::new(PolicyReview::new(
-                    policy,
-                    Arc::new(AuditedReviewInvoker::new(audited)),
-                    Arc::new(crate::agent::approval::HttpApproval::new(
-                        state.pending_approvals().clone(),
+                let runaway = crate::agent::runner::RunawayPolicy::from_policy_file(&policy);
+                return (
+                    Arc::new(PolicyReview::new(
+                        policy,
+                        Arc::new(AuditedReviewInvoker::new(audited)),
+                        Arc::new(crate::agent::approval::HttpApproval::new(
+                            state.pending_approvals().clone(),
+                        )),
+                        override_flag,
                     )),
-                    override_flag,
-                ));
+                    Some(runaway),
+                );
             }
             Err(e) => {
                 error!(
@@ -660,9 +671,12 @@ fn build_approval_callback(
             }
         }
     }
-    Arc::new(crate::agent::approval::HttpApproval::new(
-        state.pending_approvals().clone(),
-    ))
+    (
+        Arc::new(crate::agent::approval::HttpApproval::new(
+            state.pending_approvals().clone(),
+        )),
+        None,
+    )
 }
 
 /// 构造一个 fresh AgentRunner(每轮新建)
@@ -746,6 +760,10 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
     let governance_segment =
         crate::api::serve_tools::build_governance_segment(state.evorule_client(), &def.tools).await;
     let config = def.to_agent_config();
+    // G8 审批决策端 + 18 号 PR-3 Runaway 护栏:同一次 mode 判别/文件加载
+    // 双产出(决策端挂 ApprovalCallback,护栏策略挂 with_runaway_policy)
+    let (approval_callback, runaway_policy) =
+        build_approval_callback(state, def.approval_mode.as_deref());
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
         // M5-a:注入生效能力边界(声明重绑工具面 + 会话边界段/边界事实)
         .with_capability_boundary(capability_boundary)
@@ -756,7 +774,10 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         // policy=PolicyReview 评审式(独立 LLM 评审对照条件清单逐条判定,
         // 判定不可信一律降级人工;条件文件加载失败 fail-visible 降 HttpApproval);
         // 其余(manual/缺省)=HttpApproval 60s 人工审批窗(现状行为)
-        .with_approval_callback(build_approval_callback(state, def.approval_mode.as_deref()))
+        .with_approval_callback(approval_callback)
+        // 18 号 PR-3:注入 Runaway 护栏(policy 档;None=不启用行为零变化)
+        // ——200 次连续自动操作上限+修订④复述注入,跨重启计数回填
+        .with_runaway_policy(runaway_policy)
         // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
         .with_metrics(state.metrics().clone())
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源;

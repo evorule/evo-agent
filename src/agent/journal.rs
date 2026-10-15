@@ -428,6 +428,16 @@ pub enum JournalEvent {
         /// 消费后剩余预算
         remaining: u32,
     },
+    /// Runaway 护栏触发落账(18 号 §六 连续自动操作上限,护栏跨重启连续):
+    /// 达 max_actions_per_run 阈值暂停等人时落账。回填语义:本事件即计数
+    /// 重置锚(触发=配额耗尽,人工确认继续后从零重计,见
+    /// replay_runaway_actions)。观测面,不参与步映射。
+    RunawayGuardTripped {
+        /// 触发时已执行自动操作数
+        actions: u32,
+        /// 触发的阈值(max_actions_per_run)
+        threshold: u32,
+    },
 }
 
 /// 单行 journal 记录(读侧重放消费形态)
@@ -1030,6 +1040,35 @@ impl JournalWriter {
     /// 消耗可能未及落账,账面 ≤ 实际消耗,如实口径)
     pub fn rewind_budget_consumed(&self, remaining: u32) -> Result<u64, JournalError> {
         self.push(JournalEvent::RewindBudgetConsumed { remaining })
+    }
+
+    /// Runaway 护栏触发落账(连续自动操作达阈值暂停等人)
+    pub fn runaway_guard_tripped(&self, actions: u32, threshold: u32) -> Result<u64, JournalError> {
+        self.push(JournalEvent::RunawayGuardTripped { actions, threshold })
+    }
+
+    /// Runaway 自动操作计数回填(18 号修订⑦ 护栏跨重启连续):重放 journal
+    /// 统计 ToolInvoked 总数,RunawayGuardTripped 处归零重计(触发=配额耗尽,
+    /// 人工确认继续后从零重计)。读取失败=无从回填,从零起计(护栏宁可宽松,
+    /// 不误伤正常恢复,与 replay_rewind_budget_remaining 同口径)。
+    ///
+    /// 与运行态 bump 同源同口径:运行态 bump 挂本地 ReAct 与 call_service
+    /// 两个 ToolInvoked 写点,journal 面零新增计数行(仅触发时落一条
+    /// RunawayGuardTripped,兼作重置锚与审计留痕)。
+    pub fn replay_runaway_actions(&self) -> u32 {
+        let lines = match self.read_lines() {
+            Ok(l) => l,
+            Err(_) => return 0,
+        };
+        let mut actions: u32 = 0;
+        for l in &lines {
+            match &l.event {
+                JournalEvent::RunawayGuardTripped { .. } => actions = 0,
+                JournalEvent::ToolInvoked { .. } => actions = actions.saturating_add(1),
+                _ => {}
+            }
+        }
+        actions
     }
 
     /// 审批请求开启
@@ -2459,5 +2498,67 @@ mod tests {
         }
         let r = JournalWriter::open(dir.path(), "s-rewind-progress").unwrap();
         assert_eq!(r.replay_rewind_budget_remaining(), REWIND_BUDGET_LIMIT);
+    }
+
+    #[test]
+    fn replay_runaway_actions_without_tools_returns_zero() {
+        // 18 号 PR-3 回填:无工具执行(空账/纯 LLM 轮转)→ 计数 0
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let w = JournalWriter::open(dir.path(), "s-runaway-zero").unwrap();
+            let g = w.begin_turn("g").unwrap();
+            w.llm_called_react("m", None, None, Some(10), 1, "resp")
+                .unwrap();
+            g.end("success", 1, 10);
+        }
+        let r = JournalWriter::open(dir.path(), "s-runaway-zero").unwrap();
+        assert_eq!(r.replay_runaway_actions(), 0);
+    }
+
+    #[test]
+    fn replay_runaway_actions_counts_tool_invocations() {
+        // 18 号 PR-3 回填:N 次 ToolInvoked(双路径同口径)→ 计数 N
+        // (与运行态 bump 同源:本地 ReAct=None 与 call_service=Some 都计)
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let w = JournalWriter::open(dir.path(), "s-runaway-count").unwrap();
+            w.tool_invoked("file_read", &serde_json::json!({"p": "a"}), None)
+                .unwrap();
+            w.tool_invoked("shell_exec", &serde_json::json!({"c": "ls"}), Some(9))
+                .unwrap();
+            w.tool_invoked("file_read", &serde_json::json!({"p": "b"}), None)
+                .unwrap();
+        }
+        let r = JournalWriter::open(dir.path(), "s-runaway-count").unwrap();
+        assert_eq!(r.replay_runaway_actions(), 3);
+    }
+
+    #[test]
+    fn replay_runaway_actions_tripped_is_reset_anchor() {
+        // 18 号 PR-3 回填:RunawayGuardTripped=重置锚——触发后人工确认继续,
+        // 计数从零重计(150 次执行+触发+再 50 次 → 回填 50,护栏配额刷新)
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let w = JournalWriter::open(dir.path(), "s-runaway-anchor").unwrap();
+            for i in 0..150 {
+                w.tool_invoked(
+                    "shell_exec",
+                    &serde_json::json!({"c": format!("cmd-{i}")}),
+                    None,
+                )
+                .unwrap();
+            }
+            w.runaway_guard_tripped(200, 200).unwrap();
+            for i in 0..50 {
+                w.tool_invoked(
+                    "shell_exec",
+                    &serde_json::json!({"c": format!("next-{i}")}),
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        let r = JournalWriter::open(dir.path(), "s-runaway-anchor").unwrap();
+        assert_eq!(r.replay_runaway_actions(), 50);
     }
 }

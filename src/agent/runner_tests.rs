@@ -3714,6 +3714,97 @@ fn test_rewind_budget_restored_from_journal_balance() {
     assert_eq!(b.remaining, REWIND_BUDGET_LIMIT - 1);
 }
 
+// ===== Runaway 护栏(18 号 PR-3:连续自动操作上限+复述注入)=====
+
+#[test]
+fn test_runaway_guard_bump_trips_at_threshold() {
+    // 累计配额语义:bump 至阈值触发;触发后仍可 bump(暂停路径由调用方收尾,
+    // 计数器本身不拒绝——触发判据=恰达阈值那次返回 true)
+    let mut g = RunawayGuard::new(3);
+    assert!(!g.bump(), "第 1 次未达阈值");
+    assert!(!g.bump(), "第 2 次未达阈值");
+    assert!(g.bump(), "第 3 次恰达阈值触发");
+    assert_eq!(g.actions, 3);
+}
+
+#[test]
+fn test_runaway_guard_restored_from_journal_count() {
+    // 跨重启回填(修订⑦):按 journal 回填值恢复累计数,阈值不变;
+    // 回填值即达阈值时立即触发(护栏不可绕过)
+    let mut g = RunawayGuard::restored(199, 200);
+    assert_eq!(g.actions, 199);
+    assert!(g.bump(), "回填 199 后第 200 次触发——重启不可绕过护栏");
+}
+
+#[test]
+fn test_runaway_guard_semantics_independent_from_rewind_budget() {
+    // 语义分离锁(方案判据:独立计数独立 journal 变体):
+    // RunawayGuard 累计配额不随成功重置;RewindBudget 连续失败预算随推进回满
+    // ——两计数器状态互不影响,护栏叠加不混淆
+    let mut runaway = RunawayGuard::new(200);
+    let mut rewind = RewindBudget::new(REWIND_BUDGET_LIMIT);
+    for _ in 0..50 {
+        assert!(!runaway.bump());
+        rewind.reset(REWIND_BUDGET_LIMIT); // 正常推进回满
+    }
+    assert_eq!(runaway.actions, 50, "Runaway 累计不随成功重置");
+    assert_eq!(rewind.remaining, REWIND_BUDGET_LIMIT, "Rewind 推进即回满");
+    for _ in 0..32 {
+        assert!(rewind.consume());
+    }
+    assert!(!rewind.consume(), "Rewind 连续失败熔断");
+    assert_eq!(runaway.actions, 50, "Rewind 消费不影响 Runaway 计数");
+}
+
+#[test]
+fn test_runaway_restatement_block_content() {
+    // 修订④复述块内容锁:任务目标+条件清单(带组名前缀)+Runaway 余量三要素
+    let block = runaway_restatement_block(
+        "重构 auth 模块",
+        &[
+            "[shell_exec] 仅白名单 cargo 命令".to_string(),
+            "[file_delete] 仅限工作区临时目录".to_string(),
+        ],
+        42,
+    );
+    assert!(block.contains("任务护栏复述"), "复述块标题在场");
+    assert!(block.contains("任务目标: 重构 auth 模块"), "目标在场");
+    assert!(
+        block.contains("[shell_exec] 仅白名单 cargo 命令"),
+        "条件带组名前缀"
+    );
+    assert!(
+        block.contains("[file_delete] 仅限工作区临时目录"),
+        "条件带组名前缀"
+    );
+    assert!(block.contains("42 次操作"), "余量在场");
+    // 空条件清单降级形态(不空串)
+    let empty = runaway_restatement_block("g", &[], 200);
+    assert!(empty.contains("(无预置条件)"), "空条件有显式占位");
+}
+
+#[test]
+fn test_runaway_policy_from_policy_file() {
+    // 注入面构造:阈值取 policy_limits,条件按组平铺带前缀
+    let f = crate::agent::approval_policy::ApprovalPolicyFile::from_toml(
+        "[shell_exec]\nconditions = [\"仅 cargo\", \"仅工作区\"]\n[file_delete]\nconditions = [\"仅临时目录\"]\n[policy_limits]\nmax_corrections = 3\nmax_actions_per_run = 120",
+    )
+    .unwrap();
+    let rp = RunawayPolicy::from_policy_file(&f);
+    assert_eq!(rp.max_actions_per_run, 120);
+    assert_eq!(rp.restate_conditions.len(), 3);
+    // BTreeMap 键序无关断言:每条条件带所属组名前缀
+    assert!(rp.restate_conditions.iter().all(|c| c.starts_with('[')));
+    assert!(rp
+        .restate_conditions
+        .iter()
+        .any(|c| c.starts_with("[shell_exec] ")));
+    assert!(rp
+        .restate_conditions
+        .iter()
+        .any(|c| c.starts_with("[file_delete] ")));
+}
+
 // ===== B21 D3 主动压缩(近摘要区/工具结果引用替代/策略映射)=====
 
 fn user_msg(content: &str) -> Message {
