@@ -681,6 +681,11 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/git/identity",
             axum::routing::get(crate::api::git_api::identity),
         )
+        // B15:AI commit message 生成(staged diff → 三级截断 → LLM 薄委托;只读不提交)
+        .route(
+            "/api/git/commit-message/generate",
+            axum::routing::post(crate::api::git_api::generate),
+        )
         // G14:记忆事件查询 — 返回 session 的所有结构化事件
         .route(
             "/api/sessions/{id}/events",
