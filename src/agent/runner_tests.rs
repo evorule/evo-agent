@@ -3717,23 +3717,25 @@ fn test_rewind_budget_restored_from_journal_balance() {
 // ===== Runaway 护栏(18 号 PR-3:连续自动操作上限+复述注入)=====
 
 #[test]
-fn test_runaway_guard_bump_trips_at_threshold() {
-    // 累计配额语义:bump 至阈值触发;触发后仍可 bump(暂停路径由调用方收尾,
-    // 计数器本身不拒绝——触发判据=恰达阈值那次返回 true)
+fn test_runaway_guard_bump_trips_over_quota() {
+    // 累计配额语义(方案判据「200 后暂停」):阈值次数内放行,第 threshold+1
+    // 次尝试触发;触发后仍可 bump(暂停路径由调用方收尾,计数器本身不拒绝)
     let mut g = RunawayGuard::new(3);
-    assert!(!g.bump(), "第 1 次未达阈值");
-    assert!(!g.bump(), "第 2 次未达阈值");
-    assert!(g.bump(), "第 3 次恰达阈值触发");
-    assert_eq!(g.actions, 3);
+    assert!(!g.bump(), "第 1 次配额内放行");
+    assert!(!g.bump(), "第 2 次配额内放行");
+    assert!(!g.bump(), "第 3 次(恰达阈值)仍放行——阈值次操作真实可执行");
+    assert!(g.bump(), "第 4 次超出配额触发");
+    assert_eq!(g.actions, 4);
 }
 
 #[test]
 fn test_runaway_guard_restored_from_journal_count() {
     // 跨重启回填(修订⑦):按 journal 回填值恢复累计数,阈值不变;
-    // 回填值即达阈值时立即触发(护栏不可绕过)
+    // 回填后剩余配额内放行、超限即触发(护栏不可绕过)
     let mut g = RunawayGuard::restored(199, 200);
     assert_eq!(g.actions, 199);
-    assert!(g.bump(), "回填 199 后第 200 次触发——重启不可绕过护栏");
+    assert!(!g.bump(), "回填 199 后第 200 次配额内放行");
+    assert!(g.bump(), "回填后第 201 次触发——重启不可绕过护栏");
 }
 
 #[test]
