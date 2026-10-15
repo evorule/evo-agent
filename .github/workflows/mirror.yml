@@ -1,8 +1,9 @@
 name: Mirror from Gitee
 
 # 生态统一镜像模板 v1 (2026-09-16): Gitee(主仓) → GitHub(镜像)。
-# 定时(UTC 00:00 = 北京时间 08:00)将 Gitee 的全部分支与 tag 强制同步到 GitHub,
-# 手动触发见 workflow_dispatch。
+# 2026-10-15 统帅令: 定时镜像废除(推送一律人工/LLM 手动执行, 不留自动直达
+# 公开镜像的通道); 需要镜像时人工 workflow_dispatch 触发, 将 Gitee 的
+# 全部分支与 tag 强制同步到 GitHub。
 #
 # 前置: 在 GitHub 仓库 Settings → Secrets and variables → Actions 配置
 #   GITEE_TOKEN (Gitee 个人令牌, 勾选 repos + projects 权限) 用于鉴权推送。
@@ -24,8 +25,6 @@ name: Mirror from Gitee
 #   同步删除 (差集清理), 恢复「镜像 = 忠实同步」语义。
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
   workflow_dispatch:
 
 permissions:
