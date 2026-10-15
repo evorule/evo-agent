@@ -271,10 +271,11 @@ mod tests {
 
     #[test]
     fn match_symbols_ranks_by_file_score_and_dedupes_order() {
-        let mut symbols = Vec::new();
-        symbols.push(sym("hot.rs", "parse_config"));
-        symbols.push(sym("cold.rs", "parse_args"));
-        symbols.push(sym("cold.rs", "unrelated"));
+        let symbols = vec![
+            sym("hot.rs", "parse_config"),
+            sym("cold.rs", "parse_args"),
+            sym("cold.rs", "unrelated"),
+        ];
         // hot.rs 被引用 → 分数更高
         let refs = vec![refrow("cold.rs", "hot.rs", 2.0)];
         let g = SymbolGraph::build(&symbols, &refs, &HashMap::new());

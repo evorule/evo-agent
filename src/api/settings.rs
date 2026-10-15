@@ -473,6 +473,16 @@ pub fn schema() -> Vec<SettingEntry> {
             description: "代码库语义索引（符号图谱检索，/api/index/*；默认关——开启后 serve 启动时对工作区建索引并持续增量维护，重启生效）",
             scope: "window",
         },
+        SettingEntry {
+            key: "index.semantic.enabled",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "工作台",
+            description: "语义面向量检索（mode=semantic/hybrid，依赖 index.enabled）。首次启用将下载本地嵌入模型 all-MiniLM-L6-v2 q8（约 24MB，来源 HuggingFace，缓存于 ~/.evo-agent/models，之后离线运行）；重启生效",
+            scope: "window",
+        },
     ]
 }
 
@@ -783,7 +793,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 38); // 计数锁:新增键须同步(scheme 单源纪律)
+        assert_eq!(settings.len(), 39); // 计数锁:新增键须同步(scheme 单源纪律)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -838,6 +848,9 @@ mod tests {
         assert_eq!(settings["mentions.terminalLines"], json!(200));
         // index.enabled 默认关:后台索引为重资源行为,显式开启(重启生效)
         assert_eq!(settings["index.enabled"], json!(false));
+        // index.semantic.enabled 默认关:首次启用触发约 24MB 模型下载(明示),
+        // 依赖 index.enabled;缺省关 = 零外发零行为变化
+        assert_eq!(settings["index.semantic.enabled"], json!(false));
         for (k, v) in &sources {
             assert_eq!(v, &json!("default"), "key {k} should be default");
         }
