@@ -30,7 +30,7 @@ pub struct CausalLink {
 }
 
 /// /audit/causal/{fact_id} 完整响应（类型化）
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CausalChain {
     /// 会话 ID。
     pub session_id: u64,
@@ -43,7 +43,7 @@ pub struct CausalChain {
 }
 
 /// /audit/verify 完整响应（类型化）
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditVerify {
     /// 整链哈希校验是否通过。
     pub verified: bool,
