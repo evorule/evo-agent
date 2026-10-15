@@ -547,15 +547,22 @@ export function registerArtifact(path, draftContent, sid) {
   });
 }
 
-/** 定稿标记(保存成功后调用;仅对已登记产物生效,幂等) */
+/** 定稿标记(保存成功后调用;仅对已登记产物生效,幂等)。
+ *  返回是否发生首次定稿(true = 本次完成定稿;false = 已定稿或非登记产物)。
+ *  首次定稿置 govS4Notify 信号——ws.js 消费后发 s4_publish 帧入 gov 账本
+ *  (B22 治理留痕,摘要级 best-effort,WS 未连即丢弃不重试) */
 export function markFinalized(path) {
   const sid = get(sessionId);
+  const isFirst = get(artifacts).some((a) => a.path === path && a.finalizedAt === null);
+  if (!isFirst) return false;
   artifacts.update((list) => {
     if (!list.some((a) => a.path === path && a.finalizedAt === null)) return list;
     const next = list.map((a) => (a.path === path && a.finalizedAt === null ? { ...a, finalizedAt: Date.now() } : a));
     persistArtifacts(next, sid);
     return next;
   });
+  govS4Notify.set({ path });
+  return true;
 }
 
 // ---- 命令基础设施:视图显隐 + 命令面板状态 ----
@@ -617,6 +624,11 @@ export const govEvents = writable([]);
 
 /** B15:AI 生成提交消息意图(命令面板触发;自增计数,ScmView 消费后触发生成) */
 export const scmGenerateIntent = writable(0);
+
+/** B22:S4 定稿治理留痕信号(一次性):markFinalized 首次定稿产物时置
+ *  {path},ws.js 订阅后发 s4_publish 帧入 gov 账本(单向依赖——stores
+ *  不反导 ws.js,经信号桥接;消费后复位 null) */
+export const govS4Notify = writable(null);
 
 let evSeq = 0;
 /** 底部面板事件入口(kind: sys | gov;label/level 决定渲染样式) */

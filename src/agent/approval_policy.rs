@@ -294,6 +294,23 @@ impl ApprovalCallback for PolicyReview {
             judgement = %raw,
             "policy review judged"
         );
+        // B22:policy_verdict 治理事件（三态判定+判定依据摘要——serve 侧封存
+        // 锚点的持久化镜像，23 号档 §3.1；best-effort 不阻断分派）
+        let conditions_summary = if matches!(verdict, ReviewVerdict::Approved) {
+            summary_of(&judgement)
+        } else {
+            format!(
+                "{}；总体理由：{}",
+                failures_of(&judgement),
+                judgement.reason
+            )
+        };
+        crate::governance::hooks::policy_verdict(
+            req,
+            verdict.as_str(),
+            &conditions_summary,
+            self.exemption_override,
+        );
 
         // 7. 分派
         let marker = if red_line.is_some() {
