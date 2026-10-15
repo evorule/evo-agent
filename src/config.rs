@@ -19,13 +19,14 @@
 //!   `OPENAI_API_KEY` 族,优先级同序,详见 `.env.example`);
 //! - 都缺省时回落 toml 合并值或代码默认值。
 //!
-//! 配置文件支持 `${ENV:VAR_NAME}` 占位符(用于 `api_key` 字段),加载时展开为环境变量值。
+//! 配置文件支持 `${ENV:VAR_NAME}` 占位符,加载时展开为环境变量值
+//! (SG-1 key 归边起 `api_key` 不再消费——出站统一走执行体端点,凭据
+//! 仅存于执行体侧,配置里无需也不应再写密钥)。
 //!
 //! # 配置文件示例
 //! ```toml
 //! [llm]
 //! provider = "minimax"
-//! api_key = "${ENV:MINIMAX_API_KEY}"
 //! model = "MiniMax-M2.5"
 //!
 //! [evorule]
@@ -51,7 +52,9 @@ pub struct LlmConfig {
     /// 日志但不拒绝(为未来多 provider 路由预留)。
     #[serde(default = "LlmConfig::default_provider")]
     pub provider: String,
-    /// API key,支持 `${ENV:VAR_NAME}` 占位符
+    /// API key(SG-1 key 归边起不再消费:出站统一走执行体端点,凭据
+    /// 仅存于执行体侧;缺省恒空,非空配置加载时告警提示移除。
+    /// `${ENV:VAR_NAME}` 占位符解析属通用机制仍生效,但对该字段已无意义)
     #[serde(default = "LlmConfig::default_api_key")]
     pub api_key: String,
     /// 模型名
@@ -78,9 +81,11 @@ impl LlmConfig {
     pub fn default_provider() -> String {
         "minimax".to_string()
     }
-    /// 默认 api_key(占位符,加载时展开)
+    /// 默认 api_key(SG-1 key 归边起恒空:凭据仅存于执行体侧,本字段
+    /// 不再消费;此前缺省占位符 `${ENV:MINIMAX_API_KEY}` 会令严格模式
+    /// 在未设该环境变量时 fail-closed,与归边架构矛盾)
     pub fn default_api_key() -> String {
-        "${ENV:MINIMAX_API_KEY}".to_string()
+        String::new()
     }
     /// 默认 model
     pub fn default_model() -> String {
@@ -626,8 +631,9 @@ impl Config {
     ///
     /// `project_dir` 是项目根目录,会在该目录下查找 `evo-agent.toml`。
     ///
-    /// 此方法为严格模式:LLM API key 必须存在,否则报错。
-    /// 适用于 `run` 命令(实际需要调用 LLM)。
+    /// 此方法为严格模式:`${ENV:VAR}` 占位符解析 fail-closed(引用的
+    /// 变量未设置即报错)。适用于 `run` 命令等实际执行路径。
+    /// (LLM API key 自 SG-1 key 归边起不再消费,不再强制非空)
     pub fn load(project_dir: &Path) -> Result<Self, ConfigError> {
         let mut config = Config::default();
 
@@ -868,12 +874,12 @@ impl Config {
             ),
         }
 
-        // LLM API key 不能为空
-        if self.llm.api_key.is_empty() {
-            return Err(ConfigError::InvalidValue {
-                field: "llm.api_key".to_string(),
-                reason: "must not be empty (set directly or via ${{ENV:VAR}})".to_string(),
-            });
+        // LLM API key:SG-1 key 归边起不再消费(出站统一走执行体端点,
+        // 凭据仅存于执行体侧)——不再强制非空;非空配置告警留痕提示清理
+        if !self.llm.api_key.is_empty() {
+            tracing::warn!(
+                "llm.api_key 已不消费(SG-1 key 归边:出站统一走执行体端点,凭据仅存于执行体侧);建议从配置中移除该字段"
+            );
         }
 
         // evorule base_url 必须是 http:// 或 https:// 开头
@@ -919,9 +925,10 @@ impl Config {
 
     /// 宽松验证(用于 list/tools/config 等只读命令)
     ///
-    /// 与 [`validate`](Self::validate) 的区别:
-    /// - 跳过 LLM API key 非空验证
-    /// - 仍然验证 base_url/logging 等非 LLM 字段
+    /// 与 [`validate`](Self::validate) 的差异已随 SG-1 key 归边收窄:
+    /// 两者都不再强制 LLM API key 非空;宽松模式仍以空串降级占位符
+    /// 解析(严格模式 fail-closed)。仍然验证 base_url/logging 等非
+    /// LLM 字段
     fn validate_lenient(&self) -> Result<(), ConfigError> {
         // provider 为展示预留字段:未知值仅警告不拒绝(同严格模式口径)
         match self.llm.provider.as_str() {
@@ -1146,13 +1153,13 @@ mod tests {
 
     #[test]
     fn test_validate_empty_api_key() {
+        // SG-1 key 归边起 api_key 不再消费:空=正态(缺省恒空),非空=
+        // Ok+告警提示清理(旧「非空强制」守门与归边架构矛盾,已移除)
         let mut cfg = Config::default();
         cfg.llm.api_key = "".to_string();
-        let result = cfg.validate();
-        assert!(matches!(
-            result,
-            Err(ConfigError::InvalidValue { ref field, .. }) if field == "llm.api_key"
-        ));
+        assert!(cfg.validate().is_ok());
+        cfg.llm.api_key = "legacy-key".to_string();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
