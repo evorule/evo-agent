@@ -88,6 +88,15 @@ pub struct AgentRunRequest {
     /// 字段——仅 HTTP 请求方可设。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
+    /// 恢复语义分流(可选,仅 react 面消费;plan_execute 面携带忽略,同
+    /// step_timeout_secs 先例):"crash"(缺省)=既有崩溃恢复——无新输入,
+    /// 悬挂工具处置后续完中断轮;"continue"=多轮续聊——活会话走
+    /// run_continuation(要求新输入),死会话(引擎侧 404)自动降级为重建:
+    /// 取两级历史(活投影→本地快照)合成重建回注块后以新会话续跑,响应
+    /// rebuilt_from_session 透出旧会话名。非法值 400;恢复仅经显式入参,
+    /// 不自动续跑(人类持剑)。LLM 面不可见该字段——仅 HTTP 请求方可设。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_mode: Option<String>,
     /// plan-execute 粒执行器步超时覆写(可选;秒)。粒定义步超时
     /// (如 general 300s)小于容器命令预算 600s 时,超时长的容器内命令
     /// (pip/构建类)被步超时先杀——请求级覆写粒定义 step_timeout_secs。
@@ -124,6 +133,11 @@ pub struct AgentRunResponse {
     /// resume_session_id 显式恢复。react/缺省不序列化)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_session_id: Option<String>,
+    /// 重建回退发生时的旧会话名(resume_mode=continue 且引擎侧会话已失效
+    /// → 两级取历史合成重建回注块后以新会话续跑;此时 session_id=新会话
+    /// 名,本字段=旧会话名供消费端对账。react 其他路径/plan_execute 不序列化)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebuilt_from_session: Option<String>,
 }
 
 /// plan-execute 驱动循环统计(stats 七项透出;字段语义见 `driver::PlanLoopStats`)
@@ -938,20 +952,47 @@ async fn run_agent(
     axum::extract::Path(agent_type): axum::extract::Path<String>,
     Json(req): Json<AgentRunRequest>,
 ) -> Result<Json<AgentRunResponse>, (StatusCode, String)> {
+    // B17 持久会话:恢复语义预校验(fail-visible,先于定义加载与 runner 构造;
+    // 请求形状级校验最前置,agent 定义是否存在不影响 400 判定)。仅 react 面
+    // 消费——plan_execute 面携带忽略(同 step_timeout_secs 先例)。
+    let exec_mode = req
+        .execution
+        .as_ref()
+        .map(|e| e.mode.as_str())
+        .unwrap_or("react");
+    if exec_mode != "plan_execute" {
+        if let Some(mode) = req.resume_mode.as_deref() {
+            if mode != "crash" && mode != "continue" {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown resume_mode '{mode}' (expected \"crash\" or \"continue\")"),
+                ));
+            }
+            if req.resume_session_id.is_none() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "resume_mode requires resume_session_id".to_string(),
+                ));
+            }
+            if mode == "continue" && req.goal.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "resume_mode=continue requires a non-empty goal (new input)".to_string(),
+                ));
+            }
+        }
+    }
+
     let mut def = load_serve_definition(&state, &agent_type)?;
 
     // 执行模式分流（先于 per-request 覆盖——覆盖块按值取走 req 字段；plan_execute
     // 分支不消费 def，行为等价于「覆盖之后、AgentRunner 构造之前」）：
     // mode=plan_execute 走外层驱动循环（plan-execute 挂 driver），react（缺省/
     // None）走既有单代理路径（下方逐字节不动）。未知 mode = 400。
-    // 恢复旗标两态合法:plan_execute=计划级恢复;react/缺省=会话崩溃恢复
-    //(无新输入,悬挂工具处置后续完当前 turn)。恢复仅经显式入参,不自动续跑。
-    match req
-        .execution
-        .as_ref()
-        .map(|e| e.mode.as_str())
-        .unwrap_or("react")
-    {
+    // 恢复旗标合法态:plan_execute=计划级恢复;react/缺省=崩溃恢复,或经
+    // resume_mode=continue 选续聊语义(见下方恢复分支)。恢复仅经显式入参,
+    // 不自动续跑。
+    match exec_mode {
         "react" => {} // 现路径零变化
         "plan_execute" => return run_plan_execute_request(&state, &agent_type, &req).await,
         other => {
@@ -1076,12 +1117,57 @@ async fn run_agent(
     // 捕获流中 SessionCreated 的会话 ID,挂工作台本地索引(与 WS 面同
     // 口径,fail-soft;record 读时去重合并)+ 响应携带 session_id(会话关联收口)。
     let index_title: String = req.goal.chars().take(60).collect();
-    // 恢复旗标(react 面):resume_session_id 在场=崩溃恢复——无新输入
-    //(goal 字段忽略),悬挂工具处置后自然续完当前 turn;响应 session_id
-    // 取恢复会话名(continuation 不发 SessionCreated)
+    // 恢复旗标(react 面):resume_session_id 在场按 resume_mode 分流——
+    // crash(缺省)=崩溃恢复,无新输入(goal 字段忽略),悬挂工具处置后自然
+    // 续完当前 turn,响应 session_id 取恢复会话名(continuation 不发
+    // SessionCreated);continue=续聊,先 get_state 活性预检(单 runner 不被
+    // 消费;与 resume_crashed 的预检先例同源):活会话 → run_continuation,
+    // 死会话(引擎侧 404)→ 重建回退——两级取历史(活投影→本地快照)合成
+    // 重建回注块后以新会话续跑,响应 rebuilt_from_session=旧会话名;
+    // 其他预检错误 → 502 fail-visible
+    let mut rebuilt_from_session: Option<String> = None;
     let (result, session_id) = if let Some(sid) = &req.resume_session_id {
-        let (r, _) = consume_to_done(runner.resume_crashed(sid.clone())).await;
-        (r, Some(sid.clone()))
+        match req.resume_mode.as_deref().unwrap_or("crash") {
+            "continue" => {
+                // 空 goal 校验已在最前置块完成(continue 无新输入即 400)
+                match state.evorule_client().get_state(sid).await {
+                    Ok(_) => {
+                        let (r, _) =
+                            consume_to_done(runner.run_continuation(sid.clone(), req.goal)).await;
+                        (r, Some(sid.clone()))
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if crate::api::snapshots::is_session_gone(&err_str) {
+                            // 死会话重建回退:不静默丢上下文——历史不可得即 fail-visible
+                            let history = load_rebuild_history(&state, sid, &agent_type).await?;
+                            if history.is_empty() {
+                                return Err((
+                                    StatusCode::BAD_REQUEST,
+                                    format!(
+                                        "cannot continue session '{sid}': engine session is gone and no recoverable history (no local snapshot); use a fresh run"
+                                    ),
+                                ));
+                            }
+                            let composed = compose_rebuild_context(&history, &req.goal);
+                            let (r, new_sid) =
+                                consume_to_done(runner.run_streaming(composed)).await;
+                            rebuilt_from_session = Some(sid.clone());
+                            (r, new_sid)
+                        } else {
+                            return Err((
+                                StatusCode::BAD_GATEWAY,
+                                format!("resume precheck failed: {err_str}"),
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {
+                let (r, _) = consume_to_done(runner.resume_crashed(sid.clone())).await;
+                (r, Some(sid.clone()))
+            }
+        }
     } else {
         consume_to_done(runner.run_streaming(req.goal)).await
     };
@@ -1118,6 +1204,7 @@ async fn run_agent(
         duration_ms: result.duration_ms,
         error: result.error,
         session_id,
+        rebuilt_from_session,
         plan_stats: None,
         run_session_id: None,
     }))
@@ -1218,6 +1305,7 @@ async fn run_plan_execute_request(
                 duration_ms: started.elapsed().as_millis() as u64,
                 error: Some(e),
                 session_id: None,
+                rebuilt_from_session: None,
                 plan_stats: None,
                 run_session_id: None,
             }));
@@ -1248,6 +1336,7 @@ async fn run_plan_execute_request(
         duration_ms: started.elapsed().as_millis() as u64,
         error: None,
         session_id: Some(marks_session),
+        rebuilt_from_session: None,
         run_session_id: outcome.run_session_id.clone(),
         plan_stats: Some(PlanStatsResponse {
             plan_versions: outcome.stats.plan_versions,
@@ -1768,6 +1857,83 @@ pub(crate) fn resolve_memory_namespace(state: &AgentApiState, agent_type: &str) 
         // 定义加载失败/未配置 → 与 serve 侧 general 注入口径一致
         _ => "general".to_string(),
     }
+}
+
+// =============================================================================
+// B17 持久会话:死会话重建回退(两级历史 → 重建回注块)
+// =============================================================================
+
+/// 两级取历史(与 `GET /api/sessions/{id}/transcript` 同口径):
+/// 活投影(facts)→ 本地快照(TurnEnd 落盘)。两源皆不可得 → 空表
+/// (调用方 fail-visible 指引 fresh run,不静默丢上下文续跑)。
+async fn load_rebuild_history(
+    state: &AgentApiState,
+    session_id: &str,
+    agent_type: &str,
+) -> Result<Vec<crate::agent::memory::MessageRecord>, (StatusCode, String)> {
+    let namespace = resolve_memory_namespace(state, agent_type);
+    match crate::api::session_index::load_transcript(state.evorule_client(), session_id, &namespace)
+        .await
+    {
+        Ok(messages) => Ok(messages),
+        // 会话已被引擎回收(或读取失败)→ 回落本地快照
+        Err(_) => Ok(state
+            .snapshots()
+            .load(session_id)
+            .map(|snap| snap.messages)
+            .unwrap_or_default()),
+    }
+}
+
+/// 历史消息 → 重建回注块+新输入合成(纯函数,无 IO)。
+///
+/// 压缩口径(与前端 sessionRebuild.buildRebuildBlock 同格式同口径,
+/// 保证 HTTP 面与工作台面续聊上下文一致):仅 user/assistant 角色;
+/// 最近 20 条;单条 1500 字符截断;总预算 6000 字符(自最新往回收集,至少
+/// 保 1 条)。历史块在前、新输入在文末(回注头明示「直接回应文末的新输入」)。
+fn compose_rebuild_context(history: &[crate::agent::memory::MessageRecord], goal: &str) -> String {
+    const HEADER: &str = "[会话重建回注] 此前会话在引擎侧已失效(闲置回收或服务重启),以下为历史消息投影,供续接上下文;请勿复述,直接回应文末的新输入。";
+    const MAX_MESSAGES: usize = 20;
+    const MAX_PER_MESSAGE: usize = 1500;
+    const MAX_TOTAL: usize = 6000;
+
+    // 仅 user/assistant;单条截断(按字符数,非字节,防切破多字节字符)
+    let candidates: Vec<(&str, String)> = history
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .map(|m| {
+            let content = if m.content.chars().count() > MAX_PER_MESSAGE {
+                m.content.chars().take(MAX_PER_MESSAGE).collect::<String>()
+            } else {
+                m.content.clone()
+            };
+            (m.role.as_str(), content)
+        })
+        .collect();
+
+    // 自最新往回收集,总预算内(首条无条件保留=至少保 1 条;条数上限同步生效)
+    let mut picked_rev: Vec<&(&str, String)> = Vec::new();
+    let mut total = 0usize;
+    for item in candidates.iter().rev() {
+        if picked_rev.len() >= MAX_MESSAGES {
+            break;
+        }
+        let cost = item.1.chars().count();
+        if !picked_rev.is_empty() && total + cost > MAX_TOTAL {
+            break;
+        }
+        total += cost;
+        picked_rev.push(item);
+    }
+
+    let mut lines: Vec<String> = vec![HEADER.to_string(), "<recovered_history>".to_string()];
+    for (role, content) in picked_rev.into_iter().rev() {
+        lines.push(format!("[{role}] {content}"));
+    }
+    lines.push("</recovered_history>".to_string());
+    lines.push(String::new());
+    lines.push(goal.to_string());
+    lines.join("\n")
 }
 
 // =============================================================================
@@ -2612,6 +2778,7 @@ mod tests {
             workspace: None,
             execution: None,
             resume_session_id: None,
+            resume_mode: None,
             step_timeout_secs: None,
         };
 
@@ -2787,6 +2954,7 @@ mod tests {
             duration_ms: 100,
             error: None,
             session_id: Some("sess-1".to_string()),
+            rebuilt_from_session: None,
             plan_stats: None,
             run_session_id: None,
         };
@@ -2804,6 +2972,8 @@ mod tests {
             !bare_json.contains("plan_stats"),
             "react/缺省不透出 plan_stats"
         );
+        // B17:rebuilt_from_session None 不序列化(旧消费者零影响)
+        assert!(!bare_json.contains("rebuilt_from_session"));
         assert!(json.contains("hello"));
         assert!(json.contains("3"));
     }
@@ -2818,6 +2988,7 @@ mod tests {
             duration_ms: 5000,
             error: None,
             session_id: Some("marks-1".to_string()),
+            rebuilt_from_session: None,
             plan_stats: Some(PlanStatsResponse {
                 plan_versions: 1,
                 replans: 0,
@@ -2973,6 +3144,7 @@ mod tests {
             workspace: None,
             execution: None,
             resume_session_id: None,
+            resume_mode: None,
             step_timeout_secs: None,
         };
         let response = rt.block_on(async {
@@ -2989,6 +3161,137 @@ mod tests {
         });
         // 路由匹配成功 → handler 返回 404(agent 不存在)
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ===== B17 持久会话:恢复语义校验 + 重建回退合成 =====
+
+    /// B17 请求构造助手(react 面,general 定义测试环境可加载)
+    fn b17_run_request(
+        goal: &str,
+        resume_mode: Option<&str>,
+        sid: Option<&str>,
+    ) -> AgentRunRequest {
+        AgentRunRequest {
+            agent_type: "general".to_string(),
+            goal: goal.to_string(),
+            max_steps: None,
+            temperature: None,
+            model: None,
+            container: None,
+            workspace: None,
+            execution: None,
+            resume_session_id: sid.map(|s| s.to_string()),
+            resume_mode: resume_mode.map(|m| m.to_string()),
+            step_timeout_secs: None,
+        }
+    }
+
+    async fn b17_post_run(
+        app: axum::Router,
+        body: &AgentRunRequest,
+    ) -> http::Response<axum::body::Body> {
+        app.oneshot(
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/agents/general/run")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_run_rejects_unknown_resume_mode() {
+        // J-B17-5a:resume_mode 非法值 400(fail-visible,先于 runner 构造)
+        let app = router(make_test_state());
+        let response = b17_post_run(app, &b17_run_request("g", Some("bogus"), Some("s1"))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_run_rejects_resume_mode_without_session() {
+        // J-B17-5b:resume_mode 在场但缺 resume_session_id 400
+        let app = router(make_test_state());
+        let response = b17_post_run(app, &b17_run_request("g", Some("continue"), None)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_run_rejects_continue_with_empty_goal() {
+        // J-B17-5c:continue 空 goal 400(新输入是续聊的硬前提)
+        let app = router(make_test_state());
+        let response =
+            b17_post_run(app, &b17_run_request("   ", Some("continue"), Some("s1"))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn b17_msg(role: &str, content: &str) -> crate::agent::memory::MessageRecord {
+        crate::agent::memory::MessageRecord {
+            idx: 0,
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_name: None,
+            timestamp: 0,
+            fact_id: None,
+        }
+    }
+
+    #[test]
+    fn test_compose_rebuild_context_filters_roles_and_keeps_order() {
+        // J-B17-6:角色过滤(tool/system 剔除)+ 旧→新序 + goal 文末
+        let history = vec![
+            b17_msg("system", "sys prompt"),
+            b17_msg("user", "u1"),
+            b17_msg("assistant", "a1"),
+            b17_msg("tool", "tool out"),
+            b17_msg("user", "u2"),
+        ];
+        let out = compose_rebuild_context(&history, "new goal");
+        assert!(out.starts_with("[会话重建回注]"));
+        assert!(out.contains("<recovered_history>"));
+        assert!(out.contains("</recovered_history>"));
+        assert!(!out.contains("sys prompt"));
+        assert!(!out.contains("tool out"));
+        let u1 = out.find("[user] u1").unwrap();
+        let a1 = out.find("[assistant] a1").unwrap();
+        let u2 = out.find("[user] u2").unwrap();
+        assert!(u1 < a1 && a1 < u2, "历史按时间正序回注");
+        assert!(out.ends_with("new goal"), "新输入在文末");
+    }
+
+    #[test]
+    fn test_compose_rebuild_context_truncates_per_message() {
+        // J-B17-6:单条 1500 字符截断(按字符数,防切破多字节)
+        let long = "x".repeat(3000);
+        let out = compose_rebuild_context(&[b17_msg("user", &long)], "goal");
+        assert!(out.contains(&"x".repeat(1500)));
+        assert!(!out.contains(&"x".repeat(1501)));
+    }
+
+    #[test]
+    fn test_compose_rebuild_context_respects_total_budget_newest_first() {
+        // J-B17-6:总预算 6000 字符,自最新往回收集(25 条 × 500 字符 → 恰收 12 条)
+        let history: Vec<_> = (0..25)
+            .map(|i| b17_msg("user", &format!("m{i:02}{}", "y".repeat(497))))
+            .collect();
+        let out = compose_rebuild_context(&history, "g");
+        let picked = out.matches("[user] m").count();
+        assert_eq!(picked, 12, "6000/500=12 条入预算");
+        assert!(out.contains("[user] m24"), "最新一条必在");
+        assert!(out.contains("[user] m13"), "预算内最旧一条");
+        assert!(!out.contains("[user] m12"), "预算外旧条被裁");
+    }
+
+    #[test]
+    fn test_compose_rebuild_context_empty_history_keeps_goal() {
+        // 无历史(快照亦空)时块退化但合成仍合法(空历史在调用方已被 400 拦截,
+        // 此处锁纯函数自身行为)
+        let out = compose_rebuild_context(&[], "goal");
+        assert!(out.contains("<recovered_history>\n</recovered_history>"));
+        assert!(out.ends_with("goal"));
     }
 
     // ===== G6 /cancel 端点测试 =====
