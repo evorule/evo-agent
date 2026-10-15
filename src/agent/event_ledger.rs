@@ -213,6 +213,14 @@ pub struct EventLedger {
     inner: Mutex<LedgerInner>,
 }
 
+// B24:AgentApiState derive(Debug) 需要；内部为 tokio Mutex 串行化状态，
+// Debug 输出无诊断价值，非穷尽形态即可。
+impl std::fmt::Debug for EventLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventLedger").finish_non_exhaustive()
+    }
+}
+
 impl EventLedger {
     /// 由 runner 既有记忆件构造（与 MemoryEventStore/MemoryManager 同 namespace + client）
     pub fn new(store: MemoryEventStore, namespace: &str, client: EvoruleApiClient) -> Self {
