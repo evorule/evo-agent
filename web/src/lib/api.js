@@ -307,3 +307,21 @@ export function mcpRestartServer(name) {
 export function mcpStatus() {
   return fetch('/api/mcp/status', { headers: headers() }).then(unwrap);
 }
+
+/**
+ * 审批策略条件文件状态(批次一 PR-4)。
+ * {exists, parse_error, groups, limits, override}——exists=false 是合法态
+ * (未预置条件,policy 档运行时降级 manual);parse_error 非空 = 文件无效。
+ */
+export function getApprovalPolicy() {
+  return fetch('/api/approval-policy', { headers: headers() }).then(unwrap);
+}
+
+/** 试判定(机械预检,零 LLM):{tool, args} → {status, red_line, conditions, note, limits, override} */
+export function trialApproval(tool, args) {
+  return fetch('/api/approval-policy/trial', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ tool, args }),
+  }).then(unwrap);
+}

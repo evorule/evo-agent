@@ -6,6 +6,7 @@
 
 pub mod agent_api;
 pub mod api_core;
+pub mod approval_api;
 pub mod auth;
 pub mod completion_api;
 pub mod console_sidecar;

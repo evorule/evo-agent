@@ -30,6 +30,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use tracing::warn;
 
 use crate::api::agent_api::AgentApiState;
 
@@ -790,6 +791,19 @@ pub async fn put_settings(
         .write_user_layer_key(&body.key, v)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let (settings, sources) = store.merged();
+    // 红线豁免覆盖开启动作留痕（审批三档制：exemptionOverride=true = 用户显式
+    // 关闭红线强制人工审批面）——warning 级落日志；回落 false/重置不另记
+    if body.key == "approval.exemptionOverride"
+        && settings
+            .get(&body.key)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        warn!(
+            target: "approval_audit",
+            "红线豁免覆盖开启：approval.exemptionOverride=true，命中豁免清单的操作不再强制人工审批（判定留痕携带 exemption_overridden 标记）"
+        );
+    }
     let source = sources.get(&body.key).cloned().unwrap_or(json!("default"));
     Ok(Json(json!({
         "key": body.key,
