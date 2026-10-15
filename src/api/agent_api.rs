@@ -282,6 +282,9 @@ pub struct AgentApiState {
     /// B16 MCP 配置存储(.evo/mcp.toml 读写 + evo-agent.toml 回落;与 mcp
     /// 管理器成对注入,PUT 端点写回配置后重载生效)
     mcp_store: Option<Arc<crate::mcp::store::McpConfigStore>>,
+    /// B23 MCP server 暴露面开关(缺省 false;/mcp 路由仅在 true 时挂载,
+    /// fail-closed;serve 装配点从工作台设置 `mcpServer.enabled` 读取注入)
+    mcp_server_enabled: bool,
 }
 
 impl AgentApiState {
@@ -346,6 +349,7 @@ impl AgentApiState {
             // B16 MCP 管理器缺省不注入;serve 启动按 mcp 配置 with_mcp
             mcp: None,
             mcp_store: None,
+            mcp_server_enabled: false,
             fs_events: crate::api::fs_watch::FsEventHub::new(),
             workdir,
             workspace_client,
@@ -530,6 +534,17 @@ impl AgentApiState {
         self.mcp_store.as_ref()
     }
 
+    /// B23:注入 MCP server 暴露面开关(builder pattern;缺省 false)
+    pub fn with_mcp_server_enabled(mut self, enabled: bool) -> Self {
+        self.mcp_server_enabled = enabled;
+        self
+    }
+
+    /// B23:MCP server 暴露面开关(缺省 false)
+    pub fn mcp_server_enabled(&self) -> bool {
+        self.mcp_server_enabled
+    }
+
     /// B16:获取 union toolkit 底层锁(mcp_api 写路径 PUT/reload/restart
     /// 经 write() 注册工具;读路径一律走 [`Self::toolkit`] 读 guard)
     pub fn toolkit_lock(&self) -> &std::sync::RwLock<ToolHandler> {
@@ -551,6 +566,10 @@ pub fn router(state: AgentApiState) -> Router {
 pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::AuthConfig) -> Router {
     // G16:把 auth_config 也注入到 state,供 WebSocket handler 在升级前做二次校验
     let state = state.with_auth_config(auth_config.clone());
+    // B23:MCP server 暴露面开关(enabled=false 缺省 → /mcp 不挂载即 404,
+    // fail-closed;true 时挂载,鉴权由下方 G16 中间件统一覆盖,与 /api/mcp/*
+    // 工作台面同语义)
+    let mcp_server_exposed = state.mcp_server_enabled();
     Router::new()
         .route("/health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(metrics_handler))
@@ -797,12 +816,25 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         // skills 注册审批管理面(C 形态):全清单/待审预览/批准/撤销 —— 定义期
         // 供应链准入,留痕在 registry.json 账本(不走会话期 ApprovalCallback)
         .merge(crate::api::skill_api::skills_routes())
+        // B23:MCP server 暴露面(enabled=false → 空 Router,/mcp 404 fail-closed)
+        .merge(mcp_server_routes(mcp_server_exposed))
         .with_state(state)
         // G7:鉴权中间件(对 /health、/metrics 豁免)
         .layer(axum::middleware::from_fn_with_state(
             auth_config,
             crate::api::auth::auth_middleware,
         ))
+}
+
+/// B23:`/mcp` 暴露面子路由(enabled=true 才含路由;false 返回空 Router)
+///
+/// 挂载后鉴权由 G16 中间件统一覆盖(不在 PUBLIC_PATHS 豁免清单内)。
+fn mcp_server_routes(enabled: bool) -> axum::Router<AgentApiState> {
+    if enabled {
+        axum::Router::new().route("/mcp", axum::routing::post(crate::mcp::server::mcp_post))
+    } else {
+        axum::Router::new()
+    }
 }
 
 /// G5:健康检查端点

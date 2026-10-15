@@ -56,6 +56,7 @@
 
 pub mod client;
 pub mod manager;
+pub mod server;
 pub mod store;
 pub mod tool_adapter;
 pub mod transport;
