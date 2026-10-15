@@ -46,6 +46,7 @@ use tracing::{info, warn};
 use crate::index::chunker::{FileEntry, MAX_FILE_BYTES};
 use crate::index::embedder::TextEmbedder;
 use crate::index::graph::SymbolGraph;
+use crate::index::search_api::{rrf_fuse, HybridResult};
 use crate::index::store::{ChunkRow, IndexError};
 
 pub use chunker::{collect_workspace_files, DEFAULT_EXCLUDES, SKIP_EXTS};
@@ -56,6 +57,10 @@ pub const INDEX_DEBOUNCE_MS: u64 = 500;
 /// 增量更新并发批上限（超出即丢弃当批——store 单写者队列防积压；
 /// 丢批由下次全量对账兜底校正）
 const MAX_IN_FLIGHT: u64 = 4;
+/// hybrid 词法侧 grep 结果数上限（文件聚合前的行级命中预算；B2 REST 面同域量级）
+const HYBRID_LEXICAL_MAX_RESULTS: usize = 1000;
+/// hybrid 词法侧参与融合的文件数上限（RRF 输入排位深度；融合输出再按 limit 截断）
+const HYBRID_LEXICAL_MAX_FILES: usize = 200;
 
 /// 索引落盘目录：`<用户主目录>/.evo-agent/index/<workspace-hash16>/`
 ///
@@ -101,6 +106,47 @@ pub struct IndexStatusSnapshot {
     pub last_build_epoch: Option<u64>,
     /// 最近一次重建错误（fail-soft 留痕；成功后清除）
     pub last_error: Option<String>,
+    /// 语义面是否启用（嵌入器已装配）
+    pub semantic_enabled: bool,
+    /// 语义面模型名（未启用不下发）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_model: Option<String>,
+}
+
+/// 语义检索单命中（chunk 粒度，cosine 降序；search 端点 mode=semantic 直出）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SemanticHit {
+    /// 所属文件（相对路径，`/` 分隔）
+    pub file: String,
+    /// 文件内 chunk 序号
+    pub ord: u32,
+    /// 所属符号名
+    pub symbol: String,
+    /// 符号类别
+    pub kind: String,
+    /// 起始行（1 起，含）
+    pub start_line: u32,
+    /// 结束行（含）
+    pub end_line: u32,
+    /// cosine 相似度
+    pub score: f32,
+}
+
+/// cosine 相似度（dim 不符 → None 防御性丢弃，与 blob 守卫同口径；零范数 → 0.0）
+fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let (dot, na, nb) = a
+        .iter()
+        .zip(b)
+        .fold((0.0f32, 0.0f32, 0.0f32), |(d, x, y), (&p, &q)| {
+            (d + p * q, x + p * p, y + q * q)
+        });
+    if na == 0.0 || nb == 0.0 {
+        return Some(0.0);
+    }
+    Some(dot / (na.sqrt() * nb.sqrt()))
 }
 
 /// 全量重建结果（rebuild 端点三态：完成 / 在建冲突 / 失败）
@@ -122,6 +168,8 @@ pub struct IndexService {
     store: IndexStore,
     /// 图谱不可变快照（重建即整体替换；读侧克隆 `Arc` 无锁滞留）
     graph: RwLock<Arc<SymbolGraph>>,
+    /// 语义面向量快照（刷新派生时整体重载；读侧克隆 `Arc` 无锁滞留——graph 同款纪律）
+    vectors: RwLock<Arc<Vec<ChunkVectorRow>>>,
     /// 语义面嵌入器（None = 语义面关闭：chunk 照常落库，向量留空）
     embedder: Option<Arc<dyn TextEmbedder>>,
     /// 全量重建进行中（并发护栏）
@@ -156,6 +204,7 @@ impl IndexService {
             workdir: workdir.to_path_buf(),
             store,
             graph: RwLock::new(Arc::new(SymbolGraph::build(&[], &[], &HashMap::new()))),
+            vectors: RwLock::new(Arc::new(Vec::new())),
             embedder: None,
             building: AtomicBool::new(false),
             in_flight: AtomicU64::new(0),
@@ -189,6 +238,14 @@ impl IndexService {
         self.graph.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
+    /// 当前向量快照（语义检索暴力扫描输入；空 = 语义面未灌量）
+    pub fn vectors(&self) -> Arc<Vec<ChunkVectorRow>> {
+        self.vectors
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     /// 状态快照（status 端点）
     pub fn status(&self) -> IndexStatusSnapshot {
         let (files, symbols, refs) = self.store.counts().unwrap_or((0, 0, 0));
@@ -203,6 +260,8 @@ impl IndexService {
             ready: !self.graph().is_empty(),
             last_build_epoch: slow.last_build_epoch,
             last_error: slow.last_error.clone(),
+            semantic_enabled: self.embedder.is_some(),
+            semantic_model: self.embedder().map(|e| e.model_name()),
         }
     }
 
@@ -295,13 +354,15 @@ impl IndexService {
         Ok(true)
     }
 
-    /// 重刷派生面（refs 物化 + 图谱快照 + 慢变状态）
+    /// 重刷派生面（refs 物化 + 图谱快照 + 向量快照 + 慢变状态）
     fn refresh_derived(&self) -> Result<(), IndexError> {
         self.store.refresh_refs()?;
         let syms = self.store.all_symbols_min()?;
         let refs = self.store.all_refs()?;
         let graph = SymbolGraph::build(&syms, &refs, &HashMap::new());
         *self.graph.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(graph);
+        let vecs = self.store.all_vectors()?;
+        *self.vectors.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(vecs);
         let mut slow = self.slow.lock().unwrap_or_else(|p| p.into_inner());
         slow.last_build_epoch = Some(now_epoch());
         slow.last_error = None;
@@ -540,6 +601,122 @@ impl IndexService {
         info!("index watcher started (debounce {}ms)", INDEX_DEBOUNCE_MS);
         Ok(())
     }
+
+    /// 语义检索：查询文本嵌入 + 向量快照暴力精确扫描（cosine 降序取 top-limit）
+    ///
+    /// CPU 密集（嵌入 + 全量点积）：调用方须在 spawn_blocking 执行。语义面未
+    /// 装配（无嵌入器）返回 `Err`——端点侧先查 [`Self::embedder`] 分流禁用态
+    /// （C-3 口径：200 空结果 + `semantic:"disabled"` 标注）。
+    pub fn semantic_search_sync(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SemanticHit>, IndexError> {
+        let Some(embedder) = &self.embedder else {
+            return Err(IndexError("semantic disabled".into()));
+        };
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let texts = vec![query.to_string()];
+        let qv = embedder
+            .embed(&texts)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| IndexError("embedder returned no vector for query".into()))?;
+        let snap = self.vectors();
+        let mut hits: Vec<SemanticHit> = snap
+            .iter()
+            .filter_map(|row| {
+                cosine(&qv, &row.vector).map(|score| SemanticHit {
+                    file: row.file.clone(),
+                    ord: row.ord,
+                    symbol: row.symbol.clone(),
+                    kind: row.kind.clone(),
+                    start_line: row.start_line,
+                    end_line: row.end_line,
+                    score,
+                })
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    /// 词法侧文件排位（hybrid RRF 输入）：grep_core 命中按文件聚合，
+    /// 命中数降序、路径升序，取前 [`HYBRID_LEXICAL_MAX_FILES`] 文件
+    ///
+    /// 词法侧 fail-soft：grep 失败返回空排位（融合仅剩语义侧，不阻断）。
+    fn lexical_file_rank(&self, query: &str) -> Vec<(String, usize)> {
+        let params = crate::builtin_tools::grep_files::GrepParams {
+            query: query.to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            whole_word: false,
+            smart_case: true, // B2 缺省口径（search.smartCase 出厂 true）
+            dir: ".".into(),
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+            use_ignore_files: true,
+            max_results: HYBRID_LEXICAL_MAX_RESULTS,
+        };
+        let Ok(value) = crate::builtin_tools::grep_files::grep_core(&self.workdir, &params, None)
+        else {
+            return Vec::new();
+        };
+        let mut files: Vec<(String, usize)> = value
+            .get("groups")
+            .and_then(|g| g.as_array())
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|g| {
+                        let path = g.get("path")?.as_str()?.to_string();
+                        let hits = g
+                            .get("hits")
+                            .and_then(|h| h.as_array())
+                            .map_or(0, |a| a.len());
+                        Some((path, hits))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        files.truncate(HYBRID_LEXICAL_MAX_FILES);
+        files
+    }
+
+    /// 混合检索：词法侧（grep_core 聚合排位）+ 语义侧（嵌入暴力扫描）→ RRF 融合
+    ///
+    /// 语义面未装配 → 自动降级纯词法（C-3 口径：`semantic_active=false`，
+    /// 词法排位直接成形，不报错不阻断）。CPU 密集：调用方 spawn_blocking。
+    pub fn hybrid_search_sync(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<HybridResult, IndexError> {
+        let lexical = if query.trim().is_empty() {
+            Vec::new()
+        } else {
+            self.lexical_file_rank(query)
+        };
+        if self.embedder.is_none() {
+            return Ok(HybridResult {
+                semantic_active: false,
+                results: rrf_fuse(&lexical, &[], limit),
+            });
+        }
+        let semantic = self.semantic_search_sync(query, limit)?;
+        Ok(HybridResult {
+            semantic_active: true,
+            results: rrf_fuse(&lexical, &semantic, limit),
+        })
+    }
 }
 
 /// 增量批次路径轻过滤（口径与残差声明见模块文档）
@@ -753,6 +930,102 @@ mod tests {
         fn model_name(&self) -> String {
             "fake-test-model".into()
         }
+    }
+
+    /// 关键词嵌入器（检索测试）：向量 = 关键词命中 0/1 维 + 常亮偏置维，
+    /// 相似度可控（同关键词 1.0 / 异关键词 0.5 / 无关 0.0）
+    struct KeywordEmbedder;
+
+    impl TextEmbedder for KeywordEmbedder {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, IndexError> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    vec![
+                        if t.contains("alpha") { 1.0 } else { 0.0 },
+                        if t.contains("beta") { 1.0 } else { 0.0 },
+                        if t.contains("gamma") { 1.0 } else { 0.0 },
+                        1.0,
+                    ]
+                })
+                .collect())
+        }
+        fn model_name(&self) -> String {
+            "keyword-test-model".into()
+        }
+    }
+
+    #[test]
+    fn semantic_search_ranks_by_cosine_against_snapshot() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.rs"), "fn alpha_lookup() { }").unwrap();
+        std::fs::write(root.join("b.rs"), "fn beta_thing() { }").unwrap();
+        let svc = IndexService::open(root)
+            .unwrap()
+            .with_embedder(Arc::new(KeywordEmbedder));
+        match svc.rebuild_sync() {
+            RebuildOutcome::Completed(s) => assert!(s.vectors > 0),
+            other => panic!("expected completed, got {other:?}"),
+        }
+        // 空白查询 → 空结果（不嵌入不扫描）
+        assert!(svc.semantic_search_sync("  ", 10).unwrap().is_empty());
+        let hits = svc.semantic_search_sync("alpha", 10).unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits[0].symbol.contains("alpha"));
+        assert!(hits[0].score > 0.99); // 同关键词命中 → cosine≈1
+                                       // 异文件 chunk（beta）相似度显著更低（公共偏置维 → 0.5）
+        if hits.len() > 1 {
+            assert!(hits[1].score < hits[0].score);
+        }
+    }
+
+    #[test]
+    fn semantic_search_without_embedder_errors() {
+        let td = tempfile::tempdir().unwrap();
+        let svc = IndexService::open(td.path()).unwrap();
+        assert!(svc.semantic_search_sync("x", 5).is_err());
+    }
+
+    #[test]
+    fn hybrid_degrades_to_lexical_without_embedder() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.rs"), "fn alpha_lookup() { }").unwrap();
+        let svc = IndexService::open(root).unwrap();
+        match svc.rebuild_sync() {
+            RebuildOutcome::Completed(_) => {}
+            other => panic!("expected completed, got {other:?}"),
+        }
+        // C-3 降级口径：无嵌入器 → 纯词法成形，语义位 None，不报错
+        let r = svc.hybrid_search_sync("alpha", 10).unwrap();
+        assert!(!r.semantic_active);
+        assert!(r
+            .results
+            .iter()
+            .any(|h| h.file == "a.rs" && h.lexical_hits >= 1));
+        assert!(r.results.iter().all(|h| h.semantic_best.is_none()));
+    }
+
+    #[test]
+    fn hybrid_fuses_lexical_and_semantic_with_embedder() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.rs"), "fn alpha_lookup() { }").unwrap();
+        std::fs::write(root.join("b.rs"), "fn beta_thing() { }").unwrap();
+        let svc = IndexService::open(root)
+            .unwrap()
+            .with_embedder(Arc::new(KeywordEmbedder));
+        match svc.rebuild_sync() {
+            RebuildOutcome::Completed(_) => {}
+            other => panic!("expected completed, got {other:?}"),
+        }
+        let r = svc.hybrid_search_sync("alpha", 10).unwrap();
+        assert!(r.semantic_active);
+        // a.rs 双侧命中（词法 grep + 语义 cosine 1.0）→ RRF 必登顶
+        assert_eq!(r.results[0].file, "a.rs");
+        assert!(r.results[0].lexical_hits >= 1);
+        assert!(r.results[0].semantic_best.is_some());
     }
 
     #[test]
