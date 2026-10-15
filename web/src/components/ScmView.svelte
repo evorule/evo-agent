@@ -3,11 +3,27 @@
 <!-- 源代码管理视图(B3):双态更改列表 + 提交框。
      单状态源 $gitStatus(fs_events 防抖刷新 + 操作后即时刷新);
      提交走 serve GitOps(身份预检/hooks 分流在后端);
+     B15:✨ AI 生成提交消息(staged-only 门禁,结果写入输入框可编辑,绝不自动提交,
+     成功后 govEvents record-only 留痕);
      行点击打开 git diff 虚拟 tab(pendingGitDiff 信号,EditorPane 消费)。 -->
 <script>
   import { onMount } from 'svelte';
-  import { gitStatus, refreshGitStatus, openGitDiff } from '../lib/stores.js';
-  import { gitStage, gitUnstage, gitDiscard, gitCommit, gitIdentity } from '../lib/api.js';
+  import {
+    gitStatus,
+    refreshGitStatus,
+    openGitDiff,
+    pushPanelEvent,
+    scmGenerateIntent,
+  } from '../lib/stores.js';
+  import { settingsState } from '../lib/settings.js';
+  import {
+    gitStage,
+    gitUnstage,
+    gitDiscard,
+    gitCommit,
+    gitIdentity,
+    generateCommitMessage,
+  } from '../lib/api.js';
   import ConfirmDialog from './ConfirmDialog.svelte';
 
   let message = '';
@@ -16,6 +32,9 @@
   let identityHint = '';
   let notice = null; // {kind:'ok'|'err', text}(短暂 toast,命令面板同款底部浮层)
   let noticeTimer = null;
+
+  let generating = false; // B15:AI 生成中(spinner)
+  let generated = false; // 输入框当前内容来自 AI 生成(按钮转 ↻ 重试)
 
   let confirmState = null; // {paths:[..], message:'..'}(discard 二次确认)
 
@@ -92,6 +111,7 @@
     try {
       const res = await gitCommit(msg);
       message = '';
+      generated = false;
       flash('ok', `已提交 ${(res.commit || '').slice(0, 7)}`);
       refreshGitStatus(0);
     } catch (e) {
@@ -105,6 +125,38 @@
     } finally {
       committing = false;
     }
+  }
+
+  /** B15:AI 生成提交消息(staged-only 门禁;结果覆盖输入框可编辑,绝不自动提交) */
+  async function runGenerate() {
+    if (generating) return;
+    if (!$gitStatus?.staged?.length) {
+      flash('err', '先暂存变更再 AI 生成');
+      return;
+    }
+    generating = true;
+    const t0 = Date.now();
+    try {
+      const res = await generateCommitMessage();
+      message = res.message || '';
+      generated = true;
+      // govEvents record-only 留痕(展示层;生成只读,无审批接点)
+      pushPanelEvent('gov', {
+        label: 'aiCommit.generated',
+        detail: `${message.length} 字符 · ${Date.now() - t0} ms`,
+      });
+    } catch (e) {
+      flash('err', errText(e));
+    } finally {
+      generating = false;
+    }
+  }
+
+  // B15:命令面板意图信号(自增计数;去重后触发,与 ✨ 按钮同一门禁)
+  let lastIntent = 0;
+  $: if ($scmGenerateIntent !== lastIntent) {
+    lastIntent = $scmGenerateIntent;
+    if (lastIntent > 0) runGenerate();
   }
 
   function onCommitKey(e) {
@@ -159,6 +211,30 @@
         bind:value={message}
         onkeydown={onCommitKey}
       />
+      {#if $settingsState.settings['aiCommit.enabled'] !== false}
+        <div class="gen-row">
+          {#if generating}
+            <span class="gen-spinner" aria-hidden="true"></span>
+            <span class="gen-hint">AI 生成中…</span>
+          {:else}
+            <span class="spacer" />
+            <button
+              class="gen-btn"
+              disabled={$gitStatus.staged.length === 0}
+              title={
+                $gitStatus.staged.length === 0
+                  ? '先暂存变更'
+                  : generated
+                    ? '重新生成 AI 提交消息'
+                    : 'AI 生成提交消息(staged 变更交给 LLM 起草,写入输入框可编辑,不自动提交)'
+              }
+              onclick={runGenerate}
+            >
+              {generated ? '↻ 重新生成' : '✨ 生成'}
+            </button>
+          {/if}
+        </div>
+      {/if}
       <button
         class="commit-btn"
         disabled={committing || !message.trim()}
@@ -364,6 +440,52 @@
   .commit-btn:disabled {
     opacity: 0.45;
     cursor: default;
+  }
+
+  /* B15:AI 生成行(spinner/重试;staged-only 门禁禁用态) */
+  .gen-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-xs);
+    min-height: 20px;
+  }
+  .gen-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--sidebar-text-active);
+    border-radius: var(--r-sm);
+    font-size: var(--fs-xs);
+    padding: 1px 8px;
+    cursor: pointer;
+    transition:
+      border-color var(--tr-fast),
+      color var(--tr-fast);
+  }
+  .gen-btn:hover:not(:disabled) {
+    border-color: var(--brand);
+    color: var(--brand);
+  }
+  .gen-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .gen-spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--border);
+    border-top-color: var(--brand);
+    border-radius: 50%;
+    animation: gen-spin 0.8s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes gen-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .gen-hint {
+    color: var(--text-muted);
+    font-size: var(--fs-xs);
   }
 
   .group-header {

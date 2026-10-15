@@ -37,6 +37,7 @@
     gitStatus,
     openGitDiff,
     openFile,
+    scmGenerateIntent,
   } from './lib/stores.js';
   import { loadSettings } from './lib/settings.js';
   import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
@@ -76,6 +77,7 @@
     'workbench.action.git.commit',
     'workbench.action.git.stageAll',
     'workbench.action.git.refresh',
+    'workbench.action.git.generateCommitMessage',
     'workbench.action.git.openDiff',
     'workbench.action.problems.focus',
     'workbench.action.problems.next',
@@ -333,6 +335,16 @@
       title: 'Git: 刷新状态',
       category: 'Git',
       run: () => refreshGitStatus(0),
+    });
+    // B15:AI 生成提交消息(聚焦 SCM 视图 + 意图信号;无 staged 时 ScmView 提示先暂存)
+    registerCommand({
+      id: 'workbench.action.git.generateCommitMessage',
+      title: 'Git: AI 生成提交消息',
+      category: 'Git',
+      run: () => {
+        showScm();
+        scmGenerateIntent.update((n) => n + 1);
+      },
     });
     registerCommand({
       id: 'workbench.action.git.openDiff',

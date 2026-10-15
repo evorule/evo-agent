@@ -615,6 +615,9 @@ export const sysEvents = writable([]);
 /** 治理事件流(审计 tab):工具调用/审批/错误等治理可见事件 */
 export const govEvents = writable([]);
 
+/** B15:AI 生成提交消息意图(命令面板触发;自增计数,ScmView 消费后触发生成) */
+export const scmGenerateIntent = writable(0);
+
 let evSeq = 0;
 /** 底部面板事件入口(kind: sys | gov;label/level 决定渲染样式) */
 export function pushPanelEvent(kind, entry) {

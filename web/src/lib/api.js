@@ -249,6 +249,15 @@ export function gitIdentity() {
   return fetch('/api/git/identity', { headers: headers() }).then(unwrap);
 }
 
+/** B15 AI commit 生成(staged diff → LLM → 提交消息;无 staged/开关关闭 400,LLM 失败 502;生成只读不提交) */
+export function generateCommitMessage() {
+  return fetch('/api/git/commit-message/generate', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({}),
+  }).then(unwrap);
+}
+
 /** B14 语义索引:检索(q 必填,limit 缺省 20 封顶 100;mode=lexical|semantic|hybrid,缺省 lexical;semantic 未启用降级响应带 semantic:"disabled" 标注) */
 export function indexSearch(q, limit = 20, mode = 'lexical') {
   const p = new URLSearchParams({ q, limit: String(limit) });
