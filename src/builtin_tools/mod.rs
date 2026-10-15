@@ -3,9 +3,9 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! 内置工具(0.2.0:file_read / file_list / file_write / file_create /
 //! file_move / file_delete / search_files / grep_files / shell_exec /
-//! http_get / git_status / git_diff / git_log / git_stage / git_commit /
-//! read_skill / query_journal / query_trace / read_back / diff_runs /
-//! handover_write / handover_read / session_spawn)
+//! http_get / python_exec / git_status / git_diff / git_log / git_stage /
+//! git_commit / read_skill / query_journal / query_trace / read_back /
+//! diff_runs / handover_write / handover_read / session_spawn)
 //!
 //! 注:`read_skill`(skills 装配 B2)不在 default_safe_toolkit 静态注册——
 //! 其技能表来自 agent definition 的 skills 声明(声明非空时由 serve_tools::
@@ -58,6 +58,7 @@ pub mod git_tools;
 pub mod grep_files;
 pub mod http_get;
 pub mod net_guard;
+pub mod python_exec;
 pub mod search_files;
 pub mod shell_exec;
 pub mod shell_net_guard;
@@ -80,6 +81,8 @@ use crate::io_handlers::tool_handler::ToolHandler;
 /// - `search_files`:glob 找文件(工作目录沙箱 + max_results 限制)
 /// - `shell_exec`:执行白名单命令(8 active + 20 candidate + 35 blocked)
 /// - `http_get`:HTTP GET(6 active host + SSRF 防护 + 任何其他 host 需批准)
+/// - `python_exec`:一次性执行 Python 代码(candidate 全审批——任意代码
+///   执行无白名单可用,任何调用都出 needs_approval 提案)
 /// - `git_status` / `git_diff` / `git_log`:git 只读面(active,agentTools.gitRead)
 /// - `git_stage` / `git_commit`:git 写面(candidate 审批,agentTools.gitWrite)
 ///
@@ -135,6 +138,7 @@ pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
         Arc::new(shell_exec::ShellExecTool::new().with_workdir(&workdir_buf)),
     );
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
+    handler.register_static("python_exec", Arc::new(python_exec::PythonExecTool));
     handler.register_static(
         "git_status",
         Arc::new(git_tools::GitStatusTool::new(workdir_buf.clone())),
@@ -472,6 +476,24 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     required: true,
                 },
             ],
+        },
+        ToolSpec {
+            name: "python_exec".to_string(),
+            description: "Execute a short one-shot Python snippet and capture its output. \
+                          Runs OUTSIDE the workspace sandbox: the code can touch the whole \
+                          host, so EVERY call requires user approval — the call returns a \
+                          needs_approval proposal and executes only after the user approves. \
+                          Code size limit 64KB. Returns { ok, stdout, stderr, exit_code }. \
+                          Prefer file tools for reading/writing files and shell_exec for \
+                          allowlisted commands."
+                .to_string(),
+            parameters: vec![ParameterSpec {
+                name: "code".to_string(),
+                r#type: "string".to_string(),
+                description: "Python source code to execute, e.g. \"print(sum(range(10)))\""
+                    .to_string(),
+                required: true,
+            }],
         },
         ToolSpec {
             name: "git_status".to_string(),

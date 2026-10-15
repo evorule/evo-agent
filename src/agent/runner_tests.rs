@@ -3893,3 +3893,189 @@ fn pending_resolution_reconciles_io_request_response_diff() {
     // 空账 → None
     assert!(AgentRunner::plan_pending_resolution(&serde_json::json!([])).is_none());
 }
+
+// ===== B16 G8 接合:MCP 工具审批四场景(16 号档 §3.3 治理接合表 DoD)=====
+
+/// 构造 MockTransport MCP client(单工具 echo,tools/call 回哨兵值)
+async fn make_mcp_echo_client() -> std::sync::Arc<crate::mcp::client::McpClient> {
+    use crate::mcp::transport::tests::MockTransport;
+    let transport = std::sync::Arc::new(MockTransport::new());
+    transport
+        .set_response(
+            "initialize",
+            serde_json::json!({"serverInfo": {"name": "fs", "version": "1"}}),
+        )
+        .await;
+    transport
+        .set_response(
+            "tools/list",
+            serde_json::json!({"tools": [{
+                "name": "echo",
+                "description": "echo test tool",
+                "inputSchema": {"type": "object", "properties": {}}
+            }]}),
+        )
+        .await;
+    transport
+        .set_response(
+            "tools/call",
+            serde_json::json!({"content": [{"type": "text", "text": "MCP_ECHO_SENTINEL"}]}),
+        )
+        .await;
+    std::sync::Arc::new(
+        crate::mcp::client::McpClient::connect(transport)
+            .await
+            .unwrap(),
+    )
+}
+
+/// 注册 MCP echo 工具进 runner(always_allow 按场景传入)
+///
+/// 定级显式 Standard(免 P2 裁决通道,与 D7-A settings 降档同款路径)——
+/// G8 审批与 P2 意图裁决分层独立,本组判据只盯 G8(16 号档场景 6:既有
+/// 治理面行为不在本批判据射程)。
+async fn make_mcp_runner(
+    always_allow: &[&str],
+    callback: Option<std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>>,
+) -> AgentRunner {
+    let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
+    let client = make_mcp_echo_client().await;
+    let tools = client.list_tools().await.unwrap();
+    crate::mcp::tool_adapter::register_client_tools(
+        &mut handler,
+        "fs",
+        &client,
+        &tools,
+        &always_allow
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        60,
+    )
+    .unwrap();
+    handler.set_adjudication_for_source(
+        crate::agent::tool_manifest::ToolSource::Mcp,
+        crate::agent::tool_manifest::AdjudicationClass::Standard,
+    );
+    let runner =
+        AgentRunner::new(AgentConfig::default(), make_test_client()).with_tool_handler(handler);
+    match callback {
+        Some(cb) => runner.with_approval_callback(cb),
+        None => runner,
+    }
+}
+
+#[tokio::test]
+async fn b16_mcp_g8_default_call_rejected_without_approval() {
+    // 场景 3a(默认调用出审批卡):非白名单 MCP 工具首调 = candidate 暂停;
+    // DenyAll 决策端拒绝 → 真实执行未发生(哨兵不在结果中),留痕 decision=rejected
+    let runner = make_mcp_runner(
+        &[],
+        Some(std::sync::Arc::new(crate::agent::approval::DenyAll)),
+    )
+    .await;
+    let (result, record) = runner
+        .execute_tool_call_gated(
+            "test-session",
+            "mcp_fs_echo",
+            &serde_json::json!({"msg": "hi"}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let text = result.to_string();
+    assert!(text.contains("User denied approval"), "got: {text}");
+    assert!(
+        !text.contains("MCP_ECHO_SENTINEL"),
+        "tool must NOT execute without approval"
+    );
+    let record = record.expect("approval record must be produced");
+    assert_eq!(record["decision"], "rejected");
+    assert_eq!(record["tool"], "mcp_fs_echo");
+    assert!(
+        record["proposal_id"].as_str().unwrap().starts_with("ap-"),
+        "proposal_id must be present: {record}"
+    );
+}
+
+#[tokio::test]
+async fn b16_mcp_g8_approved_call_executes() {
+    // 场景 3b(批准后执行):AutoApprove 批准 → 重执行真实触达 MCP server,
+    // 哨兵回喂,留痕 decision=approved
+    let runner = make_mcp_runner(
+        &[],
+        Some(std::sync::Arc::new(crate::agent::approval::AutoApprove)),
+    )
+    .await;
+    let (result, record) = runner
+        .execute_tool_call_gated(
+            "test-session",
+            "mcp_fs_echo",
+            &serde_json::json!({"msg": "hi"}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        result.to_string().contains("MCP_ECHO_SENTINEL"),
+        "approved call must execute, got: {result}"
+    );
+    let record = record.expect("approval record must be produced");
+    assert_eq!(record["decision"], "approved");
+}
+
+#[tokio::test]
+async fn b16_mcp_g8_whitelist_runs_direct_without_approval() {
+    // 场景 3c(白名单直跑):always_allow 名单内 = active,DenyAll 决策端
+    // 也不会被征询(结果照常产出,无审批留痕)
+    let runner = make_mcp_runner(
+        &["echo"],
+        Some(std::sync::Arc::new(crate::agent::approval::DenyAll)),
+    )
+    .await;
+    let (result, record) = runner
+        .execute_tool_call_gated(
+            "test-session",
+            "mcp_fs_echo",
+            &serde_json::json!({"msg": "hi"}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        result.to_string().contains("MCP_ECHO_SENTINEL"),
+        "whitelisted tool must run directly, got: {result}"
+    );
+    assert!(
+        record.is_none(),
+        "whitelisted run must not produce an approval record"
+    );
+}
+
+#[tokio::test]
+async fn b16_mcp_g8_approval_timeout_auto_denies() {
+    // 场景 3d(超时自动拒):HttpApproval 1s 短超时(生产 60s 同机制),
+    // 无人应答 → auto_rejected,真实执行未发生
+    let mut cb = crate::agent::approval::HttpApproval::new_standalone();
+    cb.timeout_secs = 1;
+    let runner = make_mcp_runner(&[], Some(std::sync::Arc::new(cb))).await;
+    let (result, record) = runner
+        .execute_tool_call_gated(
+            "test-session",
+            "mcp_fs_echo",
+            &serde_json::json!({"msg": "hi"}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let text = result.to_string();
+    assert!(text.contains("User denied approval"), "got: {text}");
+    assert!(!text.contains("MCP_ECHO_SENTINEL"), "must not execute");
+    let record = record.expect("approval record must be produced");
+    assert_eq!(record["decision"], "auto_rejected");
+    assert_eq!(record["reason"], "timeout");
+}

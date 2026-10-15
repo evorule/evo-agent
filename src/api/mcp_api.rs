@@ -266,7 +266,14 @@ pub async fn put_servers(
     {
         let mut toolkit = state.toolkit_lock().write().expect("toolkit lock poisoned");
         for (s, client, tools) in &connections {
-            match register_client_tools(&mut toolkit, &s.name, client, tools, s.timeout_secs) {
+            match register_client_tools(
+                &mut toolkit,
+                &s.name,
+                client,
+                tools,
+                &s.always_allow,
+                s.timeout_secs,
+            ) {
                 Ok(n) => {
                     registered_servers += 1;
                     registered_tools += n;
@@ -319,7 +326,14 @@ pub async fn restart_server(
     // 同步段:持写锁重注册
     let count = {
         let mut toolkit = state.toolkit_lock().write().expect("toolkit lock poisoned");
-        register_client_tools(&mut toolkit, &s.name, &client, &tools, s.timeout_secs)
+        register_client_tools(
+            &mut toolkit,
+            &s.name,
+            &client,
+            &tools,
+            &s.always_allow,
+            s.timeout_secs,
+        )
     };
     let count = match count {
         Ok(n) => n,
