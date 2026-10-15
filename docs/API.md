@@ -92,8 +92,11 @@ press Ctrl+C to shut down
 | POST | `/agents/{agent_type}/run` | 同步执行 agent,等待完成后返回结果 | — |
 | POST | `/agents/{agent_type}/run/stream` | SSE 流式执行,逐 token 返回 LLM 输出 | G4 |
 | POST | `/agents/{agent_type}/cancel?session_id=xxx` | 取消正在运行的 session | G6 |
+| GET | `/api/sessions` | 列出历史 session(运行记录) | — |
 
 **Base URL**: `http://127.0.0.1:8081`(默认)
+
+> **工作台(IDE)端点**——文件、搜索替换、Git、LSP、终端(PTY)、任务、AI 补全/Inline Chat、语义索引、MCP 工作台面、工作台设置的完整参考,见 [WORKBENCH_API.md](WORKBENCH_API.md)。
 
 ---
 
