@@ -154,6 +154,9 @@ fn server_view(s: &McpServerConfig, snap: &HashMap<String, crate::mcp::McpServer
         "disabled": s.disabled,
         "timeout_secs": s.timeout_secs,
         "always_allow": s.always_allow,
+        "transport": s.transport.as_deref().unwrap_or("stdio"),
+        "url": s.url,
+        "headers": s.headers,
         "status": status,
         "error": error,
         "tools": tools,
@@ -194,6 +197,8 @@ pub async fn list_servers(
 #[derive(serde::Deserialize)]
 pub struct McpPutServer {
     name: String,
+    /// 启动命令(仅 stdio 传输必填;streamable_http 条目省略=空串)
+    #[serde(default)]
     command: String,
     #[serde(default)]
     args: Vec<String>,
@@ -205,6 +210,15 @@ pub struct McpPutServer {
     timeout_secs: u64,
     #[serde(default)]
     always_allow: Vec<String>,
+    /// 传输方式(B23):省略=stdio;streamable_http 需配合 url
+    #[serde(default)]
+    transport: Option<String>,
+    /// streamable_http endpoint URL
+    #[serde(default)]
+    url: Option<String>,
+    /// 附加请求头(值=${ENV_VAR} 引用形态,GET 视图原样回显引用不回明文)
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
 }
 
 /// PUT 请求体(`{"servers":[...]}`;与 GET 视图的 servers 字段同位)
@@ -255,9 +269,9 @@ pub async fn put_servers(
                 disabled: s.disabled,
                 timeout_secs: s.timeout_secs,
                 always_allow: s.always_allow,
-                transport: None,
-                url: None,
-                headers: None,
+                transport: s.transport,
+                url: s.url,
+                headers: s.headers,
             }
         })
         .collect();
@@ -584,6 +598,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_put_streamable_http_view_persistence_and_reject() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(mcp_state(tmp.path()));
+        // PUT:stdio 缺省 + streamable_http(均 disabled 避免真连接)
+        let body = json!({"servers": [
+            {"name": "local", "command": "npx", "disabled": true},
+            {"name": "remote", "transport": "streamable_http",
+             "url": "http://127.0.0.1:9/mcp", "disabled": true,
+             "headers": {"Authorization": "Bearer ${B23_TOK}"}}
+        ]});
+        let (status, _) = json_request(a.clone(), "PUT", "/api/mcp/servers", Some(body)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // GET 视图透出 transport/url/headers(stdio 条目缺省 "stdio")
+        let (status, v) = json_request(a, "GET", "/api/mcp/servers", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let servers = v["servers"].as_array().unwrap();
+        let local = servers.iter().find(|s| s["name"] == "local").unwrap();
+        assert_eq!(local["transport"], "stdio");
+        let remote = servers.iter().find(|s| s["name"] == "remote").unwrap();
+        assert_eq!(remote["transport"], "streamable_http");
+        assert_eq!(remote["url"], "http://127.0.0.1:9/mcp");
+        assert_eq!(remote["headers"]["Authorization"], "Bearer ${B23_TOK}");
+
+        // mcp.toml 落盘含新字段,重启装载形态一致(serde 回读)
+        let text = std::fs::read_to_string(tmp.path().join(".evo").join("mcp.toml")).unwrap();
+        assert!(text.contains("streamable_http"));
+        let cfg = crate::mcp::McpConfigStore::new(tmp.path(), Default::default()).load();
+        let remote = cfg.servers.iter().find(|s| s.name == "remote").unwrap();
+        assert_eq!(remote.transport.as_deref(), Some("streamable_http"));
+        assert_eq!(remote.url.as_deref(), Some("http://127.0.0.1:9/mcp"));
+        // stdio 条目 command 落盘照旧
+        let local = cfg.servers.iter().find(|s| s.name == "local").unwrap();
+        assert_eq!(local.command, "npx");
+    }
+
+    #[tokio::test]
     async fn test_put_servers_validation_rejects() {
         let tmp = tempfile::tempdir().unwrap();
         let a = app(mcp_state(tmp.path()));
@@ -607,6 +658,14 @@ mod tests {
             (
                 json!({"servers": [{"name": "bad name!", "command": "echo"}]}),
                 "unsafe name",
+            ),
+            (
+                json!({"servers": [{"name": "a", "transport": "streamable_http"}]}),
+                "http transport without url",
+            ),
+            (
+                json!({"servers": [{"name": "a", "command": "npx", "transport": "websocket"}]}),
+                "unsupported transport",
             ),
         ];
         for (body, why) in cases {

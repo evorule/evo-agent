@@ -26,7 +26,7 @@ use crate::config::McpServerConfig;
 
 use super::client::{McpClient, McpToolSpec};
 use super::tool_adapter::register_client_tools;
-use super::transport::StdioTransport;
+use super::transport::{McpTransport, StdioTransport, StreamableHttpTransport};
 
 /// 单 server 连接态(16 号档 §3.2 三态)
 #[derive(Debug, Clone, PartialEq)]
@@ -112,18 +112,32 @@ impl McpManager {
         result
     }
 
-    /// 连接实现(spawn + 握手 + 发现,整体受 timeout_secs 约束)
+    /// 连接实现(按 transport 分派 + 握手 + 发现,整体受 timeout_secs 约束)
+    ///
+    /// B23:stdio(缺省)spawn 子进程;streamable_http 连远程 endpoint
+    /// (headers 内 `${ENV_VAR}` 在 transport 构造时展开,缺变量 fail-closed)。
     async fn connect_inner(
         &self,
         cfg: &McpServerConfig,
     ) -> Result<(std::sync::Arc<McpClient>, Vec<McpToolSpec>), String> {
-        let args: Vec<&str> = cfg.args.iter().map(|s| s.as_str()).collect();
-        let transport = if cfg.env.is_empty() {
-            StdioTransport::spawn(&cfg.command, &args).await?
-        } else {
-            StdioTransport::spawn_with_env(&cfg.command, &args, &cfg.env).await?
-        };
-        let client = std::sync::Arc::new(McpClient::connect(std::sync::Arc::new(transport)).await?);
+        let transport: std::sync::Arc<dyn McpTransport> =
+            match cfg.transport.as_deref().unwrap_or("stdio") {
+                "stdio" => {
+                    let args: Vec<&str> = cfg.args.iter().map(|s| s.as_str()).collect();
+                    std::sync::Arc::new(if cfg.env.is_empty() {
+                        StdioTransport::spawn(&cfg.command, &args).await?
+                    } else {
+                        StdioTransport::spawn_with_env(&cfg.command, &args, &cfg.env).await?
+                    })
+                }
+                "streamable_http" => {
+                    let url = cfg.url.as_deref().unwrap_or("");
+                    let headers = cfg.headers.clone().unwrap_or_default();
+                    std::sync::Arc::new(StreamableHttpTransport::new(url, &headers)?)
+                }
+                other => return Err(format!("unsupported MCP transport '{}'", other)),
+            };
+        let client = std::sync::Arc::new(McpClient::connect(transport).await?);
         let tools = client.list_tools().await?;
         Ok((client, tools))
     }
@@ -320,6 +334,32 @@ mod tests {
         assert_eq!(snap[0].0, "broken");
         assert_eq!(snap[0].1.status.as_str(), "failed");
         assert!(snap[0].1.client.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_connect_server_unsupported_transport_fails() {
+        let mgr = McpManager::new();
+        let mut bad = cfg("bad-tp", "npx");
+        bad.transport = Some("websocket".to_string());
+        let result = mgr.connect_server(&bad).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unsupported MCP transport"));
+        let snap = mgr.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].1.status.as_str(), "failed");
+    }
+
+    #[tokio::test]
+    async fn test_connect_server_streamable_http_unreachable_fails() {
+        let mgr = McpManager::new();
+        let mut remote = cfg("remote", "");
+        remote.transport = Some("streamable_http".to_string());
+        // 未监听端口:连接失败隔离落 failed,不 panic
+        remote.url = Some("http://127.0.0.1:9/mcp".to_string());
+        let result = mgr.connect_server(&remote).await;
+        assert!(result.is_err());
+        let snap = mgr.snapshot();
+        assert_eq!(snap[0].1.status.as_str(), "failed");
     }
 
     #[tokio::test]
