@@ -6491,7 +6491,7 @@ impl AgentRunner {
                                                         }
                                                     }
                                                     let summary = format!(
-                                                        "Runaway guard tripped: {} automatic actions reached limit {}; pending op '{}' was NOT executed. Task paused for human confirmation. Goal: {}",
+                                                        "Runaway guard tripped: {} automatic actions counted (limit {}); pending op '{}' was NOT executed. Task paused for human confirmation. Goal: {}",
                                                         runaway_guard.actions,
                                                         runaway_guard.threshold,
                                                         tc.name,
@@ -6807,7 +6807,7 @@ impl AgentRunner {
                                                 }
                                             }
                                             let summary = format!(
-                                                "Runaway guard tripped: {} automatic actions reached limit {}; pending op '{}' was NOT executed. Task paused for human confirmation. Goal: {}",
+                                                "Runaway guard tripped: {} automatic actions counted (limit {}); pending op '{}' was NOT executed. Task paused for human confirmation. Goal: {}",
                                                 runaway_guard.actions,
                                                 runaway_guard.threshold,
                                                 tool_name,
@@ -7405,7 +7405,8 @@ impl RewindBudget {
 /// 注入;None=不启用(manual/auto 档与未接线面行为零变化)。
 #[derive(Debug, Clone)]
 pub struct RunawayPolicy {
-    /// 连续自动操作上限(policy_limits.max_actions_per_run,缺省 200)
+    /// 连续自动操作累计配额(policy_limits.max_actions_per_run,缺省 200;
+    /// 配额次数内放行,第 max+1 次尝试触发暂停)
     pub max_actions_per_run: u32,
     /// 修订④复述注入的条件清单(各工具组条件平铺,带 `[组名]` 前缀)
     pub restate_conditions: Vec<String>,
@@ -7430,7 +7431,7 @@ impl RunawayPolicy {
 ///
 /// **与 [`RewindBudget`] 语义分离**(方案判据:独立计数独立 journal 变体,
 /// 单测锁语义分离):RewindBudget=连续失败预算(推进即回满,罚连续性);
-/// RunawayGuard=累计操作配额(不随成功重置,触发即暂停等人)。
+/// RunawayGuard=累计操作配额(不随成功重置,超配额即暂停等人)。
 /// 无策略注入时以 `u32::MAX` 阈值构造(saturating 语义下永不触发,挂点空转)。
 #[derive(Debug)]
 struct RunawayGuard {
@@ -7453,10 +7454,14 @@ impl RunawayGuard {
         Self { actions, threshold }
     }
 
-    /// 计入一次自动操作;返回是否恰达阈值(触发护栏)
+    /// 计入一次自动操作;返回是否超出配额(触发护栏)。
+    ///
+    /// 配额语义=max_actions_per_run 次操作**放行执行**,第 threshold+1 次
+    /// 尝试触发(方案判据「200 后暂停」:200 次执行后拦第 201 次;与修订④
+    /// 复述块「还可自动执行 N 次」承诺一致——承诺的 N 次必须真实可执行)。
     fn bump(&mut self) -> bool {
         self.actions = self.actions.saturating_add(1);
-        self.actions >= self.threshold
+        self.actions > self.threshold
     }
 }
 
