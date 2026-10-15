@@ -18,8 +18,8 @@ use tracing::debug;
 
 use crate::mcp::transport::McpTransport;
 
-/// MCP 协议版本(2024-11-05,当前主流)
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// MCP 协议版本(2024-11-05;Streamable HTTP 传输的 MCP-Protocol-Version 头沿用)
+pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// MCP 客户端
 ///
@@ -51,7 +51,7 @@ impl McpClient {
             .request(
                 "initialize",
                 serde_json::json!({
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
                         "name": "evo-agent",

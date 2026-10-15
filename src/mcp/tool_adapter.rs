@@ -509,6 +509,9 @@ mod tests {
                 disabled: false,
                 timeout_secs: 60,
                 always_allow: vec![],
+                transport: None,
+                url: None,
+                headers: None,
             }],
         };
         let count = register_mcp_tools(&mut handler, &config).await;
