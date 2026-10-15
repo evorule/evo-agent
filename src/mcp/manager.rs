@@ -162,7 +162,14 @@ impl McpManager {
         tool_handler: &mut crate::io_handlers::tool_handler::ToolHandler,
     ) -> Result<usize, String> {
         let (client, tools) = self.reconnect(cfg).await?;
-        register_client_tools(tool_handler, &cfg.name, &client, &tools, cfg.timeout_secs)
+        register_client_tools(
+            tool_handler,
+            &cfg.name,
+            &client,
+            &tools,
+            &cfg.always_allow,
+            cfg.timeout_secs,
+        )
     }
 
     /// 连接全部 server 并把工具注册进 union toolkit(serve 启动接入)
@@ -187,6 +194,7 @@ impl McpManager {
                         &cfg.name,
                         &client,
                         &tools,
+                        &cfg.always_allow,
                         cfg.timeout_secs,
                     ) {
                         Ok(count) => {

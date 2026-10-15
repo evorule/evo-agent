@@ -364,7 +364,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（23 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（24 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -381,6 +381,11 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         b("grep_files", vec![FsRead]),
         b("shell_exec", vec![Process]),
         b("http_get", vec![Network]),
+        // python_exec（收口修复：执行体已注册但静态表缺条目，register_static
+        // fail-fast 传染 toolkit 构造型测试）。任意代码执行（无命令白名单，
+        // 危险等级高于 shell_exec）——Process 域 + candidate 全审批（见分级
+        // 段），spec 源与审批钩子同步补齐。
+        b("python_exec", vec![Process]),
         b("git_status", vec![GitRead]),
         b("git_diff", vec![GitRead]),
         b("git_log", vec![GitRead]),
@@ -449,8 +454,13 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             }
             // 命令/网络 candidate 族：分类器判入 candidate 即出 needs_approval
             // 提案（PR-4 起经管道⑤评估臂单源），如实补标 ManualDefault
-            // （此前默认 AutoPolicy 属盘点遗漏，行为等价修正）
+            // （此前默认 AutoPolicy 属盘点遗漏，行为等价修正）。
+            // python_exec：任意代码执行无白名单可用，任何调用都出提案
+            // （执行体 evaluate_proposal 全审批，无 active 名单）
             "shell_exec" | "http_get" => {
+                m.approval_policy = ApprovalPolicy::ManualDefault;
+            }
+            "python_exec" => {
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
             // grep_files 内部 30s 硬超时（与全局 60s 双层，如实标注）
@@ -710,12 +720,21 @@ pub fn dynamic_manifest(
              registration (manifest hard rule 3)"
         ));
     }
-    let (domains, default_switch) = match source {
+    let (domains, default_switch, approval_policy) = match source {
         ToolSource::ServiceProxy => (
             vec![CapDomain::Governance],
             sw(AGENT_TOOLS_SERVICE_PROXY, true),
+            ApprovalPolicy::AutoPolicy,
         ),
-        ToolSource::Mcp => (vec![CapDomain::Process], sw(AGENT_TOOLS_MCP, true)),
+        // B16 G8 接合（16 号档 §3.3/决策点 3）：MCP 工具缺省 candidate 全审批
+        // （ManualDefault——首次调用出 needs_approval 提案过 G8）；白名单直跑
+        // 由注册层按 `mcp.servers[].always_allow` 覆写为 AutoPolicy（见
+        // tool_adapter::register_client_tools，alwaysAllow=用户显式授权）。
+        ToolSource::Mcp => (
+            vec![CapDomain::Process],
+            sw(AGENT_TOOLS_MCP, true),
+            ApprovalPolicy::ManualDefault,
+        ),
         _ => return Err(format!("unsupported dynamic tool source: {source:?}")),
     };
     Ok(ToolManifest {
@@ -727,7 +746,7 @@ pub fn dynamic_manifest(
         },
         capability_domains: domains,
         adjudication_class: AdjudicationClass::Sensitive,
-        approval_policy: ApprovalPolicy::AutoPolicy,
+        approval_policy,
         default_switch,
         sandbox_scope: SandboxScope::HostSandboxed,
         timeout_class: TimeoutClass::Default,
@@ -769,7 +788,7 @@ mod tests {
 
     #[test]
     fn test_static_manifest_count_locked() {
-        // 内置 23 + 规则 58 + delegate 1 + memory 6 = 88
+        // 内置 24 + 规则 58 + delegate 1 + memory 6 = 90
         // （A 类断头线 5 工具：透传 44→49，规则 53→58，数量锁 83→88；
         // （facts_version +1：透传 43→44，规则 52→53，数量锁 82→83；
         // （audit_export +1：透传 42→43，规则 51→52，数量锁 81→82；
@@ -780,9 +799,10 @@ mod tests {
         //   账本记忆收口（ai/queue14 合并）：memory_link +1、memory_forget +1
         //   → memory 4→6，数量锁 77→79）
         //   （判定事实治理登记批：verdict_submit +1，规则 58→59，数量锁 88→89）
-        assert_eq!(builtin_manifests().len(), 23);
+        //   （python_exec 收口 +1：内置 23→24，数量锁 89→90）
+        assert_eq!(builtin_manifests().len(), 24);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 89);
+        assert_eq!(all().len(), 90);
     }
 
     #[test]
@@ -1079,6 +1099,29 @@ mod tests {
         let (description, parameters) = m.resolve_spec().unwrap();
         assert_eq!(description, "a service tool");
         assert!(parameters.is_object());
+    }
+
+    #[test]
+    fn test_dynamic_manifest_approval_policy_by_source() {
+        // B16 G8 接合（16 号档 §3.3/决策点 3）：MCP 缺省 candidate 全审批
+        // （ManualDefault）；ServiceProxy 维持 AutoPolicy（既有审批行为不变）
+        let mcp = dynamic_manifest(
+            "mcp_x",
+            ToolSource::Mcp,
+            "an mcp tool".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        assert_eq!(mcp.approval_policy, ApprovalPolicy::ManualDefault);
+
+        let svc = dynamic_manifest(
+            "svc_x",
+            ToolSource::ServiceProxy,
+            "a service tool".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        assert_eq!(svc.approval_policy, ApprovalPolicy::AutoPolicy);
     }
 
     #[test]
