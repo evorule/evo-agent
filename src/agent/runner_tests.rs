@@ -806,7 +806,10 @@ async fn test_from_definition_wildcard_entry_bypasses_registration_check() {
     let handler = make_handler_with(&["echo"]); // 无任何 mcp_* 工具注册
 
     let result = AgentRunner::from_definition(def, client, handler, None).await;
-    assert!(result.is_ok(), "wildcard entry must not reject construction");
+    assert!(
+        result.is_ok(),
+        "wildcard entry must not reject construction"
+    );
 }
 
 #[tokio::test]

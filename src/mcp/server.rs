@@ -139,6 +139,16 @@ async fn call_tool(state: &AgentApiState, params: &Value) -> Result<Value, Strin
     // (工作台/LLM 通道);v1 不跨面续跑,外部客户端按 isError 语义感知。
     if let Some(proposal) = toolkit.evaluate_proposal_for(&name, &args) {
         warn!(tool = %name, "MCP tools/call candidate tool requires approval; not executed");
+        // B24 治理等价留痕:审批短路也是治理事件,拒执行同样记账(成败皆记口径)
+        state
+            .mcp_ledger()
+            .record_tool_completion(
+                &name,
+                false,
+                0,
+                Some("requires manual approval; not executed"),
+            )
+            .await;
         return Ok(json!({
             "content": [
                 {"type": "text", "text": "tool call requires manual approval and was NOT executed; approve via the workbench approval flow, then retry"},
@@ -148,9 +158,16 @@ async fn call_tool(state: &AgentApiState, params: &Value) -> Result<Value, Strin
             "isError": true,
         }));
     }
+    let started = std::time::Instant::now();
     let result = toolkit.execute_by_name(&name, &args).await;
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     match result {
         Ok(value) => {
+            // B24 治理等价留痕:与 LLM 面 T1 同口径(工具调用完成,成败皆记)
+            state
+                .mcp_ledger()
+                .record_tool_completion(&name, true, duration_ms, None)
+                .await;
             let text = match value {
                 Value::String(s) => s,
                 other => {
@@ -177,6 +194,11 @@ async fn call_tool(state: &AgentApiState, params: &Value) -> Result<Value, Strin
         }
         Err(e) => {
             warn!(tool = %name, error = %e, "MCP tools/call tool-level error");
+            // B24 治理等价留痕:失败同样记账
+            state
+                .mcp_ledger()
+                .record_tool_completion(&name, false, duration_ms, Some(&e))
+                .await;
             Ok(json!({
                 "content": [{"type": "text", "text": e}],
                 "isError": true,
@@ -297,6 +319,33 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not found"));
+    }
+
+    /// B24:事件轨道开关开启时,tools/call 全路径(成功/未知工具失败)记账
+    /// 不炸且执行行为不变(dead client 落链失败静默 warn,不阻塞执行面);
+    /// 账内容实证归 serve 面实测(真 evorule-server 落链+audit_query 可查)
+    #[tokio::test]
+    async fn test_tools_call_with_event_ledger_enabled() {
+        crate::agent::event_ledger::init_event_ledger_enabled(true);
+        let state = state_with_toolkit();
+        register_echo(&state);
+        // 成功路径:执行结果不受记账影响
+        let resp = mcp_post(
+            State(state.clone()),
+            post_body("tools/call", json!(20), json!({"name": "file_list"})),
+        )
+        .await;
+        let v = parse_json(resp).await;
+        assert_eq!(v["result"]["isError"], false);
+        // 失败路径:未知工具 isError 语义保持
+        let resp = mcp_post(
+            State(state),
+            post_body("tools/call", json!(21), json!({"name": "no_such_tool"})),
+        )
+        .await;
+        let v = parse_json(resp).await;
+        assert_eq!(v["result"]["isError"], true);
+        crate::agent::event_ledger::init_event_ledger_enabled(false);
     }
 
     #[tokio::test]

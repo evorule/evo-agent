@@ -285,6 +285,11 @@ pub struct AgentApiState {
     /// B23 MCP server 暴露面开关(缺省 false;/mcp 路由仅在 true 时挂载,
     /// fail-closed;serve 装配点从工作台设置 `mcpServer.enabled` 读取注入)
     mcp_server_enabled: bool,
+    /// B24:/mcp 面共享事件轨道(治理等价补账——LLM 面工具调用有 EL 事件
+    /// 轨道,/mcp tools/call 同权同账;专用 namespace "mcp" 与会话面账显式
+    /// 分域,无会话语境 session_id=None;进程级开关 event_ledger_enabled
+    /// 由 serve 启动期自 settings 初始化,关闭时记录 API 自行 no-op)
+    mcp_ledger: std::sync::Arc<crate::agent::event_ledger::EventLedger>,
 }
 
 impl AgentApiState {
@@ -320,6 +325,8 @@ impl AgentApiState {
         workspace_client: Arc<WorkspaceApiClient>,
         toolkit: Arc<std::sync::RwLock<ToolHandler>>,
     ) -> Self {
+        // B24:/mcp 共享账构造前预取 client 副本(struct 表达式内原参数将被 move)
+        let evorule_client_b24 = evorule_client.clone();
         let state = Self {
             definitions,
             evorule_client,
@@ -327,6 +334,19 @@ impl AgentApiState {
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             metrics,
             auth_config: AuthConfig::disabled(),
+            // B24:/mcp 共享事件轨道(专用 namespace "mcp";client 与 state 同源;
+            // 构造廉价,EventLedger 内部惰性落链,离线/失败静默不阻塞执行面)
+            mcp_ledger: {
+                let store = crate::agent::memory_event::MemoryEventStore::new(
+                    "mcp",
+                    evorule_client_b24.clone(),
+                );
+                std::sync::Arc::new(crate::agent::event_ledger::EventLedger::new(
+                    store,
+                    "mcp",
+                    evorule_client_b24.clone(),
+                ))
+            },
             session_index: Arc::new(crate::api::session_index::SessionIndex::new(
                 workdir.join("data").join("session_index.jsonl"),
             )),
@@ -549,6 +569,11 @@ impl AgentApiState {
     /// 经 write() 注册工具;读路径一律走 [`Self::toolkit`] 读 guard)
     pub fn toolkit_lock(&self) -> &std::sync::RwLock<ToolHandler> {
         &self.toolkit
+    }
+
+    /// B24:/mcp 面共享事件轨道(tools/call 治理等价留痕消费)
+    pub fn mcp_ledger(&self) -> &std::sync::Arc<crate::agent::event_ledger::EventLedger> {
+        &self.mcp_ledger
     }
 }
 
