@@ -133,6 +133,21 @@ async fn call_tool(state: &AgentApiState, params: &Value) -> Result<Value, Strin
             .map_err(|_| "toolkit lock poisoned".to_string())?;
         guard.clone()
     };
+    // 管道⑤同源评估(治理等价核心):candidate 工具先走与 LLM 完全相同的
+    // 提案评估原语(evaluate_proposal_for,评估与执行永远同源),needs_approval
+    // 即短路不执行——/mcp 面不新增任何免审批通道,审批决策仍归 G8 人工面
+    // (工作台/LLM 通道);v1 不跨面续跑,外部客户端按 isError 语义感知。
+    if let Some(proposal) = toolkit.evaluate_proposal_for(&name, &args) {
+        warn!(tool = %name, "MCP tools/call candidate tool requires approval; not executed");
+        return Ok(json!({
+            "content": [
+                {"type": "text", "text": "tool call requires manual approval and was NOT executed; approve via the workbench approval flow, then retry"},
+                {"type": "text", "text": serde_json::to_string_pretty(&proposal)
+                    .unwrap_or_else(|_| "null".to_string())},
+            ],
+            "isError": true,
+        }));
+    }
     let result = toolkit.execute_by_name(&name, &args).await;
     match result {
         Ok(value) => {
@@ -342,6 +357,153 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = parse_json(resp).await;
         assert_eq!(v["result"]["serverInfo"]["name"], "evo-agent");
+    }
+
+    /// 治理等价锁(J-MCP2-3):/mcp tools/list 工具面 = toolkit 当前态
+    /// (同序同集;agentTools.* 裁剪在启动期已完成,/mcp 直读同一 handler
+    /// 即天然等价——本测试锁定该等价性,防后续演化出独立暴露面)
+    #[tokio::test]
+    async fn test_tools_list_equals_toolkit_manifests() {
+        let state = state_with_toolkit();
+        register_echo(&state);
+        let resp = mcp_post(
+            State(state.clone()),
+            post_body("tools/list", json!(6), json!({})),
+        )
+        .await;
+        let v = parse_json(resp).await;
+        let names: Vec<String> = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        let expected: Vec<String> = state
+            .toolkit_lock()
+            .read()
+            .unwrap()
+            .manifests()
+            .iter()
+            .map(|m| m.name.clone())
+            .collect();
+        assert_eq!(names, expected);
+    }
+
+    /// 审批链(J-MCP2-4 姊妹判据):candidate 工具经 /mcp 调用必须走管道⑤
+    /// 同源评估——needs_approval 短路不执行(isError + 提案文本),执行器
+    /// 零调用(执行标志不变)
+    #[tokio::test]
+    async fn test_tools_call_candidate_short_circuits_without_execution() {
+        use crate::io_handlers::tool_handler::ToolFunction;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Gated(std::sync::Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl ToolFunction for Gated {
+            async fn call(&self, _args: &Value) -> crate::io_handler::IoResult {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(json!({"done": true}))
+            }
+            fn evaluate_proposal(&self, _args: &Value) -> Option<Value> {
+                Some(json!({"status": "needs_approval", "reason": "test candidate"}))
+            }
+        }
+
+        let state = state_with_toolkit();
+        let executed = std::sync::Arc::new(AtomicBool::new(false));
+        let manifest = crate::agent::tool_manifest::lookup_static("file_list")
+            .expect("file_list static manifest must exist");
+        state
+            .toolkit_lock()
+            .write()
+            .unwrap()
+            .register(manifest, std::sync::Arc::new(Gated(executed.clone())));
+
+        let resp = mcp_post(
+            State(state),
+            post_body(
+                "tools/call",
+                json!(7),
+                json!({"name": "file_list", "arguments": {"any": "args"}}),
+            ),
+        )
+        .await;
+        let v = parse_json(resp).await;
+        assert_eq!(v["result"]["isError"], true);
+        assert!(v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("requires manual approval"));
+        assert!(v["result"]["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("needs_approval"));
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "candidate tool must not execute via /mcp without approval"
+        );
+    }
+
+    /// 端到端(J-MCP2-5):真实 TCP 回环——A 面 StreamableHttpTransport 作
+    /// MCP 客户端,连挂载在真实 axum server(带 G16 Bearer 鉴权)的 /mcp:
+    /// 无 token 401 fail-closed → 带 token initialize/tools/list/tools/call 全链
+    #[tokio::test]
+    async fn test_e2e_real_tcp_auth_fail_closed_and_full_chain() {
+        use crate::mcp::transport::{McpTransport, StreamableHttpTransport};
+        use std::collections::HashMap;
+
+        let state = state_with_toolkit();
+        register_echo(&state);
+        let app = crate::api::agent_api::router_with_auth(
+            state.with_mcp_server_enabled(true),
+            crate::api::auth::AuthConfig::new(vec!["tok123".to_string()], true),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/mcp");
+        // 1) 无 token → 401(fail-closed;G16 中间件覆盖 /mcp)
+        let anon = StreamableHttpTransport::new(&url, &HashMap::new()).unwrap();
+        let err = anon
+            .request("initialize", json!({"protocolVersion": PROTOCOL_VERSION}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("returned HTTP 401"), "got: {err}");
+        // 2) 带 token → initialize / tools/list / tools/call 全链
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer tok123".to_string());
+        let client = StreamableHttpTransport::new(&url, &headers).unwrap();
+        let init = client
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "evo-agent-selftest", "version": "0"}
+                }),
+            )
+            .await
+            .unwrap();
+        // transport request() 返回解包后的 JSON-RPC result(非完整信封)
+        assert_eq!(init["serverInfo"]["name"], "evo-agent");
+        let tools = client.request("tools/list", json!({})).await.unwrap();
+        assert!(tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "file_list"));
+        let call = client
+            .request(
+                "tools/call",
+                json!({"name": "file_list", "arguments": {"q": "e2e"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(call["isError"], false);
+        assert!(call["content"][0]["text"].as_str().unwrap().contains("e2e"));
     }
 
     async fn parse_json(resp: Response) -> Value {

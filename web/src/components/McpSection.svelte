@@ -17,6 +17,7 @@
     statusLabel,
     badgeCounts,
   } from '../lib/mcp.js';
+  import { settingsState, loadSettings, setSetting } from '../lib/settings.js';
 
   let editorOpen = false;
   let draft = '';
@@ -26,6 +27,22 @@
 
   $: state = $mcpState;
   $: badge = badgeCounts(state.servers);
+  /** B23:/mcp 暴露开关(schema 单源下发,值在 settings store;缺省 false=fail-closed) */
+  $: mcpExposed = $settingsState.settings['mcpServer.enabled'] === true;
+  let exposeBusy = false;
+
+  /** 开关写入(失败回滚控件值;改后需重启 serve 生效——serve 装配点一次性读) */
+  async function onToggleExpose(ev) {
+    const el = ev.target;
+    exposeBusy = true;
+    try {
+      await setSetting('mcpServer.enabled', el.checked);
+    } catch {
+      el.checked = !el.checked; // 回滚到 store 权威值
+    } finally {
+      exposeBusy = false;
+    }
+  }
 
   function openEditor() {
     draft = serversToText(state.servers);
@@ -67,11 +84,29 @@
 
   onMount(() => {
     loadMcp();
+    loadSettings(); // 暴露开关的权威值在 settings store(schema 单源)
   });
 </script>
 
 <section class="cat mcp">
   <h3 class="cat-title">MCP 服务</h3>
+
+  <!-- B23:/mcp 对外暴露开关(与 MCP 客户端面启停正交;重启 serve 生效) -->
+  <div class="expose-row">
+    <label class="chk" title="开启后外部 MCP 客户端可经 serve Bearer token 接入 /mcp">
+      <input
+        type="checkbox"
+        checked={mcpExposed}
+        disabled={exposeBusy || $settingsState.degraded}
+        onchange={(e) => onToggleExpose(e)}
+      />
+      <span>对外暴露 /mcp 端点（MCP server）</span>
+    </label>
+    <span class="expose-note">
+      开启后外部 MCP 客户端经 serve Bearer token 接入，工具面与 LLM 完全一致（治理等价），candidate
+      工具同样需人工审批；重启 serve 生效。
+    </span>
+  </div>
 
   {#if state.enabled === false}
     <div class="mcp-off">
@@ -173,6 +208,19 @@
 </section>
 
 <style>
+  .expose-row {
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: var(--sp-sm);
+    margin-bottom: var(--sp-sm);
+  }
+  .expose-note {
+    display: block;
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: var(--sp-xs);
+    padding-left: var(--sp-md);
+  }
   .mcp-off {
     font-size: var(--fs-xs);
     color: var(--text-muted);
