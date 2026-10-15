@@ -12,6 +12,7 @@
   import { getWorkbenchConfig, putWorkbenchConfig, getLlmStatus } from '../lib/api.js';
   import { openSettingsJson } from '../lib/stores.js';
   import McpSection from './McpSection.svelte';
+  import ApprovalSection from './ApprovalSection.svelte';
 
   let query = '';
   /** 数组控件展开态(键 ID) */
@@ -305,6 +306,7 @@
     {/if}
 
     <McpSection />
+    <ApprovalSection />
   </div>
 </div>
 

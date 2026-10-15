@@ -759,6 +759,15 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/mcp/status",
             axum::routing::get(crate::api::mcp_api::status_brief),
         )
+        // 批次一 PR-4:审批策略工作台面(条件文件状态+试判定机械预检,零 LLM)
+        .route(
+            "/api/approval-policy",
+            axum::routing::get(crate::api::approval_api::get_policy),
+        )
+        .route(
+            "/api/approval-policy/trial",
+            axum::routing::post(crate::api::approval_api::trial_judge),
+        )
         // G14:记忆事件查询 — 返回 session 的所有结构化事件
         .route(
             "/api/sessions/{id}/events",
