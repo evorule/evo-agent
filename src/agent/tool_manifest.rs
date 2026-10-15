@@ -341,6 +341,12 @@ pub const AGENT_TOOLS_SERVICE_PROXY_ADJUDICATION: &str = "agentTools.serviceProx
 pub const AGENT_TOOLS_HANDOVER: &str = "agentTools.handover";
 const SWITCH_HANDOVER: &str = AGENT_TOOLS_HANDOVER;
 
+/// agentTools.memory_recall（默认开；B22 记忆主动消费只读工具，23 号 §3.2）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_MEMORY_RECALL: &str = "agentTools.memory_recall";
+const SWITCH_MEMORY_RECALL: &str = AGENT_TOOLS_MEMORY_RECALL;
+
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
     Some(SwitchBinding {
@@ -364,7 +370,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（24 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（25 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -414,6 +420,11 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // default_switch 段）。spec 常驻 default_tool_specs（Builtin 源）。
         b("handover_write", vec![Memory]),
         b("handover_read", vec![Memory]),
+        // B22 记忆主动消费（23 号设计 §3.2）：只读检索工具（stable/events 两
+        // 分区账本读取）。占位执行体启动期注册（default_safe_toolkit），runner
+        // 会话期重绑（handover 同款）；Standard 免裁决 + AutoPolicy（只读面）。
+        // spec 常驻 default_tool_specs（Builtin 源）。
+        b("memory_recall", vec![Memory]),
         // 自主开会话（自主交接设计 PR-H3）：子会话派生（fork，因果链权威在
         // server 侧 parent 链）+ 首轮 goal 自动驱动。占位执行体启动期注册
         // （default_safe_toolkit），runner 会话期接线重绑（handover 双工具
@@ -478,6 +489,8 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // 自主交接族：单键同绑同开同关（自主交接设计 §四；PR-H3 起
             // session_spawn 第三行同键接入）
             "handover_write" | "handover_read" | "session_spawn" => sw(SWITCH_HANDOVER, true),
+            // B22 记忆主动消费（23 号 §3.2）：只读检索，默认开
+            "memory_recall" => sw(SWITCH_MEMORY_RECALL, true),
             _ => None,
         };
         m
@@ -800,9 +813,10 @@ mod tests {
         //   → memory 4→6，数量锁 77→79）
         //   （判定事实治理登记批：verdict_submit +1，规则 58→59，数量锁 88→89）
         //   （python_exec 收口 +1：内置 23→24，数量锁 89→90）
-        assert_eq!(builtin_manifests().len(), 24);
+        //   （B22 记忆主动消费 memory_recall +1：内置 24→25，数量锁 90→91）
+        assert_eq!(builtin_manifests().len(), 25);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 90);
+        assert_eq!(all().len(), 91);
     }
 
     #[test]
@@ -1031,6 +1045,8 @@ mod tests {
         ("handover_write", "agentTools.handover", true),
         ("handover_read", "agentTools.handover", true),
         ("session_spawn", "agentTools.handover", true),
+        // B22 记忆主动消费（23 号 §3.2）
+        ("memory_recall", "agentTools.memory_recall", true),
     ];
 
     #[test]

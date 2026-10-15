@@ -269,6 +269,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.memory_recall",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "记忆主动消费工具（memory_recall，只读）：agent 会话中按需检索稳定事实/事件账本（此前仅启动期被动回注；关闭 = 工具连 LLM 契约一起下线，记忆回流退回被动回注单通道）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.mcp",
             kind: SettingType::Boolean,
             default: json!(true),

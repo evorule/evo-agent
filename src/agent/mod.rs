@@ -25,6 +25,7 @@ pub mod lexstore;
 pub mod materializer;
 pub mod memory;
 pub mod memory_event;
+pub mod memory_recall_tool;
 pub mod memory_tool;
 pub mod output_validator;
 pub mod pipeline;

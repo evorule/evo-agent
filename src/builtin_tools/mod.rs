@@ -190,6 +190,12 @@ pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
         "handover_read",
         Arc::new(crate::agent::handover_tool::HandoverReadTool::unwired()),
     );
+    // B22 记忆主动消费（23 号设计 §3.2）：同占位/会话期重绑形态；只读工具
+    // （不产生任何写入事实），开关 agentTools.memory_recall 过滤三面自动工作
+    handler.register_static(
+        crate::agent::memory_recall_tool::MEMORY_RECALL_TOOL,
+        Arc::new(crate::agent::memory_recall_tool::MemoryRecallTool::unwired()),
+    );
     // 自主开会话工具（自主交接设计 PR-H3）：同上占位/会话期重绑形态；
     // 重绑时注入链共享态与子 runner 工厂（护栏三件+fork+自动驱动在执行体内）
     handler.register_static(
@@ -665,6 +671,48 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     .to_string(),
                 required: false,
             }],
+        },
+        ToolSpec {
+            name: "memory_recall".to_string(),
+            description: "Actively recall memory entries from the ledger (stable facts and \
+                          events of previous sessions). Unlike the automatically injected \
+                          context at startup, this tool lets you query on demand: search by \
+                          keyword, pick a partition (kind), or raise the limit. Read-only — \
+                          it never writes. Prefer a focused query; omit query to list the \
+                          newest entries."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "query".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Keyword(s), case-insensitive substring match over entry \
+                                  values; omit to list newest entries"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "kind".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Partition to search: \"all\" (default) | \"stable\" | \
+                                  \"events\""
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "namespace".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Ledger namespace; defaults to this agent's namespace"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "limit".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Max entries to return, 1..=100 (default 20)"
+                        .to_string(),
+                    required: false,
+                },
+            ],
         },
         ToolSpec {
             name: "session_spawn".to_string(),

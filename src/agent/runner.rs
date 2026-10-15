@@ -3133,6 +3133,22 @@ impl AgentRunner {
             };
             self.tool_handler.register_static(name, exec);
         }
+        // B22 记忆主动消费接线（23 号设计 §3.2）：memory_recall 占位→wired。
+        // 门控同 handover（启动期占位在场才接线——开关 agentTools.memory_recall
+        // 过滤后不在场则跳过）；只读工具无 session_id 依赖（namespace+client
+        // 在手即完整）；memory 未启用时跳过（namespace 无权威源，占位保持
+        // fail-visible 报错——不静默造 namespace）。
+        if self.tool_handler.has_tool(crate::agent::memory_recall_tool::MEMORY_RECALL_TOOL) {
+            let exec: std::sync::Arc<dyn ToolFunction> = std::sync::Arc::new(
+                crate::agent::memory_recall_tool::MemoryRecallTool::wired(
+                    namespace.clone(),
+                    client.clone(),
+                ),
+            );
+            self.tool_handler
+                .register_static(crate::agent::memory_recall_tool::MEMORY_RECALL_TOOL, exec);
+            tracing::debug!("memory_recall tool re-bound (session-scoped, read-only)");
+        }
         // 自主开会话接线(自主交接设计 PR-H3):门控同 handover(启动期占位
         // 在场才接线)。链态惰性初始化(发起方会话首个接线点创建);链 token
         // 计量注入(既有 delegate 预算计数器在场时让位——链预算降级为仅计
