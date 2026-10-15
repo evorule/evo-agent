@@ -532,6 +532,10 @@ pub struct AgentDefinition {
     /// - "manual":人工审查开启(CLI stdin 交互 / HTTP 60s 审批窗)
     /// - "auto_policy":自动判定模式(无人值守)——candidate proposal 由
     ///   PolicyApproval 判定式决策端自动批准,判断逻辑照跑、理由逐笔留痕入链
+    /// - "policy":评审式审批(2026-09-26 设计/2026-10-15 实施)——独立 LLM
+    ///   评审员对照条件清单逐条判定,判定不可信(超时/失败/解析失败/条件弃权)
+    ///   一律降级人工,绝不静默放行;条件文件 `.evo/approval-policy.toml`
+    ///   serve 侧独占读取,加载失败同样 fail-visible 降级 manual
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
     /// 组装配方(可选;元层先行批,agent_def 增量。None = 内置默认配方 =
@@ -706,9 +710,9 @@ impl AgentDefinition {
         }
         // 人工审查开合:approval_mode 取值门卫(未知值加载期即拒,不给运行期惊喜)
         if let Some(m) = &self.approval_mode {
-            if m != "manual" && m != "auto_policy" {
+            if m != "manual" && m != "auto_policy" && m != "policy" {
                 return Err(AgentDefinitionError::InvalidDefinition(format!(
-                    "approval_mode '{}' must be 'manual' or 'auto_policy'",
+                    "approval_mode '{}' must be 'manual', 'auto_policy' or 'policy'",
                     m
                 )));
             }
