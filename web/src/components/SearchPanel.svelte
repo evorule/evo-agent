@@ -1,19 +1,22 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 EvoRule Project -->
-<!-- 全局搜索面板(B2):查询区(三 toggle + include/exclude)+ 折叠替换区 +
-     结果树(文件组折叠,行项 <mark> 高亮,点击定位到行列)+ 状态/截断/超时/错误区 +
-     历史下拉(localStorage 最近 10 条)。设置消费:search.maxResults/smartCase/
-     useIgnoreFiles/excludeGlobs 4 键。命令入口经 searchIntent 一次性信号接线。 -->
+<!-- 全局搜索面板(B2):模式行(词法/语义/混合)+ 查询区(三 toggle + include/exclude)+
+     折叠替换区(仅词法)+ 结果区(词法=文件组行项高亮;语义=chunk 粒度文件组+cosine 百分比;
+     混合=文件粒度 RRF 排序+词法/语义命中徽标)+ 状态/截断/超时/错误区 + 历史下拉。
+     语义/混合走 /api/index/search(mode 透传);语义面未启用降级标注→引导横幅。
+     设置消费:search.* 4 键 + index.semantic.enabled(设置页 schema 自动渲染)。
+     命令入口经 searchIntent 一次性信号接线。 -->
 <script>
   import { onMount, onDestroy, tick } from 'svelte';
   import { searchIntent, openFile } from '../lib/stores.js';
   import { settingsState } from '../lib/settings.js';
-  import { searchGrep, replaceFiles } from '../lib/api.js';
+  import { searchGrep, replaceFiles, indexSearch } from '../lib/api.js';
   import ReplacePreview from './ReplacePreview.svelte';
 
   const HISTORY_KEY = 'evo_search_history';
   const HISTORY_LIMIT = 10;
 
+  let mode = 'lexical'; // lexical | semantic | hybrid
   let query = '';
   let isRegex = false; // .* 正则
   let caseSensitive = false; // Aa 区分大小写
@@ -24,7 +27,8 @@
   let replacement = '';
   let searching = false;
   let error = '';
-  let result = null;
+  let result = null; // 词法:grep_core 响应(groups/totalMatches/…)
+  let semResult = null; // 语义/混合:/api/index/search 响应(results/semantic 标注)
   let collapsed = new Set();
   let history = [];
   let historyOpen = false;
@@ -91,6 +95,18 @@
     };
   }
 
+  /** 模式切换:清两态结果(响应形态不同,陈旧渲染必错) */
+  function setMode(m) {
+    if (mode === m) return;
+    mode = m;
+    result = null;
+    semResult = null;
+    error = '';
+    previewData = null;
+    applyResult = null;
+    historyOpen = false;
+  }
+
   async function doSearch() {
     if (!query.trim() || searching) return;
     historyOpen = false;
@@ -100,11 +116,19 @@
     // 注意:不清 applyResult——apply 成功后的汇总横幅靠自动重搜刷新结果树,
     // 若在此清空则横幅一闪即逝(05-实施日志 PR5 修正记录);横幅由预览/关闭钮清除
     try {
-      result = await searchGrep(baseParams());
+      if (mode === 'lexical') {
+        result = await searchGrep(baseParams());
+        semResult = null;
+      } else {
+        // 语义/混合:索引面 limit 封顶 100(服务端硬顶),与 search.maxResults 取小
+        semResult = await indexSearch(query, Math.min(maxResults, 100), mode);
+        result = null;
+      }
       collapsed = new Set();
       saveHistory(query);
     } catch (e) {
       result = null;
+      semResult = null;
       error = String(e?.message || e);
     } finally {
       searching = false;
@@ -149,10 +173,25 @@
   function clearAll() {
     query = '';
     result = null;
+    semResult = null;
     error = '';
     previewData = null;
     applyResult = null;
     historyOpen = false;
+  }
+
+  /** 语义结果按文件分组(服务端 cosine 降序扁平表 → B2 文件组形态) */
+  function groupSemantics(results) {
+    const map = new Map();
+    for (const h of results || []) {
+      let g = map.get(h.file);
+      if (!g) {
+        g = { path: h.file, hits: [] };
+        map.set(h.file, g);
+      }
+      g.hits.push(h);
+    }
+    return [...map.values()];
   }
 
   function toggleGroup(p) {
@@ -229,30 +268,38 @@
   </div>
 
   <div class="toggles">
-    <button class="tg" class:on={caseSensitive} title="区分大小写" onclick={() => (caseSensitive = !caseSensitive)}>Aa</button>
-    <button class="tg" class:on={wholeWord} title="全字匹配" onclick={() => (wholeWord = !wholeWord)}>ab</button>
-    <button class="tg" class:on={isRegex} title="使用正则表达式" onclick={() => (isRegex = !isRegex)}>.*</button>
+    <button class="tg" class:on={mode === 'lexical'} title="符号/文本字面检索" onclick={() => setMode('lexical')}>词法</button>
+    <button class="tg" class:on={mode === 'semantic'} title="向量语义检索(按含义近似匹配)" onclick={() => setMode('semantic')}>语义</button>
+    <button class="tg" class:on={mode === 'hybrid'} title="词法+语义 RRF 融合排序" onclick={() => setMode('hybrid')}>混合</button>
   </div>
 
-  <input class="glob-input" bind:value={includeGlob} placeholder="包含(如 *.rs, src/**)" />
-  <input class="glob-input" bind:value={excludeGlob} placeholder="排除(逗号分隔,叠加设置排除集)" />
-
-  <button class="replace-toggle" onclick={() => (replaceOpen = !replaceOpen)}>
-    <span class="chev">{replaceOpen ? '▾' : '▸'}</span> 替换
-  </button>
-  {#if replaceOpen}
-    <div class="replace-row">
-      <input
-        class="q-input"
-        bind:this={replaceEl}
-        bind:value={replacement}
-        placeholder="替换为(支持 $1、$&#123;name&#125;)"
-        onkeydown={(e) => e.key === 'Enter' && doPreview()}
-      />
-      <button class="mini-btn" disabled={!query.trim() || searching} onclick={doPreview}>
-        预览替换
-      </button>
+  {#if mode === 'lexical'}
+    <div class="toggles">
+      <button class="tg" class:on={caseSensitive} title="区分大小写" onclick={() => (caseSensitive = !caseSensitive)}>Aa</button>
+      <button class="tg" class:on={wholeWord} title="全字匹配" onclick={() => (wholeWord = !wholeWord)}>ab</button>
+      <button class="tg" class:on={isRegex} title="使用正则表达式" onclick={() => (isRegex = !isRegex)}>.*</button>
     </div>
+
+    <input class="glob-input" bind:value={includeGlob} placeholder="包含(如 *.rs, src/**)" />
+    <input class="glob-input" bind:value={excludeGlob} placeholder="排除(逗号分隔,叠加设置排除集)" />
+
+    <button class="replace-toggle" onclick={() => (replaceOpen = !replaceOpen)}>
+      <span class="chev">{replaceOpen ? '▾' : '▸'}</span> 替换
+    </button>
+    {#if replaceOpen}
+      <div class="replace-row">
+        <input
+          class="q-input"
+          bind:this={replaceEl}
+          bind:value={replacement}
+          placeholder="替换为(支持 $1、$&#123;name&#125;)"
+          onkeydown={(e) => e.key === 'Enter' && doPreview()}
+        />
+        <button class="mini-btn" disabled={!query.trim() || searching} onclick={doPreview}>
+          预览替换
+        </button>
+      </div>
+    {/if}
   {/if}
 
   {#if error}
@@ -289,7 +336,7 @@
 
   {#if searching}
     <div class="status muted">搜索中…</div>
-  {:else if result}
+  {:else if mode === 'lexical' && result}
     <div class="status">
       {result.fileCount} 个文件 {result.totalMatches} 处匹配
       <span class="muted">· 已扫 {result.searchedFiles} · {result.elapsedMs}ms</span>
@@ -321,6 +368,77 @@
         </div>
       {/each}
       {#if result.groups.length === 0}
+        <div class="empty muted">无匹配结果</div>
+      {/if}
+    </div>
+  {:else if mode === 'semantic' && semResult}
+    {#if semResult.semantic === 'disabled'}
+      <div class="banner warn">
+        语义面未启用:设置 → 工作台 →「语义面向量检索」开启后重启生效(首次启用下载约 24MB 模型)
+      </div>
+    {/if}
+    <div class="status">
+      {semResult.results.length} 个 chunk 命中 · {groupSemantics(semResult.results).length} 个文件
+      <span class="muted">· cosine 降序</span>
+    </div>
+    <div class="results">
+      {#each groupSemantics(semResult.results) as g (g.path)}
+        <div class="group">
+          <button class="group-head" title="折叠/展开" onclick={() => toggleGroup(g.path)}>
+            <span class="chev">{collapsed.has(g.path) ? '▸' : '▾'}</span>
+            <span class="fname">{g.path.split('/').pop()}</span>
+            <span class="fpath">{g.path}</span>
+            <span class="count">{g.hits.length}</span>
+          </button>
+          {#if !collapsed.has(g.path)}
+            {#each g.hits as h}
+              <button class="hit" onclick={() => openFile(g.path, { line: h.line_start })}>
+                <span class="ln">{h.line_start}-{h.line_end}</span>
+                <span class="preview">
+                  {h.symbol || '(文件级)'} <span class="muted">{h.kind}</span>
+                </span>
+                <span class="score">{Math.round(h.score * 100)}%</span>
+              </button>
+            {/each}
+          {/if}
+        </div>
+      {/each}
+      {#if semResult.results.length === 0}
+        <div class="empty muted">无匹配结果</div>
+      {/if}
+    </div>
+  {:else if mode === 'hybrid' && semResult}
+    {#if semResult.semantic === 'disabled'}
+      <div class="banner warn">
+        语义面未启用,已降级纯词法排序:设置 → 工作台 →「语义面向量检索」开启后重启生效
+      </div>
+    {/if}
+    <div class="status">
+      {semResult.results.length} 个文件
+      <span class="muted">· RRF 融合排序(词法+语义)</span>
+    </div>
+    <div class="results">
+      {#each semResult.results as h (h.file)}
+        <button
+          class="hit hybrid"
+          onclick={() =>
+            openFile(h.file, h.semantic_best ? { line: h.semantic_best.line_start } : {})}
+        >
+          <span class="fname">{h.file.split('/').pop()}</span>
+          <span class="fpath">{h.file}</span>
+          <span class="chips">
+            {#if h.lexical_hits}
+              <span class="chip">词 {h.lexical_hits}</span>
+            {/if}
+            {#if h.semantic_best}
+              <span class="chip sem" title="最佳语义 chunk:{h.semantic_best.symbol} ({h.semantic_best.line_start}-{h.semantic_best.line_end})">
+                语义 {h.semantic_best.symbol}
+              </span>
+            {/if}
+          </span>
+        </button>
+      {/each}
+      {#if semResult.results.length === 0}
         <div class="empty muted">无匹配结果</div>
       {/if}
     </div>
@@ -594,6 +712,37 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .hit .score {
+    margin-left: auto;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .hit.hybrid {
+    align-items: center;
+  }
+  .hit.hybrid .fpath {
+    flex: 1;
+  }
+  .chips {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .chip {
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+    background: var(--bg-hover);
+    border-radius: var(--r-full);
+    padding: 0 6px;
+    max-width: 110px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chip.sem {
+    color: var(--brand-light);
+    background: var(--brand-bg);
   }
   mark {
     background: var(--brand-bg);
