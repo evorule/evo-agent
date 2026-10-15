@@ -75,8 +75,35 @@ fn validate(cfg: &McpConfig) -> Result<(), String> {
         if !seen.insert(s.name.clone()) {
             return Err(format!("duplicate server name '{}'", s.name));
         }
-        if s.command.trim().is_empty() {
-            return Err(format!("server '{}' command must not be empty", s.name));
+        // B23:按传输方式分支校验(缺省 stdio)
+        let transport = s.transport.as_deref().unwrap_or("stdio");
+        match transport {
+            "stdio" => {
+                if s.command.trim().is_empty() {
+                    return Err(format!("server '{}' command must not be empty", s.name));
+                }
+            }
+            "streamable_http" => {
+                let url = s.url.as_deref().unwrap_or("").trim();
+                if url.is_empty() {
+                    return Err(format!(
+                        "server '{}' transport=streamable_http requires url",
+                        s.name
+                    ));
+                }
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Err(format!(
+                        "server '{}' url must start with http:// or https://",
+                        s.name
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "server '{}' has unsupported transport '{}' (stdio | streamable_http)",
+                    s.name, other
+                ));
+            }
         }
         if s.timeout_secs == 0 {
             return Err(format!("server '{}' timeout_secs must be > 0", s.name));
@@ -228,6 +255,9 @@ pub async fn put_servers(
                 disabled: s.disabled,
                 timeout_secs: s.timeout_secs,
                 always_allow: s.always_allow,
+                transport: None,
+                url: None,
+                headers: None,
             }
         })
         .collect();
@@ -398,6 +428,37 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn test_validate_transport_branches() {
+        let mk = |transport: Option<&str>, url: Option<&str>, command: &str| McpServerConfig {
+            name: "t".to_string(),
+            command: command.to_string(),
+            args: vec![],
+            env: std::collections::HashMap::new(),
+            disabled: false,
+            timeout_secs: 60,
+            always_allow: vec![],
+            transport: transport.map(|s| s.to_string()),
+            url: url.map(|s| s.to_string()),
+            headers: None,
+        };
+        let one = |s: McpServerConfig| McpConfig { servers: vec![s] };
+        // 缺省 stdio:command 必填
+        assert!(validate(&one(mk(None, None, ""))).is_err());
+        assert!(validate(&one(mk(None, None, "npx"))).is_ok());
+        // streamable_http:url 必填且需 http(s) 前缀
+        assert!(validate(&one(mk(Some("streamable_http"), None, ""))).is_err());
+        assert!(validate(&one(mk(Some("streamable_http"), Some("ftp://x"), ""))).is_err());
+        assert!(validate(&one(mk(
+            Some("streamable_http"),
+            Some("http://127.0.0.1:9/mcp"),
+            ""
+        )))
+        .is_ok());
+        // 非法 transport 值
+        assert!(validate(&one(mk(Some("websocket"), None, "npx"))).is_err());
+    }
 
     /// 构造注入 MCP 管理器 + 配置存储的测试 state(空 toolkit)
     fn mcp_state(dir: &std::path::Path) -> AgentApiState {

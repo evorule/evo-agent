@@ -64,4 +64,4 @@ pub use client::{McpClient, McpToolSpec};
 pub use manager::{McpManager, McpServerEntry, McpServerStatus};
 pub use store::McpConfigStore;
 pub use tool_adapter::{mcp_tool_name, register_client_tools, register_mcp_tools, McpToolAdapter};
-pub use transport::{McpTransport, StdioTransport};
+pub use transport::{McpTransport, StdioTransport, StreamableHttpTransport};

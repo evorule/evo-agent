@@ -476,7 +476,9 @@ impl Default for AgentsConfig {
 pub struct McpServerConfig {
     /// server 名称(用于工具名前缀 `mcp_{name}_{tool}`)
     pub name: String,
-    /// 启动命令(如 `npx` / `node` / `python`)
+    /// 启动命令(如 `npx` / `node` / `python`;仅 stdio 传输必填,
+    /// streamable_http 传输忽略,缺省空串)
+    #[serde(default)]
     pub command: String,
     /// 命令参数
     #[serde(default)]
@@ -494,6 +496,18 @@ pub struct McpServerConfig {
     /// 审批(决策点 3:默认 candidate 全审批,alwaysAllow=用户显式授权)
     #[serde(default)]
     pub always_allow: Vec<String>,
+    /// 传输方式(B23):缺省 "stdio"(子进程);可选 "streamable_http"(远程
+    /// server,按 MCP 规范 Streamable HTTP 传输;HTTP+SSE 已被规范废弃不实现)
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// streamable_http 模式的 server URL(如 `http://host:3000/mcp`);
+    /// stdio 模式忽略此字段
+    #[serde(default)]
+    pub url: Option<String>,
+    /// streamable_http 模式的附加请求头(如 Authorization;值支持
+    /// `${ENV_VAR}` 引用,连接时展开,缺变量 fail-closed 报错)
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
 }
 
 impl McpServerConfig {
@@ -1317,6 +1331,59 @@ api_key = "${ENV:TEST_EVO_API_KEY_99}"
     fn test_mcp_config_default_empty() {
         let cfg = Config::default();
         assert!(cfg.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_config_transport_backcompat_and_streamable_http() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("evo-agent.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[llm]
+api_key = "literal"
+
+[[mcp.servers]]
+name = "legacy-stdio"
+command = "npx"
+
+[[mcp.servers]]
+name = "remote-http"
+transport = "streamable_http"
+url = "http://127.0.0.1:3000/mcp"
+
+[mcp.servers.headers]
+Authorization = "Bearer ${B23_TOK}"
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.merge_from_file(&toml_path).unwrap();
+
+        assert_eq!(cfg.mcp.servers.len(), 2);
+        // 旧形态:无 transport 字段 → None(stdio 语义,B23 向后兼容)
+        assert!(cfg.mcp.servers[0].transport.is_none());
+        assert!(cfg.mcp.servers[0].url.is_none());
+        assert!(cfg.mcp.servers[0].headers.is_none());
+        // 新形态:streamable_http + url + headers
+        assert_eq!(
+            cfg.mcp.servers[1].transport.as_deref(),
+            Some("streamable_http")
+        );
+        assert_eq!(
+            cfg.mcp.servers[1].url.as_deref(),
+            Some("http://127.0.0.1:3000/mcp")
+        );
+        assert_eq!(
+            cfg.mcp.servers[1]
+                .headers
+                .as_ref()
+                .unwrap()
+                .get("Authorization"),
+            Some(&"Bearer ${B23_TOK}".to_string())
+        );
     }
 
     #[test]

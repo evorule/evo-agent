@@ -302,6 +302,9 @@ mod tests {
             disabled: false,
             timeout_secs: 60,
             always_allow: vec![],
+            transport: None,
+            url: None,
+            headers: None,
         }
     }
 

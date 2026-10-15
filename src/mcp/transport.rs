@@ -341,6 +341,294 @@ impl McpTransport for StdioTransport {
     }
 }
 
+/// 展开 `${ENV_VAR}` 引用(B23)
+///
+/// streamable_http 模式的 headers 值支持环境变量引用(如
+/// `"Authorization": "Bearer ${MCP_TOKEN}"`),避免明文密钥落配置文件。
+/// 变量缺失 → fail-closed 报错(不静默替换空值,防凭据语义被静默削弱)。
+fn expand_env_refs(value: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(format!("unclosed ${{ in header value: {}", value));
+        };
+        let var = &after[..end];
+        if var.is_empty() {
+            return Err(format!("empty ${{}} reference in header value: {}", value));
+        }
+        match std::env::var(var) {
+            Ok(v) => out.push_str(&v),
+            Err(_) => {
+                return Err(format!(
+                    "environment variable '{}' referenced in MCP header not set",
+                    var
+                ))
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Streamable HTTP 传输(B23):远程 MCP server,按 MCP 规范 Streamable HTTP
+///
+/// 与已废弃的 HTTP+SSE 传输(2024-11-05,SEP-2596 deprecated)不同:
+/// 单一 endpoint,JSON-RPC 请求经 `POST`,响应可为单 JSON 或 SSE 流;
+/// 会话经 `Mcp-Session-Id` 响应头建立、`DELETE` 终止。
+pub struct StreamableHttpTransport {
+    /// MCP server endpoint URL
+    url: String,
+    /// 已展开 env 的附加请求头(如 Authorization)
+    headers: Vec<(String, String)>,
+    client: reqwest::Client,
+    /// 自增的 JSON-RPC id
+    next_id: AtomicU64,
+    /// `initialize` 响应捕获的会话 id(后续请求带上;无会话则为 None)
+    session_id: std::sync::Mutex<Option<String>>,
+}
+
+impl StreamableHttpTransport {
+    /// 构造传输(展开 headers 中的 `${ENV_VAR}` 引用,fail-closed)
+    pub fn new(url: &str, headers: &HashMap<String, String>) -> Result<Self, String> {
+        if url.trim().is_empty() {
+            return Err("MCP streamable_http url must not be empty".to_string());
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(format!(
+                "MCP streamable_http url must start with http:// or https://, got: {}",
+                url
+            ));
+        }
+        let mut resolved = Vec::with_capacity(headers.len());
+        for (k, v) in headers {
+            resolved.push((k.clone(), expand_env_refs(v)?));
+        }
+        Ok(Self {
+            url: url.to_string(),
+            headers: resolved,
+            client: reqwest::Client::new(),
+            next_id: AtomicU64::new(1),
+            session_id: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// 组装基础 POST 请求(Accept 双类型 + 附加头 + 会话头)
+    fn post(&self, body: &Value) -> Result<reqwest::RequestBuilder, String> {
+        let mut req = self
+            .client
+            .post(&self.url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", crate::mcp::client::PROTOCOL_VERSION)
+            .json(body);
+        if let Some(sid) = self
+            .session_id
+            .lock()
+            .map_err(|_| "MCP session lock poisoned".to_string())?
+            .clone()
+        {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        Ok(req)
+    }
+
+    /// 捕获 `Mcp-Session-Id` 响应头(initialize 时 server 下发)
+    fn capture_session(&self, resp: &reqwest::Response) {
+        if let Some(sid) = resp.headers().get("mcp-session-id") {
+            if let Ok(s) = sid.to_str() {
+                if let Ok(mut slot) = self.session_id.lock() {
+                    *slot = Some(s.to_string());
+                }
+            }
+        }
+    }
+
+    /// 解析 SSE 流响应:按空行分事件,`data:` 行为 JSON-RPC 响应,匹配 id 即返回
+    ///
+    /// 单 POST 的响应流内可能夹杂其他事件(如 log/notification),仅取含
+    /// 匹配 `id` 的响应;流结束仍未匹配 → 报错。
+    async fn request_via_sse(&self, resp: reqwest::Response, id: u64) -> Result<Value, String> {
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match StreamExt::next(&mut stream).await {
+                Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                Some(Err(e)) => return Err(format!("MCP streamable_http stream read: {}", e)),
+                None => {
+                    return Err(format!(
+                        "MCP streamable_http SSE stream ended without response for id {}",
+                        id
+                    ))
+                }
+            }
+            // 按空行(\n\n)切分完整事件;余部留在 buf
+            while let Some(pos) = find_subslice(&buf, b"\n\n") {
+                let event: Vec<u8> = buf.drain(..pos + 2).collect();
+                if let Some(reply) = parse_sse_event(&event, id)? {
+                    return Ok(reply);
+                }
+            }
+        }
+    }
+}
+
+/// 在 buffer 中定位子序列位置(用于按 `\n\n` 切分 SSE 事件)
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// 解析单个 SSE 事件块:取全部 `data:` 行拼接,JSON 解析后匹配 id
+///
+/// 返回 `Ok(None)` 表示本事件不含匹配响应(通知/日志事件,跳过)。
+fn parse_sse_event(event: &[u8], id: u64) -> Result<Option<Value>, String> {
+    let text = String::from_utf8_lossy(event);
+    let mut data_lines: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.strip_prefix(' ').unwrap_or(data));
+        }
+        // `event:` 行(如 message)不参与路由——按 data 内容与 id 匹配即可
+    }
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+    let payload = data_lines.join("\n");
+    let parsed: Value = serde_json::from_str(&payload)
+        .map_err(|e| format!("MCP streamable_http SSE data parse: {}", e))?;
+    // 无 id = server 通知,跳过
+    let Some(reply_id) = parsed.get("id").and_then(|v| v.as_u64()) else {
+        return Ok(None);
+    };
+    if reply_id != id {
+        return Ok(None);
+    }
+    if let Some(err) = parsed.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown MCP error")
+            .to_string();
+        return Err(msg);
+    }
+    Ok(Some(parsed.get("result").cloned().unwrap_or(Value::Null)))
+}
+
+#[async_trait]
+impl McpTransport for StreamableHttpTransport {
+    async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": id,
+        });
+        let resp = self
+            .post(&body)?
+            .send()
+            .await
+            .map_err(|e| format!("MCP streamable_http POST '{}' failed: {}", method, e))?;
+        self.capture_session(&resp);
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "MCP streamable_http '{}' returned HTTP {}: {}",
+                method,
+                status.as_u16(),
+                text
+            ));
+        }
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if ct.contains("text/event-stream") {
+            return self.request_via_sse(resp, id).await;
+        }
+        // 单 JSON 响应
+        let parsed: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("MCP streamable_http '{}' body parse: {}", method, e))?;
+        if let Some(err) = parsed.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown MCP error")
+                .to_string();
+            return Err(msg);
+        }
+        if parsed.get("id").and_then(|v| v.as_u64()) != Some(id) {
+            return Err(format!(
+                "MCP streamable_http '{}' response id mismatch",
+                method
+            ));
+        }
+        Ok(parsed.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn notify(&self, method: &str, params: Value) -> Result<(), String> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let resp = self
+            .post(&body)?
+            .send()
+            .await
+            .map_err(|e| format!("MCP streamable_http notify '{}' failed: {}", method, e))?;
+        let status = resp.status();
+        // 通知无响应体;2xx(通常 202)即成功
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "MCP streamable_http notify '{}' returned HTTP {}: {}",
+                method,
+                status.as_u16(),
+                text
+            ));
+        }
+        debug!(method = %method, "MCP streamable_http notify sent");
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<(), String> {
+        // 会话终止:DELETE endpoint + Mcp-Session-Id(规范语义);无会话则无需
+        let sid = self
+            .session_id
+            .lock()
+            .map_err(|_| "MCP session lock poisoned".to_string())?
+            .clone();
+        let Some(sid) = sid else {
+            return Ok(());
+        };
+        let mut req = self.client.delete(&self.url);
+        req = req.header("Mcp-Session-Id", sid);
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => Err(format!(
+                "MCP streamable_http session DELETE returned HTTP {}",
+                resp.status().as_u16()
+            )),
+            Err(e) => Err(format!("MCP streamable_http session DELETE failed: {}", e)),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(missing_docs)]
 pub mod tests {
@@ -562,5 +850,156 @@ while True:
 
         // 5. close
         transport.close().await.expect("close should succeed");
+    }
+
+    /// 起 Streamable HTTP mock server(axum,绑定随机端口)
+    ///
+    /// 行为:initialize → 单 JSON + 下发 mcp-session-id;tools/list → SSE 流
+    /// 形态;tools/call → 单 JSON 回显;DELETE → 200(会话终止)。
+    async fn spawn_http_mock() -> String {
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
+        use axum::routing::{delete, post};
+        use std::sync::Arc;
+
+        #[derive(Clone, Default)]
+        struct H {
+            session: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        async fn handler(
+            State(_h): State<H>,
+            headers: HeaderMap,
+            body: String,
+        ) -> axum::response::Response {
+            let req: Value = serde_json::from_str(&body).unwrap();
+            let method = req["method"].as_str().unwrap_or("").to_string();
+            let id = req["id"].clone();
+            let reply =
+                |result: Value| serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
+            match method.as_str() {
+                "initialize" => {
+                    let mut resp = axum::Json(reply(serde_json::json!({
+                        "protocolVersion":"2024-11-05",
+                        "serverInfo":{"name":"mock-http","version":"0.1.0"},
+                        "capabilities":{}
+                    })))
+                    .into_response();
+                    resp.headers_mut().insert(
+                        "mcp-session-id",
+                        axum::http::HeaderValue::from_static("sess-123"),
+                    );
+                    resp
+                }
+                "tools/list" => {
+                    // SSE 流形态:两个事件,第一个为无关通知,第二个为匹配响应
+                    let payload = format!(
+                        "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"log/notice\",\"params\":{{}}}}\n\n\
+                         event: message\ndata: {}\n\n",
+                        serde_json::to_string(&reply(serde_json::json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}))).unwrap()
+                    );
+                    let _ = headers;
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(payload))
+                        .unwrap()
+                }
+                "tools/call" => {
+                    let text = req["params"]["arguments"]["message"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    axum::Json(reply(serde_json::json!({
+                        "content":[{"type":"text","text":text}]
+                    })))
+                    .into_response()
+                }
+                _ => axum::Json(serde_json::json!({
+                    "jsonrpc":"2.0","id":id,
+                    "error":{"code":-32601,"message":"not found"}
+                }))
+                .into_response(),
+            }
+        }
+
+        async fn shutdown_handler(State(h): State<H>) -> impl axum::response::IntoResponse {
+            h.session.store(true, std::sync::atomic::Ordering::SeqCst);
+            "ok"
+        }
+
+        let h = H::default();
+        let app = axum::Router::new()
+            .route("/mcp", post(handler).delete(shutdown_handler))
+            .with_state(h);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}/mcp", addr)
+    }
+
+    #[tokio::test]
+    async fn test_streamable_http_json_and_sse_round_trip() {
+        let url = spawn_http_mock().await;
+        let transport = StreamableHttpTransport::new(&url, &HashMap::new()).unwrap();
+
+        // 1. initialize:单 JSON 响应 + 会话 id 捕获
+        let init = transport
+            .request(
+                "initialize",
+                serde_json::json!({"protocolVersion":"2024-11-05"}),
+            )
+            .await
+            .expect("initialize should succeed");
+        assert_eq!(init["serverInfo"]["name"].as_str(), Some("mock-http"));
+
+        // 2. initialized 通知(无响应体,2xx 即成功)
+        transport
+            .notify("notifications/initialized", serde_json::json!({}))
+            .await
+            .expect("notify should succeed");
+
+        // 3. tools/list:SSE 流形态,首个无关事件被跳过,匹配 id 的响应返回
+        let tools = transport
+            .request("tools/list", serde_json::json!({}))
+            .await
+            .expect("tools/list via SSE should succeed");
+        assert_eq!(tools["tools"][0]["name"].as_str(), Some("echo"));
+
+        // 4. tools/call:单 JSON 回显
+        let call = transport
+            .request(
+                "tools/call",
+                serde_json::json!({"name":"echo","arguments":{"message":"hi-http"}}),
+            )
+            .await
+            .expect("tools/call should succeed");
+        assert_eq!(call["content"][0]["text"].as_str(), Some("hi-http"));
+
+        // 5. close:DELETE 会话终止
+        transport.close().await.expect("close should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_streamable_http_url_validation() {
+        assert!(StreamableHttpTransport::new("", &HashMap::new()).is_err());
+        assert!(StreamableHttpTransport::new("ftp://x", &HashMap::new()).is_err());
+        assert!(StreamableHttpTransport::new("http://127.0.0.1:1/mcp", &HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn test_expand_env_refs() {
+        std::env::set_var("B23_TEST_TOKEN", "secret-value");
+        assert_eq!(
+            expand_env_refs("Bearer ${B23_TEST_TOKEN}").unwrap(),
+            "Bearer secret-value"
+        );
+        assert_eq!(expand_env_refs("plain").unwrap(), "plain");
+        assert!(expand_env_refs("${B23_TEST_MISSING_VAR_X}").is_err());
+        assert!(expand_env_refs("unclosed ${VAR").is_err());
+        assert!(expand_env_refs("${}").is_err());
     }
 }
