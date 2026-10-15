@@ -557,7 +557,7 @@ mod tests {
             Arc::new(Metrics::new().unwrap()),
             workdir,
             Arc::new(WorkspaceApiClient::new("http://localhost:8080")),
-            Arc::new(ToolHandler::new()),
+            Arc::new(std::sync::RwLock::new(ToolHandler::new())),
         )
     }
 
