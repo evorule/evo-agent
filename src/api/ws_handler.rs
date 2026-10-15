@@ -876,6 +876,25 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         runner = runner
             .with_memory_event_store(event_store)
             .with_event_ledger(std::sync::Arc::new(ledger));
+        // O-481:sediment 管线装配(单一实现,与 from_definition 同口径)——
+        // serve 流面此前零装配,sediment 以 Default 跑(namespace="default"
+        // 错域/llm_model_id="unknown"),知识提取/巩固/摘要全跳。收编方法
+        // 覆盖 extractor/recipe 穿线/sediment_config/自省工具/验收命令/
+        // summarizer+auditor 全链;装配失败 fail-visible 降 None(与 def
+        // 加载失败同型,上层回 Error 帧)。注:本调用位于 memory_type!=
+        // "none" 分支内——"none" 型 agent 无 memory,sediment 全链本就
+        // no-op,与 CLI 面差异仅限矛盾配置场景(声明自省工具+memory none)
+        match runner.assemble_sediment_pipeline(&def) {
+            Ok(r) => runner = r,
+            Err(e) => {
+                error!(
+                    agent_type = %agent_type,
+                    error = %e,
+                    "sediment pipeline assembly failed"
+                );
+                return None;
+            }
+        }
     }
     Some(runner)
 }
