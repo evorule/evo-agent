@@ -419,10 +419,25 @@ pub fn runtime_identity(workdir: &Path) -> RuntimeIdentity {
 /// 从 union toolkit 中只取出 `whitelist` 中列出的工具,构造一个新的
 /// `ToolHandler`。未注册的工具名会被静默跳过(防御性:agent.json 写了
 /// 不存在的工具名不应 500,`from_definition` 会兜底报错)。
+///
+/// B16:白名单条目支持尾缀 `*` 前缀通配(如 `mcp_*`)——MCP 工具名动态
+/// (`mcp_{server}_{tool}`),静态白名单无法枚举;通配仍限本 union 内已注册
+/// 工具,不改变隔离语义(never opens anything outside the union)。
 pub fn build_filtered_toolkit(union: &ToolHandler, whitelist: &[String]) -> ToolHandler {
     let mut filtered = ToolHandler::new();
     for name in whitelist {
-        filtered.register_entry_from(union, name);
+        match name.strip_suffix('*') {
+            Some(prefix) => {
+                for registered in union.tool_names() {
+                    if registered.starts_with(prefix) {
+                        filtered.register_entry_from(union, &registered);
+                    }
+                }
+            }
+            None => {
+                filtered.register_entry_from(union, name);
+            }
+        }
     }
     filtered
 }
@@ -465,10 +480,22 @@ pub fn build_filtered_toolkit_with_switches(
     };
     let mut filtered = ToolHandler::new();
     for name in whitelist {
-        if !switch_on(name) {
-            continue;
+        match name.strip_suffix('*') {
+            // B16:尾缀 `*` 前缀通配(逐实际工具判定开关,通配名本身无 manifest)
+            Some(prefix) => {
+                for registered in union.tool_names() {
+                    if registered.starts_with(prefix) && switch_on(&registered) {
+                        filtered.register_entry_from(union, &registered);
+                    }
+                }
+            }
+            None => {
+                if !switch_on(name) {
+                    continue;
+                }
+                filtered.register_entry_from(union, name);
+            }
         }
-        filtered.register_entry_from(union, name);
     }
     // D6 终态 + D7-A 方案一：动态源分级按来源级 settings 键覆写
     // （= "standard" 时人工降档为 Standard，免意图裁决；"sensitive"/缺省 =
@@ -1029,8 +1056,16 @@ service_tools = ["config_persist", "rule_sandbox"]
             let injected = ["delegate"];
             for tool in tools {
                 let name = tool.as_str().unwrap();
+                // B16:尾缀 `*` 前缀通配条目(如 `mcp_*`)豁免精确存在性——
+                // MCP 工具名动态(运行期注册进 union),通配语义本身即
+                // 「凡前缀匹配的已注册工具」;build_filtered_toolkit 消费侧
+                // 已限 union 内,无越权面。
+                let wildcard = name.ends_with('*');
                 assert!(
-                    union.has_tool(name) || svc_whitelist.contains(name) || injected.contains(&name),
+                    wildcard
+                        || union.has_tool(name)
+                        || svc_whitelist.contains(name)
+                        || injected.contains(&name),
                     "{file} whitelists tool '{name}' which is neither in the serve union toolkit nor the service_tools whitelist"
                 );
             }
@@ -1070,6 +1105,27 @@ service_tools = ["config_persist", "rule_sandbox"]
 
         assert!(filtered.has_tool("file_read"));
         assert!(!filtered.has_tool("nonexistent_tool"));
+    }
+
+    #[test]
+    fn test_build_filtered_toolkit_suffix_wildcard_matches_registered_only() {
+        // B16:尾缀 `*` 前缀通配——只命中 union 内已注册的前缀匹配工具;
+        // 无匹配时零工具,白名单外语义不变。
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+
+        // git_* 通配命中 3 个 git 只读工具(union 内 git_status/git_diff/git_log)
+        let filtered = build_filtered_toolkit(&union, &["git_*".to_string()]);
+        assert!(filtered.has_tool("git_status"));
+        assert!(filtered.has_tool("git_diff"));
+        assert!(filtered.has_tool("git_log"));
+        // 通配不越界:gitWrite 面(shell 等)不可达
+        assert!(!filtered.has_tool("file_read"));
+        assert!(!filtered.has_tool("shell_exec"));
+
+        // 无匹配前缀 → 零工具不 panic
+        let empty = build_filtered_toolkit(&union, &["mcp_*".to_string()]);
+        assert_eq!(empty.tool_names().len(), 0, "union 无 MCP 工具时通配零命中");
     }
 
     /// 动态源开关测试用最小执行器桩（仅装配面，不触发 call）

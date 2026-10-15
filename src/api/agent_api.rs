@@ -258,6 +258,9 @@ pub struct AgentApiState {
     /// B14 语义索引服务(代码库符号图谱;serve 按 `index.enabled` 注入,
     /// None = 关闭态,/api/index/* 一律 503)
     index: Option<Arc<crate::index::IndexService>>,
+    /// B16 MCP 连接态管理器(serve 按 mcp 配置注入,None = 未启用态,
+    /// /api/mcp/* 一律 503;工具注册已在启动期并入 union toolkit)
+    mcp: Option<Arc<crate::mcp::McpManager>>,
 }
 
 impl AgentApiState {
@@ -319,6 +322,8 @@ impl AgentApiState {
             task_manager: Arc::new(crate::tasks::TaskManager::new()),
             // B14 索引服务缺省不注入(关闭态 503);serve 启动按设置 with_index
             index: None,
+            // B16 MCP 管理器缺省不注入;serve 启动按 mcp 配置 with_mcp
+            mcp: None,
             fs_events: crate::api::fs_watch::FsEventHub::new(),
             workdir,
             workspace_client,
@@ -475,6 +480,18 @@ impl AgentApiState {
     /// B14:获取语义索引服务(关闭态为 None)
     pub fn index(&self) -> Option<&Arc<crate::index::IndexService>> {
         self.index.as_ref()
+    }
+
+    /// B16:注入 MCP 连接态管理器(builder pattern,供 serve 启动按 mcp 配置调用;
+    /// 未注入 = 未启用态,/api/mcp/* 一律 503)
+    pub fn with_mcp(mut self, mcp: Arc<crate::mcp::McpManager>) -> Self {
+        self.mcp = Some(mcp);
+        self
+    }
+
+    /// B16:获取 MCP 连接态管理器(未启用态为 None)
+    pub fn mcp(&self) -> Option<&Arc<crate::mcp::McpManager>> {
+        self.mcp.as_ref()
     }
 }
 

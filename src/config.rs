@@ -484,6 +484,22 @@ pub struct McpServerConfig {
     /// 环境变量(注入子进程,用于 token 等)
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// 停用开关(B16):true = 不连接不注册(配置保留,启停不删配置)
+    #[serde(default)]
+    pub disabled: bool,
+    /// 单次请求超时秒数(B16;连接握手与工具调用共用;缺省 60)
+    #[serde(default = "McpServerConfig::default_timeout_secs")]
+    pub timeout_secs: u64,
+    /// 工具白名单(B16):名单内工具免审批直跑(active),未列入走 candidate
+    /// 审批(决策点 3:默认 candidate 全审批,alwaysAllow=用户显式授权)
+    #[serde(default)]
+    pub always_allow: Vec<String>,
+}
+
+impl McpServerConfig {
+    fn default_timeout_secs() -> u64 {
+        60
+    }
 }
 
 /// G12:MCP 配置(包含多个 server)

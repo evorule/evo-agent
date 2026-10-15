@@ -1842,6 +1842,44 @@ fn cmd_serve(
             Err(e) => eprintln!("[service-tools] 临时 runtime 构建失败: {e}"),
         }
     }
+    // B16:serve 模式 MCP 接入(门禁=agentTools.mcp 设置键,manifest 开关绑定
+    // 单一事实源,缺省开;disabled server 跳过;失败隔离——单 server 失败落
+    // failed 状态不阻塞其余与启动;每请求 filtered 面同键二次过滤)
+    let mcp_manager = std::sync::Arc::new(evo_agent::mcp::McpManager::new());
+    let mut mcp_enabled = false;
+    if !config.mcp.servers.is_empty() {
+        let (merged, _) = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+            .map(|store| store.merged())
+            .unwrap_or_else(|_| (serde_json::Map::new(), serde_json::Map::new()));
+        let enabled = merged
+            .get("agentTools.mcp")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !enabled {
+            eprintln!(
+                "[mcp] {} server(s) configured but agentTools.mcp=false, MCP tools filtered out (workbench toggle to enable)",
+                config.mcp.servers.len()
+            );
+        } else {
+            mcp_enabled = true;
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => {
+                    let n = rt.block_on(
+                        mcp_manager.connect_and_register_all(&mut toolkit, &config.mcp.servers),
+                    );
+                    eprintln!(
+                        "[mcp] {}/{} server(s) connected, tools registered into serve toolkit",
+                        n,
+                        config.mcp.servers.len()
+                    );
+                }
+                Err(e) => eprintln!("[mcp] 临时 runtime 构建失败,serve 面无 MCP 工具: {e}"),
+            }
+        }
+    }
     let toolkit_tool_count = toolkit.tool_names().len();
     let toolkit = std::sync::Arc::new(toolkit);
     eprintln!(
@@ -1888,6 +1926,10 @@ fn cmd_serve(
     // serve 面各请求路径的 handler 构造与 CLI 共用同一解析产物,
     // 不再绕过配置体系直读裸环境变量
     .with_llm_config(config.llm.clone());
+    // B16:MCP 管理器注入(mcp.enabled 且配了 server 时;None = /api/mcp/* 503)
+    if mcp_enabled {
+        state = state.with_mcp(mcp_manager.clone());
+    }
 
     // B14 语义索引:按 index.enabled 设置键决定是否启动(默认关,显式开启;
     // 重启生效——服务与 watcher 均 serve 生命周期一次性装配)
@@ -1981,20 +2023,8 @@ fn cmd_serve(
         Err(e) => eprintln!("[fs-watch] watcher start failed (tree live-refresh disabled): {e}"),
     }
 
-    // G12:MCP 工具注册(P1 边界:只在 `run` 子命令生效)
-    //
-    // `serve` 模式已接入完整工具面(`src/api/serve_tools.rs`:union toolkit =
-    // 内置 15 + 规则 26 共 41 工具,存 `AgentApiState.toolkit`,按 agent 白名单
-    // `build_filtered_toolkit` 过滤后注入每请求 runner)。MCP 适配器需要共享
-    // 长生命周期的 McpClient(子进程),按请求 spawn 代价过高,故未入 serve
-    // toolkit。因此 P1 阶段 MCP 工具仅在 `evo-agent run` 中生效;serve 模式
-    // 的 MCP 接入留待后续迭代。
-    if !config.mcp.servers.is_empty() {
-        eprintln!(
-            "[mcp] {} server(s) configured, but MCP tools are only active in `evo-agent run` mode (P1)",
-            config.mcp.servers.len()
-        );
-    }
+    // B16 注:serve 模式 MCP 已接入(上方 union toolkit 组装段,受 mcp.enabled
+    // 门禁;连接态管理器见 src/mcp/manager.rs,状态/重启面见 mcp_api.rs)。
 
     // 5. 构造 router + 中间件(G7 鉴权 + CORS + 1MB body limit)
     //
@@ -2143,6 +2173,9 @@ fn cmd_serve(
             .await
             .expect("server error");
     });
+
+    // B16:退出前全量断开 MCP server(close → kill 子进程,防泄漏)
+    runtime.block_on(mcp_manager.shutdown());
 
     eprintln!("server shut down gracefully");
     ExitCode::SUCCESS
