@@ -17,6 +17,394 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
+use tracing::{info, warn};
+
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crate::agent::approval::{ApprovalCallback, ApprovalDecision, ApprovalRequest};
+
+// ===== 评审决策端（policy 档：独立评审调用+条件逐条判定） =====
+
+/// 评审调用超时（秒）——无响应按「判定不可信兜底」降级人工
+pub const POLICY_REVIEW_TIMEOUT_SECS: u64 = 30;
+
+/// 评审员决策端标识（tool_trace approval 子对象 approver 字段）
+pub const POLICY_REVIEW_APPROVER: &str = "policy-review";
+
+/// 评审员 system prompt（评审独立会话专用——不含 agent 执行上下文与对话历史，
+/// 独立性保证：杜绝自我审批偏袒）
+pub const REVIEW_SYSTEM_PROMPT: &str = r#"你是审批评审员。对照以下逐条条件判定该操作是否可放行。只依据给定操作详情与条件判定，不推测意图。
+
+判定依据分三源，优先级从高到低：
+1. 拒绝规则：操作详情命中拒绝规则（含红线类操作）即拒绝，任何其他来源不可覆盖；
+2. 会话内批准先例：与本次任务中人类已批准的同类先例一致的操作可参照放行（若提供）；
+3. 预置条件：对条件清单逐条判定。
+
+每条条件输出 pass（true=符合 / false=不符合 / null=无法判定）与 evidence（判定依据摘要）；存在无法判定的条件时 verdict 置为 abstained。输出且仅输出一个 JSON 对象，格式：
+{"conditions":[{"id":1,"pass":true,"evidence":"..."}],"verdict":"approved|rejected|abstained","reason":"总体判定理由"}"#;
+
+/// 条件判定项（评审员输出契约）
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConditionJudgement {
+    /// 条件序号（评审 payload 中 1 起编号，对应条件清单行号）
+    pub id: u32,
+    /// true=符合 / false=不符合 / null=无法判定（弃权——不计符合也不计不符合）
+    pub pass: Option<bool>,
+    /// 判定依据摘要（入留痕；评审员自行截取的原文要点）
+    #[serde(default)]
+    pub evidence: String,
+}
+
+/// 评审判定（决策端解析目标）
+///
+/// verdict 三态由决策端按条件结果**机械重算**（approve 语义不可由评审自报
+/// 单方面决定）：任何条件弃权→整体弃权；有不符合→拒绝；全部符合→放行；
+/// 条件清单为空→弃权（评审未按契约输出=判定不可信）。评审自报 verdict
+/// 字段仅入留痕比对，不参与分派。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolicyJudgement {
+    /// 逐条条件判定结果（缺失=空清单→整体弃权）
+    #[serde(default)]
+    pub conditions: Vec<ConditionJudgement>,
+    /// 评审员总体理由（入留痕；Rejected 时随修正指令回喂 agent）
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// 重算后的判定三态（CONFIRMED/REFUTED/ABSTAINED 对应放行/拒绝/弃权）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewVerdict {
+    /// 全部条件符合→放行（清修正计数）
+    Approved,
+    /// 存在不符合条件→拒绝（修正指令回喂 agent，计数+1）
+    Rejected,
+    /// 任何条件弃权/清单为空→判定不可信→降级人工
+    Abstained,
+}
+
+impl ReviewVerdict {
+    /// 结构化日志/留痕用小写串
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Abstained => "abstained",
+        }
+    }
+}
+
+impl PolicyJudgement {
+    /// 三态机械重算（不信评审自报 verdict）：
+    /// 空清单/任一弃权→Abstained；有不符合→Rejected；全符合→Approved
+    pub fn recomputed_verdict(&self) -> ReviewVerdict {
+        if self.conditions.is_empty() {
+            return ReviewVerdict::Abstained;
+        }
+        let mut any_fail = false;
+        for c in &self.conditions {
+            match c.pass {
+                None => return ReviewVerdict::Abstained,
+                Some(false) => any_fail = true,
+                Some(true) => {}
+            }
+        }
+        if any_fail {
+            ReviewVerdict::Rejected
+        } else {
+            ReviewVerdict::Approved
+        }
+    }
+}
+
+/// 评审通道抽象——调用方以独立评审调用实现（评审专用 system prompt +
+/// 非流式单轮补全，经审计留痕桥走 sidecar 会话，无静默直连兜底）；
+/// 决策端只依赖本 trait，测试可注入桩
+#[async_trait]
+#[allow(clippy::double_must_use)] // async_trait 宏生成的 must_use 与 Boxed Future 类型语义重复,源上无法消（同 approval.rs ApprovalCallback 先例）
+pub trait PolicyReviewInvoker: Send + Sync {
+    /// 提交一次评审请求，返回评审员原始输出文本（ Err=调用失败）
+    async fn review(&self, user_payload: &str) -> Result<String, String>;
+}
+
+/// 评审调用的审计 purpose 值（sidecar 命令事实 audit_purpose 键；
+/// 新 purpose 接入需同步核对 server 侧 journal LlmCalled.purpose 映射）
+pub const POLICY_REVIEW_PURPOSE: &str = "policy_review";
+
+/// AuditedLlm 评审适配器——独立评审调用经审计链 sidecar 协议执行
+/// （评审 prompt 与判定全文均入 evorule 审计链；无静默直连兜底，
+/// Err=判定不可信，由决策端降级人工）
+pub struct AuditedReviewInvoker {
+    audited: crate::agent::audited_llm::AuditedLlm,
+}
+
+impl AuditedReviewInvoker {
+    /// 从审计留痕桥构造（client=evorule 会话面，llm=经执行体中继的 LLM handler）
+    pub fn new(audited: crate::agent::audited_llm::AuditedLlm) -> Self {
+        Self { audited }
+    }
+}
+
+#[async_trait]
+impl PolicyReviewInvoker for AuditedReviewInvoker {
+    async fn review(&self, user_payload: &str) -> Result<String, String> {
+        // temperature=0 保证评审最大确定性；messages 形状与 core_eval 规则
+        // 引用的 instruction.params.messages 契约一致
+        let params = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": REVIEW_SYSTEM_PROMPT },
+                { "role": "user", "content": user_payload },
+            ],
+            "temperature": 0.0,
+            "max_tokens": 2048,
+        });
+        let out = self.audited.execute(POLICY_REVIEW_PURPOSE, &params).await?;
+        out.get("content")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "audited review response missing 'content'".to_string())
+    }
+}
+
+/// policy 档评审式决策端
+///
+/// 流程：红线豁免检查（命中且未显式关闭→强制人工）→ 条件清单拉取
+/// （空清单 fail-visible 降级人工）→ 修正重查上限检查 → 独立评审调用
+/// （30s 超时）→ 判定 JSON 解析+三态机械重算 → 分派。任何判定不可信
+/// 环节（超时/调用失败/解析失败/条件弃权）一律降级人工，绝不静默放行。
+pub struct PolicyReview {
+    policy: ApprovalPolicyFile,
+    exemption_override: bool,
+    invoker: Arc<dyn PolicyReviewInvoker>,
+    fallback: Arc<dyn ApprovalCallback>,
+    corrections: Mutex<HashMap<String, u32>>,
+}
+
+impl PolicyReview {
+    /// 构造（policy=条件文件解析结果；invoker=评审通道；fallback=降级人工端；
+    /// exemption_override=用户显式关闭红线强制——留痕必带 exemption_overridden 标记）
+    pub fn new(
+        policy: ApprovalPolicyFile,
+        invoker: Arc<dyn PolicyReviewInvoker>,
+        fallback: Arc<dyn ApprovalCallback>,
+        exemption_override: bool,
+    ) -> Self {
+        Self {
+            policy,
+            exemption_override,
+            invoker,
+            fallback,
+            corrections: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 修正重查指纹键（同会话+同工具+同命令的重查共享计数）
+    fn correction_key(req: &ApprovalRequest) -> String {
+        format!("{}|{}|{}", req.session_id, req.tool_name, req.command)
+    }
+
+    fn corrections_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, u32>> {
+        self.corrections.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+#[async_trait]
+impl ApprovalCallback for PolicyReview {
+    async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision {
+        // 1. 红线豁免：默认任何档位强制人工；用户显式关闭（override=true）
+        //    仅解除强制，评审留痕必须携带 exemption_overridden 标记
+        let red_line = hits_red_line(&req.tool_name, &req.args);
+        if red_line.is_some() && !self.exemption_override {
+            info!(
+                tool = %req.tool_name,
+                marker = red_line.map(|r| r.as_str()).unwrap_or(""),
+                "policy review: red line hit, forced manual approval"
+            );
+            return self.fallback.request_approval(req).await;
+        }
+
+        // 2. 条件清单：空=未预置（fail-visible——无条件不可评审，降级人工）
+        let conditions = self.policy.conditions_for(&req.tool_name);
+        if conditions.is_empty() {
+            warn!(
+                tool = %req.tool_name,
+                "policy review: no conditions configured for tool, fallback to manual"
+            );
+            return self.fallback.request_approval(req).await;
+        }
+
+        // 3. 修正重查上限：同指纹重查次数达到 max_corrections 即降级人工（防无限循环）
+        let key = Self::correction_key(req);
+        let max = self.policy.policy_limits.max_corrections;
+        let used = *self.corrections_lock().get(&key).unwrap_or(&0);
+        if used >= max {
+            warn!(
+                tool = %req.tool_name,
+                used,
+                max,
+                "policy review: correction limit reached, fallback to manual"
+            );
+            self.corrections_lock().remove(&key);
+            return self.fallback.request_approval(req).await;
+        }
+
+        // 4. 独立评审调用（30s 超时；失败/超时=判定不可信→降级人工）
+        let payload = build_review_payload(req, conditions);
+        let raw = match tokio::time::timeout(
+            Duration::from_secs(POLICY_REVIEW_TIMEOUT_SECS),
+            self.invoker.review(&payload),
+        )
+        .await
+        {
+            Ok(Ok(raw)) => raw,
+            Ok(Err(e)) => {
+                warn!(tool = %req.tool_name, error = %e, "policy review invocation failed, fallback to manual");
+                return self.fallback.request_approval(req).await;
+            }
+            Err(_) => {
+                warn!(
+                    tool = %req.tool_name,
+                    timeout_secs = POLICY_REVIEW_TIMEOUT_SECS,
+                    "policy review timed out, fallback to manual"
+                );
+                return self.fallback.request_approval(req).await;
+            }
+        };
+
+        // 5. 判定解析+三态机械重算（解析失败=判定不可信→降级人工）
+        let judgement = match parse_judgement(&raw) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!(tool = %req.tool_name, error = %e, "policy review judgement unparseable, fallback to manual");
+                return self.fallback.request_approval(req).await;
+            }
+        };
+        let verdict = judgement.recomputed_verdict();
+
+        // 6. 留痕：判定请求与全文进 serve 侧结构化日志（封存面）；决策摘要随
+        //    ApprovalDecision.reason 进 tool_trace approval 子对象入审计链
+        info!(
+            tool = %req.tool_name,
+            proposal_id = %req.proposal_id,
+            verdict = verdict.as_str(),
+            override_flag = self.exemption_override,
+            request = %payload,
+            judgement = %raw,
+            "policy review judged"
+        );
+
+        // 7. 分派
+        let marker = if red_line.is_some() {
+            format!(
+                " [exemption_overridden:{}]",
+                red_line.map(|r| r.as_str()).unwrap_or("")
+            )
+        } else {
+            String::new()
+        };
+        match verdict {
+            ReviewVerdict::Approved => {
+                self.corrections_lock().remove(&key);
+                ApprovalDecision {
+                    approved: true,
+                    approver: POLICY_REVIEW_APPROVER.to_string(),
+                    verified: false,
+                    reason: format!(
+                        "policy-review: {} 条件全部符合{}",
+                        summary_of(&judgement),
+                        marker
+                    ),
+                    auto_rejected: false,
+                }
+            }
+            ReviewVerdict::Rejected => {
+                *self.corrections_lock().entry(key).or_insert(0) += 1;
+                ApprovalDecision {
+                    approved: false,
+                    approver: POLICY_REVIEW_APPROVER.to_string(),
+                    verified: false,
+                    reason: format!(
+                        "policy-review: 条件未全部符合，请修正操作后重试。未符合条目：{}；总体理由：{}{}",
+                        failures_of(&judgement),
+                        judgement.reason,
+                        marker
+                    ),
+                    auto_rejected: false,
+                }
+            }
+            ReviewVerdict::Abstained => {
+                warn!(
+                    tool = %req.tool_name,
+                    "policy review abstained (verifier fault or unjudgeable), fallback to manual"
+                );
+                self.fallback.request_approval(req).await
+            }
+        }
+    }
+}
+
+/// 从评审原始输出提取判定 JSON（容忍 ```json 围栏与前后缀文本）
+fn parse_judgement(raw: &str) -> Result<PolicyJudgement, String> {
+    let trimmed = raw.trim();
+    let candidate = if trimmed.starts_with('{') {
+        trimmed.to_string()
+    } else {
+        let start = trimmed.find('{').ok_or("no JSON object found")?;
+        let end = trimmed.rfind('}').ok_or("no JSON object terminator")?;
+        if end <= start {
+            return Err("malformed JSON object".to_string());
+        }
+        trimmed[start..=end].to_string()
+    };
+    serde_json::from_str(&candidate).map_err(|e| format!("judgement parse: {e}"))
+}
+
+/// 组装评审请求（操作详情+条件清单——不含 agent 对话上下文与执行意图）
+fn build_review_payload(req: &ApprovalRequest, conditions: &[String]) -> String {
+    let args_summary = serde_json::to_string(&req.args).unwrap_or_default();
+    let mut payload = String::with_capacity(1024);
+    payload.push_str("【操作详情】\n");
+    payload.push_str(&format!("工具：{}\n", req.tool_name));
+    payload.push_str(&format!("命令描述：{}\n", req.command));
+    payload.push_str(&format!("风险说明：{}\n", req.risk));
+    payload.push_str(&format!("参数：{}\n", args_summary));
+    payload.push_str("\n【条件清单】\n");
+    for (i, c) in conditions.iter().enumerate() {
+        payload.push_str(&format!("{}. {}\n", i + 1, c));
+    }
+    payload
+}
+
+/// 判定摘要（放行 reason 用——逐条 id/pass）
+fn summary_of(j: &PolicyJudgement) -> String {
+    j.conditions
+        .iter()
+        .map(|c| {
+            format!(
+                "#{}={}",
+                c.id,
+                match c.pass {
+                    Some(true) => "符合",
+                    Some(false) => "不符合",
+                    None => "弃权",
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// 未符合条目清单（拒绝 reason 用=修正指令主体）
+fn failures_of(j: &PolicyJudgement) -> String {
+    j.conditions
+        .iter()
+        .filter(|c| c.pass == Some(false))
+        .map(|c| format!("#{}（{}）", c.id, c.evidence))
+        .collect::<Vec<_>>()
+        .join("；")
+}
 
 /// 单工具组的审批条件清单（人类预置）
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -392,5 +780,343 @@ max_actions_per_run = 200
             RedLine::GovernanceConfigWrite.as_str(),
             "red_line.governance_config_write"
         );
+    }
+
+    // ===== 评审决策端（PolicyReview） =====
+
+    use crate::agent::approval::{ApprovalCallback, ApprovalRequest};
+
+    /// 可编程评审桩：按预置响应序列返回（Err 视为调用失败），记录调用次数
+    struct MockInvoker {
+        responses: Mutex<Vec<Result<String, String>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockInvoker {
+        fn new(responses: Vec<Result<String, String>>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl PolicyReviewInvoker for MockInvoker {
+        async fn review(&self, payload: &str) -> Result<String, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(!payload.contains("对话历史"), "评审请求不得携带对话上下文");
+            self.responses
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop()
+                .unwrap_or_else(|| Err("invoker exhausted".to_string()))
+        }
+    }
+
+    /// 人工降级桩：记录调用次数，返回固定人工决策
+    struct FallbackSpy {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FallbackSpy {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ApprovalCallback for FallbackSpy {
+        async fn request_approval(&self, _req: &ApprovalRequest) -> ApprovalDecision {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ApprovalDecision {
+                approved: false,
+                approver: "manual-fallback".to_string(),
+                verified: false,
+                reason: "human window".to_string(),
+                auto_rejected: false,
+            }
+        }
+    }
+
+    fn judgement_json(pass_values: &[Option<bool>], reason: &str) -> String {
+        let conditions: Vec<String> = pass_values
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let v = match p {
+                    Some(true) => "true".to_string(),
+                    Some(false) => "false".to_string(),
+                    None => "null".to_string(),
+                };
+                format!(r#"{{"id":{},"pass":{},"evidence":"e{}"}}"#, i + 1, v, i + 1)
+            })
+            .collect();
+        format!(
+            r#"{{"conditions":[{}],"verdict":"approved","reason":"{}"}}"#,
+            conditions.join(","),
+            reason
+        )
+    }
+
+    fn review_req(tool: &str, command: &str, args: serde_json::Value) -> ApprovalRequest {
+        ApprovalRequest {
+            session_id: "s-1".to_string(),
+            tool_name: tool.to_string(),
+            args,
+            command: command.to_string(),
+            risk: "medium".to_string(),
+            alternative: String::new(),
+            proposal_id: "ap-test".to_string(),
+        }
+    }
+
+    fn policy_with_conditions(max_corrections: u32) -> ApprovalPolicyFile {
+        let toml_src = format!(
+            "[shell_exec]\nconditions = [\"仅白名单 cargo 命令\", \"仅工作区内路径\"]\n[file_delete]\nconditions = [\"仅限工作区临时目录\"]\n[policy_limits]\nmax_corrections = {}\nmax_actions_per_run = 200",
+            max_corrections
+        );
+        ApprovalPolicyFile::from_toml(&toml_src).unwrap()
+    }
+
+    async fn run_review(
+        invoker: Arc<MockInvoker>,
+        fallback: Arc<FallbackSpy>,
+        req: &ApprovalRequest,
+    ) -> ApprovalDecision {
+        let review = PolicyReview::new(
+            policy_with_conditions(3),
+            invoker,
+            fallback.clone() as Arc<dyn ApprovalCallback>,
+            false,
+        );
+        review.request_approval(req).await
+    }
+
+    #[tokio::test]
+    async fn approved_when_all_conditions_pass() {
+        let invoker = MockInvoker::new(vec![Ok(judgement_json(&[Some(true), Some(true)], "ok"))]);
+        let fallback = FallbackSpy::new();
+        let d = run_review(
+            invoker,
+            fallback.clone(),
+            &review_req(
+                "shell_exec",
+                "cargo build",
+                serde_json::json!({"command": "cargo build"}),
+            ),
+        )
+        .await;
+        assert!(d.approved);
+        assert_eq!(d.approver, "policy-review");
+        assert!(d.reason.contains("#1=符合"));
+        assert_eq!(fallback.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_returns_correction_directive() {
+        let invoker = MockInvoker::new(vec![Ok(judgement_json(
+            &[Some(true), Some(false)],
+            "路径越界",
+        ))]);
+        let fallback = FallbackSpy::new();
+        let d = run_review(
+            invoker,
+            fallback.clone(),
+            &review_req(
+                "shell_exec",
+                "cargo build",
+                serde_json::json!({"command": "cargo build"}),
+            ),
+        )
+        .await;
+        assert!(!d.approved);
+        assert!(d.reason.contains("修正"));
+        assert!(d.reason.contains("#2"));
+        assert_eq!(fallback.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn abstained_when_condition_null() {
+        let invoker = MockInvoker::new(vec![Ok(judgement_json(&[Some(true), None], "?"))]);
+        let fallback = FallbackSpy::new();
+        let d = run_review(
+            invoker,
+            fallback.clone(),
+            &review_req(
+                "shell_exec",
+                "cargo build",
+                serde_json::json!({"command": "cargo build"}),
+            ),
+        )
+        .await;
+        assert!(!d.approved);
+        assert_eq!(d.approver, "manual-fallback");
+        assert_eq!(fallback.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn self_reported_verdict_not_trusted() {
+        // 评审自报 approved 但存在 fail 条目——机械重算必须拒绝
+        let raw = judgement_json(&[Some(false)], "自报放行");
+        let invoker = MockInvoker::new(vec![Ok(raw)]);
+        let fallback = FallbackSpy::new();
+        let d = run_review(
+            invoker,
+            fallback.clone(),
+            &review_req(
+                "shell_exec",
+                "cargo build",
+                serde_json::json!({"command": "cargo build"}),
+            ),
+        )
+        .await;
+        assert!(!d.approved);
+        assert_eq!(d.approver, "policy-review");
+    }
+
+    #[tokio::test]
+    async fn parse_failure_falls_back() {
+        let invoker = MockInvoker::new(vec![Ok("评审员表示：```json\n{oops\n```".to_string())]);
+        let fallback = FallbackSpy::new();
+        let d = run_review(
+            invoker,
+            fallback.clone(),
+            &review_req(
+                "shell_exec",
+                "cargo build",
+                serde_json::json!({"command": "cargo build"}),
+            ),
+        )
+        .await;
+        assert!(!d.approved);
+        assert_eq!(d.approver, "manual-fallback");
+    }
+
+    #[tokio::test]
+    async fn invocation_error_falls_back() {
+        let invoker = MockInvoker::new(vec![Err("llm unreachable".to_string())]);
+        let fallback = FallbackSpy::new();
+        let d = run_review(
+            invoker,
+            fallback.clone(),
+            &review_req(
+                "shell_exec",
+                "cargo build",
+                serde_json::json!({"command": "cargo build"}),
+            ),
+        )
+        .await;
+        assert!(!d.approved);
+        assert_eq!(d.approver, "manual-fallback");
+    }
+
+    #[tokio::test]
+    async fn empty_conditions_fall_back() {
+        let review = PolicyReview::new(
+            ApprovalPolicyFile::default(),
+            MockInvoker::new(vec![]),
+            FallbackSpy::new() as Arc<dyn ApprovalCallback>,
+            false,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "shell_exec",
+                "cargo build",
+                serde_json::json!({"command": "cargo build"}),
+            ))
+            .await;
+        assert!(!d.approved);
+        assert_eq!(d.approver, "manual-fallback");
+    }
+
+    #[tokio::test]
+    async fn correction_limit_degrades_to_manual() {
+        let review = PolicyReview::new(
+            policy_with_conditions(1),
+            MockInvoker::new(vec![
+                Ok(judgement_json(&[Some(false)], "仍不符合")),
+                Ok(judgement_json(&[Some(false)], "首次不符合")),
+            ]),
+            FallbackSpy::new() as Arc<dyn ApprovalCallback>,
+            false,
+        );
+        let req = review_req(
+            "shell_exec",
+            "cargo build",
+            serde_json::json!({"command": "cargo build"}),
+        );
+        let d1 = review.request_approval(&req).await;
+        assert!(!d1.approved);
+        assert_eq!(d1.approver, "policy-review");
+        // 同指纹重查第二次：used=1 >= max=1 → 降级人工
+        let d2 = review.request_approval(&req).await;
+        assert!(!d2.approved);
+        assert_eq!(d2.approver, "manual-fallback");
+    }
+
+    #[tokio::test]
+    async fn red_line_forces_manual_unless_overridden() {
+        // 默认：file_delete 强制人工（评审桩不应被调用）
+        let invoker = MockInvoker::new(vec![]);
+        let fallback = FallbackSpy::new();
+        let d = run_review(
+            invoker,
+            fallback.clone(),
+            &review_req(
+                "file_delete",
+                "rm a.txt",
+                serde_json::json!({"path": "a.txt"}),
+            ),
+        )
+        .await;
+        assert_eq!(d.approver, "manual-fallback");
+        assert_eq!(fallback.count(), 1);
+
+        // override=true：红线解除强制，评审链继续，reason 携带标记
+        let invoker = MockInvoker::new(vec![Ok(judgement_json(&[Some(true), Some(true)], "ok"))]);
+        let review = PolicyReview::new(
+            policy_with_conditions(3),
+            invoker,
+            FallbackSpy::new() as Arc<dyn ApprovalCallback>,
+            true,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "file_delete",
+                "rm a.txt",
+                serde_json::json!({"path": "a.txt"}),
+            ))
+            .await;
+        assert!(d.approved);
+        assert!(d.reason.contains("exemption_overridden"));
+    }
+
+    #[test]
+    fn judgement_parses_with_code_fence() {
+        let raw = format!(
+            "评审结论如下：\n```json\n{}\n```",
+            judgement_json(&[Some(true)], "ok")
+        );
+        let j = parse_judgement(&raw).unwrap();
+        assert_eq!(j.recomputed_verdict(), ReviewVerdict::Approved);
+    }
+
+    #[test]
+    fn review_payload_contains_conditions_but_no_history() {
+        let req = review_req(
+            "shell_exec",
+            "cargo build",
+            serde_json::json!({"command": "cargo build"}),
+        );
+        let payload = build_review_payload(&req, &["仅白名单 cargo 命令".to_string()]);
+        assert!(payload.contains("cargo build"));
+        assert!(payload.contains("仅白名单 cargo 命令"));
+        assert!(!payload.contains("message"));
     }
 }
