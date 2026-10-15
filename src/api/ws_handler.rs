@@ -728,6 +728,19 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
     // 缺这步时 runner 的 tool_handler 为空 —— LLM 请求无工具契约(模型只能盲猜
     // 或输出供应商原生 XML),也调不通 call_service 工具。
     let (merged_settings, _) = state.workbench_settings().merged();
+    // B22-C:事件轨道开关 serve 面安装(first-wins 幂等,改键后重启生效;
+    // CLI 不 init 缺省开。HTTP agent_api 路径红线零触碰,其面缺省开——
+    // 开关生效面注记见施工日志)
+    crate::agent::event_ledger::init_event_ledger_enabled(
+        merged_settings
+            .get("agentTools.eventLedger")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+    );
+    // B22 顺手修:A 项 GovLedger 单例 serve 面安装——PR1/PR2 交付了骨架与
+    // 事件源 hooks,但 init_ledger 此前无生产调用点,gov 留痕实际 no-op;
+    // 此处补接线(client 同源;重复 init 幂等,断言见 ledger.rs 测试)
+    crate::governance::init_ledger(state.evorule_client().clone());
     let mut filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
         &state.toolkit(),
         &def.tools,
