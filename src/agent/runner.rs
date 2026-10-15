@@ -4297,6 +4297,9 @@ impl AgentRunner {
         args: &Value,
         journal: Option<&crate::agent::journal::JournalWriter>,
     ) -> Result<ToolExecStage, AgentError> {
+        // B22-C T1:流式面工具完成事件的计时起点(缓存命中臂经 gated 收口
+        // 自计时,不消费本起点)
+        let started = std::time::Instant::now();
         // G13:并行缓存命中(如果 call_external 已并行执行过此 active 工具,
         // 直接返回缓存结果,跳过重复执行 + 审批;candidate 工具不缓存)
         // PR-3 缓存收口:命中调用仍走完整管道(①-⑤⑧照常,仅⑦免重执行——
@@ -4337,6 +4340,19 @@ impl AgentRunner {
                     None => {
                         Self::record_handover_written(journal, session_id, tool_name, &tool_result);
                         Self::record_session_spawned(journal, session_id, tool_name, &tool_result);
+                        // B22-C T1:流式面工具完成事件——与 execute_tool_call_gated
+                        // 收口同口径;此前四触发点仅覆盖 call_service 路径,流式
+                        // ReAct 面(W serve 实际执行面)整体旁路,实证 EL 缺 T1 后补钩
+                        if let Some(ledger) = &self.event_ledger {
+                            ledger
+                                .record_tool_completion(
+                                    tool_name,
+                                    true,
+                                    started.elapsed().as_millis() as u64,
+                                    None,
+                                )
+                                .await;
+                        }
                         Ok(ToolExecStage::Done(ToolExecOutcome {
                             final_result: tool_result,
                             approval_record: None,
@@ -4364,15 +4380,33 @@ impl AgentRunner {
                 Ok(ToolExecStage::Pending(req))
             }
             other => {
-                let final_result = Self::translate_pipeline_outcome(
+                let translated = Self::translate_pipeline_outcome(
                     crate::agent::pipeline::PipelineOutcome {
                         result: other,
                         ledger,
                     },
                     tool_name,
-                )?;
+                );
+                // B22-C T1:成败皆记(Err=执行失败带 error;Ok 含治理拦截等
+                // 有产出形态——与 gated 收口 Ok→ok=true 口径一致)
+                if let Some(ledger) = &self.event_ledger {
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    match &translated {
+                        Ok(_) => {
+                            ledger
+                                .record_tool_completion(tool_name, true, duration_ms, None)
+                                .await;
+                        }
+                        Err(e) => {
+                            let err = e.to_string();
+                            ledger
+                                .record_tool_completion(tool_name, false, duration_ms, Some(&err))
+                                .await;
+                        }
+                    }
+                }
                 Ok(ToolExecStage::Done(ToolExecOutcome {
-                    final_result,
+                    final_result: translated?,
                     approval_record: None,
                     approval_flow: None,
                 }))
@@ -4427,6 +4461,14 @@ impl AgentRunner {
             "reason": decision.reason,
         });
 
+        // B22-C T3:审批决定事件(流式面)——与 call_service 路径
+        // decide_and_reexecute 的 T3 同口径,双路径互斥不双记
+        if let Some(ledger) = &self.event_ledger {
+            ledger
+                .record_approval(&approval_req.proposal_id, decision_label)
+                .await;
+        }
+
         let final_result = if !decision.approved {
             warn!(%session_id, tool = %tool_name, "G8: tool call rejected");
             Value::from(r#"{"status":"rejected","message":"User denied approval"}"#)
@@ -4441,6 +4483,7 @@ impl AgentRunner {
             } else {
                 approved_args = serde_json::json!({"original_args": args, "approved": true});
             }
+            let reexec_started = std::time::Instant::now();
             let outcome = self
                 .run_pipeline(
                     tool_name,
@@ -4451,7 +4494,26 @@ impl AgentRunner {
                     Some(decision.clone()),
                 )
                 .await;
-            Self::translate_pipeline_outcome(outcome, tool_name)?
+            let translated = Self::translate_pipeline_outcome(outcome, tool_name);
+            // B22-C T1:批准重执行的工具完成事件(成败皆记;拒绝不记——
+            // 决定面由 T3 覆盖,与 gated 收口拒绝语义一致)
+            if let Some(ledger) = &self.event_ledger {
+                let duration_ms = reexec_started.elapsed().as_millis() as u64;
+                match &translated {
+                    Ok(_) => {
+                        ledger
+                            .record_tool_completion(tool_name, true, duration_ms, None)
+                            .await;
+                    }
+                    Err(e) => {
+                        let err = e.to_string();
+                        ledger
+                            .record_tool_completion(tool_name, false, duration_ms, Some(&err))
+                            .await;
+                    }
+                }
+            }
+            translated?
         };
 
         // PR-H4 验收修复:审批恢复路径的语义事件落账与常规路径同钩位——
@@ -5503,6 +5565,19 @@ impl AgentRunner {
                     // sediment Shared 域写入依赖此绑定。
                     if let Some(mem) = runner.memory.as_mut() {
                         mem.set_session_id(&session_id);
+                    }
+                    // G14+B22 E2E 实测补齐:MemoryEventStore 与事件轨道 session_id
+                    // 同步(与 run() 同钩位)——serve 流面此前缺席,证据链写入
+                    // SessionNotSet、轨道 shared 面双写全败(warn 留痕实证)。
+                    if let Some(store) = runner.memory_event_store.as_mut() {
+                        store.set_session_id(&session_id);
+                        // best-effort 从 evorule 同步已有事件(HTTP 失败不阻塞)
+                        if let Err(e) = store.sync_from_evorule().await {
+                            tracing::warn!(session_id = %session_id, error = %e, "sync_from_evorule failed; memory event store may be incomplete");
+                        }
+                    }
+                    if let Some(ledger) = &runner.event_ledger {
+                        ledger.set_session_id(&session_id).await;
                     }
                     // A2-2:memory_propose 会话锚绑定(与 run() 对齐;G15 continuation
                     // 复用会话分支同样绑定,保证锚与 session 事实一致)

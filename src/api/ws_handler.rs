@@ -861,6 +861,21 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         runner = runner
             .with_message_persist_mode(def.memory.message_persist.to_mode().unwrap_or_default())
             .with_memory(mem);
+        // B22 PR5:E2E 实测补装配——事件轨道与证据链 store 在 WS 面此前只在
+        // from_definition(CLI)构造,serve 面四触发点实际 no-op。与 from_definition
+        // 同口径补齐(store 共享 namespace+client;ledger 同源;EL-/E- 前缀互斥)
+        let event_store = crate::agent::memory_event::MemoryEventStore::new(
+            &def.memory.namespace,
+            state.evorule_client().clone(),
+        );
+        let ledger = crate::agent::event_ledger::EventLedger::new(
+            event_store.clone(),
+            &def.memory.namespace,
+            state.evorule_client().clone(),
+        );
+        runner = runner
+            .with_memory_event_store(event_store)
+            .with_event_ledger(std::sync::Arc::new(ledger));
     }
     Some(runner)
 }
