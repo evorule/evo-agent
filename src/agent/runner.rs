@@ -1204,8 +1204,16 @@ impl AgentRunner {
         // 例外:自省记忆工具在记忆装配后才注册(阶段 3 F-611),此处按暴露
         // 条件预放行;装配后仍未注册=配置矛盾,由注册步显式报错(fail-visible)
         let introspect_allowed = crate::agent::memory_tool::exposed_tools_from_definition(&def);
+        // B16:尾缀 `*` 通配条目(如 `mcp_*`)豁免精确存在性——MCP 工具名动态
+        // (`mcp_{server}_{tool}`,握手后运行期注册),静态声明无法枚举;通配
+        // 语义本身即「凡前缀匹配的已注册工具」,与 serve_tools 白名单校验面
+        // 同构(B16 build_filtered_toolkit 消费侧同款),不放行任何未知名。
         for tool_name in &config.tool_names {
-            if !tool_handler.has_tool(tool_name) && !introspect_allowed.contains(tool_name) {
+            let is_wildcard = tool_name.ends_with('*');
+            if !tool_handler.has_tool(tool_name)
+                && !introspect_allowed.contains(tool_name)
+                && !is_wildcard
+            {
                 return Err(AgentError::Internal(format!(
                     "agent '{}' requires tool '{}' but it is NOT registered in tool_handler; \
                      check your agent.json 'tools' list vs the tool_handler you passed",

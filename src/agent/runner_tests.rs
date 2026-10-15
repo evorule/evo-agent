@@ -797,6 +797,39 @@ async fn test_from_definition_rejects_unregistered_tool() {
 }
 
 #[tokio::test]
+async fn test_from_definition_wildcard_entry_bypasses_registration_check() {
+    // B16 对齐:尾缀 `*` 通配条目(如 `mcp_*`)豁免精确存在性——MCP 工具名
+    // 运行期动态注册,静态声明无法枚举;CLI 直启路径不得因此拒建(与
+    // serve_tools 白名单校验面同构)
+    let def = make_def_with_tools(vec!["echo".to_string(), "mcp_*".to_string()]);
+    let client = make_test_client();
+    let handler = make_handler_with(&["echo"]); // 无任何 mcp_* 工具注册
+
+    let result = AgentRunner::from_definition(def, client, handler, None).await;
+    assert!(result.is_ok(), "wildcard entry must not reject construction");
+}
+
+#[tokio::test]
+async fn test_from_definition_wildcard_does_not_lift_unknown_names() {
+    // 通配豁免不放大未知名:普通名字仍须已注册(早失败语义保持)
+    let def = make_def_with_tools(vec!["mcp_*".to_string(), "magic".to_string()]);
+    let client = make_test_client();
+    let handler = make_handler_with(&["echo"]);
+
+    let result = AgentRunner::from_definition(def, client, handler, None).await;
+    let err = match result {
+        Ok(_) => panic!("expected Err but got Ok"),
+        Err(e) => e,
+    };
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("magic"),
+        "unknown plain name must still be rejected, got: {}",
+        msg
+    );
+}
+
+#[tokio::test]
 async fn test_from_definition_rejects_unknown_memory_type() {
     let mut def = make_def_with_tools(vec!["echo".to_string()]);
     def.memory.memory_type = "redis".to_string(); // 0.1.0 不支持
