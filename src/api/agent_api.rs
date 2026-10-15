@@ -1052,7 +1052,7 @@ async fn run_agent(
     let governance_segment =
         crate::api::serve_tools::build_governance_segment(&state.evorule_client, &def.tools).await;
     // 人工审查开合(2026-09-28):def move 前捕获审批模式
-    let approval_auto = def.approval_mode.as_deref() == Some("auto_policy");
+    let approval_mode = def.approval_mode.clone();
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
@@ -1068,15 +1068,28 @@ async fn run_agent(
     .wire_accounting(&state.workdir)
     // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位)
     .with_governance_segment(governance_segment.clone());
-    // G8:注入审批决策端(人工审查开合)——定义级 approval_mode=auto_policy 时
-    // 走 PolicyApproval 判定式决策端(无人值守,理由必产);manual 态维持本端点
-    // 既定行为(不注入=缺省拒绝,安全优先,行为零变化)
-    let runner = if approval_auto {
-        let callback: std::sync::Arc<dyn crate::agent::approval::ApprovalCallback> =
-            std::sync::Arc::new(crate::agent::approval::PolicyApproval);
-        runner.with_approval_callback(callback)
-    } else {
-        runner
+    // G8:注入审批决策端(人工审查开合,与 WS 面 construct_runner 三态同口径;
+    // 补接前本端点仅 auto_policy 二元路由,policy 档静默缺失):
+    // auto_policy=PolicyApproval 判定式(无人值守,理由必产,现状不变);
+    // policy=PolicyReview 评审式(独立 LLM 对照条件清单逐条判定),并同产出
+    // Runaway 护栏策略注入(18 号 PR-3——本端点改消费 run_streaming,护栏
+    // 挂点在流式面随之生效);manual 态维持本端点既定行为(不注入=缺省
+    // 拒绝,安全优先,行为零变化)
+    let runner = match approval_mode.as_deref() {
+        Some("auto_policy") => {
+            let callback: std::sync::Arc<dyn crate::agent::approval::ApprovalCallback> =
+                std::sync::Arc::new(crate::agent::approval::PolicyApproval);
+            runner.with_approval_callback(callback)
+        }
+        Some("policy") => {
+            let (approval_callback, runaway_policy) =
+                crate::api::ws_handler::build_approval_callback(&state, Some("policy"));
+            runner
+                .with_approval_callback(approval_callback)
+                .with_runaway_policy(runaway_policy)
+        }
+        // manual/缺省:现状行为零变化
+        _ => runner,
     };
     // 执行桥后端上下文注入轨迹采集器:请求携带容器名(docker-exec 后端)时
     // shell_exec 轨迹成形分流 program 旗标(分流≠删检);宿主后端零变化
@@ -1406,8 +1419,14 @@ async fn run_agent_stream(
     // S2 治理门禁段(S2 前移批):同 run_agent 口径
     let governance_segment =
         crate::api::serve_tools::build_governance_segment(&state.evorule_client, &def.tools).await;
-    // 人工审查开合(2026-09-28):def move 前捕获审批模式(auto_policy → PolicyApproval)
-    let approval_auto = def.approval_mode.as_deref() == Some("auto_policy");
+    // 人工审查开合(2026-09-28):def move 前捕获审批模式
+    // G8 审批决策端 + 18 号 PR-3 Runaway 护栏(与 WS 面 construct_runner 同口径;
+    // 补接前本端点为 auto_policy/其余二元路由,policy 档静默降 manual=缺口):
+    // build_approval_callback 三态一次判别双产出——auto_policy=PolicyApproval/
+    // policy=PolicyReview 评审式+Runaway 护栏策略(本端点消费 run_streaming,
+    // 护栏挂点随之生效)/其余=HttpApproval 60s 人工审批窗(manual 态现状行为)
+    let (approval_callback, runaway_policy) =
+        crate::api::ws_handler::build_approval_callback(&state, def.approval_mode.as_deref());
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
@@ -1423,17 +1442,10 @@ async fn run_agent_stream(
     .wire_accounting(&state.workdir)
     // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位)
     .with_governance_segment(governance_segment)
-    // G8:注入审批决策端(人工审查开合)——定义级 approval_mode=auto_policy 时
-    // 走 PolicyApproval 判定式决策端(无人值守,理由必产);否则 HttpApproval
-    // 60s 人工审批窗(manual 态,现状行为)
-    .with_approval_callback(if approval_auto {
-        std::sync::Arc::new(crate::agent::approval::PolicyApproval)
-            as std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>
-    } else {
-        std::sync::Arc::new(crate::agent::approval::HttpApproval::new(
-            state.pending_approvals.clone(),
-        )) as std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>
-    })
+    // G8:注入审批决策端(三态同口径,构造期已双产出,见上)
+    .with_approval_callback(approval_callback)
+    // 18 号 PR-3:Runaway 护栏(policy 档;None=不启用,行为零变化)
+    .with_runaway_policy(runaway_policy)
     // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
     .with_metrics(state.metrics.clone())
     // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)

@@ -623,7 +623,10 @@ async fn handle_ws(
 /// 返回 `(决策端, Runaway 护栏策略)`:policy 模式加载成功时同时产出
 /// [`RunawayPolicy`]（18 号 PR-3 护栏注入面——计数阈值+复述条件清单复用
 /// 同一份加载结果）；其余模式护栏为 None（不启用，行为零变化）。
-fn build_approval_callback(
+///
+/// crate 内共享：WS 面（construct_runner）与 HTTP 面（run_agent /
+/// run_agent_stream）同口径调用，避免三态路由在 serve 各执行面分叉。
+pub(crate) fn build_approval_callback(
     state: &AgentApiState,
     mode: Option<&str>,
 ) -> (
