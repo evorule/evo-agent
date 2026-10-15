@@ -1900,6 +1900,39 @@ fn cmd_serve(
         if index_enabled {
             match evo_agent::index::IndexService::open(workdir) {
                 Ok(svc) => {
+                    // B14 v1.x 语义面:index.semantic.enabled 开启时装配 fastembed
+                    // 本地嵌入器(all-MiniLM-L6-v2 q8,缓存 ~/.evo-agent/models)。
+                    // fail-soft:模型加载失败(首启下载网络不通等)仅降级纯结构面,
+                    // 不阻塞 serve;重开开关重启自愈。
+                    let semantic = merged
+                        .get("index.semantic.enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let svc = match (semantic, evo_agent::index::embedder::default_model_dir()) {
+                        (true, Ok(dir)) => {
+                            match evo_agent::index::embedder::FastembedEmbedder::new(&dir) {
+                                Ok(emb) => {
+                                    eprintln!(
+                                        "[index] semantic embeddings on (all-MiniLM-L6-v2 q8)"
+                                    );
+                                    svc.with_embedder(std::sync::Arc::new(emb))
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[index] semantic embedder init failed (structure-only mode): {e}"
+                                    );
+                                    svc
+                                }
+                            }
+                        }
+                        (true, Err(e)) => {
+                            eprintln!(
+                                "[index] model dir resolve failed (structure-only mode): {e}"
+                            );
+                            svc
+                        }
+                        (false, _) => svc,
+                    };
                     let svc = std::sync::Arc::new(svc);
                     // 启动对账(全盘哈希+解析可能秒级):后台线程执行,不阻塞 bind;
                     // 差量对账复用 reconcile_sync(首启空库=全量灌入)
