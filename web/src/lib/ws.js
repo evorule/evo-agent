@@ -25,6 +25,7 @@ import {
 } from './stores.js';
 import { getTranscript } from './api.js';
 import { assembleContext } from './mentions.js';
+import { looksLikeDeadSession, buildRebuildBlock, lastUserTextOf } from './sessionRebuild.js';
 
 let ws = null;
 let streamMsgId = null; // 当前轮流式 assistant 气泡
@@ -32,31 +33,39 @@ let lastToolMsgId = null; // 最近一个运行中工具气泡(按 name 匹配�
 let pendingWrite = null; // S4:进行中的 file_write {path, content}(ToolResult 成功即登记产物)
 let pendingNotice = null; // newSession 清屏后需补显的提示(SessionCreated 时补显)
 let pendingResume = false; // 恢复意图待发旗标(连接就绪 onopen 时补发 resume 帧)
+let pendingRebuild = null; // B17:重建待发态 {block, autoSend, userText}——消费点在 SessionCreated(autoSend)/sendMessage(前缀)
 
 /**
- * 死会话检测:引擎侧会话已失效(evorule-server 重启或 30min 闲置 TTL 回收),
- * evo-agent serve 转发 REST 失败回灌的错误体为 404 形态
- * ("Evorule error: API returned error: 404 {...\"message\":\"Not Found\"...}")。
- * 命中即自动新建会话(自愈),避免用户每条消息都秒回 404。
+ * 死会话自愈升级(B17 持久会话):引擎侧会话失效后不再裸新建丢上下文——
+ * 取历史(REST transcript:活投影→本地快照两级,与 serve 同口径)合成
+ * 重建回注块,新建会话后自动续发最后一条 user 消息(前缀回注历史块);
+ * 历史不可得时降级为裸重发(至少不丢用户输入)。
  */
-function looksLikeDeadSession(text) {
-  return (
-    text.includes('NOT_FOUND') ||
-    /"status":\s*404/.test(text) ||
-    /returned error: 404/.test(text) ||
-    text.includes('"message":"Not Found"')
-  );
-}
-
-function recoverFromDeadSession(rawError) {
+async function recoverFromDeadSession(rawError) {
   finishStream();
   turnActive.set(false);
-  pushMessage({
-    kind: 'error',
-    text: `消息发送失败:会话在引擎侧已失效(${String(rawError).slice(0, 100)})`,
+  pushPanelEvent('gov', {
+    label: 'SessionRebuilt',
+    detail: `死会话自愈重建:${String(rawError).slice(0, 100)}`,
+    level: 'warn',
   });
-  pendingNotice = '已自动新建会话——请重发刚才的消息。';
-  newSession();
+  const failedUserText = lastUserTextOf(get(messages));
+  const deadSid = get(sessionId);
+  let block = null;
+  if (deadSid) {
+    try {
+      const res = await getTranscript(deadSid);
+      block = buildRebuildBlock(res.messages || []);
+    } catch {
+      block = null; // 历史取回失败 → 降级为裸重发
+    }
+  }
+  newSession(); // 清屏/清 artifacts/清 pendingRebuild + connect('new')
+  pendingNotice = `已自动重建会话——正在续发刚才的消息${block ? '(历史已回注)' : ''}。`;
+  if (failedUserText) {
+    // 先于 SessionCreated 就位(newSession 入口清的是旧态,此为新建态)
+    pendingRebuild = { block, autoSend: true, userText: failedUserText };
+  }
 }
 
 function wsUrl(sid) {
@@ -120,6 +129,14 @@ export function disconnect() {
  */
 export async function sendMessage(content, mentions = []) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return null;
+  // B17:快照重建待发态(autoSend=false)——本条消息即续聊新输入,wire
+  // 正文前缀回注历史块(气泡仍显示原文),消费即清。autoSend=true 态归
+  // SessionCreated 消费,此处不动。
+  let rebuildBlock = null;
+  if (pendingRebuild && !pendingRebuild.autoSend) {
+    rebuildBlock = pendingRebuild.block;
+    pendingRebuild = null;
+  }
   let xml = '';
   let used = [];
   let dropped = [];
@@ -146,7 +163,9 @@ export async function sendMessage(content, mentions = []) {
   streamMsgId = pushMessage({ kind: 'assistant', text: '', streaming: true });
   stepCount.set(0);
   turnActive.set(true);
-  ws.send(JSON.stringify({ type: 'message', content: xml ? `${content}\n\n${xml}` : content }));
+  // wire 正文 = [重建回注块] + 正文 + [@上下文 XML];气泡显示仍为原文
+  const wireContent = `${rebuildBlock ? `${rebuildBlock}\n\n` : ''}${content}${xml ? `\n\n${xml}` : ''}`;
+  ws.send(JSON.stringify({ type: 'message', content: wireContent }));
   return { used, dropped };
 }
 
@@ -159,6 +178,7 @@ export function interrupt() {
 /** 新建会话:断开当前连接并以 "new" 重连 */
 export function newSession() {
   pendingResume = false;
+  pendingRebuild = null; // 防串台:手动新建不吃旧重建态
   sessionId.set(null);
   localStorage.removeItem('evo_session_id');
   messages.set([]);
@@ -166,24 +186,36 @@ export function newSession() {
   connect('new');
 }
 
-/** 打开历史会话:断开 → 回灌消息 → 以该会话 id 重连(继续对话) */
+/** 打开历史会话:断开 → 回灌消息 → 按数据源分流连接(继续对话) */
 export async function openSession(sid) {
   if (!sid || sid === get(sessionId)) return;
   pendingResume = false;
+  pendingRebuild = null; // 防串台:换线不吃旧重建态
   sessionId.set(sid);
   localStorage.setItem('evo_session_id', sid);
   loadArtifacts(sid); // S4:恢复该会话的产物留痕(草稿基线/定稿状态)
   disconnect();
   messages.set([]);
   connStatus.set('connecting');
+  let targetSid = sid;
   try {
     const res = await getTranscript(sid);
     loadTranscriptInto(res.messages || []);
     if (res.source === 'snapshot') {
-      // 引擎会话已被 30min 闲置 TTL 回收,历史来自本地快照(非权威副本)
+      // B17:快照源=引擎会话必死(30min 闲置 TTL 回收)——主动重建而非连
+      // 死会话:历史回显保留,新引擎会话在下一发消息时前缀回注历史块,
+      // 不再让用户首条消息撞 404
+      pendingRebuild = {
+        block: buildRebuildBlock(res.messages || []),
+        autoSend: false,
+        userText: null,
+      };
+      sessionId.set(null);
+      localStorage.removeItem('evo_session_id');
+      targetSid = 'new';
       pushMessage({
         kind: 'info',
-        text: `已恢复历史会话(${res.count ?? 0} 条消息,本地快照副本——引擎侧会话已过期;如需继续对话请新建会话)`,
+        text: `已恢复历史会话(${res.count ?? 0} 条消息,本地快照副本——已就绪新引擎会话,继续对话即可)`,
       });
     } else {
       pushMessage({ kind: 'info', text: `已恢复历史会话(${res.count ?? 0} 条消息)` });
@@ -194,7 +226,7 @@ export async function openSession(sid) {
       text: `历史恢复失败:${String(e?.message || e)}(已重连,可继续发消息)`,
     });
   }
-  connect(sid);
+  connect(targetSid);
 }
 
 /**
@@ -238,6 +270,24 @@ function handleFrame(f) {
       if (pendingNotice) {
         pushMessage({ kind: 'info', text: pendingNotice });
         pendingNotice = null;
+      }
+      if (pendingRebuild) {
+        const rb = pendingRebuild;
+        pendingRebuild = null; // 消费即清
+        if (rb.autoSend && rb.userText) {
+          // 死会话自愈自动续发:重推 user 气泡+assistant 流,wire 正文前缀
+          // 回注历史块(气泡显示仍为原文)
+          pushMessage({ kind: 'user', text: rb.userText });
+          streamMsgId = pushMessage({ kind: 'assistant', text: '', streaming: true });
+          stepCount.set(0);
+          turnActive.set(true);
+          ws.send(
+            JSON.stringify({
+              type: 'message',
+              content: rb.block ? `${rb.block}\n\n${rb.userText}` : rb.userText,
+            }),
+          );
+        }
       }
       refreshSessions();
       pushPanelEvent('sys', { label: 'SessionCreated', detail: `会话 ${f.session_id} 已建立` });
