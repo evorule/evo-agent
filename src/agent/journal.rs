@@ -798,10 +798,19 @@ impl JournalWriter {
         replay_seq: u64,
         rebuilt: Vec<String>,
     ) -> Result<u64, JournalError> {
-        self.push(JournalEvent::SessionResumed {
+        let rebuilt_len = rebuilt.len();
+        let seq = self.push(JournalEvent::SessionResumed {
             replay_seq,
             rebuilt,
-        })
+        })?;
+        // B22:b21_journal_milestone 镜像（resume 恢复；refs.journal_seq 互指，
+        // 23 号档 §3.1；best-effort 不影响 journal 落账语义）
+        crate::governance::hooks::journal_milestone(
+            &self.session_id(),
+            &format!("journal resumed (replay_seq={replay_seq}, rebuilt {rebuilt_len} 项)"),
+            seq,
+        );
+        Ok(seq)
     }
 
     /// 工具执行重试落账(attempt 从 1 计:第 attempt 次重试;幂等类工具
@@ -986,11 +995,21 @@ impl JournalWriter {
         after_est: usize,
         summary_generated: bool,
     ) -> Result<u64, JournalError> {
-        self.push(JournalEvent::CompactionPerformed {
+        let seq = self.push(JournalEvent::CompactionPerformed {
             before_est,
             after_est,
             cleared_call_ids: vec![format!("summary_generated={}", summary_generated)],
-        })
+        })?;
+        // B22:b21_journal_milestone 镜像（压缩里程碑；refs.journal_seq 互指；
+        // best-effort 不影响 journal 落账语义）
+        crate::governance::hooks::journal_milestone(
+            &self.session_id(),
+            &format!(
+                    "journal compaction (est {before_est}→{after_est}, summary_generated={summary_generated})"
+                ),
+            seq,
+        );
+        Ok(seq)
     }
 
     /// sediment 结果落 journal（受信通道持久化信号 + 沉淀结果对账依据）

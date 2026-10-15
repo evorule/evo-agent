@@ -22,6 +22,7 @@ import {
   openFile,
   fsEvents,
   refreshGitStatus,
+  govS4Notify,
 } from './stores.js';
 import { getTranscript } from './api.js';
 import { assembleContext } from './mentions.js';
@@ -34,6 +35,18 @@ let pendingWrite = null; // S4:进行中的 file_write {path, content}(ToolResul
 let pendingNotice = null; // newSession 清屏后需补显的提示(SessionCreated 时补显)
 let pendingResume = false; // 恢复意图待发旗标(连接就绪 onopen 时补发 resume 帧)
 let pendingRebuild = null; // B17:重建待发态 {block, autoSend, userText}——消费点在 SessionCreated(autoSend)/sendMessage(前缀)
+
+// B22:S4 定稿治理留痕——stores.markFinalized 首次定稿置 govS4Notify,
+// 此处消费后发 s4_publish 帧(serve 侧入 gov 账本;摘要级 best-effort,
+// WS 未连即丢弃)。先复位再发送防订阅回调重入;stores 不反导 ws.js,
+// 信号桥是唯一通道。
+govS4Notify.subscribe((n) => {
+  if (!n) return;
+  govS4Notify.set(null);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 's4_publish', path: n.path }));
+  }
+});
 
 /**
  * 死会话自愈升级(B17 持久会话):引擎侧会话失效后不再裸新建丢上下文——

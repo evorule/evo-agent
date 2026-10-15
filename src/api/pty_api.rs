@@ -125,6 +125,15 @@ async fn handle_socket(
         shell_label,
     } = handle;
     info!(term = %term_id, shell = %shell_label, pid = pid, "PTY session created");
+    // B22:terminal_session_create 治理留痕(record-only,09 号 §四;best-effort)
+    crate::governance::hooks::terminal_session(
+        &term_id,
+        crate::governance::TerminalAction::Create,
+        &format!(
+            "{shell_label}, pid={}",
+            pid.map_or_else(|| "n/a".to_string(), |p| p.to_string())
+        ),
+    );
 
     // 治理事件:会话创建(record-only,展示层留痕)
     let created = json!({
@@ -226,4 +235,15 @@ async fn cleanup(
     .to_string();
     let _ = sink.send(WsMessage::Text(closed.into())).await;
     info!(term = %term_id, reason, "PTY session cleaned up");
+    // B22:terminal_session_close 治理留痕(record-only;best-effort)
+    crate::governance::hooks::terminal_session(
+        term_id,
+        crate::governance::TerminalAction::Close,
+        &format!(
+            "{reason}, exit_code={}",
+            exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+    );
 }

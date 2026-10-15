@@ -20,8 +20,10 @@
 //! 事件源接线（hooks）沿 PR2 交付；本模块（PR1）交付骨架：事件 schema、
 //! seq 分配、路径构造、best-effort 写入与会话管理。
 
+pub mod hooks;
 pub mod ledger;
 
+pub use hooks::GovAuditedApproval;
 pub use ledger::{
     current_ledger, gov_event_id, gov_event_path, init_ledger, GovActor, GovEvent, GovEventKind,
     GovLedger, GovRefs, TerminalAction, GOV_CALLER_ROLE, GOV_NAMESPACE, GOV_SHARED_PREFIX,

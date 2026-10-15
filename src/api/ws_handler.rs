@@ -101,6 +101,12 @@ enum ClientMessage {
     /// 处置后 LLM 自然续完中断轮(与 react 面 resume_session_id 同一管线;
     /// 挂起的人工审批不恢复,由前端提示条明示)
     Resume,
+    /// B22 s4_publish 治理事件通知(前端 markFinalized 首次定稿产物时发;
+    /// serve 侧入 gov 账本,摘要级,路径即指针——不加新端点走既有 WS 面)
+    S4Publish {
+        /// 定稿产物路径
+        path: String,
+    },
 }
 
 /// 服务端 → 客户端的内部事件(用于区分 AgentEvent 和轮次结束信号)
@@ -429,6 +435,16 @@ async fn handle_ws(
                                     }
                                 }
                             }
+                            Ok(ClientMessage::S4Publish { path }) => {
+                                // B22:定稿通知入 gov 账本(best-effort,不回帧不打断
+                                // WS 流;gov 写入走 serve 内部通道不经审批卡——
+                                // 写入动作本身即 Fact,23 号档 §四.3)
+                                // session 未建立("new" 连接尚未 SessionCreated)时
+                                // 无主会话可归属,按 best-effort 丢弃
+                                if let Some(sid) = current_session.as_deref() {
+                                    crate::governance::hooks::s4_publish(sid, &path);
+                                }
+                            }
                             Err(e) => {
                                 warn!(error = %e, raw = %text, "G16: invalid client message");
                                 let _ = send_ws_json(
@@ -657,9 +673,12 @@ pub(crate) fn build_approval_callback(
                     Arc::new(PolicyReview::new(
                         policy,
                         Arc::new(AuditedReviewInvoker::new(audited)),
-                        Arc::new(crate::agent::approval::HttpApproval::new(
-                            state.pending_approvals().clone(),
-                        )),
+                        // B22:降级人工窗接审批卡留痕装饰器(仅此路会产生人工审批卡)
+                        Arc::new(crate::governance::GovAuditedApproval::new(Arc::new(
+                            crate::agent::approval::HttpApproval::new(
+                                state.pending_approvals().clone(),
+                            ),
+                        ))),
                         override_flag,
                     )),
                     Some(runaway),
@@ -674,10 +693,12 @@ pub(crate) fn build_approval_callback(
             }
         }
     }
+    // B22:manual 档审批卡接治理留痕装饰器(approval_requested/resolved 入
+    // gov 账本;auto_policy 判定式无人工卡不接——高频排除,23 号档风险#2)
     (
-        Arc::new(crate::agent::approval::HttpApproval::new(
-            state.pending_approvals().clone(),
-        )),
+        Arc::new(crate::governance::GovAuditedApproval::new(Arc::new(
+            crate::agent::approval::HttpApproval::new(state.pending_approvals().clone()),
+        ))),
         None,
     )
 }
