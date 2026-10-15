@@ -7,6 +7,7 @@ pub mod acceptance;
 pub mod adjudication;
 pub mod adjudicator;
 pub mod approval;
+pub mod approval_policy;
 pub mod assembly;
 pub mod atif;
 pub mod audited_llm;
@@ -49,6 +50,9 @@ pub mod writeback;
 pub use approval::{
     new_proposal_id, ApprovalCallback, ApprovalDecision, ApprovalRequest, AutoApprove, CliApproval,
     DenyAll, HttpApproval, PendingApproval, PolicyApproval, HTTP_APPROVAL_TIMEOUT_SECS,
+};
+pub use approval_policy::{
+    hits_red_line, ApprovalPolicyFile, PolicyFileError, PolicyLimits, RedLine, ToolGroupPolicy,
 };
 pub use assembly::{AssemblyRecipe, DEFAULT_RECIPE_VERSION};
 pub use audited_llm::{AuditedLlm, DEFAULT_AUDITED_CALL_TIMEOUT_SECS};
