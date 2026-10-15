@@ -158,6 +158,36 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "window",
         },
         SettingEntry {
+            key: "aiCommit.enabled",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "AI",
+            description: "源代码管理提交框的 AI 生成提交消息（✨）开关：staged 变更交给所配 LLM 起草提交消息写入输入框供编辑；生成只读不提交，提交动作始终在人",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "aiCommit.excludePaths",
+            kind: SettingType::Array,
+            default: json!([
+                "**/package-lock.json",
+                "**/pnpm-lock.yaml",
+                "**/yarn.lock",
+                "**/Cargo.lock",
+                "**/poetry.lock",
+                "**/*.min.js",
+                "**/*.min.css",
+                "**/dist/**",
+                "**/build/**"
+            ]),
+            enum_values: None,
+            range: None,
+            category: "AI",
+            description: "AI 生成提交消息时从 diff 输入排除的路径 glob（lockfile/构建产物等噪音文件；命中文件只留摘要行，不进 prompt）",
+            scope: "window",
+        },
+        SettingEntry {
             key: "agentTools.fileCreate",
             kind: SettingType::Boolean,
             default: json!(true),
@@ -793,7 +823,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 39); // 计数锁:新增键须同步(scheme 单源纪律)
+        assert_eq!(settings.len(), 41); // 计数锁:新增键须同步(scheme 单源纪律)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));

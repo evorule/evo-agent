@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use git2::{IndexAddOption, Repository, Status, StatusOptions};
+use git2::{DiffFlags, DiffFormat, DiffOptions, IndexAddOption, Repository, Status, StatusOptions};
 use serde::Serialize;
 
 /// evo-agent 工具私有目录（B7 软删除回收站）——git status 中必须不可见
@@ -156,6 +156,23 @@ pub struct CommitInfo {
     pub time: i64,
     /// 提交消息首行
     pub summary: String,
+}
+
+/// staged 变更的单文件 patch 切片（B15 AI commit 生成管线输入）
+#[derive(Debug, Clone, Serialize)]
+pub struct StagedPatch {
+    /// 相对 workdir 路径（`/` 分隔；rename 取新路径）
+    pub path: String,
+    /// 二进制文件（patch 为空，消费端以 `(binary)` 占位）
+    pub binary: bool,
+    /// 新增行数（不含 +++ 文件头）
+    pub additions: usize,
+    /// 删除行数（不含 --- 文件头）
+    pub deletions: usize,
+    /// unified patch 文本（单文件；binary → 空串）
+    pub patch: String,
+    /// hunk 头行（`@@ ... @@ 函数上下文`，三级截断 stat 骨架复用）
+    pub hunks: Vec<String>,
 }
 
 /// GitOps：workdir 绑定的 git 操作门面（每方法独立 open Repository，无共享态）
@@ -635,6 +652,119 @@ impl GitOps {
         }
         Ok(out)
     }
+
+    /// staged patch 切片（B15）：HEAD tree vs index 逐文件 unified patch
+    ///
+    /// 生成输入语义 = **暂存区相对 HEAD**（staged-only 门禁的严格对偶；立项
+    /// 勘误注记：设计原稿「index→workdir」为未暂存方向，不采纳）。未出生 HEAD
+    /// （空仓）对空树 diff（一切 staged 皆新增）；rename 检测开启；二进制文件
+    /// `binary=true` 且不收集 patch 正文。
+    pub fn staged_patch(&self) -> Result<Vec<StagedPatch>, GitError> {
+        let repo = self.open()?;
+        let mut opts = DiffOptions::new();
+        opts.context_lines(3);
+        let tree = match repo.head() {
+            Ok(head) => {
+                let oid = head
+                    .target()
+                    .ok_or_else(|| GitError::Lib("HEAD has no target".into()))?;
+                let commit = repo
+                    .find_commit(oid)
+                    .map_err(|e| GitError::Lib(e.message().to_string()))?;
+                Some(
+                    commit
+                        .tree()
+                        .map_err(|e| GitError::Lib(e.message().to_string()))?,
+                )
+            }
+            Err(_) => None, // 未出生 HEAD：diff_tree_to_index(None, ..) = 对空树
+        };
+        let mut diff = repo
+            .diff_tree_to_index(tree.as_ref(), None, Some(&mut opts))
+            .map_err(|e| GitError::Lib(e.message().to_string()))?;
+        // rename 检测（git2 惯例：diff 计算后 find_similar；默认相似度阈值）
+        diff.find_similar(None)
+            .map_err(|e| GitError::Lib(e.message().to_string()))?;
+
+        // 第一遍：按 delta 序建条目（path/binary 与 print 遍历序一致）
+        let deltas: Vec<git2::DiffDelta> = diff.deltas().collect();
+        let mut out: Vec<StagedPatch> = Vec::new();
+        for delta in &deltas {
+            out.push(StagedPatch {
+                path: delta_path(delta),
+                binary: delta.flags().contains(DiffFlags::BINARY),
+                additions: 0,
+                deletions: 0,
+                patch: String::new(),
+                hunks: Vec::new(),
+            });
+        }
+
+        // 第二遍：print 逐行归集（delta 顺序与第一遍一致，按路径变更推进游标）
+        let mut cursor = 0usize;
+        diff.print(DiffFormat::Patch, |delta, _hunk, line| {
+            let path = delta_path(&delta);
+            if out.get(cursor).map(|e| e.path.as_str()) != Some(path.as_str()) {
+                match out.iter().position(|e| e.path == path) {
+                    Some(i) => cursor = i,
+                    None => return true, // 路径未建条目（理论不可达）：跳过
+                }
+            }
+            let e = &mut out[cursor];
+            if e.binary {
+                return true; // 二进制：正文不收集（消费端占位）
+            }
+            let content = String::from_utf8_lossy(line.content());
+            // 二进制判定兜底：libgit2 对 tree→index 的 BINARY delta 标志可能
+            // 延迟到 print 期内容装载才落，此处以 Binary files 提示行补判
+            if content.starts_with("Binary files") {
+                e.binary = true;
+                return true;
+            }
+            match line.origin() {
+                '+' => {
+                    e.additions += 1;
+                    e.patch.push('+');
+                }
+                '-' => {
+                    e.deletions += 1;
+                    e.patch.push('-');
+                }
+                ' ' => e.patch.push(' '),
+                'H' => e.hunks.push(content.trim_end().to_string()),
+                _ => {}
+            }
+            match line.origin() {
+                '+' | '-' | ' ' | 'H' | 'F' => e.patch.push_str(&content),
+                _ => {}
+            }
+            if !e.patch.ends_with('\n') {
+                e.patch.push('\n');
+            }
+            true
+        })
+        .map_err(|e| GitError::Lib(e.message().to_string()))?;
+        // 二进制条目收尾：清掉可能的文件头残留，消费端只见 binary 标记
+        for e in out.iter_mut() {
+            if e.binary {
+                e.patch.clear();
+                e.hunks.clear();
+                e.additions = 0;
+                e.deletions = 0;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// delta 展示路径：新路径优先（rename/新增），删除回落旧路径（`/` 分隔）
+fn delta_path(delta: &git2::DiffDelta) -> String {
+    delta
+        .new_file()
+        .path()
+        .or_else(|| delta.old_file().path())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
 }
 
 /// rename 条目的展示路径：优先 delta 新路径（head_to_index / index_to_workdir），
@@ -1105,5 +1235,63 @@ mod tests {
         assert!(matches!(ops.normalize("..\\x"), Err(GitError::Invalid(_))));
         assert!(matches!(ops.normalize("/abs"), Err(GitError::Invalid(_))));
         assert_eq!(ops.normalize("a\\b.txt").unwrap(), "a/b.txt");
+    }
+
+    #[test]
+    fn test_staged_patch_counts_content_and_binary() {
+        let (_d, ops) = fresh_repo();
+        set_identity(&ops, "T", "t@example.com");
+        seed_commit(&ops, "a.rs", "fn old() {}\n", "init");
+
+        // 修改已跟踪文件（staged）+ 新增二进制文件（staged）
+        std::fs::write(ops.workdir.join("a.rs"), "fn old() {}\nfn new() {}\n").unwrap();
+        let png: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01];
+        std::fs::write(ops.workdir.join("img.png"), png).unwrap();
+        ops.stage(&["a.rs".to_string(), "img.png".to_string()])
+            .unwrap();
+
+        let patches = ops.staged_patch().unwrap();
+        assert_eq!(patches.len(), 2, "staged files: {:?}", patches);
+
+        let a = patches.iter().find(|p| p.path == "a.rs").unwrap();
+        assert!(!a.binary);
+        assert_eq!(a.additions, 1);
+        assert_eq!(a.deletions, 0, "context lines kept, only +1 added");
+        assert!(a.patch.contains("+fn new() {}"), "patch: {}", a.patch);
+        assert!(a.patch.contains("diff --git a/a.rs b/a.rs"));
+        assert!(
+            a.hunks.iter().any(|h| h.starts_with("@@")),
+            "hunk headers: {:?}",
+            a.hunks
+        );
+
+        let img = patches.iter().find(|p| p.path == "img.png").unwrap();
+        assert!(img.binary, "png detected binary");
+        assert!(img.patch.is_empty(), "binary patch not collected");
+        assert!(img.hunks.is_empty());
+    }
+
+    #[test]
+    fn test_staged_patch_unborn_head_and_unstaged_excluded() {
+        let (_d, ops) = fresh_repo();
+        set_identity(&ops, "T", "t@example.com");
+
+        // 未出生 HEAD（空仓零提交）：staged 新文件 → 对空树全新增
+        std::fs::write(ops.workdir.join("n.txt"), "l1\nl2\n").unwrap();
+        ops.stage(&["n.txt".to_string()]).unwrap();
+        let patches = ops.staged_patch().unwrap();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].path, "n.txt");
+        assert_eq!(patches[0].additions, 2);
+        assert_eq!(patches[0].deletions, 0);
+
+        // 未暂存的工作区改动不得混入（staged 严格语义）
+        std::fs::write(ops.workdir.join("n.txt"), "l1\nl2\nl3\n").unwrap();
+        let patches2 = ops.staged_patch().unwrap();
+        assert_eq!(patches2[0].additions, 2, "workdir change not included");
+
+        // 空仓无 staged → 空列表（调用端转 400）
+        let (_d2, ops2) = fresh_repo();
+        assert!(ops2.staged_patch().unwrap().is_empty());
     }
 }
