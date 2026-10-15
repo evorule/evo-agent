@@ -69,9 +69,8 @@ fn extract_args(args: &Value) -> Result<(Option<String>, String, String, usize),
         Some(v) => v
             .as_u64()
             .filter(|n| (1..=MAX_LIMIT as u64).contains(n))
-            .ok_or_else(|| {
-                format!("memory_recall: limit must be an integer in 1..={MAX_LIMIT}")
-            })? as usize,
+            .ok_or_else(|| format!("memory_recall: limit must be an integer in 1..={MAX_LIMIT}"))?
+            as usize,
     };
     Ok((query, kind, namespace_override.unwrap_or_default(), limit))
 }
@@ -79,9 +78,13 @@ fn extract_args(args: &Value) -> Result<(Option<String>, String, String, usize),
 /// 按 path 去重取最新版本（version 最大/后出现者胜——与 recall 侧
 /// latest_entries_by_path 同语义的 entry 级简版；不解析 MemoryRecord，
 /// 解析失败在工具面如实透出原值而非跳过）
-fn latest_by_path(facts: Vec<crate::api::evorule_client::SharedFactEntry>) -> Vec<crate::api::evorule_client::SharedFactEntry> {
-    let mut latest: std::collections::BTreeMap<String, crate::api::evorule_client::SharedFactEntry> =
-        Default::default();
+fn latest_by_path(
+    facts: Vec<crate::api::evorule_client::SharedFactEntry>,
+) -> Vec<crate::api::evorule_client::SharedFactEntry> {
+    let mut latest: std::collections::BTreeMap<
+        String,
+        crate::api::evorule_client::SharedFactEntry,
+    > = Default::default();
     for fact in facts {
         match latest.get(&fact.path) {
             Some(prev) if prev.version > fact.version => {}
@@ -96,11 +99,10 @@ fn latest_by_path(facts: Vec<crate::api::evorule_client::SharedFactEntry>) -> Ve
 /// `memory_recall` 执行体（多分区读取 → query 过滤 → 新序排序 → limit 截断）
 pub(crate) async fn memory_recall_exec(
     namespace: &str,
-    namespace_override: &str,
     client: &EvoruleApiClient,
     args: &Value,
 ) -> Result<Value, String> {
-    let (query, kind, _, limit) = extract_args(args)?;
+    let (query, kind, namespace_override, limit) = extract_args(args)?;
     // namespace 显式指定优先（23 号设计 §3.2：默认当前 ns；跨 ns 读取权限
     // 由 server 侧权限模型兜底，agent 侧只读不过度设防）
     let ns: &str = if namespace_override.is_empty() {
@@ -122,15 +124,10 @@ pub(crate) async fn memory_recall_exec(
     // query 过滤（value 序列化后大小写不敏感子串；query 空 = 全收）
     if let Some(q) = &query {
         let q_lower = q.to_lowercase();
-        entries.retain(|f| {
-            f.value
-                .to_string()
-                .to_lowercase()
-                .contains(&q_lower)
-        });
+        entries.retain(|f| f.value.to_string().to_lowercase().contains(&q_lower));
     }
     // 时间序近似：fact_id 单调递增，降序 = 新在前
-    entries.sort_by(|a, b| b.fact_id.cmp(&a.fact_id));
+    entries.sort_by_key(|a| std::cmp::Reverse(a.fact_id));
     let returned = entries.len().min(limit);
     let items: Vec<Value> = entries
         .into_iter()
@@ -201,7 +198,7 @@ impl MemoryRecallTool {
 impl ToolFunction for MemoryRecallTool {
     async fn call(&self, args: &Value) -> Result<Value, String> {
         let (namespace, client) = self.parts()?;
-        memory_recall_exec(namespace, "", client, args).await
+        memory_recall_exec(namespace, client, args).await
     }
 }
 
@@ -213,8 +210,14 @@ mod tests {
     fn test_kind_prefixes_mapping() {
         let all = kind_prefixes("all", "ns1").unwrap();
         assert_eq!(all, vec!["shared.ns1.stable.", "shared.ns1.events."]);
-        assert_eq!(kind_prefixes("stable", "ns1").unwrap(), vec!["shared.ns1.stable."]);
-        assert_eq!(kind_prefixes("events", "ns1").unwrap(), vec!["shared.ns1.events."]);
+        assert_eq!(
+            kind_prefixes("stable", "ns1").unwrap(),
+            vec!["shared.ns1.stable."]
+        );
+        assert_eq!(
+            kind_prefixes("events", "ns1").unwrap(),
+            vec!["shared.ns1.events."]
+        );
         assert!(kind_prefixes("kv", "ns1").is_err());
     }
 
@@ -260,7 +263,12 @@ mod tests {
     #[test]
     fn test_unwired_fails_visible() {
         let tool = MemoryRecallTool::unwired();
-        let err = futures_executor::block_on(async { tool.call(&json!({})).await.unwrap_err() });
+        let err = tool.parts().unwrap_err();
         assert!(err.contains("not wired"), "{err}");
+        let wired = MemoryRecallTool::wired(
+            "ns1".to_string(),
+            crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:1"),
+        );
+        assert!(wired.parts().is_ok());
     }
 }
