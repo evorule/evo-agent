@@ -611,6 +611,60 @@ async fn handle_ws(
 // 辅助函数
 // =============================================================================
 
+/// G8 审批决策端三态路由（2026-09-26 设计/2026-10-15 实施）
+///
+/// - `Some("auto_policy")`:PolicyApproval 判定式（无人值守，现状语义不动）
+/// - `Some("policy")`:PolicyReview 评审式——条件文件 `.evo/approval-policy.toml`
+///   serve 侧独占读取，加载失败 fail-visible 降级 HttpApproval（显式留痕，
+///   绝不静默按无条件放行处理）；评审调用经 AuditedLlm sidecar（评审 prompt
+///   与判定全文入审计链），fallback 为 HttpApproval 60s 人工审批窗
+/// - 其余（manual/缺省）:HttpApproval（现状行为零变化）
+fn build_approval_callback(
+    state: &AgentApiState,
+    mode: Option<&str>,
+) -> Arc<dyn crate::agent::approval::ApprovalCallback> {
+    use crate::agent::approval_policy::{ApprovalPolicyFile, AuditedReviewInvoker, PolicyReview};
+    if mode == Some("auto_policy") {
+        return Arc::new(crate::agent::approval::PolicyApproval);
+    }
+    if mode == Some("policy") {
+        let policy_path = state.workdir().join(".evo").join("approval-policy.toml");
+        match ApprovalPolicyFile::load(&policy_path) {
+            Ok(policy) => {
+                let override_flag = state
+                    .workbench_settings()
+                    .merged()
+                    .0
+                    .get("approval.exemptionOverride")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let audited = crate::agent::audited_llm::AuditedLlm::new(
+                    state.evorule_client().clone(),
+                    crate::io_handlers::LlmHandler::from_config(state.llm_config()),
+                );
+                return Arc::new(PolicyReview::new(
+                    policy,
+                    Arc::new(AuditedReviewInvoker::new(audited)),
+                    Arc::new(crate::agent::approval::HttpApproval::new(
+                        state.pending_approvals().clone(),
+                    )),
+                    override_flag,
+                ));
+            }
+            Err(e) => {
+                error!(
+                    path = %policy_path.display(),
+                    error = %e,
+                    "approval-policy.toml load failed; policy mode degrades to manual approval"
+                );
+            }
+        }
+    }
+    Arc::new(crate::agent::approval::HttpApproval::new(
+        state.pending_approvals().clone(),
+    ))
+}
+
 /// 构造一个 fresh AgentRunner(每轮新建)
 ///
 /// `run_streaming` / `run_continuation` 消费 `self`,所以每轮需要重新构造。
@@ -697,17 +751,12 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
         .with_capability_boundary(capability_boundary)
         // 挂 filtered toolkit(同 HTTP 端点口径,见 run_agent)
         .with_tool_handler(filtered)
-        // G8:注入审批决策端(人工审查开合)——定义级 approval_mode=auto_policy 时
-        // 走 PolicyApproval 判定式决策端(无人值守,理由必产);否则 HttpApproval
-        // 60s 人工审批窗(manual 态,现状行为)
-        .with_approval_callback(if def.approval_mode.as_deref() == Some("auto_policy") {
-            Arc::new(crate::agent::approval::PolicyApproval)
-                as Arc<dyn crate::agent::approval::ApprovalCallback>
-        } else {
-            Arc::new(crate::agent::approval::HttpApproval::new(
-                state.pending_approvals().clone(),
-            )) as Arc<dyn crate::agent::approval::ApprovalCallback>
-        })
+        // G8:注入审批决策端(人工审查开合)——定义级 approval_mode 三态路由:
+        // auto_policy=PolicyApproval 判定式(无人值守,理由必产);
+        // policy=PolicyReview 评审式(独立 LLM 评审对照条件清单逐条判定,
+        // 判定不可信一律降级人工;条件文件加载失败 fail-visible 降 HttpApproval);
+        // 其余(manual/缺省)=HttpApproval 60s 人工审批窗(现状行为)
+        .with_approval_callback(build_approval_callback(state, def.approval_mode.as_deref()))
         // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
         .with_metrics(state.metrics().clone())
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源;

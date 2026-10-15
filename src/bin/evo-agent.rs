@@ -527,7 +527,7 @@ fn cmd_run(
             }
         }
 
-        AgentRunner::from_definition(def, client.clone(), tool_handler, Some(llm_handler))
+        AgentRunner::from_definition(def.clone(), client.clone(), tool_handler, Some(llm_handler))
             .await
             .map(|r| {
                 r.with_capability_boundary(capability_boundary)
@@ -542,7 +542,7 @@ fn cmd_run(
                         evo_agent::agent::delegate::DelegateContext::new(
                             agent_name,
                             mgr.clone(),
-                            client,
+                            client.clone(),
                         )
                         .with_journal_dir(workdir.join("data").join("sessions")),
                     )
@@ -557,13 +557,54 @@ fn cmd_run(
         }
     };
 
-    // G8:注入审批决策端(人工审查开合,2026-09-28)——
+    // G8:注入审批决策端(人工审查开合,2026-09-28;2026-10-15 policy 评审式档位)——
     // --auto-approve-candidates=配置的命令行快捷方式(语义归一到 auto_policy):
     // 命中旗标或定义级 approval_mode=auto_policy → PolicyApproval(无人值守,
-    // 判定理由必产+决策入审计链);否则 CliApproval stdin 交互(manual 态,现状行为)
+    // 判定理由必产+决策入审计链);approval_mode=policy → PolicyReview 评审式
+    // (独立评审对照条件清单逐条判定,判定不可信一律降级人工;条件文件加载失败
+    // fail-visible 降 CliApproval 显式留痕);否则 CliApproval stdin 交互(manual 态)
     let callback: std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback> =
         if approval_auto || auto_approve_candidates {
             std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval)
+        } else if def.approval_mode.as_deref() == Some("policy") {
+            let policy_path = workdir.join(".evo").join("approval-policy.toml");
+            match evo_agent::agent::approval_policy::ApprovalPolicyFile::load(&policy_path) {
+                Ok(policy) => {
+                    let override_flag =
+                        evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+                            .map(|s| {
+                                s.merged()
+                                    .0
+                                    .get("approval.exemptionOverride")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                    let audited = evo_agent::agent::audited_llm::AuditedLlm::new(
+                        client.clone(),
+                        evo_agent::io_handlers::LlmHandler::from_config(&config.llm),
+                    );
+                    std::sync::Arc::new(evo_agent::agent::approval_policy::PolicyReview::new(
+                        policy,
+                        std::sync::Arc::new(
+                            evo_agent::agent::approval_policy::AuditedReviewInvoker::new(audited),
+                        ),
+                        std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                            auto_approve: false,
+                        }),
+                        override_flag,
+                    ))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[approval-policy] 条件文件加载失败,policy 档降级人工审批: {e} ({})",
+                        policy_path.display()
+                    );
+                    std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                        auto_approve: false,
+                    })
+                }
+            }
         } else {
             std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                 auto_approve: false,
@@ -2775,11 +2816,53 @@ fn run_repl_turn(
         }
     };
 
-    // 人工审查开合(2026-09-28):旗标或定义级 approval_mode=auto_policy →
-    // PolicyApproval 判定式决策端(无人值守);否则 CliApproval stdin 交互(manual 态)
+    // 人工审查开合(2026-09-28 立项;2026-10-15 policy 评审式档位):三态路由——
+    // 旗标或定义级 approval_mode=auto_policy → PolicyApproval 判定式(无人值守);
+    // approval_mode=policy → PolicyReview 评审式(独立评审对照条件清单逐条判定,
+    // 判定不可信一律降级人工;条件文件加载失败 fail-visible 降 CliApproval 显式留痕);
+    // 否则 CliApproval stdin 交互(manual 态,现状行为)
     let callback: std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback> =
         if auto_approve_candidates || def.approval_mode.as_deref() == Some("auto_policy") {
             std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval)
+        } else if def.approval_mode.as_deref() == Some("policy") {
+            let policy_path = workdir.join(".evo").join("approval-policy.toml");
+            match evo_agent::agent::approval_policy::ApprovalPolicyFile::load(&policy_path) {
+                Ok(policy) => {
+                    let override_flag =
+                        evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+                            .map(|s| {
+                                s.merged()
+                                    .0
+                                    .get("approval.exemptionOverride")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                    let audited = evo_agent::agent::audited_llm::AuditedLlm::new(
+                        client.clone(),
+                        evo_agent::io_handlers::LlmHandler::from_config(&config.llm),
+                    );
+                    std::sync::Arc::new(evo_agent::agent::approval_policy::PolicyReview::new(
+                        policy,
+                        std::sync::Arc::new(
+                            evo_agent::agent::approval_policy::AuditedReviewInvoker::new(audited),
+                        ),
+                        std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                            auto_approve: false,
+                        }),
+                        override_flag,
+                    ))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[approval-policy] 条件文件加载失败,policy 档降级人工审批: {e} ({})",
+                        policy_path.display()
+                    );
+                    std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                        auto_approve: false,
+                    })
+                }
+            }
         } else {
             std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                 auto_approve: false,
