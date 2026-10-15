@@ -289,6 +289,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.eventLedger",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "事件型记忆轨道：工具完成/轮里程碑/审批决定/会话终态四类结构化事件写入记忆账本（每轮工具事件限 5 条防膨胀；关闭 = 事件轨道停写，sediment 叙事沉淀与治理留痕不受影响）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.mcp",
             kind: SettingType::Boolean,
             default: json!(true),
@@ -877,7 +887,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 45); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query)
+        assert_eq!(settings.len(), 46); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));

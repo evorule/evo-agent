@@ -854,6 +854,14 @@ pub struct AgentRunner {
     /// `def.memory` 配置启用时自动构造。持有后,对话结束后可触发
     /// `EventExtractor` 提取结构化事件,`ReplayEngine` 可回放因果链。
     memory_event_store: Option<MemoryEventStore>,
+    /// B22-C:事件型记忆轨道(None = 未挂载;from_definition 随 memory 启用自动构造)
+    ///
+    /// 四触发点(工具完成/轮里程碑/审批决定/会话终态)经 Arc 共享的
+    /// EventLedger 落链:&self 即可写入(内部 tokio Mutex),与
+    /// memory_event_store 的可变借用面解耦。
+    event_ledger: Option<std::sync::Arc<crate::agent::event_ledger::EventLedger>>,
+    /// B22-C:当前会话轮计数(轮顶递增;里程碑/终态事件内容源)
+    session_turns: u64,
     /// C1:事件提取器(None = memory 未启用)
     ///
     /// 由 `from_definition` 在 `def.memory.memory_type != "none"` 时自动构造。
@@ -1043,6 +1051,8 @@ impl AgentRunner {
             metrics: None,
             event_callbacks: Arc::new(CallbackChain::new()),
             memory_event_store: None,
+            event_ledger: None,
+            session_turns: 0,
             extractor: None,
             sediment_config: sediment::SedimentConfig::default(),
             propose_anchor: None,
@@ -1264,7 +1274,15 @@ impl AgentRunner {
         if def.memory.memory_type != "none" {
             let event_store =
                 MemoryEventStore::new(&def.memory.namespace, runner.evorule_client.clone());
+            // B22-C:事件轨道与证据链 store 同源构造(各自持缓存;轨道事件
+            // ID 前缀 EL- 与 sediment E- 形态互斥不撞路径)
+            let ledger = crate::agent::event_ledger::EventLedger::new(
+                event_store.clone(),
+                &def.memory.namespace,
+                runner.evorule_client.clone(),
+            );
             runner = runner.with_memory_event_store(event_store);
+            runner = runner.with_event_ledger(std::sync::Arc::new(ledger));
         }
         // C1:自动构造 EventExtractor(memory 启用时)
         // extractor 在 sediment_session() 中被借用做事件提取(C1 阶段占位)
@@ -1481,6 +1499,15 @@ impl AgentRunner {
     /// `EventExtractor` 写入事件时需要可变访问。
     pub fn memory_event_store_mut(&mut self) -> Option<&mut MemoryEventStore> {
         self.memory_event_store.as_mut()
+    }
+
+    /// B22-C:注入事件轨道(通常由 `from_definition` 随 memory 启用自动构造)
+    pub fn with_event_ledger(
+        mut self,
+        ledger: std::sync::Arc<crate::agent::event_ledger::EventLedger>,
+    ) -> Self {
+        self.event_ledger = Some(ledger);
+        self
     }
 
     /// TODO: doc
@@ -2260,6 +2287,11 @@ impl AgentRunner {
             // 沉淀成功与否无对账依据（受信通道持久化信号闭环的最后半程）
             let result =
                 sediment::sediment(&mut deps, &self.sediment_config, session_id, messages).await;
+            // B22-C T4:会话终态事件与 sediment 并联(结构化面 vs 叙事面分工;
+            // summary_ref v1 恒 null——SedimentResult 无摘要路径字段,v1.x 扩展)
+            if let Some(ledger) = &self.event_ledger {
+                ledger.record_session_end(self.session_turns).await;
+            }
             if let Some(j) = journal {
                 if let Err(e) = j.sediment_performed(
                     result.summary_written,
@@ -2468,6 +2500,10 @@ impl AgentRunner {
         // 与 MemoryEventStore 对齐,会话建立后同步到 MemoryManager。
         if let Some(mem) = self.memory.as_mut() {
             mem.set_session_id(&session_id);
+        }
+        // B22-C:事件轨道同步 session_id(证据链面+共享消费面两侧)
+        if let Some(ledger) = &self.event_ledger {
+            ledger.set_session_id(&session_id).await;
         }
         // A2-2:memory_propose 会话锚绑定(注册期空锚,运行期才可绑定)
         self.bind_propose_anchor(&session_id);
@@ -3297,6 +3333,11 @@ impl AgentRunner {
                 metrics: metrics.clone(),
                 event_callbacks: event_callbacks.clone(),
                 memory_event_store: memory_event_store.clone(),
+                // B22-C:子代理会话不挂事件轨道(v1——子会话治理面由 delegate
+                // 镜像 journal 事件承载;子 runner session 为预建 sid,轨道
+                // set_session_id 同步钩位不经过,挂了也是 SessionNotSet 死件)
+                event_ledger: None,
+                session_turns: 0,
                 extractor: extractor.clone(),
                 sediment_config: sediment_config.clone(),
                 propose_anchor: propose_anchor.clone(),
@@ -3935,7 +3976,56 @@ impl AgentRunner {
     ///
     /// 返回 `(工具最终结果, 审批留痕 record)`:record 仅在本轮发生过审批时
     /// 为 `Some`(内嵌进 io_response.result,不扩 Fact 枚举)。
+    /// B22-C T1:工具调用统一收口薄壳——计时+事件轨道落链后转内层
+    ///
+    /// 成败口径:实际执行(Ok 且非拒绝)→ok=true;执行错误(Err)→ok=false
+    /// +error;审批拒绝(Ok+rejected record)不记工具事件(决定面由 T3
+    /// approval_observation 覆盖,避免同一调用双记)。全部工具执行入口
+    /// (:3872/:3880/:4223/:4967 等)汇经本收口,轨道覆盖完整。
     async fn execute_tool_call_gated(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        args: &Value,
+        journal: Option<&crate::agent::journal::JournalWriter>,
+        precomputed: Option<Value>,
+    ) -> Result<(Value, Option<Value>), AgentError> {
+        let started = std::time::Instant::now();
+        let outcome = self
+            .execute_tool_call_gated_inner(session_id, tool_name, args, journal, precomputed)
+            .await;
+        if let Some(ledger) = &self.event_ledger {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            match &outcome {
+                Ok((_, Some(record))) => {
+                    let rejected = record
+                        .get("decision")
+                        .and_then(|d| d.as_str())
+                        .map(|d| d != "approved")
+                        .unwrap_or(false);
+                    if !rejected {
+                        ledger
+                            .record_tool_completion(tool_name, true, duration_ms, None)
+                            .await;
+                    }
+                }
+                Ok((_, None)) => {
+                    ledger
+                        .record_tool_completion(tool_name, true, duration_ms, None)
+                        .await;
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    ledger
+                        .record_tool_completion(tool_name, false, duration_ms, Some(&err))
+                        .await;
+                }
+            }
+        }
+        outcome
+    }
+
+    async fn execute_tool_call_gated_inner(
         &self,
         session_id: &str,
         tool_name: &str,
@@ -4608,6 +4698,15 @@ impl AgentRunner {
             "decided_at": decided_at,
             "reason": decision.reason,
         });
+        // B22-C T3:审批决定入事件轨道(agent 会话语义面;gov 留痕由 A 项
+        // hooks 承载,两轨分工见板块设计 §3.3。偏离注记:原判「A 项 hooks
+        // 处并联」——hooks 在 serve 面无 agent 会话 store 访问,runner 侧
+        // decide_and_reexecute 才是事件轨道归属)
+        if let Some(ledger) = &self.event_ledger {
+            ledger
+                .record_approval(&approval_req.proposal_id, decision_label)
+                .await;
+        }
 
         if !decision.approved {
             warn!(%session_id, tool = tool_name, "G8: tool call rejected");
@@ -5488,6 +5587,12 @@ impl AgentRunner {
                         },
                         None => None,
                     };
+                    // B22-C T2:轮顶里程碑+配额重置(首轮/每 N 轮 checkpoint;
+                    // runner 自有轮计数——journal 缺席的 CLI 纯路径照常成立)
+                    runner.session_turns = runner.session_turns.saturating_add(1);
+                    if let Some(ledger) = &runner.event_ledger {
+                        ledger.begin_turn(runner.session_turns).await;
+                    }
                     // 自主交接 PR-H3:链熔断观察窗挂接(仅派生子会话携带 chain_watch
                     // ——组件快照沿链注入,根会话恒 None 不观察)。守卫按轮新建,
                     // ChainWatch 随守卫 move(窗口判定=journal turn_seq,窗口外轮
