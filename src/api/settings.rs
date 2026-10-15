@@ -308,6 +308,26 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "approval.mode.shellExec",
+            kind: SettingType::Enum,
+            default: json!("manual"),
+            enum_values: Some(vec!["auto", "manual", "policy"]),
+            range: None,
+            category: "Agent 工具",
+            description: "shell_exec 的审批档位（auto=白名单直跑；manual=每次人工审批；policy=对照 .evo/approval-policy.toml 预置条件由独立评审自动判定，全过放行、不过退回修正，重查超限自动回落人工。policy 是进阶选项：需先在条件文件预置审批条件，文件缺失或无效时该档自动回落人工，绝不静默放行）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "approval.exemptionOverride",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "关闭红线豁免强制人工审批（默认关闭=file_delete/push 远端/数据外发/改治理配置文件四类操作在任何档位下都强制人工审批）。开启后上述操作将由审批评审依条件自动判定，判定留痕携带 exemption_overridden 标记。请确认理解风险后再开启；此开关不影响 blocked 级拒绝（不可配置绕过）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "search.maxResults",
             kind: SettingType::Number,
             default: json!(1000),
@@ -823,7 +843,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 41); // 计数锁:新增键须同步(scheme 单源纪律)
+        assert_eq!(settings.len(), 43); // 计数锁:新增键须同步(scheme 单源纪律)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
