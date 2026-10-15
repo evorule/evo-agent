@@ -27,6 +27,10 @@ use crate::agent::callback::CallbackChain;
 use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
 use crate::agent::journal::REWIND_BUDGET_LIMIT;
 
+/// 18 号修订⑦:心跳保活超时窗(秒)。event 等待点连续 2 窗(=120s)无引擎
+/// 事件判定死锁,中止当前 turn(①重试等待=第一窗后回到 select 再等)。
+const HEARTBEAT_TIMEOUT_SECS: u64 = 60;
+
 /// F-302:组装策略版本——组装行为(分层方式/预算口径/记忆注入)的协议级版本标识。
 /// 版本变更=组装行为变更=历史重建需切版本（RL-B3 落地）。
 /// v2:组装路径由配方数据驱动(AssemblyExecutor 取代硬编码分层),配方三元落账链上。
@@ -900,6 +904,10 @@ pub struct AgentRunner {
     /// B21 D3:主动压缩策略(serve 面从 `longSession.compaction.*` 工作台设置
     /// 构造注入;None=不启用——CLI 路径与未注入面行为零变化,被动 trim 独任)
     compaction_policy: Option<CompactionPolicy>,
+    /// 18 号 PR-3:Runaway 护栏策略(policy 档任务,serve/CLI 从
+    /// approval-policy.toml 构造注入;None=不启用——manual/auto 档行为零变化,
+    /// 挂点计数空转)。「连续自动操作上限」护栏+修订④复述注入共用此注入面。
+    runaway_policy: Option<RunawayPolicy>,
     /// 验收判据自检命令(可选;长程/TB 模式)。task_done 提交前
     /// runner 强制执行,exit 0=通过放行,非 0=门禁拒绝(不存在 done 退出路径)。
     /// None=不拦截(非长程运行零影响)。由 from_definition 从 def 穿线。
@@ -1030,6 +1038,7 @@ impl AgentRunner {
             landed_format_instruction: std::sync::Mutex::new(None),
             output_format_retries: 0,
             approval_callback: None,
+            runaway_policy: None,
             parallel_tool_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             metrics: None,
             event_callbacks: Arc::new(CallbackChain::new()),
@@ -1751,6 +1760,13 @@ impl AgentRunner {
     /// 见 [`CompactionPolicy::from_settings`]。不注入=None=不启用,行为零变化)
     pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
         self.compaction_policy = Some(policy);
+        self
+    }
+
+    /// 18 号 PR-3:注入 Runaway 护栏策略(policy 档;见 [`RunawayPolicy`]。
+    /// None=不启用,manual/auto 档与未接线面行为零变化)
+    pub fn with_runaway_policy(mut self, policy: Option<RunawayPolicy>) -> Self {
+        self.runaway_policy = policy;
         self
     }
 
@@ -3239,6 +3255,7 @@ impl AgentRunner {
                 landed_format_instruction: std::sync::Mutex::new(None),
                 output_format_retries: 0,
                 approval_callback: approval_callback.clone(),
+                runaway_policy: None,
                 parallel_tool_cache: Arc::new(std::sync::Mutex::new(
                     std::collections::HashMap::new(),
                 )),
@@ -5759,11 +5776,61 @@ impl AgentRunner {
                         Some(r) => RewindBudget::restored(r),
                         None => RewindBudget::new(REWIND_BUDGET_LIMIT),
                     };
+                    // 18 号 PR-3:Runaway 护栏计数回填(修订⑦跨重启连续)。
+                    // 计数与 journal ToolInvoked 同源同口径(挂点=两个写点),
+                    // 回填沿 replay_rewind_budget_remaining 的回填模式。
+                    // 无策略注入=u32::MAX 阈值空转(挂点代码统一,行为零变化)。
+                    let mut runaway_guard = match (&runner.runaway_policy, &journal) {
+                        (Some(p), Some(j)) => {
+                            RunawayGuard::restored(j.replay_runaway_actions(), p.max_actions_per_run)
+                        }
+                        (Some(p), None) => RunawayGuard::new(p.max_actions_per_run),
+                        (None, _) => RunawayGuard::new(u32::MAX),
+                    };
+                    // 修订⑦心跳保活(event 等待点):60s 无引擎事件记一次失联,
+                    // 重试等待 1 次后仍失联(连续 2 次=120s)即判定引擎死锁,
+                    // 中止当前 turn 走恢复(三级恢复 v1:①重试等待已做;②修正
+                    // 重查 policy 在引擎等待点无对应语义,v1 记偏离;③暂停等人
+                    // =中止收尾)。LLM 通道挂起由 HTTP 超时兜底,不在此处。
+                    let mut heartbeat_misses: u32 = 0;
                     loop {
                         let event = tokio::select! {
                             ev = event_stream.next() => match ev {
                                 Some(e) => e,
                                 None => break,
+                            },
+                            _ = tokio::time::sleep(Duration::from_secs(
+                                HEARTBEAT_TIMEOUT_SECS,
+                            )) => {
+                                heartbeat_misses += 1;
+                                if heartbeat_misses >= 2 {
+                                    warn!(%session_id, misses = heartbeat_misses,
+                                        "heartbeat lost (no engine event within {}s x2); aborting turn (18号修订⑦)",
+                                        HEARTBEAT_TIMEOUT_SECS);
+                                    yield Ok(AgentEvent::Error(AgentError::Internal(format!(
+                                        "heartbeat lost: no engine event within {}s (retried once); turn aborted, please retry",
+                                        HEARTBEAT_TIMEOUT_SECS * 2,
+                                    ))));
+                                    let duration = start_time.elapsed().as_millis() as u64;
+                                    if let Some(g) = turn_guard.take() {
+                                        g.end("heartbeat_lost", step_count as u64, duration);
+                                    }
+                                    if let Err(e) = runner.flush_messages(&session_id).await {
+                                        tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                    }
+                                    runner.submit_tool_traces(&session_id).await;
+                                    yield Ok(AgentEvent::Done(AgentResult::error(
+                                        "heartbeat lost: engine unresponsive, turn aborted".to_string(),
+                                        step_count,
+                                        duration,
+                                    )));
+                                    return;
+                                }
+                                // ①同等待重试 1 次:回到 select 再等一个心跳窗
+                                info!(%session_id, misses = heartbeat_misses,
+                                    "no engine event within {}s, retrying wait (recovery step 1)",
+                                    HEARTBEAT_TIMEOUT_SECS);
+                                continue;
                             },
                             _ = cancel_token.cancelled() => {
                                 info!("Cancellation requested during streaming, cleaning up");
@@ -5791,6 +5858,8 @@ impl AgentRunner {
                                 return;
                             }
                         };
+                        // 心跳恢复:任一引擎事件到达即重置失联计数(修订⑦)
+                        heartbeat_misses = 0;
                         match event.event_type.as_str() {
                             "IoRequest" => {
                                 step_count += 1;
@@ -6037,6 +6106,22 @@ impl AgentRunner {
                                                     }
                                                 }
                                             }
+                                        }
+
+                                        // 18 号修订④:policy 档剩余条件复述块注入(每轮
+                                        // 上下文尾部,对抗长程目标漂移)。只影响本次请求
+                                        // 的 messages_to_send(临时消息列表,不入原 messages);
+                                        // Runaway 余量随计数器滚动更新。
+                                        if let Some(rp) = &runner.runaway_policy {
+                                            let remaining = runaway_guard
+                                                .threshold
+                                                .saturating_sub(runaway_guard.actions);
+                                            let block = runaway_restatement_block(
+                                                &goal,
+                                                &rp.restate_conditions,
+                                                remaining,
+                                            );
+                                            messages_to_send.push(crate::agent::translator::Message::System { content: block });
                                         }
 
                                         let serde_messages = match serde_json::to_value(&messages_to_send) {
@@ -6393,6 +6478,53 @@ impl AgentRunner {
                                             // tool 消息入列后 continue 'react 发起回喂轮
                                             let tcs = full_tool_calls.unwrap();
                                             for tc in &tcs {
+                                                // 18 号 PR-3:Runaway 计数(连续自动操作上限)。
+                                                // 触发即暂停等人:不执行当前操作,落账+摘要+
+                                                // turn 以 runaway_paused 收尾(fail-visible)。
+                                                if runaway_guard.bump() {
+                                                    if let Some(j) = &journal {
+                                                        if let Err(e) = j.runaway_guard_tripped(
+                                                            runaway_guard.actions,
+                                                            runaway_guard.threshold,
+                                                        ) {
+                                                            warn!(%session_id, error = %e, "runaway_guard_tripped journal failed");
+                                                        }
+                                                    }
+                                                    let summary = format!(
+                                                        "Runaway guard tripped: {} automatic actions reached limit {}; pending op '{}' was NOT executed. Task paused for human confirmation. Goal: {}",
+                                                        runaway_guard.actions,
+                                                        runaway_guard.threshold,
+                                                        tc.name,
+                                                        goal,
+                                                    );
+                                                    warn!(%session_id, actions = runaway_guard.actions, threshold = runaway_guard.threshold, "runaway guard tripped, pausing for human confirmation");
+                                                    yield Ok(AgentEvent::Error(
+                                                        AgentError::Internal(summary.clone()),
+                                                    ));
+                                                    let duration =
+                                                        start_time.elapsed().as_millis() as u64;
+                                                    if let Some(g) = turn_guard.take() {
+                                                        g.end(
+                                                            "runaway_paused",
+                                                            step_count as u64,
+                                                            duration,
+                                                        );
+                                                    }
+                                                    if let Err(e) =
+                                                        runner.flush_messages(&session_id).await
+                                                    {
+                                                        tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                    }
+                                                    runner.submit_tool_traces(&session_id).await;
+                                                    yield Ok(AgentEvent::Done(
+                                                        AgentResult::error(
+                                                            summary,
+                                                            step_count,
+                                                            duration,
+                                                        ),
+                                                    ));
+                                                    return;
+                                                }
                                                 // B21:tool_invoked(本地 ReAct 路径不经 evorule
                                                 // IoRequest,evorule_request_id=None,全文内容源=
                                                 // transcript payload;call_id 由事件 seq 确定性合成)
@@ -6663,6 +6795,43 @@ impl AgentRunner {
                                     "call_service" => {
                                         let tool_name = params.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                         let args = params.get("args").cloned().unwrap_or(Value::Null);
+                                        // 18 号 PR-3:Runaway 计数(引擎路径工具调用同口径;
+                                        // 触发语义与本地 ReAct 挂点一致:落账+摘要+暂停收尾)
+                                        if runaway_guard.bump() {
+                                            if let Some(j) = &journal {
+                                                if let Err(e) = j.runaway_guard_tripped(
+                                                    runaway_guard.actions,
+                                                    runaway_guard.threshold,
+                                                ) {
+                                                    warn!(%session_id, error = %e, "runaway_guard_tripped journal failed");
+                                                }
+                                            }
+                                            let summary = format!(
+                                                "Runaway guard tripped: {} automatic actions reached limit {}; pending op '{}' was NOT executed. Task paused for human confirmation. Goal: {}",
+                                                runaway_guard.actions,
+                                                runaway_guard.threshold,
+                                                tool_name,
+                                                goal,
+                                            );
+                                            warn!(%session_id, actions = runaway_guard.actions, threshold = runaway_guard.threshold, "runaway guard tripped (call_service), pausing for human confirmation");
+                                            yield Ok(AgentEvent::Error(
+                                                AgentError::Internal(summary.clone()),
+                                            ));
+                                            let duration = start_time.elapsed().as_millis() as u64;
+                                            if let Some(g) = turn_guard.take() {
+                                                g.end("runaway_paused", step_count as u64, duration);
+                                            }
+                                            if let Err(e) = runner.flush_messages(&session_id).await {
+                                                tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                            }
+                                            runner.submit_tool_traces(&session_id).await;
+                                            yield Ok(AgentEvent::Done(AgentResult::error(
+                                                summary,
+                                                step_count,
+                                                duration,
+                                            )));
+                                            return;
+                                        }
                                         yield Ok(AgentEvent::ToolCall { name: tool_name.clone(), args: args.clone() });
                                         // B21:tool_invoked(call_service 路径,evorule_request_id =
                                         // IoRequest.id,审计链 join 键——ATIF 映射表 §五)
@@ -7227,6 +7396,94 @@ impl RewindBudget {
     fn reset(&mut self, limit: u32) {
         self.remaining = limit;
     }
+}
+
+/// 18 号 §六/修订⑦:Runaway 护栏策略(policy 档任务长程护栏的注入面)。
+///
+/// 由 serve/CLI 接线层从 `.evo/approval-policy.toml` 构造(见
+/// [`RunawayPolicy::from_policy_file`]),经 [`AgentRunner::with_runaway_policy`]
+/// 注入;None=不启用(manual/auto 档与未接线面行为零变化)。
+#[derive(Debug, Clone)]
+pub struct RunawayPolicy {
+    /// 连续自动操作上限(policy_limits.max_actions_per_run,缺省 200)
+    pub max_actions_per_run: u32,
+    /// 修订④复述注入的条件清单(各工具组条件平铺,带 `[组名]` 前缀)
+    pub restate_conditions: Vec<String>,
+}
+
+impl RunawayPolicy {
+    /// 从已加载的条件文件构造(复用 serve/CLI 接线层同一份加载结果,
+    /// 不二次读盘)
+    pub fn from_policy_file(f: &crate::agent::approval_policy::ApprovalPolicyFile) -> Self {
+        Self {
+            max_actions_per_run: f.policy_limits.max_actions_per_run,
+            restate_conditions: f
+                .groups
+                .iter()
+                .flat_map(|(name, g)| g.conditions.iter().map(move |c| format!("[{name}] {c}")))
+                .collect(),
+        }
+    }
+}
+
+/// 18 号 PR-3:Runaway 内存计数器(连续自动操作累计配额)。
+///
+/// **与 [`RewindBudget`] 语义分离**(方案判据:独立计数独立 journal 变体,
+/// 单测锁语义分离):RewindBudget=连续失败预算(推进即回满,罚连续性);
+/// RunawayGuard=累计操作配额(不随成功重置,触发即暂停等人)。
+/// 无策略注入时以 `u32::MAX` 阈值构造(saturating 语义下永不触发,挂点空转)。
+#[derive(Debug)]
+struct RunawayGuard {
+    /// 已执行自动操作数
+    actions: u32,
+    /// 配额上限
+    threshold: u32,
+}
+
+impl RunawayGuard {
+    fn new(threshold: u32) -> Self {
+        Self {
+            actions: 0,
+            threshold,
+        }
+    }
+
+    /// 跨重启回填:按 journal 回填值恢复累计数(阈值不变)
+    fn restored(actions: u32, threshold: u32) -> Self {
+        Self { actions, threshold }
+    }
+
+    /// 计入一次自动操作;返回是否恰达阈值(触发护栏)
+    fn bump(&mut self) -> bool {
+        self.actions = self.actions.saturating_add(1);
+        self.actions >= self.threshold
+    }
+}
+
+/// 18 号修订④:剩余条件复述块(每轮上下文尾部注入,对抗长程目标漂移)。
+///
+/// 内容=任务目标+须持续满足的条件清单+Runaway 余量。纯函数,单测锁内容形态。
+pub(crate) fn runaway_restatement_block(
+    goal: &str,
+    conditions: &[String],
+    remaining: u32,
+) -> String {
+    let mut block = String::from("【任务护栏复述(每轮注入,只读)】\n任务目标: ");
+    block.push_str(goal);
+    block.push_str("\n须持续满足的审批条件:\n");
+    if conditions.is_empty() {
+        block.push_str("- (无预置条件)\n");
+    } else {
+        for c in conditions {
+            block.push_str("- ");
+            block.push_str(c);
+            block.push('\n');
+        }
+    }
+    block.push_str(&format!(
+        "Runaway 余量: 本任务还可自动执行 {remaining} 次操作,达到上限将暂停等待人工确认。\n"
+    ));
+    block
 }
 
 /// B21 D3:主动压缩保留轮数(设计默认 N=6,非配置面——压缩窗口结构
