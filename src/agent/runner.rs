@@ -1284,63 +1284,8 @@ impl AgentRunner {
             runner = runner.with_memory_event_store(event_store);
             runner = runner.with_event_ledger(std::sync::Arc::new(ledger));
         }
-        // C1:自动构造 EventExtractor(memory 启用时)
-        // extractor 在 sediment_session() 中被借用做事件提取(C1 阶段占位)
-        if def.memory.memory_type != "none" {
-            let mut config = ExtractionConfig {
-                extraction_model: def.memory.extraction_model.clone(),
-                ..Default::default()
-            };
-            // 触发词配置接线——配置面宣称「可被 agent.json 覆盖」自此成立
-            // （None=沿用内置默认表,既有 agent 配置零影响）
-            if let Some(kws) = &def.memory.extraction_keywords {
-                config.keywords = kws.clone();
-            }
-            if let Some(phrases) = &def.memory.extraction_explicit_phrases {
-                config.explicit_phrases = phrases.clone();
-            }
-            let extractor = EventExtractor::new(runner.llm_handler.clone(), config);
-            runner.extractor = Some(extractor);
-        }
         // 阶段 1(F-618):LexStore 检索缓存(definition 配 lex_store 路径时启用;
         // open 失败 warn 降级全量路径,I14)
-        // 阶段 2(F-610):MemoryRecipe 策略规则集(内嵌 JSON;解析失败 warn 降级
-        // 词法 legacy,零影响)
-        if let Some(rj) = &def.memory.recipe {
-            match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone()) {
-                Ok(recipe) => {
-                    let rollup = recipe.lifecycle.rollup_threshold;
-                    let journal_digest = recipe.sources.journal_digest;
-                    // 修复:failure_drafts 此前误接 journal_digest（复制粘贴错,
-                    // 草稿面从未被 Recipe 独立声明控制过）
-                    let failure_drafts = recipe.sources.failure_drafts;
-                    let material_harvest = recipe.sources.materials;
-                    let recipe_for_mem = recipe.clone();
-                    if let Some(mem) = runner.memory.as_mut() {
-                        mem.set_recipe(recipe_for_mem);
-                    }
-                    // Recipe.rollup_threshold 覆盖同名 def 配置（策略数据化）
-                    runner.sediment_config.summary_rollup_threshold = rollup;
-                    // Recipe.sources 三源穿线（跨源注册规格策略面；
-                    // 缺省关=既有 agent 零影响）
-                    runner.sediment_config.enable_journal_digest = journal_digest;
-                    runner.sediment_config.enable_failure_drafts = failure_drafts;
-                    runner.sediment_config.enable_material_harvest = material_harvest;
-                    // 战役 B：任务域事件触发词穿线（Recipe sources.task_event_keywords
-                    // → extractor config.task_keywords；缺省空=既有 agent 零影响。
-                    // extract_from_conversation 内部复检 detect_trigger，
-                    // 故必须在 extractor config 层注入而非仅外层放行）
-                    if !recipe.sources.task_event_keywords.is_empty() {
-                        if let Some(extractor) = runner.extractor.as_mut() {
-                            extractor.set_task_keywords(recipe.sources.task_event_keywords.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "MemoryRecipe 解析失败——召回走词法 legacy 路径");
-                }
-            }
-        }
         if let Some(db) = &def.memory.lex_store {
             match crate::agent::lexstore::LexStore::open(std::path::Path::new(db)) {
                 Ok(store) => {
@@ -1353,66 +1298,13 @@ impl AgentRunner {
                 }
             }
         }
-        // 阶段 3(F-611)读件注册前移除——A2-2 起注册挪至 sediment_config 赋值
-        // 之后(写件 MemoryProposer 的 namespace 取自 sediment_config)
-        // C1:沉淀配置(总是构造,sediment_session 在 memory 为 None 时是 no-op)
-        // C3/C4:从 MemoryConfig 读取 max_session_summaries/max_injected_events/
-        //        summary_rollup_threshold/enable_event_extraction
-        runner.sediment_config = sediment::SedimentConfig {
-            namespace: def.memory.namespace.clone(),
-            enable_event_extraction: def.memory.memory_type != "none"
-                && def.memory.enable_event_extraction,
-            max_session_summaries: def.memory.max_session_summaries,
-            max_injected_events: def.memory.max_injected_events,
-            summary_rollup_threshold: def.memory.summary_rollup_threshold,
-            // B5：stable 事实由摘要管道产出 → 域段记摘要模型（缺省回退主模型）
-            llm_model_id: def
-                .memory
-                .summary_model
-                .clone()
-                .unwrap_or_else(|| def.model.clone()),
-            // 知识候选提取开关（默认 true；提取走 auditor sidecar，
-            // 无审计通路时 sediment 内部自动跳过）
-            enable_knowledge_extraction: def.memory.enable_knowledge_extraction,
-            min_messages_for_extraction: 4,
-            // 跨源批 C:journal 摘要投影(缺省关;Recipe sources 穿线于上)
-            enable_journal_digest: false,
-            // 阶段 5 F-613:知识候选巩固(缺省开,跟随最小版先例)
-            enable_consolidation: true,
-            // 阶段 5 NB-2:双通道笔记事件驱动草稿(缺省关;Recipe sources 穿线于上)
-            enable_failure_drafts: false,
-            enable_material_harvest: false,
-            // S-5 收尾批+运营接线批:知识候选自动出口(dataset 配置即启用,
-            // 缺省 None=off;SedimentConfig 内闸不动=双保险;门限缺省 0.7)
-            enable_knowledge_propose: def.memory.knowledge_propose_dataset.is_some(),
-            knowledge_propose_dataset: def.memory.knowledge_propose_dataset.clone(),
-            knowledge_propose_min_confidence: def
-                .memory
-                .knowledge_propose_min_confidence
-                .unwrap_or(0.7),
-        };
-        // 阶段 3(F-611)+A2-2:自省记忆工具注册(声明面已在 step 2 按暴露条件
-        // 预放行;此处声明了而条件不满足=配置矛盾,早失败)。置于 sediment_config
-        // 赋值之后:写件(MemoryProposer)的 namespace 取自 sediment_config
-        runner.register_memory_introspection_tools()?;
-        // 判据自检回路——acceptance_command 从 definition 穿线
-        // (task_done 提交前 runner 强制执行验收命令,判据不过不存在 done 退出路径)
-        runner.acceptance_command = def.acceptance_command.clone();
-        // 用户决策 3 + G10：summary_model 单独配置,同时构造 ContextSummarizer
-        if let Some(sm) = def.memory.summary_model {
-            runner = runner.with_summary_model(&sm);
-            // G10:clone 主 LlmHandler 给摘要器(共享 API key/配置,独立调用)
-            // summary_model 指定后,摘要调用使用该模型;否则 fallback 到主 model
-            // P2-V3 结构性修复(2026-08-27)：必挂审计链执行器,
-            // 摘要类 LLM 调用经 sidecar 会话入审计链,影子调用归零
-            let audited = crate::agent::audited_llm::AuditedLlm::new(
-                runner.evorule_client.clone(),
-                runner.llm_handler.clone(),
-            );
-            let summarizer =
-                ContextSummarizer::new(runner.llm_handler.clone(), Some(sm)).with_auditor(audited);
-            runner = runner.with_summarizer(summarizer);
-        }
+        // O-481:sediment 管线装配收编为单一实现(extractor 构造/MemoryRecipe
+        // 穿线/sediment_config/自省记忆工具+验收命令/summarizer+auditor sidecar
+        // 五段,前两段原文已于上方删除)——from_definition(CLI)与
+        // construct_runner(serve)双路径同调;serve 面 construct_runner 零装配
+        // (sediment 以 Default 跑:namespace="default" 错域/model_id="unknown")
+        // 的存量缺陷自本收编起闭合
+        runner = runner.assemble_sediment_pipeline(&def)?;
         // 元层先行批:组装执行器构造。definition 未声明 assembly 时用内置
         // 默认配方,并把 memory_budget_ratio 合入 S3 槽位(保持既有配置语义:
         // 默认 0.25 与配方默认等价,显式值透传);已声明配方的 ratio 以配方
@@ -1788,6 +1680,133 @@ impl AgentRunner {
     pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
         self.compaction_policy = Some(policy);
         self
+    }
+
+    /// O-481:sediment 管线装配(单一实现)——from_definition(CLI)与
+    /// construct_runner(serve WS)双路径同调。收编自 from_definition 原地
+    /// 五段(extractor 构造/MemoryRecipe 穿线/sediment_config/自省记忆工具
+    /// 与验收命令/ContextSummarizer+AuditedLlm sidecar),语义逐行保持。
+    /// 时序约束:sediment_config 赋值先于 register_memory_introspection_tools
+    /// (写件 MemoryProposer 的 namespace 取自 sediment_config);本方法须在
+    /// memory 就位后调用(sediment_session 在 memory 为 None 时是 no-op)。
+    pub(crate) fn assemble_sediment_pipeline(
+        mut self,
+        def: &AgentDefinition,
+    ) -> Result<Self, AgentError> {
+        // C1:自动构造 EventExtractor(memory 启用时)
+        // extractor 在 sediment_session() 中被借用做事件提取(C1 阶段占位)
+        if def.memory.memory_type != "none" {
+            let mut config = ExtractionConfig {
+                extraction_model: def.memory.extraction_model.clone(),
+                ..Default::default()
+            };
+            // 触发词配置接线——配置面宣称「可被 agent.json 覆盖」自此成立
+            // （None=沿用内置默认表,既有 agent 配置零影响）
+            if let Some(kws) = &def.memory.extraction_keywords {
+                config.keywords = kws.clone();
+            }
+            if let Some(phrases) = &def.memory.extraction_explicit_phrases {
+                config.explicit_phrases = phrases.clone();
+            }
+            let extractor = EventExtractor::new(self.llm_handler.clone(), config);
+            self.extractor = Some(extractor);
+        }
+        // 阶段 2(F-610):MemoryRecipe 策略规则集(内嵌 JSON;解析失败 warn 降级
+        // 词法 legacy,零影响)
+        if let Some(rj) = &def.memory.recipe {
+            match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone()) {
+                Ok(recipe) => {
+                    let rollup = recipe.lifecycle.rollup_threshold;
+                    let journal_digest = recipe.sources.journal_digest;
+                    // 修复:failure_drafts 此前误接 journal_digest（复制粘贴错,
+                    // 草稿面从未被 Recipe 独立声明控制过）
+                    let failure_drafts = recipe.sources.failure_drafts;
+                    let material_harvest = recipe.sources.materials;
+                    let recipe_for_mem = recipe.clone();
+                    if let Some(mem) = self.memory.as_mut() {
+                        mem.set_recipe(recipe_for_mem);
+                    }
+                    // Recipe.rollup_threshold 覆盖同名 def 配置（策略数据化）
+                    self.sediment_config.summary_rollup_threshold = rollup;
+                    // Recipe.sources 三源穿线（跨源注册规格策略面；
+                    // 缺省关=既有 agent 零影响）
+                    self.sediment_config.enable_journal_digest = journal_digest;
+                    self.sediment_config.enable_failure_drafts = failure_drafts;
+                    self.sediment_config.enable_material_harvest = material_harvest;
+                    // 战役 B：任务域事件触发词穿线（Recipe sources.task_event_keywords
+                    // → extractor config.task_keywords；缺省空=既有 agent 零影响。
+                    // extract_from_conversation 内部复检 detect_trigger，
+                    // 故必须在 extractor config 层注入而非仅外层放行）
+                    if !recipe.sources.task_event_keywords.is_empty() {
+                        if let Some(extractor) = self.extractor.as_mut() {
+                            extractor.set_task_keywords(recipe.sources.task_event_keywords.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "MemoryRecipe 解析失败——召回走词法 legacy 路径");
+                }
+            }
+        }
+        // C1:沉淀配置(总是构造,sediment_session 在 memory 为 None 时是 no-op)
+        // C3/C4:从 MemoryConfig 读取 max_session_summaries/max_injected_events/
+        //        summary_rollup_threshold/enable_event_extraction
+        self.sediment_config = sediment::SedimentConfig {
+            namespace: def.memory.namespace.clone(),
+            enable_event_extraction: def.memory.memory_type != "none"
+                && def.memory.enable_event_extraction,
+            max_session_summaries: def.memory.max_session_summaries,
+            max_injected_events: def.memory.max_injected_events,
+            summary_rollup_threshold: def.memory.summary_rollup_threshold,
+            // B5：stable 事实由摘要管道产出 → 域段记摘要模型（缺省回退主模型）
+            llm_model_id: def
+                .memory
+                .summary_model
+                .clone()
+                .unwrap_or_else(|| def.model.clone()),
+            // 知识候选提取开关（默认 true；提取走 auditor sidecar，
+            // 无审计通路时 sediment 内部自动跳过）
+            enable_knowledge_extraction: def.memory.enable_knowledge_extraction,
+            min_messages_for_extraction: 4,
+            // 跨源批 C:journal 摘要投影(缺省关;Recipe sources 穿线于上)
+            enable_journal_digest: false,
+            // 阶段 5 F-613:知识候选巩固(缺省开,跟随最小版先例)
+            enable_consolidation: true,
+            // 阶段 5 NB-2:双通道笔记事件驱动草稿(缺省关;Recipe sources 穿线于上)
+            enable_failure_drafts: false,
+            enable_material_harvest: false,
+            // S-5 收尾批+运营接线批:知识候选自动出口(dataset 配置即启用,
+            // 缺省 None=off;SedimentConfig 内闸不动=双保险;门限缺省 0.7)
+            enable_knowledge_propose: def.memory.knowledge_propose_dataset.is_some(),
+            knowledge_propose_dataset: def.memory.knowledge_propose_dataset.clone(),
+            knowledge_propose_min_confidence: def
+                .memory
+                .knowledge_propose_min_confidence
+                .unwrap_or(0.7),
+        };
+        // 阶段 3(F-611)+A2-2:自省记忆工具注册(声明面已在 step 2 按暴露条件
+        // 预放行;此处声明了而条件不满足=配置矛盾,早失败)。置于 sediment_config
+        // 赋值之后:写件(MemoryProposer)的 namespace 取自 sediment_config
+        self.register_memory_introspection_tools()?;
+        // 判据自检回路——acceptance_command 从 definition 穿线
+        // (task_done 提交前 runner 强制执行验收命令,判据不过不存在 done 退出路径)
+        self.acceptance_command = def.acceptance_command.clone();
+        // 用户决策 3 + G10：summary_model 单独配置,同时构造 ContextSummarizer
+        if let Some(sm) = &def.memory.summary_model {
+            self = self.with_summary_model(sm);
+            // G10:clone 主 LlmHandler 给摘要器(共享 API key/配置,独立调用)
+            // summary_model 指定后,摘要调用使用该模型;否则 fallback 到主 model
+            // P2-V3 结构性修复(2026-08-27)：必挂审计链执行器,
+            // 摘要类 LLM 调用经 sidecar 会话入审计链,影子调用归零
+            let audited = crate::agent::audited_llm::AuditedLlm::new(
+                self.evorule_client.clone(),
+                self.llm_handler.clone(),
+            );
+            let summarizer = ContextSummarizer::new(self.llm_handler.clone(), Some(sm.clone()))
+                .with_auditor(audited);
+            self = self.with_summarizer(summarizer);
+        }
+        Ok(self)
     }
 
     /// 18 号 PR-3:注入 Runaway 护栏策略(policy 档;见 [`RunawayPolicy`]。
