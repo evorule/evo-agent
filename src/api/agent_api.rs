@@ -237,8 +237,12 @@ pub struct AgentApiState {
     /// HTTP 中间件(`auth_middleware`)对普通路由生效;WebSocket 升级发生在
     /// handler 内,需在 `ws_handler()` 中显式调用 `validate()` 做二次校验。
     auth_config: AuthConfig,
-    /// E1:工作目录(工具沙箱基目录)
+    /// E1:工作目录(工具沙箱基目录,写域根)
     workdir: std::path::PathBuf,
+    /// B 批「读宽写窄」:读域根(serve `--read-root` 注入;None=读写同域,
+    /// 行为与 v1 一致)。读面工具绑定发生在启动期 toolkit 构建,wire 面仅
+    /// 消费此值合成边界自报
+    read_root: Option<std::path::PathBuf>,
     /// E1:Workspace API 客户端(规则工具依赖)
     workspace_client: Arc<WorkspaceApiClient>,
     /// E1:预建 union toolkit(内置 + 规则,启动时组装一次)
@@ -372,6 +376,9 @@ impl AgentApiState {
             mcp_server_enabled: false,
             fs_events: crate::api::fs_watch::FsEventHub::new(),
             workdir,
+            // B 批「读宽写窄」:缺省 None(读写同域),serve 启动按 --read-root
+            // with_read_root 注入
+            read_root: None,
             workspace_client,
             toolkit,
             llm_status: Arc::new(LlmStatusSnapshot::unconfigured()),
@@ -495,9 +502,21 @@ impl AgentApiState {
         &self.evorule_client
     }
 
-    /// E1:获取工作目录(工具沙箱基目录)
+    /// E1:获取工作目录(工具沙箱基目录,写域根)
     pub fn workdir(&self) -> &std::path::Path {
         &self.workdir
+    }
+
+    /// B 批「读宽写窄」:获取读域根(None=读写同域,行为与 v1 一致)
+    pub fn read_root(&self) -> Option<&std::path::Path> {
+        self.read_root.as_deref()
+    }
+
+    /// B 批「读宽写窄」:注入读域根(builder pattern,供 cmd_serve 按
+    /// `--read-root` 启动参数调用)
+    pub fn with_read_root(mut self, read_root: std::path::PathBuf) -> Self {
+        self.read_root = Some(read_root);
+        self
     }
 
     /// E1:获取 WorkspaceApiClient 的引用(规则工具依赖)
@@ -1111,8 +1130,14 @@ async fn run_agent(
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
     // M5-a:能力边界接线(显式声明重绑 file 工具沙箱 + 生效边界注入 runner)
-    let capability_boundary =
-        crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
+    // B 批「读宽写窄」:读域根经 state 注入(--read-root);请求带 workspace 时
+    // 声明优先,read_root 不参与(workspace=请求级完整意志,同域边界)
+    let capability_boundary = crate::api::serve_tools::wire_capability_boundary_with_read_root(
+        &mut filtered,
+        &def,
+        state.workdir(),
+        state.read_root(),
+    );
     // S2 治理门禁段(S2 前移批):三段合并构造,经 runner 配置进组装层
     // (v2 序=权威紧跟 S1 身份段之后;不再改写 def.system_prompt——K-17②)
     let governance_segment =
@@ -1479,9 +1504,13 @@ async fn run_agent_stream(
         crate::api::serve_tools::apply_workspace_boundary(&mut def, ws)
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
-    // M5-a:能力边界接线(同 run_agent 口径)
-    let capability_boundary =
-        crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
+    // M5-a:能力边界接线(同 run_agent 口径;B 批「读宽写窄」读域根经 state 注入)
+    let capability_boundary = crate::api::serve_tools::wire_capability_boundary_with_read_root(
+        &mut filtered,
+        &def,
+        state.workdir(),
+        state.read_root(),
+    );
     // S2 治理门禁段(S2 前移批):同 run_agent 口径
     let governance_segment =
         crate::api::serve_tools::build_governance_segment(&state.evorule_client, &def.tools).await;

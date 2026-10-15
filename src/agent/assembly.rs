@@ -1176,6 +1176,7 @@ mod tests {
         let boundary = CapabilityBoundary {
             mode: "read_only".to_string(),
             sandbox_root: PathBuf::from("/tmp/sandbox-golden"),
+            read_root: None,
             tools: vec!["file_read".to_string()],
         };
         let out3 = exec
@@ -1763,6 +1764,7 @@ mod tests {
         let boundary = CapabilityBoundary {
             mode: "read_only".to_string(),
             sandbox_root: PathBuf::from("/srvbox/golden"),
+            read_root: None,
             tools: vec!["file_read".to_string()],
         };
         let skills = vec![SkillManifestEntry {

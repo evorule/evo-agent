@@ -92,22 +92,28 @@ use crate::io_handlers::tool_handler::ToolHandler;
 ///
 /// 用法:
 /// ```ignore
-/// let tool_handler = builtin_tools::default_safe_toolkit(Path::new("."));
+/// let tool_handler = builtin_tools::default_safe_toolkit(Path::new("."), Path::new("."));
 /// let runner = AgentRunner::new(config, client).with_tool_handler(tool_handler);
 /// ```
-pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
+pub fn default_safe_toolkit(workdir: &Path, read_root: &Path) -> ToolHandler {
     let workdir_buf = workdir
         .canonicalize()
         .unwrap_or_else(|_| workdir.to_path_buf());
+    // 读域根(B 批「读宽写窄」):读面四工具相对该根解析;缺省与写域同根时
+    // 行为与 v1 完全一致。canonicalize 统一为绝对规范形(与 workdir 同口径,
+    // 防 Windows 短名/相对形态漂移)
+    let read_root_buf = read_root
+        .canonicalize()
+        .unwrap_or_else(|_| read_root.to_path_buf());
 
     let mut handler = ToolHandler::new();
     handler.register_static(
         "file_read",
-        Arc::new(file_read::FileReadTool::new(workdir_buf.clone())),
+        Arc::new(file_read::FileReadTool::new(read_root_buf.clone())),
     );
     handler.register_static(
         "file_list",
-        Arc::new(file_list::FileListTool::new(workdir_buf.clone())),
+        Arc::new(file_list::FileListTool::new(read_root_buf.clone())),
     );
     handler.register_static(
         "file_write",
@@ -127,11 +133,11 @@ pub fn default_safe_toolkit(workdir: &Path) -> ToolHandler {
     );
     handler.register_static(
         "search_files",
-        Arc::new(search_files::SearchFilesTool::new(workdir_buf.clone())),
+        Arc::new(search_files::SearchFilesTool::new(read_root_buf.clone())),
     );
     handler.register_static(
         "grep_files",
-        Arc::new(grep_files::GrepFilesTool::new(workdir_buf.clone())),
+        Arc::new(grep_files::GrepFilesTool::new(read_root_buf)),
     );
     handler.register_static(
         "shell_exec",

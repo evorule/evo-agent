@@ -1136,7 +1136,10 @@ async fn test_react_loop_llm_request_carries_tools_schema() {
     let llm = LlmHandler::new("mock-model", &llm_server.url()).with_retry_config(0, 0.001, 0.01);
     let mut runner = AgentRunner::new(AgentConfig::default(), client)
         .with_llm_handler(llm)
-        .with_tool_handler(evo_agent::builtin_tools::default_safe_toolkit(dir.path()));
+        .with_tool_handler(evo_agent::builtin_tools::default_safe_toolkit(
+            dir.path(),
+            dir.path(),
+        ));
 
     let result = runner
         .run("record the expense")

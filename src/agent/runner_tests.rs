@@ -2495,6 +2495,7 @@ async fn test_capability_boundary_sent_in_create_session() {
         mode: "read_only".to_string(),
         sandbox_root: std::env::temp_dir(),
         tools: vec!["file_read".to_string()],
+        read_root: None,
     };
 
     // 断言请求体含 initial_content.capability_boundary(PartialJson 子集匹配;
@@ -2789,6 +2790,7 @@ fn m5c_boundary() -> CapabilityBoundary {
             "/tmp/sandbox-root"
         }),
         tools: vec!["file_read".to_string(), "file_write".to_string()],
+        read_root: None,
     }
 }
 

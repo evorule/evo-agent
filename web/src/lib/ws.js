@@ -84,6 +84,11 @@ async function recoverFromDeadSession(rawError) {
 function wsUrl(sid) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   let url = `${proto}://${location.host}/api/sessions/${sid || 'new'}/ws?agent_type=general`;
+  // C 批「会话级 workspace」:localStorage 存有工作区绝对路径 → 连接级携带
+  // (?workspace=,serve 面会话级能力边界根,读写同域)。改工作区在下次
+  // 连接(新建会话/换线/重连)生效;缺省不携带=serve workdir 行为零变化。
+  const workspace = localStorage.getItem('evo_workspace');
+  if (workspace) url += `&workspace=${encodeURIComponent(workspace)}`;
   // auth 启用时走 ?token= fallback(与 SSE 同口径);token 由用户侧配置注入
   const token = localStorage.getItem('evo_agent_token');
   if (token) url += `&token=${encodeURIComponent(token)}`;
