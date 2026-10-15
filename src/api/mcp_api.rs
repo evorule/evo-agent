@@ -12,6 +12,7 @@
 //!
 //! - `GET  /api/mcp/servers`              → 配置面 + 运行态合并视图(工具表)
 //! - `PUT  /api/mcp/servers`              → 校验 → 写回 .evo/mcp.toml → 全量重载
+//!   (env 字段省略 = 保留该 server 现有 env 值,显式提供含空对象 = 覆盖)
 //! - `POST /api/mcp/servers/{name}/restart` → 断连重连重注册单 server
 //! - `GET  /api/mcp/status`               → 聚合徽标(总/连/败/停 + 工具数)
 //!
@@ -157,14 +158,43 @@ pub async fn list_servers(
     Ok(Json(merged_view(manager, store)))
 }
 
+/// PUT 请求单 server 条目(与 [`McpServerConfig`] 同形,仅 env 可选)
+///
+/// env 缺省语义(工作台契约):GET 视图只回 `env_keys` 不回值(防泄露),
+/// 前端永远拿不到 env 值——若 PUT 要求全量 env,前端任何写回都会误清密钥。
+/// 故:省略 env 字段 = 保留该 server 现有 env 值;显式提供(含空对象)= 覆盖。
+/// (pub 仅为满足 handler 签名可见性;字段全部私有,外部不可构造读取)
+#[derive(serde::Deserialize)]
+pub struct McpPutServer {
+    name: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default = "McpServerConfig::default_timeout_secs")]
+    timeout_secs: u64,
+    #[serde(default)]
+    always_allow: Vec<String>,
+}
+
+/// PUT 请求体(`{"servers":[...]}`;与 GET 视图的 servers 字段同位)
+#[derive(serde::Deserialize)]
+pub struct McpPutRequest {
+    servers: Vec<McpPutServer>,
+}
+
 /// `PUT /api/mcp/servers` 校验 → 写回 mcp.toml → 全量重载(重连全部)
 ///
 /// 重载语义:先全量断连(旧子进程一律 kill),再按新配置逐 server 重连;
 /// disabled 跳过(不连接不注册,配置保留);单 server 失败隔离落 failed
-/// 状态,不阻塞其余。响应 = 重载后的合并视图。
+/// 状态,不阻塞其余。env 省略条目按 name 对齐现有配置继承 env 值。
+/// 响应 = 重载后的合并视图。
 pub async fn put_servers(
     State(state): State<AgentApiState>,
-    Json(cfg): Json<McpConfig>,
+    Json(body): Json<McpPutRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(manager) = state.mcp() else {
         return Err(not_enabled());
@@ -172,6 +202,37 @@ pub async fn put_servers(
     let Some(store) = state.mcp_store() else {
         return Err(not_enabled());
     };
+
+    // env 保留语义:按 name 对齐现有配置,省略 env 字段的条目继承现有值
+    let existing: HashMap<String, McpServerConfig> = store
+        .load()
+        .servers
+        .into_iter()
+        .map(|s| (s.name.clone(), s))
+        .collect();
+    let servers = body
+        .servers
+        .into_iter()
+        .map(|s| {
+            let env = s.env.unwrap_or_else(|| {
+                existing
+                    .get(&s.name)
+                    .map(|e| e.env.clone())
+                    .unwrap_or_default()
+            });
+            McpServerConfig {
+                name: s.name,
+                command: s.command,
+                args: s.args,
+                env,
+                disabled: s.disabled,
+                timeout_secs: s.timeout_secs,
+                always_allow: s.always_allow,
+            }
+        })
+        .collect();
+    let cfg = McpConfig { servers };
+
     validate(&cfg).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
 
     // 1. 写回配置(原子写;mcp.toml 从此为单一事实源,回落态终止)
@@ -499,6 +560,38 @@ mod tests {
         assert_eq!(fs["disabled"], true);
         assert_eq!(fs["timeout_secs"], 30);
         assert_eq!(fs["always_allow"], json!(["read_file"]));
+    }
+
+    #[tokio::test]
+    async fn test_put_servers_env_omitted_preserves_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(mcp_state(tmp.path()));
+        // 初次 PUT:显式 env 写入
+        let body =
+            json!({"servers": [{"name": "fs", "command": "npx", "env": {"API_KEY": "secret"}}]});
+        let (status, _) = json_request(a.clone(), "PUT", "/api/mcp/servers", Some(body)).await;
+        assert_eq!(status, StatusCode::OK);
+        // 二次 PUT:省略 env → 保留现有值(前端拿不到值,启停/勾白名单不得误清)
+        let body = json!({"servers": [{"name": "fs", "command": "npx", "disabled": true}]});
+        let (status, _) = json_request(a.clone(), "PUT", "/api/mcp/servers", Some(body)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = std::fs::read_to_string(tmp.path().join(".evo").join("mcp.toml")).unwrap();
+        assert!(text.contains("secret"), "省略 env 字段应保留现有 env 值");
+        // 三次 PUT:显式空 env → 覆盖清空
+        let body = json!({"servers": [{"name": "fs", "command": "npx", "env": {}}]});
+        let (status, _) = json_request(a.clone(), "PUT", "/api/mcp/servers", Some(body)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = std::fs::read_to_string(tmp.path().join(".evo").join("mcp.toml")).unwrap();
+        assert!(!text.contains("secret"), "显式空 env 应覆盖清空");
+        // 改名不继承:新 name 无对齐条目,env 落空
+        let body = json!({"servers": [{"name": "fs2", "command": "npx", "disabled": true}]});
+        let (status, _) = json_request(a.clone(), "PUT", "/api/mcp/servers", Some(body)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = std::fs::read_to_string(tmp.path().join(".evo").join("mcp.toml")).unwrap();
+        assert!(
+            text.contains("fs2") && !text.contains("secret"),
+            "新 name 不继承旧 server env"
+        );
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
   import { settingsState, setSetting } from '../lib/settings.js';
   import { getWorkbenchConfig, putWorkbenchConfig, getLlmStatus } from '../lib/api.js';
   import { openSettingsJson } from '../lib/stores.js';
+  import McpSection from './McpSection.svelte';
 
   let query = '';
   /** 数组控件展开态(键 ID) */
@@ -302,6 +303,8 @@
         <div class="llm-note">密钥不出现在本页;如需更换模型或密钥,请编辑启动配置文件后重启服务。</div>
       </section>
     {/if}
+
+    <McpSection />
   </div>
 </div>
 

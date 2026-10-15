@@ -274,3 +274,36 @@ export function indexStatus() {
 export function indexRebuild() {
   return fetch('/api/index/rebuild', { method: 'POST', headers: headers() }).then(unwrap);
 }
+
+// ===== MCP 工作台(B16;四端点对应 serve mcp_api.rs,未启用态 503) =====
+
+/** MCP server 配置+运行态合并视图({servers,config_path};env 只回键名不回值防泄露) */
+export function mcpListServers() {
+  return fetch('/api/mcp/servers', { headers: headers() }).then(unwrap);
+}
+
+/**
+ * MCP 配置全量写回并重载(校验 400 / 成功 200 回重载后合并视图)。
+ * env 省略 = 保留服务端现有值,显式给出(含空对象)= 覆盖——前端拿不到
+ * env 值,所有程序化写回一律省略该字段。
+ */
+export function mcpPutServers(servers) {
+  return fetch('/api/mcp/servers', {
+    method: 'PUT',
+    headers: headers(true),
+    body: JSON.stringify({ servers }),
+  }).then(unwrap);
+}
+
+/** 单 server 断连重连重注册(404 未知名 / 502 重连失败) */
+export function mcpRestartServer(name) {
+  return fetch(`/api/mcp/servers/${encodeURIComponent(name)}/restart`, {
+    method: 'POST',
+    headers: headers(),
+  }).then(unwrap);
+}
+
+/** MCP 聚合徽标({total,connected,failed,disabled,tools}) */
+export function mcpStatus() {
+  return fetch('/api/mcp/status', { headers: headers() }).then(unwrap);
+}

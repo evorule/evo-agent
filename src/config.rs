@@ -497,7 +497,7 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
-    fn default_timeout_secs() -> u64 {
+    pub(crate) fn default_timeout_secs() -> u64 {
         60
     }
 }
