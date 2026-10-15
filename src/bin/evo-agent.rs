@@ -1845,9 +1845,16 @@ fn cmd_serve(
     // B16:serve 模式 MCP 接入(门禁=agentTools.mcp 设置键,manifest 开关绑定
     // 单一事实源,缺省开;disabled server 跳过;失败隔离——单 server 失败落
     // failed 状态不阻塞其余与启动;每请求 filtered 面同键二次过滤)
+    // 配置源:.evo/mcp.toml 优先(工作台 PUT 写回的单一事实源),回落
+    // evo-agent.toml [mcp] 段(fallback 快照随 store 注入 state)
     let mcp_manager = std::sync::Arc::new(evo_agent::mcp::McpManager::new());
+    let mcp_store = std::sync::Arc::new(evo_agent::mcp::McpConfigStore::new(
+        workdir,
+        config.mcp.clone(),
+    ));
+    let mcp_cfgs = mcp_store.load();
     let mut mcp_enabled = false;
-    if !config.mcp.servers.is_empty() {
+    if !mcp_cfgs.servers.is_empty() {
         let (merged, _) = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
             .map(|store| store.merged())
             .unwrap_or_else(|_| (serde_json::Map::new(), serde_json::Map::new()));
@@ -1858,7 +1865,7 @@ fn cmd_serve(
         if !enabled {
             eprintln!(
                 "[mcp] {} server(s) configured but agentTools.mcp=false, MCP tools filtered out (workbench toggle to enable)",
-                config.mcp.servers.len()
+                mcp_cfgs.servers.len()
             );
         } else {
             mcp_enabled = true;
@@ -1868,12 +1875,12 @@ fn cmd_serve(
             {
                 Ok(rt) => {
                     let n = rt.block_on(
-                        mcp_manager.connect_and_register_all(&mut toolkit, &config.mcp.servers),
+                        mcp_manager.connect_and_register_all(&mut toolkit, &mcp_cfgs.servers),
                     );
                     eprintln!(
                         "[mcp] {}/{} server(s) connected, tools registered into serve toolkit",
                         n,
-                        config.mcp.servers.len()
+                        mcp_cfgs.servers.len()
                     );
                 }
                 Err(e) => eprintln!("[mcp] 临时 runtime 构建失败,serve 面无 MCP 工具: {e}"),
@@ -1881,7 +1888,9 @@ fn cmd_serve(
         }
     }
     let toolkit_tool_count = toolkit.tool_names().len();
-    let toolkit = std::sync::Arc::new(toolkit);
+    // B16:RwLock 包装 —— serve 运行期 MCP 重载/restart 端点需向 union
+    // 注册新工具(读路径经 state.toolkit() 取读锁,写路径 mcp_api 取写锁)
+    let toolkit = std::sync::Arc::new(std::sync::RwLock::new(toolkit));
     eprintln!(
         "[tools] union toolkit assembled: {} tool(s)",
         toolkit_tool_count
@@ -1926,9 +1935,9 @@ fn cmd_serve(
     // serve 面各请求路径的 handler 构造与 CLI 共用同一解析产物,
     // 不再绕过配置体系直读裸环境变量
     .with_llm_config(config.llm.clone());
-    // B16:MCP 管理器注入(mcp.enabled 且配了 server 时;None = /api/mcp/* 503)
+    // B16:MCP 管理器+配置存储成对注入(mcp_enabled 时;None = /api/mcp/* 503)
     if mcp_enabled {
-        state = state.with_mcp(mcp_manager.clone());
+        state = state.with_mcp(mcp_manager.clone(), mcp_store.clone());
     }
 
     // B14 语义索引:按 index.enabled 设置键决定是否启动(默认关,显式开启;

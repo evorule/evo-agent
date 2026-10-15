@@ -489,7 +489,9 @@ mod tests {
             std::sync::Arc::new(crate::api::workspace_client::WorkspaceApiClient::new(
                 "http://localhost:0",
             )),
-            std::sync::Arc::new(crate::io_handlers::tool_handler::ToolHandler::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(
+                crate::io_handlers::tool_handler::ToolHandler::new(),
+            )),
         )
     }
 

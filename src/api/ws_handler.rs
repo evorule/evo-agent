@@ -637,7 +637,7 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
     // 或输出供应商原生 XML),也调不通 call_service 工具。
     let (merged_settings, _) = state.workbench_settings().merged();
     let mut filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
-        state.toolkit(),
+        &state.toolkit(),
         &def.tools,
         &merged_settings,
     );

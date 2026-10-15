@@ -228,7 +228,11 @@ pub struct AgentApiState {
     /// E1:Workspace API 客户端(规则工具依赖)
     workspace_client: Arc<WorkspaceApiClient>,
     /// E1:预建 union toolkit(内置 + 规则,启动时组装一次)
-    toolkit: Arc<ToolHandler>,
+    ///
+    /// B16:升级为 RwLock —— serve 运行期 MCP 重载/restart 需向 union 注册
+    /// 新工具;读路径(白名单过滤/工具查询)取读锁,写路径(mcp_api 端点)
+    /// 取写锁,临界区内无 await。
+    toolkit: Arc<std::sync::RwLock<ToolHandler>>,
     /// LLM 配置脱敏快照(凭据可视化状态端点;不含任何密钥内容)
     llm_status: Arc<LlmStatusSnapshot>,
     /// LLM 配置统一解析产物(env 优先、toml 兜底;serve 与 CLI 共用同一解析链)
@@ -261,6 +265,9 @@ pub struct AgentApiState {
     /// B16 MCP 连接态管理器(serve 按 mcp 配置注入,None = 未启用态,
     /// /api/mcp/* 一律 503;工具注册已在启动期并入 union toolkit)
     mcp: Option<Arc<crate::mcp::McpManager>>,
+    /// B16 MCP 配置存储(.evo/mcp.toml 读写 + evo-agent.toml 回落;与 mcp
+    /// 管理器成对注入,PUT 端点写回配置后重载生效)
+    mcp_store: Option<Arc<crate::mcp::store::McpConfigStore>>,
 }
 
 impl AgentApiState {
@@ -271,7 +278,7 @@ impl AgentApiState {
         );
         // E1:new 兼容路径——构造默认 workspace_client + 空 toolkit
         let workspace_client = Arc::new(WorkspaceApiClient::new(evorule_client.base_url()));
-        let toolkit = Arc::new(ToolHandler::new());
+        let toolkit = Arc::new(std::sync::RwLock::new(ToolHandler::new()));
         Self::new_with_metrics(
             definitions,
             evorule_client,
@@ -294,7 +301,7 @@ impl AgentApiState {
         metrics: SharedMetrics,
         workdir: std::path::PathBuf,
         workspace_client: Arc<WorkspaceApiClient>,
-        toolkit: Arc<ToolHandler>,
+        toolkit: Arc<std::sync::RwLock<ToolHandler>>,
     ) -> Self {
         let state = Self {
             definitions,
@@ -324,6 +331,7 @@ impl AgentApiState {
             index: None,
             // B16 MCP 管理器缺省不注入;serve 启动按 mcp 配置 with_mcp
             mcp: None,
+            mcp_store: None,
             fs_events: crate::api::fs_watch::FsEventHub::new(),
             workdir,
             workspace_client,
@@ -459,9 +467,13 @@ impl AgentApiState {
         &self.workspace_client
     }
 
-    /// E1:获取预建 union toolkit 的引用(41 工具,启动时组装)
-    pub fn toolkit(&self) -> &ToolHandler {
-        &self.toolkit
+    /// E1:获取预建 union toolkit(41 工具,启动时组装)
+    ///
+    /// B16:toolkit 为 RwLock 包装,返回读锁 guard(Deref 到 ToolHandler,
+    /// owned 查询 get_tool/manifest/tool_names 调用方式不变)。guard 为
+    /// 临时值,不得跨 await 持有;写路径经 mcp_api 端点取 write()。
+    pub fn toolkit(&self) -> std::sync::RwLockReadGuard<'_, ToolHandler> {
+        self.toolkit.read().expect("toolkit lock poisoned")
     }
 
     /// G16:注入鉴权配置(builder pattern,供 `router_with_auth` 链式调用)
@@ -482,16 +494,32 @@ impl AgentApiState {
         self.index.as_ref()
     }
 
-    /// B16:注入 MCP 连接态管理器(builder pattern,供 serve 启动按 mcp 配置调用;
-    /// 未注入 = 未启用态,/api/mcp/* 一律 503)
-    pub fn with_mcp(mut self, mcp: Arc<crate::mcp::McpManager>) -> Self {
+    /// B16:注入 MCP 连接态管理器与配置存储(builder pattern,供 serve 启动
+    /// 按 mcp 配置成对调用;未注入 = 未启用态,/api/mcp/* 一律 503)
+    pub fn with_mcp(
+        mut self,
+        mcp: Arc<crate::mcp::McpManager>,
+        store: Arc<crate::mcp::store::McpConfigStore>,
+    ) -> Self {
         self.mcp = Some(mcp);
+        self.mcp_store = Some(store);
         self
     }
 
     /// B16:获取 MCP 连接态管理器(未启用态为 None)
     pub fn mcp(&self) -> Option<&Arc<crate::mcp::McpManager>> {
         self.mcp.as_ref()
+    }
+
+    /// B16:获取 MCP 配置存储(未启用态为 None)
+    pub fn mcp_store(&self) -> Option<&Arc<crate::mcp::store::McpConfigStore>> {
+        self.mcp_store.as_ref()
+    }
+
+    /// B16:获取 union toolkit 底层锁(mcp_api 写路径 PUT/reload/restart
+    /// 经 write() 注册工具;读路径一律走 [`Self::toolkit`] 读 guard)
+    pub fn toolkit_lock(&self) -> &std::sync::RwLock<ToolHandler> {
+        &self.toolkit
     }
 }
 
@@ -702,6 +730,20 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route(
             "/api/git/commit-message/generate",
             axum::routing::post(crate::api::git_api::generate),
+        )
+        // B16:MCP 工作台面(配置/连接态/重启;未启用态一律 503,G16 中间件自动覆盖)
+        .route(
+            "/api/mcp/servers",
+            axum::routing::get(crate::api::mcp_api::list_servers)
+                .put(crate::api::mcp_api::put_servers),
+        )
+        .route(
+            "/api/mcp/servers/{name}/restart",
+            axum::routing::post(crate::api::mcp_api::restart_server),
+        )
+        .route(
+            "/api/mcp/status",
+            axum::routing::get(crate::api::mcp_api::status_brief),
         )
         // G14:记忆事件查询 — 返回 session 的所有结构化事件
         .route(
@@ -943,7 +985,7 @@ async fn run_agent(
     // 文件增删改工具面(file_create/move/delete,开关关=契约同步消失)
     let (merged_settings, _) = state.workbench_settings().merged();
     let mut filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
-        &state.toolkit,
+        &state.toolkit(),
         &def.tools,
         &merged_settings,
     );
@@ -1110,9 +1152,9 @@ async fn run_plan_execute_request(
     // =仅裁开关；delegate 子代理再按各自 def.tools 白名单过滤），不重建 CLI
     // union toolkit
     let (merged_settings, _) = state.workbench_settings().merged();
-    let all_tools = state.toolkit.tool_names();
+    let all_tools = state.toolkit().tool_names();
     let mut delegate_toolkit = crate::api::serve_tools::build_filtered_toolkit_with_switches(
-        &state.toolkit,
+        &state.toolkit(),
         &all_tools,
         &merged_settings,
     );
@@ -1254,7 +1296,7 @@ async fn run_agent_stream(
     // 文件增删改工具面(同 run_agent 口径,三路径共用开关语义)
     let (merged_settings, _) = state.workbench_settings().merged();
     let mut filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
-        &state.toolkit,
+        &state.toolkit(),
         &def.tools,
         &merged_settings,
     );
@@ -2299,7 +2341,7 @@ mod tests {
             Arc::new(Metrics::new().unwrap()),
             tmp.path().to_path_buf(),
             Arc::new(WorkspaceApiClient::new(&server.url())),
-            Arc::new(ToolHandler::new()),
+            Arc::new(std::sync::RwLock::new(ToolHandler::new())),
         );
         let app = router(state);
 

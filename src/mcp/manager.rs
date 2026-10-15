@@ -140,6 +140,19 @@ impl McpManager {
         }
     }
 
+    /// 重连单 server(断连 → 按配置重连),**不注册工具**
+    ///
+    /// B16 PR-2:供 serve 端点「先 async 连接 → 再同步持 toolkit 写锁注册」
+    /// 两段式使用(写锁 guard 非 Send 不得跨 await)。失败隔离语义同
+    /// [`connect_server`](Self::connect_server)(状态面已落 connected/failed)。
+    pub async fn reconnect(
+        &self,
+        cfg: &McpServerConfig,
+    ) -> Result<(std::sync::Arc<McpClient>, Vec<McpToolSpec>), String> {
+        self.disconnect(&cfg.name).await;
+        self.connect_server(cfg).await
+    }
+
     /// 重启单 server(断连 → 按配置重连重注册进 handler)
     ///
     /// 返回注册的工具数;连接失败时错误返回(状态面已落 failed)。
@@ -148,8 +161,7 @@ impl McpManager {
         cfg: &McpServerConfig,
         tool_handler: &mut crate::io_handlers::tool_handler::ToolHandler,
     ) -> Result<usize, String> {
-        self.disconnect(&cfg.name).await;
-        let (client, tools) = self.connect_server(cfg).await?;
+        let (client, tools) = self.reconnect(cfg).await?;
         register_client_tools(tool_handler, &cfg.name, &client, &tools, cfg.timeout_secs)
     }
 
@@ -249,6 +261,21 @@ impl McpManager {
             .insert(name, entry);
     }
 
+    /// 显式落 failed 状态(B16 PR-2:端点侧注册期失败——连接已成功但工具
+    /// 注册被拒/写锁竞争异常时,状态面回落 failed 供工作台可见)
+    pub fn mark_failed(&self, name: &str, error: &str) {
+        self.set_entry(
+            name.to_string(),
+            McpServerEntry {
+                status: McpServerStatus::Failed {
+                    error: error.to_string(),
+                },
+                client: None,
+                tools: Vec::new(),
+            },
+        );
+    }
+
     fn remove_entry(&self, name: &str) -> Option<McpServerEntry> {
         self.entries.lock().expect("mcp manager lock").remove(name)
     }
@@ -287,7 +314,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_and_register_all_skips_disabled() {
         let mgr = McpManager::new();
-        let mut broken = cfg("broken", "this-command-does-not-exist-xyz999");
+        let broken = cfg("broken", "this-command-does-not-exist-xyz999");
         let mut off = cfg("off", "whatever");
         off.disabled = true;
         let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
