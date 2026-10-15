@@ -249,9 +249,10 @@ export function gitIdentity() {
   return fetch('/api/git/identity', { headers: headers() }).then(unwrap);
 }
 
-/** B14 语义索引:符号名检索(PageRank 排序;q 必填,limit 缺省 20 封顶 100) */
-export function indexSearch(q, limit = 20) {
+/** B14 语义索引:检索(q 必填,limit 缺省 20 封顶 100;mode=lexical|semantic|hybrid,缺省 lexical;semantic 未启用降级响应带 semantic:"disabled" 标注) */
+export function indexSearch(q, limit = 20, mode = 'lexical') {
   const p = new URLSearchParams({ q, limit: String(limit) });
+  if (mode && mode !== 'lexical') p.set('mode', mode);
   return fetch(`/api/index/search?${p}`, { headers: headers() }).then(unwrap);
 }
 
