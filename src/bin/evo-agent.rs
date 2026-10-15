@@ -1999,6 +1999,21 @@ fn cmd_serve(
         state = state.with_mcp(mcp_manager.clone(), mcp_store.clone());
     }
 
+    // B23:MCP server 暴露面开关(工作台设置 mcpServer.enabled,缺省 false=
+    // /mcp 不挂载 404 fail-closed;开启后外部 MCP 客户端经 serve Bearer token
+    // 接入,工具面与 LLM 治理等价;重启 serve 生效)
+    {
+        let (merged, _) = state.workbench_settings().merged();
+        let mcp_server_enabled = merged
+            .get("mcpServer.enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if mcp_server_enabled {
+            eprintln!("[mcp] server surface enabled: /mcp exposed (governance-equivalent to LLM)");
+            state = state.with_mcp_server_enabled(true);
+        }
+    }
+
     // B14 语义索引:按 index.enabled 设置键决定是否启动(默认关,显式开启;
     // 重启生效——服务与 watcher 均 serve 生命周期一次性装配)
     {

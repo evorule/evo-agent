@@ -860,7 +860,7 @@ while True:
         use axum::extract::State;
         use axum::http::HeaderMap;
         use axum::response::IntoResponse;
-        use axum::routing::{delete, post};
+        use axum::routing::post;
         use std::sync::Arc;
 
         #[derive(Clone, Default)]

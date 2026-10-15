@@ -339,6 +339,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "mcpServer.enabled",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "把 serve 工具面以 MCP 协议暴露为 /mcp 端点（B23；缺省关闭=fail-closed。开启后外部 MCP 客户端可接入，工具面与 LLM 完全一致【治理等价】，审批链共用同一执行体；鉴权复用 serve Bearer token，重启 serve 生效）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "approval.mode.shellExec",
             kind: SettingType::Enum,
             default: json!("manual"),
@@ -887,7 +897,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 46); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger)
+        assert_eq!(settings.len(), 47); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
