@@ -73,12 +73,18 @@ use crate::api::agent_api::AgentApiState;
 ///
 /// - `token`:鉴权 token(auth 启用时必填)
 /// - `agent_type`:agent 类型(必填,对应 `agents/<name>.json`)
+/// - `workspace`:会话级工作区绝对路径(可选,C 批「会话级 workspace」)——
+///   在场时本轮连接的所有轮次以该路径为能力边界根(读写同域,与 REST 面
+///   `workspace` 请求字段同语义;声明优先,`--read-root` 不参与)。连接级
+///   意志:改工作区须重连生效(新建会话/换线连接即携带)。
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
     /// 鉴权 token(复用 G7 AuthConfig.validate)
     pub token: Option<String>,
     /// agent 类型,用于加载 AgentDefinition 并构造 AgentRunner
     pub agent_type: Option<String>,
+    /// 会话级工作区(可选,绝对路径;缺省=serve workdir 行为零变化)
+    pub workspace: Option<String>,
 }
 
 /// Client → Server 消息(snake_case `type` tag)
@@ -164,6 +170,15 @@ pub async fn ws_handler(
         }
     };
 
+    // 2.5 会话级工作区(可选):fail-visible——非绝对路径在升级期即拒(400),
+    // 不让坏值漏进轮次内才报错。校验通过后交给 construct_runner 逐轮应用。
+    if let Some(ws) = &query.workspace {
+        if !std::path::Path::new(ws).is_absolute() {
+            warn!(workspace = %ws, "G16: WS upgrade rejected — workspace must be an absolute path");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    }
+
     info!(
         session_id = %session_id,
         agent_type = %agent_type,
@@ -171,7 +186,7 @@ pub async fn ws_handler(
     );
 
     // 3. 升级 WebSocket,进入 handle_ws 双向循环
-    ws.on_upgrade(move |socket| handle_ws(socket, state, session_id, agent_type))
+    ws.on_upgrade(move |socket| handle_ws(socket, state, session_id, agent_type, query.workspace))
 }
 
 // =============================================================================
@@ -191,6 +206,7 @@ async fn handle_ws(
     state: AgentApiState,
     initial_session_id: String,
     agent_type: String,
+    workspace: Option<String>,
 ) {
     // 拆分 socket 为 sender(推事件给客户端)和 receiver(读客户端消息)
     let (mut sender, mut receiver) = socket.split();
@@ -252,7 +268,7 @@ async fn handle_ws(
                                     continue;
                                 }
                                 // 构造 fresh AgentRunner(run_streaming/run_continuation 消费 self)
-                                let runner = match construct_runner(&state, &agent_type).await {
+                                let runner = match construct_runner(&state, &agent_type, workspace.as_deref()).await {
                                     Some(r) => r,
                                     None => {
                                         let _ = send_ws_json(
@@ -390,7 +406,7 @@ async fn handle_ws(
                                 // 非空,恢复轮无新标题不抹既有标题。
                                 match current_session.clone() {
                                     Some(sid) => {
-                                        let runner = match construct_runner(&state, &agent_type).await {
+                                        let runner = match construct_runner(&state, &agent_type, workspace.as_deref()).await {
                                             Some(r) => r,
                                             None => {
                                                 let _ = send_ws_json(
@@ -713,8 +729,13 @@ pub(crate) fn build_approval_callback(
 /// best-effort:拉取失败只记 warn 不阻断(历史加载走会话状态接口,
 /// 不依赖本地同步结果)。
 ///
-/// 返回 `None` = agent_type 加载失败(404 等价)。
-async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<AgentRunner> {
+/// 返回 `None` = agent_type 加载失败(404 等价)或会话级工作区非法(升级期
+/// 已校验绝对路径,此处为纵深防御,正常不可达)。
+async fn construct_runner(
+    state: &AgentApiState,
+    agent_type: &str,
+    workspace: Option<&str>,
+) -> Option<AgentRunner> {
     let mut def = state.definitions().load(agent_type).ok()?;
     // 与 HTTP 端点同口径:general 定义未配置 memory 时注入最小持久记忆档
     if agent_type == "general"
@@ -722,6 +743,20 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
     {
         def.memory.memory_type = "persistent".to_string();
         def.memory.namespace = "general".to_string();
+    }
+    // C 批「会话级 workspace」:连接携带 ?workspace= → 请求级注入能力边界
+    // (与 REST 面 run_agent 同口径:声明态整份覆盖,读写同域 rooted 于
+    // workspace;声明优先,--read-root 不参与)。失败 fail-visible 拒构造。
+    if let Some(ws) = workspace {
+        if let Err(e) = crate::api::serve_tools::apply_workspace_boundary(&mut def, ws) {
+            error!(
+                agent_type = %agent_type,
+                workspace = %ws,
+                error = %e,
+                "ws session workspace invalid; rejecting runner construction"
+            );
+            return None;
+        }
     }
     // 与 HTTP 端点(run_agent / run_agent_stream)同口径:按 def.tools 白名单从
     // state.toolkit(union 30 工具)过滤出该 agent 可用工具,挂 runner 的 tool_handler。
@@ -751,8 +786,13 @@ async fn construct_runner(state: &AgentApiState, agent_type: &str) -> Option<Age
     // 也应基于过滤后的真实工具面)
     crate::api::serve_tools::restrict_tools_to_surface(&mut def.tools, &filtered);
     // M5-a:能力边界接线(同 HTTP 端点口径:声明重绑工具面 + 生效边界注入 runner)
-    let capability_boundary =
-        crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, state.workdir());
+    // B 批「读宽写窄」:读域根经 state 注入(--read-root),合成边界携带双域自报
+    let capability_boundary = crate::api::serve_tools::wire_capability_boundary_with_read_root(
+        &mut filtered,
+        &def,
+        state.workdir(),
+        state.read_root(),
+    );
     // skills 装配(C 形态):两源合并 —— definition 显式声明(最高优先,声明时刻=
     // 人工把关) + 两级目录注册项(经 REST 注册审批闸口 active + blake3 哈希钉死,
     // 失配自动降级)。声明解析失败/目录级失败/账本损坏 = 拒构造(fail-visible,

@@ -36,6 +36,34 @@
   let showHistory = $state(false);
   // 可恢复崩溃会话集合(扫尾端点投影;与历史索引交集后展示「恢复」入口)
   let resumableIds = $state(new Set());
+  // C 批「会话级 workspace」:当前工作区(连接级 ?workspace= 携带;
+  // localStorage 持久,改值在下次连接生效——新建会话/换线/重连)
+  let workspace = $state(localStorage.getItem('evo_workspace') || '');
+
+  /** 编辑会话工作区:prompt 输入绝对路径,空串清除。立即持久化;对当前
+   *  WS 连接不回溯生效(升级期已定型),提示条明示下次连接生效。 */
+  function editWorkspace() {
+    const next = prompt(
+      '会话工作区(绝对路径,agent 读写以此目录为边界):\n留空恢复缺省(serve workdir)',
+      workspace,
+    );
+    if (next === null) return; // 取消
+    const v = next.trim();
+    if (v && !/^[a-zA-Z]:[\\/]/.test(v) && !v.startsWith('\\\\') && !v.startsWith('/')) {
+      alert('需要绝对路径(如 D:\\projects\\demo)');
+      return;
+    }
+    workspace = v;
+    if (v) localStorage.setItem('evo_workspace', v);
+    else localStorage.removeItem('evo_workspace');
+  }
+
+  /** 工作区按钮显示名:末段路径(长路径收窄);缺省态显式标示 */
+  function workspaceLabel() {
+    if (!workspace) return '工作区:缺省';
+    const parts = workspace.split(/[\\/]/).filter(Boolean);
+    return `工作区:${parts[parts.length - 1] || workspace}`;
+  }
 
   onMount(() => {
     registerMentionProviders();
@@ -326,6 +354,12 @@
   <div class="chat-header">
     <span class="title">对话</span>
     <div class="header-actions">
+      <button
+        class="new-btn ws-btn"
+        class:active={!!workspace}
+        onclick={editWorkspace}
+        title={`会话工作区:${workspace || '缺省(serve workdir)'}\n点击编辑,下次连接(新建会话/换线)生效`}
+      >{workspaceLabel()}</button>
       <button class="new-btn" class:active={showHistory} onclick={toggleHistory} title="历史会话">历史</button>
       {#if $sessionId}
         <button class="new-btn" onclick={() => askResume()} title="恢复当前崩溃会话(加载历史并续完中断轮)">恢复</button>
@@ -573,6 +607,13 @@
   .new-btn.active {
     color: var(--brand);
     border-color: var(--brand);
+  }
+  /* 会话工作区按钮:缺省灰、在场品牌色;长目录名收窄省略 */
+  .ws-btn {
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .header-actions {
     display: flex;

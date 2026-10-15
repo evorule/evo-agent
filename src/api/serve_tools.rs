@@ -99,7 +99,20 @@ pub fn build_union_toolkit(
     ws: &WorkspaceApiClient,
     ev: &EvoruleApiClient,
 ) -> ToolHandler {
-    let mut handler = default_safe_toolkit(workdir);
+    build_union_toolkit_with_read_root(workdir, workdir, ws, ev)
+}
+
+/// 「读宽写窄」变体(B 批,serve `--read-root`):读面四工具
+/// (file_read/file_list/search_files/grep_files)相对 `read_root` 解析,
+/// 写面与其余工具相对 `workdir` 解析。两根同值时行为与
+/// [`build_union_toolkit`] 完全一致。
+pub fn build_union_toolkit_with_read_root(
+    workdir: &Path,
+    read_root: &Path,
+    ws: &WorkspaceApiClient,
+    ev: &EvoruleApiClient,
+) -> ToolHandler {
+    let mut handler = default_safe_toolkit(workdir, read_root);
     let rule_handler = full_rule_toolkit(ws, ev);
     // 合并规则工具到 handler(按白名单逐个取出,保证只注册已知工具;
     // manifest+执行器成对迁移,治理元数据不丢)
@@ -576,6 +589,18 @@ pub fn effective_capability_boundary(
     def: &crate::agent::definition::AgentDefinition,
     startup_workdir: &Path,
 ) -> crate::agent::definition::CapabilityBoundary {
+    effective_capability_boundary_with_read_root(def, startup_workdir, None)
+}
+
+/// 「读宽写窄」变体(B 批,serve `--read-root`):`read_root` 显式供给且异于
+/// 写域时,合成边界的 `read_root` 字段在场(awareness 双域自报)。显式声明
+/// `def.capability_boundary` 在场时整份以声明为准(单一事实源,--read-root
+/// 不覆盖声明;声明自带 read_root 字段能力)。
+pub fn effective_capability_boundary_with_read_root(
+    def: &crate::agent::definition::AgentDefinition,
+    startup_workdir: &Path,
+    read_root: Option<&Path>,
+) -> crate::agent::definition::CapabilityBoundary {
     use crate::agent::definition::{CapabilityBoundary, SANDBOX_CAPABLE_TOOLS};
     if let Some(b) = &def.capability_boundary {
         return b.clone();
@@ -602,18 +627,32 @@ pub fn effective_capability_boundary(
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
             .join(startup_workdir)
     }));
+    // 读域根:与写域同域时归一 None(awareness 保持 v1 单根文案,零变化);
+    // 规范化口径与 sandbox_root 一致(canonicalize + simplify_verbatim)
+    let read_root = read_root
+        .map(|r| simplify_verbatim(r.canonicalize().unwrap_or_else(|_| r.to_path_buf())))
+        .filter(|r| r != &sandbox_root);
     CapabilityBoundary {
         mode: mode.to_string(),
         sandbox_root,
+        read_root,
         tools: sandbox_tools,
     }
 }
 
 /// 按「显式声明」重建 file 类工具沙箱绑定(声明缺省 → no-op,union 实例
-/// 已绑定启动 workdir,单一事实源成立)
+/// 已绑定启动期根,单一事实源成立)
 ///
-/// 显式声明 = 唯一权威:`file_read` 按 `sandbox_root` 重建;`file_write` 在
-/// `read_write` 模式下按 `sandbox_root` 全域可写(writable_dir = ".")。
+/// 显式声明 = 唯一权威,**全族重绑**(C 批实测补齐:仅重绑 file_read 时,
+/// file_list/search_files/grep_files 仍持启动期 --read-root 绑定,会话级
+/// workspace 下列目录逃逸到读根——判据实测暴露,故读面四件+写面四件一并
+/// 按声明重建):
+/// - 读面(file_read/file_list/search_files/grep_files)绑「生效读域」
+///   (声明 read_root 在场且异于写域时绑读根,否则绑 sandbox_root——
+///   B 批「读宽写窄」)
+/// - 写面(file_write/file_create/file_move/file_delete)在 `read_write`
+///   模式下按 `sandbox_root` 全域可写(writable_dir = ".")
+///
 /// 声明合法性(模式/工具一致性)由 `AgentDefinition::validate` 门卫先行保证。
 pub fn apply_capability_boundary(
     handler: &mut ToolHandler,
@@ -623,21 +662,72 @@ pub fn apply_capability_boundary(
         return;
     };
     let root = b.sandbox_root.clone();
-    if b.tools.iter().any(|t| t == "file_read") {
+    let read_root = b.effective_read_root().clone();
+    let has = |t: &str| b.tools.iter().any(|x| x == t);
+    if has("file_read") {
         handler.register_static(
             "file_read",
             std::sync::Arc::new(crate::builtin_tools::file_read::FileReadTool::new(
-                root.clone(),
+                read_root.clone(),
             )),
         );
     }
-    if !b.is_read_only() && b.tools.iter().any(|t| t == "file_write") {
+    if has("file_list") {
         handler.register_static(
-            "file_write",
-            std::sync::Arc::new(
-                crate::builtin_tools::file_write::FileWriteTool::new(root).with_writable_dir("."),
-            ),
+            "file_list",
+            std::sync::Arc::new(crate::builtin_tools::file_list::FileListTool::new(
+                read_root.clone(),
+            )),
         );
+    }
+    if has("search_files") {
+        handler.register_static(
+            "search_files",
+            std::sync::Arc::new(crate::builtin_tools::search_files::SearchFilesTool::new(
+                read_root.clone(),
+            )),
+        );
+    }
+    if has("grep_files") {
+        handler.register_static(
+            "grep_files",
+            std::sync::Arc::new(crate::builtin_tools::grep_files::GrepFilesTool::new(
+                read_root,
+            )),
+        );
+    }
+    if !b.is_read_only() {
+        if has("file_write") {
+            handler.register_static(
+                "file_write",
+                std::sync::Arc::new(
+                    crate::builtin_tools::file_write::FileWriteTool::new(root.clone())
+                        .with_writable_dir("."),
+                ),
+            );
+        }
+        if has("file_create") {
+            handler.register_static(
+                "file_create",
+                std::sync::Arc::new(crate::builtin_tools::file_create::FileCreateTool::new(
+                    root.clone(),
+                )),
+            );
+        }
+        if has("file_move") {
+            handler.register_static(
+                "file_move",
+                std::sync::Arc::new(crate::builtin_tools::file_move::FileMoveTool::new(
+                    root.clone(),
+                )),
+            );
+        }
+        if has("file_delete") {
+            handler.register_static(
+                "file_delete",
+                std::sync::Arc::new(crate::builtin_tools::file_delete::FileDeleteTool::new(root)),
+            );
+        }
     }
 }
 
@@ -649,8 +739,20 @@ pub fn wire_capability_boundary(
     def: &crate::agent::definition::AgentDefinition,
     startup_workdir: &Path,
 ) -> crate::agent::definition::CapabilityBoundary {
+    wire_capability_boundary_with_read_root(handler, def, startup_workdir, None)
+}
+
+/// 「读宽写窄」变体(B 批,serve `--read-root`):读域根经 state 传入,合成
+/// 边界携带双域信息(awareness 自报);union toolkit 实例已在启动期按双根
+/// 绑定,此处合成仅产出 LLM 自报与状态面数据。
+pub fn wire_capability_boundary_with_read_root(
+    handler: &mut ToolHandler,
+    def: &crate::agent::definition::AgentDefinition,
+    startup_workdir: &Path,
+    read_root: Option<&Path>,
+) -> crate::agent::definition::CapabilityBoundary {
     let declared = def.capability_boundary.clone();
-    let effective = effective_capability_boundary(def, startup_workdir);
+    let effective = effective_capability_boundary_with_read_root(def, startup_workdir, read_root);
     apply_capability_boundary(handler, declared.as_ref());
     effective
 }
@@ -1587,6 +1689,7 @@ service_tools = ["config_persist", "rule_sandbox"]
         CapabilityBoundary {
             mode: mode.to_string(),
             sandbox_root: root,
+            read_root: None,
             tools: tools.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -1655,11 +1758,15 @@ service_tools = ["config_persist", "rule_sandbox"]
         );
         assert_eq!(eff.tools.len(), 2);
 
-        // 纯只读白名单 → read_only,tools 只含 file_read
+        // 纯只读白名单 → read_only,tools 含读面沙箱类全集
+        // (C 扩表后 file_list 属沙箱类——旧口径将其滤出边界,致声明重绑失靶)
         let def2 = make_def(&["file_read", "file_list", "knowledge_search"], None);
         let eff2 = effective_capability_boundary(&def2, Path::new("."));
         assert!(eff2.is_read_only());
-        assert_eq!(eff2.tools, vec!["file_read".to_string()]);
+        assert_eq!(
+            eff2.tools,
+            vec!["file_read".to_string(), "file_list".to_string()]
+        );
     }
 
     #[test]
@@ -1724,6 +1831,155 @@ service_tools = ["config_persist", "rule_sandbox"]
             "no-declaration must keep startup binding: {:?}",
             res.err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_wire_with_read_root_splits_read_write_domains() {
+        // B 批「读宽写窄」:--read-root 在场 → 合成边界携带读域(双域自报);
+        // 启动期 toolkit 双根绑定 → 读面四工具可读读根内文件,写面仍限 workdir
+        let startup = tempfile::tempdir().unwrap();
+        let readbase = tempfile::tempdir().unwrap();
+        let root = startup.path().canonicalize().unwrap();
+        let read_root = readbase.path().canonicalize().unwrap();
+        std::fs::write(read_root.join("external.txt"), b"external content").unwrap();
+        std::fs::create_dir_all(root.join("workspace")).unwrap();
+
+        let (ws, ev) = make_clients();
+        let mut handler = build_union_toolkit_with_read_root(&root, &read_root, &ws, &ev);
+        let def = make_def(&["file_read", "file_write"], None);
+        let eff =
+            wire_capability_boundary_with_read_root(&mut handler, &def, &root, Some(&read_root));
+
+        // 合成边界:写域=workdir、读域=read_root(双域在场)
+        assert_eq!(eff.sandbox_root, super::simplify_verbatim(root.clone()));
+        assert_eq!(
+            eff.read_root,
+            Some(super::simplify_verbatim(read_root.clone()))
+        );
+
+        // 读面:读根内文件相对路径可读(v1 下这会拒——读域拓宽生效)
+        let ok = handler
+            .execute_by_name("file_read", &serde_json::json!({"path": "external.txt"}))
+            .await;
+        assert!(
+            ok.is_ok(),
+            "read-root file must be readable: {:?}",
+            ok.err()
+        );
+
+        // 写面:仍限 workdir 的 writable_dir 白名单——写 workspace 内落 workdir,
+        // 不落读根(写边界未放宽)
+        let wr = handler
+            .execute_by_name(
+                "file_write",
+                &serde_json::json!({"path": "workspace/out.txt", "content": "x"}),
+            )
+            .await;
+        assert!(
+            wr.is_ok(),
+            "workspace write must stay allowed: {:?}",
+            wr.err()
+        );
+        assert!(
+            root.join("workspace/out.txt").exists(),
+            "written file must land under workdir, not read_root"
+        );
+        assert!(!read_root.join("workspace/out.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_wire_read_root_same_as_workdir_stays_none() {
+        // --read-root 与 workdir 同值 → 归一 None(awareness 保持 v1 单根文案)
+        let startup = tempfile::tempdir().unwrap();
+        let root = startup.path().canonicalize().unwrap();
+        let (ws, ev) = make_clients();
+        let mut handler = build_union_toolkit(&root, &ws, &ev);
+        let def = make_def(&["file_read"], None);
+        let eff = wire_capability_boundary_with_read_root(&mut handler, &def, &root, Some(&root));
+        assert_eq!(
+            eff.read_root, None,
+            "same-domain read_root must normalize to None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wire_declared_boundary_takes_precedence_over_read_root() {
+        // 显式声明在场 → 整份以声明为准(单一事实源),--read-root 不参与合成
+        let startup = tempfile::tempdir().unwrap();
+        let readbase = tempfile::tempdir().unwrap();
+        let root = startup.path().canonicalize().unwrap();
+        let read_root = readbase.path().canonicalize().unwrap();
+        let (ws, ev) = make_clients();
+        let mut handler = build_union_toolkit(&root, &ws, &ev);
+        let declared = make_boundary("read_only", root.clone(), &["file_read"]);
+        let def = make_def(&["file_read"], Some(declared));
+        let eff =
+            wire_capability_boundary_with_read_root(&mut handler, &def, &root, Some(&read_root));
+        assert_eq!(
+            eff.read_root, None,
+            "declared boundary without read_root must win over --read-root"
+        );
+        assert_eq!(eff.sandbox_root, root);
+    }
+
+    #[tokio::test]
+    async fn test_declared_workspace_rebinds_full_file_family() {
+        // C 批回归(实测暴露缺口):声明边界在场 → 读面四件+写面按声明根全族
+        // 重绑——仅重绑 file_read 时 file_list 仍持启动期 --read-root 绑定,
+        // 会话 workspace 下列目录逃逸到读根
+        let startup = tempfile::tempdir().unwrap();
+        let readbase = tempfile::tempdir().unwrap();
+        let wsbase = tempfile::tempdir().unwrap();
+        let root = startup.path().canonicalize().unwrap();
+        let read_root = readbase.path().canonicalize().unwrap();
+        let ws_root = wsbase.path().canonicalize().unwrap();
+        std::fs::write(read_root.join("outside.txt"), b"outside").unwrap();
+        std::fs::write(ws_root.join("inside.txt"), b"inside").unwrap();
+
+        let (ws, ev) = make_clients();
+        let mut handler = build_union_toolkit_with_read_root(&root, &read_root, &ws, &ev);
+        let mut def = make_def(&["file_read", "file_list", "file_write"], None);
+        // 生产同路径:请求级 workspace → 声明态注入(REST/WS 会话级同口径)
+        apply_workspace_boundary(&mut def, ws_root.to_str().unwrap()).unwrap();
+        let eff =
+            wire_capability_boundary_with_read_root(&mut handler, &def, &root, Some(&read_root));
+
+        // 生效边界:整域 = workspace(--read-root 不参与)
+        assert_eq!(eff.sandbox_root, super::simplify_verbatim(ws_root.clone()));
+        assert_eq!(eff.read_root, None);
+
+        // 读面:file_list "." 列 workspace(仅 inside.txt),不再逃逸到读根
+        let listing = handler
+            .execute_by_name("file_list", &serde_json::json!({"dir": "."}))
+            .await
+            .expect("file_list must succeed");
+        let s = format!("{listing:?}");
+        assert!(
+            s.contains("inside.txt"),
+            "file_list must see workspace content: {s}"
+        );
+        assert!(
+            !s.contains("outside.txt"),
+            "file_list must NOT see read-root content: {s}"
+        );
+
+        // file_read 越出 workspace(读根内文件)被拒
+        let denied = handler
+            .execute_by_name("file_read", &serde_json::json!({"path": "outside.txt"}))
+            .await;
+        assert!(denied.is_err(), "read outside workspace must be denied");
+
+        // 写面:file_write 按 workspace 域落盘,不落读根/启动 workdir
+        handler
+            .execute_by_name(
+                "file_write",
+                &serde_json::json!({"path": "created.txt", "content": "x"}),
+            )
+            .await
+            .expect("write inside workspace must succeed");
+        assert!(ws_root.join("created.txt").exists());
+        assert!(!read_root.join("created.txt").exists());
+        assert!(!root.join("created.txt").exists());
     }
 
     #[tokio::test]

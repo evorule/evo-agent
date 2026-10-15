@@ -250,8 +250,22 @@ pub struct OutputFormat {
 }
 
 /// 沙箱类工具清单:出现在顶层 `tools` 时,`capability_boundary.tools` 必须覆盖
-/// (单一事实源门卫的判定基准)
-pub const SANDBOX_CAPABLE_TOOLS: &[&str] = &["file_read", "file_write"];
+/// (单一事实源门卫的判定基准;边界合成同样按此表求交)
+///
+/// C 批实测补齐(2026-10-16):v1 仅含 file_read/file_write——会话级 workspace
+/// 声明在场时,合成边界把 file_list 等过滤在外,apply_capability_boundary 的
+/// 全族重绑失靶,读面工具仍持启动期 --read-root 绑定而列目录逃逸(serve 实测
+/// 判据暴露)。扩为读面四件+写面四件全族,声明门卫与合成口径同步收紧。
+pub const SANDBOX_CAPABLE_TOOLS: &[&str] = &[
+    "file_read",
+    "file_list",
+    "search_files",
+    "grep_files",
+    "file_write",
+    "file_create",
+    "file_move",
+    "file_delete",
+];
 
 /// 能力边界声明（M5-a 全局观机制,2026-09-25;agent_def v1.1 增量字段）
 ///
@@ -263,8 +277,15 @@ pub const SANDBOX_CAPABLE_TOOLS: &[&str] = &["file_read", "file_write"];
 pub struct CapabilityBoundary {
     /// 访问模式:"read_only"(只读) | "read_write"(沙箱根全域可读写)
     pub mode: String,
-    /// 沙箱根目录(绝对路径);file 类工具路径一律相对该根解析,越界即拒
+    /// 写域沙箱根目录(绝对路径);写面工具(file_write 族)路径相对该根解析,
+    /// 越界即拒。缺省合成时同时是读域根(读写同域)
     pub sandbox_root: PathBuf,
+    /// 读域根(可选,绝对路径):「读宽写窄」拆分(B 批,serve `--read-root`)时
+    /// 在场——读面工具(file_read/file_list/search_files/grep_files)路径相对
+    /// 该根解析,越界即拒。缺省(None)=读写同域(一律相对 sandbox_root 解析),
+    /// 行为与 v1 完全一致。显式声明 def.json 亦可携带(同受绝对路径门卫)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_root: Option<PathBuf>,
     /// 边界内工具清单(语义门卫:顶层 tools 中的沙箱类工具必须列于此;
     /// mode=read_only 时不得含 file_write)
     pub tools: Vec<String>,
@@ -276,16 +297,26 @@ impl CapabilityBoundary {
         self.mode == "read_only"
     }
 
+    /// 生效读域根:read_root 显式在场(且异于写域)时取之,否则回落写域根
+    pub fn effective_read_root(&self) -> &PathBuf {
+        match &self.read_root {
+            Some(r) if r != &self.sandbox_root => r,
+            _ => &self.sandbox_root,
+        }
+    }
+
     /// 序列化为会话事实形态(经 create_session initial_content 既有载体进链,
     /// 零新 Fact 类型)
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "capability_boundary": {
-                "mode": self.mode,
-                "sandbox_root": self.sandbox_root.display().to_string(),
-                "tools": self.tools,
-            }
-        })
+        let mut inner = serde_json::json!({
+            "mode": self.mode,
+            "sandbox_root": self.sandbox_root.display().to_string(),
+            "tools": self.tools,
+        });
+        if let Some(r) = &self.read_root {
+            inner["read_root"] = serde_json::Value::from(r.display().to_string());
+        }
+        serde_json::json!({ "capability_boundary": inner })
     }
 
     /// 系统级边界段文本(会话建立稳定位置追加到 system_prompt 尾部;
@@ -302,12 +333,34 @@ impl CapabilityBoundary {
         } else {
             "read_write(沙箱根全域可读写)"
         };
+        // 双域拆分(B 批「读宽写窄」):读域异于写域时逐族说明,LLM 精确自知
+        // 「哪里可读、哪里可写」;同域时逐字节保持 v1 单根文案(黄金样本锁定,
+        // 零变化)
+        let (root_desc, boundary_rule) = match &self.read_root {
+            Some(r) if r != &self.sandbox_root => (
+                format!(
+                    "- 可读根:{}(读面工具 file_read/file_list/search_files/grep_files \
+                     相对该根解析)\n- 可写域:{}(写面工具 file_write/file_create/file_move/\
+                     file_delete 相对该根解析)",
+                    r.display(),
+                    self.sandbox_root.display()
+                ),
+                "越出可读根或可写域的路径不可访问;尝试越界的操作会被拒绝并告知边界。",
+            ),
+            _ => (
+                format!(
+                    "- 沙箱根目录:{}(一切文件路径相对该根解析)",
+                    self.sandbox_root.display()
+                ),
+                "越出沙箱根的路径不可访问;尝试越界的操作会被拒绝并告知边界。",
+            ),
+        };
         format!(
             "【能力边界声明】\n\
              - 访问模式:{}\n\
-             - 沙箱根目录:{}(一切文件路径相对该根解析)\n\
+             {}\n\
              - 边界内工具:{}\n\
-             越出沙箱根的路径不可访问;尝试越界的操作会被拒绝并告知边界。\
+             {}\
              若任务需要边界外的资源,如实说明边界限制,不要猜测或编造。\n\n\
              【会话交接协议】\n\
              - 主动交接优于被动截断:窗口余量紧张(见 [context] 余量信号)或\
@@ -320,8 +373,9 @@ impl CapabilityBoundary {
              再继续任务;跳过读档直接开工,审计面可见。\n\
              - 交接不是失败:任务半程主动交接是长程一致性的正规手段。",
             mode_desc,
-            self.sandbox_root.display(),
-            self.tools.join(", ")
+            root_desc,
+            self.tools.join(", "),
+            boundary_rule
         )
     }
 }
@@ -680,6 +734,21 @@ impl AgentDefinition {
                     "capability_boundary.sandbox_root '{}' must be an absolute path",
                     b.sandbox_root.display()
                 )));
+            }
+            // 读域根(B 批「读宽写窄」):在场时同受绝对路径门卫(路径语义与
+            // sandbox_root 一致,防相对路径歧义)
+            if let Some(r) = &b.read_root {
+                if r.as_os_str().is_empty() {
+                    return Err(AgentDefinitionError::InvalidDefinition(
+                        "capability_boundary.read_root must not be empty".to_string(),
+                    ));
+                }
+                if !r.is_absolute() {
+                    return Err(AgentDefinitionError::InvalidDefinition(format!(
+                        "capability_boundary.read_root '{}' must be an absolute path",
+                        r.display()
+                    )));
+                }
             }
             // 单一事实源:顶层 tools 中的沙箱类工具必须被声明覆盖
             // (否则该工具沙箱绑定启动配置、声明形同虚设 → 双源漂移)
@@ -2211,6 +2280,7 @@ mod tests {
             capability_boundary: Some(CapabilityBoundary {
                 mode: mode.to_string(),
                 sandbox_root: PathBuf::from(root),
+                read_root: None,
                 tools: btools.into_iter().map(String::from).collect(),
             }),
             approval_mode: None,
@@ -2267,6 +2337,7 @@ mod tests {
         let b = CapabilityBoundary {
             mode: "read_only".to_string(),
             sandbox_root: PathBuf::from("D:/evo-agent"),
+            read_root: None,
             tools: vec!["file_read".to_string()],
         };
         // 会话事实形态:包裹键 capability_boundary(server initial_content 载体)
@@ -2284,6 +2355,91 @@ mod tests {
         assert!(seg.contains("session_spawn"));
         assert!(seg.contains("踩坑清单"));
         assert!(seg.contains("续接判据"));
+    }
+
+    // ===== B 批「读宽写窄」:CapabilityBoundary.read_root 双域语义 =====
+
+    #[test]
+    fn test_capability_boundary_read_root_json_and_awareness() {
+        let b = CapabilityBoundary {
+            mode: "read_write".to_string(),
+            sandbox_root: PathBuf::from("D:/evo-agent"),
+            read_root: Some(PathBuf::from("D:/")),
+            tools: vec!["file_read".to_string(), "file_write".to_string()],
+        };
+        // to_json:read_root 在场即输出(状态面透明)
+        let j = b.to_json();
+        assert_eq!(j["capability_boundary"]["read_root"], "D:/");
+        // 双域自报:读域异于写域 → 逐族说明
+        let seg = b.awareness_segment();
+        assert!(seg.contains("可读根:D:/"));
+        assert!(seg.contains("可写域:D:/evo-agent"));
+        // effective_read_root:异域时取读根
+        assert_eq!(b.effective_read_root(), &PathBuf::from("D:/"));
+    }
+
+    #[test]
+    fn test_capability_boundary_same_domain_read_root_stays_single_root() {
+        // read_root 与写域同值(或等价情形) → awareness 保持 v1 单根文案,
+        // effective_read_root 回落写域
+        let b = CapabilityBoundary {
+            mode: "read_write".to_string(),
+            sandbox_root: PathBuf::from("D:/evo-agent"),
+            read_root: Some(PathBuf::from("D:/evo-agent")),
+            tools: vec!["file_read".to_string(), "file_write".to_string()],
+        };
+        let seg = b.awareness_segment();
+        assert!(!seg.contains("可读根"));
+        assert!(seg.contains("沙箱根目录:D:/evo-agent"));
+        assert_eq!(b.effective_read_root(), &PathBuf::from("D:/evo-agent"));
+    }
+
+    #[test]
+    fn test_capability_boundary_read_root_serde_roundtrip() {
+        // serde 往返:read_root 在场序列化不丢,缺省(旧 def)装载为 None
+        // (向后兼容:v1 声明零变化)
+        let with_rr = CapabilityBoundary {
+            mode: "read_write".to_string(),
+            sandbox_root: PathBuf::from("D:/evo-agent"),
+            read_root: Some(PathBuf::from("D:/")),
+            tools: vec!["file_read".to_string()],
+        };
+        let s = serde_json::to_string(&with_rr).unwrap();
+        let back: CapabilityBoundary = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.read_root, Some(PathBuf::from("D:/")));
+
+        let legacy = r#"{
+            "mode": "read_write",
+            "sandbox_root": "D:/evo-agent",
+            "tools": ["file_read"]
+        }"#;
+        let back: CapabilityBoundary = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.read_root, None, "legacy def must load as None");
+    }
+
+    #[test]
+    fn test_capability_boundary_read_root_relative_path_rejected() {
+        // 门卫:read_root 在场时同受绝对路径校验(相对路径加载期即拒)
+        let json = r#"{
+            "agent_type": "tester",
+            "version": "1.0.0",
+            "description": "",
+            "system_prompt": "",
+            "model": "m",
+            "temperature": 0.5,
+            "max_steps": 10,
+            "step_timeout_secs": 30,
+            "tools": ["file_read"],
+            "capability_boundary": {
+                "mode": "read_only",
+                "sandbox_root": "D:/evo-agent",
+                "read_root": "relative/dir",
+                "tools": ["file_read"]
+            }
+        }"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse ok");
+        let err = def.validate().expect_err("relative read_root must fail");
+        assert!(err.to_string().contains("read_root"), "{err}");
     }
 
     // ===== G13: max_parallel_tools 测试 =====

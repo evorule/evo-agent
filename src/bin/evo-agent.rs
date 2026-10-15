@@ -151,6 +151,14 @@ enum Command {
         /// G7:禁用鉴权(覆盖配置文件的 enabled=true)
         #[arg(long)]
         no_auth: bool,
+
+        /// B 批「读宽写窄」:读域根(可选,绝对路径)——读面工具
+        /// (file_read/file_list/search_files/grep_files)相对该根解析,
+        /// 写面(file_write 族)仍限 workdir;缺省=读写同域(行为不变)。
+        /// LLM 由此可读 workdir 之外的工作资产(如整个盘的仓/知识库),
+        /// 写边界不放宽
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        read_root: Option<PathBuf>,
     },
 
     /// 进化巡视任务模式(一次性):信号探查 → 有信号则 agent 起草+提名 →
@@ -346,7 +354,15 @@ fn main() -> ExitCode {
             port,
             auth_token,
             no_auth,
-        } => cmd_serve(&cli.workdir, &host, port, &auth_token, no_auth),
+            read_root,
+        } => cmd_serve(
+            &cli.workdir,
+            &host,
+            port,
+            &auth_token,
+            no_auth,
+            read_root.as_deref(),
+        ),
         Command::Patrol {
             session,
             workspace,
@@ -1703,6 +1719,7 @@ fn cmd_serve(
     port: u16,
     auth_tokens: &[String],
     no_auth: bool,
+    read_root: Option<&Path>,
 ) -> ExitCode {
     use evo_agent::api::agent_api;
     use evo_agent::api::auth::{AuthConfig, AuthPosture};
@@ -1875,9 +1892,28 @@ fn cmd_serve(
 
     let evorule_client = evorule_client_from(&config);
     // E1:构造 workspace_client + union toolkit(启动时一次组装 26 个工具)
+    // B 批「读宽写窄」:--read-root 在场时读面四工具绑读根(写面仍限 workdir);
+    // canonicalize 失败(目录不存在)fail-visible 拒启——读根无效等效配置错误
+    let read_root_buf = match read_root {
+        Some(r) => match r.canonicalize() {
+            Ok(canonical) => {
+                eprintln!(
+                    "[serve] read-root: {}(读宽写窄:读面四工具绑此根,写面仍限 workdir)",
+                    canonical.display()
+                );
+                Some(canonical)
+            }
+            Err(e) => {
+                eprintln!("[serve] --read-root '{}' invalid: {e}", r.display());
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
     let workspace_client = std::sync::Arc::new(WorkspaceApiClient::new(evorule_client.base_url()));
-    let mut toolkit = evo_agent::api::serve_tools::build_union_toolkit(
+    let mut toolkit = evo_agent::api::serve_tools::build_union_toolkit_with_read_root(
         workdir,
+        read_root_buf.as_deref().unwrap_or(workdir),
         &workspace_client,
         &evorule_client,
     );
@@ -1994,6 +2030,11 @@ fn cmd_serve(
     // serve 面各请求路径的 handler 构造与 CLI 共用同一解析产物,
     // 不再绕过配置体系直读裸环境变量
     .with_llm_config(config.llm.clone());
+    // B 批「读宽写窄」:注入读域根(--read-root;None=读写同域零变化)——
+    // 会话期 wire 面消费此值合成边界自报(工具绑定已在启动期 toolkit 完成)
+    if let Some(rr) = read_root_buf {
+        state = state.with_read_root(rr);
+    }
     // B16:MCP 管理器+配置存储成对注入(mcp_enabled 时;None = /api/mcp/* 503)
     if mcp_enabled {
         state = state.with_mcp(mcp_manager.clone(), mcp_store.clone());
