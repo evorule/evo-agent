@@ -208,7 +208,7 @@ async fn gov_scope(client: &EvoruleApiClient, args: &Value) -> Result<Value, Str
     }))
 }
 
-/// scope=shared：共享账本面查询（get_shared_facts prefix 透传；/// b——/mcp 面事件轨道 `shared.mcp.events.EL-*` 的 agent 只读检索入口）。
+/// scope=shared：共享账本面查询（get_shared_facts prefix 透传；/mcp 面事件轨道 `shared.mcp.events.EL-*` 的 agent 只读检索入口）。
 /// 输出口径与 gov events 视图同构：fact_id 降序（新在前）+ limit 截取。
 async fn shared_scope(client: &EvoruleApiClient, args: &Value) -> Result<Value, String> {
     let prefix = args

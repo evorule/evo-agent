@@ -87,6 +87,37 @@ describe('serversToPayload(视图 → PUT 载荷)', () => {
       always_allow: [],
     });
   });
+
+  it('stdio 条目不携带传输字段(省略=服务端按 stdio)', () => {
+    const p = serversToPayload([{ name: 'x', command: 'echo' }]);
+    expect('transport' in p[0]).toBe(false);
+    expect('url' in p[0]).toBe(false);
+    expect('headers' in p[0]).toBe(false);
+  });
+
+  it('远程传输条目携带 transport/url/headers(卡片启停不再退化为 stdio 被拒)', () => {
+    const p = serversToPayload([
+      {
+        name: 'remote',
+        transport: 'streamable_http',
+        url: 'https://example.com/mcp',
+        headers: { Authorization: '${MCP_TOKEN}' },
+        disabled: false,
+      },
+    ]);
+    expect(p[0]).toMatchObject({
+      name: 'remote',
+      transport: 'streamable_http',
+      url: 'https://example.com/mcp',
+      headers: { Authorization: '${MCP_TOKEN}' },
+    });
+  });
+
+  it('远程传输缺省 url/headers 补空值(url 空串由服务端校验拦)', () => {
+    const p = serversToPayload([{ name: 'r2', transport: 'streamable_http' }]);
+    expect(p[0].url).toBe('');
+    expect(p[0].headers).toEqual({});
+  });
 });
 
 describe('编辑器往返(serversToText / parseServersText)', () => {
