@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! O-491 J-d E2E:definition 级 http_get active host 声明——真实公网验证
+//! E2E:definition 级 http_get active host 声明——真实公网验证
 //!
 //! 题塞形态 agent 定义(声明 example.com 为额外 active host)走完整装配,
 //! 然后以真实公网请求验证三面:
@@ -11,9 +11,9 @@
 //!
 //! 注:LLM 决策由直接工具调用代替(判分环境无 LLM 端点);工具执行、
 //! 网络请求、装配校验全部真实。声明重绑段的语义与
-//! `AgentRunner::from_definition`(runner.rs O-491 段)逐行同款。
+//! `AgentRunner::from_definition`(runner.rs 对应实现段)逐行同款。
 //!
-//! 运行:`cargo run --example o491_http_allowed_hosts_e2e`(需外网可达)
+//! 运行:`cargo run --example http_allowed_hosts_e2e`(需外网可达)
 
 use std::path::Path;
 
@@ -62,7 +62,7 @@ async fn main() {
         .expect("from_definition must succeed with declared hosts");
     println!("[2] from_definition assembly OK (declaration rebind path exercised)");
 
-    // 3. 行为验证:与 from_definition O-491 段逐行同款的重绑(实调面)
+    // 3. 行为验证:与 from_definition 对应实现段逐行同款的重绑(实调面)
     let bound = rebind_like_from_definition(default_safe_toolkit(workdir, Path::new(".")));
 
     // 3a. 声明 host:直接执行(无审批提案),真实 HTTP 200
@@ -107,12 +107,12 @@ async fn main() {
     assert!(err.contains("BLOCKED"), "got: {err}");
     println!("[3c] blocklisted IP declared -> still BLOCKED (safety line held)");
 
-    println!("\n=== O-491 J-d E2E PASS ===");
+    println!("\n=== E2E PASS ===");
     println!("  declared hosts execute directly on the real network;");
     println!("  undeclared stay candidate; blocklist never upgraded.");
 }
 
-/// 与 AgentRunner::from_definition O-491 段逐行同款的重绑
+/// 与 AgentRunner::from_definition 对应实现段逐行同款的重绑
 /// (声明 → 同名覆盖注册;register_static 为 insert 语义)
 fn rebind_like_from_definition(mut handler: ToolHandler) -> ToolHandler {
     let hosts = Some(vec!["example.com".to_string(), "www.iana.org".to_string()]);

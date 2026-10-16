@@ -249,386 +249,386 @@ async fn handle_ws(
 
     loop {
         tokio::select! {
-            // ===== 读客户端消息(始终轮询) =====
-            msg = receiver.next() => {
-                match msg {
-                    Some(Ok(WsMessage::Text(text))) => {
-                        match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(ClientMessage::Message { content }) => {
-                                if turn_active {
-                                    if let Err(e) = send_ws_json(
-                                        &mut sender,
-                                        serde_json::json!({
-                                            "type": "Error",
-                                            "error": "a turn is already active; send interrupt first"
-                                        }),
-                                    ).await {
-                                        debug!(error = %e, "ws send Error(turn_active) failed; client likely disconnected");
-                                    }
-                                    continue;
-                                }
-                                // 构造 fresh AgentRunner(run_streaming/run_continuation 消费 self)
-                                let runner = match construct_runner(&state, &agent_type, workspace.as_deref()).await {
-                                    Some(r) => r,
-                                    None => {
-                                        let _ = send_ws_json(
-                                            &mut sender,
-                                            serde_json::json!({
-                                                "type": "Error",
-                                                "error": format!("agent '{}' not found", agent_type)
-                                            }),
-                                        ).await;
-                                        continue;
-                                    }
-                                };
-                                // 提取 cancel token(interrupt 用)
-                                let cancel = runner.cancel_token().clone();
-                                current_cancel = Some(cancel);
-                                turn_active = true;
-                                // 会话索引:记录标题来源(首轮用户消息)
-                                pending_title = Some(content.clone());
-                                // 会话索引:新轮次重置成功标志
-                                turn_succeeded = false;
+                   // ===== 读客户端消息(始终轮询) =====
+                   msg = receiver.next() => {
+                       match msg {
+                           Some(Ok(WsMessage::Text(text))) => {
+                               match serde_json::from_str::<ClientMessage>(&text) {
+                                   Ok(ClientMessage::Message { content }) => {
+                                       if turn_active {
+                                           if let Err(e) = send_ws_json(
+                                               &mut sender,
+                                               serde_json::json!({
+                                                   "type": "Error",
+                                                   "error": "a turn is already active; send interrupt first"
+                                               }),
+                                           ).await {
+                                               debug!(error = %e, "ws send Error(turn_active) failed; client likely disconnected");
+                                           }
+                                           continue;
+                                       }
+                                       // 构造 fresh AgentRunner(run_streaming/run_continuation 消费 self)
+                                       let runner = match construct_runner(&state, &agent_type, workspace.as_deref()).await {
+                                           Some(r) => r,
+                                           None => {
+                                               let _ = send_ws_json(
+                                                   &mut sender,
+                                                   serde_json::json!({
+                                                       "type": "Error",
+                                                       "error": format!("agent '{}' not found", agent_type)
+                                                   }),
+                                               ).await;
+                                               continue;
+                                           }
+                                       };
+                                       // 提取 cancel token(interrupt 用)
+                                       let cancel = runner.cancel_token().clone();
+                                       current_cancel = Some(cancel);
+                                       turn_active = true;
+                                       // 会话索引:记录标题来源(首轮用户消息)
+                                       pending_title = Some(content.clone());
+                                       // 会话索引:新轮次重置成功标志
+                                       turn_succeeded = false;
 
-                                // 首轮(无 session)→ run_streaming(创建 session)
-                                // 后续(有 session)→ run_continuation(复用 session)
-                                let event_stream = if let Some(sid) = current_session.clone() {
-                                    info!(session_id = %sid, "G16: continuation turn");
-                                    runner.run_continuation(sid, content)
-                                } else {
-                                    info!("G16: first turn (new session)");
-                                    runner.run_streaming(content)
-                                };
+                                       // 首轮(无 session)→ run_streaming(创建 session)
+                                       // 后续(有 session)→ run_continuation(复用 session)
+                                       let event_stream = if let Some(sid) = current_session.clone() {
+                                           info!(session_id = %sid, "G16: continuation turn");
+                                           runner.run_continuation(sid, content)
+                                       } else {
+                                           info!("G16: first turn (new session)");
+                                           runner.run_streaming(content)
+                                       };
 
-                                // spawn task:把事件流转发到 channel
-                                let tx = event_tx.clone();
-                                tokio::spawn(async move {
-                                    let mut stream = event_stream;
-                                    while let Some(ev) = stream.next().await {
-                                        if tx.send(WsEvent::Agent(ev)).await.is_err() {
-                                            // 主循环已退出(receiver drop),停止转发
-                                            return;
-                                        }
-                                    }
-                                    // 事件流结束 → 发 TurnEnd 信号
-                                    if let Err(e) = tx.send(WsEvent::TurnEnd).await {
-                                        debug!(error = %e, "TurnEnd send failed; main ws loop already exited");
-                                    }
-                                });
-                            }
-                            Ok(ClientMessage::Interrupt) => {
-                                if let Some(cancel) = &current_cancel {
-                                    cancel.cancel();
-                                    info!("G16: interrupt sent to current turn");
-                                    let _ = send_ws_json(
-                                        &mut sender,
-                                        serde_json::json!({
-                                            "type": "Info",
-                                            "message": "interrupt sent"
-                                        }),
-                                    ).await;
-                                } else {
-                                    let _ = send_ws_json(
-                                        &mut sender,
-                                        serde_json::json!({
-                                            "type": "Info",
-                                            "message": "no active turn to interrupt"
-                                        }),
-                                    ).await;
-                                }
-                            }
-                            Ok(ClientMessage::Rewind { version }) => {
-                                if turn_active {
-                                    let _ = send_ws_json(
-                                        &mut sender,
-                                        serde_json::json!({
-                                            "type": "Error",
-                                            "error": "cannot rewind during active turn; send interrupt first"
-                                        }),
-                                    ).await;
-                                } else if let Some(sid) = &current_session {
-                                    info!(session_id = %sid, version = version, "G16: rewind");
-                                    match state.evorule_client().rewind(sid, version).await {
-                                        Ok(reply) => {
-                                            // 透传服务端回执的实际回退版本(缺省回落到请求版本)
-                                            let actual = reply["actual_version"]
-                                                .as_u64()
-                                                .unwrap_or(version);
-                                            let _ = send_ws_json(
-                                                &mut sender,
-                                                serde_json::json!({
-                                                    "type": "Info",
-                                                    "message": format!("rewound to version {}", actual),
-                                                    "requested_version": version,
-                                                    "actual_version": actual,
-                                                }),
-                                            ).await;
-                                        }
-                                        Err(e) => {
-                                            warn!(error = %e, "G16: rewind failed");
-                                            let _ = send_ws_json(
-                                                &mut sender,
-                                                serde_json::json!({
-                                                    "type": "Error",
-                                                    "error": format!("rewind failed: {}", e)
-                                                }),
-                                            ).await;
-                                        }
-                                    }
-                                } else {
-                                    let _ = send_ws_json(
-                                        &mut sender,
-                                        serde_json::json!({
-                                            "type": "Error",
-                                            "error": "no session to rewind"
-                                        }),
-                                    ).await;
-                                }
-                            }
-                            Ok(ClientMessage::Resume) => {
-                                if turn_active {
-                                    if let Err(e) = send_ws_json(
-                                        &mut sender,
-                                        serde_json::json!({
-                                            "type": "Error",
-                                            "error": "a turn is already active; send interrupt first"
-                                        }),
-                                    ).await {
-                                        debug!(error = %e, "ws send Error(turn_active) failed; client likely disconnected");
-                                    }
-                                    continue;
-                                }
-                                // 崩溃恢复(无新输入):与 react 面 resume_session_id
-                                // 同一 resume_crashed 管线。会话索引口径与 continuation
-                                // 一致——恢复路径不发 SessionCreated(既有会话),不手置
-                                // session_established,Done success 才落索引:恢复失败
-                                //(如引擎侧无状态)不产生幽灵条目;索引合并 title 取首个
-                                // 非空,恢复轮无新标题不抹既有标题。
-                                match current_session.clone() {
-                                    Some(sid) => {
-                                        let runner = match construct_runner(&state, &agent_type, workspace.as_deref()).await {
-                                            Some(r) => r,
-                                            None => {
-                                                let _ = send_ws_json(
-                                                    &mut sender,
-                                                    serde_json::json!({
-                                                        "type": "Error",
-                                                        "error": format!("agent '{}' not found", agent_type)
-                                                    }),
-                                                ).await;
-                                                continue;
-                                            }
-                                        };
-                                        let cancel = runner.cancel_token().clone();
-                                        current_cancel = Some(cancel);
-                                        turn_active = true;
-                                        turn_succeeded = false;
-                                        info!(session_id = %sid, "G16: crash-resume turn");
-                                        let event_stream = runner.resume_crashed(sid);
-                                        let tx = event_tx.clone();
-                                        tokio::spawn(async move {
-                                            let mut stream = event_stream;
-                                            while let Some(ev) = stream.next().await {
-                                                if tx.send(WsEvent::Agent(ev)).await.is_err() {
-                                                    // 主循环已退出(receiver drop),停止转发
-                                                    return;
-                                                }
-                                            }
-                                            // 事件流结束 → 发 TurnEnd 信号
-                                            if let Err(e) = tx.send(WsEvent::TurnEnd).await {
-                                                debug!(error = %e, "TurnEnd send failed; main ws loop already exited");
-                                            }
-                                        });
-                                    }
-                                    None => {
-                                        let _ = send_ws_json(
-                                            &mut sender,
-                                            serde_json::json!({
-                                                "type": "Error",
-                                                "error": "no session to resume; connect with a session id first"
-                                            }),
-                                        ).await;
-                                    }
-                                }
-                            }
-                            Ok(ClientMessage::S4Publish { path }) => {
-                                // B22:定稿通知入 gov 账本(best-effort,不回帧不打断
-                                // WS 流;gov 写入走 serve 内部通道不经审批卡——
-                                // 写入动作本身即 Fact,23 号档 §四.3)
-                                // session 未建立("new" 连接尚未 SessionCreated)时
-                                // 无主会话可归属,按 best-effort 丢弃
-                                if let Some(sid) = current_session.as_deref() {
-                                    crate::governance::hooks::s4_publish(sid, &path);
-                                }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, raw = %text, "G16: invalid client message");
-                                let _ = send_ws_json(
-                                    &mut sender,
-                                    serde_json::json!({
-                                        "type": "Error",
-                                        "error": format!("invalid message: {}", e)
-                                    }),
-                                ).await;
-                            }
-                        }
-                    }
-                    Some(Ok(WsMessage::Binary(_))) => {
-                        warn!("G16: received binary WS message, ignoring");
-                    }
-                    Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {
-                        // axum 自动响应 Ping,无需手动处理
-                    }
-                    Some(Ok(WsMessage::Close(_))) => {
-                        info!("G16: client sent Close frame");
-                        break;
-                    }
-                    Some(Err(e)) => {
-                        warn!(error = %e, "G16: WS receive error");
-                        break;
-                    }
-                    None => {
-                        info!("G16: WS receiver stream ended");
-                        break;
-                    }
-                }
-            }
-            // ===== 转发 Agent 事件给客户端 =====
-            event = event_rx.recv() => {
-                match event {
-                    Some(WsEvent::Agent(result)) => {
-                        // 跟踪 session_id(首轮 run_streaming 会产出 SessionCreated)
-                        match &result {
-                            Ok(AgentEvent::SessionCreated { session_id: sid, .. }) => {
-                                current_session = Some(sid.clone());
-                                session_established = true;
-                                info!(session_id = %sid, "G16: session created");
-                                // 会话索引:新会话落一行(fail-soft,仅展示辅助)
-                                state.session_index().record(
-                                    &crate::api::session_index::SessionIndexEntry {
-                                        session_id: sid.clone(),
-                                        agent_type: agent_type.clone(),
-                                        created_at: crate::api::session_index::unix_now(),
-                                        last_active: crate::api::session_index::unix_now(),
-                                        title: pending_title
-                                            .as_deref()
-                                            .unwrap_or("")
-                                            .chars()
-                                            .take(60)
-                                            .collect(),
-                                    },
-                                );
-                            }
-                            Ok(AgentEvent::Done(r)) => turn_succeeded = r.success,
-                            // 流级错误 / Error 事件 = 本轮失败(不落索引)
-                            Ok(AgentEvent::Error(_)) | Err(_) => turn_succeeded = false,
-                            _ => {}
-                        }
-                        // 序列化 + 推给客户端
-                        let mut json = agent_event_to_json(result.clone());
-                        // 每轮权威校正(2026-10-03): Done 回执附服务端 Fact 版本
-                        // (actual_version,与 rewind 回执同口径)——console 侧每轮据此
-                        // 同步本地指针,版本漂移窗口清零。查询失败回落=不带字段
-                        // (客户端容错保留旧指针,fail-soft)。
-                        if json["type"] == "Done" {
-                            if let Some(sid) = &current_session {
-                                match crate::agent::runner::session_version(
-                                    state.evorule_client(),
-                                    sid,
-                                )
-                                .await
-                                {
-                                    Ok(ver) => {
-                                        json["actual_version"] = serde_json::json!(ver);
-                                    }
-                                    Err(e) => {
-                                        debug!(error = %e, session_id = %sid, "session_version query failed; Done frame without actual_version");
-                                    }
-                                }
-                            }
-                        }
-                        if send_ws_json(&mut sender, json).await.is_err() {
-                            warn!("G16: failed to send WS frame, client may have disconnected");
-                            break;
-                        }
-                    }
-                    Some(WsEvent::TurnEnd) => {
-                        // 当前轮次的事件流耗尽 → 清理状态
-                        turn_active = false;
-                        current_cancel = None;
-                        info!("G16: turn ended");
-                        // 会话索引:续用会话(重连恢复/多轮)无 SessionCreated 事件,
-                        // 以 TurnEnd 补记录刷新 last_active(读时去重合并)。
-                        // 仅当会话真实建立过或本轮成功时落记录 — 防幽灵条目:
-                        // localStorage 残留不存在的 session id 时 run_continuation
-                        // 失败,失败 turn 不写入索引
-                        if let Some(sid) = &current_session {
-                            if session_established || turn_succeeded {
-                                state.session_index().record(
-                                    &crate::api::session_index::SessionIndexEntry {
-                                        session_id: sid.clone(),
-                                        agent_type: agent_type.clone(),
-                                        created_at: crate::api::session_index::unix_now(),
-                                        last_active: crate::api::session_index::unix_now(),
-                                        title: String::new(),
-                                    },
-                                );
-                                // 同批落本地消息快照(与 transcript 端点同一
-                                // load_transcript 投影路径,保证同源同构)。fail-soft:
-                                // 快照是展示辅助(服务会话 TTL 回收后的历史可见),
-                                // 失败只 warn 不阻断会话流程。
-                                let ns = crate::api::agent_api::resolve_memory_namespace(
-                                    &state,
-                                    &agent_type,
-                                );
-                                match crate::api::snapshots::capture_from_engine(
-                                    state.evorule_client(),
-                                    state.snapshots(),
-                                    sid,
-                                    &agent_type,
-                                    &ns,
-                                )
-                                .await
-                                {
-                                    Ok(p) => debug!(path = %p.display(), "snapshot saved"),
-                                    Err(e) => warn!(
-                                        error = %e,
-                                        session_id = %sid,
-                                        "snapshot save failed (fail-soft)"
-                                    ),
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        // event_tx 全部 drop(不应发生 — 主循环持有 event_tx)
-                        // 视为连接异常,退出
-                        warn!("G16: event channel closed unexpectedly");
-                        break;
-                    }
-                }
-            }
-            // ===== 转发文件系统事件批量给客户端(工作台文件树实时刷新) =====
-            fs_batch = fs_rx.recv() => {
-                match fs_batch {
-                    Ok(batch) => {
-                        let json = serde_json::json!({ "type": "fs_events", "events": &*batch });
-                        if send_ws_json(&mut sender, json).await.is_err() {
-                            warn!("G16: failed to send fs_events frame, client may have disconnected");
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        // 设计取舍:不补发——跳过落后量,前端手动刷新兜底
-                        debug!(skipped = n, "G16: fs_events lagged; skipping missed batches");
-                    }
-                    Err(_) => {
-                        // hub 关闭 = serve 正在关闭;正常退出连接
-                        break;
-                    }
-                }
-            }
-        }
+                                       // spawn task:把事件流转发到 channel
+                                       let tx = event_tx.clone();
+                                       tokio::spawn(async move {
+                                           let mut stream = event_stream;
+                                           while let Some(ev) = stream.next().await {
+                                               if tx.send(WsEvent::Agent(ev)).await.is_err() {
+                                                   // 主循环已退出(receiver drop),停止转发
+                                                   return;
+                                               }
+                                           }
+                                           // 事件流结束 → 发 TurnEnd 信号
+                                           if let Err(e) = tx.send(WsEvent::TurnEnd).await {
+                                               debug!(error = %e, "TurnEnd send failed; main ws loop already exited");
+                                           }
+                                       });
+                                   }
+                                   Ok(ClientMessage::Interrupt) => {
+                                       if let Some(cancel) = &current_cancel {
+                                           cancel.cancel();
+                                           info!("G16: interrupt sent to current turn");
+                                           let _ = send_ws_json(
+                                               &mut sender,
+                                               serde_json::json!({
+                                                   "type": "Info",
+                                                   "message": "interrupt sent"
+                                               }),
+                                           ).await;
+                                       } else {
+                                           let _ = send_ws_json(
+                                               &mut sender,
+                                               serde_json::json!({
+                                                   "type": "Info",
+                                                   "message": "no active turn to interrupt"
+                                               }),
+                                           ).await;
+                                       }
+                                   }
+                                   Ok(ClientMessage::Rewind { version }) => {
+                                       if turn_active {
+                                           let _ = send_ws_json(
+                                               &mut sender,
+                                               serde_json::json!({
+                                                   "type": "Error",
+                                                   "error": "cannot rewind during active turn; send interrupt first"
+                                               }),
+                                           ).await;
+                                       } else if let Some(sid) = &current_session {
+                                           info!(session_id = %sid, version = version, "G16: rewind");
+                                           match state.evorule_client().rewind(sid, version).await {
+                                               Ok(reply) => {
+                                                   // 透传服务端回执的实际回退版本(缺省回落到请求版本)
+                                                   let actual = reply["actual_version"]
+                                                       .as_u64()
+                                                       .unwrap_or(version);
+                                                   let _ = send_ws_json(
+                                                       &mut sender,
+                                                       serde_json::json!({
+                                                           "type": "Info",
+                                                           "message": format!("rewound to version {}", actual),
+                                                           "requested_version": version,
+                                                           "actual_version": actual,
+                                                       }),
+                                                   ).await;
+                                               }
+                                               Err(e) => {
+                                                   warn!(error = %e, "G16: rewind failed");
+                                                   let _ = send_ws_json(
+                                                       &mut sender,
+                                                       serde_json::json!({
+                                                           "type": "Error",
+                                                           "error": format!("rewind failed: {}", e)
+                                                       }),
+                                                   ).await;
+                                               }
+                                           }
+                                       } else {
+                                           let _ = send_ws_json(
+                                               &mut sender,
+                                               serde_json::json!({
+                                                   "type": "Error",
+                                                   "error": "no session to rewind"
+                                               }),
+                                           ).await;
+                                       }
+                                   }
+                                   Ok(ClientMessage::Resume) => {
+                                       if turn_active {
+                                           if let Err(e) = send_ws_json(
+                                               &mut sender,
+                                               serde_json::json!({
+                                                   "type": "Error",
+                                                   "error": "a turn is already active; send interrupt first"
+                                               }),
+                                           ).await {
+                                               debug!(error = %e, "ws send Error(turn_active) failed; client likely disconnected");
+                                           }
+                                           continue;
+                                       }
+                                       // 崩溃恢复(无新输入):与 react 面 resume_session_id
+                                       // 同一 resume_crashed 管线。会话索引口径与 continuation
+                                       // 一致——恢复路径不发 SessionCreated(既有会话),不手置
+                                       // session_established,Done success 才落索引:恢复失败
+                                       //(如引擎侧无状态)不产生幽灵条目;索引合并 title 取首个
+                                       // 非空,恢复轮无新标题不抹既有标题。
+                                       match current_session.clone() {
+                                           Some(sid) => {
+                                               let runner = match construct_runner(&state, &agent_type, workspace.as_deref()).await {
+                                                   Some(r) => r,
+                                                   None => {
+                                                       let _ = send_ws_json(
+                                                           &mut sender,
+                                                           serde_json::json!({
+                                                               "type": "Error",
+                                                               "error": format!("agent '{}' not found", agent_type)
+                                                           }),
+                                                       ).await;
+                                                       continue;
+                                                   }
+                                               };
+                                               let cancel = runner.cancel_token().clone();
+                                               current_cancel = Some(cancel);
+                                               turn_active = true;
+                                               turn_succeeded = false;
+                                               info!(session_id = %sid, "G16: crash-resume turn");
+                                               let event_stream = runner.resume_crashed(sid);
+                                               let tx = event_tx.clone();
+                                               tokio::spawn(async move {
+                                                   let mut stream = event_stream;
+                                                   while let Some(ev) = stream.next().await {
+                                                       if tx.send(WsEvent::Agent(ev)).await.is_err() {
+                                                           // 主循环已退出(receiver drop),停止转发
+                                                           return;
+                                                       }
+                                                   }
+                                                   // 事件流结束 → 发 TurnEnd 信号
+                                                   if let Err(e) = tx.send(WsEvent::TurnEnd).await {
+                                                       debug!(error = %e, "TurnEnd send failed; main ws loop already exited");
+                                                   }
+                                               });
+                                           }
+                                           None => {
+                                               let _ = send_ws_json(
+                                                   &mut sender,
+                                                   serde_json::json!({
+                                                       "type": "Error",
+                                                       "error": "no session to resume; connect with a session id first"
+                                                   }),
+                                               ).await;
+                                           }
+                                       }
+                                   }
+                                   Ok(ClientMessage::S4Publish { path }) => {
+                                       // B22:定稿通知入 gov 账本(best-effort,不回帧不打断
+                                       // WS 流;gov 写入走 serve 内部通道不经审批卡——
+        // 写入动作本身即 Fact,§四.3)
+                                       // session 未建立("new" 连接尚未 SessionCreated)时
+                                       // 无主会话可归属,按 best-effort 丢弃
+                                       if let Some(sid) = current_session.as_deref() {
+                                           crate::governance::hooks::s4_publish(sid, &path);
+                                       }
+                                   }
+                                   Err(e) => {
+                                       warn!(error = %e, raw = %text, "G16: invalid client message");
+                                       let _ = send_ws_json(
+                                           &mut sender,
+                                           serde_json::json!({
+                                               "type": "Error",
+                                               "error": format!("invalid message: {}", e)
+                                           }),
+                                       ).await;
+                                   }
+                               }
+                           }
+                           Some(Ok(WsMessage::Binary(_))) => {
+                               warn!("G16: received binary WS message, ignoring");
+                           }
+                           Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {
+                               // axum 自动响应 Ping,无需手动处理
+                           }
+                           Some(Ok(WsMessage::Close(_))) => {
+                               info!("G16: client sent Close frame");
+                               break;
+                           }
+                           Some(Err(e)) => {
+                               warn!(error = %e, "G16: WS receive error");
+                               break;
+                           }
+                           None => {
+                               info!("G16: WS receiver stream ended");
+                               break;
+                           }
+                       }
+                   }
+                   // ===== 转发 Agent 事件给客户端 =====
+                   event = event_rx.recv() => {
+                       match event {
+                           Some(WsEvent::Agent(result)) => {
+                               // 跟踪 session_id(首轮 run_streaming 会产出 SessionCreated)
+                               match &result {
+                                   Ok(AgentEvent::SessionCreated { session_id: sid, .. }) => {
+                                       current_session = Some(sid.clone());
+                                       session_established = true;
+                                       info!(session_id = %sid, "G16: session created");
+                                       // 会话索引:新会话落一行(fail-soft,仅展示辅助)
+                                       state.session_index().record(
+                                           &crate::api::session_index::SessionIndexEntry {
+                                               session_id: sid.clone(),
+                                               agent_type: agent_type.clone(),
+                                               created_at: crate::api::session_index::unix_now(),
+                                               last_active: crate::api::session_index::unix_now(),
+                                               title: pending_title
+                                                   .as_deref()
+                                                   .unwrap_or("")
+                                                   .chars()
+                                                   .take(60)
+                                                   .collect(),
+                                           },
+                                       );
+                                   }
+                                   Ok(AgentEvent::Done(r)) => turn_succeeded = r.success,
+                                   // 流级错误 / Error 事件 = 本轮失败(不落索引)
+                                   Ok(AgentEvent::Error(_)) | Err(_) => turn_succeeded = false,
+                                   _ => {}
+                               }
+                               // 序列化 + 推给客户端
+                               let mut json = agent_event_to_json(result.clone());
+                               // 每轮权威校正(2026-10-03): Done 回执附服务端 Fact 版本
+                               // (actual_version,与 rewind 回执同口径)——console 侧每轮据此
+                               // 同步本地指针,版本漂移窗口清零。查询失败回落=不带字段
+                               // (客户端容错保留旧指针,fail-soft)。
+                               if json["type"] == "Done" {
+                                   if let Some(sid) = &current_session {
+                                       match crate::agent::runner::session_version(
+                                           state.evorule_client(),
+                                           sid,
+                                       )
+                                       .await
+                                       {
+                                           Ok(ver) => {
+                                               json["actual_version"] = serde_json::json!(ver);
+                                           }
+                                           Err(e) => {
+                                               debug!(error = %e, session_id = %sid, "session_version query failed; Done frame without actual_version");
+                                           }
+                                       }
+                                   }
+                               }
+                               if send_ws_json(&mut sender, json).await.is_err() {
+                                   warn!("G16: failed to send WS frame, client may have disconnected");
+                                   break;
+                               }
+                           }
+                           Some(WsEvent::TurnEnd) => {
+                               // 当前轮次的事件流耗尽 → 清理状态
+                               turn_active = false;
+                               current_cancel = None;
+                               info!("G16: turn ended");
+                               // 会话索引:续用会话(重连恢复/多轮)无 SessionCreated 事件,
+                               // 以 TurnEnd 补记录刷新 last_active(读时去重合并)。
+                               // 仅当会话真实建立过或本轮成功时落记录 — 防幽灵条目:
+                               // localStorage 残留不存在的 session id 时 run_continuation
+                               // 失败,失败 turn 不写入索引
+                               if let Some(sid) = &current_session {
+                                   if session_established || turn_succeeded {
+                                       state.session_index().record(
+                                           &crate::api::session_index::SessionIndexEntry {
+                                               session_id: sid.clone(),
+                                               agent_type: agent_type.clone(),
+                                               created_at: crate::api::session_index::unix_now(),
+                                               last_active: crate::api::session_index::unix_now(),
+                                               title: String::new(),
+                                           },
+                                       );
+                                       // 同批落本地消息快照(与 transcript 端点同一
+                                       // load_transcript 投影路径,保证同源同构)。fail-soft:
+                                       // 快照是展示辅助(服务会话 TTL 回收后的历史可见),
+                                       // 失败只 warn 不阻断会话流程。
+                                       let ns = crate::api::agent_api::resolve_memory_namespace(
+                                           &state,
+                                           &agent_type,
+                                       );
+                                       match crate::api::snapshots::capture_from_engine(
+                                           state.evorule_client(),
+                                           state.snapshots(),
+                                           sid,
+                                           &agent_type,
+                                           &ns,
+                                       )
+                                       .await
+                                       {
+                                           Ok(p) => debug!(path = %p.display(), "snapshot saved"),
+                                           Err(e) => warn!(
+                                               error = %e,
+                                               session_id = %sid,
+                                               "snapshot save failed (fail-soft)"
+                                           ),
+                                       }
+                                   }
+                               }
+                           }
+                           None => {
+                               // event_tx 全部 drop(不应发生 — 主循环持有 event_tx)
+                               // 视为连接异常,退出
+                               warn!("G16: event channel closed unexpectedly");
+                               break;
+                           }
+                       }
+                   }
+                   // ===== 转发文件系统事件批量给客户端(工作台文件树实时刷新) =====
+                   fs_batch = fs_rx.recv() => {
+                       match fs_batch {
+                           Ok(batch) => {
+                               let json = serde_json::json!({ "type": "fs_events", "events": &*batch });
+                               if send_ws_json(&mut sender, json).await.is_err() {
+                                   warn!("G16: failed to send fs_events frame, client may have disconnected");
+                                   break;
+                               }
+                           }
+                           Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                               // 设计取舍:不补发——跳过落后量,前端手动刷新兜底
+                               debug!(skipped = n, "G16: fs_events lagged; skipping missed batches");
+                           }
+                           Err(_) => {
+                               // hub 关闭 = serve 正在关闭;正常退出连接
+                               break;
+                           }
+                       }
+                   }
+               }
     }
 
     // 清理:cancel 任何仍在执行的轮次
@@ -653,7 +653,7 @@ async fn handle_ws(
 /// - 其余（manual/缺省）:HttpApproval（现状行为零变化）
 ///
 /// 返回 `(决策端, Runaway 护栏策略)`:policy 模式加载成功时同时产出
-/// [`RunawayPolicy`]（18 号 PR-3 护栏注入面——计数阈值+复述条件清单复用
+/// [`RunawayPolicy`]（护栏注入面——计数阈值+复述条件清单复用
 /// 同一份加载结果）；其余模式护栏为 None（不启用，行为零变化）。
 ///
 /// crate 内共享：WS 面（construct_runner）与 HTTP 面（run_agent /
@@ -710,7 +710,7 @@ pub(crate) fn build_approval_callback(
         }
     }
     // B22:manual 档审批卡接治理留痕装饰器(approval_requested/resolved 入
-    // gov 账本;auto_policy 判定式无人工卡不接——高频排除,23 号档风险#2)
+    // gov 账本;auto_policy 判定式无人工卡不接——高频排除)
     (
         Arc::new(crate::governance::GovAuditedApproval::new(Arc::new(
             crate::agent::approval::HttpApproval::new(state.pending_approvals().clone()),
@@ -837,7 +837,7 @@ async fn construct_runner(
     let governance_segment =
         crate::api::serve_tools::build_governance_segment(state.evorule_client(), &def.tools).await;
     let config = def.to_agent_config();
-    // G8 审批决策端 + 18 号 PR-3 Runaway 护栏:同一次 mode 判别/文件加载
+    // G8 审批决策端 + Runaway 护栏:同一次 mode 判别/文件加载
     // 双产出(决策端挂 ApprovalCallback,护栏策略挂 with_runaway_policy)
     let (approval_callback, runaway_policy) =
         build_approval_callback(state, def.approval_mode.as_deref());
@@ -852,7 +852,7 @@ async fn construct_runner(
         // 判定不可信一律降级人工;条件文件加载失败 fail-visible 降 HttpApproval);
         // 其余(manual/缺省)=HttpApproval 60s 人工审批窗(现状行为)
         .with_approval_callback(approval_callback)
-        // 18 号 PR-3:注入 Runaway 护栏(policy 档;None=不启用行为零变化)
+        // 注入 Runaway 护栏(policy 档;None=不启用行为零变化)
         // ——200 次连续自动操作上限+修订④复述注入,跨重启计数回填
         .with_runaway_policy(runaway_policy)
         // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
@@ -926,7 +926,7 @@ async fn construct_runner(
         runner = runner
             .with_memory_event_store(event_store)
             .with_event_ledger(std::sync::Arc::new(ledger));
-        // O-481:sediment 管线装配(单一实现,与 from_definition 同口径)——
+        // sediment 管线装配(单一实现,与 from_definition 同口径)——
         // serve 流面此前零装配,sediment 以 Default 跑(namespace="default"
         // 错域/llm_model_id="unknown"),知识提取/巩固/摘要全跳。收编方法
         // 覆盖 extractor/recipe 穿线/sediment_config/自省工具/验收命令/

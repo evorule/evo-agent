@@ -3,7 +3,7 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! B16 PR-2:MCP 配置存储(`<workdir>/.evo/mcp.toml`)
 //!
-//! ## 职责(16 号档 §3.2 配置面;C-1a 裁定:独立 mcp.toml)
+//! ## 职责(配置面;C-1a 裁定:独立 mcp.toml)
 //!
 //! - **load**:`.evo/mcp.toml` 存在则优先(单一事实源),不存在回落
 //!   `evo-agent.toml [mcp]` 段(启动时注入的 fallback 快照)——用户从

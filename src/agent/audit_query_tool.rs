@@ -3,13 +3,13 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! 审计查询工具（audit_query）——治理留痕与会话审计的 agent 只读入口。
 //!
-//! 四 scope（23 号设计 §3.2 + O-482 子裁定 b）：
+//! 四 scope：
 //! - `gov`：读共享账本治理分区 `shared.gov.`（B22-A 治理留痕，GovLedger
 //!   写入的六类事件 Fact）。`precedent=true` 时输出**先例卡**——同类工具+
-//!   参数摘要+当时批准者+档位+时间，18 号 policy 档「会话内批准先例参照」
-//!   的机制载体（18 号修订① 落地）。
+//! 参数摘要+当时批准者+档位+时间（会话内批准先例参照）
+//! 的机制载体。
 //! - `shared`：读共享账本任意前缀（get_shared_facts prefix 透传）——含
-//!   O-482 /mcp 面事件轨道 `shared.mcp.events.EL-*` 的 agent 只读检索入口。
+//! /mcp 面事件轨道 `shared.mcp.events.EL-*` 的 agent 只读检索入口。
 //! - `session`：读当前/指定会话 Fact 列表（get_facts）；`fact_id` 给出时
 //!   回溯因果链（get_causal_chain_typed）；`verify=true` 时跑链完整性验证
 //!   （verify_audit_typed）。
@@ -208,8 +208,7 @@ async fn gov_scope(client: &EvoruleApiClient, args: &Value) -> Result<Value, Str
     }))
 }
 
-/// scope=shared：共享账本面查询（get_shared_facts prefix 透传；O-482 子裁定
-/// b——/mcp 面事件轨道 `shared.mcp.events.EL-*` 的 agent 只读检索入口）。
+/// scope=shared：共享账本面查询（get_shared_facts prefix 透传；/// b——/mcp 面事件轨道 `shared.mcp.events.EL-*` 的 agent 只读检索入口）。
 /// 输出口径与 gov events 视图同构：fact_id 降序（新在前）+ limit 截取。
 async fn shared_scope(client: &EvoruleApiClient, args: &Value) -> Result<Value, String> {
     let prefix = args
@@ -508,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shared_scope_dispatch_and_validation() {
-        // O-482 子裁定 b：scope=shared 分派 + limit 校验前置（不触网即拒）
+        // scope=shared 分派 + limit 校验前置（不触网即拒）
         let client = crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:1");
         let err = audit_query_exec("s1", &client, None, &json!({"scope": "shared", "limit": 0}))
             .await

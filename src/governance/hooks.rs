@@ -1,4 +1,4 @@
-//! 六类事件源接线点（B22 A 项 PR2，23 号档 §3.1 事件类型清单）
+//! 六类事件源接线点（事件类型清单）
 //!
 //! 每类事件源一个 `gov_*` 薄钩子：构造摘要级 [`GovDraft`] 并 fire-and-forget
 //! 写入 gov 账本——进程未初始化 GovLedger（CLI 面/单测进程）时 no-op，
@@ -7,12 +7,12 @@
 //! | kind | 事件源 | 接线点 |
 //! |---|---|---|
 //! | `approval_requested` / `approval_resolved` | G8 审批卡（人工窗） | [`GovAuditedApproval`] 装饰器——build_approval_callback 手工档与 policy 降级路 |
-//! | `policy_verdict` | 18 号 policy 三态判定 | approval_policy.rs 判定输出点（步骤 6 留痕处） |
+//! | `policy_verdict` | policy 三态判定 | approval_policy.rs 判定输出点（步骤 6 留痕处） |
 //! | `s4_publish` | S4 产物定稿 | WS `ClientMessage::S4Publish`（前端 markFinalized 首次定稿产物时经信号桥发帧） |
-//! | `terminal_session_create` / `terminal_session_close` | PTY 会话生命周期 | pty_api.rs 创建/收尾（record-only 治理分级，09 号 §四） |
+//! | `terminal_session_create` / `terminal_session_close` | PTY 会话生命周期 | pty_api.rs 创建/收尾（record-only 治理分级） |
 //! | `b21_journal_milestone` | B21 journal 里程碑 | journal.rs resumed/compaction 落账点（镜像，refs 互指） |
 //!
-//! 高频事件不收录（23 号档风险#2）：`auto_policy` 判定式决策端逐工具调用
+//! 高频事件不收录：`auto_policy` 判定式决策端逐工具调用
 //! 触发、不产生审批卡，不接 approval_* 钩子（其判定全文已走 auto_policy
 //! 理由必产留痕，治理真相面由 policy_verdict 与审批卡事件承载）。
 
@@ -123,7 +123,7 @@ pub(crate) fn policy_verdict_draft(
         }
     );
     if summary.len() > SUMMARY_MAX_CHARS {
-        // 判定依据摘要级（18 号 §五持久化镜像），超限截断
+        // 判定依据摘要级（持久化镜像），超限截断
         summary = clamp_summary(summary);
     }
     GovDraft {
@@ -203,7 +203,7 @@ pub fn approval_resolved(req: &ApprovalRequest, decision: &ApprovalDecision) {
     fire(approval_resolved_draft(req, decision));
 }
 
-/// policy 三态判定（18 号 §五判定依据摘要的持久化镜像）
+/// policy 三态判定（判定依据摘要的持久化镜像）
 pub fn policy_verdict(
     req: &ApprovalRequest,
     verdict: &str,
@@ -223,7 +223,7 @@ pub fn s4_publish(session_id: &str, path: &str) {
     fire(s4_publish_draft(session_id, path));
 }
 
-/// terminal PTY 会话生命周期（record-only，09 号 §四）
+/// terminal PTY 会话生命周期（record-only）
 pub fn terminal_session(term_id: &str, action: TerminalAction, detail: &str) {
     fire(terminal_session_draft(term_id, action, detail));
 }

@@ -9,7 +9,7 @@
 //!
 //! 调用约定：批量接口（一次调用喂多文本，输出顺序与输入一一对应）；调用方
 //! 在专用阻塞线程执行（CPU 密集，不占 tokio worker——与 tree-sitter 解析同款
-//! 纪律）。治理面（15 号 §四）：本地模型零外发；模型下载属一次性显式触发
+//! 纪律）。治理面：本地模型零外发；模型下载属一次性显式触发
 //! 外发（首次启用语义面时明示大小与来源），实现方承载该明示义务。
 
 use std::path::PathBuf;
@@ -39,7 +39,7 @@ pub fn default_model_dir() -> Result<PathBuf, IndexError> {
     Ok(PathBuf::from(home).join(".evo-agent").join("models"))
 }
 
-/// fastembed 本地嵌入器（15 号决策点 1 裁决实现：all-MiniLM-L6-v2 q8）
+/// fastembed 本地嵌入器（裁决实现：all-MiniLM-L6-v2 q8）
 ///
 /// - 模型加载即 [`TextEmbedding::try_new`]：首次启用触发一次性显式下载
 ///   （HuggingFace CDN，进度明示；`HF_ENDPOINT` 可指镜像，`HF_HOME` 优先）；

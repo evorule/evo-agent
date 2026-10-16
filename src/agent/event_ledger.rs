@@ -2,7 +2,7 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! B22-C 事件型记忆轨道（23 号档 §3.3）——四触发点结构化事件写入
+//! 事件型记忆轨道——四触发点结构化事件写入
 //!
 //! 会话过程中的四类结构化事件（工具完成/轮里程碑/审批决定/会话终态）
 //! 以 [`MemoryEvent`] 形式落链：
@@ -15,7 +15,7 @@
 //! 结果不写引擎 Fact、无 FactId 锚，前序事件锚点使 `fact_to_event` 命中、
 //! effects 反向链真实成立；轨道首事件为根（cause=None）。
 //!
-//! 配额/开关（23 号档风险 6 处置）：每轮工具事件最多
+//! 配额/开关：每轮工具事件最多
 //! [`DEFAULT_TURN_QUOTA`] 条（超限丢弃 + 每轮一次 warn 留痕，里程碑重置）；
 //! 进程级开关 [`event_ledger_enabled`]（serve 启动期自 settings
 //! `agentTools.eventLedger` 安装，CLI 不 init 缺省开）。
@@ -32,13 +32,13 @@ use crate::api::evorule_client::EvoruleApiClient;
 
 use super::memory::{MemoryError, MemoryManager, MemoryScope, PersistOutcome};
 
-/// 每轮工具事件配额（23 号档风险 6：默认 5；definition 可配与同 kind 聚合 v1 顺延）
+/// 每轮工具事件配额（默认 5；definition 可配与同 kind 聚合 v1 顺延）
 pub const DEFAULT_TURN_QUOTA: usize = 5;
 
 /// 轮里程碑间隔（首轮 + 每 N 轮 checkpoint）
 pub const MILESTONE_EVERY_TURNS: u64 = 10;
 
-/// O-482:/mcp 面合成治理会话状态文件名（{workdir}/data/ 下；本地持久化
+/// /mcp 面合成治理会话状态文件名（{workdir}/data/ 下；本地持久化
 /// 数字会话 id——server 不支持指定会话名，幂等开具靠此文件）
 pub const GOV_SESSION_STATE_FILE: &str = "mcp_gov_session.json";
 
@@ -66,7 +66,7 @@ fn event_id(seq: u64) -> String {
     format!("EL-{seq:06}")
 }
 
-// ===== O-482:/mcp 面合成治理会话（开具/复用/自愈） =====
+// ===== /mcp 面合成治理会话（开具/复用/自愈） =====
 
 /// 读取合成治理会话状态文件（无/损坏/空 id → None，fail-soft）
 fn read_gov_session_state(path: &Path) -> Option<String> {
@@ -218,14 +218,14 @@ pub(crate) fn build_session_end_event(seq: u64, turns: u64, ts: u64) -> MemoryEv
 struct LedgerInner {
     store: MemoryEventStore,
     memory: MemoryManager,
-    /// O-482:自愈重开具用 client（与 store/memory 同源副本）
+    /// 自愈重开具用 client（与 store/memory 同源副本）
     client: EvoruleApiClient,
     seq: u64,
     /// 轨道内前序事件 FactId（cause 单链锚；仅真实 FactId>0 时推进）
     prev_fact: Option<FactId>,
     turn_written: usize,
     turn_warned: bool,
-    /// O-482:开具/注入待办（写入失败传感器置位；下一次 persist 前置重开具重注入）
+    /// 开具/注入待办（写入失败传感器置位；下一次 persist 前置重开具重注入）
     needs_ensure: bool,
 }
 
@@ -235,7 +235,7 @@ impl LedgerInner {
         self.seq
     }
 
-    /// O-482 J-b 链续接：回读账面末端事件（复用活会话且进程内链为空时）——
+    /// 回读账面末端事件（复用活会话且进程内链为空时）——
     /// EL 序号续编 + prev_fact 接锚旧链末端 + store 种子回填（effects 反向
     /// 链维护不缺位）。新会话账面为空 → 返回 None 保持根。
     async fn fetch_chain_tail(&mut self, sid: &str) -> Option<(u64, FactId)> {
@@ -262,7 +262,7 @@ impl LedgerInner {
         Some((seq, tail.id))
     }
 
-    /// O-482:合成治理会话开具/复用并注入（needs_ensure 消费者；gov 路径
+    /// 合成治理会话开具/复用并注入（needs_ensure 消费者；gov 路径
     /// 未装 = v1 语义 no-op）。探活复用（get_session_metadata Ok）→ 注入；
     /// 404 判死 → 重开具 + 原子写回 → 注入新会话（cause 链锚重置：旧
     /// FactId 属旧会话，跨会话 cause 无效）；其余错误 fail-soft 维持现状，
@@ -315,7 +315,7 @@ impl LedgerInner {
     /// 落链：证据链面（根/cause 链）+ 共享消费面（sediment 双写同款）；
     /// 全程 best-effort，失败 warn 留痕不阻断
     async fn persist(&mut self, event: MemoryEvent, gov_path: Option<&PathBuf>) {
-        // O-482 自愈前置：待开具时先重开具重注入（session 在手 fast path
+        // 自愈前置：待开具时先重开具重注入（session 在手 fast path
         // 零探活直落；未装 gov 路径 = v1 语义 no-op）
         if self.needs_ensure {
             self.ensure_gov_session(gov_path).await;
@@ -336,7 +336,7 @@ impl LedgerInner {
                 }
             },
         };
-        // O-482 自愈传感器：证据链面未落（session 未设静默 / HTTP 失败 /
+        // 自愈传感器：证据链面未落（session 未设静默 / HTTP 失败 /
         // 404 类）→ 待重开具；本轮事件照旧 best-effort 不阻断
         if fact_id == 0 {
             self.needs_ensure = true;
@@ -351,12 +351,12 @@ impl LedgerInner {
                     .await
                 {
                     Ok(PersistOutcome::Persisted { .. }) => {}
-                    // O-482 自愈传感器：session 在手但 HTTP 失败（404 类/瞬时）
+                    // 自愈传感器：session 在手但 HTTP 失败（404 类/瞬时）
                     Ok(PersistOutcome::CacheOnly) => {
                         self.needs_ensure = true;
                         tracing::warn!(event_id = %event.event_id, "event ledger: shared-face dual write CacheOnly; gov session re-ensure armed");
                     }
-                    // O-482 自愈传感器：session 未设（注入前/失效后）
+                    // 自愈传感器：session 未设（注入前/失效后）
                     Err(e) => {
                         if matches!(e, MemoryError::SessionNotSet) {
                             self.needs_ensure = true;
@@ -379,7 +379,7 @@ impl LedgerInner {
 /// B22-C 事件型记忆轨道——四触发点写入入口（runner 持有 [`Arc`]，&self 可用）
 pub struct EventLedger {
     inner: Mutex<LedgerInner>,
-    /// O-482:合成治理会话状态文件（serve 启动期安装一次；未装 = v1 语义）
+    /// 合成治理会话状态文件（serve 启动期安装一次；未装 = v1 语义）
     gov_session_path: OnceLock<PathBuf>,
 }
 
@@ -409,13 +409,13 @@ impl EventLedger {
         }
     }
 
-    /// O-482:安装合成治理会话状态文件路径（serve 启动期一次；first-wins）。
+    /// 安装合成治理会话状态文件路径（serve 启动期一次；first-wins）。
     /// 安装后 persist 自愈通道生效（开具/复用/注入）；未安装 = v1 语义。
     pub fn set_gov_session_path(&self, path: PathBuf) {
         let _ = self.gov_session_path.set(path);
     }
 
-    /// O-482:合成治理会话开具/复用并注入（serve 启动期一次；fail-soft——
+    /// 合成治理会话开具/复用并注入（serve 启动期一次；fail-soft——
     /// 失败仅 warn，事件轨道维持 v1 CacheOnly，后续写入经自愈路径补开具）
     pub async fn ensure_gov_session_now(&self) {
         let mut g = self.inner.lock().await;

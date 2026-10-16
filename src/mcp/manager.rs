@@ -8,7 +8,7 @@
 //! 过高)——本管理器持有每 server 的连接与工具清单,并把工具注册进 serve
 //! union toolkit,是 B16 工作台面(配置/状态/重启)的运行态基座。
 //!
-//! ## 连接态模型(16 号档 §3.2)
+//! ## 连接态模型
 //!
 //! `starting → connected | failed{error}`;restart = 断连(close,kill 子
 //! 进程)后按同一配置重连重注册。失败隔离(D10):单 server 失败只落状态,
@@ -28,7 +28,7 @@ use super::client::{McpClient, McpToolSpec};
 use super::tool_adapter::register_client_tools;
 use super::transport::{McpTransport, StdioTransport, StreamableHttpTransport};
 
-/// 单 server 连接态(16 号档 §3.2 三态)
+/// 单 server 连接态(三态)
 #[derive(Debug, Clone, PartialEq)]
 pub enum McpServerStatus {
     /// 连接中(异步连接尚未落定)

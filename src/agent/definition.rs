@@ -592,7 +592,7 @@ pub struct AgentDefinition {
     ///   serve 侧独占读取,加载失败同样 fail-visible 降级 manual
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
-    /// http_get 额外 active host 白名单(可选;O-491 ALE 参赛增量)
+    /// http_get 额外 active host 白名单(可选)
     ///
     /// - 声明 host(域名形态)内 http_get 直接执行(active,无审批开销),
     ///   声明外仍走 candidate(各审批模式行为不变);SSRF 黑名单与负面域
@@ -725,7 +725,7 @@ impl AgentDefinition {
                 "step_timeout_secs must be >= 1".to_string(),
             ));
         }
-        // O-491:http_get 额外 active host 白名单形态门卫(仅裸域名形态;
+        // http_get 额外 active host 白名单形态门卫(仅裸域名形态;
         // IP 字面量/带端口/带 scheme/带路径等一律拒——IP 走 SSRF/candidate
         // 语义不收声明,其余形态在 host 匹配下无意义且易误解)
         if let Some(hosts) = &self.http_get_allowed_hosts {
@@ -2648,7 +2648,7 @@ mod tests {
     }
 
     // =========================================================================
-    // O-491:http_get 额外 active host 白名单(声明形态门卫 + 缺省零影响)
+    // http_get 额外 active host 白名单(声明形态门卫 + 缺省零影响)
     // =========================================================================
 
     #[test]

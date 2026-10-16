@@ -105,7 +105,7 @@ pub struct HttpGetTool {
     max_bytes: u64,
     #[allow(dead_code)]
     allow_insecure: bool,
-    /// agent 定义级 active host 声明(O-491):声明 host 在分类时由
+    /// agent 定义级 active host 声明:声明 host 在分类时由
     /// Candidate 升级为 Active(直接执行);空=既有行为逐字节不变。
     /// Blocked/Invalid 永不升级(SSRF 黑名单与负面域守卫不受影响)。
     extra_allowed_hosts: Vec<String>,
@@ -657,7 +657,7 @@ mod tests {
     }
 
     // =========================================================================
-    // O-491:definition 级 active host 声明(声明内 Active 直放/声明外
+    // definition 级 active host 声明(声明内 Active 直放/声明外
     // 仍 Candidate/Blocked 永不升级/大小写归一)
     // =========================================================================
 
