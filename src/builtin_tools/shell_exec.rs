@@ -281,6 +281,165 @@ pub enum CommandCategory {
     Unknown,
 }
 
+/// 执行环境 profile(G1:环境决定安全分类基线)
+///
+/// 逃逸的定义随环境边界而变:bash/python 在 host 工作台是逃逸出口(blocked),
+/// 在一次性隔离环境(评测沙箱/容器/VM)里是任务本体(active)——环境本身即
+/// 隔离边界。红线不是被绕过,而是按环境重列:提权/网络逃逸/毁盘/环境自毁
+/// 在任何 profile 任何档位保持拦截。
+///
+/// - [`ExecutionProfile::Workbench`](缺省):host 工作台,人在环基线,
+///   分类逐项等于历史三表(回归测试守门);
+/// - [`ExecutionProfile::SandboxTrusted`]:一次性隔离执行环境。
+///
+/// 缺省不变式:不显式声明即为 Workbench,现行为零改动;
+/// 解析 fail-fast:未知值显式报错,不静默回落。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionProfile {
+    /// host 工作台(缺省;人在环基线)
+    #[default]
+    Workbench,
+    /// 一次性隔离执行环境(评测沙箱/容器/VM)
+    SandboxTrusted,
+}
+
+impl ExecutionProfile {
+    /// 从配置字符串解析(fail-fast:未知值报错,不回落)
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "workbench" => Ok(Self::Workbench),
+            "sandbox-trusted" => Ok(Self::SandboxTrusted),
+            other => Err(format!(
+                "unknown execution_profile '{other}' (expected: workbench | sandbox-trusted)"
+            )),
+        }
+    }
+
+    /// 配置序列化形态
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Workbench => "workbench",
+            Self::SandboxTrusted => "sandbox-trusted",
+        }
+    }
+}
+
+/// **[sandbox-trusted] Active 白名单**:直接执行,无需请示
+///
+/// 隔离环境内任务必需面 = 工作台 active 全量保留 + shell/解释器升格
+/// (环境即隔离边界,直进 shell 不再是逃逸)+ 工作台低风险 candidate 升格
+/// (一次性环境内风险主体是任务时间,不是不可逆性)。
+pub const TRUSTED_ACTIVE_COMMANDS: &[&str] = &[
+    // 工作台 active 全量保留(回归不变式见测试)
+    "cargo", "git", "ls", "cat", "grep", "rg", "make", "find",
+    // shell/解释器:隔离环境内为任务本体
+    "bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl",
+    // 工作台 candidate 升格:一次性环境内低风险/可重建
+    "mv", "cp", "mkdir", "touch", "head", "tail", "sed", "awk", "tar", "zip",
+    "unzip", "xargs", "patch", "diff", "wc", "sort", "uniq", "cut", "tr",
+];
+
+/// **[sandbox-trusted] Candidate 备选**:有真实风险,走无人值守评审通道
+/// (auto_policy/policy 档),全部落账
+pub const TRUSTED_CANDIDATE_COMMANDS: &[CandidateCommand] = &[
+    CandidateCommand {
+        name: "rm",
+        description: "删除文件或目录",
+        risk: "误删不可逆;rm -rf 无提示(一次性环境内影响=丢环境重来)",
+        alternative: "优先 mv 到临时目录;确需删除再 rm",
+    },
+    CandidateCommand {
+        name: "curl",
+        description: "HTTP(S) 外联传输",
+        risk: "网络外联 — 出环境数据通道;下载内容不可信",
+        alternative: "宿主侧 http_get 工具",
+    },
+    CandidateCommand {
+        name: "wget",
+        description: "HTTP(S) 下载",
+        risk: "同 curl",
+        alternative: "宿主侧 http_get 工具",
+    },
+    CandidateCommand {
+        name: "chmod",
+        description: "修改文件权限",
+        risk: "误改可执行位/敏感文件权限",
+        alternative: "—",
+    },
+    CandidateCommand {
+        name: "chown",
+        description: "修改文件属主",
+        risk: "误改属主致权限混乱",
+        alternative: "—",
+    },
+    CandidateCommand {
+        name: "mount",
+        description: "挂载设备/文件系统",
+        risk: "改环境系统状态;误操作可致环境不可用",
+        alternative: "—",
+    },
+    CandidateCommand {
+        name: "umount",
+        description: "卸载设备",
+        risk: "卸载在用文件系统致环境不可用",
+        alternative: "—",
+    },
+    CandidateCommand {
+        name: "systemctl",
+        description: "系统服务控制",
+        risk: "误停关键服务致环境失效",
+        alternative: "—",
+    },
+    CandidateCommand {
+        name: "service",
+        description: "系统服务控制(旧接口)",
+        risk: "同 systemctl",
+        alternative: "—",
+    },
+    CandidateCommand {
+        name: "kill",
+        description: "按 pid 终止进程",
+        risk: "可能终止评测基础设施/自身进程族",
+        alternative: "精确按 pid,避免按名扫杀",
+    },
+    CandidateCommand {
+        name: "killall",
+        description: "按名终止进程",
+        risk: "同名误杀(含基础设施同名进程)",
+        alternative: "按 pid kill",
+    },
+    CandidateCommand {
+        name: "pkill",
+        description: "按模式终止进程",
+        risk: "模式过宽误杀",
+        alternative: "按 pid kill",
+    },
+];
+
+/// **[sandbox-trusted] Blocked 永不**:真红线按环境重列
+///
+/// 任何 profile 任何档位保持拦截:提权(跨边界)、网络逃逸(反向 shell/
+/// 跨主机)、毁盘、环境自毁。工作台 blocked 其余成员(shell/解释器/进程
+/// 控制等)在本环境重列为 active/candidate——环境边界内不再是逃逸。
+/// 治理配置自我扩权与 benchmark 基础设施域由机制层独立守卫(net_guard 等),
+/// 不依赖本表。
+pub const TRUSTED_BLOCKED_COMMANDS: &[(&str, &str)] = &[
+    ("sudo", "权限提升 — 跨安全边界"),
+    ("su", "切换用户 — 同上"),
+    ("nc", "网络原始 socket — 反向 shell/逃逸通道"),
+    ("ncat", "同上"),
+    ("ssh", "远程 shell — 跨主机逃逸"),
+    ("scp", "远程文件传输 — 跨主机通道"),
+    ("dd", "块设备直接读写 — 可毁盘"),
+    ("mkfs", "格式化文件系统 — 毁数据"),
+    ("fdisk", "分区表修改 — 毁数据"),
+    ("shutdown", "环境自毁 — 终止评测环境"),
+    ("reboot", "同上"),
+    ("halt", "同上"),
+    ("poweroff", "同上"),
+    ("init", "init 系统 — 同上"),
+];
+
 /// 单次执行超时(秒)
 ///
 /// 直调兜底缺省(handler 介入的执行路径以静态表超时档
@@ -611,6 +770,8 @@ pub struct ShellExecTool {
     max_output_bytes: usize,
     workdir: Option<std::path::PathBuf>,
     backend: ExecBackend,
+    /// 执行环境 profile(G1;缺省 Workbench = 历史行为)
+    profile: ExecutionProfile,
     /// 在飞子进程登记(pid → 取消旗标):执行超时钩子的进程族回收面
     live: Arc<StdMutex<HashMap<u32, Arc<AtomicBool>>>>,
 }
@@ -627,6 +788,7 @@ impl ShellExecTool {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             workdir: None,
             backend: ExecBackend::Local,
+            profile: ExecutionProfile::Workbench,
             live: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
@@ -656,6 +818,19 @@ impl ShellExecTool {
     pub fn with_backend(mut self, backend: ExecBackend) -> Self {
         self.backend = backend;
         self
+    }
+
+    /// 设置执行环境 profile(G1:缺省 Workbench,人在环基线不变)
+    pub fn with_execution_profile(mut self, profile: ExecutionProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// 克隆并切换执行环境 profile(保留 workdir/backend/timeout 等其余装配)
+    pub fn with_profile(&self, profile: ExecutionProfile) -> Self {
+        let mut cloned = self.clone();
+        cloned.profile = profile;
+        cloned
     }
 
     /// 提取 argv[0] 的 basename
@@ -853,6 +1028,53 @@ impl ShellExecTool {
         }
     }
 
+    /// 按执行环境 profile 分桶(G1 分类工厂)
+    ///
+    /// Workbench 分支逐项等于历史 [`Self::classify`](缺省不变式,回归测试
+    /// 逐项断言);红线守卫(net_guard 等)在分类之前独立生效,与本分派正交。
+    pub fn classify_for(profile: ExecutionProfile, program: &str) -> CommandCategory {
+        match profile {
+            ExecutionProfile::Workbench => Self::classify(program),
+            ExecutionProfile::SandboxTrusted => {
+                if TRUSTED_ACTIVE_COMMANDS.contains(&program) {
+                    CommandCategory::Active
+                } else if let Some(&c) = TRUSTED_CANDIDATE_COMMANDS
+                    .iter()
+                    .find(|c| c.name == program)
+                {
+                    CommandCategory::Candidate(c)
+                } else if let Some(&(_, reason)) = TRUSTED_BLOCKED_COMMANDS
+                    .iter()
+                    .find(|(name, _)| *name == program)
+                {
+                    CommandCategory::Blocked(reason)
+                } else {
+                    CommandCategory::Unknown
+                }
+            }
+        }
+    }
+
+    /// Unknown 拒绝消息(按 profile 列出本环境允许面)
+    fn unknown_message(profile: ExecutionProfile, program: &str) -> String {
+        let (active, candidates): (&[&str], Vec<&str>) = match profile {
+            ExecutionProfile::Workbench => (
+                ACTIVE_COMMANDS,
+                CANDIDATE_COMMANDS.iter().map(|c| c.name).collect(),
+            ),
+            ExecutionProfile::SandboxTrusted => (
+                TRUSTED_ACTIVE_COMMANDS,
+                TRUSTED_CANDIDATE_COMMANDS.iter().map(|c| c.name).collect(),
+            ),
+        };
+        format!(
+            "command '{program}' is NOT in active or candidate list (allowed: {}; \
+             candidates: {}; see builtin_tools::shell_exec)",
+            active.join(", "),
+            candidates.join(", ")
+        )
+    }
+
     /// 实际执行命令(宿主后端)
     fn execute(&self, parts: &[&str], original_cmd: &str) -> IoResult {
         let program = Self::program_name(parts[0]);
@@ -877,6 +1099,23 @@ impl ShellExecTool {
                 Self::completed_result(original_cmd, program, &output, self.max_output_bytes)
             }
         }
+    }
+
+    /// G1 审计同权:sandbox-trusted 档执行结果带 profile 标记可回放
+    /// (workbench 结果逐字节不变;docker-exec 容器域本就是任务沙箱语义,
+    /// 不经本标记)
+    fn mark_profile(&self, mut result: IoResult) -> IoResult {
+        if self.profile == ExecutionProfile::SandboxTrusted {
+            if let Ok(v) = result.as_mut() {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "execution_profile".to_string(),
+                        Value::from(self.profile.as_str()),
+                    );
+                }
+            }
+        }
+        result
     }
 
     /// 自然退出的结果 JSON(与原 `Command::output` 路径同形态)
@@ -1031,7 +1270,7 @@ impl ShellExecTool {
             return None;
         }
         let program = Self::program_name(parts[0]);
-        match Self::classify(program) {
+        match Self::classify_for(self.profile, program) {
             CommandCategory::Candidate(c) => Some(
                 Self::make_proposal(program, cmd_str, c)
                     .expect("proposal construction is infallible"),
@@ -1131,10 +1370,10 @@ impl ShellExecTool {
 
         // 3. 分类
         let program = Self::program_name(parts[0]);
-        let category = Self::classify(program);
+        let category = Self::classify_for(self.profile, program);
 
         match category {
-            CommandCategory::Active => self.execute(&parts, cmd_str),
+            CommandCategory::Active => self.mark_profile(self.execute(&parts, cmd_str)),
 
             CommandCategory::Candidate(c) => {
                 // 检查 approved
@@ -1143,7 +1382,7 @@ impl ShellExecTool {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if approved {
-                    self.execute(&parts, cmd_str)
+                    self.mark_profile(self.execute(&parts, cmd_str))
                 } else {
                     // 返回 proposal(让上层问用户)
                     Self::make_proposal(program, cmd_str, c)
@@ -1156,17 +1395,7 @@ impl ShellExecTool {
                 program, reason
             )),
 
-            CommandCategory::Unknown => Err(format!(
-                "command '{}' is NOT in active or candidate list (allowed: {}; \
-                 candidates: {}; see builtin_tools::shell_exec)",
-                program,
-                ACTIVE_COMMANDS.join(", "),
-                CANDIDATE_COMMANDS
-                    .iter()
-                    .map(|c| c.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
+            CommandCategory::Unknown => Err(Self::unknown_message(self.profile, program)),
         }
     }
 }
@@ -1193,6 +1422,100 @@ mod tests {
         assert_eq!(ShellExecTool::classify("cargo"), CommandCategory::Active);
         assert_eq!(ShellExecTool::classify("git"), CommandCategory::Active);
         assert_eq!(ShellExecTool::classify("ls"), CommandCategory::Active);
+    }
+
+    // === G1 执行环境 profile ===
+
+    /// 回归不变式:Workbench 分支逐项等于历史分类(缺省不变式守门)
+    #[test]
+    fn test_profile_workbench_equals_legacy() {
+        let mut probed: Vec<&str> = ACTIVE_COMMANDS.to_vec();
+        probed.extend(CANDIDATE_COMMANDS.iter().map(|c| c.name));
+        probed.extend(BLOCKED_COMMANDS.iter().map(|(n, _)| *n));
+        probed.extend(["bash", "python3", "curl", "rm", "sudo", "nonexistent_xyz"]);
+        for p in probed {
+            assert_eq!(
+                ShellExecTool::classify_for(ExecutionProfile::Workbench, p),
+                ShellExecTool::classify(p),
+                "workbench classification drifted for '{p}'"
+            );
+        }
+    }
+
+    /// Trusted 档:shell/解释器/工作台低风险命令升 active;工作台 active 全量保留
+    #[test]
+    fn test_profile_trusted_active_expansion() {
+        for p in [
+            "bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl",
+            "mv", "cp", "sed", "awk", "tar", "zip", "unzip", "xargs", "patch", "diff",
+        ] {
+            assert_eq!(
+                ShellExecTool::classify_for(ExecutionProfile::SandboxTrusted, p),
+                CommandCategory::Active,
+                "{p} should be active in sandbox-trusted"
+            );
+        }
+        for p in ACTIVE_COMMANDS {
+            assert_eq!(
+                ShellExecTool::classify_for(ExecutionProfile::SandboxTrusted, p),
+                CommandCategory::Active,
+                "workbench active {p} must be preserved in sandbox-trusted"
+            );
+        }
+    }
+
+    /// Trusted 档真红线保持拦截;风险面走 candidate(无人值守评审通道)
+    #[test]
+    fn test_profile_trusted_redlines_and_candidates() {
+        for p in [
+            "sudo", "su", "nc", "ncat", "ssh", "scp", "dd", "mkfs", "fdisk",
+            "shutdown", "reboot", "halt", "poweroff", "init",
+        ] {
+            assert!(
+                matches!(
+                    ShellExecTool::classify_for(ExecutionProfile::SandboxTrusted, p),
+                    CommandCategory::Blocked(_)
+                ),
+                "{p} must stay blocked in sandbox-trusted"
+            );
+        }
+        for p in ["rm", "curl", "wget", "chmod", "chown", "kill", "killall", "pkill"] {
+            assert!(
+                matches!(
+                    ShellExecTool::classify_for(ExecutionProfile::SandboxTrusted, p),
+                    CommandCategory::Candidate(_)
+                ),
+                "{p} should be candidate in sandbox-trusted"
+            );
+        }
+    }
+
+    /// 解析 fail-fast:未知值显式报错不回落
+    #[test]
+    fn test_execution_profile_parse_fail_fast() {
+        assert_eq!(
+            ExecutionProfile::parse("workbench"),
+            Ok(ExecutionProfile::Workbench)
+        );
+        assert_eq!(
+            ExecutionProfile::parse("sandbox-trusted"),
+            Ok(ExecutionProfile::SandboxTrusted)
+        );
+        assert!(ExecutionProfile::parse("trusted").is_err());
+        assert!(ExecutionProfile::parse("").is_err());
+    }
+
+    /// 缺省 = Workbench(新构造实例与历史行为一致)
+    #[test]
+    fn test_profile_default_is_workbench() {
+        assert_eq!(ExecutionProfile::default(), ExecutionProfile::Workbench);
+        assert_eq!(ShellExecTool::new().profile, ExecutionProfile::Workbench);
+        assert_eq!(
+            ShellExecTool::new()
+                .with_execution_profile(ExecutionProfile::SandboxTrusted)
+                .profile,
+            ExecutionProfile::SandboxTrusted
+        );
     }
 
     #[test]
