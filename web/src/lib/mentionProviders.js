@@ -82,6 +82,7 @@ function toCandidate(e) {
     detail: e.path,
     positions: [],
   };
+  if (!e.isDir && Number.isFinite(e.size)) c.size = e.size;
   if (!e.isDir && isSensitivePath(e.path)) c.warn = true;
   return c;
 }
@@ -377,6 +378,7 @@ export async function reconcileMentions(draft, mentions) {
         ref: entry.path,
         insertAt: match.index + match[1].length,
         token,
+        size: Number.isFinite(entry.size) ? entry.size : null,
       });
       added.push(token);
     }

@@ -20,7 +20,7 @@
   import { orderSessionsWithLineage } from '../lib/orchestration.js';
   import { onMount, onDestroy, tick } from 'svelte';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
-  import { collectCandidates, MENTION_GROUP_LABELS, estimateTokens, tokenLevel } from '../lib/mentions.js';
+  import { collectCandidates, MENTION_GROUP_LABELS, estimateComposerTokens, tokenLevel } from '../lib/mentions.js';
   import { highlightSegments } from '../lib/fuzzy.js';
   import { registerMentionProviders, reconcileMentions } from '../lib/mentionProviders.js';
   import {
@@ -276,7 +276,10 @@
     const start = mp.insertAt;
     const cursor = draftEl?.selectionStart ?? draft.length;
     draft = draft.slice(0, start) + token + ' ' + draft.slice(cursor);
-    composerMentions.update((arr) => [...arr, { type: c.type, ref: c.ref, insertAt: start, token }]);
+    composerMentions.update((arr) => [
+      ...arr,
+      { type: c.type, ref: c.ref, insertAt: start, token, size: c.size ?? null },
+    ]);
     closeMention();
     const caret = start + token.length + 1;
     await tick();
@@ -578,9 +581,12 @@
       disabled={$connStatus !== 'online'}
     ></textarea>
     <div class="composer-meta">
-      <span class="token-est {tokenLevel(estimateTokens(draft))}">
-        ≈ {estimateTokens(draft)} tokens
+      <span class="token-est {tokenLevel(estimateComposerTokens(draft, $composerMentions))}">
+        ≈ {estimateComposerTokens(draft, $composerMentions)} tokens{#if $composerMentions.some((m) => m.type === 'file')}&nbsp;·&nbsp;含引用{/if}
       </span>
+      {#if tokenLevel(estimateComposerTokens(draft, $composerMentions)) === 'over'}
+        <span class="token-est-hint">引用体积较大，可删除部分引用 chip</span>
+      {/if}
     </div>
     <div class="composer-actions">
       {#if $turnActive}
@@ -1103,6 +1109,8 @@
   .composer-meta {
     display: flex;
     justify-content: flex-end;
+    align-items: center;
+    gap: 8px;
   }
   .token-est {
     font-size: 10px;
@@ -1112,6 +1120,10 @@
     color: var(--warning);
   }
   .token-est.over {
+    color: var(--danger);
+  }
+  .token-est-hint {
+    font-size: 10px;
     color: var(--danger);
   }
   .user-col {
