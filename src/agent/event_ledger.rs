@@ -248,7 +248,16 @@ impl LedgerInner {
         // path 形态 __memory__.mcp.events.EL-000005 → 末段为事件 ID
         let eid = tail.path.split('.').next_back()?;
         let seq: u64 = eid.strip_prefix("EL-")?.parse().ok()?;
-        let source = self.store.read_event(eid).await.ok().flatten();
+        let source = match self.store.read_event(eid).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(event_id = %eid, error = %e, "event ledger: chain-tail readback failed (effects reverse-link maintenance degraded)");
+                None
+            }
+        };
+        if source.is_none() {
+            tracing::warn!(event_id = %eid, path = %tail.path, "event ledger: chain-tail readback returned None (effects reverse-link maintenance degraded)");
+        }
         self.store.seed_chain_anchor(tail.id, eid, source);
         Some((seq, tail.id))
     }
