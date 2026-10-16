@@ -329,6 +329,8 @@ pub struct RedLineGuardApproval {
 }
 
 impl RedLineGuardApproval {
+    /// 构造(inner=常规判定端;manual=红线命中回落决策端;
+    /// exemption_override=用户显式关闭红线强制——放行留痕必带标记)
     pub fn new(
         inner: Arc<dyn ApprovalCallback>,
         manual: Arc<dyn ApprovalCallback>,

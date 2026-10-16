@@ -100,7 +100,10 @@ pub enum JournalEvent {
     LlmCalled {
         /// 模型名(react_model 或 runner 默认)
         model: String,
-        /// 调用用途:react|summarize|session_summary|rollup|compaction
+        /// 调用用途(实测值域):react(主循环,ATIF 映射为步)|i2_semantic(语义
+        /// 精判)——sidecar 用途不映射步(ATIF 跳过臂)。审计链侧 audit_purpose
+        /// (acceptance_criteria/policy_review/summarize/session_summary/rollup/
+        /// compaction)不入本枚举,见 audited_llm.rs 模块文档
         purpose: String,
         /// evorule IoRequest FactId(call_external;审计链 join 键)
         evorule_request_id: Option<u64>,
