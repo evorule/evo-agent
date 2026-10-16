@@ -25,14 +25,21 @@ const MAX_ITERATIONS: usize = 100;
 /// 收敛阈值（L∞ 变化量）
 const CONVERGENCE_EPS: f64 = 1e-9;
 
+/// 会话打开文件的 seed 权重倍数（个性化排位注入面：打开文件相对未打开
+/// 文件的 seed 基准权重倍率）
+const OPEN_FILE_SEED_WEIGHT: f64 = 50.0;
+
 /// 符号引用图谱（不可变快照；重建即整体替换）
 pub struct SymbolGraph {
-    /// 文件 → PageRank 分数（归一化和为 1）
+    /// 文件 → PageRank 分数（归一化和为 1；缺省全局口径）
     ranks: HashMap<String, f64>,
     /// 文件 → 该文件定义的符号清单（检索候选）
     symbols_by_file: HashMap<String, Vec<SymbolMin>>,
     /// 边数（status 面就绪度展示）
     edge_count: usize,
+    /// 节点集与出边表快照（查询期个性化排位重算用）
+    nodes: HashSet<String>,
+    out: HashMap<String, Vec<(String, f64)>>,
 }
 
 impl SymbolGraph {
@@ -85,12 +92,26 @@ impl SymbolGraph {
             ranks,
             symbols_by_file,
             edge_count,
+            nodes,
+            out,
         }
     }
 
     /// 文件 PageRank 分数（未知文件为 0）
     pub fn rank_of(&self, file: &str) -> f64 {
         self.ranks.get(file).copied().unwrap_or(0.0)
+    }
+
+    /// 会话打开文件个性化排位：以打开文件为 seed（权重 ×50）重算 PageRank
+    ///
+    /// 查询期重算（快照图万级文件量级单轮毫秒级）；与缓存的全局
+    /// [`Self::ranks`](构建期) 同源同算法，仅 seed 分布不同。
+    pub fn personalized_ranks(&self, open_files: &[String]) -> HashMap<String, f64> {
+        let seeds: HashMap<String, f64> = open_files
+            .iter()
+            .map(|f| (f.clone(), OPEN_FILE_SEED_WEIGHT))
+            .collect();
+        personalize_pagerank(&self.nodes, &self.out, &seeds)
     }
 
     /// 边数（status 面展示）
@@ -107,13 +128,25 @@ impl SymbolGraph {
     ///
     /// 返回 `(符号, 分数)`；分数 = 所在文件 PageRank（文件级重要性传递到符号）。
     pub fn match_symbols(&self, query: &str, limit: usize) -> Vec<(SymbolMin, f64)> {
+        self.match_symbols_with(query, limit, &self.ranks)
+    }
+
+    /// 指定排位表的符号检索（个性化注入面）：`ranks` 传
+    /// [`Self::personalized_ranks`] 产物即得「打开文件优先」排序
+    pub fn match_symbols_with(
+        &self,
+        query: &str,
+        limit: usize,
+        ranks: &HashMap<String, f64>,
+    ) -> Vec<(SymbolMin, f64)> {
         let q = query.trim().to_lowercase();
         if q.is_empty() || limit == 0 {
             return Vec::new();
         }
+        let rank_of = |f: &str| ranks.get(f).copied().unwrap_or(0.0);
         let mut hits: Vec<(SymbolMin, f64)> = Vec::new();
         for (file, syms) in &self.symbols_by_file {
-            let rank = self.rank_of(file);
+            let rank = rank_of(file);
             for s in syms {
                 if s.name.to_lowercase().contains(&q) {
                     hits.push((s.clone(), rank));
@@ -252,6 +285,25 @@ mod tests {
         // seed 加权后 b.rs 占优
         assert!(boosted.rank_of("b.rs") > boosted.rank_of("a.rs"));
         assert!((boosted.rank_of("a.rs") + boosted.rank_of("b.rs") - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn personalized_ranks_lift_open_file_symbols() {
+        // 查询期个性化：无引用图上两同名候选符号,打开文件者的符号排位反超
+        let symbols = vec![sym("a.rs", "dup"), sym("b.rs", "dup")];
+        let g = SymbolGraph::build(&symbols, &refs_empty(), &HashMap::new());
+        // 全局口径：无边图均匀分布,同名按文件名 tiebreak → a.rs 在前
+        let plain = g.match_symbols("dup", 10);
+        assert_eq!(plain[0].0.file, "a.rs");
+        // 个性化：b.rs 打开 → b.rs 排位反超
+        let ranks = g.personalized_ranks(&["b.rs".to_string()]);
+        let ranked = g.match_symbols_with("dup", 10, &ranks);
+        assert_eq!(ranked[0].0.file, "b.rs");
+        assert!(ranked[0].1 > ranked[1].1);
+    }
+
+    fn refs_empty() -> Vec<RefRow> {
+        Vec::new()
     }
 
     #[test]
