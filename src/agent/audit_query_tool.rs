@@ -3,11 +3,13 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! 审计查询工具（audit_query）——治理留痕与会话审计的 agent 只读入口。
 //!
-//! 三 scope（23 号设计 §3.2）：
+//! 四 scope（23 号设计 §3.2 + O-482 子裁定 b）：
 //! - `gov`：读共享账本治理分区 `shared.gov.`（B22-A 治理留痕，GovLedger
 //!   写入的六类事件 Fact）。`precedent=true` 时输出**先例卡**——同类工具+
 //!   参数摘要+当时批准者+档位+时间，18 号 policy 档「会话内批准先例参照」
 //!   的机制载体（18 号修订① 落地）。
+//! - `shared`：读共享账本任意前缀（get_shared_facts prefix 透传）——含
+//!   O-482 /mcp 面事件轨道 `shared.mcp.events.EL-*` 的 agent 只读检索入口。
 //! - `session`：读当前/指定会话 Fact 列表（get_facts）；`fact_id` 给出时
 //!   回溯因果链（get_causal_chain_typed）；`verify=true` 时跑链完整性验证
 //!   （verify_audit_typed）。
@@ -89,16 +91,16 @@ pub(crate) async fn audit_query_exec(
     journal: Option<&JournalWriter>,
     args: &Value,
 ) -> Result<Value, String> {
-    let scope = args
-        .get("scope")
-        .and_then(|v| v.as_str())
-        .ok_or("audit_query: 'scope' is required (\"gov\" | \"session\" | \"journal\")")?;
+    let scope = args.get("scope").and_then(|v| v.as_str()).ok_or(
+        "audit_query: 'scope' is required (\"gov\" | \"shared\" | \"session\" | \"journal\")",
+    )?;
     match scope {
         "gov" => gov_scope(client, args).await,
+        "shared" => shared_scope(client, args).await,
         "session" => session_scope(session_id, client, args).await,
         "journal" => journal_scope(journal, args),
         other => Err(format!(
-            "audit_query: unknown scope '{other}' (expected \"gov\" | \"session\" | \"journal\")"
+            "audit_query: unknown scope '{other}' (expected \"gov\" | \"shared\" | \"session\" | \"journal\")"
         )),
     }
 }
@@ -199,6 +201,50 @@ async fn gov_scope(client: &EvoruleApiClient, args: &Value) -> Result<Value, Str
     Ok(json!({
         "status": if items.is_empty() { "empty" } else { "ok" },
         "scope": "gov",
+        "view": "events",
+        "total": total,
+        "returned": items.len(),
+        "events": items,
+    }))
+}
+
+/// scope=shared：共享账本面查询（get_shared_facts prefix 透传；O-482 子裁定
+/// b——/mcp 面事件轨道 `shared.mcp.events.EL-*` 的 agent 只读检索入口）。
+/// 输出口径与 gov events 视图同构：fact_id 降序（新在前）+ limit 截取。
+async fn shared_scope(client: &EvoruleApiClient, args: &Value) -> Result<Value, String> {
+    let prefix = args
+        .get("prefix")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let limit = match args.get("limit") {
+        None => DEFAULT_LIMIT,
+        Some(v) => v
+            .as_u64()
+            .filter(|n| (1..=MAX_LIMIT as u64).contains(n))
+            .ok_or_else(|| format!("audit_query: limit must be an integer in 1..={MAX_LIMIT}"))?
+            as usize,
+    };
+    let facts = client
+        .get_shared_facts(prefix)
+        .await
+        .map_err(|e| format!("audit_query: shared facts query failed ({e})"))?;
+    let mut events: Vec<&crate::api::evorule_client::SharedFactEntry> = facts.iter().collect();
+    let total = events.len();
+    events.sort_by_key(|e| std::cmp::Reverse(e.fact_id));
+    let items: Vec<Value> = events
+        .iter()
+        .take(limit)
+        .map(|e| {
+            json!({
+                "path": e.path,
+                "fact_id": e.fact_id,
+                "value": e.value,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "status": if items.is_empty() { "empty" } else { "ok" },
+        "scope": "shared",
         "view": "events",
         "total": total,
         "returned": items.len(),
@@ -458,5 +504,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("journal not available"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_shared_scope_dispatch_and_validation() {
+        // O-482 子裁定 b：scope=shared 分派 + limit 校验前置（不触网即拒）
+        let client = crate::api::evorule_client::EvoruleApiClient::new("http://127.0.0.1:1");
+        let err = audit_query_exec("s1", &client, None, &json!({"scope": "shared", "limit": 0}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("limit must be an integer in 1..=100"), "{err}");
+        let err = audit_query_exec(
+            "s1",
+            &client,
+            None,
+            &json!({"scope": "shared", "limit": 101}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("limit must be an integer in 1..=100"), "{err}");
+        // 合法参数（含 prefix 透传）→ dead client → fail-visible 网络错误
+        let err = audit_query_exec(
+            "s1",
+            &client,
+            None,
+            &json!({"scope": "shared", "prefix": "shared.mcp.events."}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("shared facts query failed"), "{err}");
     }
 }

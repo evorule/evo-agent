@@ -285,7 +285,7 @@ pub fn schema() -> Vec<SettingEntry> {
             enum_values: None,
             range: None,
             category: "Agent 工具",
-            description: "审计查询工具（audit_query，只读）：三 scope 入口——gov 治理留痕（含批准先例卡）/session 会话审计与因果链/journal 事件流（关闭 = 工具连 LLM 契约一起下线，agent 无法主动查询治理留痕与会话审计）",
+            description: "审计查询工具（audit_query，只读）：四 scope 入口——gov 治理留痕（含批准先例卡）/shared 共享账本前缀检索（含 /mcp 事件轨道）/session 会话审计与因果链/journal 事件流（关闭 = 工具连 LLM 契约一起下线，agent 无法主动查询治理留痕与会话审计）",
             scope: "application",
         },
         SettingEntry {
