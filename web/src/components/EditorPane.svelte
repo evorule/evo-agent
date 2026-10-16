@@ -13,6 +13,7 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
+  import { marked } from 'marked';
   import { setupMonaco, monaco, jsonDiagnosticsOptions } from '../lib/monaco-setup.js';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
   import { uriSpecFor, initDiagnostics, rebindPath, setDiagnostics, clearDiagnostics } from '../lib/diagnostics.js';
@@ -97,6 +98,11 @@
   const gitDiffModels = new Map();
   /** 当前激活 tab 是否处于差异视图 */
   let diffOn = false;
+  /** Markdown 预览(形制补全 F4):激活 tab 为 .md 时可切换渲染视图 */
+  let mdPreviewOn = false;
+  let mdPreviewHtml = '';
+  /** 当前激活 tab 是否 Markdown 文件(预览钮可见性) */
+  $: isMd = ($activePath || '').toLowerCase().endsWith('.md');
   /** 保存失败的临时提示,保存成功即清 */
   let saveError = '';
 
@@ -385,6 +391,23 @@
     renderActive(get(activePath));
   }
 
+  /** Markdown 预览开关(渲染当前 tab 内容;预览态下编辑器隐藏) */
+  function toggleMdPreview() {
+    mdPreviewOn = !mdPreviewOn;
+    refreshMdPreview();
+  }
+
+  /** 以当前激活 tab 内容刷新预览 HTML(tabs 内容变化时随动) */
+  function refreshMdPreview() {
+    if (!mdPreviewOn) {
+      mdPreviewHtml = '';
+      return;
+    }
+    const p = get(activePath);
+    const t = get(tabs).find((x) => x.path === p);
+    mdPreviewHtml = t ? marked.parse(t.content ?? '', { async: false }) : '';
+  }
+
   // 消费一次性定位信号(B2 全局搜索跳转等):信号目标与当前激活 tab 及
   // 显示中 model 一致时 revealLineInCenter+选区+聚焦,消费即清(幂等)。
   // 双入口:activePath 切换渲染后探一次 + pendingReveal 变化时触发,
@@ -572,6 +595,7 @@
 
     unsubActive = activePath.subscribe((p) => {
       diffOn = false; // 切 tab 回到编辑模式
+      mdPreviewOn = false; // 预览态随 tab 切换退出(重进可再开)
       renderActive(p);
       maybeConsumeReveal();
     });
@@ -613,6 +637,7 @@
     // (重开=从磁盘重载;防复用含未保存残文的陈旧 model 且 dirty 失真)。
     let prevTabPaths = new Set();
     const unsubTabs = tabs.subscribe((list) => {
+      if (mdPreviewOn) refreshMdPreview(); // 预览态随内容保存/更新实时刷新
       const next = new Set(list.map((t) => t.path));
       for (const p of prevTabPaths) {
         if (next.has(p)) continue;
@@ -702,8 +727,7 @@
     {#if $tabs.length === 0}
       <div class="etab active">欢迎</div>
     {:else}
-      {#each $tabs as t (t.path)}
-        <div
+      {#each $tabs as t (t.path)}        <div
           class="etab file"
           class:active={t.path === $activePath}
           role="tab"
@@ -723,6 +747,16 @@
           >
         </div>
       {/each}
+      {#if isMd}
+        <button
+          class="md-preview-toggle"
+          class:on={mdPreviewOn}
+          title="Markdown 预览(渲染当前内容)"
+          onclick={toggleMdPreview}
+        >
+          {mdPreviewOn ? '返回编辑' : '预览'}
+        </button>
+      {/if}
     {/if}
     {#if saveError}
       <div class="save-error" title={saveError}>保存失败</div>
@@ -744,7 +778,10 @@
       </button>
     </div>
   {/if}
-  <div class="editor-host" bind:this={editorEl} data-zone="editor"></div>
+  <div class="editor-host" bind:this={editorEl} data-zone="editor" style={mdPreviewOn ? 'display:none' : ''}></div>
+  {#if mdPreviewOn}
+    <div class="md-preview" data-zone="editor">{@html mdPreviewHtml}</div>
+  {/if}
   <div class="editor-host diff-host" bind:this={diffEl} style="display:none" data-zone="editor"></div>
   <div class="editor-host settings-host" bind:this={settingsEl} style="display:none" data-zone="editor">
     <SettingsEditor />
@@ -821,6 +858,74 @@
   .editor-host {
     flex: 1;
     min-height: 0;
+  }
+  .md-preview-toggle {
+    margin-left: auto;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    font-size: 11px;
+    padding: 2px 10px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .md-preview-toggle:hover,
+  .md-preview-toggle.on {
+    color: var(--text-primary);
+    background: var(--bg-active);
+  }
+  .md-preview {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 20px 28px;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.65;
+  }
+  .md-preview :global(h1),
+  .md-preview :global(h2),
+  .md-preview :global(h3),
+  .md-preview :global(h4) {
+    color: var(--text-primary);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px;
+    margin: 18px 0 10px;
+  }
+  .md-preview :global(code) {
+    background: var(--bg-active);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 12px;
+  }
+  .md-preview :global(pre) {
+    background: var(--bg-active);
+    padding: 10px 12px;
+    border-radius: 4px;
+    overflow: auto;
+  }
+  .md-preview :global(pre code) {
+    background: transparent;
+    padding: 0;
+  }
+  .md-preview :global(blockquote) {
+    border-left: 3px solid var(--brand);
+    margin: 10px 0;
+    padding: 2px 12px;
+    color: var(--text-secondary);
+  }
+  .md-preview :global(a) {
+    color: var(--brand);
+  }
+  .md-preview :global(table) {
+    border-collapse: collapse;
+  }
+  .md-preview :global(th),
+  .md-preview :global(td) {
+    border: 1px solid var(--border);
+    padding: 4px 10px;
   }
   .artifact-bar {
     display: flex;
