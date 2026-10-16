@@ -131,7 +131,7 @@ pub struct MemoryEvent {
     /// 兼容同族);缺省 1.0
     #[serde(
         default = "default_confidence",
-        deserialize_with = "deserialize_confidence"
+        deserialize_with = "deserialize_f32_flex"
     )]
     pub confidence: f32,
 
@@ -152,9 +152,10 @@ fn default_confidence() -> f32 {
     1.0
 }
 
-/// confidence 读侧容错:接受数字与字符串两种形态(存储层浮点规范化为字符串,
-/// 实测探针:写 1.0/2.5 → 读回 "1.0"/"2.5",整数与字符串原样)
-fn deserialize_confidence<'de, D>(deserializer: D) -> Result<f32, D::Error>
+/// f32 字段读侧容错(共享):接受数字与字符串两种形态(存储层浮点规范化为字符串,
+/// 实测探针:写 1.0/2.5 → 读回 "1.0"/"2.5",整数与字符串原样);
+/// confidence / Emotion.valence / Emotion.arousal 三处同语义复用
+fn deserialize_f32_flex<'de, D>(deserializer: D) -> Result<f32, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -416,9 +417,15 @@ pub enum IOTriggerSubtype {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Emotion {
     /// 情感极性(-1.0 极负 ~ +1.0 极正)
+    ///
+    /// 读侧容错同 confidence:存储层浮点规范化为字符串,双形态反序列化
+    #[serde(deserialize_with = "deserialize_f32_flex")]
     pub valence: f32,
 
     /// 情感强度(0.0 平静 ~ 1.0 极强烈)
+    ///
+    /// 读侧容错同 confidence:存储层浮点规范化为字符串,双形态反序列化
+    #[serde(deserialize_with = "deserialize_f32_flex")]
     pub arousal: f32,
 
     /// 情感标签(开放集合,如 joy/sadness/anger/fear/love/nostalgia)
@@ -648,6 +655,26 @@ mod tests {
             let de: EmotionSubject = serde_json::from_str(&json).unwrap();
             assert_eq!(s, de);
         }
+    }
+
+    #[test]
+    fn test_emotion_float_string_tolerance() {
+        // 存储层浮点规范化为字符串(O-488 定性:TCB 确定性值域):
+        // Emotion 读回时 valence/arousal 为 "0.8"/"-0.3" 形态,须反序列化成功
+        let json = r#"{
+            "valence": "0.8",
+            "arousal": "-0.3",
+            "labels": ["joy"],
+            "subject": "User"
+        }"#;
+        let e: Emotion = serde_json::from_str(json).expect("string-form floats must parse");
+        assert_eq!(e.valence, 0.8);
+        assert_eq!(e.arousal, -0.3);
+        // 数字形态原样兼容(回归)
+        let e2: Emotion = serde_json::from_str(r#"{"valence":0.5,"arousal":0.9,"subject":"User"}"#)
+            .expect("number-form floats must parse");
+        assert_eq!(e2.valence, 0.5);
+        assert_eq!(e2.arousal, 0.9);
     }
 
     #[test]
