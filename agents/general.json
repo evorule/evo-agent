@@ -27,6 +27,7 @@
     "diff_runs",
     "shell_exec",
     "http_get",
+    "python_exec",
     "rule_list",
     "rule_get",
     "rule_versions",

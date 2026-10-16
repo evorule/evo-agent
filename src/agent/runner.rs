@@ -1208,10 +1208,14 @@ impl AgentRunner {
         // (`mcp_{server}_{tool}`,握手后运行期注册),静态声明无法枚举;通配
         // 语义本身即「凡前缀匹配的已注册工具」,与 serve_tools 白名单校验面
         // 同构(B16 build_filtered_toolkit 消费侧同款),不放行任何未知名。
+        // delegate/session_spawn 是 builder after-construction 注册的（with_delegate_context），
+        // from_definition 校验时尚未注册，此处预放行——注册步失败会在 builder 阶段显式报错。
         for tool_name in &config.tool_names {
+            let is_after_builder = tool_name == "delegate" || tool_name == "session_spawn";
             let is_wildcard = tool_name.ends_with('*');
             if !tool_handler.has_tool(tool_name)
                 && !introspect_allowed.contains(tool_name)
+                && !is_after_builder
                 && !is_wildcard
             {
                 return Err(AgentError::Internal(format!(
