@@ -11,6 +11,7 @@
     { id: 'explorer', label: '资源管理器', enabled: true },
     { id: 'search', label: '搜索', enabled: true },
     { id: 'scm', label: '源代码管理', enabled: true },
+    { id: 'orchestration', label: '编排(委托谱系)', enabled: true },
     { id: 'audit', label: '审计(治理叠加阶段接入)', enabled: false },
     { id: 'settings', label: '设置', enabled: true },
   ];
@@ -56,6 +57,14 @@
           <circle cx="7" cy="18" r="2.4" />
           <circle cx="17" cy="9" r="2.4" />
           <path d="M7 8.4v7.2M17 11.4c0 3-2.5 3.6-7.6 3.6" />
+        </svg>
+      {:else if it.id === 'orchestration'}
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
+          <circle cx="5" cy="12" r="2.2" />
+          <circle cx="18" cy="5" r="2.2" />
+          <circle cx="18" cy="12" r="2.2" />
+          <circle cx="18" cy="19" r="2.2" />
+          <path d="M7.2 12h8.6M7.2 11.2C7.2 8 10 7.2 15.7 6.9M7.2 12.8c0 3.2 2.8 4 8.5 4.3" />
         </svg>
       {:else if it.id === 'audit'}
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">

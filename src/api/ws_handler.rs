@@ -865,7 +865,17 @@ async fn construct_runner(
         // B2:注入 skills manifest(read_skill 已注册进 filtered,清单喂 S4b 槽位)
         .with_skills(resolved_skills)
         // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位,不再内嵌基底)
-        .with_governance_segment(governance_segment);
+        .with_governance_segment(governance_segment)
+        // serve 面 delegate 执行能力接线(B25 批顺手修,CLI run 主路径同款镜像;
+        // 与 agent_api run/stream 端点同口径——此前 WS 会话 LLM 不可见 delegate)
+        .with_delegate_context(
+            crate::agent::delegate::DelegateContext::new(
+                def.agent_type.as_str(),
+                state.definitions().clone(),
+                state.evorule_client().clone(),
+            )
+            .with_journal_dir(state.workdir().join("data").join("sessions")),
+        );
     // PR-H4 验收修复:WS 流式路径此前从未消费 def.context_window_tokens——
     // max_context_tokens 停在 AgentRunner::new 字段默认 8192,context_window
     // 亦为 None(裁剪管路整体缺席;实测 session_spawn 链预算误判 32768=4×8192,

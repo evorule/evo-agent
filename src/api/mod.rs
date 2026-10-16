@@ -20,6 +20,7 @@ pub mod llm_ops;
 pub mod lsp_api;
 pub mod mcp_api;
 pub mod metrics;
+pub mod orchestration_api;
 pub mod pty_api;
 pub mod serve_tools;
 pub mod session_index;

@@ -325,3 +325,22 @@ export function trialApproval(tool, args) {
     body: JSON.stringify({ tool, args }),
   }).then(unwrap);
 }
+
+// ===== 编排可视化(B25;端点对应 serve orchestration_api.rs,只读 journal 投影) =====
+
+/** 会话委托谱系树(session_id 必填;journal 为权威谱系,子状态由尾部推断) */
+export function getOrchestrationTree(sessionId) {
+  return fetch(`/api/orchestration/sessions?session_id=${encodeURIComponent(sessionId)}`, {
+    headers: headers(),
+  }).then(unwrap);
+}
+
+/** 全局子会话归属链(会话列表「委托自」徽标数据源;links: [{parent,child,agent_type,kind,depth}]) */
+export function getOrchestrationLinks() {
+  return fetch('/api/orchestration/sessions', { headers: headers() }).then(unwrap);
+}
+
+/** 可委托 agent 清单(图例;agents: [{agent_type,description,can_delegate}]) */
+export function getOrchestrationAgents() {
+  return fetch('/api/orchestration/agents', { headers: headers() }).then(unwrap);
+}
