@@ -120,12 +120,21 @@ export function registerAiCompletion(editor, languages) {
     // Monaco 0.52:undo 无直接 reason 标记;以 undo 命令拦截替代(见 keydown)
     return -1;
   }
-  const onUndoCmd = editor.onDidUndo(() => {
-    lastEditWasUndo = true;
-  });
-  const onRedoCmd = editor.onDidRedo(() => {
-    lastEditWasUndo = true;
-  });
+  // 特性探测守卫:部分 Monaco 构建 standalone editor 无 onDidUndo/onDidRedo
+  // (直接调用即 TypeError 并断断整个注册链——provider 不再注册);缺位时
+  // 撤销抑制由 keydown Esc 路径兜底,功能降级不致失效
+  const onUndoCmd =
+    typeof editor.onDidUndo === 'function'
+      ? editor.onDidUndo(() => {
+          lastEditWasUndo = true;
+        })
+      : null;
+  const onRedoCmd =
+    typeof editor.onDidRedo === 'function'
+      ? editor.onDidRedo(() => {
+          lastEditWasUndo = true;
+        })
+      : null;
 
   const providerDisposers = [];
 
@@ -189,8 +198,8 @@ export function registerAiCompletion(editor, languages) {
     dispose() {
       onPaste.dispose();
       onUndo.dispose();
-      onUndoCmd.dispose();
-      onRedoCmd.dispose();
+      onUndoCmd?.dispose();
+      onRedoCmd?.dispose();
       onKeyDown.dispose();
       for (const d of providerDisposers) d.dispose();
     },
