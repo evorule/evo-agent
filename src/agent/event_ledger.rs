@@ -232,6 +232,24 @@ impl LedgerInner {
         self.seq
     }
 
+    /// O-482 J-b 链续接：回读账面末端事件（复用活会话且进程内链为空时）——
+    /// EL 序号续编 + prev_fact 接锚旧链末端 + store 种子回填（effects 反向
+    /// 链维护不缺位）。新会话账面为空 → 返回 None 保持根。
+    async fn fetch_chain_tail(&mut self, sid: &str) -> Option<(u64, FactId)> {
+        let facts = self
+            .client
+            .get_facts(sid, Some("__memory__.mcp.events."))
+            .await
+            .ok()?;
+        let tail = facts.iter().max_by_key(|f| f.id)?;
+        // path 形态 __memory__.mcp.events.EL-000005 → 末段为事件 ID
+        let eid = tail.path.split('.').next_back()?;
+        let seq: u64 = eid.strip_prefix("EL-")?.parse().ok()?;
+        let source = self.store.read_event(eid).await.ok().flatten();
+        self.store.seed_chain_anchor(tail.id, eid, source);
+        Some((seq, tail.id))
+    }
+
     /// O-482:合成治理会话开具/复用并注入（needs_ensure 消费者；gov 路径
     /// 未装 = v1 语义 no-op）。探活复用（get_session_metadata Ok）→ 注入；
     /// 404 判死 → 重开具 + 原子写回 → 注入新会话（cause 链锚重置：旧
@@ -248,8 +266,18 @@ impl LedgerInner {
         };
         let prev_sid = self.store.session_id().map(str::to_string);
         if prev_sid.as_deref() != Some(sid.as_str()) {
-            // 新会话：cause 单链锚重置（轨道内首事件重新为根）
-            self.prev_fact = None;
+            if self.prev_fact.is_none() {
+                // 进程内链为空（重启首注入/开具失败后补注入）：回读账面末端
+                // 续链——EL 序号续编 + 接锚（新会话账面为空则保持根）
+                if let Some((seq, fid)) = self.fetch_chain_tail(&sid).await {
+                    self.seq = seq;
+                    self.prev_fact = Some(fid);
+                }
+            } else {
+                // 在途失效换新会话：旧 FactId 属旧会话，cause 锚与序号清零重来
+                self.prev_fact = None;
+                self.seq = 0;
+            }
         }
         self.store.set_session_id(&sid);
         self.memory.set_session_id(&sid);
