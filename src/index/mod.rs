@@ -312,10 +312,19 @@ impl IndexService {
         let mut vectors: Vec<(String, Vec<f32>)> = Vec::new();
         let mut vectorized = false;
         if let Some(embedder) = &self.embedder {
+            // 维度守卫:复用只认维度与当前模型一致的旧向量——换模型后残维度
+            // 缓存一律视为缺量重嵌（否则该 chunk 永久不可见于语义检索）。
+            // dim 未可知（本进程首嵌前）时保守全量重嵌，首嵌后自愈。
+            let dim = embedder.dim();
             let mut reused: Vec<(String, Vec<f32>)> = Vec::new();
             let mut missing: Vec<String> = Vec::new();
             for c in &chunk_rows {
-                if let Some(v) = old_vectors.get(&c.chunk_hash) {
+                let reusable = old_vectors
+                    .get(&c.chunk_hash)
+                    .map(|v| dim.map_or(false, |d| v.len() == d))
+                    .unwrap_or(false);
+                if reusable {
+                    let v = old_vectors.get(&c.chunk_hash).unwrap();
                     if !reused.iter().any(|(h, _)| h == &c.chunk_hash) {
                         reused.push((c.chunk_hash.clone(), v.clone()));
                     }
@@ -930,6 +939,9 @@ mod tests {
         fn model_name(&self) -> String {
             "fake-test-model".into()
         }
+        fn dim(&self) -> Option<usize> {
+            Some(self.dim)
+        }
     }
 
     /// 关键词嵌入器（检索测试）：向量 = 关键词命中 0/1 维 + 常亮偏置维，
@@ -952,6 +964,9 @@ mod tests {
         }
         fn model_name(&self) -> String {
             "keyword-test-model".into()
+        }
+        fn dim(&self) -> Option<usize> {
+            Some(4)
         }
     }
 
@@ -1062,6 +1077,37 @@ mod tests {
         let all = svc.store().all_vectors().unwrap();
         assert!(all.len() >= 3);
         assert!(all.iter().all(|c| c.vector.len() == 8));
+    }
+
+    #[test]
+    fn dim_mismatch_vectors_are_reembedded_not_reused() {
+        // 维度守卫：换模型场景——库中 8 维旧向量 + 4 维新嵌入器,
+        // 同 hash 缓存不得复用（复用即该 chunk 永久不可见于语义检索）,
+        // 守卫判维度不符 → 全量重嵌自愈,库内维度归一
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.rs"), "fn alpha() { beta(); }").unwrap();
+        let old_emb = Arc::new(FakeEmbedder::new(8));
+        let svc = IndexService::open(root).unwrap().with_embedder(old_emb);
+        match svc.rebuild_sync() {
+            RebuildOutcome::Completed(s) => assert!(s.vectors > 0),
+            other => panic!("expected completed, got {other:?}"),
+        }
+        let new_emb = Arc::new(FakeEmbedder::new(4));
+        let svc2 = IndexService::open(root)
+            .unwrap()
+            .with_embedder(new_emb.clone());
+        // 追加换行:content_hash 变化触发重摄入,chunk 文本不变 → chunk_hash
+        // 不变 → 命中旧 8 维缓存,守卫须判维度不符重嵌
+        std::fs::write(root.join("a.rs"), "fn alpha() { beta(); }\n").unwrap();
+        svc2.update_files_sync(&["a.rs".to_string()]).unwrap();
+        assert!(
+            new_emb.embedded() > 0,
+            "dim-mismatched cache must be re-embedded, not reused"
+        );
+        let all = svc2.store().all_vectors().unwrap();
+        assert!(!all.is_empty());
+        assert!(all.iter().all(|c| c.vector.len() == 4));
     }
 
     #[test]

@@ -26,6 +26,12 @@ pub trait TextEmbedder: Send + Sync {
 
     /// 模型名（status 面展示）
     fn model_name(&self) -> String;
+
+    /// 输出向量维度（`None`=尚不可知——首嵌前旧维度缓存一律不复用，
+    /// 防换模型后残维度向量滞留：复用只补缺，维度不符即视为缺量重嵌）
+    fn dim(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// 语义面缺省模型目录：`<用户主目录>/.evo-agent/models/`
@@ -49,6 +55,8 @@ pub fn default_model_dir() -> Result<PathBuf, IndexError> {
 pub struct FastembedEmbedder {
     model: Mutex<TextEmbedding>,
     model_name: String,
+    /// 首嵌成功后记下的输出维度（线程安全一次性写入）
+    observed_dim: std::sync::OnceLock<usize>,
 }
 
 impl FastembedEmbedder {
@@ -62,10 +70,16 @@ impl FastembedEmbedder {
                 .with_cache_dir(cache_dir.to_path_buf()),
         )
         .map_err(|e| IndexError(format!("fastembed init: {e}")))?;
-        Ok(Self {
+        let this = Self {
             model: Mutex::new(model),
             model_name: "all-MiniLM-L6-v2 (q8, 384d)".into(),
-        })
+            observed_dim: std::sync::OnceLock::new(),
+        };
+        // 维度探针:装配期单条推理记下输出维度——重启后首轮即可复用跨重启
+        // 向量缓存(否则 dim 未知保守全量重嵌,D6 缓存每进程首拍失效);
+        // 探针失败不阻断装配(dim 维持 None=保守重嵌)
+        let _ = this.embed(&["dimension probe".to_string()]);
+        Ok(this)
     }
 }
 
@@ -78,13 +92,21 @@ impl TextEmbedder for FastembedEmbedder {
         let embeddings = model
             .embed(texts, None)
             .map_err(|e| IndexError(format!("fastembed embed: {e}")))?;
-        Ok(embeddings
+        let collected: Vec<Vec<f32>> = embeddings
             .into_iter()
             .map(|e| e.into_iter().collect())
-            .collect())
+            .collect();
+        if let Some(first) = collected.first() {
+            let _ = self.observed_dim.set(first.len());
+        }
+        Ok(collected)
     }
 
     fn model_name(&self) -> String {
         self.model_name.clone()
+    }
+
+    fn dim(&self) -> Option<usize> {
+        self.observed_dim.get().copied()
     }
 }

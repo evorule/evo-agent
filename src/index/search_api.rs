@@ -48,6 +48,9 @@ pub struct SearchQuery {
     pub limit: Option<usize>,
     /// 检索模式（缺省 lexical）
     pub mode: Option<String>,
+    /// 会话打开文件路径清单（逗号分隔，工作区相对路径；lexical 模式注入
+    /// 个性化排位——打开文件优先，缺省=全局口径）
+    pub open: Option<String>,
 }
 
 /// 检索模式（mode 参数白名单；缺省 lexical 与 v1 行为一致）
@@ -177,7 +180,22 @@ pub async fn search(State(state): State<AgentApiState>, Query(q): Query<SearchQu
     match mode {
         SearchMode::Lexical => {
             let graph = svc.graph();
-            let hits = graph.match_symbols(&query, limit);
+            // 个性化注入：请求携带打开文件清单时按其重算排位（打开文件优先）
+            let opens: Vec<String> = q
+                .open
+                .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            let hits = if opens.is_empty() {
+                graph.match_symbols(&query, limit)
+            } else {
+                let ranks = graph.personalized_ranks(&opens);
+                graph.match_symbols_with(&query, limit, &ranks)
+            };
             Json(json!({
                 "query": query,
                 "mode": "lexical",
