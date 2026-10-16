@@ -8,6 +8,7 @@ import {
   connStatus,
   sessionId,
   turnActive,
+  lastEngineEventAt,
   stepCount,
   messages,
   pushMessage,
@@ -282,6 +283,8 @@ function sendResume() {
 }
 
 function handleFrame(f) {
+  // 引擎活性触碰:任何帧到达即刷新(心跳停滞提示的判据源)
+  lastEngineEventAt.set(Date.now());
   switch (f.type) {
     case 'SessionCreated': {
       sessionId.set(f.session_id);
