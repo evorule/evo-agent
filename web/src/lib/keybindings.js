@@ -36,6 +36,7 @@ export const DEFAULT_KEYBINDINGS = [
   { key: 'f8', command: 'workbench.action.problems.next', when: '!inPalette' },
   { key: 'shift+f8', command: 'workbench.action.problems.prev', when: '!inPalette' },
   { key: 'alt+f8', command: 'workbench.action.problems.nextInFile', when: '!inPalette' },
+  { key: 'ctrl+k', command: 'ai.inlineChat', when: 'editorFocus' },
 ];
 
 // ---- key 规范化 ----
