@@ -116,6 +116,70 @@ pub(crate) fn tail_str(s: &str, n: usize) -> String {
     s[start..].to_string()
 }
 
+// ===== G4 判据生成(先写后锁/外部锚优先/生成执行解耦;执行半边=本文件既有机制层) =====
+
+/// 生成判据的提示模板(外部锚优先:强制 shell 命令形态,禁自由文本自评)
+pub(crate) fn build_criteria_prompt(goal: &str, tools: &[String]) -> String {
+    let tool_list = if tools.is_empty() {
+        "(工具清单不可用)".to_string()
+    } else {
+        tools.join(", ")
+    };
+    format!(
+        "你是验收判据设计器。为下述任务产出**一条 shell 验收命令**,供自动化门禁在 \
+         agent 声称完成时执行:exit 0 = 验收通过,非 0 = 拒绝。\n\n\
+         任务目标:\n{goal}\n\n\
+         可用工具面(判据只应使用 shell 可观测的外部事实,而非重新执行任务):\n{tool_list}\n\n\
+         硬性要求:\n\
+         1. 只输出一条命令,单行,不换行,不用 markdown 代码块,无任何解释文字;\n\
+         2. 优先外部锚:产物文件存在性/内容断言(test/grep)、退出码、HTTP 探针 \
+            (curl -fsS)、输出断言——不要让判据依赖 agent 的自我报告;\n\
+         3. 判据必须可重复执行且无副作用(只读检查;不得修改/删除任务产物);\n\
+         4. 判据不要重新执行任务本身,只验证其产物;\n\
+         5. 无法设计可执行判据时,输出以 echo 开头的最诚实降级判据 \
+            (如 `echo PENDING-HUMAN-REVIEW && exit 1`),保持单行。\n\n\
+         示例形态:test -f report.md && grep -q \"总销售额\" report.md"
+    )
+}
+
+/// 校验生成的判据(外部锚优先的结构保证:非命令形态/超长/多行一律拒绝)
+pub fn validate_generated_criteria(cmd: &str) -> Result<(), String> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return Err("判据为空".to_string());
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err("判据必须单行(多语句用 && 串联)".to_string());
+    }
+    if trimmed.len() > 2048 {
+        return Err(format!("判据超长({} 字节 > 2048)", trimmed.len()));
+    }
+    Ok(())
+}
+
+/// 从 LLM 响应中提取判据文本(剥 markdown 围栏与语言标签行;多行时取首个
+/// 非空行——容错模型惯性,后续仍过 validate 单行校验)
+pub(crate) fn extract_criteria(raw: &str) -> String {
+    let mut out = raw.trim().to_string();
+    if let Some(rest) = out.strip_prefix("```") {
+        let rest = rest.trim_start_matches(['\r', '\n']);
+        out = match rest.rfind("```") {
+            Some(end) => rest[..end].trim().to_string(),
+            None => rest.trim().to_string(),
+        };
+    }
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = match lines.next() {
+        Some(l) => l,
+        None => return String::new(),
+    };
+    // 裸语言标签行(如 ```sh 残留的 "sh"):真实 shell 判据必然含空格/路径/操作符
+    if first.len() <= 10 && first.chars().all(|c| c.is_ascii_alphabetic()) {
+        return lines.next().unwrap_or("").to_string();
+    }
+    first.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +248,63 @@ mod tests {
             apply_acceptance_gate(Some("exit 1"), &args).await,
             GateOutcome::Allow(_)
         ));
+    }
+
+    // ===== G4 判据生成纯函数 =====
+
+    #[test]
+    fn test_validate_criteria_accepts_command() {
+        assert!(validate_generated_criteria("test -f report.md").is_ok());
+        assert!(
+            validate_generated_criteria("  exit 0  ").is_ok(),
+            "首尾空白放行(trim 语义)"
+        );
+        let edge = "x".repeat(2048);
+        assert!(validate_generated_criteria(&edge).is_ok(), "2048 边界放行");
+    }
+
+    #[test]
+    fn test_validate_criteria_rejects_bad_shapes() {
+        assert!(validate_generated_criteria("").is_err(), "空判据拒绝");
+        assert!(validate_generated_criteria("   \t ").is_err(), "纯空白拒绝");
+        assert!(validate_generated_criteria("a\nb").is_err(), "多行拒绝");
+        assert!(validate_generated_criteria("a\r\nb").is_err(), "CRLF 拒绝");
+        let long = "x".repeat(2049);
+        assert!(validate_generated_criteria(&long).is_err(), "超长拒绝");
+    }
+
+    #[test]
+    fn test_extract_criteria_variants() {
+        assert_eq!(extract_criteria("test -f a.md"), "test -f a.md");
+        // 围栏与语言标签行剥离
+        assert_eq!(extract_criteria("```\ntest -f a.md\n```"), "test -f a.md");
+        assert_eq!(extract_criteria("```sh\ntest -f a.md\n```"), "test -f a.md");
+        assert_eq!(extract_criteria("```rust\ncargo build\n```"), "cargo build");
+        assert_eq!(
+            extract_criteria("```sh\ntest -f a.md"),
+            "test -f a.md",
+            "未闭合围栏容错"
+        );
+        // 多行:取首个非空行(容错;整体仍受单行校验约束)
+        assert_eq!(extract_criteria("test -f a.md\n这是解释"), "test -f a.md");
+        assert_eq!(
+            extract_criteria("  \n  \n"),
+            "",
+            "全空白返回空串(交由 validate 拒绝)"
+        );
+    }
+
+    #[test]
+    fn test_criteria_prompt_contains_goal_and_anchors() {
+        let p = build_criteria_prompt(
+            "生成月报",
+            &["file_read".to_string(), "shell_exec".to_string()],
+        );
+        assert!(p.contains("生成月报"));
+        assert!(p.contains("file_read"));
+        assert!(p.contains("单行"));
+        assert!(p.contains("外部锚"));
+        // 空工具面也成立
+        assert!(build_criteria_prompt("g", &[]).contains("工具清单不可用"));
     }
 }

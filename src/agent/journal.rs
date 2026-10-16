@@ -82,7 +82,7 @@ pub struct TokenRecord {
     pub total: u64,
 }
 
-/// journal 事件(19 种;schema 终版 = ATIF 映射表 §二增补)
+/// journal 事件(20 种;schema 终版 = ATIF 映射表 §二增补)
 ///
 /// 序列化形态:`{"type":"<event>","payload":{...}}`(adjacently tagged,
 /// 与文件行内 seq/ts 平铺后即全行)
@@ -437,6 +437,17 @@ pub enum JournalEvent {
         actions: u32,
         /// 触发的阈值(max_actions_per_run)
         threshold: u32,
+    },
+    /// G4 在线 verifier 判据生成落账(先写后锁):主循环开工前 LLM 生成验收
+    /// 判据并锁定(runner 私有状态,LLM 面无工具可达)时写本事件。判据全文+
+    /// 生成模型入账(时间戳=行级 ts;生成过程 prompt/response 全文在 sidecar
+    /// 会话事实链,audit_purpose=acceptance_criteria;执行消费面在 task_done
+    /// 门禁的 acceptance_passed)。观测面,不参与步映射。
+    AcceptanceCriteriaGenerated {
+        /// 生成的判据全文(已过 validate_generated_criteria 单行校验)
+        criteria: String,
+        /// 生成调用模型名(handler 主模型)
+        model: String,
     },
 }
 
@@ -1249,6 +1260,18 @@ impl JournalWriter {
             agent_type: agent_type.to_string(),
             depth,
             task_digest: task_digest.to_string(),
+        })
+    }
+
+    /// G4 判据生成落账(先写后锁的会话账面锚;best-effort 调用方决定失败处置)
+    pub fn acceptance_criteria_generated(
+        &self,
+        criteria: &str,
+        model: &str,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::AcceptanceCriteriaGenerated {
+            criteria: criteria.to_string(),
+            model: model.to_string(),
         })
     }
 }

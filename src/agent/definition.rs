@@ -555,6 +555,15 @@ pub struct AgentDefinition {
     /// **判据不过不存在 done 退出路径**。未配置时不拦截（非长程运行零影响）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance_command: Option<String>,
+    /// G4 判据生成开关(可选,缺省 false 零变化):true 且未配静态
+    /// acceptance_command 时,runner 主循环开工前由 LLM 一次性生成验收判据
+    /// 并锁定(先写后锁:锁定后运行中不可改;外部锚优先:判据必须是 shell
+    /// 命令形态;生成执行解耦:生成经审计链,执行仍走 acceptance.rs 机制层);
+    /// def 静态判据优先级最高(人工预锁 > LLM 生成);生成/校验失败 =
+    /// run fail-visible 终止。开关写入定义文件即人工预先授权(policy 档
+    /// 哲学同构),判据全文+模型+时间戳落 journal 可回放
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_generation: Option<bool>,
     /// I2 词表声明（数据化：definition 级语言风格覆盖；None=机制内建
     /// v2 双语表。serde 缺省 None=既有定义零影响）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1945,6 +1954,7 @@ mod tests {
             output_format: None,
             context_window_tokens: None,
             acceptance_command: None,
+            acceptance_generation: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,
@@ -2319,6 +2329,7 @@ mod tests {
             output_format: None,
             context_window_tokens: None,
             acceptance_command: None,
+            acceptance_generation: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,
@@ -2572,6 +2583,7 @@ mod tests {
             output_format: None,
             context_window_tokens: None,
             acceptance_command: None,
+            acceptance_generation: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,
@@ -2809,6 +2821,7 @@ mod tests {
             output_format: None,
             context_window_tokens: None,
             acceptance_command: None,
+            acceptance_generation: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,

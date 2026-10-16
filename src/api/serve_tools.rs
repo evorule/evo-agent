@@ -598,8 +598,8 @@ pub fn with_shell_exec_profile(
     filtered: &mut ToolHandler,
     profile: crate::builtin_tools::shell_exec::ExecutionProfile,
 ) {
-    let tool = crate::builtin_tools::shell_exec::ShellExecTool::new()
-        .with_execution_profile(profile);
+    let tool =
+        crate::builtin_tools::shell_exec::ShellExecTool::new().with_execution_profile(profile);
     filtered.register_static("shell_exec", std::sync::Arc::new(tool));
     filtered.register_static(
         "python_exec",
@@ -1786,6 +1786,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             output_format: None,
             context_window_tokens: None,
             acceptance_command: None,
+            acceptance_generation: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             max_parallel_tools: 1,

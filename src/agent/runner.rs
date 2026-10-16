@@ -920,6 +920,8 @@ pub struct AgentRunner {
     /// runner 强制执行,exit 0=通过放行,非 0=门禁拒绝(不存在 done 退出路径)。
     /// None=不拦截(非长程运行零影响)。由 from_definition 从 def 穿线。
     acceptance_command: Option<String>,
+    /// G4 判据生成开关(先写后锁;from_definition 解析:静态判据优先,缺省 false 零变化)
+    acceptance_generation: bool,
     /// 进展停滞检测器(F2 空转克星)。跨轮持续观察
     /// (工具名,参数,结果)三元组,连续重复→警告→按 H2 阻塞收尾
     stagnation: crate::agent::stagnation::StagnationDetector,
@@ -1072,6 +1074,7 @@ impl AgentRunner {
             journal_dir: None,
             compaction_policy: None,
             acceptance_command: None,
+            acceptance_generation: false,
             stagnation: crate::agent::stagnation::StagnationDetector::new(),
             pipeline_entry: crate::agent::pipeline::PipelineEntry::React,
             assembly_scope_focus: false,
@@ -1819,6 +1822,9 @@ impl AgentRunner {
         // 判据自检回路——acceptance_command 从 definition 穿线
         // (task_done 提交前 runner 强制执行验收命令,判据不过不存在 done 退出路径)
         self.acceptance_command = def.acceptance_command.clone();
+        // G4:判据生成开关(缺省不变式——未声明/静态判据在手 = false,零行为变化)
+        self.acceptance_generation =
+            def.acceptance_generation == Some(true) && self.acceptance_command.is_none();
         // 用户决策 3 + G10：summary_model 单独配置,同时构造 ContextSummarizer
         if let Some(sm) = &def.memory.summary_model {
             self = self.with_summary_model(sm);
@@ -2435,6 +2441,58 @@ impl AgentRunner {
         info!(%session_id, total, "tool_trace batch submitted to engine audit chain");
     }
 
+    /// G4 判据生成(先写后锁/外部锚优先/生成执行解耦)
+    ///
+    /// 主循环开工前一次性生成验收判据并锁定:
+    /// - 生成 = AuditedLlm sidecar 一次性会话(与主循环同 call_external 契约,
+    ///   prompt/response 全文入审计链,audit_purpose=acceptance_criteria);
+    /// - 校验 = acceptance::validate_generated_criteria(单行/非空/≤2048——
+    ///   结构保证判据是可执行命令而非自由文本自评);
+    /// - 锁定 = 写入 self.acceptance_command 后运行期不可改(LLM 面无工具可达);
+    /// - 落账 = journal 在手时写 acceptance_criteria_generated(判据全文+生成
+    ///   模型;时间戳=行级 ts)。run() 纯路径无 journal,账面由 sidecar 事实链
+    ///   承载;落账失败 fail-soft(与其它 journal 写入同风格,不重复计错);
+    /// - 失败 = fail-visible 终止 run(显式开启生成=要求判据必须存在,
+    ///   静默降级为无判据运行违背开启意图);
+    /// - 未开启/已有静态判据 = no-op(缺省不变式,零行为变化)。
+    async fn generate_acceptance_criteria(&mut self, goal: &str) -> Result<(), AgentError> {
+        if !self.acceptance_generation || self.acceptance_command.is_some() {
+            return Ok(());
+        }
+        let tools = self.tool_handler.tool_names();
+        let prompt = crate::agent::acceptance::build_criteria_prompt(goal, &tools);
+        // 生成模型 = 主模型(handler 内建;summary_model 偏好不接线——LlmHandler
+        // 无模型 setter,复用需重构摘要器构造;语义等价,偏差已留痕)
+        let model = self.llm_handler.default_model().to_string();
+        let audited = crate::agent::audited_llm::AuditedLlm::new(
+            self.evorule_client.clone(),
+            self.llm_handler.clone(),
+        );
+        let params = serde_json::json!({
+            "temperature": 0.0,
+            "messages": [{ "role": "user", "content": prompt }],
+        });
+        let raw = audited
+            .execute("acceptance_criteria", &params)
+            .await
+            .map_err(|e| {
+                AgentError::Internal(format!("acceptance criteria generation failed: {e}"))
+            })?;
+        let content = raw.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let cmd = crate::agent::acceptance::extract_criteria(content);
+        crate::agent::acceptance::validate_generated_criteria(&cmd)
+            .map_err(|e| AgentError::Internal(format!("acceptance criteria invalid: {e}")))?;
+        // 先写后锁:此后 LLM 面无任何工具可改判据;生成过程全文在 sidecar 事实链
+        info!(criteria = %cmd, model = %model, "acceptance criteria generated and LOCKED (运行期不可改)");
+        if let Some(j) = self.active_journal.as_deref() {
+            if let Err(e) = j.acceptance_criteria_generated(&cmd, &model) {
+                tracing::warn!(error = %e, "acceptance_criteria_generated journal failed");
+            }
+        }
+        self.acceptance_command = Some(cmd);
+        Ok(())
+    }
+
     /// 非流式主循环:执行 ReAct 推理至目标完成,返回最终结果
     ///
     /// 与 [`Self::run_streaming`] 共享 G17 工具插桩与治理链路;本路径在
@@ -2442,10 +2500,9 @@ impl AgentRunner {
     ///
     /// 引擎自 v0.5.0 起仅单发桥接(call_external 的 io_response 消费后即
     /// Stable,不再发起下一轮),多轮编排由应用层负责——本方法**没有**本地
-    /// 工具结果回喂循环,LLM 首轮返回 tool_calls 的任务会在 Stable 终止
-    /// (此时按编排断裂指纹显式判错,不再假绿)。生产多轮工具任务一律走
-    /// [`Self::run_streaming`](本地回喂循环);本方法仅保留给 mock 引擎
-    /// 测试面与单轮纯文本场景。
+    /// 回喂循环;首轮返回 tool_calls 的任务会在 Stable 终止(此时按编排断裂
+    /// 指纹显式判错,不再假绿)。生产多轮工具任务一律走 [`Self::run_streaming`]
+    /// (本地回喂循环);本方法仅保留给 mock 引擎测试面与单轮纯文本场景。
     pub async fn run(&mut self, goal: &str) -> Result<AgentResult, AgentError> {
         let start_time = std::time::Instant::now();
 
@@ -2556,6 +2613,10 @@ impl AgentRunner {
         self.bind_propose_anchor(&session_id);
         // 双通道笔记批:note_write 会话期注册(payload 写,session_id 在手)
         self.register_session_scoped_memory_tools(&session_id);
+        // G4 判据生成(先写后锁):主循环开工前一次性生成验收判据并锁定;
+        // 生成经 AuditedLlm sidecar 审计链(prompt/response 全文入账),
+        // 执行仍走 acceptance.rs 机制层(生成执行解耦);失败=fail-visible
+        self.generate_acceptance_criteria(goal).await?;
         // 自主交接批:handover 双工具+session_spawn 会话期重绑(占位→wired,
         // session_id 在手;run 纯路径无 journal,传 None——语义事件缺席如实
         // 降级,调用镜像 tool_invoked/tool_result 仍在)
@@ -3403,6 +3464,10 @@ impl AgentRunner {
                 )),
                 journal_dir: journal_dir.clone(),
                 acceptance_command: acceptance_command.clone(),
+                // G4:子代理不继承判据生成开关(生成判据=父任务开工时的内存锁态,
+                // 跨 runner 实例不继承;子任务门禁走静态判据穿线,本字段恒 false
+                // ——缺省不变式,子代理行为与 G4 前完全一致)
+                acceptance_generation: false,
                 stagnation: crate::agent::stagnation::StagnationDetector::new(),
                 pipeline_entry,
                 assembly_scope_focus,
@@ -5723,6 +5788,26 @@ impl AgentRunner {
                                if let Some(w) = runner.chain_watch.take() {
                                    g.attach_chain_watch(w);
                                }
+                           }
+
+                           // G4 判据生成(先写后锁):仅 Fresh(新建会话=任务开工)生成一次;
+                           // continuation/crash-resume 属任务中段,重生成=判据漂移违背锁定
+                           // 语义——跳过(生成的判据为 runner 内存态,跨 runner 实例不可恢复,
+                           // 本轮门禁不生效;续话场景应配静态判据,机制缺口已登记 O 项)。
+                           // 失败 fail-visible:显式开启=要求判据必须存在,不静默降级。
+                           if recovery == RecoveryMode::Fresh {
+                               if let Err(e) = runner.generate_acceptance_criteria(&goal).await {
+                                   yield Err(e);
+                                   return;
+                               }
+                           } else if runner.acceptance_generation {
+                               warn!(
+                                   %session_id,
+                                   "acceptance_generation enabled but not a fresh run: \
+                                    generated criteria are per-run in-memory and NOT \
+                                    regenerated mid-task; task_done gate unenforced this turn \
+                                    (use static acceptance_command for continuation workflows)"
+                               );
                            }
 
                            // K-11/P2-1 观测落账(延迟点;recall 块已暂存 recall_hits/lex_stats,
