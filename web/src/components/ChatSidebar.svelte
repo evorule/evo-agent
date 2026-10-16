@@ -193,7 +193,8 @@
       try {
         const res = await collectCandidates(query, {});
         if (seq !== mpSeq) return; // 过期响应丢弃
-        const groups = withQuickItems(res.groups);
+        // 快捷项仅空查询注入(设计口径:空查询显示快捷项;输入中让位检索结果)
+        const groups = query ? res.groups : withQuickItems(res.groups);
         let idx = 0;
         const enabled = [];
         for (const g of groups) {

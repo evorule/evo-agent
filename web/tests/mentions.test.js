@@ -217,6 +217,31 @@ describe('collectCandidates', () => {
     expect(groups[0].items).toHaveLength(50);
   });
 
+  it('组间公平配额:大组不独占预算,其余组保底可见', async () => {
+    const files = Array.from({ length: 50 }, (_, i) => ({
+      type: 'file',
+      ref: `f${i}.rs`,
+      label: `f${i}`,
+      detail: '',
+      positions: [],
+    }));
+    registerProvider('many', staticProvider(files));
+    registerProvider(
+      'few',
+      staticProvider([
+        { type: 'folder', ref: 'src', label: 'src', detail: '', positions: [] },
+        { type: 'selection', ref: 'a.rs:1-2', label: '选区', detail: '', positions: [] },
+      ]),
+    );
+    const { groups } = await collectCandidates('', {}, 50);
+    const byType = Object.fromEntries(groups.map((g) => [g.type, g.items.length]));
+    // 首轮限额=25:file 与 folder/selection 各保底可见,二轮分摊剩余
+    expect(byType['file']).toBeGreaterThanOrEqual(25);
+    expect(byType['file']).toBeLessThanOrEqual(48);
+    expect(byType['folder']).toBe(1);
+    expect(byType['selection']).toBe(1);
+  });
+
   it('candidates 抛错的 provider 不阻断其余', async () => {
     registerProvider('boom2', {
       candidates() {
