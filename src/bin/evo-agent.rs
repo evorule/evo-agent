@@ -600,8 +600,24 @@ fn cmd_run(
         std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>,
         Option<evo_agent::agent::runner::RunawayPolicy>,
     ) = if approval_auto || auto_approve_candidates {
+        // 红线豁免前置闸:命中且未显式关闭时回落 stdin 人工确认
+        let override_flag = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+            .map(|s| {
+                s.merged()
+                    .0
+                    .get("approval.exemptionOverride")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
         (
-            std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+            std::sync::Arc::new(evo_agent::agent::approval::RedLineGuardApproval::new(
+                std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+                std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                    auto_approve: false,
+                }),
+                override_flag,
+            )),
             None,
         )
     } else if def.approval_mode.as_deref() == Some("policy") {
@@ -896,8 +912,23 @@ async fn patrol_build_runner(
     // 人工审查开合(2026-09-28):巡视为无人值守场景,决策端统一 PolicyApproval
     // (语义归一:approver="auto_policy"+判定理由必产,替换原 CliApproval{
     // auto_approve} 的 "cli-user" 语义混乱点;运行期零人工决策事件不变)
+    // 红线豁免前置闸:无人值守无人工可回落,命中且未显式关闭时显式拒绝
+    // (DenyAll——保守安全,理由携带红线标记入留痕)
+    let override_flag = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+        .map(|s| {
+            s.merged()
+                .0
+                .get("approval.exemptionOverride")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
     Ok(runner.with_approval_callback(std::sync::Arc::new(
-        evo_agent::agent::approval::PolicyApproval,
+        evo_agent::agent::approval::RedLineGuardApproval::new(
+            std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+            std::sync::Arc::new(evo_agent::agent::approval::DenyAll),
+            override_flag,
+        ),
     )))
 }
 

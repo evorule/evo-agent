@@ -658,6 +658,18 @@ async fn handle_ws(
 ///
 /// crate 内共享：WS 面（construct_runner）与 HTTP 面（run_agent /
 /// run_agent_stream）同口径调用，避免三态路由在 serve 各执行面分叉。
+/// `approval.exemptionOverride` 设置读取(用户显式关闭红线豁免强制;
+/// serve WS/HTTP 两面共读,缺省 false=红线强制生效)
+pub(crate) fn approval_exemption_override(state: &AgentApiState) -> bool {
+    state
+        .workbench_settings()
+        .merged()
+        .0
+        .get("approval.exemptionOverride")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 pub(crate) fn build_approval_callback(
     state: &AgentApiState,
     mode: Option<&str>,
@@ -667,19 +679,23 @@ pub(crate) fn build_approval_callback(
 ) {
     use crate::agent::approval_policy::{ApprovalPolicyFile, AuditedReviewInvoker, PolicyReview};
     if mode == Some("auto_policy") {
-        return (Arc::new(crate::agent::approval::PolicyApproval), None);
+        // 红线豁免前置闸:豁免清单适用于所有档位——命中且未显式关闭时
+        // 回落人工审批卡(无人值守场景 60s 窗超时自动拒,保守安全)
+        let override_flag = approval_exemption_override(state);
+        let guarded = crate::agent::approval::RedLineGuardApproval::new(
+            Arc::new(crate::agent::approval::PolicyApproval),
+            Arc::new(crate::governance::GovAuditedApproval::new(Arc::new(
+                crate::agent::approval::HttpApproval::new(state.pending_approvals().clone()),
+            ))),
+            override_flag,
+        );
+        return (Arc::new(guarded), None);
     }
     if mode == Some("policy") {
         let policy_path = state.workdir().join(".evo").join("approval-policy.toml");
         match ApprovalPolicyFile::load(&policy_path) {
             Ok(policy) => {
-                let override_flag = state
-                    .workbench_settings()
-                    .merged()
-                    .0
-                    .get("approval.exemptionOverride")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let override_flag = approval_exemption_override(state);
                 let audited = crate::agent::audited_llm::AuditedLlm::new(
                     state.evorule_client().clone(),
                     crate::io_handlers::LlmHandler::from_config(state.llm_config()),
