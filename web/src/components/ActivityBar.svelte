@@ -12,6 +12,7 @@
     { id: 'search', label: '搜索', enabled: true },
     { id: 'scm', label: '源代码管理', enabled: true },
     { id: 'orchestration', label: '编排(委托谱系)', enabled: true },
+    { id: 'extensions', label: '扩展', enabled: true },
     { id: 'audit', label: '审计(治理叠加阶段接入)', enabled: false },
     { id: 'settings', label: '设置', enabled: true },
   ];

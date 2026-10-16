@@ -344,3 +344,35 @@ export function getOrchestrationLinks() {
 export function getOrchestrationAgents() {
   return fetch('/api/orchestration/agents', { headers: headers() }).then(unwrap);
 }
+
+/** 技能包全清单(三态;F2 扩展面板) */
+export function listSkills() {
+  return fetch('/api/skills', { headers: headers() })
+    .then(unwrap)
+    .then((d) => d.skills ?? []);
+}
+
+/** 待审批技能(discovered 项+SKILL.md 全文预览,审批前必读) */
+export function listPendingSkills() {
+  return fetch('/api/skills/pending', { headers: headers() })
+    .then(unwrap)
+    .then((d) => d.pending ?? []);
+}
+
+/** 批准技能(blake3 落账→active) */
+export function approveSkill(name, level) {
+  return fetch('/api/skills/approve', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ name, level }),
+  }).then(unwrap);
+}
+
+/** 撤销技能(状态置 revoked) */
+export function revokeSkill(name, level) {
+  return fetch('/api/skills/revoke', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ name, level }),
+  }).then(unwrap);
+}
