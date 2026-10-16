@@ -670,6 +670,29 @@ pub(crate) fn approval_exemption_override(state: &AgentApiState) -> bool {
         .unwrap_or(false)
 }
 
+/// 审批档位解析单源:定义级 `approval_mode` 优先;未指定时回落设置键
+/// `approval.mode.shellExec`(每工具组档位=设置键的接线——shell_exec 为
+/// candidate 主面,其设置档位充作会话缺省档位);两级均未指定 → None
+/// (manual 缺省)。未知设置值不计(回落 None,门禁语义保守)
+pub(crate) fn resolve_approval_mode(
+    state: &AgentApiState,
+    def_mode: Option<&str>,
+) -> Option<String> {
+    if let Some(m) = def_mode {
+        return Some(m.to_string());
+    }
+    let (merged, _) = state.workbench_settings().merged();
+    let v = merged
+        .get("approval.mode.shellExec")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    match v {
+        "manual" | "auto_policy" | "policy" => Some(v.to_string()),
+        _ => None,
+    }
+}
+
 pub(crate) fn build_approval_callback(
     state: &AgentApiState,
     mode: Option<&str>,
@@ -855,8 +878,10 @@ async fn construct_runner(
     let config = def.to_agent_config();
     // G8 审批决策端 + Runaway 护栏:同一次 mode 判别/文件加载
     // 双产出(决策端挂 ApprovalCallback,护栏策略挂 with_runaway_policy)
+    // 档位解析单源:定义级优先,未指定回落设置键 approval.mode.shellExec
+    let resolved_mode = resolve_approval_mode(state, def.approval_mode.as_deref());
     let (approval_callback, runaway_policy) =
-        build_approval_callback(state, def.approval_mode.as_deref());
+        build_approval_callback(state, resolved_mode.as_deref());
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
         // M5-a:注入生效能力边界(声明重绑工具面 + 会话边界段/边界事实)
         .with_capability_boundary(capability_boundary)
@@ -1079,6 +1104,67 @@ fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json::Val
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    // ===== 审批档位解析单源测试(定义级优先/设置键回落/未知值保守) =====
+
+    fn resolver_state(dir: &std::path::Path) -> AgentApiState {
+        AgentApiState::new_with_metrics(
+            crate::agent::AgentDefinitionManager::with_default_dir(),
+            crate::api::evorule_client::EvoruleApiClient::new("http://localhost:0"),
+            std::sync::Arc::new(crate::api::metrics::Metrics::new().unwrap()),
+            dir.to_path_buf(),
+            std::sync::Arc::new(crate::api::workspace_client::WorkspaceApiClient::new(
+                "http://localhost:0",
+            )),
+            std::sync::Arc::new(std::sync::RwLock::new(
+                crate::io_handlers::tool_handler::ToolHandler::new(),
+            )),
+        )
+    }
+
+    #[test]
+    fn resolve_approval_mode_definition_wins_over_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = resolver_state(dir.path());
+        // 定义级显式指定:无视设置键
+        assert_eq!(
+            resolve_approval_mode(&state, Some("policy")),
+            Some("policy".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_approval_mode_falls_back_to_setting_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("data").join("workbench_settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            r#"{"approval.mode.shellExec": "auto_policy"}"#,
+        )
+        .unwrap();
+        let state = resolver_state(dir.path());
+        assert_eq!(
+            resolve_approval_mode(&state, None),
+            Some("auto_policy".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_approval_mode_default_manual_and_unknown_conservative() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = resolver_state(dir.path());
+        // 出厂默认 manual:显式 manual 态(行为与缺省 None 的 manual 臂一致)
+        assert_eq!(
+            resolve_approval_mode(&state, None),
+            Some("manual".to_string())
+        );
+        // 用户手写未知值:不计,回落 None(manual 缺省,门禁保守)
+        let settings_path = dir.path().join("data").join("workbench_settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(&settings_path, r#"{"approval.mode.shellExec": "yolo"}"#).unwrap();
+        assert_eq!(resolve_approval_mode(&state, None), None);
+    }
 
     // ===== ClientMessage 反序列化测试 =====
 
