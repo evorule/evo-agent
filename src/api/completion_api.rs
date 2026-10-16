@@ -48,8 +48,11 @@ mod tests {
     }
 }
 
-/// 补全服务端超时(超时即丢弃,前端静默)
-const COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(800);
+/// 补全服务端超时(超时即丢弃,前端静默)。设计原值 800ms;实施期上调 10s——
+/// 推理型模型(MiniMax M2.5 真机实测 2.8-3.4s/M3 1.6s,偶发抖动破 3s)
+/// 恒超 800ms/3s 即恒空文本;去重缓存+前端 debounce 仍兜请求频次,
+/// 迟到的建议由前端过期丢弃,不打扰输入
+const COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10_000);
 /// Inline Chat 改写超时(改写全文较长)
 const INLINE_CHAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 /// FIM 上下文预算:prefix/suffix 字符裁剪(约 2000/500 token 量级)
@@ -103,7 +106,15 @@ async fn openai_compatible_call(
     timeout: std::time::Duration,
     max_tokens: u32,
 ) -> Result<String, String> {
-    let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
+    let base = api_base.trim_end_matches('/');
+    // 端点语义兼容:OpenAI 形态 base(.../v1)追加 /chat/completions;
+    // MiniMax 形态 base 即完整端点(.../chatcompletion_v2)原样使用——
+    // 盲拼会得到 chatcompletion_v2/chat/completions 的 404
+    let url = if base.ends_with("chatcompletion_v2") || base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{base}/chat/completions")
+    };
     // 文档化(clippy):构造即用
     let client = reqwest::Client::new();
     let mut body = json!({
@@ -199,8 +210,10 @@ pub async fn completion(
     .await
     {
         Ok(t) => t,
-        Err(_) => {
-            // 补全失败前端静默:返回空文本(HTTP 200,零打扰纪律)
+        Err(e) => {
+            // 补全失败前端静默:返回空文本(HTTP 200,零打扰纪律);
+            // 失败原因落 tracing 日志面(不回传前端)
+            tracing::warn!(error = %e, "completion: llm call failed, returning empty");
             return Json(json!({ "text": "" })).into_response();
         }
     };
