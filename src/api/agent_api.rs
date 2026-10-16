@@ -731,6 +731,17 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/lsp/ws",
             axum::routing::get(crate::api::lsp_api::lsp_ws),
         )
+        // DAP 代理面(运行和调试板块):适配器白名单检测 + WS 透明转发(每调试
+        // 会话单连接单适配器;fail-closed 缺省白名单空=拒绝);G16 中间件自动
+        // 覆盖,WS 内二次校验
+        .route(
+            "/api/dap/adapters",
+            axum::routing::get(crate::api::dap_api::adapters),
+        )
+        .route(
+            "/api/dap/ws",
+            axum::routing::get(crate::api::dap_api::dap_ws),
+        )
         // 工作台终端面(人的终端,治理分级=会话留痕+会话内零拦截;独立端点
         // 与会话 WS/LSP WS 互不牵连;G16 中间件自动覆盖,WS 内二次校验)
         .route(

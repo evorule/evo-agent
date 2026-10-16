@@ -52,6 +52,8 @@ pub enum GovEventKind {
     S4Publish,
     /// terminal PTY 会话生命周期（create/close 两态，record-only 留痕）
     TerminalSession(TerminalAction),
+    /// 调试适配器会话生命周期（spawn/exit 两态，record-only 留痕）
+    DapSession(TerminalAction),
     /// B21 journal 重大事件镜像（compaction 完成/resume 恢复）
     B21JournalMilestone,
     /// AI commit message 生成（record-only：动作+耗时+产物长度；生成绝不自动提交）
@@ -78,6 +80,8 @@ impl GovEventKind {
             Self::S4Publish => "s4_publish",
             Self::TerminalSession(TerminalAction::Create) => "terminal_session_create",
             Self::TerminalSession(TerminalAction::Close) => "terminal_session_close",
+            Self::DapSession(TerminalAction::Create) => "dap_session_create",
+            Self::DapSession(TerminalAction::Close) => "dap_session_close",
             Self::B21JournalMilestone => "b21_journal_milestone",
             Self::AiCommit => "ai_commit",
         }
