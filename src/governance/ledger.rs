@@ -54,6 +54,8 @@ pub enum GovEventKind {
     TerminalSession(TerminalAction),
     /// B21 journal 重大事件镜像（compaction 完成/resume 恢复）
     B21JournalMilestone,
+    /// AI commit message 生成（record-only：动作+耗时+产物长度；生成绝不自动提交）
+    AiCommit,
 }
 
 /// terminal 会话动作（create/close 拆两路径段，查询面单段精确）
@@ -77,6 +79,7 @@ impl GovEventKind {
             Self::TerminalSession(TerminalAction::Create) => "terminal_session_create",
             Self::TerminalSession(TerminalAction::Close) => "terminal_session_close",
             Self::B21JournalMilestone => "b21_journal_milestone",
+            Self::AiCommit => "ai_commit",
         }
     }
 }
@@ -349,6 +352,10 @@ mod tests {
             (
                 GovEventKind::B21JournalMilestone,
                 "shared.gov.gov.b21_journal_milestone.1790400000.7",
+            ),
+            (
+                GovEventKind::AiCommit,
+                "shared.gov.gov.ai_commit.1790400000.8",
             ),
         ];
         for (i, (kind, expected)) in cases.iter().enumerate() {
