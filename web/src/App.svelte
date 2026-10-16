@@ -40,7 +40,7 @@
     openFile,
     scmGenerateIntent,
   } from './lib/stores.js';
-  import { loadSettings } from './lib/settings.js';
+  import { loadSettings, settingsState } from './lib/settings.js';
   import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
   import { initContextTracking } from './lib/context-keys.js';
   import { getEffectiveRules, resolveKeybinding, migrateKeybindings } from './lib/keybindings.js';
