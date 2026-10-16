@@ -125,7 +125,14 @@ pub struct MemoryEvent {
     pub source: EventSource,
 
     /// 置信度(0.0-1.0,user_input=1.0,llm_extraction 视情况)
-    #[serde(default = "default_confidence")]
+    ///
+    /// 读侧容错:evorule 存储层将浮点规范化为字符串(1.0 → "1.0",整数/布尔
+    /// 原样),反序列化需同时接受数字与字符串形态(与 EventRef 新旧形态
+    /// 兼容同族);缺省 1.0
+    #[serde(
+        default = "default_confidence",
+        deserialize_with = "deserialize_confidence"
+    )]
     pub confidence: f32,
 
     /// 标签(自由分类,与 031 兼容)
@@ -143,6 +150,24 @@ pub struct MemoryEvent {
 
 fn default_confidence() -> f32 {
     1.0
+}
+
+/// confidence 读侧容错:接受数字与字符串两种形态(存储层浮点规范化为字符串,
+/// 实测探针:写 1.0/2.5 → 读回 "1.0"/"2.5",整数与字符串原样)
+fn deserialize_confidence<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Num(f32),
+        Str(String),
+    }
+    match Raw::deserialize(deserializer)? {
+        Raw::Num(n) => Ok(n),
+        Raw::Str(s) => s.parse::<f32>().map_err(serde::de::Error::custom),
+    }
 }
 
 impl MemoryEvent {
@@ -483,6 +508,30 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: MemoryEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, deserialized);
+    }
+
+    /// 存储层浮点规范化容错:confidence 以字符串形态读回(实测账面存储
+    /// 形态,含缺省 fact_id/effects 字段)必须可反序列化
+    #[test]
+    fn test_confidence_server_canonical_string() {
+        let stored = r#"{
+            "confidence":"1.0","content":{"duration_ms":0,"ok":true,"tool":"file_list"},
+            "entities":[],"event_id":"EL-000002","event_type":{"kind":"SystemObservation"},
+            "session_id":"2","source":"ToolResult","timestamp":1792114502,
+            "cause":30000
+        }"#;
+        let ev: MemoryEvent = serde_json::from_str(stored).unwrap();
+        assert_eq!(ev.confidence, 1.0);
+        assert_eq!(ev.cause, Some(30000));
+
+        // 数字形态(本端写侧直读)与非法字符串(报错不静默改值)行为
+        let num: MemoryEvent =
+            serde_json::from_str(r#"{"event_id":"E1","event_type":{"kind":"SystemObservation"},"timestamp":1,"source":"ToolResult","content":null,"confidence":0.5}"#).unwrap();
+        assert_eq!(num.confidence, 0.5);
+        assert!(serde_json::from_str::<MemoryEvent>(
+            r#"{"event_id":"E2","event_type":{"kind":"SystemObservation"},"timestamp":1,"source":"ToolResult","content":null,"confidence":"abc"}"#
+        )
+        .is_err());
     }
 
     /// 改进2：EventRef 向后兼容（旧字符串数组 / 新对象数组）
