@@ -1,0 +1,26 @@
+# evo-agent agent preset for ALE (referenced from an experiment yaml's
+# `agents:` list). `class:` accepts any importable deployer FQN — install
+# this package first (see tools/ale/README.md) so the import resolves.
+class: evo_agent_ale.deployer.EvoAgentDeployer
+id: evo-agent
+executor: local
+config:
+  # Absolute path to the evo-agent executable (adjust per machine).
+  serve_binary: D:/evo-agent/target/release/evo-agent.exe
+  serve_port: 18091
+  agent_type: general
+  # Benchmark line: request-level execution profile + tool allowlist.
+  # `tools` is intersect-only against the agent definition surface;
+  # `mcp_vm_*` / `mcp_cua_*` cover the official sandbox bridges.
+  execution_profile: sandbox-trusted
+  tools:
+    - shell_exec
+    - python_exec
+    - file_*
+    - search_*
+    - mcp_vm_*
+    - mcp_cua_*
+  # Headless benchmark runs must not stall on human approval; the two
+  # bridge servers are explicitly allow-listed in the generated per-run
+  # evo-agent.toml (config-level authorization, visible in the audit trail).
+  always_allow_bridges: true
