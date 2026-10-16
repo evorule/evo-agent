@@ -79,8 +79,7 @@ impl ToolFunction for PythonExecTool {
         });
         // G1 审计同权:trusted 档结果带 profile 标记(workbench 结果不变)
         if self.profile == crate::builtin_tools::shell_exec::ExecutionProfile::SandboxTrusted {
-            result["execution_profile"] =
-                json!(self.profile.as_str());
+            result["execution_profile"] = json!(self.profile.as_str());
         }
         Ok(result)
     }
@@ -125,17 +124,21 @@ mod tests {
         let p = tool
             .evaluate_proposal(&json!({"code": "print(1)"}))
             .expect("workbench must propose");
-        assert_eq!(p.get("category").and_then(|v| v.as_str()), Some("candidate"));
+        assert_eq!(
+            p.get("category").and_then(|v| v.as_str()),
+            Some("candidate")
+        );
     }
 
     /// G1:trusted 档不出提案(隔离环境内 python 是任务本体,直跑落账)
     #[test]
     fn test_trusted_no_proposal() {
-        let tool = PythonExecTool::new()
-            .with_execution_profile(
-                crate::builtin_tools::shell_exec::ExecutionProfile::SandboxTrusted,
-            );
-        assert!(tool.evaluate_proposal(&json!({"code": "print(1)"})).is_none());
+        let tool = PythonExecTool::new().with_execution_profile(
+            crate::builtin_tools::shell_exec::ExecutionProfile::SandboxTrusted,
+        );
+        assert!(tool
+            .evaluate_proposal(&json!({"code": "print(1)"}))
+            .is_none());
     }
 
     /// G1:缺省 = Workbench(人在环基线零变化)
