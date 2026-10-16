@@ -4582,6 +4582,7 @@ impl AgentRunner {
                 verified: true,
                 reason: "denied by policy".to_string(),
                 auto_rejected: false,
+                verdict_json: None,
             }
         };
 
@@ -4606,6 +4607,15 @@ impl AgentRunner {
             "decided_at": decided_at,
             "reason": decision.reason,
         });
+
+        // 判定全文封存(policy 评审路径:决定随 ApprovalDecision 携带全文 JSON,
+        // 此处落账 journal——跨重启回放权威面;非评审路径 None 不落)
+        if let (Some(json), Some(j)) = (&decision.verdict_json, journal) {
+            if let Err(e) = j.policy_review_sealed(&approval_req.proposal_id, decision_label, json)
+            {
+                warn!(error = %e, "policy review seal: journal append failed (best-effort)");
+            }
+        }
 
         // B22-C T3:审批决定事件(流式面)——与 call_service 路径
         // decide_and_reexecute 的 T3 同口径,双路径互斥不双记
@@ -4882,6 +4892,7 @@ impl AgentRunner {
                 verified: true,
                 reason: "denied by policy".to_string(),
                 auto_rejected: false,
+                verdict_json: None,
             }
         };
 
@@ -4906,6 +4917,14 @@ impl AgentRunner {
             "decided_at": decided_at,
             "reason": decision.reason,
         });
+        // 判定全文封存(policy 评审路径:决定随 ApprovalDecision 携带全文 JSON,
+        // 此处落账 journal——跨重启回放权威面;非评审路径 None 不落)
+        if let (Some(json), Some(j)) = (&decision.verdict_json, journal) {
+            if let Err(e) = j.policy_review_sealed(&approval_req.proposal_id, decision_label, json)
+            {
+                warn!(error = %e, "policy review seal: journal append failed (best-effort)");
+            }
+        }
         // B22-C T3:审批决定入事件轨道(agent 会话语义面;gov 留痕由 A 项
         // hooks 承载,两轨分工见板块设计 §3.3。偏离注记:原判「A 项 hooks
         // 处并联」——hooks 在 serve 面无 agent 会话 store 访问,runner 侧

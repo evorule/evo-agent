@@ -313,6 +313,19 @@ impl ApprovalCallback for PolicyReview {
             self.exemption_override,
         );
 
+        // 判定全文封存 JSON（随 ApprovalDecision 下行，runner 落账 journal——
+        // 进程日志与 gov 摘要镜像之外的跨重启回放权威面）
+        let verdict_seal = serde_json::json!({
+            "proposal_id": req.proposal_id,
+            "tool": req.tool_name,
+            "verdict": verdict.as_str(),
+            "exemption_override": self.exemption_override,
+            "request": payload,
+            "judgement": serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.clone())),
+        })
+        .to_string();
+
         // 7. 分派
         let marker = if red_line.is_some() {
             format!(
@@ -335,6 +348,7 @@ impl ApprovalCallback for PolicyReview {
                         marker
                     ),
                     auto_rejected: false,
+                    verdict_json: Some(verdict_seal.clone()),
                 }
             }
             ReviewVerdict::Rejected => {
@@ -350,6 +364,7 @@ impl ApprovalCallback for PolicyReview {
                         marker
                     ),
                     auto_rejected: false,
+                    verdict_json: Some(verdict_seal),
                 }
             }
             ReviewVerdict::Abstained => {
@@ -858,6 +873,7 @@ max_actions_per_run = 200
                 verified: false,
                 reason: "human window".to_string(),
                 auto_rejected: false,
+                verdict_json: None,
             }
         }
     }
@@ -996,6 +1012,15 @@ max_actions_per_run = 200
         .await;
         assert!(!d.approved);
         assert_eq!(d.approver, "policy-review");
+        // 判定全文封存:决策携带可解析的全文 JSON(含请求与评审输出)
+        let vj = d
+            .verdict_json
+            .as_deref()
+            .expect("review decision must carry full verdict json");
+        let v: serde_json::Value = serde_json::from_str(vj).unwrap();
+        assert_eq!(v["verdict"], "rejected");
+        assert!(v["judgement"].is_object(), "judgement 应为解析后的对象");
+        assert!(v["request"].as_str().unwrap().contains("cargo build"));
     }
 
     #[tokio::test]

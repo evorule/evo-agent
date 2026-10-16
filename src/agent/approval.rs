@@ -72,6 +72,10 @@ pub struct ApprovalDecision {
     pub reason: String,
     /// 是否系统自动拒绝(超时 / 通道关闭)
     pub auto_rejected: bool,
+    /// policy 评审判定全文 JSON(封存面:runner 落账 journal 供跨重启回放;
+    /// None=非评审路径。tool_trace 序列化时省略,审计链形状零变化)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict_json: Option<String>,
 }
 
 /// HTTP 审批等待项 — pending map 的值类型
@@ -114,6 +118,7 @@ impl ApprovalCallback for CliApproval {
                 verified: false,
                 reason: String::new(),
                 auto_rejected: false,
+                verdict_json: None,
             };
         }
 
@@ -147,6 +152,7 @@ impl ApprovalCallback for CliApproval {
             verified: false,
             reason: String::new(),
             auto_rejected: false,
+            verdict_json: None,
         }
     }
 }
@@ -218,6 +224,7 @@ impl ApprovalCallback for HttpApproval {
                     verified: true,
                     reason: "approval channel closed".to_string(),
                     auto_rejected: true,
+                    verdict_json: None,
                 }
             }
             Err(_) => {
@@ -238,6 +245,7 @@ impl ApprovalCallback for HttpApproval {
                     verified: true,
                     reason: "timeout".to_string(),
                     auto_rejected: true,
+                    verdict_json: None,
                 }
             }
         }
@@ -257,6 +265,7 @@ impl ApprovalCallback for AutoApprove {
             verified: true,
             reason: String::new(),
             auto_rejected: false,
+            verdict_json: None,
         }
     }
 }
@@ -274,6 +283,7 @@ impl ApprovalCallback for DenyAll {
             verified: true,
             reason: "denied by policy".to_string(),
             auto_rejected: false,
+            verdict_json: None,
         }
     }
 }
@@ -305,6 +315,7 @@ impl ApprovalCallback for PolicyApproval {
             verified: false,
             reason,
             auto_rejected: false,
+            verdict_json: None,
         }
     }
 }
@@ -732,6 +743,7 @@ mod tests {
                 verified: true,
                 reason: String::new(),
                 auto_rejected: false,
+                verdict_json: None,
             })
             .unwrap();
 
@@ -775,6 +787,7 @@ mod tests {
                 verified: false,
                 reason: "denied".to_string(),
                 auto_rejected: false,
+                verdict_json: None,
             })
             .unwrap();
 
@@ -895,6 +908,7 @@ mod tests {
                 verified: true,
                 reason: "cleanup".to_string(),
                 auto_rejected: false,
+                verdict_json: None,
             })
             .unwrap();
         let _ = wait_fut.await;
