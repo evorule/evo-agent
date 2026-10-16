@@ -2493,7 +2493,7 @@ impl AgentRunner {
         Ok(())
     }
 
-    /// O-492:续话/crash-resume 轮从会话 journal 恢复已锁生成判据
+    /// 续话/crash-resume 轮从会话 journal 恢复已锁生成判据
     ///
     /// 生成判据为 runner 内存态,重生成=判据漂移违背先写后锁——续话场景的
     /// 恢复锚=journal `acceptance_criteria_generated` 事件(G4 落账:判据全文
@@ -5845,7 +5845,7 @@ impl AgentRunner {
 
                            // G4 判据生成(先写后锁):仅 Fresh(新建会话=任务开工)生成一次;
                            // continuation/crash-resume 属任务中段,重生成=判据漂移违背锁定
-                           // 语义——不生成,改从会话 journal 恢复已锁判据(O-492:判据事件
+                           // 语义——不生成,改从会话 journal 恢复已锁判据(判据事件
                            // G4 生成时已落账,恢复+复检后重新锁定)。失败 fail-visible:
                            // 显式开启=要求判据必须存在,不静默降级(指引改配静态判据)。
                            if recovery == RecoveryMode::Fresh {
