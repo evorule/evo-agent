@@ -6,6 +6,7 @@
     connStatus,
     sessionId,
     turnActive,
+    lastEngineEventAt,
     messages,
     sessions,
     refreshSessions,
@@ -80,11 +81,23 @@
     refreshSessions();
     loadResumable();
     loadLineage();
+    // 心跳停滞提示的秒级心跳(纯客户端:turn 活跃且久无引擎事件→琥珀提示;
+    // serve 侧心跳 2 窗中止,此处为其可见前兆)
+    stallTicker = setInterval(() => {
+      nowTick = Date.now();
+    }, 1000);
   });
 
   onDestroy(() => {
     unregisterCommand('chat.addContext');
+    if (stallTicker) clearInterval(stallTicker);
   });
+
+  /** 引擎事件停滞秒数(turn 活跃面;<0 = 事件仍新鲜) */
+  const stallSeconds = $derived(
+    $turnActive ? Math.floor((nowTick - $lastEngineEventAt) / 1000) : 0
+  );
+  const engineStalled = $derived(stallSeconds >= 10);
 
   /** 命令入口:聚焦输入框并打开 @ 弹层(空查询=快捷项视角) */
   function openMentionPopup() {
@@ -160,6 +173,10 @@
   let mp = $state(null);
   let mpTimer = null;
   let mpSeq = 0;
+
+  // 心跳停滞提示(秒级 ticker + 停滞判据)
+  let stallTicker = null;
+  let nowTick = $state(Date.now());
 
   // 键盘导航与 Enter 只走可用候选;置灰行(状态不可得)仅展示
   const flatCandidates = $derived(mp ? mp.enabled : []);
@@ -596,6 +613,11 @@
         <button class="btn primary" onclick={submit} disabled={!draft.trim() || $connStatus !== 'online'}>发送</button>
       {/if}
     </div>
+    {#if engineStalled}
+      <div class="heartbeat-stall" role="status">
+        ⚠ 引擎已 {stallSeconds}s 无事件返回——长程工具或引擎停滞;持续无响应可中断后重试
+      </div>
+    {/if}
   </div>
 </aside>
 
@@ -1126,6 +1148,12 @@
   .token-est-hint {
     font-size: 10px;
     color: var(--danger);
+  }
+  .heartbeat-stall {
+    font-size: 11px;
+    color: var(--warning);
+    padding: 4px 8px;
+    border-top: 1px solid var(--border);
   }
   .user-col {
     display: flex;
