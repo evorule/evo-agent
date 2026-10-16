@@ -4,6 +4,10 @@
 // 驱动(token 表唯一真相源,消除本模块手工双源);本模块保留 worker 装配与
 // JSON 诊断选项基线。
 import * as monaco from 'monaco-editor';
+// 全量编辑器贡献:monaco-editor 0.52 的包入口 editor.main 只含核心编辑器
+// (edcore)+语言——inline completions 控制器/查找/右键菜单/undo-redo API 等
+// 富贡献在 editor.all.js,不导入则 ghost text 永不触发、编辑器退化为裸核心
+import 'monaco-editor/esm/vs/editor/editor.all.js';
 import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
 import JsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker';
 import { applyTheme, readStoredMode } from './theme.js';
