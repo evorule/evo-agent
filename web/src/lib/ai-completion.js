@@ -144,6 +144,9 @@ export function registerAiCompletion(editor, languages) {
 
     const d = monaco.languages.registerInlineCompletionsProvider(lang, {
       async provideInlineCompletions(model, position, _ctx, token) {
+        if (typeof window !== 'undefined') {
+          window.__provCalls = (window.__provCalls || 0) + 1;
+        }
         if (!completionEnabled() || token.isCancellationRequested) return { items: [] };
         // 仅空白/粘贴/撤销抑制
         if (editSuppressed(model, position)) return { items: [] };
