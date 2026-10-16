@@ -358,6 +358,15 @@ pub async fn restart_server(
             Json(json!({ "error": format!("server '{name}' not found in mcp config") })),
         ));
     };
+    // 停用态不重启(不变式:disabled 不连接不注册——重启会绕过该门)
+    if s.disabled {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("server '{name}' is disabled; enable it before restart")
+            })),
+        ));
+    }
 
     // async 段:断连重连(失败已落 failed 状态)
     let (client, tools) = manager.reconnect(s).await.map_err(|e| {
@@ -735,6 +744,18 @@ mod tests {
         let (status, v) = json_request(a, "POST", "/api/mcp/servers/nope/restart", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(v["error"].as_str().unwrap().contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn test_restart_disabled_server_409() {
+        // 停用态不重启:重启会绕过「disabled 不连接不注册」不变式
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(mcp_state(tmp.path()));
+        let body = json!({"servers": [{"name": "off", "command": "echo", "disabled": true}]});
+        let _ = json_request(a.clone(), "PUT", "/api/mcp/servers", Some(body)).await;
+        let (status, v) = json_request(a, "POST", "/api/mcp/servers/off/restart", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(v["error"].as_str().unwrap().contains("disabled"));
     }
 
     #[tokio::test]
