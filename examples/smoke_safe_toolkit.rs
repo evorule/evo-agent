@@ -56,7 +56,7 @@ async fn main() {
     std::fs::create_dir(workdir.join("workspace")).unwrap();
 
     // 拿到默认工具集(只确认装配 OK,实际用 struct 直接调)
-    let _handler = default_safe_toolkit(workdir);
+    let _handler = default_safe_toolkit(workdir, workdir);
 
     let file_read = evo_agent::builtin_tools::file_read::FileReadTool::new(workdir.to_path_buf());
     let file_list = evo_agent::builtin_tools::file_list::FileListTool::new(workdir.to_path_buf());

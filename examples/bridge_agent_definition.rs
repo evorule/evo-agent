@@ -67,7 +67,7 @@ async fn main() {
     let client = EvoruleApiClient::new("http://localhost:8080");
 
     // 5. 装 6 个安全工具
-    let tool_handler = default_safe_toolkit(workdir);
+    let tool_handler = default_safe_toolkit(workdir, workdir);
     println!("\nTool handler registered {} tools", {
         // 用 has_tool 测试每个,或干脆只确认这几个在
         let mut count = 0;
