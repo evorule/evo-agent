@@ -636,6 +636,48 @@ pub fn restrict_tools_to_surface(def_tools: &mut Vec<String>, filtered: &ToolHan
     def_tools.retain(|t| filtered.has_tool(t));
 }
 
+/// 请求级工具子集(allowlist)——请求面只收不放
+///
+/// 语义:`requested` 为 allowlist,与当前 def/settings 已过滤面求交
+/// (只收不放:请求不能越过 def 白名单与 agentTools.* 开关重新放开任何
+/// 工具);条目支持尾缀 `*` 前缀通配(与 [`build_filtered_toolkit`] B16
+/// 语义同款);零命中条目 fail-visible 报错——请求级是显式意志,拼错名
+/// 静默收敛 = 静默缩权,违背最小惊讶(与执行环境 profile 未知值 400 同族)。
+///
+/// 调用序:必须先于 [`restrict_tools_to_surface`]——后者随后把 def.tools
+/// 收敛到本函数产物,白名单声明=执行器=LLM 契约三者一致自动保持。
+/// 空切片 = 合法全收敛(显式意志,不做二次解释)。
+pub fn apply_request_tool_allowlist(
+    filtered: &mut ToolHandler,
+    requested: &[String],
+) -> Result<(), String> {
+    let surface = filtered.tool_names();
+    for name in requested {
+        let matched = match name.strip_suffix('*') {
+            Some(prefix) => surface.iter().any(|r| r.starts_with(prefix)),
+            None => surface.iter().any(|r| r == name),
+        };
+        if !matched {
+            return Err(format!(
+                "request tools: '{}' matches no tool in the available surface",
+                name
+            ));
+        }
+    }
+    let mut next = ToolHandler::new();
+    for registered in surface {
+        let keep = requested.iter().any(|name| match name.strip_suffix('*') {
+            Some(prefix) => registered.starts_with(prefix),
+            None => name == &registered,
+        });
+        if keep {
+            next.register_entry_from(filtered, &registered);
+        }
+    }
+    *filtered = next;
+    Ok(())
+}
+
 // =============================================================================
 // M5-a 能力边界:生效边界合成 + 声明绑定(serve 三路径与 CLI 共用)
 // =============================================================================
@@ -1303,6 +1345,62 @@ service_tools = ["config_persist", "rule_sandbox"]
         // 无匹配前缀 → 零工具不 panic
         let empty = build_filtered_toolkit(&union, &["mcp_*".to_string()]);
         assert_eq!(empty.tool_names().len(), 0, "union 无 MCP 工具时通配零命中");
+    }
+
+    #[test]
+    fn test_request_tool_allowlist_exact_and_wildcard() {
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let mut filtered = build_filtered_toolkit(
+            &union,
+            &[
+                "file_read".to_string(),
+                "git_*".to_string(),
+                "shell_exec".to_string(),
+            ],
+        );
+        apply_request_tool_allowlist(&mut filtered, &["git_*".to_string()]).unwrap();
+        // 求交后只留命中者:通配保留 git 族,其余收敛
+        assert!(filtered.has_tool("git_status"));
+        assert!(filtered.has_tool("git_log"));
+        assert!(!filtered.has_tool("file_read"));
+        assert!(!filtered.has_tool("shell_exec"));
+    }
+
+    #[test]
+    fn test_request_tool_allowlist_unknown_fails_surface_unchanged() {
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let mut filtered = build_filtered_toolkit(&union, &["file_read".to_string()]);
+        // 零命中条目 fail-visible;整体拒绝不做部分收敛(面不变)
+        let err =
+            apply_request_tool_allowlist(&mut filtered, &["shell_exec".to_string()]).unwrap_err();
+        assert!(err.contains("matches no tool"));
+        assert!(filtered.has_tool("file_read"));
+    }
+
+    #[test]
+    fn test_request_tool_allowlist_cannot_expand_def_surface() {
+        // 只收不放:union 有 shell_exec 但 def 面没有 → 请求它报错,不放开
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        assert!(union.has_tool("shell_exec"));
+        let mut filtered = build_filtered_toolkit(&union, &["file_read".to_string()]);
+        assert!(apply_request_tool_allowlist(&mut filtered, &["shell_exec".to_string()]).is_err());
+        assert!(!filtered.has_tool("shell_exec"));
+    }
+
+    #[test]
+    fn test_request_tool_allowlist_empty_collapses_all() {
+        // 空切片 = 显式全收敛(合法意志,不做二次解释)
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let mut filtered = build_filtered_toolkit(
+            &union,
+            &["file_read".to_string(), "git_status".to_string()],
+        );
+        apply_request_tool_allowlist(&mut filtered, &[]).unwrap();
+        assert_eq!(filtered.tool_names().len(), 0);
     }
 
     /// 动态源开关测试用最小执行器桩（仅装配面，不触发 call）
