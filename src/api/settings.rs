@@ -352,10 +352,10 @@ pub fn schema() -> Vec<SettingEntry> {
             key: "approval.mode.shellExec",
             kind: SettingType::Enum,
             default: json!("manual"),
-            enum_values: Some(vec!["auto", "manual", "policy"]),
+            enum_values: Some(vec!["manual", "auto_policy", "policy"]),
             range: None,
             category: "Agent 工具",
-            description: "shell_exec 的审批档位（auto=白名单直跑；manual=每次人工审批；policy=对照 .evo/approval-policy.toml 预置条件由独立评审自动判定，全过放行、不过退回修正，重查超限自动回落人工。policy 是进阶选项：需先在条件文件预置审批条件，文件缺失或无效时该档自动回落人工，绝不静默放行）",
+            description: "shell_exec 的审批档位（agent 定义未显式指定 approval_mode 时的缺省档位：manual=每次人工审批；auto_policy=判定式无人值守放行；policy=对照 .evo/approval-policy.toml 预置条件由独立评审自动判定，全过放行、不过退回修正，重查超限自动回落人工。policy 是进阶选项：需先在条件文件预置审批条件，文件缺失或无效时该档自动回落人工，绝不静默放行。重启会话生效）",
             scope: "application",
         },
         SettingEntry {

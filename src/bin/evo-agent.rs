@@ -620,7 +620,26 @@ fn cmd_run(
             )),
             None,
         )
-    } else if def.approval_mode.as_deref() == Some("policy") {
+    } else if {
+        // 档位解析单源(与 serve 面同口径):定义级优先,未指定回落设置键
+        // approval.mode.shellExec(manual/auto_policy/policy 之外不计)
+        let def_mode = def.approval_mode.clone();
+        match def_mode {
+            Some(m) => Some(m),
+            None => evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+                .ok()
+                .and_then(|s| {
+                    let (merged, _) = s.merged();
+                    merged
+                        .get("approval.mode.shellExec")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .filter(|v| v == "manual" || v == "auto_policy" || v == "policy"),
+        }
+        .as_deref()
+            == Some("policy")
+    } {
         let policy_path = workdir.join(".evo").join("approval-policy.toml");
         match evo_agent::agent::approval_policy::ApprovalPolicyFile::load(&policy_path) {
             Ok(policy) => {
@@ -2981,7 +3000,26 @@ fn run_repl_turn(
             std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
             None,
         )
-    } else if def.approval_mode.as_deref() == Some("policy") {
+    } else if {
+        // 档位解析单源(与 serve 面同口径):定义级优先,未指定回落设置键
+        // approval.mode.shellExec(manual/auto_policy/policy 之外不计)
+        let def_mode = def.approval_mode.clone();
+        match def_mode {
+            Some(m) => Some(m),
+            None => evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+                .ok()
+                .and_then(|s| {
+                    let (merged, _) = s.merged();
+                    merged
+                        .get("approval.mode.shellExec")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .filter(|v| v == "manual" || v == "auto_policy" || v == "policy"),
+        }
+        .as_deref()
+            == Some("policy")
+    } {
         let policy_path = workdir.join(".evo").join("approval-policy.toml");
         match evo_agent::agent::approval_policy::ApprovalPolicyFile::load(&policy_path) {
             Ok(policy) => {

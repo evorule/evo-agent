@@ -1172,7 +1172,9 @@ async fn run_agent(
     let governance_segment =
         crate::api::serve_tools::build_governance_segment(&state.evorule_client, &def.tools).await;
     // 人工审查开合(2026-09-28):def move 前捕获审批模式
-    let approval_mode = def.approval_mode.clone();
+    // 档位解析单源:定义级优先,未指定回落设置键 approval.mode.shellExec
+    let approval_mode =
+        crate::api::ws_handler::resolve_approval_mode(&state, def.approval_mode.as_deref());
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
@@ -1589,8 +1591,10 @@ async fn run_agent_stream(
     // build_approval_callback 三态一次判别双产出——auto_policy=PolicyApproval/
     // policy=PolicyReview 评审式+Runaway 护栏策略(本端点消费 run_streaming,
     // 护栏挂点随之生效)/其余=HttpApproval 60s 人工审批窗(manual 态现状行为)
+    let resolved_mode =
+        crate::api::ws_handler::resolve_approval_mode(&state, def.approval_mode.as_deref());
     let (approval_callback, runaway_policy) =
-        crate::api::ws_handler::build_approval_callback(&state, def.approval_mode.as_deref());
+        crate::api::ws_handler::build_approval_callback(&state, resolved_mode.as_deref());
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
