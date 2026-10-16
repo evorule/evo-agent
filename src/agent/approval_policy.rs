@@ -295,7 +295,7 @@ impl ApprovalCallback for PolicyReview {
             "policy review judged"
         );
         // B22:policy_verdict 治理事件（三态判定+判定依据摘要——serve 侧封存
-        // 锚点的持久化镜像，23 号档 §3.1；best-effort 不阻断分派）
+        // 锚点的持久化镜像，best-effort 不阻断分派）
         let conditions_summary = if matches!(verdict, ReviewVerdict::Approved) {
             summary_of(&judgement)
         } else {

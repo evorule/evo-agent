@@ -1185,7 +1185,7 @@ async fn run_agent(
     // 补接前本端点仅 auto_policy 二元路由,policy 档静默缺失):
     // auto_policy=PolicyApproval 判定式(无人值守,理由必产,现状不变);
     // policy=PolicyReview 评审式(独立 LLM 对照条件清单逐条判定),并同产出
-    // Runaway 护栏策略注入(18 号 PR-3——本端点改消费 run_streaming,护栏
+    // Runaway 护栏策略注入(本端点改消费 run_streaming,护栏
     // 挂点在流式面随之生效);manual 态维持本端点既定行为(不注入=缺省
     // 拒绝,安全优先,行为零变化)
     let runner = match approval_mode.as_deref() {
@@ -1537,7 +1537,7 @@ async fn run_agent_stream(
     let governance_segment =
         crate::api::serve_tools::build_governance_segment(&state.evorule_client, &def.tools).await;
     // 人工审查开合(2026-09-28):def move 前捕获审批模式
-    // G8 审批决策端 + 18 号 PR-3 Runaway 护栏(与 WS 面 construct_runner 同口径;
+    // G8 审批决策端 + Runaway 护栏(与 WS 面 construct_runner 同口径;
     // 补接前本端点为 auto_policy/其余二元路由,policy 档静默降 manual=缺口):
     // build_approval_callback 三态一次判别双产出——auto_policy=PolicyApproval/
     // policy=PolicyReview 评审式+Runaway 护栏策略(本端点消费 run_streaming,
@@ -1570,7 +1570,7 @@ async fn run_agent_stream(
     .with_governance_segment(governance_segment)
     // G8:注入审批决策端(三态同口径,构造期已双产出,见上)
     .with_approval_callback(approval_callback)
-    // 18 号 PR-3:Runaway 护栏(policy 档;None=不启用,行为零变化)
+    // Runaway 护栏(policy 档;None=不启用,行为零变化)
     .with_runaway_policy(runaway_policy)
     // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
     .with_metrics(state.metrics.clone())

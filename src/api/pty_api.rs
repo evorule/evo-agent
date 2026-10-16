@@ -125,7 +125,7 @@ async fn handle_socket(
         shell_label,
     } = handle;
     info!(term = %term_id, shell = %shell_label, pid = pid, "PTY session created");
-    // B22:terminal_session_create 治理留痕(record-only,09 号 §四;best-effort)
+    // terminal_session_create 治理留痕(record-only，best-effort)
     crate::governance::hooks::terminal_session(
         &term_id,
         crate::governance::TerminalAction::Create,

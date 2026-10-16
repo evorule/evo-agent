@@ -196,13 +196,13 @@ pub fn default_safe_toolkit(workdir: &Path, read_root: &Path) -> ToolHandler {
         "handover_read",
         Arc::new(crate::agent::handover_tool::HandoverReadTool::unwired()),
     );
-    // B22 记忆主动消费（23 号设计 §3.2）：同占位/会话期重绑形态；只读工具
+    // 记忆主动消费：同占位/会话期重绑形态；只读工具
     // （不产生任何写入事实），开关 agentTools.memory_recall 过滤三面自动工作
     handler.register_static(
         crate::agent::memory_recall_tool::MEMORY_RECALL_TOOL,
         Arc::new(crate::agent::memory_recall_tool::MemoryRecallTool::unwired()),
     );
-    // B22 审计查询（23 号设计 §3.2）：三 scope 只读入口（gov 治理留痕/
+    // 审计查询：三 scope 只读入口（gov 治理留痕/
     // session 审计/journal 事件流）；占位/会话期重绑同构，开关
     // agentTools.audit_query 过滤三面自动工作
     handler.register_static(

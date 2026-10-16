@@ -320,7 +320,7 @@ impl MemoryEventStore {
         }
     }
 
-    /// O-482:进程重启链续接种子——复用既有会话时以账面末端 Fact 回填
+    /// 进程重启链续接种子——复用既有会话时以账面末端 Fact 回填
     /// `fact_to_event` 映射与源事件缓存，使新事件 cause 写入后 effects
     /// 反向链维护（write_event_with_cause 的源事件回写）不因 cache 空缺位
     pub fn seed_chain_anchor(

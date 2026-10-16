@@ -187,7 +187,7 @@ export function parseServersText(text) {
   return { servers };
 }
 
-/** 状态点色类(16 号档 §3.4:success=connected / warning=starting|unconnected /
+/** 状态点色类(success=connected / warning=starting|unconnected /
  *  danger=failed / disabled 灰) */
 export function statusKind(status) {
   if (status === 'connected') return 'success';

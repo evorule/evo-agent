@@ -3753,7 +3753,7 @@ fn test_rewind_budget_restored_from_journal_balance() {
     assert_eq!(b.remaining, REWIND_BUDGET_LIMIT - 1);
 }
 
-// ===== Runaway 护栏(18 号 PR-3:连续自动操作上限+复述注入)=====
+// ===== Runaway 护栏(连续自动操作上限+复述注入)=====
 
 #[test]
 fn test_runaway_guard_bump_trips_over_quota() {
@@ -4026,7 +4026,7 @@ fn pending_resolution_reconciles_io_request_response_diff() {
     assert!(AgentRunner::plan_pending_resolution(&serde_json::json!([])).is_none());
 }
 
-// ===== B16 G8 接合:MCP 工具审批四场景(16 号档 §3.3 治理接合表 DoD)=====
+// ===== G8 接合:MCP 工具审批四场景(治理接合表 DoD)=====
 
 /// 构造 MockTransport MCP client(单工具 echo,tools/call 回哨兵值)
 async fn make_mcp_echo_client() -> std::sync::Arc<crate::mcp::client::McpClient> {
@@ -4064,7 +4064,7 @@ async fn make_mcp_echo_client() -> std::sync::Arc<crate::mcp::client::McpClient>
 /// 注册 MCP echo 工具进 runner(always_allow 按场景传入)
 ///
 /// 定级显式 Standard(免 P2 裁决通道,与 D7-A settings 降档同款路径)——
-/// G8 审批与 P2 意图裁决分层独立,本组判据只盯 G8(16 号档场景 6:既有
+/// G8 审批与 P2 意图裁决分层独立,本组判据只盯 G8(既有
 /// 治理面行为不在本批判据射程)。
 async fn make_mcp_runner(
     always_allow: &[&str],

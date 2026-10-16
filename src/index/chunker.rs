@@ -4,8 +4,8 @@
 #![forbid(unsafe_code)]
 //! chunker —— 工作区遍历与文件清单（B14 结构面 v1）
 //!
-//! 职责（15 号 D7 / §四）：双层 ignore 遍历——`.gitignore` + `.evoignore`
-//! （13 号语义，serve 索引层直接尊重，比 prompt 组装层更早拦截）+
+//! 职责：双层 ignore 遍历——`.gitignore` + `.evoignore`
+//! （serve 索引层直接尊重，比 prompt 组装层更早拦截）+
 //! `.evoindexingignore`（仅索引排除的用户追加口）+ 硬编码默认排除。敏感面
 //! （.env 类/密钥/锁文件/二进制）拦在索引入口：源码内容根本不入库。
 //! tree-sitter 符号抽取随 PR-2 加入；本文件当前交付遍历 + 内容哈希。

@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn test_emotion_float_string_tolerance() {
-        // 存储层浮点规范化为字符串(O-488 定性:TCB 确定性值域):
+        // 存储层浮点规范化为字符串(定性:TCB 确定性值域):
         // Emotion 读回时 valence/arousal 为 "0.8"/"-0.3" 形态,须反序列化成功
         let json = r#"{
             "valence": "0.8",

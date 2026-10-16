@@ -5,7 +5,7 @@
 //! 代码库语义索引（B14，结构面 v1 + 语义面 v1.x）—— 对工作区源码建符号图谱
 //! 与 chunk 向量面，并提供统一检索入口 `/api/index/*`（search/status/rebuild）。
 //!
-//! 模块六件（15 号 §3.2 + PR-5 语义面，与 [`crate::mcp`] 独立子系统先例同款组织）：
+//! 模块六件（PR-5 语义面，与 [`crate::mcp`] 独立子系统先例同款组织）：
 //! - [`store`]：SQLite 持久层（files/symbols/idents/refs/chunks/vectors，单写者纪律）；
 //! - [`chunker`]：工作区遍历（双层 ignore）+ 内容哈希；
 //! - [`symbols`]：tree-sitter 符号抽取 + chunk 切分；
@@ -13,7 +13,7 @@
 //! - [`embedder`]：语义面文本嵌入器抽象（fastembed 实现随 PR-5b 落地）；
 //! - [`search_api`]：HTTP 处理器；本文件承载 [`IndexService`] 编排层。
 //!
-//! 治理面（15 号 §四）：serve 本地后台行为，无 agent 工具执行、无 shell/写
+//! 治理面：serve 本地后台行为，无 agent 工具执行、无 shell/写
 //! 工作区动作——无审批接点；落盘只存哈希+符号+元数据（D8，源码明文不落索引
 //! 库）；v1 零外发；`index.enabled` 设置键（B6 schema 单源注册）关闭时
 //! `/api/index/*` 返回 503（服务未注入即关，随 PR-4 接入设置键）。

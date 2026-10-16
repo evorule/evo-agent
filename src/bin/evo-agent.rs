@@ -579,7 +579,7 @@ fn cmd_run(
     // 判定理由必产+决策入审计链);approval_mode=policy → PolicyReview 评审式
     // (独立评审对照条件清单逐条判定,判定不可信一律降级人工;条件文件加载失败
     // fail-visible 降 CliApproval 显式留痕);否则 CliApproval stdin 交互(manual 态)
-    // 同一次加载双产出 Runaway 护栏策略(18 号 PR-3;CLI run() 为非流式路径,
+    // 同一次加载双产出 Runaway 护栏策略(CLI run 为非流式路径,
     // 护栏挂点在流式面,此处注入随定义路由空转——面一致性优先,偏离记在案)
     let (callback, runaway_policy): (
         std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>,
@@ -2040,7 +2040,7 @@ fn cmd_serve(
         state = state.with_mcp(mcp_manager.clone(), mcp_store.clone());
     }
 
-    // O-482:/mcp 面合成治理会话 ledger 副本（state 随 router 消费，开具在
+    // /mcp 面合成治理会话 ledger 副本（state 随 router 消费，开具在
     // listener 绑定后 accept 前的 block_on 内执行，需独立句柄）
     let mut gov_ledger_o482: Option<std::sync::Arc<evo_agent::agent::event_ledger::EventLedger>> =
         None;
@@ -2058,7 +2058,7 @@ fn cmd_serve(
             eprintln!("[mcp] server surface enabled: /mcp exposed (governance-equivalent to LLM)");
             state = state.with_mcp_server_enabled(true);
 
-            // O-482:/mcp 面合成治理会话——安装状态文件路径（事件轨道开启时）。
+            // /mcp 面合成治理会话——安装状态文件路径（事件轨道开启时）。
             // 开具/复用本身在下方 listener 绑定后执行；此处仅装配句柄与路径，
             // 不做网络动作（启动期网络探测红线同 2.5 先例）。安装后 persist
             // 自愈通道生效（写入失败 → 下一条 tools/call 惰性补开具重注入）；
@@ -2316,7 +2316,7 @@ fn cmd_serve(
     eprintln!("press Ctrl+C to shut down");
 
     runtime.block_on(async {
-        // O-482:合成治理会话开具/复用并注入（listener 已绑定未 accept，
+        // 合成治理会话开具/复用并注入（listener 已绑定未 accept，
         // 无请求竞态窗；开关关 = None 跳过 = 零行为变化）。失败 fail-soft
         // ——事件轨道维持 v1 CacheOnly，后续 tools/call 经 persist 自愈
         // 路径惰性补开具重注入，不阻塞 serve 启动
@@ -2926,7 +2926,7 @@ fn run_repl_turn(
     // approval_mode=policy → PolicyReview 评审式(独立评审对照条件清单逐条判定,
     // 判定不可信一律降级人工;条件文件加载失败 fail-visible 降 CliApproval 显式留痕);
     // 否则 CliApproval stdin 交互(manual 态,现状行为)
-    // 同一次加载双产出 Runaway 护栏策略(18 号 PR-3):REPL 走流式面即生效
+    // 同一次加载双产出 Runaway 护栏策略:REPL 走流式面即生效
     let (callback, runaway_policy): (
         std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>,
         Option<evo_agent::agent::runner::RunawayPolicy>,

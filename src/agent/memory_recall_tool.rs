@@ -16,7 +16,7 @@
 //! 注册形态（handover_read 同构）：占位执行体启动期注册（default_safe_toolkit，
 //! 未接线时调用 fail-visible 如实报错），runner 会话期重绑（namespace /
 //! client 在手）——开关过滤（agentTools.memory_recall）/声明收紧/LLM 契约
-//! 三面自动工作。只读工具：不产生任何写入事实（23 号设计 §3.2）。
+//! 三面自动工作。只读工具：不产生任何写入事实。
 
 use serde_json::{json, Value};
 
@@ -103,7 +103,7 @@ pub(crate) async fn memory_recall_exec(
     args: &Value,
 ) -> Result<Value, String> {
     let (query, kind, namespace_override, limit) = extract_args(args)?;
-    // namespace 显式指定优先（23 号设计 §3.2：默认当前 ns；跨 ns 读取权限
+    // namespace 显式指定优先（默认当前 ns；跨 ns 读取权限
     // 由 server 侧权限模型兜底，agent 侧只读不过度设防）
     let ns: &str = if namespace_override.is_empty() {
         namespace

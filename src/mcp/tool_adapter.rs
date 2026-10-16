@@ -38,7 +38,7 @@ pub fn mcp_tool_name(server: &str, tool: &str) -> String {
     format!("mcp_{}_{}", server, tool)
 }
 
-/// 单次工具结果上限(16 号档 §3.3 治理接合表:call_tool 结果 >100KB 截断+提示)
+/// 单次工具结果上限(治理接合表:call_tool 结果 >100KB 截断+提示)
 const MAX_RESULT_BYTES: usize = 100 * 1024;
 
 /// 审批卡命令摘要上限(bytes;args 序列化截断,防巨型参数撑爆审批卡)
@@ -155,7 +155,7 @@ impl ToolFunction for McpToolAdapter {
 
         let result = result.map_err(|e| format!("MCP tool '{}' failed: {}", self.tool_name, e))?;
 
-        // 结果上限(16 号档 §3.3):>100KB 截断+提示——LLM 上下文保护,原始
+        // 结果上限:>100KB 截断+提示——LLM 上下文保护,原始
         // 字节数留痕;按 UTF-8 字符边界回退避免截断撕裂多字节字符
         let mut text = result;
         if text.len() > MAX_RESULT_BYTES {
@@ -175,7 +175,7 @@ impl ToolFunction for McpToolAdapter {
         Ok(Value::from(text))
     }
 
-    /// 管道⑤评估钩子(B16 G8 接合,16 号档 §3.3/决策点 3):MCP 工具缺省
+    /// 管道⑤评估钩子(G8 接合):MCP 工具缺省
     /// candidate 全审批——非白名单调用返回 needs_approval 提案交 G8 决策端;
     /// `always_allow` 白名单内(active)返回 None 直通执行。
     /// 提案 command = 注册名 + args 摘要(截断防巨型参数撑爆审批卡)。
@@ -210,7 +210,7 @@ impl ToolFunction for McpToolAdapter {
 /// 逐工具 `mcp_{server}_{tool}` 命名 → manifest 契约校验(description/
 /// inputSchema 透传,一表硬规则 3)→ `McpToolAdapter` 注册(带超时覆盖)。
 ///
-/// 治理接合(B16 G8,16 号档 §3.3/决策点 3):manifest 缺省 ManualDefault
+/// 治理接合(G8):manifest 缺省 ManualDefault
 /// (dynamic_manifest Mcp 分支);`always_allow` 名单内工具覆写 AutoPolicy
 /// (active 直跑=用户显式授权)并给 adapter 打 active 标——评估钩子与
 /// manifest 策略同源,每次调用按名单判定,不依赖注册次序。
@@ -532,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_client_tools_default_candidate_policy() {
-        // 缺省全审批(16 号档 §3.3 决策点 3):manifest=ManualDefault,
+        // 缺省全审批:manifest=ManualDefault,
         // 评估钩子对任意调用返回 needs_approval 提案
         let (client, _transport) = make_client_with_tool_response().await;
         let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
@@ -619,7 +619,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_adapter_call_truncates_over_100kb() {
-        // 结果上限(16 号档 §3.3):>100KB 截断+提示,提示含原始字节数
+        // 结果上限:>100KB 截断+提示,提示含原始字节数
         let (client, transport) = make_client_with_tool_response().await;
         let big = "y".repeat(150 * 1024);
         transport

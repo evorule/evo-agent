@@ -428,7 +428,7 @@ pub enum JournalEvent {
         /// 消费后剩余预算
         remaining: u32,
     },
-    /// Runaway 护栏触发落账(18 号 §六 连续自动操作上限,护栏跨重启连续):
+    /// Runaway 护栏触发落账(连续自动操作上限,护栏跨重启连续):
     /// 达 max_actions_per_run 阈值暂停等人时落账。回填语义:本事件即计数
     /// 重置锚(触发=配额耗尽,人工确认继续后从零重计,见
     /// replay_runaway_actions)。观测面,不参与步映射。
@@ -804,7 +804,7 @@ impl JournalWriter {
             rebuilt,
         })?;
         // B22:b21_journal_milestone 镜像（resume 恢复；refs.journal_seq 互指，
-        // 23 号档 §3.1；best-effort 不影响 journal 落账语义）
+        // ；best-effort 不影响 journal 落账语义）
         crate::governance::hooks::journal_milestone(
             &self.session_id(),
             &format!("journal resumed (replay_seq={replay_seq}, rebuilt {rebuilt_len} 项)"),
@@ -1066,7 +1066,7 @@ impl JournalWriter {
         self.push(JournalEvent::RunawayGuardTripped { actions, threshold })
     }
 
-    /// Runaway 自动操作计数回填(18 号修订⑦ 护栏跨重启连续):重放 journal
+    /// Runaway 自动操作计数回填(护栏跨重启连续):重放 journal
     /// 统计 ToolInvoked 总数,RunawayGuardTripped 处归零重计(触发=配额耗尽,
     /// 人工确认继续后从零重计)。读取失败=无从回填,从零起计(护栏宁可宽松,
     /// 不误伤正常恢复,与 replay_rewind_budget_remaining 同口径)。
@@ -2521,7 +2521,7 @@ mod tests {
 
     #[test]
     fn replay_runaway_actions_without_tools_returns_zero() {
-        // 18 号 PR-3 回填:无工具执行(空账/纯 LLM 轮转)→ 计数 0
+        // 无工具执行(空账/纯 LLM 轮转)→ 计数 0
         let dir = tempfile::tempdir().unwrap();
         {
             let w = JournalWriter::open(dir.path(), "s-runaway-zero").unwrap();
@@ -2536,7 +2536,7 @@ mod tests {
 
     #[test]
     fn replay_runaway_actions_counts_tool_invocations() {
-        // 18 号 PR-3 回填:N 次 ToolInvoked(双路径同口径)→ 计数 N
+        // N 次 ToolInvoked(双路径同口径)→ 计数 N
         // (与运行态 bump 同源:本地 ReAct=None 与 call_service=Some 都计)
         let dir = tempfile::tempdir().unwrap();
         {
@@ -2554,7 +2554,7 @@ mod tests {
 
     #[test]
     fn replay_runaway_actions_tripped_is_reset_anchor() {
-        // 18 号 PR-3 回填:RunawayGuardTripped=重置锚——触发后人工确认继续,
+        // RunawayGuardTripped=重置锚——触发后人工确认继续,
         // 计数从零重计(150 次执行+触发+再 50 次 → 回填 50,护栏配额刷新)
         let dir = tempfile::tempdir().unwrap();
         {

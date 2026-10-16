@@ -1,7 +1,7 @@
 //! GovLedger：治理事件写入 evorule 共享账本（B22 A 项）
 //!
 //! 写入通道=既有 [`EvoruleApiClient::update_payload`]——`shared.*` 前缀
-//! 路径由 evorule 服务端 P3 广播进共享表（23 号档 §二「引擎侧零改动」
+//! 路径由 evorule 服务端 P3 广播进共享表（§二「引擎侧零改动」
 //! 判断）；查询面（`get_shared_facts`）与防膨胀（`mark_shared_facts_rollup`）
 //! 同样复用既有通道。本模块只做：seq 分配、路径构造、事件 schema、
 //! best-effort 写入与失败留痕。
@@ -21,7 +21,7 @@ use tracing::warn;
 use crate::api::api_core::ApiError;
 use crate::api::evorule_client::EvoruleApiClient;
 
-/// gov 命名空间（固定；23 号档 §八风险 3，与 `__memory__`/`shared.{agent_ns}` 隔离）
+/// gov 命名空间（固定；§八风险 3，与 `__memory__`/`shared.{agent_ns}` 隔离）
 pub const GOV_NAMESPACE: &str = "gov";
 
 /// 共享账本 gov 子树前缀（`audit_query` scope=gov 查询前缀）
@@ -29,7 +29,7 @@ pub const GOV_SHARED_PREFIX: &str = "shared.gov.";
 
 /// sidecar 治理会话 caller_role：**不声明**——server 侧白名单仅 `human | llm`
 /// （workspace_service.rs 建链校验），gov 写入者是 serve 进程内部调用
-/// （23 号档 §四.3「serve 内部调用，非 agent 工具」），两者皆不是；
+/// （§四.3「serve 内部调用，非 agent 工具」），两者皆不是；
 /// 沿 sediment 主会话（agent 建链不声明角色）同款前例，声明扩展留
 /// evorule 侧缺口登记后另议。此常量仅作文档锚点。
 pub const GOV_CALLER_ROLE: Option<&str> = None;
@@ -38,19 +38,19 @@ pub const GOV_CALLER_ROLE: Option<&str> = None;
 const SESSION_SETUP_RETRIES: u32 = 3;
 const SESSION_SETUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// 治理事件类型（v1 收录六类，23 号档 §3.1 事件类型清单）
+/// 治理事件类型（v1 收录六类，事件类型清单）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GovEventKind {
-    /// 工作台审批卡请求（G8 审批链，17 号审批层）
+    /// 工作台审批卡请求（G8 审批链）
     ApprovalRequested,
     /// 工作台审批卡决定
     ApprovalResolved,
-    /// policy 三态判定（18 号 §五；判定依据摘要=serve 侧封存锚点的持久化镜像）
+    /// policy 三态判定（判定依据摘要=serve 侧封存锚点的持久化镜像）
     PolicyVerdict,
     /// S4 产物定稿（agent 草稿→人定稿，工作台既有流程）
     S4Publish,
-    /// terminal PTY 会话生命周期（create/close 两态，09 号 §四 record-only 留痕）
+    /// terminal PTY 会话生命周期（create/close 两态，record-only 留痕）
     TerminalSession(TerminalAction),
     /// B21 journal 重大事件镜像（compaction 完成/resume 恢复）
     B21JournalMilestone,
@@ -81,7 +81,7 @@ impl GovEventKind {
     }
 }
 
-/// 事件行为者（23 号档 value schema `actor`）
+/// 事件行为者（value schema `actor`）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GovActor {
@@ -94,10 +94,10 @@ pub enum GovActor {
 }
 
 /// 引用指针（摘要+引用级，不存全文——隐私边界：指令/产物全文已在 journal
-/// 与会话事实，gov 只存治理摘要+指针，23 号档 §3.1 schema 注记）
+/// 与会话事实，gov 只存治理摘要+指针，schema 注记）
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovRefs {
-    /// 关联 B21 journal 事件序号（两链互指，23 号档 §四.5）
+    /// 关联 B21 journal 事件序号（两链互指，§四.5）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_seq: Option<u64>,
     /// 关联审批卡 id
@@ -108,7 +108,7 @@ pub struct GovRefs {
     pub fact_id: Option<u64>,
 }
 
-/// 治理事件 value schema（23 号档 §3.1）
+/// 治理事件 value schema
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovEvent {
     /// 事件 id：`G` + 6 位零填充进程内序号（示例 `G000123`）

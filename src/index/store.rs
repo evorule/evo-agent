@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 //! 索引库持久层（B14 结构面）—— SQLite（rusqlite bundled / WAL）
 //!
-//! 表结构（15 号 §3.1，v3 语义）：
+//! 表结构（v3 语义）：
 //! - `files`：path（相对工作区根，`/` 分隔）+ content_hash（blake3 hex）+ mtime + size + vectorized（chunk 向量是否已随当前内容产出，语义面补嵌入判据）—— 增量对账键（启动哈希对账 / notify 增量判定）；
 //! - `symbols`：file/kind/name/line_start/line_end —— 符号抽取产物；
 //! - `idents`：file/name/count —— 标识符出现计数（name 级原始事实，按文件聚合）；
@@ -17,7 +17,7 @@
 //! - `vectors`：chunk_id/dim/blob —— chunk 嵌入向量（f32 LE 序；向量不可逆推
 //!   源码，D8 落盘边界允许）。
 //!
-//! 并发纪律（15 号 §八风险 5 裁决）：单连接 + `Mutex` 串行写；WAL 允许读并发。
+//! 并发纪律（裁决）：单连接 + `Mutex` 串行写；WAL 允许读并发。
 //! 落盘边界（D8）：源码内容不落索引库——只存哈希 + 符号 + 元数据，展示时按需
 //! 回读源文件。
 //!

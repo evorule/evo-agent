@@ -341,13 +341,13 @@ pub const AGENT_TOOLS_SERVICE_PROXY_ADJUDICATION: &str = "agentTools.serviceProx
 pub const AGENT_TOOLS_HANDOVER: &str = "agentTools.handover";
 const SWITCH_HANDOVER: &str = AGENT_TOOLS_HANDOVER;
 
-/// agentTools.memory_recall（默认开；B22 记忆主动消费只读工具，23 号 §3.2）
+/// agentTools.memory_recall（默认开；记忆主动消费只读工具）
 ///
 /// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
 pub const AGENT_TOOLS_MEMORY_RECALL: &str = "agentTools.memory_recall";
 const SWITCH_MEMORY_RECALL: &str = AGENT_TOOLS_MEMORY_RECALL;
 
-/// agentTools.audit_query（默认开；B22 审计查询只读工具，23 号 §3.2）
+/// agentTools.audit_query（默认开；审计查询只读工具）
 ///
 /// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
 pub const AGENT_TOOLS_AUDIT_QUERY: &str = "agentTools.audit_query";
@@ -426,12 +426,12 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // default_switch 段）。spec 常驻 default_tool_specs（Builtin 源）。
         b("handover_write", vec![Memory]),
         b("handover_read", vec![Memory]),
-        // B22 记忆主动消费（23 号设计 §3.2）：只读检索工具（stable/events 两
+        // 记忆主动消费：只读检索工具（stable/events 两
         // 分区账本读取）。占位执行体启动期注册（default_safe_toolkit），runner
         // 会话期重绑（handover 同款）；Standard 免裁决 + AutoPolicy（只读面）。
         // spec 常驻 default_tool_specs（Builtin 源）。
         b("memory_recall", vec![Memory]),
-        // B22 审计查询（23 号设计 §3.2）：三 scope 只读入口（gov/session/
+        // 审计查询：三 scope 只读入口（gov/session/
         // journal）。注册/重绑/审批面同 memory_recall（只读 Standard+AutoPolicy）。
         b("audit_query", vec![Memory]),
         // 自主开会话（自主交接设计 PR-H3）：子会话派生（fork，因果链权威在
@@ -498,9 +498,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // 自主交接族：单键同绑同开同关（自主交接设计 §四；PR-H3 起
             // session_spawn 第三行同键接入）
             "handover_write" | "handover_read" | "session_spawn" => sw(SWITCH_HANDOVER, true),
-            // B22 记忆主动消费（23 号 §3.2）：只读检索，默认开
+            // 记忆主动消费：只读检索，默认开
             "memory_recall" => sw(SWITCH_MEMORY_RECALL, true),
-            // B22 审计查询（23 号 §3.2）：只读入口，默认开
+            // 审计查询：只读入口，默认开
             "audit_query" => sw(SWITCH_AUDIT_QUERY, true),
             _ => None,
         };
@@ -750,7 +750,7 @@ pub fn dynamic_manifest(
             sw(AGENT_TOOLS_SERVICE_PROXY, true),
             ApprovalPolicy::AutoPolicy,
         ),
-        // B16 G8 接合（16 号档 §3.3/决策点 3）：MCP 工具缺省 candidate 全审批
+        // G8 接合：MCP 工具缺省 candidate 全审批
         // （ManualDefault——首次调用出 needs_approval 提案过 G8）；白名单直跑
         // 由注册层按 `mcp.servers[].always_allow` 覆写为 AutoPolicy（见
         // tool_adapter::register_client_tools，alwaysAllow=用户显式授权）。
@@ -1057,9 +1057,9 @@ mod tests {
         ("handover_write", "agentTools.handover", true),
         ("handover_read", "agentTools.handover", true),
         ("session_spawn", "agentTools.handover", true),
-        // B22 记忆主动消费（23 号 §3.2）
+        // 记忆主动消费
         ("memory_recall", "agentTools.memory_recall", true),
-        // B22 审计查询（23 号 §3.2）
+        // 审计查询
         ("audit_query", "agentTools.audit_query", true),
     ];
 
@@ -1133,7 +1133,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_manifest_approval_policy_by_source() {
-        // B16 G8 接合（16 号档 §3.3/决策点 3）：MCP 缺省 candidate 全审批
+        // G8 接合：MCP 缺省 candidate 全审批
         // （ManualDefault）；ServiceProxy 维持 AutoPolicy（既有审批行为不变）
         let mcp = dynamic_manifest(
             "mcp_x",

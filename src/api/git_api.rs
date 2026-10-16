@@ -182,7 +182,7 @@ pub async fn identity(
 // B15：AI commit message 生成（staged diff → 三级截断 → 风格示例 → LLM 薄委托）
 // =====================================================================================
 
-/// 生成输入三级截断预算（16 号 §3.1③ 定值：24k 字符；不新增设置键）
+/// 生成输入三级截断预算（定值：24k 字符；不新增设置键）
 const GEN_PATCH_BUDGET: usize = 24_000;
 
 /// `POST /api/git/commit-message/generate` 请求体（空对象占位，显式声明便于扩展）
@@ -216,7 +216,7 @@ fn summary_line(f: &GenFile) -> String {
     )
 }
 
-/// 排除件注记块：任何截断级别下排除文件都只留摘要行（16 号 §3.1③）
+/// 排除件注记块：任何截断级别下排除文件都只留摘要行
 fn compose_with_excluded(body: String, files: &[GenFile]) -> String {
     let mut out = body;
     let excluded: Vec<String> = files
@@ -237,7 +237,7 @@ fn compose_with_excluded(body: String, files: &[GenFile]) -> String {
     out
 }
 
-/// 三级截断管线（16 号 §3.1③）：全文 ≤24k → per-file stat 骨架 → 摘要表
+/// 三级截断管线：全文 ≤24k → per-file stat 骨架 → 摘要表
 ///
 /// L2 骨架 = 文件头（路径+±行数）+ hunk 头（含函数上下文）；L3 仅摘要表，
 /// 超预算再按行截断并留省略注记。
@@ -299,7 +299,7 @@ fn truncate_pipeline(files: &[GenFile], budget: usize) -> String {
     compose_with_excluded(kept.join("\n"), files)
 }
 
-/// 生成 prompt 组装（16 号 §3.1④：跟随仓库风格，不硬编码 Conventional Commits）
+/// 生成 prompt 组装（跟随仓库风格，不硬编码 Conventional Commits）
 fn build_prompt(diff_input: &str, subjects: &[String]) -> String {
     let style = if subjects.is_empty() {
         "（本仓库还没有历史提交，请使用清晰简洁的祈使句风格）".to_string()

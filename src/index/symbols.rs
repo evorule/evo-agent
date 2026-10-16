@@ -2,9 +2,9 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! 符号抽取（tree-sitter，PR-2）—— rust/ts 两门 grammar（与 08 号 LSP 同语言范围）
+//! 符号抽取（tree-sitter，PR-2）—— rust/ts 两门 grammar（与 LSP 同语言范围）
 //!
-//! 单文件一遍解析产出三面（15 号 D2/§3.1）：
+//! 单文件一遍解析产出三面：
 //! - **def**：顶层与 impl/class 内符号（fn/struct/enum/trait/impl/method/
 //!   class/interface/type）→ [`SymbolRow`]（入库 symbols 表）；
 //! - **ref**：标识符出现计数（name 级，Aider repomap 口径）→ 跨库两遍编排时
@@ -23,7 +23,7 @@ use crate::index::store::SymbolRow;
 /// chunk 估算 token 上限（≈4 字符/token，与前端 estimateTokens 同口径）
 pub const MAX_CHUNK_TOKENS: usize = 500;
 
-/// 符号抽取语言（v1 两门：与 08 号 LSP 范围一致）
+/// 符号抽取语言（v1 两门：与 LSP 范围一致）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
     /// Rust（.rs）

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! 符号引用图谱与个性化 PageRank（B14 结构面检索排序核心，15 号 §3.2）。
+//! 符号引用图谱与个性化 PageRank（B14 结构面检索排序核心）。
 //!
 //! 口径（Aider repomap 路线）：
 //! - 节点 = 文件；边 = 引用（`from_file → owner(被引符号名)`，weight=√出现次数）；
