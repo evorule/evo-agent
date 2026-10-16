@@ -51,9 +51,11 @@ export function summarizeDiff(rows) {
   for (const r of rows) {
     if (r.type === 'del') deletedLines.push(r.oldLine);
     if (r.type === 'add') {
-      if (!cur || cur.afterLine !== (r.newLine - 1)) {
+      if (!cur) {
         cur = { afterLine: r.newLine - 1, lines: [] };
         addedBlocks.push(cur);
+      } else {
+        cur.afterLine = r.newLine - 1; // 连续 add:块尾随行进推进
       }
       cur.lines.push(r.text);
     }
