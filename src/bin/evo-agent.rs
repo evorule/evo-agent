@@ -2040,6 +2040,11 @@ fn cmd_serve(
         state = state.with_mcp(mcp_manager.clone(), mcp_store.clone());
     }
 
+    // O-482:/mcp 面合成治理会话 ledger 副本（state 随 router 消费，开具在
+    // listener 绑定后 accept 前的 block_on 内执行，需独立句柄）
+    let mut gov_ledger_o482: Option<std::sync::Arc<evo_agent::agent::event_ledger::EventLedger>> =
+        None;
+
     // B23:MCP server 暴露面开关(工作台设置 mcpServer.enabled,缺省 false=
     // /mcp 不挂载 404 fail-closed;开启后外部 MCP 客户端经 serve Bearer token
     // 接入,工具面与 LLM 治理等价;重启 serve 生效)
@@ -2052,6 +2057,25 @@ fn cmd_serve(
         if mcp_server_enabled {
             eprintln!("[mcp] server surface enabled: /mcp exposed (governance-equivalent to LLM)");
             state = state.with_mcp_server_enabled(true);
+
+            // O-482:/mcp 面合成治理会话——安装状态文件路径（事件轨道开启时）。
+            // 开具/复用本身在下方 listener 绑定后执行；此处仅装配句柄与路径，
+            // 不做网络动作（启动期网络探测红线同 2.5 先例）。安装后 persist
+            // 自愈通道生效（写入失败 → 下一条 tools/call 惰性补开具重注入）；
+            // 未安装（开关关）= v1 语义零行为变化。
+            if merged
+                .get("agentTools.eventLedger")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+            {
+                let ledger = state.mcp_ledger().clone();
+                ledger.set_gov_session_path(
+                    workdir
+                        .join("data")
+                        .join(evo_agent::agent::event_ledger::GOV_SESSION_STATE_FILE),
+                );
+                gov_ledger_o482 = Some(ledger);
+            }
         }
     }
 
@@ -2292,6 +2316,13 @@ fn cmd_serve(
     eprintln!("press Ctrl+C to shut down");
 
     runtime.block_on(async {
+        // O-482:合成治理会话开具/复用并注入（listener 已绑定未 accept，
+        // 无请求竞态窗；开关关 = None 跳过 = 零行为变化）。失败 fail-soft
+        // ——事件轨道维持 v1 CacheOnly，后续 tools/call 经 persist 自愈
+        // 路径惰性补开具重注入，不阻塞 serve 启动
+        if let Some(ledger) = &gov_ledger_o482 {
+            ledger.ensure_gov_session_now().await;
+        }
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await

@@ -20,21 +20,27 @@
 //! 进程级开关 [`event_ledger_enabled`]（serve 启动期自 settings
 //! `agentTools.eventLedger` 安装，CLI 不 init 缺省开）。
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use tokio::sync::Mutex;
 
 use crate::agent::memory_event::event::{EventSource, EventType, FactId, MemoryEvent};
 use crate::agent::memory_event::MemoryEventStore;
+use crate::api::api_core::ApiError;
 use crate::api::evorule_client::EvoruleApiClient;
 
-use super::memory::{MemoryManager, MemoryScope};
+use super::memory::{MemoryError, MemoryManager, MemoryScope, PersistOutcome};
 
 /// 每轮工具事件配额（23 号档风险 6：默认 5；definition 可配与同 kind 聚合 v1 顺延）
 pub const DEFAULT_TURN_QUOTA: usize = 5;
 
 /// 轮里程碑间隔（首轮 + 每 N 轮 checkpoint）
 pub const MILESTONE_EVERY_TURNS: u64 = 10;
+
+/// O-482:/mcp 面合成治理会话状态文件名（{workdir}/data/ 下；本地持久化
+/// 数字会话 id——server 不支持指定会话名，幂等开具靠此文件）
+pub const GOV_SESSION_STATE_FILE: &str = "mcp_gov_session.json";
 
 static EVENT_LEDGER_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -58,6 +64,78 @@ fn now_secs() -> u64 {
 /// 轨道事件 ID（会话内递增；路径安全单段）
 fn event_id(seq: u64) -> String {
     format!("EL-{seq:06}")
+}
+
+// ===== O-482:/mcp 面合成治理会话（开具/复用/自愈） =====
+
+/// 读取合成治理会话状态文件（无/损坏/空 id → None，fail-soft）
+fn read_gov_session_state(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("session_id")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// 原子写回状态文件（同目录 temp + rename；失败仅 warn——自愈路径会重开具）
+fn write_gov_session_state(path: &Path, session_id: &str) {
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "created_ts": now_secs(),
+    });
+    let body = match serde_json::to_vec_pretty(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "event ledger: gov session state encode failed");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &body).and_then(|()| std::fs::rename(&tmp, path)) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "event ledger: gov session state write failed (self-heal will re-provision)"
+        );
+    }
+}
+
+/// 开具新合成治理会话（caller_role="service"）+ 原子写回；失败 fail-soft None
+async fn provision_gov_session(client: &EvoruleApiClient, path: &Path) -> Option<String> {
+    match client.create_session(None, Some("service")).await {
+        Ok(sid) => {
+            write_gov_session_state(path, &sid);
+            Some(sid)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "event ledger: gov session provisioning failed; event ledger stays CacheOnly until self-heal"
+            );
+            None
+        }
+    }
+}
+
+/// 合成治理会话开具/复用决策：状态文件在手 → 探活复用（404 判死重开具；
+/// 网络等其他错误不判死，fail-soft None）；无/损坏 → 直接开具
+async fn ensure_mcp_gov_session(client: &EvoruleApiClient, path: &Path) -> Option<String> {
+    match read_gov_session_state(path) {
+        Some(sid) => match client.get_session_metadata(&sid).await {
+            Ok(_) => Some(sid),
+            Err(ApiError::SessionNotFound) => provision_gov_session(client, path).await,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "event ledger: gov session probe failed; keeping current state"
+                );
+                None
+            }
+        },
+        None => provision_gov_session(client, path).await,
+    }
 }
 
 /// T1 工具调用完成事件（成败皆记；EventType=SystemObservation）
@@ -137,17 +215,44 @@ pub(crate) fn build_session_end_event(seq: u64, turns: u64, ts: u64) -> MemoryEv
 struct LedgerInner {
     store: MemoryEventStore,
     memory: MemoryManager,
+    /// O-482:自愈重开具用 client（与 store/memory 同源副本）
+    client: EvoruleApiClient,
     seq: u64,
     /// 轨道内前序事件 FactId（cause 单链锚；仅真实 FactId>0 时推进）
     prev_fact: Option<FactId>,
     turn_written: usize,
     turn_warned: bool,
+    /// O-482:开具/注入待办（写入失败传感器置位；下一次 persist 前置重开具重注入）
+    needs_ensure: bool,
 }
 
 impl LedgerInner {
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
+    }
+
+    /// O-482:合成治理会话开具/复用并注入（needs_ensure 消费者；gov 路径
+    /// 未装 = v1 语义 no-op）。探活复用（get_session_metadata Ok）→ 注入；
+    /// 404 判死 → 重开具 + 原子写回 → 注入新会话（cause 链锚重置：旧
+    /// FactId 属旧会话，跨会话 cause 无效）；其余错误 fail-soft 维持现状，
+    /// 传感器下次失败会再武装。session 在手 fast path 零探活直落。
+    async fn ensure_gov_session(&mut self, gov_path: Option<&PathBuf>) {
+        let Some(path) = gov_path else {
+            self.needs_ensure = false;
+            return;
+        };
+        self.needs_ensure = false;
+        let Some(sid) = ensure_mcp_gov_session(&self.client, path).await else {
+            return;
+        };
+        let prev_sid = self.store.session_id().map(str::to_string);
+        if prev_sid.as_deref() != Some(sid.as_str()) {
+            // 新会话：cause 单链锚重置（轨道内首事件重新为根）
+            self.prev_fact = None;
+        }
+        self.store.set_session_id(&sid);
+        self.memory.set_session_id(&sid);
     }
 
     /// T1 配额闸（每轮 [`DEFAULT_TURN_QUOTA`] 条；超限丢弃 + 每轮一次 warn）
@@ -168,7 +273,12 @@ impl LedgerInner {
 
     /// 落链：证据链面（根/cause 链）+ 共享消费面（sediment 双写同款）；
     /// 全程 best-effort，失败 warn 留痕不阻断
-    async fn persist(&mut self, event: MemoryEvent) {
+    async fn persist(&mut self, event: MemoryEvent, gov_path: Option<&PathBuf>) {
+        // O-482 自愈前置：待开具时先重开具重注入（session 在手 fast path
+        // 零探活直落；未装 gov 路径 = v1 语义 no-op）
+        if self.needs_ensure {
+            self.ensure_gov_session(gov_path).await;
+        }
         let fact_id = match self.prev_fact {
             Some(prev) => match self.store.write_event_with_cause(event.clone(), prev).await {
                 Ok(fid) => fid,
@@ -185,16 +295,33 @@ impl LedgerInner {
                 }
             },
         };
+        // O-482 自愈传感器：证据链面未落（session 未设静默 / HTTP 失败 /
+        // 404 类）→ 待重开具；本轮事件照旧 best-effort 不阻断
+        if fact_id == 0 {
+            self.needs_ensure = true;
+        }
         // 共享消费面：memory_recall kind=events 检索源（sediment 双写同款键形态）
         match serde_json::to_string(&event) {
             Ok(value) => {
                 let key = format!("events.{}", event.event_id);
-                if let Err(e) = self
+                match self
                     .memory
                     .set_scoped(MemoryScope::Shared, &key, &value)
                     .await
                 {
-                    tracing::warn!(event_id = %event.event_id, error = %e, "event ledger: shared-face dual write failed");
+                    Ok(PersistOutcome::Persisted { .. }) => {}
+                    // O-482 自愈传感器：session 在手但 HTTP 失败（404 类/瞬时）
+                    Ok(PersistOutcome::CacheOnly) => {
+                        self.needs_ensure = true;
+                        tracing::warn!(event_id = %event.event_id, "event ledger: shared-face dual write CacheOnly; gov session re-ensure armed");
+                    }
+                    // O-482 自愈传感器：session 未设（注入前/失效后）
+                    Err(e) => {
+                        if matches!(e, MemoryError::SessionNotSet) {
+                            self.needs_ensure = true;
+                        }
+                        tracing::warn!(event_id = %event.event_id, error = %e, "event ledger: shared-face dual write failed");
+                    }
                 }
             }
             Err(e) => {
@@ -211,6 +338,8 @@ impl LedgerInner {
 /// B22-C 事件型记忆轨道——四触发点写入入口（runner 持有 [`Arc`]，&self 可用）
 pub struct EventLedger {
     inner: Mutex<LedgerInner>,
+    /// O-482:合成治理会话状态文件（serve 启动期安装一次；未装 = v1 语义）
+    gov_session_path: OnceLock<PathBuf>,
 }
 
 // B24:AgentApiState derive(Debug) 需要；内部为 tokio Mutex 串行化状态，
@@ -227,13 +356,29 @@ impl EventLedger {
         Self {
             inner: Mutex::new(LedgerInner {
                 store,
-                memory: MemoryManager::new(namespace, client),
+                memory: MemoryManager::new(namespace, client.clone()),
+                client,
                 seq: 0,
                 prev_fact: None,
                 turn_written: 0,
                 turn_warned: false,
+                needs_ensure: false,
             }),
+            gov_session_path: OnceLock::new(),
         }
+    }
+
+    /// O-482:安装合成治理会话状态文件路径（serve 启动期一次；first-wins）。
+    /// 安装后 persist 自愈通道生效（开具/复用/注入）；未安装 = v1 语义。
+    pub fn set_gov_session_path(&self, path: PathBuf) {
+        let _ = self.gov_session_path.set(path);
+    }
+
+    /// O-482:合成治理会话开具/复用并注入（serve 启动期一次；fail-soft——
+    /// 失败仅 warn，事件轨道维持 v1 CacheOnly，后续写入经自愈路径补开具）
+    pub async fn ensure_gov_session_now(&self) {
+        let mut g = self.inner.lock().await;
+        g.ensure_gov_session(self.gov_session_path.get()).await;
     }
 
     /// 会话建立后同步 session_id（证据链面与共享面两侧）
@@ -254,7 +399,7 @@ impl EventLedger {
         if turn == 1 || turn.is_multiple_of(MILESTONE_EVERY_TURNS) {
             let seq = g.next_seq();
             let event = build_milestone_event(seq, turn, now_secs());
-            g.persist(event).await;
+            g.persist(event, self.gov_session_path.get()).await;
         }
     }
 
@@ -275,7 +420,7 @@ impl EventLedger {
         }
         let seq = g.next_seq();
         let event = build_tool_event(seq, tool, ok, duration_ms, error, now_secs());
-        g.persist(event).await;
+        g.persist(event, self.gov_session_path.get()).await;
         true
     }
 
@@ -287,7 +432,7 @@ impl EventLedger {
         let mut g = self.inner.lock().await;
         let seq = g.next_seq();
         let event = build_approval_event(seq, approval_id, verdict, now_secs());
-        g.persist(event).await;
+        g.persist(event, self.gov_session_path.get()).await;
         true
     }
 
@@ -299,7 +444,7 @@ impl EventLedger {
         let mut g = self.inner.lock().await;
         let seq = g.next_seq();
         let event = build_session_end_event(seq, turns, now_secs());
-        g.persist(event).await;
+        g.persist(event, self.gov_session_path.get()).await;
         true
     }
 }
@@ -363,10 +508,12 @@ mod tests {
         let mut inner = LedgerInner {
             store: MemoryEventStore::new("agent_test", dead_client()),
             memory: MemoryManager::new("agent_test", dead_client()),
+            client: dead_client(),
             seq: 0,
             prev_fact: None,
             turn_written: 0,
             turn_warned: false,
+            needs_ensure: false,
         };
         let admitted: Vec<bool> = (0..7).map(|_| inner.try_admit_tool_event()).collect();
         assert_eq!(
@@ -401,6 +548,101 @@ mod tests {
         // 低频事件不受工具配额约束
         assert!(ledger.record_approval("A-1", "approved").await);
         assert!(ledger.record_session_end(3).await);
+    }
+
+    #[test]
+    fn gov_session_state_file_roundtrip_and_corruption() {
+        let tmp = std::env::temp_dir().join(format!(
+            "o482-el-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let p = tmp.join(GOV_SESSION_STATE_FILE);
+        // 无文件 → None
+        assert!(read_gov_session_state(&p).is_none(), "missing file → None");
+        // 损坏内容 → None（fail-soft，不 panic）
+        std::fs::write(&p, "not json at all").unwrap();
+        assert!(read_gov_session_state(&p).is_none(), "corrupt file → None");
+        // 正常写读往返 + 无 temp 残留（rename 原子性）
+        write_gov_session_state(&p, "sess-42");
+        assert_eq!(
+            read_gov_session_state(&p).as_deref(),
+            Some("sess-42"),
+            "roundtrip via atomic write"
+        );
+        assert!(
+            !p.with_extension("json.tmp").exists(),
+            "atomic rename leaves no temp residue"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn ensure_mcp_gov_session_fail_soft_with_dead_client() {
+        let tmp = std::env::temp_dir().join(format!(
+            "o482-el-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let p = tmp.join(GOV_SESSION_STATE_FILE);
+        let client = dead_client();
+        // 无状态文件 + server 不可达 → 开具失败 → None 且不落状态文件
+        assert!(
+            ensure_mcp_gov_session(&client, &p).await.is_none(),
+            "provisioning failure stays None (fail-soft)"
+        );
+        assert!(!p.exists(), "failed provisioning must not write state");
+        // 有状态文件 + server 不可达（网络错误 ≠ 死亡判定）→ None 且不改写文件
+        std::fs::write(&p, r#"{"session_id":"sess-7"}"#).unwrap();
+        assert!(
+            ensure_mcp_gov_session(&client, &p).await.is_none(),
+            "probe network failure stays None (not judged dead)"
+        );
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains("sess-7"),
+            "probe network failure must not rewrite state"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn gov_session_self_heal_flag_lifecycle() {
+        let mut inner = LedgerInner {
+            store: MemoryEventStore::new("agent_test", dead_client()),
+            memory: MemoryManager::new("agent_test", dead_client()),
+            client: dead_client(),
+            seq: 0,
+            prev_fact: None,
+            turn_written: 0,
+            turn_warned: false,
+            needs_ensure: false,
+        };
+        // 传感器：写入失败（fact_id=0）武装自愈待办
+        let e1 = build_tool_event(1, "echo", true, 1, None, now_secs());
+        inner.persist(e1, None).await;
+        assert!(
+            inner.needs_ensure,
+            "store write fail (fact_id=0) arms self-heal"
+        );
+        // ensure 消费待办（gov 路径未装 = v1 no-op 开具 + 解除武装）
+        inner.ensure_gov_session(None).await;
+        assert!(!inner.needs_ensure, "ensure pass disarms the flag");
+        // 全链路：待办武装的下一条 persist 前置 ensure（解除）后，本轮写入
+        // 失败再次武装——传感器逐条生效，直到开具成功写入落账
+        inner.needs_ensure = true;
+        let e2 = build_tool_event(2, "echo", true, 1, None, now_secs());
+        inner.persist(e2, None).await;
+        assert!(
+            inner.needs_ensure,
+            "post-ensure write failure re-arms (sensor per persist)"
+        );
     }
 
     #[test]

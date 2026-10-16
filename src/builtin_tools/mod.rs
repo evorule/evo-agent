@@ -743,12 +743,14 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "audit_query".to_string(),
-            description: "Read-only audit query across three scopes. scope=gov: governance \
+            description: "Read-only audit query across four scopes. scope=gov: governance \
                           ledger events (approvals, policy verdicts, S4 publications, \
                           terminal sessions, journal milestones); pass precedent=true to \
                           get approval precedent cards (tool + params summary + approver + \
                           decision + time) — useful to reference past in-session approval \
-                          precedents. scope=session: session facts list, or the causal \
+                          precedents. scope=shared: cross-session shared facts by optional \
+                          path prefix (e.g. shared.mcp.events. for the MCP tool-call event \
+                          track). scope=session: session facts list, or the causal \
                           chain of a specific fact_id, or chain integrity verification \
                           (verify=true). scope=journal: this session's journal event \
                           stream. The tool never writes."
@@ -757,7 +759,7 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                 ParameterSpec {
                     name: "scope".to_string(),
                     r#type: "string".to_string(),
-                    description: "\"gov\" | \"session\" | \"journal\"".to_string(),
+                    description: "\"gov\" | \"shared\" | \"session\" | \"journal\"".to_string(),
                     required: true,
                 },
                 ParameterSpec {
@@ -775,6 +777,14 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     r#type: "boolean".to_string(),
                     description: "(gov) true = return approval precedent cards instead of \
                                   raw events (requested+resolved paired by approval_id)"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "prefix".to_string(),
+                    r#type: "string".to_string(),
+                    description: "(shared) path prefix filter, e.g. shared.mcp.events. \
+                                  for the MCP event track; omit for all shared facts"
                         .to_string(),
                     required: false,
                 },
@@ -817,8 +827,8 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                 ParameterSpec {
                     name: "limit".to_string(),
                     r#type: "integer".to_string(),
-                    description: "(gov/journal) max entries (gov 1..=100 default 20; \
-                                  journal 1..=500 default 100)"
+                    description: "(gov/shared/journal) max entries (gov/shared \
+                                  1..=100 default 20; journal 1..=500 default 100)"
                         .to_string(),
                     required: false,
                 },
