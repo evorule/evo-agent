@@ -126,16 +126,26 @@ export async function applyServersText(text) {
 // ---- 纯函数(编辑器往返 / 视图派生;vitest 直测) ----
 
 /** 合并视图条目 → PUT 载荷(去 status/error/tools/env_keys 派生字段;
- *  env 一律省略 = 保留服务端现值,绝不误清密钥) */
+ *  env 一律省略 = 保留服务端现值,绝不误清密钥;
+ *  远程传输形态必须随载荷携带 transport/url,否则服务端按 stdio 校验拒绝;
+ *  headers 为 ${ENV_VAR} 引用形态(GET 原样回显),随卡回传无损) */
 export function serversToPayload(servers) {
-  return (servers ?? []).map((s) => ({
-    name: s.name,
-    command: s.command,
-    args: s.args ?? [],
-    disabled: !!s.disabled,
-    timeout_secs: s.timeout_secs ?? 60,
-    always_allow: s.always_allow ?? [],
-  }));
+  return (servers ?? []).map((s) => {
+    const payload = {
+      name: s.name,
+      command: s.command,
+      args: s.args ?? [],
+      disabled: !!s.disabled,
+      timeout_secs: s.timeout_secs ?? 60,
+      always_allow: s.always_allow ?? [],
+    };
+    if (s.transport && s.transport !== 'stdio') {
+      payload.transport = s.transport;
+      payload.url = s.url ?? '';
+      payload.headers = s.headers ?? {};
+    }
+    return payload;
+  });
 }
 
 /** 编辑器预填文本(与 PUT 载荷同形;env 不回显) */
