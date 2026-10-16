@@ -130,7 +130,8 @@ pub trait PolicyReviewInvoker: Send + Sync {
 }
 
 /// 评审调用的审计 purpose 值（sidecar 命令事实 audit_purpose 键；
-/// 新 purpose 接入需同步核对 server 侧 journal LlmCalled.purpose 映射）
+/// 新 purpose 接入需同步核对 journal 侧 LlmCalled.purpose 枚举（journal.rs）
+/// 与 ATIF 导出映射（atif.rs 跳过臂））
 pub const POLICY_REVIEW_PURPOSE: &str = "policy_review";
 
 /// AuditedLlm 评审适配器——独立评审调用经审计链 sidecar 协议执行
