@@ -542,6 +542,13 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                     a.policy_verdicts.push(verdict.clone());
                 }
             }
+            JournalEvent::PolicyReviewSealed { verdict, .. } => {
+                // 评审全文封存事件:投影口径与 PolicyJudged 摘要一致(收 verdict 标签;
+                // 全文本体留账面,投影不展开——transcript 面向轮步叙事)
+                if let Some(a) = acc.as_mut() {
+                    a.policy_verdicts.push(verdict.clone());
+                }
+            }
             JournalEvent::CompactionPerformed {
                 cleared_call_ids, ..
             } => {

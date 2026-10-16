@@ -322,6 +322,7 @@ mod tests {
                 verified: true,
                 reason: String::new(),
                 auto_rejected: false,
+                verdict_json: None,
             },
         );
         assert_eq!(d.kind, GovEventKind::ApprovalResolved);
@@ -336,6 +337,7 @@ mod tests {
                 verified: false,
                 reason: "policy-review: 3 条件全部符合".to_string(),
                 auto_rejected: false,
+                verdict_json: None,
             },
         );
         assert_eq!(d.actor, GovActor::Policy);
@@ -348,6 +350,7 @@ mod tests {
                 verified: false,
                 reason: String::new(),
                 auto_rejected: true,
+                verdict_json: None,
             },
         );
         assert_eq!(d.actor, GovActor::Policy);

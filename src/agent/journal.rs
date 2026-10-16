@@ -242,6 +242,16 @@ pub enum JournalEvent {
         /// 判定依据摘要(工具名+scope/intent,截 256 字符)
         evidence: String,
     },
+    /// policy 评审判定全文封存(决策随 ApprovalDecision 下行,runner 落账;
+    /// 与 PolicyJudged 的摘要口径区分——本事件全文不截断,跨重启回放权威面)
+    PolicyReviewSealed {
+        /// 审批提案 id
+        proposal_id: String,
+        /// approved|rejected
+        verdict: String,
+        /// 判定全文 JSON(请求+评审输出+三态重算口径)
+        full_json: String,
+    },
     /// 窗口压力压缩执行(PR-3 接线,事件面先就绪)
     ///
     /// 接线纪律(2026-10-01 立规):压缩动作前被压缩原文必须全文在账
@@ -1244,6 +1254,24 @@ impl JournalWriter {
         })
     }
 
+    /// policy 评审判定全文封落(full_json 不截断——跨重启回放权威面;
+    /// runner 于审批决策返回后调用,best-effort 调用方决定失败处置)
+    pub fn policy_review_sealed(
+        &self,
+        proposal_id: &str,
+        verdict: &str,
+        full_json: &str,
+    ) -> Result<u64, JournalError> {
+        let proposal_id = proposal_id.to_string();
+        let verdict = verdict.to_string();
+        let full_json = full_json.to_string();
+        self.push_with(|seq| JournalEvent::PolicyReviewSealed {
+            proposal_id,
+            verdict,
+            full_json,
+        })
+    }
+
     /// 冷迁计数落账(F-617;best-effort 调用方决定失败处置)
     pub fn cold_moved(&self, count: u64) -> Result<u64, JournalError> {
         self.push(JournalEvent::ColdMoved { count })
@@ -1719,6 +1747,36 @@ mod tests {
                 assert_eq!(reason, "unclean_tail");
             }
             other => panic!("expected session_crashed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn policy_review_sealed_keeps_full_json_untruncated() {
+        // 评审全文封存:full_json 不受 PolicyJudged 摘要 256 截断口径影响
+        let dir = std::env::temp_dir().join(format!("jf-seal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let long_json = format!("{{\"request\":\"{}\",\"k\":1}}", "x".repeat(600));
+        {
+            let w = JournalWriter::open(&dir, "s-seal").unwrap();
+            w.policy_review_sealed("ap-1", "approved", &long_json)
+                .unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-seal")).unwrap();
+        assert_eq!(lines.len(), 1);
+        match &lines[0].event {
+            JournalEvent::PolicyReviewSealed {
+                proposal_id,
+                verdict,
+                full_json,
+            } => {
+                assert_eq!(proposal_id, "ap-1");
+                assert_eq!(verdict, "approved");
+                assert_eq!(full_json.len(), long_json.len(), "全文不得截断");
+                assert_eq!(full_json, &long_json);
+            }
+            other => panic!("expected policy_review_sealed, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

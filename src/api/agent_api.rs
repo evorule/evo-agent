@@ -1836,6 +1836,7 @@ async fn approve_agent(
         verified,
         reason: req.reason.unwrap_or_default(),
         auto_rejected: false,
+        verdict_json: None,
     };
     // 发送审批决定(接收方已 drop 时返回 Err,但 HTTP 仍返回 200 表示"已处理")
     let _ = pending.tx.send(decision);
