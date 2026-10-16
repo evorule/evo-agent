@@ -384,6 +384,8 @@ fn builtin_manifests() -> Vec<ToolManifest> {
     };
     vec![
         b("file_read", vec![FsRead]),
+        // B1 多模态上行触发源:读面图片装载(沙箱/口径同 file_read,FsRead 域)
+        b("image_load", vec![FsRead]),
         b("file_list", vec![FsRead]),
         b("file_write", vec![FsWrite]),
         b("file_create", vec![FsWrite]),
@@ -826,9 +828,10 @@ mod tests {
         //   （python_exec 收口 +1：内置 23→24，数量锁 89→90）
         //   （B22 记忆主动消费 memory_recall +1：内置 24→25，数量锁 90→91）
         //   （B22 审计查询 audit_query +1：内置 25→26，数量锁 91→92）
-        assert_eq!(builtin_manifests().len(), 26);
+        //   （B1 多模态上行 image_load +1：内置 26→27，数量锁 92→93）
+        assert_eq!(builtin_manifests().len(), 27);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 92);
+        assert_eq!(all().len(), 93);
     }
 
     #[test]

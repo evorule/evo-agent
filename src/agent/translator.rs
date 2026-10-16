@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Message type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "role")]
 pub enum Message {
     #[serde(rename = "system")]
@@ -36,6 +36,10 @@ pub enum Message {
         content: String,
         /// Tool name
         tool_name: String,
+        /// 旁路图片（B1 多模态上行；空 = 无图，wire 层保持纯字符串 content 与
+        /// 既有行为完全一致。旧审计链记录无此键，serde default 反序列化为空）
+        #[serde(default)]
+        images: Vec<ImageData>,
     },
 }
 
@@ -52,7 +56,7 @@ impl Message {
 }
 
 /// Tool call
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     #[serde(rename = "tool_name")]
     /// Tool name
@@ -60,6 +64,18 @@ pub struct ToolCall {
     #[serde(rename = "args")]
     /// Tool arguments
     pub arguments: Value,
+}
+
+/// 图片旁路载荷（B1 多模态上行：工具结果提取，不进 content 字符串）
+///
+/// wire 层组装为 OpenAI 多 part content 数组
+/// `[{type:"text"},{type:"image_url",image_url:{url:"data:<mime>;base64,<data>"}}]`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageData {
+    /// MIME 类型（白名单校验通过后装入：image/png|image/jpeg|image/webp|image/gif）
+    pub mime_type: String,
+    /// 图片字节流 base64
+    pub data_base64: String,
 }
 
 /// LLM response
@@ -142,6 +158,7 @@ mod tests {
         let tool = Message::Tool {
             content: "tool".to_string(),
             tool_name: "echo".to_string(),
+            images: Vec::new(),
         };
         assert_eq!(tool.content(), "tool");
     }

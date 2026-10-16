@@ -57,6 +57,7 @@ pub mod fs_safety;
 pub mod git_tools;
 pub mod grep_files;
 pub mod http_get;
+pub mod image_load;
 pub mod net_guard;
 pub mod python_exec;
 pub mod search_files;
@@ -96,11 +97,7 @@ use crate::io_handlers::tool_handler::ToolHandler;
 /// let runner = AgentRunner::new(config, client).with_tool_handler(tool_handler);
 /// ```
 pub fn default_safe_toolkit(workdir: &Path, read_root: &Path) -> ToolHandler {
-    default_safe_toolkit_with_profile(
-        workdir,
-        read_root,
-        shell_exec::ExecutionProfile::Workbench,
-    )
+    default_safe_toolkit_with_profile(workdir, read_root, shell_exec::ExecutionProfile::Workbench)
 }
 
 /// G1:带执行环境 profile 的装配
@@ -128,6 +125,11 @@ pub fn default_safe_toolkit_with_profile(
     handler.register_static(
         "file_read",
         Arc::new(file_read::FileReadTool::new(read_root_buf.clone())),
+    );
+    // B1 多模态上行触发源:读图片文件返回旁路 images 形态(读面,沙箱同 file_read)
+    handler.register_static(
+        "image_load",
+        Arc::new(image_load::ImageLoadTool::new(read_root_buf.clone())),
     );
     handler.register_static(
         "file_list",
@@ -255,6 +257,22 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                 name: "path".to_string(),
                 r#type: "string".to_string(),
                 description: "File path, relative to workdir (e.g. \"src/main.rs\")".to_string(),
+                required: true,
+            }],
+        },
+        ToolSpec {
+            name: "image_load".to_string(),
+            description: "Load an image file (PNG/JPEG/GIF/WEBP, max 1.5MB) for multimodal \
+                          uplink. Path is relative to workdir; absolute paths and `..` are \
+                          rejected. The image is attached to this tool result as a sideband \
+                          payload and becomes visible to you on the next turn; the result \
+                          text carries only a content fingerprint."
+                .to_string(),
+            parameters: vec![ParameterSpec {
+                name: "path".to_string(),
+                r#type: "string".to_string(),
+                description: "Image file path, relative to workdir (e.g. \"screenshots/shot.png\")"
+                    .to_string(),
                 required: true,
             }],
         },

@@ -308,7 +308,7 @@ fn observation_annotations(dropped: &[Message], goal: &str) -> String {
     }
     let mut rows: Vec<(f32, String)> = Vec::new();
     for (idx, msg) in dropped.iter().enumerate() {
-        if let Message::Tool { content, tool_name } = msg {
+        if let Message::Tool { content, tool_name, .. } = msg {
             let w = observation_value_weight(tool_name, content, goal);
             rows.push((
                 w,
@@ -840,10 +840,12 @@ mod tests {
             Message::Tool {
                 content: "short".to_string(),
                 tool_name: "file_read".to_string(),
+                images: Vec::new(),
             },
             Message::Tool {
                 content: "记忆预算裁剪的关键结论".to_string(),
                 tool_name: "file_write".to_string(),
+                images: Vec::new(),
             },
         ];
         let a = observation_annotations(&dropped, "记忆预算裁剪");
@@ -1022,6 +1024,7 @@ mod tests {
             Message::Tool {
                 content: "搜索结果: 今天晴天".to_string(),
                 tool_name: "search".to_string(),
+                images: Vec::new(),
             },
             assistant("今天天气不错"),
             user("那我们去公园吧"),
@@ -1047,6 +1050,7 @@ mod tests {
             Message::Tool {
                 content: "北京今天 25°C 晴".to_string(),
                 tool_name: "search".to_string(),
+                images: Vec::new(),
             },
             assistant("北京今天 25 度,晴天"),
             user("谢谢"),

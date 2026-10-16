@@ -1265,7 +1265,7 @@ impl JournalWriter {
         let proposal_id = proposal_id.to_string();
         let verdict = verdict.to_string();
         let full_json = full_json.to_string();
-        self.push_with(|seq| JournalEvent::PolicyReviewSealed {
+        self.push_with(|_seq| JournalEvent::PolicyReviewSealed {
             proposal_id,
             verdict,
             full_json,

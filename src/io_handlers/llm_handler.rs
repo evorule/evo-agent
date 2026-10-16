@@ -538,6 +538,9 @@ fn normalize_executor_response(json: Value) -> Result<Value, String> {
 ///   （已是 function 形状的项原样透传，兼容上游已转换的历史）
 /// - Tool 消息: `tool_name` → `tool_call_id`（按名 FIFO 配对最近一个 assistant 产生的未消费 id，
 ///   无可配对时回退 `call_{tool_name}`），并移除非标准的 `tool_name` 键
+/// - Tool 消息（B1 多模态上行）: 旁路 `images` 非空时 content 升级为多 part 数组
+///   `[{type:"text"},{type:"image_url",...}]`，并移除非标准 `images` 键；
+///   空/缺失时 content 保持纯字符串（与既有形态一致）
 ///
 /// 其余消息与字段原样保留。id 确定性生成（`call_{index}_{name}`），同一 assistant 消息内
 /// 多个同名 tool_call 按 index 区分。
@@ -597,6 +600,30 @@ fn to_openai_wire_messages(messages: serde_json::Value) -> serde_json::Value {
                         .unwrap_or_else(|| format!("call_{}", name));
                     converted.insert("tool_call_id".to_string(), serde_json::Value::String(id));
                     converted.remove("tool_name");
+                }
+                // B1 多模态上行:旁路 images 非空时 content 升级为多 part 数组
+                // [{type:"text"},{type:"image_url",image_url:{url:"data:<mime>;base64,<data>"}}];
+                // 空/缺失时保持纯字符串 content(与既有 wire 形态 byte 级一致)。
+                // 组装后删除非标准 images 键(与 tool_name 同口径)。
+                if let Some(imgs) = obj.get("images").and_then(|v| v.as_array()) {
+                    if !imgs.is_empty() {
+                        let mut parts: Vec<serde_json::Value> = Vec::with_capacity(imgs.len() + 1);
+                        let text = converted.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        parts.push(serde_json::json!({"type": "text", "text": text}));
+                        for img in imgs {
+                            let mime = img.get("mime_type").and_then(|v| v.as_str()).unwrap_or("image/png");
+                            let data = img.get("data_base64").and_then(|v| v.as_str()).unwrap_or("");
+                            if data.is_empty() {
+                                continue;
+                            }
+                            parts.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": {"url": format!("data:{mime};base64,{data}")}
+                            }));
+                        }
+                        converted.insert("content".to_string(), serde_json::Value::Array(parts));
+                    }
+                    converted.remove("images");
                 }
             }
             _ => {}
@@ -852,6 +879,50 @@ mod tests {
         ]);
         let wire = to_openai_wire_messages(messages);
         assert_eq!(wire[0]["tool_call_id"], "call_orphan");
+    }
+
+    /// B1 多模态上行:images 空/缺失 → 纯字符串 content 原样(与既有形态一致),
+    /// 非 images 键形态不触碰
+    #[test]
+    fn test_wire_messages_images_empty_keeps_string_content() {
+        let messages = serde_json::json!([
+            {"role": "tool", "content": "ok", "tool_name": "echo", "images": []},
+            {"role": "tool", "content": "ok2", "tool_name": "echo2"}
+        ]);
+        let wire = to_openai_wire_messages(messages);
+        let arr = wire.as_array().unwrap();
+        assert_eq!(arr[0]["content"], "ok");
+        assert_eq!(arr[0]["tool_call_id"], "call_echo");
+        assert_eq!(arr[1]["content"], "ok2");
+    }
+
+    /// B1 多模态上行:images 非空 → content 升级多 part 数组
+    /// [text, image_url...],images 键移除;data 为空的项跳过
+    #[test]
+    fn test_wire_messages_images_become_content_parts() {
+        let messages = serde_json::json!([
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"tool_name": "image_load", "args": {"path": "a.png"}}]},
+            {"role": "tool", "content": "fp", "tool_name": "image_load",
+             "images": [
+                 {"mime_type": "image/png", "data_base64": "QUJD"},
+                 {"mime_type": "image/png", "data_base64": ""}
+             ]}
+        ]);
+        let wire = to_openai_wire_messages(messages);
+        let arr = wire.as_array().unwrap();
+        let tool = &arr[1];
+        assert_eq!(tool["tool_call_id"], "call_0_image_load");
+        let parts = tool["content"].as_array().expect("content must be array");
+        assert_eq!(parts.len(), 2, "text part + one non-empty image part");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "fp");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,QUJD"
+        );
+        assert!(tool.get("images").is_none(), "sideband key must be removed");
     }
 
     #[test]

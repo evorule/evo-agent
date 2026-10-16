@@ -434,6 +434,7 @@ mod tests {
         Message::Tool {
             content: content.to_string(),
             tool_name: tool_name.to_string(),
+            images: Vec::new(),
         }
     }
 

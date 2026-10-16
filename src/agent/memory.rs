@@ -1053,7 +1053,7 @@ impl MessageRecord {
                 timestamp,
                 fact_id: None,
             },
-            Message::Tool { content, tool_name } => Self {
+            Message::Tool { content, tool_name, .. } => Self {
                 idx,
                 role: "tool".to_string(),
                 content: content.clone(),
@@ -4987,6 +4987,7 @@ mod tests {
         let msg = Message::Tool {
             content: "result data".to_string(),
             tool_name: "search".to_string(),
+            images: Vec::new(),
         };
         let record = MessageRecord::from_message(3, &msg, 4000);
         assert_eq!(record.idx, 3);
