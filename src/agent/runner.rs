@@ -104,6 +104,209 @@ fn truncate_tool_result(raw: String, max_chars: usize) -> String {
     format!("{}{}{}", head_str, marker, tail_str)
 }
 
+// ---- B1 多模态上行:旁路图片提取/还原/窗口预算 ----
+
+/// B1:单图 base64 字符上限(2 MB;解码后约 1.5 MB,本机内存约束下的单图口径)
+const B1_MAX_IMAGE_B64_CHARS: usize = 2 * 1024 * 1024;
+/// B1:单工具结果图片数上限
+const B1_MAX_IMAGES_PER_RESULT: usize = 4;
+/// B1:运行窗图片总量预算(base64 字符计,8 MB;序列化前从最旧图片开始丢)
+const B1_WINDOW_IMAGE_BUDGET_B64: usize = 8 * 1024 * 1024;
+/// B1:图片本体落盘目录(相对进程 cwd,与 lex_store 的 data/ 同口径;内容寻址去重)
+const B1_IMAGES_DIR: &str = "data/agent-images";
+
+/// B1:mime 白名单 × 魔数头校验(防伪装文件;解码后字节判定)
+fn b1_image_magic_ok(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(b"\xFF\xD8\xFF"),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
+fn b1_image_ext(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+/// B1 多模态上行:从工具结果 raw JSON 中提取旁路图片并瘦身原键。
+///
+/// 提取协议:工具结果为 JSON 对象且顶层含 `images` 数组键,元素
+/// `{mime_type, data_base64}`。校验链 = mime 白名单 × 魔数头 × 单图/单结果
+/// 预算;通过者装入 `Vec<ImageData>`(回喂旁路),原 `images` 键替换为指纹
+/// `{"images_extracted":[{fingerprint,bytes,mime_type}],"images_omitted":N}`
+/// (审计链/journal/回喂三面统一存瘦身后文本——存指纹不存 base64,图片本体
+/// 内容寻址落盘 `data/agent-images/`)。校验失败/超限丢弃计数入
+/// `images_omitted`(fail-soft 于工具调用,fail-visible 于 LLM 面)。
+///
+/// 非 JSON 对象 / 无 images 键 / 空数组 → 原样返回,零行为变化(回滚保证)。
+fn extract_images_from_raw(
+    raw_content: &str,
+    images_dir: &std::path::Path,
+) -> (Vec<crate::agent::translator::ImageData>, String) {
+    use base64::Engine as _;
+
+    let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(raw_content) else {
+        return (Vec::new(), raw_content.to_string());
+    };
+    let Some(Value::Array(raw_images)) = map.get("images").cloned() else {
+        return (Vec::new(), raw_content.to_string());
+    };
+    if raw_images.is_empty() {
+        map.remove("images");
+        return (Vec::new(), Value::Object(map).to_string());
+    }
+
+    let mut kept = Vec::new();
+    let mut fingerprints: Vec<Value> = Vec::new();
+    let mut omitted = 0usize;
+    for item in &raw_images {
+        if kept.len() >= B1_MAX_IMAGES_PER_RESULT {
+            omitted += 1;
+            continue;
+        }
+        let mime = item.get("mime_type").and_then(|v| v.as_str()).unwrap_or("");
+        let data = item
+            .get("data_base64")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if data.is_empty()
+            || data.len() > B1_MAX_IMAGE_B64_CHARS
+            || !mime.starts_with("image/")
+        {
+            omitted += 1;
+            continue;
+        }
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+            omitted += 1;
+            continue;
+        };
+        if !b1_image_magic_ok(mime, &bytes) {
+            omitted += 1;
+            continue;
+        }
+        let fingerprint = blake3::hash(&bytes).to_hex().to_string();
+        // 内容寻址落盘(同名已存在跳过写,去重);落盘失败不阻断提取(指纹仍在,
+        // 仅续话还原不可用——fail-soft)
+        if let Some(ext) = b1_image_ext(mime) {
+            if std::fs::create_dir_all(images_dir).is_ok() {
+                let path = images_dir.join(format!("{fingerprint}.{ext}"));
+                if !path.exists() {
+                    let _ = std::fs::write(&path, &bytes);
+                }
+            }
+        }
+        fingerprints.push(serde_json::json!({
+            "fingerprint": fingerprint,
+            "bytes": bytes.len(),
+            "mime_type": mime,
+        }));
+        kept.push(crate::agent::translator::ImageData {
+            mime_type: mime.to_string(),
+            data_base64: data.to_string(),
+        });
+    }
+
+    map.remove("images");
+    if !fingerprints.is_empty() {
+        map.insert(
+            "images_extracted".to_string(),
+            Value::Array(fingerprints),
+        );
+    }
+    if omitted > 0 {
+        map.insert("images_omitted".to_string(), Value::from(omitted));
+    }
+    (kept, Value::Object(map).to_string())
+}
+
+/// B1:续话重建时按 content 中 `images_extracted` 指纹从落盘还原旁路图片。
+///
+/// 还原做 blake3 完整性复检(防文件被改);文件缺失/指纹不匹配/超单结果上限
+/// → 跳过(降级为空——content 面指纹文本已是 fail-visible 记录,不重复注记)。
+fn restore_images_from_content(
+    content: &str,
+    images_dir: &std::path::Path,
+) -> Vec<crate::agent::translator::ImageData> {
+    use base64::Engine as _;
+
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(content) else {
+        return Vec::new();
+    };
+    let Some(Value::Array(fps)) = map.get("images_extracted") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for fp in fps.iter().take(B1_MAX_IMAGES_PER_RESULT) {
+        let Some(hex) = fp.get("fingerprint").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(mime) = fp.get("mime_type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(ext) = b1_image_ext(mime) else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(images_dir.join(format!("{hex}.{ext}"))) else {
+            continue;
+        };
+        if blake3::hash(&bytes).to_hex().as_str() != hex {
+            continue;
+        }
+        out.push(crate::agent::translator::ImageData {
+            mime_type: mime.to_string(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        });
+    }
+    out
+}
+
+/// B1:运行窗图片总量预算(base64 字符计)。超限从最旧 Tool 消息开始逐张丢弃,
+/// 该消息 content 追加一次注记(fail-visible 于 LLM 面)。返回丢弃张数。
+fn enforce_window_image_budget(messages: &mut [Message], max_total_b64: usize) -> usize {
+    let total: usize = messages
+        .iter()
+        .map(|m| match m {
+            Message::Tool { images, .. } => {
+                images.iter().map(|i| i.data_base64.len()).sum::<usize>()
+            }
+            _ => 0,
+        })
+        .sum();
+    if total <= max_total_b64 {
+        return 0;
+    }
+    let mut dropped = 0usize;
+    let mut running = total;
+    for msg in messages.iter_mut() {
+        if running <= max_total_b64 {
+            break;
+        }
+        if let Message::Tool { content, images, .. } = msg {
+            let mut dropped_here = 0usize;
+            while !images.is_empty() && running > max_total_b64 {
+                let img = images.remove(0);
+                running = running.saturating_sub(img.data_base64.len());
+                dropped += 1;
+                dropped_here += 1;
+            }
+            if dropped_here > 0 {
+                content.push_str(&format!(
+                    "\n[image omitted: window image budget, {dropped_here} dropped]"
+                ));
+            }
+        }
+    }
+    dropped
+}
+
 #[derive(Debug, Clone)]
 /// TODO: doc
 pub struct AgentConfig {
@@ -3831,6 +4034,16 @@ impl AgentRunner {
             }
         }
 
+        // B1:窗口图片总量预算(8MB base64 计)——超限从最旧图开始丢,注记进发送副本
+        // (messages_to_send 为发送副本,不动权威面)
+        let dropped_images = enforce_window_image_budget(
+            &mut messages_to_send,
+            B1_WINDOW_IMAGE_BUDGET_B64,
+        );
+        if dropped_images > 0 {
+            info!(dropped = dropped_images, "B1: window image budget enforced");
+        }
+
         let serde_messages = serde_json::to_value(&messages_to_send)
             .map_err(|e| AgentError::Internal(format!("serialize messages: {}", e)))?;
         let tcb_messages = serde_messages.clone();
@@ -4070,10 +4283,15 @@ impl AgentRunner {
                 .observe(tool_name, &args.to_string(), &tool_result.to_string());
         let tool_idx = messages.len();
         // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文(事实记录)
-        let raw_content = tool_result.to_string();
+        // B1:先提取旁路图片+瘦身(指纹替换 base64),回喂/持久化两面统一用
+        // 瘦身后文本(审计链存指纹不存 base64;图片本体内容寻址落盘)
+        let (tool_images, extracted_raw) =
+            extract_images_from_raw(&tool_result.to_string(), std::path::Path::new(B1_IMAGES_DIR));
+        let raw_content = extracted_raw.clone();
         let tool_msg = Message::Tool {
             content: truncate_tool_result(raw_content.clone(), self.tool_result_max_chars),
             tool_name: tool_name.to_string(),
+            images: tool_images,
         };
         messages.push(tool_msg);
         // P0: 持久化 tool 消息
@@ -4083,13 +4301,14 @@ impl AgentRunner {
             Message::Tool {
                 content: raw_content,
                 tool_name: tool_name.to_string(),
+                images: Vec::new(),
             },
         )
         .await?;
 
         let mut result = serde_json::json!({
             "tool_name": tool_name,
-            "result": tool_result.to_string(),
+            "result": extracted_raw,
         });
         match stagnation_verdict {
             StagnationVerdict::Normal => {}
@@ -5281,6 +5500,7 @@ impl AgentRunner {
         let mut report = DanglingRepairReport::default();
         for (name, arguments, action) in plan {
             report.dangling += 1;
+            let mut repair_images = Vec::new();
             let content = match action {
                 DanglingAction::Reexecute => {
                     match self
@@ -5289,7 +5509,13 @@ impl AgentRunner {
                     {
                         Ok((result, _)) => {
                             report.reexecuted += 1;
-                            truncate_tool_result(result.to_string(), self.tool_result_max_chars)
+                            // B1:重执行结果同样过旁路图片提取+瘦身(与主回喂一致)
+                            let (imgs, cleaned) = extract_images_from_raw(
+                                &result.to_string(),
+                                std::path::Path::new(B1_IMAGES_DIR),
+                            );
+                            repair_images = imgs;
+                            truncate_tool_result(cleaned, self.tool_result_max_chars)
                         }
                         Err(e) => {
                             report.observed += 1;
@@ -5314,10 +5540,16 @@ impl AgentRunner {
             let msg = Message::Tool {
                 content,
                 tool_name: name,
+                images: repair_images,
             };
             let idx = messages.len();
-            messages.push(msg.clone());
-            self.persist_message(session_id, idx, msg)
+            // 回喂消息带旁路图;persist 面存瘦身后文本+空图(审计链存指纹不存 base64)
+            let mut persist_msg = msg.clone();
+            if let Message::Tool { images, .. } = &mut persist_msg {
+                images.clear();
+            }
+            messages.push(msg);
+            self.persist_message(session_id, idx, persist_msg)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -6555,6 +6787,16 @@ impl AgentRunner {
                                                    messages_to_send.push(crate::agent::translator::Message::System { content: block });
                                                }
 
+                                               // B1:窗口图片总量预算(8MB base64 计)——超限从最旧图开始丢,
+                                               // 注记进发送副本(messages_to_send 为发送副本,不动权威面)
+                                               let dropped_images = enforce_window_image_budget(
+                                                   &mut messages_to_send,
+                                                   B1_WINDOW_IMAGE_BUDGET_B64,
+                                               );
+                                               if dropped_images > 0 {
+                                                   info!(dropped = dropped_images, "B1: window image budget enforced");
+                                               }
+
                                                let serde_messages = match serde_json::to_value(&messages_to_send) {
                                                    Ok(v) => v,
                                                    Err(e) => {
@@ -7049,6 +7291,7 @@ impl AgentRunner {
                                                                let err_tool_msg = Message::Tool {
                                                                    content: err_content.clone(),
                                                                    tool_name: tc.name.clone(),
+                                                                   images: Vec::new(),
                                                                };
                                                                messages.push(err_tool_msg.clone());
                                                                if let Err(pe) = runner
@@ -7102,6 +7345,10 @@ impl AgentRunner {
                                                            raw_content.push('\n');
                                                            raw_content.push_str(&adv);
                                                        }
+                                                       // B1:旁路图片提取+瘦身(指纹替换 base64),
+                                                       // journal/回喂/持久化三面统一用瘦身后文本
+                                                       let (tool_images, raw_content) =
+                                                           extract_images_from_raw(&raw_content, std::path::Path::new(B1_IMAGES_DIR));
                                                        // 委托子会话锚落账(delegate 工具:spawn 账 drain,
                                                        // 事件序 tool_invoked → delegate_spawned → tool_result)
                                                        if tc.name == "delegate" {
@@ -7119,6 +7366,7 @@ impl AgentRunner {
                                                                runner.tool_result_max_chars,
                                                            ),
                                                            tool_name: tc.name.clone(),
+                                                           images: tool_images,
                                                        };
                                                        messages.push(tool_msg);
                                                        if let Err(e) = runner
@@ -7128,6 +7376,7 @@ impl AgentRunner {
                                                                Message::Tool {
                                                                    content: raw_content,
                                                                    tool_name: tc.name.clone(),
+                                                                   images: Vec::new(),
                                                                },
                                                            )
                                                            .await
@@ -7299,6 +7548,7 @@ impl AgentRunner {
                                                                "{{\"status\":\"rejected_by_acceptance_gate\",\"detail\":\"{detail}\"}}"
                                                            ),
                                                            tool_name: tool_name.clone(),
+                                                           images: Vec::new(),
                                                        });
                                                        if let Err(e) = runner
                                                            .persist_message(&session_id, tool_idx, messages.last().cloned().expect("gate reject tool msg"))
@@ -7489,9 +7739,14 @@ impl AgentRunner {
                                                    fr
                                                };
 
+                                               // B1:旁路图片提取+瘦身(指纹替换 base64),
+                                               // journal/回喂/持久化三面统一用瘦身后文本
+                                               let (tool_images, extracted_raw) =
+                                                   extract_images_from_raw(&final_result.to_string(), std::path::Path::new(B1_IMAGES_DIR));
+
                                                // B21:tool_result(ok;content = 工具输出全文与 io_response 一致)
                                                if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                   if let Err(e) = j.tool_result(cid, "ok", &final_result.to_string()) {
+                                                   if let Err(e) = j.tool_result(cid, "ok", &extracted_raw) {
                                                        warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
                                                    }
                                                }
@@ -7500,7 +7755,7 @@ impl AgentRunner {
                                                tool_calls.push(tool_name.clone());
                                                let tool_idx = messages.len();
                                                // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文
-                                               let mut raw_content = final_result.to_string();
+                                               let mut raw_content = extracted_raw;
                                                if let Some(adv) = gate_note_advisory.take() {
                                                    raw_content.push('\n');
                                                    raw_content.push_str(&adv);
@@ -7515,6 +7770,7 @@ impl AgentRunner {
                                                        runner.tool_result_max_chars,
                                                    ),
                                                    tool_name: tool_name.clone(),
+                                                   images: tool_images,
                                                };
                                                messages.push(tool_msg);
                                                if let Err(e) = runner
@@ -7524,6 +7780,7 @@ impl AgentRunner {
                                                        Message::Tool {
                                                            content: raw_content,
                                                            tool_name: tool_name.clone(),
+                                                           images: Vec::new(),
                                                        },
                                                    )
                                                    .await
@@ -7756,11 +8013,16 @@ fn rec_to_message(rec: &MessageRecord, max_chars: usize) -> Option<Message> {
                 tool_calls,
             })
         }
-        "tool" => rec.tool_name.clone().map(|tool_name| Message::Tool {
+        "tool" => rec.tool_name.clone().map(|tool_name| {
             // 重建值同样按上限截断:continuation 恢复路径与运行中回喂的 wire
-            // 形态保持一致(审计链始终存原始全文,截断仅作用于回喂 LLM 的值)
-            content: truncate_tool_result(rec.content.clone(), max_chars),
-            tool_name,
+            // 形态保持一致(审计链存瘦身后指纹文本,截断仅作用于回喂 LLM 的值)
+            let content = truncate_tool_result(rec.content.clone(), max_chars);
+            Message::Tool {
+                // B1:按 content 中指纹从落盘还原旁路图片(缺失/不匹配降级为空)
+                images: restore_images_from_content(&content, std::path::Path::new(B1_IMAGES_DIR)),
+                content,
+                tool_name,
+            }
         }),
         other => {
             warn!(role = %other, idx = rec.idx, "G15: unknown message role, skipping");
@@ -8024,8 +8286,10 @@ fn clear_tool_results(region: &[Message], max_clear: usize) -> (Vec<Message>, us
     let mut cleared = 0usize;
     for (i, msg) in out.iter_mut().enumerate() {
         if clear_set.contains(&i) {
-            if let Message::Tool { content, tool_name } = msg {
+            if let Message::Tool { content, tool_name, images } = msg {
                 *content = format!("[cleared: {tool_name}]");
+                // B1:图片属窗口大头,清 content 必须连带清旁路图,防预算门被架空
+                *images = Vec::new();
                 cleared += 1;
             }
         }

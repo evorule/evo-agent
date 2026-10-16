@@ -2553,7 +2553,7 @@ fn test_g15_rec_to_message_tool() {
     let msg =
         rec_to_message(&rec, recipe_tool_result_max_chars()).expect("tool rec should convert");
     assert!(
-        matches!(msg, Message::Tool { ref content, ref tool_name } if content == "result data" && tool_name == "search")
+        matches!(msg, Message::Tool { ref content, ref tool_name, .. } if content == "result data" && tool_name == "search")
     );
 }
 
@@ -2576,7 +2576,7 @@ fn test_g15_rec_to_message_tool_long_content_truncated() {
     };
     let msg = rec_to_message(&rec, max_chars).expect("tool rec should convert");
     match msg {
-        Message::Tool { content, tool_name } => {
+        Message::Tool { content, tool_name, .. } => {
             assert_eq!(tool_name, "search");
             assert!(
                 content.contains("[truncated 100 chars]"),
@@ -4227,6 +4227,7 @@ fn tool_msg(name: &str, content: &str) -> Message {
     Message::Tool {
         content: content.to_string(),
         tool_name: name.to_string(),
+        images: Vec::new(),
     }
 }
 
@@ -4579,4 +4580,194 @@ async fn b16_mcp_g8_approval_timeout_auto_denies() {
     let record = record.expect("approval record must be produced");
     assert_eq!(record["decision"], "auto_rejected");
     assert_eq!(record["reason"], "timeout");
+}
+
+// ---- B1 多模态上行:旁路图片提取/还原/窗口预算 测试组 ----
+
+/// 最小合法 PNG 字节(魔数 8 字节 + 体)
+fn b1_png_bytes(marker: &[u8]) -> Vec<u8> {
+    let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+    v.extend_from_slice(marker);
+    v
+}
+
+use base64::Engine as _;
+
+#[test]
+fn test_b1_extract_keeps_valid_image_with_fingerprint_and_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b1_png_bytes(b"body-one");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let raw = serde_json::json!({"status": "ok", "images": [
+        {"mime_type": "image/png", "data_base64": b64}
+    ]})
+    .to_string();
+
+    let (images, cleaned) =
+        extract_images_from_raw(&raw, dir.path());
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].mime_type, "image/png");
+    // 原键被指纹替换
+    let obj: serde_json::Value = serde_json::from_str(&cleaned).unwrap();
+    assert!(obj.get("images").is_none(), "raw images key must be removed");
+    let fps = obj.get("images_extracted").unwrap().as_array().unwrap();
+    assert_eq!(fps.len(), 1);
+    let fp = fps[0].get("fingerprint").unwrap().as_str().unwrap();
+    assert_eq!(fp, blake3::hash(&bytes).to_hex().to_string());
+    // 图片本体内容寻址落盘
+    let path = dir.path().join(format!("{fp}.png"));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn test_b1_extract_passthrough_non_json_and_missing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    // 非 JSON 对象 → 原样
+    let (images, cleaned) = extract_images_from_raw("plain text", dir.path());
+    assert!(images.is_empty());
+    assert_eq!(cleaned, "plain text");
+    // JSON 对象但无 images 键 → 原样
+    let raw = serde_json::json!({"status": "ok"}).to_string();
+    let (images, cleaned) = extract_images_from_raw(&raw, dir.path());
+    assert!(images.is_empty());
+    assert_eq!(cleaned, raw);
+    // 空数组 → 键删除,无指纹
+    let raw = serde_json::json!({"status": "ok", "images": []}).to_string();
+    let (images, cleaned) = extract_images_from_raw(&raw, dir.path());
+    assert!(images.is_empty());
+    let obj: serde_json::Value = serde_json::from_str(&cleaned).unwrap();
+    assert!(obj.get("images").is_none());
+    assert!(obj.get("images_extracted").is_none());
+}
+
+#[test]
+fn test_b1_extract_rejects_bad_base64_and_magic_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = serde_json::json!({"images": [
+        {"mime_type": "image/png", "data_base64": "!!!not-base64!!!"},
+        {"mime_type": "image/png", "data_base64": base64::engine::general_purpose::STANDARD.encode(b"not a png at all")}
+    ]})
+    .to_string();
+    let (images, cleaned) = extract_images_from_raw(&raw, dir.path());
+    assert!(images.is_empty());
+    let obj: serde_json::Value = serde_json::from_str(&cleaned).unwrap();
+    assert!(obj.get("images_extracted").is_none());
+    assert_eq!(obj.get("images_omitted").unwrap().as_u64().unwrap(), 2);
+}
+
+#[test]
+fn test_b1_extract_caps_at_four_images_per_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b1_png_bytes(b"x"));
+    let mut imgs = Vec::new();
+    for _ in 0..6 {
+        imgs.push(serde_json::json!({"mime_type": "image/png", "data_base64": b64}));
+    }
+    let raw = serde_json::json!({"images": imgs}).to_string();
+    let (images, cleaned) = extract_images_from_raw(&raw, dir.path());
+    assert_eq!(images.len(), 4, "keep cap");
+    let obj: serde_json::Value = serde_json::from_str(&cleaned).unwrap();
+    assert_eq!(obj.get("images_omitted").unwrap().as_u64().unwrap(), 2);
+}
+
+#[test]
+fn test_b1_tool_message_serde_roundtrip_and_legacy_compat() {
+    use crate::agent::translator::ImageData;
+    // 往返一致
+    let msg = Message::Tool {
+        content: "fp".to_string(),
+        tool_name: "image_load".to_string(),
+        images: vec![ImageData {
+            mime_type: "image/png".to_string(),
+            data_base64: "QUJD".to_string(),
+        }],
+    };
+    let v = serde_json::to_value(&msg).unwrap();
+    let back: Message = serde_json::from_value(v).unwrap();
+    assert_eq!(back, msg);
+    // 旧形态(无 images 键)反序列化 → 空(向后兼容)
+    let legacy: Message = serde_json::from_value(serde_json::json!({
+        "role": "tool", "content": "ok", "tool_name": "echo"
+    }))
+    .unwrap();
+    match legacy {
+        Message::Tool { images, .. } => assert!(images.is_empty()),
+        other => panic!("expected Tool, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_b1_restore_images_from_content_by_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b1_png_bytes(b"restore-me");
+    let hex = blake3::hash(&bytes).to_hex().to_string();
+    std::fs::write(dir.path().join(format!("{hex}.png")), &bytes).unwrap();
+    let content = serde_json::json!({
+        "status": "ok",
+        "images_extracted": [{"fingerprint": hex, "bytes": bytes.len(), "mime_type": "image/png"}]
+    })
+    .to_string();
+    let images = restore_images_from_content(&content, dir.path());
+    assert_eq!(images.len(), 1);
+    use base64::Engine as _;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&images[0].data_base64)
+            .unwrap(),
+        bytes
+    );
+
+    // 文件缺失 → 空降级
+    let content_missing = serde_json::json!({
+        "images_extracted": [{"fingerprint": format!("{hex}a"), "bytes": 1, "mime_type": "image/png"}]
+    })
+    .to_string();
+    let images = restore_images_from_content(&content_missing, dir.path());
+    assert!(images.is_empty());
+
+    // 无指纹键 → 空
+    let images = restore_images_from_content("{\"status\":\"ok\"}", dir.path());
+    assert!(images.is_empty());
+}
+
+#[test]
+fn test_b1_window_image_budget_drops_oldest_with_annotation() {
+    use crate::agent::translator::ImageData;
+    let img = |tag: &str| ImageData {
+        mime_type: "image/png".to_string(),
+        data_base64: tag.to_string(),
+    };
+    let mut messages = vec![
+        Message::Tool {
+            content: "old".to_string(),
+            tool_name: "a".to_string(),
+            images: vec![img("aaaaaaaaaa")],
+        },
+        Message::User {
+            content: "u".to_string(),
+        },
+        Message::Tool {
+            content: "new".to_string(),
+            tool_name: "b".to_string(),
+            images: vec![img("bbbbbbbbbb")],
+        },
+    ];
+    // 预算 15:总 20 → 超限,最旧先丢一张
+    let dropped = enforce_window_image_budget(&mut messages, 15);
+    assert_eq!(dropped, 1);
+    assert!(
+        matches!(&messages[0], Message::Tool { images, content, .. } if images.is_empty() && content.contains("window image budget"))
+    );
+    assert!(
+        matches!(&messages[2], Message::Tool { images, content, .. } if images.len() == 1 && !content.contains("window image budget"))
+    );
+    // 未超 → 零改动
+    let mut messages = vec![Message::Tool {
+        content: "ok".to_string(),
+        tool_name: "a".to_string(),
+        images: vec![img("aaa")],
+    }];
+    let dropped = enforce_window_image_budget(&mut messages, 1024);
+    assert_eq!(dropped, 0);
+    assert!(matches!(&messages[0], Message::Tool { content, .. } if content == "ok"));
 }

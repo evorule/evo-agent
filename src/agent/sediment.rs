@@ -2092,6 +2092,7 @@ mod tests {
             Message::Tool {
                 content: "result".to_string(),
                 tool_name: "search".to_string(),
+                images: Vec::new(),
             },
         ];
         let text = conversation_text(&messages);
