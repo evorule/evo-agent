@@ -10,6 +10,7 @@ pub mod approval_api;
 pub mod auth;
 pub mod completion_api;
 pub mod console_sidecar;
+pub mod dap_api;
 pub mod evorule_client;
 pub mod file_api;
 pub mod fs_watch;

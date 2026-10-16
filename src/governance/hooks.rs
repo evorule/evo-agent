@@ -235,6 +235,26 @@ pub fn s4_publish(session_id: &str, path: &str) {
     fire(s4_publish_draft(session_id, path));
 }
 
+/// 调试适配器会话生命周期（record-only；spawn=Create、退出=Close）
+pub(crate) fn dap_session_draft(action: TerminalAction, detail: &str) -> GovDraft {
+    let (kind, verb) = match action {
+        TerminalAction::Create => (GovEventKind::DapSession(TerminalAction::Create), "开启"),
+        TerminalAction::Close => (GovEventKind::DapSession(TerminalAction::Close), "退出"),
+    };
+    GovDraft {
+        kind,
+        session_id: "workbench".to_string(),
+        actor: GovActor::User,
+        summary: format!("调试适配器会话{verb}（{detail}）"),
+        refs: GovRefs::default(),
+    }
+}
+
+/// 调试适配器会话生命周期（record-only）
+pub fn dap_session(action: TerminalAction, detail: &str) {
+    fire(dap_session_draft(action, detail));
+}
+
 /// AI commit message 生成（record-only）
 pub fn ai_commit(detail: &str) {
     fire(ai_commit_draft(detail));

@@ -359,6 +359,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "dap.adapters",
+            kind: SettingType::String,
+            default: json!("{}"),
+            enum_values: None,
+            range: None,
+            category: "运行和调试",
+            description: "调试适配器白名单（运行和调试板块，fail-closed：缺省空=拒绝任何适配器 spawn）。JSON 对象形态：{\"适配器名\": {\"command\": \"可执行文件\", \"args\": [\"启动参数\"], \"langs\": [\"语言标签\"]}}，如 {\"rust\": {\"command\": \"lldb-dap\"}}。仅白名单内的适配器可经 /api/dap/ws 启动调试会话；重启 serve 生效",
+            scope: "application",
+        },
+        SettingEntry {
             key: "approval.exemptionOverride",
             kind: SettingType::Boolean,
             default: json!(false),
