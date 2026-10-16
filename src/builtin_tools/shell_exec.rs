@@ -335,8 +335,8 @@ pub const TRUSTED_ACTIVE_COMMANDS: &[&str] = &[
     // shell/解释器:隔离环境内为任务本体
     "bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl",
     // 工作台 candidate 升格:一次性环境内低风险/可重建
-    "mv", "cp", "mkdir", "touch", "head", "tail", "sed", "awk", "tar", "zip",
-    "unzip", "xargs", "patch", "diff", "wc", "sort", "uniq", "cut", "tr",
+    "mv", "cp", "mkdir", "touch", "head", "tail", "sed", "awk", "tar", "zip", "unzip", "xargs",
+    "patch", "diff", "wc", "sort", "uniq", "cut", "tr",
 ];
 
 /// **[sandbox-trusted] Candidate 备选**:有真实风险,走无人值守评审通道
@@ -1446,8 +1446,8 @@ mod tests {
     #[test]
     fn test_profile_trusted_active_expansion() {
         for p in [
-            "bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl",
-            "mv", "cp", "sed", "awk", "tar", "zip", "unzip", "xargs", "patch", "diff",
+            "bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl", "mv", "cp",
+            "sed", "awk", "tar", "zip", "unzip", "xargs", "patch", "diff",
         ] {
             assert_eq!(
                 ShellExecTool::classify_for(ExecutionProfile::SandboxTrusted, p),
@@ -1468,8 +1468,8 @@ mod tests {
     #[test]
     fn test_profile_trusted_redlines_and_candidates() {
         for p in [
-            "sudo", "su", "nc", "ncat", "ssh", "scp", "dd", "mkfs", "fdisk",
-            "shutdown", "reboot", "halt", "poweroff", "init",
+            "sudo", "su", "nc", "ncat", "ssh", "scp", "dd", "mkfs", "fdisk", "shutdown", "reboot",
+            "halt", "poweroff", "init",
         ] {
             assert!(
                 matches!(
@@ -1479,7 +1479,9 @@ mod tests {
                 "{p} must stay blocked in sandbox-trusted"
             );
         }
-        for p in ["rm", "curl", "wget", "chmod", "chown", "kill", "killall", "pkill"] {
+        for p in [
+            "rm", "curl", "wget", "chmod", "chown", "kill", "killall", "pkill",
+        ] {
             assert!(
                 matches!(
                     ShellExecTool::classify_for(ExecutionProfile::SandboxTrusted, p),
