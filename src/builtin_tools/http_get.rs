@@ -105,6 +105,10 @@ pub struct HttpGetTool {
     max_bytes: u64,
     #[allow(dead_code)]
     allow_insecure: bool,
+    /// agent 定义级 active host 声明(O-491):声明 host 在分类时由
+    /// Candidate 升级为 Active(直接执行);空=既有行为逐字节不变。
+    /// Blocked/Invalid 永不升级(SSRF 黑名单与负面域守卫不受影响)。
+    extra_allowed_hosts: Vec<String>,
 }
 
 impl HttpGetTool {
@@ -114,7 +118,18 @@ impl HttpGetTool {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_bytes: DEFAULT_MAX_BYTES,
             allow_insecure: false,
+            extra_allowed_hosts: Vec::new(),
         }
+    }
+
+    /// 声明额外 active host 白名单(大小写归一存储;语义见结构体字段注释)
+    pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.extra_allowed_hosts = hosts
+            .into_iter()
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        self
     }
 
     /// TODO: doc
@@ -200,6 +215,23 @@ impl HttpGetTool {
         // 其他 → candidate
         HostCategory::Candidate {
             host: host.to_string(),
+        }
+    }
+
+    /// agent 实例级分类:静态分类结果为 Candidate 且 host 命中本实例声明的
+    /// 额外白名单时升级为 Active;Blocked/Invalid 永不升级(安全优先)。
+    /// 无声明(extra_allowed_hosts 空)时与 `Self::classify` 逐字节等价。
+    fn classify_for_agent(&self, url: &str) -> HostCategory {
+        match Self::classify(url) {
+            HostCategory::Candidate { host } => {
+                let normalized = host.to_lowercase();
+                if self.extra_allowed_hosts.contains(&normalized) {
+                    HostCategory::Active
+                } else {
+                    HostCategory::Candidate { host }
+                }
+            }
+            other => other,
         }
     }
 
@@ -392,7 +424,7 @@ impl ToolFunction for HttpGetTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match Self::classify(url) {
+        match self.classify_for_agent(url) {
             HostCategory::Active => self.fetch(url).await,
             HostCategory::Candidate { host } => {
                 if approved {
@@ -622,6 +654,57 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("BLOCKED"), "got: {}", err);
+    }
+
+    // =========================================================================
+    // O-491:definition 级 active host 声明(声明内 Active 直放/声明外
+    // 仍 Candidate/Blocked 永不升级/大小写归一)
+    // =========================================================================
+
+    #[test]
+    fn test_classify_for_agent_declared_host_upgrades_to_active() {
+        let tool = HttpGetTool::new().with_allowed_hosts(vec![
+            "api.example.com".to_string(),
+            "API.OpenWeather.org".to_string(), // 大写声明,归一命中
+        ]);
+        // 声明内 → Active
+        assert_eq!(
+            tool.classify_for_agent("https://api.example.com/v2/data"),
+            HostCategory::Active
+        );
+        assert_eq!(
+            tool.classify_for_agent("https://api.openweather.org/x"),
+            HostCategory::Active
+        );
+        // 声明外(含内置 6 host 之外的普通公网域) → 仍 Candidate
+        assert_eq!(
+            tool.classify_for_agent("https://other.example.org/x"),
+            HostCategory::Candidate {
+                host: "other.example.org".to_string()
+            }
+        );
+        // 无声明实例与静态分类逐字节等价(既有行为零变化)
+        let plain = HttpGetTool::new();
+        assert_eq!(
+            plain.classify_for_agent("https://api.example.com/v2/data"),
+            HttpGetTool::classify("https://api.example.com/v2/data")
+        );
+    }
+
+    #[test]
+    fn test_classify_for_agent_never_upgrades_blocked_or_invalid() {
+        // SSRF 黑名单 IP 即使被声明也不升级(Blocked 永不放行)
+        let tool = HttpGetTool::new()
+            .with_allowed_hosts(vec!["192.168.1.1".to_string(), "127.0.0.1".to_string()]);
+        match tool.classify_for_agent("https://192.168.1.1/admin") {
+            HostCategory::Blocked { .. } => {}
+            other => panic!("blocked host must stay blocked, got {:?}", other),
+        }
+        // 声明无法把非法 URL 变合法
+        assert_eq!(
+            tool.classify_for_agent("not a url"),
+            HttpGetTool::classify("not a url")
+        );
     }
 
     #[tokio::test]

@@ -592,6 +592,15 @@ pub struct AgentDefinition {
     ///   serve 侧独占读取,加载失败同样 fail-visible 降级 manual
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
+    /// http_get 额外 active host 白名单(可选;O-491 ALE 参赛增量)
+    ///
+    /// - 声明 host(域名形态)内 http_get 直接执行(active,无审批开销),
+    ///   声明外仍走 candidate(各审批模式行为不变);SSRF 黑名单与负面域
+    ///   守卫不受影响,Blocked/Invalid 永不放行
+    /// - None(缺省)=既有定义零影响;大小写不敏感(加载期归一)
+    /// - 校验:仅接受裸域名形态(拒 scheme/路径/端口/IP 字面量/空白)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_get_allowed_hosts: Option<Vec<String>>,
     /// 组装配方(可选;元层先行批,agent_def 增量。None = 内置默认配方 =
     /// 现状行为逐字节等价;声明后配方版本/哈希进 effective_params 三阶落账)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -715,6 +724,31 @@ impl AgentDefinition {
             return Err(AgentDefinitionError::InvalidDefinition(
                 "step_timeout_secs must be >= 1".to_string(),
             ));
+        }
+        // O-491:http_get 额外 active host 白名单形态门卫(仅裸域名形态;
+        // IP 字面量/带端口/带 scheme/带路径等一律拒——IP 走 SSRF/candidate
+        // 语义不收声明,其余形态在 host 匹配下无意义且易误解)
+        if let Some(hosts) = &self.http_get_allowed_hosts {
+            for h in hosts {
+                let t = h.trim();
+                if t.is_empty()
+                    || t != h
+                    || t.contains("://")
+                    || t.contains('/')
+                    || t.contains('?')
+                    || t.contains('#')
+                    || t.contains('@')
+                    || t.contains(':')
+                    || t.contains(char::is_whitespace)
+                    || t.parse::<std::net::IpAddr>().is_ok()
+                {
+                    return Err(AgentDefinitionError::InvalidDefinition(format!(
+                        "http_get_allowed_hosts entry '{}' must be a bare hostname \
+                         (no scheme/path/port/IP literal/whitespace)",
+                        h
+                    )));
+                }
+            }
         }
         // M5-a:capability_boundary 语义门卫(单一事实源 + 模式/工具一致性)
         if let Some(b) = &self.capability_boundary {
@@ -1888,6 +1922,7 @@ mod tests {
     #[test]
     fn test_to_agent_config() {
         let def = AgentDefinition {
+            http_get_allowed_hosts: None,
             agent_type: "writer".to_string(),
             version: "1.0.0".to_string(),
             description: "Writer agent".to_string(),
@@ -2260,6 +2295,7 @@ mod tests {
     #[test]
     fn test_capability_boundary_validate_rejections() {
         let mk = |mode: &str, root: &str, tools: Vec<&str>, btools: Vec<&str>| AgentDefinition {
+            http_get_allowed_hosts: None,
             agent_type: "x".to_string(),
             version: "1".to_string(),
             description: String::new(),
@@ -2511,6 +2547,7 @@ mod tests {
     #[test]
     fn test_max_parallel_tools_skipped_when_default_in_serialization() {
         let def = AgentDefinition {
+            http_get_allowed_hosts: None,
             agent_type: "x".to_string(),
             version: "1".to_string(),
             description: String::new(),
@@ -2611,6 +2648,79 @@ mod tests {
     }
 
     // =========================================================================
+    // O-491:http_get 额外 active host 白名单(声明形态门卫 + 缺省零影响)
+    // =========================================================================
+
+    #[test]
+    fn test_http_get_allowed_hosts_defaults_to_none() {
+        // 旧版 agent.json 不含 http_get_allowed_hosts → None(现状行为零变化)
+        let json = r#"{
+            "agent_type": "x", "version": "1", "description": "",
+            "system_prompt": "", "model": "m", "temperature": 0.5,
+            "max_steps": 1, "step_timeout_secs": 1, "tools": [],
+            "output_format": null
+        }"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert!(def.http_get_allowed_hosts.is_none());
+        let ser = serde_json::to_string(&def).expect("serialize");
+        assert!(!ser.contains("http_get_allowed_hosts"));
+        assert!(def.validate().is_ok());
+    }
+
+    #[test]
+    fn test_http_get_allowed_hosts_bare_hostname_accepted() {
+        let json = r#"{
+            "agent_type": "x", "version": "1", "description": "",
+            "system_prompt": "", "model": "m", "temperature": 0.5,
+            "max_steps": 1, "step_timeout_secs": 1, "tools": [],
+            "output_format": null,
+            "http_get_allowed_hosts": ["api.example.com", "api.openweather.org"]
+        }"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert_eq!(
+            def.http_get_allowed_hosts.as_deref(),
+            Some(
+                &[
+                    "api.example.com".to_string(),
+                    "api.openweather.org".to_string()
+                ][..]
+            )
+        );
+        assert!(def.validate().is_ok());
+    }
+
+    #[test]
+    fn test_http_get_allowed_hosts_rejects_non_bare_forms() {
+        let base = r#"{
+            "agent_type": "x", "version": "1", "description": "",
+            "system_prompt": "", "model": "m", "temperature": 0.5,
+            "max_steps": 1, "step_timeout_secs": 1, "tools": [],
+            "output_format": null,
+            "http_get_allowed_hosts": ["%HOST%"]
+        }"#;
+        // scheme / 路径 / 端口 / IP 字面量 / 首尾空白 / 空串 全拒
+        for bad in [
+            "https://api.example.com",
+            "api.example.com/v2",
+            "api.example.com:8080",
+            "127.0.0.1",
+            "192.168.1.1",
+            "::1",
+            " api.example.com",
+            "api.example.com ",
+            "",
+        ] {
+            let json = base.replace("%HOST%", bad);
+            let def: AgentDefinition = serde_json::from_str(&json).expect("parse");
+            let err = def.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("http_get_allowed_hosts"),
+                "host '{bad}' must be rejected, got: {err}"
+            );
+        }
+    }
+
+    // =========================================================================
     // skills 装配 B2 批(声明字段/frontmatter 解析/加载门卫)
     // =========================================================================
 
@@ -2673,6 +2783,7 @@ mod tests {
         let dir = make_tmp_dir();
         let skill_path = write_skill_md(dir.path(), "a/SKILL.md", SAMPLE_SKILL_MD);
         let empty_name = AgentDefinition {
+            http_get_allowed_hosts: None,
             agent_type: "x".into(),
             version: "1".into(),
             description: "d".into(),

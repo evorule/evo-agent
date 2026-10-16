@@ -1199,6 +1199,22 @@ impl AgentRunner {
             crate::api::serve_tools::wire_skills(&mut tool_handler, declared_skills)
                 .map_err(AgentError::Internal)?;
 
+        // O-491:definition 级 http_get active host 声明——声明 host 在分类时
+        // 由 Candidate 升级 Active(直接执行,无审批开销),声明外仍 candidate;
+        // SSRF 黑名单与负面域守卫不受影响。None=实例不替换(零影响)。
+        // register_static 为同名覆盖(insert 语义),static manifest 必在。
+        if let Some(hosts) = &def.http_get_allowed_hosts {
+            if !hosts.is_empty() && tool_handler.has_tool("http_get") {
+                tool_handler.register_static(
+                    "http_get",
+                    std::sync::Arc::new(
+                        crate::builtin_tools::http_get::HttpGetTool::new()
+                            .with_allowed_hosts(hosts.clone()),
+                    ),
+                );
+            }
+        }
+
         // 2. 校验:def.tools 全部已在 tool_handler 注册
         // (早失败:用户能在跑之前就发现配错,而不是跑一半才挂)
         // 例外:自省记忆工具在记忆装配后才注册(阶段 3 F-611),此处按暴露
