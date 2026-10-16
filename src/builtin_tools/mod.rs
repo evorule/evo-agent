@@ -96,6 +96,24 @@ use crate::io_handlers::tool_handler::ToolHandler;
 /// let runner = AgentRunner::new(config, client).with_tool_handler(tool_handler);
 /// ```
 pub fn default_safe_toolkit(workdir: &Path, read_root: &Path) -> ToolHandler {
+    default_safe_toolkit_with_profile(
+        workdir,
+        read_root,
+        shell_exec::ExecutionProfile::Workbench,
+    )
+}
+
+/// G1:带执行环境 profile 的装配
+///
+/// profile 决定 shell_exec/python_exec 的安全分类基线(`Workbench` =
+/// 历史行为逐项一致;`SandboxTrusted` = 一次性隔离环境语义,见
+/// `shell_exec::ExecutionProfile`)。缺省入口 [`default_safe_toolkit`]
+/// 委托 Workbench,零变化。
+pub fn default_safe_toolkit_with_profile(
+    workdir: &Path,
+    read_root: &Path,
+    profile: shell_exec::ExecutionProfile,
+) -> ToolHandler {
     let workdir_buf = workdir
         .canonicalize()
         .unwrap_or_else(|_| workdir.to_path_buf());
@@ -141,10 +159,17 @@ pub fn default_safe_toolkit(workdir: &Path, read_root: &Path) -> ToolHandler {
     );
     handler.register_static(
         "shell_exec",
-        Arc::new(shell_exec::ShellExecTool::new().with_workdir(&workdir_buf)),
+        Arc::new(
+            shell_exec::ShellExecTool::new()
+                .with_workdir(&workdir_buf)
+                .with_execution_profile(profile),
+        ),
     );
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
-    handler.register_static("python_exec", Arc::new(python_exec::PythonExecTool));
+    handler.register_static(
+        "python_exec",
+        Arc::new(python_exec::PythonExecTool::new().with_execution_profile(profile)),
+    );
     handler.register_static(
         "git_status",
         Arc::new(git_tools::GitStatusTool::new(workdir_buf.clone())),

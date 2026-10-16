@@ -592,6 +592,14 @@ pub struct AgentDefinition {
     ///   serve 侧独占读取,加载失败同样 fail-visible 降级 manual
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
+    /// 执行环境 profile(G1,可选):环境决定 shell_exec/python_exec 的安全
+    /// 分类基线——"workbench"(缺省)= host 工作台人在环基线,行为零变化;
+    /// "sandbox-trusted" = 一次性隔离执行环境(评测沙箱/容器/VM),环境本身
+    /// 即隔离边界,shell/解释器按任务本体放行,真红线(提权/网络逃逸/毁盘/
+    /// 环境自毁)任何档位保持拦截。未知值 fail-fast(装配/请求解析时报错,
+    /// 不静默回落)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<String>,
     /// http_get 额外 active host 白名单(可选)
     ///
     /// - 声明 host(域名形态)内 http_get 直接执行(active,无审批开销),
@@ -1923,6 +1931,7 @@ mod tests {
     fn test_to_agent_config() {
         let def = AgentDefinition {
             http_get_allowed_hosts: None,
+            execution_profile: None,
             agent_type: "writer".to_string(),
             version: "1.0.0".to_string(),
             description: "Writer agent".to_string(),
@@ -2296,6 +2305,7 @@ mod tests {
     fn test_capability_boundary_validate_rejections() {
         let mk = |mode: &str, root: &str, tools: Vec<&str>, btools: Vec<&str>| AgentDefinition {
             http_get_allowed_hosts: None,
+            execution_profile: None,
             agent_type: "x".to_string(),
             version: "1".to_string(),
             description: String::new(),
@@ -2548,6 +2558,7 @@ mod tests {
     fn test_max_parallel_tools_skipped_when_default_in_serialization() {
         let def = AgentDefinition {
             http_get_allowed_hosts: None,
+            execution_profile: None,
             agent_type: "x".to_string(),
             version: "1".to_string(),
             description: String::new(),
@@ -2784,6 +2795,7 @@ mod tests {
         let skill_path = write_skill_md(dir.path(), "a/SKILL.md", SAMPLE_SKILL_MD);
         let empty_name = AgentDefinition {
             http_get_allowed_hosts: None,
+            execution_profile: None,
             agent_type: "x".into(),
             version: "1".into(),
             description: "d".into(),

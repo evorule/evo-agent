@@ -492,8 +492,23 @@ fn cmd_run(
 
     // 4. 工具 handler:内置工具(15) + 规则工具(26) 的 union
     //    修复:rule-copilot 等规则角色在 run 路径也能使用 ws_*/rule_*/audit_* 工具
-    let mut tool_handler =
-        evo_agent::api::serve_tools::build_union_toolkit(workdir, &ws_client, &client);
+    // G1:定义级执行环境 profile(未知值 fail-fast 退出;缺省 Workbench = 零变化)
+    let execution_profile = match def.execution_profile.as_deref() {
+        None => evo_agent::builtin_tools::shell_exec::ExecutionProfile::Workbench,
+        Some(s) => match evo_agent::builtin_tools::shell_exec::ExecutionProfile::parse(s) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: invalid execution_profile in agent definition: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let mut tool_handler = evo_agent::api::serve_tools::build_union_toolkit_with_profile(
+        workdir,
+        &ws_client,
+        &client,
+        execution_profile,
+    );
     // M5-a:能力边界接线(显式声明重绑 file 工具沙箱 + 生效边界注入 runner)
     let capability_boundary =
         evo_agent::api::serve_tools::wire_capability_boundary(&mut tool_handler, &def, workdir);

@@ -19,7 +19,6 @@ use serde_json::Value;
 
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::workspace_client::WorkspaceApiClient;
-use crate::builtin_tools::default_safe_toolkit;
 use crate::io_handlers::tool_handler::ToolHandler;
 use crate::rule_tools::full_rule_toolkit;
 
@@ -112,7 +111,36 @@ pub fn build_union_toolkit_with_read_root(
     ws: &WorkspaceApiClient,
     ev: &EvoruleApiClient,
 ) -> ToolHandler {
-    let mut handler = default_safe_toolkit(workdir, read_root);
+    build_union_toolkit_with_read_root_and_profile(
+        workdir,
+        read_root,
+        ws,
+        ev,
+        crate::builtin_tools::shell_exec::ExecutionProfile::Workbench,
+    )
+}
+
+/// G1:带执行环境 profile 的 union 装配(其余同 [`build_union_toolkit`];
+/// profile 决定 shell_exec/python_exec 的安全分类基线,Workbench = 零变化)
+pub fn build_union_toolkit_with_profile(
+    workdir: &Path,
+    ws: &WorkspaceApiClient,
+    ev: &EvoruleApiClient,
+    profile: crate::builtin_tools::shell_exec::ExecutionProfile,
+) -> ToolHandler {
+    build_union_toolkit_with_read_root_and_profile(workdir, workdir, ws, ev, profile)
+}
+
+/// G1 核心:读域根 + 执行环境 profile 全参装配
+pub fn build_union_toolkit_with_read_root_and_profile(
+    workdir: &Path,
+    read_root: &Path,
+    ws: &WorkspaceApiClient,
+    ev: &EvoruleApiClient,
+    profile: crate::builtin_tools::shell_exec::ExecutionProfile,
+) -> ToolHandler {
+    let mut handler =
+        crate::builtin_tools::default_safe_toolkit_with_profile(workdir, read_root, profile);
     let rule_handler = full_rule_toolkit(ws, ev);
     // 合并规则工具到 handler(按白名单逐个取出,保证只注册已知工具;
     // manifest+执行器成对迁移,治理元数据不丢)
@@ -538,13 +566,60 @@ pub fn build_filtered_toolkit_with_switches(
 /// 容器域 = 任务沙箱语义见 `shell_exec::docker_exec_argv` 注记;白名单/规则面
 /// 随动 = 参赛 P2 扩权批规则面;不传容器名即零变化(删配置即下线)。
 /// 容器命令超时取 600s(容器内 pip/构建类命令显著长于宿主 30s 缺省)。
-pub fn with_shell_exec_backend(filtered: &mut ToolHandler, container: &str) {
+pub fn with_shell_exec_backend(
+    filtered: &mut ToolHandler,
+    container: &str,
+    profile: crate::builtin_tools::shell_exec::ExecutionProfile,
+) {
     let tool = crate::builtin_tools::shell_exec::ShellExecTool::new()
         .with_backend(crate::builtin_tools::shell_exec::ExecBackend::DockerExec {
             container: container.to_string(),
         })
-        .with_timeout(600);
+        .with_timeout(600)
+        .with_execution_profile(profile);
     filtered.register_static("shell_exec", std::sync::Arc::new(tool));
+    // G1:非缺省 profile 时 python_exec 随动(Workbench = 不触碰,零变化)
+    if profile != crate::builtin_tools::shell_exec::ExecutionProfile::Workbench {
+        filtered.register_static(
+            "python_exec",
+            std::sync::Arc::new(
+                crate::builtin_tools::python_exec::PythonExecTool::new()
+                    .with_execution_profile(profile),
+            ),
+        );
+    }
+}
+
+/// G1:per-request 执行环境 profile 注入(P1 后端替换同构:filtered 副本上
+/// 以目标 profile 重建 shell_exec/python_exec;不影响启动期 union toolkit;
+/// 未知值已在解析层 fail-fast,不进本函数。注:重建实例不带 workdir——
+/// P1 替换先例同语义;trusted 档生产用法是容器/vm 桥后端)
+pub fn with_shell_exec_profile(
+    filtered: &mut ToolHandler,
+    profile: crate::builtin_tools::shell_exec::ExecutionProfile,
+) {
+    let tool = crate::builtin_tools::shell_exec::ShellExecTool::new()
+        .with_execution_profile(profile);
+    filtered.register_static("shell_exec", std::sync::Arc::new(tool));
+    filtered.register_static(
+        "python_exec",
+        std::sync::Arc::new(
+            crate::builtin_tools::python_exec::PythonExecTool::new()
+                .with_execution_profile(profile),
+        ),
+    );
+}
+
+/// G1:执行环境 profile 判优解析(请求级 > 定义级;None = 零变化;
+/// 未知值 fail-fast 返回 Err,不静默回落)
+pub fn resolve_execution_profile(
+    request_level: Option<&str>,
+    def_level: Option<&str>,
+) -> Result<Option<crate::builtin_tools::shell_exec::ExecutionProfile>, String> {
+    match request_level.or(def_level) {
+        None => Ok(None),
+        Some(s) => crate::builtin_tools::shell_exec::ExecutionProfile::parse(s).map(Some),
+    }
 }
 
 /// 把 `def.tools` 收紧为 filtered toolkit 实际注册的工具面(白名单 ∩ 开关开)。
@@ -1697,6 +1772,7 @@ service_tools = ["config_persist", "rule_sandbox"]
     fn make_def(tools: &[&str], boundary: Option<CapabilityBoundary>) -> AgentDefinition {
         AgentDefinition {
             http_get_allowed_hosts: None,
+            execution_profile: None,
             agent_type: "tester".to_string(),
             version: "1.0.0".to_string(),
             description: "test".to_string(),
@@ -2201,6 +2277,59 @@ service_tools = ["config_persist", "rule_sandbox"]
 
     // ===== P1 执行桥:delegate 节点工具面容器后端继承 =====
 
+    // ===== G1 执行环境 profile =====
+
+    /// G1:profile 判优解析——请求级 > 定义级;未知值 fail-fast;None = 零变化
+    #[test]
+    fn test_resolve_execution_profile_precedence_and_fail_fast() {
+        use crate::builtin_tools::shell_exec::ExecutionProfile;
+        assert_eq!(resolve_execution_profile(None, None), Ok(None));
+        assert_eq!(
+            resolve_execution_profile(Some("sandbox-trusted"), Some("workbench")),
+            Ok(Some(ExecutionProfile::SandboxTrusted)),
+            "request level must win over definition level"
+        );
+        assert_eq!(
+            resolve_execution_profile(None, Some("sandbox-trusted")),
+            Ok(Some(ExecutionProfile::SandboxTrusted))
+        );
+        assert!(resolve_execution_profile(Some("trusted"), None).is_err());
+    }
+
+    /// G1:with_shell_exec_profile 在副本上注册 trusted 实例且分类基线生效
+    /// (trusted 下 bash 为 active 直跑:本机有 bash 则执行成功且带
+    /// execution_profile 标记;无 bash 则以 spawn 失败形态暴露——两臂都证明
+    /// 走的是执行路径,而非 Unknown 分类拒绝或审批提案路径)
+    #[tokio::test]
+    async fn test_with_shell_exec_profile_trusted_baseline() {
+        let mut union = ToolHandler::new();
+        union.register_static(
+            "shell_exec",
+            std::sync::Arc::new(crate::builtin_tools::shell_exec::ShellExecTool::new()),
+        );
+        with_shell_exec_profile(
+            &mut union,
+            crate::builtin_tools::shell_exec::ExecutionProfile::SandboxTrusted,
+        );
+        let result = union
+            .execute_by_name(
+                "shell_exec",
+                &serde_json::json!({"command": "bash -c 'echo g1'"}),
+            )
+            .await;
+        match result {
+            Ok(v) => assert_eq!(
+                v.get("execution_profile").and_then(|x| x.as_str()),
+                Some("sandbox-trusted"),
+                "trusted execution must be profile-marked: {v}"
+            ),
+            Err(e) => assert!(
+                e.contains("failed to spawn") || e.contains("bash"),
+                "unexpected rejection — classification must not be Unknown in trusted: {e}"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn test_shell_exec_backend_inherits_through_filtered_toolkit() {
         // plan-execute delegate 通路:union 面 with_shell_exec_backend 后,按
@@ -2214,7 +2343,11 @@ service_tools = ["config_persist", "rule_sandbox"]
             "shell_exec",
             std::sync::Arc::new(crate::builtin_tools::shell_exec::ShellExecTool::new()),
         );
-        with_shell_exec_backend(&mut union, "no-such-container-xyz");
+        with_shell_exec_backend(
+            &mut union,
+            "no-such-container-xyz",
+            crate::builtin_tools::shell_exec::ExecutionProfile::Workbench,
+        );
         let filtered = build_filtered_toolkit(&union, &["shell_exec".to_string()]);
         assert!(filtered.has_tool("shell_exec"), "过滤面须保留 shell_exec");
         let result = filtered

@@ -68,6 +68,12 @@ pub struct AgentRunRequest {
     /// 请求方(如评测 harness 的 agent 壳)可设。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
+    /// G1 执行环境 profile 扩展字段(可选):"sandbox-trusted" = 一次性隔离
+    /// 执行环境语义(shell_exec/python_exec 按 trusted 分类基线运行);优先级
+    /// 高于 agent 定义级 execution_profile;未知值 fail-fast 400。None = 既有
+    /// 语义零变化。LLM 面不可见该字段——仅 HTTP 请求方(如评测 harness)可设。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<String>,
     /// P2 沙箱根映射扩展字段(可选):file 类工具沙箱根重绑到指定绝对路径
     /// (校验域随执行域迁移,fs_safety 判据零改动;None = 既有语义零变化,
     /// 删字段即下线)。LLM 面不可见该字段——仅 HTTP 请求方可设。
@@ -1130,8 +1136,20 @@ async fn run_agent(
     crate::api::serve_tools::restrict_tools_to_surface(&mut def.tools, &filtered);
     // P1 执行桥:run 请求携带容器名 → shell_exec 替换为 docker-exec 后端
     // (per-request 替换,不影响启动期 union toolkit;None = 宿主语义零变化)
+    // G1 执行环境 profile:请求级 > 定义级(未知值 fail-fast 400;None = 零变化)
+    let execution_profile = crate::api::serve_tools::resolve_execution_profile(
+        req.execution_profile.as_deref(),
+        def.execution_profile.as_deref(),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     if let Some(container) = &req.container {
-        crate::api::serve_tools::with_shell_exec_backend(&mut filtered, container);
+        crate::api::serve_tools::with_shell_exec_backend(
+            &mut filtered,
+            container,
+            execution_profile.unwrap_or(crate::builtin_tools::shell_exec::ExecutionProfile::Workbench),
+        );
+    } else if let Some(profile) = execution_profile {
+        crate::api::serve_tools::with_shell_exec_profile(&mut filtered, profile);
     }
     // P2 沙箱根映射:请求携带 workspace → 以声明态注入能力边界
     // (先于 M5-a 接线,fs_safety 判据零改动;None = 零变化)
@@ -1376,7 +1394,11 @@ async fn run_plan_execute_request(
     // (per-agent filtered copies inherit the backend through entry cloning);
     // None = host backend, existing behavior unchanged.
     if let Some(container) = &req.container {
-        crate::api::serve_tools::with_shell_exec_backend(&mut delegate_toolkit, container);
+        crate::api::serve_tools::with_shell_exec_backend(
+            &mut delegate_toolkit,
+            container,
+            crate::builtin_tools::shell_exec::ExecutionProfile::Workbench,
+        );
     }
     // 治理门禁段随上下文下放（与 react 路径 DelegateContext 同源——治理纪律
     // 无豁免面）；L2 前馈按 serve union 全量工具面触发
@@ -1518,8 +1540,20 @@ async fn run_agent_stream(
     // 开关裁剪后同步收紧 def.tools(同 run_agent 口径)
     crate::api::serve_tools::restrict_tools_to_surface(&mut def.tools, &filtered);
     // P1 执行桥:同 run_agent 口径(请求携带容器名 → shell_exec 转 docker-exec)
+    // G1 执行环境 profile:同 run_agent 口径(请求级 > 定义级,未知值 fail-fast 400)
+    let execution_profile = crate::api::serve_tools::resolve_execution_profile(
+        req.execution_profile.as_deref(),
+        def.execution_profile.as_deref(),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     if let Some(container) = &req.container {
-        crate::api::serve_tools::with_shell_exec_backend(&mut filtered, container);
+        crate::api::serve_tools::with_shell_exec_backend(
+            &mut filtered,
+            container,
+            execution_profile.unwrap_or(crate::builtin_tools::shell_exec::ExecutionProfile::Workbench),
+        );
+    } else if let Some(profile) = execution_profile {
+        crate::api::serve_tools::with_shell_exec_profile(&mut filtered, profile);
     }
     // P2 沙箱根映射:同 run_agent 口径(请求携带 workspace → 声明态注入边界)
     if let Some(ws) = &req.workspace {
@@ -2913,6 +2947,7 @@ mod tests {
             temperature: None,
             model: None,
             container: None,
+            execution_profile: None,
             workspace: None,
             execution: None,
             resume_session_id: None,
@@ -3279,6 +3314,7 @@ mod tests {
             temperature: None,
             model: None,
             container: None,
+            execution_profile: None,
             workspace: None,
             execution: None,
             resume_session_id: None,
@@ -3316,6 +3352,7 @@ mod tests {
             temperature: None,
             model: None,
             container: None,
+            execution_profile: None,
             workspace: None,
             execution: None,
             resume_session_id: sid.map(|s| s.to_string()),

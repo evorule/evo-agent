@@ -661,6 +661,7 @@ use crate::agent::definition::MemoryConfig;
 fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
     AgentDefinition {
         http_get_allowed_hosts: None,
+        execution_profile: None,
         agent_type: "test".to_string(),
         version: "0.1.0".to_string(),
         description: "test agent".to_string(),
