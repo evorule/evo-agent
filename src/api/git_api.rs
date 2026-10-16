@@ -445,6 +445,13 @@ pub async fn generate(
         ms = started.elapsed().as_millis() as u64,
         "AI commit message generated"
     );
+    // 治理留痕（record-only，best-effort）：生成动作+耗时+产物长度,
+    // 不记 diff 内容与 message 正文；生成写输入框可编辑、绝不自动提交
+    crate::governance::hooks::ai_commit(&format!(
+        "done in {}ms, {} chars",
+        started.elapsed().as_millis(),
+        message.chars().count()
+    ));
     Ok(Json(serde_json::json!({ "message": message })))
 }
 

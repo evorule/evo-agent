@@ -148,6 +148,18 @@ pub(crate) fn s4_publish_draft(session_id: &str, path: &str) -> GovDraft {
     }
 }
 
+/// AI commit message 生成（record-only：耗时+产物长度；生成写输入框可编辑、
+/// 绝不自动提交——留痕只记动作不记 diff 内容）
+pub(crate) fn ai_commit_draft(detail: &str) -> GovDraft {
+    GovDraft {
+        kind: GovEventKind::AiCommit,
+        session_id: "workbench".to_string(),
+        actor: GovActor::User,
+        summary: format!("AI commit message 生成：{detail}"),
+        refs: GovRefs::default(),
+    }
+}
+
 pub(crate) fn terminal_session_draft(
     term_id: &str,
     action: TerminalAction,
@@ -221,6 +233,11 @@ pub fn policy_verdict(
 /// S4 产物定稿（前端 markFinalized 首次定稿经 WS 信号桥通知）
 pub fn s4_publish(session_id: &str, path: &str) {
     fire(s4_publish_draft(session_id, path));
+}
+
+/// AI commit message 生成（record-only）
+pub fn ai_commit(detail: &str) {
+    fire(ai_commit_draft(detail));
 }
 
 /// terminal PTY 会话生命周期（record-only）
