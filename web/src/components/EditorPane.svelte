@@ -454,13 +454,6 @@
     });
     welcomeModel = monaco.editor.createModel(welcomeText, 'markdown');
     welcomeModel.updateOptions({ tabSize: tabSizeValue() });
-    // AI 补全 provider(多语言清单;设置 completion.enabled 运行时守卫)
-    const AI_LANGS = [
-      'rust', 'typescript', 'javascript', 'python', 'go', 'java',
-      'markdown', 'json', 'yaml', 'shell', 'sql',
-    ];
-    disposeAi = registerAiCompletion(editor, AI_LANGS);
-    refreshAiEvoignore();
     const o = appearanceOptions();
     editor = monaco.editor.create(editorEl, {
       model: welcomeModel,
@@ -477,6 +470,16 @@
       scrollBeyondLastLine: false,
       padding: { top: 16, bottom: 16 },
     });
+    // AI 补全 provider(多语言清单;设置 completion.enabled 运行时守卫)。
+    // 必须在 editor 创建之后接线:registerAiCompletion 内部订阅编辑器级
+    // 事件(onDidPaste 等),先于 create 调用会因 editor 仍为 null 抛
+    // TypeError 并中断整个 onMount 装配链。
+    const AI_LANGS = [
+      'rust', 'typescript', 'javascript', 'python', 'go', 'java',
+      'markdown', 'json', 'yaml', 'shell', 'sql',
+    ];
+    disposeAi = registerAiCompletion(editor, AI_LANGS);
+    refreshAiEvoignore();
     editor.onDidChangeModelContent(() => {
       const path = $activePath;
       const model = getModelForPath(path);
