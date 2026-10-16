@@ -102,9 +102,12 @@ fn write_gov_session_state(path: &Path, session_id: &str) {
     }
 }
 
-/// 开具新合成治理会话（caller_role="service"）+ 原子写回；失败 fail-soft None
+/// 开具新合成治理会话（caller_role="llm"）+ 原子写回；失败 fail-soft None。
+/// 角色口径：server 契约仅接受 human | llm（workspace_service 声明校验），
+/// "service" 非合法声明——合成治理会话主体是自动化审计调用，按 ai-plugin
+/// sidecar 先例（审计型 sidecar 会话）声明 llm。
 async fn provision_gov_session(client: &EvoruleApiClient, path: &Path) -> Option<String> {
-    match client.create_session(None, Some("service")).await {
+    match client.create_session(None, Some("llm")).await {
         Ok(sid) => {
             write_gov_session_state(path, &sid);
             Some(sid)
