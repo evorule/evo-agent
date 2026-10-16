@@ -12,6 +12,9 @@ import { isIgnored } from './evoignore.js';
 /** widget 可见态:{editor, selection, instruction, busy, result, error} | null */
 export const inlineChat = writable(null);
 
+// E4 诊断临器:双实例比对(收口后移除)
+if (typeof window !== 'undefined') { window.__moduleInline = inlineChat; }
+
 let activeController = null;
 
 /** 唤起(编辑器内 Ctrl+K):selection 空则以当前行为段 */
