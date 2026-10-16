@@ -138,8 +138,10 @@ impl ToolFunction for McpToolAdapter {
             "MCP tool adapter invoked"
         );
 
-        let call = self.client.call_tool(&self.tool_name, &args_json);
-        let result = if self.timeout_secs == 0 {
+        let call = self
+            .client
+            .call_tool_structured(&self.tool_name, &args_json);
+        let structured = if self.timeout_secs == 0 {
             call.await
         } else {
             match tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), call)
@@ -153,11 +155,14 @@ impl ToolFunction for McpToolAdapter {
             }
         };
 
-        let result = result.map_err(|e| format!("MCP tool '{}' failed: {}", self.tool_name, e))?;
+        let structured =
+            structured.map_err(|e| format!("MCP tool '{}' failed: {}", self.tool_name, e))?;
 
         // 结果上限:>100KB 截断+提示——LLM 上下文保护,原始
         // 字节数留痕;按 UTF-8 字符边界回退避免截断撕裂多字节字符
-        let mut text = result;
+        // (G3:截断只作用 text 部分;图片不走文本截断,由 runner 侧 B1
+        // 预算校验统一管——单图/单结果上限,超限丢弃计数 images_omitted)
+        let mut text = structured.text;
         if text.len() > MAX_RESULT_BYTES {
             let original = text.len();
             let mut cut = MAX_RESULT_BYTES;
@@ -171,8 +176,26 @@ impl ToolFunction for McpToolAdapter {
             ));
         }
 
-        // MCP 返回的是 text 字符串,包装成 Value::string
-        Ok(Value::from(text))
+        // G3 双形态:无图维持纯 string(存量 MCP server 逐字节零变化);
+        // 有图组装 B1 提取协议对象(images 旁路)——下游 runner 统一提取点
+        // 自动接住(校验/指纹/落盘/wire 组装/续话还原全复用,零新增管道)
+        if structured.images.is_empty() {
+            return Ok(Value::from(text));
+        }
+        let images_json: Vec<Value> = structured
+            .images
+            .iter()
+            .map(|img| {
+                serde_json::json!({
+                    "mime_type": img.mime_type,
+                    "data_base64": img.data_base64,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "text": text,
+            "images": images_json,
+        }))
     }
 
     /// 管道⑤评估钩子(G8 接合):MCP 工具缺省
@@ -468,6 +491,69 @@ mod tests {
         let adapter = McpToolAdapter::new(client, "noop".to_string());
         let result = adapter.call(&Value::Null).await.unwrap();
         assert_eq!(result.as_str(), Some(""));
+    }
+
+    // ---- G3:图片面双形态 ----
+
+    #[tokio::test]
+    async fn test_adapter_call_with_images_returns_b1_object() {
+        // 有图结果组装 B1 提取协议对象 {text, images:[{mime_type,data_base64}]}——
+        // 下游 runner 统一提取点按此协议接住(截图类 GUI 桥闭环)
+        let (client, transport) = make_client_with_tool_response().await;
+        transport
+            .set_response(
+                "tools/call",
+                serde_json::json!({
+                    "content": [
+                        {"type": "text", "text": "screenshot ok"},
+                        {"type": "image", "data": "cG5nLWRhdGE=", "mimeType": "image/png"}
+                    ]
+                }),
+            )
+            .await;
+        let adapter = McpToolAdapter::new(client, "screenshot".to_string());
+        let result = adapter.call(&Value::Null).await.unwrap();
+        let obj = result.as_object().expect("expected JSON object");
+        assert_eq!(
+            obj.get("text").and_then(|v| v.as_str()),
+            Some("screenshot ok")
+        );
+        let images = obj.get("images").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            images[0].get("mime_type").and_then(|v| v.as_str()),
+            Some("image/png")
+        );
+        assert_eq!(
+            images[0].get("data_base64").and_then(|v| v.as_str()),
+            Some("cG5nLWRhdGE=")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adapter_call_truncation_only_affects_text_with_images() {
+        // 有图 + 超限 text:截断只作用 text(带标记),images 原样旁路
+        let (client, transport) = make_client_with_tool_response().await;
+        let big_text = "x".repeat(MAX_RESULT_BYTES + 1000);
+        transport
+            .set_response(
+                "tools/call",
+                serde_json::json!({
+                    "content": [
+                        {"type": "text", "text": big_text},
+                        {"type": "image", "data": "cG5nLWRhdGE=", "mimeType": "image/png"}
+                    ]
+                }),
+            )
+            .await;
+        let adapter = McpToolAdapter::new(client, "shot".to_string());
+        let result = adapter.call(&Value::Null).await.unwrap();
+        let obj = result.as_object().expect("expected JSON object");
+        let text = obj.get("text").and_then(|v| v.as_str()).unwrap();
+        assert!(text.len() < MAX_RESULT_BYTES + 1000);
+        assert!(text.contains("[truncated:"));
+        let images = obj.get("images").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(images.len(), 1);
     }
 
     #[tokio::test]

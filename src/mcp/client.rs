@@ -150,10 +150,66 @@ impl McpClient {
         Ok(extract_first_text(&result).unwrap_or_default())
     }
 
+    /// 结构化调用工具(G3:`call_tool` 的图片面扩展)
+    ///
+    /// text 语义与 [`McpClient::call_tool`] 完全一致(首个 text 块,无则空串;
+    /// isError 错误路径同款);额外收集 `content` 数组内全部 image 块。
+    /// 其余块类型(resource 等)维持忽略。旧方法原样保留,存量调用零变化。
+    pub async fn call_tool_structured(
+        &self,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<McpToolResult, String> {
+        let result = self
+            .transport
+            .request(
+                "tools/call",
+                serde_json::json!({
+                    "name": name,
+                    "arguments": arguments,
+                }),
+            )
+            .await?;
+
+        // MCP 错误响应(isError=true)优先处理——与 call_tool 同款语义
+        if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+            let msg = extract_first_text(&result)
+                .unwrap_or_else(|| "MCP tool returned error".to_string());
+            return Err(format!("MCP tool '{}' returned error: {}", name, msg));
+        }
+
+        Ok(McpToolResult {
+            text: extract_first_text(&result).unwrap_or_default(),
+            images: extract_images(&result),
+        })
+    }
+
     /// 关闭底层传输层
     pub async fn close(&self) -> Result<(), String> {
         self.transport.close().await
     }
+}
+
+/// MCP image content block(G3 结构化提取产物)
+///
+/// MCP `tools/call` 响应中 `{"type":"image","data":"<base64>","mimeType":"..."}` 块。
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpImage {
+    /// MIME 类型(如 `image/png`)
+    pub mime_type: String,
+    /// 图片本体 base64(未解码,与 MCP 协议原样)
+    pub data_base64: String,
+}
+
+/// MCP `tools/call` 结构化结果
+///
+/// G3:GUI 桥类工具(截图等)返回 image content block,P1 首个 text 语义接不住
+/// ——本结构在不动 `call_tool` 的前提下补齐图片面。text 语义与 `call_tool`
+/// 完全一致(首个 text 块,无则空串),存量调用零变化。
+#[derive(Debug, Clone, Default)]
+pub struct McpToolResult {
+    pub text: String,
+    pub images: Vec<McpImage>,
 }
 
 /// 从 MCP tools/call 响应中提取第一个 text content
@@ -165,6 +221,33 @@ fn extract_first_text(response: &Value) -> Option<String> {
         .and_then(|c| c.get("text"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// G3:收集响应 `content` 数组内全部 image content block
+///
+/// MCP image 块形态 `{"type":"image","data":"<base64>","mimeType":"image/png"}`;
+/// 缺 data/mimeType、空值块跳过(不 fail,与 P1 忽略未知类型语义同族)。
+fn extract_images(response: &Value) -> Vec<McpImage> {
+    response
+        .get("content")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|c| c.get("type").and_then(|v| v.as_str()) == Some("image"))
+                .filter_map(|c| {
+                    let data = c.get("data").and_then(|v| v.as_str())?;
+                    let mime = c.get("mimeType").and_then(|v| v.as_str())?;
+                    if data.is_empty() || mime.is_empty() {
+                        return None;
+                    }
+                    Some(McpImage {
+                        mime_type: mime.to_string(),
+                        data_base64: data.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// MCP 工具 spec(`tools/list` 返回的单个工具描述)
@@ -380,6 +463,94 @@ mod tests {
         let result = client.call_tool("unknown", &serde_json::json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no response registered"));
+    }
+
+    // ---- G3:call_tool_structured 图片面 ----
+
+    #[tokio::test]
+    async fn test_call_tool_structured_collects_image_blocks() {
+        let (client, transport) = make_connected_client().await;
+        transport
+            .set_response(
+                "tools/call",
+                serde_json::json!({
+                    "content": [
+                        {"type": "text", "text": "screenshot taken"},
+                        {"type": "image", "data": "cG5nLWRhdGE=", "mimeType": "image/png"},
+                        {"type": "resource", "resource": {"uri": "file:///x"}},
+                        {"type": "image", "data": "anYtZGF0YQ==", "mimeType": "image/jpeg"}
+                    ]
+                }),
+            )
+            .await;
+        let r = client
+            .call_tool_structured("screenshot", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(r.text, "screenshot taken");
+        assert_eq!(r.images.len(), 2);
+        assert_eq!(r.images[0].mime_type, "image/png");
+        assert_eq!(r.images[0].data_base64, "cG5nLWRhdGE=");
+        assert_eq!(r.images[1].mime_type, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_structured_skips_invalid_image_blocks() {
+        let (client, transport) = make_connected_client().await;
+        transport
+            .set_response(
+                "tools/call",
+                serde_json::json!({
+                    "content": [
+                        {"type": "text", "text": "only text survives"},
+                        {"type": "image", "data": "", "mimeType": "image/png"},
+                        {"type": "image", "data": "aGF2ZW1pbWU="},
+                        {"type": "image", "mimeType": "image/png"}
+                    ]
+                }),
+            )
+            .await;
+        let r = client
+            .call_tool_structured("mixed", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(r.images.len(), 0);
+        assert_eq!(r.text, "only text survives");
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_structured_no_content_matches_call_tool() {
+        let (client, transport) = make_connected_client().await;
+        transport
+            .set_response("tools/call", serde_json::json!({}))
+            .await;
+        let r = client
+            .call_tool_structured("noop", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(r.text, "");
+        assert!(r.images.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_structured_is_error_same_semantics() {
+        let (client, transport) = make_connected_client().await;
+        transport
+            .set_response(
+                "tools/call",
+                serde_json::json!({
+                    "isError": true,
+                    "content": [{"type": "text", "text": "boom"}]
+                }),
+            )
+            .await;
+        let result = client
+            .call_tool_structured("bad", &serde_json::json!({}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("returned error"));
+        assert!(err.contains("boom"));
     }
 
     #[test]
