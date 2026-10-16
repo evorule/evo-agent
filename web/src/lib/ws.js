@@ -24,6 +24,11 @@ import {
   refreshGitStatus,
   govS4Notify,
 } from './stores.js';
+import {
+  refreshOrchestration,
+  orchestrationToolCall,
+  orchestrationToolResult,
+} from './orchestration.js';
 import { getTranscript } from './api.js';
 import { assembleContext } from './mentions.js';
 import { looksLikeDeadSession, buildRebuildBlock, lastUserTextOf } from './sessionRebuild.js';
@@ -310,6 +315,8 @@ function handleFrame(f) {
       refreshSessions();
       pushPanelEvent('sys', { label: 'SessionCreated', detail: `会话 ${f.session_id} 已建立` });
       refreshGovBadges(f.session_id);
+      // B25 编排可视化:连接建立即拉 journal 权威谱系树(REST 兜底/历史合并)
+      refreshOrchestration(f.session_id);
       break;
     }
     case 'Step':
@@ -335,6 +342,10 @@ function handleFrame(f) {
         };
       }
       pushPanelEvent('gov', { label: 'ToolCall', detail: f.name, level: 'info' });
+      // B25 编排可视化:delegate 调用即入图(临时 running 节点,零往返)
+      if (f.name === 'delegate') {
+        orchestrationToolCall(get(sessionId), f.args);
+      }
       break;
     }
     case 'ToolResult': {
@@ -355,6 +366,11 @@ function handleFrame(f) {
         pendingWrite = null;
       }
       pushPanelEvent('gov', { label: 'ToolResult', detail: f.name, level: 'ok' });
+      // B25 编排可视化:delegate 结果收色(ok→done / error→failed,agent_type
+      // 栈顶匹配;错误结果不含 agent_type 时匹配最近在跑临时节点)
+      if (f.name === 'delegate') {
+        orchestrationToolResult(get(sessionId), f.result);
+      }
       break;
     }
     case 'LlmDone':

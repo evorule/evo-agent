@@ -831,6 +831,16 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/approval-policy/trial",
             axum::routing::post(crate::api::approval_api::trial_judge),
         )
+        // B25:编排可视化谱系面(只读 journal 投影;树 + 全局归属链 + 可委托
+        // agent 清单,前端编排面板与会话列表徽标数据源)
+        .route(
+            "/api/orchestration/sessions",
+            axum::routing::get(crate::api::orchestration_api::list_orchestration_sessions),
+        )
+        .route(
+            "/api/orchestration/agents",
+            axum::routing::get(crate::api::orchestration_api::list_orchestration_agents),
+        )
         // G14:记忆事件查询 — 返回 session 的所有结构化事件
         .route(
             "/api/sessions/{id}/events",
@@ -1155,6 +1165,18 @@ async fn run_agent(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .with_capability_boundary(capability_boundary)
+    // serve 面 delegate 执行能力接线(B25 批顺手修,CLI run 主路径同款镜像):
+    // from_definition 对 "delegate" 仅预放行校验,此前 serve 三路径(run/stream/ws)
+    // 均无人调用 with_delegate_context → 声明了 delegate 的定义(general 等)
+    // LLM 不可见、tool_call 无处解析。子代理 journal 同目录落账,谱系面可见。
+    .with_delegate_context(
+        crate::agent::delegate::DelegateContext::new(
+            &agent_type,
+            state.definitions().clone(),
+            state.evorule_client.clone(),
+        )
+        .with_journal_dir(state.workdir.join("data").join("sessions")),
+    )
     // 查账工具族接线（PR-11a）：以本会话态重绑 handler 内查账工具实例
     .wire_accounting(&state.workdir)
     // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位)
@@ -1533,6 +1555,15 @@ async fn run_agent_stream(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .with_capability_boundary(capability_boundary)
+    // serve 面 delegate 执行能力接线(同 run_agent 端点;SSE 流式面)
+    .with_delegate_context(
+        crate::agent::delegate::DelegateContext::new(
+            &agent_type,
+            state.definitions().clone(),
+            state.evorule_client.clone(),
+        )
+        .with_journal_dir(state.workdir.join("data").join("sessions")),
+    )
     // 查账工具族接线（PR-11a）：以本会话态重绑 handler 内查账工具实例
     .wire_accounting(&state.workdir)
     // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位)

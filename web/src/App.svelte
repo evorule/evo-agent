@@ -13,6 +13,7 @@
   import Explorer from './components/Explorer.svelte';
   import SearchPanel from './components/SearchPanel.svelte';
   import ScmView from './components/ScmView.svelte';
+  import OrchestrationPanel from './components/OrchestrationPanel.svelte';
   import EditorPane from './components/EditorPane.svelte';
   import BottomPanel from './components/BottomPanel.svelte';
   import ChatSidebar from './components/ChatSidebar.svelte';
@@ -659,6 +660,8 @@
         <SearchPanel />
       {:else if $sidebarView === 'scm'}
         <ScmView />
+      {:else if $sidebarView === 'orchestration'}
+        <OrchestrationPanel />
       {/if}
     </div>
     <div class="center">

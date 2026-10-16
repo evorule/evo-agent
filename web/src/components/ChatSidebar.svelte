@@ -16,7 +16,8 @@
     activePath,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
-  import { approveProposal, listResumableRuns } from '../lib/api.js';
+  import { approveProposal, listResumableRuns, getOrchestrationLinks } from '../lib/api.js';
+  import { orderSessionsWithLineage } from '../lib/orchestration.js';
   import { onMount, onDestroy, tick } from 'svelte';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
   import { collectCandidates, MENTION_GROUP_LABELS, estimateTokens, tokenLevel } from '../lib/mentions.js';
@@ -36,6 +37,8 @@
   let showHistory = $state(false);
   // 可恢复崩溃会话集合(扫尾端点投影;与历史索引交集后展示「恢复」入口)
   let resumableIds = $state(new Set());
+  // B25 谱系归属(全局归属链投影):子会话在列表内缩进 + 「委托自」徽标
+  let lineageLinks = $state([]);
   // C 批「会话级 workspace」:当前工作区(连接级 ?workspace= 携带;
   // localStorage 持久,改值在下次连接生效——新建会话/换线/重连)
   let workspace = $state(localStorage.getItem('evo_workspace') || '');
@@ -76,6 +79,7 @@
     });
     refreshSessions();
     loadResumable();
+    loadLineage();
   });
 
   onDestroy(() => {
@@ -100,6 +104,19 @@
     }
   }
 
+  /** B25 谱系归属链加载(fail-soft:端点不可用 = 列表原样平铺) */
+  async function loadLineage() {
+    try {
+      const res = await getOrchestrationLinks();
+      lineageLinks = res.links || [];
+    } catch {
+      lineageLinks = [];
+    }
+  }
+
+  /** 列表渲染序:子会话紧跟其父(缩进/徽标按 lineage 标注) */
+  const orderedSessions = $derived(orderSessionsWithLineage($sessions, lineageLinks));
+
   function fmtTime(unix) {
     if (!unix) return '';
     const d = new Date(unix * 1000);
@@ -112,6 +129,7 @@
     if (showHistory) {
       refreshSessions();
       loadResumable();
+      loadLineage();
     }
   }
 
@@ -373,17 +391,23 @@
       {#if $sessions.length === 0}
         <div class="session-empty">暂无历史会话</div>
       {:else}
-        {#each $sessions as s (s.session_id)}
-          <div class="session-row">
+        {#each orderedSessions as s (s.session_id)}
+          <div class="session-row" class:lineage={!!s.lineage}>
             <button
               class="session-item"
               class:current={s.session_id === $sessionId}
               onclick={() => openSession(s.session_id)}
-              title={s.session_id}
+              title={s.lineage ? `${s.lineage.display} · ${s.session_id}` : s.session_id}
             >
-              <span class="s-title">{s.title || '(无标题)'}</span>
+              <span class="s-title">
+                {#if s.lineage}<span class="s-branch">└</span>{/if}
+                {s.title || '(无标题)'}
+              </span>
               <span class="s-time mono">{fmtTime(s.last_active)}</span>
             </button>
+            {#if s.lineage}
+              <span class="lineage-badge" title={s.lineage.display}>{s.lineage.display}</span>
+            {/if}
             {#if resumableIds.has(s.session_id)}
               <button
                 class="resume-btn"
@@ -689,6 +713,22 @@
     font-size: 10px;
     color: var(--text-muted);
     flex-shrink: 0;
+  }
+  /* B25 谱系归属:缩进分支符 + 「委托自/派生会话」徽标 */
+  .s-branch {
+    color: var(--brand);
+    margin-right: 4px;
+    flex-shrink: 0;
+  }
+  .lineage-badge {
+    flex-shrink: 0;
+    font-size: 10px;
+    color: var(--brand);
+    border: 1px solid var(--brand);
+    border-radius: 999px;
+    padding: 0 6px;
+    line-height: 16px;
+    white-space: nowrap;
   }
   .msg-list {
     flex: 1;
