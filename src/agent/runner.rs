@@ -2493,6 +2493,40 @@ impl AgentRunner {
         Ok(())
     }
 
+    /// O-492:续话/crash-resume 轮从会话 journal 恢复已锁生成判据
+    ///
+    /// 生成判据为 runner 内存态,重生成=判据漂移违背先写后锁——续话场景的
+    /// 恢复锚=journal `acceptance_criteria_generated` 事件(G4 落账:判据全文
+    /// +生成模型)。恢复=读会话 journal 全行(容忍尾部半行)→ 取最新一条判据
+    /// 事件 → validate_generated_criteria 复检(防御账面被改)→ 返回判据。
+    /// 任何环节失败如实报错(fail-visible,错误信息指引改配静态判据)——静默
+    /// 降级为无判据运行违背显式开启意图。仅生成判据走本路径;静态判据最优先,
+    /// 不经过此处。
+    fn recover_acceptance_criteria(
+        dir: &std::path::Path,
+        session_id: &str,
+    ) -> Result<String, String> {
+        let path = crate::agent::journal::JournalWriter::path_for(dir, session_id);
+        let lines = crate::agent::journal::read_all_tolerant(&path)
+            .map_err(|e| format!("acceptance criteria recovery: journal read failed: {e}"))?;
+        let criteria = lines.into_iter().rev().find_map(|l| match l.event {
+            crate::agent::journal::JournalEvent::AcceptanceCriteriaGenerated {
+                criteria, ..
+            } => Some(criteria),
+            _ => None,
+        });
+        let cmd = criteria.ok_or_else(|| {
+            "acceptance criteria recovery: no acceptance_criteria_generated event in \
+             session journal (generated criteria were never locked in this session); \
+             configure static acceptance_command for continuation runs"
+                .to_string()
+        })?;
+        crate::agent::acceptance::validate_generated_criteria(&cmd).map_err(|e| {
+            format!("acceptance criteria recovery: journal entry failed revalidation: {e}")
+        })?;
+        Ok(cmd)
+    }
+
     /// 非流式主循环:执行 ReAct 推理至目标完成,返回最终结果
     ///
     /// 与 [`Self::run_streaming`] 共享 G17 工具插桩与治理链路;本路径在
@@ -5792,22 +5826,53 @@ impl AgentRunner {
 
                            // G4 判据生成(先写后锁):仅 Fresh(新建会话=任务开工)生成一次;
                            // continuation/crash-resume 属任务中段,重生成=判据漂移违背锁定
-                           // 语义——跳过(生成的判据为 runner 内存态,跨 runner 实例不可恢复,
-                           // 本轮门禁不生效;续话场景应配静态判据,机制缺口已登记 O 项)。
-                           // 失败 fail-visible:显式开启=要求判据必须存在,不静默降级。
+                           // 语义——不生成,改从会话 journal 恢复已锁判据(O-492:判据事件
+                           // G4 生成时已落账,恢复+复检后重新锁定)。失败 fail-visible:
+                           // 显式开启=要求判据必须存在,不静默降级(指引改配静态判据)。
                            if recovery == RecoveryMode::Fresh {
                                if let Err(e) = runner.generate_acceptance_criteria(&goal).await {
                                    yield Err(e);
                                    return;
                                }
                            } else if runner.acceptance_generation {
-                               warn!(
-                                   %session_id,
-                                   "acceptance_generation enabled but not a fresh run: \
-                                    generated criteria are per-run in-memory and NOT \
-                                    regenerated mid-task; task_done gate unenforced this turn \
-                                    (use static acceptance_command for continuation workflows)"
-                               );
+                               if runner.acceptance_command.is_some() {
+                                   // 静态判据最优先:门禁照常执行,无需恢复
+                               } else {
+                                   match runner.journal_dir.as_ref() {
+                                       Some(dir) => {
+                                           match AgentRunner::recover_acceptance_criteria(
+                                               dir,
+                                               &session_id,
+                                           ) {
+                                               Ok(cmd) => {
+                                                   info!(
+                                                       %session_id,
+                                                       criteria = %cmd,
+                                                       "acceptance criteria recovered from journal and LOCKED (运行期不可改)"
+                                                   );
+                                                   runner.acceptance_command = Some(cmd);
+                                               }
+                                               Err(e) => {
+                                                   yield Err(AgentError::Internal(format!(
+                                                       "{e} (fail-visible: acceptance_generation is \
+                                                        on but generated criteria cannot be restored \
+                                                        for this continuation turn)"
+                                                   )));
+                                                   return;
+                                               }
+                                           }
+                                       }
+                                       None => {
+                                           yield Err(AgentError::Internal(format!(
+                                               "acceptance criteria recovery impossible: journal \
+                                                not enabled for session '{session_id}' (generated \
+                                                criteria are per-run in-memory); configure static \
+                                                acceptance_command for continuation runs"
+                                           )));
+                                           return;
+                                       }
+                                   }
+                               }
                            }
 
                            // K-11/P2-1 观测落账(延迟点;recall 块已暂存 recall_hits/lex_stats,

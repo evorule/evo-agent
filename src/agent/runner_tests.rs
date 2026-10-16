@@ -876,6 +876,271 @@ async fn test_generate_acceptance_criteria_fail_visible_on_sidecar_failure() {
     );
 }
 
+// ===== O-492:续话轮生成判据恢复(journal 锚+复检+fail-visible) =====
+
+/// 唯一临时目录(进程 id+纳秒;防测试间与跨运行残留账面互扰)
+fn o492_temp_dir(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "o492-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
+/// O-492 单元:journal 含判据事件 → 恢复;多事件取最新一条(最新优先)
+#[test]
+fn test_recover_acceptance_criteria_latest_wins() {
+    let dir = o492_temp_dir("latest");
+    let sid = "s-o492-latest";
+    {
+        let w = crate::agent::journal::JournalWriter::open(&dir, sid).unwrap();
+        w.acceptance_criteria_generated("echo stale", "m1").unwrap();
+        w.acceptance_criteria_generated("test -f out.md", "m2")
+            .unwrap();
+    }
+    let got = AgentRunner::recover_acceptance_criteria(&dir, sid).expect("must recover");
+    assert_eq!(got, "test -f out.md");
+}
+
+/// O-492 单元:journal 无判据事件(空账面)→ fail-visible Err,指引配静态判据
+#[test]
+fn test_recover_acceptance_criteria_missing_event() {
+    let dir = o492_temp_dir("missing");
+    let sid = "s-o492-missing";
+    {
+        // 仅开立账面,不写判据事件(空文件)
+        let _w = crate::agent::journal::JournalWriter::open(&dir, sid).unwrap();
+    }
+    let err = AgentRunner::recover_acceptance_criteria(&dir, sid).unwrap_err();
+    assert!(
+        err.contains("no acceptance_criteria_generated event"),
+        "got: {err}"
+    );
+    assert!(err.contains("static acceptance_command"), "got: {err}");
+}
+
+/// O-492 单元:journal 文件缺失 → fail-visible Err(journal read failed)
+#[test]
+fn test_recover_acceptance_criteria_missing_journal_file() {
+    let dir = o492_temp_dir("nofile");
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = AgentRunner::recover_acceptance_criteria(&dir, "s-o492-nofile").unwrap_err();
+    assert!(err.contains("journal read failed"), "got: {err}");
+}
+
+/// O-492 单元:账面被改防御——判据事件若被塞入多行形态,复检必须拒绝
+#[test]
+fn test_recover_acceptance_criteria_revalidation_rejects_multiline() {
+    let dir = o492_temp_dir("reval");
+    let sid = "s-o492-reval";
+    {
+        let w = crate::agent::journal::JournalWriter::open(&dir, sid).unwrap();
+        w.acceptance_criteria_generated("echo a\necho b", "m1")
+            .unwrap();
+    }
+    let err = AgentRunner::recover_acceptance_criteria(&dir, sid).unwrap_err();
+    assert!(err.contains("revalidation"), "got: {err}");
+}
+
+/// O-492 集成:续话+生成开关开启+无静态判据+journal 无判据事件 → 流显式 Err
+/// (fail-visible,不静默降级为无门禁运行)
+#[tokio::test]
+async fn test_continuation_acceptance_recovery_fail_visible() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let sid = "s-o492-fv";
+
+    server
+        .mock("GET", format!("/api/sessions/{sid}/state").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"payload":{}}"#)
+        .create_async()
+        .await;
+    server
+        .mock("POST", format!("/api/sessions/{sid}/payload").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"success":true,"fact_id":1}"#)
+        .create_async()
+        .await;
+    server
+        .mock("GET", format!("/api/sessions/{sid}/events").as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("")
+        .create_async()
+        .await;
+    server
+        .mock("POST", format!("/api/sessions/{sid}/command").as_str())
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let dir = o492_temp_dir("fv");
+    let config = AgentConfig::default();
+    let mem = MemoryManager::new("default", client.clone());
+    let mut runner = AgentRunner::new(config, client)
+        .with_memory(mem)
+        .with_journal_dir(dir);
+    runner.acceptance_generation = true; // 显式开启,无静态判据
+    let mut stream = runner.run_continuation(sid.to_string(), "continue".to_string());
+
+    let mut got_err: Option<String> = None;
+    let mut count = 0;
+    while let Some(event) = stream.next().await {
+        if let Err(AgentError::Internal(m)) = &event {
+            got_err = Some(m.clone());
+        }
+        count += 1;
+        if count > 30 {
+            break;
+        }
+    }
+    let m = got_err.expect("unrecoverable generated criteria must fail the continuation visibly");
+    assert!(m.contains("acceptance criteria recovery"), "got: {m}");
+    assert!(m.contains("static acceptance_command"), "got: {m}");
+}
+
+/// O-492 集成:静态判据在位+生成开关同开 → 静态最优先,不触发恢复路径,
+/// 流正常走完(原 warn 误报面一并清理:静态在位时门禁本就生效)
+#[tokio::test]
+async fn test_continuation_acceptance_static_criteria_wins() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let sid = "s-o492-static";
+
+    let state_mock = server
+        .mock("GET", format!("/api/sessions/{sid}/state").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"payload":{}}"#)
+        .create_async()
+        .await;
+    server
+        .mock("POST", format!("/api/sessions/{sid}/payload").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"success":true,"fact_id":1}"#)
+        .create_async()
+        .await;
+    let events_mock = server
+        .mock("GET", format!("/api/sessions/{sid}/events").as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("")
+        .create_async()
+        .await;
+    let command_mock = server
+        .mock("POST", format!("/api/sessions/{sid}/command").as_str())
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let config = AgentConfig::default();
+    let mem = MemoryManager::new("default", client.clone());
+    let mut runner = AgentRunner::new(config, client).with_memory(mem); // 无 journal_dir
+    runner.acceptance_generation = true;
+    runner.acceptance_command = Some("exit 0".to_string()); // 静态最优先
+    let mut stream = runner.run_continuation(sid.to_string(), "continue".to_string());
+
+    let mut errs: Vec<String> = Vec::new();
+    let mut count = 0;
+    while let Some(event) = stream.next().await {
+        if let Err(AgentError::Internal(m)) = &event {
+            errs.push(m.clone());
+        }
+        count += 1;
+        if count > 30 {
+            break;
+        }
+    }
+    assert!(
+        errs.iter()
+            .all(|m| !m.contains("acceptance criteria recovery")),
+        "static criteria must bypass recovery, got: {errs:?}"
+    );
+    // 静态在位 → 不因恢复缺失而中断,流程走完(命令提交命中)
+    state_mock.assert_async().await;
+    events_mock.assert_async().await;
+    command_mock.assert_async().await;
+}
+
+/// O-492 集成:journal 含已锁判据事件 → 续话轮恢复判据并重新锁定,流正常走完
+#[tokio::test]
+async fn test_continuation_acceptance_recovery_success() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let sid = "s-o492-ok";
+
+    let state_mock = server
+        .mock("GET", format!("/api/sessions/{sid}/state").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"payload":{}}"#)
+        .create_async()
+        .await;
+    server
+        .mock("POST", format!("/api/sessions/{sid}/payload").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"success":true,"fact_id":1}"#)
+        .create_async()
+        .await;
+    let events_mock = server
+        .mock("GET", format!("/api/sessions/{sid}/events").as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("")
+        .create_async()
+        .await;
+    let command_mock = server
+        .mock("POST", format!("/api/sessions/{sid}/command").as_str())
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let dir = o492_temp_dir("ok");
+    {
+        let w = crate::agent::journal::JournalWriter::open(&dir, sid).unwrap();
+        w.acceptance_criteria_generated("test -f out.md", "m1")
+            .unwrap();
+    } // 写者释放:runner 打开同会话 journal 不触发 WriterActive
+
+    let config = AgentConfig::default();
+    let mem = MemoryManager::new("default", client.clone());
+    let mut runner = AgentRunner::new(config, client)
+        .with_memory(mem)
+        .with_journal_dir(dir);
+    runner.acceptance_generation = true; // 无静态判据,走恢复路径
+    let mut stream = runner.run_continuation(sid.to_string(), "continue".to_string());
+
+    let mut errs: Vec<String> = Vec::new();
+    let mut count = 0;
+    while let Some(event) = stream.next().await {
+        if let Err(AgentError::Internal(m)) = &event {
+            errs.push(m.clone());
+        }
+        count += 1;
+        if count > 30 {
+            break;
+        }
+    }
+    assert!(
+        errs.is_empty(),
+        "recovered criteria must let the continuation proceed, got: {errs:?}"
+    );
+    state_mock.assert_async().await;
+    events_mock.assert_async().await;
+    command_mock.assert_async().await;
+}
+
 #[tokio::test]
 async fn test_from_definition_rejects_unregistered_tool() {
     // def 想用 "magic" 但 handler 没注册 → 应早失败(可控)
