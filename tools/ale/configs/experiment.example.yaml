@@ -1,0 +1,17 @@
+# Experiment shell for the evo-agent ALE preset. Fill in `environment` and
+# `tasks` per the official quick start (https://github.com/rdi-berkeley/
+# agents-last-exam) — this file only demonstrates the wiring of our agent.
+name: evo-agent-ale
+output:
+  root: .logs/ale
+# Exactly one environment per experiment; see configs/environments/ in the
+# official repo for provider presets (docker / static / gcloud / ...).
+environment: configs/environments/docker.yaml
+agents:
+  - configs/agents/evo-agent.yaml   # this directory, or install the preset into the official repo's configs/agents/
+tasks:
+  # .txt = one task path per line (variant 0); .yaml = {path, variants} list.
+  - tasks-smoke.txt
+concurrency: 1        # keep 1 unless each agent preset uses a distinct serve_port
+auto_resume: true
+max_attempts: 3
