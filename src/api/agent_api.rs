@@ -74,6 +74,13 @@ pub struct AgentRunRequest {
     /// 语义零变化。LLM 面不可见该字段——仅 HTTP 请求方(如评测 harness)可设。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_profile: Option<String>,
+    /// 请求级工具子集扩展字段(可选):allowlist 语义——只保留列表命中的工具,
+    /// 与 def 白名单求交(只收不放,请求不能越过定义面重新放开);条目支持
+    /// 尾缀 `*` 前缀通配(与 def.tools 通配语义同款);可用面上零命中的条目
+    /// fail-fast 400(显式意志拼错名不静默缩权)。None = 既有语义零变化。
+    /// LLM 面不可见该字段——仅 HTTP 请求方(如评测 harness)可设。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
     /// P2 沙箱根映射扩展字段(可选):file 类工具沙箱根重绑到指定绝对路径
     /// (校验域随执行域迁移,fs_safety 判据零改动;None = 既有语义零变化,
     /// 删字段即下线)。LLM 面不可见该字段——仅 HTTP 请求方可设。
@@ -1142,6 +1149,13 @@ async fn run_agent(
         &def.tools,
         &merged_settings,
     );
+    // 请求级工具子集(allowlist 只收不放,与 def 面求交;零命中条目 400;
+    // None = 零变化)。先于开关收紧步——restrict_tools_to_surface 随后把
+    // def.tools 同步收敛(白名单声明=执行器=LLM 契约三者一致自动保持)
+    if let Some(req_tools) = &req.tools {
+        crate::api::serve_tools::apply_request_tool_allowlist(&mut filtered, req_tools)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
     // 开关裁剪后同步收紧 def.tools(白名单声明=执行器=LLM 契约三者一致,
     // 防 from_definition 早失败校验把「声明了默认关工具」误判为配置错误)
     crate::api::serve_tools::restrict_tools_to_surface(&mut def.tools, &filtered);
@@ -1562,6 +1576,12 @@ async fn run_agent_stream(
         &def.tools,
         &merged_settings,
     );
+    // 请求级工具子集(同 run_agent 口径:allowlist 只收不放,零命中条目 400;
+    // None = 零变化;先于开关收紧步保三者一致)
+    if let Some(req_tools) = &req.tools {
+        crate::api::serve_tools::apply_request_tool_allowlist(&mut filtered, req_tools)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
     // 开关裁剪后同步收紧 def.tools(同 run_agent 口径)
     crate::api::serve_tools::restrict_tools_to_surface(&mut def.tools, &filtered);
     // P1 执行桥:同 run_agent 口径(请求携带容器名 → shell_exec 转 docker-exec)
@@ -2977,6 +2997,7 @@ mod tests {
             model: None,
             container: None,
             execution_profile: None,
+            tools: None,
             workspace: None,
             execution: None,
             resume_session_id: None,
@@ -3344,6 +3365,7 @@ mod tests {
             model: None,
             container: None,
             execution_profile: None,
+            tools: None,
             workspace: None,
             execution: None,
             resume_session_id: None,
@@ -3382,6 +3404,7 @@ mod tests {
             model: None,
             container: None,
             execution_profile: None,
+            tools: None,
             workspace: None,
             execution: None,
             resume_session_id: sid.map(|s| s.to_string()),
