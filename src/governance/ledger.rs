@@ -128,8 +128,10 @@ pub struct GovEvent {
     pub refs: GovRefs,
 }
 
-/// 进程内 seq 分配器（单调递增，跨 kind 共用一个计数；事件路径
-/// `{ts}.{seq}` 双段在跨进程重启场景下仍保证唯一）
+/// 进程内 seq 分配器（单调递增，跨 kind 共用一个计数）。事件路径
+/// `{ts}.{seq}` 的唯一性由**写入域**保证：每进程 GovLedger 各建独立
+/// sidecar 会话（create_session 不复用），payload 按会话域写入——
+/// 路径唯一性 = 会话域内 ts+seq 不重号（同进程内由本计数器保证）
 #[derive(Debug, Default)]
 pub struct GovSeq(AtomicU64);
 

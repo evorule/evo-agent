@@ -581,7 +581,7 @@
               detail: `files=${s.files} symbols=${s.symbols} refs=${s.refs} ${s.building ? 'building' : s.ready ? 'ready' : 'empty'}`,
             });
           })
-          .catch((e) => pushPanelEvent('sys', { label: '[index]', detail: String(e?.message || e), level: 'error' }));
+          .catch((e) => pushPanelEvent('gov', { label: '[index]', detail: String(e?.message || e), level: 'error' }));
         openBottomPanel('output');
       },
     });
@@ -591,7 +591,7 @@
       category: '索引',
       run: () => {
         // 同步重建(blocking 池执行):大仓数秒级,起止均落事件流水
-        pushPanelEvent('sys', { label: '[index]', detail: 'rebuild started (全量重建进行中,大仓可能需数秒)' });
+        pushPanelEvent('gov', { label: '[index]', detail: 'rebuild started (全量重建进行中,大仓可能需数秒)' });
         openBottomPanel('output');
         indexRebuild()
           .then((s) => {
@@ -600,7 +600,7 @@
               detail: `rebuild done: files=${s.files} symbols=${s.symbols} refs=${s.refs}`,
             });
           })
-          .catch((e) => pushPanelEvent('sys', { label: '[index]', detail: `rebuild failed: ${String(e?.message || e)}`, level: 'error' }));
+          .catch((e) => pushPanelEvent('gov', { label: '[index]', detail: `rebuild failed: ${String(e?.message || e)}`, level: 'error' }));
       },
     });
     loadSettings(); // 设置快照加载(失败降级缓存只读;编辑器参数订阅在 EditorPane)

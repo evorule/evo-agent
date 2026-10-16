@@ -143,15 +143,32 @@ export async function collectCandidates(query, ctx = {}, limit = 50) {
     ...MENTION_GROUPS,
     ...[...byType.keys()].filter((t) => !known.has(t)).map((t) => ({ type: t, label: t })),
   ];
+  // 组间公平配额:首轮单组上限=limit 半数(向上取整),防文件等大组独占
+  // 预算饿死其他组;首轮剩余预算按组序二次分摊给被截断组的余量
+  const perGroupCap = Math.ceil(limit / 2);
   let budget = limit;
-  const groups = [];
+  const entries = [];
   for (const g of order) {
     const items = byType.get(g.type);
-    if (!items || items.length === 0 || budget <= 0) continue;
-    const take = items.slice(0, budget);
-    budget -= take.length;
-    groups.push({ type: g.type, label: g.label, items: take });
+    if (!items || items.length === 0) continue;
+    entries.push({ g, items, taken: [] });
   }
+  for (const e of entries) {
+    if (budget <= 0) break;
+    e.taken = e.items.slice(0, Math.min(perGroupCap, budget));
+    budget -= e.taken.length;
+  }
+  for (const e of entries) {
+    if (budget <= 0) break;
+    const rest = e.items.slice(e.taken.length);
+    if (rest.length === 0) continue;
+    const more = rest.slice(0, budget);
+    budget -= more.length;
+    e.taken = e.taken.concat(more);
+  }
+  const groups = entries
+    .filter((e) => e.taken.length > 0)
+    .map((e) => ({ type: e.g.type, label: e.g.label, items: e.taken }));
   return { groups, total, truncated: total > limit };
 }
 
