@@ -11,6 +11,7 @@ import {
   collectCandidates,
   xmlEscape,
   xmlBlock,
+  estimateComposerTokens,
   estimateTokens,
   tokenLevel,
   TOKEN_LIMITS,
@@ -253,5 +254,23 @@ describe('token 估算', () => {
     expect(tokenLevel(TOKEN_LIMITS.safe)).toBe('warn');
     expect(tokenLevel(TOKEN_LIMITS.warn)).toBe('warn');
     expect(tokenLevel(TOKEN_LIMITS.warn + 1)).toBe('over');
+  });
+
+  it('estimateComposerTokens = 正文 + @文件字节数权重(组装口径)', () => {
+    expect(estimateComposerTokens('', [])).toBe(0);
+    expect(estimateComposerTokens('abcd', [])).toBe(1);
+    const mentions = [
+      { type: 'file', ref: 'a.js', size: 4000 },
+      { type: 'folder', ref: 'src' },
+      { type: 'file', ref: 'b.js' },
+      { type: 'selection', ref: 'a.js:1-2' },
+    ];
+    // 4000 字节文件计入;folder/无 size/动态源不计(低估不虚报)
+    expect(estimateComposerTokens('abcd', mentions)).toBe(Math.ceil((4 + 4000) / 4));
+  });
+
+  it('estimateComposerTokens 超 32k 判 over(大文件警示生效)', () => {
+    const mentions = [{ type: 'file', ref: 'big.js', size: 200000 }];
+    expect(tokenLevel(estimateComposerTokens('', mentions))).toBe('over');
   });
 });

@@ -195,3 +195,17 @@ export function tokenLevel(tokens) {
   if (tokens >= TOKEN_LIMITS.safe) return 'warn';
   return 'safe';
 }
+
+/**
+ * 组装口径 token 估算:正文 + @文件引用已知权重(设计:组装后 chars/4)。
+ * 文件权重=文件索引缓存的字节数(发送时全量抓取注入,占比绝对主导);
+ * 选区/终端/问题等动态源发送时才抓取,v1 不计入(低估不虚报);
+ * 文件夹引用按其展开注入同口径估算,v1 同样不计。
+ */
+export function estimateComposerTokens(draft, mentions = []) {
+  let chars = typeof draft === 'string' ? draft.length : 0;
+  for (const m of Array.isArray(mentions) ? mentions : []) {
+    if (m && m.type === 'file' && Number.isFinite(m.size)) chars += m.size;
+  }
+  return Math.ceil(chars / 4);
+}

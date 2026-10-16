@@ -260,7 +260,7 @@ describe('reconcileMentions(发送前对账)', () => {
     const { kept, added } = await reconcileMentions('参考 @readme.md 写说明', []);
     expect(added).toEqual(['@readme.md']);
     expect(kept).toEqual([
-      { type: 'file', ref: 'docs/readme.md', insertAt: 3, token: '@readme.md' },
+      { type: 'file', ref: 'docs/readme.md', insertAt: 3, token: '@readme.md', size: null },
     ]);
   });
 

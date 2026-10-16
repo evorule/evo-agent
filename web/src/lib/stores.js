@@ -256,7 +256,13 @@ export function ensureFileIndex(force = false) {
         for (const e of res.entries || []) {
           if (out.length >= FILE_INDEX_LIMIT) break;
           const path = dir ? `${dir}/${e.name}` : e.name;
-          out.push({ path, name: e.name, isDir: e.kind === 'dir' });
+          // size 保留:token 估算条的 @ 文件权重来源(file_list 缺省带字节数)
+          out.push({
+            path,
+            name: e.name,
+            isDir: e.kind === 'dir',
+            size: Number.isFinite(e.size) ? e.size : null,
+          });
           if (e.kind === 'dir' && !FILE_INDEX_SKIP_DIRS.has(e.name) && !visited.has(path)) {
             visited.add(path);
             queue.push(path);
