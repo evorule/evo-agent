@@ -876,7 +876,7 @@ async fn test_generate_acceptance_criteria_fail_visible_on_sidecar_failure() {
     );
 }
 
-// ===== O-492:续话轮生成判据恢复(journal 锚+复检+fail-visible) =====
+// ===== 续话轮生成判据恢复(journal 锚+复检+fail-visible) =====
 
 /// 唯一临时目录(进程 id+纳秒;防测试间与跨运行残留账面互扰)
 fn o492_temp_dir(tag: &str) -> std::path::PathBuf {
@@ -890,7 +890,7 @@ fn o492_temp_dir(tag: &str) -> std::path::PathBuf {
     ))
 }
 
-/// O-492 单元:journal 含判据事件 → 恢复;多事件取最新一条(最新优先)
+/// 单元:journal 含判据事件 → 恢复;多事件取最新一条(最新优先)
 #[test]
 fn test_recover_acceptance_criteria_latest_wins() {
     let dir = o492_temp_dir("latest");
@@ -905,7 +905,7 @@ fn test_recover_acceptance_criteria_latest_wins() {
     assert_eq!(got, "test -f out.md");
 }
 
-/// O-492 单元:journal 无判据事件(空账面)→ fail-visible Err,指引配静态判据
+/// 单元:journal 无判据事件(空账面)→ fail-visible Err,指引配静态判据
 #[test]
 fn test_recover_acceptance_criteria_missing_event() {
     let dir = o492_temp_dir("missing");
@@ -922,7 +922,7 @@ fn test_recover_acceptance_criteria_missing_event() {
     assert!(err.contains("static acceptance_command"), "got: {err}");
 }
 
-/// O-492 单元:journal 文件缺失 → fail-visible Err(journal read failed)
+/// 单元:journal 文件缺失 → fail-visible Err(journal read failed)
 #[test]
 fn test_recover_acceptance_criteria_missing_journal_file() {
     let dir = o492_temp_dir("nofile");
@@ -931,7 +931,7 @@ fn test_recover_acceptance_criteria_missing_journal_file() {
     assert!(err.contains("journal read failed"), "got: {err}");
 }
 
-/// O-492 单元:账面被改防御——判据事件若被塞入多行形态,复检必须拒绝
+/// 单元:账面被改防御——判据事件若被塞入多行形态,复检必须拒绝
 #[test]
 fn test_recover_acceptance_criteria_revalidation_rejects_multiline() {
     let dir = o492_temp_dir("reval");
@@ -945,7 +945,7 @@ fn test_recover_acceptance_criteria_revalidation_rejects_multiline() {
     assert!(err.contains("revalidation"), "got: {err}");
 }
 
-/// O-492 集成:续话+生成开关开启+无静态判据+journal 无判据事件 → 流显式 Err
+/// 集成:续话+生成开关开启+无静态判据+journal 无判据事件 → 流显式 Err
 /// (fail-visible,不静默降级为无门禁运行)
 #[tokio::test]
 async fn test_continuation_acceptance_recovery_fail_visible() {
@@ -1006,7 +1006,7 @@ async fn test_continuation_acceptance_recovery_fail_visible() {
     assert!(m.contains("static acceptance_command"), "got: {m}");
 }
 
-/// O-492 集成:静态判据在位+生成开关同开 → 静态最优先,不触发恢复路径,
+/// 集成:静态判据在位+生成开关同开 → 静态最优先,不触发恢复路径,
 /// 流正常走完(原 warn 误报面一并清理:静态在位时门禁本就生效)
 #[tokio::test]
 async fn test_continuation_acceptance_static_criteria_wins() {
@@ -1071,7 +1071,7 @@ async fn test_continuation_acceptance_static_criteria_wins() {
     command_mock.assert_async().await;
 }
 
-/// O-492 集成:journal 含已锁判据事件 → 续话轮恢复判据并重新锁定,流正常走完
+/// 集成:journal 含已锁判据事件 → 续话轮恢复判据并重新锁定,流正常走完
 #[tokio::test]
 async fn test_continuation_acceptance_recovery_success() {
     let mut server = mockito::Server::new_async().await;
