@@ -53,12 +53,12 @@ export function parseEvoignore(text) {
 export function isIgnored(path) {
   if (!rules.length) return false;
   const segments = path.split('/');
-  // 任一父目录前缀命中(目录规则)
-  for (let i = 1; i < segments.length; i++) {
-    const prefix = segments.slice(0, i).join('/');
-    for (const r of rules) {
-      if (r.kind === RULE.DIR && r.value === prefix) return true;
-    }
+  // 目录规则:路径中任一目录段等于规则名即排除(gitignore 语义——规则
+  // config/ 命中任意层级下 config 目录及其内容);路径恰为目录本身同样命中
+  for (const r of rules) {
+    if (r.kind !== RULE.DIR) continue;
+    if (path === r.value) return true;
+    if (segments.slice(0, -1).includes(r.value)) return true;
   }
   const basename = segments[segments.length - 1];
   for (const r of rules) {
