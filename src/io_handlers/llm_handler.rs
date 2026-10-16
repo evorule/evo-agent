@@ -129,6 +129,11 @@ impl LlmHandler {
         self
     }
 
+    /// 主模型名(getter;G4 判据生成落账记录生成模型用)
+    pub fn default_model(&self) -> &str {
+        &self.default_model
+    }
+
     /// 覆盖请求超时(秒；连接超时固定 DEFAULT_CONNECT_TIMEOUT_SECS)
     pub fn with_request_timeout(mut self, secs: u64) -> Self {
         self.request_timeout_secs = secs;

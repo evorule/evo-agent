@@ -979,6 +979,9 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             // 是可靠性内部状态,非对话轨迹内容(变体文档口径一致)
             JournalEvent::RewindBudgetConsumed { .. } => {}
             JournalEvent::RunawayGuardTripped { .. } => {}
+            // G4 判据生成落账(先写后锁):元数据事件不映射步——判据经 task_done
+            // 门禁消费反映在 acceptance_passed;生成过程全文在 sidecar 审计链
+            JournalEvent::AcceptanceCriteriaGenerated { .. } => {}
         }
     }
     // 流末悬挂 agent 步(无 turn_ended 尾:crash/截断场景)

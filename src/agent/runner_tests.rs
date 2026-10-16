@@ -675,6 +675,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         output_format: None,
         context_window_tokens: None,
         acceptance_command: None,
+        acceptance_generation: None,
         i2_lexicon: None,
         wall_clock_budget_secs: None,
         max_parallel_tools: 1,
@@ -771,6 +772,108 @@ async fn test_from_definition_success() {
     assert!(runner.tool_handler.has_tool("echo"));
     // "none" memory → None
     assert!(runner.memory.is_none());
+}
+
+// === G4 判据生成(先写后锁;状态机 §2.1 设计-18) ===
+
+#[tokio::test]
+async fn test_from_definition_acceptance_generation_default_off() {
+    // 缺省不变式:未声明 acceptance_generation → false,零行为变化
+    let def = make_def_with_tools(vec!["echo".to_string()]);
+    let runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    assert!(!runner.acceptance_generation);
+    assert!(runner.acceptance_command.is_none());
+}
+
+#[tokio::test]
+async fn test_from_definition_acceptance_generation_static_wins() {
+    // 静态判据优先(先写后锁强形态):def 已配 acceptance_command 时生成节点不启动
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.acceptance_command = Some("exit 0".to_string());
+    def.acceptance_generation = Some(true);
+    let runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    assert!(
+        !runner.acceptance_generation,
+        "静态判据在手,生成节点不得启动"
+    );
+    assert_eq!(runner.acceptance_command.as_deref(), Some("exit 0"));
+}
+
+#[tokio::test]
+async fn test_from_definition_acceptance_generation_explicit_on() {
+    // 显式开启且无静态判据 → 生成节点待命(主循环开工前一次性生成并锁定)
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.acceptance_generation = Some(true);
+    let runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    assert!(runner.acceptance_generation);
+    assert!(runner.acceptance_command.is_none());
+}
+
+#[tokio::test]
+async fn test_generate_acceptance_criteria_noop_when_disabled() {
+    // 开关缺省:方法为 no-op,零网络零状态变化(缺省不变式回归守门)
+    let def = make_def_with_tools(vec!["echo".to_string()]);
+    let mut runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    runner
+        .generate_acceptance_criteria("some goal")
+        .await
+        .expect("disabled flag must be a no-op");
+    assert!(runner.acceptance_command.is_none());
+}
+
+#[tokio::test]
+async fn test_generate_acceptance_criteria_noop_when_static_present() {
+    // 静态判据在手:即便 flag 显式开启(from_definition 会关掉,此处防御性
+    // 直设)也不得触发生成——人工预锁优先于 LLM 生成
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.acceptance_command = Some("test -f out.md".to_string());
+    def.acceptance_generation = Some(true);
+    let mut runner =
+        AgentRunner::from_definition(def, make_test_client(), make_handler_with(&["echo"]), None)
+            .await
+            .unwrap();
+    runner.acceptance_generation = true; // 防御性直设:状态机第二道闸
+    runner
+        .generate_acceptance_criteria("some goal")
+        .await
+        .expect("static criteria must win");
+    assert_eq!(runner.acceptance_command.as_deref(), Some("test -f out.md"));
+}
+
+#[tokio::test]
+async fn test_generate_acceptance_criteria_fail_visible_on_sidecar_failure() {
+    // 显式开启且 sidecar 不可达 → fail-visible Err(不静默降级为无判据运行)
+    let mut def = make_def_with_tools(vec!["echo".to_string()]);
+    def.acceptance_generation = Some(true);
+    let mut runner = AgentRunner::from_definition(
+        def,
+        EvoruleApiClient::new("http://127.0.0.1:1"), // 不可达
+        make_handler_with(&["echo"]),
+        None,
+    )
+    .await
+    .unwrap();
+    let err = runner
+        .generate_acceptance_criteria("some goal")
+        .await
+        .expect_err("unreachable sidecar must fail the run visibly");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("acceptance criteria generation failed"),
+        "got: {msg}"
+    );
 }
 
 #[tokio::test]
