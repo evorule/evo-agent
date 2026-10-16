@@ -320,6 +320,22 @@ impl MemoryEventStore {
         }
     }
 
+    /// O-482:进程重启链续接种子——复用既有会话时以账面末端 Fact 回填
+    /// `fact_to_event` 映射与源事件缓存，使新事件 cause 写入后 effects
+    /// 反向链维护（write_event_with_cause 的源事件回写）不因 cache 空缺位
+    pub fn seed_chain_anchor(
+        &mut self,
+        cause_fact_id: FactId,
+        event_id: &str,
+        source_event: Option<MemoryEvent>,
+    ) {
+        self.fact_to_event
+            .insert(cause_fact_id, event_id.to_string());
+        if let Some(e) = source_event {
+            self.event_cache.insert(event_id.to_string(), e);
+        }
+    }
+
     /// 读取事件(优先从 cache,cache miss 时从 evorule 拉取)
     pub async fn read_event(&mut self, event_id: &str) -> Result<Option<MemoryEvent>, StoreError> {
         // cache hit
