@@ -10,6 +10,7 @@
   import { taskRuns } from '../lib/tasks.js';
   import { activePath } from '../lib/stores.js';
   import { addSecondaryGroup, splitOpen } from '../lib/editorGroups.js';
+  import MenuBar from './MenuBar.svelte';
 
   const statusText = {
     connecting: '连接中',
@@ -56,6 +57,8 @@
     <span class="brand-text">evo-agent</span>
     <span class="brand-sub">工作台</span>
   </div>
+
+  <MenuBar />
 
   <div class="actions">
     {#if $turnActive}
