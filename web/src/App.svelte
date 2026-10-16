@@ -41,7 +41,7 @@
     scmGenerateIntent,
   } from './lib/stores.js';
   import { loadSettings, settingsState } from './lib/settings.js';
-  import { applyTheme, readStoredMode } from './lib/theme.js';
+  import { applyTheme, readStoredMode, resolveMode } from './lib/theme.js';
   import * as monaco from 'monaco-editor';
   import { registerCommand, unregisterCommand, executeCommand, getCommand } from './lib/commands.js';
   import { initContextTracking } from './lib/context-keys.js';

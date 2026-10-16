@@ -529,6 +529,46 @@
       when: 'tabsOpen',
       run: toggleDiff,
     });
+    // 编辑器桥命令(顶栏菜单栏 编辑/选择 组的执行本体):经 trigger 走
+    // Monaco 内置动作;无编辑器实例时静默(菜单项点选无 Editor 场景=欢迎页)
+    const edBridge = (action) => () => {
+      if (editor) editor.trigger('menubar', action);
+    };
+    registerCommand({
+      id: 'editor.undo',
+      title: '编辑器: 撤销',
+      category: '编辑器',
+      when: 'editorFocus',
+      run: edBridge('undo'),
+    });
+    registerCommand({
+      id: 'editor.redo',
+      title: '编辑器: 重做',
+      category: '编辑器',
+      when: 'editorFocus',
+      run: edBridge('redo'),
+    });
+    registerCommand({
+      id: 'editor.find',
+      title: '编辑器: 查找',
+      category: '编辑器',
+      when: 'editorFocus',
+      run: edBridge('actions.find'),
+    });
+    registerCommand({
+      id: 'editor.replace',
+      title: '编辑器: 替换',
+      category: '编辑器',
+      when: 'editorFocus',
+      run: edBridge('editor.action.startFindReplaceAction'),
+    });
+    registerCommand({
+      id: 'editor.selectAll',
+      title: '编辑器: 全选',
+      category: '编辑器',
+      when: 'editorFocus',
+      run: edBridge('editor.action.selectAll'),
+    });
 
     unsubActive = activePath.subscribe((p) => {
       diffOn = false; // 切 tab 回到编辑模式
