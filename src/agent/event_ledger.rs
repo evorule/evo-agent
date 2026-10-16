@@ -268,6 +268,9 @@ impl LedgerInner {
             return;
         };
         let prev_sid = self.store.session_id().map(str::to_string);
+        // 先注入（链续接回读 read_event 需要 store session 在手）
+        self.store.set_session_id(&sid);
+        self.memory.set_session_id(&sid);
         if prev_sid.as_deref() != Some(sid.as_str()) {
             if self.prev_fact.is_none() {
                 // 进程内链为空（重启首注入/开具失败后补注入）：回读账面末端
@@ -282,8 +285,6 @@ impl LedgerInner {
                 self.seq = 0;
             }
         }
-        self.store.set_session_id(&sid);
-        self.memory.set_session_id(&sid);
     }
 
     /// T1 配额闸（每轮 [`DEFAULT_TURN_QUOTA`] 条；超限丢弃 + 每轮一次 warn）
