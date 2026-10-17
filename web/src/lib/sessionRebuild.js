@@ -18,6 +18,7 @@ const MAX_TOTAL = 6000;
  */
 export function looksLikeDeadSession(text) {
   return (
+    text.includes('Session not found') || // serve 死会话错误文案(WS 残留失效 id)
     text.includes('NOT_FOUND') ||
     /"status":\s*404/.test(text) ||
     /returned error: 404/.test(text) ||

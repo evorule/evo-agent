@@ -128,7 +128,11 @@ async fn ensure_mcp_gov_session(client: &EvoruleApiClient, path: &Path) -> Optio
     match read_gov_session_state(path) {
         Some(sid) => match client.get_session_metadata(&sid).await {
             Ok(_) => Some(sid),
-            Err(ApiError::SessionNotFound) => provision_gov_session(client, path).await,
+            // 错误面迁移后 404 统一为 ApiError{status:404}（check_response_full
+            // 不再特判 SessionNotFound）；判死重开具按 wire 状态匹配，legacy 变体保留兜底
+            Err(ApiError::ApiError { status: 404, .. }) | Err(ApiError::SessionNotFound) => {
+                provision_gov_session(client, path).await
+            }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
