@@ -319,9 +319,64 @@ enum ToolsAction {
 // main
 // =============================================================================
 
+/// 深异步链专用栈大小（O-511 修复）。
+///
+/// Windows 主线程栈沿用 PE 头 SizeOfStackReserve（rustc 默认 1 MB），远小于
+/// pthread 平台的 8 MB；`run_streaming` 等深 async poll 链在 debug 构建下单层
+/// 流首 poll 即耗数百 KB（SP 探针实测 ≈365 KB），delegate 嵌套再叠一层即溢出
+/// （0xC00000FD）。深链子命令统一调度到 16 MB 专用线程执行（reserve 不同于
+/// commit，无内存常驻压力）。
+const BIG_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// 在 16 MB 专用栈线程上执行闭包（O-511 修复：深 async poll 链入口统一走大栈）。
+///
+/// 闭包内自建 tokio runtime / 多次 `block_on` 均合法（runtime 与其消费同线程）。
+/// 线程 spawn 失败返回 Err（fail-fast）；闭包 panic 原样恢复为 panic
+/// （保持调用方 panic 语义，不静默吞并）。
+fn with_big_stack<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(BIG_STACK_BYTES)
+        .spawn(f)
+        .map_err(|e| format!("failed to spawn big-stack thread: {e}"))?
+        .join()
+        .map_err(|panic| std::panic::resume_unwind(panic))
+}
+
+/// 深链子命令专用：`with_big_stack` 的 ExitCode 薄壳（spawn 失败 fail-fast 退出码 1）。
+fn run_with_big_stack(f: impl FnOnce() -> ExitCode + Send + 'static) -> ExitCode {
+    with_big_stack(f).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        ExitCode::from(1)
+    })
+}
+
+/// serve 启动期单次桥接专用：在 16 MB 专用栈线程上自建 current-thread runtime
+/// 并驱动闭包（O-511 修复，替代裸建临时 runtime——主线程 1MB 栈对深链不安全；
+/// 闭包持有值进出线程，注册结果可写回调用方持有态）。
+fn bridge_on_big_stack<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce(&tokio::runtime::Runtime) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    with_big_stack(move || -> Result<T, String> {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => return Err(format!("failed to build tokio runtime: {e}")),
+        };
+        Ok(f(&rt))
+    })
+    .and_then(|inner| inner)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
-
     // 0. 加载 .env(若存在;已设置的环境变量优先,不覆盖)——结构性修复的
     //    全子命令推广:LLM 密钥加载前置到 main,run/workflow/patrol 等所有子命令
     //    均不再依赖外部注入(此前仅 serve 加载,workflow 真实 LLM 运行会静默失联)
@@ -338,13 +393,15 @@ fn main() -> ExitCode {
             agent,
             auto_approve_candidates,
             stream,
-        } => cmd_run(
-            &cli.workdir,
-            &goal,
-            agent.as_deref(),
-            auto_approve_candidates,
-            stream,
-        ),
+        } => run_with_big_stack(move || {
+            cmd_run(
+                &cli.workdir,
+                &goal,
+                agent.as_deref(),
+                auto_approve_candidates,
+                stream,
+            )
+        }),
         Command::List { dir } => cmd_list(&cli.workdir, dir.as_deref()),
         Command::Tools { action } => cmd_tools(&cli.workdir, action),
         Command::Validate { agent } => cmd_validate(&cli.workdir, &agent),
@@ -368,13 +425,15 @@ fn main() -> ExitCode {
             workspace,
             agent,
             out,
-        } => cmd_patrol(
-            &cli.workdir,
-            session,
-            &workspace,
-            agent.as_deref(),
-            out.as_deref(),
-        ),
+        } => run_with_big_stack(move || {
+            cmd_patrol(
+                &cli.workdir,
+                session,
+                &workspace,
+                agent.as_deref(),
+                out.as_deref(),
+            )
+        }),
         Command::Workflow {
             workflow_id,
             dir,
@@ -386,33 +445,37 @@ fn main() -> ExitCode {
             max_wall_ms,
             max_tokens,
             resume_session,
-        } => cmd_workflow(
-            &cli.workdir,
-            &workflow_id,
-            dir.as_deref(),
-            max_depth,
-            max_concurrent,
-            WorkflowRunOpts {
-                plan_execute,
-                limits: DriverLimits {
-                    max_replan,
-                    max_recuts: max_recut,
-                    max_wall_ms: Some(max_wall_ms),
-                    max_tokens,
+        } => run_with_big_stack(move || {
+            cmd_workflow(
+                &cli.workdir,
+                &workflow_id,
+                dir.as_deref(),
+                max_depth,
+                max_concurrent,
+                WorkflowRunOpts {
+                    plan_execute,
+                    limits: DriverLimits {
+                        max_replan,
+                        max_recuts: max_recut,
+                        max_wall_ms: Some(max_wall_ms),
+                        max_tokens,
+                    },
+                    resume_session,
                 },
-                resume_session,
-            },
-        ),
+            )
+        }),
         Command::Repl {
             agent,
             auto_approve_candidates,
             session,
-        } => cmd_repl(
-            &cli.workdir,
-            agent.as_deref(),
-            auto_approve_candidates,
-            session.as_deref(),
-        ),
+        } => run_with_big_stack(move || {
+            cmd_repl(
+                &cli.workdir,
+                agent.as_deref(),
+                auto_approve_candidates,
+                session.as_deref(),
+            )
+        }),
         Command::Replay {
             session,
             event,
@@ -1994,21 +2057,29 @@ fn cmd_serve(
     // 服务消费桥:按白名单把 server 插件服务注册为代理工具
     // (注册失败降级继续并明示影响,不阻塞 server 启动)
     if !config.evorule.service_tools.is_empty() {
-        match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => match rt.block_on(evo_agent::service_tools::register_service_tools(
-                &mut toolkit,
-                &evorule_client,
-                &config.evorule.service_tools,
-            )) {
-                Ok(n) => eprintln!("[service-tools] {n} service tool(s) registered"),
-                Err(e) => {
-                    eprintln!("[service-tools] 服务工具注册失败,serve 面无服务工具: {e}")
-                }
-            },
-            Err(e) => eprintln!("[service-tools] 临时 runtime 构建失败: {e}"),
+        // O-511 修复：临时 runtime 统一走大栈线程（原主线程 1MB 栈对深链不安全）；
+        // 注册结果写回 serve 持有的 toolkit（白名单/客户端快照随闭包进出线程）
+        let whitelist = config.evorule.service_tools.clone();
+        let client = evorule_client.clone();
+        let mut snapshot = toolkit.clone();
+        match bridge_on_big_stack(move |rt| {
+            let result = rt.block_on(evo_agent::service_tools::register_service_tools(
+                &mut snapshot,
+                &client,
+                &whitelist,
+            ));
+            (result, snapshot)
+        }) {
+            Ok((Ok(n), registered)) => {
+                eprintln!("[service-tools] {n} service tool(s) registered");
+                toolkit = registered;
+            }
+            Ok((Err(e), _)) => {
+                eprintln!("[service-tools] 服务工具注册失败,serve 面无服务工具: {e}")
+            }
+            Err(e) => {
+                eprintln!("[service-tools] 临时大栈线程失败,serve 面无服务工具: {e}")
+            }
         }
     }
     // B16:serve 模式 MCP 接入(门禁=agentTools.mcp 设置键,manifest 开关绑定
@@ -2038,21 +2109,23 @@ fn cmd_serve(
             );
         } else {
             mcp_enabled = true;
-            match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => {
-                    let n = rt.block_on(
-                        mcp_manager.connect_and_register_all(&mut toolkit, &mcp_cfgs.servers),
-                    );
-                    eprintln!(
-                        "[mcp] {}/{} server(s) connected, tools registered into serve toolkit",
-                        n,
-                        mcp_cfgs.servers.len()
-                    );
-                }
-                Err(e) => eprintln!("[mcp] 临时 runtime 构建失败,serve 面无 MCP 工具: {e}"),
+            // O-511 修复：临时 runtime 统一走大栈线程（原主线程 1MB 栈对深链不安全）；
+            // 注册结果写回 serve 持有的 toolkit（MCP manager/配置快照随闭包进出线程）
+            let manager = std::sync::Arc::clone(&mcp_manager);
+            let servers = mcp_cfgs.servers.clone();
+            let server_count = servers.len();
+            let mut snapshot = toolkit.clone();
+            match bridge_on_big_stack(move |rt| {
+                let n = rt.block_on(manager.connect_and_register_all(&mut snapshot, &servers));
+                eprintln!(
+                    "[mcp] {}/{} server(s) connected, tools registered into serve toolkit",
+                    n,
+                    server_count
+                );
+                snapshot
+            }) {
+                Ok(registered) => toolkit = registered,
+                Err(e) => eprintln!("[mcp] 临时大栈线程失败,serve 面无 MCP 工具: {e}"),
             }
         }
     }
