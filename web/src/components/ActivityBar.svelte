@@ -12,6 +12,7 @@
     { id: 'search', label: '搜索', enabled: true },
     { id: 'scm', label: '源代码管理', enabled: true },
     { id: 'orchestration', label: '编排(委托谱系)', enabled: true },
+    { id: 'debug', label: '运行和调试', enabled: true },
     { id: 'extensions', label: '扩展', enabled: true },
     { id: 'audit', label: '审计(治理叠加阶段接入)', enabled: false },
     { id: 'settings', label: '设置', enabled: true },
@@ -66,6 +67,11 @@
           <circle cx="18" cy="12" r="2.2" />
           <circle cx="18" cy="19" r="2.2" />
           <path d="M7.2 12h8.6M7.2 11.2C7.2 8 10 7.2 15.7 6.9M7.2 12.8c0 3.2 2.8 4 8.5 4.3" />
+        </svg>
+      {:else if it.id === 'debug'}
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
+          <ellipse cx="12" cy="13" rx="4.6" ry="5.6" />
+          <path d="M9.4 6.2 10.6 4M14.6 6.2 13.4 4M7.4 11H3.8M7.2 15H4.2M20.2 11h-3.6M19.8 15h-3M12 7.4V5.4M7.4 13h9.2" />
         </svg>
       {:else if it.id === 'audit'}
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">

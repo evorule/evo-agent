@@ -16,7 +16,7 @@
   import { marked } from 'marked';
   import { setupMonaco, monaco, jsonDiagnosticsOptions } from '../lib/monaco-setup.js';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
-  import { uriSpecFor, initDiagnostics, rebindPath, setDiagnostics, clearDiagnostics } from '../lib/diagnostics.js';
+  import { uriSpecFor, initDiagnostics, rebindPath, setDiagnostics, clearDiagnostics, pathFromUri } from '../lib/diagnostics.js';
   import { lintMarkdown, LINT_MAX_LENGTH } from '../lib/markdown-lint.js';
   import SettingsEditor from './SettingsEditor.svelte';
   import {
@@ -42,6 +42,7 @@
   } from '../lib/settings.js';
   import { initLsp, notifySaved } from '../lib/lsp/index.js';
   import { registerAiCompletion, refreshAiEvoignore } from '../lib/ai-completion.js';
+  import { attachDebugDecorations } from '../lib/dap/decorations.js';
   import { openInlineChat, inlineChat } from '../lib/inlineChat.js';
   import InlineChatWidget from './InlineChatWidget.svelte';
   import { applyTheme, resolveMode } from '../lib/theme.js';
@@ -88,6 +89,7 @@
   /** LSP 装配清理函数(onMount 异步赋值;onDestroy 调用) */
   let disposeLsp = null;
   let disposeAi = null;
+  let disposeDebugDecor = null;
   /** path → monaco model(含 undo 栈与编辑状态) */
   /** path → 保存基线内容(对比判 dirty) */
   /** path → 打开失败的错误占位 model(缓存防重复创建) */
@@ -502,6 +504,8 @@
       'markdown', 'json', 'yaml', 'shell', 'sql',
     ];
     disposeAi = registerAiCompletion(editor, AI_LANGS);
+    // 调试装饰:文件编辑的真实实例=本组件 editor(GroupPane 仅分屏挂载;2026-10-17 实测勘误)
+    disposeDebugDecor = attachDebugDecorations({ monaco, editor, pathFromUri });
     refreshAiEvoignore();
     editor.onDidChangeModelContent(() => {
       const path = $activePath;
@@ -715,6 +719,7 @@
     if (diffEditor) diffEditor.dispose();
     unmountSettingsSchema();
     disposeLsp?.(); // LSP 装配清理(断连/摘订阅)
+    disposeDebugDecor?.(); // 调试装饰清理(断点/stopped 集合)
   });
 </script>
 

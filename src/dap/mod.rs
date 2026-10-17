@@ -33,9 +33,24 @@ pub struct AdapterSpec {
     pub langs: Vec<String>,
 }
 
-/// 从设置值解析适配器映射（`{ "名称": {command,args,langs} }`）
+/// 从设置值解析适配器映射（`{ "名称": {command,args,langs} }`）。
+///
+/// 设置注册表把 `dap.adapters` 声明为 **String** 形态（默认 "{}"，JSON 文本），
+/// 而本函数早期只认对象形态——白名单经 PUT 写入后永远解析为空（真缺陷，
+/// 2026-10-17 复检发现）。现兼容两形态：字符串 → 解析内嵌 JSON；对象 → 直用。
 pub fn adapters_from_settings(v: Option<&Value>) -> Vec<(String, AdapterSpec)> {
-    let Some(map) = v.and_then(|v| v.as_object()) else {
+    let raw = match v {
+        None => return Vec::new(),
+        Some(Value::String(s)) => {
+            // 字符串形态:解析内嵌 JSON;解析失败/非对象 = 空（保守不 spawn）
+            match serde_json::from_str::<Value>(s) {
+                Ok(parsed) => parsed,
+                Err(_) => return Vec::new(),
+            }
+        }
+        Some(other) => other.clone(),
+    };
+    let Some(map) = raw.as_object() else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -209,5 +224,19 @@ mod tests {
         assert_eq!(out[0].0, "alpha");
         assert_eq!(out[1].0, "zeta");
         assert_eq!(out[0].1.args, vec!["--x"]);
+    }
+
+    #[test]
+    fn adapters_from_string_form_setting_key() {
+        // 注册表形态:dap.adapters 为 String(JSON 文本)——对象形态修复前此路径恒空
+        let s = json!(r#"{"python": {"command": "py", "args": ["-m", "debugpy.adapter"], "langs": ["python"]}}"#);
+        let out = adapters_from_settings(Some(&s));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "python");
+        assert_eq!(out[0].1.command, "py");
+        assert_eq!(out[0].1.args, vec!["-m", "debugpy.adapter"]);
+        // 非法 JSON 文本/非对象 JSON = 空（fail-closed 不变）
+        assert!(adapters_from_settings(Some(&json!("not json"))).is_empty());
+        assert!(adapters_from_settings(Some(&json!("[1,2]"))).is_empty());
     }
 }
