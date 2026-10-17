@@ -2105,10 +2105,8 @@ fn cmd_serve(
             // I/O 后其 drop 在 Windows 管道路径永久挂死）。失败隔离语义不变
             // （manager 内部逐 server 落 failed 不阻塞启动）。
             let server_count = mcp_cfgs.servers.len();
-            let n = runtime.block_on(
-                mcp_manager
-                    .connect_and_register_all(&mut toolkit, &mcp_cfgs.servers),
-            );
+            let n = runtime
+                .block_on(mcp_manager.connect_and_register_all(&mut toolkit, &mcp_cfgs.servers));
             eprintln!(
                 "[mcp] {}/{} server(s) connected, tools registered into serve toolkit",
                 n, server_count
