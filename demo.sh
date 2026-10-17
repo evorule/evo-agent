@@ -23,10 +23,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PROVIDER="${PROVIDER:-minimax}"
-SERVER_VERSION="${SERVER_VERSION:-v0.5.0}"
+# evorule-server release to fetch (pinned for reproducibility).
+# SERVER_VERSION=latest resolves the newest Gitee release at runtime.
+SERVER_VERSION="${SERVER_VERSION:-v0.10.0}"
 DEMO_DIR=".demo"
 SERVER_DIR="$DEMO_DIR/server"
-SERVER_PORT=18080
+# Port for the demo evorule-server instance (default matches the deployment
+# default; override with SERVER_PORT=<port> when the default is occupied).
+SERVER_PORT="${SERVER_PORT:-18080}"
 SERVER_URL="http://127.0.0.1:$SERVER_PORT"
 
 case "$PROVIDER" in
@@ -63,13 +67,24 @@ if [ "$server_up" = "1" ]; then
   echo "  a demo server started by this script manages the token for you."
 else
   if [ ! -x "$SERVER_DIR/evorule-server" ]; then
-    echo "downloading evorule-server $SERVER_VERSION from Gitee..."
+    RESOLVED_VERSION="$SERVER_VERSION"
+    if [ "$RESOLVED_VERSION" = "latest" ]; then
+      echo "resolving latest evorule-server release from Gitee..."
+      RESOLVED_VERSION=$(curl -s "https://gitee.com/api/v5/repos/evorule/evorule-server/releases/latest" \
+        | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)
+      if [ -z "$RESOLVED_VERSION" ]; then
+        echo "FAIL: could not resolve latest release from Gitee API" >&2
+        exit 1
+      fi
+      echo "  latest = $RESOLVED_VERSION"
+    fi
+    echo "downloading evorule-server $RESOLVED_VERSION from Gitee..."
     mkdir -p "$DEMO_DIR"
     # Gitee Release asset names carry the version without the "v" prefix
-    # (tag v0.5.0 -> asset evorule-server-0.5.0-linux64.tar.gz)
-    ASSET_VER="${SERVER_VERSION#v}"
+    # (tag v0.10.0 -> asset evorule-server-0.10.0-linux64.tar.gz)
+    ASSET_VER="${RESOLVED_VERSION#v}"
     curl -L -o "$DEMO_DIR/server.tar.gz" \
-      "https://gitee.com/evorule/evorule-server/releases/download/$SERVER_VERSION/evorule-server-$ASSET_VER-linux64.tar.gz"
+      "https://gitee.com/evorule/evorule-server/releases/download/$RESOLVED_VERSION/evorule-server-$ASSET_VER-linux64.tar.gz"
     mkdir -p "$SERVER_DIR"
     tar -xzf "$DEMO_DIR/server.tar.gz" -C "$SERVER_DIR"
     rm -f "$DEMO_DIR/server.tar.gz"
