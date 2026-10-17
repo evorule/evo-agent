@@ -201,7 +201,7 @@ fn smoke_serve_with_stdio_mcp_reaches_listening_and_client_face_works() {
             panic!("serve process exited before listening (see inherited output)");
         }
         if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-            let req = format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let req = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
             if s.write_all(req.as_bytes()).is_ok() {
                 let mut raw = Vec::new();
                 if s.read_to_end(&mut raw).is_ok() {

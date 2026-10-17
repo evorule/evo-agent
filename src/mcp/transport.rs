@@ -169,6 +169,19 @@ impl StdioTransport {
     }
 }
 
+/// JSON-RPC id 归一化(O-515):数值按十进制串、字符串取原文,双形态等价匹配;
+/// 其余类型(null/bool/对象)返回 None 视同无 id。
+///
+/// 客户端只发数值 id,但部分 server 实现会把回显 id 转成字符串(JSON-RPC spec
+/// 违例但野外存在)——路由前统一归一,避免字符串 id 响应被当通知丢弃。
+fn canonical_id(v: &Value) -> Option<String> {
+    match v {
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// reader loop:逐行读 stdout,解析 JSON-RPC response,按 id 路由到 pending channel
 ///
 /// - 成功响应(`{"result":...}`)→ 发送 `Ok(result)`
@@ -202,12 +215,17 @@ async fn reader_loop(
                         continue;
                     }
                 };
-                // 通知(无 id)→ 仅记录
-                let id = match parsed.get("id").and_then(|v| v.as_u64()) {
+                // O-515:id 双形态归一(见 canonical_id)——归一后解析回 u64 匹配
+                // pending 表;解析不出数值的帧(真通知/未知 id)走同一路径丢弃
+                let id = match parsed
+                    .get("id")
+                    .and_then(canonical_id)
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     Some(id) => id,
                     None => {
                         let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("?");
-                        debug!(method = %method, "MCP server notification (no id), ignoring");
+                        debug!(method = %method, "MCP server notification or non-pending id, ignoring");
                         continue;
                     }
                 };
@@ -502,11 +520,11 @@ fn parse_sse_event(event: &[u8], id: u64) -> Result<Option<Value>, String> {
     let payload = data_lines.join("\n");
     let parsed: Value = serde_json::from_str(&payload)
         .map_err(|e| format!("MCP streamable_http SSE data parse: {}", e))?;
-    // 无 id = server 通知,跳过
-    let Some(reply_id) = parsed.get("id").and_then(|v| v.as_u64()) else {
-        return Ok(None);
+    // O-515:id 双形态归一比较(客户端只发数值 id,server 可能回显字符串)
+    let Some(reply_id) = parsed.get("id").and_then(canonical_id) else {
+        return Ok(None); // 无 id = server 通知,跳过
     };
-    if reply_id != id {
+    if reply_id != id.to_string() {
         return Ok(None);
     }
     if let Some(err) = parsed.get("error") {
@@ -568,7 +586,8 @@ impl McpTransport for StreamableHttpTransport {
                 .to_string();
             return Err(msg);
         }
-        if parsed.get("id").and_then(|v| v.as_u64()) != Some(id) {
+        // O-515:id 双形态归一比较(同 parse_sse_event)
+        if parsed.get("id").and_then(canonical_id).as_deref() != Some(&id.to_string()) {
             return Err(format!(
                 "MCP streamable_http '{}' response id mismatch",
                 method
@@ -744,6 +763,93 @@ pub mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.contains("spawn MCP server") || err.contains("failed"));
+    }
+
+    #[test]
+    fn test_canonical_id_forms() {
+        // O-515:数值/字符串双形态归一,其余类型视同无 id
+        assert_eq!(canonical_id(&serde_json::json!(1)), Some("1".to_string()));
+        assert_eq!(canonical_id(&serde_json::json!(42)), Some("42".to_string()));
+        assert_eq!(canonical_id(&serde_json::json!("1")), Some("1".to_string()));
+        assert_eq!(
+            canonical_id(&serde_json::json!("abc-1")),
+            Some("abc-1".to_string())
+        );
+        assert_eq!(canonical_id(&serde_json::json!(null)), None);
+        assert_eq!(canonical_id(&serde_json::json!({"x": 1})), None);
+        // 双形态等价匹配(数值 7 与字符串 "7" 归一结果一致)
+        assert_eq!(
+            canonical_id(&serde_json::json!(7)),
+            canonical_id(&serde_json::json!("7"))
+        );
+    }
+
+    /// O-515:id 双形态回环——server 回显字符串 id(如 "1")也必须路由成功。
+    /// 原 as_u64 解析把字符串 id 帧当通知丢弃,所有调用挂到超时。
+    /// python 缺席时优雅跳过(有 python 的环境常态守护,非 #[ignore])。
+    #[tokio::test]
+    async fn test_stdio_string_id_response_routes() {
+        let python = ["python", "python3"]
+            .iter()
+            .copied()
+            .find(|cmd| {
+                std::process::Command::new(cmd)
+                    .arg("--version")
+                    .stdout(StdIo::null())
+                    .stderr(StdIo::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            });
+        let Some(python) = python else {
+            eprintln!("skipped: python not found on PATH");
+            return;
+        };
+        // 最小 MCP server:所有响应回显 id 故意转字符串(spec 违例形态)
+        let script_content = r#"import sys, json
+def send(m):
+    sys.stdout.write(json.dumps(m) + "\n"); sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line: break
+    line = line.strip()
+    if not line: continue
+    try: req = json.loads(line)
+    except: continue
+    method = req.get("method"); rid = req.get("id")
+    if rid is None: continue
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":str(rid),"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"mock-string-id","version":"0.1.0"},"capabilities":{}}})
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":str(rid),"result":{"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object"}}]}})
+    else:
+        send({"jsonrpc":"2.0","id":str(rid),"result":{}})
+"#;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script_path = tmp.path().join("mock_string_id.py");
+        std::fs::write(&script_path, script_content).expect("write script");
+
+        let transport = StdioTransport::spawn(python, &[script_path.to_str().unwrap()])
+            .await
+            .unwrap();
+        let init = transport
+            .request(
+                "initialize",
+                serde_json::json!({"protocolVersion": "2024-11-05", "capabilities": {}}),
+            )
+            .await
+            .expect("string-id response must route (O-515)");
+        assert_eq!(init["serverInfo"]["name"], "mock-string-id");
+        let tools = transport
+            .request("tools/list", serde_json::json!({}))
+            .await
+            .expect("second string-id call must route");
+        assert!(tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "echo"));
+        let _ = transport.close().await;
     }
 
     /// 真实子进程 round-trip 测试(需要 python)

@@ -137,9 +137,24 @@ impl McpManager {
                 }
                 other => return Err(format!("unsupported MCP transport '{}'", other)),
             };
-        let client = std::sync::Arc::new(McpClient::connect(transport).await?);
-        let tools = client.list_tools().await?;
-        Ok((client, tools))
+        // O-515:握手 + 工具发现整体受 timeout_secs 约束(兑现 connect_server
+        // 文档承诺;原无界 await——hang 住的 server 会拖死 serve 启动期
+        // block_on 与 CLI 连接路径)
+        let deadline = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
+        let (client, tools) = tokio::time::timeout(deadline, async {
+            let client = McpClient::connect(transport).await?;
+            let tools = client.list_tools().await?;
+            Ok::<_, String>((client, tools))
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "MCP server '{}' connect/discovery timed out after {}s",
+                cfg.name,
+                deadline.as_secs()
+            )
+        })??;
+        Ok((std::sync::Arc::new(client), tools))
     }
 
     /// 断连单 server(close → kill 子进程)并清除运行态条目
@@ -358,6 +373,35 @@ mod tests {
         remote.url = Some("http://127.0.0.1:9/mcp".to_string());
         let result = mgr.connect_server(&remote).await;
         assert!(result.is_err());
+        let snap = mgr.snapshot();
+        assert_eq!(snap[0].1.status.as_str(), "failed");
+    }
+
+    /// O-515:连接/发现阶段超时——responder 接受连接但永不响应,connect 必须
+    /// 在 timeout_secs 附近报超时错误(原无界 await 会拖死调用方)。纯 Rust
+    /// hung responder(accept 后握住不写回),无外部依赖。
+    #[tokio::test]
+    async fn test_connect_server_timeout_on_hung_responder() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // 握住 accept 的连接 30s,永不写回(测试进程生命周期内即消亡)
+            let _held = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let mgr = McpManager::new();
+        let mut slow = cfg("hung", "");
+        slow.transport = Some("streamable_http".to_string());
+        slow.url = Some(format!("http://{addr}/mcp"));
+        slow.timeout_secs = 1;
+        let t0 = std::time::Instant::now();
+        let err = mgr.connect_server(&slow).await.unwrap_err();
+        assert!(err.contains("timed out"), "got: {err}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "timeout must fire near timeout_secs=1, took {:?}",
+            t0.elapsed()
+        );
         let snap = mgr.snapshot();
         assert_eq!(snap[0].1.status.as_str(), "failed");
     }
