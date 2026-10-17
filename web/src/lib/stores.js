@@ -23,6 +23,9 @@ export const sessionId = writable(null);
 /** 当前轮次执行中(控制发送/中断按钮与流式光标) */
 export const turnActive = writable(false);
 
+/** 扩展面板待审批数(活动栏「扩展」角标;F2) */
+export const extensionsBadge = writable(0);
+
 /** 最近一次引擎帧到达时刻(毫秒 epoch;ws 帧漏斗统一触碰)。
  *  心跳停滞提示消费:turn 活跃且久无引擎事件→前端琥珀提示(纯客户端
  *  判据,serve 心跳 2 窗中止的可见前兆) */
