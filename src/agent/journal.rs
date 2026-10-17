@@ -137,6 +137,12 @@ pub enum JournalEvent {
         size_bytes: usize,
         /// 输出全文 digest(evorule-hash 口径)
         content_digest: String,
+        /// 执行环境 profile 标记(workbench|sandbox-trusted;缺省=旧账无标记)。
+        /// trusted 环境下工具结果的「结果 JSON 间接锚定」升级为审计事件明文——
+        /// 回放/合成面据此可信引用工具输出。旧 journal 文件无此字段,
+        /// 反序列化缺省 None(向后兼容)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_profile: Option<String>,
     },
     /// 工具执行重试落账(幂等类工具遇瞬态故障自动重试;每次重试独立一条,
     /// 首次执行不落此事件——观测面,不参与步映射)
@@ -997,18 +1003,22 @@ impl JournalWriter {
     }
 
     /// tool_result:与 tool_invoked 经 call_id 配对;content = 工具输出全文
-    /// (digest/size 就地计算,journal 不再复制大文本)
+    /// (digest/size 就地计算,journal 不再复制大文本)。
+    /// `execution_profile` = 会话执行环境标记(workbench/sandbox-trusted),
+    /// None = 既有行为零变化(旧账无标记语义)
     pub fn tool_result(
         &self,
         call_id: &str,
         status: &str,
         content: &str,
+        execution_profile: Option<&str>,
     ) -> Result<u64, JournalError> {
         self.push(JournalEvent::ToolResult {
             call_id: call_id.to_string(),
             status: status.to_string(),
             size_bytes: content.len(),
             content_digest: evorule_digest(content),
+            execution_profile: execution_profile.map(str::to_string),
         })
     }
 
@@ -2219,6 +2229,7 @@ mod tests {
                 status: "ok".into(),
                 size_bytes: 128,
                 content_digest: evorule_digest("file body"),
+                execution_profile: None,
             },
             JE::ApprovalRequested {
                 approval_id: "p1".into(),
@@ -2482,7 +2493,7 @@ mod tests {
         let spawn_seq = w
             .delegate_spawned("child-9", "researcher", 1, &evorule_digest("do research"))
             .unwrap();
-        let result_seq = w.tool_result(&call_id, "ok", "done").unwrap();
+        let result_seq = w.tool_result(&call_id, "ok", "done", None).unwrap();
         assert!(
             spawn_seq < result_seq,
             "事件序 delegate_spawned({spawn_seq}) < tool_result({result_seq})"
@@ -2511,6 +2522,45 @@ mod tests {
             matches!(&lines[2].event, JournalEvent::ToolResult { call_id: c, status, .. } if *c == call_id && status == "ok"),
             "尾事件=配对 tool_result"
         );
+    }
+
+    /// O-493:旧账兼容——无 execution_profile 键的历史行反序列化缺省 None
+    #[test]
+    fn test_tool_result_legacy_line_without_profile() {
+        let line = r#"{"seq":1,"ts":1000,"type":"tool_result","payload":{"call_id":"t1","status":"ok","size_bytes":3,"content_digest":"abc"}}"#;
+        let parsed = decode_line(line).unwrap();
+        match parsed.event {
+            JournalEvent::ToolResult {
+                execution_profile, ..
+            } => {
+                assert_eq!(execution_profile, None, "旧账无标记=缺省 None");
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    /// O-493:新账标记随行落账——execution_profile 往返保持
+    #[test]
+    fn test_tool_result_execution_profile_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-prof").unwrap();
+        let _guard = w.begin_turn("g").unwrap();
+        let call_id = w
+            .tool_invoked("shell_exec", &serde_json::json!({"c": "ls"}), None)
+            .unwrap();
+        w.tool_result(&call_id, "ok", "done", Some("sandbox-trusted"))
+            .unwrap();
+        w.end_turn("success", 1, 10).unwrap();
+        let lines = read_all(&JournalWriter::path_for(dir.path(), "s-prof")).unwrap();
+        // lines[0]=turn_started / [1]=tool_invoked / [2]=tool_result
+        match &lines[2].event {
+            JournalEvent::ToolResult {
+                execution_profile, ..
+            } => {
+                assert_eq!(execution_profile.as_deref(), Some("sandbox-trusted"));
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
     }
 
     #[test]

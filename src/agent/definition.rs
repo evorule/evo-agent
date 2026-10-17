@@ -514,6 +514,80 @@ pub fn resolve_skill_manifest_entries(
     Ok(out)
 }
 
+/// http_get 配置节(G7 配置化批;agent_def 增量)
+///
+/// 全字段缺省=工具内置现值(零行为变化铁律);仅显式声明才生效。
+/// `allow_http` 放宽明文 scheme(GET-only 不放宽);`allow_private_hosts`
+/// 把回环/内网段从 SSRF 硬拒降级为 candidate(仍走审批人在环;云元数据
+/// 169.254 与未指明地址永不放宽)。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct HttpGetToolConfig {
+    /// 请求超时秒数(缺省 10)
+    #[serde(default = "default_http_get_timeout_secs")]
+    pub timeout_secs: u64,
+    /// 响应体上限字节(缺省 1 MiB)
+    #[serde(default = "default_http_get_max_bytes")]
+    pub max_bytes: u64,
+    /// 重定向上限(缺省 3)
+    #[serde(default = "default_http_get_max_redirects")]
+    pub max_redirects: u32,
+    /// 放宽 http:// 明文(缺省 false=https-only)
+    #[serde(default)]
+    pub allow_http: bool,
+    /// 放宽内网/回环段为 candidate(缺省 false=SSRF 黑名单不变)
+    #[serde(default)]
+    pub allow_private_hosts: bool,
+}
+
+fn default_http_get_timeout_secs() -> u64 {
+    crate::builtin_tools::http_get::DEFAULT_TIMEOUT_SECS
+}
+
+fn default_http_get_max_bytes() -> u64 {
+    crate::builtin_tools::http_get::DEFAULT_MAX_BYTES
+}
+
+fn default_http_get_max_redirects() -> u32 {
+    crate::builtin_tools::http_get::DEFAULT_MAX_REDIRECTS
+}
+
+impl Default for HttpGetToolConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: default_http_get_timeout_secs(),
+            max_bytes: default_http_get_max_bytes(),
+            max_redirects: default_http_get_max_redirects(),
+            allow_http: false,
+            allow_private_hosts: false,
+        }
+    }
+}
+
+impl HttpGetToolConfig {
+    /// fail-fast 门卫(装配前拒荒谬值,防"配置了却永不成功"的静默失联)
+    pub fn validate(&self) -> Result<(), String> {
+        if self.timeout_secs == 0 || self.timeout_secs > 300 {
+            return Err(format!(
+                "http_get_config.timeout_secs must be in 1..=300, got {}",
+                self.timeout_secs
+            ));
+        }
+        if self.max_bytes == 0 || self.max_bytes > 100 * 1024 * 1024 {
+            return Err(format!(
+                "http_get_config.max_bytes must be in 1..=104857600, got {}",
+                self.max_bytes
+            ));
+        }
+        if self.max_redirects > 10 {
+            return Err(format!(
+                "http_get_config.max_redirects must be in 0..=10, got {}",
+                self.max_redirects
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Agent definition
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentDefinition {
@@ -618,6 +692,12 @@ pub struct AgentDefinition {
     /// - 校验:仅接受裸域名形态(拒 scheme/路径/端口/IP 字面量/空白)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_get_allowed_hosts: Option<Vec<String>>,
+    /// http_get 配置节(可选;G7 配置化。None(缺省)=工具内置现值,既有定义
+    /// 零影响;显式声明才生效——超时/大小/重定向/明文 http/内网段放宽,
+    /// GET-only 不放宽,SSRF 云元数据红线永不放宽。fail-fast 门卫见
+    /// [`HttpGetToolConfig::validate`])
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_get_config: Option<HttpGetToolConfig>,
     /// 组装配方(可选;元层先行批,agent_def 增量。None = 内置默认配方 =
     /// 现状行为逐字节等价;声明后配方版本/哈希进 effective_params 三阶落账)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -766,6 +846,10 @@ impl AgentDefinition {
                     )));
                 }
             }
+        }
+        // http_get 配置节门卫(G7 配置化:fail-fast 拒荒谬值,防静默失联)
+        if let Some(cfg) = &self.http_get_config {
+            cfg.validate().map_err(AgentDefinitionError::InvalidDefinition)?;
         }
         // M5-a:capability_boundary 语义门卫(单一事实源 + 模式/工具一致性)
         if let Some(b) = &self.capability_boundary {
@@ -1940,6 +2024,7 @@ mod tests {
     fn test_to_agent_config() {
         let def = AgentDefinition {
             http_get_allowed_hosts: None,
+            http_get_config: None,
             execution_profile: None,
             agent_type: "writer".to_string(),
             version: "1.0.0".to_string(),
@@ -2315,6 +2400,7 @@ mod tests {
     fn test_capability_boundary_validate_rejections() {
         let mk = |mode: &str, root: &str, tools: Vec<&str>, btools: Vec<&str>| AgentDefinition {
             http_get_allowed_hosts: None,
+            http_get_config: None,
             execution_profile: None,
             agent_type: "x".to_string(),
             version: "1".to_string(),
@@ -2569,6 +2655,7 @@ mod tests {
     fn test_max_parallel_tools_skipped_when_default_in_serialization() {
         let def = AgentDefinition {
             http_get_allowed_hosts: None,
+            http_get_config: None,
             execution_profile: None,
             agent_type: "x".to_string(),
             version: "1".to_string(),
@@ -2807,6 +2894,7 @@ mod tests {
         let skill_path = write_skill_md(dir.path(), "a/SKILL.md", SAMPLE_SKILL_MD);
         let empty_name = AgentDefinition {
             http_get_allowed_hosts: None,
+            http_get_config: None,
             execution_profile: None,
             agent_type: "x".into(),
             version: "1".into(),

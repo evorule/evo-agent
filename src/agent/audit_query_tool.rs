@@ -6,10 +6,9 @@
 //! 四 scope：
 //! - `gov`：读共享账本治理分区 `shared.gov.`（B22-A 治理留痕，GovLedger
 //!   写入的六类事件 Fact）。`precedent=true` 时输出**先例卡**——同类工具+
-//! 参数摘要+当时批准者+档位+时间（会话内批准先例参照）
-//! 的机制载体。
+//!   参数摘要+当时批准者+档位+时间（会话内批准先例参照）的机制载体。
 //! - `shared`：读共享账本任意前缀（get_shared_facts prefix 透传）——含
-//! /mcp 面事件轨道 `shared.mcp.events.EL-*` 的 agent 只读检索入口。
+//!   /mcp 面事件轨道 `shared.mcp.events.EL-*` 的 agent 只读检索入口。
 //! - `session`：读当前/指定会话 Fact 列表（get_facts）；`fact_id` 给出时
 //!   回溯因果链（get_causal_chain_typed）；`verify=true` 时跑链完整性验证
 //!   （verify_audit_typed）。

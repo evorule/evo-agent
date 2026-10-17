@@ -1372,6 +1372,7 @@ mod tests {
             status: "ok".into(),
             size_bytes: 10,
             content_digest: "blake3:bb".into(),
+            execution_profile: None,
         });
         j.push(JE::LlmCalled {
             model: "glm-5.3".into(),
@@ -1510,6 +1511,7 @@ mod tests {
             status: "ok".into(),
             size_bytes: 5,
             content_digest: "blake3:dd".into(),
+            execution_profile: None,
         });
         j.push(JE::TurnEnded {
             status: "success".into(),
@@ -1610,6 +1612,7 @@ mod tests {
             status: "ok".into(),
             size_bytes: 5,
             content_digest: "blake3:bb".into(),
+            execution_profile: None,
         });
         j.push(JE::LlmCalled {
             model: "glm-5.3".into(),
@@ -2130,6 +2133,7 @@ mod tests {
             status: "ok".into(),
             size_bytes: 1,
             content_digest: "blake3:00".into(),
+            execution_profile: None,
         });
         j.push(JE::TurnEnded {
             status: "success".into(),
@@ -2266,6 +2270,7 @@ mod tests {
             status: "ok".into(),
             size_bytes: 4,
             content_digest: "blake3:cc".into(),
+            execution_profile: None,
         });
         j.push(JE::TurnEnded {
             status: "success".into(),

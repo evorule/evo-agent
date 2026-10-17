@@ -1109,6 +1109,10 @@ pub struct AgentRunner {
     /// ——CLI/子代理路径零改动)。run_streaming_inner 创建会话时在此目录建
     /// `{session_id}.jsonl` 事件流(会话唯一真相源,见 crate::agent::journal)
     journal_dir: Option<std::path::PathBuf>,
+    /// G1/O-493:会话执行环境 profile 标记(serve 请求级>定义级、CLI 定义级
+    /// 显式声明才注入)。随 tool_result 落账进 journal——trusted 环境下工具
+    /// 结果在审计事件中明文可追溯。None=既有行为零变化(旧账无标记语义)
+    execution_profile: Option<String>,
     /// B21 D3:主动压缩策略(serve 面从 `longSession.compaction.*` 工作台设置
     /// 构造注入;None=不启用——CLI 路径与未注入面行为零变化,被动 trim 独任)
     compaction_policy: Option<CompactionPolicy>,
@@ -1272,6 +1276,7 @@ impl AgentRunner {
                 crate::agent::tool_trace::ToolTraceCollector::default(),
             )),
             journal_dir: None,
+            execution_profile: None,
             compaction_policy: None,
             acceptance_command: None,
             acceptance_generation: false,
@@ -1402,19 +1407,37 @@ impl AgentRunner {
             crate::api::serve_tools::wire_skills(&mut tool_handler, declared_skills)
                 .map_err(AgentError::Internal)?;
 
-        // definition 级 http_get active host 声明——声明 host 在分类时
-        // 由 Candidate 升级 Active(直接执行,无审批开销),声明外仍 candidate;
-        // SSRF 黑名单与负面域守卫不受影响。None=实例不替换(零影响)。
-        // register_static 为同名覆盖(insert 语义),static manifest 必在。
-        if let Some(hosts) = &def.http_get_allowed_hosts {
-            if !hosts.is_empty() && tool_handler.has_tool("http_get") {
-                tool_handler.register_static(
-                    "http_get",
-                    std::sync::Arc::new(
-                        crate::builtin_tools::http_get::HttpGetTool::new()
-                            .with_allowed_hosts(hosts.clone()),
-                    ),
-                );
+        // definition 级 http_get 声明(G7 配置化 + 既有 active host 白名单)——
+        // 两声明源合一构造(单点同名覆盖替换,static manifest 必在):
+        // - http_get_allowed_hosts:声明 host 由 Candidate 升 Active;
+        // - http_get_config:超时/大小/重定向/明文 http/内网段放宽(缺省=
+        //   工具内置现值;SSRF 云元数据红线与 GET-only 永不放宽)。
+        // 无任何声明=实例不替换(零影响)。
+        {
+            let mut tool =
+                crate::builtin_tools::http_get::HttpGetTool::new();
+            let mut customized = false;
+            if let Some(hosts) = &def.http_get_allowed_hosts {
+                if !hosts.is_empty() {
+                    tool = tool.with_allowed_hosts(hosts.clone());
+                    customized = true;
+                }
+            }
+            if let Some(cfg) = &def.http_get_config {
+                tool = tool
+                    .with_timeout(cfg.timeout_secs)
+                    .with_max_bytes(cfg.max_bytes)
+                    .with_max_redirects(cfg.max_redirects);
+                if cfg.allow_http {
+                    tool = tool.with_allow_http(true);
+                }
+                if cfg.allow_private_hosts {
+                    tool = tool.with_allow_private_hosts(true);
+                }
+                customized = true;
+            }
+            if customized && tool_handler.has_tool("http_get") {
+                tool_handler.register_static("http_get", std::sync::Arc::new(tool));
             }
         }
 
@@ -1904,6 +1927,18 @@ impl AgentRunner {
     pub fn with_journal_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.journal_dir = Some(dir);
         self
+    }
+
+    /// O-493:注入会话执行环境 profile 标记(workbench|sandbox-trusted)。
+    /// 仅显式声明才注入(None=缺省语义零变化);随 tool_result 落账进 journal
+    pub fn with_execution_profile_marker(mut self, profile: Option<&str>) -> Self {
+        self.execution_profile = profile.map(str::to_string);
+        self
+    }
+
+    /// 当前会话执行环境标记(tool_result 落账消费)
+    fn execution_profile_marker(&self) -> Option<&str> {
+        self.execution_profile.as_deref()
     }
 
     /// B21 D3:注入主动压缩策略(serve 面;`longSession.compaction.*` 设置映射,
@@ -2490,6 +2525,8 @@ impl AgentRunner {
         let memory = self.memory.as_mut().ok_or("memory not enabled")?;
         memory.flush_usage(session_id).await;
         let mut deps = sediment::SedimentDeps {
+            // O-487①:实况工具注册表快照(与 sediment_session 同源)
+            available_tools: self.tool_handler.tool_names(),
             memory,
             summarizer: self.summarizer.as_ref(),
             extractor: self.extractor.as_mut(),
@@ -2524,6 +2561,8 @@ impl AgentRunner {
             // 出生即受检;已水合的历史事件同批受检(断点5-水合配合)。
             let recipe = memory.recipe.clone().unwrap_or_default();
             let mut deps = sediment::SedimentDeps {
+                // O-487①:实况工具注册表快照(stable fact 落账前校验工具清单类断言)
+                available_tools: self.tool_handler.tool_names(),
                 memory,
                 summarizer: self.summarizer.as_ref(),
                 extractor: self.extractor.as_mut(),
@@ -3529,6 +3568,24 @@ impl AgentRunner {
                 .register_static(crate::agent::memory_recall_tool::MEMORY_RECALL_TOOL, exec);
             tracing::debug!("memory_recall tool re-bound (session-scoped, read-only)");
         }
+        // 记忆墓碑接线（沉淀污染环治理出口）：memory_tombstone 占位→wired。
+        // 门控同 memory_recall（启动期占位在场才接线——默认关时开关过滤后
+        // 不在场即跳过）；写面需要 session_id（null 墓碑落账归属当前会话）。
+        if self
+            .tool_handler
+            .has_tool(crate::agent::memory_tombstone_tool::MEMORY_TOMBSTONE_TOOL)
+        {
+            let exec: std::sync::Arc<dyn ToolFunction> = std::sync::Arc::new(
+                crate::agent::memory_tombstone_tool::MemoryTombstoneTool::wired(
+                    namespace.clone(),
+                    session_id.to_string(),
+                    client.clone(),
+                ),
+            );
+            self.tool_handler
+                .register_static(crate::agent::memory_tombstone_tool::MEMORY_TOMBSTONE_TOOL, exec);
+            tracing::debug!("memory_tombstone tool re-bound (session-scoped, sensitive write)");
+        }
         // 审计查询接线：audit_query 占位→wired。门控同上；
         // journal 句柄透传（None=journal scope 调用时 fail-visible 如实报错，
         // gov/session scope 不受影响）。
@@ -3660,6 +3717,7 @@ impl AgentRunner {
                 pending_note_feed: false,
                 advised_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
                 summary_model: summary_model.clone(),
+                execution_profile: None,
                 context_window,
                 summarizer: summarizer.clone(),
                 compaction_policy: None,
@@ -5240,6 +5298,27 @@ impl AgentRunner {
             .map_err(AgentError::ToolError)
     }
 
+    /// auto_recall 注入条目的来源标注（O-487③，纯展示层）
+    ///
+    /// 「来源会话」取 SharedFactEntry.source_session_id（服务端账本字段）；
+    /// 「落账时点」取 value 内 MemoryRecord.timestamp（sediment 写入形态，
+    /// Unix 秒）——value 非 MemoryRecord 形态（手工/老数据）无时点，仅标
+    /// 来源会话。标注让 LLM 与人能区分「新近确证」与「陈年残留」。
+    fn auto_recall_provenance(fact: &crate::api::evorule_client::SharedFactEntry) -> String {
+        let recorded_at = serde_json::from_value::<crate::agent::memory::MemoryRecord>(
+            fact.value.clone(),
+        )
+        .ok()
+        .map(|r| r.timestamp);
+        match recorded_at {
+            Some(ts) => format!(
+                " (source_session: {}, recorded_at: {ts})",
+                fact.source_session_id
+            ),
+            None => format!(" (source_session: {})", fact.source_session_id),
+        }
+    }
+
     async fn auto_recall(&mut self, session_id: &str) -> Result<Vec<u64>, AgentError> {
         // B5/D3：限定本 namespace（旧实现 `shared.` 跨 namespace 越权读）
         let prefix = format!("shared.{}.", self.sediment_config.namespace);
@@ -5261,10 +5340,11 @@ impl AgentRunner {
         for (fact, _) in &latest {
             recalled_ids.push(fact.fact_id);
             recalled_content.push_str(&format!(
-                "[Fact {}] {}: {}\n",
+                "[Fact {}] {}: {}{}\n",
                 fact.fact_id,
                 fact.path,
-                serde_json::to_string(&fact.value).unwrap_or_default()
+                serde_json::to_string(&fact.value).unwrap_or_default(),
+                Self::auto_recall_provenance(fact)
             ));
         }
 
@@ -7322,7 +7402,7 @@ impl AgentRunner {
                                                                }
                                                                // B21:tool_result(error;内容与 transcript 回喂消息一致)
                                                                if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                                   if let Err(e) = j.tool_result(cid, "error", &err_content) {
+                                                                   if let Err(e) = j.tool_result(cid, "error", &err_content, runner.execution_profile_marker()) {
                                                                        warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
                                                                    }
                                                                }
@@ -7353,7 +7433,7 @@ impl AgentRunner {
                                                        }
                                                        // B21:tool_result(ok;content = 工具输出全文与 transcript 一致)
                                                        if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                           if let Err(e) = j.tool_result(cid, "ok", &raw_content) {
+                                                           if let Err(e) = j.tool_result(cid, "ok", &raw_content, runner.execution_profile_marker()) {
                                                                warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
                                                            }
                                                        }
@@ -7534,7 +7614,7 @@ impl AgentRunner {
                                                    GateOutcome::Reject(detail) => {
                                                        warn!(%session_id, %detail, "acceptance gate rejected instruction submission");
                                                        if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                           if let Err(e) = j.tool_result(cid, "rejected", &detail) {
+                                                           if let Err(e) = j.tool_result(cid, "rejected", &detail, runner.execution_profile_marker()) {
                                                                warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
                                                            }
                                                        }
@@ -7681,7 +7761,7 @@ impl AgentRunner {
                                                        yield Ok(AgentEvent::Error(e.clone()));
                                                        // B21:tool_result(error;工具尝试已失败,补记保重放完整)
                                                        if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                           if let Err(je) = j.tool_result(cid, "error", &e.to_string()) {
+                                                           if let Err(je) = j.tool_result(cid, "error", &e.to_string(), runner.execution_profile_marker()) {
                                                                warn!(%session_id, call_id = %cid, error = %je, "tool_result journal failed");
                                                            }
                                                        }
@@ -7743,7 +7823,7 @@ impl AgentRunner {
 
                                                // B21:tool_result(ok;content = 工具输出全文与 io_response 一致)
                                                if let (Some(j), Some(cid)) = (&journal, j_call_id.as_ref()) {
-                                                   if let Err(e) = j.tool_result(cid, "ok", &extracted_raw) {
+                                                   if let Err(e) = j.tool_result(cid, "ok", &extracted_raw, runner.execution_profile_marker()) {
                                                        warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
                                                    }
                                                }

@@ -393,7 +393,7 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        let resp = self.core.check_response_full(resp).await?;
+        self.core.check_response_full(resp).await?;
 
         Ok(())
     }
@@ -454,7 +454,7 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        let resp = self.core.check_response_full(resp).await?;
+        self.core.check_response_full(resp).await?;
 
         Ok(())
     }
@@ -727,7 +727,7 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        let resp = self.core.check_response_full(resp).await?;
+        self.core.check_response_full(resp).await?;
 
         Ok(())
     }

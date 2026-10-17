@@ -562,6 +562,9 @@ fn cmd_run(
             .await
             .map(|r| {
                 r.with_capability_boundary(capability_boundary)
+                    // O-493:定义级显式声明的执行环境 profile 随 tool_result 落账;
+                    // 未声明=None=落账无标记(缺省语义零变化)
+                    .with_execution_profile_marker(def.execution_profile.as_deref())
                     // CLI run 主路径 delegate+journal 接线——serve 面
                     // (agent_api.rs run 端点)完整先例的镜像。此前 CLI 只接
                     // capability_boundary+wire_accounting:general.json 等声明了
@@ -620,26 +623,7 @@ fn cmd_run(
             )),
             None,
         )
-    } else if {
-        // 档位解析单源(与 serve 面同口径):定义级优先,未指定回落设置键
-        // approval.mode.shellExec(manual/auto_policy/policy 之外不计)
-        let def_mode = def.approval_mode.clone();
-        match def_mode {
-            Some(m) => Some(m),
-            None => evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
-                .ok()
-                .and_then(|s| {
-                    let (merged, _) = s.merged();
-                    merged
-                        .get("approval.mode.shellExec")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                })
-                .filter(|v| v == "manual" || v == "auto_policy" || v == "policy"),
-        }
-        .as_deref()
-            == Some("policy")
-    } {
+    } else if approval_policy_mode_resolved(&def, workdir) {
         let policy_path = workdir.join(".evo").join("approval-policy.toml");
         match evo_agent::agent::approval_policy::ApprovalPolicyFile::load(&policy_path) {
             Ok(policy) => {
@@ -721,6 +705,31 @@ fn cmd_run(
     // 任务已结束,停止监听 Ctrl+C
     cancel_handle.abort();
     exit
+}
+
+/// 档位解析单源(与 serve 面同口径):定义级优先,未指定回落设置键
+/// approval.mode.shellExec(manual/auto_policy/policy 之外不计)。
+/// 返回是否解析为 policy 档。
+fn approval_policy_mode_resolved(
+    def: &evo_agent::agent::definition::AgentDefinition,
+    workdir: &Path,
+) -> bool {
+    let def_mode = def.approval_mode.clone();
+    match def_mode {
+        Some(m) => Some(m),
+        None => evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+            .ok()
+            .and_then(|s| {
+                let (merged, _) = s.merged();
+                merged
+                    .get("approval.mode.shellExec")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|v| v == "manual" || v == "auto_policy" || v == "policy"),
+    }
+    .as_deref()
+        == Some("policy")
 }
 
 /// 解析 agent 产出中的围栏 JSON 代码块(取最后一个 ```json 或 ``` 围栏块)
@@ -3000,26 +3009,7 @@ fn run_repl_turn(
             std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
             None,
         )
-    } else if {
-        // 档位解析单源(与 serve 面同口径):定义级优先,未指定回落设置键
-        // approval.mode.shellExec(manual/auto_policy/policy 之外不计)
-        let def_mode = def.approval_mode.clone();
-        match def_mode {
-            Some(m) => Some(m),
-            None => evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
-                .ok()
-                .and_then(|s| {
-                    let (merged, _) = s.merged();
-                    merged
-                        .get("approval.mode.shellExec")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                })
-                .filter(|v| v == "manual" || v == "auto_policy" || v == "policy"),
-        }
-        .as_deref()
-            == Some("policy")
-    } {
+    } else if approval_policy_mode_resolved(def, workdir) {
         let policy_path = workdir.join(".evo").join("approval-policy.toml");
         match evo_agent::agent::approval_policy::ApprovalPolicyFile::load(&policy_path) {
             Ok(policy) => {
