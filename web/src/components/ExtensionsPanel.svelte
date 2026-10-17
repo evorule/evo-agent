@@ -11,7 +11,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     listPendingSkills,
     approveSkill,
     revokeSkill,
-    readFile,
+    importSkillBundle,
     getOrchestrationAgents,
   } from '../lib/api.js';
   import { activePath, sidebarView, extensionsBadge } from '../lib/stores.js';
@@ -27,6 +27,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
   let detailName = $state(null); // 展开的待审批项(正文必读)
   let importPath = $state('');
   let importMsg = $state('');
+  let importing = $state(false);
 
   async function refresh() {
     loading = true;
@@ -69,7 +70,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     }
   }
 
-  /** bundle 导入:读工作区内 bundle 文件 → 走技能包导入(文件内容直呈审批,人在环) */
+  /** bundle 导入:serve 解包落盘 → 扫描即 discovered → 待审批组出现(人在环) */
   async function doImport() {
     importMsg = '';
     const p = importPath.trim();
@@ -77,13 +78,22 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
       importMsg = '请填写工作区内 bundle 文件路径(如 data/skills/xx.bundle.json)';
       return;
     }
+    importing = true;
     try {
-      const d = await readFile(p);
-      // bundle 原文进待审预览:导入即发现,批准才生效(人在环)
-      importMsg = `已读取 ${p}(${(d.content || '').length} 字符)——技能包导入经 serve 工具面落 discovered 态,请在「待审批」组过目后批准`;
+      const r = await importSkillBundle(p);
+      const bad = (r.results || []).filter((x) => x.status === 'rejected');
+      if (r.imported > 0) {
+        importMsg = `已导入 ${r.imported} 项到待审批组${bad.length ? `；${bad.length} 项被拒: ${bad.map((x) => `${x.name}(${x.reason})`).join('；')}` : ''}——请在「待审批」组过目正文后批准(导入≠生效)`;
+      } else if (bad.length) {
+        importMsg = `导入被拒: ${bad.map((x) => `${x.name}(${x.reason})`).join('；')}`;
+      } else {
+        importMsg = 'bundle 内无可导入项';
+      }
       await refresh();
     } catch (e) {
       importMsg = '导入失败:' + String(e?.message || e);
+    } finally {
+      importing = false;
     }
   }
 
@@ -118,7 +128,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
         placeholder="bundle 文件路径(工作区内)"
         bind:value={importPath}
       />
-      <button class="ext-import-btn" onclick={doImport}>导入</button>
+      <button class="ext-import-btn" onclick={doImport} disabled={importing}>{importing ? '导入中…' : '导入'}</button>
     </div>
     {#if importMsg}
       <div class="ext-import-msg">{importMsg}</div>
