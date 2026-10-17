@@ -373,8 +373,11 @@ impl HttpGetTool {
         if attempt.previous().len() > max_redirects as usize {
             return attempt.error("redirect limit exceeded");
         }
-        match Self::check_redirect_target_with_policy(attempt.url(), allow_http, allow_private_hosts)
-        {
+        match Self::check_redirect_target_with_policy(
+            attempt.url(),
+            allow_http,
+            allow_private_hosts,
+        ) {
             Ok(()) => attempt.follow(),
             Err(reason) => attempt.error(reason),
         }
@@ -384,8 +387,11 @@ impl HttpGetTool {
     async fn fetch(&self, url: &str) -> IoResult {
         // G7:redirect 策略按实例配置(上限/放宽旗标)闭包捕获——重定向
         // 与首跳同源单策略,不构成第二放宽通道
-        let (allow_http, allow_private, max_redirects) =
-            (self.allow_http, self.allow_private_hosts, self.max_redirects);
+        let (allow_http, allow_private, max_redirects) = (
+            self.allow_http,
+            self.allow_private_hosts,
+            self.max_redirects,
+        );
         let client = reqwest::Client::builder()
             .timeout(self.timeout)
             .connect_timeout(Duration::from_secs(5))
@@ -993,7 +999,9 @@ mod tests {
         let from_cfg = HttpGetTool::new()
             .with_timeout(crate::agent::definition::HttpGetToolConfig::default().timeout_secs)
             .with_max_bytes(crate::agent::definition::HttpGetToolConfig::default().max_bytes)
-            .with_max_redirects(crate::agent::definition::HttpGetToolConfig::default().max_redirects);
+            .with_max_redirects(
+                crate::agent::definition::HttpGetToolConfig::default().max_redirects,
+            );
         // 缺省策略下既有判定全部保持:http 拒/内网拒/元数据拒/公网 candidate
         for url in [
             "http://example.com/foo",
@@ -1007,7 +1015,10 @@ mod tests {
                 "default config must not change classification of {url}"
             );
             assert!(
-                matches!(from_cfg.classify_for_agent(url), HostCategory::Blocked { .. }),
+                matches!(
+                    from_cfg.classify_for_agent(url),
+                    HostCategory::Blocked { .. }
+                ),
                 "{url} must stay blocked under default config"
             );
         }
@@ -1073,7 +1084,10 @@ mod tests {
             "https://0.0.0.0/x",
         ] {
             assert!(
-                matches!(relaxed.classify_for_agent(url), HostCategory::Blocked { .. }),
+                matches!(
+                    relaxed.classify_for_agent(url),
+                    HostCategory::Blocked { .. }
+                ),
                 "{url} must NEVER be relaxed (metadata/unspecified)"
             );
         }
@@ -1095,14 +1109,30 @@ mod tests {
         // 缺省配置过门卫
         assert!(HttpGetToolConfig::default().validate().is_ok());
         // 荒谬值 fail-fast
-        assert!(HttpGetToolConfig { timeout_secs: 0, ..Default::default() }
-            .validate().is_err());
-        assert!(HttpGetToolConfig { timeout_secs: 301, ..Default::default() }
-            .validate().is_err());
-        assert!(HttpGetToolConfig { max_bytes: 0, ..Default::default() }
-            .validate().is_err());
-        assert!(HttpGetToolConfig { max_redirects: 11, ..Default::default() }
-            .validate().is_err());
+        assert!(HttpGetToolConfig {
+            timeout_secs: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(HttpGetToolConfig {
+            timeout_secs: 301,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(HttpGetToolConfig {
+            max_bytes: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(HttpGetToolConfig {
+            max_redirects: 11,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
         // serde 缺省:空对象 = 全缺省值(零变化)
         let cfg: HttpGetToolConfig = serde_json::from_value(Value::Object(Default::default()))
             .expect("empty config must deserialize with defaults");

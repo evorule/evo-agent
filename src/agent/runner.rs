@@ -1414,8 +1414,7 @@ impl AgentRunner {
         //   工具内置现值;SSRF 云元数据红线与 GET-only 永不放宽)。
         // 无任何声明=实例不替换(零影响)。
         {
-            let mut tool =
-                crate::builtin_tools::http_get::HttpGetTool::new();
+            let mut tool = crate::builtin_tools::http_get::HttpGetTool::new();
             let mut customized = false;
             if let Some(hosts) = &def.http_get_allowed_hosts {
                 if !hosts.is_empty() {
@@ -3582,8 +3581,10 @@ impl AgentRunner {
                     client.clone(),
                 ),
             );
-            self.tool_handler
-                .register_static(crate::agent::memory_tombstone_tool::MEMORY_TOMBSTONE_TOOL, exec);
+            self.tool_handler.register_static(
+                crate::agent::memory_tombstone_tool::MEMORY_TOMBSTONE_TOOL,
+                exec,
+            );
             tracing::debug!("memory_tombstone tool re-bound (session-scoped, sensitive write)");
         }
         // 审计查询接线：audit_query 占位→wired。门控同上；
@@ -5305,11 +5306,10 @@ impl AgentRunner {
     /// Unix 秒）——value 非 MemoryRecord 形态（手工/老数据）无时点，仅标
     /// 来源会话。标注让 LLM 与人能区分「新近确证」与「陈年残留」。
     fn auto_recall_provenance(fact: &crate::api::evorule_client::SharedFactEntry) -> String {
-        let recorded_at = serde_json::from_value::<crate::agent::memory::MemoryRecord>(
-            fact.value.clone(),
-        )
-        .ok()
-        .map(|r| r.timestamp);
+        let recorded_at =
+            serde_json::from_value::<crate::agent::memory::MemoryRecord>(fact.value.clone())
+                .ok()
+                .map(|r| r.timestamp);
         match recorded_at {
             Some(ts) => format!(
                 " (source_session: {}, recorded_at: {ts})",

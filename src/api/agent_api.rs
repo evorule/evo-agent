@@ -2433,7 +2433,7 @@ fn synth_replay_events(
     tool_outputs: &[String],
     session_id: &str,
 ) -> Vec<crate::agent::memory_event::event::MemoryEvent> {
-    use crate::agent::journal::{JournalEvent, evorule_digest};
+    use crate::agent::journal::{evorule_digest, JournalEvent};
     use crate::agent::memory_event::event::{EventSource, EventType, MemoryEvent};
 
     // invoked 骨架:call_id → (tool 名, 分发序)
@@ -2520,17 +2520,14 @@ async fn synthesize_replay_from_journal(
 
     // transcript 原文(尽力取;tool 消息按执行序与 journal 分发序对位,
     // 与 ATIF 导出的 transcript 对位法同构)
-    let tool_outputs: Vec<String> = crate::api::session_index::load_transcript(
-        &state.evorule_client,
-        session_id,
-        "default",
-    )
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .filter(|m| m.role == "tool")
-    .map(|m| m.content)
-    .collect();
+    let tool_outputs: Vec<String> =
+        crate::api::session_index::load_transcript(&state.evorule_client, session_id, "default")
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content)
+            .collect();
 
     synth_replay_events(&lines, &tool_outputs, session_id)
 }
@@ -2929,7 +2926,7 @@ mod tests {
     /// O-493:本地兜底合成——call_id 配对 + 分发序对位 + digest 复算防伪
     #[test]
     fn test_synth_replay_events_pairs_and_digest_guard() {
-        use crate::agent::journal::{JournalEvent, JournalLine, evorule_digest};
+        use crate::agent::journal::{evorule_digest, JournalEvent, JournalLine};
         let mk = |seq: u64, ts: u64, event: JournalEvent| JournalLine { seq, ts, event };
         let content = r#"{"price":185.35}"#;
         let lines = vec![

@@ -179,8 +179,11 @@ mod tests {
         assert!(validate_args(&json!({"path": "  "}), "default").is_err());
         assert!(validate_args(&json!({"path": "shared.default.stable.x"}), "default").is_err());
         assert!(
-            validate_args(&json!({"path": "shared.default.stable.x", "reason": "   "}), "default")
-                .is_err(),
+            validate_args(
+                &json!({"path": "shared.default.stable.x", "reason": "   "}),
+                "default"
+            )
+            .is_err(),
             "空 reason 视同缺失"
         );
     }
