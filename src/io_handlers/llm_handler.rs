@@ -608,11 +608,20 @@ fn to_openai_wire_messages(messages: serde_json::Value) -> serde_json::Value {
                 if let Some(imgs) = obj.get("images").and_then(|v| v.as_array()) {
                     if !imgs.is_empty() {
                         let mut parts: Vec<serde_json::Value> = Vec::with_capacity(imgs.len() + 1);
-                        let text = converted.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        let text = converted
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         parts.push(serde_json::json!({"type": "text", "text": text}));
                         for img in imgs {
-                            let mime = img.get("mime_type").and_then(|v| v.as_str()).unwrap_or("image/png");
-                            let data = img.get("data_base64").and_then(|v| v.as_str()).unwrap_or("");
+                            let mime = img
+                                .get("mime_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("image/png");
+                            let data = img
+                                .get("data_base64")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
                             if data.is_empty() {
                                 continue;
                             }
@@ -918,10 +927,7 @@ mod tests {
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[0]["text"], "fp");
         assert_eq!(parts[1]["type"], "image_url");
-        assert_eq!(
-            parts[1]["image_url"]["url"],
-            "data:image/png;base64,QUJD"
-        );
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,QUJD");
         assert!(tool.get("images").is_none(), "sideband key must be removed");
     }
 

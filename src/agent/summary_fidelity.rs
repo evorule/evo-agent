@@ -55,7 +55,10 @@ pub fn extract_anchors(dropped: &[Message]) -> Vec<String> {
     }
     // 工具结论锚：工具名×结果首句（截断）
     for m in dropped {
-        if let Message::Tool { content, tool_name, .. } = m {
+        if let Message::Tool {
+            content, tool_name, ..
+        } = m
+        {
             let first_sentence = content
                 .split(['.', '。', '\n'])
                 .find(|s| !s.trim().is_empty())

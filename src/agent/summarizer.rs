@@ -308,7 +308,10 @@ fn observation_annotations(dropped: &[Message], goal: &str) -> String {
     }
     let mut rows: Vec<(f32, String)> = Vec::new();
     for (idx, msg) in dropped.iter().enumerate() {
-        if let Message::Tool { content, tool_name, .. } = msg {
+        if let Message::Tool {
+            content, tool_name, ..
+        } = msg
+        {
             let w = observation_value_weight(tool_name, content, goal);
             rows.push((
                 w,

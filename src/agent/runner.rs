@@ -177,10 +177,7 @@ fn extract_images_from_raw(
             .get("data_base64")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if data.is_empty()
-            || data.len() > B1_MAX_IMAGE_B64_CHARS
-            || !mime.starts_with("image/")
-        {
+        if data.is_empty() || data.len() > B1_MAX_IMAGE_B64_CHARS || !mime.starts_with("image/") {
             omitted += 1;
             continue;
         }
@@ -216,10 +213,7 @@ fn extract_images_from_raw(
 
     map.remove("images");
     if !fingerprints.is_empty() {
-        map.insert(
-            "images_extracted".to_string(),
-            Value::Array(fingerprints),
-        );
+        map.insert("images_extracted".to_string(), Value::Array(fingerprints));
     }
     if omitted > 0 {
         map.insert("images_omitted".to_string(), Value::from(omitted));
@@ -289,7 +283,10 @@ fn enforce_window_image_budget(messages: &mut [Message], max_total_b64: usize) -
         if running <= max_total_b64 {
             break;
         }
-        if let Message::Tool { content, images, .. } = msg {
+        if let Message::Tool {
+            content, images, ..
+        } = msg
+        {
             let mut dropped_here = 0usize;
             while !images.is_empty() && running > max_total_b64 {
                 let img = images.remove(0);
@@ -4036,10 +4033,8 @@ impl AgentRunner {
 
         // B1:窗口图片总量预算(8MB base64 计)——超限从最旧图开始丢,注记进发送副本
         // (messages_to_send 为发送副本,不动权威面)
-        let dropped_images = enforce_window_image_budget(
-            &mut messages_to_send,
-            B1_WINDOW_IMAGE_BUDGET_B64,
-        );
+        let dropped_images =
+            enforce_window_image_budget(&mut messages_to_send, B1_WINDOW_IMAGE_BUDGET_B64);
         if dropped_images > 0 {
             info!(dropped = dropped_images, "B1: window image budget enforced");
         }
@@ -4285,8 +4280,10 @@ impl AgentRunner {
         // 回喂 LLM 的入列值按上限截断;审计链持久化保留原始全文(事实记录)
         // B1:先提取旁路图片+瘦身(指纹替换 base64),回喂/持久化两面统一用
         // 瘦身后文本(审计链存指纹不存 base64;图片本体内容寻址落盘)
-        let (tool_images, extracted_raw) =
-            extract_images_from_raw(&tool_result.to_string(), std::path::Path::new(B1_IMAGES_DIR));
+        let (tool_images, extracted_raw) = extract_images_from_raw(
+            &tool_result.to_string(),
+            std::path::Path::new(B1_IMAGES_DIR),
+        );
         let raw_content = extracted_raw.clone();
         let tool_msg = Message::Tool {
             content: truncate_tool_result(raw_content.clone(), self.tool_result_max_chars),
@@ -8286,7 +8283,12 @@ fn clear_tool_results(region: &[Message], max_clear: usize) -> (Vec<Message>, us
     let mut cleared = 0usize;
     for (i, msg) in out.iter_mut().enumerate() {
         if clear_set.contains(&i) {
-            if let Message::Tool { content, tool_name, images } = msg {
+            if let Message::Tool {
+                content,
+                tool_name,
+                images,
+            } = msg
+            {
                 *content = format!("[cleared: {tool_name}]");
                 // B1:图片属窗口大头,清 content 必须连带清旁路图,防预算门被架空
                 *images = Vec::new();
