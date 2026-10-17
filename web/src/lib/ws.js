@@ -63,6 +63,7 @@ govS4Notify.subscribe((n) => {
 async function recoverFromDeadSession(rawError) {
   finishStream();
   turnActive.set(false);
+  disconnect(); // 先摘 socket,防 onclose 退避重连用死 sid 与自愈重建竞态
   pushPanelEvent('gov', {
     label: 'SessionRebuilt',
     detail: `死会话自愈重建:${String(rawError).slice(0, 100)}`,
@@ -80,7 +81,9 @@ async function recoverFromDeadSession(rawError) {
     }
   }
   newSession(); // 清屏/清 artifacts/清 pendingRebuild + connect('new')
-  pendingNotice = `已自动重建会话——正在续发刚才的消息${block ? '(历史已回注)' : ''}。`;
+  pendingNotice = failedUserText
+    ? `已自动重建会话——正在续发刚才的消息${block ? '(历史已回注)' : ''}。`
+    : '原会话已失效，已自动新建会话。';
   if (failedUserText) {
     // 先于 SessionCreated 就位(newSession 入口清的是旧态,此为新建态)
     pendingRebuild = { block, autoSend: true, userText: failedUserText };
@@ -101,13 +104,41 @@ function wsUrl(sid) {
   return url;
 }
 
+// WS 非主动断开自动重连(指数退避 1s→2s→…→30s 封顶;连上即清零)
+let reconnectAttempts = 0;
+let reconnectTimer = null;
+let currentSid = 'new'; // 最近连接目标(断连自动重连复用)
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  const delay = Math.min(1000 * 2 ** reconnectAttempts, 30000);
+  reconnectAttempts += 1;
+  // 提示降噪:首次断连必提示,其后每 5 次重试提示一次(状态区恒可见连接态)
+  if (reconnectAttempts === 1 || reconnectAttempts % 5 === 0) {
+    pushMessage({
+      kind: 'error',
+      text: `连接已断开，${Math.round(delay / 1000)}s 后自动重连(第 ${reconnectAttempts} 次)…`,
+    });
+  }
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect(currentSid);
+  }, delay);
+}
+
 export function connect(sid) {
   disconnect();
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  currentSid = sid || 'new';
   connStatus.set('connecting');
-  ws = new WebSocket(wsUrl(sid));
+  ws = new WebSocket(wsUrl(currentSid));
 
   ws.onopen = () => {
     connStatus.set('online');
+    reconnectAttempts = 0; // 连上即清零,下次断连从 1s 重新退避
     // 恢复意图待发:resume 换线(openSession)后连接刚建立,此处补发恢复帧
     if (pendingResume) {
       pendingResume = false;
@@ -118,6 +149,9 @@ export function connect(sid) {
     connStatus.set('offline');
     turnActive.set(false);
     ws = null;
+    // 非主动断开(disconnect 已置空 onclose,走到此处即被动断)
+    // → 显式提示 + 指数退避自动重连;主动换线/newSession 的 connect 入口会清计时器
+    scheduleReconnect();
   };
   ws.onerror = () => connStatus.set('offline');
   ws.onmessage = (ev) => {

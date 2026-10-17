@@ -123,6 +123,10 @@ impl ApiCore {
     }
 
     /// Check response status; return error on non-2xx.
+    ///
+    /// 旧口径（存量保留，公共语义不变）：错误 message 恒为空串、
+    /// 404 特判 `SessionNotFound`。**新代码请用 [`Self::check_response_full`]**
+    /// （错误 body 详情透出 + 404 不特判，LLM 消费方可自诊断）。
     pub(crate) async fn check_response(&self, resp: &Response) -> Result<(), ApiError> {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();

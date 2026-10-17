@@ -52,7 +52,8 @@
     "handover_read",
     "session_spawn",
     "delegate",
-    "mcp_*"
+    "mcp_*",
+    "inference_*"
   ],
   "skills": [
     {

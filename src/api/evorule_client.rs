@@ -129,7 +129,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -155,7 +155,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -169,7 +169,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -191,7 +191,7 @@ impl EvoruleApiClient {
             .json(args)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -263,7 +263,7 @@ impl EvoruleApiClient {
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await.map_err(|_| ApiError::InvalidResponse)?;
         let username = result["user"]["username"]
@@ -299,7 +299,7 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         let session_id = result["session_id"]
@@ -337,7 +337,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().post(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         let session_id = result["session_id"]
@@ -362,7 +362,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await.map_err(|_| ApiError::InvalidResponse)?;
         let sid = result["session_id"]
@@ -393,7 +393,7 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         Ok(())
     }
@@ -422,7 +422,7 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -454,7 +454,7 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         Ok(())
     }
@@ -487,7 +487,7 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         Ok(body.get("fact_id").and_then(|f| f.as_u64()))
     }
@@ -520,7 +520,7 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         let success = body
             .get("success")
@@ -558,7 +558,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -579,7 +579,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -607,7 +607,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Vec<FactEntry> = resp.json().await?;
         Ok(result)
@@ -629,7 +629,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Vec<SharedFactEntry> = resp.json().await?;
         Ok(result)
@@ -644,7 +644,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -699,7 +699,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: SharedFactEntry = resp.json().await?;
         Ok(result)
@@ -727,7 +727,7 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         Ok(())
     }
@@ -745,7 +745,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         let fact_ids: Vec<u64> = result["fact_ids"]
@@ -771,7 +771,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         let sessions: Vec<u64> = result["sessions"]
@@ -793,7 +793,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -817,7 +817,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -836,7 +836,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -872,7 +872,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -892,7 +892,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -909,7 +909,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         let valid = result["verified"]
@@ -937,7 +937,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -959,7 +959,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result = resp.json().await?;
         Ok(result)
@@ -983,7 +983,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result = resp.json().await?;
         Ok(result)
@@ -1009,7 +1009,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -1035,7 +1035,7 @@ impl EvoruleApiClient {
             .json(data)
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -1057,7 +1057,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.bytes().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -1087,7 +1087,7 @@ impl EvoruleApiClient {
             .body(gz.to_vec())
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -1105,7 +1105,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -1124,7 +1124,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().post(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -1139,7 +1139,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().post(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -1156,7 +1156,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
@@ -1173,7 +1173,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Vec<Value> = resp.json().await?;
         Ok(result)
@@ -1208,7 +1208,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
         Ok(resp.json().await?)
     }
 
@@ -1227,7 +1227,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -1272,7 +1272,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -1291,7 +1291,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -1310,7 +1310,7 @@ impl EvoruleApiClient {
             .auth_header(self.core.client().get(&url))
             .send()
             .await?;
-        self.core.check_response(&resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
         Ok(result)
@@ -1618,6 +1618,32 @@ mod tests {
     fn test_client_new() {
         let client = make_test_client();
         assert_eq!(client.core.base_url(), "http://localhost:8080");
+    }
+
+    #[tokio::test]
+    async fn test_error_body_detail_surfaces_on_400() {
+        // 非 2xx 时 server 统一错误 {"error": "..."} 详情透出（LLM 自诊断面）；
+        // 旧口径 message 恒空串导致校验失败详情丢失
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", "/api/services")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"参数 units 须为字符串数组"}"#)
+            .create_async()
+            .await;
+        let client = EvoruleApiClient::new(&server.url());
+        match client.list_services().await {
+            Err(ApiError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(
+                    message.contains("units"),
+                    "错误详情应透出 server 文案，得到: {message:?}"
+                );
+            }
+            other => panic!("应为 ApiError::ApiError{{400,..}}，得到: {other:?}"),
+        }
+        m.assert_async().await;
     }
 
     // ===== B1 FactEntry 契约修复测试 =====
