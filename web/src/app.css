@@ -233,3 +233,23 @@ a:hover {
 .no-theme-transition *::after {
   transition: none !important;
 }
+
+/* =====================================================================
+   调试装饰(F3 运行和调试):断点圆点 + stopped 命中行
+   主题 token 驱动(明暗双主题自动适配,B11 三通道)
+   ===================================================================== */
+.dap-bp-glyph {
+  background: var(--danger);
+  border-radius: 50%;
+  width: 9px !important;
+  height: 9px !important;
+  margin-left: 5px;
+  cursor: pointer;
+}
+.dap-stopped-line {
+  background: var(--warning-bg);
+}
+.dap-stopped-arrow {
+  border-left: 3px solid var(--warning);
+  margin-left: 2px;
+}

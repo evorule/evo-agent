@@ -25,6 +25,7 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
     setBaseline,
   } from '../lib/modelRegistry.js';
   import { uriSpecFor } from '../lib/diagnostics.js';
+  import { attachDebugDecorations } from '../lib/dap/decorations.js';
   import { resolveMode } from '../lib/theme.js';
   import { notifySaved } from '../lib/lsp/index.js';
 
@@ -39,6 +40,7 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
   /** 已挂 hook 的 model(同 model 多组引用时防重复订阅) */
   const hookedModels = new Set();
   let currentPath = null;
+  let disposeDebugDecor = null; // 调试装饰清理函数(onMount 赋值)
   let activePathLocal = group.activePath || null;
   let groupPaths = group.paths || [];
 
@@ -194,6 +196,9 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
 
   onMount(() => {
     setupMonaco();
+    // 调试装饰(断点 gutter 圆点+stopped 行高亮+gutter 点击增删;F3)——
+    // 本组件的 editor 是文件编辑的真实实例(EditorPane 的 editor 是设置/diff 宿主)
+    disposeDebugDecor = attachDebugDecorations({ monaco, editor, pathFromUri: pathOfModel });
     const o = appearance();
     editor = monaco.editor.create(hostEl, {
       theme: o.theme,
@@ -224,6 +229,7 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
   }
 
   onDestroy(() => {
+    disposeDebugDecor?.(); // 调试装饰清理(先于 editor.dispose 摘订阅)
     if (editor) editor.dispose();
   });
 </script>

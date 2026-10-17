@@ -15,6 +15,7 @@
   import ScmView from './components/ScmView.svelte';
   import OrchestrationPanel from './components/OrchestrationPanel.svelte';
   import ExtensionsPanel from './components/ExtensionsPanel.svelte';
+  import DebugView from './components/DebugView.svelte';
   import EditorPane from './components/EditorPane.svelte';
   import BottomPanel from './components/BottomPanel.svelte';
   import ChatSidebar from './components/ChatSidebar.svelte';
@@ -667,6 +668,8 @@
         <OrchestrationPanel />
       {:else if $sidebarView === 'extensions'}
         <ExtensionsPanel />
+      {:else if $sidebarView === 'debug'}
+        <DebugView />
       {/if}
     </div>
     <div class="center">

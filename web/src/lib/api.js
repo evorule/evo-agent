@@ -163,6 +163,11 @@ export function getLspStatus() {
   return fetch('/api/lsp/status', { headers: headers() }).then(unwrap);
 }
 
+/** DAP 白名单适配器清单(运行和调试板块;fail-closed:缺省空) */
+export function getDapAdapters() {
+  return fetch('/api/dap/adapters', { headers: headers() }).then(unwrap);
+}
+
 /** LLM 配置只读快照(脱敏;响应体不携带任何密钥内容) */
 export function getLlmStatus() {
   return fetch('/admin/llm-status', { headers: headers() }).then(unwrap);
