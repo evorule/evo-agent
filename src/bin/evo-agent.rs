@@ -354,27 +354,6 @@ fn run_with_big_stack(f: impl FnOnce() -> ExitCode + Send + 'static) -> ExitCode
     })
 }
 
-/// serve 启动期单次桥接专用：在 16 MB 专用栈线程上自建 current-thread runtime
-/// 并驱动闭包（O-511 修复，替代裸建临时 runtime——主线程 1MB 栈对深链不安全；
-/// 闭包持有值进出线程，注册结果可写回调用方持有态）。
-fn bridge_on_big_stack<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce(&tokio::runtime::Runtime) -> T + Send + 'static,
-    T: Send + 'static,
-{
-    with_big_stack(move || -> Result<T, String> {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => return Err(format!("failed to build tokio runtime: {e}")),
-        };
-        Ok(f(&rt))
-    })
-    .and_then(|inner| inner)
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     // 0. 加载 .env(若存在;已设置的环境变量优先,不覆盖)——结构性修复的
@@ -412,14 +391,19 @@ fn main() -> ExitCode {
             auth_token,
             no_auth,
             read_root,
-        } => cmd_serve(
-            &cli.workdir,
-            &host,
-            port,
-            &auth_token,
-            no_auth,
-            read_root.as_deref(),
-        ),
+        } => run_with_big_stack(move || {
+            // O-513 修复：serve 与 run/patrol/workflow 同款走 16MB 大栈线程
+            // ——启动期 service-tools 注册与 MCP 连接在 cmd_serve 内建的
+            // serve 主 runtime 上 block_on 驱动，深链不再依赖临时 runtime 桥接
+            cmd_serve(
+                &cli.workdir,
+                &host,
+                port,
+                &auth_token,
+                no_auth,
+                read_root.as_deref(),
+            )
+        }),
         Command::Patrol {
             session,
             workspace,
@@ -2054,31 +2038,37 @@ fn cmd_serve(
         &workspace_client,
         &evorule_client,
     );
+    // O-513 修复：多线程 runtime 提前到启动期注册/连接之前构建——service-tools
+    // 注册与 MCP 连接直接在本 runtime 上 block_on 驱动（本函数整体运行在
+    // 16MB 大栈线程，见 main() 的 run_with_big_stack 包装），连接产物（含
+    // stdio reader task）终身留在 serve runtime，不再跨临时 runtime 逃逸
+    // （O-511 期的临时 current-thread runtime 桥接在真实 stdio I/O 后 drop
+    // 永久挂死，已废除）。
+    // 6. 多线程 runtime(server 需要并发处理请求)
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to build tokio runtime: {}", e);
+            return ExitCode::from(1);
+        }
+    };
     // 服务消费桥:按白名单把 server 插件服务注册为代理工具
     // (注册失败降级继续并明示影响,不阻塞 server 启动)
     if !config.evorule.service_tools.is_empty() {
-        // O-511 修复：临时 runtime 统一走大栈线程（原主线程 1MB 栈对深链不安全）；
-        // 注册结果写回 serve 持有的 toolkit（白名单/客户端快照随闭包进出线程）
         let whitelist = config.evorule.service_tools.clone();
         let client = evorule_client.clone();
-        let mut snapshot = toolkit.clone();
-        match bridge_on_big_stack(move |rt| {
-            let result = rt.block_on(evo_agent::service_tools::register_service_tools(
-                &mut snapshot,
-                &client,
-                &whitelist,
-            ));
-            (result, snapshot)
-        }) {
-            Ok((Ok(n), registered)) => {
-                eprintln!("[service-tools] {n} service tool(s) registered");
-                toolkit = registered;
-            }
-            Ok((Err(e), _)) => {
-                eprintln!("[service-tools] 服务工具注册失败,serve 面无服务工具: {e}")
-            }
+        let result = runtime.block_on(evo_agent::service_tools::register_service_tools(
+            &mut toolkit,
+            &client,
+            &whitelist,
+        ));
+        match result {
+            Ok(n) => eprintln!("[service-tools] {n} service tool(s) registered"),
             Err(e) => {
-                eprintln!("[service-tools] 临时大栈线程失败,serve 面无服务工具: {e}")
+                eprintln!("[service-tools] 服务工具注册失败,serve 面无服务工具: {e}")
             }
         }
     }
@@ -2109,24 +2099,20 @@ fn cmd_serve(
             );
         } else {
             mcp_enabled = true;
-            // O-511 修复：临时 runtime 统一走大栈线程（原主线程 1MB 栈对深链不安全）；
-            // 注册结果写回 serve 持有的 toolkit（MCP manager/配置快照随闭包进出线程）
-            let manager = std::sync::Arc::clone(&mcp_manager);
-            let servers = mcp_cfgs.servers.clone();
-            let server_count = servers.len();
-            let mut snapshot = toolkit.clone();
-            match bridge_on_big_stack(move |rt| {
-                let n = rt.block_on(manager.connect_and_register_all(&mut snapshot, &servers));
-                eprintln!(
-                    "[mcp] {}/{} server(s) connected, tools registered into serve toolkit",
-                    n,
-                    server_count
-                );
-                snapshot
-            }) {
-                Ok(registered) => toolkit = registered,
-                Err(e) => eprintln!("[mcp] 临时大栈线程失败,serve 面无 MCP 工具: {e}"),
-            }
+            // O-513 修复：连接注册直接在 serve 主 runtime 上 block_on 驱动
+            // （连接产物含 stdio reader task 终身留在本 runtime，与 restart/
+            // reload 端点通路同构；原临时 runtime 桥接已废除——真实 stdio
+            // I/O 后其 drop 在 Windows 管道路径永久挂死）。失败隔离语义不变
+            // （manager 内部逐 server 落 failed 不阻塞启动）。
+            let server_count = mcp_cfgs.servers.len();
+            let n = runtime.block_on(
+                mcp_manager
+                    .connect_and_register_all(&mut toolkit, &mcp_cfgs.servers),
+            );
+            eprintln!(
+                "[mcp] {}/{} server(s) connected, tools registered into serve toolkit",
+                n, server_count
+            );
         }
     }
     let toolkit_tool_count = toolkit.tool_names().len();
@@ -2347,18 +2333,6 @@ fn cmd_serve(
         .fallback_service(workbench)
         .layer(CorsLayer::permissive())
         .layer(RequestBodyLimitLayer::new(1024 * 1024));
-
-    // 6. 多线程 runtime(server 需要并发处理请求)
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("failed to build tokio runtime: {}", e);
-            return ExitCode::from(1);
-        }
-    };
 
     // console 审计页 sidecar 自动拉起(配置化,fail-soft)。
     // workbench.console_dir 配置 console-cloud 仓目录后,serve 启动期探测端口,
