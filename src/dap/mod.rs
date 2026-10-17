@@ -66,6 +66,7 @@ pub fn adapters_from_settings(v: Option<&Value>) -> Vec<(String, AdapterSpec)> {
 
 /// 适配器进程（透传泵持有 stdin/stdout；stderr 丢弃——DAP 无 stderr 协议语义）
 pub struct AdapterProcess {
+    /// 适配器进程 PID（spawn 后回填；诊断/审计展示用，None=未取到）
     pub pid: Option<u32>,
     stdin: tokio::process::ChildStdin,
     stdout: crate::lsp::transport::FrameReader<tokio::process::ChildStdout>,
@@ -108,6 +109,7 @@ impl AdapterProcess {
         })
     }
 
+    /// 终止适配器进程（best-effort：已退出则静默）
     pub fn kill(&mut self) {
         self.child.start_kill().ok();
     }
@@ -137,7 +139,7 @@ pub async fn run_bridge(
     spec: AdapterSpec,
     workdir: PathBuf,
     mut incoming: mpsc::Receiver<String>,
-    mut outgoing: mpsc::Sender<String>,
+    outgoing: mpsc::Sender<String>,
 ) -> SessionEnd {
     let mut proc = match AdapterProcess::spawn(&spec, &workdir).await {
         Ok(p) => p,
@@ -156,16 +158,12 @@ pub async fn run_bridge(
     loop {
         tokio::select! {
             text = incoming.recv() => match text {
-                Some(t) => {
-                    if write_in_frame(&mut proc.stdin, &t).await {
-                        if let Err(e) = proc.child.try_wait() {
-                            let _ = outgoing.send(format!("{{\"type\":\"dap_error\",\"message\":\"{e}\"}}")).await;
-                        }
-                    } else {
-                        return SessionEnd::ClientClosed;
+                Some(t) if write_in_frame(&mut proc.stdin, &t).await => {
+                    if let Err(e) = proc.child.try_wait() {
+                        let _ = outgoing.send(format!("{{\"type\":\"dap_error\",\"message\":\"{e}\"}}")).await;
                     }
                 }
-                None => return SessionEnd::ClientClosed,
+                Some(_) | None => return SessionEnd::ClientClosed,
             },
             frame = proc.stdout.next_frame() => match frame {
                 Ok(body) => {
@@ -229,7 +227,9 @@ mod tests {
     #[test]
     fn adapters_from_string_form_setting_key() {
         // 注册表形态:dap.adapters 为 String(JSON 文本)——对象形态修复前此路径恒空
-        let s = json!(r#"{"python": {"command": "py", "args": ["-m", "debugpy.adapter"], "langs": ["python"]}}"#);
+        let s = json!(
+            r#"{"python": {"command": "py", "args": ["-m", "debugpy.adapter"], "langs": ["python"]}}"#
+        );
         let out = adapters_from_settings(Some(&s));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "python");

@@ -18,18 +18,22 @@
 //! | `GET /api/skills/pending` | discovered 项 + 正文预览（审批前必读，人工过目 = 供应链闸口） |
 //! | `POST /api/skills/approve` | 泄露检查（署名硬拦 / 技术词警告）→ blake3 落账 → active |
 //! | `POST /api/skills/revoke` | 状态置 revoked（下会话 manifest 移除；账本保留历史行） |
+//! | `POST /api/skills/import` | skill-pack bundle 解包落盘 → 计算态 discovered（导入≠生效，人在环在 approve） |
 //!
 //! 工作台管理 UI 留 IDE 化批；本面 REST 即可操作（curl / REST 消费面先例充分）。
 //! 鉴权随路由面（`/api/skills*` 不进 PUBLIC_PATHS，默认 Bearer token 内）。
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::agent::definition::parse_skill_frontmatter;
 use crate::agent::skill_store::{
     check_skill_leaks, hash_skill_file_prefixed, merge_skill_manifest, parse_skill_body,
     scan_skills_dir, SkillLevel, SkillRegistry, SkillStatus,
 };
 use crate::api::agent_api::AgentApiState;
+use crate::api::human_gate::CallerIdentity;
 
 /// 用户级 skill 目录（serve workdir 相对，运行时资产，gitignore 管辖）
 pub fn user_skills_dir(state: &AgentApiState) -> std::path::PathBuf {
@@ -113,6 +117,250 @@ pub struct SkillNameRequest {
     /// 操作者（可选；v1 无操作者身份体系，缺省 local-operator）
     #[serde(default)]
     pub operator: Option<String>,
+}
+
+/// bundle 导入请求体（`POST /api/skills/import`）
+#[derive(Debug, Deserialize)]
+pub struct SkillImportRequest {
+    /// 工作区内 skill-pack bundle 文件路径（JSON；复用 B7 同源路径语义）
+    pub path: String,
+}
+
+/// bundle 内单条 skill 条目
+#[derive(Debug, Deserialize)]
+pub struct SkillImportEntry {
+    /// 技能名（= skill 子目录名；`[a-zA-Z0-9][a-zA-Z0-9_-]*`，防路径穿越）
+    pub name: String,
+    /// 来源级："user" | "project"
+    pub level: String,
+    /// SKILL.md 全文（含 frontmatter 围栏）
+    pub body: String,
+}
+
+/// bundle 文件 v1 格式：`{ "skills": [ { name, level, body } ] }`
+#[derive(Debug, Deserialize)]
+pub struct SkillImportBundle {
+    /// 技能条目列表（空数组整体 400）
+    pub skills: Vec<SkillImportEntry>,
+}
+
+/// 单条导入结果
+#[derive(Debug, Serialize)]
+pub struct SkillImportResult {
+    /// 技能名
+    pub name: String,
+    /// 来源级（"user" | "project"）
+    pub level: String,
+    /// 落盘的 SKILL.md 绝对路径
+    pub path: String,
+    /// 状态："imported"（落盘，待审批）| "rejected"（reason 随行）
+    pub status: String,
+    /// rejected 时的原因（imported 时缺省）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `POST /api/skills/import` — skill-pack bundle 导入 → 解包落盘 skills 目录
+///
+/// F2-D1 闭环：导入 = 把 bundle 内 SKILL.md 写入 `<skills_dir>/<name>/SKILL.md`，
+/// 扫描即计算态 discovered → 待审批组出现 → approve 既有链生效（导入≠生效，
+/// 人在环兜底在 approve 侧：泄露检查 + blake3 落账）。
+///
+/// - bundle 路径必须在工作区内（canonicalize 越界拒；对齐 B7 文件面语义）
+/// - name 非法（含路径分隔/穿越）→ 该项 rejected；frontmatter 不可解析 → rejected
+/// - 同名同 level 账本行已 active/revoked → rejected（已审批内容不静默覆盖；
+///   先 revoke 或改名）——discovered（账本无行）允许重导入覆盖（内容更新语义）
+/// - HumanGate：写面语义，落人工账（op="skills_import"）
+pub async fn import_skills(
+    State(state): State<AgentApiState>,
+    Json(req): Json<SkillImportRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // 写面人工账（对齐 file_api gate_write 语义）
+    let identity = crate::api::human_gate::ensure_write_allowed(state.auth_config());
+    let gate = |outcome: &str| {
+        state.human_gate().record(
+            "skills_import",
+            CallerIdentity::Anonymous,
+            &req.path,
+            outcome,
+        );
+    };
+    if let Err(e) = identity {
+        gate("denied");
+        return Err((e.0, Json(serde_json::json!({ "error": e.1 }))));
+    }
+
+    // bundle 路径越界守卫（工作区内；canonicalize 防穿越）
+    let bundle_path = state.workdir().join(&req.path);
+    let canon = bundle_path.canonicalize().map_err(|e| {
+        gate("error");
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("bundle file '{}' unreadable: {}", req.path, e)
+            })),
+        )
+    })?;
+    let workdir_canon = state
+        .workdir()
+        .canonicalize()
+        .unwrap_or_else(|_| state.workdir().to_path_buf());
+    if !canon.starts_with(&workdir_canon) {
+        gate("error");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("bundle path '{}' escapes workspace", req.path)
+            })),
+        ));
+    }
+
+    let raw = std::fs::read_to_string(&canon).map_err(|e| {
+        gate("error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("bundle '{}' unreadable: {}", req.path, e)
+            })),
+        )
+    })?;
+    let bundle: SkillImportBundle = serde_json::from_str(&raw).map_err(|e| {
+        gate("error");
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("bundle '{}' is not a valid skill-pack ({{skills:[{{name,level,body}}]}}): {}", req.path, e)
+            })),
+        )
+    })?;
+    if bundle.skills.is_empty() {
+        gate("error");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "bundle contains no skills" })),
+        ));
+    }
+
+    // 账本一次加载：同名同 level 已 active/revoked → 拒（不静默覆盖已审批内容）
+    let registry = SkillRegistry::load(&registry_path(&state)).map_err(|e| {
+        gate("error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+    })?;
+
+    let name_re = regex_lite_skill_name();
+    let mut results: Vec<SkillImportResult> = Vec::new();
+    for entry in bundle.skills {
+        let mut item = |status: &str, path: String, reason: Option<String>| {
+            results.push(SkillImportResult {
+                name: entry.name.clone(),
+                level: entry.level.clone(),
+                path,
+                status: status.to_string(),
+                reason,
+            });
+        };
+        // name 安全面：仅字母数字下划线连字符，首字符字母数字（防穿越/隐藏目录）
+        if !name_re.is_match(&entry.name) {
+            item(
+                "rejected",
+                String::new(),
+                Some(format!("invalid skill name '{}'", entry.name)),
+            );
+            continue;
+        }
+        let Some(level) = level_from_str(&entry.level) else {
+            item(
+                "rejected",
+                String::new(),
+                Some(format!("invalid level '{}' (user|project)", entry.level)),
+            );
+            continue;
+        };
+        // frontmatter 可解析（导入对象必须是合法 skill；正文级问题留给 approve 泄露检查）
+        let fm = match parse_skill_frontmatter(&entry.body) {
+            Ok(fm) => fm,
+            Err(e) => {
+                item("rejected", String::new(), Some(e));
+                continue;
+            }
+        };
+        // frontmatter name 与条目 name 一致性（防钓鱼：目录名≠声明名）
+        if let Some(declared) = &fm.name {
+            if declared != &entry.name {
+                item(
+                    "rejected",
+                    String::new(),
+                    Some(format!(
+                        "frontmatter name '{}' mismatches entry name '{}'",
+                        declared, entry.name
+                    )),
+                );
+                continue;
+            }
+        }
+        // 已审批内容保护
+        if let Some(row) = registry.find(&entry.name, level) {
+            if matches!(row.status, SkillStatus::Active | SkillStatus::Revoked) {
+                item(
+                    "rejected",
+                    String::new(),
+                    Some(format!(
+                        "skill '{}' is {} — revoke it first or use another name (approved content is not silently overwritten)",
+                        entry.name,
+                        match row.status {
+                            SkillStatus::Active => "active",
+                            _ => "revoked",
+                        }
+                    )),
+                );
+                continue;
+            }
+        }
+        // 落盘 `<skills_dir>/<name>/SKILL.md`（子目录式，市面惯例一致）
+        let dir = match level {
+            SkillLevel::User => user_skills_dir(&state),
+            SkillLevel::Project => project_skills_dir(&state),
+        };
+        let skill_dir = dir.join(&entry.name);
+        let write = std::fs::create_dir_all(&skill_dir)
+            .and_then(|_| std::fs::write(skill_dir.join("SKILL.md"), &entry.body));
+        match write {
+            Ok(()) => item(
+                "imported",
+                skill_dir.join("SKILL.md").display().to_string(),
+                None,
+            ),
+            Err(e) => item(
+                "rejected",
+                String::new(),
+                Some(format!("write failed: {}", e)),
+            ),
+        }
+    }
+
+    let imported = results.iter().filter(|r| r.status == "imported").count();
+    gate("ok");
+    tracing::info!(
+        bundle = %req.path,
+        imported,
+        total = results.len(),
+        "skill bundle imported (pending approval; import != activate)"
+    );
+    Ok(Json(serde_json::json!({
+        "bundle": req.path,
+        "imported": imported,
+        "results": results,
+    })))
+}
+
+/// skill 名合法形态（单次编译缓存；防路径穿越/隐藏目录）
+fn regex_lite_skill_name() -> &'static regex::Regex {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$").unwrap())
 }
 
 /// approve 成功响应
@@ -511,6 +759,7 @@ pub fn skills_routes() -> axum::Router<AgentApiState> {
         .route("/api/skills/pending", get(list_pending_skills))
         .route("/api/skills/approve", post(approve_skill))
         .route("/api/skills/revoke", post(revoke_skill))
+        .route("/api/skills/import", post(import_skills))
 }
 
 /// 会话创建装配链入口（PR-3 接线用）：扫描 + 账本核对 + 两源合并的
@@ -561,15 +810,74 @@ mod tests {
         )
     }
 
+    /// human 身份(写面放行;对齐 file_api mutation_state——auth enabled 即中间件
+    /// 已验 token 语义)。bundle 导入是写面(HumanGate),测试须经此构造。
+    fn human_state(workdir: std::path::PathBuf) -> AgentApiState {
+        make_state(workdir).with_auth_config(crate::api::auth::AuthConfig::new(
+            vec!["test-token".to_string()],
+            true,
+        ))
+    }
+
+    /// human_state + router_with_auth(bundle 导入测试专用;`router()` 会用
+    /// AuthConfig::disabled 覆盖 state 的 auth config,导致写面门恒 403)
+    fn human_router(workdir: std::path::PathBuf) -> axum::Router {
+        let auth = crate::api::auth::AuthConfig::new(vec!["test-token".to_string()], true);
+        crate::api::agent_api::router_with_auth(human_state(workdir), auth)
+    }
+
     fn write_skill(workdir: &std::path::Path, level_dir: &str, name: &str, body: &str) {
         let sub = workdir.join(level_dir).join(name);
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("SKILL.md"), body).unwrap();
     }
 
-    async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    /// 带认证的 POST(human_state 测试用;token 须与 AuthConfig 配置一致)
+    #[allow(dead_code)]
+    async fn post_authed(
+        app: axum::Router,
+        uri: &str,
+        json: serde_json::Value,
+        token: &str,
+    ) -> (StatusCode, serde_json::Value) {
         let resp = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(json.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        get_authed(app, uri, None).await
+    }
+
+    /// 带认证的 GET(human_router 测试用)
+    async fn get_authed(
+        app: axum::Router,
+        uri: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = axum::http::Request::builder().uri(uri);
+        if let Some(t) = token {
+            builder = builder.header("authorization", format!("Bearer {t}"));
+        }
+        let resp = app
+            .oneshot(builder.body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = resp.status();
@@ -948,5 +1256,175 @@ mod tests {
         assert!(has_read_skill);
         assert_eq!(manifest.len(), 1);
         assert_eq!(manifest[0].name, "proj-flow");
+    }
+
+    // =========================================================================
+    // bundle 导入（F2-D1 闭环：导入→discovered→approve 全链）
+    // =========================================================================
+
+    /// 写 bundle 文件到工作区并返回其相对路径
+    fn write_bundle(workdir: &std::path::Path, rel: &str, bundle: serde_json::Value) -> String {
+        let p = workdir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bundle.to_string()).unwrap();
+        rel.to_string()
+    }
+
+    #[tokio::test]
+    async fn test_import_bundle_lands_discovered_then_approve_activates() {
+        // DoD 全链:bundle 导入 → pending 出现 → approve → active
+        let tmp = tempfile::tempdir().unwrap();
+        let app = human_router(tmp.path().to_path_buf());
+        let rel = write_bundle(
+            tmp.path(),
+            "data/skills/pack.bundle.json",
+            serde_json::json!({
+                "skills": [
+                    {"name": "git-discipline", "level": "user", "body": CLEAN_SKILL}
+                ]
+            }),
+        );
+
+        let (status, body) = post_authed(
+            app.clone(),
+            "/api/skills/import",
+            serde_json::json!({"path": rel}),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {}", body);
+        assert_eq!(body["imported"], 1);
+        assert_eq!(body["results"][0]["status"], "imported");
+        // 落盘形态:<skills_dir>/<name>/SKILL.md
+        assert!(tmp
+            .path()
+            .join("data/skills/git-discipline/SKILL.md")
+            .exists());
+
+        // 导入即发现:计算态 discovered,待审批组出现(正文预览随行)
+        let (_, inv) = get_authed(app.clone(), "/api/skills", Some("test-token")).await;
+        assert_eq!(inv["skills"][0]["status"], "discovered");
+        let (_, pending) = get_authed(app.clone(), "/api/skills/pending", Some("test-token")).await;
+        assert_eq!(pending["pending"][0]["name"], "git-discipline");
+
+        // 既有审批链照常生效
+        let (status, body) = post_authed(
+            app.clone(),
+            "/api/skills/approve",
+            serde_json::json!({"name": "git-discipline", "level": "user"}),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "active");
+
+        // 已审批内容保护:再导入同名 → rejected(不静默覆盖)
+        let (_, body) = post_authed(
+            app,
+            "/api/skills/import",
+            serde_json::json!({"path": rel}),
+            "test-token",
+        )
+        .await;
+        assert_eq!(body["imported"], 0);
+        assert_eq!(body["results"][0]["status"], "rejected");
+        assert!(body["results"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("active"));
+    }
+
+    #[tokio::test]
+    async fn test_import_rejects_path_traversal_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = human_router(tmp.path().to_path_buf());
+        let rel = write_bundle(
+            tmp.path(),
+            "evil.bundle.json",
+            serde_json::json!({
+                "skills": [
+                    {"name": "../evil", "level": "user", "body": CLEAN_SKILL}
+                ]
+            }),
+        );
+        let (status, body) = post_authed(
+            app,
+            "/api/skills/import",
+            serde_json::json!({"path": rel}),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "per-item reject, not whole-request");
+        assert_eq!(body["imported"], 0);
+        assert_eq!(body["results"][0]["status"], "rejected");
+        // 越界目录未创建
+        assert!(!tmp.path().join("data/skills").join("evil").exists());
+    }
+
+    #[tokio::test]
+    async fn test_import_rejects_bad_frontmatter_and_bundle_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = human_router(tmp.path().to_path_buf());
+        // frontmatter 损坏项 rejected
+        let rel = write_bundle(
+            tmp.path(),
+            "bad.bundle.json",
+            serde_json::json!({
+                "skills": [
+                    {"name": "no-fm", "level": "user", "body": "没有围栏的正文"}
+                ]
+            }),
+        );
+        let (_, body) = post_authed(
+            app.clone(),
+            "/api/skills/import",
+            serde_json::json!({"path": rel}),
+            "test-token",
+        )
+        .await;
+        assert_eq!(body["results"][0]["status"], "rejected");
+
+        // bundle 路径越界 → 400(文件须存在才触发 escape 检查,否则 404)
+        let outside = tmp
+            .path()
+            .parent()
+            .unwrap()
+            .join("__wuying_escape_test.bundle.json");
+        std::fs::write(&outside, "{}").unwrap();
+        let (status, body) = post_authed(
+            app,
+            "/api/skills/import",
+            serde_json::json!({"path": "../__wuying_escape_test.bundle.json"}),
+            "test-token",
+        )
+        .await;
+        let _ = std::fs::remove_file(&outside);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("escapes"));
+    }
+
+    #[tokio::test]
+    async fn test_import_anonymous_denied_403() {
+        // 写面纪律:anonymous(auth disabled)一律 403,文件未被触碰
+        // (对齐 file_api anonymous 拒绝路径;真机已实测 anonymous 拒)
+        let tmp = tempfile::tempdir().unwrap();
+        let app = router(make_state(tmp.path().to_path_buf())); // 无 auth = anonymous
+        let rel = write_bundle(
+            tmp.path(),
+            "data/skills/anon.bundle.json",
+            serde_json::json!({
+                "skills": [
+                    {"name": "should-not-land", "level": "user", "body": CLEAN_SKILL}
+                ]
+            }),
+        );
+        let (status, body) =
+            post(app, "/api/skills/import", serde_json::json!({"path": rel})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["error"].as_str().unwrap().contains("read-only"));
+        assert!(
+            !tmp.path().join("data/skills/should-not-land").exists(),
+            "denied import must not touch skills dir"
+        );
     }
 }
