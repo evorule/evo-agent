@@ -381,3 +381,12 @@ export function revokeSkill(name, level) {
     body: JSON.stringify({ name, level }),
   }).then(unwrap);
 }
+
+/** skill-pack bundle 导入(解包落盘→discovered 待审批;导入≠生效) */
+export function importSkillBundle(path) {
+  return fetch('/api/skills/import', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ path }),
+  }).then(unwrap);
+}
