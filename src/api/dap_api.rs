@@ -24,11 +24,10 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::api::agent_api::AgentApiState;
 use crate::dap::{adapters_from_settings, AdapterSpec};
-use crate::governance::TerminalAction;
 
 /// WS 帧大小上限（与 LSP WS 门同款 4MB；DAP 消息远小于此，超限断开）
 const WS_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
