@@ -27,8 +27,13 @@ param(
     # international endpoint; use https://api.minimax.cn/v1/text/chatcompletion_v2
     # for China-mainland keys.
     [string]$ApiBase = "",
-    # evorule-server release to fetch (pinned for reproducibility)
-    [string]$ServerVersion = "v0.5.0"
+    # evorule-server release to fetch (pinned for reproducibility).
+    # "latest" resolves the newest Gitee release at runtime.
+    [string]$ServerVersion = "v0.10.0",
+    # Port for the demo evorule-server instance (default matches the
+    # deployment default; override when the default is occupied).
+    [ValidateRange(1024, 65535)]
+    [int]$ServerPort = 18080
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,7 +41,7 @@ $repo = $PSScriptRoot
 Set-Location $repo
 $demoDir = Join-Path $repo ".demo"
 $serverDir = Join-Path $demoDir "server"
-$serverPort = 18080
+$serverPort = $ServerPort
 $serverUrl = "http://127.0.0.1:$serverPort"
 
 $failed = $false
@@ -69,13 +74,24 @@ if ($serverUp) {
     Write-Host "  a demo server started by this script manages the token for you."
 } else {
     if (-not (Test-Path (Join-Path $serverDir "evorule-server.exe"))) {
-        Write-Host "downloading evorule-server $ServerVersion from Gitee..."
+        $resolvedVersion = $ServerVersion
+        if ($resolvedVersion -eq "latest") {
+            Write-Host "resolving latest evorule-server release from Gitee..."
+            $rel = Invoke-RestMethod -Uri "https://gitee.com/api/v5/repos/evorule/evorule-server/releases/latest" -UseBasicParsing
+            if (-not $rel.tag_name) {
+                Write-Host "FAIL: could not resolve latest release from Gitee API"
+                exit 1
+            }
+            $resolvedVersion = $rel.tag_name
+            Write-Host "  latest = $resolvedVersion"
+        }
+        Write-Host "downloading evorule-server $resolvedVersion from Gitee..."
         New-Item -ItemType Directory -Force -Path $demoDir | Out-Null
         # Gitee Release asset names carry the version without the "v" prefix
-        # (tag v0.5.0 -> asset evorule-server-0.5.0-win64.zip)
-        $ver = $ServerVersion.TrimStart("v")
+        # (tag v0.10.0 -> asset evorule-server-0.10.0-win64.zip)
+        $ver = $resolvedVersion.TrimStart("v")
         $zip = Join-Path $demoDir "evorule-server-$ver-win64.zip"
-        $dl = "https://gitee.com/evorule/evorule-server/releases/download/$ServerVersion/evorule-server-$ver-win64.zip"
+        $dl = "https://gitee.com/evorule/evorule-server/releases/download/$resolvedVersion/evorule-server-$ver-win64.zip"
         Invoke-WebRequest -Uri $dl -OutFile $zip -UseBasicParsing
         Expand-Archive -Path $zip -DestinationPath $serverDir -Force
         Remove-Item $zip
