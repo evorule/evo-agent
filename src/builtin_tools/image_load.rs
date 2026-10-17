@@ -56,10 +56,7 @@ impl ImageLoadTool {
             Some("image/jpeg")
         } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
             Some("image/gif")
-        } else if bytes.len() >= 12
-            && &bytes[0..4] == b"RIFF"
-            && &bytes[8..12] == b"WEBP"
-        {
+        } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
             Some("image/webp")
         } else {
             None
@@ -89,8 +86,7 @@ impl ImageLoadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required arg: path (string)".to_string())?;
 
-        let safe_path =
-            crate::builtin_tools::fs_safety::resolve_existing(&self.workdir, path)?;
+        let safe_path = crate::builtin_tools::fs_safety::resolve_existing(&self.workdir, path)?;
 
         let metadata = std::fs::metadata(&safe_path).map_err(|e| format!("stat failed: {}", e))?;
 
@@ -106,8 +102,7 @@ impl ImageLoadTool {
             ));
         }
 
-        let bytes = std::fs::read(&safe_path)
-            .map_err(|e| format!("read failed: {}", e))?;
+        let bytes = std::fs::read(&safe_path).map_err(|e| format!("read failed: {}", e))?;
 
         let mime = Self::sniff_mime(&bytes).ok_or_else(|| {
             "not a recognized image (magic check failed; supported: PNG/JPEG/GIF/WEBP)".to_string()

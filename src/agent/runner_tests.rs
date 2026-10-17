@@ -2576,7 +2576,9 @@ fn test_g15_rec_to_message_tool_long_content_truncated() {
     };
     let msg = rec_to_message(&rec, max_chars).expect("tool rec should convert");
     match msg {
-        Message::Tool { content, tool_name, .. } => {
+        Message::Tool {
+            content, tool_name, ..
+        } => {
             assert_eq!(tool_name, "search");
             assert!(
                 content.contains("[truncated 100 chars]"),
@@ -4603,13 +4605,15 @@ fn test_b1_extract_keeps_valid_image_with_fingerprint_and_file() {
     ]})
     .to_string();
 
-    let (images, cleaned) =
-        extract_images_from_raw(&raw, dir.path());
+    let (images, cleaned) = extract_images_from_raw(&raw, dir.path());
     assert_eq!(images.len(), 1);
     assert_eq!(images[0].mime_type, "image/png");
     // 原键被指纹替换
     let obj: serde_json::Value = serde_json::from_str(&cleaned).unwrap();
-    assert!(obj.get("images").is_none(), "raw images key must be removed");
+    assert!(
+        obj.get("images").is_none(),
+        "raw images key must be removed"
+    );
     let fps = obj.get("images_extracted").unwrap().as_array().unwrap();
     assert_eq!(fps.len(), 1);
     let fp = fps[0].get("fingerprint").unwrap().as_str().unwrap();

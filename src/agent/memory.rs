@@ -1053,7 +1053,9 @@ impl MessageRecord {
                 timestamp,
                 fact_id: None,
             },
-            Message::Tool { content, tool_name, .. } => Self {
+            Message::Tool {
+                content, tool_name, ..
+            } => Self {
                 idx,
                 role: "tool".to_string(),
                 content: content.clone(),
