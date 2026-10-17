@@ -718,6 +718,7 @@ impl Config {
             merge_field(table, "api_key", &mut self.llm.api_key)?;
             merge_field(table, "model", &mut self.llm.model)?;
             merge_field(table, "api_base", &mut self.llm.api_base)?;
+            merge_field(table, "executor_url", &mut self.llm.executor_url)?;
             merge_field(table, "timeout_secs", &mut self.llm.timeout_secs)?;
             merge_field(table, "max_retries", &mut self.llm.max_retries)?;
         }
@@ -830,6 +831,7 @@ impl Config {
         if !self.evorule.api_key.is_empty() {
             self.evorule.api_key = resolve_env_placeholder(&self.evorule.api_key)?;
         }
+        self.llm.executor_url = resolve_env_placeholder(&self.llm.executor_url)?;
         Ok(())
     }
 
@@ -860,6 +862,7 @@ impl Config {
         if !self.evorule.api_key.is_empty() {
             self.evorule.api_key = resolve_env_placeholder_lenient(&self.evorule.api_key);
         }
+        self.llm.executor_url = resolve_env_placeholder_lenient(&self.llm.executor_url);
     }
 
     /// 验证配置值的合法性
@@ -891,6 +894,20 @@ impl Config {
                 reason: format!(
                     "must start with http:// or https://, got '{}'",
                     self.evorule.base_url
+                ),
+            });
+        }
+
+        // llm executor_url 必须是 http:// 或 https:// 开头(出站请求的
+        // 实际目标,装载期拦截格式错误,避免运行期重试空转)
+        if !self.llm.executor_url.starts_with("http://")
+            && !self.llm.executor_url.starts_with("https://")
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "llm.executor_url".to_string(),
+                reason: format!(
+                    "must start with http:// or https://, got '{}'",
+                    self.llm.executor_url
                 ),
             });
         }
@@ -950,6 +967,20 @@ impl Config {
                 reason: format!(
                     "must start with http:// or https://, got '{}'",
                     self.evorule.base_url
+                ),
+            });
+        }
+
+        // llm executor_url 必须是 http:// 或 https:// 开头(出站请求的
+        // 实际目标,装载期拦截格式错误,避免运行期重试空转)
+        if !self.llm.executor_url.starts_with("http://")
+            && !self.llm.executor_url.starts_with("https://")
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "llm.executor_url".to_string(),
+                reason: format!(
+                    "must start with http:// or https://, got '{}'",
+                    self.llm.executor_url
                 ),
             });
         }
@@ -1209,6 +1240,73 @@ model = "gpt-4o"
         assert_eq!(cfg.llm.model, "gpt-4o");
         // 未被覆盖(保留 default)
         assert_eq!(cfg.evorule.base_url, "http://localhost:18080");
+    }
+
+    #[test]
+    fn test_llm_section_all_fields_roundtrip_from_toml() {
+        // llm 段全字段声明锁:toml 显式声明的每个字段都必须被合并采纳。
+        // 此后给 LlmConfig 增字段时若遗漏合并清单,本测试即红——防止
+        // 「字段在结构体上存在、toml 值被静默忽略」这类配置面缺陷复发
+        let _lock = ENV_LOCK.lock().unwrap();
+        let exec_snap = std::env::var("EVORULE_LLM_EXECUTOR_URL").ok();
+        std::env::remove_var("EVORULE_LLM_EXECUTOR_URL");
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("evo-agent.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[llm]
+provider = "openai"
+api_key = "k1"
+model = "m1"
+api_base = "https://api.example.com/v1"
+executor_url = "http://127.0.0.1:9999/llm/execute"
+timeout_secs = 11
+max_retries = 7
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.merge_from_file(&toml_path).unwrap();
+        assert_eq!(cfg.llm.provider, "openai");
+        assert_eq!(cfg.llm.api_key, "k1");
+        assert_eq!(cfg.llm.model, "m1");
+        assert_eq!(cfg.llm.api_base, "https://api.example.com/v1");
+        assert_eq!(cfg.llm.executor_url, "http://127.0.0.1:9999/llm/execute");
+        assert_eq!(cfg.llm.timeout_secs, 11);
+        assert_eq!(cfg.llm.max_retries, 7);
+
+        match exec_snap {
+            Some(v) => std::env::set_var("EVORULE_LLM_EXECUTOR_URL", v),
+            None => std::env::remove_var("EVORULE_LLM_EXECUTOR_URL"),
+        }
+    }
+
+    #[test]
+    fn test_validate_executor_url_must_be_http() {
+        let mut cfg = Config::default();
+        cfg.llm.executor_url = "ftp://nope".to_string();
+        let result = cfg.validate();
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "llm.executor_url"
+        ));
+        // 宽松模式同口径(base_url 同族校验,只读命令同样拦截格式错误)
+        assert!(cfg.validate_lenient().is_err());
+    }
+
+    #[test]
+    fn test_llm_executor_url_env_placeholder_resolved() {
+        // executor_url 值支持 ${ENV:VAR} 占位符(字段文档契约;严格解析,
+        // env 未设置时装载 fail-closed 而非静默产出空 URL)
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TEST_EVO_EXECUTOR_77", "http://127.0.0.1:9310/llm/execute");
+        let mut cfg = Config::default();
+        cfg.llm.executor_url = "${ENV:TEST_EVO_EXECUTOR_77}".to_string();
+        cfg.resolve_env_placeholders().unwrap();
+        assert_eq!(cfg.llm.executor_url, "http://127.0.0.1:9310/llm/execute");
+        std::env::remove_var("TEST_EVO_EXECUTOR_77");
     }
 
     #[test]
