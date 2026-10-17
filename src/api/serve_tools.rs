@@ -1395,10 +1395,8 @@ service_tools = ["config_persist", "rule_sandbox"]
         // 空切片 = 显式全收敛(合法意志,不做二次解释)
         let (ws, ev) = make_clients();
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
-        let mut filtered = build_filtered_toolkit(
-            &union,
-            &["file_read".to_string(), "git_status".to_string()],
-        );
+        let mut filtered =
+            build_filtered_toolkit(&union, &["file_read".to_string(), "git_status".to_string()]);
         apply_request_tool_allowlist(&mut filtered, &[]).unwrap();
         assert_eq!(filtered.tool_names().len(), 0);
     }

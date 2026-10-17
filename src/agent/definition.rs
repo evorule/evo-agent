@@ -849,7 +849,8 @@ impl AgentDefinition {
         }
         // http_get 配置节门卫(G7 配置化:fail-fast 拒荒谬值,防静默失联)
         if let Some(cfg) = &self.http_get_config {
-            cfg.validate().map_err(AgentDefinitionError::InvalidDefinition)?;
+            cfg.validate()
+                .map_err(AgentDefinitionError::InvalidDefinition)?;
         }
         // M5-a:capability_boundary 语义门卫(单一事实源 + 模式/工具一致性)
         if let Some(b) = &self.capability_boundary {
