@@ -96,6 +96,14 @@ fn latest_by_path(
     latest.into_values().collect()
 }
 
+/// 落账时点提取（O-487③，纯展示层）：value 为 MemoryRecord 形态（sediment
+/// 写入）时取其 timestamp（Unix 秒）；手工/老数据形态无时点 → None。
+fn recorded_at_of(value: &Value) -> Option<u64> {
+    serde_json::from_value::<crate::agent::memory::MemoryRecord>(value.clone())
+        .ok()
+        .map(|r| r.timestamp)
+}
+
 /// `memory_recall` 执行体（多分区读取 → query 过滤 → 新序排序 → limit 截断）
 pub(crate) async fn memory_recall_exec(
     namespace: &str,
@@ -139,6 +147,7 @@ pub(crate) async fn memory_recall_exec(
                 "fact_id": f.fact_id,
                 "version": f.version,
                 "source_session_id": f.source_session_id,
+                "recorded_at": recorded_at_of(&f.value),
                 "value": f.value,
             })
         })
@@ -258,6 +267,20 @@ mod tests {
         assert_eq!(got.len(), 2);
         let a = got.iter().find(|e| e.path == "a").unwrap();
         assert_eq!(a.fact_id, 2, "version 3 wins over 1/2");
+    }
+
+    #[test]
+    fn test_recorded_at_of_memory_record_vs_plain_value() {
+        // MemoryRecord 形态（sediment 写入）→ 落账时点可提取
+        let record = json!({
+            "key": "stable.llm.m3.prefers_dark",
+            "value": "用户偏好暗色主题",
+            "timestamp": 1790000000u64,
+        });
+        assert_eq!(recorded_at_of(&record), Some(1_790_000_000));
+        // 非 MemoryRecord 形态（手工/老数据）→ 无时点
+        assert_eq!(recorded_at_of(&json!("plain text")), None);
+        assert_eq!(recorded_at_of(&json!({"other": 1})), None);
     }
 
     #[test]

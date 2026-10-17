@@ -15,7 +15,7 @@
 //! - **命名空间**：`ns=gov` 固定（§八风险 3），与 `__memory__` /
 //!   `shared.{agent_ns}` 隔离；路径 `shared.gov.{ns}.{event_kind}.{ts}.{seq}`。
 //! - **隐私边界**：gov value 为摘要+引用级，不存指令/产物全文（全文已在
-//! journal 与会话事实，gov 只存治理摘要+指针）。
+//!   journal 与会话事实，gov 只存治理摘要+指针）。
 //!
 //! 事件源接线（hooks）沿 PR2 交付；本模块（PR1）交付骨架：事件 schema、
 //! seq 分配、路径构造、best-effort 写入与会话管理。

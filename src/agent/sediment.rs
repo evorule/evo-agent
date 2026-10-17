@@ -123,6 +123,11 @@ pub struct SedimentDeps<'a> {
     /// journal 全量行（会话收尾投影消费；调用方经 `JournalWriter::read_lines`
     /// 预读，读取失败=空集如实降级）
     pub journal_lines: Vec<JournalLine>,
+    /// O-487①:实况工具注册表快照（工具名清单，runner 调用侧从 tool_handler
+    /// 取）。stable fact 落账前，工具清单类断言（available_tools / *_tool_exists /
+    /// capability_*）对照本表校验，不符拒写+warn（错误结论不固化）；
+    /// 空表=无锚，清单类断言一律拒写
+    pub available_tools: Vec<String>,
 }
 
 /// 沉淀结果
@@ -155,6 +160,45 @@ pub struct SedimentResult {
     /// S-5 收尾批：成功提议到治理数据集的候选 event_id 列表
     /// （Draft 回执=提议凭据；失败/不达标候选不在此列，保持原态下批重试）
     pub knowledge_proposed: Vec<String>,
+}
+
+/// O-487①:工具清单类稳定事实的实况校验锚（拒写优先，不降级）
+///
+/// stable fact 的 key/value 命中工具清单类模式（available_tools /
+/// *_tool_exists / capability_*）时，落账前对照实况工具注册表校验：
+/// - `*_tool_exists`：断言的工具名不在注册表 → 拒写；
+/// - available_tools / capability_* 清单断言：value 中确证不出任何注册表内
+///   工具名（不可确证）→ 拒写；
+/// - 注册表为空（无锚）→ 清单类断言一律拒写。
+///
+/// 未命中模式的正常领域事实不受影响。拒写语义：错误结论不固化最忠实，
+/// warn 留痕不降级写入。
+fn tool_claim_rejected(key: &str, value: &str, registry: &[String]) -> bool {
+    let registry_lower: std::collections::HashSet<String> =
+        registry.iter().map(|t| t.to_lowercase()).collect();
+    let key_lower = key.to_lowercase();
+    let value_lower = value.to_lowercase();
+
+    let hits_tool_exists = key_lower.ends_with("_tool_exists");
+    let hits_list_claim = key_lower.contains("available_tools")
+        || key_lower.contains("capability_")
+        || value_lower.contains("available_tools");
+    if !hits_tool_exists && !hits_list_claim {
+        return false; // 未命中模式:正常领域事实放行
+    }
+
+    // *_tool_exists:断言名对照注册表(大小写不敏感;最后段去后缀)
+    if hits_tool_exists {
+        let last = key.rsplit('.').next().unwrap_or(key);
+        let claimed = last
+            .trim_end_matches("_tool_exists")
+            .trim_end_matches("_tool");
+        return !registry_lower.contains(&claimed.to_lowercase());
+    }
+
+    // 清单类断言:value 必须能确证至少一个注册表内工具名,否则拒写
+    // (空注册表=无锚,any()==false,同样拒写)
+    !registry_lower.iter().any(|t| value_lower.contains(t))
 }
 
 /// C1 主入口：会话结束时调用（best-effort，错误记日志不阻断）
@@ -212,6 +256,16 @@ pub async fn sediment(
                         fact.key
                     );
                     let source = format!("llm:{}", cfg.llm_model_id);
+                    // O-487①:工具清单类断言实况校验锚——不符拒写+warn
+                    // (错误结论不固化;注册表未注入=无锚同拒)
+                    if tool_claim_rejected(&key, &fact.value, &deps.available_tools) {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            key = %key,
+                            "sediment: tool-claim stable fact rejected by registry check; not persisted"
+                        );
+                        continue;
+                    }
                     match deps
                         .memory
                         .set_scoped_with_source(MemoryScope::Shared, &key, &fact.value, &source)
@@ -1741,6 +1795,57 @@ mod tests {
         crate::api::evorule_client::EvoruleApiClient::new("http://localhost:8080")
     }
 
+    /// O-487①:工具清单类断言实况校验锚——不符拒写、无锚拒写、正常事实放行
+    #[test]
+    fn test_tool_claim_rejected_registry_anchor() {
+        let registry = vec![
+            "file_read".to_string(),
+            "http_get".to_string(),
+            "web_search".to_string(),
+        ];
+        // 未命中模式:正常领域事实放行
+        assert!(!tool_claim_rejected(
+            "stable.llm.m3.prefers_dark",
+            "用户偏好暗色主题",
+            &registry
+        ));
+        // *_tool_exists:注册表确证 → 放行(大小写不敏感)
+        assert!(!tool_claim_rejected(
+            "stable.llm.m3.web_search_tool_exists",
+            "该环境具备该工具",
+            &registry
+        ));
+        // *_tool_exists:断言工具不在注册表 → 拒写(错误结论不固化)
+        assert!(tool_claim_rejected(
+            "stable.llm.m3.browser_tool_exists",
+            "该环境具备该工具",
+            &registry
+        ));
+        // 清单断言:value 可确证注册表内工具名 → 放行
+        assert!(!tool_claim_rejected(
+            "stable.llm.m3.capability_summary",
+            "会话期间使用了 http_get 与 file_read 工具",
+            &registry
+        ));
+        // 清单断言:不可确证(空想清单) → 拒写
+        assert!(tool_claim_rejected(
+            "stable.llm.m3.available_tools",
+            "可用 trade_stocks 工具完成下单",
+            &registry
+        ));
+        // 无锚(空注册表):清单断言与 _tool_exists 一律拒写
+        assert!(tool_claim_rejected(
+            "stable.llm.m3.capability_x",
+            "可用 http_get",
+            &[]
+        ));
+        assert!(tool_claim_rejected(
+            "stable.llm.m3.http_get_tool_exists",
+            "有",
+            &[]
+        ));
+    }
+
     #[test]
     fn test_cluster_candidates_greedy_deterministic() {
         // 巩固聚类:同主题成簇、异主题孤立(单元素簇不出)、同输入同簇序
@@ -1793,6 +1898,7 @@ mod tests {
         let llm = LlmHandler::mock("{}");
         let auditor = AuditedLlm::new(make_test_client(), llm);
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut mgr,
             summarizer: None,
             extractor: None,
@@ -1866,6 +1972,7 @@ mod tests {
             ..Default::default()
         };
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut mgr,
             summarizer: None,
             extractor: None,
@@ -1879,6 +1986,7 @@ mod tests {
                     status: "error".into(),
                     size_bytes: 1,
                     content_digest: "blake3:aa".into(),
+                    execution_profile: None,
                 },
             }],
         };
@@ -1923,6 +2031,7 @@ mod tests {
         let llm = LlmHandler::mock(r#"{"title":"x","body":"y"}"#);
         let auditor = AuditedLlm::new(make_test_client(), llm);
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut mgr,
             summarizer: None,
             extractor: None,
@@ -1979,6 +2088,7 @@ mod tests {
                     status: "error".into(),
                     size_bytes: 0,
                     content_digest: "d".into(),
+                    execution_profile: None,
                 },
             },
             JournalLine {
@@ -1999,6 +2109,7 @@ mod tests {
                     status: "ok".into(),
                     size_bytes: 10,
                     content_digest: "d".into(),
+                    execution_profile: None,
                 },
             },
             JournalLine {
@@ -2117,6 +2228,7 @@ mod tests {
         let mut memory = MemoryManager::new("test", client).with_session_id("s1");
         let cfg = SedimentConfig::default();
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: None,
@@ -2137,6 +2249,7 @@ mod tests {
         let mut memory = MemoryManager::new("test", client).with_session_id("s1");
         let cfg = SedimentConfig::default();
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: None,
@@ -2170,6 +2283,7 @@ mod tests {
         let mock_response = r#"{"event_type":{"kind":"Milestone","subtype":"Birthday"},"entities":[],"content":{"summary":"用户生日"},"emotion":null,"tags":["birthday"]}"#;
         let mut extractor = EventExtractor::with_defaults(LlmHandler::mock(mock_response));
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: Some(&mut extractor),
@@ -2222,6 +2336,7 @@ mod tests {
         };
         let mut extractor = EventExtractor::with_defaults(LlmHandler::mock(""));
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: Some(&mut extractor),
@@ -2259,6 +2374,7 @@ mod tests {
         };
         let mut extractor = EventExtractor::with_defaults(LlmHandler::mock(""));
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: Some(&mut extractor),
@@ -2331,6 +2447,7 @@ mod tests {
             ..Default::default()
         };
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: None,
@@ -2377,6 +2494,7 @@ mod tests {
             ..Default::default()
         };
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: None,
@@ -2417,6 +2535,7 @@ mod tests {
             ..Default::default()
         };
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: None,
@@ -2464,6 +2583,7 @@ mod tests {
             ..Default::default()
         };
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: None,
@@ -2604,6 +2724,7 @@ mod tests {
             .await;
 
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: None,
@@ -2678,6 +2799,7 @@ mod tests {
             .await;
 
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: None,
@@ -2747,6 +2869,7 @@ mod tests {
             .await;
 
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: None,
@@ -2810,6 +2933,7 @@ mod tests {
             .await;
 
         let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
             memory: &mut memory,
             summarizer: None,
             extractor: None,

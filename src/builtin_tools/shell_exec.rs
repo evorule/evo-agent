@@ -290,7 +290,7 @@ pub enum CommandCategory {
 ///
 /// - [`ExecutionProfile::Workbench`](缺省):host 工作台,人在环基线,
 ///   分类逐项等于历史三表(回归测试守门);
-/// - [`ExecutionProfile::SandboxTrusted`]:一次性隔离执行环境。
+/// - [`ExecutionProfile::SandboxTrusted`][]:一次性隔离执行环境。
 ///
 /// 缺省不变式:不显式声明即为 Workbench,现行为零改动;
 /// 解析 fail-fast:未知值显式报错,不静默回落。

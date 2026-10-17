@@ -242,6 +242,13 @@ pub fn default_safe_toolkit_with_profile(
         crate::agent::session_spawn_tool::SESSION_SPAWN_TOOL,
         Arc::new(crate::agent::session_spawn_tool::SessionSpawnTool::unwired()),
     );
+    // 记忆墓碑（沉淀污染环治理出口 O-487②）：同占位/会话期重绑形态；
+    // 默认不进 LLM 契约（agentTools.memory_tombstone 默认关），显式启用后
+    // 仍走 Sensitive 意图裁决 + candidate 审批
+    handler.register_static(
+        crate::agent::memory_tombstone_tool::MEMORY_TOMBSTONE_TOOL,
+        Arc::new(crate::agent::memory_tombstone_tool::MemoryTombstoneTool::unwired()),
+    );
     handler
 }
 
@@ -767,6 +774,38 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     description: "Max entries to return, 1..=100 (default 20)"
                         .to_string(),
                     required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "memory_tombstone".to_string(),
+            description: "Write a null tombstone over one of your memory ledger entries \
+                          (stable facts or events), making it view-invisible to recall and \
+                          search — use this to neutralize a fact you know is wrong (e.g. a \
+                          hallucinated conclusion that was persisted). The original value \
+                          stays in the append-only ledger; only the view is suppressed. The \
+                          path must point at THIS agent's ledger (shared.<ns>.stable.* or \
+                          shared.<ns>.events.*) and must already exist — the tool verifies \
+                          it first. A reason is mandatory and permanently recorded in the \
+                          audit trail. This is a sensitive write: expect an approval \
+                          proposal on first use."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "path".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Full ledger path to tombstone (e.g. \
+                                  \"shared.default.stable.llm.m3.prefers_dark\")"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "reason".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Why this entry is wrong and must be suppressed \
+                                  (permanently attached to the audit trail)"
+                        .to_string(),
+                    required: true,
                 },
             ],
         },

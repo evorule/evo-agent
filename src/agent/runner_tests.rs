@@ -301,6 +301,39 @@ async fn test_openai_tools_payload_dynamic_service_schema_carries_parameters() {
     );
 }
 
+// O-487③：auto_recall 注入条目来源标注（纯展示层）——MemoryRecord 形态
+// 标「来源会话+落账时点」，非 MemoryRecord 形态仅标来源会话
+#[test]
+fn test_auto_recall_provenance_formats() {
+    use crate::api::evorule_client::SharedFactEntry;
+    // MemoryRecord 形态（sediment 写入）→ 双标注
+    let fact = SharedFactEntry {
+        fact_id: 7,
+        path: "shared.default.stable.llm.m3.prefers_dark".to_string(),
+        value: serde_json::json!({
+            "key": "stable.llm.m3.prefers_dark",
+            "value": "用户偏好暗色主题",
+            "timestamp": 1_790_000_000u64,
+        }),
+        source_session_id: 42,
+        version: 1,
+        origin_fact_id: None,
+    };
+    let p = crate::agent::runner::AgentRunner::auto_recall_provenance(&fact);
+    assert_eq!(p, " (source_session: 42, recorded_at: 1790000000)");
+    // 非 MemoryRecord 形态（手工/老数据）→ 仅来源会话
+    let plain = SharedFactEntry {
+        fact_id: 8,
+        path: "shared.default.stable.legacy".to_string(),
+        value: serde_json::json!("plain text"),
+        source_session_id: 43,
+        version: 2,
+        origin_fact_id: None,
+    };
+    let p = crate::agent::runner::AgentRunner::auto_recall_provenance(&plain);
+    assert_eq!(p, " (source_session: 43)");
+}
+
 #[tokio::test]
 async fn test_auto_recall_empty_shared_facts() {
     let mut server = mockito::Server::new_async().await;
@@ -661,6 +694,7 @@ use crate::agent::definition::MemoryConfig;
 fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
     AgentDefinition {
         http_get_allowed_hosts: None,
+        http_get_config: None,
         execution_profile: None,
         agent_type: "test".to_string(),
         version: "0.1.0".to_string(),
@@ -3663,11 +3697,14 @@ fn p2_adjudication_table_matches_design() {
     // 判定事实治理登记批(2026-10-11):verdict_submit 落地 Sensitive
     // (治理写族单键管理一致性;治理终审在 evorule-rule 机器闸,agent 面
     // 仅运行时审批),集合演进 27→28(数量锁 89,新增条目已 diff 审)。
+    // O-487② 记忆墓碑批(2026-10-17):memory_tombstone 落地 Sensitive
+    // (双闸同 session_spawn——null 墓碑写面意图必报+人工默认否决点;默认关,
+    // 显式启用才可达),集合演进 28→29(数量锁 94,新增条目已 diff 审)。
     let p2_count = crate::agent::tool_manifest::static_manifests()
         .iter()
         .filter(|m| m.is_p2_adjudicated())
         .count();
-    assert_eq!(p2_count, 28);
+    assert_eq!(p2_count, 29);
     for t in [
         "file_create",
         "file_move",

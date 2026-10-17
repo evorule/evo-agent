@@ -28,7 +28,8 @@
 //! - [`AdjudicationClass::Sentineled`]：P2 事前意图裁决 + 规则正本 enforce 已在场
 //!   （file_create/file_move/file_delete/file_write 的 out_of_sandbox enforce）；
 //! - [`AdjudicationClass::Sensitive`]：P2 事前意图裁决在通道（意图必报，暂无
-//!   enforce——git 写族 2 + 规则治理写族 19 + delegate 1 + session_spawn 1）；
+//!   enforce——git 写族 2 + 规则治理写族 19 + delegate 1 + session_spawn 1 +
+//!   memory_tombstone 1）；
 //! - [`AdjudicationClass::Standard`]：不走 P2 裁决（机制层治理或纯落链）。
 //!   `is_governance_adjudication_tool` 改由 manifest 派生后，命中集合恰等于
 //!   原 GOVERNANCE_ADJUDICATION_TOOLS 24 表；delegate 统一装配批兑现模块
@@ -353,6 +354,13 @@ const SWITCH_MEMORY_RECALL: &str = AGENT_TOOLS_MEMORY_RECALL;
 pub const AGENT_TOOLS_AUDIT_QUERY: &str = "agentTools.audit_query";
 const SWITCH_AUDIT_QUERY: &str = AGENT_TOOLS_AUDIT_QUERY;
 
+/// agentTools.memory_tombstone（默认关；记忆墓碑写入工具——沉淀污染环
+/// 存量出口，显式启用后仍走 Sensitive 意图裁决 + candidate 审批）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_MEMORY_TOMBSTONE: &str = "agentTools.memory_tombstone";
+const SWITCH_MEMORY_TOMBSTONE: &str = AGENT_TOOLS_MEMORY_TOMBSTONE;
+
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
     Some(SwitchBinding {
@@ -376,7 +384,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（26 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（28 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -436,6 +444,11 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 审计查询：三 scope 只读入口（gov/session/
         // journal）。注册/重绑/审批面同 memory_recall（只读 Standard+AutoPolicy）。
         b("audit_query", vec![Memory]),
+        // 记忆墓碑（沉淀污染环存量出口）：null 墓碑写入（path+reason，
+        // 存在性核对在执行体内）。注册/重绑同 memory_recall；Sensitive +
+        // ManualDefault（双闸同 session_spawn——写面治理意图必报 + 人工
+        // 默认否决点），默认关（agentTools.memory_tombstone）。
+        b("memory_tombstone", vec![Memory]),
         // 自主开会话（自主交接设计 PR-H3）：子会话派生（fork，因果链权威在
         // server 侧 parent 链）+ 首轮 goal 自动驱动。占位执行体启动期注册
         // （default_safe_toolkit），runner 会话期接线重绑（handover 双工具
@@ -474,6 +487,13 @@ fn builtin_manifests() -> Vec<ToolManifest> {
                 m.adjudication_class = AdjudicationClass::Sensitive;
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
+            // memory_tombstone（沉淀污染环存量出口）：双闸同 session_spawn——
+            // Sensitive（写面治理意图必报）+ ManualDefault（candidate 审批
+            // 模式首调出 needs_approval 提案；默认关，显式启用才可达）
+            "memory_tombstone" => {
+                m.adjudication_class = AdjudicationClass::Sensitive;
+                m.approval_policy = ApprovalPolicy::ManualDefault;
+            }
             // 命令/网络 candidate 族：分类器判入 candidate 即出 needs_approval
             // 提案（PR-4 起经管道⑤评估臂单源），如实补标 ManualDefault
             // （此前默认 AutoPolicy 属盘点遗漏，行为等价修正）。
@@ -504,6 +524,8 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             "memory_recall" => sw(SWITCH_MEMORY_RECALL, true),
             // 审计查询：只读入口，默认开
             "audit_query" => sw(SWITCH_AUDIT_QUERY, true),
+            // 记忆墓碑：写入面默认关（显式启用才进 LLM 契约）
+            "memory_tombstone" => sw(SWITCH_MEMORY_TOMBSTONE, false),
             _ => None,
         };
         m
@@ -829,9 +851,10 @@ mod tests {
         //   （B22 记忆主动消费 memory_recall +1：内置 24→25，数量锁 90→91）
         //   （B22 审计查询 audit_query +1：内置 25→26，数量锁 91→92）
         //   （B1 多模态上行 image_load +1：内置 26→27，数量锁 92→93）
-        assert_eq!(builtin_manifests().len(), 27);
+        //   （O-487② 记忆墓碑 memory_tombstone +1：内置 27→28，数量锁 93→94）
+        assert_eq!(builtin_manifests().len(), 28);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 93);
+        assert_eq!(all().len(), 94);
     }
 
     #[test]
@@ -946,6 +969,9 @@ mod tests {
     /// 不变，级别变化不增减条目数）。D1 兑现批 file_write 升 Sentineled
     /// 后演进为 26 条（同款 diff 审纪律）。自主交接 PR-H3 批 session_spawn
     /// 落地 Sensitive（双闸叠加），演进为 27 条（数量锁 76→77）。
+    /// 判定事实治理登记批 verdict_submit +1 → 28 条；O-487② 记忆墓碑
+    /// memory_tombstone 落地 Sensitive（双闸同 session_spawn），演进为 29 条
+    /// （默认关——开关不在场不进 LLM 契约，裁决集仍含，防绕道）。
     const GOVERNANCE_SNAPSHOT: &[&str] = &[
         "file_create",
         "file_move",
@@ -975,6 +1001,7 @@ mod tests {
         "bundle_import",
         "delegate",
         "session_spawn",
+        "memory_tombstone",
     ];
 
     #[test]
@@ -1064,6 +1091,8 @@ mod tests {
         ("memory_recall", "agentTools.memory_recall", true),
         // 审计查询
         ("audit_query", "agentTools.audit_query", true),
+        // 记忆墓碑（默认关）
+        ("memory_tombstone", "agentTools.memory_tombstone", false),
     ];
 
     #[test]

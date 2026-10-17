@@ -321,7 +321,7 @@ impl IndexService {
             for c in &chunk_rows {
                 let reusable = old_vectors
                     .get(&c.chunk_hash)
-                    .map(|v| dim.map_or(false, |d| v.len() == d))
+                    .map(|v| dim == Some(v.len()))
                     .unwrap_or(false);
                 if reusable {
                     let v = old_vectors.get(&c.chunk_hash).unwrap();

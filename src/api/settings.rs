@@ -289,6 +289,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.memory_tombstone",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "记忆墓碑工具（memory_tombstone，写入面）：对已固化的沉淀错误事实写 null 墓碑使其视图不可见（append-only 原值永在账；仅本命名空间 stable/events 两分区；reason 强制且永久入审计链；默认关——显式启用才进 LLM 契约，启用后仍走敏感意图裁决与人工审批）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.eventLedger",
             kind: SettingType::Boolean,
             default: json!(true),
@@ -907,7 +917,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 48); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled)
+        assert_eq!(settings.len(), 49); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));

@@ -1211,6 +1211,9 @@ async fn run_agent(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .with_capability_boundary(capability_boundary)
+    // O-493:执行环境 profile 标记随 tool_result 落账(trusted 审计明文可追溯;
+    // 未声明=None=落账无标记,零变化)
+    .with_execution_profile_marker(execution_profile.as_ref().map(|p| p.as_str()))
     // serve 面 delegate 执行能力接线(B25 批顺手修,CLI run 主路径同款镜像):
     // from_definition 对 "delegate" 仅预放行校验,此前 serve 三路径(run/stream/ws)
     // 均无人调用 with_delegate_context → 声明了 delegate 的定义(general 等)
@@ -1637,6 +1640,8 @@ async fn run_agent_stream(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .with_capability_boundary(capability_boundary)
+    // O-493:执行环境 profile 标记随 tool_result 落账(同 run_agent 口径)
+    .with_execution_profile_marker(execution_profile.as_ref().map(|p| p.as_str()))
     // serve 面 delegate 执行能力接线(同 run_agent 端点;SSE 流式面)
     .with_delegate_context(
         crate::agent::delegate::DelegateContext::new(
@@ -2418,6 +2423,118 @@ struct ReplayQueryParams {
     narrate: Option<bool>,
 }
 
+/// O-493 A 案:审计回放本地兜底合成(纯函数核心,单测直测)
+///
+/// 输入 journal 全量行 + transcript tool 消息原文(按执行序),产出合成回放
+/// 事件:ToolInvoked/ToolResult 按 call_id 配对,分发序对位原文,digest 复算
+/// 防伪(不符不带原文,`digest_verified:false`)。
+fn synth_replay_events(
+    lines: &[crate::agent::journal::JournalLine],
+    tool_outputs: &[String],
+    session_id: &str,
+) -> Vec<crate::agent::memory_event::event::MemoryEvent> {
+    use crate::agent::journal::{JournalEvent, evorule_digest};
+    use crate::agent::memory_event::event::{EventSource, EventType, MemoryEvent};
+
+    // invoked 骨架:call_id → (tool 名, 分发序)
+    let mut invoked_order: HashMap<String, (String, usize)> = HashMap::new();
+    let mut events = Vec::new();
+    for line in lines {
+        match &line.event {
+            JournalEvent::ToolInvoked { call_id, tool, .. } => {
+                let ord = invoked_order.len();
+                invoked_order.insert(call_id.clone(), (tool.clone(), ord));
+            }
+            JournalEvent::ToolResult {
+                call_id,
+                status,
+                size_bytes,
+                content_digest,
+                execution_profile,
+            } => {
+                // 分发序对位原文 + digest 复算防伪(不符不带原文)
+                let (output, verified) = match invoked_order.get(call_id) {
+                    Some((_, ord)) => match tool_outputs.get(*ord) {
+                        Some(text) => {
+                            let digest = evorule_digest(text);
+                            if digest == *content_digest {
+                                (serde_json::Value::String(text.clone()), true)
+                            } else {
+                                (serde_json::Value::Null, false)
+                            }
+                        }
+                        None => (serde_json::Value::Null, false),
+                    },
+                    None => (serde_json::Value::Null, false),
+                };
+                let event = MemoryEvent::new_root(
+                    &format!("journal-{}-{call_id}", line.seq),
+                    EventType::Custom("journal_tool_result".into()),
+                    line.ts / 1000,
+                    EventSource::ToolResult,
+                )
+                .with_content(serde_json::json!({
+                    "call_id": call_id,
+                    "tool": invoked_order.get(call_id).map(|(t, _)| t.clone()),
+                    "status": status,
+                    "size_bytes": size_bytes,
+                    "content_digest": content_digest,
+                    "execution_profile": execution_profile,
+                    "output": output,
+                    "digest_verified": verified,
+                    "synthesized": true,
+                }))
+                .with_session(session_id)
+                .with_tag("journal_synth");
+                events.push(event);
+            }
+            _ => {}
+        }
+    }
+    events
+}
+
+/// O-493 A 案:审计回放本地兜底合成(IO 包装)
+///
+/// 引擎事件流为空(server 数据丢失/纯内存态重启)时,用本地 journal 事件
+/// 骨架(journal 恒在本地 `data/sessions/{sid}.jsonl`,不依赖引擎)+
+/// transcript 原文(经 evorule facts 持久投影,尽力取)合成回放事件。
+/// 合成事件 `event_type: Custom("journal_tool_result")`,响应面带
+/// `source: "local_journal_synth"` 标记,消费方可区分合成账与引擎账。
+async fn synthesize_replay_from_journal(
+    state: &AgentApiState,
+    session_id: &str,
+) -> Vec<crate::agent::memory_event::event::MemoryEvent> {
+    use crate::agent::journal::JournalWriter;
+
+    let dir = state.workdir().join("data").join("sessions");
+    let path = JournalWriter::path_for(&dir, session_id);
+    if !path.exists() {
+        return Vec::new();
+    }
+    // 容错读:行级损坏跳过(审计合成面不因个别坏行整体拒答)
+    let lines = match crate::agent::journal::read_all_tolerant(&path) {
+        Ok(lines) => lines,
+        Err(_) => return Vec::new(),
+    };
+
+    // transcript 原文(尽力取;tool 消息按执行序与 journal 分发序对位,
+    // 与 ATIF 导出的 transcript 对位法同构)
+    let tool_outputs: Vec<String> = crate::api::session_index::load_transcript(
+        &state.evorule_client,
+        session_id,
+        "default",
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|m| m.role == "tool")
+    .map(|m| m.content)
+    .collect();
+
+    synth_replay_events(&lines, &tool_outputs, session_id)
+}
+
 /// G14:回放 session 的记忆事件链
 ///
 /// 路由:`GET /api/sessions/{id}/replay`
@@ -2448,6 +2565,24 @@ async fn replay_session_events(
     }
 
     if store.event_count() == 0 {
+        // O-493 A 案:引擎事件流为空 → 本地 journal 兜底合成(事件骨架+
+        // transcript 原文按分发序对齐,digest 复算防伪)。合成失败/无账
+        // → 原空响应语义零变化
+        let synthesized = synthesize_replay_from_journal(&state, &session_id).await;
+        if !synthesized.is_empty() {
+            let events_json: Vec<serde_json::Value> = synthesized
+                .iter()
+                .filter_map(|e| serde_json::to_value(e).ok())
+                .collect();
+            let count = events_json.len();
+            return Ok(Json(serde_json::json!({
+                "session_id": session_id,
+                "count": count,
+                "events": events_json,
+                "source": "local_journal_synth",
+                "message": "engine events empty; synthesized from local journal audit trail",
+            })));
+        }
         return Ok(Json(serde_json::json!({
             "session_id": session_id,
             "count": 0,
@@ -2718,7 +2853,7 @@ mod tests {
             )
             .unwrap();
         writer
-            .tool_result(&call_id, "ok", r#"{"price":185.35}"#)
+            .tool_result(&call_id, "ok", r#"{"price":185.35}"#, None)
             .unwrap();
         writer.end_turn("done", 1, 10).unwrap();
 
@@ -2789,6 +2924,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// O-493:本地兜底合成——call_id 配对 + 分发序对位 + digest 复算防伪
+    #[test]
+    fn test_synth_replay_events_pairs_and_digest_guard() {
+        use crate::agent::journal::{JournalEvent, JournalLine, evorule_digest};
+        let mk = |seq: u64, ts: u64, event: JournalEvent| JournalLine { seq, ts, event };
+        let content = r#"{"price":185.35}"#;
+        let lines = vec![
+            mk(
+                1,
+                1_000,
+                JournalEvent::ToolInvoked {
+                    call_id: "t1".into(),
+                    tool: "http_get".into(),
+                    args_digest: "a".into(),
+                    evorule_request_id: None,
+                },
+            ),
+            mk(
+                2,
+                2_000,
+                JournalEvent::ToolResult {
+                    call_id: "t1".into(),
+                    status: "ok".into(),
+                    size_bytes: content.len(),
+                    content_digest: evorule_digest(content),
+                    execution_profile: Some("sandbox-trusted".into()),
+                },
+            ),
+            mk(
+                3,
+                3_000,
+                JournalEvent::ToolInvoked {
+                    call_id: "t2".into(),
+                    tool: "file_read".into(),
+                    args_digest: "b".into(),
+                    evorule_request_id: None,
+                },
+            ),
+            mk(
+                4,
+                4_000,
+                JournalEvent::ToolResult {
+                    call_id: "t2".into(),
+                    status: "ok".into(),
+                    size_bytes: 4,
+                    content_digest: evorule_digest("real"),
+                    execution_profile: None,
+                },
+            ),
+        ];
+        // transcript tool 消息按执行序两条:第 1 条与 t1 digest 对上;第 2 条对不上
+        let tool_outputs = vec![content.to_string(), "tampered".to_string()];
+        let events = super::synth_replay_events(&lines, &tool_outputs, "s1");
+        assert_eq!(events.len(), 2);
+        let e1 = &events[0];
+        assert_eq!(e1.event_id, "journal-2-t1");
+        assert_eq!(e1.content["tool"], "http_get");
+        assert_eq!(e1.content["output"], content, "digest 对上=带原文");
+        assert_eq!(e1.content["digest_verified"], true);
+        assert_eq!(e1.content["execution_profile"], "sandbox-trusted");
+        let e2 = &events[1];
+        assert_eq!(e2.content["digest_verified"], false, "digest 不符不带原文");
+        assert!(e2.content["output"].is_null(), "宁缺毋假");
+    }
+
+    /// O-493:孤立 tool_result(无 invoked 配对)→ tool/output 双空,不误配
+    #[test]
+    fn test_synth_replay_events_orphan_result() {
+        use crate::agent::journal::{JournalEvent, JournalLine};
+        let lines = vec![JournalLine {
+            seq: 1,
+            ts: 1_000,
+            event: JournalEvent::ToolResult {
+                call_id: "t9".into(),
+                status: "error".into(),
+                size_bytes: 0,
+                content_digest: "x".into(),
+                execution_profile: None,
+            },
+        }];
+        let events = super::synth_replay_events(&lines, &[], "s1");
+        assert_eq!(events.len(), 1);
+        assert!(events[0].content["tool"].is_null());
+        assert!(events[0].content["output"].is_null());
+        assert_eq!(events[0].content["synthesized"], true);
+        assert_eq!(events[0].session_id, Some("s1".into()));
     }
 
     #[tokio::test]
