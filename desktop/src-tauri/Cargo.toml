@@ -1,6 +1,6 @@
 [package]
 name = "evo-agent-desktop"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "evo-agent desktop shell"
 license = "AGPL-3.0-or-later"
@@ -15,6 +15,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

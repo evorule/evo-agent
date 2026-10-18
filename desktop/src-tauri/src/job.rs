@@ -15,7 +15,7 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess};
+use windows_sys::Win32::System::Threading::OpenProcess;
 
 const PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
 
@@ -51,12 +51,7 @@ impl JobHandle {
         }
     }
 
-    /// 自收编：壳进程自身加入 job，此后 spawn 的子进程自动隶属。
-    pub fn assign_self(&self) -> bool {
-        unsafe { AssignProcessToJobObject(self.handle, GetCurrentProcess()) != 0 }
-    }
-
-    /// 逐个收编既有进程（自收编失败时的退化路径）。
+    /// 逐个收编进程（壳不自收编模式下的收编路径）。
     pub fn assign_pid(&self, pid: u32) -> bool {
         unsafe {
             let h = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);

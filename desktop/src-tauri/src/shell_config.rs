@@ -16,6 +16,8 @@ pub struct ShellConfig {
     pub engine: Engine,
     #[serde(default)]
     pub ui: Ui,
+    #[serde(default)]
+    pub update: Update,
 }
 
 /// 壳层 UI 行为（M3）：关窗缺省最小化到托盘，close_directly=true 直接退出。
@@ -23,6 +25,36 @@ pub struct ShellConfig {
 pub struct Ui {
     #[serde(default)]
     pub close_directly: bool,
+}
+
+/// 自动更新链（M4）：缺省全开。endpoints 空 = 用 tauri.conf.json 内置端点；
+/// 非空 = 完全覆盖（高级项，本地源调试用）。
+#[derive(serde::Deserialize, Clone)]
+pub struct Update {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_check_interval_hours")]
+    pub check_interval_hours: u64,
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+}
+
+impl Default for Update {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_interval_hours: 24,
+            endpoints: Vec::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_check_interval_hours() -> u64 {
+    24
 }
 
 #[derive(serde::Deserialize, Default)]

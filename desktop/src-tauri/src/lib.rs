@@ -16,6 +16,7 @@ mod job;
 mod orchestrator;
 mod shell_config;
 mod supervisor;
+mod update;
 
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -129,6 +130,14 @@ fn open_logs_dir(sup: tauri::State<'_, SupHandle>) -> Result<(), String> {
     Ok(())
 }
 
+/// 手动检查更新（托盘菜单/命令同路径）：独立线程执行，避免阻塞调用线程
+/// （确认对话框为 blocking 原生弹窗，不能在主线程）
+#[tauri::command]
+fn check_updates(app: tauri::AppHandle, sup: tauri::State<'_, SupHandle>) {
+    let sup = sup.inner().clone();
+    std::thread::spawn(move || update::run_update_flow(&app, &sup, true));
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = shell_config::load();
     let version = env!("CARGO_PKG_VERSION").to_string();
@@ -147,7 +156,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = win.set_focus();
             }
         }))
-        .invoke_handler(tauri::generate_handler![restart_services, open_logs_dir])
+        // 更新链三插件（Rust 侧调用，capability 仅作 IPC 面兜底）
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            restart_services,
+            open_logs_dir,
+            check_updates
+        ])
         .setup(move |app| {
             let handle = app.handle().clone();
             let nav_port: NavPort = Arc::new(RwLock::new(None));
@@ -169,7 +186,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 _ => builder.inner_size(1280.0, 800.0),
             };
             let win = builder
-                .initialization_script(&init_script(&serve_token))
+                .initialization_script(init_script(&serve_token))
                 .on_navigation({
                     let nav_port = nav_port.clone();
                     move |url| {
@@ -211,7 +228,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
-            // 托盘：打开主窗 / 重启服务 / 打开数据目录 / 退出
+            // 托盘：打开主窗 / 重启服务 / 打开数据目录 / 检查更新 / 退出
             use tauri::menu::{MenuBuilder, MenuItem};
             let mk = |id: &str, label: &str| {
                 MenuItem::with_id(app, id, label, true, None::<&str>)
@@ -220,6 +237,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .item(&mk("open", "打开主窗")?)
                 .item(&mk("restart", "重启服务")?)
                 .item(&mk("data", "打开数据目录")?)
+                .item(&mk("check-update", "检查更新")?)
                 .separator()
                 .item(&mk("quit", "退出")?)
                 .build()?;
@@ -247,6 +265,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         "data" => open_in_explorer(&sup.paths.data_dir),
+                        "check-update" => {
+                            let app_h = app.clone();
+                            let sup = sup_for_tray.clone();
+                            std::thread::spawn(move || {
+                                update::run_update_flow(&app_h, &sup, true)
+                            });
+                        }
                         "quit" => sup.shutdown(),
                         _ => {}
                     }
@@ -254,6 +279,24 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .build(app)?;
 
             sup.start();
+
+            // 自动更新周期检查（M4）：延迟 90s 首查（避让启动高峰），
+            // 之后按 [update].check_interval_hours 周期；enabled=false 不启动。
+            // 全 fail-soft，任何异常不影响壳主功能。
+            if cfg.update.enabled {
+                let app_for_update = app.handle().clone();
+                let sup_for_update = sup.clone();
+                let interval_hours = cfg.update.check_interval_hours.max(1);
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(90));
+                    loop {
+                        update::run_update_flow(&app_for_update, &sup_for_update, false);
+                        std::thread::sleep(std::time::Duration::from_secs(
+                            interval_hours * 3600,
+                        ));
+                    }
+                });
+            }
             Ok(())
         })
         .build(tauri::generate_context!())?;
