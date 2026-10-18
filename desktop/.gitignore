@@ -1,4 +1,6 @@
 node_modules/
 target/
-src-tauri/gen/schemas/
+src-tauri/gen/
+src-tauri/data/
+src-tauri/resources/
 *.log

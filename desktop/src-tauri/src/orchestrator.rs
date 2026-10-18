@@ -69,10 +69,13 @@ fn open_append(path: &Path) -> Result<std::fs::File, String> {
         .map_err(|e| format!("open log {}: {e}", path.display()))
 }
 
-/// 确保 `link` 为指向 `target` 的目录 junction（已存在则跳过）。
+/// 确保 `link` 为指向 `target` 的目录 junction。
+///
+/// 每次启动幂等重建（毫秒级）：悬空（目标消失）或错向（指向他处）的旧
+/// junction 一律清除，杜绝 mklink「已存在」失败与 serve 静态 404。
 fn ensure_junction(link: &Path, target: &Path) -> Result<(), String> {
-    if link.exists() {
-        return Ok(());
+    if std::fs::symlink_metadata(link).is_ok() {
+        let _ = std::fs::remove_dir(link);
     }
     let out = Command::new("cmd")
         .args(["/C", "mklink", "/J"])
@@ -93,31 +96,72 @@ fn ensure_junction(link: &Path, target: &Path) -> Result<(), String> {
     }
 }
 
-/// 壳生成的 serve 工作配置：agents 绝对路径必写（serve agents 为空即拒起）；
-/// console 通道按开关注入（预留通路，缺省关闭）。
+/// 壳生成的 serve 工作配置。
+///
+/// 基座 = 用户 evo-agent.toml 透传（查找序：产品资源根 → 壳配置目录；LLM key
+/// 等敏感配置随用户配置走，壳不感知其内容）；随后强制覆盖 [agents].dir 为
+/// 绝对路径（serve agents 空目录拒起）；console 通道按开关注入（预留通路，
+/// 缺省关闭）。用户配置解析失败时 fail-soft：告警后退回最小配置（M1 行为）。
 fn write_runtime_config(
     runtime_dir: &Path,
     home: &Path,
+    app_config_dir: &Path,
     console: &Console,
     log: &mut impl Write,
 ) -> Result<(), String> {
     let path = runtime_dir.join("evo-agent.toml");
-    let mut src = format!("[agents]\ndir = '{}'\n", home.join("agents").display());
+
+    let base = [home.join("evo-agent.toml"), app_config_dir.join("evo-agent.toml")]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok());
+
+    let mut table: toml::Table = match &base {
+        Some(s) => match toml::from_str(s) {
+            Ok(t) => t,
+            Err(e) => {
+                writeln!(
+                    log,
+                    "[orch] user evo-agent.toml parse failed ({e}); using minimal config"
+                )
+                .ok();
+                toml::Table::new()
+            }
+        },
+        None => toml::Table::new(),
+    };
+
+    // [agents].dir 一律覆盖为绝对路径（基座中的相对路径以壳解析结果为准）
+    let agents = table
+        .entry("agents")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let toml::Value::Table(t) = agents {
+        t.insert(
+            "dir".to_string(),
+            toml::Value::String(home.join("agents").display().to_string()),
+        );
+    }
+
     if console.enabled {
         match &console.dir {
             Some(dir) => {
-                src.push_str(&format!("\n[workbench]\nconsole_dir = '{}'\n", dir.display()));
+                let wb = table
+                    .entry("workbench")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let toml::Value::Table(t) = wb {
+                    t.insert(
+                        "console_dir".to_string(),
+                        toml::Value::String(dir.display().to_string()),
+                    );
+                }
             }
             None => {
-                writeln!(
-                    log,
-                    "[orch] console.enabled=true but console.dir empty; skipped"
-                )
-                .ok();
+                writeln!(log, "[orch] console.enabled=true but console.dir empty; skipped").ok();
             }
         }
     }
-    std::fs::write(&path, src).map_err(|e| format!("write {}: {e}", path.display()))
+
+    let out = toml::to_string(&table).map_err(|e| format!("serialize evo-agent.toml: {e}"))?;
+    std::fs::write(&path, out).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 pub struct LaunchInput<'a> {
@@ -148,7 +192,13 @@ pub fn launch(input: LaunchInput) -> Result<Runtime, String> {
         &paths.evo_agent_home.join("web").join("dist"),
     )?;
 
-    write_runtime_config(&paths.runtime_dir, &paths.evo_agent_home, input.console, &mut shell_log)?;
+    write_runtime_config(
+        &paths.runtime_dir,
+        &paths.evo_agent_home,
+        &paths.app_config_dir,
+        input.console,
+        &mut shell_log,
+    )?;
 
     let serve_port = pick_free_port(None)?;
     let engine_port = pick_free_port(Some(serve_port))?;
