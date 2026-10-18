@@ -66,6 +66,7 @@ pub enum Decision {
 }
 
 impl Supervisor {
+    #[allow(clippy::too_many_arguments)] // 八项输入均为编排必需，结构体化反增噪音
     pub fn new(
         paths: ResolvedPaths,
         console: Console,
@@ -77,7 +78,12 @@ impl Supervisor {
         nav_port: Arc<RwLock<Option<u16>>>,
     ) -> Result<Arc<Self>, String> {
         let job = Arc::new(JobHandle::create()?);
-        let self_assigned = job.assign_self();
+        // 壳不自收编（M4.1 教训）：updater install 时 ShellExecuteW 启动的
+        // NSIS 安装器同为壳子进程，若壳自收编，install 末尾壳 exit(0) 会经
+        // KILL_ON_JOB_CLOSE 顺杀安装器，覆盖安装被中断。改为 serve/engine
+        // 在 spawn 点逐个收编（orchestrator）；杀壳/崩溃时 job 句柄随壳进程
+        // 关闭，服务树回收语义不变。
+        let self_assigned = false;
         if let Ok(mut log) = open_shell_log(&paths) {
             writeln!(log, "[guard] job created (self_assigned={self_assigned})").ok();
         }
@@ -289,6 +295,25 @@ impl Supervisor {
             let _ = self.window.navigate(u);
         }
         let _ = self.window.show();
+    }
+
+    /// 更新安装前停服务：置 shutting_down 阻止守护线程重启 + 两段式优雅停 +
+    /// 删握手文件，但不退出进程（updater install 接管；进程结束时
+    /// KILL_ON_JOB_CLOSE 兜底）。与 shutdown 的区别仅在于不调 app.exit。
+    pub fn stop_for_update(self: &Arc<Self>) {
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.shutting_down {
+                return;
+            }
+            st.shutting_down = true;
+        }
+        self.log_line("[guard] stop for update (graceful two-phase)");
+        let mut runtime = self.state.lock().unwrap().runtime.take();
+        if let Some(rt) = runtime.as_mut() {
+            orchestrator::graceful_stop(&mut rt.engine, &mut rt.serve, GRACEFUL_TIMEOUT);
+        }
+        let _ = std::fs::remove_file(self.paths.data_dir.join("runtime.json"));
     }
 
     /// 退出序列：两段式优雅停 → 删握手文件 → 清理退出。

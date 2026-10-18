@@ -4,3 +4,4 @@ src-tauri/gen/
 src-tauri/data/
 src-tauri/resources/
 *.log
+src-tauri/updater-key/
