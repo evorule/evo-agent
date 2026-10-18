@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>evo-agent — 启动失败</title>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: #12233f;
+        color: #d7e2f0;
+        font-family: "Segoe UI", sans-serif;
+        gap: 18px;
+        padding: 32px;
+        box-sizing: border-box;
+      }
+      h1 {
+        font-size: 18px;
+        font-weight: 600;
+        color: #e8b84a;
+        margin: 0;
+      }
+      .msg {
+        max-width: 720px;
+        font-size: 14px;
+        line-height: 1.6;
+        color: #d7e2f0;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .logs {
+        max-width: 720px;
+        font-size: 13px;
+        color: #8fa3bd;
+        word-break: break-all;
+      }
+      button {
+        padding: 8px 28px;
+        font-size: 14px;
+        border: 1px solid #3fae4e;
+        background: transparent;
+        color: #8fd18f;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: rgba(63, 174, 78, 0.15);
+      }
+    </style>
+  </head>
+  <body>
+    <h1>服务启动失败</h1>
+    <div class="msg" id="msg"></div>
+    <div class="logs" id="logs"></div>
+    <button onclick="location.href='http://tauri.localhost/index.html'">重试</button>
+    <script>
+      const q = new URLSearchParams(location.search);
+      document.getElementById('msg').textContent =
+        q.get('msg') || '未知错误，请查看日志。';
+      document.getElementById('logs').textContent = q.get('logs')
+        ? '日志目录：' + q.get('logs')
+        : '';
+    </script>
+  </body>
+</html>
