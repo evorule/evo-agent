@@ -11,13 +11,17 @@
 // - evorule 连接：env 覆盖 `EVO_AGENT_EVORULE__BASE_URL`（必须带 scheme，
 //   客户端按纯字符串拼接 path）+ `EVO_AGENT_EVORULE__API_KEY`；token 仅存
 //   壳内存与子进程环境，不落盘。
+//
+// M3 扩展：launch/restart_services 共用 spawn 助手（崩溃守护整组重启）；
+// graceful_stop 两段式（Ctrl+C 按进程组尽力送达 → 5s 超时强杀）。
 
 use std::io::Write;
 use std::net::TcpListener;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rand::Rng;
 
@@ -27,19 +31,28 @@ use crate::shell_config::{Console, ResolvedPaths};
 
 /// 子进程不弹控制台窗口（GUI 进程 spawn 控制台程序必带）
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// 子进程各立进程组：graceful 停止可按组送达 Ctrl+C（组 id = 子进程 pid）
+pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
+/// 运行中的一组子进程（崩溃守护与退出序列的操作对象）。
 pub struct Runtime {
-    pub job: JobHandle,
     pub serve_port: u16,
-    _serve: Child,
-    _engine: Child,
+    pub engine_port: u16,
+    pub serve: Option<Child>,
+    pub engine: Option<Child>,
 }
 
-impl Runtime {
-    /// 退出序列主路径：立即终止整树（M1 用强杀；优雅停两段式留 M3 细化）。
-    pub fn shutdown(&self) {
-        self.job.terminate();
-    }
+/// 一次拉起所需的全部输入（job 由守护方持有，跨重启复用）。
+pub struct LaunchContext<'a> {
+    pub paths: &'a ResolvedPaths,
+    pub console: &'a Console,
+    pub engine_extra_args: &'a [String],
+    pub serve_token: &'a str,
+    pub engine_token: &'a str,
+    pub version: &'a str,
+    pub job: &'a Arc<JobHandle>,
+    /// 自收编是否成功（决定子进程要不要逐个收编）
+    pub self_assigned: bool,
 }
 
 /// 生成 128bit 随机 token（32 hex 字符）。
@@ -164,56 +177,28 @@ fn write_runtime_config(
     std::fs::write(&path, out).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-pub struct LaunchInput<'a> {
-    pub paths: &'a ResolvedPaths,
-    pub console: &'a Console,
-    pub engine_extra_args: &'a [String],
-    pub serve_token: &'a str,
-    pub engine_token: &'a str,
-    pub version: &'a str,
-}
-
-pub fn launch(input: LaunchInput) -> Result<Runtime, String> {
-    let paths = input.paths;
-
-    // 目录先行（日志 open_append 依赖 logs 目录已存在）
+/// 目录/配置/静态资源预备（幂等；初始启动与重启均可安全调用）。
+pub fn prepare_workspace(ctx: &LaunchContext, log: &mut impl Write) -> Result<(), String> {
+    let paths = ctx.paths;
     for dir in [&paths.data_dir, &paths.runtime_dir, &paths.logs_dir] {
         std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     }
-    let mut shell_log = open_append(&paths.logs_dir.join("shell.log"))?;
-
-    writeln!(shell_log, "[orch] launch begin (shell v{})", input.version).ok();
-    std::fs::create_dir_all(paths.runtime_dir.join("web"))
-        .map_err(|e| e.to_string())?;
-
-    // 工作台静态资源：serve 硬编码读 {workdir}/web/dist，junction 指向产品资源根
+    std::fs::create_dir_all(paths.runtime_dir.join("web")).map_err(|e| e.to_string())?;
     ensure_junction(
         &paths.runtime_dir.join("web").join("dist"),
         &paths.evo_agent_home.join("web").join("dist"),
     )?;
-
     write_runtime_config(
         &paths.runtime_dir,
         &paths.evo_agent_home,
         &paths.app_config_dir,
-        input.console,
-        &mut shell_log,
-    )?;
-
-    let serve_port = pick_free_port(None)?;
-    let engine_port = pick_free_port(Some(serve_port))?;
-
-    // job 收编优先自收编（此后子进程自动隶属）；失败退化为逐个收编
-    let job = JobHandle::create()?;
-    let self_assigned = job.assign_self();
-    writeln!(
-        shell_log,
-        "[orch] job created (self_assigned={self_assigned})"
+        ctx.console,
+        log,
     )
-    .ok();
+}
 
-    // engine：evorule-server（development 档 + 回环 + token + 全路径显式，
-    // 不依赖 CWD：宪法/规则取资源根，db/memory 归壳数据目录，wal 常驻）
+fn spawn_engine(ctx: &LaunchContext, engine_port: u16) -> Result<Child, String> {
+    let paths = ctx.paths;
     let engine_wal = paths.data_dir.join("engine-wal");
     std::fs::create_dir_all(&engine_wal).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&paths.engine_data_dir).map_err(|e| e.to_string())?;
@@ -227,7 +212,7 @@ pub fn launch(input: LaunchInput) -> Result<Runtime, String> {
             "--addr",
             &format!("127.0.0.1:{engine_port}"),
             "--auth-token",
-            input.engine_token,
+            ctx.engine_token,
             "--core-eval",
         ])
         .arg(paths.evorule_server_home.join("resources").join("server_eval.json"))
@@ -239,28 +224,21 @@ pub fn launch(input: LaunchInput) -> Result<Runtime, String> {
         .arg(paths.engine_data_dir.join("memory"))
         .args(["--wal-dir"])
         .arg(&engine_wal)
-        .args(input.engine_extra_args)
+        .args(ctx.engine_extra_args)
         .stdout(Stdio::from(engine_log))
         .stderr(Stdio::from(engine_log_err))
-        .creation_flags(CREATE_NO_WINDOW);
-    writeln!(shell_log, "[orch] spawn engine: {}", paths.evorule_server_exe.display()).ok();
-    let mut engine = engine_cmd
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    let engine = engine_cmd
         .spawn()
         .map_err(|e| format!("spawn evorule-server: {e}"))?;
-    if !self_assigned {
-        job.assign_pid(engine.id());
+    if !ctx.self_assigned {
+        ctx.job.assign_pid(engine.id());
     }
+    Ok(engine)
+}
 
-    if !health::wait_healthy(engine_port, "/api/health", Duration::from_secs(30)) {
-        let _ = engine.kill();
-        return Err(format!(
-            "engine health check timeout (port {engine_port}); logs: {}",
-            paths.logs_dir.display()
-        ));
-    }
-    writeln!(shell_log, "[orch] engine healthy on port {engine_port}").ok();
-
-    // serve：evo-agent serve（workdir=壳 runtime 目录，evorule 指向 engine 走 env）
+fn spawn_serve(ctx: &LaunchContext, serve_port: u16, engine_port: u16) -> Result<Child, String> {
+    let paths = ctx.paths;
     let serve_log = open_append(&paths.logs_dir.join("serve.log"))?;
     let serve_log_err = open_append(&paths.logs_dir.join("serve.log"))?;
     let mut serve_cmd = Command::new(&paths.evo_agent_exe);
@@ -272,54 +250,170 @@ pub fn launch(input: LaunchInput) -> Result<Runtime, String> {
             "--port",
             &serve_port.to_string(),
             "--auth-token",
-            input.serve_token,
+            ctx.serve_token,
             "--workdir",
         ])
         .arg(&paths.runtime_dir)
-        .env("EVO_AGENT_EVORULE__BASE_URL", format!("http://127.0.0.1:{engine_port}"))
-        .env("EVO_AGENT_EVORULE__API_KEY", input.engine_token)
-        .env("EVORULE_AUTH_TOKEN", input.engine_token)
+        .env(
+            "EVO_AGENT_EVORULE__BASE_URL",
+            format!("http://127.0.0.1:{engine_port}"),
+        )
+        .env("EVO_AGENT_EVORULE__API_KEY", ctx.engine_token)
+        .env("EVORULE_AUTH_TOKEN", ctx.engine_token)
         .stdout(Stdio::from(serve_log))
         .stderr(Stdio::from(serve_log_err))
-        .creation_flags(CREATE_NO_WINDOW);
-    writeln!(shell_log, "[orch] spawn serve: {}", paths.evo_agent_exe.display()).ok();
-    let mut serve = serve_cmd
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    let serve = serve_cmd
         .spawn()
         .map_err(|e| format!("spawn evo-agent serve: {e}"))?;
-    if !self_assigned {
-        job.assign_pid(serve.id());
+    if !ctx.self_assigned {
+        ctx.job.assign_pid(serve.id());
     }
+    Ok(serve)
+}
 
-    if !health::wait_healthy(serve_port, "/health", Duration::from_secs(30)) {
-        let _ = serve.kill();
-        return Err(format!(
-            "serve health check timeout (port {serve_port}); logs: {}",
-            paths.logs_dir.display()
-        ));
-    }
-    writeln!(shell_log, "[orch] serve healthy on port {serve_port}").ok();
-
-    // 运行时握手文件（诊断用；不含 token）
+fn write_runtime_file(
+    paths: &ResolvedPaths,
+    version: &str,
+    rt: &Runtime,
+    serve_pid: u32,
+    engine_pid: u32,
+) -> Result<(), String> {
     let runtime_json = serde_json::json!({
-        "version": input.version,
+        "version": version,
         "started_at": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
-        "serve": { "port": serve_port, "pid": serve.id() },
-        "engine": { "port": engine_port, "pid": engine.id() },
+        "serve": { "port": rt.serve_port, "pid": serve_pid },
+        "engine": { "port": rt.engine_port, "pid": engine_pid },
     });
     std::fs::write(
         paths.data_dir.join("runtime.json"),
         serde_json::to_string_pretty(&runtime_json).unwrap(),
     )
-    .map_err(|e| format!("write runtime.json: {e}"))?;
+    .map_err(|e| format!("write runtime.json: {e}"))
+}
 
-    writeln!(shell_log, "[orch] launch complete").ok();
-    Ok(Runtime {
-        job,
+/// 初始启动：预备工作区 → engine → 探测 → serve → 探测 → runtime.json。
+pub fn launch(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, String> {
+    writeln!(log, "[orch] launch begin (shell v{})", ctx.version).ok();
+    prepare_workspace(ctx, log)?;
+
+    let serve_port = pick_free_port(None)?;
+    let engine_port = pick_free_port(Some(serve_port))?;
+
+    let mut engine = spawn_engine(ctx, engine_port)?;
+    if !health::wait_healthy(engine_port, "/api/health", Duration::from_secs(30)) {
+        let _ = engine.kill();
+        return Err(format!(
+            "engine health check timeout (port {engine_port}); logs: {}",
+            ctx.paths.logs_dir.display()
+        ));
+    }
+    writeln!(log, "[orch] engine healthy on port {engine_port}").ok();
+
+    let mut serve = spawn_serve(ctx, serve_port, engine_port)?;
+    if !health::wait_healthy(serve_port, "/health", Duration::from_secs(30)) {
+        let _ = serve.kill();
+        return Err(format!(
+            "serve health check timeout (port {serve_port}); logs: {}",
+            ctx.paths.logs_dir.display()
+        ));
+    }
+    writeln!(log, "[orch] serve healthy on port {serve_port}").ok();
+
+    let rt = Runtime {
         serve_port,
-        _serve: serve,
-        _engine: engine,
-    })
+        engine_port,
+        serve: Some(serve),
+        engine: Some(engine),
+    };
+    write_runtime_file(
+        ctx.paths,
+        ctx.version,
+        &rt,
+        rt.serve.as_ref().map(|c| c.id()).unwrap_or(0),
+        rt.engine.as_ref().map(|c| c.id()).unwrap_or(0),
+    )?;
+    writeln!(log, "[orch] launch complete").ok();
+    Ok(rt)
+}
+
+/// 整组重启（崩溃退避 / 手动触发共用）：复用工作区，端口重选，全链重拉。
+pub fn restart_services(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, String> {
+    writeln!(log, "[orch] group restart begin").ok();
+    let serve_port = pick_free_port(None)?;
+    let engine_port = pick_free_port(Some(serve_port))?;
+
+    let mut engine = spawn_engine(ctx, engine_port)?;
+    if !health::wait_healthy(engine_port, "/api/health", Duration::from_secs(30)) {
+        let _ = engine.kill();
+        return Err(format!("engine health check timeout (port {engine_port})"));
+    }
+    let mut serve = spawn_serve(ctx, serve_port, engine_port)?;
+    if !health::wait_healthy(serve_port, "/health", Duration::from_secs(30)) {
+        let _ = serve.kill();
+        return Err(format!("serve health check timeout (port {serve_port})"));
+    }
+    let rt = Runtime {
+        serve_port,
+        engine_port,
+        serve: Some(serve),
+        engine: Some(engine),
+    };
+    write_runtime_file(
+        ctx.paths,
+        ctx.version,
+        &rt,
+        rt.serve.as_ref().map(|c| c.id()).unwrap_or(0),
+        rt.engine.as_ref().map(|c| c.id()).unwrap_or(0),
+    )?;
+    writeln!(log, "[orch] group restart complete").ok();
+    Ok(rt)
+}
+
+/// 尽力向子进程组送达 Ctrl+C（GUI 壳无控制台，AttachConsole 后按组发送）。
+fn send_ctrl_c(pid: u32) {
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, CTRL_C_EVENT,
+    };
+    unsafe {
+        if AttachConsole(pid) != 0 {
+            GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid);
+            FreeConsole();
+        }
+    }
+}
+
+/// 两段式停止：Ctrl+C 尽力送达 → 轮询至超时（5s）→ 强杀。数据面由
+/// WAL 保障（engine 跨 kill -9 全存活已实证），强杀仅影响优雅收尾。
+pub fn graceful_stop(
+    engine: &mut Option<Child>,
+    serve: &mut Option<Child>,
+    timeout: Duration,
+) {
+    for slot in [engine.as_ref(), serve.as_ref()].into_iter().flatten() {
+        send_ctrl_c(slot.id());
+    }
+    let start = Instant::now();
+    loop {
+        let engine_gone = engine
+            .as_mut()
+            .map(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(true))
+            .unwrap_or(true);
+        let serve_gone = serve
+            .as_mut()
+            .map(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(true))
+            .unwrap_or(true);
+        if engine_gone && serve_gone {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if let Some(c) = engine { let _ = c.kill(); }
+    if let Some(c) = serve { let _ = c.kill(); }
 }

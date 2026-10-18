@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <title>evo-agent — 启动失败</title>
+    <title>evo-agent — 服务状态</title>
     <style>
       html,
       body {
@@ -41,6 +41,10 @@
         color: #8fa3bd;
         word-break: break-all;
       }
+      .row {
+        display: flex;
+        gap: 14px;
+      }
       button {
         padding: 8px 28px;
         font-size: 14px;
@@ -53,20 +57,49 @@
       button:hover {
         background: rgba(63, 174, 78, 0.15);
       }
+      button.ghost {
+        border-color: #3a5a86;
+        color: #8fa3bd;
+      }
+      button.ghost:hover {
+        background: rgba(58, 90, 134, 0.15);
+      }
+      .note {
+        font-size: 12px;
+        color: #62789a;
+      }
     </style>
   </head>
   <body>
-    <h1>服务启动失败</h1>
+    <h1>服务不可用</h1>
     <div class="msg" id="msg"></div>
     <div class="logs" id="logs"></div>
-    <button onclick="location.href='http://tauri.localhost/index.html'">重试</button>
+    <div class="row">
+      <button onclick="restartServices()">重启服务</button>
+      <button class="ghost" onclick="openLogs()">打开日志目录</button>
+    </div>
+    <div class="note" id="note"></div>
     <script>
       const q = new URLSearchParams(location.search);
       document.getElementById('msg').textContent =
-        q.get('msg') || '未知错误，请查看日志。';
+        q.get('msg') || '服务未就绪，请查看日志。';
       document.getElementById('logs').textContent = q.get('logs')
         ? '日志目录：' + q.get('logs')
         : '';
+      function invoke(cmd) {
+        try {
+          window.__TAURI_INTERNALS__.invoke(cmd);
+        } catch (e) {
+          document.getElementById('note').textContent =
+            '无法唤起壳操作（' + e + '），请手动重启应用。';
+        }
+      }
+      function restartServices() {
+        invoke('restart_services');
+      }
+      function openLogs() {
+        invoke('open_logs_dir');
+      }
     </script>
   </body>
 </html>

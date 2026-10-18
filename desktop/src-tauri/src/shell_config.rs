@@ -14,6 +14,15 @@ pub struct ShellConfig {
     pub console: Console,
     #[serde(default)]
     pub engine: Engine,
+    #[serde(default)]
+    pub ui: Ui,
+}
+
+/// 壳层 UI 行为（M3）：关窗缺省最小化到托盘，close_directly=true 直接退出。
+#[derive(serde::Deserialize, Default)]
+pub struct Ui {
+    #[serde(default)]
+    pub close_directly: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -31,7 +40,7 @@ pub struct Paths {
 /// console 审计页通道（预留）：enabled=true 时壳把 console_dir 写入 serve
 /// 工作目录的 evo-agent.toml，由 serve 既有 fail-soft sidecar 机制拉起。
 /// 缺省关闭（M1 决策 R4）；console 集成批次开启并指向 console 产物目录。
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize, Default, Clone)]
 pub struct Console {
     #[serde(default)]
     pub enabled: bool,
@@ -47,6 +56,7 @@ pub struct Engine {
 }
 
 /// 解析后的全部路径（launch 输入）。
+#[derive(Clone)]
 pub struct ResolvedPaths {
     pub evo_agent_exe: PathBuf,
     pub evo_agent_home: PathBuf,

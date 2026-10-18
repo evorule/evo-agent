@@ -12,7 +12,7 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess};
@@ -25,6 +25,7 @@ pub struct JobHandle {
 
 /// Windows 句柄为进程级整数资源，Job 系 API 均线程安全，跨线程持有无碍。
 unsafe impl Send for JobHandle {}
+unsafe impl Sync for JobHandle {}
 
 impl JobHandle {
     /// 创建 job 并设置 KILL_ON_JOB_CLOSE（句柄关闭即整树回收）。
@@ -65,13 +66,6 @@ impl JobHandle {
             let ok = AssignProcessToJobObject(self.handle, h) != 0;
             CloseHandle(h);
             ok
-        }
-    }
-
-    /// 立即终止 job 内全部进程（退出序列主路径）。
-    pub fn terminate(&self) {
-        unsafe {
-            TerminateJobObject(self.handle, 0);
         }
     }
 }

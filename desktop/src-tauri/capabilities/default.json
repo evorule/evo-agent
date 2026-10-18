@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "壳内置页（降级页）核心 IPC 权限；仅 local 上下文，工作台（127.0.0.1）不在此列",
+  "windows": ["main"],
+  "context": "local",
+  "permissions": ["core:default"]
+}

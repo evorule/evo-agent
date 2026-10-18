@@ -1,29 +1,38 @@
-// 桌面壳入口：窗口 + 编排 + token 注入 + 退出树杀。
+// 桌面壳入口：窗口 + 编排 + token 注入 + 退出树杀 + 桌面体验（M3）。
 //
-// 启动序列（M1）：
-//   1. 读壳配置（shell.toml，缺省全缺省）
-//   2. 建主窗口加载内置加载页；initialization_script 预置工作台 token
-//      （WebView2 每次文档创建都会执行，跨 origin 导航后仍生效）
-//   3. 后台编排：engine → 健康探测 → serve → 健康探测 → runtime.json
-//   4. 成功后 webview 导航到工作台（http://127.0.0.1:{serve_port}/）；
-//      失败导航到内置降级页（错误信息 + 日志路径）
-//   5. 退出时 terminate job（JobHandle Drop 关句柄，KILL_ON_JOB_CLOSE 兜底）
+// 启动序列：
+//   1. 读壳配置（shell.toml，缺省全缺省）+ 窗口尺寸记忆（window.json）
+//   2. 单实例：二次启动唤起既有窗口（tauri-plugin-single-instance）
+//   3. 建主窗口（1280×800 缺省/960×600 最小/尺寸位置记忆）加载内置加载页；
+//      initialization_script 预置工作台 token（每次文档创建都执行）
+//   4. 守护线程编排：engine → 健康探测 → serve → 健康探测 → runtime.json；
+//      之后子进程监视：意外退出 → 60s 滑窗 3 次退避内整组重启，超限降级页
+//   5. 托盘：打开主窗 / 重启服务 / 打开数据目录 / 退出
+//   6. 关窗缺省最小化到托盘（shell.toml [ui].close_directly 可配直接退出）；
+//      退出走两段式优雅停（Ctrl+C → 5s 超时强杀）+ KILL_ON_JOB_CLOSE 兜底
 
 mod health;
 mod job;
 mod orchestrator;
 mod shell_config;
+mod supervisor;
 
 use std::os::windows::process::CommandExt;
-use std::sync::{Arc, Mutex, RwLock};
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
-use tauri::{RunEvent, Url, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    Manager, RunEvent, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+};
+use tauri_plugin_single_instance::init as single_instance_init;
+
+use supervisor::Supervisor;
 
 type NavPort = Arc<RwLock<Option<u16>>>;
-type RuntimeState = Arc<Mutex<Option<orchestrator::Runtime>>>;
+type SupHandle = Arc<Supervisor>;
 
 /// 仅保留 RFC 3986 unreserved 字符，其余 percent-encode（query 值编码）。
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         match b {
@@ -65,28 +74,101 @@ fn open_in_system_browser(url: &str) {
         .spawn();
 }
 
+fn open_in_explorer(dir: &std::path::Path) {
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+}
+
+// ---- 窗口尺寸记忆（%APPDATA%\evo-agent-desktop\window.json） ----
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct WindowState {
+    w: f64,
+    h: f64,
+    x: f64,
+    y: f64,
+}
+
+fn window_state_path(paths: &shell_config::ResolvedPaths) -> PathBuf {
+    paths.app_config_dir.join("window.json")
+}
+
+fn load_window_state(paths: &shell_config::ResolvedPaths) -> Option<WindowState> {
+    let raw = std::fs::read_to_string(window_state_path(paths)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn save_window_state(paths: &shell_config::ResolvedPaths, win: &WebviewWindow) {
+    if !win.is_visible().unwrap_or(false) {
+        return; // 隐藏态（托盘最小化）无有效几何，跳过
+    }
+    let state = WindowState {
+        w: win.outer_size().map(|s| s.width as f64).unwrap_or(1280.0),
+        h: win.outer_size().map(|s| s.height as f64).unwrap_or(800.0),
+        x: win.outer_position().map(|p| p.x as f64).unwrap_or(0.0),
+        y: win.outer_position().map(|p| p.y as f64).unwrap_or(0.0),
+    };
+    if let Some(dir) = window_state_path(paths).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(&state) {
+        let _ = std::fs::write(window_state_path(paths), json);
+    }
+}
+
+// ---- Tauri commands（降级页按钮 / 托盘复用同路径） ----
+
+#[tauri::command]
+fn restart_services(sup: tauri::State<'_, SupHandle>) -> Result<(), String> {
+    sup.manual_restart();
+    Ok(())
+}
+
+#[tauri::command]
+fn open_logs_dir(sup: tauri::State<'_, SupHandle>) -> Result<(), String> {
+    open_in_explorer(&sup.paths.logs_dir);
+    Ok(())
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = shell_config::load();
     let version = env!("CARGO_PKG_VERSION").to_string();
-    let runtime_state: RuntimeState = Arc::new(Mutex::new(None));
+    // 路径解析失败直接退（无窗口必要；错误可经 shell.toml 修复后重试）
+    let paths = shell_config::resolve(&cfg)?;
+    let close_directly = cfg.ui.close_directly;
+    let console = cfg.console.clone();
+    let engine_extra_args = cfg.engine.extra_args.clone();
 
     let app = tauri::Builder::default()
-        .setup({
-            let runtime_state = runtime_state.clone();
-            move |app| {
-                let handle = app.handle().clone();
-                let nav_port: NavPort = Arc::new(RwLock::new(None));
-                let serve_token = orchestrator::gen_token();
-                let engine_token = orchestrator::gen_token();
+        // 单实例必须最先注册：二次启动唤起既有窗口
+        .plugin(single_instance_init(move |app, _args, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
+        .invoke_handler(tauri::generate_handler![restart_services, open_logs_dir])
+        .setup(move |app| {
+            let handle = app.handle().clone();
+            let nav_port: NavPort = Arc::new(RwLock::new(None));
+            let serve_token = orchestrator::gen_token();
+            let engine_token = orchestrator::gen_token();
 
-                let win = WebviewWindowBuilder::new(
-                    &handle,
-                    "main",
-                    WebviewUrl::App("index.html".into()),
-                )
-                .title("evo-agent")
-                .inner_size(1280.0, 800.0)
-                .min_inner_size(960.0, 600.0)
+            // 窗口尺寸记忆：缺省 1280×800，最小 960×600
+            let mut builder = WebviewWindowBuilder::new(
+                &handle,
+                "main",
+                WebviewUrl::App("index.html".into()),
+            )
+            .title("evo-agent")
+            .min_inner_size(960.0, 600.0);
+            builder = match load_window_state(&paths) {
+                Some(ws) if ws.w >= 960.0 && ws.h >= 600.0 => {
+                    builder.inner_size(ws.w, ws.h).position(ws.x, ws.y)
+                }
+                _ => builder.inner_size(1280.0, 800.0),
+            };
+            let win = builder
                 .initialization_script(&init_script(&serve_token))
                 .on_navigation({
                     let nav_port = nav_port.clone();
@@ -100,62 +182,87 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .build()?;
 
-                let nav_port_for_task = nav_port.clone();
-                let runtime_state_for_task = runtime_state.clone();
-                let version_for_task = version.clone();
-                std::thread::spawn(move || {
-                    eprintln!("[shell] orchestration thread started");
-                    // 路径解析失败也走降级页（配置可修后重试），不崩壳
-                    let outcome = shell_config::resolve(&cfg).and_then(|paths| {
-                        orchestrator::launch(orchestrator::LaunchInput {
-                            paths: &paths,
-                            console: &cfg.console,
-                            engine_extra_args: &cfg.engine.extra_args,
-                            serve_token: &serve_token,
-                            engine_token: &engine_token,
-                            version: &version_for_task,
-                        })
-                    });
-                    match outcome {
-                        Ok(rt) => {
-                            *nav_port_for_task.write().unwrap() = Some(rt.serve_port);
-                            let url = format!("http://127.0.0.1:{}/", rt.serve_port);
-                            if let Ok(u) = Url::parse(&url) {
-                                let _ = win.navigate(u);
-                            }
-                            *runtime_state_for_task.lock().unwrap() = Some(rt);
-                        }
-                        Err(e) => {
-                            let logs = std::env::var("LOCALAPPDATA")
-                                .map(|d| {
-                                    std::path::PathBuf::from(d)
-                                        .join("com.evorule.evo-agent-desktop")
-                                        .join("logs")
-                                        .display()
-                                        .to_string()
-                                })
-                                .unwrap_or_default();
-                            let url = format!(
-                                "http://tauri.localhost/error.html?msg={}&logs={}",
-                                percent_encode(&e),
-                                percent_encode(&logs),
-                            );
-                            if let Ok(u) = Url::parse(&url) {
-                                let _ = win.navigate(u);
-                            }
-                        }
+            // 守护器：job 创建 + 自收编在此完成
+            let sup = Supervisor::new(
+                paths.clone(),
+                console,
+                engine_extra_args,
+                serve_token,
+                engine_token,
+                version,
+                win.clone(),
+                nav_port.clone(),
+            )?;
+            app.manage(sup.clone());
+
+            // 关窗行为：缺省最小化到托盘；[ui].close_directly = true 时直接退出
+            let sup_for_close = sup.clone();
+            let paths_for_close = paths.clone();
+            let win_for_close = win.clone();
+            win.on_window_event(move |event| {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    save_window_state(&paths_for_close, &win_for_close);
+                    if close_directly {
+                        sup_for_close.shutdown();
+                    } else {
+                        let _ = win_for_close.hide();
                     }
-                });
-                Ok(())
-            }
+                }
+            });
+
+            // 托盘：打开主窗 / 重启服务 / 打开数据目录 / 退出
+            use tauri::menu::{MenuBuilder, MenuItem};
+            let mk = |id: &str, label: &str| {
+                MenuItem::with_id(app, id, label, true, None::<&str>)
+            };
+            let menu = MenuBuilder::new(app)
+                .item(&mk("open", "打开主窗")?)
+                .item(&mk("restart", "重启服务")?)
+                .item(&mk("data", "打开数据目录")?)
+                .separator()
+                .item(&mk("quit", "退出")?)
+                .build()?;
+            let sup_for_tray = sup.clone();
+            tauri::tray::TrayIconBuilder::with_id("main-tray")
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("evo-agent")
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(move |app, event| {
+                    let sup = &sup_for_tray;
+                    match event.id().as_ref() {
+                        "open" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "restart" => {
+                            sup.manual_restart();
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "data" => open_in_explorer(&sup.paths.data_dir),
+                        "quit" => sup.shutdown(),
+                        _ => {}
+                    }
+                })
+                .build(app)?;
+
+            sup.start();
+            Ok(())
         })
         .build(tauri::generate_context!())?;
 
-    let runtime_state_for_run = runtime_state.clone();
-    app.run(move |_, event| {
+    // 兜底：任何未被拦截的退出请求同样走优雅停序列（shutting_down 幂等护栏）
+    app.run(move |app, event| {
         if let RunEvent::ExitRequested { .. } = event {
-            if let Some(rt) = runtime_state_for_run.lock().unwrap().as_ref() {
-                rt.shutdown();
+            if let Some(sup) = app.try_state::<SupHandle>() {
+                sup.shutdown();
             }
         }
     });
