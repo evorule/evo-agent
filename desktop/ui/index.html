@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>evo-agent</title>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: #12233f;
+        color: #8fd18f;
+        font-family: "Segoe UI", sans-serif;
+        gap: 24px;
+      }
+      .mark {
+        width: 96px;
+        height: 96px;
+        animation: spin 3.2s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .text {
+        font-size: 15px;
+        letter-spacing: 0.08em;
+        opacity: 0.85;
+      }
+    </style>
+  </head>
+  <body>
+    <svg class="mark" viewBox="0 0 100 100" fill="none" stroke="#3fae4e" stroke-width="4">
+      <polygon points="50,6 89,28 89,72 50,94 11,72 11,28" />
+      <circle cx="50" cy="50" r="20" />
+      <circle cx="50" cy="50" r="4" fill="#3fae4e" stroke="none" />
+    </svg>
+    <div class="text">正在启动 evo-agent 服务…</div>
+  </body>
+</html>
