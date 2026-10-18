@@ -62,6 +62,8 @@ pub struct ResolvedPaths {
     pub engine_data_dir: PathBuf,
     /// 日志目录（data_dir\logs）
     pub logs_dir: PathBuf,
+    /// 壳配置目录（%APPDATA%\evo-agent-desktop；用户 evo-agent.toml 透传查找位）
+    pub app_config_dir: PathBuf,
 }
 
 fn shell_config_path() -> Option<PathBuf> {
@@ -95,32 +97,62 @@ fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
+fn app_config_dir() -> Option<PathBuf> {
+    std::env::var("APPDATA").ok().map(|d| PathBuf::from(d).join("evo-agent-desktop"))
+}
+
+/// 安装态优先：NSIS 资源布局（exe_dir\resources\...）存在即用之，否则回落
+/// 开发态布局（exe 同目录直接放二进制/资源根，由 shell.toml 显式指定）。
+fn installed_or(installed: PathBuf, fallback: PathBuf) -> PathBuf {
+    if installed.exists() {
+        installed
+    } else {
+        fallback
+    }
+}
+
 pub fn resolve(cfg: &ShellConfig) -> Result<ResolvedPaths, String> {
     let exe_dir = exe_dir().ok_or("cannot resolve current exe dir")?;
     let evo_agent_exe = cfg
         .paths
         .evo_agent_exe
         .clone()
-        .unwrap_or_else(|| exe_dir.join("evo-agent.exe"));
+        .unwrap_or_else(|| {
+            installed_or(
+                exe_dir.join("resources").join("bin").join("evo-agent.exe"),
+                exe_dir.join("evo-agent.exe"),
+            )
+        });
     let evo_agent_home = cfg
         .paths
         .evo_agent_home
         .clone()
-        .unwrap_or_else(|| exe_dir.clone());
+        .unwrap_or_else(|| installed_or(exe_dir.join("resources").join("evo-agent"), exe_dir.clone()));
     let evorule_server_exe = cfg
         .paths
         .evorule_server_exe
         .clone()
-        .unwrap_or_else(|| exe_dir.join("evorule-server.exe"));
+        .unwrap_or_else(|| {
+            installed_or(
+                exe_dir.join("resources").join("bin").join("evorule-server.exe"),
+                exe_dir.join("evorule-server.exe"),
+            )
+        });
     let evorule_server_home = cfg
         .paths
         .evorule_server_home
         .clone()
-        .unwrap_or_else(|| exe_dir.clone());
+        .unwrap_or_else(|| installed_or(
+            exe_dir.join("resources").join("evorule-server"),
+            exe_dir.clone(),
+        ));
 
+    // 数据根用 identifier（与 NSIS currentUser 安装目录 %LOCALAPPDATA%\{productName} 隔离，
+    // 防卸载危及用户数据）
     let data_dir = std::env::var("LOCALAPPDATA")
-        .map(|d| PathBuf::from(d).join("evo-agent-desktop"))
+        .map(|d| PathBuf::from(d).join("com.evorule.evo-agent-desktop"))
         .map_err(|_| "LOCALAPPDATA not set".to_string())?;
+    let app_config = app_config_dir().unwrap_or_else(|| data_dir.join("config"));
 
     Ok(ResolvedPaths {
         evo_agent_exe,
@@ -131,5 +163,6 @@ pub fn resolve(cfg: &ShellConfig) -> Result<ResolvedPaths, String> {
         logs_dir: data_dir.join("logs"),
         engine_data_dir: data_dir.join("engine-data"),
         data_dir,
+        app_config_dir: app_config,
     })
 }

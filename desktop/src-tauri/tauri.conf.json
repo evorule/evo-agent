@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "evo-agent",
+  "productName": "evo-agent-desktop",
   "version": "0.2.0",
   "identifier": "com.evorule.evo-agent-desktop",
   "build": {
@@ -16,9 +16,18 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
+    "resources": [
+      "resources/bin/*",
+      "resources/evo-agent/**/*",
+      "resources/evorule-server/**/*"
+    ],
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"]
       }
     }
   }

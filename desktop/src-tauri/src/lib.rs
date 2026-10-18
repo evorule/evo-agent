@@ -129,7 +129,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             let logs = std::env::var("LOCALAPPDATA")
                                 .map(|d| {
                                     std::path::PathBuf::from(d)
-                                        .join("evo-agent-desktop")
+                                        .join("com.evorule.evo-agent-desktop")
                                         .join("logs")
                                         .display()
                                         .to_string()
