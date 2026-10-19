@@ -2326,36 +2326,62 @@ fn cmd_serve(
     let workbench = tower_http::services::ServeDir::new(&dist_dir).not_found_service(
         tower_http::services::ServeFile::new(dist_dir.join("index.html")),
     );
-    let app = axum::Router::new()
-        .merge(agent_api::router_with_auth(state, auth_config))
+    let mut app = axum::Router::new().merge(agent_api::router_with_auth(state, auth_config));
+
+    // console 审计页双形态接入(配置化,fail-soft):
+    // 1) <console_dir>/build/index.html 在位 → 同源静态托管 /console(产物形态,
+    //    纯净机无 node 可用;审计深链 /console/audit 同源直达)。挂外层 Router,
+    //    不经 auth 中间件 —— 静态页须无 token 可打开(与 workbench fallback 同理)。
+    // 2) 产物缺位 → 回落 dev 拉起(开发场景,见下方 sidecar 段,fail-soft)。
+    let mut console_hosted = false;
+    if let Some(console_dir) = config.workbench.console_dir.clone() {
+        if let Some(build_dir) =
+            evo_agent::api::console_sidecar::static_build_dir(std::path::Path::new(&console_dir))
+        {
+            let console_service =
+                tower_http::services::ServeDir::new(&build_dir).not_found_service(
+                    tower_http::services::ServeFile::new(build_dir.join("index.html")),
+                );
+            app = app.nest_service("/console", console_service);
+            console_hosted = true;
+            eprintln!(
+                "[console] static hosting from {} at /console (audit deep-link: /console/audit)",
+                build_dir.display()
+            );
+        }
+    }
+
+    let app = app
         .fallback_service(workbench)
         .layer(CorsLayer::permissive())
         .layer(RequestBodyLimitLayer::new(1024 * 1024));
 
-    // console 审计页 sidecar 自动拉起(配置化,fail-soft)。
-    // workbench.console_dir 配置 console-cloud 仓目录后,serve 启动期探测端口,
-    // 未监听则拉起 vite dev(审计深链数据源);未配置/目录无效/拉起失败仅告警。
-    if let Some(console_dir) = config.workbench.console_dir.clone() {
-        let port = config
-            .workbench
-            .console_port
-            .unwrap_or(evo_agent::api::console_sidecar::DEFAULT_CONSOLE_PORT);
-        let log_file = workdir.join("data").join("console_sidecar.log");
-        runtime.spawn(async move {
-            let (spawned, msg) = evo_agent::api::console_sidecar::ensure_console_dev(
-                &console_dir,
-                port,
-                Some(&log_file),
-            )
-            .await;
-            eprintln!("[console-sidecar] {}", msg);
-            if spawned {
-                eprintln!(
-                    "[console-sidecar] audit deep-link target: http://localhost:{}/audit",
-                    port
-                );
-            }
-        });
+    // console 审计页 sidecar 自动拉起(仅 dev 形态;产物已静态托管时跳过,fail-soft)。
+    // workbench.console_dir 配置 console-cloud 仓目录且产物缺位时,serve 启动期
+    // 探测端口,未监听则拉起 vite dev;未配置/目录无效/拉起失败仅告警。
+    if !console_hosted {
+        if let Some(console_dir) = config.workbench.console_dir.clone() {
+            let port = config
+                .workbench
+                .console_port
+                .unwrap_or(evo_agent::api::console_sidecar::DEFAULT_CONSOLE_PORT);
+            let log_file = workdir.join("data").join("console_sidecar.log");
+            runtime.spawn(async move {
+                let (spawned, msg) = evo_agent::api::console_sidecar::ensure_console_dev(
+                    &console_dir,
+                    port,
+                    Some(&log_file),
+                )
+                .await;
+                eprintln!("[console-sidecar] {}", msg);
+                if spawned {
+                    eprintln!(
+                        "[console-sidecar] audit deep-link (dev): http://localhost:{}/audit",
+                        port
+                    );
+                }
+            });
+        }
     }
 
     // 快照目录自建 + 启动清扫 + 每日周期清理。

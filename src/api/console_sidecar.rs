@@ -21,6 +21,17 @@ pub async fn is_port_listening(port: u16) -> bool {
     TcpListener::bind(addr).await.is_err()
 }
 
+/// 探测静态产物在位,返回产物目录(`<dir>/build/`)。
+///
+/// 产物在位(即已执行 `CONSOLE_BASE=/console/ npm run build`)时,serve 直接
+/// 同源静态托管 `/console`,无需 dev server;返回 None 表示产物缺位,由调用方
+/// 回落 dev 拉起形态。
+pub fn static_build_dir(dir: &Path) -> Option<PathBuf> {
+    let build = dir.join("build");
+    let index = build.join("index.html");
+    index.is_file().then_some(build)
+}
+
 /// 校验 console 目录具备启动条件,返回 vite 入口路径
 /// (`<dir>/node_modules/vite/bin/vite.js` 必须存在,即已 npm install)
 pub fn vite_entry(dir: &Path) -> Option<PathBuf> {
@@ -136,6 +147,21 @@ mod tests {
     #[test]
     fn test_vite_entry_missing_dir() {
         assert!(vite_entry(Path::new("Z:/definitely/not/a/dir")).is_none());
+    }
+
+    #[test]
+    fn test_static_build_dir_present_and_absent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "evo-console-probe-{}",
+            std::process::id()
+        ));
+        let build = tmp.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        assert!(static_build_dir(&tmp).is_none()); // index.html 缺位
+        std::fs::write(build.join("index.html"), "<html></html>").unwrap();
+        let found = static_build_dir(&tmp).expect("build dir should be detected");
+        assert!(found.ends_with("build"));
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[tokio::test]
