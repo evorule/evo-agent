@@ -36,7 +36,7 @@ pub fn router(client: EvoruleApiClient) -> Router {
 /// 剥离代理前缀 + 拼 query,得到转发用 path?query(纯逻辑,独立可测)。
 pub fn target_path(path: &str, query: Option<&str>) -> Option<String> {
     let rest = path.strip_prefix(CONSOLE_API_PREFIX)?;
-    if rest.is_empty() {
+    if rest.is_empty() || rest == "/" {
         return None;
     }
     Some(match query {
