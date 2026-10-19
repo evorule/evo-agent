@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! O-511 复现探针:delegate 子代理栈溢出(长 task 文本场景)
+//! 复现探针:delegate 子代理栈溢出(长 task 文本场景)
 //!
 //! 复现口径:delegate 携带约 3KB 长 task(含嵌套代码块/XML 示例)下探 researcher
 //! 子代理,进程 `thread 'main' has overflowed its stack`(0xC00000FD)。
@@ -15,7 +15,7 @@ use evo_agent::agent::definition::AgentDefinitionManager;
 use evo_agent::agent::delegate::DelegateContext;
 use evo_agent::api::evorule_client::EvoruleApiClient;
 
-/// O-511 实录等价 task 文本(约 3KB,含嵌套代码块/XML 标签/JSON 示例)
+/// 实录等价 task 文本(约 3KB,含嵌套代码块/XML 标签/JSON 示例)
 const LONG_TASK: &str = r#"Read the file rules/22_djbh_rules.json (it's a JSON rule_set document with a top-level "transform" array of 4 branch entries).
 
 Then call the tool `inference_rw_extract` with EXACTLY these parameters:

@@ -33,6 +33,15 @@ $patterns = @(
     "-----BEGIN [A-Z ]*PRIVATE KEY-----",        # PEM private key
     "(?i)(api[_-]?key|secret|token)\s*[=:]\s*""[A-Za-z0-9_\-]{20,}"""  # hardcoded key assignment
 )
+# Whitelist: documentation example values used by the exfiltration detector's
+# own rule corpus/tests in src/builtin_tools/exfil_scan.rs (the detector must
+# carry secret-shaped literals by construction; these are published sample
+# values, not real credentials). Entries are content-exact on purpose -- no
+# line numbers (they drift with edits).
+$secretScanWhitelist = @(
+    "AKIAIOSFODNN7EXAMPLE",                      # AWS docs sample access key id
+    "-----BEGIN RSA PRIVATE KEY-----"            # generic PEM header test fixture
+)
 $targets = @("src", "config-examples", "docs", "agents", "assets", "README.md", "NOTICE.md", "CHANGELOG.md")
 $hits = @()
 foreach ($t in $targets) {
@@ -40,7 +49,13 @@ foreach ($t in $targets) {
         foreach ($p in $patterns) {
             $m = Get-ChildItem $t -Recurse -File -ErrorAction SilentlyContinue |
                 Select-String -Pattern $p -ErrorAction SilentlyContinue
-            foreach ($x in $m) { $hits += "$($x.Path):$($x.LineNumber)" }
+            foreach ($x in $m) {
+                $whitelisted = $false
+                foreach ($w in $secretScanWhitelist) {
+                    if ($null -ne $x.Line -and $x.Line.Contains($w)) { $whitelisted = $true; break }
+                }
+                if (-not $whitelisted) { $hits += "$($x.Path):$($x.LineNumber)" }
+            }
         }
     }
 }

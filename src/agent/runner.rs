@@ -1109,7 +1109,7 @@ pub struct AgentRunner {
     /// ——CLI/子代理路径零改动)。run_streaming_inner 创建会话时在此目录建
     /// `{session_id}.jsonl` 事件流(会话唯一真相源,见 crate::agent::journal)
     journal_dir: Option<std::path::PathBuf>,
-    /// G1/O-493:会话执行环境 profile 标记(serve 请求级>定义级、CLI 定义级
+    /// 会话执行环境 profile 标记(serve 请求级>定义级、CLI 定义级
     /// 显式声明才注入)。随 tool_result 落账进 journal——trusted 环境下工具
     /// 结果在审计事件中明文可追溯。None=既有行为零变化(旧账无标记语义)
     execution_profile: Option<String>,
@@ -1928,7 +1928,7 @@ impl AgentRunner {
         self
     }
 
-    /// O-493:注入会话执行环境 profile 标记(workbench|sandbox-trusted)。
+    /// 注入会话执行环境 profile 标记(workbench|sandbox-trusted)。
     /// 仅显式声明才注入(None=缺省语义零变化);随 tool_result 落账进 journal
     pub fn with_execution_profile_marker(mut self, profile: Option<&str>) -> Self {
         self.execution_profile = profile.map(str::to_string);

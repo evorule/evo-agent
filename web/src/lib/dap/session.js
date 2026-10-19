@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-// DAP 调试会话层:状态机 + launch 时序 + 断点全量同步语义(34 号 §三.3)。
+// DAP 调试会话层:状态机 + launch 时序 + 断点全量同步语义(设计档 §三.3)。
 //
 // 核心时序(launch):
 //   connect → initialize → (response) → launch(配置参数) →
@@ -15,7 +15,7 @@
 
 import { pathToFileUri } from '../lsp/client.js';
 
-/** 会话状态(镜像 34 号 §三.2;与 client 层状态解耦——client 只管连接) */
+/** 会话状态(镜像设计档 §三.2;与 client 层状态解耦——client 只管连接) */
 export const DBG_STATES = {
   IDLE: 'idle',
   CONNECTING: 'connecting',
@@ -34,7 +34,7 @@ const MAX_BREAKPOINTS_PER_FILE = 200;
 /**
  * launch 配置解析:.evo/debug.json 自有形态(数组或 {configurations:[]}),
  * 兼容读取 .vscode/launch.json 同名字段(type/request/name/program/args/cwd/env)。
- * 返回规范形态数组;request 非 launch 的配置过滤掉(v1 仅 launch,34 号 §一)。
+ * 返回规范形态数组;request 非 launch 的配置过滤掉(v1 仅 launch,设计档 §一)。
  */
 export function normalizeLaunchConfigs(raw) {
   if (!raw) return [];

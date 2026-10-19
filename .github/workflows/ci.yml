@@ -75,6 +75,11 @@ jobs:
   web-test:
     name: web unit tests (vitest)
     runs-on: ubuntu-latest
+    env:
+      # vitest heap guard: the runner Node default old-space ceiling is too
+      # small for the current web test volume (JavaScript heap OOM); raise it
+      # for this job only (runner has 16 GB RAM).
+      NODE_OPTIONS: --max-old-space-size=6144
     defaults:
       run:
         working-directory: web

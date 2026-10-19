@@ -1,13 +1,17 @@
 # NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
 #
 # 资源布局（安装后 {install}\resources\...，由 tauri.conf.json bundle.resources 承接）：
-#   resources\bin\evo-agent.exe             <- D:\evo-agent\target\release\evo-agent.exe
-#   resources\bin\evorule-server.exe        <- D:\evorule-server\target\release\evorule-server.exe
-#   resources\evo-agent\evo-agent.toml      <- D:\evo-agent\evo-agent.toml（可选，用户配置透传基座）
-#   resources\evo-agent\agents\             <- D:\evo-agent\agents
-#   resources\evo-agent\web\dist\           <- D:\evo-agent\web\dist
-#   resources\evorule-server\resources\     <- D:\evorule-server\resources
-#   resources\evorule-server\rules\         <- D:\evorule-server\rules
+#   resources\bin\evo-agent.exe             <- <repo>\target\release\evo-agent.exe
+#   resources\bin\evorule-server.exe        <- <server-repo>\target\release\evorule-server.exe
+#   resources\evo-agent\evo-agent.toml      <- <repo>\evo-agent.toml（可选，用户配置透传基座）
+#   resources\evo-agent\agents\             <- <repo>\agents
+#   resources\evo-agent\web\dist\           <- <repo>\web\dist
+#   resources\evorule-server\resources\     <- <server-repo>\resources
+#   resources\evorule-server\rules\         <- <server-repo>\rules
+#
+# <repo>       = 本仓根（本脚本所在 desktop 目录的上级）。
+# <server-repo> = 引擎仓根，默认取本仓同级 evorule-server 目录，-ServerRepo 可覆盖。
+# console 仓同理（-ConsoleRepo，默认同级 evorule-console-cloud）。
 #
 # 用法：powershell -File build-installer.ps1 [-SkipCollect] [-UpdateUrlBase <base>] [-ReleaseNotes <notes>]
 # 产物：desktop\target\release\bundle\nsis\evo-agent-desktop_<ver>_x64-setup.exe（+.sig）
@@ -23,6 +27,8 @@
 
 param(
     [switch]$SkipCollect,
+    [string]$ServerRepo = "",
+    [string]$ConsoleRepo = "",
     [string]$UpdateUrlBase = "http://127.0.0.1:18777",
     [string]$ReleaseNotes = ""
 )
@@ -30,15 +36,18 @@ param(
 $ErrorActionPreference = "Stop"
 $desktop = $PSScriptRoot
 $srcTauri = Join-Path $desktop "src-tauri"
+$repoRoot = Split-Path $desktop -Parent
+if (-not $ServerRepo) { $ServerRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-server" }
+if (-not $ConsoleRepo) { $ConsoleRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-console-cloud" }
 
 if (-not $SkipCollect) {
     $pairs = @(
-        @{ Src = "D:\evo-agent\target\release\evo-agent.exe";            Dst = "resources\bin\evo-agent.exe" },
-        @{ Src = "D:\evorule-server\target\release\evorule-server.exe";  Dst = "resources\bin\evorule-server.exe" },
-        @{ Src = "D:\evo-agent\agents";                                  Dst = "resources\evo-agent\agents" },
-        @{ Src = "D:\evo-agent\web\dist";                                Dst = "resources\evo-agent\web\dist" },
-        @{ Src = "D:\evorule-server\resources";                          Dst = "resources\evorule-server\resources" },
-        @{ Src = "D:\evorule-server\rules";                              Dst = "resources\evorule-server\rules" }
+        @{ Src = (Join-Path $repoRoot "target\release\evo-agent.exe");        Dst = "resources\bin\evo-agent.exe" },
+        @{ Src = (Join-Path $ServerRepo "target\release\evorule-server.exe"); Dst = "resources\bin\evorule-server.exe" },
+        @{ Src = (Join-Path $repoRoot "agents");                              Dst = "resources\evo-agent\agents" },
+        @{ Src = (Join-Path $repoRoot "web\dist");                            Dst = "resources\evo-agent\web\dist" },
+        @{ Src = (Join-Path $ServerRepo "resources");                         Dst = "resources\evorule-server\resources" },
+        @{ Src = (Join-Path $ServerRepo "rules");                             Dst = "resources\evorule-server\rules" }
     )
 
     foreach ($p in $pairs) {
@@ -52,16 +61,16 @@ if (-not $SkipCollect) {
     }
 
     # 用户配置透传基座（可选源，存在才收）
-    $userToml = "D:\evo-agent\evo-agent.toml"
+    $userToml = Join-Path $repoRoot "evo-agent.toml"
     if (Test-Path $userToml) {
         Copy-Item $userToml (Join-Path $srcTauri "resources\evo-agent\evo-agent.toml") -Force
         Write-Host "collected $userToml -> resources\evo-agent\evo-agent.toml"
     }
 
     # console 静态产物（可选源，存在才收；W6：在位即启用，缺位 = 安装包不带
-    # console 通道，壳启动探测缺位后静默不启用）。源 = console-cloud 仓
+    # console 通道，壳启动探测缺位后静默不启用）。源 = console 仓
     # CONSOLE_BASE=/console/ 构建产物。
-    $consoleBuild = "D:\evorule-console-cloud\build"
+    $consoleBuild = Join-Path $ConsoleRepo "build"
     if (Test-Path (Join-Path $consoleBuild "index.html")) {
         $consoleDst = Join-Path $srcTauri "resources\console"
         if (Test-Path $consoleDst -PathType Container) { Remove-Item $consoleDst -Recurse -Force }
@@ -69,7 +78,7 @@ if (-not $SkipCollect) {
         Copy-Item $consoleBuild (Join-Path $consoleDst "build") -Recurse -Force
         Write-Host "collected $consoleBuild -> resources\console\build"
     } else {
-        Write-Warning "console build missing (run: CONSOLE_BASE=/console/ npm --prefix D:\evorule-console-cloud run build); installer ships without console"
+        Write-Warning "console build missing (run: CONSOLE_BASE=/console/ npm --prefix $ConsoleRepo run build); installer ships without console"
     }
 }
 

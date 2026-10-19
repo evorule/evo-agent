@@ -1211,7 +1211,7 @@ async fn run_agent(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .with_capability_boundary(capability_boundary)
-    // O-493:执行环境 profile 标记随 tool_result 落账(trusted 审计明文可追溯;
+    // 执行环境 profile 标记随 tool_result 落账(trusted 审计明文可追溯;
     // 未声明=None=落账无标记,零变化)
     .with_execution_profile_marker(execution_profile.as_ref().map(|p| p.as_str()))
     // serve 面 delegate 执行能力接线(B25 批顺手修,CLI run 主路径同款镜像):
@@ -1640,7 +1640,7 @@ async fn run_agent_stream(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .with_capability_boundary(capability_boundary)
-    // O-493:执行环境 profile 标记随 tool_result 落账(同 run_agent 口径)
+    // 执行环境 profile 标记随 tool_result 落账(同 run_agent 口径)
     .with_execution_profile_marker(execution_profile.as_ref().map(|p| p.as_str()))
     // serve 面 delegate 执行能力接线(同 run_agent 端点;SSE 流式面)
     .with_delegate_context(
@@ -2423,7 +2423,7 @@ struct ReplayQueryParams {
     narrate: Option<bool>,
 }
 
-/// O-493 A 案:审计回放本地兜底合成(纯函数核心,单测直测)
+/// 审计回放本地兜底合成(纯函数核心,单测直测)
 ///
 /// 输入 journal 全量行 + transcript tool 消息原文(按执行序),产出合成回放
 /// 事件:ToolInvoked/ToolResult 按 call_id 配对,分发序对位原文,digest 复算
@@ -2494,7 +2494,7 @@ fn synth_replay_events(
     events
 }
 
-/// O-493 A 案:审计回放本地兜底合成(IO 包装)
+/// 审计回放本地兜底合成(IO 包装)
 ///
 /// 引擎事件流为空(server 数据丢失/纯内存态重启)时,用本地 journal 事件
 /// 骨架(journal 恒在本地 `data/sessions/{sid}.jsonl`,不依赖引擎)+
@@ -2562,7 +2562,7 @@ async fn replay_session_events(
     }
 
     if store.event_count() == 0 {
-        // O-493 A 案:引擎事件流为空 → 本地 journal 兜底合成(事件骨架+
+        // 引擎事件流为空 → 本地 journal 兜底合成(事件骨架+
         // transcript 原文按分发序对齐,digest 复算防伪)。合成失败/无账
         // → 原空响应语义零变化
         let synthesized = synthesize_replay_from_journal(&state, &session_id).await;
@@ -2923,7 +2923,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// O-493:本地兜底合成——call_id 配对 + 分发序对位 + digest 复算防伪
+    /// 本地兜底合成——call_id 配对 + 分发序对位 + digest 复算防伪
     #[test]
     fn test_synth_replay_events_pairs_and_digest_guard() {
         use crate::agent::journal::{evorule_digest, JournalEvent, JournalLine};
@@ -2988,7 +2988,7 @@ mod tests {
         assert!(e2.content["output"].is_null(), "宁缺毋假");
     }
 
-    /// O-493:孤立 tool_result(无 invoked 配对)→ tool/output 双空,不误配
+    /// 孤立 tool_result(无 invoked 配对)→ tool/output 双空,不误配
     #[test]
     fn test_synth_replay_events_orphan_result() {
         use crate::agent::journal::{JournalEvent, JournalLine};

@@ -38,8 +38,8 @@ export function diffLines(oldText, newText) {
       j++;
     }
   }
-  while (i < n) out.push({ type: 'del', text: a[i], oldLine: i + 1 });
-  while (j < m) out.push({ type: 'add', text: b[j], newLine: j + 1 });
+  while (i < n) { out.push({ type: 'del', text: a[i], oldLine: i + 1 }); i++; }
+  while (j < m) { out.push({ type: 'add', text: b[j], newLine: j + 1 }); j++; }
   return out;
 }
 

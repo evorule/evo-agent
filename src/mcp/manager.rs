@@ -137,7 +137,7 @@ impl McpManager {
                 }
                 other => return Err(format!("unsupported MCP transport '{}'", other)),
             };
-        // O-515:握手 + 工具发现整体受 timeout_secs 约束(兑现 connect_server
+        // 握手 + 工具发现整体受 timeout_secs 约束(兑现 connect_server
         // 文档承诺;原无界 await——hang 住的 server 会拖死 serve 启动期
         // block_on 与 CLI 连接路径)
         let deadline = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(snap[0].1.status.as_str(), "failed");
     }
 
-    /// O-515:连接/发现阶段超时——responder 接受连接但永不响应,connect 必须
+    /// 连接/发现阶段超时——responder 接受连接但永不响应,connect 必须
     /// 在 timeout_secs 附近报超时错误(原无界 await 会拖死调用方)。纯 Rust
     /// hung responder(accept 后握住不写回),无外部依赖。
     #[tokio::test]

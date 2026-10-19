@@ -2524,7 +2524,7 @@ mod tests {
         );
     }
 
-    /// O-493:旧账兼容——无 execution_profile 键的历史行反序列化缺省 None
+    /// 旧账兼容——无 execution_profile 键的历史行反序列化缺省 None
     #[test]
     fn test_tool_result_legacy_line_without_profile() {
         let line = r#"{"seq":1,"ts":1000,"type":"tool_result","payload":{"call_id":"t1","status":"ok","size_bytes":3,"content_digest":"abc"}}"#;
@@ -2539,7 +2539,7 @@ mod tests {
         }
     }
 
-    /// O-493:新账标记随行落账——execution_profile 往返保持
+    /// 新账标记随行落账——execution_profile 往返保持
     #[test]
     fn test_tool_result_execution_profile_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
