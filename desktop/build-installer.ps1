@@ -1,4 +1,4 @@
-﻿# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
+# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
 #
 # 资源布局（安装后 {install}\resources\...，由 tauri.conf.json bundle.resources 承接）：
 #   resources\bin\evo-agent.exe             <- D:\evo-agent\target\release\evo-agent.exe
@@ -56,6 +56,20 @@ if (-not $SkipCollect) {
     if (Test-Path $userToml) {
         Copy-Item $userToml (Join-Path $srcTauri "resources\evo-agent\evo-agent.toml") -Force
         Write-Host "collected $userToml -> resources\evo-agent\evo-agent.toml"
+    }
+
+    # console 静态产物（可选源，存在才收；W6：在位即启用，缺位 = 安装包不带
+    # console 通道，壳启动探测缺位后静默不启用）。源 = console-cloud 仓
+    # CONSOLE_BASE=/console/ 构建产物。
+    $consoleBuild = "D:\evorule-console-cloud\build"
+    if (Test-Path (Join-Path $consoleBuild "index.html")) {
+        $consoleDst = Join-Path $srcTauri "resources\console"
+        if (Test-Path $consoleDst -PathType Container) { Remove-Item $consoleDst -Recurse -Force }
+        New-Item -ItemType Directory -Path $consoleDst -Force | Out-Null
+        Copy-Item $consoleBuild (Join-Path $consoleDst "build") -Recurse -Force
+        Write-Host "collected $consoleBuild -> resources\console\build"
+    } else {
+        Write-Warning "console build missing (run: CONSOLE_BASE=/console/ npm --prefix D:\evorule-console-cloud run build); installer ships without console"
     }
 }
 
