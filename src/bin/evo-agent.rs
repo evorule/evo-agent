@@ -2356,10 +2356,9 @@ fn cmd_serve(
 
     let mut app = axum::Router::new().merge(agent_api::router_with_auth(state, auth_config));
     if let Some(build_dir) = console_build_dir {
-        let console_service =
-            tower_http::services::ServeDir::new(&build_dir).fallback(
-                tower_http::services::ServeFile::new(build_dir.join("index.html")),
-            );
+        let console_service = tower_http::services::ServeDir::new(&build_dir).fallback(
+            tower_http::services::ServeFile::new(build_dir.join("index.html")),
+        );
         app = app.nest_service("/console", console_service);
     }
     if let Some(proxy_router) = console_proxy_router {

@@ -70,7 +70,10 @@ async fn proxy(
         Ok(resp) => {
             let status = resp.status();
             let mut builder = Response::builder().status(status.as_u16());
-            for h in [axum::http::header::CONTENT_TYPE, axum::http::header::CONTENT_LENGTH] {
+            for h in [
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::CONTENT_LENGTH,
+            ] {
                 if let Some(v) = resp.headers().get(&h) {
                     builder = builder.header(&h, v.clone());
                 }
@@ -85,11 +88,7 @@ async fn proxy(
                     .into_response(),
             }
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            format!("engine unreachable: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("engine unreachable: {e}")).into_response(),
     }
 }
 
