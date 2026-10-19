@@ -68,6 +68,11 @@ pub struct LlmConfig {
     /// `EVORULE_LLM_EXECUTOR_URL`,再回落 `http://127.0.0.1:9130/llm/execute`
     #[serde(default = "LlmConfig::default_executor_url")]
     pub executor_url: String,
+    /// 执行体调用方令牌(SG-1 件1 配套):env `EVORULE_LLM_EXECUTOR_TOKEN` 优先,
+    /// toml `[llm] executor_token` 兜底;出站 Authorization: Bearer 携带,
+    /// 执行体校验匹配即放行。None/空 = 不发送(dev 兼容)。
+    #[serde(default)]
+    pub executor_token: Option<String>,
     /// 请求超时(秒)
     #[serde(default = "default_llm_timeout")]
     pub timeout_secs: u64,
@@ -329,6 +334,7 @@ impl Default for LlmConfig {
             model: Self::default_model(),
             api_base: Self::default_api_base(),
             executor_url: Self::default_executor_url(),
+            executor_token: None,
             timeout_secs: default_llm_timeout(),
             max_retries: default_max_retries(),
         }

@@ -90,6 +90,9 @@ pub struct LlmHandler {
     default_model: String,
     /// 执行体端点(SG-1 件1 key 归边):所有 LLM 出站统一 POST 到此 URL
     executor_url: String,
+    /// 执行体调用方令牌(O-533):Some = 出站 Authorization: Bearer 携带,
+    /// ai-plugin 校验匹配即放行(本机其他进程无令牌即 401)
+    executor_token: Option<String>,
     /// If set, skip HTTP and return a canned LlmResponse-format JSON.
     /// Used by tests to avoid hitting a real LLM API.
     mock_content: Option<String>,
@@ -114,6 +117,7 @@ impl LlmHandler {
         Self {
             default_model: default_model.to_string(),
             executor_url: executor_url.to_string(),
+            executor_token: None,
             mock_content: None,
             max_retries: DEFAULT_MAX_RETRIES,
             base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
@@ -153,6 +157,7 @@ impl LlmHandler {
                 .unwrap_or_else(|_| "MiniMax-M2.5".to_string()),
             executor_url: std::env::var("EVORULE_LLM_EXECUTOR_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:9130/llm/execute".to_string()),
+            executor_token: std::env::var("EVORULE_LLM_EXECUTOR_TOKEN").ok(),
             mock_content: None,
             max_retries: DEFAULT_MAX_RETRIES,
             base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
@@ -171,6 +176,7 @@ impl LlmHandler {
         Self {
             default_model: config.model.clone(),
             executor_url: config.executor_url.clone(),
+            executor_token: config.executor_token.clone(),
             mock_content: None,
             max_retries: config.max_retries,
             base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
@@ -236,6 +242,7 @@ impl LlmHandler {
         Self {
             default_model: "mock".to_string(),
             executor_url: "mock://".to_string(),
+            executor_token: None,
             mock_content: Some(content.to_string()),
             max_retries: 0, // mock 不重试
             base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
@@ -338,7 +345,11 @@ impl LlmHandler {
             .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        client.post(&self.executor_url).json(body).send().await
+        let mut req = client.post(&self.executor_url).json(body);
+        if let Some(tok) = &self.executor_token {
+            req = req.header("Authorization", format!("Bearer {tok}"));
+        }
+        req.send().await
     }
 
     /// G3:解析 2xx 响应为 LlmResponse 格式 JSON
@@ -387,6 +398,7 @@ impl LlmHandler {
         let body_result = self.build_request_body(params);
         let executor_url = self.executor_url.clone();
         let mock_content = self.mock_content.clone();
+        let executor_token = self.executor_token.clone();
         // 超时值提升为局部量（stream! 块内不持有 &self）
         let connect_secs = self.connect_timeout_secs;
         let request_secs = self.request_timeout_secs;
@@ -417,6 +429,9 @@ impl LlmHandler {
             }
 
             // === HTTP 请求(执行体端点,无 Authorization——key 归边) ===
+            // === HTTP 请求(执行体端点) ===
+            // key 归边:仅携带执行体调用方令牌(SG-1 件1 配套,O-533),
+            // provider 凭据不出执行体。
             // streaming path same dual timeout
             let client = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(connect_secs))
@@ -424,7 +439,11 @@ impl LlmHandler {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new());
 
-            let resp = match client.post(&executor_url).json(&body).send().await {
+            let mut req = client.post(&executor_url).json(&body);
+            if let Some(tok) = &executor_token {
+                req = req.header("Authorization", format!("Bearer {tok}"));
+            }
+            let resp = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     yield Err(format!("LLM stream request failed: {}", e));
