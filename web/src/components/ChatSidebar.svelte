@@ -15,6 +15,7 @@
     openFile,
     composerMentions,
     activePath,
+    openSettingsTab,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
   import { approveProposal, listResumableRuns, getOrchestrationLinks } from '../lib/api.js';
@@ -69,7 +70,79 @@
     return `工作区:${parts[parts.length - 1] || workspace}`;
   }
 
+  // ---- S6 输入历史召回 + 草稿持久化(对齐主流 IDE 输入框) ----
+  // 空输入 ↑ 逐条召回已发送历史(0=最新),↓ 回退,至 -1 还原在途草稿;
+  // 未发送草稿(含引用 chip)localStorage 持久,刷新不丢。
+  const DRAFT_KEY = 'evo_chat_draft';
+  const MENTIONS_KEY = 'evo_chat_mentions';
+  const HISTORY_KEY = 'evo_chat_history';
+  const HISTORY_MAX = 50;
+
+  function loadDraftHistory() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+      return Array.isArray(raw)
+        ? raw.filter((x) => typeof x === 'string').slice(0, HISTORY_MAX)
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  let draftHistory = $state(loadDraftHistory());
+  let histIdx = $state(-1); // -1=草稿态;>=0=历史召回游标
+  let recallBase = ''; // 召回前的在途草稿暂存(非响应式)
+
+  function persistDraft() {
+    if (draft) {
+      localStorage.setItem(DRAFT_KEY, draft);
+      try {
+        localStorage.setItem(
+          MENTIONS_KEY,
+          JSON.stringify(
+            $composerMentions.map(({ type, ref, token }) => ({ type, ref, token })),
+          ),
+        );
+      } catch {
+        // 存储满等异常 fail-soft:草稿正文仍已持久
+      }
+    } else {
+      localStorage.removeItem(DRAFT_KEY);
+      localStorage.removeItem(MENTIONS_KEY);
+    }
+  }
+
+  function onInput() {
+    if (histIdx !== -1) histIdx = -1;
+    persistDraft();
+    detectMention();
+  }
+
+  // S1 自动增高:高度随内容伸缩,超过上限(约 8 行)内部滚动
+  const DRAFT_MAX_H = 176;
+  $effect(() => {
+    draft;
+    const el = draftEl;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, DRAFT_MAX_H)}px`;
+  });
+
   onMount(() => {
+    draft = localStorage.getItem(DRAFT_KEY) || '';
+    try {
+      const saved = JSON.parse(localStorage.getItem(MENTIONS_KEY) || '[]');
+      const chips = [];
+      for (const m of Array.isArray(saved) ? saved : []) {
+        if (!m || typeof m.token !== 'string' || typeof m.ref !== 'string') continue;
+        const at = draft.indexOf(m.token);
+        if (at < 0) continue;
+        chips.push({ type: m.type, ref: m.ref, insertAt: at, token: m.token });
+      }
+      if (chips.length > 0) composerMentions.set(chips);
+    } catch {
+      // 损坏存档 fail-soft:仅恢复正文
+    }
     registerMentionProviders();
     registerMentionSourceProviders();
     registerCommand({
@@ -335,6 +408,16 @@
     // 先清输入(防 await 窗口内重复提交),再对账,最后交 ws.js 组装发送
     draft = '';
     closeMention();
+    // S6:入历史(去重置顶,封顶 50),清草稿持久化
+    draftHistory = [text, ...draftHistory.filter((h) => h !== text)].slice(0, HISTORY_MAX);
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(draftHistory));
+    } catch {
+      // fail-soft:历史不可持久不影响本次发送
+    }
+    localStorage.removeItem(DRAFT_KEY);
+    localStorage.removeItem(MENTIONS_KEY);
+    histIdx = -1;
     const { kept } = await reconcileMentions(text, $composerMentions);
     composerMentions.set([]);
     sendMessage(text, kept);
@@ -362,6 +445,26 @@
       if (e.key === 'Escape') {
         e.preventDefault();
         closeMention();
+        return;
+      }
+    }
+    // S6 历史召回:空草稿 ↑ 进历史,召回态 ↑ 更早 / ↓ 回新(至 -1 还原在途草稿)
+    if (!mp && draftHistory.length > 0 && (draft === '' || histIdx >= 0)) {
+      if (e.key === 'ArrowUp' && !e.shiftKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        if (histIdx === -1) {
+          recallBase = draft;
+          histIdx = 0;
+        } else {
+          histIdx = Math.min(histIdx + 1, draftHistory.length - 1);
+        }
+        draft = draftHistory[histIdx];
+        return;
+      }
+      if (e.key === 'ArrowDown' && !e.shiftKey && histIdx >= 0) {
+        e.preventDefault();
+        histIdx -= 1;
+        draft = histIdx === -1 ? recallBase : draftHistory[histIdx];
         return;
       }
     }
@@ -599,29 +702,64 @@
     {/if}
     <textarea
       class="draft"
-      rows="2"
+      rows="1"
       placeholder={$turnActive ? 'agent 执行中…(可中断)' : '输入任务,@ 引用文件/上下文,Enter 发送'}
       bind:value={draft}
       bind:this={draftEl}
-      oninput={detectMention}
+      oninput={onInput}
       onkeydown={onKeydown}
       onblur={closeMention}
       disabled={$connStatus !== 'online'}
     ></textarea>
-    <div class="composer-meta">
-      <span class="token-est {tokenLevel(estimateComposerTokens(draft, $composerMentions))}">
-        ≈ {estimateComposerTokens(draft, $composerMentions)} tokens{#if $composerMentions.some((m) => m.type === 'file')}&nbsp;·&nbsp;含引用{/if}
-      </span>
-      {#if tokenLevel(estimateComposerTokens(draft, $composerMentions)) === 'over'}
-        <span class="token-est-hint">引用体积较大，可删除部分引用 chip</span>
-      {/if}
-    </div>
-    <div class="composer-actions">
-      {#if $turnActive}
-        <button class="btn danger" onclick={interrupt}>中断</button>
-      {:else}
-        <button class="btn primary" onclick={submit} disabled={!draft.trim() || $connStatus !== 'online'}>发送</button>
-      {/if}
+    <div class="composer-toolbar">
+      <div class="tb-left">
+        <button class="tb-btn" onclick={openMentionPopup} title="插入 @ 上下文引用">@</button>
+        <button class="tb-btn" disabled title="图片/附件上传(未接入,待后端配套)">
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+            <path
+              d="M8 3.2v9.6M3.2 8h9.6"
+              stroke="currentColor"
+              stroke-width="1.5"
+              fill="none"
+              stroke-linecap="round"
+            />
+          </svg>
+        </button>
+        <button class="tb-btn" onclick={openSettingsTab} title="MCP 服务管理(打开设置)">MCP</button>
+      </div>
+      <div class="tb-right">
+        <span class="token-est {tokenLevel(estimateComposerTokens(draft, $composerMentions))}">
+          ≈ {estimateComposerTokens(draft, $composerMentions)} tokens{#if $composerMentions.some((m) => m.type === 'file')}&nbsp;·&nbsp;含引用{/if}
+        </span>
+        {#if tokenLevel(estimateComposerTokens(draft, $composerMentions)) === 'over'}
+          <span class="token-est-hint">引用体积较大，可删除部分引用 chip</span>
+        {/if}
+        {#if $turnActive}
+          <button class="send-btn stop" onclick={interrupt} title="中断 agent 执行">
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <rect x="3.5" y="3.5" width="9" height="9" rx="1.5" fill="currentColor" />
+            </svg>
+          </button>
+        {:else}
+          <button
+            class="send-btn"
+            onclick={submit}
+            disabled={!draft.trim() || $connStatus !== 'online'}
+            title="发送 (Enter)"
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path
+                d="M8 13V3.5M3.8 7.7 8 3.5l4.2 4.2"
+                stroke="currentColor"
+                stroke-width="1.7"
+                fill="none"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+        {/if}
+      </div>
     </div>
     {#if engineStalled}
       <div class="heartbeat-stall" role="status">
@@ -985,20 +1123,28 @@
     margin-top: var(--sp-xs);
     color: var(--danger);
   }
+  /* S1 一体化输入容器(主流 IDE 对齐):chips/输入区/工具行同处一张圆角卡片 */
   .composer {
     position: relative;
     flex-shrink: 0;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    margin: var(--sp-sm);
     padding: var(--sp-sm);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    background: var(--bg-input);
     display: flex;
     flex-direction: column;
-    gap: var(--sp-sm);
+    gap: var(--sp-xs);
+    transition: border-color var(--tr-fast);
+  }
+  .composer:focus-within {
+    border-color: var(--brand);
   }
   .mention-pop {
     position: absolute;
-    bottom: calc(100% - 4px);
-    left: var(--sp-sm);
-    right: var(--sp-sm);
+    bottom: calc(100% + 6px);
+    left: 0;
+    right: 0;
     max-height: 260px;
     overflow-y: auto;
     background: var(--bg-card);
@@ -1117,37 +1263,99 @@
   .chip-x:hover {
     color: var(--danger);
   }
+  /* S1 输入区:融入容器(无独立边框),自动增高,超限内部滚动 */
   .draft {
     width: 100%;
     resize: none;
-    background: var(--bg-input);
-    border: 1px solid var(--border);
-    border-radius: var(--r-sm);
+    background: transparent;
+    border: none;
     color: var(--text-primary);
     font-size: var(--fs-sm);
-    padding: var(--sp-sm);
+    font-family: inherit;
+    line-height: 1.5;
+    padding: 2px 0;
     outline: none;
-    transition: border-color var(--tr-fast);
+    overflow-y: auto;
+    min-height: 44px;
+    max-height: 176px;
   }
-  .draft:focus {
-    border-color: var(--brand);
+  .draft:disabled {
+    color: var(--text-muted);
+    cursor: not-allowed;
   }
   .draft::placeholder {
     color: var(--text-muted);
   }
-  .composer-actions {
+  /* S2 底部工具行(主流 IDE 对齐):左=上下文/附件/MCP,右=token/发送圆钮 */
+  .composer-toolbar {
     display: flex;
-    justify-content: flex-end;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-sm);
   }
-  .composer-meta {
+  .tb-left {
     display: flex;
-    justify-content: flex-end;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+  }
+  .tb-btn {
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: var(--fw-med);
+    line-height: 1;
+    padding: 4px 7px;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .tb-btn:hover:not(:disabled) {
+    background: var(--sidebar-hover);
+    color: var(--text-primary);
+  }
+  .tb-btn:disabled {
+    opacity: 0.38;
+    cursor: not-allowed;
+  }
+  .tb-right {
+    display: flex;
     align-items: center;
     gap: 8px;
+    min-width: 0;
+  }
+  .send-btn {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: none;
+    border-radius: 999px;
+    background: var(--brand);
+    color: #fff;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background var(--tr-fast);
+  }
+  .send-btn:hover:not(:disabled) {
+    background: var(--brand-hover);
+  }
+  .send-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .send-btn.stop {
+    background: var(--danger);
   }
   .token-est {
     font-size: 10px;
     color: var(--text-muted);
+    white-space: nowrap;
   }
   .token-est.warn {
     color: var(--warning);
@@ -1158,11 +1366,14 @@
   .token-est-hint {
     font-size: 10px;
     color: var(--danger);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .heartbeat-stall {
     font-size: 11px;
     color: var(--warning);
-    padding: 4px 8px;
+    padding: 4px 0 0;
     border-top: 1px solid var(--border);
   }
   .user-col {
@@ -1210,30 +1421,5 @@
   .ur-note {
     color: var(--danger);
     flex-shrink: 0;
-  }
-  .btn {
-    height: 30px;
-    padding: 0 var(--sp-md);
-    font-size: var(--fs-sm);
-    font-weight: var(--fw-med);
-    border-radius: var(--r-sm);
-  }
-  .btn.primary {
-    background: var(--brand);
-    color: #fff;
-  }
-  .btn.primary:hover {
-    background: var(--brand-hover);
-  }
-  .btn.primary:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-  .btn.danger {
-    background: var(--danger);
-    color: #fff;
-  }
-  .btn.danger:hover {
-    filter: brightness(0.9);
   }
 </style>
