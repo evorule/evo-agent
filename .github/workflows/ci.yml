@@ -64,6 +64,16 @@ jobs:
 
       - name: verify.ps1 (build + test + secret scan + dep contract)
         shell: pwsh
+        env:
+          # Resource guard: a full debug build of this repo produces ~9.4 GB
+          # of target artifacts, which sits right at the ubuntu runner disk
+          # ceiling -- two CI runs died mid-step (~50 min in, step never
+          # concluded, no log uploaded). Stripping debug info shrinks target
+          # output several-fold on both runners; windows stays well clear of
+          # its larger disk either way, and both platforms keep the same
+          # build shape.
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
         run: ./verify.ps1
 
       - name: doc tests

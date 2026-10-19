@@ -2564,6 +2564,13 @@ mod tests {
     #[test]
     fn test_capability_boundary_read_root_relative_path_rejected() {
         // 门卫:read_root 在场时同受绝对路径校验(相对路径加载期即拒)
+        // fixture 的 sandbox_root 必须是当前平台的绝对路径:Windows 盘符路径
+        // 跑在 Linux 上 is_absolute() 为假,validate() 先拒 sandbox_root
+        // (错误消息不含 read_root),测试目的(相对 read_root 被拒)走不到。
+        #[cfg(windows)]
+        let abs_root = "D:/evo-agent";
+        #[cfg(not(windows))]
+        let abs_root = "/tmp/evo-agent";
         let json = r#"{
             "agent_type": "tester",
             "version": "1.0.0",
@@ -2576,12 +2583,13 @@ mod tests {
             "tools": ["file_read"],
             "capability_boundary": {
                 "mode": "read_only",
-                "sandbox_root": "D:/evo-agent",
+                "sandbox_root": "__ABS_ROOT__",
                 "read_root": "relative/dir",
                 "tools": ["file_read"]
             }
-        }"#;
-        let def: AgentDefinition = serde_json::from_str(json).expect("parse ok");
+        }"#
+        .replace("__ABS_ROOT__", abs_root);
+        let def: AgentDefinition = serde_json::from_str(&json).expect("parse ok");
         let err = def.validate().expect_err("relative read_root must fail");
         assert!(err.to_string().contains("read_root"), "{err}");
     }
