@@ -192,7 +192,12 @@ fn smoke_serve_with_stdio_mcp_reaches_listening_and_client_face_works() {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut healthy = false;
     while Instant::now() < deadline {
-        if serve.0.try_wait().map(|s| s.is_some()).unwrap_or(false) {
+        if serve
+            .0
+            .try_wait()
+            .map(|s| s.is_some())
+            .unwrap_or(false)
+        {
             panic!("serve process exited before listening (see inherited output)");
         }
         if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
