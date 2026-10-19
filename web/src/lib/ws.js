@@ -185,7 +185,7 @@ export function disconnect() {
  * 不阻断发送。
  * @returns {Promise<{used: Array, dropped: Array} | null>} null=连接不可用
  */
-export async function sendMessage(content, mentions = []) {
+export async function sendMessage(content, mentions = [], opts = {}) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return null;
   // B17:快照重建待发态(autoSend=false)——本条消息即续聊新输入,wire
   // 正文前缀回注历史块(气泡仍显示原文),消费即清。autoSend=true 态归
@@ -221,8 +221,14 @@ export async function sendMessage(content, mentions = []) {
   streamMsgId = pushMessage({ kind: 'assistant', text: '', streaming: true });
   stepCount.set(0);
   turnActive.set(true);
-  // wire 正文 = [重建回注块] + 正文 + [@上下文 XML];气泡显示仍为原文
-  const wireContent = `${rebuildBlock ? `${rebuildBlock}\n\n` : ''}${content}${xml ? `\n\n${xml}` : ''}`;
+  // S3:对话模式 wire-only 提示块(气泡仍显示原文;仅强化先确认后变更的
+  // man-in-loop 姿态,不触碰审批链语义)
+  const modeHint =
+    opts.mode === 'chat'
+      ? '<mode>chat</mode>\n<mode-note>用户当前为对话模式:本条为咨询问答,仅分析/解释/给建议,不要执行文件修改、命令执行等变更性操作;若判断确需变更,先给出方案并等待用户确认。</mode-note>'
+      : '';
+  // wire 正文 = [重建回注块] + [模式提示块] + 正文 + [@上下文 XML];气泡显示仍为原文
+  const wireContent = `${rebuildBlock ? `${rebuildBlock}\n\n` : ''}${modeHint ? `${modeHint}\n\n` : ''}${content}${xml ? `\n\n${xml}` : ''}`;
   ws.send(JSON.stringify({ type: 'message', content: wireContent }));
   return { used, dropped };
 }

@@ -128,6 +128,17 @@
     el.style.height = `${Math.min(el.scrollHeight, DRAFT_MAX_H)}px`;
   });
 
+  // ---- S3 构建/对话模式(前端姿态+提示语;审批链语义不动) ----
+  // 构建=默认,agent 执行任务;对话=仅问答咨询,wire 附提示块引导先确认后变更。
+  const MODE_KEY = 'evo_chat_mode';
+  let chatMode = $state(localStorage.getItem(MODE_KEY) === 'chat' ? 'chat' : 'build');
+
+  function setMode(m) {
+    if ($turnActive || chatMode === m) return;
+    chatMode = m;
+    localStorage.setItem(MODE_KEY, m);
+  }
+
   onMount(() => {
     draft = localStorage.getItem(DRAFT_KEY) || '';
     try {
@@ -420,7 +431,7 @@
     histIdx = -1;
     const { kept } = await reconcileMentions(text, $composerMentions);
     composerMentions.set([]);
-    sendMessage(text, kept);
+    sendMessage(text, kept, { mode: chatMode });
   }
 
   function onKeydown(e) {
@@ -703,7 +714,11 @@
     <textarea
       class="draft"
       rows="1"
-      placeholder={$turnActive ? 'agent 执行中…(可中断)' : '输入任务,@ 引用文件/上下文,Enter 发送'}
+      placeholder={$turnActive
+        ? 'agent 执行中…(可中断)'
+        : chatMode === 'chat'
+          ? '对话模式:提问与讨论,Enter 发送'
+          : '输入任务,@ 引用文件/上下文,Enter 发送'}
       bind:value={draft}
       bind:this={draftEl}
       oninput={onInput}
@@ -713,6 +728,24 @@
     ></textarea>
     <div class="composer-toolbar">
       <div class="tb-left">
+        <div class="mode-seg" role="group" aria-label="会话模式">
+          <button
+            class:active={chatMode === 'build'}
+            onclick={() => setMode('build')}
+            disabled={$turnActive}
+            title="构建模式:agent 执行任务(默认)"
+          >
+            构建
+          </button>
+          <button
+            class:active={chatMode === 'chat'}
+            onclick={() => setMode('chat')}
+            disabled={$turnActive}
+            title="对话模式:仅问答咨询,不做变更"
+          >
+            对话
+          </button>
+        </div>
         <button class="tb-btn" onclick={openMentionPopup} title="插入 @ 上下文引用">@</button>
         <button class="tb-btn" disabled title="图片/附件上传(未接入,待后端配套)">
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
@@ -1298,6 +1331,37 @@
     align-items: center;
     gap: 2px;
     min-width: 0;
+  }
+  /* S3 模式段控件(Trae 对齐):构建/对话二态切换 */
+  .mode-seg {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+    margin-right: 4px;
+    flex-shrink: 0;
+  }
+  .mode-seg button {
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: var(--fw-med);
+    line-height: 1;
+    padding: 4px 8px;
+    cursor: pointer;
+  }
+  .mode-seg button + button {
+    border-left: 1px solid var(--border);
+  }
+  .mode-seg button.active {
+    background: var(--brand);
+    color: #fff;
+  }
+  .mode-seg button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
   .tb-btn {
     border: none;
