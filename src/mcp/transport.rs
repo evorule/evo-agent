@@ -789,15 +789,18 @@ pub mod tests {
     /// python 缺席时优雅跳过(有 python 的环境常态守护,非 #[ignore])。
     #[tokio::test]
     async fn test_stdio_string_id_response_routes() {
-        let python = ["python", "python3"].iter().copied().find(|cmd| {
-            std::process::Command::new(cmd)
-                .arg("--version")
-                .stdout(StdIo::null())
-                .stderr(StdIo::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        });
+        let python = ["python", "python3"]
+            .iter()
+            .copied()
+            .find(|cmd| {
+                std::process::Command::new(cmd)
+                    .arg("--version")
+                    .stdout(StdIo::null())
+                    .stderr(StdIo::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            });
         let Some(python) = python else {
             eprintln!("skipped: python not found on PATH");
             return;
