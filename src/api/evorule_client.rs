@@ -81,6 +81,31 @@ impl EvoruleApiClient {
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
+    /// console 嵌入态反向代理透传(`/console-api/*` → 引擎)。
+    ///
+    /// method + path?query + 原始 body + content-type 透传,服务端注入
+    /// Authorization(token 不进页面);响应原样返回(status/headers/body)。
+    /// 传输失败返回 Err(reqwest 原始错误),由调用方转 502。
+    pub async fn proxy_passthrough(
+        &self,
+        method: reqwest::Method,
+        path_with_query: &str,
+        content_type: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let url = self.core.url(path_with_query);
+        let mut req = self
+            .core
+            .auth_header(self.core.client().request(method, &url));
+        if let Some(ct) = content_type {
+            req = req.header(reqwest::header::CONTENT_TYPE, ct);
+        }
+        if let Some(b) = body {
+            req = req.body(b.to_vec());
+        }
+        req.send().await
+    }
+
     /// GET /api/io-contract —— evorule-server IO 形状契约拉取（启动期协商）。
     ///
     /// 错误分类给 [`crate::api::io_contract::negotiate_io_contract`] 消费：

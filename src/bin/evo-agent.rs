@@ -2326,31 +2326,45 @@ fn cmd_serve(
     let workbench = tower_http::services::ServeDir::new(&dist_dir).not_found_service(
         tower_http::services::ServeFile::new(dist_dir.join("index.html")),
     );
-    let mut app = axum::Router::new().merge(agent_api::router_with_auth(state, auth_config));
 
     // console 审计页双形态接入(配置化,fail-soft):
     // 1) <console_dir>/build/index.html 在位 → 同源静态托管 /console(产物形态,
     //    纯净机无 node 可用;审计深链 /console/audit 同源直达)。挂外层 Router,
-    //    不经 auth 中间件 —— 静态页须无 token 可打开(与 workbench fallback 同理)。
+    //    不经 auth 中间件 —— 静态页须无 token 可打开(与 workbench fallback 同理);
+    //    同时挂 /console-api 反向代理(数据面 Authorization 服务端注入,不进页面)。
     // 2) 产物缺位 → 回落 dev 拉起(开发场景,见下方 sidecar 段,fail-soft)。
-    let mut console_hosted = false;
+    let mut console_build_dir: Option<std::path::PathBuf> = None;
     if let Some(console_dir) = config.workbench.console_dir.clone() {
         if let Some(build_dir) =
             evo_agent::api::console_sidecar::static_build_dir(std::path::Path::new(&console_dir))
         {
-            let console_service =
-                tower_http::services::ServeDir::new(&build_dir).not_found_service(
-                    tower_http::services::ServeFile::new(build_dir.join("index.html")),
-                );
-            app = app.nest_service("/console", console_service);
-            console_hosted = true;
             eprintln!(
                 "[console] static hosting from {} at /console (audit deep-link: /console/audit)",
                 build_dir.display()
             );
+            console_build_dir = Some(build_dir);
         }
     }
+    let console_hosted = console_build_dir.is_some();
+    let console_proxy_router = if console_hosted {
+        Some(evo_agent::api::console_proxy::router(
+            state.evorule_client().clone(),
+        ))
+    } else {
+        None
+    };
 
+    let mut app = axum::Router::new().merge(agent_api::router_with_auth(state, auth_config));
+    if let Some(build_dir) = console_build_dir {
+        let console_service =
+            tower_http::services::ServeDir::new(&build_dir).not_found_service(
+                tower_http::services::ServeFile::new(build_dir.join("index.html")),
+            );
+        app = app.nest_service("/console", console_service);
+    }
+    if let Some(proxy_router) = console_proxy_router {
+        app = app.merge(proxy_router);
+    }
     let app = app
         .fallback_service(workbench)
         .layer(CorsLayer::permissive())
