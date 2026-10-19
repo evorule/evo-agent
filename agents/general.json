@@ -59,6 +59,10 @@
     {
       "name": "git-discipline",
       "path": "skills/git-discipline/SKILL.md"
+    },
+    {
+      "name": "evorule-deterministic-compute",
+      "path": "skills/evorule-deterministic-compute/SKILL.md"
     }
   ],
   "memory": {
