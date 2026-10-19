@@ -129,29 +129,13 @@
     return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
 
-  // 审计页深链:console-cloud /audit?session=<数字id>(Agent 会话台同款先例)
-  const CONSOLE_ORIGIN_KEY = 'evo_console_origin';
-  function consoleOrigin() {
-    return localStorage.getItem(CONSOLE_ORIGIN_KEY) || 'http://localhost:5174';
-  }
+  // 审计页深链:console 同源托管 /console/audit?session=<数字id>
+  // (serve 静态托管形态同源直达,无需探活;dev 形态仅开发调试直连 5174)
   function auditDeepLink() {
     const sid = $sessionId;
     return sid && /^\d+$/.test(String(sid))
-      ? `${consoleOrigin()}/audit?session=${sid}`
-      : `${consoleOrigin()}/audit`;
-  }
-  // 深链点击前探活:console 未运行时不跳死链,就地明示引导
-  let consoleDown = '';
-  async function openAuditLink(ev) {
-    ev.preventDefault();
-    const origin = consoleOrigin();
-    try {
-      await fetch(origin + '/', { mode: 'no-cors', cache: 'no-store' });
-      consoleDown = '';
-      window.open(auditDeepLink(), '_blank', 'noopener,noreferrer');
-    } catch {
-      consoleDown = origin;
-    }
+      ? `/console/audit?session=${sid}`
+      : '/console/audit';
   }
 </script>
 
@@ -251,11 +235,8 @@
       {:else if $panelTab === 'audit'}
         <div class="audit-head">
           <span class="audit-note">当前会话治理事件流(展示层视图;权威审计链以审计页为准)</span>
-          <a class="deep-link" href={auditDeepLink()} onclick={openAuditLink} target="_blank" rel="noopener noreferrer">在审计页查看 →</a>
+          <a class="deep-link" href={auditDeepLink()} target="_blank" rel="noopener noreferrer">在审计页查看 →</a>
         </div>
-        {#if consoleDown}
-          <div class="probe-warn">console 审计页未运行（{consoleDown}）：在 evo-agent.toml 配置 [workbench] console_dir 指向 console 仓目录后重启 serve 可自动拉起；或手动在 console 仓执行 npm run dev。</div>
-        {/if}
         {#if $govEvents.length === 0}
           <div class="empty">暂无治理事件。工具调用、审批请求/结果与错误在此呈现。</div>
         {:else}
@@ -442,13 +423,6 @@
   }
   .deep-link:hover {
     text-decoration: underline;
-  }
-  .probe-warn {
-    color: var(--warning);
-    font-size: var(--fs-xs);
-    line-height: 1.5;
-    padding: 2px 0;
-    border-bottom: 1px solid var(--border);
   }
   .ev-row {
     display: flex;
