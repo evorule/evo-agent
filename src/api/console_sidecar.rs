@@ -151,10 +151,7 @@ mod tests {
 
     #[test]
     fn test_static_build_dir_present_and_absent() {
-        let tmp = std::env::temp_dir().join(format!(
-            "evo-console-probe-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("evo-console-probe-{}", std::process::id()));
         let build = tmp.join("build");
         std::fs::create_dir_all(&build).unwrap();
         assert!(static_build_dir(&tmp).is_none()); // index.html 缺位
