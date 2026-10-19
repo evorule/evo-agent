@@ -90,7 +90,7 @@ pub struct LlmHandler {
     default_model: String,
     /// 执行体端点(SG-1 件1 key 归边):所有 LLM 出站统一 POST 到此 URL
     executor_url: String,
-    /// 执行体调用方令牌(O-533):Some = 出站 Authorization: Bearer 携带,
+    /// 执行体调用方令牌:Some = 出站 Authorization: Bearer 携带,
     /// ai-plugin 校验匹配即放行(本机其他进程无令牌即 401)
     executor_token: Option<String>,
     /// If set, skip HTTP and return a canned LlmResponse-format JSON.
@@ -428,9 +428,8 @@ impl LlmHandler {
                 obj.insert("stream".to_string(), serde_json::Value::Bool(true));
             }
 
-            // === HTTP 请求(执行体端点,无 Authorization——key 归边) ===
             // === HTTP 请求(执行体端点) ===
-            // key 归边:仅携带执行体调用方令牌(SG-1 件1 配套,O-533),
+            // key 归边:仅携带执行体调用方令牌(SG-1 件1 配套),
             // provider 凭据不出执行体。
             // streaming path same dual timeout
             let client = reqwest::Client::builder()
