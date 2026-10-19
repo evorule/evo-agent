@@ -319,7 +319,7 @@ enum ToolsAction {
 // main
 // =============================================================================
 
-/// 深异步链专用栈大小（O-511 修复）。
+/// 深异步链专用栈大小。
 ///
 /// Windows 主线程栈沿用 PE 头 SizeOfStackReserve（rustc 默认 1 MB），远小于
 /// pthread 平台的 8 MB；`run_streaming` 等深 async poll 链在 debug 构建下单层
@@ -328,7 +328,7 @@ enum ToolsAction {
 /// commit，无内存常驻压力）。
 const BIG_STACK_BYTES: usize = 16 * 1024 * 1024;
 
-/// 在 16 MB 专用栈线程上执行闭包（O-511 修复：深 async poll 链入口统一走大栈）。
+/// 在 16 MB 专用栈线程上执行闭包（深 async poll 链入口统一走大栈）。
 ///
 /// 闭包内自建 tokio runtime / 多次 `block_on` 均合法（runtime 与其消费同线程）。
 /// 线程 spawn 失败返回 Err（fail-fast）；闭包 panic 原样恢复为 panic
@@ -392,7 +392,7 @@ fn main() -> ExitCode {
             no_auth,
             read_root,
         } => run_with_big_stack(move || {
-            // O-513 修复：serve 与 run/patrol/workflow 同款走 16MB 大栈线程
+            // serve 与 run/patrol/workflow 同款走 16MB 大栈线程
             // ——启动期 service-tools 注册与 MCP 连接在 cmd_serve 内建的
             // serve 主 runtime 上 block_on 驱动，深链不再依赖临时 runtime 桥接
             cmd_serve(
@@ -609,7 +609,7 @@ fn cmd_run(
             .await
             .map(|r| {
                 r.with_capability_boundary(capability_boundary)
-                    // O-493:定义级显式声明的执行环境 profile 随 tool_result 落账;
+                    // 定义级显式声明的执行环境 profile 随 tool_result 落账;
                     // 未声明=None=落账无标记(缺省语义零变化)
                     .with_execution_profile_marker(def.execution_profile.as_deref())
                     // CLI run 主路径 delegate+journal 接线——serve 面
@@ -2038,11 +2038,11 @@ fn cmd_serve(
         &workspace_client,
         &evorule_client,
     );
-    // O-513 修复：多线程 runtime 提前到启动期注册/连接之前构建——service-tools
+    // 多线程 runtime 提前到启动期注册/连接之前构建——service-tools
     // 注册与 MCP 连接直接在本 runtime 上 block_on 驱动（本函数整体运行在
     // 16MB 大栈线程，见 main() 的 run_with_big_stack 包装），连接产物（含
     // stdio reader task）终身留在 serve runtime，不再跨临时 runtime 逃逸
-    // （O-511 期的临时 current-thread runtime 桥接在真实 stdio I/O 后 drop
+    // （早期临时 current-thread runtime 桥接在真实 stdio I/O 后 drop
     // 永久挂死，已废除）。
     // 6. 多线程 runtime(server 需要并发处理请求)
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -2099,7 +2099,7 @@ fn cmd_serve(
             );
         } else {
             mcp_enabled = true;
-            // O-513 修复：连接注册直接在 serve 主 runtime 上 block_on 驱动
+            // 连接注册直接在 serve 主 runtime 上 block_on 驱动
             // （连接产物含 stdio reader task 终身留在本 runtime，与 restart/
             // reload 端点通路同构；原临时 runtime 桥接已废除——真实 stdio
             // I/O 后其 drop 在 Windows 管道路径永久挂死）。失败隔离语义不变
@@ -2364,9 +2364,18 @@ fn cmd_serve(
     if let Some(proxy_router) = console_proxy_router {
         app = app.merge(proxy_router);
     }
+    // CORS 按鉴权态条件化:鉴权开启(产品/桌面形态)时不发通配 CORS 头——
+    // 工作台与 serve 同源无需 CORS;通配层会使任意网页可跨_origin 读取
+    // 本机 API 响应(会话/记忆/文件工具面)。仅 --no-auth 开发形态保留
+    // permissive(console vite dev 跨端口场景)。
+    let cors_layer = if auth_enabled {
+        CorsLayer::new()
+    } else {
+        CorsLayer::permissive()
+    };
     let app = app
         .fallback_service(workbench)
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer)
         .layer(RequestBodyLimitLayer::new(1024 * 1024));
 
     // console 审计页 sidecar 自动拉起(仅 dev 形态;产物已静态托管时跳过,fail-soft)。
