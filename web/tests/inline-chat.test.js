@@ -20,7 +20,9 @@ describe('inline-chat-diff 行级 LCS', () => {
     expect(rows.some((r) => r.type === 'add')).toBe(true);
   });
   it('超大输入走全量替换语义(内存护栏)', () => {
-    const big = 'x\n'.repeat(1500);
+    // 输入须越过护栏阈值:diffLines 按 n*m>4_000_000 cells 触发全量替换,
+    // 2101*2101≈4.41M 越阈;1500 行(≈2.25M)不触发,属正常精确 diff 区间
+    const big = 'x\n'.repeat(2100);
     const rows = diffLines(big, big + 'y');
     expect(rows.length).toBeLessThanOrEqual(2);
   });
