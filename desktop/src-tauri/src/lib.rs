@@ -144,7 +144,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 路径解析失败直接退（无窗口必要；错误可经 shell.toml 修复后重试）
     let paths = shell_config::resolve(&cfg)?;
     let close_directly = cfg.ui.close_directly;
-    let console = cfg.console.clone();
+    // console 通道生效配置 = 产物在位探测结果（W6：在位即启用，见 shell_config）
+    let console = paths.console.clone();
     let engine_extra_args = cfg.engine.extra_args.clone();
 
     let app = tauri::Builder::default()

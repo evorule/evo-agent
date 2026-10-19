@@ -25,7 +25,8 @@
     "resources": [
       "resources/bin/*",
       "resources/evo-agent/**/*",
-      "resources/evorule-server/**/*"
+      "resources/evorule-server/**/*",
+      "resources/console/**/*"
     ],
     "windows": {
       "webviewInstallMode": {

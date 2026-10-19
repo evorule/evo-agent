@@ -69,9 +69,11 @@ pub struct Paths {
     pub evorule_server_home: Option<PathBuf>,
 }
 
-/// console 审计页通道（预留）：enabled=true 时壳把 console_dir 写入 serve
-/// 工作目录的 evo-agent.toml，由 serve 既有 fail-soft sidecar 机制拉起。
-/// 缺省关闭（M1 决策 R4）；console 集成批次开启并指向 console 产物目录。
+/// console 审计页通道：产物在位即启用（W6，替代 M1 的「缺省关闭」）。
+/// resolve() 启动期探测 console 静态产物（build\index.html）：在位 = enabled
+/// 且 dir 生效（写 console_dir 进 serve 工作目录 evo-agent.toml，serve 同源
+/// 托管 /console）；缺位 = 缺省态静默不启用，仅 shell.toml 显式 enabled=true
+/// 时保留（serve 侧 fail-soft 处理 dev 拉起/告警）。
 #[derive(serde::Deserialize, Default, Clone)]
 pub struct Console {
     #[serde(default)]
@@ -106,6 +108,8 @@ pub struct ResolvedPaths {
     pub logs_dir: PathBuf,
     /// 壳配置目录（%APPDATA%\evo-agent-desktop；用户 evo-agent.toml 透传查找位）
     pub app_config_dir: PathBuf,
+    /// console 通道生效配置（产物在位探测结果；见 Console 文档）
+    pub console: Console,
 }
 
 fn shell_config_path() -> Option<PathBuf> {
@@ -196,6 +200,29 @@ pub fn resolve(cfg: &ShellConfig) -> Result<ResolvedPaths, String> {
         .map_err(|_| "LOCALAPPDATA not set".to_string())?;
     let app_config = app_config_dir().unwrap_or_else(|| data_dir.join("config"));
 
+    // console 通道生效解析（W6）：产物在位即启用。
+    // 候选目录：shell.toml 显式 [console].dir 优先，其次安装布局
+    // exe_dir\resources\console（build-installer 收集 console build）。
+    // 候选目录下 build\index.html 在位 = enabled+dir 生效；缺位时仅显式
+    // enabled=true 保留（serve 侧 fail-soft），缺省态静默不启用。
+    let console = {
+        let candidate = cfg
+            .console
+            .dir
+            .clone()
+            .unwrap_or_else(|| exe_dir.join("resources").join("console"));
+        if candidate.join("build").join("index.html").is_file() {
+            Console {
+                enabled: true,
+                dir: Some(candidate),
+            }
+        } else if cfg.console.enabled {
+            cfg.console.clone()
+        } else {
+            Console::default()
+        }
+    };
+
     Ok(ResolvedPaths {
         evo_agent_exe,
         evo_agent_home,
@@ -206,5 +233,6 @@ pub fn resolve(cfg: &ShellConfig) -> Result<ResolvedPaths, String> {
         engine_data_dir: data_dir.join("engine-data"),
         data_dir,
         app_config_dir: app_config,
+        console,
     })
 }
