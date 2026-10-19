@@ -14,7 +14,7 @@
     { id: 'orchestration', label: '编排(委托谱系)', enabled: true },
     { id: 'debug', label: '运行和调试', enabled: true },
     { id: 'extensions', label: '扩展', enabled: true },
-    { id: 'audit', label: '审计(治理叠加阶段接入)', enabled: false },
+    { id: 'audit', label: '审计', enabled: true },
     { id: 'settings', label: '设置', enabled: true },
   ];
 
