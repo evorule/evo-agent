@@ -2,7 +2,7 @@
 // Copyright (C) 2026 EvoRule Project
 // DAP 调试客户端:WS 连接生命周期 + DAP 1.x 请求/事件 API。
 //
-// 与 LSP client 的同构与差异(34 号 §三):
+// 与 LSP client 的同构与差异(设计档 §三):
 // - 同构:WS 文本帧进出;serve 桥已做 Content-Length 帧翻译,本层只见 JSON;
 // - 差异:DAP initialize 后无 didOpen 文档同步——断点由本层按文件全量同步
 //   (setBreakpoints),代码状态由适配器自行读取 debuggee 文件。

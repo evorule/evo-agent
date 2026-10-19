@@ -4,7 +4,7 @@
 // 调试控制台缓冲。组件层(DebugView/BreakpointsPanel/…)只读本模块 store。
 //
 // 断点存储:.evo/debug-breakpoints.json(路径 → 行号数组;跨会话持久,
-// 34 号 §三.1)——与运行期会话内断点真相源(session 层 Map)双向同步:
+// 设计档 §三.1)——与运行期会话内断点真相源(session 层 Map)双向同步:
 // 启动时读文件灌入,变更(增删/verified 写回)防抖 500ms 写回文件。
 //
 // 治理:launch 首跑确认沿 B10 先例(一次性信任,localStorage 键),由

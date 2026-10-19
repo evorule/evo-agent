@@ -169,7 +169,7 @@ impl StdioTransport {
     }
 }
 
-/// JSON-RPC id 归一化(O-515):数值按十进制串、字符串取原文,双形态等价匹配;
+/// JSON-RPC id 归一化:数值按十进制串、字符串取原文,双形态等价匹配;
 /// 其余类型(null/bool/对象)返回 None 视同无 id。
 ///
 /// 客户端只发数值 id,但部分 server 实现会把回显 id 转成字符串(JSON-RPC spec
@@ -215,7 +215,7 @@ async fn reader_loop(
                         continue;
                     }
                 };
-                // O-515:id 双形态归一(见 canonical_id)——归一后解析回 u64 匹配
+                // id 双形态归一(见 canonical_id)——归一后解析回 u64 匹配
                 // pending 表;解析不出数值的帧(真通知/未知 id)走同一路径丢弃
                 let id = match parsed
                     .get("id")
@@ -520,7 +520,7 @@ fn parse_sse_event(event: &[u8], id: u64) -> Result<Option<Value>, String> {
     let payload = data_lines.join("\n");
     let parsed: Value = serde_json::from_str(&payload)
         .map_err(|e| format!("MCP streamable_http SSE data parse: {}", e))?;
-    // O-515:id 双形态归一比较(客户端只发数值 id,server 可能回显字符串)
+    // id 双形态归一比较(客户端只发数值 id,server 可能回显字符串)
     let Some(reply_id) = parsed.get("id").and_then(canonical_id) else {
         return Ok(None); // 无 id = server 通知,跳过
     };
@@ -586,7 +586,7 @@ impl McpTransport for StreamableHttpTransport {
                 .to_string();
             return Err(msg);
         }
-        // O-515:id 双形态归一比较(同 parse_sse_event)
+        // id 双形态归一比较(同 parse_sse_event)
         if parsed.get("id").and_then(canonical_id).as_deref() != Some(&id.to_string()) {
             return Err(format!(
                 "MCP streamable_http '{}' response id mismatch",
@@ -767,7 +767,7 @@ pub mod tests {
 
     #[test]
     fn test_canonical_id_forms() {
-        // O-515:数值/字符串双形态归一,其余类型视同无 id
+        // 数值/字符串双形态归一,其余类型视同无 id
         assert_eq!(canonical_id(&serde_json::json!(1)), Some("1".to_string()));
         assert_eq!(canonical_id(&serde_json::json!(42)), Some("42".to_string()));
         assert_eq!(canonical_id(&serde_json::json!("1")), Some("1".to_string()));
@@ -784,7 +784,7 @@ pub mod tests {
         );
     }
 
-    /// O-515:id 双形态回环——server 回显字符串 id(如 "1")也必须路由成功。
+    /// id 双形态回环——server 回显字符串 id(如 "1")也必须路由成功。
     /// 原 as_u64 解析把字符串 id 帧当通知丢弃,所有调用挂到超时。
     /// python 缺席时优雅跳过(有 python 的环境常态守护,非 #[ignore])。
     #[tokio::test]
@@ -835,7 +835,7 @@ while True:
                 serde_json::json!({"protocolVersion": "2024-11-05", "capabilities": {}}),
             )
             .await
-            .expect("string-id response must route (O-515)");
+            .expect("string-id response must route");
         assert_eq!(init["serverInfo"]["name"], "mock-string-id");
         let tools = transport
             .request("tools/list", serde_json::json!({}))

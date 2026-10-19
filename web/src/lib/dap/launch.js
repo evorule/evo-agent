@@ -2,7 +2,7 @@
 // Copyright (C) 2026 EvoRule Project
 // launch 配置读取:.evo/debug.json 自有形态,兼容 .vscode/launch.json 同名字段。
 //
-// 读取序(34 号 §三.1 裁决):.evo/debug.json 优先;不存在时回落
+// 读取序(设计档 §三.1 裁决):.evo/debug.json 优先;不存在时回落
 // .vscode/launch.json(launch.json 允许 JSONC 注释——剥离后再解析)。
 
 import { readFile } from '../api.js';

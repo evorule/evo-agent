@@ -2,11 +2,11 @@
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 #![forbid(unsafe_code)]
-//! O-513 起服冒烟守卫：真实 `evo-agent serve` 二进制 + 真实 stdio MCP server。
+//! 起服冒烟守卫：真实 `evo-agent serve` 二进制 + 真实 stdio MCP server。
 //!
 //! 守卫目标 = 本缺陷类三连：
 //! 1. 「起不来」——配置可连通 MCP server 时 serve 永久挂死、端口不起
-//!    （O-513：临时 runtime 桥接 drop 挂死；修复前 /health 探活必超时失败）；
+//!    （临时 runtime 桥接 drop 挂死；修复前 /health 探活必超时失败）；
 //! 2. 「注册在案」——MCP 工具经 /mcp 暴露面 tools/list 可见；
 //! 3. 「假活」——连接产物（stdio reader task）跨 runtime 逃逸后调用必死；
 //!    tools/call 必须真实回显（补丁式绕开挂死但 reader 死亡的回归在此步暴露）。
@@ -56,7 +56,7 @@ for line in sys.stdin:
 const AGENT_JSON: &str = r#"{
   "agent_type": "general",
   "version": "0.3.0",
-  "description": "O-513 smoke guard agent",
+  "description": "smoke guard agent",
   "license": "AGPL-3.0-or-later",
   "system_prompt": "smoke test",
   "model": "MiniMax-M3",
@@ -188,7 +188,7 @@ fn smoke_serve_with_stdio_mcp_reaches_listening_and_client_face_works() {
         .expect("spawn evo-agent serve");
     let mut serve = KillOnDrop(child);
 
-    // 判据 1（O-513 主判据）：/health 限时探活——修复前起服挂死此步必超时
+    // 判据 1（主判据）：/health 限时探活——修复前起服挂死此步必超时
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut healthy = false;
     while Instant::now() < deadline {
@@ -212,7 +212,7 @@ fn smoke_serve_with_stdio_mcp_reaches_listening_and_client_face_works() {
     }
     assert!(
         healthy,
-        "serve did not become healthy within 60s — O-513 startup hang regression?"
+        "serve did not become healthy within 60s — startup hang regression?"
     );
 
     // 判据 2：/mcp initialize + tools/list —— mcp_mock_echo 注册在案
