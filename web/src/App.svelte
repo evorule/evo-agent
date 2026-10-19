@@ -20,7 +20,7 @@
   import BottomPanel from './components/BottomPanel.svelte';
   import ChatSidebar from './components/ChatSidebar.svelte';
   import CommandPalette from './components/CommandPalette.svelte';
-  import { reconnectFromStorage, newSession } from './lib/ws.js';
+  import { reconnectFromStorage, newSession, openSession } from './lib/ws.js';
   import {
     activePath,
     closeTab,
@@ -56,6 +56,7 @@
   import ConfirmRunDialog from './components/ConfirmRunDialog.svelte';
   import { taskList, refreshTaskList, runTaskWithConfirm, cancelTaskRun, lastTaskLabel } from './lib/tasks.js';
   import GroupPane from './components/GroupPane.svelte';
+  import ConsoleView from './components/ConsoleView.svelte';
   import { splitOpen, toggleSplit, closeSplit, secondaryGroups, activeGroupId, addSecondaryGroup, closeSecondaryGroup, moveActiveTabTarget, groupRemovePath, evenWidths as doEvenWidths, groupFocusSignal, restoreGroups, maximizedGroupId, toggleMaximize } from './lib/editorGroups.js';
   import { lspBanner, restartGate, gateSnapshot } from './lib/lsp/index.js';
   import { pushPanelEvent } from './lib/stores.js';
@@ -213,6 +214,16 @@
 
   onMount(() => {
     restoreGroups(); // 恢复上次分屏状态(组结构+成员路径,localStorage)
+    // console 回链深链(/?session=N,console 审计页「在工作台打开」目标):
+    // 换线打开对应会话;非法 sid 忽略(fail-soft);读后清参防刷新重放。
+    try {
+      const sp = new URLSearchParams(window.location.search);
+      const sid = sp.get('session');
+      if (sid && /^\d+$/.test(sid)) {
+        openSession(sid);
+        window.history.replaceState(null, '', window.location.pathname);
+      }
+    } catch {}
     window.addEventListener('unhandledrejection', (e) => {
       try { localStorage.setItem('dbg_rej', String(e.reason).slice(0, 250)); } catch {}
     });
@@ -682,7 +693,7 @@
           <button class="lsp-banner-dismiss" onclick={() => lspBanner.set(null)} aria-label="关闭提示">×</button>
         </div>
       {/if}
-      <div class="editors-row">
+      <div class="editors-row" style:display={$sidebarView === 'audit' ? 'none' : ''}>
         <div style:display={$maximizedGroupId && $maximizedGroupId !== 'primary' ? 'none' : ''} class="editor-slot">
           <EditorPane />
         </div>
@@ -693,6 +704,11 @@
             </div>
           {/if}
         {/each}
+      </div>
+      <!-- console 审计视图(audit 活动栏):常挂载 display 切换,iframe 销毁会丢
+           console 登录态(同 BottomPanel TerminalView 先例) -->
+      <div class="console-slot" style:display={$sidebarView === 'audit' ? 'flex' : 'none'}>
+        <ConsoleView />
       </div>
       <BottomPanel />
     </div>
@@ -730,6 +746,12 @@
   }
   .editors-row {
     display: flex;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .console-slot {
     flex: 1;
     min-height: 0;
     min-width: 0;

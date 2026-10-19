@@ -155,6 +155,11 @@
     resumeSession(sid);
   }
 
+  /** 审计深链:新开 console 审计页并定位到该会话(同源 /console/audit) */
+  function openAuditDeepLink(sid) {
+    window.open(`/console/audit?session=${sid}`, '_blank', 'noopener,noreferrer');
+  }
+
   // 消息变化时滚动到底部
   $effect(() => {
     $messages;
@@ -436,6 +441,11 @@
                 title="恢复崩溃会话(挂起审批不恢复,须重走审批)"
               >恢复</button>
             {/if}
+            <button
+              class="resume-btn audit-btn"
+              onclick={() => openAuditDeepLink(s.session_id)}
+              title="在 console 审计页打开该会话"
+            >审计</button>
           </div>
         {/each}
       {/if}
