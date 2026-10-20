@@ -9,7 +9,10 @@
   `desktop/src-tauri/Cargo.toml`、主仓 `Cargo.toml`、`web/package.json` 四处
   保持一致（发版前 bump 同一版本号，0.4.0 起统一）。
 - 发布仓：`github.com/evorule/evo-agent-desktop`（PUBLIC，release & 自更新通道）。
-- 发布 tag 现行形态：`latest`（0.3.0 首发沿用）；release 标题=`evo-agent <版本>`。
+- 发布 tag 形态：`evo-agent-desktop-v<版本>`（每版一 tag 一 release，原子发布；
+  版本史可溯、无 clobber 竞态）。0.3.0 首发误用了滚动 `latest` tag——该 release
+  留作历史不重挂；新 release 发布后 GitHub `releases/latest` 自动指向它，旧版
+  壳的更新器端点随之翻页到新 latest.json，无需迁移动作。release 标题=`evo-agent <版本>`。
 - 产物三件套：`evo-agent-desktop_<ver>_x64-setup.exe` + `.sig` + `latest.json`
   （由 build-installer.ps1 归集到 `desktop/target/release/bundle/updater/`）。
 
@@ -37,9 +40,12 @@ npm --prefix web run build
 powershell -File desktop\build-installer.ps1 [-ReleaseNotes "..."]
 #    本地源调试可加 -UpdateUrlBase http://127.0.0.1:18777
 
-# 4. 人工上传（gh 或网页）：三件套上传至 evorule/evo-agent-desktop 的
-#    release（tag=latest 复用编辑或新建）；latest.json 必须同批上传。
-gh release upload latest desktop\target\release\bundle\updater\* --clobber
+# 4. 人工上传（gh 或网页）：新建 evorule/evo-agent-desktop 的 release
+#    （tag=evo-agent-desktop-v<版本>，与 build-installer 生成的 latest.json
+#    url permalink 同形）；三件套必须同批上传（部分上传窗口=旧壳更新探针
+#    拿到新版本号却下不到安装包）。
+gh release create "evo-agent-desktop-v<版本>" desktop\target\release\bundle\updater\* `
+  --title "evo-agent <版本>" --notes "<ReleaseNotes>"
 
 # 5. 发布后验证
 #    - 探针：GET releases/latest/download/latest.json 应返回新版本号
