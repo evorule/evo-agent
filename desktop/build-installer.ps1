@@ -24,15 +24,18 @@
 # env（私钥位置见发布留痕档）；无 env 时 build 产出 setup.exe 但 .sig 缺失，本脚本报错终止。
 #
 # latest.json 由本脚本程序化生成（signature 从 .sig 文件读原文注入，禁止手写——
-# 手抄 base64 极易漂移）；url = UpdateUrlBase + 安装包文件名。发布时传真实
-# base（如 https://gitee.com/{owner}/{repo}/releases/download/latest），
-# 缺省本地调试形态 http://127.0.0.1:18777；上传 Release 由人工按发布步骤档执行。
+# 手抄 base64 极易漂移）；url = UpdateUrlBase + 安装包文件名。缺省（不传参）=
+# 按本版 tag 的 GitHub Releases permalink（.../releases/download/evo-agent-desktop-v<ver>）
+# ——更新器端点取 releases/latest/latest.json 自动追踪最新发布，但 latest.json 内
+# url 指向的安装包必须钉本版 tag（latest 解析到更新版本时文件名已变，钉 permalink
+# 才不空指）；本地源调试传 http://127.0.0.1:18777 等显式 base 覆盖；上传 Release
+# 由人工按发布步骤档执行（latest.json 随三件套上传）。
 
 param(
     [switch]$SkipCollect,
     [string]$ServerRepo = "",
     [string]$ConsoleRepo = "",
-    [string]$UpdateUrlBase = "http://127.0.0.1:18777",
+    [string]$UpdateUrlBase = "",
     [string]$ReleaseNotes = ""
 )
 
@@ -113,6 +116,11 @@ if ($setup.Name -notmatch '^evo-agent-desktop_(.+)_x64-setup\.exe$') {
     throw "unexpected setup name: $($setup.Name)"
 }
 $version = $Matches[1]
+if (-not $UpdateUrlBase) {
+    # 缺省=按本版 tag 的 GitHub Releases permalink（见文件头注释：latest.json
+    # 内 url 必须钉本版 tag，更新器入口端点才可用 latest 自动追踪）
+    $UpdateUrlBase = "https://github.com/evorule/evo-agent-desktop/releases/download/evo-agent-desktop-v$version"
+}
 $latest = @{
     version  = $version
     notes    = $ReleaseNotes

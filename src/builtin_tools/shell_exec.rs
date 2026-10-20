@@ -1075,24 +1075,27 @@ impl ShellExecTool {
         )
     }
 
+    /// PATHEXT 双跳防护判定:工作目录内存在与程序同名的可执行扩展文件
+    /// (.exe/.com/.bat/.cmd)即视为遮蔽。Windows 工作目录优先解析 + PATHEXT
+    /// 扩展补全语义下,CreateProcess 会执行该本地文件而非 PATH 二进制——
+    /// 白名单无法为本地未知文件背书(配合 file_create 植文件即成两跳
+    /// 外传/任意执行)。检出即拒,fail-visible。
+    fn workdir_shadowed(workdir: Option<&Path>, program: &str) -> bool {
+        ["exe", "com", "bat", "cmd"]
+            .iter()
+            .any(|ext| workdir.is_some_and(|d| d.join(format!("{program}.{ext}")).is_file()))
+    }
+
     /// 实际执行命令(宿主后端)
     fn execute(&self, parts: &[&str], original_cmd: &str) -> IoResult {
         let program = Self::program_name(parts[0]);
 
-        // O 系安全登记:Windows 工作目录优先解析 + PATHEXT 扩展补全——工作
-        // 目录内存在与程序同名的可执行文件(.exe/.com/.bat/.cmd)时,
-        // CreateProcess 会执行本地文件而非 PATH 二进制,白名单无法为本地
-        // 未知文件背书(配合 file_create 植文件即成两跳外传/任意执行)。
-        // 检出即拒,fail-visible。
-        if let Some(dir) = &self.workdir {
-            let shadowed = ["exe", "com", "bat", "cmd"]
-                .iter()
-                .any(|ext| dir.join(format!("{program}.{ext}")).is_file());
-            if shadowed {
-                return Err(format!(
-                    "PATHEXT 双跳防护: 工作目录内存在与 '{program}' 同名的本地                     可执行文件 — 可能执行植文件而非 PATH 二进制,白名单无法                     为其背书。请重命名该文件,或用显式路径分步执行"
-                ));
-            }
+        if Self::workdir_shadowed(self.workdir.as_deref(), program) {
+            return Err(format!(
+                "PATHEXT 双跳防护: 工作目录内存在与 '{program}' 同名的本地可执行文件 \
+                 — 可能执行植文件而非 PATH 二进制,白名单无法为其背书。请重命名该文件,\
+                 或用显式路径分步执行"
+            ));
         }
 
         let mut cmd = Command::new(program);
@@ -1438,6 +1441,47 @@ mod tests {
         assert_eq!(ShellExecTool::classify("cargo"), CommandCategory::Active);
         assert_eq!(ShellExecTool::classify("git"), CommandCategory::Active);
         assert_eq!(ShellExecTool::classify("ls"), CommandCategory::Active);
+    }
+
+    // === PATHEXT 双跳防护(file_create 植文件 + 无扩展名程序两跳旁路的执法面) ===
+
+    #[test]
+    fn test_workdir_shadowed_by_extension() {
+        let dir =
+            std::env::temp_dir().join(format!("evo-shell-shadow-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 四扩展任一在位即遮蔽
+        for ext in ["exe", "com", "bat", "cmd"] {
+            std::fs::write(dir.join(format!("git.{ext}")), b"").unwrap();
+            assert!(
+                ShellExecTool::workdir_shadowed(Some(&dir), "git"),
+                "{ext} 应遮蔽"
+            );
+            std::fs::remove_file(dir.join(format!("git.{ext}"))).unwrap();
+        }
+        // 非可执行扩展不遮蔽
+        std::fs::write(dir.join("git.txt"), b"").unwrap();
+        assert!(!ShellExecTool::workdir_shadowed(Some(&dir), "git"));
+        std::fs::remove_file(dir.join("git.txt")).unwrap();
+        // 干净目录/无工作目录不遮蔽
+        assert!(!ShellExecTool::workdir_shadowed(Some(&dir), "git"));
+        assert!(!ShellExecTool::workdir_shadowed(None, "git"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 端到端拒执:工作目录含同名 .bat 时,白名单程序也拒绝执行(fail-visible)
+    #[test]
+    fn test_execute_rejects_shadowed_program() {
+        let dir =
+            std::env::temp_dir().join(format!("evo-shell-shadow-exec-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("git.bat"), b"@echo off\r\n").unwrap();
+        let tool = ShellExecTool::new().with_workdir(&dir);
+        let err = tool
+            .execute(&["git", "--version"], "git --version")
+            .expect_err("遮蔽程序应拒执");
+        assert!(err.contains("PATHEXT"), "拒执消息应指明防护面: {err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // === G1 执行环境 profile ===
