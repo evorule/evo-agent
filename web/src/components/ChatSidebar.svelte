@@ -47,6 +47,8 @@
   let showHistory = $state(false);
   // 可恢复崩溃会话集合(扫尾端点投影;与历史索引交集后展示「恢复」入口)
   let resumableIds = $state(new Set());
+  // 非计划重连对账后,当前会话可恢复时的中断回合横幅(存 sid;null=不展示)
+  let reconnectBannerSid = $state(null);
   // B25 谱系归属(全局归属链投影):子会话在列表内缩进 + 「委托自」徽标
   let lineageLinks = $state([]);
   // C 批「会话级 workspace」:当前工作区(连接级 ?workspace= 携带;
@@ -352,6 +354,7 @@
     refreshModels();
     document.addEventListener('click', onDocClickCloseModelMenu);
     document.addEventListener('click', onDocClickCloseApprovalMenu);
+    window.addEventListener('evo:reconnected', onReconnected);
     // 心跳停滞提示的秒级心跳(纯客户端:turn 活跃且久无引擎事件→琥珀提示;
     // serve 侧心跳 2 窗中止,此处为其可见前兆)
     stallTicker = setInterval(() => {
@@ -364,6 +367,7 @@
     if (stallTicker) clearInterval(stallTicker);
     document.removeEventListener('click', onDocClickCloseModelMenu);
     document.removeEventListener('click', onDocClickCloseApprovalMenu);
+    window.removeEventListener('evo:reconnected', onReconnected);
   });
 
   /** 引擎事件停滞秒数(turn 活跃面;<0 = 事件仍新鲜) */
@@ -387,6 +391,18 @@
     } catch {
       // fail-soft:扫尾端点不可用时不展示恢复入口(历史继续对话不受影响)
       resumableIds = new Set();
+    }
+  }
+
+  /** 非计划重连对账(连接韧性):serve 归位后刷新可恢复列表,当前会话
+   *  在其中 → 中断回合横幅。恢复仍走 askResume 显式确认——「人类持剑:
+   *  只列不续」语义不变,横幅只是把入口带到眼前。 */
+  async function onReconnected(ev) {
+    reconnectBannerSid = null;
+    await loadResumable();
+    const sid = ev && ev.detail ? ev.detail.sid : null;
+    if (sid && sid !== 'new' && resumableIds.has(sid)) {
+      reconnectBannerSid = sid;
     }
   }
 
@@ -758,6 +774,25 @@
   {/if}
 
   <div class="msg-list" bind:this={listEl}>
+    {#if reconnectBannerSid}
+      <div class="reconnect-banner" role="status">
+        <span class="rb-text">连接已恢复——上一回合被打断。</span>
+        <button
+          class="resume-btn"
+          onclick={() => {
+            const sid = reconnectBannerSid;
+            reconnectBannerSid = null;
+            askResume(sid);
+          }}
+          title="恢复中断的轮次(挂起审批不恢复,须重走审批)"
+        >恢复</button>
+        <button
+          class="rb-dismiss"
+          onclick={() => (reconnectBannerSid = null)}
+          title="不再提示"
+        >✕</button>
+      </div>
+    {/if}
     {#if $messages.length === 0}
       <div class="empty">
         <div class="empty-title">开始与 agent 对话</div>
@@ -1257,6 +1292,30 @@
     display: flex;
     flex-direction: column;
     gap: var(--sp-sm);
+  }
+  .reconnect-banner {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-sm);
+    padding: 6px 10px;
+    border: 1px solid var(--border-warn, #b8860b);
+    border-radius: 6px;
+    background: var(--bg-warn-soft, rgba(184, 134, 11, 0.12));
+    font-size: 12px;
+  }
+  .reconnect-banner .rb-text {
+    flex: 1;
+  }
+  .reconnect-banner .rb-dismiss {
+    border: none;
+    background: none;
+    color: var(--fg-muted, #888);
+    cursor: pointer;
+    padding: 0 2px;
+    font-size: 12px;
+  }
+  .reconnect-banner .rb-dismiss:hover {
+    color: var(--fg, inherit);
   }
   .empty {
     text-align: center;

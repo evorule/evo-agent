@@ -108,9 +108,13 @@ function wsUrl(sid) {
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let currentSid = 'new'; // 最近连接目标(断连自动重连复用)
+// 被动断连后在位旗标:下次 onopen 即「非计划重连」——广播 evo:reconnected
+// 供对账面消费(可恢复列表刷新+中断回合横幅);主动换线/新建不置位
+let reconnected = false;
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
+  reconnected = true;
   const delay = Math.min(1000 * 2 ** reconnectAttempts, 30000);
   reconnectAttempts += 1;
   // 提示降噪:首次断连必提示,其后每 5 次重试提示一次(状态区恒可见连接态)
@@ -143,6 +147,17 @@ export function connect(sid) {
     if (pendingResume) {
       pendingResume = false;
       sendResume();
+    }
+    // 非计划重连成功:广播对账事件(会话列表/可恢复列表消费方自行刷新)
+    if (reconnected) {
+      reconnected = false;
+      try {
+        window.dispatchEvent(
+          new CustomEvent('evo:reconnected', { detail: { sid: currentSid } })
+        );
+      } catch {
+        /* 非浏览器环境(测试)无 window,静默 */
+      }
     }
   };
   ws.onclose = () => {

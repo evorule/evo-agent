@@ -40,6 +40,28 @@ async function unwrap(resp) {
   return resp.json();
 }
 
+/**
+ * 幂等 GET 退避重试:仅网络级失败(fetch reject,serve 停机窗内连接拒绝即拒)
+ * 重试,任何 HTTP 响应(含 4xx/5xx)不重试——错误语义归调用方。
+ * 与 WS 重连节奏对齐(1s→2s→…封顶 30s);供断连恢复期的对账类拉取用
+ * (会话列表/可恢复列表/transcript),普通用户动作型请求不走此通道。
+ */
+export async function getJsonRetry(path, tries = 6) {
+  let delay = 1000;
+  for (let i = 0; ; i++) {
+    let resp;
+    try {
+      resp = await fetch(path, { headers: headers() });
+    } catch (e) {
+      if (i >= tries - 1) throw e;
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 2, 30000);
+      continue;
+    }
+    return unwrap(resp);
+  }
+}
+
 /** 列目录(dir 相对 workdir 根,缺省 = 根) */
 export function listDir(dir) {
   const q = dir ? `?dir=${encodeURIComponent(dir)}` : '';
@@ -119,19 +141,19 @@ export function replaceFiles(body) {
 
 /** 会话列表(本地索引,按最近活跃降序) */
 export function listSessions() {
-  return fetch('/api/sessions', { headers: headers() }).then(unwrap);
+  return getJsonRetry('/api/sessions');
 }
 
 /** 可恢复 run 扫尾列表(崩溃会话,只读投影;恢复须显式触发,无自动续跑) */
 export function listResumableRuns() {
-  return fetch('/api/sessions/resumable', { headers: headers() }).then(unwrap);
+  return getJsonRetry('/api/sessions/resumable');
 }
 
 /** 会话消息历史(活投影 source=live;TTL 回收后回落本地快照 source=snapshot) */
 export function getTranscript(sessionId) {
-  return fetch(`/api/sessions/${encodeURIComponent(sessionId)}/transcript`, {
-    headers: headers(),
-  }).then(unwrap);
+  return getJsonRetry(
+    `/api/sessions/${encodeURIComponent(sessionId)}/transcript`
+  );
 }
 
 /** 工作台配置读取(快照保留期;缺省 3m) */

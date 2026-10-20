@@ -157,12 +157,22 @@ impl Supervisor {
         });
     }
 
-    /// 就绪：登记 runtime、导航工作台、启动监视。
+    /// 就绪：登记 runtime、按需导航工作台、启动监视。
+    /// 粘滞端口配套（连接韧性）：仅当端口变化或曾离席（降级页把 nav_port
+    /// 置 None）才重导航——同口组重启跳过 navigate，前端 WS 指数退避重连
+    /// 直接命中，用户零整页刷新。
     fn on_running(self: &Arc<Self>, rt: Runtime) {
-        *self.nav_port.write().unwrap() = Some(rt.serve_port);
-        let url = format!("http://127.0.0.1:{}/", rt.serve_port);
-        if let Ok(u) = Url::parse(&url) {
-            let _ = self.window.navigate(u);
+        let need_nav = {
+            let mut np = self.nav_port.write().unwrap();
+            let need = *np != Some(rt.serve_port);
+            *np = Some(rt.serve_port);
+            need
+        };
+        if need_nav {
+            let url = format!("http://127.0.0.1:{}/", rt.serve_port);
+            if let Ok(u) = Url::parse(&url) {
+                let _ = self.window.navigate(u);
+            }
         }
         let (epoch, watch_executor) = {
             let mut st = self.state.lock().unwrap();
@@ -403,9 +413,11 @@ impl Supervisor {
         self.spawn_restart();
     }
 
-    /// 降级页导航（纯壳内资源，不经 serve）。
+    /// 降级页导航（纯壳内资源，不经 serve）。离席标记：nav_port 置 None，
+    /// 使恢复重启后 on_running 必重导航回工作台（粘滞同口也不跳过）。
     pub fn show_degrade(self: &Arc<Self>, msg: &str) {
         self.log_line(&format!("[guard] degrade: {msg}"));
+        *self.nav_port.write().unwrap() = None;
         let url = format!(
             "http://tauri.localhost/error.html?mode=degrade&msg={}&logs={}",
             crate::percent_encode(msg),
