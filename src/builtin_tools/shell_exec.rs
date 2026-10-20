@@ -1079,6 +1079,22 @@ impl ShellExecTool {
     fn execute(&self, parts: &[&str], original_cmd: &str) -> IoResult {
         let program = Self::program_name(parts[0]);
 
+        // O 系安全登记:Windows 工作目录优先解析 + PATHEXT 扩展补全——工作
+        // 目录内存在与程序同名的可执行文件(.exe/.com/.bat/.cmd)时,
+        // CreateProcess 会执行本地文件而非 PATH 二进制,白名单无法为本地
+        // 未知文件背书(配合 file_create 植文件即成两跳外传/任意执行)。
+        // 检出即拒,fail-visible。
+        if let Some(dir) = &self.workdir {
+            let shadowed = ["exe", "com", "bat", "cmd"]
+                .iter()
+                .any(|ext| dir.join(format!("{program}.{ext}")).is_file());
+            if shadowed {
+                return Err(format!(
+                    "PATHEXT 双跳防护: 工作目录内存在与 '{program}' 同名的本地                     可执行文件 — 可能执行植文件而非 PATH 二进制,白名单无法                     为其背书。请重命名该文件,或用显式路径分步执行"
+                ));
+            }
+        }
+
         let mut cmd = Command::new(program);
         cmd.args(&parts[1..]);
         if let Some(dir) = &self.workdir {
