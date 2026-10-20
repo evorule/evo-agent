@@ -47,6 +47,8 @@
   import { attachDebugDecorations } from '../lib/dap/decorations.js';
   import { openInlineChat, inlineChat } from '../lib/inlineChat.js';
   import InlineChatWidget from './InlineChatWidget.svelte';
+  import Breadcrumbs from './Breadcrumbs.svelte';
+  import { dispatchTabDrop } from '../lib/editorGroups.js';
   import { applyTheme, resolveMode } from '../lib/theme.js';
   import {
     getModelForPath,
@@ -107,8 +109,43 @@
   let mdPreviewHtml = '';
   /** 当前激活 tab 是否 Markdown 文件(预览钮可见性) */
   $: isMd = ($activePath || '').toLowerCase().endsWith('.md');
+  /** H2 面包屑:仅真实文件 tab 显示(设置页/diff/错误占位不显) */
+  $: crumbTab = $activePath ? $tabs.find((t) => t.path === $activePath) || null : null;
+  $: crumbPath = crumbTab && !crumbTab.kind && !crumbTab.error ? crumbTab.path : '';
   /** 保存失败的临时提示,保存成功即清 */
   let saveError = '';
+
+  // ---- H1 tab 拖拽:同组重排 + 跨组移动(dispatchTabDrop 统一分发) ----
+  let dragFrom = null; // {groupId, path}(仅本工作台 tab;外部拖入不接)
+  let dropIndex = -1; // 插入位指示(0..len;负 = 无)
+
+  function onTabDragStart(e, groupId, path) {
+    dragFrom = { groupId, path };
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', path); // 非空 data 保证 drop 派发
+  }
+
+  function onTabDragOver(e, index) {
+    if (!dragFrom) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const rect = e.currentTarget.getBoundingClientRect();
+    dropIndex = e.clientX > rect.left + rect.width / 2 ? index + 1 : index;
+  }
+
+  function onTabDrop(e, index) {
+    if (!dragFrom) return;
+    e.preventDefault();
+    const from = dragFrom;
+    const to = dropIndex >= 0 ? dropIndex : index;
+    endTabDrag();
+    dispatchTabDrop(from.groupId, from.path, 'primary', to);
+  }
+
+  function endTabDrag() {
+    dragFrom = null;
+    dropIndex = -1;
+  }
 
   /** 当前激活 tab 对应的产物登记(null = 非产物文件) */
   $: activeArtifact = $activePath
@@ -741,13 +778,20 @@
     {#if $tabs.length === 0}
       <div class="etab active">欢迎</div>
     {:else}
-      {#each $tabs as t (t.path)}        <div
+      {#each $tabs as t, i (t.path)}        <div
           class="etab file"
           class:active={t.path === $activePath}
+          class:drop-before={dropIndex === i}
+          class:drop-after={dropIndex === $tabs.length && i === $tabs.length - 1}
+          draggable="true"
           role="tab"
           tabindex="0"
           onclick={() => activePath.set(t.path)}
           onkeydown={(e) => e.key === 'Enter' && activePath.set(t.path)}
+          ondragstart={(e) => onTabDragStart(e, 'primary', t.path)}
+          ondragover={(e) => onTabDragOver(e, i)}
+          ondrop={(e) => onTabDrop(e, i)}
+          ondragend={endTabDrag}
         >
           <span class="tab-name">{t.name}</span>
           {#if t.dirty}<span class="dot" title="未保存"></span>{/if}
@@ -776,6 +820,7 @@
       <div class="save-error" title={saveError}>保存失败</div>
     {/if}
   </div>
+  <Breadcrumbs path={crumbPath} />
   {#if activeArtifact}
     <div class="artifact-bar">
       <span class="ab-tag">agent 产物</span>
@@ -829,6 +874,13 @@
     cursor: pointer;
     user-select: none;
     white-space: nowrap;
+  }
+  /* H1 拖拽插入位指示(inset 阴影不引发回流) */
+  .etab.drop-before {
+    box-shadow: inset 2px 0 0 var(--brand);
+  }
+  .etab.drop-after {
+    box-shadow: inset -2px 0 0 var(--brand);
   }
   .etab.active {
     color: var(--text-primary);
