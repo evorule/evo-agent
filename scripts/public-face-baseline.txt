@@ -20,7 +20,6 @@ internal-obs-id|plan/OBSERVATIONS-存量问题登记册.md|330d7a5b27a8749be82da
 internal-obs-id|plan/OBSERVATIONS-存量问题登记册.md|4c6fd9f401c8ce5e851377c055ef4393
 internal-obs-id|plan/OBSERVATIONS-存量问题登记册.md|9ba131a45c1fac231156e3214286652c
 private-repo-path|.trae/skills/evorule-ecosystem-constraints/SKILL.md|0775e62068d3b275451179dbc055ec30
-private-repo-path|.trae/skills/evorule-ecosystem-constraints/SKILL.md|0c32274b80630d79d76474a7b3786f60
 private-repo-path|.trae/skills/evorule-ecosystem-constraints/SKILL.md|ae5792f0892a30077df400f2101dd29f
 private-repo-path|data/verify/skill-rule-pack.json|1c4556b6648867513d466c6e61ed4054
 private-repo-path|data/verify/skill-rule-pack.json|2518cdb3dc009ec987c82bd09f8b3e4b
