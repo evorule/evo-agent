@@ -8,7 +8,7 @@
 <script>
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
-  import { settingsState, setSetting } from '../lib/settings.js';
+  import { settingsState, setSetting, loadSettings } from '../lib/settings.js';
   import { getWorkbenchConfig, putWorkbenchConfig, getLlmStatus } from '../lib/api.js';
   import { openSettingsJson } from '../lib/stores.js';
   import McpSection from './McpSection.svelte';
@@ -31,6 +31,7 @@
   let llmStatus = null;
 
   $: degraded = $settingsState.degraded;
+  $: loaded = $settingsState.loaded;
   $: entries = $settingsState.entries;
   $: sources = $settingsState.sources;
   $: settings = $settingsState.settings;
@@ -164,14 +165,25 @@
       </div>
     </div>
     {#if degraded}
-      <div class="degraded">服务不可达,当前显示缓存值(只读);恢复连接后自动解除</div>
+      <div class="degraded">
+        {loaded
+          ? '服务不可达,当前显示缓存值(只读);恢复连接后自动解除'
+          : '服务不可达,设置尚未加载;正在自动重试,也可手动重试'}
+      </div>
     {/if}
   </div>
 
   <div class="body">
     {#if entries.length === 0}
       <div class="empty">
-        {degraded ? '设置不可用:服务未连接且本地无缓存。' : '设置加载中…'}
+        {#if degraded && !loaded}
+          <div>无法连接服务,设置未加载。</div>
+          <button class="btn" onclick={() => loadSettings()}>重试</button>
+        {:else if !loaded}
+          <div>设置加载中…</div>
+        {:else}
+          <div>无设置项(serve 未下发 schema 条目)。</div>
+        {/if}
       </div>
     {:else}
       {#each categories as [cat, items] (cat)}

@@ -21,6 +21,7 @@ import {
   saveUserSettingsDoc,
   saveWorkspaceSettingsDoc,
   WORKSPACE_SETTINGS_FILE,
+  __resetLoadRetryForTest,
 } from '../src/lib/settings.js';
 import {
   getWorkbenchSettings,
@@ -292,5 +293,66 @@ describe('saveWorkspaceSettingsDoc(工作区文件直写)', () => {
     writeFile.mockRejectedValue(new Error('HTTP 500'));
     const err = await saveWorkspaceSettingsDoc('{}');
     expect(err).toBe('HTTP 500');
+  });
+});
+
+describe('loadSettings 自动重试(桌面壳启动早期 serve 未就绪场景)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    __resetLoadRetryForTest();
+    vi.useRealTimers();
+  });
+
+  it('从未加载成功+失败 → 定时重拉,成功后解除降级', async () => {
+    getWorkbenchSettingsSchema.mockRejectedValueOnce(new Error('down'));
+    getWorkbenchSettings.mockRejectedValueOnce(new Error('down'));
+    const ok = await loadSettings();
+    expect(ok).toBe(false);
+    expect(get(settingsState).degraded).toBe(true);
+    expect(get(settingsState).loaded).toBe(false);
+
+    getWorkbenchSettingsSchema.mockResolvedValue(SCHEMA_RES);
+    getWorkbenchSettings.mockResolvedValue(SETTINGS_RES);
+    await vi.advanceTimersByTimeAsync(5000);
+    const s = get(settingsState);
+    expect(s.loaded).toBe(true);
+    expect(s.degraded).toBe(false);
+    expect(s.entries).toEqual(SCHEMA_RES.entries);
+  });
+
+  it('连续失败 → 只挂一个重试 timer(幂等排程)', async () => {
+    getWorkbenchSettingsSchema.mockRejectedValue(new Error('down'));
+    getWorkbenchSettings.mockRejectedValue(new Error('down'));
+    await loadSettings();
+    await loadSettings();
+    expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it('已加载成功后失败(缓存只读场景) → 不排程自动重试', async () => {
+    settingsState.set({
+      entries: SCHEMA_RES.entries,
+      settings: { 'editor.fontSize': 18 },
+      sources: { 'editor.fontSize': 'user' },
+      degraded: false,
+      loaded: true,
+    });
+    getWorkbenchSettingsSchema.mockRejectedValue(new Error('down'));
+    getWorkbenchSettings.mockRejectedValue(new Error('down'));
+    await loadSettings();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(get(settingsState).degraded).toBe(true);
+  });
+
+  it('成功加载 → 取消 pending 重试', async () => {
+    getWorkbenchSettingsSchema.mockRejectedValueOnce(new Error('down'));
+    getWorkbenchSettings.mockRejectedValueOnce(new Error('down'));
+    await loadSettings();
+    expect(vi.getTimerCount()).toBe(1);
+    getWorkbenchSettingsSchema.mockResolvedValue(SCHEMA_RES);
+    getWorkbenchSettings.mockResolvedValue(SETTINGS_RES);
+    await loadSettings();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

@@ -43,11 +43,44 @@ export async function loadSettings() {
     };
     settingsState.set(next);
     persistCache(next);
+    cancelLoadRetry();
     return true;
   } catch {
     settingsState.update((s) => ({ ...s, degraded: true }));
+    // 完成过在线加载 → 缓存只读态,等调用方/用户操作重拉;
+    // 从未成功过(桌面壳启动早期 serve 未就绪) → 定时重拉,
+    // 兑现「恢复连接后自动解除」承诺,避免设置页永远停在空态。
+    if (!get(settingsState).loaded) scheduleLoadRetry();
     return false;
   }
+}
+
+// ---- 在线加载自动重试 ----
+
+/** 在线重拉失败后的自动重试间隔(ms) */
+export const LOAD_RETRY_DELAY_MS = 5000;
+
+/** 防重复排程的 timer 句柄(模块级) */
+let retryTimer = null;
+
+function scheduleLoadRetry() {
+  if (retryTimer !== null) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    if (!get(settingsState).loaded) loadSettings();
+  }, LOAD_RETRY_DELAY_MS);
+}
+
+function cancelLoadRetry() {
+  if (retryTimer !== null) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+}
+
+/** 重置自动重试排程(测试专用;生产代码勿调) */
+export function __resetLoadRetryForTest() {
+  cancelLoadRetry();
 }
 
 /**
