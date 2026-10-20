@@ -2355,8 +2355,10 @@ fn cmd_serve(
     };
 
     // state/auth_config 各留一份给文末附件上传子路由(S4)
-    let mut app = axum::Router::new()
-        .merge(agent_api::router_with_auth(state.clone(), auth_config.clone()));
+    let mut app = axum::Router::new().merge(agent_api::router_with_auth(
+        state.clone(),
+        auth_config.clone(),
+    ));
     if let Some(build_dir) = console_build_dir {
         let console_service = tower_http::services::ServeDir::new(&build_dir).fallback(
             tower_http::services::ServeFile::new(build_dir.join("index.html")),
