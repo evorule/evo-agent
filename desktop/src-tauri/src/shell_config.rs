@@ -67,6 +67,9 @@ pub struct Paths {
     pub evorule_server_exe: Option<PathBuf>,
     /// evorule-server 资源根（含 resources\、rules\；缺省 = 壳 exe 同目录）
     pub evorule_server_home: Option<PathBuf>,
+    /// LLM 执行体 evorule-ai-plugin 可执行文件（缺省 = 安装布局
+    /// resources\bin\evorule-ai-plugin.exe，回落壳 exe 同目录；在位才拉起）
+    pub ai_plugin_exe: Option<PathBuf>,
 }
 
 /// console 审计页通道：产物在位即启用（W6，替代 M1 的「缺省关闭」）。
@@ -97,6 +100,8 @@ pub struct ResolvedPaths {
     pub evorule_server_exe: PathBuf,
     /// evorule-server 资源根（宪法/规则文件；显式传 flag，不依赖 CWD）
     pub evorule_server_home: PathBuf,
+    /// LLM 执行体可执行文件（解析路径恒有值；在位与否在拉起期判定）
+    pub ai_plugin_exe: PathBuf,
     /// 壳数据根（%LOCALAPPDATA%\evo-agent-desktop）
     pub data_dir: PathBuf,
     /// serve 工作目录（data_dir\runtime）：壳生成的 evo-agent.toml、
@@ -192,6 +197,16 @@ pub fn resolve(cfg: &ShellConfig) -> Result<ResolvedPaths, String> {
             exe_dir.join("resources").join("evorule-server"),
             exe_dir.clone(),
         ));
+    let ai_plugin_exe = cfg
+        .paths
+        .ai_plugin_exe
+        .clone()
+        .unwrap_or_else(|| {
+            installed_or(
+                exe_dir.join("resources").join("bin").join("evorule-ai-plugin.exe"),
+                exe_dir.join("evorule-ai-plugin.exe"),
+            )
+        });
 
     // 数据根用 identifier（与 NSIS currentUser 安装目录 %LOCALAPPDATA%\{productName} 隔离，
     // 防卸载危及用户数据）
@@ -228,6 +243,7 @@ pub fn resolve(cfg: &ShellConfig) -> Result<ResolvedPaths, String> {
         evo_agent_home,
         evorule_server_exe,
         evorule_server_home,
+        ai_plugin_exe,
         runtime_dir: data_dir.join("runtime"),
         logs_dir: data_dir.join("logs"),
         engine_data_dir: data_dir.join("engine-data"),
