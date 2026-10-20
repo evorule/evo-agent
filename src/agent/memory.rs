@@ -1030,7 +1030,7 @@ impl MessageRecord {
                 timestamp,
                 fact_id: None,
             },
-            Message::User { content } => Self {
+            Message::User { content, .. } => Self {
                 idx,
                 role: "user".to_string(),
                 content: content.clone(),
@@ -4963,6 +4963,7 @@ mod tests {
     fn test_message_record_from_user_message() {
         let msg = Message::User {
             content: "Hello".to_string(),
+            images: Vec::new(),
         };
         let record = MessageRecord::from_message(1, &msg, 2000);
         assert_eq!(record.idx, 1);
@@ -5002,6 +5003,7 @@ mod tests {
     fn test_message_record_path_key() {
         let msg = Message::User {
             content: "test".to_string(),
+            images: Vec::new(),
         };
         let record = MessageRecord::from_message(5, &msg, 1000);
         assert_eq!(record.path_key(), "messages.5");
@@ -5923,6 +5925,7 @@ mod tests {
         };
         let dropped = vec![Message::User {
             content: "部署".to_string(),
+            images: Vec::new(),
         }];
         let mut ctx_on = RecallContext::default();
         ctx_on.stable.push(MemoryRecord::new(

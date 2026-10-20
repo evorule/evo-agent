@@ -1022,7 +1022,7 @@ async fn patrol_consume(
     label: &str,
 ) -> Result<evo_agent::agent::runner::AgentResult, String> {
     use futures_util::StreamExt;
-    let mut stream = runner.run_streaming(prompt);
+    let mut stream = runner.run_streaming(prompt, Vec::new());
     let mut final_result: Option<evo_agent::agent::runner::AgentResult> = None;
     let mut step = 0usize;
     while let Some(ev) = stream.next().await {
@@ -1421,7 +1421,7 @@ fn cmd_run_blocking(
     use futures_util::StreamExt;
 
     let final_result = runtime.block_on(async move {
-        let mut event_stream = runner.run_streaming(goal.to_string());
+        let mut event_stream = runner.run_streaming(goal.to_string(), Vec::new());
 
         let mut final_result: Option<evo_agent::AgentResult> = None;
 
@@ -1510,7 +1510,7 @@ fn cmd_run_streaming(
     use std::io::Write;
 
     let final_result = runtime.block_on(async move {
-        let mut event_stream = runner.run_streaming(goal.to_string());
+        let mut event_stream = runner.run_streaming(goal.to_string(), Vec::new());
 
         let mut final_result: Option<evo_agent::AgentResult> = None;
 
@@ -3185,10 +3185,10 @@ fn run_repl_turn(
 
     let event_stream = if let Some(sid) = current_session.clone() {
         // G15:continuation — 复用已有 session
-        runner.run_continuation(sid, input)
+        runner.run_continuation(sid, input, Vec::new())
     } else {
         // 首次输入 — 创建新 session
-        runner.run_streaming(input)
+        runner.run_streaming(input, Vec::new())
     };
 
     let turn_result = runtime.block_on(async move {

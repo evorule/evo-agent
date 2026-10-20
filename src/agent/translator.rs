@@ -20,6 +20,11 @@ pub enum Message {
     User {
         /// Message content
         content: String,
+        /// 旁路图片（S4-b 用户轮多模态上行；空 = 无图，序列化跳过该键、wire 层
+        /// 保持纯字符串 content 与既有行为完全一致。旧记录无此键，serde default
+        /// 反序列化为空。镜像 Tool 变体的 B1 旁路口径）
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageData>,
     },
     #[serde(rename = "assistant")]
     /// Assistant message
@@ -48,7 +53,7 @@ impl Message {
     pub fn content(&self) -> &str {
         match self {
             Message::System { content } => content,
-            Message::User { content } => content,
+            Message::User { content, .. } => content,
             Message::Assistant { content, .. } => content,
             Message::Tool { content, .. } => content,
         }
@@ -76,6 +81,21 @@ pub struct ImageData {
     pub mime_type: String,
     /// 图片字节流 base64
     pub data_base64: String,
+}
+
+/// 用户轮附件图片引用（S4-b 多模态上行：客户端上传回执 `{path,mime}` 原样回传）
+///
+/// `path` 为相对进程 cwd 的工作区路径，必须在 `.evo-agent/uploads/` 固定
+/// 子目录下（服务端上传端点的落盘域，无用户可控路径段）；runner 侧校验链
+/// = 路径沙箱 × mime 白名单 × 魔数头 × 尺寸/数量预算，任一不过即丢弃计数
+/// （fail-soft）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserImageRef {
+    /// 上传件相对路径（`.evo-agent/uploads/<UTC时间戳>-<净化名>`）
+    pub path: String,
+    /// 客户端声明 MIME（服务端魔数复检兜底，白名单外丢弃）
+    #[serde(rename = "mime_type")]
+    pub mime_type: String,
 }
 
 /// LLM response
@@ -146,6 +166,7 @@ mod tests {
 
         let user = Message::User {
             content: "user".to_string(),
+            images: Vec::new(),
         };
         assert_eq!(user.content(), "user");
 

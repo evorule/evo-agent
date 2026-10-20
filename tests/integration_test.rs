@@ -422,6 +422,7 @@ async fn test_sediment_rollup_marks_old_summaries_as_rolled_up() {
     };
     let messages = vec![Message::User {
         content: "some conversation".to_string(),
+        images: Vec::new(),
     }];
 
     let result = sediment(&mut deps, &cfg, "s1", &messages).await;

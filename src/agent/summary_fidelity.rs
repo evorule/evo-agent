@@ -42,7 +42,7 @@ const TOOL_ANCHOR_MAX_CHARS: usize = 64;
 pub fn extract_anchors(dropped: &[Message]) -> Vec<String> {
     let mut anchors: Vec<String> = Vec::new();
     // goal 关键词：首条 user 消息分词 top-8（频次降序+字典序 tie-break）
-    if let Some(Message::User { content }) =
+    if let Some(Message::User { content, .. }) =
         dropped.iter().find(|m| matches!(m, Message::User { .. }))
     {
         let mut freq: std::collections::BTreeMap<String, usize> = Default::default();
@@ -116,6 +116,7 @@ mod tests {
     fn msg_user(content: &str) -> Message {
         Message::User {
             content: content.to_string(),
+            images: Vec::new(),
         }
     }
 

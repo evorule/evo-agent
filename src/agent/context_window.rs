@@ -411,6 +411,7 @@ mod tests {
     fn user(content: &str) -> Message {
         Message::User {
             content: content.to_string(),
+            images: Vec::new(),
         }
     }
 
@@ -695,9 +696,9 @@ mod tests {
         let mut prev_idx = usize::MAX;
         // 找出 trimmed 中各消息在原数组的位置
         for m in &trimmed {
-            if let Message::User { content } = m {
+            if let Message::User { content, .. } = m {
                 if let Some(idx) = msgs.iter().position(|orig| {
-                    if let Message::User { content: oc } = orig {
+                    if let Message::User { content: oc, .. } = orig {
                         oc == content
                     } else {
                         false

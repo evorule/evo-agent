@@ -559,6 +559,10 @@ fn normalize_executor_response(json: Value) -> Result<Value, String> {
 /// - Tool 消息（B1 多模态上行）: 旁路 `images` 非空时 content 升级为多 part 数组
 ///   `[{type:"text"},{type:"image_url",...}]`，并移除非标准 `images` 键；
 ///   空/缺失时 content 保持纯字符串（与既有形态一致）
+/// - User 消息（S4-b 用户轮多模态上行）: 旁路 `images` 非空时镜像 Tool 分支升级为
+///   多 part 数组；text part 取 content 指纹 blob 的 `text` 字段（runner 侧 JSON 化
+///   留痕），解析失败（如窗口预算注记破坏 JSON）回落原始字符串仍可见；
+///   空/缺失时 content 保持纯字符串（无图消息 byte 级一致）
 ///
 /// 其余消息与字段原样保留。id 确定性生成（`call_{index}_{name}`），同一 assistant 消息内
 /// 多个同名 tool_call 按 index 区分。
@@ -630,6 +634,50 @@ fn to_openai_wire_messages(messages: serde_json::Value) -> serde_json::Value {
                             .get("content")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
+                        parts.push(serde_json::json!({"type": "text", "text": text}));
+                        for img in imgs {
+                            let mime = img
+                                .get("mime_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("image/png");
+                            let data = img
+                                .get("data_base64")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if data.is_empty() {
+                                continue;
+                            }
+                            parts.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": {"url": format!("data:{mime};base64,{data}")}
+                            }));
+                        }
+                        converted.insert("content".to_string(), serde_json::Value::Array(parts));
+                    }
+                    converted.remove("images");
+                }
+            }
+            "user" => {
+                // S4-b 用户轮多模态上行:旁路 images 非空时镜像 tool 分支升级为
+                // 多 part 数组;text part 取指纹 blob 的 text 字段,解析失败回落
+                // 原始字符串(窗口预算丢弃注记破坏 JSON 形态时仍可见)。空/缺失
+                // 时保持纯字符串 content(无图消息 wire 形态 byte 级一致),
+                // images 键组装后移除(与 tool_name/images 同口径)。
+                if let Some(imgs) = obj.get("images").and_then(|v| v.as_array()) {
+                    if !imgs.is_empty() {
+                        let raw = converted
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let text = serde_json::from_str::<Value>(raw)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("text")
+                                    .and_then(|t| t.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_else(|| raw.to_string());
+                        let mut parts: Vec<serde_json::Value> = Vec::with_capacity(imgs.len() + 1);
                         parts.push(serde_json::json!({"type": "text", "text": text}));
                         for img in imgs {
                             let mime = img
@@ -947,6 +995,70 @@ mod tests {
         assert_eq!(parts[1]["type"], "image_url");
         assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,QUJD");
         assert!(tool.get("images").is_none(), "sideband key must be removed");
+    }
+
+    /// S4-b 用户轮多模态上行:无图 user 消息(无 images 键)content 保持
+    /// 纯字符串——与既有 wire 形态 byte 级一致(回滚保证)
+    #[test]
+    fn test_wire_user_message_without_images_untouched() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "hello world"}
+        ]);
+        let wire = to_openai_wire_messages(messages);
+        let arr = wire.as_array().unwrap();
+        assert_eq!(arr[0]["role"], "user");
+        assert_eq!(arr[0]["content"], "hello world");
+        assert!(arr[0].get("images").is_none());
+    }
+
+    /// S4-b 用户轮多模态上行:images 非空 → content 升级多 part 数组,text part
+    /// 取指纹 blob 的 text 字段(而非整个 blob),images 键移除
+    #[test]
+    fn test_wire_user_message_images_upgrade_parts_from_blob_text() {
+        let blob = serde_json::json!({
+            "text": "这张图里有什么?",
+            "images_extracted": [
+                {"fingerprint": "abc123", "bytes": 3, "mime_type": "image/png"}
+            ]
+        })
+        .to_string();
+        let messages = serde_json::json!([
+            {"role": "user", "content": blob,
+             "images": [{"mime_type": "image/jpeg", "data_base64": "QUJD"}]}
+        ]);
+        let wire = to_openai_wire_messages(messages);
+        let arr = wire.as_array().unwrap();
+        let user = &arr[0];
+        let parts = user["content"].as_array().expect("content must be array");
+        assert_eq!(parts.len(), 2, "text part + one image part");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(
+            parts[0]["text"], "这张图里有什么?",
+            "text part must be the blob's text field, not the whole blob"
+        );
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
+        assert!(user.get("images").is_none(), "sideband key must be removed");
+    }
+
+    /// S4-b:text 解析回落——content 非合法指纹 blob(如窗口预算注记破坏 JSON)
+    /// 时回落原始字符串,text part 仍可见
+    #[test]
+    fn test_wire_user_message_blob_parse_fallback() {
+        let messages = serde_json::json!([
+            {"role": "user",
+             "content": "{\"text\":\"hi\",\"images_extracted\":[]}\n[image omitted: window image budget, 1 dropped]",
+             "images": [{"mime_type": "image/png", "data_base64": "QUJD"}]}
+        ]);
+        let wire = to_openai_wire_messages(messages);
+        let arr = wire.as_array().unwrap();
+        let parts = arr[0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("[image omitted: window image budget, 1 dropped]"),
+            "fallback text must be the raw string with the omission note, got: {text}"
+        );
     }
 
     #[test]

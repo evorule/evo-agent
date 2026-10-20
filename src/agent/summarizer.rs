@@ -797,6 +797,7 @@ mod tests {
     fn user(content: &str) -> Message {
         Message::User {
             content: content.to_string(),
+            images: Vec::new(),
         }
     }
 

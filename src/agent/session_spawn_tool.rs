@@ -348,7 +348,8 @@ impl ToolFunction for SessionSpawnTool {
         // 事件流（G16 续跑语义，ws_handler 同构）。
         let first_goal = compose_first_goal(&w.session_id, child_depth);
         let child_runner = (w.factory)(&child_id);
-        let mut stream = child_runner.run_continuation(child_id.clone(), first_goal.clone());
+        let mut stream =
+            child_runner.run_continuation(child_id.clone(), first_goal.clone(), Vec::new());
         tokio::spawn(async move {
             use futures_util::StreamExt;
             while let Some(item) = stream.next().await {

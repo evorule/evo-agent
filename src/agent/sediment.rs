@@ -1548,7 +1548,7 @@ async fn extract_and_store_events(
     let mut seq = 0usize;
 
     for (i, msg) in messages.iter().enumerate() {
-        let Message::User { content } = msg else {
+        let Message::User { content, .. } = msg else {
             continue;
         };
         // 触发检测（显式/关键词/任务域词，纯文本匹配，不调 LLM）
@@ -1996,6 +1996,7 @@ mod tests {
             "s-starve",
             &[Message::User {
                 content: "g".to_string(),
+                images: Vec::new(),
             }],
         )
         .await;
@@ -2195,6 +2196,7 @@ mod tests {
             },
             Message::User {
                 content: "Hello".to_string(),
+                images: Vec::new(),
             },
             Message::Assistant {
                 content: "Hi there".to_string(),
@@ -2259,6 +2261,7 @@ mod tests {
         };
         let messages = vec![Message::User {
             content: "hello".to_string(),
+            images: Vec::new(),
         }];
         let result = sediment(&mut deps, &cfg, "s1", &messages).await;
         assert!(!result.summary_written);
@@ -2294,6 +2297,7 @@ mod tests {
         let messages = vec![
             Message::User {
                 content: "今天是我生日".to_string(),
+                images: Vec::new(),
             },
             Message::Assistant {
                 content: "生日快乐！".to_string(),
@@ -2346,6 +2350,7 @@ mod tests {
         };
         let messages = vec![Message::User {
             content: "今天是我生日".to_string(),
+            images: Vec::new(),
         }];
         // 开关关闭：不应有任何写入（配置语义从"静默失效"变为"真实生效"）
         let m1 = server
@@ -2384,6 +2389,7 @@ mod tests {
         };
         let messages = vec![Message::User {
             content: "今天天气不错".to_string(),
+            images: Vec::new(),
         }];
         // 无触发：不调 LLM、不写事件
         let m1 = server
@@ -2459,6 +2465,7 @@ mod tests {
         let messages = vec![
             Message::User {
                 content: "第一条".to_string(),
+                images: Vec::new(),
             },
             Message::Assistant {
                 content: "回复一".to_string(),
@@ -2466,6 +2473,7 @@ mod tests {
             },
             Message::User {
                 content: "第二条".to_string(),
+                images: Vec::new(),
             },
             Message::Assistant {
                 content: "回复二".to_string(),
@@ -2505,6 +2513,7 @@ mod tests {
         let messages = vec![
             Message::User {
                 content: "你好".to_string(),
+                images: Vec::new(),
             },
             Message::Assistant {
                 content: "你好！".to_string(),
@@ -2546,6 +2555,7 @@ mod tests {
         let messages = vec![
             Message::User {
                 content: "第一条".to_string(),
+                images: Vec::new(),
             },
             Message::Assistant {
                 content: "回复一".to_string(),
@@ -2553,6 +2563,7 @@ mod tests {
             },
             Message::User {
                 content: "第二条".to_string(),
+                images: Vec::new(),
             },
             Message::Assistant {
                 content: "回复二".to_string(),
@@ -2880,6 +2891,7 @@ mod tests {
         let messages = vec![
             Message::User {
                 content: "第一条".to_string(),
+                images: Vec::new(),
             },
             Message::Assistant {
                 content: "回复一".to_string(),
@@ -2944,6 +2956,7 @@ mod tests {
         let messages = vec![
             Message::User {
                 content: "第一条".to_string(),
+                images: Vec::new(),
             },
             Message::Assistant {
                 content: "回复一".to_string(),
