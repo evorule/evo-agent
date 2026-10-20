@@ -1,13 +1,16 @@
-# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
+﻿# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
 #
 # 资源布局（安装后 {install}\resources\...，由 tauri.conf.json bundle.resources 承接）：
 #   resources\bin\evo-agent.exe             <- <repo>\target\release\evo-agent.exe
 #   resources\bin\evorule-server.exe        <- <server-repo>\target\release\evorule-server.exe
-#   resources\evo-agent\evo-agent.toml      <- <repo>\evo-agent.toml（可选，用户配置透传基座）
+#   resources\bin\evorule-ai-plugin.exe     <- <server-repo>\plugins\ai-plugin\target\release\（LLM 执行体）
+#   resources\evo-agent\evo-agent.toml      <- desktop\templates\evo-agent.toml（发版模板，唯一源）
 #   resources\evo-agent\agents\             <- <repo>\agents
 #   resources\evo-agent\web\dist\           <- <repo>\web\dist
 #   resources\evorule-server\resources\     <- <server-repo>\resources
 #   resources\evorule-server\rules\         <- <server-repo>\rules
+#   resources\evorule-server\agent-governance\rules\00_constraint_model_allowlist.json
+#                                           <- <server-repo>\data\agent-governance\rules\（执行体白名单物料）
 #
 # <repo>       = 本仓根（本脚本所在 desktop 目录的上级）。
 # <server-repo> = 引擎仓根，默认取本仓同级 evorule-server 目录，-ServerRepo 可覆盖。
@@ -44,14 +47,16 @@ if (-not $SkipCollect) {
     $pairs = @(
         @{ Src = (Join-Path $repoRoot "target\release\evo-agent.exe");        Dst = "resources\bin\evo-agent.exe" },
         @{ Src = (Join-Path $ServerRepo "target\release\evorule-server.exe"); Dst = "resources\bin\evorule-server.exe" },
+        @{ Src = (Join-Path $ServerRepo "plugins\ai-plugin\target\release\evorule-ai-plugin.exe"); Dst = "resources\bin\evorule-ai-plugin.exe" },
         @{ Src = (Join-Path $repoRoot "agents");                              Dst = "resources\evo-agent\agents" },
         @{ Src = (Join-Path $repoRoot "web\dist");                            Dst = "resources\evo-agent\web\dist" },
         @{ Src = (Join-Path $ServerRepo "resources");                         Dst = "resources\evorule-server\resources" },
-        @{ Src = (Join-Path $ServerRepo "rules");                             Dst = "resources\evorule-server\rules" }
+        @{ Src = (Join-Path $ServerRepo "rules");                             Dst = "resources\evorule-server\rules" },
+        @{ Src = (Join-Path $ServerRepo "data\agent-governance\rules\00_constraint_model_allowlist.json"); Dst = "resources\evorule-server\agent-governance\rules\00_constraint_model_allowlist.json" }
     )
 
     foreach ($p in $pairs) {
-        if (-not (Test-Path $p.Src)) { throw "missing source: $($p.Src)（先 cargo build --release 两个引擎仓）" }
+        if (-not (Test-Path $p.Src)) { throw "missing source: $($p.Src)（先 cargo build --release 引擎仓与 ai-plugin）" }
         $dst = Join-Path $srcTauri $p.Dst
         $dstParent = Split-Path $dst -Parent
         if (-not (Test-Path $dstParent)) { New-Item -ItemType Directory -Path $dstParent -Force | Out-Null }
@@ -60,12 +65,19 @@ if (-not $SkipCollect) {
         Write-Host "collected $($p.Src) -> $dst"
     }
 
-    # 用户配置透传基座（可选源，存在才收）
-    $userToml = Join-Path $repoRoot "evo-agent.toml"
-    if (Test-Path $userToml) {
-        Copy-Item $userToml (Join-Path $srcTauri "resources\evo-agent\evo-agent.toml") -Force
-        Write-Host "collected $userToml -> resources\evo-agent\evo-agent.toml"
+    # 发版模板（唯一源）：desktop\templates\evo-agent.toml；仓根 evo-agent.toml
+    # 是开发本地配置（gitignore），不再是发版源。收集前先过 SSOT 校验——
+    # service_tools 清单漂移（少家族/漏服务）= 桌面 agent 无法路由，构建必红
+    # （子进程调用：校验脚本自身的 exit 码不经 & 传染本脚本）。
+    $syncScript = Join-Path $desktop "scripts\sync-service-tools.ps1"
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $syncScript -ServerRepo $ServerRepo -Check
+    if ($LASTEXITCODE -ne 0) {
+        throw "service_tools drift vs SSOT — run desktop\scripts\sync-service-tools.ps1 and commit"
     }
+    $templateToml = Join-Path $desktop "templates\evo-agent.toml"
+    if (-not (Test-Path $templateToml)) { throw "release template missing: $templateToml" }
+    Copy-Item $templateToml (Join-Path $srcTauri "resources\evo-agent\evo-agent.toml") -Force
+    Write-Host "collected $templateToml -> resources\evo-agent\evo-agent.toml"
 
     # console 静态产物（可选源，存在才收；W6：在位即启用，缺位 = 安装包不带
     # console 通道，壳启动探测缺位后静默不启用）。源 = console 仓

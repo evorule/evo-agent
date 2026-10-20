@@ -1,4 +1,6 @@
-// 进程编排：端口预分配 → job 收编 → engine → 健康探测 → serve → 健康探测。
+// 进程编排：端口预分配（三口互斥）→ job 收编 → engine → 健康探测 →
+// LLM 执行体（可选：exe+key 双条件，缺位降级不阻断）→ 健康探测 →
+// serve（注入执行体端点与调用方令牌 env）→ 健康探测。
 //
 // 已核实的实况约定（实施期逐一对照源码验证）：
 // - evorule-server：`--profile development` 跳过生产五条件门（缺省 production
@@ -40,6 +42,9 @@ pub struct Runtime {
     pub engine_port: u16,
     pub serve: Option<Child>,
     pub engine: Option<Child>,
+    /// LLM 执行体（可选组件：exe+key 双条件启用；未启用 = None）
+    pub ai_plugin: Option<Child>,
+    pub ai_plugin_port: Option<u16>,
 }
 
 /// 一次拉起所需的全部输入（job 由守护方持有，跨重启复用）。
@@ -49,6 +54,9 @@ pub struct LaunchContext<'a> {
     pub engine_extra_args: &'a [String],
     pub serve_token: &'a str,
     pub engine_token: &'a str,
+    /// 执行体调用方令牌（每次壳启动随机生成；仅 env 注入双方进程，
+    /// 不落盘/不进命令行/不进日志——与 engine token 同款纪律）
+    pub executor_token: &'a str,
     pub version: &'a str,
     pub job: &'a Arc<JobHandle>,
     /// 自收编是否成功（决定子进程要不要逐个收编）
@@ -62,12 +70,13 @@ pub fn gen_token() -> String {
 }
 
 /// bind-test 选空闲端口：绑定 0 拿系统分配后立即释放，显式传给子进程。
-fn pick_free_port(exclude: Option<u16>) -> Result<u16, String> {
+/// exclude 列出已占定的兄弟端口（serve/engine/executor 三口互斥）。
+fn pick_free_port(exclude: &[u16]) -> Result<u16, String> {
     for _ in 0..16 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         drop(listener);
-        if Some(port) != exclude {
+        if !exclude.contains(&port) {
             return Ok(port);
         }
     }
@@ -238,7 +247,12 @@ fn spawn_engine(ctx: &LaunchContext, engine_port: u16) -> Result<Child, String> 
     Ok(engine)
 }
 
-fn spawn_serve(ctx: &LaunchContext, serve_port: u16, engine_port: u16) -> Result<Child, String> {
+fn spawn_serve(
+    ctx: &LaunchContext,
+    serve_port: u16,
+    engine_port: u16,
+    ai_plugin_port: Option<u16>,
+) -> Result<Child, String> {
     let paths = ctx.paths;
     let serve_log = open_append(&paths.logs_dir.join("serve.log"))?;
     let serve_log_err = open_append(&paths.logs_dir.join("serve.log"))?;
@@ -264,6 +278,15 @@ fn spawn_serve(ctx: &LaunchContext, serve_port: u16, engine_port: u16) -> Result
         .stdout(Stdio::from(serve_log))
         .stderr(Stdio::from(serve_log_err))
         .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    // 执行体调用方令牌恒注入（无执行体时无害闲置）；端点仅在执行体在位时
+    // 覆盖缺省 9130——serve 侧 env 优先链已就绪
+    serve_cmd.env("EVORULE_LLM_EXECUTOR_TOKEN", ctx.executor_token);
+    if let Some(p) = ai_plugin_port {
+        serve_cmd.env(
+            "EVORULE_LLM_EXECUTOR_URL",
+            format!("http://127.0.0.1:{p}/llm/execute"),
+        );
+    }
     let serve = serve_cmd
         .spawn()
         .map_err(|e| format!("spawn evo-agent serve: {e}"))?;
@@ -273,12 +296,119 @@ fn spawn_serve(ctx: &LaunchContext, serve_port: u16, engine_port: u16) -> Result
     Ok(serve)
 }
 
+/// 用户 LLM key 文件（app_config_dir\llm-key.txt，单行 trim）。
+/// 读出后仅以 env 注入执行体进程：不进日志/不进命令行/不落 runtime 产物。
+fn read_llm_key(paths: &ResolvedPaths) -> Option<String> {
+    std::fs::read_to_string(paths.app_config_dir.join("llm-key.txt"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 壳生成的执行体运行时配置（每次拉起覆写）。动态值——监听端口/引擎地址/
+/// 白名单物料绝对路径——不允许静态模板承载；key 与调用方令牌一律走 env，
+/// 不进本文件。server_auth_token 置空：本拓扑下执行体只被 serve 调用
+/// （/llm/execute），不主动调引擎。
+fn write_ai_plugin_config(
+    paths: &ResolvedPaths,
+    listen_port: u16,
+    engine_port: u16,
+) -> Result<(), String> {
+    let allowlist = paths
+        .evorule_server_home
+        .join("agent-governance")
+        .join("rules")
+        .join("00_constraint_model_allowlist.json");
+    let cfg = serde_json::json!({
+        "listen_addr": format!("127.0.0.1:{listen_port}"),
+        "server_base_url": format!("http://127.0.0.1:{engine_port}"),
+        "server_auth_token": "",
+        "llm_endpoint": "https://api.minimaxi.com/v1",
+        "llm_execute_url": "https://api.minimaxi.com/v1/text/chatcompletion_v2",
+        "llm_model": "MiniMax-M3",
+        "llm_temperature": 0.2,
+        "llm_timeout_ms": 60000,
+        "model_allowlist_path": allowlist.display().to_string(),
+    });
+    let out = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    std::fs::write(paths.runtime_dir.join("ai-plugin.json"), out)
+        .map_err(|e| format!("write ai-plugin.json: {e}"))
+}
+
+/// 执行体启用判定：exe 在位 且 key 文件在位（对齐 console「产物在位即启用」
+/// 先例）。缺任一 = 不拉起 + 一条日志指引，工作台其余功能照常。
+fn llm_executor_ready(ctx: &LaunchContext, log: &mut impl Write) -> Option<String> {
+    if !ctx.paths.ai_plugin_exe.is_file() {
+        writeln!(
+            log,
+            "[orch] llm executor exe not found ({}); LLM disabled",
+            ctx.paths.ai_plugin_exe.display()
+        )
+        .ok();
+        return None;
+    }
+    match read_llm_key(ctx.paths) {
+        Some(k) => Some(k),
+        None => {
+            writeln!(
+                log,
+                "[orch] llm key file missing ({}); put your key there (single line) to enable LLM",
+                ctx.paths.app_config_dir.join("llm-key.txt").display()
+            )
+            .ok();
+            None
+        }
+    }
+}
+
+fn spawn_ai_plugin(
+    ctx: &LaunchContext,
+    listen_port: u16,
+    engine_port: u16,
+    llm_key: &str,
+) -> Result<Child, String> {
+    let paths = ctx.paths;
+    write_ai_plugin_config(paths, listen_port, engine_port)?;
+    let out_log = open_append(&paths.logs_dir.join("ai-plugin.log"))?;
+    let err_log = open_append(&paths.logs_dir.join("ai-plugin.log"))?;
+    let mut cmd = Command::new(&paths.ai_plugin_exe);
+    cmd.arg("--config")
+        .arg(paths.runtime_dir.join("ai-plugin.json"))
+        .env("EVORULE_AI_PLUGIN_CALLER_TOKEN", ctx.executor_token)
+        .env("EVORULE_AI_PLUGIN_LLM_API_KEY", llm_key)
+        .stdout(Stdio::from(out_log))
+        .stderr(Stdio::from(err_log))
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn ai-plugin: {e}"))?;
+    if !ctx.self_assigned {
+        ctx.job.assign_pid(child.id());
+    }
+    Ok(child)
+}
+
+/// 执行体单独重生（serve/engine 在位时执行体退出的轻量恢复）：复用原端口
+/// ——serve 的执行体端点 env 不变——并按当前 engine 端口重生成配置。
+pub fn restart_llm_executor(
+    ctx: &LaunchContext,
+    port: u16,
+    engine_port: u16,
+    log: &mut impl Write,
+) -> Result<Child, String> {
+    match llm_executor_ready(ctx, log) {
+        Some(key) => spawn_ai_plugin(ctx, port, engine_port, &key),
+        None => Err("llm executor prerequisites gone (exe/key)".into()),
+    }
+}
+
 fn write_runtime_file(
     paths: &ResolvedPaths,
     version: &str,
     rt: &Runtime,
     serve_pid: u32,
     engine_pid: u32,
+    ai_plugin_pid: Option<u32>,
 ) -> Result<(), String> {
     let runtime_json = serde_json::json!({
         "version": version,
@@ -288,6 +418,11 @@ fn write_runtime_file(
             .unwrap_or(0),
         "serve": { "port": rt.serve_port, "pid": serve_pid },
         "engine": { "port": rt.engine_port, "pid": engine_pid },
+        // null = 执行体未启用（exe/key 缺位）；令牌永不入本文件
+        "llm_executor": rt.ai_plugin_port.map(|p| serde_json::json!({
+            "port": p,
+            "pid": ai_plugin_pid.unwrap_or(0),
+        })),
     });
     std::fs::write(
         paths.data_dir.join("runtime.json"),
@@ -296,31 +431,49 @@ fn write_runtime_file(
     .map_err(|e| format!("write runtime.json: {e}"))
 }
 
-/// 初始启动：预备工作区 → engine → 探测 → serve → 探测 → runtime.json。
-pub fn launch(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, String> {
-    writeln!(log, "[orch] launch begin (shell v{})", ctx.version).ok();
-    prepare_workspace(ctx, log)?;
-
-    let serve_port = pick_free_port(None)?;
-    let engine_port = pick_free_port(Some(serve_port))?;
+/// 全链拉起（初始启动与整组重启共用）：engine → 探测 → 执行体（可选）→
+/// 探测 → serve → 探测 → runtime.json。执行体为可选组件：exe/key 缺位或
+/// 健康失败一律降级不阻断（LLM 不可用，工作台其余功能照常）。
+fn start_group(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, String> {
+    let serve_port = pick_free_port(&[])?;
+    let engine_port = pick_free_port(&[serve_port])?;
+    let executor_port = pick_free_port(&[serve_port, engine_port])?;
 
     let mut engine = spawn_engine(ctx, engine_port)?;
     if !health::wait_healthy(engine_port, "/api/health", Duration::from_secs(30)) {
         let _ = engine.kill();
-        return Err(format!(
-            "engine health check timeout (port {engine_port}); logs: {}",
-            ctx.paths.logs_dir.display()
-        ));
+        return Err(format!("engine health check timeout (port {engine_port})"));
     }
     writeln!(log, "[orch] engine healthy on port {engine_port}").ok();
 
-    let mut serve = spawn_serve(ctx, serve_port, engine_port)?;
+    let mut ai_plugin = None;
+    let mut ai_plugin_port = None;
+    if let Some(key) = llm_executor_ready(ctx, log) {
+        match spawn_ai_plugin(ctx, executor_port, engine_port, &key) {
+            Ok(mut child) => {
+                if health::wait_healthy(executor_port, "/health", Duration::from_secs(15)) {
+                    writeln!(log, "[orch] llm executor healthy on port {executor_port}").ok();
+                    ai_plugin = Some(child);
+                    ai_plugin_port = Some(executor_port);
+                } else {
+                    writeln!(
+                        log,
+                        "[orch] llm executor health timeout (port {executor_port}); LLM disabled"
+                    )
+                    .ok();
+                    let _ = child.kill();
+                }
+            }
+            Err(e) => {
+                writeln!(log, "[orch] llm executor spawn failed: {e}").ok();
+            }
+        }
+    }
+
+    let mut serve = spawn_serve(ctx, serve_port, engine_port, ai_plugin_port)?;
     if !health::wait_healthy(serve_port, "/health", Duration::from_secs(30)) {
         let _ = serve.kill();
-        return Err(format!(
-            "serve health check timeout (port {serve_port}); logs: {}",
-            ctx.paths.logs_dir.display()
-        ));
+        return Err(format!("serve health check timeout (port {serve_port})"));
     }
     writeln!(log, "[orch] serve healthy on port {serve_port}").ok();
 
@@ -329,6 +482,8 @@ pub fn launch(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, Stri
         engine_port,
         serve: Some(serve),
         engine: Some(engine),
+        ai_plugin,
+        ai_plugin_port,
     };
     write_runtime_file(
         ctx.paths,
@@ -336,7 +491,16 @@ pub fn launch(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, Stri
         &rt,
         rt.serve.as_ref().map(|c| c.id()).unwrap_or(0),
         rt.engine.as_ref().map(|c| c.id()).unwrap_or(0),
+        rt.ai_plugin.as_ref().map(|c| c.id()),
     )?;
+    Ok(rt)
+}
+
+/// 初始启动：预备工作区 → 全链拉起（日志目录随错误提示，便于排障）。
+pub fn launch(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, String> {
+    writeln!(log, "[orch] launch begin (shell v{})", ctx.version).ok();
+    prepare_workspace(ctx, log)?;
+    let rt = start_group(ctx, log)?;
     writeln!(log, "[orch] launch complete").ok();
     Ok(rt)
 }
@@ -344,32 +508,7 @@ pub fn launch(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, Stri
 /// 整组重启（崩溃退避 / 手动触发共用）：复用工作区，端口重选，全链重拉。
 pub fn restart_services(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, String> {
     writeln!(log, "[orch] group restart begin").ok();
-    let serve_port = pick_free_port(None)?;
-    let engine_port = pick_free_port(Some(serve_port))?;
-
-    let mut engine = spawn_engine(ctx, engine_port)?;
-    if !health::wait_healthy(engine_port, "/api/health", Duration::from_secs(30)) {
-        let _ = engine.kill();
-        return Err(format!("engine health check timeout (port {engine_port})"));
-    }
-    let mut serve = spawn_serve(ctx, serve_port, engine_port)?;
-    if !health::wait_healthy(serve_port, "/health", Duration::from_secs(30)) {
-        let _ = serve.kill();
-        return Err(format!("serve health check timeout (port {serve_port})"));
-    }
-    let rt = Runtime {
-        serve_port,
-        engine_port,
-        serve: Some(serve),
-        engine: Some(engine),
-    };
-    write_runtime_file(
-        ctx.paths,
-        ctx.version,
-        &rt,
-        rt.serve.as_ref().map(|c| c.id()).unwrap_or(0),
-        rt.engine.as_ref().map(|c| c.id()).unwrap_or(0),
-    )?;
+    let rt = start_group(ctx, log)?;
     writeln!(log, "[orch] group restart complete").ok();
     Ok(rt)
 }
@@ -392,22 +531,22 @@ fn send_ctrl_c(pid: u32) {
 pub fn graceful_stop(
     engine: &mut Option<Child>,
     serve: &mut Option<Child>,
+    ai_plugin: &mut Option<Child>,
     timeout: Duration,
 ) {
-    for slot in [engine.as_ref(), serve.as_ref()].into_iter().flatten() {
+    for slot in [engine.as_ref(), serve.as_ref(), ai_plugin.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         send_ctrl_c(slot.id());
     }
     let start = Instant::now();
     loop {
-        let engine_gone = engine
-            .as_mut()
-            .map(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(true))
-            .unwrap_or(true);
-        let serve_gone = serve
-            .as_mut()
-            .map(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(true))
-            .unwrap_or(true);
-        if engine_gone && serve_gone {
+        let all_gone = [engine.as_mut(), serve.as_mut(), ai_plugin.as_mut()]
+            .into_iter()
+            .flatten()
+            .all(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(true));
+        if all_gone {
             return;
         }
         if start.elapsed() >= timeout {
@@ -417,4 +556,68 @@ pub fn graceful_stop(
     }
     if let Some(c) = engine { let _ = c.kill(); }
     if let Some(c) = serve { let _ = c.kill(); }
+    if let Some(c) = ai_plugin { let _ = c.kill(); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_paths(tag: &str) -> ResolvedPaths {
+        let root = std::env::temp_dir().join(format!("evo-shell-orch-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        std::fs::create_dir_all(root.join("app-config")).unwrap();
+        ResolvedPaths {
+            evo_agent_exe: root.join("evo-agent.exe"),
+            evo_agent_home: root.clone(),
+            evorule_server_exe: root.join("evorule-server.exe"),
+            evorule_server_home: root.join("server-home"),
+            ai_plugin_exe: root.join("evorule-ai-plugin.exe"),
+            data_dir: root.clone(),
+            runtime_dir: root.join("runtime"),
+            engine_data_dir: root.join("engine-data"),
+            logs_dir: root.join("logs"),
+            app_config_dir: root.join("app-config"),
+            console: crate::shell_config::Console::default(),
+        }
+    }
+
+    /// 生成的执行体配置是跨进程契约（消费方 = server 仓 ai-plugin）：
+    /// 动态值正确落位，令牌/key 绝不入文件（零落盘纪律）。
+    #[test]
+    fn ai_plugin_config_carries_dynamic_values_and_no_secrets() {
+        let paths = scratch_paths("cfg");
+        write_ai_plugin_config(&paths, 19131, 18080).unwrap();
+        let raw =
+            std::fs::read_to_string(paths.runtime_dir.join("ai-plugin.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["listen_addr"], "127.0.0.1:19131");
+        assert_eq!(v["server_base_url"], "http://127.0.0.1:18080");
+        assert_eq!(v["server_auth_token"], "");
+        assert!(v["model_allowlist_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("00_constraint_model_allowlist.json"));
+        // 零落盘红线：调用方令牌与 LLM key 的载体是 env，本文件不得出现键名
+        assert!(v.get("caller_token").is_none());
+        assert!(v.get("llm_api_key").is_none());
+        assert!(v.get("EVORULE_AI_PLUGIN_CALLER_TOKEN").is_none());
+        assert!(v.get("EVORULE_AI_PLUGIN_LLM_API_KEY").is_none());
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn llm_key_file_trimmed_and_blank_rejected() {
+        let paths = scratch_paths("key");
+        // 缺文件 → None
+        assert!(read_llm_key(&paths).is_none());
+        let key_file = paths.app_config_dir.join("llm-key.txt");
+        // 空白 → None（视为未配置，不误启用）
+        std::fs::write(&key_file, "   \n").unwrap();
+        assert!(read_llm_key(&paths).is_none());
+        // 正常值 → trim 后返回
+        std::fs::write(&key_file, "  sk-live-example \n").unwrap();
+        assert_eq!(read_llm_key(&paths).as_deref(), Some("sk-live-example"));
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
 }

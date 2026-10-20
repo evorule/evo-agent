@@ -40,8 +40,9 @@ workspace/
 .evo/
 
 
-# 本地运行配置(含端点选择与本地路径,不随仓分发,密钥走 ENV 引用)
-evo-agent.toml
+# 本地运行配置(含端口选择与本地路径,不随仓分发,密钥走 ENV 引用)。
+# 根锚定:desktop/templates/ 发版模板是入库件,不受此规则误伤
+/evo-agent.toml
 
 # 运维脚本本机实例配置(含本机真实路径,不随仓分发)
 scripts/ops/ops.local.json

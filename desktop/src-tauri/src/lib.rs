@@ -171,6 +171,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let nav_port: NavPort = Arc::new(RwLock::new(None));
             let serve_token = orchestrator::gen_token();
             let engine_token = orchestrator::gen_token();
+            // 执行体调用方令牌：serve 与 LLM 执行体共享，仅 env 注入双方
+            let executor_token = orchestrator::gen_token();
 
             // 窗口尺寸记忆：缺省 1280×800，最小 960×600
             let mut builder = WebviewWindowBuilder::new(
@@ -207,6 +209,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 engine_extra_args,
                 serve_token,
                 engine_token,
+                executor_token,
                 version,
                 win.clone(),
                 nav_port.clone(),
