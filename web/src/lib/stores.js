@@ -123,6 +123,22 @@ export const tabs = writable([]);
 /** 当前激活 tab 的文件路径(null = 无激活 tab,显示欢迎页) */
 export const activePath = writable(null);
 
+/** 当前焦点编辑器光标(F1 状态栏):{line, column, language}(monaco 坐标);
+ *  null = 无编辑器焦点(欢迎页/设置页)。由 EditorPane/GroupPane 写入。 */
+export const cursorPos = writable(null);
+
+/** 编辑器侧统一发布光标位(焦点编辑器的事件回调里调用,天然只反映当前焦点实例) */
+export function publishCursor(editor) {
+  const model = editor?.getModel?.();
+  const pos = editor?.getPosition?.();
+  if (!model || !pos) return;
+  cursorPos.set({
+    line: pos.lineNumber,
+    column: pos.column,
+    language: model.getLanguageId?.() || '',
+  });
+}
+
 /** 按路径查找已打开的 tab(tabs 快照上) */
 export function findTab(list, path) {
   return list.find((t) => t.path === path);

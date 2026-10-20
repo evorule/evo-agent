@@ -16,6 +16,7 @@
     scmGenerateIntent,
   } from '../lib/stores.js';
   import { settingsState } from '../lib/settings.js';
+  import { push as pushNotification } from '../lib/notifications.js';
   import {
     gitStage,
     gitUnstage,
@@ -30,18 +31,15 @@
   let committing = false;
   let identityMissing = false;
   let identityHint = '';
-  let notice = null; // {kind:'ok'|'err', text}(短暂 toast,命令面板同款底部浮层)
-  let noticeTimer = null;
 
   let generating = false; // B15:AI 生成中(spinner)
   let generated = false; // 输入框当前内容来自 AI 生成(按钮转 ↻ 重试)
 
   let confirmState = null; // {paths:[..], message:'..'}(discard 二次确认)
 
+  /** F2 收编:提示统一走通知中心(右下 toast+状态栏铃铛),原面板内局部浮层摘除 */
   function flash(kind, text) {
-    notice = { kind, text };
-    if (noticeTimer) clearTimeout(noticeTimer);
-    noticeTimer = setTimeout(() => (notice = null), 3200);
+    pushNotification(kind === 'ok' ? 'info' : kind, '源代码管理', text);
   }
 
   function errText(e) {
@@ -57,9 +55,6 @@
       })
       .catch(() => {});
     refreshGitStatus(0);
-    return () => {
-      if (noticeTimer) clearTimeout(noticeTimer);
-    };
   });
 
   async function runStage(paths) {
@@ -331,10 +326,6 @@
   {/if}
 </div>
 
-{#if notice}
-  <div class="scm-toast {notice.kind}" role="alert">{notice.text}</div>
-{/if}
-
 <ConfirmDialog
   open={!!confirmState}
   title="丢弃更改"
@@ -562,28 +553,5 @@
   }
   .badge.renamed {
     color: var(--git-renamed);
-  }
-
-  .scm-toast {
-    position: fixed;
-    left: 50%;
-    bottom: 40px;
-    transform: translateX(-50%);
-    background: var(--bg-card);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--r-md);
-    color: var(--text-primary);
-    font-size: var(--fs-xs);
-    padding: var(--sp-xs) var(--sp-md);
-    box-shadow: var(--sh-modal);
-    z-index: 301;
-  }
-  .scm-toast.ok {
-    border-color: var(--success);
-    color: var(--success);
-  }
-  .scm-toast.err {
-    border-color: var(--danger);
-    color: var(--danger);
   }
 </style>
