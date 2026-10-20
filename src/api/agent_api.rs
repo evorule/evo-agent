@@ -314,6 +314,49 @@ pub struct AgentApiState {
     mcp_ledger: std::sync::Arc<crate::agent::event_ledger::EventLedger>,
 }
 
+// =============================================================================
+// S5-b: 会话模型持久化(data/llm_state.json;「最后一次人工显式切换」记录)
+// 范式与 workbench settings user 层同构:固定相对路径过白名单门、tmp+rename
+// 原子写、损坏件读侧降级(fail-soft)。仅 model 单键,零凭据物料。
+// =============================================================================
+
+/// S5-b: 持久化状态文件路径(workdir 相对固定路径,过白名单门防演化越界)
+fn llm_state_path(workdir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    crate::api::settings::ensure_fixed_relative(workdir, "data/llm_state.json")
+}
+
+/// S5-b: 读持久化模型名(缺文件/损坏/非对象/空值 → None 降级回静态配置)
+pub fn read_llm_state_model(workdir: &std::path::Path) -> Option<String> {
+    let path = llm_state_path(workdir).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("model")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// S5-b: 原子写持久化模型名(tmp+rename,父目录确保;与 settings save_atomic 同款)
+fn write_llm_state_model(workdir: &std::path::Path, model: &str) -> Result<(), String> {
+    let path = llm_state_path(workdir)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create llm state dir failed: {e}"))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let doc = serde_json::json!({ "model": model });
+    let text = serde_json::to_string_pretty(&doc)
+        .map_err(|e| format!("serialize llm state failed: {e}"))?;
+    {
+        use std::io::Write as _;
+        let mut f =
+            std::fs::File::create(&tmp).map_err(|e| format!("write llm state tmp failed: {e}"))?;
+        f.write_all(text.as_bytes())
+            .map_err(|e| format!("write llm state tmp failed: {e}"))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename llm state failed: {e}"))
+}
+
 impl AgentApiState {
     /// Create new Agent API state
     pub fn new(definitions: AgentDefinitionManager, evorule_client: EvoruleApiClient) -> Self {
@@ -468,7 +511,23 @@ impl AgentApiState {
             .model = model.to_string();
         let mut snap = self.llm_status.write().expect("llm_status lock poisoned");
         snap.model = model.to_string();
-        snap.clone()
+        let snapshot = snap.clone();
+        drop(snap);
+        // S5-b:内存态切换成功后落盘(fail-soft:写失败仅告警不回滚内存态;
+        // 唯一写入口=切换端点,与 workbench settings「端点唯一写入口」同构)
+        self.persist_llm_state_model(model);
+        snapshot
+    }
+
+    /// S5-b: 持久化「最后一次人工显式切换」到 data/llm_state.json,serve 重启
+    /// 后由启动段读回恢复;写失败仅告警——下次启动回退静态配置值(可接受)
+    fn persist_llm_state_model(&self, model: &str) {
+        if let Err(e) = write_llm_state_model(&self.workdir, model) {
+            eprintln!(
+                "[llm] persist model state failed (in-memory switch kept): {}",
+                e
+            );
+        }
     }
 
     /// 会话索引的引用(WS 处理器记录会话活动)
@@ -2964,9 +3023,17 @@ mod tests {
     use crate::agent::AgentResult;
 
     fn make_test_state() -> AgentApiState {
-        AgentApiState::new(
+        // S5-b 起 switch_llm_model 会向 workdir/data/llm_state.json 落盘——
+        // 测试态改用一次性 tempdir 作 workdir(有意泄漏,OS temp 兜底),
+        // 避免测试残留写进仓根 runtime 面、被下次真 serve 启动误读。
+        let tmp: &tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        AgentApiState::new_with_metrics(
             AgentDefinitionManager::with_default_dir(),
             EvoruleApiClient::new("http://localhost:8080"),
+            Arc::new(Metrics::new().unwrap()),
+            tmp.path().to_path_buf(),
+            Arc::new(WorkspaceApiClient::new("http://localhost:8080")),
+            Arc::new(std::sync::RwLock::new(ToolHandler::new())),
         )
     }
 
@@ -2985,6 +3052,61 @@ mod tests {
         // 默认态(未注入):api_key 为空(from_config 视为未配置,不误用占位符)
         let fresh = make_test_state();
         assert!(fresh.llm_config().api_key.is_empty());
+    }
+
+    #[test]
+    fn test_llm_state_roundtrip_and_degrade() {
+        // S5-b:持久化写/读往返 + 缺失/损坏/非对象/空值降级(fail-soft 不 panic)
+        let tmp = tempfile::tempdir().unwrap();
+        let wd = tmp.path();
+        assert_eq!(super::read_llm_state_model(wd), None);
+        super::write_llm_state_model(wd, "MiniMax-M3").unwrap();
+        assert_eq!(
+            super::read_llm_state_model(wd),
+            Some("MiniMax-M3".to_string())
+        );
+        // 覆盖写 → 新值(tmp+rename 原子替换语义)
+        super::write_llm_state_model(wd, "MiniMax-M2.5").unwrap();
+        assert_eq!(
+            super::read_llm_state_model(wd),
+            Some("MiniMax-M2.5".to_string())
+        );
+        // 损坏件 → None 降级
+        std::fs::write(wd.join("data").join("llm_state.json"), "not json{{").unwrap();
+        assert_eq!(super::read_llm_state_model(wd), None);
+        // 非对象 JSON → None
+        std::fs::write(wd.join("data").join("llm_state.json"), "[]").unwrap();
+        assert_eq!(super::read_llm_state_model(wd), None);
+        // 空 model → None
+        super::write_llm_state_model(wd, "").unwrap();
+        assert_eq!(super::read_llm_state_model(wd), None);
+    }
+
+    #[test]
+    fn test_llm_model_switch_persists_state() {
+        // S5-b:切换成功即落盘,内存态与文件同步;重复切换覆盖更新
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AgentApiState::new_with_metrics(
+            AgentDefinitionManager::with_default_dir(),
+            EvoruleApiClient::new("http://localhost:8080"),
+            Arc::new(Metrics::new().unwrap()),
+            tmp.path().to_path_buf(),
+            Arc::new(WorkspaceApiClient::new("http://localhost:8080")),
+            Arc::new(std::sync::RwLock::new(ToolHandler::new())),
+        )
+        .with_llm_status(crate::config::LlmConfig::default().status_snapshot(None));
+        state.switch_llm_model("MiniMax-M3");
+        assert_eq!(state.current_llm_model(), "MiniMax-M3");
+        assert_eq!(
+            super::read_llm_state_model(tmp.path()),
+            Some("MiniMax-M3".to_string())
+        );
+        state.switch_llm_model("MiniMax-M2.5");
+        assert_eq!(state.current_llm_model(), "MiniMax-M2.5");
+        assert_eq!(
+            super::read_llm_state_model(tmp.path()),
+            Some("MiniMax-M2.5".to_string())
+        );
     }
 
     #[tokio::test]

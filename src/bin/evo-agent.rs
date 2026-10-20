@@ -1849,7 +1849,7 @@ fn cmd_serve(
 
     // 1. 加载配置(宽松模式:server 启动不需要 LLM API key,只在 run 时才需要)
     //    (.env 已在 main 入口统一加载,serve 不再单独处理)
-    let config = match evo_agent::config::Config::load_lenient(workdir) {
+    let mut config = match evo_agent::config::Config::load_lenient(workdir) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("config error: {}", e);
@@ -2142,6 +2142,14 @@ fn cmd_serve(
         let _ = evo_agent::metrics::set_safety_hit_hook(move |rule| {
             evo_agent::Metrics::inc_safety_audit_hit(&m, rule);
         });
+    }
+    // S5-b: 会话模型持久化——「最后一次人工显式切换」为最高优先(高于 env/toml,
+    // 与运行期 UI 切换覆盖 env 态同语义),仅覆盖 model 单字段;缺文件/损坏降级
+    // 回静态配置值。位于 AgentApiState 构造前,with_llm_status/with_llm_config
+    // 共享同一覆盖后配置。
+    if let Some(m) = evo_agent::api::agent_api::read_llm_state_model(std::path::Path::new(workdir))
+    {
+        config.llm.model = m;
     }
     let mut state = AgentApiState::new_with_metrics(
         definitions,
