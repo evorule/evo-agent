@@ -323,7 +323,12 @@ pub async fn upload_file(
     let full = state.workdir().join(&rel);
     // create_parents:仅固定子目录段,无用户可控路径,无越界面
     let result = std::fs::create_dir_all(full.parent().unwrap_or(&full))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir failed: {e}")))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("mkdir failed: {e}"),
+            )
+        })
         .and_then(|()| {
             std::fs::write(&full, &bytes)
                 .map(|_| {
@@ -334,7 +339,12 @@ pub async fn upload_file(
                         "mime": upload_mime(&clean),
                     })
                 })
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write failed: {e}")))
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("write failed: {e}"),
+                    )
+                })
         });
     record_outcome(&state, "file_upload", identity, &rel, &result);
     result.map(Json)
@@ -512,7 +522,10 @@ mod tests {
     #[test]
     fn test_sanitize_upload_name() {
         assert_eq!(sanitize_upload_name("a.png"), "a.png");
-        assert_eq!(sanitize_upload_name(r"C:\Users\test\我 的 图.png"), "我 的 图.png");
+        assert_eq!(
+            sanitize_upload_name(r"C:\Users\test\我 的 图.png"),
+            "我 的 图.png"
+        );
         assert_eq!(sanitize_upload_name("../../etc/passwd"), "passwd");
         assert_eq!(sanitize_upload_name("bad<script>.txt"), "bad_script_.txt");
         let long = sanitize_upload_name(&"x".repeat(100));
