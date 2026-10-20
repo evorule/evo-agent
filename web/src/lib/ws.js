@@ -279,6 +279,13 @@ export function interrupt() {
   }
 }
 
+/** 手动立即重连(E1 工作区切换「立即重连」消费):断开现有 socket 并按
+ *  当前目标重建——wsUrl 读 localStorage evo_workspace,新连接即携带新工作区。
+ *  connect 入口会清被动退避计时器,无重连竞态。 */
+export function reconnectCurrent() {
+  connect(currentSid);
+}
+
 /** 新建会话:断开当前连接并以 "new" 重连 */
 export function newSession() {
   pendingResume = false;
