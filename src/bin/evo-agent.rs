@@ -2334,6 +2334,15 @@ fn cmd_serve(
     let workbench = tower_http::services::ServeDir::new(&dist_dir).not_found_service(
         tower_http::services::ServeFile::new(dist_dir.join("index.html")),
     );
+    // 静态面统一 no-cache:桌面 WebView2 对无 Cache-Control 的响应走启发式缓存,
+    // 旧 index.html 会引用已被新构建覆盖的 hash bundle → 白屏/旧 UI。
+    // no-cache 强制 revalidate(ETag 未变 304,变了 200 新内容;hash 资产同名不变仍 304)。
+    let workbench = tower::ServiceBuilder::new()
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache"),
+        ))
+        .service(workbench);
 
     // console 审计页双形态接入(配置化,fail-soft):
     // 1) <console_dir>/build/index.html 在位 → 同源静态托管 /console(产物形态,
