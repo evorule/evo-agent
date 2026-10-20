@@ -28,11 +28,11 @@ jobs:
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 若 master 启用分支保护导致签名提交被拒，需配置有写权限的 PAT 并取消下行注释：
+          # 若默认分支启用分支保护导致签名提交被拒，需配置有写权限的 PAT 并取消下行注释：
           # PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
         with:
           path-to-signatures: 'signatures/version1/cla.json'
-          path-to-document: 'https://github.com/evorule/evo-agent/blob/master/CLA-individual.md'
-          branch: 'master'
+          path-to-document: 'https://github.com/evorule/evo-agent/blob/main/CLA-individual.md'
+          branch: 'main'
           # allowlist：免签账号（项目账号 + 常用 bot）。
           allowlist: 'evorule, EvoRuleLab, dependabot[bot], renovate[bot]'
