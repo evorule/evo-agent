@@ -13,6 +13,7 @@
   import ProblemsView from './ProblemsView.svelte';
   import TerminalView from './TerminalView.svelte';
   import DebugConsoleTab from './DebugConsoleTab.svelte';
+  import ConsoleLogTab from './ConsoleLogTab.svelte';
   import Divider from './Divider.svelte';
   import { panelHeight, setPanelHeight, PANEL_MIN, PANEL_DEFAULT } from '../lib/layout.js';
   import { taskChannelIds, taskBufferVersion, taskLines, clearTaskChannel } from '../lib/tasks.js';
@@ -23,7 +24,7 @@
     { id: 'output', label: '输出' },
     { id: 'problems', label: '问题' },
     { id: 'debugconsole', label: '调试控制台' },
-    { id: 'console', label: '控制台日志', disabled: true, tip: 'serve 日志流在后续阶段接入' },
+    { id: 'console', label: '控制台日志' },
     { id: 'audit', label: '审计' },
     { id: 'timetravel', label: '时光机器', disabled: true, tip: '回放面板在后续阶段接入(引擎侧回放已就绪)' },
     { id: 'memory', label: '记忆', disabled: true, tip: '记忆面板在后续阶段接入' },
@@ -204,6 +205,8 @@
         <ProblemsView />
       {:else if $panelTab === 'debugconsole'}
         <DebugConsoleTab />
+      {:else if $panelTab === 'console'}
+        <ConsoleLogTab />
       {:else if $panelTab === 'audit'}
         <div class="audit-head">
           <span class="audit-note">当前会话治理事件流(展示层视图;权威审计链以审计页为准)</span>
