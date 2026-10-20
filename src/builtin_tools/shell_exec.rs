@@ -1447,15 +1447,16 @@ mod tests {
 
     #[test]
     fn test_workdir_shadowed_by_extension() {
-        let dir = std::env::temp_dir().join(format!(
-            "evo-shell-shadow-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("evo-shell-shadow-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // 四扩展任一在位即遮蔽
         for ext in ["exe", "com", "bat", "cmd"] {
             std::fs::write(dir.join(format!("git.{ext}")), b"").unwrap();
-            assert!(ShellExecTool::workdir_shadowed(Some(&dir), "git"), "{ext} 应遮蔽");
+            assert!(
+                ShellExecTool::workdir_shadowed(Some(&dir), "git"),
+                "{ext} 应遮蔽"
+            );
             std::fs::remove_file(dir.join(format!("git.{ext}"))).unwrap();
         }
         // 非可执行扩展不遮蔽
@@ -1471,10 +1472,8 @@ mod tests {
     /// 端到端拒执:工作目录含同名 .bat 时,白名单程序也拒绝执行(fail-visible)
     #[test]
     fn test_execute_rejects_shadowed_program() {
-        let dir = std::env::temp_dir().join(format!(
-            "evo-shell-shadow-exec-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("evo-shell-shadow-exec-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("git.bat"), b"@echo off\r\n").unwrap();
         let tool = ShellExecTool::new().with_workdir(&dir);
