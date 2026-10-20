@@ -33,6 +33,8 @@
     openGitDiffTab,
     USER_SETTINGS_URI,
     WORKSPACE_SETTINGS_URI,
+    cursorPos,
+    publishCursor,
   } from '../lib/stores.js';
   import {
     settingsState,
@@ -343,15 +345,18 @@
     if (!path) {
       editor.setModel(welcomeModel);
       showHost('edit');
+      publishCursor(editor);
       return;
     }
     if (!tab) {
       editor.setModel(welcomeModel);
       showHost('edit');
+      publishCursor(editor);
       return;
     }
     if (tab.kind === 'settings') {
       // 设置页:非 Monaco 特殊 tab,渲染设置组件(不建 model)
+      cursorPos.set(null); // F1 状态栏:无编辑器光标
       showHost('settings');
       return;
     }
@@ -365,6 +370,7 @@
       }
       editor.setModel(errorModels.get(tab.path));
       showHost('edit');
+      publishCursor(editor);
       return;
     }
     if (tab.kind === 'git-diff') {
@@ -386,6 +392,7 @@
       editor.setModel(model);
       showHost('edit');
     }
+    publishCursor(editor); // F1 状态栏:切 model 后光标位即发布(onDidChange 之外的兜底)
   }
 
   function toggleDiff() {
@@ -515,6 +522,8 @@
         scheduleMarkdownLint(path, model); // markdown 去抖校验(非 markdown 直接跳过)
       }
     });
+    // F1 状态栏:光标移动即发布行列/语言(焦点编辑器事件,天然只反映当前焦点实例)
+    editor.onDidChangeCursorPosition(() => publishCursor(editor));
     // 本组件命令自注册(命令面板/键位路由统一入口;卸载时注销)。
     // 编辑器内 Ctrl+S 也统一走全局键位路由(when editorFocus 命中)——
     // Monaco addCommand 不阻止 keydown 冒泡,双注册会双触发(实测)。
