@@ -2354,7 +2354,9 @@ fn cmd_serve(
         None
     };
 
-    let mut app = axum::Router::new().merge(agent_api::router_with_auth(state, auth_config));
+    // state/auth_config 各留一份给文末附件上传子路由(S4)
+    let mut app = axum::Router::new()
+        .merge(agent_api::router_with_auth(state.clone(), auth_config.clone()));
     if let Some(build_dir) = console_build_dir {
         let console_service = tower_http::services::ServeDir::new(&build_dir).fallback(
             tower_http::services::ServeFile::new(build_dir.join("index.html")),
@@ -2375,8 +2377,11 @@ fn cmd_serve(
     };
     let app = app
         .fallback_service(workbench)
-        .layer(cors_layer)
-        .layer(RequestBodyLimitLayer::new(1024 * 1024));
+        .layer(cors_layer.clone())
+        .layer(RequestBodyLimitLayer::new(1024 * 1024))
+        // S4 附件上传面:全局 1MB 钳制之后 merge 注入(后 merge 的路由不受
+        // 既有 layer 约束),子路由自带 14MB 限层与同款 G7 鉴权
+        .merge(agent_api::upload_router_with_auth(state, auth_config).layer(cors_layer));
 
     // console 审计页 sidecar 自动拉起(仅 dev 形态;产物已静态托管时跳过,fail-soft)。
     // workbench.console_dir 配置 console-cloud 仓目录且产物缺位时,serve 启动期

@@ -227,8 +227,22 @@ export async function sendMessage(content, mentions = [], opts = {}) {
     opts.mode === 'chat'
       ? '<mode>chat</mode>\n<mode-note>用户当前为对话模式:本条为咨询问答,仅分析/解释/给建议,不要执行文件修改、命令执行等变更性操作;若判断确需变更,先给出方案并等待用户确认。</mode-note>'
       : '';
-  // wire 正文 = [重建回注块] + [模式提示块] + 正文 + [@上下文 XML];气泡显示仍为原文
-  const wireContent = `${rebuildBlock ? `${rebuildBlock}\n\n` : ''}${modeHint ? `${modeHint}\n\n` : ''}${content}${xml ? `\n\n${xml}` : ''}`;
+  // S4:附件块(wire-only,气泡不渲染)——路径引用形态,agent 以文件工具读取;
+  // 名称/路径均经服务端净化与时间戳命名,无 XML 注入面
+  const atts = Array.isArray(opts.attachments)
+    ? opts.attachments.filter((a) => a && a.path)
+    : [];
+  const attachBlock =
+    atts.length > 0
+      ? `<attachments>\n${atts
+          .map(
+            (a) =>
+              `<file name="${a.name}" path="${a.path}" size="${a.size}" mime="${a.mime || ''}"/>`
+          )
+          .join('\n')}\n<note>以上附件已保存于工作区相对路径,可用文件读取工具访问;图片类附件暂以文件形态提供(视觉理解未接入)。</note>\n</attachments>`
+      : '';
+  // wire 正文 = [重建回注块] + [模式提示块] + 正文 + [附件块] + [@上下文 XML];气泡显示仍为原文
+  const wireContent = `${rebuildBlock ? `${rebuildBlock}\n\n` : ''}${modeHint ? `${modeHint}\n\n` : ''}${content}${attachBlock ? `\n\n${attachBlock}` : ''}${xml ? `\n\n${xml}` : ''}`;
   ws.send(JSON.stringify({ type: 'message', content: wireContent }));
   return { used, dropped };
 }

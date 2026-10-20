@@ -18,7 +18,7 @@
     openSettingsTab,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
-  import { approveProposal, listResumableRuns, getOrchestrationLinks } from '../lib/api.js';
+  import { approveProposal, listResumableRuns, getOrchestrationLinks, uploadFile } from '../lib/api.js';
   import { orderSessionsWithLineage } from '../lib/orchestration.js';
   import { onMount, onDestroy, tick } from 'svelte';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
@@ -137,6 +137,72 @@
     if ($turnActive || chatMode === m) return;
     chatMode = m;
     localStorage.setItem(MODE_KEY, m);
+  }
+
+  // ---- S4 附件上传(图片/文件;落盘 .evo-agent/uploads,agent 同沙箱可读) ----
+  // 附件不入草稿持久化(刷新后需重选);发送仅携带已上传成功件
+  const ATT_MAX_BYTES = 10 * 1024 * 1024;
+  let fileInputEl = $state(null);
+  let attachments = $state([]);
+  let uploadSeq = 0;
+
+  function pickFiles() {
+    if ($turnActive) return;
+    fileInputEl?.click();
+  }
+
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => {
+        const s = String(r.result);
+        resolve(s.slice(s.indexOf(',') + 1));
+      };
+      r.onerror = () => reject(new Error('读取失败'));
+      r.readAsDataURL(file);
+    });
+  }
+
+  async function addAttachments(files) {
+    for (const f of files) {
+      if (!f) continue;
+      uploadSeq += 1;
+      const id = uploadSeq;
+      if (f.size > ATT_MAX_BYTES) {
+        attachments = [...attachments, { id, name: f.name, error: '超过 10MB 上限' }];
+        continue;
+      }
+      attachments = [...attachments, { id, name: f.name, uploading: true }];
+      try {
+        const data = await fileToBase64(f);
+        const res = await uploadFile(f.name, data);
+        attachments = attachments.map((a) =>
+          a.id === id ? { id, name: res.name || f.name, path: res.path, size: res.size, mime: res.mime } : a
+        );
+      } catch (e) {
+        attachments = attachments.map((a) =>
+          a.id === id ? { id, name: f.name, error: String(e?.message || e) } : a
+        );
+      }
+    }
+  }
+
+  function onFilesChosen(e) {
+    const files = [...(e.target?.files || [])];
+    e.target.value = '';
+    if (files.length > 0) addAttachments(files);
+  }
+
+  function removeAttachment(id) {
+    attachments = attachments.filter((a) => a.id !== id);
+  }
+
+  function onPasteFiles(e) {
+    const files = [...(e.clipboardData?.files || [])];
+    if (files.length > 0) {
+      e.preventDefault();
+      addAttachments(files);
+    }
   }
 
   onMount(() => {
@@ -431,7 +497,9 @@
     histIdx = -1;
     const { kept } = await reconcileMentions(text, $composerMentions);
     composerMentions.set([]);
-    sendMessage(text, kept, { mode: chatMode });
+    const okAtts = attachments.filter((a) => a.path);
+    attachments = attachments.filter((a) => !a.path);
+    sendMessage(text, kept, { mode: chatMode, attachments: okAtts });
   }
 
   function onKeydown(e) {
@@ -700,6 +768,23 @@
         {/if}
       </div>
     {/if}
+    {#if attachments.length > 0}
+      <div class="chip-tray">
+        {#each attachments as a (a.id)}
+          <span
+            class="chip"
+            class:chip-err={a.error}
+            title={a.error || `${a.name} · ${((a.size || 0) / 1024).toFixed(1)}KB · ${a.path || '上传中'}`}
+          >
+            <span class="chip-kind">附件</span>
+            <span class="chip-ref mono">
+              {a.uploading ? '上传中…' : a.error ? `失败:${a.error}` : a.name}
+            </span>
+            <button class="chip-x" title="移除该附件" onclick={() => removeAttachment(a.id)}>×</button>
+          </span>
+        {/each}
+      </div>
+    {/if}
     {#if $composerMentions.length > 0}
       <div class="chip-tray">
         {#each $composerMentions as cm, i}
@@ -724,8 +809,10 @@
       oninput={onInput}
       onkeydown={onKeydown}
       onblur={closeMention}
+      onpaste={onPasteFiles}
       disabled={$connStatus !== 'online'}
     ></textarea>
+    <input type="file" multiple bind:this={fileInputEl} onchange={onFilesChosen} hidden />
     <div class="composer-toolbar">
       <div class="tb-left">
         <div class="mode-seg" role="group" aria-label="会话模式">
@@ -747,7 +834,7 @@
           </button>
         </div>
         <button class="tb-btn" onclick={openMentionPopup} title="插入 @ 上下文引用">@</button>
-        <button class="tb-btn" disabled title="图片/附件上传(未接入,待后端配套)">
+        <button class="tb-btn" onclick={pickFiles} title="上传图片/附件(存入工作区 .evo-agent/uploads,agent 可读)">
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
             <path
               d="M8 3.2v9.6M3.2 8h9.6"
@@ -1362,6 +1449,11 @@
   .mode-seg button:disabled {
     opacity: 0.45;
     cursor: not-allowed;
+  }
+  /* S4 附件 chip 错误态 */
+  .chip-err {
+    border-color: #e5484d;
+    color: #e5484d;
   }
   .tb-btn {
     border: none;

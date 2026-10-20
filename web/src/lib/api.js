@@ -71,6 +71,15 @@ export function createFile(path, kind = 'file') {
   }).then(unwrap);
 }
 
+/** 对话附件上传(base64 → serve 解码落盘 .evo-agent/uploads/,返回 {name,path,size,mime}) */
+export function uploadFile(name, dataBase64) {
+  return fetch('/api/files/upload', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ name, data_base64: dataBase64 }),
+  }).then(unwrap);
+}
+
 /** 移动/重命名(targetDir 必须已存在;newName 缺省保留原名) */
 export function moveFile(path, targetDir, newName = null) {
   const body = { path, target_dir: targetDir };
