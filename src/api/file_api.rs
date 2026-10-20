@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 //! 工作台文件 REST 面 —— IDE 文件树浏览与编辑器保存的消费端点
 //!
-//! 六个端点,全部复用 builtin_tools 的 file 工具实现(同一沙箱 / 同一校验 /
+//! 九个端点,全部复用 builtin_tools 的 file 工具实现(同一沙箱 / 同一校验 /
 //! 同一资源限制),不在本模块重复任何路径安全逻辑:
 //!
 //! - `GET /api/files/list?dir=`  → [`FileListTool`](crate::builtin_tools::file_list::FileListTool)
@@ -23,6 +23,8 @@
 //!   (全项目内容搜索;沙箱同款;30s 硬超时 partial)
 //! - `POST /api/files/replace`   → [`replace_core`](crate::builtin_tools::grep_files::replace_core)
 //!   (apply=false 预览零写盘 / apply=true 重匹配+原子写;核心层内部持树写互斥锁)
+//! - `POST /api/files/upload`    → base64 解码直写 `.evo-agent/uploads/`(对话附件
+//!   上传;二进制不走 file 工具文本通道;固定子目录无用户可控路径段)
 //!
 //! ## 语义边界(与 agent 工具通道的差别,设计定稿留痕)
 //!
@@ -104,6 +106,60 @@ pub struct MoveBody {
 pub struct DeleteQuery {
     /// 相对 workdir 的删除目标(软删除进 `.evo-trash`)
     pub path: String,
+}
+
+/// `POST /api/files/upload` 请求体
+#[derive(Debug, Deserialize)]
+pub struct UploadBody {
+    /// 原始文件名(仅取基名,净化后落盘)
+    pub name: String,
+    /// 文件内容 base64(标准字母表,可含 padding)
+    pub data_base64: String,
+}
+
+/// 附件上传解码上限(字节)
+const UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
+/// 附件落盘子目录(相对 workdir;agent 文件工具同沙箱根,可读)
+const UPLOAD_DIR: &str = ".evo-agent/uploads";
+
+/// 扩展名 → MIME(附件块标注用;未知回落 application/octet-stream)
+fn upload_mime(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "json" => "application/json",
+        "txt" | "md" | "log" | "csv" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+/// 文件名净化:取基名,白名单字符(其余替为 `_`),截长 80,去首尾空白与
+/// 尾部点/空格(Windows 文件名约束),空/`.`/`..` 兜底 `file`
+fn sanitize_upload_name(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let kept: String = base
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | ' ' | '(' | ')') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed: String = kept.trim().chars().take(80).collect();
+    let trimmed = trimmed.trim_end_matches(['.', ' ']);
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// 工具错误字符串 → HTTP 状态码
@@ -225,6 +281,62 @@ pub async fn write_file(
         .await
         .map_err(|e| (err_status(&e), e));
     record_outcome(&state, "file_write", identity, &body.path, &result);
+    result.map(Json)
+}
+
+/// `POST /api/files/upload` —— 附件上传(base64 解码落盘)
+///
+/// 语义:人把本地文件(图片/文档等)作为对话附件送入工作区。落盘固定在
+/// `{workdir}/.evo-agent/uploads/<UTC毫秒时间戳>-<净化名>`,在 workdir 沙箱内,
+/// agent 文件工具同根可读;二进制直写(file 工具走文本通道,不适用)。
+/// 不持树写互斥锁:仅向专用子目录增量新增(时间戳文件名),与 write_file
+/// 同类(非树结构改组)。HumanGate:human 可写(落人工账 op=file_upload);
+/// anonymous 403(拒绝留痕)。
+/// 错误 → 403(anonymous)/ 400(base64 非法)/ 413(超 10MB)。
+pub async fn upload_file(
+    State(state): State<AgentApiState>,
+    Json(body): Json<UploadBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let clean = sanitize_upload_name(&body.name);
+    let rel = format!(
+        "{UPLOAD_DIR}/{}-{clean}",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S%3f")
+    );
+    let identity = gate_write(&state, "file_upload", &rel)?;
+    // base64 长度预检(解码前粗检,防无谓大分配)+ 解码后精确校验
+    if body.data_base64.len() > UPLOAD_MAX_BYTES / 3 * 4 + 4 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("upload exceeds {} bytes", UPLOAD_MAX_BYTES),
+        ));
+    }
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body.data_base64.trim())
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid base64: {e}")))?;
+    if bytes.len() > UPLOAD_MAX_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("upload exceeds {} bytes", UPLOAD_MAX_BYTES),
+        ));
+    }
+    let full = state.workdir().join(&rel);
+    // create_parents:仅固定子目录段,无用户可控路径,无越界面
+    let result = std::fs::create_dir_all(full.parent().unwrap_or(&full))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir failed: {e}")))
+        .and_then(|()| {
+            std::fs::write(&full, &bytes)
+                .map(|_| {
+                    serde_json::json!({
+                        "name": clean,
+                        "path": rel,
+                        "size": bytes.len(),
+                        "mime": upload_mime(&clean),
+                    })
+                })
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write failed: {e}")))
+        });
+    record_outcome(&state, "file_upload", identity, &rel, &result);
     result.map(Json)
 }
 
@@ -395,6 +507,31 @@ pub async fn replace_files(
 mod tests {
     use super::*;
     use crate::builtin_tools::file_write::FileWriteTool;
+
+    /// S4:上传文件名净化——基名提取/白名单替换/截长/尾部点清理/危险名兜底
+    #[test]
+    fn test_sanitize_upload_name() {
+        assert_eq!(sanitize_upload_name("a.png"), "a.png");
+        assert_eq!(sanitize_upload_name(r"C:\Users\test\我 的 图.png"), "我 的 图.png");
+        assert_eq!(sanitize_upload_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_upload_name("bad<script>.txt"), "bad_script_.txt");
+        let long = sanitize_upload_name(&"x".repeat(100));
+        assert_eq!(long.chars().count(), 80);
+        assert_eq!(sanitize_upload_name("name...   "), "name");
+        assert_eq!(sanitize_upload_name("  "), "file");
+        assert_eq!(sanitize_upload_name(".."), "file");
+    }
+
+    /// S4:MIME 按扩展名标注,未知回落 application/octet-stream
+    #[test]
+    fn test_upload_mime() {
+        assert_eq!(upload_mime("a.PNG"), "image/png");
+        assert_eq!(upload_mime("b.jpg"), "image/jpeg");
+        assert_eq!(upload_mime("c.svg"), "image/svg+xml");
+        assert_eq!(upload_mime("d.md"), "text/plain");
+        assert_eq!(upload_mime("e.xyz"), "application/octet-stream");
+        assert_eq!(upload_mime("noext"), "application/octet-stream");
+    }
 
     /// `writable_dir="."` 是本模块引入的新用法(IDE 人工编辑面 = workdir 全域)。
     /// 核心前提:workdir 根下的文件可写(join(".") 产生的 CurDir 组件会被

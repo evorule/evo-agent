@@ -728,6 +728,8 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/files/replace",
             axum::routing::post(crate::api::file_api::replace_files),
         )
+        // 附件上传(人工面)不在主链:见文末 upload_router_with_auth
+        // (全局 1MB 钳制之后独立 merge,自带 14MB 限层与同款 G7 鉴权)
         // LSP 代理面(人工编辑辅助,零 agent 工具面):两语言门状态检测 + WS
         // 透明转发(每语言单连接单实例);G16 中间件自动覆盖,WS 内二次校验
         .route(
@@ -898,6 +900,37 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .merge(mcp_server_routes(mcp_server_exposed))
         .with_state(state)
         // G7:鉴权中间件(对 /health、/metrics 豁免)
+        .layer(axum::middleware::from_fn_with_state(
+            auth_config,
+            crate::api::auth::auth_middleware,
+        ))
+}
+
+/// S4:附件上传独立子路由 —— 自带 14MB 请求体限层与同款 G7 鉴权
+///
+/// 限层机制(实测定谳):
+/// - 全局 1MB 真实钳制(evo-agent.rs serve 装配尾 `RequestBodyLimitLayer`)
+///   罩住主链全部路由,`Router::layer` 只约束此前添加的路由,故本子路由须
+///   由装配点在主链 1MB 层**之后** merge(后 merge 的路由不受既有 layer
+///   约束)逃逸之——实测 1.4MB 请求体通过即证;
+/// - axum Router 对每条路由**内建**缺省 2MB `DefaultBodyLimit`(不随 merge
+///   时序变化,per-route 机制),实测 4.2MB 请求体仍 413 即证;以
+///   `DefaultBodyLimit::max(14MB)` 抬限(14MB = 10MB 解码上限 ≈ 13.7MB
+///   base64 + JSON 信封余量),该层即 axum 自身限流实现,单层足够。
+///
+/// 鉴权:与 [`router_with_auth`] 同款 —— G16 步骤把 auth_config 注入 state
+/// (HumanGate 写面身份门读 state 内 auth_config,缺省 disabled 会误判
+/// anonymous 403)+ 中间件层 token 校验;CORS 由装配点随子路由补挂。
+pub fn upload_router_with_auth(state: AgentApiState, auth_config: AuthConfig) -> axum::Router {
+    // G16:auth_config 注入 state(同 router_with_auth 口径)
+    let state = state.with_auth_config(auth_config.clone());
+    axum::Router::new()
+        .route(
+            "/api/files/upload",
+            axum::routing::post(crate::api::file_api::upload_file)
+                .layer(axum::extract::DefaultBodyLimit::max(14 * 1024 * 1024)),
+        )
+        .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             auth_config,
             crate::api::auth::auth_middleware,
