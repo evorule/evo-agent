@@ -33,6 +33,7 @@ import {
 import { getTranscript } from './api.js';
 import { assembleContext } from './mentions.js';
 import { looksLikeDeadSession, buildRebuildBlock, lastUserTextOf } from './sessionRebuild.js';
+import { push as pushNotification } from './notifications.js';
 
 let ws = null;
 let streamMsgId = null; // 当前轮流式 assistant 气泡
@@ -119,10 +120,10 @@ function scheduleReconnect() {
   reconnectAttempts += 1;
   // 提示降噪:首次断连必提示,其后每 5 次重试提示一次(状态区恒可见连接态)
   if (reconnectAttempts === 1 || reconnectAttempts % 5 === 0) {
-    pushMessage({
-      kind: 'error',
-      text: `连接已断开，${Math.round(delay / 1000)}s 后自动重连(第 ${reconnectAttempts} 次)…`,
-    });
+    const text = `连接已断开，${Math.round(delay / 1000)}s 后自动重连(第 ${reconnectAttempts} 次)…`;
+    pushMessage({ kind: 'error', text });
+    // F2 通知中心:断连同时入列(状态栏铃铛/右下 toast;首次 warn,后续 err 降噪档)
+    pushNotification(reconnectAttempts === 1 ? 'warn' : 'err', '工作台连接断开', text);
   }
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
@@ -518,6 +519,12 @@ function handleFrame(f) {
         detail: `${f.tool_name}(risk ${f.risk ?? '?'}) 待审批`,
         level: 'warn',
       });
+      // F2 通知中心:审批请求弹 toast+角标+1(在聊天气泡之外的全局入口)
+      pushNotification(
+        'warn',
+        `审批请求:${f.tool_name}`,
+        `${f.command || ''}(风险 ${f.risk ?? '?'})等待人工确认`,
+      );
       break;
     case 'ApprovalResult':
       pushMessage({
@@ -529,6 +536,11 @@ function handleFrame(f) {
         detail: `${f.tool_name} ${f.approved ? '已批准' : `已拒绝${f.auto_rejected ? '(超时自动)' : ''}`}`,
         level: f.approved ? 'ok' : 'warn',
       });
+      pushNotification(
+        f.approved ? 'info' : 'warn',
+        `审批${f.approved ? '已批准' : '已拒绝'}`,
+        `工具 ${f.tool_name}`,
+      );
       break;
     default:
       break;

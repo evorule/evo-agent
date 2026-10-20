@@ -19,6 +19,7 @@
   import EditorPane from './components/EditorPane.svelte';
   import BottomPanel from './components/BottomPanel.svelte';
   import ChatSidebar from './components/ChatSidebar.svelte';
+  import StatusBar from './components/StatusBar.svelte';
   import CommandPalette from './components/CommandPalette.svelte';
   import { reconnectFromStorage, newSession, openSession } from './lib/ws.js';
   import {
@@ -776,6 +777,8 @@
       <ChatSidebar />
     </div>
   </div>
+  <!-- F1:底部状态栏(全宽 22px;铃铛下拉+右下 toast 由其内部承载) -->
+  <StatusBar />
   {#if taskPickerOpen}
     <TaskPicker tasks={get(taskList).tasks || []} on:pick={onTaskPicked} on:close={() => (taskPickerOpen = false)} />
   {/if}
