@@ -217,6 +217,10 @@ export function closeTab(path) {
  *  {added:[], updated:[], removed:[], moved:[{from,to}]}(相对 workdir 路径) */
 export const fsEvents = writable(null);
 
+/** H2 文件树定位信号(面包屑/命令共用):{path}(相对 workdir 的文件或目录)。
+ *  消费方 Explorer:切到文件树视图 + 逐级展开祖先 + 滚动定位+闪烁;消费即清 */
+export const pendingTreeReveal = writable(null);
+
 // ---- @上下文文件索引(B13;懒 BFS,fs_events 失效,2000 条上限) ----
 
 /** 文件索引快照 [{path, name, isDir}](相对 workdir,路径升序)。
