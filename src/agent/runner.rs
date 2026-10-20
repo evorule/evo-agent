@@ -262,13 +262,116 @@ fn restore_images_from_content(
     out
 }
 
-/// B1:运行窗图片总量预算(base64 字符计)。超限从最旧 Tool 消息开始逐张丢弃,
-/// 该消息 content 追加一次注记(fail-visible 于 LLM 面)。返回丢弃张数。
+/// S4-b:对话附件上传子目录前缀(相对进程 cwd;与 file_api UPLOAD_DIR 落盘域
+/// 同口径——上传端点固定写此处,无用户可控路径段)
+const S4B_UPLOADS_DIR_PREFIX: &str = ".evo-agent/uploads/";
+/// S4-b:单用户轮图片数上限(与 B1 单工具结果上限同值)
+const S4B_MAX_IMAGES_PER_TURN: usize = 4;
+/// S4-b:单图片文件字节上限(与 file_api 上传解码上限同值)
+const S4B_MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// S4-b:上传件引用路径沙箱校验
+///
+/// 规则:相对路径(拒绝绝对/反斜杠)× 固定子目录前缀 × 其余段无 `..`/`.`/空段
+/// (段级判定,`..name` 类合法文件名不受影响)。不过即拒绝(调用方丢弃计数)。
+fn s4b_upload_path_ok(path: &str) -> bool {
+    if path.starts_with('/') || path.starts_with('\\') || path.contains('\\') {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix(S4B_UPLOADS_DIR_PREFIX) else {
+        return false;
+    };
+    rest.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// S4-b:用户轮多模态上行——从上传件引用提取旁路图片并生成指纹内容。
+///
+/// 镜像 B1 `extract_images_from_raw` 口径:校验链 = 路径沙箱
+/// ([`s4b_upload_path_ok`])× mime 白名单 × 魔数头 × 单图尺寸 × 单轮数量
+/// 预算;通过者装入 `Vec<ImageData>`(回喂旁路),图片本体内容寻址落盘
+/// `images_dir`(`data/agent-images/`,与 B1 同目录去重),指纹随 user 内容
+/// JSON 化 `{"text":..,"images_extracted":[..],"images_omitted":N}` 留痕——
+/// 续话 `restore_images_from_content` 按指纹还原,与 B1 tool 消息同一机制,
+/// 旁路 base64 不进审计链。校验失败/超限丢弃计数入 `images_omitted`
+/// (fail-soft,不阻断会话;LLM 面由注记可见)。
+///
+/// `uploads_root` 为上传域根(生产传 `Path::new(".")`,读盘相对进程 cwd,
+/// 与 B1_IMAGES_DIR 相对路径同口径;测试传 tempdir 零污染)。
+/// refs 为空 → 原文原样返回,零行为变化(回滚保证)。
+fn build_user_turn_images(
+    text: &str,
+    refs: &[crate::agent::translator::UserImageRef],
+    uploads_root: &std::path::Path,
+    images_dir: &std::path::Path,
+) -> (String, Vec<crate::agent::translator::ImageData>) {
+    use base64::Engine as _;
+
+    if refs.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+    let mut kept = Vec::new();
+    let mut fingerprints: Vec<Value> = Vec::new();
+    let mut omitted = 0usize;
+    for r in refs {
+        if kept.len() >= S4B_MAX_IMAGES_PER_TURN {
+            omitted += 1;
+            continue;
+        }
+        if !s4b_upload_path_ok(&r.path) {
+            omitted += 1;
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(uploads_root.join(&r.path)) else {
+            omitted += 1;
+            continue;
+        };
+        if bytes.len() > S4B_MAX_IMAGE_BYTES || !b1_image_magic_ok(&r.mime_type, &bytes) {
+            omitted += 1;
+            continue;
+        }
+        let fingerprint = blake3::hash(&bytes).to_hex().to_string();
+        // 内容寻址落盘(同名已存在跳过写,去重);落盘失败不阻断提取(指纹仍在,
+        // 仅续话还原不可用——fail-soft,与 B1 同口径)
+        if let Some(ext) = b1_image_ext(&r.mime_type) {
+            if std::fs::create_dir_all(images_dir).is_ok() {
+                let stored = images_dir.join(format!("{fingerprint}.{ext}"));
+                if !stored.exists() {
+                    let _ = std::fs::write(&stored, &bytes);
+                }
+            }
+        }
+        fingerprints.push(serde_json::json!({
+            "fingerprint": fingerprint,
+            "bytes": bytes.len(),
+            "mime_type": r.mime_type,
+        }));
+        kept.push(crate::agent::translator::ImageData {
+            mime_type: r.mime_type.clone(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        });
+    }
+
+    let mut map = serde_json::Map::new();
+    map.insert("text".to_string(), Value::from(text));
+    if !fingerprints.is_empty() {
+        map.insert("images_extracted".to_string(), Value::Array(fingerprints));
+    }
+    if omitted > 0 {
+        map.insert("images_omitted".to_string(), Value::from(omitted));
+    }
+    (Value::Object(map).to_string(), kept)
+}
+
+/// B1:运行窗图片总量预算(base64 字符计)。超限从最旧带图消息(Tool/User)
+/// 开始逐张丢弃,该消息 content 追加一次注记(fail-visible 于 LLM 面;
+/// User 内容为指纹 blob 时注记破坏 JSON 形态,wire 层回落原始字符串仍可见)。
+/// 返回丢弃张数。
 fn enforce_window_image_budget(messages: &mut [Message], max_total_b64: usize) -> usize {
     let total: usize = messages
         .iter()
         .map(|m| match m {
-            Message::Tool { images, .. } => {
+            Message::Tool { images, .. } | Message::User { images, .. } => {
                 images.iter().map(|i| i.data_base64.len()).sum::<usize>()
             }
             _ => 0,
@@ -283,9 +386,15 @@ fn enforce_window_image_budget(messages: &mut [Message], max_total_b64: usize) -
         if running <= max_total_b64 {
             break;
         }
-        if let Message::Tool {
-            content, images, ..
-        } = msg
+        let (content, images) = match msg {
+            Message::Tool {
+                content, images, ..
+            }
+            | Message::User {
+                content, images, ..
+            } => (content, images),
+            _ => continue,
+        };
         {
             let mut dropped_here = 0usize;
             while !images.is_empty() && running > max_total_b64 {
@@ -2968,6 +3077,7 @@ impl AgentRunner {
         let user_idx = messages.len();
         messages.push(Message::User {
             content: goal.to_string(),
+            images: Vec::new(),
         });
         // P0: 持久化 user 消息
         self.persist_message(
@@ -2975,6 +3085,7 @@ impl AgentRunner {
             user_idx,
             Message::User {
                 content: goal.to_string(),
+                images: Vec::new(),
             },
         )
         .await?;
@@ -5804,8 +5915,12 @@ impl AgentRunner {
         session_id: String,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         let callbacks = self.event_callbacks.clone();
-        let inner =
-            self.run_streaming_inner(String::new(), Some(session_id), RecoveryMode::CrashResume);
+        let inner = self.run_streaming_inner(
+            String::new(),
+            Some(session_id),
+            RecoveryMode::CrashResume,
+            Vec::new(),
+        );
         Box::pin(async_stream::stream! {
             let mut inner = inner;
             while let Some(result) = inner.next().await {
@@ -5842,10 +5957,11 @@ impl AgentRunner {
     pub fn run_streaming(
         self,
         goal: String,
+        images: Vec<crate::agent::translator::UserImageRef>,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         // G18:提取回调链(Arc clone),在 inner stream 之外包装 dispatch
         let callbacks = self.event_callbacks.clone();
-        let inner = self.run_streaming_inner(goal, None, RecoveryMode::Fresh);
+        let inner = self.run_streaming_inner(goal, None, RecoveryMode::Fresh, images);
         Box::pin(async_stream::stream! {
             let mut inner = inner;
             while let Some(result) = inner.next().await {
@@ -5875,11 +5991,16 @@ impl AgentRunner {
         self,
         session_id: String,
         user_input: String,
+        images: Vec<crate::agent::translator::UserImageRef>,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         // G18:提取回调链(Arc clone),在 inner stream 之外包装 dispatch
         let callbacks = self.event_callbacks.clone();
-        let inner =
-            self.run_streaming_inner(user_input, Some(session_id), RecoveryMode::Continuation);
+        let inner = self.run_streaming_inner(
+            user_input,
+            Some(session_id),
+            RecoveryMode::Continuation,
+            images,
+        );
         Box::pin(async_stream::stream! {
             let mut inner = inner;
             while let Some(result) = inner.next().await {
@@ -5903,6 +6024,7 @@ impl AgentRunner {
         goal: String,
         existing_session_id: Option<String>,
         recovery: RecoveryMode,
+        user_images: Vec<crate::agent::translator::UserImageRef>,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         Box::pin(stream! {
                            let mut runner = self;
@@ -6425,9 +6547,25 @@ impl AgentRunner {
                            // 崩溃恢复不注入新 user 输入:悬挂处置完毕后 LLM 自然续完当前 turn
                            if recovery != RecoveryMode::CrashResume {
                                let user_idx = messages.len();
-                               messages.push(Message::User { content: goal.clone() });
+                               // S4-b:用户轮图片旁路提取(fail-soft;空 refs 零行为变化)
+                               // ——内容 JSON 化带指纹留痕,回喂旁路带 base64(仅发送面)
+                               let (turn_content, turn_images) = build_user_turn_images(
+                                   &goal,
+                                   &user_images,
+                                   std::path::Path::new("."),
+                                   std::path::Path::new(B1_IMAGES_DIR),
+                               );
+                               messages.push(Message::User {
+                                   content: turn_content.clone(),
+                                   images: turn_images,
+                               });
+                               // 持久化仅存指纹内容(旁路 base64 不进审计链,与 B1 同口径)
                                if let Err(e) = runner
-                                   .persist_message(&session_id, user_idx, Message::User { content: goal.clone() })
+                                   .persist_message(
+                                       &session_id,
+                                       user_idx,
+                                       Message::User { content: turn_content, images: Vec::new() },
+                                   )
                                    .await
                                {
                                    yield Err(e);
@@ -7522,6 +7660,7 @@ impl AgentRunner {
                                                            );
                                                            messages.push(Message::User {
                                                                content: IO_GUARD_CORRECTION_PROMPT.to_string(),
+                                                               images: Vec::new(),
                                                            });
                                                            continue 'react;
                                                        }
@@ -8078,9 +8217,16 @@ fn rec_to_message(rec: &MessageRecord, max_chars: usize) -> Option<Message> {
         "system" => Some(Message::System {
             content: rec.content.clone(),
         }),
-        "user" => Some(Message::User {
-            content: rec.content.clone(),
-        }),
+        "user" => {
+            // S4-b:按 content 中指纹从落盘还原旁路图片(缺失/不匹配降级为空;
+            // 与 tool 分支同一 restore 机制)
+            let images =
+                restore_images_from_content(&rec.content, std::path::Path::new(B1_IMAGES_DIR));
+            Some(Message::User {
+                content: rec.content.clone(),
+                images,
+            })
+        }
         "assistant" => {
             let tool_calls = rec.tool_calls.as_ref().and_then(|v| {
                 serde_json::from_value::<Vec<crate::agent::translator::ToolCall>>(v.clone()).ok()

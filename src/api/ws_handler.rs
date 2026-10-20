@@ -62,6 +62,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::agent::translator::UserImageRef;
 use crate::agent::{AgentError, AgentEvent, AgentRunner, MemoryManager};
 use crate::api::agent_api::AgentApiState;
 
@@ -95,6 +96,10 @@ enum ClientMessage {
     Message {
         /// 用户输入内容
         content: String,
+        /// S4-b:附件图片引用(上传回执 `{path,mime_type}` 原样回传;缺省无图
+        /// 零行为变化,服务端沙箱校验+魔数复检,越界 fail-soft 丢弃)
+        #[serde(default)]
+        images: Vec<UserImageRef>,
     },
     /// 中断当前正在执行的轮次(cancel runner)
     Interrupt,
@@ -254,7 +259,7 @@ async fn handle_ws(
                        match msg {
                            Some(Ok(WsMessage::Text(text))) => {
                                match serde_json::from_str::<ClientMessage>(&text) {
-                                   Ok(ClientMessage::Message { content }) => {
+                                   Ok(ClientMessage::Message { content, images }) => {
                                        if turn_active {
                                            if let Err(e) = send_ws_json(
                                                &mut sender,
@@ -292,12 +297,13 @@ async fn handle_ws(
 
                                        // 首轮(无 session)→ run_streaming(创建 session)
                                        // 后续(有 session)→ run_continuation(复用 session)
+                                       // S4-b:images 旁路透传(空切片零行为变化)
                                        let event_stream = if let Some(sid) = current_session.clone() {
                                            info!(session_id = %sid, "G16: continuation turn");
-                                           runner.run_continuation(sid, content)
+                                           runner.run_continuation(sid, content, images)
                                        } else {
                                            info!("G16: first turn (new session)");
-                                           runner.run_streaming(content)
+                                           runner.run_streaming(content, images)
                                        };
 
                                        // spawn task:把事件流转发到 channel
@@ -1173,7 +1179,28 @@ mod tests {
         let json = r#"{"type":"message","content":"hello"}"#;
         let msg: ClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            ClientMessage::Message { content } => assert_eq!(content, "hello"),
+            // S4-b:images 缺省反序列化为空(无图消息零行为变化)
+            ClientMessage::Message { content, images } => {
+                assert_eq!(content, "hello");
+                assert!(images.is_empty());
+            }
+            _ => panic!("expected Message variant"),
+        }
+    }
+
+    /// S4-b:images 旁路字段随消息反序列化(上传回执原样回传形态)
+    #[test]
+    fn test_client_message_deserialize_with_images() {
+        let json = r#"{"type":"message","content":"look","images":[
+            {"path":".evo-agent/uploads/20261020-a.png","mime_type":"image/png"}]}"#;
+        let msg: ClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ClientMessage::Message { content, images } => {
+                assert_eq!(content, "look");
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].path, ".evo-agent/uploads/20261020-a.png");
+                assert_eq!(images[0].mime_type, "image/png");
+            }
             _ => panic!("expected Message variant"),
         }
     }

@@ -1567,8 +1567,12 @@ async fn run_agent(
                 // 空 goal 校验已在最前置块完成(continue 无新输入即 400)
                 match state.evorule_client().get_state(sid).await {
                     Ok(_) => {
-                        let (r, _) =
-                            consume_to_done(runner.run_continuation(sid.clone(), req.goal)).await;
+                        let (r, _) = consume_to_done(runner.run_continuation(
+                            sid.clone(),
+                            req.goal,
+                            Vec::new(),
+                        ))
+                        .await;
                         (r, Some(sid.clone()))
                     }
                     Err(e) => {
@@ -1586,7 +1590,7 @@ async fn run_agent(
                             }
                             let composed = compose_rebuild_context(&history, &req.goal);
                             let (r, new_sid) =
-                                consume_to_done(runner.run_streaming(composed)).await;
+                                consume_to_done(runner.run_streaming(composed, Vec::new())).await;
                             rebuilt_from_session = Some(sid.clone());
                             (r, new_sid)
                         } else {
@@ -1604,7 +1608,7 @@ async fn run_agent(
             }
         }
     } else {
-        consume_to_done(runner.run_streaming(req.goal)).await
+        consume_to_done(runner.run_streaming(req.goal, Vec::new())).await
     };
     if let Some(sid) = &session_id {
         state
@@ -1940,7 +1944,7 @@ async fn run_agent_stream(
     let agent_type_for_index = agent_type.clone();
     let sse_stream = async_stream::stream! {
         let _sse_guard = SseConnectionGuard::new(sse_metrics);
-        let mut event_stream = runner.run_streaming(req.goal);
+        let mut event_stream = runner.run_streaming(req.goal, Vec::new());
 
         // G6:在 map 中拦截 SessionCreated(注册 token)/ Done / Error / Err(注销 token)
         let mut current_session: Option<String> = None;

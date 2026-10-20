@@ -1022,7 +1022,7 @@ async fn test_continuation_acceptance_recovery_fail_visible() {
         .with_memory(mem)
         .with_journal_dir(dir);
     runner.acceptance_generation = true; // 显式开启,无静态判据
-    let mut stream = runner.run_continuation(sid.to_string(), "continue".to_string());
+    let mut stream = runner.run_continuation(sid.to_string(), "continue".to_string(), Vec::new());
 
     let mut got_err: Option<String> = None;
     let mut count = 0;
@@ -1081,7 +1081,7 @@ async fn test_continuation_acceptance_static_criteria_wins() {
     let mut runner = AgentRunner::new(config, client).with_memory(mem); // 无 journal_dir
     runner.acceptance_generation = true;
     runner.acceptance_command = Some("exit 0".to_string()); // 静态最优先
-    let mut stream = runner.run_continuation(sid.to_string(), "continue".to_string());
+    let mut stream = runner.run_continuation(sid.to_string(), "continue".to_string(), Vec::new());
 
     let mut errs: Vec<String> = Vec::new();
     let mut count = 0;
@@ -1153,7 +1153,7 @@ async fn test_continuation_acceptance_recovery_success() {
         .with_memory(mem)
         .with_journal_dir(dir);
     runner.acceptance_generation = true; // 无静态判据,走恢复路径
-    let mut stream = runner.run_continuation(sid.to_string(), "continue".to_string());
+    let mut stream = runner.run_continuation(sid.to_string(), "continue".to_string(), Vec::new());
 
     let mut errs: Vec<String> = Vec::new();
     let mut count = 0;
@@ -2515,7 +2515,7 @@ fn test_g15_rec_to_message_user() {
     };
     let msg =
         rec_to_message(&rec, recipe_tool_result_max_chars()).expect("user rec should convert");
-    assert!(matches!(msg, Message::User { ref content } if content == "Hello"));
+    assert!(matches!(msg, Message::User { ref content, .. } if content == "Hello"));
 }
 
 #[test]
@@ -2726,7 +2726,7 @@ async fn test_g15_load_messages_parses_payload() {
     let messages = result.unwrap();
     assert_eq!(messages.len(), 3);
     assert!(matches!(&messages[0], Message::System { content } if content == "You are helpful"));
-    assert!(matches!(&messages[1], Message::User { content } if content == "Hello"));
+    assert!(matches!(&messages[1], Message::User { content, .. } if content == "Hello"));
     assert!(matches!(&messages[2], Message::Assistant { content, .. } if content == "Hi there"));
 }
 
@@ -2812,7 +2812,7 @@ async fn test_g15_run_continuation_does_not_create_session() {
     let mem = MemoryManager::new("default", client.clone());
     let runner = AgentRunner::new(config, client).with_memory(mem);
 
-    let stream = runner.run_continuation("s42".to_string(), "hello".to_string());
+    let stream = runner.run_continuation("s42".to_string(), "hello".to_string(), Vec::new());
     let mut stream = stream;
 
     // 消费流直到结束(空 SSE 流 → 立即结束 → Done 事件)
@@ -2866,7 +2866,7 @@ async fn test_g15_run_streaming_creates_new_session() {
     let config = AgentConfig::default();
     let runner = AgentRunner::new(config, client);
 
-    let stream = runner.run_streaming("hello".to_string());
+    let stream = runner.run_streaming("hello".to_string(), Vec::new());
     let mut stream = stream;
 
     // 消费流
@@ -2942,7 +2942,7 @@ async fn test_capability_boundary_sent_in_create_session() {
     let runner =
         AgentRunner::new(AgentConfig::default(), client).with_capability_boundary(boundary);
 
-    let stream = runner.run_streaming("hello".to_string());
+    let stream = runner.run_streaming("hello".to_string(), Vec::new());
     let mut stream = stream;
 
     let mut got_session_created = false;
@@ -4259,6 +4259,7 @@ fn test_runaway_policy_from_policy_file() {
 fn user_msg(content: &str) -> Message {
     Message::User {
         content: content.to_string(),
+        images: Vec::new(),
     }
 }
 
@@ -4289,7 +4290,7 @@ fn test_compaction_region_bounds_keeps_recent_rounds() {
     assert_eq!(system_end, 1);
     // split = 自尾数第 6 个 User = 第 3 个 User(索引 1+2*3=7):7 之前全入近摘要区
     assert_eq!(split, 7);
-    assert!(matches!(&msgs[split], Message::User { content } if content == "u2"));
+    assert!(matches!(&msgs[split], Message::User { content, .. } if content == "u2"));
     assert_eq!(msgs.len() - split, 18, "保留 6 轮×3 消息");
 }
 
@@ -4711,6 +4712,240 @@ fn test_b1_extract_caps_at_four_images_per_result() {
     assert_eq!(obj.get("images_omitted").unwrap().as_u64().unwrap(), 2);
 }
 
+// =============================================================================
+// S4-b 用户轮多模态上行:路径沙箱 × 旁路提取 × 指纹留痕 × 续话还原
+// =============================================================================
+
+/// S4-b:上传引用路径沙箱——固定子目录前缀 × 段级 `..`/`.`/空段拒绝 ×
+/// 绝对路径/反斜杠拒绝;`..name` 类合法文件名放行
+#[test]
+fn test_s4b_upload_path_sandbox() {
+    // 放行:标准上传回执形态
+    assert!(s4b_upload_path_ok(
+        ".evo-agent/uploads/20261020-120000-abc a().png"
+    ));
+    assert!(s4b_upload_path_ok(".evo-agent/uploads/..hidden.png"));
+    // 拒绝:前缀不符 / 绝对路径 / 反斜杠 / 段级穿越 / 段级点 / 空段
+    assert!(!s4b_upload_path_ok("data/agent-images/x.png"));
+    assert!(!s4b_upload_path_ok(".evo-agent/uploads-evil/x.png"));
+    assert!(!s4b_upload_path_ok("/etc/passwd"));
+    assert!(!s4b_upload_path_ok(r"C:\Users\x.png"));
+    assert!(!s4b_upload_path_ok(".evo-agent/uploads/../secrets.txt"));
+    assert!(!s4b_upload_path_ok(".evo-agent/uploads/a/../../b.png"));
+    assert!(!s4b_upload_path_ok(".evo-agent/uploads/./x.png"));
+    assert!(!s4b_upload_path_ok(".evo-agent/uploads//x.png"));
+    assert!(!s4b_upload_path_ok(".evo-agent/uploads/"));
+}
+
+/// S4-b:合法上传件 → 旁路装入 + 指纹 blob 留痕 + 内容寻址落盘
+#[test]
+fn test_s4b_build_user_turn_keeps_valid_upload() {
+    use crate::agent::translator::UserImageRef;
+    let uploads = tempfile::tempdir().unwrap();
+    let images_dir = tempfile::tempdir().unwrap();
+    let bytes = b1_png_bytes(b"upload-body");
+    std::fs::create_dir_all(uploads.path().join(".evo-agent/uploads")).unwrap();
+    std::fs::write(
+        uploads
+            .path()
+            .join(".evo-agent/uploads/20261020-120000-a.png"),
+        &bytes,
+    )
+    .unwrap();
+
+    let refs = vec![UserImageRef {
+        path: ".evo-agent/uploads/20261020-120000-a.png".to_string(),
+        mime_type: "image/png".to_string(),
+    }];
+    let (content, images) =
+        build_user_turn_images("看这张图", &refs, uploads.path(), images_dir.path());
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].mime_type, "image/png");
+    let obj: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(obj.get("text").unwrap().as_str().unwrap(), "看这张图");
+    let fps = obj.get("images_extracted").unwrap().as_array().unwrap();
+    assert_eq!(fps.len(), 1);
+    let fp = fps[0].get("fingerprint").unwrap().as_str().unwrap();
+    assert_eq!(fp, blake3::hash(&bytes).to_hex().to_string());
+    assert_eq!(
+        std::fs::read(images_dir.path().join(format!("{fp}.png"))).unwrap(),
+        bytes,
+        "image body content-addressed into images dir"
+    );
+}
+
+/// S4-b:空 refs → 原文原样,零行为变化(回滚保证)
+#[test]
+fn test_s4b_build_user_turn_empty_refs_passthrough() {
+    let uploads = tempfile::tempdir().unwrap();
+    let images_dir = tempfile::tempdir().unwrap();
+    let refs: Vec<crate::agent::translator::UserImageRef> = Vec::new();
+    let (content, images) =
+        build_user_turn_images("plain goal", &refs, uploads.path(), images_dir.path());
+    assert_eq!(content, "plain goal");
+    assert!(images.is_empty());
+}
+
+/// S4-b:越界引用 fail-soft 丢弃计数——路径穿越/缺失文件/魔数不符
+#[test]
+fn test_s4b_build_user_turn_drops_invalid_refs() {
+    use crate::agent::translator::UserImageRef;
+    let uploads = tempfile::tempdir().unwrap();
+    let images_dir = tempfile::tempdir().unwrap();
+    let refs = vec![
+        UserImageRef {
+            path: ".evo-agent/uploads/../secrets.txt".to_string(),
+            mime_type: "image/png".to_string(),
+        },
+        UserImageRef {
+            path: ".evo-agent/uploads/missing.png".to_string(),
+            mime_type: "image/png".to_string(),
+        },
+        UserImageRef {
+            path: ".evo-agent/uploads/fake.png".to_string(),
+            mime_type: "image/png".to_string(),
+        },
+    ];
+    std::fs::create_dir_all(uploads.path().join(".evo-agent/uploads")).unwrap();
+    std::fs::write(
+        uploads.path().join(".evo-agent/uploads/fake.png"),
+        b"not a png",
+    )
+    .unwrap();
+
+    let (content, images) = build_user_turn_images("hi", &refs, uploads.path(), images_dir.path());
+    assert!(images.is_empty(), "all invalid refs must be dropped");
+    let obj: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(obj.get("text").unwrap().as_str().unwrap(), "hi");
+    assert!(obj.get("images_extracted").is_none());
+    assert_eq!(obj.get("images_omitted").unwrap().as_u64().unwrap(), 3);
+}
+
+/// S4-b:单轮数量上限 4(与 B1 单工具结果上限同值)
+#[test]
+fn test_s4b_build_user_turn_caps_at_four() {
+    use crate::agent::translator::UserImageRef;
+    let uploads = tempfile::tempdir().unwrap();
+    let images_dir = tempfile::tempdir().unwrap();
+    let bytes = b1_png_bytes(b"cap");
+    std::fs::create_dir_all(uploads.path().join(".evo-agent/uploads")).unwrap();
+    for i in 0..6 {
+        std::fs::write(
+            uploads
+                .path()
+                .join(format!(".evo-agent/uploads/img{i}.png")),
+            &bytes,
+        )
+        .unwrap();
+    }
+    let refs: Vec<UserImageRef> = (0..6)
+        .map(|i| UserImageRef {
+            path: format!(".evo-agent/uploads/img{i}.png"),
+            mime_type: "image/png".to_string(),
+        })
+        .collect();
+    let (content, images) = build_user_turn_images("hi", &refs, uploads.path(), images_dir.path());
+    assert_eq!(images.len(), 4, "keep cap");
+    let obj: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(obj.get("images_omitted").unwrap().as_u64().unwrap(), 2);
+}
+
+/// S4-b:User 消息 serde 形态——带图序列化含 images 键;无图跳过该键
+/// (既有 wire 形态 byte 级一致);旧记录(无键)反序列化降级为空
+#[test]
+fn test_s4b_user_message_serde_roundtrip_and_imageless_compat() {
+    use crate::agent::translator::ImageData;
+    let with = Message::User {
+        content: "blob".to_string(),
+        images: vec![ImageData {
+            mime_type: "image/png".to_string(),
+            data_base64: "QUJD".to_string(),
+        }],
+    };
+    let v = serde_json::to_value(&with).unwrap();
+    assert_eq!(v["role"], "user");
+    assert_eq!(v["images"][0]["mime_type"], "image/png");
+    let back: Message = serde_json::from_value(v).unwrap();
+    assert_eq!(back, with, "roundtrip must preserve images");
+
+    let without = Message::User {
+        content: "plain".to_string(),
+        images: Vec::new(),
+    };
+    let v = serde_json::to_value(&without).unwrap();
+    assert!(
+        v.get("images").is_none(),
+        "imageless user message must serialize without the images key"
+    );
+    let legacy: Message =
+        serde_json::from_value(serde_json::json!({"role": "user", "content": "old"})).unwrap();
+    let Message::User { content, images } = legacy else {
+        panic!("expected User message");
+    };
+    assert_eq!(content, "old");
+    assert!(
+        images.is_empty(),
+        "legacy record without images key deserializes empty"
+    );
+}
+
+/// S4-b:续话历史重建——user 记录按 content 指纹从落盘还原旁路图片;
+/// 纯文本记录降级为空。
+/// 注:rec_to_message 生产口径按 B1_IMAGES_DIR 相对 cwd 取图,故本测写入
+/// 仓相对 `data/agent-images/`(gitignore 运行时域,内容寻址唯一名)。
+#[test]
+fn test_s4b_rec_to_message_user_restores_images() {
+    let images_dir = std::path::Path::new("data/agent-images");
+    let bytes = b1_png_bytes(b"restore-body");
+    let fp = blake3::hash(&bytes).to_hex().to_string();
+    std::fs::create_dir_all(images_dir).unwrap();
+    std::fs::write(images_dir.join(format!("{fp}.png")), &bytes).unwrap();
+    let blob = serde_json::json!({
+        "text": "看图",
+        "images_extracted": [
+            {"fingerprint": fp, "bytes": bytes.len(), "mime_type": "image/png"}
+        ]
+    })
+    .to_string();
+    let rec = crate::agent::memory::MessageRecord {
+        idx: 1,
+        role: "user".to_string(),
+        content: blob,
+        tool_calls: None,
+        tool_name: None,
+        timestamp: 0,
+        fact_id: None,
+    };
+    let msg = rec_to_message(&rec, 10_000).expect("user rec must convert");
+    match msg {
+        Message::User { content, images } => {
+            assert!(content.contains("images_extracted"), "blob kept as content");
+            assert_eq!(images.len(), 1, "restored from fingerprint");
+            assert_eq!(images[0].mime_type, "image/png");
+        }
+        other => panic!("expected User message, got {other:?}"),
+    }
+
+    // 纯文本记录(无指纹)→ 空 images
+    let plain = crate::agent::memory::MessageRecord {
+        idx: 2,
+        role: "user".to_string(),
+        content: "just text".to_string(),
+        tool_calls: None,
+        tool_name: None,
+        timestamp: 0,
+        fact_id: None,
+    };
+    let msg = rec_to_message(&plain, 10_000).unwrap();
+    match msg {
+        Message::User { content, images } => {
+            assert_eq!(content, "just text");
+            assert!(images.is_empty());
+        }
+        other => panic!("expected User message, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_b1_tool_message_serde_roundtrip_and_legacy_compat() {
     use crate::agent::translator::ImageData;
@@ -4786,6 +5021,7 @@ fn test_b1_window_image_budget_drops_oldest_with_annotation() {
         },
         Message::User {
             content: "u".to_string(),
+            images: Vec::new(),
         },
         Message::Tool {
             content: "new".to_string(),

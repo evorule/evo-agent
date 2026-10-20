@@ -367,7 +367,7 @@ impl DelegateContext {
             // 返回 tool_calls 也不执行。delegate() 对外签名 Result<String,String>
             // 不变，driver/marks 层零改动。tokens 埋点已随流式路径 token_counter
             // 累加点（StreamChunk::Done 臂）继续生效。
-            let mut stream = runner.run_streaming(task.to_string());
+            let mut stream = runner.run_streaming(task.to_string(), Vec::new());
             let mut final_result: Option<crate::agent::runner::AgentResult> = None;
             let mut stream_err: Option<String> = None;
             while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
