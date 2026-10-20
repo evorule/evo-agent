@@ -236,6 +236,8 @@
 
 <style>
   .dbg-panel {
+    width: var(--sidebar-w, 280px); /* E2:divider 可调,根变量统一侧栏宽 */
+    flex-shrink: 0;
     padding: var(--sp-md);
     overflow-y: auto;
     height: 100%;

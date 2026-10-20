@@ -346,7 +346,7 @@
 
 <style>
   .scm {
-    width: 240px;
+    width: var(--sidebar-w, 240px); /* E2:divider 可调,根变量统一侧栏宽 */
     flex-shrink: 0;
     background: var(--sidebar-bg);
     border-right: 1px solid var(--border);

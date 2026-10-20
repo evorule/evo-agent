@@ -57,7 +57,16 @@
   import { taskList, refreshTaskList, runTaskWithConfirm, cancelTaskRun, lastTaskLabel } from './lib/tasks.js';
   import GroupPane from './components/GroupPane.svelte';
   import ConsoleView from './components/ConsoleView.svelte';
-  import { splitOpen, toggleSplit, closeSplit, secondaryGroups, activeGroupId, addSecondaryGroup, closeSecondaryGroup, moveActiveTabTarget, groupRemovePath, evenWidths as doEvenWidths, groupFocusSignal, restoreGroups, maximizedGroupId, toggleMaximize } from './lib/editorGroups.js';
+  import Divider from './components/Divider.svelte';
+  import {
+    sidebarWidth,
+    setSidebarWidth,
+    applySidebarWidth,
+    hasStoredSidebarWidth,
+    SIDEBAR_DEFAULT,
+    groupPercentFromDrag,
+  } from './lib/layout.js';
+  import { splitOpen, toggleSplit, closeSplit, secondaryGroups, activeGroupId, addSecondaryGroup, closeSecondaryGroup, moveActiveTabTarget, groupRemovePath, evenWidths as doEvenWidths, groupFocusSignal, restoreGroups, maximizedGroupId, toggleMaximize, setGroupWidth } from './lib/editorGroups.js';
   import { lspBanner, restartGate, gateSnapshot } from './lib/lsp/index.js';
   import { pushPanelEvent } from './lib/stores.js';
 
@@ -110,6 +119,31 @@
     'workbench.selectTheme',
   ];
   let cleanupTracking = null;
+
+  // ---- E2 divider:侧栏/副组尺寸接线 ----
+  let editorsRowEl = null; // 副组宽换算的分母(行实际像素宽)
+  let sidebarSlotEl = null; // 侧栏视图宿主(未定制宽度时从活动视图实测初始化)
+  let sidebarVarApplied = false; // CSS 变量生效旗标(生效前各视图用自身缺省宽)
+
+  /** 侧栏 divider 拖拽(dx<0 = 变宽;首事件从活动视图实测宽度初始化,防跳变) */
+  function onSidebarResize(e) {
+    if (!sidebarVarApplied) {
+      sidebarVarApplied = true;
+      const el = sidebarSlotEl && sidebarSlotEl.firstElementChild;
+      const w = el ? Math.round(el.getBoundingClientRect().width) : $sidebarWidth;
+      setSidebarWidth(w);
+    }
+    setSidebarWidth($sidebarWidth - e.detail.dx);
+  }
+
+  /** 副组 divider 拖拽:分隔条在目标组左侧,dx>0(右拖) = 目标组变窄 */
+  function nudgeGroupWidth(id, dx, rowEl) {
+    const g = get(secondaryGroups).find((x) => x.id === id);
+    if (!g || !rowEl || !(rowEl.clientWidth > 0)) return;
+    const start = parseFloat(String(g.width)) || 0;
+    const pct = groupPercentFromDrag(start, -dx, rowEl.clientWidth);
+    setGroupWidth(id, `${pct}%`);
+  }
 
   /** 活动栏条目分发(设置等非文件树视图的宿主接线路由) */
   function handleActivityItem(id) {
@@ -214,6 +248,15 @@
 
   onMount(() => {
     restoreGroups(); // 恢复上次分屏状态(组结构+成员路径,localStorage)
+    // E2 侧栏宽度:有持久定制则立即使 CSS 变量生效;否则各视图用自身缺省宽,
+    // 首次拖拽时实测初始化(防跳变)。订阅仅在其后生效期间同步变量。
+    if (hasStoredSidebarWidth()) {
+      sidebarVarApplied = true;
+      applySidebarWidth($sidebarWidth);
+    }
+    const unsubSidebarW = sidebarWidth.subscribe((w) => {
+      if (sidebarVarApplied) applySidebarWidth(w);
+    });
     // console 回链深链(/?session=N,console 审计页「在工作台打开」目标):
     // 换线打开对应会话;非法 sid 忽略(fail-soft);读后清参防刷新重放。
     try {
@@ -645,6 +688,7 @@
       for (const id of OWNED_COMMANDS) unregisterCommand(id);
       if (cleanupTracking) cleanupTracking();
       unsubTheme();
+      unsubSidebarW();
       window.removeEventListener('storage', onThemeStorage);
     };
   });
@@ -668,7 +712,7 @@
   <TitleBar />
   <div class="main">
     <ActivityBar onitemclick={handleActivityItem} />
-    <div style:display={$explorerVisible ? 'contents' : 'none'}>
+    <div style:display={$explorerVisible ? 'contents' : 'none'} bind:this={sidebarSlotEl}>
       {#if $sidebarView === 'explorer'}
         <Explorer />
       {:else if $sidebarView === 'search'}
@@ -683,6 +727,15 @@
         <DebugView />
       {/if}
     </div>
+    {#if $explorerVisible}
+      <!-- E2:侧栏↔编辑器分隔条(宽 180–480px,持久化 evo_sidebar_w) -->
+      <Divider
+        orient="v"
+        title="拖拽调整侧栏宽度;双击恢复缺省"
+        on:resize={onSidebarResize}
+        on:reset={() => setSidebarWidth(SIDEBAR_DEFAULT)}
+      />
+    {/if}
     <div class="center">
       {#if $lspBanner}
         <div class="lsp-banner" role="alert">
@@ -693,12 +746,19 @@
           <button class="lsp-banner-dismiss" onclick={() => lspBanner.set(null)} aria-label="关闭提示">×</button>
         </div>
       {/if}
-      <div class="editors-row" style:display={$sidebarView === 'audit' ? 'none' : ''}>
+      <div class="editors-row" style:display={$sidebarView === 'audit' ? 'none' : ''} bind:this={editorsRowEl}>
         <div style:display={$maximizedGroupId && $maximizedGroupId !== 'primary' ? 'none' : ''} class="editor-slot">
           <EditorPane />
         </div>
         {#each $secondaryGroups as g (g.id)}
           {#if !$maximizedGroupId || $maximizedGroupId === g.id}
+            <!-- E2:主组↔副组分隔条(宽 10–80%,持久化随 evo_editor_groups_v2) -->
+            <Divider
+              orient="v"
+              title="拖拽调整组宽;双击均分各组"
+              on:resize={(e) => nudgeGroupWidth(g.id, e.detail.dx, editorsRowEl)}
+              on:reset={() => doEvenWidths()}
+            />
             <div class="split-pane" style:width={$maximizedGroupId === g.id ? '100%' : g.width}>
               <GroupPane group={g} />
             </div>
