@@ -83,6 +83,40 @@ fn pick_free_port(exclude: &[u16]) -> Result<u16, String> {
     Err("cannot pick a free port".into())
 }
 
+/// 端口可绑判定（bind 即释放；与 pick_free_port 同一释放-竞态窗语义）。
+fn port_bindable(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// 读 runtime.json 记录的上次三口（粘滞候选；缺件/损坏一律 fail-soft 全空，
+/// 不因状态文件问题改变选口行为）。
+fn last_ports(paths: &ResolvedPaths) -> (Option<u16>, Option<u16>, Option<u16>) {
+    let Ok(raw) = std::fs::read_to_string(paths.data_dir.join("runtime.json")) else {
+        return (None, None, None);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (None, None, None);
+    };
+    let port_of = |k: &str| {
+        v.get(k)
+            .and_then(|s| s.get("port"))
+            .and_then(|p| p.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+    };
+    (port_of("serve"), port_of("engine"), port_of("llm_executor"))
+}
+
+/// 粘滞选口（连接韧性核心）：上次端口未被兄弟口占用且可绑 → 复用；
+/// 否则回落挑新口。组崩溃重启端口不变 = 壳跳过重导航、前端 WS 指数退避
+/// 重连直接命中归位的 serve——用户可感「断」（整页刷新）的消点。
+/// 被其他进程抢占时如实回落新口（此时壳会重导航，连接仍可恢复）。
+fn sticky_or_free(preferred: Option<u16>, exclude: &[u16]) -> Result<u16, String> {
+    match preferred {
+        Some(p) if !exclude.contains(&p) && port_bindable(p) => Ok(p),
+        _ => pick_free_port(exclude),
+    }
+}
+
 fn open_append(path: &Path) -> Result<std::fs::File, String> {
     std::fs::OpenOptions::new()
         .create(true)
@@ -443,9 +477,10 @@ fn write_runtime_file(
 /// 探测 → serve → 探测 → runtime.json。执行体为可选组件：exe/key 缺位或
 /// 健康失败一律降级不阻断（LLM 不可用，工作台其余功能照常）。
 fn start_group(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, String> {
-    let serve_port = pick_free_port(&[])?;
-    let engine_port = pick_free_port(&[serve_port])?;
-    let executor_port = pick_free_port(&[serve_port, engine_port])?;
+    let (last_serve, last_engine, last_exec) = last_ports(ctx.paths);
+    let serve_port = sticky_or_free(last_serve, &[])?;
+    let engine_port = sticky_or_free(last_engine, &[serve_port])?;
+    let executor_port = sticky_or_free(last_exec, &[serve_port, engine_port])?;
 
     let mut engine = spawn_engine(ctx, engine_port)?;
     if !health::wait_healthy(engine_port, "/api/health", Duration::from_secs(30)) {
@@ -632,6 +667,42 @@ mod tests {
         // 正常值 → trim 后返回
         std::fs::write(&key_file, "  sk-live-example \n").unwrap();
         assert_eq!(read_llm_key(&paths).as_deref(), Some("sk-live-example"));
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    // === 粘滞选口（连接韧性：同口重启=前端零刷新） ===
+
+    #[test]
+    fn sticky_or_free_prefers_free_port_and_falls_back() {
+        // 候选口空闲 → 原样复用
+        let free = pick_free_port(&[]).unwrap();
+        assert_eq!(sticky_or_free(Some(free), &[]).unwrap(), free);
+        // 候选口被排除 → 回落且不撞排除集
+        let picked = sticky_or_free(Some(free), &[free]).unwrap();
+        assert_ne!(picked, free);
+        // 候选口被他人绑定 → 回落
+        let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let held_port = held.local_addr().unwrap().port();
+        assert_ne!(sticky_or_free(Some(held_port), &[]).unwrap(), held_port);
+        // 无候选 → 挑新口
+        assert_ne!(sticky_or_free(None, &[]).unwrap(), held_port);
+    }
+
+    #[test]
+    fn last_ports_reads_runtime_json_fail_soft() {
+        let paths = scratch_paths("ports");
+        // 缺文件 → 全空
+        assert_eq!(last_ports(&paths), (None, None, None));
+        // 正常记录 → 三口读出（llm_executor 为 null）
+        std::fs::write(
+            paths.data_dir.join("runtime.json"),
+            r#"{"serve":{"port":8081,"pid":1},"engine":{"port":18080,"pid":2},"llm_executor":null}"#,
+        )
+        .unwrap();
+        assert_eq!(last_ports(&paths), (Some(8081), Some(18080), None));
+        // 损坏 → 全空（不改变选口行为）
+        std::fs::write(paths.data_dir.join("runtime.json"), "{not json").unwrap();
+        assert_eq!(last_ports(&paths), (None, None, None));
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 }
