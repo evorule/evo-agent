@@ -204,6 +204,22 @@ export function getLlmStatus() {
   return fetch('/admin/llm-status', { headers: headers() }).then(unwrap);
 }
 
+/** G1:serve 日志环形缓冲尾部({count, lines})(控制台日志 tab 2s 轮询) */
+export function getAdminLogs(n = 200) {
+  return fetch(`/admin/logs?n=${n}`, { headers: headers() }).then(unwrap);
+}
+
+/** G2:会话记忆事件清单({count, events}) */
+export function listSessionEvents(sid, entity = null) {
+  const q = entity ? `?entity=${encodeURIComponent(entity)}` : '';
+  return fetch(`/api/sessions/${encodeURIComponent(sid)}/events${q}`, { headers: headers() }).then(unwrap);
+}
+
+/** G3:会话回放事件链({count, events[, source, message]};无参=全量) */
+export function replaySession(sid) {
+  return fetch(`/api/sessions/${encodeURIComponent(sid)}/replay`, { headers: headers() }).then(unwrap);
+}
+
 /** S5:会话模型清单(执行体白名单中继;{ready, models, current[, note]}) */
 export function getLlmModels() {
   return fetch('/admin/llm-models', { headers: headers() }).then(unwrap);

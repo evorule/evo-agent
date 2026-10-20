@@ -726,6 +726,8 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route("/admin/llm-status", axum::routing::get(get_llm_status))
         .route("/admin/llm-models", axum::routing::get(get_llm_models))
         .route("/admin/llm-model", axum::routing::post(post_llm_model))
+        // G1:serve 日志环形缓冲尾部(纯内存,进程重启即清;前端控制台日志 tab 轮询)
+        .route("/admin/logs", axum::routing::get(get_admin_logs))
         .route("/agents", axum::routing::get(list_agents))
         .route("/agents/{agent_type}", axum::routing::get(get_agent))
         .route("/agents/{agent_type}/run", axum::routing::post(run_agent))
@@ -1073,6 +1075,29 @@ async fn get_version(State(state): State<AgentApiState>) -> Json<RuntimeIdentity
 /// 来源变量名。响应体**不携带任何密钥内容**(见 [`LlmStatusSnapshot`] 设计铁律)。
 async fn get_llm_status(State(state): State<AgentApiState>) -> Json<LlmStatusSnapshot> {
     Json(state.llm_status())
+}
+
+/// `GET /admin/logs` 的查询参数
+#[derive(Debug, serde::Deserialize)]
+struct AdminLogsQuery {
+    /// 取尾部条数(1..=500,缺省 200)
+    n: Option<usize>,
+}
+
+/// G1:serve 日志环形缓冲尾部(纯内存,进程重启即清)
+///
+/// 路由:`GET /admin/logs?n=200`
+///
+/// 返回:`{count, lines: [..]}`——lines 为 tracing 格式化条目(通常一行,
+/// 消息内含换行则多行)。前端控制台日志 tab 2s 轮询呈现;排障视图,
+/// 不充当审计链。
+async fn get_admin_logs(
+    axum::extract::Query(params): axum::extract::Query<AdminLogsQuery>,
+) -> Json<serde_json::Value> {
+    let n = params.n.unwrap_or(200).clamp(1, 500);
+    let lines = crate::api::log_buffer::tail_lines(n);
+    let count = lines.len();
+    Json(serde_json::json!({ "count": count, "lines": lines }))
 }
 
 /// S5:执行体模型清单中继 URL——executor_url 为 `/llm/execute` 全 URL 形态
