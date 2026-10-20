@@ -205,14 +205,15 @@ fn spawn_engine(ctx: &LaunchContext, engine_port: u16) -> Result<Child, String> 
     let engine_log = open_append(&paths.logs_dir.join("engine.log"))?;
     let engine_log_err = open_append(&paths.logs_dir.join("engine.log"))?;
     let mut engine_cmd = Command::new(&paths.evorule_server_exe);
+    // 安全令牌走环境变量注入(引擎支持 EVORULE_AUTH_TOKEN),不经进程命令行——
+    // 命令行参数对本机所有进程可读,令牌上账面即暴露。
     engine_cmd
+        .env("EVORULE_AUTH_TOKEN", ctx.engine_token)
         .args([
             "--profile",
             "development",
             "--addr",
             &format!("127.0.0.1:{engine_port}"),
-            "--auth-token",
-            ctx.engine_token,
             "--core-eval",
         ])
         .arg(paths.evorule_server_home.join("resources").join("server_eval.json"))
