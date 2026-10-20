@@ -158,7 +158,7 @@ pub async fn run_operation(
     // 不访问外部 LLM；未设置时走统一解析产物(state 持有,与 CLI 同一语义)。
     let llm = match std::env::var("EVO_AGENT_LLM_MOCK_CONTENT") {
         Ok(mock) => LlmHandler::mock(&mock),
-        Err(_) => LlmHandler::from_config(state.llm_config()),
+        Err(_) => LlmHandler::from_config(&state.llm_config()),
     };
 
     let model = req.model.as_deref().unwrap_or("default");

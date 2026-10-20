@@ -182,6 +182,20 @@ export function getLlmStatus() {
   return fetch('/admin/llm-status', { headers: headers() }).then(unwrap);
 }
 
+/** S5:会话模型清单(执行体白名单中继;{ready, models, current[, note]}) */
+export function getLlmModels() {
+  return fetch('/admin/llm-models', { headers: headers() }).then(unwrap);
+}
+
+/** S5:切换会话模型(执行体不可达/清单外拒绝;成功返回 {ok, status}) */
+export function setLlmModel(model) {
+  return fetch('/admin/llm-model', {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ model }),
+  }).then(unwrap);
+}
+
 /** 审批决定(G8 既有通道;approved=true 批准 / false 拒绝) */
 export function approveProposal(agentType, sessionId, approved, proposalId) {
   return fetch(`/agents/${encodeURIComponent(agentType)}/approve`, {

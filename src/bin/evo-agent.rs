@@ -2152,11 +2152,11 @@ fn cmd_serve(
         toolkit,
     )
     // 凭据可视化:注入 LLM 配置脱敏快照(响应体不含任何密钥内容)
-    .with_llm_status(std::sync::Arc::new(
+    .with_llm_status(
         config
             .llm
             .status_snapshot(config.llm_api_key_source.as_deref()),
-    ))
+    )
     // 配置统一:注入经统一解析的 LLM 配置(env 优先、toml 兜底)——
     // serve 面各请求路径的 handler 构造与 CLI 共用同一解析产物,
     // 不再绕过配置体系直读裸环境变量

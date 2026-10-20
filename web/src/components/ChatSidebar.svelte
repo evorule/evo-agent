@@ -18,7 +18,7 @@
     openSettingsTab,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
-  import { approveProposal, listResumableRuns, getOrchestrationLinks, uploadFile } from '../lib/api.js';
+  import { approveProposal, listResumableRuns, getOrchestrationLinks, uploadFile, getLlmModels, setLlmModel } from '../lib/api.js';
   import { orderSessionsWithLineage } from '../lib/orchestration.js';
   import { onMount, onDestroy, tick } from 'svelte';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
@@ -205,6 +205,60 @@
     }
   }
 
+  // ---- S5 模型选择器(会话模型运行期热切换;白名单正源=执行体,serve 中继) ----
+  // 选择即人工显式配置态,不涉审批链;清单外/执行体不可达由 serve 拒切。
+  let modelMenuOpen = $state(false);
+  let currentModel = $state('');
+  let modelList = $state([]);
+  let modelReady = $state(false);
+  let modelNote = $state('');
+  let modelErr = $state('');
+  let modelBusy = $state(false);
+  let modelPickEl = $state(null);
+
+  async function refreshModels() {
+    try {
+      const s = await getLlmModels();
+      modelList = Array.isArray(s.models) ? s.models : [];
+      modelReady = !!s.ready;
+      modelNote = s.note || '';
+      if (s.current) currentModel = s.current;
+      if (modelErr) modelErr = '';
+    } catch (e) {
+      modelReady = false;
+      modelNote = String(e?.message || e);
+    }
+  }
+
+  function toggleModelMenu() {
+    modelMenuOpen = !modelMenuOpen;
+    if (modelMenuOpen) refreshModels();
+  }
+
+  async function pickModel(m) {
+    if (modelBusy || m === currentModel) {
+      modelMenuOpen = false;
+      return;
+    }
+    modelBusy = true;
+    modelErr = '';
+    try {
+      const r = await setLlmModel(m);
+      currentModel = r?.status?.model || m;
+      modelMenuOpen = false;
+    } catch (e) {
+      modelErr = String(e?.message || e);
+    } finally {
+      modelBusy = false;
+    }
+  }
+
+  function onDocClickCloseModelMenu(e) {
+    if (!modelMenuOpen) return;
+    if (modelPickEl?.contains(e.target)) return;
+    modelMenuOpen = false;
+  }
+
   onMount(() => {
     draft = localStorage.getItem(DRAFT_KEY) || '';
     try {
@@ -231,6 +285,9 @@
     refreshSessions();
     loadResumable();
     loadLineage();
+    // S5:模型选择器初值(当前生效模型;清单懒加载,点开时再拉)
+    refreshModels();
+    document.addEventListener('click', onDocClickCloseModelMenu);
     // 心跳停滞提示的秒级心跳(纯客户端:turn 活跃且久无引擎事件→琥珀提示;
     // serve 侧心跳 2 窗中止,此处为其可见前兆)
     stallTicker = setInterval(() => {
@@ -241,6 +298,7 @@
   onDestroy(() => {
     unregisterCommand('chat.addContext');
     if (stallTicker) clearInterval(stallTicker);
+    document.removeEventListener('click', onDocClickCloseModelMenu);
   });
 
   /** 引擎事件停滞秒数(turn 活跃面;<0 = 事件仍新鲜) */
@@ -832,6 +890,49 @@
           >
             对话
           </button>
+        </div>
+        <div class="model-pick" bind:this={modelPickEl}>
+          <button
+            class="tb-btn model-btn"
+            class:active={modelMenuOpen}
+            onclick={toggleModelMenu}
+            disabled={$turnActive}
+            title="会话模型(点击切换;准入白名单由执行体执法)"
+          >
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <path
+                d="M8 1.8 14 5v6L8 14.2 2 11V5Z"
+                stroke="currentColor"
+                stroke-width="1.3"
+                fill="none"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span class="model-name">{currentModel || '模型'}</span>
+          </button>
+          {#if modelMenuOpen}
+            <div class="model-menu" role="listbox" aria-label="会话模型">
+              {#if modelErr}<div class="model-menu-note err">{modelErr}</div>{/if}
+              {#if !modelReady}
+                <div class="model-menu-note">{modelNote || '模型清单不可用'}</div>
+              {:else}
+                {#each modelList as m (m)}
+                  <button
+                    class="model-item"
+                    class:active={m === currentModel}
+                    role="option"
+                    aria-selected={m === currentModel}
+                    onclick={() => pickModel(m)}
+                    disabled={modelBusy}
+                  >
+                    <span class="mono">{m}</span>
+                    {#if m === currentModel}<span class="model-check">✓</span>{/if}
+                  </button>
+                {/each}
+              {/if}
+              {#if modelBusy}<div class="model-menu-note">切换中…</div>{/if}
+            </div>
+          {/if}
         </div>
         <button class="tb-btn" onclick={openMentionPopup} title="插入 @ 上下文引用">@</button>
         <button class="tb-btn" onclick={pickFiles} title="上传图片/附件(存入工作区 .evo-agent/uploads,agent 可读)">
@@ -1445,6 +1546,72 @@
   .mode-seg button.active {
     background: var(--brand);
     color: #fff;
+  }
+  /* S5 模型选择器(Trae 对齐):mode 段右侧下拉,白名单正源=执行体 */
+  .model-pick {
+    position: relative;
+    flex-shrink: 0;
+  }
+  .model-btn {
+    max-width: 150px;
+  }
+  .model-btn .model-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 110px;
+  }
+  .model-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    min-width: 210px;
+    max-height: 240px;
+    overflow-y: auto;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    box-shadow: var(--sh-modal);
+    z-index: 60;
+    padding: 4px;
+  }
+  .model-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 10px;
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 12px;
+    cursor: pointer;
+    border-radius: var(--r-sm);
+    text-align: left;
+  }
+  .model-item:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .model-item.active {
+    color: var(--brand);
+  }
+  .model-item:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .model-check {
+    font-size: 11px;
+    color: var(--brand);
+  }
+  .model-menu-note {
+    padding: 8px 10px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: normal;
+  }
+  .model-menu-note.err {
+    color: var(--danger);
   }
   .mode-seg button:disabled {
     opacity: 0.45;

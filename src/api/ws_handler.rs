@@ -721,7 +721,7 @@ pub(crate) fn build_approval_callback(
                 let override_flag = approval_exemption_override(state);
                 let audited = crate::agent::audited_llm::AuditedLlm::new(
                     state.evorule_client().clone(),
-                    crate::io_handlers::LlmHandler::from_config(state.llm_config()),
+                    crate::io_handlers::LlmHandler::from_config(&state.llm_config()),
                 );
                 let runaway = crate::agent::runner::RunawayPolicy::from_policy_file(&policy);
                 return (
