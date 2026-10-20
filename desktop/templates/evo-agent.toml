@@ -1,0 +1,144 @@
+# 发版捆绑模板（唯一源）——desktop/templates/evo-agent.toml
+#
+# build-installer.ps1 以本文件为捆绑 resources/evo-agent/evo-agent.toml 的基座；
+# 仓根 evo-agent.toml 是开发本地配置（gitignore），不再是发版源。
+# service_tools 段由 desktop/scripts/sync-service-tools.ps1 从执行侧 SSOT
+# （server 仓 plugins/*/official_native_services.json 并集）再生成，
+# build-installer 内嵌 -Check 校验，漂移即构建红。
+# 动态值（端口/引擎地址/令牌/key）一律由壳在运行期 env 注入，不入本模板。
+
+[llm]
+provider = "minimax"
+model = "MiniMax-M3"
+# 预算基数口径：记忆区预算默认以输入侧为基数（input = 总窗扣除 25% 响应预留 = 750000；
+# 默认配方记忆区预算 = 750000 × 0.25 = 187500 token）。如需沿用旧总窗口径（记忆区 51200），
+# 在 definition 装配配方记忆槽显式声明 base = "total_window"（向后兼容保留）
+# MiniMax-M3 满窗 1M（保障 512K）：按用户裁定取满窗——M3 费用无负担，跑时
+# 不多开窗口/并发会话，防本机内存吃紧被撑爆
+context_window_tokens = 1000000  # M3 满窗 1M（用户裁定 2026-10-16）；换模型须同步修改
+api_base = "https://api.minimaxi.com/v1/text/chatcompletion_v2"
+
+[evorule]
+base_url = "http://127.0.0.1:18080"
+api_key = ""
+service_tools = [
+  "browser_accessibility_tree",
+  "browser_back",
+  "browser_check",
+  "browser_clear",
+  "browser_click",
+  "browser_close_tab",
+  "browser_console_log",
+  "browser_cookies",
+  "browser_dialog",
+  "browser_double_click",
+  "browser_download",
+  "browser_drag",
+  "browser_evaluate",
+  "browser_exists",
+  "browser_fill",
+  "browser_forward",
+  "browser_get_attribute",
+  "browser_get_element_text",
+  "browser_get_html",
+  "browser_get_location",
+  "browser_get_text",
+  "browser_hover",
+  "browser_iframe_eval",
+  "browser_launch",
+  "browser_list_frames",
+  "browser_multi_select",
+  "browser_navigate",
+  "browser_network_requests",
+  "browser_press",
+  "browser_reload",
+  "browser_right_click",
+  "browser_screenshot",
+  "browser_scroll",
+  "browser_scroll_to_element",
+  "browser_select",
+  "browser_set_viewport",
+  "browser_storage",
+  "browser_switch_tab",
+  "browser_tabs",
+  "browser_type",
+  "browser_upload",
+  "browser_wait",
+  "browser_wait_for_element",
+  "browser_wait_network_idle",
+  "browser_wait_new_tab",
+  "checksum_iban",
+  "checksum_isbn",
+  "checksum_luhn",
+  "cny_amount_upper",
+  "config_persist",
+  "fluid_bernoulli",
+  "fluid_continuity",
+  "fluid_hydrostatic",
+  "geometry_clearance_check",
+  "geometry_collision_check",
+  "geometry_occlusion_check",
+  "gnss_clock_total",
+  "gnss_eccentricity_correction",
+  "gnss_factory_prebias",
+  "gnss_range_error",
+  "gnss_relativistic_drift",
+  "gov_aggregate",
+  "gov_ratio_split",
+  "gov_window_duration",
+  "gov_window_overlap",
+  "grav_light_deflection",
+  "grav_perihelion_precession",
+  "grav_schwarzschild_radius",
+  "indicator_ema",
+  "indicator_macd",
+  "indicator_rsi",
+  "indicator_sma",
+  "inference_backward_plan",
+  "inference_conflict_detect",
+  "inference_convergence_check",
+  "inference_counterfactual_analyze",
+  "inference_counterfactual_sweep",
+  "inference_cycle_detect",
+  "inference_differential_diff",
+  "inference_dimension_compare_units",
+  "inference_dimension_from_unit",
+  "inference_dimension_verify_formula",
+  "inference_effect_predict",
+  "inference_equivalence_probe",
+  "inference_forward_simulate",
+  "inference_rw_extract",
+  "inverse_kinematics_solver",
+  "legal_deadline",
+  "llm_advisor",
+  "mechanics_energy_mech",
+  "mechanics_kinematics_uniform",
+  "mechanics_momentum_impulse",
+  "mechanics_newton_second",
+  "mechanics_ohm_law",
+  "mechanics_pid_step",
+  "mechanics_resistance_network",
+  "metrology_uncertainty_propagate",
+  "numeric_decimal_convert",
+  "numeric_decimal_eval",
+  "numeric_dim_eval",
+  "numeric_fin_amortize",
+  "numeric_fin_interest",
+  "numeric_number_theory",
+  "numeric_rational_eval",
+  "numeric_unit_convert",
+  "physics_energy",
+  "physics_grav_band",
+  "physics_simulate",
+  "quantum_harmonic_oscillator",
+  "quantum_infinite_well",
+  "robot_move_joints",
+  "rule_sandbox",
+  "sampling_service",
+  "shadow_ik_solver",
+  "template_render",
+]
+
+# 工作台附加配置:serve 启动期自动拉起 console 审计页(审计深链数据源)
+[workbench]
+console_dir = "D:\\evorule-console-cloud"
