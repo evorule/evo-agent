@@ -19,6 +19,7 @@ pub mod git_api;
 pub mod human_gate;
 pub mod io_contract;
 pub mod llm_ops;
+pub mod log_buffer;
 pub mod lsp_api;
 pub mod mcp_api;
 pub mod metrics;

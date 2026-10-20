@@ -485,7 +485,12 @@ fn init_logging(verbose: bool) {
     use tracing_subscriber::{fmt, EnvFilter};
     let level = if verbose { "debug" } else { "info" };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    let _ = fmt().with_env_filter(filter).with_target(false).try_init();
+    // G1:Tee writer 双写——stdout 原样 + 内存环形缓冲(GET /admin/logs 读尾部)
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(evo_agent::api::log_buffer::LogTee)
+        .try_init();
 }
 
 // =============================================================================
