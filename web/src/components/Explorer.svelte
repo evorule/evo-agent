@@ -9,6 +9,15 @@
   import { onMount } from 'svelte';
   import { listDir, createFile, moveFile, deleteFile } from '../lib/api.js';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
+  import { reconnectCurrent } from '../lib/ws.js';
+  import {
+    validateWorkspaceInput,
+    updateWorkspaceRecent,
+    loadRecentWorkspaces,
+    saveRecentWorkspaces,
+    workspaceAnchor,
+    workspaceLabel as wsLabelOf,
+  } from '../lib/workspace.js';
   import {
     openFile,
     closeTab,
@@ -59,6 +68,20 @@
 
   // path('' = 根) → {loaded, expanded, children}
   const dirState = new Map();
+
+  // ---- E1 工作区:文件树锚点 + 重连刷新 ----
+  // REST 文件面以 serve workdir 为根(绝对路径拒绝,安全红线不松);工作区在
+  // workdir 之下时树锚定其相对子目录(anchor),之外时保持 workdir 根(agent
+  // 能力边界仍随新连接生效,提示条明示)。
+  const IS_WIN = typeof navigator !== 'undefined' && /win/i.test(navigator.userAgent || '');
+  let anchor = ''; // 树根的 workdir 相对路径('' = workdir 根)
+  let lastRootDir = ''; // 最近一次 listDir 返回的 serve workdir(重连对比用)
+  let lastWsAtLoad = ''; // 最近一次建树时的工作区(重连对比用)
+  let didLoad = false; // 首树建好后重连才做按需刷新
+  let wsMenu = null; // 工作区下拉 {x, y, items}
+  let wsDialog = null; // 切换工作区对话框 {value, error, probe}
+  let wsNotice = ''; // 工作区切换提示条(带「立即重连」)
+  let recentWs = loadRecentWorkspaces();
 
   // 折叠状态持久化(localStorage;键位口径与工作台其他 localStorage 键一致)
   const STATE_KEY = 'evo_explorer_state';
@@ -285,6 +308,7 @@
     }
     items.push({ label: '重命名', action: () => startRename(node) });
     items.push({ label: '复制路径', action: () => copyPath(node) });
+    items.push({ label: '刷新', action: refreshAll }); // E3:节点菜单补刷新(根区已有)
     items.push({ separator: true });
     items.push({ label: '删除…', danger: true, action: () => askDelete(node) });
     return items;
@@ -302,8 +326,8 @@
       x: e.clientX,
       y: e.clientY,
       items: [
-        { label: '新建文件', action: () => startCreate('createFile', '') },
-        { label: '新建文件夹', action: () => startCreate('createDir', '') },
+        { label: '新建文件', action: () => startCreate('createFile', anchor) },
+        { label: '新建文件夹', action: () => startCreate('createDir', anchor) },
         { label: '刷新', action: refreshAll },
       ],
     };
@@ -360,7 +384,7 @@
       dirState.delete(from); // 旧子树状态随移动失效(展开态不迁移,v1 从简)
       await reloadDir(parentDir(from));
       if (dirState.get(targetDir)?.loaded) await reloadDir(targetDir);
-      rootChildren = dirState.get('')?.children || [];
+      rootChildren = dirState.get(anchor)?.children || [];
       persistExpanded();
       rebuild();
       // tab 打开时路径联动(dirty 保留;未打开时无 model 键,信号无害)
@@ -374,9 +398,9 @@
   // 命令面板作用域:菜单/操作钮与命令共用同一本地函数(一处定义两处消费)
   // =========================================================================
 
-  /** 选中节点 → 新建动作的目录锚点(dir→自身,file→父目录,无选中→根) */
+  /** 选中节点 → 新建动作的目录锚点(dir→自身,file→父目录,无选中→树根) */
   function anchorFor(sel) {
-    if (!sel) return '';
+    if (!sel) return anchor;
     return sel.kind === 'dir' ? sel.path : parentDir(sel.path);
   }
 
@@ -426,17 +450,156 @@
       }
     }
     for (const dir of toReload) await reloadDir(dir);
-    rootChildren = dirState.get('')?.children || [];
+    rootChildren = dirState.get(anchor)?.children || [];
     persistExpanded();
     rebuild();
   }
 
   /** 全量刷新:重读根与全部已加载目录(保留展开状态) */
   async function refreshAll() {
-    const loaded = [...dirState.keys()].filter((p) => dirState.get(p)?.loaded);
-    for (const p of ['', ...loaded]) await reloadDir(p);
-    rootChildren = dirState.get('')?.children || [];
+    const loaded = [...dirState.keys()].filter((p) => dirState.get(p)?.loaded && p !== anchor);
+    for (const p of [anchor, ...loaded]) await reloadDir(p);
+    rootChildren = dirState.get(anchor)?.children || [];
     rebuild();
+  }
+
+  // =========================================================================
+  // E1 工作区:建树/重连刷新 + 下拉菜单 + 切换对话框
+  // =========================================================================
+
+  /** 建树(挂载与工作区变化后共用):重读根 → 换算锚点 → 全量重建 */
+  async function initTree() {
+    try {
+      const res = await listDir();
+      lastRootDir = res.dir || '';
+      lastWsAtLoad = localStorage.getItem('evo_workspace') || '';
+      anchor = workspaceAnchor(lastRootDir, lastWsAtLoad, { caseInsensitive: IS_WIN }) || '';
+      dirState.clear(); // 锚点可能变化,旧展开/懒加载状态整树失效
+      rootChildren = [];
+      const segSrc = anchor || lastRootDir;
+      const seg = segSrc.split(/[\\/]/).filter(Boolean).pop();
+      if (seg) rootName = seg;
+      await loadChildren(anchor);
+      rootChildren = dirState.get(anchor)?.children || [];
+      // 恢复上次折叠状态(目录已不存在的条目静默跳过)
+      for (const p of restoreExpanded()) {
+        try {
+          await loadChildren(p);
+          dirState.set(p, { ...dirState.get(p), expanded: true });
+        } catch {
+          /* 目录已不存在 */
+        }
+      }
+      rebuild();
+      loadError = '';
+      didLoad = true;
+    } catch (e) {
+      loadError = String(e?.message || e);
+    }
+  }
+
+  /** 重连后按需刷新:根目录或工作区未变则树不动(防被动重连闪树) */
+  async function refreshOnReconnect() {
+    if (!didLoad) return;
+    try {
+      const res = await listDir();
+      const ws = localStorage.getItem('evo_workspace') || '';
+      if (res.dir === lastRootDir && ws === lastWsAtLoad) return;
+      await initTree();
+    } catch {
+      /* 闪断:树保留旧态,后续 fs_events/手动刷新兜底 */
+    }
+  }
+
+  function currentWorkspace() {
+    return localStorage.getItem('evo_workspace') || '';
+  }
+
+  /** 工作区下拉菜单:最近 5 个 + 切换对话框 + 恢复缺省 */
+  function openWsMenu(e) {
+    const el = e.currentTarget || e.target;
+    const r = el.getBoundingClientRect ? el.getBoundingClientRect() : { left: e.clientX, bottom: e.clientY };
+    const cur = currentWorkspace();
+    const items = recentWs.map((p) => ({
+      label: `${p === cur ? '✓ ' : ''}${p}`,
+      action: () => applyWorkspace(p),
+    }));
+    if (items.length) items.push({ separator: true });
+    items.push({ label: '切换工作区…', action: openWsDialog });
+    items.push({ label: '恢复缺省(serve workdir)', action: () => applyWorkspace('') });
+    wsMenu = { x: r.left, y: r.bottom + 2, items };
+  }
+
+  /** 应用工作区(切换/恢复缺省共用):写 localStorage → 提示条(重连生效);
+   *  广播 evo:workspace-changed 供对话侧栏同步按钮态。 */
+  function applyWorkspace(v) {
+    const chk = validateWorkspaceInput(v);
+    if (!chk.ok) {
+      wsNotice = `工作区路径不合法:${chk.error}`;
+      return;
+    }
+    if (chk.value) {
+      localStorage.setItem('evo_workspace', chk.value);
+      recentWs = updateWorkspaceRecent(recentWs, chk.value);
+      saveRecentWorkspaces(recentWs);
+      wsNotice = `工作区已设为:${wsLabelOf(chk.value) || chk.value}。对新连接生效(新建会话/换线/重连)。`;
+    } else {
+      localStorage.removeItem('evo_workspace');
+      wsNotice = '已恢复缺省工作区(serve workdir)。对新连接生效。';
+    }
+    try {
+      window.dispatchEvent(new CustomEvent('evo:workspace-changed'));
+    } catch {
+      /* 非浏览器环境(测试)静默 */
+    }
+  }
+
+  function openWsDialog() {
+    wsDialog = { value: currentWorkspace(), error: '', probe: '' };
+  }
+
+  function confirmWsDialog() {
+    if (!wsDialog) return;
+    const chk = validateWorkspaceInput(wsDialog.value);
+    if (!chk.ok) {
+      wsDialog = { ...wsDialog, error: chk.error };
+      return;
+    }
+    applyWorkspace(chk.value);
+    wsDialog = null;
+  }
+
+  /** 探测输入路径(尽力而为):REST 文件面 workdir 根限定,越界/外部路径
+   *  探测必然失败——提示措辞明示「新边界属正常」,不阻断切换(serve 为
+   *  一等校验面,连接失败可恢复缺省)。 */
+  async function probeWsPath() {
+    if (!wsDialog) return;
+    const chk = validateWorkspaceInput(wsDialog.value);
+    if (!chk.ok) {
+      wsDialog = { ...wsDialog, error: chk.error, probe: '' };
+      return;
+    }
+    wsDialog = { ...wsDialog, error: '', probe: chk.value ? '探测中…' : '' };
+    if (!chk.value) return;
+    try {
+      await listDir(chk.value);
+      wsDialog = { ...wsDialog, probe: '探测:该路径可从当前连接访问。' };
+    } catch (e) {
+      wsDialog = {
+        ...wsDialog,
+        probe: `探测:当前连接无法访问该目录(${String(e?.message || e)})——若为新能力边界属正常,以重连后实况为准。`,
+      };
+    }
+  }
+
+  function reconnectNow() {
+    reconnectCurrent();
+    wsNotice = '重连中,连接建立后文件树将按新工作区刷新…';
+  }
+
+  /** 对话框输入框自动聚焦(Svelte action) */
+  function autofocus(node) {
+    node.focus();
   }
 
   onMount(async () => {
@@ -491,34 +654,26 @@
       },
     ];
     for (const c of commands) registerCommand(c);
-    try {
-      const res = await listDir();
-      const seg = (res.dir || '').split(/[\\/]/).filter(Boolean).pop();
-      if (seg) rootName = seg;
-      await loadChildren('');
-      rootChildren = dirState.get('')?.children || [];
-      // 恢复上次折叠状态(目录已不存在的条目静默跳过)
-      for (const p of restoreExpanded()) {
-        try {
-          await loadChildren(p);
-          dirState.set(p, { ...dirState.get(p), expanded: true });
-        } catch {
-          /* 目录已不存在 */
-        }
-      }
-      rebuild();
-    } catch (e) {
-      loadError = String(e?.message || e);
-    }
+    await initTree();
     // fs_events 一次性信号订阅:消费后置 null
     const unsubFs = fsEvents.subscribe((ev) => {
       if (!ev) return;
       fsEvents.set(null);
       applyFsEvents(ev);
     });
+    // E1:重连(手动/自动)成功且根或工作区变化时按需重建(锚点换算在 initTree)
+    let prevConn = null;
+    const unsubConn = connStatus.subscribe((s) => {
+      if (prevConn && prevConn !== 'online' && s === 'online') {
+        wsNotice = ''; // 重连成功,提示条收起
+        refreshOnReconnect();
+      }
+      prevConn = s;
+    });
     return () => {
       for (const c of commands) unregisterCommand(c.id);
       unsubFs();
+      unsubConn();
     };
   });
 </script>
@@ -533,25 +688,32 @@
   <div class="actions">
     <span
       class="workdir mono"
-      class:drop-root={dragOverPath === ''}
-      title="工作目录(拖动节点到此处移动到根)"
-      ondragover={(e) => dragOver(e, '')}
+      class:drop-root={dragOverPath === anchor}
+      role="button"
+      tabindex="0"
+      title={`树根:${anchor || 'serve workdir 根'}\n点击切换工作区(重连生效);拖动节点到此处移动到树根`}
+      onclick={openWsMenu}
+      onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && openWsMenu(e)}
+      ondragover={(e) => dragOver(e, anchor)}
       ondragleave={() => (dragOverPath = null)}
-      ondrop={(e) => dropTo(e, '')}
+      ondrop={(e) => dropTo(e, anchor)}
     >
       <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8">
         <path d="M4 5a1 1 0 0 1 1-1h5l2 2h7a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5Z" />
       </svg>
       {rootName}
+      <svg class="ws-caret" viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.2">
+        <path d="M6 9l6 6 6-6" />
+      </svg>
     </span>
     <span class="spacer" />
-    <button class="action-btn" title="新建文件" onclick={() => startCreate('createFile', '')}>
+    <button class="action-btn" title="新建文件" onclick={() => startCreate('createFile', anchor)}>
       <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8">
         <path d="M13 3H7a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V8l-5-5Z" />
         <path d="M12 11v6M9 14h6" />
       </svg>
     </button>
-    <button class="action-btn" title="新建文件夹" onclick={() => startCreate('createDir', '')}>
+    <button class="action-btn" title="新建文件夹" onclick={() => startCreate('createDir', anchor)}>
       <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8">
         <path d="M4 5a1 1 0 0 1 1-1h5l2 2h7a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5Z" />
         <path d="M10 13h6" />
@@ -563,11 +725,19 @@
       </svg>
     </button>
   </div>
+  {#if wsNotice}
+    <!-- E1:工作区切换提示条(写面即刻持久化,生效在下次连接;立即重连可选) -->
+    <div class="ws-notice" role="status">
+      <span class="ws-notice-text">{wsNotice}</span>
+      <button class="ws-notice-btn" onclick={reconnectNow}>立即重连</button>
+      <button class="ws-notice-x" onclick={() => (wsNotice = '')} aria-label="关闭提示">×</button>
+    </div>
+  {/if}
   {#if loadError}
     <div class="error">加载失败:{loadError}</div>
   {:else}
     <div class="tree" role="tree">
-      {#if naming && naming.mode !== 'rename' && naming.anchor === ''}
+      {#if naming && naming.mode !== 'rename' && naming.anchor === anchor}
         <div class="node naming" style="padding-left: 10px">
           <input
             class="name-input"
@@ -666,6 +836,49 @@
   <ContextMenu x={menu.x} y={menu.y} items={menu.items} on:close={() => (menu = null)} />
 {/if}
 
+{#if wsMenu}
+  <!-- E1:工作区下拉(最近列表 + 切换 + 恢复缺省) -->
+  <ContextMenu x={wsMenu.x} y={wsMenu.y} items={wsMenu.items} on:close={() => (wsMenu = null)} />
+{/if}
+
+{#if wsDialog}
+  <!-- E1:切换工作区对话框(输入框 + 校验 + 尽力而为探测;替代裸 prompt) -->
+  <div
+    class="ws-overlay"
+    role="presentation"
+    onclick={(e) => e.target === e.currentTarget && (wsDialog = null)}
+  >
+    <div class="ws-dialog" role="dialog" aria-modal="true" aria-label="切换工作区">
+      <div class="ws-dialog-title">切换工作区</div>
+      <div class="ws-dialog-hint">
+        绝对路径,作为 agent 读写能力边界(重连后生效;serve workdir 之下的子目录将同时成为文件树根)。留空恢复缺省。
+      </div>
+      <input
+        class="ws-input mono"
+        bind:value={wsDialog.value}
+        placeholder="如 D:\projects\demo"
+        aria-label="工作区绝对路径"
+        use:autofocus
+        onchange={probeWsPath}
+        onkeydown={(e) => {
+          if (e.key === 'Enter') confirmWsDialog();
+          else if (e.key === 'Escape') wsDialog = null;
+        }}
+      />
+      {#if wsDialog.error}
+        <div class="ws-dialog-err">{wsDialog.error}</div>
+      {/if}
+      {#if wsDialog.probe}
+        <div class="ws-dialog-probe">{wsDialog.probe}</div>
+      {/if}
+      <div class="ws-dialog-actions">
+        <button class="ws-btn-plain" onclick={() => (wsDialog = null)}>取消</button>
+        <button class="ws-btn-primary" onclick={confirmWsDialog}>切换</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <ConfirmDialog
   open={!!confirmState}
   title="删除确认"
@@ -681,7 +894,7 @@
 
 <style>
   .explorer {
-    width: 220px;
+    width: var(--sidebar-w, 220px); /* E2:divider 可调,根变量统一侧栏宽 */
     flex-shrink: 0;
     background: var(--sidebar-bg);
     border-right: 1px solid var(--border);
@@ -726,6 +939,141 @@
     white-space: nowrap;
     text-overflow: ellipsis;
     min-width: 0;
+    cursor: pointer;
+    border-radius: var(--r-sm);
+  }
+  .workdir:hover {
+    background: var(--sidebar-hover);
+    color: var(--sidebar-text-active);
+  }
+  .ws-caret {
+    flex-shrink: 0;
+    color: var(--text-muted);
+  }
+  /* E1:工作区切换提示条(状态行,不占树区) */
+  .ws-notice {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    margin: var(--sp-xs) var(--sp-sm) 0;
+    padding: 6px 8px;
+    border: 1px solid var(--brand);
+    border-radius: var(--r-sm);
+    background: var(--brand-bg, rgba(88, 166, 255, 0.08));
+    font-size: var(--fs-xs);
+    line-height: var(--lh-normal);
+  }
+  .ws-notice-text {
+    flex: 1;
+    min-width: 0;
+    word-break: break-all;
+    color: var(--sidebar-text);
+  }
+  .ws-notice-btn {
+    flex-shrink: 0;
+    border: 1px solid var(--brand);
+    border-radius: 4px;
+    color: var(--brand);
+    font-size: var(--fs-xs);
+    padding: 1px 8px;
+    white-space: nowrap;
+  }
+  .ws-notice-btn:hover {
+    background: var(--brand-bg, rgba(88, 166, 255, 0.12));
+  }
+  .ws-notice-x {
+    flex-shrink: 0;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1;
+    padding: 0 2px;
+  }
+  /* E1:切换工作区对话框(替代裸 prompt) */
+  .ws-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1100;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 18vh;
+  }
+  .ws-dialog {
+    width: 460px;
+    max-width: calc(100vw - 32px);
+    background: var(--bg-card);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    box-shadow: var(--sh-modal);
+    padding: var(--sp-md);
+  }
+  .ws-dialog-title {
+    font-size: var(--fs-base);
+    font-weight: var(--fw-sb);
+    color: var(--text-primary);
+    margin-bottom: 6px;
+  }
+  .ws-dialog-hint {
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    line-height: var(--lh-normal);
+    margin-bottom: 10px;
+  }
+  .ws-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--bg-input);
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: var(--fs-sm);
+    padding: 6px 8px;
+    outline: none;
+  }
+  .ws-input:focus {
+    border-color: var(--brand);
+  }
+  .ws-dialog-err {
+    margin-top: 6px;
+    font-size: var(--fs-xs);
+    color: #f87171;
+    word-break: break-all;
+  }
+  .ws-dialog-probe {
+    margin-top: 6px;
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    line-height: var(--lh-normal);
+    word-break: break-all;
+  }
+  .ws-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .ws-btn-plain {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    padding: 4px 14px;
+  }
+  .ws-btn-plain:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+  .ws-btn-primary {
+    border: 1px solid var(--brand);
+    border-radius: 4px;
+    background: var(--brand);
+    color: #fff;
+    padding: 4px 14px;
+  }
+  .ws-btn-primary:hover {
+    filter: brightness(1.1);
   }
   .spacer {
     flex: 1;

@@ -214,6 +214,8 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
 
 <style>
   .ext-panel {
+    width: var(--sidebar-w, 280px); /* E2:divider 可调,根变量统一侧栏宽 */
+    flex-shrink: 0;
     height: 100%;
     overflow: auto;
     padding: 10px;

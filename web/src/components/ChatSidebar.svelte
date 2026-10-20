@@ -80,6 +80,15 @@
     return `工作区:${parts[parts.length - 1] || workspace}`;
   }
 
+  // E1:Explorer 侧工作区切换同步(自定义事件;防两侧按钮态漂移)
+  $effect(() => {
+    const sync = () => {
+      workspace = localStorage.getItem('evo_workspace') || '';
+    };
+    window.addEventListener('evo:workspace-changed', sync);
+    return () => window.removeEventListener('evo:workspace-changed', sync);
+  });
+
   // ---- S6 输入历史召回 + 草稿持久化(对齐主流 IDE 输入框) ----
   // 空输入 ↑ 逐条召回已发送历史(0=最新),↓ 回退,至 -1 还原在途草稿;
   // 未发送草稿(含引用 chip)localStorage 持久,刷新不丢。

@@ -13,6 +13,8 @@
   import ProblemsView from './ProblemsView.svelte';
   import TerminalView from './TerminalView.svelte';
   import DebugConsoleTab from './DebugConsoleTab.svelte';
+  import Divider from './Divider.svelte';
+  import { panelHeight, setPanelHeight, PANEL_MIN, PANEL_DEFAULT } from '../lib/layout.js';
   import { taskChannelIds, taskBufferVersion, taskLines, clearTaskChannel } from '../lib/tasks.js';
 
   // tabs:标准 IDE 标配 4 + evorule 专有 3(设计输入见立项文档)
@@ -27,12 +29,9 @@
     { id: 'memory', label: '记忆', disabled: true, tip: '记忆面板在后续阶段接入' },
   ];
 
-  // 开合状态已提升为全局 store(命令面板 Ctrl+J 可切换);激活 tab 同为全局 store
-  let bodyHeight = 180; // 面板体高度(sash 拖拽可调,px)
+  // 开合状态已提升为全局 store(命令面板 Ctrl+J 可切换);激活 tab 同为全局 store。
+  // 面板体高度为全局 store(E2):钳制 120–50vh,localStorage 持久化(evo_bottom_h)。
   let listEl = null;
-
-  const MIN_H = 100;
-  const MAX_H = Math.floor(window.innerHeight * 0.6);
 
   function clickTab(t) {
     if (t.disabled) return;
@@ -43,46 +42,20 @@
     openBottomPanel(t.id);
   }
 
-  // ---- sash 拖拽调高(向上拉升/向下拉低) ----
-  let dragState = null;
-
-  function clampHeight(h) {
-    return Math.min(MAX_H, Math.max(MIN_H, Math.round(h)));
-  }
-
-  function onSashMousedown(e) {
-    dragState = { startY: e.clientY, startH: open ? bodyHeight : MIN_H };
-    window.addEventListener('mousemove', onDragMove);
-    window.addEventListener('mouseup', onDragEnd);
-    e.preventDefault();
-  }
-
-  function onDragMove(e) {
-    if (!dragState) return;
-    const delta = dragState.startY - e.clientY; // 向上拖 = 变高
-    bodyHeight = clampHeight(dragState.startH + delta);
-    panelVisible.set(true);
-  }
-
-  function onDragEnd() {
-    dragState = null;
-    window.removeEventListener('mousemove', onDragMove);
-    window.removeEventListener('mouseup', onDragEnd);
-  }
-
-  function onSashKeydown(e) {
-    if (e.key === 'ArrowUp') {
-      bodyHeight = clampHeight(($panelVisible ? bodyHeight : MIN_H) + 20);
+  // ---- sash 拖拽调高(E2 Divider 接线):向上拖(dy<0)=变高;折叠态首事件
+  //      先展开至下限;每次调整即钳制+落库。 ----
+  function onDividerResize(e) {
+    if (!$panelVisible) {
+      setPanelHeight(PANEL_MIN);
       panelVisible.set(true);
-      e.preventDefault();
-    } else if (e.key === 'ArrowDown') {
-      bodyHeight = clampHeight(($panelVisible ? bodyHeight : MIN_H) - 20);
-      panelVisible.set(true);
-      e.preventDefault();
-    } else if (e.key === 'Enter' || e.key === ' ') {
-      panelVisible.update((v) => !v);
-      e.preventDefault();
+      return;
     }
+    setPanelHeight($panelHeight - e.detail.dy);
+  }
+
+  function onDividerReset() {
+    setPanelHeight(PANEL_DEFAULT);
+    panelVisible.set(true);
   }
 
   // 事件追加时滚动到底部
@@ -140,16 +113,15 @@
 </script>
 
 <div class="bottom-panel" class:open={$panelVisible} data-zone="panel">
-  <div
-    class="sash"
-    role="separator"
-    aria-orientation="horizontal"
-    aria-expanded={$panelVisible}
-    tabindex="0"
-    title="拖拽调整面板高度"
-    onmousedown={onSashMousedown}
-    onkeydown={onSashKeydown}
-  ></div>
+  <!-- E2:编辑器↔底部面板分隔条(高 120–50vh,持久化 evo_bottom_h) -->
+  <Divider
+    orient="h"
+    title="拖拽调整面板高度;双击恢复缺省;Enter 折叠/展开"
+    toggleOnEnter
+    on:resize={onDividerResize}
+    on:reset={onDividerReset}
+    on:toggle={() => panelVisible.update((v) => !v)}
+  />
   <div class="tab-bar">
     {#each tabs as t (t.id)}
       <button
@@ -170,7 +142,7 @@
   </div>
 
   {#if $panelVisible}
-    <div class="panel-body" bind:this={listEl} style={`height:${bodyHeight}px`}>
+    <div class="panel-body" bind:this={listEl} style={`height:${$panelHeight}px`}>
       <!-- 终端视图常挂载(display 切换):切 tab 销毁会杀掉全部 PTY 会话,
            其余 tab 才走 if/else 挂载 -->
       <div class="panel-slot" style:display={$panelTab === 'terminal' ? '' : 'none'}>
@@ -260,17 +232,6 @@
     background: var(--bg-card);
     display: flex;
     flex-direction: column;
-  }
-  .sash {
-    height: 4px;
-    cursor: ns-resize;
-    background: transparent;
-    transition: background var(--tr-fast);
-  }
-  .sash:hover,
-  .sash:focus-visible {
-    background: var(--brand);
-    outline: none;
   }
   .tab-bar {
     display: flex;
