@@ -145,11 +145,15 @@ pub fn load() -> ShellConfig {
 }
 
 fn exe_dir() -> Option<PathBuf> {
-    std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
 fn app_config_dir() -> Option<PathBuf> {
-    std::env::var("APPDATA").ok().map(|d| PathBuf::from(d).join("evo-agent-desktop"))
+    std::env::var("APPDATA")
+        .ok()
+        .map(|d| PathBuf::from(d).join("evo-agent-desktop"))
 }
 
 /// 安装态优先：NSIS 资源布局（exe_dir\resources\...）存在即用之，否则回落
@@ -164,49 +168,39 @@ fn installed_or(installed: PathBuf, fallback: PathBuf) -> PathBuf {
 
 pub fn resolve(cfg: &ShellConfig) -> Result<ResolvedPaths, String> {
     let exe_dir = exe_dir().ok_or("cannot resolve current exe dir")?;
-    let evo_agent_exe = cfg
-        .paths
-        .evo_agent_exe
-        .clone()
-        .unwrap_or_else(|| {
-            installed_or(
-                exe_dir.join("resources").join("bin").join("evo-agent.exe"),
-                exe_dir.join("evo-agent.exe"),
-            )
-        });
-    let evo_agent_home = cfg
-        .paths
-        .evo_agent_home
-        .clone()
-        .unwrap_or_else(|| installed_or(exe_dir.join("resources").join("evo-agent"), exe_dir.clone()));
-    let evorule_server_exe = cfg
-        .paths
-        .evorule_server_exe
-        .clone()
-        .unwrap_or_else(|| {
-            installed_or(
-                exe_dir.join("resources").join("bin").join("evorule-server.exe"),
-                exe_dir.join("evorule-server.exe"),
-            )
-        });
-    let evorule_server_home = cfg
-        .paths
-        .evorule_server_home
-        .clone()
-        .unwrap_or_else(|| installed_or(
+    let evo_agent_exe = cfg.paths.evo_agent_exe.clone().unwrap_or_else(|| {
+        installed_or(
+            exe_dir.join("resources").join("bin").join("evo-agent.exe"),
+            exe_dir.join("evo-agent.exe"),
+        )
+    });
+    let evo_agent_home = cfg.paths.evo_agent_home.clone().unwrap_or_else(|| {
+        installed_or(exe_dir.join("resources").join("evo-agent"), exe_dir.clone())
+    });
+    let evorule_server_exe = cfg.paths.evorule_server_exe.clone().unwrap_or_else(|| {
+        installed_or(
+            exe_dir
+                .join("resources")
+                .join("bin")
+                .join("evorule-server.exe"),
+            exe_dir.join("evorule-server.exe"),
+        )
+    });
+    let evorule_server_home = cfg.paths.evorule_server_home.clone().unwrap_or_else(|| {
+        installed_or(
             exe_dir.join("resources").join("evorule-server"),
             exe_dir.clone(),
-        ));
-    let ai_plugin_exe = cfg
-        .paths
-        .ai_plugin_exe
-        .clone()
-        .unwrap_or_else(|| {
-            installed_or(
-                exe_dir.join("resources").join("bin").join("evorule-ai-plugin.exe"),
-                exe_dir.join("evorule-ai-plugin.exe"),
-            )
-        });
+        )
+    });
+    let ai_plugin_exe = cfg.paths.ai_plugin_exe.clone().unwrap_or_else(|| {
+        installed_or(
+            exe_dir
+                .join("resources")
+                .join("bin")
+                .join("evorule-ai-plugin.exe"),
+            exe_dir.join("evorule-ai-plugin.exe"),
+        )
+    });
 
     // 数据根用 identifier（与 NSIS currentUser 安装目录 %LOCALAPPDATA%\{productName} 隔离，
     // 防卸载危及用户数据）

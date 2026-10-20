@@ -17,14 +17,13 @@ mod orchestrator;
 mod shell_config;
 mod supervisor;
 mod update;
+mod wizard;
 
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use tauri::{
-    Manager, RunEvent, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
-};
+use tauri::{Manager, RunEvent, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_single_instance::init as single_instance_init;
 
 use supervisor::Supervisor;
@@ -49,9 +48,7 @@ pub(crate) fn percent_encode(s: &str) -> String {
 /// 工作台 token 注入脚本（每次文档创建执行；JSON 字符串字面量即合法 JS 字面量）。
 fn init_script(token: &str) -> String {
     let lit = serde_json::to_string(token).unwrap_or_default();
-    format!(
-        "try{{localStorage.setItem('evo_agent_token',{lit});}}catch(e){{}}"
-    )
+    format!("try{{localStorage.setItem('evo_agent_token',{lit});}}catch(e){{}}")
 }
 
 /// 导航白名单：壳内置页（tauri.localhost）与工作台（127.0.0.1:{serve_port}）；
@@ -164,7 +161,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .invoke_handler(tauri::generate_handler![
             restart_services,
             open_logs_dir,
-            check_updates
+            check_updates,
+            wizard::wizard_key_status,
+            wizard::wizard_save_key,
+            wizard::wizard_finish
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -175,13 +175,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executor_token = orchestrator::gen_token();
 
             // 窗口尺寸记忆：缺省 1280×800，最小 960×600
-            let mut builder = WebviewWindowBuilder::new(
-                &handle,
-                "main",
-                WebviewUrl::App("index.html".into()),
-            )
-            .title("evo-agent")
-            .min_inner_size(960.0, 600.0);
+            let mut builder =
+                WebviewWindowBuilder::new(&handle, "main", WebviewUrl::App("index.html".into()))
+                    .title("evo-agent")
+                    .min_inner_size(960.0, 600.0);
             builder = match load_window_state(&paths) {
                 Some(ws) if ws.w >= 960.0 && ws.h >= 600.0 => {
                     builder.inner_size(ws.w, ws.h).position(ws.x, ws.y)
@@ -234,12 +231,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             // 托盘：打开主窗 / 重启服务 / 打开数据目录 / 检查更新 / 退出
             use tauri::menu::{MenuBuilder, MenuItem};
-            let mk = |id: &str, label: &str| {
-                MenuItem::with_id(app, id, label, true, None::<&str>)
-            };
+            let mk = |id: &str, label: &str| MenuItem::with_id(app, id, label, true, None::<&str>);
             let menu = MenuBuilder::new(app)
                 .item(&mk("open", "打开主窗")?)
                 .item(&mk("restart", "重启服务")?)
+                .item(&mk("llm-key", "LLM 凭据…")?)
                 .item(&mk("data", "打开数据目录")?)
                 .item(&mk("check-update", "检查更新")?)
                 .separator()
@@ -269,18 +265,29 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         "data" => open_in_explorer(&sup.paths.data_dir),
+                        "llm-key" => {
+                            if let Err(e) = wizard::open_wizard(app) {
+                                eprintln!("[shell] open wizard: {e}");
+                            }
+                        }
                         "check-update" => {
                             let app_h = app.clone();
                             let sup = sup_for_tray.clone();
-                            std::thread::spawn(move || {
-                                update::run_update_flow(&app_h, &sup, true)
-                            });
+                            std::thread::spawn(move || update::run_update_flow(&app_h, &sup, true));
                         }
                         "quit" => sup.shutdown(),
                         _ => {}
                     }
                 })
                 .build(app)?;
+
+            // 首启向导：key 未配置 且 向导从未完成 → 弹向导窗（主窗继续启动链，
+            // 保存 key 后可经向导内「立即生效」调 restart_services 热启用 LLM 面）
+            if wizard::first_run_pending(&paths) {
+                if let Err(e) = wizard::open_wizard(&handle) {
+                    eprintln!("[shell] first-run wizard: {e}");
+                }
+            }
 
             sup.start();
 
@@ -295,9 +302,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     std::thread::sleep(std::time::Duration::from_secs(90));
                     loop {
                         update::run_update_flow(&app_for_update, &sup_for_update, false);
-                        std::thread::sleep(std::time::Duration::from_secs(
-                            interval_hours * 3600,
-                        ));
+                        std::thread::sleep(std::time::Duration::from_secs(interval_hours * 3600));
                     }
                 });
             }
