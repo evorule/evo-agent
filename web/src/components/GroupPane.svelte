@@ -8,7 +8,7 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
   import { onMount, onDestroy, tick } from 'svelte';
   import { get } from 'svelte/store';
   import { setupMonaco, monaco } from '../lib/monaco-setup.js';
-  import { saveTab, markDirty, markSaved, tabs, closeTab, ensureTabOpen } from '../lib/stores.js';
+  import { saveTab, markDirty, markSaved, tabs, closeTab, ensureTabOpen, publishCursor } from '../lib/stores.js';
   import { settingsState } from '../lib/settings.js';
   import {
     groupOpenPath,
@@ -130,6 +130,7 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
     }
     currentPath = path;
     editor.setModel(model);
+    publishCursor(editor); // F1 状态栏:切 model 后光标位兜底发布
     const vs = viewStates.get(path);
     if (vs) editor.restoreViewState(vs);
     editor.focus();
@@ -219,6 +220,8 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
         markDirty(path, model.getValue() !== getBaseline(path));
       }
     });
+    // F1 状态栏:光标移动即发布行列/语言(焦点编辑器事件,天然只反映当前焦点实例)
+    editor.onDidChangeCursorPosition(() => publishCursor(editor));
     hostReady = true;
     if (group.activePath) openInGroup(group.activePath);
   });

@@ -28,6 +28,7 @@
     approvalPresetView,
   } from '../lib/approval.js';
   import { orderSessionsWithLineage } from '../lib/orchestration.js';
+  import { push as pushNotification } from '../lib/notifications.js';
   import { onMount, onDestroy, tick } from 'svelte';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
   import { collectCandidates, MENTION_GROUP_LABELS, estimateComposerTokens, tokenLevel } from '../lib/mentions.js';
@@ -198,6 +199,7 @@
         attachments = attachments.map((a) =>
           a.id === id ? { id, name: res.name || f.name, path: res.path, size: res.size, mime: res.mime } : a
         );
+        pushNotification('info', '附件上传完成', `${res.path || f.name}`);
       } catch (e) {
         attachments = attachments.map((a) =>
           a.id === id ? { id, name: f.name, error: String(e?.message || e) } : a
@@ -267,6 +269,7 @@
       modelMenuOpen = false;
     } catch (e) {
       modelErr = String(e?.message || e);
+      pushNotification('err', '模型切换失败', modelErr);
     } finally {
       modelBusy = false;
     }

@@ -17,6 +17,7 @@
     openFile,
   } from '../lib/stores.js';
   import { openSession } from '../lib/ws.js';
+  import { push as pushNotification } from '../lib/notifications.js';
   import { listCommands, executeCommand } from '../lib/commands.js';
   import { setContextKey } from '../lib/context-keys.js';
   import { fuzzyMatch, highlightSegments } from '../lib/fuzzy.js';
@@ -36,7 +37,6 @@
   let inputEl = null;
   let listEl = null;
   let composing = false; // IME 组合中:Enter 不触发选择
-  let execError = '';
   let restoreFocusEl = null;
   let wasOpen = false;
 
@@ -55,7 +55,6 @@
       wasOpen = true;
       query = '';
       activeIndex = 0;
-      execError = '';
       restoreFocusEl = document.activeElement;
       setContextKey('inPalette', true);
       document.addEventListener('keydown', trapTab, true);
@@ -245,9 +244,8 @@
       try {
         executeCommand(item.cmd.id);
       } catch (e) {
-        // 面板已关,错误就地可见(顶栏事件流水是治理事件,不混用)
-        execError = String(e?.message || e);
-        setTimeout(() => (execError = ''), 4000);
+        // 面板已关,错误走通知中心右下 toast(顶栏事件流水是治理事件,不混用)
+        pushNotification('err', '命令执行失败', String(e?.message || e));
       }
     } else if (item.kind === 'session') {
       openSession(item.session.session_id);
@@ -428,9 +426,6 @@
     </div>
   </div>
 {/if}
-{#if execError}
-  <div class="palette-toast" role="alert">{execError}</div>
-{/if}
 
 <style>
   .palette-overlay {
@@ -529,19 +524,5 @@
     padding: var(--sp-md);
     color: var(--text-muted);
     font-size: var(--fs-sm);
-  }
-  .palette-toast {
-    position: fixed;
-    left: 50%;
-    bottom: 40px;
-    transform: translateX(-50%);
-    background: var(--bg-card);
-    border: 1px solid var(--danger);
-    border-radius: var(--r-md);
-    color: var(--danger);
-    font-size: var(--fs-xs);
-    padding: var(--sp-xs) var(--sp-md);
-    box-shadow: var(--sh-modal);
-    z-index: 301;
   }
 </style>
