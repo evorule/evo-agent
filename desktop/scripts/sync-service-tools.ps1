@@ -9,11 +9,17 @@
 #   缺省   = 再生成 desktop\templates\evo-agent.toml 的 service_tools 段（排序去重）
 #   -Check = 只校验不落盘：漂移即 exit 1（清单漂移构建必红，杜绝复发）
 param(
-    [string]$ServerRepo = "D:\evorule-server",
+    # 缺省=本仓同级的 evorule-server 目录（与 build-installer.ps1 同款解析）
+    [string]$ServerRepo = "",
     [switch]$Check
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $ServerRepo) {
+    $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+    $ServerRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-server"
+}
 
 $templatePath = Join-Path $PSScriptRoot "..\templates\evo-agent.toml"
 if (-not (Test-Path $templatePath)) {
