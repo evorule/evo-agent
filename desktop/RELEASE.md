@@ -28,6 +28,10 @@
    - 本仓 `target\release\evo-agent.exe`（`cargo build --release`）
 3. 前端产物在位：`npm --prefix web run build`（cargo build 不含前端构建——
    安装包内的 web/dist 以收集时刻磁盘实况为准，忘跑=装旧前端）。
+4. **新鲜度与干净度由 build-installer 自动校验**（`scripts/check-build-freshness.ps1`）：
+   每笔预构建产物必须**晚于**其源码树的最后提交（发行纪律=先定稿提交、再
+   release 重建），相关仓不得有未提交的已跟踪改动。陈旧/脏树即构建红——
+   这道门把「推了代码忘重建=安装包静默装旧 bits」从事后教训变成构建期拦截。
 
 ## 构建与发布步骤
 

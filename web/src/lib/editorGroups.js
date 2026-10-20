@@ -137,6 +137,11 @@ export function groupRemovePath(id, path) {
   );
 }
 
+/** 拖拽调宽(E2 divider):按 id 设定副组宽度(百分比字符串);持久化随 setGroups */
+export function setGroupWidth(id, width) {
+  setGroups(get(secondaryGroups).map((g) => (g.id === id ? { ...g, width } : g)));
+}
+
 /** 均分副组宽度(主组 flex:1 占余;N 副+主 → 每副 1/(N+1)) */
 export function evenWidths() {
   const groups = get(secondaryGroups);
