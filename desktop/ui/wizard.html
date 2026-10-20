@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>evo-agent 首次配置</title>
+    <style>
+      :root {
+        color-scheme: light;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+        font-size: 13px;
+        color: #1c2b3a;
+        background: #f5f7fa;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        padding: 18px 24px 12px;
+        border-bottom: 1px solid #e3e8ee;
+        background: #fff;
+      }
+      header h1 {
+        margin: 0 0 4px;
+        font-size: 16px;
+      }
+      header p {
+        margin: 0;
+        color: #64748b;
+      }
+      main {
+        flex: 1;
+        overflow: auto;
+        padding: 18px 24px;
+      }
+      .step {
+        display: none;
+      }
+      .step.active {
+        display: block;
+      }
+      .step h2 {
+        font-size: 14px;
+        margin: 0 0 8px;
+      }
+      .step .hint {
+        color: #64748b;
+        line-height: 1.6;
+        margin: 0 0 12px;
+      }
+      .key-row {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+      input[type="password"],
+      input[type="text"] {
+        flex: 1;
+        padding: 8px 10px;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        font-size: 13px;
+        font-family: Consolas, monospace;
+      }
+      input:focus {
+        outline: 2px solid #3fae4e33;
+        border-color: #3fae4e;
+      }
+      .btn {
+        padding: 8px 16px;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        background: #fff;
+        color: #334155;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .btn.primary {
+        background: #2f8f46;
+        border-color: #2f8f46;
+        color: #fff;
+      }
+      .btn.primary:hover {
+        background: #277a3b;
+      }
+      .btn:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+      .msg {
+        min-height: 18px;
+        margin: 6px 0 0;
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      .msg.err {
+        color: #c0392b;
+      }
+      .msg.ok {
+        color: #2f8f46;
+      }
+      .status-card {
+        border: 1px solid #e3e8ee;
+        border-radius: 8px;
+        background: #fff;
+        padding: 12px 14px;
+        margin-bottom: 12px;
+        line-height: 1.7;
+      }
+      .status-card b {
+        color: #1c2b3a;
+      }
+      .status-card code {
+        font-family: Consolas, monospace;
+        font-size: 12px;
+        background: #eef2f6;
+        padding: 1px 5px;
+        border-radius: 4px;
+        word-break: break-all;
+      }
+      .ok-mark {
+        color: #2f8f46;
+        font-weight: 600;
+      }
+      .no-mark {
+        color: #c0392b;
+        font-weight: 600;
+      }
+      footer {
+        padding: 14px 24px;
+        border-top: 1px solid #e3e8ee;
+        background: #fff;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+      }
+      .foot-note {
+        color: #94a3b8;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>欢迎使用 evo-agent</h1>
+      <p>首次配置只需一分钟；本向导可随时从托盘菜单「LLM 凭据…」重新打开。</p>
+    </header>
+    <main>
+      <!-- 步骤 1：LLM 凭据 -->
+      <section class="step active" id="step-key">
+        <h2>① LLM 凭据</h2>
+        <p class="hint">
+          粘贴你的模型服务 API Key（如 MiniMax）。凭据将以 Windows
+          凭据保护（DPAPI）加密后保存在本机用户目录，仅本 Windows
+          账户可读；不会经过工作台页面，也不会写入日志。没有 Key 可先跳过，
+          之后仍可使用非对话功能。
+        </p>
+        <div class="key-row">
+          <input
+            id="key-input"
+            type="password"
+            placeholder="sk-…"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button class="btn" id="toggle-visibility" type="button">显示</button>
+        </div>
+        <p class="msg" id="key-msg"></p>
+      </section>
+
+      <!-- 步骤 2：完成摘要 -->
+      <section class="step" id="step-done">
+        <h2>② 配置摘要</h2>
+        <div class="status-card" id="summary-card">读取中…</div>
+        <p class="hint">
+          服务会在后台就绪；若刚保存凭据，点击「立即生效」重启服务组即可启用对话能力，无需重启应用。
+          工作目录等进阶配置见安装目录下的 evo-agent.toml 与壳配置 shell.toml。
+        </p>
+        <p class="msg" id="done-msg"></p>
+      </section>
+    </main>
+    <footer>
+      <span class="foot-note" id="foot-note"></span>
+      <span>
+        <button class="btn" id="btn-skip" type="button">跳过</button>
+        <button class="btn primary" id="btn-main" type="button" disabled>
+          保存并继续
+        </button>
+      </span>
+    </footer>
+    <script>
+      const invoke = window.__TAURI__?.core?.invoke;
+      const $ = (id) => document.getElementById(id);
+      const keyInput = $("key-input");
+      const keyMsg = $("key-msg");
+      const btnMain = $("btn-main");
+      const btnSkip = $("btn-skip");
+      let saved = false; // 本轮已成功保存（防重复提交）
+
+      function setMsg(el, text, kind) {
+        el.textContent = text || "";
+        el.className = "msg" + (kind ? " " + kind : "");
+      }
+
+      // 主按钮语义随状态切换：步骤1=保存并继续；步骤2=立即生效
+      function gotoStep(step) {
+        document
+          .querySelectorAll(".step")
+          .forEach((s) => s.classList.remove("active"));
+        $(step).classList.add("active");
+        if (step === "step-done") loadSummary();
+      }
+
+      async function loadSummary() {
+        const card = $("summary-card");
+        try {
+          const st = await invoke("wizard_key_status");
+          const keyLine = st.configured
+            ? `<span class="ok-mark">已配置</span>（尾 4 位 <b>${escapeHtml(st.tail4)}</b>）`
+            : '<span class="no-mark">未配置</span>——对话能力停用，其余功能照常';
+          card.innerHTML =
+            `<b>LLM 凭据：</b>${keyLine}<br/>` +
+            `<b>凭据文件：</b><code>${escapeHtml(st.key_file)}</code>`;
+          btnMain.textContent = st.configured ? "立即生效" : "进入 evo-agent";
+          $("foot-note").textContent = st.configured
+            ? "「立即生效」将重启服务组并启用对话能力。"
+            : "可稍后在托盘菜单「LLM 凭据…」补配。";
+        } catch (e) {
+          card.textContent = "读取状态失败：" + e;
+        }
+      }
+
+      function escapeHtml(s) {
+        return String(s ?? "").replace(/[&<>"']/g, (c) =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+        );
+      }
+
+      $("toggle-visibility").addEventListener("click", () => {
+        const show = keyInput.type === "password";
+        keyInput.type = show ? "text" : "password";
+        $("toggle-visibility").textContent = show ? "隐藏" : "显示";
+      });
+
+      keyInput.addEventListener("input", () => {
+        if (saved) {
+          saved = false;
+          btnMain.textContent = "保存并继续";
+          setMsg(keyMsg, "");
+        }
+        btnMain.disabled = keyInput.value.trim().length === 0;
+      });
+
+      btnMain.addEventListener("click", async () => {
+        if (!saved) {
+          // 步骤 1：保存凭据
+          btnMain.disabled = true;
+          btnSkip.disabled = true;
+          try {
+            await invoke("wizard_save_key", { key: keyInput.value });
+            saved = true;
+            setMsg(keyMsg, "凭据已加密保存。", "ok");
+            gotoStep("step-done");
+          } catch (e) {
+            setMsg(keyMsg, String(e), "err");
+          } finally {
+            btnMain.disabled = false;
+            btnSkip.disabled = false;
+          }
+          return;
+        }
+        // 步骤 2：按摘要语义二分
+        btnMain.disabled = true;
+        try {
+          if (btnMain.textContent === "立即生效") {
+            setMsg($("done-msg"), "正在重启服务组…");
+            await invoke("restart_services");
+            setMsg($("done-msg"), "服务组已重启，对话能力已启用。", "ok");
+            btnMain.textContent = "完成";
+          } else {
+            await finishAndClose();
+          }
+        } catch (e) {
+          setMsg($("done-msg"), String(e), "err");
+        } finally {
+          btnMain.disabled = false;
+        }
+      });
+
+      async function finishAndClose() {
+        try {
+          await invoke("wizard_finish");
+        } catch (e) {
+          // 完成标记写失败不阻断退出（下次可能再弹向导，fail-soft）
+          console.warn("wizard_finish:", e);
+        }
+        window.__TAURI__?.window?.getCurrentWindow?.()?.close?.();
+      }
+
+      btnSkip.addEventListener("click", finishAndClose);
+      keyInput.focus();
+    </script>
+  </body>
+</html>

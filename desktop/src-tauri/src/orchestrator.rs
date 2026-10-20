@@ -133,9 +133,12 @@ fn write_runtime_config(
 ) -> Result<(), String> {
     let path = runtime_dir.join("evo-agent.toml");
 
-    let base = [home.join("evo-agent.toml"), app_config_dir.join("evo-agent.toml")]
-        .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok());
+    let base = [
+        home.join("evo-agent.toml"),
+        app_config_dir.join("evo-agent.toml"),
+    ]
+    .iter()
+    .find_map(|p| std::fs::read_to_string(p).ok());
 
     let mut table: toml::Table = match &base {
         Some(s) => match toml::from_str(s) {
@@ -177,7 +180,11 @@ fn write_runtime_config(
                 }
             }
             None => {
-                writeln!(log, "[orch] console.enabled=true but console.dir empty; skipped").ok();
+                writeln!(
+                    log,
+                    "[orch] console.enabled=true but console.dir empty; skipped"
+                )
+                .ok();
             }
         }
     }
@@ -225,7 +232,12 @@ fn spawn_engine(ctx: &LaunchContext, engine_port: u16) -> Result<Child, String> 
             &format!("127.0.0.1:{engine_port}"),
             "--core-eval",
         ])
-        .arg(paths.evorule_server_home.join("resources").join("server_eval.json"))
+        .arg(
+            paths
+                .evorule_server_home
+                .join("resources")
+                .join("server_eval.json"),
+        )
         .args(["--rules-dir"])
         .arg(paths.evorule_server_home.join("rules"))
         .args(["--db-path"])
@@ -296,13 +308,11 @@ fn spawn_serve(
     Ok(serve)
 }
 
-/// 用户 LLM key 文件（app_config_dir\llm-key.txt，单行 trim）。
+/// 用户 LLM key（app_config_dir\llm-key.txt，单行 trim）。
+/// 密文形态 `dpapi1:<hex>` 走 DPAPI 解密（向导批），无前缀按存量明文兼容；
 /// 读出后仅以 env 注入执行体进程：不进日志/不进命令行/不落 runtime 产物。
 fn read_llm_key(paths: &ResolvedPaths) -> Option<String> {
-    std::fs::read_to_string(paths.app_config_dir.join("llm-key.txt"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    crate::wizard::read_llm_key(paths)
 }
 
 /// 壳生成的执行体运行时配置（每次拉起覆写）。动态值——监听端口/引擎地址/
@@ -379,9 +389,7 @@ fn spawn_ai_plugin(
         .stdout(Stdio::from(out_log))
         .stderr(Stdio::from(err_log))
         .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn ai-plugin: {e}"))?;
+    let child = cmd.spawn().map_err(|e| format!("spawn ai-plugin: {e}"))?;
     if !ctx.self_assigned {
         ctx.job.assign_pid(child.id());
     }
@@ -554,9 +562,15 @@ pub fn graceful_stop(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    if let Some(c) = engine { let _ = c.kill(); }
-    if let Some(c) = serve { let _ = c.kill(); }
-    if let Some(c) = ai_plugin { let _ = c.kill(); }
+    if let Some(c) = engine {
+        let _ = c.kill();
+    }
+    if let Some(c) = serve {
+        let _ = c.kill();
+    }
+    if let Some(c) = ai_plugin {
+        let _ = c.kill();
+    }
 }
 
 #[cfg(test)]
@@ -564,7 +578,8 @@ mod tests {
     use super::*;
 
     fn scratch_paths(tag: &str) -> ResolvedPaths {
-        let root = std::env::temp_dir().join(format!("evo-shell-orch-test-{tag}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("evo-shell-orch-test-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(root.join("runtime")).unwrap();
         std::fs::create_dir_all(root.join("app-config")).unwrap();
         ResolvedPaths {
@@ -588,8 +603,7 @@ mod tests {
     fn ai_plugin_config_carries_dynamic_values_and_no_secrets() {
         let paths = scratch_paths("cfg");
         write_ai_plugin_config(&paths, 19131, 18080).unwrap();
-        let raw =
-            std::fs::read_to_string(paths.runtime_dir.join("ai-plugin.json")).unwrap();
+        let raw = std::fs::read_to_string(paths.runtime_dir.join("ai-plugin.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["listen_addr"], "127.0.0.1:19131");
         assert_eq!(v["server_base_url"], "http://127.0.0.1:18080");

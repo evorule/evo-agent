@@ -237,7 +237,9 @@ impl Supervisor {
             self.log_line("[guard] llm-executor exited; solo respawn");
             self.spawn_executor_restart();
         } else {
-            self.log_line("[guard] llm-executor crash limit reached; LLM disabled until services restart");
+            self.log_line(
+                "[guard] llm-executor crash limit reached; LLM disabled until services restart",
+            );
         }
     }
 
@@ -332,7 +334,10 @@ impl Supervisor {
         };
         match decision {
             Decision::Restart => {
-                self.log_line(&format!("[guard] {} exited; auto group restart", kind.name()));
+                self.log_line(&format!(
+                    "[guard] {} exited; auto group restart",
+                    kind.name()
+                ));
                 self.spawn_restart();
             }
             Decision::Degrade => {

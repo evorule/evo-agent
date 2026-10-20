@@ -92,9 +92,7 @@ fn run_inner(app: &AppHandle, sup: &Arc<Supervisor>, manual: bool) -> Result<(),
     let sup_for_exit = sup.clone();
     builder = builder.on_before_exit(Box::new(move || sup_for_exit.stop_for_update()));
     builder = builder.timeout(CHECK_TIMEOUT);
-    let updater = builder
-        .build()
-        .map_err(|e| format!("init updater: {e}"))?;
+    let updater = builder.build().map_err(|e| format!("init updater: {e}"))?;
 
     // 检查：None = 无新版（插件内置 semver 比较已拒绝 ≤ 当前版本）
     let update = tauri::async_runtime::block_on(updater.check())
@@ -118,7 +116,10 @@ fn run_inner(app: &AppHandle, sup: &Arc<Supervisor>, manual: bool) -> Result<(),
     } else {
         format!("\n\n更新说明：{}", notes)
     };
-    log_line(&shell_log, &format!("[update] new version {remote} available"));
+    log_line(
+        &shell_log,
+        &format!("[update] new version {remote} available"),
+    );
 
     if !manual {
         // 自动场景先发托盘气泡（fail-soft），随后原生确认对话框
@@ -131,9 +132,7 @@ fn run_inner(app: &AppHandle, sup: &Arc<Supervisor>, manual: bool) -> Result<(),
     }
     let confirmed = app
         .dialog()
-        .message(format!(
-            "发现新版 v{remote}：{notes_line}是否下载并安装？"
-        ))
+        .message(format!("发现新版 v{remote}：{notes_line}是否下载并安装？"))
         .title("evo-agent 更新")
         .buttons(MessageDialogButtons::OkCancelCustom(
             "立即更新".into(),
@@ -149,10 +148,8 @@ fn run_inner(app: &AppHandle, sup: &Arc<Supervisor>, manual: bool) -> Result<(),
     log_line(&shell_log, &format!("[update] installing v{remote}"));
     // 下载 + 验签 + 启动 NSIS 安装器 + 退出本进程（on_before_exit 已挂优雅停）；
     // 成功路径不会返回，走到 Err 分支说明下载/启动安装器失败
-    let result = tauri::async_runtime::block_on(update.download_and_install(
-        |_chunk, _total| {},
-        || {},
-    ));
+    let result =
+        tauri::async_runtime::block_on(update.download_and_install(|_chunk, _total| {}, || {}));
     // 失败恢复托盘 tooltip，报错留痕（壳照常运行）
     set_tray_tooltip(app, "evo-agent");
     result.map_err(|e| format!("download/install failed: {e}"))
