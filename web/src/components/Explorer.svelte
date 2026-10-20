@@ -6,7 +6,8 @@
      右键菜单 / 删除确认 / 折叠持久化 / WS fs_events 增量刷新 / tabs 联动 /
      拖拽移动(目录节点与根区可放置)。 -->
 <script>
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import { get } from 'svelte/store';
   import { listDir, createFile, moveFile, deleteFile } from '../lib/api.js';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
   import { reconnectCurrent } from '../lib/ws.js';
@@ -26,9 +27,11 @@
     fsEvents,
     connStatus,
     gitStatus,
+    pendingTreeReveal,
   } from '../lib/stores.js';
   import ContextMenu from './ContextMenu.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
+  import OutlinePanel from './OutlinePanel.svelte';
 
   // ---- git 状态字母装饰(B3) ----
   // 单状态源 $gitStatus;exact 命中文件条目,折叠目录条目(尾 `/`)前缀命中其
@@ -464,6 +467,63 @@
   }
 
   // =========================================================================
+  // H2 文件树定位(面包屑/命令共用的 pendingTreeReveal 一次性信号):
+  // 逐级展开祖先目录 → 滚动定位 + 闪烁;树根可能锚定在工作区子目录(E1),
+  // 树外路径不定位。消费即清,onMount 也探一次(组件未挂载时设下的信号)。
+  // =========================================================================
+
+  let treeEl = null;
+  let flashPath = null; // 定位闪烁的节点路径(1.5s 自动清)
+  let flashTimer = null;
+
+  /** 工作区路径 → 树内路径(锚点换算);null = 树外 */
+  function toTreePath(p) {
+    if (!p) return '';
+    if (!anchor) return p;
+    if (p === anchor) return '';
+    if (p.startsWith(`${anchor}/`)) return p.slice(anchor.length + 1);
+    return null;
+  }
+
+  async function revealInTree(target) {
+    try {
+      const segs = target ? target.split('/').filter(Boolean) : [];
+      let acc = '';
+      for (const seg of segs) {
+        acc = acc ? `${acc}/${seg}` : seg;
+        const st = dirState.get(acc);
+        if (!st?.loaded) await loadChildren(acc);
+        dirState.set(acc, { ...dirState.get(acc), expanded: true });
+      }
+      rootChildren = dirState.get(anchor)?.children || [];
+      persistExpanded();
+      rebuild();
+      await tick();
+      const esc =
+        typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(target) : target.replace(/"/g, '');
+      const el = treeEl?.querySelector(`[data-tree-path="${esc}"]`);
+      if (el) {
+        el.scrollIntoView({ block: 'center' });
+        flashPath = target;
+        clearTimeout(flashTimer);
+        flashTimer = setTimeout(() => (flashPath = null), 1500);
+      }
+    } catch {
+      /* 目录加载失败(树外/瞬态):树态保持,不阻断 */
+    }
+  }
+
+  async function consumeTreeReveal(sig) {
+    if (!sig?.path) return;
+    pendingTreeReveal.set(null);
+    const target = toTreePath(sig.path);
+    if (target === null) return;
+    await revealInTree(target);
+  }
+
+  $: consumeTreeReveal($pendingTreeReveal);
+
+  // =========================================================================
   // E1 工作区:建树/重连刷新 + 下拉菜单 + 切换对话框
   // =========================================================================
 
@@ -655,6 +715,9 @@
     ];
     for (const c of commands) registerCommand(c);
     await initTree();
+    // H2:组件未挂载期间设下的定位信号(侧栏在别的视图时)挂载后补消费
+    const staleReveal = get(pendingTreeReveal);
+    if (staleReveal) consumeTreeReveal(staleReveal);
     // fs_events 一次性信号订阅:消费后置 null
     const unsubFs = fsEvents.subscribe((ev) => {
       if (!ev) return;
@@ -736,7 +799,7 @@
   {#if loadError}
     <div class="error">加载失败:{loadError}</div>
   {:else}
-    <div class="tree" role="tree">
+    <div class="tree" role="tree" bind:this={treeEl}>
       {#if naming && naming.mode !== 'rename' && naming.anchor === anchor}
         <div class="node naming" style="padding-left: 10px">
           <input
@@ -757,6 +820,8 @@
           class="node {node.kind}"
           class:selected={selected && selected.path === node.path}
           class:drop-target={dragOverPath === node.path}
+          class:flash={flashPath === node.path}
+          data-tree-path={node.path}
           style="padding-left: {10 + depth * 14}px"
           role="treeitem"
           aria-selected={node.kind === 'file' && node.path === $activePath}
@@ -830,6 +895,8 @@
       {/if}
     </div>
   {/if}
+  <!-- H3 大纲面板:视图下方折叠段(随 explorer 视图显隐) -->
+  <OutlinePanel />
 </div>
 
 {#if menu}
@@ -1121,6 +1188,22 @@
     outline: 1px dashed var(--brand);
     outline-offset: -1px;
     background: var(--brand-bg);
+  }
+  /* H2:定位闪烁(面包屑/命令跳目录时 1.5s 渐隐) */
+  .node.flash {
+    animation: tree-flash 1.5s ease-out;
+  }
+  @keyframes tree-flash {
+    0%,
+    35% {
+      background: var(--brand-bg);
+      outline: 1px solid var(--brand);
+      outline-offset: -1px;
+    }
+    100% {
+      background: transparent;
+      outline: none;
+    }
   }
   .workdir.drop-root {
     outline: 1px dashed var(--brand);

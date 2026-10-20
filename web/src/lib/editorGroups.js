@@ -8,6 +8,7 @@
 // tab 只摘本组成员;全局最后一个引用才真正关 tab(防孤儿 model)。
 
 import { writable, get } from 'svelte/store';
+import { tabs, openFile, closeTab } from './stores.js';
 
 /** 副组列表:[{id, paths:[], activePath, width}](width 为百分比字符串) */
 export const secondaryGroups = writable([]);
@@ -148,6 +149,70 @@ export function evenWidths() {
   if (!groups.length) return;
   const w = `${Math.round(100 / (groups.length + 1))}%`;
   setGroups(groups.map((g) => ({ ...g, width: w })));
+}
+
+// ---- H1 tab 拖拽:组内重排 + 落点分发 ----
+
+/** 纯重排:摘 fromIndex 元素插到 toIndex(越界收拢到有效区间;同位返回副本) */
+export function reorderedPaths(list, fromIndex, toIndex) {
+  if (!Array.isArray(list)) return list;
+  const out = list.slice();
+  if (out.length === 0) return out;
+  const from = Math.max(0, Math.min(fromIndex, out.length - 1));
+  const to = Math.max(0, Math.min(toIndex, out.length - 1));
+  if (from === to) return out;
+  const [item] = out.splice(from, 1);
+  out.splice(to, 0, item);
+  return out;
+}
+
+/** 主组 tab 面重排(主组无 paths 成员概念,顺序 = 全局 tabs 顺序;不动激活) */
+export function reorderTab(path, toIndex) {
+  if (!path) return;
+  tabs.update((list) => {
+    const from = list.findIndex((t) => t.path === path);
+    if (from === -1) return list;
+    const to = Number.isInteger(toIndex) ? toIndex : list.length - 1;
+    return reorderedPaths(list, from, to);
+  });
+}
+
+/** 副组组内 tab 重排(不改激活态;path 不在组内为无操作) */
+export function moveTabWithinSecondary(id, path, toIndex) {
+  setGroups(
+    get(secondaryGroups).map((g) => {
+      if (g.id !== id) return g;
+      const from = g.paths.indexOf(path);
+      if (from === -1) return g;
+      const to = Math.max(0, Math.min(Number.isInteger(toIndex) ? toIndex : g.paths.length - 1, g.paths.length - 1));
+      if (to === from) return g;
+      return { ...g, paths: reorderedPaths(g.paths, from, to) };
+    }),
+  );
+}
+
+/** tab 拖拽落点分发(主组/副组统一入口):同组重排;跨组移动语义与
+ *  view.moveTabToNextGroup 命令一致——主组→副组 = 副组登记 + 主组关 tab;
+ *  副组→主组 = 摘成员 + 全局激活;副组→副组 = 摘源 + 目标组打开+落位。 */
+export function dispatchTabDrop(fromId, path, toId, toIndex) {
+  if (!path || !toId) return;
+  if (fromId === toId) {
+    if (toId === 'primary') reorderTab(path, toIndex);
+    else moveTabWithinSecondary(toId, path, toIndex);
+    return;
+  }
+  if (fromId === 'primary') {
+    groupOpenPath(toId, path);
+    closeTab(path);
+    return;
+  }
+  groupRemovePath(fromId, path);
+  if (toId === 'primary') {
+    openFile(path);
+  } else {
+    groupOpenPath(toId, path);
+    moveTabWithinSecondary(toId, path, toIndex);
+  }
 }
 
 // ---- 持久化(组结构+成员路径+激活 id;仅路径元数据,零内容/零敏感) ----

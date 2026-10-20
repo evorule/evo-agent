@@ -15,7 +15,9 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
     groupClosePath,
     groupFocusSignal,
     activeGroupId,
+    dispatchTabDrop,
   } from '../lib/editorGroups.js';
+  import Breadcrumbs from './Breadcrumbs.svelte';
   import {
     getModelForPath,
     hasModel,
@@ -174,6 +176,38 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
     groupFocusSignal.update((s) => ({ id: group.id, n: s.n + 1 }));
   }
 
+  // ---- H1 tab 拖拽:同组重排 + 跨组移动(dispatchTabDrop 统一分发) ----
+  let dragFrom = null; // {groupId, path}
+  let dropIndex = -1; // 插入位指示(负 = 无)
+
+  function onTabDragStart(e, path) {
+    dragFrom = { groupId: group.id, path };
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', path);
+  }
+
+  function onTabDragOver(e, index) {
+    if (!dragFrom) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const rect = e.currentTarget.getBoundingClientRect();
+    dropIndex = e.clientX > rect.left + rect.width / 2 ? index + 1 : index;
+  }
+
+  function onTabDrop(e, index) {
+    if (!dragFrom) return;
+    e.preventDefault();
+    const from = dragFrom;
+    const to = dropIndex >= 0 ? dropIndex : index;
+    endTabDrag();
+    dispatchTabDrop(from.groupId, from.path, group.id, to);
+  }
+
+  function endTabDrag() {
+    dragFrom = null;
+    dropIndex = -1;
+  }
+
   function focusEditor() {
     activeGroupId.set(group.id);
     tick().then(() => editor?.focus());
@@ -240,8 +274,20 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
 <div class="group-pane" onmousedown={() => focusEditor()} role="presentation">
   <div class="gp-tabbar">
     <div class="gp-tabs">
-      {#each groupPaths as p (p)}
-        <button class="gp-tab" class:active={p === activePathLocal} onclick={() => activateTab(p)} title={p}>
+      {#each groupPaths as p, i (p)}
+        <button
+          class="gp-tab"
+          class:active={p === activePathLocal}
+          class:drop-before={dropIndex === i}
+          class:drop-after={dropIndex === groupPaths.length && i === groupPaths.length - 1}
+          draggable="true"
+          onclick={() => activateTab(p)}
+          title={p}
+          ondragstart={(e) => onTabDragStart(e, p)}
+          ondragover={(e) => onTabDragOver(e, i)}
+          ondrop={(e) => onTabDrop(e, i)}
+          ondragend={endTabDrag}
+        >
           {(p.split('/').pop() || p)}
           {#if $tabs.find((t) => t.path === p)?.dirty}<span class="gp-dirty">●</span>{/if}
           <span
@@ -257,6 +303,7 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
     </div>
     <button class="gp-group-close" onclick={closeThisGroup} title="关闭本组">×</button>
   </div>
+  <Breadcrumbs path={activePathLocal || ''} />
   <div class="gp-host" bind:this={hostEl}></div>
 </div>
 
@@ -298,6 +345,13 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
   .gp-tab.active {
     border-color: var(--accent);
     color: var(--fg);
+  }
+  /* H1 拖拽插入位指示(inset 阴影不引发回流) */
+  .gp-tab.drop-before {
+    box-shadow: inset 2px 0 0 var(--brand);
+  }
+  .gp-tab.drop-after {
+    box-shadow: inset -2px 0 0 var(--brand);
   }
   .gp-dirty {
     color: #e3b341;
