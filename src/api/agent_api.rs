@@ -265,13 +265,18 @@ pub struct AgentApiState {
     /// 取写锁,临界区内无 await。
     toolkit: Arc<std::sync::RwLock<ToolHandler>>,
     /// LLM 配置脱敏快照(凭据可视化状态端点;不含任何密钥内容)
-    llm_status: Arc<LlmStatusSnapshot>,
+    ///
+    /// S5 模型切换:切换端点写回新 model 后同步更新快照 model 字段,
+    /// RwLock 支撑运行期可变(临界区内无 await)。
+    llm_status: Arc<std::sync::RwLock<LlmStatusSnapshot>>,
     /// LLM 配置统一解析产物(env 优先、toml 兜底;serve 与 CLI 共用同一解析链)
     ///
     /// serve 面各请求路径的 handler 构造统一走
-    /// `LlmHandler::from_config(state.llm_config())`,不再绕过配置体系
+    /// `LlmHandler::from_config(&state.llm_config())`,不再绕过配置体系
     /// 直读裸环境变量。
-    llm_config: Arc<LlmConfig>,
+    /// S5 模型切换:切换端点写回新 model 后,handler 每请求现取现构即对
+    /// 后续所有请求生效(运行期热切换,进程内存态,重启回落 env/toml 基线)。
+    llm_config: Arc<std::sync::RwLock<LlmConfig>>,
     /// 会话索引(JSONL 本地持久化;对话与历史阶段的枚举面)
     session_index: Arc<crate::api::session_index::SessionIndex>,
     /// 会话消息本地快照(展示层非权威副本;TTL 回收后历史仍可见)
@@ -394,13 +399,13 @@ impl AgentApiState {
             read_root: None,
             workspace_client,
             toolkit,
-            llm_status: Arc::new(LlmStatusSnapshot::unconfigured()),
+            llm_status: Arc::new(std::sync::RwLock::new(LlmStatusSnapshot::unconfigured())),
             // 默认态:api_key 置空(SG-1 件1 key 归边后 handler 不消费此字段,
             // 仅配置层脱敏回显保留),待 cmd_serve 注入经统一解析的完整配置
-            llm_config: Arc::new(LlmConfig {
+            llm_config: Arc::new(std::sync::RwLock::new(LlmConfig {
                 api_key: String::new(),
                 ..LlmConfig::default()
-            }),
+            })),
         };
         // 治理写权开关启动期观测:敏感部署(agentTools.governanceWrite=false)
         // 一开服即显式曝光只读模式,避免「写工具静默消失」被误判为故障。
@@ -416,28 +421,54 @@ impl AgentApiState {
     }
 
     /// 注入 LLM 配置脱敏快照(builder 风格,供 serve 启动时调用)
-    pub fn with_llm_status(mut self, snapshot: Arc<LlmStatusSnapshot>) -> Self {
-        self.llm_status = snapshot;
+    pub fn with_llm_status(self, snapshot: LlmStatusSnapshot) -> Self {
+        *self.llm_status.write().expect("llm_status lock poisoned") = snapshot;
         self
     }
 
-    /// 获取 LLM 配置脱敏快照(状态端点消费)
-    pub fn llm_status(&self) -> &LlmStatusSnapshot {
-        &self.llm_status
+    /// 获取 LLM 配置脱敏快照(状态端点消费;克隆值,S5 切换端点同步更新)
+    pub fn llm_status(&self) -> LlmStatusSnapshot {
+        self.llm_status
+            .read()
+            .expect("llm_status lock poisoned")
+            .clone()
     }
 
     /// 注入统一解析后的 LLM 配置(builder 风格,供 serve 启动时调用)
     ///
     /// `config.llm` 来自 `Config::load`(env 优先、toml 兜底的统一解析),
     /// serve 面各请求路径的 handler 构造与 CLI 共用同一语义。
-    pub fn with_llm_config(mut self, config: LlmConfig) -> Self {
-        self.llm_config = Arc::new(config);
+    pub fn with_llm_config(self, config: LlmConfig) -> Self {
+        *self.llm_config.write().expect("llm_config lock poisoned") = config;
         self
     }
 
     /// 获取统一解析后的 LLM 配置(请求路径 handler 构造消费)
-    pub fn llm_config(&self) -> &LlmConfig {
-        &self.llm_config
+    ///
+    /// S5:返回克隆值——调用侧 `LlmHandler::from_config(&state.llm_config())`;
+    /// 切换端点写回新 model 后,后续每请求现取即得新值(运行期热切换)。
+    pub fn llm_config(&self) -> LlmConfig {
+        self.llm_config
+            .read()
+            .expect("llm_config lock poisoned")
+            .clone()
+    }
+
+    /// S5:当前生效模型名(清单中继端点 current 字段消费)
+    pub fn current_llm_model(&self) -> String {
+        self.llm_config().model
+    }
+
+    /// S5:切换会话模型(切换端点消费;白名单校验在中继侧完成,此处只做
+    /// 写回配置+联动快照 model 字段,两锁无嵌套)
+    pub fn switch_llm_model(&self, model: &str) -> LlmStatusSnapshot {
+        self.llm_config
+            .write()
+            .expect("llm_config lock poisoned")
+            .model = model.to_string();
+        let mut snap = self.llm_status.write().expect("llm_status lock poisoned");
+        snap.model = model.to_string();
+        snap.clone()
     }
 
     /// 会话索引的引用(WS 处理器记录会话活动)
@@ -634,6 +665,8 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route("/version", axum::routing::get(get_version))
         // 凭据可视化:LLM 配置只读状态(脱敏,响应体不携带任何密钥内容)
         .route("/admin/llm-status", axum::routing::get(get_llm_status))
+        .route("/admin/llm-models", axum::routing::get(get_llm_models))
+        .route("/admin/llm-model", axum::routing::post(post_llm_model))
         .route("/agents", axum::routing::get(list_agents))
         .route("/agents/{agent_type}", axum::routing::get(get_agent))
         .route("/agents/{agent_type}/run", axum::routing::post(run_agent))
@@ -980,7 +1013,131 @@ async fn get_version(State(state): State<AgentApiState>) -> Json<RuntimeIdentity
 /// 凭据可视化消费面:报告 provider/model/端点与 API key 存在性、末 4 位提示、
 /// 来源变量名。响应体**不携带任何密钥内容**(见 [`LlmStatusSnapshot`] 设计铁律)。
 async fn get_llm_status(State(state): State<AgentApiState>) -> Json<LlmStatusSnapshot> {
-    Json(state.llm_status().clone())
+    Json(state.llm_status())
+}
+
+/// S5:执行体模型清单中继 URL——executor_url 为 `/llm/execute` 全 URL 形态
+/// (配置契约),去尾换 `/llm/models`;其余形态按原样拼接 `/llm/models`。
+fn executor_models_url(executor_url: &str) -> String {
+    format!(
+        "{}/llm/models",
+        executor_url.trim_end_matches("/llm/execute")
+    )
+}
+
+/// S5:向执行体中继取模型清单(短超时,不挂 UI)。
+///
+/// 成功 → 执行体响应原值(`{ready, models[, note]}`);失败 → Err(人读详情)。
+async fn relay_llm_models(cfg: &crate::config::LlmConfig) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("relay client build: {e}"))?;
+    let mut req = client.get(executor_models_url(&cfg.executor_url));
+    if let Some(tok) = &cfg.executor_token {
+        req = req.header("Authorization", format!("Bearer {tok}"));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("executor unreachable ({}): {e}", cfg.executor_url))?;
+    let status = resp.status();
+    let payload: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("executor responded {status} with non-JSON body: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("executor responded {status}: {payload}"));
+    }
+    Ok(payload)
+}
+
+/// 路由:`GET /admin/llm-models` → 执行体白名单清单中继(附 current)。
+///
+/// 正源唯一=执行体白名单物料(serve 不复制清单,杜绝双真相);执行体
+/// 不可达 → 503 自诊断(fail-visible)。
+async fn get_llm_models(State(state): State<AgentApiState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let cfg = state.llm_config();
+    match relay_llm_models(&cfg).await {
+        Err(e) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "error": format!("模型清单中继失败: {e}") })),
+        )
+            .into_response(),
+        Ok(mut payload) => {
+            payload["current"] = serde_json::json!(state.current_llm_model());
+            axum::Json(payload).into_response()
+        }
+    }
+}
+
+/// 路由:`POST /admin/llm-model` → 切换会话模型(body `{"model": "..."}`)。
+///
+/// 校验:①body 形状;②在执行体白名单内(正源执法面同一清单);③执行体
+/// 不可达/未就绪一律拒切(不盲切,与执行体 fail-closed 姿态一致)。成功
+/// → 写回共享配置+联动脱敏快照,后续每请求即生效。模型切换=纯配置态
+/// 人工显式操作,不挂 HumanGate(审批链语义不动;白名单执法面不变)。
+async fn post_llm_model(
+    State(state): State<AgentApiState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(model) = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "body 需 {\"model\": \"<模型名>\"}(非空字符串)"
+            })),
+        )
+            .into_response();
+    };
+    let cfg = state.llm_config();
+    match relay_llm_models(&cfg).await {
+        Err(e) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": format!("模型清单不可达,拒绝切换(不盲切): {e}")
+            })),
+        )
+            .into_response(),
+        Ok(payload) => {
+            if payload["ready"] != serde_json::json!(true) {
+                let note = payload["note"].as_str().unwrap_or("执行体未就绪");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({
+                        "error": format!("扩展执行体未就绪,拒绝切换: {note}")
+                    })),
+                )
+                    .into_response();
+            }
+            let allowlisted = payload["models"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|m| m.as_str()).any(|m| m == model))
+                .unwrap_or(false);
+            if !allowlisted {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": format!(
+                            "模型不在执行体准入白名单内: {model}(白名单以执行体执法面为准)"
+                        ),
+                        "models": payload["models"],
+                    })),
+                )
+                    .into_response();
+            }
+            let snapshot = state.switch_llm_model(model);
+            axum::Json(serde_json::json!({ "ok": true, "status": snapshot })).into_response()
+        }
+    }
 }
 
 async fn list_agents(State(state): State<AgentApiState>) -> Json<AgentListResponse> {
@@ -1238,7 +1395,7 @@ async fn run_agent(
         state.evorule_client.clone(),
         filtered,
         Some(crate::io_handlers::LlmHandler::from_config(
-            state.llm_config(),
+            &state.llm_config(),
         )), // llm_handler — serve 与 CLI 共用统一解析产物(env 优先、toml 兜底)
     )
     .await
@@ -1667,7 +1824,7 @@ async fn run_agent_stream(
         state.evorule_client.clone(),
         filtered,
         Some(crate::io_handlers::LlmHandler::from_config(
-            state.llm_config(),
+            &state.llm_config(),
         )), // llm_handler — serve 与 CLI 共用统一解析产物(env 优先、toml 兜底)
     )
     .await
@@ -2626,7 +2783,7 @@ async fn replay_session_events(
     // 可选注入 LLM(narrate=true 时)——统一解析产物,与 CLI 同一配置语义
     let do_narrate = params.narrate.unwrap_or(false);
     if do_narrate {
-        let llm = crate::io_handlers::LlmHandler::from_config(state.llm_config());
+        let llm = crate::io_handlers::LlmHandler::from_config(&state.llm_config());
         engine = engine.with_llm(llm);
     }
 
@@ -2824,7 +2981,7 @@ mod tests {
             ..crate::config::LlmConfig::default()
         };
         let state = make_test_state().with_llm_config(injected.clone());
-        assert_eq!(state.llm_config(), &injected);
+        assert_eq!(state.llm_config(), injected);
         // 默认态(未注入):api_key 为空(from_config 视为未配置,不误用占位符)
         let fresh = make_test_state();
         assert!(fresh.llm_config().api_key.is_empty());
@@ -3117,7 +3274,7 @@ mod tests {
         let snapshot = cfg.status_snapshot(Some("MINIMAX_API_KEY"));
         assert_eq!(snapshot.api_key.hint.as_deref(), Some("wxyz"));
 
-        let state = make_test_state().with_llm_status(std::sync::Arc::new(snapshot));
+        let state = make_test_state().with_llm_status(snapshot);
         let app = router(state);
 
         let response = app
@@ -3140,6 +3297,254 @@ mod tests {
             "response body leaked the API key"
         );
         assert!(text.contains("wxyz"), "last-4 hint should be present");
+    }
+
+    // ---- S5:模型清单中继与切换端点 ----
+
+    /// S5 测试辅助:起 mock 执行体(仅 /llm/models),返回 executor_url 形态地址
+    async fn spawn_mock_executor(models: serde_json::Value) -> String {
+        let app = axum::Router::new().route(
+            "/llm/models",
+            axum::routing::get(move || {
+                let v = models.clone();
+                async move { axum::Json(v) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/llm/execute")
+    }
+
+    #[test]
+    fn test_executor_models_url_strips_execute_suffix() {
+        assert_eq!(
+            executor_models_url("http://127.0.0.1:9130/llm/execute"),
+            "http://127.0.0.1:9130/llm/models"
+        );
+        assert_eq!(
+            executor_models_url("http://127.0.0.1:9130/other"),
+            "http://127.0.0.1:9130/other/llm/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_llm_models_endpoint_relays_and_attaches_current() {
+        let url = spawn_mock_executor(serde_json::json!({
+            "ready": true,
+            "models": ["MiniMax-M2.5", "MiniMax-M3"]
+        }))
+        .await;
+        let cfg = crate::config::LlmConfig {
+            executor_url: url,
+            ..crate::config::LlmConfig::default()
+        };
+        let state = make_test_state().with_llm_config(cfg);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ready"], serde_json::json!(true));
+        assert_eq!(
+            v["models"],
+            serde_json::json!(["MiniMax-M2.5", "MiniMax-M3"])
+        );
+        // current 取自共享配置的出厂模型缺省值
+        assert_eq!(v["current"], serde_json::json!("MiniMax-M2.5"));
+    }
+
+    #[tokio::test]
+    async fn test_llm_models_endpoint_relay_offline_is_503() {
+        // 127.0.0.1:1 = 必拒端口(不依赖本机 9130 是否有活执行体)
+        let cfg = crate::config::LlmConfig {
+            executor_url: "http://127.0.0.1:1/llm/execute".to_string(),
+            ..crate::config::LlmConfig::default()
+        };
+        let state = make_test_state().with_llm_config(cfg);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_llm_model_switch_success_updates_config_and_status() {
+        let url = spawn_mock_executor(serde_json::json!({
+            "ready": true,
+            "models": ["MiniMax-M2.5", "MiniMax-M3"]
+        }))
+        .await;
+        let cfg = crate::config::LlmConfig {
+            executor_url: url,
+            ..crate::config::LlmConfig::default()
+        };
+        let state = make_test_state().with_llm_config(cfg);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-model")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model": "MiniMax-M3"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true));
+        assert_eq!(v["status"]["model"], serde_json::json!("MiniMax-M3"));
+    }
+
+    #[tokio::test]
+    async fn test_llm_model_switch_propagates_to_handler_construction() {
+        // 切换后 state.llm_config() 即新值(handler 每请求现取现构=运行期生效),
+        // 且脱敏快照 model 字段联动(状态端点可见)
+        let url = spawn_mock_executor(serde_json::json!({
+            "ready": true,
+            "models": ["MiniMax-M2.5", "MiniMax-M3"]
+        }))
+        .await;
+        let cfg = crate::config::LlmConfig {
+            executor_url: url,
+            ..crate::config::LlmConfig::default()
+        };
+        let state = make_test_state().with_llm_config(cfg);
+        let app = router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-model")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model": "MiniMax-M3"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(state.llm_config().model, "MiniMax-M3");
+        assert_eq!(state.llm_status().model, "MiniMax-M3");
+        // 切换不越界改其他字段(纯 model 态)
+        assert!(state.llm_config().api_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_llm_model_switch_rejects_non_allowlisted() {
+        let url = spawn_mock_executor(serde_json::json!({
+            "ready": true,
+            "models": ["MiniMax-M2.5", "MiniMax-M3"]
+        }))
+        .await;
+        let cfg = crate::config::LlmConfig {
+            executor_url: url,
+            ..crate::config::LlmConfig::default()
+        };
+        let state = make_test_state().with_llm_config(cfg);
+        let app = router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-model")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model": "unlisted-model"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // 拒切后配置态不变
+        assert_eq!(state.llm_config().model, "MiniMax-M2.5");
+    }
+
+    #[tokio::test]
+    async fn test_llm_model_switch_rejects_when_executor_offline() {
+        let cfg = crate::config::LlmConfig {
+            executor_url: "http://127.0.0.1:1/llm/execute".to_string(),
+            ..crate::config::LlmConfig::default()
+        };
+        let state = make_test_state()
+            .with_llm_config(cfg)
+            // 注入与配置同源的基线快照(unconfigured 快照 model 为空串,不适用)
+            .with_llm_status(crate::config::LlmConfig::default().status_snapshot(None));
+        let app = router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-model")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model": "MiniMax-M3"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 不盲切:执行体不可达=拒切(503),配置态保持
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.llm_config().model, "MiniMax-M2.5");
+        assert_eq!(state.llm_status().model, "MiniMax-M2.5");
+    }
+
+    #[tokio::test]
+    async fn test_llm_model_switch_rejects_empty_body() {
+        let state = make_test_state();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-model")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model": "  "#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

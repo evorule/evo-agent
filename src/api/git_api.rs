@@ -416,7 +416,7 @@ pub async fn generate(
     // LLM 薄委托（llm_ops 同构：mock 开关 + 统一解析产物；非流式）
     let llm = match std::env::var("EVO_AGENT_LLM_MOCK_CONTENT") {
         Ok(mock) => LlmHandler::mock(&mock),
-        Err(_) => LlmHandler::from_config(state.llm_config()),
+        Err(_) => LlmHandler::from_config(&state.llm_config()),
     };
     let io = llm
         .execute(&serde_json::json!({ "prompt": prompt, "temperature": 0.2 }))
