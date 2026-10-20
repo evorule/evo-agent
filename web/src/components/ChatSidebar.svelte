@@ -19,6 +19,14 @@
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
   import { approveProposal, listResumableRuns, getOrchestrationLinks, uploadFile, getLlmModels, setLlmModel } from '../lib/api.js';
+  import { settingsState, setSetting } from '../lib/settings.js';
+  import {
+    APPROVAL_MODE_KEY,
+    APPROVAL_EXEMPTION_KEY,
+    FULL_ACCESS_CONFIRM,
+    approvalPresetWrites,
+    approvalPresetView,
+  } from '../lib/approval.js';
   import { orderSessionsWithLineage } from '../lib/orchestration.js';
   import { onMount, onDestroy, tick } from 'svelte';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
@@ -259,6 +267,61 @@
     modelMenuOpen = false;
   }
 
+  // ---- 审批档位选择器(批B):四档快捷预设;写键走既有设置通道,对新会话生效 ----
+  // 静态路由层无放行权:仅设置键写入,决策端/红线闸/审计链零触碰;
+  // 「完全访问」必经确认条,绝不静默开红线豁免。
+  let approvalMenuOpen = $state(false);
+  let approvalPickEl = $state(null);
+  let approvalFullConfirm = $state(false);
+  let approvalErr = $state('');
+  let approvalBusy = $state(false);
+
+  const APPROVAL_PRESETS = [
+    { id: 'manual', label: '手动审批', desc: '每次人工确认;红线强制' },
+    { id: 'auto', label: '自动审批', desc: '无人值守判定放行+留痕;红线仍强制人工' },
+    { id: 'full', label: '完全访问', desc: '红线类操作交评审判定(需确认)' },
+    { id: 'custom', label: '自定义配置', desc: '对照条件文件评审判定' },
+  ];
+
+  let approvalView = $derived(
+    approvalPresetView(
+      $settingsState.settings[APPROVAL_MODE_KEY],
+      $settingsState.settings[APPROVAL_EXEMPTION_KEY],
+    ),
+  );
+
+  function toggleApprovalMenu() {
+    approvalMenuOpen = !approvalMenuOpen;
+    approvalFullConfirm = false;
+    if (approvalErr) approvalErr = '';
+  }
+
+  async function pickApprovalPreset(p) {
+    if (approvalBusy) return;
+    if (p === 'full' && !approvalFullConfirm) {
+      approvalFullConfirm = true; // 先出确认条;再次点击确认才写入
+      return;
+    }
+    approvalBusy = true;
+    approvalErr = '';
+    try {
+      for (const [k, v] of approvalPresetWrites(p)) await setSetting(k, v);
+      approvalMenuOpen = false;
+      approvalFullConfirm = false;
+    } catch (e) {
+      approvalErr = String(e?.message || e);
+    } finally {
+      approvalBusy = false;
+    }
+  }
+
+  function onDocClickCloseApprovalMenu(e) {
+    if (!approvalMenuOpen) return;
+    if (approvalPickEl?.contains(e.target)) return;
+    approvalMenuOpen = false;
+    approvalFullConfirm = false;
+  }
+
   onMount(() => {
     draft = localStorage.getItem(DRAFT_KEY) || '';
     try {
@@ -288,6 +351,7 @@
     // S5:模型选择器初值(当前生效模型;清单懒加载,点开时再拉)
     refreshModels();
     document.addEventListener('click', onDocClickCloseModelMenu);
+    document.addEventListener('click', onDocClickCloseApprovalMenu);
     // 心跳停滞提示的秒级心跳(纯客户端:turn 活跃且久无引擎事件→琥珀提示;
     // serve 侧心跳 2 窗中止,此处为其可见前兆)
     stallTicker = setInterval(() => {
@@ -299,6 +363,7 @@
     unregisterCommand('chat.addContext');
     if (stallTicker) clearInterval(stallTicker);
     document.removeEventListener('click', onDocClickCloseModelMenu);
+    document.removeEventListener('click', onDocClickCloseApprovalMenu);
   });
 
   /** 引擎事件停滞秒数(turn 活跃面;<0 = 事件仍新鲜) */
@@ -934,6 +999,62 @@
             </div>
           {/if}
         </div>
+        <div class="approval-pick" bind:this={approvalPickEl}>
+          <button
+            class="tb-btn approval-btn"
+            class:active={approvalMenuOpen}
+            onclick={toggleApprovalMenu}
+            title="审批档位(对新会话生效;agent 定义显式指定档位时以其为准)"
+          >
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <path
+                d="M8 1.5 13 3.6v4.1c0 3.4-2.1 5.9-5 7-2.9-1.1-5-3.6-5-7V3.6Z"
+                stroke="currentColor"
+                stroke-width="1.3"
+                fill="none"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span class="model-name" class:exempt={approvalView.exempt}>{approvalView.label}</span>
+            {#if approvalView.exempt}<span class="exempt-dot" title="红线豁免覆盖开启中"></span>{/if}
+          </button>
+          {#if approvalMenuOpen}
+            <div class="model-menu" role="listbox" aria-label="审批档位">
+              {#if approvalErr}<div class="model-menu-note err">{approvalErr}</div>{/if}
+              {#each APPROVAL_PRESETS as p (p.id)}
+                <button
+                  class="model-item"
+                  class:active={approvalView.preset === p.id}
+                  role="option"
+                  aria-selected={approvalView.preset === p.id}
+                  onclick={() => pickApprovalPreset(p.id)}
+                  disabled={approvalBusy}
+                >
+                  <span class="ap-label">
+                    {p.label}
+                    {#if p.id === 'full' && approvalView.preset === 'full'}<span class="model-check">✓</span>{/if}
+                  </span>
+                  <span class="ap-desc">{p.desc}</span>
+                </button>
+              {/each}
+              <div class="ap-note">档位对新会话生效;agent 定义显式指定档位时以其为准</div>
+              {#if approvalFullConfirm}
+                <div class="ap-confirm" role="alert">
+                  {FULL_ACCESS_CONFIRM}
+                  <div class="ap-confirm-row">
+                    <button class="ap-confirm-btn danger" onclick={() => pickApprovalPreset('full')} disabled={approvalBusy}>
+                      确认开启
+                    </button>
+                    <button class="ap-confirm-btn" onclick={() => (approvalFullConfirm = false)}>取消</button>
+                  </div>
+                </div>
+              {/if}
+              <button class="model-item ap-manage" onclick={openSettingsTab}>
+                管理条件文件与豁免 →
+              </button>
+            </div>
+          {/if}
+        </div>
         <button class="tb-btn" onclick={openMentionPopup} title="插入 @ 上下文引用">@</button>
         <button class="tb-btn" onclick={pickFiles} title="上传图片/附件(存入工作区 .evo-agent/uploads,agent 可读)">
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
@@ -1551,6 +1672,83 @@
   .model-pick {
     position: relative;
     flex-shrink: 0;
+  }
+  /* 审批档位选择器(批B):与 model-pick 同款定位;豁免开启态红警示 */
+  .approval-pick {
+    position: relative;
+    flex-shrink: 0;
+  }
+  .approval-btn .model-name.exempt {
+    color: var(--danger);
+  }
+  .exempt-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--danger);
+    flex-shrink: 0;
+  }
+  .approval-pick .model-item {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+  .ap-label {
+    font-size: var(--fs-xs);
+    color: var(--text-primary);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .ap-desc {
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+  .ap-note {
+    font-size: 10px;
+    color: var(--text-muted);
+    padding: 4px 10px 6px;
+    border-top: 1px solid var(--border);
+    margin-top: 2px;
+  }
+  .ap-confirm {
+    font-size: var(--fs-xs);
+    color: var(--text-primary);
+    background: var(--danger-bg, rgba(231, 76, 60, 0.12));
+    border: 1px solid var(--danger);
+    border-radius: var(--r-sm);
+    padding: 6px 8px;
+    margin: 0 6px 6px;
+  }
+  .ap-confirm-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+  }
+  .ap-confirm-btn {
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: var(--fs-xs);
+    padding: 2px 10px;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .ap-confirm-btn.danger {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: #fff;
+  }
+  .ap-confirm-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .ap-manage {
+    border-top: 1px solid var(--border);
+    border-radius: 0 0 var(--r-sm) var(--r-sm);
+    color: var(--brand);
+    width: 100%;
   }
   .model-btn {
     max-width: 150px;

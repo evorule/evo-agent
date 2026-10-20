@@ -21,6 +21,10 @@ import {
   savePolicyText,
   runTrial,
   trialStatusView,
+  APPROVAL_MODE_KEY,
+  APPROVAL_EXEMPTION_KEY,
+  approvalPresetWrites,
+  approvalPresetView,
 } from '../src/lib/approval.js';
 import { getApprovalPolicy, trialApproval, readFile, writeFile } from '../src/lib/api.js';
 
@@ -178,5 +182,77 @@ describe('readPolicyText(编辑器草稿初始化)', () => {
     expect(await readPolicyText()).toBe('[policy_limits]\nmax_corrections = 3');
     readFile.mockRejectedValue(new Error('HTTP 404'));
     expect(await readPolicyText()).toBe('');
+  });
+});
+
+describe('approvalPresetWrites(批B 四档预设写入序列)', () => {
+  it('manual → mode=manual+豁免复位 false(安全向)', () => {
+    expect(approvalPresetWrites('manual')).toEqual([
+      ['approval.mode.shellExec', 'manual'],
+      ['approval.exemptionOverride', false],
+    ]);
+  });
+
+  it('auto → mode=auto_policy+豁免复位 false(红线仍强制人工)', () => {
+    expect(approvalPresetWrites('auto')).toEqual([
+      ['approval.mode.shellExec', 'auto_policy'],
+      ['approval.exemptionOverride', false],
+    ]);
+  });
+
+  it('full → mode=auto_policy+豁免开启 true(调用方须先过确认条)', () => {
+    expect(approvalPresetWrites('full')).toEqual([
+      ['approval.mode.shellExec', 'auto_policy'],
+      ['approval.exemptionOverride', true],
+    ]);
+  });
+
+  it('custom → 仅写 mode=policy,豁免键不动(用户在审批策略分区自管)', () => {
+    expect(approvalPresetWrites('custom')).toEqual([['approval.mode.shellExec', 'policy']]);
+    expect(approvalPresetWrites('custom').length).toBe(1);
+  });
+
+  it('未知预设 → 空序列(零写入)', () => {
+    expect(approvalPresetWrites('yolo')).toEqual([]);
+  });
+});
+
+describe('approvalPresetView(批B 两键实况反查展示)', () => {
+  it('manual(+豁免) → 手动审批;豁免开启带角标与后缀', () => {
+    expect(approvalPresetView('manual', false)).toEqual({
+      preset: 'manual',
+      label: '手动审批',
+      exempt: false,
+    });
+    expect(approvalPresetView('manual', true).label).toBe('手动审批(红线豁免)');
+    expect(approvalPresetView('manual', true).exempt).toBe(true);
+  });
+
+  it('auto_policy 主键二分:无豁免=自动审批,有豁免=完全访问', () => {
+    expect(approvalPresetView('auto_policy', false)).toEqual({
+      preset: 'auto',
+      label: '自动审批',
+      exempt: false,
+    });
+    expect(approvalPresetView('auto_policy', true)).toEqual({
+      preset: 'full',
+      label: '完全访问',
+      exempt: true,
+    });
+  });
+
+  it('policy → 自定义配置(豁免只做后缀不改变 preset)', () => {
+    expect(approvalPresetView('policy', false)).toEqual({
+      preset: 'custom',
+      label: '自定义配置',
+      exempt: false,
+    });
+    expect(approvalPresetView('policy', true).label).toBe('自定义配置(红线豁免)');
+    expect(approvalPresetView('policy', true).preset).toBe('custom');
+  });
+
+  it('未设/未知 mode → serve 缺省 manual 展示(preset=null)', () => {
+    expect(approvalPresetView(undefined, false)).toEqual({ preset: null, label: '手动审批', exempt: false });
+    expect(approvalPresetView('yolo', false).preset).toBeNull();
   });
 });

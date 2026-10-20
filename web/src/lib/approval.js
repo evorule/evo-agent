@@ -97,3 +97,60 @@ export function trialStatusView(status) {
       return { kind: 'grey', label: status || '(未知)' };
   }
 }
+
+// ---- 审批档位选择器(批B):四档快捷预设,底层=既有两键(mode+豁免覆盖) ----
+//
+// 静态路由层无放行权:本组函数只产出「设置键写入序列」,决策端/红线闸/审计链
+// 零触碰。「完全访问」=auto_policy+豁免开启,调用方必须先过确认条(FULL_ACCESS_CONFIRM)
+// 才可下发 full 预设——绝不静默开红线豁免(自我扩权防护精神)。
+
+/** 档位设置键与豁免键(与 serve settings.rs 注册条目同源) */
+export const APPROVAL_MODE_KEY = 'approval.mode.shellExec';
+export const APPROVAL_EXEMPTION_KEY = 'approval.exemptionOverride';
+
+/** 「完全访问」确认文案(与审批策略分区豁免开启确认同口径) */
+export const FULL_ACCESS_CONFIRM =
+  '确认开启完全访问?红线类操作(删除文件/推送远端/数据外发/修改治理配置文件)将不再强制人工确认,由评审自动判定,留痕携带豁免标记。';
+
+/** 四档预设 → 两键写入序列(纯函数,vitest 锁)。
+ *  manual/auto 复位豁免(安全向);full 开豁免(调用方先过确认);
+ *  custom 只写 mode——豁免不动,条件文件由用户在审批策略分区自管。 */
+export function approvalPresetWrites(preset) {
+  switch (preset) {
+    case 'manual':
+      return [
+        [APPROVAL_MODE_KEY, 'manual'],
+        [APPROVAL_EXEMPTION_KEY, false],
+      ];
+    case 'auto':
+      return [
+        [APPROVAL_MODE_KEY, 'auto_policy'],
+        [APPROVAL_EXEMPTION_KEY, false],
+      ];
+    case 'full':
+      return [
+        [APPROVAL_MODE_KEY, 'auto_policy'],
+        [APPROVAL_EXEMPTION_KEY, true],
+      ];
+    case 'custom':
+      return [[APPROVAL_MODE_KEY, 'policy']];
+    default:
+      return [];
+  }
+}
+
+/** 两键实况 → 档位展示(纯函数,vitest 锁):主键映射+豁免角标。
+ *  未设/未知 mode → serve 缺省 manual(preset=null 表示未显式写入过)。 */
+export function approvalPresetView(mode, exemption) {
+  const exempt = !!exemption;
+  switch (mode) {
+    case 'manual':
+      return { preset: 'manual', label: exempt ? '手动审批(红线豁免)' : '手动审批', exempt };
+    case 'auto_policy':
+      return { preset: exempt ? 'full' : 'auto', label: exempt ? '完全访问' : '自动审批', exempt };
+    case 'policy':
+      return { preset: 'custom', label: exempt ? '自定义配置(红线豁免)' : '自定义配置', exempt };
+    default:
+      return { preset: null, label: '手动审批', exempt };
+  }
+}
