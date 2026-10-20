@@ -33,6 +33,7 @@
 
 param(
     [switch]$SkipCollect,
+    [switch]$SkipFreshness,
     [string]$ServerRepo = "",
     [string]$ConsoleRepo = "",
     [string]$UpdateUrlBase = "",
@@ -47,6 +48,18 @@ if (-not $ServerRepo) { $ServerRepo = Join-Path (Split-Path $repoRoot -Parent) "
 if (-not $ConsoleRepo) { $ConsoleRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-console-cloud" }
 
 if (-not $SkipCollect) {
+    # 新鲜度门（发版前置红线）:产物须新于源码最后提交(先定稿提交、再 release
+    # 重建的发行纪律),源码树须干净(未提交 bits 不得入包)。判定逻辑与实测
+    # 见 scripts/check-build-freshness.ps1;-SkipFreshness 仅限本地调试,发版禁用。
+    if (-not $SkipFreshness) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File `
+            (Join-Path $desktop "scripts\check-build-freshness.ps1") `
+            -RepoRoot $repoRoot -ServerRepo $ServerRepo -ConsoleRepo $ConsoleRepo
+        if ($LASTEXITCODE -ne 0) {
+            throw "build freshness gate failed(见上;先重建再打包,-SkipFreshness 仅限本地调试)"
+        }
+    }
+
     $pairs = @(
         @{ Src = (Join-Path $repoRoot "target\release\evo-agent.exe");        Dst = "resources\bin\evo-agent.exe" },
         @{ Src = (Join-Path $ServerRepo "target\release\evorule-server.exe"); Dst = "resources\bin\evorule-server.exe" },
