@@ -89,7 +89,8 @@ use crate::io_handlers::tool_handler::ToolHandler;
 /// - `file_move`:移动/重命名(candidate 审批 + 目标重名拒)
 /// - `file_delete`:软删除进 `.evo-trash/`(candidate 审批)
 /// - `search_files`:glob 找文件(工作目录沙箱 + max_results 限制)
-/// - `shell_exec`:执行白名单命令(8 active + 20 candidate + 35 blocked)
+/// - `shell_exec`:执行白名单命令(Unix 基线 8 active + 20 candidate + 34
+///   blocked;Windows 平台增量/降档见 shell_exec.rs 平台分档表)
 /// - `http_get`:HTTP GET(6 active host + SSRF 防护 + 任何其他 host 需批准)
 /// - `python_exec`:一次性执行 Python 代码(candidate 全审批——任意代码
 ///   执行无白名单可用,任何调用都出 needs_approval 提案)
@@ -1312,14 +1313,21 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
 
 /// 构造 shell_exec 的 description(给 LLM 看)
 fn shell_exec_description() -> String {
-    use crate::builtin_tools::shell_exec::{ACTIVE_COMMANDS, BLOCKED_COMMANDS, CANDIDATE_COMMANDS};
+    use crate::builtin_tools::shell_exec::{
+        effective_active_commands, effective_blocked_commands, effective_candidate_commands,
+    };
 
-    let active: Vec<String> = ACTIVE_COMMANDS.iter().map(|s| format!("`{}`", s)).collect();
-    let candidates: Vec<String> = CANDIDATE_COMMANDS
+    // 平台有效面(cfg 内聚在 shell_exec.rs 访问器):Windows 增量/降档
+    // 随编译期平台如实渲染,spec 单源不变
+    let active: Vec<String> = effective_active_commands()
+        .iter()
+        .map(|s| format!("`{}`", s))
+        .collect();
+    let candidates: Vec<String> = effective_candidate_commands()
         .iter()
         .map(|c| format!("`{}` ({}: {})", c.name, c.description, c.risk))
         .collect();
-    let blocked: Vec<String> = BLOCKED_COMMANDS
+    let blocked: Vec<String> = effective_blocked_commands()
         .iter()
         .map(|(name, reason)| format!("`{}` ({})", name, reason))
         .collect();
