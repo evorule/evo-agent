@@ -98,6 +98,13 @@ export function browseFs(path = '') {
   return fetch(`/api/fs/browse${q}`, { headers: headers() }).then(unwrap);
 }
 
+/** 公告列表(批 J1 段 2;/api/notices;全局面,不携带重锚头)。
+ *  响应 {notices:[{id,date,level,title,body_md,pinned,links:[{label,href}]}], error?}
+ *  失败由调用方 fail-soft(公告卡整卡隐藏)。 */
+export function fetchNotices() {
+  return fetch('/api/notices', { headers: headers() }).then(unwrap);
+}
+
 /** 读文件(path 相对有效根) */
 export function readFile(path) {
   return fetch(`/api/files/read?path=${encodeURIComponent(path)}`, {
