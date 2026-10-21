@@ -83,6 +83,12 @@ jobs:
           # ubuntu-only); the sampler is stopped when the step exits.
           $probe = $null
           if ($IsLinux) {
+            # Cap cargo compile parallelism on Linux: full-parallel rustc
+            # processes spike runner memory during the build+test loop, and
+            # the runner dies mid-step with no log surviving. Limiting to 2
+            # jobs trades compile time for a flat memory ceiling. Windows
+            # runners have more headroom and stay untouched.
+            $env:CARGO_BUILD_JOBS = '2'
             $probe = Start-Process -FilePath 'bash' -ArgumentList '-c', 'while true; do echo "== PROBE $(date -u +%H:%M:%S)"; df -h /; free -m; sleep 30; done' -PassThru
           }
           ./verify.ps1
