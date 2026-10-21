@@ -352,7 +352,12 @@ mod tests {
 
     /// 构造 journal 行(裸事件 + 自增 seq/ts)
     fn line(seq: u64, ts: u64, event: JournalEvent) -> JournalLine {
-        JournalLine { seq, ts, event }
+        JournalLine {
+            seq,
+            ts,
+            event,
+            hashes: None,
+        }
     }
 
     fn anchor(parent: &str, child: &str, kind: &'static str, depth: u32, seq: u64) -> SpawnAnchor {
