@@ -2390,6 +2390,26 @@ fn cmd_serve(
     if let Some(proxy_router) = console_proxy_router {
         app = app.merge(proxy_router);
     }
+    // 公告静态资源(批 J1):/notices-static → data/notices/assets(免鉴权公开面,
+    // 与 workbench/console 同层 —— 展示页/图片是发布者主动放置的公开物,浏览器
+    // 直链新标签打开不得要求 token)。启动自建目录:发布=丢文件即生效,无需重启;
+    // no-cache 与 workbench 同款(ETag revalidate,文件变更刷新即生效)。
+    let notices_assets = evo_agent::api::notices_api::notices_assets_dir(workdir);
+    if let Err(e) = std::fs::create_dir_all(&notices_assets) {
+        eprintln!("[notices] assets dir create failed ({e}); static hosting disabled");
+    } else {
+        eprintln!(
+            "[notices] serving notice assets from {} at /notices-static",
+            notices_assets.display()
+        );
+        let notices_service = tower::ServiceBuilder::new()
+            .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-cache"),
+            ))
+            .service(tower_http::services::ServeDir::new(&notices_assets));
+        app = app.nest_service("/notices-static", notices_service);
+    }
     // CORS 按鉴权态条件化:鉴权开启(产品/桌面形态)时不发通配 CORS 头——
     // 工作台与 serve 同源无需 CORS;通配层会使任意网页可跨_origin 读取
     // 本机 API 响应(会话/记忆/文件工具面)。仅 --no-auth 开发形态保留
