@@ -116,7 +116,7 @@
         <rect x="7.5" y="12.6" width="9" height="2.3" rx="0.9" fill="#F0D27A" />
       </svg>
       <h1>evo-agent 工作台</h1>
-      <p class="sub">以标准编程 IDE 为底盘,叠加 evorule 治理能力(agent 会话 / 审批 / 审计 / 规则)。</p>
+      <p class="sub">Powered by <i>EvoRule</i></p>
     </div>
 
     <section class="sec notices" data-testid="notices-card">
