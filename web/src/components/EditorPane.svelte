@@ -19,6 +19,7 @@
   import { uriSpecFor, initDiagnostics, rebindPath, setDiagnostics, clearDiagnostics, pathFromUri } from '../lib/diagnostics.js';
   import { lintMarkdown, LINT_MAX_LENGTH } from '../lib/markdown-lint.js';
   import SettingsEditor from './SettingsEditor.svelte';
+  import HomeView from './HomeView.svelte';
   import {
     tabs,
     activePath,
@@ -112,6 +113,9 @@
   /** H2 面包屑:仅真实文件 tab 显示(设置页/diff/错误占位不显) */
   $: crumbTab = $activePath ? $tabs.find((t) => t.path === $activePath) || null : null;
   $: crumbPath = crumbTab && !crumbTab.kind && !crumbTab.error ? crumbTab.path : '';
+  /** 批 I 段 3:无打开 tab = 首页态(工作区卡替代欢迎编辑器;Monaco 宿主
+   *  保持挂载仅隐藏,实例/undo 栈不销毁) */
+  $: showHome = $tabs.length === 0;
   /** 保存失败的临时提示,保存成功即清 */
   let saveError = '';
 
@@ -837,13 +841,17 @@
       </button>
     </div>
   {/if}
-  <div class="editor-host" bind:this={editorEl} data-zone="editor" style={mdPreviewOn ? 'display:none' : ''}></div>
+  <div class="editor-host" bind:this={editorEl} data-zone="editor" style:display={showHome || mdPreviewOn ? 'none' : ''}></div>
   {#if mdPreviewOn}
     <div class="md-preview" data-zone="editor">{@html mdPreviewHtml}</div>
   {/if}
   <div class="editor-host diff-host" bind:this={diffEl} style="display:none" data-zone="editor"></div>
   <div class="editor-host settings-host" bind:this={settingsEl} style="display:none" data-zone="editor">
     <SettingsEditor />
+  </div>
+  <!-- 批 I 段 3:首页工作区卡(无打开 tab 时;宿主与 Monaco 同栖互斥显示) -->
+  <div class="home-host" style:display={showHome ? 'flex' : 'none'} data-zone="editor">
+    <HomeView />
   </div>
 </div>
 
@@ -853,6 +861,12 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+  }
+  .home-host {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
   }
   .tabbar {
     display: flex;

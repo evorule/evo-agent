@@ -44,19 +44,80 @@
 //!   (防误操作出 workdir),不是安全边界。
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::api::agent_api::AgentApiState;
 use crate::api::human_gate::{ensure_write_allowed, CallerIdentity};
+use crate::api::serve_tools::simplify_verbatim;
 use crate::builtin_tools::file_create::FileCreateTool;
 use crate::builtin_tools::file_delete::FileDeleteTool;
+use crate::builtin_tools::file_list::FileListTool;
 use crate::builtin_tools::file_move::FileMoveTool;
+use crate::builtin_tools::file_read::FileReadTool;
 use crate::builtin_tools::file_write::FileWriteTool;
 use crate::builtin_tools::fs_safety::tree_mutation_lock;
 use crate::io_handlers::tool_handler::ToolFunction;
+
+/// 会话边界根请求头(批 I 文件面重锚):值 = 会话工作区绝对路径
+/// (与连接级 `?workspace=` 同源,前端对文件面请求统一注入)。
+pub const WORKSPACE_HEADER: &str = "x-evo-workspace";
+
+/// 会话边界根解析(批 I 文件面重锚):
+/// - 头缺省/空 → serve workdir(**严格模式行为零变化**,既有测试锁护航);
+/// - 显式值 → 须为绝对路径(相对路径 400 拒绝),作为本请求的沙箱基准。
+///
+/// 安全语义:fs_safety 的越界拒绝 / `..` 上跳拒绝 / `\\?\` verbatim 处理 /
+/// 守护目标防线全部不变,仅「根的尺寸」由会话工作区显式选定——与 agent
+/// 通道 CapabilityBoundary 同语义(sandbox_root 即工作区),人工编辑面的
+/// workdir 沙箱定位本是 UX 边界(见模块文档),安全边界由会话能力边界与
+/// 鉴权承担。upload 端点不消费本头(附件固定落 workdir 产品存储面)。
+fn resolve_fs_root(
+    state: &AgentApiState,
+    header: Option<&HeaderValue>,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let raw = match header {
+        None => return Ok(state.workdir().to_path_buf()),
+        Some(h) => h
+            .to_str()
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "X-Evo-Workspace must be valid ASCII".to_string(),
+                )
+            })?
+            .trim(),
+    };
+    if raw.is_empty() {
+        return Ok(state.workdir().to_path_buf());
+    }
+    let p = PathBuf::from(raw);
+    if !p.is_absolute() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("X-Evo-Workspace must be an absolute path, got: {raw}"),
+        ));
+    }
+    Ok(p)
+}
+
+/// 读面工具 manifest 在场检查(PR-3 入口收口的运行期镜像,现场构造路径
+/// 同样适用:无 manifest 的工具拒载,防读面越界能力域)。
+fn ensure_manifest(state: &AgentApiState, name: &str) -> Result<(), (StatusCode, String)> {
+    if state.toolkit().manifest(name).is_none() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "tool '{name}' has no manifest (NoManifest) — refusing to invoke \
+                 (entry-point closure: read surface must not reach unmanifested tools)"
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// `GET /api/files/list` 查询参数
 #[derive(Debug, Deserialize)]
@@ -234,29 +295,52 @@ fn record_outcome(
 
 /// `GET /api/files/list` —— 列目录(委托 file_list 工具)
 ///
+/// `X-Evo-Workspace` 头在场时以该绝对路径为基准现场构造(同实现同校验);
+/// 缺省走 union toolkit 共享实例(严格模式行为零变化)。
 /// 错误 → 404(目录不存在)/ 400(路径越界等)。
 pub async fn list_dir(
     State(state): State<AgentApiState>,
     Query(q): Query<ListQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
     let mut args = serde_json::Map::new();
     if let Some(d) = &q.dir {
         args.insert("dir".to_string(), Value::from(d.as_str()));
     }
-    let v = call_toolkit_tool(&state, "file_list", Value::Object(args)).await?;
+    let v = if headers.contains_key(WORKSPACE_HEADER) {
+        ensure_manifest(&state, "file_list")?;
+        FileListTool::new(root)
+            .call(&Value::Object(args))
+            .await
+            .map_err(|e| (err_status(&e), e))?
+    } else {
+        call_toolkit_tool(&state, "file_list", Value::Object(args)).await?
+    };
     Ok(Json(v))
 }
 
 /// `GET /api/files/read` —— 读文件(委托 file_read 工具)
 ///
+/// `X-Evo-Workspace` 重锚语义同 list_dir。
 /// 错误 → 404(文件不存在)/ 400(路径越界 / 过大 / 非常规文件)。
 pub async fn read_file(
     State(state): State<AgentApiState>,
     Query(q): Query<ReadQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
     let mut args = serde_json::Map::new();
     args.insert("path".to_string(), Value::from(q.path.as_str()));
-    let v = call_toolkit_tool(&state, "file_read", Value::Object(args)).await?;
+    let v = if headers.contains_key(WORKSPACE_HEADER) {
+        ensure_manifest(&state, "file_read")?;
+        FileReadTool::new(root)
+            .call(&Value::Object(args))
+            .await
+            .map_err(|e| (err_status(&e), e))?
+    } else {
+        call_toolkit_tool(&state, "file_read", Value::Object(args)).await?
+    };
     Ok(Json(v))
 }
 
@@ -267,10 +351,12 @@ pub async fn read_file(
 /// 错误 → 403(anonymous)/ 400(路径越界 / 内容过大)。
 pub async fn write_file(
     State(state): State<AgentApiState>,
+    headers: HeaderMap,
     Json(body): Json<WriteBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
     let identity = gate_write(&state, "file_write", &body.path)?;
-    let tool = FileWriteTool::new(state.workdir().to_path_buf()).with_writable_dir(".");
+    let tool = FileWriteTool::new(root).with_writable_dir(".");
     let mut args = serde_json::Map::new();
     args.insert("path".to_string(), Value::from(body.path.as_str()));
     args.insert("content".to_string(), Value::from(body.content.as_str()));
@@ -350,6 +436,153 @@ pub async fn upload_file(
     result.map(Json)
 }
 
+/// `GET /api/fs/browse` 查询参数
+#[derive(Debug, Deserialize)]
+pub struct BrowseQuery {
+    /// 要列的目录绝对路径(缺省 = 列文件系统根:Windows 盘符 / POSIX 根)
+    pub path: Option<String>,
+}
+
+/// 目录浏览条目(只列子目录——本端点服务于「选工作区」目录选择器)
+#[derive(Debug, Serialize)]
+pub struct BrowseEntry {
+    /// 目录名
+    pub name: String,
+    /// 目录绝对路径(规整形态,可直接回填下一跳 path 参数)
+    pub path: String,
+}
+
+/// 目录浏览响应
+#[derive(Debug, Serialize)]
+pub struct BrowseResponse {
+    /// 当前目录绝对路径(根列表模式 = None)
+    pub path: Option<String>,
+    /// 父目录绝对路径(已是根 = None,面包屑上移用)
+    pub parent: Option<String>,
+    /// true = 盘符/根列表模式(path 缺省)
+    pub roots: bool,
+    /// 子目录列表(只列目录)
+    pub entries: Vec<BrowseEntry>,
+    /// 读取失败信息(权限等;fail-soft 不 500,空表 + 本字段)
+    pub error: Option<String>,
+}
+
+/// Windows/POSIX 根列表(path 缺省态)
+fn list_roots() -> BrowseResponse {
+    #[cfg(windows)]
+    {
+        let entries = (b'A'..=b'Z')
+            .map(|c| c as char)
+            .filter(|letter| std::path::Path::new(&format!("{letter}:\\")).exists())
+            .map(|letter| BrowseEntry {
+                name: format!("{letter}:"),
+                path: format!("{letter}:\\"),
+            })
+            .collect();
+        BrowseResponse {
+            path: None,
+            parent: None,
+            roots: true,
+            entries,
+            error: None,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let (entries, error) = match std::fs::read_dir("/") {
+            Ok(rd) => {
+                let mut es: Vec<BrowseEntry> = rd
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                    .map(|e| BrowseEntry {
+                        name: e.file_name().to_string_lossy().into_owned(),
+                        path: format!("/{}", e.file_name().to_string_lossy()),
+                    })
+                    .collect();
+                es.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                (es, None)
+            }
+            Err(e) => (Vec::new(), Some(format!("read_dir failed: {e}"))),
+        };
+        BrowseResponse {
+            path: Some("/".to_string()),
+            parent: None,
+            roots: true,
+            entries,
+            error,
+        }
+    }
+}
+
+/// `GET /api/fs/browse` —— 目录浏览(批 I 段 2,首页/工作台目录选择器消费面)
+///
+/// 语义:
+/// - `path` 缺省 → 列文件系统根(Windows = 存在的盘符;POSIX = `/`),`roots=true`;
+/// - `path` 显式 → 必须绝对路径(相对 400),必须存在(404)且为目录(400),
+///   返回其**子目录**列表(只列目录,不触文件内容);
+/// - 目录读取失败(权限等)fail-soft:空表 + `error` 字段;
+/// - 路径返回形态统一 canonicalize + 去 verbatim(前端直接可用)。
+///
+/// 定位与文件面一致:人的 UI 操作(选工作区),UX 边界非安全边界——本端点
+/// 只暴露目录名与目录路径,不读任何文件内容;鉴权由路由层 G16 中间件统一
+/// 承担。不消费 `X-Evo-Workspace`(本端点的使命就是自由选工作区)。
+pub async fn browse_dirs(
+    Query(q): Query<BrowseQuery>,
+) -> Result<Json<BrowseResponse>, (StatusCode, String)> {
+    let raw = match q.path.as_deref() {
+        None | Some("") => return Ok(Json(list_roots())),
+        Some(p) => p.trim(),
+    };
+    let p = PathBuf::from(raw);
+    if !p.is_absolute() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("path must be an absolute directory, got: {raw}"),
+        ));
+    }
+    let canon = simplify_verbatim(
+        p.canonicalize()
+            .map_err(|_| (StatusCode::NOT_FOUND, format!("path does not exist: {raw}")))?,
+    );
+    if !canon.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("path is not a directory: {}", canon.display()),
+        ));
+    }
+    let parent = canon.parent().map(|pp| {
+        simplify_verbatim(pp.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    });
+    let (mut entries, error) = match std::fs::read_dir(&canon) {
+        Ok(rd) => {
+            let mut es: Vec<BrowseEntry> = rd
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| BrowseEntry {
+                    name: e.file_name().to_string_lossy().into_owned(),
+                    path: simplify_verbatim(canon.join(e.file_name()))
+                        .to_string_lossy()
+                        .into_owned(),
+                })
+                .collect();
+            es.sort_by_key(|a| a.name.to_lowercase());
+            (es, None)
+        }
+        Err(e) => (Vec::new(), Some(format!("read_dir failed: {e}"))),
+    };
+    entries.retain(|e| !e.name.starts_with('.'));
+    Ok(Json(BrowseResponse {
+        path: Some(canon.to_string_lossy().into_owned()),
+        parent,
+        roots: false,
+        entries,
+        error,
+    }))
+}
+
 /// `POST /api/files/create` —— 创建文件/目录(委托 file_create 实现,`writable_dir="."`)
 ///
 /// 人工面语义:人工面不走 agent 审批(人即最终审批者,REST 面无 agent 会话
@@ -359,11 +592,13 @@ pub async fn upload_file(
 /// 错误 → 403(anonymous)/ 409(已存在)/ 400(越界 / 保留名 / 非法字符 / kind 非法)。
 pub async fn create_file(
     State(state): State<AgentApiState>,
+    headers: HeaderMap,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
     let identity = gate_write(&state, "file_create", &body.path)?;
     let _guard = tree_mutation_lock().lock().await;
-    let tool = FileCreateTool::new(state.workdir().to_path_buf()).with_writable_dir(".");
+    let tool = FileCreateTool::new(root).with_writable_dir(".");
     let mut args = serde_json::Map::new();
     args.insert("path".to_string(), Value::from(body.path.as_str()));
     if let Some(kind) = &body.kind {
@@ -386,11 +621,13 @@ pub async fn create_file(
 /// 错误 → 403(anonymous)/ 404(源或目标目录不存在)/ 400(越界 / 保留名 / 移入自身子树)。
 pub async fn move_file(
     State(state): State<AgentApiState>,
+    headers: HeaderMap,
     Json(body): Json<MoveBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
     let identity = gate_write(&state, "file_move", &body.path)?;
     let _guard = tree_mutation_lock().lock().await;
-    let tool = FileMoveTool::new(state.workdir().to_path_buf()).with_writable_dir(".");
+    let tool = FileMoveTool::new(root).with_writable_dir(".");
     let mut args = serde_json::Map::new();
     args.insert("path".to_string(), Value::from(body.path.as_str()));
     args.insert(
@@ -417,10 +654,12 @@ pub async fn move_file(
 pub async fn delete_file(
     State(state): State<AgentApiState>,
     Query(q): Query<DeleteQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
     let identity = gate_write(&state, "file_delete", &q.path)?;
     let _guard = tree_mutation_lock().lock().await;
-    let tool = FileDeleteTool::new(state.workdir().to_path_buf()).with_writable_dir(".");
+    let tool = FileDeleteTool::new(root).with_writable_dir(".");
     let mut args = serde_json::Map::new();
     args.insert("path".to_string(), Value::from(q.path.as_str()));
     let result = tool
@@ -442,11 +681,12 @@ pub async fn delete_file(
 /// 错误 → 404(dir 不存在)/ 400(非法正则 / 非法 glob / 参数非法 / 越界)。
 pub async fn search_files(
     State(state): State<AgentApiState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let params = crate::builtin_tools::grep_files::GrepParams::from_args(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let workdir = state.workdir().to_path_buf();
+    let workdir = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
     // G13:核心层为同步 fs 遍历,spawn_blocking 包装
     let v = tokio::task::spawn_blocking(move || {
         crate::builtin_tools::grep_files::grep_core(&workdir, &params, None)
@@ -476,6 +716,7 @@ pub async fn search_files(
 /// 错误 → 403(anonymous 写)/ 404(dir 不存在)/ 400(缺 replacement / 非法正则 / glob / 参数非法)。
 pub async fn replace_files(
     State(state): State<AgentApiState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let params = crate::builtin_tools::grep_files::ReplaceParams::from_args(&body)
@@ -486,7 +727,7 @@ pub async fn replace_files(
     if params.apply {
         gate_write(&state, "files_replace", &query_selector)?;
     }
-    let workdir = state.workdir().to_path_buf();
+    let workdir = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
     // G13:apply=true 在 replace_core 内部 blocking_lock 持树写锁,
     // 必须 spawn_blocking(禁 async 上下文直调);apply 快照供闭包后判定
     let apply = params.apply;
@@ -618,7 +859,7 @@ mod tests {
             path: "notes/todo.md".to_string(),
             content: "- [ ] item".to_string(),
         };
-        let resp = write_file(State(state), Json(body)).await;
+        let resp = write_file(State(state), HeaderMap::new(), Json(body)).await;
         assert!(resp.is_ok(), "write should succeed, got: {:?}", resp.err());
         let written = std::fs::read_to_string(dir_canon.join("notes/todo.md")).unwrap();
         assert_eq!(written, "- [ ] item");
@@ -629,7 +870,10 @@ mod tests {
         mutation_state(dir_canon)
     }
 
-    /// 构造 anonymous 身份(auth disabled)的 handler 级 AgentApiState
+    /// 构造 anonymous 身份(auth disabled)的 handler 级 AgentApiState。
+    /// toolkit 用生产同款内置装配(default_safe_toolkit_with_profile,15 工具
+    /// 带 manifest)——读面 list/read 的 manifest 在场检查是生产行为的一部分,
+    /// 测试态必须镜像;规则工具需远端引擎,单测不装配。
     fn anonymous_state(dir_canon: &std::path::Path) -> AgentApiState {
         AgentApiState::new_with_metrics(
             crate::agent::definition::AgentDefinitionManager::new(dir_canon.join("agents")),
@@ -640,7 +884,11 @@ mod tests {
                 "http://localhost:0",
             )),
             std::sync::Arc::new(std::sync::RwLock::new(
-                crate::io_handlers::tool_handler::ToolHandler::new(),
+                crate::builtin_tools::default_safe_toolkit_with_profile(
+                    dir_canon,
+                    dir_canon,
+                    crate::builtin_tools::shell_exec::ExecutionProfile::Workbench,
+                ),
             )),
         )
     }
@@ -670,6 +918,7 @@ mod tests {
         let state = anonymous_state(&dir_canon); // auth disabled = anonymous
         let resp = write_file(
             State(state),
+            HeaderMap::new(),
             Json(WriteBody {
                 path: "should-not-exist.txt".to_string(),
                 content: "nope".to_string(),
@@ -709,6 +958,7 @@ mod tests {
         let state = anonymous_state(&dir_canon);
         let (status, _) = create_file(
             State(state.clone()),
+            HeaderMap::new(),
             Json(CreateBody {
                 path: "new.txt".to_string(),
                 kind: None,
@@ -722,6 +972,7 @@ mod tests {
             Query(DeleteQuery {
                 path: "keep.txt".to_string(),
             }),
+            HeaderMap::new(),
         )
         .await
         .expect_err("anonymous delete must be denied");
@@ -742,6 +993,7 @@ mod tests {
         let state = human_state(&dir_canon);
         let resp = create_file(
             State(state),
+            HeaderMap::new(),
             Json(CreateBody {
                 path: "ledgertest/a.md".to_string(),
                 kind: None,
@@ -772,6 +1024,7 @@ mod tests {
         // 预览只读:匿名放行
         let preview = replace_files(
             State(state.clone()),
+            HeaderMap::new(),
             Json(serde_json::json!({ "query": "foo", "replacement": "bar" })),
         )
         .await;
@@ -784,6 +1037,7 @@ mod tests {
         // apply=true:匿名 403,文件未被改写
         let (status, _) = replace_files(
             State(state),
+            HeaderMap::new(),
             Json(serde_json::json!({
                 "query": "foo",
                 "replacement": "bar",
@@ -827,6 +1081,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = create_file(
             State(state),
+            HeaderMap::new(),
             Json(CreateBody {
                 path: "notes/todo.md".to_string(),
                 kind: None,
@@ -849,6 +1104,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = create_file(
             State(state),
+            HeaderMap::new(),
             Json(CreateBody {
                 path: "docs/guides".to_string(),
                 kind: Some("dir".to_string()),
@@ -874,8 +1130,10 @@ mod tests {
                 kind: None,
             })
         };
-        let _ = create_file(State(state.clone()), mk_body()).await.unwrap();
-        let second = create_file(State(state), mk_body()).await;
+        let _ = create_file(State(state.clone()), HeaderMap::new(), mk_body())
+            .await
+            .unwrap();
+        let second = create_file(State(state), HeaderMap::new(), mk_body()).await;
         let (status, msg) = second.expect_err("duplicate create must fail");
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(msg.contains("already exists"), "got: {msg}");
@@ -891,6 +1149,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = create_file(
             State(state),
+            HeaderMap::new(),
             Json(CreateBody {
                 path: "../escape.txt".to_string(),
                 kind: None,
@@ -914,6 +1173,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = move_file(
             State(state),
+            HeaderMap::new(),
             Json(MoveBody {
                 path: "src/a.txt".to_string(),
                 target_dir: "dst".to_string(),
@@ -939,6 +1199,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = move_file(
             State(state),
+            HeaderMap::new(),
             Json(MoveBody {
                 path: "nope.txt".to_string(),
                 target_dir: "dst".to_string(),
@@ -965,6 +1226,7 @@ mod tests {
             Query(DeleteQuery {
                 path: "gone.txt".to_string(),
             }),
+            HeaderMap::new(),
         )
         .await;
         let v = resp.expect("delete should succeed");
@@ -990,6 +1252,7 @@ mod tests {
             Query(DeleteQuery {
                 path: "nope.txt".to_string(),
             }),
+            HeaderMap::new(),
         )
         .await;
         let (status, _) = resp.expect_err("missing target must fail");
@@ -1009,6 +1272,7 @@ mod tests {
             Query(DeleteQuery {
                 path: ".".to_string(),
             }),
+            HeaderMap::new(),
         )
         .await;
         let (status, _) = resp.expect_err("workdir root must be guarded");
@@ -1030,6 +1294,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = search_files(
             State(state),
+            HeaderMap::new(),
             Json(serde_json::json!({ "query": "needle", "smartCase": false })),
         )
         .await;
@@ -1051,6 +1316,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = search_files(
             State(state),
+            HeaderMap::new(),
             Json(serde_json::json!({ "query": "(", "isRegex": true })),
         )
         .await;
@@ -1069,6 +1335,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = search_files(
             State(state),
+            HeaderMap::new(),
             Json(serde_json::json!({ "query": "x", "dir": "nope" })),
         )
         .await;
@@ -1086,6 +1353,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = search_files(
             State(state),
+            HeaderMap::new(),
             Json(serde_json::json!({ "query": "x", "dir": "../outside" })),
         )
         .await;
@@ -1104,6 +1372,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = replace_files(
             State(state),
+            HeaderMap::new(),
             Json(serde_json::json!({
                 "query": "foo",
                 "replacement": "baz",
@@ -1139,6 +1408,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = replace_files(
             State(state),
+            HeaderMap::new(),
             Json(serde_json::json!({
                 "query": "foo",
                 "replacement": "baz",
@@ -1165,7 +1435,12 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| dir.path().to_path_buf());
         let state = mutation_state(&dir_canon);
-        let resp = replace_files(State(state), Json(serde_json::json!({ "query": "x" }))).await;
+        let resp = replace_files(
+            State(state),
+            HeaderMap::new(),
+            Json(serde_json::json!({ "query": "x" })),
+        )
+        .await;
         let (status, msg) = resp.expect_err("missing replacement must fail");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("replacement"), "got: {msg}");
@@ -1181,11 +1456,241 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = replace_files(
             State(state),
+            HeaderMap::new(),
             Json(serde_json::json!({ "query": "(", "isRegex": true, "replacement": "x" })),
         )
         .await;
         let (status, msg) = resp.expect_err("invalid regex must fail");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("invalid regex"), "got: {msg}");
+    }
+
+    // =========================================================================
+    // 批 I:会话工作区重锚(X-Evo-Workspace 头)
+    // =========================================================================
+
+    /// 构造携带会话工作区头的 HeaderMap
+    fn ws_headers(v: &std::path::Path) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        m.insert(
+            WORKSPACE_HEADER,
+            HeaderValue::from_str(&v.to_string_lossy()).unwrap(),
+        );
+        m
+    }
+
+    /// tempdir 路径 canonicalize(Windows 下取 \\?\ verbatim 去除后的实路径)
+    fn canon(p: &std::path::Path) -> std::path::PathBuf {
+        p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+    }
+
+    /// workspace 指向 workdir 外目录:list / read / write 均以工作区为基准,
+    /// workdir 自身不被触碰(严格/自由隔离的核心锁)。
+    #[tokio::test]
+    async fn test_workspace_header_reanchors_read_and_write() {
+        let dir = tempfile::tempdir().unwrap(); // serve workdir
+        let ws = tempfile::tempdir().unwrap(); // 会话工作区(workdir 外)
+        let dir_canon = canon(dir.path());
+        let ws_canon = canon(ws.path());
+        std::fs::write(ws_canon.join("outer.md"), b"outside content").unwrap();
+        let state = mutation_state(&dir_canon);
+
+        // list:工作区根可见 outer.md
+        let v = list_dir(
+            State(state.clone()),
+            Query(ListQuery { dir: None }),
+            ws_headers(&ws_canon),
+        )
+        .await
+        .expect("list at workspace root should succeed");
+        assert!(
+            v.to_string().contains("outer.md"),
+            "workspace root listing must see workspace files, got: {v:?}"
+        );
+
+        // read:读工作区内文件
+        let v = read_file(
+            State(state.clone()),
+            Query(ReadQuery {
+                path: "outer.md".to_string(),
+            }),
+            ws_headers(&ws_canon),
+        )
+        .await
+        .expect("read at workspace root should succeed");
+        assert_eq!(v["content"], "outside content");
+
+        // write:写进工作区(写面走 HumanGate,mutation_state=human)
+        let resp = write_file(
+            State(state.clone()),
+            ws_headers(&ws_canon),
+            Json(WriteBody {
+                path: "new-in-ws.txt".to_string(),
+                content: "hi".to_string(),
+            }),
+        )
+        .await;
+        assert!(resp.is_ok(), "write into workspace should succeed");
+        assert_eq!(
+            std::fs::read_to_string(ws_canon.join("new-in-ws.txt")).unwrap(),
+            "hi"
+        );
+        // workdir 未被触碰
+        assert!(
+            !dir_canon.join("new-in-ws.txt").exists(),
+            "write must land in workspace, not serve workdir"
+        );
+    }
+
+    /// 相对路径 workspace 拒绝(400):重锚只接受绝对路径
+    #[tokio::test]
+    async fn test_workspace_header_relative_path_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = mutation_state(&canon(dir.path()));
+        let mut m = HeaderMap::new();
+        m.insert(WORKSPACE_HEADER, HeaderValue::from_static("relative/path"));
+        let resp = list_dir(State(state), Query(ListQuery { dir: None }), m).await;
+        let (status, msg) = resp.expect_err("relative workspace must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("absolute path"), "got: {msg}");
+    }
+
+    /// 重锚后沙箱防线不松:工作区外(`..` 上跳)仍拒
+    #[tokio::test]
+    async fn test_workspace_header_escape_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let state = mutation_state(&canon(dir.path()));
+        let resp = list_dir(
+            State(state),
+            Query(ListQuery {
+                dir: Some("..".to_string()),
+            }),
+            ws_headers(&canon(ws.path())),
+        )
+        .await;
+        let (status, _) = resp.expect_err("parent escape at workspace root must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// 空 workspace 头 = 严格模式回落 serve workdir(行为零变化口径)
+    #[tokio::test]
+    async fn test_workspace_header_empty_falls_back_to_workdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = canon(dir.path());
+        std::fs::write(dir_canon.join("inside.md"), b"inside").unwrap();
+        let state = mutation_state(&dir_canon);
+        let mut m = HeaderMap::new();
+        m.insert(WORKSPACE_HEADER, HeaderValue::from_static("   "));
+        let v = list_dir(State(state), Query(ListQuery { dir: None }), m)
+            .await
+            .expect("empty header must fall back to workdir");
+        assert!(
+            v.to_string().contains("inside.md"),
+            "fallback listing must see workdir files, got: {v:?}"
+        );
+    }
+
+    // =========================================================================
+    // 批 I 段 2:GET /api/fs/browse 目录浏览(选工作区目录选择器消费面)
+    // =========================================================================
+
+    /// path 缺省 = 根列表模式(Windows 盘符 / POSIX 根),entries 非空
+    #[tokio::test]
+    async fn test_browse_default_returns_roots() {
+        let v = browse_dirs(Query(BrowseQuery { path: None }))
+            .await
+            .expect("default browse should return root list");
+        assert!(v.roots, "default browse must be roots mode");
+        assert!(v.path.is_none(), "roots mode has no current path");
+        assert!(
+            !v.entries.is_empty(),
+            "root list must be non-empty on any CI runner"
+        );
+        assert!(v.parent.is_none(), "roots mode has no parent");
+    }
+
+    /// 显式目录:只列子目录(不列文件),path/parent 规整返回
+    #[tokio::test]
+    async fn test_browse_lists_dirs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = canon(dir.path());
+        std::fs::create_dir(dir_canon.join("sub")).unwrap();
+        std::fs::write(dir_canon.join("file.txt"), b"x").unwrap();
+        let v = browse_dirs(Query(BrowseQuery {
+            path: Some(dir_canon.to_string_lossy().into_owned()),
+        }))
+        .await
+        .expect("browse tempdir should succeed");
+        assert!(!v.roots);
+        assert_eq!(
+            v.path.as_deref(),
+            Some(
+                simplify_verbatim(dir_canon.clone())
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "current path must be canonicalized (verbatim-stripped)"
+        );
+        assert_eq!(
+            v.parent.as_deref(),
+            dir_canon
+                .parent()
+                .map(|p| simplify_verbatim(p.to_path_buf())
+                    .to_string_lossy()
+                    .into_owned())
+                .as_deref(),
+            "parent must be the canonical parent dir"
+        );
+        assert_eq!(v.entries.len(), 1, "only subdirs listed, files skipped");
+        assert_eq!(v.entries[0].name, "sub");
+        assert_eq!(
+            v.entries[0].path,
+            simplify_verbatim(dir_canon.join("sub"))
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
+
+    /// 相对路径拒绝(400)——浏览面同样只收绝对路径
+    #[tokio::test]
+    async fn test_browse_rejects_relative_path() {
+        let resp = browse_dirs(Query(BrowseQuery {
+            path: Some("relative/dir".to_string()),
+        }))
+        .await;
+        let (status, msg) = resp.expect_err("relative path must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            msg.contains("absolute"),
+            "error must say absolute, got: {msg}"
+        );
+    }
+
+    /// 不存在路径 404;指向文件(非目录)400
+    #[tokio::test]
+    async fn test_browse_missing_and_file_paths() {
+        let missing = browse_dirs(Query(BrowseQuery {
+            path: Some("Z:\\definitely-not-evo-browse\\nope".to_string()),
+        }))
+        .await;
+        #[cfg(not(windows))]
+        let missing = browse_dirs(Query(BrowseQuery {
+            path: Some("/definitely-not-evo-browse/nope".to_string()),
+        }))
+        .await;
+        let (status, _) = missing.expect_err("missing path must 404");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let not_dir = browse_dirs(Query(BrowseQuery {
+            path: Some(file.to_string_lossy().into_owned()),
+        }))
+        .await;
+        let (status, msg) = not_dir.expect_err("file path must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("not a directory"), "got: {msg}");
     }
 }

@@ -8,16 +8,15 @@
 <script>
   import { onMount, tick } from 'svelte';
   import { get } from 'svelte/store';
-  import { listDir, createFile, moveFile, deleteFile } from '../lib/api.js';
+  import { listDir, listDirWorkdir, browseFs, createFile, moveFile, deleteFile } from '../lib/api.js';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
   import { reconnectCurrent } from '../lib/ws.js';
   import {
-    validateWorkspaceInput,
-    updateWorkspaceRecent,
     loadRecentWorkspaces,
-    saveRecentWorkspaces,
+    validateWorkspaceInput,
     workspaceAnchor,
     workspaceLabel as wsLabelOf,
+    switchWorkspace,
   } from '../lib/workspace.js';
   import {
     openFile,
@@ -28,9 +27,11 @@
     connStatus,
     gitStatus,
     pendingTreeReveal,
+    workspaceEpoch,
   } from '../lib/stores.js';
   import ContextMenu from './ContextMenu.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
+  import DirectoryBrowser from './DirectoryBrowser.svelte';
   import OutlinePanel from './OutlinePanel.svelte';
 
   // ---- git 状态字母装饰(B3) ----
@@ -72,17 +73,21 @@
   // path('' = 根) → {loaded, expanded, children}
   const dirState = new Map();
 
-  // ---- E1 工作区:文件树锚点 + 重连刷新 ----
-  // REST 文件面以 serve workdir 为根(绝对路径拒绝,安全红线不松);工作区在
-  // workdir 之下时树锚定其相对子目录(anchor),之外时保持 workdir 根(agent
-  // 能力边界仍随新连接生效,提示条明示)。
+  // ---- E1/批 I 工作区:文件树锚定 + 重连刷新 ----
+  // 批 I 重锚语义:文件面 8 端点按 X-Evo-Workspace 头重锚(api.js 统一注入),
+  // 树根 = 有效根(工作区 || serve workdir),树路径恒为有效根相对(anchor
+  // 恒空串)。fs watcher 固定盯 serve workdir,事件换算锚 wsAnchor 承担
+  // workdir 相对 → 树空间的换算(工作区在 workdir 之外时事件整体忽略)。
   const IS_WIN = typeof navigator !== 'undefined' && /win/i.test(navigator.userAgent || '');
-  let anchor = ''; // 树根的 workdir 相对路径('' = workdir 根)
-  let lastRootDir = ''; // 最近一次 listDir 返回的 serve workdir(重连对比用)
+  let anchor = ''; // 树根的相对路径(批 I 重锚后恒 ''——树根即有效根)
+  let serveWorkdir = ''; // serve workdir 绝对路径(无头探测;事件换算基准)
+  let wsAnchor = ''; // 事件换算前缀('' 直通 / null 忽略,见 workspaceAnchor)
+  let lastRootDir = ''; // 最近一次 listDir 返回的有效根(重连对比用)
   let lastWsAtLoad = ''; // 最近一次建树时的工作区(重连对比用)
   let didLoad = false; // 首树建好后重连才做按需刷新
   let wsMenu = null; // 工作区下拉 {x, y, items}
   let wsDialog = null; // 切换工作区对话框 {value, error, probe}
+  let wsBrowserOpen = false; // 目录浏览器(选工作区)
   let wsNotice = ''; // 工作区切换提示条(带「立即重连」)
   let recentWs = loadRecentWorkspaces();
 
@@ -94,9 +99,22 @@
   // {mode:'rename', target: node, depth, value, error}
   let naming = null;
 
-  // ---- 右键菜单 / 删除确认 ----
+  // ---- 右键菜单 / 删除确认 / 工作区切换确认 ----
   let menu = null; // {x, y, items}
-  let confirmState = null; // {message, run()}
+  let confirmState = null; // {message, run(), cancel()?}
+
+  /** 确认对话框 Promise 化(switchWorkspace 的 confirmFn 注入用) */
+  function confirmViaDialog(message) {
+    return new Promise((resolve) => {
+      confirmState = {
+        title: '确认',
+        confirmText: '继续',
+        message,
+        run: () => resolve(true),
+        cancel: () => resolve(false),
+      };
+    });
+  }
 
   // ---- 选中与拖拽(选中 = 命令面板节点命令的作用对象;DnD = 树内移动) ----
   let selected = null;
@@ -338,6 +356,8 @@
 
   function askDelete(node) {
     confirmState = {
+      title: '删除确认',
+      confirmText: '删除',
       message: `删除「${node.name}」?内容将移入回收目录(.evo-trash),可手动找回。`,
       run: async () => {
         try {
@@ -416,26 +436,51 @@
 
   // =========================================================================
   // WS fs_events 增量刷新(受影响目录重读 → rebuild,不全树 refetch)
+  // 事件路径为 workdir 相对(watcher 固定盯 serve workdir),经 eventToTreePath
+  // 换算到树空间(有效根相对);工作区在 workdir 之外时事件整体忽略。
   // =========================================================================
+
+  /** workdir 相对事件路径 → 树空间路径;null = 树空间外,忽略 */
+  function eventToTreePath(p) {
+    if (!wsAnchor) return p; // 未设工作区或工作区 = workdir:事件空间 == 树空间
+    const norm = String(p || '').replace(/[\\/]+/g, '/').replace(/\/+$/g, '');
+    const prefix = `${wsAnchor}/`;
+    const normC = IS_WIN ? norm.toLowerCase() : norm;
+    const prefixC = IS_WIN ? prefix.toLowerCase() : prefix;
+    if (normC === prefixC.slice(0, -1)) return ''; // 事件指向树根本身
+    if (!normC.startsWith(prefixC)) return null;
+    return norm.slice(prefix.length);
+  }
 
   async function applyFsEvents(events) {
     const toReload = new Set();
     const toInvalidate = new Set();
-    const touchParent = (p) => toReload.add(parentDir(p));
-    const invalidate = (p) => {
-      toInvalidate.add(p);
-      touchParent(p);
+    const touchParent = (treePath) => toReload.add(parentDir(treePath));
+    const invalidate = (treePath) => {
+      toInvalidate.add(treePath);
+      touchParent(treePath);
     };
-    for (const p of events.added || []) touchParent(p);
-    for (const p of events.updated || []) touchParent(p);
-    for (const p of events.removed || []) invalidate(p);
+    const conv = (p) => {
+      const t = eventToTreePath(p);
+      if (t !== null) touchParent(t);
+      return t;
+    };
+    for (const p of events.added || []) conv(p);
+    for (const p of events.updated || []) conv(p);
+    for (const p of events.removed || []) {
+      const t = conv(p);
+      if (t !== null) invalidate(t);
+    }
     for (const m of events.moved || []) {
-      invalidate(m.from);
-      touchParent(m.to);
+      const from = eventToTreePath(m.from);
+      const to = eventToTreePath(m.to);
+      if (from === null || to === null) continue;
+      invalidate(from);
+      touchParent(to);
       // 移动目录:旧子树的展开/懒加载状态全部失效
-      toInvalidate.add(m.to);
+      toInvalidate.add(to);
       // tabs 联动:外部/agent 侧移动时已打开 tab 跟随迁移(dirty 保留)
-      renameTabPath(m.from, m.to);
+      renameTabPath(from, to);
     }
     // 失效:删除以失效路径为前缀的全部 dirState 条目
     if (toInvalidate.size) {
@@ -476,15 +521,6 @@
   let flashPath = null; // 定位闪烁的节点路径(1.5s 自动清)
   let flashTimer = null;
 
-  /** 工作区路径 → 树内路径(锚点换算);null = 树外 */
-  function toTreePath(p) {
-    if (!p) return '';
-    if (!anchor) return p;
-    if (p === anchor) return '';
-    if (p.startsWith(`${anchor}/`)) return p.slice(anchor.length + 1);
-    return null;
-  }
-
   async function revealInTree(target) {
     try {
       const segs = target ? target.split('/').filter(Boolean) : [];
@@ -516,9 +552,8 @@
   async function consumeTreeReveal(sig) {
     if (!sig?.path) return;
     pendingTreeReveal.set(null);
-    const target = toTreePath(sig.path);
-    if (target === null) return;
-    await revealInTree(target);
+    // 批 I:agent 信号路径与树同空间(agent 能力边界相对 = 有效根相对),直用
+    await revealInTree(sig.path);
   }
 
   $: consumeTreeReveal($pendingTreeReveal);
@@ -527,18 +562,22 @@
   // E1 工作区:建树/重连刷新 + 下拉菜单 + 切换对话框
   // =========================================================================
 
-  /** 建树(挂载与工作区变化后共用):重读根 → 换算锚点 → 全量重建 */
+  /** 建树(挂载与工作区纪元变化后共用):无头探测 workdir(事件换算基准,
+   *  ws 空时兼作根列表)→ 根列表 = 有效根(listDir 按头重锚)→ 全量重建 */
   async function initTree() {
     try {
-      const res = await listDir();
-      lastRootDir = res.dir || '';
-      lastWsAtLoad = localStorage.getItem('evo_workspace') || '';
-      anchor = workspaceAnchor(lastRootDir, lastWsAtLoad, { caseInsensitive: IS_WIN }) || '';
-      dirState.clear(); // 锚点可能变化,旧展开/懒加载状态整树失效
+      const ws = localStorage.getItem('evo_workspace') || '';
+      lastWsAtLoad = ws;
+      dirState.clear(); // 根可能变化,旧展开/懒加载状态整树失效
       rootChildren = [];
-      const segSrc = anchor || lastRootDir;
-      const seg = segSrc.split(/[\\/]/).filter(Boolean).pop();
-      if (seg) rootName = seg;
+      const base = await listDirWorkdir();
+      serveWorkdir = base.dir || '';
+      wsAnchor = ws ? workspaceAnchor(serveWorkdir, ws, { caseInsensitive: IS_WIN }) : '';
+      const res = ws ? await listDir() : base;
+      lastRootDir = res.dir || '';
+      rootName = ws
+        ? wsLabelOf(ws) || ws || '工作区'
+        : lastRootDir.split(/[\\/]/).filter(Boolean).pop() || 'evo-agent(工作区)';
       await loadChildren(anchor);
       rootChildren = dirState.get(anchor)?.children || [];
       // 恢复上次折叠状态(目录已不存在的条目静默跳过)
@@ -580,38 +619,24 @@
     const el = e.currentTarget || e.target;
     const r = el.getBoundingClientRect ? el.getBoundingClientRect() : { left: e.clientX, bottom: e.clientY };
     const cur = currentWorkspace();
+    recentWs = loadRecentWorkspaces(); // 任意入口切换后保持新鲜
     const items = recentWs.map((p) => ({
       label: `${p === cur ? '✓ ' : ''}${p}`,
       action: () => applyWorkspace(p),
     }));
     if (items.length) items.push({ separator: true });
+    items.push({ label: '浏览目录…', action: () => (wsBrowserOpen = true) });
     items.push({ label: '切换工作区…', action: openWsDialog });
     items.push({ label: '恢复缺省(serve workdir)', action: () => applyWorkspace('') });
     wsMenu = { x: r.left, y: r.bottom + 2, items };
   }
 
-  /** 应用工作区(切换/恢复缺省共用):写 localStorage → 提示条(重连生效);
-   *  广播 evo:workspace-changed 供对话侧栏同步按钮态。 */
-  function applyWorkspace(v) {
-    const chk = validateWorkspaceInput(v);
-    if (!chk.ok) {
-      wsNotice = `工作区路径不合法:${chk.error}`;
-      return;
-    }
-    if (chk.value) {
-      localStorage.setItem('evo_workspace', chk.value);
-      recentWs = updateWorkspaceRecent(recentWs, chk.value);
-      saveRecentWorkspaces(recentWs);
-      wsNotice = `工作区已设为:${wsLabelOf(chk.value) || chk.value}。对新连接生效(新建会话/换线/重连)。`;
-    } else {
-      localStorage.removeItem('evo_workspace');
-      wsNotice = '已恢复缺省工作区(serve workdir)。对新连接生效。';
-    }
-    try {
-      window.dispatchEvent(new CustomEvent('evo:workspace-changed'));
-    } catch {
-      /* 非浏览器环境(测试)静默 */
-    }
+  /** 应用工作区(切换/恢复缺省共用):统一切换入口(dirty 护栏 + 落库 +
+   *  关文件 tab + 纪元自增);树重建与提示条由纪元订阅统一承担。 */
+  async function applyWorkspace(v) {
+    const r = await switchWorkspace(v, confirmViaDialog);
+    if (!r.ok && r.error) wsNotice = `工作区路径不合法:${r.error}`;
+    // 用户取消:零副作用静默;成功:纪元订阅负责重建树并提示
   }
 
   function openWsDialog() {
@@ -620,18 +645,12 @@
 
   function confirmWsDialog() {
     if (!wsDialog) return;
-    const chk = validateWorkspaceInput(wsDialog.value);
-    if (!chk.ok) {
-      wsDialog = { ...wsDialog, error: chk.error };
-      return;
-    }
-    applyWorkspace(chk.value);
+    applyWorkspace(wsDialog.value);
     wsDialog = null;
   }
 
-  /** 探测输入路径(尽力而为):REST 文件面 workdir 根限定,越界/外部路径
-   *  探测必然失败——提示措辞明示「新边界属正常」,不阻断切换(serve 为
-   *  一等校验面,连接失败可恢复缺省)。 */
+  /** 探测输入路径(尽力而为):走 /api/fs/browse(绝对路径目录导航面),
+   *  任意绝对路径均可探测——失败即目录不存在/不可访问,措辞如实提示。 */
   async function probeWsPath() {
     if (!wsDialog) return;
     const chk = validateWorkspaceInput(wsDialog.value);
@@ -642,12 +661,12 @@
     wsDialog = { ...wsDialog, error: '', probe: chk.value ? '探测中…' : '' };
     if (!chk.value) return;
     try {
-      await listDir(chk.value);
-      wsDialog = { ...wsDialog, probe: '探测:该路径可从当前连接访问。' };
+      await browseFs(chk.value);
+      wsDialog = { ...wsDialog, probe: '探测:目录存在且可访问。' };
     } catch (e) {
       wsDialog = {
         ...wsDialog,
-        probe: `探测:当前连接无法访问该目录(${String(e?.message || e)})——若为新能力边界属正常,以重连后实况为准。`,
+        probe: `探测失败:${String(e?.message || e)}`,
       };
     }
   }
@@ -733,10 +752,25 @@
       }
       prevConn = s;
     });
+    // 批 I:工作区纪元(任意入口切换)→ 树重建 + 提示条(挂载期首树由
+    // 上方 initTree 承担;取消切换不触发纪元,零副作用)
+    let epochSeen = get(workspaceEpoch);
+    const unsubEpoch = workspaceEpoch.subscribe((n) => {
+      if (n === epochSeen) return;
+      epochSeen = n;
+      if (!didLoad) return;
+      const ws = localStorage.getItem('evo_workspace') || '';
+      initTree().then(() => {
+        wsNotice = ws
+          ? `文件树已随工作区重锚:${wsLabelOf(ws) || ws}。文件面即刻生效;agent 能力边界对新连接生效(立即重连可提前)。`
+          : '已恢复缺省工作区(serve workdir),文件树已重锚。agent 能力边界对新连接生效(立即重连可提前)。';
+      });
+    });
     return () => {
       for (const c of commands) unregisterCommand(c.id);
       unsubFs();
       unsubConn();
+      unsubEpoch();
     };
   });
 </script>
@@ -754,7 +788,7 @@
       class:drop-root={dragOverPath === anchor}
       role="button"
       tabindex="0"
-      title={`树根:${anchor || 'serve workdir 根'}\n点击切换工作区(重连生效);拖动节点到此处移动到树根`}
+      title={`树根:${currentWorkspace() || 'serve workdir 根'}\n点击切换工作区(文件面即刻重锚);拖动节点到此处移动到树根`}
       onclick={openWsMenu}
       onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && openWsMenu(e)}
       ondragover={(e) => dragOver(e, anchor)}
@@ -909,7 +943,7 @@
 {/if}
 
 {#if wsDialog}
-  <!-- E1:切换工作区对话框(输入框 + 校验 + 尽力而为探测;替代裸 prompt) -->
+  <!-- E1/批 I:切换工作区对话框(输入框 + 校验 + browse 探测 + 目录浏览器) -->
   <div
     class="ws-overlay"
     role="presentation"
@@ -918,7 +952,8 @@
     <div class="ws-dialog" role="dialog" aria-modal="true" aria-label="切换工作区">
       <div class="ws-dialog-title">切换工作区</div>
       <div class="ws-dialog-hint">
-        绝对路径,作为 agent 读写能力边界(重连后生效;serve workdir 之下的子目录将同时成为文件树根)。留空恢复缺省。
+        绝对路径,作为 agent 读写能力边界;文件树与文件面即刻随工作区重锚,agent
+        边界对新连接生效(新建会话/换线/重连)。留空恢复缺省。
       </div>
       <input
         class="ws-input mono"
@@ -939,6 +974,8 @@
         <div class="ws-dialog-probe">{wsDialog.probe}</div>
       {/if}
       <div class="ws-dialog-actions">
+        <button class="ws-btn-plain" onclick={() => (wsBrowserOpen = true)}>浏览目录…</button>
+        <span class="ws-dialog-gap" />
         <button class="ws-btn-plain" onclick={() => (wsDialog = null)}>取消</button>
         <button class="ws-btn-primary" onclick={confirmWsDialog}>切换</button>
       </div>
@@ -946,17 +983,39 @@
   </div>
 {/if}
 
+{#if wsBrowserOpen}
+  <!-- 批 I 段 3:目录浏览器(/api/fs/browse 消费面;选定回填输入框并探测) -->
+  <DirectoryBrowser
+    title="选择工作区目录"
+    initialPath={wsDialog?.value || ''}
+    on:select={(e) => {
+      wsBrowserOpen = false;
+      if (wsDialog) {
+        wsDialog = { ...wsDialog, value: e.detail.path };
+        probeWsPath();
+      } else {
+        applyWorkspace(e.detail.path);
+      }
+    }}
+    on:close={() => (wsBrowserOpen = false)}
+  />
+{/if}
+
 <ConfirmDialog
   open={!!confirmState}
-  title="删除确认"
+  title={confirmState?.title || '确认'}
   message={confirmState?.message || ''}
-  confirmText="删除"
+  confirmText={confirmState?.confirmText || '继续'}
   on:confirm={() => {
-    const run = confirmState?.run;
+    const c = confirmState;
     confirmState = null;
-    run?.();
+    c?.run?.();
   }}
-  on:cancel={() => (confirmState = null)}
+  on:cancel={() => {
+    const c = confirmState;
+    confirmState = null;
+    c?.cancel?.();
+  }}
 />
 
 <style>
@@ -1119,8 +1178,12 @@
   .ws-dialog-actions {
     display: flex;
     justify-content: flex-end;
+    align-items: center;
     gap: 8px;
     margin-top: 12px;
+  }
+  .ws-dialog-gap {
+    flex: 1;
   }
   .ws-btn-plain {
     border: 1px solid var(--border);
