@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { get } from 'svelte/store';
 import {
   validateWorkspaceInput,
   updateWorkspaceRecent,
   workspaceAnchor,
   workspaceLabel,
+  switchWorkspace,
 } from '../src/lib/workspace.js';
+import { tabs, workspaceEpoch } from '../src/lib/stores.js';
 
 describe('validateWorkspaceInput', () => {
   it('空串 = 恢复缺省(ok, value 空)', () => {
@@ -102,5 +105,98 @@ describe('workspaceLabel', () => {
 
   it('空值返回空串', () => {
     expect(workspaceLabel('')).toBe('');
+  });
+});
+
+// ---- switchWorkspace(批 I 段 3 统一切换入口) ----
+// node 环境:localStorage 桩 + window/CustomEvent 缺失由入口内 try-catch 静默
+
+function memoryStorage() {
+  const m = new Map();
+  return {
+    getItem: (k) => (m.has(k) ? m.get(k) : null),
+    setItem: (k, v) => m.set(k, String(v)),
+    removeItem: (k) => m.delete(k),
+  };
+}
+
+describe('switchWorkspace', () => {
+  beforeEach(() => {
+    vi.stubGlobal('localStorage', memoryStorage());
+    tabs.set([]);
+    workspaceEpoch.set(0);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    tabs.set([]);
+    workspaceEpoch.set(0);
+  });
+
+  it('相对路径校验失败:零副作用', async () => {
+    const r = await switchWorkspace('relative/path');
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('绝对路径');
+    expect(get(workspaceEpoch)).toBe(0);
+    expect(get(tabs)).toHaveLength(0);
+  });
+
+  it('无 dirty tab:不询问确认,直接落库 + 关闭文件 tab + 纪元自增', async () => {
+    tabs.set([{ path: 'a.rs', name: 'a.rs', content: 'x', dirty: false, error: null }]);
+    let asked = false;
+    const r = await switchWorkspace('D:\\projects\\demo', async () => {
+      asked = true;
+      return true;
+    });
+    expect(asked).toBe(false);
+    expect(r).toEqual({ ok: true, value: 'D:\\projects\\demo' });
+    expect(localStorage.getItem('evo_workspace')).toBe('D:\\projects\\demo');
+    expect(JSON.parse(localStorage.getItem('evo_workspace_recent'))).toEqual([
+      'D:\\projects\\demo',
+    ]);
+    expect(get(tabs)).toHaveLength(0);
+    expect(get(workspaceEpoch)).toBe(1);
+  });
+
+  it('dirty tab + 确认拒绝 → cancelled,零副作用', async () => {
+    tabs.set([{ path: 'b.rs', name: 'b.rs', content: 'x', dirty: true, error: null }]);
+    let asked = '';
+    const r = await switchWorkspace('D:\\x', async (m) => {
+      asked = m;
+      return false;
+    });
+    expect(r.ok).toBe(false);
+    expect(r.cancelled).toBe(true);
+    expect(asked).toContain('未保存');
+    expect(localStorage.getItem('evo_workspace')).toBe(null);
+    expect(get(tabs)).toHaveLength(1);
+    expect(get(workspaceEpoch)).toBe(0);
+  });
+
+  it('dirty tab + 确认同意 → 落库并关闭全部文件 tab', async () => {
+    tabs.set([
+      { path: 'b.rs', name: 'b.rs', content: 'x', dirty: true, error: null },
+      { path: 'c.rs', name: 'c.rs', content: 'y', dirty: false, error: null },
+    ]);
+    const r = await switchWorkspace('D:\\x', () => Promise.resolve(true));
+    expect(r.ok).toBe(true);
+    expect(get(tabs)).toHaveLength(0);
+    expect(get(workspaceEpoch)).toBe(1);
+  });
+
+  it('空串恢复缺省:移除工作区键,纪元仍自增', async () => {
+    localStorage.setItem('evo_workspace', 'D:\\old');
+    const r = await switchWorkspace('  ');
+    expect(r).toEqual({ ok: true, value: '' });
+    expect(localStorage.getItem('evo_workspace')).toBe(null);
+    expect(get(workspaceEpoch)).toBe(1);
+  });
+
+  it('agent 会话 tab(kind 非空)不算文件 tab:不触发确认,不参与关闭', async () => {
+    tabs.set([{ path: null, kind: 'agent', name: '对话', dirty: false }]);
+    const r = await switchWorkspace('D:\\x');
+    expect(r.ok).toBe(true);
+    expect(get(tabs)).toHaveLength(1);
+    expect(get(workspaceEpoch)).toBe(1);
   });
 });

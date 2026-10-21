@@ -32,7 +32,14 @@ pendingReveal 定位信号,col 走 serve 搜索坐标的 0-based 约定)。 -->
       state = 'idle';
       return;
     }
-    const model = getModelForPath(path);
+    // model 由 EditorPane/GroupPane 打开 tab 后异步创建,activePath 先行——
+    // 短重试等就绪(3×300ms);期间切走即弃,仍无 model 回 idle(错误占位等)
+    let model = getModelForPath(path);
+    for (let i = 0; !model && i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 300));
+      if (get(activePath) !== path) return;
+      model = getModelForPath(path);
+    }
     if (!model) {
       symbols = [];
       state = 'idle';

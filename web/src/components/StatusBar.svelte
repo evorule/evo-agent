@@ -22,11 +22,35 @@
     clearAll,
     dismissToast,
   } from '../lib/notifications.js';
+  import { settingsState } from '../lib/settings.js';
+  import {
+    APPROVAL_MODE_KEY,
+    APPROVAL_EXEMPTION_KEY,
+    approvalPresetView,
+  } from '../lib/approval.js';
+  import { workspaceLabel } from '../lib/workspace.js';
   import { version } from '../../package.json';
 
   let panelOpen = false;
   let bellEl = null;
   let panelEl = null;
+
+  // ---- 批 I 段 3:工作区 + 审批档位显性化(纯读态;入口跳转) ----
+  let wsPath = '';
+  function syncWs() {
+    wsPath = localStorage.getItem('evo_workspace') || '';
+  }
+  $: wsText = wsPath ? `工作区:${workspaceLabel(wsPath) || wsPath}` : '工作区:缺省';
+  $: wsTitle = wsPath || '缺省(serve workdir)';
+  $: approvalView = approvalPresetView(
+    $settingsState.settings[APPROVAL_MODE_KEY],
+    $settingsState.settings[APPROVAL_EXEMPTION_KEY],
+  );
+
+  function openExplorer() {
+    sidebarView.set('explorer');
+    explorerVisible.set(true);
+  }
 
   const LANG_LABELS = {
     javascript: 'JavaScript',
@@ -78,8 +102,13 @@
   }
 
   onMount(() => {
+    syncWs(); // 批 I:工作区显性化初值(此后随切换事件同步)
+    window.addEventListener('evo:workspace-changed', syncWs);
     document.addEventListener('click', onDocClick);
-    return () => document.removeEventListener('click', onDocClick);
+    return () => {
+      window.removeEventListener('evo:workspace-changed', syncWs);
+      document.removeEventListener('click', onDocClick);
+    };
   });
 </script>
 
@@ -94,6 +123,17 @@
       </svg>
       {$gitStatus?.branch || '无分支'}
     </button>
+    <!-- 批 I 段 3:工作区显性化(点击 → 文件树;切换入口在树根/首页卡) -->
+    <button class="sb-item ws" onclick={openExplorer} title={wsTitle}>
+      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+        <path d="M4 5a1 1 0 0 1 1-1h5l2 2h7a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5Z" />
+      </svg>
+      {wsText}
+    </button>
+    <!-- 批 I 段 3:审批档位显性化(调整入口在首页卡/对话侧栏) -->
+    <span class="sb-item mode" title={`审批档位(在首页卡或对话侧栏调整):${approvalView.label}`}>
+      {approvalView.label}
+    </span>
     <span class="sb-item agent" title={$turnActive ? '代理执行中' : '代理空闲'}>
       <span class="dot {$turnActive ? 'run' : 'idle'}" />
       {$turnActive ? '代理运行中' : '代理空闲'}
