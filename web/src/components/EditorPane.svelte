@@ -114,8 +114,19 @@
   $: crumbTab = $activePath ? $tabs.find((t) => t.path === $activePath) || null : null;
   $: crumbPath = crumbTab && !crumbTab.kind && !crumbTab.error ? crumbTab.path : '';
   /** 批 I 段 3:无打开 tab = 首页态(工作区卡替代欢迎编辑器;Monaco 宿主
-   *  保持挂载仅隐藏,实例/undo 栈不销毁) */
-  $: showHome = $tabs.length === 0;
+   *  保持挂载仅隐藏,实例/undo 栈不销毁)。
+   *  批 J1 补:tab 栏常驻「首页」chip——任意 tab 态可一键返回首页
+   *  (homeActive;不清已开 tab,激活任意文件 tab 即离开首页态) */
+  let homeActive = false;
+  $: showHome = $tabs.length === 0 || homeActive;
+
+  /** 返回首页:先置 null(订阅回调同步复位 homeActive 并渲染 welcome
+   *  model),后置 homeActive=true——flush 时 home-host 显示、editor-host
+   *  隐藏盖过 showHost 的直切,时序成立。 */
+  function goHome() {
+    activePath.set(null);
+    homeActive = true;
+  }
   /** 保存失败的临时提示,保存成功即清 */
   let saveError = '';
 
@@ -648,6 +659,7 @@
     });
 
     unsubActive = activePath.subscribe((p) => {
+      homeActive = false; // 激活任意具体路径即离开首页态(goHome 自身先 null 后置 true,顺序保证)
       diffOn = false; // 切 tab 回到编辑模式
       mdPreviewOn = false; // 预览态随 tab 切换退出(重进可再开)
       renderActive(p);
@@ -782,6 +794,14 @@
     {#if $tabs.length === 0}
       <div class="etab active">欢迎</div>
     {:else}
+      <button
+        class="etab home"
+        class:active={homeActive}
+        title="返回首页(公告 / 工作区 / 审批模式)"
+        onclick={goHome}
+      >
+        首页
+      </button>
       {#each $tabs as t, i (t.path)}        <div
           class="etab file"
           class:active={t.path === $activePath}
@@ -900,6 +920,15 @@
     color: var(--text-primary);
     border-bottom: 2px solid var(--brand);
     background: var(--bg-card);
+  }
+  /* 首页 chip(批 J1):button 形态重置为 etab 观感 */
+  button.etab.home {
+    appearance: none;
+    border: none;
+    border-right: 1px solid var(--border);
+    background: transparent;
+    font: inherit;
+    cursor: pointer;
   }
   .etab.file {
     max-width: 220px;
