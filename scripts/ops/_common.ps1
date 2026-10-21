@@ -1,4 +1,4 @@
-﻿# evorule 本地运维脚本族 - 共享工具(配置加载/探活/分离启动/日志)
+# evorule 本地运维脚本族 - 共享工具(配置加载/探活/分离启动/日志)
 # 由各 start-*.ps1 与 watchdog-check.ps1 点源加载,不单独执行
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -48,7 +48,7 @@ function Start-OpsDetached {
     # 分离启动: 子进程脱离调用方独立存活,stdout/stderr 落日志(上次日志轮转为 .prev)
     param(
         [Parameter(Mandatory)][string]$Exe,
-        [Parameter(Mandatory)][string]$ArgLine,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ArgLine,
         [string]$Workdir,
         [string]$StdoutLog,
         [hashtable]$ExtraEnv = @{}
@@ -56,6 +56,7 @@ function Start-OpsDetached {
     foreach ($key in $ExtraEnv.Keys) { Set-Item -Path "env:$key" -Value $ExtraEnv[$key] }
     $resolved = if (Test-Path $Exe) { $Exe } elseif (Get-Command $Exe -ErrorAction SilentlyContinue) { $Exe } else { throw "[ops] 可执行文件不存在且不在 PATH: $Exe" }
     $argList = if ($Workdir) { @{ WorkingDirectory = $Workdir } } else { @{} }
+    if ($ArgLine) { $argList.ArgumentList = $ArgLine }
     if ($StdoutLog) {
         $dir = Split-Path $StdoutLog -Parent
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -74,10 +75,10 @@ function Start-OpsDetached {
                 }
             }
         }
-        return Start-Process -FilePath $resolved -ArgumentList $ArgLine -WindowStyle Hidden -PassThru `
-            -RedirectStandardOutput $out -RedirectStandardError $err @argList
+        return Start-Process -FilePath $resolved -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $out -RedirectStandardError $err @argList
     }
-    return Start-Process -FilePath $resolved -ArgumentList $ArgLine -WindowStyle Hidden -PassThru @argList
+    return Start-Process -FilePath $resolved -WindowStyle Hidden -PassThru @argList
 }
 
 function Write-OpsLog {
@@ -86,6 +87,39 @@ function Write-OpsLog {
     $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
     Add-Content -Path (Join-Path $LogDir 'watchdog.log') -Value $line -Encoding utf8
     Write-Host $line
+}
+
+function Repair-OpsStaleBinary {
+    # 二进制陈旧自愈: 启动器新鲜度门判 STALE/MISSING 时自动重建, 复核与拉起仍由调用方负责。
+    # 接线缘起(2026-10-21): 此前「改码→exe 陈旧→看门狗每次拉起被门挡死→进程一断永不自愈」——
+    # 门挡陈旧代码是对的, 缺的是自动重建环节。构建限档 -j 2(本机内存红线)。
+    param(
+        [Parameter(Mandatory)][string]$ExePath,
+        [Parameter(Mandatory)][string]$RepoPath,
+        [Parameter(Mandatory)][string[]]$Paths,
+        [Parameter(Mandatory)][string]$SvcName,
+        [Parameter(Mandatory)][string]$Status,
+        [Parameter(Mandatory)][string]$LogDir
+    )
+    Write-OpsLog -LogDir $LogDir -Message "[watchdog] $SvcName 二进制 $Status, 自动重建(-j 2 限档)..."
+    $buildScript = Join-Path $PSScriptRoot 'build-rust-service.ps1'
+    $prevJobs = $env:CARGO_BUILD_JOBS
+    $env:CARGO_BUILD_JOBS = '2'
+    $ok = $false
+    try {
+        & $buildScript -Repo $RepoPath -Exe $ExePath -StopServe *>> (Join-Path $LogDir 'autobuild.log')
+        $ok = ($LASTEXITCODE -eq 0)
+    } catch {
+        Write-OpsLog -LogDir $LogDir -Message "[watchdog] $SvcName 自动重建异常: $($_.Exception.Message)"
+    } finally {
+        if ($null -ne $prevJobs) { $env:CARGO_BUILD_JOBS = $prevJobs } else { Remove-Item env:CARGO_BUILD_JOBS -ErrorAction SilentlyContinue }
+    }
+    if ($ok) {
+        Write-OpsLog -LogDir $LogDir -Message "[watchdog] $SvcName 自动重建完成, 复核新鲜度后继续"
+    } else {
+        Write-OpsLog -LogDir $LogDir -Message "[watchdog] $SvcName 自动重建失败 — 详见 autobuild.log, 拒绝拉起"
+    }
+    return $ok
 }
 
 function Test-OpsBinaryFreshness {

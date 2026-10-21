@@ -1,4 +1,4 @@
-﻿# 拉起 evorule-server(18080) - 幂等: 探活通过则跳过
+# 拉起 evorule-server(18080) - 幂等: 探活通过则跳过
 $OpsDir = $PSScriptRoot
 . (Join-Path $OpsDir '_common.ps1')
 $cfg = Get-OpsConfig -OpsDir $OpsDir
@@ -20,8 +20,16 @@ if ($freshProp) {
     } else {
         $fr = Test-OpsBinaryFreshness -ExePath $svc.exe -RepoPath $f.repo -Paths @($f.paths)
         if (($fr.Status -eq 'STALE' -or $fr.Status -eq 'MISSING') -and $policy -ne 'warn') {
+            # 自愈(2026-10-21 接线): 陈旧先自动重建再复核, 复核仍不过才拒绝——
+            # 防「改码→exe 陈旧→拉起被门挡死→永不自愈」断链(手动跑本启动器同样受益)
+            if (Repair-OpsStaleBinary -ExePath $svc.exe -RepoPath $f.repo -Paths @($f.paths) `
+                    -SvcName 'evorule-server' -Status $fr.Status -LogDir $cfg.log_dir) {
+                $fr = Test-OpsBinaryFreshness -ExePath $svc.exe -RepoPath $f.repo -Paths @($f.paths)
+            }
+        }
+        if (($fr.Status -eq 'STALE' -or $fr.Status -eq 'MISSING') -and $policy -ne 'warn') {
             Write-Host "[ops] 拒绝拉起: $($fr.Status) $($fr.Detail)"
-            Write-Host "[ops] 修复: 先停服 → scripts\ops\build-rust-service.ps1 -Repo <仓路径> -Exe <exe路径> -StopServe → 重跑本启动器"
+            Write-Host "[ops] 修复: 查 autobuild.log 重建失败原因; 或临时把 policy 改 warn 降级放行"
             exit 1
         }
         if ($fr.Status -ne 'FRESH') {
