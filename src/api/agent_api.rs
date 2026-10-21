@@ -791,6 +791,12 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/files/list",
             axum::routing::get(crate::api::file_api::list_dir),
         )
+        // 目录浏览(批 I 段 2,首页/工作台目录选择器消费):自由列文件系统目录,
+        // 只列目录名不触文件内容;鉴权同文件面(G16 中间件覆盖)
+        .route(
+            "/api/fs/browse",
+            axum::routing::get(crate::api::file_api::browse_dirs),
+        )
         .route(
             "/api/files/read",
             axum::routing::get(crate::api::file_api::read_file),
