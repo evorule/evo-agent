@@ -49,19 +49,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # CI diagnosis (2026-10-21): ubuntu verify died 5x mid-step (~49 min
-          # in, log blob lost, "lost communication"), including 2x WITH the
-          # -j2 cap + debug=0 guards. The deaths started inside the GitHub
-          # ubuntu-latest -> Ubuntu 26.04 rollout window (2026-10-19..11-19),
-          # so this job pins the previous LTS image to isolate the migration
-          # variable; display name stays "ubuntu-latest" for check-name
-          # stability. Unpin deliberately (not by label drift) once the
-          # workload is verified green on the 26 image.
+          # CI diagnosis (2026-10-21, updated): ubuntu verify died 6x mid-step
+          # (~48-52 min in, log blob lost, "lost communication"). The 6th death
+          # landed ON the ubuntu-24.04 pin WITH the -j2 cap + debug=0 guards +
+          # a fresh slim cache, which weakens the image-migration hypothesis
+          # and points at the verify workload itself (resource spike during
+          # the ~25-50 min window). Mitigation round 2: verify.ps1 now takes
+          # -Phase, and this job runs one phase per step -- completed step
+          # logs survive a runner death, so the next death (if any) is bounded
+          # to a single phase with before/after disk+memory echoes around it.
           - os: ubuntu-24.04
             name: ubuntu-latest
           - os: windows-latest
             name: windows-latest
     runs-on: ${{ matrix.os }}
+    env:
+      # Resource guard: a full debug build of this repo produces ~9.4 GB
+      # of target artifacts, which sits right at the ubuntu runner disk
+      # ceiling -- two CI runs died mid-step (~50 min in, step never
+      # concluded, no log uploaded). Stripping debug info shrinks target
+      # output several-fold on both runners; windows stays well clear of
+      # its larger disk either way, and both platforms keep the same
+      # build shape.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -78,37 +89,38 @@ jobs:
       # 宪法 schema 校验组件以 git 依赖(rev 钉版)由 cargo 自动拉取,
       # 且 0.2.0 起 schema 编译期内嵌——运行时零磁盘依赖,无需检出宪法仓。
 
-      - name: verify.ps1 (build + test + secret scan + dep contract)
+      # Phase-split layout (2026-10-21): one verify.ps1 phase per step.
+      # Completed step logs survive a runner death; the resource echoes
+      # bracket each phase with disk/memory state. The linux-only -j2 cap
+      # is re-applied per step (job-level env would also cap windows).
+      - name: verify 1/5 build
         shell: pwsh
-        env:
-          # Resource guard: a full debug build of this repo produces ~9.4 GB
-          # of target artifacts, which sits right at the ubuntu runner disk
-          # ceiling -- two CI runs died mid-step (~50 min in, step never
-          # concluded, no log uploaded). Stripping debug info shrinks target
-          # output several-fold on both runners; windows stays well clear of
-          # its larger disk either way, and both platforms keep the same
-          # build shape.
-          CARGO_PROFILE_DEV_DEBUG: 0
-          CARGO_PROFILE_TEST_DEBUG: 0
         run: |
-          # CI diagnosis: ubuntu verify has died mid-step repeatedly (~48 min
-          # in, step never concluded, its log blob lost), so nothing post-hoc
-          # survives. While verify.ps1 runs, a background sampler echoes a
-          # disk/memory snapshot into the live log every 30 s, making resource
-          # exhaustion visible before the kill point. Linux only (deaths are
-          # ubuntu-only); the sampler is stopped when the step exits.
-          $probe = $null
-          if ($IsLinux) {
-            # Cap cargo compile parallelism on Linux: full-parallel rustc
-            # processes spike runner memory during the build+test loop, and
-            # the runner dies mid-step with no log surviving. Limiting to 2
-            # jobs trades compile time for a flat memory ceiling. Windows
-            # runners have more headroom and stay untouched.
-            $env:CARGO_BUILD_JOBS = '2'
-            $probe = Start-Process -FilePath 'bash' -ArgumentList '-c', 'while true; do echo "== PROBE $(date -u +%H:%M:%S)"; df -h /; free -m; sleep 30; done' -PassThru
-          }
-          ./verify.ps1
-          if ($null -ne $probe) { Stop-Process -Id $probe.Id -Force -ErrorAction SilentlyContinue }
+          if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
+          ./verify.ps1 -Phase build
+          if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
+
+      - name: verify 2/5 test-compile
+        shell: pwsh
+        run: |
+          if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
+          ./verify.ps1 -Phase test-compile
+          if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
+
+      - name: verify 3/5 test-run
+        shell: pwsh
+        run: |
+          if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
+          ./verify.ps1 -Phase test-run
+          if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
+
+      - name: verify 4/5 secret scan
+        shell: pwsh
+        run: ./verify.ps1 -Phase scan
+
+      - name: verify 5/5 dep contract
+        shell: pwsh
+        run: ./verify.ps1 -Phase contract
 
       - name: doc tests
         run: cargo test --doc
