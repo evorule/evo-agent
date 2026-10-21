@@ -387,6 +387,13 @@ const SWITCH_WEB_SEARCH: &str = AGENT_TOOLS_WEB_SEARCH;
 pub const AGENT_TOOLS_CODE_SEARCH: &str = "agentTools.codeSearch";
 const SWITCH_CODE_SEARCH: &str = AGENT_TOOLS_CODE_SEARCH;
 
+/// agentTools.todo（默认开；todo 任务清单族单键双绑——工具契约面过滤 +
+/// runner 装配注入面同键判定，批K 段4）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_TODO: &str = "agentTools.todo";
+const SWITCH_TODO: &str = AGENT_TOOLS_TODO;
+
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
     Some(SwitchBinding {
@@ -410,7 +417,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（31 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（34 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -493,6 +500,13 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // （default_safe_toolkit），runner 会话期接线重绑（handover 双工具
         // 同款）。能力域=Delegate（语义最近：创建执行上下文）。
         b("session_spawn", vec![CapDomain::Delegate]),
+        // todo 任务清单族（批K 段4）：会话内结构化任务清单全量重写读写。
+        // 占位执行体启动期注册（default_safe_toolkit），runner 会话期重绑
+        // （handover 同款，state 在手）；Standard 免裁决 + AutoPolicy（进程
+        // 内内存态读写，无沙箱/网络/子进程面）。能力域=Memory（handover
+        // 先例：会话自管理状态面）。spec 常驻 default_tool_specs（Builtin 源）。
+        b("todo_write", vec![Memory]),
+        b("todo_read", vec![Memory]),
     ]
     .into_iter()
     .map(|mut m| {
@@ -574,6 +588,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             "audit_query" => sw(SWITCH_AUDIT_QUERY, true),
             // 记忆墓碑：写入面默认关（显式启用才进 LLM 契约）
             "memory_tombstone" => sw(SWITCH_MEMORY_TOMBSTONE, false),
+            // todo 任务清单族（批K 段4）：单键双绑（工具契约面过滤 +
+            // runner 装配注入面同键判定），默认开（进程内内存态，零外溢面）
+            "todo_write" | "todo_read" => sw(SWITCH_TODO, true),
             _ => None,
         };
         m
@@ -903,9 +920,10 @@ mod tests {
         //   （批K 段1 精准编辑 edit_file +1：内置 28→29，数量锁 94→95）
         //   （批K 段2 网络双件 web_fetch/web_search +2：内置 29→31，数量锁 95→97）
         //   （批K 段3 符号图谱检索 code_search +1：内置 31→32，数量锁 97→98）
-        assert_eq!(builtin_manifests().len(), 32);
+        //   （批K 段4 todo 双件 todo_write/todo_read +2：内置 32→34，数量锁 98→100）
+        assert_eq!(builtin_manifests().len(), 34);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 98);
+        assert_eq!(all().len(), 100);
     }
 
     #[test]
@@ -1109,9 +1127,10 @@ mod tests {
         );
     }
 
-    /// 原 TOOL_SWITCH_KEYS 30 条快照（tool, key, default_on）；批K 段1
-    /// edit_file 接入 → 31 条；批K 段2 web_fetch/web_search 接入 → 33 条；
-    /// 批K 段3 code_search 接入 → 34 条
+    /// 原 TOOL_SWITCH_KEYS 快照（tool, key, default_on）；批K 段1 edit_file
+    /// 接入 → 32 条（memory_recall/audit_query/memory_tombstone 后续接入，
+    /// 历史批注曾滞后于实际行数，20261021 批K 段4 修正口径）；批K 段4
+    /// todo_write/todo_read 接入 → 43 条
     const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
         ("file_create", "agentTools.fileCreate", true),
         ("edit_file", "agentTools.editFile", true),
@@ -1159,6 +1178,9 @@ mod tests {
         ("audit_query", "agentTools.audit_query", true),
         // 记忆墓碑（默认关）
         ("memory_tombstone", "agentTools.memory_tombstone", false),
+        // todo 任务清单族（批K 段4）：单键双绑同列
+        ("todo_write", "agentTools.todo", true),
+        ("todo_read", "agentTools.todo", true),
     ];
 
     #[test]

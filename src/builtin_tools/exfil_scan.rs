@@ -73,6 +73,8 @@ use serde_json::Value;
 /// 出站通道）。
 /// 批K 段3：code_search 查询词为符号名子串（纯本地索引检索，零外发），
 /// **不扩容**本名单——查询不出站，无凭据出域面。
+/// 批K 段4：todo 双件为进程内内存态读写（会话任务清单，无任何出站面），
+/// **不扩容**本名单。
 pub const EXFIL_SCAN_TOOLS: &[&str] = &["http_get", "web_fetch", "web_search"];
 
 /// 凭据特征模式表（id, 词形）。词形按 ASCII 小写匹配纪律存储（匹配大小写

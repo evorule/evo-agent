@@ -21,8 +21,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// 默认配方版本（recipe-v1.0 = 现状硬编码值的规则化形态）
-pub const DEFAULT_RECIPE_VERSION: &str = "recipe-v1.0";
+/// 默认配方版本（recipe-v1.0 = 现状硬编码值的规则化形态；recipe-v1.1 =
+/// 批K 段4 增补 S3c_todo 槽位——optional 槽,无 todo 态时逐字节等价 v1.0）
+pub const DEFAULT_RECIPE_VERSION: &str = "recipe-v1.1";
 
 /// 槽位来源白名单（执行器只认这些来源;新增来源 = 执行器升级 = major）
 pub const SLOT_SOURCES: &[&str] = &[
@@ -30,6 +31,7 @@ pub const SLOT_SOURCES: &[&str] = &[
     "governance_segment",
     "knowledge_segment",
     "recall",
+    "todo_summary",
     "definition.capability_boundary.awareness_segment",
     "manifest",
     "goal",
@@ -251,6 +253,22 @@ fn default_slots() -> Vec<SlotSpec> {
             degradation_order: Some(DEGRADATION_LAYERS.iter().map(|s| s.to_string()).collect()),
             sections: Some(SlotSections::default()),
             separator: None,
+            role: None,
+            trim: None,
+        },
+        SlotSpec {
+            id: "S3c_todo".to_string(),
+            source: "todo_summary".to_string(),
+            // 小体量结构字段完整性优先,不占记忆预算(Handoff Base 底座块
+            // 同口径);无清单/开关关时 runner 不传内容,槽位静默跳过 =
+            // 既有 agent 逐字节零影响(recipe-v1.1 minor 增补的等价性依据)
+            degradable: false,
+            optional: true,
+            enabled: true,
+            budget: None,
+            degradation_order: None,
+            sections: None,
+            separator: Some("\n\n".to_string()),
             role: None,
             trim: None,
         },
@@ -653,10 +671,12 @@ impl AssemblyExecutor {
     /// - `recall`:S3_memory 内容(已在调用侧完成召回;预算裁剪在渲染器内)
     /// - `total_window`:记忆区预算基准的原始输入(默认配方 `base: input`
     ///   扣除响应预留后作基数;显式 `base: total_window` 直接作基数=兼容口径)
-    /// - `boundary_segment`:S4_boundary 源(None = 未声明边界,槽位跳过)
-    /// - `skills`:S4b_skills 源(None/空 = 未声明技能,槽位跳过 = 历史行为)
+    /// - `handoff`:S3 槽内尾随交接底座包(None = 未声明,跳过)
+    /// - `governance_segment`:S2_governance 源(None = 未声明,槽位跳过)
     /// - `knowledge_segment`:S2b_knowledge 源(None/空 = 未声明治理知识
     ///   数据集,槽位跳过 = 既有定义零影响)
+    /// - `todo_summary`:S3c_todo 源(None = 无清单/开关关,槽位静默跳过;
+    ///   runner 侧确定性渲染,小体量不占记忆预算)
     ///
     /// Err 仅当配方声明了执行器不认识的预算基准(budget.base——validate 白名单
     /// 应已拦截,此处运行时兜底 fail-fast),不做静默降级。
@@ -674,6 +694,7 @@ impl AssemblyExecutor {
         handoff: Option<&crate::agent::definition::HandoffPackage>,
         governance_segment: Option<&str>,
         knowledge_segment: Option<&str>,
+        todo_summary: Option<&str>,
     ) -> Result<String, String> {
         let mut prompt = String::new();
         for slot in &self.recipe.slots {
@@ -752,6 +773,20 @@ impl AssemblyExecutor {
                         );
                     }
                 }
+                // S3c_todo:todo 清单摘要(批K 段4)——LLM 自管理任务状态的
+                // 常驻注入(每轮随装配重建,状态锚定不靠消息历史记忆)。内容
+                // 由 runner 侧确定性渲染(render_todo_summary),None/空 =
+                // 无清单/开关关,槽位静默跳过;不占记忆预算(结构字段完整性
+                // 优先,Handoff Base 底座块同口径)
+                "todo_summary" => {
+                    if let Some(seg) = todo_summary {
+                        if !seg.trim().is_empty() {
+                            let sep = slot.separator.as_deref().unwrap_or("\n\n");
+                            prompt.push_str(sep);
+                            prompt.push_str(seg);
+                        }
+                    }
+                }
                 // S4_boundary:边界段(现状 "\n\n" 前缀由配方 separator 声明)
                 "definition.capability_boundary.awareness_segment" => {
                     if let Some(seg) = boundary_segment {
@@ -792,7 +827,7 @@ mod tests {
     #[test]
     fn test_default_recipe_matches_current_hardcoded_values() {
         let r = AssemblyRecipe::default();
-        assert_eq!(r.recipe_version, "recipe-v1.0");
+        assert_eq!(r.recipe_version, "recipe-v1.1");
         let ids: Vec<&str> = r.slots.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -801,6 +836,7 @@ mod tests {
                 "S2_governance",
                 "S2b_knowledge",
                 "S3_memory",
+                "S3c_todo",
                 "S4_boundary",
                 "S4b_skills",
                 "S5_task",
@@ -831,17 +867,27 @@ mod tests {
             &["stable", "summaries", "events"]
         );
         assert!(s3.sections.unwrap().notices_first);
+        // S3c todo 清单摘要(批K 段4):optional + 不可降级 + "\n\n"(清单空/开关关
+        // =槽位静默跳过,既有 agent 逐字节零影响)
+        let s3c = &r.slots[4];
+        assert_eq!(s3c.id, "S3c_todo");
+        assert_eq!(s3c.source, "todo_summary");
+        assert!(s3c.optional);
+        assert!(!s3c.degradable);
+        assert!(s3c.enabled);
+        assert!(s3c.budget.is_none());
+        assert_eq!(s3c.separator.as_deref(), Some("\n\n"));
         // S4 边界段:optional + "\n\n"
-        assert!(r.slots[4].optional);
-        assert_eq!(r.slots[4].separator.as_deref(), Some("\n\n"));
-        // S4b:B2 启用(optional + skills 未声明时跳过 = 预留期行为逐字节一致)
-        assert!(r.slots[5].enabled);
-        assert!(r.slots[4].optional);
+        assert!(r.slots[5].optional);
         assert_eq!(r.slots[5].separator.as_deref(), Some("\n\n"));
+        // S4b:B2 启用(optional + skills 未声明时跳过 = 预留期行为逐字节一致)
+        assert!(r.slots[6].enabled);
+        assert!(r.slots[5].optional);
+        assert_eq!(r.slots[6].separator.as_deref(), Some("\n\n"));
         // S5 任务:user 角色
-        assert_eq!(r.slots[6].role.as_deref(), Some("user"));
+        assert_eq!(r.slots[7].role.as_deref(), Some("user"));
         // S7 裁剪:KeepSystemKeepLast + buffer 5% + hint 15
-        let t = r.slots[8].trim.as_ref().unwrap();
+        let t = r.slots[9].trim.as_ref().unwrap();
         assert_eq!(t.strategy, "KeepSystemKeepLast");
         assert_eq!(t.buffer_pct, 5);
         assert_eq!(t.hint_budget_tokens, 15);
@@ -904,6 +950,7 @@ mod tests {
                 None,
                 Some("GOV"),
                 Some("KNOW"),
+                None,
             )
             .unwrap();
         assert!(out.starts_with("BASE"));
@@ -927,6 +974,7 @@ mod tests {
                 None,
                 None,
                 Some("GOV"),
+                None,
                 None,
             )
             .unwrap();
@@ -1144,6 +1192,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1160,6 +1209,7 @@ mod tests {
                 Some(&mem),
                 &recall,
                 60,
+                None,
                 None,
                 None,
                 None,
@@ -1192,6 +1242,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1219,6 +1270,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(out_none, "base");
@@ -1232,6 +1284,7 @@ mod tests {
                 &Default::default(),
                 0,
                 Some("【能力边界声明】boundary"),
+                None,
                 None,
                 None,
                 None,
@@ -1256,12 +1309,63 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
             out_ns,
             "base\n\n【身份资产】identity\n\n【北极星】north star"
         );
+    }
+
+    /// S3c_todo(批K 段4):todo 清单摘要经配方槽位注入——Some → S3_memory
+    /// 之后 S4_boundary 之前(separator "\n\n");None → 槽位静默跳过(既有
+    /// agent 逐字节零影响,v1.0→v1.1 minor 增补等价铁律)
+    #[test]
+    fn test_assemble_todo_summary_slot_order() {
+        let exec = AssemblyExecutor::default_executor();
+        // 有摘要:紧随基底块(唯一非空槽,"\n\n" 分隔逐字节);且在边界段之前
+        let out = exec
+            .assemble(
+                "base",
+                None,
+                None,
+                None,
+                &Default::default(),
+                0,
+                Some("【能力边界声明】boundary"),
+                None,
+                None,
+                None,
+                None,
+                Some("【清单】- [*] t1 先做"),
+            )
+            .unwrap();
+        assert_eq!(out, "base\n\n【清单】- [*] t1 先做\n\n【能力边界声明】boundary");
+        let todo_pos = out.find("【清单】").unwrap();
+        let boundary_pos = out.find("【能力边界声明】").unwrap();
+        assert!(
+            todo_pos < boundary_pos,
+            "S3c 槽序:todo 清单摘要 前于 边界段"
+        );
+        // None → 槽位静默跳过(输出与 v1.0 逐字节一致)
+        let out_none = exec
+            .assemble(
+                "base",
+                None,
+                None,
+                None,
+                &Default::default(),
+                0,
+                Some("【能力边界声明】boundary"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!out_none.contains("【清单】"));
     }
 
     /// 执行器预算参数访问:默认配方 = 现状硬编码值
@@ -1289,6 +1393,7 @@ mod tests {
                 None,
                 &Default::default(),
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -1330,6 +1435,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(out.starts_with("base\n\n"));
@@ -1359,6 +1465,7 @@ mod tests {
                 0,
                 Some("【能力边界声明】boundary"),
                 Some(&skills),
+                None,
                 None,
                 None,
                 None,
@@ -1398,6 +1505,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1417,6 +1525,7 @@ mod tests {
                 0,
                 None,
                 Some(&[]),
+                None,
                 None,
                 None,
                 None,
@@ -1475,6 +1584,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         // 显式兼容口径(base=total_window,历史行为)
@@ -1494,6 +1604,7 @@ mod tests {
                 Some(&mem),
                 &recall,
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -1552,6 +1663,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         // 新配方:加载 → validate → 字段落位
@@ -1577,6 +1689,7 @@ mod tests {
                 None,
                 &Default::default(),
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -1683,6 +1796,7 @@ mod tests {
                 Some(&handoff),
                 None,
                 None,
+                None,
             )
             .unwrap();
         let stable_pos = out1
@@ -1706,6 +1820,7 @@ mod tests {
                 Some(&handoff),
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(out2.contains("## Handoff Base"));
@@ -1720,6 +1835,7 @@ mod tests {
                 None,
                 &RecallContext::default(),
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -1823,6 +1939,7 @@ mod tests {
                 Some(&handoff),
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -1863,6 +1980,7 @@ mod tests {
                 Some(&skills),
                 Some(&handoff),
                 Some(&governance),
+                None,
                 None,
             )
             .unwrap();

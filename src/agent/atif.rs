@@ -989,6 +989,10 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             // G4 判据生成落账(先写后锁):元数据事件不映射步——判据经 task_done
             // 门禁消费反映在 acceptance_passed;生成过程全文在 sidecar 审计链
             JournalEvent::AcceptanceCriteriaGenerated { .. } => {}
+            // TodoUpdated(批K 段4):清单快照观测事件不映射步——清单终态经
+            // S3c 装配槽位注入反映在 system prompt 面,journal 事件本身是
+            // 恢复面回放载体(todo 工具重绑重建),非对话轨迹内容
+            JournalEvent::TodoUpdated { .. } => {}
         }
     }
     // 流末悬挂 agent 步(无 turn_ended 尾:crash/截断场景)

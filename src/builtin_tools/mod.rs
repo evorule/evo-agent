@@ -6,7 +6,8 @@
 //! http_get / python_exec / git_status / git_diff / git_log / git_stage /
 //! git_commit / read_skill / query_journal / query_trace / read_back /
 //! diff_runs / handover_write / handover_read / session_spawn /
-//! web_fetch / web_search（批K 段2）/ code_search（批K 段3）)
+//! web_fetch / web_search（批K 段2）/ code_search（批K 段3）/
+//! todo_write / todo_read（批K 段4，占位注册+会话期重绑）)
 //!
 //! 注:`read_skill`(skills 装配 B2)不在 default_safe_toolkit 静态注册——
 //! 其技能表来自 agent definition 的 skills 声明(声明非空时由 serve_tools::
@@ -67,6 +68,7 @@ pub mod search_files;
 pub mod shell_exec;
 pub mod shell_net_guard;
 pub mod skill_read;
+pub mod todo;
 pub mod web_fetch;
 pub mod web_search;
 
@@ -271,6 +273,18 @@ pub fn default_safe_toolkit_with_profile(
     handler.register_static(
         crate::agent::memory_tombstone_tool::MEMORY_TOMBSTONE_TOOL,
         Arc::new(crate::agent::memory_tombstone_tool::MemoryTombstoneTool::unwired()),
+    );
+    // todo 任务清单族（批K 段4）：占位执行体启动期注册（未接线时调用
+    // fail-visible 如实报错）；runner 会话期重绑（handover 同构，state 在
+    // 手）——开关 agentTools.todo 过滤工具契约面 + 装配点同键判定注入面，
+    // 双绑单键自动工作
+    handler.register_static(
+        crate::builtin_tools::todo::TODO_WRITE_TOOL,
+        Arc::new(crate::builtin_tools::todo::TodoWriteTool::unwired()),
+    );
+    handler.register_static(
+        crate::builtin_tools::todo::TODO_READ_TOOL,
+        Arc::new(crate::builtin_tools::todo::TodoReadTool::unwired()),
     );
     handler
 }
@@ -1203,6 +1217,37 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     required: false,
                 },
             ],
+        },
+        ToolSpec {
+            name: "todo_write".to_string(),
+            description: "Replace the session todo list with the given items (FULL rewrite, \
+                          not a patch — always submit the complete list). Each item: id \
+                          (unique short key within the list), content (1-500 chars, \
+                          actionable), status (pending | in_progress | completed), \
+                          priority (high | medium | low, default medium). Max 10 items; \
+                          an empty array clears the list. The current list summary is \
+                          injected into your system prompt each turn — keep it current: \
+                          mark an item in_progress before starting it and completed \
+                          immediately when done. The list lives only for this session."
+                .to_string(),
+            parameters: vec![ParameterSpec {
+                name: "items".to_string(),
+                r#type: "array".to_string(),
+                description: "Complete replacement list, e.g. [{\"id\": \"t1\", \"content\": \
+                              \"fix parser\", \"status\": \"in_progress\", \"priority\": \
+                              \"high\"}] (empty array = clear the list)"
+                    .to_string(),
+                required: true,
+            }],
+        },
+        ToolSpec {
+            name: "todo_read".to_string(),
+            description: "Read the current session todo list (items with id/content/status/\
+                          priority plus a count). Read-only — use it to re-check the exact \
+                          state when the injected summary is not enough. The list lives \
+                          only for this session."
+                .to_string(),
+            parameters: vec![],
         },
     ]
 }

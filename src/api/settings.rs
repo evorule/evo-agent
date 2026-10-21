@@ -339,6 +339,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.todo",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "todo 任务清单族（todo_write/todo_read，单键双绑）：会话内结构化任务清单的全量重写读写——关闭 = 两工具连 LLM 契约一起下线，且 runner 装配注入面同键判定同步缺席（清单摘要不再注入 system prompt，防「工具在、注入断」的单腿态）；进程内内存态零外溢面，默认开",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.eventLedger",
             kind: SettingType::Boolean,
             default: json!(true),
@@ -957,7 +967,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 53); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch)
+        assert_eq!(settings.len(), 54); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -986,6 +996,8 @@ mod tests {
         );
         // 自主交接开关(交接设计 PR-H2):默认开 = 交接族在面,零行为变化
         assert_eq!(settings["agentTools.handover"], json!(true));
+        // todo 任务清单族(批K 段4):默认开 = 进程内内存态零外溢面
+        assert_eq!(settings["agentTools.todo"], json!(true));
         // search.* 全局搜索 4 键(B2 消费)
         assert_eq!(settings["search.maxResults"], json!(1000));
         assert_eq!(settings["search.smartCase"], json!(true));
