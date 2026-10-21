@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-// 工作台文件 REST 面客户端(目录列表 / 读 / 写)
+// 工作台文件 REST 面客户端(目录列表 / 读 / 写 / 目录浏览)
 //
-// 三个端点全部对应 serve 侧 file_api.rs;写走 file_write 同一实现(同沙箱)。
+// 端点全部对应 serve 侧 file_api.rs;写走 file_write 同一实现(同沙箱)。
 // auth 启用时以 Bearer header 接入(与 WS 的 ?token= 同一 token 来源)。
+// 批 I 重锚:文件面 8 端点统一携带 X-Evo-Workspace 头(localStorage
+// evo_workspace,与 WS ?workspace= 同源),serve 以该绝对路径为本请求沙箱
+// 基准——文件树/编辑/搜索即刻随工作区;agent 能力边界仍由连接级参数承担。
+// 头缺省 = serve workdir(严格零变化)。
+
+export const WORKSPACE_STORAGE_KEY = 'evo_workspace';
 
 function token() {
   return localStorage.getItem('evo_agent_token') || '';
@@ -14,6 +20,14 @@ function headers(json = false) {
   const t = token();
   if (t) h['Authorization'] = `Bearer ${t}`;
   if (json) h['Content-Type'] = 'application/json';
+  return h;
+}
+
+/** 文件面请求头 = 通用头 + 会话工作区重锚头(空工作区不携带 → workdir 根) */
+function fileHeaders(json = false) {
+  const h = headers(json);
+  const w = (localStorage.getItem(WORKSPACE_STORAGE_KEY) || '').trim();
+  if (w) h['X-Evo-Workspace'] = w;
   return h;
 }
 
@@ -62,16 +76,32 @@ export async function getJsonRetry(path, tries = 6) {
   }
 }
 
-/** 列目录(dir 相对 workdir 根,缺省 = 根) */
+/** 列目录(dir 相对有效根 = 工作区 || serve workdir;缺省 = 根) */
 export function listDir(dir) {
   const q = dir ? `?dir=${encodeURIComponent(dir)}` : '';
-  return fetch(`/api/files/list${q}`, { headers: headers() }).then(unwrap);
+  return fetch(`/api/files/list${q}`, { headers: fileHeaders() }).then(unwrap);
 }
 
-/** 读文件(path 相对 workdir 根) */
+/** serve workdir 基准探测(刻意不带重锚头):工作区模式下供文件树取
+ *  workdir 作 fs_events 事件换算基准(watcher 固定盯 serve workdir) */
+export function listDirWorkdir() {
+  return fetch('/api/files/list', { headers: headers() }).then(unwrap);
+}
+
+/**
+ * 目录浏览(批 I 段 2;/api/fs/browse;选工作区专用,不携带重锚头):
+ * path 缺省 → 文件系统根(Windows 盘符);显式绝对路径 → 子目录列表(只列目录)。
+ * 响应 {path, parent, roots, entries:[{name,path}], error?}
+ */
+export function browseFs(path = '') {
+  const q = path ? `?path=${encodeURIComponent(path)}` : '';
+  return fetch(`/api/fs/browse${q}`, { headers: headers() }).then(unwrap);
+}
+
+/** 读文件(path 相对有效根) */
 export function readFile(path) {
   return fetch(`/api/files/read?path=${encodeURIComponent(path)}`, {
-    headers: headers(),
+    headers: fileHeaders(),
   }).then(unwrap);
 }
 
@@ -79,7 +109,7 @@ export function readFile(path) {
 export function writeFile(path, content) {
   return fetch('/api/files/write', {
     method: 'PUT',
-    headers: headers(true),
+    headers: fileHeaders(true),
     body: JSON.stringify({ path, content }),
   }).then(unwrap);
 }
@@ -88,7 +118,7 @@ export function writeFile(path, content) {
 export function createFile(path, kind = 'file') {
   return fetch('/api/files/create', {
     method: 'POST',
-    headers: headers(true),
+    headers: fileHeaders(true),
     body: JSON.stringify({ path, kind }),
   }).then(unwrap);
 }
@@ -108,7 +138,7 @@ export function moveFile(path, targetDir, newName = null) {
   if (newName) body.new_name = newName;
   return fetch('/api/files/move', {
     method: 'POST',
-    headers: headers(true),
+    headers: fileHeaders(true),
     body: JSON.stringify(body),
   }).then(unwrap);
 }
@@ -117,7 +147,7 @@ export function moveFile(path, targetDir, newName = null) {
 export function deleteFile(path) {
   return fetch(`/api/files?path=${encodeURIComponent(path)}`, {
     method: 'DELETE',
-    headers: headers(),
+    headers: fileHeaders(),
   }).then(unwrap);
 }
 
@@ -125,7 +155,7 @@ export function deleteFile(path) {
 export function searchGrep(body) {
   return fetch('/api/files/search', {
     method: 'POST',
-    headers: headers(true),
+    headers: fileHeaders(true),
     body: JSON.stringify(body),
   }).then(unwrap);
 }
@@ -134,7 +164,7 @@ export function searchGrep(body) {
 export function replaceFiles(body) {
   return fetch('/api/files/replace', {
     method: 'POST',
-    headers: headers(true),
+    headers: fileHeaders(true),
     body: JSON.stringify(body),
   }).then(unwrap);
 }

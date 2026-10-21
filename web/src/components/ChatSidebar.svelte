@@ -27,6 +27,7 @@
     approvalPresetWrites,
     approvalPresetView,
   } from '../lib/approval.js';
+  import { switchWorkspace } from '../lib/workspace.js';
   import { orderSessionsWithLineage } from '../lib/orchestration.js';
   import { push as pushNotification } from '../lib/notifications.js';
   import { onMount, onDestroy, tick } from 'svelte';
@@ -56,22 +57,17 @@
   // localStorage 持久,改值在下次连接生效——新建会话/换线/重连)
   let workspace = $state(localStorage.getItem('evo_workspace') || '');
 
-  /** 编辑会话工作区:prompt 输入绝对路径,空串清除。立即持久化;对当前
-   *  WS 连接不回溯生效(升级期已定型),提示条明示下次连接生效。 */
-  function editWorkspace() {
+  /** 编辑会话工作区:prompt 输入绝对路径,空串清除。批 I:走统一切换入口
+   *  (dirty 护栏 + 落库 + 关文件 tab + 纪元自增);文件面即刻重锚,
+   *  agent 能力边界下次连接生效(新建会话/换线/重连)。 */
+  async function editWorkspace() {
     const next = prompt(
       '会话工作区(绝对路径,agent 读写以此目录为边界):\n留空恢复缺省(serve workdir)',
       workspace,
     );
     if (next === null) return; // 取消
-    const v = next.trim();
-    if (v && !/^[a-zA-Z]:[\\/]/.test(v) && !v.startsWith('\\\\') && !v.startsWith('/')) {
-      alert('需要绝对路径(如 D:\\projects\\demo)');
-      return;
-    }
-    workspace = v;
-    if (v) localStorage.setItem('evo_workspace', v);
-    else localStorage.removeItem('evo_workspace');
+    const r = await switchWorkspace(next, (m) => Promise.resolve(window.confirm(m)));
+    if (!r.ok && r.error) alert(r.error);
   }
 
   /** 工作区按钮显示名:末段路径(长路径收窄);缺省态显式标示 */
