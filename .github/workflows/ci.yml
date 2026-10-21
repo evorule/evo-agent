@@ -49,19 +49,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # CI diagnosis (2026-10-21, updated): ubuntu verify died 6x mid-step
-          # (~48-52 min in, log blob lost, "lost communication"). The 6th death
-          # landed ON the ubuntu-24.04 pin WITH the -j2 cap + debug=0 guards +
-          # a fresh slim cache, which weakens the image-migration hypothesis
-          # and points at the verify workload itself (resource spike during
-          # the ~25-50 min window). Mitigation round 2: verify.ps1 now takes
-          # -Phase, and this job runs one phase per step -- completed step
-          # logs survive a runner death, so the next death (if any) is bounded
-          # to a single phase with before/after disk+memory echoes around it.
+          # CI diagnosis (2026-10-21/22): ubuntu verify died 7x mid-step (~48-52
+          # min in, "lost communication"), including ON the ubuntu-24.04 pin
+          # WITH -j2 + debug=0 + fresh cache. Main-branch history shows ubuntu
+          # verify has NEVER been green on GitHub (30+ consecutive failures
+          # since the repo migration) -- and because a job must COMPLETE to
+          # save its rust-cache, every death re-arms a cold-cache spiral:
+          # slowest possible run, maximum exposure, death again.
+          #
+          # Decision (2026-10-22, approved): TEMPORARY load downgrade -- the
+          # ubuntu leg runs build + secret scan + dep contract only; the test
+          # surface (unit + doc tests) is carried by the windows leg, which
+          # has never missed (9-16 min). This unblocks the merge chain today.
+          # RESTORE ubuntu tests (flip `tests: true`) once the side diagnostic
+          # (phase-split full run) attributes the death to a concrete phase
+          # and a fix lands. Tracked as a registry TODO -- do not let this
+          # downgrade become permanent by omission.
           - os: ubuntu-24.04
             name: ubuntu-latest
+            tests: false
           - os: windows-latest
             name: windows-latest
+            tests: true
     runs-on: ${{ matrix.os }}
     env:
       # Resource guard: a full debug build of this repo produces ~9.4 GB
@@ -101,6 +110,7 @@ jobs:
           if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
 
       - name: verify 2/5 test-compile
+        if: matrix.tests
         shell: pwsh
         run: |
           if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
@@ -108,6 +118,7 @@ jobs:
           if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
 
       - name: verify 3/5 test-run
+        if: matrix.tests
         shell: pwsh
         run: |
           if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
@@ -123,6 +134,7 @@ jobs:
         run: ./verify.ps1 -Phase contract
 
       - name: doc tests
+        if: matrix.tests
         run: cargo test --doc
 
   # ==========================================================================
