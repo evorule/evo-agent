@@ -268,6 +268,193 @@ pub struct CandidateCommand {
     pub alternative: &'static str,
 }
 
+// =============================================================================
+// 平台分档(o15:平台分档表,单源不双轨)
+// =============================================================================
+//
+// Unix 基线三表(ACTIVE/CANDIDATE/BLOCKED_COMMANDS)一字不动;平台差异以
+// 增量/降档表表达,分类点经编译期 cfg 取有效面(零运行期开销):
+//
+// - Windows 增量仅收「真实 .exe」:CreateProcess 对无扩展名程序只补 .exe
+//   (不认 PATHEXT),cmd 内建(copy/del/move/ren/md/rd,磁盘无对应文件)与
+//   .com 文件(tree/more)直 spawn 必失败——不进表,宁缺勿假(能力缺口由
+//   file_* 工具面覆盖);`where <名>` 磁盘实证见段6 修订案;
+// - find 撞名降档(平台分档第一例):Windows System32 find.exe = 文本搜索,
+//   非 Unix 文件查找——工作台面降 candidate(注记指引 rg/search_files)。
+//
+// sandbox-trusted 档三表不引入平台维度:目标环境为 Linux 容器/VM,
+// Windows 宿主上未列命令走 Unknown 拒(fail-safe 缺省)。
+
+/// 平台降档:基线 active 中在本平台语义不成立、降 candidate 的命令
+#[cfg(windows)]
+const PLATFORM_DEMOTED_ACTIVE: &[&str] = &["find"];
+#[cfg(unix)]
+const PLATFORM_DEMOTED_ACTIVE: &[&str] = &[];
+
+/// 平台增量 active(Windows:真实 exe、只读、用途明确)
+#[cfg(windows)]
+const PLATFORM_ACTIVE_ADDITIONS: &[&str] = &[
+    "findstr",  // 文本搜索
+    "where",    // 定位程序
+    "tasklist", // 进程列表(只读)
+];
+#[cfg(unix)]
+const PLATFORM_ACTIVE_ADDITIONS: &[&str] = &[];
+
+/// 平台增量 candidate(Windows;风险注记对齐 rm/mv 先例形态)
+#[cfg(windows)]
+const PLATFORM_CANDIDATE_ADDITIONS: &[CandidateCommand] = &[
+    // find 降档:System32 find.exe = 文本搜索,非 Unix 文件查找
+    CandidateCommand {
+        name: "find",
+        description: "Windows find.exe:在文件中搜索文本串",
+        risk: "与 Unix find(文件查找)同名异义,误当文件查找用会搜错",
+        alternative: "rg/search_files(结构化,跨平台同语义)",
+    },
+    CandidateCommand {
+        name: "robocopy",
+        description: "复制目录树(含多线程/断点形态)",
+        risk: "/MIR 镜像模式会删除目标端多余文件,误用可清空目录",
+        alternative: "file_read + file_write 分步,或 file_move",
+    },
+    CandidateCommand {
+        name: "fc",
+        description: "比较两个文件内容差异",
+        risk: "低(只读)",
+        alternative: "—",
+    },
+    CandidateCommand {
+        name: "ipconfig",
+        description: "显示网络配置信息(只读)",
+        risk: "查看形态低风险;/release /renew 会断网重连(审批面把关)",
+        alternative: "—",
+    },
+];
+#[cfg(unix)]
+const PLATFORM_CANDIDATE_ADDITIONS: &[CandidateCommand] = &[];
+
+/// 平台增量 blocked(Windows shell 逃逸族显式化 + 系统状态面)
+///
+/// shutdown 已由基线表覆盖(「关机」),不重列(撞名守卫测试锁)。
+#[cfg(windows)]
+const PLATFORM_BLOCKED_ADDITIONS: &[(&str, &str)] = &[
+    ("powershell", "shell 逃逸 — 绕过白名单(Windows shell)"),
+    ("pwsh", "shell 逃逸 — 同上(PowerShell Core)"),
+    ("cmd", "shell 逃逸 — 同上(Windows shell)"),
+    ("reg", "注册表修改 — 改系统状态"),
+    ("sc", "系统服务控制"),
+    ("schtasks", "计划任务修改 — 持久化执行向量"),
+    ("net", "系统/域状态控制(net user/net start 等)"),
+    ("netsh", "网络栈配置修改"),
+    ("diskpart", "磁盘分区 — 毁数据"),
+    ("bcdedit", "启动配置修改 — 可致系统不可启动"),
+    ("wmic", "WMI 系统管理面 — 任意系统状态操作"),
+];
+#[cfg(unix)]
+const PLATFORM_BLOCKED_ADDITIONS: &[(&str, &str)] = &[];
+
+/// 有效 active 面(基线 − 平台降档 + 平台增量)
+///
+/// 分类点/描述面/CLI/PATH 探测共用此单源;热路径请用 [`ShellExecTool::classify`]
+/// (零分配),本访问器面向渲染与测试。
+pub fn effective_active_commands() -> Vec<&'static str> {
+    ACTIVE_COMMANDS
+        .iter()
+        .copied()
+        .filter(|c| !PLATFORM_DEMOTED_ACTIVE.contains(c))
+        .chain(PLATFORM_ACTIVE_ADDITIONS.iter().copied())
+        .collect()
+}
+
+/// 有效 candidate 面(基线 + 平台增量)
+pub fn effective_candidate_commands() -> Vec<CandidateCommand> {
+    CANDIDATE_COMMANDS
+        .iter()
+        .copied()
+        .chain(PLATFORM_CANDIDATE_ADDITIONS.iter().copied())
+        .collect()
+}
+
+/// 有效 blocked 面(基线 + 平台增量)
+pub fn effective_blocked_commands() -> Vec<(&'static str, &'static str)> {
+    BLOCKED_COMMANDS
+        .iter()
+        .copied()
+        .chain(PLATFORM_BLOCKED_ADDITIONS.iter().copied())
+        .collect()
+}
+
+// =============================================================================
+// PATH 探测(Windows:增强失败消息,不改分类)
+// =============================================================================
+
+/// 有效 active 集在本机的 PATH 命中缓存(首败惰性探测一次,进程级单例)
+///
+/// 设计原案为构造期探测;实测 ShellExecTool::new() 在测试套件中被构造数百
+/// 次,构造期逐例跑 ~10 个 where.exe 会显著拖慢 Windows CI——改为首次
+/// spawn 失败时惰性探测全集并缓存:消息增强语义不变,开销只付一次。
+///
+/// 探测只增强错误消息,不静默改分类(缺省不变式):active 照常直跑,
+/// 不可用只把「is it installed and in PATH?」升级为 where.exe 实证结论。
+#[cfg(windows)]
+fn active_path_hits() -> &'static std::collections::HashSet<&'static str> {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    static HITS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    HITS.get_or_init(|| {
+        effective_active_commands()
+            .into_iter()
+            .filter(|cmd| where_probe_found(cmd))
+            .collect()
+    })
+}
+
+/// where.exe 探测单命令(spawn 异常按未命中计,探测自身永不 panic)
+#[cfg(windows)]
+fn where_probe_found(program: &str) -> bool {
+    Command::new("where")
+        .arg(program)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Unix 血统命令的 Git-for-Windows 提示(miss 且属血统集时附安装线索)
+#[cfg(windows)]
+fn git_bash_hint(program: &str) -> &'static str {
+    if matches!(program, "ls" | "cat" | "grep" | "rg" | "find") {
+        "; Git for Windows provides ls/grep"
+    } else {
+        ""
+    }
+}
+
+/// spawn 失败消息(Unix:原文不变;Windows:NotFound 且 where 实证未命中
+/// 时增强为「not found on PATH」+ 安装线索)
+///
+/// 探测说命中却 spawn NotFound(罕见)或错误非 NotFound(权限等)时保持
+/// 原消息——增强只做实证加注,不猜测。
+fn spawn_failure_message(program: &str, e: &std::io::Error) -> String {
+    let base = format!(
+        "failed to spawn '{}': {} (is it installed and in PATH?)",
+        program, e
+    );
+    #[cfg(windows)]
+    {
+        if e.kind() == std::io::ErrorKind::NotFound && !active_path_hits().contains(program) {
+            return format!(
+                "failed to spawn '{}': program not found on PATH{}",
+                program,
+                git_bash_hint(program)
+            );
+        }
+    }
+    base
+}
+
 /// 命令分类结果
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandCategory {
@@ -1013,14 +1200,27 @@ impl ShellExecTool {
         Ok(())
     }
 
-    /// 把命令分到 3 个桶之一
+    /// 把命令分到 3 个桶之一(平台有效面:基线三表 + 平台增量 − 平台降档)
+    ///
+    /// 判定序 active→candidate→blocked 与基线语义一致;平台降档(find on
+    /// Windows)跳过 active 分支落 candidate。零分配:直接查 const 表,
+    /// 不经 [`effective_active_commands`] 等渲染面访问器。
     pub fn classify(program: &str) -> CommandCategory {
-        if ACTIVE_COMMANDS.contains(&program) {
+        let demoted = PLATFORM_DEMOTED_ACTIVE.contains(&program);
+        if !demoted
+            && (ACTIVE_COMMANDS.contains(&program) || PLATFORM_ACTIVE_ADDITIONS.contains(&program))
+        {
             CommandCategory::Active
-        } else if let Some(&c) = CANDIDATE_COMMANDS.iter().find(|c| c.name == program) {
-            CommandCategory::Candidate(c)
-        } else if let Some(&(_, reason)) =
-            BLOCKED_COMMANDS.iter().find(|(name, _)| *name == program)
+        } else if let Some(c) = CANDIDATE_COMMANDS
+            .iter()
+            .chain(PLATFORM_CANDIDATE_ADDITIONS.iter())
+            .find(|c| c.name == program)
+        {
+            CommandCategory::Candidate(*c)
+        } else if let Some(&(_, reason)) = BLOCKED_COMMANDS
+            .iter()
+            .chain(PLATFORM_BLOCKED_ADDITIONS.iter())
+            .find(|(name, _)| *name == program)
         {
             CommandCategory::Blocked(reason)
         } else {
@@ -1055,15 +1255,18 @@ impl ShellExecTool {
         }
     }
 
-    /// Unknown 拒绝消息(按 profile 列出本环境允许面)
+    /// Unknown 拒绝消息(按 profile 列出本环境允许面;Workbench 面=平台有效面)
     fn unknown_message(profile: ExecutionProfile, program: &str) -> String {
-        let (active, candidates): (&[&str], Vec<&str>) = match profile {
+        let (active, candidates): (Vec<&str>, Vec<&str>) = match profile {
             ExecutionProfile::Workbench => (
-                ACTIVE_COMMANDS,
-                CANDIDATE_COMMANDS.iter().map(|c| c.name).collect(),
+                effective_active_commands(),
+                effective_candidate_commands()
+                    .iter()
+                    .map(|c| c.name)
+                    .collect(),
             ),
             ExecutionProfile::SandboxTrusted => (
-                TRUSTED_ACTIVE_COMMANDS,
+                TRUSTED_ACTIVE_COMMANDS.to_vec(),
                 TRUSTED_CANDIDATE_COMMANDS.iter().map(|c| c.name).collect(),
             ),
         };
@@ -1105,10 +1308,7 @@ impl ShellExecTool {
         }
 
         match self.run_family(cmd, self.timeout) {
-            FamilyOutcome::Failed(e) => Err(format!(
-                "failed to spawn '{}': {} (is it installed and in PATH?)",
-                program, e
-            )),
+            FamilyOutcome::Failed(e) => Err(spawn_failure_message(program, &e)),
             FamilyOutcome::Terminated {
                 output,
                 pid,
@@ -1619,6 +1819,316 @@ mod tests {
             ShellExecTool::classify("nonexistent_xyz"),
             CommandCategory::Unknown
         );
+    }
+
+    // === 平台分档(o15:平台分档表,单源不双轨) ===
+
+    /// 矩阵一致性锁(平台无关,双平台 CI 各自执行):分类点必须与有效面
+    /// 访问器单源一致——active 面成员→Active,candidate 面成员→Candidate,
+    /// blocked 面成员→Blocked,三面两两不交,外部→Unknown。
+    /// 表增删/分类序改动必动本测试(diff 审),防静默漂移。
+    #[test]
+    fn test_effective_faces_consistent_with_classify() {
+        let active = effective_active_commands();
+        let candidates = effective_candidate_commands();
+        let blocked = effective_blocked_commands();
+
+        for p in &active {
+            assert_eq!(
+                ShellExecTool::classify(p),
+                CommandCategory::Active,
+                "effective active '{p}' misclassified"
+            );
+        }
+        for c in &candidates {
+            match ShellExecTool::classify(c.name) {
+                CommandCategory::Candidate(got) => {
+                    assert_eq!(got, *c, "candidate '{}' drift", c.name)
+                }
+                other => panic!(
+                    "effective candidate '{}' misclassified: {:?}",
+                    c.name, other
+                ),
+            }
+        }
+        for (p, reason) in &blocked {
+            match ShellExecTool::classify(p) {
+                CommandCategory::Blocked(got) => assert_eq!(&got, reason, "blocked '{p}' drift"),
+                other => panic!("effective blocked '{p}' misclassified: {:?}", other),
+            }
+        }
+
+        // 两两不交(平台内):同一命令不得出现在两个面
+        for a in &active {
+            assert!(
+                !candidates.iter().any(|c| c.name == *a),
+                "'{a}' in both active and candidate"
+            );
+            assert!(
+                !blocked.iter().any(|(n, _)| n == a),
+                "'{a}' in both active and blocked"
+            );
+        }
+        for c in &candidates {
+            assert!(
+                !blocked.iter().any(|(n, _)| *n == c.name),
+                "'{}' in both candidate and blocked",
+                c.name
+            );
+        }
+        // 平台降档成员不在 active 面(Windows find 形态)
+        for d in PLATFORM_DEMOTED_ACTIVE {
+            assert!(
+                !active.contains(d),
+                "demoted '{d}' must not be in effective active"
+            );
+        }
+        // 外部默认拒(兜底形态双平台一致)
+        assert_eq!(
+            ShellExecTool::classify("nonexistent_xyz"),
+            CommandCategory::Unknown
+        );
+
+        // sandbox-trusted 档矩阵同源一致(平台维度不进 trusted 表)
+        let trusted_active: std::collections::HashSet<&str> =
+            TRUSTED_ACTIVE_COMMANDS.iter().copied().collect();
+        for p in TRUSTED_ACTIVE_COMMANDS {
+            assert_eq!(
+                ShellExecTool::classify_for(ExecutionProfile::SandboxTrusted, p),
+                CommandCategory::Active,
+                "trusted active '{p}' drift"
+            );
+        }
+        for c in TRUSTED_CANDIDATE_COMMANDS {
+            assert!(
+                !trusted_active.contains(c.name),
+                "'{}' in both trusted active and candidate",
+                c.name
+            );
+            assert!(
+                matches!(
+                    ShellExecTool::classify_for(ExecutionProfile::SandboxTrusted, c.name),
+                    CommandCategory::Candidate(_)
+                ),
+                "trusted candidate '{}' drift",
+                c.name
+            );
+        }
+        for (p, _) in TRUSTED_BLOCKED_COMMANDS {
+            assert!(
+                matches!(
+                    ShellExecTool::classify_for(ExecutionProfile::SandboxTrusted, p),
+                    CommandCategory::Blocked(_)
+                ),
+                "trusted blocked '{p}' drift"
+            );
+        }
+    }
+
+    /// 有效面数量锁(平台分档矩阵计数;增删命令必动本测试,diff 审)
+    #[test]
+    fn test_platform_face_counts() {
+        #[cfg(windows)]
+        {
+            // 基线 8 − find 降档 1 + Windows 增量 3 = 10
+            assert_eq!(effective_active_commands().len(), 10);
+            // 基线 20 + Windows 增量 4(find/robocopy/fc/ipconfig) = 24
+            assert_eq!(effective_candidate_commands().len(), 24);
+            // 基线 34 + Windows 增量 11(shutdown 基线已列不重列) = 45
+            assert_eq!(effective_blocked_commands().len(), 45);
+        }
+        #[cfg(unix)]
+        {
+            // Unix 基线一字不动(零增量、零降档)
+            assert!(PLATFORM_ACTIVE_ADDITIONS.is_empty());
+            assert!(PLATFORM_CANDIDATE_ADDITIONS.is_empty());
+            assert!(PLATFORM_BLOCKED_ADDITIONS.is_empty());
+            assert!(PLATFORM_DEMOTED_ACTIVE.is_empty());
+            assert_eq!(effective_active_commands().len(), 8);
+            assert_eq!(effective_candidate_commands().len(), 20);
+            assert_eq!(effective_blocked_commands().len(), 34);
+        }
+    }
+
+    /// Windows 平台增量形态锁:active 三件/candidate 四件/find 降档/
+    /// shell 逃逸族显式化/shutdown 不重列
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_platform_layers() {
+        for p in ["findstr", "where", "tasklist"] {
+            assert_eq!(ShellExecTool::classify(p), CommandCategory::Active, "{p}");
+        }
+        // find 撞名降档(平台分档第一例):基线 active → Windows candidate
+        match ShellExecTool::classify("find") {
+            CommandCategory::Candidate(c) => {
+                assert_eq!(c.name, "find");
+                assert!(
+                    c.alternative.contains("rg") && c.alternative.contains("search_files"),
+                    "降档注记应指引替代: {}",
+                    c.alternative
+                );
+            }
+            other => panic!("find should be demoted to candidate, got {:?}", other),
+        }
+        for p in ["robocopy", "fc", "ipconfig"] {
+            assert!(
+                matches!(ShellExecTool::classify(p), CommandCategory::Candidate(_)),
+                "{p} should be candidate"
+            );
+        }
+        // Windows shell 逃逸族显式化(设计稿标注的硬缺口):必 blocked
+        for p in [
+            "powershell",
+            "pwsh",
+            "cmd",
+            "reg",
+            "sc",
+            "schtasks",
+            "net",
+            "netsh",
+            "diskpart",
+            "bcdedit",
+            "wmic",
+        ] {
+            assert!(
+                matches!(ShellExecTool::classify(p), CommandCategory::Blocked(_)),
+                "{p} should be blocked"
+            );
+        }
+        // shutdown 基线已列,Windows 增量不重列(防撞名双账)
+        assert_eq!(
+            PLATFORM_BLOCKED_ADDITIONS
+                .iter()
+                .filter(|(n, _)| *n == "shutdown")
+                .count(),
+            0
+        );
+    }
+
+    /// Windows shell 逃逸族端到端拒执:approved=true 也不越(blocked 无审批通道)
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_shell_blocked_even_approved() {
+        let tool = ShellExecTool::new();
+        let result = tool.call_sync(&arg_with("cmd /c echo hi", true));
+        let err = result.expect_err("cmd must be rejected");
+        assert!(err.contains("BLOCKED"), "got: {err}");
+    }
+
+    /// Windows find 降档端到端:candidate 提案流(未批不出 proposal 不执行)
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_find_demoted_proposal_flow() {
+        let tool = ShellExecTool::new();
+        let result = tool.call_sync(&arg("find \"foo\" somefile.txt"));
+        let v = result.expect("candidate should return proposal");
+        assert_eq!(v.get("status").unwrap().as_str().unwrap(), "needs_approval");
+        assert_eq!(v.get("program").unwrap().as_str().unwrap(), "find");
+        assert_eq!(v.get("category").unwrap().as_str().unwrap(), "candidate");
+    }
+
+    /// Unix 基线形态锁:find 仍 active;Windows 增量命令在 Unix 不入表
+    /// (基线一字不动,Unix 上未知即 Unknown 拒)
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_baseline_unchanged() {
+        assert_eq!(ShellExecTool::classify("find"), CommandCategory::Active);
+        for p in ["findstr", "where", "tasklist", "robocopy", "fc", "ipconfig"] {
+            assert_eq!(
+                ShellExecTool::classify(p),
+                CommandCategory::Unknown,
+                "{p} must not leak into unix tables"
+            );
+        }
+    }
+
+    /// Windows PATHEXT 双跳防护对新增 active 命令面自动生效(防护零改动)
+    #[cfg(windows)]
+    #[test]
+    fn test_pathext_shadow_applies_to_new_active() {
+        let dir = std::env::temp_dir().join(format!("evo-shell-shadow-w-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("findstr.bat"), b"@echo off\r\n").unwrap();
+        let tool = ShellExecTool::new().with_workdir(&dir);
+        let err = tool
+            .execute(&["findstr", "/?"], "findstr /?")
+            .expect_err("shadowed findstr must be rejected");
+        assert!(err.contains("PATHEXT"), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PATH 探测:where.exe 实证命中/未命中;失败消息增强只做加注不改分类
+    #[cfg(windows)]
+    #[test]
+    fn test_path_probe_and_enhanced_message() {
+        // 真栈探测:系统必在的 where.exe 命中;凭空名未命中
+        assert!(where_probe_found("where"));
+        assert!(!where_probe_found("evorule-nonexistent-xyz-42"));
+
+        // miss + Unix 血统命令 → not found on PATH + Git for Windows 线索
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let msg = spawn_failure_message("ls", &not_found);
+        assert!(msg.contains("not found on PATH"), "got: {msg}");
+        assert!(msg.contains("Git for Windows"), "got: {msg}");
+        // miss + 非血统命令 → 仅实证结论,无线索
+        let msg = spawn_failure_message("evorule-nonexistent-xyz-42", &not_found);
+        assert!(msg.contains("not found on PATH"), "got: {msg}");
+        assert!(!msg.contains("Git for Windows"), "got: {msg}");
+
+        // 探测说命中(findstr 系统必有)却 spawn NotFound(罕见形态)→ 保持原消息
+        let _ = active_path_hits(); // 触发全集缓存
+        let msg = spawn_failure_message("findstr", &not_found);
+        assert!(msg.contains("is it installed and in PATH?"), "got: {msg}");
+
+        // 非 NotFound(权限等)→ 原消息,不猜测
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = spawn_failure_message("evorule-nonexistent-xyz-42", &denied);
+        assert!(msg.contains("is it installed and in PATH?"), "got: {msg}");
+    }
+
+    /// 真栈直跑:Windows 增量 active 为真实 exe,经工具全链路可执行
+    /// (锁修订案「真实 .exe 可直跑」前提;Findstr/where 系统必有)
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_new_active_real_exec() {
+        let tool = ShellExecTool::new();
+        for cmdline in ["findstr /?", "where cmd"] {
+            let result = tool.call_sync(&arg(cmdline));
+            match result {
+                Ok(v) => assert_eq!(
+                    v.get("status").unwrap().as_str().unwrap(),
+                    "ok",
+                    "{cmdline}"
+                ),
+                other => panic!("{cmdline} should really run, got {other:?}"),
+            }
+        }
+        // tasklist 过滤单 pid(输出有界,验证真实 exe 直跑)
+        let result = tool.call_sync(&arg("tasklist /nh /fi \"PID eq 4\""));
+        match result {
+            Ok(v) => assert_eq!(v.get("status").unwrap().as_str().unwrap(), "ok"),
+            other => panic!("tasklist should really run, got {other:?}"),
+        }
+    }
+
+    /// Unknown 拒绝消息按平台有效面渲染(Windows 增量在列,Unix 不列)
+    #[test]
+    fn test_unknown_message_lists_platform_faces() {
+        let msg = ShellExecTool::unknown_message(ExecutionProfile::Workbench, "nonexistent_xyz");
+        assert!(msg.contains("NOT in active or candidate"), "got: {msg}");
+        #[cfg(windows)]
+        {
+            assert!(msg.contains("findstr"), "Windows 增量应在列: {msg}");
+            // active 面精确形态(降档 find 不在 active,Windows 增量三件在列)
+            assert!(
+                msg.contains("cargo, git, ls, cat, grep, rg, make, findstr, where, tasklist"),
+                "active 面渲染漂移: {msg}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert!(!msg.contains("findstr"), "Unix 基线一字不动: {msg}");
+        }
     }
 
     // === call() 行为测试 ===

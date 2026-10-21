@@ -1685,14 +1685,15 @@ fn tools_list() -> ExitCode {
     println!();
 
     println!("[CANDIDATE] 备选(LLM 想用 → 摊开 proposal 给你看 → 你批 → 再执行):");
-    for c in shell_exec::CANDIDATE_COMMANDS {
+    // 平台有效面(Windows 增量/降档随编译期平台如实列出)
+    for c in shell_exec::effective_candidate_commands() {
         println!("  - {} — {} (risk: {})", c.name, c.description, c.risk);
     }
     println!("  (http_get candidate host:任何不在 active 列表的公开 host)");
     println!();
 
     println!("[BLOCKED] 永不批准(逃逸出口 / 不可逆破坏):");
-    for (name, reason) in shell_exec::BLOCKED_COMMANDS {
+    for (name, reason) in shell_exec::effective_blocked_commands() {
         println!("  - {} — {}", name, reason);
     }
     println!(
@@ -1716,9 +1717,9 @@ fn tools_show(name: &str) -> ExitCode {
         print_spec(spec, "ACTIVE");
         return ExitCode::SUCCESS;
     }
-    // shell_exec candidate
-    if let Some(c) = shell_exec::CANDIDATE_COMMANDS
-        .iter()
+    // shell_exec candidate(平台有效面)
+    if let Some(c) = shell_exec::effective_candidate_commands()
+        .into_iter()
         .find(|c| c.name == name)
     {
         println!("[CANDIDATE] {}", c.name);
@@ -1727,9 +1728,9 @@ fn tools_show(name: &str) -> ExitCode {
         println!("  alternative: {}", c.alternative);
         return ExitCode::SUCCESS;
     }
-    // shell_exec blocked
-    if let Some((_, reason)) = shell_exec::BLOCKED_COMMANDS
-        .iter()
+    // shell_exec blocked(平台有效面)
+    if let Some((_, reason)) = shell_exec::effective_blocked_commands()
+        .into_iter()
         .find(|(n, _)| *n == name)
     {
         println!("[BLOCKED] {}", name);
