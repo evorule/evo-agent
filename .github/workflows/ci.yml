@@ -49,11 +49,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # CI diagnosis (2026-10-21/22): ubuntu verify died 7x mid-step (~48-52
-          # min in, "lost communication"), including ON the ubuntu-24.04 pin
-          # WITH -j2 + debug=0 + fresh cache. Main-branch history shows ubuntu
-          # verify has NEVER been green on GitHub (30+ consecutive failures
-          # since the repo migration) -- and because a job must COMPLETE to
+          # CI diagnosis (2026-10-21/22): ubuntu verify was green (2-3 min
+          # warm-cache runs) through 2026-10-14. On 10-15 five runs hung
+          # inside cargo test (silent for hours, killed by the 6-hour job
+          # cap; teardown showed orphan test binary + npm exec + sh). Since
+          # 2026-10-16 every run has died mid-step (~48-52 min in, "lost
+          # communication"), including ON the ubuntu-24.04 pin WITH -j2 +
+          # debug=0 + fresh cache -- and because a job must COMPLETE to
           # save its rust-cache, every death re-arms a cold-cache spiral:
           # slowest possible run, maximum exposure, death again.
           #
