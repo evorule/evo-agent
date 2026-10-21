@@ -67,8 +67,9 @@
 
   const welcomeText = `# evo-agent 工作台
 
-这里是 evo-agent 的工作台 —— 以标准编程 IDE 为底盘,
-叠加 evorule 治理能力(agent 会话 / 审批 / 审计 / 规则)。
+Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / 审计 / 规则)。
+
+官方仓库: https://github.com/evorule/evo-agent
 
 ## 现在可以做什么
 
