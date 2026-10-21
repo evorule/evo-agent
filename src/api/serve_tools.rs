@@ -685,7 +685,8 @@ pub fn apply_request_tool_allowlist(
 /// Windows canonicalize 产物带 `\\?\` verbatim 前缀,边界展示面(LLM 自知
 /// 边界/系统提示段)用常规形态;`\\?\UNC\` 还原为 `\\server\share`。
 /// 仅影响展示与纯路径运算的自洽形态,不含 fs 语义变更。
-fn simplify_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
+/// (pub(crate):file_api browse 端点返回路径同款规整,单一正本防漂移)
+pub(crate) fn simplify_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
     if let Some(s) = p.to_str() {
         if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
             return std::path::PathBuf::from(format!(r"\\{}", stripped));
