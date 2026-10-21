@@ -21,6 +21,10 @@ export const connStatus = writable('offline');
  *  文件面随请求头即刻重锚,此处只承担「树需要重建」的显式信号。 */
 export const workspaceEpoch = writable(0);
 
+/** 首页请求信号:活动栏「evo-agent 工作台」等入口点击后自增,
+ *  EditorPane 订阅消费(切回首页态,不清已开 tab)。 */
+export const homeRequested = writable(0);
+
 /** 当前会话 id(null = 尚未创建) */
 export const sessionId = writable(null);
 

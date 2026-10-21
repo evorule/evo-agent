@@ -20,6 +20,9 @@
   } from '../lib/approval.js';
   import { settingsState, setSetting } from '../lib/settings.js';
   import { reconnectCurrent } from '../lib/ws.js';
+  import { fetchNotices } from '../lib/api.js';
+  import { sortNotices, sliceForDisplay, levelClass } from '../lib/notices.js';
+  import { marked } from 'marked';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import DirectoryBrowser from './DirectoryBrowser.svelte';
 
@@ -30,6 +33,15 @@
   let modeBusy = false;
   let modeErr = '';
   let confirmState = null; // {message, resolve}
+
+  // ---- 公告卡(批 J1 段 2):/api/notices 单向只读发布面 ----
+  // fail-soft:拉取失败/空表整卡隐藏(未发布态与现状零差异);
+  // body_md 走 marked 渲染,口径同 EditorPane md 预览(内容源=发布者本机文件)。
+  let notices = [];
+  let noticeErr = '';
+  let allNotices = false;
+
+  $: visibleNotices = sliceForDisplay(notices, allNotices);
 
   function confirmViaDialog(message) {
     return new Promise((resolve) => {
@@ -83,15 +95,59 @@
     epochSeen = -2; // 强制首次刷新(rune 块已随首帧执行过一次)
     ws = localStorage.getItem('evo_workspace') || '';
     recents = loadRecentWorkspaces();
+    // 公告面:异步拉取,失败静默(整卡隐藏)
+    fetchNotices()
+      .then((r) => {
+        notices = sortNotices(r?.notices || []);
+        if (r?.error) noticeErr = r.error;
+      })
+      .catch(() => {});
   });
 </script>
 
 <div class="home" data-zone="editor">
   <div class="card">
     <div class="brand">
+      <!-- EvoRule 内核徽标:金色双环内等号(与顶栏/favicon 同源) -->
+      <svg class="brand-mark" viewBox="0 0 24 24" width="28" height="28" fill="none" aria-hidden="true">
+        <circle cx="12" cy="12" r="9.4" stroke="#D4AF37" stroke-width="1.5" />
+        <circle cx="12" cy="12" r="6.9" stroke="#F0D27A" stroke-width="0.9" />
+        <rect x="7.5" y="9.1" width="9" height="2.3" rx="0.9" fill="#D4AF37" />
+        <rect x="7.5" y="12.6" width="9" height="2.3" rx="0.9" fill="#F0D27A" />
+      </svg>
       <h1>evo-agent 工作台</h1>
       <p class="sub">以标准编程 IDE 为底盘,叠加 evorule 治理能力(agent 会话 / 审批 / 审计 / 规则)。</p>
     </div>
+
+    <section class="sec notices" data-testid="notices-card">
+      <div class="sec-head">
+        <span class="sec-title">公告</span>
+        {#if notices.length > 2}
+          <button class="btn ghost sm" onclick={() => (allNotices = !allNotices)}>
+            {allNotices ? '收起' : `全部展开(${notices.length})`}
+          </button>
+        {/if}
+      </div>
+      {#each visibleNotices as n (n.id)}
+        <article class="notice">
+          <div class="n-head">
+            <span class="badge {levelClass(n.level)}">{n.level}</span>
+            {#if n.pinned}<span class="pin" title="置顶">▲</span>{/if}
+            <b class="n-title">{n.title}</b>
+            <span class="n-date mono">{n.date}</span>
+          </div>
+          <div class="n-body md">{@html marked.parse(n.body_md || '', { async: false })}</div>
+          {#if n.links?.length}
+            <div class="n-links">
+              {#each n.links as l (l.href)}
+                <a class="chip" href={l.href} target="_blank" rel="noopener">{l.label}</a>
+              {/each}
+            </div>
+          {/if}
+        </article>
+      {/each}
+      {#if noticeErr}<p class="hint">{noticeErr}</p>{/if}
+    </section>
 
     <section class="sec">
       <div class="sec-head">
@@ -215,6 +271,14 @@
     width: 620px;
     max-width: 100%;
     align-self: flex-start;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .brand-mark {
+    flex: none;
   }
   .brand h1 {
     font-size: 20px;
@@ -361,5 +425,104 @@
   }
   .guide li + li {
     margin-top: 4px;
+  }
+  /* ---- 公告卡(批 J1 段 2) ---- */
+  .btn.sm {
+    font-size: var(--fs-xs);
+    padding: 2px 10px;
+  }
+  .notice {
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    background: var(--bg-card);
+  }
+  .notice:last-of-type {
+    margin-bottom: 0;
+  }
+  .n-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .badge {
+    flex: none;
+    font-size: var(--fs-xs);
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-weight: var(--fw-sb);
+  }
+  .badge.lv-info {
+    color: var(--text-secondary);
+    border: 1px solid var(--border-strong);
+  }
+  .badge.lv-warn {
+    color: var(--warning, #d29922);
+    border: 1px solid var(--warning, #d29922);
+  }
+  .badge.lv-feature {
+    color: var(--brand);
+    border: 1px solid var(--brand);
+  }
+  .pin {
+    flex: none;
+    color: var(--brand);
+    font-size: var(--fs-xs);
+  }
+  .n-title {
+    font-size: var(--fs-sm);
+    color: var(--text-primary);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .n-date {
+    flex: none;
+    margin-left: auto;
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+  }
+  .n-body {
+    margin-top: 6px;
+    font-size: var(--fs-sm);
+    color: var(--text-secondary);
+    line-height: var(--lh-normal);
+    overflow-wrap: anywhere;
+  }
+  .n-body :global(p) {
+    margin: 0 0 6px;
+  }
+  .n-body :global(p:last-child) {
+    margin-bottom: 0;
+  }
+  .n-body :global(img) {
+    max-width: 100%;
+    border-radius: var(--r-sm);
+  }
+  .n-body :global(code) {
+    background: var(--bg-header, rgba(255, 255, 255, 0.06));
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: var(--fs-xs);
+  }
+  .n-links {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+  }
+  .n-links .chip {
+    display: inline-block;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--brand);
+    font-size: var(--fs-xs);
+    padding: 2px 10px;
+    text-decoration: none;
+  }
+  .n-links .chip:hover {
+    border-color: var(--brand);
   }
 </style>

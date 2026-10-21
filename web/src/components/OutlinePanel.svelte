@@ -15,16 +15,26 @@ pendingReveal 定位信号,col 走 serve 搜索坐标的 0-based 约定)。 -->
   let open = true;
   let symbols = [];
   let state = 'idle'; // idle | loading | ready | empty
-  let disposeContent = null; // 激活 model 内容订阅(切走即摘)
+  // 订阅句柄容器:Svelte 5 对 legacy 组件 async 函数的 await 点做作用域重建
+  // ($.track_reactivity_loss),plain let 在恢复点值错乱(disposeContent 变
+  // truthy 非函数,摘除即 TypeError)。const 绑定的对象属性读写不经重建,
+  // 且句柄摘除收敛到同步 detachContent,async 面内不再直接读句柄。
+  const sub = { content: null };
+  let refreshSeq = 0; // 代际令牌:仅最新一次 refresh 有落座/存续裁决权
   let debounceTimer = null;
+
+  function detachContent() {
+    if (sub.content) {
+      sub.content.dispose(); // monaco onDidChangeContent returns IDisposable, not a fn
+      sub.content = null;
+    }
+  }
 
   $: refresh($activePath);
 
   async function refresh(path) {
-    if (disposeContent) {
-      disposeContent();
-      disposeContent = null;
-    }
+    const gen = ++refreshSeq;
+    detachContent();
     clearTimeout(debounceTimer);
     // 非文件 tab(设置页/虚拟路径/欢迎页)不采
     if (!path || path.startsWith('evo://') || path.startsWith('git-diff://')) {
@@ -33,11 +43,11 @@ pendingReveal 定位信号,col 走 serve 搜索坐标的 0-based 约定)。 -->
       return;
     }
     // model 由 EditorPane/GroupPane 打开 tab 后异步创建,activePath 先行——
-    // 短重试等就绪(3×300ms);期间切走即弃,仍无 model 回 idle(错误占位等)
+    // 短重试等就绪(3×300ms);期间被抢代/切走即弃,仍无 model 回 idle(错误占位等)
     let model = getModelForPath(path);
     for (let i = 0; !model && i < 3; i++) {
       await new Promise((r) => setTimeout(r, 300));
-      if (get(activePath) !== path) return;
+      if (gen !== refreshSeq || get(activePath) !== path) return;
       model = getModelForPath(path);
     }
     if (!model) {
@@ -47,10 +57,15 @@ pendingReveal 定位信号,col 走 serve 搜索坐标的 0-based 约定)。 -->
     }
     state = 'loading';
     // 内容变化 → 去抖重采(编辑中大纲跟随)
-    disposeContent = model.onDidChangeContent(() => {
+    const d = model.onDidChangeContent(() => {
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => collect(path, model), 500);
     });
+    if (gen !== refreshSeq) {
+      d.dispose(); // superseded during await window: dispose now, never seat
+      return;
+    }
+    sub.content = d;
     await collect(path, model);
   }
 
@@ -71,7 +86,7 @@ pendingReveal 定位信号,col 走 serve 搜索坐标的 0-based 约定)。 -->
   }
 
   onDestroy(() => {
-    disposeContent?.();
+    detachContent();
     clearTimeout(debounceTimer);
   });
 </script>

@@ -23,6 +23,7 @@ pub mod log_buffer;
 pub mod lsp_api;
 pub mod mcp_api;
 pub mod metrics;
+pub mod notices_api;
 pub mod orchestration_api;
 pub mod pty_api;
 pub mod serve_tools;

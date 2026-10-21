@@ -47,11 +47,12 @@
 <header class="header">
   <div class="brand">
     <span class="logo" aria-hidden="true">
+      <!-- EvoRule 内核徽标:金色双环内等号(与 evorule-console-cloud 一致) -->
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none">
-        <path
-          d="M13 2 4.5 13.5H11L9.5 22 19.5 9.5H13L13 2Z"
-          fill="var(--brand-ocean)"
-        />
+        <circle cx="12" cy="12" r="9.4" stroke="#D4AF37" stroke-width="1.5" />
+        <circle cx="12" cy="12" r="6.9" stroke="#F0D27A" stroke-width="0.9" />
+        <rect x="7.5" y="9.1" width="9" height="2.3" rx="0.9" fill="#D4AF37" />
+        <rect x="7.5" y="12.6" width="9" height="2.3" rx="0.9" fill="#F0D27A" />
       </svg>
     </span>
     <span class="brand-text">evo-agent</span>
