@@ -1,4 +1,4 @@
-﻿# 看门狗单次巡检: 四服务探活,不通则拉起。计划任务每 5 分钟触发(2026-09-30 由每小时提频),也可手动运行当作"一键全启"。
+# 看门狗单次巡检: 四服务探活,不通则拉起。计划任务每 5 分钟触发(2026-09-30 由每小时提频),也可手动运行当作"一键全启"。
 $created = $false
 $mutex = [System.Threading.Mutex]::new($false, 'Global\EvoruleOpsWatchdog')
 try { $created = $mutex.WaitOne(0) } catch { $created = $true }
@@ -12,6 +12,7 @@ try {
         'evorule-server'      = 'start-evorule-server.ps1'
         'echo'                = 'start-echo.ps1'
         'evo-agent-serve'     = 'start-evo-agent-serve.ps1'
+        'ai-plugin'           = 'start-ai-plugin.ps1'
         'console'             = 'start-console.ps1'
         'context-inspector'   = 'start-context-inspector.ps1'
     }
