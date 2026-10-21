@@ -108,6 +108,13 @@
 <div class="home" data-zone="editor">
   <div class="card">
     <div class="brand">
+      <!-- EvoRule 内核徽标:金色双环内等号(与顶栏/favicon 同源) -->
+      <svg class="brand-mark" viewBox="0 0 24 24" width="28" height="28" fill="none" aria-hidden="true">
+        <circle cx="12" cy="12" r="9.4" stroke="#D4AF37" stroke-width="1.5" />
+        <circle cx="12" cy="12" r="6.9" stroke="#F0D27A" stroke-width="0.9" />
+        <rect x="7.5" y="9.1" width="9" height="2.3" rx="0.9" fill="#D4AF37" />
+        <rect x="7.5" y="12.6" width="9" height="2.3" rx="0.9" fill="#F0D27A" />
+      </svg>
       <h1>evo-agent 工作台</h1>
       <p class="sub">以标准编程 IDE 为底盘,叠加 evorule 治理能力(agent 会话 / 审批 / 审计 / 规则)。</p>
     </div>
@@ -264,6 +271,14 @@
     width: 620px;
     max-width: 100%;
     align-self: flex-start;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .brand-mark {
+    flex: none;
   }
   .brand h1 {
     font-size: 20px;
