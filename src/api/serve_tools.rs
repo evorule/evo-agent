@@ -1182,7 +1182,7 @@ mod tests {
             );
         }
 
-        // 总数 = 23 + 45 = 68(逐个验证所有预期工具都在;批K 段3 code_search、批K 段4 todo 双件、批K 段5 http_request 接入)
+        // 总数 = 23 + 46 = 69(逐个验证所有预期工具都在;批K 段3 code_search、批K 段4 todo 双件、批K 段5 http_request、批K 段7 ask_user 接入)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -1198,6 +1198,7 @@ mod tests {
             "web_fetch",
             "web_search",
             "http_request",
+            "ask_user",
             "git_status",
             "git_diff",
             "git_log",
@@ -1212,7 +1213,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 68, "expected 68 total tool names");
+        assert_eq!(all_names.len(), 69, "expected 69 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),

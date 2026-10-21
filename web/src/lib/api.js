@@ -285,6 +285,19 @@ export function approveProposal(agentType, sessionId, approved, proposalId) {
   }).then(unwrap);
 }
 
+/** 问答回传(批K 段7 人在环 ask_user;answer 数组:单选=1 项/多选=1..=N 项/自由文本=1 项) */
+export function answerQuestion(agentType, sessionId, questionId, answer) {
+  return fetch(`/agents/${encodeURIComponent(agentType)}/answer`, {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({
+      session_id: sessionId,
+      question_id: questionId,
+      answer,
+    }),
+  }).then(unwrap);
+}
+
 /** agent 定义(白名单徽标数据源:tools 列表) */
 export function getAgentDef(agentType = 'general') {
   return fetch(`/agents/${encodeURIComponent(agentType)}`, { headers: headers() }).then(unwrap);

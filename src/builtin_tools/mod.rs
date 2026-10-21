@@ -8,7 +8,8 @@
 //! diff_runs / handover_write / handover_read / session_spawn /
 //! web_fetch / web_search（批K 段2）/ code_search（批K 段3）/
 //! todo_write / todo_read（批K 段4，占位注册+会话期重绑）/
-//! http_request（批K 段5，HTTP 写动词）)
+//! http_request（批K 段5，HTTP 写动词）/
+//! ask_user（批K 段7，人在环澄清卡——两阶段协议，等待在 runner 层）)
 //!
 //! 注:`read_skill`(skills 装配 B2)不在 default_safe_toolkit 静态注册——
 //! 其技能表来自 agent definition 的 skills 声明(声明非空时由 serve_tools::
@@ -48,6 +49,7 @@
 //! 默认是"宁可功能少,也不可被滥用"。
 
 pub mod accounting;
+pub mod ask_user;
 pub mod code_search;
 pub mod delegate_tool;
 pub mod edit_file;
@@ -295,6 +297,14 @@ pub fn default_safe_toolkit_with_profile(
     handler.register_static(
         crate::builtin_tools::todo::TODO_READ_TOOL,
         Arc::new(crate::builtin_tools::todo::TodoReadTool::unwired()),
+    );
+    // ask_user 人在环澄清卡（批K 段7）：无占位/重绑形态（工具无状态，
+    // 校验+形态返回；阻塞等待在 runner 层经 AskUserCallback）——开关
+    // agentTools.askUser 过滤契约面自动工作；callback 由执行面装配
+    // （serve=HttpAskUser+QuestionStore，CLI=CliAskUser）
+    handler.register_static(
+        crate::builtin_tools::ask_user::ASK_USER_TOOL,
+        Arc::new(crate::builtin_tools::ask_user::AskUserTool::new()),
     );
     handler
 }
@@ -1307,6 +1317,55 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                           only for this session."
                 .to_string(),
             parameters: vec![],
+        },
+        ToolSpec {
+            name: "ask_user".to_string(),
+            description: "Ask the user a clarifying question and block until they answer \
+                          (or it times out). Use this at genuine decision points where \
+                          guessing could waste significant work — not for trivial choices \
+                          or questions answerable from the session context. Provide \
+                          `options` (2-4 short choices) when the answer is a selection; \
+                          omit them for free-form input. Set `multi_select: true` to allow \
+                          choosing several options. The user is notified immediately; if \
+                          they do not answer within `timeout_secs` (60-600, default 300) \
+                          the tool returns status=timeout — then decide on your own and \
+                          continue without waiting again. Do not call this tool twice for \
+                          the same question; after a timeout, proceed with your best \
+                          judgment and state the assumption."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "question".to_string(),
+                    r#type: "string".to_string(),
+                    description: "The question to ask (1-2000 chars, specific and \
+                                  self-contained)"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "options".to_string(),
+                    r#type: "array".to_string(),
+                    description: "2-4 answer choices (each ≤200 chars); omit for free-form \
+                                  input"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "multi_select".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Allow choosing several options (default false; only \
+                                  meaningful with options)"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "timeout_secs".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Wait limit in seconds, 60-600 clamped (default 300)"
+                        .to_string(),
+                    required: false,
+                },
+            ],
         },
     ]
 }

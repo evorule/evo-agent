@@ -2041,6 +2041,9 @@ async fn test_g13_cache_hit_reruns_adjudication_for_p2_tools() {
         ToolExecStage::Pending(_) => {
             panic!("cache-hit of non-proposal result must not be Pending");
         }
+        ToolExecStage::PendingQuestion(_) => {
+            panic!("cache-hit of non-question result must not be PendingQuestion");
+        }
     }
 
     m_create.assert_async().await;

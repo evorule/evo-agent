@@ -104,6 +104,8 @@ pub enum CapDomain {
     Delegate,
     /// 技能加载
     Skill,
+    /// 人在环交互（ask_user 澄清卡——会话面问答，无文件/网络触点）
+    Interaction,
 }
 
 /// 裁决分级（P2 事前意图裁决的通道分级，见模块文档）
@@ -401,6 +403,13 @@ const SWITCH_TODO: &str = AGENT_TOOLS_TODO;
 pub const AGENT_TOOLS_HTTP_REQUEST: &str = "agentTools.httpRequest";
 const SWITCH_HTTP_REQUEST: &str = AGENT_TOOLS_HTTP_REQUEST;
 
+/// agentTools.askUser（默认开；人在环澄清卡——agent 向用户发结构化问题
+/// 阻塞等回答，超时 fail-visible，批K 段7）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_ASK_USER: &str = "agentTools.askUser";
+const SWITCH_ASK_USER: &str = AGENT_TOOLS_ASK_USER;
+
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
     Some(SwitchBinding {
@@ -519,6 +528,13 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 先例：会话自管理状态面）。spec 常驻 default_tool_specs（Builtin 源）。
         b("todo_write", vec![Memory]),
         b("todo_read", vec![Memory]),
+        // ask_user 人在环澄清卡（批K 段7）：agent 向用户发结构化问题阻塞
+        // 等回答（两阶段协议：首调出 pending 形态 → runner 推帧等回答 →
+        // 带 answer 重调）。能力域=Interaction（新增：人在环交互，无文件/
+        // 网络/子进程触点）；Standard 免裁决 + AutoPolicy（交互零风险），
+        // 不进 EXFIL_SCAN_TOOLS（question 发给会话数据有权方，非网络外发）。
+        // spec 常驻 default_tool_specs（Builtin 源）。
+        b("ask_user", vec![Interaction]),
     ]
     .into_iter()
     .map(|mut m| {
@@ -615,6 +631,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // 批K 段5:HTTP 写动词,默认关(写动词不进缺省工具面,显式启用
             // 才可达;启用后仍走双闸全流审批)
             "http_request" => sw(SWITCH_HTTP_REQUEST, false),
+            // 批K 段7:人在环澄清卡,默认开(交互零风险;关=agent 无人可问,
+            // resolve 侧立即返回无人态 fail-visible)
+            "ask_user" => sw(SWITCH_ASK_USER, true),
             _ => None,
         };
         m
@@ -946,9 +965,10 @@ mod tests {
         //   （批K 段3 符号图谱检索 code_search +1：内置 31→32，数量锁 97→98）
         //   （批K 段4 todo 双件 todo_write/todo_read +2：内置 32→34，数量锁 98→100）
         //   （批K 段5 HTTP 写动词 http_request +1：内置 34→35，数量锁 100→101）
-        assert_eq!(builtin_manifests().len(), 35);
+        //   （批K 段7 人在环 ask_user +1：内置 35→36，数量锁 101→102）
+        assert_eq!(builtin_manifests().len(), 36);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 101);
+        assert_eq!(all().len(), 102);
     }
 
     #[test]
@@ -1180,7 +1200,7 @@ mod tests {
     /// 接入 → 32 条（memory_recall/audit_query/memory_tombstone 后续接入，
     /// 历史批注曾滞后于实际行数，20261021 批K 段4 修正口径）；批K 段4
     /// todo_write/todo_read 接入 → 43 条；批K 段5 http_request 接入
-    /// （默认关）→ 44 条
+    /// （默认关）→ 44 条；批K 段7 ask_user 接入 → 45 条
     const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
         ("file_create", "agentTools.fileCreate", true),
         ("edit_file", "agentTools.editFile", true),
@@ -1233,6 +1253,8 @@ mod tests {
         ("todo_read", "agentTools.todo", true),
         // HTTP 写动词（批K 段5）：默认关（写动词不进缺省工具面）
         ("http_request", "agentTools.httpRequest", false),
+        // 人在环澄清卡（批K 段7）：默认开（交互零风险，无文件/网络/子进程触点）
+        ("ask_user", "agentTools.askUser", true),
     ];
 
     #[test]

@@ -26,6 +26,9 @@ use crate::agent::approval::{
 use crate::agent::callback::CallbackChain;
 use crate::agent::context_window::{ContextWindowManager, TrimStrategy};
 use crate::agent::journal::REWIND_BUDGET_LIMIT;
+use crate::builtin_tools::ask_user::{
+    parse_ask_user_query, AskUserCallback, AskUserQuery, ASK_USER_TOOL,
+};
 
 /// 心跳保活超时窗(秒)。event 等待点连续 2 窗(=120s)无引擎
 /// 事件判定死锁,中止当前 turn(①重试等待=第一窗后回到 select 再等)。
@@ -770,6 +773,9 @@ enum ToolExecStage {
     Done(ToolExecOutcome),
     /// 工具返回 needs_approval proposal,待调用方通知用户后进入阶段二
     Pending(ApprovalRequest),
+    /// ask_user 返回 pending 形态(批K 段7),待调用方推帧后等待用户回答
+    /// 并重调(两阶段协议阶段二在 resolve_ask_user)
+    PendingQuestion(AskUserQuery),
 }
 
 /// G4:Agent 执行过程中的事件流
@@ -850,6 +856,30 @@ pub enum AgentEvent {
         approver: String,
         /// 是否系统自动拒绝(超时 / 通道关闭)
         auto_rejected: bool,
+    },
+    /// G8 扩展:ask_user 澄清卡开启(批K 段7)——agent 向用户发结构化问题,
+    /// 前端渲染问答卡;等待在 runner 层(不占轮次,与 ApprovalPending 同构)
+    AskUser {
+        /// 问题 ID(`au-` 前缀;/answer 回传校验主键)
+        question_id: String,
+        /// 问题文本
+        question: String,
+        /// 选项(空 = 自由文本问答)
+        options: Vec<String>,
+        /// 是否多选
+        multi_select: bool,
+        /// 等待超时(秒;前端可渲染倒计时)
+        timeout_secs: u64,
+    },
+    /// G8 扩展:ask_user 澄清卡收场(批K 段7)——前端据此把问答卡置为
+    /// 已答/已超时终态
+    AskUserResult {
+        /// 问题 ID(关联开启帧的卡)
+        question_id: String,
+        /// 是否已回答(false 且 !timed_out = 通道关闭等异常收场)
+        answered: bool,
+        /// 是否无人回答(超时/无人值守;卡置灰)
+        timed_out: bool,
     },
 }
 
@@ -1138,6 +1168,13 @@ pub struct AgentRunner {
     /// CLI 模式:`with_approval_callback(Arc::new(CliApproval { auto_approve: ... }))`
     /// HTTP 模式:`with_approval_callback(Arc::new(HttpApproval::new(pending)))`
     approval_callback: Option<Arc<dyn ApprovalCallback>>,
+    /// 批K 段7:ask_user 问答回调(None = 无人可问,resolve 侧立即无人态)
+    ///
+    /// 由执行面装配:serve=`HttpAskUser`(oneshot 等 POST /answer),CLI=
+    /// `CliAskUser`(stdin 交互 / auto=立即无人态)。形态对齐 approval_callback
+    /// (不自动构造,运行环境决定),但缺位语义不同:审批缺位=拒绝(安全优先),
+    /// 问答缺位=立即无人态 fail-visible(不干等超时,无人值守零阻塞)。
+    ask_user_callback: Option<Arc<dyn AskUserCallback>>,
     /// G13:并行工具结果缓存
     ///
     /// 当 `max_parallel_tools > 1` 时,`call_external` 分支会并行执行所有 tool_calls,
@@ -1366,6 +1403,7 @@ impl AgentRunner {
             landed_format_instruction: std::sync::Mutex::new(None),
             output_format_retries: 0,
             approval_callback: None,
+            ask_user_callback: None,
             runaway_policy: None,
             parallel_tool_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             metrics: None,
@@ -2023,6 +2061,19 @@ impl AgentRunner {
     /// CLI 模式用 `CliApproval`,HTTP 模式用 `HttpApproval`,测试用 `AutoApprove`/`DenyAll`。
     pub fn with_approval_callback(mut self, callback: Arc<dyn ApprovalCallback>) -> Self {
         self.approval_callback = Some(callback);
+        self
+    }
+
+    /// 批K 段7:设置 ask_user 问答回调
+    ///
+    /// - `Some(callback)`:ask_user 返回 pending 形态时,通过 callback 等用户回答
+    /// - `None`(默认):无人可问——resolve 侧立即返回 timeout 形态(fail-visible,
+    ///   不干等超时),agent 自行决策续跑
+    ///
+    /// serve 模式用 `HttpAskUser`,CLI 交互模式用 `CliAskUser { auto: false }`,
+    /// 无人值守面用 `CliAskUser { auto: true }`。
+    pub fn with_ask_user_callback(mut self, callback: Arc<dyn AskUserCallback>) -> Self {
+        self.ask_user_callback = Some(callback);
         self
     }
 
@@ -3921,6 +3972,8 @@ impl AgentRunner {
                 landed_format_instruction: std::sync::Mutex::new(None),
                 output_format_retries: 0,
                 approval_callback: approval_callback.clone(),
+                // 批K 段7:子代理无人值守——ask callback 缺位 = 立即无人态(不干等)
+                ask_user_callback: None,
                 runaway_policy: None,
                 parallel_tool_cache: Arc::new(std::sync::Mutex::new(
                     std::collections::HashMap::new(),
@@ -4987,6 +5040,14 @@ impl AgentRunner {
                 let result_str = tool_result.to_string();
                 match parse_approval_request(session_id, tool_name, &first_args, &result_str) {
                     None => {
+                        // 批K 段7:ask_user pending 形态识别(两阶段协议阶段一)——
+                        // 人在环澄清卡,等待在流式循环臂(帧时序同审批:先推帧
+                        // 再进等待,问答卡必须先到前端)
+                        if tool_name == ASK_USER_TOOL {
+                            if let Some(query) = parse_ask_user_query(session_id, &result_str) {
+                                return Ok(ToolExecStage::PendingQuestion(query));
+                            }
+                        }
                         Self::record_handover_written(journal, session_id, tool_name, &tool_result);
                         Self::record_session_spawned(journal, session_id, tool_name, &tool_result);
                         self.record_todo_updated(journal, tool_name);
@@ -5195,6 +5256,87 @@ impl AgentRunner {
             approval_record: Some(record),
             approval_flow: Some((approval_req, decision)),
         })
+    }
+
+    /// 阶段二(流式路径):等待用户回答并重调 ask_user(批K 段7)
+    ///
+    /// PendingQuestion 后调用。callback 缺位/无人值守 = 立即无人态(不干等
+    /// 超时,无人值守零阻塞);回答到达 = args 注入 answer 重调工具(二阶段
+    /// 校验,answer 只能由 runner 注入——对齐 approved:true 决策门纪律);
+    /// 超时 = timeout 形态回喂(fail-visible,agent 自行决策续跑)。
+    /// 返回 (outcome, 收场标签 answered | timeout)。
+    async fn resolve_ask_user(
+        &self,
+        session_id: &str,
+        args: &Value,
+        query: AskUserQuery,
+        journal: Option<&crate::agent::journal::JournalWriter>,
+    ) -> Result<(ToolExecOutcome, String), AgentError> {
+        use crate::builtin_tools::ask_user::AskUserAnswer;
+        let question_id = query.question_id.clone();
+        let answer = if let Some(cb) = &self.ask_user_callback {
+            cb.request_answer(&query).await
+        } else {
+            // callback 缺位 = 无人可问:立即无人态(fail-visible,不干等)
+            info!(%session_id, %question_id, "ask_user: no callback wired, returning no-answer immediately");
+            AskUserAnswer {
+                answer: vec![],
+                answered_by: "auto".to_string(),
+                verified: true,
+                timed_out: true,
+            }
+        };
+
+        if answer.timed_out {
+            info!(%session_id, %question_id, "ask_user: no user answer, returning timeout form (fail-visible)");
+            return Ok((
+                ToolExecOutcome {
+                    final_result: serde_json::json!({
+                        "status": "timeout",
+                        "question_id": question_id,
+                        "message": "no user answer within the wait window; decide on your own, state the assumption, and continue without asking again",
+                    }),
+                    approval_record: None,
+                    approval_flow: None,
+                },
+                "timeout".to_string(),
+            ));
+        }
+
+        // 回答到达:带 answer 重调(二阶段;对齐 resolve_approval 重执行形态)
+        info!(
+            %session_id,
+            %question_id,
+            answered_by = %answer.answered_by,
+            "ask_user: answer received, re-invoking with answer"
+        );
+        let mut re_args = args.clone();
+        if let Some(obj) = re_args.as_object_mut() {
+            obj.insert("answer".to_string(), serde_json::json!(answer.answer));
+            obj.insert(
+                "answered_by".to_string(),
+                Value::from(answer.answered_by.as_str()),
+            );
+        }
+        let outcome = self
+            .run_pipeline(
+                ASK_USER_TOOL,
+                &re_args,
+                journal,
+                None,
+                crate::agent::pipeline::PipelineEntry::React,
+                None,
+            )
+            .await;
+        let final_result = Self::translate_pipeline_outcome(outcome, ASK_USER_TOOL)?;
+        Ok((
+            ToolExecOutcome {
+                final_result,
+                approval_record: None,
+                approval_flow: None,
+            },
+            "answered".to_string(),
+        ))
     }
 
     // ===== G13:并行工具调用 =====
@@ -7611,6 +7753,40 @@ impl AgentRunner {
                                                                }
                                                                res
                                                            }
+                                                           Ok(ToolExecStage::PendingQuestion(query)) => {
+                                                               // 批K 段7:ask_user 两阶段(人在环澄清卡)。帧先到
+                                                               // 前端再进等待(时序同审批);等待在 runner 层不占
+                                                               // 轮次,与 ApprovalPending 同构;收场帧+journal 本臂落
+                                                               let question_id = query.question_id.clone();
+                                                               yield Ok(AgentEvent::AskUser {
+                                                                   question_id: query.question_id.clone(),
+                                                                   question: query.question.clone(),
+                                                                   options: query.options.clone(),
+                                                                   multi_select: query.multi_select,
+                                                                   timeout_secs: query.timeout_secs,
+                                                               });
+                                                               if let Some(j) = &journal {
+                                                                   if let Err(e) = j.question_requested(&question_id, &tc.name, &query.question) {
+                                                                       warn!(%session_id, error = %e, "question_requested journal failed");
+                                                                   }
+                                                               }
+                                                               let res = runner
+                                                                   .resolve_ask_user(&session_id, &tc.arguments, query, journal.as_deref())
+                                                                   .await;
+                                                               if let Ok((_, label)) = &res {
+                                                                   yield Ok(AgentEvent::AskUserResult {
+                                                                       answered: label == "answered",
+                                                                       timed_out: label == "timeout",
+                                                                       question_id: question_id.clone(),
+                                                                   });
+                                                                   if let Some(j) = &journal {
+                                                                       if let Err(e) = j.question_resolved(&question_id, label) {
+                                                                           warn!(%session_id, error = %e, "question_resolved journal failed");
+                                                                       }
+                                                                   }
+                                                               }
+                                                               res.map(|(o, _)| o)
+                                                           }
                                                        };
                                                        let outcome = match outcome_res {
                                                            Ok(o) => o,
@@ -8008,6 +8184,38 @@ impl AgentRunner {
                                                            }
                                                        }
                                                        res
+                                                   }
+                                                   Ok(ToolExecStage::PendingQuestion(query)) => {
+                                                       // 批K 段7:ask_user 两阶段(人在环澄清卡,与本函数审批臂同构)
+                                                       let question_id = query.question_id.clone();
+                                                       yield Ok(AgentEvent::AskUser {
+                                                           question_id: query.question_id.clone(),
+                                                           question: query.question.clone(),
+                                                           options: query.options.clone(),
+                                                           multi_select: query.multi_select,
+                                                           timeout_secs: query.timeout_secs,
+                                                       });
+                                                       if let Some(j) = &journal {
+                                                           if let Err(e) = j.question_requested(&question_id, &tool_name, &query.question) {
+                                                               warn!(%session_id, error = %e, "question_requested journal failed");
+                                                           }
+                                                       }
+                                                       let res = runner
+                                                           .resolve_ask_user(&session_id, &args, query, journal.as_deref())
+                                                           .await;
+                                                       if let Ok((_, label)) = &res {
+                                                           yield Ok(AgentEvent::AskUserResult {
+                                                               answered: label == "answered",
+                                                               timed_out: label == "timeout",
+                                                               question_id: question_id.clone(),
+                                                           });
+                                                           if let Some(j) = &journal {
+                                                               if let Err(e) = j.question_resolved(&question_id, label) {
+                                                                   warn!(%session_id, error = %e, "question_resolved journal failed");
+                                                               }
+                                                           }
+                                                       }
+                                                       res.map(|(o, _)| o)
                                                    }
                                                };
                                                let outcome = match outcome_res {
