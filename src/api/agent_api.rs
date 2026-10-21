@@ -23,11 +23,13 @@ use crate::agent::{
     AgentDefinitionManager, AgentError, AgentEvent, AgentResult, AgentRunner, ApprovalDecision,
     PendingApproval,
 };
+// 批K 段7:人在环问答(AskUser 注入 + /answer 端点共享 QuestionStore)
 use crate::api::auth::AuthConfig;
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::metrics::{Metrics, SharedMetrics, SseConnectionGuard};
 use crate::api::serve_tools::RuntimeIdentity;
 use crate::api::workspace_client::WorkspaceApiClient;
+use crate::builtin_tools::ask_user::{AskUserAnswer, CliAskUser, HttpAskUser, QuestionStore};
 use crate::config::{LlmConfig, LlmStatusSnapshot};
 use crate::io_handlers::tool_handler::ToolHandler;
 
@@ -243,6 +245,8 @@ pub struct AgentApiState {
     running: SessionStore,
     /// G8:正在等待审批的 session → oneshot sender(ApprovalStore)
     pending_approvals: ApprovalStore,
+    /// 批K 段7:正在等待用户回答的 session → oneshot sender(QuestionStore)
+    pending_questions: QuestionStore,
     /// G17:Prometheus 指标(自定义 Registry,非全局)
     metrics: SharedMetrics,
     /// G16:鉴权配置(WebSocket 升级前检查 ?token=,复用 G7 token 列表)
@@ -397,6 +401,7 @@ impl AgentApiState {
             evorule_client,
             running: Arc::new(Mutex::new(HashMap::new())),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+            pending_questions: Arc::new(Mutex::new(HashMap::new())),
             metrics,
             auth_config: AuthConfig::disabled(),
             // B24:/mcp 共享事件轨道(专用 namespace "mcp";client 与 state 同源;
@@ -563,6 +568,11 @@ impl AgentApiState {
     /// G8:获取 ApprovalStore 的引用(供外部观察或测试)
     pub fn pending_approvals(&self) -> &ApprovalStore {
         &self.pending_approvals
+    }
+
+    /// 批K 段7:获取 QuestionStore 的引用(/answer 端点与 HttpAskUser 共享)
+    pub fn pending_questions(&self) -> &QuestionStore {
+        &self.pending_questions
     }
 
     /// G17:获取 SharedMetrics 的引用(供 runner 注入等)
@@ -745,6 +755,11 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route(
             "/agents/{agent_type}/approve",
             axum::routing::post(approve_agent),
+        )
+        // 批K 段7:回答正在等待的用户提问(按 session_id 查 QuestionStore)
+        .route(
+            "/agents/{agent_type}/answer",
+            axum::routing::post(answer_agent),
         )
         // G16:WebSocket 双向流端点 — ?token= 鉴权 + 复用 run_continuation
         .route(
@@ -1550,6 +1565,17 @@ async fn run_agent(
         // manual/缺省:现状行为零变化
         _ => runner,
     };
+    // 批K 段7:人在环问答端注入(与审批模式同口径分派):
+    // auto_policy=无人值守语义 → CliAskUser 立即返回无人态(不模拟回答、不干等);
+    // manual/policy/缺省 → HttpAskUser,pending 项经 POST /agents/{t}/answer 送达
+    let runner = match approval_mode.as_deref() {
+        Some("auto_policy") => {
+            runner.with_ask_user_callback(std::sync::Arc::new(CliAskUser { auto: true }))
+        }
+        _ => runner.with_ask_user_callback(std::sync::Arc::new(HttpAskUser {
+            pending: state.pending_questions().clone(),
+        })),
+    };
     // 执行桥后端上下文注入轨迹采集器:请求携带容器名(docker-exec 后端)时
     // shell_exec 轨迹成形分流 program 旗标(分流≠删检);宿主后端零变化
     let runner = if let Some(container) = &req.container {
@@ -1967,6 +1993,18 @@ async fn run_agent_stream(
         runner
     };
 
+    // 批K 段7:人在环问答端注入(与审批模式同口径分派,同 run_agent/WS 面):
+    // auto_policy=无人值守语义 → CliAskUser 立即返回无人态(不模拟回答、不干等);
+    // manual/policy/缺省 → HttpAskUser,pending 项经 POST /agents/{t}/answer 送达
+    let runner = match resolved_mode.as_deref() {
+        Some("auto_policy") => {
+            runner.with_ask_user_callback(std::sync::Arc::new(CliAskUser { auto: true }))
+        }
+        _ => runner.with_ask_user_callback(std::sync::Arc::new(HttpAskUser {
+            pending: state.pending_questions().clone(),
+        })),
+    };
+
     // G6:clone token(run_streaming 会 move runner),存入 SessionStore 供 /cancel 使用
     let cancel_token = runner.cancel_token().clone();
     let store = state.running.clone();
@@ -2083,6 +2121,22 @@ pub struct ApproveRequest {
     pub reason: Option<String>,
 }
 
+/// 批K 段7:问答回传请求的 body
+#[derive(Debug, Deserialize)]
+pub struct AnswerRequest {
+    /// 要回答的 session ID
+    pub session_id: String,
+    /// 问题 ID(ask_user 帧携带;不匹配时请求被拒绝)
+    pub question_id: String,
+    /// 回答内容(单选=1 项且 ∈options;多选=1..=N 项 ⊆options;自由文本=1 项;
+    /// 二阶段校验在工具侧重做,不合法 fail-visible 回喂 agent)
+    pub answer: Vec<String>,
+    /// 回答人平台令牌(可选;提供并校验通过时回执带已验证身份)
+    ///
+    /// ⚠️ 该字段只用于换取用户名,不落审计链、不进日志。
+    pub approver_token: Option<String>,
+}
+
 /// G8:审批正在等待的 candidate 工具调用
 ///
 /// 路由:`POST /agents/{agent_type}/approve`
@@ -2187,6 +2241,105 @@ async fn approve_agent(
     })))
 }
 
+/// 批K 段7:回答正在等待的用户提问
+///
+/// 路由:`POST /agents/{agent_type}/answer`
+/// Body:`{"session_id":"xxx","question_id":"au-...","answer":["选项文本"],"approver_token":"..."}`
+///
+/// 按 `session_id` 在 QuestionStore 中查找 pending 问答项:
+/// - 问题 ID 不匹配 → 400(等待保持,可携带正确 ID 重试)
+/// - 提供 `approver_token` → 调认证端点换取平台用户名作为已验证回答人;
+///   未提供或校验失败 → 回答人记 `unverified`(回答照常送达,不阻断)
+///
+/// runner 的 `HttpAskUser::request_answer()` 收到回答后,把 answer 注入
+/// args 重调 ask_user 工具做二阶段校验(单选 ∈options/多选 ⊆options),
+/// 不合法则 fail-visible 回喂,agent 自行澄清续跑。
+///
+/// 200 = 回答已送达;404 = session 不在等待问答(已超时/不存在/未发问)。
+async fn answer_agent(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(_agent_type): axum::extract::Path<String>,
+    Json(req): Json<AnswerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let pending = {
+        let mut map = state.pending_questions.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal error"})),
+            )
+        })?;
+        map.remove(&req.session_id)
+    };
+    let Some(pending) = pending else {
+        warn!(
+            session_id = %req.session_id,
+            "K7: answer delivered but session not pending question (timed out / not found / no question asked)"
+        );
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not pending question"})),
+        ));
+    };
+
+    // 问题 ID 校验:不匹配时把 pending 放回,允许携带正确 ID 重试
+    if req.question_id != pending.question_id {
+        if let Ok(mut map) = state.pending_questions.lock() {
+            map.insert(req.session_id.clone(), pending);
+        }
+        warn!(
+            session_id = %req.session_id,
+            "K7: question_id mismatch on answer request"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "question_id mismatch",
+                "session_id": req.session_id,
+            })),
+        ));
+    }
+
+    // 回答人身份:与 /approve 同口径(令牌换用户名;失败降级 unverified)
+    let (answered_by, verified) = match &req.approver_token {
+        Some(token) => match state.evorule_client().verify_platform_token(token).await {
+            Ok(username) => (username, true),
+            Err(e) => {
+                info!(
+                    session_id = %req.session_id,
+                    error = %e,
+                    "K7: answerer token verification failed; degrading to unverified"
+                );
+                ("unverified".to_string(), false)
+            }
+        },
+        None => ("unverified".to_string(), false),
+    };
+
+    let answer = AskUserAnswer {
+        answer: req.answer,
+        answered_by: answered_by.clone(),
+        verified,
+        timed_out: false,
+    };
+    // 发送回答(接收方已 drop 时返回 Err,但 HTTP 仍返回 200 表示"已处理")
+    let _ = pending.tx.send(answer);
+    info!(
+        session_id = %req.session_id,
+        question_id = %pending.question_id,
+        answered_by = %answered_by,
+        verified = verified,
+        "K7: question answer delivered"
+    );
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "answer delivered",
+        "session_id": req.session_id,
+        "question_id": pending.question_id,
+        "answered_by": answered_by,
+        "verified": verified,
+    })))
+}
+
 /// G4:把单个 `AgentEvent`(或流级错误)转成 axum SSE `Event`
 ///
 /// 约定:`event:` 名 = 变体名 snake_case;`data:` 是 JSON 字符串。
@@ -2264,6 +2417,36 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
                 "approved": approved,
                 "approver": approver,
                 "auto_rejected": auto_rejected,
+            })
+            .to_string(),
+        ),
+        // 批K 段7:人在环问答帧 —— 前端弹问答卡,经 POST /agents/{t}/answer 回传
+        Ok(AgentEvent::AskUser {
+            question_id,
+            question,
+            options,
+            multi_select,
+            timeout_secs,
+        }) => Event::default().event("ask_user").data(
+            serde_json::json!({
+                "question_id": question_id,
+                "question": question,
+                "options": options,
+                "multi_select": multi_select,
+                "timeout_secs": timeout_secs,
+            })
+            .to_string(),
+        ),
+        // 批K 段7:问答结果(已回答/超时) —— 前端据此收卡置态
+        Ok(AgentEvent::AskUserResult {
+            question_id,
+            answered,
+            timed_out,
+        }) => Event::default().event("ask_user_result").data(
+            serde_json::json!({
+                "question_id": question_id,
+                "answered": answered,
+                "timed_out": timed_out,
             })
             .to_string(),
         ),

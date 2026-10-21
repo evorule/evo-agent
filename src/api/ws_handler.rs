@@ -902,6 +902,18 @@ async fn construct_runner(
         // 注入 Runaway 护栏(policy 档;None=不启用行为零变化)
         // ——200 次连续自动操作上限+修订④复述注入,跨重启计数回填
         .with_runaway_policy(runaway_policy)
+        // 批K 段7:人在环问答端注入(与审批三态同口径):
+        // auto_policy=无人值守语义 → CliAskUser 立即返回无人态(不模拟回答、不干等);
+        // manual/policy/缺省 → HttpAskUser,pending 项经 POST /agents/{t}/answer 送达
+        .with_ask_user_callback(match resolved_mode.as_deref() {
+            Some("auto_policy") => {
+                Arc::new(crate::builtin_tools::ask_user::CliAskUser { auto: true })
+                    as Arc<dyn crate::builtin_tools::ask_user::AskUserCallback>
+            }
+            _ => Arc::new(crate::builtin_tools::ask_user::HttpAskUser {
+                pending: state.pending_questions().clone(),
+            }) as Arc<dyn crate::builtin_tools::ask_user::AskUserCallback>,
+        })
         // G17:注入 metrics — runner 在 session/step/LLM/工具关键路径插桩
         .with_metrics(state.metrics().clone())
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源;
@@ -1094,6 +1106,32 @@ fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json::Val
             "approved": approved,
             "approver": approver,
             "auto_rejected": auto_rejected,
+        }),
+        // 批K 段7:人在环问答帧 —— 前端弹问答卡,经 POST /agents/{t}/answer 回传
+        Ok(AgentEvent::AskUser {
+            question_id,
+            question,
+            options,
+            multi_select,
+            timeout_secs,
+        }) => serde_json::json!({
+            "type": "AskUser",
+            "question_id": question_id,
+            "question": question,
+            "options": options,
+            "multi_select": multi_select,
+            "timeout_secs": timeout_secs,
+        }),
+        // 批K 段7:问答结果(已回答/超时) —— 前端据此收卡置态
+        Ok(AgentEvent::AskUserResult {
+            question_id,
+            answered,
+            timed_out,
+        }) => serde_json::json!({
+            "type": "AskUserResult",
+            "question_id": question_id,
+            "answered": answered,
+            "timed_out": timed_out,
         }),
         Err(err) => serde_json::json!({
             "type": "Error",

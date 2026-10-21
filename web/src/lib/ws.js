@@ -542,6 +542,44 @@ function handleFrame(f) {
         `工具 ${f.tool_name}`,
       );
       break;
+    case 'AskUser':
+      // 批K 段7 人在环问答卡:点选/输入走新增 POST /answer 通道(二阶段
+      // 校验在工具侧,非法回答 fail-visible 回喂,agent 自行澄清续跑)
+      pushMessage({
+        kind: 'ask_user',
+        questionId: f.question_id,
+        question: f.question,
+        options: f.options || [],
+        multiSelect: !!f.multi_select,
+        timeoutSecs: f.timeout_secs,
+        answerState: null, // null | 'sending' | 'sent' | 'error'
+        errText: null,
+        draftSel: [], // 多选勾选项
+        draftText: '', // 自由文本草稿
+        result: null, // {answered, timedOut} — AskUserResult 帧到达后回填
+      });
+      pushPanelEvent('gov', {
+        label: 'AskUser',
+        detail: `等待用户回答${f.timeout_secs ? `(超时 ${f.timeout_secs}s)` : ''}`,
+        level: 'warn',
+      });
+      pushNotification('warn', 'Agent 提问等待回答', String(f.question || '').slice(0, 80));
+      break;
+    case 'AskUserResult':
+      // 按 question_id 收卡置态(与开启帧配对;超时/关通道 = 无人回答)
+      messages.update((arr) =>
+        arr.map((m) =>
+          m.kind === 'ask_user' && m.questionId === f.question_id
+            ? { ...m, result: { answered: !!f.answered, timedOut: !!f.timed_out } }
+            : m,
+        ),
+      );
+      pushPanelEvent('gov', {
+        label: 'AskUserResult',
+        detail: `问答收场:${f.answered ? '已回答' : f.timed_out ? '无人回答(超时)' : '通道关闭'}`,
+        level: f.answered ? 'ok' : 'warn',
+      });
+      break;
     default:
       break;
   }

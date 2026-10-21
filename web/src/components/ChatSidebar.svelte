@@ -18,7 +18,7 @@
     openSettingsTab,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
-  import { approveProposal, listResumableRuns, getOrchestrationLinks, uploadFile, getLlmModels, setLlmModel } from '../lib/api.js';
+  import { approveProposal, answerQuestion, listResumableRuns, getOrchestrationLinks, uploadFile, getLlmModels, setLlmModel } from '../lib/api.js';
   import { settingsState, setSetting } from '../lib/settings.js';
   import {
     APPROVAL_MODE_KEY,
@@ -721,6 +721,44 @@
         updateMessage(m.id, { decision: 'error', errText: text });
       });
   }
+
+  // 批K 段7 人在环问答:回答走新增 POST /answer 通道(二阶段校验在工具侧,
+  // 非法回答 fail-visible 回喂,agent 自行澄清续跑;AskUserResult 帧收卡)
+  function decideAnswer(m, answer) {
+    if (m.answerState === 'sending' || m.answerState === 'sent') return;
+    if (!$sessionId) {
+      updateMessage(m.id, { answerState: 'error', errText: '会话未建立,无法提交回答' });
+      return;
+    }
+    const clean = (Array.isArray(answer) ? answer : [])
+      .map((a) => String(a ?? '').trim())
+      .filter(Boolean);
+    if (clean.length === 0) {
+      updateMessage(m.id, { answerState: 'error', errText: '回答不能为空' });
+      return;
+    }
+    updateMessage(m.id, { answerState: 'sending', errText: null });
+    answerQuestion('general', $sessionId, m.questionId, clean)
+      .then(() => updateMessage(m.id, { answerState: 'sent' }))
+      .catch((err) => {
+        const status = err?.status;
+        const text =
+          status === 404
+            ? '回答提交失败:问题已失效(超时或已收场)'
+            : status === 400
+              ? `回答被拒:${String(err?.message || err)}`
+              : `提交失败:${String(err?.message || err)}`;
+        updateMessage(m.id, { answerState: 'error', errText: text });
+      });
+  }
+
+  // 多选勾选切换(草稿存消息对象;提交时整体送二阶段校验)
+  function toggleDraftSel(m, opt) {
+    const sel = new Set(m.draftSel || []);
+    if (sel.has(opt)) sel.delete(opt);
+    else sel.add(opt);
+    updateMessage(m.id, { draftSel: [...sel] });
+  }
 </script>
 
 <aside class="chat" data-zone="chat">
@@ -895,6 +933,72 @@
             {#if m.decision === 'error' && m.errText}
               <div class="ap-err">{m.errText}</div>
             {/if}
+          {/if}
+        </div>
+      {:else if m.kind === 'ask_user'}
+        <div class="ask-card">
+          <div class="ap-head">
+            Agent 提问 · 等待回答{m.timeoutSecs ? `(超时 ${m.timeoutSecs}s)` : ''}
+          </div>
+          <div class="ask-q">{m.question}</div>
+          {#if m.result}
+            {#if m.result.answered}
+              <div class="ap-ok">已回答,agent 正在继续…</div>
+            {:else if m.result.timedOut}
+              <div class="ap-err">无人回答(超时),agent 将自行决策续跑</div>
+            {:else}
+              <div class="ap-err">回答通道已关闭,agent 将自行决策续跑</div>
+            {/if}
+          {:else if m.answerState === 'sent'}
+            <div class="ap-ok">回答已提交,等待 agent 继续…</div>
+          {:else if (m.options || []).length > 0}
+            <div class="ask-opts">
+              {#each m.options as opt}
+                {#if m.multiSelect}
+                  <button
+                    class="ask-opt"
+                    class:sel={(m.draftSel || []).includes(opt)}
+                    disabled={m.answerState === 'sending'}
+                    onclick={() => toggleDraftSel(m, opt)}
+                  >{opt}</button>
+                {:else}
+                  <button
+                    class="ask-opt"
+                    disabled={m.answerState === 'sending'}
+                    onclick={() => decideAnswer(m, [opt])}
+                  >{opt}</button>
+                {/if}
+              {/each}
+            </div>
+            {#if m.multiSelect}
+              <div class="ap-actions">
+                <button
+                  class="ap-btn approve"
+                  disabled={m.answerState === 'sending' || !(m.draftSel || []).length}
+                  onclick={() => decideAnswer(m, m.draftSel || [])}
+                >提交所选({(m.draftSel || []).length})</button>
+              </div>
+            {/if}
+          {:else}
+            <input
+              class="ask-input"
+              placeholder="输入你的回答,回车发送…"
+              disabled={m.answerState === 'sending'}
+              value={m.draftText || ''}
+              oninput={(e) => updateMessage(m.id, { draftText: e.target.value })}
+              onkeydown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  decideAnswer(m, [m.draftText]);
+                }
+              }}
+            />
+          {/if}
+          {#if m.answerState === 'sending'}
+            <div class="ap-foot">回答提交中…</div>
+          {/if}
+          {#if m.answerState === 'error' && m.errText}
+            <div class="ap-err">{m.errText}</div>
           {/if}
         </div>
       {/if}
@@ -1531,6 +1635,65 @@
   .ap-err {
     margin-top: var(--sp-xs);
     color: var(--danger);
+  }
+  /* 批K 段7 人在环问答卡(形态同构审批卡;选项按钮+自由文本输入) */
+  .ask-card {
+    border: 1px solid var(--brand);
+    border-radius: var(--r-md);
+    background: var(--bg-page);
+    padding: var(--sp-sm);
+    font-size: var(--fs-xs);
+  }
+  .ask-card .ap-head {
+    color: var(--brand);
+  }
+  .ask-q {
+    margin: var(--sp-xs) 0;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .ask-opts {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-xs);
+    margin-bottom: var(--sp-xs);
+  }
+  .ask-opt {
+    text-align: left;
+    padding: var(--sp-xs) var(--sp-sm);
+    font-size: var(--fs-xs);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--bg-card, transparent);
+    color: var(--text-secondary);
+    word-break: break-word;
+  }
+  .ask-opt:hover:not(:disabled) {
+    border-color: var(--brand);
+    color: var(--text-primary);
+  }
+  .ask-opt.sel {
+    border-color: var(--brand);
+    background: var(--brand-bg, var(--bg-page));
+    color: var(--text-primary);
+  }
+  .ask-opt:disabled {
+    opacity: 0.6;
+  }
+  .ask-input {
+    width: 100%;
+    height: 28px;
+    padding: 0 var(--sp-sm);
+    font-size: var(--fs-xs);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--bg-page);
+    color: var(--text-primary);
+  }
+  .ask-input:focus {
+    outline: none;
+    border-color: var(--brand);
   }
   /* S1 一体化输入容器(主流 IDE 对齐):chips/输入区/工具行同处一张圆角卡片 */
   .composer {

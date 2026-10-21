@@ -359,6 +359,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.askUser",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "人在环澄清卡（ask_user）：agent 在关键分歧点向用户发结构化问题并阻塞等回答（单选/多选/自由文本，超时缺省 300s）——关闭 = 工具连 LLM 契约一起下线，等待面同步缺席；交互零风险（无文件/网络/子进程触点），问题只发给会话数据有权方（用户本人），默认开",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.eventLedger",
             kind: SettingType::Boolean,
             default: json!(true),
@@ -977,7 +987,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 55); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo;批K 段5 httpRequest)
+        assert_eq!(settings.len(), 56); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo;批K 段5 httpRequest;批K 段7 askUser)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));

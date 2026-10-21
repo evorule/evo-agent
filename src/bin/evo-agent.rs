@@ -730,7 +730,14 @@ fn cmd_run(
     };
     let runner = runner
         .with_approval_callback(callback)
-        .with_runaway_policy(runaway_policy);
+        .with_runaway_policy(runaway_policy)
+        // 批K 段7:人在环问答端(CLI 交互)——stdin 编号问答;无人值守旗标下
+        // auto 态立即无人(不模拟回答、不干等,对齐 PolicyApproval 零人工决策事件)
+        .with_ask_user_callback(std::sync::Arc::new(
+            evo_agent::builtin_tools::ask_user::CliAskUser {
+                auto: approval_auto || auto_approve_candidates,
+            },
+        ));
 
     // 6. 跑
     eprintln!(
@@ -1003,13 +1010,18 @@ async fn patrol_build_runner(
                 .unwrap_or(false)
         })
         .unwrap_or(false);
-    Ok(runner.with_approval_callback(std::sync::Arc::new(
-        evo_agent::agent::approval::RedLineGuardApproval::new(
-            std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
-            std::sync::Arc::new(evo_agent::agent::approval::DenyAll),
-            override_flag,
-        ),
-    )))
+    Ok(runner
+        .with_approval_callback(std::sync::Arc::new(
+            evo_agent::agent::approval::RedLineGuardApproval::new(
+                std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+                std::sync::Arc::new(evo_agent::agent::approval::DenyAll),
+                override_flag,
+            ),
+        ))
+        // 批K 段7:巡视无人值守——ask auto 态立即无人(不模拟回答、不干等)
+        .with_ask_user_callback(std::sync::Arc::new(
+            evo_agent::builtin_tools::ask_user::CliAskUser { auto: true },
+        )))
 }
 
 /// patrol 单轮流式执行:消费事件流至 Done。
@@ -1572,6 +1584,21 @@ fn cmd_run_streaming(
                         eprintln!("[✓ approved: {}] re-executing...", tool_name);
                     } else {
                         eprintln!("[✗ denied: {}] returning rejected", tool_name);
+                    }
+                }
+                // 批K 段7:问答交互提示由 CliAskUser(stdin)负责,此处只收结果帧
+                Ok(AgentEvent::AskUser { .. }) => {}
+                Ok(AgentEvent::AskUserResult {
+                    answered,
+                    timed_out,
+                    ..
+                }) => {
+                    if answered {
+                        eprintln!("[✓ answer delivered]");
+                    } else if timed_out {
+                        eprintln!("[⚠ no answer — agent decides on its own]");
+                    } else {
+                        eprintln!("[✗ answer channel closed]");
                     }
                 }
                 Ok(AgentEvent::Error(e)) => {
@@ -3229,7 +3256,15 @@ fn run_repl_turn(
     };
     let runner = runner
         .with_approval_callback(callback)
-        .with_runaway_policy(runaway_policy);
+        .with_runaway_policy(runaway_policy)
+        // 批K 段7:人在环问答端(REPL 交互)——stdin 编号问答;无人值守旗标/档位下
+        // auto 态立即无人(不模拟回答、不干等)
+        .with_ask_user_callback(std::sync::Arc::new(
+            evo_agent::builtin_tools::ask_user::CliAskUser {
+                auto: auto_approve_candidates
+                    || def.approval_mode.as_deref() == Some("auto_policy"),
+            },
+        ));
 
     // G6:Ctrl+C → cancel_token
     let cancel_token = runner.cancel_token().clone();
@@ -3305,6 +3340,21 @@ fn run_repl_turn(
                         eprintln!("[approved: {}]", tool_name);
                     } else {
                         eprintln!("[denied: {}]", tool_name);
+                    }
+                }
+                // 批K 段7:问答交互提示由 CliAskUser(stdin)负责,此处只收结果帧
+                Ok(AgentEvent::AskUser { .. }) => {}
+                Ok(AgentEvent::AskUserResult {
+                    answered,
+                    timed_out,
+                    ..
+                }) => {
+                    if answered {
+                        eprintln!("[answer delivered]");
+                    } else if timed_out {
+                        eprintln!("[no answer — agent decides on its own]");
+                    } else {
+                        eprintln!("[answer channel closed]");
                     }
                 }
                 Ok(AgentEvent::Error(e)) => {

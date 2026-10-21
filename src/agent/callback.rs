@@ -222,6 +222,16 @@ impl EventCallback for LoggingCallback {
             } => {
                 tracing::info!(%tool_name, %approved, %approver, %auto_rejected, "callback: approval result");
             }
+            AgentEvent::AskUser { question_id, .. } => {
+                tracing::info!(%question_id, "callback: ask_user pending");
+            }
+            AgentEvent::AskUserResult {
+                question_id,
+                answered,
+                timed_out,
+            } => {
+                tracing::info!(%question_id, %answered, %timed_out, "callback: ask_user result");
+            }
             AgentEvent::Info(msg) => {
                 tracing::info!(%msg, "callback: info");
             }
@@ -352,6 +362,10 @@ mod tests {
                 AgentEvent::Info(_) => "info".to_string(),
                 AgentEvent::ApprovalRequired { .. } => "approval_required".to_string(),
                 AgentEvent::ApprovalResult { .. } => "approval_result".to_string(),
+                AgentEvent::AskUser { question_id, .. } => format!("ask_user:{}", question_id),
+                AgentEvent::AskUserResult { question_id, .. } => {
+                    format!("ask_user_result:{}", question_id)
+                }
             };
             self.events.lock().unwrap().push(label);
         }

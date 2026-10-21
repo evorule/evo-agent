@@ -490,6 +490,24 @@ pub enum JournalEvent {
         /// 当前清单全量快照(重写后终态)
         items: Vec<TodoItemSnapshot>,
     },
+    /// ask_user 澄清卡开启落账(批K 段7):runner 识别 pending 形态后调用,
+    /// 与 ApprovalRequested 同构(会话暂停等人=轮转中断点证据)。观测面+
+    /// 推进面(进 is_progress_event,对齐审批窗口径)。
+    QuestionRequested {
+        /// 问题 ID(`au-` 前缀;/answer 回传校验主键)
+        question_id: String,
+        /// 工具名(恒 ask_user,留扩展位)
+        tool: String,
+        /// 问题摘要(截 256 字符)
+        payload: String,
+    },
+    /// ask_user 澄清卡收场落账(批K 段7):answered / timeout / channel_closed
+    QuestionResolved {
+        /// 问题 ID
+        question_id: String,
+        /// 收场标签(answered / timeout / channel_closed)
+        decision: String,
+    },
 }
 
 /// 单行 journal 记录(读侧重放消费形态)
@@ -1172,6 +1190,32 @@ impl JournalWriter {
         })
     }
 
+    /// ask_user 澄清卡开启(批K 段7,approval_requested 同构)
+    pub fn question_requested(
+        &self,
+        question_id: &str,
+        tool: &str,
+        payload: &str,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::QuestionRequested {
+            question_id: question_id.to_string(),
+            tool: tool.to_string(),
+            payload: truncate_text(payload, 256),
+        })
+    }
+
+    /// ask_user 澄清卡收场(批K 段7,approval_resolved 同构)
+    pub fn question_resolved(
+        &self,
+        question_id: &str,
+        decision: &str,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::QuestionResolved {
+            question_id: question_id.to_string(),
+            decision: decision.to_string(),
+        })
+    }
+
     /// 治理裁决输出(judgement_id 由本事件 seq 确定性合成)
     /// 召回集观测落账(检索质量观测批 K-11 观测级;每会话 recall 后调用,
     /// journal 在位才落——ground truth 判据列二期,先积累数据)。
@@ -1364,6 +1408,8 @@ fn is_progress_event(e: &JournalEvent) -> bool {
             | JournalEvent::PlanLoopFinished { .. }
             | JournalEvent::ApprovalRequested { .. }
             | JournalEvent::ApprovalResolved { .. }
+            | JournalEvent::QuestionRequested { .. }
+            | JournalEvent::QuestionResolved { .. }
             | JournalEvent::PolicyJudged { .. }
             | JournalEvent::CompactionPerformed { .. }
             | JournalEvent::SedimentPerformed { .. }

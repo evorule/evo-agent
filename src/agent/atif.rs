@@ -537,6 +537,10 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                     }
                 }
             }
+            // 批K 段7:人在环问答事件 —— ATIF 导出规格无问答槽位,投影 no-op
+            // (对齐 TodoUpdated 口径;问答轨迹由 journal 面权威承载)
+            JournalEvent::QuestionRequested { .. } => {}
+            JournalEvent::QuestionResolved { .. } => {}
             JournalEvent::PolicyJudged { verdict, .. } => {
                 if let Some(a) = acc.as_mut() {
                     a.policy_verdicts.push(verdict.clone());
