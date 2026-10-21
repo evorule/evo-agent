@@ -249,6 +249,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.httpRequest",
+            kind: SettingType::Boolean,
+            default: json!(false),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 发 HTTP 写请求（http_request，POST/PUT/PATCH/DELETE；全批最严治理面：SSRF 防线 + 敏感意图裁决 + 每次调用人工审批双闸，Active 域亦不直跑，redirect 禁跟随；默认关——显式启用才进 LLM 契约，启用后仍走双闸全流审批）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.fileDelete",
             kind: SettingType::Boolean,
             default: json!(false),
@@ -967,7 +977,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 54); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo)
+        assert_eq!(settings.len(), 55); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo;批K 段5 httpRequest)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -980,6 +990,8 @@ mod tests {
         assert_eq!(settings["agentTools.codeSearch"], json!(true));
         assert_eq!(settings["agentTools.fileMove"], json!(false));
         assert_eq!(settings["agentTools.fileDelete"], json!(false));
+        // http_request(批K 段5):写动词默认关——显式启用才进 LLM 契约
+        assert_eq!(settings["agentTools.httpRequest"], json!(false));
         assert_eq!(settings["agentTools.grep"], json!(true));
         assert_eq!(settings["agentTools.gitRead"], json!(true));
         assert_eq!(settings["agentTools.gitWrite"], json!(false));

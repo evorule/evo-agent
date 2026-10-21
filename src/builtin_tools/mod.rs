@@ -7,7 +7,8 @@
 //! git_commit / read_skill / query_journal / query_trace / read_back /
 //! diff_runs / handover_write / handover_read / session_spawn /
 //! web_fetch / web_search（批K 段2）/ code_search（批K 段3）/
-//! todo_write / todo_read（批K 段4，占位注册+会话期重绑）)
+//! todo_write / todo_read（批K 段4，占位注册+会话期重绑）/
+//! http_request（批K 段5，HTTP 写动词）)
 //!
 //! 注:`read_skill`(skills 装配 B2)不在 default_safe_toolkit 静态注册——
 //! 其技能表来自 agent definition 的 skills 声明(声明非空时由 serve_tools::
@@ -61,6 +62,7 @@ pub mod fs_safety;
 pub mod git_tools;
 pub mod grep_files;
 pub mod http_get;
+pub mod http_request;
 pub mod image_load;
 pub mod net_guard;
 pub mod python_exec;
@@ -193,6 +195,13 @@ pub fn default_safe_toolkit_with_profile(
     // 互联网搜索(ai-plugin 中继,Brave key 归边 ai-plugin 侧)
     handler.register_static("web_fetch", Arc::new(web_fetch::WebFetchTool::new()));
     handler.register_static("web_search", Arc::new(web_search::WebSearchTool::new()));
+    // 批K 段5:网络面第四件——HTTP 写动词(POST/PUT/PATCH/DELETE)。防线
+    // 组合继承 http_get;治理全批最严(双闸 Sensitive+ManualDefault,Active
+    // host 亦审批;redirect Policy::none 禁跟随;默认关 agentTools.httpRequest)
+    handler.register_static(
+        "http_request",
+        Arc::new(http_request::HttpRequestTool::new()),
+    );
     handler.register_static(
         "python_exec",
         Arc::new(python_exec::PythonExecTool::new().with_execution_profile(profile)),
@@ -702,6 +711,55 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     name: "count".to_string(),
                     r#type: "number".to_string(),
                     description: "Number of results, 1-10 (default 5).".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        // 批K 段5:HTTP 写动词(candidate 审批 + SSRF 防线,默认关)
+        ToolSpec {
+            name: "http_request".to_string(),
+            description: "Send an HTTP WRITE request (POST/PUT/PATCH/DELETE) and return \
+                          { status, headers, body, truncated }. Reuses the http_get host \
+                          policy (SSRF/private/metadata hosts always rejected, https-only); \
+                          redirects are NEVER followed — 3xx responses are returned as-is. \
+                          EVERY call requires user approval (write verbs never auto-execute, \
+                          even on allowlisted hosts): the first call returns a needs_approval \
+                          proposal and executes only after the user approves. Disabled by \
+                          default (agentTools.httpRequest). The tool is OFF until the user \
+                          enables it — do not assume it is available."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "method".to_string(),
+                    r#type: "string".to_string(),
+                    description: "HTTP write verb: POST | PUT | PATCH | DELETE (case-insensitive). \
+                                  Read verbs (GET/HEAD) are rejected — use http_get.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "url".to_string(),
+                    r#type: "string".to_string(),
+                    description: "HTTPS URL to request.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "headers".to_string(),
+                    r#type: "object".to_string(),
+                    description: "Optional request headers as {name: value} string pairs \
+                                  (e.g. {\"Content-Type\": \"application/json\"}).".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "body".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Optional request body (max 1MB).".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "max_response_bytes".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Response body cap in bytes (default and max 1MB); \
+                                  larger bodies are truncated with truncated=true.".to_string(),
                     required: false,
                 },
             ],

@@ -3703,11 +3703,14 @@ fn p2_adjudication_table_matches_design() {
     // 显式启用才可达),集合演进 28→29(数量锁 94,新增条目已 diff 审)。
     // 批K 段1(2026-10-21):edit_file 落地 Sentineled(file_write 同族写面
     // 精准编辑),集合演进 29→30(数量锁 95,新增条目已 diff 审)。
+    // 批K 段5(2026-10-21):http_request 落地 Sensitive(写动词双闸——意图
+    // 必报,Active host 亦审批),集合演进 30→31(数量锁 101,新增条目已
+    // diff 审)。
     let p2_count = crate::agent::tool_manifest::static_manifests()
         .iter()
         .filter(|m| m.is_p2_adjudicated())
         .count();
-    assert_eq!(p2_count, 30);
+    assert_eq!(p2_count, 31);
     for t in [
         "file_create",
         "file_move",
