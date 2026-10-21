@@ -82,7 +82,21 @@ pub struct TokenRecord {
     pub total: u64,
 }
 
-/// journal 事件(20 种;schema 终版 = ATIF 映射表 §二增补)
+/// todo 清单条目快照(todo_updated 事件载荷;与 builtin_tools::todo::TodoItem
+/// 同构独立定义——journal 自包含,不反向依赖工具面,向后兼容独立演进)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoItemSnapshot {
+    /// 条目 id(清单内唯一)
+    pub id: String,
+    /// 内容
+    pub content: String,
+    /// 状态(pending|in_progress|completed)
+    pub status: String,
+    /// 优先级(high|medium|low)
+    pub priority: String,
+}
+
+/// journal 事件(21 种;schema 终版 = ATIF 映射表 §二增补)
 ///
 /// 序列化形态:`{"type":"<event>","payload":{...}}`(adjacently tagged,
 /// 与文件行内 seq/ts 平铺后即全行)
@@ -467,6 +481,14 @@ pub enum JournalEvent {
         criteria: String,
         /// 生成调用模型名(handler 主模型)
         model: String,
+    },
+    /// todo 清单全量快照落账(批K 段4):todo_write 成功后由 runner 按工具名
+    /// 分支调用(best-effort,与 handover_written 同风格)。全量重写式使恢复
+    /// =回放最新本事件重建清单(零折叠逻辑);会话内态,跨会话不保。观测面,
+    /// 不参与步映射。
+    TodoUpdated {
+        /// 当前清单全量快照(重写后终态)
+        items: Vec<TodoItemSnapshot>,
     },
 }
 
@@ -1243,6 +1265,13 @@ impl JournalWriter {
             child: child.to_string(),
             depth,
         })
+    }
+
+    /// todo 清单全量快照落账(批K 段4):todo_write 成功后由 runner 按工具名
+    /// 分支调用(best-effort,与 handover_written 同风格);恢复=回放最新本
+    /// 事件重建(全量重写式,取末条即终态)。
+    pub fn todo_updated(&self, items: Vec<TodoItemSnapshot>) -> Result<u64, JournalError> {
+        self.push(JournalEvent::TodoUpdated { items })
     }
 
     /// 会话链熔断落账(自主交接设计 §3.4):连续失败熔断/spawn 同签名重复

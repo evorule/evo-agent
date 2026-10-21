@@ -262,6 +262,7 @@ pub const SANDBOX_CAPABLE_TOOLS: &[&str] = &[
     "search_files",
     "grep_files",
     "file_write",
+    "edit_file",
     "file_create",
     "file_move",
     "file_delete",
@@ -340,8 +341,8 @@ impl CapabilityBoundary {
             Some(r) if r != &self.sandbox_root => (
                 format!(
                     "- 可读根:{}(读面工具 file_read/file_list/search_files/grep_files \
-                     相对该根解析)\n- 可写域:{}(写面工具 file_write/file_create/file_move/\
-                     file_delete 相对该根解析)",
+                     相对该根解析)\n- 可写域:{}(写面工具 file_write/edit_file/file_create/\
+                     file_move/file_delete 相对该根解析)",
                     r.display(),
                     self.sandbox_root.display()
                 ),
@@ -897,10 +898,16 @@ impl AgentDefinition {
                     )));
                 }
             }
-            // 只读模式不得授予写工具
-            if b.is_read_only() && b.tools.iter().any(|t| t == "file_write") {
+            // 只读模式不得授予写工具(file_write / edit_file——写面第五件
+            // 批K 段1 同族门卫)
+            if b.is_read_only()
+                && b.tools
+                    .iter()
+                    .any(|t| t == "file_write" || t == "edit_file")
+            {
                 return Err(AgentDefinitionError::InvalidDefinition(
-                    "capability_boundary mode 'read_only' cannot grant 'file_write'".to_string(),
+                    "capability_boundary mode 'read_only' cannot grant 'file_write'/'edit_file'"
+                        .to_string(),
                 ));
             }
             // 死声明防护:声明的工具必须真实存在于顶层 tools

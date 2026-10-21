@@ -267,7 +267,9 @@ impl HttpGetTool {
     /// agent 实例级分类:静态分类结果为 Candidate 且 host 命中本实例声明的
     /// 额外白名单时升级为 Active;Blocked/Invalid 永不升级(安全优先)。
     /// 无声明(extra_allowed_hosts 空)时与 `Self::classify` 逐字节等价。
-    fn classify_for_agent(&self, url: &str) -> HostCategory {
+    ///
+    /// 批K 段2:pub(crate) 供 web_fetch 组合复用(防线同源,见 web_fetch.rs)
+    pub(crate) fn classify_for_agent(&self, url: &str) -> HostCategory {
         match Self::classify_with(url, self.allow_http, self.allow_private_hosts) {
             HostCategory::Candidate { host } => {
                 let normalized = host.to_lowercase();
@@ -384,7 +386,10 @@ impl HttpGetTool {
     }
 
     /// 实际 HTTP GET(G13:原生 async,不再创建独立 runtime)
-    async fn fetch(&self, url: &str) -> IoResult {
+    ///
+    /// 批K 段2:pub(crate) 供 web_fetch 组合复用(防线零复制,fetch_and_render
+    /// 在返回体上做 content-type 判别与 HTML→文本提取)
+    pub(crate) async fn fetch(&self, url: &str) -> IoResult {
         // G7:redirect 策略按实例配置(上限/放宽旗标)闭包捕获——重定向
         // 与首跳同源单策略,不构成第二放宽通道
         let (allow_http, allow_private, max_redirects) = (

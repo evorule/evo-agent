@@ -884,7 +884,7 @@ pub fn resolve_target_scope(
     args: &Value,
     boundary: Option<&crate::agent::definition::CapabilityBoundary>,
 ) -> Option<&'static str> {
-    if tool_name != "file_read" && tool_name != "file_write" {
+    if tool_name != "file_read" && tool_name != "file_write" && tool_name != "edit_file" {
         return None;
     }
     let raw = args.get("path").and_then(|v| v.as_str())?;
@@ -969,9 +969,10 @@ pub fn resolve_tool_intent(
     }
     let mut intent = serde_json::json!({ "tool_name": tool_name });
     let path_fields: &[&str] = match tool_name {
-        // file_write：D1 兑现——升 P2 哨兵后意图信号经 resolve_tool_intent
-        // 采集（与 M5-c R1 的 pending_target_scope 通道并存互不干扰）
-        "file_create" | "file_delete" | "file_write" => &["path"],
+        // file_write / edit_file：D1 兑现——升 P2 哨兵后意图信号经
+        // resolve_tool_intent 采集（与 M5-c R1 的 pending_target_scope
+        // 通道并存互不干扰）；edit_file 同族（批K 段1，path 字段快筛）
+        "file_create" | "file_delete" | "file_write" | "edit_file" => &["path"],
         "file_move" => &["path", "target_dir"],
         _ => &[],
     };
@@ -1268,6 +1269,10 @@ pub struct AgentRunner {
     pending_note_feed: bool,
     /// 写前置查询会话级路径去重(同路径重复写不再重复建议;R-4)
     advised_paths: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// todo 清单共享态(批K 段4;None=未接线/开关关)。会话期重绑时创建并
+    /// 注入两工具(Arc 三方共享);装配点据此渲染 S3c_todo 摘要;G15 续跑从
+    /// journal 回放最新 todo_updated 重建(全量重写式,取末条即终态)
+    todo_state: Option<std::sync::Arc<crate::builtin_tools::todo::TodoState>>,
     /// 摘要保真对照(规格修正批交付物 B):当前会话 journal 写者(流式路径
     /// 注入;CLI run 纯路径无 journal=只 warn 不落账)。G10 摘要替换时
     /// 自动对照落 summary_fidelity_scan 事件。
@@ -1396,6 +1401,7 @@ impl AgentRunner {
             semantic_i2_enabled: true,
             pending_note_feed: false,
             advised_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
+            todo_state: None,
             active_journal: None,
             accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
             chain: None,
@@ -2940,6 +2946,8 @@ impl AgentRunner {
                 self.config.handoff.as_ref(),
                 self.config.governance_segment.as_deref(),
                 knowledge_segment.as_deref(),
+                // 批K 段4:S3c_todo 槽位内容物(开关单键双绑;None=静默跳过)
+                self.todo_summary_segment().as_deref(),
             )
             .map_err(AgentError::Internal)?;
 
@@ -3002,6 +3010,8 @@ impl AgentRunner {
         // session_id 在手;run 纯路径无 journal,传 None——语义事件缺席如实
         // 降级,调用镜像 tool_invoked/tool_result 仍在)
         self.register_session_scoped_handover_tools(&session_id, None);
+        // 批K 段4:todo 族会话期重绑(run 纯路径无 journal,同 None 口径)
+        self.register_session_scoped_todo_tools(None);
         // 跨源批 D:技能双层注册同步(声明面真账镜像+正文本地索引;
         // Recipe sources.skills_index 门控,缺省关=no-op;best-effort
         // 不阻塞会话)
@@ -3756,6 +3766,78 @@ impl AgentRunner {
         info!(%session_id, "handover tools re-bound (session-scoped)");
     }
 
+    /// todo 族会话期重绑(批K 段4):占位→wired;共享 TodoState 创建后两工具
+    /// 与 runner 三方共享(Arc)。门控=has_tool(启动期注册+开关 agentTools.todo
+    /// 过滤后在场才接线——开关关=占位未进面,工具契约与装配注入双面同步缺席
+    /// =单键双绑;装配点按 has_tool 同键判定,零新机制)。journal 在手时回放
+    /// 最新 todo_updated 重建清单(G15 续跑恢复;全量重写式,取末条即终态),
+    /// 读账失败=空清单如实起步(护栏宁可重建不误锚旧态)。
+    fn register_session_scoped_todo_tools(
+        &mut self,
+        journal: Option<std::sync::Arc<crate::agent::journal::JournalWriter>>,
+    ) {
+        use crate::builtin_tools::todo::{TodoReadTool, TodoState, TodoWriteTool};
+        if !self
+            .tool_handler
+            .has_tool(crate::builtin_tools::todo::TODO_READ_TOOL)
+        {
+            return; // 开关关:占位未进面,保持双面同步缺席
+        }
+        let state = std::sync::Arc::new(TodoState::default());
+        if let Some(j) = journal.as_ref() {
+            if let Ok(lines) = j.read_lines() {
+                let latest = lines
+                    .into_iter()
+                    .filter_map(|l| match l.event {
+                        crate::agent::journal::JournalEvent::TodoUpdated { items } => Some(items),
+                        _ => None,
+                    })
+                    .next_back();
+                if let Some(items) = latest {
+                    state.replace(
+                        items
+                            .into_iter()
+                            .map(|s| crate::builtin_tools::todo::TodoItem {
+                                id: s.id,
+                                content: s.content,
+                                status: crate::builtin_tools::todo::TodoStatus::parse(&s.status)
+                                    .unwrap_or(crate::builtin_tools::todo::TodoStatus::Pending),
+                                priority: crate::builtin_tools::todo::TodoPriority::parse(
+                                    &s.priority,
+                                )
+                                .unwrap_or(crate::builtin_tools::todo::TodoPriority::Medium),
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        let write_exec: std::sync::Arc<dyn ToolFunction> =
+            std::sync::Arc::new(TodoWriteTool::wired(state.clone()));
+        self.tool_handler
+            .register_static(crate::builtin_tools::todo::TODO_WRITE_TOOL, write_exec);
+        let read_exec: std::sync::Arc<dyn ToolFunction> =
+            std::sync::Arc::new(TodoReadTool::wired(state.clone()));
+        self.tool_handler
+            .register_static(crate::builtin_tools::todo::TODO_READ_TOOL, read_exec);
+        self.todo_state = Some(state);
+        tracing::debug!("todo tools re-bound (session-scoped, shared state)");
+    }
+
+    /// S3c_todo 槽位内容物(批K 段4):装配点按开关同键判定(has_tool——工具
+    /// 契约面在场才注入),清单空/缺态返回 None=槽位静默跳过。渲染走
+    /// render_todo_summary 确定性纯函数(同状态逐字节同输出,wire 可重建适用)。
+    fn todo_summary_segment(&self) -> Option<String> {
+        let state = self.todo_state.as_ref()?;
+        if !self
+            .tool_handler
+            .has_tool(crate::builtin_tools::todo::TODO_READ_TOOL)
+        {
+            return None; // 双绑注入面:开关关不注入(防单腿态)
+        }
+        crate::builtin_tools::todo::render_todo_summary(&state.snapshot())
+    }
+
     /// 自主交接 PR-H3:子会话 runner 工厂(SessionSpawnTool 接线用)
     ///
     /// 闭包构造期一次性克隆可 Clone 组件(组件快照);不可克隆项按同源输入
@@ -3828,6 +3910,7 @@ impl AgentRunner {
                 pending_messages: Vec::new(),
                 pending_note_feed: false,
                 advised_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
+                todo_state: None,
                 summary_model: summary_model.clone(),
                 execution_profile: None,
                 context_window,
@@ -4812,6 +4895,39 @@ impl AgentRunner {
         }
     }
 
+    /// todo 族（批K 段4）:todo_write 成功落 journal todo_updated(全量快照;
+    /// 恢复=回放最新本事件重建清单,零折叠逻辑)。非 todo_write/未接线/无
+    /// journal = 不落(语义事件仅成功形态在场,失败由调用镜像覆盖)。
+    /// 快照从 self.todo_state 读(工具执行已重写终态),handover_written 同钩位。
+    fn record_todo_updated(
+        &self,
+        journal: Option<&crate::agent::journal::JournalWriter>,
+        tool_name: &str,
+    ) {
+        if tool_name != crate::builtin_tools::todo::TODO_WRITE_TOOL {
+            return;
+        }
+        let Some(state) = self.todo_state.as_ref() else {
+            return;
+        };
+        let Some(j) = journal else {
+            return;
+        };
+        let items = state
+            .snapshot()
+            .into_iter()
+            .map(|it| crate::agent::journal::TodoItemSnapshot {
+                id: it.id,
+                content: it.content,
+                status: it.status.as_str().to_string(),
+                priority: it.priority.as_str().to_string(),
+            })
+            .collect();
+        if let Err(e) = j.todo_updated(items) {
+            tracing::warn!(error = %e, "todo_updated journal append failed");
+        }
+    }
+
     /// 阶段一(流式路径):执行工具并解析审批请求,不做决策
     ///
     /// 供 stream! 生成器在 yield ApprovalRequired **之前**调用 —— 帧必须在
@@ -4843,6 +4959,7 @@ impl AgentRunner {
                 .await?;
             Self::record_handover_written(journal, session_id, tool_name, &final_result);
             Self::record_session_spawned(journal, session_id, tool_name, &final_result);
+            self.record_todo_updated(journal, tool_name);
             return Ok(ToolExecStage::Done(ToolExecOutcome {
                 final_result,
                 approval_record: None,
@@ -4872,6 +4989,7 @@ impl AgentRunner {
                     None => {
                         Self::record_handover_written(journal, session_id, tool_name, &tool_result);
                         Self::record_session_spawned(journal, session_id, tool_name, &tool_result);
+                        self.record_todo_updated(journal, tool_name);
                         // B22-C T1:流式面工具完成事件——与 execute_tool_call_gated
                         // 收口同口径;此前四触发点仅覆盖 call_service 路径,流式
                         // ReAct 面(W serve 实际执行面)整体旁路,实证 EL 缺 T1 后补钩
@@ -5064,6 +5182,7 @@ impl AgentRunner {
         // 直通路径有、847 审批路径无即此根因)。handover_write 同理对称补挂。
         Self::record_handover_written(journal, session_id, tool_name, &final_result);
         Self::record_session_spawned(journal, session_id, tool_name, &final_result);
+        self.record_todo_updated(journal, tool_name);
 
         // 人工审查开合:决策事件入审计链(tool_trace 条目附加 approval 子对象;
         // 批准=重执行条目,拒绝=proposal 首调条目;candidate 始终串行无交错)
@@ -6101,6 +6220,9 @@ impl AgentRunner {
                                runner.config.handoff.as_ref(),
                                runner.config.governance_segment.as_deref(),
                                knowledge_segment.as_deref(),
+                               // 批K 段4:S3c_todo 槽位内容物(每轮装配重建——
+                               // 状态锚定不靠消息历史;None=静默跳过)
+                               runner.todo_summary_segment().as_deref(),
                            ) {
                                Ok(p) => p,
                                Err(e) => {
@@ -6233,6 +6355,10 @@ impl AgentRunner {
                            // (与 run() 同钩位补挂——此前流式路径漏挂,handover 工具在 serve
                            // 流式会话恒 unwired;journal 在手后透传,派生/停链语义事件可落账)
                            runner.register_session_scoped_handover_tools(&session_id, journal.clone());
+                           // 批K 段4:todo 族会话期重绑(journal 在手——G15 续跑
+                           // 回放最新 todo_updated 重建清单;写侧 todo_updated
+                           // 语义事件经 journal 落账)
+                           runner.register_session_scoped_todo_tools(journal.clone());
                            // 崩溃恢复 server 侧预检:崩溃早于首轮落账的会话在 server 无状态
                            // 文档(get_state 404)——无进展可保,显式指引重发,而非裸 404。
                            // 预检在 journal 开立之后:崩溃标记已补写,拒绝恢复的会话以

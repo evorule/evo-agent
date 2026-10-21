@@ -768,8 +768,8 @@ pub fn effective_capability_boundary_with_read_root(
 /// - 读面(file_read/file_list/search_files/grep_files)绑「生效读域」
 ///   (声明 read_root 在场且异于写域时绑读根,否则绑 sandbox_root——
 ///   B 批「读宽写窄」)
-/// - 写面(file_write/file_create/file_move/file_delete)在 `read_write`
-///   模式下按 `sandbox_root` 全域可写(writable_dir = ".")
+/// - 写面(file_write/edit_file/file_create/file_move/file_delete)在
+///   `read_write` 模式下按 `sandbox_root` 全域可写(writable_dir = ".")
 ///
 /// 声明合法性(模式/工具一致性)由 `AgentDefinition::validate` 门卫先行保证。
 pub fn apply_capability_boundary(
@@ -820,6 +820,17 @@ pub fn apply_capability_boundary(
                 "file_write",
                 std::sync::Arc::new(
                     crate::builtin_tools::file_write::FileWriteTool::new(root.clone())
+                        .with_writable_dir("."),
+                ),
+            );
+        }
+        // 批K 段1:写面第五件随族重绑(C 批全族重绑纪律——仅绑启动期根=
+        // 会话级逃逸教训),read_write 模式下全 sandbox_root 可写
+        if has("edit_file") {
+            handler.register_static(
+                "edit_file",
+                std::sync::Arc::new(
+                    crate::builtin_tools::edit_file::FileEditTool::new(root.clone())
                         .with_writable_dir("."),
                 ),
             );
@@ -1129,7 +1140,7 @@ mod tests {
         let (ws, ev) = make_clients();
         let handler = build_union_toolkit(Path::new("."), &ws, &ev);
 
-        // 17 个内置工具(10 文件/搜索/网络 + 5 git 族 + 查账占位/交接占位)
+        // 22 个内置工具(10 文件/搜索/网络 + 2 网络面第二三件[批K 段2] + 符号图谱[批K 段3] + 5 git 族 + 交接占位 + todo 占位[批K 段4])
         for name in [
             "file_read",
             "file_list",
@@ -1139,8 +1150,11 @@ mod tests {
             "file_delete",
             "search_files",
             "grep_files",
+            "code_search",
             "shell_exec",
             "http_get",
+            "web_fetch",
+            "web_search",
             "git_status",
             "git_diff",
             "git_log",
@@ -1148,6 +1162,8 @@ mod tests {
             "git_commit",
             "handover_write",
             "handover_read",
+            "todo_write",
+            "todo_read",
         ] {
             assert!(
                 handler.has_tool(name),
@@ -1165,7 +1181,7 @@ mod tests {
             );
         }
 
-        // 总数 = 17 + 44 = 61(逐个验证所有预期工具都在)
+        // 总数 = 22 + 45 = 67(逐个验证所有预期工具都在;批K 段3 code_search、批K 段4 todo 双件接入)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -1175,8 +1191,11 @@ mod tests {
             "file_delete",
             "search_files",
             "grep_files",
+            "code_search",
             "shell_exec",
             "http_get",
+            "web_fetch",
+            "web_search",
             "git_status",
             "git_diff",
             "git_log",
@@ -1184,12 +1203,14 @@ mod tests {
             "git_commit",
             "handover_write",
             "handover_read",
+            "todo_write",
+            "todo_read",
         ]
         .iter()
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 62, "expected 62 total tool names");
+        assert_eq!(all_names.len(), 67, "expected 67 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),
@@ -1221,6 +1242,27 @@ mod tests {
             !closed.has_tool("handover_read"),
             "handover_read must be gated off"
         );
+    }
+
+    #[test]
+    fn test_todo_switch_off_gates_todo_tools() {
+        // todo 族开关(批K 段4):默认(键缺失)双工具在面;false = 双工具下线
+        // (runner wire 的 has_tool 门控同键——注入面同步缺席,单键双绑)
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let whitelist = vec!["todo_write".to_string(), "todo_read".to_string()];
+        let open =
+            build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
+        assert!(open.has_tool("todo_write"), "todo must default ON");
+        assert!(open.has_tool("todo_read"), "todo must default ON");
+        let mut settings = serde_json::Map::new();
+        settings.insert("agentTools.todo".to_string(), serde_json::json!(false));
+        let closed = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        assert!(
+            !closed.has_tool("todo_write"),
+            "todo_write must be gated off"
+        );
+        assert!(!closed.has_tool("todo_read"), "todo_read must be gated off");
     }
 
     #[test]

@@ -361,6 +361,39 @@ const SWITCH_AUDIT_QUERY: &str = AGENT_TOOLS_AUDIT_QUERY;
 pub const AGENT_TOOLS_MEMORY_TOMBSTONE: &str = "agentTools.memory_tombstone";
 const SWITCH_MEMORY_TOMBSTONE: &str = AGENT_TOOLS_MEMORY_TOMBSTONE;
 
+/// agentTools.editFile（默认开；写面精准编辑工具——file_write 同族治理）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_EDIT_FILE: &str = "agentTools.editFile";
+const SWITCH_EDIT_FILE: &str = AGENT_TOOLS_EDIT_FILE;
+
+/// agentTools.webFetch（默认开；网页抓取取读——http_get 防线同源复用，批K 段2）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_WEB_FETCH: &str = "agentTools.webFetch";
+const SWITCH_WEB_FETCH: &str = AGENT_TOOLS_WEB_FETCH;
+
+/// agentTools.webSearch（默认开；互联网搜索——ai-plugin 中继，Brave key
+/// 归边 ai-plugin 侧，批K 段2）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_WEB_SEARCH: &str = "agentTools.webSearch";
+const SWITCH_WEB_SEARCH: &str = AGENT_TOOLS_WEB_SEARCH;
+
+/// agentTools.codeSearch（默认开；工作区符号图谱检索——B14 结构面 agent
+/// 工具化,纯读零模型依赖,批K 段3）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_CODE_SEARCH: &str = "agentTools.codeSearch";
+const SWITCH_CODE_SEARCH: &str = AGENT_TOOLS_CODE_SEARCH;
+
+/// agentTools.todo（默认开；todo 任务清单族单键双绑——工具契约面过滤 +
+/// runner 装配注入面同键判定，批K 段4）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_TODO: &str = "agentTools.todo";
+const SWITCH_TODO: &str = AGENT_TOOLS_TODO;
+
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
     Some(SwitchBinding {
@@ -384,7 +417,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（28 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（34 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -396,13 +429,26 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         b("image_load", vec![FsRead]),
         b("file_list", vec![FsRead]),
         b("file_write", vec![FsWrite]),
+        // 批K 段1:写面第五件——精准编辑(old/new 串替换+唯一性闸+保真细节),
+        // 治理同 file_write(Sentineled+AutoPolicy,见下方分级段)
+        b("edit_file", vec![FsWrite]),
         b("file_create", vec![FsWrite]),
         b("file_move", vec![FsWrite]),
         b("file_delete", vec![FsWrite]),
         b("search_files", vec![FsRead]),
         b("grep_files", vec![FsRead]),
+        // 批K 段3:符号图谱检索(B14 结构面 agent 工具化)——读面 FsRead 域,
+        // 占位/serve 期重绑双态(见 mod.rs 注册注释);Standard+AutoPolicy
+        // 免裁决(纯读),不进 GOVERNANCE_SNAPSHOT
+        b("code_search", vec![FsRead]),
         b("shell_exec", vec![Process]),
         b("http_get", vec![Network]),
+        // 批K 段2:网络面第二件——网页抓取取读(复用 http_get host 分类/
+        // SSRF/重定向/负面域全部防线;candidate host 同 http_get 审批语义)
+        b("web_fetch", vec![Network]),
+        // 批K 段2:网络面第三件——互联网搜索(ai-plugin 中继,Brave key 归边
+        // ai-plugin 侧;查询词出站面由 exfil_scan 词形打标管辖)
+        b("web_search", vec![Network]),
         // python_exec（收口修复：执行体已注册但静态表缺条目，register_static
         // fail-fast 传染 toolkit 构造型测试）。任意代码执行（无命令白名单，
         // 危险等级高于 shell_exec）——Process 域 + candidate 全审批（见分级
@@ -454,6 +500,13 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // （default_safe_toolkit），runner 会话期接线重绑（handover 双工具
         // 同款）。能力域=Delegate（语义最近：创建执行上下文）。
         b("session_spawn", vec![CapDomain::Delegate]),
+        // todo 任务清单族（批K 段4）：会话内结构化任务清单全量重写读写。
+        // 占位执行体启动期注册（default_safe_toolkit），runner 会话期重绑
+        // （handover 同款，state 在手）；Standard 免裁决 + AutoPolicy（进程
+        // 内内存态读写，无沙箱/网络/子进程面）。能力域=Memory（handover
+        // 先例：会话自管理状态面）。spec 常驻 default_tool_specs（Builtin 源）。
+        b("todo_write", vec![Memory]),
+        b("todo_read", vec![Memory]),
     ]
     .into_iter()
     .map(|mut m| {
@@ -466,10 +519,12 @@ fn builtin_manifests() -> Vec<ToolManifest> {
                 m.adjudication_class = AdjudicationClass::Sentineled;
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
-            // file_write：D1 兑现——规则正本第 4 条 enforce（out_of_sandbox）
-            // 在场，升 Sentineled；审批面不动（写面高频工具维持既有审批策略，
-            // 由 handler 内联沙箱检查 + 规则层 enforce 双层把守）
-            "file_write" => {
+            // file_write / edit_file：D1 兑现——规则正本第 4 条 enforce
+            // （out_of_sandbox）在场，升 Sentineled；审批面不动（写面高频
+            // 工具维持既有审批策略，由 handler 内联沙箱检查 + 规则层
+            // enforce 双层把守）。edit_file 同族：写面精准编辑（批K 段1），
+            // 意图信号经 resolve_tool_intent 采集（path 字段快筛同族）
+            "file_write" | "edit_file" => {
                 m.adjudication_class = AdjudicationClass::Sentineled;
             }
             // git 写族：P2 裁决在通道；D1 建议上 enforce（PR-5 规则正本入库时
@@ -499,7 +554,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // （此前默认 AutoPolicy 属盘点遗漏，行为等价修正）。
             // python_exec：任意代码执行无白名单可用，任何调用都出提案
             // （执行体 evaluate_proposal 全审批，无 active 名单）
-            "shell_exec" | "http_get" => {
+            "shell_exec" | "http_get" | "web_fetch" => {
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
             "python_exec" => {
@@ -512,9 +567,16 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // agentTools.* 开关绑定（原 TOOL_SWITCH_KEYS 内置段，快照测试锁等价）
         m.default_switch = match m.name.as_str() {
             "file_create" => sw(SWITCH_FILE_CREATE, true),
+            // 批K 段1:写面精准编辑,默认开(低风险高频,同 fileCreate 先例)
+            "edit_file" => sw(SWITCH_EDIT_FILE, true),
+            // 批K 段2:网络读取/检索面,默认开
+            "web_fetch" => sw(SWITCH_WEB_FETCH, true),
+            "web_search" => sw(SWITCH_WEB_SEARCH, true),
             "file_move" => sw(SWITCH_FILE_MOVE, false),
             "file_delete" => sw(SWITCH_FILE_DELETE, false),
             "grep_files" => sw(SWITCH_GREP, true),
+            // 批K 段3:符号图谱检索,默认开(纯读面,同 grep 先例)
+            "code_search" => sw(SWITCH_CODE_SEARCH, true),
             "git_status" | "git_diff" | "git_log" => sw(SWITCH_GIT_READ, true),
             "git_stage" | "git_commit" => sw(SWITCH_GIT_WRITE, false),
             // 自主交接族：单键同绑同开同关（自主交接设计 §四；PR-H3 起
@@ -526,6 +588,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             "audit_query" => sw(SWITCH_AUDIT_QUERY, true),
             // 记忆墓碑：写入面默认关（显式启用才进 LLM 契约）
             "memory_tombstone" => sw(SWITCH_MEMORY_TOMBSTONE, false),
+            // todo 任务清单族（批K 段4）：单键双绑（工具契约面过滤 +
+            // runner 装配注入面同键判定），默认开（进程内内存态，零外溢面）
+            "todo_write" | "todo_read" => sw(SWITCH_TODO, true),
             _ => None,
         };
         m
@@ -852,9 +917,13 @@ mod tests {
         //   （B22 审计查询 audit_query +1：内置 25→26，数量锁 91→92）
         //   （B1 多模态上行 image_load +1：内置 26→27，数量锁 92→93）
         //   （O-487② 记忆墓碑 memory_tombstone +1：内置 27→28，数量锁 93→94）
-        assert_eq!(builtin_manifests().len(), 28);
+        //   （批K 段1 精准编辑 edit_file +1：内置 28→29，数量锁 94→95）
+        //   （批K 段2 网络双件 web_fetch/web_search +2：内置 29→31，数量锁 95→97）
+        //   （批K 段3 符号图谱检索 code_search +1：内置 31→32，数量锁 97→98）
+        //   （批K 段4 todo 双件 todo_write/todo_read +2：内置 32→34，数量锁 98→100）
+        assert_eq!(builtin_manifests().len(), 34);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 94);
+        assert_eq!(all().len(), 100);
     }
 
     #[test]
@@ -972,11 +1041,14 @@ mod tests {
     /// 判定事实治理登记批 verdict_submit +1 → 28 条；O-487② 记忆墓碑
     /// memory_tombstone 落地 Sensitive（双闸同 session_spawn），演进为 29 条
     /// （默认关——开关不在场不进 LLM 契约，裁决集仍含，防绕道）。
+    /// 批K 段1 edit_file 落地 Sentineled（file_write 同族写面）→ 30 条
+    /// （快照重录 diff 审）。
     const GOVERNANCE_SNAPSHOT: &[&str] = &[
         "file_create",
         "file_move",
         "file_delete",
         "file_write",
+        "edit_file",
         "git_stage",
         "git_commit",
         "rule_create",
@@ -1045,13 +1117,26 @@ mod tests {
         sentineled.sort_unstable();
         assert_eq!(
             sentineled,
-            vec!["file_create", "file_delete", "file_move", "file_write"]
+            vec![
+                "edit_file",
+                "file_create",
+                "file_delete",
+                "file_move",
+                "file_write"
+            ]
         );
     }
 
-    /// 原 TOOL_SWITCH_KEYS 30 条快照（tool, key, default_on）
+    /// 原 TOOL_SWITCH_KEYS 快照（tool, key, default_on）；批K 段1 edit_file
+    /// 接入 → 32 条（memory_recall/audit_query/memory_tombstone 后续接入，
+    /// 历史批注曾滞后于实际行数，20261021 批K 段4 修正口径）；批K 段4
+    /// todo_write/todo_read 接入 → 43 条
     const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
         ("file_create", "agentTools.fileCreate", true),
+        ("edit_file", "agentTools.editFile", true),
+        ("web_fetch", "agentTools.webFetch", true),
+        ("web_search", "agentTools.webSearch", true),
+        ("code_search", "agentTools.codeSearch", true),
         ("file_move", "agentTools.fileMove", false),
         ("file_delete", "agentTools.fileDelete", false),
         ("grep_files", "agentTools.grep", true),
@@ -1093,6 +1178,9 @@ mod tests {
         ("audit_query", "agentTools.audit_query", true),
         // 记忆墓碑（默认关）
         ("memory_tombstone", "agentTools.memory_tombstone", false),
+        // todo 任务清单族（批K 段4）：单键双绑同列
+        ("todo_write", "agentTools.todo", true),
+        ("todo_read", "agentTools.todo", true),
     ];
 
     #[test]

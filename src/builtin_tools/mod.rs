@@ -5,7 +5,9 @@
 //! file_move / file_delete / search_files / grep_files / shell_exec /
 //! http_get / python_exec / git_status / git_diff / git_log / git_stage /
 //! git_commit / read_skill / query_journal / query_trace / read_back /
-//! diff_runs / handover_write / handover_read / session_spawn)
+//! diff_runs / handover_write / handover_read / session_spawn /
+//! web_fetch / web_search（批K 段2）/ code_search（批K 段3）/
+//! todo_write / todo_read（批K 段4，占位注册+会话期重绑）)
 //!
 //! 注:`read_skill`(skills 装配 B2)不在 default_safe_toolkit 静态注册——
 //! 其技能表来自 agent definition 的 skills 声明(声明非空时由 serve_tools::
@@ -45,7 +47,9 @@
 //! 默认是"宁可功能少,也不可被滥用"。
 
 pub mod accounting;
+pub mod code_search;
 pub mod delegate_tool;
+pub mod edit_file;
 pub mod exfil_scan;
 pub mod file_create;
 pub mod file_delete;
@@ -64,6 +68,9 @@ pub mod search_files;
 pub mod shell_exec;
 pub mod shell_net_guard;
 pub mod skill_read;
+pub mod todo;
+pub mod web_fetch;
+pub mod web_search;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -139,6 +146,12 @@ pub fn default_safe_toolkit_with_profile(
         "file_write",
         Arc::new(file_write::FileWriteTool::new(workdir_buf.clone())),
     );
+    // 写面第五件(批K 段1):精准编辑,沙箱/白名单/保真细节见 edit_file.rs;
+    // 治理同 file_write(Sentineled+AutoPolicy),开关 agentTools.editFile 默认开
+    handler.register_static(
+        "edit_file",
+        Arc::new(edit_file::FileEditTool::new(workdir_buf.clone())),
+    );
     handler.register_static(
         "file_create",
         Arc::new(file_create::FileCreateTool::new(workdir_buf.clone())),
@@ -159,6 +172,14 @@ pub fn default_safe_toolkit_with_profile(
         "grep_files",
         Arc::new(grep_files::GrepFilesTool::new(read_root_buf)),
     );
+    // 符号图谱检索（批K 段3）：占位注册（B14 index 服务 serve 期注入）——
+    // serve 启动 index.enabled 建好 IndexService 后经 toolkit 写锁重绑 wired()；
+    // CLI 面与关闭态恒占位（fail-visible 引导）。纯读面、无模型依赖（v1 只做
+    // lexical 结构面,理由与分工见 code_search.rs 模块文档）
+    handler.register_static(
+        "code_search",
+        Arc::new(code_search::CodeSearchTool::unwired()),
+    );
     handler.register_static(
         "shell_exec",
         Arc::new(
@@ -168,6 +189,10 @@ pub fn default_safe_toolkit_with_profile(
         ),
     );
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
+    // 批K 段2:网络面第二/三件——网页抓取取读(http_get 防线全量复用)与
+    // 互联网搜索(ai-plugin 中继,Brave key 归边 ai-plugin 侧)
+    handler.register_static("web_fetch", Arc::new(web_fetch::WebFetchTool::new()));
+    handler.register_static("web_search", Arc::new(web_search::WebSearchTool::new()));
     handler.register_static(
         "python_exec",
         Arc::new(python_exec::PythonExecTool::new().with_execution_profile(profile)),
@@ -248,6 +273,18 @@ pub fn default_safe_toolkit_with_profile(
     handler.register_static(
         crate::agent::memory_tombstone_tool::MEMORY_TOMBSTONE_TOOL,
         Arc::new(crate::agent::memory_tombstone_tool::MemoryTombstoneTool::unwired()),
+    );
+    // todo 任务清单族（批K 段4）：占位执行体启动期注册（未接线时调用
+    // fail-visible 如实报错）；runner 会话期重绑（handover 同构，state 在
+    // 手）——开关 agentTools.todo 过滤工具契约面 + 装配点同键判定注入面，
+    // 双绑单键自动工作
+    handler.register_static(
+        crate::builtin_tools::todo::TODO_WRITE_TOOL,
+        Arc::new(crate::builtin_tools::todo::TodoWriteTool::unwired()),
+    );
+    handler.register_static(
+        crate::builtin_tools::todo::TODO_READ_TOOL,
+        Arc::new(crate::builtin_tools::todo::TodoReadTool::unwired()),
     );
     handler
 }
@@ -341,6 +378,48 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     name: "create_parents".to_string(),
                     r#type: "boolean".to_string(),
                     description: "Set true to auto-create parent directories (default: false)".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "edit_file".to_string(),
+            description: "Make a precise in-place edit to an EXISTING file by replacing \
+                          an exact anchor string — much safer and cheaper than rewriting \
+                          the whole file. The anchor (old_string) must match exactly once \
+                          unless replace_all=true. Only UTF-8 files are accepted; line \
+                          endings (CRLF/LF) and BOM are preserved as-is. Path is relative \
+                          to the writable subdir; the file must already exist. Returns a \
+                          context preview around the change."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "path".to_string(),
+                    r#type: "string".to_string(),
+                    description: "File path, relative to writable_dir (e.g. \"workspace/notes.md\")".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "old_string".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Exact text to replace (non-empty). Must be unique in the \
+                                  file unless replace_all=true; copy it from file_read/grep_files \
+                                  output to be exact."
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "new_string".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Replacement text (may be empty to delete the anchor)".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "replace_all".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Set true to replace every occurrence (default: false; \
+                                  non-unique anchor without it is rejected with the hit count)"
+                        .to_string(),
                     required: false,
                 },
             ],
@@ -523,6 +602,33 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
             ],
         },
         ToolSpec {
+            name: "code_search".to_string(),
+            description: "Search CODE SYMBOLS by name across the workdir (symbol graph, \
+                          tree-sitter + PageRank ranking). Returns files where a symbol \
+                          (function/struct/method/...) is defined or referenced, ranked by \
+                          graph importance — use this to locate definitions and impact \
+                          surfaces. For plain text/regex line matching use grep_files; \
+                          for filename lookup use search_files. Structure-only: no local \
+                          ML models involved. Requires the index service (index.enabled)."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "query".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Symbol name substring to search for, case-insensitive \
+                                  (must not be empty)"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "limit".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Max results (default 20, capped at 100)".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
             name: "shell_exec".to_string(),
             description: shell_exec_description(),
             parameters: vec![
@@ -543,6 +649,60 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     r#type: "string".to_string(),
                     description: "HTTPS URL to GET. Must be in active allowlist OR approved by user.".to_string(),
                     required: true,
+                },
+            ],
+        },
+        // 批K 段2:网络面第二/三件
+        ToolSpec {
+            name: "web_fetch".to_string(),
+            description: "Fetch a web page and return readable text. Reuses the http_get host \
+                          policy: active allowlist hosts run directly; other public hosts return \
+                          a needs_approval proposal; private/SSRF hosts are always rejected. \
+                          HTML pages are converted to plain text (script/style stripped, entities \
+                          decoded); non-textual content types are rejected unless raw=true. \
+                          Extracted text is truncated to max_chars (default 20000, cap 50000)."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "url".to_string(),
+                    r#type: "string".to_string(),
+                    description: "HTTPS URL to fetch. Must be in active allowlist OR approved by user.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "raw".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Return the raw response body without HTML-to-text extraction (default false).".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "max_chars".to_string(),
+                    r#type: "number".to_string(),
+                    description: "Max characters of extracted text (default 20000, cap 50000).".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "web_search".to_string(),
+            description: "Search the web via the local ai-plugin relay (Brave Search API; the API \
+                          key never lives in this process). Returns { status, provider, query, \
+                          result_count, results: [{title, url, description}] }. Fails visibly \
+                          with a self-diagnosis message when the relay is not configured (missing \
+                          provider/key) or the caller token mismatches."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "query".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Search query (non-empty).".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "count".to_string(),
+                    r#type: "number".to_string(),
+                    description: "Number of results, 1-10 (default 5).".to_string(),
+                    required: false,
                 },
             ],
         },
@@ -1057,6 +1217,37 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     required: false,
                 },
             ],
+        },
+        ToolSpec {
+            name: "todo_write".to_string(),
+            description: "Replace the session todo list with the given items (FULL rewrite, \
+                          not a patch — always submit the complete list). Each item: id \
+                          (unique short key within the list), content (1-500 chars, \
+                          actionable), status (pending | in_progress | completed), \
+                          priority (high | medium | low, default medium). Max 10 items; \
+                          an empty array clears the list. The current list summary is \
+                          injected into your system prompt each turn — keep it current: \
+                          mark an item in_progress before starting it and completed \
+                          immediately when done. The list lives only for this session."
+                .to_string(),
+            parameters: vec![ParameterSpec {
+                name: "items".to_string(),
+                r#type: "array".to_string(),
+                description: "Complete replacement list, e.g. [{\"id\": \"t1\", \"content\": \
+                              \"fix parser\", \"status\": \"in_progress\", \"priority\": \
+                              \"high\"}] (empty array = clear the list)"
+                    .to_string(),
+                required: true,
+            }],
+        },
+        ToolSpec {
+            name: "todo_read".to_string(),
+            description: "Read the current session todo list (items with id/content/status/\
+                          priority plus a count). Read-only — use it to re-check the exact \
+                          state when the injected summary is not enough. The list lives \
+                          only for this session."
+                .to_string(),
+            parameters: vec![],
         },
     ]
 }

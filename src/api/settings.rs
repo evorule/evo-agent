@@ -199,6 +199,46 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.editFile",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 精准编辑已有文件（edit_file，锚串替换+唯一性闸，UTF-8/CRLF 保真；沙箱与审计同 file_write 写面，随开随用）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "agentTools.webFetch",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 抓取网页并转为可读文本（web_fetch，http_get 防线同源复用：active host 直取/candidate host 审批/SSRF 永拒；随开随用）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "agentTools.webSearch",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 互联网搜索（web_search，经本机 ai-plugin 中继调用 Brave Search API，搜索凭据仅存 ai-plugin 侧；未配置时 fail-visible 自诊断）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "agentTools.codeSearch",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 符号图谱检索（code_search，基于工作区索引的符号级代码搜索，tree-sitter + PageRank 排位，纯结构面无本地模型；需 index.enabled 开启索引服务）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.fileMove",
             kind: SettingType::Boolean,
             default: json!(false),
@@ -296,6 +336,16 @@ pub fn schema() -> Vec<SettingEntry> {
             range: None,
             category: "Agent 工具",
             description: "记忆墓碑工具（memory_tombstone，写入面）：对已固化的沉淀错误事实写 null 墓碑使其视图不可见（append-only 原值永在账；仅本命名空间 stable/events 两分区；reason 强制且永久入审计链；默认关——显式启用才进 LLM 契约，启用后仍走敏感意图裁决与人工审批）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "agentTools.todo",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "todo 任务清单族（todo_write/todo_read，单键双绑）：会话内结构化任务清单的全量重写读写——关闭 = 两工具连 LLM 契约一起下线，且 runner 装配注入面同键判定同步缺席（清单摘要不再注入 system prompt，防「工具在、注入断」的单腿态）；进程内内存态零外溢面，默认开",
             scope: "application",
         },
         SettingEntry {
@@ -917,13 +967,17 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 49); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone)
+        assert_eq!(settings.len(), 54); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
         assert_eq!(settings["keybindings.overrides"], json!([]));
-        // agentTools.* 开关键:出厂默认(fileCreate/grep/gitRead 开 / fileMove、fileDelete、gitWrite 关)
+        // agentTools.* 开关键:出厂默认(fileCreate/editFile/grep/gitRead 开 / fileMove、fileDelete、gitWrite 关)
         assert_eq!(settings["agentTools.fileCreate"], json!(true));
+        assert_eq!(settings["agentTools.editFile"], json!(true));
+        assert_eq!(settings["agentTools.webFetch"], json!(true));
+        assert_eq!(settings["agentTools.webSearch"], json!(true));
+        assert_eq!(settings["agentTools.codeSearch"], json!(true));
         assert_eq!(settings["agentTools.fileMove"], json!(false));
         assert_eq!(settings["agentTools.fileDelete"], json!(false));
         assert_eq!(settings["agentTools.grep"], json!(true));
@@ -942,6 +996,8 @@ mod tests {
         );
         // 自主交接开关(交接设计 PR-H2):默认开 = 交接族在面,零行为变化
         assert_eq!(settings["agentTools.handover"], json!(true));
+        // todo 任务清单族(批K 段4):默认开 = 进程内内存态零外溢面
+        assert_eq!(settings["agentTools.todo"], json!(true));
         // search.* 全局搜索 4 键(B2 消费)
         assert_eq!(settings["search.maxResults"], json!(1000));
         assert_eq!(settings["search.smartCase"], json!(true));

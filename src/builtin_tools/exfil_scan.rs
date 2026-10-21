@@ -56,6 +56,8 @@
 //!   网络外传面。call_service 是 runner 内部 io 通路（非工具面，内层工具
 //!   经管道重入会双计）；shell_exec 的网络外传面由 SG-5 `shell_net_guard`
 //!   既有管辖，凭据词形检测挂账后续批（避免双面治理叠加误伤）；
+//!   批K 段2按同纪律扩容 web_fetch（URL 直接外传面）与 web_search（查询
+//!   词出站面）——扩的是名单不是判据，词形检测零变化；
 //! - `aws_akia`（裸 4 字母词形）与 `bearer_scheme`（词形含尾空格）在散文
 //!   文本存在误伤可能——observe 缺省下仅多一条留痕，enforce 态手动开启时
 //!   知悉；词边界护栏已排除词中形态（`Sakia`/`bearer.example.com`）；
@@ -65,7 +67,15 @@
 use serde_json::Value;
 
 /// 外传能力工具名单（外传面单一事实源；宁窄勿错，演化依据见模块边界注记）
-pub const EXFIL_SCAN_TOOLS: &[&str] = &["http_get"];
+///
+/// 批K 段2扩容：web_fetch（直接外传面同 http_get——URL 携带凭据形态出域）
+/// 与 web_search（查询词亦可携带凭据形态出域，且经 ai-plugin 中继为新增
+/// 出站通道）。
+/// 批K 段3：code_search 查询词为符号名子串（纯本地索引检索，零外发），
+/// **不扩容**本名单——查询不出站，无凭据出域面。
+/// 批K 段4：todo 双件为进程内内存态读写（会话任务清单，无任何出站面），
+/// **不扩容**本名单。
+pub const EXFIL_SCAN_TOOLS: &[&str] = &["http_get", "web_fetch", "web_search"];
 
 /// 凭据特征模式表（id, 词形）。词形按 ASCII 小写匹配纪律存储（匹配大小写
 /// 不敏感）；子串 + 词边界护栏（见 [`scan_text`]）。
@@ -461,6 +471,9 @@ mod tests {
         assert!(!exfil_scan_applies("file_write"));
         assert!(!exfil_scan_applies(""));
         assert!(EXFIL_SCAN_TOOLS.contains(&"http_get"));
+        // 批K 段2扩容锚
+        assert!(EXFIL_SCAN_TOOLS.contains(&"web_fetch"));
+        assert!(EXFIL_SCAN_TOOLS.contains(&"web_search"));
     }
 
     #[test]
