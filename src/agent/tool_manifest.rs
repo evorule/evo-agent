@@ -394,6 +394,13 @@ const SWITCH_CODE_SEARCH: &str = AGENT_TOOLS_CODE_SEARCH;
 pub const AGENT_TOOLS_TODO: &str = "agentTools.todo";
 const SWITCH_TODO: &str = AGENT_TOOLS_TODO;
 
+/// agentTools.httpRequest（默认关；HTTP 写动词 POST/PUT/PATCH/DELETE——
+/// 双闸 Sensitive+ManualDefault，Active host 亦审批，批K 段5）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_HTTP_REQUEST: &str = "agentTools.httpRequest";
+const SWITCH_HTTP_REQUEST: &str = AGENT_TOOLS_HTTP_REQUEST;
+
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
     Some(SwitchBinding {
@@ -449,6 +456,11 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 批K 段2:网络面第三件——互联网搜索(ai-plugin 中继,Brave key 归边
         // ai-plugin 侧;查询词出站面由 exfil_scan 词形打标管辖)
         b("web_search", vec![Network]),
+        // 批K 段5:网络面第四件——HTTP 写动词(POST/PUT/PATCH/DELETE)。
+        // 防线组合继承 http_get(SSRF/三层 host/net_guard/超时/帽);redirect
+        // Policy::none 禁跟随(唯一分叉)。治理全批最严:双闸 Sensitive+
+        // ManualDefault(见下方分级段),默认关(写动词不进缺省工具面)
+        b("http_request", vec![Network]),
         // python_exec（收口修复：执行体已注册但静态表缺条目，register_static
         // fail-fast 传染 toolkit 构造型测试）。任意代码执行（无命令白名单，
         // 危险等级高于 shell_exec）——Process 域 + candidate 全审批（见分级
@@ -549,6 +561,15 @@ fn builtin_manifests() -> Vec<ToolManifest> {
                 m.adjudication_class = AdjudicationClass::Sensitive;
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
+            // http_request（批K 段5，写动词）：双闸同 session_spawn 先例——
+            // Sensitive（写动词意图必报，Active host 亦出 proposal——写面
+            // 无 AutoPolicy 直跑特权）+ ManualDefault（每次调用人工默认
+            // 否决点）。全批最严治理面：红线 + SSRF + exfil 横切 + 双闸
+            // 四层叠加（见 http_request.rs 模块文档）
+            "http_request" => {
+                m.adjudication_class = AdjudicationClass::Sensitive;
+                m.approval_policy = ApprovalPolicy::ManualDefault;
+            }
             // 命令/网络 candidate 族：分类器判入 candidate 即出 needs_approval
             // 提案（PR-4 起经管道⑤评估臂单源），如实补标 ManualDefault
             // （此前默认 AutoPolicy 属盘点遗漏，行为等价修正）。
@@ -591,6 +612,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // todo 任务清单族（批K 段4）：单键双绑（工具契约面过滤 +
             // runner 装配注入面同键判定），默认开（进程内内存态，零外溢面）
             "todo_write" | "todo_read" => sw(SWITCH_TODO, true),
+            // 批K 段5:HTTP 写动词,默认关(写动词不进缺省工具面,显式启用
+            // 才可达;启用后仍走双闸全流审批)
+            "http_request" => sw(SWITCH_HTTP_REQUEST, false),
             _ => None,
         };
         m
@@ -921,9 +945,10 @@ mod tests {
         //   （批K 段2 网络双件 web_fetch/web_search +2：内置 29→31，数量锁 95→97）
         //   （批K 段3 符号图谱检索 code_search +1：内置 31→32，数量锁 97→98）
         //   （批K 段4 todo 双件 todo_write/todo_read +2：内置 32→34，数量锁 98→100）
-        assert_eq!(builtin_manifests().len(), 34);
+        //   （批K 段5 HTTP 写动词 http_request +1：内置 34→35，数量锁 100→101）
+        assert_eq!(builtin_manifests().len(), 35);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 100);
+        assert_eq!(all().len(), 101);
     }
 
     #[test]
@@ -1042,7 +1067,8 @@ mod tests {
     /// memory_tombstone 落地 Sensitive（双闸同 session_spawn），演进为 29 条
     /// （默认关——开关不在场不进 LLM 契约，裁决集仍含，防绕道）。
     /// 批K 段1 edit_file 落地 Sentineled（file_write 同族写面）→ 30 条
-    /// （快照重录 diff 审）。
+    /// （快照重录 diff 审）。批K 段5 http_request 落地 Sensitive（写动词
+    /// 双闸，Active host 亦审批）→ 31 条（快照重录 diff 审）。
     const GOVERNANCE_SNAPSHOT: &[&str] = &[
         "file_create",
         "file_move",
@@ -1074,6 +1100,8 @@ mod tests {
         "delegate",
         "session_spawn",
         "memory_tombstone",
+        // 批K 段5:HTTP 写动词（双闸 Sensitive+ManualDefault——写动词意图必报）
+        "http_request",
     ];
 
     #[test]
@@ -1106,6 +1134,27 @@ mod tests {
     }
 
     #[test]
+    fn test_http_request_manifest_dual_gate() {
+        // 批K 段5:HTTP 写动词双闸断言——Sensitive(P2 意图必报,写动词
+        // 无直跑特权)+ ManualDefault(每次调用人工默认否决点);Network 域;
+        // 默认关(写动词不进缺省工具面)
+        let manifests = all();
+        let m = manifests
+            .iter()
+            .find(|m| m.name == "http_request")
+            .expect("http_request manifest must exist in static table");
+        assert_eq!(m.adjudication_class, AdjudicationClass::Sensitive);
+        assert_eq!(m.approval_policy, ApprovalPolicy::ManualDefault);
+        assert!(m.is_p2_adjudicated());
+        assert!(m
+            .capability_domains
+            .contains(&crate::agent::tool_manifest::CapDomain::Network));
+        let sw = m.default_switch.as_ref().expect("switch binding required");
+        assert_eq!(sw.key, "agentTools.httpRequest");
+        assert!(!sw.default_on, "write verb must default OFF");
+    }
+
+    #[test]
     fn test_sentineled_is_exactly_file_break_family() {
         let manifests = all();
         // 名序化表(C1 OnceLock BTreeMap)遍历序=字典序;断言按集合语义排序比较
@@ -1130,7 +1179,8 @@ mod tests {
     /// 原 TOOL_SWITCH_KEYS 快照（tool, key, default_on）；批K 段1 edit_file
     /// 接入 → 32 条（memory_recall/audit_query/memory_tombstone 后续接入，
     /// 历史批注曾滞后于实际行数，20261021 批K 段4 修正口径）；批K 段4
-    /// todo_write/todo_read 接入 → 43 条
+    /// todo_write/todo_read 接入 → 43 条；批K 段5 http_request 接入
+    /// （默认关）→ 44 条
     const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
         ("file_create", "agentTools.fileCreate", true),
         ("edit_file", "agentTools.editFile", true),
@@ -1181,6 +1231,8 @@ mod tests {
         // todo 任务清单族（批K 段4）：单键双绑同列
         ("todo_write", "agentTools.todo", true),
         ("todo_read", "agentTools.todo", true),
+        // HTTP 写动词（批K 段5）：默认关（写动词不进缺省工具面）
+        ("http_request", "agentTools.httpRequest", false),
     ];
 
     #[test]

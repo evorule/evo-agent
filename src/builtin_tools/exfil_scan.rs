@@ -75,7 +75,10 @@ use serde_json::Value;
 /// **不扩容**本名单——查询不出站，无凭据出域面。
 /// 批K 段4：todo 双件为进程内内存态读写（会话任务清单，无任何出站面），
 /// **不扩容**本名单。
-pub const EXFIL_SCAN_TOOLS: &[&str] = &["http_get", "web_fetch", "web_search"];
+/// 批K 段5：http_request 写动词扩容——URL/headers/body 三面均为凭据
+/// 出域载体（写动词出域面比读面更宽），扩的是名单不是判据，词形检测
+/// 零变化。
+pub const EXFIL_SCAN_TOOLS: &[&str] = &["http_get", "web_fetch", "web_search", "http_request"];
 
 /// 凭据特征模式表（id, 词形）。词形按 ASCII 小写匹配纪律存储（匹配大小写
 /// 不敏感）；子串 + 词边界护栏（见 [`scan_text`]）。
@@ -474,6 +477,8 @@ mod tests {
         // 批K 段2扩容锚
         assert!(EXFIL_SCAN_TOOLS.contains(&"web_fetch"));
         assert!(EXFIL_SCAN_TOOLS.contains(&"web_search"));
+        // 批K 段5扩容锚：写动词入名单（URL/headers/body 三面出域载体）
+        assert!(EXFIL_SCAN_TOOLS.contains(&"http_request"));
     }
 
     #[test]

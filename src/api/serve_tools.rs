@@ -1140,7 +1140,7 @@ mod tests {
         let (ws, ev) = make_clients();
         let handler = build_union_toolkit(Path::new("."), &ws, &ev);
 
-        // 22 个内置工具(10 文件/搜索/网络 + 2 网络面第二三件[批K 段2] + 符号图谱[批K 段3] + 5 git 族 + 交接占位 + todo 占位[批K 段4])
+        // 23 个内置工具(10 文件/搜索/网络 + 2 网络面第二三件[批K 段2] + 符号图谱[批K 段3] + 5 git 族 + 交接占位 + todo 占位[批K 段4] + 写动词[批K 段5])
         for name in [
             "file_read",
             "file_list",
@@ -1155,6 +1155,7 @@ mod tests {
             "http_get",
             "web_fetch",
             "web_search",
+            "http_request",
             "git_status",
             "git_diff",
             "git_log",
@@ -1181,7 +1182,7 @@ mod tests {
             );
         }
 
-        // 总数 = 22 + 45 = 67(逐个验证所有预期工具都在;批K 段3 code_search、批K 段4 todo 双件接入)
+        // 总数 = 23 + 45 = 68(逐个验证所有预期工具都在;批K 段3 code_search、批K 段4 todo 双件、批K 段5 http_request 接入)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -1196,6 +1197,7 @@ mod tests {
             "http_get",
             "web_fetch",
             "web_search",
+            "http_request",
             "git_status",
             "git_diff",
             "git_log",
@@ -1210,7 +1212,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 67, "expected 67 total tool names");
+        assert_eq!(all_names.len(), 68, "expected 68 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),
@@ -1263,6 +1265,32 @@ mod tests {
             "todo_write must be gated off"
         );
         assert!(!closed.has_tool("todo_read"), "todo_read must be gated off");
+    }
+
+    #[test]
+    fn test_http_request_switch_default_off_and_opt_in() {
+        // 写动词开关(批K 段5):默认(键缺失)不在面(默认关——与 todo/handover
+        // 默认开先例反向);显式 agentTools.httpRequest=true 后在面,且开启后
+        // 仍走双闸全流审批(候选形态由 evaluate_proposal 单源,见工具侧测试)
+        let (ws, ev) = make_clients();
+        let union = build_union_toolkit(Path::new("."), &ws, &ev);
+        let whitelist = vec!["http_request".to_string()];
+        let default_off =
+            build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
+        assert!(
+            !default_off.has_tool("http_request"),
+            "write verb must default OFF (not in LLM contract surface)"
+        );
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            "agentTools.httpRequest".to_string(),
+            serde_json::json!(true),
+        );
+        let opted_in = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
+        assert!(
+            opted_in.has_tool("http_request"),
+            "explicit opt-in must surface the tool"
+        );
     }
 
     #[test]
