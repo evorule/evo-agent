@@ -44,11 +44,23 @@ jobs:
         run: cargo clippy --all-targets
 
   verify:
-    name: verify (${{ matrix.os }})
+    name: verify (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          # CI diagnosis (2026-10-21): ubuntu verify died 5x mid-step (~49 min
+          # in, log blob lost, "lost communication"), including 2x WITH the
+          # -j2 cap + debug=0 guards. The deaths started inside the GitHub
+          # ubuntu-latest -> Ubuntu 26.04 rollout window (2026-10-19..11-19),
+          # so this job pins the previous LTS image to isolate the migration
+          # variable; display name stays "ubuntu-latest" for check-name
+          # stability. Unpin deliberately (not by label drift) once the
+          # workload is verified green on the 26 image.
+          - os: ubuntu-24.04
+            name: ubuntu-latest
+          - os: windows-latest
+            name: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +69,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.os }}
+          # Cache-bust (2026-10-21): pre-mitigation runs cached ~9.4 GB of
+          # debug-full target artifacts; restoring them re-fills the disk
+          # even though new builds are slim (debug=0). Bump the key so a
+          # fresh slim cache is built from scratch.
+          key: ${{ matrix.os }}-slim1
 
       # 宪法 schema 校验组件以 git 依赖(rev 钉版)由 cargo 自动拉取,
       # 且 0.2.0 起 schema 编译期内嵌——运行时零磁盘依赖,无需检出宪法仓。
