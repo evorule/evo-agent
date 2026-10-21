@@ -8,16 +8,34 @@ $ErrorActionPreference = "Continue"
 $repo = $PSScriptRoot
 Set-Location $repo
 $failed = $false
+# OS gate compatible with Windows PowerShell 5.1 ($IsWindows is pwsh-only).
+$isWin = $env:OS -eq 'Windows_NT'
 
 Write-Host "== [1/4] cargo build =="
-cargo build --quiet
+# CI diagnosis (2026-10-21): ubuntu verify has died 3x at ~48-52 min with the
+# log blob lost, so nothing post-hoc survives. Wrap the heavy phases in
+# coreutils timeout (Linux only): a hang becomes a logged FAIL with full
+# output instead of an infra kill. Windows is unaffected and stays direct.
+if ($isWin) {
+    cargo build --quiet
+} else {
+    timeout --kill-after=30 1500 cargo build --quiet
+}
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL: cargo build"; $failed = $true } else { Write-Host "PASS: cargo build" }
 
 Write-Host "== [2/4] cargo test =="
-# 失败明细随 stderr 走——必须并流保留,否则 CI 日志只剩汇总行无法定位
-# (2026-09-25 教训:ubuntu 两测试红灯但日志零明细,只能本地 WSL 复现)。
-# $ErrorActionPreference 顶部已设 Continue,2>&1 不会中断脚本。
-$testLog = cargo test 2>&1 | ForEach-Object { "$_" }
+# Failure details travel on stderr -- must keep the merged stream, otherwise
+# CI log carries only the summary line (2026-09-25 lesson: ubuntu had two red
+# tests with zero details in the log; local WSL repro was the only option).
+# $ErrorActionPreference is Continue at the top, so 2>&1 will not abort.
+if ($isWin) {
+    $testLog = cargo test 2>&1 | ForEach-Object { "$_" }
+} else {
+    # Exit code 124 = timeout fired: the buffered log still carries every
+    # test line printed before the hang, which pinpoints the stuck test.
+    $testLog = timeout --kill-after=30 2100 cargo test 2>&1 | ForEach-Object { "$_" }
+    if ($LASTEXITCODE -eq 124) { Write-Host "TIMEOUT: cargo test after 35 min" }
+}
 $testLog | Select-String -Pattern "^test result"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "FAIL: cargo test -- failure details (last 80 lines):"
