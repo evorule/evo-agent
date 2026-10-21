@@ -209,6 +209,26 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.webFetch",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 抓取网页并转为可读文本（web_fetch，http_get 防线同源复用：active host 直取/candidate host 审批/SSRF 永拒；随开随用）",
+            scope: "application",
+        },
+        SettingEntry {
+            key: "agentTools.webSearch",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 互联网搜索（web_search，经本机 ai-plugin 中继调用 Brave Search API，搜索凭据仅存 ai-plugin 侧；未配置时 fail-visible 自诊断）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.fileMove",
             kind: SettingType::Boolean,
             default: json!(false),
@@ -927,7 +947,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 50); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile)
+        assert_eq!(settings.len(), 52); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -935,6 +955,8 @@ mod tests {
         // agentTools.* 开关键:出厂默认(fileCreate/editFile/grep/gitRead 开 / fileMove、fileDelete、gitWrite 关)
         assert_eq!(settings["agentTools.fileCreate"], json!(true));
         assert_eq!(settings["agentTools.editFile"], json!(true));
+        assert_eq!(settings["agentTools.webFetch"], json!(true));
+        assert_eq!(settings["agentTools.webSearch"], json!(true));
         assert_eq!(settings["agentTools.fileMove"], json!(false));
         assert_eq!(settings["agentTools.fileDelete"], json!(false));
         assert_eq!(settings["agentTools.grep"], json!(true));

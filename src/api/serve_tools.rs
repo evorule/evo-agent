@@ -1140,7 +1140,7 @@ mod tests {
         let (ws, ev) = make_clients();
         let handler = build_union_toolkit(Path::new("."), &ws, &ev);
 
-        // 17 个内置工具(10 文件/搜索/网络 + 5 git 族 + 查账占位/交接占位)
+        // 19 个内置工具(10 文件/搜索/网络 + 2 网络面第二三件[批K 段2] + 5 git 族 + 查账占位/交接占位)
         for name in [
             "file_read",
             "file_list",
@@ -1152,6 +1152,8 @@ mod tests {
             "grep_files",
             "shell_exec",
             "http_get",
+            "web_fetch",
+            "web_search",
             "git_status",
             "git_diff",
             "git_log",
@@ -1176,7 +1178,7 @@ mod tests {
             );
         }
 
-        // 总数 = 17 + 44 = 61(逐个验证所有预期工具都在)
+        // 总数 = 19 + 45 = 64(逐个验证所有预期工具都在)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -1188,6 +1190,8 @@ mod tests {
             "grep_files",
             "shell_exec",
             "http_get",
+            "web_fetch",
+            "web_search",
             "git_status",
             "git_diff",
             "git_log",
@@ -1200,7 +1204,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 62, "expected 62 total tool names");
+        assert_eq!(all_names.len(), 64, "expected 64 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),

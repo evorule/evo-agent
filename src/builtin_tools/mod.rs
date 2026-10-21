@@ -5,7 +5,8 @@
 //! file_move / file_delete / search_files / grep_files / shell_exec /
 //! http_get / python_exec / git_status / git_diff / git_log / git_stage /
 //! git_commit / read_skill / query_journal / query_trace / read_back /
-//! diff_runs / handover_write / handover_read / session_spawn)
+//! diff_runs / handover_write / handover_read / session_spawn /
+//! web_fetch / web_search（批K 段2）)
 //!
 //! 注:`read_skill`(skills 装配 B2)不在 default_safe_toolkit 静态注册——
 //! 其技能表来自 agent definition 的 skills 声明(声明非空时由 serve_tools::
@@ -65,6 +66,8 @@ pub mod search_files;
 pub mod shell_exec;
 pub mod shell_net_guard;
 pub mod skill_read;
+pub mod web_fetch;
+pub mod web_search;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -175,6 +178,10 @@ pub fn default_safe_toolkit_with_profile(
         ),
     );
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
+    // 批K 段2:网络面第二/三件——网页抓取取读(http_get 防线全量复用)与
+    // 互联网搜索(ai-plugin 中继,Brave key 归边 ai-plugin 侧)
+    handler.register_static("web_fetch", Arc::new(web_fetch::WebFetchTool::new()));
+    handler.register_static("web_search", Arc::new(web_search::WebSearchTool::new()));
     handler.register_static(
         "python_exec",
         Arc::new(python_exec::PythonExecTool::new().with_execution_profile(profile)),
@@ -592,6 +599,60 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     r#type: "string".to_string(),
                     description: "HTTPS URL to GET. Must be in active allowlist OR approved by user.".to_string(),
                     required: true,
+                },
+            ],
+        },
+        // 批K 段2:网络面第二/三件
+        ToolSpec {
+            name: "web_fetch".to_string(),
+            description: "Fetch a web page and return readable text. Reuses the http_get host \
+                          policy: active allowlist hosts run directly; other public hosts return \
+                          a needs_approval proposal; private/SSRF hosts are always rejected. \
+                          HTML pages are converted to plain text (script/style stripped, entities \
+                          decoded); non-textual content types are rejected unless raw=true. \
+                          Extracted text is truncated to max_chars (default 20000, cap 50000)."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "url".to_string(),
+                    r#type: "string".to_string(),
+                    description: "HTTPS URL to fetch. Must be in active allowlist OR approved by user.".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "raw".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Return the raw response body without HTML-to-text extraction (default false).".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "max_chars".to_string(),
+                    r#type: "number".to_string(),
+                    description: "Max characters of extracted text (default 20000, cap 50000).".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "web_search".to_string(),
+            description: "Search the web via the local ai-plugin relay (Brave Search API; the API \
+                          key never lives in this process). Returns { status, provider, query, \
+                          result_count, results: [{title, url, description}] }. Fails visibly \
+                          with a self-diagnosis message when the relay is not configured (missing \
+                          provider/key) or the caller token mismatches."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "query".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Search query (non-empty).".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "count".to_string(),
+                    r#type: "number".to_string(),
+                    description: "Number of results, 1-10 (default 5).".to_string(),
+                    required: false,
                 },
             ],
         },

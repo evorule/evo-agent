@@ -367,6 +367,19 @@ const SWITCH_MEMORY_TOMBSTONE: &str = AGENT_TOOLS_MEMORY_TOMBSTONE;
 pub const AGENT_TOOLS_EDIT_FILE: &str = "agentTools.editFile";
 const SWITCH_EDIT_FILE: &str = AGENT_TOOLS_EDIT_FILE;
 
+/// agentTools.webFetch（默认开；网页抓取取读——http_get 防线同源复用，批K 段2）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_WEB_FETCH: &str = "agentTools.webFetch";
+const SWITCH_WEB_FETCH: &str = AGENT_TOOLS_WEB_FETCH;
+
+/// agentTools.webSearch（默认开；互联网搜索——ai-plugin 中继，Brave key
+/// 归边 ai-plugin 侧，批K 段2）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_WEB_SEARCH: &str = "agentTools.webSearch";
+const SWITCH_WEB_SEARCH: &str = AGENT_TOOLS_WEB_SEARCH;
+
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
     Some(SwitchBinding {
@@ -390,7 +403,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（29 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（31 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -412,6 +425,12 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         b("grep_files", vec![FsRead]),
         b("shell_exec", vec![Process]),
         b("http_get", vec![Network]),
+        // 批K 段2:网络面第二件——网页抓取取读(复用 http_get host 分类/
+        // SSRF/重定向/负面域全部防线;candidate host 同 http_get 审批语义)
+        b("web_fetch", vec![Network]),
+        // 批K 段2:网络面第三件——互联网搜索(ai-plugin 中继,Brave key 归边
+        // ai-plugin 侧;查询词出站面由 exfil_scan 词形打标管辖)
+        b("web_search", vec![Network]),
         // python_exec（收口修复：执行体已注册但静态表缺条目，register_static
         // fail-fast 传染 toolkit 构造型测试）。任意代码执行（无命令白名单，
         // 危险等级高于 shell_exec）——Process 域 + candidate 全审批（见分级
@@ -510,7 +529,7 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // （此前默认 AutoPolicy 属盘点遗漏，行为等价修正）。
             // python_exec：任意代码执行无白名单可用，任何调用都出提案
             // （执行体 evaluate_proposal 全审批，无 active 名单）
-            "shell_exec" | "http_get" => {
+            "shell_exec" | "http_get" | "web_fetch" => {
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
             "python_exec" => {
@@ -525,6 +544,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             "file_create" => sw(SWITCH_FILE_CREATE, true),
             // 批K 段1:写面精准编辑,默认开(低风险高频,同 fileCreate 先例)
             "edit_file" => sw(SWITCH_EDIT_FILE, true),
+            // 批K 段2:网络读取/检索面,默认开
+            "web_fetch" => sw(SWITCH_WEB_FETCH, true),
+            "web_search" => sw(SWITCH_WEB_SEARCH, true),
             "file_move" => sw(SWITCH_FILE_MOVE, false),
             "file_delete" => sw(SWITCH_FILE_DELETE, false),
             "grep_files" => sw(SWITCH_GREP, true),
@@ -866,9 +888,10 @@ mod tests {
         //   （B1 多模态上行 image_load +1：内置 26→27，数量锁 92→93）
         //   （O-487② 记忆墓碑 memory_tombstone +1：内置 27→28，数量锁 93→94）
         //   （批K 段1 精准编辑 edit_file +1：内置 28→29，数量锁 94→95）
-        assert_eq!(builtin_manifests().len(), 29);
+        //   （批K 段2 网络双件 web_fetch/web_search +2：内置 29→31，数量锁 95→97）
+        assert_eq!(builtin_manifests().len(), 31);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 95);
+        assert_eq!(all().len(), 97);
     }
 
     #[test]
@@ -1073,10 +1096,12 @@ mod tests {
     }
 
     /// 原 TOOL_SWITCH_KEYS 30 条快照（tool, key, default_on）；批K 段1
-    /// edit_file 接入 → 31 条
+    /// edit_file 接入 → 31 条；批K 段2 web_fetch/web_search 接入 → 33 条
     const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
         ("file_create", "agentTools.fileCreate", true),
         ("edit_file", "agentTools.editFile", true),
+        ("web_fetch", "agentTools.webFetch", true),
+        ("web_search", "agentTools.webSearch", true),
         ("file_move", "agentTools.fileMove", false),
         ("file_delete", "agentTools.fileDelete", false),
         ("grep_files", "agentTools.grep", true),
