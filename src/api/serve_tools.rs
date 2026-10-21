@@ -1150,6 +1150,7 @@ mod tests {
             "file_delete",
             "search_files",
             "grep_files",
+            "code_search",
             "shell_exec",
             "http_get",
             "web_fetch",
@@ -1178,7 +1179,7 @@ mod tests {
             );
         }
 
-        // 总数 = 19 + 45 = 64(逐个验证所有预期工具都在)
+        // 总数 = 20 + 45 = 65(逐个验证所有预期工具都在;批K 段3 code_search 接入)
         let all_names: Vec<&str> = [
             "file_read",
             "file_list",
@@ -1188,6 +1189,7 @@ mod tests {
             "file_delete",
             "search_files",
             "grep_files",
+            "code_search",
             "shell_exec",
             "http_get",
             "web_fetch",
@@ -1204,7 +1206,7 @@ mod tests {
         .copied()
         .chain(RULE_TOOL_NAMES.iter().copied())
         .collect();
-        assert_eq!(all_names.len(), 64, "expected 64 total tool names");
+        assert_eq!(all_names.len(), 65, "expected 65 total tool names");
         for name in &all_names {
             assert!(
                 handler.has_tool(name),

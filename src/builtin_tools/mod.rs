@@ -6,7 +6,7 @@
 //! http_get / python_exec / git_status / git_diff / git_log / git_stage /
 //! git_commit / read_skill / query_journal / query_trace / read_back /
 //! diff_runs / handover_write / handover_read / session_spawn /
-//! web_fetch / web_search（批K 段2）)
+//! web_fetch / web_search（批K 段2）/ code_search（批K 段3）)
 //!
 //! 注:`read_skill`(skills 装配 B2)不在 default_safe_toolkit 静态注册——
 //! 其技能表来自 agent definition 的 skills 声明(声明非空时由 serve_tools::
@@ -46,6 +46,7 @@
 //! 默认是"宁可功能少,也不可被滥用"。
 
 pub mod accounting;
+pub mod code_search;
 pub mod delegate_tool;
 pub mod edit_file;
 pub mod exfil_scan;
@@ -168,6 +169,14 @@ pub fn default_safe_toolkit_with_profile(
     handler.register_static(
         "grep_files",
         Arc::new(grep_files::GrepFilesTool::new(read_root_buf)),
+    );
+    // 符号图谱检索（批K 段3）：占位注册（B14 index 服务 serve 期注入）——
+    // serve 启动 index.enabled 建好 IndexService 后经 toolkit 写锁重绑 wired()；
+    // CLI 面与关闭态恒占位（fail-visible 引导）。纯读面、无模型依赖（v1 只做
+    // lexical 结构面,理由与分工见 code_search.rs 模块文档）
+    handler.register_static(
+        "code_search",
+        Arc::new(code_search::CodeSearchTool::unwired()),
     );
     handler.register_static(
         "shell_exec",
@@ -574,6 +583,33 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     name: "max_results".to_string(),
                     r#type: "integer".to_string(),
                     description: "Max total matches (default 1000)".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "code_search".to_string(),
+            description: "Search CODE SYMBOLS by name across the workdir (symbol graph, \
+                          tree-sitter + PageRank ranking). Returns files where a symbol \
+                          (function/struct/method/...) is defined or referenced, ranked by \
+                          graph importance — use this to locate definitions and impact \
+                          surfaces. For plain text/regex line matching use grep_files; \
+                          for filename lookup use search_files. Structure-only: no local \
+                          ML models involved. Requires the index service (index.enabled)."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "query".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Symbol name substring to search for, case-insensitive \
+                                  (must not be empty)"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "limit".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Max results (default 20, capped at 100)".to_string(),
                     required: false,
                 },
             ],

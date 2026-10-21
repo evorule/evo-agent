@@ -71,6 +71,8 @@ use serde_json::Value;
 /// 批K 段2扩容：web_fetch（直接外传面同 http_get——URL 携带凭据形态出域）
 /// 与 web_search（查询词亦可携带凭据形态出域，且经 ai-plugin 中继为新增
 /// 出站通道）。
+/// 批K 段3：code_search 查询词为符号名子串（纯本地索引检索，零外发），
+/// **不扩容**本名单——查询不出站，无凭据出域面。
 pub const EXFIL_SCAN_TOOLS: &[&str] = &["http_get", "web_fetch", "web_search"];
 
 /// 凭据特征模式表（id, 词形）。词形按 ASCII 小写匹配纪律存储（匹配大小写

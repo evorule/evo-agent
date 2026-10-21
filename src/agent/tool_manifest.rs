@@ -380,6 +380,13 @@ const SWITCH_WEB_FETCH: &str = AGENT_TOOLS_WEB_FETCH;
 pub const AGENT_TOOLS_WEB_SEARCH: &str = "agentTools.webSearch";
 const SWITCH_WEB_SEARCH: &str = AGENT_TOOLS_WEB_SEARCH;
 
+/// agentTools.codeSearch（默认开；工作区符号图谱检索——B14 结构面 agent
+/// 工具化,纯读零模型依赖,批K 段3）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_CODE_SEARCH: &str = "agentTools.codeSearch";
+const SWITCH_CODE_SEARCH: &str = AGENT_TOOLS_CODE_SEARCH;
+
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
     Some(SwitchBinding {
@@ -423,6 +430,10 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         b("file_delete", vec![FsWrite]),
         b("search_files", vec![FsRead]),
         b("grep_files", vec![FsRead]),
+        // 批K 段3:符号图谱检索(B14 结构面 agent 工具化)——读面 FsRead 域,
+        // 占位/serve 期重绑双态(见 mod.rs 注册注释);Standard+AutoPolicy
+        // 免裁决(纯读),不进 GOVERNANCE_SNAPSHOT
+        b("code_search", vec![FsRead]),
         b("shell_exec", vec![Process]),
         b("http_get", vec![Network]),
         // 批K 段2:网络面第二件——网页抓取取读(复用 http_get host 分类/
@@ -550,6 +561,8 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             "file_move" => sw(SWITCH_FILE_MOVE, false),
             "file_delete" => sw(SWITCH_FILE_DELETE, false),
             "grep_files" => sw(SWITCH_GREP, true),
+            // 批K 段3:符号图谱检索,默认开(纯读面,同 grep 先例)
+            "code_search" => sw(SWITCH_CODE_SEARCH, true),
             "git_status" | "git_diff" | "git_log" => sw(SWITCH_GIT_READ, true),
             "git_stage" | "git_commit" => sw(SWITCH_GIT_WRITE, false),
             // 自主交接族：单键同绑同开同关（自主交接设计 §四；PR-H3 起
@@ -889,9 +902,10 @@ mod tests {
         //   （O-487② 记忆墓碑 memory_tombstone +1：内置 27→28，数量锁 93→94）
         //   （批K 段1 精准编辑 edit_file +1：内置 28→29，数量锁 94→95）
         //   （批K 段2 网络双件 web_fetch/web_search +2：内置 29→31，数量锁 95→97）
-        assert_eq!(builtin_manifests().len(), 31);
+        //   （批K 段3 符号图谱检索 code_search +1：内置 31→32，数量锁 97→98）
+        assert_eq!(builtin_manifests().len(), 32);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 97);
+        assert_eq!(all().len(), 98);
     }
 
     #[test]
@@ -1096,12 +1110,14 @@ mod tests {
     }
 
     /// 原 TOOL_SWITCH_KEYS 30 条快照（tool, key, default_on）；批K 段1
-    /// edit_file 接入 → 31 条；批K 段2 web_fetch/web_search 接入 → 33 条
+    /// edit_file 接入 → 31 条；批K 段2 web_fetch/web_search 接入 → 33 条；
+    /// 批K 段3 code_search 接入 → 34 条
     const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
         ("file_create", "agentTools.fileCreate", true),
         ("edit_file", "agentTools.editFile", true),
         ("web_fetch", "agentTools.webFetch", true),
         ("web_search", "agentTools.webSearch", true),
+        ("code_search", "agentTools.codeSearch", true),
         ("file_move", "agentTools.fileMove", false),
         ("file_delete", "agentTools.fileDelete", false),
         ("grep_files", "agentTools.grep", true),

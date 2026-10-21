@@ -229,6 +229,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.codeSearch",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 符号图谱检索（code_search，基于工作区索引的符号级代码搜索，tree-sitter + PageRank 排位，纯结构面无本地模型；需 index.enabled 开启索引服务）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.fileMove",
             kind: SettingType::Boolean,
             default: json!(false),
@@ -947,7 +957,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 52); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch)
+        assert_eq!(settings.len(), 53); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -957,6 +967,7 @@ mod tests {
         assert_eq!(settings["agentTools.editFile"], json!(true));
         assert_eq!(settings["agentTools.webFetch"], json!(true));
         assert_eq!(settings["agentTools.webSearch"], json!(true));
+        assert_eq!(settings["agentTools.codeSearch"], json!(true));
         assert_eq!(settings["agentTools.fileMove"], json!(false));
         assert_eq!(settings["agentTools.fileDelete"], json!(false));
         assert_eq!(settings["agentTools.grep"], json!(true));

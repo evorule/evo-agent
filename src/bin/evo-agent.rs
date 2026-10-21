@@ -2293,7 +2293,29 @@ fn cmd_serve(
                             eprintln!("[index] watcher start failed (incremental disabled): {e}")
                         }
                     }
-                    state = state.with_index(svc);
+                    state = state.with_index(svc.clone());
+                    // 批K 段3:code_search 占位重绑——index 服务就绪后以本实例
+                    // 覆盖启动期占位（B16 MCP 运行期重绑同款写锁手法）。先查
+                    // has_tool:开关 agentTools.codeSearch 关=装配过滤后不在面,
+                    // 跳过重绑（不得借重绑绕过开关语义）
+                    {
+                        let mut tk = state.toolkit_lock().write().unwrap();
+                        if tk.has_tool("code_search") {
+                            tk.register_static(
+                                "code_search",
+                                std::sync::Arc::new(
+                                    evo_agent::builtin_tools::code_search::CodeSearchTool::wired(
+                                        svc.clone(),
+                                    ),
+                                ),
+                            );
+                            eprintln!("[index] code_search tool wired (symbol graph ready)");
+                        } else {
+                            eprintln!(
+                                "[index] code_search not in toolkit (agentTools.codeSearch off) — skip wiring"
+                            );
+                        }
+                    }
                     eprintln!("[index] semantic index enabled (index.enabled=true)");
                 }
                 Err(e) => eprintln!("[index] service init failed (index disabled): {e}"),
