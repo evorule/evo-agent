@@ -219,9 +219,7 @@ pub fn validate_todo_items(args: &Value) -> Result<Vec<TodoItem>, String> {
         };
         let priority = match entry.get("priority") {
             None | Some(Value::Null) => Ok(TodoPriority::Medium),
-            Some(Value::String(s)) => {
-                TodoPriority::parse(s).map_err(|e| format!("{tag}: {e}"))
-            }
+            Some(Value::String(s)) => TodoPriority::parse(s).map_err(|e| format!("{tag}: {e}")),
             Some(_) => Err(format!("{tag}: 'priority' must be a string")),
         };
         // status/priority 校验错误入收集(逐条列明,fail-visible 一次报全)
@@ -422,9 +420,24 @@ mod tests {
     fn test_render_summary_deterministic_and_empty_absent() {
         assert!(render_todo_summary(&[]).is_none());
         let items = vec![
-            TodoItem { id: "a".into(), content: "先做".into(), status: TodoStatus::InProgress, priority: TodoPriority::High },
-            TodoItem { id: "b".into(), content: "后做".into(), status: TodoStatus::Pending, priority: TodoPriority::Low },
-            TodoItem { id: "c".into(), content: "完成".into(), status: TodoStatus::Completed, priority: TodoPriority::Medium },
+            TodoItem {
+                id: "a".into(),
+                content: "先做".into(),
+                status: TodoStatus::InProgress,
+                priority: TodoPriority::High,
+            },
+            TodoItem {
+                id: "b".into(),
+                content: "后做".into(),
+                status: TodoStatus::Pending,
+                priority: TodoPriority::Low,
+            },
+            TodoItem {
+                id: "c".into(),
+                content: "完成".into(),
+                status: TodoStatus::Completed,
+                priority: TodoPriority::Medium,
+            },
         ];
         let r1 = render_todo_summary(&items).expect("some");
         let r2 = render_todo_summary(&items).expect("some");
@@ -432,7 +445,10 @@ mod tests {
         assert!(r1.starts_with("## Current Todo List\n"));
         assert!(r1.contains("- [*] a 先做 (High)"));
         assert!(r1.contains("- [ ] b 后做 (Low)"));
-        assert!(!r1.contains("完成"), "completed items collapse to count line");
+        assert!(
+            !r1.contains("完成"),
+            "completed items collapse to count line"
+        );
         assert!(r1.contains("Completed: 1/3"));
     }
 
@@ -501,8 +517,13 @@ mod tests {
         // 第一次全量重写落账,随后第二次重写(终态)落账
         {
             let w = JournalWriter::open(&dir, "s-todo").unwrap();
-            w.todo_updated(vec![snap("t1", "旧条目", TodoStatus::InProgress, TodoPriority::High)])
-                .unwrap();
+            w.todo_updated(vec![snap(
+                "t1",
+                "旧条目",
+                TodoStatus::InProgress,
+                TodoPriority::High,
+            )])
+            .unwrap();
             w.todo_updated(vec![
                 snap("t2", "终态甲", TodoStatus::Completed, TodoPriority::Medium),
                 snap("t3", "终态乙", TodoStatus::Pending, TodoPriority::Low),
@@ -525,10 +546,8 @@ mod tests {
             .map(|s| TodoItem {
                 id: s.id,
                 content: s.content,
-                status: TodoStatus::parse(&s.status)
-                    .unwrap_or(TodoStatus::Pending),
-                priority: TodoPriority::parse(&s.priority)
-                    .unwrap_or(TodoPriority::Medium),
+                status: TodoStatus::parse(&s.status).unwrap_or(TodoStatus::Pending),
+                priority: TodoPriority::parse(&s.priority).unwrap_or(TodoPriority::Medium),
             })
             .collect();
         assert_eq!(rebuilt.len(), 2, "重建取末条快照=终态(非折叠)");

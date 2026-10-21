@@ -1341,7 +1341,10 @@ mod tests {
                 Some("【清单】- [*] t1 先做"),
             )
             .unwrap();
-        assert_eq!(out, "base\n\n【清单】- [*] t1 先做\n\n【能力边界声明】boundary");
+        assert_eq!(
+            out,
+            "base\n\n【清单】- [*] t1 先做\n\n【能力边界声明】boundary"
+        );
         let todo_pos = out.find("【清单】").unwrap();
         let boundary_pos = out.find("【能力边界声明】").unwrap();
         assert!(

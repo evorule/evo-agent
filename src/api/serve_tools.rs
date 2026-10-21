@@ -1251,13 +1251,17 @@ mod tests {
         let (ws, ev) = make_clients();
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
         let whitelist = vec!["todo_write".to_string(), "todo_read".to_string()];
-        let open = build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
+        let open =
+            build_filtered_toolkit_with_switches(&union, &whitelist, &serde_json::Map::new());
         assert!(open.has_tool("todo_write"), "todo must default ON");
         assert!(open.has_tool("todo_read"), "todo must default ON");
         let mut settings = serde_json::Map::new();
         settings.insert("agentTools.todo".to_string(), serde_json::json!(false));
         let closed = build_filtered_toolkit_with_switches(&union, &whitelist, &settings);
-        assert!(!closed.has_tool("todo_write"), "todo_write must be gated off");
+        assert!(
+            !closed.has_tool("todo_write"),
+            "todo_write must be gated off"
+        );
         assert!(!closed.has_tool("todo_read"), "todo_read must be gated off");
     }
 
