@@ -46,12 +46,13 @@
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::api::agent_api::AgentApiState;
 use crate::api::human_gate::{ensure_write_allowed, CallerIdentity};
+use crate::api::serve_tools::simplify_verbatim;
 use crate::builtin_tools::file_create::FileCreateTool;
 use crate::builtin_tools::file_delete::FileDeleteTool;
 use crate::builtin_tools::file_list::FileListTool;
@@ -433,6 +434,153 @@ pub async fn upload_file(
         });
     record_outcome(&state, "file_upload", identity, &rel, &result);
     result.map(Json)
+}
+
+/// `GET /api/fs/browse` 查询参数
+#[derive(Debug, Deserialize)]
+pub struct BrowseQuery {
+    /// 要列的目录绝对路径(缺省 = 列文件系统根:Windows 盘符 / POSIX 根)
+    pub path: Option<String>,
+}
+
+/// 目录浏览条目(只列子目录——本端点服务于「选工作区」目录选择器)
+#[derive(Debug, Serialize)]
+pub struct BrowseEntry {
+    /// 目录名
+    pub name: String,
+    /// 目录绝对路径(规整形态,可直接回填下一跳 path 参数)
+    pub path: String,
+}
+
+/// 目录浏览响应
+#[derive(Debug, Serialize)]
+pub struct BrowseResponse {
+    /// 当前目录绝对路径(根列表模式 = None)
+    pub path: Option<String>,
+    /// 父目录绝对路径(已是根 = None,面包屑上移用)
+    pub parent: Option<String>,
+    /// true = 盘符/根列表模式(path 缺省)
+    pub roots: bool,
+    /// 子目录列表(只列目录)
+    pub entries: Vec<BrowseEntry>,
+    /// 读取失败信息(权限等;fail-soft 不 500,空表 + 本字段)
+    pub error: Option<String>,
+}
+
+/// Windows/POSIX 根列表(path 缺省态)
+fn list_roots() -> BrowseResponse {
+    #[cfg(windows)]
+    {
+        let entries = (b'A'..=b'Z')
+            .map(|c| c as char)
+            .filter(|letter| std::path::Path::new(&format!("{letter}:\\")).exists())
+            .map(|letter| BrowseEntry {
+                name: format!("{letter}:"),
+                path: format!("{letter}:\\"),
+            })
+            .collect();
+        BrowseResponse {
+            path: None,
+            parent: None,
+            roots: true,
+            entries,
+            error: None,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let (entries, error) = match std::fs::read_dir("/") {
+            Ok(rd) => {
+                let mut es: Vec<BrowseEntry> = rd
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                    .map(|e| BrowseEntry {
+                        name: e.file_name().to_string_lossy().into_owned(),
+                        path: format!("/{}", e.file_name().to_string_lossy()),
+                    })
+                    .collect();
+                es.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                (es, None)
+            }
+            Err(e) => (Vec::new(), Some(format!("read_dir failed: {e}"))),
+        };
+        BrowseResponse {
+            path: Some("/".to_string()),
+            parent: None,
+            roots: true,
+            entries,
+            error,
+        }
+    }
+}
+
+/// `GET /api/fs/browse` —— 目录浏览(批 I 段 2,首页/工作台目录选择器消费面)
+///
+/// 语义:
+/// - `path` 缺省 → 列文件系统根(Windows = 存在的盘符;POSIX = `/`),`roots=true`;
+/// - `path` 显式 → 必须绝对路径(相对 400),必须存在(404)且为目录(400),
+///   返回其**子目录**列表(只列目录,不触文件内容);
+/// - 目录读取失败(权限等)fail-soft:空表 + `error` 字段;
+/// - 路径返回形态统一 canonicalize + 去 verbatim(前端直接可用)。
+///
+/// 定位与文件面一致:人的 UI 操作(选工作区),UX 边界非安全边界——本端点
+/// 只暴露目录名与目录路径,不读任何文件内容;鉴权由路由层 G16 中间件统一
+/// 承担。不消费 `X-Evo-Workspace`(本端点的使命就是自由选工作区)。
+pub async fn browse_dirs(
+    Query(q): Query<BrowseQuery>,
+) -> Result<Json<BrowseResponse>, (StatusCode, String)> {
+    let raw = match q.path.as_deref() {
+        None | Some("") => return Ok(Json(list_roots())),
+        Some(p) => p.trim(),
+    };
+    let p = PathBuf::from(raw);
+    if !p.is_absolute() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("path must be an absolute directory, got: {raw}"),
+        ));
+    }
+    let canon = simplify_verbatim(
+        p.canonicalize()
+            .map_err(|_| (StatusCode::NOT_FOUND, format!("path does not exist: {raw}")))?,
+    );
+    if !canon.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("path is not a directory: {}", canon.display()),
+        ));
+    }
+    let parent = canon.parent().map(|pp| {
+        simplify_verbatim(pp.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    });
+    let (mut entries, error) = match std::fs::read_dir(&canon) {
+        Ok(rd) => {
+            let mut es: Vec<BrowseEntry> = rd
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| BrowseEntry {
+                    name: e.file_name().to_string_lossy().into_owned(),
+                    path: simplify_verbatim(canon.join(e.file_name()))
+                        .to_string_lossy()
+                        .into_owned(),
+                })
+                .collect();
+            es.sort_by_key(|a| a.name.to_lowercase());
+            (es, None)
+        }
+        Err(e) => (Vec::new(), Some(format!("read_dir failed: {e}"))),
+    };
+    entries.retain(|e| !e.name.starts_with('.'));
+    Ok(Json(BrowseResponse {
+        path: Some(canon.to_string_lossy().into_owned()),
+        parent,
+        roots: false,
+        entries,
+        error,
+    }))
 }
 
 /// `POST /api/files/create` —— 创建文件/目录(委托 file_create 实现,`writable_dir="."`)
@@ -1441,5 +1589,108 @@ mod tests {
             v.to_string().contains("inside.md"),
             "fallback listing must see workdir files, got: {v:?}"
         );
+    }
+
+    // =========================================================================
+    // 批 I 段 2:GET /api/fs/browse 目录浏览(选工作区目录选择器消费面)
+    // =========================================================================
+
+    /// path 缺省 = 根列表模式(Windows 盘符 / POSIX 根),entries 非空
+    #[tokio::test]
+    async fn test_browse_default_returns_roots() {
+        let v = browse_dirs(Query(BrowseQuery { path: None }))
+            .await
+            .expect("default browse should return root list");
+        assert!(v.roots, "default browse must be roots mode");
+        assert!(v.path.is_none(), "roots mode has no current path");
+        assert!(
+            !v.entries.is_empty(),
+            "root list must be non-empty on any CI runner"
+        );
+        assert!(v.parent.is_none(), "roots mode has no parent");
+    }
+
+    /// 显式目录:只列子目录(不列文件),path/parent 规整返回
+    #[tokio::test]
+    async fn test_browse_lists_dirs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = canon(dir.path());
+        std::fs::create_dir(dir_canon.join("sub")).unwrap();
+        std::fs::write(dir_canon.join("file.txt"), b"x").unwrap();
+        let v = browse_dirs(Query(BrowseQuery {
+            path: Some(dir_canon.to_string_lossy().into_owned()),
+        }))
+        .await
+        .expect("browse tempdir should succeed");
+        assert!(!v.roots);
+        assert_eq!(
+            v.path.as_deref(),
+            Some(
+                simplify_verbatim(dir_canon.clone())
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "current path must be canonicalized (verbatim-stripped)"
+        );
+        assert_eq!(
+            v.parent.as_deref(),
+            dir_canon
+                .parent()
+                .map(|p| simplify_verbatim(p.to_path_buf())
+                    .to_string_lossy()
+                    .into_owned())
+                .as_deref(),
+            "parent must be the canonical parent dir"
+        );
+        assert_eq!(v.entries.len(), 1, "only subdirs listed, files skipped");
+        assert_eq!(v.entries[0].name, "sub");
+        assert_eq!(
+            v.entries[0].path,
+            simplify_verbatim(dir_canon.join("sub"))
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
+
+    /// 相对路径拒绝(400)——浏览面同样只收绝对路径
+    #[tokio::test]
+    async fn test_browse_rejects_relative_path() {
+        let resp = browse_dirs(Query(BrowseQuery {
+            path: Some("relative/dir".to_string()),
+        }))
+        .await;
+        let (status, msg) = resp.expect_err("relative path must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            msg.contains("absolute"),
+            "error must say absolute, got: {msg}"
+        );
+    }
+
+    /// 不存在路径 404;指向文件(非目录)400
+    #[tokio::test]
+    async fn test_browse_missing_and_file_paths() {
+        let missing = browse_dirs(Query(BrowseQuery {
+            path: Some("Z:\\definitely-not-evo-browse\\nope".to_string()),
+        }))
+        .await;
+        #[cfg(not(windows))]
+        let missing = browse_dirs(Query(BrowseQuery {
+            path: Some("/definitely-not-evo-browse/nope".to_string()),
+        }))
+        .await;
+        let (status, _) = missing.expect_err("missing path must 404");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let not_dir = browse_dirs(Query(BrowseQuery {
+            path: Some(file.to_string_lossy().into_owned()),
+        }))
+        .await;
+        let (status, msg) = not_dir.expect_err("file path must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("not a directory"), "got: {msg}");
     }
 }
