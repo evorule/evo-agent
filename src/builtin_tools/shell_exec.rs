@@ -2066,18 +2066,35 @@ mod tests {
         assert!(!where_probe_found("evorule-nonexistent-xyz-42"));
 
         // miss + Unix 血统命令 → not found on PATH + Git for Windows 线索
+        // 取材动态化:runner 镜像可能把 Git usr\bin 带上 PATH(2026-10-22
+        // windows-latest 实证 where ls 命中),硬编码「ls 必 miss」随镜像漂移翻红
         let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
-        let msg = spawn_failure_message("ls", &not_found);
-        assert!(msg.contains("not found on PATH"), "got: {msg}");
-        assert!(msg.contains("Git for Windows"), "got: {msg}");
+        let heritage_miss = ["ls", "cat", "grep", "rg", "find"]
+            .into_iter()
+            .find(|c| !where_probe_found(c));
+        if let Some(c) = heritage_miss {
+            let msg = spawn_failure_message(c, &not_found);
+            assert!(msg.contains("not found on PATH"), "got: {msg}");
+            assert!(msg.contains("Git for Windows"), "got: {msg}");
+        }
+
         // miss + 非血统命令 → 仅实证结论,无线索
         let msg = spawn_failure_message("evorule-nonexistent-xyz-42", &not_found);
         assert!(msg.contains("not found on PATH"), "got: {msg}");
         assert!(!msg.contains("Git for Windows"), "got: {msg}");
 
-        // 探测说命中(findstr 系统必有)却 spawn NotFound(罕见形态)→ 保持原消息
+        // 探测说命中却 spawn NotFound(罕见形态)→ 保持原消息;命中件动态取材
+        // (findstr 系统必有保底;镜像漂移致其未命中时改取实证命中集首件)
         let _ = active_path_hits(); // 触发全集缓存
-        let msg = spawn_failure_message("findstr", &not_found);
+        let hit = if where_probe_found("findstr") {
+            "findstr"
+        } else {
+            *active_path_hits()
+                .iter()
+                .next()
+                .expect("at least one active command must exist on PATH")
+        };
+        let msg = spawn_failure_message(hit, &not_found);
         assert!(msg.contains("is it installed and in PATH?"), "got: {msg}");
 
         // 非 NotFound(权限等)→ 原消息,不猜测
