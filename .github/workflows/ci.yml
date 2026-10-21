@@ -44,12 +44,44 @@ jobs:
         run: cargo clippy --all-targets
 
   verify:
-    name: verify (${{ matrix.os }})
+    name: verify (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          # CI diagnosis (2026-10-21/22): ubuntu verify died 7x mid-step (~48-52
+          # min in, "lost communication"), including ON the ubuntu-24.04 pin
+          # WITH -j2 + debug=0 + fresh cache. Main-branch history shows ubuntu
+          # verify has NEVER been green on GitHub (30+ consecutive failures
+          # since the repo migration) -- and because a job must COMPLETE to
+          # save its rust-cache, every death re-arms a cold-cache spiral:
+          # slowest possible run, maximum exposure, death again.
+          #
+          # Decision (2026-10-22, approved): TEMPORARY load downgrade -- the
+          # ubuntu leg runs build + secret scan + dep contract only; the test
+          # surface (unit + doc tests) is carried by the windows leg, which
+          # has never missed (9-16 min). This unblocks the merge chain today.
+          # RESTORE ubuntu tests (flip `tests: true`) once the side diagnostic
+          # (phase-split full run) attributes the death to a concrete phase
+          # and a fix lands. Tracked as a registry TODO -- do not let this
+          # downgrade become permanent by omission.
+          - os: ubuntu-24.04
+            name: ubuntu-latest
+            tests: false
+          - os: windows-latest
+            name: windows-latest
+            tests: true
     runs-on: ${{ matrix.os }}
+    env:
+      # Resource guard: a full debug build of this repo produces ~9.4 GB
+      # of target artifacts, which sits right at the ubuntu runner disk
+      # ceiling -- two CI runs died mid-step (~50 min in, step never
+      # concluded, no log uploaded). Stripping debug info shrinks target
+      # output several-fold on both runners; windows stays well clear of
+      # its larger disk either way, and both platforms keep the same
+      # build shape.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -57,44 +89,52 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.os }}
+          # Cache-bust (2026-10-21): pre-mitigation runs cached ~9.4 GB of
+          # debug-full target artifacts; restoring them re-fills the disk
+          # even though new builds are slim (debug=0). Bump the key so a
+          # fresh slim cache is built from scratch.
+          key: ${{ matrix.os }}-slim1
 
       # 宪法 schema 校验组件以 git 依赖(rev 钉版)由 cargo 自动拉取,
       # 且 0.2.0 起 schema 编译期内嵌——运行时零磁盘依赖,无需检出宪法仓。
 
-      - name: verify.ps1 (build + test + secret scan + dep contract)
+      # Phase-split layout (2026-10-21): one verify.ps1 phase per step.
+      # Completed step logs survive a runner death; the resource echoes
+      # bracket each phase with disk/memory state. The linux-only -j2 cap
+      # is re-applied per step (job-level env would also cap windows).
+      - name: verify 1/5 build
         shell: pwsh
-        env:
-          # Resource guard: a full debug build of this repo produces ~9.4 GB
-          # of target artifacts, which sits right at the ubuntu runner disk
-          # ceiling -- two CI runs died mid-step (~50 min in, step never
-          # concluded, no log uploaded). Stripping debug info shrinks target
-          # output several-fold on both runners; windows stays well clear of
-          # its larger disk either way, and both platforms keep the same
-          # build shape.
-          CARGO_PROFILE_DEV_DEBUG: 0
-          CARGO_PROFILE_TEST_DEBUG: 0
         run: |
-          # CI diagnosis: ubuntu verify has died mid-step repeatedly (~48 min
-          # in, step never concluded, its log blob lost), so nothing post-hoc
-          # survives. While verify.ps1 runs, a background sampler echoes a
-          # disk/memory snapshot into the live log every 30 s, making resource
-          # exhaustion visible before the kill point. Linux only (deaths are
-          # ubuntu-only); the sampler is stopped when the step exits.
-          $probe = $null
-          if ($IsLinux) {
-            # Cap cargo compile parallelism on Linux: full-parallel rustc
-            # processes spike runner memory during the build+test loop, and
-            # the runner dies mid-step with no log surviving. Limiting to 2
-            # jobs trades compile time for a flat memory ceiling. Windows
-            # runners have more headroom and stay untouched.
-            $env:CARGO_BUILD_JOBS = '2'
-            $probe = Start-Process -FilePath 'bash' -ArgumentList '-c', 'while true; do echo "== PROBE $(date -u +%H:%M:%S)"; df -h /; free -m; sleep 30; done' -PassThru
-          }
-          ./verify.ps1
-          if ($null -ne $probe) { Stop-Process -Id $probe.Id -Force -ErrorAction SilentlyContinue }
+          if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
+          ./verify.ps1 -Phase build
+          if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
+
+      - name: verify 2/5 test-compile
+        if: matrix.tests
+        shell: pwsh
+        run: |
+          if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
+          ./verify.ps1 -Phase test-compile
+          if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
+
+      - name: verify 3/5 test-run
+        if: matrix.tests
+        shell: pwsh
+        run: |
+          if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
+          ./verify.ps1 -Phase test-run
+          if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
+
+      - name: verify 4/5 secret scan
+        shell: pwsh
+        run: ./verify.ps1 -Phase scan
+
+      - name: verify 5/5 dep contract
+        shell: pwsh
+        run: ./verify.ps1 -Phase contract
 
       - name: doc tests
+        if: matrix.tests
         run: cargo test --doc
 
   # ==========================================================================
