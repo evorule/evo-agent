@@ -56,12 +56,17 @@ if (Test-Phase 'test-run') {
     # CI log carries only the summary line (2026-09-25 lesson: ubuntu had two red
     # tests with zero details in the log; local WSL repro was the only option).
     # $ErrorActionPreference is Continue at the top, so 2>&1 will not abort.
+    # Tee mode (2026-10-22 diagnostic): stream every line to the step log as
+    # it arrives -- if cargo test hangs, the LAST log line names the stuck
+    # test. The full stream is still kept in memory for the failure-detail
+    # tail below (buffered-only output was the blind spot that hid the hang).
+    $testLog = New-Object System.Collections.Generic.List[string]
     if ($isWin) {
-        $testLog = cargo test 2>&1 | ForEach-Object { "$_" }
+        cargo test 2>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $testLog.Add($l) }
     } else {
-        # Exit code 124 = timeout fired: the buffered log still carries every
-        # test line printed before the hang, which pinpoints the stuck test.
-        $testLog = timeout --kill-after=30 2100 cargo test 2>&1 | ForEach-Object { "$_" }
+        # Exit code 124 = timeout fired (35 min < the ~48 min runner death):
+        # the streamed log already carries every test line before the hang.
+        timeout --kill-after=30 2100 cargo test 2>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $testLog.Add($l) }
         if ($LASTEXITCODE -eq 124) { Write-Host "TIMEOUT: cargo test after 35 min" }
     }
     $testLog | Select-String -Pattern "^test result"
