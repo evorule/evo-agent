@@ -797,6 +797,12 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/fs/browse",
             axum::routing::get(crate::api::file_api::browse_dirs),
         )
+        // 公告列表(批 J1 段 1,主页公告卡消费):读 data/notices/notices.json,
+        // fail-soft;鉴权同文件面(G16 中间件覆盖);不消费 X-Evo-Workspace(全局面)
+        .route(
+            "/api/notices",
+            axum::routing::get(crate::api::notices_api::list_notices),
+        )
         .route(
             "/api/files/read",
             axum::routing::get(crate::api::file_api::read_file),
