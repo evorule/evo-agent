@@ -884,7 +884,7 @@ pub fn resolve_target_scope(
     args: &Value,
     boundary: Option<&crate::agent::definition::CapabilityBoundary>,
 ) -> Option<&'static str> {
-    if tool_name != "file_read" && tool_name != "file_write" {
+    if tool_name != "file_read" && tool_name != "file_write" && tool_name != "edit_file" {
         return None;
     }
     let raw = args.get("path").and_then(|v| v.as_str())?;
@@ -969,9 +969,10 @@ pub fn resolve_tool_intent(
     }
     let mut intent = serde_json::json!({ "tool_name": tool_name });
     let path_fields: &[&str] = match tool_name {
-        // file_write：D1 兑现——升 P2 哨兵后意图信号经 resolve_tool_intent
-        // 采集（与 M5-c R1 的 pending_target_scope 通道并存互不干扰）
-        "file_create" | "file_delete" | "file_write" => &["path"],
+        // file_write / edit_file：D1 兑现——升 P2 哨兵后意图信号经
+        // resolve_tool_intent 采集（与 M5-c R1 的 pending_target_scope
+        // 通道并存互不干扰）；edit_file 同族（批K 段1，path 字段快筛）
+        "file_create" | "file_delete" | "file_write" | "edit_file" => &["path"],
         "file_move" => &["path", "target_dir"],
         _ => &[],
     };

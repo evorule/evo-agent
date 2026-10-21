@@ -768,8 +768,8 @@ pub fn effective_capability_boundary_with_read_root(
 /// - 读面(file_read/file_list/search_files/grep_files)绑「生效读域」
 ///   (声明 read_root 在场且异于写域时绑读根,否则绑 sandbox_root——
 ///   B 批「读宽写窄」)
-/// - 写面(file_write/file_create/file_move/file_delete)在 `read_write`
-///   模式下按 `sandbox_root` 全域可写(writable_dir = ".")
+/// - 写面(file_write/edit_file/file_create/file_move/file_delete)在
+///   `read_write` 模式下按 `sandbox_root` 全域可写(writable_dir = ".")
 ///
 /// 声明合法性(模式/工具一致性)由 `AgentDefinition::validate` 门卫先行保证。
 pub fn apply_capability_boundary(
@@ -820,6 +820,17 @@ pub fn apply_capability_boundary(
                 "file_write",
                 std::sync::Arc::new(
                     crate::builtin_tools::file_write::FileWriteTool::new(root.clone())
+                        .with_writable_dir("."),
+                ),
+            );
+        }
+        // 批K 段1:写面第五件随族重绑(C 批全族重绑纪律——仅绑启动期根=
+        // 会话级逃逸教训),read_write 模式下全 sandbox_root 可写
+        if has("edit_file") {
+            handler.register_static(
+                "edit_file",
+                std::sync::Arc::new(
+                    crate::builtin_tools::edit_file::FileEditTool::new(root.clone())
                         .with_writable_dir("."),
                 ),
             );

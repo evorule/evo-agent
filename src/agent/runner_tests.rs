@@ -3700,16 +3700,19 @@ fn p2_adjudication_table_matches_design() {
     // O-487② 记忆墓碑批(2026-10-17):memory_tombstone 落地 Sensitive
     // (双闸同 session_spawn——null 墓碑写面意图必报+人工默认否决点;默认关,
     // 显式启用才可达),集合演进 28→29(数量锁 94,新增条目已 diff 审)。
+    // 批K 段1(2026-10-21):edit_file 落地 Sentineled(file_write 同族写面
+    // 精准编辑),集合演进 29→30(数量锁 95,新增条目已 diff 审)。
     let p2_count = crate::agent::tool_manifest::static_manifests()
         .iter()
         .filter(|m| m.is_p2_adjudicated())
         .count();
-    assert_eq!(p2_count, 29);
+    assert_eq!(p2_count, 30);
     for t in [
         "file_create",
         "file_move",
         "file_delete",
         "file_write",
+        "edit_file",
         "git_stage",
         "git_commit",
         "rule_activate",

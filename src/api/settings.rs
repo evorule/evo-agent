@@ -199,6 +199,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.editFile",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 精准编辑已有文件（edit_file，锚串替换+唯一性闸，UTF-8/CRLF 保真；沙箱与审计同 file_write 写面，随开随用）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.fileMove",
             kind: SettingType::Boolean,
             default: json!(false),
@@ -917,13 +927,14 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 49); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone)
+        assert_eq!(settings.len(), 50); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
         assert_eq!(settings["keybindings.overrides"], json!([]));
-        // agentTools.* 开关键:出厂默认(fileCreate/grep/gitRead 开 / fileMove、fileDelete、gitWrite 关)
+        // agentTools.* 开关键:出厂默认(fileCreate/editFile/grep/gitRead 开 / fileMove、fileDelete、gitWrite 关)
         assert_eq!(settings["agentTools.fileCreate"], json!(true));
+        assert_eq!(settings["agentTools.editFile"], json!(true));
         assert_eq!(settings["agentTools.fileMove"], json!(false));
         assert_eq!(settings["agentTools.fileDelete"], json!(false));
         assert_eq!(settings["agentTools.grep"], json!(true));

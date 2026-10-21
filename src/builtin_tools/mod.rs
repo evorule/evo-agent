@@ -46,6 +46,7 @@
 
 pub mod accounting;
 pub mod delegate_tool;
+pub mod edit_file;
 pub mod exfil_scan;
 pub mod file_create;
 pub mod file_delete;
@@ -138,6 +139,12 @@ pub fn default_safe_toolkit_with_profile(
     handler.register_static(
         "file_write",
         Arc::new(file_write::FileWriteTool::new(workdir_buf.clone())),
+    );
+    // 写面第五件(批K 段1):精准编辑,沙箱/白名单/保真细节见 edit_file.rs;
+    // 治理同 file_write(Sentineled+AutoPolicy),开关 agentTools.editFile 默认开
+    handler.register_static(
+        "edit_file",
+        Arc::new(edit_file::FileEditTool::new(workdir_buf.clone())),
     );
     handler.register_static(
         "file_create",
@@ -341,6 +348,48 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     name: "create_parents".to_string(),
                     r#type: "boolean".to_string(),
                     description: "Set true to auto-create parent directories (default: false)".to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "edit_file".to_string(),
+            description: "Make a precise in-place edit to an EXISTING file by replacing \
+                          an exact anchor string — much safer and cheaper than rewriting \
+                          the whole file. The anchor (old_string) must match exactly once \
+                          unless replace_all=true. Only UTF-8 files are accepted; line \
+                          endings (CRLF/LF) and BOM are preserved as-is. Path is relative \
+                          to the writable subdir; the file must already exist. Returns a \
+                          context preview around the change."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "path".to_string(),
+                    r#type: "string".to_string(),
+                    description: "File path, relative to writable_dir (e.g. \"workspace/notes.md\")".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "old_string".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Exact text to replace (non-empty). Must be unique in the \
+                                  file unless replace_all=true; copy it from file_read/grep_files \
+                                  output to be exact."
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "new_string".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Replacement text (may be empty to delete the anchor)".to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "replace_all".to_string(),
+                    r#type: "boolean".to_string(),
+                    description: "Set true to replace every occurrence (default: false; \
+                                  non-unique anchor without it is rejected with the hit count)"
+                        .to_string(),
                     required: false,
                 },
             ],

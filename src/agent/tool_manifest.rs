@@ -361,6 +361,12 @@ const SWITCH_AUDIT_QUERY: &str = AGENT_TOOLS_AUDIT_QUERY;
 pub const AGENT_TOOLS_MEMORY_TOMBSTONE: &str = "agentTools.memory_tombstone";
 const SWITCH_MEMORY_TOMBSTONE: &str = AGENT_TOOLS_MEMORY_TOMBSTONE;
 
+/// agentTools.editFile（默认开；写面精准编辑工具——file_write 同族治理）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_EDIT_FILE: &str = "agentTools.editFile";
+const SWITCH_EDIT_FILE: &str = AGENT_TOOLS_EDIT_FILE;
+
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
     Some(SwitchBinding {
@@ -384,7 +390,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（28 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（29 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -396,6 +402,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         b("image_load", vec![FsRead]),
         b("file_list", vec![FsRead]),
         b("file_write", vec![FsWrite]),
+        // 批K 段1:写面第五件——精准编辑(old/new 串替换+唯一性闸+保真细节),
+        // 治理同 file_write(Sentineled+AutoPolicy,见下方分级段)
+        b("edit_file", vec![FsWrite]),
         b("file_create", vec![FsWrite]),
         b("file_move", vec![FsWrite]),
         b("file_delete", vec![FsWrite]),
@@ -466,10 +475,12 @@ fn builtin_manifests() -> Vec<ToolManifest> {
                 m.adjudication_class = AdjudicationClass::Sentineled;
                 m.approval_policy = ApprovalPolicy::ManualDefault;
             }
-            // file_write：D1 兑现——规则正本第 4 条 enforce（out_of_sandbox）
-            // 在场，升 Sentineled；审批面不动（写面高频工具维持既有审批策略，
-            // 由 handler 内联沙箱检查 + 规则层 enforce 双层把守）
-            "file_write" => {
+            // file_write / edit_file：D1 兑现——规则正本第 4 条 enforce
+            // （out_of_sandbox）在场，升 Sentineled；审批面不动（写面高频
+            // 工具维持既有审批策略，由 handler 内联沙箱检查 + 规则层
+            // enforce 双层把守）。edit_file 同族：写面精准编辑（批K 段1），
+            // 意图信号经 resolve_tool_intent 采集（path 字段快筛同族）
+            "file_write" | "edit_file" => {
                 m.adjudication_class = AdjudicationClass::Sentineled;
             }
             // git 写族：P2 裁决在通道；D1 建议上 enforce（PR-5 规则正本入库时
@@ -512,6 +523,8 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // agentTools.* 开关绑定（原 TOOL_SWITCH_KEYS 内置段，快照测试锁等价）
         m.default_switch = match m.name.as_str() {
             "file_create" => sw(SWITCH_FILE_CREATE, true),
+            // 批K 段1:写面精准编辑,默认开(低风险高频,同 fileCreate 先例)
+            "edit_file" => sw(SWITCH_EDIT_FILE, true),
             "file_move" => sw(SWITCH_FILE_MOVE, false),
             "file_delete" => sw(SWITCH_FILE_DELETE, false),
             "grep_files" => sw(SWITCH_GREP, true),
@@ -852,9 +865,10 @@ mod tests {
         //   （B22 审计查询 audit_query +1：内置 25→26，数量锁 91→92）
         //   （B1 多模态上行 image_load +1：内置 26→27，数量锁 92→93）
         //   （O-487② 记忆墓碑 memory_tombstone +1：内置 27→28，数量锁 93→94）
-        assert_eq!(builtin_manifests().len(), 28);
+        //   （批K 段1 精准编辑 edit_file +1：内置 28→29，数量锁 94→95）
+        assert_eq!(builtin_manifests().len(), 29);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 94);
+        assert_eq!(all().len(), 95);
     }
 
     #[test]
@@ -972,11 +986,14 @@ mod tests {
     /// 判定事实治理登记批 verdict_submit +1 → 28 条；O-487② 记忆墓碑
     /// memory_tombstone 落地 Sensitive（双闸同 session_spawn），演进为 29 条
     /// （默认关——开关不在场不进 LLM 契约，裁决集仍含，防绕道）。
+    /// 批K 段1 edit_file 落地 Sentineled（file_write 同族写面）→ 30 条
+    /// （快照重录 diff 审）。
     const GOVERNANCE_SNAPSHOT: &[&str] = &[
         "file_create",
         "file_move",
         "file_delete",
         "file_write",
+        "edit_file",
         "git_stage",
         "git_commit",
         "rule_create",
@@ -1045,13 +1062,21 @@ mod tests {
         sentineled.sort_unstable();
         assert_eq!(
             sentineled,
-            vec!["file_create", "file_delete", "file_move", "file_write"]
+            vec![
+                "edit_file",
+                "file_create",
+                "file_delete",
+                "file_move",
+                "file_write"
+            ]
         );
     }
 
-    /// 原 TOOL_SWITCH_KEYS 30 条快照（tool, key, default_on）
+    /// 原 TOOL_SWITCH_KEYS 30 条快照（tool, key, default_on）；批K 段1
+    /// edit_file 接入 → 31 条
     const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
         ("file_create", "agentTools.fileCreate", true),
+        ("edit_file", "agentTools.editFile", true),
         ("file_move", "agentTools.fileMove", false),
         ("file_delete", "agentTools.fileDelete", false),
         ("grep_files", "agentTools.grep", true),
