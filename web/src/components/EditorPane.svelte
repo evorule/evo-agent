@@ -36,6 +36,7 @@
     WORKSPACE_SETTINGS_URI,
     cursorPos,
     publishCursor,
+    homeRequested,
   } from '../lib/stores.js';
   import {
     settingsState,
@@ -665,6 +666,13 @@
       renderActive(p);
       maybeConsumeReveal();
     });
+    // 活动栏「evo-agent 工作台」入口:信号驱动切回首页(不清已开 tab)
+    let homeReqSeen = 0;
+    const unsubHomeReq = homeRequested.subscribe((n) => {
+      if (n === homeReqSeen) return;
+      homeReqSeen = n;
+      goHome();
+    });
     const unsubReveal = pendingReveal.subscribe(() => maybeConsumeReveal());
     // git diff 打开信号(B3):消费即清 → 打开 git-diff 虚拟 tab
     const unsubGitDiff = pendingGitDiff.subscribe((p) => {
@@ -758,6 +766,7 @@
       unregisterCommand('editor.action.toggleDiff');
       disposeDiagnostics();
       if (unsubActive) unsubActive();
+      unsubHomeReq();
       unsubReveal();
       unsubGitDiff();
       unsubRename();

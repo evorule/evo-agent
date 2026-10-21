@@ -2,12 +2,13 @@
 <!-- Copyright (C) 2026 EvoRule Project -->
 <!-- 活动栏(Trae 最左列):资源管理器/搜索(B2)/源代码管理(B3)/设置入口;后续阶段逐项点亮 -->
 <script>
-  import { sidebarView } from '../lib/stores.js';
+  import { sidebarView, homeRequested } from '../lib/stores.js';
 
   /** 条目点击外发(设置等非视图切换入口的宿主接线;App.svelte 按 id 分发) */
   export let onitemclick = null;
 
   const items = [
+    { id: 'home', label: 'evo-agent 工作台(首页)', enabled: true },
     { id: 'explorer', label: '资源管理器', enabled: true },
     { id: 'search', label: '搜索', enabled: true },
     { id: 'scm', label: '源代码管理', enabled: true },
@@ -24,6 +25,13 @@
 
   function click(it) {
     if (!it.enabled) return;
+    if (it.id === 'home') {
+      // 首页是内容区视图而非侧面板:发信号给 EditorPane(切回首页,不清 tab),
+      // 侧面板高亮态保持不变;自身不参与 active 高亮。
+      homeRequested.update((n) => n + 1);
+      if (onitemclick) onitemclick(it.id);
+      return;
+    }
     if (it.id === 'settings') {
       settingsPinned = true;
       if (onitemclick) onitemclick(it.id);
@@ -44,7 +52,12 @@
       disabled={!it.enabled}
       onclick={() => click(it)}
     >
-      {#if it.id === 'explorer'}
+      {#if it.id === 'home'}
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M4 11.5 12 4l8 7.5" />
+          <path d="M6 10v10h4.5v-5h3v5H18V10" />
+        </svg>
+      {:else if it.id === 'explorer'}
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
           <path d="M4 5a1 1 0 0 1 1-1h5l2 2h7a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5Z" />
         </svg>
