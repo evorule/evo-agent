@@ -18,7 +18,7 @@
     openSettingsTab,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
-  import { approveProposal, answerQuestion, listResumableRuns, getOrchestrationLinks, uploadFile, getLlmModels, setLlmModel } from '../lib/api.js';
+  import { approveProposal, answerQuestion, listResumableRuns, getOrchestrationLinks, uploadFile, getLlmModels, setLlmModel, listSkills } from '../lib/api.js';
   import { settingsState, setSetting } from '../lib/settings.js';
   import {
     APPROVAL_MODE_KEY,
@@ -332,6 +332,56 @@
     approvalFullConfirm = false;
   }
 
+  // ---- 技能选择器(对标 Trae 会话框技能入口;evorule 治理语义) ----
+  // 仅列 active 态(GET /api/skills 服务端权威清单;discovered 须经扩展面板
+  // 人工审批,导入≠生效——供应链闸口不因 UI 入口而旁路)。点选=激活,随
+  // 下一条消息以 wire-only 技能块装配(服务端技能文件,agent 以文件工具
+  // 读取 SKILL.md 并遵循),再点同项=停用;零协议改动,形态与 modeHint 同构。
+  let skillMenuOpen = $state(false);
+  let skillPickEl = $state(null);
+  let skillList = $state([]);
+  let skillLoaded = $state(false);
+  let skillBusy = $state(false);
+  let skillErr = $state('');
+  let skillPendingCount = $state(0);
+  let selectedSkill = $state(null); // {name, path, description}
+
+  async function loadSkills() {
+    if (skillBusy) return;
+    skillBusy = true;
+    skillErr = '';
+    try {
+      const all = await listSkills();
+      skillList = all.filter((s) => s.status === 'active');
+      skillPendingCount = all.filter((s) => s.status === 'discovered').length;
+      skillLoaded = true;
+      // 已选技能被撤销时静默清除(下一条消息不再装配)
+      if (selectedSkill && !skillList.some((s) => s.name === selectedSkill.name)) {
+        selectedSkill = null;
+      }
+    } catch (e) {
+      skillErr = String(e?.message || e);
+    } finally {
+      skillBusy = false;
+    }
+  }
+
+  function toggleSkillMenu() {
+    skillMenuOpen = !skillMenuOpen;
+    if (skillMenuOpen) loadSkills();
+  }
+
+  function pickSkill(s) {
+    selectedSkill = selectedSkill?.name === s.name ? null : s;
+    skillMenuOpen = false;
+  }
+
+  function onDocClickCloseSkillMenu(e) {
+    if (!skillMenuOpen) return;
+    if (skillPickEl?.contains(e.target)) return;
+    skillMenuOpen = false;
+  }
+
   onMount(() => {
     draft = localStorage.getItem(DRAFT_KEY) || '';
     try {
@@ -362,6 +412,7 @@
     refreshModels();
     document.addEventListener('click', onDocClickCloseModelMenu);
     document.addEventListener('click', onDocClickCloseApprovalMenu);
+    document.addEventListener('click', onDocClickCloseSkillMenu);
     window.addEventListener('evo:reconnected', onReconnected);
     // 心跳停滞提示的秒级心跳(纯客户端:turn 活跃且久无引擎事件→琥珀提示;
     // serve 侧心跳 2 窗中止,此处为其可见前兆)
@@ -375,6 +426,7 @@
     if (stallTicker) clearInterval(stallTicker);
     document.removeEventListener('click', onDocClickCloseModelMenu);
     document.removeEventListener('click', onDocClickCloseApprovalMenu);
+    document.removeEventListener('click', onDocClickCloseSkillMenu);
     window.removeEventListener('evo:reconnected', onReconnected);
   });
 
@@ -646,7 +698,7 @@
     composerMentions.set([]);
     const okAtts = attachments.filter((a) => a.path);
     attachments = attachments.filter((a) => !a.path);
-    sendMessage(text, kept, { mode: chatMode, attachments: okAtts });
+    sendMessage(text, kept, { mode: chatMode, attachments: okAtts, skill: selectedSkill });
   }
 
   function onKeydown(e) {
@@ -1102,6 +1154,55 @@
           >
             对话
           </button>
+        </div>
+        <div class="model-pick" bind:this={skillPickEl}>
+          <button
+            class="tb-btn model-btn"
+            class:active={skillMenuOpen || selectedSkill}
+            onclick={toggleSkillMenu}
+            disabled={$turnActive}
+            title="技能(active 技能选用;随下一条消息生效;发现/审批在扩展面板)"
+          >
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <path
+                d="M9 1.5 3.5 9H8l-1 5.5L12.5 7H8Z"
+                stroke="currentColor"
+                stroke-width="1.3"
+                fill="none"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span class="model-name">{selectedSkill ? selectedSkill.name : '技能'}</span>
+          </button>
+          {#if skillMenuOpen}
+            <div class="model-menu" role="listbox" aria-label="技能">
+              {#if skillErr}<div class="model-menu-note err">{skillErr}</div>{/if}
+              {#if skillBusy && !skillLoaded}
+                <div class="model-menu-note">技能清单加载中…</div>
+              {:else if skillList.length === 0}
+                <div class="model-menu-note">暂无生效技能 — 扩展面板导入并审批后可选</div>
+              {:else}
+                {#each skillList as s (s.name)}
+                  <button
+                    class="model-item"
+                    class:active={selectedSkill?.name === s.name}
+                    role="option"
+                    aria-selected={selectedSkill?.name === s.name}
+                    title={s.description}
+                    onclick={() => pickSkill(s)}
+                    disabled={skillBusy}
+                  >
+                    <span class="mono">{s.name}</span>
+                    {#if selectedSkill?.name === s.name}<span class="model-check">✓</span>{/if}
+                  </button>
+                {/each}
+              {/if}
+              {#if skillPendingCount > 0}
+                <div class="model-menu-note">待审技能 {skillPendingCount} 项(扩展面板处理)</div>
+              {/if}
+              <div class="ap-note">技能随下一条消息生效;再点已选项即停用;审批/撤销在扩展面板</div>
+            </div>
+          {/if}
         </div>
         <div class="model-pick" bind:this={modelPickEl}>
           <button
