@@ -79,7 +79,7 @@ export function createTerminalSession(container, forcedId) {
     fontSize,
     scrollback,
     theme: terminalTheme,
-    fontFamily: '"JetBrains Mono", Consolas, monospace',
+    fontFamily: '"JetBrains Mono", Consolas, "Microsoft YaHei", monospace',
     cursorBlink: true,
     allowProposedApi: true,
   });

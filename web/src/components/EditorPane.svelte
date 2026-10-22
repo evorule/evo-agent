@@ -376,7 +376,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
         minimap: o.minimap,
         wordWrap: o.wordWrap,
         automaticLayout: true,
-        fontFamily: '"JetBrains Mono", Consolas, monospace',
+        fontFamily: '"JetBrains Mono", Consolas, "Microsoft YaHei", monospace',
         lineHeight: 22,
         renderLineHighlight: 'none',
         scrollBeyondLastLine: false,
@@ -549,7 +549,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
       wordWrap: o.wordWrap,
       readOnly: false,
       automaticLayout: true,
-      fontFamily: '"JetBrains Mono", Consolas, monospace',
+      fontFamily: '"JetBrains Mono", Consolas, "Microsoft YaHei", monospace',
       lineHeight: 22,
       lineNumbers: 'on',
       renderLineHighlight: 'none',
@@ -1016,7 +1016,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
     background: var(--bg-active);
     padding: 1px 5px;
     border-radius: 3px;
-    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-family: 'JetBrains Mono', Consolas, 'Microsoft YaHei', monospace;
     font-size: 12px;
   }
   .md-preview :global(pre) {
