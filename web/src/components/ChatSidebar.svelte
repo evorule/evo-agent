@@ -42,6 +42,14 @@
     activeTerminalRef,
     problemsTotal,
   } from '../lib/mentionSources.js';
+  import AuditBadge from './AuditBadge.svelte';
+  import AuditCard from './AuditCard.svelte';
+  import { auditState, badgeStatus, mapAssistantToFacts } from '../lib/audit.js';
+
+  // audit-one-click:assistant 终稿消息 ↔ IoResponse entries 顺序对齐(M1b);
+  // 会话级审计状态由 ws.js initAuditWatcher 拉取,此处只做派生与徽章挂载。
+  const auditBadgeMap = $derived(mapAssistantToFacts($messages, $auditState));
+  let auditCardEntry = $state(null); // 报告卡当前条目(null=关)
 
   // Svelte 5:组件用了 $effect 等 rune 即进入 runes 模式,
   // 顶层状态必须 $state() 声明,普通 let 不具备响应性(历史面板/发送按钮会失效)
@@ -937,6 +945,13 @@
           <div class="bubble assistant-bubble">
             {m.text}<span class="cursor" class:on={m.streaming}></span>
           </div>
+          <span class="audit-chip">
+            <AuditBadge
+              status={badgeStatus($auditState, auditBadgeMap.has(m.id))}
+              clickable={auditBadgeMap.has(m.id) && $auditState?.verified === true}
+              onclick={() => (auditCardEntry = auditBadgeMap.get(m.id))}
+            />
+          </span>
         </div>
       {:else if m.kind === 'tool'}
         <div class="tool-card" class:running={m.running}>
@@ -1056,6 +1071,16 @@
         </div>
       {/if}
     {/each}
+
+    {#if auditCardEntry}
+      <AuditCard
+        entry={auditCardEntry}
+        sid={$sessionId}
+        verified={$auditState?.verified ?? null}
+        factCount={$auditState?.factCount ?? null}
+        onclose={() => (auditCardEntry = null)}
+      />
+    {/if}
   </div>
 
   <div class="composer">
@@ -1548,6 +1573,11 @@
   .row {
     display: flex;
     justify-content: flex-start;
+  }
+  .audit-chip {
+    align-self: flex-end;
+    margin-bottom: 4px;
+    display: inline-flex;
   }
   .row.user {
     justify-content: flex-end;

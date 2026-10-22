@@ -34,6 +34,11 @@ import { getTranscript } from './api.js';
 import { assembleContext } from './mentions.js';
 import { looksLikeDeadSession, buildRebuildBlock, lastUserTextOf } from './sessionRebuild.js';
 import { push as pushNotification } from './notifications.js';
+import { initAuditWatcher } from './audit.js';
+
+// audit-one-click:会话创建/打开/切换即触发审计报告轻量拉取(徽章数据源);
+// 成功/失败经 pushPanelEvent('gov') 留痕进审计 tab 事件流。
+initAuditWatcher(sessionId, (e) => pushPanelEvent('gov', e));
 
 let ws = null;
 let streamMsgId = null; // 当前轮流式 assistant 气泡
