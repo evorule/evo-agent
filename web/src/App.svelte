@@ -150,9 +150,9 @@
   }
 
   /** 活动栏点击(Trae 语义):侧面板视图点在已激活项=收起侧栏,再点=展开;
-   *  点其他视图=切换并保证可见。home/audit 是内容区入口;设置入口在顶栏齿轮钮。 */
+   *  home 是内容区入口;设置在菜单行、console 面板入口在顶栏工作台钮。 */
   function handleActivityItem(id) {
-    if (id === 'home' || id === 'audit') return;
+    if (id === 'home') return;
     if (get(sidebarView) === id && get(explorerVisible)) {
       explorerVisible.set(false);
     } else {
