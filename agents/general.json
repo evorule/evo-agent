@@ -69,6 +69,10 @@
     {
       "name": "evorule-deliverable",
       "path": "skills/evorule-deliverable/SKILL.md"
+    },
+    {
+      "name": "evorule-deep-research",
+      "path": "skills/evorule-deep-research/SKILL.md"
     }
   ],
   "memory": {

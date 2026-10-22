@@ -1,0 +1,30 @@
+{
+  "workflow_id": "deep-research",
+  "description": "深度研究编排预制（web_search 定向 → browser_* 抓取 → 聚合 → 可复算交付物导出；零新原语，全链既有工具）",
+  "nodes": [
+    {
+      "id": "search",
+      "agent_type": "general",
+      "task": "深度研究编排·检索粒：围绕研究主题〈在此填入主题〉，先用 web_search 做多角度检索（中英文各至少两轮，提炼关键词再检索一轮），输出：①主题要点清单 ②值得定向抓取的网页 URL 清单（3-8 条，附各自要抓什么）。只检索不抓取。"
+    },
+    {
+      "id": "browse",
+      "agent_type": "general",
+      "task_template": "深度研究编排·抓取粒：按下述检索结果，用 browser_* 工具族定向抓取（browser_launch → browser_navigate → browser_get_text/browser_evaluate，逐页抓正文要点；页面失败如实记跳过并留痕，不编造内容）：\n{search}",
+      "depends_on": ["search"]
+    },
+    {
+      "id": "synthesize",
+      "agent_type": "general",
+      "task_template": "深度研究编排·聚合粒：综合以下检索与抓取结果，产出研究纪要（要点/分歧/证据缺口/来源清单；来源必须逐条给 URL；查证的数字标注来自哪个页面，查证不了的显式标注'未核实'）：\n检索：\n{search}\n\n抓取：\n{browse}",
+      "depends_on": ["search", "browse"]
+    },
+    {
+      "id": "deliver",
+      "agent_type": "general",
+      "task_template": "深度研究编排·交付粒：按 evorule-deliverable 技能纪律，把研究纪要产出为 docx 报告（export_document_docx：标题/段落/来源表格；文中任何数字若经你方核算，先调确定性服务再入文并进 provenance；来源 URL 入表格不需要 provenance）。完成后回报文件绝对路径、字节数、blake3：\n{synthesize}",
+      "depends_on": ["synthesize"]
+    }
+  ],
+  "output_node": "deliver"
+}

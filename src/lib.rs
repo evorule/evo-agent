@@ -45,6 +45,7 @@ pub mod mcp;
 pub mod pty;
 #[doc(hidden)]
 pub mod rule_tools;
+pub mod schedule;
 #[doc(hidden)]
 pub mod service_tools;
 pub mod tasks;

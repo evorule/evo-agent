@@ -158,11 +158,40 @@ impl ToolFunction for McpToolAdapter {
         let structured =
             structured.map_err(|e| format!("MCP tool '{}' failed: {}", self.tool_name, e))?;
 
-        // 结果上限:>100KB 截断+提示——LLM 上下文保护,原始
-        // 字节数留痕;按 UTF-8 字符边界回退避免截断撕裂多字节字符
+        // 结果上限:>100KB 截断+提示——LLM 上下文保护,原始字节数留痕;
+        // 按 UTF-8 字符边界回退避免截断撕裂多字节字符
         // (G3:截断只作用 text 部分;图片不走文本截断,由 runner 侧 B1
         // 预算校验统一管——单图/单结果上限,超限丢弃计数 images_omitted)
         let mut text = structured.text;
+
+        // 2025-06-18 additive 面：structuredContent/内嵌文本资源拼入模型可见文本
+        // （旧版本 server 三者皆空 → 拼接零字节，存量语义逐字节不变）。
+        // 链接只列 uri 不自动展开——取数由模型按需决策（防上下文自膨胀）。
+        if let Some(sv) = &structured.structured {
+            text.push_str("
+
+[structured]
+");
+            text.push_str(&sv.to_string());
+        }
+        for rt in &structured.resource_texts {
+            text.push_str(&format!("
+
+[resource {}]
+{}", rt.uri, rt.text));
+        }
+        if !structured.resource_links.is_empty() {
+            text.push_str(&format!(
+                "
+
+[resource_links]
+{}",
+                structured.resource_links.join("
+")
+            ));
+        }
+
+        // 单次合并截断（text+新面合计过限才截；提示文案保持存量口径）
         if text.len() > MAX_RESULT_BYTES {
             let original = text.len();
             let mut cut = MAX_RESULT_BYTES;
@@ -171,8 +200,9 @@ impl ToolFunction for McpToolAdapter {
             }
             text.truncate(cut);
             text.push_str(&format!(
-                "\n\n[truncated: original result was {original} bytes, \
-                 showing first {cut} bytes (MCP tool result limit 100KB)]"
+                "
+
+[truncated: original result was {original} bytes,                  showing first {cut} bytes (MCP tool result limit 100KB)]"
             ));
         }
 

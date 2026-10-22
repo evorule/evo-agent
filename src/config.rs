@@ -561,6 +561,9 @@ pub struct Config {
     #[serde(default)]
     /// 工作台附加配置(console 审计页自动拉起等,纯展示层)
     pub workbench: WorkbenchConfig,
+    #[serde(default)]
+    /// 定时自治调度(纯确定性组件;触发后执行照常走既有管道与治理)
+    pub schedule: crate::schedule::ScheduleConfig,
     /// LLM API key 的来源记录(脱敏状态端点用;不携带任何密钥内容)
     ///
     /// 取值:`Some(环境变量名)`(如 `MINIMAX_API_KEY` / `EVO_AGENT_LLM__API_KEY`)
@@ -754,6 +757,21 @@ impl Config {
             merge_field(table, "console_port", &mut self.workbench.console_port)?;
         }
 
+        if let Some(table) = value.get("schedule").and_then(|v| v.as_table()) {
+            merge_field(table, "tick_secs", &mut self.schedule.tick_secs)?;
+            merge_field(table, "journal", &mut self.schedule.journal)?;
+            if let Some(jobs) = table.get("jobs") {
+                let parsed: Vec<crate::schedule::ScheduleJob> = jobs
+                    .clone()
+                    .try_into()
+                    .map_err(|e| ConfigError::InvalidValue {
+                        field: "schedule.jobs".into(),
+                        reason: format!("{e}"),
+                    })?;
+                self.schedule.jobs = parsed;
+            }
+        }
+
         Ok(())
     }
 
@@ -873,6 +891,10 @@ impl Config {
 
     /// 验证配置值的合法性
     fn validate(&self) -> Result<(), ConfigError> {
+        self.schedule.validate().map_err(|e| ConfigError::InvalidValue {
+            field: "schedule".into(),
+            reason: e,
+        })?;
         // provider 为展示预留字段:未知值仅警告不拒绝(实际请求端点由
         // api_base/model 决定,旧配置文件里的自定义值装载不受影响)
         match self.llm.provider.as_str() {
@@ -953,6 +975,10 @@ impl Config {
     /// 解析(严格模式 fail-closed)。仍然验证 base_url/logging 等非
     /// LLM 字段
     fn validate_lenient(&self) -> Result<(), ConfigError> {
+        self.schedule.validate().map_err(|e| ConfigError::InvalidValue {
+            field: "schedule".into(),
+            reason: e,
+        })?;
         // provider 为展示预留字段:未知值仅警告不拒绝(同严格模式口径)
         match self.llm.provider.as_str() {
             "minimax" | "deepseek" | "openai" => {}
