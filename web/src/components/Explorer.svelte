@@ -575,9 +575,11 @@
       wsAnchor = ws ? workspaceAnchor(serveWorkdir, ws, { caseInsensitive: IS_WIN }) : '';
       const res = ws ? await listDir() : base;
       lastRootDir = res.dir || '';
+      // 无工作区时根名固定「选择目录」(引导点击根区开目录浏览器选工作区),
+      // 不显示 serve 目录 basename(如 runtime),对国内用户不友好(统帅 2026-10-22)
       rootName = ws
         ? wsLabelOf(ws) || ws || '工作区'
-        : lastRootDir.split(/[\\/]/).filter(Boolean).pop() || 'evo-agent(工作区)';
+        : '选择目录';
       await loadChildren(anchor);
       rootChildren = dirState.get(anchor)?.children || [];
       // 恢复上次折叠状态(目录已不存在的条目静默跳过)
