@@ -20,8 +20,10 @@ import {
   mapAssistantToFacts,
   factForMemoryEvent,
   isAuditSupported,
+  initAuditWatcher,
 } from '../src/lib/audit.js';
 import { getAuditReport } from '../src/lib/api.js';
+import { writable } from 'svelte/store';
 
 beforeEach(() => {
   auditState.set(null);
@@ -176,5 +178,29 @@ describe('loadAudit 生命周期', () => {
     expect(isAuditSupported(undefined)).toBe(false);
     expect(isAuditSupported('')).toBe(false);
     expect(isAuditSupported('12x')).toBe(false);
+  });
+});
+
+// ---- watcher 接线 ----
+
+describe('initAuditWatcher', () => {
+  it('会话切换触发拉取;轮次收尾(true→false)轻量刷新', async () => {
+    const sid = writable(null);
+    const turnActive = writable(false);
+    const gov = [];
+    initAuditWatcher(sid, turnActive, (e) => gov.push(e));
+    await vi.waitFor(() => {}); // 订阅回调同步执行,无需等待
+
+    sid.set('9'); // 会话创建 → 拉取
+    expect(getAuditReport).toHaveBeenCalledTimes(1);
+    turnActive.set(true);
+    turnActive.set(false); // 轮次收尾 → 刷新
+    expect(getAuditReport).toHaveBeenCalledTimes(2);
+    turnActive.set(false); // 非收尾沿(连续 false)不刷
+    expect(getAuditReport).toHaveBeenCalledTimes(2);
+
+    getAuditReport.mockRejectedValueOnce(new Error('x'));
+    sid.set('10');
+    await vi.waitFor(() => expect(gov.some((e) => e.level === 'warn')).toBe(true));
   });
 });

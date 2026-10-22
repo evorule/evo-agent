@@ -166,15 +166,24 @@ export function factForMemoryEvent(state, factId) {
 // ---- 会话 watcher 接线 ----
 
 /**
- * 订阅 sessionId:会话创建/打开/切换即触发审计拉取(一处接线覆盖全部
- * 路径——newSession/openSession/恢复)。由 ws.js 模块初始化时调用一次;
- * 非数字 sid(本地路径会话)同样置档(supported=false 落灰),不发请求。
+ * 订阅 sessionId + turnActive:会话创建/打开/切换即触发审计拉取(一处
+ * 接线覆盖全部路径——newSession/openSession/恢复);轮次结束(turnActive
+ * true→false)后轻量刷新一次,新终稿消息徽章即从灰翻绿(新回合的
+ * io_response 收尾轮才入链,会话级一次性拉取覆盖不到)。
+ * 由 ws.js 模块初始化时调用一次;非数字 sid(本地路径会话)同样置档
+ * (supported=false 落灰),不发请求。
  * @param onGov 可选治理事件汇({label,detail,level})——ws.js 接线为
  *        pushPanelEvent('gov', e),审计拉取留痕进审计 tab 事件流
  */
-export function initAuditWatcher(sessionIdStore, onGov = null) {
+export function initAuditWatcher(sessionIdStore, turnActiveStore, onGov = null) {
   govSink = onGov;
   sessionIdStore.subscribe((sid) => {
     if (sid && sid !== loadedFor) loadAudit(sid);
+  });
+  let wasActive = false;
+  turnActiveStore.subscribe((active) => {
+    const sid = loadedFor;
+    if (wasActive && !active && sid) loadAudit(sid); // 轮次收尾:轻量刷新
+    wasActive = !!active;
   });
 }
