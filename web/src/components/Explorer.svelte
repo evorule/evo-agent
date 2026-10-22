@@ -27,8 +27,10 @@
     connStatus,
     gitStatus,
     pendingTreeReveal,
+    tabs,
     workspaceEpoch,
   } from '../lib/stores.js';
+  import { problems } from '../lib/diagnostics.js';
   import ContextMenu from './ContextMenu.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import DirectoryBrowser from './DirectoryBrowser.svelte';
@@ -107,6 +109,23 @@
   let wsBrowserOpen = false; // 目录浏览器(选工作区)
   let wsNotice = ''; // 工作区切换提示条(带「立即重连」)
   let recentWs = loadRecentWorkspaces();
+
+  // 打开的编辑器区折叠持久化(缺省展开;键位口径同 evo_explorer_state)
+  let oeOpen = true;
+  try {
+    oeOpen = localStorage.getItem('evo_oe_open') !== '0';
+  } catch {
+    /* 隐私模式缺省展开 */
+  }
+
+  function toggleOe() {
+    oeOpen = !oeOpen;
+    try {
+      localStorage.setItem('evo_oe_open', oeOpen ? '1' : '0');
+    } catch {
+      /* 隐私模式忽略 */
+    }
+  }
 
   // 折叠状态持久化(localStorage;键位口径与工作台其他 localStorage 键一致)
   const STATE_KEY = 'evo_explorer_state';
@@ -369,6 +388,50 @@
         { label: '刷新', action: refreshAll },
       ],
     };
+  }
+
+  // 打开的编辑器区:行右键菜单(关闭/关闭其他/全部关闭,VS Code OPEN EDITORS 同款)
+  function openOeMenu(e, t) {
+    e.preventDefault();
+    menu = {
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { label: '关闭', action: () => closeTab(t.path) },
+        { label: '关闭其他', action: () => closeOthers(t.path) },
+        { label: '全部关闭', action: closeAllTabs },
+      ],
+    };
+  }
+
+  function closeOthers(keepPath) {
+    for (const t of get(tabs)) if (t.path !== keepPath) closeTab(t.path);
+  }
+
+  function closeAllTabs() {
+    for (const t of get(tabs)) closeTab(t.path);
+  }
+
+  // 问题修饰标(结构层):单状态源 $problems.groups 聚合 每文件最重级(severity 8=错 4=警);
+  // 仅装饰不拦截点击,悬停 title 给首条消息与计数(与 ProblemsView 同源零双写)。
+  function buildDiagMap(p) {
+    const map = new Map();
+    if (!p || !Array.isArray(p.groups)) return map;
+    for (const g of p.groups) {
+      let worst = 0;
+      for (const m of g.markers || []) worst = Math.max(worst, m.severity || 0);
+      if (worst > 0) map.set(g.path, worst);
+    }
+    return map;
+  }
+
+  $: diagMap = buildDiagMap($problems);
+
+  function diagTitle(sev, path) {
+    const g = $problems.groups.find((x) => x.path === path);
+    const n = (g && g.markers ? g.markers.length : 0);
+    const first = (g && g.markers && g.markers[0] && g.markers[0].message) || '';
+    return `${sev >= 8 ? '错误' : '警告'}(${n}):${String(first).slice(0, 80)}`;
   }
 
   function askDelete(node) {
@@ -795,6 +858,41 @@
 </script>
 
 <div class="explorer" data-zone="explorer">
+  {#snippet fileIcon(name)}
+    {@const ik = fileIconKey(name)}
+    <svg class="icon fi-{ik}" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      {#if ik === 'ts' || ik === 'js' || ik === 'py' || ik === 'go' || ik === 'sql'}
+        <text x="12" y="16" text-anchor="middle" font-size="8.5" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{ik.toUpperCase()}</text>
+      {:else if ik === 'json'}
+        <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'{}'}</text>
+      {:else if ik === 'md'}
+        <text x="12" y="16" text-anchor="middle" font-size="9" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">M↓</text>
+      {:else if ik === 'css'}
+        <text x="12" y="16" text-anchor="middle" font-size="11" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">#</text>
+      {:else if ik === 'html'}
+        <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'<>'}</text>
+      {:else if ik === 'sh'}
+        <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'>_'}</text>
+      {:else if ik === 'svelte'}
+        <text x="12" y="16" text-anchor="middle" font-size="11" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">S</text>
+      {:else if ik === 'font'}
+        <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">A</text>
+      {:else if ik === 'rust' || ik === 'toml'}
+        <!-- 齿轮(配置/构建语义,Seti rust 同形):中环+八向齿 -->
+        <circle cx="12" cy="12" r="3.4" />
+        <path d="M12 5.4v2M12 16.6v2M5.4 12h2M16.6 12h2M7.3 7.3l1.4 1.4M15.3 15.3l1.4 1.4M16.7 7.3l-1.4 1.4M8.7 15.3l-1.4 1.4" />
+      {:else if ik === 'lock'}
+        <rect x="7" y="11" width="10" height="8" rx="1.2" />
+        <path d="M9 11V8a3 3 0 0 1 6 0v3" />
+      {:else if ik === 'img' || ik === 'svg'}
+        <rect x="4.5" y="5.5" width="15" height="13" rx="1.5" />
+        <circle cx="9.5" cy="10" r="1.5" />
+        <path d="m6 16.5 3.5-3.5 2.5 2.5 2-2 4 3.5" />
+      {:else}
+        <path d="M7 3h7l4 4v14H7z" />
+      {/if}
+    </svg>
+  {/snippet}
   <div class="panel-title">
     资源管理器
     {#if $connStatus === 'offline'}
@@ -849,10 +947,66 @@
       <button class="ws-notice-x" onclick={() => (wsNotice = '')} aria-label="关闭提示">×</button>
     </div>
   {/if}
+  {#if $tabs.length > 0}
+    <!-- 结构层:打开的编辑器区(VS Code OPEN EDITORS 同位同款;折叠持久化 evo_oe_open;
+         行=tab 快照:dirty 点/悬停关闭钮/右键 关闭·关闭其他·全部关闭;点击行=激活 tab) -->
+    <div class="oe-section">
+      <button class="oe-header" title="打开的编辑器" onclick={toggleOe}>
+        <svg class="caret" class:open={oeOpen} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <path d="M9 6l6 6-6 6" />
+        </svg>
+        <span>打开的编辑器</span>
+        <span class="oe-count">{$tabs.length}</span>
+      </button>
+      {#if oeOpen}
+        <div class="oe-list" role="list">
+          {#each $tabs as t (t.path)}
+            <div
+              class="node file oe-row"
+              class:active={t.path === $activePath}
+              role="listitem"
+              tabindex="0"
+              onclick={() => activePath.set(t.path)}
+              onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && activePath.set(t.path)}
+              oncontextmenu={(e) => openOeMenu(e, t)}
+            >
+              {@render fileIcon(t.name)}
+              <span class="name" class:dirty={t.dirty}>{t.name}</span>
+              {#if t.dirty}
+                <span class="oe-dirty" title="未保存">●</span>
+              {/if}
+              <button
+                class="oe-close"
+                title="关闭"
+                aria-label={`关闭 ${t.name}`}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  closeTab(t.path);
+                }}
+              >
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
   {#if loadError}
     <div class="error">加载失败:{loadError}</div>
   {:else}
-    <div class="tree" role="tree" bind:this={treeEl}>
+    <div
+      class="tree"
+      role="tree"
+      bind:this={treeEl}
+      oncontextmenu={(e) => {
+        // 空白区右键(openRootMenu 原为死代码,结构层接线):节点行有自己的菜单,冒泡到此即吞掉
+        if (e.target.closest && e.target.closest('.node')) return;
+        openRootMenu(e);
+      }}
+    >
       {#if naming && naming.mode !== 'rename' && naming.anchor === anchor}
         <div class="node naming" style="padding-left: 10px">
           <input
@@ -910,39 +1064,7 @@
               {/if}
             </svg>
           {:else}
-            {@const ik = fileIconKey(node.name)}
-            <svg class="icon fi-{ik}" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              {#if ik === 'ts' || ik === 'js' || ik === 'py' || ik === 'go' || ik === 'sql'}
-                <text x="12" y="16" text-anchor="middle" font-size="8.5" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{ik.toUpperCase()}</text>
-              {:else if ik === 'json'}
-                <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'{}'}</text>
-              {:else if ik === 'md'}
-                <text x="12" y="16" text-anchor="middle" font-size="9" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">M↓</text>
-              {:else if ik === 'css'}
-                <text x="12" y="16" text-anchor="middle" font-size="11" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">#</text>
-              {:else if ik === 'html'}
-                <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'<>'}</text>
-              {:else if ik === 'sh'}
-                <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'>_'}</text>
-              {:else if ik === 'svelte'}
-                <text x="12" y="16" text-anchor="middle" font-size="11" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">S</text>
-              {:else if ik === 'font'}
-                <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">A</text>
-              {:else if ik === 'rust' || ik === 'toml'}
-                <!-- 齿轮(配置/构建语义,Seti rust 同形):中环+八向齿 -->
-                <circle cx="12" cy="12" r="3.4" />
-                <path d="M12 5.4v2M12 16.6v2M5.4 12h2M16.6 12h2M7.3 7.3l1.4 1.4M15.3 15.3l1.4 1.4M16.7 7.3l-1.4 1.4M8.7 15.3l-1.4 1.4" />
-              {:else if ik === 'lock'}
-                <rect x="7" y="11" width="10" height="8" rx="1.2" />
-                <path d="M9 11V8a3 3 0 0 1 6 0v3" />
-              {:else if ik === 'img' || ik === 'svg'}
-                <rect x="4.5" y="5.5" width="15" height="13" rx="1.5" />
-                <circle cx="9.5" cy="10" r="1.5" />
-                <path d="m6 16.5 3.5-3.5 2.5 2.5 2-2 4 3.5" />
-              {:else}
-                <path d="M7 3h7l4 4v14H7z" />
-              {/if}
-            </svg>
+            {@render fileIcon(node.name)}
           {/if}
           {#if naming && naming.mode === 'rename' && naming.target.path === node.path}
             <input
@@ -961,6 +1083,12 @@
           {#if gitLetter(node)}
             <span class="git-letter {gitLetterClass(gitLetter(node))}"
               title="git:{gitLetter(node)}">{gitLetter(node)}</span>
+          {/if}
+          {#if diagMap.get(node.path)}
+            <span
+              class="diag-badge {diagMap.get(node.path) >= 8 ? 'err' : 'warn'}"
+              title={diagTitle(diagMap.get(node.path), node.path)}
+            >●</span>
           {/if}
         </div>
         {#if naming && naming.mode !== 'rename' && naming.anchor === node.path}
@@ -1415,6 +1543,93 @@
   }
   .git-letter.deleted {
     color: var(--git-deleted);
+  }
+  /* 问题修饰标(结构层):红=错误 黄=警告,行尾钉右;按相邻组合分流推距 */
+  .diag-badge {
+    font-size: 9px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .diag-badge.err {
+    color: var(--git-deleted);
+  }
+  .diag-badge.warn {
+    color: var(--git-modified);
+  }
+  .name + .diag-badge {
+    margin-left: auto; /* 无 git 字母:钉行尾 */
+  }
+  .git-letter + .diag-badge {
+    margin-left: 4px; /* 有 git 字母:紧随其后 */
+  }
+  /* ---- 打开的编辑器区(VS Code OPEN EDITORS 同构) ---- */
+  .oe-section {
+    border-bottom: 1px solid var(--border);
+    padding: 2px 0 4px;
+  }
+  .oe-header {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    width: 100%;
+    padding: 4px 10px;
+    background: none;
+    border: none;
+    color: var(--sidebar-text);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    user-select: none;
+  }
+  .oe-header .caret {
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+    color: var(--text-muted);
+    transition: transform 0.12s ease;
+  }
+  .oe-header .caret.open {
+    transform: rotate(90deg);
+  }
+  .oe-count {
+    color: var(--text-muted);
+    font-size: 10px;
+  }
+  .oe-row {
+    padding-left: 24px;
+  }
+  .oe-row .name.dirty {
+    font-style: italic;
+  }
+  .oe-dirty {
+    color: var(--text-primary);
+    font-size: 9px;
+    line-height: 1;
+    flex-shrink: 0;
+    margin-left: 4px;
+  }
+  .oe-close {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    margin-left: auto;
+    padding: 0;
+    background: none;
+    border: none;
+    border-radius: 3px;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .oe-close:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .oe-row:hover .oe-close,
+  .oe-row.active .oe-close {
+    display: inline-flex;
   }
   .git-letter.renamed {
     color: var(--git-renamed);
