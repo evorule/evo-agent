@@ -168,17 +168,22 @@ impl ToolFunction for McpToolAdapter {
         // （旧版本 server 三者皆空 → 拼接零字节，存量语义逐字节不变）。
         // 链接只列 uri 不自动展开——取数由模型按需决策（防上下文自膨胀）。
         if let Some(sv) = &structured.structured {
-            text.push_str("
+            text.push_str(
+                "
 
 [structured]
-");
+",
+            );
             text.push_str(&sv.to_string());
         }
         for rt in &structured.resource_texts {
-            text.push_str(&format!("
+            text.push_str(&format!(
+                "
 
 [resource {}]
-{}", rt.uri, rt.text));
+{}",
+                rt.uri, rt.text
+            ));
         }
         if !structured.resource_links.is_empty() {
             text.push_str(&format!(
@@ -186,8 +191,10 @@ impl ToolFunction for McpToolAdapter {
 
 [resource_links]
 {}",
-                structured.resource_links.join("
-")
+                structured.resource_links.join(
+                    "
+"
+                )
             ));
         }
 

@@ -49,7 +49,11 @@ impl Field {
                 return Err(format!("{name} 字段含空段"));
             }
             let (range, step) = match part.split_once('/') {
-                Some((r, s)) => (r, s.parse::<u32>().map_err(|_| format!("{name} 步长非法: {s}"))?),
+                Some((r, s)) => (
+                    r,
+                    s.parse::<u32>()
+                        .map_err(|_| format!("{name} 步长非法: {s}"))?,
+                ),
                 None => (part, 1),
             };
             if step == 0 {
@@ -58,11 +62,19 @@ impl Field {
             let (a, b) = if range == "*" {
                 (lo, hi)
             } else if let Some((x, y)) = range.split_once('-') {
-                let a = x.trim().parse::<u32>().map_err(|_| format!("{name} 范围起点非法: {x}"))?;
-                let b = y.trim().parse::<u32>().map_err(|_| format!("{name} 范围终点非法: {y}"))?;
+                let a = x
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("{name} 范围起点非法: {x}"))?;
+                let b = y
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("{name} 范围终点非法: {y}"))?;
                 (a, b)
             } else {
-                let v = range.parse::<u32>().map_err(|_| format!("{name} 数值非法: {range}"))?;
+                let v = range
+                    .parse::<u32>()
+                    .map_err(|_| format!("{name} 数值非法: {range}"))?;
                 (v, v)
             };
             if a < lo || b > hi || a > b {
@@ -148,11 +160,19 @@ fn weekday_index(year: i32, month: u32, day: u32) -> u32 {
     let mut days: i64 = 0;
     if year >= 1970 {
         for y in 1970..year {
-            days += if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+            days += if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                366
+            } else {
+                365
+            };
         }
     } else {
         for y in year..1970 {
-            days -= if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+            days -= if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                366
+            } else {
+                365
+            };
         }
     }
     for m in 1..month {
@@ -226,7 +246,10 @@ impl ScheduleConfig {
     /// 装载期校验：cron 可解析 + kind 合法 + run 带 goal + tick<60 + 名字唯一。
     pub fn validate(&self) -> Result<(), String> {
         if self.tick_secs >= 60 {
-            return Err(format!("schedule.tick_secs={} ≥60 会漏分钟，须 <60", self.tick_secs));
+            return Err(format!(
+                "schedule.tick_secs={} ≥60 会漏分钟，须 <60",
+                self.tick_secs
+            ));
         }
         let mut names = std::collections::HashSet::new();
         for j in &self.jobs {
@@ -241,7 +264,9 @@ impl ScheduleConfig {
                     }
                 }
                 "patrol" => {
-                    if j.session.is_none() || j.workspace.as_deref().map(str::is_empty).unwrap_or(true) {
+                    if j.session.is_none()
+                        || j.workspace.as_deref().map(str::is_empty).unwrap_or(true)
+                    {
                         return Err(format!("任务 {} type=patrol 缺 session/workspace", j.name));
                     }
                 }
@@ -269,7 +294,11 @@ pub struct TickAction {
 /// 计算本 tick 应发生的动作：从 `last_minute`（含）之后到 `now_minute`（含）逐分钟
 /// 扫描；`now_minute` 的匹配=fired，此前错过的=missed（不补跑）。
 /// `last_minute=None`（首 tick）只看当前分钟，不回溯（启动即历史清零，如实约定）。
-pub fn plan_tick(jobs: &[ScheduleJob], last_minute: Option<&str>, now_minute: &str) -> Vec<TickAction> {
+pub fn plan_tick(
+    jobs: &[ScheduleJob],
+    last_minute: Option<&str>,
+    now_minute: &str,
+) -> Vec<TickAction> {
     let mut out = Vec::new();
     let now = parse_minute(now_minute).unwrap_or((1970, 1, 1, 0, 0));
     for j in jobs.iter().filter(|j| j.enabled) {
@@ -377,12 +406,13 @@ pub fn fire_job(exe: &Path, workdir: &Path, job: &ScheduleJob) -> Result<i32, St
 
 /// 调度主循环（阻塞；每 tick_secs 对账一次）。留痕失败/任务失败都不中断循环
 /// （单任务故障不拖垮其余任务），但 journal 写失败=断账级错误即刻返回。
-pub fn run_loop(
-    config: &ScheduleConfig,
-    workdir: &Path,
-    exe: PathBuf,
-) -> Result<(), String> {
-    let journal_path = workdir.join(config.journal.clone().unwrap_or_else(|| "data/schedule.journal.jsonl".into()));
+pub fn run_loop(config: &ScheduleConfig, workdir: &Path, exe: PathBuf) -> Result<(), String> {
+    let journal_path = workdir.join(
+        config
+            .journal
+            .clone()
+            .unwrap_or_else(|| "data/schedule.journal.jsonl".into()),
+    );
     let mut last_minute: Option<String> = None;
     println!(
         "[schedule] 调度器启动：{} 任务，tick={}s，留痕={}",
@@ -420,7 +450,10 @@ pub fn run_loop(
                     }
                 }
                 _ => {
-                    println!("[schedule] 错过（不补跑）{}/{} @{}", a.job, a.kind, a.minute);
+                    println!(
+                        "[schedule] 错过（不补跑）{}/{} @{}",
+                        a.job, a.kind, a.minute
+                    );
                     journal_append(&journal_path, &entry)?;
                 }
             }
@@ -579,7 +612,11 @@ mod tests {
     #[test]
     fn minute_math_roundtrip() {
         assert_eq!(increment_minute(2026, 12, 31, 23, 59), (2027, 1, 1, 0, 0));
-        assert_eq!(increment_minute(2024, 2, 28, 23, 59), (2024, 2, 29, 0, 0), "闰年");
+        assert_eq!(
+            increment_minute(2024, 2, 28, 23, 59),
+            (2024, 2, 29, 0, 0),
+            "闰年"
+        );
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20648), (2026, 7, 14));
     }

@@ -115,7 +115,7 @@
         <rect x="7.5" y="9.1" width="9" height="2.3" rx="0.9" fill="#D4AF37" />
         <rect x="7.5" y="12.6" width="9" height="2.3" rx="0.9" fill="#F0D27A" />
       </svg>
-      <h1>evo-agent 工作台</h1>
+      <h1>evo-agent</h1>
       <p class="sub">Powered by <i>EvoRule</i></p>
     </div>
 

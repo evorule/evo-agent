@@ -241,7 +241,7 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
       minimap: o.minimap,
       wordWrap: o.wordWrap,
       automaticLayout: true,
-      fontFamily: '"JetBrains Mono", Consolas, monospace',
+      fontFamily: '"JetBrains Mono", Consolas, "Microsoft YaHei", monospace',
       lineHeight: 22,
       lineNumbers: 'on',
       renderLineHighlight: 'none',

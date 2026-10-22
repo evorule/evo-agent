@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
-// 工作台布局尺寸管理(E2 divider 配套):侧栏宽/底部面板高的钳制纯函数 +
-// 持久化 store。分组宽百分比换算同理。钳制口径:侧栏 180–480px,面板
-// 120–50vh,副组 10–80%(与批 E 设计档一致)。localStorage 不可用(测试/
-// 隐私模式)时降级为会话内布局。
+// 工作台布局尺寸管理(E2 divider 配套):侧栏宽/底部面板高/对话栏宽的钳制
+// 纯函数 + 持久化 store。分组宽百分比换算同理。钳制口径:侧栏 180–480px,
+// 面板 120–50vh,对话栏 300–560px,副组 10–80%(与批 E 设计档一致)。
+// localStorage 不可用(测试/隐私模式)时降级为会话内布局。
 
 import { writable } from 'svelte/store';
 
@@ -17,6 +17,11 @@ export const PANEL_MAX_VH = 0.5;
 export const PANEL_DEFAULT = 180;
 export const PANEL_KEY = 'evo_bottom_h';
 
+export const CHAT_MIN = 300;
+export const CHAT_MAX = 560;
+export const CHAT_DEFAULT = 380;
+export const CHAT_KEY = 'evo_chat_w';
+
 export const GROUP_MIN_PCT = 10;
 export const GROUP_MAX_PCT = 80;
 
@@ -29,6 +34,10 @@ export function clampInt(v, min, max) {
 
 export function clampSidebarWidth(px) {
   return clampInt(px, SIDEBAR_MIN, SIDEBAR_MAX);
+}
+
+export function clampChatWidth(px) {
+  return clampInt(px, CHAT_MIN, CHAT_MAX);
 }
 
 function defaultViewportHeight() {
@@ -111,5 +120,15 @@ export function setPanelHeight(px, viewportHeight) {
   const v = clampPanelHeight(px, viewportHeight);
   panelHeight.set(v);
   writeStored(PANEL_KEY, v);
+  return v;
+}
+
+/** 对话栏宽度 store(初始化读持久值;钳制后落库) */
+export const chatWidth = writable(clampChatWidth(readStoredInt(CHAT_KEY, CHAT_DEFAULT)));
+
+export function setChatWidth(px) {
+  const v = clampChatWidth(px);
+  chatWidth.set(v);
+  writeStored(CHAT_KEY, v);
   return v;
 }

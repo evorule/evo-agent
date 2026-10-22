@@ -201,6 +201,27 @@ function lightRules() {
   ];
 }
 
+// 暗色 token 配色(Atom One Dark 族,贴 DeepSeek 网页版代码块观感):
+// 注释斜体灰蓝/关键字紫/字符串绿/数字橙/类型黄/函数蓝/操作符青。
+// 仅 token 色,编辑器背景仍由 monacoColorsFor(dark) 派生,保持工作台整体协调。
+function darkRules() {
+  return [
+    { token: 'comment', foreground: '5c637b', fontStyle: 'italic' },
+    { token: 'string', foreground: '98c379' },
+    { token: 'string.escape', foreground: '56b6c2' },
+    { token: 'keyword', foreground: 'c678dd' },
+    { token: 'number', foreground: 'd19a66' },
+    { token: 'regexp', foreground: '98c379' },
+    { token: 'type', foreground: 'e5c07b' },
+    { token: 'type.identifier', foreground: 'e5c07b' },
+    { token: 'function', foreground: '61afef' },
+    { token: 'operator', foreground: '56b6c2' },
+    { token: 'tag', foreground: 'e06c75' },
+    { token: 'attribute.name', foreground: 'd19a66' },
+    { token: 'attribute.value', foreground: '98c379' },
+  ];
+}
+
 let themesRegistered = false;
 
 /**
@@ -242,7 +263,7 @@ export function applyTheme(mode, monaco) {
       monaco.editor.defineTheme('evorule-dark', {
         base: 'vs-dark',
         inherit: true,
-        rules: [],
+        rules: darkRules(),
         colors: monacoColorsFor('dark'),
       });
       monaco.editor.defineTheme('evorule-light', {

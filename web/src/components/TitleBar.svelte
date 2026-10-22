@@ -4,7 +4,7 @@
 <script>
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
-  import { connStatus, sessionId, stepCount, turnActive, toolWhitelist, signalCount, refreshGovBadges } from '../lib/stores.js';
+  import { connStatus, sessionId, stepCount, turnActive, toolWhitelist, signalCount, refreshGovBadges, sidebarView } from '../lib/stores.js';
   import { problems } from '../lib/diagnostics.js';
   import { openBottomPanel } from '../lib/panel.js';
   import { taskRuns } from '../lib/tasks.js';
@@ -70,7 +70,6 @@
       </svg>
     </span>
     <span class="brand-text">evo-agent</span>
-    <span class="brand-sub">工作台</span>
   </div>
 
   <MenuBar />
@@ -93,6 +92,14 @@
         {/if}
       </button>
     {/if}
+    <button
+      class="gov-chip mono"
+      class:active={$sidebarView === 'audit'}
+      title="工作台:evorule console 治理面板;点击在 编辑区 ↔ 面板 间切换"
+      onclick={() => sidebarView.set($sidebarView === 'audit' ? 'home' : 'audit')}
+    >
+      工作台
+    </button>
     <span
       class="gov-chip mono"
       title={$toolWhitelist ? `agent 工具白名单(${$toolWhitelist.length}):${$toolWhitelist.join(', ')}` : '工具白名单未加载'}
@@ -179,11 +186,6 @@
     font-size: var(--fs-lg);
     color: var(--text-primary);
   }
-  .brand-sub {
-    font-weight: var(--fw-reg);
-    color: var(--text-secondary);
-    font-size: var(--fs-sm);
-  }
   .actions {
     margin-left: auto;
     display: flex;
@@ -218,6 +220,12 @@
   button.gov-chip:hover {
     color: var(--text-primary);
     border-color: var(--brand);
+  }
+  /* 面板驻留态(工作台钮):当前内容区正是 console 面板时高亮 */
+  button.gov-chip.active {
+    color: var(--brand);
+    border-color: var(--brand);
+    background: var(--bg-active);
   }
   .diag-chip .d-err {
     color: var(--danger);

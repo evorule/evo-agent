@@ -28,6 +28,7 @@
     approvalPresetView,
   } from '../lib/approval.js';
   import { switchWorkspace } from '../lib/workspace.js';
+  import { chatWidth } from '../lib/layout.js';
   import { orderSessionsWithLineage } from '../lib/orchestration.js';
   import { push as pushNotification } from '../lib/notifications.js';
   import { onMount, onDestroy, tick } from 'svelte';
@@ -813,7 +814,7 @@
   }
 </script>
 
-<aside class="chat" data-zone="chat">
+<aside class="chat" data-zone="chat" style:width={`${$chatWidth}px`}>
   <div class="chat-header">
     <span class="title">对话</span>
     <div class="header-actions">
@@ -1361,7 +1362,7 @@
 
 <style>
   .chat {
-    width: 380px;
+    /* 宽度由宿主经 inline style 绑定 chatWidth(300–560px,持久化 evo_chat_w) */
     flex-shrink: 0;
     background: var(--sidebar-bg);
     border-left: 1px solid var(--border);

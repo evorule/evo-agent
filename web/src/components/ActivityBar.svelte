@@ -1,10 +1,11 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 EvoRule Project -->
-<!-- 活动栏(Trae 最左列):资源管理器/搜索(B2)/源代码管理(B3)/设置入口;后续阶段逐项点亮 -->
+<!-- 活动栏(Trae 最左列):资源管理器/搜索(B2)/源代码管理(B3)等视图入口;后续阶段逐项点亮。
+     设置入口在顶栏(齿轮钮,白名单左侧),不在此列。 -->
 <script>
   import { sidebarView, homeRequested } from '../lib/stores.js';
 
-  /** 条目点击外发(设置等非视图切换入口的宿主接线;App.svelte 按 id 分发) */
+  /** 条目点击外发(home/audit 等内容区入口的宿主接线;App.svelte 按 id 分发) */
   export let onitemclick = null;
 
   const items = [
@@ -15,13 +16,9 @@
     { id: 'orchestration', label: '编排(委托谱系)', enabled: true },
     { id: 'debug', label: '运行和调试', enabled: true },
     { id: 'extensions', label: '扩展', enabled: true },
-    { id: 'audit', label: '审计', enabled: true },
-    { id: 'settings', label: '设置', enabled: true },
   ];
 
-  /** 设置是快捷入口而非侧面板视图:点击后本地钉住高亮,直至切回视图 */
-  let settingsPinned = false;
-  $: active = settingsPinned ? 'settings' : $sidebarView;
+  $: active = $sidebarView;
 
   function click(it) {
     if (!it.enabled) return;
@@ -32,12 +29,6 @@
       if (onitemclick) onitemclick(it.id);
       return;
     }
-    if (it.id === 'settings') {
-      settingsPinned = true;
-      if (onitemclick) onitemclick(it.id);
-      return;
-    }
-    settingsPinned = false;
     sidebarView.set(it.id);
     if (onitemclick) onitemclick(it.id);
   }
@@ -86,15 +77,9 @@
           <ellipse cx="12" cy="13" rx="4.6" ry="5.6" />
           <path d="M9.4 6.2 10.6 4M14.6 6.2 13.4 4M7.4 11H3.8M7.2 15H4.2M20.2 11h-3.6M19.8 15h-3M12 7.4V5.4M7.4 13h9.2" />
         </svg>
-      {:else if it.id === 'audit'}
+      {:else if it.id === 'extensions'}
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
-          <path d="M12 3 5 6v5c0 4.5 3 8.2 7 9.5 4-1.3 7-5 7-9.5V6l-7-3Z" />
-          <path d="m9.5 12 2 2 3.5-4" />
-        </svg>
-      {:else}
-        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
-          <circle cx="12" cy="12" r="3" />
-          <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" />
+          <path d="M12 3.5a2 2 0 0 1 2 2V7h3.5a1 1 0 0 1 1 1v3.5H17a2 2 0 0 0 0 4h1.5V19a1 1 0 0 1-1 1H14v-1.5a2 2 0 0 0-4 0V20H6.5a1 1 0 0 1-1-1v-3.5H4a2 2 0 0 1 0-4h1.5V8a1 1 0 0 1 1-1H10V5.5a2 2 0 0 1 2-2Z" />
         </svg>
       {/if}
     </button>
