@@ -146,9 +146,19 @@
     setGroupWidth(id, `${pct}%`);
   }
 
-  /** 活动栏条目分发(设置等非文件树视图的宿主接线路由) */
+  /** 活动栏点击(Trae 语义):侧面板视图点在已激活项=收起侧栏,再点=展开;
+   *  点其他视图=切换并保证可见。home/audit 是内容区入口,settings 由上分支处理。 */
   function handleActivityItem(id) {
-    if (id === 'settings') openSettingsTab();
+    if (id === 'settings') {
+      openSettingsTab();
+      return;
+    }
+    if (id === 'home' || id === 'audit') return;
+    if (get(sidebarView) === id && get(explorerVisible)) {
+      explorerVisible.set(false);
+    } else {
+      explorerVisible.set(true);
+    }
   }
 
   // ---- 任务面(B10):选择器/首跑确认/运行编排 ----
