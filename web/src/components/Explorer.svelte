@@ -65,7 +65,7 @@
     return 'modified';
   }
 
-  // ---- 文件类型图标着色(Seti 风,按扩展名;仅图标提色,文件名不受影响) ----
+  // ---- 文件类型图标(Seti 风:每类专属形状——字母徽标/符号/小图形;色沿用 fi-* 语义色) ----
   // 语义色沿用行业惯例(语言官网/Seti 配色),与 git-letter 语义色同性质。
   const FILE_ICON_EXT = {
     svelte: 'svelte', rs: 'rust', ts: 'ts', tsx: 'ts', js: 'js', jsx: 'js',
@@ -77,9 +77,9 @@
     woff: 'font', woff2: 'font', ttf: 'font', otf: 'font', txt: 'plain',
   };
 
-  function fileIconClass(name) {
+  function fileIconKey(name) {
     const m = /\.([a-z0-9]+)$/i.exec(name || '');
-    return 'fi-' + (FILE_ICON_EXT[m ? m[1].toLowerCase() : ''] || 'plain');
+    return FILE_ICON_EXT[m ? m[1].toLowerCase() : ''] || 'plain';
   }
 
   let rootName = 'evo-agent(工作区)';
@@ -910,8 +910,38 @@
               {/if}
             </svg>
           {:else}
-            <svg class="icon {fileIconClass(node.name)}" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8">
-              <path d="M7 3h7l4 4v14H7z" />
+            {@const ik = fileIconKey(node.name)}
+            <svg class="icon fi-{ik}" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              {#if ik === 'ts' || ik === 'js' || ik === 'py' || ik === 'go' || ik === 'sql'}
+                <text x="12" y="16" text-anchor="middle" font-size="8.5" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{ik.toUpperCase()}</text>
+              {:else if ik === 'json'}
+                <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'{}'}</text>
+              {:else if ik === 'md'}
+                <text x="12" y="16" text-anchor="middle" font-size="9" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">M↓</text>
+              {:else if ik === 'css'}
+                <text x="12" y="16" text-anchor="middle" font-size="11" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">#</text>
+              {:else if ik === 'html'}
+                <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'<>'}</text>
+              {:else if ik === 'sh'}
+                <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'>_'}</text>
+              {:else if ik === 'svelte'}
+                <text x="12" y="16" text-anchor="middle" font-size="11" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">S</text>
+              {:else if ik === 'font'}
+                <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">A</text>
+              {:else if ik === 'rust' || ik === 'toml'}
+                <!-- 齿轮(配置/构建语义,Seti rust 同形):中环+八向齿 -->
+                <circle cx="12" cy="12" r="3.4" />
+                <path d="M12 5.4v2M12 16.6v2M5.4 12h2M16.6 12h2M7.3 7.3l1.4 1.4M15.3 15.3l1.4 1.4M16.7 7.3l-1.4 1.4M8.7 15.3l-1.4 1.4" />
+              {:else if ik === 'lock'}
+                <rect x="7" y="11" width="10" height="8" rx="1.2" />
+                <path d="M9 11V8a3 3 0 0 1 6 0v3" />
+              {:else if ik === 'img' || ik === 'svg'}
+                <rect x="4.5" y="5.5" width="15" height="13" rx="1.5" />
+                <circle cx="9.5" cy="10" r="1.5" />
+                <path d="m6 16.5 3.5-3.5 2.5 2.5 2-2 4 3.5" />
+              {:else}
+                <path d="M7 3h7l4 4v14H7z" />
+              {/if}
             </svg>
           {/if}
           {#if naming && naming.mode === 'rename' && naming.target.path === node.path}
@@ -1289,8 +1319,9 @@
   .node.selected {
     background-color: var(--bg-active);
   }
-  /* 打开文件高亮:文字提亮 + 品牌色左标记(VS Code 同款语义) */
+  /* 打开文件高亮:整行底色 + 文字提亮 + 品牌色左标记(VS Code activeSelection 同语义) */
   .node.active {
+    background-color: var(--bg-active);
     box-shadow: inset 2px 0 0 var(--brand);
   }
   .node.active .name {
