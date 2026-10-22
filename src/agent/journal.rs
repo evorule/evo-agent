@@ -526,8 +526,11 @@ pub struct JournalLine {
 /// journal 行链哈希三元组(与 evorule WAL v2 同构;链步公式与内核 SSOT 同源,黄金向量锁定)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineHashes {
+    /// 行内容哈希（归一化字节的 blake3）
     pub content_hash: String,
+    /// 前行链哈希
     pub prev_hash: String,
+    /// 当前链哈希 blake3(prev + content)
     pub chain_hash: String,
 }
 
