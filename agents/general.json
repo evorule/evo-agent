@@ -65,6 +65,10 @@
     {
       "name": "evorule-deterministic-compute",
       "path": "skills/evorule-deterministic-compute/SKILL.md"
+    },
+    {
+      "name": "evorule-deliverable",
+      "path": "skills/evorule-deliverable/SKILL.md"
     }
   ],
   "memory": {
