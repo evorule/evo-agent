@@ -53,6 +53,7 @@
     "handover_read",
     "session_spawn",
     "delegate",
+    "browser_*",
     "mcp_*",
     "inference_*"
   ],

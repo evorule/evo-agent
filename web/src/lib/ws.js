@@ -262,8 +262,15 @@ export async function sendMessage(content, mentions = [], opts = {}) {
           )
           .join('\n')}\n<note>以上附件已保存于工作区相对路径,可用文件读取工具访问;图片类附件已随本消息以多模态形态上行(可直接视觉理解),文件本体仍可经路径用工具处理。</note>\n</attachments>`
       : '';
-  // wire 正文 = [重建回注块] + [模式提示块] + 正文 + [附件块] + [@上下文 XML];气泡显示仍为原文
-  const wireContent = `${rebuildBlock ? `${rebuildBlock}\n\n` : ''}${modeHint ? `${modeHint}\n\n` : ''}${content}${attachBlock ? `\n\n${attachBlock}` : ''}${xml ? `\n\n${xml}` : ''}`;
+  // 技能激活块(wire-only,气泡不渲染)——会话框技能菜单选中的 active 技能,
+  // 随本条消息装配;name/path 来自服务端 /api/skills 权威清单(仅 active 态
+  // 可选,discovered 未经人工审批不得进入),agent 以文件工具读取 SKILL.md
+  // 并遵循其纪律,直至用户明示停用。形态与 modeHint 同构,零协议改动。
+  const skillBlock = opts.skill
+    ? `<skill-activate name="${opts.skill.name}" path="${opts.skill.path}">\n<note>用户为本会话启用了上述技能:先用文件读取工具完整读取该 SKILL.md,再按其纪律执行本条消息及后续任务,直至用户明示停用或更换技能。</note>\n</skill-activate>`
+    : '';
+  // wire 正文 = [重建回注块] + [模式提示块] + [技能激活块] + 正文 + [附件块] + [@上下文 XML];气泡显示仍为原文
+  const wireContent = `${rebuildBlock ? `${rebuildBlock}\n\n` : ''}${modeHint ? `${modeHint}\n\n` : ''}${skillBlock ? `${skillBlock}\n\n` : ''}${content}${attachBlock ? `\n\n${attachBlock}` : ''}${xml ? `\n\n${xml}` : ''}`;
   ws.send(
     JSON.stringify({
       type: 'message',
