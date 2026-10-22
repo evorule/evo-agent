@@ -31,6 +31,7 @@
     workspaceEpoch,
   } from '../lib/stores.js';
   import { problems } from '../lib/diagnostics.js';
+  import { settingsState } from '../lib/settings.js';
   import ContextMenu from './ContextMenu.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import DirectoryBrowser from './DirectoryBrowser.svelte';
@@ -426,6 +427,11 @@
   }
 
   $: diagMap = buildDiagMap($problems);
+
+  // 文件树字号跟随编辑器字号(设置 editor.fontSize,缺省 14;统帅令:树=编辑器同字号)。
+  // 以 CSS 变量下发到 .explorer 根,树行与打开的编辑器区共用;设置变更即时生效。
+  $: treeFontSize =
+    typeof $settingsState['editor.fontSize'] === 'number' ? $settingsState['editor.fontSize'] : 14;
 
   function diagTitle(sev, path) {
     const g = $problems.groups.find((x) => x.path === path);
@@ -857,7 +863,7 @@
   });
 </script>
 
-<div class="explorer" data-zone="explorer">
+<div class="explorer" data-zone="explorer" style:--tree-fs="{treeFontSize}px">
   {#snippet fileIcon(name)}
     {@const ik = fileIconKey(name)}
     <svg class="icon fi-{ik}" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -1414,7 +1420,7 @@
     gap: 5px;
     padding-right: var(--sp-md);
     height: 24px;
-    font-size: var(--fs-sm);
+    font-size: var(--tree-fs, var(--fs-base));
     color: var(--sidebar-text);
     cursor: pointer;
     user-select: none;
