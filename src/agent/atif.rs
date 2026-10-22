@@ -1297,6 +1297,7 @@ mod tests {
                 seq: self.seq,
                 ts: self.ts,
                 event: ev,
+                hashes: None,
             });
             self.seq
         }

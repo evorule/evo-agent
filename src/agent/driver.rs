@@ -1999,6 +1999,7 @@ mod tests {
                         inline: None,
                     },
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 2,
@@ -2019,6 +2020,7 @@ mod tests {
                     recut_counts: vec![],
                     cur_workflow: "{}".into(),
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 3,
@@ -2042,6 +2044,7 @@ mod tests {
                     recut_counts: vec![("ghost".into(), 2)],
                     cur_workflow: r#"{"workflow_id":"wf"}"#.into(),
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 4,
@@ -2057,6 +2060,7 @@ mod tests {
                         inline: None,
                     },
                 },
+                hashes: None,
             },
         ];
         let (state, tail_start) = replay_plan_loop_checkpoint(&lines)

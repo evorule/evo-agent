@@ -1915,6 +1915,7 @@ mod tests {
                     tool: "file_write".into(),
                     payload: "敏感路径".into(),
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 2,
@@ -1923,6 +1924,7 @@ mod tests {
                     approval_id: "ap1".into(),
                     decision: "rejected".into(),
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 3,
@@ -1932,6 +1934,7 @@ mod tests {
                     verdict: "blocked".into(),
                     evidence: "shell 越界".into(),
                 },
+                hashes: None,
             },
             // 重复摘要(同工具同载荷同决定)→去重
             JournalLine {
@@ -1942,6 +1945,7 @@ mod tests {
                     tool: "file_write".into(),
                     payload: "敏感路径".into(),
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 5,
@@ -1950,6 +1954,7 @@ mod tests {
                     approval_id: "ap2".into(),
                     decision: "rejected".into(),
                 },
+                hashes: None,
             },
         ];
         let mut result = SedimentResult::default();
@@ -1988,6 +1993,7 @@ mod tests {
                     content_digest: "blake3:aa".into(),
                     execution_profile: None,
                 },
+                hashes: None,
             }],
         };
         let result = sediment(
@@ -2057,6 +2063,7 @@ mod tests {
                     turn_seq: 1,
                     goal: "部署服务".into(),
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 2,
@@ -2070,6 +2077,7 @@ mod tests {
                     request: 3,
                     response: "r".into(),
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 3,
@@ -2080,6 +2088,7 @@ mod tests {
                     args_digest: "d".into(),
                     evorule_request_id: None,
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 4,
@@ -2091,6 +2100,7 @@ mod tests {
                     content_digest: "d".into(),
                     execution_profile: None,
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 5,
@@ -2101,6 +2111,7 @@ mod tests {
                     args_digest: "d".into(),
                     evorule_request_id: None,
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 6,
@@ -2112,6 +2123,7 @@ mod tests {
                     content_digest: "d".into(),
                     execution_profile: None,
                 },
+                hashes: None,
             },
             JournalLine {
                 seq: 7,
@@ -2121,6 +2133,7 @@ mod tests {
                     steps: 2,
                     duration_ms: 800,
                 },
+                hashes: None,
             },
         ];
         let d1 = build_journal_digest("s1", &lines);

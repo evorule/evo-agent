@@ -8398,6 +8398,16 @@ impl AgentRunner {
                                        if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
                                            tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
                                        }
+                                       // 批 F 锚定：journal 链尾写入引擎审计链（防整链重算；best-effort，失败下次终态补锚）
+                                       if let Some(j) = journal.as_ref() {
+                                           if let Err(e) = crate::agent::journal_anchor::anchor_to_engine_chain(
+                                               &runner.evorule_client,
+                                               &session_id,
+                                               j,
+                                           ).await {
+                                               tracing::warn!(session_id = %session_id, error = %e, "journal chain anchor failed (unanchored-tail)");
+                                           }
+                                       }
                                        // R2-T04 链体积观测（B3）：会话收尾时 best-effort 查审计链长告警
                                        runner.check_chain_size(&session_id).await;
                                        let state = match runner.evorule_client.get_state(&session_id).await {
@@ -8436,6 +8446,16 @@ impl AgentRunner {
                                    }
                                    "Error" => {
                                        let msg = event.payload.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                                       // 批 F 锚定：错误终态同样锚（终态锚覆盖 Stable/Error 两态）
+                                       if let Some(j) = journal.as_ref() {
+                                           if let Err(e) = crate::agent::journal_anchor::anchor_to_engine_chain(
+                                               &runner.evorule_client,
+                                               &session_id,
+                                               j,
+                                           ).await {
+                                               tracing::warn!(session_id = %session_id, error = %e, "journal chain anchor failed on Error terminal");
+                                           }
+                                       }
                                        // H1:回退预算执法——超预算熔断为 fail-visible(与非流式同语义)
                                        // 尝试 auto_rewind
                                        if let Ok(rewind_version) = runner.auto_rewind(&session_id).await {

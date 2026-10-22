@@ -3463,7 +3463,12 @@ mod tests {
     #[test]
     fn test_synth_replay_events_pairs_and_digest_guard() {
         use crate::agent::journal::{evorule_digest, JournalEvent, JournalLine};
-        let mk = |seq: u64, ts: u64, event: JournalEvent| JournalLine { seq, ts, event };
+        let mk = |seq: u64, ts: u64, event: JournalEvent| JournalLine {
+            seq,
+            ts,
+            event,
+            hashes: None,
+        };
         let content = r#"{"price":185.35}"#;
         let lines = vec![
             mk(
@@ -3538,6 +3543,7 @@ mod tests {
                 content_digest: "x".into(),
                 execution_profile: None,
             },
+            hashes: None,
         }];
         let events = super::synth_replay_events(&lines, &[], "s1");
         assert_eq!(events.len(), 1);

@@ -22,6 +22,7 @@ pub mod driver;
 pub mod event_ledger;
 pub mod handover_tool;
 pub mod journal;
+pub mod journal_anchor;
 pub mod judge_guard;
 pub mod lexstore;
 pub mod materializer;

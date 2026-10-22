@@ -519,6 +519,44 @@ pub struct JournalLine {
     pub ts: u64,
     /// 事件本体
     pub event: JournalEvent,
+    /// 链哈希三元组(链化行必有;存量旧行 None——格式单调性,验证计 unhashed)
+    pub hashes: Option<LineHashes>,
+}
+
+/// journal 行链哈希三元组(与 evorule WAL v2 同构;链步公式与内核 SSOT 同源,黄金向量锁定)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineHashes {
+    pub content_hash: String,
+    pub prev_hash: String,
+    pub chain_hash: String,
+}
+
+/// journal 链起点(与 evorule 审计链 genesis 语义对齐,独立账本本地文件)
+pub const JOURNAL_CHAIN_GENESIS: &str = "genesis";
+
+/// 归一 content 字节：解析→(去三哈希键)→重序列化的稳定字节。
+/// 写入侧与验证侧**同构**（防键序漂移）；未知字段保留在字节中
+/// （篡改者追加/删除任意键都改变 content，不可逐过规范化丢弃）。
+pub fn journal_normalized_content(raw_line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw_line).ok()?;
+    let mut obj = v.as_object()?.clone();
+    obj.remove("content_hash");
+    obj.remove("prev_hash");
+    obj.remove("chain_hash");
+    Some(serde_json::Value::Object(obj).to_string())
+}
+
+/// 行内容哈希:对归一 content 字节直接 blake3
+pub fn journal_content_hash(normalized_line: &str) -> String {
+    blake3::hash(normalized_line.as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// 链步:blake3(prev + content) —— 与 evorule audit-chain chain_step 同公式(跨仓等价由黄金向量测试锁定)
+pub fn journal_chain_step(prev: &str, content: &str) -> String {
+    let combined = format!("{prev}{content}");
+    blake3::hash(combined.as_bytes()).to_hex().to_string()
 }
 
 /// journal 错误面(打开/写入/重放全部显式化,不静默吞错)
@@ -545,6 +583,35 @@ pub enum JournalError {
     /// 事件序列化失败
     #[error("journal encode: {0}")]
     Encode(String),
+}
+
+/// 平铺编码+链哈希:先产不含哈希字段的平铺行(即 content 输入),再追加三元组。
+/// prev = 前行 chain_hash(首链化行为 JOURNAL_CHAIN_GENESIS)。
+fn encode_line_chained(
+    seq: u64,
+    ts: u64,
+    event: &JournalEvent,
+    prev: &str,
+) -> Result<(String, LineHashes), JournalError> {
+    let base = encode_line(seq, ts, event)?;
+    // content 锚归一字节（解析重序）而非原始产物：与验证侧同构且未知键不丢
+    let normalized = journal_normalized_content(&base)
+        .ok_or_else(|| JournalError::Corrupt("encode normalize failed".into()))?;
+    let content_hash = journal_content_hash(&normalized);
+    let chain_hash = journal_chain_step(prev, &content_hash);
+    let hashes = LineHashes {
+        content_hash: content_hash.clone(),
+        prev_hash: prev.to_string(),
+        chain_hash: chain_hash.clone(),
+    };
+    let mut v: serde_json::Value =
+        serde_json::from_str(&base).map_err(|e| JournalError::Corrupt(e.to_string()))?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("content_hash".into(), serde_json::json!(content_hash));
+        obj.insert("prev_hash".into(), serde_json::json!(prev));
+        obj.insert("chain_hash".into(), serde_json::json!(chain_hash));
+    }
+    Ok((v.to_string(), hashes))
 }
 
 /// 平铺编码:seq/ts + 事件的 type/payload 键合并为单行 JSON
@@ -586,9 +653,37 @@ fn decode_line(raw: &str) -> Result<JournalLine, JournalError> {
     let mut rest = obj.clone();
     rest.remove("seq");
     rest.remove("ts");
+    let hashes = obj
+        .get("chain_hash")
+        .and_then(|x| x.as_str())
+        .map(|_| LineHashes {
+            content_hash: obj
+                .get("content_hash")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            prev_hash: obj
+                .get("prev_hash")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            chain_hash: obj
+                .get("chain_hash")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
+    rest.remove("content_hash");
+    rest.remove("prev_hash");
+    rest.remove("chain_hash");
     let event: JournalEvent = serde_json::from_value(serde_json::Value::Object(rest))
         .map_err(|e| JournalError::Corrupt(format!("unknown event at seq {seq}: {e}")))?;
-    Ok(JournalLine { seq, ts, event })
+    Ok(JournalLine {
+        seq,
+        ts,
+        event,
+        hashes,
+    })
 }
 
 struct JournalInner {
@@ -598,6 +693,10 @@ struct JournalInner {
     turn_open: bool,
     /// 会话 ID(open 时登记;turn 守卫链熔断落账需要会话锚,免透传)
     session_id: String,
+    /// journal 链尾(存量未链化起步为 JOURNAL_CHAIN_GENESIS;open 续接恢复并验证)
+    chain_tail: String,
+    /// 距上次引擎链锚定的新增行数(锚定执行器消费;失败保留计数下次补锚)
+    lines_since_anchor: u64,
 }
 
 /// journal 写入器(廉价 Clone,内部 Arc+Mutex;每会话一个实例)
@@ -636,6 +735,7 @@ impl JournalWriter {
         let path = Self::path_for(dir, session_id);
         let mut last_seq = 0u64;
         let mut turn_count = 0u64;
+        let mut recovered_tail: Option<String> = None;
         // 尾部悬挂检测:turn_started 无配对 turn_ended = 上一进程死前轮未收尾。
         // 崩溃标记只在打开时补写(进程死亡瞬间什么也写不了,运行时不产生此
         // 事件);末事件已是崩溃标记则不重复补写(重复打开幂等)。
@@ -653,6 +753,7 @@ impl JournalWriter {
                 .rposition(|b| *b == b'\n')
                 .map(|pos| pos + 1)
                 .unwrap_or(0);
+            let mut chained_prev: Option<String> = None;
             let raw_lines: Vec<String> = String::from_utf8_lossy(&bytes[..valid_len])
                 .lines()
                 .map(str::to_string)
@@ -668,6 +769,41 @@ impl JournalWriter {
                         expected,
                         found: parsed.seq,
                     });
+                }
+                // 链连续性(带哈希段):content 重算+prev 链接+链步三查,失配 open 即失败
+                if let Some(h) = &parsed.hashes {
+                    let content = match journal_normalized_content(line) {
+                        Some(c) => journal_content_hash(&c),
+                        None => {
+                            return Err(JournalError::Corrupt(format!(
+                                "journal line {} normalize failed",
+                                parsed.seq
+                            )))
+                        }
+                    };
+                    if content != h.content_hash {
+                        return Err(JournalError::Corrupt(format!(
+                            "journal chain content_hash mismatch at seq {}",
+                            parsed.seq
+                        )));
+                    }
+                    let expect_prev = chained_prev
+                        .clone()
+                        .unwrap_or_else(|| JOURNAL_CHAIN_GENESIS.to_string());
+                    if h.prev_hash != expect_prev {
+                        return Err(JournalError::Corrupt(format!(
+                            "journal chain broken at seq {} (prev_hash mismatch)",
+                            parsed.seq
+                        )));
+                    }
+                    if journal_chain_step(&expect_prev, &content) != h.chain_hash {
+                        return Err(JournalError::Corrupt(format!(
+                            "journal chain_hash mismatch at seq {}",
+                            parsed.seq
+                        )));
+                    }
+                    chained_prev = Some(h.chain_hash.clone());
+                    recovered_tail = Some(h.chain_hash.clone());
                 }
                 expected += 1;
                 last_seq = parsed.seq;
@@ -717,6 +853,8 @@ impl JournalWriter {
                 turn_count,
                 turn_open: false,
                 session_id: session_id.to_string(),
+                chain_tail: recovered_tail.unwrap_or_else(|| JOURNAL_CHAIN_GENESIS.to_string()),
+                lines_since_anchor: 0,
             })),
             registry_key,
             file_path: path,
@@ -736,6 +874,36 @@ impl JournalWriter {
             .unwrap_or_else(|p| p.into_inner())
             .session_id
             .clone()
+    }
+
+    /// journal 链尾哈希(锚定执行器写入引擎审计链用;空账本=genesis)
+    pub fn chain_tail(&self) -> String {
+        self.core
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chain_tail
+            .clone()
+    }
+
+    /// 当前末行 seq(锚定执行器的锚值组成)
+    pub fn last_seq(&self) -> u64 {
+        self.core.lock().unwrap_or_else(|p| p.into_inner()).last_seq
+    }
+
+    /// 距上次锚定的新增行数(锚定策略消费)
+    pub fn lines_since_anchor(&self) -> u64 {
+        self.core
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .lines_since_anchor
+    }
+
+    /// 锚定成功回执:清零计数(锚定执行器在引擎链写入成功后调用)
+    pub fn mark_anchored(&self) {
+        self.core
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .lines_since_anchor = 0;
     }
 
     /// 读取全量 journal 行(会话收尾投影消费;与写者并存只读句柄)。
@@ -786,10 +954,12 @@ impl JournalWriter {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let line = encode_line(seq, ts, &event)?;
+        let (line, hashes) = encode_line_chained(seq, ts, &event, &g.chain_tail)?;
         g.file.write_all(line.as_bytes())?;
         g.file.write_all(b"\n")?;
         g.file.flush()?;
+        g.chain_tail = hashes.chain_hash;
+        g.lines_since_anchor += 1;
         g.last_seq = seq;
         Ok(seq)
     }
@@ -808,17 +978,20 @@ impl JournalWriter {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let line = encode_line(
+            let (line, hashes) = encode_line_chained(
                 g.last_seq + 1,
                 ts,
                 &JournalEvent::TurnStarted {
                     turn_seq,
                     goal: truncate_text(goal, 512),
                 },
+                &g.chain_tail,
             )?;
             g.file.write_all(line.as_bytes())?;
             g.file.write_all(b"\n")?;
             g.file.flush()?;
+            g.chain_tail = hashes.chain_hash;
+            g.lines_since_anchor += 1;
             g.last_seq += 1;
             g.turn_count = turn_seq;
             g.turn_open = true;
@@ -1802,6 +1975,115 @@ fn truncate_text(s: &str, max_chars: usize) -> String {
     }
 }
 
+// ===========================================================================
+// 批 F:journal 链只读验证(verify 工具口径;与 open 续接验证同口径,
+// 由测试保证两口径一致——改动任一侧须同批核对另一侧)
+// ===========================================================================
+
+/// journal 文件验证报告
+#[derive(Debug, Clone)]
+pub struct JournalVerifyReport {
+    pub total_lines: u64,
+    /// 存量无哈希行数(格式单调性:计入但不假充验证过)
+    pub unhashed_lines: u64,
+    /// seq 连续 + 带哈希段三查是否全过(半行单独标注)
+    pub verified: bool,
+    /// 链尾(无任何哈希行为 genesis)
+    pub chain_tail: String,
+    /// 首个失配/半行描述
+    pub first_failure: Option<String>,
+}
+
+/// 只读验证 journal 文件(不注册写者、不改文件)
+pub fn verify_journal_file(path: &std::path::Path) -> Result<JournalVerifyReport, JournalError> {
+    let bytes = std::fs::read(path)?;
+    let valid_len = bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let partial_tail = valid_len < bytes.len();
+    let text = String::from_utf8_lossy(&bytes[..valid_len]).to_string();
+
+    let mut expected = 1u64;
+    let mut chained_prev: Option<String> = None;
+    let mut total = 0u64;
+    let mut unhashed = 0u64;
+    let mut tail = JOURNAL_CHAIN_GENESIS.to_string();
+    let mut failure: Option<String> = None;
+
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        total += 1;
+        let parsed = match decode_line(line) {
+            Ok(p) => p,
+            Err(e) => {
+                failure = Some(format!("line {expected}: {e}"));
+                break;
+            }
+        };
+        if parsed.seq != expected {
+            failure = Some(format!(
+                "seq gap: expected {expected}, found {}",
+                parsed.seq
+            ));
+            break;
+        }
+        if let Some(h) = &parsed.hashes {
+            let content = match journal_normalized_content(line) {
+                Some(c) => journal_content_hash(&c),
+                None => {
+                    failure = Some(format!("seq {expected}: normalize failed"));
+                    break;
+                }
+            };
+            let expect_prev = chained_prev
+                .clone()
+                .unwrap_or_else(|| JOURNAL_CHAIN_GENESIS.to_string());
+            if content != h.content_hash {
+                failure = Some(format!(
+                    "content_hash mismatch at seq {}（行内容被改）",
+                    parsed.seq
+                ));
+                break;
+            }
+            if h.prev_hash != expect_prev {
+                failure = Some(format!(
+                    "chain broken at seq {}（prev_hash 链接失配——删行/重排）",
+                    parsed.seq
+                ));
+                break;
+            }
+            if journal_chain_step(&expect_prev, &content) != h.chain_hash {
+                failure = Some(format!(
+                    "chain_hash mismatch at seq {}（链值被改）",
+                    parsed.seq
+                ));
+                break;
+            }
+            chained_prev = Some(h.chain_hash.clone());
+            tail = h.chain_hash.clone();
+        } else {
+            unhashed += 1;
+        }
+        expected += 1;
+    }
+
+    if partial_tail && failure.is_none() {
+        failure =
+            Some("partial tail line（半行——崩溃产物，受控恢复思路同 evorule truncate）".into());
+    }
+    Ok(JournalVerifyReport {
+        total_lines: total,
+        unhashed_lines: unhashed,
+        verified: failure.is_none(),
+        chain_tail: tail,
+        first_failure: failure,
+    })
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2272,6 +2554,135 @@ mod tests {
 
     use super::*;
     use JournalEvent as JE;
+
+    // ===== 批 F：链化 =====
+
+    /// 黄金向量:链步公式与 evorule audit-chain SSOT 逐字节等价
+    /// (STEP 值由内核 governance::hash::chain_step 实算固化——跨仓锁定)
+    #[test]
+    fn golden_chain_step_matches_kernel_ssot() {
+        const C0: &str = "56de9ce95d41896edf081f452b4ea5d3ad6508de3a0781a36fa5fbd13c586aa1";
+        const C1: &str = "902f22869450a78851d5bf1396b64d4bc7be0666468a39d2dac53b7d176f8047";
+        const STEP1: &str = "a7d4cc10fdba7231ad28495030262821b92eb72b5f7e29ba3aa3497dfff7bfa4";
+        const STEP2: &str = "513b620435d70994b25fd8c864b1b6c75fe1434af2f185a1c2499fddd631f3a0";
+        assert_eq!(journal_chain_step("genesis", C0), STEP1);
+        assert_eq!(journal_chain_step(STEP1, C1), STEP2);
+    }
+
+    /// 链化 roundtrip:写→verify PASS→重开续写→链尾推进
+    #[test]
+    fn chain_roundtrip_reopen_and_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-chain").unwrap();
+        let g = w.begin_turn("goal").unwrap();
+        g.end("success", 0, 0);
+        w.push(JE::SessionResumed {
+            replay_seq: 0,
+            rebuilt: vec![],
+        })
+        .unwrap();
+        let tail1 = w.chain_tail();
+        assert_ne!(tail1, JOURNAL_CHAIN_GENESIS);
+        assert!(w.lines_since_anchor() >= 2);
+        drop(w);
+
+        let report = verify_journal_file(&JournalWriter::path_for(dir.path(), "s-chain")).unwrap();
+        assert!(report.verified, "{:?}", report.first_failure);
+        assert_eq!(report.total_lines, 3);
+        assert_eq!(report.unhashed_lines, 0);
+        assert_eq!(report.chain_tail, tail1);
+
+        let w2 = JournalWriter::open(dir.path(), "s-chain").unwrap();
+        w2.push(JE::SessionCrashed {
+            reason: "done".into(),
+        })
+        .unwrap();
+        assert_ne!(w2.chain_tail(), tail1, "续写必须推进链尾");
+        let r2 = verify_journal_file(&JournalWriter::path_for(dir.path(), "s-chain")).unwrap();
+        assert!(r2.verified);
+        assert_eq!(r2.total_lines, 4);
+        assert_eq!(r2.chain_tail, w2.chain_tail());
+    }
+
+    /// 篡改检出:改行内容(不重算)→verify FAIL 且 open 拒绝续写
+    #[test]
+    fn tamper_content_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-tamper").unwrap();
+        let g = w.begin_turn("g").unwrap();
+        g.end("success", 0, 0);
+        w.push(JE::SessionResumed {
+            replay_seq: 1,
+            rebuilt: vec!["msgs".into()],
+        })
+        .unwrap();
+        drop(w);
+        let path = JournalWriter::path_for(dir.path(), "s-tamper");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+        let obj: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        let mut o = obj.as_object().unwrap().clone();
+        o.insert("rebuilt".into(), serde_json::json!(["tampered"]));
+        lines[1] = serde_json::to_string(&serde_json::Value::Object(o)).unwrap();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let report = verify_journal_file(&path).unwrap();
+        assert!(!report.verified, "篡改必须被检出");
+        let f = report.first_failure.unwrap();
+        assert!(f.contains("content_hash") || f.contains("chain"), "{f}");
+        assert!(JournalWriter::open(dir.path(), "s-tamper").is_err());
+    }
+
+    /// 篡改检出:删中间行→seq gap
+    #[test]
+    fn tamper_delete_line_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-del").unwrap();
+        let g = w.begin_turn("g").unwrap();
+        g.end("success", 0, 0);
+        w.push(JE::SessionResumed {
+            replay_seq: 1,
+            rebuilt: vec!["msgs".into()],
+        })
+        .unwrap();
+        drop(w);
+        let path = JournalWriter::path_for(dir.path(), "s-del");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        std::fs::write(&path, lines[0].to_string() + "\n" + lines[2] + "\n").unwrap();
+        let report = verify_journal_file(&path).unwrap();
+        assert!(!report.verified);
+    }
+
+    /// 半行(崩溃产物)→verify 标注 partial
+    #[test]
+    fn partial_tail_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-half-f").unwrap();
+        let g = w.begin_turn("g").unwrap();
+        g.end("success", 0, 0);
+        drop(w);
+        let path = JournalWriter::path_for(dir.path(), "s-half-f");
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("{\"seq\":3,\"ts\":1");
+        std::fs::write(&path, raw).unwrap();
+        let report = verify_journal_file(&path).unwrap();
+        assert!(!report.verified);
+        assert!(report.first_failure.unwrap().contains("partial tail"));
+    }
+
+    /// 锚定计数语义
+    #[test]
+    fn anchor_counter_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-anchor").unwrap();
+        assert_eq!(w.lines_since_anchor(), 0);
+        let g = w.begin_turn("g").unwrap();
+        g.end("success", 0, 0);
+        assert_eq!(w.lines_since_anchor(), 2);
+        w.mark_anchored();
+        assert_eq!(w.lines_since_anchor(), 0);
+    }
 
     #[test]
     fn roundtrip_all_14_events() {
