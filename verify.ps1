@@ -182,3 +182,7 @@ if (Test-Phase 'contract') {
 
 if ($failed) { Write-Host "== RESULT: FAIL =="; exit 1 }
 Write-Host "== RESULT: ALL PASS =="
+# Explicit exit 0: a natural script end leaves $LASTEXITCODE at whatever the
+# last NATIVE command set it to, and CI steps propagate $LASTEXITCODE -- a
+# stale non-zero from an earlier phase would false-red an ALL PASS run.
+exit 0

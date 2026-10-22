@@ -113,6 +113,7 @@ jobs:
         run: |
           if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
           ./verify.ps1 -Phase build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
 
       - name: verify 2/5 test-compile
@@ -121,6 +122,7 @@ jobs:
         run: |
           if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
           ./verify.ps1 -Phase test-compile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
 
       - name: verify 3/5 test-run
@@ -129,15 +131,20 @@ jobs:
         run: |
           if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
           ./verify.ps1 -Phase test-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
 
       - name: verify 4/5 secret scan
         shell: pwsh
-        run: ./verify.ps1 -Phase scan
+        run: |
+          ./verify.ps1 -Phase scan
+          exit $LASTEXITCODE
 
       - name: verify 5/5 dep contract
         shell: pwsh
-        run: ./verify.ps1 -Phase contract
+        run: |
+          ./verify.ps1 -Phase contract
+          exit $LASTEXITCODE
 
       - name: doc tests
         if: matrix.tests
