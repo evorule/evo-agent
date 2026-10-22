@@ -49,6 +49,7 @@ pub mod tool_manifest;
 pub mod tool_retry;
 pub mod tool_trace;
 pub mod translator;
+pub mod wire_attestation;
 pub mod workflow;
 pub mod writeback;
 

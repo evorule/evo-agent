@@ -1160,6 +1160,8 @@ pub struct AgentRunner {
     output_validator: Option<OutputValidator>,
     /// R3-b/G-7:已落链的格式指令(去重——同指令不重复落链)
     landed_format_instruction: std::sync::Mutex<Option<String>>,
+    /// D6：wire 存证调用序（会话级单调；Atomic 供 &self 上下文自增）
+    wire_attestation_seq: std::sync::atomic::AtomicU64,
     /// G11:当前步骤的格式校验重试计数(超过 max 时降级为接受原输出)
     output_format_retries: usize,
     /// G8:工具审批回调(None = 默认拒绝 candidate 工具,安全优先)
@@ -1401,6 +1403,7 @@ impl AgentRunner {
             cancel_token: CancellationToken::new(),
             output_validator: None,
             landed_format_instruction: std::sync::Mutex::new(None),
+            wire_attestation_seq: std::sync::atomic::AtomicU64::new(0),
             output_format_retries: 0,
             approval_callback: None,
             ask_user_callback: None,
@@ -3970,6 +3973,7 @@ impl AgentRunner {
                 cancel_token: CancellationToken::new(),
                 output_validator,
                 landed_format_instruction: std::sync::Mutex::new(None),
+                wire_attestation_seq: std::sync::atomic::AtomicU64::new(0),
                 output_format_retries: 0,
                 approval_callback: approval_callback.clone(),
                 // 批K 段7:子代理无人值守——ask callback 缺位 = 立即无人态(不干等)
@@ -4224,6 +4228,53 @@ impl AgentRunner {
         }
     }
 
+    /// D6 字节级存证：实际发送消息集合的哈希+边界信息入引擎链
+    /// （payload 事实 `__audit__.wire_attestation.{seq}`；fail-soft——失败
+    /// warn 落日志，journal 的 WireRendered.content_hash 仍可对账）。
+    /// seq 由会话级计数器分配（与调用顺序一致）。
+    async fn attest_wire(
+        &self,
+        session_id: &str,
+        model: &str,
+        temperature: f64,
+        serde_messages: &serde_json::Value,
+        messages_sent: usize,
+        purpose: &str,
+    ) {
+        let seq = self
+            .wire_attestation_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (wire_hash, wire_len) =
+            crate::agent::wire_attestation::compute(model, temperature, serde_messages);
+        let record = serde_json::json!({
+            "seq": seq,
+            "model": model,
+            "wire_hash": wire_hash,
+            "wire_len": wire_len,
+            "messages_sent": messages_sent,
+            "purpose": purpose,
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        });
+        if let Err(e) = self
+            .evorule_client
+            .update_payload(
+                session_id,
+                &crate::agent::wire_attestation::attestation_path(seq),
+                &record,
+            )
+            .await
+        {
+            warn!(
+                %session_id,
+                seq, error = %e,
+                "D6: wire attestation persist failed (fail-soft; journal carries wire hash)"
+            );
+        }
+    }
+
     async fn handle_call_external(
         &mut self,
         session_id: &str,
@@ -4348,6 +4399,17 @@ impl AgentRunner {
         let serde_messages = serde_json::to_value(&messages_to_send)
             .map_err(|e| AgentError::Internal(format!("serialize messages: {}", e)))?;
         let tcb_messages = serde_messages.clone();
+
+        // D6 字节级存证：发送时刻哈希入链（fail-soft；journal 侧 WireRendered 对账）
+        self.attest_wire(
+            session_id,
+            model,
+            temperature,
+            &serde_messages,
+            messages_to_send.len(),
+            "react",
+        )
+        .await;
 
         let mut call_params = serde_json::Map::new();
         call_params.insert("model".to_string(), Value::from(model.to_string()));
@@ -7294,6 +7356,18 @@ impl AgentRunner {
                                                    }
                                                };
                                                let tcb_messages = serde_messages.clone();
+
+                                               // D6 字节级存证：发送时刻哈希入链（fail-soft）
+                                               runner
+                                                   .attest_wire(
+                                                       &session_id,
+                                                       model,
+                                                       temperature,
+                                                       &serde_messages,
+                                                       messages_to_send.len(),
+                                                       "react-stream",
+                                                   )
+                                                   .await;
 
                                                let mut call_params = serde_json::Map::new();
                                                call_params.insert("model".to_string(), Value::from(model.to_string()));
