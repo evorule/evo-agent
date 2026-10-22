@@ -2743,6 +2743,7 @@ async fn get_atif(
         // 单会话端点不做父链路反查(父 journal 扫描属批量面);子轨迹
         // 带链路标注走 journal::scan_delegate_spawns 发现+离线导出
         parent_session_id: None,
+        engine_chain_tail: None,
     };
     let trajectory = crate::agent::atif::export(sources)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;

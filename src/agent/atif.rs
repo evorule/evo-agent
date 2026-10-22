@@ -78,6 +78,9 @@ pub struct AtifSources<'a> {
     /// 父会话链路(委托子轨迹标注;调用方经父 journal 扫描
     /// `scan_delegate_spawns` 反查后传入,无则缺省——schema 零改动)
     pub parent_session_id: Option<String>,
+    /// 引擎审计链链尾哈希（EA-2：下游验 ATIF 可回验内容源完整性；
+    /// 调用方经 audit/export 或 verify 端点获取；None=离线降级如实缺省）
+    pub engine_chain_tail: Option<String>,
 }
 
 /// 导出错误(fail-visible,不静默产出半截轨迹)
@@ -153,6 +156,9 @@ pub struct AtifRootExtra {
     /// 既有导出恒 false 不序列化,字节不变)
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub resumed_after_crash: bool,
+    /// 引擎审计链链尾（EA-2：下游验 ATIF 可回验内容源；None=离线降级缺省）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_chain_tail: Option<String>,
 }
 
 /// ATIF StepObject(RFC §StepObject)
@@ -1044,6 +1050,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             exporter: format!("evo-agent atif v{}", env!("CARGO_PKG_VERSION")),
             parent_session_id: sources.parent_session_id.clone(),
             resumed_after_crash,
+            engine_chain_tail: sources.engine_chain_tail.clone(),
         },
     })
 }
@@ -1349,6 +1356,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         assert!(export(src).is_err());
     }
@@ -1443,6 +1451,7 @@ mod tests {
             audit_facts: &audit,
             tool_definitions: tools,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.schema_version, "ATIF-v1.8");
@@ -1545,6 +1554,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         // 步:system + user + agent(transcript 无对位 assistant 回退 journal 摘要?有 asst idx1 → 对位)
@@ -1659,6 +1669,7 @@ mod tests {
             audit_facts: &audit,
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         let agent_steps: Vec<&AtifStep> = t.steps.iter().filter(|s| s.source == "agent").collect();
@@ -1716,6 +1727,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.steps.len(), 3, "system+user+agent,sidecar 不成步");
@@ -1762,6 +1774,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         // system + user + agent + compaction-system
@@ -1810,6 +1823,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         // system + user + i2_scan_report-system(turn 内无 LLM 步,agent 步不产生)
@@ -1860,6 +1874,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         // system + user + wire_rendered-system(turn 内无 LLM 步,agent 步不产生)
@@ -1920,6 +1935,7 @@ mod tests {
             audit_facts: &audit,
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         let a = t.steps.last().unwrap();
@@ -1974,6 +1990,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.steps.len(), 3, "crash 截断:后续 turn_started 不入步");
@@ -2045,6 +2062,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.steps.len(), 5, "两段都入步:system+崩溃前 2 步+续接 2 步");
@@ -2101,6 +2119,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         assert_eq!(t.steps.len(), 3, "system+user+agent 三步,重试事件不产生步");
@@ -2161,6 +2180,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = export(src).unwrap();
         let a = t.steps.last().unwrap();
@@ -2205,6 +2225,7 @@ mod tests {
             audit_facts: &audit,
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let a = serde_json::to_string(&export(mk()).unwrap()).unwrap();
         let b = serde_json::to_string(&export(mk()).unwrap()).unwrap();
@@ -2294,6 +2315,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let t = serde_json::to_value(export(mk()).unwrap()).unwrap();
         let serialized = serde_json::to_string(&t).unwrap();
@@ -2315,6 +2337,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: None,
+            engine_chain_tail: None,
         };
         let a = serde_json::to_value(export(mk()).unwrap()).unwrap();
         let b = serde_json::to_value(export(mk2()).unwrap()).unwrap();
@@ -2346,6 +2369,7 @@ mod tests {
             audit_facts: &[],
             tool_definitions: None,
             parent_session_id: parent,
+            engine_chain_tail: None,
         };
         let with_parent =
             serde_json::to_value(export(mk(Some("parent-3".into()))).unwrap()).unwrap();
