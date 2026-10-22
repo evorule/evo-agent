@@ -72,6 +72,7 @@ service_tools = [
   "checksum_luhn",
   "cny_amount_upper",
   "config_persist",
+  "export_report_pdf",
   "fluid_bernoulli",
   "fluid_continuity",
   "fluid_hydrostatic",
