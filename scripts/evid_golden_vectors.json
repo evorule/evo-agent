@@ -1,0 +1,72 @@
+{
+  "comment": "EVID evid_hash 跨语言黄金向量——值由 Python 独立推导（json.dumps ensure_ascii=False separators=(',',':') + blake3），Rust 测试逐值断言（src/agent/evid.rs）。两实现任一漂移即红。改动哈希契约=必须同步再生成本文件与 Rust 断言。",
+  "hash_contract": "evid_hash = blake3(canonical_json([str(seq), step_id, fact_type, cause|null, previous_evid, fact_hash, domain_check|null]))",
+  "genesis_root": "blake3:d474d757dfcc53544d8f870dfcd8c74d894a24c24225b9c1a9dc9329fc2c8a34",
+  "vectors": [
+    {
+      "name": "v1_genesis_record_null_cause_null_domain",
+      "causal": {
+        "seq": 1,
+        "step_id": "s1",
+        "fact_type": "Command",
+        "cause": null,
+        "previous_evid": "",
+        "fact_hash": "blake3:56de9ce95d41896edf081f452b4ea5d3ad6508de3a0781a36fa5fbd13c586aa1",
+        "domain_check": null
+      },
+      "expect_evid_hash": "blake3:b559488746f4e07b9a565be57293bdd498f026175d75aea72149e97073375083"
+    },
+    {
+      "name": "v2_cause_number_domain_string",
+      "causal": {
+        "seq": 2,
+        "step_id": "s2",
+        "fact_type": "IoResponse",
+        "cause": 1,
+        "previous_evid": "blake3:b559488746f4e07b9a565be57293bdd498f026175d75aea72149e97073375083",
+        "fact_hash": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "domain_check": "sat"
+      },
+      "expect_evid_hash": "blake3:68f99218b5d21220715d7da0e25f52e550633860bde32aa18b7c82d4a089c729"
+    },
+    {
+      "name": "v3_unicode_fact_type",
+      "causal": {
+        "seq": 3,
+        "step_id": "s3",
+        "fact_type": "用户消息",
+        "cause": 2,
+        "previous_evid": "blake3:68f99218b5d21220715d7da0e25f52e550633860bde32aa18b7c82d4a089c729",
+        "fact_hash": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "domain_check": null
+      },
+      "expect_evid_hash": "blake3:4a72451f16928681e820bc79e6d492b811c894947b651cb78d1ad52f28d9451a"
+    },
+    {
+      "name": "v4_u64_max_seq",
+      "causal": {
+        "seq": 18446744073709551615,
+        "step_id": "s18446744073709551615",
+        "fact_type": "Command",
+        "cause": null,
+        "previous_evid": "",
+        "fact_hash": "blake3:56de9ce95d41896edf081f452b4ea5d3ad6508de3a0781a36fa5fbd13c586aa1",
+        "domain_check": null
+      },
+      "expect_evid_hash": "blake3:178ad5c28ce27ac9a28b9b88f0abf39a42370cbfc9c18ba1836318a6b342af80"
+    },
+    {
+      "name": "v5_domain_violated_large_prev",
+      "causal": {
+        "seq": 7,
+        "step_id": "s7",
+        "fact_type": "TransitionTrace",
+        "cause": 6,
+        "previous_evid": "blake3:178ad5c28ce27ac9a28b9b88f0abf39a42370cbfc9c18ba1836318a6b342af80",
+        "fact_hash": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "domain_check": "violated"
+      },
+      "expect_evid_hash": "blake3:0a05b6ee1a0b265470a37210a9dc867939689f032b8146e8890e415f3fffe23a"
+    }
+  ]
+}

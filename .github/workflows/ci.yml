@@ -205,3 +205,33 @@ jobs:
 
       - name: 公开面矩阵扫描 (AI 身份 + 内部编号阻断)
         run: python3 scripts/scan_public_face.py --fail-on A1 --fail-on B
+
+  # ==========================================================================
+  # evid-parity：EVID 证据投影跨语言对拍。
+  # Python 验证器（scripts/evid_verify.py）与 Rust 投影器（src/agent/evid.rs）
+  # 共享同一哈希契约，由黄金向量（evid_golden_vectors.json）双向锁定：
+  #   1) 自检 bootstrap 4/4
+  #   2) 黄金向量对拍（Python 重算 == 期望值；Rust 侧在 cargo test 逐值断言）
+  #   3) 七连破坏注入验收（篡改分类逐项红绿判定）
+  # ==========================================================================
+  evid-parity:
+    name: evid cross-lang parity (vectors + injection)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install verifier deps (blake3 + pynacl)
+        run: pip install blake3 pynacl
+
+      - name: EVID verifier self-test (bootstrap 4/4)
+        run: python3 scripts/evid_verify.py --self-test
+
+      - name: EVID golden vectors cross-language parity
+        run: python3 scripts/evid_verify.py --vectors scripts/evid_golden_vectors.json
+
+      - name: EVID seven-fold tamper injection acceptance
+        run: python3 scripts/evid_injection_test.py
