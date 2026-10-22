@@ -1607,10 +1607,23 @@ impl AgentRunner {
         for tool_name in &config.tool_names {
             let is_after_builder = tool_name == "delegate" || tool_name == "session_spawn";
             let is_wildcard = tool_name.ends_with('*');
+            // 交互件条件降级：ask_user 依赖会话回调通道，仅 serve/工作台装配面注册；
+            // CLI run 等无交互通道的面按"声明保留、运行面缺席"降级——工具不进
+            // 清单即模型不可见（不会调到），记 warn 后放行。硬报错会让 headless
+            // run 在装配校验一步即断（与 delegate/session_spawn 预放行同族语义）。
+            let is_interactive_only = tool_name == "ask_user";
+            if !tool_handler.has_tool(tool_name) && is_interactive_only {
+                tracing::warn!(
+                    agent = %def.agent_type,
+                    "交互件 '{}' 在当前装配面无回调通道，降级缺席（不进工具清单）",
+                    tool_name
+                );
+            }
             if !tool_handler.has_tool(tool_name)
                 && !introspect_allowed.contains(tool_name)
                 && !is_after_builder
                 && !is_wildcard
+                && !is_interactive_only
             {
                 return Err(AgentError::Internal(format!(
                     "agent '{}' requires tool '{}' but it is NOT registered in tool_handler; \
