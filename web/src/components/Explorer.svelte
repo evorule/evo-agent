@@ -65,6 +65,23 @@
     return 'modified';
   }
 
+  // ---- 文件类型图标着色(Seti 风,按扩展名;仅图标提色,文件名不受影响) ----
+  // 语义色沿用行业惯例(语言官网/Seti 配色),与 git-letter 语义色同性质。
+  const FILE_ICON_EXT = {
+    svelte: 'svelte', rs: 'rust', ts: 'ts', tsx: 'ts', js: 'js', jsx: 'js',
+    mjs: 'js', cjs: 'js', json: 'json', md: 'md', markdown: 'md',
+    css: 'css', scss: 'css', html: 'html', htm: 'html', toml: 'toml',
+    yml: 'toml', yaml: 'toml', py: 'py', sh: 'sh', ps1: 'sh', bat: 'sh',
+    cmd: 'sh', sql: 'sql', go: 'go', lock: 'lock', svg: 'svg',
+    png: 'img', jpg: 'img', jpeg: 'img', gif: 'img', ico: 'img',
+    woff: 'font', woff2: 'font', ttf: 'font', otf: 'font', txt: 'plain',
+  };
+
+  function fileIconClass(name) {
+    const m = /\.([a-z0-9]+)$/i.exec(name || '');
+    return 'fi-' + (FILE_ICON_EXT[m ? m[1].toLowerCase() : ''] || 'plain');
+  }
+
   let rootName = 'evo-agent(工作区)';
   let rootChildren = [];
   let rows = []; // [{node, depth}]
@@ -855,10 +872,11 @@
         <div
           class="node {node.kind}"
           class:selected={selected && selected.path === node.path}
+          class:active={node.kind === 'file' && node.path === $activePath}
           class:drop-target={dragOverPath === node.path}
           class:flash={flashPath === node.path}
           data-tree-path={node.path}
-          style="padding-left: {10 + depth * 14}px"
+          style="--depth: {depth}; padding-left: {10 + depth * 14}px"
           role="treeitem"
           aria-selected={node.kind === 'file' && node.path === $activePath}
           aria-expanded={node.kind === 'dir' ? !!dirState.get(node.path)?.expanded : undefined}
@@ -884,10 +902,15 @@
               <path d="M9 6l6 6-6 6" />
             </svg>
             <svg class="icon dir" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8">
-              <path d="M4 5a1 1 0 0 1 1-1h5l2 2h7a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5Z" />
+              {#if dirState.get(node.path)?.expanded}
+                <!-- 开态:盖板掀起(lucide folder-open) -->
+                <path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" />
+              {:else}
+                <path d="M4 5a1 1 0 0 1 1-1h5l2 2h7a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5Z" />
+              {/if}
             </svg>
           {:else}
-            <svg class="icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8">
+            <svg class="icon {fileIconClass(node.name)}" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8">
               <path d="M7 3h7l4 4v14H7z" />
             </svg>
           {/if}
@@ -1232,27 +1255,52 @@
     align-items: center;
     gap: 5px;
     padding-right: var(--sp-md);
-    height: 26px;
+    height: 24px;
     font-size: var(--fs-sm);
     color: var(--sidebar-text);
     cursor: pointer;
     user-select: none;
     white-space: nowrap;
     overflow: hidden;
+    position: relative;
+  }
+  /* 缩进参考线(VS Code 同款):每 14px 一条 1px 淡线,宽度止于本行内容起点;
+     depth=0 时宽 10px,首线落在 13px 被裁剪,自然不可见 */
+  .node::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: calc(10px + var(--depth, 0) * 14px);
+    pointer-events: none;
+    background: repeating-linear-gradient(
+      to right,
+      transparent 0 13px,
+      var(--border) 13px 14px
+    );
   }
   .node.naming {
     cursor: default;
   }
   .node:hover {
-    background: rgba(255, 255, 255, 0.06);
+    background-color: rgba(255, 255, 255, 0.06);
   }
   .node.selected {
-    background: var(--bg-active);
+    background-color: var(--bg-active);
+  }
+  /* 打开文件高亮:文字提亮 + 品牌色左标记(VS Code 同款语义) */
+  .node.active {
+    box-shadow: inset 2px 0 0 var(--brand);
+  }
+  .node.active .name {
+    color: var(--text-primary);
+    font-weight: var(--fw-med);
   }
   .node.drop-target {
     outline: 1px dashed var(--brand);
     outline-offset: -1px;
-    background: var(--brand-bg);
+    background-color: var(--brand-bg);
   }
   /* H2:定位闪烁(面包屑/命令跳目录时 1.5s 渐隐) */
   .node.flash {
@@ -1297,6 +1345,24 @@
     color: var(--brand);
     opacity: 0.85;
   }
+  /* 文件类型着色(Seti/语言官网惯例色,提亮到暗底可辨) */
+  .icon.fi-svelte { color: #e0643c; }
+  .icon.fi-rust { color: #d98a4b; }
+  .icon.fi-ts { color: #4d9bd7; }
+  .icon.fi-js { color: #d9c35c; }
+  .icon.fi-json { color: #cbb94d; }
+  .icon.fi-md { color: #6aa3c4; }
+  .icon.fi-css { color: #5c9fd6; }
+  .icon.fi-html { color: #d38a52; }
+  .icon.fi-toml { color: #a67fc9; }
+  .icon.fi-py { color: #4d8fc9; }
+  .icon.fi-sh { color: #89c46f; }
+  .icon.fi-sql { color: #c98a5c; }
+  .icon.fi-go { color: #5cc8d8; }
+  .icon.fi-lock { color: #8a8f98; }
+  .icon.fi-svg { color: #ffb13b; }
+  .icon.fi-img { color: #7fb3d9; }
+  .icon.fi-font { color: #b08ac9; }
   .name {
     overflow: hidden;
     text-overflow: ellipsis;
