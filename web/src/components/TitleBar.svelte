@@ -42,9 +42,23 @@
   });
   // 任务 chip:运行中数量
   $: runningCount = Object.values($taskRuns).filter((r) => r.state === 'running').length;
+
+  // 无边框窗口三键(window.__TAURI__ 由壳 withGlobalTauri 注入,权限见壳侧
+  // capabilities/main-window.json 四项最小授权;dev 浏览器无此全局→整组隐藏)
+  const winApi =
+    typeof window !== 'undefined' && window.__TAURI__?.window ? window.__TAURI__.window : null;
+  function winMin() {
+    winApi?.getCurrentWindow().minimize();
+  }
+  function winMax() {
+    winApi?.getCurrentWindow().toggleMaximize();
+  }
+  function winClose() {
+    winApi?.getCurrentWindow().close();
+  }
 </script>
 
-<header class="header">
+<header class="header" data-tauri-drag-region>
   <div class="brand">
     <span class="logo" aria-hidden="true">
       <!-- EvoRule 内核徽标:金色双环内等号(与 evorule-console-cloud 一致) -->
@@ -113,6 +127,25 @@
     <span class="conn {statusClass[$connStatus]}">
       <span class="dot"></span>{statusText[$connStatus]}
     </span>
+    {#if winApi}
+      <div class="win-controls">
+        <button class="win-btn" title="最小化" aria-label="最小化" onclick={winMin}>
+          <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
+            <path d="M2 6h8" stroke="currentColor" stroke-width="1.2" />
+          </svg>
+        </button>
+        <button class="win-btn" title="最大化/还原" aria-label="最大化/还原" onclick={winMax}>
+          <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
+            <rect x="2.5" y="2.5" width="7" height="7" stroke="currentColor" stroke-width="1.2" fill="none" />
+          </svg>
+        </button>
+        <button class="win-btn win-close" title="关闭" aria-label="关闭" onclick={winClose}>
+          <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
+            <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.2" />
+          </svg>
+        </button>
+      </div>
+    {/if}
   </div>
 </header>
 
@@ -217,5 +250,32 @@
   .conn.neutral {
     background: var(--bg-hover);
     color: var(--text-secondary);
+  }
+  /* 无边框窗口三键:低调图标钮,hover 提亮;close hover 红底白叉(现代应用惯例) */
+  .win-controls {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: var(--sp-xs);
+  }
+  .win-btn {
+    width: 34px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .win-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+  .win-btn.win-close:hover {
+    background: var(--danger);
+    color: #fff;
   }
 </style>

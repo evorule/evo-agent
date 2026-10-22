@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window-controls",
+  "description": "工作台(main,远程 127.0.0.1)窗口三键+拖拽最小授权:无边框窗口(decorations=false)后由 header 承担标题栏职责,仅授予 min/max/close/start-dragging 四项;不可达文件/进程/导航类权限,local 降级页权限(default.json)不受影响",
+  "windows": ["main"],
+  "context": {
+    "remote": {
+      "urls": ["http://127.0.0.1:*/*"]
+    }
+  },
+  "permissions": [
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging"
+  ]
+}
