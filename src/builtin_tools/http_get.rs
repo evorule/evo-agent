@@ -7,7 +7,7 @@
 //!
 //! | 类别 | 例子 | 行为 |
 //! |---|---|---|
-//! | **active host** | `docs.rs` `crates.io` `github.com` `raw.githubusercontent.com` `api.github.com` `static.crates.io` | **直接请求** |
+//! | **active host** | `docs.rs`/`crates.io`/`github.com` 等代码托管+官方文档站+标准+百科 26 域（见 [`ACTIVE_HOSTS`]） | **直接请求** |
 //! | **candidate host** | 任何其他公开 host | 返回 `proposal`,问用户 |
 //! | **blocked** | localhost / 私有 IP / 内网段(SSRF) | **永不**批准 |
 //!
@@ -54,12 +54,38 @@ use crate::io_handlers::tool_handler::ToolFunction;
 
 /// **Active host 白名单**:直接请求,无需请示
 pub const ACTIVE_HOSTS: &[&str] = &[
+    // 代码托管与包管理
     "docs.rs",
     "crates.io",
     "static.crates.io",
     "github.com",
     "raw.githubusercontent.com",
     "api.github.com",
+    "objects.githubusercontent.com",
+    "gitlab.com",
+    "gitee.com",
+    "npmjs.com",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    // 官方文档站（通用任务高频）
+    "developer.mozilla.org",
+    "doc.rust-lang.org",
+    "static.rust-lang.org",
+    "nodejs.org",
+    "learn.microsoft.com",
+    "python.org",
+    "go.dev",
+    // 标准与规范
+    "w3.org",
+    "www.w3.org",
+    "datatracker.ietf.org",
+    "www.rfc-editor.org",
+    "openid.net",
+    "modelcontextprotocol.io",
+    // 百科与知识面（只读参考）
+    "en.wikipedia.org",
+    "zh.wikipedia.org",
 ];
 
 /// **Blocked IP 段**:SSRF 防护

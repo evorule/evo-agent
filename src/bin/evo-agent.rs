@@ -161,6 +161,10 @@ enum Command {
         read_root: Option<PathBuf>,
     },
 
+    /// 定时自治调度(常驻;纯确定性组件,cron 按分钟触发 run/patrol 子命令,
+    /// 错过不补跑逐条留痕;配置见 evo-agent.toml [schedule] 节)
+    Schedule,
+
     /// 进化巡视任务模式(一次性):信号探查 → 有信号则 agent 起草+提名 →
     /// 结构化 JSON 巡视报告;无信号零动作静默退出(报告仍输出一行供调度器消费)。
     /// 触发器在 agent 侧/外部调度(cron/运维脚本),server 零自治循环。
@@ -404,6 +408,8 @@ fn main() -> ExitCode {
                 read_root.as_deref(),
             )
         }),
+        Command::Schedule => run_with_big_stack(move || cmd_schedule(&cli.workdir)),
+
         Command::Patrol {
             session,
             workspace,
@@ -949,6 +955,36 @@ fn extract_keyed_value(text: &str, key: &str) -> Option<String> {
 /// `allowed_tools` 收窄本轮工具面(轮A 4 个起草工具/轮B 1 个提名工具):
 /// 宽工具面下真实 LLM 会绕路探索(file_read/ws_list 等),实测导致步数超限或
 /// 上下文被无关内容污染;窄面让 LLM 只见任务必需工具,行为收敛。
+/// 定时调度入口：装载 [schedule] 配置(校验 fail-fast)后进入常驻循环。
+fn cmd_schedule(workdir: &Path) -> ExitCode {
+    let config = match evo_agent::config::Config::load_lenient(workdir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[schedule] 配置装载失败: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = config.schedule.validate() {
+        eprintln!("[schedule] 配置校验失败: {e}");
+        return ExitCode::FAILURE;
+    }
+    if config.schedule.jobs.is_empty() {
+        eprintln!("[schedule] 无任务（[schedule.jobs] 为空）——如需常驻请先配置任务");
+        return ExitCode::FAILURE;
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|e| {
+        eprintln!("[schedule] 无法定位自身可执行文件: {e}");
+        std::process::exit(1);
+    });
+    match evo_agent::schedule::run_loop(&config.schedule, workdir, exe) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("[schedule] 退出(留痕失败级): {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 async fn patrol_build_runner(
     config: &evo_agent::config::Config,
     workdir: &Path,
