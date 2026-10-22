@@ -55,7 +55,13 @@
     "delegate",
     "browser_*",
     "mcp_*",
-    "inference_*"
+    "inference_*",
+    "edit_file",
+    "web_fetch",
+    "web_search",
+    "todo_write",
+    "todo_read",
+    "code_search"
   ],
   "skills": [
     {
