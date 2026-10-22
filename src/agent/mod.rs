@@ -20,6 +20,7 @@ pub mod definition;
 pub mod delegate;
 pub mod driver;
 pub mod event_ledger;
+pub mod evid;
 pub mod handover_tool;
 pub mod journal;
 pub mod journal_anchor;

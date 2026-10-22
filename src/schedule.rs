@@ -234,6 +234,7 @@ pub struct ScheduleConfig {
     /// 留痕日志路径（相对 workdir；缺省 data/schedule.journal.jsonl）
     #[serde(default)]
     pub journal: Option<String>,
+    /// 调度任务清单
     #[serde(default, rename = "jobs")]
     pub jobs: Vec<ScheduleJob>,
 }
@@ -285,10 +286,14 @@ impl ScheduleConfig {
 
 /// 一次 tick 的对账动作（可测纯函数核心 + IO 注入面）
 pub struct TickAction {
+    /// 任务名
     pub job: String,
+    /// 任务类型（run|patrol）
     pub kind: String,
-    pub action: &'static str, // "fired" | "missed"
-    pub minute: String,       // "YYYY-MM-DDTHH:MM"
+    /// 动作（"fired" | "missed"）
+    pub action: &'static str,
+    /// 分钟槽（"YYYY-MM-DDTHH:MM"）
+    pub minute: String,
 }
 
 /// 计算本 tick 应发生的动作：从 `last_minute`（含）之后到 `now_minute`（含）逐分钟
@@ -485,7 +490,7 @@ fn chrono_now_minute() -> String {
 fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as i64;
+    let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);

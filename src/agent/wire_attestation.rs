@@ -21,6 +21,7 @@ use serde::Serialize;
 pub struct WireAttestation {
     /// 会话内调用序（从 0 起；与 journal LlmCalled 的顺序一致）
     pub seq: u64,
+    /// 模型标识（发送目标模型名）
     pub model: String,
     /// blake3(canonical_input_json)，"blake3:"+64hex
     pub wire_hash: String,
@@ -30,6 +31,7 @@ pub struct WireAttestation {
     pub messages_sent: usize,
     /// 送发前被裁剪的消息数（0=未裁剪）
     pub trimmed_count: usize,
+    /// 发送用途标签（如 react/plan——区分同一会话内不同发送面）
     pub purpose: String,
     /// Unix 秒
     pub ts: u64,
@@ -70,7 +72,7 @@ pub fn compute(
     let mut hasher = Hasher::new();
     hasher.update(canonical.as_bytes());
     let hash = format!("blake3:{}", hasher.finalize().to_hex());
-    let len = canonical.as_bytes().len() as u64;
+    let len = canonical.len() as u64;
     (hash, len)
 }
 
