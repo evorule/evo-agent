@@ -83,6 +83,11 @@
       ],
     },
     {
+      // 直接动作项(无下拉):点击即开设置页;设置入口自活动栏(太阳符)迁入菜单行
+      title: '设置',
+      command: 'workbench.action.openSettings',
+    },
+    {
       title: '帮助(H)',
       items: [
         { label: '重启语言服务器', command: 'workbench.action.lsp.restart' },
@@ -124,28 +129,42 @@
 <nav class="menubar" bind:this={rootEl} aria-label="主菜单">
   {#each MENUS as menu, i}
     <div class="menu-root">
-      <button
-        class="menu-title"
-        class:open={openIndex === i}
-        aria-haspopup="menu"
-        aria-expanded={openIndex === i}
-        onclick={() => toggle(i)}
-        onmouseenter={() => hover(i)}
-      >
-        {menu.title}
-      </button>
-      {#if openIndex === i}
-        <div class="dropdown" role="menu">
-          {#each menu.items as item}
-            {#if item === 'sep'}
-              <div class="sep" role="separator"></div>
-            {:else}
-              <button class="menu-item" role="menuitem" onclick={() => run(item)}>
-                {item.label}
-              </button>
-            {/if}
-          {/each}
-        </div>
+      {#if menu.command}
+        <!-- 直接动作项:点击即执行命令,不展开下拉 -->
+        <button
+          class="menu-title"
+          onclick={() => {
+            openIndex = -1;
+            executeCommand(menu.command);
+          }}
+          onmouseenter={() => hover(i)}
+        >
+          {menu.title}
+        </button>
+      {:else}
+        <button
+          class="menu-title"
+          class:open={openIndex === i}
+          aria-haspopup="menu"
+          aria-expanded={openIndex === i}
+          onclick={() => toggle(i)}
+          onmouseenter={() => hover(i)}
+        >
+          {menu.title}
+        </button>
+        {#if openIndex === i}
+          <div class="dropdown" role="menu">
+            {#each menu.items as item}
+              {#if item === 'sep'}
+                <div class="sep" role="separator"></div>
+              {:else}
+                <button class="menu-item" role="menuitem" onclick={() => run(item)}>
+                  {item.label}
+                </button>
+              {/if}
+            {/each}
+          </div>
+        {/if}
       {/if}
     </div>
   {/each}
