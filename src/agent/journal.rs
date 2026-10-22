@@ -1986,6 +1986,7 @@ fn truncate_text(s: &str, max_chars: usize) -> String {
 /// journal 文件验证报告
 #[derive(Debug, Clone)]
 pub struct JournalVerifyReport {
+    /// 总行数（含无哈希旧行）
     pub total_lines: u64,
     /// 存量无哈希行数(格式单调性:计入但不假充验证过)
     pub unhashed_lines: u64,
