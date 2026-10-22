@@ -65,6 +65,9 @@
     applySidebarWidth,
     hasStoredSidebarWidth,
     SIDEBAR_DEFAULT,
+    chatWidth,
+    setChatWidth,
+    CHAT_DEFAULT,
     groupPercentFromDrag,
   } from './lib/layout.js';
   import { splitOpen, toggleSplit, closeSplit, secondaryGroups, activeGroupId, addSecondaryGroup, closeSecondaryGroup, moveActiveTabTarget, groupRemovePath, evenWidths as doEvenWidths, groupFocusSignal, restoreGroups, maximizedGroupId, toggleMaximize, setGroupWidth } from './lib/editorGroups.js';
@@ -126,7 +129,7 @@
   let sidebarSlotEl = null; // 侧栏视图宿主(未定制宽度时从活动视图实测初始化)
   let sidebarVarApplied = false; // CSS 变量生效旗标(生效前各视图用自身缺省宽)
 
-  /** 侧栏 divider 拖拽(dx<0 = 变宽;首事件从活动视图实测宽度初始化,防跳变) */
+  /** 侧栏 divider 拖拽(dx>0 = 变宽;首事件从活动视图实测宽度初始化,防跳变) */
   function onSidebarResize(e) {
     if (!sidebarVarApplied) {
       sidebarVarApplied = true;
@@ -134,7 +137,7 @@
       const w = el ? Math.round(el.getBoundingClientRect().width) : $sidebarWidth;
       setSidebarWidth(w);
     }
-    setSidebarWidth($sidebarWidth - e.detail.dx);
+    setSidebarWidth($sidebarWidth + e.detail.dx);
   }
 
   /** 副组 divider 拖拽:分隔条在目标组左侧,dx>0(右拖) = 目标组变窄 */
@@ -784,6 +787,14 @@
       <BottomPanel />
     </div>
     <div style:display={$chatVisible ? 'contents' : 'none'}>
+      <!-- E2:编辑器↔对话侧栏分隔条(宽 300–560px,持久化 evo_chat_w;
+           分隔条在对话栏左缘,dx>0(右拖) = 对话栏变窄) -->
+      <Divider
+        orient="v"
+        title="拖拽调整对话栏宽度;双击恢复缺省"
+        on:resize={(e) => setChatWidth($chatWidth - e.detail.dx)}
+        on:reset={() => setChatWidth(CHAT_DEFAULT)}
+      />
       <ChatSidebar />
     </div>
   </div>
