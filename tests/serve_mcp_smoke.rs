@@ -68,14 +68,33 @@ const AGENT_JSON: &str = r#"{
 }"#;
 
 /// 进程树收割（panic/断言路径也兜底，防 serve/python 孤儿泄漏）。
+/// 平台分档收割（2026-10-22）：taskkill 是 Windows 专用命令——Linux 上
+/// `Command::new("taskkill")` 必 Err（被忽略），fallback 变成
+/// `self.0.wait()` 等 serve 退出，而 serve 是健康运行的服务器永不退出：
+/// 任何失败路径都被放大为整相位永久挂死（ubuntu CI 实证：测试超 60s
+/// 警告后零输出零 CPU 35 分钟，timeout 才收尾；即 o22 死亡史 hang 期
+/// 「孤儿 evo_agent serve + 5 连挂 6 小时」的机制本体）。Unix 改用
+/// kill -9 单杀 serve；python mock 的 stdin 管道随 serve 亡而 EOF 自行
+/// 退出。两平台都随后 wait 回收，杜绝「等服务器退出」的语义颠倒。
 struct KillOnDrop(Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &self.0.id().to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &self.0.id().to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = Command::new("kill")
+                .args(["-9", &self.0.id().to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         let _ = self.0.wait();
     }
 }

@@ -49,27 +49,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # CI diagnosis (2026-10-21/22): ubuntu verify was green (2-3 min
+          # ubuntu verify death saga (2026-10-15/22): green (2-3 min
           # warm-cache runs) through 2026-10-14. On 10-15 five runs hung
           # inside cargo test (silent for hours, killed by the 6-hour job
           # cap; teardown showed orphan test binary + npm exec + sh). Since
-          # 2026-10-16 every run has died mid-step (~48-52 min in, "lost
+          # 2026-10-16 every run had died mid-step (~48-52 min in, "lost
           # communication"), including ON the ubuntu-24.04 pin WITH -j2 +
-          # debug=0 + fresh cache -- and because a job must COMPLETE to
-          # save its rust-cache, every death re-arms a cold-cache spiral:
-          # slowest possible run, maximum exposure, death again.
+          # debug=0 + fresh cache.
           #
-          # Decision (2026-10-22, approved): TEMPORARY load downgrade -- the
-          # ubuntu leg runs build + secret scan + dep contract only; the test
-          # surface (unit + doc tests) is carried by the windows leg, which
-          # has never missed (9-16 min). This unblocks the merge chain today.
-          # RESTORE ubuntu tests (flip `tests: true`) once the side diagnostic
-          # (phase-split full run) attributes the death to a concrete phase
-          # and a fix lands. Tracked as a registry TODO -- do not let this
-          # downgrade become permanent by omission.
+          # A temporary load downgrade (tests: false, 2026-10-22) unblocked
+          # the merge chain while a side diagnostic ran the full surface:
+          # phase-split steps, tee'd streaming log, 15s resource watchdog.
+          # The diagnostic went GREEN twice in a row (full 2172-test run,
+          # ubuntu) and the same day produced a windows-latest image drift
+          # (Git usr/bin appearing on PATH) -- evidence pointing at a
+          # GitHub host/image regression rather than our workload, likely
+          # fixed upstream or intermittent.
+          #
+          # Restored (2026-10-22, approved): tests back on. The resource
+          # watchdog stays as a PERMANENT fixture of the linux test-run
+          # phase inside verify.ps1 -- passive snapshots at zero risk; if
+          # the freeze ever recurs, its streamed resource curve and the
+          # culprit's process tree are captured right up to the death.
           - os: ubuntu-24.04
             name: ubuntu-latest
-            tests: false
+            tests: true
           - os: windows-latest
             name: windows-latest
             tests: true
@@ -109,6 +113,7 @@ jobs:
         run: |
           if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
           ./verify.ps1 -Phase build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
 
       - name: verify 2/5 test-compile
@@ -117,6 +122,7 @@ jobs:
         run: |
           if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
           ./verify.ps1 -Phase test-compile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
 
       - name: verify 3/5 test-run
@@ -125,15 +131,20 @@ jobs:
         run: |
           if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
           ./verify.ps1 -Phase test-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
 
       - name: verify 4/5 secret scan
         shell: pwsh
-        run: ./verify.ps1 -Phase scan
+        run: |
+          ./verify.ps1 -Phase scan
+          exit $LASTEXITCODE
 
       - name: verify 5/5 dep contract
         shell: pwsh
-        run: ./verify.ps1 -Phase contract
+        run: |
+          ./verify.ps1 -Phase contract
+          exit $LASTEXITCODE
 
       - name: doc tests
         if: matrix.tests

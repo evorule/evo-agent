@@ -506,7 +506,7 @@ fn list_roots() -> BrowseResponse {
             Err(e) => (Vec::new(), Some(format!("read_dir failed: {e}"))),
         };
         BrowseResponse {
-            path: Some("/".to_string()),
+            path: None,
             parent: None,
             roots: true,
             entries,
