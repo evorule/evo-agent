@@ -866,7 +866,7 @@
 <div class="explorer" data-zone="explorer" style:--tree-fs="{treeFontSize}px">
   {#snippet fileIcon(name)}
     {@const ik = fileIconKey(name)}
-    <svg class="icon fi-{ik}" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <svg class="icon fi-{ik}" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
       {#if ik === 'ts' || ik === 'js' || ik === 'py' || ik === 'go' || ik === 'sql'}
         <text x="12" y="16" text-anchor="middle" font-size="8.5" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{ik.toUpperCase()}</text>
       {:else if ik === 'json'}
@@ -1061,7 +1061,7 @@
             >
               <path d="M9 6l6 6-6 6" />
             </svg>
-            <svg class="icon dir" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8">
+            <svg class="icon dir" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8">
               {#if dirState.get(node.path)?.expanded}
                 <!-- 开态:盖板掀起(lucide folder-open) -->
                 <path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" />
