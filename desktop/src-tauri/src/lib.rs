@@ -175,10 +175,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executor_token = orchestrator::gen_token();
 
             // 窗口尺寸记忆：缺省 1280×800，最小 960×600
+            // 无边框窗口(decorations=false):去原生标题栏,工作台 header 即顶栏
+            // (三键/拖拽由前端 window.__TAURI__ + drag-region 承担,权限见
+            // capabilities/main-window.json 四项最小授权);shadow 保留系统投影
             let mut builder =
                 WebviewWindowBuilder::new(&handle, "main", WebviewUrl::App("index.html".into()))
                     .title("evo-agent")
-                    .min_inner_size(960.0, 600.0);
+                    .min_inner_size(960.0, 600.0)
+                    .decorations(false)
+                    .shadow(true);
             builder = match load_window_state(&paths) {
                 Some(ws) if ws.w >= 960.0 && ws.h >= 600.0 => {
                     builder.inner_size(ws.w, ws.h).position(ws.x, ws.y)
