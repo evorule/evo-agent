@@ -7,6 +7,9 @@
 <script>
   import { sessionId } from '../lib/stores.js';
   import { listSessionEvents } from '../lib/api.js';
+  import AuditBadge from './AuditBadge.svelte';
+  import AuditCard from './AuditCard.svelte';
+  import { auditState, badgeStatus, factForMemoryEvent } from '../lib/audit.js';
 
   let filter = $state('');
   let events = $state([]);
@@ -14,6 +17,17 @@
   let err = $state('');
   let loadedFor = $state(null);
   let expandedId = $state(null);
+  // audit-one-click:记忆条目挂共享审计徽章——有 fact_id 的条目按链上
+  // 存证绿/灰,点开同款报告卡(按 fact_id 直查,不走消息映射)。
+  let auditCardEntry = $state(null);
+
+  function evBadge(ev) {
+    const has = factForMemoryEvent($auditState, ev?.fact_id) != null;
+    return {
+      status: badgeStatus($auditState, has),
+      entry: factForMemoryEvent($auditState, ev?.fact_id),
+    };
+  }
 
   function kindOf(ev) {
     return ev?.event_type?.kind || '?';
@@ -102,6 +116,11 @@
             <span class="mem-time mono">{fmtTime(ev.timestamp)}</span>
             <span class="mem-kind">{kindOf(ev)}{subOf(ev) ? `·${subOf(ev)}` : ''}</span>
             <span class="mem-summary">{summarize(ev)}</span>
+            <AuditBadge
+              status={evBadge(ev).status}
+              clickable={evBadge(ev).status === 'green'}
+              onclick={() => (auditCardEntry = evBadge(ev).entry)}
+            />
           </div>
           {#if expandedId === ev.event_id}
             <div class="mem-detail" onclick={(e) => e.stopPropagation()}>
@@ -116,6 +135,16 @@
         </button>
       {/each}
     </div>
+  {/if}
+
+  {#if auditCardEntry}
+    <AuditCard
+      entry={auditCardEntry}
+      sid={$sessionId}
+      verified={$auditState?.verified ?? null}
+      factCount={$auditState?.factCount ?? null}
+      onclose={() => (auditCardEntry = null)}
+    />
   {/if}
 </div>
 
@@ -182,6 +211,11 @@
     align-items: baseline;
     gap: var(--sp-sm);
     min-width: 0;
+  }
+  .mem-row :global(.audit-badge) {
+    margin-left: auto;
+    align-self: center;
+    flex: none;
   }
   .mem-time {
     font-size: 10px;

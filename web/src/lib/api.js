@@ -501,3 +501,36 @@ export function importSkillBundle(path) {
     body: JSON.stringify({ path }),
   }).then(unwrap);
 }
+
+// ===== 会话审计面(audit-one-click;经 /console-api 同源代理直达 evorule-server) =====
+// serve 侧 console_proxy 无路径白名单全量转发,鉴权由 serve 自身对上注入;
+// 本地路径会话(非数字 sid)不产生审计链,调用方须先按 sid 形态分流。
+// 响应形态(与 server audit_archive.rs 同形注释锚定):
+// /audit → {session_id, fact_count, last_hash, verified, unhashed_records,
+//           entries:[{fact_id, fact_type, logical_time, content_hash,
+//                     prev_hash, cause?, content_json?(include_content)}]}
+
+/** 会话审计报告(entries 序=逻辑时间序;include_content 时每条附 content_json) */
+export function getAuditReport(sid, includeContent = false) {
+  const q = includeContent ? '?include_content=true' : '';
+  return fetch(
+    `/console-api/api/sessions/${encodeURIComponent(sid)}/audit${q}`,
+    { headers: headers() }
+  ).then(unwrap);
+}
+
+/** 整链哈希校验({verified, session_id, fact_count?, last_hash?}) */
+export function getAuditVerify(sid) {
+  return fetch(
+    `/console-api/api/sessions/${encodeURIComponent(sid)}/audit/verify`,
+    { headers: headers() }
+  ).then(unwrap);
+}
+
+/** 因果链({session_id, fact_id, chain_length, chain:[CausalLink]}) */
+export function getAuditCausalChain(sid, factId) {
+  return fetch(
+    `/console-api/api/sessions/${encodeURIComponent(sid)}/audit/causal/${encodeURIComponent(factId)}`,
+    { headers: headers() }
+  ).then(unwrap);
+}
