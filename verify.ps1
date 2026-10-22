@@ -56,12 +56,39 @@ if (Test-Phase 'test-run') {
     # CI log carries only the summary line (2026-09-25 lesson: ubuntu had two red
     # tests with zero details in the log; local WSL repro was the only option).
     # $ErrorActionPreference is Continue at the top, so 2>&1 will not abort.
+    # Tee mode (2026-10-22): stream every line to the step log as it arrives --
+    # if cargo test hangs, the LAST log line names the stuck test. The full
+    # stream is still kept in memory for the failure-detail tail below
+    # (buffered-only output was the blind spot that hid the hang).
+    $testLog = New-Object System.Collections.Generic.List[string]
     if ($isWin) {
-        $testLog = cargo test 2>&1 | ForEach-Object { "$_" }
+        cargo test 2>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $testLog.Add($l) }
     } else {
-        # Exit code 124 = timeout fired: the buffered log still carries every
-        # test line printed before the hang, which pinpoints the stuck test.
-        $testLog = timeout --kill-after=30 2100 cargo test 2>&1 | ForEach-Object { "$_" }
+        # Resource watchdog (2026-10-22, permanent sentinel): a background
+        # loop streams a snapshot every 15s (loadavg / mem / disk / top-mem
+        # procs / process counts) alongside the test stream. Origin: the
+        # ubuntu runner froze 49s into test-run and the box froze so hard
+        # even the 35-min timeout never concluded -- a machine-level freeze,
+        # not a single-test hang. Two diagnostic rounds with this watchdog
+        # went green, and the same day a windows-latest image drift pointed
+        # at a host/image regression; if the freeze ever recurs on main,
+        # the watchdog's last streamed snapshots bracket it with the
+        # resource curve and the culprit's process tree, even if the runner
+        # itself dies and the final log upload is lost.
+        bash -c '
+            ( while true; do
+                  echo "=== WD $(date -u +%H:%M:%S) load=$(cat /proc/loadavg) ==="
+                  free -m | sed -n 2p
+                  df -h / | tail -1
+                  ps aux --sort=-%mem | head -8
+                  echo "=== procs evo_agent=$(pgrep -c -f evo_agent) npm_or_node=$(pgrep -c -f "npm|node") sh=$(pgrep -c -x sh) total=$(ps -e --no-headers | wc -l)"
+                  sleep 15
+              done ) & WD=$!
+            timeout --kill-after=30 2100 cargo test 2>&1
+            RC=$?
+            kill $WD 2>/dev/null
+            exit $RC
+        ' 2>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $testLog.Add($l) }
         if ($LASTEXITCODE -eq 124) { Write-Host "TIMEOUT: cargo test after 35 min" }
     }
     $testLog | Select-String -Pattern "^test result"
@@ -155,3 +182,7 @@ if (Test-Phase 'contract') {
 
 if ($failed) { Write-Host "== RESULT: FAIL =="; exit 1 }
 Write-Host "== RESULT: ALL PASS =="
+# Explicit exit 0: a natural script end leaves $LASTEXITCODE at whatever the
+# last NATIVE command set it to, and CI steps propagate $LASTEXITCODE -- a
+# stale non-zero from an earlier phase would false-red an ALL PASS run.
+exit 0
