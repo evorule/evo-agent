@@ -2831,6 +2831,41 @@ async fn put_workbench_config(
 // G14:记忆事件 HTTP 端点
 // =============================================================================
 
+/// 事件记忆 namespace 判定核心（读写同域,纯函数）
+///
+/// 与写侧完全同构（WS construct_runner / CLI from_definition）:
+/// 定义声明优先;general 未启用记忆时同款注入 "general"（写侧
+/// ws_handler 同口径例外）;其余按声明（含空串,与写侧传参一致）。
+fn resolve_events_namespace(agent_type: &str, memory_type: &str, declared_ns: &str) -> String {
+    if agent_type == "general" && (memory_type == "none" || memory_type.is_empty()) {
+        return "general".to_string();
+    }
+    declared_ns.to_string()
+}
+
+/// 会话事件读面 namespace 解析（记忆事件账本读面修复:读侧此前硬编码
+/// "default",与写侧定义声明 namespace 错位 → MemoryTab/replay 恒空）。
+/// 会话索引查归属 agent → 定义取 memory.namespace;索引无记录/定义
+/// 加载失败回落 "general"（[agents] default 即 general,桌面工作台
+/// 主 agent 实际域）。
+fn session_events_namespace(state: &AgentApiState, session_id: &str) -> String {
+    let agent_type = state
+        .session_index()
+        .list()
+        .into_iter()
+        .find(|e| e.session_id == session_id)
+        .map(|e| e.agent_type)
+        .unwrap_or_else(|| "general".to_string());
+    match state.definitions().load(&agent_type) {
+        Ok(def) => resolve_events_namespace(
+            &agent_type,
+            &def.memory.memory_type,
+            &def.memory.namespace,
+        ),
+        Err(_) => "general".to_string(),
+    }
+}
+
 /// `GET /api/sessions/{id}/events` 的查询参数
 #[derive(Debug, serde::Deserialize)]
 struct EventsQueryParams {
@@ -2854,13 +2889,16 @@ async fn list_session_events(
     use crate::agent::memory_event::MemoryEventStore;
 
     let client = state.evorule_client.clone();
-    let mut store = MemoryEventStore::new("default", client);
+    // 记忆事件账本读面修复:namespace 与写侧同域解析（此前硬编码 "default" 错位恒空）
+    let namespace = session_events_namespace(&state, &session_id);
+    let mut store = MemoryEventStore::new(&namespace, client);
     store.set_session_id(&session_id);
 
     // best-effort 同步(HTTP 失败返回空列表)
     if let Err(e) = store.sync_from_evorule().await {
         tracing::warn!(
             session_id = %session_id,
+            namespace = %namespace,
             error = %e,
             "memory event sync failed before list; serving possibly stale local data"
         );
@@ -3023,7 +3061,8 @@ async fn replay_session_events(
     use crate::agent::memory_event::{MemoryEventStore, ReplayDirection, ReplayEngine};
 
     let client = state.evorule_client.clone();
-    let mut store = MemoryEventStore::new("default", client);
+    // 记忆事件账本读面修复:namespace 与写侧同域解析（此前硬编码 "default" 错位恒空）
+    let mut store = MemoryEventStore::new(&session_events_namespace(&state, &session_id), client);
     store.set_session_id(&session_id);
 
     // best-effort 同步
@@ -4887,6 +4926,30 @@ mod tests {
             .unwrap();
         // 路由匹配成功 → handler 返回 200
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ===== 记忆事件账本读面:namespace 同域解析（纯函数核心） =====
+
+    #[test]
+    fn test_resolve_events_namespace_matches_write_side() {
+        // 桌面捆绑 general 定义(persistent + namespace "general")——写侧实际域
+        assert_eq!(
+            resolve_events_namespace("general", "persistent", "general"),
+            "general"
+        );
+        // general 未启用记忆:写侧 construct_runner 同款例外注入 "general"
+        assert_eq!(resolve_events_namespace("general", "none", ""), "general");
+        assert_eq!(resolve_events_namespace("general", "", ""), "general");
+        // 非 general 自定义声明:按声明(读写同构)
+        assert_eq!(
+            resolve_events_namespace("researcher", "persistent", "researcher_ns"),
+            "researcher_ns"
+        );
+        // general 显式声明自定义 ns:声明优先,例外注入不覆盖声明
+        assert_eq!(
+            resolve_events_namespace("general", "persistent", "custom_ns"),
+            "custom_ns"
+        );
     }
 
     // ===== 审批人身份验证(降级 / 提案 ID 校验) =====
