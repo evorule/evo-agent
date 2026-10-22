@@ -761,13 +761,13 @@ impl Config {
             merge_field(table, "tick_secs", &mut self.schedule.tick_secs)?;
             merge_field(table, "journal", &mut self.schedule.journal)?;
             if let Some(jobs) = table.get("jobs") {
-                let parsed: Vec<crate::schedule::ScheduleJob> = jobs
-                    .clone()
-                    .try_into()
-                    .map_err(|e| ConfigError::InvalidValue {
-                        field: "schedule.jobs".into(),
-                        reason: format!("{e}"),
-                    })?;
+                let parsed: Vec<crate::schedule::ScheduleJob> =
+                    jobs.clone()
+                        .try_into()
+                        .map_err(|e| ConfigError::InvalidValue {
+                            field: "schedule.jobs".into(),
+                            reason: format!("{e}"),
+                        })?;
                 self.schedule.jobs = parsed;
             }
         }
@@ -891,10 +891,12 @@ impl Config {
 
     /// 验证配置值的合法性
     fn validate(&self) -> Result<(), ConfigError> {
-        self.schedule.validate().map_err(|e| ConfigError::InvalidValue {
-            field: "schedule".into(),
-            reason: e,
-        })?;
+        self.schedule
+            .validate()
+            .map_err(|e| ConfigError::InvalidValue {
+                field: "schedule".into(),
+                reason: e,
+            })?;
         // provider 为展示预留字段:未知值仅警告不拒绝(实际请求端点由
         // api_base/model 决定,旧配置文件里的自定义值装载不受影响)
         match self.llm.provider.as_str() {
@@ -975,10 +977,12 @@ impl Config {
     /// 解析(严格模式 fail-closed)。仍然验证 base_url/logging 等非
     /// LLM 字段
     fn validate_lenient(&self) -> Result<(), ConfigError> {
-        self.schedule.validate().map_err(|e| ConfigError::InvalidValue {
-            field: "schedule".into(),
-            reason: e,
-        })?;
+        self.schedule
+            .validate()
+            .map_err(|e| ConfigError::InvalidValue {
+                field: "schedule".into(),
+                reason: e,
+            })?;
         // provider 为展示预留字段:未知值仅警告不拒绝(同严格模式口径)
         match self.llm.provider.as_str() {
             "minimax" | "deepseek" | "openai" => {}

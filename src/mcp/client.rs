@@ -186,7 +186,10 @@ impl McpClient {
         Ok(McpToolResult {
             text: extract_first_text(&result).unwrap_or_default(),
             images: extract_images(&result),
-            structured: result.get("structuredContent").filter(|v| v.is_object()).cloned(),
+            structured: result
+                .get("structuredContent")
+                .filter(|v| v.is_object())
+                .cloned(),
             resource_texts: extract_resource_texts(&result),
             resource_links: extract_resource_links(&result),
         })
@@ -197,7 +200,10 @@ impl McpClient {
     /// 返回 server 原始 `resources` 数组（每项含 uri/name/mimeType/description?）。
     /// server 不支持资源能力时按协议返回错误——错误原文透传（不静默空数组）。
     pub async fn list_resources(&self) -> Result<Vec<Value>, String> {
-        let result = self.transport.request("resources/list", serde_json::json!({})).await?;
+        let result = self
+            .transport
+            .request("resources/list", serde_json::json!({}))
+            .await?;
         result
             .get("resources")
             .and_then(|v| v.as_array())
@@ -217,7 +223,10 @@ impl McpClient {
 
     /// 列出 server 提示（`prompts/list`）
     pub async fn list_prompts(&self) -> Result<Vec<Value>, String> {
-        let result = self.transport.request("prompts/list", serde_json::json!({})).await?;
+        let result = self
+            .transport
+            .request("prompts/list", serde_json::json!({}))
+            .await?;
         result
             .get("prompts")
             .and_then(|v| v.as_array())
@@ -278,7 +287,6 @@ pub struct McpResourceText {
     pub uri: String,
     pub text: String,
 }
-
 
 /// 2025-06-18:收集 content 内嵌文本资源块（`{"type":"resource","resource":{"uri","text"}}`）
 ///
@@ -415,10 +423,16 @@ mod tests {
                 }),
             )
             .await;
-        let r = client.call_tool_structured("t", &serde_json::json!({})).await.unwrap();
+        let r = client
+            .call_tool_structured("t", &serde_json::json!({}))
+            .await
+            .unwrap();
         assert_eq!(r.text, "summary");
         assert_eq!(
-            r.structured.as_ref().and_then(|v| v.get("rows")).and_then(|v| v.as_i64()),
+            r.structured
+                .as_ref()
+                .and_then(|v| v.get("rows"))
+                .and_then(|v| v.as_i64()),
             Some(3)
         );
         assert_eq!(r.resource_texts.len(), 1);
@@ -439,7 +453,10 @@ mod tests {
                 }),
             )
             .await;
-        let r = client.call_tool_structured("t", &serde_json::json!({})).await.unwrap();
+        let r = client
+            .call_tool_structured("t", &serde_json::json!({}))
+            .await
+            .unwrap();
         assert_eq!(r.text, "legacy");
         assert!(r.structured.is_none());
         assert!(r.resource_texts.is_empty());
@@ -485,12 +502,17 @@ mod tests {
         assert_eq!(rs.len(), 1);
         let c = client.read_resource("file:///a").await.unwrap();
         assert_eq!(
-            c.get(0).and_then(|v| v.get("text")).and_then(|v| v.as_str()),
+            c.get(0)
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str()),
             Some("正文")
         );
         let ps = client.list_prompts().await.unwrap();
         assert_eq!(ps.len(), 1);
-        let pg = client.get_prompt("p1", &serde_json::json!({})).await.unwrap();
+        let pg = client
+            .get_prompt("p1", &serde_json::json!({}))
+            .await
+            .unwrap();
         assert!(pg.get("messages").is_some());
     }
 
