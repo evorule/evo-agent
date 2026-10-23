@@ -11,9 +11,10 @@
 @font-face {
   font-family: "Inter";
   font-style: normal;
-  font-weight: 400 700;
+  font-weight: 100 900;
   font-display: swap;
-  src: local("Inter Regular"), local("Inter-Regular"), local("Inter");
+  src: local("Inter Regular"), local("Inter-Regular"), local("Inter"),
+    url("/fonts/Inter-VF.woff2") format("woff2");
 }
 @font-face {
   font-family: "Inter";
@@ -254,6 +255,11 @@ a:hover {
   --git-renamed: #0969da;
   --sh-card: 0 1px 3px rgba(31, 35, 40, 0.08);
   --sh-modal: 0 10px 25px rgba(31, 35, 40, 0.12);
+  --sidebar-bg: #f6f8fa;
+  --sidebar-text: #656d76;
+  --sidebar-text-active: #1f2328;
+  --sidebar-hover: rgba(31, 35, 40, 0.05);
+  --sidebar-active: rgba(31, 35, 40, 0.08);
 }
 
 /* 首帧防闪烁(index.html 内联脚本在解析到此之前已设 data-theme;
