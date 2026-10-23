@@ -44,6 +44,10 @@ initAuditWatcher(sessionId, turnActive, (e) => pushPanelEvent('gov', e));
 let ws = null;
 let streamMsgId = null; // 当前轮流式 assistant 气泡
 let lastToolMsgId = null; // 最近一个运行中工具气泡(按 name 匹配结果)
+let toolStartedAt = 0; // 当前工具调用起始时刻(M2:ToolResult 时算耗时 tookMs)
+// M2:工具 args/result 的客户端截断帽(原 safeJson 缺省 400)。编辑类 diff
+// 需完整 old_string/new_string,「查看全部」需余量,提到 20000;其余调用点缺省不变。
+const TOOL_PAYLOAD_CAP = 20000;
 let pendingWrite = null; // S4:进行中的 file_write {path, content}(ToolResult 成功即登记产物)
 let pendingNotice = null; // newSession 清屏后需补显的提示(SessionCreated 时补显)
 let pendingResume = false; // 恢复意图待发旗标(连接就绪 onopen 时补发 resume 帧)
@@ -432,11 +436,13 @@ function handleFrame(f) {
       }
       break;
     case 'ToolCall': {
+      toolStartedAt = Date.now();
       lastToolMsgId = pushMessage({
         kind: 'tool',
         name: f.name,
-        args: safeJson(f.args),
+        args: safeJson(f.args, TOOL_PAYLOAD_CAP),
         running: true,
+        startedAt: toolStartedAt,
       });
       // S4:记下 file_write 的目标与内容(草稿基线),待成功结果确认
       if (f.name === 'file_write' && f.args && typeof f.args.path === 'string') {
@@ -454,8 +460,11 @@ function handleFrame(f) {
     }
     case 'ToolResult': {
       if (lastToolMsgId !== null) {
-        updateMessage(lastToolMsgId, { running: false, result: safeJson(f.result) });
+        const patch = { running: false, result: safeJson(f.result, TOOL_PAYLOAD_CAP) };
+        if (toolStartedAt) patch.tookMs = Date.now() - toolStartedAt;
+        updateMessage(lastToolMsgId, patch);
         lastToolMsgId = null;
+        toolStartedAt = 0;
       }
       // S4:file_write 成功(结果为对象含 path)→ 登记产物 + 编辑器自动打开 + 产物卡
       if (f.name === 'file_write' && pendingWrite && f.result && typeof f.result === 'object') {
@@ -613,10 +622,10 @@ function finishStream() {
   }
 }
 
-function safeJson(v) {
+function safeJson(v, cap = 400) {
   try {
     const s = JSON.stringify(v);
-    return s && s.length > 400 ? s.slice(0, 400) + '…' : s;
+    return s && s.length > cap ? s.slice(0, cap) + '…' : s;
   } catch {
     return String(v);
   }

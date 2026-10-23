@@ -19,6 +19,7 @@
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
   import { renderChatHtml, copyChatCode } from '../lib/chat-markdown.js';
+  import { lineDiff, toolDiffPayload } from '../lib/chat-diff.js';
   import { approveProposal, answerQuestion, listResumableRuns, getOrchestrationLinks, uploadFile, getLlmModels, setLlmModel, listSkills } from '../lib/api.js';
   import { settingsState, setSetting } from '../lib/settings.js';
   import {
@@ -519,13 +520,84 @@
     window.open(`/console/audit?session=${sid}`, '_blank', 'noopener,noreferrer');
   }
 
-  // 消息变化时滚动到底部
+  // M2 滚动体验:贴底跟滚;上翻阅读时不拽回,新增消息计入浮条
+  let stickBottom = $state(true);
+  let freshCount = $state(0);
+  let lastMsgLen = 0; // 普通变量游标:$effect 依赖面之外,防重复计数
   $effect(() => {
-    $messages;
+    const arr = $messages;
+    const len = arr.length;
     if (listEl) {
-      requestAnimationFrame(() => listEl.scrollTo({ top: listEl.scrollHeight }));
+      if (stickBottom) {
+        requestAnimationFrame(() => listEl.scrollTo({ top: listEl.scrollHeight }));
+      } else if (len > lastMsgLen) {
+        freshCount += len - lastMsgLen;
+      }
     }
+    lastMsgLen = len;
   });
+
+  /** 滚动位置对账:距底 <48px 视为贴底(恢复自动跟滚),否则交还用户阅读位 */
+  function onListScroll() {
+    const el = listEl;
+    if (!el) return;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 48) {
+      stickBottom = true;
+      freshCount = 0;
+    } else {
+      stickBottom = false;
+    }
+  }
+
+  /** 回到底部(浮条/发送时),恢复贴底跟滚 */
+  function jumpToBottom() {
+    stickBottom = true;
+    freshCount = 0;
+    listEl?.scrollTo({ top: listEl.scrollHeight });
+  }
+
+  // ---- M2 工具卡交互态(易失 UI 态,不入消息 store、不随会话持久化) ----
+  const expandedTools = $state(new Set());
+  const fullResults = $state(new Set());
+  const TOOL_RESULT_CAP = 4000; // 展开态预览截断帽(「查看全部」解锁全文)
+
+  function toggleTool(id) {
+    if (expandedTools.has(id)) expandedTools.delete(id);
+    else expandedTools.add(id);
+  }
+
+  function toggleFull(id) {
+    fullResults.add(id);
+  }
+
+  /** 耗时文案:<1s 毫秒,否则一位小数秒 */
+  function formatTook(ms) {
+    return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+  }
+
+  /** edit_file → 行级 diff 行序列;不可 diff(非编辑类/超帽/args 缺失)→ null 降级原文 */
+  function toolDiffRows(m) {
+    const p = toolDiffPayload(m);
+    return p ? lineDiff(p.oldText, p.newText) : null;
+  }
+
+  /** 消息级复制(assistant/error 气泡与工具卡共用);按钮瞬时「已复制」反馈 */
+  async function copyPlainText(text, btn) {
+    try {
+      await navigator.clipboard.writeText(String(text));
+      if (btn) {
+        const old = btn.textContent;
+        btn.textContent = '已复制';
+        btn.disabled = true;
+        setTimeout(() => {
+          btn.textContent = old;
+          btn.disabled = false;
+        }, 1200);
+      }
+    } catch {
+      /* 剪贴板不可用静默(与代码块复制同口径) */
+    }
+  }
 
   // ---- @上下文 mention(B13)----
   // 触发:光标前缀形如 (^|\s)@<query>,300ms 防抖后汇总 provider 候选;
@@ -708,6 +780,7 @@
     composerMentions.set([]);
     const okAtts = attachments.filter((a) => a.path);
     attachments = attachments.filter((a) => !a.path);
+    jumpToBottom(); // 用户主动发言:必然关心最新流,强制恢复贴底
     sendMessage(text, kept, { mode: chatMode, attachments: okAtts, skill: selectedSkill });
   }
 
@@ -887,7 +960,7 @@
     </div>
   {/if}
 
-  <div class="msg-list" bind:this={listEl}>
+  <div class="msg-list" bind:this={listEl} onscroll={onListScroll}>
     {#if reconnectBannerSid}
       <div class="reconnect-banner" role="status">
         <span class="rb-text">连接已恢复——上一回合被打断。</span>
@@ -951,6 +1024,17 @@
         <div class="row">
           <div class="bubble assistant-bubble md-body" onclick={onMdCopyClick}>
             {@html renderChatHtml(m.text, m.id)}<span class="cursor" class:on={m.streaming}></span>
+            {#if m.text}
+              <button
+                type="button"
+                class="msg-copy"
+                title="复制全文"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  copyPlainText(m.text, e.currentTarget);
+                }}
+              >复制</button>
+            {/if}
           </div>
           <span class="audit-chip">
             <AuditBadge
@@ -961,17 +1045,73 @@
           </span>
         </div>
       {:else if m.kind === 'tool'}
-        <div class="tool-card" class:running={m.running}>
-          <span class="tool-name mono">{m.name}</span>
-          <span class="tool-state">{m.running ? '执行中…' : '完成'}</span>
-          {#if m.result !== undefined}
-            <pre class="tool-payload mono">{m.result}</pre>
+        <div class="tool-card" class:running={m.running} class:open={expandedTools.has(m.id)}>
+          <div
+            class="tool-head"
+            role="button"
+            tabindex="0"
+            onclick={() => toggleTool(m.id)}
+            onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && toggleTool(m.id)}
+          >
+            <span class="tool-chev">▸</span>
+            <span class="tool-name mono">{m.name}</span>
+            <span class="tool-state">
+              {m.running
+                ? '执行中…'
+                : m.tookMs !== undefined
+                  ? `完成·${formatTook(m.tookMs)}`
+                  : '完成'}
+            </span>
+          </div>
+          {#if expandedTools.has(m.id)}
+            <div class="tool-body">
+              {#if m.result !== undefined}
+                {@const rows = toolDiffRows(m)}
+                {@const text = String(m.result)}
+                {#if rows}
+                  <div class="diff-box mono">
+                    {#each rows as r}
+                      <div class="diff-row {r.t}">
+                        <span class="diff-sign">{r.t === 'add' ? '+' : r.t === 'del' ? '-' : ' '}</span>
+                        <span class="diff-text">{r.s}</span>
+                      </div>
+                    {/each}
+                  </div>
+                {:else if text.length > TOOL_RESULT_CAP && !fullResults.has(m.id)}
+                  <pre class="tool-payload mono">{text.slice(0, TOOL_RESULT_CAP)}</pre>
+                  <button
+                    type="button"
+                    class="tool-full"
+                    onclick={() => toggleFull(m.id)}
+                  >查看全部(共 {text.length} 字符)</button>
+                {:else}
+                  <pre class="tool-payload mono">{text}</pre>
+                {/if}
+                <button
+                  type="button"
+                  class="tool-copy"
+                  onclick={(e) => copyPlainText(text, e.currentTarget)}
+                >复制</button>
+              {:else}
+                <pre class="tool-payload mono">{m.args ?? '(无参数)'}</pre>
+              {/if}
+            </div>
           {/if}
         </div>
       {:else if m.kind === 'info'}
         <div class="row center"><span class="sys mono">{m.text}</span></div>
       {:else if m.kind === 'error'}
-        <div class="row"><div class="bubble error-bubble">{m.text}</div></div>
+        <div class="row">
+          <div class="bubble error-bubble">
+            {m.text}
+            <button
+              type="button"
+              class="msg-copy"
+              title="复制全文"
+              onclick={(e) => copyPlainText(m.text, e.currentTarget)}
+            >复制</button>
+          </div>
+        </div>
       {:else if m.kind === 'artifact'}
         <div class="artifact-card">
           <div class="ac-head">
@@ -1078,6 +1218,12 @@
         </div>
       {/if}
     {/each}
+
+    {#if !stickBottom && freshCount > 0}
+      <button type="button" class="fresh-pill" onclick={jumpToBottom} title="跳到最新消息">
+        ↓ {freshCount} 条新消息
+      </button>
+    {/if}
 
     {#if auditCardEntry}
       <AuditCard
@@ -1768,30 +1914,159 @@
     border: 1px solid var(--border);
     border-radius: var(--r-md);
     background: var(--bg-card);
-    padding: var(--sp-sm) var(--sp-sm);
     font-size: var(--fs-xs);
+    overflow: hidden;
   }
   .tool-card.running {
     border-color: var(--brand);
+  }
+  .tool-head {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-xs);
+    padding: var(--sp-xs) var(--sp-sm);
+    cursor: pointer;
+    user-select: none;
+  }
+  .tool-head:hover {
+    background: var(--bg-hover);
+  }
+  .tool-chev {
+    display: inline-block;
+    color: var(--text-muted);
+    font-size: 10px;
+    transition: transform var(--tr-fast);
+  }
+  .tool-card.open .tool-chev {
+    transform: rotate(90deg);
   }
   .tool-name {
     color: var(--brand-ocean);
     font-weight: var(--fw-sb);
   }
   .tool-state {
-    margin-left: var(--sp-sm);
+    margin-left: auto;
     color: var(--text-muted);
   }
+  .tool-body {
+    padding: 0 var(--sp-sm) var(--sp-xs);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-xs);
+  }
   .tool-payload {
-    margin-top: var(--sp-xs);
+    margin: 0;
     padding: var(--sp-xs) var(--sp-sm);
     background: var(--bg-page);
     border-radius: var(--r-sm);
     color: var(--text-secondary);
-    max-height: 120px;
-    overflow: auto;
+    overflow-x: auto;
     white-space: pre-wrap;
     word-break: break-all;
+  }
+  .tool-full {
+    align-self: flex-start;
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: var(--fs-xs);
+    color: var(--brand-ocean);
+    cursor: pointer;
+  }
+  .tool-full:hover {
+    text-decoration: underline;
+  }
+  .tool-copy {
+    align-self: flex-end;
+    background: none;
+    border: 1px solid var(--border-muted);
+    border-radius: var(--r-sm);
+    padding: 1px 8px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .tool-copy:hover {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+  }
+  /* M2:edit_file 行级 diff 视图(红删绿增,双主题走语义令牌) */
+  .diff-box {
+    border: 1px solid var(--border-muted);
+    border-radius: var(--r-sm);
+    overflow: hidden;
+    font-size: 12px;
+    line-height: var(--lh-code);
+  }
+  .diff-row {
+    display: flex;
+    gap: 6px;
+    padding: 0 var(--sp-xs);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .diff-sign {
+    flex: 0 0 8px;
+    user-select: none;
+  }
+  .diff-text {
+    flex: 1;
+  }
+  .diff-row.add {
+    background: var(--success-bg);
+    color: var(--success);
+  }
+  .diff-row.del {
+    background: var(--danger-bg);
+    color: var(--danger);
+  }
+  .diff-row.ctx {
+    color: var(--text-secondary);
+  }
+  /* M2:消息级复制钮(assistant/error 气泡右上角,hover 显现) */
+  .bubble {
+    position: relative;
+  }
+  .msg-copy {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    padding: 1px 6px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: var(--bg-card);
+    border: 1px solid var(--border-muted);
+    border-radius: var(--r-sm);
+    opacity: 0;
+    transition: opacity var(--tr-fast);
+    cursor: pointer;
+  }
+  .bubble:hover .msg-copy,
+  .msg-copy:focus-visible {
+    opacity: 1;
+  }
+  .msg-copy:hover {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+  }
+  /* M2:新消息浮条(msg-list 内 sticky 底部居中) */
+  .fresh-pill {
+    position: sticky;
+    bottom: var(--sp-sm);
+    align-self: center;
+    z-index: 2;
+    padding: 4px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-full);
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: var(--fs-xs);
+    box-shadow: var(--sh-md);
+    cursor: pointer;
+  }
+  .fresh-pill:hover {
+    border-color: var(--brand-ocean);
+    color: var(--brand-ocean);
   }
   .sys {
     font-size: var(--fs-2xs);
