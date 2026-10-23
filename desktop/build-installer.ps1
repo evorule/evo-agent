@@ -1,4 +1,4 @@
-﻿# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
+# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
 #
 # 资源布局（安装后 {install}\resources\...，由 tauri.conf.json bundle.resources 承接）：
 #   resources\bin\evo-agent.exe             <- <repo>\target\release\evo-agent.exe
@@ -153,7 +153,9 @@ Copy-Item $setup.FullName $outDir -Force
 Copy-Item $sigPath $outDir -Force
 
 # 机器校验：回读 latest.json 与 .sig 原文逐字节比对，防生成环节漂移
-$check = Get-Content (Join-Path $outDir "latest.json") -Raw | ConvertFrom-Json
+# （-Encoding UTF8 必带：WriteAllText 产出无 BOM UTF-8，PS5.1 Get-Content 缺省
+# 按 ANSI/GBK 误读，中文双字节配对吞引号会伪报 Unterminated string）
+$check = Get-Content (Join-Path $outDir "latest.json") -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($check.platforms.'windows-x86_64'.signature -cne $sig) {
     throw "latest.json signature mismatch after generation"
 }
