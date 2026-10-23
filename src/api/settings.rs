@@ -78,7 +78,7 @@ pub struct SettingEntry {
     pub scope: &'static str,
 }
 
-/// v1 设置项清单（7 键）。
+/// 设置项注册表（声明即生效；计数锁见测试 merged_defaults_when_no_files）。
 ///
 /// - `editor.minimap` 默认 **false**：EditorPane 创建参数实态即显式关闭
 ///   （设计初稿记 true 为 Monaco 缺省口径，实施期按「默认值=现行为」原则修正）。
@@ -136,6 +136,16 @@ pub fn schema() -> Vec<SettingEntry> {
             range: None,
             category: "工作台",
             description: "工作台配色主题（auto=跟随系统深浅；evorule-dark=深色；evorule-light=浅色）",
+            scope: "window",
+        },
+        SettingEntry {
+            key: "workbench.uiFontSize",
+            kind: SettingType::Number,
+            default: json!(13),
+            enum_values: None,
+            range: Some([11, 18]),
+            category: "工作台",
+            description: "界面基准字号（px）：联动全部 UI 令牌面（侧栏/面板/状态栏/对话等）；编辑器与终端字号独立设置（editor.fontSize / terminal.fontSize），不随本键变动",
             scope: "window",
         },
         SettingEntry {
@@ -987,7 +997,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 56); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo;批K 段5 httpRequest;批K 段7 askUser)
+        assert_eq!(settings.len(), 57); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo;批K 段5 httpRequest;批K 段7 askUser;O-540 workbench.uiFontSize)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));

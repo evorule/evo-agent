@@ -76,6 +76,17 @@
 
   reconnectFromStorage();
 
+  // UI 基准字号接线(O-540):设置快照变化 -> :root 缩放因子(全部 --fs-* 令牌 calc 联动);
+  // 顶层订阅:缓存回放值在首帧渲染前生效,零闪变。编辑器/终端字号独立设置,不随本键。
+  let lastUiFontSize = null;
+  const unsubUiFontSize = settingsState.subscribe((s) => {
+    const v = s.settings['workbench.uiFontSize'];
+    if (typeof v === 'number' && v > 0 && v !== lastUiFontSize) {
+      lastUiFontSize = v;
+      document.documentElement.style.setProperty('--ui-font-scale', String(v / 13));
+    }
+  });
+
   // 本组件注册的命令(卸载时注销;同 id 重复注册=覆盖,热替换安全)
   const OWNED_COMMANDS = [
     'workbench.action.showCommands',
@@ -698,6 +709,7 @@
       for (const id of OWNED_COMMANDS) unregisterCommand(id);
       if (cleanupTracking) cleanupTracking();
       unsubTheme();
+      unsubUiFontSize();
       unsubSidebarW();
       window.removeEventListener('storage', onThemeStorage);
     };
