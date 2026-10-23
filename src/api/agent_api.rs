@@ -2857,11 +2857,9 @@ fn session_events_namespace(state: &AgentApiState, session_id: &str) -> String {
         .map(|e| e.agent_type)
         .unwrap_or_else(|| "general".to_string());
     match state.definitions().load(&agent_type) {
-        Ok(def) => resolve_events_namespace(
-            &agent_type,
-            &def.memory.memory_type,
-            &def.memory.namespace,
-        ),
+        Ok(def) => {
+            resolve_events_namespace(&agent_type, &def.memory.memory_type, &def.memory.namespace)
+        }
         Err(_) => "general".to_string(),
     }
 }
