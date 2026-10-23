@@ -435,7 +435,7 @@
     margin-top: 2px;
   }
   .reset {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     border: 1px solid var(--brand);
     color: var(--brand);
     background: transparent;
@@ -446,7 +446,7 @@
   }
   .reset:hover {
     background: var(--brand);
-    color: #fff;
+    color: var(--text-inverse);
   }
   .row-ctl {
     display: flex;
@@ -488,7 +488,7 @@
     cursor: pointer;
   }
   .src {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
   }
   .array-editor {
@@ -532,7 +532,7 @@
   .btn.primary {
     background: var(--brand);
     border-color: var(--brand);
-    color: #fff;
+    color: var(--text-inverse);
   }
   .btn.primary:hover {
     background: var(--brand-hover);
@@ -555,7 +555,7 @@
   }
   .llm-note {
     margin-top: var(--sp-xs);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
   }
 </style>

@@ -128,7 +128,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     border-radius: 6px;
     box-sizing: border-box;
     color: var(--fg);
-    font-size: 13px;
+    font-size: var(--fs-sm);
     margin-bottom: 6px;
     padding: 8px 10px;
     width: 100%;
@@ -150,18 +150,18 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
   }
   .pi-label {
     color: var(--fg);
-    font-size: 13px;
+    font-size: var(--fs-sm);
   }
   .pi-cmd {
     color: var(--fg-dim);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .picker-empty {
     color: var(--fg-dim);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 14px 10px;
   }
 </style>

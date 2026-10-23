@@ -138,7 +138,7 @@ pendingReveal 定位信号,col 走 serve 搜索坐标的 0-based 约定)。 -->
     background: transparent;
     border: none;
     color: var(--sidebar-text);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     font-weight: var(--fw-sb);
     text-transform: uppercase;
     letter-spacing: 0.5px;

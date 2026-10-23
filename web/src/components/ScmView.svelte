@@ -346,18 +346,18 @@
     overflow-y: auto;
   }
   .panel-title {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     font-weight: var(--fw-sb);
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: rgba(255, 255, 255, 0.4);
+    color: var(--text-muted);
     padding: var(--sp-sm) var(--sp-md);
     display: flex;
     align-items: center;
     gap: var(--sp-xs);
   }
   .branch {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     color: var(--sidebar-text);
     text-transform: none;
     letter-spacing: 0;
@@ -422,7 +422,7 @@
   }
   .commit-btn {
     background: var(--brand);
-    color: #fff;
+    color: var(--text-inverse);
     border-radius: var(--r-sm);
     font-size: var(--fs-xs);
     padding: var(--sp-xs) 0;
@@ -484,7 +484,7 @@
     align-items: center;
     gap: var(--sp-xs);
     padding: var(--sp-xs) var(--sp-md);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     font-weight: var(--fw-sb);
     color: var(--sidebar-text);
     text-transform: uppercase;
@@ -495,7 +495,7 @@
     border-radius: 8px;
     min-width: 16px;
     text-align: center;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     padding: 0 4px;
   }
 
@@ -520,7 +520,7 @@
   }
   .row .dir {
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -536,7 +536,7 @@
 
   .badge {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     font-weight: var(--fw-sb);
     width: 14px;
     text-align: center;

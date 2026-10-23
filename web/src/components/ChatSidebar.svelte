@@ -1400,15 +1400,15 @@
     align-items: center;
     justify-content: space-between;
     padding: var(--sp-sm) var(--sp-md);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    border-bottom: 1px solid var(--border-muted);
     flex-shrink: 0;
   }
   .title {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     font-weight: var(--fw-sb);
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: rgba(255, 255, 255, 0.4);
+    color: var(--text-muted);
   }
   .new-btn {
     font-size: var(--fs-xs);
@@ -1470,7 +1470,7 @@
     background: var(--sidebar-hover);
   }
   .session-item.current {
-    background: rgba(29, 99, 237, 0.18);
+    background: var(--bg-active);
     box-shadow: inset 2px 0 0 var(--brand);
   }
   .session-row {
@@ -1503,7 +1503,7 @@
     flex: 1;
   }
   .s-time {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     flex-shrink: 0;
   }
@@ -1515,7 +1515,7 @@
   }
   .lineage-badge {
     flex-shrink: 0;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--brand);
     border: 1px solid var(--brand);
     border-radius: 999px;
@@ -1540,7 +1540,7 @@
     border: 1px solid var(--border-warn, #b8860b);
     border-radius: 6px;
     background: var(--bg-warn-soft, rgba(184, 134, 11, 0.12));
-    font-size: 12px;
+    font-size: var(--fs-xs);
   }
   .reconnect-banner .rb-text {
     flex: 1;
@@ -1551,7 +1551,7 @@
     color: var(--fg-muted, #888);
     cursor: pointer;
     padding: 0 2px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
   }
   .reconnect-banner .rb-dismiss:hover {
     color: var(--fg, inherit);
@@ -1589,14 +1589,14 @@
     max-width: 88%;
     padding: var(--sp-sm) var(--sp-md);
     border-radius: var(--r-lg);
-    font-size: var(--fs-sm);
+    font-size: var(--fs-md);
     line-height: var(--lh-normal);
     white-space: pre-wrap;
     word-break: break-word;
   }
   .user-bubble {
     background: var(--brand);
-    color: #fff;
+    color: var(--text-inverse);
   }
   .assistant-bubble {
     background: var(--bg-hover);
@@ -1654,7 +1654,7 @@
     word-break: break-all;
   }
   .sys {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
   }
   .artifact-card {
@@ -1747,7 +1747,7 @@
   }
   .ap-btn.approve {
     background: var(--brand);
-    color: #fff;
+    color: var(--text-inverse);
   }
   .ap-btn.approve:hover {
     background: var(--brand-hover);
@@ -1862,7 +1862,7 @@
     gap: 1px;
   }
   .m-label {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -1887,7 +1887,7 @@
     background: var(--sidebar-hover);
   }
   .m-row.sel {
-    background: rgba(29, 99, 237, 0.18);
+    background: var(--bg-active);
     box-shadow: inset 2px 0 0 var(--brand);
   }
   .m-row.dis,
@@ -1908,12 +1908,12 @@
   }
   .m-kind {
     flex-shrink: 0;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
   }
   .m-warn {
     flex-shrink: 0;
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     color: var(--warning);
   }
   .m-empty {
@@ -1925,7 +1925,7 @@
   .m-more {
     padding: 4px var(--sp-sm);
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
   }
   .chip-tray {
     display: flex;
@@ -1945,7 +1945,7 @@
   }
   .chip-kind {
     color: var(--brand);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     flex-shrink: 0;
   }
   .chip-ref {
@@ -1961,7 +1961,7 @@
     color: var(--text-muted);
     cursor: pointer;
     padding: 0 4px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     line-height: 1;
   }
   .chip-x:hover {
@@ -2017,7 +2017,7 @@
     border: none;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     font-weight: var(--fw-med);
     line-height: 1;
     padding: 4px 8px;
@@ -2028,7 +2028,7 @@
   }
   .mode-seg button.active {
     background: var(--brand);
-    color: #fff;
+    color: var(--text-inverse);
   }
   /* S5 模型选择器(Trae 对齐):mode 段右侧下拉,白名单正源=执行体 */
   .model-pick {
@@ -2064,11 +2064,11 @@
     gap: 6px;
   }
   .ap-desc {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
   }
   .ap-note {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     padding: 4px 10px 6px;
     border-top: 1px solid var(--border);
@@ -2100,7 +2100,7 @@
   .ap-confirm-btn.danger {
     background: var(--danger);
     border-color: var(--danger);
-    color: #fff;
+    color: var(--text-inverse);
   }
   .ap-confirm-btn:disabled {
     opacity: 0.5;
@@ -2145,7 +2145,7 @@
     border: none;
     background: transparent;
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     cursor: pointer;
     border-radius: var(--r-sm);
     text-align: left;
@@ -2161,12 +2161,12 @@
     cursor: default;
   }
   .model-check {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     color: var(--brand);
   }
   .model-menu-note {
     padding: 8px 10px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     color: var(--text-secondary);
     white-space: normal;
   }
@@ -2179,14 +2179,14 @@
   }
   /* S4 附件 chip 错误态 */
   .chip-err {
-    border-color: #e5484d;
-    color: #e5484d;
+    border-color: var(--danger);
+    color: var(--danger);
   }
   .tb-btn {
     border: none;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     font-weight: var(--fw-med);
     line-height: 1;
     padding: 4px 7px;
@@ -2217,7 +2217,7 @@
     border: none;
     border-radius: 999px;
     background: var(--brand);
-    color: #fff;
+    color: var(--text-inverse);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -2236,7 +2236,7 @@
     background: var(--danger);
   }
   .token-est {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     white-space: nowrap;
   }
@@ -2247,14 +2247,14 @@
     color: var(--danger);
   }
   .token-est-hint {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--danger);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .heartbeat-stall {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     color: var(--warning);
     padding: 4px 0 0;
     border-top: 1px solid var(--border);
@@ -2274,7 +2274,7 @@
     gap: 4px;
   }
   .ur-label {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
   }
   .used-chip {
@@ -2284,7 +2284,7 @@
     border: 1px solid var(--border);
     border-radius: 999px;
     padding: 1px 6px;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     max-width: 220px;
   }
   .used-chip.dropped {

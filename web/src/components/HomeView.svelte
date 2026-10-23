@@ -281,7 +281,7 @@
     flex: none;
   }
   .brand h1 {
-    font-size: 20px;
+    font-size: var(--fs-2xl);
     font-weight: var(--fw-sb);
     color: var(--text-primary);
     margin: 0 0 6px;
@@ -394,7 +394,7 @@
   }
   .opt.on {
     background: var(--brand);
-    color: #fff;
+    color: var(--text-inverse);
     font-weight: var(--fw-sb);
   }
   .opt:disabled {

@@ -50,13 +50,13 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
   }
   .c-title {
     color: var(--fg);
-    font-size: 14px;
+    font-size: var(--fs-md);
     font-weight: 600;
     margin-bottom: 8px;
   }
   .c-label {
     color: var(--fg-dim);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     margin-bottom: 6px;
   }
   .c-cmd {
@@ -64,7 +64,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     border: 1px solid var(--border);
     border-radius: 6px;
     color: var(--fg);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     margin: 0 0 10px;
     overflow-x: auto;
     padding: 8px 10px;
@@ -73,7 +73,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
   }
   .c-note {
     color: var(--fg-dim);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     line-height: 1.6;
     margin-bottom: 14px;
   }
@@ -88,7 +88,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     border-radius: 4px;
     color: var(--fg);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 5px 14px;
   }
   .c-btn.primary {

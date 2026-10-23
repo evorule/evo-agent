@@ -958,7 +958,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
     border: none;
     background: transparent;
     color: var(--text-muted);
-    font-size: 14px;
+    font-size: var(--fs-base);
     line-height: 1;
     padding: 0 2px;
     cursor: pointer;
@@ -966,13 +966,13 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
   }
   .close:hover {
     color: var(--text-primary);
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--bg-hover);
   }
   .save-error {
     align-self: center;
     margin-left: var(--sp-sm);
     font-size: var(--fs-xs);
-    color: #f87171;
+    color: var(--danger);
   }
   .editor-host {
     flex: 1;
@@ -983,7 +983,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
     border: 1px solid var(--border);
     background: var(--bg-card);
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     padding: 2px 10px;
     cursor: pointer;
     white-space: nowrap;
@@ -1000,7 +1000,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
     padding: 20px 28px;
     background: var(--bg-card);
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--fs-sm);
     line-height: 1.65;
   }
   .md-preview :global(h1),
@@ -1017,7 +1017,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
     padding: 1px 5px;
     border-radius: 3px;
     font-family: 'JetBrains Mono', Consolas, 'Microsoft YaHei', monospace;
-    font-size: 12px;
+    font-size: var(--fs-xs);
   }
   .md-preview :global(pre) {
     background: var(--bg-active);

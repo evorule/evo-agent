@@ -43,7 +43,7 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     line-height: 1;
     padding: 0;
     margin: 0 2px;

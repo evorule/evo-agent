@@ -115,7 +115,7 @@
     min-height: 0;
     overflow: auto;
     padding: var(--sp-xs) var(--sp-sm);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     line-height: 1.55;
     white-space: pre-wrap;
     word-break: break-all;
@@ -127,7 +127,7 @@
     color: var(--danger);
   }
   .clog-line.warn {
-    color: #d29922;
+    color: var(--warning);
   }
   .clog-empty,
   .clog-err {

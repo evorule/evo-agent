@@ -1218,18 +1218,18 @@
     overflow-y: auto;
   }
   .panel-title {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     font-weight: var(--fw-sb);
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: rgba(255, 255, 255, 0.4);
+    color: var(--text-muted);
     padding: var(--sp-sm) var(--sp-md);
     display: flex;
     align-items: center;
     gap: var(--sp-sm);
   }
   .offline {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     text-transform: none;
     letter-spacing: 0;
     color: var(--warning);
@@ -1242,7 +1242,7 @@
     align-items: center;
     gap: 2px;
     padding: var(--sp-xs) var(--sp-sm);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    border-bottom: 1px solid var(--border-muted);
   }
   .workdir {
     display: flex;
@@ -1301,7 +1301,7 @@
     border: none;
     background: transparent;
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: var(--fs-sm);
     line-height: 1;
     padding: 0 2px;
   }
@@ -1354,7 +1354,7 @@
   .ws-dialog-err {
     margin-top: 6px;
     font-size: var(--fs-xs);
-    color: #f87171;
+    color: var(--danger);
     word-break: break-all;
   }
   .ws-dialog-probe {
@@ -1388,7 +1388,7 @@
     border: 1px solid var(--brand);
     border-radius: 4px;
     background: var(--brand);
-    color: #fff;
+    color: var(--text-inverse);
     padding: 4px 14px;
   }
   .ws-btn-primary:hover {
@@ -1448,7 +1448,7 @@
     cursor: default;
   }
   .node:hover {
-    background-color: rgba(255, 255, 255, 0.06);
+    background-color: var(--bg-hover);
   }
   .node.selected {
     background-color: var(--bg-active);
@@ -1537,7 +1537,7 @@
   }
   .git-letter {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     font-weight: var(--fw-sb);
     flex-shrink: 0;
   }
@@ -1582,7 +1582,7 @@
     background: none;
     border: none;
     color: var(--sidebar-text);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     letter-spacing: 0.04em;
     cursor: pointer;
     user-select: none;
@@ -1599,7 +1599,7 @@
   }
   .oe-count {
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
   }
   .oe-row {
     padding-left: 24px;
@@ -1631,7 +1631,7 @@
   }
   .oe-close:hover {
     color: var(--text-primary);
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--bg-hover);
   }
   .oe-row:hover .oe-close,
   .oe-row.active .oe-close {
@@ -1654,14 +1654,14 @@
   .naming-error {
     margin: var(--sp-xs) var(--sp-md);
     font-size: var(--fs-xs);
-    color: #f87171;
+    color: var(--danger);
     line-height: var(--lh-normal);
     word-break: break-all;
   }
   .error {
     padding: var(--sp-md);
     font-size: var(--fs-xs);
-    color: #f87171;
+    color: var(--danger);
     line-height: var(--lh-normal);
   }
 </style>

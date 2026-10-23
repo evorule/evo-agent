@@ -187,7 +187,7 @@
     border: none;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 0 9px;
     cursor: pointer;
     white-space: nowrap;
@@ -216,7 +216,7 @@
     border: none;
     background: transparent;
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 6px 16px;
     cursor: pointer;
     white-space: nowrap;

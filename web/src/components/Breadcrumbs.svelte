@@ -90,7 +90,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
   }
   .seg {
     color: var(--fg-dim);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     cursor: pointer;
     padding: 1px 4px;
     border-radius: 3px;
@@ -107,12 +107,12 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
   }
   .sep {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     user-select: none;
   }
   .ellipsis {
     color: var(--fg-dim);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     cursor: pointer;
     padding: 0 4px;
   }

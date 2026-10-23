@@ -218,12 +218,12 @@
     flex: none;
   }
   .mem-time {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     flex-shrink: 0;
   }
   .mem-kind {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--brand);
     flex-shrink: 0;
     white-space: nowrap;

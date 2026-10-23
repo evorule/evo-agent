@@ -374,7 +374,7 @@
     margin-bottom: var(--sp-sm);
   }
   .editor-hint {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     margin-bottom: var(--sp-xs);
   }
@@ -459,7 +459,7 @@
     color: var(--warning, #fbbf24);
   }
   .t-rl {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--danger);
   }
   .t-note {
@@ -493,7 +493,7 @@
   .btn.primary {
     background: var(--brand);
     border-color: var(--brand);
-    color: #fff;
+    color: var(--text-inverse);
   }
   .btn.primary:hover:not(:disabled) {
     background: var(--brand-hover);
@@ -501,7 +501,7 @@
   .btn.danger {
     background: var(--danger);
     border-color: var(--danger);
-    color: #fff;
+    color: var(--text-inverse);
   }
   .mono {
     font-family: var(--font-mono, monospace);

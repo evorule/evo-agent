@@ -201,7 +201,7 @@ Svelte 5 runes 模式(legacy 模式下本组件响应性坏死:store 更新后�
     background: var(--brand-bg);
     border-radius: var(--r-sm);
     color: var(--brand);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     padding: 2px 6px;
   }
   .ic-input {
@@ -210,7 +210,7 @@ Svelte 5 runes 模式(legacy 模式下本组件响应性坏死:store 更新后�
     border-radius: var(--r-sm);
     color: var(--fg);
     flex: 1;
-    font-size: 13px;
+    font-size: var(--fs-sm);
     padding: 5px 8px;
   }
   .ic-btn {
@@ -219,7 +219,7 @@ Svelte 5 runes 模式(legacy 模式下本组件响应性坏死:store 更新后�
     border-radius: var(--r-sm);
     color: var(--fg);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 4px 10px;
   }
   .ic-btn.primary {
@@ -228,7 +228,7 @@ Svelte 5 runes 模式(legacy 模式下本组件响应性坏死:store 更新后�
   }
   .ic-error {
     color: var(--danger);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 6px 2px 0;
   }
   .ic-actions {
@@ -252,7 +252,7 @@ Svelte 5 runes 模式(legacy 模式下本组件响应性坏死:store 更新后�
   :global(.ic-add-zone pre) {
     color: var(--fg);
     font-family: var(--font-mono);
-    font-size: 13px;
+    font-size: var(--fs-sm);
     margin: 0;
     padding: 2px 8px;
     white-space: pre;

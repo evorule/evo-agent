@@ -136,7 +136,7 @@
     flex-shrink: 0;
   }
   .orch-title {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     font-weight: var(--fw-sb);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -185,7 +185,7 @@
     flex-shrink: 0;
   }
   .lg {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     display: inline-flex;
     align-items: center;
@@ -211,7 +211,7 @@
     flex-shrink: 0;
   }
   .oa {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     border: 1px solid var(--border);
     border-radius: 999px;
@@ -248,12 +248,12 @@
   .onode.unknown .obox { stroke-dasharray: 3 3; }
   .onode.unknown .odot { fill: transparent; stroke: var(--text-muted); stroke-width: 1; }
   .otype {
-    font-size: 12px;
+    font-size: var(--fs-xs);
     font-weight: var(--fw-sb);
     fill: var(--text-primary);
   }
   .osid {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     fill: var(--text-muted);
   }
   @keyframes orch-dash {

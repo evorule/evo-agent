@@ -261,14 +261,14 @@
     border: none;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 16px;
+    font-size: var(--fs-lg);
     cursor: pointer;
     padding: 0 var(--sp-xs);
   }
   .ac-verdict {
     padding: var(--sp-sm) var(--sp-sm);
     border-radius: 6px;
-    font-size: 13px;
+    font-size: var(--fs-sm);
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -286,7 +286,7 @@
   }
   .ac-sub {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
   }
   .ac-section {
     display: flex;
@@ -294,7 +294,7 @@
     gap: var(--sp-xs);
   }
   .ac-label {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     text-transform: uppercase;
     letter-spacing: 0.4px;
     color: var(--text-muted);
@@ -305,7 +305,7 @@
     background: var(--bg-page);
     border: 1px solid var(--border);
     border-radius: 6px;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     white-space: pre-wrap;
     word-break: break-word;
     max-height: 180px;
@@ -319,7 +319,7 @@
     display: flex;
     flex-wrap: wrap;
     gap: var(--sp-xs) var(--sp-md);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
   }
   .ac-kv .k::after {
@@ -334,7 +334,7 @@
     display: flex;
     align-items: center;
     gap: var(--sp-sm);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 2px var(--sp-xs);
     border-radius: 4px;
     color: var(--text-secondary);
@@ -354,14 +354,14 @@
   .tl-t {
     margin-left: auto;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
   }
   .ac-drawer-toggle {
     align-self: flex-start;
     border: none;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     cursor: pointer;
     padding: 0;
   }
@@ -376,7 +376,7 @@
     padding-left: var(--sp-sm);
   }
   .dr-head {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     color: var(--text-secondary);
     display: flex;
     flex-wrap: wrap;
@@ -386,7 +386,7 @@
     color: var(--text-muted);
   }
   .dr-cap {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     margin-top: var(--sp-xs);
   }
@@ -401,7 +401,7 @@
     border-radius: 6px;
     background: var(--bg-hover);
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     cursor: pointer;
   }
   .ac-btn:hover {
@@ -412,11 +412,11 @@
     color: var(--text-secondary);
   }
   .ac-dim {
-    font-size: 12px;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
   }
   .ac-err {
-    font-size: 12px;
+    font-size: var(--fs-xs);
     color: var(--danger);
   }
   .mono {

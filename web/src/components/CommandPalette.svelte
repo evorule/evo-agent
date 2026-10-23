@@ -469,7 +469,7 @@
   }
   .group-label {
     padding: var(--sp-xs) var(--sp-md);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     font-weight: var(--fw-sb);
     text-transform: uppercase;
     letter-spacing: 0.5px;

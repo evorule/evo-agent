@@ -256,7 +256,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     border-radius: 4px;
     color: var(--fg-dim);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 2px 8px;
     white-space: nowrap;
   }
@@ -265,13 +265,13 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     color: var(--fg);
   }
   .dot {
-    color: #3fb950;
+    color: var(--success);
     font-size: 8px;
     margin-right: 4px;
     vertical-align: 1px;
   }
   .dot.exited {
-    color: #f85149;
+    color: var(--danger);
   }
   .actions {
     display: flex;
@@ -283,7 +283,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     border-radius: 4px;
     color: var(--fg-dim);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 2px 8px;
   }
   .tbtn:hover:not(:disabled) {
@@ -308,7 +308,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     border-radius: 4px;
     color: var(--fg);
     flex: 1;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     max-width: 280px;
     padding: 3px 8px;
   }
@@ -326,14 +326,14 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     color: var(--fg-dim);
     display: flex;
     flex-direction: column;
-    font-size: 13px;
+    font-size: var(--fs-sm);
     gap: 10px;
     height: 100%;
     justify-content: center;
   }
   .gov-note {
     color: var(--fg-dim);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     max-width: 420px;
     opacity: 0.8;
     text-align: center;
@@ -344,7 +344,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     border-radius: 4px;
     color: var(--fg);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 4px 14px;
   }
   .exit-overlay {
@@ -354,7 +354,7 @@ This file is part of EvoRule, licensed under GNU Affero General Public License v
     color: var(--fg-dim);
     display: flex;
     flex-shrink: 0;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     gap: 12px;
     justify-content: space-between;
     padding: 6px 12px;

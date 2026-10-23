@@ -338,7 +338,7 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
     border-radius: 4px;
     color: var(--fg-dim);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 2px 8px;
     white-space: nowrap;
   }
@@ -354,7 +354,7 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
     box-shadow: inset -2px 0 0 var(--brand);
   }
   .gp-dirty {
-    color: #e3b341;
+    color: var(--warning);
     font-size: 9px;
     margin-left: 2px;
   }
@@ -364,17 +364,17 @@ diff/产物/设置页留在主组(轻量实现边界,完整组模型随完整 Ed
     margin-left: 6px;
   }
   .gp-tab-close:hover {
-    color: #f85149;
+    color: var(--danger);
   }
   .gp-group-close {
     background: transparent;
     border: none;
     color: var(--fg-dim);
     cursor: pointer;
-    font-size: 14px;
+    font-size: var(--fs-base);
   }
   .gp-group-close:hover {
-    color: #f85149;
+    color: var(--danger);
   }
   .gp-host {
     flex: 1;

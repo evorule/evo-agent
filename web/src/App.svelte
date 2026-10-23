@@ -860,7 +860,7 @@
     background: var(--warn-bg, #3d2e00);
     border-bottom: 1px solid var(--border, #30363d);
     color: var(--warn-fg, #f0c674);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     flex-shrink: 0;
   }
   .lsp-banner-text {
@@ -876,7 +876,7 @@
     border-radius: 4px;
     color: inherit;
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 2px 10px;
   }
   .lsp-banner-dismiss {
@@ -884,7 +884,7 @@
     border: none;
     color: inherit;
     cursor: pointer;
-    font-size: 14px;
+    font-size: var(--fs-base);
     line-height: 1;
     padding: 2px 6px;
   }

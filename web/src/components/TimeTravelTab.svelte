@@ -137,11 +137,11 @@
     gap: 6px;
   }
   .tt-synth {
-    color: #d29922;
-    border: 1px solid #d29922;
+    color: var(--warning);
+    border: 1px solid var(--warning);
     border-radius: 999px;
     padding: 0 7px;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
   }
   .tt-count {
     font-size: var(--fs-xs);
@@ -183,7 +183,7 @@
     background: var(--bg-hover);
   }
   .tt-idx {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     border: 1px solid var(--border);
     border-radius: 50%;
@@ -209,16 +209,16 @@
     gap: var(--sp-sm);
   }
   .tt-kind {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--brand);
     white-space: nowrap;
   }
   .tt-time {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
   }
   .tt-now {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--brand);
     border: 1px solid var(--brand);
     border-radius: 999px;

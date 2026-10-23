@@ -211,8 +211,8 @@
     align-items: center;
     justify-content: space-between;
     background: var(--brand);
-    color: #fff;
-    font-size: 11px;
+    color: var(--text-inverse);
+    font-size: var(--fs-2xs);
     user-select: none;
     position: relative;
     z-index: 30;
@@ -233,7 +233,7 @@
     color: inherit;
     background: transparent;
     border: none;
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -289,8 +289,8 @@
     position: absolute;
     top: 2px;
     right: 1px;
-    background: #d1242f;
-    color: #fff;
+    background: var(--danger);
+    color: var(--text-inverse);
     font-size: 9px;
     line-height: 1;
     padding: 2px 4px;
@@ -463,7 +463,7 @@
     border: none;
     color: var(--text-muted);
     cursor: pointer;
-    font-size: 13px;
+    font-size: var(--fs-sm);
     line-height: 1;
     padding: 0 2px;
   }

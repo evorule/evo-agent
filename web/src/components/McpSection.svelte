@@ -216,7 +216,7 @@
   }
   .expose-note {
     display: block;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     margin-top: var(--sp-xs);
     padding-left: var(--sp-md);
@@ -308,7 +308,7 @@
     word-break: break-all;
   }
   .card-env {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     margin-top: 2px;
   }
@@ -352,7 +352,7 @@
     white-space: nowrap;
   }
   .tool-note {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     margin-top: var(--sp-xs);
   }
@@ -372,7 +372,7 @@
     margin-top: var(--sp-sm);
   }
   .editor-hint {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
     margin-bottom: var(--sp-xs);
   }
@@ -417,7 +417,7 @@
   .btn.primary {
     background: var(--brand);
     border-color: var(--brand);
-    color: #fff;
+    color: var(--text-inverse);
   }
   .btn.primary:hover:not(:disabled) {
     background: var(--brand-hover);

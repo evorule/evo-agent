@@ -249,7 +249,7 @@
   }
   .chev {
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     flex-shrink: 0;
   }
   .path {
@@ -261,7 +261,7 @@
   .badge {
     margin-left: auto;
     flex-shrink: 0;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-secondary);
     background: var(--bg-hover);
     border-radius: var(--r-full, 999px);
@@ -310,6 +310,6 @@
     margin-left: auto;
     flex-shrink: 0;
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--fs-2xs);
   }
 </style>

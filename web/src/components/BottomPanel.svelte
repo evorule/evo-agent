@@ -279,7 +279,7 @@
     align-items: center;
   }
   .collapse-btn {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-secondary);
     padding: 2px var(--sp-xs);
     border-radius: var(--r-sm);
@@ -301,7 +301,7 @@
     border: 1px solid var(--border);
     border-radius: 4px;
     color: var(--fg);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     max-width: 260px;
     padding: 2px 6px;
   }
@@ -311,7 +311,7 @@
     border-radius: 4px;
     color: var(--fg-dim);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 2px 8px;
   }
   .out-act.follow {
@@ -328,7 +328,7 @@
     align-items: baseline;
     color: var(--fg);
     display: flex;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     gap: 8px;
     line-height: 1.55;
     white-space: pre-wrap;
@@ -340,20 +340,20 @@
   .out-stream {
     color: var(--fg-dim);
     flex-shrink: 0;
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     width: 26px;
   }
   .out-stream.err {
-    color: #f85149;
+    color: var(--danger);
   }
   .out-link {
-    color: #58a6ff;
+    color: var(--info);
     cursor: pointer;
     text-decoration: underline;
   }
   .out-truncated {
     color: var(--fg-dim);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     padding: 2px 0;
   }
   .panel-slot {

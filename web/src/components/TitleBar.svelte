@@ -195,7 +195,7 @@
   .session-chip,
   .step-chip,
   .gov-chip {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     color: var(--text-secondary);
     background: var(--bg-hover);
     border: 1px solid var(--border);
@@ -284,6 +284,6 @@
   }
   .win-btn.win-close:hover {
     background: var(--danger);
-    color: #fff;
+    color: var(--text-inverse);
   }
 </style>

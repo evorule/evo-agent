@@ -236,7 +236,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     background: transparent;
     color: var(--text-secondary);
     cursor: pointer;
-    font-size: 14px;
+    font-size: var(--fs-base);
   }
   .ext-tabs {
     display: flex;
@@ -248,7 +248,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     border: 1px solid var(--border);
     background: transparent;
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     padding: 4px 6px;
     cursor: pointer;
     border-radius: var(--r-sm);
@@ -260,13 +260,13 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
   }
   .ext-err {
     color: var(--danger);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     padding: 4px 0;
   }
   .ext-loading,
   .ext-empty {
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     padding: 10px 4px;
   }
   .ext-import {
@@ -280,19 +280,19 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     border: 1px solid var(--border);
     border-radius: var(--r-sm);
     color: var(--text-primary);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     padding: 4px 6px;
   }
   .ext-import-btn {
     border: 1px solid var(--border);
     background: var(--bg-card);
     color: var(--text-primary);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     padding: 3px 10px;
     cursor: pointer;
   }
   .ext-import-msg {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     color: var(--text-secondary);
     padding: 2px 0 6px;
   }
@@ -316,7 +316,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     font-weight: var(--fw-med);
   }
   .ext-status {
-    font-size: 10px;
+    font-size: var(--fs-2xs);
     color: var(--text-muted);
   }
   .st-pending {
@@ -329,7 +329,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     color: var(--danger);
   }
   .ext-desc {
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     color: var(--text-secondary);
     margin: 4px 0;
     display: -webkit-box;
@@ -345,7 +345,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     border: 1px solid var(--border);
     background: transparent;
     color: var(--text-primary);
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     padding: 3px 10px;
     cursor: pointer;
     border-radius: var(--r-sm);
@@ -363,7 +363,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     overflow: auto;
     background: var(--bg-active);
     padding: 8px;
-    font-size: 11px;
+    font-size: var(--fs-2xs);
     color: var(--text-primary);
     margin: 6px 0 0;
     white-space: pre-wrap;
