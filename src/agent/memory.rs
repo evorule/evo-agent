@@ -1458,12 +1458,9 @@ impl MemoryManager {
     ///
     /// # 返回值
     ///
-    /// - `Ok(PersistOutcome)`（缺陷登记项②）：Persisted=已落审计链，CacheOnly=仅本地
-    ///   （调用方——sediment——不应把 CacheOnly 计为 summary_written）
+    /// - `Ok(PersistOutcome)`（缺陷登记项②）：Persisted=已落审计链（含 fact_id 回填），
+    ///   CacheOnly=仅本地（调用方——sediment——不应把 CacheOnly 计为 summary_written）
     /// - `Err(e)`:键校验失败（空键/超长）或 session 未设置
-    ///
-    /// 挂账（跨仓）：`update_payload` 客户端返回 `Result<(), _>`，fact_id 无法
-    /// 回填——证据链上游缺失需 server 仓让该端点返回 FactId 后方能闭环。
     pub async fn write_shared_summary(
         &mut self,
         session_id: &str,

@@ -870,7 +870,7 @@ pub fn register(h: &mut ToolHandler, ws: &WorkspaceApiClient, ev: &EvoruleApiCli
     );
 }
 
-/// 全部本地逻辑工具 spec（5 个）
+/// 全部本地逻辑工具 spec（7 个）
 pub fn specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {

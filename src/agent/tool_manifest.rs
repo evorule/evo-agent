@@ -13,8 +13,8 @@
 //! 1. 无 manifest 拒绝注册：[`crate::io_handlers::tool_handler::ToolHandler::register`]
 //!    接收 `(manifest, handler)`；按名查不到静态条目且非动态源（服务代理/MCP）
 //!    的注册在启动期 panic（fail-fast）。
-//! 2. 静态层锁定：内置 23 + 规则 49 + delegate 1 + memory 4 的 manifest 为
-//!    静态表（[`static_manifests`]）；测试断言数量、名称无重叠、spec 可解析、
+//! 2. 静态层锁定：内置 36 + 规则 59 + delegate 1 + memory 6 的 manifest 为
+//!    静态表（[`static_manifests`]，合计 102）；测试断言数量、名称无重叠、spec 可解析、
 //!    派生视图与旧表快照一致——「union 42 vs 41」类注释漂移机制上不可能再现。
 //! 3. 动态层注册期补全：服务代理与 MCP 在注册期必须产出 spec
 //!    （[`SpecSource::Inline`]）；丢字段即注册失败。
@@ -47,7 +47,7 @@
 //! 注册不改变治理分级），静态未命中按 runtime manifest（MCP/ServiceProxy
 //! 默认 Sensitive 意图必报，人工分级降档走 settings 键
 //! `agentTools.mcpAdjudication` / `agentTools.serviceProxyAdjudication`，
-//! D7-A 方案一来源级）。`GOVERNANCE_SNAPSHOT` 26 条快照锁静态面不变；
+//! D7-A 方案一来源级）。`GOVERNANCE_SNAPSHOT` 31 条快照锁静态面不变；
 //! 本扩展零静态表变更（数量锁现 74）。
 
 use serde::{Deserialize, Serialize};
@@ -64,11 +64,11 @@ use crate::builtin_tools::ParameterSpec;
 pub enum ToolSource {
     /// 内置工具（宿主实现，default_safe_toolkit 注册）
     Builtin,
-    /// 规则工具·透传（rule_tools adapter 表驱动，40 个）
+    /// 规则工具·透传（rule_tools adapter 表驱动，49 个）
     RuleTransparent,
-    /// 规则工具·本地逻辑（rule_tools local_handlers，6 个）
+    /// 规则工具·本地逻辑（rule_tools local_handlers，7 个）
     RuleLocal,
-    /// 自省记忆工具（memory_tool，4 个）
+    /// 自省记忆工具（memory_tool，6 个）
     Memory,
     /// delegate 子代理派发
     Delegate,
@@ -114,7 +114,9 @@ pub enum CapDomain {
 pub enum AdjudicationClass {
     /// 哨兵：P2 裁决 + 规则正本 enforce 已在场
     Sentineled,
-    /// 敏感：P2 裁决在通道（意图必报，暂无 enforce）
+    /// 敏感：P2 裁决在通道，意图必报（每次调用必产出裁决提案并留痕）。
+    /// 「必报」≠「必拦」——是否真正拦截取决于规则正本是否配置了匹配该
+    /// 工具的 enforce 条目，以规则资产现状为准，勿将本分级当作拦截保证。
     Sensitive,
     /// 常规：免 P2 裁决（机制层治理或纯落链）
     Standard,
@@ -297,7 +299,7 @@ impl ToolManifest {
 }
 
 // =============================================================================
-// 静态表（硬规则 2：内置 22 + 规则 49 + delegate 1 + memory 4 = 76）
+// 静态表（硬规则 2：内置 36 + 规则 59 + delegate 1 + memory 6 = 102）
 // =============================================================================
 
 /// agentTools.fileCreate（默认开）
@@ -433,7 +435,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（34 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（36 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -817,7 +819,7 @@ fn memory_manifests() -> Vec<ToolManifest> {
     ]
 }
 
-/// 全部静态 manifest（77 条；测试锁数量/唯一名/双侧集合相等）
+/// 全部静态 manifest（102 条；测试锁数量/唯一名/双侧集合相等）
 ///
 /// C1 性能收口（PR-3 顺手）：静态表在首次访问后经 OnceLock 缓存——
 /// 构造函数为纯函数（无常量/无环境依赖），行为零变化（调用面拿到的

@@ -36,7 +36,7 @@
 //! │                McpClient (client.rs)                     │
 //! │  connect() / list_tools() / call_tool(_structured)()     │
 //! │  JSON-RPC 2.0: initialize / tools/list / tools/call      │
-//! │  （协议版本 2024-11-05；响应 content 图片块收集，B1）      │
+//! │  （协议版本 2025-06-18，additive 回落旧版；图片块收集）    │
 //! └──────────────────────┬──────────────────────────────────┘
 //!                        │ McpTransport::request / notify
 //!                        ▼
