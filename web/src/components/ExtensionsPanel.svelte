@@ -303,7 +303,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     margin-bottom: 8px;
   }
   .ext-item.pending {
-    border-color: var(--warning, #f39c12);
+    border-color: var(--warning, #d29922);
   }
   .ext-item-head {
     display: flex;
@@ -320,7 +320,7 @@ MCP 聚合入口。全部映射既有 serve 端点,零新后端;审批链人在�
     color: var(--text-muted);
   }
   .st-pending {
-    color: var(--warning, #f39c12);
+    color: var(--warning, #d29922);
   }
   .st-active {
     color: var(--brand);

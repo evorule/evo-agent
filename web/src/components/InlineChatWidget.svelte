@@ -243,11 +243,11 @@ Svelte 5 runes 模式(legacy 模式下本组件响应性坏死:store 更新后�
     text-decoration: line-through;
   }
   :global(.ic-del-line) {
-    background: rgba(231, 76, 60, 0.12);
+    background: var(--danger-bg);
   }
   :global(.ic-add-zone) {
-    background: rgba(46, 204, 113, 0.12);
-    border-left: 2px solid #2ecc71;
+    background: var(--success-bg);
+    border-left: 2px solid var(--success);
   }
   :global(.ic-add-zone pre) {
     color: var(--fg);
