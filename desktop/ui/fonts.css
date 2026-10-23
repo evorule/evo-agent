@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 EvoRule Project */
-/* 壳侧小页(向导/启动/错误)离线字体,与工作台设计令牌 v4.0 同源(O-539)。
+/* 壳侧小页(向导/启动/错误)离线字体,与工作台设计令牌 v4.0 同源。
    local() 优先,无任何网络请求;路径相对本文件(frontendDist 根)。 */
 @font-face {
   font-family: "Inter";

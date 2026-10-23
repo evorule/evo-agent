@@ -76,7 +76,7 @@
 
   reconnectFromStorage();
 
-  // UI 基准字号接线(O-540):设置快照变化 -> :root 缩放因子(全部 --fs-* 令牌 calc 联动);
+  // UI 基准字号接线:设置快照变化 -> :root 缩放因子(全部 --fs-* 令牌 calc 联动);
   // 顶层订阅:缓存回放值在首帧渲染前生效,零闪变。编辑器/终端字号独立设置,不随本键。
   let lastUiFontSize = null;
   const unsubUiFontSize = settingsState.subscribe((s) => {

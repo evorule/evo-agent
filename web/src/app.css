@@ -89,7 +89,7 @@
   --sh-lg: 0 4px 6px rgba(0, 0, 0, 0.07), 0 2px 4px rgba(0, 0, 0, 0.06);
   --sh-xl: 0 10px 15px rgba(0, 0, 0, 0.1), 0 4px 6px rgba(0, 0, 0, 0.05);
 
-  /* Typography(13px 基准;--ui-font-scale 由 workbench.uiFontSize 驱动,O-540) */
+  /* Typography(13px 基准;--ui-font-scale 由 workbench.uiFontSize 驱动) */
   --font-sans: "Inter", "Noto Sans SC", -apple-system, BlinkMacSystemFont,
     "Segoe UI", Roboto, "Helvetica Neue", "Microsoft YaHei", Arial, sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Code", "SF Mono", "Fira Code",
