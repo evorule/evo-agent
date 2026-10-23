@@ -169,7 +169,12 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node 22 (upgraded from 20, 2026-10-23): the jsdom chain now pulls
+          # undici v8, whose decompress interceptor references
+          # zlib.createZstdDecompress -- a zstd API that only exists on
+          # Node >= 22.15. On Node 20 that module crashes at load time
+          # (TypeError: Cannot read properties of undefined (reading 'bind')).
+          node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
 
