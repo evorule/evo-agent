@@ -264,6 +264,86 @@ a:hover {
   --sidebar-active: rgba(31, 35, 40, 0.08);
 }
 
+/* 聊天流代码高亮配色(Primer 双主题,仅 .md-body 消费方;chat-markdown.js 产 hljs 类) */
+.md-body .hljs-keyword,
+.md-body .hljs-selector-tag,
+.md-body .hljs-literal,
+.md-body .hljs-doctag {
+  color: #ff7b72;
+}
+.md-body .hljs-string,
+.md-body .hljs-regexp,
+.md-body .hljs-addition,
+.md-body .hljs-meta {
+  color: #a5d6ff;
+}
+.md-body .hljs-number,
+.md-body .hljs-variable,
+.md-body .hljs-template-variable,
+.md-body .hljs-attr,
+.md-body .hljs-attribute,
+.md-body .hljs-type {
+  color: #79c0ff;
+}
+.md-body .hljs-title,
+.md-body .hljs-title.function_,
+.md-body .hljs-section,
+.md-body .hljs-name,
+.md-body .hljs-selector-id,
+.md-body .hljs-selector-class {
+  color: #d2a8ff;
+}
+.md-body .hljs-comment,
+.md-body .hljs-quote,
+.md-body .hljs-deletion {
+  color: #8b949e;
+}
+.md-body .hljs-built_in,
+.md-body .hljs-builtin-name,
+.md-body .hljs-symbol,
+.md-body .hljs-params {
+  color: #ffa657;
+}
+[data-theme='light'] .md-body .hljs-keyword,
+[data-theme='light'] .md-body .hljs-selector-tag,
+[data-theme='light'] .md-body .hljs-literal,
+[data-theme='light'] .md-body .hljs-doctag {
+  color: #cf222e;
+}
+[data-theme='light'] .md-body .hljs-string,
+[data-theme='light'] .md-body .hljs-regexp,
+[data-theme='light'] .md-body .hljs-addition,
+[data-theme='light'] .md-body .hljs-meta {
+  color: #0a3069;
+}
+[data-theme='light'] .md-body .hljs-number,
+[data-theme='light'] .md-body .hljs-variable,
+[data-theme='light'] .md-body .hljs-template-variable,
+[data-theme='light'] .md-body .hljs-attr,
+[data-theme='light'] .md-body .hljs-attribute,
+[data-theme='light'] .md-body .hljs-type {
+  color: #0550ae;
+}
+[data-theme='light'] .md-body .hljs-title,
+[data-theme='light'] .md-body .hljs-title.function_,
+[data-theme='light'] .md-body .hljs-section,
+[data-theme='light'] .md-body .hljs-name,
+[data-theme='light'] .md-body .hljs-selector-id,
+[data-theme='light'] .md-body .hljs-selector-class {
+  color: #8250df;
+}
+[data-theme='light'] .md-body .hljs-comment,
+[data-theme='light'] .md-body .hljs-quote,
+[data-theme='light'] .md-body .hljs-deletion {
+  color: #6e7781;
+}
+[data-theme='light'] .md-body .hljs-built_in,
+[data-theme='light'] .md-body .hljs-builtin-name,
+[data-theme='light'] .md-body .hljs-symbol,
+[data-theme='light'] .md-body .hljs-params {
+  color: #953800;
+}
+
 /* 首帧防闪烁(index.html 内联脚本在解析到此之前已设 data-theme;
    帧内禁用颜色过渡) */
 .no-theme-transition *,

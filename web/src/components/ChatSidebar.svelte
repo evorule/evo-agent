@@ -18,6 +18,7 @@
     openSettingsTab,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
+  import { renderChatHtml, copyChatCode } from '../lib/chat-markdown.js';
   import { approveProposal, answerQuestion, listResumableRuns, getOrchestrationLinks, uploadFile, getLlmModels, setLlmModel, listSkills } from '../lib/api.js';
   import { settingsState, setSetting } from '../lib/settings.js';
   import {
@@ -761,6 +762,12 @@
     }
   }
 
+  // 代码块复制(事件委托:{@html} 注入节点无 Svelte 事件绑定)
+  function onMdCopyClick(e) {
+    const btn = e.target.closest?.('.md-copy');
+    if (btn?.dataset?.mdCopy) copyChatCode(btn.dataset.mdCopy, btn);
+  }
+
   // 治理叠加:审批决定走既有 G8 /approve 通道(60s 超时自动拒绝)
   function decideApproval(m, approved) {
     if (!m.proposalId || m.decision === 'sending' || m.decision === 'sent') return;
@@ -942,8 +949,8 @@
         </div>
       {:else if m.kind === 'assistant'}
         <div class="row">
-          <div class="bubble assistant-bubble">
-            {m.text}<span class="cursor" class:on={m.streaming}></span>
+          <div class="bubble assistant-bubble md-body" onclick={onMdCopyClick}>
+            {@html renderChatHtml(m.text, m.id)}<span class="cursor" class:on={m.streaming}></span>
           </div>
           <span class="audit-chip">
             <AuditBadge
@@ -1601,6 +1608,139 @@
   .assistant-bubble {
     background: var(--bg-hover);
     color: var(--text-primary);
+  }
+  /* markdown 正文(注入 DOM 不带 Svelte 作用域属性,后代一律 :global);
+     配色全部走排版 v4.0 令牌,hljs 主题色在 app.css 按主题切换 */
+  .md-body :global(p) {
+    margin: 0 0 8px;
+  }
+  .md-body :global(p:last-child) {
+    margin-bottom: 0;
+  }
+  .md-body :global(h1),
+  .md-body :global(h2),
+  .md-body :global(h3),
+  .md-body :global(h4),
+  .md-body :global(h5),
+  .md-body :global(h6) {
+    margin: 14px 0 8px;
+    line-height: 1.35;
+    font-weight: 600;
+  }
+  .md-body :global(h1):first-child,
+  .md-body :global(h2):first-child,
+  .md-body :global(h3):first-child,
+  .md-body :global(p:first-child) {
+    margin-top: 0;
+  }
+  .md-body :global(h1) {
+    font-size: 1.25em;
+  }
+  .md-body :global(h2) {
+    font-size: 1.15em;
+  }
+  .md-body :global(h3) {
+    font-size: 1.05em;
+  }
+  .md-body :global(h4),
+  .md-body :global(h5),
+  .md-body :global(h6) {
+    font-size: 1em;
+  }
+  .md-body :global(ul),
+  .md-body :global(ol) {
+    margin: 4px 0 8px;
+    padding-left: 22px;
+  }
+  .md-body :global(li) {
+    margin: 2px 0;
+  }
+  .md-body :global(blockquote) {
+    margin: 6px 0;
+    padding: 2px 12px;
+    border-left: 3px solid var(--border-strong);
+    color: var(--text-secondary);
+  }
+  .md-body :global(a) {
+    color: var(--brand-ocean);
+    text-decoration: none;
+  }
+  .md-body :global(a:hover) {
+    text-decoration: underline;
+  }
+  .md-body :global(hr) {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 12px 0;
+  }
+  .md-body :global(table) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    margin: 8px 0;
+    font-size: 0.92em;
+  }
+  .md-body :global(th),
+  .md-body :global(td) {
+    border: 1px solid var(--border);
+    padding: 4px 10px;
+    text-align: left;
+  }
+  .md-body :global(th) {
+    background: var(--bg-card);
+  }
+  .md-body :global(code:not(.hljs)) {
+    background: var(--bg-card);
+    border: 1px solid var(--border-muted);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: var(--font-mono);
+    font-size: 0.92em;
+  }
+  .md-body :global(.md-code) {
+    margin: 8px 0;
+    border: 1px solid var(--border-muted);
+    border-radius: 6px;
+    overflow: hidden;
+    background: var(--bg-card);
+  }
+  .md-body :global(.md-code-head) {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 3px 10px;
+    border-bottom: 1px solid var(--border-muted);
+    background: var(--bg-hover);
+  }
+  .md-body :global(.md-code-lang) {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+  }
+  .md-body :global(.md-copy) {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 11px;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .md-body :global(.md-copy:hover) {
+    color: var(--text-primary);
+  }
+  .md-body :global(.md-code pre) {
+    margin: 0;
+    padding: 10px 12px;
+    overflow-x: auto;
+  }
+  .md-body :global(.hljs) {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.55;
+    background: transparent;
+    padding: 0;
   }
   .error-bubble {
     background: var(--danger-bg);
