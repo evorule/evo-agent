@@ -1,4 +1,4 @@
-﻿# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
+# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
 #
 # 资源布局（安装后 {install}\resources\...，由 tauri.conf.json bundle.resources 承接）：
 #   resources\bin\evo-agent.exe             <- <repo>\target\release\evo-agent.exe
@@ -17,8 +17,9 @@
 # console 仓同理（-ConsoleRepo，默认同级 evorule-console-cloud）。
 #
 # 用法：powershell -File build-installer.ps1 [-SkipCollect] [-UpdateUrlBase <base>] [-ReleaseNotes <notes>]
+#       [-LicenseSsot <根仓目录>]（缺省取本仓同级 evorule 目录）
 # 产物：desktop\target\release\bundle\nsis\evo-agent-desktop_<ver>_x64-setup.exe（+.sig）
-#       desktop\target\release\bundle\updater\{setup.exe, .sig, latest.json}（三件套归集）
+#       desktop\target\release\bundle\updater\{setup.exe, .sig, latest.json, 源码 tarball}（发布归集）
 #
 # 签名要求：tauri build 需 TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 # env（私钥位置见发布留痕档）；无 env 时 build 产出 setup.exe 但 .sig 缺失，本脚本报错终止。
@@ -36,6 +37,7 @@ param(
     [switch]$SkipFreshness,
     [string]$ServerRepo = "",
     [string]$ConsoleRepo = "",
+    [string]$LicenseSsot = "",
     [string]$UpdateUrlBase = "",
     [string]$ReleaseNotes = ""
 )
@@ -46,6 +48,7 @@ $srcTauri = Join-Path $desktop "src-tauri"
 $repoRoot = Split-Path $desktop -Parent
 if (-not $ServerRepo) { $ServerRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-server" }
 if (-not $ConsoleRepo) { $ConsoleRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-console-cloud" }
+if (-not $LicenseSsot) { $LicenseSsot = Join-Path (Split-Path $repoRoot -Parent) "evorule" }
 
 if (-not $SkipCollect) {
     # 新鲜度门（发版前置红线）:产物须新于源码最后提交(先定稿提交、再 release
@@ -94,6 +97,77 @@ if (-not $SkipCollect) {
     if (-not (Test-Path $templateToml)) { throw "release template missing: $templateToml" }
     Copy-Item $templateToml (Join-Path $srcTauri "resources\evo-agent\evo-agent.toml") -Force
     Write-Host "collected $templateToml -> resources\evo-agent\evo-agent.toml"
+
+    # 许可证合规五件套（AGPL §4）：LICENSE/NOTICE.md 用本仓自带；THIRD-PARTY-NOTICES.md
+    # 与 LICENSES/third-party/ 出自根仓声明面单一事实源（-LicenseSsot，缺省同级 evorule
+    # 目录，钉版内容随根仓声明面维护）；SOURCE.md 按本次构建动态生成（§13 指纹表填实值，
+    # 内嵌组件源码入口一并列明）。落 src-tauri\resources\license\，由 tauri.conf.json
+    # bundle.resources 承接入安装包（安装目录 resources\license\）。
+    if (-not (Test-Path (Join-Path $LicenseSsot "THIRD-PARTY-NOTICES.md")) -or
+        -not (Test-Path (Join-Path $LicenseSsot "LICENSES\third-party"))) {
+        throw "license SSOT incomplete: $LicenseSsot（需 THIRD-PARTY-NOTICES.md + LICENSES\third-party\，-LicenseSsot 可覆盖路径）"
+    }
+    $licDst = Join-Path $srcTauri "resources\license"
+    if (Test-Path $licDst) { Remove-Item $licDst -Recurse -Force }
+    New-Item -ItemType Directory -Path (Join-Path $licDst "LICENSES") -Force | Out-Null
+    Copy-Item (Join-Path $desktop "LICENSE") (Join-Path $licDst "LICENSE") -Force
+    Copy-Item (Join-Path $repoRoot "NOTICE.md") (Join-Path $licDst "NOTICE.md") -Force
+    Copy-Item (Join-Path $LicenseSsot "THIRD-PARTY-NOTICES.md") $licDst -Force
+    Copy-Item (Join-Path $LicenseSsot "LICENSES\third-party") (Join-Path $licDst "LICENSES\third-party") -Recurse -Force
+
+    # §13 源码 tarball（git archive 于本仓 HEAD 生成）+ 指纹，落 updater 归集目录，
+    # 随三件套一并人工上传；内嵌组件（引擎/ai-plugin/console）源码各随其仓发版，
+    # 入口在 SOURCE.md 内嵌组件表列明。
+    $version = (Get-Content (Join-Path $srcTauri "tauri.conf.json") -Raw | ConvertFrom-Json).version
+    $commitSha = (git -C $repoRoot rev-parse HEAD).Trim()
+    $srcTgz = Join-Path $desktop "target\release\bundle\updater\evo-agent-desktop-$version-source.tar.gz"
+    New-Item -ItemType Directory -Force -Path (Split-Path $srcTgz) | Out-Null
+    git -C $repoRoot archive --format=tar.gz --prefix="evo-agent-desktop-$version/" -o $srcTgz HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git archive failed ($LASTEXITCODE)" }
+    $srcSha = (Get-FileHash $srcTgz -Algorithm SHA256).Hash.ToLower()
+    $srcTarballName = Split-Path $srcTgz -Leaf
+    # here-string 终止符必须在行首（PS 语法约束），本段不缩进
+    $sourceMd = @"
+<!--
+  Copyright 2026 EvoRule Project
+
+  SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
+# evo-agent Desktop — 源码提供入口（AGPL-3.0 §13）
+
+本安装包对应 evo-agent Desktop v$version，以 AGPL-3.0-or-later 授权。本文件随包
+分发（安装目录 resources\license\），用于定位并校验与该包对应的完整源码
+（AGPL-3.0 第 13 条）。
+
+| 字段 | 值 |
+|---|---|
+| 产品版本 | $version |
+| 构建 commit（evo-agent 仓） | $commitSha |
+| 源码仓库（权威源） | <https://gitee.com/evorule/evo-agent> |
+| 源码仓库（GitHub 镜像） | <https://github.com/evorule/evo-agent> |
+| 源码 tarball | $srcTarballName（随发布 Release 附件分发） |
+| 源码 tarball SHA256 | $srcSha |
+
+## 获取与校验方式
+
+1. ``git clone`` 上表任一仓库，``git checkout $commitSha``
+2. 复现归档：``git archive --format=tar.gz --prefix=evo-agent-desktop-$version/ -o $srcTarballName HEAD``
+3. 计算 SHA256 并与上表值比对
+
+## 内嵌组件
+
+- evo-agent（本机智能体外壳）与 sdk：本仓（上表构建 commit）
+- evorule-server 引擎 / evorule-ai-plugin：<https://gitee.com/evorule/evorule-server>
+- console 用户面板（如随包分发）：<https://gitee.com/evorule/evorule-console-cloud>
+
+## 第三方组件
+
+许可正文与归属声明见本目录 THIRD-PARTY-NOTICES.md 与 LICENSES/third-party/。
+"@
+    [System.IO.File]::WriteAllText((Join-Path $licDst "SOURCE.md"), $sourceMd)
+    Write-Host "collected license five-piece (SSOT=$LicenseSsot) + SOURCE.md"
+    Write-Host "  source tarball: $srcTarballName sha256=$srcSha"
 
     # console 静态产物（可选源，存在才收；W6：在位即启用，缺位 = 安装包不带
     # console 通道，壳启动探测缺位后静默不启用）。源 = console 仓

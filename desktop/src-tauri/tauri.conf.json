@@ -30,7 +30,8 @@
       "resources/bin/*",
       "resources/evo-agent/**/*",
       "resources/evorule-server/**/*",
-      "resources/console/**/*"
+      "resources/console/**/*",
+      "resources/license/**/*"
     ],
     "windows": {
       "webviewInstallMode": {

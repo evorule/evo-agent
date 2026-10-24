@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 EvoRule Project
+#
+# evo-agent Desktop 安装包构建 workflow — CI 构建 + 人工上传
+#   (2026-10-24 批审裁定: RELEASE.md 原「构建/签名/上传全链人工」修订为
+#    「CI 构建+签名, 上传 Release 与发布确认保持人工」——人在环保留在上传环节)
+#
+# 触发: 推送 evo-agent-desktop-v* tag 或 workflow_dispatch
+# 产物: artifact `evo-agent-desktop-release` = updater 三件套
+#   (setup.exe / .sig / latest.json) + 源码 tarball (AGPL §13)。
+#   人工下载后按 RELEASE.md 上传到 github.com/evorule/evo-agent-desktop 的
+#   release (tag 形态同名) —— 本 workflow 不上传 Release。
+#
+# 构建内容: 三方 release 构建 (evo-agent / evorule-server / ai-plugin) +
+#   web 前端 + console 静态产物 + 许可证五件套入包 (build-installer.ps1 collect)。
+#   检出目录布局镜像本地同级仓 (build-installer 缺省按同级目录定位各仓)。
+#
+# 前置 secrets: TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#   (minisign 私钥; 缺失时 tauri 不产 .sig, build-installer 报错终止——
+#   fail-closed, 不发无签名版)
+name: Desktop Release Build
+
+on:
+  push:
+    tags: ["evo-agent-desktop-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build installer (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: evo-agent
+
+      - uses: actions/checkout@v4
+        with:
+          repository: evorule/evorule-server
+          path: evorule-server
+
+      - uses: actions/checkout@v4
+        with:
+          repository: evorule/evorule-console-cloud
+          path: evorule-console-cloud
+
+      # 根仓声明面 SSOT (THIRD-PARTY-NOTICES.md + LICENSES/third-party/), 钉 SHA
+      - uses: actions/checkout@v4
+        with:
+          repository: evorule/evorule
+          ref: 5560fe93c2443c1d985d21b534535b241333cffd
+          path: evorule
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: evorule-server -> target
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: evorule-server/plugins/ai-plugin -> target
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: evo-agent -> target
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 核对 tag 版本 = tauri.conf.json 版本
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        working-directory: evo-agent/desktop
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^evo-agent-desktop-v',''
+          $ver = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          Write-Host "tag=evo-agent-desktop-v$tag  tauri.conf.json=$ver"
+          if ($tag -ne $ver) { throw "tag 版本($tag) != tauri.conf.json 版本($ver); 发版前先统一四处版本号 (RELEASE.md)" }
+
+      - name: 构建 evorule-server 引擎
+        run: cargo build --release --bin evorule-server
+        working-directory: evorule-server
+
+      - name: 构建 evorule-ai-plugin
+        run: cargo build --release
+        working-directory: evorule-server/plugins/ai-plugin
+
+      - name: 构建 evo-agent
+        run: cargo build --release
+        working-directory: evo-agent
+
+      - name: 构建 web 前端
+        working-directory: evo-agent/web
+        run: |
+          npm ci
+          npm run build
+
+      - name: 构建 console 静态产物
+        working-directory: evorule-console-cloud
+        run: |
+          npm ci
+          $env:CONSOLE_BASE = '/console/'
+          npm run build
+
+      - name: 安装 desktop 工具链依赖 (tauri cli)
+        working-directory: evo-agent/desktop
+        run: npm ci
+
+      - name: 安装包构建 (freshness 门 + collect + 五件套 + SSOT 校验 + tauri build + 三件套)
+        working-directory: evo-agent/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: pwsh
+        run: >
+          powershell -NoProfile -ExecutionPolicy Bypass -File build-installer.ps1
+          -ServerRepo "${{ github.workspace }}\evorule-server"
+          -ConsoleRepo "${{ github.workspace }}\evorule-console-cloud"
+          -LicenseSsot "${{ github.workspace }}\evorule"
+
+      - name: 上传发布产物 (人工下载后按 RELEASE.md 上传 Release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: evo-agent-desktop-release
+          path: evo-agent/desktop/target/release/bundle/updater/*
+          if-no-files-found: error

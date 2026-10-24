@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 EvoRule Project
+#
+# npm 发布 workflow — sdk/nodejs (evo-agent-node)
+#
+# 触发: 推送 evo-agent-node-v* tag (tag 须已同步到 github 侧; gitee 为主仓,
+#   github 承担发布执行, 与 evorule / evorule-server 仓 release 链同构)
+# 产物: npm registry 上的 evo-agent-node 包 (cargo publish 同款纪律: 发版必须
+#   同步 npm)。包为零依赖纯 JS client, npm 自动随附仓内 LICENSE (AGPL-3.0-or-later)。
+#
+# 前置: repo Settings → Secrets and variables → Actions 配置 NPM_TOKEN
+#   (npm publish token; automation 型 token 即可)
+# 门禁: tag 版本 == package.json 版本 (fail-closed); tarball 必含 LICENSE
+name: sdk-nodejs npm Release
+
+on:
+  push:
+    tags: ["evo-agent-node-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: sdk/nodejs
+
+jobs:
+  publish:
+    name: publish evo-agent-node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: 核对 tag 版本 = package.json 版本
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME#evo-agent-node-v}"
+          PKG_VER=$(node -p "require('./package.json').version")
+          echo "tag=evo-agent-node-v${TAG}  package.json=${PKG_VER}"
+          if [ -z "${PKG_VER}" ] || [ "${TAG}" != "${PKG_VER}" ]; then
+            echo "ERROR: tag 版本(${TAG}) != package.json 版本(${PKG_VER}); 先 bump 四处版本再打 tag"
+            exit 1
+          fi
+
+      - name: tarball 预检 (LICENSE 随附 + 清单预览)
+        run: |
+          set -e
+          npm pack --dry-run 2>&1 | tee pack-preview.txt
+          grep -q " LICENSE" pack-preview.txt || { echo "ERROR: tarball 缺 LICENSE (AGPL §4 随附义务)"; exit 1; }
+          rm pack-preview.txt
+
+      - name: npm 发布 (fail-closed)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -e
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "ERROR: NPM_TOKEN secret 未配置 - npm 发布阻断(fail-closed, 禁止静默假绿);"
+            echo "修复: repo Settings → Secrets and variables → Actions 配置 NPM_TOKEN 后 rerun 本 job"
+            exit 1
+          fi
+          npm publish
