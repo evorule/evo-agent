@@ -310,6 +310,9 @@ pub async fn list_dir(
     }
     let v = if headers.contains_key(WORKSPACE_HEADER) {
         ensure_manifest(&state, "file_list")?;
+        // 人工树面特例:点文件(.gitignore 等)对程序员是常用可见项,显式放开;
+        // agent toolkit 面(else 分支)缺省口径零变化——仍跳过隐藏文件。
+        args.insert("include_hidden".to_string(), Value::Bool(true));
         FileListTool::new(root)
             .call(&Value::Object(args))
             .await
