@@ -31,6 +31,7 @@
     workspaceEpoch,
   } from '../lib/stores.js';
   import { problems } from '../lib/diagnostics.js';
+  import { fileIconSvg, dirIconSvg } from '../lib/fileIcons.js';
   import { settingsState } from '../lib/settings.js';
   import ContextMenu from './ContextMenu.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
@@ -68,22 +69,9 @@
     return 'modified';
   }
 
-  // ---- 文件类型图标(Seti 风:每类专属形状——字母徽标/符号/小图形;色沿用 fi-* 语义色) ----
-  // 语义色沿用行业惯例(语言官网/Seti 配色),与 git-letter 语义色同性质。
-  const FILE_ICON_EXT = {
-    svelte: 'svelte', rs: 'rust', ts: 'ts', tsx: 'ts', js: 'js', jsx: 'js',
-    mjs: 'js', cjs: 'js', json: 'json', md: 'md', markdown: 'md',
-    css: 'css', scss: 'css', html: 'html', htm: 'html', toml: 'toml',
-    yml: 'toml', yaml: 'toml', py: 'py', sh: 'sh', ps1: 'sh', bat: 'sh',
-    cmd: 'sh', sql: 'sql', go: 'go', lock: 'lock', svg: 'svg',
-    png: 'img', jpg: 'img', jpeg: 'img', gif: 'img', ico: 'img',
-    woff: 'font', woff2: 'font', ttf: 'font', otf: 'font', txt: 'plain',
-  };
-
-  function fileIconKey(name) {
-    const m = /\.([a-z0-9]+)$/i.exec(name || '');
-    return FILE_ICON_EXT[m ? m[1].toLowerCase() : ''] || 'plain';
-  }
+  // ---- 文件类型图标(vscode-icons 内嵌子集,官方配色;映射与 SVG 见 lib/fileIcons.js) ----
+  // 选型记录:自绘字母补丁方案(16px SVG 塞 8.5px 文字)在实测中糊成噪点、且无类型色,
+  // 2026-10-24 换为内嵌 vscode-icons 真彩图标(离线可用,MIT 出处已登记)。
 
   let rootName = 'evo-agent(工作区)';
   let rootChildren = [];
@@ -865,39 +853,7 @@
 
 <div class="explorer" data-zone="explorer" style:--tree-fs="{treeFontSize}px">
   {#snippet fileIcon(name)}
-    {@const ik = fileIconKey(name)}
-    <svg class="icon fi-{ik}" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-      {#if ik === 'ts' || ik === 'js' || ik === 'py' || ik === 'go' || ik === 'sql'}
-        <text x="12" y="16" text-anchor="middle" font-size="8.5" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{ik.toUpperCase()}</text>
-      {:else if ik === 'json'}
-        <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'{}'}</text>
-      {:else if ik === 'md'}
-        <text x="12" y="16" text-anchor="middle" font-size="9" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">M↓</text>
-      {:else if ik === 'css'}
-        <text x="12" y="16" text-anchor="middle" font-size="11" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">#</text>
-      {:else if ik === 'html'}
-        <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'<>'}</text>
-      {:else if ik === 'sh'}
-        <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">{'>_'}</text>
-      {:else if ik === 'svelte'}
-        <text x="12" y="16" text-anchor="middle" font-size="11" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">S</text>
-      {:else if ik === 'font'}
-        <text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" font-family="'JetBrains Mono', Consolas, monospace" fill="currentColor" stroke="none">A</text>
-      {:else if ik === 'rust' || ik === 'toml'}
-        <!-- 齿轮(配置/构建语义,Seti rust 同形):中环+八向齿 -->
-        <circle cx="12" cy="12" r="3.4" />
-        <path d="M12 5.4v2M12 16.6v2M5.4 12h2M16.6 12h2M7.3 7.3l1.4 1.4M15.3 15.3l1.4 1.4M16.7 7.3l-1.4 1.4M8.7 15.3l-1.4 1.4" />
-      {:else if ik === 'lock'}
-        <rect x="7" y="11" width="10" height="8" rx="1.2" />
-        <path d="M9 11V8a3 3 0 0 1 6 0v3" />
-      {:else if ik === 'img' || ik === 'svg'}
-        <rect x="4.5" y="5.5" width="15" height="13" rx="1.5" />
-        <circle cx="9.5" cy="10" r="1.5" />
-        <path d="m6 16.5 3.5-3.5 2.5 2.5 2-2 4 3.5" />
-      {:else}
-        <path d="M7 3h7l4 4v14H7z" />
-      {/if}
-    </svg>
+    <span class="icon">{@html fileIconSvg(name)}</span>
   {/snippet}
   <div class="panel-title">
     资源管理器
@@ -1061,14 +1017,7 @@
             >
               <path d="M9 6l6 6-6 6" />
             </svg>
-            <svg class="icon dir" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8">
-              {#if dirState.get(node.path)?.expanded}
-                <!-- 开态:盖板掀起(lucide folder-open) -->
-                <path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" />
-              {:else}
-                <path d="M4 5a1 1 0 0 1 1-1h5l2 2h7a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5Z" />
-              {/if}
-            </svg>
+            <span class="icon dir">{@html dirIconSvg(!!dirState.get(node.path)?.expanded)}</span>
           {:else}
             {@render fileIcon(node.name)}
           {/if}
@@ -1221,9 +1170,10 @@
     font-size: var(--fs-2xs);
     font-weight: var(--fw-sb);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: normal; /* 中文标题去字距(原 0.5px 松散) */
     color: var(--text-muted);
     padding: var(--sp-sm) var(--sp-md);
+    border-bottom: 1px solid var(--border-muted); /* 标题区/树区分层 */
     display: flex;
     align-items: center;
     gap: var(--sp-sm);
@@ -1417,9 +1367,9 @@
   .node {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: 6px;
     padding-right: var(--sp-md);
-    height: 24px;
+    height: 22px; /* Trae/VS Code 同密度(原 24px 偏疏) */
     font-size: var(--tree-fs, var(--fs-base));
     color: var(--sidebar-text);
     cursor: pointer;
@@ -1503,31 +1453,19 @@
     transform: rotate(90deg);
   }
   .icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
     flex-shrink: 0;
-    color: var(--text-muted);
+    margin-right: 3px; /* 图标-文字呼吸感(与 gap 合计 9px),间距只加在图标→名字一侧 */
   }
-  .icon.dir {
-    color: var(--brand);
-    opacity: 0.85;
+  .icon :global(svg) {
+    width: 16px;
+    height: 16px;
+    display: block;
   }
-  /* 文件类型着色(Seti/语言官网惯例色,提亮到暗底可辨) */
-  .icon.fi-svelte { color: #e0643c; }
-  .icon.fi-rust { color: #d98a4b; }
-  .icon.fi-ts { color: #4d9bd7; }
-  .icon.fi-js { color: #d9c35c; }
-  .icon.fi-json { color: #cbb94d; }
-  .icon.fi-md { color: #6aa3c4; }
-  .icon.fi-css { color: #5c9fd6; }
-  .icon.fi-html { color: #d38a52; }
-  .icon.fi-toml { color: #a67fc9; }
-  .icon.fi-py { color: #4d8fc9; }
-  .icon.fi-sh { color: #89c46f; }
-  .icon.fi-sql { color: #c98a5c; }
-  .icon.fi-go { color: #5cc8d8; }
-  .icon.fi-lock { color: #8a8f98; }
-  .icon.fi-svg { color: #ffb13b; }
-  .icon.fi-img { color: #7fb3d9; }
-  .icon.fi-font { color: #b08ac9; }
   .name {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1583,7 +1521,7 @@
     border: none;
     color: var(--sidebar-text);
     font-size: var(--fs-2xs);
-    letter-spacing: 0.04em;
+    letter-spacing: normal; /* 中文标题去字距 */
     cursor: pointer;
     user-select: none;
   }
