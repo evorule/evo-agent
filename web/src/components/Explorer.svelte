@@ -193,8 +193,31 @@
 
   function rebuild() {
     const out = [];
+    // 目录优先排序(VS Code/Trae 同款):每层先目录后文件,各自自然序。
+    // 比较器小写化+数字分段+按码点(不用 localeCompare:zh 环境会把中文目录
+    // 排到 ASCII 名之前,'_'与'-'先后也不稳定);file2 排在 file10 前。
+    const natChunks = (s) => s.toLowerCase().split(/(\d+)/);
+    const cmpName = (a, b) => {
+      const A = natChunks(a.name);
+      const B = natChunks(b.name);
+      for (let i = 0; i < Math.min(A.length, B.length); i++) {
+        if (A[i] === B[i]) continue;
+        if (/^\d/.test(A[i]) && /^\d/.test(B[i])) {
+          const d = Number(A[i]) - Number(B[i]);
+          if (d) return d;
+          continue; // 数值等值("007" vs "7")续比下段
+        }
+        return A[i] < B[i] ? -1 : 1;
+      }
+      return A.length - B.length;
+    };
+    const ordered = (children) =>
+      [...children].sort((a, b) => {
+        if (a.kind !== b.kind) return a.kind === 'dir' ? -1 : 1;
+        return cmpName(a, b);
+      });
     const walk = (children, depth) => {
-      for (const n of children) {
+      for (const n of ordered(children)) {
         out.push({ node: n, depth });
         if (n.kind === 'dir' && dirState.get(n.path)?.expanded) {
           walk(dirState.get(n.path)?.children || [], depth + 1);
