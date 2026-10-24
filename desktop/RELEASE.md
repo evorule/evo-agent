@@ -1,7 +1,9 @@
-# evo-agent-desktop 发版手册（人工流程）
+# evo-agent-desktop 发版手册（CI 构建 + 人工上传）
 
-> 推送人工化纪律（统帅令）同样适用于发版：构建、签名、上传全链人工执行，
-> 不设自动 release workflow。本手册=发版唯一操作正本，改动须经批审。
+> 发版纪律（2026-10-24 批审修订，原「构建/签名/上传全链人工」条款废止）：
+> 构建+签名由 CI workflow（`desktop-release.yml`，触发 `evo-agent-desktop-v*` tag）
+> 执行，**上传 Release 与发布确认保持人工执行**——人在环保留在上传环节。
+> CI 不可用时按「本地构建路径」人工执行。本手册=发版唯一操作正本，改动须经批审。
 
 ## 版本与产物形态
 
@@ -13,15 +15,17 @@
   版本史可溯、无 clobber 竞态）。0.3.0 首发误用了滚动 `latest` tag——该 release
   留作历史不重挂；新 release 发布后 GitHub `releases/latest` 自动指向它，旧版
   壳的更新器端点随之翻页到新 latest.json，无需迁移动作。release 标题=`evo-agent <版本>`。
-- 产物三件套：`evo-agent-desktop_<ver>_x64-setup.exe` + `.sig` + `latest.json`
-  （由 build-installer.ps1 归集到 `desktop/target/release/bundle/updater/`）。
+- 发布产物四件：`evo-agent-desktop_<ver>_x64-setup.exe` + `.sig` + `latest.json`
+  + `evo-agent-desktop-<ver>-source.tar.gz`（AGPL §13 源码归档；许可证五件套
+  已内嵌安装包 `resources\license\`）。均由 build-installer.ps1 归集到
+  `desktop/target/release/bundle/updater/`。
 
 ## 前置条件
 
 1. 签名私钥：`TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-   env（minisign 私钥；位置见发布留痕，不入仓不落公开面）。无 env 时
-   build 产出 setup.exe 但 `.sig` 缺失，脚本报错终止——更新器签名是
-   fail-closed 红线，不允许无签名发版。
+   env（minisign 私钥；位置见发布留痕，不入仓不落公开面）。CI 通道取自
+   evo-agent 仓 Actions secrets（同名）；无 env 时 build 产出 setup.exe 但
+   `.sig` 缺失，脚本报错终止——更新器签名是 fail-closed 红线，不允许无签名发版。
 2. 引擎与执行体 release 构建在位：
    - `<server-repo>\target\release\evorule-server.exe`（engine 仓，工作目录同级）
    - `<server-repo>\plugins\ai-plugin\target\release\evorule-ai-plugin.exe`
@@ -35,12 +39,24 @@
 
 ## 构建与发布步骤
 
+### 缺省通道：CI 构建（desktop-release.yml）
+
+1. 推送 tag `evo-agent-desktop-v<版本>` 到 github 侧（或 Actions 页
+   workflow_dispatch 手动触发）。workflow 自动核对 tag 版本 = tauri.conf.json
+   版本，随后执行三方 release 构建 + 前端/console 构建 + 安装包构建 + 签名
+   （私钥取自 repo secrets；新鲜度门与 SSOT 校验在 CI 内同样生效）。
+2. 下载 run 的 artifact `evo-agent-desktop-release`（发布产物四件，见上节）。
+3. 人工上传：按下述第 4 步执行（上传命令 glob 已覆盖四件）。
+
+### 本地构建路径（CI 不可用时的备选）
+
 ```powershell
 # 1. 三方 release 构建（engine 仓 + ai-plugin + 本仓）
 # 2. 前端构建
 npm --prefix web run build
 
-# 3. 安装包构建（收集内嵌资源 → SSOT 校验 → tauri build → 更新三件套）
+# 3. 安装包构建（freshness 门 → 收集内嵌资源 → SSOT 校验 → 许可证五件套 →
+#    tauri build → 更新三件套 + 源码 tarball）
 powershell -File desktop\build-installer.ps1 [-ReleaseNotes "..."]
 #    本地源调试可加 -UpdateUrlBase http://127.0.0.1:18777
 
