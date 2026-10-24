@@ -2364,6 +2364,9 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
         Ok(AgentEvent::LlmDelta { text }) => Event::default()
             .event("llm_delta")
             .data(serde_json::json!({ "text": text }).to_string()),
+        Ok(AgentEvent::LlmThinkingDelta { text }) => Event::default()
+            .event("llm_thinking_delta")
+            .data(serde_json::json!({ "text": text }).to_string()),
         Ok(AgentEvent::ToolCall { name, args }) => Event::default()
             .event("tool_call")
             .data(serde_json::json!({ "name": name, "args": args }).to_string()),
@@ -4322,6 +4325,20 @@ mod tests {
         let s = format!("{:?}", ev);
         assert!(s.contains("llm_delta"));
         assert!(s.contains("hello"));
+    }
+
+    #[test]
+    fn test_agent_event_to_sse_llm_thinking_delta() {
+        // 注:Event 的 Debug 输出 buffer 为 Bytes 字节串形式,非 ASCII 以 \xNN
+        // 转义——断言文本须用 ASCII(中文值透传正确性由 serde_json 序列化保证,
+        // ws 侧同型测试已用中文覆盖)
+        let ev = agent_event_to_sse(Ok(AgentEvent::LlmThinkingDelta {
+            text: "thinking...".to_string(),
+        }))
+        .unwrap();
+        let s = format!("{:?}", ev);
+        assert!(s.contains("llm_thinking_delta"));
+        assert!(s.contains("thinking..."));
     }
 
     #[test]

@@ -18,6 +18,9 @@
     openSettingsTab,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
+  // Svelte 5 不深度代理原生 Set(add/delete 不触发重渲染,点击开合会失明),
+  // 交互态集合必须用 SvelteSet
+  import { SvelteSet } from 'svelte/reactivity';
   import { renderChatHtml, copyChatCode } from '../lib/chat-markdown.js';
   import { lineDiff, toolDiffPayload } from '../lib/chat-diff.js';
   import { approveProposal, answerQuestion, listResumableRuns, getOrchestrationLinks, uploadFile, getLlmModels, setLlmModel, listSkills } from '../lib/api.js';
@@ -570,6 +573,45 @@
     fullResults.add(id);
   }
 
+  // ---- 思考面板交互态(同工具卡:易失 UI 态不入消息 store、不随会话持久化) ----
+  // 流式中被手动收起的消息 id;结束后被手动展开的消息 id(两态分治:流式默认
+  // 展开、结束后默认折叠,用户手动操作覆写默认,跨流式/收态语义不互染)
+  const collapsedThinking = new SvelteSet();
+  const expandedThinking = new SvelteSet();
+  // 流式思考体元素引用(同刻至多一条流式;$effect 吸底消费)
+  let streamThinkingEl = null;
+
+  function thinkingOpen(m) {
+    if (m.thinkingStreaming) return !collapsedThinking.has(m.id);
+    return expandedThinking.has(m.id);
+  }
+
+  function toggleThinking(m) {
+    if (m.thinkingStreaming) {
+      if (collapsedThinking.has(m.id)) collapsedThinking.delete(m.id);
+      else collapsedThinking.add(m.id);
+    } else {
+      if (expandedThinking.has(m.id)) expandedThinking.delete(m.id);
+      else expandedThinking.add(m.id);
+    }
+  }
+
+  /** 思考耗时文案:非流式取 thinkingEndedAt 固化值;无起始时间返回空 */
+  function thinkingDuration(m) {
+    if (!m.thinkingStartedAt) return '';
+    const end = m.thinkingEndedAt || Date.now();
+    return formatTook(end - m.thinkingStartedAt);
+  }
+
+  // 流式思考吸底:messages 任何更新(思考/正文增量)即把流式中的思考体
+  // 滚到底部(仿终端跟随语义);非流式展开体 data-streaming='0' 不滚动
+  $effect(() => {
+    void $messages;
+    if (streamThinkingEl && streamThinkingEl.dataset.streaming === '1') {
+      streamThinkingEl.scrollTop = streamThinkingEl.scrollHeight;
+    }
+  });
+
   /** 耗时文案:<1s 毫秒,否则一位小数秒 */
   function formatTook(ms) {
     return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
@@ -1022,19 +1064,46 @@
         </div>
       {:else if m.kind === 'assistant'}
         <div class="row">
-          <div class="bubble assistant-bubble md-body" onclick={onMdCopyClick}>
-            {@html renderChatHtml(m.text, m.id)}<span class="cursor" class:on={m.streaming}></span>
-            {#if m.text}
-              <button
-                type="button"
-                class="msg-copy"
-                title="复制全文"
-                onclick={(e) => {
-                  e.stopPropagation();
-                  copyPlainText(m.text, e.currentTarget);
-                }}
-              >复制</button>
+          <div class="assistant-col">
+            {#if m.thinking}
+              <div class="thinking-card" class:streaming={m.thinkingStreaming} class:expanded={thinkingOpen(m)}>
+                <div
+                  class="thinking-head"
+                  role="button"
+                  tabindex="0"
+                  onclick={() => toggleThinking(m)}
+                  onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && toggleThinking(m)}
+                >
+                  <span class="tool-chev">▸</span>
+                  <span class="thinking-label">
+                    {m.thinkingStreaming
+                      ? '深度思考中…'
+                      : `已深度思考(用时 ${thinkingDuration(m)})`}
+                  </span>
+                </div>
+                {#if thinkingOpen(m)}
+                  <div
+                    class="thinking-body mono"
+                    data-streaming={m.thinkingStreaming ? '1' : '0'}
+                    bind:this={streamThinkingEl}
+                  >{m.thinking}</div>
+                {/if}
+              </div>
             {/if}
+            <div class="bubble assistant-bubble md-body" onclick={onMdCopyClick}>
+              {@html renderChatHtml(m.text, m.id)}<span class="cursor" class:on={m.streaming}></span>
+              {#if m.text}
+                <button
+                  type="button"
+                  class="msg-copy"
+                  title="复制全文"
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    copyPlainText(m.text, e.currentTarget);
+                  }}
+                >复制</button>
+              {/if}
+            </div>
           </div>
           <span class="audit-chip">
             <AuditBadge
@@ -1754,6 +1823,53 @@
   .assistant-bubble {
     background: var(--bg-hover);
     color: var(--text-primary);
+  }
+  /* 思考面板:assistant 气泡上方的深度思考折叠卡——流式自动展开淡色 mono
+     限高吸底,结束后折叠条固化耗时;交互态与工具卡同构 */
+  .assistant-col {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-width: 88%;
+    min-width: 0;
+  }
+  .thinking-card {
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    background: var(--bg-card);
+    font-size: var(--fs-xs);
+    overflow: hidden;
+  }
+  .thinking-card.streaming {
+    border-color: var(--brand);
+  }
+  .thinking-head {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-xs);
+    padding: var(--sp-xs) var(--sp-sm);
+    cursor: pointer;
+    user-select: none;
+  }
+  .thinking-head:hover {
+    background: var(--bg-hover);
+  }
+  .thinking-card.expanded .tool-chev {
+    transform: rotate(90deg);
+  }
+  .thinking-label {
+    color: var(--text-muted);
+  }
+  .thinking-body {
+    margin: 0 var(--sp-sm) var(--sp-xs);
+    padding: var(--sp-xs) var(--sp-sm);
+    background: var(--bg-page);
+    border-radius: var(--r-sm);
+    color: var(--text-secondary);
+    max-height: 180px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
   /* markdown 正文(注入 DOM 不带 Svelte 作用域属性,后代一律 :global);
      配色全部走排版 v4.0 令牌,hljs 主题色在 app.css 按主题切换 */

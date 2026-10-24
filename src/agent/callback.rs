@@ -193,6 +193,10 @@ impl EventCallback for LoggingCallback {
             AgentEvent::LlmDelta { text } => {
                 tracing::trace!(len = text.len(), "callback: llm delta");
             }
+            AgentEvent::LlmThinkingDelta { text } => {
+                // 事件名 thinking_delta;trace 级不进审计正文(非终稿内容)
+                tracing::trace!(len = text.len(), "callback: thinking_delta");
+            }
             AgentEvent::LlmDone {
                 content,
                 finish_reason,
@@ -354,6 +358,7 @@ mod tests {
                 AgentEvent::SessionCreated { .. } => "session".to_string(),
                 AgentEvent::Step { step } => format!("step:{}", step),
                 AgentEvent::LlmDelta { .. } => "delta".to_string(),
+                AgentEvent::LlmThinkingDelta { .. } => "thinking_delta".to_string(),
                 AgentEvent::LlmDone { .. } => "llm_done".to_string(),
                 AgentEvent::ToolCall { name, .. } => format!("tool_call:{}", name),
                 AgentEvent::ToolResult { name, .. } => format!("tool_result:{}", name),
@@ -512,6 +517,9 @@ mod tests {
             AgentEvent::Step { step: 1 },
             AgentEvent::LlmDelta {
                 text: "hello".to_string(),
+            },
+            AgentEvent::LlmThinkingDelta {
+                text: "pondering".to_string(),
             },
             AgentEvent::LlmDone {
                 content: "done".to_string(),

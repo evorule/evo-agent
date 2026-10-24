@@ -435,12 +435,23 @@ function handleFrame(f) {
     case 'Step':
       stepCount.set(f.step);
       break;
+    case 'LlmThinkingDelta':
+      // 真流式思考增量(reasoning):累积到当前流式气泡的 thinking 字段。
+      // 思考不入正文、不持久化转录(与 CLI stderr 暗色输出同面)。
+      if (streamMsgId !== null) {
+        appendThinking(f.text);
+      }
+      break;
     case 'LlmDelta':
+      // 首个非思考帧到达即收思考流(面板折叠条固化耗时);思考可再续帧,
+      // closeThinking 幂等(thinkingEndedAt 已置不再改)
+      closeThinking();
       if (streamMsgId !== null) {
         appendToStream(f.text);
       }
       break;
     case 'ToolCall': {
+      closeThinking();
       toolStartedAt = Date.now();
       lastToolMsgId = pushMessage({
         kind: 'tool',
@@ -492,7 +503,8 @@ function handleFrame(f) {
       break;
     }
     case 'LlmDone':
-      // 流式文本即最终内容;LlmDone 仅标记收尾
+      // 流式文本即最终内容;LlmDone 仅标记收尾(思考流一并收口)
+      closeThinking();
       break;
     case 'Done': {
       finishStream();
@@ -618,11 +630,42 @@ function appendToStream(text) {
   );
 }
 
+/** 思考增量累积(首帧起记 thinkingStartedAt,流式中 thinkingStreaming=true) */
+function appendThinking(text) {
+  messages.update((arr) =>
+    arr.map((m) =>
+      m.id === streamMsgId
+        ? {
+            ...m,
+            thinking: (m.thinking || '') + text,
+            thinkingStreaming: true,
+            thinkingStartedAt: m.thinkingStartedAt || Date.now(),
+          }
+        : m,
+    ),
+  );
+}
+
+/** 收思考流(首个非思考帧/LlmDone/finishStream 消费;幂等,已收不重记) */
+function closeThinking() {
+  if (streamMsgId === null) return;
+  messages.update((arr) =>
+    arr.map((m) =>
+      m.id === streamMsgId && m.thinkingStreaming
+        ? { ...m, thinkingStreaming: false, thinkingEndedAt: Date.now() }
+        : m,
+    ),
+  );
+}
+
 function finishStream() {
+  closeThinking();
   if (streamMsgId !== null) {
     updateMessage(streamMsgId, { streaming: false });
-    // 空流式气泡(如纯工具轮)移除占位
-    messages.update((arr) => arr.filter((m) => !(m.id === streamMsgId && !m.text)));
+    // 空流式气泡(如纯工具轮)移除占位;仅含思考的气泡保留(思考也是产出)
+    messages.update((arr) =>
+      arr.filter((m) => !(m.id === streamMsgId && !m.text && !m.thinking)),
+    );
     streamMsgId = null;
   }
 }

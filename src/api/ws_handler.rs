@@ -1044,6 +1044,10 @@ fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json::Val
             "type": "LlmDelta",
             "text": text,
         }),
+        Ok(AgentEvent::LlmThinkingDelta { text }) => serde_json::json!({
+            "type": "LlmThinkingDelta",
+            "text": text,
+        }),
         Ok(AgentEvent::ToolCall { name, args }) => serde_json::json!({
             "type": "ToolCall",
             "name": name,
@@ -1320,6 +1324,15 @@ mod tests {
         }));
         assert_eq!(v["type"], "LlmDelta");
         assert_eq!(v["text"], "hello");
+    }
+
+    #[test]
+    fn test_event_to_json_llm_thinking_delta() {
+        let v = agent_event_to_json(Ok(AgentEvent::LlmThinkingDelta {
+            text: "思考中".to_string(),
+        }));
+        assert_eq!(v["type"], "LlmThinkingDelta");
+        assert_eq!(v["text"], "思考中");
     }
 
     #[test]

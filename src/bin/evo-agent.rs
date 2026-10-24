@@ -1580,6 +1580,11 @@ fn cmd_run_streaming(
                     print!("{}", text);
                     let _ = std::io::stdout().flush();
                 }
+                Ok(AgentEvent::LlmThinkingDelta { text }) => {
+                    // 思考增量 → stderr 淡色直出(与正文 stdout 分流,终端可见)
+                    eprint!("\x1b[2m{}\x1b[0m", text);
+                    let _ = std::io::stderr().flush();
+                }
                 Ok(AgentEvent::LlmDone {
                     content: _,
                     finish_reason,
@@ -3336,6 +3341,11 @@ fn run_repl_turn(
                 Ok(AgentEvent::LlmDelta { text }) => {
                     print!("{}", text);
                     let _ = std::io::stdout().flush();
+                }
+                Ok(AgentEvent::LlmThinkingDelta { text }) => {
+                    // 思考增量 → stderr 淡色直出(与正文 stdout 分流,终端可见)
+                    eprint!("\x1b[2m{}\x1b[0m", text);
+                    let _ = std::io::stderr().flush();
                 }
                 Ok(AgentEvent::LlmDone {
                     content: _,

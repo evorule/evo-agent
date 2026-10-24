@@ -12,7 +12,15 @@
 //! 由执行体原样透传)。API key 由执行体(server 侧)持有,agent 侧
 //! 不携带任何凭据。响应为执行体归一后的四键形状
 //! `{content, tool_calls:[{tool_name,args}], finish_reason, token_usage}`
-//! (与 agent `LlmResponse` 同构;流式请求由执行体做 SSE 聚合后整包返回)。
+//! (与 agent `LlmResponse` 同构;推理模型增补第五键 `reasoning`,
+//! 仅非空携带)。
+//!
+//! ## 流式双路径
+//!
+//! `execute_stream` 真流式优先:执行体流式端点 `/llm/execute-stream`
+//! (由 executor_url 派生)就绪时增量解析归一化帧(思考/正文/tool_call
+//! 分片逐帧下行);端点不存在(旧执行体,404/405)自动回落整包路径并
+//! 置进程级负缓存;env `EVORULE_LLM_STREAM_DISABLE=1` 显式停用。
 //!
 //! ## G3:重试机制
 //!
@@ -27,10 +35,11 @@ use std::time::Duration;
 
 use async_stream::stream;
 use futures_core::Stream;
+use futures_util::StreamExt;
 use rand::Rng;
 use serde_json;
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent::translator::{LlmResponse, TokenUsage};
 use crate::io_handler::{IoHandler, IoResult};
@@ -61,14 +70,68 @@ pub fn effective_generation_params(
     (t, m, true)
 }
 
+/// 进程级负缓存(按流式端点 URL 记账):曾探得端点不存在(404/405)的
+/// 端点,后续调用直走 legacy 整包路径,不再重复探测(旧执行体组合下
+/// 省去每轮一次 404 往返)。按 URL 而非全局单旗标——多执行体部署下
+/// 各端点独立记账,互不误伤。
+static STREAM_ENDPOINTS_MISSING: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+fn mark_stream_endpoint_missing(stream_url: &str) {
+    if let Ok(mut slot) = STREAM_ENDPOINTS_MISSING.lock() {
+        slot.get_or_insert_with(Default::default)
+            .insert(stream_url.to_string());
+    }
+}
+
+/// 清负缓存条目(测试专用):mockito 随机端口在并行测试下可能复用刚释放
+/// 的端口号,404 记账测试收尾须清理,防同端口后继测试被负缓存毒化走
+/// legacy(撞 mockito 无匹配路由的 501)。生产执行体地址稳定,无需清理面。
+#[cfg(test)]
+pub(crate) fn clear_stream_endpoint_missing_for_test(stream_url: &str) {
+    if let Ok(mut slot) = STREAM_ENDPOINTS_MISSING.lock() {
+        if let Some(set) = slot.as_mut() {
+            set.remove(stream_url);
+        }
+    }
+}
+
+fn stream_endpoint_missing(stream_url: &str) -> bool {
+    match STREAM_ENDPOINTS_MISSING.lock() {
+        Ok(slot) => slot
+            .as_ref()
+            .is_some_and(|set| set.contains(stream_url)),
+        Err(_) => false, // 锁中毒不放大故障,仅退化为重复探测
+    }
+}
+
+/// env 显式停用检测:`EVORULE_LLM_STREAM_DISABLE=1` → true
+/// (参数注入式,便于测试;调用点传 `std::env::var(..).ok()`)
+fn stream_disabled_by_env(env_value: Option<String>) -> bool {
+    env_value.as_deref() == Some("1")
+}
+
+/// 执行体端点 → 流式端点 URL:剥 `/llm/execute` 后缀拼 `/llm/execute-stream`
+/// (同一插件进程的孪生端点,同令牌同执法面)。不以该后缀收尾(自托管改路径)
+/// 返回 None——无流式端点可试,直走 legacy 整包路径。
+fn stream_endpoint_of(executor_url: &str) -> Option<String> {
+    executor_url
+        .strip_suffix("/llm/execute")
+        .map(|base| format!("{base}/llm/execute-stream"))
+}
+
 /// G1:LLM 流式输出的单个分片
 ///
-/// `execute_stream` 依次产出:
+/// `execute_stream` 依次产出(真流式路径):
 /// ```text
-/// Delta(text) * N  →  (ToolCallDelta * N)?  →  Done(LlmResponse)
+/// ThinkingDelta * N  →  Delta(text) * N  →  (ToolCallDelta * N)?  →  Done(LlmResponse)
 /// ```
+/// legacy 整包回落路径为合成序列:ThinkingDelta(整块,思考非空时) →
+/// Delta(content) → Done(LlmResponse)。
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
+    /// 思考增量(推理模型 reasoning_content,非累积;仅展示链路,不持久化)
+    ThinkingDelta(String),
     /// 文本增量(本次帧的 delta 文本,非累积)
     Delta(String),
     /// tool_call 增量(可能多次,需 caller 聚合)
@@ -373,15 +436,22 @@ impl LlmHandler {
 
     /// G1:流式调用 LLM API(经执行体中继)
     ///
-    /// SG-1 件1:流式 SSE 解析与聚合已上移至执行体(`POST /llm/execute`
-    /// 收到 `stream:true` 后对 provider SSE 做服务端聚合),agent 收到的
-    /// 是聚合完成的四键 JSON 整包。本方法把整包合成为流式事件序列:
+    /// 双路径设计(真流式优先,旧执行体自动回落):
+    /// - **真流式路径**:执行体流式端点(`/llm/execute-stream`,由
+    ///   `executor_url` 剥 `/llm/execute` 后缀派生)就绪时,agent 侧对
+    ///   响应 `bytes_stream` 增量解析,归一化帧逐个下行——思考/正文/
+    ///   tool_call 分片全程不经整包缓冲。env `EVORULE_LLM_STREAM_DISABLE=1`
+    ///   显式停用;进程级负缓存(曾探得 404/405)后不再重复探测。
+    /// - **legacy 整包路径**(回落/停用/URL 不可派生):执行体聚合后
+    ///   整包返回,本方法合成流式事件序列(思考整块 → 正文 → Done)。
     ///
-    /// ```text
-    /// (content 非空时) Delta(content)  →  Done(LlmResponse)
-    /// ```
-    ///
-    /// `Done` 携带完整聚合的 `LlmResponse`,与 `execute()` 输出格式一致。
+    /// 真流式帧契约(执行体下行):`{"type":"reasoning","text"}` /
+    /// `{"type":"content","text"}` / `{"type":"tool_call_delta","index",
+    /// "name"?,"fragment"}` / `{"type":"done",...五键聚合}` /
+    /// `{"type":"error","error"}` + `data: [DONE]` 哨兵。error 帧与流
+    /// 读取失败以 Err 下行(fail-visible);安全网:全程零 reasoning 帧
+    /// 而 done 帧带非空思考 → 补发单帧 ThinkingDelta(防 provider 仅在
+    /// 终帧给思考块)。
     ///
     /// ## 不重试
     ///
@@ -416,7 +486,7 @@ impl LlmHandler {
                 return;
             }
 
-            // === 构造请求体(加 stream: true——执行体按此走 SSE 聚合) ===
+            // === 构造请求体(加 stream: true——执行体按此走流式) ===
             let mut body = match body_result {
                 Ok(b) => b,
                 Err(e) => {
@@ -428,21 +498,119 @@ impl LlmHandler {
                 obj.insert("stream".to_string(), serde_json::Value::Bool(true));
             }
 
-            // === HTTP 请求(执行体端点) ===
-            // key 归边:仅携带执行体调用方令牌(SG-1 件1 配套),
-            // provider 凭据不出执行体。
-            // streaming path same dual timeout
+            // === HTTP 客户端(双超时;key 归边:仅携带执行体调用方令牌,
+            // provider 凭据不出执行体) ===
             let client = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(connect_secs))
                 .timeout(std::time::Duration::from_secs(request_secs))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new());
+            let build_request = |url: &str| {
+                let mut req = client.post(url).json(&body);
+                if let Some(tok) = &executor_token {
+                    req = req.header("Authorization", format!("Bearer {tok}"));
+                }
+                req
+            };
 
-            let mut req = client.post(&executor_url).json(&body);
-            if let Some(tok) = &executor_token {
-                req = req.header("Authorization", format!("Bearer {tok}"));
+            // === 路径选择:env 显式停用 / 负缓存已记账 / URL 不可派生 → legacy ===
+            let stream_disabled = stream_disabled_by_env(std::env::var("EVORULE_LLM_STREAM_DISABLE").ok());
+            let stream_url = if stream_disabled {
+                None
+            } else {
+                stream_endpoint_of(&executor_url)
+                    .filter(|url| !stream_endpoint_missing(url))
+            };
+
+            if let Some(stream_url) = stream_url {
+                match build_request(&stream_url).send().await {
+                    Err(e) => {
+                        yield Err(format!("LLM stream request failed: {}", e));
+                        return;
+                    }
+                    // 端点不存在(旧执行体)→ 负缓存置位 + 回落 legacy(留痕可观测)
+                    Ok(resp)
+                        if matches!(
+                            resp.status(),
+                            reqwest::StatusCode::NOT_FOUND
+                                | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                        ) =>
+                    {
+                        mark_stream_endpoint_missing(&stream_url);
+                        info!(
+                            executor_url = %executor_url,
+                            status = %resp.status(),
+                            "执行体流式端点不可用,回落整包路径(负缓存记账,后续不再探测该端点)"
+                        );
+                    }
+                    Ok(resp) if !resp.status().is_success() => {
+                        let status = resp.status();
+                        let text = resp.text().await.unwrap_or_default();
+                        yield Err(format!("LLM API error ({}): {}", status, text));
+                        return;
+                    }
+                    Ok(resp) => {
+                        // === 真流式:bytes_stream 增量解析,逐帧下行(不经整包缓冲) ===
+                        let mut buffer = String::new();
+                        let mut saw_reasoning = false;
+                        let mut saw_done = false;
+                        let mut sse = resp.bytes_stream();
+                        'frames: loop {
+                            // 先消费缓冲内完整帧(\n\n 切帧),再读下一字节块
+                            while let Some(pos) = buffer.find("\n\n") {
+                                let frame: String = buffer.drain(..pos + 2).collect();
+                                let (chunks, end) =
+                                    executor_sse_frame_outcome(&frame, &mut saw_reasoning, &mut saw_done);
+                                for chunk in chunks {
+                                    yield Ok(chunk);
+                                }
+                                match end {
+                                    FrameEnd::Continue => {}
+                                    FrameEnd::Stop => break 'frames,
+                                    FrameEnd::Fail(msg) => {
+                                        yield Err(msg);
+                                        return;
+                                    }
+                                }
+                            }
+                            match sse.next().await {
+                                Some(Ok(chunk)) => {
+                                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                                }
+                                Some(Err(e)) => {
+                                    yield Err(format!("LLM stream read failed: {}", e));
+                                    return;
+                                }
+                                None => break 'frames,
+                            }
+                        }
+                        // 流收尾残留缓冲(末帧无尾随空行形态):与执行体切帧语义对齐
+                        let residual = std::mem::take(&mut buffer);
+                        if !residual.trim().is_empty() {
+                            let (chunks, end) = executor_sse_frame_outcome(
+                                &residual,
+                                &mut saw_reasoning,
+                                &mut saw_done,
+                            );
+                            for chunk in chunks {
+                                yield Ok(chunk);
+                            }
+                            if let FrameEnd::Fail(msg) = end {
+                                yield Err(msg);
+                                return;
+                            }
+                        }
+                        if !saw_done {
+                            yield Err("执行体流式响应未含 done 终帧(连接提前关闭)".to_string());
+                            return;
+                        }
+                        return;
+                    }
+                }
             }
-            let resp = match req.send().await {
+
+            // === legacy 整包路径(执行体聚合结果,四/五键 JSON) ===
+            let resp = match build_request(&executor_url).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     yield Err(format!("LLM stream request failed: {}", e));
@@ -457,7 +625,6 @@ impl LlmHandler {
                 return;
             }
 
-            // === 整包解析(执行体聚合结果,四键 JSON) ===
             let json: serde_json::Value = match resp.json().await {
                 Ok(v) => v,
                 Err(e) => {
@@ -473,7 +640,16 @@ impl LlmHandler {
                 }
             };
 
-            // === 整包合成:单 Delta(content 非空时)+ Done ===
+            // === 整包合成:ThinkingDelta(思考非空,整块) →
+            // Delta(content 非空) → Done ===
+            let reasoning = normalized
+                .get("reasoning")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !reasoning.is_empty() {
+                yield Ok(StreamChunk::ThinkingDelta(reasoning));
+            }
             let content = normalized
                 .get("content")
                 .and_then(|v| v.as_str())
@@ -494,6 +670,132 @@ impl LlmHandler {
     }
 }
 
+/// 单帧处理后的流向(真流式路径)
+enum FrameEnd {
+    /// 继续收帧
+    Continue,
+    /// 流收口(done 帧已下行 / [DONE] 哨兵)
+    Stop,
+    /// 以 Err 收口(fail-visible;调用方 yield Err 后终止)
+    Fail(String),
+}
+
+/// 执行体流式端点单帧解析 → 下行帧集 + 流向。
+///
+/// 帧形态:`data:` 行提取(多行 join,与执行体切帧语义对齐)→ 空行跳过 →
+/// `[DONE]` 哨兵收口 → JSON 解析失败 warn 跳过(流继续)→ 按帧 `type`
+/// 分派到 ThinkingDelta/Delta/ToolCallDelta/done(五键归一+安全网)/error。
+fn executor_sse_frame_outcome(
+    frame: &str,
+    saw_reasoning: &mut bool,
+    saw_done: &mut bool,
+) -> (Vec<StreamChunk>, FrameEnd) {
+    let data: String = frame
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() {
+        return (Vec::new(), FrameEnd::Continue);
+    }
+    if data.trim() == "[DONE]" {
+        return (Vec::new(), FrameEnd::Stop);
+    }
+    let frame_json: Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                vec![StreamChunk::Warn(format!("SSE 帧解析失败(跳过,流继续): {e}"))],
+                FrameEnd::Continue,
+            );
+        }
+    };
+    match frame_json.get("type").and_then(Value::as_str) {
+        Some("reasoning") => {
+            let text = frame_json.get("text").and_then(Value::as_str).unwrap_or("");
+            if text.is_empty() {
+                (Vec::new(), FrameEnd::Continue)
+            } else {
+                *saw_reasoning = true;
+                (
+                    vec![StreamChunk::ThinkingDelta(text.to_string())],
+                    FrameEnd::Continue,
+                )
+            }
+        }
+        Some("content") => {
+            let text = frame_json.get("text").and_then(Value::as_str).unwrap_or("");
+            if text.is_empty() {
+                (Vec::new(), FrameEnd::Continue)
+            } else {
+                (vec![StreamChunk::Delta(text.to_string())], FrameEnd::Continue)
+            }
+        }
+        Some("tool_call_delta") => {
+            let index = frame_json
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            let fragment = frame_json
+                .get("fragment")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            (
+                vec![StreamChunk::ToolCallDelta {
+                    index,
+                    fragment: fragment.to_string(),
+                }],
+                FrameEnd::Continue,
+            )
+        }
+        Some("done") => {
+            // 安全网:全程零 reasoning 帧 → 终帧思考块补发(防 provider 仅在
+            // 终帧给思考块);随后五键归一 → Done 收口
+            let reasoning = frame_json
+                .get("reasoning")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let mut chunks = Vec::new();
+            if !*saw_reasoning && !reasoning.is_empty() {
+                chunks.push(StreamChunk::ThinkingDelta(reasoning.to_string()));
+            }
+            let normalized = match normalize_executor_response(frame_json) {
+                Ok(v) => v,
+                Err(e) => return (Vec::new(), FrameEnd::Fail(e)),
+            };
+            let content = normalized
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let llm_response: LlmResponse = serde_json::from_value(normalized).unwrap_or_else(|_| {
+                LlmResponse {
+                    content,
+                    tool_calls: None,
+                    finish_reason: Some("stop".to_string()),
+                    token_usage: None,
+                }
+            });
+            *saw_done = true;
+            chunks.push(StreamChunk::Done(llm_response));
+            (chunks, FrameEnd::Stop)
+        }
+        Some("error") => {
+            let msg = frame_json
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("(执行体未附错误说明)");
+            (Vec::new(), FrameEnd::Fail(msg.to_string()))
+        }
+        other => (
+            vec![StreamChunk::Warn(format!("SSE 帧类型未知(跳过): {other:?}"))],
+            FrameEnd::Continue,
+        ),
+    }
+}
+
 /// SG-1 件1:执行体四键响应的宽松透传归一(自由函数,`execute` 与
 /// `execute_stream` 共用)。
 ///
@@ -504,6 +806,9 @@ impl LlmHandler {
 /// - `token_usage`:try-parse 为 `TokenUsage`,形状不符 → None
 ///   (与旧流式路径 usage 解析语义逐值同构,防止 provider usage
 ///   缺字段导致整个 LlmResponse 反序列化失败)
+/// - `reasoning`(推理模型增补第五键):缺键/非字符串 → "";归一输出
+///   仅非空携带——非思考模型输出与原四键形状逐字节一致。`LlmResponse`
+///   结构不读该键(思考内容只走增量帧,本键仅作 execute_stream 消费面)
 fn normalize_executor_response(json: Value) -> Result<Value, String> {
     let content = json
         .get("content")
@@ -537,18 +842,32 @@ fn normalize_executor_response(json: Value) -> Result<Value, String> {
         .filter(|v| !v.is_null())
         .and_then(|v| serde_json::from_value::<TokenUsage>(v.clone()).ok());
 
+    let reasoning = json
+        .get("reasoning")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
     debug!(
         content_len = content.len(),
+        reasoning_len = reasoning.len(),
         finish_reason = ?finish_reason,
         tool_calls = ?tool_calls,
         "LLM executor response normalized"
     );
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "content": content,
         "tool_calls": tool_calls,
         "finish_reason": finish_reason,
         "token_usage": token_usage,
-    }))
+    });
+    // 第五键 reasoning:仅非空携带——非思考模型输出与原四键形状逐字节一致
+    if !reasoning.is_empty() {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("reasoning".to_string(), Value::String(reasoning));
+        }
+    }
+    Ok(out)
 }
 
 /// 把内部消息历史转换为 OpenAI wire 形状（出站边界转换）:
@@ -1455,6 +1774,9 @@ mod tests {
                 Ok(StreamChunk::ToolCallDelta { .. }) => {
                     panic!("ToolCallDelta must not be produced by whole-payload path")
                 }
+                Ok(StreamChunk::ThinkingDelta(_)) => {
+                    panic!("ThinkingDelta must not be produced without reasoning content")
+                }
                 Err(e) => panic!("stream error: {}", e),
             }
         }
@@ -1564,5 +1886,293 @@ mod tests {
         while let Some(_item) = stream.next().await {}
 
         mock.assert_async().await;
+    }
+
+    // ========== 真流式路径(执行体 /llm/execute-stream 孪生端点) ==========
+
+    /// 真流式:归一化帧序列逐帧下行(思考/正文/tool_call 分片/done 五键聚合),
+    /// saw_reasoning=true 时 done 帧思考不重发;saw_done 语义锁定
+    #[tokio::test]
+    async fn test_stream_true_streaming_frame_sequence() {
+        let mut server = mockito::Server::new_async().await;
+        let sse = [
+            r#"data: {"type":"reasoning","text":"思考A"}"#,
+            r#"data: {"type":"content","text":"he"}"#,
+            r#"data: {"type":"content","text":"llo"}"#,
+            r#"data: {"type":"tool_call_delta","index":0,"name":"f","fragment":"{\"a\""}"#,
+            r#"data: {"type":"tool_call_delta","index":0,"fragment":":1}"}"#,
+            r#"data: {"type":"done","content":"hello","reasoning":"思考A","tool_calls":[{"tool_name":"f","args":{"a":1}}],"finish_reason":"tool_calls","token_usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#,
+            "data: [DONE]",
+        ]
+        .join("\n\n");
+        let _mock = server
+            .mock("POST", "/llm/execute-stream")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create_async()
+            .await;
+
+        let executor_url = format!("{}/llm/execute", server.url());
+        let handler = LlmHandler::new("m", &executor_url);
+        let params = Value::Object(Default::default());
+        let mut stream = handler.execute_stream(&params);
+
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("no error expected"));
+        }
+
+        assert_eq!(
+            chunks.len(),
+            6,
+            "思考增量已在场 → done 帧思考不重发: {:?}",
+            chunks
+        );
+        match &chunks[0] {
+            StreamChunk::ThinkingDelta(t) => assert_eq!(t, "思考A"),
+            other => panic!("expected ThinkingDelta, got {:?}", other),
+        }
+        match &chunks[1] {
+            StreamChunk::Delta(t) => assert_eq!(t, "he"),
+            other => panic!("expected Delta, got {:?}", other),
+        }
+        match &chunks[2] {
+            StreamChunk::Delta(t) => assert_eq!(t, "llo"),
+            other => panic!("expected Delta, got {:?}", other),
+        }
+        match &chunks[3] {
+            StreamChunk::ToolCallDelta { index, fragment } => {
+                assert_eq!(*index, 0);
+                assert_eq!(fragment, "{\"a\"");
+            }
+            other => panic!("expected ToolCallDelta, got {:?}", other),
+        }
+        match &chunks[4] {
+            StreamChunk::ToolCallDelta { index, fragment } => {
+                assert_eq!(*index, 0);
+                assert_eq!(fragment, ":1}");
+            }
+            other => panic!("expected ToolCallDelta, got {:?}", other),
+        }
+        match &chunks[5] {
+            StreamChunk::Done(resp) => {
+                assert_eq!(resp.content, "hello");
+                let tcs = resp.tool_calls.as_ref().expect("should have tool_calls");
+                assert_eq!(tcs.len(), 1);
+                assert_eq!(tcs[0].name, "f");
+                assert_eq!(tcs[0].arguments["a"], 1);
+                assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
+                assert_eq!(resp.token_usage.as_ref().expect("usage").total_tokens, 7);
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    /// 真流式:error 帧以 Err 收口(fail-visible),先前增量照常下行
+    #[tokio::test]
+    async fn test_stream_true_streaming_error_frame_fails_visible() {
+        let mut server = mockito::Server::new_async().await;
+        let sse = [
+            r#"data: {"type":"content","text":"partial"}"#,
+            r#"data: {"type":"error","error":"LLM API business error (status_code=1004): invalid"}"#,
+        ]
+        .join("\n\n");
+        let _mock = server
+            .mock("POST", "/llm/execute-stream")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create_async()
+            .await;
+
+        let executor_url = format!("{}/llm/execute", server.url());
+        let handler = LlmHandler::new("m", &executor_url);
+        let params = Value::Object(Default::default());
+        let mut stream = handler.execute_stream(&params);
+
+        match stream.next().await.unwrap() {
+            Ok(StreamChunk::Delta(t)) => assert_eq!(t, "partial"),
+            other => panic!("expected Delta, got {:?}", other),
+        }
+        match stream.next().await.unwrap() {
+            Err(e) => assert!(
+                e.contains("business error"),
+                "error frame message must surface: {}",
+                e
+            ),
+            other => panic!("expected Err, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none(), "Err 后流应终止");
+    }
+
+    /// 真流式安全网:全程零 reasoning 帧 → done 帧思考块补发单帧
+    /// ThinkingDelta(紧邻 Done 之前,防 provider 仅在终帧给思考块)。
+    /// 注意真流式逐帧下行:先到的 content 帧物理上先行,补发思考帧
+    /// 位置在已下行增量之后、Done 之前(安全网目标是思考不丢,非重排)
+    #[tokio::test]
+    async fn test_stream_safety_net_reasoning_from_done_frame() {
+        let mut server = mockito::Server::new_async().await;
+        let sse = [
+            r#"data: {"type":"content","text":"答"}"#,
+            r#"data: {"type":"done","content":"答","reasoning":"思","tool_calls":null,"finish_reason":"stop","token_usage":null}"#,
+        ]
+        .join("\n\n");
+        let _mock = server
+            .mock("POST", "/llm/execute-stream")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create_async()
+            .await;
+
+        let executor_url = format!("{}/llm/execute", server.url());
+        let handler = LlmHandler::new("m", &executor_url);
+        let params = Value::Object(Default::default());
+        let mut stream = handler.execute_stream(&params);
+
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("no error expected"));
+        }
+        assert_eq!(chunks.len(), 3, "Delta + 补发思考帧 + Done: {:?}", chunks);
+        match &chunks[0] {
+            StreamChunk::Delta(t) => assert_eq!(t, "答"),
+            other => panic!("expected Delta first (逐帧下行), got {:?}", other),
+        }
+        match &chunks[1] {
+            StreamChunk::ThinkingDelta(t) => assert_eq!(t, "思"),
+            other => panic!("safety-net ThinkingDelta must precede Done, got {:?}", other),
+        }
+        assert!(matches!(&chunks[2], StreamChunk::Done(_)));
+    }
+
+    /// 404 回落:流式端点不存在 → legacy 整包路径成功;负缓存记账 →
+    /// 第二次调用不再探测(404 mock expect(1) 为证)
+    #[tokio::test]
+    async fn test_stream_404_fallback_and_negative_cache() {
+        let mut server = mockito::Server::new_async().await;
+        let m404 = server
+            .mock("POST", "/llm/execute-stream")
+            .with_status(404)
+            .with_body("not found")
+            .expect(1)
+            .create_async()
+            .await;
+        let mexec = server
+            .mock("POST", "/llm/execute")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"content":"legacy","tool_calls":null,"finish_reason":"stop","token_usage":null}"#,
+            )
+            .expect(2)
+            .create_async()
+            .await;
+
+        let executor_url = format!("{}/llm/execute", server.url());
+        let handler = LlmHandler::new("m", &executor_url);
+        let params = Value::Object(Default::default());
+
+        // 第一轮:探测 404 → 回落 legacy
+        let mut first = handler.execute_stream(&params);
+        let mut chunks1 = Vec::new();
+        while let Some(item) = first.next().await {
+            chunks1.push(item.expect("fallback path must succeed"));
+        }
+        assert_eq!(chunks1.len(), 2, "Delta(legacy) + Done: {:?}", chunks1);
+
+        // 第二轮:负缓存记账 → 不再探测,直走 legacy
+        let mut second = handler.execute_stream(&params);
+        let mut chunks2 = Vec::new();
+        while let Some(item) = second.next().await {
+            chunks2.push(item.expect("second call must succeed"));
+        }
+        assert_eq!(chunks2.len(), 2);
+
+        drop(first);
+        drop(second);
+        m404.assert_async().await;
+        mexec.assert_async().await;
+        // 收尾清负缓存:server 仍在监听(未 drop,端口未释放)时清理,并行
+        // 后继测试不会持同端口——彻底消除 mockito 端口复用 × 负缓存串台
+        let stream_url = format!("{}/llm/execute-stream", server.url());
+        clear_stream_endpoint_missing_for_test(&stream_url);
+    }
+
+    /// legacy 整包五键增强:reasoning 非空 → ThinkingDelta(整块) 先于 Delta
+    /// (URL 不带 /llm/execute 后缀 → 无流式端点可试,直走 legacy)
+    #[tokio::test]
+    async fn test_stream_legacy_five_keys_yields_thinking_block_first() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"content":"hi","reasoning":"思考整块","tool_calls":null,
+                    "finish_reason":"stop","token_usage":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let handler = LlmHandler::new("m", &server.url());
+        let params = Value::Object(Default::default());
+        let mut stream = handler.execute_stream(&params);
+
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("no error expected"));
+        }
+        assert_eq!(chunks.len(), 3, "ThinkingDelta + Delta + Done: {:?}", chunks);
+        match &chunks[0] {
+            StreamChunk::ThinkingDelta(t) => assert_eq!(t, "思考整块"),
+            other => panic!("expected ThinkingDelta first, got {:?}", other),
+        }
+        match &chunks[1] {
+            StreamChunk::Delta(t) => assert_eq!(t, "hi"),
+            other => panic!("expected Delta, got {:?}", other),
+        }
+        assert!(matches!(&chunks[2], StreamChunk::Done(_)));
+    }
+
+    /// 路径选择纯函数:env 开关语义 / URL 派生 / 负缓存记账(按 URL 独立)
+    #[test]
+    fn test_stream_path_selection_helpers() {
+        // env 开关:仅字面 "1" 停用(测试经参数注入,不变异进程环境)
+        assert!(stream_disabled_by_env(Some("1".to_string())));
+        assert!(!stream_disabled_by_env(Some("0".to_string())));
+        assert!(!stream_disabled_by_env(Some("".to_string())));
+        assert!(!stream_disabled_by_env(None));
+        // URL 派生:仅 /llm/execute 后缀可派生孪生端点
+        assert_eq!(
+            stream_endpoint_of("http://127.0.0.1:9130/llm/execute").as_deref(),
+            Some("http://127.0.0.1:9130/llm/execute-stream")
+        );
+        assert_eq!(stream_endpoint_of("http://other/execute"), None);
+        // 负缓存:按 URL 独立记账,互不误伤
+        mark_stream_endpoint_missing("http://negcache-test/llm/execute-stream");
+        assert!(stream_endpoint_missing("http://negcache-test/llm/execute-stream"));
+        assert!(!stream_endpoint_missing("http://other-host/llm/execute-stream"));
+    }
+
+    /// 归一第五键:reasoning 非空携带;非思考模型输出与原四键形状一致
+    #[test]
+    fn test_normalize_executor_response_reasoning_key() {
+        let out = normalize_executor_response(serde_json::json!({
+            "content": "hi", "reasoning": "思考", "tool_calls": null,
+            "finish_reason": "stop", "token_usage": null
+        }))
+        .unwrap();
+        assert_eq!(out["reasoning"], "思考");
+        assert_eq!(out["content"], "hi");
+
+        let out = normalize_executor_response(serde_json::json!({
+            "content": "hi", "tool_calls": null,
+            "finish_reason": "stop", "token_usage": null
+        }))
+        .unwrap();
+        assert!(out.get("reasoning").is_none(), "四键形状不得多出空 reasoning 键");
+        assert_eq!(out["content"], "hi");
     }
 }

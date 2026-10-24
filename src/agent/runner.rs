@@ -806,6 +806,12 @@ pub enum AgentEvent {
         /// 本次帧的增量文本
         text: String,
     },
+    /// LLM 思考增量(来自 G1 的 `StreamChunk::ThinkingDelta`;推理模型
+    /// reasoning_content 逐帧下行,仅展示链路——不积累进消息、不持久化)
+    LlmThinkingDelta {
+        /// 本次帧的思考增量文本
+        text: String,
+    },
     /// LLM 调用了工具
     ToolCall {
         /// 工具名称
@@ -7448,6 +7454,11 @@ impl AgentRunner {
                                                        Ok(StreamChunk::Delta(text)) => {
                                                            full_content.push_str(&text);
                                                            yield Ok(AgentEvent::LlmDelta { text });
+                                                       }
+                                                       Ok(StreamChunk::ThinkingDelta(text)) => {
+                                                           // 思考增量:仅事件下行(展示链路),
+                                                           // 不积累不持久化(设计裁定)
+                                                           yield Ok(AgentEvent::LlmThinkingDelta { text });
                                                        }
                                                        Ok(StreamChunk::ToolCallDelta { .. }) => {
                                                            // 聚合在 execute_stream 内部完成,不 yield 半截 JSON
