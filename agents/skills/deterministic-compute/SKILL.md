@@ -25,6 +25,7 @@ evorule-server，其中运行着**确定性推理层**——同样的输入永�
 | 定位"哪个决策引入了差异"（失败归因） | `inference_counterfactual_analyze` |
 | 扫描参数取值面（哪些值安全） | `inference_counterfactual_sweep` |
 | 判断图形是否碰撞 / 间距够不够 / 层次对不对 | `geometry_collision_check` / `geometry_clearance_check` / `geometry_occlusion_check` |
+| 三维点集投成等距屏幕坐标 / 校核管路转角与弯径 / 审计棱柱-管路场景间隙 | `geometry_iso_project` / `geometry_tube_route` / `geometry_figure_audit` |
 
 ## 什么留给自己
 
