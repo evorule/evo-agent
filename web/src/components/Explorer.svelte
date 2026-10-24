@@ -1042,6 +1042,9 @@
             </svg>
             <span class="icon dir">{@html dirIconSvg(!!dirState.get(node.path)?.expanded)}</span>
           {:else}
+            <!-- 箭头占位空槽(与 .caret 同宽):文件图标与同层文件夹图标对齐,
+                 否则文件行少 16px 缩进,视觉上比文件夹高一级 -->
+            <span class="caret-space"></span>
             {@render fileIcon(node.name)}
           {/if}
           {#if naming && naming.mode === 'rename' && naming.target.path === node.path}
@@ -1474,6 +1477,10 @@
   }
   .caret.open {
     transform: rotate(90deg);
+  }
+  .caret-space {
+    width: 10px; /* 与 .caret 同宽:文件行占位,图标与文件夹对齐 */
+    flex-shrink: 0;
   }
   .icon {
     display: inline-flex;
