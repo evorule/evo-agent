@@ -42,6 +42,7 @@
     openGitDiff,
     openFile,
     scmGenerateIntent,
+    connBanner,
   } from './lib/stores.js';
   import { loadSettings, settingsState } from './lib/settings.js';
   import { applyTheme, readStoredMode, resolveMode } from './lib/theme.js';
@@ -759,6 +760,12 @@
       />
     {/if}
     <div class="center">
+      {#if $connBanner}
+        <!-- 断连横幅按连接状态翻转渲染(断连期间显示,重连成功即清,零残留) -->
+        <div class="conn-banner" role="alert">
+          <span class="conn-banner-text">{$connBanner}</span>
+        </div>
+      {/if}
       {#if $lspBanner}
         <div class="lsp-banner" role="alert">
           <span class="lsp-banner-text">
@@ -863,6 +870,24 @@
   .editor-slot :global(.editor-pane) {
     flex: 1;
     min-width: 0;
+  }
+  .conn-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--warn-bg, #3d2e00);
+    border-bottom: 1px solid var(--border, #30363d);
+    color: var(--warn-fg, #f0c674);
+    font-size: var(--fs-xs);
+    flex-shrink: 0;
+  }
+  .conn-banner-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .lsp-banner {
     display: flex;

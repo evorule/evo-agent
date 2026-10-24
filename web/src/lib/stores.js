@@ -17,6 +17,11 @@ import { userLayerDoc } from './settings.js';
 /** 连接状态: connecting | online | offline */
 export const connStatus = writable('offline');
 
+/** 断连横幅文案(null = 无横幅)。断连提示从消息转录(永久残留)改为
+ *  连接状态翻转渲染——断连期间恒显示最新退避文案,重连成功/主动换线即清,
+ *  零残留不跨次累积。 */
+export const connBanner = writable(null);
+
 /** 会话工作区纪元(批 I):工作区切换(任意入口)后自增,文件树订阅重建。
  *  文件面随请求头即刻重锚,此处只承担「树需要重建」的显式信号。 */
 export const workspaceEpoch = writable(0);

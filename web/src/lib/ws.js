@@ -6,6 +6,7 @@
 import { get } from 'svelte/store';
 import {
   connStatus,
+  connBanner,
   sessionId,
   turnActive,
   lastEngineEventAt,
@@ -131,7 +132,9 @@ function scheduleReconnect() {
   // 提示降噪:首次断连必提示,其后每 5 次重试提示一次(状态区恒可见连接态)
   if (reconnectAttempts === 1 || reconnectAttempts % 5 === 0) {
     const text = `连接已断开，${Math.round(delay / 1000)}s 后自动重连(第 ${reconnectAttempts} 次)…`;
-    pushMessage({ kind: 'error', text });
+    // 横幅改连接状态翻转渲染(connBanner,重连成功即清),不再 pushMessage
+    // 入消息转录——那会在重连后永久残留并跨次累积
+    connBanner.set(text);
     // F2 通知中心:断连同时入列(状态栏铃铛/右下 toast;首次 warn,后续 err 降噪档)
     pushNotification(reconnectAttempts === 1 ? 'warn' : 'err', '工作台连接断开', text);
   }
@@ -148,11 +151,13 @@ export function connect(sid) {
     reconnectTimer = null;
   }
   currentSid = sid || 'new';
+  connBanner.set(null); // 主动换线/新建即清残留断连横幅(重连成功亦由 onopen 兜底清)
   connStatus.set('connecting');
   ws = new WebSocket(wsUrl(currentSid));
 
   ws.onopen = () => {
     connStatus.set('online');
+    connBanner.set(null); // 重连成功撤横幅,零残留
     reconnectAttempts = 0; // 连上即清零,下次断连从 1s 重新退避
     // 恢复意图待发:resume 换线(openSession)后连接刚建立,此处补发恢复帧
     if (pendingResume) {
