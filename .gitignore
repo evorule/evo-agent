@@ -81,3 +81,8 @@ sleep_worker/
 
 # 运营登记册（本地私有面，不上库）
 plan/
+
+# 第三方 MIT 内容包走装机面部署(桌面 runtime 的 <workdir>/data/skills 装载,
+# 桌面端已镜像),不入代码仓;本地副本仅供开发。
+agents/skills/anatomy/
+agents/anatomy-studio.json
