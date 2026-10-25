@@ -1217,28 +1217,35 @@
                 {/if}
               </div>
             {/if}
-            <div class="bubble assistant-bubble md-body" onclick={onMdCopyClick}>
-              {@html renderChatHtml(m.text, m.id)}<span class="cursor" class:on={m.streaming}></span>
-              {#if m.text}
-                <button
-                  type="button"
-                  class="msg-copy"
-                  title="复制全文"
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    copyPlainText(m.text, e.currentTarget);
-                  }}
-                >复制</button>
-              {/if}
-            </div>
+            {#if m.text || m.streaming}
+              <!-- 纯思考步(无正文且非流式)不渲染气泡:答案升格样式会让
+                   空气泡变成醒目空盒(真机实锤=思考线下的成排空框);
+                   流式中未出字的段只留紧凑光标线 -->
+              <div class="bubble assistant-bubble md-body" class:pending={!m.text && m.streaming} onclick={onMdCopyClick}>
+                {@html renderChatHtml(m.text, m.id)}<span class="cursor" class:on={m.streaming}></span>
+                {#if m.text}
+                  <button
+                    type="button"
+                    class="msg-copy"
+                    title="复制全文"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      copyPlainText(m.text, e.currentTarget);
+                    }}
+                  >复制</button>
+                {/if}
+              </div>
+            {/if}
           </div>
-          <span class="audit-chip">
-            <AuditBadge
-              status={badgeStatus($auditState, auditBadgeMap.has(m.id))}
-              clickable={auditBadgeMap.has(m.id) && $auditState?.verified === true}
-              onclick={() => (auditCardEntry = auditBadgeMap.get(m.id))}
-            />
-          </span>
+          {#if m.text || m.streaming}
+            <span class="audit-chip">
+              <AuditBadge
+                status={badgeStatus($auditState, auditBadgeMap.has(m.id))}
+                clickable={auditBadgeMap.has(m.id) && $auditState?.verified === true}
+                onclick={() => (auditCardEntry = auditBadgeMap.get(m.id))}
+              />
+            </span>
+          {/if}
         </div>
       {:else if m.kind === 'tool'}
         <div class="tool-card" class:running={m.running} class:open={expandedTools.has(m.id)}>
@@ -1975,6 +1982,12 @@
     border-radius: var(--r-md);
     color: var(--text-primary);
     padding: var(--sp-md);
+  }
+  /* 流式中未出字的段:只留紧凑光标线,不占醒目空盒 */
+  .assistant-bubble.pending {
+    background: transparent;
+    border-left-color: transparent;
+    padding: 2px var(--sp-md);
   }
   /* 思考面板:assistant 气泡上方的深度思考折叠卡——流式自动展开淡色 mono
      限高吸底,结束后折叠条固化耗时;交互态与工具卡同构 */
