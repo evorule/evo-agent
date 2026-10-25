@@ -646,7 +646,8 @@ pub fn hits_red_line(tool: &str, args: &serde_json::Value) -> Option<RedLine> {
                 return Some(RedLine::RemotePush);
             }
         }
-        "file_write" | "file_create" | "file_move" | "file_edit" | "write_file" => {
+        "file_write" | "file_create" | "file_move" | "file_edit" | "write_file" | "edit_file"
+        | "workspace_undo" => {
             let mut strings = Vec::new();
             collect_strings(args, &mut strings);
             if strings.iter().any(|s| is_governance_config_path(s)) {
@@ -792,6 +793,24 @@ max_actions_per_run = 200
         assert_eq!(
             hits_red_line("file_write", &json!({"path": "src/main.rs"})),
             None
+        );
+    }
+
+    /// O-547 回归：内置注册名 edit_file 与 workspace_undo 必须命中治理配置红线
+    /// （修复前名单缺 edit_file——`.` 边界下可绕强制人工直改 .evo/ 治理配置）
+    #[test]
+    fn red_line_edit_and_undo_governance_config() {
+        assert_eq!(
+            hits_red_line(
+                "edit_file",
+                &json!({"path": ".evo/settings.json", "old_string": "a", "new_string": "b"})
+            ),
+            Some(RedLine::GovernanceConfigWrite)
+        );
+        assert_eq!(
+            hits_red_line("workspace_undo", &json!({})),
+            None,
+            "无参 undo 不携带路径，不命中治理配置红线（恢复路径校验在 CheckpointStore 复验层）"
         );
     }
 
