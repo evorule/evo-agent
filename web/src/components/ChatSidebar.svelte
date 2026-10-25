@@ -539,6 +539,43 @@
     void $sessionId;
     renderCount = RENDER_WINDOW;
   });
+
+  // ---- 回合内过程折叠(视觉层级:过程=安静脚手架,答案=主角) ----
+  // 活动元素=工具卡或纯思考行(无叙述正文);两个叙述/答案气泡之间的连续
+  // 活动段,在段被闭合(后随正文气泡存在)且段长≥4 时收成一行摘要——回答
+  // 落地即把中间几十步过程退成一行,视线先落在答案上;点击摘要可展开全程。
+  const GROUP_MIN = 4;
+  const expandedGroups = new SvelteSet();
+  const activityLayout = $derived.by(() => {
+    const hidden = new Set();
+    const leaders = new Map(); // leaderId -> {count}
+    let buf = null;
+    const isActivity = (m) =>
+      m.kind === 'tool' || (m.kind === 'assistant' && !(m.text || '').trim());
+    const close = () => {
+      if (buf && buf.count >= GROUP_MIN && !expandedGroups.has(buf.leader)) {
+        leaders.set(buf.leader, { count: buf.count });
+        // leader 自身不入 hidden(它要渲染成摘要行);其余成员隐藏
+        for (const id of buf.ids) if (id !== buf.leader) hidden.add(id);
+      }
+      buf = null;
+    };
+    for (const m of visibleMessages) {
+      if (isActivity(m)) {
+        if (!buf) buf = { leader: m.id, ids: [], count: 0 };
+        buf.ids.push(m.id);
+        buf.count += 1;
+      } else {
+        close();
+      }
+    }
+    // 末尾未闭合段=正在进行的实时活动,保持展开不折叠
+    return { hidden, leaders };
+  });
+  function toggleGroup(leaderId) {
+    if (expandedGroups.has(leaderId)) expandedGroups.delete(leaderId);
+    else expandedGroups.add(leaderId);
+  }
   async function onLoadOlder() {
     if (loadingOlder) return;
     loadingOlder = true;
@@ -1111,7 +1148,19 @@
       </button>
     {/if}
     {#each visibleMessages as m (m.id)}
-      {#if m.kind === 'user'}
+      {#if activityLayout.leaders.has(m.id)}
+        <button
+          type="button"
+          class="tool-group"
+          onclick={() => toggleGroup(m.id)}
+          title="展开这段思考与工具调用全程"
+        >
+          <span class="tool-chev">▸</span>
+          <span>已折叠 {activityLayout.leaders.get(m.id).count} 步过程（思考与工具调用）</span>
+        </button>
+      {:else if activityLayout.hidden.has(m.id)}
+        <!-- 已折叠进过程摘要 -->
+      {:else if m.kind === 'user'}
         <div class="row user">
           <div class="user-col">
             <div class="bubble user-bubble">{m.text}</div>
@@ -1891,6 +1940,8 @@
   .row {
     display: flex;
     justify-content: flex-start;
+    /* 节奏:气泡行(回合边界/答案)前留大间隙,与紧凑的过程行拉开层级 */
+    margin-top: 12px;
   }
   .audit-chip {
     align-self: flex-end;
@@ -1902,6 +1953,7 @@
   }
   .row.center {
     justify-content: center;
+    margin-top: 4px;
   }
   .bubble {
     max-width: 88%;
@@ -1916,9 +1968,13 @@
     background: var(--brand);
     color: var(--text-inverse);
   }
+  /* 答案=主角:实底卡+品牌色左标线,与低对比的过程行拉开视觉层级 */
   .assistant-bubble {
-    background: var(--bg-hover);
+    background: var(--bg-card);
+    border-left: 2px solid var(--brand);
+    border-radius: var(--r-md);
     color: var(--text-primary);
+    padding: var(--sp-md);
   }
   /* 思考面板:assistant 气泡上方的深度思考折叠卡——流式自动展开淡色 mono
      限高吸底,结束后折叠条固化耗时;交互态与工具卡同构 */
@@ -1929,21 +1985,24 @@
     max-width: 88%;
     min-width: 0;
   }
+  /* 思考=安静脚手架行:去盒、缩进、低对比紧凑;仅展开体与流式段保留视觉标记 */
   .thinking-card {
-    border: 1px solid var(--border);
-    border-radius: var(--r-md);
-    background: var(--bg-card);
-    font-size: var(--fs-xs);
+    border: none;
+    border-left: 2px solid transparent;
+    border-radius: var(--r-sm);
+    background: transparent;
+    font-size: 11px;
+    margin-left: 10px;
     overflow: hidden;
   }
   .thinking-card.streaming {
-    border-color: var(--brand);
+    border-left-color: var(--brand);
   }
   .thinking-head {
     display: flex;
     align-items: center;
     gap: var(--sp-xs);
-    padding: var(--sp-xs) var(--sp-sm);
+    padding: 2px 6px;
     cursor: pointer;
     user-select: none;
   }
@@ -1957,9 +2016,10 @@
     color: var(--text-muted);
   }
   .thinking-body {
-    margin: 0 var(--sp-sm) var(--sp-xs);
+    margin: 0 0 var(--sp-xs) 6px;
     padding: var(--sp-xs) var(--sp-sm);
     background: var(--bg-page);
+    border: 1px solid var(--border);
     border-radius: var(--r-sm);
     color: var(--text-secondary);
     max-height: 180px;
@@ -2122,21 +2182,24 @@
       opacity: 0;
     }
   }
+  /* 工具卡=安静脚手架行:与思考行同制——去盒缩进低对比,展开体才成盒 */
   .tool-card {
-    border: 1px solid var(--border);
-    border-radius: var(--r-md);
-    background: var(--bg-card);
-    font-size: var(--fs-xs);
+    border: none;
+    border-left: 2px solid transparent;
+    border-radius: var(--r-sm);
+    background: transparent;
+    font-size: 11px;
+    margin-left: 10px;
     overflow: hidden;
   }
   .tool-card.running {
-    border-color: var(--brand);
+    border-left-color: var(--brand);
   }
   .tool-head {
     display: flex;
     align-items: center;
     gap: var(--sp-xs);
-    padding: var(--sp-xs) var(--sp-sm);
+    padding: 2px 6px;
     cursor: pointer;
     user-select: none;
   }
@@ -2153,7 +2216,7 @@
     transform: rotate(90deg);
   }
   .tool-name {
-    color: var(--brand-ocean);
+    color: var(--text-secondary);
     font-weight: var(--fw-sb);
   }
   .tool-state {
@@ -2161,10 +2224,34 @@
     color: var(--text-muted);
   }
   .tool-body {
-    padding: 0 var(--sp-sm) var(--sp-xs);
+    margin: 0 0 var(--sp-xs) 6px;
+    padding: var(--sp-xs) var(--sp-sm);
+    background: var(--bg-page);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
     display: flex;
     flex-direction: column;
     gap: var(--sp-xs);
+  }
+  /* 回合内过程折叠摘要行(胶囊虚线):回答落地后几十步过程退位成一行 */
+  .tool-group {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-xs);
+    margin: 4px 0 4px 10px;
+    padding: 3px 10px;
+    border: 1px dashed var(--border);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 11px;
+    cursor: pointer;
+    text-align: left;
+    user-select: none;
+  }
+  .tool-group:hover {
+    background: var(--bg-hover);
+    color: var(--text-secondary);
   }
   /* 动作/结果两段式小节标题与截断徽标 */
   .tb-label {
