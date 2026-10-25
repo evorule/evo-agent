@@ -638,9 +638,9 @@ mod tests {
         );
         handler.register_static(
             crate::builtin_tools::todo::TODO_READ_TOOL,
-            Arc::new(crate::builtin_tools::todo::TodoReadTool::wired(
-                Arc::new(crate::builtin_tools::todo::TodoState::default()),
-            )),
+            Arc::new(crate::builtin_tools::todo::TodoReadTool::wired(Arc::new(
+                crate::builtin_tools::todo::TodoState::default(),
+            ))),
         );
 
         // 执行器面:三件都在(占位保留 fail-visible,防绕过)
@@ -655,11 +655,13 @@ mod tests {
 
         let wired = handler.wired_tool_names();
         assert!(wired.contains(&"file_read".to_string()));
+        assert!(wired
+            .iter()
+            .any(|n| n == crate::builtin_tools::todo::TODO_READ_TOOL));
         assert!(
-            wired.iter().any(|n| n == crate::builtin_tools::todo::TODO_READ_TOOL)
-        );
-        assert!(
-            wired.iter().all(|n| n != crate::builtin_tools::todo::TODO_WRITE_TOOL),
+            wired
+                .iter()
+                .all(|n| n != crate::builtin_tools::todo::TODO_WRITE_TOOL),
             "占位必须从 wired 清单摘除"
         );
     }

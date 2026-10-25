@@ -135,7 +135,9 @@ mod tests {
     #[tokio::test]
     async fn undo_tombstone_reports_removed_path() {
         let (dir, store) = temp_store();
-        let p = store.pre_capture("workspace/new.txt", "file_create").unwrap();
+        let p = store
+            .pre_capture("workspace/new.txt", "file_create")
+            .unwrap();
         store.commit(&p, None).unwrap();
         std::fs::write(dir.path().join("workspace/new.txt"), b"x").unwrap();
 
@@ -158,10 +160,7 @@ mod tests {
     async fn rejects_extra_arguments() {
         let (_dir, store) = temp_store();
         let tool = WorkspaceUndoTool::new(store);
-        let err = tool
-            .call(&serde_json::json!({"seq": 3}))
-            .await
-            .unwrap_err();
+        let err = tool.call(&serde_json::json!({"seq": 3})).await.unwrap_err();
         assert!(err.contains("takes no arguments"), "got: {err}");
     }
 }

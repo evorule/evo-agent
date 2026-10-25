@@ -239,7 +239,13 @@ impl CheckpointStore {
 
         if let Some(j) = journal {
             let seq = j
-                .file_checkpoint_taken(&entry.path, &entry.kind, &entry.hash, entry.bytes, &entry.tool)
+                .file_checkpoint_taken(
+                    &entry.path,
+                    &entry.kind,
+                    &entry.hash,
+                    entry.bytes,
+                    &entry.tool,
+                )
                 .map_err(|e| format!("checkpoint journal failed: {e}"))?;
             entry.journal_seq = Some(seq);
         }
@@ -414,10 +420,10 @@ impl CheckpointStore {
             return Ok(());
         }
         self.ensure_dirs()?;
-        let tmp = self.root.join("blobs").join(format!(
-            ".tmp-{}",
-            hex_part(hash)
-        ));
+        let tmp = self
+            .root
+            .join("blobs")
+            .join(format!(".tmp-{}", hex_part(hash)));
         std::fs::write(&tmp, content).map_err(|e| format!("blob write failed: {e}"))?;
         std::fs::rename(&tmp, &path).map_err(|e| format!("blob rename failed: {e}"))
     }
@@ -548,14 +554,21 @@ mod tests {
         assert_eq!(restored, b"hello\r\nold");
         assert_eq!(store.depth(), 0);
         // 弹栈后 blob 引用归零被回收
-        assert!(!store.blob_path(&format!("blake3:{}", blake3::hash(b"hello\r\nold").to_hex())).exists());
+        assert!(!store
+            .blob_path(&format!(
+                "blake3:{}",
+                blake3::hash(b"hello\r\nold").to_hex()
+            ))
+            .exists());
     }
 
     #[test]
     fn tombstone_snapshot_then_undo_removes_file() {
         let (dir, store) = temp_workdir();
         // 目标不存在 → tombstone
-        let pending = store.pre_capture("workspace/new.txt", "file_create").unwrap();
+        let pending = store
+            .pre_capture("workspace/new.txt", "file_create")
+            .unwrap();
         assert_eq!(pending.kind(), KIND_TOMBSTONE);
         assert_eq!(pending.hash(), &evorule_digest_bytes(&[]));
         store.commit(&pending, None).unwrap();
@@ -596,10 +609,14 @@ mod tests {
         let (dir, store) = temp_workdir();
         let big = "x".repeat(40 * 1024 * 1024); // 40MB ×2 = 80MB > 64MB
         write_target(dir.path(), "workspace/big.txt", &big);
-        let p1 = store.pre_capture("workspace/big.txt", "file_write").unwrap();
+        let p1 = store
+            .pre_capture("workspace/big.txt", "file_write")
+            .unwrap();
         store.commit(&p1, None).unwrap();
         write_target(dir.path(), "workspace/big.txt", &format!("{big}y"));
-        let p2 = store.pre_capture("workspace/big.txt", "file_write").unwrap();
+        let p2 = store
+            .pre_capture("workspace/big.txt", "file_write")
+            .unwrap();
         store.commit(&p2, None).unwrap();
         // 总帽 64MB:第二条(41MB)入账后合计超限,最旧被淘汰
         assert_eq!(store.depth(), 1);
@@ -678,7 +695,10 @@ mod tests {
         assert_eq!(kinds, vec!["taken".to_string(), "restored".to_string()]);
         // manifest 行与 journal seq 关联
         let manifest = std::fs::read_to_string(store.manifest_path()).unwrap();
-        assert!(manifest.trim().is_empty(), "stack should be empty after undo");
+        assert!(
+            manifest.trim().is_empty(),
+            "stack should be empty after undo"
+        );
         let _ = jseq;
     }
 
@@ -686,7 +706,10 @@ mod tests {
     fn pre_capture_rejects_paths_outside_writable_dir() {
         let (_dir, store) = temp_workdir();
         let err = store.pre_capture("../evil.txt", "file_write").unwrap_err();
-        assert!(err.contains("..") || err.contains("not allowed"), "got: {err}");
+        assert!(
+            err.contains("..") || err.contains("not allowed"),
+            "got: {err}"
+        );
     }
 
     #[test]

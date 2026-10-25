@@ -71,10 +71,7 @@ impl VerifyConfig {
                 ));
             }
             if cmd.command.trim().is_empty() {
-                return Err(format!(
-                    "verify.commands[{}] command is empty",
-                    cmd.name
-                ));
+                return Err(format!("verify.commands[{}] command is empty", cmd.name));
             }
         }
         Ok(())
@@ -175,10 +172,7 @@ impl VerifyOrchestrator {
 
     /// 轮末执行 pending verify(回喂下一轮前调用);无 pending = None(零开销路径)。
     /// 执行后 pending 复位;verdict 全量入账(journal 可选面)。
-    pub async fn run_pending(
-        &self,
-        journal: Option<&JournalWriter>,
-    ) -> Option<VerdictReport> {
+    pub async fn run_pending(&self, journal: Option<&JournalWriter>) -> Option<VerdictReport> {
         if !self.pending.swap(false, Ordering::SeqCst) {
             return None;
         }
@@ -334,7 +328,8 @@ fn render_observation(v: &CommandVerdict, passed: usize, escalate: bool) -> Stri
         "fail" => {
             text.push_str(&format!(
                 "verify: FAILED (command '{}', exit_code: {})\n",
-                v.command, v.exit_code.unwrap_or(-1)
+                v.command,
+                v.exit_code.unwrap_or(-1)
             ));
             text.push_str(&format!(
                 "errors: {}{}\n",
@@ -349,7 +344,9 @@ fn render_observation(v: &CommandVerdict, passed: usize, escalate: bool) -> Stri
                 text.push_str(l);
                 text.push('\n');
             }
-            text.push_str("Fix the errors above; saving the fix will trigger automatic re-verification.");
+            text.push_str(
+                "Fix the errors above; saving the fix will trigger automatic re-verification.",
+            );
         }
         _ => {
             text.push_str(&format!(
@@ -524,9 +521,10 @@ mod tests {
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("unknown matcher"), "got: {err}");
         // serde 反序列化不拦(装载点 validate 拦)——契约语义单点
-        let raw: VerifyConfig =
-            serde_json::from_value(serde_json::json!({"commands":[{"name":"x","command":"y","matcher":"$go"}]}))
-                .unwrap();
+        let raw: VerifyConfig = serde_json::from_value(
+            serde_json::json!({"commands":[{"name":"x","command":"y","matcher":"$go"}]}),
+        )
+        .unwrap();
         assert!(raw.validate().is_err());
     }
 
@@ -568,7 +566,9 @@ mod tests {
         orch.note_write_success();
         let report = orch.run_pending(None).await.unwrap();
         assert_eq!(report.verdict, "fail");
-        assert!(report.observation.contains("src/a.rs:1:1 error[E0308] mismatched types"));
+        assert!(report
+            .observation
+            .contains("src/a.rs:1:1 error[E0308] mismatched types"));
         assert!(report.observation.contains("automatic re-verification"));
     }
 
@@ -610,9 +610,7 @@ mod tests {
     #[tokio::test]
     async fn consecutive_fails_escalate_at_limit() {
         let outputs = (0..3)
-            .map(|_| {
-                ok_output("src/a.rs:1:1: error[E0308]: boom")
-            })
+            .map(|_| ok_output("src/a.rs:1:1: error[E0308]: boom"))
             .collect();
         let orch = VerifyOrchestrator::new(
             config(vec![("c", "cargo check", "$rustc")]),

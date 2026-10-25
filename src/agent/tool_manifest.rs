@@ -1212,12 +1212,12 @@ mod tests {
     }
 
     /// 原 TOOL_SWITCH_KEYS 快照（tool, key, default_on）；批K 段1 edit_file
-/// 接入 → 32 条（memory_recall/audit_query/memory_tombstone 后续接入，
-/// 历史批注曾滞后于实际行数，20261021 批K 段4 修正口径）；批K 段4
-/// todo_write/todo_read 接入 → 43 条；批K 段5 http_request 接入
-/// （默认关）→ 44 条；批K 段7 ask_user 接入 → 45 条；写面撤销批
-/// workspace_undo 接入（默认开）→ 46 条
-const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
+    /// 接入 → 32 条（memory_recall/audit_query/memory_tombstone 后续接入，
+    /// 历史批注曾滞后于实际行数，20261021 批K 段4 修正口径）；批K 段4
+    /// todo_write/todo_read 接入 → 43 条；批K 段5 http_request 接入
+    /// （默认关）→ 44 条；批K 段7 ask_user 接入 → 45 条；写面撤销批
+    /// workspace_undo 接入（默认开）→ 46 条
+    const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
         ("file_create", "agentTools.fileCreate", true),
         ("edit_file", "agentTools.editFile", true),
         ("web_fetch", "agentTools.webFetch", true),
