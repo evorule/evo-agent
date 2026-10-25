@@ -22,6 +22,8 @@
     "git_status",
     "git_diff",
     "git_log",
+    "git_stage",
+    "git_commit",
     "query_journal",
     "query_trace",
     "read_back",
