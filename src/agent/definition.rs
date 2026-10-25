@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! Agent 瀹氫箟 鈥斺€?浠?agent.json 鍔犺浇 Agent 閰嶇疆
+//! Agent 定义 —— 从 `agent.json` 加载 Agent 配置。
+//! 字段语义以本模块 `AgentDefinition` 及其子结构注释为准；
+//! 实例样例见 `agents/general.json`（运行时缺省定义）。
 
 use std::path::{Path, PathBuf};
 
 use crate::agent::runner::AgentConfig;
 
-/// Agent 瀹氫箟鍔犺浇閿欒
+/// Agent 定义加载错误
 #[derive(Debug)]
 pub enum AgentDefinitionError {
-    /// IO 閿欒
+    /// IO 错误
     Io(std::io::Error),
-    /// JSON 瑙ｆ瀽閿欒
+    /// JSON 解析错误
     Json(serde_json::Error),
-    /// Agent 绫诲瀷鏈壘鍒
+    /// Agent 类型未找到
     NotFound(String),
     /// 定义非法(门卫:取值越界/标识符不合法)
     InvalidDefinition(String),
@@ -103,13 +105,13 @@ impl MessagePersistConfig {
     }
 }
 
-/// 鍐呭瓨閰嶇疆
+/// 内存配置
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryConfig {
     #[serde(rename = "type")]
-    /// 鍐呭瓨绫诲瀷锛堝涓 "none", "persistent"锛
+    /// 内存类型（例如 "none", "persistent"）
     pub memory_type: String,
-    /// 鍐呭瓨鍛藉悕绌洪棿
+    /// 内存命名空间
     pub namespace: String,
     /// 消息持久化配置（用户决策 2：可选开关，默认 `every_message`）
     #[serde(default)]
@@ -1272,10 +1274,10 @@ impl AgentDefinition {
     }
 }
 
-/// Agent 瀹氫箟绠＄悊鍣
+/// Agent 定义管理器
 #[derive(Debug, Clone)]
 pub struct AgentDefinitionManager {
-    /// Agent 瀹氫箟鏂囦欢鎵€鍦ㄧ洰褰
+    /// Agent 定义文件所在目录
     agents_dir: PathBuf,
 }
 
@@ -1873,8 +1875,8 @@ mod tests {
         let json = r#"{
             "agent_type": "simple",
             "version": "1.0.0",
-            "description": "绠€鍗?Agent",
-            "system_prompt": "浣犲ソ",
+            "description": "简单 Agent",
+            "system_prompt": "你好",
             "model": "gpt-4o-mini",
             "temperature": 0.7,
             "max_steps": 10,
@@ -1893,7 +1895,7 @@ mod tests {
         let json = r#"{
             "agent_type": "test_agent",
             "version": "2.0.0",
-            "description": "娴嬭瘯",
+            "description": "测试",
             "system_prompt": "test",
             "model": "gpt-4",
             "temperature": 0.5,
