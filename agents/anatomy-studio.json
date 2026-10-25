@@ -1,0 +1,101 @@
+{
+  "agent_type": "anatomy-studio",
+  "version": "0.3.0",
+  "description": "anatomy 等距图样工作台:通用能力 + anatomy 技能 + sandbox-trusted 执行档(node 放行;仅在本定义会话生效)",
+  "license": "AGPL-3.0-or-later",
+  "system_prompt": "You are a helpful general-purpose assistant. Use tools to accomplish tasks. Be concise and direct. For tasks involving rules or domain knowledge, consult the effective rule set and knowledge base with the rule_* / knowledge_* / audit_get tools instead of guessing. To convert a skill-rule-pack JSON (as produced by tools/skill-adapter) into an execution-domain DatasetBundle, use skill_pack_to_bundle (it always produces a \"fail\"-verdict skeleton bundle; a \"pass\"-verdict bundle can only come from the governance-side bundle_export tool). To turn a rule idea into a draft, validate it with rule_validate first, then create it with rule_create and submit it with rule_submit — drafts always go through human review before taking effect. Execution discipline: to read a known file prefer file_read; to list a directory prefer file_list; use search_files/grep_files only when the location is unknown, and pass dir/exclude to narrow the scope; do the minimum work to satisfy the goal, then answer immediately.",
+  "model": "MiniMax-M3",
+  "temperature": 0.3,
+  "max_steps": 500,
+  "context_window_tokens": 1000000,
+  "step_timeout_secs": 300,
+  "tools": [
+    "file_read",
+    "image_load",
+    "file_list",
+    "file_write",
+    "file_create",
+    "file_move",
+    "file_delete",
+    "search_files",
+    "grep_files",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "query_journal",
+    "query_trace",
+    "read_back",
+    "diff_runs",
+    "shell_exec",
+    "http_get",
+    "ask_user",
+    "python_exec",
+    "rule_list",
+    "rule_get",
+    "rule_versions",
+    "rule_version_get",
+    "rule_validate",
+    "knowledge_datasets",
+    "knowledge_search",
+    "knowledge_entry_get",
+    "bundle_export",
+    "audit_get",
+    "rule_create",
+    "rule_update",
+    "rule_submit",
+    "meta_summary",
+    "evolution_signals",
+    "explain_denial",
+    "causal_order",
+    "lineage_of",
+    "skill_pack_to_bundle",
+    "handover_write",
+    "handover_read",
+    "session_spawn",
+    "delegate",
+    "browser_*",
+    "mcp_*",
+    "inference_*",
+    "edit_file",
+    "web_fetch",
+    "web_search",
+    "todo_write",
+    "todo_read",
+    "code_search"
+  ],
+  "skills": [
+    {
+      "name": "git-discipline",
+      "path": "skills/git-discipline/SKILL.md"
+    },
+    {
+      "name": "evorule-deterministic-compute",
+      "path": "skills/evorule-deterministic-compute/SKILL.md"
+    },
+    {
+      "name": "evorule-deliverable",
+      "path": "skills/evorule-deliverable/SKILL.md"
+    },
+    {
+      "name": "evorule-deep-research",
+      "path": "skills/evorule-deep-research/SKILL.md"
+    },
+    {
+      "name": "anatomy",
+      "path": "skills/anatomy/SKILL.md"
+    }
+  ],
+  "memory": {
+    "type": "persistent",
+    "namespace": "general",
+    "message_persist": {
+      "mode": "every_message"
+    },
+    "max_session_summaries": 3,
+    "max_injected_events": 5,
+    "enable_event_extraction": true,
+    "summary_model": "MiniMax-M3",
+    "lex_store": "data/lex/general.db"
+  },
+  "execution_profile": "sandbox-trusted"
+}
