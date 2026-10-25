@@ -310,7 +310,7 @@ async fn test_openai_tools_payload_dynamic_service_schema_carries_parameters() {
 
 #[tokio::test]
 async fn test_openai_tools_payload_excludes_unwired_placeholders() {
-    use crate::builtin_tools::todo::{TodoState, TodoReadTool, TodoWriteTool};
+    use crate::builtin_tools::todo::{TodoReadTool, TodoState, TodoWriteTool};
     use std::sync::Arc;
 
     let mut handler = make_handler_with(&["echo"]);
@@ -320,7 +320,8 @@ async fn test_openai_tools_payload_excludes_unwired_placeholders() {
             .expect("todo_write static manifest");
     handler.register(
         todo_write_manifest,
-        Arc::new(TodoWriteTool::unwired()) as Arc<dyn crate::io_handlers::tool_handler::ToolFunction>,
+        Arc::new(TodoWriteTool::unwired())
+            as Arc<dyn crate::io_handlers::tool_handler::ToolFunction>,
     );
     let client = make_test_client();
     let mut runner = AgentRunner::new(AgentConfig::default(), client);
@@ -336,9 +337,7 @@ async fn test_openai_tools_payload_excludes_unwired_placeholders() {
         "占位 todo_write 不得出现在 LLM 契约"
     );
     assert!(
-        payload
-            .iter()
-            .any(|t| t["function"]["name"] == "echo"),
+        payload.iter().any(|t| t["function"]["name"] == "echo"),
         "普通工具不受影响"
     );
 
@@ -2554,6 +2553,7 @@ fn test_g15_rec_to_message_system() {
         tool_calls: None,
         tool_name: None,
         timestamp: 0,
+        reasoning: None,
         fact_id: None,
     };
     let msg =
@@ -2570,6 +2570,7 @@ fn test_g15_rec_to_message_user() {
         tool_calls: None,
         tool_name: None,
         timestamp: 0,
+        reasoning: None,
         fact_id: None,
     };
     let msg =
@@ -2589,6 +2590,7 @@ fn test_g15_rec_to_message_assistant_with_tool_calls() {
         tool_calls: Some(tool_calls_json),
         tool_name: None,
         timestamp: 0,
+        reasoning: None,
         fact_id: None,
     };
     let msg =
@@ -2616,6 +2618,7 @@ fn test_g15_rec_to_message_assistant_without_tool_calls() {
         tool_calls: None,
         tool_name: None,
         timestamp: 0,
+        reasoning: None,
         fact_id: None,
     };
     let msg =
@@ -2633,6 +2636,27 @@ fn test_g15_rec_to_message_assistant_without_tool_calls() {
 }
 
 #[test]
+fn test_g15_rec_with_reasoning_strips_for_replay_and_wire() {
+    // 思考留痕不回喂契约:MessageRecord.reasoning 仅展示链路(transcript/快照
+    // REST 读);G15 投影到 Message 后,序列化形状(即 LLM wire 组装输入)不含
+    // reasoning——思考不进上下文、不上 wire。
+    let rec = MessageRecord {
+        idx: 2,
+        role: "assistant".to_string(),
+        content: "answer".to_string(),
+        tool_calls: None,
+        tool_name: None,
+        reasoning: Some("thinking...".to_string()),
+        timestamp: 0,
+        fact_id: None,
+    };
+    let msg =
+        rec_to_message(&rec, recipe_tool_result_max_chars()).expect("assistant rec should convert");
+    let wire = serde_json::to_value(&msg).unwrap();
+    assert!(wire.get("reasoning").is_none(), "回放形状不得含 reasoning");
+}
+
+#[test]
 fn test_g15_rec_to_message_tool() {
     let rec = MessageRecord {
         idx: 3,
@@ -2641,6 +2665,7 @@ fn test_g15_rec_to_message_tool() {
         tool_calls: None,
         tool_name: Some("search".to_string()),
         timestamp: 0,
+        reasoning: None,
         fact_id: None,
     };
     let msg =
@@ -2665,6 +2690,7 @@ fn test_g15_rec_to_message_tool_long_content_truncated() {
         tool_calls: None,
         tool_name: Some("search".to_string()),
         timestamp: 0,
+        reasoning: None,
         fact_id: None,
     };
     let msg = rec_to_message(&rec, max_chars).expect("tool rec should convert");
@@ -2692,6 +2718,7 @@ fn test_g15_rec_to_message_tool_missing_name() {
         tool_calls: None,
         tool_name: None,
         timestamp: 0,
+        reasoning: None,
         fact_id: None,
     };
     assert!(
@@ -2709,6 +2736,7 @@ fn test_g15_rec_to_message_unknown_role() {
         tool_calls: None,
         tool_name: None,
         timestamp: 0,
+        reasoning: None,
         fact_id: None,
     };
     assert!(
@@ -4979,6 +5007,7 @@ fn test_s4b_rec_to_message_user_restores_images() {
         tool_calls: None,
         tool_name: None,
         timestamp: 0,
+        reasoning: None,
         fact_id: None,
     };
     let msg = rec_to_message(&rec, 10_000).expect("user rec must convert");
@@ -4999,6 +5028,7 @@ fn test_s4b_rec_to_message_user_restores_images() {
         tool_calls: None,
         tool_name: None,
         timestamp: 0,
+        reasoning: None,
         fact_id: None,
     };
     let msg = rec_to_message(&plain, 10_000).unwrap();

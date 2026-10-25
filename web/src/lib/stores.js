@@ -9,6 +9,7 @@ import {
   getAgentDef,
   getEvolutionSignals,
   getWorkbenchSettings,
+  getTranscript,
   gitStatus as fetchGitStatus,
   gitDiff,
 } from './api.js';
@@ -75,29 +76,44 @@ export async function refreshSessions() {
   }
 }
 
-/** MessageRecord(evorule 投影)→ UI 消息 */
+/** MessageRecord(evorule 投影)→ UI 消息;带 tool_calls 的 assistant 记录
+ *  返回数组:[叙述文字气泡(content 非空时,不丢引擎已落库的叙述)] + 调用卡。
+ *  调用卡无结果时 result 不设键(undefined)——配合模板「无结果回退显示 args」,
+ *  历史回灌不得出现字面量 "null" 渲染。reasoning(思考留痕)挂到 assistant
+ *  气泡的 thinking 字段,历史思考卡(收起态)由此渲染。 */
 export function recordToMessage(r) {
   if (r.role === 'user') {
     return { kind: 'user', text: r.content };
   }
   if (r.role === 'assistant') {
+    const reasoning = typeof r.reasoning === 'string' && r.reasoning ? r.reasoning : undefined;
+    let calls = [];
     if (r.tool_calls) {
-      // 有工具调用的 assistant 消息:每个调用一张完成态工具卡
-      let calls = [];
       try {
         calls = Array.isArray(r.tool_calls) ? r.tool_calls : [r.tool_calls];
       } catch {
         calls = [];
       }
-      return calls.map((c) => ({
-        kind: 'tool',
-        name: c?.name || c?.function?.name || 'tool',
-        args: c?.arguments ?? c?.function?.arguments ?? null,
-        result: null,
-        running: false,
-      }));
     }
-    return { kind: 'assistant', text: r.content };
+    const cards = calls.map((c) => ({
+      kind: 'tool',
+      // 键形态兼容三源:引擎持久化(serde rename → tool_name/args)/
+      // 内部名(name/arguments)/OpenAI wire 形状(function.name/.arguments)
+      name: c?.tool_name ?? c?.name ?? c?.function?.name ?? 'tool',
+      args: c?.args ?? c?.arguments ?? c?.function?.arguments ?? null,
+      running: false,
+    }));
+    if (cards.length === 0) {
+      return { kind: 'assistant', text: r.content, thinking: reasoning };
+    }
+    if (typeof r.content === 'string' && r.content.trim()) {
+      return [{ kind: 'assistant', text: r.content, thinking: reasoning }, ...cards];
+    }
+    if (reasoning) {
+      // 仅思考无叙述:思考卡单独成行(不丢)
+      return [{ kind: 'assistant', text: '', thinking: reasoning }, ...cards];
+    }
+    return cards;
   }
   if (r.role === 'tool') {
     return {
@@ -111,11 +127,75 @@ export function recordToMessage(r) {
   return null; // system 等不渲染
 }
 
-/** 历史消息回灌(清空当前消息,按投影顺序渲染) */
+/** 调用卡/结果卡配对合并(transcript 投影收口):assistant.tool_calls 投影出的
+ *  调用卡(有 args 无 result)与紧随的 tool 结果记录(有 result 无 args)按
+ *  「工具名+顺序(FIFO)」合并为一卡(args+result 两段齐备,与实时一卡形态一致)。
+ *  配不上的各自保留(孤立结果卡原样、未收结果调用卡 result 保持 undefined),
+ *  不丢任何信息。非工具消息不参与配对(叙述气泡可夹在中间)。原地改写调用卡。 */
+export function mergeToolPairs(entries) {
+  const out = [];
+  const pending = []; // 待收结果的调用卡,FIFO
+  for (const m of entries) {
+    if (m && m.kind === 'tool') {
+      if (m.result == null && m.args != null) {
+        pending.push(m);
+        out.push(m);
+        continue;
+      }
+      if (m.result != null) {
+        const idx = pending.findIndex((c) => c.name === m.name);
+        if (idx >= 0) {
+          pending.splice(idx, 1)[0].result = m.result; // 合并进调用卡,结果卡丢弃
+          continue;
+        }
+      }
+    }
+    out.push(m);
+  }
+  return out;
+}
+
+/** 历史消息回灌(清空当前消息,按投影顺序渲染;工具调用/结果配对合并) */
 export function loadTranscriptInto(records) {
+  transcriptSource = Array.isArray(records) ? [...records] : [];
+  projectTranscript();
+}
+
+/** transcript 分页状态:更早侧还有未加载页(「加载更早消息」按钮数据源) */
+export const transcriptHasMore = writable(false);
+
+/** transcript 首拉页大小(超过部分走「加载更早消息」游标续拉) */
+export const TRANSCRIPT_PAGE_SIZE = 200;
+
+/** 已回灌的源记录(分页累积,重投影数据源) */
+let transcriptSource = [];
+
+/** 加载更早一页:按当前最旧 idx 取游标页,前插进源记录后整体重投影
+ *  (重投影保证跨页的调用/结果配对仍成立);返回 has_more。 */
+export async function loadOlderTranscript(sessionId) {
+  const oldestIdx = transcriptSource.find((r) => typeof r.idx === 'number')?.idx;
+  if (!sessionId || !Number.isFinite(oldestIdx)) return false;
+  const res = await getTranscript(sessionId, {
+    limit: TRANSCRIPT_PAGE_SIZE,
+    beforeIdx: oldestIdx,
+  });
+  const older = Array.isArray(res.messages) ? res.messages : [];
+  if (older.length === 0) {
+    transcriptHasMore.set(false);
+    return false;
+  }
+  transcriptSource = [...older, ...transcriptSource];
+  projectTranscript();
+  const hasMore = !!res.has_more;
+  transcriptHasMore.set(hasMore);
+  return hasMore;
+}
+
+/** 源记录 → 投影+配对合并+重编号,一次性落入 messages store */
+function projectTranscript() {
   let id = 0;
   const out = [];
-  for (const r of records) {
+  for (const r of transcriptSource) {
     const m = recordToMessage(r);
     if (Array.isArray(m)) {
       for (const item of m) out.push({ id: ++id, ...item });
@@ -123,8 +203,7 @@ export function loadTranscriptInto(records) {
       out.push({ id: ++id, ...m });
     }
   }
-  // seq 接到全局序号之后,避免与实时消息 id 冲突
-  messages.set(out);
+  messages.set(mergeToolPairs(out));
   if (out.length > 0) seq = Math.max(seq, id);
 }
 

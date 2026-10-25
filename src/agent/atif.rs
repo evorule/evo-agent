@@ -1324,6 +1324,7 @@ mod tests {
             tool_calls: None,
             tool_name: None,
             timestamp: 0,
+            reasoning: None,
             fact_id: None,
         }
     }

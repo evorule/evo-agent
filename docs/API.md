@@ -29,6 +29,8 @@
 - [9. 端到端完整示例](#9-端到端完整示例)
 - [10. 错误处理](#10-错误处理)
 - [11. 限制与边界](#11-限制与边界)
+- [12. MCP 协议(G12)](#12-mcp-协议g12)
+- [13. 会话消息历史(transcript)](#13-会话消息历史transcript)
 
 ---
 
@@ -93,6 +95,7 @@ press Ctrl+C to shut down
 | POST | `/agents/{agent_type}/run/stream` | SSE 流式执行,逐 token 返回 LLM 输出 | G4 |
 | POST | `/agents/{agent_type}/cancel?session_id=xxx` | 取消正在运行的 session | G6 |
 | GET | `/api/sessions` | 列出历史 session(运行记录) | — |
+| GET | `/api/sessions/{id}/transcript` | 会话消息历史(两级取历史;支持 limit+before_idx 游标分页) | — |
 
 **Base URL**: `http://127.0.0.1:8081`(默认)
 
@@ -1234,6 +1237,50 @@ ToolHandler.register_tool("mcp_filesystem_read_file", adapter)
                               ▼  JSON-RPC 2.0
                         StdioTransport  ──►  MCP server 子进程 (stdin/stdout)
 ```
+
+---
+
+## 13. 会话消息历史(transcript)
+
+读取某会话的消息历史投影。数据源两级:活投影(消息已持久化进 evorule payload facts)优先,会话被闲置回收后回落 serve 本地快照(`source: "snapshot"`,非权威副本)。
+
+```
+GET /api/sessions/{id}/transcript?agent_type=general&limit=200&before_idx=123
+```
+
+| 参数 | 说明 |
+|------|------|
+| `agent_type` | 可选;缺省从会话索引回查,再缺省 `general`(决定记忆 namespace) |
+| `limit` | 可选;单页条数上限,自最新端截取。缺省不传=全量 |
+| `before_idx` | 可选;游标,仅返回消息序号小于该值的部分(配合 `limit` 做「加载更早」翻页) |
+
+响应:
+
+```json
+{
+  "session_id": "…",
+  "agent_type": "general",
+  "namespace": "general",
+  "source": "live",
+  "count": 3,
+  "has_more": false,
+  "messages": [
+    {"idx": 0, "role": "user", "content": "…", "timestamp": 1761000000},
+    {"idx": 1, "role": "assistant", "content": "…",
+     "tool_calls": [{"tool_name": "file_read", "args": {"path": "a.md"}}],
+     "reasoning": "思考过程留痕(仅展示链路;可选,非思考模型无此键)",
+     "timestamp": 1761000001},
+    {"idx": 2, "role": "tool", "tool_name": "file_read", "content": "…", "timestamp": 1761000002}
+  ]
+}
+```
+
+说明:
+
+- `messages` 按消息序号升序;同序号后写覆盖先写(last-write-wins)。
+- `reasoning` 为推理模型的思考过程留痕,**仅展示链路**——续话回放与 LLM 请求组装不包含该字段,思考不回喂模型;旧会话记录无此键。
+- `has_more: true` 表示应用 `limit`/`before_idx` 后更早侧仍有未取消息;以本页最旧一条的 `idx` 作为下一页 `before_idx` 即可翻页。
+- 会话在引擎侧失效(闲置回收)时响应回落快照源,`authoritative: false` 明示非权威副本。
 
 ---
 

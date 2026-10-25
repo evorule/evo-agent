@@ -1137,7 +1137,7 @@ pub struct AgentRunner {
     ///
     /// 元组 `(idx, Message)` 中 idx 是消息在 `messages` 数组中的索引，
     /// 也是 evorule payload path 的最后一段（`messages.{idx}`）。
-    pending_messages: Vec<(usize, Message)>,
+    pending_messages: Vec<(usize, Message, Option<String>)>,
     /// 摘要模型名称（用户决策 3：单独配置 summary_model）
     ///
     /// P4 阶段用于记忆压缩。P0+P1 阶段仅存储不使用。
@@ -2698,25 +2698,42 @@ impl AgentRunner {
         idx: usize,
         message: Message,
     ) -> Result<(), AgentError> {
+        self.persist_message_with_reasoning(session_id, idx, message, None)
+            .await
+    }
+
+    /// 持久化消息（带思考留痕）：reasoning 仅 assistant 消息持久化点传入，
+    /// 落 evorule payload facts 供展示链路读取；缓冲模式随三元组携带，
+    /// flush 时批量写入。思考不入会话消息（Message 无此字段），续话回放
+    /// 与 LLM wire 组装天然不见。
+    async fn persist_message_with_reasoning(
+        &mut self,
+        session_id: &str,
+        idx: usize,
+        message: Message,
+        reasoning: Option<String>,
+    ) -> Result<(), AgentError> {
         if self.message_persist_mode.is_disabled() || self.memory.is_none() {
             return Ok(());
         }
         match self.message_persist_mode {
             MessagePersistMode::EveryMessage => {
                 if let Some(memory) = self.memory.as_mut() {
-                    memory.append_message(session_id, idx, &message).await?;
+                    memory
+                        .append_message_with_reasoning(session_id, idx, &message, reasoning)
+                        .await?;
                 }
                 Ok(())
             }
             MessagePersistMode::EveryN(n) => {
-                self.pending_messages.push((idx, message));
+                self.pending_messages.push((idx, message, reasoning));
                 if self.pending_messages.len() >= n {
                     self.flush_messages(session_id).await?;
                 }
                 Ok(())
             }
             MessagePersistMode::PerReactRound => {
-                self.pending_messages.push((idx, message));
+                self.pending_messages.push((idx, message, reasoning));
                 Ok(())
             }
             MessagePersistMode::Disabled => Ok(()),
@@ -2735,7 +2752,8 @@ impl AgentRunner {
         if self.pending_messages.is_empty() || self.memory.is_none() {
             return Ok(());
         }
-        let drained: Vec<(usize, Message)> = std::mem::take(&mut self.pending_messages);
+        let drained: Vec<(usize, Message, Option<String>)> =
+            std::mem::take(&mut self.pending_messages);
         if let Some(memory) = self.memory.as_mut() {
             // &Vec<T> 自动 coercion 为 &[T]
             memory.append_messages_batch(session_id, &drained).await?;
@@ -4538,6 +4556,13 @@ impl AgentRunner {
         }
         let llm_result = llm_result?;
 
+        // 思考留痕:归一化五键形状的第五键 reasoning 仅展示链路——随 assistant
+        // 消息持久化留痕,不进会话消息(LlmResponse 无此字段,回放/wire 不见)
+        let llm_reasoning = llm_result
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let llm_response: LlmResponse = serde_json::from_str(&llm_result.to_string())
             .map_err(|e| AgentError::Internal(format!("parse LLM response: {}", e)))?;
 
@@ -4569,15 +4594,20 @@ impl AgentRunner {
                     self.output_format_retries += 1;
                     let retry_count = self.output_format_retries;
 
-                    // 推送原始(未清洗)assistant 消息到审计链
+                    // 推送原始(未清洗)assistant 消息到审计链(带思考留痕)
                     let assistant_idx = messages.len();
                     let assistant_msg = Message::Assistant {
                         content: llm_response.content.clone(),
                         tool_calls: llm_response.tool_calls.clone(),
                     };
                     messages.push(assistant_msg.clone());
-                    self.persist_message(session_id, assistant_idx, assistant_msg)
-                        .await?;
+                    self.persist_message_with_reasoning(
+                        session_id,
+                        assistant_idx,
+                        assistant_msg,
+                        reasoning_opt(&llm_reasoning),
+                    )
+                    .await?;
 
                     // 推送 System 校正消息
                     let correction_idx = messages.len();
@@ -4645,9 +4675,14 @@ impl AgentRunner {
             tool_calls: effective_tool_calls.clone(),
         };
         messages.push(assistant_msg.clone());
-        // P0: 持久化 assistant 消息
-        self.persist_message(session_id, assistant_idx, assistant_msg)
-            .await?;
+        // P0: 持久化 assistant 消息(带思考留痕,仅展示链路)
+        self.persist_message_with_reasoning(
+            session_id,
+            assistant_idx,
+            assistant_msg,
+            reasoning_opt(&llm_reasoning),
+        )
+        .await?;
 
         // G13:并行预执行工具(max_parallel_tools > 1 且有多个 tool_calls 时)
         // 预执行=管道并行实例(PR-3):产物=已过闸结果,存入 parallel_tool_cache,
@@ -5065,15 +5100,14 @@ impl AgentRunner {
         let Some(pending) = pending else {
             return;
         };
-        let attach_failed =
-            |value: &mut Value, reason: &str| {
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert(
-                        "checkpoint".to_string(),
-                        Value::String(format!("failed:{}", reason)),
-                    );
-                }
-            };
+        let attach_failed = |value: &mut Value, reason: &str| {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "checkpoint".to_string(),
+                    Value::String(format!("failed:{}", reason)),
+                );
+            }
+        };
         match pending {
             Ok(p) => {
                 // ⑦ 失败 = 无写落盘(工具原子写语义),丢弃 pending 快照
@@ -7615,6 +7649,10 @@ impl AgentRunner {
                                                let llm_start = std::time::Instant::now();
                                                let mut llm_stream = runner.llm_handler.execute_stream(&call_params_json);
                                                let mut full_content = String::new();
+                                               // 思考留痕:流式所有 reasoning(真流式帧/legacy 整包
+                                               // 合成/终帧安全网补发)统一经 ThinkingDelta 下行,
+                                               // 此处随步累积,随 assistant 消息持久化(仅展示链路)
+                                               let mut full_reasoning = String::new();
                                                let mut full_tool_calls: Option<Vec<crate::agent::translator::ToolCall>> = None;
                                                let mut finish_reason: Option<String> = None;
                                                // B21:provider token 真值(Done chunk 采集,llm_called 埋点消费)
@@ -7667,8 +7705,10 @@ impl AgentRunner {
                                                            yield Ok(AgentEvent::LlmDelta { text });
                                                        }
                                                        Ok(StreamChunk::ThinkingDelta(text)) => {
-                                                           // 思考增量:仅事件下行(展示链路),
-                                                           // 不积累不持久化(设计裁定)
+                                                           // 思考增量:事件下行(展示链路)随步累积+
+                                                           // 随 assistant 消息持久化留痕;不入会话
+                                                           // 消息,续话回放/wire 组装不见(G15 剥离)
+                                                           full_reasoning.push_str(&text);
                                                            yield Ok(AgentEvent::LlmThinkingDelta { text });
                                                        }
                                                        Ok(StreamChunk::ToolCallDelta { .. }) => {
@@ -7842,7 +7882,7 @@ impl AgentRunner {
                                                                                            if runner.output_format_retries < max_retries {
                                                                                                runner.output_format_retries += 1;
                                                                                                let retry_count = runner.output_format_retries;
-                                                                                               // 推原始(未清洗) assistant 到审计链
+                                                                                               // 推原始(未清洗) assistant 到审计链(带思考留痕)
                                                                                                let a_idx = messages.len();
                                                                                                let a_msg = Message::Assistant {
                                                                                                    content: full_content.clone(),
@@ -7850,7 +7890,12 @@ impl AgentRunner {
                                                                                                };
                                                                                                messages.push(a_msg.clone());
                                                                                                if let Err(pe) = runner
-                                                                                                   .persist_message(&session_id, a_idx, a_msg)
+                                                                                                   .persist_message_with_reasoning(
+                                                                                                       &session_id,
+                                                                                                       a_idx,
+                                                                                                       a_msg,
+                                                                                                       reasoning_opt(&full_reasoning),
+                                                                                                   )
                                                                                                    .await
                                                                                                {
                                                                                                    if let Some(rid) = request_id {
@@ -7922,7 +7967,7 @@ impl AgentRunner {
                                                                                    tool_calls: full_tool_calls.clone(),
                                                                                };
                                                                                messages.push(assistant_msg.clone());
-                                               if let Err(e) = runner.persist_message(&session_id, assistant_idx, assistant_msg).await {
+                                               if let Err(e) = runner.persist_message_with_reasoning(&session_id, assistant_idx, assistant_msg, reasoning_opt(&full_reasoning)).await {
                                                    // 持久化失败也不留悬挂在途 io_request(回写后终止)
                                                    if let Some(rid) = request_id {
                                                        let err_str = e.to_string();
@@ -8894,6 +8939,15 @@ impl AgentRunner {
     }
 }
 
+/// 思考留痕入参收敛:空串归一为 None(非思考模型零增量,记录不带空字段)
+fn reasoning_opt(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
 /// G15:将 `MessageRecord` 转换回 `Message`(continuation 历史加载用)
 ///
 /// 返回 `None` 的情况:
@@ -8918,6 +8972,8 @@ fn rec_to_message(rec: &MessageRecord, max_chars: usize) -> Option<Message> {
             })
         }
         "assistant" => {
+            // 思考留痕不在此投影:MessageRecord.reasoning 仅展示链路(transcript/
+            // 快照 REST 读),续话回放与 LLM wire 组装天然不见——思考不回喂
             let tool_calls = rec.tool_calls.as_ref().and_then(|v| {
                 serde_json::from_value::<Vec<crate::agent::translator::ToolCall>>(v.clone()).ok()
             });

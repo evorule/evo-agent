@@ -25,50 +25,65 @@ describe('looksLikeDeadSession', () => {
 });
 
 describe('buildRebuildBlock', () => {
-  it('角色过滤 + 时间正序 + 头尾标记', () => {
+  it('system 剔除 + tool 以名称+摘要入块 + 时间正序 + 头尾标记', () => {
     const block = buildRebuildBlock([
       { role: 'system', content: 'sys prompt' },
       { role: 'user', content: 'u1' },
       { role: 'assistant', content: 'a1' },
-      { role: 'tool', content: 'tool out' },
+      { role: 'tool', tool_name: 'file_read', content: 'tool out' },
       { role: 'user', content: 'u2' },
     ]);
     expect(block.startsWith('[会话重建回注]')).toBe(true);
     expect(block).toContain('<recovered_history>');
     expect(block).toContain('</recovered_history>');
     expect(block).not.toContain('sys prompt');
-    expect(block).not.toContain('tool out');
+    expect(block).toContain('[tool:file_read] tool out');
     const u1 = block.indexOf('[user] u1');
     const a1 = block.indexOf('[assistant] a1');
+    const t1 = block.indexOf('[tool:file_read] tool out');
     const u2 = block.indexOf('[user] u2');
     expect(u1).toBeGreaterThanOrEqual(0);
-    expect(u1 < a1 && a1 < u2).toBe(true);
+    expect(u1 < a1 && a1 < t1 && t1 < u2).toBe(true);
   });
 
-  it('单条 1500 字符截断(按字符数)', () => {
-    const block = buildRebuildBlock([{ role: 'user', content: 'x'.repeat(3000) }]);
-    expect(block).toContain('x'.repeat(1500));
-    expect(block).not.toContain('x'.repeat(1501));
+  it('assistant 带 tool_calls → 调用轮廓行(工具名三源兼容)', () => {
+    const block = buildRebuildBlock([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          { tool_name: 'file_read', args: { path: 'a' } },
+          { name: 'shell_exec', args: { command: 'ls' } },
+        ],
+      },
+    ]);
+    expect(block).toContain('[assistant] (随后调用 file_read、shell_exec)');
   });
 
-  it('总预算 6000 字符,自最新往回收集(25×500 → 恰收 12 条)', () => {
-    const msgs = Array.from({ length: 25 }, (_, i) => ({
+  it('单行 4000 字符截断(按字符数)', () => {
+    const block = buildRebuildBlock([{ role: 'user', content: 'x'.repeat(8000) }]);
+    expect(block).toContain('x'.repeat(4000));
+    expect(block).not.toContain('x'.repeat(4001));
+  });
+
+  it('总预算 24000 字符,自最新往回收集(100×500 → 恰收 48 行)', () => {
+    const msgs = Array.from({ length: 100 }, (_, i) => ({
       role: 'user',
       content: `m${String(i).padStart(2, '0')}${'y'.repeat(497)}`,
     }));
     const block = buildRebuildBlock(msgs);
     const picked = block.split('\n').filter((l) => l.startsWith('[user] m')).length;
-    expect(picked).toBe(12);
-    expect(block).toContain('[user] m24');
-    expect(block).toContain('[user] m13');
-    expect(block).not.toContain('[user] m12');
+    expect(picked).toBe(48);
+    expect(block).toContain('[user] m99');
+    expect(block).toContain('[user] m52');
+    expect(block).not.toContain('[user] m51');
   });
 
   it('空/非法输入退化为空块', () => {
     const empty = buildRebuildBlock([]);
     expect(empty).toContain('<recovered_history>\n</recovered_history>');
     expect(buildRebuildBlock(null)).toBe(empty);
-    expect(buildRebuildBlock([{ role: 'tool', content: 'x' }])).toBe(empty);
+    expect(buildRebuildBlock([{ role: 'system', content: 'x' }])).toBe(empty);
   });
 });
 

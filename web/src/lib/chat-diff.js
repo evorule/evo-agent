@@ -10,13 +10,18 @@ const DIFF_LINE_CAP = 800;
 /**
  * 从工具卡消息提取 diff 输入(前端解析收口)。
  * args 兼容三种形态:JSON 字符串(ws.js safeJson 存储形态)/对象(历史
- * transcript arguments)/null。仅 edit_file 且 old_string/new_string 均为
- * 字符串时可 diff;其余(file_write 整文件写、历史卡 args 缺失)返回 null。
+ * transcript arguments)/null。
+ * - edit_file:old_string/new_string 均为字符串时可 diff(与基线参数无关);
+ * - file_write:写入内容取 args.content,基线取第二参数(产物链草稿基线,
+ *   有基线 → 基线→新全文的行级 diff;无基线(首写/跨会话)→ null 降级,
+ *   写入内容经工具卡动作段(args)展示);
+ * 其余工具返回 null。
  * @param {{name?: string, args?: any}} msg 工具卡消息
+ * @param {string|null} [baseline] file_write 的旧文基线(草稿快照)
  * @returns {{oldText: string, newText: string} | null}
  */
-export function toolDiffPayload(msg) {
-  if (!msg || msg.name !== 'edit_file') return null;
+export function toolDiffPayload(msg, baseline = null) {
+  if (!msg) return null;
   const raw = msg.args;
   let a = raw;
   if (typeof raw === 'string') {
@@ -27,10 +32,17 @@ export function toolDiffPayload(msg) {
     }
   }
   if (!a || typeof a !== 'object') return null;
-  const o = a.old_string;
-  const n = a.new_string;
-  if (typeof o !== 'string' || typeof n !== 'string') return null;
-  return { oldText: o, newText: n };
+  if (msg.name === 'edit_file') {
+    const o = a.old_string;
+    const n = a.new_string;
+    if (typeof o !== 'string' || typeof n !== 'string') return null;
+    return { oldText: o, newText: n };
+  }
+  if (msg.name === 'file_write') {
+    if (typeof baseline !== 'string' || typeof a.content !== 'string') return null;
+    return { oldText: baseline, newText: a.content };
+  }
+  return null;
 }
 
 /**

@@ -16,6 +16,8 @@ import {
   updateMessage,
   refreshSessions,
   loadTranscriptInto,
+  transcriptHasMore,
+  TRANSCRIPT_PAGE_SIZE,
   pushPanelEvent,
   refreshGovBadges,
   registerArtifact,
@@ -318,11 +320,12 @@ export function newSession() {
   sessionId.set(null);
   localStorage.removeItem('evo_session_id');
   messages.set([]);
+  transcriptHasMore.set(false);
   clearArtifacts();
   connect('new');
 }
 
-/** 打开历史会话:断开 → 回灌消息 → 按数据源分流连接(继续对话) */
+/** 打开历史会话:断开 → 回灌消息(首页,余量走「加载更早消息」游标续拉) → 按数据源分流连接(继续对话) */
 export async function openSession(sid) {
   if (!sid || sid === get(sessionId)) return;
   pendingResume = false;
@@ -332,11 +335,13 @@ export async function openSession(sid) {
   loadArtifacts(sid); // S4:恢复该会话的产物留痕(草稿基线/定稿状态)
   disconnect();
   messages.set([]);
+  transcriptHasMore.set(false);
   connStatus.set('connecting');
   let targetSid = sid;
   try {
-    const res = await getTranscript(sid);
+    const res = await getTranscript(sid, { limit: TRANSCRIPT_PAGE_SIZE });
     loadTranscriptInto(res.messages || []);
+    transcriptHasMore.set(!!res.has_more);
     if (res.source === 'snapshot') {
       // B17:快照源=引擎会话必死(30min 闲置 TTL 回收)——主动重建而非连
       // 死会话:历史回显保留,新引擎会话在下一发消息时前缀回注历史块,
@@ -351,10 +356,10 @@ export async function openSession(sid) {
       targetSid = 'new';
       pushMessage({
         kind: 'info',
-        text: `已恢复历史会话(${res.count ?? 0} 条消息,本地快照副本——已就绪新引擎会话,继续对话即可)`,
+        text: `已恢复历史会话(${pageHint(res)}本地快照副本——已就绪新引擎会话,继续对话即可)`,
       });
     } else {
-      pushMessage({ kind: 'info', text: `已恢复历史会话(${res.count ?? 0} 条消息)` });
+      pushMessage({ kind: 'info', text: `已恢复历史会话(${pageHint(res)})` });
     }
   } catch (e) {
     pushMessage({
@@ -363,6 +368,12 @@ export async function openSession(sid) {
     });
   }
   connect(targetSid);
+}
+
+/** 分页语义的恢复提示:截断页明示余量(全量则维持旧文案) */
+function pageHint(res) {
+  const n = res.count ?? 0;
+  return res.has_more ? `最近 ${n} 条,更早请点「加载更早消息」` : `${n} 条消息`;
 }
 
 /**
@@ -441,26 +452,26 @@ function handleFrame(f) {
       break;
     case 'LlmThinkingDelta':
       // 真流式思考增量(reasoning):累积到当前流式气泡的 thinking 字段。
-      // 思考不入正文、不持久化转录(与 CLI stderr 暗色输出同面)。
-      if (streamMsgId !== null) {
-        appendThinking(f.text);
-      }
+      // 思考不入正文、不持久化转录(与 CLI stderr 暗色输出同面);气泡为空
+      // 时懒建(工具后的新思考段由此归入新段,不丢)。
+      appendThinking(f.text);
       break;
     case 'LlmDelta':
       // 首个非思考帧到达即收思考流(面板折叠条固化耗时);思考可再续帧,
       // closeThinking 幂等(thinkingEndedAt 已置不再改)
       closeThinking();
-      if (streamMsgId !== null) {
-        appendToStream(f.text);
-      }
+      appendToStream(f.text);
       break;
     case 'ToolCall': {
       closeThinking();
+      sealStreamBubble(); // 轮内分段:固化当前叙述段,后续内容帧懒建新段
       toolStartedAt = Date.now();
+      const cappedArgs = cappedJson(f.args, TOOL_PAYLOAD_CAP);
       lastToolMsgId = pushMessage({
         kind: 'tool',
         name: f.name,
-        args: safeJson(f.args, TOOL_PAYLOAD_CAP),
+        args: cappedArgs.text,
+        argsMeta: cappedArgs.truncated ? { originalLen: cappedArgs.originalLen } : null,
         running: true,
         startedAt: toolStartedAt,
       });
@@ -480,7 +491,12 @@ function handleFrame(f) {
     }
     case 'ToolResult': {
       if (lastToolMsgId !== null) {
-        const patch = { running: false, result: safeJson(f.result, TOOL_PAYLOAD_CAP) };
+        const cappedResult = cappedJson(f.result, TOOL_PAYLOAD_CAP);
+        const patch = {
+          running: false,
+          result: cappedResult.text,
+          resultMeta: cappedResult.truncated ? { originalLen: cappedResult.originalLen } : null,
+        };
         if (toolStartedAt) patch.tookMs = Date.now() - toolStartedAt;
         updateMessage(lastToolMsgId, patch);
         lastToolMsgId = null;
@@ -628,17 +644,44 @@ function handleFrame(f) {
   }
 }
 
+/** 轮内分段懒建:流式气泡在首个内容帧(思考/文本)到达且当前无在段时创建——
+ *  ToolCall 固化在段并置空游标,每段叙述独立成泡,与工具卡按引擎事件时序交错
+ *  (替代旧「一轮一泡跨 step 合并」形态)。 */
+function ensureStreamBubble() {
+  if (streamMsgId === null) {
+    streamMsgId = pushMessage({ kind: 'assistant', text: '', streaming: true });
+  }
+}
+
+/** 固化当前叙述段:有内容/思考则停游标保留,空泡(纯工具轮的占位)直接移除 */
+function sealStreamBubble() {
+  if (streamMsgId === null) return;
+  const sid = streamMsgId;
+  streamMsgId = null;
+  messages.update((arr) => {
+    const seg = arr.find((m) => m.id === sid);
+    if (seg && !seg.text && !seg.thinking) {
+      return arr.filter((m) => m.id !== sid);
+    }
+    return arr.map((m) => (m.id === sid ? { ...m, streaming: false } : m));
+  });
+}
+
 function appendToStream(text) {
+  ensureStreamBubble();
+  const sid = streamMsgId;
   messages.update((arr) =>
-    arr.map((m) => (m.id === streamMsgId ? { ...m, text: (m.text || '') + text } : m)),
+    arr.map((m) => (m.id === sid ? { ...m, text: (m.text || '') + text } : m)),
   );
 }
 
 /** 思考增量累积(首帧起记 thinkingStartedAt,流式中 thinkingStreaming=true) */
 function appendThinking(text) {
+  ensureStreamBubble();
+  const sid = streamMsgId;
   messages.update((arr) =>
     arr.map((m) =>
-      m.id === streamMsgId
+      m.id === sid
         ? {
             ...m,
             thinking: (m.thinking || '') + text,
@@ -682,12 +725,17 @@ function pushTurnError(text) {
   pushMessage({ kind: 'error', text });
 }
 
-function safeJson(v, cap = 400) {
+/** 工具载荷截断的元数据版:截断事实与原始长度随卡片携带(展开体渲染
+ *  「已截断」徽标——截断必须显式,不得让残缺内容冒充全文)。 */
+export function cappedJson(v, cap = 400) {
   try {
-    const s = JSON.stringify(v);
-    return s && s.length > cap ? s.slice(0, cap) + '…' : s;
+    const s = JSON.stringify(v) ?? String(v);
+    return s.length > cap
+      ? { text: s.slice(0, cap) + '…', truncated: true, originalLen: s.length }
+      : { text: s, truncated: false, originalLen: s.length };
   } catch {
-    return String(v);
+    const s = String(v);
+    return { text: s, truncated: false, originalLen: s.length };
   }
 }
 

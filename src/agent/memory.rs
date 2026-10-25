@@ -1010,6 +1010,11 @@ pub struct MessageRecord {
     /// 工具名（仅 tool 消息，可选）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// 思考过程留痕（推理模型 reasoning；仅展示链路——续话回放/LLM wire
+    /// 组装时经 G15 投影天然剥离，思考不回喂；非空才序列化，旧记录缺键
+    /// 反序列化为 None，零迁移）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     /// 时间戳（Unix 秒）
     pub timestamp: u64,
     /// 关联的 evorule FactId（写入后由 evorule 分配，可选用于 causal_chain）
@@ -1018,8 +1023,19 @@ pub struct MessageRecord {
 }
 
 impl MessageRecord {
-    /// 从 Message 构造记录
+    /// 从 Message 构造记录（无思考留痕）
     pub fn from_message(idx: usize, message: &Message, timestamp: u64) -> Self {
+        Self::from_message_parts(idx, message, None, timestamp)
+    }
+
+    /// 从 Message 构造记录（带思考留痕）：reasoning 仅 assistant 消息消费，
+    /// 其余角色置 None（思考属于 assistant 生成过程，不挂在其他角色上）
+    pub fn from_message_parts(
+        idx: usize,
+        message: &Message,
+        reasoning: Option<String>,
+        timestamp: u64,
+    ) -> Self {
         match message {
             Message::System { content } => Self {
                 idx,
@@ -1027,6 +1043,7 @@ impl MessageRecord {
                 content: content.clone(),
                 tool_calls: None,
                 tool_name: None,
+                reasoning: None,
                 timestamp,
                 fact_id: None,
             },
@@ -1036,6 +1053,7 @@ impl MessageRecord {
                 content: content.clone(),
                 tool_calls: None,
                 tool_name: None,
+                reasoning: None,
                 timestamp,
                 fact_id: None,
             },
@@ -1050,6 +1068,7 @@ impl MessageRecord {
                     .as_ref()
                     .and_then(|tc| serde_json::to_value(tc).ok()),
                 tool_name: None,
+                reasoning: reasoning.filter(|r| !r.is_empty()),
                 timestamp,
                 fact_id: None,
             },
@@ -1061,6 +1080,7 @@ impl MessageRecord {
                 content: content.clone(),
                 tool_calls: None,
                 tool_name: Some(tool_name.clone()),
+                reasoning: None,
                 timestamp,
                 fact_id: None,
             },
@@ -1933,8 +1953,22 @@ impl MemoryManager {
         idx: usize,
         message: &Message,
     ) -> Result<(), MemoryError> {
+        self.append_message_with_reasoning(session_id, idx, message, None)
+            .await
+    }
+
+    /// 追加消息（带思考留痕）：reasoning 仅 assistant 消息携带，落 evorule
+    /// payload facts 供 transcript/快照展示链路读取；续话回放侧经 G15 投影
+    /// 剥离，思考不回喂 LLM。
+    pub async fn append_message_with_reasoning(
+        &self,
+        session_id: &str,
+        idx: usize,
+        message: &Message,
+        reasoning: Option<String>,
+    ) -> Result<(), MemoryError> {
         let timestamp = now_secs();
-        let record = MessageRecord::from_message(idx, message, timestamp);
+        let record = MessageRecord::from_message_parts(idx, message, reasoning, timestamp);
         let scope = MemoryScope::Messages(session_id.to_string(), idx);
         let path = self.build_path_scoped(&scope, "");
         let payload_value = serde_json::to_value(&record)?;
@@ -1986,15 +2020,16 @@ impl MemoryManager {
     pub async fn append_messages_batch(
         &mut self,
         session_id: &str,
-        messages: &[(usize, Message)],
+        messages: &[(usize, Message, Option<String>)],
     ) -> Result<(), MemoryError> {
         if messages.is_empty() {
             return Ok(());
         }
         let timestamp = now_secs();
         let mut updates: Vec<(String, serde_json::Value)> = Vec::with_capacity(messages.len());
-        for (idx, message) in messages {
-            let record = MessageRecord::from_message(*idx, message, timestamp);
+        for (idx, message, reasoning) in messages {
+            let record =
+                MessageRecord::from_message_parts(*idx, message, reasoning.clone(), timestamp);
             let scope = MemoryScope::Messages(session_id.to_string(), *idx);
             let path = self.build_path_scoped(&scope, "");
             updates.push((path, serde_json::to_value(&record)?));
@@ -4980,6 +5015,43 @@ mod tests {
         assert_eq!(record.content, "Hi there");
         assert!(record.tool_calls.is_none());
         assert!(record.tool_name.is_none());
+        // 思考留痕:无参构造不携带(旧记录零迁移口径)
+        assert!(record.reasoning.is_none());
+    }
+
+    #[test]
+    fn test_message_record_reasoning_roundtrip() {
+        let msg = Message::Assistant {
+            content: "answer".to_string(),
+            tool_calls: None,
+        };
+        let record =
+            MessageRecord::from_message_parts(2, &msg, Some("thinking...".to_string()), 3000);
+        assert_eq!(record.reasoning.as_deref(), Some("thinking..."));
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["reasoning"], "thinking...");
+        let back: MessageRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.reasoning.as_deref(), Some("thinking..."));
+    }
+
+    #[test]
+    fn test_message_record_reasoning_empty_is_none_and_old_shape_deserializes() {
+        let msg = Message::Assistant {
+            content: "answer".to_string(),
+            tool_calls: None,
+        };
+        // 空串归一 None(非思考模型零增量,记录不带空字段)
+        let record = MessageRecord::from_message_parts(2, &msg, Some(String::new()), 3000);
+        assert!(record.reasoning.is_none());
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(json.get("reasoning").is_none(), "None 不序列化");
+        // 旧形状(无 reasoning 键)反序列化 → None,零迁移
+        let old: MessageRecord = serde_json::from_value(serde_json::json!({
+            "idx": 2, "role": "assistant", "content": "answer",
+            "tool_calls": null, "timestamp": 3000
+        }))
+        .unwrap();
+        assert!(old.reasoning.is_none());
     }
 
     #[test]

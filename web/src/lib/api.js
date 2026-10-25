@@ -186,10 +186,16 @@ export function listResumableRuns() {
   return getJsonRetry('/api/sessions/resumable');
 }
 
-/** 会话消息历史(活投影 source=live;TTL 回收后回落本地快照 source=snapshot) */
-export function getTranscript(sessionId) {
+/** 会话消息历史(活投影 source=live;TTL 回收后回落本地快照 source=snapshot)。
+ *  opts 可选分页:{limit, beforeIdx}——serve 端 before_idx 游标取更早侧最新段,
+ *  响应带 has_more;缺省不传=全量(向后兼容)。 */
+export function getTranscript(sessionId, opts = {}) {
+  const p = new URLSearchParams();
+  if (Number.isFinite(opts.limit)) p.set('limit', String(opts.limit));
+  if (Number.isFinite(opts.beforeIdx)) p.set('before_idx', String(opts.beforeIdx));
+  const qs = p.toString();
   return getJsonRetry(
-    `/api/sessions/${encodeURIComponent(sessionId)}/transcript`
+    `/api/sessions/${encodeURIComponent(sessionId)}/transcript${qs ? `?${qs}` : ''}`
   );
 }
 

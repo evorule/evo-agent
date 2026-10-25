@@ -2487,6 +2487,31 @@ async fn list_sessions(
 struct TranscriptQuery {
     /// agent 类型(缺省从索引回查,再缺省 general——决定记忆 namespace)
     agent_type: Option<String>,
+    /// 分页:单页条数上限;缺省(不传)=全量(向后兼容)
+    limit: Option<usize>,
+    /// 分页游标:仅返回 idx 小于该值的消息(取最新一段);缺省=不限
+    before_idx: Option<usize>,
+}
+
+/// transcript 分页就地收缩:先按 before_idx 游标过滤(仅保留更早侧),再自
+/// 最新端截取 limit 条;返回 has_more(被截者=更早还有)。缺省不传=全量、
+/// false(向后兼容);快照源同构。
+fn apply_transcript_pagination(
+    messages: &mut Vec<crate::agent::memory::MessageRecord>,
+    before_idx: Option<usize>,
+    limit: Option<usize>,
+) -> bool {
+    if let Some(before) = before_idx {
+        messages.retain(|m| m.idx < before);
+    }
+    match limit {
+        Some(l) if messages.len() > l => {
+            let at = messages.len() - l;
+            messages.drain(..at);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// `GET /api/sessions/{id}/transcript` —— 会话消息历史
@@ -2497,6 +2522,8 @@ struct TranscriptQuery {
 /// 2. **snapshot**(回落):evorule 会话 30min 闲置 TTL 回收后活投影报
 ///    `Session not found`,回落 serve 本地快照(`authoritative:false`,
 ///    展示层副本;TurnEnd 时与 live 同一投影路径落盘)。
+///
+/// 分页:`limit`+`before_idx` 游标(见 [`apply_transcript_pagination`]);缺省不传=全量。
 async fn get_transcript(
     State(state): State<AgentApiState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
@@ -2522,7 +2549,8 @@ async fn get_transcript(
     )
     .await
     {
-        Ok(messages) => {
+        Ok(mut messages) => {
+            let has_more = apply_transcript_pagination(&mut messages, q.before_idx, q.limit);
             let count = messages.len();
             Ok(Json(serde_json::json!({
                 "session_id": session_id,
@@ -2530,21 +2558,29 @@ async fn get_transcript(
                 "namespace": namespace,
                 "source": "live",
                 "count": count,
+                "has_more": has_more,
                 "messages": messages,
             })))
         }
         // 会话已被 evorule TTL 回收 → 回落本地快照(非权威副本明示)
         Err(e) if crate::api::snapshots::is_session_gone(&e) => {
             match state.snapshots().load(&session_id) {
-                Some(snap) => Ok(Json(serde_json::json!({
-                    "session_id": session_id,
-                    "agent_type": snap.agent_type,
-                    "source": "snapshot",
-                    "authoritative": false,
-                    "saved_at": snap.saved_at,
-                    "count": snap.count,
-                    "messages": snap.messages,
-                }))),
+                Some(snap) => {
+                    let mut messages = snap.messages;
+                    let has_more =
+                        apply_transcript_pagination(&mut messages, q.before_idx, q.limit);
+                    let count = messages.len();
+                    Ok(Json(serde_json::json!({
+                        "session_id": session_id,
+                        "agent_type": snap.agent_type,
+                        "source": "snapshot",
+                        "authoritative": false,
+                        "saved_at": snap.saved_at,
+                        "count": count,
+                        "has_more": has_more,
+                        "messages": messages,
+                    })))
+                }
                 // 无快照 → 保持原有 502 语义
                 None => Err((StatusCode::BAD_GATEWAY, e)),
             }
@@ -2589,50 +2625,96 @@ async fn load_rebuild_history(
     }
 }
 
+/// assistant 记录的调用轮廓:带 tool_calls 时在内容行后追加「(随后调用 A、B)」,
+/// 工具名三源兼容(引擎持久化 tool_name / 内部 name / OpenAI function.name)。
+/// 与前端 sessionRebuild.assistantOutline 同格式同口径。
+fn rebuild_assistant_outline(m: &crate::agent::memory::MessageRecord) -> String {
+    let Some(tc) = &m.tool_calls else {
+        return String::new();
+    };
+    let empty = Vec::new();
+    let arr: &[serde_json::Value] = match tc {
+        serde_json::Value::Array(a) => a,
+        v if v.is_null() => &empty,
+        v => std::slice::from_ref(v),
+    };
+    if arr.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = arr
+        .iter()
+        .map(|c| {
+            c.get("tool_name")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| c.get("name").and_then(serde_json::Value::as_str))
+                .or_else(|| {
+                    c.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("tool")
+                .to_string()
+        })
+        .collect();
+    format!("(随后调用 {})", names.join("、"))
+}
+
 /// 历史消息 → 重建回注块+新输入合成(纯函数,无 IO)。
 ///
 /// 压缩口径(与前端 sessionRebuild.buildRebuildBlock 同格式同口径,
-/// 保证 HTTP 面与工作台面续聊上下文一致):仅 user/assistant 角色;
-/// 最近 20 条;单条 1500 字符截断;总预算 6000 字符(自最新往回收集,至少
-/// 保 1 条)。历史块在前、新输入在文末(回注头明示「直接回应文末的新输入」)。
+/// 保证 HTTP 面与工作台面续聊上下文一致):user/assistant/tool 三角色
+/// (tool 以名称+结果摘要入块,续聊模型可引用先前工具轮廓);assistant 带
+/// tool_calls 追加调用轮廓;最近 60 条;单行 4000 字符截断;总预算 24000
+/// 字符(自最新往回收集,至少保 1 行)。历史块在前、新输入在文末(回注头
+/// 明示「直接回应文末的新输入」)。
 fn compose_rebuild_context(history: &[crate::agent::memory::MessageRecord], goal: &str) -> String {
-    const HEADER: &str = "[会话重建回注] 此前会话在引擎侧已失效(闲置回收或服务重启),以下为历史消息投影,供续接上下文;请勿复述,直接回应文末的新输入。";
-    const MAX_MESSAGES: usize = 20;
-    const MAX_PER_MESSAGE: usize = 1500;
-    const MAX_TOTAL: usize = 6000;
+    const HEADER: &str = "[会话重建回注] 此前会话在引擎侧已失效(闲置回收或服务重启),以下为历史消息投影(含工具调用轮廓与结果摘要),供续接上下文;请勿复述,直接回应文末的新输入。";
+    const MAX_MESSAGES: usize = 60;
+    const MAX_PER_MESSAGE: usize = 4000;
+    const MAX_TOTAL: usize = 24000;
 
-    // 仅 user/assistant;单条截断(按字符数,非字节,防切破多字节字符)
-    let candidates: Vec<(&str, String)> = history
-        .iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
-        .map(|m| {
-            let content = if m.content.chars().count() > MAX_PER_MESSAGE {
-                m.content.chars().take(MAX_PER_MESSAGE).collect::<String>()
-            } else {
-                m.content.clone()
-            };
-            (m.role.as_str(), content)
-        })
-        .collect();
+    // 三角色入块;单行截断(按字符数,非字节,防切破多字节字符)
+    let mut candidates: Vec<(String, usize)> = Vec::new();
+    for m in history {
+        let content = if m.content.chars().count() > MAX_PER_MESSAGE {
+            m.content.chars().take(MAX_PER_MESSAGE).collect::<String>()
+        } else {
+            m.content.clone()
+        };
+        match m.role.as_str() {
+            "user" => candidates.push((format!("[user] {content}"), content.chars().count())),
+            "assistant" => {
+                let outline = rebuild_assistant_outline(m);
+                let line = format!("[assistant] {content}{outline}");
+                let cost = content.chars().count() + outline.chars().count();
+                candidates.push((line, cost));
+            }
+            "tool" => {
+                let name = m.tool_name.clone().unwrap_or_else(|| "tool".to_string());
+                let line = format!("[tool:{name}] {content}");
+                candidates.push((line, content.chars().count()));
+            }
+            _ => {}
+        }
+    }
 
-    // 自最新往回收集,总预算内(首条无条件保留=至少保 1 条;条数上限同步生效)
-    let mut picked_rev: Vec<&(&str, String)> = Vec::new();
+    // 自最新往回收集,总预算内(首行无条件保留=至少保 1 行;条数上限同步生效)
+    let mut picked_rev: Vec<&(String, usize)> = Vec::new();
     let mut total = 0usize;
     for item in candidates.iter().rev() {
         if picked_rev.len() >= MAX_MESSAGES {
             break;
         }
-        let cost = item.1.chars().count();
-        if !picked_rev.is_empty() && total + cost > MAX_TOTAL {
+        if !picked_rev.is_empty() && total + item.1 > MAX_TOTAL {
             break;
         }
-        total += cost;
+        total += item.1;
         picked_rev.push(item);
     }
 
     let mut lines: Vec<String> = vec![HEADER.to_string(), "<recovered_history>".to_string()];
-    for (role, content) in picked_rev.into_iter().rev() {
-        lines.push(format!("[{role}] {content}"));
+    for (line, _) in picked_rev.into_iter().rev() {
+        lines.push(line.clone());
     }
     lines.push("</recovered_history>".to_string());
     lines.push(String::new());
@@ -4529,18 +4611,26 @@ mod tests {
             tool_calls: None,
             tool_name: None,
             timestamp: 0,
+            reasoning: None,
             fact_id: None,
+        }
+    }
+
+    fn b17_tool(name: &str, content: &str) -> crate::agent::memory::MessageRecord {
+        crate::agent::memory::MessageRecord {
+            tool_name: Some(name.to_string()),
+            ..b17_msg("tool", content)
         }
     }
 
     #[test]
     fn test_compose_rebuild_context_filters_roles_and_keeps_order() {
-        // J-B17-6:角色过滤(tool/system 剔除)+ 旧→新序 + goal 文末
+        // J-B17-6:system 剔除 + tool 以名称+摘要入块 + 旧→新序 + goal 文末
         let history = vec![
             b17_msg("system", "sys prompt"),
             b17_msg("user", "u1"),
             b17_msg("assistant", "a1"),
-            b17_msg("tool", "tool out"),
+            b17_tool("file_read", "tool out"),
             b17_msg("user", "u2"),
         ];
         let out = compose_rebuild_context(&history, "new goal");
@@ -4548,35 +4638,48 @@ mod tests {
         assert!(out.contains("<recovered_history>"));
         assert!(out.contains("</recovered_history>"));
         assert!(!out.contains("sys prompt"));
-        assert!(!out.contains("tool out"));
+        assert!(out.contains("[tool:file_read] tool out"));
         let u1 = out.find("[user] u1").unwrap();
         let a1 = out.find("[assistant] a1").unwrap();
+        let t1 = out.find("[tool:file_read] tool out").unwrap();
         let u2 = out.find("[user] u2").unwrap();
-        assert!(u1 < a1 && a1 < u2, "历史按时间正序回注");
+        assert!(u1 < a1 && a1 < t1 && t1 < u2, "历史按时间正序回注");
         assert!(out.ends_with("new goal"), "新输入在文末");
     }
 
     #[test]
+    fn test_compose_rebuild_context_assistant_outline() {
+        // assistant 带 tool_calls → 调用轮廓行(工具名三源兼容)
+        let mut a = b17_msg("assistant", "");
+        a.tool_calls = Some(serde_json::json!([
+            {"tool_name": "file_read", "args": {"path": "a"}},
+            {"name": "shell_exec", "args": {"command": "ls"}}
+        ]));
+        let out = compose_rebuild_context(&[a], "goal");
+        assert!(out.contains("[assistant] (随后调用 file_read、shell_exec)"));
+    }
+
+    #[test]
     fn test_compose_rebuild_context_truncates_per_message() {
-        // J-B17-6:单条 1500 字符截断(按字符数,防切破多字节)
-        let long = "x".repeat(3000);
+        // J-B17-6:单行 4000 字符截断(按字符数,防切破多字节)
+        let long = "x".repeat(8000);
         let out = compose_rebuild_context(&[b17_msg("user", &long)], "goal");
-        assert!(out.contains(&"x".repeat(1500)));
-        assert!(!out.contains(&"x".repeat(1501)));
+        assert!(out.contains(&"x".repeat(4000)));
+        assert!(!out.contains(&"x".repeat(4001)));
     }
 
     #[test]
     fn test_compose_rebuild_context_respects_total_budget_newest_first() {
-        // J-B17-6:总预算 6000 字符,自最新往回收集(25 条 × 500 字符 → 恰收 12 条)
-        let history: Vec<_> = (0..25)
+        // J-B17-6:总预算 24000 字符,自最新往回收集(100 条 × 500 字符 → 恰收 48 行)
+        let history: Vec<_> = (0..100)
             .map(|i| b17_msg("user", &format!("m{i:02}{}", "y".repeat(497))))
             .collect();
         let out = compose_rebuild_context(&history, "g");
         let picked = out.matches("[user] m").count();
-        assert_eq!(picked, 12, "6000/500=12 条入预算");
-        assert!(out.contains("[user] m24"), "最新一条必在");
-        assert!(out.contains("[user] m13"), "预算内最旧一条");
-        assert!(!out.contains("[user] m12"), "预算外旧条被裁");
+        assert_eq!(picked, 48, "24000/500=48 行入预算");
+        assert!(out.contains("[user] m99"), "最新一条必在");
+        assert!(out.contains("[user] m52"), "预算内最旧一条");
+        assert!(!out.contains("[user] m51"), "预算外旧条被裁");
     }
 
     #[test]
@@ -4586,6 +4689,39 @@ mod tests {
         let out = compose_rebuild_context(&[], "goal");
         assert!(out.contains("<recovered_history>\n</recovered_history>"));
         assert!(out.ends_with("goal"));
+    }
+
+    #[test]
+    fn test_transcript_pagination_cursor_and_limit() {
+        let mk = |i: usize| crate::agent::memory::MessageRecord {
+            idx: i,
+            role: "user".to_string(),
+            content: format!("m{i}"),
+            tool_calls: None,
+            tool_name: None,
+            reasoning: None,
+            timestamp: 0,
+            fact_id: None,
+        };
+        let idxs = |v: &[crate::agent::memory::MessageRecord]| -> Vec<usize> {
+            v.iter().map(|m| m.idx).collect()
+        };
+        // 无参 → 全量,has_more=false
+        let mut all: Vec<_> = (0..10).map(mk).collect();
+        assert!(!apply_transcript_pagination(&mut all, None, None));
+        assert_eq!(idxs(&all), (0..10).collect::<Vec<_>>());
+        // 仅 limit → 自最新端截取,has_more=true
+        let mut paged: Vec<_> = (0..10).map(mk).collect();
+        assert!(apply_transcript_pagination(&mut paged, None, Some(3)));
+        assert_eq!(idxs(&paged), vec![7, 8, 9]);
+        // 游标+limit → 更早侧最新段
+        let mut cur: Vec<_> = (0..10).map(mk).collect();
+        assert!(apply_transcript_pagination(&mut cur, Some(7), Some(3)));
+        assert_eq!(idxs(&cur), vec![4, 5, 6]);
+        // 游标后不足 limit → 全给,has_more=false
+        let mut tail: Vec<_> = (0..10).map(mk).collect();
+        assert!(!apply_transcript_pagination(&mut tail, Some(2), Some(5)));
+        assert_eq!(idxs(&tail), vec![0, 1]);
     }
 
     // ===== G6 /cancel 端点测试 =====

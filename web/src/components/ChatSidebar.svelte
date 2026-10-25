@@ -16,6 +16,8 @@
     composerMentions,
     activePath,
     openSettingsTab,
+    transcriptHasMore,
+    loadOlderTranscript,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
   // Svelte 5 不深度代理原生 Set(add/delete 不触发重渲染,点击开合会失明),
@@ -523,6 +525,37 @@
     window.open(`/console/audit?session=${sid}`, '_blank', 'noopener,noreferrer');
   }
 
+  // ---- 长会话渲染窗(DOM 上限防千条级会话卡顿;分页加载走游标续拉) ----
+  const RENDER_WINDOW = 400;
+  const RENDER_WINDOW_STEP = 200;
+  let renderCount = $state(RENDER_WINDOW);
+  let loadingOlder = $state(false);
+  // 只渲染最近 renderCount 条;更早的经「显示更早消息」按钮扩窗
+  const visibleMessages = $derived(
+    $messages.length > renderCount ? $messages.slice($messages.length - renderCount) : $messages,
+  );
+  // 换线/新建即复位渲染窗(防旧会话窗口状态串台)
+  $effect(() => {
+    void $sessionId;
+    renderCount = RENDER_WINDOW;
+  });
+  async function onLoadOlder() {
+    if (loadingOlder) return;
+    loadingOlder = true;
+    try {
+      if ($messages.length > renderCount) {
+        // 仅扩渲染窗(消息已在内存)
+        renderCount += RENDER_WINDOW_STEP;
+      } else if ($sessionId) {
+        // 拉更早一页(transcript 游标续拉,重投影配对)
+        await loadOlderTranscript($sessionId);
+        renderCount += RENDER_WINDOW_STEP;
+      }
+    } finally {
+      loadingOlder = false;
+    }
+  }
+
   // M2 滚动体验:贴底跟滚;上翻阅读时不拽回,新增消息计入浮条
   let stickBottom = $state(true);
   let freshCount = $state(0);
@@ -617,10 +650,40 @@
     return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
   }
 
-  /** edit_file → 行级 diff 行序列;不可 diff(非编辑类/超帽/args 缺失)→ null 降级原文 */
+  /** 编辑类/整文件写 → 行级 diff 行序列;不可 diff(非编辑类/超帽/args 缺失/
+   *  file_write 无草稿基线)→ null 降级。file_write 基线取产物链草稿快照
+   *  (同路径首写无基线 → null,写入内容经动作段 args 展示)。 */
   function toolDiffRows(m) {
-    const p = toolDiffPayload(m);
+    const baseline = m.name === 'file_write' ? fileWriteBaseline(m) : null;
+    const p = toolDiffPayload(m, baseline);
     return p ? lineDiff(p.oldText, p.newText) : null;
+  }
+
+  /** file_write 的旧文基线:产物登记(draftContent)按 args.path 查找;形态
+   *  兼容 JSON 字符串/对象两种 args 载体 */
+  function fileWriteBaseline(m) {
+    let a = m.args;
+    if (typeof a === 'string') {
+      try {
+        a = JSON.parse(a);
+      } catch {
+        return null;
+      }
+    }
+    const p = a && typeof a === 'object' ? a.path : null;
+    if (!p) return null;
+    const hit = $artifacts.find((x) => x.path === p);
+    return hit && typeof hit.draftContent === 'string' ? hit.draftContent : null;
+  }
+
+  /** 动作段文本:实时卡为 JSON 字符串,历史卡为对象(配对合并投影),统一文本化 */
+  function argsText(m) {
+    if (typeof m.args === 'string') return m.args;
+    try {
+      return JSON.stringify(m.args, null, 2);
+    } catch {
+      return String(m.args);
+    }
   }
 
   /** 消息级复制(assistant/error 气泡与工具卡共用);按钮瞬时「已复制」反馈 */
@@ -1034,7 +1097,19 @@
         </div>
       </div>
     {/if}
-    {#each $messages as m (m.id)}
+    {#if $messages.length > renderCount || $transcriptHasMore}
+      <button
+        type="button"
+        class="load-older"
+        onclick={onLoadOlder}
+        disabled={loadingOlder}
+      >
+        {#if loadingOlder}加载中…{:else}
+          {#if $messages.length > renderCount}显示更早消息(还有 {$messages.length - renderCount} 条未渲染){:else}加载更早消息{/if}
+        {/if}
+      </button>
+    {/if}
+    {#each visibleMessages as m (m.id)}
       {#if m.kind === 'user'}
         <div class="row user">
           <div class="user-col">
@@ -1078,7 +1153,9 @@
                   <span class="thinking-label">
                     {m.thinkingStreaming
                       ? '深度思考中…'
-                      : `已深度思考(用时 ${thinkingDuration(m)})`}
+                      : m.thinkingStartedAt
+                        ? `已深度思考(用时 ${thinkingDuration(m)})`
+                        : '已深度思考'}
                   </span>
                 </div>
                 {#if thinkingOpen(m)}
@@ -1134,9 +1211,14 @@
           </div>
           {#if expandedTools.has(m.id)}
             <div class="tool-body">
-              {#if m.result !== undefined}
+              {#if m.args != null}
+                <div class="tb-label">
+                  <span>动作</span>
+                  {#if m.argsMeta}
+                    <span class="tb-trunc">已截断（原 {m.argsMeta.originalLen} 字符）</span>
+                  {/if}
+                </div>
                 {@const rows = toolDiffRows(m)}
-                {@const text = String(m.result)}
                 {#if rows}
                   <div class="diff-box mono">
                     {#each rows as r}
@@ -1146,7 +1228,19 @@
                       </div>
                     {/each}
                   </div>
-                {:else if text.length > TOOL_RESULT_CAP && !fullResults.has(m.id)}
+                {:else}
+                  <pre class="tool-payload mono">{argsText(m)}</pre>
+                {/if}
+              {/if}
+              {#if m.result != null}
+                <div class="tb-label">
+                  <span>结果</span>
+                  {#if m.resultMeta}
+                    <span class="tb-trunc">已截断（原 {m.resultMeta.originalLen} 字符）</span>
+                  {/if}
+                </div>
+                {@const text = String(m.result)}
+                {#if text.length > TOOL_RESULT_CAP && !fullResults.has(m.id)}
                   <pre class="tool-payload mono">{text.slice(0, TOOL_RESULT_CAP)}</pre>
                   <button
                     type="button"
@@ -1161,8 +1255,9 @@
                   class="tool-copy"
                   onclick={(e) => copyPlainText(text, e.currentTarget)}
                 >复制</button>
-              {:else}
-                <pre class="tool-payload mono">{m.args ?? '(无参数)'}</pre>
+              {/if}
+              {#if m.args == null && m.result == null}
+                <pre class="tool-payload mono">(无参数)</pre>
               {/if}
             </div>
           {/if}
@@ -2069,6 +2164,38 @@
     display: flex;
     flex-direction: column;
     gap: var(--sp-xs);
+  }
+  /* 动作/结果两段式小节标题与截断徽标 */
+  .tb-label {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-xs);
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+  .tb-trunc {
+    color: var(--warning);
+  }
+  /* 渲染窗/分页的「更早」入口(列表顶部) */
+  .load-older {
+    margin: var(--sp-xs) auto 0;
+    display: block;
+    padding: 4px 14px;
+    font-size: var(--fs-xs);
+    color: var(--text-secondary);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .load-older:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+  .load-older:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
   .tool-payload {
     margin: 0;
