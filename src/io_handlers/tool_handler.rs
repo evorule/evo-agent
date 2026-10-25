@@ -52,6 +52,16 @@ pub trait ToolFunction: Send + Sync {
     fn evaluate_proposal(&self, _args: &Value) -> Option<Value> {
         None
     }
+
+    /// 接线状态(占位/会话期重绑家族的实例级判定,清债批 2026-10-25)
+    ///
+    /// 占位形态(`unwired()` 构造、依赖未注入)返回 `false`:调用必报错的
+    /// 工具不应进 LLM 契约面(模型不可见,ask_user「声明保留、运行面缺席」
+    /// 降级同族);wired 形态与全部普通工具返回 `true`。缺省 `true`:
+    /// 既有工具零改动外溢。
+    fn is_wired(&self) -> bool {
+        true
+    }
 }
 
 /// 终止宽限:执行超时钩子触发后,收取工具真实结局(killed 记账)的等待上限
@@ -220,6 +230,30 @@ impl ToolHandler {
     /// 按名取出工具实现(供 serve 按白名单过滤复用)
     pub fn get_tool(&self, name: &str) -> Option<Arc<dyn ToolFunction>> {
         self.tools.get(name).map(|e| e.func.clone())
+    }
+
+    /// 按名查接线状态(注册条目执行器实例的 `is_wired`)
+    ///
+    /// 与 [`Self::evaluate_proposal_for`] 同源语义:按 **handler 注册的 func
+    /// 实例** 判定,而非按工具名查静态形态——重绑后实例即 wired,占位即
+    /// false。未注册名返回 `true`(缺席过滤由 has_tool 语义负责,不在本判定射程)。
+    pub fn is_wired(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .map(|e| e.func.is_wired())
+            .unwrap_or(true)
+    }
+
+    /// 已注册且接线的工具名列表(按字母序)
+    ///
+    /// 供 runner 组装 LLM 契约面:占位(未接线)工具从模型视野摘除,
+    /// 执行器面保留(占位调用仍 fail-visible,防绕过)。
+    pub fn wired_tool_names(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|(_, e)| e.func.is_wired())
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// 按名查治理元数据（一表派生面：裁决分级/审批/开关/能力域）
@@ -565,6 +599,68 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "grace expiry must not hang: {elapsed:?}"
+        );
+    }
+
+    // === 接线状态查询（清债批 2026-10-25:占位不进 LLM 契约面） ===
+
+    /// 占位探针:is_wired=false 的最小桩(模拟 unwired() 构造的占位形态)
+    struct UnwiredProbe;
+
+    #[async_trait::async_trait]
+    impl ToolFunction for UnwiredProbe {
+        async fn call(&self, _args: &Value) -> IoResult {
+            Err("placeholder (not wired)".to_string())
+        }
+
+        fn is_wired(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_is_wired_defaults_true_for_plain_tools() {
+        // 缺省 true:普通工具(EchoTool 未 override)零改动外溢
+        let mut handler = ToolHandler::new();
+        register_static(&mut handler, "file_read");
+        assert!(handler.is_wired("file_read"));
+        assert_eq!(handler.wired_tool_names(), vec!["file_read".to_string()]);
+    }
+
+    #[test]
+    fn test_wired_tool_names_excludes_placeholders() {
+        let mut handler = ToolHandler::new();
+        register_static(&mut handler, "file_read");
+        // 占位实例注册(真实占位类型:todo_write 静态 manifest + unwired 形态)
+        handler.register_static(
+            crate::builtin_tools::todo::TODO_WRITE_TOOL,
+            Arc::new(crate::builtin_tools::todo::TodoWriteTool::unwired()),
+        );
+        handler.register_static(
+            crate::builtin_tools::todo::TODO_READ_TOOL,
+            Arc::new(crate::builtin_tools::todo::TodoReadTool::wired(
+                Arc::new(crate::builtin_tools::todo::TodoState::default()),
+            )),
+        );
+
+        // 执行器面:三件都在(占位保留 fail-visible,防绕过)
+        assert!(handler.has_tool("file_read"));
+        assert!(handler.has_tool(crate::builtin_tools::todo::TODO_WRITE_TOOL));
+        // 查询面:按实例接线态分派——占位 false / wired true / 普通 true
+        assert!(!handler.is_wired(crate::builtin_tools::todo::TODO_WRITE_TOOL));
+        assert!(handler.is_wired(crate::builtin_tools::todo::TODO_READ_TOOL));
+        assert!(handler.is_wired("file_read"));
+        // 未注册名不在判定射程(缺席过滤由 has_tool 语义负责)
+        assert!(handler.is_wired("nope"));
+
+        let wired = handler.wired_tool_names();
+        assert!(wired.contains(&"file_read".to_string()));
+        assert!(
+            wired.iter().any(|n| n == crate::builtin_tools::todo::TODO_READ_TOOL)
+        );
+        assert!(
+            wired.iter().all(|n| n != crate::builtin_tools::todo::TODO_WRITE_TOOL),
+            "占位必须从 wired 清单摘除"
         );
     }
 }

@@ -117,6 +117,10 @@ impl CodeSearchTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for CodeSearchTool {
+    fn is_wired(&self) -> bool {
+        self.index.is_some()
+    }
+
     /// G13:async 入口 — 用 spawn_blocking 包装同步图谱检索（PageRank CPU 密集）
     async fn call(&self, args: &Value) -> IoResult {
         // IndexService 无 &self 可变态且 graph() 快照廉价克隆;Arc 双份跨线程

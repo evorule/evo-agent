@@ -292,6 +292,10 @@ impl HandoverWriteTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for HandoverWriteTool {
+    fn is_wired(&self) -> bool {
+        self.namespace.is_some() && self.client.is_some()
+    }
+
     async fn call(&self, args: &Value) -> Result<Value, String> {
         let (namespace, client, session_id) = self.parts()?;
         handover_write_exec(namespace, client, session_id, args).await
@@ -335,6 +339,10 @@ impl HandoverReadTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for HandoverReadTool {
+    fn is_wired(&self) -> bool {
+        self.namespace.is_some() && self.client.is_some()
+    }
+
     async fn call(&self, args: &Value) -> Result<Value, String> {
         let (namespace, client) = self.parts()?;
         handover_read_exec(namespace, client, args).await

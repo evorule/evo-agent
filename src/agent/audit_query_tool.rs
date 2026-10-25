@@ -423,6 +423,12 @@ impl AuditQueryTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for AuditQueryTool {
+    fn is_wired(&self) -> bool {
+        // journal 句柄缺席不降 wired：journal scope 调用时 fail-visible，
+        // gov/session scope 完全可用（wired 构造的 None 透传语义）
+        self.session_id.is_some() && self.client.is_some()
+    }
+
     async fn call(&self, args: &Value) -> Result<Value, String> {
         let (session_id, client, journal) = self.parts()?;
         audit_query_exec(session_id, client, journal, args).await

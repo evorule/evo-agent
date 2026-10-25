@@ -294,6 +294,10 @@ impl SessionSpawnTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for SessionSpawnTool {
+    fn is_wired(&self) -> bool {
+        self.wiring.is_some()
+    }
+
     /// 管道⑤评估单源（PR-4 收编）——PR-H4 验收修复补实现：Sensitive+
     /// ManualDefault 声明档（tool_manifest 双闸）的执行面兑现。candidate
     /// 首调=needs_approval 提案（设计档 §四权限面口径）：本会话首次 spawn

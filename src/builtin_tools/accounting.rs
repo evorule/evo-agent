@@ -57,6 +57,12 @@ pub struct AccountingDeps {
 }
 
 impl AccountingDeps {
+    /// 接线状态（ToolFunction::is_wired 判定源）：traces 句柄在场 = wired
+    /// （unwired_placeholder 的 traces=None，wired 构造必带）
+    pub fn is_wired(&self) -> bool {
+        self.traces.is_some()
+    }
+
     /// 未接线 deps（default_safe_toolkit 注册占位实例用）
     pub fn unwired_placeholder(workdir: &Path) -> Self {
         Self {
@@ -156,6 +162,10 @@ impl QueryJournalTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for QueryJournalTool {
+    fn is_wired(&self) -> bool {
+        self.deps.is_wired()
+    }
+
     async fn call(&self, args: &Value) -> IoResult {
         let turn = args.get("turn").and_then(|v| v.as_u64());
         let since_seq = args.get("since_seq").and_then(|v| v.as_u64());
@@ -262,6 +272,10 @@ impl QueryTraceTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for QueryTraceTool {
+    fn is_wired(&self) -> bool {
+        self.deps.is_wired()
+    }
+
     async fn call(&self, args: &Value) -> IoResult {
         let tool_filter = args
             .get("tool")
@@ -336,6 +350,10 @@ impl ReadBackTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for ReadBackTool {
+    fn is_wired(&self) -> bool {
+        self.deps.is_wired()
+    }
+
     async fn call(&self, args: &Value) -> IoResult {
         let raw_path = args
             .get("path")
@@ -450,6 +468,9 @@ impl DiffRunsTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for DiffRunsTool {
+    // 不 override is_wired：diff_runs 是两段文本的行级结构化比对纯函数，
+    // 不消费 AccountingDeps（字段 _deps 未使用），占位形态调用完全可用。
+
     async fn call(&self, args: &Value) -> IoResult {
         let left = args
             .get("left")

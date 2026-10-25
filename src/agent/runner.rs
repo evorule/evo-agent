@@ -4050,8 +4050,27 @@ impl AgentRunner {
     /// 名字清单来源(`tool_handler` 实际注册执行器;agent 配置的 `tools` 列表已在
     /// `from_definition` 校验过 ⊆ 注册集,故以注册集为准即可覆盖配置意图)与
     /// 空集语义(返回 `None` = 请求不携带 tools 键,向后兼容)。
+    ///
+    /// 清债批(2026-10-25):未接线占位从模型视野摘除(ask_user「声明保留、
+    /// 运行面缺席」降级同族)——占位调用必报错,进契约只会浪费模型步数。
+    /// 本点实例态 = 会话期终态(全部重绑——wire_accounting/会话期 handover/todo
+    /// 族/serve 启动期 code_search——均先于本调用),判定准确;执行器面不动
+    /// (占位调用仍 fail-visible,防绕过)。atif 导出面不受影响(该端点仅有
+    /// def.tools 声明面、无会话 handler,union 实例判定会误摘会话期重绑族)。
     fn openai_tools_payload(&self) -> Option<Vec<Value>> {
-        let registered = self.tool_handler.tool_names();
+        let registered = self.tool_handler.wired_tool_names();
+        let all = self.tool_handler.tool_names();
+        let dropped: Vec<String> = all
+            .iter()
+            .filter(|n| !registered.contains(*n))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            tracing::debug!(
+                dropped = ?dropped,
+                "unwired placeholder tools excluded from LLM contract surface"
+            );
+        }
         let tools = Self::openai_function_schemas_for(&registered);
         if tools.is_empty() {
             None

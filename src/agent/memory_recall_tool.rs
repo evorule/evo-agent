@@ -205,6 +205,10 @@ impl MemoryRecallTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for MemoryRecallTool {
+    fn is_wired(&self) -> bool {
+        self.namespace.is_some() && self.client.is_some()
+    }
+
     async fn call(&self, args: &Value) -> Result<Value, String> {
         let (namespace, client) = self.parts()?;
         memory_recall_exec(namespace, client, args).await

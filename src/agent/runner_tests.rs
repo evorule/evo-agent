@@ -302,6 +302,60 @@ async fn test_openai_tools_payload_dynamic_service_schema_carries_parameters() {
     );
 }
 
+// === 清债批(2026-10-25):未接线占位不进 LLM 契约面 ===
+//
+// openai_tools_payload 以 wired_tool_names 为源:占位(unwired)实例从模型
+// 视野摘除,执行器面保留;占位重绑 wired 后契约恢复。时序安全前提(全部
+// 重绑先于本调用)由 runner 装配序保证,此处直接以终态实例验证判定语义。
+
+#[tokio::test]
+async fn test_openai_tools_payload_excludes_unwired_placeholders() {
+    use crate::builtin_tools::todo::{TodoState, TodoReadTool, TodoWriteTool};
+    use std::sync::Arc;
+
+    let mut handler = make_handler_with(&["echo"]);
+    // 占位实例(启动期 default_safe_toolkit 同款形态)
+    let todo_write_manifest =
+        crate::agent::tool_manifest::lookup_static(crate::builtin_tools::todo::TODO_WRITE_TOOL)
+            .expect("todo_write static manifest");
+    handler.register(
+        todo_write_manifest,
+        Arc::new(TodoWriteTool::unwired()) as Arc<dyn crate::io_handlers::tool_handler::ToolFunction>,
+    );
+    let client = make_test_client();
+    let mut runner = AgentRunner::new(AgentConfig::default(), client);
+    runner.tool_handler = handler;
+
+    let payload = runner
+        .openai_tools_payload()
+        .expect("wired tools exist, payload must be Some");
+    assert!(
+        payload
+            .iter()
+            .all(|t| t["function"]["name"] != crate::builtin_tools::todo::TODO_WRITE_TOOL),
+        "占位 todo_write 不得出现在 LLM 契约"
+    );
+    assert!(
+        payload
+            .iter()
+            .any(|t| t["function"]["name"] == "echo"),
+        "普通工具不受影响"
+    );
+
+    // 会话期重绑同款形态:占位→wired,契约恢复
+    runner.tool_handler.register_static(
+        crate::builtin_tools::todo::TODO_WRITE_TOOL,
+        Arc::new(TodoWriteTool::wired(Arc::new(TodoState::default()))),
+    );
+    let payload = runner.openai_tools_payload().unwrap();
+    assert!(
+        payload
+            .iter()
+            .any(|t| t["function"]["name"] == crate::builtin_tools::todo::TODO_WRITE_TOOL),
+        "重绑 wired 后契约应恢复"
+    );
+}
+
 // O-487③：auto_recall 注入条目来源标注（纯展示层）——MemoryRecord 形态
 // 标「来源会话+落账时点」，非 MemoryRecord 形态仅标来源会话
 #[test]

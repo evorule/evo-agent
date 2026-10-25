@@ -146,6 +146,10 @@ impl MemoryTombstoneTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for MemoryTombstoneTool {
+    fn is_wired(&self) -> bool {
+        self.namespace.is_some() && self.session_id.is_some() && self.client.is_some()
+    }
+
     async fn call(&self, args: &Value) -> Result<Value, String> {
         let (namespace, session_id, client) = self.parts()?;
         memory_tombstone_exec(namespace, session_id, client, args).await

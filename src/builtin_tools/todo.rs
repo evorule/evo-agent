@@ -298,6 +298,10 @@ impl TodoWriteTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for TodoWriteTool {
+    fn is_wired(&self) -> bool {
+        self.state.is_some()
+    }
+
     async fn call(&self, args: &Value) -> crate::io_handler::IoResult {
         let state = self.state.as_ref().ok_or_else(|| {
             "todo_write is not wired to session state (placeholder; wired at session start)"
@@ -334,6 +338,10 @@ impl TodoReadTool {
 
 #[async_trait::async_trait]
 impl ToolFunction for TodoReadTool {
+    fn is_wired(&self) -> bool {
+        self.state.is_some()
+    }
+
     async fn call(&self, _args: &Value) -> crate::io_handler::IoResult {
         let state = self.state.as_ref().ok_or_else(|| {
             "todo_read is not wired to session state (placeholder; wired at session start)"
