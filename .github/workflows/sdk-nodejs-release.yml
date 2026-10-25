@@ -28,6 +28,7 @@ defaults:
 jobs:
   publish:
     name: publish evo-agent-node
+    needs: dist-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,3 +67,12 @@ jobs:
             exit 1
           fi
           npm publish
+
+  # Distribution-compliance gate (reusable workflow, pinned to root-repo commit)
+  dist-gate:
+    name: dist compliance gate
+    permissions:
+      contents: read
+    uses: evorule/evorule/.github/workflows/dist-gate.yml@a3aa299151fa3cfbf0d9fe6b659b5f91cb909807
+    with:
+      repo: evo-agent
