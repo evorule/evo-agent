@@ -59,6 +59,7 @@
     "mcp_*",
     "inference_*",
     "edit_file",
+    "workspace_undo",
     "web_fetch",
     "web_search",
     "todo_write",

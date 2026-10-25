@@ -265,6 +265,7 @@ pub const SANDBOX_CAPABLE_TOOLS: &[&str] = &[
     "grep_files",
     "file_write",
     "edit_file",
+    "workspace_undo",
     "file_create",
     "file_move",
     "file_delete",
@@ -641,6 +642,14 @@ pub struct AgentDefinition {
     /// 哲学同构),判据全文+模型+时间戳落 journal 可回放
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance_generation: Option<bool>,
+    /// 自验证门禁配置(写面撤销批 M3;可选,None=门禁不存在,既有定义零影响)
+    ///
+    /// 命令仅来自本配置(人类预置,模型只读消费不可生成/修改);写面工具
+    /// 成功后 runner 置位 pending,轮末回喂下一轮前统一执行,诊断经确定性
+    /// matcher 解析后结构化回喂。装载期 validate fail-fast(matcher 词汇
+    /// 白名单),未知 matcher = 定义加载失败拒绝启动。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::agent::verify::VerifyConfig>,
     /// I2 词表声明（数据化：definition 级语言风格覆盖；None=机制内建
     /// v2 双语表。serde 缺省 None=既有定义零影响）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2050,6 +2059,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             acceptance_generation: None,
+            verify: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,
@@ -2426,6 +2436,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             acceptance_generation: None,
+            verify: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,
@@ -2689,6 +2700,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             acceptance_generation: None,
+            verify: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,
@@ -2928,6 +2940,7 @@ mod tests {
             context_window_tokens: None,
             acceptance_command: None,
             acceptance_generation: None,
+            verify: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,

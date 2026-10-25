@@ -1003,6 +1003,12 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             // S3c 装配槽位注入反映在 system prompt 面,journal 事件本身是
             // 恢复面回放载体(todo 工具重绑重建),非对话轨迹内容
             JournalEvent::TodoUpdated { .. } => {}
+            // 写面撤销批(检查点/undo/自验证):账面观测事件不映射步——快照与
+            // 撤销已镜像在所属写面工具的 tool_invoked/tool_result 步内,verify
+            // 判定经轮末观察块回喂反映在下一 LLM 步输入侧;本体贴留 journal 面
+            JournalEvent::FileCheckpointTaken { .. } => {}
+            JournalEvent::FileCheckpointRestored { .. } => {}
+            JournalEvent::VerifyRan { .. } => {}
         }
     }
     // 流末悬挂 agent 步(无 turn_ended 尾:crash/截断场景)

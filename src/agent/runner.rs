@@ -1334,6 +1334,17 @@ pub struct AgentRunner {
     /// 自主交接 PR-H3:链熔断观察窗(仅派生子会话经组件快照携带;轮守卫
     /// 创建时 move 注入 TurnEndGuard,根会话恒 None 不观察)
     chain_watch: Option<crate::agent::session_spawn_tool::ChainWatch>,
+    /// 写面撤销批:工作区快照仓库(None=未接线,快照钩子零开销跳过)。
+    /// with_workspace_checkpoint 接线注入;undo 工具实例侧另有同 root store
+    /// ——盘上 manifest.jsonl 是 SSOT,进程级 per-root 锁保证读写窗口不交叠
+    checkpoint: Option<std::sync::Arc<crate::agent::workspace_checkpoint::CheckpointStore>>,
+    /// 写面撤销批 M3:自验证编排器(None=无 verify 配置,门禁不存在,零开销)。
+    /// 写面成功置 pending,轮末回喂前统一执行(设计批 §4.3 延迟触发)
+    verify: Option<std::sync::Arc<crate::agent::verify::VerifyOrchestrator>>,
+    /// verify 配置中间态(from_definition 装载并 fail-fast 校验;
+    /// with_workspace_checkpoint 接线时与 workdir 合成生产编排器——
+    /// verify 命令须在 agent workdir 执行,workdir 只在接线点可得)
+    verify_config: Option<crate::agent::verify::VerifyConfig>,
 }
 
 /// 管道阶段⑦执行器：runner 的 call_service 通路
@@ -1453,6 +1464,9 @@ impl AgentRunner {
             accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
             chain: None,
             chain_watch: None,
+            checkpoint: None,
+            verify: None,
+            verify_config: None,
         }
     }
 
@@ -1693,6 +1707,22 @@ impl AgentRunner {
             .with_tool_handler(tool_handler)
             .with_message_persist_mode(persist_mode)
             .with_skills(resolved_skills);
+        // M3 自验证门禁装载(verify 块在场才生效;缺省无块 = 零行为变化)。
+        // 契约 fail-fast:未知 matcher 启动期显式拒绝;空 commands 显式 warn
+        // (配置了门禁但空转,不静默吞配置错误)。
+        if let Some(vcfg) = &def.verify {
+            if let Err(e) = vcfg.validate() {
+                return Err(AgentError::Internal(e));
+            }
+            if vcfg.commands.is_empty() {
+                tracing::warn!(
+                    agent = %def.agent_type,
+                    "agent definition has a 'verify' block with empty commands; \
+                     the verify gate stays inert"
+                );
+            }
+            runner.verify_config = Some(vcfg.clone());
+        }
         if let Some(mem) = memory {
             runner = runner.with_memory(mem);
         }
@@ -2113,6 +2143,31 @@ impl AgentRunner {
     /// 唯一真相源;不注入(默认)行为零变化。
     pub fn with_journal_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.journal_dir = Some(dir);
+        self
+    }
+
+    /// 写面撤销批:一次接线两钩子(快照仓库 + 自验证门禁;两钩子同点不同
+    /// 职责,顺序先快照后置位)。注入 workdir 后:
+    /// - 快照仓库常驻(pre-capture/post-commit 双段钩子在 run_pipeline)
+    /// - verify 配置在场( from_definition 装载)时合成生产编排器(命令在
+    ///   agent workdir 执行,与 shell_exec 同级安全口径)
+    /// 未接线(默认)=两钩子零开销跳过,行为与既有完全一致(缺省不变式)
+    pub fn with_workspace_checkpoint(mut self, workdir: &std::path::Path) -> Self {
+        self.checkpoint = Some(std::sync::Arc::new(
+            crate::agent::workspace_checkpoint::CheckpointStore::new(
+                workdir,
+                crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR,
+            ),
+        ));
+        if let Some(cfg) = self.verify_config.take() {
+            let shell_runner = crate::agent::verify::ShellCommandRunner::new(workdir);
+            self.verify = Some(std::sync::Arc::new(
+                crate::agent::verify::VerifyOrchestrator::new(
+                    cfg,
+                    std::sync::Arc::new(shell_runner),
+                ),
+            ));
+        }
         self
     }
 
@@ -4040,6 +4095,11 @@ impl AgentRunner {
                 accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
                 chain: Some(chain.clone()),
                 chain_watch: Some(ChainWatch::new(chain.clone())),
+                // 写面撤销批:子代理 v1 不接线快照/verify(缺省不变式——安全网
+                // 与门禁随主会话接线面生效;子代理接线记演进)
+                checkpoint: None,
+                verify: None,
+                verify_config: None,
             }
         })
     }
@@ -4925,6 +4985,15 @@ impl AgentRunner {
             metrics: self.metrics.as_deref(),
             retry_backoff: std::time::Duration::from_secs(1),
         };
+        // M4 写面撤销 pre-capture:⑦ 执行前读原状态入 blob(缓存收口臂
+        // precomputed 命中 = 无写动作发生,跳过)。在 req 构造前判断,
+        // 避免 precomputed 被 move 进 req 后再借用。失败不阻塞执行,
+        // reason 留给 post 阶段附注 fail-visible。
+        let pending_snapshot = if precomputed.is_none() {
+            self.checkpoint_pre_capture(tool_name, args).await
+        } else {
+            None
+        };
         let req = crate::agent::pipeline::PipelineRequest {
             tool_name,
             args,
@@ -4936,9 +5005,132 @@ impl AgentRunner {
             precomputed,
             approval_preset,
         };
-        crate::agent::pipeline::ToolExecutionPipeline
+        let mut outcome = crate::agent::pipeline::ToolExecutionPipeline
             .execute(req, deps)
-            .await
+            .await;
+        // M4 post-commit:⑦ 出口统一收口(快照入账/丢弃 + undo 入账 +
+        // verify deferred 置位与附注)
+        self.checkpoint_post_commit(tool_name, pending_snapshot, &mut outcome, journal);
+        outcome
+    }
+
+    /// M4 写面撤销 pre-capture(⑦ 执行前):写面三件(file_write/edit_file/
+    /// file_create)+ `path` 参数在场才快照;其余调用返回 None(零开销路径)。
+    /// 快照失败返回 `Some(Err(reason))`,由 post 阶段附注 fail-visible,
+    /// 不阻塞工具执行。重 IO(读原状态 + blake3)经 spawn_blocking 下放。
+    async fn checkpoint_pre_capture(
+        &self,
+        tool_name: &str,
+        args: &Value,
+    ) -> Option<Result<crate::agent::workspace_checkpoint::PendingSnapshot, String>> {
+        const SNAPSHOT_TOOLS: [&str; 3] = ["file_write", "edit_file", "file_create"];
+        let store = self.checkpoint.as_ref()?;
+        if !SNAPSHOT_TOOLS.contains(&tool_name) {
+            return None;
+        }
+        let raw = args.get("path").and_then(|v| v.as_str())?;
+        let store = store.clone();
+        let raw = raw.to_string();
+        let tool = tool_name.to_string();
+        Some(
+            tokio::task::spawn_blocking(move || store.pre_capture(&raw, &tool))
+                .await
+                .unwrap_or_else(|e| Err(format!("checkpoint pre-capture task failed: {}", e))),
+        )
+    }
+
+    /// M4 写面撤销 post-commit(⑦ 出口统一收口):
+    /// - workspace_undo 成功 → FileCheckpointRestored 入账(工具无 journal 面)
+    /// - 写面成功 → 快照入账(manifest 栈 + FileCheckpointTaken);verify 门禁
+    ///   在场再置位 pending 并附注 "verify":"deferred"(轮末统一执行)
+    /// - ⑦ 失败 → 快照丢弃(工具原子写语义,无部分落盘)
+    /// - 快照/入账失败 → "checkpoint":"failed:<reason>" 附注(仅 object 结果,
+    ///   fail-visible 不静默,不阻塞工具结果)
+    fn checkpoint_post_commit(
+        &self,
+        tool_name: &str,
+        pending: Option<Result<crate::agent::workspace_checkpoint::PendingSnapshot, String>>,
+        outcome: &mut crate::agent::pipeline::PipelineOutcome,
+        journal: Option<&crate::agent::journal::JournalWriter>,
+    ) {
+        if tool_name == crate::builtin_tools::workspace_undo::WORKSPACE_UNDO_TOOL {
+            if let (Some(j), Ok(value)) = (journal, outcome.result.as_ref()) {
+                self.record_undo_restored_journal(j, value);
+            }
+            return;
+        }
+        let Some(store) = self.checkpoint.as_ref() else {
+            return;
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        let attach_failed =
+            |value: &mut Value, reason: &str| {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "checkpoint".to_string(),
+                        Value::String(format!("failed:{}", reason)),
+                    );
+                }
+            };
+        match pending {
+            Ok(p) => {
+                // ⑦ 失败 = 无写落盘(工具原子写语义),丢弃 pending 快照
+                let Ok(value) = outcome.result.as_mut() else {
+                    store.discard(&p);
+                    return;
+                };
+                match store.commit(&p, journal) {
+                    Ok(_) => {
+                        if let Some(vorch) = self.verify.as_ref() {
+                            vorch.note_write_success();
+                            if let Some(obj) = value.as_object_mut() {
+                                obj.insert(
+                                    "verify".to_string(),
+                                    Value::String("deferred".to_string()),
+                                );
+                            }
+                        }
+                    }
+                    Err(reason) => attach_failed(value, &reason),
+                }
+            }
+            Err(reason) => {
+                if let Ok(value) = outcome.result.as_mut() {
+                    attach_failed(value, &reason);
+                }
+            }
+        }
+    }
+
+    /// workspace_undo 结果 → FileCheckpointRestored 入账(工具无 journal 面,
+    /// 由 runner 从结果 JSON 提取;缺字段跳过,入账失败 warn 不阻塞工具结果)
+    fn record_undo_restored_journal(
+        &self,
+        journal: &crate::agent::journal::JournalWriter,
+        value: &Value,
+    ) {
+        let path = value
+            .get("restored_path")
+            .or_else(|| value.get("removed_path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if path.is_empty() {
+            return;
+        }
+        let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let restored_hash = value
+            .get("restored_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let popped_seq = value
+            .get("popped_seq")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if let Err(e) = journal.file_checkpoint_restored(path, kind, restored_hash, popped_seq) {
+            tracing::warn!(error = %e, "file_checkpoint_restored journal append failed");
+        }
     }
 
     /// 管道结局 → LLM 可见面翻译(两入口共用;错误语义逐臂与原实现等价)
@@ -8040,6 +8232,33 @@ impl AgentRunner {
                                                            name: tc.name.clone(),
                                                            result: result_value,
                                                        });
+                                                   }
+                                                   // M3 自验证门禁:轮末回喂前执行 pending verify(一轮 N 写
+                                                   // 只跑 1 次;verdict 作为结构化附加观察块拼进最后一条
+                                                   // tool 消息 content——write_advisory 同型回喂,零协议
+                                                   // 风险;VerifyRan 已在 run_pending 内全量入账)。
+                                                   if let Some(vorch) = runner.verify.as_ref() {
+                                                       if vorch.has_pending() {
+                                                           if let Some(report) =
+                                                               vorch.run_pending(journal.as_deref()).await
+                                                           {
+                                                               if !report.observation.is_empty() {
+                                                                   if let Some(last) = messages.last_mut() {
+                                                                       if let Message::Tool { content, .. } = last {
+                                                                           content.push('\n');
+                                                                           content.push_str(&report.observation);
+                                                                       }
+                                                                   }
+                                                               }
+                                                               if report.escalate {
+                                                                   warn!(
+                                                                       %session_id,
+                                                                       verdict = %report.verdict,
+                                                                       "verify fix-loop limit reached; escalation surfaced to LLM"
+                                                                   );
+                                                               }
+                                                           }
+                                                       }
                                                    }
                                                    // 所有 tool 结果已入列 messages,回喂轮 LLM 将看到它们
                                                    continue 'react;

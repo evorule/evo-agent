@@ -219,6 +219,16 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "application",
         },
         SettingEntry {
+            key: "agentTools.workspaceUndo",
+            kind: SettingType::Boolean,
+            default: json!(true),
+            enum_values: None,
+            range: None,
+            category: "Agent 工具",
+            description: "允许 agent 回退最近一次工作区写面操作（workspace_undo，写前快照弹栈恢复——覆盖写字节级写回/新建文件删除；恢复路径复验写面白名单并全程落账；安全网能力随开随用）",
+            scope: "application",
+        },
+        SettingEntry {
             key: "agentTools.webFetch",
             kind: SettingType::Boolean,
             default: json!(true),
@@ -997,7 +1007,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 57); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo;批K 段5 httpRequest;批K 段7 askUser;workbench.uiFontSize)
+        assert_eq!(settings.len(), 58); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo;批K 段5 httpRequest;批K 段7 askUser;workbench.uiFontSize;M4 workspaceUndo)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -1005,6 +1015,7 @@ mod tests {
         // agentTools.* 开关键:出厂默认(fileCreate/editFile/grep/gitRead 开 / fileMove、fileDelete、gitWrite 关)
         assert_eq!(settings["agentTools.fileCreate"], json!(true));
         assert_eq!(settings["agentTools.editFile"], json!(true));
+        assert_eq!(settings["agentTools.workspaceUndo"], json!(true)); // M4 写面撤销默认开
         assert_eq!(settings["agentTools.webFetch"], json!(true));
         assert_eq!(settings["agentTools.webSearch"], json!(true));
         assert_eq!(settings["agentTools.codeSearch"], json!(true));

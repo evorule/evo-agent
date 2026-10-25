@@ -75,6 +75,7 @@ pub mod skill_read;
 pub mod todo;
 pub mod web_fetch;
 pub mod web_search;
+pub mod workspace_undo;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -156,6 +157,19 @@ pub fn default_safe_toolkit_with_profile(
     handler.register_static(
         "edit_file",
         Arc::new(edit_file::FileEditTool::new(workdir_buf.clone())),
+    );
+    // 写面撤销(写面撤销批):弹栈回退薄壳,执行序列/路径复验/hash 核对在
+    // CheckpointStore;store 与 runner 快照钩子实例同 root(盘面 manifest
+    // SSOT+进程级 per-root 锁互斥)。治理 Standard+AutoPolicy,开关
+    // agentTools.workspaceUndo 默认开(安全网能力)
+    handler.register_static(
+        crate::builtin_tools::workspace_undo::WORKSPACE_UNDO_TOOL,
+        Arc::new(workspace_undo::WorkspaceUndoTool::new(Arc::new(
+            crate::agent::workspace_checkpoint::CheckpointStore::new(
+                &workdir_buf,
+                file_write::DEFAULT_WRITABLE_DIR,
+            ),
+        ))),
     );
     handler.register_static(
         "file_create",
@@ -443,6 +457,17 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     required: false,
                 },
             ],
+        },
+        ToolSpec {
+            name: "workspace_undo".to_string(),
+            description: "Undo the most recent workspace write (file_write / edit_file / \
+                          file_create): restores the pre-write snapshot byte-for-byte, \
+                          or removes the file/folder if the undo target was newly created \
+                          (tombstone). Takes no arguments; call repeatedly to step back \
+                          multiple writes. Restores outside the writable boundary are \
+                          rejected; every restore is recorded in the session journal."
+                .to_string(),
+            parameters: vec![],
         },
         ToolSpec {
             name: "file_create".to_string(),

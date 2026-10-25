@@ -632,6 +632,7 @@ fn cmd_run(
                     // journal=None(子轨迹无账)——CLI/serve 不对称。
                     // 治理段同源下放(子代理 S2 槽位与主 runner 同源,纪律无豁免面)。
                     .with_journal_dir(workdir.join("data").join("sessions"))
+                    .with_workspace_checkpoint(&workdir)
                     .with_delegate_context(
                         evo_agent::agent::delegate::DelegateContext::new(
                             agent_name,
@@ -1032,6 +1033,7 @@ async fn patrol_build_runner(
         // 步级 journal 缺位。目录随 serve 约定(<workdir>/data/sessions);
         // run_streaming_inner 打开失败 fail-soft,与 serve 同语义。
         .with_journal_dir(workdir.join("data").join("sessions"))
+        .with_workspace_checkpoint(&workdir)
         // 查账工具族接线（PR-11a）：以本会话态重绑 union 内查账工具实例
         .wire_accounting(workdir);
     // 人工审查开合(2026-09-28):巡视为无人值守场景,决策端统一 PolicyApproval

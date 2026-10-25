@@ -508,6 +508,59 @@ pub enum JournalEvent {
         /// 收场标签(answered / timeout / channel_closed)
         decision: String,
     },
+    /// 工作区写面检查点快照落账(写面撤销批):写面工具(file_write/edit_file/
+    /// file_create)⑦执行成功后,runner 将写前预捕获的文件原状态入账——
+    /// kind=content(覆盖/截断前的原内容)|tombstone(删除目标的存在性原状);
+    /// hash=blob 的 evorule-hash 口径 digest,tool=触发快照的写面工具名。
+    /// 快照失败不落本事件(结果附注 checkpoint=failed,不回滚不静默)。
+    /// 观测面,不参与步映射。
+    FileCheckpointTaken {
+        /// 工作区相对路径
+        path: String,
+        /// 快照类(content | tombstone)
+        kind: String,
+        /// blob 摘要(evorule-hash 口径)
+        hash: String,
+        /// 原内容字节数(tombstone=0)
+        bytes: u64,
+        /// 触发快照的写面工具名
+        tool: String,
+    },
+    /// workspace_undo 弹栈恢复落账(写面撤销批):undo 工具成功恢复后,runner
+    /// 将恢复结果入账——restored_hash=恢复后复算核对的 blob digest
+    /// (tombstone=移除痕迹),popped_seq=被消费的 manifest 栈目 seq。
+    /// 观测面,不参与步映射。
+    FileCheckpointRestored {
+        /// 工作区相对路径
+        path: String,
+        /// 恢复类(content | tombstone)
+        kind: String,
+        /// 恢复后核对的 blob 摘要(evorule-hash 口径)
+        restored_hash: String,
+        /// 被消费的 manifest 栈目 seq
+        popped_seq: u64,
+    },
+    /// 自验证门禁命令执行落账(自验证门禁批):runner 于轮末执行 pending
+    /// verify,每条命令一次本事件;verdict=pass(无 Error)|fail(含 Error)|
+    /// unknown(超时/启动失败);diags_digest=错误行集 digest、output_digest=
+    /// 输出全文 digest(均 evorule-hash 口径)。观测面,不参与步映射。
+    VerifyRan {
+        /// 命令名(verify 配置中的 name)
+        name: String,
+        /// 命令行原文
+        command: String,
+        /// 退出码(超时/启动失败=None;向后兼容照 execution_profile 先例)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// 解析出的 Error 行数(截断前口径)
+        error_count: usize,
+        /// 错误行集 digest(evorule-hash 口径)
+        diags_digest: String,
+        /// 判定(pass | fail | unknown)
+        verdict: String,
+        /// 输出全文 digest(evorule-hash 口径)
+        output_digest: String,
+    },
 }
 
 /// 单行 journal 记录(读侧重放消费形态)
@@ -1562,6 +1615,63 @@ impl JournalWriter {
         self.push(JournalEvent::AcceptanceCriteriaGenerated {
             criteria: criteria.to_string(),
             model: model.to_string(),
+        })
+    }
+
+    /// 工作区写面检查点快照落账(写面撤销批;best-effort 调用方决定失败处置)
+    pub fn file_checkpoint_taken(
+        &self,
+        path: &str,
+        kind: &str,
+        hash: &str,
+        bytes: u64,
+        tool: &str,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::FileCheckpointTaken {
+            path: path.to_string(),
+            kind: kind.to_string(),
+            hash: hash.to_string(),
+            bytes,
+            tool: tool.to_string(),
+        })
+    }
+
+    /// workspace_undo 弹栈恢复落账(写面撤销批;best-effort 调用方决定失败处置)
+    pub fn file_checkpoint_restored(
+        &self,
+        path: &str,
+        kind: &str,
+        restored_hash: &str,
+        popped_seq: u64,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::FileCheckpointRestored {
+            path: path.to_string(),
+            kind: kind.to_string(),
+            restored_hash: restored_hash.to_string(),
+            popped_seq,
+        })
+    }
+
+    /// 自验证门禁命令执行落账(自验证门禁批;best-effort 调用方决定失败处置)
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_ran(
+        &self,
+        name: &str,
+        command: &str,
+        exit_code: Option<i32>,
+        error_count: usize,
+        diags_digest: &str,
+        verdict: &str,
+        output_digest: &str,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::VerifyRan {
+            name: name.to_string(),
+            command: command.to_string(),
+            exit_code,
+            error_count,
+            diags_digest: diags_digest.to_string(),
+            verdict: verdict.to_string(),
+            output_digest: output_digest.to_string(),
         })
     }
 }

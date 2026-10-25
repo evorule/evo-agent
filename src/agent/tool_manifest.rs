@@ -371,6 +371,12 @@ const SWITCH_MEMORY_TOMBSTONE: &str = AGENT_TOOLS_MEMORY_TOMBSTONE;
 pub const AGENT_TOOLS_EDIT_FILE: &str = "agentTools.editFile";
 const SWITCH_EDIT_FILE: &str = AGENT_TOOLS_EDIT_FILE;
 
+/// agentTools.workspaceUndo（默认开；写面撤销——弹栈回退安全网，写面撤销批）
+///
+/// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
+pub const AGENT_TOOLS_WORKSPACE_UNDO: &str = "agentTools.workspaceUndo";
+const SWITCH_WORKSPACE_UNDO: &str = AGENT_TOOLS_WORKSPACE_UNDO;
+
 /// agentTools.webFetch（默认开；网页抓取取读——http_get 防线同源复用，批K 段2）
 ///
 /// 公开常量：serve settings schema 登记与 manifest 开关绑定共用此单一来源。
@@ -435,7 +441,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（36 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（37 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -450,6 +456,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 批K 段1:写面第五件——精准编辑(old/new 串替换+唯一性闸+保真细节),
         // 治理同 file_write(Sentineled+AutoPolicy,见下方分级段)
         b("edit_file", vec![FsWrite]),
+        // 写面撤销批:弹栈回退安全网(Standard+AutoPolicy 免裁决——不引入新
+        // 内容只回退;FsWrite 域,恢复路径复验写面白名单;红线名单含本工具)
+        b("workspace_undo", vec![FsWrite]),
         b("file_create", vec![FsWrite]),
         b("file_move", vec![FsWrite]),
         b("file_delete", vec![FsWrite]),
@@ -608,6 +617,9 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             "file_create" => sw(SWITCH_FILE_CREATE, true),
             // 批K 段1:写面精准编辑,默认开(低风险高频,同 fileCreate 先例)
             "edit_file" => sw(SWITCH_EDIT_FILE, true),
+            // 写面撤销批:弹栈回退安全网,默认开(不引入新内容只回退;
+            // 关=agent 改坏后无自助退出面,回退到用户兜底)
+            "workspace_undo" => sw(SWITCH_WORKSPACE_UNDO, true),
             // 批K 段2:网络读取/检索面,默认开
             "web_fetch" => sw(SWITCH_WEB_FETCH, true),
             "web_search" => sw(SWITCH_WEB_SEARCH, true),
@@ -968,9 +980,10 @@ mod tests {
         //   （批K 段4 todo 双件 todo_write/todo_read +2：内置 32→34，数量锁 98→100）
         //   （批K 段5 HTTP 写动词 http_request +1：内置 34→35，数量锁 100→101）
         //   （批K 段7 人在环 ask_user +1：内置 35→36，数量锁 101→102）
-        assert_eq!(builtin_manifests().len(), 36);
+        //   （写面撤销批 workspace_undo +1：内置 36→37，数量锁 102→103）
+        assert_eq!(builtin_manifests().len(), 37);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 102);
+        assert_eq!(all().len(), 103);
     }
 
     #[test]
@@ -1199,11 +1212,12 @@ mod tests {
     }
 
     /// 原 TOOL_SWITCH_KEYS 快照（tool, key, default_on）；批K 段1 edit_file
-    /// 接入 → 32 条（memory_recall/audit_query/memory_tombstone 后续接入，
-    /// 历史批注曾滞后于实际行数，20261021 批K 段4 修正口径）；批K 段4
-    /// todo_write/todo_read 接入 → 43 条；批K 段5 http_request 接入
-    /// （默认关）→ 44 条；批K 段7 ask_user 接入 → 45 条
-    const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
+/// 接入 → 32 条（memory_recall/audit_query/memory_tombstone 后续接入，
+/// 历史批注曾滞后于实际行数，20261021 批K 段4 修正口径）；批K 段4
+/// todo_write/todo_read 接入 → 43 条；批K 段5 http_request 接入
+/// （默认关）→ 44 条；批K 段7 ask_user 接入 → 45 条；写面撤销批
+/// workspace_undo 接入（默认开）→ 46 条
+const SWITCH_SNAPSHOT: &[(&str, &str, bool)] = &[
         ("file_create", "agentTools.fileCreate", true),
         ("edit_file", "agentTools.editFile", true),
         ("web_fetch", "agentTools.webFetch", true),
@@ -1257,6 +1271,8 @@ mod tests {
         ("http_request", "agentTools.httpRequest", false),
         // 人在环澄清卡（批K 段7）：默认开（交互零风险，无文件/网络/子进程触点）
         ("ask_user", "agentTools.askUser", true),
+        // 写面撤销（写面撤销批）：默认开（安全网能力——弹栈回退,不引入新内容）
+        ("workspace_undo", "agentTools.workspaceUndo", true),
     ];
 
     #[test]

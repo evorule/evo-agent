@@ -919,6 +919,7 @@ async fn construct_runner(
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源;
         // run_streaming_inner 内按会话创建 {sid}.jsonl)
         .with_journal_dir(state.workdir().join("data").join("sessions"))
+        .with_workspace_checkpoint(state.workdir())
         // 查账工具族接线（PR-11a）：以本会话态重绑 filtered 内查账工具实例
         .wire_accounting(state.workdir())
         // B2:注入 skills manifest(read_skill 已注册进 filtered,清单喂 S4b 槽位)

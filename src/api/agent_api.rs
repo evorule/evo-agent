@@ -1587,6 +1587,7 @@ async fn run_agent(
         .with_metrics(state.metrics.clone())
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
         .with_journal_dir(state.workdir.join("data").join("sessions"))
+        .with_workspace_checkpoint(&state.workdir)
         // B21 D3:注入主动压缩策略(longSession.compaction.* 设置映射;
         // CLI 面不读设置=None=不启用,行为零变化)
         .with_compaction_policy(crate::agent::runner::CompactionPolicy::from_settings(
@@ -1979,6 +1980,7 @@ async fn run_agent_stream(
     .with_metrics(state.metrics.clone())
     // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
     .with_journal_dir(state.workdir.join("data").join("sessions"))
+    .with_workspace_checkpoint(&state.workdir)
     // B21 D3:注入主动压缩策略(longSession.compaction.* 设置映射;同 run_agent 口径)
     .with_compaction_policy(crate::agent::runner::CompactionPolicy::from_settings(
         &merged_settings,
