@@ -79,6 +79,9 @@ pub struct LlmConfig {
     /// 失败重试次数
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
+    /// 单回输出上限 tokens(可选;None = 引擎兜底 4096,既有行为零变化)
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
 }
 
 impl LlmConfig {
@@ -337,6 +340,7 @@ impl Default for LlmConfig {
             executor_token: None,
             timeout_secs: default_llm_timeout(),
             max_retries: default_max_retries(),
+            max_tokens: None,
         }
     }
 }

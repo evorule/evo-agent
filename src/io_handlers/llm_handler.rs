@@ -169,6 +169,9 @@ pub struct LlmHandler {
     connect_timeout_secs: u64,
     /// 单请求总超时(秒)
     request_timeout_secs: u64,
+    /// [llm] max_tokens 配置兜底(None = 4096 硬兜底,既有行为零变化;
+    /// 请求级 params.max_tokens > 本配置 > 4096)
+    config_max_tokens: Option<u64>,
 }
 
 impl LlmHandler {
@@ -187,12 +190,20 @@ impl LlmHandler {
             max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            config_max_tokens: None,
         }
     }
 
     /// G3:覆盖最大重试次数（builder 风格；契约测试用 0 关闭重试避免退避延迟）
     pub fn with_max_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    /// [llm] max_tokens 配置兜底(builder 风格;None = 4096 硬兜底,
+    /// 请求级 params.max_tokens 仍压过本值)
+    pub fn with_config_max_tokens(mut self, v: Option<u64>) -> Self {
+        self.config_max_tokens = v;
         self
     }
 
@@ -227,6 +238,7 @@ impl LlmHandler {
             max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            config_max_tokens: None,
         }
     }
 
@@ -246,6 +258,7 @@ impl LlmHandler {
             max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            config_max_tokens: config.max_tokens,
         }
     }
 
@@ -312,6 +325,7 @@ impl LlmHandler {
             max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            config_max_tokens: None,
         }
     }
 
@@ -335,7 +349,10 @@ impl LlmHandler {
 
         let (temperature, max_tokens, _stream) = effective_generation_params(
             params_val.get("temperature").and_then(|v| v.as_f64()),
-            params_val.get("max_tokens").and_then(|v| v.as_u64()),
+            params_val
+                .get("max_tokens")
+                .and_then(|v| v.as_u64())
+                .or(self.config_max_tokens),
         );
 
         let prompt = params_val
@@ -2174,5 +2191,41 @@ mod tests {
         .unwrap();
         assert!(out.get("reasoning").is_none(), "四键形状不得多出空 reasoning 键");
         assert_eq!(out["content"], "hi");
+    }
+}
+
+#[cfg(test)]
+mod config_max_tokens_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    /// [llm] max_tokens 配置兜底三态:None=4096 硬兜底(既有行为零变化)/
+    /// 配置值生效/请求级显式值压过配置
+    #[test]
+    fn config_max_tokens_precedence() {
+        let base = LlmHandler::new("m", "https://x");
+        let body = base
+            .build_request_body(&serde_json::json!({"prompt": "p"}))
+            .unwrap();
+        assert_eq!(
+            body["max_tokens"],
+            serde_json::json!(4096),
+            "None 兜底必须保持 4096(既有行为零变化)"
+        );
+
+        let configured = base.with_config_max_tokens(Some(32768));
+        let body = configured
+            .build_request_body(&serde_json::json!({"prompt": "p"}))
+            .unwrap();
+        assert_eq!(body["max_tokens"], serde_json::json!(32768));
+
+        let body = configured
+            .build_request_body(&serde_json::json!({"prompt": "p", "max_tokens": 1024}))
+            .unwrap();
+        assert_eq!(
+            body["max_tokens"],
+            serde_json::json!(1024),
+            "请求级显式值压过配置兜底"
+        );
     }
 }
