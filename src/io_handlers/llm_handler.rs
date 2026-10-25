@@ -98,9 +98,7 @@ pub(crate) fn clear_stream_endpoint_missing_for_test(stream_url: &str) {
 
 fn stream_endpoint_missing(stream_url: &str) -> bool {
     match STREAM_ENDPOINTS_MISSING.lock() {
-        Ok(slot) => slot
-            .as_ref()
-            .is_some_and(|set| set.contains(stream_url)),
+        Ok(slot) => slot.as_ref().is_some_and(|set| set.contains(stream_url)),
         Err(_) => false, // 锁中毒不放大故障,仅退化为重复探测
     }
 }
@@ -724,7 +722,9 @@ fn executor_sse_frame_outcome(
         Ok(v) => v,
         Err(e) => {
             return (
-                vec![StreamChunk::Warn(format!("SSE 帧解析失败(跳过,流继续): {e}"))],
+                vec![StreamChunk::Warn(format!(
+                    "SSE 帧解析失败(跳过,流继续): {e}"
+                ))],
                 FrameEnd::Continue,
             );
         }
@@ -747,14 +747,14 @@ fn executor_sse_frame_outcome(
             if text.is_empty() {
                 (Vec::new(), FrameEnd::Continue)
             } else {
-                (vec![StreamChunk::Delta(text.to_string())], FrameEnd::Continue)
+                (
+                    vec![StreamChunk::Delta(text.to_string())],
+                    FrameEnd::Continue,
+                )
             }
         }
         Some("tool_call_delta") => {
-            let index = frame_json
-                .get("index")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize;
+            let index = frame_json.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             let fragment = frame_json
                 .get("fragment")
                 .and_then(Value::as_str)
@@ -787,14 +787,13 @@ fn executor_sse_frame_outcome(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let llm_response: LlmResponse = serde_json::from_value(normalized).unwrap_or_else(|_| {
-                LlmResponse {
+            let llm_response: LlmResponse =
+                serde_json::from_value(normalized).unwrap_or_else(|_| LlmResponse {
                     content,
                     tool_calls: None,
                     finish_reason: Some("stop".to_string()),
                     token_usage: None,
-                }
-            });
+                });
             *saw_done = true;
             chunks.push(StreamChunk::Done(llm_response));
             (chunks, FrameEnd::Stop)
@@ -807,7 +806,9 @@ fn executor_sse_frame_outcome(
             (Vec::new(), FrameEnd::Fail(msg.to_string()))
         }
         other => (
-            vec![StreamChunk::Warn(format!("SSE 帧类型未知(跳过): {other:?}"))],
+            vec![StreamChunk::Warn(format!(
+                "SSE 帧类型未知(跳过): {other:?}"
+            ))],
             FrameEnd::Continue,
         ),
     }
@@ -2059,7 +2060,10 @@ mod tests {
         }
         match &chunks[1] {
             StreamChunk::ThinkingDelta(t) => assert_eq!(t, "思"),
-            other => panic!("safety-net ThinkingDelta must precede Done, got {:?}", other),
+            other => panic!(
+                "safety-net ThinkingDelta must precede Done, got {:?}",
+                other
+            ),
         }
         assert!(matches!(&chunks[2], StreamChunk::Done(_)));
     }
@@ -2141,7 +2145,12 @@ mod tests {
         while let Some(item) = stream.next().await {
             chunks.push(item.expect("no error expected"));
         }
-        assert_eq!(chunks.len(), 3, "ThinkingDelta + Delta + Done: {:?}", chunks);
+        assert_eq!(
+            chunks.len(),
+            3,
+            "ThinkingDelta + Delta + Done: {:?}",
+            chunks
+        );
         match &chunks[0] {
             StreamChunk::ThinkingDelta(t) => assert_eq!(t, "思考整块"),
             other => panic!("expected ThinkingDelta first, got {:?}", other),
@@ -2169,8 +2178,12 @@ mod tests {
         assert_eq!(stream_endpoint_of("http://other/execute"), None);
         // 负缓存:按 URL 独立记账,互不误伤
         mark_stream_endpoint_missing("http://negcache-test/llm/execute-stream");
-        assert!(stream_endpoint_missing("http://negcache-test/llm/execute-stream"));
-        assert!(!stream_endpoint_missing("http://other-host/llm/execute-stream"));
+        assert!(stream_endpoint_missing(
+            "http://negcache-test/llm/execute-stream"
+        ));
+        assert!(!stream_endpoint_missing(
+            "http://other-host/llm/execute-stream"
+        ));
     }
 
     /// 归一第五键:reasoning 非空携带;非思考模型输出与原四键形状一致
@@ -2189,7 +2202,10 @@ mod tests {
             "finish_reason": "stop", "token_usage": null
         }))
         .unwrap();
-        assert!(out.get("reasoning").is_none(), "四键形状不得多出空 reasoning 键");
+        assert!(
+            out.get("reasoning").is_none(),
+            "四键形状不得多出空 reasoning 键"
+        );
         assert_eq!(out["content"], "hi");
     }
 }
