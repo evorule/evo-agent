@@ -556,21 +556,27 @@
     }
   }
 
-  // M2 滚动体验:贴底跟滚;上翻阅读时不拽回,新增消息计入浮条
+  // 滚动体验:贴底跟滚;上翻阅读时不拽回,新增消息与流式增量计入浮条
   let stickBottom = $state(true);
   let freshCount = $state(0);
   let lastMsgLen = 0; // 普通变量游标:$effect 依赖面之外,防重复计数
+  let lastTailLen = 0; // 末条消息文本长度游标(回答流式增量计数用)
   $effect(() => {
     const arr = $messages;
     const len = arr.length;
+    const tail = arr.length ? (arr[arr.length - 1].text?.length || 0) : 0;
     if (listEl) {
       if (stickBottom) {
         requestAnimationFrame(() => listEl.scrollTo({ top: listEl.scrollHeight }));
       } else if (len > lastMsgLen) {
         freshCount += len - lastMsgLen;
+      } else if (tail > lastTailLen) {
+        // 末条气泡流式增长(回答正文)也算新内容——滚离时回答抵达必须有可见信号
+        freshCount += 1;
       }
     }
     lastMsgLen = len;
+    lastTailLen = tail;
   });
 
   /** 滚动位置对账:距底 <48px 视为贴底(恢复自动跟滚),否则交还用户阅读位 */
@@ -608,27 +614,20 @@
     fullResults.add(id);
   }
 
-  // ---- 思考面板交互态(同工具卡:易失 UI 态不入消息 store、不随会话持久化) ----
-  // 流式中被手动收起的消息 id;结束后被手动展开的消息 id(两态分治:流式默认
-  // 展开、结束后默认折叠,用户手动操作覆写默认,跨流式/收态语义不互染)
-  const collapsedThinking = new SvelteSet();
+  // ---- 思考面板交互态(易失 UI 态不入消息 store、不随会话持久化) ----
+  // 一律默认折叠(含流式中):流式默认展开的旧设计经项目方令废止——长回合下
+  // 展开思考挤占视线、回答沉底;用户点击任意段展开,流式段展开时保持吸底跟滚
   const expandedThinking = new SvelteSet();
   // 流式思考体元素引用(同刻至多一条流式;$effect 吸底消费)
   let streamThinkingEl = null;
 
   function thinkingOpen(m) {
-    if (m.thinkingStreaming) return !collapsedThinking.has(m.id);
     return expandedThinking.has(m.id);
   }
 
   function toggleThinking(m) {
-    if (m.thinkingStreaming) {
-      if (collapsedThinking.has(m.id)) collapsedThinking.delete(m.id);
-      else collapsedThinking.add(m.id);
-    } else {
-      if (expandedThinking.has(m.id)) expandedThinking.delete(m.id);
-      else expandedThinking.add(m.id);
-    }
+    if (expandedThinking.has(m.id)) expandedThinking.delete(m.id);
+    else expandedThinking.add(m.id);
   }
 
   /** 思考耗时文案:非流式取 thinkingEndedAt 固化值;无起始时间返回空 */
@@ -1386,8 +1385,8 @@
     {/each}
 
     {#if !stickBottom && freshCount > 0}
-      <button type="button" class="fresh-pill" onclick={jumpToBottom} title="跳到最新消息">
-        ↓ {freshCount} 条新消息
+      <button type="button" class="fresh-pill" onclick={jumpToBottom} title="跳到底部查看最新回复">
+        ↓ 查看最新回复（{freshCount} 条新消息）
       </button>
     {/if}
 
