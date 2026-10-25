@@ -2658,7 +2658,7 @@ fn evorule_client_from(config: &evo_agent::config::Config) -> EvoruleApiClient {
         std::env::var("EVORULE_SERVICE_TOKEN").ok(),
         std::env::var("EVORULE_AUTH_TOKEN").ok(),
     ) {
-        eprintln!("evorule-agent: {msg}");
+        eprintln!("evo-agent: {msg}");
         std::process::exit(2);
     }
     EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key))
