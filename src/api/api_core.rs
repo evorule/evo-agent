@@ -213,10 +213,94 @@ fn resolve_effective_auth_token(
     }
 }
 
+/// 启动期传输面鉴权体检（fail-closed）：base_url 指向**非回环地址**而全链路
+/// （显式声明 → `EVORULE_SERVICE_TOKEN` → `EVORULE_AUTH_TOKEN`）解析不出凭据时
+/// 拒绝——把「无鉴权 server 暴露在非本机地址」的部署错配挡在启动期，而不是
+/// 放任请求以无认证形态发往远端。回环（localhost / 127.0.0.0/8 / ::1）不设限：
+/// 本机 dev 模式无鉴权是合法形态。纯函数，环境变量由调用方注入。
+pub fn check_transport_auth(
+    base_url: &str,
+    explicit_token: Option<&str>,
+    service_env: Option<String>,
+    user_env: Option<String>,
+) -> Result<(), String> {
+    let host = transport_host(base_url)
+        .ok_or_else(|| format!("base_url `{base_url}` 无法解析出主机名，无法做传输面鉴权体检"))?;
+    let loopback = host == "localhost" || host.starts_with("127.") || host == "::1";
+    if loopback {
+        return Ok(());
+    }
+    if resolve_effective_auth_token(explicit_token, service_env, user_env).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "拒绝构造 evorule 客户端: base_url `{base_url}` 为非回环地址但全链路无凭据\
+         （配置 evorum.api_key 为空，EVORULE_SERVICE_TOKEN / EVORULE_AUTH_TOKEN 均未设置）\
+         ——非本机地址 + 无鉴权 = 凭据与数据面裸奔；为部署配置凭据，或改用回环地址。"
+    ))
+}
+
+/// 从 base_url 提取主机名（容忍 http(s) 前缀 / 端口 / 路径 / IPv6 方括号形态）
+fn transport_host(base_url: &str) -> Option<String> {
+    let rest = base_url.split_once("://").map(|x| x.1).unwrap_or(base_url);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = if let Some(rest6) = authority.strip_prefix('[') {
+        rest6.split(']').next()?
+    } else {
+        authority.rsplit_once(':').map(|x| x.0).unwrap_or(authority)
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn transport_auth_rejects_non_loopback_without_token() {
+        let err = check_transport_auth("http://192.168.1.10:18080", Some(""), None, None)
+            .expect_err("非回环+全链路无凭据必须拒");
+        assert!(err.contains("拒绝"), "{err}");
+    }
+
+    #[test]
+    fn transport_auth_allows_loopback_without_token() {
+        for url in [
+            "http://127.0.0.1:18080",
+            "http://localhost:18080",
+            "http://[::1]:18080",
+        ] {
+            check_transport_auth(url, Some(""), None, None)
+                .unwrap_or_else(|e| panic!("{url} 回环不应拒: {e}"));
+        }
+    }
+
+    #[test]
+    fn transport_auth_allows_non_loopback_with_env_token() {
+        check_transport_auth(
+            "http://192.168.1.10:18080",
+            Some(""),
+            Some("svc".into()),
+            None,
+        )
+        .expect("环境变量凭据应放行");
+    }
+
+    #[test]
+    fn transport_auth_allows_non_loopback_with_explicit_token() {
+        check_transport_auth("http://192.168.1.10:18080", Some("k"), None, None)
+            .expect("显式凭据应放行");
+    }
+
+    #[test]
+    fn transport_auth_rejects_unparsable_url() {
+        assert!(check_transport_auth("http://", Some(""), None, None).is_err());
+    }
 
     #[test]
     fn test_resolve_auth_token_service_takes_precedence() {

@@ -162,7 +162,9 @@ enum Command {
     },
 
     /// 定时自治调度(常驻;纯确定性组件,cron 按分钟触发 run/patrol 子命令,
-    /// 错过不补跑逐条留痕;配置见 evo-agent.toml [schedule] 节)
+    /// 错过不补跑逐条留痕)。配置:`workdir` 下 `evo-agent.toml` 的可选
+    /// `[schedule]` 节——**无该节时本子命令拒绝启动**(打印指引并返回失败,
+    /// 不静默空转);字段定义见 `src/schedule.rs`(ScheduleConfig/ScheduleJob)。
     Schedule,
 
     /// 进化巡视任务模式(一次性):信号探查 → 有信号则 agent 起草+提名 →
@@ -2646,7 +2648,19 @@ fn cmd_serve(
 /// EvoruleApiClient 统一工厂（理顺批 P3 卫生收敛）：base_url/api_key 取值
 /// 单点声明，各子命令禁止散落 `with_auth_token(&config.evorule.base_url, …)`
 /// 式重复拼接，防鉴权口径漂移。
+///
+/// 工厂同时是**传输面鉴权体检的唯一闸口**（fail-closed）：非回环地址 +
+/// 全链路无凭据 ⇒ 拒绝启动（错误信息给配置指引）。本机回环 dev 无鉴权不受影响。
 fn evorule_client_from(config: &evo_agent::config::Config) -> EvoruleApiClient {
+    if let Err(msg) = evo_agent::api::api_core::check_transport_auth(
+        &config.evorule.base_url,
+        Some(&config.evorule.api_key),
+        std::env::var("EVORULE_SERVICE_TOKEN").ok(),
+        std::env::var("EVORULE_AUTH_TOKEN").ok(),
+    ) {
+        eprintln!("evorule-agent: {msg}");
+        std::process::exit(2);
+    }
     EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key))
 }
 
