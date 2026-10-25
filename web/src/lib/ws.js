@@ -44,6 +44,7 @@ initAuditWatcher(sessionId, turnActive, (e) => pushPanelEvent('gov', e));
 
 let ws = null;
 let streamMsgId = null; // 当前轮流式 assistant 气泡
+let turnErrorText = null; // 本轮已推送错误文案(Error+Done 同文案双发去重;轮起复位)
 let lastToolMsgId = null; // 最近一个运行中工具气泡(按 name 匹配结果)
 let toolStartedAt = 0; // 当前工具调用起始时刻(M2:ToolResult 时算耗时 tookMs)
 // M2:工具 args/result 的客户端截断帽(原 safeJson 缺省 400)。编辑类 diff
@@ -250,6 +251,7 @@ export async function sendMessage(content, mentions = [], opts = {}) {
   }
   pushMessage({ kind: 'user', text: content, mentions: used, dropped });
   streamMsgId = pushMessage({ kind: 'assistant', text: '', streaming: true });
+  turnErrorText = null;
   stepCount.set(0);
   turnActive.set(true);
   // S3:对话模式 wire-only 提示块(气泡仍显示原文;仅强化先确认后变更的
@@ -387,6 +389,7 @@ function sendResume() {
     text: '正在恢复会话——agent 将加载历史并续完中断的轮次;挂起的人工审批不会被恢复,须重走审批。',
   });
   streamMsgId = pushMessage({ kind: 'assistant', text: '', streaming: true });
+  turnErrorText = null;
   stepCount.set(0);
   turnActive.set(true);
   ws.send(JSON.stringify({ type: 'resume' }));
@@ -415,6 +418,7 @@ function handleFrame(f) {
           // 回注历史块(气泡显示仍为原文)
           pushMessage({ kind: 'user', text: rb.userText });
           streamMsgId = pushMessage({ kind: 'assistant', text: '', streaming: true });
+          turnErrorText = null;
           stepCount.set(0);
           turnActive.set(true);
           ws.send(
@@ -513,7 +517,7 @@ function handleFrame(f) {
           recoverFromDeadSession(f.error);
           break;
         }
-        pushMessage({ kind: 'error', text: String(f.error) });
+        pushTurnError(String(f.error));
         pushPanelEvent('gov', { label: 'TurnFailed', detail: String(f.error), level: 'error' });
       } else {
         pushPanelEvent('sys', { label: 'Done', detail: `本轮完成(step ${f.steps ?? '?'})` });
@@ -528,7 +532,7 @@ function handleFrame(f) {
         break;
       }
       finishStream();
-      pushMessage({ kind: 'error', text: String(f.error) });
+      pushTurnError(String(f.error));
       pushPanelEvent('gov', { label: 'Error', detail: String(f.error), level: 'error' });
       turnActive.set(false);
       break;
@@ -668,6 +672,14 @@ function finishStream() {
     );
     streamMsgId = null;
   }
+}
+
+/** 失败轮错误卡推送:同轮同文案只渲染一条(Error 帧与 Done(success=false)
+ * 常携带同一错误双发;不同文案仍各自上报,轮起即复位)。 */
+function pushTurnError(text) {
+  if (text === turnErrorText) return;
+  turnErrorText = text;
+  pushMessage({ kind: 'error', text });
 }
 
 function safeJson(v, cap = 400) {
