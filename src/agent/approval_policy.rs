@@ -796,7 +796,7 @@ max_actions_per_run = 200
         );
     }
 
-    /// O-547 回归：内置注册名 edit_file 与 workspace_undo 必须命中治理配置红线
+    /// 回归：内置注册名 edit_file 与 workspace_undo 必须命中治理配置红线
     /// （修复前名单缺 edit_file——`.` 边界下可绕强制人工直改 .evo/ 治理配置）
     #[test]
     fn red_line_edit_and_undo_governance_config() {
