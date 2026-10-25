@@ -592,9 +592,11 @@
     listEl?.scrollTo({ top: listEl.scrollHeight });
   }
 
-  // ---- M2 工具卡交互态(易失 UI 态,不入消息 store、不随会话持久化) ----
-  const expandedTools = $state(new Set());
-  const fullResults = $state(new Set());
+  // ---- 工具卡交互态(易失 UI 态,不入消息 store、不随会话持久化) ----
+  // 必须用 SvelteSet:$state 对 Set 变更不触发重渲染(真机实锤——展开/查看
+  // 全部点击失灵,卡片永远收起=「内容不显示」的交互层根因)
+  const expandedTools = new SvelteSet();
+  const fullResults = new SvelteSet();
   const TOOL_RESULT_CAP = 4000; // 展开态预览截断帽(「查看全部」解锁全文)
 
   function toggleTool(id) {
