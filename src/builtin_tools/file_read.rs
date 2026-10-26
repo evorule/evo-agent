@@ -66,8 +66,21 @@ impl ToolFunction for FileReadTool {
 }
 
 impl FileReadTool {
+    /// 单次读取的缺省分段长度(字节):大文件未显式给 length 时按此分段,
+    /// 返回体自带 truncated 标记,agent 可用 offset 续读。
+    pub const DEFAULT_READ_CHUNK: u64 = 256 * 1024;
+
     /// 同步实现(供 spawn_blocking 调用)
+    ///
+    /// 可选参数(主流 Read 工具形态):
+    /// - `offset`(字节,缺省 0):起始偏移
+    /// - `length`(字节,缺省 256KB,上限 max_bytes):本次读取长度
+    ///
+    /// 返回 map 恒含 `path/size/offset/read_bytes/content`,文件后段未读完时
+    /// 另含 `truncated: true`——agent 按返回的 offset 续读即可渐进消费大文件。
     fn call_sync(&self, args: &Value) -> IoResult {
+        use std::io::{Read as _, Seek, SeekFrom};
+
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -81,16 +94,30 @@ impl FileReadTool {
             return Err(format!("not a regular file: '{}'", path));
         }
 
-        if metadata.len() > self.max_bytes {
-            return Err(format!(
-                "file too large: {} bytes (max {} bytes); use head/tail/grep on the agent side",
-                metadata.len(),
-                self.max_bytes
-            ));
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+        let length = args
+            .get("length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(Self::DEFAULT_READ_CHUNK)
+            .min(self.max_bytes);
+
+        let mut file =
+            std::fs::File::open(&safe_path).map_err(|e| format!("open failed: {}", e))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("seek failed: {}", e))?;
+
+        // 读取上限=max_bytes(与既有安全模型一致,防 length 传巨值绕过)
+        let mut bytes = Vec::new();
+        {
+            let mut take = (&mut file).take(length.min(self.max_bytes));
+            take.read_to_end(&mut bytes)
+                .map_err(|e| format!("read failed (binary or permission?): {}", e))?;
         }
 
-        let content = std::fs::read_to_string(&safe_path)
-            .map_err(|e| format!("read failed (binary or permission?): {}", e))?;
+        // 按字节读,UTF-8 边界截断(lossy 保证无 panic)
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        let read_bytes = bytes.len() as u64;
+        let more = offset + read_bytes < metadata.len();
 
         let mut map = serde_json::Map::new();
         map.insert(
@@ -98,7 +125,16 @@ impl FileReadTool {
             Value::from(safe_path.display().to_string()),
         );
         map.insert("size".to_string(), Value::from(metadata.len() as i64));
+        map.insert("offset".to_string(), Value::from(offset as i64));
+        map.insert("read_bytes".to_string(), Value::from(read_bytes as i64));
         map.insert("content".to_string(), Value::from(content));
+        if more {
+            map.insert("truncated".to_string(), Value::from(true));
+            map.insert(
+                "next_offset".to_string(),
+                Value::from((offset + read_bytes) as i64),
+            );
+        }
         Ok(Value::Object(map))
     }
 }
@@ -255,9 +291,81 @@ mod tests {
             m.insert("path".to_string(), Value::from("big.txt"));
             m
         }));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("too large"), "got: {}", err);
+        // 行为变更(2026-10-26):超限文件不再死报错,返回首段+truncated 标记
+        // (主流 Read 工具形态;agent 按返回的 next_offset 渐进续读)
+        let v = result.unwrap();
+        assert_eq!(
+            v.get("truncated").unwrap().as_bool().unwrap(),
+            true,
+            "超限文件首段读取应标记 truncated"
+        );
+        assert_eq!(v.get("offset").unwrap().as_i64().unwrap(), 0);
+        assert_eq!(
+            v.get("read_bytes").unwrap().as_i64().unwrap(),
+            256 * 1024,
+            "缺省 length 被钳到 max_bytes"
+        );
+    }
+
+    #[test]
+    fn test_offset_and_length_segmented_read() {
+        let dir = temp_workdir();
+        let file = dir.path().join("seg.txt");
+        std::fs::write(&file, b"0123456789abcdefghij").unwrap();
+
+        let tool = make_tool(dir.path());
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("seg.txt"));
+            m.insert("offset".to_string(), Value::from(5 as i64));
+            m.insert("length".to_string(), Value::from(4 as i64));
+            m
+        }));
+        let v = result.unwrap();
+        assert_eq!(v.get("content").unwrap().as_str().unwrap(), "5678");
+        assert_eq!(v.get("offset").unwrap().as_i64().unwrap(), 5);
+        assert_eq!(v.get("read_bytes").unwrap().as_i64().unwrap(), 4);
+        assert_eq!(
+            v.get("truncated").unwrap().as_bool().unwrap(),
+            true,
+            "文件尾还有内容,应标记 truncated 并给出续读游标"
+        );
+        assert_eq!(v.get("next_offset").unwrap().as_i64().unwrap(), 9);
+    }
+
+    #[test]
+    fn test_default_read_returns_whole_small_file() {
+        let dir = temp_workdir();
+        let file = dir.path().join("small.txt");
+        std::fs::write(&file, b"hello").unwrap();
+
+        let tool = make_tool(dir.path());
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("small.txt"));
+            m
+        }));
+        let v = result.unwrap();
+        assert_eq!(v.get("content").unwrap().as_str().unwrap(), "hello");
+        assert_eq!(v.get("truncated"), None);
+    }
+
+    #[test]
+    fn test_offset_beyond_eof_returns_empty_content() {
+        let dir = temp_workdir();
+        let file = dir.path().join("tiny.txt");
+        std::fs::write(&file, b"abc").unwrap();
+
+        let tool = make_tool(dir.path());
+        let result = tool.call_sync(&Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("path".to_string(), Value::from("tiny.txt"));
+            m.insert("offset".to_string(), Value::from(100 as i64));
+            m
+        }));
+        let v = result.unwrap();
+        assert_eq!(v.get("content").unwrap().as_str().unwrap(), "");
+        assert_eq!(v.get("read_bytes").unwrap().as_i64().unwrap(), 0);
     }
 
     #[test]
