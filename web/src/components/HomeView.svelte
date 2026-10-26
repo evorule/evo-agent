@@ -152,12 +152,12 @@
     <section class="sec">
       <div class="sec-head">
         <span class="sec-title">工作区</span>
-        <span class="ws-cur mono" title={ws || 'serve workdir'}>{ws || '缺省(serve workdir)'}</span>
+        <span class="ws-cur mono" title={ws || '未选择——agent 目前只能访问程序启动目录'}>{ws || '未选择(程序启动目录)'}</span>
       </div>
       <div class="btn-row">
         <button class="btn" onclick={() => (browserOpen = true)}>浏览目录…</button>
-        <button class="btn" disabled={!ws} onclick={() => switchTo('')} title="恢复为 serve workdir 根">
-          恢复缺省
+        <button class="btn" disabled={!ws} onclick={() => switchTo('')} title="恢复为程序启动目录根">
+          恢复默认位置
         </button>
         <button class="btn ghost" onclick={reconnectNow} title="以当前工作区重建 agent 连接(能力边界生效)">
           立即重连

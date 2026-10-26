@@ -40,8 +40,8 @@
   function syncWs() {
     wsPath = localStorage.getItem('evo_workspace') || '';
   }
-  $: wsText = wsPath ? `工作区:${workspaceLabel(wsPath) || wsPath}` : '工作区:缺省';
-  $: wsTitle = wsPath || '缺省(serve workdir)';
+  $: wsText = wsPath ? `工作区:${workspaceLabel(wsPath) || wsPath}` : '工作区:未选择';
+  $: wsTitle = wsPath || '未选择工作区——agent 目前只能访问程序启动目录,点右上角工作区按钮选择';
   $: approvalView = approvalPresetView(
     $settingsState.settings[APPROVAL_MODE_KEY],
     $settingsState.settings[APPROVAL_EXEMPTION_KEY],

@@ -104,7 +104,7 @@
       class="gov-chip mono"
       title={$toolWhitelist ? `agent 工具白名单(${$toolWhitelist.length}):${$toolWhitelist.join(', ')}` : '工具白名单未加载'}
     >
-      白名单 {$toolWhitelist === null ? '—' : $toolWhitelist.length}
+      可用工具 {$toolWhitelist === null ? '—' : $toolWhitelist.length}
     </span>
     <span
       class="gov-chip mono"
@@ -113,7 +113,7 @@
         ? '违规信号未加载(需已建立会话且 evorule 可达)'
         : `当前会话违规信号累计 ${$signalCount} 条`}
     >
-      信号 {$signalCount === null ? '—' : $signalCount}
+      违规信号 {$signalCount === null ? '—' : $signalCount}
     </span>
     <button
       class="gov-chip mono"

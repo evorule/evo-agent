@@ -88,7 +88,7 @@
 
   /** 工作区按钮显示名:末段路径(长路径收窄);缺省态显式标示 */
   function workspaceLabel() {
-    if (!workspace) return '工作区:缺省';
+    if (!workspace) return '工作区:未选择';
     const parts = workspace.split(/[\\/]/).filter(Boolean);
     return `工作区:${parts[parts.length - 1] || workspace}`;
   }
@@ -1157,6 +1157,16 @@
               : '连接已断开,请确认 evo-agent serve 正在运行。'}
         </div>
       </div>
+    {/if}
+    {#if !workspace}
+      <button
+        type="button"
+        class="ws-hint"
+        onclick={editWorkspace}
+        title="选择后 agent 即可在该文件夹内读写"
+      >
+        ⚠ 未选择工作文件夹——agent 目前只能访问程序自带目录。点击选择你的工作文件夹
+      </button>
     {/if}
     {#if $messages.length > renderCount || $transcriptHasMore}
       <button
@@ -2366,6 +2376,21 @@
   }
   .process-body .row {
     margin-top: 0;
+  }
+  /* 未选择工作区的引导条(术语白话化批):缺省目录对用户是黑盒,显式引导选择 */
+  .ws-hint {
+    margin: 0 0 var(--sp-xs);
+    padding: 7px 10px;
+    font-size: 11px;
+    text-align: left;
+    color: var(--warning);
+    background: rgba(210, 153, 34, 0.12);
+    border: 1px solid var(--warning);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .ws-hint:hover {
+    background: rgba(210, 153, 34, 0.22);
   }
   .process-body .tool-card,
   .process-body .thinking-card {
