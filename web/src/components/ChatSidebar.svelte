@@ -482,6 +482,20 @@
     }
   }
 
+  /** 中断回合「继续」横幅(37 号项 1):会话切换/清单刷新后,若当前会话
+   *  存在未完回合→把恢复入口以横幅带到眼前(启动壳即见,不必进历史翻找)。
+   *  语义同上:只列不续,点击经 askResume 显式确认。 */
+  async function refreshResumeBanner() {
+    const sid = $sessionId;
+    if (!sid || $turnActive) {
+      return;
+    }
+    await loadResumable();
+    if (resumableIds.has(sid)) {
+      reconnectBannerSid = sid;
+    }
+  }
+
   /** B25 谱系归属链加载(fail-soft:端点不可用 = 列表原样平铺) */
   async function loadLineage() {
     try {
@@ -539,6 +553,11 @@
     void $sessionId;
     renderCount = RENDER_WINDOW;
   });
+  $effect(() => {
+    // 换线/启动后:当前会话存在可恢复回合 → 顶部横幅(37 号项 1)
+    void $sessionId;
+    refreshResumeBanner();
+  });
 
   // ---- 回合内过程容器(项目方令):思考与工具调用收进一个框 ----
   // 回合进行中=框内实时展开(左缘品牌色+「进行中」标);正文/回答气泡抵达
@@ -573,6 +592,8 @@
   async function onLoadOlder() {
     if (loadingOlder) return;
     loadingOlder = true;
+    // 滚动锚定(37 号项 4):前插旧内容后把视口停在原阅读位,不跳顶
+    const prevHeight = listEl?.scrollHeight ?? 0;
     try {
       if ($messages.length > renderCount) {
         // 仅扩渲染窗(消息已在内存)
@@ -582,6 +603,10 @@
         await loadOlderTranscript($sessionId);
         renderCount += RENDER_WINDOW_STEP;
       }
+      requestAnimationFrame(() => {
+        if (!listEl) return;
+        listEl.scrollTop += listEl.scrollHeight - prevHeight;
+      });
     } finally {
       loadingOlder = false;
     }
@@ -1068,7 +1093,10 @@
             <button
               class="session-item"
               class:current={s.session_id === $sessionId}
-              onclick={() => openSession(s.session_id)}
+              onclick={() => {
+                openSession(s.session_id);
+                showHistory = false; // 选中即收起:内容独占阅读位(37 号项 3)
+              }}
               title={s.lineage ? `${s.lineage.display} · ${s.session_id}` : s.session_id}
             >
               <span class="s-title">
