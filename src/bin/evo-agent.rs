@@ -159,6 +159,14 @@ enum Command {
         /// 写边界不放宽
         #[arg(long, value_hint = ValueHint::DirPath)]
         read_root: Option<PathBuf>,
+
+        /// 38 号方案 X:agent 能力边界根(可选,绝对路径,不存在自动创建)
+        /// ——fs 沙箱族(file_* / shell_exec cwd)与能力边界相对该根解析;
+        /// 缺省=workdir(行为零变化)。与 --workdir 解耦:workdir 承载编排
+        /// 基础设施(toml/junction/dist/rules/会话持久化),agent-root 承载
+        /// 用户语义的读写区,两者分离后桌面/服务化可把边界指到用户文件夹
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        agent_root: Option<PathBuf>,
     },
 
     /// 定时自治调度(常驻;纯确定性组件,cron 按分钟触发 run/patrol 子命令,
@@ -397,6 +405,7 @@ fn main() -> ExitCode {
             auth_token,
             no_auth,
             read_root,
+            agent_root,
         } => run_with_big_stack(move || {
             // serve 与 run/patrol/workflow 同款走 16MB 大栈线程
             // ——启动期 service-tools 注册与 MCP 连接在 cmd_serve 内建的
@@ -408,6 +417,7 @@ fn main() -> ExitCode {
                 &auth_token,
                 no_auth,
                 read_root.as_deref(),
+                agent_root.as_deref(),
             )
         }),
         Command::Schedule => run_with_big_stack(move || cmd_schedule(&cli.workdir)),
@@ -1919,6 +1929,7 @@ fn cmd_serve(
     auth_tokens: &[String],
     no_auth: bool,
     read_root: Option<&Path>,
+    agent_root: Option<&Path>,
 ) -> ExitCode {
     use evo_agent::api::agent_api;
     use evo_agent::api::auth::{AuthConfig, AuthPosture};
@@ -2109,9 +2120,24 @@ fn cmd_serve(
         },
         None => None,
     };
+    // 38 号方案 X:agent 能力边界根(缺省=workdir 零变化;不存在自动创建——
+    // 用户文件夹首启即用,无需预先手工建)
+    let agent_root_buf = match agent_root {
+        Some(r) => {
+            if let Err(e) = std::fs::create_dir_all(r) {
+                eprintln!("[serve] --agent-root '{}' invalid: {e}", r.display());
+                return ExitCode::from(1);
+            }
+            Some(r.to_path_buf())
+        }
+        None => None,
+    };
     let workspace_client = std::sync::Arc::new(WorkspaceApiClient::new(evorule_client.base_url()));
+    // 38 号方案 X:工具沙箱根=agent_root(缺省=workdir,行为零变化)——
+    // 编排基础设施(toml/junction/dist/rules/会话持久化)仍在 workdir,
+    // agent 语义的读写区与之解耦(桌面/服务化可把边界指到用户文件夹)
     let mut toolkit = evo_agent::api::serve_tools::build_union_toolkit_with_read_root(
-        workdir,
+        agent_root_buf.as_deref().unwrap_or(workdir),
         read_root_buf.as_deref().unwrap_or(workdir),
         &workspace_client,
         &evorule_client,
@@ -2251,6 +2277,9 @@ fn cmd_serve(
     // 会话期 wire 面消费此值合成边界自报(工具绑定已在启动期 toolkit 完成)
     if let Some(rr) = read_root_buf {
         state = state.with_read_root(rr);
+        if let Some(ar) = &agent_root_buf {
+            state = state.with_agent_root(ar.clone());
+        }
     }
     // B16:MCP 管理器+配置存储成对注入(mcp_enabled 时;None = /api/mcp/* 503)
     if mcp_enabled {

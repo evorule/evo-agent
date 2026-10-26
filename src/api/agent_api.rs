@@ -260,6 +260,8 @@ pub struct AgentApiState {
     /// 行为与 v1 一致)。读面工具绑定发生在启动期 toolkit 构建,wire 面仅
     /// 消费此值合成边界自报
     read_root: Option<std::path::PathBuf>,
+    /// 38 号方案 X:agent 能力边界根(缺省=workdir;None=未显式指定)
+    agent_root: Option<std::path::PathBuf>,
     /// E1:Workspace API 客户端(规则工具依赖)
     workspace_client: Arc<WorkspaceApiClient>,
     /// E1:预建 union toolkit(内置 + 规则,启动时组装一次)
@@ -445,6 +447,8 @@ impl AgentApiState {
             // B 批「读宽写窄」:缺省 None(读写同域),serve 启动按 --read-root
             // with_read_root 注入
             read_root: None,
+            // 38 号方案 X:agent 能力边界根(缺省=workdir;serve 启动按 --agent-root with_agent_root 注入)
+            agent_root: None,
             workspace_client,
             toolkit,
             llm_status: Arc::new(std::sync::RwLock::new(LlmStatusSnapshot::unconfigured())),
@@ -630,6 +634,18 @@ impl AgentApiState {
     pub fn with_read_root(mut self, read_root: std::path::PathBuf) -> Self {
         self.read_root = Some(read_root);
         self
+    }
+
+    /// 38 号方案 X:注入 agent 能力边界根(builder pattern,供 cmd_serve 按
+    /// `--agent-root` 启动参数调用;None=缺省 workdir,行为零变化)
+    pub fn with_agent_root(mut self, agent_root: std::path::PathBuf) -> Self {
+        self.agent_root = Some(agent_root);
+        self
+    }
+
+    /// 38 号方案 X:agent 能力边界根(None=未显式指定,语义=workdir)
+    pub fn agent_root(&self) -> Option<&std::path::Path> {
+        self.agent_root.as_deref()
     }
 
     /// E1:获取 WorkspaceApiClient 的引用(规则工具依赖)
@@ -1487,10 +1503,12 @@ async fn run_agent(
     // M5-a:能力边界接线(显式声明重绑 file 工具沙箱 + 生效边界注入 runner)
     // B 批「读宽写窄」:读域根经 state 注入(--read-root);请求带 workspace 时
     // 声明优先,read_root 不参与(workspace=请求级完整意志,同域边界)
+    // 38 号方案 X:能力边界根优先取 --agent-root(缺省=workdir)
+    let boundary_root = state.agent_root().unwrap_or(state.workdir());
     let capability_boundary = crate::api::serve_tools::wire_capability_boundary_with_read_root(
         &mut filtered,
         &def,
-        state.workdir(),
+        boundary_root,
         state.read_root(),
     );
     // S2 治理门禁段(S2 前移批):三段合并构造,经 runner 配置进组装层
@@ -1927,10 +1945,12 @@ async fn run_agent_stream(
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
     // M5-a:能力边界接线(同 run_agent 口径;B 批「读宽写窄」读域根经 state 注入)
+    // 38 号方案 X:能力边界根优先取 --agent-root(缺省=workdir)
+    let boundary_root = state.agent_root().unwrap_or(state.workdir());
     let capability_boundary = crate::api::serve_tools::wire_capability_boundary_with_read_root(
         &mut filtered,
         &def,
-        state.workdir(),
+        boundary_root,
         state.read_root(),
     );
     // S2 治理门禁段(S2 前移批):同 run_agent 口径
