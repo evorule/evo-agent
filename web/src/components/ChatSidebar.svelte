@@ -1064,7 +1064,7 @@
   }
 </script>
 
-<aside class="chat" data-zone="chat" style:width={`${$chatWidth}px`}>
+<aside class="chat" class:history-open={showHistory} data-zone="chat" style:width={`${$chatWidth}px`}>
   <div class="chat-header">
     <span class="title">对话</span>
     <div class="header-actions">
@@ -1826,6 +1826,7 @@
 <style>
   .chat {
     /* 宽度由宿主经 inline style 绑定 chatWidth(300–560px,持久化 evo_chat_w) */
+    position: relative; /* 历史浮层的定位锚 */
     flex-shrink: 0;
     background: var(--sidebar-bg);
     border-left: 1px solid var(--border);
@@ -1875,14 +1876,21 @@
     gap: var(--sp-xs);
   }
   .session-list {
-    flex-shrink: 0;
-    max-height: 200px;
+    /* 互斥布局:历史打开时浮层独占对话栏,不挤压对话内容;关闭即恢复 */
+    position: absolute;
+    inset: 0;
+    z-index: 25;
+    background: var(--bg-card);
     overflow-y: auto;
-    border-bottom: 1px solid var(--border);
     padding: var(--sp-xs);
     display: flex;
     flex-direction: column;
     gap: 2px;
+  }
+  /* 历史打开时隐藏对话流与输入框(互斥) */
+  .chat.history-open .msg-list,
+  .chat.history-open .composer {
+    display: none;
   }
   .session-empty {
     padding: var(--sp-sm);
