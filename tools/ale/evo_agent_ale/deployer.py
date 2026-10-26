@@ -217,7 +217,7 @@ class EvoAgentDeployer(BaseAgentDeployer):
                     "see serve-stderr.log in the run work_dir"
                 )
             try:
-                await asyncio.to_thread(self._http_json, "GET", f"{base}/health", None, 5.0)
+                await asyncio.to_thread(self._http_ok, f"{base}/health", 5.0)
                 return
             except Exception:
                 if asyncio.get_running_loop().time() >= deadline:
@@ -383,6 +383,21 @@ class EvoAgentDeployer(BaseAgentDeployer):
     # ------------------------------------------------------------------
     # HTTP helper (stdlib only)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _http_ok(url: str, timeout: float | None) -> None:
+        """Liveness probe: GET the URL, HTTP 200 == healthy.
+
+        Deliberately body-agnostic — serve's ``/health`` returns a
+        plain-text body (``ok``), not JSON (the established probe
+        convention), so the JSON-parsing ``_http_json`` must not be used
+        here: it would raise on every poll and burn the whole start
+        timeout against a perfectly healthy serve.
+        """
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            if resp.status != 200:
+                raise RuntimeError(f"health probe returned HTTP {resp.status}")
 
     @staticmethod
     def _http_json(
