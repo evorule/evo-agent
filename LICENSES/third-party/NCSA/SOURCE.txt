@@ -1,0 +1,7 @@
+Source: https://opensource.org/licenses/NCSA (OSI, University of Illinois/NCSA
+        Open Source License page), licence text block extracted verbatim.
+Retrieved: 2026-10-24
+Reason: libfuzzer-sys (evo-agent dev-dependency) declares
+        '(MIT OR Apache-2.0) AND NCSA'. The NCSA part is a mandatory AND
+        component and cannot be elected away, but the upstream crate ships
+        no NCSA text.

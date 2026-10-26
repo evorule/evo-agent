@@ -17,7 +17,8 @@
 # console 仓同理（-ConsoleRepo，默认同级 evorule-console-cloud）。
 #
 # 用法：powershell -File build-installer.ps1 [-SkipCollect] [-UpdateUrlBase <base>] [-ReleaseNotes <notes>]
-#       [-LicenseSsot <根仓目录>]（缺省取本仓同级 evorule 目录）
+# 五件套来源：THIRD-PARTY-NOTICES.md 与 LICENSES/third-party/ 为本仓自持件
+# （桌面分发面仓集子集，由根仓 gen_notice.py --repos 生成并随本仓版本化），不再取自其他仓。
 # 产物：desktop\target\release\bundle\nsis\evo-agent-desktop_<ver>_x64-setup.exe（+.sig）
 #       desktop\target\release\bundle\updater\{setup.exe, .sig, latest.json, 源码 tarball}（发布归集）
 #
@@ -37,7 +38,6 @@ param(
     [switch]$SkipFreshness,
     [string]$ServerRepo = "",
     [string]$ConsoleRepo = "",
-    [string]$LicenseSsot = "",
     [string]$UpdateUrlBase = "",
     [string]$ReleaseNotes = ""
 )
@@ -48,7 +48,6 @@ $srcTauri = Join-Path $desktop "src-tauri"
 $repoRoot = Split-Path $desktop -Parent
 if (-not $ServerRepo) { $ServerRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-server" }
 if (-not $ConsoleRepo) { $ConsoleRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-console-cloud" }
-if (-not $LicenseSsot) { $LicenseSsot = Join-Path (Split-Path $repoRoot -Parent) "evorule" }
 
 if (-not $SkipCollect) {
     # 新鲜度门（发版前置红线）:产物须新于源码最后提交(先定稿提交、再 release
@@ -99,21 +98,24 @@ if (-not $SkipCollect) {
     Write-Host "collected $templateToml -> resources\evo-agent\evo-agent.toml"
 
     # 许可证合规五件套（AGPL §4）：LICENSE/NOTICE.md 用本仓自带；THIRD-PARTY-NOTICES.md
-    # 与 LICENSES/third-party/ 出自根仓声明面单一事实源（-LicenseSsot，缺省同级 evorule
-    # 目录，钉版内容随根仓声明面维护）；SOURCE.md 按本次构建动态生成（§13 指纹表填实值，
-    # 内嵌组件源码入口一并列明）。落 src-tauri\resources\license\，由 tauri.conf.json
-    # bundle.resources 承接入安装包（安装目录 resources\license\）。
-    if (-not (Test-Path (Join-Path $LicenseSsot "THIRD-PARTY-NOTICES.md")) -or
-        -not (Test-Path (Join-Path $LicenseSsot "LICENSES\third-party"))) {
-        throw "license SSOT incomplete: $LicenseSsot（需 THIRD-PARTY-NOTICES.md + LICENSES\third-party\，-LicenseSsot 可覆盖路径）"
+    # 与 LICENSES/third-party/ 为本仓自持件（桌面分发面仓集子集：evo-agent +
+    # evorule-server + evorule-console-cloud 并集，由根仓 gen_notice.py --repos
+    # 生成并随本仓版本化，依赖变化时重跑生成脚本更新）；SOURCE.md 按本次构建
+    # 动态生成（§13 指纹表填实值，内嵌组件源码入口一并列明）。落
+    # src-tauri\resources\license\，由 tauri.conf.json bundle.resources 承接入
+    # 安装包（安装目录 resources\license\）。不取自任何其他仓checkout——
+    # 应用分发面与内核仓声明面解耦（架构红线 2026-10-26）。
+    if (-not (Test-Path (Join-Path $repoRoot "THIRD-PARTY-NOTICES.md")) -or
+        -not (Test-Path (Join-Path $repoRoot "LICENSES\third-party"))) {
+        throw "self-held license files missing: $repoRoot（需 THIRD-PARTY-NOTICES.md + LICENSES\third-party\；由根仓 gen_notice.py --repos 生成后随本仓版本化）"
     }
     $licDst = Join-Path $srcTauri "resources\license"
     if (Test-Path $licDst) { Remove-Item $licDst -Recurse -Force }
     New-Item -ItemType Directory -Path (Join-Path $licDst "LICENSES") -Force | Out-Null
     Copy-Item (Join-Path $desktop "LICENSE") (Join-Path $licDst "LICENSE") -Force
     Copy-Item (Join-Path $repoRoot "NOTICE.md") (Join-Path $licDst "NOTICE.md") -Force
-    Copy-Item (Join-Path $LicenseSsot "THIRD-PARTY-NOTICES.md") $licDst -Force
-    Copy-Item (Join-Path $LicenseSsot "LICENSES\third-party") (Join-Path $licDst "LICENSES\third-party") -Recurse -Force
+    Copy-Item (Join-Path $repoRoot "THIRD-PARTY-NOTICES.md") $licDst -Force
+    Copy-Item (Join-Path $repoRoot "LICENSES\third-party") (Join-Path $licDst "LICENSES\third-party") -Recurse -Force
 
     # §13 源码 tarball（git archive 于本仓 HEAD 生成）+ 指纹，落 updater 归集目录，
     # 随三件套一并人工上传；内嵌组件（引擎/ai-plugin/console）源码各随其仓发版，
@@ -166,7 +168,7 @@ if (-not $SkipCollect) {
 许可正文与归属声明见本目录 THIRD-PARTY-NOTICES.md 与 LICENSES/third-party/。
 "@
     [System.IO.File]::WriteAllText((Join-Path $licDst "SOURCE.md"), $sourceMd)
-    Write-Host "collected license five-piece (SSOT=$LicenseSsot) + SOURCE.md"
+    Write-Host "collected license five-piece (self-held, $repoRoot) + SOURCE.md"
     Write-Host "  source tarball: $srcTarballName sha256=$srcSha"
 
     # console 静态产物（可选源，存在才收；W6：在位即启用，缺位 = 安装包不带
