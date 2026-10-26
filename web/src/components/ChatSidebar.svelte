@@ -1234,18 +1234,18 @@
                     }}
                   >复制</button>
                 {/if}
+                {#if m.text || m.streaming}
+                  <span class="audit-chip">
+                    <AuditBadge
+                      status={badgeStatus($auditState, auditBadgeMap.has(m.id))}
+                      clickable={auditBadgeMap.has(m.id) && $auditState?.verified === true}
+                      onclick={() => (auditCardEntry = auditBadgeMap.get(m.id))}
+                    />
+                  </span>
+                {/if}
               </div>
             {/if}
           </div>
-          {#if m.text || m.streaming}
-            <span class="audit-chip">
-              <AuditBadge
-                status={badgeStatus($auditState, auditBadgeMap.has(m.id))}
-                clickable={auditBadgeMap.has(m.id) && $auditState?.verified === true}
-                onclick={() => (auditCardEntry = auditBadgeMap.get(m.id))}
-              />
-            </span>
-          {/if}
         </div>
       {:else if m.kind === 'tool'}
         <div class="tool-card" class:running={m.running} class:open={expandedTools.has(m.id)}>
@@ -1951,11 +1951,11 @@
     /* 节奏:气泡行(回合边界/答案)前留大间隙,与紧凑的过程行拉开层级 */
     margin-top: 12px;
   }
-  /* 审计徽标=行角悬浮标:不占横向位,回复气泡得以与栏左右等距 */
+  /* 审计徽标=气泡内右上常驻圆点,与「复制」按钮同行(复制 hover 显于其左) */
   .audit-chip {
     position: absolute;
-    top: -7px;
-    right: 2px;
+    top: 5px;
+    right: 36px;
     display: inline-flex;
   }
   .row.user {
