@@ -49,7 +49,10 @@ const DEFAULT_MAX_RETRIES: usize = 3;
 /// default connect timeout (secs) - unattended runs must not wait forever on a hung endpoint
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// default per-request total timeout (secs)
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+/// (2026-10-26: 300→1800 对齐执行体 LLM_EXECUTE_TIMEOUT_SECS 实值——推理模型
+///  长回合单次流式调用实测可超 300s,超时被本地切断时报 error decoding
+///  response body 而非显式 timeout,易误导排查)
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 1800;
 /// 默认初始退避(秒)
 const DEFAULT_BASE_BACKOFF_SECS: f64 = 1.0;
 /// 默认最大退避(秒)
@@ -1196,27 +1199,38 @@ mod tests {
     /// 最坏预算公式锁定
     #[test]
     fn test_worst_case_budget_formula_e7() {
-        // 默认口径: 300s×4 attempts + backoff(1+2+4=7,cap 30 不触) + 10 = 1217
+        // 默认口径: request_timeout×4 attempts + backoff(1+2+4=7,cap 30 不触) + 10
+        // (从缺省常量推导,防止 DEFAULT_REQUEST_TIMEOUT_SECS 调整时本测试硬编码漂移)
         let h = LlmHandler::new("m", "https://x");
-        assert_eq!(h.worst_case_budget_secs(), 300 * 4 + 7 + 10);
+        assert_eq!(
+            h.worst_case_budget_secs(),
+            DEFAULT_REQUEST_TIMEOUT_SECS * 4 + 7 + 10
+        );
         // cap 生效口径: base=20 → 20+30+30=80
         let h = h.with_retry_config(3, 20.0, 30.0);
-        assert_eq!(h.worst_case_budget_secs(), 300 * 4 + 80 + 10);
+        assert_eq!(
+            h.worst_case_budget_secs(),
+            DEFAULT_REQUEST_TIMEOUT_SECS * 4 + 80 + 10
+        );
         // 零重试口径: 单次请求 + 10
         let h = h.with_retry_config(0, 1.0, 30.0);
-        assert_eq!(h.worst_case_budget_secs(), 300 + 10);
+        assert_eq!(
+            h.worst_case_budget_secs(),
+            DEFAULT_REQUEST_TIMEOUT_SECS + 10
+        );
     }
 
-    /// 失配判定（600=失配口径必红,1300=修复口径必绿）
+    /// 失配判定(半预算=失配口径必红,超预算=修复口径必绿;预算取自同实例实算)
     #[test]
     fn test_step_budget_mismatch_e7() {
-        let h = LlmHandler::new("m", "https://x"); // budget=1225
-        assert!(h.step_budget_mismatch(600).is_err());
+        let h = LlmHandler::new("m", "https://x");
+        let budget = h.worst_case_budget_secs();
+        assert!(h.step_budget_mismatch(budget / 2).is_err());
         assert!(h
-            .step_budget_mismatch(600)
+            .step_budget_mismatch(budget / 2)
             .unwrap_err()
             .contains("step budget mismatch"));
-        assert!(h.step_budget_mismatch(1300).is_ok());
+        assert!(h.step_budget_mismatch(budget + 100).is_ok());
     }
 
     /// 实际生效参数:显式值原样透传,兜底值 0.7/4096,stream 恒 true

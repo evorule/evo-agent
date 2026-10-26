@@ -265,15 +265,21 @@ fn apply_bare_provider_env(cfg: &mut LlmConfig, explicit_key_taken: bool) {
     cfg.api_key = key;
     // model/api_base:基线已被显式 env 或 toml 定制(≠出厂默认)时不动,
     // 保持「环境变量只补缺省、不冲掉显式定制」的兜底语义
-    if let Ok(v) = std::env::var(model_var) {
-        cfg.model = v;
-    } else if cfg.model == LlmConfig::default_model() {
-        cfg.model = def_model.to_string();
+    // (2026-10-26 修复:原实现 env 存在即无条件覆盖,把 toml 显式定制的
+    //  model/api_base 冲回 provider 值,与本文档行承诺相悖)
+    if cfg.model == LlmConfig::default_model() {
+        if let Ok(v) = std::env::var(model_var) {
+            cfg.model = v;
+        } else {
+            cfg.model = def_model.to_string();
+        }
     }
-    if let Ok(v) = std::env::var(base_var) {
-        cfg.api_base = v;
-    } else if cfg.api_base == LlmConfig::default_api_base() {
-        cfg.api_base = def_base.to_string();
+    if cfg.api_base == LlmConfig::default_api_base() {
+        if let Ok(v) = std::env::var(base_var) {
+            cfg.api_base = v;
+        } else {
+            cfg.api_base = def_base.to_string();
+        }
     }
 }
 
@@ -734,6 +740,7 @@ impl Config {
             merge_field(table, "executor_url", &mut self.llm.executor_url)?;
             merge_field(table, "timeout_secs", &mut self.llm.timeout_secs)?;
             merge_field(table, "max_retries", &mut self.llm.max_retries)?;
+            merge_field(table, "max_tokens", &mut self.llm.max_tokens)?;
         }
         if let Some(table) = value.get("evorule").and_then(|v| v.as_table()) {
             merge_field(table, "base_url", &mut self.evorule.base_url)?;
