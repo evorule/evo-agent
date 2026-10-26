@@ -541,41 +541,35 @@
     renderCount = RENDER_WINDOW;
   });
 
-  // ---- 回合内过程折叠(视觉层级:过程=安静脚手架,答案=主角) ----
-  // 活动元素=工具卡或纯思考行(无叙述正文);两个叙述/答案气泡之间的连续
-  // 活动段,在段被闭合(后随正文气泡存在)且段长≥4 时收成一行摘要——回答
-  // 落地即把中间几十步过程退成一行,视线先落在答案上;点击摘要可展开全程。
-  const GROUP_MIN = 4;
+  // ---- 回合内过程容器(项目方令):思考与工具调用收进一个框 ----
+  // 回合进行中=框内实时展开(左缘品牌色+「进行中」标);正文/回答气泡抵达
+  // 即整框自动折叠成一行(约一行字高);点击头部展开,再点收起。开合状态
+  // 按组键记忆,用户手动开合覆写默认。
   const expandedGroups = new SvelteSet();
-  const activityLayout = $derived.by(() => {
-    const hidden = new Set();
-    const leaders = new Map(); // leaderId -> {count}
-    let buf = null;
+  const turnLayout = $derived.by(() => {
     const isActivity = (m) =>
       m.kind === 'tool' || (m.kind === 'assistant' && !(m.text || '').trim());
-    const close = () => {
-      if (buf && buf.count >= GROUP_MIN && !expandedGroups.has(buf.leader)) {
-        leaders.set(buf.leader, { count: buf.count });
-        // leader 自身不入 hidden(它要渲染成摘要行);其余成员隐藏
-        for (const id of buf.ids) if (id !== buf.leader) hidden.add(id);
-      }
-      buf = null;
-    };
+    const out = [];
+    let buf = null;
     for (const m of visibleMessages) {
       if (isActivity(m)) {
-        if (!buf) buf = { leader: m.id, ids: [], count: 0 };
-        buf.ids.push(m.id);
-        buf.count += 1;
+        if (!buf) {
+          buf = { type: 'process', key: `p${m.id}`, items: [], closed: false };
+          out.push(buf);
+        }
+        buf.items.push(m);
       } else {
-        close();
+        if (buf) buf.closed = true;
+        buf = null;
+        out.push({ type: 'single', key: `m${m.id}`, m });
       }
     }
-    // 末尾未闭合段=正在进行的实时活动,保持展开不折叠
-    return { hidden, leaders };
+    // 末尾未闭合段=进行中的实时活动,保持框内展开
+    return out;
   });
-  function toggleGroup(leaderId) {
-    if (expandedGroups.has(leaderId)) expandedGroups.delete(leaderId);
-    else expandedGroups.add(leaderId);
+  function toggleGroup(key) {
+    if (expandedGroups.has(key)) expandedGroups.delete(key);
+    else expandedGroups.add(key);
   }
   async function onLoadOlder() {
     if (loadingOlder) return;
@@ -1149,20 +1143,8 @@
         {/if}
       </button>
     {/if}
-    {#each visibleMessages as m (m.id)}
-      {#if activityLayout.leaders.has(m.id)}
-        <button
-          type="button"
-          class="tool-group"
-          onclick={() => toggleGroup(m.id)}
-          title="展开这段思考与工具调用全程"
-        >
-          <span class="tool-chev">▸</span>
-          <span>已折叠 {activityLayout.leaders.get(m.id).count} 步过程（思考与工具调用）</span>
-        </button>
-      {:else if activityLayout.hidden.has(m.id)}
-        <!-- 已折叠进过程摘要 -->
-      {:else if m.kind === 'user'}
+    {#snippet renderMsg(m)}
+      {#if m.kind === 'user'}
         <div class="row user">
           <div class="user-col">
             <div class="bubble user-bubble">{m.text}</div>
@@ -1439,6 +1421,26 @@
             <div class="ap-err">{m.errText}</div>
           {/if}
         </div>
+      {/if}
+    {/snippet}
+
+    {#each turnLayout as g (g.key)}
+      {#if g.type === 'process'}
+        {@const open = g.closed ? expandedGroups.has(g.key) : !expandedGroups.has(g.key)}
+        <div class="process-box" class:live={!g.closed}>
+          <button type="button" class="process-head" onclick={() => toggleGroup(g.key)}>
+            <span class="tool-chev" class:rot={open}>▸</span>
+            <span>过程（{g.items.length} 步 · 思考与工具调用）</span>
+            {#if !g.closed}<span class="process-live">· 进行中</span>{/if}
+          </button>
+          {#if open}
+            <div class="process-body">
+              {#each g.items as m (m.id)}{@render renderMsg(m)}{/each}
+            </div>
+          {/if}
+        </div>
+      {:else}
+        {@render renderMsg(g.m)}
       {/if}
     {/each}
 
@@ -2255,25 +2257,59 @@
     flex-direction: column;
     gap: var(--sp-xs);
   }
-  /* 回合内过程折叠摘要行(胶囊虚线):回答落地后几十步过程退位成一行 */
-  .tool-group {
+  /* 回合内过程容器(项目方令):思考与工具调用收进一个框——进行中框内实时
+     展开(左缘品牌色),回答抵达整框自动折叠成一行,点击头部开合 */
+  .process-box {
+    margin: 4px 0 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    background: transparent;
+    overflow: hidden;
+  }
+  .process-box.live {
+    border-left: 2px solid var(--brand);
+  }
+  .process-head {
     display: flex;
     align-items: center;
     gap: var(--sp-xs);
-    margin: 4px 0 4px 10px;
-    padding: 3px 10px;
-    border: 1px dashed var(--border);
-    border-radius: 999px;
-    background: transparent;
-    color: var(--text-muted);
+    width: 100%;
+    padding: 4px 8px;
     font-size: 11px;
+    color: var(--text-muted);
+    background: transparent;
+    border: none;
     cursor: pointer;
     text-align: left;
     user-select: none;
   }
-  .tool-group:hover {
+  .process-head:hover {
     background: var(--bg-hover);
     color: var(--text-secondary);
+  }
+  .process-head .tool-chev {
+    display: inline-block;
+    font-size: 10px;
+    transition: transform var(--tr-fast);
+  }
+  .process-head .tool-chev.rot {
+    transform: rotate(90deg);
+  }
+  .process-live {
+    color: var(--brand);
+  }
+  .process-body {
+    padding: 2px 0 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .process-body .row {
+    margin-top: 0;
+  }
+  .process-body .tool-card,
+  .process-body .thinking-card {
+    margin-left: 2px;
   }
   /* 动作/结果两段式小节标题与截断徽标 */
   .tb-label {
