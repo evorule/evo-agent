@@ -18,6 +18,7 @@
     openSettingsTab,
     transcriptHasMore,
     loadOlderTranscript,
+    openGuideTab,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
   // Svelte 5 不深度代理原生 Set(add/delete 不触发重渲染,点击开合会失明),
@@ -1059,6 +1060,7 @@
       {#if $sessionId}
         <button class="new-btn" onclick={() => askResume()} title="恢复当前崩溃会话(加载历史并续完中断轮)">恢复</button>
       {/if}
+      <button class="new-btn" onclick={openGuideTab} title="系统性使用说明:工作区边界/审批模式/回复阅读/常见问题">指南</button>
       <button class="new-btn" onclick={newSession} title="断开并新建会话">新建会话</button>
     </div>
   </div>

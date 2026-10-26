@@ -90,6 +90,7 @@
     {
       title: '帮助(H)',
       items: [
+        { label: '使用指南', command: 'workbench.action.guide' },
         { label: '重启语言服务器', command: 'workbench.action.lsp.restart' },
         { label: '刷新治理徽标', command: 'workbench.action.gov.refreshBadges' },
       ],

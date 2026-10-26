@@ -11,7 +11,7 @@
     workspaceLabel,
     switchWorkspace,
   } from '../lib/workspace.js';
-  import { workspaceEpoch } from '../lib/stores.js';
+  import { workspaceEpoch, openGuideTab } from '../lib/stores.js';
   import {
     APPROVAL_MODE_KEY,
     APPROVAL_EXEMPTION_KEY,
@@ -224,6 +224,9 @@
         <li>右侧对话侧栏与 general agent 对话;agent 写文件后产物自动打开,可切差异视图对比后定稿</li>
         <li>切换工作区后,文件面即刻以新工作区为根;agent 能力边界在「立即重连」后生效</li>
       </ul>
+      <button type="button" class="guide-entry" onclick={() => openGuideTab()} title="系统性使用说明:工作区边界/审批模式/回复阅读/常见问题">
+        📖 打开完整使用指南(工作区边界 / 审批模式 / 回复阅读 / 常见问题)
+      </button>
     </section>
   </div>
 </div>
@@ -524,5 +527,22 @@
   }
   .n-links .chip:hover {
     border-color: var(--brand);
+  }
+
+  .guide-entry {
+    margin-top: 10px;
+    width: 100%;
+    text-align: left;
+    padding: 8px 12px;
+    font-size: var(--fs-sm);
+    color: var(--text-secondary);
+    background: var(--bg-page);
+    border: 1px dashed var(--border);
+    border-radius: var(--r-md);
+    cursor: pointer;
+  }
+  .guide-entry:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
   }
 </style>

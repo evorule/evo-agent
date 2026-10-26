@@ -540,6 +540,27 @@ export async function saveTab(path, content) {
 /** 设置页虚拟路径(特殊 tab,非文件;EditorPane 按 kind 渲染设置组件) */
 export const SETTINGS_TAB_PATH = 'evo://settings';
 
+/** 使用指南虚拟路径(特殊 tab;EditorPane 按 kind 渲染指南组件) */
+export const GUIDE_TAB_PATH = 'evo://guide';
+
+/** 打开使用指南(特殊 tab;已开则激活) */
+export function openGuideTab() {
+  let existing = null;
+  tabs.update((list) => {
+    existing = findTab(list, GUIDE_TAB_PATH) || null;
+    return list;
+  });
+  if (existing) {
+    activePath.set(GUIDE_TAB_PATH);
+    return;
+  }
+  tabs.update((list) => [
+    ...list,
+    { path: GUIDE_TAB_PATH, kind: 'guide', name: '使用指南', content: '', dirty: false, error: null },
+  ]);
+  activePath.set(GUIDE_TAB_PATH);
+}
+
 /** 用户层设置 JSON 虚拟路径(编辑器 tab;内容=生效层为 user 的键值集) */
 export const USER_SETTINGS_URI = 'evo://settings/user';
 

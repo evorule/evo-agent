@@ -19,6 +19,7 @@
   import { uriSpecFor, initDiagnostics, rebindPath, setDiagnostics, clearDiagnostics, pathFromUri } from '../lib/diagnostics.js';
   import { lintMarkdown, LINT_MAX_LENGTH } from '../lib/markdown-lint.js';
   import SettingsEditor from './SettingsEditor.svelte';
+  import GuidePanel from './GuidePanel.svelte';
   import HomeView from './HomeView.svelte';
   import {
     tabs,
@@ -90,6 +91,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
   let editorEl;
   let diffEl;
   let settingsEl;
+  let guideEl;
   let editor = null;
   let diffEditor = null;
   let welcomeModel = null;
@@ -237,6 +239,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
     if (editorEl) editorEl.style.display = which === 'edit' ? '' : 'none';
     if (diffEl) diffEl.style.display = which === 'diff' ? '' : 'none';
     if (settingsEl) settingsEl.style.display = which === 'settings' ? '' : 'none';
+    if (guideEl) guideEl.style.display = which === 'guide' ? '' : 'none';
   }
 
   // 设置 JSON Schema:仅在用户层设置 tab 激活期间挂载(fileMatch 限定该虚拟 URI,
@@ -412,6 +415,12 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
       // 设置页:非 Monaco 特殊 tab,渲染设置组件(不建 model)
       cursorPos.set(null); // F1 状态栏:无编辑器光标
       showHost('settings');
+      return;
+    }
+    if (tab.kind === 'guide') {
+      // 使用指南:非 Monaco 特殊 tab,渲染指南组件(不建 model)
+      cursorPos.set(null); // F1 状态栏:无编辑器光标
+      showHost('guide');
       return;
     }
     if (tab.error) {
@@ -878,6 +887,9 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
   <div class="editor-host diff-host" bind:this={diffEl} style="display:none" data-zone="editor"></div>
   <div class="editor-host settings-host" bind:this={settingsEl} style="display:none" data-zone="editor">
     <SettingsEditor />
+  </div>
+  <div class="editor-host guide-host" bind:this={guideEl} style="display:none" data-zone="editor">
+    <GuidePanel />
   </div>
   <!-- 批 I 段 3:首页工作区卡(无打开 tab 时;宿主与 Monaco 同栖互斥显示) -->
   <div class="home-host" style:display={showHome ? 'flex' : 'none'} data-zone="editor">

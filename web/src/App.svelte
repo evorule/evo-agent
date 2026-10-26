@@ -43,7 +43,8 @@
     openFile,
     scmGenerateIntent,
     connBanner,
-  } from './lib/stores.js';
+  openGuideTab,
+} from './lib/stores.js';
   import { loadSettings, settingsState } from './lib/settings.js';
   import { applyTheme, readStoredMode, resolveMode } from './lib/theme.js';
   import * as monaco from 'monaco-editor';
@@ -102,6 +103,7 @@
     'workbench.action.gov.refreshBadges',
     'workbench.action.openSettings',
     'workbench.action.openSettingsJson',
+    'workbench.action.guide',
     'workbench.action.search.show',
     'workbench.action.search.replace',
     'workbench.action.search.clear',
@@ -373,6 +375,12 @@
       title: '打开用户设置 (JSON)',
       category: '首选项',
       run: () => openSettingsJson('user'),
+    });
+    registerCommand({
+      id: 'workbench.action.guide',
+      title: '打开使用指南',
+      category: '帮助',
+      run: () => openGuideTab(),
     });
     registerCommand({
       id: 'workbench.action.search.show',
