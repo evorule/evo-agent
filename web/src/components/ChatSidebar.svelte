@@ -36,6 +36,7 @@
     approvalPresetView,
   } from '../lib/approval.js';
   import { switchWorkspace } from '../lib/workspace.js';
+  import DirectoryBrowser from './DirectoryBrowser.svelte';
   import { chatWidth } from '../lib/layout.js';
   import { orderSessionsWithLineage } from '../lib/orchestration.js';
   import { push as pushNotification } from '../lib/notifications.js';
@@ -77,14 +78,12 @@
   /** 编辑会话工作区:prompt 输入绝对路径,空串清除。批 I:走统一切换入口
    *  (dirty 护栏 + 落库 + 关文件 tab + 纪元自增);文件面即刻重锚,
    *  agent 能力边界下次连接生效(新建会话/换线/重连)。 */
-  async function editWorkspace() {
-    const next = prompt(
-      '会话工作区(绝对路径,agent 读写以此目录为边界):\n留空恢复缺省(serve workdir)',
-      workspace,
-    );
-    if (next === null) return; // 取消
-    const r = await switchWorkspace(next, (m) => Promise.resolve(window.confirm(m)));
-    if (!r.ok && r.error) alert(r.error);
+  let wsBrowserOpen = $state(false);
+
+  /** 工作区编辑(体验优化项 5):弃裸 prompt,复用图形化目录浏览器(与首页
+   *  同款);恢复缺省入口在首页工作区卡(「恢复缺省」按钮)。 */
+  function editWorkspace() {
+    wsBrowserOpen = true;
   }
 
   /** 工作区按钮显示名:末段路径(长路径收窄);缺省态显式标示 */
@@ -1281,6 +1280,16 @@
                   {/if}
                 </div>
                 {@const text = String(m.result)}
+                {#if text.includes('sandbox boundary')}
+                  <div class="boundary-hint">
+                    ⚠ 该目标在工作区边界之外。调整:点顶部「工作区」按钮扩大范围后新建会话;或把文件放进当前工作区。
+                  </div>
+                {/if}
+                {#if text.includes('sandbox boundary')}
+                  <div class="boundary-hint">
+                    ⚠ 该目标在工作区边界之外。调整:点顶部「工作区」按钮扩大范围后新建会话;或把文件放进当前工作区。
+                  </div>
+                {/if}
                 {#if text.length > TOOL_RESULT_CAP && !fullResults.has(m.id)}
                   <pre class="tool-payload mono">{text.slice(0, TOOL_RESULT_CAP)}</pre>
                   <button
@@ -1460,6 +1469,19 @@
       />
     {/if}
   </div>
+
+  {#if wsBrowserOpen}
+    <DirectoryBrowser
+      title="选择会话工作区(agent 读写以此目录为边界;恢复缺省请用首页工作区卡)"
+      initialPath={workspace}
+      on:select={async (e) => {
+        wsBrowserOpen = false;
+        const r = await switchWorkspace(e.detail.path, (m) => Promise.resolve(window.confirm(m)));
+        if (!r.ok && r.error) alert(r.error);
+      }}
+      on:close={() => (wsBrowserOpen = false)}
+    />
+  {/if}
 
   <div class="composer">
     {#if mp}
@@ -2256,6 +2278,16 @@
     display: flex;
     flex-direction: column;
     gap: var(--sp-xs);
+  }
+  /* 撞工作区边界的卡内引导条(体验优化项 6) */
+  .boundary-hint {
+    margin: 4px 0;
+    padding: 6px 8px;
+    font-size: 11px;
+    color: var(--warning);
+    background: rgba(210, 153, 34, 0.12);
+    border: 1px solid var(--warning);
+    border-radius: var(--r-sm);
   }
   /* 回合内过程容器(项目方令):思考与工具调用收进一个框——进行中框内实时
      展开(左缘品牌色),回答抵达整框自动折叠成一行,点击头部开合 */

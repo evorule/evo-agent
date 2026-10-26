@@ -413,10 +413,16 @@ function handleFrame(f) {
     case 'SessionCreated': {
       sessionId.set(f.session_id);
       localStorage.setItem('evo_session_id', f.session_id);
-      pushMessage({
-        kind: 'info',
-        text: `会话已建立${f.memory_enabled ? '(记忆已启用)' : ''}`,
-      });
+      // 晚到帧守卫(37 号项 2):回合已开始才收到 SessionCreated(事件竞态)
+      // 时不再把 info 插进消息流中部打断阅读;边界信息随下次空闲建立展示。
+      // 非缺省工作区时随建立信息亮出能力边界(37 号项 7)。
+      if (!get(turnActive)) {
+        const wsRoot = localStorage.getItem('evo_workspace');
+        pushMessage({
+          kind: 'info',
+          text: `会话已建立${f.memory_enabled ? '(记忆已启用)' : ''}${wsRoot ? ` · 工作区边界:${wsRoot}` : ''}`,
+        });
+      }
       if (pendingNotice) {
         pushMessage({ kind: 'info', text: pendingNotice });
         pendingNotice = null;
