@@ -189,6 +189,199 @@ async fn test_auto_rewind_on_error() {
 }
 
 #[tokio::test]
+async fn test_rewind_then_stable_without_resumed_work_fails_visibly() {
+    // 复现：引擎 Error → auto-rewind 成功 → 引擎侧 call_external 命令已被消费、
+    // 无 pending 工作 → 回退后下一个 SSE 事件是 Stable（payload 空）。
+    // 旧行为：Stable 分支无条件判 success（content 空）= 伪成功静默吞轮。
+    // 期望：fail-visible——终态必须是 error 且错误信息携带 rewind 上下文；
+    // 无 rewind 语境的合法空响应不在此列（另有测试锁定）。
+    let mut server = Server::new_async().await;
+    let server_url = server.url();
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_body(r#"{"session_id": 888}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
+        .with_status(200)
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", "/api/sessions/888/command")
+        .with_status(200)
+        .with_body(r#"{"success": true, "fact_id": 1}"#)
+        .create_async()
+        .await;
+
+    // Error 之后紧跟 Stable(空)——镜像 rewind 后引擎无工作可续的真实形态
+    let sse_events = "data: {\"type\":\"Error\",\"payload\":{\"message\":\"LLM token budget exhausted\"}}\r\n\r\ndata: {\"type\":\"Stable\",\"payload\":\"\"}\r\n\r\n";
+    server
+        .mock("GET", "/api/sessions/888/events")
+        .with_status(200)
+        .with_header("Content-Type", "text/event-stream")
+        .with_body(sse_events)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/888/facts")
+        .with_status(200)
+        .with_body(
+            json!([
+                {"version": 0, "id": 1, "path": "init", "value": "init", "type": "PayloadUpdate"},
+                {"version": 1, "id": 2, "path": "command", "value": "test", "type": "Command"}
+            ])
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let rewind_mock = server
+        .mock("GET", "/api/sessions/888/rewind?version=0")
+        .with_status(200)
+        .with_body(r#"{"version": 0, "payload": {}, "queue": []}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/888/state")
+        .with_status(200)
+        .with_body(r#"{"payload": ""}"#)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server_url);
+    let config = AgentConfig::default();
+    let mut runner = AgentRunner::new(config, client);
+
+    let result = runner.run("Test rewind then stable").await;
+
+    assert!(result.is_ok());
+    let result = result.unwrap();
+    // rewind 端点必须真实被调用（区分「rewind 后伪 success」与「SSE 被静默吞掉」）
+    rewind_mock.assert();
+    // fail-visible：rewind 后无续跑工作的 Stable 终态必须报错，严禁伪 success
+    assert!(
+        !result.success,
+        "rewind followed by Stable with no resumed work must not report success: {result:?}"
+    );
+    let err = result
+        .error
+        .expect("terminal error must carry rewind context");
+    assert!(
+        err.to_lowercase().contains("rewind"),
+        "error should mention the rewind context: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_streaming_rewind_then_stable_without_resumed_work_fails_visibly() {
+    // 流式路径同款复现：IoRequest(call_external) → LLM 空响应（无 tool_calls）
+    // → 提交 io_response → 引擎 Error → auto-rewind → Stable(空)，中间无任何
+    // 续跑工作。最终 Done 事件必须是 error 结果，严禁 success+空 content。
+    let mut server = Server::new_async().await;
+    let server_url = server.url();
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_body(r#"{"session_id": 889}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
+        .with_status(200)
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", "/api/sessions/889/command")
+        .with_status(200)
+        .with_body(r#"{"success": true, "fact_id": 1}"#)
+        .create_async()
+        .await;
+
+    let sse_events = "data: {\"type\":\"IoRequest\",\"io_type\":\"call_external\",\"id\":1,\"params\":{\"model\":\"gpt-4o-mini\",\"system_prompt\":\"You are a helpful assistant\",\"goal\":\"Do the task\",\"tool_names\":[]}}\r\n\r\ndata: {\"type\":\"Error\",\"payload\":{\"message\":\"LLM token budget exhausted\"}}\r\n\r\ndata: {\"type\":\"Stable\",\"payload\":\"\"}\r\n\r\n";
+    server
+        .mock("GET", "/api/sessions/889/events")
+        .with_status(200)
+        .with_header("Content-Type", "text/event-stream")
+        .with_body(sse_events)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/889/facts")
+        .with_status(200)
+        .with_body(
+            json!([
+                {"version": 0, "id": 1, "path": "init", "value": "init", "type": "PayloadUpdate"},
+                {"version": 1, "id": 2, "path": "command", "value": "test", "type": "Command"}
+            ])
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let rewind_mock = server
+        .mock("GET", "/api/sessions/889/rewind?version=0")
+        .with_status(200)
+        .with_body(r#"{"version": 0, "payload": {}, "queue": []}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", "/api/sessions/889/io_response")
+        .with_status(200)
+        .with_body(r#"{"success": true, "message": "IoResponse submitted"}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/889/state")
+        .with_status(200)
+        .with_body(r#"{"payload": ""}"#)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server_url);
+    let config = AgentConfig::default();
+    let runner = AgentRunner::new(config, client).with_llm_handler(LlmHandler::mock(""));
+
+    use futures_util::StreamExt;
+    let mut stream = runner.run_streaming("Do the task".to_string(), Vec::new());
+    let mut terminal: Option<evo_agent::agent::runner::AgentResult> = None;
+    while let Some(item) = stream.next().await {
+        if let Ok(evo_agent::agent::runner::AgentEvent::Done(r)) = item {
+            terminal = Some(r);
+        }
+    }
+    let result = terminal.expect("stream must end with a Done event");
+    rewind_mock.assert();
+    assert!(
+        !result.success,
+        "streaming rewind followed by Stable with no resumed work must not report success: {result:?}"
+    );
+    let err = result
+        .error
+        .expect("terminal error must carry rewind context");
+    assert!(
+        err.to_lowercase().contains("rewind"),
+        "error should mention the rewind context: {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_auto_recall_no_shared_facts() {
     let mut server = Server::new_async().await;
     let server_url = server.url();

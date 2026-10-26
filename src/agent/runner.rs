@@ -3265,6 +3265,12 @@ impl AgentRunner {
         // tool_traces/error 结果),fail-visible 不静默。重置语义:任意非 Error
         // 事件(正常推进)即清零——只惩罚"连续"失败,不惩罚间歇错误。
         let mut rewind_budget = RewindBudget::new(REWIND_BUDGET_LIMIT);
+        // 回退后等待续跑工作标志：rewind 成功即置位，仅真实工作恢复(IoRequest)清位。
+        // rewind 后引擎不会重新下发已消费的 call_external 命令——回退后若直接到达
+        // Stable，即"无可续工作"死局信号。此终态必须 fail-visible 报错，严禁以
+        // success+空 content 收尾（伪成功会让调用方以 exit 0 误判整轮工作完成）。
+        let mut rewound_awaiting_work = false;
+        let mut last_rewind_version: Option<u64> = None;
         while let Some(event) = event_stream.next().await {
             // G6:取消检查(event 边界 — 即使 LLM 调用已返回,也在此处响应取消)
             if self.cancel_token.is_cancelled() {
@@ -3288,6 +3294,8 @@ impl AgentRunner {
             info!(%session_id, event_type = %event.event_type, "Received event");
             match event.event_type.as_str() {
                 "IoRequest" => {
+                    // 真实工作恢复——回退死局解除（rewind 等待标志清位）
+                    rewound_awaiting_work = false;
                     step_count += 1;
                     // G17:步数指标
                     if let Some(m) = &self.metrics {
@@ -3392,6 +3400,30 @@ impl AgentRunner {
                     }
                 }
                 "Stable" => {
+                    // 回退后无续跑工作即到达 Stable——fail-visible，不以空产出伪装成功。
+                    // 注意只在 rewind 语境改判：无 rewind 的合法空响应仍按原语义放行
+                    // （假绿改判只看 tool_calls 悬挂，见下方既有逻辑）。
+                    if rewound_awaiting_work {
+                        let duration = start_time.elapsed().as_millis() as u64;
+                        let msg = format!(
+                            "turn failed after auto-rewind{}: no resumable work followed the \
+                             rewind (the rewound turn produced no output and the engine issued \
+                             no new work); reporting as error instead of an empty success",
+                            last_rewind_version
+                                .map(|v| format!(" to version {v}"))
+                                .unwrap_or_default(),
+                        );
+                        warn!(%session_id, step_count, msg = %msg,
+                            "rewind ended without resumed work; failing visibly");
+                        self.flush_messages(&session_id).await?;
+                        if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
+                            tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                        }
+                        self.submit_tool_traces(&session_id).await;
+                        self.interrupt_evorule_session_best_effort(&session_id)
+                            .await;
+                        return Ok(AgentResult::error(msg, step_count, duration));
+                    }
                     let duration = start_time.elapsed().as_millis() as u64;
                     // 确保所有缓冲的消息都写入 evorule（EveryN/PerReactRound 模式）
                     self.flush_messages(&session_id).await?;
@@ -3495,6 +3527,10 @@ impl AgentRunner {
                         if rewind_budget.consume() {
                             info!(%session_id, remaining = rewind_budget.remaining,
                                 "Auto-rewind successful, retrying from version {}", rewind_result);
+                            // 置位等待标志：仅当后续真实工作(IoRequest)恢复时清位；
+                            // 若回退后无任何工作直达 Stable，Stable 分支按 fail-visible 收尾。
+                            rewound_awaiting_work = true;
+                            last_rewind_version = Some(rewind_result);
                             continue;
                         }
                         warn!(%session_id, remaining = 0,
@@ -7262,6 +7298,13 @@ impl AgentRunner {
                                Some(r) => RewindBudget::restored(r),
                                None => RewindBudget::new(REWIND_BUDGET_LIMIT),
                            };
+                           // 回退后等待续跑工作标志(非流式 run() 同款镜像)：rewind 成功
+                           // 即置位，仅真实工作恢复(IoRequest)清位。rewind 后引擎不会重新
+                           // 下发已消费的 call_external 命令——回退后若直接到达 Stable，
+                           // 即"无可续工作"死局信号。此终态必须 fail-visible 报错，严禁以
+                           // success+空 content 收尾（伪成功会让调用方误判整轮工作完成）。
+                           let mut rewound_awaiting_work = false;
+                           let mut last_rewind_version: Option<u64> = None;
         // Runaway 护栏计数回填(跨重启连续)。
                            // 计数与 journal ToolInvoked 同源同口径(挂点=两个写点),
                            // 回填沿 replay_rewind_budget_remaining 的回填模式。
@@ -7348,6 +7391,8 @@ impl AgentRunner {
                                heartbeat_misses = 0;
                                match event.event_type.as_str() {
                                    "IoRequest" => {
+                                       // 真实工作恢复——回退死局解除（rewind 等待标志清位）
+                                       rewound_awaiting_work = false;
                                        step_count += 1;
                                        // G17:步数指标
                                        if let Some(m) = &runner.metrics {
@@ -8785,6 +8830,39 @@ impl AgentRunner {
                                        }
                                    }
                                    "Stable" => {
+                                       // 回退后无续跑工作即到达 Stable——fail-visible，不以空
+                                       // 产出伪装成功（只在 rewind 语境改判，无 rewind 的合法
+                                       // 空响应仍按原语义放行）。
+                                       if rewound_awaiting_work {
+                                           let duration = start_time.elapsed().as_millis() as u64;
+                                           let msg = format!(
+                                               "turn failed after auto-rewind{}: no resumable work \
+                                                followed the rewind (the rewound turn produced no \
+                                                output and the engine issued no new work); \
+                                                reporting as error instead of an empty success",
+                                               last_rewind_version
+                                                   .map(|v| format!(" to version {v}"))
+                                                   .unwrap_or_default(),
+                                           );
+                                           warn!(%session_id, step_count, msg = %msg,
+                                               "rewind ended without resumed work; failing visibly");
+                                           if let Err(e) = runner.flush_messages(&session_id).await {
+                                               tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                           }
+                                           if let Err(e) = runner.sediment_session(&session_id, &messages, journal.as_deref()).await {
+                                               tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                                           }
+                                           runner.submit_tool_traces(&session_id).await;
+                                           runner.interrupt_evorule_session_best_effort(&session_id).await;
+                                           // B21:turn_ended(error)
+                                           if let Some(g) = turn_guard.take() {
+                                               g.end("error", step_count as u64, duration);
+                                           }
+                                           yield Ok(AgentEvent::Done(AgentResult::error(
+                                               msg, step_count, duration,
+                                           )));
+                                           return;
+                                       }
                                        let duration = start_time.elapsed().as_millis() as u64;
                                        if let Err(e) = runner.flush_messages(&session_id).await {
                                            tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
@@ -8868,6 +8946,10 @@ impl AgentRunner {
                                                        );
                                                    }
                                                }
+                                               // 置位等待标志：仅当后续真实工作(IoRequest)恢复时
+                                               // 清位；回退后无任何工作直达 Stable 时按 fail-visible 收尾。
+                                               rewound_awaiting_work = true;
+                                               last_rewind_version = Some(rewind_version);
                                                yield Ok(AgentEvent::Info(format!("Auto-rewind to version {}", rewind_version)));
                                                continue;
                                            }
