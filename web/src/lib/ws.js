@@ -51,7 +51,9 @@ let lastToolMsgId = null; // 最近一个运行中工具气泡(按 name 匹配�
 let toolStartedAt = 0; // 当前工具调用起始时刻(M2:ToolResult 时算耗时 tookMs)
 // M2:工具 args/result 的客户端截断帽(原 safeJson 缺省 400)。编辑类 diff
 // 需完整 old_string/new_string,「查看全部」需余量,提到 20000;其余调用点缺省不变。
-const TOOL_PAYLOAD_CAP = 20000;
+// 载荷帽(37 号 D-EVA-29 余项):20000→64000。帽是前端展示/存储上限,
+// 完整结果以 journal 为准;可配化(设置键)待设置系统扩展后跟进。
+const TOOL_PAYLOAD_CAP = 64000;
 let pendingWrite = null; // S4:进行中的 file_write {path, content}(ToolResult 成功即登记产物)
 let pendingNotice = null; // newSession 清屏后需补显的提示(SessionCreated 时补显)
 let pendingResume = false; // 恢复意图待发旗标(连接就绪 onopen 时补发 resume 帧)
