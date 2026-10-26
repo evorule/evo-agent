@@ -2756,7 +2756,19 @@ impl AgentRunner {
             std::mem::take(&mut self.pending_messages);
         if let Some(memory) = self.memory.as_mut() {
             // &Vec<T> 自动 coercion 为 &[T]
-            memory.append_messages_batch(session_id, &drained).await?;
+            if let Err(e) = memory.append_messages_batch(session_id, &drained).await {
+                // 批量被拒(典型=单条超大触发服务端 413)→逐条降级重试:同 idx
+                // 后写覆盖语义使重试幂等;坏条仅丢自身并留痕,不拖垮整批。
+                warn!(%session_id, error = %e, count = drained.len(), "batch persist rejected; falling back to per-message persist");
+                for (idx, message, reasoning) in &drained {
+                    if let Err(e2) = memory
+                        .append_message_with_reasoning(session_id, *idx, message, reasoning.clone())
+                        .await
+                    {
+                        warn!(%session_id, idx = *idx, error = %e2, "per-message persist failed; buffered message dropped");
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -7055,6 +7067,8 @@ impl AgentRunner {
                                // G15:continuation — 从 evorule payload 加载历史消息(best-effort)
                                match Self::load_messages_from_payload(&runner, &session_id).await {
                                    Ok(loaded) if !loaded.is_empty() => {
+                                       let mut loaded = loaded;
+                                       sanitize_tool_pairing(&mut loaded);
                                        info!(%session_id, loaded_count = loaded.len(), "G15: loaded historical messages");
                                        messages = loaded;
                                    }
@@ -8936,6 +8950,95 @@ impl AgentRunner {
                                closed_error, step_count, duration,
                            )));
                        })
+    }
+}
+
+/// 会话历史形状消毒(喂 LLM 前的最后防线):修复持久化/恢复链路可能留下的
+/// 工具调用配对破损。提供方对 tool 配对破损一律拒收(典型故障=恢复后每轮
+/// 请求 4xx/502,会话砖死)。两条规则:
+/// ①孤儿工具结果(前面没有带匹配 tool_calls 的 assistant)改写为带标注的
+///   用户消息——内容不丢,wire 形状合法;
+/// ②未获应答的 assistant.tool_calls 置空并在 content 尾部补注记——不再
+///   悬挂等待永远不会到来的结果。
+/// 只改写角色/内容,不增删元素:调用方消息序号与持久化 idx 的对应关系不受
+/// 影响。运行中产生的序列天然配对,本函数只在历史加载路径消费。
+pub fn sanitize_tool_pairing(messages: &mut [Message]) {
+    // pass 1:孤儿 tool 结果改写为用户消息
+    let mut expecting: Option<Vec<String>> = None;
+    for m in messages.iter_mut() {
+        match m {
+            Message::Tool {
+                content, tool_name, ..
+            } => {
+                let names = expecting.get_or_insert_with(Vec::new);
+                if let Some(pos) = names.iter().position(|n| n == tool_name) {
+                    names.remove(pos);
+                } else {
+                    let name = tool_name.clone();
+                    let salvaged = content.clone();
+                    *m = Message::User {
+                        content: format!(
+                            "[系统回收] 历史恢复时检测到损坏:以下工具({name})的结果缺少配对的调用记录,现以原文回收供参考。
+{salvaged}"
+                        ),
+                        images: Vec::new(),
+                    };
+                }
+            }
+            Message::Assistant { tool_calls, .. } => {
+                let mut names = Vec::new();
+                if let Some(calls) = tool_calls {
+                    for c in calls.iter() {
+                        names.push(c.name.clone());
+                    }
+                }
+                expecting = if names.is_empty() { None } else { Some(names) };
+            }
+            _ => {
+                expecting = None;
+            }
+        }
+    }
+    // pass 2:未应答 tool_calls 置空 + content 尾注
+    for i in 0..messages.len() {
+        let unanswered: Vec<String> = match &messages[i] {
+            Message::Assistant {
+                tool_calls: Some(calls),
+                ..
+            } => {
+                let mut declared: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
+                // 向后吃紧邻的 tool 应答
+                for m in messages.iter().skip(i + 1) {
+                    match m {
+                        Message::Tool { tool_name, .. } => {
+                            if let Some(pos) = declared.iter().position(|n| n == tool_name) {
+                                declared.remove(pos);
+                            } else {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                declared
+            }
+            _ => continue,
+        };
+        if unanswered.is_empty() {
+            continue;
+        }
+        if let Message::Assistant {
+            content,
+            tool_calls,
+        } = &mut messages[i]
+        {
+            let list = unanswered.join("、");
+            content.push_str(&format!(
+                "
+[系统注:以下工具调用因会话恢复损坏未获得结果记录,已作废:{list}]"
+            ));
+            *tool_calls = None;
+        }
     }
 }
 

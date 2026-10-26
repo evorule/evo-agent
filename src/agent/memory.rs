@@ -1093,6 +1093,43 @@ impl MessageRecord {
     }
 }
 
+/// 落库载荷护栏上限:单条消息记录序列化字节数。远高于任何正常消息,又留足
+/// 服务端载荷上限的信封余量。
+const MESSAGE_RECORD_MAX_BYTES: usize = 512 * 1024;
+
+/// 落库前载荷护栏:超大记录(典型=工具返回的海量结果整条入消息)截断 content
+/// 并显式标注,防 payload 更新被服务端 413 拒收——整条丢失会在恢复重建时
+/// 造成工具调用配对破损(会话砖死的成因链)。截断保留头尾,中段省略。
+fn shrink_record_for_persist(record: &mut MessageRecord) {
+    const KEEP_HEAD: usize = 32 * 1024;
+    const KEEP_TAIL: usize = 8 * 1024;
+    let measure = |r: &MessageRecord| serde_json::to_vec(r).map(|v| v.len()).unwrap_or(usize::MAX);
+    if measure(record) <= MESSAGE_RECORD_MAX_BYTES {
+        return;
+    }
+    let total = record.content.chars().count();
+    if total > KEEP_HEAD + KEEP_TAIL {
+        let head: String = record.content.chars().take(KEEP_HEAD).collect();
+        let tail: String = record.content.chars().skip(total - KEEP_TAIL).collect();
+        record.content = format!(
+            "{head}\n…[落库护栏截断:原 {total} 字符,中段省略,完整结果以 journal 为准]…\n{tail}"
+        );
+    }
+    if measure(record) <= MESSAGE_RECORD_MAX_BYTES {
+        return;
+    }
+    record.reasoning = None;
+    if measure(record) <= MESSAGE_RECORD_MAX_BYTES {
+        return;
+    }
+    if let Some(tc) = record.tool_calls.as_mut() {
+        let size = serde_json::to_vec(tc).map(|v| v.len()).unwrap_or(0);
+        *tc = serde_json::json!(format!(
+            "[落库护栏截断:工具调用载荷原 {size} 字节,超限省略]"
+        ));
+    }
+}
+
 /// 当前 Unix 时间戳（秒）
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -1968,7 +2005,8 @@ impl MemoryManager {
         reasoning: Option<String>,
     ) -> Result<(), MemoryError> {
         let timestamp = now_secs();
-        let record = MessageRecord::from_message_parts(idx, message, reasoning, timestamp);
+        let mut record = MessageRecord::from_message_parts(idx, message, reasoning, timestamp);
+        shrink_record_for_persist(&mut record);
         let scope = MemoryScope::Messages(session_id.to_string(), idx);
         let path = self.build_path_scoped(&scope, "");
         let payload_value = serde_json::to_value(&record)?;
@@ -2028,8 +2066,9 @@ impl MemoryManager {
         let timestamp = now_secs();
         let mut updates: Vec<(String, serde_json::Value)> = Vec::with_capacity(messages.len());
         for (idx, message, reasoning) in messages {
-            let record =
+            let mut record =
                 MessageRecord::from_message_parts(*idx, message, reasoning.clone(), timestamp);
+            shrink_record_for_persist(&mut record);
             let scope = MemoryScope::Messages(session_id.to_string(), *idx);
             let path = self.build_path_scoped(&scope, "");
             updates.push((path, serde_json::to_value(&record)?));
@@ -5052,6 +5091,37 @@ mod tests {
         }))
         .unwrap();
         assert!(old.reasoning.is_none());
+    }
+
+    #[test]
+    fn test_shrink_truncates_oversized_content_with_annotation() {
+        let big = "x".repeat(600 * 1024);
+        let msg = Message::Tool {
+            content: big,
+            tool_name: "shell_exec".to_string(),
+            images: Vec::new(),
+        };
+        let mut record = MessageRecord::from_message_parts(0, &msg, None, 0);
+        shrink_record_for_persist(&mut record);
+        let size = serde_json::to_vec(&record).unwrap().len();
+        assert!(size <= MESSAGE_RECORD_MAX_BYTES, "截断后不超限: {size}");
+        assert!(record.content.contains("落库护栏截断"), "含显式标注");
+        assert!(record.content.contains("完整结果以 journal 为准"));
+        assert!(record.content.starts_with("xxxx"), "头部保留");
+    }
+
+    #[test]
+    fn test_shrink_leaves_normal_record_untouched() {
+        let msg = Message::Tool {
+            content: "small result".to_string(),
+            tool_name: "file_read".to_string(),
+            images: Vec::new(),
+        };
+        let mut record = MessageRecord::from_message_parts(0, &msg, None, 0);
+        let before = serde_json::to_string(&record).unwrap();
+        shrink_record_for_persist(&mut record);
+        let after = serde_json::to_string(&record).unwrap();
+        assert_eq!(before, after, "正常记录零改写");
     }
 
     #[test]
