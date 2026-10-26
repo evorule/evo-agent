@@ -11,6 +11,48 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::pin::Pin;
 
+/// io_response 提交载荷护栏上限:工具结果经 call_service 回写引擎时,超大
+/// 结果(典型=查询/读取命中海量数据)整体提交会被服务端载荷上限拒收(413),
+/// 引擎侧 io_request 永久悬挂。与消息落库护栏(512KB)同值同构——两条通路
+/// 独立,护栏必须两路都设。
+const IO_RESPONSE_MAX_BYTES: usize = 512 * 1024;
+
+/// 提交前载荷护栏:超限时截断 result.content 与 error 并显式标注(引擎/LLM
+/// 拿到的结果不完整但可知),形状不变。小载荷原样返回(零拷贝语义由调用方
+/// 借用传入,此处仅在超限时克隆)。
+fn shrink_io_response_for_submit(result: &mut Value) {
+    const KEEP_HEAD: usize = 32 * 1024;
+    const KEEP_TAIL: usize = 8 * 1024;
+    let measure = |v: &Value| serde_json::to_vec(v).map(|b| b.len()).unwrap_or(usize::MAX);
+    if measure(result) <= IO_RESPONSE_MAX_BYTES {
+        return;
+    }
+    let note = |s: &mut String, total: usize| {
+        let head: String = s.chars().take(KEEP_HEAD).collect();
+        let tail: String = s.chars().skip(total.saturating_sub(KEEP_TAIL)).collect();
+        *s = format!(
+            "{head}
+…[io_response 护栏截断:原 {total} 字符,中段省略]…
+{tail}"
+        );
+    };
+    if let Some(Value::String(content)) = result.get_mut("content") {
+        let total = content.chars().count();
+        if total > KEEP_HEAD + KEEP_TAIL {
+            note(content, total);
+        }
+    }
+    if measure(result) <= IO_RESPONSE_MAX_BYTES {
+        return;
+    }
+    if let Some(Value::String(err)) = result.get_mut("error") {
+        let total = err.chars().count();
+        if total > KEEP_HEAD + KEEP_TAIL {
+            note(err, total);
+        }
+    }
+}
+
 /// evorule server HTTP API 客户端（会话 / Fact / 审计 / bundle 部署）。
 #[derive(Debug, Clone)]
 pub struct EvoruleApiClient {
@@ -466,6 +508,10 @@ impl EvoruleApiClient {
             self.core.base_url(),
             session_id
         );
+
+        // 载荷护栏:超限截断+显式标注,防 413 拒收致 io_request 永久悬挂
+        let mut result = result.clone();
+        shrink_io_response_for_submit(&mut result);
 
         let body = serde_json::json!({
             "request_id": request_id,
@@ -1633,6 +1679,28 @@ impl EvoruleEventStream {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_shrink_io_response_truncates_oversized_content() {
+        let big = "x".repeat(600 * 1024);
+        let mut resp = serde_json::json!({ "content": big, "error": null });
+        super::shrink_io_response_for_submit(&mut resp);
+        let size = serde_json::to_vec(&resp).unwrap().len();
+        assert!(size <= super::IO_RESPONSE_MAX_BYTES, "截断后不超限: {size}");
+        let content = resp["content"].as_str().unwrap();
+        assert!(content.contains("io_response 护栏截断"), "含显式标注");
+        assert!(content.starts_with("xxx"), "头部保留");
+        assert!(content.ends_with("xxx"), "尾部保留");
+    }
+
+    #[test]
+    fn test_shrink_io_response_leaves_small_untouched() {
+        let mut resp = serde_json::json!({ "content": "ok", "error": null });
+        let before = serde_json::to_string(&resp).unwrap();
+        super::shrink_io_response_for_submit(&mut resp);
+        let after = serde_json::to_string(&resp).unwrap();
+        assert_eq!(before, after, "小载荷零改写");
+    }
     use super::*;
 
     fn make_test_client() -> EvoruleApiClient {
