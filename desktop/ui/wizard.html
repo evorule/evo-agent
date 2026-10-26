@@ -178,9 +178,23 @@
         <p class="msg" id="key-msg"></p>
       </section>
 
-      <!-- 步骤 2：完成摘要 -->
+      <!-- 步骤 2：工作文件夹 -->
+      <section class="step" id="step-workspace">
+        <h2>② 工作文件夹</h2>
+        <p class="hint">
+          agent 的读写都在这个文件夹里进行（缺省在
+          <code id="ws-default"></code>，对日常使用不方便）。建议保持缺省或
+          选择你自己的工作文件夹；之后随时可在对话栏顶部修改。
+        </p>
+        <div class="key-row">
+          <input id="ws-input" type="text" autocomplete="off" spellcheck="false" />
+        </div>
+        <p class="msg" id="ws-msg"></p>
+      </section>
+
+      <!-- 步骤 3：完成摘要 -->
       <section class="step" id="step-done">
-        <h2>② 配置摘要</h2>
+        <h2>③ 配置摘要</h2>
         <div class="status-card" id="summary-card">读取中…</div>
         <p class="hint">
           服务会在后台就绪；若刚保存凭据，点击「立即生效」重启服务组即可启用对话能力，无需重启应用。
@@ -206,6 +220,7 @@
       const btnMain = $("btn-main");
       const btnSkip = $("btn-skip");
       let saved = false; // 本轮已成功保存（防重复提交）
+      let wsSaved = false; // 工作文件夹已保存（防重复提交）
 
       function setMsg(el, text, kind) {
         el.textContent = text || "";
@@ -219,6 +234,7 @@
           .forEach((s) => s.classList.remove("active"));
         $(step).classList.add("active");
         if (step === "step-done") loadSummary();
+        if (step === "step-workspace") loadWorkspace();
       }
 
       async function loadSummary() {
@@ -237,6 +253,17 @@
             : "可稍后在托盘菜单「LLM 凭据…」补配。";
         } catch (e) {
           card.textContent = "读取状态失败：" + e;
+        }
+      }
+
+      async function loadWorkspace() {
+        try {
+          const st = await invoke("wizard_workspace_status");
+          $("ws-default").textContent = st.default_root;
+          $("ws-input").value = st.saved || st.default_root;
+          wsSaved = !!st.saved;
+        } catch (e) {
+          setMsg($("ws-msg"), String(e), "err");
         }
       }
 
@@ -270,7 +297,7 @@
             await invoke("wizard_save_key", { key: keyInput.value });
             saved = true;
             setMsg(keyMsg, "凭据已加密保存。", "ok");
-            gotoStep("step-done");
+            gotoStep("step-workspace");
           } catch (e) {
             setMsg(keyMsg, String(e), "err");
           } finally {
@@ -279,7 +306,22 @@
           }
           return;
         }
-        // 步骤 2：按摘要语义二分
+        // 步骤 2：保存工作文件夹
+        if (!wsSaved) {
+          btnMain.disabled = true;
+          btnSkip.disabled = true;
+          try {
+            await invoke("wizard_save_workspace", { path: $("ws-input").value });
+            wsSaved = true;
+            gotoStep("step-done");
+          } catch (e) {
+            setMsg($("ws-msg"), String(e), "err");
+          } finally {
+            btnMain.disabled = false;
+          }
+          return;
+        }
+        // 步骤 3：按摘要语义二分
         btnMain.disabled = true;
         try {
           if (btnMain.textContent === "立即生效") {

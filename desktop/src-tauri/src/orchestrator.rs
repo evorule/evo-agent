@@ -20,7 +20,7 @@
 use std::io::Write;
 use std::net::TcpListener;
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -293,6 +293,32 @@ fn spawn_engine(ctx: &LaunchContext, engine_port: u16) -> Result<Child, String> 
     Ok(engine)
 }
 
+/// 用户工作文件夹偏好(38 号方案 X):向导/设置保存于壳配置目录的
+/// `agent-workspace.txt`;None=用户未改过,用缺省(用户 Documents\evo-agent)。
+pub(crate) fn workspace_pref(app_config_dir: &Path) -> Option<PathBuf> {
+    let p = app_config_dir.join("agent-workspace.txt");
+    let s = std::fs::read_to_string(p).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(s))
+}
+
+/// 写工作文件夹偏好(向导保存;空串=清除偏好回缺省)。
+pub fn save_workspace_pref(app_config_dir: &Path, path: &str) -> Result<(), String> {
+    let p = app_config_dir.join("agent-workspace.txt");
+    std::fs::write(&p, path.trim()).map_err(|e| format!("write agent-workspace.txt: {e}"))
+}
+
+/// 缺省 agent 能力边界根:%USERPROFILE%\Documents\evo-agent。
+/// (Documents 若被 OneDrive 等策略重定向,此处仍落本机 Documents——
+/// 目录恒有效且用户可见,重定向场景差异可接受。)
+pub(crate) fn default_agent_root() -> PathBuf {
+    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join("Documents").join("evo-agent")
+}
+
 fn spawn_serve(
     ctx: &LaunchContext,
     serve_port: u16,
@@ -303,6 +329,10 @@ fn spawn_serve(
     let serve_log = open_append(&paths.logs_dir.join("serve.log"))?;
     let serve_log_err = open_append(&paths.logs_dir.join("serve.log"))?;
     let mut serve_cmd = Command::new(&paths.evo_agent_exe);
+    // 38 号方案 X:agent 能力边界根(用户工作文件夹)与编排 workdir(runtime)
+    // 解耦——用户文件夹缺省自动创建,用户在向导/设置里改过则以偏好为准
+    let agent_root = workspace_pref(&paths.app_config_dir).unwrap_or_else(default_agent_root);
+    let _ = std::fs::create_dir_all(&agent_root);
     serve_cmd
         .args([
             "serve",
@@ -315,6 +345,8 @@ fn spawn_serve(
             "--workdir",
         ])
         .arg(&paths.runtime_dir)
+        .args(["--agent-root"])
+        .arg(&agent_root)
         .env(
             "EVO_AGENT_EVORULE__BASE_URL",
             format!("http://127.0.0.1:{engine_port}"),

@@ -248,6 +248,33 @@ pub fn wizard_finish(sup: tauri::State<'_, SupHandle>) -> Result<(), String> {
     mark_wizard_done(&sup.paths)
 }
 
+/// 工作文件夹状态(向导工作区步):缺省根+用户已存偏好(38 号方案 X)。
+#[derive(Debug, serde::Serialize)]
+pub struct WorkspaceStatus {
+    /// 缺省边界根(%USERPROFILE%\Documents\evo-agent)
+    pub default_root: String,
+    /// 用户已保存的工作文件夹(None=未改过,用缺省)
+    pub saved: Option<String>,
+}
+
+#[tauri::command]
+pub fn wizard_workspace_status(sup: tauri::State<'_, SupHandle>) -> WorkspaceStatus {
+    let saved = crate::orchestrator::workspace_pref(&sup.paths.app_config_dir)
+        .map(|p| p.display().to_string());
+    let default_root = crate::orchestrator::default_agent_root()
+        .display()
+        .to_string();
+    WorkspaceStatus {
+        default_root,
+        saved,
+    }
+}
+
+#[tauri::command]
+pub fn wizard_save_workspace(sup: tauri::State<'_, SupHandle>, path: String) -> Result<(), String> {
+    crate::orchestrator::save_workspace_pref(&sup.paths.app_config_dir, &path)
+}
+
 /// 打开向导窗（首启 / 托盘「LLM 凭据…」共用）；已存在则聚焦
 pub fn open_wizard(app: &tauri::AppHandle) -> Result<(), String> {
     if let Some(existing) = app.get_webview_window("wizard") {
