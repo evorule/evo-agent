@@ -1947,12 +1947,15 @@
   .row {
     display: flex;
     justify-content: flex-start;
+    position: relative;
     /* 节奏:气泡行(回合边界/答案)前留大间隙,与紧凑的过程行拉开层级 */
     margin-top: 12px;
   }
+  /* 审计徽标=行角悬浮标:不占横向位,回复气泡得以与栏左右等距 */
   .audit-chip {
-    align-self: flex-end;
-    margin-bottom: 4px;
+    position: absolute;
+    top: -7px;
+    right: 2px;
     display: inline-flex;
   }
   .row.user {
@@ -1975,13 +1978,15 @@
     background: var(--brand);
     color: var(--text-inverse);
   }
-  /* 答案=主角:实底卡+品牌色左标线,与低对比的过程行拉开视觉层级 */
+  /* 答案=主角:实底卡+品牌色左标线,与低对比的过程行拉开视觉层级;
+     宽度与栏左右等距(右侧不再预留区分位) */
   .assistant-bubble {
     background: var(--bg-card);
     border-left: 2px solid var(--brand);
     border-radius: var(--r-md);
     color: var(--text-primary);
     padding: var(--sp-md);
+    max-width: 100%;
   }
   /* 流式中未出字的段:只留紧凑光标线,不占醒目空盒 */
   .assistant-bubble.pending {
@@ -1995,7 +2000,9 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    max-width: 88%;
+    /* 回复气泡与栏左右等距(项目方令:右侧留宽无必要,宽列缩短长回复) */
+    max-width: 100%;
+    flex: 1 1 auto;
     min-width: 0;
   }
   /* 思考=安静脚手架行:去盒、缩进、低对比紧凑;仅展开体与流式段保留视觉标记 */
