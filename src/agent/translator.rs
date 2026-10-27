@@ -120,6 +120,13 @@ pub struct TokenUsage {
     pub completion_tokens: usize,
     /// Total token count
     pub total_tokens: usize,
+    /// provider 回执的缓存命中输入 token(OpenAI 兼容回执形状
+    /// `usage.prompt_tokens_details.cached_tokens`,MiniMax/OpenAI 等被动
+    /// 前缀缓存 provider 命中时携带)。llm_handler 归一时从执行体透传的
+    /// raw 嵌套形状展平到此;provider 未回执该字段时为 None(可空字段,
+    /// 旧 usage 形状反序列化零破坏)
+    #[serde(default)]
+    pub cached_tokens: Option<usize>,
 }
 
 impl LlmResponse {

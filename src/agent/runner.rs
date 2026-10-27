@@ -3141,7 +3141,7 @@ impl AgentRunner {
             }
             _ => None,
         };
-        let mut system_prompt = self
+        let system_prompt = self
             .assembly
             .assemble(
                 &self.config.system_prompt,
@@ -3155,19 +3155,14 @@ impl AgentRunner {
                 self.config.handoff.as_ref(),
                 self.config.governance_segment.as_deref(),
                 knowledge_segment.as_deref(),
+                // 项目记忆段(AGENTS.md 层级)入静态区槽位(知识契约之后、
+                // 记忆召回之前)——内容仅随文件编辑变化,跨轮字节级稳定,
+                // 被动前缀缓存的跨轮命中段因此覆盖静态头+项目记忆
+                self.agents_md_segment.as_deref(),
                 // 批K 段4:S3c_todo 槽位内容物(开关单键双绑;None=静默跳过)
                 self.todo_summary_segment().as_deref(),
             )
             .map_err(AgentError::Internal)?;
-        // 39 号项 A:项目记忆段(AGENTS.md 层级)追加到 system prompt 尾段
-        if let Some(seg) = &self.agents_md_segment {
-            system_prompt.push_str(
-                "
-
-",
-            );
-            system_prompt.push_str(seg);
-        }
 
         // 建会话前 IO 形状契约协商——404/连不通=旧 server warn
         // 通过;端点在但版本不匹配=hard fail(未验证升级行为宁停不错)。
@@ -4676,6 +4671,14 @@ impl AgentRunner {
             .to_string();
         let llm_response: LlmResponse = serde_json::from_str(&llm_result.to_string())
             .map_err(|e| AgentError::Internal(format!("parse LLM response: {}", e)))?;
+
+        // 缓存命中观测:provider 回执的缓存命中输入 token 入指标面
+        // (未回执归零,防跨调用误读旧值)
+        if let Some(m) = &self.metrics {
+            if let Some(usage) = &llm_response.token_usage {
+                m.set_llm_cached_tokens_last(usage.cached_tokens.unwrap_or(0) as u64);
+            }
+        }
 
         // G11:结构化输出校验
         // 先提取校验结果(owned data),释放 &self.output_validator 的借用,
@@ -6862,6 +6865,9 @@ impl AgentRunner {
                                runner.config.handoff.as_ref(),
                                runner.config.governance_segment.as_deref(),
                                knowledge_segment.as_deref(),
+                               // 项目记忆段(AGENTS.md 层级)入静态区槽位——
+                               // 与 run() 路径同口径,跨轮前缀稳定
+                               runner.agents_md_segment.as_deref(),
                                // 批K 段4:S3c_todo 槽位内容物(每轮装配重建——
                                // 状态锚定不靠消息历史;None=静默跳过)
                                runner.todo_summary_segment().as_deref(),
@@ -6872,14 +6878,6 @@ impl AgentRunner {
                                    return;
                                }
                            };
-                           // 39 号项 A:项目记忆段追加到 system prompt 尾段
-                           let mut system_prompt = system_prompt;
-                           if let Some(seg) = &runner.agents_md_segment {
-                               system_prompt.push_str("
-
-");
-                               system_prompt.push_str(seg);
-                           }
 
                            // 2. session:新建 或 复用(G15:continuation)
                            let session_id = if let Some(id) = existing_session_id.clone() {
@@ -7986,6 +7984,16 @@ impl AgentRunner {
                                                // G17:记录 LLM 流式调用成功指标(正常完成)
                                                if let Some(m) = &runner.metrics {
                                                    m.observe_llm_call(model, llm_start.elapsed(), true);
+                                               }
+
+                                               // 缓存命中观测:provider 回执的缓存命中输入 token
+                                               // 入指标面(未回执归零,防跨调用误读旧值)
+                                               if let Some(m) = &runner.metrics {
+                                                   if let Some(usage) = &react_tokens {
+                                                       m.set_llm_cached_tokens_last(
+                                                           usage.cached_tokens.unwrap_or(0) as u64,
+                                                       );
+                                                   }
                                                }
 
                                                // B21:llm_called 事件(provider 真值优先,tokens_est 兜底;
