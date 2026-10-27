@@ -112,6 +112,15 @@ enum Command {
         #[arg(long)]
         stream: bool,
 
+        /// 结构化 JSON 事件流:每事件一行 NDJSON 输出到 stdout,与 serve WS 帧同构
+        /// (进度帧默认包含,可按 type 过滤;stdout 纯 JSON,日志与摘要走 stderr)
+        #[arg(long)]
+        json: bool,
+
+        /// JSON 事件流缩进输出(隐含 --json;人读检视用,机器消费用 --json)
+        #[arg(long)]
+        json_pretty: bool,
+
         /// 39 号项 A:生成项目 AGENTS.md 骨架到 {workdir}/AGENTS.md
         /// (扫描顶层结构+空节模板);已存在则拒绝覆盖,不带 goal 也可运行
         #[arg(long)]
@@ -384,7 +393,13 @@ fn main() -> ExitCode {
     }
 
     // 初始化 logging(0.1.0 简化:用 env RUST_LOG,默认 info)
-    init_logging(cli.verbose);
+    // JSON 事件面先于 match 判定:日志须在订阅器初始化前改道 stderr,
+    // 保 stdout 只承载 NDJSON 事件帧
+    let json_events = matches!(
+        &cli.command,
+        Command::Run { json, json_pretty, .. } if *json || *json_pretty
+    );
+    init_logging(cli.verbose, json_events);
 
     match cli.command {
         Command::Run {
@@ -392,6 +407,8 @@ fn main() -> ExitCode {
             agent,
             auto_approve_candidates,
             stream,
+            json,
+            json_pretty,
             init,
         } => {
             if init {
@@ -408,6 +425,8 @@ fn main() -> ExitCode {
                     agent.as_deref(),
                     auto_approve_candidates,
                     stream,
+                    json || json_pretty,
+                    json_pretty,
                 )
             })
         }
@@ -515,16 +534,25 @@ fn main() -> ExitCode {
     }
 }
 
-fn init_logging(verbose: bool) {
+fn init_logging(verbose: bool, json_events: bool) {
     use tracing_subscriber::{fmt, EnvFilter};
     let level = if verbose { "debug" } else { "info" };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    // G1:Tee writer 双写——stdout 原样 + 内存环形缓冲(GET /admin/logs 读尾部)
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(evo_agent::api::log_buffer::LogTee)
-        .try_init();
+    // G1:Tee writer 双写——stdout 原样 + 内存环形缓冲(GET /admin/logs 读尾部);
+    // JSON 事件面换 stderr 变体:stdout 只承载事件帧,日志不得混入 NDJSON 流
+    let _ = if json_events {
+        fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_writer(evo_agent::api::log_buffer::LogTeeStderr)
+            .try_init()
+    } else {
+        fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_writer(evo_agent::api::log_buffer::LogTee)
+            .try_init()
+    };
 }
 
 // =============================================================================
@@ -613,6 +641,8 @@ fn cmd_run(
     agent: Option<&str>,
     auto_approve_candidates: bool,
     stream: bool,
+    json: bool,
+    json_pretty: bool,
 ) -> ExitCode {
     // 1. 加载配置
     let config = match evo_agent::config::Config::load(workdir) {
@@ -855,7 +885,13 @@ fn cmd_run(
         "running agent '{}' with goal: {}{}",
         runner.agent_type(),
         goal,
-        if stream { " [stream]" } else { "" }
+        if json {
+            " [json]"
+        } else if stream {
+            " [stream]"
+        } else {
+            ""
+        }
     );
 
     // G6:Ctrl+C → 触发 cancel_token,runner 在下一个 event/chunk 边界优雅退出
@@ -867,7 +903,9 @@ fn cmd_run(
         }
     });
 
-    let exit = if stream {
+    let exit = if json {
+        cmd_run_json(&runtime, runner, goal, json_pretty)
+    } else if stream {
         cmd_run_streaming(&runtime, runner, goal)
     } else {
         cmd_run_blocking(&runtime, runner, goal)
@@ -1798,6 +1836,60 @@ fn cmd_run_streaming(
         }
         None => {
             eprintln!("stream ended without result");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// JSON 事件流 — 每个事件一行输出到 stdout,与 serve WS 帧同构
+///
+/// 帧序列化单源在 `agent_event_json_line`(WS 帧映射的行形态,同构断言测试锁定);
+/// stdout 只承载事件帧(无 ANSI/横幅,日志经 stderr 变体改道,见 init_logging);
+/// 退出码与文本臂同语义:Done.success / 流级错误 / 无终帧 → 0 / 1 / 1。
+/// 进度帧默认全量包含(消费方按 type 过滤),不做衰减开关。
+fn cmd_run_json(
+    runtime: &tokio::runtime::Runtime,
+    runner: AgentRunner,
+    goal: &str,
+    pretty: bool,
+) -> ExitCode {
+    use evo_agent::api::ws_handler::agent_event_json_line;
+    use evo_agent::AgentEvent;
+    use futures_util::StreamExt;
+    use std::io::Write;
+
+    let final_success = runtime.block_on(async move {
+        let mut event_stream = runner.run_streaming(goal.to_string(), Vec::new());
+        let mut stdout = std::io::stdout().lock();
+
+        let mut final_success: Option<bool> = None;
+
+        while let Some(event) = event_stream.next().await {
+            // 终帧退出码先行登记(借检查在消费前结束,事件随后被序列化)
+            match &event {
+                Ok(AgentEvent::Done(result)) => final_success = Some(result.success),
+                Err(_) => final_success = Some(false),
+                _ => {}
+            }
+            let line = agent_event_json_line(event, pretty);
+            if writeln!(stdout, "{line}")
+                .and_then(|_| stdout.flush())
+                .is_err()
+            {
+                // 下游管道提前关闭(如 head/jq 早退):与 WS 发送端断开同语义,停止消费
+                eprintln!("json output stream closed");
+                return final_success;
+            }
+        }
+
+        final_success
+    });
+
+    match final_success {
+        Some(true) => ExitCode::SUCCESS,
+        Some(false) => ExitCode::from(1),
+        None => {
+            eprintln!("stream ended without a final result");
             ExitCode::from(1)
         }
     }
