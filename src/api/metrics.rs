@@ -93,6 +93,12 @@ pub struct Metrics {
     /// 定期校验对齐时累计漂移条目数（ghost 清理 + miss 回填），
     /// 持续增长说明写入链路存在系统性失败。
     memory_cache_drift_total: IntCounter,
+    /// 最近一次 LLM 调用的 provider 缓存命中输入 token（被动前缀缓存观测）
+    ///
+    /// OpenAI 兼容回执 `prompt_tokens_details.cached_tokens`；provider 未
+    /// 回执时置 0。prompt 缓存收益验证（命中率/时延下降）与缓存档计费
+    /// 核对的入口指标。
+    llm_cached_tokens_last: IntGauge,
 }
 
 impl fmt::Debug for Metrics {
@@ -186,6 +192,13 @@ impl Metrics {
         .map_err(|_| {
             MetricsError::CounterCreationFailed("evo_agent_memory_cache_drift_total".into())
         })?;
+        let llm_cached_tokens_last = IntGauge::new(
+            "evo_agent_llm_cached_tokens_last",
+            "Provider cache-hit prompt tokens of the most recent LLM call",
+        )
+        .map_err(|_| {
+            MetricsError::GaugeCreationFailed("evo_agent_llm_cached_tokens_last".into())
+        })?;
 
         registry
             .register(Box::new(sessions_total.clone()))
@@ -244,6 +257,11 @@ impl Metrics {
                     "evo_agent_memory_cache_drift_total".into(),
                 )
             })?;
+        registry
+            .register(Box::new(llm_cached_tokens_last.clone()))
+            .map_err(|_| {
+                MetricsError::RegistryRegistrationFailed("evo_agent_llm_cached_tokens_last".into())
+            })?;
 
         Ok(Self {
             registry,
@@ -258,6 +276,7 @@ impl Metrics {
             llm_bypass_audit_total,
             safety_audit_hits_total,
             memory_cache_drift_total,
+            llm_cached_tokens_last,
         })
     }
 
@@ -328,6 +347,13 @@ impl Metrics {
         self.tool_calls_total
             .with_label_values(&[tool, status])
             .inc();
+    }
+
+    /// 记录最近一次 LLM 调用的 provider 缓存命中输入 token(被动前缀缓存观测)
+    ///
+    /// provider 回执无缓存信息时传 0(指标归零而非保留旧值,防跨会话误读)。
+    pub fn set_llm_cached_tokens_last(&self, n: u64) {
+        self.llm_cached_tokens_last.set(n as i64);
     }
 
     /// SSE 连接 +1
@@ -544,6 +570,20 @@ mod tests {
         m.dec_sse_connections();
         let output = m.render();
         assert!(output.contains("evo_agent_sse_connections 1"));
+    }
+
+    #[test]
+    fn test_llm_cached_tokens_last_gauge() {
+        let m = make_metrics();
+        assert!(
+            m.render().contains("evo_agent_llm_cached_tokens_last 0"),
+            "指标必须在注册时可见(初始 0)"
+        );
+        m.set_llm_cached_tokens_last(80);
+        assert!(m.render().contains("evo_agent_llm_cached_tokens_last 80"));
+        // 未回执归零语义:防跨调用误读旧值
+        m.set_llm_cached_tokens_last(0);
+        assert!(m.render().contains("evo_agent_llm_cached_tokens_last 0"));
     }
 
     #[test]

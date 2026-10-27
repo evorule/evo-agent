@@ -861,7 +861,19 @@ fn normalize_executor_response(json: Value) -> Result<Value, String> {
     let token_usage = json
         .get("token_usage")
         .filter(|v| !v.is_null())
-        .and_then(|v| serde_json::from_value::<TokenUsage>(v.clone()).ok());
+        .and_then(|v| {
+            let mut usage: TokenUsage = serde_json::from_value(v.clone()).ok()?;
+            // 执行体透传的是 provider raw usage(缓存命中输入 token 嵌在
+            // prompt_tokens_details.cached_tokens)——归一时展平入
+            // TokenUsage.cached_tokens,随 io_response/审计链/指标面可见
+            if usage.cached_tokens.is_none() {
+                usage.cached_tokens = v
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize);
+            }
+            Some(usage)
+        });
 
     let reasoning = json
         .get("reasoning")
@@ -2221,6 +2233,49 @@ mod tests {
             "四键形状不得多出空 reasoning 键"
         );
         assert_eq!(out["content"], "hi");
+    }
+
+    /// 缓存命中观测展平:执行体透传的 provider raw 嵌套形状
+    /// prompt_tokens_details.cached_tokens → TokenUsage.cached_tokens;
+    /// 未回执/旧三键形状/嵌套对象缺键 → None(可空字段零破坏)
+    #[test]
+    fn test_normalize_executor_response_cached_tokens_flattened() {
+        let out = normalize_executor_response(serde_json::json!({
+            "content": "ok", "tool_calls": null, "finish_reason": "stop",
+            "token_usage": {
+                "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+                "prompt_tokens_details": { "cached_tokens": 80 }
+            }
+        }))
+        .unwrap();
+        let usage: TokenUsage = serde_json::from_value(out["token_usage"].clone()).unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.cached_tokens, Some(80), "嵌套回执必须展平可见");
+
+        let out = normalize_executor_response(serde_json::json!({
+            "content": "ok", "tool_calls": null, "finish_reason": "stop",
+            "token_usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+        .unwrap();
+        let usage: TokenUsage = serde_json::from_value(out["token_usage"].clone()).unwrap();
+        assert_eq!(
+            usage.cached_tokens, None,
+            "旧三键形状兼容,缓存字段缺省 None"
+        );
+
+        let out = normalize_executor_response(serde_json::json!({
+            "content": "ok", "tool_calls": null, "finish_reason": "stop",
+            "token_usage": {
+                "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2,
+                "prompt_tokens_details": {}
+            }
+        }))
+        .unwrap();
+        let usage: TokenUsage = serde_json::from_value(out["token_usage"].clone()).unwrap();
+        assert_eq!(
+            usage.cached_tokens, None,
+            "嵌套对象缺 cached_tokens 亦 None"
+        );
     }
 }
 

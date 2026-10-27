@@ -22,14 +22,18 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// 默认配方版本（recipe-v1.0 = 现状硬编码值的规则化形态；recipe-v1.1 =
-/// 批K 段4 增补 S3c_todo 槽位——optional 槽,无 todo 态时逐字节等价 v1.0）
-pub const DEFAULT_RECIPE_VERSION: &str = "recipe-v1.1";
+/// 批K 段4 增补 S3c_todo 槽位——optional 槽,无 todo 态时逐字节等价 v1.0；
+/// recipe-v1.2 = 增补 S2c_agents_md 槽位——项目记忆段(AGENTS.md 层级)
+/// 从 system prompt 尾段挪入静态区(知识契约之后、记忆召回之前),optional
+/// 槽,无段时逐字节等价 v1.1;动态区(recall/todo)集中尾置的前缀稳定前提）
+pub const DEFAULT_RECIPE_VERSION: &str = "recipe-v1.2";
 
 /// 槽位来源白名单（执行器只认这些来源;新增来源 = 执行器升级 = major）
 pub const SLOT_SOURCES: &[&str] = &[
     "definition.system_prompt",
     "governance_segment",
     "knowledge_segment",
+    "agents_md",
     "recall",
     "todo_summary",
     "definition.capability_boundary.awareness_segment",
@@ -236,6 +240,25 @@ fn default_slots() -> Vec<SlotSpec> {
             degradation_order: None,
             sections: None,
             separator: None,
+            role: None,
+            trim: None,
+        },
+        SlotSpec {
+            id: "S2c_agents_md".to_string(),
+            source: "agents_md".to_string(),
+            // 项目记忆段(AGENTS.md 层级):静态区尾槽(知识契约之后、记忆
+            // 召回之前)。内容仅随文件编辑变化,跨轮字节级稳定——被动前缀
+            // 缓存的跨轮命中段因此从静态头延长到静态头+项目记忆;动态区
+            // (recall/todo)集中尾置。超限裁剪由装载器负责并带标注,槽内
+            // 不再裁剪;None/空 = 未启用,槽位静默跳过 = 既有 agent 逐字节
+            // 零影响(recipe-v1.2 minor 增补的等价性依据)
+            degradable: false,
+            optional: true,
+            enabled: true,
+            budget: None,
+            degradation_order: None,
+            sections: None,
+            separator: Some("\n\n".to_string()),
             role: None,
             trim: None,
         },
@@ -694,6 +717,7 @@ impl AssemblyExecutor {
         handoff: Option<&crate::agent::definition::HandoffPackage>,
         governance_segment: Option<&str>,
         knowledge_segment: Option<&str>,
+        agents_md: Option<&str>,
         todo_summary: Option<&str>,
     ) -> Result<String, String> {
         let mut prompt = String::new();
@@ -734,6 +758,19 @@ impl AssemblyExecutor {
                     if let Some(seg) = knowledge_segment {
                         if !seg.trim().is_empty() {
                             prompt.push_str("\n\n");
+                            prompt.push_str(seg);
+                        }
+                    }
+                }
+                // S2c_agents_md:项目记忆段(AGENTS.md 层级)——静态区尾槽
+                // (知识契约之后、记忆召回之前)。内容仅随文件编辑变化,
+                // 跨轮字节级稳定;与动态区(recall/todo)分区隔离是被动前缀
+                // 缓存跨轮命中的前提。None/空 = 未启用,槽位静默跳过
+                "agents_md" => {
+                    if let Some(seg) = agents_md {
+                        if !seg.trim().is_empty() {
+                            let sep = slot.separator.as_deref().unwrap_or("\n\n");
+                            prompt.push_str(sep);
                             prompt.push_str(seg);
                         }
                     }
@@ -827,7 +864,7 @@ mod tests {
     #[test]
     fn test_default_recipe_matches_current_hardcoded_values() {
         let r = AssemblyRecipe::default();
-        assert_eq!(r.recipe_version, "recipe-v1.1");
+        assert_eq!(r.recipe_version, "recipe-v1.2");
         let ids: Vec<&str> = r.slots.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -835,6 +872,7 @@ mod tests {
                 "S1_base",
                 "S2_governance",
                 "S2b_knowledge",
+                "S2c_agents_md",
                 "S3_memory",
                 "S3c_todo",
                 "S4_boundary",
@@ -854,8 +892,18 @@ mod tests {
         assert_eq!(s2b.id, "S2b_knowledge");
         assert!(!s2b.degradable);
         assert!(s2b.optional);
+        // S2c 项目记忆段(AGENTS.md 层级):静态区尾槽(知识契约之后、记忆
+        // 召回之前;optional+不可降级+"\n\n",超限裁剪归装载器)
+        let s2c = &r.slots[3];
+        assert_eq!(s2c.id, "S2c_agents_md");
+        assert_eq!(s2c.source, "agents_md");
+        assert!(s2c.optional);
+        assert!(!s2c.degradable);
+        assert!(s2c.enabled);
+        assert!(s2c.budget.is_none());
+        assert_eq!(s2c.separator.as_deref(), Some("\n\n"));
         // S3 记忆区:C3 默认 0.25 + clamp(0.1,0.5) + 降级序 stable>summaries>events + notices 置前
-        let s3 = &r.slots[3];
+        let s3 = &r.slots[4];
         assert_eq!(s3.source, "recall");
         assert!(s3.degradable);
         let b = s3.budget.as_ref().unwrap();
@@ -869,7 +917,7 @@ mod tests {
         assert!(s3.sections.unwrap().notices_first);
         // S3c todo 清单摘要(批K 段4):optional + 不可降级 + "\n\n"(清单空/开关关
         // =槽位静默跳过,既有 agent 逐字节零影响)
-        let s3c = &r.slots[4];
+        let s3c = &r.slots[5];
         assert_eq!(s3c.id, "S3c_todo");
         assert_eq!(s3c.source, "todo_summary");
         assert!(s3c.optional);
@@ -878,16 +926,16 @@ mod tests {
         assert!(s3c.budget.is_none());
         assert_eq!(s3c.separator.as_deref(), Some("\n\n"));
         // S4 边界段:optional + "\n\n"
-        assert!(r.slots[5].optional);
-        assert_eq!(r.slots[5].separator.as_deref(), Some("\n\n"));
-        // S4b:B2 启用(optional + skills 未声明时跳过 = 预留期行为逐字节一致)
-        assert!(r.slots[6].enabled);
-        assert!(r.slots[5].optional);
+        assert!(r.slots[6].optional);
         assert_eq!(r.slots[6].separator.as_deref(), Some("\n\n"));
+        // S4b:B2 启用(optional + skills 未声明时跳过 = 预留期行为逐字节一致)
+        assert!(r.slots[7].enabled);
+        assert!(r.slots[6].optional);
+        assert_eq!(r.slots[7].separator.as_deref(), Some("\n\n"));
         // S5 任务:user 角色
-        assert_eq!(r.slots[7].role.as_deref(), Some("user"));
+        assert_eq!(r.slots[8].role.as_deref(), Some("user"));
         // S7 裁剪:KeepSystemKeepLast + buffer 5% + hint 15
-        let t = r.slots[9].trim.as_ref().unwrap();
+        let t = r.slots[10].trim.as_ref().unwrap();
         assert_eq!(t.strategy, "KeepSystemKeepLast");
         assert_eq!(t.buffer_pct, 5);
         assert_eq!(t.hint_budget_tokens, 15);
@@ -908,6 +956,36 @@ mod tests {
     fn test_empty_object_deserializes_to_default() {
         let r: AssemblyRecipe = serde_json::from_str("{}").unwrap();
         assert_eq!(r, AssemblyRecipe::default());
+    }
+
+    /// S2c_agents_md 静态区槽位:段落序=知识契约之后、动态尾区(todo)之前
+    /// (跨轮前缀稳定的结构前提;被动前缀缓存命中段=静态头+项目记忆。
+    /// recall 侧序由配方槽序黄金断言锁定 S2c<S3,此处行为面验 todo 侧)
+    #[test]
+    fn test_agents_md_slot_sits_between_knowledge_and_volatile_tail() {
+        let executor = AssemblyExecutor::new(AssemblyRecipe::default());
+        let out = executor
+            .assemble(
+                "BASE",
+                None,
+                None,
+                None,
+                &RecallContext::default(),
+                0,
+                None,
+                None,
+                None,
+                Some("GOV"),
+                Some("KNOW"),
+                Some("AGENTSMD"),
+                Some("TODO"),
+            )
+            .unwrap();
+        let know = out.find("KNOW").expect("knowledge segment present");
+        let agents = out.find("AGENTSMD").expect("agents md segment present");
+        let todo = out.find("TODO").expect("todo summary present");
+        assert!(know < agents, "项目记忆必须在知识契约之后(静态区内)");
+        assert!(agents < todo, "项目记忆必须在动态尾区(recall/todo)之前");
     }
 
     /// 默认配方通过自身校验(自洽)
@@ -951,6 +1029,7 @@ mod tests {
                 Some("GOV"),
                 Some("KNOW"),
                 None,
+                None,
             )
             .unwrap();
         assert!(out.starts_with("BASE"));
@@ -974,6 +1053,7 @@ mod tests {
                 None,
                 None,
                 Some("GOV"),
+                None,
                 None,
                 None,
             )
@@ -1193,6 +1273,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1209,6 +1290,7 @@ mod tests {
                 Some(&mem),
                 &recall,
                 60,
+                None,
                 None,
                 None,
                 None,
@@ -1243,6 +1325,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1271,6 +1354,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(out_none, "base");
@@ -1284,6 +1368,7 @@ mod tests {
                 &Default::default(),
                 0,
                 Some("【能力边界声明】boundary"),
+                None,
                 None,
                 None,
                 None,
@@ -1304,6 +1389,7 @@ mod tests {
                 None,
                 &Default::default(),
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -1339,6 +1425,7 @@ mod tests {
                 None,
                 None,
                 Some("【清单】- [*] t1 先做"),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1361,6 +1448,7 @@ mod tests {
                 &Default::default(),
                 0,
                 Some("【能力边界声明】boundary"),
+                None,
                 None,
                 None,
                 None,
@@ -1396,6 +1484,7 @@ mod tests {
                 None,
                 &Default::default(),
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -1439,6 +1528,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(out.starts_with("base\n\n"));
@@ -1468,6 +1558,7 @@ mod tests {
                 0,
                 Some("【能力边界声明】boundary"),
                 Some(&skills),
+                None,
                 None,
                 None,
                 None,
@@ -1509,6 +1600,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1528,6 +1620,7 @@ mod tests {
                 0,
                 None,
                 Some(&[]),
+                None,
                 None,
                 None,
                 None,
@@ -1588,6 +1681,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         // 显式兼容口径(base=total_window,历史行为)
@@ -1607,6 +1701,7 @@ mod tests {
                 Some(&mem),
                 &recall,
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -1667,6 +1762,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         // 新配方:加载 → validate → 字段落位
@@ -1692,6 +1788,7 @@ mod tests {
                 None,
                 &Default::default(),
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -1800,6 +1897,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         let stable_pos = out1
@@ -1824,6 +1922,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(out2.contains("## Handoff Base"));
@@ -1838,6 +1937,7 @@ mod tests {
                 None,
                 &RecallContext::default(),
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -1943,6 +2043,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -1983,6 +2084,7 @@ mod tests {
                 Some(&skills),
                 Some(&handoff),
                 Some(&governance),
+                None,
                 None,
                 None,
             )
