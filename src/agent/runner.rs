@@ -1135,6 +1135,9 @@ pub struct AgentRunner {
     /// plan_submit 执行成功即收束回合推 PlanSubmitted。serve 面每条消息
     /// 重建 runner,随构造传入=天然回合级;CLI 面恒 false 零影响
     plan_mode: bool,
+    /// 用户 hooks(交互批 第二批):pre_tool deny/rewrite 与 post_tool/turn_end
+    /// 只读通知;None=未配置,管道直通零开销(既有路径零变化)
+    user_hooks: Option<std::sync::Arc<crate::agent::user_hooks::WiredHooks>>,
     config: AgentConfig,
     evorule_client: EvoruleApiClient,
     llm_handler: LlmHandler,
@@ -1424,6 +1427,7 @@ impl AgentRunner {
             llm_handler: LlmHandler::with_defaults(),
             agents_md_segment: None,
             plan_mode: false,
+            user_hooks: None,
             tool_handler: ToolHandler::new(),
             memory: None,
             delegate_context: None,
@@ -2199,6 +2203,16 @@ impl AgentRunner {
     /// 成功即收束回合。false(缺省)=零变化
     pub fn with_plan_mode(mut self, enabled: bool) -> Self {
         self.plan_mode = enabled;
+        self
+    }
+
+    /// 注入用户 hooks(交互批 第二批):构造期装载好的 WiredHooks;None=未配置
+    /// (零变化)。serve 面随 construct_runner 按 workdir 装载
+    pub fn with_user_hooks(
+        mut self,
+        hooks: Option<std::sync::Arc<crate::agent::user_hooks::WiredHooks>>,
+    ) -> Self {
+        self.user_hooks = hooks;
         self
     }
 
@@ -4145,6 +4159,7 @@ impl AgentRunner {
                 tool_handler: tool_handler.clone(),
                 agents_md_segment: None,
                 plan_mode: false,
+                user_hooks: None,
                 memory: memory.clone(),
                 delegate_context: delegate_context.clone(),
                 session_id: Some(child_sid.to_string()),
@@ -5115,6 +5130,7 @@ impl AgentRunner {
             traces: Some(&self.tool_traces),
             metrics: self.metrics.as_deref(),
             retry_backoff: std::time::Duration::from_secs(1),
+            user_hooks: self.user_hooks.clone(),
         };
         // M4 写面撤销 pre-capture:⑦ 执行前读原状态入 blob(缓存收口臂
         // precomputed 命中 = 无写动作发生,跳过)。在 req 构造前判断,
@@ -5305,6 +5321,13 @@ impl AgentRunner {
                         })
                     }))
                 }
+                // 用户 hook 拒绝 = Ok(blocked JSON) 回喂(同治理形态;区别在
+                // status 标签,LLM 可分辨「治理红线」与「用户定制拦截」)
+                crate::agent::pipeline::DenialStage::UserHook => Ok(serde_json::json!({
+                    "status": "blocked_by_user_hook",
+                    "tool": tool_name,
+                    "reason": denial.reason,
+                })),
             },
         }
     }
@@ -5861,6 +5884,15 @@ impl AgentRunner {
                                 "status": "needs_approval",
                                 "tool": tc.name,
                             })
+                        })
+                    }
+                    // 用户 hook 拒绝 = blocked JSON(与主路径 status 标签一致;
+                    // G13 缓存 parse 不命中=不缓存,审批/重试语义不受影响)
+                    crate::agent::pipeline::DenialStage::UserHook => {
+                        serde_json::json!({
+                            "status": "blocked_by_user_hook",
+                            "tool": tc.name,
+                            "reason": denial.reason,
                         })
                     }
                     // 其余拒绝(①②⑤拒绝/③④通道/⑧账面)= error JSON 显式回喂,
@@ -6612,9 +6644,10 @@ impl AgentRunner {
         session_id: String,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         let callbacks = self.event_callbacks.clone();
+        let hooks = self.user_hooks.clone();
         let inner = self.run_streaming_inner(
             String::new(),
-            Some(session_id),
+            Some(session_id.clone()),
             RecoveryMode::CrashResume,
             Vec::new(),
         );
@@ -6625,6 +6658,21 @@ impl AgentRunner {
                     callbacks.dispatch(event).await;
                 }
                 yield result;
+            }
+            // turn_end 只读 hooks(交互批 第二批):流终=回合终(任意收场形态);
+            // 失败只留痕不回传
+            if let Some(wired) = hooks {
+                let outcomes = wired
+                    .hooks
+                    .turn_end_notify(&session_id, &wired.workdir)
+                    .await;
+                for out in &outcomes {
+                    if let Some(err) = &out.error {
+                        tracing::warn!(rule = out.rule_index, error = %err, "user turn_end hook failed (ignored)");
+                    } else if !out.exited_ok {
+                        tracing::warn!(rule = out.rule_index, "user turn_end hook exited non-zero (ignored)");
+                    }
+                }
             }
         })
     }
@@ -6658,15 +6706,31 @@ impl AgentRunner {
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         // G18:提取回调链(Arc clone),在 inner stream 之外包装 dispatch
         let callbacks = self.event_callbacks.clone();
+        let hooks = self.user_hooks.clone();
         let inner = self.run_streaming_inner(goal, None, RecoveryMode::Fresh, images);
         Box::pin(async_stream::stream! {
             let mut inner = inner;
+            let mut hooks_session: Option<String> = None;
             while let Some(result) = inner.next().await {
                 // G18:Ok 事件在 yield 前分发给所有回调(超时/panic 不中断)
                 if let Ok(ref event) = result {
+                    if let AgentEvent::SessionCreated { session_id, .. } = event {
+                        hooks_session = Some(session_id.clone());
+                    }
                     callbacks.dispatch(event).await;
                 }
                 yield result;
+            }
+            // turn_end 只读 hooks(交互批 第二批):流终=回合终;会话未建立则跳过
+            if let (Some(wired), Some(sid)) = (hooks.as_ref(), hooks_session.as_deref()) {
+                let outcomes = wired.hooks.turn_end_notify(sid, &wired.workdir).await;
+                for out in &outcomes {
+                    if let Some(err) = &out.error {
+                        tracing::warn!(rule = out.rule_index, error = %err, "user turn_end hook failed (ignored)");
+                    } else if !out.exited_ok {
+                        tracing::warn!(rule = out.rule_index, "user turn_end hook exited non-zero (ignored)");
+                    }
+                }
             }
         })
     }
