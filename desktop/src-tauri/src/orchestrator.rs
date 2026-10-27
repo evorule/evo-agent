@@ -374,17 +374,14 @@ fn spawn_serve(
     Ok(serve)
 }
 
-/// 用户 LLM key（app_config_dir\llm-key.txt，单行 trim）。
-/// 密文形态 `dpapi1:<hex>` 走 DPAPI 解密（向导批），无前缀按存量明文兼容；
-/// 读出后仅以 env 注入执行体进程：不进日志/不进命令行/不落 runtime 产物。
-fn read_llm_key(paths: &ResolvedPaths) -> Option<String> {
-    crate::wizard::read_llm_key(paths)
-}
-
 /// 壳生成的执行体运行时配置（每次拉起覆写）。动态值——监听端口/引擎地址/
 /// 白名单物料绝对路径——不允许静态模板承载；key 与调用方令牌一律走 env，
 /// 不进本文件。server_auth_token 置空：本拓扑下执行体只被 serve 调用
 /// （/llm/execute），不主动调引擎。
+///
+/// 多 provider 路由：已配置 key 的内置目录 provider 生成为 `llm_providers`
+/// 节（按模型路由端点与凭据）；同时保留 `llm_execute_url` 单端点形态——
+/// 旧版捆绑插件忽略未知配置键时按单端点路径降级工作（向前向后兼容）。
 fn write_ai_plugin_config(
     paths: &ResolvedPaths,
     listen_port: u16,
@@ -395,7 +392,7 @@ fn write_ai_plugin_config(
         .join("agent-governance")
         .join("rules")
         .join("00_constraint_model_allowlist.json");
-    let cfg = serde_json::json!({
+    let mut cfg = serde_json::json!({
         "listen_addr": format!("127.0.0.1:{listen_port}"),
         "server_base_url": format!("http://127.0.0.1:{engine_port}"),
         "server_auth_token": "",
@@ -406,13 +403,40 @@ fn write_ai_plugin_config(
         "llm_timeout_ms": 60000,
         "model_allowlist_path": allowlist.display().to_string(),
     });
+    let providers = crate::wizard::read_provider_keys(paths);
+    if !providers.is_empty() {
+        cfg["llm_providers"] = serde_json::Value::Array(
+            providers
+                .iter()
+                .filter_map(|(name, _)| {
+                    let entry = crate::wizard::catalog_entry(name)?;
+                    Some(serde_json::json!({
+                        "name": name,
+                        "execute_url": entry.execute_url,
+                        "api_key_env": crate::wizard::provider_key_env(name),
+                        "models": entry.models,
+                    }))
+                })
+                .collect(),
+        );
+    }
     let out = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
     std::fs::write(paths.runtime_dir.join("ai-plugin.json"), out)
         .map_err(|e| format!("write ai-plugin.json: {e}"))
 }
 
-/// 执行体启用判定：exe 在位 且 key 文件在位（对齐 console「产物在位即启用」
-/// 先例）。缺任一 = 不拉起 + 一条日志指引，工作台其余功能照常。
+/// 主 key（legacy 单端点 env 兼容载体）：minimax 优先（单 key 时代语义），
+/// 缺位取目录序第一个已配置 provider。仅供旧版捆绑插件降级路径与
+/// EVORULE_AI_PLUGIN_LLM_API_KEY env 使用；路由模式各 provider 用专属 env。
+fn read_primary_llm_key(paths: &ResolvedPaths) -> Option<String> {
+    match crate::wizard::read_provider_key(paths, "minimax") {
+        Some(k) => Some(k),
+        None => crate::wizard::read_provider_keys(paths).into_iter().next().map(|(_, k)| k),
+    }
+}
+
+/// 执行体启用判定：exe 在位 且 任一 provider key 在位（对齐 console「产物
+/// 在位即启用」先例）。缺任一 = 不拉起 + 一条日志指引，工作台其余功能照常。
 fn llm_executor_ready(ctx: &LaunchContext, log: &mut impl Write) -> Option<String> {
     if !ctx.paths.ai_plugin_exe.is_file() {
         writeln!(
@@ -423,7 +447,7 @@ fn llm_executor_ready(ctx: &LaunchContext, log: &mut impl Write) -> Option<Strin
         .ok();
         return None;
     }
-    match read_llm_key(ctx.paths) {
+    match read_primary_llm_key(ctx.paths) {
         Some(k) => Some(k),
         None => {
             writeln!(
@@ -451,8 +475,12 @@ fn spawn_ai_plugin(
     cmd.arg("--config")
         .arg(paths.runtime_dir.join("ai-plugin.json"))
         .env("EVORULE_AI_PLUGIN_CALLER_TOKEN", ctx.executor_token)
-        .env("EVORULE_AI_PLUGIN_LLM_API_KEY", llm_key)
-        .stdout(Stdio::from(out_log))
+        .env("EVORULE_AI_PLUGIN_LLM_API_KEY", llm_key);
+    // 路由模式：各 provider 专属 key env（凭据只走 env，不落盘不进命令行）
+    for (name, key) in crate::wizard::read_provider_keys(paths) {
+        cmd.env(crate::wizard::provider_key_env(name), key);
+    }
+    cmd.stdout(Stdio::from(out_log))
         .stderr(Stdio::from(err_log))
         .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     let child = cmd.spawn().map_err(|e| format!("spawn ai-plugin: {e}"))?;
@@ -691,14 +719,58 @@ mod tests {
     fn llm_key_file_trimmed_and_blank_rejected() {
         let paths = scratch_paths("key");
         // 缺文件 → None
-        assert!(read_llm_key(&paths).is_none());
+        assert!(crate::wizard::read_llm_key(&paths).is_none());
         let key_file = paths.app_config_dir.join("llm-key.txt");
         // 空白 → None（视为未配置，不误启用）
         std::fs::write(&key_file, "   \n").unwrap();
-        assert!(read_llm_key(&paths).is_none());
+        assert!(crate::wizard::read_llm_key(&paths).is_none());
         // 正常值 → trim 后返回
         std::fs::write(&key_file, "  sk-live-example \n").unwrap();
-        assert_eq!(read_llm_key(&paths).as_deref(), Some("sk-live-example"));
+        assert_eq!(
+            crate::wizard::read_llm_key(&paths).as_deref(),
+            Some("sk-live-example")
+        );
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn ai_plugin_config_emits_llm_providers_for_configured_keys() {
+        let paths = scratch_paths("prov-cfg");
+        // 两家 provider 配 key（明文直写=读侧兼容形态；不经 DPAPI 依赖）
+        let keys_dir = paths.app_config_dir.join("llm-keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+        std::fs::write(keys_dir.join("deepseek.txt"), "sk-ds-test\n").unwrap();
+        std::fs::write(keys_dir.join("kimi.txt"), "sk-kimi-test\n").unwrap();
+        write_ai_plugin_config(&paths, 19132, 18080).unwrap();
+        let raw = std::fs::read_to_string(paths.runtime_dir.join("ai-plugin.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let providers = v["llm_providers"].as_array().expect("providers emitted");
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0]["name"], "deepseek");
+        assert_eq!(
+            providers[0]["api_key_env"],
+            "EVORULE_AI_PLUGIN_LLM_KEY_DEEPSEEK"
+        );
+        assert!(providers[0]["models"].as_array().unwrap().len() >= 1);
+        assert_eq!(providers[1]["name"], "kimi");
+        // 零落盘红线延伸：路由节同样不得出现 key 本体
+        assert!(raw.contains("api_key_env") && !raw.contains("sk-ds-test"));
+        // 单端点形态保留（旧版捆绑插件降级路径）
+        assert!(v["llm_execute_url"].as_str().unwrap().starts_with("https://"));
+        // 主 key 兼容载体：无 minimax key 时回落目录序第一个
+        let primary = read_primary_llm_key(&paths).unwrap();
+        assert_eq!(primary, "sk-ds-test");
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn ai_plugin_config_has_no_providers_section_when_no_keys() {
+        let paths = scratch_paths("prov-empty");
+        write_ai_plugin_config(&paths, 19133, 18080).unwrap();
+        let raw = std::fs::read_to_string(paths.runtime_dir.join("ai-plugin.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(v.get("llm_providers").is_none(), "无 key 不生成路由节");
+        assert!(read_primary_llm_key(&paths).is_none());
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 

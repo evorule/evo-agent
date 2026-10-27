@@ -159,6 +159,12 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 /// 保存 key：trim + 单行 + 长度校验 → DPAPI 加密落盘
 pub fn save_key(paths: &ResolvedPaths, raw: &str) -> Result<(), String> {
+    validate_and_store(&key_file_path(paths), raw)
+}
+
+/// 校验（trim 非空/单行/长度上限）后 DPAPI 加密落盘（save_key 与分 provider
+/// key 共用一套形态：`dpapi1:<hex>` 前缀自识别，读侧明文兼容）
+fn validate_and_store(path: &std::path::Path, raw: &str) -> Result<(), String> {
     let key = raw.trim();
     if key.is_empty() {
         return Err("key 不能为空".into());
@@ -176,11 +182,10 @@ pub fn save_key(paths: &ResolvedPaths, raw: &str) -> Result<(), String> {
     );
     #[cfg(not(windows))]
     let stored = key.to_string(); // 非 Windows（内测仅发 Windows）明文回落
-    let p = key_file_path(paths);
-    if let Some(dir) = p.parent() {
+    if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&p, stored).map_err(|e| format!("write llm-key.txt: {e}"))
+    std::fs::write(path, stored).map_err(|e| format!("write key file: {e}"))
 }
 
 /// 原始文件内容（None = 未配置）
@@ -194,7 +199,117 @@ fn read_key_raw(paths: &ResolvedPaths) -> Option<String> {
 /// 供编排层消费：密文前缀走 DPAPI 解密，无前缀按明文兼容返回。
 /// 失败（解不开）返回 None 并由调用方记日志——fail-visible 于日志面。
 pub fn read_llm_key(paths: &ResolvedPaths) -> Option<String> {
-    let raw = read_key_raw(paths)?;
+    read_key_file(&key_file_path(paths))
+}
+
+fn key_tail4(key: &str) -> String {
+    key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect()
+}
+
+// ---- 多 provider 目录与分 provider key 存储（模型路由批跟随） ----
+
+/// 内置 provider 目录（OpenAI 兼容 chat/completions 全 URL 形态）。
+///
+/// `models` 为出厂建议集：**实际准入以白名单物料为准**——执行体启动执法
+/// 「路由 ⊆ 物料」，物料未收的模型对应 provider 不装载（启动日志留诊断），
+/// 属预期渐进态；扩展 provider/模型以物料扩表为正源，目录只承载端点与凭据。
+pub struct ProviderEntry {
+    pub name: &'static str,
+    pub display: &'static str,
+    pub execute_url: &'static str,
+    pub models: &'static [&'static str],
+}
+
+pub const PROVIDERS: &[ProviderEntry] = &[
+    ProviderEntry {
+        name: "minimax",
+        display: "MiniMax",
+        execute_url: "https://api.minimaxi.com/v1/text/chatcompletion_v2",
+        models: &["MiniMax-M2.5", "MiniMax-M3"],
+    },
+    ProviderEntry {
+        name: "deepseek",
+        display: "DeepSeek",
+        execute_url: "https://api.deepseek.com/v1/chat/completions",
+        models: &["deepseek-chat", "deepseek-reasoner"],
+    },
+    ProviderEntry {
+        name: "kimi",
+        display: "Kimi",
+        execute_url: "https://api.moonshot.cn/v1/chat/completions",
+        models: &["kimi-k2-0905-preview", "kimi-latest"],
+    },
+    ProviderEntry {
+        name: "zhipu",
+        display: "智谱 GLM",
+        execute_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        models: &["glm-4.6", "glm-4.5"],
+    },
+    ProviderEntry {
+        name: "qwen",
+        display: "通义千问",
+        execute_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        models: &["qwen3-max", "qwen-plus"],
+    },
+];
+
+/// 目录内查找（编排层生成 llm_providers 时消费）
+pub fn catalog_entry(name: &str) -> Option<&'static ProviderEntry> {
+    PROVIDERS.iter().find(|p| p.name == name)
+}
+
+/// provider key 的执行体环境变量名（编排层注入进程；插件 api_key_env 消费
+/// 同名义——凭据只走 env，不落盘）
+pub fn provider_key_env(name: &str) -> String {
+    format!("EVORULE_AI_PLUGIN_LLM_KEY_{}", name.to_ascii_uppercase())
+}
+
+fn provider_key_file(paths: &ResolvedPaths, name: &str) -> Option<PathBuf> {
+    catalog_entry(name)?;
+    Some(
+        paths
+            .app_config_dir
+            .join("llm-keys")
+            .join(format!("{name}.txt")),
+    )
+}
+
+/// 分 provider 保存 key（provider 须在目录内；校验与 DPAPI 形态同 save_key）
+pub fn save_provider_key(paths: &ResolvedPaths, name: &str, raw: &str) -> Result<(), String> {
+    let path = provider_key_file(paths, name)
+        .ok_or_else(|| format!("未知模型服务: {name}"))?;
+    validate_and_store(&path, raw)
+}
+
+/// 读分 provider key：`llm-keys/<name>.txt`；minimax 回落存量 `llm-key.txt`
+/// （单 key 时代部署零迁移）。密文前缀走 DPAPI 解密，无前缀明文兼容；
+/// 失败（解不开）None，由调用方记日志。
+pub fn read_provider_key(paths: &ResolvedPaths, name: &str) -> Option<String> {
+    if let Some(path) = provider_key_file(paths, name) {
+        if let Some(k) = read_key_file(&path) {
+            return Some(k);
+        }
+    }
+    if name == "minimax" {
+        return read_llm_key(paths);
+    }
+    None
+}
+
+/// 编排层消费：目录序返回全部已配置的 (name, key) 列表
+pub fn read_provider_keys(paths: &ResolvedPaths) -> Vec<(&'static str, String)> {
+    PROVIDERS
+        .iter()
+        .filter_map(|p| read_provider_key(paths, p.name).map(|k| (p.name, k)))
+        .collect()
+}
+
+/// 单文件读取（trim 空判 + DPAPI 前缀自识别；read_llm_key 的文件参数化形态）
+fn read_key_file(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
     if let Some(hexpart) = raw.strip_prefix(CIPHER_PREFIX) {
         let bytes = hex_decode(hexpart)?;
         #[cfg(windows)]
@@ -205,7 +320,7 @@ pub fn read_llm_key(paths: &ResolvedPaths) -> Option<String> {
         #[cfg(not(windows))]
         String::from_utf8(bytes).ok().map(|s| s.trim().to_string())
     } else {
-        Some(raw) // 存量明文兼容（第三进程编排批格式）
+        Some(raw) // 存量明文兼容
     }
 }
 
@@ -241,6 +356,42 @@ pub fn wizard_key_status(sup: tauri::State<'_, SupHandle>) -> KeyStatus {
 #[tauri::command]
 pub fn wizard_save_key(sup: tauri::State<'_, SupHandle>, key: String) -> Result<(), String> {
     save_key(&sup.paths, &key)
+}
+
+/// 分 provider key 状态（向导「更多模型服务」列表消费）
+#[derive(serde::Serialize)]
+pub struct ProviderKeyStatus {
+    pub name: &'static str,
+    pub display: &'static str,
+    pub configured: bool,
+    /// 已配置时的尾 4 位（轮换核对用；不泄全量）
+    pub tail4: Option<String>,
+}
+
+#[tauri::command]
+pub fn wizard_provider_status(sup: tauri::State<'_, SupHandle>) -> Vec<ProviderKeyStatus> {
+    PROVIDERS
+        .iter()
+        .map(|p| {
+            let key = read_provider_key(&sup.paths, p.name);
+            ProviderKeyStatus {
+                name: p.name,
+                display: p.display,
+                configured: key.is_some(),
+                tail4: key.as_deref().map(key_tail4),
+            }
+        })
+        .collect()
+}
+
+/// 分 provider 保存 key（provider 须在内置目录内；DPAPI 加密落 llm-keys/）
+#[tauri::command]
+pub fn wizard_save_provider_key(
+    sup: tauri::State<'_, SupHandle>,
+    name: String,
+    key: String,
+) -> Result<(), String> {
+    save_provider_key(&sup.paths, &name, &key)
 }
 
 #[tauri::command]
@@ -352,5 +503,66 @@ mod tests {
         mark_wizard_done(&paths).unwrap();
         assert!(!first_run_pending(&paths), "done mark suppresses wizard");
         std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn provider_catalog_entries_are_well_formed() {
+        // 名字须 ASCII 小写（env 变量名映射与文件名的契约前提）且全局唯一
+        let mut names = std::collections::BTreeSet::new();
+        for p in PROVIDERS {
+            assert!(!p.name.is_empty(), "empty provider name");
+            assert!(
+                p.name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "provider name {} must be lowercase ascii",
+                p.name
+            );
+            assert!(names.insert(p.name), "duplicate provider name {}", p.name);
+            assert!(p.execute_url.starts_with("https://"), "{} url", p.name);
+            assert!(!p.models.is_empty(), "{} models", p.name);
+            assert!(!p.display.is_empty(), "{} display", p.name);
+        }
+    }
+
+    #[test]
+    fn provider_key_save_read_roundtrip_and_legacy_fallback() {
+        let paths = scratch_paths("provkey");
+        // deepseek：独立文件落盘（密文形态），读回一致
+        save_provider_key(&paths, "deepseek", "  sk-ds-abc123  ").unwrap();
+        let raw = std::fs::read_to_string(provider_key_file(&paths, "deepseek").unwrap())
+            .unwrap();
+        assert!(raw.starts_with(CIPHER_PREFIX), "provider key stored as cipher");
+        assert_eq!(read_provider_key(&paths, "deepseek").as_deref(), Some("sk-ds-abc123"));
+        // minimax：独立文件缺位时回落存量 llm-key.txt（单 key 时代零迁移）
+        assert!(read_provider_key(&paths, "minimax").is_none());
+        std::fs::write(key_file_path(&paths), "sk-legacy-minimax\n").unwrap();
+        assert_eq!(
+            read_provider_key(&paths, "minimax").as_deref(),
+            Some("sk-legacy-minimax")
+        );
+        // 编排层清单：目录序、含回落项
+        let keys = read_provider_keys(&paths);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].0, "minimax");
+        assert_eq!(keys[1].0, "deepseek");
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn provider_key_rejects_unknown_provider_and_blank() {
+        let paths = scratch_paths("provreject");
+        assert!(save_provider_key(&paths, "no-such-provider", "sk-x").is_err());
+        assert!(save_provider_key(&paths, "deepseek", "   ").is_err());
+        assert!(read_provider_key(&paths, "no-such-provider").is_none());
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn provider_key_env_naming_is_stable() {
+        assert_eq!(
+            provider_key_env("deepseek"),
+            "EVORULE_AI_PLUGIN_LLM_KEY_DEEPSEEK"
+        );
     }
 }

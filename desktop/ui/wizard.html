@@ -62,6 +62,45 @@
         gap: 8px;
         margin-bottom: 10px;
       }
+      .more-providers {
+        margin-top: 14px;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 8px 12px;
+      }
+      .more-providers summary {
+        cursor: pointer;
+        color: #475569;
+        font-size: 13px;
+        user-select: none;
+      }
+      .more-providers .hint {
+        font-size: 12px;
+        margin: 8px 0;
+      }
+      .provider-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 6px 0;
+      }
+      .provider-row .p-name {
+        width: 88px;
+        flex: none;
+        font-size: 13px;
+        color: #334155;
+      }
+      .provider-row .p-state {
+        width: 96px;
+        flex: none;
+        font-size: 12px;
+      }
+      .provider-row .p-state.ok {
+        color: #15803d;
+      }
+      .provider-row .p-state.no {
+        color: #94a3b8;
+      }
       input[type="password"],
       input[type="text"] {
         flex: 1;
@@ -176,6 +215,14 @@
           <button class="btn" id="toggle-visibility" type="button">显示</button>
         </div>
         <p class="msg" id="key-msg"></p>
+        <details class="more-providers" id="more-providers">
+          <summary>更多模型服务（可选，配置后可在对话框切换模型）</summary>
+          <p class="hint">
+            为其他模型服务配置 API Key 后，对话/补全会按所选模型自动路由到对应服务。
+            模型可用范围以工作区准入白名单为准。
+          </p>
+          <div id="provider-list"></div>
+        </details>
       </section>
 
       <!-- 步骤 2：工作文件夹 -->
@@ -244,9 +291,17 @@
           const keyLine = st.configured
             ? `<span class="ok-mark">已配置</span>（尾 4 位 <b>${escapeHtml(st.tail4)}</b>）`
             : '<span class="no-mark">未配置</span>——对话能力停用，其余功能照常';
+          let provLine = "";
+          try {
+            const provs = await invoke("wizard_provider_status");
+            const n = provs.filter((p) => p.configured).length;
+            if (n > 0)
+              provLine = `<br/><b>多模型服务：</b>${n} 家已配置（对话框内可切换模型）`;
+          } catch {}
           card.innerHTML =
             `<b>LLM 凭据：</b>${keyLine}<br/>` +
-            `<b>凭据文件：</b><code>${escapeHtml(st.key_file)}</code>`;
+            `<b>凭据文件：</b><code>${escapeHtml(st.key_file)}</code>` +
+            provLine;
           btnMain.textContent = st.configured ? "立即生效" : "进入 evo-agent";
           $("foot-note").textContent = st.configured
             ? "「立即生效」将重启服务组并启用对话能力。"
@@ -350,6 +405,61 @@
       }
 
       btnSkip.addEventListener("click", finishAndClose);
+
+      // ---- 更多模型服务（可选；分 provider key 录入，DPAPI 落 llm-keys/） ----
+      async function loadProviders() {
+        const list = $("provider-list");
+        if (!list || !invoke) return;
+        try {
+          const rows = await invoke("wizard_provider_status");
+          list.innerHTML = "";
+          for (const p of rows) {
+            const row = document.createElement("div");
+            row.className = "provider-row";
+            const name = document.createElement("span");
+            name.className = "p-name";
+            name.textContent = p.display;
+            const state = document.createElement("span");
+            state.className = "p-state " + (p.configured ? "ok" : "no");
+            state.textContent = p.configured ? `已配置（尾 4 位 ${p.tail4}）` : "未配置";
+            const input = document.createElement("input");
+            input.type = "password";
+            input.placeholder = "sk-…";
+            input.autocomplete = "off";
+            input.spellcheck = false;
+            const btn = document.createElement("button");
+            btn.className = "btn";
+            btn.type = "button";
+            btn.textContent = "保存";
+            btn.disabled = true;
+            input.addEventListener("input", () => {
+              btn.disabled = input.value.trim().length === 0;
+            });
+            btn.addEventListener("click", async () => {
+              btn.disabled = true;
+              try {
+                await invoke("wizard_save_provider_key", {
+                  name: p.name,
+                  key: input.value,
+                });
+                await loadProviders();
+              } catch (e) {
+                state.textContent = String(e);
+                state.className = "p-state no";
+                btn.disabled = false;
+              }
+            });
+            row.append(name, state, input, btn);
+            list.append(row);
+          }
+        } catch (e) {
+          list.textContent = "读取模型服务列表失败：" + e;
+        }
+      }
+      $("more-providers").addEventListener("toggle", function () {
+        if (this.open) loadProviders();
+      });
+
       keyInput.focus();
     </script>
   </body>
