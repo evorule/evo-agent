@@ -242,8 +242,10 @@ pub const PROVIDERS: &[ProviderEntry] = &[
     ProviderEntry {
         name: "zhipu",
         display: "智谱 GLM",
-        execute_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        models: &["glm-4.6", "glm-4.5"],
+        // coding 套餐端点（token plan key 在标准 /api/paas/v4 会报 1113 余额
+        // 错误；本目录按套餐端点配置，标准计费 key 需自行改回标准端点）
+        execute_url: "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+        models: &["glm-4.6", "glm-4.5-air"],
     },
     ProviderEntry {
         name: "qwen",
