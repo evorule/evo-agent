@@ -9244,7 +9244,7 @@ pub fn load_agents_md_segment(workdir: &std::path::Path) -> Option<String> {
     let project_level = workdir.join("AGENTS.md");
     let mut parts: Vec<String> = Vec::new();
     // 用户级缺失不阻断项目级(两级独立读取);内容与上一级完全相同则去重跳过
-    let levels: [( &str, Option<std::path::PathBuf>); 2] =
+    let levels: [(&str, Option<std::path::PathBuf>); 2] =
         [("用户级", user_level), ("项目级", Some(project_level))];
     for (label, p) in levels {
         let Some(p) = p else { continue };
@@ -9253,10 +9253,7 @@ pub fn load_agents_md_segment(workdir: &std::path::Path) -> Option<String> {
             if body.is_empty() {
                 continue;
             }
-            if parts
-                .iter()
-                .any(|prev| prev.contains(&format!("\n{body}")))
-            {
+            if parts.iter().any(|prev| prev.contains(&format!("\n{body}"))) {
                 continue;
             }
             parts.push(format!("### {label}({})\n{body}", p.display()));
@@ -9346,7 +9343,13 @@ mod agents_md_tests {
             assert!(gate(true, tool).is_none(), "{tool} must be allowed");
         }
         // 武装后:写族/执行族拒答(引导性文案,LLM 可自适应改路)
-        for tool in ["file_write", "file_create", "shell_exec", "edit_file", "delegate"] {
+        for tool in [
+            "file_write",
+            "file_create",
+            "shell_exec",
+            "edit_file",
+            "delegate",
+        ] {
             let blocked = gate(true, tool).unwrap_or_else(|| panic!("{tool} must be blocked"));
             assert!(blocked.contains("plan_mode_blocked"));
             assert!(blocked.contains(tool));

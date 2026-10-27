@@ -2481,15 +2481,15 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
             })
             .to_string(),
         ),
-        Ok(AgentEvent::PlanSubmitted { plan_id, plan }) => Event::default()
-            .event("plan_submitted")
-            .data(
+        Ok(AgentEvent::PlanSubmitted { plan_id, plan }) => {
+            Event::default().event("plan_submitted").data(
                 serde_json::json!({
                     "plan_id": plan_id,
                     "plan": plan,
                 })
                 .to_string(),
-            ),
+            )
+        }
         // 流级错误(底层 stream yield Err) — 当作可恢复错误帧发出
         Err(err) => Event::default()
             .event("error")

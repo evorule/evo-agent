@@ -899,7 +899,9 @@ async fn construct_runner(
         build_approval_callback(state, resolved_mode.as_deref());
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
         // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
-        .with_agents_md_segment(crate::agent::runner::load_agents_md_segment(state.workdir()))
+        .with_agents_md_segment(crate::agent::runner::load_agents_md_segment(
+            state.workdir(),
+        ))
         // M5-a:注入生效能力边界(声明重绑工具面 + 会话边界段/边界事实)
         .with_capability_boundary(capability_boundary)
         // 挂 filtered toolkit(同 HTTP 端点口径,见 run_agent)
@@ -1239,7 +1241,11 @@ mod tests {
         let msg: ClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             // S4-b:images 缺省反序列化为空(无图消息零行为变化)
-            ClientMessage::Message { content, images, mode } => {
+            ClientMessage::Message {
+                content,
+                images,
+                mode,
+            } => {
                 assert_eq!(content, "hello");
                 assert!(images.is_empty());
                 assert!(mode.is_none());
@@ -1255,7 +1261,9 @@ mod tests {
             {"path":".evo-agent/uploads/20261020-a.png","mime_type":"image/png"}]}"#;
         let msg: ClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            ClientMessage::Message { content, images, .. } => {
+            ClientMessage::Message {
+                content, images, ..
+            } => {
                 assert_eq!(content, "look");
                 assert_eq!(images.len(), 1);
                 assert_eq!(images[0].path, ".evo-agent/uploads/20261020-a.png");

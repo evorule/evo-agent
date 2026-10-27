@@ -68,8 +68,9 @@ pub fn validate_plan_args(args: &Value) -> Result<Value, String> {
         problems.push(format!("notes exceeds {PLAN_MAX_NOTES_CHARS} chars"));
     }
     let Some(steps) = args.get("steps").and_then(|v| v.as_array()) else {
-        return Err("steps is required and must be a non-empty array of {{title, detail?}}"
-            .to_string());
+        return Err(
+            "steps is required and must be a non-empty array of {{title, detail?}}".to_string(),
+        );
     };
     if steps.is_empty() {
         problems.push("steps must contain at least 1 item".to_string());

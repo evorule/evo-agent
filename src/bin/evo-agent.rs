@@ -1687,9 +1687,14 @@ fn cmd_run_streaming(
                     let _ = std::io::stdout().flush();
                 }
                 Ok(AgentEvent::PlanSubmitted { plan_id, plan }) => {
-                    eprintln!("[plan submitted: {} ({} step(s)); awaiting user approval]",
+                    eprintln!(
+                        "[plan submitted: {} ({} step(s)); awaiting user approval]",
                         plan_id,
-                        plan.get("steps").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0));
+                        plan.get("steps")
+                            .and_then(|s| s.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0)
+                    );
                 }
                 Ok(AgentEvent::LlmThinkingDelta { text }) => {
                     // 思考增量 → stderr 淡色直出(与正文 stdout 分流,终端可见)
@@ -3485,9 +3490,14 @@ fn run_repl_turn(
                     let _ = std::io::stdout().flush();
                 }
                 Ok(AgentEvent::PlanSubmitted { plan_id, plan }) => {
-                    eprintln!("[plan submitted: {} ({} step(s)); awaiting user approval]",
+                    eprintln!(
+                        "[plan submitted: {} ({} step(s)); awaiting user approval]",
                         plan_id,
-                        plan.get("steps").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0));
+                        plan.get("steps")
+                            .and_then(|s| s.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0)
+                    );
                 }
                 Ok(AgentEvent::LlmThinkingDelta { text }) => {
                     // 思考增量 → stderr 淡色直出(与正文 stdout 分流,终端可见)
