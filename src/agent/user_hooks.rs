@@ -538,11 +538,16 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pre_tool_deny_stops_execution() {
+        // 决策 JSON 经文件零引用下发(cat 直读;shell 引号在各平台形态不同,
+        // 不进测试依赖——Windows 侧由 cmd 转义回退路径覆盖)
+        let dir = tempfile::tempdir().unwrap();
+        let decision_file = dir.path().join("decision.json");
+        std::fs::write(&decision_file, r#"{"decision":"deny","reason":"no rm"}"#).unwrap();
         let hooks = UserHooks {
             pre_tool: vec![
                 HookRule {
                     tool: "shell_exec".into(),
-                    command: r#"echo '{"decision":"deny","reason":"no rm"}'"#.into(),
+                    command: format!("cat {}", decision_file.display()),
                     timeout_secs: Some(15),
                 },
                 HookRule {
@@ -553,7 +558,6 @@ mod tests {
             ],
             ..Default::default()
         };
-        let dir = tempfile::tempdir().unwrap();
         let (v, outs) = hooks
             .pre_tool_verdict(
                 "shell_exec",
@@ -562,8 +566,16 @@ mod tests {
                 dir.path(),
             )
             .await;
-        assert_eq!(v, PreToolVerdict::Deny("no rm".into()));
-        assert_eq!(outs.len(), 1, "deny must stop later rules");
+        assert_eq!(
+            v,
+            PreToolVerdict::Deny("no rm".into()),
+            "outcomes: {outs:?}"
+        );
+        assert_eq!(
+            outs.len(),
+            1,
+            "deny must stop later rules; outcomes: {outs:?}"
+        );
     }
 
     #[tokio::test]
