@@ -32,7 +32,8 @@ fn test_agent_config_default() {
     assert_eq!(config.model, "gpt-4o-mini");
     assert!((config.temperature - 0.7).abs() < 0.01);
     assert_eq!(config.max_steps, 10);
-    assert_eq!(config.step_timeout, Duration::from_secs(60));
+    // 缺省 0=不限步超时
+    assert!(config.step_timeout.is_zero());
     assert!(config.tool_names.is_empty());
     assert_eq!(config.llm_retry_count, 3);
 }

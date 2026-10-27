@@ -1802,18 +1802,9 @@ async fn run_plan_execute_request(
         max_wall_ms: Some(1_800_000),
         max_tokens: None,
     };
-    // 粒执行器步超时请求级覆写(秒→Duration;0=立即超时无意义,拒绝;
-    // None = 粒定义值零变化)
-    let step_timeout_override = match req.step_timeout_secs {
-        None => None,
-        Some(0) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "step_timeout_secs must be >= 1".to_string(),
-            ));
-        }
-        Some(secs) => Some(std::time::Duration::from_secs(secs)),
-    };
+    // 粒执行器步超时请求级覆写(秒→Duration;0=不限步超时，与定义面
+    // 校验语义一致;None = 粒定义值零变化)
+    let step_timeout_override = req.step_timeout_secs.map(std::time::Duration::from_secs);
     let run = crate::agent::driver::run_plan_execute(
         state.evorule_client.clone(),
         state.definitions.clone(),

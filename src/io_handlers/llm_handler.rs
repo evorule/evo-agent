@@ -249,7 +249,7 @@ impl LlmHandler {
     /// `executor_url` 映射自 `config.llm.executor_url`;配置中的 `api_key`
     /// 字段不再消费(key 归边,凭据仅存于执行体侧)。
     pub fn from_config(config: &crate::config::LlmConfig) -> Self {
-        Self {
+        let mut handler = Self {
             default_model: config.model.clone(),
             executor_url: config.executor_url.clone(),
             executor_token: config.executor_token.clone(),
@@ -260,7 +260,13 @@ impl LlmHandler {
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             config_max_tokens: config.max_tokens,
+        };
+        // [llm] timeout_secs 显式声明即生效（此前被静默忽略）；
+        // 0（未显式配置）保持内建缺省——接通前后未配置用户行为不变。
+        if config.timeout_secs > 0 {
+            handler.request_timeout_secs = config.timeout_secs;
         }
+        handler
     }
 
     /// G3:自定义重试参数(builder 风格,测试时注入极小退避避免拖慢)
@@ -279,6 +285,10 @@ impl LlmHandler {
     /// 预算失配详情（供 runner 启动断言消费；
     /// Ok=匹配,Err=人读详情——公式同 worst_case_budget_secs 实算）。
     pub fn step_budget_mismatch(&self, step_timeout_secs: u64) -> Result<(), String> {
+        // step_timeout=0（不限步超时）无预算失配可言——判定跳过。
+        if step_timeout_secs == 0 {
+            return Ok(());
+        }
         let budget = self.worst_case_budget_secs();
         if step_timeout_secs >= budget {
             return Ok(());
@@ -1243,6 +1253,32 @@ mod tests {
             .unwrap_err()
             .contains("step budget mismatch"));
         assert!(h.step_budget_mismatch(budget + 100).is_ok());
+    }
+
+    /// step_timeout=0（不限步超时）跳过失配判定——0 值无预算失配可言。
+    #[test]
+    fn test_step_budget_mismatch_zero_is_ok() {
+        let h = LlmHandler::new("m", "https://x");
+        assert!(h.step_budget_mismatch(0).is_ok());
+    }
+
+    /// from_config 消费 [llm] timeout_secs（死配置接通——
+    /// 显式声明从被静默忽略转为生效）。
+    #[test]
+    fn test_from_config_consumes_timeout_secs() {
+        let mut cfg = crate::config::LlmConfig::default();
+        cfg.timeout_secs = 11;
+        let h = LlmHandler::from_config(&cfg);
+        assert_eq!(h.request_timeout_secs, 11);
+    }
+
+    /// timeout_secs=0（未显式配置）用内建缺省——接通前后
+    /// 未配置用户行为不变（字段死配置时代即 1800 生效）。
+    #[test]
+    fn test_from_config_zero_uses_builtin_default() {
+        let cfg = crate::config::LlmConfig::default();
+        let h = LlmHandler::from_config(&cfg);
+        assert_eq!(h.request_timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
     }
 
     /// 实际生效参数:显式值原样透传,兜底值 0.7/4096,stream 恒 true

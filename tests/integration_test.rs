@@ -1983,3 +1983,75 @@ async fn test_create_session_none_keeps_body_free_of_caller_role() {
     assert_eq!(sid, "9003");
     mock.assert_async().await;
 }
+
+// ===== step_timeout 0 值语义（不限步超时） =====
+
+/// 缺省 step_timeout=0（不限步超时）——60s 缺省与 LLM 最坏预算（request_timeout
+/// 1800s × 尝试数）的矛盾系 step_budget_mismatch 启动断言自白的历史遗留；真保护层
+/// = engine io_error_timeout + 超时类 Error 续跑兜底，非 step deadline。
+#[test]
+fn test_default_step_timeout_is_unlimited() {
+    assert!(
+        AgentConfig::default().step_timeout.is_zero(),
+        "default step_timeout must be 0 (unlimited), got {:?}",
+        AgentConfig::default().step_timeout
+    );
+}
+
+/// step_timeout=0 语义：execute_external 跳过 deadline 包裹——修复前
+/// tokio::time::timeout(Duration::ZERO) 在内层 Pending 期间 Elapsed →
+/// AgentError::Timeout 硬断轮（错误形态被偷换）；修复后 0 值不设 deadline，
+/// 慢 LLM 调用等到响应，错误形态也不会被 step deadline 偷换。
+/// 注：内层立即失败（连接拒绝）时 tokio timeout 先 poll 内层、ZERO 不触发——
+/// 故用延迟 LLM 响应构造内层 Pending 形态，才能真正命中 deadline 路径。
+#[tokio::test]
+async fn test_zero_step_timeout_does_not_kill_the_step() {
+    // 慢 LLM 端点：accept 后停 300ms 才回一段最小 SSE 流（mockito 无延迟 API，
+    // 手写 TCP 慢响应构造「内层 Pending」形态——内层立即失败时 ZERO 不触发）
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let llm_addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = match listener.accept() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let body = "data: {\"content\":\"slow ok\"}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        use std::io::Write;
+        let _ = stream.write_all(resp.as_bytes());
+    });
+
+    let mut server = Server::new_async().await;
+    let sse = format!(
+        "{}{}",
+        sse_line(&io_request(
+            1,
+            "call_external",
+            json!({"model":"mock-model"})
+        )),
+        sse_line(&json!({"type":"Stable"})),
+    );
+    let _fallback = mock_evorule_base(&mut server, "777", sse).await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let llm = LlmHandler::new("mock-model", &format!("http://{llm_addr}"))
+        .with_retry_config(0, 0.001, 0.01);
+    let mut config = AgentConfig::default();
+    config.step_timeout = std::time::Duration::ZERO;
+    let mut runner = AgentRunner::new(config, client).with_llm_handler(llm);
+
+    let result = runner.run("trigger slow llm").await;
+    let err = match result {
+        Ok(_) => return, // 慢 LLM 正常返回即最直接的绿
+        Err(e) => e,
+    };
+    assert!(
+        !matches!(err, evo_agent::agent::runner::AgentError::Timeout(_)),
+        "step_timeout=0 must not impose a step deadline, got {err:?}"
+    );
+}

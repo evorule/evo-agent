@@ -1230,7 +1230,12 @@ impl ShellExecTool {
     /// 执行钩子;upload-archive 可执行任意命令;daemon 对外暴露 git 服务;
     /// send-email 外发数据。fetch/push 为版本控制工作流本体,不收窄。
     const GIT_DENY_SUBCOMMANDS: &[&str] = &[
-        "config", "filter-branch", "hook", "upload-archive", "daemon", "send-email",
+        "config",
+        "filter-branch",
+        "hook",
+        "upload-archive",
+        "daemon",
+        "send-email",
     ];
 
     /// workbench 档 active 直跑前的参数级守卫
@@ -2405,8 +2410,14 @@ mod tests {
             &["git", "-c", "core.fsmonitor=cmd", "status"]
         )
         .is_err());
-        for deny in ["config", "filter-branch", "hook", "upload-archive", "daemon", "send-email"]
-        {
+        for deny in [
+            "config",
+            "filter-branch",
+            "hook",
+            "upload-archive",
+            "daemon",
+            "send-email",
+        ] {
             assert!(
                 ShellExecTool::active_arg_guard("git", &["git", deny]).is_err(),
                 "{deny} must be denied"
@@ -2450,7 +2461,11 @@ mod tests {
             let v = tool
                 .call_sync(&arg(cmdline))
                 .unwrap_or_else(|e| panic!("{cmdline} must still run, got: {e}"));
-            assert_eq!(v.get("status").unwrap().as_str().unwrap(), "ok", "{cmdline}");
+            assert_eq!(
+                v.get("status").unwrap().as_str().unwrap(),
+                "ok",
+                "{cmdline}"
+            );
         }
     }
 

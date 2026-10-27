@@ -112,7 +112,10 @@ impl LlmConfig {
 }
 
 fn default_llm_timeout() -> u64 {
-    60
+    // 0=未显式配置，LlmHandler 用内建缺省 1800s——接通
+    // from_config 消费链后本缺省保持「未配置用户行为不变」（此前字段死、
+    // 实际生效即 1800）。显式配置 >0 值时生效。
+    0
 }
 
 fn default_max_retries() -> usize {

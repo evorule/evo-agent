@@ -829,11 +829,9 @@ impl AgentDefinition {
                 "max_steps must be >= 1".to_string(),
             ));
         }
-        if self.step_timeout_secs == 0 {
-            return Err(AgentDefinitionError::InvalidDefinition(
-                "step_timeout_secs must be >= 1".to_string(),
-            ));
-        }
+        // step_timeout_secs=0 合法（0=不限步超时），与 AgentConfig::default()
+        // 缺省 ZERO 语义一致；正值=显式 deadline。单轮长跑的真实保护层=
+        // engine io_error_timeout + 超时类 Error 续跑兜底。
         // http_get 额外 active host 白名单形态门卫(仅裸域名形态;
         // IP 字面量/带端口/带 scheme/带路径等一律拒——IP 走 SSRF/candidate
         // 语义不收声明,其余形态在 host 匹配下无意义且易误解)
@@ -1972,7 +1970,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_zero_max_steps_and_timeout() {
+    fn test_validate_rejects_zero_max_steps_and_zero_timeout_unlimited() {
         let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":0,"step_timeout_secs":1,"tools":[],"output_format":null}"#;
         let def: AgentDefinition = serde_json::from_str(json).expect("parse");
         assert!(def
@@ -1981,13 +1979,10 @@ mod tests {
             .to_string()
             .contains("max_steps"));
 
+        // step_timeout_secs=0 合法（0=不限步超时），validate 放行
         let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":0,"tools":[],"output_format":null}"#;
         let def: AgentDefinition = serde_json::from_str(json).expect("parse");
-        assert!(def
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("step_timeout_secs"));
+        assert!(def.validate().is_ok());
     }
 
     #[test]

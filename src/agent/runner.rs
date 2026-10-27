@@ -480,7 +480,10 @@ impl Default for AgentConfig {
             model: "gpt-4o-mini".to_string(),
             temperature: 0.7,
             max_steps: 10,
-            step_timeout: Duration::from_secs(60),
+            // 缺省 0=不限步超时——60s 缺省与 LLM 最坏预算（request_timeout
+            // × 尝试数 + 退避）矛盾系 step_budget_mismatch 启动断言自白的历史遗留；
+            // 单轮长跑的真实保护层=engine io_error_timeout + 超时类 Error 续跑兜底。
+            step_timeout: Duration::ZERO,
             tool_names: Vec::new(),
             llm_retry_count: 3,
             output_format: None,
@@ -6130,16 +6133,23 @@ impl AgentRunner {
     }
 
     async fn execute_external(&self, io_type: &str, params: &Value) -> Result<Value, AgentError> {
-        tokio::time::timeout(self.config.step_timeout, async {
+        let fut = async {
             let mut instr = serde_json::Map::new();
             instr.insert("type".to_string(), Value::from(io_type.to_string()));
             instr.insert("params".to_string(), params.clone());
 
             let tcb_instr = Value::Object(instr);
             self.execute_io_request(&tcb_instr).await
-        })
-        .await
-        .map_err(|_| AgentError::Timeout(format!("{} timeout", io_type)))?
+        };
+        // step_timeout=0（不限）跳过 deadline 包裹——显式正值才设
+        // deadline；tokio timeout 先 poll 内层，内层立即失败不受包裹影响。
+        if self.config.step_timeout.is_zero() {
+            fut.await
+        } else {
+            tokio::time::timeout(self.config.step_timeout, fut)
+                .await
+                .map_err(|_| AgentError::Timeout(format!("{} timeout", io_type)))?
+        }
     }
 
     async fn execute_io_request(&self, request: &Value) -> Result<Value, AgentError> {
