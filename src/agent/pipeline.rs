@@ -1253,13 +1253,23 @@ mod tests {
         }
     }
 
-    fn echo_deny_cmd() -> String {
-        // cmd echo 的引号经参数层转义为 \";parse 回退反转义覆盖(跨平台)
-        r#"echo {"decision":"deny","reason":"hook-no"}"#.to_string()
+    // 决策 JSON 生产命令:各平台各自的确定性形态(引号经 shell 形态不同,
+    // 不做统一——Windows 走 cmd echo 转义+parse 回退;POSIX 走 cat 文件
+    // 零引用)。文件由测试预写
+    fn deny_cmd(decision_file: &std::path::Path) -> String {
+        if cfg!(target_os = "windows") {
+            r#"echo {"decision":"deny","reason":"hook-no"}"#.to_string()
+        } else {
+            format!("cat {}", decision_file.display())
+        }
     }
 
-    fn echo_rewrite_cmd() -> String {
-        r#"echo {"decision":"rewrite","args":{"path":"rewritten.txt"}}"#.to_string()
+    fn rewrite_cmd(decision_file: &std::path::Path) -> String {
+        if cfg!(target_os = "windows") {
+            r#"echo {"decision":"rewrite","args":{"path":"rewritten.txt"}}"#.to_string()
+        } else {
+            format!("cat {}", decision_file.display())
+        }
     }
 
     fn wired_for(
@@ -1283,11 +1293,13 @@ mod tests {
         let focus = FocusSnapshot::from_names(["file_read"]);
         let args = serde_json::json!({"path": "a.txt"});
         let dir = tempfile::tempdir().unwrap();
+        let decision_file = dir.path().join("decision.json");
+        std::fs::write(&decision_file, r#"{"decision":"deny","reason":"hook-no"}"#).unwrap();
         let hooks = wired_for(
             dir.path(),
             vec![crate::agent::user_hooks::HookRule {
                 tool: "file_read".into(),
-                command: echo_deny_cmd(),
+                command: deny_cmd(&decision_file),
                 timeout_secs: Some(15),
             }],
         );
@@ -1310,11 +1322,17 @@ mod tests {
         let focus = FocusSnapshot::from_names(["file_read"]);
         let args = serde_json::json!({"path": "a.txt"});
         let dir = tempfile::tempdir().unwrap();
+        let decision_file = dir.path().join("decision.json");
+        std::fs::write(
+            &decision_file,
+            r#"{"decision":"rewrite","args":{"path":"rewritten.txt"}}"#,
+        )
+        .unwrap();
         let hooks = wired_for(
             dir.path(),
             vec![crate::agent::user_hooks::HookRule {
                 tool: "file_read".into(),
-                command: echo_rewrite_cmd(),
+                command: rewrite_cmd(&decision_file),
                 timeout_secs: Some(15),
             }],
         );
