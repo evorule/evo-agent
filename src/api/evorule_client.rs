@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// io_response 提交载荷护栏上限:工具结果经 call_service 回写引擎时,超大
 /// 结果(典型=查询/读取命中海量数据)整体提交会被服务端载荷上限拒收(413),
@@ -53,11 +54,27 @@ fn shrink_io_response_for_submit(result: &mut Value) {
     }
 }
 
-/// evorule server HTTP API 客户端（会话 / Fact / 审计 / bundle 部署）。
-#[derive(Debug, Clone)]
+/// evorule server HTTP API 客户端 —— 封装 session/audit 相关 API 调用。
+/// 持有共享 ApiCore（base_url + client + auth），与 WorkspaceApiClient 职责分离。
+#[derive(Debug)]
 pub struct EvoruleApiClient {
     /// 复用的 HTTP 核心客户端（共享 base_url 与认证头注入）。
     core: ApiCore,
+    /// 引擎 pending I/O 预算基准（秒；0=预防层禁用）。装配期经
+    /// set_engine_io_budget 设定后只读。
+    engine_io_budget_secs: u64,
+    /// 当前 I/O 步开始时刻（unix 秒；0=无活动步）。
+    io_step_started: AtomicU64,
+}
+
+impl Clone for EvoruleApiClient {
+    fn clone(&self) -> Self {
+        Self {
+            core: self.core.clone(),
+            engine_io_budget_secs: self.engine_io_budget_secs,
+            io_step_started: AtomicU64::new(self.io_step_started.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 /// 单会话元数据（GET /api/sessions/{id} 响应的客户端投影，只取会话链
@@ -87,12 +104,59 @@ impl EvoruleApiClient {
     pub fn with_auth_token(base_url: &str, auth_token: Option<&str>) -> Self {
         Self {
             core: ApiCore::with_auth_token(base_url, auth_token),
+            engine_io_budget_secs: 0,
+            io_step_started: AtomicU64::new(0),
         }
     }
 
     /// 返回 evorule server 的 base_url(供 serve 模式构造 WorkspaceApiClient 等)
     pub fn base_url(&self) -> &str {
         self.core.base_url()
+    }
+
+    /// 设定引擎 pending I/O 预算基准(秒;0=禁用预防层)。装配期调用,
+    /// 值取自 config.evorule.engine_io_timeout_secs(缺省 60=引擎官方缺省)。
+    pub fn set_engine_io_budget(&mut self, secs: u64) {
+        self.engine_io_budget_secs = secs;
+    }
+
+    /// 引擎 pending I/O 预算基准(秒;0=禁用)。启动断言(from_definition
+    /// 对齐检查)经此读取,与执行面护栏同源。
+    pub fn engine_io_budget(&self) -> u64 {
+        self.engine_io_budget_secs
+    }
+
+    /// 标记当前 I/O 步开始(预算计时起点)。预算禁用时 no-op。
+    pub fn begin_io_step(&self) {
+        if self.engine_io_budget_secs == 0 {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.io_step_started.store(now, Ordering::Relaxed);
+    }
+
+    /// 清除当前 I/O 步标记(提交完成/步终止后调用)。
+    pub fn end_io_step(&self) {
+        self.io_step_started.store(0, Ordering::Relaxed);
+    }
+
+    /// 当前步已耗秒数与预算(Some=预算激活且有活动步;None=禁用或无步)。
+    fn io_step_elapsed(&self) -> Option<(u64, u64)> {
+        if self.engine_io_budget_secs == 0 {
+            return None;
+        }
+        let started = self.io_step_started.load(Ordering::Relaxed);
+        if started == 0 {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Some((now.saturating_sub(started), self.engine_io_budget_secs))
     }
 
     /// 通用透传请求（rule_tools OpenAPI 适配器专用）：method + path（可含
@@ -512,6 +576,39 @@ impl EvoruleApiClient {
         // 载荷护栏:超限截断+显式标注,防 413 拒收致 io_request 永久悬挂
         let mut result = result.clone();
         shrink_io_response_for_submit(&mut result);
+
+        // 预算护栏(单步引擎 I/O 预算对齐):步开始后超过引擎 pending 预算线的
+        // 提交必为引擎侧 unknown/stale(引擎 pending 已被 io_error_timeout 回收),
+        // 放弃提交并把错误文本钉在 "timed out" 上,交由续跑兜底判定接住;
+        // 预算 50%/80% 线 warn 预警(耗时证据+调参指引)。预算禁用时完全旁路。
+        if let Some((elapsed, budget)) = self.io_step_elapsed() {
+            if elapsed >= budget {
+                tracing::warn!(
+                    elapsed_s = elapsed,
+                    budget_s = budget,
+                    "engine io pending budget exceeded; io_response submit abandoned to avoid stale write"
+                );
+                return Err(ApiError::ApiError {
+                    status: 408,
+                    message: format!(
+                        "engine io pending budget exceeded (timed out): step elapsed {elapsed}s >= budget {budget}s; io_response submit abandoned to avoid stale write; raise engine io_error_timeout or shorten step work"
+                    ),
+                });
+            }
+            if elapsed * 10 >= budget * 8 {
+                tracing::warn!(
+                    elapsed_s = elapsed,
+                    budget_s = budget,
+                    "engine io pending budget 80%+ consumed; further step work will have its submit abandoned"
+                );
+            } else if elapsed * 2 >= budget {
+                tracing::warn!(
+                    elapsed_s = elapsed,
+                    budget_s = budget,
+                    "engine io pending budget 50%+ consumed"
+                );
+            }
+        }
 
         let body = serde_json::json!({
             "request_id": request_id,
@@ -1711,6 +1808,60 @@ mod tests {
     fn test_client_new() {
         let client = make_test_client();
         assert_eq!(client.core.base_url(), "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_engine_io_budget_disabled_by_default() {
+        // 未装配预算的 client(new())预防层禁用:begin 后 io_step_elapsed 仍为
+        // None——执行面行为与本批前现状一致(装配点 always set,生产路径总激活)。
+        let client = make_test_client();
+        assert_eq!(client.engine_io_budget(), 0);
+        client.begin_io_step();
+        assert!(client.io_step_elapsed().is_none());
+        client.end_io_step();
+    }
+
+    #[test]
+    fn test_io_step_elapsed_tracks_window() {
+        let mut client = make_test_client();
+        client.set_engine_io_budget(60);
+        client.begin_io_step();
+        let (elapsed, budget) = client.io_step_elapsed().expect("active step");
+        assert!(elapsed <= 2, "fresh step elapsed {elapsed}s");
+        assert_eq!(budget, 60);
+        client.end_io_step();
+        assert!(client.io_step_elapsed().is_none());
+    }
+
+    #[test]
+    fn test_zero_budget_disables_step_tracking() {
+        let mut client = make_test_client();
+        client.set_engine_io_budget(0);
+        client.begin_io_step();
+        assert!(
+            client.io_step_elapsed().is_none(),
+            "budget 0 = prevention disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_abandoned_after_budget_deadline() {
+        let mut client = make_test_client();
+        client.set_engine_io_budget(60);
+        // 伪造 2 小时前开始的步:提交必为引擎侧 stale(护栏应在发送前拦下,
+        // 错误文本含 "timed out" 供续跑兜底判定匹配)。
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        client.io_step_started.store(now - 7200, Ordering::Relaxed);
+        let err = client
+            .submit_io_response("s", 1, &serde_json::json!({"ok": true}), None)
+            .await
+            .expect_err("stale submit must be abandoned");
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "msg: {msg}");
+        assert!(msg.contains("abandoned"), "msg: {msg}");
     }
 
     #[tokio::test]

@@ -2886,7 +2886,12 @@ fn evorule_client_from(config: &evo_agent::config::Config) -> EvoruleApiClient {
         eprintln!("evo-agent: {msg}");
         std::process::exit(2);
     }
-    EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key))
+    let mut client =
+        EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
+    // 引擎 pending 预算基准装配:提交面护栏/耗时预警/启动断言共用基准值
+    // (0=禁用预防层;缺省 60=对齐引擎官方缺省)。
+    client.set_engine_io_budget(config.evorule.engine_io_timeout_secs);
+    client
 }
 
 /// G5:根据 config.logging 初始化日志

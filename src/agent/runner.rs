@@ -1724,6 +1724,20 @@ impl AgentRunner {
             tracing::warn!(msg = %msg, "step budget mismatch (warn; enforce via EVORULE_STEP_BUDGET_ENFORCE=1)");
         }
 
+        // 引擎 pending 预算对齐断言:LLM 最坏耗时超过所连引擎 io_error_timeout
+        // 时,慢调用令引擎 pending 先被回收,agent 提交成为 stale——预防层
+        // (提交前放弃+续跑兜底)接得住后果,此断言给可见证据与调参指引。
+        // 预算 0(禁用)或匹配时静默;enforce 开关与上方 step 维度同一把。
+        let engine_budget = client.engine_io_budget();
+        if engine_budget > 0 {
+            if let Err(msg) = llm.engine_budget_mismatch(engine_budget) {
+                if std::env::var("EVORULE_STEP_BUDGET_ENFORCE").as_deref() == Ok("1") {
+                    return Err(AgentError::Internal(msg));
+                }
+                tracing::warn!(msg = %msg, "engine io budget mismatch (warn; enforce via EVORULE_STEP_BUDGET_ENFORCE=1)");
+            }
+        }
+
         // 5. 组装
         let mut runner = Self::new(config, client)
             .with_llm_handler(llm)
@@ -3375,6 +3389,9 @@ impl AgentRunner {
                     }
 
                     info!(%session_id, step = step_count, "Received IoRequest event");
+                    // 引擎 pending 预算窗口起点:从本请求开始处理到 io_response
+                    // 提交完成,提交面护栏(client 层)据此判定超预算 stale 提交。
+                    self.evorule_client.begin_io_step();
                     // G6:clone token 避免 &mut self(handle_io_request) 与 &self(cancel_token) 借用冲突
                     let cancel_token = self.cancel_token.clone();
                     let result = tokio::select! {
@@ -3406,6 +3423,7 @@ impl AgentRunner {
                                 // B1:轮错误收尾 best-effort 中断 server 反应器（fail-soft，
                                 // 不留悬挂会话空转到 TTL 收割）
                                 self.interrupt_evorule_session_best_effort(&session_id).await;
+                                self.evorule_client.end_io_step();
                                 return Err(e);
                             }
                         },
@@ -3430,6 +3448,7 @@ impl AgentRunner {
                             }
                             self.submit_tool_traces(&session_id).await;
                             let duration = start_time.elapsed().as_millis() as u64;
+                            self.evorule_client.end_io_step();
                             return Ok(AgentResult::error(
                                 "cancelled by user".to_string(),
                                 step_count,
@@ -3444,6 +3463,7 @@ impl AgentRunner {
                             .await?;
                         info!(%session_id, request_id, "Submitted io_response");
                     }
+                    self.evorule_client.end_io_step();
 
                     // plan-execute tokens 埋点（纲领 §8 Phase 2 交付物 7）：llm_handler
                     // 把 provider usage 解析为 result.token_usage；此处只累加不干预。

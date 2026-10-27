@@ -319,6 +319,28 @@ impl LlmHandler {
         attempts * self.request_timeout_secs + backoff_sum.ceil() as u64 + 10
     }
 
+    /// 引擎 pending 预算对齐断言（供 runner 启动断言消费；Ok=匹配,Err=人读详情）。
+    ///
+    /// LLM 最坏耗时超过引擎 pending I/O 预算（io_error_timeout）时,单步内的
+    /// 慢 LLM 调用会令引擎侧 pending 先被回收——agent 侧提交成为 unknown/stale。
+    /// agent 侧预防层(提交前放弃+续跑兜底)接得住后果,本断言给出可见证据与
+    /// 调参指引。engine_io_timeout_secs=0(预防层禁用)由调用方守卫,不进本函数。
+    pub fn engine_budget_mismatch(&self, engine_io_timeout_secs: u64) -> Result<(), String> {
+        if engine_io_timeout_secs == 0 {
+            return Ok(());
+        }
+        let budget = self.worst_case_budget_secs();
+        if engine_io_timeout_secs >= budget {
+            return Ok(());
+        }
+        Err(format!(
+            "engine io_error_timeout ({}s) < LLM worst-case budget ({}s = request_timeout {}s × {} attempts \
+             + backoff + 10s margin): 慢 LLM 调用会超出引擎 pending 预算,agent 提交前护栏将放弃提交并依赖续跑兜底; \
+             调大引擎侧 io_error_timeout 或调小 llm.max_retries/request_timeout 可消除该失配",
+            engine_io_timeout_secs, budget, self.request_timeout_secs, 1 + self.max_retries
+        ))
+    }
+
     /// Create a mock LLM handler for tests.
     ///
     /// Returns a deterministic `LlmResponse`-shaped JSON regardless of input.
@@ -1260,6 +1282,21 @@ mod tests {
     fn test_step_budget_mismatch_zero_is_ok() {
         let h = LlmHandler::new("m", "https://x");
         assert!(h.step_budget_mismatch(0).is_ok());
+    }
+
+    /// 引擎预算对齐断言:0=禁用守卫;失配命中(worst_case 远大于典型 60s
+    /// 引擎预算);预算充足时放行。
+    #[test]
+    fn test_engine_budget_mismatch_dimensions() {
+        let h = LlmHandler::new("m", "https://x");
+        // 0=禁用,调用方守卫语义兜底
+        assert!(h.engine_budget_mismatch(0).is_ok());
+        // 典型部署:worst_case(1800+ 秒级) > 引擎 60s → 失配命中,文案含指引
+        let err = h.engine_budget_mismatch(60).expect_err("mismatch expected");
+        assert!(err.contains("engine io_error_timeout"), "msg: {err}");
+        assert!(err.contains("续跑兜底"), "msg: {err}");
+        // 预算充足:worst_case 内放行
+        assert!(h.engine_budget_mismatch(h.worst_case_budget_secs()).is_ok());
     }
 
     /// from_config 消费 [llm] timeout_secs（死配置接通——

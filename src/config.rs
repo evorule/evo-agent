@@ -371,6 +371,15 @@ pub struct EvoruleConfig {
     /// 空列表 = 不注册任何服务工具(安全默认)。
     #[serde(default)]
     pub service_tools: Vec<String>,
+    /// 引擎 pending I/O 超时预算(秒)——agent 侧对所连引擎 io_error_timeout
+    /// 的预期值,单步执行预算对齐的基准(提交前护栏/耗时预警/启动断言共用)。
+    /// 0 = 禁用预防层(步预算不设防);缺省 60 = 对齐引擎官方缺省。
+    #[serde(default = "default_engine_io_timeout")]
+    pub engine_io_timeout_secs: u64,
+}
+
+fn default_engine_io_timeout() -> u64 {
+    60
 }
 
 fn default_evorule_timeout() -> u64 {
@@ -395,6 +404,7 @@ impl Default for EvoruleConfig {
             api_key: Self::default_api_key(),
             timeout_secs: default_evorule_timeout(),
             service_tools: Vec::new(),
+            engine_io_timeout_secs: default_engine_io_timeout(),
         }
     }
 }
@@ -1928,5 +1938,19 @@ context_window_tokens = 32768
         std::env::remove_var("EVO_AGENT_MCP__NOT_A_FIELD");
         std::env::remove_var("EVO_AGENT_UNKNOWN_SECTION__X");
         restore_env(env_snap);
+    }
+
+    #[test]
+    fn test_default_engine_io_timeout_is_60() {
+        // 缺省 60=对齐引擎 io_error_timeout 官方缺省（预防层缺省激活,
+        // 经用户批复备案）;0=显式禁用,serde 缺省函数与 Default 双源一致。
+        let cfg = EvoruleConfig::default();
+        assert_eq!(cfg.engine_io_timeout_secs, 60);
+        let from_toml: EvoruleConfig =
+            toml::from_str("base_url = \"http://x\"").expect("parse evorule section");
+        assert_eq!(from_toml.engine_io_timeout_secs, 60);
+        let disabled: EvoruleConfig =
+            toml::from_str("engine_io_timeout_secs = 0").expect("parse disabled");
+        assert_eq!(disabled.engine_io_timeout_secs, 0);
     }
 }
