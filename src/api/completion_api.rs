@@ -3,13 +3,16 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! AI 补全/Inline Chat 端点(FIM 代理+改写代理)。
 //!
-//! 与对话 LLM 的关系:复用 `LlmConfig` 配置面(模型/key/端点),但请求形态独立
-//! ——补全是**非流式短超时** FIM 调用,Inline Chat 是**改写全文**调用,均不经
-//! 对话执行体(llm_handler 在途重构中,独立实现避免耦合;配置面同源零重复)。
+//! 出站路径与对话 LLM **同链归边**:统一 POST 扩展执行体(`/llm/execute`),
+//! 由执行体完成模型准入白名单执法(网络入口,先于出站)、多 provider 路由与
+//! 凭据持有——serve 侧零凭据,补全/改写不再自建直连 LLM 的旁路。请求形态仍
+//! 独立:补全是**非流式短超时**调用,Inline Chat 是**改写全文**调用;模型取
+//! 共享配置当前生效模型(随会话模型热切换联动)。
 //!
-//! 治理边界:两端点挂 G16 token 中间件;服务端不落盘 prompt 正文(tracing
-//! 脱敏);外发目标=既有 LLM 配置端点(无新第三方);.evoignore 排除在前端
-//! prompt 组装层执行(serve 端不重复判定)。
+//! 治理边界:两端点挂 token 中间件;服务端不落盘 prompt 正文(tracing 脱敏);
+//! 外发目标=配置的扩展执行体(无新第三方);.evoignore 排除在前端 prompt
+//! 组装层执行(serve 端不重复判定)。执行体不可达时的失败语义:补全=空文本
+//! 零打扰(HTTP 200),改写=502 显式上抛——与对话链路同域可见。
 
 #![forbid(unsafe_code)]
 
@@ -45,6 +48,183 @@ mod tests {
                 .unwrap();
         assert_eq!(r.instruction, "add doc");
         assert!(r.path.is_none());
+    }
+
+    // ---------- 归边执行体出站路径(补全/改写与对话同链) ----------
+
+    type Capture = std::sync::Arc<std::sync::Mutex<Option<(String, serde_json::Value)>>>;
+
+    /// 起 mock 执行体(POST /llm/execute):捕获 Authorization+请求体,回四键应答
+    async fn spawn_mock_executor(reply: serde_json::Value, captured: Capture) -> String {
+        let app = axum::Router::new().route(
+            "/llm/execute",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let captured = captured.clone();
+                    let reply = reply.clone();
+                    async move {
+                        let auth = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        *captured.lock().unwrap() = Some((auth, body));
+                        Json(reply)
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/llm/execute")
+    }
+
+    /// 起可指定状态码与错误体的 mock 执行体(拒绝路径)
+    async fn spawn_mock_executor_with_status(status: StatusCode, error: &str) -> String {
+        let body = json!({ "error": error });
+        let app = axum::Router::new().route(
+            "/llm/execute",
+            axum::routing::post(move || {
+                let body = body.clone();
+                async move { (status, Json(body)).into_response() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/llm/execute")
+    }
+
+    fn state_with_executor(executor_url: &str, token: Option<&str>) -> AgentApiState {
+        let cfg = crate::config::LlmConfig {
+            executor_url: executor_url.to_string(),
+            executor_token: token.map(str::to_string),
+            ..crate::config::LlmConfig::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        AgentApiState::new_with_metrics(
+            crate::agent::AgentDefinitionManager::with_default_dir(),
+            crate::api::evorule_client::EvoruleApiClient::new("http://localhost:8080"),
+            std::sync::Arc::new(crate::api::metrics::Metrics::new().unwrap()),
+            tmp.path().to_path_buf(),
+            std::sync::Arc::new(crate::api::workspace_client::WorkspaceApiClient::new(
+                "http://localhost:8080",
+            )),
+            std::sync::Arc::new(std::sync::RwLock::new(
+                crate::io_handlers::tool_handler::ToolHandler::new(),
+            )),
+        )
+        .with_llm_config(cfg)
+    }
+
+    #[tokio::test]
+    async fn completion_routes_through_executor_without_local_key() {
+        // 归边语义:api_key 恒空(SG-1 凭据归边)下补全照常可用——走执行体
+        let captured: Capture = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let url = spawn_mock_executor(
+            json!({ "content": "let x = 1;", "tool_calls": null, "finish_reason": "stop" }),
+            captured.clone(),
+        )
+        .await;
+        let state = state_with_executor(&url, Some("tok-1"));
+        let resp = completion(
+            State(state),
+            Json(CompletionRequest {
+                prefix: "fn ma".into(),
+                suffix: String::new(),
+                lang: Some("rust".into()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["text"], "let x = 1;");
+        let (auth, body) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(auth, "Bearer tok-1", "执行体调用方令牌随配置携带");
+        assert_eq!(body["model"], "MiniMax-M2.5", "模型=共享配置当前生效模型");
+        assert_eq!(body["stream"], serde_json::json!(false));
+        assert_eq!(body["max_tokens"], serde_json::json!(256));
+        assert!(body["stop"].is_array(), "FIM 停止序列随请求透传");
+        assert!(body["messages"].as_array().unwrap().len() == 2);
+    }
+
+    #[tokio::test]
+    async fn completion_silent_empty_when_executor_unreachable() {
+        // 执行体不可达 → 空文本零打扰(HTTP 200,失败原因落日志不回传)
+        let state = state_with_executor("http://127.0.0.1:1/llm/execute", None);
+        let resp = completion(
+            State(state),
+            Json(CompletionRequest {
+                prefix: "fn ma".into(),
+                suffix: String::new(),
+                lang: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["text"], "");
+    }
+
+    #[tokio::test]
+    async fn inline_chat_routes_through_executor() {
+        let captured: Capture = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let url = spawn_mock_executor(
+            json!({ "content": "fn main() {}", "tool_calls": null, "finish_reason": "stop" }),
+            captured.clone(),
+        )
+        .await;
+        let state = state_with_executor(&url, None);
+        let resp = inline_chat(
+            State(state),
+            Json(InlineChatRequest {
+                instruction: "加注释".into(),
+                code: "fn main(){}".into(),
+                path: Some("a.rs".into()),
+                lang: Some("rust".into()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["text"], "fn main() {}");
+        let (_, body) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(body["max_tokens"], serde_json::json!(2048));
+        assert!(body.get("stop").is_none(), "改写无停止序列");
+    }
+
+    #[tokio::test]
+    async fn inline_chat_surfaces_executor_rejection() {
+        // 白名单/路由拒绝来自执行体 502+error 体重:显式上抛给前端(不再旁路)
+        let url =
+            spawn_mock_executor_with_status(StatusCode::BAD_GATEWAY, "模型 m 不在准入白名单")
+                .await;
+        let state = state_with_executor(&url, None);
+        let resp = inline_chat(
+            State(state),
+            Json(InlineChatRequest {
+                instruction: "改写".into(),
+                code: "code".into(),
+                path: None,
+                lang: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let v = body_json(resp).await;
+        assert!(v["error"].as_str().unwrap().contains("白名单"));
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 }
 
@@ -90,33 +270,28 @@ pub struct InlineChatRequest {
 fn llm_not_configured() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({ "error": "LLM 未配置" })),
+        Json(json!({ "error": "LLM 未配置(扩展执行体地址为空)" })),
     )
         .into_response()
 }
 
-/// OpenAI 兼容 chat/completions 调用(非流式;统一超时)。
-/// 返回首条 choice 文本;HTTP/网络错误→Err(描述)。
-async fn openai_compatible_call(
-    api_base: &str,
-    api_key: &str,
+/// 扩展执行体调用(非流式;补全/改写与对话 LLM 同链归边)。
+///
+/// POST `executor_url`(全 URL 形态),body 透传(model/messages/stream/max_tokens/
+/// temperature[/stop]);执行体完成白名单执法与多 provider 路由后回四键同构
+/// `{content, tool_calls, finish_reason, token_usage}`,此处只取 content。
+/// HTTP/网络错误→Err(描述,不含凭据);执行体拒绝(白名单/路由/provider 失败)
+/// 以非 2xx+error 体重上抛,归因消息优先透传(错误体为执行体自诊断,不含
+/// 用户代码;无 error 字段时只报状态码)。
+async fn executor_call(
+    executor_url: &str,
+    executor_token: Option<&str>,
     model: &str,
     messages: &[serde_json::Value],
     stop: Option<Vec<String>>,
     timeout: std::time::Duration,
     max_tokens: u32,
 ) -> Result<String, String> {
-    let base = api_base.trim_end_matches('/');
-    // 端点语义兼容:OpenAI 形态 base(.../v1)追加 /chat/completions;
-    // MiniMax 形态 base 即完整端点(.../chatcompletion_v2)原样使用——
-    // 盲拼会得到 chatcompletion_v2/chat/completions 的 404
-    let url = if base.ends_with("chatcompletion_v2") || base.ends_with("/chat/completions") {
-        base.to_string()
-    } else {
-        format!("{base}/chat/completions")
-    };
-    // 文档化(clippy):构造即用
-    let client = reqwest::Client::new();
     let mut body = json!({
         "model": model,
         "messages": messages,
@@ -128,37 +303,48 @@ async fn openai_compatible_call(
         body["stop"] =
             serde_json::Value::Array(stop.into_iter().map(serde_json::Value::String).collect());
     }
-    let resp = tokio::time::timeout(
-        timeout,
-        client.post(&url).bearer_auth(api_key).json(&body).send(),
-    )
-    .await
-    .map_err(|_| "LLM 请求超时".to_string())?
-    .map_err(|e| format!("LLM 请求失败: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let _ = resp.text().await.unwrap_or_default();
-        // 日志脱敏:仅状态码与响应头长度,不记响应正文(可能含用户代码)
-        return Err(format!("LLM HTTP {status}"));
+    // 文档化(clippy):构造即用;调用方各自短超时,不复用全局长连接客户端
+    let client = reqwest::Client::new();
+    let mut req = client.post(executor_url).json(&body);
+    if let Some(token) = executor_token.map(str::trim).filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(token);
+    }
+    let resp = tokio::time::timeout(timeout, req.send())
+        .await
+        .map_err(|_| "LLM 请求超时".to_string())?
+        .map_err(|e| format!("执行体请求失败: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        // 执行体错误体=自诊断消息(白名单/路由/provider 归因,不含用户代码)
+        // ——优先透传归因;无 error 字段则只按状态码归因(不记原始正文)
+        let reason = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        return Err(reason);
     }
     let v: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("LLM 响应解析失败: {e}"))?;
-    let text = v["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    Ok(text)
+        .map_err(|e| format!("执行体响应解析失败: {e}"))?;
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(format!("执行体拒绝: {err}"));
+    }
+    Ok(v["content"].as_str().unwrap_or_default().to_string())
 }
 
-/// `POST /api/completion` — FIM 补全(prefix/suffix → 补全文本;非流式,800ms 超时)
+/// `POST /api/completion` — FIM 补全(prefix/suffix → 补全文本;非流式,10s 超时)
 pub async fn completion(
     State(state): State<AgentApiState>,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
     let config = state.llm_config().clone();
-    if config.api_key.is_empty() {
+    if config.executor_url.trim().is_empty() {
         return llm_not_configured();
     }
     let prefix_len = req.prefix.chars().count();
@@ -193,9 +379,9 @@ pub async fn completion(
             )
         }),
     ];
-    let text = match openai_compatible_call(
-        &config.api_base,
-        &config.api_key,
+    let text = match executor_call(
+        &config.executor_url,
+        config.executor_token.as_deref(),
         &config.model,
         &messages,
         Some(vec![
@@ -226,7 +412,7 @@ pub async fn inline_chat(
     Json(req): Json<InlineChatRequest>,
 ) -> Response {
     let config = state.llm_config().clone();
-    if config.api_key.is_empty() {
+    if config.executor_url.trim().is_empty() {
         return llm_not_configured();
     }
     if req.instruction.trim().is_empty() {
@@ -250,9 +436,9 @@ pub async fn inline_chat(
             )
         }),
     ];
-    let text = match openai_compatible_call(
-        &config.api_base,
-        &config.api_key,
+    let text = match executor_call(
+        &config.executor_url,
+        config.executor_token.as_deref(),
         &config.model,
         &messages,
         None,
