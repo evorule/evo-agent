@@ -72,6 +72,11 @@ use crate::io_handlers::tool_handler::ToolFunction;
 /// **Active 白名单**:直接执行,无需请示
 ///
 /// 这些是开发/调试高频、无破坏性、用途明确的命令。
+///
+/// 程序名背书之外另有参数级守卫(workbench 档,见
+/// [`ShellExecTool::active_arg_guard`]):find 的执行/写文件动作、
+/// cargo 的 install/publish/login、git 的 config/-c 等间接执行面在
+/// active 直跑前被拒——白名单背书不覆盖参数级第三方执行/外发面。
 pub const ACTIVE_COMMANDS: &[&str] = &[
     "cargo", // Rust build/test/clippy/fmt
     "git",   // 版本控制(只读 + 安全的写:status/log/diff/add/commit)
@@ -1200,6 +1205,96 @@ impl ShellExecTool {
         Ok(())
     }
 
+    // === active 白名单参数守卫(间接执行/写文件/外发面) ===
+
+    /// find 的执行/写文件动作(程序名背书覆盖不到的参数级执行面)
+    ///
+    /// `;` 终结符形态已被 [`Self::check_no_shell_metachars`] 挡住;真实
+    /// 缺口是 `{}` + 批量终结符(零元字符)与 -fprintf 类纯写向量。
+    const FIND_DENY_ACTIONS: &[&str] = &[
+        "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
+    ];
+
+    /// cargo 的下载执行/外发类子命令
+    ///
+    /// install = 下载第三方 crate 并执行其 build.rs、产出的 bin 入 PATH;
+    /// publish = 工作区内容外发;login = 凭据外发。build/test/check/clippy/
+    /// fmt/run/doc 执行面=当前工作区(信任域内),不收窄。
+    const CARGO_DENY_SUBCOMMANDS: &[&str] = &["install", "publish", "login"];
+
+    /// git 的配置注入/持久执行向量面
+    ///
+    /// -c = 一次性配置注入(core.fsmonitor/core.pager 类任意执行向量);
+    /// config = 写配置即持久执行向量(fail-safe 整拒,读场景走 --list 的
+    /// 需求由宿主 git 面覆盖);filter-branch 执行 filter 脚本;hook 显式
+    /// 执行钩子;upload-archive 可执行任意命令;daemon 对外暴露 git 服务;
+    /// send-email 外发数据。fetch/push 为版本控制工作流本体,不收窄。
+    const GIT_DENY_SUBCOMMANDS: &[&str] = &[
+        "config", "filter-branch", "hook", "upload-archive", "daemon", "send-email",
+    ];
+
+    /// workbench 档 active 直跑前的参数级守卫
+    ///
+    /// active 白名单以「程序名」为背书单位,但 find/cargo/git 的部分参数
+    /// 可执行白名单之外的代码、写任意文件或外发数据——程序名背书覆盖
+    /// 不到。本守卫对已知间接执行面按参数级拒绝(fail-safe:宁多拒,
+    /// 不误放)。make 不设守卫:执行面=当前工作区 Makefile,信任域与
+    /// cargo build 执行工作区 build.rs 同级,构建任务本体不收窄。
+    ///
+    /// 环境基线:守卫仅随 Workbench 档生效(调用点见 call_sync);另注意
+    /// 同名成员的平台分档(如 Windows find 落 candidate)天然不经此通道。
+    fn active_arg_guard(program: &str, parts: &[&str]) -> Result<(), String> {
+        match program {
+            "find" => {
+                for a in &parts[1..] {
+                    if Self::FIND_DENY_ACTIONS.contains(a) {
+                        return Err(format!(
+                            "find action '{a}' executes commands or writes files — not \
+                             allowed by the active whitelist guard; use read-only find \
+                             forms (-name/-type/-maxdepth) or the search_files tool"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            "cargo" => {
+                if let Some(sub) = parts[1..]
+                    .iter()
+                    .find(|a| !a.starts_with('-') && !a.starts_with('+'))
+                {
+                    if Self::CARGO_DENY_SUBCOMMANDS.contains(sub) {
+                        return Err(format!(
+                            "cargo subcommand '{sub}' downloads/builds third-party code or \
+                             sends credentials — not allowed by the active whitelist guard; \
+                             run it in your own terminal"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            "git" => {
+                if parts[1..].contains(&"-c") {
+                    return Err(
+                        "git option '-c' injects config values (persistent execution \
+                         vectors like core.fsmonitor) — not allowed by the active \
+                         whitelist guard"
+                            .to_string(),
+                    );
+                }
+                if let Some(sub) = parts[1..].iter().find(|a| !a.starts_with('-')) {
+                    if Self::GIT_DENY_SUBCOMMANDS.contains(sub) {
+                        return Err(format!(
+                            "git subcommand '{sub}' can execute hooks/filters or write \
+                             persistent config — not allowed by the active whitelist guard"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// 把命令分到 3 个桶之一(平台有效面:基线三表 + 平台增量 − 平台降档)
     ///
     /// 判定序 active→candidate→blocked 与基线语义一致;平台降档(find on
@@ -1592,7 +1687,14 @@ impl ShellExecTool {
         let category = Self::classify_for(self.profile, program);
 
         match category {
-            CommandCategory::Active => self.mark_profile(self.execute(&parts, cmd_str)),
+            CommandCategory::Active => {
+                // workbench 档:程序名背书之外的参数级间接执行面守卫
+                // (trusted 档环境即隔离边界,不挂守卫)
+                if self.profile == ExecutionProfile::Workbench {
+                    Self::active_arg_guard(program, &parts)?;
+                }
+                self.mark_profile(self.execute(&parts, cmd_str))
+            }
 
             CommandCategory::Candidate(c) => {
                 // 检查 approved
@@ -2222,6 +2324,149 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("metacharacter"), "got: {}", err);
+    }
+
+    // === active 白名单参数守卫(间接执行/写文件/外发面收窄) ===
+    //
+    // 背景:active 直跑通道以「程序名」为背书单位,但 find/cargo/git 的部分
+    // 参数可在白名单之外执行代码、写文件或外发数据。本组测试锁守卫语义:
+    // workbench 档命中即拒;sandbox-trusted 档不挂守卫(环境即隔离边界)。
+
+    /// cargo install(下载+构建执行第三方 build.rs)— 守卫须拒
+    /// (--list 形态安全,红相验证不产生副作用)
+    #[test]
+    fn test_cargo_install_denied_in_workbench() {
+        let tool = ShellExecTool::new();
+        let err = tool
+            .call_sync(&arg("cargo install --list"))
+            .expect_err("cargo install must be denied");
+        assert!(err.contains("not allowed"), "got: {err}");
+    }
+
+    /// cargo publish/login(外发工作区内容/凭据)— 守卫须拒
+    #[test]
+    fn test_cargo_publish_and_login_denied() {
+        for cmdline in ["cargo publish --help", "cargo login --help"] {
+            let err = ShellExecTool::new()
+                .call_sync(&arg(cmdline))
+                .expect_err("{cmdline} must be denied");
+            assert!(err.contains("not allowed"), "{cmdline}: {err}");
+        }
+    }
+
+    /// git config 子命令(写配置=持久执行向量,如 core.fsmonitor/core.pager)
+    #[test]
+    fn test_git_config_subcommand_denied() {
+        let err = ShellExecTool::new()
+            .call_sync(&arg("git config --list"))
+            .expect_err("git config must be denied");
+        assert!(err.contains("not allowed"), "got: {err}");
+    }
+
+    /// git -c 全局选项(一次性配置注入,任意执行向量)
+    #[test]
+    fn test_git_dash_c_injection_denied() {
+        let err = ShellExecTool::new()
+            .call_sync(&arg("git -c foo.bar=baz --version"))
+            .expect_err("git -c must be denied");
+        assert!(err.contains("not allowed"), "got: {err}");
+    }
+
+    /// 守卫规则表全量锚定(纯函数,零执行;跨平台可跑)
+    #[test]
+    fn test_active_arg_guard_rule_table() {
+        // find:执行/写文件动作全拒;只读形态放行
+        for deny in [
+            "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
+        ] {
+            assert!(
+                ShellExecTool::active_arg_guard("find", &["find", ".", deny]).is_err(),
+                "{deny} must be denied"
+            );
+        }
+        assert!(ShellExecTool::active_arg_guard(
+            "find",
+            &["find", ".", "-name", "x", "-maxdepth", "1"]
+        )
+        .is_ok());
+        // cargo:下载执行/外发子命令拒;构建/测试/toolchain 前缀放行
+        for deny in ["install", "publish", "login"] {
+            assert!(
+                ShellExecTool::active_arg_guard("cargo", &["cargo", deny]).is_err(),
+                "{deny} must be denied"
+            );
+        }
+        assert!(ShellExecTool::active_arg_guard("cargo", &["cargo", "build", "--release"]).is_ok());
+        assert!(ShellExecTool::active_arg_guard("cargo", &["cargo", "+nightly", "test"]).is_ok());
+        assert!(ShellExecTool::active_arg_guard("cargo", &["cargo", "--version"]).is_ok());
+        // git:配置注入与执行面子命令拒;常规版本控制放行(含路径恰名 config)
+        assert!(ShellExecTool::active_arg_guard(
+            "git",
+            &["git", "-c", "core.fsmonitor=cmd", "status"]
+        )
+        .is_err());
+        for deny in ["config", "filter-branch", "hook", "upload-archive", "daemon", "send-email"]
+        {
+            assert!(
+                ShellExecTool::active_arg_guard("git", &["git", deny]).is_err(),
+                "{deny} must be denied"
+            );
+        }
+        assert!(ShellExecTool::active_arg_guard("git", &["git", "status"]).is_ok());
+        assert!(ShellExecTool::active_arg_guard("git", &["git", "commit", "-m", "msg"]).is_ok());
+        assert!(ShellExecTool::active_arg_guard("git", &["git", "add", "config"]).is_ok());
+        // 其他 active 成员不设守卫(make=任务本体,详见守卫文档)
+        assert!(ShellExecTool::active_arg_guard("make", &["make", "build"]).is_ok());
+        assert!(ShellExecTool::active_arg_guard("ls", &["ls", "-la"]).is_ok());
+        assert!(ShellExecTool::active_arg_guard("rg", &["rg", "pattern"]).is_ok());
+    }
+
+    /// find 执行/写文件动作端到端拒绝(unix:find 为 active)
+    ///
+    /// `;` 终结符形态已被元字符防线挡住,真实缺口是 `{}` + 批量形态
+    /// (零元字符)与 -fprintf 类纯写向量 — 两者均无 shell 元字符。
+    #[cfg(unix)]
+    #[test]
+    fn test_find_write_exec_actions_denied_in_workbench() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ShellExecTool::new().with_workdir(tmp.path());
+        for cmdline in [
+            "find . -maxdepth 0 -exec echo probe +",
+            "find . -maxdepth 0 -fprintf probe.txt x",
+            "find . -maxdepth 0 -fls probe2.txt",
+        ] {
+            let err = tool
+                .call_sync(&arg(cmdline))
+                .expect_err("find write/exec actions must be denied");
+            assert!(err.contains("not allowed"), "{cmdline}: {err}");
+        }
+    }
+
+    /// 回归锁:常规构建/版本控制形态不受守卫误伤
+    #[test]
+    fn test_active_guard_no_false_positives() {
+        let tool = ShellExecTool::new();
+        for cmdline in ["cargo --version", "git --version"] {
+            let v = tool
+                .call_sync(&arg(cmdline))
+                .unwrap_or_else(|e| panic!("{cmdline} must still run, got: {e}"));
+            assert_eq!(v.get("status").unwrap().as_str().unwrap(), "ok", "{cmdline}");
+        }
+    }
+
+    /// 回归锁:sandbox-trusted 档不挂参数守卫 — 环境即隔离边界,
+    /// find -exec 在域内为任务本体(与 TRUSTED_ACTIVE_COMMANDS 全量保留一致)
+    #[cfg(unix)]
+    #[test]
+    fn test_trusted_profile_not_arg_guarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ShellExecTool::new()
+            .with_workdir(tmp.path())
+            .with_execution_profile(ExecutionProfile::SandboxTrusted);
+        let v = tool
+            .call_sync(&arg("find . -maxdepth 0 -exec echo trusted +"))
+            .expect("trusted profile keeps find -exec as task semantics");
+        assert_eq!(v.get("status").unwrap().as_str().unwrap(), "ok");
     }
 
     #[test]
