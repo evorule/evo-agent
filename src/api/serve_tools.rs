@@ -128,7 +128,31 @@ pub fn build_union_toolkit_with_profile(
     ev: &EvoruleApiClient,
     profile: crate::builtin_tools::shell_exec::ExecutionProfile,
 ) -> ToolHandler {
-    build_union_toolkit_with_read_root_and_profile(workdir, workdir, ws, ev, profile)
+    build_union_toolkit_with_profile_and_shell(workdir, ws, ev, profile, None)
+        .expect("default shell sandbox (none) resolution is infallible")
+}
+
+/// E-2(design-36 期2):带 shell 沙箱档配置的 union 装配(run 本地路径接线)
+///
+/// 档位解析/装配语义见 `builtin_tools::default_safe_toolkit_with_shell`;
+/// serve 面既有 per-request 容器化路径不受影响(见
+/// [`with_shell_exec_backend`],其请求级替换优先于本配置面)。
+pub fn build_union_toolkit_with_profile_and_shell(
+    workdir: &Path,
+    ws: &WorkspaceApiClient,
+    ev: &EvoruleApiClient,
+    profile: crate::builtin_tools::shell_exec::ExecutionProfile,
+    shell: Option<&crate::config::ShellConfig>,
+) -> Result<ToolHandler, String> {
+    let mut handler =
+        crate::builtin_tools::default_safe_toolkit_with_shell(workdir, workdir, profile, shell)?;
+    let rule_handler = full_rule_toolkit(ws, ev);
+    // 合并规则工具到 handler(按白名单逐个取出,保证只注册已知工具;
+    // manifest+执行器成对迁移,治理元数据不丢)
+    for name in RULE_TOOL_NAMES {
+        handler.register_entry_from(&rule_handler, name);
+    }
+    Ok(handler)
 }
 
 /// G1 核心:读域根 + 执行环境 profile 全参装配

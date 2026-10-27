@@ -125,6 +125,63 @@ pub fn default_safe_toolkit_with_profile(
     read_root: &Path,
     profile: shell_exec::ExecutionProfile,
 ) -> ToolHandler {
+    default_safe_toolkit_with_shell(workdir, read_root, profile, None)
+        .expect("default shell sandbox (none) resolution is infallible")
+}
+
+/// E-2(design-36 期2):带 shell 沙箱档配置的装配
+///
+/// 档位解析见 `shell_exec::resolve_sandbox_tier`:
+/// - `None`(缺省)/`none` = tier-3 现行为(装配产物与
+///   [`default_safe_toolkit_with_profile`] 一致,仅结果多 sandbox=none 章);
+/// - `container`/`auto` 命中 tier-1 时 shell_exec 整体重绑容器桥
+///   (DockerExec + trusted 档语义,复用 design-17 既有表;超时对齐 serve 面
+///   600s 档)。**python_exec 不随动**:它无容器后端,仍在宿主执行,分类
+///   基线维持调用方 profile(容器边界只覆盖 shell_exec 执行体,分类不放宽);
+/// - `auto` 降级 tier-3 时携带降级原因,随执行结果 fail-visible 打标;
+/// - `container` 档前提不满足 / `appcontainer` 未实现 = Err(启动期 fail-fast)。
+pub fn default_safe_toolkit_with_shell(
+    workdir: &Path,
+    read_root: &Path,
+    profile: shell_exec::ExecutionProfile,
+    shell: Option<&crate::config::ShellConfig>,
+) -> Result<ToolHandler, String> {
+    // 档位解析(container 档先配置校验后探测;探测进程内一次落账)
+    let resolution = match shell {
+        None => shell_exec::resolve_sandbox_tier(
+            crate::config::ShellSandboxMode::None,
+            None,
+            false,
+        )?,
+        Some(cfg) => shell_exec::resolve_sandbox_tier(
+            cfg.sandbox,
+            cfg.container.as_deref(),
+            shell_exec::detect_docker_daemon(),
+        )?,
+    };
+    // posture 落账(启动期一次;逐执行打标见 shell_exec::mark_audit,审计同权)
+    match (&resolution.container, &resolution.downgrade_reason) {
+        (Some(c), _) => {
+            tracing::info!(container = %c, "shell sandbox posture: tier-1 (container bridge)");
+        }
+        (None, Some(reason)) => {
+            tracing::info!(reason = %reason, "shell sandbox posture: tier-3 (sandbox unavailable, fail-visible)");
+        }
+        (None, None) => {
+            tracing::debug!("shell sandbox posture: tier-3 (default none mode)");
+        }
+    }
+    Ok(default_safe_toolkit_core(workdir, read_root, profile, &resolution))
+}
+
+/// 安全默认工具集核心装配(全部档位共用的单一构造路径;档位差异只作用于
+/// shell_exec 构造,其余工具注册与历史行为逐项一致)
+fn default_safe_toolkit_core(
+    workdir: &Path,
+    read_root: &Path,
+    profile: shell_exec::ExecutionProfile,
+    resolution: &shell_exec::SandboxResolution,
+) -> ToolHandler {
     let workdir_buf = workdir
         .canonicalize()
         .unwrap_or_else(|_| workdir.to_path_buf());
@@ -200,14 +257,25 @@ pub fn default_safe_toolkit_with_profile(
         "code_search",
         Arc::new(code_search::CodeSearchTool::unwired()),
     );
-    handler.register_static(
-        "shell_exec",
-        Arc::new(
-            shell_exec::ShellExecTool::new()
-                .with_workdir(&workdir_buf)
-                .with_execution_profile(profile),
-        ),
-    );
+    // E-2(design-36 期2):shell_exec 档位装配——tier-1 容器桥(DockerExec +
+    // trusted 档语义,环境即隔离边界;超时对齐 serve 面容器桥 600s)/ tier-3
+    // 裸跑(缺省 = 现行为)。python_exec 不随动:无容器后端,仍在宿主执行,
+    // 分类基线维持调用方 profile(容器边界只覆盖 shell_exec 执行体,不放宽)
+    let mut shell_tool = shell_exec::ShellExecTool::new()
+        .with_workdir(&workdir_buf)
+        .with_execution_profile(profile);
+    if let Some(container) = &resolution.container {
+        shell_tool = shell_tool
+            .with_backend(shell_exec::ExecBackend::DockerExec {
+                container: container.clone(),
+            })
+            .with_execution_profile(shell_exec::ExecutionProfile::SandboxTrusted)
+            .with_timeout(600);
+    }
+    if let Some(reason) = &resolution.downgrade_reason {
+        shell_tool = shell_tool.with_sandbox_downgrade_reason(Some(reason.clone()));
+    }
+    handler.register_static("shell_exec", Arc::new(shell_tool));
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
     // 批K 段2:网络面第二/三件——网页抓取取读(http_get 防线全量复用)与
     // 互联网搜索(ai-plugin 中继,Brave key 归边 ai-plugin 侧)
@@ -1504,6 +1572,59 @@ pub struct ToolSpec {
     pub description: String,
     /// TODO: doc
     pub parameters: Vec<ParameterSpec>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_safe_toolkit_shell_none_mode_builds_ok() {
+        // E-2:缺省档(None/未配置)装配成功且 shell_exec 在册(现行为)
+        let handler = default_safe_toolkit_with_shell(
+            Path::new("."),
+            Path::new("."),
+            shell_exec::ExecutionProfile::Workbench,
+            None,
+        )
+        .expect("none-mode resolution is infallible");
+        assert!(handler.has_tool("shell_exec"));
+    }
+
+    #[test]
+    fn test_default_safe_toolkit_container_mode_requires_container_name() {
+        // 显式 container 档缺容器名:构造期 fail-fast(先配置校验后探测,
+        // 本测试不依赖本机 docker)
+        let cfg = crate::config::ShellConfig {
+            sandbox: crate::config::ShellSandboxMode::Container,
+            container: None,
+        };
+        let err = default_safe_toolkit_with_shell(
+            Path::new("."),
+            Path::new("."),
+            shell_exec::ExecutionProfile::Workbench,
+            Some(&cfg),
+        )
+        .unwrap_err();
+        assert!(err.contains("shell.container"), "got: {err}");
+    }
+
+    #[test]
+    fn test_default_safe_toolkit_appcontainer_mode_fails_fast() {
+        // 期3 未施工:显式报错,不猜不回落
+        let cfg = crate::config::ShellConfig {
+            sandbox: crate::config::ShellSandboxMode::AppContainer,
+            container: None,
+        };
+        let err = default_safe_toolkit_with_shell(
+            Path::new("."),
+            Path::new("."),
+            shell_exec::ExecutionProfile::Workbench,
+            Some(&cfg),
+        )
+        .unwrap_err();
+        assert!(err.contains("appcontainer"), "got: {err}");
+    }
 }
 
 #[derive(Debug, Clone)]

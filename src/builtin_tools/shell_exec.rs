@@ -57,7 +57,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -955,6 +955,100 @@ fn docker_exec_argv(container: &str, command: &str) -> Vec<String> {
     ]
 }
 
+/// 沙箱档解析结论(E-2 / design-36 §4.1)
+///
+/// `container` = tier-1 容器名(Some 即容器桥,trusted 档语义);None = tier-3
+/// 进程内防线裸跑(现行为)。`downgrade_reason` = auto 档降级原因(tier-1 或
+/// 显式 none 档恒为 None)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxResolution {
+    /// tier-1 容器名;None = tier-3 裸跑
+    pub container: Option<String>,
+    /// auto 档降级原因(随执行结果 fail-visible 打标)
+    pub downgrade_reason: Option<String>,
+}
+
+/// 沙箱档位解析(纯函数:探测结论由调用方注入,便于测试与「探测一次落账」)
+///
+/// 规则(design-36 §4.1,缺省不变式):
+/// - `none`:现行为(tier-3),探测结论不消费;
+/// - `container`:强制容器桥——容器名缺失或 daemon 不可用即 Err(显式意志
+///   不满足 = fail-fast 拒绝,不静默裸跑);
+/// - `auto`:探测可用且有容器名 → tier-1;否则降 tier-3 并携带降级原因
+///   (fail-visible,随执行结果打标);
+/// - `appcontainer`:期3 待 spike,显式报错(不猜、不回落)。
+pub fn resolve_sandbox_tier(
+    mode: crate::config::ShellSandboxMode,
+    container: Option<&str>,
+    docker_daemon_available: bool,
+) -> Result<SandboxResolution, String> {
+    match mode {
+        crate::config::ShellSandboxMode::None => Ok(SandboxResolution {
+            container: None,
+            downgrade_reason: None,
+        }),
+        crate::config::ShellSandboxMode::Container => {
+            let name = container.ok_or_else(|| {
+                "shell.sandbox=container requires shell.container (target container name)"
+                    .to_string()
+            })?;
+            if !docker_daemon_available {
+                return Err(
+                    "shell.sandbox=container but docker daemon is not available \
+                     (explicit sandbox demanded; refusing bare-metal fallback)"
+                        .to_string(),
+                );
+            }
+            Ok(SandboxResolution {
+                container: Some(name.to_string()),
+                downgrade_reason: None,
+            })
+        }
+        crate::config::ShellSandboxMode::Auto => {
+            if docker_daemon_available {
+                if let Some(name) = container {
+                    return Ok(SandboxResolution {
+                        container: Some(name.to_string()),
+                        downgrade_reason: None,
+                    });
+                }
+                return Ok(SandboxResolution {
+                    container: None,
+                    downgrade_reason: Some(
+                        "auto: docker daemon available but shell.container not configured"
+                            .to_string(),
+                    ),
+                });
+            }
+            Ok(SandboxResolution {
+                container: None,
+                downgrade_reason: Some("auto: docker daemon unavailable".to_string()),
+            })
+        }
+        crate::config::ShellSandboxMode::AppContainer => Err(
+            "shell.sandbox=appcontainer is not yet implemented (design-36 phase 3, pending spike)"
+                .to_string(),
+        ),
+    }
+}
+
+/// docker daemon 可用性探测(进程内一次落账,design-36 §4.1 auto-detect)
+///
+/// 探测 = `docker info --format ok`(daemon 不可达时 docker CLI 即时连接
+/// 拒绝快速失败);结果经 [`OnceLock`] 进程内缓存,装配期只探一次。
+pub fn detect_docker_daemon() -> bool {
+    static DOCKER_DAEMON: OnceLock<bool> = OnceLock::new();
+    *DOCKER_DAEMON.get_or_init(|| {
+        Command::new("docker")
+            .arg("info")
+            .arg("--format")
+            .arg("ok")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
 /// `shell_exec` 工具
 #[derive(Clone)]
 pub struct ShellExecTool {
@@ -966,6 +1060,9 @@ pub struct ShellExecTool {
     profile: ExecutionProfile,
     /// 在飞子进程登记(pid → 取消旗标):执行超时钩子的进程族回收面
     live: Arc<StdMutex<HashMap<u32, Arc<AtomicBool>>>>,
+    /// E-2 期2:沙箱降级原因(auto 档探测不可用降 tier-3 时非空;
+    /// 随执行结果 fail-visible 输出,只影响打标面不改执行路径)
+    sandbox_downgrade: Option<String>,
 }
 
 impl ShellExecTool {
@@ -982,6 +1079,7 @@ impl ShellExecTool {
             backend: ExecBackend::Local,
             profile: ExecutionProfile::Workbench,
             live: Arc::new(StdMutex::new(HashMap::new())),
+            sandbox_downgrade: None,
         }
     }
 
@@ -1015,6 +1113,13 @@ impl ShellExecTool {
     /// 设置执行环境 profile(G1:缺省 Workbench,人在环基线不变)
     pub fn with_execution_profile(mut self, profile: ExecutionProfile) -> Self {
         self.profile = profile;
+        self
+    }
+
+    /// E-2 期2:标注沙箱降级原因(auto 档探测不可用 → tier-3;随执行结果
+    /// fail-visible 输出,不静默降级)
+    pub fn with_sandbox_downgrade_reason(mut self, reason: Option<String>) -> Self {
+        self.sandbox_downgrade = reason;
         self
     }
 
@@ -1420,13 +1525,31 @@ impl ShellExecTool {
         }
     }
 
-    /// G1 审计同权:sandbox-trusted 档执行结果带 profile 标记可回放
-    /// (workbench 结果逐字节不变;docker-exec 容器域本就是任务沙箱语义,
-    /// 不经本标记)
-    fn mark_profile(&self, mut result: IoResult) -> IoResult {
-        if self.profile == ExecutionProfile::SandboxTrusted {
-            if let Ok(v) = result.as_mut() {
-                if let Some(obj) = v.as_object_mut() {
+    /// 审计同权打标(G1 execution_profile + E-2 sandbox 档位章)
+    ///
+    /// - `sandbox`:E-2 期2 fail-visible 档位章——容器后端 = `container`(容器域
+    ///   即任务沙箱),宿主后端 = `none`(进程内防线裸跑,现行为);auto 降级时
+    ///   附带 `sandbox_reason`。Err 结果不打标(错误面原样)。
+    /// - `execution_profile`:trusted 档执行结果带 profile 标记可回放(workbench
+    ///   结果不带,G1 既有语义不变)。
+    fn mark_audit(&self, mut result: IoResult) -> IoResult {
+        if let Ok(v) = result.as_mut() {
+            if let Some(obj) = v.as_object_mut() {
+                match &self.backend {
+                    ExecBackend::DockerExec { .. } => {
+                        obj.insert("sandbox".to_string(), Value::from("container"));
+                    }
+                    ExecBackend::Local => {
+                        obj.insert("sandbox".to_string(), Value::from("none"));
+                        if let Some(reason) = &self.sandbox_downgrade {
+                            obj.insert(
+                                "sandbox_reason".to_string(),
+                                Value::from(reason.clone()),
+                            );
+                        }
+                    }
+                }
+                if self.profile == ExecutionProfile::SandboxTrusted {
                     obj.insert(
                         "execution_profile".to_string(),
                         Value::from(self.profile.as_str()),
@@ -1675,7 +1798,7 @@ impl ShellExecTool {
                 return Err("empty command".to_string());
             }
             validate_container_name(container)?;
-            return self.execute_docker_exec(container, cmd_str);
+            return self.mark_audit(self.execute_docker_exec(container, cmd_str));
         }
 
         // 1. 解析
@@ -1698,7 +1821,7 @@ impl ShellExecTool {
                 if self.profile == ExecutionProfile::Workbench {
                     Self::active_arg_guard(program, &parts)?;
                 }
-                self.mark_profile(self.execute(&parts, cmd_str))
+                self.mark_audit(self.execute(&parts, cmd_str))
             }
 
             CommandCategory::Candidate(c) => {
@@ -1708,7 +1831,7 @@ impl ShellExecTool {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if approved {
-                    self.mark_profile(self.execute(&parts, cmd_str))
+                    self.mark_audit(self.execute(&parts, cmd_str))
                 } else {
                     // 返回 proposal(让上层问用户)
                     Self::make_proposal(program, cmd_str, c)
@@ -2604,6 +2727,144 @@ mod tests {
         let result = tool.call_sync(&arg("python3 --version"));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("BLOCKED"));
+    }
+
+    // === E-2(design-36 期2):沙箱档位解析与 fail-visible 打标 ===
+
+    #[test]
+    fn test_shell_sandbox_mode_serde_lowercase_and_fail_fast() {
+        // 小写枚举面(与 config.toml 契约一致)
+        assert_eq!(
+            serde_json::from_str::<crate::config::ShellSandboxMode>("\"none\"").unwrap(),
+            crate::config::ShellSandboxMode::None
+        );
+        assert_eq!(
+            serde_json::from_str::<crate::config::ShellSandboxMode>("\"auto\"").unwrap(),
+            crate::config::ShellSandboxMode::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<crate::config::ShellSandboxMode>("\"container\"").unwrap(),
+            crate::config::ShellSandboxMode::Container
+        );
+        assert_eq!(
+            serde_json::from_str::<crate::config::ShellSandboxMode>("\"appcontainer\"").unwrap(),
+            crate::config::ShellSandboxMode::AppContainer
+        );
+        // 未知值 fail-fast(反序列化即拒,不静默回落;大小写敏感)
+        assert!(serde_json::from_str::<crate::config::ShellSandboxMode>("\"docker\"").is_err());
+        assert!(serde_json::from_str::<crate::config::ShellSandboxMode>("\"None\"").is_err());
+    }
+
+    #[test]
+    fn test_resolve_sandbox_tier_matrix() {
+        // none:现行为(tier-3),探测结论不消费、无降级原因
+        let r = resolve_sandbox_tier(crate::config::ShellSandboxMode::None, None, false).unwrap();
+        assert!(r.container.is_none());
+        assert!(r.downgrade_reason.is_none());
+        let r = resolve_sandbox_tier(crate::config::ShellSandboxMode::None, None, true).unwrap();
+        assert!(r.container.is_none());
+        assert!(r.downgrade_reason.is_none());
+
+        // container:强制档——容器名缺失/daemon 缺失均 fail-fast(显式意志
+        // 不满足 = 拒绝,不静默裸跑)
+        let err =
+            resolve_sandbox_tier(crate::config::ShellSandboxMode::Container, None, true)
+                .unwrap_err();
+        assert!(err.contains("shell.container"), "got: {err}");
+        let err =
+            resolve_sandbox_tier(crate::config::ShellSandboxMode::Container, Some("dev"), false)
+                .unwrap_err();
+        assert!(err.contains("docker daemon"), "got: {err}");
+        let r =
+            resolve_sandbox_tier(crate::config::ShellSandboxMode::Container, Some("dev"), true)
+                .unwrap();
+        assert_eq!(r.container.as_deref(), Some("dev"));
+        assert!(r.downgrade_reason.is_none());
+
+        // auto:探测可用且有容器名 → tier-1;缺一降 tier-3 并携带降级原因
+        // (fail-visible,随执行结果打标)
+        let r =
+            resolve_sandbox_tier(crate::config::ShellSandboxMode::Auto, Some("dev"), true).unwrap();
+        assert_eq!(r.container.as_deref(), Some("dev"));
+        assert!(r.downgrade_reason.is_none());
+        let r = resolve_sandbox_tier(crate::config::ShellSandboxMode::Auto, None, true).unwrap();
+        assert!(r.container.is_none());
+        assert!(
+            r.downgrade_reason.unwrap().contains("shell.container"),
+            "auto downgrade reason must name the missing config"
+        );
+        let r =
+            resolve_sandbox_tier(crate::config::ShellSandboxMode::Auto, Some("dev"), false)
+                .unwrap();
+        assert!(r.container.is_none());
+        assert!(
+            r.downgrade_reason.unwrap().contains("docker daemon"),
+            "auto downgrade reason must name the missing daemon"
+        );
+
+        // appcontainer:期3 待 spike,显式报错(不猜、不回落)
+        let err =
+            resolve_sandbox_tier(crate::config::ShellSandboxMode::AppContainer, None, true)
+                .unwrap_err();
+        assert!(err.contains("not yet implemented"), "got: {err}");
+    }
+
+    #[test]
+    fn test_local_results_mark_sandbox_none() {
+        // 缺省档(tier-3):执行路径不变(仍是宿主直跑),结果带 sandbox=none
+        // (fail-visible 档位章);workbench 档不带 execution_profile(G1 既有语义)
+        let tool = ShellExecTool::new();
+        let result = tool.call_sync(&arg("git --version")).unwrap();
+        assert_eq!(result.get("sandbox").and_then(|v| v.as_str()), Some("none"));
+        assert!(result.get("sandbox_reason").is_none());
+        assert!(result.get("execution_profile").is_none());
+    }
+
+    #[test]
+    fn test_downgrade_reason_marked_and_err_unmarked() {
+        // auto 降级:tier-3 结果附带 sandbox_reason(落账可回放);Err 结果不打标
+        let tool = ShellExecTool::new()
+            .with_sandbox_downgrade_reason(Some("auto: docker daemon unavailable".to_string()));
+        let marked = tool
+            .mark_audit(Ok(serde_json::json!({"status": "ok"})))
+            .unwrap();
+        assert_eq!(marked.get("sandbox").and_then(|v| v.as_str()), Some("none"));
+        assert_eq!(
+            marked.get("sandbox_reason").and_then(|v| v.as_str()),
+            Some("auto: docker daemon unavailable")
+        );
+        let err = tool.mark_audit(Err("spawn failed".to_string()));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_docker_backend_results_mark_sandbox_container() {
+        // 容器后端结果盖 tier-1 章(容器域即任务沙箱)
+        let tool = ShellExecTool::new().with_backend(ExecBackend::DockerExec {
+            container: "dev".to_string(),
+        });
+        let marked = tool
+            .mark_audit(Ok(serde_json::json!({"status": "ok", "backend": "docker-exec"})))
+            .unwrap();
+        assert_eq!(
+            marked.get("sandbox").and_then(|v| v.as_str()),
+            Some("container")
+        );
+        assert!(marked.get("sandbox_reason").is_none());
+    }
+
+    #[test]
+    fn test_trusted_profile_stamp_coexists_with_sandbox_mark() {
+        // G1 既有 execution_profile 打标与 E-2 sandbox 章并存(tier-1 装配形态:
+        // DockerExec + SandboxTrusted;此处 Local+Trusted 只验共存)
+        let tool = ShellExecTool::new()
+            .with_execution_profile(ExecutionProfile::SandboxTrusted);
+        let marked = tool.mark_audit(Ok(serde_json::json!({"status": "ok"}))).unwrap();
+        assert_eq!(
+            marked.get("execution_profile").and_then(|v| v.as_str()),
+            Some("sandbox-trusted")
+        );
+        assert_eq!(marked.get("sandbox").and_then(|v| v.as_str()), Some("none"));
     }
 
     // === 网络负面域守卫(net_guard,两后端统一前置红线)===

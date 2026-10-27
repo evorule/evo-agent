@@ -695,12 +695,23 @@ fn cmd_run(
             }
         },
     };
-    let mut tool_handler = evo_agent::api::serve_tools::build_union_toolkit_with_profile(
-        workdir,
-        &ws_client,
-        &client,
-        execution_profile,
-    );
+    // E-2(design-36 期2):shell 沙箱档接线(config [shell] 节;缺省 none =
+    // 现行为;container 档前提不满足 / appcontainer 未实现 = 启动期 fail-fast,
+    // 不静默裸跑)
+    let mut tool_handler =
+        match evo_agent::api::serve_tools::build_union_toolkit_with_profile_and_shell(
+            workdir,
+            &ws_client,
+            &client,
+            execution_profile,
+            Some(&config.shell),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: shell sandbox config: {e}");
+                return ExitCode::from(2);
+            }
+        };
     // M5-a:能力边界接线(显式声明重绑 file 工具沙箱 + 生效边界注入 runner)
     let capability_boundary =
         evo_agent::api::serve_tools::wire_capability_boundary(&mut tool_handler, &def, workdir);

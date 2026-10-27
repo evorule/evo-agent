@@ -587,6 +587,10 @@ pub struct Config {
     #[serde(default)]
     /// 定时自治调度(纯确定性组件;触发后执行照常走既有管道与治理)
     pub schedule: crate::schedule::ScheduleConfig,
+    #[serde(default)]
+    /// E-2(design-36 期2):shell 沙箱档配置(本地档;serve 面既有 per-request
+    /// 容器化路径不受影响)。缺省 = none = 现行为(缺省不变式)
+    pub shell: ShellConfig,
     /// LLM API key 的来源记录(脱敏状态端点用;不携带任何密钥内容)
     ///
     /// 取值:`Some(环境变量名)`(如 `MINIMAX_API_KEY` / `EVO_AGENT_LLM__API_KEY`)
@@ -607,6 +611,43 @@ pub struct WorkbenchConfig {
     /// console dev server 端口(缺省 5174,与 console-cloud vite 配置一致)
     #[serde(default)]
     pub console_port: Option<u16>,
+}
+
+/// shell 沙箱档配置(E-2 / design-36 期2:tier-1 容器桥显式激活,缺省 tier-3)
+///
+/// 红线正交:三层分类 / metachar 拒绝 / net_guard / 参数守卫在任何档位都生效
+/// (OS 边界是纵深第二道,不替代进程内防线)。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ShellConfig {
+    /// 沙箱档位(design-36 §4.1):
+    /// - `none`(缺省)= 进程内防线裸跑(现行为,结果打 sandbox=none 章);
+    /// - `auto` = 探测 docker daemon,可用且有容器名即走容器桥(trusted 档
+    ///   语义),否则降 tier-3 并随结果携带降级原因(fail-visible,不静默);
+    /// - `container` = 强制容器桥,容器名缺失或 daemon 不可用即启动期报错
+    ///   (显式意志不满足 = fail-fast,不静默裸跑);
+    /// - `appcontainer` = OS 低盒(design-36 期3,待 spike,当前显式报错未实现)。
+    #[serde(default)]
+    pub sandbox: ShellSandboxMode,
+    /// tier-1 容器名(`sandbox = "container"` / `"auto"` 时生效)。容器契约与
+    /// serve 面容器桥一致:目标容器须已备工作区(工作台目录在容器内可见),
+    /// shell_exec 整体落容器执行,宿主分类面不适用容器侧命令。
+    #[serde(default)]
+    pub container: Option<String>,
+}
+
+/// 沙箱档位枚举(小写字面量;未知值反序列化即拒,fail-fast)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellSandboxMode {
+    /// 进程内防线裸跑(缺省 = 现行为)
+    #[default]
+    None,
+    /// 探测可用即容器桥,不可用降 tier-3 并 fail-visible 打标
+    Auto,
+    /// 强制容器桥(前提不满足启动期报错)
+    Container,
+    /// OS 低盒(design-36 期3 待 spike,当前显式报错)
+    AppContainer,
 }
 
 /// 配置加载/解析错误
@@ -1209,6 +1250,26 @@ mod tests {
         assert_eq!(cfg.evorule.base_url, "http://localhost:18080");
         assert_eq!(cfg.agents.dir, PathBuf::from("./agents"));
         assert_eq!(cfg.agents.default, "general");
+    }
+
+    #[test]
+    fn test_shell_config_section_parse_and_defaults() {
+        // E-2(design-36 期2):[shell] 节——节整体缺失 = tier-3 现行为
+        // (缺省不变式:缺省值必须等于现行为)
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(matches!(cfg.shell.sandbox, ShellSandboxMode::None));
+        assert!(cfg.shell.container.is_none());
+
+        // 显式档位 + 容器名
+        let cfg: Config = toml::from_str(
+            "[shell]\nsandbox = \"container\"\ncontainer = \"dev\"\n",
+        )
+        .unwrap();
+        assert!(matches!(cfg.shell.sandbox, ShellSandboxMode::Container));
+        assert_eq!(cfg.shell.container.as_deref(), Some("dev"));
+
+        // 未知枚举值 fail-fast(反序列化层即拒,不静默回落)
+        assert!(toml::from_str::<Config>("[shell]\nsandbox = \"docker\"\n").is_err());
     }
 
     #[test]
