@@ -68,8 +68,31 @@ pub fn validate_plan_args(args: &Value) -> Result<Value, String> {
         problems.push(format!("notes exceeds {PLAN_MAX_NOTES_CHARS} chars"));
     }
     let Some(steps) = args.get("steps").and_then(|v| v.as_array()) else {
+        // 宽容形态:steps 以多行字符串提交时按行拆步(模型偶发字符串形态,
+        // 真机实证);其余形态指路正确形态
+        if let Some(s) = args.get("steps").and_then(|v| v.as_str()) {
+            let lines: Vec<&str> = s
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect();
+            if !lines.is_empty() {
+                if !problems.is_empty() {
+                    return Err(format!("invalid plan: {}", problems.join("; ")));
+                }
+                let norm: Vec<Value> = lines
+                    .iter()
+                    .map(|l| {
+                        json!({"title": l.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ').trim(), "detail": ""})
+                    })
+                    .collect();
+                return finish_steps(title, notes, norm);
+            }
+        }
         return Err(
-            "steps is required and must be a non-empty array of {{title, detail?}}".to_string(),
+            "steps is required: pass an array of {title, detail?} objects (a multi-line \
+             string also works, one step per line)"
+                .to_string(),
         );
     };
     if steps.is_empty() {
@@ -80,6 +103,22 @@ pub fn validate_plan_args(args: &Value) -> Result<Value, String> {
     }
     let mut norm_steps: Vec<Value> = Vec::with_capacity(steps.len());
     for (i, s) in steps.iter().enumerate() {
+        // 宽容形态:步骤项为字符串时视作 title(模型偶发字符串数组形态)
+        if let Some(st) = s.as_str() {
+            let st = st.trim();
+            if st.is_empty() {
+                problems.push(format!("steps[{}] is empty", i + 1));
+                continue;
+            }
+            if st.chars().count() > PLAN_MAX_STEP_TITLE_CHARS {
+                problems.push(format!(
+                    "steps[{}] exceeds {PLAN_MAX_STEP_TITLE_CHARS} chars",
+                    i + 1
+                ));
+            }
+            norm_steps.push(json!({"title": st, "detail": ""}));
+            continue;
+        }
         let st = s.get("title").and_then(|v| v.as_str()).unwrap_or("");
         if st.trim().is_empty() {
             problems.push(format!("steps[{}].title is required", i + 1));
@@ -103,9 +142,14 @@ pub fn validate_plan_args(args: &Value) -> Result<Value, String> {
     if !problems.is_empty() {
         return Err(format!("invalid plan: {}", problems.join("; ")));
     }
+    finish_steps(title, notes, norm_steps)
+}
+
+/// 组装规范化计划 JSON(校验通过后的单一出口)
+fn finish_steps(title: &str, notes: &str, steps: Vec<Value>) -> Result<Value, String> {
     Ok(json!({
         "title": title.trim(),
-        "steps": norm_steps,
+        "steps": steps,
         "notes": notes.trim(),
     }))
 }
@@ -181,6 +225,26 @@ mod tests {
             .map(|i| json!({"title": format!("s{i}")}))
             .collect();
         assert!(validate_plan_args(&json!({"steps": many})).is_err());
+    }
+
+    #[test]
+    fn lenient_step_forms_accepted() {
+        // 真机实证形态一:步骤项为字符串数组(视作 title)
+        let c1 = validate_plan_args(&json!({"steps": ["读文件", "改配置"]}))
+            .expect("string-array steps must be accepted");
+        assert_eq!(c1["steps"][0]["title"], "读文件");
+        assert_eq!(c1["steps"][1]["detail"], "");
+        // 真机实证形态二:steps 为多行字符串(按行拆步,容忍 "1. " 序号前缀)
+        let c2 = validate_plan_args(&json!({"steps": "1. 读文件\n2. 改配置\n"}))
+            .expect("multi-line string steps must be accepted");
+        assert_eq!(c2["steps"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(c2["steps"][0]["title"], "读文件");
+        assert_eq!(c2["steps"][1]["title"], "改配置");
+        // 字符串形态下 title 超限仍须拒(宽容不放过超限)
+        let big = "x".repeat(PLAN_MAX_TITLE_CHARS + 1);
+        assert!(validate_plan_args(&json!({"title": big, "steps": "a\nb"})).is_err());
+        // 彻底不是形态的仍拒
+        assert!(validate_plan_args(&json!({"steps": 42})).is_err());
     }
 
     #[tokio::test]
