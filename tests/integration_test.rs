@@ -382,6 +382,373 @@ async fn test_streaming_rewind_then_stable_without_resumed_work_fails_visibly() 
 }
 
 #[tokio::test]
+async fn test_timeout_error_resumes_by_resubmitting_call_external() {
+    // 长任务 I/O 超时续跑：引擎 pending I/O 超时（"I/O request FN timed out"）
+    // 会移除该请求的台账并消费掉原 call_external 命令——回退后引擎不会重发
+    // 已消费的命令，轮次死局。续跑通道 = runner 重发同一形态 call_external
+    // 命令，引擎重新评估后下发全新 request_id 的 IoRequest，轮次自动走完。
+    // 断言：rewind 被调 + call_external 命令重发（POST command 共两次）+
+    // 新 IoRequest 被执行（io_response 提交）+ 终态 success（不落 fail-visible）。
+    let mut server = Server::new_async().await;
+    let server_url = server.url();
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_body(r#"{"session_id": 890}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
+        .with_status(200)
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    let command_mock = server
+        .mock("POST", "/api/sessions/890/command")
+        .with_status(200)
+        .with_body(r#"{"success": true, "fact_id": 1}"#)
+        .expect(2)
+        .create_async()
+        .await;
+
+    // Error(超时) → 重发命令后引擎重新下发全新 IoRequest → Stable
+    let sse_events = "data: {\"type\":\"Error\",\"id\":9,\"message\":\"I/O request F23 timed out after 60s\"}\r\n\r\ndata: {\"type\":\"IoRequest\",\"io_type\":\"call_external\",\"id\":2,\"params\":{\"model\":\"gpt-4o-mini\",\"system_prompt\":\"You are a helpful assistant\",\"goal\":\"Do the task\",\"tool_names\":[]}}\r\n\r\ndata: {\"type\":\"Stable\",\"payload\":\"\"}\r\n\r\n";
+    server
+        .mock("GET", "/api/sessions/890/events")
+        .with_status(200)
+        .with_header("Content-Type", "text/event-stream")
+        .with_body(sse_events)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/890/facts")
+        .with_status(200)
+        .with_body(
+            json!([
+                {"version": 0, "id": 1, "path": "init", "value": "init", "type": "PayloadUpdate"},
+                {"version": 1, "id": 2, "path": "command", "value": "test", "type": "Command"}
+            ])
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let rewind_mock = server
+        .mock("GET", "/api/sessions/890/rewind?version=0")
+        .with_status(200)
+        .with_body(r#"{"version": 0, "payload": {}, "queue": []}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", "/api/sessions/890/io_response")
+        .with_status(200)
+        .with_body(r#"{"success": true, "message": "IoResponse submitted"}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/890/state")
+        .with_status(200)
+        .with_body(r#"{"payload": ""}"#)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server_url);
+    let config = AgentConfig::default();
+    let mut runner =
+        AgentRunner::new(config, client).with_llm_handler(LlmHandler::mock("resumed content"));
+
+    let result = runner.run("Do the task").await;
+
+    assert!(result.is_ok());
+    let result = result.unwrap();
+    rewind_mock.assert();
+    command_mock.assert();
+    assert!(
+        result.success,
+        "timeout-class error must resume the turn via command resubmission: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_timeout_error_resume_rejected_falls_back_fail_visible() {
+    // 回落：超时类 Error 触发续跑重发（200），但引擎无新工作（SSE 直达
+    // Stable）——续跑未产生效果不阻断事件循环，Stable 由既有 fail-visible
+    // 路径兜底（错误文案携带 rewind 上下文，与无续跑能力时逐字节同语义）。
+    let mut server = Server::new_async().await;
+    let server_url = server.url();
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_body(r#"{"session_id": 891}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
+        .with_status(200)
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    let command_mock = server
+        .mock("POST", "/api/sessions/891/command")
+        .with_status(200)
+        .with_body(r#"{"success": true, "fact_id": 1}"#)
+        .expect(2)
+        .create_async()
+        .await;
+
+    let sse_events = "data: {\"type\":\"Error\",\"id\":9,\"message\":\"I/O request F23 timed out after 60s\"}\r\n\r\ndata: {\"type\":\"Stable\",\"payload\":\"\"}\r\n\r\n";
+    server
+        .mock("GET", "/api/sessions/891/events")
+        .with_status(200)
+        .with_header("Content-Type", "text/event-stream")
+        .with_body(sse_events)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/891/facts")
+        .with_status(200)
+        .with_body(
+            json!([
+                {"version": 0, "id": 1, "path": "init", "value": "init", "type": "PayloadUpdate"},
+                {"version": 1, "id": 2, "path": "command", "value": "test", "type": "Command"}
+            ])
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let rewind_mock = server
+        .mock("GET", "/api/sessions/891/rewind?version=0")
+        .with_status(200)
+        .with_body(r#"{"version": 0, "payload": {}, "queue": []}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/891/state")
+        .with_status(200)
+        .with_body(r#"{"payload": ""}"#)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server_url);
+    let config = AgentConfig::default();
+    let mut runner = AgentRunner::new(config, client);
+
+    let result = runner.run("Do the task").await;
+
+    assert!(result.is_ok());
+    let result = result.unwrap();
+    rewind_mock.assert();
+    command_mock.assert();
+    assert!(
+        !result.success,
+        "resume rejected must fall back to fail-visible: {result:?}"
+    );
+    let err = result
+        .error
+        .expect("terminal error must carry rewind context");
+    assert!(
+        err.to_lowercase().contains("rewind"),
+        "error should mention the rewind context: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_streaming_timeout_error_resumes_by_resubmitting_call_external() {
+    // 流式路径同款续跑：Error(超时) → 重发 call_external → 新 IoRequest 执行 →
+    // Stable 正常收尾。终态 Done 必须 success（LLM mock 产出非空 content）。
+    let mut server = Server::new_async().await;
+    let server_url = server.url();
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_body(r#"{"session_id": 892}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
+        .with_status(200)
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    let command_mock = server
+        .mock("POST", "/api/sessions/892/command")
+        .with_status(200)
+        .with_body(r#"{"success": true, "fact_id": 1}"#)
+        .expect(2)
+        .create_async()
+        .await;
+
+    let sse_events = "data: {\"type\":\"Error\",\"id\":9,\"message\":\"I/O request F23 timed out after 60s\"}\r\n\r\ndata: {\"type\":\"IoRequest\",\"io_type\":\"call_external\",\"id\":2,\"params\":{\"model\":\"gpt-4o-mini\",\"system_prompt\":\"You are a helpful assistant\",\"goal\":\"Do the task\",\"tool_names\":[]}}\r\n\r\ndata: {\"type\":\"Stable\",\"payload\":\"\"}\r\n\r\n";
+    server
+        .mock("GET", "/api/sessions/892/events")
+        .with_status(200)
+        .with_header("Content-Type", "text/event-stream")
+        .with_body(sse_events)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/892/facts")
+        .with_status(200)
+        .with_body(
+            json!([
+                {"version": 0, "id": 1, "path": "init", "value": "init", "type": "PayloadUpdate"},
+                {"version": 1, "id": 2, "path": "command", "value": "test", "type": "Command"}
+            ])
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let rewind_mock = server
+        .mock("GET", "/api/sessions/892/rewind?version=0")
+        .with_status(200)
+        .with_body(r#"{"version": 0, "payload": {}, "queue": []}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", "/api/sessions/892/io_response")
+        .with_status(200)
+        .with_body(r#"{"success": true, "message": "IoResponse submitted"}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/892/state")
+        .with_status(200)
+        .with_body(r#"{"payload": ""}"#)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server_url);
+    let config = AgentConfig::default();
+    let runner =
+        AgentRunner::new(config, client).with_llm_handler(LlmHandler::mock("resumed content"));
+
+    use futures_util::StreamExt;
+    let mut stream = runner.run_streaming("Do the task".to_string(), Vec::new());
+    let mut terminal: Option<evo_agent::agent::runner::AgentResult> = None;
+    while let Some(item) = stream.next().await {
+        if let Ok(evo_agent::agent::runner::AgentEvent::Done(r)) = item {
+            terminal = Some(r);
+        }
+    }
+    let result = terminal.expect("stream must end with a Done event");
+    rewind_mock.assert();
+    command_mock.assert();
+    assert!(
+        result.success,
+        "streaming timeout-class error must resume the turn via command resubmission: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_streaming_timeout_error_resume_rejected_falls_back_fail_visible() {
+    // 流式回落：续跑重发成功但引擎无新工作（SSE 直达 Stable）→ 事件循环
+    // 不中断，Stable 由既有 fail-visible 路径收尾，错误文案携带 rewind 上下文。
+    let mut server = Server::new_async().await;
+    let server_url = server.url();
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_body(r#"{"session_id": 893}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
+        .with_status(200)
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    let command_mock = server
+        .mock("POST", "/api/sessions/893/command")
+        .with_status(200)
+        .with_body(r#"{"success": true, "fact_id": 1}"#)
+        .expect(2)
+        .create_async()
+        .await;
+
+    let sse_events = "data: {\"type\":\"Error\",\"id\":9,\"message\":\"I/O request F23 timed out after 60s\"}\r\n\r\ndata: {\"type\":\"Stable\",\"payload\":\"\"}\r\n\r\n";
+    server
+        .mock("GET", "/api/sessions/893/events")
+        .with_status(200)
+        .with_header("Content-Type", "text/event-stream")
+        .with_body(sse_events)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/893/facts")
+        .with_status(200)
+        .with_body(
+            json!([
+                {"version": 0, "id": 1, "path": "init", "value": "init", "type": "PayloadUpdate"},
+                {"version": 1, "id": 2, "path": "command", "value": "test", "type": "Command"}
+            ])
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let rewind_mock = server
+        .mock("GET", "/api/sessions/893/rewind?version=0")
+        .with_status(200)
+        .with_body(r#"{"version": 0, "payload": {}, "queue": []}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server_url);
+    let config = AgentConfig::default();
+    let runner = AgentRunner::new(config, client);
+
+    use futures_util::StreamExt;
+    let mut stream = runner.run_streaming("Do the task".to_string(), Vec::new());
+    let mut terminal: Option<evo_agent::agent::runner::AgentResult> = None;
+    while let Some(item) = stream.next().await {
+        if let Ok(evo_agent::agent::runner::AgentEvent::Done(r)) = item {
+            terminal = Some(r);
+        }
+    }
+    let result = terminal.expect("stream must end with a Done event");
+    rewind_mock.assert();
+    command_mock.assert();
+    assert!(
+        !result.success,
+        "streaming resume rejected must fall back to fail-visible: {result:?}"
+    );
+    let err = result
+        .error
+        .expect("terminal error must carry rewind context");
+    assert!(
+        err.to_lowercase().contains("rewind"),
+        "error should mention the rewind context: {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_auto_recall_no_shared_facts() {
     let mut server = Server::new_async().await;
     let server_url = server.url();

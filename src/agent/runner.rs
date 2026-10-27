@@ -3576,6 +3576,12 @@ impl AgentRunner {
                         .unwrap_or("unknown error");
                     let duration = start_time.elapsed().as_millis() as u64;
 
+                    // 长任务 I/O 超时续跑判定：仅超时/迟到响应类 Error 重发命令续跑
+                    // （引擎 pending I/O 超时移除台账并消费原命令，同 request_id 重提交
+                    // 会被拒绝）；其余类型 Error 维持既有 rewind+fail-visible 语义。
+                    let timeout_class = error_msg.contains("timed out")
+                        || error_msg.contains("unknown/stale request_id");
+
                     // H1:回退预算执法——连续 Error 超预算即熔断(rewind 不计步的
                     // 无界循环封顶;耗尽后落 Error 收尾,与 rewind 本身失败同路)
                     if let Ok(rewind_result) = self.auto_rewind(&session_id).await {
@@ -3586,6 +3592,34 @@ impl AgentRunner {
                             // 若回退后无任何工作直达 Stable，Stable 分支按 fail-visible 收尾。
                             rewound_awaiting_work = true;
                             last_rewind_version = Some(rewind_result);
+                            if timeout_class {
+                                // 续跑：重发 call_external 命令。system_prompt 已随首次
+                                // 持久化 move 进 messages，此处从缓冲消息提取。
+                                let resume_system_prompt = messages
+                                    .iter()
+                                    .find_map(|m| match m {
+                                        Message::System { content } => Some(content.clone()),
+                                        _ => None,
+                                    })
+                                    .unwrap_or_default();
+                                match self
+                                    .resubmit_call_external_for_resume(
+                                        &session_id,
+                                        &resume_system_prompt,
+                                        goal,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => info!(
+                                        %session_id,
+                                        "timeout-class error: call_external command resubmitted to resume the turn"
+                                    ),
+                                    Err(e) => warn!(
+                                        %session_id, error = %e,
+                                        "resume resubmit failed; falling back to fail-visible if no new work arrives"
+                                    ),
+                                }
+                            }
                             continue;
                         }
                         warn!(%session_id, remaining = 0,
@@ -6355,6 +6389,28 @@ impl AgentRunner {
         Ok(rewind_version)
     }
 
+    /// 超时类 Error 后续跑：重发 call_external 命令（非流式/流式共用）。
+    ///
+    /// 引擎 pending I/O 超时会移除该请求台账并消费掉原 call_external 命令，
+    /// 且 rewind 端点为只读快照（不改变引擎状态），回退后引擎不会重发已消费
+    /// 的命令——此处主动重发同一形态命令，引擎重新评估后下发全新 request_id
+    /// 的 IoRequest，轮次自动续跑。失败仅告警不阻断事件循环：后续 Stable 由
+    /// rewound_awaiting_work 的 fail-visible 路径兜底（与无续跑能力时同语义）。
+    async fn resubmit_call_external_for_resume(
+        &self,
+        session_id: &str,
+        system_prompt: &str,
+        goal: &str,
+    ) -> Result<(), AgentError> {
+        let command =
+            self.build_call_external_command(system_prompt, goal, self.openai_tools_payload());
+        self.evorule_client
+            .submit_command(session_id, &command)
+            .await?;
+        info!(%session_id, "call_external command resubmitted for turn resume");
+        Ok(())
+    }
+
     /// 悬挂工具处置计划(纯函数):定位历史尾部未配对的 assistant tool_calls。
     /// 判定:最后一个带非空 tool_calls 的 assistant 之后无任何 Tool 消息=
     /// 该批 calls 全部悬挂(按 L1 幂等分类路由);有 Tool 跟随=视作已配对
@@ -9113,6 +9169,11 @@ impl AgentRunner {
                                    }
                                    "Error" => {
                                        let msg = event.payload.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                                       // 长任务 I/O 超时续跑判定(非流式 run() 同款镜像)：
+                                       // 仅超时/迟到响应类 Error 重发命令续跑；其余类型
+                                       // Error 维持既有 rewind+fail-visible 语义。
+                                       let timeout_class = msg.contains("timed out")
+                                           || msg.contains("unknown/stale request_id");
                                        // 批 F 锚定：错误终态同样锚（终态锚覆盖 Stable/Error 两态）
                                        if let Some(j) = journal.as_ref() {
                                            if let Err(e) = crate::agent::journal_anchor::anchor_to_engine_chain(
@@ -9145,6 +9206,30 @@ impl AgentRunner {
                                                rewound_awaiting_work = true;
                                                last_rewind_version = Some(rewind_version);
                                                yield Ok(AgentEvent::Info(format!("Auto-rewind to version {}", rewind_version)));
+                                               if timeout_class {
+                                                   match runner
+                                                       .resubmit_call_external_for_resume(
+                                                           &session_id,
+                                                           &system_prompt,
+                                                           &goal,
+                                                       )
+                                                       .await
+                                                   {
+                                                       Ok(()) => {
+                                                           info!(
+                                                               %session_id,
+                                                               "timeout-class error: call_external command resubmitted to resume the turn"
+                                                           );
+                                                           yield Ok(AgentEvent::Info(
+                                                               "Resumed after timeout: call_external command resubmitted".to_string(),
+                                                           ));
+                                                       }
+                                                       Err(e) => warn!(
+                                                           %session_id, error = %e,
+                                                           "resume resubmit failed; falling back to fail-visible if no new work arrives"
+                                                       ),
+                                                   }
+                                               }
                                                continue;
                                            }
                                            tracing::warn!(session_id = %session_id, remaining = 0,
