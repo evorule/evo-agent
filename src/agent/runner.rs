@@ -8394,10 +8394,17 @@ impl AgentRunner {
                                                            yield Err(e);
                                                            return;
                                                        }
-                                                       // ToolResult 事件(审批留痕内嵌)
+                                                       // ToolResult 事件(审批留痕内嵌)。
+                                                       // 帧面截断(交互批真机发现):事件此前带原始全文,
+                                                       // 大结果(grep 命中 89MB)直发前端=WS 帧爆炸/浏览器
+                                                       // 卡死;与回喂 LLM 同款上限截断+标记,全文仍随
+                                                       // journal 持久化(审计面不变)
                                                        let mut result_value = serde_json::json!({
                                                            "tool_name": tc.name,
-                                                           "result": outcome.final_result.to_string(),
+                                                           "result": truncate_tool_result(
+                                                               outcome.final_result.to_string(),
+                                                               runner.tool_result_max_chars,
+                                                           ),
                                                        });
                                                        if let Some(record) = outcome.approval_record {
                                                            result_value["approval"] = record;
@@ -8406,39 +8413,46 @@ impl AgentRunner {
                                                            name: tc.name.clone(),
                                                            result: result_value,
                                                        });
-                                                       // 计划模式:plan_submit 成功即收束回合(交互批)。
+                                                       // 计划模式:plan_submit 校验通过即收束回合(交互批)。
                                                        // 推 PlanSubmitted 帧后按收场序(turn_guard/flush/
                                                        // traces)以 success Done 收场——计划文本已随
                                                        // tool_invoked/tool_result 入账,批准记录随后续
-                                                       // 用户消息入账;重开会话历史可见(批账即持久化)
+                                                       // 用户消息入账;重开会话历史可见(批账即持久化)。
+                                                       // 校验失败(真机实证:模型偶发 steps 字符串形态
+                                                       // 且超出宽容面)不收束——错误已按普通工具结果
+                                                       // 回喂,LLM 下一轮自行修正形态重提
                                                        if runner.plan_mode
                                                            && tc.name
                                                                == crate::builtin_tools::plan_submit::PLAN_SUBMIT_TOOL
                                                        {
-                                                           let canonical = crate::builtin_tools::plan_submit::validate_plan_args(&tc.arguments).ok();
-                                                           let plan_id = canonical
-                                                               .as_ref()
-                                                               .map(crate::builtin_tools::plan_submit::plan_id_for)
-                                                               .unwrap_or_default();
-                                                           yield Ok(AgentEvent::PlanSubmitted {
-                                                               plan_id,
-                                                               plan: canonical.unwrap_or(serde_json::json!({})),
-                                                           });
-                                                           let duration = start_time.elapsed().as_millis() as u64;
-                                                           if let Some(g) = turn_guard.take() {
-                                                               g.end("plan_submitted", step_count as u64, duration);
+                                                           if let Ok(canonical) =
+                                                               crate::builtin_tools::plan_submit::validate_plan_args(&tc.arguments)
+                                                           {
+                                                               let plan_id =
+                                                                   crate::builtin_tools::plan_submit::plan_id_for(&canonical);
+                                                               yield Ok(AgentEvent::PlanSubmitted {
+                                                                   plan_id,
+                                                                   plan: canonical,
+                                                               });
+                                                               let duration =
+                                                                   start_time.elapsed().as_millis() as u64;
+                                                               if let Some(g) = turn_guard.take() {
+                                                                   g.end("plan_submitted", step_count as u64, duration);
+                                                               }
+                                                               if let Err(e) =
+                                                                   runner.flush_messages(&session_id).await
+                                                               {
+                                                                   tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                               }
+                                                               runner.submit_tool_traces(&session_id).await;
+                                                               yield Ok(AgentEvent::Done(AgentResult::success(
+                                                                   "计划已提交,等待用户批准或拒绝。".to_string(),
+                                                                   step_count,
+                                                                   duration,
+                                                                   tool_calls.clone(),
+                                                               )));
+                                                               return;
                                                            }
-                                                           if let Err(e) = runner.flush_messages(&session_id).await {
-                                                               tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
-                                                           }
-                                                           runner.submit_tool_traces(&session_id).await;
-                                                           yield Ok(AgentEvent::Done(AgentResult::success(
-                                                               "计划已提交,等待用户批准或拒绝。".to_string(),
-                                                               step_count,
-                                                               duration,
-                                                               tool_calls.clone(),
-                                                           )));
-                                                           return;
                                                        }
                                                    }
                                                    // M3 自验证门禁:轮末回喂前执行 pending verify(一轮 N 写
@@ -8897,9 +8911,13 @@ impl AgentRunner {
 
                                                // 4. yield ToolResult + 提交 io_response(格式同 handle_call_service)
                                                // 本轮发生过审批时,把审批留痕内嵌进 result(不扩 Fact 枚举)
+                                               // 帧面截断(同本地 ReAct 臂:大结果与回喂同上限,全文留 journal)
                                                let mut result_value = serde_json::json!({
                                                    "tool_name": tool_name,
-                                                   "result": final_result.to_string(),
+                                                   "result": truncate_tool_result(
+                                                       final_result.to_string(),
+                                                       runner.tool_result_max_chars,
+                                                   ),
                                                });
                                                if let Some(record) = outcome.approval_record {
                                                    result_value["approval"] = record;
