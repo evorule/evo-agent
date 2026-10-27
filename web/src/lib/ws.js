@@ -260,10 +260,14 @@ export async function sendMessage(content, mentions = [], opts = {}) {
   turnActive.set(true);
   // S3:对话模式 wire-only 提示块(气泡仍显示原文;仅强化先确认后变更的
   // man-in-loop 姿态,不触碰审批链语义)
+  // 计划模式(交互批):wire-only 引导 + 结构化 mode 字段上行——服务端
+  // 据此收窄本回合工具面(只读族+plan_submit),plan_submit 提交即收束
   const modeHint =
     opts.mode === 'chat'
       ? '<mode>chat</mode>\n<mode-note>用户当前为对话模式:本条为咨询问答,仅分析/解释/给建议,不要执行文件修改、命令执行等变更性操作;若判断确需变更,先给出方案并等待用户确认。</mode-note>'
-      : '';
+      : opts.mode === 'plan'
+        ? '<mode>plan</mode>\n<mode-note>用户当前为计划模式:请先用只读探查工具(file_read/file_list/search_files/grep_files/code_search)了解现状,形成结构化执行计划后调用 plan_submit 提交(steps 数组,每步 title 必填、detail 建议写明改动点与涉及文件)。只读探查与 plan_submit 之外的工具调用会被拒绝。plan_submit 成功后本回合自动收束,等待用户批准或拒绝;不要在批准前执行任何变更。</mode-note>'
+        : '';
   // S4:附件块(wire-only,气泡不渲染)——路径引用形态,agent 以文件工具读取;
   // 名称/路径均经服务端净化与时间戳命名,无 XML 注入面。
   // S4-b:图片类附件随消息多模态上行(images 旁路,服务端沙箱校验+魔数复检);
@@ -291,11 +295,18 @@ export async function sendMessage(content, mentions = [], opts = {}) {
     ? `<skill-activate name="${opts.skill.name}" path="${opts.skill.path}">\n<note>用户为本会话启用了上述技能:先用文件读取工具完整读取该 SKILL.md,再按其纪律执行本条消息及后续任务,直至用户明示停用或更换技能。</note>\n</skill-activate>`
     : '';
   // wire 正文 = [重建回注块] + [模式提示块] + [技能激活块] + 正文 + [附件块] + [@上下文 XML];气泡显示仍为原文
-  const wireContent = `${rebuildBlock ? `${rebuildBlock}\n\n` : ''}${modeHint ? `${modeHint}\n\n` : ''}${skillBlock ? `${skillBlock}\n\n` : ''}${content}${attachBlock ? `\n\n${attachBlock}` : ''}${xml ? `\n\n${xml}` : ''}`;
+  // opts.wireBlock(交互批 计划卡批准/拒绝):决策注记块 wire-only 前插,
+  // 气泡仍显示短决策文本
+  const decisionBlock =
+    typeof opts.wireBlock === 'string' && opts.wireBlock ? `${opts.wireBlock}\n\n` : '';
+  const wireContent = `${rebuildBlock ? `${rebuildBlock}\n\n` : ''}${decisionBlock}${modeHint ? `${modeHint}\n\n` : ''}${skillBlock ? `${skillBlock}\n\n` : ''}${content}${attachBlock ? `\n\n${attachBlock}` : ''}${xml ? `\n\n${xml}` : ''}`;
   ws.send(
     JSON.stringify({
       type: 'message',
       content: wireContent,
+      // 计划模式:结构化 mode 字段随帧上行(服务端按此收窄工具面;
+      // build/chat 不带字段,服务端零变化)
+      ...(opts.mode === 'plan' ? { mode: 'plan' } : {}),
       ...(images.length > 0 ? { images } : {}),
     })
   );
@@ -647,6 +658,34 @@ function handleFrame(f) {
         level: f.answered ? 'ok' : 'warn',
       });
       break;
+    case 'PlanSubmitted': {
+      // 交互批 计划模式:agent 提交计划 → 计划卡(批准/拒绝两键,首批
+      // 不做在线改计划);回合已由服务端收束,卡片按钮在回合空闲时可用
+      const plan = f.plan && typeof f.plan === 'object' ? f.plan : {};
+      const steps = Array.isArray(plan.steps)
+        ? plan.steps
+            .map((s) => ({
+              title: String(s?.title ?? '').slice(0, 400),
+              detail: String(s?.detail ?? ''),
+            }))
+            .filter((s) => s.title)
+        : [];
+      pushMessage({
+        kind: 'plan_card',
+        planId: String(f.plan_id || ''),
+        planTitle: String(plan.title || ''),
+        steps,
+        notes: String(plan.notes || ''),
+        decision: null, // null | 'approved' | 'rejected'
+      });
+      pushPanelEvent('gov', {
+        label: 'PlanSubmitted',
+        detail: `计划已提交(${steps.length} 步),等待批准`,
+        level: 'info',
+      });
+      pushNotification('info', 'Agent 提交了执行计划', `共 ${steps.length} 步,等待你的批准`);
+      break;
+    }
     default:
       break;
   }

@@ -96,8 +96,9 @@ struct Cli {
 enum Command {
     /// 跑 agent(给一个 goal)
     Run {
-        /// 任务描述(给 agent 的指令)
-        goal: String,
+        /// 任务描述(给 agent 的指令);--init 时可省略
+        #[arg(required_unless_present = "init")]
+        goal: Option<String>,
 
         /// agent 类型(对应 `agents/<name>.json`)。不指定则用 config.agents.default
         #[arg(long, short = 'a')]
@@ -110,6 +111,11 @@ enum Command {
         /// G4:流式输出(token-by-token,实时显示 LLM 输出)
         #[arg(long)]
         stream: bool,
+
+        /// 39 号项 A:生成项目 AGENTS.md 骨架到 {workdir}/AGENTS.md
+        /// (扫描顶层结构+空节模板);已存在则拒绝覆盖,不带 goal 也可运行
+        #[arg(long)]
+        init: bool,
     },
 
     /// 列出所有可用的 agent 类型
@@ -386,15 +392,25 @@ fn main() -> ExitCode {
             agent,
             auto_approve_candidates,
             stream,
-        } => run_with_big_stack(move || {
-            cmd_run(
-                &cli.workdir,
-                &goal,
-                agent.as_deref(),
-                auto_approve_candidates,
-                stream,
-            )
-        }),
+            init,
+        } => {
+            if init {
+                return cmd_agents_init(&cli.workdir);
+            }
+            let Some(goal) = goal else {
+                eprintln!("error: goal is required (or use --init)");
+                return ExitCode::from(2);
+            };
+            run_with_big_stack(move || {
+                cmd_run(
+                    &cli.workdir,
+                    &goal,
+                    agent.as_deref(),
+                    auto_approve_candidates,
+                    stream,
+                )
+            })
+        }
         Command::List { dir } => cmd_list(&cli.workdir, dir.as_deref()),
         Command::Tools { action } => cmd_tools(&cli.workdir, action),
         Command::Validate { agent } => cmd_validate(&cli.workdir, &agent),
@@ -509,6 +525,82 @@ fn init_logging(verbose: bool) {
         .with_target(false)
         .with_writer(evo_agent::api::log_buffer::LogTee)
         .try_init();
+}
+
+// =============================================================================
+// run --init —— 生成项目 AGENTS.md 骨架
+// =============================================================================
+
+/// 39 号项 A:扫描 workdir 顶层结构,生成 AGENTS.md 骨架(空节模板+目录清单)。
+/// 已存在则拒绝覆盖(防抹掉用户既有记忆);写入路径打印到 stdout。
+fn cmd_agents_init(workdir: &Path) -> ExitCode {
+    let target = workdir.join("AGENTS.md");
+    if target.exists() {
+        eprintln!(
+            "refusing to overwrite existing {} (edit it directly)",
+            target.display()
+        );
+        return ExitCode::from(1);
+    }
+    // 顶层条目清单(目录带 / 后缀;跳过明显的基础设施噪声;上限 40 行防膨胀)
+    let mut entries: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(workdir) {
+        let mut names: Vec<(String, bool)> = rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') || name == "node_modules" || name == "target" {
+                    return None;
+                }
+                let is_dir = e.file_type().ok()?.is_dir();
+                Some((name, is_dir))
+            })
+            .collect();
+        names.sort();
+        for (name, is_dir) in names.into_iter().take(40) {
+            entries.push(if is_dir { format!("{name}/") } else { name });
+        }
+    }
+    let listing = if entries.is_empty() {
+        "(空目录)".to_string()
+    } else {
+        entries.join("\n")
+    };
+    let skeleton = format!(
+        r"# 项目记忆(AGENTS.md)
+
+本文件由 `evo-agent run --init` 生成,是本项目的长期记忆与会话入场须知;
+每次会话开始时会注入 agent 的 system prompt。请按需增删小节,删除括号内提示再填写。
+
+## 项目概览
+
+(一句话:这个项目是什么、给谁用、当前阶段)
+
+## 目录结构(自动扫描,可手工修订)
+
+```
+{listing}
+```
+
+## 构建与测试
+
+(常用命令清单,例如 build/test/lint/运行方式)
+
+## 代码风格与约定
+
+(命名、分支、提交信息、注释语言等项目特有约定)
+
+## 注意事项
+
+(易错点、禁止事项、外部依赖的已知坑)
+"
+    );
+    if let Err(e) = std::fs::write(&target, skeleton) {
+        eprintln!("failed to write {}: {e}", target.display());
+        return ExitCode::from(1);
+    }
+    println!("AGENTS.md skeleton written to {}", target.display());
+    ExitCode::SUCCESS
 }
 
 // =============================================================================
@@ -1593,6 +1685,11 @@ fn cmd_run_streaming(
                     // LLM 增量文本 → stdout(不换行,实时显示)
                     print!("{}", text);
                     let _ = std::io::stdout().flush();
+                }
+                Ok(AgentEvent::PlanSubmitted { plan_id, plan }) => {
+                    eprintln!("[plan submitted: {} ({} step(s)); awaiting user approval]",
+                        plan_id,
+                        plan.get("steps").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0));
                 }
                 Ok(AgentEvent::LlmThinkingDelta { text }) => {
                     // 思考增量 → stderr 淡色直出(与正文 stdout 分流,终端可见)
@@ -3386,6 +3483,11 @@ fn run_repl_turn(
                 Ok(AgentEvent::LlmDelta { text }) => {
                     print!("{}", text);
                     let _ = std::io::stdout().flush();
+                }
+                Ok(AgentEvent::PlanSubmitted { plan_id, plan }) => {
+                    eprintln!("[plan submitted: {} ({} step(s)); awaiting user approval]",
+                        plan_id,
+                        plan.get("steps").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0));
                 }
                 Ok(AgentEvent::LlmThinkingDelta { text }) => {
                     // 思考增量 → stderr 淡色直出(与正文 stdout 分流,终端可见)

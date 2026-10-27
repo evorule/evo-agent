@@ -239,6 +239,9 @@ impl EventCallback for LoggingCallback {
             AgentEvent::Info(msg) => {
                 tracing::info!(%msg, "callback: info");
             }
+            AgentEvent::PlanSubmitted { plan_id, plan } => {
+                tracing::info!(%plan_id, steps = plan.get("steps").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0), "callback: plan submitted");
+            }
             AgentEvent::Error(err) => {
                 tracing::error!(error = %err, "callback: error");
             }
@@ -365,6 +368,7 @@ mod tests {
                 AgentEvent::Done(_) => "done".to_string(),
                 AgentEvent::Error(_) => "error".to_string(),
                 AgentEvent::Info(_) => "info".to_string(),
+                AgentEvent::PlanSubmitted { plan_id, .. } => format!("plan_submitted:{}", plan_id),
                 AgentEvent::ApprovalRequired { .. } => "approval_required".to_string(),
                 AgentEvent::ApprovalResult { .. } => "approval_result".to_string(),
                 AgentEvent::AskUser { question_id, .. } => format!("ask_user:{}", question_id),

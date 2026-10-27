@@ -160,10 +160,14 @@
     el.style.height = `${Math.min(el.scrollHeight, DRAFT_MAX_H)}px`;
   });
 
-  // ---- S3 构建/对话模式(前端姿态+提示语;审批链语义不动) ----
-  // 构建=默认,agent 执行任务;对话=仅问答咨询,wire 附提示块引导先确认后变更。
+  // ---- S3 构建/计划/对话模式(前端姿态+提示语;审批链语义不动) ----
+  // 构建=默认,agent 执行任务;计划(交互批)=agent 只读探查后经 plan_submit
+  // 提交计划,批准后按计划执行;对话=仅问答咨询,提示块引导先确认后变更。
   const MODE_KEY = 'evo_chat_mode';
-  let chatMode = $state(localStorage.getItem(MODE_KEY) === 'chat' ? 'chat' : 'build');
+  const MODES = ['build', 'plan', 'chat'];
+  let chatMode = $state(
+    MODES.includes(localStorage.getItem(MODE_KEY)) ? localStorage.getItem(MODE_KEY) : 'build',
+  );
 
   function setMode(m) {
     if ($turnActive || chatMode === m) return;
@@ -1062,6 +1066,41 @@
     else sel.add(opt);
     updateMessage(m.id, { draftSel: [...sel] });
   }
+
+  // ---- 计划卡决策(交互批 计划模式):批准=build 模式按计划执行;
+  // 拒绝=留在计划模式,agent 重新探查并提交修订计划。决策注记走
+  // opts.wireBlock(wire-only,气泡显示短决策文本) ----
+  function decidePlan(m, approved) {
+    if (m.decision || $turnActive) return;
+    updateMessage(m.id, { decision: approved ? 'approved' : 'rejected' });
+    if (approved) {
+      const stepsText = (m.steps || [])
+        .map((s, i) => `${i + 1}. ${s.title}${s.detail ? ` — ${s.detail}` : ''}`)
+        .join('\n');
+      setMode('build');
+      sendMessage(
+        '[已批准计划,请按计划执行]',
+        [],
+        {
+          mode: 'build',
+          wireBlock:
+            `<plan-approved id="${m.planId || ''}">\n<plan-title>${m.planTitle || ''}</plan-title>\n<steps>\n${stepsText}\n</steps>` +
+            (m.notes ? `\n<notes>${m.notes}</notes>` : '') +
+            '\n<note>用户已批准上述计划:请严格按步骤顺序执行;执行中如确需偏离计划,先说明原因再继续。</note>\n</plan-approved>',
+        },
+      );
+    } else {
+      sendMessage(
+        '[已拒绝该计划,请修订后重新提交]',
+        [],
+        {
+          mode: 'plan',
+          wireBlock:
+            `<plan-rejected id="${m.planId || ''}">\n<note>用户拒绝了当前计划:请重新只读探查(如需)并提交修订后的计划(仍走 plan_submit);不要在未获批准前执行任何变更。</note>\n</plan-rejected>`,
+        },
+      );
+    }
+  }
 </script>
 
 <aside class="chat" class:history-open={showHistory} data-zone="chat" style:width={`${$chatWidth}px`}>
@@ -1468,6 +1507,39 @@
             <div class="ap-err">{m.errText}</div>
           {/if}
         </div>
+      {:else if m.kind === 'plan_card'}
+        <div class="plan-card">
+          <div class="ap-head">执行计划 · 等待批准{m.planTitle ? ` · ${m.planTitle}` : ''}</div>
+          <ol class="plan-steps">
+            {#each m.steps as s}
+              <li>
+                <span class="plan-step-title">{s.title}</span>
+                {#if s.detail}<span class="plan-step-detail">{s.detail}</span>{/if}
+              </li>
+            {/each}
+          </ol>
+          {#if m.notes}<div class="plan-notes">备注:{m.notes}</div>{/if}
+          {#if m.decision === 'approved'}
+            <div class="ap-ok">已批准,agent 按计划执行(已切回构建模式)</div>
+          {:else if m.decision === 'rejected'}
+            <div class="ap-err">已拒绝,agent 将重新探查并提交修订计划</div>
+          {:else}
+            <div class="ap-actions">
+              <button
+                class="ap-btn approve"
+                disabled={$turnActive}
+                onclick={() => decidePlan(m, true)}
+                title="批准后 agent 按此计划执行"
+              >批准执行</button>
+              <button
+                class="ap-btn reject"
+                disabled={$turnActive}
+                onclick={() => decidePlan(m, false)}
+                title="拒绝后 agent 重新探查并提交修订计划"
+              >拒绝</button>
+            </div>
+          {/if}
+        </div>
       {/if}
     {/snippet}
 
@@ -1589,7 +1661,9 @@
         ? 'agent 执行中…(可中断)'
         : chatMode === 'chat'
           ? '对话模式:提问与讨论,Enter 发送'
-          : '输入任务,@ 引用文件/上下文,Enter 发送'}
+          : chatMode === 'plan'
+            ? '计划模式:描述目标,agent 只读探查后出计划待你批准'
+            : '输入任务,@ 引用文件/上下文,Enter 发送'}
       bind:value={draft}
       bind:this={draftEl}
       oninput={onInput}
@@ -1609,6 +1683,14 @@
             title="构建模式:agent 执行任务(默认)"
           >
             构建
+          </button>
+          <button
+            class:active={chatMode === 'plan'}
+            onclick={() => setMode('plan')}
+            disabled={$turnActive}
+            title="计划模式:agent 只读探查后提交计划,批准后才执行(适合大改动前先看方案)"
+          >
+            计划
           </button>
           <button
             class:active={chatMode === 'chat'}
@@ -2672,6 +2754,40 @@
     background: var(--bg-page);
     padding: var(--sp-sm);
     font-size: var(--fs-xs);
+  }
+  /* 交互批 计划模式计划卡(形态同构问答卡;步骤列表+批准/拒绝两键) */
+  .plan-card {
+    border: 1px solid var(--brand);
+    border-radius: var(--r-md);
+    background: var(--bg-page);
+    padding: var(--sp-sm);
+    font-size: var(--fs-xs);
+  }
+  .plan-card .ap-head {
+    color: var(--brand);
+  }
+  .plan-steps {
+    margin: var(--sp-xs) 0;
+    padding-left: 1.4em;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2xs, 2px);
+    color: var(--text-primary);
+  }
+  .plan-step-title {
+    font-weight: var(--fw-med);
+  }
+  .plan-step-detail {
+    display: block;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .plan-notes {
+    margin-bottom: var(--sp-xs);
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
   }
   .ask-card .ap-head {
     color: var(--brand);

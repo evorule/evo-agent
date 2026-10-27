@@ -100,6 +100,11 @@ enum ClientMessage {
         /// 零行为变化,服务端沙箱校验+魔数复检,越界 fail-soft 丢弃)
         #[serde(default)]
         images: Vec<UserImageRef>,
+        /// 交互批 计划模式:Some("plan")=本回合工具面收窄为只读族+
+        /// plan_submit(LLM 提交计划即收束回合);缺省/其他值=零变化
+        /// (对话模式的软引导仍走 wire 提示块,不进此字段)
+        #[serde(default)]
+        mode: Option<String>,
     },
     /// 中断当前正在执行的轮次(cancel runner)
     Interrupt,
@@ -259,7 +264,7 @@ async fn handle_ws(
                        match msg {
                            Some(Ok(WsMessage::Text(text))) => {
                                match serde_json::from_str::<ClientMessage>(&text) {
-                                   Ok(ClientMessage::Message { content, images }) => {
+                                   Ok(ClientMessage::Message { content, images, mode }) => {
                                        if turn_active {
                                            if let Err(e) = send_ws_json(
                                                &mut sender,
@@ -273,6 +278,9 @@ async fn handle_ws(
                                            continue;
                                        }
                                        // 构造 fresh AgentRunner(run_streaming/run_continuation 消费 self)
+                                       // 交互批 计划模式:mode=plan 时本回合工具闸收窄(回合级,
+                                       // 随 fresh runner 天然单回合)
+                                       let plan_mode = mode.as_deref() == Some("plan");
                                        let runner = match construct_runner(&state, &agent_type, workspace.as_deref()).await {
                                            Some(r) => r,
                                            None => {
@@ -285,7 +293,8 @@ async fn handle_ws(
                                                ).await;
                                                continue;
                                            }
-                                       };
+                                       }
+                                       .with_plan_mode(plan_mode);
                                        // 提取 cancel token(interrupt 用)
                                        let cancel = runner.cancel_token().clone();
                                        current_cancel = Some(cancel);
@@ -889,6 +898,8 @@ async fn construct_runner(
     let (approval_callback, runaway_policy) =
         build_approval_callback(state, resolved_mode.as_deref());
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
+        // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
+        .with_agents_md_segment(crate::agent::runner::load_agents_md_segment(state.workdir()))
         // M5-a:注入生效能力边界(声明重绑工具面 + 会话边界段/边界事实)
         .with_capability_boundary(capability_boundary)
         // 挂 filtered toolkit(同 HTTP 端点口径,见 run_agent)
@@ -1082,6 +1093,11 @@ fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json::Val
             "type": "Error",
             "error": err.to_string(),
         }),
+        Ok(AgentEvent::PlanSubmitted { plan_id, plan }) => serde_json::json!({
+            "type": "PlanSubmitted",
+            "plan_id": plan_id,
+            "plan": plan,
+        }),
         Ok(AgentEvent::Info(msg)) => serde_json::json!({
             "type": "Info",
             "message": msg,
@@ -1223,9 +1239,10 @@ mod tests {
         let msg: ClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             // S4-b:images 缺省反序列化为空(无图消息零行为变化)
-            ClientMessage::Message { content, images } => {
+            ClientMessage::Message { content, images, mode } => {
                 assert_eq!(content, "hello");
                 assert!(images.is_empty());
+                assert!(mode.is_none());
             }
             _ => panic!("expected Message variant"),
         }
@@ -1238,7 +1255,7 @@ mod tests {
             {"path":".evo-agent/uploads/20261020-a.png","mime_type":"image/png"}]}"#;
         let msg: ClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            ClientMessage::Message { content, images } => {
+            ClientMessage::Message { content, images, .. } => {
                 assert_eq!(content, "look");
                 assert_eq!(images.len(), 1);
                 assert_eq!(images[0].path, ".evo-agent/uploads/20261020-a.png");

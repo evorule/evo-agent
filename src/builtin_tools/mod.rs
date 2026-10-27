@@ -63,6 +63,7 @@ pub mod file_write;
 pub mod fs_safety;
 pub mod git_tools;
 pub mod grep_files;
+pub mod plan_submit;
 pub mod http_get;
 pub mod http_request;
 pub mod image_load;
@@ -319,6 +320,13 @@ pub fn default_safe_toolkit_with_profile(
     handler.register_static(
         crate::builtin_tools::ask_user::ASK_USER_TOOL,
         Arc::new(crate::builtin_tools::ask_user::AskUserTool::new()),
+    );
+    // plan_submit 计划提交（交互批 计划模式）：纯申报型无状态工具，
+    // 计划模式回合内经 runner 识别收束;非计划模式下调用同样合法
+    // （agent 主动提案,前端同样出计划卡,批准后照计划执行）
+    handler.register_static(
+        crate::builtin_tools::plan_submit::PLAN_SUBMIT_TOOL,
+        Arc::new(crate::builtin_tools::plan_submit::PlanSubmitTool::new()),
     );
     handler
 }
@@ -1387,6 +1395,41 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     name: "timeout_secs".to_string(),
                     r#type: "integer".to_string(),
                     description: "Wait limit in seconds, 60-600 clamped (default 300)"
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        ToolSpec {
+            name: "plan_submit".to_string(),
+            description: "Submit a structured execution plan for the user to review and \
+                          approve. Use this in plan mode (and whenever you want explicit \
+                          sign-off before multi-step work): explore read-only first, then \
+                          submit 1-30 concise steps. After submitting, end your turn — \
+                          the turn closes automatically and the user will approve or \
+                          reject the plan; do not start executing the plan before approval."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "steps".to_string(),
+                    r#type: "array".to_string(),
+                    description: "Ordered plan steps; each item is an object with a \
+                                  required `title` (≤200 chars) and optional `detail` \
+                                  (≤2000 chars, what/how/files touched)"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "title".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Overall plan title (≤300 chars)".to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "notes".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Risks, trade-offs, or open questions for the reviewer \
+                                  (≤2000 chars)"
                         .to_string(),
                     required: false,
                 },

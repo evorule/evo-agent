@@ -833,6 +833,14 @@ pub enum AgentEvent {
         /// 结束原因(stop / end_turn / tool_calls 等)
         finish_reason: Option<String>,
     },
+    /// 计划模式:agent 经 plan_submit 提交计划(交互批)——回合随即收束,
+    /// 前端渲染计划卡(批准/拒绝)
+    PlanSubmitted {
+        /// 确定性计划 id(规范化计划 JSON 的 BLAKE3 前 12 hex)
+        plan_id: String,
+        /// 规范化计划 JSON({title,steps:[{title,detail}],notes})
+        plan: serde_json::Value,
+    },
     /// 整个任务完成
     Done(AgentResult),
     /// 错误(可能可恢复,看 caller 决定是否中断)
@@ -1121,6 +1129,12 @@ fn context_signal_line(used: usize, budget: usize, window: usize, step: usize) -
 
 /// TODO: doc
 pub struct AgentRunner {
+    /// 项目记忆段(AGENTS.md 层级注入;启动/构造时算好,组装期追加到 system prompt 尾段)
+    agents_md_segment: Option<String>,
+    /// 计划模式闸(交互批):true=本回合工具面收窄为只读族+plan_submit,
+    /// plan_submit 执行成功即收束回合推 PlanSubmitted。serve 面每条消息
+    /// 重建 runner,随构造传入=天然回合级;CLI 面恒 false 零影响
+    plan_mode: bool,
     config: AgentConfig,
     evorule_client: EvoruleApiClient,
     llm_handler: LlmHandler,
@@ -1408,6 +1422,8 @@ impl AgentRunner {
             config,
             evorule_client,
             llm_handler: LlmHandler::with_defaults(),
+            agents_md_segment: None,
+            plan_mode: false,
             tool_handler: ToolHandler::new(),
             memory: None,
             delegate_context: None,
@@ -2169,6 +2185,27 @@ impl AgentRunner {
             ));
         }
         self
+    }
+
+    /// 39 号项 A:注入项目记忆段(AGENTS.md 层级,构造方按 workdir/用户级
+    /// 解析后传入;None=无项目记忆,组装零变化)
+    pub fn with_agents_md_segment(mut self, segment: Option<String>) -> Self {
+        self.agents_md_segment = segment;
+        self
+    }
+
+    /// 计划模式闸(交互批):本回合工具面收窄为只读族+plan_submit;
+    /// LLM 对收窄外的工具调用收到引导性拒答(可自适应改路),plan_submit
+    /// 成功即收束回合。false(缺省)=零变化
+    pub fn with_plan_mode(mut self, enabled: bool) -> Self {
+        self.plan_mode = enabled;
+        self
+    }
+
+    /// 计划模式工具闸:收窄外工具返回拒答文案(工具结果形态回喂,LLM 可
+    /// 自适应改路);收窄内返回 None。委托自由函数(单测可直测)
+    fn plan_mode_blocked(&self, tool_name: &str) -> Option<String> {
+        plan_mode_allowlist_blocked(self.plan_mode, tool_name)
     }
 
     /// 注入会话执行环境 profile 标记(workbench|sandbox-trusted)。
@@ -3090,7 +3127,7 @@ impl AgentRunner {
             }
             _ => None,
         };
-        let system_prompt = self
+        let mut system_prompt = self
             .assembly
             .assemble(
                 &self.config.system_prompt,
@@ -3108,6 +3145,15 @@ impl AgentRunner {
                 self.todo_summary_segment().as_deref(),
             )
             .map_err(AgentError::Internal)?;
+        // 39 号项 A:项目记忆段(AGENTS.md 层级)追加到 system prompt 尾段
+        if let Some(seg) = &self.agents_md_segment {
+            system_prompt.push_str(
+                "
+
+",
+            );
+            system_prompt.push_str(seg);
+        }
 
         // 建会话前 IO 形状契约协商——404/连不通=旧 server warn
         // 通过;端点在但版本不匹配=hard fail(未验证升级行为宁停不错)。
@@ -4097,6 +4143,8 @@ impl AgentRunner {
                 evorule_client: evorule_client.clone(),
                 llm_handler: llm_handler.clone(),
                 tool_handler: tool_handler.clone(),
+                agents_md_segment: None,
+                plan_mode: false,
                 memory: memory.clone(),
                 delegate_context: delegate_context.clone(),
                 session_id: Some(child_sid.to_string()),
@@ -5375,6 +5423,20 @@ impl AgentRunner {
         // B22-C T1:流式面工具完成事件的计时起点(缓存命中臂经 gated 收口
         // 自计时,不消费本起点)
         let started = std::time::Instant::now();
+        // 计划模式闸(交互批):本咽喉为本地 ReAct 与 call_service 两路唯一
+        // 汇入点,闸置于此单点覆盖双路。收窄外工具不进管道不审批,引导性
+        // 拒答按普通工具结局回喂(LLM 可自适应改路;非 Err,不终止回合)
+        if let Some(blocked) = self.plan_mode_blocked(tool_name) {
+            info!(%session_id, tool = %tool_name, "plan mode: tool blocked by allowlist, guidance fed back");
+            return Ok(ToolExecStage::Done(ToolExecOutcome {
+                final_result: serde_json::json!({
+                    "tool_name": tool_name,
+                    "result": blocked,
+                }),
+                approval_record: None,
+                approval_flow: None,
+            }));
+        }
         // G13:并行缓存命中(如果 call_external 已并行执行过此 active 工具,
         // 直接返回缓存结果,跳过重复执行 + 审批;candidate 工具不缓存)
         // PR-3 缓存收口:命中调用仍走完整管道(①-⑤⑧照常,仅⑦免重执行——
@@ -6746,6 +6808,14 @@ impl AgentRunner {
                                    return;
                                }
                            };
+                           // 39 号项 A:项目记忆段追加到 system prompt 尾段
+                           let mut system_prompt = system_prompt;
+                           if let Some(seg) = &runner.agents_md_segment {
+                               system_prompt.push_str("
+
+");
+                               system_prompt.push_str(seg);
+                           }
 
                            // 2. session:新建 或 复用(G15:continuation)
                            let session_id = if let Some(id) = existing_session_id.clone() {
@@ -8336,6 +8406,40 @@ impl AgentRunner {
                                                            name: tc.name.clone(),
                                                            result: result_value,
                                                        });
+                                                       // 计划模式:plan_submit 成功即收束回合(交互批)。
+                                                       // 推 PlanSubmitted 帧后按收场序(turn_guard/flush/
+                                                       // traces)以 success Done 收场——计划文本已随
+                                                       // tool_invoked/tool_result 入账,批准记录随后续
+                                                       // 用户消息入账;重开会话历史可见(批账即持久化)
+                                                       if runner.plan_mode
+                                                           && tc.name
+                                                               == crate::builtin_tools::plan_submit::PLAN_SUBMIT_TOOL
+                                                       {
+                                                           let canonical = crate::builtin_tools::plan_submit::validate_plan_args(&tc.arguments).ok();
+                                                           let plan_id = canonical
+                                                               .as_ref()
+                                                               .map(crate::builtin_tools::plan_submit::plan_id_for)
+                                                               .unwrap_or_default();
+                                                           yield Ok(AgentEvent::PlanSubmitted {
+                                                               plan_id,
+                                                               plan: canonical.unwrap_or(serde_json::json!({})),
+                                                           });
+                                                           let duration = start_time.elapsed().as_millis() as u64;
+                                                           if let Some(g) = turn_guard.take() {
+                                                               g.end("plan_submitted", step_count as u64, duration);
+                                                           }
+                                                           if let Err(e) = runner.flush_messages(&session_id).await {
+                                                               tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                                                           }
+                                                           runner.submit_tool_traces(&session_id).await;
+                                                           yield Ok(AgentEvent::Done(AgentResult::success(
+                                                               "计划已提交,等待用户批准或拒绝。".to_string(),
+                                                               step_count,
+                                                               duration,
+                                                               tool_calls.clone(),
+                                                           )));
+                                                           return;
+                                                       }
                                                    }
                                                    // M3 自验证门禁:轮末回喂前执行 pending verify(一轮 N 写
                                                    // 只跑 1 次;verdict 作为结构化附加观察块拼进最后一条
@@ -9122,6 +9226,155 @@ pub fn sanitize_tool_pairing(messages: &mut [Message]) {
             *tool_calls = None;
         }
     }
+}
+
+/// 39 号项 A(第一批):项目记忆段(AGENTS.md 层级)——用户级 ~/.evo-agent/AGENTS.md
+/// 先于项目级 {workdir}/AGENTS.md,按序拼接;总量 16KB 上限(超限按序裁剪
+/// 并标注)。两级均无文件时 None(组装零变化)。
+pub fn load_agents_md_segment(workdir: &std::path::Path) -> Option<String> {
+    const MAX_BYTES: usize = 16 * 1024;
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok();
+    let user_level = home.map(|h| {
+        std::path::PathBuf::from(h)
+            .join(".evo-agent")
+            .join("AGENTS.md")
+    });
+    let project_level = workdir.join("AGENTS.md");
+    let mut parts: Vec<String> = Vec::new();
+    // 用户级缺失不阻断项目级(两级独立读取);内容与上一级完全相同则去重跳过
+    let levels: [( &str, Option<std::path::PathBuf>); 2] =
+        [("用户级", user_level), ("项目级", Some(project_level))];
+    for (label, p) in levels {
+        let Some(p) = p else { continue };
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            let body = s.trim();
+            if body.is_empty() {
+                continue;
+            }
+            if parts
+                .iter()
+                .any(|prev| prev.contains(&format!("\n{body}")))
+            {
+                continue;
+            }
+            parts.push(format!("### {label}({})\n{body}", p.display()));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut seg: String = "# 项目记忆(AGENTS.md 层级)\n以下为项目约定与长期记忆,按层级由远及近排列(用户级→项目级);与系统指令冲突时以系统指令为准。"
+        .to_string();
+    for part in parts {
+        seg.push_str(
+            "
+
+",
+        );
+        seg.push_str(&part);
+    }
+    let bytes = seg.as_bytes();
+    if bytes.len() > MAX_BYTES {
+        let mut cut = MAX_BYTES;
+        while cut > 0 && !seg.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        seg.truncate(cut);
+        seg.push_str(
+            "
+…[项目记忆超限截断]…",
+        );
+    }
+    Some(seg)
+}
+
+#[cfg(test)]
+mod agents_md_tests {
+    use super::load_agents_md_segment;
+
+    #[test]
+    fn project_level_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "project rules").unwrap();
+        let seg = load_agents_md_segment(dir.path()).unwrap();
+        assert!(seg.contains("### 项目级"));
+        assert!(seg.contains("project rules"));
+    }
+
+    #[test]
+    fn empty_when_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_agents_md_segment(dir.path()).is_none());
+    }
+
+    #[test]
+    fn oversized_project_file_is_truncated_with_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "长".repeat(32 * 1024);
+        std::fs::write(dir.path().join("AGENTS.md"), &big).unwrap();
+        let seg = load_agents_md_segment(dir.path()).unwrap();
+        assert!(seg.len() < 32 * 1024, "segment must be capped near 16KB");
+        assert!(seg.ends_with("…[项目记忆超限截断]…"));
+        assert!(seg.is_char_boundary(seg.len()));
+    }
+
+    #[test]
+    fn blank_project_file_counts_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "   \n\t").unwrap();
+        assert!(load_agents_md_segment(dir.path()).is_none());
+    }
+
+    #[test]
+    fn plan_mode_allowlist_gate() {
+        use super::plan_mode_allowlist_blocked as gate;
+        // 闸未武装:任何工具都放行(缺省零变化)
+        assert!(gate(false, "file_write").is_none());
+        assert!(gate(false, "shell_exec").is_none());
+        // 武装后:只读族+plan_submit+ask_user 放行
+        for tool in [
+            "file_read",
+            "file_list",
+            "search_files",
+            "grep_files",
+            "code_search",
+            "plan_submit",
+            "ask_user",
+        ] {
+            assert!(gate(true, tool).is_none(), "{tool} must be allowed");
+        }
+        // 武装后:写族/执行族拒答(引导性文案,LLM 可自适应改路)
+        for tool in ["file_write", "file_create", "shell_exec", "edit_file", "delegate"] {
+            let blocked = gate(true, tool).unwrap_or_else(|| panic!("{tool} must be blocked"));
+            assert!(blocked.contains("plan_mode_blocked"));
+            assert!(blocked.contains(tool));
+        }
+    }
+}
+
+/// 计划模式工具闸(自由形态,单测可直测):plan_mode=true 时收窄外工具
+/// 返回引导性拒答文案;收窄内(只读族+plan_submit+ask_user)与闸未武装
+/// 时返回 None
+fn plan_mode_allowlist_blocked(plan_mode: bool, tool_name: &str) -> Option<String> {
+    if !plan_mode {
+        return None;
+    }
+    const ALLOWED: [&str; 6] = [
+        "file_read",
+        "file_list",
+        "search_files",
+        "grep_files",
+        "code_search",
+        "plan_submit",
+    ];
+    if ALLOWED.contains(&tool_name) || tool_name == crate::builtin_tools::ask_user::ASK_USER_TOOL {
+        return None;
+    }
+    Some(format!(
+        "{{\"status\":\"plan_mode_blocked\",\"tool\":\"{tool_name}\",\"note\":\"计划模式下仅允许只读探查(file_read/file_list/search_files/grep_files/code_search)、plan_submit 与 ask_user;请继续只读探查,或用 plan_submit 提交结构化计划收束本回合。\"}}"
+    ))
 }
 
 /// 思考留痕入参收敛:空串归一为 None(非思考模型零增量,记录不带空字段)

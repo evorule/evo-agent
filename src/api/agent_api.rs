@@ -1519,6 +1519,8 @@ async fn run_agent(
     // 档位解析单源:定义级优先,未指定回落设置键 approval.mode.shellExec
     let approval_mode =
         crate::api::ws_handler::resolve_approval_mode(&state, def.approval_mode.as_deref());
+    // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
+    let agents_md = crate::agent::runner::load_agents_md_segment(state.workdir());
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
@@ -1529,6 +1531,7 @@ async fn run_agent(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .with_agents_md_segment(agents_md)
     .with_capability_boundary(capability_boundary)
     // 执行环境 profile 标记随 tool_result 落账(trusted 审计明文可追溯;
     // 未声明=None=落账无标记,零变化)
@@ -1966,6 +1969,8 @@ async fn run_agent_stream(
         crate::api::ws_handler::resolve_approval_mode(&state, def.approval_mode.as_deref());
     let (approval_callback, runaway_policy) =
         crate::api::ws_handler::build_approval_callback(&state, resolved_mode.as_deref());
+    // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
+    let agents_md = crate::agent::runner::load_agents_md_segment(state.workdir());
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
@@ -1976,6 +1981,7 @@ async fn run_agent_stream(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .with_agents_md_segment(agents_md)
     .with_capability_boundary(capability_boundary)
     // 执行环境 profile 标记随 tool_result 落账(同 run_agent 口径)
     .with_execution_profile_marker(execution_profile.as_ref().map(|p| p.as_str()))
@@ -2475,6 +2481,15 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
             })
             .to_string(),
         ),
+        Ok(AgentEvent::PlanSubmitted { plan_id, plan }) => Event::default()
+            .event("plan_submitted")
+            .data(
+                serde_json::json!({
+                    "plan_id": plan_id,
+                    "plan": plan,
+                })
+                .to_string(),
+            ),
         // 流级错误(底层 stream yield Err) — 当作可恢复错误帧发出
         Err(err) => Event::default()
             .event("error")

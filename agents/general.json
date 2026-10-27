@@ -64,7 +64,8 @@
     "web_search",
     "todo_write",
     "todo_read",
-    "code_search"
+    "code_search",
+    "plan_submit"
   ],
   "skills": [
     {

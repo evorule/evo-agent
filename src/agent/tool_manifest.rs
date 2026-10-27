@@ -418,6 +418,11 @@ const SWITCH_HTTP_REQUEST: &str = AGENT_TOOLS_HTTP_REQUEST;
 pub const AGENT_TOOLS_ASK_USER: &str = "agentTools.askUser";
 const SWITCH_ASK_USER: &str = AGENT_TOOLS_ASK_USER;
 
+/// agentTools.planSubmit（默认开；计划提交卡——agent 向用户提交结构化执行
+/// 计划等待批准/拒绝，交互批 计划模式配套；纯申报型零副作用）
+pub const AGENT_TOOLS_PLAN_SUBMIT: &str = "agentTools.planSubmit";
+const SWITCH_PLAN_SUBMIT: &str = AGENT_TOOLS_PLAN_SUBMIT;
+
 /// 开关绑定便捷构造（静态键 → String 归一）
 fn sw(key: &'static str, default_on: bool) -> Option<SwitchBinding> {
     Some(SwitchBinding {
@@ -546,6 +551,12 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 不进 EXFIL_SCAN_TOOLS（question 发给会话数据有权方，非网络外发）。
         // spec 常驻 default_tool_specs（Builtin 源）。
         b("ask_user", vec![Interaction]),
+        // plan_submit 计划提交（交互批 计划模式配套）：agent 提交结构化执行
+        // 计划给用户裁决（校验+确定性 plan_id+submitted 形态返回；runner 在
+        // 计划模式回合内识别成功即收束回合推 PlanSubmitted 帧）。能力域=
+        // Interaction（申报型零文件/网络/子进程触点）；Standard 免裁决 +
+        // AutoPolicy 直通，不进 EXFIL_SCAN_TOOLS。spec 常驻 default_tool_specs。
+        b("plan_submit", vec![Interaction]),
     ]
     .into_iter()
     .map(|mut m| {
@@ -648,6 +659,10 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // 批K 段7:人在环澄清卡,默认开(交互零风险;关=agent 无人可问,
             // resolve 侧立即返回无人态 fail-visible)
             "ask_user" => sw(SWITCH_ASK_USER, true),
+            // 交互批:计划提交卡,默认开(纯申报零副作用;关=工具不进 LLM 契约面,
+            // 计划模式回合内 agent 无法提交计划,闸引导文案会指路 plan_submit——
+            // 面向受限部署的降档开关)
+            "plan_submit" => sw(SWITCH_PLAN_SUBMIT, true),
             _ => None,
         };
         m
@@ -981,9 +996,10 @@ mod tests {
         //   （批K 段5 HTTP 写动词 http_request +1：内置 34→35，数量锁 100→101）
         //   （批K 段7 人在环 ask_user +1：内置 35→36，数量锁 101→102）
         //   （写面撤销批 workspace_undo +1：内置 36→37，数量锁 102→103）
-        assert_eq!(builtin_manifests().len(), 37);
+        //   （交互批 计划模式 plan_submit +1：内置 37→38，数量锁 103→104）
+        assert_eq!(builtin_manifests().len(), 38);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 103);
+        assert_eq!(all().len(), 104);
     }
 
     #[test]
@@ -1273,6 +1289,8 @@ mod tests {
         ("ask_user", "agentTools.askUser", true),
         // 写面撤销（写面撤销批）：默认开（安全网能力——弹栈回退,不引入新内容）
         ("workspace_undo", "agentTools.workspaceUndo", true),
+        // 计划提交（交互批 计划模式配套）：默认开（纯申报零副作用）
+        ("plan_submit", "agentTools.planSubmit", true),
     ];
 
     #[test]
