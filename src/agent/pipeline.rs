@@ -195,6 +195,8 @@ pub struct PipelineDeps<'a> {
     /// 幂等类工具瞬态故障重试的回退基数（第 n 次重试等待 = 基数 × n；
     /// 生产装配 = 1s 与 LLM 传输层同量级，测试注入极短值）
     pub retry_backoff: std::time::Duration,
+    /// 用户 hooks（交互批 第二批；None=未配置零开销直通——既有路径零变化）
+    pub user_hooks: Option<std::sync::Arc<crate::agent::user_hooks::WiredHooks>>,
 }
 
 // =============================================================================
@@ -221,6 +223,10 @@ pub enum DenialStage {
     Channel,
     /// ⑧账面写失败（fail-visible：账写不掉=错误显式化）
     Ledger,
+    /// 用户 pre_tool hook 拒绝（交互批 第二批；位于治理/审批之后、执行之前
+    /// ——顺序契约「治理 enforce → hooks → 执行」的结构性保证：治理拒绝的
+    /// 调用不会到达 hooks）
+    UserHook,
 }
 
 /// 显式拒绝（无静默路径：每条 Denial 带阶段与原因）
@@ -742,12 +748,55 @@ impl ToolExecutionPipeline {
         // 幂等类工具遇连接/超时类错误形态自动重试（有限次、线性回退，与
         // LLM 传输层重试面同参数量级）；非幂等工具不自动重试——盲重试写
         // 操作是漂移风险源，失败显式回喂。每次重试先落账再推进。
+        // ── ⑥b 用户 hooks（交互批 第二批）——顺序契约「治理 enforce →
+        // hooks → 执行」的落点：③④裁决、exfil 事前裁决、⑤审批任一拒绝的
+        // 调用不会到达此处。pre_tool deny=显式拒绝回喂（UserHook 阶段）；
+        // rewrite=参数改写进⑦；运行性故障（超时/生成失败）按 fail-open
+        // 放行+留痕。None=未配置零开销直通（既有路径零变化）。
+        let hook_rewrite: Option<Value> = match deps.user_hooks.clone() {
+            Some(wired) => {
+                let session = req.caller.session_id.as_deref().unwrap_or("");
+                let (verdict, outcomes) = wired
+                    .hooks
+                    .pre_tool_verdict(req.tool_name, req.args, session, &wired.workdir)
+                    .await;
+                for out in &outcomes {
+                    if let Some(err) = &out.error {
+                        tracing::warn!(
+                            tool = %req.tool_name, rule = out.rule_index, error = %err,
+                            "user pre_tool hook failed (fail-open)"
+                        );
+                    } else if !out.exited_ok {
+                        tracing::warn!(
+                            tool = %req.tool_name, rule = out.rule_index,
+                            "user pre_tool hook exited non-zero (fail-open)"
+                        );
+                    }
+                }
+                match verdict {
+                    crate::agent::user_hooks::PreToolVerdict::Deny(reason) => {
+                        ledger.denial = Some(DenialStage::UserHook);
+                        return PipelineOutcome {
+                            result: Err(PipelineFailure::Denial(PipelineDenial::new(
+                                DenialStage::UserHook,
+                                reason,
+                            ))),
+                            ledger,
+                        };
+                    }
+                    crate::agent::user_hooks::PreToolVerdict::Rewrite(args) => Some(args),
+                    crate::agent::user_hooks::PreToolVerdict::Allow => None,
+                }
+            }
+            None => None,
+        };
+        let exec_args: &Value = hook_rewrite.as_ref().unwrap_or(req.args);
         let pre = req.precomputed.clone();
         let tool_start = Instant::now();
         let raw = match pre {
             Some(cached) => Ok(cached),
             None => {
-                let mut outcome = deps.executor.execute_tool(req.tool_name, req.args).await;
+                let mut outcome = deps.executor.execute_tool(req.tool_name, exec_args).await;
                 let mut retry_no: u32 = 0;
                 while let Err(err) = &outcome {
                     if retry_no >= crate::agent::tool_retry::MAX_TOOL_RETRIES {
@@ -779,7 +828,7 @@ impl ToolExecutionPipeline {
                         }
                     }
                     tokio::time::sleep(deps.retry_backoff * retry_no).await;
-                    outcome = deps.executor.execute_tool(req.tool_name, req.args).await;
+                    outcome = deps.executor.execute_tool(req.tool_name, exec_args).await;
                 }
                 outcome
             }
@@ -812,6 +861,39 @@ impl ToolExecutionPipeline {
                     tracing::error!(
                         main_session = ?req.caller.session_id, tool = %req.tool_name,
                         "tool trace lock poisoned after execution; trace entry lost (ledger gap)"
+                    );
+                }
+            }
+        }
+
+        // ── ⑦b 用户 post_tool hooks（交互批 第二批；只读不可阻断）——
+        // 结局随 stdin 下发;失败/超时只留痕,不改变工具结局语义
+        if let Some(wired) = deps.user_hooks.clone() {
+            let session = req.caller.session_id.as_deref().unwrap_or("");
+            let result_text = match &raw {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("{{\"error\":{}}}", serde_json::json!(e.to_string())),
+            };
+            let outcomes = wired
+                .hooks
+                .post_tool_notify(
+                    req.tool_name,
+                    exec_args,
+                    &result_text,
+                    session,
+                    &wired.workdir,
+                )
+                .await;
+            for out in &outcomes {
+                if let Some(err) = &out.error {
+                    tracing::warn!(
+                        tool = %req.tool_name, rule = out.rule_index, error = %err,
+                        "user post_tool hook failed (ignored)"
+                    );
+                } else if !out.exited_ok {
+                    tracing::warn!(
+                        tool = %req.tool_name, rule = out.rule_index,
+                        "user post_tool hook exited non-zero (ignored)"
                     );
                 }
             }
@@ -1096,6 +1178,7 @@ mod tests {
             traces: None,
             metrics: None,
             retry_backoff: std::time::Duration::from_millis(1),
+            user_hooks: None,
         }
     }
 
@@ -1115,6 +1198,181 @@ mod tests {
             precomputed: None,
             approval_preset: None,
         }
+    }
+
+    // ── 交互批 第二批:用户 hooks 管道缝 ──
+
+    /// 记账执行桩:计数+记录收到的 args(rewrite 验收看这里)
+    struct CountingExecutor {
+        calls: std::sync::atomic::AtomicUsize,
+        seen_args: std::sync::Mutex<Vec<String>>,
+    }
+    impl CountingExecutor {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                seen_args: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn seen(&self) -> Vec<String> {
+            self.seen_args.lock().unwrap().clone()
+        }
+    }
+    impl PipelineExecutor for CountingExecutor {
+        fn execute_tool(
+            &self,
+            _tool_name: &str,
+            args: &Value,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, AgentError>> + Send + '_>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.seen_args.lock().unwrap().push(args.to_string());
+            Box::pin(async { Ok(Value::from("executed")) })
+        }
+    }
+
+    fn hooks_deps_for<'a>(
+        executor: &'a CountingExecutor,
+        adj: &'a tokio::sync::Mutex<AdjudicationChannel>,
+        manifest_of: &'a (dyn Fn(&str) -> Option<ToolManifest> + Sync),
+        hooks: std::sync::Arc<crate::agent::user_hooks::WiredHooks>,
+    ) -> PipelineDeps<'a> {
+        PipelineDeps {
+            executor,
+            adjudicator: adj,
+            manifest_of,
+            proposal_of: None,
+            journal: None,
+            boundary: None,
+            traces: None,
+            metrics: None,
+            retry_backoff: std::time::Duration::from_millis(1),
+            user_hooks: Some(hooks),
+        }
+    }
+
+    fn echo_deny_cmd() -> String {
+        // cmd echo 的引号经参数层转义为 \";parse 回退反转义覆盖(跨平台)
+        r#"echo {"decision":"deny","reason":"hook-no"}"#.to_string()
+    }
+
+    fn echo_rewrite_cmd() -> String {
+        r#"echo {"decision":"rewrite","args":{"path":"rewritten.txt"}}"#.to_string()
+    }
+
+    fn wired_for(
+        dir: &std::path::Path,
+        rules: Vec<crate::agent::user_hooks::HookRule>,
+    ) -> std::sync::Arc<crate::agent::user_hooks::WiredHooks> {
+        std::sync::Arc::new(crate::agent::user_hooks::WiredHooks {
+            hooks: crate::agent::user_hooks::UserHooks {
+                pre_tool: rules,
+                ..Default::default()
+            },
+            workdir: dir.to_path_buf(),
+        })
+    }
+
+    #[tokio::test]
+    async fn user_hook_pre_tool_deny_blocks_execution() {
+        // pre_tool deny:显式拒绝(UserHook 阶段),执行器不可达
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_read"]);
+        let args = serde_json::json!({"path": "a.txt"});
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = wired_for(
+            dir.path(),
+            vec![crate::agent::user_hooks::HookRule {
+                tool: "file_read".into(),
+                command: echo_deny_cmd(),
+                timeout_secs: Some(15),
+            }],
+        );
+        let exec = CountingExecutor::new();
+        let deps = hooks_deps_for(&exec, &adj, &manifests, hooks);
+        let out = ToolExecutionPipeline
+            .execute(req_for("file_read", &args, &focus), deps)
+            .await;
+        let denial = denial_of(&out);
+        assert_eq!(denial.stage, DenialStage::UserHook);
+        assert_eq!(denial.reason, "hook-no");
+        assert_eq!(exec.call_count(), 0, "deny 后不得执行");
+    }
+
+    #[tokio::test]
+    async fn user_hook_rewrite_feeds_executor() {
+        // pre_tool rewrite:改写后的 args 进⑦执行器
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_read"]);
+        let args = serde_json::json!({"path": "a.txt"});
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = wired_for(
+            dir.path(),
+            vec![crate::agent::user_hooks::HookRule {
+                tool: "file_read".into(),
+                command: echo_rewrite_cmd(),
+                timeout_secs: Some(15),
+            }],
+        );
+        let exec = CountingExecutor::new();
+        let deps = hooks_deps_for(&exec, &adj, &manifests, hooks);
+        let out = ToolExecutionPipeline
+            .execute(req_for("file_read", &args, &focus), deps)
+            .await;
+        assert!(
+            out.result.is_ok(),
+            "rewrite 后应正常执行: {:?}",
+            out.result.err()
+        );
+        assert_eq!(exec.call_count(), 1);
+        assert!(
+            exec.seen()[0].contains("rewritten.txt"),
+            "executor must receive rewritten args, got: {:?}",
+            exec.seen()
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_focus_denial_precedes_hooks() {
+        // 顺序锁:②聚焦拒绝先于 hooks——hook 未执行(哨兵文件不存在),
+        // 拒绝阶段=OutOfFocus 而非 UserHook
+        let adj = dummy_adjudicator();
+        let manifests = |n: &str| lookup_static(n);
+        let focus = FocusSnapshot::from_names(["file_read"]);
+        let args = serde_json::json!({});
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("hook_ran.txt");
+        let hooks = wired_for(
+            dir.path(),
+            vec![crate::agent::user_hooks::HookRule {
+                tool: "grep_files".into(),
+                command: {
+                    if cfg!(target_os = "windows") {
+                        "echo ran > hook_ran.txt".to_string()
+                    } else {
+                        "echo ran > hook_ran.txt".to_string()
+                    }
+                },
+                timeout_secs: Some(15),
+            }],
+        );
+        let exec = CountingExecutor::new();
+        let deps = hooks_deps_for(&exec, &adj, &manifests, hooks);
+        let out = ToolExecutionPipeline
+            .execute(req_for("grep_files", &args, &focus), deps)
+            .await;
+        let denial = denial_of(&out);
+        assert_eq!(
+            denial.stage,
+            DenialStage::OutOfFocus,
+            "治理面前的拒绝不得落到 hooks"
+        );
+        assert!(!sentinel.exists(), "hooks 不得在②拒绝前执行");
+        assert_eq!(exec.call_count(), 0);
     }
 
     #[tokio::test]

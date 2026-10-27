@@ -1532,6 +1532,17 @@ async fn run_agent(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .with_agents_md_segment(agents_md)
+    .with_user_hooks(
+        match crate::agent::user_hooks::WiredHooks::load_from_workdir(state.workdir()) {
+            Ok(v) => v.map(std::sync::Arc::new),
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("user hooks invalid: {e}"),
+                ))
+            }
+        },
+    )
     .with_capability_boundary(capability_boundary)
     // 执行环境 profile 标记随 tool_result 落账(trusted 审计明文可追溯;
     // 未声明=None=落账无标记,零变化)
@@ -1982,6 +1993,17 @@ async fn run_agent_stream(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .with_agents_md_segment(agents_md)
+    .with_user_hooks(
+        match crate::agent::user_hooks::WiredHooks::load_from_workdir(state.workdir()) {
+            Ok(v) => v.map(std::sync::Arc::new),
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("user hooks invalid: {e}"),
+                ))
+            }
+        },
+    )
     .with_capability_boundary(capability_boundary)
     // 执行环境 profile 标记随 tool_result 落账(同 run_agent 口径)
     .with_execution_profile_marker(execution_profile.as_ref().map(|p| p.as_str()))

@@ -891,6 +891,21 @@ async fn construct_runner(
     let governance_segment =
         crate::api::serve_tools::build_governance_segment(state.evorule_client(), &def.tools).await;
     let config = def.to_agent_config();
+    // 用户 hooks 装载(交互批 第二批):{workdir}/.evo-agent/hooks.json;
+    // 缺失=None 零变化;解析失败=拒绝构造(fail-visible,与 skills 同型
+    // ——坏的 hooks 文件静默跳过会让用户误以为在防)。每回合 fresh
+    // runner=构造期装载,文件变更下回合生效
+    let user_hooks = match crate::agent::user_hooks::WiredHooks::load_from_workdir(state.workdir())
+    {
+        Ok(v) => v.map(std::sync::Arc::new),
+        Err(e) => {
+            error!(
+                error = %e,
+                "user hooks load failed; rejecting runner construction"
+            );
+            return None;
+        }
+    };
     // G8 审批决策端 + Runaway 护栏:同一次 mode 判别/文件加载
     // 双产出(决策端挂 ApprovalCallback,护栏策略挂 with_runaway_policy)
     // 档位解析单源:定义级优先,未指定回落设置键 approval.mode.shellExec
@@ -898,6 +913,8 @@ async fn construct_runner(
     let (approval_callback, runaway_policy) =
         build_approval_callback(state, resolved_mode.as_deref());
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
+        // 用户 hooks(交互批 第二批)
+        .with_user_hooks(user_hooks)
         // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
         .with_agents_md_segment(crate::agent::runner::load_agents_md_segment(
             state.workdir(),
