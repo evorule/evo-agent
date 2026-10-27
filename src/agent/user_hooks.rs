@@ -274,14 +274,19 @@ impl UserHooks {
             "args": args,
             "session_id": session_id,
         });
-        let outcomes = self
-            .run_kind(HookKind::PreTool, tool_name, &ctx, workdir)
-            .await;
+        // 逐条执行逐条解析:deny 即停(后续规则命令不执行)——ubuntu CI
+        // 实证缺陷纠正:此前 run_kind 全量先跑、解析循环事后找 deny,
+        // 「deny 即停」文档语义从未真正落地
+        let mut outcomes: Vec<HookOutcome> = Vec::new();
         let mut rewritten: Option<Value> = None;
-        for out in &outcomes {
-            let decision = parse_pre_decision(&out.stdout);
-            match decision {
+        for (i, rule) in self.pre_tool.iter().enumerate() {
+            if !rule.matches_tool(tool_name) {
+                continue;
+            }
+            let out = run_hook_rule(i, rule, HookKind::PreTool, &ctx, workdir).await;
+            match parse_pre_decision(&out.stdout) {
                 Some(PreToolVerdict::Deny(reason)) => {
+                    outcomes.push(out);
                     return (PreToolVerdict::Deny(reason), outcomes);
                 }
                 Some(PreToolVerdict::Rewrite(args)) => {
@@ -289,6 +294,7 @@ impl UserHooks {
                 }
                 Some(PreToolVerdict::Allow) | None => {}
             }
+            outcomes.push(out);
         }
         match rewritten {
             Some(args) => (PreToolVerdict::Rewrite(args), outcomes),
