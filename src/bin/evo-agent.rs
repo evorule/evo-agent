@@ -2663,7 +2663,8 @@ fn cmd_serve(
     //
     // 工作台静态托管:API 路由外层 fallback 到 web/dist(SPA,缺省回退 index.html)。
     // fallback 挂在外层 Router 上,不经过 API 面的 auth 中间件 —— 工作台页面必须
-    // 无 token 可打开;API 与 WS 面仍全部走 G7 鉴权(auth 启用时前端以 ?token= 接入)。
+    // 无凭据可打开;API 与 WS 面仍全部走 G7 鉴权(auth 启用时前端以 Bearer 换
+    // 一次性 ticket 后经 `?ticket=` 接入)。
     let dist_dir = workdir.join("web").join("dist");
     if dist_dir.join("index.html").exists() {
         eprintln!(

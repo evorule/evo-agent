@@ -5,12 +5,12 @@
 //!
 //! - `GET /api/dap/adapters`：白名单适配器清单（来自 `dap.adapters` 设置键；
 //!   **缺省空=fail-closed**——部署方显式配置后才可 spawn 适配器进程）
-//! - `GET /api/dap/ws?adapter=<名>&token=`：WS 升级，白名单命中即 spawn 适配器
+//! - `GET /api/dap/ws?adapter=<名>`：WS 升级，白名单命中即 spawn 适配器
 //!   并双向透传（WS 文本帧 ↔ 适配器 stdio Content-Length 帧）；断连/适配器
 //!   退出即收尾并 kill。
 //!
-//! 治理：spawn/exit 经治理事件流 record-only（`dap_session` 事件型）；鉴权与
-//! 既有 WS 端点同款双层（auth 中间件第一层 + `?token=` fallback 第二层）。
+//! 治理：spawn/exit 经治理事件流 record-only（`dap_session` 事件型）；鉴权由
+//! auth 中间件单点执法（Bearer 或 `?ticket=` 一次性短票，`?token=` 恒 401）。
 
 use axum::{
     extract::{
@@ -37,9 +37,6 @@ const WS_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 pub struct DapWsQuery {
     /// 适配器名（须命中 `dap.adapters` 白名单）
     pub adapter: String,
-    /// 鉴权 token（WS 握手不能带 Authorization 头时的 fallback）
-    #[serde(default)]
-    pub token: Option<String>,
 }
 
 /// `GET /api/dap/adapters` — 白名单适配器清单

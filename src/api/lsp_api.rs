@@ -4,11 +4,11 @@
 //! LSP 代理端点:语言门状态检测 + WS 透明转发升级。
 //!
 //! - `GET /api/lsp/status`:两语言门 PATH 检测(可用性+版本),前端灰置降级依据
-//! - `GET /api/lsp/ws?lang=rust|typescript&token=`:WS 升级,接通
+//! - `GET /api/lsp/ws?lang=rust|typescript`:WS 升级,接通
 //!   [`crate::lsp::bridge`] 桥(每语言单连接单实例,占用中拒绝新连接)
 //!
-//! 鉴权与既有 WS 端点同款双层:auth 中间件第一层(含 `?token=` fallback),
-//! handler 内二次校验(defense in depth)。
+//! 鉴权:auth 中间件单点执法(Authorization Bearer 或 `?ticket=` 一次性短票;
+//! `?token=` 长期凭据恒 401),handler 层不再二次校验。
 
 #![forbid(unsafe_code)]
 
@@ -64,8 +64,6 @@ pub struct LspStatusResponse {
 pub struct LspWsQuery {
     /// 语言门(`rust` | `typescript`)
     pub lang: Option<String>,
-    /// 鉴权 token(auth 启用时必填)
-    pub token: Option<String>,
 }
 
 /// 探测一个命令的可用性与版本(`<prog> --version`,5s 超时;候选名同 spawn)。
@@ -155,7 +153,7 @@ pub async fn status(State(state): State<AgentApiState>) -> Json<LspStatusRespons
     })
 }
 
-/// `GET /api/lsp/ws?lang=...&token=...` — WS 升级
+/// `GET /api/lsp/ws?lang=...` — WS 升级
 pub async fn lsp_ws(
     ws: WebSocketUpgrade,
     State(state): State<AgentApiState>,
@@ -172,18 +170,6 @@ pub async fn lsp_ws(
                 .into_response()
         }
     };
-    // 二次鉴权(defense in depth — 中间件已做第一层)
-    if state.auth_config().enabled() {
-        let ok = query
-            .token
-            .as_deref()
-            .map(|t| state.auth_config().validate(t))
-            .unwrap_or(false);
-        if !ok {
-            warn!("LSP WS upgrade rejected — invalid token");
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-    }
     // 每语言单连接单实例
     if !state.lsp_registry().try_acquire(lang) {
         return (

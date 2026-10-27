@@ -3,8 +3,8 @@
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
 //! PTY WS 端点:工作台集成终端(人的终端)。
 //!
-//! - `GET /api/pty/ws?term={id}&cols=&rows=&token=` → WS 升级(与会话 WS/LSP WS
-//!   同款三层鉴权:middleware `?token=` fallback + handler 内二次校验)
+//! - `GET /api/pty/ws?term={id}&cols=&rows=` → WS 升级(鉴权由 auth 中间件
+//!   单点执法:Bearer 或 `?ticket=` 一次性短票,`?token=` 恒 401)
 //! - 上行:**Binary**=键盘字节;**Text**=控制帧(白名单 `resize|pause|resume`)
 //! - 下行:**Binary**=PTY 输出;**Text**=控制帧(`gov_event`/`exit`/`error`)
 //! - 治理分级:会话创建/关闭推 `gov_event`(record-only 展示层);会话内零拦截
@@ -26,7 +26,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::api::agent_api::AgentApiState;
 use crate::pty::session::{PtyMsg, PtySessionHandle};
@@ -45,8 +45,6 @@ pub struct PtyWsQuery {
     pub cols: Option<u16>,
     /// 初始行数
     pub rows: Option<u16>,
-    /// 鉴权 token(auth 启用时必填)
-    pub token: Option<String>,
 }
 
 /// `GET /api/pty/ws` — WS 升级
@@ -55,18 +53,6 @@ pub async fn pty_ws(
     State(state): State<AgentApiState>,
     Query(query): Query<PtyWsQuery>,
 ) -> Response {
-    // 二次鉴权(defense in depth — 中间件已做第一层)
-    if state.auth_config().enabled() {
-        let ok = query
-            .token
-            .as_deref()
-            .map(|t| state.auth_config().validate(t))
-            .unwrap_or(false);
-        if !ok {
-            warn!("PTY WS upgrade rejected — invalid token");
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-    }
     let term_id = query.term.clone().unwrap_or_else(|| "term-1".to_string());
     let cols = query.cols.unwrap_or(80).clamp(2, 500);
     let rows = query.rows.unwrap_or(24).clamp(2, 300);

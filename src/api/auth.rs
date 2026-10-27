@@ -5,7 +5,9 @@
 //!
 //! 复用 evorule tier2 的 AuthConfig 模式:
 //! - Bearer token in `Authorization` header(首选)
-//! - `?token=xxx` query param fallback(仅 SSE 端点,浏览器 EventSource 不支持自定义 header)
+//! - `?ticket=` query param fallback(仅 WS/SSE 端点,浏览器 EventSource/
+//!   WebSocket 不支持自定义 header):一次性短期 ticket,POST
+//!   `/api/auth/ticket` 以 Bearer 换票,TTL 30s 消费即焚——长效凭据不再进 URL
 //! - `subtle::ConstantTimeEq` 恒定时间比较(防时序攻击)
 //! - `current_tokens` + `previous_tokens` 双 token 轮换(无缝过渡)
 //! - `validate()` 遍历所有 token,不提前返回(防枚举攻击)
@@ -27,8 +29,62 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
-use std::sync::Arc;
+use rand::RngCore;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
+
+/// ticket 有效期(覆盖建连+握手窗口;一次性消费防重放)
+const TICKET_TTL: Duration = Duration::from_secs(30);
+
+/// 一次性短期 ticket 存储(进程内;签发期惰性清扫过期项)
+///
+/// 浏览器 EventSource/WebSocket 无法携带 Authorization 头,ticket 是其
+/// 凭据载体:长效 token 换一次性短票,URL 泄露面从「token 全生命周期」
+/// 收敛到「30s 且单次」。
+#[derive(Debug, Clone, Default)]
+pub struct TicketStore {
+    tickets: Arc<StdMutex<HashMap<String, Instant>>>,
+}
+
+impl TicketStore {
+    /// 签发一张一次性 ticket(CSPRNG 32 字节 hex)
+    pub fn issue(&self) -> String {
+        let mut store = match self.tickets.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        // 惰性清扫:签发期顺带回收过期项,免独立清扫线程
+        store.retain(|_, issued_at| issued_at.elapsed() < TICKET_TTL);
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let ticket: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        store.insert(ticket.clone(), Instant::now());
+        ticket
+    }
+
+    /// 消费一张 ticket(一次性:命中即删除;过期/未知均 false)
+    pub fn consume(&self, ticket: &str) -> bool {
+        let mut store = match self.tickets.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        match store.remove(ticket) {
+            Some(issued_at) => issued_at.elapsed() < TICKET_TTL,
+            None => false,
+        }
+    }
+}
+
+/// 鉴权经由标记(中间件成功后注入 request extensions;审计同权)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthVia {
+    /// Authorization: Bearer 头(长效 token)
+    Bearer,
+    /// `?ticket=` 一次性短票(浏览器 WS/SSE 建连)
+    Ticket,
+}
 
 /// 公开路由前缀(不需要鉴权)
 ///
@@ -47,6 +103,8 @@ pub struct AuthConfig {
     previous_tokens: Arc<Vec<String>>,
     /// 是否启用鉴权(false 时跳过检查)
     enabled: bool,
+    /// 一次性短期 ticket 存储(WS/SSE 浏览器建连换票面)
+    tickets: TicketStore,
 }
 
 impl AuthConfig {
@@ -59,6 +117,7 @@ impl AuthConfig {
             current_tokens: Arc::new(tokens),
             previous_tokens: Arc::new(Vec::new()),
             enabled,
+            tickets: TicketStore::default(),
         }
     }
 
@@ -68,6 +127,7 @@ impl AuthConfig {
             current_tokens: Arc::new(Vec::new()),
             previous_tokens: Arc::new(Vec::new()),
             enabled: false,
+            tickets: TicketStore::default(),
         }
     }
 
@@ -87,7 +147,20 @@ impl AuthConfig {
             current_tokens: Arc::new(new_tokens),
             previous_tokens: self.current_tokens.clone(),
             enabled: self.enabled,
+            tickets: TicketStore::default(),
         }
+    }
+
+    /// 签发一次性短期 ticket(POST /api/auth/ticket 端点消费)
+    ///
+    /// 返回 `(ticket, ttl)`;鉴权关闭态同样可签发(客户端此时无需票,无害)。
+    pub fn issue_ticket(&self) -> (String, Duration) {
+        (self.tickets.issue(), TICKET_TTL)
+    }
+
+    /// 消费一次性 ticket(中间件 `?ticket=` 通路;消费式校验)
+    pub fn consume_ticket(&self, ticket: &str) -> bool {
+        self.tickets.consume(ticket)
     }
 
     /// 恒定时间比较两个字符串是否相等
@@ -202,44 +275,43 @@ pub fn decide_auth_posture(auth_enabled: bool, explicit_no_auth: bool, host: &st
     }
 }
 
-/// 从请求中提取 token
+/// 从请求中提取 Bearer token(仅 Authorization 头)
 ///
-/// 优先级:
-/// 1. `Authorization: Bearer <token>` header(首选,所有端点)
-/// 2. `?token=xxx` query param(SSE 端点 fallback,浏览器 EventSource 不支持自定义 header)
-fn extract_token(req: &Request) -> Option<String> {
-    // 1. Bearer token from Authorization header
-    if let Some(token) = req
-        .headers()
+/// 长效 token 只允许走头;query 不再是 token 通道(见 [`extract_ticket`])。
+fn extract_bearer(req: &Request) -> Option<String> {
+    req.headers()
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string())
-    {
-        return Some(token);
-    }
+}
 
-    // 2. Query param fallback (for SSE / EventSource)
-    if let Some(query) = req.uri().query() {
-        for pair in query.split('&') {
-            if let Some(token) = pair.strip_prefix("token=") {
-                return Some(token.to_string());
-            }
+/// 从 query 提取一次性 ticket(`?ticket=xxx`;WS/SSE 浏览器建连专用)
+///
+/// 注意:历史形态 `?token=` **刻意不被本函数识别**——query 中出现长效
+/// token 一律 401(本整改的回归锁:URL 长效凭据面关闭)。
+fn extract_ticket(req: &Request) -> Option<String> {
+    let query = req.uri().query()?;
+    for pair in query.split('&') {
+        if let Some(ticket) = pair.strip_prefix("ticket=") {
+            return Some(ticket.to_string());
         }
     }
-
     None
 }
 
 /// Axum 鉴权中间件
 ///
-/// 从 `Authorization: Bearer <token>` 头(或 `?token=` query param)提取 token,
-/// 验证是否在合法 token 列表中。
+/// 凭据两级:
+/// 1. `Authorization: Bearer <token>` 头 → token 列表恒时校验;
+/// 2. `?ticket=<ticket>` query → 一次性 ticket 消费式校验(TTL 30s,用后即焚);
+/// 3. 其余(含历史 `?token=` 形态)→ 401。
 ///
-/// 公开路由(`/health`)豁免鉴权。
+/// 成功后向 request extensions 注入 [`AuthVia`](审计同权,handler 可见经由)。
+/// 公开路由(`/health`、`/metrics`)豁免鉴权。
 pub async fn auth_middleware(
     State(auth_config): State<AuthConfig>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     // 公开路由豁免
@@ -252,13 +324,24 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    let token = extract_token(&req).ok_or(StatusCode::UNAUTHORIZED)?;
-
-    if auth_config.validate(&token) {
-        Ok(next.run(req).await)
+    let via = if let Some(token) = extract_bearer(&req) {
+        if auth_config.validate(&token) {
+            AuthVia::Bearer
+        } else {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    } else if let Some(ticket) = extract_ticket(&req) {
+        if auth_config.consume_ticket(&ticket) {
+            AuthVia::Ticket
+        } else {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
     } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    req.extensions_mut().insert(via);
+
+    Ok(next.run(req).await)
 }
 
 #[cfg(test)]
@@ -354,7 +437,7 @@ mod tests {
         assert!(!disabled.enabled());
     }
 
-    // ===== extract_token 测试 =====
+    // ===== 凭据提取测试 =====
 
     use axum::http::Request as HttpRequest;
 
@@ -372,6 +455,13 @@ mod tests {
             .unwrap()
     }
 
+    fn make_request_with_query_ticket(ticket: &str) -> Request {
+        HttpRequest::builder()
+            .uri(format!("/agents/x/run/stream?ticket={}", ticket))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
     fn make_request_no_auth() -> Request {
         HttpRequest::builder()
             .uri("/agents")
@@ -380,32 +470,64 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_token_from_header() {
+    fn test_extract_bearer_from_header() {
         let req = make_request_with_auth_header("my-secret");
-        assert_eq!(extract_token(&req), Some("my-secret".to_string()));
+        assert_eq!(extract_bearer(&req), Some("my-secret".to_string()));
     }
 
     #[test]
-    fn test_extract_token_from_query_param() {
+    fn test_extract_bearer_ignores_query() {
+        // 长效 token 不再从 query 提取(回归锁:URL 凭据面关闭)
         let req = make_request_with_query_token("query-secret");
-        assert_eq!(extract_token(&req), Some("query-secret".to_string()));
+        assert_eq!(extract_bearer(&req), None);
     }
 
     #[test]
-    fn test_extract_token_none() {
-        let req = make_request_no_auth();
-        assert_eq!(extract_token(&req), None);
+    fn test_extract_ticket_from_query() {
+        let req = make_request_with_query_ticket("tkt-123");
+        assert_eq!(extract_ticket(&req), Some("tkt-123".to_string()));
     }
 
     #[test]
-    fn test_extract_token_header_takes_precedence() {
-        // 同时有 header 和 query param → header 优先
-        let req = HttpRequest::builder()
-            .uri("/agents/x/run/stream?token=query-secret")
-            .header("Authorization", "Bearer header-secret")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), Some("header-secret".to_string()));
+    fn test_extract_ticket_none_without_ticket() {
+        assert_eq!(extract_ticket(&make_request_no_auth()), None);
+        // 历史 ?token= 形态不被识别为 ticket(刻意不识别 → 中间件 401)
+        assert_eq!(extract_ticket(&make_request_with_query_token("x")), None);
+    }
+
+    // ===== TicketStore 单元测试 =====
+
+    #[test]
+    fn test_ticket_store_issue_and_consume_once() {
+        let store = TicketStore::default();
+        let ticket = store.issue();
+        assert_eq!(ticket.len(), 64);
+        assert!(store.consume(&ticket), "fresh ticket must be consumable");
+        // 一次性:第二遍消费失败(消费即焚)
+        assert!(!store.consume(&ticket), "ticket is single-use");
+        // 未知票
+        assert!(!store.consume("deadbeef"));
+    }
+
+    #[test]
+    fn test_ticket_store_expired_entry_rejected() {
+        // 过期判定:消费时 issued_at 距今超过 TTL 即拒(构造回拨账本直接验证)
+        let store = TicketStore::default();
+        store
+            .tickets
+            .lock()
+            .unwrap()
+            .insert("stale".to_string(), Instant::now() - TICKET_TTL - Duration::from_secs(1));
+        assert!(!store.consume("stale"), "expired ticket must be rejected");
+    }
+
+    #[test]
+    fn test_auth_config_issue_and_consume_ticket() {
+        let config = AuthConfig::new(vec!["secret".to_string()], true);
+        let (ticket, ttl) = config.issue_ticket();
+        assert_eq!(ttl, TICKET_TTL);
+        assert!(config.consume_ticket(&ticket));
+        assert!(!config.consume_ticket(&ticket));
     }
 
     // ===== auth_middleware 集成测试 =====
@@ -516,8 +638,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_middleware_query_param_fallback() {
-        // SSE 端点用 ?token=xxx fallback
+    async fn test_middleware_query_token_is_rejected() {
+        // 回归锁:历史 ?token= 形态一律 401(长效凭据不再进 URL)——
+        // 即使 token 值本身合法也拒(token= 不是凭据通道)
         let app = make_test_router(AuthConfig::new(vec!["secret".to_string()], true));
 
         let resp = app
@@ -529,7 +652,54 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_middleware_ticket_flow_accepted_and_single_use() {
+        // 换票 → ?ticket= 通行 → 二次用同票 401(一次性)
+        let config = AuthConfig::new(vec!["secret".to_string()], true);
+        let app = make_test_router(config.clone());
+
+        let (ticket, _) = config.issue_ticket();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/agents?ticket={}", ticket))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/agents?ticket={}", ticket))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_middleware_unknown_ticket_rejected() {
+        let app = make_test_router(AuthConfig::new(vec!["secret".to_string()], true));
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/agents?ticket=not-a-real-ticket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

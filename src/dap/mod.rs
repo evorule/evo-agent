@@ -12,7 +12,7 @@
 //!   launch/setBreakpoints 全协商），桥不理解内容只搬运。
 //!
 //! 治理：spawn/exit 记录进治理事件流（record-only，`dap_session` 事件型）；
-//! WS 鉴权与既有 WS 端点同款双层（auth 中间件 + `?token=` fallback）。
+//! WS 鉴权由 auth 中间件单点执法（Bearer 或 `?ticket=` 一次性短票）。
 
 use std::path::PathBuf;
 

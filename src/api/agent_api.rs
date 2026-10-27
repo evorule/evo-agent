@@ -6,7 +6,7 @@
 use axum::{
     extract::State,
     http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    response::{sse::{Event, KeepAlive, Sse}, IntoResponse},
     Json, Router,
 };
 use futures_core::Stream;
@@ -249,10 +249,11 @@ pub struct AgentApiState {
     pending_questions: QuestionStore,
     /// G17:Prometheus 指标(自定义 Registry,非全局)
     metrics: SharedMetrics,
-    /// G16:鉴权配置(WebSocket 升级前检查 ?token=,复用 G7 token 列表)
+    /// G16:鉴权配置(Bearer / 一次性 ticket,复用 G7 token 列表)
     ///
-    /// HTTP 中间件(`auth_middleware`)对普通路由生效;WebSocket 升级发生在
-    /// handler 内,需在 `ws_handler()` 中显式调用 `validate()` 做二次校验。
+    /// HTTP 中间件(`auth_middleware`)对所有受保护路由单点执法:校验
+    /// Authorization Bearer 或 `?ticket=` 一次性短票,成功后向 request
+    /// extensions 注入 AuthVia(handler 可见经由,审计同权)。
     auth_config: AuthConfig,
     /// E1:工作目录(工具沙箱基目录,写域根)
     workdir: std::path::PathBuf,
@@ -584,7 +585,7 @@ impl AgentApiState {
         &self.metrics
     }
 
-    /// G16:获取 AuthConfig 的引用(WebSocket 升级前检查 ?token=)
+    /// G16:获取 AuthConfig 的引用(ticket 换票端点等使用)
     pub fn auth_config(&self) -> &AuthConfig {
         &self.auth_config
     }
@@ -734,10 +735,11 @@ pub fn router(state: AgentApiState) -> Router {
 
 /// G7:Create Agent API routes with auth middleware
 ///
-/// 鉴权中间件对 `/health` 豁免,其余路由需要 Bearer token(或 `?token=` query param)。
+/// 鉴权中间件对 `/health` 豁免,其余路由需要 Authorization Bearer
+/// (WS/SSE 握手不能带头时经 `POST /api/auth/ticket` 换一次性票走 `?ticket=`)。
 /// `auth_config.enabled() == false` 时等价于无鉴权。
 pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::AuthConfig) -> Router {
-    // G16:把 auth_config 也注入到 state,供 WebSocket handler 在升级前做二次校验
+    // G16:把 auth_config 也注入到 state(ticket 换票端点读之)
     let state = state.with_auth_config(auth_config.clone());
     // B23:MCP server 暴露面开关(enabled=false 缺省 → /mcp 不挂载即 404,
     // fail-closed;true 时挂载,鉴权由下方 G16 中间件统一覆盖,与 /api/mcp/*
@@ -1052,12 +1054,28 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .merge(crate::api::skill_api::skills_routes())
         // B23:MCP server 暴露面(enabled=false → 空 Router,/mcp 404 fail-closed)
         .merge(mcp_server_routes(mcp_server_exposed))
+        // auth ticket 换票端点:Bearer 换一次性短票(WS/SSE query 通行用),
+        // 消费式校验执法在 auth_middleware
+        .route(
+            "/api/auth/ticket",
+            axum::routing::post(issue_auth_ticket),
+        )
         .with_state(state)
         // G7:鉴权中间件(对 /health、/metrics 豁免)
         .layer(axum::middleware::from_fn_with_state(
             auth_config,
             crate::api::auth::auth_middleware,
         ))
+}
+
+/// auth ticket 换票 handler — `POST /api/auth/ticket`
+///
+/// Bearer 凭据(经 auth_middleware 校验并注入 AuthVia::Bearer)换一次性短票,
+/// 供不能携带自定义 Authorization 头的 WS/SSE 握手经 `?ticket=` 通行。
+/// 票 TTL 30s、单次消费即焚(见 [`crate::api::auth::TicketStore`])。
+pub async fn issue_auth_ticket(State(state): State<AgentApiState>) -> impl IntoResponse {
+    let (ticket, ttl) = state.auth_config().issue_ticket();
+    Json(serde_json::json!({ "ticket": ticket, "expires_in": ttl.as_secs() }))
 }
 
 /// S4:附件上传独立子路由 —— 自带 14MB 请求体限层与同款 G7 鉴权

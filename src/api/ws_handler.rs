@@ -8,12 +8,13 @@
 //!
 //! ## 路由
 //!
-//! `GET /api/sessions/{id}/ws?agent_type=researcher&token=xxx`
+//! `GET /api/sessions/{id}/ws?agent_type=researcher&ticket=xxx`
 //!
 //! - `id`:session ID。`"new"` 表示首次连接(由服务端创建新 session),
 //!   传具体 ID 则复用已有 session(continuation 模式)。
 //! - `agent_type`:必填 query param,对应 `agents/<name>.json`,用于构造 AgentRunner。
-//! - `token`:鉴权 token(当 auth 启用时必填,复用 G7 token 列表)。
+//! - `ticket`:一次性短票(WS 握手不能带 Authorization 头,客户端先以 Bearer
+//!   换票;auth 启用时经 `?ticket=` 通行,`?token=` 长期凭据恒 401)。
 //!
 //! ## 消息协议(双向 JSON)
 //!
@@ -35,7 +36,8 @@
 //!
 //! ## 生命周期
 //!
-//! 1. 客户端连接 → 服务端在升级前校验 `?token=`,失败返回 401(不升级)。
+//! 1. 客户端连接 → 服务端在升级前由 auth 中间件校验(Authorization Bearer 或
+//!    一次性 ticket),失败返回 401(不升级)。
 //! 2. 客户端发 `message` → 服务端构造 fresh AgentRunner(每轮新建,
 //!    因 `run_streaming`/`run_continuation` 消费 `self`),
 //!    首轮调 `run_streaming`(创建 session),后续调 `run_continuation`(复用 session)。
@@ -72,7 +74,6 @@ use crate::api::agent_api::AgentApiState;
 
 /// WebSocket 连接的 query 参数
 ///
-/// - `token`:鉴权 token(auth 启用时必填)
 /// - `agent_type`:agent 类型(必填,对应 `agents/<name>.json`)
 /// - `workspace`:会话级工作区绝对路径(可选,C 批「会话级 workspace」)——
 ///   在场时本轮连接的所有轮次以该路径为能力边界根(读写同域,与 REST 面
@@ -80,8 +81,6 @@ use crate::api::agent_api::AgentApiState;
 ///   意志:改工作区须重连生效(新建会话/换线连接即携带)。
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
-    /// 鉴权 token(复用 G7 AuthConfig.validate)
-    pub token: Option<String>,
     /// agent 类型,用于加载 AgentDefinition 并构造 AgentRunner
     pub agent_type: Option<String>,
     /// 会话级工作区(可选,绝对路径;缺省=serve workdir 行为零变化)
@@ -139,39 +138,26 @@ enum WsEvent {
 
 /// G16:WebSocket 升级 handler
 ///
-/// 路由:`GET /api/sessions/{id}/ws?agent_type=xxx&token=yyy`
+/// 路由:`GET /api/sessions/{id}/ws?agent_type=xxx&ticket=yyy`
 ///
-/// 鉴权流程(双层):
-/// 1. **auth_middleware**(layer 层)检查 `?token=` query param → 失败返回 401
-///    (在 WebSocketUpgrade 提取之前执行,未授权请求不会触发 WS 升级)
-/// 2. **handler 内**二次校验 `?token=`(defense in depth)→ 失败返回 401
-/// 3. **handler 内**校验 `?agent_type=` → 缺失返回 400
-/// 4. `ws.on_upgrade(handle_ws)` — 升级 WebSocket,进入双向循环
+/// 鉴权流程(单点执法):
+/// 1. **auth_middleware**(layer 层)校验 Authorization Bearer 或 `?ticket=`
+///    一次性短票 → 失败返回 401(在 WebSocketUpgrade 提取之前执行,未授权
+///    请求不会触发 WS 升级)。ticket 消费式校验(TTL 30s,单次有效),升级
+///    前语义不变
+/// 2. **handler 内**校验 `?agent_type=` → 缺失返回 400
+/// 3. `ws.on_upgrade(handle_ws)` — 升级 WebSocket,进入双向循环
 ///
-/// 注意:auth_middleware 已对 `?token=` fallback 生效(参见 `auth::extract_token`),
-/// 因此 WebSocket 升级前鉴权由中间件保证。handler 内的二次校验是 defense in depth。
+/// 注意:`?token=` 长期凭据不再被接受(恒 401,回归锁见 auth 测试);WS 握手
+/// 不能带自定义 Authorization 头,客户端以 Bearer 换一次性 ticket 后经
+/// `?ticket=` 通行。
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AgentApiState>,
     Path(session_id): Path<String>,
     Query(query): Query<WsQuery>,
 ) -> Response {
-    // 1. 二次鉴权(defense in depth — 中间件已做第一层校验)
-    if state.auth_config().enabled() {
-        let token = match &query.token {
-            Some(t) => t.as_str(),
-            None => {
-                warn!("G16: WS upgrade rejected — missing ?token= query param");
-                return StatusCode::UNAUTHORIZED.into_response();
-            }
-        };
-        if !state.auth_config().validate(token) {
-            warn!("G16: WS upgrade rejected — invalid token");
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-    }
-
-    // 2. 必须指定 agent_type(构造 AgentRunner 需要)
+    // 1. 必须指定 agent_type(构造 AgentRunner 需要)
     let agent_type = match &query.agent_type {
         Some(t) => t.clone(),
         None => {
@@ -180,7 +166,7 @@ pub async fn ws_handler(
         }
     };
 
-    // 2.5 会话级工作区(可选):fail-visible——非绝对路径在升级期即拒(400),
+    // 2. 会话级工作区(可选):fail-visible——非绝对路径在升级期即拒(400),
     // 不让坏值漏进轮次内才报错。校验通过后交给 construct_runner 逐轮应用。
     if let Some(ws) = &query.workspace {
         if !std::path::Path::new(ws).is_absolute() {
@@ -1353,17 +1339,17 @@ mod tests {
     // ===== WsQuery 反序列化测试 =====
 
     #[test]
-    fn test_ws_query_with_token_and_agent_type() {
+    fn test_ws_query_with_agent_type() {
+        // 未知字段(如旧版 `?token=`)被 serde 忽略——旧客户端 URL 不炸,只被
+        // 中间件 401(回归锁见 auth::test_middleware_query_token_is_rejected)
         let query: WsQuery =
             serde_json::from_str(r#"{"token":"secret","agent_type":"researcher"}"#).unwrap();
-        assert_eq!(query.token.as_deref(), Some("secret"));
         assert_eq!(query.agent_type.as_deref(), Some("researcher"));
     }
 
     #[test]
     fn test_ws_query_empty() {
         let query: WsQuery = serde_json::from_str(r#"{}"#).unwrap();
-        assert!(query.token.is_none());
         assert!(query.agent_type.is_none());
     }
 
@@ -1646,8 +1632,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ws_auth_rejects_missing_token() {
-        // auth 启用 + 无 token → 401(auth_middleware 在 WS 提取前拦截)
+    async fn test_ws_auth_rejects_missing_credentials() {
+        // auth 启用 + 无 Bearer/无 ticket → 401(auth_middleware 在 WS 提取前拦截)
         let state = make_test_state();
         let auth = AuthConfig::new(vec!["secret".to_string()], true);
         let app = router_with_auth(state, auth);
@@ -1670,8 +1656,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ws_auth_rejects_wrong_token() {
-        // auth 启用 + 错误 token → 401
+    async fn test_ws_auth_rejects_query_token() {
+        // auth 启用 + query 长期凭据 `?token=` → 恒 401(query 凭据已废止,
+        // 刻意不识别;客户端改走 Bearer 换一次性 ticket)
         let state = make_test_state();
         let auth = AuthConfig::new(vec!["secret".to_string()], true);
         let app = router_with_auth(state, auth);
@@ -1691,6 +1678,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_ws_tcp_valid_ticket_upgrade_succeeds() {
+        // 真实 TCP server:auth 启用 + Bearer 换取的一次性 ticket → `?ticket=`
+        // 通行中间件,升级成功(101);同票二次消费将 401(见 auth::TicketStore 测试)
+        let state = make_test_state();
+        let auth = AuthConfig::new(vec!["secret".to_string()], true);
+        let (ticket, _ttl) = auth.issue_ticket();
+        let (addr, _handle) = start_test_server(state, Some(auth)).await;
+
+        let url = format!(
+            "ws://{}/api/sessions/new/ws?agent_type=test&ticket={ticket}",
+            addr
+        );
+        let result = tokio_tungstenite::connect_async(url).await;
+
+        assert!(result.is_ok(), "should upgrade with valid one-time ticket");
     }
 
     // ===== WebSocket 集成测试(真实 TCP server + tokio-tungstenite) =====
@@ -1736,7 +1741,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ws_tcp_invalid_token_rejected() {
-        // 真实 TCP server:auth 启用 + 错误 token → 401
+        // 真实 TCP server:auth 启用 + query 长期凭据 `?token=` → 401(已废止)
         let state = make_test_state();
         let auth = AuthConfig::new(vec!["secret".to_string()], true);
         let (addr, _handle) = start_test_server(state, Some(auth)).await;
