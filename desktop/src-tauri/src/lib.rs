@@ -166,6 +166,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             wizard::wizard_save_key,
             wizard::wizard_provider_status,
             wizard::wizard_save_provider_key,
+            wizard::wizard_custom_providers,
+            wizard::wizard_save_custom_provider,
+            wizard::wizard_remove_custom_provider,
+            wizard::wizard_test_provider,
             wizard::wizard_workspace_status,
             wizard::wizard_save_workspace,
             wizard::wizard_finish

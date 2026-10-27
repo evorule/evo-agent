@@ -374,14 +374,29 @@ fn spawn_serve(
     Ok(serve)
 }
 
+/// 已配置 key 的 provider 合并视图（内置目录+自定义；自定义清单损坏=留痕
+/// 后仅按内置目录降级，绝不静默吞）。
+fn configured_providers(paths: &ResolvedPaths) -> Vec<(crate::wizard::OwnedProvider, String)> {
+    let all = match crate::wizard::read_all_providers(paths) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[orch] custom providers list corrupt, degrading to built-in only: {e}");
+            crate::wizard::catalog_providers()
+        }
+    };
+    all.into_iter()
+        .filter_map(|p| crate::wizard::read_provider_key(paths, &p.name).map(|k| (p, k)))
+        .collect()
+}
+
 /// 壳生成的执行体运行时配置（每次拉起覆写）。动态值——监听端口/引擎地址/
 /// 白名单物料绝对路径——不允许静态模板承载；key 与调用方令牌一律走 env，
 /// 不进本文件。server_auth_token 置空：本拓扑下执行体只被 serve 调用
 /// （/llm/execute），不主动调引擎。
 ///
-/// 多 provider 路由：已配置 key 的内置目录 provider 生成为 `llm_providers`
-/// 节（按模型路由端点与凭据）；同时保留 `llm_execute_url` 单端点形态——
-/// 旧版捆绑插件忽略未知配置键时按单端点路径降级工作（向前向后兼容）。
+/// 多 provider 路由：已配置 key 的 provider（内置目录+自定义）生成为
+/// `llm_providers` 节（按模型路由端点与凭据）；同时保留 `llm_execute_url`
+/// 单端点形态——旧版捆绑插件忽略未知配置键时按单端点路径降级工作。
 fn write_ai_plugin_config(
     paths: &ResolvedPaths,
     listen_port: u16,
@@ -403,19 +418,18 @@ fn write_ai_plugin_config(
         "llm_timeout_ms": 60000,
         "model_allowlist_path": allowlist.display().to_string(),
     });
-    let providers = crate::wizard::read_provider_keys(paths);
+    let providers = configured_providers(paths);
     if !providers.is_empty() {
         cfg["llm_providers"] = serde_json::Value::Array(
             providers
                 .iter()
-                .filter_map(|(name, _)| {
-                    let entry = crate::wizard::catalog_entry(name)?;
-                    Some(serde_json::json!({
-                        "name": name,
-                        "execute_url": entry.execute_url,
-                        "api_key_env": crate::wizard::provider_key_env(name),
-                        "models": entry.models,
-                    }))
+                .map(|(p, _)| {
+                    serde_json::json!({
+                        "name": p.name,
+                        "execute_url": p.execute_url,
+                        "api_key_env": crate::wizard::provider_key_env(&p.name),
+                        "models": p.models,
+                    })
                 })
                 .collect(),
         );
@@ -426,12 +440,15 @@ fn write_ai_plugin_config(
 }
 
 /// 主 key（legacy 单端点 env 兼容载体）：minimax 优先（单 key 时代语义），
-/// 缺位取目录序第一个已配置 provider。仅供旧版捆绑插件降级路径与
+/// 缺位取合并视图第一个已配置 provider。仅供旧版捆绑插件降级路径与
 /// EVORULE_AI_PLUGIN_LLM_API_KEY env 使用；路由模式各 provider 用专属 env。
 fn read_primary_llm_key(paths: &ResolvedPaths) -> Option<String> {
     match crate::wizard::read_provider_key(paths, "minimax") {
         Some(k) => Some(k),
-        None => crate::wizard::read_provider_keys(paths).into_iter().next().map(|(_, k)| k),
+        None => configured_providers(paths)
+            .into_iter()
+            .next()
+            .map(|(_, k)| k),
     }
 }
 
@@ -477,8 +494,8 @@ fn spawn_ai_plugin(
         .env("EVORULE_AI_PLUGIN_CALLER_TOKEN", ctx.executor_token)
         .env("EVORULE_AI_PLUGIN_LLM_API_KEY", llm_key);
     // 路由模式：各 provider 专属 key env（凭据只走 env，不落盘不进命令行）
-    for (name, key) in crate::wizard::read_provider_keys(paths) {
-        cmd.env(crate::wizard::provider_key_env(name), key);
+    for (p, key) in configured_providers(paths) {
+        cmd.env(crate::wizard::provider_key_env(&p.name), key);
     }
     cmd.stdout(Stdio::from(out_log))
         .stderr(Stdio::from(err_log))
@@ -756,7 +773,10 @@ mod tests {
         // 零落盘红线延伸：路由节同样不得出现 key 本体
         assert!(raw.contains("api_key_env") && !raw.contains("sk-ds-test"));
         // 单端点形态保留（旧版捆绑插件降级路径）
-        assert!(v["llm_execute_url"].as_str().unwrap().starts_with("https://"));
+        assert!(v["llm_execute_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://"));
         // 主 key 兼容载体：无 minimax key 时回落目录序第一个
         let primary = read_primary_llm_key(&paths).unwrap();
         assert_eq!(primary, "sk-ds-test");
@@ -771,6 +791,41 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(v.get("llm_providers").is_none(), "无 key 不生成路由节");
         assert!(read_primary_llm_key(&paths).is_none());
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn ai_plugin_config_includes_custom_providers() {
+        let paths = scratch_paths("custom-cfg");
+        let custom = serde_json::json!([{
+            "name": "myprov",
+            "display": "My Provider",
+            "execute_url": "https://api.example.com/v1/chat/completions",
+            "models": ["model-a"]
+        }]);
+        std::fs::write(
+            paths.app_config_dir.join("llm-custom-providers.json"),
+            custom.to_string(),
+        )
+        .unwrap();
+        let keys_dir = paths.app_config_dir.join("llm-keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+        std::fs::write(keys_dir.join("myprov.txt"), "sk-custom\n").unwrap();
+        write_ai_plugin_config(&paths, 19134, 18080).unwrap();
+        let raw = std::fs::read_to_string(paths.runtime_dir.join("ai-plugin.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let providers = v["llm_providers"].as_array().expect("providers emitted");
+        let mine = providers
+            .iter()
+            .find(|p| p["name"] == "myprov")
+            .expect("custom provider routed");
+        assert_eq!(
+            mine["execute_url"],
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(mine["api_key_env"], "EVORULE_AI_PLUGIN_LLM_KEY_MYPROV");
+        // 零落盘红线：自定义 key 本体不入配置文件
+        assert!(!raw.contains("sk-custom"));
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 

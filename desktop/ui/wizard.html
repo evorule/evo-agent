@@ -222,6 +222,19 @@
             模型可用范围以工作区准入白名单为准。
           </p>
           <div id="provider-list"></div>
+          <div id="custom-list"></div>
+          <div class="provider-row" style="margin-top:10px">
+            <span class="p-name">自定义+</span>
+            <input id="cp-name" type="text" placeholder="id(小写字母数字)" autocomplete="off" spellcheck="false" style="max-width:130px" />
+            <input id="cp-url" type="text" placeholder="https://…/v1/chat/completions" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="provider-row">
+            <span class="p-name"></span>
+            <input id="cp-models" type="text" placeholder="模型名, 逗号分隔" autocomplete="off" spellcheck="false" />
+            <input id="cp-key" type="password" placeholder="sk-…" autocomplete="off" />
+            <button class="btn" id="cp-save" type="button">保存服务</button>
+          </div>
+          <p class="msg" id="cp-msg"></p>
         </details>
       </section>
 
@@ -406,9 +419,49 @@
 
       btnSkip.addEventListener("click", finishAndClose);
 
-      // ---- 更多模型服务（可选；分 provider key 录入，DPAPI 落 llm-keys/） ----
+      // ---- 更多模型服务（可选；分 provider key 录入+连通性测试+自定义服务，DPAPI 落 llm-keys/） ----
+      async function testProvider(executeUrl, model, key, name, stateEl) {
+        stateEl.textContent = "测试中…";
+        stateEl.className = "p-state no";
+        try {
+          const r = await invoke("wizard_test_provider", {
+            req: { execute_url: executeUrl, model, key: key || "", name: name || "" },
+          });
+          if (r.ok) {
+            stateEl.textContent = `测试通过 ${r.latency_ms}ms`;
+            stateEl.className = "p-state ok";
+          } else {
+            const detail = (r.error_detail || "").slice(0, 60);
+            stateEl.textContent = `失败[${r.error_class}] ${detail}`;
+            stateEl.className = "p-state no";
+          }
+        } catch (e) {
+          stateEl.textContent = "失败 " + e;
+          stateEl.className = "p-state no";
+        }
+      }
+
+      function makeTestBtn(getReq, stateEl) {
+        const btn = document.createElement("button");
+        btn.className = "btn";
+        btn.type = "button";
+        btn.textContent = "测试";
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
+          try {
+            const req = getReq();
+            if (!req.model) { stateEl.textContent = "缺模型名"; return; }
+            await testProvider(req.execute_url, req.model, req.key, req.name, stateEl);
+          } finally {
+            btn.disabled = false;
+          }
+        });
+        return btn;
+      }
+
       async function loadProviders() {
         const list = $("provider-list");
+        const customList = $("custom-list");
         if (!list || !invoke) return;
         try {
           const rows = await invoke("wizard_provider_status");
@@ -427,16 +480,16 @@
             input.placeholder = "sk-…";
             input.autocomplete = "off";
             input.spellcheck = false;
-            const btn = document.createElement("button");
-            btn.className = "btn";
-            btn.type = "button";
-            btn.textContent = "保存";
-            btn.disabled = true;
+            const saveBtn = document.createElement("button");
+            saveBtn.className = "btn";
+            saveBtn.type = "button";
+            saveBtn.textContent = "保存";
+            saveBtn.disabled = true;
             input.addEventListener("input", () => {
-              btn.disabled = input.value.trim().length === 0;
+              saveBtn.disabled = input.value.trim().length === 0;
             });
-            btn.addEventListener("click", async () => {
-              btn.disabled = true;
+            saveBtn.addEventListener("click", async () => {
+              saveBtn.disabled = true;
               try {
                 await invoke("wizard_save_provider_key", {
                   name: p.name,
@@ -446,16 +499,113 @@
               } catch (e) {
                 state.textContent = String(e);
                 state.className = "p-state no";
-                btn.disabled = false;
+                saveBtn.disabled = false;
               }
             });
-            row.append(name, state, input, btn);
+            const testBtn = makeTestBtn(
+              () => ({
+                execute_url: p.execute_url,
+                model: (p.models && p.models[0]) || "",
+                key: input.value.trim(),
+                name: p.name,
+              }),
+              state
+            );
+            row.append(name, state, input, saveBtn, testBtn);
             list.append(row);
+          }
+          // 自定义服务行（可移除；key 可轮换）
+          customList.innerHTML = "";
+          const customs = await invoke("wizard_custom_providers");
+          for (const c of customs) {
+            const row = document.createElement("div");
+            row.className = "provider-row";
+            const name = document.createElement("span");
+            name.className = "p-name";
+            name.textContent = c.display || c.name;
+            const state = document.createElement("span");
+            state.className = "p-state ok";
+            state.textContent = "已配置";
+            const input = document.createElement("input");
+            input.type = "password";
+            input.placeholder = "新 key（留空=沿用）";
+            input.autocomplete = "off";
+            input.spellcheck = false;
+            const saveBtn = document.createElement("button");
+            saveBtn.className = "btn";
+            saveBtn.type = "button";
+            saveBtn.textContent = "更新key";
+            saveBtn.disabled = true;
+            input.addEventListener("input", () => {
+              saveBtn.disabled = input.value.trim().length === 0;
+            });
+            saveBtn.addEventListener("click", async () => {
+              try {
+                await invoke("wizard_save_provider_key", { name: c.name, key: input.value });
+                state.textContent = "key 已更新";
+                input.value = "";
+                saveBtn.disabled = true;
+              } catch (e) {
+                state.textContent = String(e);
+              }
+            });
+            const testBtn = makeTestBtn(
+              () => ({
+                execute_url: c.execute_url,
+                model: (c.models && c.models[0]) || "",
+                key: input.value.trim(),
+                name: c.name,
+              }),
+              state
+            );
+            const delBtn = document.createElement("button");
+            delBtn.className = "btn";
+            delBtn.type = "button";
+            delBtn.textContent = "移除";
+            delBtn.addEventListener("click", async () => {
+              try {
+                await invoke("wizard_remove_custom_provider", { name: c.name });
+                await loadProviders();
+              } catch (e) {
+                state.textContent = String(e);
+              }
+            });
+            row.append(name, state, input, saveBtn, testBtn, delBtn);
+            customList.append(row);
           }
         } catch (e) {
           list.textContent = "读取模型服务列表失败：" + e;
         }
       }
+
+      $("cp-save").addEventListener("click", async () => {
+        const msg = $("cp-msg");
+        const name = $("cp-name").value.trim();
+        const models = $("cp-models").value.split(",").map((s) => s.trim()).filter(Boolean);
+        msg.textContent = "";
+        try {
+          await invoke("wizard_save_custom_provider", {
+            provider: {
+              name,
+              display: name,
+              execute_url: $("cp-url").value.trim(),
+              models,
+            },
+          });
+          if ($("cp-key").value.trim()) {
+            await invoke("wizard_save_provider_key", { name, key: $("cp-key").value });
+          }
+          msg.textContent = "自定义服务已保存。";
+          $("cp-name").value = "";
+          $("cp-url").value = "";
+          $("cp-models").value = "";
+          $("cp-key").value = "";
+          await loadProviders();
+        } catch (e) {
+          msg.textContent = String(e);
+        }
+      });
+
       $("more-providers").addEventListener("toggle", function () {
         if (this.open) loadProviders();
       });

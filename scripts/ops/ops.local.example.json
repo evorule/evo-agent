@@ -2,39 +2,75 @@
   "log_dir": "C:\\path\\to\\evo-agent\\data\\ops",
   "services": {
     "evorule-server": {
-      "probe": { "type": "http", "url": "http://127.0.0.1:18080/api/health", "timeout_sec": 4 },
+      "probe": {
+        "type": "http",
+        "url": "http://127.0.0.1:18080/api/health",
+        "timeout_sec": 4
+      },
       "exe": "C:\\path\\to\\evorule-server\\target\\release\\evorule-server.exe",
       "args": "--addr 127.0.0.1:18080 --insecure-serve --rules-dir C:\\path\\to\\evorule-server\\data\\agent-governance\\rules --db-path C:\\path\\to\\evorule-server\\data\\agent-governance\\evorule.db --workspace-db C:\\path\\to\\evorule-server\\data\\agent-governance\\workspace.db --core-eval C:\\path\\to\\evorule-server\\resources\\server_eval.json --no-rate-limit --service-registry C:\\path\\to\\evorule-server\\service_registry.json --io-warn-timeout-secs 1800 --io-error-timeout-secs 3600 --allow-loopback --log-file C:\\path\\to\\evorule-server\\data\\agent-governance\\logs\\server.log",
       "workdir": "C:\\path\\to\\evorule-server",
       "freshness": {
         "repo": "C:\\path\\to\\evorule-server",
-        "paths": ["src", "Cargo.toml", "Cargo.lock", "build.rs"],
+        "paths": [
+          "src",
+          "Cargo.toml",
+          "Cargo.lock",
+          "build.rs"
+        ],
         "policy": "enforce"
       }
     },
     "echo": {
-      "probe": { "type": "tcp", "port": 9100, "timeout_sec": 3 },
+      "probe": {
+        "type": "tcp",
+        "port": 9100,
+        "timeout_sec": 3
+      },
       "exe": "python",
       "args": "C:\\path\\to\\evorule-server\\echo_server.py",
       "workdir": "C:\\path\\to\\evorule-server"
     },
     "evo-agent-serve": {
-      "probe": { "type": "http", "url": "http://127.0.0.1:8081/health", "timeout_sec": 4 },
+      "probe": {
+        "type": "http",
+        "url": "http://127.0.0.1:8081/health",
+        "timeout_sec": 4
+      },
       "exe": "C:\\path\\to\\evo-agent\\target\\release\\evo-agent.exe",
       "args": "serve --host 127.0.0.1 --port 8081 --no-auth",
       "workdir": "C:\\path\\to\\evo-agent",
       "env_file": "C:\\path\\to\\evo-agent\\.env",
       "freshness": {
         "repo": "C:\\path\\to\\evo-agent",
-        "paths": ["src", "Cargo.toml", "Cargo.lock", "build.rs"],
+        "paths": [
+          "src",
+          "Cargo.toml",
+          "Cargo.lock",
+          "build.rs"
+        ],
         "policy": "enforce"
       }
     },
     "console": {
-      "probe": { "type": "tcp", "port": 5174, "timeout_sec": 3 },
+      "probe": {
+        "type": "tcp",
+        "port": 5174,
+        "timeout_sec": 3
+      },
       "exe": "node",
       "args": "C:\\path\\to\\evorule-console-cloud\\node_modules\\vite\\bin\\vite.js dev --port 5174 --strictPort --host 127.0.0.1",
       "workdir": "C:\\path\\to\\evorule-console-cloud"
+    },
+    "ai-plugin": {
+      "probe": {
+        "type": "tcp",
+        "port": 9130,
+        "timeout_sec": 3
+      },
+      "exe": "C:\\path\\to\\evorule-server\\plugins\\ai-plugin\\target\\release\\evorule-ai-plugin.exe",
+      "args": "--config C:\\path\\to\\evorule-server\\ai-plugin.json",
+      "workdir": "C:\\path\\to\\evorule-server"
     }
   }
 }

@@ -84,6 +84,11 @@ Write-Host "运行时目录: $RulesDir"
 if ($Check) { Write-Host "模式: 校验(不写)" } else { Write-Host "模式: 同步(写入需人工确认)" }
 Write-Host ""
 
+# 模型准入白名单已参数化（配置面 model-admission.json + sync-model-admission.ps1
+# 翻译器直落 rules_dir），本单向同步链对其跳过——运行时自治；出厂种子仅在
+# 全新部署时装载。撤销参数化需删除本特判并恢复正本同步。
+$ParameterizedRuleIds = @('com.evorule.constraint.model_allowlist')
+
 foreach ($src in $sources) {
     # 本链同步对象=约束链正本(tier=constraint); 其余(业务/留痕型)不经
     # agent-governance 约束目录部署, 信息性跳过
@@ -91,6 +96,10 @@ foreach ($src in $sources) {
     if (-not $meta -or $meta.metadata.tier -ne 'constraint') {
         $tier = if ($meta) { $meta.metadata.tier } else { 'unknown' }
         Write-Host "[LOCAL-ONLY] $($src.Name) 非约束链正本(tier=$tier), 不走本同步链"
+        continue
+    }
+    if ($meta.id -and $ParameterizedRuleIds -contains $meta.id) {
+        Write-Host "[PARAMETERIZED] $($src.Name) 已走配置面参数化(model-admission.json), 本链跳过"
         continue
     }
     $dst = Join-Path $RulesDir $src.Name
