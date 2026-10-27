@@ -1055,7 +1055,9 @@ async fn send_ws_json(
 /// `{"type":"SessionCreated","session_id":"42"}`
 ///
 /// 注意:AgentEvent 和 AgentError 未 derive Serialize,需手动映射(同 `agent_event_to_sse`)。
-fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json::Value {
+/// 本函数=结构化事件帧契约的单一事实源:serve WS 面与 CLI `run --json` NDJSON 面
+/// 共用此映射,两帧面逐帧同构(同构断言测试锁定)。
+pub fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json::Value {
     match event {
         Ok(AgentEvent::SessionCreated {
             session_id,
@@ -1177,6 +1179,19 @@ fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json::Val
             "type": "Error",
             "error": err.to_string(),
         }),
+    }
+}
+
+/// 把 AgentEvent(或流级错误)序列化为一行 JSON(NDJSON)或缩进 JSON
+///
+/// CLI `run --json` 的输出形态:compact=一行一事件(管道/jq 消费);
+/// pretty=缩进多行(人读检视)。帧内容与 [`agent_event_to_json`](serve WS 面)完全一致。
+pub fn agent_event_json_line(event: Result<AgentEvent, AgentError>, pretty: bool) -> String {
+    let value = agent_event_to_json(event);
+    if pretty {
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+    } else {
+        value.to_string()
     }
 }
 
@@ -1457,6 +1472,128 @@ mod tests {
         let v = agent_event_to_json(Err(AgentError::Internal("stream broke".to_string())));
         assert_eq!(v["type"], "Error");
         assert!(v["error"].as_str().unwrap().contains("stream broke"));
+    }
+
+    // ===== CLI JSON 事件面同构断言(NDJSON 行形态与 WS 帧逐帧一致) =====
+
+    /// 固定事件样本:覆盖全部帧变体(含流级错误);每次调用产出新鲜实例
+    fn sample_frame_events() -> Vec<Result<AgentEvent, AgentError>> {
+        use crate::agent::AgentResult;
+        vec![
+            Ok(AgentEvent::SessionCreated {
+                session_id: "s-iso".to_string(),
+                memory_enabled: true,
+                constitution: Some("pass@2".to_string()),
+            }),
+            Ok(AgentEvent::Step { step: 1 }),
+            Ok(AgentEvent::LlmDelta {
+                text: "he\nllo".to_string(),
+            }),
+            Ok(AgentEvent::LlmThinkingDelta {
+                text: "想".to_string(),
+            }),
+            Ok(AgentEvent::ToolCall {
+                name: "search".to_string(),
+                args: serde_json::json!({"q": "iso"}),
+            }),
+            Ok(AgentEvent::ToolResult {
+                name: "search".to_string(),
+                result: serde_json::json!({"hits": 1}),
+            }),
+            Ok(AgentEvent::LlmDone {
+                content: "ok".to_string(),
+                finish_reason: Some("stop".to_string()),
+            }),
+            Ok(AgentEvent::PlanSubmitted {
+                plan_id: "p-1".to_string(),
+                plan: serde_json::json!({"steps": ["a", "b"]}),
+            }),
+            Ok(AgentEvent::Info("rewind".to_string())),
+            Ok(AgentEvent::ApprovalRequired {
+                tool_name: "shell_exec".to_string(),
+                command: "echo hi".to_string(),
+                risk: "low".to_string(),
+                alternative: String::new(),
+                proposal_id: "ap-iso".to_string(),
+            }),
+            Ok(AgentEvent::ApprovalResult {
+                tool_name: "shell_exec".to_string(),
+                approved: true,
+                approver: "user".to_string(),
+                auto_rejected: false,
+            }),
+            Ok(AgentEvent::AskUser {
+                question_id: "q-1".to_string(),
+                question: "pick".to_string(),
+                options: vec!["a".to_string(), "b".to_string()],
+                multi_select: false,
+                timeout_secs: 30,
+            }),
+            Ok(AgentEvent::AskUserResult {
+                question_id: "q-1".to_string(),
+                answered: true,
+                timed_out: false,
+            }),
+            Ok(AgentEvent::Error(AgentError::LlmError("mid".to_string()))),
+            Ok(AgentEvent::Done(AgentResult::success(
+                "final".to_string(),
+                2,
+                50,
+                vec!["search".to_string()],
+            ))),
+            Err(AgentError::Internal("stream broke".to_string())),
+        ]
+    }
+
+    #[test]
+    fn json_line_matches_ws_frame_for_every_variant() {
+        // 同构锚:同一事件,WS 帧映射与 CLI NDJSON 行形态(compact+pretty)一致
+        for ev in sample_frame_events() {
+            let ws_frame = agent_event_to_json(ev.clone());
+            let line = agent_event_json_line(ev.clone(), false);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&line).expect("ndjson line parses");
+            assert_eq!(parsed, ws_frame);
+
+            let pretty: serde_json::Value =
+                serde_json::from_str(&agent_event_json_line(ev, true)).unwrap();
+            assert_eq!(pretty, ws_frame);
+        }
+    }
+
+    #[test]
+    fn json_line_compact_is_single_line_ndjson() {
+        // NDJSON 契约:compact 形态一行一事件,载荷内换行被 JSON 转义不破行
+        let ev = Ok(AgentEvent::LlmDelta {
+            text: "line1\nline2".to_string(),
+        });
+        let line = agent_event_json_line(ev, false);
+        assert_eq!(line.lines().count(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["text"], "line1\nline2");
+    }
+
+    #[test]
+    fn json_lines_sequence_matches_ws_frames_frame_by_frame() {
+        // 事件序列合成 NDJSON 流,按行解析后与 WS 面逐帧对照
+        let events = sample_frame_events();
+        let ws: Vec<serde_json::Value> = events
+            .iter()
+            .map(|e| agent_event_to_json(e.clone()))
+            .collect();
+        let stream = events
+            .iter()
+            .map(|e| agent_event_json_line(e.clone(), false))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Vec<serde_json::Value> = stream
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(parsed.len(), ws.len());
+        for (p, w) in parsed.iter().zip(ws.iter()) {
+            assert_eq!(p, w);
+        }
     }
 
     // ===== 鉴权 + 路由集成测试 =====

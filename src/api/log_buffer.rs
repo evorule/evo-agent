@@ -24,13 +24,34 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogTee {
     type Writer = TeeWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        TeeWriter { buf: Vec::new() }
+        TeeWriter {
+            buf: Vec::new(),
+            to_stderr: false,
+        }
+    }
+}
+
+/// stderr 变体:结构化事件面(CLI run --json 的 stdout NDJSON 契约)专用——
+/// 日志转发 stderr,stdout 只承载事件帧;环形缓冲行为与 stdout 变体一致
+#[derive(Clone, Copy, Default)]
+pub struct LogTeeStderr;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogTeeStderr {
+    type Writer = TeeWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TeeWriter {
+            buf: Vec::new(),
+            to_stderr: true,
+        }
     }
 }
 
 /// 单事件收集器:fmt 层把格式化好的一条日志写入 buf,Drop 时双写
 pub struct TeeWriter {
     buf: Vec<u8>,
+    /// 转发目标:false=stdout(默认,进程既有行为),true=stderr(结构化事件面)
+    to_stderr: bool,
 }
 
 impl Write for TeeWriter {
@@ -46,9 +67,14 @@ impl Write for TeeWriter {
 
 impl Drop for TeeWriter {
     fn drop(&mut self) {
-        // stdout 转发(进程既有行为零变化)
-        let _ = std::io::stdout().write_all(&self.buf);
-        let _ = std::io::stdout().flush();
+        // 转发(默认 stdout 原样;stderr 变体服务 stdout 纯净的 JSON 事件面)
+        if self.to_stderr {
+            let _ = std::io::stderr().write_all(&self.buf);
+            let _ = std::io::stderr().flush();
+        } else {
+            let _ = std::io::stdout().write_all(&self.buf);
+            let _ = std::io::stdout().flush();
+        }
         // 环形缓冲(截超长单条防内存尖刺;锁毒化时丢弃本条,日志面不致命)
         let mut text = String::from_utf8_lossy(&self.buf).into_owned();
         text.truncate(text.trim_end_matches('\n').len()); // 去 fmt 层尾换行,入环归一
