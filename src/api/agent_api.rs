@@ -831,6 +831,15 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/sessions/{id}/compact",
             axum::routing::post(compact_session),
         )
+        // 后台任务:用户直发派生+结果轻投影
+        .route(
+            "/agents/{type}/spawn",
+            axum::routing::post(spawn_background_task),
+        )
+        .route(
+            "/api/sessions/{id}/result",
+            axum::routing::get(get_session_result),
+        )
         .route(
             "/api/sessions/{id}/compaction",
             axum::routing::get(get_session_compaction),
@@ -3192,6 +3201,150 @@ async fn get_checkpoint_diff(
         "cp_version": cp_version,
         "current_version": current,
         "diff": diff,
+    })))
+}
+
+// =============================================================================
+// 后台任务直发(用户不经 LLM 直接派生后台 agent 会话;44 号方案乙)
+// =============================================================================
+
+/// 后台任务派生请求体
+#[derive(Debug, serde::Deserialize)]
+struct SpawnTaskRequest {
+    /// 后台任务目标(必填)
+    goal: String,
+    /// 父会话 id(fork 因果链上账+谱系可见;前端传当前会话)
+    session_id: String,
+}
+
+/// 用户直发后台任务:fork 父会话为独立子会话,以用户 goal 直接驱动
+/// (不经 LLM 中转;链护栏=深度/预算/熔断全套继承 spawn_factory)。
+/// 返回 {child_session_id};进度经 B25 谱系面板与会话列表观测,结果经
+/// transcript/result 端点回查。
+async fn spawn_background_task(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(agent_type): axum::extract::Path<String>,
+    Json(body): Json<SpawnTaskRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if body.goal.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "goal is required".to_string()));
+    }
+    if body.session_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "session_id (parent session) is required".to_string(),
+        ));
+    }
+    let def = state
+        .definitions()
+        .load(&agent_type)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let agents_md = crate::agent::runner::load_agents_md_segment(state.workdir());
+    let governance_segment =
+        crate::api::serve_tools::build_governance_segment(&state.evorule_client, &def.tools).await;
+    let (merged_settings, _) = state.workbench_settings().merged();
+    let filtered = crate::api::serve_tools::build_filtered_toolkit_with_switches(
+        &state.toolkit(),
+        &def.tools,
+        &merged_settings,
+    );
+    let llm_handler = crate::io_handlers::LlmHandler::from_config(&state.llm_config());
+    let runner = AgentRunner::from_definition(
+        def.clone(),
+        state.evorule_client.clone(),
+        filtered,
+        Some(llm_handler.clone()),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .with_agents_md_segment(agents_md)
+    .with_governance_segment(governance_segment)
+    .with_journal_dir(state.workdir.join("data").join("sessions"))
+    .with_workspace_checkpoint(&state.workdir)
+    .with_compaction_policy(crate::agent::runner::CompactionPolicy::from_settings(
+        &merged_settings,
+    ))
+    .with_metrics(state.metrics.clone());
+    // fork:因果链上账+声明继承(spawn 链同款机制层)
+    let child_id = state
+        .evorule_client()
+        .create_session_fork(&body.session_id, None)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("fork failed: {e}")))?;
+    // 链护栏:预算=4×会话窗口(与 runner 内链懒建口径一致)
+    let budget = (def.context_window_tokens.unwrap_or(8192) as u64)
+        .saturating_mul(crate::agent::session_spawn_tool::CHAIN_BUDGET_WINDOW_MULT);
+    let chain = std::sync::Arc::new(crate::agent::session_spawn_tool::ChainRuntimeState::new(
+        budget,
+    ));
+    let factory = runner.spawn_factory(chain.clone());
+    let child_runner = factory(&child_id);
+    let goal = body.goal.clone();
+    let child_for_drain = child_id.clone();
+    // 派生锚落父 journal(B25 谱系面/任务列表数据源;直发路径与工具路径同账)
+    if let Ok(j) = crate::agent::journal::JournalWriter::open(
+        &state.workdir.join("data").join("sessions"),
+        &body.session_id,
+    ) {
+        if let Err(e) = j.session_spawned(&body.session_id, &child_id, 1) {
+            tracing::warn!(error = %e, "background spawn anchor journal failed");
+        }
+    }
+    // 后台排水:事件流消费至终态(错误 warn 留痕;完成通知走前端 REST merge 轮询收色)
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        let mut stream = child_runner.run_continuation(child_for_drain.clone(), goal, Vec::new());
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                tracing::warn!(
+                    session_id = %child_for_drain,
+                    error = %e,
+                    "background task: child continuation errored"
+                );
+            }
+        }
+        info!(session_id = %child_for_drain, "background task: continuation stream ended");
+    });
+    Ok(Json(serde_json::json!({
+        "status": "spawned",
+        "child_session_id": child_id.clone(),
+        "parent_session_id": body.session_id,
+        "agent_type": agent_type,
+        "goal": body.goal,
+    })))
+}
+
+/// 后台任务结果轻投影:子会话末条 assistant 消息(任务面板免跳转)
+async fn get_session_result(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let agent_type = q
+        .get("agent_type")
+        .cloned()
+        .or_else(|| {
+            state
+                .session_index()
+                .list()
+                .into_iter()
+                .find(|e| e.session_id == session_id)
+                .map(|e| e.agent_type)
+        })
+        .unwrap_or_else(|| "general".to_string());
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+    let messages =
+        crate::api::session_index::load_transcript(state.evorule_client(), &session_id, &namespace)
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let last_assistant = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| serde_json::json!({ "content": m.content, "idx": m.idx }));
+    Ok(Json(serde_json::json!({
+        "session_id": session_id,
+        "result": last_assistant,
     })))
 }
 
