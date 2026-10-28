@@ -5209,3 +5209,22 @@ fn with_tool_calls_builder_keeps_failure_semantics() {
     assert!(!r.cancelled);
     assert_eq!(r.tool_calls, vec!["http_get".to_string()]);
 }
+
+// ===== frontmatter 轻量解析的留痕语义(嵌套/列表不静默不污染) =====
+
+#[test]
+fn frontmatter_nested_and_list_entries_do_not_pollute_fields() {
+    let md = "---\nname: demo\ndescription: >\n  folded text\nitems:\n  - a\n  - b\n---\nbody\n";
+    let fm = crate::agent::definition::parse_skill_frontmatter(md).expect("fence 完整应解析成功");
+    assert_eq!(fm.name.as_deref(), Some("demo"));
+    // 折叠/嵌套 description 不得被写成指示符或空串污染 manifest 渲染
+    assert_eq!(fm.description, None);
+}
+
+#[test]
+fn frontmatter_plain_keys_still_parse() {
+    let md = "---\nname: demo\ndescription: \"plain text\"\n---\nbody\n";
+    let fm = crate::agent::definition::parse_skill_frontmatter(md).unwrap();
+    assert_eq!(fm.name.as_deref(), Some("demo"));
+    assert_eq!(fm.description.as_deref(), Some("plain text"));
+}
