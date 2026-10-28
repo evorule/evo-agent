@@ -263,6 +263,44 @@ export function replaySession(sid) {
   return fetch(`/api/sessions/${encodeURIComponent(sid)}/replay`, { headers: headers() }).then(unwrap);
 }
 
+// ===== 会话检查点(手动存档+引擎版本回滚) =====
+
+/** 引擎版本时间线({session_id, latest, versions:[{version, facts}]}) */
+export function listSessionVersions(sid) {
+  return fetch(`/api/sessions/${encodeURIComponent(sid)}/versions`, { headers: headers() }).then(unwrap);
+}
+
+/** 手动回滚引擎 fact 链到指定版本({requested_version, actual_version};活跃轮 409) */
+export function rewindSession(sid, version) {
+  return fetch(`/api/sessions/${encodeURIComponent(sid)}/rewind`, {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ version }),
+  }).then(unwrap);
+}
+
+/** 手动检查点列表({checkpoints:[{cp_id,label,saved_at,count,engine_version}]}) */
+export function listCheckpoints(sid) {
+  return fetch(`/api/sessions/${encodeURIComponent(sid)}/checkpoints`, { headers: headers() }).then(unwrap);
+}
+
+/** 打点:transcript 快照+当前引擎版本锚定({cp_id,label,engine_version,count};活跃轮 409) */
+export function createCheckpoint(sid, label) {
+  return fetch(`/api/sessions/${encodeURIComponent(sid)}/checkpoints`, {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ label }),
+  }).then(unwrap);
+}
+
+/** 恢复检查点:引擎回滚到打点锚定版本,返回打点时刻消息({restored_version,label,messages};活跃轮 409) */
+export function restoreCheckpoint(sid, cpId) {
+  return fetch(`/api/sessions/${encodeURIComponent(sid)}/checkpoints/${cpId}/restore`, {
+    method: 'POST',
+    headers: headers(),
+  }).then(unwrap);
+}
+
 /** S5:会话模型清单(执行体白名单中继;{ready, models, current[, note]}) */
 export function getLlmModels() {
   return fetch('/admin/llm-models', { headers: headers() }).then(unwrap);

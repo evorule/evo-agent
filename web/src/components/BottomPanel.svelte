@@ -16,6 +16,7 @@
   import ConsoleLogTab from './ConsoleLogTab.svelte';
   import MemoryTab from './MemoryTab.svelte';
   import TimeTravelTab from './TimeTravelTab.svelte';
+  import CheckpointTab from './CheckpointTab.svelte';
   import Divider from './Divider.svelte';
   import { panelHeight, setPanelHeight, PANEL_MIN, PANEL_DEFAULT } from '../lib/layout.js';
   import { taskChannelIds, taskBufferVersion, taskLines, clearTaskChannel } from '../lib/tasks.js';
@@ -30,6 +31,7 @@
     { id: 'audit', label: '审计' },
     { id: 'timetravel', label: '时光机器' },
     { id: 'memory', label: '记忆' },
+    { id: 'checkpoint', label: '检查点' },
   ];
 
   // 开合状态已提升为全局 store(命令面板 Ctrl+J 可切换);激活 tab 同为全局 store。
@@ -213,6 +215,8 @@
         <TimeTravelTab />
       {:else if $panelTab === 'memory'}
         <MemoryTab />
+      {:else if $panelTab === 'checkpoint'}
+        <CheckpointTab />
       {:else if $panelTab === 'audit'}
         <div class="audit-head">
           <span class="audit-note">当前会话治理事件流(展示层视图;权威审计链以审计页为准)</span>
