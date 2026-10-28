@@ -112,6 +112,7 @@ fn test_merge_delegate_tool() {
         governance_segment: None,
         // 记忆下放(测试不开启)
         propagate_memory: false,
+        agents_md_segment: None,
         // 步超时覆写(测试不覆写)
         step_timeout_override: None,
         // spawn 账(测试空账)
@@ -4379,6 +4380,28 @@ fn test_compaction_region_bounds_keeps_recent_rounds() {
             tool_calls: None,
         });
         msgs.push(tool_msg("t", "x"));
+    }
+    // keepRounds 设置键:from_settings 钳制(2..=50)+默认=COMPACTION_KEEP_ROUNDS
+    {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "longSession.compaction.keepRounds".to_string(),
+            serde_json::json!(999),
+        );
+        let pol = crate::agent::runner::CompactionPolicy::from_settings(&m);
+        assert_eq!(pol.keep_rounds, 50, "越界钳上 50");
+        m.insert(
+            "longSession.compaction.keepRounds".to_string(),
+            serde_json::json!(1),
+        );
+        let pol = crate::agent::runner::CompactionPolicy::from_settings(&m);
+        assert_eq!(pol.keep_rounds, 2, "越界钳下 2");
+        let pol = crate::agent::runner::CompactionPolicy::from_settings(&serde_json::Map::new());
+        assert_eq!(
+            pol.keep_rounds,
+            crate::agent::runner::COMPACTION_KEEP_ROUNDS,
+            "缺省=既有硬编码值"
+        );
     }
     let (system_end, split) = compaction_region_bounds(&msgs, COMPACTION_KEEP_ROUNDS).unwrap();
     assert_eq!(system_end, 1);

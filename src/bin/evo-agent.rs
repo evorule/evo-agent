@@ -1657,6 +1657,16 @@ fn cmd_run_blocking(
                 Ok(AgentEvent::SessionCreated { session_id, .. }) => {
                     eprintln!("[session: {}]", session_id);
                 }
+                Ok(AgentEvent::CompactionPerformed {
+                    before_chars,
+                    after_chars,
+                    summary_generated,
+                }) => {
+                    eprintln!(
+                        "[compacted: {} -> {} chars (summary={})]",
+                        before_chars, after_chars, summary_generated
+                    );
+                }
                 Ok(AgentEvent::Step { step }) => {
                     eprintln!("[step {}]", step);
                 }
@@ -1745,6 +1755,16 @@ fn cmd_run_streaming(
             match event {
                 Ok(AgentEvent::SessionCreated { session_id, .. }) => {
                     eprintln!("[session: {}]", session_id);
+                }
+                Ok(AgentEvent::CompactionPerformed {
+                    before_chars,
+                    after_chars,
+                    summary_generated,
+                }) => {
+                    eprintln!(
+                        "[compacted: {} -> {} chars (summary={})]",
+                        before_chars, after_chars, summary_generated
+                    );
                 }
                 Ok(AgentEvent::Step { step }) => {
                     eprintln!("\n--- step {} ---", step);
@@ -3659,6 +3679,16 @@ fn run_repl_turn(
                 Ok(AgentEvent::SessionCreated { session_id, .. }) => {
                     eprintln!("[session: {}]", session_id);
                     got_session = Some(session_id);
+                }
+                Ok(AgentEvent::CompactionPerformed {
+                    before_chars,
+                    after_chars,
+                    summary_generated,
+                }) => {
+                    eprintln!(
+                        "[compacted: {} -> {} chars (summary={})]",
+                        before_chars, after_chars, summary_generated
+                    );
                 }
                 Ok(AgentEvent::Step { step }) => {
                     eprintln!("\n--- step {} ---", step);
