@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
+// E-2(design-36 期3):模块级 unsafe 哨兵由 forbid 降为 deny——allow 只能覆盖
+// deny,AppContainer 低盒面(builtin_tools::appcontainer)以模块内单点 allow
+// 显式收口,本模块其余子模块与 crate 其余面默认仍拒绝(每处 unsafe 须显式
+// allow 方可通过,审计面不扩大)
+#![deny(unsafe_code)]
 //! 内置工具(0.2.0:file_read / file_list / file_write / file_create /
 //! file_move / file_delete / search_files / grep_files / shell_exec /
 //! http_get / python_exec / git_status / git_diff / git_log / git_stage /
@@ -49,6 +54,10 @@
 //! 默认是"宁可功能少,也不可被滥用"。
 
 pub mod accounting;
+// E-2(design-36 期3):AppContainer 低盒执行面——全仓唯一显式 unsafe 收口点
+// (Win32 FFI 无 std 兑现形态);模块级哨兵由 forbid 降 deny,仅此模块内部 allow
+#[cfg(windows)]
+pub mod appcontainer;
 pub mod ask_user;
 pub mod code_search;
 pub mod delegate_tool;
@@ -138,26 +147,40 @@ pub fn default_safe_toolkit_with_profile(
 ///   (DockerExec + trusted 档语义,复用 design-17 既有表;超时对齐 serve 面
 ///   600s 档)。**python_exec 不随动**:它无容器后端,仍在宿主执行,分类
 ///   基线维持调用方 profile(容器边界只覆盖 shell_exec 执行体,分类不放宽);
+/// - `appcontainer` = tier-2 低盒(仅 Windows;职责分离形态——低盒首航清单
+///   进低盒,其余命令宿主回落并 fail-visible 打标;见 `shell_exec::LOWBOX_PROGRAMS`);
+///   非 Windows 平台 Err(启动期 fail-fast);
 /// - `auto` 降级 tier-3 时携带降级原因,随执行结果 fail-visible 打标;
-/// - `container` 档前提不满足 / `appcontainer` 未实现 = Err(启动期 fail-fast)。
+/// - `container` 档前提不满足 = Err(启动期 fail-fast)。
 pub fn default_safe_toolkit_with_shell(
     workdir: &Path,
     read_root: &Path,
     profile: shell_exec::ExecutionProfile,
     shell: Option<&crate::config::ShellConfig>,
 ) -> Result<ToolHandler, String> {
-    // 档位解析(container 档先配置校验后探测;探测进程内一次落账)
+    // 档位解析(container 档先配置校验后探测;探测进程内一次落账;
+    // appcontainer 平台支持由编译目标注入)
     let resolution = match shell {
-        None => {
-            shell_exec::resolve_sandbox_tier(crate::config::ShellSandboxMode::None, None, false)?
-        }
+        None => shell_exec::resolve_sandbox_tier(
+            crate::config::ShellSandboxMode::None,
+            None,
+            false,
+            false,
+        )?,
         Some(cfg) => shell_exec::resolve_sandbox_tier(
             cfg.sandbox,
             cfg.container.as_deref(),
             shell_exec::detect_docker_daemon(),
+            cfg!(windows),
         )?,
     };
     // posture 落账(启动期一次;逐执行打标见 shell_exec::mark_audit,审计同权)
+    if resolution.appcontainer {
+        tracing::info!(
+            "shell sandbox posture: tier-2 (appcontainer lowbox; duty separation: \
+             cargo-chain→lowbox, other commands→host)"
+        );
+    }
     match (&resolution.container, &resolution.downgrade_reason) {
         (Some(c), _) => {
             tracing::info!(container = %c, "shell sandbox posture: tier-1 (container bridge)");
@@ -260,10 +283,13 @@ fn default_safe_toolkit_core(
         "code_search",
         Arc::new(code_search::CodeSearchTool::unwired()),
     );
-    // E-2(design-36 期2):shell_exec 档位装配——tier-1 容器桥(DockerExec +
-    // trusted 档语义,环境即隔离边界;超时对齐 serve 面容器桥 600s)/ tier-3
-    // 裸跑(缺省 = 现行为)。python_exec 不随动:无容器后端,仍在宿主执行,
-    // 分类基线维持调用方 profile(容器边界只覆盖 shell_exec 执行体,不放宽)
+    // E-2(design-36 期2/期3):shell_exec 档位装配——tier-1 容器桥(DockerExec +
+    // trusted 档语义,环境即隔离边界;超时对齐 serve 面容器桥 600s)/ tier-2
+    // 低盒(AppContainer,职责分离:首航清单进低盒、其余宿主回落;profile 不重绑
+    // ——宿主回落保持调用方分类基线,低盒路径边界语义自带;超时对齐 600s)/
+    // tier-3 裸跑(缺省 = 现行为)。python_exec 不随动:无容器/低盒后端,仍在
+    // 宿主执行,分类基线维持调用方 profile(隔离边界只覆盖 shell_exec 执行体,
+    // 不放宽)
     let mut shell_tool = shell_exec::ShellExecTool::new()
         .with_workdir(&workdir_buf)
         .with_execution_profile(profile);
@@ -273,6 +299,10 @@ fn default_safe_toolkit_core(
                 container: container.clone(),
             })
             .with_execution_profile(shell_exec::ExecutionProfile::SandboxTrusted)
+            .with_timeout(600);
+    } else if resolution.appcontainer {
+        shell_tool = shell_tool
+            .with_backend(shell_exec::ExecBackend::AppContainer)
             .with_timeout(600);
     }
     if let Some(reason) = &resolution.downgrade_reason {
@@ -1612,9 +1642,10 @@ mod tests {
         assert!(err.contains("shell.container"), "got: {err}");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn test_default_safe_toolkit_appcontainer_mode_fails_fast() {
-        // 期3 未施工:显式报错,不猜不回落
+        // 期3 非 Windows:显式报错,不猜不回落
         let cfg = crate::config::ShellConfig {
             sandbox: crate::config::ShellSandboxMode::AppContainer,
             container: None,
@@ -1627,6 +1658,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("appcontainer"), "got: {err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_default_safe_toolkit_appcontainer_mode_assembles() {
+        // 期3 已施工:Windows 上 appcontainer 档装配成功(职责分离形态,
+        // 缺省不变式:tier-3 缺省路径与 python_exec 不随动)
+        let cfg = crate::config::ShellConfig {
+            sandbox: crate::config::ShellSandboxMode::AppContainer,
+            container: None,
+        };
+        default_safe_toolkit_with_shell(
+            Path::new("."),
+            Path::new("."),
+            shell_exec::ExecutionProfile::Workbench,
+            Some(&cfg),
+        )
+        .unwrap_or_else(|e| panic!("appcontainer 档在 Windows 应装配成功: {e}"));
     }
 }
 

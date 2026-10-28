@@ -686,13 +686,14 @@ fn drain_pipe<R: std::io::Read>(pipe: &mut Option<R>) -> Vec<u8> {
 /// 按 pid 终止进程族(执行超时钩子侧;无 Child 句柄,组级/树级终止尽力)
 ///
 /// - Windows:`taskkill /PID <pid> /T /F` 终止进程树(Job Object 主方案需
-///   FFI 依赖,本仓 forbid(unsafe) 纪律下以 taskkill 为 std 兑现形态);
+///   FFI 依赖,本仓 forbid(unsafe) 纪律下以 taskkill 为 std 兑现形态;
+///   E-2 期3 起低盒路径超时终止同款复用——见 appcontainer 模块);
 /// - Unix:组级 SIGKILL(spawn 侧 `process_group(0)` 使 pgid=pid,组 kill
 ///   覆盖全部子孙;经 kill 二进制,规避 FFI)。
 ///
 /// 用 `.output()` 同步回收终止器自身(阻塞毫秒级):std `Child` drop 不
 /// reap,`spawn` 后不管会留僵尸。
-fn terminate_family_by_pid(pid: u32) {
+pub(crate) fn terminate_family_by_pid(pid: u32) {
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")
@@ -899,7 +900,7 @@ fn poll_family_clear(mut clear: impl FnMut() -> Option<bool>) -> bool {
     false
 }
 
-/// 执行后端(P1 执行桥:配置选择器 local / docker-exec)
+/// 执行后端(P1 执行桥:配置选择器 local / docker-exec / E-2 期3 appcontainer)
 ///
 /// 兼容层三原则②「删配置即下线」:不传容器名即回落 `Local`,宿主语义零变化。
 /// 容器名经 serve run 请求扩展字段传入,不由 LLM 可控
@@ -913,6 +914,10 @@ pub enum ExecBackend {
         /// 目标任务容器名(serve run 请求传入;经 validate_container_name 校验)
         container: String,
     },
+    /// E-2 期3:AppContainer 低盒执行(仅 Windows;职责分离形态——低盒首航
+    /// 清单进低盒,其余命令宿主回落;非 Windows 平台装配期即 Err fail-fast,
+    /// 本变体在非 Windows 编译存在但不可达)
+    AppContainer,
 }
 
 /// 校验 docker 容器名(防 argv 注入:容器名以 `-` 开头会被 docker 解析为 flag)
@@ -959,13 +964,25 @@ fn docker_exec_argv(container: &str, command: &str) -> Vec<String> {
 ///
 /// `container` = tier-1 容器名(Some 即容器桥,trusted 档语义);None = tier-3
 /// 进程内防线裸跑(现行为)。`downgrade_reason` = auto 档降级原因(tier-1 或
-/// 显式 none 档恒为 None)。
+/// 显式 none 档恒为 None)。`appcontainer` = tier-2 低盒(职责分离形态,
+/// 仅 Windows;与 container 互斥,见 [`resolve_sandbox_tier`])。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxResolution {
-    /// tier-1 容器名;None = tier-3 裸跑
+    /// tier-1 容器名;None = 非 tier-1
     pub container: Option<String>,
     /// auto 档降级原因(随执行结果 fail-visible 打标)
     pub downgrade_reason: Option<String>,
+    /// E-2 期3:tier-2 低盒命中(true = appcontainer 档且平台支持)
+    pub appcontainer: bool,
+}
+
+/// 低盒首航清单(design-36 §6.4 职责分离:低盒只跑不可信计算型命令;
+/// §6.1/§6.2 spike 实证 cargo 链闭环,git/script 类=待验证扩展,登记不实施)
+pub(crate) const LOWBOX_PROGRAMS: &[&str] = &["cargo", "rustc", "rustdoc"];
+
+/// 低盒首航清单判定(与 mark_audit 打章共用同一判定面,一致性由单测锁)
+pub(crate) fn is_lowbox_program(program: &str) -> bool {
+    LOWBOX_PROGRAMS.contains(&program)
 }
 
 /// 沙箱档位解析(纯函数:探测结论由调用方注入,便于测试与「探测一次落账」)
@@ -976,16 +993,19 @@ pub struct SandboxResolution {
 ///   不满足 = fail-fast 拒绝,不静默裸跑);
 /// - `auto`:探测可用且有容器名 → tier-1;否则降 tier-3 并携带降级原因
 ///   (fail-visible,随执行结果打标);
-/// - `appcontainer`:期3 待 spike,显式报错(不猜、不回落)。
+/// - `appcontainer`:tier-2 低盒(期3 落地,仅 Windows)——非 Windows 平台
+///   Err fail-fast(显式意志不满足 = 拒绝,不静默回落 tier-3)。
 pub fn resolve_sandbox_tier(
     mode: crate::config::ShellSandboxMode,
     container: Option<&str>,
     docker_daemon_available: bool,
+    platform_supports_appcontainer: bool,
 ) -> Result<SandboxResolution, String> {
     match mode {
         crate::config::ShellSandboxMode::None => Ok(SandboxResolution {
             container: None,
             downgrade_reason: None,
+            appcontainer: false,
         }),
         crate::config::ShellSandboxMode::Container => {
             let name = container.ok_or_else(|| {
@@ -1002,6 +1022,7 @@ pub fn resolve_sandbox_tier(
             Ok(SandboxResolution {
                 container: Some(name.to_string()),
                 downgrade_reason: None,
+                appcontainer: false,
             })
         }
         crate::config::ShellSandboxMode::Auto => {
@@ -1010,6 +1031,7 @@ pub fn resolve_sandbox_tier(
                     return Ok(SandboxResolution {
                         container: Some(name.to_string()),
                         downgrade_reason: None,
+                        appcontainer: false,
                     });
                 }
                 return Ok(SandboxResolution {
@@ -1018,17 +1040,27 @@ pub fn resolve_sandbox_tier(
                         "auto: docker daemon available but shell.container not configured"
                             .to_string(),
                     ),
+                    appcontainer: false,
                 });
             }
             Ok(SandboxResolution {
                 container: None,
                 downgrade_reason: Some("auto: docker daemon unavailable".to_string()),
+                appcontainer: false,
             })
         }
-        crate::config::ShellSandboxMode::AppContainer => Err(
-            "shell.sandbox=appcontainer is not yet implemented (design-36 phase 3, pending spike)"
-                .to_string(),
-        ),
+        crate::config::ShellSandboxMode::AppContainer => {
+            if !platform_supports_appcontainer {
+                return Err("shell.sandbox=appcontainer is only supported on Windows \
+                     (design-36 phase 3 lowbox face; refusing host fallback)"
+                    .to_string());
+            }
+            Ok(SandboxResolution {
+                container: None,
+                downgrade_reason: None,
+                appcontainer: true,
+            })
+        }
     }
 }
 
@@ -1539,6 +1571,27 @@ impl ShellExecTool {
                     ExecBackend::DockerExec { .. } => {
                         obj.insert("sandbox".to_string(), Value::from("container"));
                     }
+                    // E-2 期3:低盒后端——按执行面分章(同一后端两执行面:
+                    // 首航清单程序进低盒 = appcontainer;其余宿主回落 = none
+                    // + 职责分离原因)。判定面与 call_sync 路由同一纯函数
+                    ExecBackend::AppContainer => {
+                        let program = obj
+                            .get("program")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if is_lowbox_program(&program) {
+                            obj.insert("sandbox".to_string(), Value::from("appcontainer"));
+                        } else {
+                            obj.insert("sandbox".to_string(), Value::from("none"));
+                            obj.insert(
+                                "sandbox_reason".to_string(),
+                                Value::from(format!(
+                                    "tier-2 duty separation: {program} stays on host"
+                                )),
+                            );
+                        }
+                    }
                     ExecBackend::Local => {
                         obj.insert("sandbox".to_string(), Value::from("none"));
                         if let Some(reason) = &self.sandbox_downgrade {
@@ -1555,6 +1608,67 @@ impl ShellExecTool {
             }
         }
         result
+    }
+
+    /// 实际执行命令(AppContainer 低盒后端,E-2 期3;仅 Windows 可达)
+    ///
+    /// 职责分离(design-36 §6.4):调用方(call_sync)已按低盒首航清单分流,
+    /// 本方法只承接清单内命令。执行链:workdir 遮蔽检查(与宿主同防护)→
+    /// 宿主 PATH 定位绝对路径 → appcontainer::run_lowbox(profile per-execution
+    /// + ACL 授权 + 环境块白名单 + PROC_THREAD_ATTRIBUTE 拉起,见
+    ///   [`super::appcontainer`])→ 结果形态对齐宿主路径(自然退出 =
+    ///   completed_result,超时 = report_terminated,killed 记账复用)。
+    ///
+    /// 分类面注记:低盒路径不过 3 层分类(分类面是宿主 program 风险分档,
+    /// 低盒执行体已被 OS 边界包裹——禁网+文件系统白名单,边界语义更强);
+    /// metachar/net_guard 由 call_sync 统一前置照检。
+    #[cfg(windows)]
+    fn execute_appcontainer(&self, parts: &[&str], original_cmd: &str) -> IoResult {
+        let program = Self::program_name(parts[0]);
+
+        if Self::workdir_shadowed(self.workdir.as_deref(), program) {
+            return Err(format!(
+                "PATHEXT 双跳防护: 工作目录内存在与 '{program}' 同名的本地可执行文件 \
+                 — 可能执行植文件而非 PATH 二进制,白名单无法为其背书。请重命名该文件,\
+                 或用显式路径分步执行"
+            ));
+        }
+
+        let abs_program = super::appcontainer::locate_program_in_path(program)
+            .map_err(|e| format!("lowbox program locate: {e}"))?;
+        let workdir = match &self.workdir {
+            Some(dir) => dir.clone(),
+            None => std::env::current_dir().map_err(|e| format!("lowbox workdir resolve: {e}"))?,
+        };
+        let spec = super::appcontainer::LowboxSpec {
+            program: abs_program,
+            args: parts[1..].iter().map(|s| s.to_string()).collect(),
+            workdir,
+            timeout: self.timeout,
+        };
+        match super::appcontainer::run_lowbox(&spec) {
+            Ok(outcome) => {
+                if outcome.timed_out {
+                    // 超时:killed 结局(登记入执行轨迹;低盒域进程族核验面
+                    // 不在本批,verified 保守入账 false)
+                    Self::report_terminated(
+                        original_cmd,
+                        outcome.pid,
+                        &outcome.output.status,
+                        self.timeout,
+                        false,
+                    )
+                } else {
+                    Self::completed_result(
+                        original_cmd,
+                        program,
+                        &outcome.output,
+                        self.max_output_bytes,
+                    )
+                }
+            }
+            Err(e) => Err(format!("lowbox execution failed: {e}")),
+        }
     }
 
     /// 自然退出的结果 JSON(与原 `Command::output` 路径同形态)
@@ -1796,6 +1910,36 @@ impl ShellExecTool {
             }
             validate_container_name(container)?;
             return self.mark_audit(self.execute_docker_exec(container, cmd_str));
+        }
+
+        // E-2 期3:AppContainer 低盒后端(tier-2)——低盒首航清单(cargo 链)
+        // 进低盒(sandbox=appcontainer 章);其余命令宿主回落,分类面/metachar/
+        // 守卫全量照旧(落穿下方 Local 同路径,sandbox=none + 职责分离原因章;
+        // design-36 §6.4 职责分离)。网络面:低盒禁网由 OS 边界物理断绝
+        // (capabilities=None),强于 shell_net_guard 白名单,不另设守卫。
+        if let ExecBackend::AppContainer = &self.backend {
+            let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+            if parts.is_empty() {
+                return Err("empty command".to_string());
+            }
+            let program = Self::program_name(parts[0]);
+            if is_lowbox_program(program) {
+                #[cfg(windows)]
+                {
+                    // metachar 照检(低盒无 shell 解释器,检查与宿主面同语义
+                    // 防误用);net_guard 已统一前置
+                    Self::check_no_shell_metachars(&parts)?;
+                    return self.mark_audit(self.execute_appcontainer(&parts, cmd_str));
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = program;
+                    return Err(
+                        "appcontainer lowbox face is windows-only (design-36 phase 3)".to_string(),
+                    );
+                }
+            }
+            // 非清单命令:宿主回落(落穿至下方宿主路径,分类面照旧)
         }
 
         // 1. 解析
@@ -2755,21 +2899,30 @@ mod tests {
     #[test]
     fn test_resolve_sandbox_tier_matrix() {
         // none:现行为(tier-3),探测结论不消费、无降级原因
-        let r = resolve_sandbox_tier(crate::config::ShellSandboxMode::None, None, false).unwrap();
+        let r = resolve_sandbox_tier(crate::config::ShellSandboxMode::None, None, false, false)
+            .unwrap();
         assert!(r.container.is_none());
         assert!(r.downgrade_reason.is_none());
-        let r = resolve_sandbox_tier(crate::config::ShellSandboxMode::None, None, true).unwrap();
+        assert!(!r.appcontainer);
+        let r =
+            resolve_sandbox_tier(crate::config::ShellSandboxMode::None, None, true, false).unwrap();
         assert!(r.container.is_none());
         assert!(r.downgrade_reason.is_none());
 
         // container:强制档——容器名缺失/daemon 缺失均 fail-fast(显式意志
         // 不满足 = 拒绝,不静默裸跑)
-        let err = resolve_sandbox_tier(crate::config::ShellSandboxMode::Container, None, true)
-            .unwrap_err();
+        let err = resolve_sandbox_tier(
+            crate::config::ShellSandboxMode::Container,
+            None,
+            true,
+            false,
+        )
+        .unwrap_err();
         assert!(err.contains("shell.container"), "got: {err}");
         let err = resolve_sandbox_tier(
             crate::config::ShellSandboxMode::Container,
             Some("dev"),
+            false,
             false,
         )
         .unwrap_err();
@@ -2778,35 +2931,93 @@ mod tests {
             crate::config::ShellSandboxMode::Container,
             Some("dev"),
             true,
+            false,
         )
         .unwrap();
         assert_eq!(r.container.as_deref(), Some("dev"));
         assert!(r.downgrade_reason.is_none());
+        assert!(!r.appcontainer);
 
         // auto:探测可用且有容器名 → tier-1;缺一降 tier-3 并携带降级原因
         // (fail-visible,随执行结果打标)
-        let r =
-            resolve_sandbox_tier(crate::config::ShellSandboxMode::Auto, Some("dev"), true).unwrap();
+        let r = resolve_sandbox_tier(
+            crate::config::ShellSandboxMode::Auto,
+            Some("dev"),
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(r.container.as_deref(), Some("dev"));
         assert!(r.downgrade_reason.is_none());
-        let r = resolve_sandbox_tier(crate::config::ShellSandboxMode::Auto, None, true).unwrap();
+        let r =
+            resolve_sandbox_tier(crate::config::ShellSandboxMode::Auto, None, true, false).unwrap();
         assert!(r.container.is_none());
         assert!(
             r.downgrade_reason.unwrap().contains("shell.container"),
             "auto downgrade reason must name the missing config"
         );
-        let r = resolve_sandbox_tier(crate::config::ShellSandboxMode::Auto, Some("dev"), false)
-            .unwrap();
+        let r = resolve_sandbox_tier(
+            crate::config::ShellSandboxMode::Auto,
+            Some("dev"),
+            false,
+            false,
+        )
+        .unwrap();
         assert!(r.container.is_none());
         assert!(
             r.downgrade_reason.unwrap().contains("docker daemon"),
             "auto downgrade reason must name the missing daemon"
         );
 
-        // appcontainer:期3 待 spike,显式报错(不猜、不回落)
-        let err = resolve_sandbox_tier(crate::config::ShellSandboxMode::AppContainer, None, true)
-            .unwrap_err();
-        assert!(err.contains("not yet implemented"), "got: {err}");
+        // appcontainer(期3 落地):平台支持 → tier-2 低盒;非 Windows → Err
+        // fail-fast(显式意志不满足 = 拒绝,不静默回落 tier-3)
+        let r = resolve_sandbox_tier(
+            crate::config::ShellSandboxMode::AppContainer,
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(r.container.is_none());
+        assert!(r.downgrade_reason.is_none());
+        assert!(r.appcontainer, "tier-2 低盒命中");
+        let err = resolve_sandbox_tier(
+            crate::config::ShellSandboxMode::AppContainer,
+            None,
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("only supported on Windows"), "got: {err}");
+    }
+
+    /// E-2 期3:低盒首航清单(design-36 §6.4 职责分离)——清单内进低盒,
+    /// 清单外宿主回落;mark_audit 打章与 call_sync 路由共用本判定面
+    #[test]
+    fn test_lowbox_program_list() {
+        for p in ["cargo", "rustc", "rustdoc"] {
+            assert!(is_lowbox_program(p), "{p} 应在低盒首航清单");
+        }
+        for p in [
+            "git",
+            "python",
+            "bash",
+            "node",
+            "curl",
+            "cargobuild",
+            "cargo-old",
+            "rust",
+            "",
+        ] {
+            assert!(!is_lowbox_program(p), "{p} 不应在低盒首航清单");
+        }
+        // 分类面语义锁定:宿主分类面只有 cargo 为 Active(workbench 既有
+        // 事实,缺省不变式——期3 不扩分类面);rustc/rustdoc 宿主分类为
+        // Unknown——它们只经低盒路径执行(appcontainer 档 call_sync 先按
+        // 清单分流,分类面不消费;tier-3 缺省档宿主面与期2 前基线一致)
+        assert_eq!(ShellExecTool::classify("cargo"), CommandCategory::Active);
+        assert_eq!(ShellExecTool::classify("rustc"), CommandCategory::Unknown);
+        assert_eq!(ShellExecTool::classify("rustdoc"), CommandCategory::Unknown);
     }
 
     #[test]

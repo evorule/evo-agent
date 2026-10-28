@@ -613,7 +613,8 @@ pub struct WorkbenchConfig {
     pub console_port: Option<u16>,
 }
 
-/// shell 沙箱档配置(E-2 / design-36 期2:tier-1 容器桥显式激活,缺省 tier-3)
+/// shell 沙箱档配置(E-2 / design-36 期2:tier-1 容器桥 / 期3:tier-2 低盒,
+/// 显式激活,缺省 tier-3)
 ///
 /// 红线正交:三层分类 / metachar 拒绝 / net_guard / 参数守卫在任何档位都生效
 /// (OS 边界是纵深第二道,不替代进程内防线)。
@@ -625,7 +626,9 @@ pub struct ShellConfig {
     ///   语义),否则降 tier-3 并随结果携带降级原因(fail-visible,不静默);
     /// - `container` = 强制容器桥,容器名缺失或 daemon 不可用即启动期报错
     ///   (显式意志不满足 = fail-fast,不静默裸跑);
-    /// - `appcontainer` = OS 低盒(design-36 期3,待 spike,当前显式报错未实现)。
+    /// - `appcontainer` = OS 低盒(仅 Windows;design-36 期3 职责分离形态:
+    ///   低盒首航清单 cargo 链进低盒,其余命令宿主回落并 fail-visible 打标;
+    ///   非 Windows 平台启动期报错)。
     #[serde(default)]
     pub sandbox: ShellSandboxMode,
     /// tier-1 容器名(`sandbox = "container"` / `"auto"` 时生效)。容器契约与
@@ -646,7 +649,7 @@ pub enum ShellSandboxMode {
     Auto,
     /// 强制容器桥(前提不满足启动期报错)
     Container,
-    /// OS 低盒(design-36 期3 待 spike,当前显式报错)
+    /// OS 低盒(仅 Windows;design-36 期3 职责分离形态)
     AppContainer,
 }
 
