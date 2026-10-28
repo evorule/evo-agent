@@ -1413,3 +1413,30 @@ mod tests {
         assert!(binding.default_on, "service proxy switch must default ON");
     }
 }
+
+#[cfg(test)]
+mod sandbox_coverage_tests {
+    /// 一致性锁:builtin manifest 内 FsRead/FsWrite 域的每件必须登记进
+    /// SANDBOX_CAPABLE_TOOLS(声明门卫+缺省边界合成的判定基准)——
+    /// 读面/写面新件漏登记 = 声明边界场景下该工具不受沙箱覆盖(逃逸同型缺陷)
+    #[test]
+    fn sandbox_capable_table_covers_all_fs_domain_manifest_tools() {
+        let manifest = super::builtin_manifests();
+        let sandbox = super::super::definition::SANDBOX_CAPABLE_TOOLS;
+        let mut missing = Vec::new();
+        for tool in &manifest {
+            let fs_domain = tool
+                .capability_domains
+                .iter()
+                .any(|d| matches!(d, super::CapDomain::FsRead | super::CapDomain::FsWrite));
+            if fs_domain && !sandbox.contains(&tool.name.as_str()) {
+                missing.push(tool.name.clone());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "FsRead/FsWrite manifest tools missing from SANDBOX_CAPABLE_TOOLS: {missing:?} \
+             —— 声明门卫与缺省边界合成将不覆盖它们(逃逸同型缺陷)"
+        );
+    }
+}

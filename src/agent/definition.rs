@@ -254,6 +254,10 @@ pub struct OutputFormat {
 /// 沙箱类工具清单:出现在顶层 `tools` 时,`capability_boundary.tools` 必须覆盖
 /// (单一事实源门卫的判定基准;边界合成同样按此表求交)
 ///
+/// 纪律:tool_manifest 内 FsRead/FsWrite 域的每件必须同步入表
+/// (一致性锁测试钉死——新读面/写面件漏登记即测试红,防「声明边界
+/// 场景下该工具不受沙箱覆盖」的逃逸同型缺陷再现)
+///
 /// C 批实测补齐(2026-10-16):v1 仅含 file_read/file_write——会话级 workspace
 /// 声明在场时,合成边界把 file_list 等过滤在外,apply_capability_boundary 的
 /// 全族重绑失靶,读面工具仍持启动期 --read-root 绑定而列目录逃逸(serve 实测
@@ -263,6 +267,9 @@ pub const SANDBOX_CAPABLE_TOOLS: &[&str] = &[
     "file_list",
     "search_files",
     "grep_files",
+    "image_load",
+    "code_search",
+    "read_back",
     "file_write",
     "edit_file",
     "workspace_undo",
@@ -422,8 +429,9 @@ pub struct SkillFrontmatter {
 }
 
 /// 轻量 frontmatter 解析(照 skill-adapter 正则行解析口径,不引 YAML 依赖:
-/// 仅取 `---` 围栏内平铺 `key: value` 行;嵌套/列表不支持——显式未覆盖声明,
-/// 市面 skill 实测遇解析失败按样本补)
+/// 仅取 `---` 围栏内平铺 `key: value` 行。已知限制:嵌套块与列表不支持——
+/// 遇到时 warn 留痕并跳过,不静默:嵌套键不再写入空值/块指示符污染字段,
+/// 列表行不再无声吞掉。市面 skill 实测遇解析失败按样本补)
 pub fn parse_skill_frontmatter(content: &str) -> Result<SkillFrontmatter, String> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut lines = content.lines().map(str::trim_start);
@@ -444,11 +452,27 @@ pub fn parse_skill_frontmatter(content: &str) -> Result<SkillFrontmatter, String
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
+        // 列表项(`- item`):轻量解析器不支持,留痕跳过(不静默吞)
+        if t.starts_with("- ") {
+            tracing::warn!("frontmatter list entry skipped by the lightweight parser: {t}");
+            continue;
+        }
         // 平铺 `key: value`(无冒号行跳过,宽松口径与 adapter 一致)
         let Some((k, v)) = t.split_once(':') else {
             continue;
         };
-        let value = v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        // 空值键 = 嵌套块/折叠块的开始(YAML 块指示符 `>`/`|` 系同判):
+        // 留痕跳过,不把空串或指示符写进字段(曾静默写成 Some("")/Some(">")
+        // 污染 manifest 渲染)
+        let raw = v.trim();
+        if raw.is_empty() || raw.starts_with('>') || raw.starts_with('|') {
+            tracing::warn!(
+                "frontmatter key `{}` uses a nested/block form the lightweight parser skips",
+                k.trim()
+            );
+            continue;
+        }
+        let value = raw.trim_matches(|c| c == '"' || c == '\'').to_string();
         match k.trim() {
             "name" => fm.name = Some(value),
             "description" => fm.description = Some(value),

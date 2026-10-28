@@ -86,6 +86,23 @@ fn judge_whitelist() -> &'static HashSet<String> {
     })
 }
 
+/// serve/TB 等常驻服务面的启动期体检:逃生门 env 只允许本地调试会话使用——
+/// 服务面一旦携带,判据命令白名单即被整体跳过,等于摘掉「LLM 产出直达宿主
+/// shell」的唯一防线。纯函数,env 由调用方注入(可测);Err 文本供调用方
+/// fail-fast 退出。
+pub fn check_serve_escape_hatch(env_value: Option<String>) -> Result<(), String> {
+    let set = env_value
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if set {
+        return Err(
+            "拒绝启动: serve 面检测到 EVO_JUDGE_ALLOW_ANY —— 判据命令白名单是 LLM 产出直达             宿主 shell 的唯一防线,常驻服务面禁止携带该逃生门;本地调试请在非服务会话中             显式设置,或移除该环境变量后重启。"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// 是否启用逃生门(本地调试;EVO_JUDGE_ALLOW_ANY=1 时跳过白名单)
 fn allow_any() -> bool {
     std::env::var("EVO_JUDGE_ALLOW_ANY")
@@ -171,5 +188,27 @@ mod tests {
     fn test_empty_command_rejected() {
         assert!(validate_judge_command("").is_err());
         assert!(validate_judge_command("   ").is_err());
+    }
+}
+
+#[cfg(test)]
+mod serve_hatch_tests {
+    use super::check_serve_escape_hatch;
+
+    #[test]
+    fn serve_hatch_rejects_when_env_set() {
+        for v in ["1", "true", "TRUE"] {
+            let err = check_serve_escape_hatch(Some(v.to_string()))
+                .expect_err("服务面携带逃生门必须拒启");
+            assert!(err.contains("拒绝启动"), "{err}");
+        }
+    }
+
+    #[test]
+    fn serve_hatch_allows_unset_or_off() {
+        assert!(check_serve_escape_hatch(None).is_ok());
+        assert!(check_serve_escape_hatch(Some("0".into())).is_ok());
+        assert!(check_serve_escape_hatch(Some("false".into())).is_ok());
+        assert!(check_serve_escape_hatch(Some(String::new())).is_ok());
     }
 }

@@ -2358,6 +2358,16 @@ fn cmd_serve(
         }
     };
 
+    // 1.2 逃生门体检(fail-closed):判据命令白名单是「LLM 产出直达宿主
+    //     shell」的唯一防线,常驻服务面禁止携带 EVO_JUDGE_ALLOW_ANY——
+    //     本地调试逃生门只属于非服务会话
+    if let Err(msg) = evo_agent::agent::judge_guard::check_serve_escape_hatch(
+        std::env::var("EVO_JUDGE_ALLOW_ANY").ok(),
+    ) {
+        eprintln!("evo-agent: {msg}");
+        return ExitCode::from(2);
+    }
+
     // 1.5 启动预检(依赖1/依赖2 可达性启动期显性化,失败给指引
     //      非零退出;Quick 双探并行,依赖在位时仅毫秒级,不构成启动负担)
     if let Err(code) = startup_preflight(&config, workdir, no_preflight) {
