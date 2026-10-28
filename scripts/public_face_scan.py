@@ -19,12 +19,14 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SELF_EXEMPT = {
+    # 注意: 用正斜杠字面量 —— iter_files 的 rel 已统一为正斜杠,
+    # os.path.join 在 Windows 产反斜杠会导致永不匹配 (曾掩盖的 bug)。
     "PUBLIC-FACE.md",
     "AGENTS.md",
-    os.path.join("scripts", "public_face_scan.py"),
-    os.path.join("scripts", "public-face-baseline.txt"),
-    os.path.join("scripts", "public-face-words.txt"),
-    os.path.join(".github", "workflows", "public-face.yml"),
+    "scripts/public_face_scan.py",
+    "scripts/public-face-baseline.txt",
+    "scripts/public-face-words.txt",
+    ".github/workflows/public-face.yml",
 }
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".obsidian"}
