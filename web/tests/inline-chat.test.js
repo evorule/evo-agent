@@ -3,7 +3,7 @@
 // Inline Chat 预览行级 diff + .evoignore v1 子集匹配 单测
 import { describe, it, expect, beforeEach } from 'vitest';
 import { diffLines, summarizeDiff } from '../src/lib/inline-chat-diff.js';
-import { parseEvoignore, isIgnored } from '../src/lib/evoignore.js';
+import { parseEvoignore, isIgnored, parseIgnoreLines, matchIgnore } from '../src/lib/evoignore.js';
 
 describe('inline-chat-diff 行级 LCS', () => {
   it('纯新增', () => {
@@ -62,5 +62,41 @@ describe('evoignore v1 子集匹配', () => {
     parseEvoignore(['# comment', '', 'target/', ''].join('\n'));
     expect(isIgnored('target/a')).toBe(true);
     expect(isIgnored('target')).toBe(true);
+  });
+});
+
+describe('evoignore v1.1 negation 与根锚定(gitignore 语义;Explorer .gitignore 消费)', () => {
+  it('negation 例外重新包含(最后命中规则胜出)', () => {
+    parseEvoignore(['.env', '.env.*', '!.env.example'].join('\n'));
+    expect(isIgnored('.env')).toBe(true);
+    expect(isIgnored('.env.local')).toBe(true);
+    expect(isIgnored('.env.example')).toBe(false); // 例外胜出
+  });
+  it('目录例外:被忽略目录的重新包含子树', () => {
+    parseEvoignore(['data/', '!src/agent/data/'].join('\n'));
+    expect(isIgnored('data/db.sqlite')).toBe(true);
+    expect(isIgnored('data')).toBe(true);
+    expect(isIgnored('src/agent/data/foo.json')).toBe(false); // 例外目录内容放行
+    expect(isIgnored('src/agent/data')).toBe(false);
+  });
+  it('根锚定:前导 / 只命中根下路径', () => {
+    parseEvoignore(['/evo-agent.toml', '/build/'].join('\n'));
+    expect(isIgnored('evo-agent.toml')).toBe(true);
+    expect(isIgnored('src/evo-agent.toml')).toBe(false); // 嵌套同名放行
+    expect(isIgnored('build/out.js')).toBe(true);
+    expect(isIgnored('src/build/out.js')).toBe(false);
+  });
+  it('含路径分隔符的规则天然根锚定(gitignore 标准)', () => {
+    parseEvoignore('scripts/ops/ops.local.json');
+    expect(isIgnored('scripts/ops/ops.local.json')).toBe(true);
+    expect(isIgnored('a/scripts/ops/ops.local.json')).toBe(false);
+  });
+  it('parseIgnoreLines/matchIgnore 纯函数(独立规则集,不触单例)', () => {
+    const mine = parseIgnoreLines('*.log\n!keep.log');
+    parseEvoignore('config/'); // 单例被改写,不影响 mine
+    expect(matchIgnore(mine, 'a/b.log')).toBe(true);
+    expect(matchIgnore(mine, 'keep.log')).toBe(false);
+    expect(matchIgnore(mine, 'config/x.json')).toBe(false);
+    expect(isIgnored('config/x.json')).toBe(true); // 单例照常工作
   });
 });

@@ -8,7 +8,8 @@
 <script>
   import { onMount, tick } from 'svelte';
   import { get } from 'svelte/store';
-  import { listDir, listDirWorkdir, browseFs, createFile, moveFile, deleteFile } from '../lib/api.js';
+  import { listDir, listDirWorkdir, browseFs, createFile, moveFile, deleteFile, readFile } from '../lib/api.js';
+  import { parseIgnoreLines, matchIgnore } from '../lib/evoignore.js';
   import { registerCommand, unregisterCommand } from '../lib/commands.js';
   import { reconnectCurrent } from '../lib/ws.js';
   import {
@@ -67,6 +68,33 @@
     if (s === 'D') return 'deleted';
     if (s === 'R') return 'renamed';
     return 'modified';
+  }
+
+  // ---- git 忽略态暗淡装饰(VS Code 同语义:ignored 行整体降亮度) ----
+  // .gitignore 前端解析(gitignore 子集引擎,含 negation/根锚定;与 .evoignore
+  // 单例互不干扰)。非 git 仓/无 .gitignore → 空规则,零装饰。折叠目录
+  // (尾 `/`)判定去尾路径;服务端 git status 未含 ignored 面(include_ignored
+  // false),此处为纯前端近似:嵌套 .gitignore 与 .git/info/exclude 不参与。
+  let gitignoreRules = [];
+  async function loadGitignore() {
+    gitignoreRules = [];
+    try {
+      const d = await readFile('.gitignore');
+      gitignoreRules = parseIgnoreLines(d.content || '');
+    } catch {
+      /* 404/失败 → 空规则,静默降级 */
+    }
+  }
+
+  /** 树内全部节点路径逐一判定 → Set(markup 走 class:ignored) */
+  $: ignoredSet = computeIgnoredSet(gitignoreRules, rows);
+  function computeIgnoredSet(rules, rowList) {
+    const set = new Set();
+    if (!rules.length) return set;
+    for (const { node } of rowList) {
+      if (node.path && matchIgnore(rules, node.path)) set.add(node.path);
+    }
+    return set;
   }
 
   // ---- 文件类型图标(vscode-icons 内嵌子集,官方配色;映射与 SVG 见 lib/fileIcons.js) ----
@@ -689,6 +717,7 @@
         }
       }
       rebuild();
+      loadGitignore(); // 异步不阻塞建树;完成后 ignoredSet 自动重算
       loadError = '';
       didLoad = true;
     } catch (e) {
@@ -1012,6 +1041,7 @@
           class="node {node.kind}"
           class:selected={selected && selected.path === node.path}
           class:active={node.kind === 'file' && node.path === $activePath}
+          class:ignored={ignoredSet.has(node.path)}
           class:drop-target={dragOverPath === node.path}
           class:flash={flashPath === node.path}
           data-tree-path={node.path}
@@ -1397,12 +1427,20 @@
     padding-right: var(--sp-md);
     height: 22px; /* Trae/VS Code 同密度(原 24px 偏疏) */
     font-size: var(--tree-fs, var(--fs-base));
-    color: var(--sidebar-text);
+    color: var(--tree-text, var(--text-primary)); /* 正常文件=前景亮色(VS Code 同语义) */
     cursor: pointer;
     user-select: none;
     white-space: nowrap;
     overflow: hidden;
     position: relative;
+  }
+  /* git 忽略态(ignored):整行降亮度 + 图标随行淡出(VS Code 同款);
+     色值=原树统一色(--sidebar-text),暗/亮主题均与正常文件拉开对比 */
+  .node.ignored {
+    color: var(--sidebar-text);
+  }
+  .node.ignored .icon {
+    opacity: 0.55;
   }
   /* 缩进参考线(VS Code 同款):每 14px 一条 1px 淡线,宽度止于本行内容起点;
      depth=0 时宽 10px,首线落在 13px 被裁剪,自然不可见 */
