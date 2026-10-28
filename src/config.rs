@@ -1029,10 +1029,7 @@ impl Config {
             other => {
                 return Err(ConfigError::InvalidValue {
                     field: "llm.mode".to_string(),
-                    reason: format!(
-                        "unknown mode '{}', expected one of: relay, direct",
-                        other
-                    ),
+                    reason: format!("unknown mode '{}', expected one of: relay, direct", other),
                 });
             }
         }
@@ -1159,10 +1156,7 @@ impl Config {
             other => {
                 return Err(ConfigError::InvalidValue {
                     field: "llm.mode".to_string(),
-                    reason: format!(
-                        "unknown mode '{}', expected one of: relay, direct",
-                        other
-                    ),
+                    reason: format!("unknown mode '{}', expected one of: relay, direct", other),
                 });
             }
         }

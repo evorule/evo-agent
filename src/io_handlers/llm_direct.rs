@@ -53,8 +53,10 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use super::llm_handler::{
+    backoff_duration, is_retryable_error, is_retryable_status, parse_retry_after, StreamChunk,
+};
 use crate::agent::translator::{LlmResponse, TokenUsage, ToolCall};
-use super::llm_handler::{backoff_duration, is_retryable_error, is_retryable_status, parse_retry_after, StreamChunk};
 
 /// direct 档连接参数（agent 侧持有的直连凭据与端点）
 ///
@@ -106,9 +108,10 @@ pub(crate) async fn execute(
                 if attempt > 0 {
                     debug!(attempt, "direct LLM API recovered after retry");
                 }
-                let json: Value = resp.json().await.map_err(|e| {
-                    format!("LLM API response parse error: {}", e)
-                })?;
+                let json: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("LLM API response parse error: {}", e))?;
                 return normalize_provider_response(json);
             }
             Ok(resp) if is_retryable_status(resp.status()) && attempt < retry.max_retries => {
@@ -130,9 +133,16 @@ pub(crate) async fn execute(
                 let status = resp.status();
                 let error_text = resp.text().await.unwrap_or_default();
                 if attempt == retry.max_retries && is_retryable_status(status) {
-                    warn!(attempt, status = status.as_u16(), "direct LLM API retries exhausted");
+                    warn!(
+                        attempt,
+                        status = status.as_u16(),
+                        "direct LLM API retries exhausted"
+                    );
                 } else {
-                    warn!(status = status.as_u16(), "direct LLM API non-retryable error");
+                    warn!(
+                        status = status.as_u16(),
+                        "direct LLM API non-retryable error"
+                    );
                 }
                 return Err(format!("LLM API error ({}): {}", status, error_text));
             }
@@ -217,9 +227,8 @@ pub(crate) fn normalize_provider_response(json: Value) -> Result<Value, String> 
                         .and_then(Value::as_str)
                         .or_else(|| tc.get("tool_name").and_then(Value::as_str))?;
                     let args = match tc.get("function").and_then(|f| f.get("arguments")) {
-                        Some(Value::String(s)) => {
-                            serde_json::from_str::<Value>(s).unwrap_or(Value::Object(Default::default()))
-                        }
+                        Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+                            .unwrap_or(Value::Object(Default::default())),
                         Some(obj @ Value::Object(_)) => obj.clone(),
                         _ => Value::Object(Default::default()),
                     };
@@ -315,7 +324,9 @@ fn provider_sse_frame_outcome(
 
     let Ok(json) = serde_json::from_str::<Value>(&data) else {
         return (
-            vec![StreamChunk::Warn("direct SSE 帧解析失败(跳过,流继续)".to_string())],
+            vec![StreamChunk::Warn(
+                "direct SSE 帧解析失败(跳过,流继续)".to_string(),
+            )],
             FrameEnd::Continue,
         );
     };
@@ -357,7 +368,10 @@ fn provider_sse_frame_outcome(
     let mut chunks = Vec::new();
     let delta = choice.get("delta");
 
-    if let Some(r) = delta.and_then(|d| d.get("reasoning_content")).and_then(Value::as_str) {
+    if let Some(r) = delta
+        .and_then(|d| d.get("reasoning_content"))
+        .and_then(Value::as_str)
+    {
         if !r.is_empty() {
             acc_reasoning.push_str(r);
             chunks.push(StreamChunk::ThinkingDelta(r.to_string()));
@@ -369,7 +383,10 @@ fn provider_sse_frame_outcome(
             chunks.push(StreamChunk::Delta(c.to_string()));
         }
     }
-    if let Some(calls) = delta.and_then(|d| d.get("tool_calls")).and_then(Value::as_array) {
+    if let Some(calls) = delta
+        .and_then(|d| d.get("tool_calls"))
+        .and_then(Value::as_array)
+    {
         for tc in calls {
             let Some(idx) = tc.get("index").and_then(Value::as_u64) else {
                 continue;
@@ -705,7 +722,11 @@ mod tests {
 
         let (chunks, end) = provider_sse_frame_outcome(
             "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n",
-            &mut content, &mut reasoning, &mut tools, &mut finish, &mut usage,
+            &mut content,
+            &mut reasoning,
+            &mut tools,
+            &mut finish,
+            &mut usage,
         );
         assert!(matches!(end, FrameEnd::Continue));
         assert_eq!(chunks.len(), 1);
@@ -713,7 +734,11 @@ mod tests {
 
         let (chunks, end) = provider_sse_frame_outcome(
             "data: [DONE]\n\n",
-            &mut content, &mut reasoning, &mut tools, &mut finish, &mut usage,
+            &mut content,
+            &mut reasoning,
+            &mut tools,
+            &mut finish,
+            &mut usage,
         );
         assert!(matches!(end, FrameEnd::Stop));
         assert!(chunks.is_empty());
@@ -734,13 +759,17 @@ mod tests {
             &mut content, &mut reasoning, &mut tools, &mut finish, &mut usage,
         );
         assert_eq!(chunks.len(), 1);
-        assert!(matches!(&chunks[0], StreamChunk::ToolCallDelta { index: 0, fragment } if fragment == "{\"a\""));
+        assert!(
+            matches!(&chunks[0], StreamChunk::ToolCallDelta { index: 0, fragment } if fragment == "{\"a\"")
+        );
         // 分片 2:arguments 后半
         let (chunks, _) = provider_sse_frame_outcome(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":1}\"}}]}}]}\n\n",
             &mut content, &mut reasoning, &mut tools, &mut finish, &mut usage,
         );
-        assert!(matches!(&chunks[0], StreamChunk::ToolCallDelta { index: 0, fragment } if fragment == ":1}"));
+        assert!(
+            matches!(&chunks[0], StreamChunk::ToolCallDelta { index: 0, fragment } if fragment == ":1}")
+        );
         // 终帧 finish_reason + usage
         provider_sse_frame_outcome(
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n",
@@ -765,7 +794,11 @@ mod tests {
         let mut usage = None;
         let (chunks, end) = provider_sse_frame_outcome(
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"思\"}}]}\n\n",
-            &mut content, &mut reasoning, &mut tools, &mut finish, &mut usage,
+            &mut content,
+            &mut reasoning,
+            &mut tools,
+            &mut finish,
+            &mut usage,
         );
         assert!(matches!(end, FrameEnd::Continue));
         assert!(matches!(&chunks[0], StreamChunk::ThinkingDelta(t) if t == "思"));
@@ -781,7 +814,11 @@ mod tests {
         let mut usage = None;
         let (chunks, end) = provider_sse_frame_outcome(
             "data: {broken json}\n\n",
-            &mut content, &mut reasoning, &mut tools, &mut finish, &mut usage,
+            &mut content,
+            &mut reasoning,
+            &mut tools,
+            &mut finish,
+            &mut usage,
         );
         assert!(matches!(end, FrameEnd::Continue));
         assert!(matches!(&chunks[0], StreamChunk::Warn(_)));
@@ -864,7 +901,10 @@ mod tests {
         };
         assert_eq!(cfg.mode, "direct");
         let handler = LlmHandler::from_config(&cfg);
-        let out = handler.execute(&serde_json::json!({"prompt": "hi"})).await.unwrap();
+        let out = handler
+            .execute(&serde_json::json!({"prompt": "hi"}))
+            .await
+            .unwrap();
         assert_eq!(out["content"], "你好");
         assert_eq!(out["finish_reason"], "stop");
         assert_eq!(out["token_usage"]["total_tokens"], 5);
@@ -888,9 +928,14 @@ mod tests {
             .create_async()
             .await;
 
-        let cfg = DirectLlmConfig { api_key: "k".into(), api_base: server.url() };
+        let cfg = DirectLlmConfig {
+            api_key: "k".into(),
+            api_base: server.url(),
+        };
         let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"读文件"}]});
-        let out = execute(&body, &cfg, direct_retry_params_for_test()).await.unwrap();
+        let out = execute(&body, &cfg, direct_retry_params_for_test())
+            .await
+            .unwrap();
         let llm_resp: LlmResponse = serde_json::from_value(out).unwrap();
         let calls = llm_resp.tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
@@ -917,9 +962,14 @@ mod tests {
             .create_async()
             .await;
 
-        let cfg = DirectLlmConfig { api_key: "k".into(), api_base: server.url() };
+        let cfg = DirectLlmConfig {
+            api_key: "k".into(),
+            api_base: server.url(),
+        };
         let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
-        let out = execute(&body, &cfg, direct_retry_params_for_test()).await.unwrap();
+        let out = execute(&body, &cfg, direct_retry_params_for_test())
+            .await
+            .unwrap();
         assert_eq!(out["content"], "ok");
     }
 
@@ -935,9 +985,14 @@ mod tests {
             .create_async()
             .await;
 
-        let cfg = DirectLlmConfig { api_key: "bad".into(), api_base: server.url() };
+        let cfg = DirectLlmConfig {
+            api_key: "bad".into(),
+            api_base: server.url(),
+        };
         let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
-        let err = execute(&body, &cfg, direct_retry_params_for_test()).await.unwrap_err();
+        let err = execute(&body, &cfg, direct_retry_params_for_test())
+            .await
+            .unwrap_err();
         assert!(err.contains("401"));
         m.assert(); // expect(1):恰好一次请求,未重试
     }
@@ -961,7 +1016,10 @@ mod tests {
             .create_async()
             .await;
 
-        let cfg = DirectLlmConfig { api_key: "sk-stream".into(), api_base: server.url() };
+        let cfg = DirectLlmConfig {
+            api_key: "sk-stream".into(),
+            api_base: server.url(),
+        };
         let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
         use futures_util::StreamExt;
         let mut stream = execute_stream(body, cfg, direct_retry_params_for_test());
@@ -1021,9 +1079,14 @@ mod tests {
             )
             .create_async()
             .await;
-        let direct_cfg = DirectLlmConfig { api_key: "k".into(), api_base: direct_server.url() };
+        let direct_cfg = DirectLlmConfig {
+            api_key: "k".into(),
+            api_base: direct_server.url(),
+        };
         let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
-        let direct_out = execute(&body, &direct_cfg, direct_retry_params_for_test()).await.unwrap();
+        let direct_out = execute(&body, &direct_cfg, direct_retry_params_for_test())
+            .await
+            .unwrap();
 
         // 同构判据:四键逐字段一致(等价性允许差异面 = 仅传输相关字段;
         // 本剧本两边都无 id/reasoning 键 → 输出 JSON 全等)
