@@ -285,6 +285,9 @@ pub enum JournalEvent {
         /// 压缩后 token 估算
         after_est: usize,
         /// 被清除的工具结果 call_id 列表
+        /// (契约注记 2026-10-29: 写入方实际携带 `summary_generated={bool}` 标记
+        /// 而非真实 call_id 清单——call_id 级对账在 journal 侧以 t{seq} 合成键
+        /// 成立;消费方勿按字段名解读为 call_id 集合)
         cleared_call_ids: Vec<String>,
     },
     /// 会话沉淀结果落账：sediment 四项持久化结果进步级账面。
