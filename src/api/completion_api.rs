@@ -202,8 +202,7 @@ mod tests {
     async fn inline_chat_surfaces_executor_rejection() {
         // 白名单/路由拒绝来自执行体 502+error 体重:显式上抛给前端(不再旁路)
         let url =
-            spawn_mock_executor_with_status(StatusCode::BAD_GATEWAY, "模型 m 不在准入白名单")
-                .await;
+            spawn_mock_executor_with_status(StatusCode::BAD_GATEWAY, "模型 m 不在准入白名单").await;
         let state = state_with_executor(&url, None);
         let resp = inline_chat(
             State(state),
@@ -320,11 +319,7 @@ async fn executor_call(
         // ——优先透传归因;无 error 字段则只按状态码归因(不记原始正文)
         let reason = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
-            .and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.as_str())
-                    .map(str::to_string)
-            })
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
             .unwrap_or_else(|| format!("HTTP {status}"));
         return Err(reason);
     }
