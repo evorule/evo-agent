@@ -52,6 +52,61 @@ pub(crate) type SpawnLedger = Arc<std::sync::Mutex<Vec<SpawnRecord>>>;
 /// G9:并行委托的默认并发上限(§9.6 风险缓解,默认 5)
 pub const DEFAULT_MAX_CONCURRENT_DELEGATES: usize = 5;
 
+/// 回传摘要触发阈值(字符数):子代理最终结果超过此长度时以确定性头尾
+/// 摘录回传,全文留在子会话账(journal/evorule facts)按指针可查。
+/// 阈值内全文直传——短结果摘要反而丢信息。
+pub const DIGEST_THRESHOLD_CHARS: usize = 8000;
+/// 摘录保留的头部长度(字符)
+pub const DIGEST_HEAD_CHARS: usize = 1600;
+/// 摘录保留的尾部长度(字符)
+pub const DIGEST_TAIL_CHARS: usize = 800;
+
+/// 父上下文摘要与委托任务的确定性拼接(零 LLM 参与)。
+///
+/// context 为空/纯空白时原样返回 task;非空时结构化前缀注入(子代理
+/// system prompt 不动,摘要走首条用户消息)。
+pub fn compose_task(task: &str, context: Option<&str>) -> String {
+    match context.map(str::trim) {
+        Some(c) if !c.is_empty() => {
+            format!("【父代理上下文摘要】\n{c}\n\n【委托任务】\n{task}")
+        }
+        _ => task.to_string(),
+    }
+}
+
+/// 按字符边界截断(多字节安全:越界端点回退到 char_boundary)
+fn safe_cut(s: &str, end: usize) -> usize {
+    let mut cut = end.min(s.len());
+    while cut < s.len() && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
+/// 子代理结果的确定性摘要(零 LLM、可复算)。
+///
+/// 长度 ≤ [`DIGEST_THRESHOLD_CHARS`] 时原样返回;超长时保留头尾摘录+
+/// 结构化标记+子会话指针(全文按 child_session_id 在子 journal 与
+/// evorule 会话账可查)。摘要只改变主代理看到的形态,不改变账面全文。
+pub fn digest_delegate_result(child_sid: &str, agent_type: &str, content: &str) -> String {
+    let total = content.chars().count();
+    if total <= DIGEST_THRESHOLD_CHARS {
+        return content.to_string();
+    }
+    let head_end = safe_cut(content, DIGEST_HEAD_CHARS);
+    let tail_start = safe_cut(content, content.len().saturating_sub(DIGEST_TAIL_CHARS));
+    let omitted =
+        total - content[..head_end].chars().count() - content[tail_start..].chars().count();
+    format!(
+        "[委托结果摘要] 子会话 {child_sid}(agent={agent_type})全文 {total} 字符,以下为头尾摘录\n\
+         —— 开头 ——\n{head}\n\
+         ——(中略 {omitted} 字符;全文可查:子会话 {child_sid} 的 journal 与 evorule 会话账)——\n{tail}\n\
+         —— 结束 ——",
+        head = &content[..head_end],
+        tail = &content[tail_start..],
+    )
+}
+
 /// Delegate context
 #[derive(Debug, Clone)]
 pub struct DelegateContext {
@@ -241,210 +296,230 @@ impl DelegateContext {
         agent_type: &'a str,
         task: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
-        Box::pin(async move {
-            // G9:深度强制(旧版只提供 can_delegate 辅助方法但不强制)
-            if self.current_depth >= self.max_depth {
-                return Err(format!(
-                    "max delegate depth exceeded: current_depth={} >= max_depth={} \
+        self.delegate_with_context(agent_type, task, None)
+    }
+
+    /// 带父上下文摘要的委托(其余同 [`Self::delegate`])
+    ///
+    /// `context` = 父代理按需携带的上下文摘要(可空);非空时确定性拼进
+    /// 子代理首条用户消息前部(拼接形态见 [`compose_task`],零 LLM 参与)。
+    pub fn delegate_with_context<'a>(
+        &'a self,
+        agent_type: &'a str,
+        task: &'a str,
+        context: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move { self.delegate_inner(agent_type, task, context).await })
+    }
+
+    async fn delegate_inner(
+        &self,
+        agent_type: &str,
+        task: &str,
+        context: Option<&str>,
+    ) -> Result<String, String> {
+        // G9:深度强制(旧版只提供 can_delegate 辅助方法但不强制)
+        if self.current_depth >= self.max_depth {
+            return Err(format!(
+                "max delegate depth exceeded: current_depth={} >= max_depth={} \
                      (cannot delegate to agent '{}')",
-                    self.current_depth, self.max_depth, agent_type
-                ));
-            }
+                self.current_depth, self.max_depth, agent_type
+            ));
+        }
 
-            tracing::info!(
-                agent_type,
-                task = %task,
-                depth = self.current_depth,
-                max_depth = self.max_depth,
-                "Starting delegated sub-agent execution"
+        tracing::info!(
+            agent_type,
+            task = %task,
+            depth = self.current_depth,
+            max_depth = self.max_depth,
+            "Starting delegated sub-agent execution"
+        );
+
+        let def = self.definitions.load(agent_type).map_err(|e| {
+            format!(
+                "Failed to load sub-agent definition ({}): {}",
+                agent_type, e
+            )
+        })?;
+
+        let mut config = def.to_agent_config();
+        // 请求级步超时覆写（Some=覆写定义值;None=定义值零变化）
+        if let Some(t) = self.step_timeout_override {
+            config.step_timeout = t;
+        }
+
+        // 统一装配（delegate 统一装配批）：子代理 runner 构建期标记
+        // 管道入口类=Delegate（子代理工具调用账面可分，聚焦决策落账），
+        // 聚焦快照=装配面（注册面本身）——LLM 契约面（messages 侧 tools
+        // payload，同为注册面）与管道②聚焦允许面同源，静态表不再自动
+        // 进入子代理允许面（union 提权面在装配期收口）。
+        let mut runner =
+            crate::agent::runner::AgentRunner::new(config, self.evorule_client.clone())
+                .with_delegate_pipeline_entry()
+                .with_assembly_scope_focus();
+        if let Some(counter) = &self.token_counter {
+            runner = runner.with_token_counter(counter.clone());
+        }
+        // 委托子代理 journal 步级账面接线
+        if let Some(dir) = &self.journal_dir {
+            runner = runner.with_journal_dir(dir.clone());
+        }
+        // 治理门禁段下放（serve 构造点传入;CLI 路径 None=子代理与 CLI
+        // 主路径同口径。治理段为全局纪律前馈,子代理无豁免理由）
+        if let Some(gs) = &self.governance_segment {
+            runner = runner.with_governance_segment(Some(gs.clone()));
+        }
+        // 记忆声明下放（上下文开关 × def.memory 声明双条件;子代理默认
+        // 无状态执行器,显式开启+定义声明才装配召回面,ns=定义声明域,
+        // 与子会话天然隔离）。只读召回面:ttl/配方/LexStore/召回配额
+        // 与主装配同源;写侧沉淀件不随行（子代理短生命周期,沉淀由
+        // 主会话统一收口）
+        if self.propagate_memory
+            && !def.memory.memory_type.is_empty()
+            && def.memory.memory_type != "none"
+        {
+            let mut mem = crate::agent::memory::MemoryManager::new(
+                &def.memory.namespace,
+                self.evorule_client.clone(),
             );
-
-            let def = self.definitions.load(agent_type).map_err(|e| {
-                format!(
-                    "Failed to load sub-agent definition ({}): {}",
-                    agent_type, e
-                )
-            })?;
-
-            let mut config = def.to_agent_config();
-            // 请求级步超时覆写（Some=覆写定义值;None=定义值零变化）
-            if let Some(t) = self.step_timeout_override {
-                config.step_timeout = t;
+            if let Some(ttl) = def.memory.ttl_secs {
+                mem = mem.with_ttl_secs(ttl);
             }
-
-            // 统一装配（delegate 统一装配批）：子代理 runner 构建期标记
-            // 管道入口类=Delegate（子代理工具调用账面可分，聚焦决策落账），
-            // 聚焦快照=装配面（注册面本身）——LLM 契约面（messages 侧 tools
-            // payload，同为注册面）与管道②聚焦允许面同源，静态表不再自动
-            // 进入子代理允许面（union 提权面在装配期收口）。
-            let mut runner =
-                crate::agent::runner::AgentRunner::new(config, self.evorule_client.clone())
-                    .with_delegate_pipeline_entry()
-                    .with_assembly_scope_focus();
-            if let Some(counter) = &self.token_counter {
-                runner = runner.with_token_counter(counter.clone());
-            }
-            // 委托子代理 journal 步级账面接线
-            if let Some(dir) = &self.journal_dir {
-                runner = runner.with_journal_dir(dir.clone());
-            }
-            // 治理门禁段下放（serve 构造点传入;CLI 路径 None=子代理与 CLI
-            // 主路径同口径。治理段为全局纪律前馈,子代理无豁免理由）
-            if let Some(gs) = &self.governance_segment {
-                runner = runner.with_governance_segment(Some(gs.clone()));
-            }
-            // 记忆声明下放（上下文开关 × def.memory 声明双条件;子代理默认
-            // 无状态执行器,显式开启+定义声明才装配召回面,ns=定义声明域,
-            // 与子会话天然隔离）。只读召回面:ttl/配方/LexStore/召回配额
-            // 与主装配同源;写侧沉淀件不随行（子代理短生命周期,沉淀由
-            // 主会话统一收口）
-            if self.propagate_memory
-                && !def.memory.memory_type.is_empty()
-                && def.memory.memory_type != "none"
-            {
-                let mut mem = crate::agent::memory::MemoryManager::new(
-                    &def.memory.namespace,
-                    self.evorule_client.clone(),
-                );
-                if let Some(ttl) = def.memory.ttl_secs {
-                    mem = mem.with_ttl_secs(ttl);
-                }
-                if let Some(rj) = &def.memory.recipe {
-                    match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone()) {
-                        Ok(recipe) => mem.set_recipe(recipe),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "子代理记忆配方解析失败——召回走词法 legacy 路径");
-                        }
-                    }
-                }
-                if let Some(db) = &def.memory.lex_store {
-                    match crate::agent::lexstore::LexStore::open(std::path::Path::new(db)) {
-                        Ok(store) => mem.set_lex_store(std::sync::Arc::new(store)),
-                        Err(e) => {
-                            tracing::warn!(db = %db, error = %e, "子代理 LexStore open failed——召回走全量拉取降级路径");
-                        }
-                    }
-                }
-                if let Err(e) = mem.sync_from_evorule().await {
-                    tracing::warn!(error = %e, "子代理记忆同步失败——召回降级为空记忆起步");
-                }
-                runner = runner.with_recall_quotas(
-                    def.memory.max_session_summaries,
-                    def.memory.max_injected_events,
-                );
-                runner = runner.with_memory(mem);
-            }
-
-            // 工具面 + 能力边界接线（对齐 serve 面 construct_runner / CLI
-            // patrol_build_runner 模式）。委托 runner 此前零工具契约：LLM 无 tools
-            // 可知 → 凭训练先验输出供应商原生 XML（<minimax:tool_call> 死文本）。
-            // 按 def.tools 白名单过滤挂载；过滤后为空则不挂（纯规划类子代理维持旧行为）。
-            if let (Some(union), Some(workdir)) = (&self.toolkit, &self.workdir) {
-                let mut filtered =
-                    crate::api::serve_tools::build_filtered_toolkit(union, &def.tools);
-                if !filtered.tool_names().is_empty() {
-                    let boundary = crate::api::serve_tools::wire_capability_boundary(
-                        &mut filtered,
-                        &def,
-                        workdir,
-                    );
-                    // B2:skills 声明接线(read_skill 注册 + manifest 槽位源)。
-                    // 置于工具面挂载块内:无工具面的纯规划子代理不注入 manifest,
-                    // 防 LLM 看到技能清单却无 read_skill 可调;解析失败=定义损坏,
-                    // 上抛拒委托(声明时刻=人工把关,路径由系统解析)。
-                    // C 形态后子代理路径为纯声明面(不扫目录——两源合并在 serve
-                    // 会话创建路径,见 skill_api::merged_manifest_for_session)
-                    let declared_skills = crate::api::serve_tools::resolve_declared_skills(&def)?;
-                    let resolved_skills =
-                        crate::api::serve_tools::wire_skills(&mut filtered, declared_skills)?;
-                    runner = runner
-                        .with_tool_handler(filtered)
-                        .with_capability_boundary(boundary)
-                        .with_skills(resolved_skills);
-                }
-            }
-
-            // 执行路径改走流式消费——宪法 v0.5.0 起 server 只做单发桥接
-            // （call_external 的 io_response 提交后即 Stable），多轮工具回喂在应用层
-            // run_streaming 的本地 ReAct 循环；非流式 run() 单轮即止，即使 LLM 正确
-            // 返回 tool_calls 也不执行。delegate() 对外签名 Result<String,String>
-            // 不变，driver/marks 层零改动。tokens 埋点已随流式路径 token_counter
-            // 累加点（StreamChunk::Done 臂）继续生效。
-            let mut stream = runner.run_streaming(task.to_string(), Vec::new());
-            let mut final_result: Option<crate::agent::runner::AgentResult> = None;
-            let mut stream_err: Option<String> = None;
-            // 本委托窗口 token 归账基线（子 runner 每次 LLM 调用后累加,
-            // Done 时以差值落 SpawnRecord;未接线埋点时恒 0-0=None 语义）
-            let tokens_start = self.token_total();
-            let mut spawn_record_idx: Option<usize> = None;
-            while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
-                match ev {
-                    Ok(crate::agent::runner::AgentEvent::Done(r)) => {
-                        final_result = Some(r);
-                        break;
-                    }
-                    Ok(crate::agent::runner::AgentEvent::SessionCreated { session_id, .. }) => {
-                        // 子会话锚即刻入账(父 runner 在本委托调用的工具结果
-                        // 写账时 drain 落事件;先记后亡的取消分支也留锚——
-                        // 记录语义="实际创建的子会话")
-                        if let Ok(mut ledger) = self.spawn_ledger.lock() {
-                            spawn_record_idx = Some(ledger.len());
-                            ledger.push(SpawnRecord {
-                                child_session_id: session_id,
-                                agent_type: agent_type.to_string(),
-                                depth: self.current_depth + 1,
-                                task_digest: crate::agent::journal::evorule_digest(task),
-                                tokens_used: None,
-                            });
-                        }
-                    }
-                    Ok(_) => {}
+            if let Some(rj) = &def.memory.recipe {
+                match serde_json::from_value::<crate::agent::recipe::MemoryRecipe>(rj.clone()) {
+                    Ok(recipe) => mem.set_recipe(recipe),
                     Err(e) => {
-                        // 流式实现中 Err 后仍会跟 Done(error)；记录并以 Done 为权威终态
-                        stream_err = Some(e.to_string());
+                        tracing::warn!(error = %e, "子代理记忆配方解析失败——召回走词法 legacy 路径");
                     }
                 }
             }
-
-            // 窗口闭合归账（Done/流级错/无终态均记——差值落回本委托的账目行）
-            if let Some(idx) = spawn_record_idx {
-                if let Ok(mut ledger) = self.spawn_ledger.lock() {
-                    if let Some(rec) = ledger.get_mut(idx) {
-                        rec.tokens_used = Some(self.token_total().saturating_sub(tokens_start));
+            if let Some(db) = &def.memory.lex_store {
+                match crate::agent::lexstore::LexStore::open(std::path::Path::new(db)) {
+                    Ok(store) => mem.set_lex_store(std::sync::Arc::new(store)),
+                    Err(e) => {
+                        tracing::warn!(db = %db, error = %e, "子代理 LexStore open failed——召回走全量拉取降级路径");
                     }
                 }
             }
+            if let Err(e) = mem.sync_from_evorule().await {
+                tracing::warn!(error = %e, "子代理记忆同步失败——召回降级为空记忆起步");
+            }
+            runner = runner.with_recall_quotas(
+                def.memory.max_session_summaries,
+                def.memory.max_injected_events,
+            );
+            runner = runner.with_memory(mem);
+        }
 
-            match final_result {
-                Some(r) => {
-                    if r.success {
-                        tracing::info!(
-                            agent_type,
-                            depth = self.current_depth,
-                            "Sub-agent execution succeeded"
-                        );
-                        Ok(r.content)
-                    } else {
-                        let err = r.error.unwrap_or_default();
-                        tracing::warn!(
-                            agent_type,
-                            depth = self.current_depth,
-                            "Sub-agent execution failed: {}",
-                            err
-                        );
-                        Err(err)
+        // 工具面 + 能力边界接线（对齐 serve 面 construct_runner / CLI
+        // patrol_build_runner 模式）。委托 runner 此前零工具契约：LLM 无 tools
+        // 可知 → 凭训练先验输出供应商原生 XML（<minimax:tool_call> 死文本）。
+        // 按 def.tools 白名单过滤挂载；过滤后为空则不挂（纯规划类子代理维持旧行为）。
+        if let (Some(union), Some(workdir)) = (&self.toolkit, &self.workdir) {
+            let mut filtered = crate::api::serve_tools::build_filtered_toolkit(union, &def.tools);
+            if !filtered.tool_names().is_empty() {
+                let boundary =
+                    crate::api::serve_tools::wire_capability_boundary(&mut filtered, &def, workdir);
+                // B2:skills 声明接线(read_skill 注册 + manifest 槽位源)。
+                // 置于工具面挂载块内:无工具面的纯规划子代理不注入 manifest,
+                // 防 LLM 看到技能清单却无 read_skill 可调;解析失败=定义损坏,
+                // 上抛拒委托(声明时刻=人工把关,路径由系统解析)。
+                // C 形态后子代理路径为纯声明面(不扫目录——两源合并在 serve
+                // 会话创建路径,见 skill_api::merged_manifest_for_session)
+                let declared_skills = crate::api::serve_tools::resolve_declared_skills(&def)?;
+                let resolved_skills =
+                    crate::api::serve_tools::wire_skills(&mut filtered, declared_skills)?;
+                runner = runner
+                    .with_tool_handler(filtered)
+                    .with_capability_boundary(boundary)
+                    .with_skills(resolved_skills);
+            }
+        }
+
+        // 执行路径改走流式消费——宪法 v0.5.0 起 server 只做单发桥接
+        // （call_external 的 io_response 提交后即 Stable），多轮工具回喂在应用层
+        // run_streaming 的本地 ReAct 循环；非流式 run() 单轮即止，即使 LLM 正确
+        // 返回 tool_calls 也不执行。delegate() 对外签名 Result<String,String>
+        // 不变，driver/marks 层零改动。tokens 埋点已随流式路径 token_counter
+        // 累加点（StreamChunk::Done 臂）继续生效。
+        let goal = compose_task(task, context);
+        let mut stream = runner.run_streaming(goal, Vec::new());
+        let mut final_result: Option<crate::agent::runner::AgentResult> = None;
+        let mut stream_err: Option<String> = None;
+        // 子会话 id(摘要指针用;SessionCreated 即锚定)
+        let mut child_sid = String::new();
+        // 本委托窗口 token 归账基线（子 runner 每次 LLM 调用后累加,
+        // Done 时以差值落 SpawnRecord;未接线埋点时恒 0-0=None 语义）
+        let tokens_start = self.token_total();
+        let mut spawn_record_idx: Option<usize> = None;
+        while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
+            match ev {
+                Ok(crate::agent::runner::AgentEvent::Done(r)) => {
+                    final_result = Some(r);
+                    break;
+                }
+                Ok(crate::agent::runner::AgentEvent::SessionCreated { session_id, .. }) => {
+                    // 子会话锚即刻入账(父 runner 在本委托调用的工具结果
+                    // 写账时 drain 落事件;先记后亡的取消分支也留锚——
+                    // 记录语义="实际创建的子会话")
+                    child_sid.clone_from(&session_id);
+                    if let Ok(mut ledger) = self.spawn_ledger.lock() {
+                        spawn_record_idx = Some(ledger.len());
+                        ledger.push(SpawnRecord {
+                            child_session_id: session_id,
+                            agent_type: agent_type.to_string(),
+                            depth: self.current_depth + 1,
+                            task_digest: crate::agent::journal::evorule_digest(task),
+                            tokens_used: None,
+                        });
                     }
                 }
-                None => {
-                    let err = format!(
-                        "Sub-agent runtime error: {}",
-                        stream_err.unwrap_or_else(|| "stream ended without Done".to_string())
+                Ok(_) => {}
+                Err(e) => {
+                    // 流式实现中 Err 后仍会跟 Done(error)；记录并以 Done 为权威终态
+                    stream_err = Some(e.to_string());
+                }
+            }
+        }
+
+        // 窗口闭合归账（Done/流级错/无终态均记——差值落回本委托的账目行）
+        if let Some(idx) = spawn_record_idx {
+            if let Ok(mut ledger) = self.spawn_ledger.lock() {
+                if let Some(rec) = ledger.get_mut(idx) {
+                    rec.tokens_used = Some(self.token_total().saturating_sub(tokens_start));
+                }
+            }
+        }
+
+        match final_result {
+            Some(r) => {
+                if r.success {
+                    tracing::info!(
+                        agent_type,
+                        depth = self.current_depth,
+                        "Sub-agent execution succeeded"
                     );
-                    tracing::error!(agent_type, depth = self.current_depth, "{}", err);
+                    Ok(digest_delegate_result(&child_sid, agent_type, &r.content))
+                } else {
+                    let err = r.error.unwrap_or_default();
+                    tracing::warn!(
+                        agent_type,
+                        depth = self.current_depth,
+                        "Sub-agent execution failed: {}",
+                        err
+                    );
                     Err(err)
                 }
             }
-        })
+            None => {
+                let err = format!(
+                    "Sub-agent runtime error: {}",
+                    stream_err.unwrap_or_else(|| "stream ended without Done".to_string())
+                );
+                tracing::error!(agent_type, depth = self.current_depth, "{}", err);
+                Err(err)
+            }
+        }
     }
 
     /// G9:并行委托多个子 agent
@@ -544,6 +619,59 @@ mod tests {
 
     fn make_test_client() -> EvoruleApiClient {
         EvoruleApiClient::new("http://localhost:8080")
+    }
+
+    // ===== 回传确定性摘要 + 上下文拼接(纯函数) =====
+
+    #[test]
+    fn compose_task_appends_context_prefix() {
+        assert_eq!(compose_task("do x", None), "do x");
+        assert_eq!(
+            compose_task("do x", Some("  ")),
+            "do x",
+            "纯空白 context=无注入"
+        );
+        let composed = compose_task("do x", Some("决策:用方案B"));
+        assert!(composed.contains("【父代理上下文摘要】"));
+        assert!(composed.contains("决策:用方案B"));
+        assert!(composed.contains("【委托任务】\ndo x"));
+        // 顺序:摘要在前,任务在后
+        let summary_pos = composed.find("决策:用方案B").unwrap();
+        let task_pos = composed.find("do x").unwrap();
+        assert!(summary_pos < task_pos);
+    }
+
+    #[test]
+    fn digest_keeps_short_content_verbatim() {
+        let short = "短结果";
+        assert_eq!(digest_delegate_result("s1", "researcher", short), short);
+    }
+
+    #[test]
+    fn digest_truncates_long_content_with_head_tail_and_pointer() {
+        let long = format!("{}尾", "汉".repeat(DIGEST_THRESHOLD_CHARS + 500));
+        let out = digest_delegate_result("sid-9", "researcher", &long);
+        assert!(out.contains("[委托结果摘要]"), "结构化标记在");
+        assert!(out.contains("sid-9"));
+        assert!(out.contains("agent=researcher"));
+        let total: usize = long.chars().count();
+        assert!(out.contains(&format!("全文 {total} 字符")));
+        // 头部摘录在(开头的字符序列),尾部摘录在(结尾字符含"尾")
+        assert!(out.contains(&"汉".repeat(64)));
+        assert!(out.ends_with("—— 结束 ——"));
+        assert!(out.contains("尾\n—— 结束 ——".trim_end()));
+        // 摘录边界多字节安全(无 U+FFFD 替换符)
+        assert!(!out.contains('\u{FFFD}'), "字符边界截断不得产生替换符");
+        // 输出显著短于原文
+        assert!(out.chars().count() < total / 2);
+    }
+
+    #[test]
+    fn digest_char_boundary_safety_on_mixed_input() {
+        // 3 字节汉字+1 字节 ASCII 混排,切点落在多字节序列内部的概率最大化
+        let long = "a汉b字c节".repeat(DIGEST_THRESHOLD_CHARS);
+        let out = digest_delegate_result("s", "w", &long);
+        assert!(!out.contains('\u{FFFD}'));
     }
 
     fn make_ctx() -> DelegateContext {
