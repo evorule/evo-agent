@@ -81,15 +81,20 @@ impl ToolFunction for DelegateTool {
             .get("task")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required arg: task (string)".to_string())?;
+        let context = args.get("context").and_then(|v| v.as_str());
 
         tracing::info!(
             agent_type,
             task = %task,
+            has_context = context.is_some(),
             depth = self.ctx.current_depth,
             "delegate tool invoked by LLM"
         );
 
-        let result = self.ctx.delegate(agent_type, task).await;
+        let result = self
+            .ctx
+            .delegate_with_context(agent_type, task, context)
+            .await;
         match result {
             Ok(content) => {
                 let mut map = serde_json::Map::new();
@@ -131,6 +136,15 @@ pub fn delegate_tool_spec() -> crate::builtin_tools::ToolSpec {
                 r#type: "string".to_string(),
                 description: "The task description to give to the sub-agent".to_string(),
                 required: true,
+            },
+            crate::builtin_tools::ParameterSpec {
+                name: "context".to_string(),
+                r#type: "string".to_string(),
+                description: "Optional digest of the parent context the sub-agent needs (it \
+                              otherwise only sees the task). Keep it to essential facts and \
+                              decisions, not the full history."
+                    .to_string(),
+                required: false,
             },
         ],
     }
@@ -199,7 +213,7 @@ mod tests {
     fn test_delegate_tool_spec() {
         let spec = delegate_tool_spec();
         assert_eq!(spec.name, "delegate");
-        assert_eq!(spec.parameters.len(), 2);
+        assert_eq!(spec.parameters.len(), 3);
         assert!(spec
             .parameters
             .iter()
@@ -208,6 +222,11 @@ mod tests {
             .parameters
             .iter()
             .any(|p| p.name == "task" && p.required));
+        // context_digest(批 B):可选参数——父代理按需携带,不传=行为零变化
+        assert!(spec
+            .parameters
+            .iter()
+            .any(|p| p.name == "context" && !p.required));
     }
 
     #[test]
