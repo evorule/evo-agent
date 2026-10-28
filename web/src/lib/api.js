@@ -23,6 +23,30 @@ function headers(json = false) {
   return h;
 }
 
+/**
+ * G16 换票:浏览器 WS/SSE 建连鉴权查询串(主会话流/dap/lsp/pty/tasks 五处共用)。
+ * serve G16 起 `?token=` 长期凭据恒 401(auth 启用态),唯一合法通道是以 Bearer
+ * 换一次性短票:`POST /api/auth/ticket` → `?ticket=` 握手(票 TTL 30s 消费即焚)。
+ * 每次建连现取新票(不可缓存复用);无 token(auth 关闭态)或换票被拒 → 返回 ''
+ * 匿名直连,由服务端裁决(auth 关闭放行/开启拒绝)。
+ * @returns {Promise<string>} `&ticket=...` 或 ''
+ */
+export async function wsAuthQuery() {
+  const t = token();
+  if (!t) return '';
+  try {
+    const resp = await fetch('/api/auth/ticket', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${t}` },
+    });
+    if (!resp.ok) return '';
+    const body = await resp.json();
+    return body?.ticket ? `&ticket=${encodeURIComponent(body.ticket)}` : '';
+  } catch {
+    return '';
+  }
+}
+
 /** 文件面请求头 = 通用头 + 会话工作区重锚头(空工作区不携带 → workdir 根) */
 function fileHeaders(json = false) {
   const h = headers(json);

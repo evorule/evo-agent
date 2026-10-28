@@ -54,9 +54,10 @@ vi.stubGlobal('WebSocket', MockWebSocket);
 const { connect, sendMessage } = await import('../src/lib/ws.js');
 const { messages } = await import('../src/lib/stores.js');
 
-beforeEach(() => {
+beforeEach(async () => {
   messages.set([]);
-  connect('new');
+  // G16 换票接线后 connect 已 async 化(建连前换票),须 await 落座再驱动 socket
+  await connect('new');
   MockWebSocket.last.open();
 });
 

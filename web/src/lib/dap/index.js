@@ -11,7 +11,7 @@
 // DebugView 在调用 startDebug 前消费 needsDebugConfirm。
 
 import { writable, get } from 'svelte/store';
-import { getDapAdapters, getLspStatus, readFile, writeFile } from '../api.js';
+import { getDapAdapters, getLspStatus, readFile, writeFile, wsAuthQuery } from '../api.js';
 import { openFile, pushPanelEvent, sidebarView } from '../stores.js';
 import { registerCommand } from '../commands.js';
 import { openBottomPanel } from '../panel.js';
@@ -239,8 +239,10 @@ export async function startDebug(adapter, config) {
   if (session && ![DBG_STATES.IDLE, DBG_STATES.ENDED, DBG_STATES.TERMINATED, DBG_STATES.FAILED].includes(get(debugState).state)) {
     throw new Error('调试会话已在进行中');
   }
+  // G16 换票:Bearer 换一次性短票走 ?ticket=(?token= 恒 401)
+  const authq = await wsAuthQuery();
   client = createDapClient({
-    wsUrl: `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/dap/ws?adapter=${encodeURIComponent(adapter)}${(localStorage.getItem('evo_agent_token') || '') ? `&token=${encodeURIComponent(localStorage.getItem('evo_agent_token'))}` : ''}`,
+    wsUrl: `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/dap/ws?adapter=${encodeURIComponent(adapter)}${authq}`,
     onEvent: (ev) => session?.handleClientEvent(ev),
     onDapEvent: (event, body) => session?.handleDapEvent(event, body),
   });

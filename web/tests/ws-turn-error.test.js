@@ -63,11 +63,12 @@ async function startTurn() {
   await sendMessage('hi');
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   MockWebSocket.instances.length = 0;
   messages.set([]);
   newSession();
-  connect('new');
+  // G16 换票接线后 connect 已 async 化(建连前换票),须 await 落座
+  await connect('new');
 });
 
 describe('失败轮错误卡同轮去重', () => {

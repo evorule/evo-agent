@@ -16,6 +16,7 @@ import '@xterm/xterm/css/xterm.css';
 import { terminalTheme } from './xterm-theme.js';
 import { getSetting } from './settings.js';
 import { pushPanelEvent } from './stores.js';
+import { wsAuthQuery } from './api.js';
 
 /** 写队列水位(字节):超 HIGH 告诉后端暂停,回落 LOW 恢复 */
 export const WATERMARK_HIGH = 100 * 1024;
@@ -45,13 +46,10 @@ export function getActiveTerminal() {
   return null;
 }
 
-function token() {
-  return localStorage.getItem('evo_agent_token') || '';
-}
-
-function ptyUrl(termId, cols, rows) {
+function ptyUrl(termId, cols, rows, authq) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${proto}://${location.host}/api/pty/ws?term=${encodeURIComponent(termId)}&cols=${cols}&rows=${rows}${token() ? `&token=${encodeURIComponent(token())}` : ''}`;
+  // G16 换票:authq = `&ticket=...`(Bearer 换一次性短票;?token= 恒 401)
+  return `${proto}://${location.host}/api/pty/ws?term=${encodeURIComponent(termId)}&cols=${cols}&rows=${rows}${authq || ''}`;
 }
 
 /** 预取下一个实例 id(视图层先渲染槽位再创建,防 DOM 换键重建) */
@@ -124,76 +122,85 @@ export function createTerminalSession(container, forcedId) {
   instances.set(termId, inst);
 
   const dims = currentDims(inst);
-  const ws = new WebSocket(ptyUrl(termId, dims.cols, dims.rows));
-  ws.binaryType = 'arraybuffer';
-  inst.ws = ws;
+  // G16 换票:票一次性;v1 无断线恢复,无重连换票面。await 窗口内
+  // 键盘/resize 事件由 inst.ws 空值守卫兜住(不发送,不崩溃)。
+  void (async () => {
+    const authq = await wsAuthQuery();
+    if (instances.get(termId) !== inst) return; // 期间被销毁/抢代,弃
+    const ws = new WebSocket(ptyUrl(termId, dims.cols, dims.rows, authq));
+    ws.binaryType = 'arraybuffer';
+    inst.ws = ws;
 
-  ws.onopen = () => {
-    setState(inst, 'ready');
-  };
-  ws.onmessage = (ev) => {
-    if (ev.data instanceof ArrayBuffer) {
-      enqueueWrite(inst, new Uint8Array(ev.data));
-      return;
-    }
-    // 控制帧(Text JSON)
-    let msg;
-    try {
-      msg = JSON.parse(ev.data);
-    } catch {
-      return;
-    }
-    switch (msg.type) {
-      case 'gov_event': {
-        const e = msg.event || {};
-        if (e.action === 'pty.created') {
-          pushPanelEvent('gov', {
-            label: 'pty.created',
-            detail: `${e.termId} · ${e.shell} · ${e.cwd} · approver=${e.approver}`,
-          });
-        } else if (e.action === 'pty.closed') {
-          pushPanelEvent('gov', {
-            label: 'pty.closed',
-            detail: `${e.termId} · reason=${e.reason}${e.exitCode != null ? ` · exit=${e.exitCode}` : ''}`,
-          });
-        }
-        break;
+    ws.onopen = () => {
+      setState(inst, 'ready');
+    };
+    ws.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        enqueueWrite(inst, new Uint8Array(ev.data));
+        return;
       }
-      case 'exit':
+      // 控制帧(Text JSON)
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      switch (msg.type) {
+        case 'gov_event': {
+          const e = msg.event || {};
+          if (e.action === 'pty.created') {
+            pushPanelEvent('gov', {
+              label: 'pty.created',
+              detail: `${e.termId} · ${e.shell} · ${e.cwd} · approver=${e.approver}`,
+            });
+          } else if (e.action === 'pty.closed') {
+            pushPanelEvent('gov', {
+              label: 'pty.closed',
+              detail: `${e.termId} · reason=${e.reason}${e.exitCode != null ? ` · exit=${e.exitCode}` : ''}`,
+            });
+          }
+          break;
+        }
+        case 'exit':
+          setState(inst, 'exited');
+          inst.exitCode = msg.code;
+          notify();
+          break;
+        case 'error':
+          setState(inst, 'error');
+          inst.hint = msg.hint || '';
+          notify();
+          break;
+        default:
+          break;
+      }
+    };
+    ws.onclose = () => {
+      if (inst.state === 'ready' || inst.state === 'connecting') {
+        // v1 无断线恢复:会话终止,重开即干净会话(设计档降级矩阵)
         setState(inst, 'exited');
-        inst.exitCode = msg.code;
+        inst.exitCode = null;
+        inst.hint = '连接已断开,进程已回收。重新打开终端即新会话。';
         notify();
-        break;
-      case 'error':
-        setState(inst, 'error');
-        inst.hint = msg.hint || '';
-        notify();
-        break;
-      default:
-        break;
-    }
-  };
-  ws.onclose = () => {
-    if (inst.state === 'ready' || inst.state === 'connecting') {
-      // v1 无断线恢复:会话终止,重开即干净会话(设计档降级矩阵)
-      setState(inst, 'exited');
-      inst.exitCode = null;
-      inst.hint = '连接已断开,进程已回收。重新打开终端即新会话。';
-      notify();
-    }
-  };
-  ws.onerror = () => {};
+      }
+    };
+    ws.onerror = () => {};
+  })();
 
-  // 键盘 → WS(Binary)
+  // 键盘 → WS(Binary)——G16 换票后建连 async 化,await 窗口内 inst.ws 为
+  // null,空值守卫兜住(不发送,不崩溃)
   inst.disposers.push(
     term.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(new TextEncoder().encode(data));
+      const sock = inst.ws;
+      if (sock && sock.readyState === WebSocket.OPEN) {
+        sock.send(new TextEncoder().encode(data));
       }
     }),
     term.onResize(({ cols, rows }) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+      const sock = inst.ws;
+      if (sock && sock.readyState === WebSocket.OPEN) {
+        sock.send(JSON.stringify({ type: 'resize', cols, rows }));
       }
     }),
   );

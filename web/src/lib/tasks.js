@@ -9,6 +9,7 @@ import { writable, get } from 'svelte/store';
 import { outputChannel } from './panel.js';
 import { setDiagnostics, clearDiagnostics } from './diagnostics.js';
 import { pushPanelEvent } from './stores.js';
+import { wsAuthQuery } from './api.js';
 
 /** 工作区任务清单(GET /api/tasks;含 error/hint) */
 export const taskList = writable({ tasks: [], error: null, hint: null, loaded: false });
@@ -188,68 +189,72 @@ function applyDiagnostics(owner, items) {
   }
 }
 
-/** 连接一个 run 的事件流(回放+活播) */
+/** 连接一个 run 的事件流(回放+活播)。G16 换票:票一次性;
+ *  断连不自动重连,无重连换票面)。 */
 function connectRun(runId, label) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(
-    `${proto}://${location.host}/api/tasks/ws?run_id=${encodeURIComponent(runId)}${token() ? `&token=${encodeURIComponent(token())}` : ''}`,
-  );
-  liveSockets.set(runId, ws);
-  const owner = `task.${label}`;
-  ws.onmessage = (ev) => {
-    let msg;
-    try {
-      msg = JSON.parse(ev.data);
-    } catch {
-      return;
-    }
-    switch (msg.type) {
-      case 'started':
-        // 运行开始:清同 owner 旧诊断(防叠加),回显命令行
-        clearDiagnostics(owner);
-        pushLine(label, 'sys', `$ ${msg.command}`);
-        break;
-      case 'output':
-        pushLine(label, msg.stream, msg.line);
-        break;
-      case 'diagnostics':
-        applyDiagnostics(msg.owner, msg.items);
-        break;
-      case 'ended': {
-        pushLine(label, 'sys', `进程退出(code ${msg.exitCode}${msg.cancelled ? ',已取消' : ''},${Math.round(msg.durationMs / 100) / 10}s)`);
-        setRunState(runId, { state: 'exited', exitCode: msg.exitCode, cancelled: msg.cancelled });
-        if (get(lastTaskLabel) === label) {
-          // 最近任务保持
-        }
-        // autoRevealProblems:非零退出/扫出问题→自动开问题面板(调用方接线)
-        if (get(autoRevealProblems)) {
-          window.dispatchEvent(new CustomEvent('evo:task-problems', { detail: { label, exitCode: msg.exitCode } }));
-        }
-        break;
+  void (async () => {
+    const authq = await wsAuthQuery();
+    const ws = new WebSocket(
+      `${proto}://${location.host}/api/tasks/ws?run_id=${encodeURIComponent(runId)}${authq}`,
+    );
+    liveSockets.set(runId, ws);
+    const owner = `task.${label}`;
+    ws.onmessage = (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        return;
       }
-      case 'gov_event': {
-        const e = msg.event || {};
-        pushPanelEvent('gov', {
-          label: e.action,
-          detail: `${e.label} · ${e.command}${e.exitCode != null ? ` · exit=${e.exitCode}` : ''}`,
-        });
-        break;
+      switch (msg.type) {
+        case 'started':
+          // 运行开始:清同 owner 旧诊断(防叠加),回显命令行
+          clearDiagnostics(owner);
+          pushLine(label, 'sys', `$ ${msg.command}`);
+          break;
+        case 'output':
+          pushLine(label, msg.stream, msg.line);
+          break;
+        case 'diagnostics':
+          applyDiagnostics(msg.owner, msg.items);
+          break;
+        case 'ended': {
+          pushLine(label, 'sys', `进程退出(code ${msg.exitCode}${msg.cancelled ? ',已取消' : ''},${Math.round(msg.durationMs / 100) / 10}s)`);
+          setRunState(runId, { state: 'exited', exitCode: msg.exitCode, cancelled: msg.cancelled });
+          if (get(lastTaskLabel) === label) {
+            // 最近任务保持
+          }
+          // autoRevealProblems:非零退出/扫出问题→自动开问题面板(调用方接线)
+          if (get(autoRevealProblems)) {
+            window.dispatchEvent(new CustomEvent('evo:task-problems', { detail: { label, exitCode: msg.exitCode } }));
+          }
+          break;
+        }
+        case 'gov_event': {
+          const e = msg.event || {};
+          pushPanelEvent('gov', {
+            label: e.action,
+            detail: `${e.label} · ${e.command}${e.exitCode != null ? ` · exit=${e.exitCode}` : ''}`,
+          });
+          break;
+        }
+        case 'error':
+          pushLine(label, 'sys', msg.hint || '任务错误');
+          break;
+        default:
+          break;
       }
-      case 'error':
-        pushLine(label, 'sys', msg.hint || '任务错误');
-        break;
-      default:
-        break;
-    }
-  };
-  ws.onclose = () => {
-    liveSockets.delete(runId);
-    const runs = get(taskRuns);
-    const run = runs[runId];
-    if (run && run.state === 'running') {
-      setRunState(runId, { state: 'disconnected' });
-    }
-  };
+    };
+    ws.onclose = () => {
+      liveSockets.delete(runId);
+      const runs = get(taskRuns);
+      const run = runs[runId];
+      if (run && run.state === 'running') {
+        setRunState(runId, { state: 'disconnected' });
+      }
+    };
+  })();
 }
 
 /**

@@ -12,7 +12,7 @@ import { monaco as monacoSingleton } from '../monaco-setup.js';
 import { settingsState } from '../settings.js';
 import { pushPanelEvent, openFile } from '../stores.js';
 import { uriSpecFor, setDiagnostics, clearDiagnostics, pathFromUri } from '../diagnostics.js';
-import { getLspStatus } from '../api.js';
+import { getLspStatus, wsAuthQuery } from '../api.js';
 import { createLspClient, pathToFileUri, LSP_STATES } from './client.js';
 import {
   attachFeatures,
@@ -115,12 +115,16 @@ function ensureClient(lang) {
   if (clients.has(lang) || !enabled || !workdirBase) return clients.get(lang);
   if (!gateStatus.get(lang)?.available) return null; // PATH 缺失:灰置,不建连
   const serverName = lang === 'rust' ? 'rust-analyzer' : 'typescript-language-server';
-  const token = localStorage.getItem('evo_agent_token') || '';
-  const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/lsp/ws?lang=${lang}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
+  // G16 换票:建连 URL 改 thunk——connect 时换票现取(?token= 恒 401,
+  // Bearer 换一次性短票 ?ticket= 是唯一合法通道;票一次性,每次 connect 现取)
   const client = createLspClient({
     lang,
     serverName,
-    wsUrl,
+    wsUrl: async () => {
+      const authq = await wsAuthQuery();
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      return `${proto}://${location.host}/api/lsp/ws?lang=${lang}${authq}`;
+    },
     workdirBase,
     onEvent: (event) => handleEvent(lang, serverName, event),
     onDiagnostics: (params) => handleDiagnostics(lang, params),

@@ -173,7 +173,7 @@ export function createLspClient({ lang, serverName, wsUrl, workdirBase, onEvent,
     if (typeof ev.data === 'string') rpc.onMessage(ev.data);
   }
 
-  function connect() {
+  async function connect() {
     if (disposed || ws) return;
     setState(LSP_STATES.CONNECTING, 'ws');
     rpc = createRpcLayer((text) => {
@@ -185,7 +185,9 @@ export function createLspClient({ lang, serverName, wsUrl, workdirBase, onEvent,
     });
 
     try {
-      ws = new WebSocket(wsUrl);
+      // G16 换票:wsUrl 支持 thunk——connect 时换票现取完整 URL(票一次性)
+      const url = typeof wsUrl === 'function' ? await wsUrl() : wsUrl;
+      ws = new WebSocket(url);
     } catch (e) {
       setState(LSP_STATES.UNAVAILABLE, String(e?.message || e));
       return;

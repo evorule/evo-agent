@@ -36,7 +36,7 @@ import {
   applySpawnResult,
   orchestration,
 } from './orchestration.js';
-import { getTranscript } from './api.js';
+import { getTranscript, wsAuthQuery } from './api.js';
 import { assembleContext } from './mentions.js';
 import { looksLikeDeadSession, buildRebuildBlock, lastUserTextOf } from './sessionRebuild.js';
 import { push as pushNotification } from './notifications.js';
@@ -110,7 +110,7 @@ async function recoverFromDeadSession(rawError) {
   }
 }
 
-function wsUrl(sid) {
+function wsUrl(sid, authq) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   let url = `${proto}://${location.host}/api/sessions/${sid || 'new'}/ws?agent_type=general`;
   // C 批「会话级 workspace」:localStorage 存有工作区绝对路径 → 连接级携带
@@ -118,9 +118,9 @@ function wsUrl(sid) {
   // 连接(新建会话/换线/重连)生效;缺省不携带=serve workdir 行为零变化。
   const workspace = localStorage.getItem('evo_workspace');
   if (workspace) url += `&workspace=${encodeURIComponent(workspace)}`;
-  // auth 启用时走 ?token= fallback(与 SSE 同口径);token 由用户侧配置注入
-  const token = localStorage.getItem('evo_agent_token');
-  if (token) url += `&token=${encodeURIComponent(token)}`;
+  // G16 换票:auth 启用时以 Bearer 换一次性短票走 ?ticket=(?token=
+  // 恒 401);auth 关闭态 wsAuthQuery 返回 '' 匿名直连,行为与旧版一致
+  if (authq) url += authq;
   return url;
 }
 
@@ -152,7 +152,11 @@ function scheduleReconnect() {
   }, delay);
 }
 
-export function connect(sid) {
+// G16 换票:建连代际守卫——换票 await 窗口内 connect 可重入(新建/换线/
+// 断线重连),仅最新一次落座,过期建连直接弃,防跨会话串台
+let connectSeq = 0;
+
+export async function connect(sid) {
   disconnect();
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
@@ -161,7 +165,10 @@ export function connect(sid) {
   currentSid = sid || 'new';
   connBanner.set(null); // 主动换线/新建即清残留断连横幅(重连成功亦由 onopen 兜底清)
   connStatus.set('connecting');
-  ws = new WebSocket(wsUrl(currentSid));
+  const seq = ++connectSeq;
+  const authq = await wsAuthQuery();
+  if (seq !== connectSeq) return; // await 窗口内被新 connect 抢代
+  ws = new WebSocket(wsUrl(currentSid, authq));
 
   ws.onopen = () => {
     connStatus.set('online');
