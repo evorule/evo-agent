@@ -3,13 +3,14 @@
 <!-- 设置页(schema 驱动表单 + 命令面板式交互):
      搜索(支持 @modified 过滤令牌) / 分类分组 / 四类控件(改即存) /
      「已修改」指示(点击=重置回默认) / 快照保留期收编行(原工作台配置端点) /
-     LLM 配置只读区(脱敏快照,编辑引导至启动配置文件)。
+     LLM 状态区(serve 侧脱敏快照 + 执行体就绪态;密钥按安全设计零接触,
+     配置指引:桌面版托盘「LLM 凭据…」向导 / CLI 走执行体侧凭据)。
      serve 不可达 → 缓存回放 + 只读黄条。 -->
 <script>
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { settingsState, setSetting, loadSettings } from '../lib/settings.js';
-  import { getWorkbenchConfig, putWorkbenchConfig, getLlmStatus } from '../lib/api.js';
+  import { getWorkbenchConfig, putWorkbenchConfig, getLlmStatus, getLlmModels } from '../lib/api.js';
   import { openSettingsJson } from '../lib/stores.js';
   import McpSection from './McpSection.svelte';
   import ApprovalSection from './ApprovalSection.svelte';
@@ -27,8 +28,9 @@
   let retention = null;
   let retentionMsg = '';
 
-  // LLM 配置只读快照(fail-soft:null = 不渲染该区)
+  // LLM 状态(fail-soft:null = 不渲染该区;执行体就绪态单独拉,失败=未知)
   let llmStatus = null;
+  let llmModels = null;
 
   $: degraded = $settingsState.degraded;
   $: loaded = $settingsState.loaded;
@@ -117,6 +119,9 @@
     getLlmStatus()
       .then((s) => (llmStatus = s))
       .catch(() => (llmStatus = null));
+    getLlmModels()
+      .then((s) => (llmModels = s))
+      .catch(() => (llmModels = null));
   });
 
   async function changeRetention(e) {
@@ -298,22 +303,26 @@
       <section class="cat llm">
         <h3 class="cat-title">AI 服务状态(只读)</h3>
         <div class="llm-grid">
-          <span class="llm-k">状态</span>
+          <span class="llm-k">服务</span>
           <span class="llm-v">{llmStatus.configured ? '已配置' : '未配置(功能降级运行)'}</span>
-          <span class="llm-k">提供方</span>
-          <span class="llm-v">{llmStatus.provider || '—'}</span>
-          <span class="llm-k">模型</span>
-          <span class="llm-v mono">{llmStatus.model || '—'}</span>
+          <span class="llm-k">执行体</span>
+          <span class="llm-v">
+            {#if llmModels?.ready}
+              在位 · {(llmModels.models || []).length} 个模型可选
+            {:else if llmModels}
+              未就绪{llmModels.note ? `( ${llmModels.note} )` : ''}
+            {:else}
+              未知(清单端点不可达)
+            {/if}
+          </span>
+          <span class="llm-k">当前模型</span>
+          <span class="llm-v mono">{llmModels?.current || llmStatus.model || '—'}</span>
           <span class="llm-k">端点</span>
           <span class="llm-v mono">{llmStatus.api_base || '—'}</span>
-          <span class="llm-k">密钥</span>
-          <span class="llm-v">
-            {llmStatus.api_key?.present
-              ? `已配置(尾号 ${llmStatus.api_key.hint || '****'},来源 ${llmStatus.api_key.source || 'config'})`
-              : '未配置'}
-          </span>
         </div>
-        <div class="llm-note">密钥不出现在本页;如需更换模型或密钥,请编辑启动配置文件后重启服务。</div>
+        <div class="llm-note">
+          密钥按安全设计不经过工作台,本页无密钥操作。桌面版:系统托盘 → 「LLM 凭据…」打开配置向导(首启自动弹出;密钥加密落盘,支持连通性测试与多模型服务)。CLI/自托管:凭据配置在执行体侧(ai-plugin),不在 evo-agent.toml。
+        </div>
       </section>
     {/if}
 

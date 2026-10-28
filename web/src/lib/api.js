@@ -419,6 +419,20 @@ export function setLlmModel(model) {
   }).then(unwrap);
 }
 
+/** S5 话术:模型清单失败 → 用户可执行的配置指引。
+ *
+ * serve 侧失败形态两类:中继 503(`executor unreachable`/`中继失败`/`拒绝切换`)
+ * 与执行体未就绪(`未就绪`)——共同根因是执行体不在位,桌面版唯一配置入口
+ * 是托盘「LLM 凭据…」向导(key 归边,凭据不过工作台);其余错误原样透传,
+ * 不吞执行体/serve 的自有诊断。 */
+export function llmModelsNoteFromError(message) {
+  const s = String(message || '');
+  if (/executor unreachable|中继失败|执行体未就绪|拒绝切换/.test(s)) {
+    return '未检测到模型服务(执行体未运行)。桌面版:系统托盘 → 「LLM 凭据…」配置模型服务并「立即生效」;CLI/自托管:检查执行体端点 [llm].executor_url 是否在位。';
+  }
+  return s;
+}
+
 /** 审批决定(G8 既有通道;approved=true 批准 / false 拒绝) */
 export function approveProposal(agentType, sessionId, approved, proposalId) {
   return fetch(`/agents/${encodeURIComponent(agentType)}/approve`, {

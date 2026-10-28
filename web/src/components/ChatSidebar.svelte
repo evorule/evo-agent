@@ -26,7 +26,7 @@
   import { SvelteSet } from 'svelte/reactivity';
   import { renderChatHtml, copyChatCode } from '../lib/chat-markdown.js';
   import { lineDiff, toolDiffPayload } from '../lib/chat-diff.js';
-  import { approveProposal, answerQuestion, listResumableRuns, getOrchestrationLinks, uploadFile, getLlmModels, setLlmModel, listSkills } from '../lib/api.js';
+  import { approveProposal, answerQuestion, listResumableRuns, getOrchestrationLinks, uploadFile, getLlmModels, setLlmModel, llmModelsNoteFromError, listSkills } from '../lib/api.js';
   import { settingsState, setSetting } from '../lib/settings.js';
   import {
     APPROVAL_MODE_KEY,
@@ -263,7 +263,7 @@
       if (modelErr) modelErr = '';
     } catch (e) {
       modelReady = false;
-      modelNote = String(e?.message || e);
+      modelNote = llmModelsNoteFromError(e?.message || e);
     }
   }
 
