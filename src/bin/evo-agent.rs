@@ -88,6 +88,12 @@ struct Cli {
     #[arg(long, global = true, short = 'v')]
     verbose: bool,
 
+    /// 跳过启动预检依赖探活(逃生口;跳过后依赖失败将在运行中以网络错误
+    /// 形态暴露)。作用于 run/serve/repl/schedule/patrol 五入口;`doctor`
+    /// 子命令不受影响(其本体即全量体检)
+    #[arg(long, global = true)]
+    no_preflight: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -148,6 +154,17 @@ enum Command {
 
     /// 显示合并后的配置(default + user + project + env)
     Config,
+
+    /// 启动依赖全量体检(doctor):七项检查(config / evorule-server 探活 /
+    /// LLM 执行体探活 / LLM 凭据 / default agent 装载 / workdir 可写 /
+    /// 流式端点形态)。任一 FAIL 项 → 退出码 1;人读渲染恒走 stderr,
+    /// `--json` 时机器可读报告走 stdout。不受 `--no-preflight` 影响
+    /// (doctor 本体即体检)
+    Doctor {
+        /// 输出机器可读 JSON 报告到 stdout(人读渲染仍走 stderr)
+        #[arg(long)]
+        json: bool,
+    },
 
     /// G5:启动 HTTP server(对外提供 agent API + SSE 流式 + 取消端点)
     Serve {
@@ -432,6 +449,7 @@ fn main() -> ExitCode {
                     stream,
                     json || json_pretty,
                     json_pretty,
+                    cli.no_preflight,
                 )
             })
         }
@@ -439,6 +457,9 @@ fn main() -> ExitCode {
         Command::Tools { action } => cmd_tools(&cli.workdir, action),
         Command::Validate { agent } => cmd_validate(&cli.workdir, &agent),
         Command::Config => cmd_config(&cli.workdir),
+        Command::Doctor { json } => {
+            run_with_big_stack(move || cmd_doctor(&cli.workdir, json))
+        }
         Command::Serve {
             host,
             port,
@@ -460,9 +481,10 @@ fn main() -> ExitCode {
                 no_rate_limit,
                 read_root.as_deref(),
                 agent_root.as_deref(),
+                cli.no_preflight,
             )
         }),
-        Command::Schedule => run_with_big_stack(move || cmd_schedule(&cli.workdir)),
+        Command::Schedule => run_with_big_stack(move || cmd_schedule(&cli.workdir, cli.no_preflight)),
 
         Command::Patrol {
             session,
@@ -476,6 +498,7 @@ fn main() -> ExitCode {
                 &workspace,
                 agent.as_deref(),
                 out.as_deref(),
+                cli.no_preflight,
             )
         }),
         Command::Workflow {
@@ -518,6 +541,7 @@ fn main() -> ExitCode {
                 agent.as_deref(),
                 auto_approve_candidates,
                 session.as_deref(),
+                cli.no_preflight,
             )
         }),
         Command::Replay {
@@ -639,9 +663,102 @@ fn cmd_agents_init(workdir: &Path) -> ExitCode {
 }
 
 // =============================================================================
+// 启动预检(fail-visible:依赖缺失给修复指引非零退出)
+// =============================================================================
+
+/// 启动期 Quick 预检闸(五入口统一):并行探活依赖1(evorule-server)/依赖2
+/// (LLM 执行体),任一 FAIL 即人读报告 + 修复指引 + 非零退出。
+///
+/// - 配置装载由各入口自理(run/repl/patrol 严格档,schedule/serve 宽松档),
+///   本闸只消费装载结果,不改变各入口装载语义;
+/// - `--no-preflight` 显式跳过探活并留痕 warning(逃生口;跳过本身必须可见);
+/// - Fail 退出码 1(INV-6:预检失败给修复指引非零退出,不回落继续)。
+fn startup_preflight(
+    config: &evo_agent::config::Config,
+    workdir: &Path,
+    no_preflight: bool,
+) -> Result<(), ExitCode> {
+    use evo_agent::preflight::{self, PreflightScope};
+
+    if no_preflight {
+        eprintln!("[preflight] {}", evo_agent::preflight::SKIP_NOTE);
+        return Ok(());
+    }
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to build tokio runtime (preflight): {}", e);
+            return Err(ExitCode::from(1));
+        }
+    };
+    let report =
+        runtime.block_on(preflight::run_preflight(config, workdir, PreflightScope::Quick));
+    if report.has_fail() {
+        eprint!("{}", report.render_human());
+        eprintln!(
+            "preflight failed; fix the FAIL items above or rerun with --no-preflight \
+             to bypass (failures will surface mid-run)"
+        );
+        return Err(ExitCode::from(1));
+    }
+    if report.has_warn() {
+        eprint!("{}", report.render_human());
+    }
+    Ok(())
+}
+
+/// doctor 子命令:Full 七项全量体检,只报告不代修;任一 FAIL → 退出码 1。
+/// 人读渲染恒走 stderr;`--json` 时机器可读报告走 stdout(对齐 Run 子命令
+/// stdout 纯 JSON 惯例)。不受 `--no-preflight` 影响(doctor 本体即体检)。
+fn cmd_doctor(workdir: &Path, json: bool) -> ExitCode {
+    use evo_agent::preflight::{self, PreflightScope};
+
+    let config = match evo_agent::config::Config::load(workdir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {}", e);
+            eprintln!("{}", evo_agent::preflight::HINT_CONFIG_LOAD);
+            return ExitCode::from(1);
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to build tokio runtime (doctor): {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    let report =
+        runtime.block_on(preflight::run_preflight(&config, workdir, PreflightScope::Full));
+    eprint!("{}", report.render_human());
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("failed to serialize doctor report: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    if report.has_fail() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+// =============================================================================
 // run —— 跑 agent
 // =============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     workdir: &Path,
     goal: &str,
@@ -650,6 +767,7 @@ fn cmd_run(
     stream: bool,
     json: bool,
     json_pretty: bool,
+    no_preflight: bool,
 ) -> ExitCode {
     // 1. 加载配置
     let config = match evo_agent::config::Config::load(workdir) {
@@ -659,6 +777,12 @@ fn cmd_run(
             return ExitCode::from(1);
         }
     };
+
+    // 1.5 启动预检(依赖缺失 fail-visible,给指引非零退出;
+    //      对照旧况:执行体不可达要吃 3 次指数退避才在深处报网络错)
+    if let Err(code) = startup_preflight(&config, workdir, no_preflight) {
+        return code;
+    }
 
     // 2. 决定 agent 类型
     let agent_name = agent.unwrap_or(&config.agents.default);
@@ -1129,7 +1253,7 @@ fn extract_keyed_value(text: &str, key: &str) -> Option<String> {
 /// 宽工具面下真实 LLM 会绕路探索(file_read/ws_list 等),实测导致步数超限或
 /// 上下文被无关内容污染;窄面让 LLM 只见任务必需工具,行为收敛。
 /// 定时调度入口：装载 [schedule] 配置(校验 fail-fast)后进入常驻循环。
-fn cmd_schedule(workdir: &Path) -> ExitCode {
+fn cmd_schedule(workdir: &Path, no_preflight: bool) -> ExitCode {
     let config = match evo_agent::config::Config::load_lenient(workdir) {
         Ok(c) => c,
         Err(e) => {
@@ -1144,6 +1268,10 @@ fn cmd_schedule(workdir: &Path) -> ExitCode {
     if config.schedule.jobs.is_empty() {
         eprintln!("[schedule] 无任务（[schedule.jobs] 为空）——如需常驻请先配置任务");
         return ExitCode::FAILURE;
+    }
+    // 启动预检:守护进程拉起前先验依赖1/依赖2 可达,失败给指引
+    if let Err(code) = startup_preflight(&config, workdir, no_preflight) {
+        return code;
     }
     let exe = std::env::current_exe().unwrap_or_else(|e| {
         eprintln!("[schedule] 无法定位自身可执行文件: {e}");
@@ -1295,6 +1423,7 @@ fn cmd_patrol(
     workspace: &str,
     agent: Option<&str>,
     out: Option<&Path>,
+    no_preflight: bool,
 ) -> ExitCode {
     // 巡视报告(全程填充;任何分支都以一行 JSON 收尾供调度器消费)
     let mut report = serde_json::json!({
@@ -1330,6 +1459,14 @@ fn cmd_patrol(
             return ExitCode::from(1);
         }
     };
+
+    // 1.5 启动预检(fail-visible;失败仍输出一行 JSON 报告
+    //      供调度器消费,人读渲染与指引走 stderr)
+    if let Err(code) = startup_preflight(&config, workdir, no_preflight) {
+        report["error"] = serde_json::json!("preflight failed (see stderr for details)");
+        write_report(&report, out);
+        return code;
+    }
 
     // 2. 加载 agent 档案(默认 rule-copilot:rule_promote 在协作体档案白名单)
     let agent_name = agent.unwrap_or("rule-copilot");
@@ -2177,6 +2314,7 @@ fn cmd_serve(
     no_rate_limit: bool,
     read_root: Option<&Path>,
     agent_root: Option<&Path>,
+    no_preflight: bool,
 ) -> ExitCode {
     use evo_agent::api::agent_api;
     use evo_agent::api::auth::{AuthConfig, AuthPosture};
@@ -2192,6 +2330,12 @@ fn cmd_serve(
             return ExitCode::from(1);
         }
     };
+
+    // 1.5 启动预检(依赖1/依赖2 可达性启动期显性化,失败给指引
+    //      非零退出;Quick 双探并行,依赖在位时仅毫秒级,不构成启动负担)
+    if let Err(code) = startup_preflight(&config, workdir, no_preflight) {
+        return code;
+    }
 
     // 2. 初始化 logging(尊重 config.logging)
     init_logging_for_serve(&config);
@@ -2211,8 +2355,9 @@ fn cmd_serve(
     }
 
     // 2.5 SG-1 件1(key 归边):agent 不再持有 provider 凭据,LLM 出站
-    //     统一经 ai-plugin 扩展型执行体中继。执行体未就绪在首次调用时
-    //     显式报错(连接拒绝),启动期不做网络探测(避免拖慢 serve 启动)。
+    //     统一经 ai-plugin 扩展型执行体中继。执行体可达性已由启动预检
+    //     (1.5 步)显性化——失败给修复指引非零退出,逃生口
+    //     `--no-preflight`;本步仅打印生效端点。
     let executor_url = std::env::var("EVORULE_LLM_EXECUTOR_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:9130/llm/execute".to_string());
     eprintln!("[llm] LLM executor (SG-1 relay): {}", executor_url);
@@ -3293,6 +3438,7 @@ fn cmd_repl(
     agent: Option<&str>,
     auto_approve_candidates: bool,
     session: Option<&str>,
+    no_preflight: bool,
 ) -> ExitCode {
     use rustyline::error::ReadlineError;
     use rustyline::{DefaultEditor, Result as RlResult};
@@ -3305,6 +3451,11 @@ fn cmd_repl(
             return ExitCode::from(1);
         }
     };
+
+    // 1.5 启动预检(依赖缺失 fail-visible,进对话前先给修复指引)
+    if let Err(code) = startup_preflight(&config, workdir, no_preflight) {
+        return code;
+    }
 
     let agent_name = agent.unwrap_or(&config.agents.default);
     let agents_dir = &config.agents.dir;

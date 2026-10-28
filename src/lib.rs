@@ -46,6 +46,7 @@ pub mod io_handlers;
 pub mod lsp;
 #[doc(hidden)]
 pub mod mcp;
+pub mod preflight;
 pub mod pty;
 #[doc(hidden)]
 pub mod rule_tools;
