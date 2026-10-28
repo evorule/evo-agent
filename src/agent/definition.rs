@@ -176,7 +176,7 @@ pub struct MemoryConfig {
     /// 是否启用知识候选提取（默认 true）
     ///
     /// 会话收尾时 sediment 增一次 sidecar 审计 LLM 调用提取知识候选
-    /// （五类），落 shared.{ns}.knowledge_candidates.*；无审计通路时
+    /// （七类=rule 仓内置谱系），落 shared.{ns}.knowledge_candidates.*；无审计通路时
     /// 自动跳过（纪律①）。
     #[serde(default = "default_true")]
     pub enable_knowledge_extraction: bool,
