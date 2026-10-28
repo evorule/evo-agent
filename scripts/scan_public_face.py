@@ -46,6 +46,9 @@ WORDLIST_CARRIER_FILES = {
 SKIP_FILE_NAMES = {
     'Cargo.lock', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock',
     'poetry.lock', 'go.sum', 'gradlew', 'gradlew.bat',
+    # 本扫描器词表快照（--dump-words 生成的禁词清单自身）：模式源经
+    # re.compile 拼接后含被禁词面，属工具面自描述内容，按名豁免自扫描。
+    'public-face-words.txt',
 }
 
 # 仓库注册表文件：按既有词表规则，注册表「可见性」列允许提及各仓仓名
@@ -280,27 +283,82 @@ def scan_repo(root: Path, allowlist: dict = None):
             skipped.append((rel, 'undecodable'))
             continue
         for lineno, line in enumerate(text.splitlines(), start=1):
-            for cat_name, blocking, patterns, hints in CATEGORIES:
-                # 注册表文件按既有裁定豁免 C 类（可见性列可提仓名）
-                if blocking and rel in REGISTRY_FILES and cat_name.startswith('C-'):
-                    continue
-                if hints is not None and hints.search(line):
-                    continue
-                for pat in patterns:
-                    m = pat.search(line)
-                    if m:
-                        match_text = m.group(0)[:60]
-                        if finding_exempted(rel, m.group(0), allowlist):
-                            continue
-                        findings.append({
-                            'file': rel,
-                            'line': lineno,
-                            'category': cat_name,
-                            'blocking': blocking,
-                            'match': match_text,
-                            'text': line.strip()[:160],
-                        })
+            classify_line(rel, lineno, line, allowlist, findings)
     return findings, skipped, None
+
+
+def classify_line(rel: str, lineno: int, line: str, allowlist, findings) -> None:
+    """对单行跑全部类别匹配，命中追加进 findings（scan_repo 与 --staged 共用）。"""
+    for cat_name, blocking, patterns, hints in CATEGORIES:
+        # 注册表文件按既有裁定豁免 C 类（可见性列可提仓名）
+        if blocking and rel in REGISTRY_FILES and cat_name.startswith('C-'):
+            continue
+        if hints is not None and hints.search(line):
+            continue
+        for pat in patterns:
+            m = pat.search(line)
+            if m:
+                match_text = m.group(0)[:60]
+                if finding_exempted(rel, m.group(0), allowlist):
+                    continue
+                findings.append({
+                    'file': rel,
+                    'line': lineno,
+                    'category': cat_name,
+                    'blocking': blocking,
+                    'match': match_text,
+                    'text': line.strip()[:160],
+                })
+
+
+def staged_added_lines(root: Path):
+    """解析 git 暂存 diff 的新增行，返回 ([(文件, 新行号, 行文本)], 错误)。"""
+    try:
+        proc = subprocess.run(
+            ['git', '-C', str(root), 'diff', '--cached', '-U0', '--no-color'],
+            capture_output=True, timeout=30)
+    except OSError as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        return None, proc.stderr.decode('utf-8', errors='replace').strip()
+    text = proc.stdout.decode('utf-8', errors='replace')
+    lines_out = []
+    rel = None
+    new_line = 0
+    for raw in text.splitlines():
+        if raw.startswith('+++ b/'):
+            rel = raw[6:]
+            continue
+        if raw.startswith('--- '):
+            continue
+        if raw.startswith('@@'):
+            m = re.match(r'@@ -\d+(?:,\d+)? \+(\d+)', raw)
+            if m:
+                new_line = int(m.group(1))
+            continue
+        if rel is None:
+            continue
+        if raw.startswith('+'):
+            lines_out.append((rel, new_line, raw[1:]))
+            new_line += 1
+        elif raw.startswith('-'):
+            pass
+    return lines_out, None
+
+
+def dump_words() -> None:
+    """导出全部类别模式（正则源形态）供词表快照与写码红线参考。"""
+    print('公开面扫描词表快照（由 scan_public_face.py --dump-words 生成）')
+    print('说明: 模式为正则源形态; 源定义处拆写的字面量经 re.compile 拼接后')
+    print('      即为被禁词面 —— 本文件仅限仓内工具面使用, 禁止复制到对外材料。')
+    print('行级豁免与文件级白名单机制未在本清单展开, 见扫描器源码注释。')
+    print()
+    for cat_name, blocking, patterns, _hints in CATEGORIES:
+        mark = '阻断' if blocking else '复核'
+        print(f'== {cat_name} [{mark}] ({len(patterns)} 模式) ==')
+        for pat in patterns:
+            print(f'  {pat.pattern}')
+        print()
 
 
 def main() -> int:
@@ -308,6 +366,12 @@ def main() -> int:
     parser.add_argument('--root', default=None,
                         help='待扫描仓库根目录（默认 = 本脚本所在仓）')
     parser.add_argument('--json', action='store_true', help='JSON 输出')
+    parser.add_argument('--staged', action='store_true',
+                        help='只扫 git 暂存区新增行（pre-commit 快速门；'
+                             '存量行不背锅，新增行命中阻断类即红）')
+    parser.add_argument('--dump-words', action='store_true',
+                        help='导出全部类别模式清单（正则源形态，运行时等价拆写）'
+                             '到 stdout；配合重定向刷新词表快照文件')
     parser.add_argument('--allowlist', default=None,
                         help='白名单文件路径（默认探测 scripts/scan_public_face_allowlist.txt）')
     parser.add_argument('--fail-on', action='append', default=None, metavar='PREFIX',
@@ -315,6 +379,10 @@ def main() -> int:
                              '缺省=全部阻断类计入。用于分类别收紧门禁，如 C 类存量未裁定前'
                              ' CI 传 --fail-on A1 --fail-on B）')
     args = parser.parse_args()
+
+    if args.dump_words:
+        dump_words()
+        return 0
 
     root = Path(args.root).resolve() if args.root else \
         Path(__file__).resolve().parent.parent
@@ -324,10 +392,23 @@ def main() -> int:
 
     allowlist, allowlist_path = load_allowlist(root, args.allowlist)
 
-    findings, skipped, err = scan_repo(root, allowlist)
+    findings, skipped, err = scan_repo(root, allowlist) if not args.staged \
+        else ([], [], None)
     if err is not None:
         print(f'ERROR: git ls-files 失败: {err}', file=sys.stderr)
         return 2
+
+    if args.staged:
+        staged_lines, staged_err = staged_added_lines(root)
+        if staged_err is not None:
+            print(f'ERROR: git diff --cached 失败: {staged_err}', file=sys.stderr)
+            return 2
+        findings = []
+        for rel, lineno, line in staged_lines:
+            # 与 scan_repo 同款豁免面：词表载体/锁文件/词表快照不扫
+            if rel in WORDLIST_CARRIER_FILES or Path(rel).name in SKIP_FILE_NAMES:
+                continue
+            classify_line(rel, lineno, line, allowlist, findings)
 
     if args.json:
         print(json.dumps({

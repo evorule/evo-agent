@@ -1,0 +1,74 @@
+公开面扫描词表快照（由 scan_public_face.py --dump-words 生成）
+说明: 模式为正则源形态; 源定义处拆写的字面量经 re.compile 拼接后
+      即为被禁词面 —— 本文件仅限仓内工具面使用, 禁止复制到对外材料。
+行级豁免与文件级白名单机制未在本清单展开, 见扫描器源码注释。
+
+== A1-AI身份署名 [阻断] (13 模式) ==
+  \bmavis\b
+  \bclaude\b
+  \banthropic\b
+  \bcopilot\b
+  \bchatgpt\b
+  \bworkbuddy\b
+  \bcodebuddy\b
+  \bqoder\b
+  \bcodearts\b
+  co-authored-by
+  (?:由|经)\s*AI\s*(?:生成|编写|创作|辅助)
+  AI\s*辅助\s*(?:编写|创作|开发|完成|起草|撰写)
+  AI\s*生成\s*(?:的|了)
+
+== A2-集成厂商名 [复核] (7 模式) ==
+  \bopenai\b
+  \bdeepseek\b
+  \bqwen\b
+  \bglm\b
+  \bgemini\b
+  \bkimi\b
+  \bminimax\b
+
+== B-内部编号 [阻断] (13 模式) ==
+  TCB-\d{4}-\d+
+  CR-\d{8}-\d{3}
+  UV-\d{2,3}
+  INC-\d{2,3}
+  REM-\d+
+  \bO-\d{2,3}\b
+  批次\s*W\d+
+  (?<![令发〕])\d{2,3}\s*号
+  决策点\s*[①-⑨]
+  裁定\s*[①-⑨]
+  设计稿\s*\d+\s*号
+  PLANNING_FINALIZE
+  T[78]\s*(?:缓办|调查报告)
+
+== C-私有路径仓名 [阻断] (12 模式) ==
+  D:\\knowledge
+  D:\\审计
+  D:\\仓库管理
+  D:\\evorule
+  D:\\evo-agent
+  _PRIVATE_zh_docs
+  0[1-9]\d_[\u4e00-\u9fa5A-Za-z]
+  evorule-agent
+  evorule-application
+  evorule-core-backup
+  evorule-backup
+  文档[\\/](design|implement|benchmarks|archive)
+
+== D-治理语境 [复核] (14 模式) ==
+  战地脚本|误下沉|止血|堵死|豁免清零|维持挂账
+  清偿|整改|反馈集中|专项同步|专项登记|批准删除
+  整治(?![\u4e00-\u9fffA-Za-z0-9_])
+  台账
+  (?<![成设建])立项
+  核销
+  窗口期
+  监督方
+  遗留项
+  拍板
+  留痕
+  项目方\s*(?:自行|批准|节奏|纠错|明示|确认|拍板)
+  内部协作区|决策过程记录|发布材料经审批
+  阶段\s*0[.\d]
+
