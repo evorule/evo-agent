@@ -40,8 +40,7 @@ use crate::config::Config;
 // ---------------------------------------------------------------------------
 
 /// 配置装载失败指引(config error 时随错误行输出)
-pub const HINT_CONFIG_LOAD: &str =
-    "fix the config error above (evo-agent.toml in the workdir); \
+pub const HINT_CONFIG_LOAD: &str = "fix the config error above (evo-agent.toml in the workdir); \
      `evo-agent config` shows the merged result after fixing";
 
 /// 依赖1(evorule-server)不可达指引
@@ -239,14 +238,15 @@ fn check_config(cfg: &Config) -> PreflightCheck {
 /// ② 依赖1 evorule-server health 探活(`GET /api/health`,3s 超时)
 async fn probe_evorule_health(cfg: &Config) -> PreflightCheck {
     const NAME: &str = "evorule-server";
-    let url = format!(
-        "{}/api/health",
-        cfg.evorule.base_url.trim_end_matches('/')
-    );
+    let url = format!("{}/api/health", cfg.evorule.base_url.trim_end_matches('/'));
     let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
         Ok(c) => c,
         Err(e) => {
-            return fail(NAME, format!("probe client build error: {e}"), HINT_EVORULE_SERVER)
+            return fail(
+                NAME,
+                format!("probe client build error: {e}"),
+                HINT_EVORULE_SERVER,
+            )
         }
     };
     match client.get(&url).send().await {
@@ -275,7 +275,13 @@ async fn probe_executor(cfg: &Config) -> PreflightCheck {
     let url = &cfg.llm.executor_url;
     let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
         Ok(c) => c,
-        Err(e) => return fail(NAME, format!("probe client build error: {e}"), HINT_LLM_EXECUTOR),
+        Err(e) => {
+            return fail(
+                NAME,
+                format!("probe client build error: {e}"),
+                HINT_LLM_EXECUTOR,
+            )
+        }
     };
     match client.get(url).send().await {
         Ok(resp) => pass(
@@ -473,7 +479,11 @@ mod tests {
         let report = PreflightReport {
             checks: vec![
                 pass("config", "ok".to_string()),
-                fail("evorule-server", "unreachable".to_string(), HINT_EVORULE_SERVER),
+                fail(
+                    "evorule-server",
+                    "unreachable".to_string(),
+                    HINT_EVORULE_SERVER,
+                ),
             ],
         };
         let s = report.render_human();
@@ -491,7 +501,15 @@ mod tests {
         let report = run_preflight(&cfg, Path::new("."), PreflightScope::Quick).await;
         let elapsed = started.elapsed();
         let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["config", "evorule-server", "llm-executor", "llm-credentials"]);
+        assert_eq!(
+            names,
+            vec![
+                "config",
+                "evorule-server",
+                "llm-executor",
+                "llm-credentials"
+            ]
+        );
         assert!(report.has_fail());
         let d1 = &report.checks[1];
         assert_eq!(d1.verdict, PreflightVerdict::Fail);

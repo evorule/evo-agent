@@ -457,9 +457,7 @@ fn main() -> ExitCode {
         Command::Tools { action } => cmd_tools(&cli.workdir, action),
         Command::Validate { agent } => cmd_validate(&cli.workdir, &agent),
         Command::Config => cmd_config(&cli.workdir),
-        Command::Doctor { json } => {
-            run_with_big_stack(move || cmd_doctor(&cli.workdir, json))
-        }
+        Command::Doctor { json } => run_with_big_stack(move || cmd_doctor(&cli.workdir, json)),
         Command::Serve {
             host,
             port,
@@ -484,7 +482,9 @@ fn main() -> ExitCode {
                 cli.no_preflight,
             )
         }),
-        Command::Schedule => run_with_big_stack(move || cmd_schedule(&cli.workdir, cli.no_preflight)),
+        Command::Schedule => {
+            run_with_big_stack(move || cmd_schedule(&cli.workdir, cli.no_preflight))
+        }
 
         Command::Patrol {
             session,
@@ -695,8 +695,11 @@ fn startup_preflight(
             return Err(ExitCode::from(1));
         }
     };
-    let report =
-        runtime.block_on(preflight::run_preflight(config, workdir, PreflightScope::Quick));
+    let report = runtime.block_on(preflight::run_preflight(
+        config,
+        workdir,
+        PreflightScope::Quick,
+    ));
     if report.has_fail() {
         eprint!("{}", report.render_human());
         eprintln!(
@@ -735,8 +738,11 @@ fn cmd_doctor(workdir: &Path, json: bool) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let report =
-        runtime.block_on(preflight::run_preflight(&config, workdir, PreflightScope::Full));
+    let report = runtime.block_on(preflight::run_preflight(
+        &config,
+        workdir,
+        PreflightScope::Full,
+    ));
     eprint!("{}", report.render_human());
     if json {
         match serde_json::to_string_pretty(&report) {
@@ -1853,7 +1859,10 @@ fn cmd_run_blocking(
     match final_result {
         Some(result) => {
             if let Some(t) = &result.tokens {
-                eprintln!("[tokens] prompt={} completion={} total={}", t.prompt, t.completion, t.total);
+                eprintln!(
+                    "[tokens] prompt={} completion={} total={}",
+                    t.prompt, t.completion, t.total
+                );
             }
             let json = match serde_json::to_string_pretty(&result) {
                 Ok(s) => s,
@@ -2010,7 +2019,10 @@ fn cmd_run_streaming(
     match final_result {
         Some(result) => {
             if let Some(t) = &result.tokens {
-                eprintln!("[tokens] prompt={} completion={} total={}", t.prompt, t.completion, t.total);
+                eprintln!(
+                    "[tokens] prompt={} completion={} total={}",
+                    t.prompt, t.completion, t.total
+                );
             }
             // 最终结果以 JSON 输出到 stdout
             let json = match serde_json::to_string_pretty(&result) {
@@ -2064,7 +2076,10 @@ fn cmd_run_json(
                     final_success = Some(result.success);
                     if let Some(t) = &result.tokens {
                         // 人读补充行走 stderr；stdout 只承载事件帧（Done 帧内已含 tokens 字段）
-                        eprintln!("[tokens] prompt={} completion={} total={}", t.prompt, t.completion, t.total);
+                        eprintln!(
+                            "[tokens] prompt={} completion={} total={}",
+                            t.prompt, t.completion, t.total
+                        );
                     }
                 }
                 Err(_) => final_success = Some(false),
@@ -3940,7 +3955,10 @@ fn run_repl_turn(
                 }
                 Ok(AgentEvent::Done(result)) => {
                     if let Some(t) = &result.tokens {
-                        eprintln!("[tokens] prompt={} completion={} total={}", t.prompt, t.completion, t.total);
+                        eprintln!(
+                            "[tokens] prompt={} completion={} total={}",
+                            t.prompt, t.completion, t.total
+                        );
                     }
                     break;
                 }

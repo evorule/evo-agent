@@ -2454,8 +2454,7 @@ mod sse_frame_tests {
         let mut saw_reasoning = false;
         let mut saw_done = false;
         let raw = "data: {\"type\":\"content\",\ndata: \"text\":\"ab\"}\n\n";
-        let (chunks, end) =
-            executor_sse_frame_outcome(raw, &mut saw_reasoning, &mut saw_done);
+        let (chunks, end) = executor_sse_frame_outcome(raw, &mut saw_reasoning, &mut saw_done);
         assert!(matches!(end, FrameEnd::Continue));
         match &chunks[0] {
             StreamChunk::Delta(t) => assert_eq!(t, "ab", "多 data: 行 join 后解析"),
@@ -2468,9 +2467,11 @@ mod sse_frame_tests {
         let mut saw_reasoning = false;
         let mut saw_done = false;
         for raw in ["\n\n", "event: message\n\n", ": keep-alive comment\n\n"] {
-            let (chunks, end) =
-                executor_sse_frame_outcome(raw, &mut saw_reasoning, &mut saw_done);
-            assert!(matches!(end, FrameEnd::Continue), "无 data 行应继续: {raw:?}");
+            let (chunks, end) = executor_sse_frame_outcome(raw, &mut saw_reasoning, &mut saw_done);
+            assert!(
+                matches!(end, FrameEnd::Continue),
+                "无 data 行应继续: {raw:?}"
+            );
             assert!(chunks.is_empty(), "无 data 行零 chunks: {raw:?}");
         }
     }
@@ -2549,7 +2550,9 @@ mod sse_frame_tests {
         let mut saw_reasoning = false; // 全程零 reasoning 帧
         let mut saw_done = false;
         let (chunks, end) = executor_sse_frame_outcome(
-            &frame(r#"{"type":"done","reasoning":"only-at-end","content":"ans","finish_reason":"stop"}"#),
+            &frame(
+                r#"{"type":"done","reasoning":"only-at-end","content":"ans","finish_reason":"stop"}"#,
+            ),
             &mut saw_reasoning,
             &mut saw_done,
         );

@@ -86,11 +86,7 @@ impl UsageAwareTokenCounter {
         if g.window.is_empty() {
             return None;
         }
-        let sum: f64 = g
-            .window
-            .iter()
-            .map(|(a, t)| *t as f64 / *a as f64)
-            .sum();
+        let sum: f64 = g.window.iter().map(|(a, t)| *t as f64 / *a as f64).sum();
         Some(sum / g.window.len() as f64)
     }
 }
