@@ -3630,9 +3630,8 @@ impl AgentRunner {
 
                     info!(%session_id, content_len = content.len(), "Received Stable event, execution complete");
                     self.submit_tool_traces(&session_id).await;
-                    let mut result = AgentResult::success(
-                        content, step_count, duration, tool_calls,
-                    );
+                    let mut result =
+                        AgentResult::success(content, step_count, duration, tool_calls);
                     // 真值计量收尾：usage_counter 若已接线，快照累计 token 记录随结果外送
                     result.tokens = self.usage_counter.as_ref().map(|c| c.snapshot());
                     return Ok(result);
@@ -4928,8 +4927,7 @@ impl AgentRunner {
                 .map(|t| t.is_empty())
                 .unwrap_or(true)
         {
-            final_content
-                .push_str("\n\n[输出因达到生成长度上限被截断,内容可能不完整]");
+            final_content.push_str("\n\n[输出因达到生成长度上限被截断,内容可能不完整]");
         }
 
         let assistant_idx = messages.len();
@@ -7981,6 +7979,24 @@ impl AgentRunner {
                                                                    error = %e,
                                                                    "R3: format instruction landing failed (best-effort)——G-7 divergence, doctor flags"
                                                                ),
+                                                           }
+                                                       }
+                                                   }
+                                               }
+                                               // H1:窗口余量信号行(与引擎路径同款;此前仅
+                                               // 引擎路径注入,流式主循环缺位=批六清尾补齐)
+                                               if let Some(ctx) = &runner.context_window {
+                                                   let used = ctx.count(&messages_to_send);
+                                                   if let Some(line) = context_signal_line(
+                                                       used,
+                                                       ctx.budget(),
+                                                       ctx.window_tokens(),
+                                                       react_round as usize,
+                                                   ) {
+                                                       for msg in &mut messages_to_send {
+                                                           if let Message::System { content } = msg {
+                                                               content.push_str(&line);
+                                                               break;
                                                            }
                                                        }
                                                    }
