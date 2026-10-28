@@ -173,6 +173,10 @@ pub struct LlmHandler {
     /// [llm] max_tokens 配置兜底(None = 4096 硬兜底,既有行为零变化;
     /// 请求级 params.max_tokens > 本配置 > 4096)
     config_max_tokens: Option<u64>,
+    /// direct 档配置(None = relay 档,出站行为与既有逐字节一致;Some =
+    /// `mode="direct"` 显式启用,execute/execute_stream 分派直连传输)。
+    /// 分派收在 handler 内部——IoDispatcher/runner/audited_llm 零感知。
+    direct: Option<super::llm_direct::DirectLlmConfig>,
 }
 
 impl LlmHandler {
@@ -192,6 +196,7 @@ impl LlmHandler {
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             config_max_tokens: None,
+            direct: None,
         }
     }
 
@@ -240,14 +245,17 @@ impl LlmHandler {
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             config_max_tokens: None,
+            direct: None,
         }
     }
 
     /// G3:从 `LlmConfig` 构造 handler(由 CLI `cmd_run` 调用)
     ///
     /// 把 `config.llm.max_retries` 真正接到 handler 上,复活死代码。
-    /// `executor_url` 映射自 `config.llm.executor_url`;配置中的 `api_key`
-    /// 字段不再消费(key 归边,凭据仅存于执行体侧)。
+    /// `executor_url` 映射自 `config.llm.executor_url`;relay 档(缺省)
+    /// 配置中的 `api_key` 字段不消费(key 归边,凭据仅存于执行体侧)。
+    /// `mode="direct"` 时构造直连配置(api_key/api_base 生效,启动期
+    /// 校验已保证非空——校验入口在 config validate,fail-fast 在前)。
     pub fn from_config(config: &crate::config::LlmConfig) -> Self {
         let mut handler = Self {
             default_model: config.model.clone(),
@@ -260,6 +268,14 @@ impl LlmHandler {
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             config_max_tokens: config.max_tokens,
+            direct: if config.mode == "direct" {
+                Some(super::llm_direct::DirectLlmConfig {
+                    api_key: config.api_key.clone(),
+                    api_base: config.api_base.clone(),
+                })
+            } else {
+                None
+            },
         };
         // [llm] timeout_secs 显式声明即生效（此前被静默忽略）；
         // 0（未显式配置）保持内建缺省——接通前后未配置用户行为不变。
@@ -319,6 +335,18 @@ impl LlmHandler {
         attempts * self.request_timeout_secs + backoff_sum.ceil() as u64 + 10
     }
 
+    /// direct 档重试参数包(两处分派点共用;数值全部取自 handler 既有
+    /// 字段——direct 复用 relay 同款策略,零常量分叉)
+    fn direct_retry_params(&self) -> super::llm_direct::DirectRetryParams {
+        super::llm_direct::DirectRetryParams {
+            max_retries: self.max_retries,
+            base_backoff_secs: self.base_backoff_secs,
+            max_backoff_secs: self.max_backoff_secs,
+            connect_timeout_secs: self.connect_timeout_secs,
+            request_timeout_secs: self.request_timeout_secs,
+        }
+    }
+
     /// 引擎 pending 预算对齐断言（供 runner 启动断言消费；Ok=匹配,Err=人读详情）。
     ///
     /// LLM 最坏耗时超过引擎 pending I/O 预算（io_error_timeout）时,单步内的
@@ -359,6 +387,7 @@ impl LlmHandler {
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             config_max_tokens: None,
+            direct: None,
         }
     }
 
@@ -516,6 +545,22 @@ impl LlmHandler {
         params: &Value,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, String>> + Send>> {
         let body_result = self.build_request_body(params);
+
+        // direct 档分派(在 relay stream 构造前短路——relay 双路径代码
+        // 物理不被触碰):请求构造共用,传输/增量解析走 llm_direct
+        if let Some(direct_cfg) = &self.direct {
+            return match body_result {
+                Ok(body) => super::llm_direct::execute_stream(
+                    body,
+                    direct_cfg.clone(),
+                    self.direct_retry_params(),
+                ),
+                Err(e) => Box::pin(async_stream::stream! {
+                    yield Err::<StreamChunk, String>(e);
+                }),
+            };
+        }
+
         let executor_url = self.executor_url.clone();
         let mock_content = self.mock_content.clone();
         let executor_token = self.executor_token.clone();
@@ -1107,12 +1152,14 @@ fn to_openai_wire_messages(messages: serde_json::Value) -> serde_json::Value {
 }
 
 /// G3:判断 HTTP 状态码是否值得重试
-fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+///
+/// pub(crate):direct 档(llm_direct.rs)复用同款策略,重试判定零分叉
+pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
 }
 
-/// G3:判断网络层错误是否值得重试
-fn is_retryable_error(e: &reqwest::Error) -> bool {
+/// G3:判断网络层错误是否值得重试(direct 档复用,同上)
+pub(crate) fn is_retryable_error(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
 }
 
@@ -1121,7 +1168,9 @@ fn is_retryable_error(e: &reqwest::Error) -> bool {
 /// - `attempt`:已失败的次数(0 = 第 1 次重试前的等待)
 /// - `base`:初始退避(秒)
 /// - `max`:退避上限(秒)
-fn backoff_duration(attempt: usize, base: f64, max: f64) -> Duration {
+///
+/// (direct 档复用,同上)
+pub(crate) fn backoff_duration(attempt: usize, base: f64, max: f64) -> Duration {
     let exp = base * 2f64.powi(attempt as i32);
     let capped = exp.min(max);
     // jitter:±20%
@@ -1152,6 +1201,13 @@ impl IoHandler for LlmHandler {
         let body = self.build_request_body(params)?;
         let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
         debug!(model = model, "ready to invoke LLM API");
+
+        // direct 档分派(mode="direct" 显式启用):请求构造共用(wire 形状
+        // = provider 形状),传输/归一走 llm_direct;relay 路径物理不动
+        // (review 性实现——本 if 不在位时下方 relay 代码逐字节原样)。
+        if let Some(direct_cfg) = &self.direct {
+            return super::llm_direct::execute(&body, direct_cfg, self.direct_retry_params()).await;
+        }
 
         // G3:重试循环。attempt = 0 是首次请求,1..=max_retries 是重试。
         for attempt in 0..=self.max_retries {
@@ -1239,7 +1295,8 @@ impl IoHandler for LlmHandler {
 /// - HTTP 日期:`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`(暂不支持,返回 None)
 ///
 /// 上限 60 秒(避免 server 端配错导致长时间挂起)。
-fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
+/// (direct 档复用,同上)
+pub(crate) fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
     let header = resp.headers().get(reqwest::header::RETRY_AFTER)?;
     let s = header.to_str().ok()?;
     let secs: u64 = s.parse().ok()?;
@@ -2427,7 +2484,6 @@ mod sse_frame_tests {
     /// o14 流式覆盖增强：executor_sse_frame_outcome 纯函数面边界锁。
     /// 覆盖八分支（content/reasoning/tool_call_delta/done/error/未知类型/
     /// [DONE] 哨兵/坏 JSON）+ 多行 join/空帧/安全网补发三边界。
-
     fn frame(data: &str) -> String {
         format!("data: {data}\n\n")
     }

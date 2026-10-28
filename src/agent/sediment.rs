@@ -2678,7 +2678,7 @@ mod tests {
         // 第七谱系 preference：候选直映 builtin:knowledge/preference
         // （rule 仓第七壳批准后治理契约校验放行；本测锚定直映关系）
         let mut server = mockito::Server::new_async().await;
-        let client = crate::api::evorule_client::EvoruleApiClient::new(&server.url());
+        let _client = crate::api::evorule_client::EvoruleApiClient::new(&server.url());
         let llm = LlmHandler::mock(r#"{}"#);
         let auditor = AuditedLlm::new(make_test_client(), llm);
         let mut mgr = MemoryManager::new("ns", make_test_client()).with_session_id("s-pref");
@@ -2716,7 +2716,7 @@ mod tests {
             .with_body(facts.to_string())
             .create_async()
             .await;
-        let m_invoke = server
+        let _m_invoke = server
             .mock("POST", "/api/services/knowledge-propose/invoke")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
                 "entry": {"schema_ref": "builtin:knowledge/preference"},

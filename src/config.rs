@@ -52,9 +52,18 @@ pub struct LlmConfig {
     /// 日志但不拒绝(为未来多 provider 路由预留)。
     #[serde(default = "LlmConfig::default_provider")]
     pub provider: String,
+    /// LLM 出站轨道:`relay`(缺省,经执行体中继,key 归边执行体侧)|
+    /// `direct`(opt-in,agent 进程直连 provider `api_base`,key 经 env
+    /// 链/toml 槽位生效)。其他值装载期拒启(fail-fast,不回落)。
+    #[serde(default = "LlmConfig::default_mode")]
+    pub mode: String,
     /// API key(SG-1 key 归边起不再消费:出站统一走执行体端点,凭据
     /// 仅存于执行体侧;缺省恒空,非空配置加载时告警提示移除。
     /// `${ENV:VAR_NAME}` 占位符解析属通用机制仍生效,但对该字段已无意义)
+    ///
+    /// direct 档(`mode = "direct"`)本字段复活为生效凭据:env 链解析
+    /// (`EVO_AGENT_LLM__API_KEY` > 裸 provider 链)与 toml 槽位均生效;
+    /// 空值启动期拒启并给出配置指引(凭据不落盘原则下推荐 env 注入)。
     #[serde(default = "LlmConfig::default_api_key")]
     pub api_key: String,
     /// 模型名
@@ -95,6 +104,10 @@ impl LlmConfig {
     /// 默认 provider
     pub fn default_provider() -> String {
         "minimax".to_string()
+    }
+    /// 默认出站轨道:relay(key 归边缺省档,未显式启用直连行为零变化)
+    pub fn default_mode() -> String {
+        "relay".to_string()
     }
     /// 默认 api_key(SG-1 key 归边起恒空:凭据仅存于执行体侧,本字段
     /// 不再消费;此前缺省占位符 `${ENV:MINIMAX_API_KEY}` 会令严格模式
@@ -143,7 +156,12 @@ fn default_max_retries() -> usize {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LlmStatusSnapshot {
     /// LLM 是否可用(key 已配置)
+    ///
+    /// 分档语义:relay 档 = agent 侧 key 存在性(既有口径,resolve 链
+    /// 可见性);direct 档 = key 与 api_base 均非空(直连可用判据)。
     pub configured: bool,
+    /// 出站轨道(relay|direct,与 `[llm] mode` 同值回显)
+    pub mode: String,
     /// provider 名称
     pub provider: String,
     /// 模型名
@@ -170,6 +188,7 @@ impl LlmStatusSnapshot {
     pub fn unconfigured() -> Self {
         Self {
             configured: false,
+            mode: LlmConfig::default_mode(),
             provider: String::new(),
             model: String::new(),
             api_base: String::new(),
@@ -215,6 +234,9 @@ impl LlmConfig {
 fn apply_explicit_llm_env(cfg: &mut LlmConfig) -> Option<String> {
     if let Ok(v) = std::env::var("EVO_AGENT_LLM__PROVIDER") {
         cfg.provider = v;
+    }
+    if let Ok(v) = std::env::var("EVO_AGENT_LLM__MODE") {
+        cfg.mode = v;
     }
     if let Ok(v) = std::env::var("EVO_AGENT_LLM__MODEL") {
         cfg.model = v;
@@ -317,6 +339,13 @@ impl LlmConfig {
     /// (见 `Config::llm_api_key_source`),透传不加工。
     pub fn status_snapshot(&self, key_source: Option<&str>) -> LlmStatusSnapshot {
         let present = !self.api_key.is_empty();
+        // configured 分档语义:relay 档维持既有口径(key 存在性);direct 档
+        // = key 与 api_base 均非空(直连可用判据,与启动期校验同判据)
+        let configured = if self.mode == "direct" {
+            present && !self.api_base.trim().is_empty()
+        } else {
+            present
+        };
         let hint = if self.api_key.chars().count() >= 8 {
             let tail: String = self
                 .api_key
@@ -339,7 +368,8 @@ impl LlmConfig {
             .unwrap_or_default()
             .to_string();
         LlmStatusSnapshot {
-            configured: present,
+            configured,
+            mode: self.mode.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
             api_base,
@@ -356,6 +386,7 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             provider: Self::default_provider(),
+            mode: Self::default_mode(),
             api_key: Self::default_api_key(),
             model: Self::default_model(),
             api_base: Self::default_api_base(),
@@ -805,6 +836,7 @@ impl Config {
                 );
             }
             merge_field(table, "provider", &mut self.llm.provider)?;
+            merge_field(table, "mode", &mut self.llm.mode)?;
             merge_field(table, "api_key", &mut self.llm.api_key)?;
             merge_field(table, "model", &mut self.llm.model)?;
             merge_field(table, "api_base", &mut self.llm.api_base)?;
@@ -990,12 +1022,55 @@ impl Config {
             ),
         }
 
-        // LLM API key:SG-1 key 归边起不再消费(出站统一走执行体端点,
-        // 凭据仅存于执行体侧)——不再强制非空;非空配置告警留痕提示清理
-        if !self.llm.api_key.is_empty() {
+        // LLM 出站轨道值域检查(fail-fast,不猜不回落):relay 缺省档 /
+        // direct 显式直连档,其他值拒启
+        match self.llm.mode.as_str() {
+            "relay" | "direct" => {}
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "llm.mode".to_string(),
+                    reason: format!(
+                        "unknown mode '{}', expected one of: relay, direct",
+                        other
+                    ),
+                });
+            }
+        }
+
+        // direct 档启动期校验:凭据与直连端点缺一不可(空 key/空端点拒启
+        // + 修复指引,fail-visible;凭据推荐 env 注入,不落盘)
+        if self.llm.mode == "direct" {
+            if self.llm.api_key.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "llm.api_key".to_string(),
+                    reason: "direct 档直连 provider 需要凭据:llm.api_key 为空,请设置环境变量 \
+                             (EVO_AGENT_LLM__API_KEY 或 provider 裸链 MINIMAX_API_KEY / \
+                             DEEPSEEK_API_KEY / OPENAI_API_KEY)后在 [llm] 配置 mode = \"direct\""
+                        .to_string(),
+                });
+            }
+            if self.llm.api_base.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "llm.api_base".to_string(),
+                    reason: "direct 档直连 provider 需要端点:llm.api_base 为空,请配置 \
+                             OpenAI 兼容 chat/completions 全 URL(如 MiniMax 缺省 \
+                             https://api.minimaxi.com/v1/text/chatcompletion_v2)"
+                        .to_string(),
+                });
+            }
             tracing::warn!(
-                "llm.api_key 已不消费(SG-1 key 归边:出站统一走执行体端点,凭据仅存于执行体侧);建议从配置中移除该字段"
+                "llm.mode=direct:出站直连 provider({}),llm.executor_url 在本档不生效(忽略);\
+                 agent 进程内持有凭据,注意部署面环境变量可见性",
+                self.llm.api_base
             );
+        } else {
+            // relay 档维持既有语义:SG-1 key 归边,agent 侧 key 不消费,
+            // 非空配置告警留痕提示清理(direct 档该字段是生效凭据,不提示)
+            if !self.llm.api_key.is_empty() {
+                tracing::warn!(
+                    "llm.api_key 已不消费(SG-1 key 归边:出站统一走执行体端点,凭据仅存于执行体侧);建议从配置中移除该字段"
+                );
+            }
         }
 
         // evorule base_url 必须是 http:// 或 https:// 开头
@@ -1076,6 +1151,21 @@ impl Config {
         }
 
         // 注意:宽松模式跳过 LLM API key 非空检查
+
+        // 出站轨道值域检查(格式检查,宽松/严格同口径;direct 档凭据
+        // 非空检查仅严格模式)
+        match self.llm.mode.as_str() {
+            "relay" | "direct" => {}
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "llm.mode".to_string(),
+                    reason: format!(
+                        "unknown mode '{}', expected one of: relay, direct",
+                        other
+                    ),
+                });
+            }
+        }
 
         // evorule base_url 必须是 http:// 或 https:// 开头
         if !self.evorule.base_url.starts_with("http://")
@@ -1355,6 +1445,129 @@ mod tests {
         ));
     }
 
+    /// mode 拼写错误拒启(fail-fast,不猜不回落);严格/宽松双档同拦
+    #[test]
+    fn test_llm_mode_invalid_rejected_both_validators() {
+        let mut cfg = Config::default();
+        cfg.llm.mode = "relay ".to_string(); // 含空格的拼写错误形态
+        let result = cfg.validate();
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, reason }) if field == "llm.mode" && reason.contains("relay ")
+        ));
+        let result = cfg.validate_lenient();
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "llm.mode"
+        ));
+    }
+
+    /// direct 档缺凭据拒启 + 修复指引文案可见(fail-visible)
+    #[test]
+    fn test_llm_mode_direct_missing_key_rejected() {
+        let mut cfg = Config::default();
+        cfg.llm.mode = "direct".to_string();
+        cfg.llm.api_key = String::new();
+        let result = cfg.validate();
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "llm.api_key"
+        ));
+        // 指引面:错误信息点出环境变量注入路径
+        let Err(ConfigError::InvalidValue { reason, .. }) = result else {
+            panic!("expected InvalidValue");
+        };
+        assert!(reason.contains("EVO_AGENT_LLM__API_KEY"));
+    }
+
+    /// direct 档缺直连端点拒启(凭据在而端点空)
+    #[test]
+    fn test_llm_mode_direct_missing_base_rejected() {
+        let mut cfg = Config::default();
+        cfg.llm.mode = "direct".to_string();
+        cfg.llm.api_key = "k".to_string();
+        cfg.llm.api_base = "  ".to_string();
+        let result = cfg.validate();
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "llm.api_base"
+        ));
+    }
+
+    /// direct 档凭据+端点齐备时 validate 通过(合法形态)
+    #[test]
+    fn test_llm_mode_direct_complete_passes() {
+        let mut cfg = Config::default();
+        cfg.llm.mode = "direct".to_string();
+        cfg.llm.api_key = "k".to_string();
+        cfg.llm.api_base = "https://api.example.com/v1/chat/completions".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// EVO_AGENT_LLM__MODE 显式环境变量覆盖(toml 之上,部署注入面同族语义)
+    #[test]
+    fn test_llm_mode_explicit_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let snap = std::env::var("EVO_AGENT_LLM__MODE").ok();
+        std::env::set_var("EVO_AGENT_LLM__MODE", "direct");
+
+        let base = LlmConfig {
+            mode: "relay".to_string(),
+            ..LlmConfig::default()
+        };
+        let resolved = LlmConfig::resolve(base);
+        assert_eq!(resolved.mode, "direct");
+
+        match snap {
+            Some(v) => std::env::set_var("EVO_AGENT_LLM__MODE", v),
+            None => std::env::remove_var("EVO_AGENT_LLM__MODE"),
+        }
+    }
+
+    /// 脱敏快照分档语义:relay 档 configured = key 存在性
+    /// (既有口径);direct 档 configured = key 与 api_base 均非空;快照
+    /// 回显 mode 且不含任何密钥内容
+    #[test]
+    fn test_llm_status_snapshot_mode_aware() {
+        // relay 档:key 非空即 configured(既有口径,api_base 为空不影响)
+        let relay_cfg = LlmConfig {
+            mode: "relay".to_string(),
+            api_key: "sk-abcdef123456".to_string(),
+            ..LlmConfig::default()
+        };
+        let snap = relay_cfg.status_snapshot(None);
+        assert!(snap.configured);
+        assert_eq!(snap.mode, "relay");
+
+        // direct 档:有 key 无端点 → 未就绪
+        let direct_cfg = LlmConfig {
+            mode: "direct".to_string(),
+            api_key: "sk-abcdef123456".to_string(),
+            api_base: String::new(),
+            ..LlmConfig::default()
+        };
+        let snap = direct_cfg.status_snapshot(None);
+        assert!(!snap.configured);
+        assert_eq!(snap.mode, "direct");
+
+        // direct 档:key + 端点齐备 → 就绪
+        let direct_cfg = LlmConfig {
+            mode: "direct".to_string(),
+            api_key: "sk-abcdef123456".to_string(),
+            api_base: "https://api.example.com/v1/chat/completions".to_string(),
+            ..LlmConfig::default()
+        };
+        let snap = direct_cfg.status_snapshot(Some("MINIMAX_API_KEY"));
+        assert!(snap.configured);
+        assert_eq!(snap.mode, "direct");
+        assert_eq!(snap.api_key.source.as_deref(), Some("MINIMAX_API_KEY"));
+
+        // 未配置态:mode 回显缺省档
+        let snap = LlmStatusSnapshot::unconfigured();
+        assert!(!snap.configured);
+        assert_eq!(snap.mode, "relay");
+    }
+
     #[test]
     fn test_merge_from_file_partial() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -1376,8 +1589,9 @@ model = "gpt-4o"
         // 被覆盖
         assert_eq!(cfg.llm.provider, "openai");
         assert_eq!(cfg.llm.model, "gpt-4o");
-        // 未被覆盖(保留 default)
+        // 未被覆盖(保留 default;mode 未声明回落缺省 relay——缺省形状回归锁)
         assert_eq!(cfg.evorule.base_url, "http://localhost:18080");
+        assert_eq!(cfg.llm.mode, "relay");
     }
 
     #[test]
@@ -1397,6 +1611,7 @@ model = "gpt-4o"
             r#"
 [llm]
 provider = "openai"
+mode = "direct"
 api_key = "k1"
 model = "m1"
 api_base = "https://api.example.com/v1"
@@ -1411,6 +1626,7 @@ max_retries = 7
         let mut cfg = Config::default();
         cfg.merge_from_file(&toml_path).unwrap();
         assert_eq!(cfg.llm.provider, "openai");
+        assert_eq!(cfg.llm.mode, "direct");
         assert_eq!(cfg.llm.api_key, "k1");
         assert_eq!(cfg.llm.model, "m1");
         assert_eq!(cfg.llm.api_base, "https://api.example.com/v1");
