@@ -1,0 +1,37 @@
+{
+  "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
+  "kind": "rule_set",
+  "id": "com.evorule.constraint.model_allowlist",
+  "version": "1.2.2",
+  "metadata": {
+    "tier": "constraint",
+    "title": "会话模型准入白名单",
+    "description": "本工作区仅允许准入白名单内的模型发起 LLM 会话（call_external）。白名单以 in 域集合成员判定表达；内容由 model-admission.json 配置面经本翻译器生成，执法仍在引擎+执行体双层。"
+  },
+  "transform": [
+    {
+      "type": "enforce",
+      "params": {
+        "domain": {
+          "type": "all",
+          "inner": [
+            {
+              "type": "instruction",
+              "instruction_type": "call_external"
+            },
+            {
+              "type": "not",
+              "inner": {
+                "type": "in",
+                "path": "instruction.params.model",
+                "values": ["MiniMax-M2.5","MiniMax-M3","glm-4.6","glm-4.5-air"],
+                "on_missing": "error"
+              }
+            }
+          ]
+        },
+        "reason": "会话模型不在本工作区准入白名单（仅允许 MiniMax-M2.5、MiniMax-M3、glm-4.6、glm-4.5-air；由 model-admission.json 参数化生成）"
+      }
+    }
+  ]
+}

@@ -10,7 +10,11 @@
 #   resources\evorule-server\resources\     <- <server-repo>\resources
 #   resources\evorule-server\rules\         <- <server-repo>\rules
 #   resources\evorule-server\agent-governance\rules\00_constraint_model_allowlist.json
-#                                           <- <server-repo>\data\agent-governance\rules\（执行体白名单物料）
+#                                           <- 本仓 desktop\installer-assets\agent-governance\rules\
+#                                              （执行体白名单物料快照，版本入 git；源物料由 server 侧
+#                                              model-admission 配置面经翻译器生成，server 的 data\ 目录
+#                                              系运行态不入版本控制，故安装器自带已验证快照。更新物料
+#                                              时以新版本 JSON 覆盖本快照并随批提交。）
 #
 # <repo>       = 本仓根（本脚本所在 desktop 目录的上级）。
 # <server-repo> = 引擎仓根，默认取本仓同级 evorule-server 目录，-ServerRepo 可覆盖。
@@ -70,7 +74,7 @@ if (-not $SkipCollect) {
         @{ Src = (Join-Path $repoRoot "web\dist");                            Dst = "resources\evo-agent\web\dist" },
         @{ Src = (Join-Path $ServerRepo "resources");                         Dst = "resources\evorule-server\resources" },
         @{ Src = (Join-Path $ServerRepo "rules");                             Dst = "resources\evorule-server\rules" },
-        @{ Src = (Join-Path $ServerRepo "data\agent-governance\rules\00_constraint_model_allowlist.json"); Dst = "resources\evorule-server\agent-governance\rules\00_constraint_model_allowlist.json" }
+        @{ Src = (Join-Path $repoRoot "desktop\installer-assets\agent-governance\rules\00_constraint_model_allowlist.json"); Dst = "resources\evorule-server\agent-governance\rules\00_constraint_model_allowlist.json" }
     )
 
     foreach ($p in $pairs) {
