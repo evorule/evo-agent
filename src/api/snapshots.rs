@@ -189,6 +189,16 @@ pub struct SnapshotFile {
     pub count: usize,
     /// 消息列表(与 transcript 端点同构的 MessageRecord)
     pub messages: Vec<MessageRecord>,
+    /// 用户命名检查点标签(手动存档时写入;serde default 兼容旧快照)
+    #[serde(default)]
+    pub label: Option<String>,
+    /// 打点时刻的引擎 fact 链版本(手动检查点锚定;恢复=回滚到此版本。
+    /// serde default 兼容旧快照/自动快照=缺省 None)
+    #[serde(default)]
+    pub engine_version: Option<u64>,
+    /// 是否用户手动检查点(豁免保留期清理;自动 TurnEnd 快照=false)
+    #[serde(default)]
+    pub manual: bool,
 }
 
 /// 快照存储(目录 = `<workdir>/data/snapshots`,按 YYYY/MM/DD 日期分片)
@@ -246,6 +256,9 @@ impl SnapshotStore {
             saved_at: unix_now(),
             count: messages.len(),
             messages: messages.to_vec(),
+            label: None,
+            engine_version: None,
+            manual: false,
         };
         let text = serde_json::to_string(&snap).map_err(|e| format!("serialize failed: {e}"))?;
         // 原子写:tmp + rename(Windows rename 覆盖已存在文件)
@@ -289,6 +302,117 @@ impl SnapshotStore {
         best
     }
 
+    /// 保存用户命名检查点（手动存档;独立文件逐份保留,不覆盖自动快照）
+    ///
+    /// 文件名 `checkpoint_{sid}_{saved_at}.json`——`saved_at` 即检查点 ID
+    /// （同秒重复打点时递增避免覆盖）。`engine_version` 锚定打点时刻的
+    /// 引擎 fact 链版本（恢复=回滚到此版本）。
+    pub fn save_checkpoint(
+        &self,
+        session_id: &str,
+        agent_type: &str,
+        messages: &[MessageRecord],
+        label: &str,
+        engine_version: u64,
+    ) -> Result<(u64, PathBuf), String> {
+        if !Self::safe_session_id(session_id) {
+            return Err(format!("unsafe session id for snapshot: {session_id}"));
+        }
+        let label = label.trim();
+        if label.is_empty() {
+            return Err("checkpoint label must not be empty".to_string());
+        }
+        let (y, m, d) = civil_from_days((unix_now() / 86_400) as i64);
+        let dir = self.day_dir(y, m, d);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create snapshot dir failed: {e}"))?;
+        // 同秒防覆盖:已存在则顺延秒值(检查点 ID=落盘时刻,唯一即可)
+        let mut saved_at = unix_now();
+        loop {
+            let name = format!("checkpoint_{session_id}_{saved_at}.json");
+            if !dir.join(&name).exists() {
+                break;
+            }
+            saved_at += 1;
+        }
+        let name = format!("checkpoint_{session_id}_{saved_at}.json");
+        let snap = SnapshotFile {
+            kind: "checkpoint".to_string(),
+            authoritative: false,
+            session_id: session_id.to_string(),
+            agent_type: agent_type.to_string(),
+            saved_at,
+            count: messages.len(),
+            messages: messages.to_vec(),
+            label: Some(label.to_string()),
+            engine_version: Some(engine_version),
+            manual: true,
+        };
+        let text = serde_json::to_string(&snap).map_err(|e| format!("serialize failed: {e}"))?;
+        let tmp = dir.join(format!(".{name}.tmp"));
+        {
+            let mut f =
+                std::fs::File::create(&tmp).map_err(|e| format!("write tmp failed: {e}"))?;
+            use std::io::Write as _;
+            f.write_all(text.as_bytes())
+                .map_err(|e| format!("write tmp failed: {e}"))?;
+        }
+        let target = dir.join(&name);
+        std::fs::rename(&tmp, &target).map_err(|e| format!("rename failed: {e}"))?;
+        Ok((saved_at, target))
+    }
+
+    /// 列出某会话的全部手动检查点(遍历日期分片,按 `saved_at` 升序)
+    pub fn list_checkpoints(&self, session_id: &str) -> Vec<SnapshotFile> {
+        if !Self::safe_session_id(session_id) {
+            return Vec::new();
+        }
+        let mut found: Vec<SnapshotFile> = Vec::new();
+        for y in numeric_subdirs(&self.root) {
+            for m in numeric_subdirs(&y.path()) {
+                for d in numeric_subdirs(&m.path()) {
+                    let Ok(rd) = std::fs::read_dir(d.path()) else {
+                        continue;
+                    };
+                    for entry in rd.flatten() {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if !name.starts_with(&format!("checkpoint_{session_id}_")) {
+                            continue;
+                        }
+                        if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                            if let Ok(snap) = serde_json::from_str::<SnapshotFile>(&text) {
+                                found.push(snap);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        found.sort_by_key(|s| s.saved_at);
+        found
+    }
+
+    /// 读取单个手动检查点(`cp_id` = 打点时刻秒值,见 [`Self::save_checkpoint`])
+    pub fn load_checkpoint(&self, session_id: &str, cp_id: u64) -> Option<SnapshotFile> {
+        if !Self::safe_session_id(session_id) {
+            return None;
+        }
+        // 日期未知 → 遍历全部分片定位(与 load 同口径)
+        for y in numeric_subdirs(&self.root) {
+            for m in numeric_subdirs(&y.path()) {
+                for d in numeric_subdirs(&m.path()) {
+                    let path = d
+                        .path()
+                        .join(format!("checkpoint_{session_id}_{cp_id}.json"));
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        return serde_json::from_str::<SnapshotFile>(&text).ok();
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// 按保留期清理过期日期分片(整目录删除;返回删除的日期分片数)
     ///
     /// 判据:`当前 UTC 日 - 目录日 >= 保留天数`;`Forever` 直接返回 0。
@@ -312,12 +436,20 @@ impl SnapshotStore {
                         continue;
                     };
                     let dir_days = days_from_civil(yv, mv, dv);
-                    if today - dir_days >= max_age as i64
-                        && std::fs::remove_dir_all(d.path()).is_ok()
-                    {
-                        removed += 1;
-                        // 空月目录顺手移除(非空则失败忽略)
-                        let _ = std::fs::remove_dir(m.path());
+                    if today - dir_days >= max_age as i64 {
+                        // 手动检查点豁免清理(用户显式存档意图);其余按保留期删除
+                        for entry in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
+                            let name = entry.file_name();
+                            if name.to_string_lossy().starts_with("checkpoint_") {
+                                continue;
+                            }
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                        if is_dir_empty(&d.path()) && std::fs::remove_dir(d.path()).is_ok() {
+                            removed += 1;
+                            // 空月目录顺手移除(非空则失败忽略)
+                            let _ = std::fs::remove_dir(m.path());
+                        }
                     }
                 }
                 // 整月删空后移除空月目录
@@ -351,6 +483,23 @@ pub async fn capture_from_engine(
 ) -> Result<PathBuf, String> {
     let messages = load_transcript(client, session_id, namespace).await?;
     store.save(session_id, agent_type, &messages)
+}
+
+/// 用户手动检查点采集:transcript 快照 + 引擎版本锚定三元组落盘。
+///
+/// 与 TurnEnd 自动快照同一读取路径(`load_transcript`,活投影同源同构);
+/// `engine_version` 由调用方在打点前从引擎取(`get_facts` 最新版本)。
+pub async fn capture_checkpoint(
+    client: &EvoruleApiClient,
+    store: &SnapshotStore,
+    session_id: &str,
+    agent_type: &str,
+    namespace: &str,
+    label: &str,
+    engine_version: u64,
+) -> Result<(u64, PathBuf), String> {
+    let messages = load_transcript(client, session_id, namespace).await?;
+    store.save_checkpoint(session_id, agent_type, &messages, label, engine_version)
 }
 
 /// evorule 会话是否已不可达(30min 闲置 TTL 回收 → facts 查询 404 →
@@ -535,6 +684,9 @@ mod tests {
                     saved_at: unix_now(),
                     count: 0,
                     messages: vec![],
+                    label: None,
+                    engine_version: None,
+                    manual: false,
                 })
                 .unwrap(),
             )
@@ -559,6 +711,71 @@ mod tests {
         std::fs::write(weird.join("session_x.json"), "{}").unwrap();
         let store = SnapshotStore::new(root);
         assert_eq!(store.cleanup_expired(RetentionPolicy::Day1), 0);
+    }
+
+    #[test]
+    fn test_checkpoint_save_list_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path().join("snapshots"));
+        store.ensure_dir();
+        let msgs = vec![record(0, "user", "hello"), record(1, "assistant", "hi")];
+        let (cp1, _) = store
+            .save_checkpoint("s_cp", "general", &msgs, "第一关", 41)
+            .unwrap();
+        let (cp2, _) = store
+            .save_checkpoint("s_cp", "general", &msgs[0..1], "第二关", 42)
+            .unwrap();
+        assert_ne!(cp1, cp2, "检查点 ID(打点时刻)不碰撞");
+        let list = store.list_checkpoints("s_cp");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].label.as_deref(), Some("第一关"));
+        assert_eq!(list[0].engine_version, Some(41));
+        assert!(list[0].manual);
+        assert_eq!(list[1].label.as_deref(), Some("第二关"));
+        // 读取单点+消息保真
+        let snap = store.load_checkpoint("s_cp", cp2).unwrap();
+        assert_eq!(snap.messages.len(), 1);
+        assert_eq!(snap.messages[0].content, "hello");
+        // 无关会话零泄漏
+        assert!(store.list_checkpoints("s_other").is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_preserves_manual_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path().join("snapshots"));
+        store.ensure_dir();
+        let today = (unix_now() / 86_400) as i64;
+        let (y, m, d) = civil_from_days(today - 100);
+        let dirp = store.day_dir(y, m, d);
+        std::fs::create_dir_all(&dirp).unwrap();
+        std::fs::write(
+            dirp.join("session_s_old.json"),
+            r#"{"kind":"snapshot","authoritative":false,"session_id":"s_old","agent_type":"general","saved_at":1,"count":0,"messages":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dirp.join("checkpoint_s_old_999.json"),
+            r#"{"kind":"checkpoint","authoritative":false,"session_id":"s_old","agent_type":"general","saved_at":999,"count":1,"messages":[],"label":"保留","engine_version":7,"manual":true}"#,
+        )
+        .unwrap();
+        // 过期日目录:自动快照清、手动检查点豁免、目录不整删
+        assert_eq!(store.cleanup_expired(RetentionPolicy::Month3), 0);
+        assert!(store.load("s_old").is_none(), "自动快照按保留期删除");
+        assert!(
+            store.load_checkpoint("s_old", 999).is_some(),
+            "手动检查点豁免清理"
+        );
+    }
+
+    /// 旧快照兼容——无 label/engine_version/manual 键的历史文件缺省解析
+    #[test]
+    fn test_old_snapshot_without_new_fields_parses() {
+        let line = r#"{"kind":"snapshot","authoritative":false,"session_id":"s","agent_type":"general","saved_at":1,"count":0,"messages":[]}"#;
+        let snap: SnapshotFile = serde_json::from_str(line).unwrap();
+        assert_eq!(snap.label, None);
+        assert_eq!(snap.engine_version, None);
+        assert!(!snap.manual);
     }
 
     #[test]

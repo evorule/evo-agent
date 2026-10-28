@@ -796,6 +796,23 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         )
         // B21 PR-4/G2:ATIF v1.8 轨迹导出(journal × 审计链 × transcript 三源 join)
         .route("/api/sessions/{id}/atif", axum::routing::get(get_atif))
+        // 会话检查点:版本时间线 / 手动回滚 / 打点·列举·恢复(与 WS Rewind 同源)
+        .route(
+            "/api/sessions/{id}/versions",
+            axum::routing::get(get_session_versions),
+        )
+        .route(
+            "/api/sessions/{id}/rewind",
+            axum::routing::post(post_session_rewind),
+        )
+        .route(
+            "/api/sessions/{id}/checkpoints",
+            axum::routing::get(list_session_checkpoints).post(create_session_checkpoint),
+        )
+        .route(
+            "/api/sessions/{id}/checkpoints/{cp_id}/restore",
+            axum::routing::post(restore_session_checkpoint),
+        )
         // 工作台配置(快照保留期;展示层,不触引擎面)
         .route(
             "/api/workbench/config",
@@ -2656,6 +2673,214 @@ pub(crate) fn resolve_memory_namespace(state: &AgentApiState, agent_type: &str) 
         // 定义加载失败/未配置 → 与 serve 侧 general 注入口径一致
         _ => "general".to_string(),
     }
+}
+
+// =============================================================================
+// 会话检查点(用户手动存档 + 引擎版本回滚;与 WS Rewind 通道同源)
+// =============================================================================
+
+/// 打点/回滚请求体
+#[derive(Debug, serde::Deserialize)]
+struct SessionOpRequest {
+    /// 检查点标签(打点)或目标版本号(回滚)
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    version: Option<u64>,
+}
+
+/// REST 面活跃轮守卫(与 WS Rewind 同语义:活跃轮内拒绝结构性变更)
+fn session_turn_active(state: &AgentApiState, session_id: &str) -> bool {
+    state
+        .running_sessions()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(session_id)
+}
+
+/// 版本列举:引擎 fact 链可回滚目标投影(每条 fact 的 version 即回滚锚)
+async fn get_session_versions(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let facts = state
+        .evorule_client()
+        .get_facts(&session_id, None)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let mut versions: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    for f in &facts {
+        // 版本 v 时链上事实数 = version <= v 的条目数(时间线进度语义)
+        let count = versions.entry(f.version).or_insert(0);
+        *count += 1;
+    }
+    let list: Vec<serde_json::Value> = versions
+        .into_iter()
+        .scan(0usize, |acc, (version, n)| {
+            *acc += n;
+            Some(serde_json::json!({ "version": version, "facts": *acc }))
+        })
+        .collect();
+    let latest = list.last().and_then(|v| v["version"].as_u64()).unwrap_or(0);
+    Ok(Json(serde_json::json!({
+        "session_id": session_id,
+        "latest": latest,
+        "versions": list,
+    })))
+}
+
+/// 手动回滚(引擎 fact 链版本回退;与 WS Rewind 同一底层端点)
+async fn post_session_rewind(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Json(body): Json<SessionOpRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(version) = body.version else {
+        return Err((StatusCode::BAD_REQUEST, "version is required".to_string()));
+    };
+    if session_turn_active(&state, &session_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "cannot rewind during active turn; send interrupt first".to_string(),
+        ));
+    }
+    let reply = state
+        .evorule_client()
+        .rewind(&session_id, version)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let actual = reply["actual_version"].as_u64().unwrap_or(version);
+    Ok(Json(serde_json::json!({
+        "session_id": session_id,
+        "requested_version": version,
+        "actual_version": actual,
+    })))
+}
+
+/// 创建检查点(打点):transcript 快照 + 当前引擎版本锚定三元组落盘
+async fn create_session_checkpoint(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Json(body): Json<SessionOpRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(label) = body
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err((StatusCode::BAD_REQUEST, "label is required".to_string()));
+    };
+    if session_turn_active(&state, &session_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "cannot take a checkpoint during an active turn".to_string(),
+        ));
+    }
+    let agent_type = state
+        .session_index()
+        .list()
+        .into_iter()
+        .find(|e| e.session_id == session_id)
+        .map(|e| e.agent_type)
+        .unwrap_or_else(|| "general".to_string());
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+    // 版本锚:当前引擎 fact 链最新版本
+    let facts = state
+        .evorule_client()
+        .get_facts(&session_id, None)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let engine_version = facts.iter().map(|f| f.version).max().unwrap_or(0);
+    let (cp_id, _path) = crate::api::snapshots::capture_checkpoint(
+        state.evorule_client(),
+        state.snapshots(),
+        &session_id,
+        &agent_type,
+        &namespace,
+        label,
+        engine_version,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let count = state
+        .snapshots()
+        .load_checkpoint(&session_id, cp_id)
+        .map(|s| s.count)
+        .unwrap_or(0);
+    Ok(Json(serde_json::json!({
+        "cp_id": cp_id,
+        "session_id": session_id,
+        "label": label,
+        "engine_version": engine_version,
+        "count": count,
+    })))
+}
+
+/// 列举某会话的手动检查点(按打点时刻升序)
+async fn list_session_checkpoints(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let checkpoints: Vec<serde_json::Value> = state
+        .snapshots()
+        .list_checkpoints(&session_id)
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "cp_id": s.saved_at,
+                "label": s.label,
+                "saved_at": s.saved_at,
+                "count": s.count,
+                "engine_version": s.engine_version,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "session_id": session_id,
+        "checkpoints": checkpoints,
+    }))
+}
+
+/// 恢复检查点:引擎回滚到打点锚定版本 + 返回打点时刻消息(前端重建视图)
+async fn restore_session_checkpoint(
+    State(state): State<AgentApiState>,
+    axum::extract::Path((session_id, cp_id)): axum::extract::Path<(String, u64)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if session_turn_active(&state, &session_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "cannot restore during an active turn; send interrupt first".to_string(),
+        ));
+    }
+    let snap = state
+        .snapshots()
+        .load_checkpoint(&session_id, cp_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("checkpoint {cp_id} not found for session {session_id}"),
+            )
+        })?;
+    let version = snap.engine_version.ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "checkpoint has no engine version anchor (legacy snapshot)".to_string(),
+        )
+    })?;
+    let reply = state
+        .evorule_client()
+        .rewind(&session_id, version)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let actual = reply["actual_version"].as_u64().unwrap_or(version);
+    Ok(Json(serde_json::json!({
+        "session_id": session_id,
+        "cp_id": cp_id,
+        "label": snap.label,
+        "restored_version": actual,
+        "messages": snap.messages,
+    })))
 }
 
 // =============================================================================
