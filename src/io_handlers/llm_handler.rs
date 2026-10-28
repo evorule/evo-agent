@@ -2355,6 +2355,177 @@ mod tests {
 }
 
 #[cfg(test)]
+mod sse_frame_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    /// o14 流式覆盖增强：executor_sse_frame_outcome 纯函数面边界锁。
+    /// 覆盖八分支（content/reasoning/tool_call_delta/done/error/未知类型/
+    /// [DONE] 哨兵/坏 JSON）+ 多行 join/空帧/安全网补发三边界。
+
+    fn frame(data: &str) -> String {
+        format!("data: {data}\n\n")
+    }
+
+    #[test]
+    fn test_sse_content_frame_yields_delta() {
+        let mut saw_reasoning = false;
+        let mut saw_done = false;
+        let (chunks, end) = executor_sse_frame_outcome(
+            &frame(r#"{"type":"content","text":"你好"}"#),
+            &mut saw_reasoning,
+            &mut saw_done,
+        );
+        assert!(matches!(end, FrameEnd::Continue));
+        assert_eq!(chunks.len(), 1, "content 帧产单 Delta");
+        match &chunks[0] {
+            StreamChunk::Delta(t) => assert_eq!(t, "你好"),
+            other => panic!("expected Delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sse_multiline_data_joined() {
+        let mut saw_reasoning = false;
+        let mut saw_done = false;
+        let raw = "data: {\"type\":\"content\",\ndata: \"text\":\"ab\"}\n\n";
+        let (chunks, end) =
+            executor_sse_frame_outcome(raw, &mut saw_reasoning, &mut saw_done);
+        assert!(matches!(end, FrameEnd::Continue));
+        match &chunks[0] {
+            StreamChunk::Delta(t) => assert_eq!(t, "ab", "多 data: 行 join 后解析"),
+            other => panic!("expected Delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sse_blank_and_non_data_lines_skipped() {
+        let mut saw_reasoning = false;
+        let mut saw_done = false;
+        for raw in ["\n\n", "event: message\n\n", ": keep-alive comment\n\n"] {
+            let (chunks, end) =
+                executor_sse_frame_outcome(raw, &mut saw_reasoning, &mut saw_done);
+            assert!(matches!(end, FrameEnd::Continue), "无 data 行应继续: {raw:?}");
+            assert!(chunks.is_empty(), "无 data 行零 chunks: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn test_sse_done_sentinel_stops_without_chunks() {
+        let mut saw_reasoning = false;
+        let mut saw_done = false;
+        let (chunks, end) =
+            executor_sse_frame_outcome(&frame("[DONE]"), &mut saw_reasoning, &mut saw_done);
+        assert!(matches!(end, FrameEnd::Stop));
+        assert!(chunks.is_empty(), "[DONE] 哨兵零 chunks");
+    }
+
+    #[test]
+    fn test_sse_malformed_json_warns_and_continues() {
+        let mut saw_reasoning = false;
+        let mut saw_done = false;
+        let (chunks, end) =
+            executor_sse_frame_outcome(&frame("{not-json"), &mut saw_reasoning, &mut saw_done);
+        assert!(matches!(end, FrameEnd::Continue), "坏 JSON 流继续不收口");
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0], StreamChunk::Warn(_)), "坏 JSON → Warn");
+    }
+
+    #[test]
+    fn test_sse_tool_call_delta_index_fragment() {
+        let mut saw_reasoning = false;
+        let mut saw_done = false;
+        let (chunks, end) = executor_sse_frame_outcome(
+            &frame(r#"{"type":"tool_call_delta","index":2,"fragment":"{\"a\":"}"#),
+            &mut saw_reasoning,
+            &mut saw_done,
+        );
+        assert!(matches!(end, FrameEnd::Continue));
+        match &chunks[0] {
+            StreamChunk::ToolCallDelta { index, fragment } => {
+                assert_eq!(*index, 2, "OpenAI SSE 按 index 分片");
+                assert_eq!(fragment, "{\"a\":");
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sse_reasoning_frame_sets_flag() {
+        let mut saw_reasoning = false;
+        let mut saw_done = false;
+        let (chunks, end) = executor_sse_frame_outcome(
+            &frame(r#"{"type":"reasoning","text":"think…"}"#),
+            &mut saw_reasoning,
+            &mut saw_done,
+        );
+        assert!(matches!(end, FrameEnd::Continue));
+        assert!(saw_reasoning, "reasoning 帧置位 saw_reasoning");
+        assert!(matches!(chunks[0], StreamChunk::ThinkingDelta(_)));
+    }
+
+    #[test]
+    fn test_sse_done_frame_no_backfill_when_reasoning_seen() {
+        let mut saw_reasoning = true; // 途中已有 reasoning 帧
+        let mut saw_done = false;
+        let (chunks, end) = executor_sse_frame_outcome(
+            &frame(r#"{"type":"done","reasoning":"late…","content":"ans","finish_reason":"stop"}"#),
+            &mut saw_reasoning,
+            &mut saw_done,
+        );
+        assert!(matches!(end, FrameEnd::Stop));
+        assert!(saw_done);
+        assert_eq!(chunks.len(), 1, "saw_reasoning 已置位 → 终帧思考块不补发");
+        assert!(matches!(chunks[0], StreamChunk::Done(_)));
+    }
+
+    #[test]
+    fn test_sse_done_frame_backfills_reasoning_safety_net() {
+        let mut saw_reasoning = false; // 全程零 reasoning 帧
+        let mut saw_done = false;
+        let (chunks, end) = executor_sse_frame_outcome(
+            &frame(r#"{"type":"done","reasoning":"only-at-end","content":"ans","finish_reason":"stop"}"#),
+            &mut saw_reasoning,
+            &mut saw_done,
+        );
+        assert!(matches!(end, FrameEnd::Stop));
+        assert_eq!(chunks.len(), 2, "安全网：补发 ThinkingDelta + Done");
+        assert!(
+            matches!(chunks[0], StreamChunk::ThinkingDelta(ref t) if t == "only-at-end"),
+            "终帧思考块补发在前"
+        );
+        match &chunks[1] {
+            StreamChunk::Done(r) => assert_eq!(r.content, "ans"),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sse_error_frame_fails_with_message() {
+        let mut saw_reasoning = false;
+        let mut saw_done = false;
+        let (chunks, end) = executor_sse_frame_outcome(
+            &frame(r#"{"type":"error","error":"upstream 500"}"#),
+            &mut saw_reasoning,
+            &mut saw_done,
+        );
+        assert!(chunks.is_empty());
+        let FrameEnd::Fail(msg) = end else {
+            panic!("error 帧应 Fail 收口")
+        };
+        assert_eq!(msg, "upstream 500");
+        // 未知类型分支同测（Warn 跳过）
+        let (chunks2, end2) = executor_sse_frame_outcome(
+            &frame(r#"{"type":"mystery"}"#),
+            &mut saw_reasoning,
+            &mut saw_done,
+        );
+        assert!(matches!(end2, FrameEnd::Continue));
+        assert!(matches!(chunks2[0], StreamChunk::Warn(_)));
+    }
+}
+
+#[cfg(test)]
 mod config_max_tokens_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
