@@ -67,6 +67,45 @@ export function applyDelegateResult(nodes, agentType, ok) {
 }
 
 /**
+ * WS ToolCall(session_spawn)→ 临时 running 节点(kind=spawn,无 agent_type
+ * ——spawn 链为同能力分身,类型随 REST 合并回填)。
+ */
+export function applySpawnCall(nodes, parentSid, seq) {
+  const parent = nodes.find((n) => n.session_id === parentSid);
+  const depth = parent ? parent.depth + 1 : 1;
+  return [
+    ...nodes,
+    {
+      session_id: `tmp-spawn:${parentSid}:${seq}`,
+      agent_type: '',
+      parent: parentSid,
+      kind: 'spawn',
+      depth,
+      spawned_at: null,
+      status: 'running',
+      temp: true,
+    },
+  ];
+}
+
+/**
+ * WS ToolResult(session_spawn)→ status==='spawned' 即派生成功(子会话
+ * 后台自跑,本节点收色 done;真身由 REST 合并按 child_session_id 取代)。
+ * 非 spawned 视为失败收色。
+ */
+export function applySpawnResult(nodes, ok) {
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (n.temp && n.status === 'running' && n.kind === 'spawn') {
+      return nodes.map((m, j) =>
+        j === i ? { ...m, status: ok ? 'done' : 'failed', temp: false } : m,
+      );
+    }
+  }
+  return nodes;
+}
+
+/**
  * REST 权威树合并:真身节点全量替换;prev 中仍在跑的临时节点保留追加
  * (其 journal 锚未落,REST 尚无真身;已收色临时节点由真身取代防重复)。
  */

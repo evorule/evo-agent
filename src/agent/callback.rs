@@ -242,6 +242,18 @@ impl EventCallback for LoggingCallback {
             AgentEvent::PlanSubmitted { plan_id, plan } => {
                 tracing::info!(%plan_id, steps = plan.get("steps").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0), "callback: plan submitted");
             }
+            AgentEvent::CompactionPerformed {
+                before_chars,
+                after_chars,
+                summary_generated,
+            } => {
+                tracing::info!(
+                    before_chars,
+                    after_chars,
+                    summary_generated,
+                    "callback: compaction performed"
+                );
+            }
             AgentEvent::Error(err) => {
                 tracing::error!(error = %err, "callback: error");
             }
@@ -375,6 +387,7 @@ mod tests {
                 AgentEvent::AskUserResult { question_id, .. } => {
                     format!("ask_user_result:{}", question_id)
                 }
+                AgentEvent::CompactionPerformed { .. } => "compaction_performed".to_string(),
             };
             self.events.lock().unwrap().push(label);
         }

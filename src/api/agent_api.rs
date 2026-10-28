@@ -818,6 +818,23 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/sessions/{id}/checkpoints/{cp_id}/restore",
             axum::routing::post(restore_session_checkpoint),
         )
+        // 会话手动压缩(显式触发面)+滚动摘要查看(压缩产物面)
+        .route(
+            "/api/sessions/{id}/diff",
+            axum::routing::get(get_session_version_diff),
+        )
+        .route(
+            "/api/sessions/{id}/checkpoints/{cp_id}/diff",
+            axum::routing::get(get_checkpoint_diff),
+        )
+        .route(
+            "/api/sessions/{id}/compact",
+            axum::routing::post(compact_session),
+        )
+        .route(
+            "/api/sessions/{id}/compaction",
+            axum::routing::get(get_session_compaction),
+        )
         // 记忆用户主权面:用户笔记读写删(仅 stable.user 域,服务端拼 path)
         // + 跨会话记忆浏览(只读,前缀白名单制)
         .route(
@@ -1580,7 +1597,7 @@ async fn run_agent(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .with_agents_md_segment(agents_md)
+    .with_agents_md_segment(agents_md.clone())
     .with_user_hooks(
         match crate::agent::user_hooks::WiredHooks::load_from_workdir(state.workdir()) {
             Ok(v) => v.map(std::sync::Arc::new),
@@ -2037,7 +2054,7 @@ async fn run_agent_stream(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .with_agents_md_segment(agents_md)
+    .with_agents_md_segment(agents_md.clone())
     .with_user_hooks(
         match crate::agent::user_hooks::WiredHooks::load_from_workdir(state.workdir()) {
             Ok(v) => v.map(std::sync::Arc::new),
@@ -2060,6 +2077,8 @@ async fn run_agent_stream(
             state.evorule_client.clone(),
         )
         .with_journal_dir(state.workdir.join("data").join("sessions"))
+        // 项目记忆段下放(与主 runner 同源)
+        .with_agents_md_segment(agents_md.clone())
         // 子代理工具契约:union toolkit 快照下放(此前 SSE 面子代理零工具契约)
         .with_toolkit((*state.toolkit()).clone(), &state.workdir)
         // 治理段同源下放(下方主 runner 消费同源值)
@@ -2551,6 +2570,19 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
                 "question_id": question_id,
                 "answered": answered,
                 "timed_out": timed_out,
+            })
+            .to_string(),
+        ),
+        // 主动压缩观测帧(前端一次性提示;与 journal compaction_performed 同源)
+        Ok(AgentEvent::CompactionPerformed {
+            before_chars,
+            after_chars,
+            summary_generated,
+        }) => Event::default().event("compaction_performed").data(
+            serde_json::json!({
+                "before_chars": before_chars,
+                "after_chars": after_chars,
+                "summary_generated": summary_generated,
             })
             .to_string(),
         ),
@@ -3082,6 +3114,170 @@ async fn delete_user_note(
         "path": path,
         "status": "tombstoned",
         "fact_id": fact_id,
+    })))
+}
+
+/// 引擎版本差异(检查点时间线的差异查看;client diff 包装的 serve 暴露)
+async fn get_session_version_diff(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let a = q
+        .get("a")
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "query param 'a' (version) is required".to_string(),
+            )
+        })?;
+    let b = q
+        .get("b")
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "query param 'b' (version) is required".to_string(),
+            )
+        })?;
+    let diff = state
+        .evorule_client()
+        .diff(&session_id, a, b)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "session_id": session_id,
+        "a": a,
+        "b": b,
+        "diff": diff,
+    })))
+}
+
+/// 检查点 vs 当前版本的差异(恢复/回滚前预览)
+async fn get_checkpoint_diff(
+    State(state): State<AgentApiState>,
+    axum::extract::Path((session_id, cp_id)): axum::extract::Path<(String, u64)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let snap = state
+        .snapshots()
+        .load_checkpoint(&session_id, cp_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("checkpoint {cp_id} not found for session {session_id}"),
+            )
+        })?;
+    let cp_version = snap.engine_version.ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "checkpoint has no engine version anchor (legacy snapshot)".to_string(),
+        )
+    })?;
+    let facts = state
+        .evorule_client()
+        .get_facts(&session_id, None)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let current = facts.iter().map(|f| f.version).max().unwrap_or(0);
+    let diff = state
+        .evorule_client()
+        .diff(&session_id, cp_version, current)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "session_id": session_id,
+        "cp_id": cp_id,
+        "label": snap.label,
+        "cp_version": cp_version,
+        "current_version": current,
+        "diff": diff,
+    })))
+}
+
+// =============================================================================
+// 会话手动压缩(longSession.compaction.* 机制的显式触发面)
+// =============================================================================
+
+/// 手动压缩:对当前会话消息执行一次滚动摘要压缩(与阈值触发的
+/// active_compaction 同一套纪律——审计链 sidecar+保真对照+rolling_summary
+/// 落账;后续轮次阈值触发时直接命中摘要缓存)。活跃轮拒绝。
+async fn compact_session(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if state
+        .running_sessions()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(&session_id)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "cannot compact during an active turn; send interrupt first".to_string(),
+        ));
+    }
+    let agent_type = state
+        .session_index()
+        .list()
+        .into_iter()
+        .find(|e| e.session_id == session_id)
+        .map(|e| e.agent_type)
+        .unwrap_or_else(|| "general".to_string());
+    let def = state
+        .definitions()
+        .load(&agent_type)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+    let result = crate::agent::runner::compact_session_now(
+        state.evorule_client().clone(),
+        crate::io_handlers::LlmHandler::from_config(&state.llm_config()),
+        def.memory.summary_model.clone(),
+        &namespace,
+        &session_id,
+        &state.workdir().join("data").join("sessions"),
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(result))
+}
+
+/// 滚动摘要查看:会话当前滚动摘要投影(压缩机制的产物面;
+/// 无摘要=空对象)
+async fn get_session_compaction(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let agent_type = q
+        .get("agent_type")
+        .cloned()
+        .or_else(|| {
+            state
+                .session_index()
+                .list()
+                .into_iter()
+                .find(|e| e.session_id == session_id)
+                .map(|e| e.agent_type)
+        })
+        .unwrap_or_else(|| "general".to_string());
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+    let prefix = format!("__memory__.{namespace}.session_{session_id}.rolling_summary");
+    let facts = state
+        .evorule_client()
+        .get_facts(&session_id, Some(&prefix))
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    // latest-wins:取最高版本的摘要条目
+    let latest = facts
+        .iter()
+        .max_by_key(|f| f.version)
+        .map(|f| f.value.clone())
+        .unwrap_or(serde_json::Value::Null);
+    Ok(Json(serde_json::json!({
+        "session_id": session_id,
+        "namespace": namespace,
+        "rolling_summary": latest,
     })))
 }
 

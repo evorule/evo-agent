@@ -32,6 +32,9 @@ import {
   refreshOrchestration,
   orchestrationToolCall,
   orchestrationToolResult,
+  applySpawnCall,
+  applySpawnResult,
+  orchestration,
 } from './orchestration.js';
 import { getTranscript } from './api.js';
 import { assembleContext } from './mentions.js';
@@ -481,6 +484,14 @@ function handleFrame(f) {
       closeThinking();
       appendToStream(f.text);
       break;
+    // B25 spawn 实时化包装:store 更新 + apply 纯函数(批次五)
+    const orchestrationSpawnCallLocal = (sid) => {
+      orchestration.update((o) => ({ ...o, nodes: applySpawnCall(o.nodes, sid) }));
+    };
+    const orchestrationSpawnResultLocal = (sid, ok) => {
+      orchestration.update((o) => ({ ...o, nodes: applySpawnResult(o.nodes, ok) }));
+    };
+
     case 'ToolCall': {
       closeThinking();
       sealStreamBubble(); // 轮内分段:固化当前叙述段,后续内容帧懒建新段
@@ -505,6 +516,10 @@ function handleFrame(f) {
       // B25 编排可视化:delegate 调用即入图(临时 running 节点,零往返)
       if (f.name === 'delegate') {
         orchestrationToolCall(get(sessionId), f.args);
+      }
+      // B25 spawn 实时化:session_spawn 派生节点即时入图(此前仅 REST 合并可见)
+      if (f.name === 'session_spawn') {
+        orchestrationSpawnCallLocal(get(sessionId));
       }
       break;
     }
@@ -538,6 +553,11 @@ function handleFrame(f) {
       // 栈顶匹配;错误结果不含 agent_type 时匹配最近在跑临时节点)
       if (f.name === 'delegate') {
         orchestrationToolResult(get(sessionId), f.result);
+      }
+      // spawn 结果收色(ChildSessionId 回执;status!==spawned 收 failed)
+      if (f.name === 'session_spawn') {
+        const spawnRes = f.result && typeof f.result === 'object' ? f.result : {};
+        orchestrationSpawnResultLocal(get(sessionId), spawnRes.status === 'spawned');
       }
       break;
     }
@@ -575,6 +595,14 @@ function handleFrame(f) {
       pushMessage({ kind: 'info', text: String(f.message) });
       pushPanelEvent('sys', { label: 'Info', detail: String(f.message) });
       break;
+    case 'CompactionPerformed': {
+      // 主动压缩观测帧:一次性系统提示(前后字符数+摘要是否生成)
+      const fmtK = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n ?? 0));
+      const text = `已完成上下文压缩（${fmtK(f.before_chars)} → ${fmtK(f.after_chars)} 字符${f.summary_generated ? '，滚动摘要已生成' : ''}）`;
+      pushMessage({ kind: 'info', text });
+      pushPanelEvent('sys', { label: 'Compaction', detail: text });
+      break;
+    }
     case 'fs_events':
       // 文件系统事件批量(相对 workdir);Explorer 订阅消费,一次性信号。
       // git 装饰/SCM 面不订阅一次性信号(防被 Explorer 抢走),此处直接

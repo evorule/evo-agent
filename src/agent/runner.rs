@@ -898,6 +898,15 @@ pub enum AgentEvent {
         /// 是否无人回答(超时/无人值守;卡置灰)
         timed_out: bool,
     },
+    /// 主动压缩已执行(阈值触发;观测面——前端可呈现一次性提示)
+    CompactionPerformed {
+        /// 压缩前全量消息字符数估算
+        before_chars: usize,
+        /// 压缩后字符数估算
+        after_chars: usize,
+        /// 滚动摘要是否已生成(工具结果清除的降压与摘要无关,恒发生)
+        summary_generated: bool,
+    },
 }
 
 // ----- M5-c:工具意图裁决(规范字段生产=机制层,处置=规则层,兜底=机制层)-----
@@ -2599,7 +2608,7 @@ impl AgentRunner {
     ///
     /// 触发:本轮 LLM 调用前,上下文用量(count)≥ 窗口×thresholdPct 时执行。
     /// 动作(设计 D3):①近摘要区 = system 前缀 + 最近
-    /// [`COMPACTION_KEEP_ROUNDS`] 轮之外的全部消息;②近摘要区滚动摘要
+    /// `policy.keep_rounds`(设置键 longSession.compaction.keepRounds,默认 = COMPACTION_KEEP_ROUNDS)轮之外的全部消息;②近摘要区滚动摘要
     /// (purpose=compaction,经 audited_llm 留痕,复用保真对照+记忆落链);
     /// ③区内大块工具结果原文以 `[cleared: 工具名]` 引用替代(按原文长度
     /// 从大到小,条数受 maxClearToolResults 约束);④摘要块回注区前 +
@@ -2617,7 +2626,7 @@ impl AgentRunner {
         messages: &[Message],
         goal: &str,
         journal: Option<&std::sync::Arc<crate::agent::journal::JournalWriter>>,
-    ) -> Option<Vec<Message>> {
+    ) -> Option<CompactionOutcome> {
         let policy = self.compaction_policy.as_ref()?;
         if !policy.enabled {
             return None;
@@ -2631,7 +2640,7 @@ impl AgentRunner {
         if threshold == 0 || ctx.count(messages) < threshold {
             return None;
         }
-        let (system_end, split) = compaction_region_bounds(messages, COMPACTION_KEEP_ROUNDS)?;
+        let (system_end, split) = compaction_region_bounds(messages, policy.keep_rounds)?;
         if split <= system_end {
             return None;
         }
@@ -2675,9 +2684,9 @@ impl AgentRunner {
         compacted.extend_from_slice(&messages[split..]);
         // F-902:主动压缩事件落 journal(观测面;before/after=全量消息字符数,
         // 与被动 trim 落账同口径)
+        let before: usize = messages.iter().map(|m| m.content().len()).sum();
+        let after: usize = compacted.iter().map(|m| m.content().len()).sum();
         if let Some(j) = journal {
-            let before: usize = messages.iter().map(|m| m.content().len()).sum();
-            let after: usize = compacted.iter().map(|m| m.content().len()).sum();
             if let Err(e) = j.compaction_performed(before, after, summary_generated) {
                 warn!(%session_id, error = %e, "compaction_performed journal failed (active)");
             }
@@ -2689,7 +2698,12 @@ impl AgentRunner {
             summary_generated,
             "D3: active compaction performed (threshold-driven)"
         );
-        Some(compacted)
+        Some(CompactionOutcome {
+            compacted,
+            before_chars: before,
+            after_chars: after,
+            summary_generated,
+        })
     }
 
     /// 会话终态标记（PayloadUpdate，append-only 不改既有事实）。
@@ -4166,6 +4180,7 @@ impl AgentRunner {
         let evorule_client = self.evorule_client.clone();
         let llm_handler = self.llm_handler.clone();
         let tool_handler = self.tool_handler.clone();
+        let agents_md_segment = self.agents_md_segment.clone();
         let memory = self.memory.clone();
         let delegate_context = self.delegate_context.clone();
         let message_persist_mode = self.message_persist_mode.clone();
@@ -4213,7 +4228,8 @@ impl AgentRunner {
                 evorule_client: evorule_client.clone(),
                 llm_handler: llm_handler.clone(),
                 tool_handler: tool_handler.clone(),
-                agents_md_segment: None,
+                // 项目记忆段随父继承(AGENTS.md 层级;与 delegate 通路同口径)
+                agents_md_segment: agents_md_segment.clone(),
                 plan_mode: false,
                 user_hooks: None,
                 memory: memory.clone(),
@@ -7754,9 +7770,10 @@ impl AgentRunner {
                                                // G1:流式调用 LLM
                                                // G2+G10:裁剪 messages(同 handle_call_external)
                                                // G10:如果有 summarizer,裁剪掉的消息生成摘要替换 hint
-                                               let messages_to_send = if let Some(ctx) = &runner.context_window {
+                                                   let messages_to_send = if let Some(ctx) = &runner.context_window {
                                                    // B21 D3:主动 compaction(阈值触发,先于被动 trim;
                                                    // None=未启用/未触发/无 summarizer——原消息直接走被动 trim)
+                                                   let mut compaction_note: Option<(usize, usize, bool)> = None;
                                                    let mut trim_result = match runner
                                                        .active_compaction(
                                                            &session_id,
@@ -7766,9 +7783,25 @@ impl AgentRunner {
                                                        )
                                                        .await
                                                    {
-                                                       Some(compacted) => ctx.trim_detailed(&compacted),
+                                                       Some(outcome) => {
+                                                           compaction_note = Some((
+                                                               outcome.before_chars,
+                                                               outcome.after_chars,
+                                                               outcome.summary_generated,
+                                                           ));
+                                                           ctx.trim_detailed(&outcome.compacted)
+                                                       }
                                                        None => ctx.trim_detailed(&messages),
                                                    };
+                                                   // 观测面:压缩发生即广播(前端一次性提示;与 journal
+                                                   // 落账同口径,批五 CompactionPerformed 观测件)
+                                                   if let Some((before, after, summary_generated)) = compaction_note {
+                                                       yield Ok(AgentEvent::CompactionPerformed {
+                                                           before_chars: before,
+                                                           after_chars: after,
+                                                           summary_generated,
+                                                       });
+                                                   }
                                                    if !trim_result.dropped.is_empty() {
                                                        info!(
                                                            dropped = trim_result.dropped.len(),
@@ -7817,6 +7850,26 @@ impl AgentRunner {
                                                // 语义与非流式 run() :3282 一致;R3-b/G-7 指令落链
                                                // (同指令去重,best-effort 留痕)
                                                let mut messages_to_send = messages_to_send;
+                                               // 上游护栏:无 User 轮的 chat 请求会被 provider 以
+                                               // invalid params 拒绝(实测 base_resp 2013)——极端小窗下
+                                               // 压缩+trim 级联可能裁光非 system 消息,此时从原始
+                                               // 历史补最后一条 User 起的最小段保底
+                                               if !messages_to_send
+                                                   .iter()
+                                                   .any(|m| matches!(m, Message::User { .. }))
+                                               {
+                                                   if let Some(last_user) = messages
+                                                       .iter()
+                                                       .rposition(|m| matches!(m, Message::User { .. }))
+                                                   {
+                                                       debug!(
+                                                           restored_tail = messages.len() - last_user,
+                                                           "view lost all user rounds; restoring minimal tail"
+                                                       );
+                                                       messages_to_send
+                                                           .extend_from_slice(&messages[last_user..]);
+                                                   }
+                                               }
                                                if let Some(validator) = &runner.output_validator {
                                                    let instruction = validator.instruction();
                                                    if !instruction.is_empty() {
@@ -9805,6 +9858,149 @@ pub(crate) fn runaway_restatement_block(
 /// 参数,与 rewind 预算同属可靠性底线)
 const COMPACTION_KEEP_ROUNDS: usize = 6;
 
+/// 主动压缩结果(压缩视图 + 观测元数据;CompactionPerformed 事件与
+/// journal 落账共用同一估算口径)
+pub struct CompactionOutcome {
+    /// 压缩后的消息视图(占位替换+摘要回注;权威历史不动,原文 journal 全存)
+    pub compacted: Vec<Message>,
+    /// 压缩前全量消息字符数估算
+    pub before_chars: usize,
+    /// 压缩后字符数估算
+    pub after_chars: usize,
+    /// 滚动摘要是否已生成
+    pub summary_generated: bool,
+}
+
+/// MessageRecord → translator Message(手动压缩的消息重建;附件图不参与——
+/// 历史消息的图在压缩场景可弃,正文与工具调用结构保留)
+fn messages_record_to_message(r: &crate::agent::memory::MessageRecord) -> Message {
+    match r.role.as_str() {
+        "user" => Message::User {
+            content: r.content.clone(),
+            images: Vec::new(),
+        },
+        "assistant" => Message::Assistant {
+            content: r.content.clone(),
+            tool_calls: r
+                .tool_calls
+                .as_ref()
+                .and_then(|tc| serde_json::from_value(tc.clone()).ok()),
+        },
+        "tool" => Message::Tool {
+            content: r.content.clone(),
+            tool_name: r.tool_name.clone().unwrap_or_default(),
+            images: Vec::new(),
+        },
+        _ => Message::System {
+            content: r.content.clone(),
+        },
+    }
+}
+
+/// 会话手动压缩(REST compact 端点后端;不持有 runner 的独立压缩入口)
+///
+/// 与 [`active_compaction`](Self::active_compaction) 同一套纪律:滚动摘要
+/// 经 AuditedLlm sidecar 审计链+summary_fidelity 对照+rolling_summary
+/// Payload 落账(G-3 种子回读——后续轮次的 active_compaction 直接命中
+/// 摘要缓存)。消息从会话 facts 投影重建(无阈值门槛,用户显式触发即
+/// 执行;消息过少拒绝)。观测面:fidelity scan 事件落 journal;
+/// compaction_performed 不落(standalone 无压缩视图,前后字符数不可比)。
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_session_now(
+    client: crate::api::evorule_client::EvoruleApiClient,
+    llm_handler: crate::io_handlers::LlmHandler,
+    summary_model: Option<String>,
+    namespace: &str,
+    session_id: &str,
+    journal_dir: &std::path::Path,
+) -> Result<serde_json::Value, String> {
+    let records = crate::api::session_index::load_transcript(&client, session_id, namespace)
+        .await
+        .map_err(|e| format!("transcript unavailable: {e}"))?;
+    if records.len() < 4 {
+        return Err(format!(
+            "session '{session_id}' has only {} messages; too short to compact",
+            records.len()
+        ));
+    }
+    let messages: Vec<Message> = records.iter().map(messages_record_to_message).collect();
+    let before: usize = messages.iter().map(|m| m.content().len()).sum();
+
+    let mut summarizer =
+        crate::agent::summarizer::ContextSummarizer::new(llm_handler.clone(), summary_model);
+    let audited = crate::agent::audited_llm::AuditedLlm::new(client.clone(), llm_handler);
+    summarizer = summarizer.with_auditor(audited);
+
+    // goal 取最后一条用户消息(压缩摘要的语境锚,与会话内路径同语义)
+    let goal = messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::User { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let outcome = summarizer
+        .summarize_dropped_with_purpose(&messages, &goal, "compaction")
+        .await
+        .map_err(|e| format!("compaction summary failed: {e}"))?;
+    let summary_text = outcome.formatted();
+    let summary_generated = summary_text.is_some();
+    let scan = crate::agent::summary_fidelity::scan(
+        &messages,
+        summary_text.as_deref().unwrap_or(""),
+        summary_text.is_none(),
+    );
+    // journal 观测面(fail-soft;进程既有 journal 文件按会话追加)
+    let journal = crate::agent::journal::JournalWriter::open(journal_dir, session_id).ok();
+    if let Some(j) = &journal {
+        let _ = j.summary_fidelity_scan(
+            session_id,
+            scan.trimmed_n,
+            scan.anchors_n,
+            scan.hit_n,
+            scan.ratio,
+            scan.summary_empty,
+        );
+    }
+    let mut gen = serde_json::Value::Null;
+    if let crate::agent::summarizer::SummarizeOutcome::Generated(meta) = &outcome {
+        gen = serde_json::json!(meta.gen);
+        let entry = serde_json::json!({
+            "gen": meta.gen,
+            "frozen_len_before": meta.frozen_len_before,
+            "frozen_len_after": meta.frozen_len_after,
+            "strategy_fingerprint": meta.strategy_fingerprint,
+            "parent_gen": meta.parent_gen,
+            "summary_text": meta.summary_text,
+        });
+        let mem = crate::agent::memory::MemoryManager::new(namespace, client.clone())
+            .with_session_id(session_id);
+        if let Err(e) = mem.save_rolling_summary(session_id, &entry).await {
+            warn!(
+                %session_id,
+                error = %e,
+                "manual compact: rolling summary landing failed (best-effort)"
+            );
+        }
+    }
+    let after: usize = summary_text
+        .as_ref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+    Ok(serde_json::json!({
+        "session_id": session_id,
+        "messages": records.len(),
+        "before_chars": before,
+        "after_chars": after,
+        "summary_generated": summary_generated,
+        "summary": summary_text,
+        "fidelity_ratio": scan.ratio,
+        "gen": gen,
+    }))
+}
+
 /// B21 D3:主动压缩策略(`longSession.compaction.*` 工作台设置键映射)。
 ///
 /// serve 面经 [`AgentRunner::with_compaction_policy`] 注入;CLI 路径不读
@@ -9818,6 +10014,8 @@ pub struct CompactionPolicy {
     pub threshold_pct: u32,
     /// 单次压缩最多清除的工具结果条数(0..=200,默认 20;0=不清除,仅摘要)
     pub max_clear_tool_results: usize,
+    /// 近摘要区保留的最近 User 轮数(默认 6;近摘要区=近期工作记忆全量保真)
+    pub keep_rounds: usize,
 }
 
 impl Default for CompactionPolicy {
@@ -9828,6 +10026,7 @@ impl Default for CompactionPolicy {
             enabled: false,
             threshold_pct: 70,
             max_clear_tool_results: 20,
+            keep_rounds: COMPACTION_KEEP_ROUNDS,
         }
     }
 }
@@ -9854,6 +10053,12 @@ impl CompactionPolicy {
             .and_then(serde_json::Value::as_f64)
         {
             p.max_clear_tool_results = (v.round() as i64).clamp(0, 200) as usize;
+        }
+        if let Some(v) = settings
+            .get("longSession.compaction.keepRounds")
+            .and_then(serde_json::Value::as_f64)
+        {
+            p.keep_rounds = (v.round() as i64).clamp(2, 50) as usize;
         }
         p
     }

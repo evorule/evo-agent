@@ -301,6 +301,36 @@ export function restoreCheckpoint(sid, cpId) {
   }).then(unwrap);
 }
 
+/** 引擎版本差异(检查点时间线的差异查看;{a,b,diff}) */
+export function getVersionDiff(sid, a, b) {
+  return fetch(
+    `/api/sessions/${encodeURIComponent(sid)}/diff?a=${a}&b=${b}`,
+    { headers: headers() }
+  ).then(unwrap);
+}
+
+/** 检查点 vs 当前版本差异(恢复前预览;{cp_version,current_version,diff}) */
+export function getCheckpointDiff(sid, cpId) {
+  return fetch(
+    `/api/sessions/${encodeURIComponent(sid)}/checkpoints/${cpId}/diff`,
+    { headers: headers() }
+  ).then(unwrap);
+}
+
+/** 手动压缩:对会话执行一次滚动摘要压缩({summary_generated,summary,fidelity_ratio};活跃轮 409) */
+export function compactSession(sid) {
+  return fetch(`/api/sessions/${encodeURIComponent(sid)}/compact`, {
+    method: 'POST',
+    headers: headers(),
+  }).then(unwrap);
+}
+
+/** 滚动摘要查看({rolling_summary};压缩产物面) */
+export function getCompaction(sid, agentType) {
+  const q = agentType ? `?agent_type=${encodeURIComponent(agentType)}` : '';
+  return fetch(`/api/sessions/${encodeURIComponent(sid)}/compaction${q}`, { headers: headers() }).then(unwrap);
+}
+
 // ===== 记忆用户主权面(stable.user.* 用户笔记;跨会话持久,召回权威最高) =====
 
 /** 用户笔记列表({count, notes:[{key,value,fact_id,version}]};null 墓碑已抑制) */
