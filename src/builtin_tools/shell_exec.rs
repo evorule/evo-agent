@@ -960,7 +960,7 @@ fn docker_exec_argv(container: &str, command: &str) -> Vec<String> {
     ]
 }
 
-/// 沙箱档解析结论(E-2 / design-36 §4.1)
+/// 沙箱档解析结论(E-2 沙箱设计 §4.1)
 ///
 /// `container` = tier-1 容器名(Some 即容器桥,trusted 档语义);None = tier-3
 /// 进程内防线裸跑(现行为)。`downgrade_reason` = auto 档降级原因(tier-1 或
@@ -976,7 +976,7 @@ pub struct SandboxResolution {
     pub appcontainer: bool,
 }
 
-/// 低盒首航清单(design-36 §6.4 职责分离:低盒只跑不可信计算型命令;
+/// 低盒首航清单(沙箱设计 §6.4 职责分离:低盒只跑不可信计算型命令;
 /// §6.1/§6.2 spike 实证 cargo 链闭环,git/script 类=待验证扩展,登记不实施)
 pub(crate) const LOWBOX_PROGRAMS: &[&str] = &["cargo", "rustc", "rustdoc"];
 
@@ -987,7 +987,7 @@ pub(crate) fn is_lowbox_program(program: &str) -> bool {
 
 /// 沙箱档位解析(纯函数:探测结论由调用方注入,便于测试与「探测一次落账」)
 ///
-/// 规则(design-36 §4.1,缺省不变式):
+/// 规则(沙箱设计 §4.1,缺省不变式):
 /// - `none`:现行为(tier-3),探测结论不消费;
 /// - `container`:强制容器桥——容器名缺失或 daemon 不可用即 Err(显式意志
 ///   不满足 = fail-fast 拒绝,不静默裸跑);
@@ -1052,7 +1052,7 @@ pub fn resolve_sandbox_tier(
         crate::config::ShellSandboxMode::AppContainer => {
             if !platform_supports_appcontainer {
                 return Err("shell.sandbox=appcontainer is only supported on Windows \
-                     (design-36 phase 3 lowbox face; refusing host fallback)"
+                     (sandbox phase 3 lowbox face; refusing host fallback)"
                     .to_string());
             }
             Ok(SandboxResolution {
@@ -1064,7 +1064,7 @@ pub fn resolve_sandbox_tier(
     }
 }
 
-/// docker daemon 可用性探测(进程内一次落账,design-36 §4.1 auto-detect)
+/// docker daemon 可用性探测(进程内一次落账,沙箱设计 §4.1 auto-detect)
 ///
 /// 探测 = `docker info --format ok`(daemon 不可达时 docker CLI 即时连接
 /// 拒绝快速失败);结果经 [`OnceLock`] 进程内缓存,装配期只探一次。
@@ -1612,7 +1612,7 @@ impl ShellExecTool {
 
     /// 实际执行命令(AppContainer 低盒后端,E-2 期3;仅 Windows 可达)
     ///
-    /// 职责分离(design-36 §6.4):调用方(call_sync)已按低盒首航清单分流,
+    /// 职责分离(沙箱设计 §6.4):调用方(call_sync)已按低盒首航清单分流,
     /// 本方法只承接清单内命令。执行链:workdir 遮蔽检查(与宿主同防护)→
     /// 宿主 PATH 定位绝对路径 → appcontainer::run_lowbox(profile per-execution
     /// + ACL 授权 + 环境块白名单 + PROC_THREAD_ATTRIBUTE 拉起,见
@@ -1915,7 +1915,7 @@ impl ShellExecTool {
         // E-2 期3:AppContainer 低盒后端(tier-2)——低盒首航清单(cargo 链)
         // 进低盒(sandbox=appcontainer 章);其余命令宿主回落,分类面/metachar/
         // 守卫全量照旧(落穿下方 Local 同路径,sandbox=none + 职责分离原因章;
-        // design-36 §6.4 职责分离)。网络面:低盒禁网由 OS 边界物理断绝
+        // 沙箱设计 §6.4 职责分离)。网络面:低盒禁网由 OS 边界物理断绝
         // (capabilities=None),强于 shell_net_guard 白名单,不另设守卫。
         if let ExecBackend::AppContainer = &self.backend {
             let parts: Vec<&str> = cmd_str.split_whitespace().collect();
@@ -1935,7 +1935,7 @@ impl ShellExecTool {
                 {
                     let _ = program;
                     return Err(
-                        "appcontainer lowbox face is windows-only (design-36 phase 3)".to_string(),
+                        "appcontainer lowbox face is windows-only (sandbox phase 3)".to_string(),
                     );
                 }
             }
@@ -2870,7 +2870,7 @@ mod tests {
         assert!(result.unwrap_err().contains("BLOCKED"));
     }
 
-    // === E-2(design-36 期2):沙箱档位解析与 fail-visible 打标 ===
+    // === E-2 期2:沙箱档位解析与 fail-visible 打标 ===
 
     #[test]
     fn test_shell_sandbox_mode_serde_lowercase_and_fail_fast() {
@@ -2991,7 +2991,7 @@ mod tests {
         assert!(err.contains("only supported on Windows"), "got: {err}");
     }
 
-    /// E-2 期3:低盒首航清单(design-36 §6.4 职责分离)——清单内进低盒,
+    /// E-2 期3:低盒首航清单(沙箱设计 §6.4 职责分离)——清单内进低盒,
     /// 清单外宿主回落;mark_audit 打章与 call_sync 路由共用本判定面
     #[test]
     fn test_lowbox_program_list() {

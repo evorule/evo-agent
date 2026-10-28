@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! E-2(design-36 期3):Windows AppContainer 低盒(tier-2)执行面
+//! E-2 期3:Windows AppContainer 低盒(tier-2)执行面
 //!
 //! ## 定位
 //!
 //! tier-1 容器桥(DockerExec)不可用时的 OS 级兜底:纯 Windows 能力,零外部
 //! 依赖(无 Docker/无虚拟机),覆盖 CLI/桌面直装用户。**职责分离形态**
-//! (design-36 §6.4 裁定):低盒只跑不可信计算型命令(首航清单 = cargo 链三件,
-//! spike 实证闭环见 design-36 §6.1/§6.2),git 等工作流编排留宿主面(mingw/
+//! (沙箱设计 §6.4 裁定):低盒只跑不可信计算型命令(首航清单 = cargo 链三件,
+//! spike 实证闭环见沙箱设计 §6.1/§6.2),git 等工作流编排留宿主面(mingw/
 //! MSYS2 运行时与 AppContainer 系统性不兼容,已隔离根因)。
 //!
 //! ## 全模块 unsafe 例外声明
@@ -22,7 +22,7 @@
 //! ## 边界语义(低盒内进程拿到的)
 //!
 //! - **网络物理断绝**:SECURITY_CAPABILITIES capabilities=None = 缺省禁网
-//!   (loopback 与外网双拒,design-36 §6.1 ③ 实证),比白名单守卫更强;
+//!   (loopback 与外网双拒,沙箱设计 §6.1 ③ 实证),比白名单守卫更强;
 //! - **文件系统**:仅 workdir(GENERIC_ALL,(OI)(CI) 继承)+ 工具链映像
 //!   (VS/SDK/cargo/rustup 根,RX)+ 系统默认可读面;其余全拒;
 //! - **环境块白名单**(§6.3):父环境白名单过滤构建,宿主密钥不入块
@@ -149,7 +149,7 @@ impl Drop for LocalFreeGuard {
     }
 }
 
-// ─────────────────── 环境块白名单(design-36 §6.3) ───────────────────
+// ─────────────────── 环境块白名单(沙箱设计 §6.3) ───────────────────
 
 /// 环境变量白名单(大小写不敏感匹配;§6.3 坑1:真实环境名 Path/windir/
 /// ComSpec 混合大小写,精确匹配会把 PATH 滤掉)。密钥面(LLM API key 等)
@@ -182,7 +182,7 @@ const ENV_WHITELIST: &[&str] = &[
 
 /// 构建低盒环境块(纯函数;父环境白名单过滤 + cargo 助推项并入)
 ///
-/// 规则(design-36 §6.3):
+/// 规则(沙箱设计 §6.3):
 /// - 父环境按白名单过滤(变量名大小写不敏感);`extra` 为宿主探测构造面
 ///   (MSVC 助推,非用户输入),后写覆盖同名项;
 /// - **必含 LOCALAPPDATA**(§6.3 坑2:低盒初始化定位
@@ -371,7 +371,7 @@ impl Drop for LowboxProfile {
     }
 }
 
-// ─────────────────── ACL 授权(design-36 §6.1 ②) ───────────────────
+// ─────────────────── ACL 授权(沙箱设计 §6.1 ②) ───────────────────
 
 /// SID 相等(两个 SID 都是 Win32 API 产物或其字节拷贝,布局有效)
 fn sid_eq(a: PSID, b: &SidBuf) -> bool {
@@ -561,7 +561,7 @@ fn grant_dir_access(dir: &Path, sid: &SidBuf, rights: u32) -> Result<(), String>
             return Err(format!(
                 "lowbox ACL grant failed on '{}' (access denied; likely an \
                  administrator-owned directory). Grant once from an elevated shell: \
-                 icacls \"{}\" /grant *{}:{flag}  — see design-36 §6.1",
+                 icacls \"{}\" /grant *{}:{flag}  — see sandbox design §6.1",
                 dir.display(),
                 dir.display(),
                 sid_string(sid)
@@ -636,7 +636,7 @@ fn grant_toolchain_rx(sid: &SidBuf, msvc_env: &[(String, String)]) -> Result<(),
         .clone()
 }
 
-// ─────────────────── VS/SDK 探测(cargo 助推,design-36 §6.2) ───────────────────
+// ─────────────────── VS/SDK 探测(cargo 助推,沙箱设计 §6.2) ───────────────────
 
 /// 版本号比较(目录名点分段数值序;段缺失按 0)
 fn cmp_version(a: &str, b: &str) -> Ordering {
@@ -657,7 +657,7 @@ fn cmp_version(a: &str, b: &str) -> Ordering {
     Ordering::Equal
 }
 
-/// 8.3 短路径(design-36 §6.2 栅栏 2:RUSTFLAGS 带空格路径被 cargo 分词
+/// 8.3 短路径(沙箱设计 §6.2 栅栏 2:RUSTFLAGS 带空格路径被 cargo 分词
 /// 切断——GetShortPathNameW 消除空格;卷禁用 8.3 生成时结果仍带空格,
 /// fail-visible 拒绝而非静默产出必败配置)
 fn short_path(p: &Path) -> Result<PathBuf, String> {
@@ -746,7 +746,7 @@ pub(crate) fn detect_msvc_env(
     let Some((_msvc_ver, vs_install, msvc_dir)) = best_msvc else {
         return Err(
             "MSVC toolchain not detected (VS BuildTools with C++ workload required \
-             for the lowbox cargo chain; see design-36 §6.2)"
+             for the lowbox cargo chain; see sandbox design §6.2)"
                 .to_string(),
         );
     };
@@ -776,7 +776,7 @@ pub(crate) fn detect_msvc_env(
     let Some((sdk_ver, sdk_dir)) = best_sdk else {
         return Err(
             "Windows SDK not detected (Lib\\<ver>\\um\\x64 + ucrt\\x64 required; \
-             see design-36 §6.2)"
+             see sandbox design §6.2)"
                 .to_string(),
         );
     };
@@ -1089,7 +1089,7 @@ unsafe fn spawn_lowbox(
             format!(
                 "CreateProcessW(appcontainer) failed: {e} (note: lowbox image access \
                  failure surfaces as ERROR_FILE_NOT_FOUND, not access denied — \
-                 design-36 §6.6)"
+                 sandbox design §6.6)"
             )
         })?;
     }
@@ -1186,7 +1186,7 @@ unsafe fn spawn_lowbox(
 mod tests {
     use super::*;
 
-    // === 环境块白名单(design-36 §6.3) ===
+    // === 环境块白名单(沙箱设计 §6.3) ===
 
     #[test]
     fn env_block_filters_secrets() {
@@ -1379,7 +1379,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    #[ignore = "真低盒验证:需 Windows + 本机 VS 工具链;cargo test -- --ignored 显式运行(design-36 期3 首航)"]
+    #[ignore = "真低盒验证:需 Windows + 本机 VS 工具链;cargo test -- --ignored 显式运行(沙箱期3 首航)"]
     fn appcontainer_lowbox_cargo_version() {
         let cargo = locate_program_in_path("cargo").expect("cargo in PATH");
         let workdir = tempfile::tempdir().unwrap();

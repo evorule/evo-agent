@@ -588,7 +588,7 @@ pub struct Config {
     /// 定时自治调度(纯确定性组件;触发后执行照常走既有管道与治理)
     pub schedule: crate::schedule::ScheduleConfig,
     #[serde(default)]
-    /// E-2(design-36 期2):shell 沙箱档配置(本地档;serve 面既有 per-request
+    /// E-2 期2:shell 沙箱档配置(本地档;serve 面既有 per-request
     /// 容器化路径不受影响)。缺省 = none = 现行为(缺省不变式)
     pub shell: ShellConfig,
     /// LLM API key 的来源记录(脱敏状态端点用;不携带任何密钥内容)
@@ -613,20 +613,20 @@ pub struct WorkbenchConfig {
     pub console_port: Option<u16>,
 }
 
-/// shell 沙箱档配置(E-2 / design-36 期2:tier-1 容器桥 / 期3:tier-2 低盒,
+/// shell 沙箱档配置(E-2 期2:tier-1 容器桥 / 期3:tier-2 低盒,
 /// 显式激活,缺省 tier-3)
 ///
 /// 红线正交:三层分类 / metachar 拒绝 / net_guard / 参数守卫在任何档位都生效
 /// (OS 边界是纵深第二道,不替代进程内防线)。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ShellConfig {
-    /// 沙箱档位(design-36 §4.1):
+    /// 沙箱档位(沙箱设计 §4.1):
     /// - `none`(缺省)= 进程内防线裸跑(现行为,结果打 sandbox=none 章);
     /// - `auto` = 探测 docker daemon,可用且有容器名即走容器桥(trusted 档
     ///   语义),否则降 tier-3 并随结果携带降级原因(fail-visible,不静默);
     /// - `container` = 强制容器桥,容器名缺失或 daemon 不可用即启动期报错
     ///   (显式意志不满足 = fail-fast,不静默裸跑);
-    /// - `appcontainer` = OS 低盒(仅 Windows;design-36 期3 职责分离形态:
+    /// - `appcontainer` = OS 低盒(仅 Windows;沙箱期3 职责分离形态:
     ///   低盒首航清单 cargo 链进低盒,其余命令宿主回落并 fail-visible 打标;
     ///   非 Windows 平台启动期报错)。
     #[serde(default)]
@@ -649,7 +649,7 @@ pub enum ShellSandboxMode {
     Auto,
     /// 强制容器桥(前提不满足启动期报错)
     Container,
-    /// OS 低盒(仅 Windows;design-36 期3 职责分离形态)
+    /// OS 低盒(仅 Windows;沙箱期3 职责分离形态)
     AppContainer,
 }
 
@@ -1257,7 +1257,7 @@ mod tests {
 
     #[test]
     fn test_shell_config_section_parse_and_defaults() {
-        // E-2(design-36 期2):[shell] 节——节整体缺失 = tier-3 现行为
+        // E-2 期2:[shell] 节——节整体缺失 = tier-3 现行为
         // (缺省不变式:缺省值必须等于现行为)
         let cfg: Config = toml::from_str("").unwrap();
         assert!(matches!(cfg.shell.sandbox, ShellSandboxMode::None));

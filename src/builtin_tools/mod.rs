@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-// E-2(design-36 期3):模块级 unsafe 哨兵由 forbid 降为 deny——allow 只能覆盖
+// E-2 期3:模块级 unsafe 哨兵由 forbid 降为 deny——allow 只能覆盖
 // deny,AppContainer 低盒面(builtin_tools::appcontainer)以模块内单点 allow
 // 显式收口,本模块其余子模块与 crate 其余面默认仍拒绝(每处 unsafe 须显式
 // allow 方可通过,审计面不扩大)
@@ -54,7 +54,7 @@
 //! 默认是"宁可功能少,也不可被滥用"。
 
 pub mod accounting;
-// E-2(design-36 期3):AppContainer 低盒执行面——全仓唯一显式 unsafe 收口点
+// E-2 期3:AppContainer 低盒执行面——全仓唯一显式 unsafe 收口点
 // (Win32 FFI 无 std 兑现形态);模块级哨兵由 forbid 降 deny,仅此模块内部 allow
 #[cfg(windows)]
 pub mod appcontainer;
@@ -138,13 +138,13 @@ pub fn default_safe_toolkit_with_profile(
         .expect("default shell sandbox (none) resolution is infallible")
 }
 
-/// E-2(design-36 期2):带 shell 沙箱档配置的装配
+/// E-2 期2:带 shell 沙箱档配置的装配
 ///
 /// 档位解析见 `shell_exec::resolve_sandbox_tier`:
 /// - `None`(缺省)/`none` = tier-3 现行为(装配产物与
 ///   [`default_safe_toolkit_with_profile`] 一致,仅结果多 sandbox=none 章);
 /// - `container`/`auto` 命中 tier-1 时 shell_exec 整体重绑容器桥
-///   (DockerExec + trusted 档语义,复用 design-17 既有表;超时对齐 serve 面
+///   (DockerExec + trusted 档语义,复用既有表;超时对齐 serve 面
 ///   600s 档)。**python_exec 不随动**:它无容器后端,仍在宿主执行,分类
 ///   基线维持调用方 profile(容器边界只覆盖 shell_exec 执行体,分类不放宽);
 /// - `appcontainer` = tier-2 低盒(仅 Windows;职责分离形态——低盒首航清单
@@ -283,7 +283,7 @@ fn default_safe_toolkit_core(
         "code_search",
         Arc::new(code_search::CodeSearchTool::unwired()),
     );
-    // E-2(design-36 期2/期3):shell_exec 档位装配——tier-1 容器桥(DockerExec +
+    // E-2 期2/期3:shell_exec 档位装配——tier-1 容器桥(DockerExec +
     // trusted 档语义,环境即隔离边界;超时对齐 serve 面容器桥 600s)/ tier-2
     // 低盒(AppContainer,职责分离:首航清单进低盒、其余宿主回落;profile 不重绑
     // ——宿主回落保持调用方分类基线,低盒路径边界语义自带;超时对齐 600s)/

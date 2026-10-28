@@ -702,7 +702,7 @@ fn cmd_run(
             }
         },
     };
-    // E-2(design-36 期2):shell 沙箱档接线(config [shell] 节;缺省 none =
+    // E-2 期2:shell 沙箱档接线(config [shell] 节;缺省 none =
     // 现行为;container 档前提不满足 / appcontainer 未实现 = 启动期 fail-fast,
     // 不静默裸跑)
     let mut tool_handler =

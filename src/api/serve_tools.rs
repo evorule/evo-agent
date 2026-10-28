@@ -132,7 +132,7 @@ pub fn build_union_toolkit_with_profile(
         .expect("default shell sandbox (none) resolution is infallible")
 }
 
-/// E-2(design-36 期2):带 shell 沙箱档配置的 union 装配(run 本地路径接线)
+/// E-2 期2:带 shell 沙箱档配置的 union 装配(run 本地路径接线)
 ///
 /// 档位解析/装配语义见 `builtin_tools::default_safe_toolkit_with_shell`;
 /// serve 面既有 per-request 容器化路径不受影响(见

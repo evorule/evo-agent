@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-// E-2(design-36 期3):crate 级 unsafe 哨兵由 forbid 降为 deny——allow 只能
+// E-2 期3:crate 级 unsafe 哨兵由 forbid 降为 deny——allow 只能
 // 覆盖 deny;全仓唯一 allow 点 = builtin_tools::appcontainer(OS 低盒 Win32
 // FFI 面,无 std 兑现形态),其余模块哨兵(各文件 #![forbid(unsafe_code)])
 // 逐文件保留不动,每处新 unsafe 仍须显式 allow 方可通过,审计面不扩大

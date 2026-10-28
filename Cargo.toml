@@ -121,7 +121,7 @@ tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
 fastembed = "7.1.1"
 
-# E-2(design-36 期3):AppContainer OS 低盒(仅 Windows 生效;Linux CI 不编译此依赖)
+# E-2 期3:AppContainer OS 低盒(仅 Windows 生效;Linux CI 不编译此依赖)
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -131,7 +131,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_System_Environment",
     "Win32_Storage_FileSystem",
-    # 工程化增补(design-36 §6.6 清单外):ReadFile → IO;CreatePipe → Pipes
+    # 工程化增补(沙箱设计 §6.6 清单外):ReadFile → IO;CreatePipe → Pipes
     # (LocalFree/SetHandleInformation 已在 Foundation,无需 Memory)
     "Win32_System_IO",
     "Win32_System_Pipes",
