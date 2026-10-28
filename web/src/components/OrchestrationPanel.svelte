@@ -14,8 +14,61 @@
     layoutTree,
     edgePath,
   } from '../lib/orchestration.js';
+  import { spawnBackgroundTask } from '../lib/api.js';
+  import { push as pushNotification } from '../lib/notifications.js';
 
   const STATUS_TEXT = { running: '执行中', done: '完成', failed: '失败', unknown: '未知' };
+
+  // ===== 后台任务直发(44 号方案乙:fork 父会话派生独立子会话) =====
+  let taskGoal = $state('');
+  let taskBusy = $state(false);
+  let taskErr = $state('');
+
+  async function dispatchTask() {
+    const goal = taskGoal.trim();
+    const sid = get(sessionId);
+    if (!goal || !sid || taskBusy) return;
+    taskBusy = true;
+    taskErr = '';
+    try {
+      const agentType = get(orchestration).agents?.find((a) => a.can_delegate)?.agent_type;
+      const r = await spawnBackgroundTask(agentType || 'general', goal, sid);
+      pushNotification('info', '后台任务已派发', `${r.child_session_id} · ${goal}`);
+      taskGoal = '';
+      await refreshOrchestration(sid);
+    } catch (e) {
+      taskErr = String(e?.message || e);
+    } finally {
+      taskBusy = false;
+    }
+  }
+
+  // ===== 后台任务完成通知:周期刷新 + spawn 节点收色跃迁检测 =====
+  let prevSpawnStatus = new Map();
+  $effect(() => {
+    if (!$sessionId) return;
+    const timer = setInterval(async () => {
+      const before = new Map(
+        get(orchestration)
+          .nodes.filter((n) => n.kind === 'spawn')
+          .map((n) => [n.session_id, n.status])
+      );
+      await refreshOrchestration(get(sessionId));
+      for (const n of get(orchestration).nodes) {
+        if (n.kind !== 'spawn') continue;
+        const was = before.get(n.session_id) || 'unknown';
+        if ((was === 'running' || was === 'unknown') && (n.status === 'done' || n.status === 'failed')) {
+          pushNotification(
+            'info',
+            `后台任务${n.status === 'done' ? '完成' : '失败'}`,
+            `派生会话 ${n.session_id} 已收尾，结果见会话列表`
+          );
+        }
+      }
+    }, 15000);
+    return () => clearInterval(timer);
+  });
+
 
   function nodeLabel(n) {
     if (n.parent === null || n.parent === undefined) return '本会话';
@@ -114,6 +167,22 @@
     </div>
   {/if}
 
+  <!-- 后台任务直发(44 号方案乙:fork 父会话派生独立子会话,护栏继承 spawn 链) -->
+  <div class="task-dispatch">
+    <input
+      class="task-goal"
+      type="text"
+      placeholder="后台任务目标(如:把测试套件跑完并汇总结果)…"
+      bind:value={taskGoal}
+      onkeydown={(e) => e.key === 'Enter' && dispatchTask()}
+      disabled={taskBusy || !$sessionId}
+    />
+    <button class="task-go" onclick={dispatchTask} disabled={taskBusy || !$sessionId || !taskGoal.trim()}>
+      {taskBusy ? '派发中…' : '后台派发'}
+    </button>
+  </div>
+  {#if taskErr}<div class="task-err">{taskErr}</div>{/if}
+
   {#if $orchestration.agents.length > 0 && hasChildren}
     <div class="orch-agents">
       {#each $orchestration.agents as a (a.agent_type)}
@@ -184,6 +253,43 @@
     min-height: 0;
     overflow: auto;
     padding: var(--sp-xs);
+  }
+  .task-dispatch {
+    display: flex;
+    gap: 6px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--border, #333);
+    flex-shrink: 0;
+  }
+  .task-goal {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    padding: 4px 8px;
+    background: var(--bg-input, #1c1c1c);
+    color: var(--fg, #ddd);
+    border: 1px solid var(--border, #3a3a3a);
+    border-radius: 4px;
+  }
+  .task-go {
+    font-size: 12px;
+    padding: 4px 12px;
+    cursor: pointer;
+    background: var(--accent, #b8860b);
+    border: 1px solid var(--accent, #b8860b);
+    color: #111;
+    border-radius: 4px;
+    white-space: nowrap;
+    font-weight: 600;
+  }
+  .task-go:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .task-err {
+    color: #e07070;
+    font-size: 11px;
+    padding: 2px 12px 4px;
   }
   .orch-legend {
     display: flex;

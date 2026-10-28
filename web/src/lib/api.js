@@ -301,6 +301,21 @@ export function restoreCheckpoint(sid, cpId) {
   }).then(unwrap);
 }
 
+/** 后台任务直发:fork 父会话派生独立子会话({child_session_id,status};护栏继承 spawn 链) */
+export function spawnBackgroundTask(agentType, goal, sessionId) {
+  return fetch(`/agents/${encodeURIComponent(agentType)}/spawn`, {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ goal, session_id: sessionId }),
+  }).then(unwrap);
+}
+
+/** 后台任务结果轻投影({result:{content,idx}|null}) */
+export function getSessionResult(sid, agentType) {
+  const q = agentType ? `?agent_type=${encodeURIComponent(agentType)}` : '';
+  return fetch(`/api/sessions/${encodeURIComponent(sid)}/result${q}`, { headers: headers() }).then(unwrap);
+}
+
 /** 引擎版本差异(检查点时间线的差异查看;{a,b,diff}) */
 export function getVersionDiff(sid, a, b) {
   return fetch(
