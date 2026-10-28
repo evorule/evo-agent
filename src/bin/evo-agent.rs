@@ -750,6 +750,10 @@ fn cmd_run(
             }
         }
 
+        // delegate 工具契约源:union toolkit 快照(from_definition 消费原值前克隆;
+        // delegate 内部按子定义 def.tools 白名单过滤)
+        let delegate_toolkit = tool_handler.clone();
+
         AgentRunner::from_definition(def.clone(), client.clone(), tool_handler, Some(llm_handler))
             .await
             .map(|r| {
@@ -762,7 +766,8 @@ fn cmd_run(
                     // capability_boundary+wire_accounting:general.json 等声明了
                     // "delegate" 工具但执行能力未注册(tool_call 无处解析),
                     // journal=None(子轨迹无账)——CLI/serve 不对称。
-                    // 治理段同源下放(子代理 S2 槽位与主 runner 同源,纪律无豁免面)。
+                    // 治理段:CLI 主路径无 S2 段,子代理同口径 None(delegate
+                    // 字段文档口径);serve 三面才存在治理段下放。
                     .with_journal_dir(workdir.join("data").join("sessions"))
                     .with_workspace_checkpoint(&workdir)
                     .with_delegate_context(
@@ -771,7 +776,14 @@ fn cmd_run(
                             mgr.clone(),
                             client.clone(),
                         )
-                        .with_journal_dir(workdir.join("data").join("sessions")),
+                        .with_journal_dir(workdir.join("data").join("sessions"))
+                        // 子代理工具契约(此前 CLI run 子代理零工具契约=
+                        // 纯文本执行器,与 serve 面 B25 缺陷同源)
+                        .with_toolkit(delegate_toolkit, workdir)
+                        // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
+                        .with_token_counter(std::sync::Arc::new(
+                            std::sync::atomic::AtomicU64::new(0),
+                        )),
                     )
                     .wire_accounting(workdir)
             })
@@ -3054,7 +3066,9 @@ fn cmd_workflow(
         .with_max_depth(max_depth)
         // 子代理事件流与主会话同目录落账(serve 面同口径;未接线时子代理
         // journal 缺位=子轨迹无账可查)
-        .with_journal_dir(workdir.join("data").join("sessions"));
+        .with_journal_dir(workdir.join("data").join("sessions"))
+        // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
+        .with_token_counter(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
     if max_concurrent > 0 {
         ctx = ctx.with_max_concurrent_delegates(max_concurrent);
     }

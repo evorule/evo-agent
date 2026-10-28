@@ -2380,7 +2380,7 @@ mod tests {
         {
             let p = JournalWriter::open(&dir, "sess-parent").unwrap();
             p.begin_turn("g").unwrap();
-            p.delegate_spawned("sess-child", "researcher", 1, "digest")
+            p.delegate_spawned("sess-child", "researcher", 1, "digest", None)
                 .unwrap();
             p.end_turn("ok", 1, 1).unwrap();
             let c = JournalWriter::open(&dir, "sess-child").unwrap();

@@ -955,7 +955,7 @@ async fn construct_runner(
         // B2:注入 skills manifest(read_skill 已注册进 filtered,清单喂 S4b 槽位)
         .with_skills(resolved_skills)
         // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位,不再内嵌基底)
-        .with_governance_segment(governance_segment)
+        .with_governance_segment(governance_segment.clone())
         // serve 面 delegate 执行能力接线(B25 批顺手修,CLI run 主路径同款镜像;
         // 与 agent_api run/stream 端点同口径——此前 WS 会话 LLM 不可见 delegate)
         .with_delegate_context(
@@ -964,7 +964,14 @@ async fn construct_runner(
                 state.definitions().clone(),
                 state.evorule_client().clone(),
             )
-            .with_journal_dir(state.workdir().join("data").join("sessions")),
+            .with_journal_dir(state.workdir().join("data").join("sessions"))
+            // 子代理工具契约:union toolkit 快照下放(delegate 内部按子定义
+            // def.tools 白名单过滤——此前子代理零工具契约=纯文本执行器)
+            .with_toolkit((*state.toolkit()).clone(), state.workdir())
+            // 治理段同源下放(子代理 S2 槽位与主 runner 同源,纪律无豁免面)
+            .with_governance_segment(governance_segment)
+            // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
+            .with_token_counter(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
         );
     // PR-H4 验收修复:WS 流式路径此前从未消费 def.context_window_tokens——
     // max_context_tokens 停在 AgentRunner::new 字段默认 8192,context_window

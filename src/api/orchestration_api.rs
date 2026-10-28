@@ -395,6 +395,7 @@ mod tests {
                     agent_type: "researcher".into(),
                     depth: 1,
                     task_digest: "d1".into(),
+                    tokens_used: None,
                 },
             ),
             line(
