@@ -33,10 +33,15 @@ function Assert-Clean([string]$name, [string]$repo) {
     & git -C $repo diff --quiet 2>$null
     if ($LASTEXITCODE -ne 0) {
         $script:violations += "${name}: 存在未提交改动(git diff 非空)——发版不得携带无版本 bits"
+        Write-Host "[freshness-diag] ${name} git diff --stat (first 8):"
+        & git -C $repo diff --stat 2>$null | Select-Object -First 8 | ForEach-Object { Write-Host "  $_" }
+        Write-Host ("[freshness-diag] {0} autocrlf=[{1}] git=[{2}]" -f $name, (& git -C $repo config core.autocrlf 2>$null), (& git --version 2>$null))
     }
     & git -C $repo diff --cached --quiet 2>$null
     if ($LASTEXITCODE -ne 0) {
         $script:violations += "${name}: 存在已暂存未提交(git diff --cached 非空)"
+        Write-Host "[freshness-diag] ${name} git diff --cached --stat (first 8):"
+        & git -C $repo diff --cached --stat 2>$null | Select-Object -First 8 | ForEach-Object { Write-Host "  $_" }
     }
 }
 
