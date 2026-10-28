@@ -402,11 +402,55 @@ pub fn fire_job(exe: &Path, workdir: &Path, job: &ScheduleJob) -> Result<i32, St
             cmd.arg("--").arg(job.goal.as_deref().unwrap_or(""));
         }
     }
-    // 子进程输出直通本进程 stdio（运维诚实性：任务日志可见，不吞）
-    let st = cmd
-        .status()
+    // 超时强杀：timeout_secs（缺省 600s）到点强杀子进程——否则单个挂死任务
+    // 会以阻塞等待方式永久卡死 run_loop，后续所有分钟的调度全部停摆，恰是
+    // 「单任务故障不拖垮其余任务」承诺唯一兜不住的情形。强杀以 Err 返回
+    // （带任务名与预算），run_loop 照常留痕并继续后续任务。
+    // 子进程输出直通本进程 stdio（运维诚实性：任务日志可见，不吞）——
+    // spawn 继承父 stdio，与旧阻塞等待的直通语义一致。
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("拉起子进程失败 {}: {e}", exe.display()))?;
-    Ok(st.code().unwrap_or(-1))
+    match wait_child_with_timeout(&mut child, Duration::from_secs(job.timeout_secs))? {
+        ChildOutcome::Exited(st) => Ok(st.code().unwrap_or(-1)),
+        ChildOutcome::TimedOut => Err(format!(
+            "任务 `{}` 超时（{}s）已强杀——run_loop 不被单个挂死任务阻塞",
+            job.name, job.timeout_secs
+        )),
+    }
+}
+
+/// 子进程等待结局
+pub enum ChildOutcome {
+    /// 预算内自然退出
+    Exited(std::process::ExitStatus),
+    /// 超预算被强杀（kill+收尸已在此函数内完成，调用方无须再 wait）
+    TimedOut,
+}
+
+/// 带预算的子进程等待：预算内轮询 `try_wait`，到点 `kill` 并收尸。
+/// 轮询间隔 200ms（调度粒度是分钟级，轮询开销可忽略）。
+pub fn wait_child_with_timeout(
+    child: &mut std::process::Child,
+    budget: Duration,
+) -> Result<ChildOutcome, String> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| format!("等待子进程失败: {e}"))?
+        {
+            Some(st) => return Ok(ChildOutcome::Exited(st)),
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // 收尸防僵尸
+                    return Ok(ChildOutcome::TimedOut);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
 }
 
 /// 调度主循环（阻塞；每 tick_secs 对账一次）。留痕失败/任务失败都不中断循环
@@ -624,5 +668,55 @@ mod tests {
         );
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20648), (2026, 7, 14));
+    }
+}
+
+#[cfg(test)]
+mod wait_timeout_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use std::process::Command;
+
+    fn long_running_cmd() -> Command {
+        if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "ping", "-n", "5", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 5"]);
+            c
+        }
+    }
+
+    fn quick_exit_cmd() -> Command {
+        if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "exit 0"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "exit 0"]);
+            c
+        }
+    }
+
+    #[test]
+    fn wait_timeout_kills_runaway_child() {
+        let mut child = long_running_cmd().spawn().unwrap();
+        match wait_child_with_timeout(&mut child, Duration::from_millis(300)).unwrap() {
+            ChildOutcome::TimedOut => {}
+            ChildOutcome::Exited(_) => panic!("5s 子进程不应在 300ms 预算内自然退出"),
+        }
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn wait_returns_normally_on_quick_exit() {
+        let mut child = quick_exit_cmd().spawn().unwrap();
+        match wait_child_with_timeout(&mut child, Duration::from_secs(10)).unwrap() {
+            ChildOutcome::Exited(st) => assert_eq!(st.code(), Some(0)),
+            ChildOutcome::TimedOut => panic!("立即退出的子进程不应被判超时"),
+        }
     }
 }
