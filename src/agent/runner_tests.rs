@@ -31,7 +31,13 @@ fn test_agent_config_default() {
     assert_eq!(config.agent_type, "default");
     assert_eq!(config.model, "gpt-4o-mini");
     assert!((config.temperature - 0.7).abs() < 0.01);
-    assert_eq!(config.max_steps, 10);
+    assert_eq!(config.max_steps, 50);
+    // agent 定义显式覆盖通道仍然生效（definition max_steps 必填，显式值直通 config）
+    let override_cfg = AgentConfig {
+        max_steps: 10,
+        ..AgentConfig::default()
+    };
+    assert_eq!(override_cfg.max_steps, 10);
     // 缺省 0=不限步超时
     assert!(config.step_timeout.is_zero());
     assert!(config.tool_names.is_empty());
@@ -1933,10 +1939,12 @@ async fn test_g13_execute_parallel_caches_active_tools() {
         ToolCall {
             name: "delayed_a".to_string(),
             arguments: serde_json::json!({}),
+            id: None,
         },
         ToolCall {
             name: "delayed_b".to_string(),
             arguments: serde_json::json!({}),
+            id: None,
         },
     ];
 
@@ -1971,6 +1979,7 @@ async fn test_g13_execute_parallel_skips_candidate_cache() {
     let tool_calls = vec![ToolCall {
         name: "dangerous".to_string(),
         arguments: serde_json::json!({"command": "rm"}),
+        id: None,
     }];
 
     let results = runner
@@ -2065,6 +2074,7 @@ async fn test_g13_cache_hit_reruns_adjudication_for_p2_tools() {
     let tool_calls = vec![ToolCall {
         name: "git_stage".to_string(),
         arguments: args.clone(),
+        id: None,
     }];
 
     // 第一次调用:并行预执行=管道并行实例——P2 意图提交#1,真实执行(非占位),
@@ -2198,6 +2208,7 @@ async fn mcp_dynamic_tool_produces_intent_adjudication() {
     let tool_calls = vec![ToolCall {
         name: "mcp_test_echo".to_string(),
         arguments: serde_json::json!({}),
+        id: None,
     }];
     let results = runner
         .execute_tools_parallel("test-session", &tool_calls)
@@ -2242,6 +2253,7 @@ async fn downgraded_dynamic_tool_executes_without_intent() {
     let tool_calls = vec![ToolCall {
         name: "mcp_test_echo".to_string(),
         arguments: serde_json::json!({}),
+        id: None,
     }];
     let results = runner
         .execute_tools_parallel("test-session", &tool_calls)
@@ -2500,14 +2512,17 @@ async fn test_g13_parallel_faster_than_serial() {
         ToolCall {
             name: "t1".to_string(),
             arguments: serde_json::json!({}),
+            id: None,
         },
         ToolCall {
             name: "t2".to_string(),
             arguments: serde_json::json!({}),
+            id: None,
         },
         ToolCall {
             name: "t3".to_string(),
             arguments: serde_json::json!({}),
+            id: None,
         },
     ];
 

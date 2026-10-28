@@ -427,6 +427,7 @@ mod tests {
             tool_calls: Some(vec![ToolCall {
                 name: tool_name.to_string(),
                 arguments: json!({"q": "test"}),
+                id: None,
             }]),
         }
     }
@@ -593,14 +594,17 @@ mod tests {
                 ToolCall {
                     name: "search".to_string(),
                     arguments: json!({"q": "test"}),
+                    id: None,
                 },
                 ToolCall {
                     name: "search".to_string(),
                     arguments: json!({"q": "test"}),
+                    id: None,
                 },
                 ToolCall {
                     name: "search".to_string(),
                     arguments: json!({"q": "test"}),
+                    id: None,
                 },
             ]),
         };

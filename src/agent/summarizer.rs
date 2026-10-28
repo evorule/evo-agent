@@ -1049,6 +1049,7 @@ mod tests {
                 tool_calls: Some(vec![ToolCall {
                     name: "search".to_string(),
                     arguments: json!({"q": "北京天气"}),
+                    id: None,
                 }]),
             },
             Message::Tool {

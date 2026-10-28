@@ -69,6 +69,11 @@ pub struct ToolCall {
     #[serde(rename = "args")]
     /// Tool arguments
     pub arguments: Value,
+    /// Provider 原生 tool_call id（真 id 保真：归一层透传、wire 重组按 id 直配；
+    /// 旧形状记录无此键 → None。serde 缺省 + 序列化省略，无 id 时与旧形状
+    /// 逐字节一致）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// 图片旁路载荷（B1 多模态上行：工具结果提取，不进 content 字符串）
@@ -143,6 +148,24 @@ impl LlmResponse {
         )
     }
 
+    /// 输出被生成长度上限截断（length/max_tokens 终态；`is_finished` 判据不动，
+    /// 本方法只做分类补充——截断的半截输出不得被当作完整回答继续流转）
+    pub fn is_truncated(&self) -> bool {
+        matches!(
+            self.finish_reason.as_deref(),
+            Some("length") | Some("max_tokens")
+        )
+    }
+
+    /// 内容被安全策略拦截或 provider 上报错误终态（消费侧应 fail-visible 显式失败，
+    /// 不得把空/残缺内容静默当正常回答继续流转；`is_finished` 判据不动）
+    pub fn is_content_blocked(&self) -> bool {
+        matches!(
+            self.finish_reason.as_deref(),
+            Some("content_filter") | Some("error")
+        )
+    }
+
     /// Extract response content
     pub fn extract_content(&self) -> String {
         self.content.clone()
@@ -198,6 +221,7 @@ mod tests {
             tool_calls: Some(vec![ToolCall {
                 name: "search".to_string(),
                 arguments: serde_json::json!({"query": "test"}),
+                id: None,
             }]),
             finish_reason: None,
             token_usage: None,
@@ -280,5 +304,76 @@ mod tests {
         }"#;
         let calls = extract_tool_calls(json).expect("extract");
         assert!(calls.is_empty());
+    }
+
+    /// ToolCall id 字段 serde 往返:有 id 序列化保留/反序列化还原;无 id 时
+    /// 序列化省略键(与旧形状逐字节一致)、反序列化缺省 None
+    #[test]
+    fn test_tool_call_id_serde_roundtrip() {
+        let with_id = ToolCall {
+            name: "search".to_string(),
+            arguments: serde_json::json!({"q": "x"}),
+            id: Some("call_abc".to_string()),
+        };
+        let ser = serde_json::to_string(&with_id).expect("serialize");
+        assert!(ser.contains("\"id\":\"call_abc\""));
+        let back: ToolCall = serde_json::from_str(&ser).expect("deserialize");
+        assert_eq!(back, with_id);
+
+        let without_id = ToolCall {
+            name: "search".to_string(),
+            arguments: serde_json::json!({"q": "x"}),
+            id: None,
+        };
+        let ser = serde_json::to_string(&without_id).expect("serialize");
+        assert!(!ser.contains("\"id\""), "id 键在 None 时不得出现: {ser}");
+        let back: ToolCall = serde_json::from_str(&ser).expect("deserialize");
+        assert_eq!(back.id, None);
+    }
+
+    /// finish_reason=length|max_tokens → 生成上限截断判据
+    #[test]
+    fn test_llm_response_is_truncated() {
+        for reason in ["length", "max_tokens"] {
+            let resp = LlmResponse {
+                content: "half".to_string(),
+                tool_calls: None,
+                finish_reason: Some(reason.to_string()),
+                token_usage: None,
+            };
+            assert!(resp.is_truncated(), "{reason} 应判截断");
+        }
+        for reason in ["stop", "end_turn", "tool_call", "content_filter"] {
+            let resp = LlmResponse {
+                content: "x".to_string(),
+                tool_calls: None,
+                finish_reason: Some(reason.to_string()),
+                token_usage: None,
+            };
+            assert!(!resp.is_truncated(), "{reason} 不应判截断");
+        }
+    }
+
+    /// finish_reason=content_filter|error → 内容阻断 fail-visible 判据
+    #[test]
+    fn test_llm_response_is_content_blocked() {
+        for reason in ["content_filter", "error"] {
+            let resp = LlmResponse {
+                content: "".to_string(),
+                tool_calls: None,
+                finish_reason: Some(reason.to_string()),
+                token_usage: None,
+            };
+            assert!(resp.is_content_blocked(), "{reason} 应判阻断");
+        }
+        for reason in ["stop", "end_turn", "length", "max_tokens"] {
+            let resp = LlmResponse {
+                content: "x".to_string(),
+                tool_calls: None,
+                finish_reason: Some(reason.to_string()),
+                token_usage: None,
+            };
+            assert!(!resp.is_content_blocked(), "{reason} 不应判阻断");
+        }
     }
 }

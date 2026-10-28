@@ -50,6 +50,7 @@ pub mod tool_manifest;
 pub mod tool_retry;
 pub mod tool_trace;
 pub mod translator;
+pub mod usage_counter;
 pub mod user_hooks;
 pub mod verify;
 pub mod wire_attestation;

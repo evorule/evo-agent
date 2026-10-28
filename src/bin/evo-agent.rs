@@ -1852,6 +1852,9 @@ fn cmd_run_blocking(
 
     match final_result {
         Some(result) => {
+            if let Some(t) = &result.tokens {
+                eprintln!("[tokens] prompt={} completion={} total={}", t.prompt, t.completion, t.total);
+            }
             let json = match serde_json::to_string_pretty(&result) {
                 Ok(s) => s,
                 Err(e) => {
@@ -2006,6 +2009,9 @@ fn cmd_run_streaming(
 
     match final_result {
         Some(result) => {
+            if let Some(t) = &result.tokens {
+                eprintln!("[tokens] prompt={} completion={} total={}", t.prompt, t.completion, t.total);
+            }
             // 最终结果以 JSON 输出到 stdout
             let json = match serde_json::to_string_pretty(&result) {
                 Ok(s) => s,
@@ -2054,7 +2060,13 @@ fn cmd_run_json(
         while let Some(event) = event_stream.next().await {
             // 终帧退出码先行登记(借检查在消费前结束,事件随后被序列化)
             match &event {
-                Ok(AgentEvent::Done(result)) => final_success = Some(result.success),
+                Ok(AgentEvent::Done(result)) => {
+                    final_success = Some(result.success);
+                    if let Some(t) = &result.tokens {
+                        // 人读补充行走 stderr；stdout 只承载事件帧（Done 帧内已含 tokens 字段）
+                        eprintln!("[tokens] prompt={} completion={} total={}", t.prompt, t.completion, t.total);
+                    }
+                }
                 Err(_) => final_success = Some(false),
                 _ => {}
             }
@@ -3926,7 +3938,10 @@ fn run_repl_turn(
                 Ok(AgentEvent::Info(msg)) => {
                     eprintln!("[info: {}]", msg);
                 }
-                Ok(AgentEvent::Done(_result)) => {
+                Ok(AgentEvent::Done(result)) => {
+                    if let Some(t) = &result.tokens {
+                        eprintln!("[tokens] prompt={} completion={} total={}", t.prompt, t.completion, t.total);
+                    }
                     break;
                 }
                 Err(e) => {

@@ -479,7 +479,11 @@ impl Default for AgentConfig {
             system_prompt: "You are a helpful assistant".to_string(),
             model: "gpt-4o-mini".to_string(),
             temperature: 0.7,
-            max_steps: 10,
+            // 步数预算缺省上调（10 → 50）：真实多工具任务在 10 步内跑不完即熔断，
+            // 对标主流 agent 循环预算量级；agent 定义文件仍逐显式覆盖（definition
+            // max_steps 为必填字段，显式值零影响）。缺省值回归锁见
+            // runner_tests::test_agent_config_default。
+            max_steps: 50,
             // 缺省 0=不限步超时——60s 缺省与 LLM 最坏预算（request_timeout
             // × 尝试数 + 退避）矛盾系 step_budget_mismatch 启动断言自白的历史遗留；
             // 单轮长跑的真实保护层=engine io_error_timeout + 超时类 Error 续跑兜底。
@@ -569,6 +573,11 @@ pub struct AgentResult {
     pub error: Option<String>,
     /// 是否为用户取消(区别于执行失败)
     pub cancelled: bool,
+    /// 收尾 token 三元组快照（provider 真值累计；usage 计数器在位时填充，
+    /// 否则 None。journal TokenRecord 复用类型，零新采集。None 不序列化，
+    /// 计数器未接线时 JSON 输出面逐字节不变）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<crate::agent::journal::TokenRecord>,
 }
 
 impl AgentResult {
@@ -587,6 +596,7 @@ impl AgentResult {
             tool_calls,
             error: None,
             cancelled: false,
+            tokens: None,
         }
     }
 
@@ -600,6 +610,7 @@ impl AgentResult {
             tool_calls: Vec::new(),
             error: Some(error),
             cancelled: false,
+            tokens: None,
         }
     }
 
@@ -613,6 +624,7 @@ impl AgentResult {
             tool_calls: Vec::new(),
             error: Some(error),
             cancelled: true,
+            tokens: None,
         }
     }
 }
@@ -689,6 +701,7 @@ fn parse_tool_calls_from_json(
         return Some(vec![crate::agent::translator::ToolCall {
             name: name.to_string(),
             arguments: args,
+            id: None,
         }]);
     }
 
@@ -702,6 +715,7 @@ fn parse_tool_calls_from_json(
         return Some(vec![crate::agent::translator::ToolCall {
             name: name.to_string(),
             arguments: args,
+            id: None,
         }]);
     }
 
@@ -722,6 +736,7 @@ fn parse_tool_calls_from_json(
                 calls.push(crate::agent::translator::ToolCall {
                     name: name.to_string(),
                     arguments: args,
+                    id: None,
                 });
             }
         }
@@ -1177,6 +1192,9 @@ pub struct AgentRunner {
     /// 保留 system + 最近若干轮(含 tool_call/tool_result 原子对)。
     /// `None` 时不裁剪(向后兼容旧行为)。
     context_window: Option<ContextWindowManager>,
+    /// usage 真值计数器共享句柄（与 ContextWindowManager 内计数器同源状态）：
+    /// 每次 LLM 响应喂入 provider 真值 → 压缩决策真值驱动 + 收尾三元组输出
+    usage_counter: Option<std::sync::Arc<crate::agent::usage_counter::UsageAwareTokenCounter>>,
     /// G10:上下文摘要器(记忆压缩)
     ///
     /// `Some` 时,裁剪掉的消息会送给摘要 LLM 生成摘要,替换 `[earlier N messages trimmed]` 提示。
@@ -1448,6 +1466,7 @@ impl AgentRunner {
             pending_messages: Vec::new(),
             summary_model: None,
             context_window: None,
+            usage_counter: None,
             summarizer: None,
             cancel_token: CancellationToken::new(),
             output_validator: None,
@@ -2118,7 +2137,17 @@ impl AgentRunner {
             }
         };
         let reserve = max_tokens * self.assembly.reserve_for_response_pct() as usize / 100;
-        let ctx_mgr = ContextWindowManager::with_approx_counter(
+        // usage 真值计数器注入：压缩决策真值驱动（provider 真值滑动窗口校准，
+        // 冷启动回落近似计数）+ 收尾三元组输出；与 ContextWindowManager 共享
+        // 同一计数器状态（observe 句柄 = runner 侧 Arc）
+        let usage_counter = std::sync::Arc::new(
+            crate::agent::usage_counter::UsageAwareTokenCounter::new_fallback(Box::new(
+                crate::agent::context_window::ApproxTokenCounter::new(),
+            )),
+        );
+        self.usage_counter = Some(usage_counter.clone());
+        let ctx_mgr = ContextWindowManager::new(
+            Box::new(usage_counter),
             max_tokens,
             reserve,
             TrimStrategy::KeepSystemKeepLast,
@@ -3601,9 +3630,12 @@ impl AgentRunner {
 
                     info!(%session_id, content_len = content.len(), "Received Stable event, execution complete");
                     self.submit_tool_traces(&session_id).await;
-                    return Ok(AgentResult::success(
+                    let mut result = AgentResult::success(
                         content, step_count, duration, tool_calls,
-                    ));
+                    );
+                    // 真值计量收尾：usage_counter 若已接线，快照累计 token 记录随结果外送
+                    result.tokens = self.usage_counter.as_ref().map(|c| c.snapshot());
+                    return Ok(result);
                 }
                 "StateTransition" => {
                     info!(%session_id, "State transition occurred");
@@ -4218,7 +4250,15 @@ impl AgentRunner {
                     }
                 }
             });
-            let context_window = Some(ContextWindowManager::with_approx_counter(
+            // usage 真值计数器注入（子 runner 独立实例，与主 runner 同构；
+            // 压缩决策真值驱动 + 收尾三元组输出）
+            let usage_counter = std::sync::Arc::new(
+                crate::agent::usage_counter::UsageAwareTokenCounter::new_fallback(Box::new(
+                    crate::agent::context_window::ApproxTokenCounter::new(),
+                )),
+            );
+            let context_window = Some(ContextWindowManager::new(
+                Box::new(usage_counter.clone()),
                 max_context_tokens,
                 reserve,
                 TrimStrategy::KeepSystemKeepLast,
@@ -4243,6 +4283,7 @@ impl AgentRunner {
                 summary_model: summary_model.clone(),
                 execution_profile: None,
                 context_window,
+                usage_counter: Some(usage_counter),
                 summarizer: summarizer.clone(),
                 compaction_policy: None,
                 cancel_token: CancellationToken::new(),
@@ -4757,6 +4798,24 @@ impl AgentRunner {
             }
         }
 
+        // usage 真值喂入:provider 真值入滑动窗口 → 压缩决策真值驱动 +
+        // 收尾三元组累计（与 ContextWindowManager 内计数器同源状态）
+        if let Some(counter) = &self.usage_counter {
+            if let Some(usage) = &llm_response.token_usage {
+                counter.observe(usage);
+            }
+        }
+
+        // finish_reason=content_filter/error:fail-visible 显式失败——被安全策略
+        // 拦截或 provider 报错终态的内容不得当正常回答流转（上抛后由调用层
+        // 提交 error io_response,审计链照常记录）
+        if llm_response.is_content_blocked() {
+            return Err(AgentError::Internal(format!(
+                "LLM response terminated by provider (finish_reason: {})",
+                llm_response.finish_reason.as_deref().unwrap_or("unknown")
+            )));
+        }
+
         // G11:结构化输出校验
         // 先提取校验结果(owned data),释放 &self.output_validator 的借用,
         // 才能后续 &mut self.output_format_retries / persist_message
@@ -4858,6 +4917,19 @@ impl AgentRunner {
                 effective_tool_calls = Some(parsed);
                 final_content = String::new();
             }
+        }
+
+        // finish_reason=length（生成长度截断）:半截输出双可见化——结果面与
+        // 消息历史同带截断标记,不冒充完整回答(循环自然终止;is_tool_call
+        // 判据不变,截断文本中的可解析 tool call 仍走既有 fallback 解析)
+        if llm_response.is_truncated()
+            && effective_tool_calls
+                .as_ref()
+                .map(|t| t.is_empty())
+                .unwrap_or(true)
+        {
+            final_content
+                .push_str("\n\n[输出因达到生成长度上限被截断,内容可能不完整]");
         }
 
         let assistant_idx = messages.len();
@@ -8139,6 +8211,14 @@ impl AgentRunner {
                                                    }
                                                }
 
+                                               // usage 真值喂入:provider 真值入滑动窗口 → 压缩
+                                               // 决策真值驱动 + 收尾三元组累计（流式路径）
+                                               if let Some(counter) = &runner.usage_counter {
+                                                   if let Some(usage) = &react_tokens {
+                                                       counter.observe(usage);
+                                                   }
+                                               }
+
                                                // B21:llm_called 事件(provider 真值优先,tokens_est 兜底;
                                                // purpose=react,One-LLM-per-step 映射依据)
                                                if let Some(j) = &journal {
@@ -8303,7 +8383,7 @@ impl AgentRunner {
                                                                                        }
                                                                                    }
                                                                                };
-                                                                               let full_content = g11_validated_content;
+                                                                               let mut full_content = g11_validated_content;
 
                                                                                let assistant_idx = messages.len();
                                                                                let assistant_msg = Message::Assistant {
@@ -8660,12 +8740,14 @@ impl AgentRunner {
                                                                    tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
                                                                }
                                                                runner.submit_tool_traces(&session_id).await;
-                                                               yield Ok(AgentEvent::Done(AgentResult::success(
+                                                               let mut plan_result = AgentResult::success(
                                                                    "计划已提交,等待用户批准或拒绝。".to_string(),
                                                                    step_count,
                                                                    duration,
                                                                    tool_calls.clone(),
-                                                               )));
+                                                               );
+                                                               plan_result.tokens = runner.usage_counter.as_ref().map(|c| c.snapshot());
+                                                               yield Ok(AgentEvent::Done(plan_result));
                                                                return;
                                                            }
                                                        }
@@ -8697,6 +8779,47 @@ impl AgentRunner {
                                                    }
                                                    // 所有 tool 结果已入列 messages,回喂轮 LLM 将看到它们
                                                    continue 'react;
+                                               }
+
+                                               // finish_reason 终态分支（is_tool_call 判据不变）:
+                                               // content_filter/error → fail-visible 显式失败
+                                               // （error io_response + yield Error,审计链照常记录;
+                                               // 被拦截/错误终态内容不得当正常回答流转）
+                                               if matches!(
+                                                   finish_reason.as_deref(),
+                                                   Some("content_filter") | Some("error")
+                                               ) {
+                                                   let err_str = format!(
+                                                       "LLM response terminated by provider (finish_reason: {})",
+                                                       finish_reason.as_deref().unwrap_or("unknown")
+                                                   );
+                                                   if let Some(rid) = request_id {
+                                                       let _ = runner.evorule_client
+                                                           .submit_io_response(
+                                                               &session_id,
+                                                               rid,
+                                                               &serde_json::json!({"error": &err_str}),
+                                                               Some(err_str.as_str()),
+                                                           )
+                                                           .await;
+                                                   }
+                                                   yield Err(AgentError::EvoruleError(err_str));
+                                                   return;
+                                               }
+
+                                               // finish_reason=length（生成长度截断）:半截输出
+                                               // 双可见化——结果面与消息历史同带截断标记,
+                                               // 不冒充完整回答（收尾自然终止）
+                                               if matches!(
+                                                   finish_reason.as_deref(),
+                                                   Some("length") | Some("max_tokens")
+                                               ) {
+                                                   full_content.push_str(
+                                                       "\n\n[输出因达到生成长度上限被截断,内容可能不完整]",
+                                                   );
+                                                   messages.push(Message::System {
+                                                       content: "[上一条 assistant 输出因达到生成长度上限被截断,内容可能不完整]".to_string(),
+                                                   });
                                                }
 
                                                // 无 tool_calls:产出最终 content,提交 io_response 收尾
@@ -9243,9 +9366,12 @@ impl AgentRunner {
                                        if let Some(g) = turn_guard.take() {
                                            g.end("success", step_count as u64, duration);
                                        }
-                                       yield Ok(AgentEvent::Done(AgentResult::success(
+                                       let mut final_result = AgentResult::success(
                                            content, step_count, duration, tool_calls,
-                                       )));
+                                       );
+                                       // 真值计量收尾：usage_counter 若已接线，快照累计 token 记录随结果外送
+                                       final_result.tokens = runner.usage_counter.as_ref().map(|c| c.snapshot());
+                                       yield Ok(AgentEvent::Done(final_result));
                                        return;
                                    }
                                    "StateTransition" => {

@@ -878,7 +878,14 @@ fn normalize_executor_response(json: Value) -> Result<Value, String> {
                 .filter_map(|tc| {
                     let name = tc.get("tool_name").and_then(|n| n.as_str())?;
                     let args = tc.get("args").cloned().unwrap_or(serde_json::json!({}));
-                    Some(serde_json::json!({"tool_name": name, "args": args}))
+                    // tool_call 真 id 保真透传：provider 原生 id 原样保留，供 wire
+                    // 重组按 id 直配（按名 FIFO 降级为 legacy fallback）。缺省不
+                    // 携带——无 id 时归一输出与旧四键形状逐字节一致
+                    let mut call = serde_json::json!({"tool_name": name, "args": args});
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        call["id"] = serde_json::Value::String(id.to_string());
+                    }
+                    Some(call)
                 })
                 .collect();
             serde_json::Value::Array(normalized)
@@ -985,7 +992,14 @@ fn to_openai_wire_messages(messages: serde_json::Value) -> serde_json::Value {
                                 Some(v) => v.to_string(),
                                 None => "{}".to_string(),
                             };
-                            let id = format!("call_{}_{}", i, name);
+                            // 真 id 直配优先：归一层保留的 provider 原生 id（或上游
+                            // 已转换历史的既有 id）原样上行；无真 id 时确定性合成
+                            // （`call_{index}_{name}`，既有行为，legacy fallback）
+                            let id = call
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| format!("call_{}_{}", i, name));
                             pending.push((name.clone(), id.clone()));
                             serde_json::json!({
                                 "id": id,
@@ -1392,6 +1406,57 @@ mod tests {
         ]);
         let wire = to_openai_wire_messages(messages);
         assert_eq!(wire[0]["tool_call_id"], "call_orphan");
+    }
+
+    /// tool_call 真 id 保真:执行体响应归一时 id 键原样透传;无 id 项不合成
+    /// id 键(与旧形状逐字节一致)
+    #[test]
+    fn test_normalize_preserves_tool_call_id() {
+        let resp = serde_json::json!({
+            "content": "",
+            "tool_calls": [
+                {"tool_name": "echo", "args": {"text": "hi"}, "id": "call_real_1"},
+                {"tool_name": "bare", "args": {}}
+            ],
+            "finish_reason": "tool_call"
+        });
+        let out = normalize_executor_response(resp).expect("normalize");
+        let calls = out["tool_calls"].as_array().expect("calls");
+        assert_eq!(calls[0]["id"], "call_real_1");
+        assert!(calls[1].get("id").is_none(), "无 id 项不得合成 id 键");
+    }
+
+    /// wire 重组真 id 直配:assistant 携带真 id → 出站用真 id,tool 消息按名
+    /// FIFO 消费到的也是真 id;无 id 时回退 call_{i}_{name} 合成不变
+    #[test]
+    fn test_wire_messages_real_tool_call_id_direct_pairing() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [
+                 {"tool_name": "a", "args": {}, "id": "call_real_a"},
+                 {"tool_name": "b", "args": {}, "id": "call_real_b"}
+             ]},
+            {"role": "tool", "content": "ra", "tool_name": "a"},
+            {"role": "tool", "content": "rb", "tool_name": "b"}
+        ]);
+        let wire = to_openai_wire_messages(messages);
+        let arr = wire.as_array().unwrap();
+        assert_eq!(arr[1]["tool_calls"][0]["id"], "call_real_a");
+        assert_eq!(arr[1]["tool_calls"][1]["id"], "call_real_b");
+        assert_eq!(arr[2]["tool_call_id"], "call_real_a");
+        assert_eq!(arr[3]["tool_call_id"], "call_real_b");
+
+        // 无 id 项:合成形态不变(既有回归锁镜像)
+        let legacy = serde_json::json!([
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"tool_name": "echo", "args": {"text": "hi"}}]},
+            {"role": "tool", "content": "ok", "tool_name": "echo"}
+        ]);
+        let wire = to_openai_wire_messages(legacy);
+        let arr = wire.as_array().unwrap();
+        assert_eq!(arr[0]["tool_calls"][0]["id"], "call_0_echo");
+        assert_eq!(arr[1]["tool_call_id"], "call_0_echo");
     }
 
     /// B1 多模态上行:images 空/缺失 → 纯字符串 content 原样(与既有形态一致),
