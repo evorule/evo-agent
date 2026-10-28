@@ -627,6 +627,21 @@ impl AgentResult {
             tokens: None,
         }
     }
+
+    /// 取消收尾统一出口:两条取消路径(事件边界/在途)共用,保证
+    /// `cancelled` 标志与已累积的 `tool_calls` 不因路径分叉而丢失——
+    /// 同一语义事件(用户取消)必须产生同一种可观测结果。
+    pub fn cancelled_result(tool_calls: Vec<String>, steps: usize, duration_ms: u64) -> Self {
+        Self::cancelled("cancelled by user".to_string(), steps, duration_ms)
+            .with_tool_calls(tool_calls)
+    }
+
+    /// 附加已累积的工具调用清单(失败/取消语义下,「哪几个工具已执行过」
+    /// 是排障与审计的关键事实;journal/审计链之外,API 返回体不再丢弃)
+    pub fn with_tool_calls(mut self, tool_calls: Vec<String>) -> Self {
+        self.tool_calls = tool_calls;
+        self
+    }
 }
 
 /// Fallback: 从 LLM 文本内容中尝试解析 JSON 格式的 tool call。
@@ -3404,8 +3419,8 @@ impl AgentRunner {
                 }
                 self.submit_tool_traces(&session_id).await;
                 let duration = start_time.elapsed().as_millis() as u64;
-                return Ok(AgentResult::cancelled(
-                    "cancelled by user".to_string(),
+                return Ok(AgentResult::cancelled_result(
+                    tool_calls.clone(),
                     step_count,
                     duration,
                 ));
@@ -3496,8 +3511,8 @@ impl AgentRunner {
                             self.submit_tool_traces(&session_id).await;
                             let duration = start_time.elapsed().as_millis() as u64;
                             self.evorule_client.end_io_step();
-                            return Ok(AgentResult::error(
-                                "cancelled by user".to_string(),
+                            return Ok(AgentResult::cancelled_result(
+                                tool_calls.clone(),
                                 step_count,
                                 duration,
                             ));
@@ -7687,8 +7702,8 @@ impl AgentRunner {
                                        yield Ok(AgentEvent::Error(AgentError::Internal(
                                            "cancelled by user".to_string(),
                                        )));
-                                       yield Ok(AgentEvent::Done(AgentResult::cancelled(
-                                           "cancelled by user".to_string(),
+                                       yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
+                                           tool_calls.clone(),
                                            step_count,
                                            duration,
                                        )));
@@ -8113,8 +8128,8 @@ impl AgentRunner {
                                                            yield Ok(AgentEvent::Error(AgentError::Internal(
                                                                "cancelled by user".to_string(),
                                                            )));
-                                                           yield Ok(AgentEvent::Done(AgentResult::cancelled(
-                                                               "cancelled by user".to_string(),
+                                                           yield Ok(AgentEvent::Done(AgentResult::cancelled_result(
+                                                               tool_calls.clone(),
                                                                step_count,
                                                                duration,
                                                            )));

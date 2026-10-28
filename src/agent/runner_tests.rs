@@ -5182,3 +5182,30 @@ fn test_b1_window_image_budget_drops_oldest_with_annotation() {
     assert_eq!(dropped, 0);
     assert!(matches!(&messages[0], Message::Tool { content, .. } if content == "ok"));
 }
+
+// ===== 取消收尾语义:cancelled 标志不失效+已累积 tool_calls 不丢 =====
+
+#[test]
+fn cancelled_result_carries_flag_and_accumulated_calls() {
+    let r = AgentResult::cancelled_result(
+        vec!["file_read".to_string(), "shell_exec".to_string()],
+        3,
+        1200,
+    );
+    assert!(r.cancelled, "取消收尾必须置 cancelled=true(区别于执行失败)");
+    assert_eq!(r.error.as_deref(), Some("cancelled by user"));
+    assert_eq!(
+        r.tool_calls,
+        vec!["file_read".to_string(), "shell_exec".to_string()],
+        "取消路径不得丢弃已累积的工具调用事实"
+    );
+}
+
+#[test]
+fn with_tool_calls_builder_keeps_failure_semantics() {
+    let r = AgentResult::error("boom".into(), 2, 500).with_tool_calls(vec!["http_get".to_string()]);
+    assert!(!r.success);
+    assert_eq!(r.error.as_deref(), Some("boom"));
+    assert!(!r.cancelled);
+    assert_eq!(r.tool_calls, vec!["http_get".to_string()]);
+}
