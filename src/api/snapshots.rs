@@ -31,6 +31,11 @@ use crate::agent::memory::MessageRecord;
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::api::session_index::{load_transcript, unix_now};
 
+/// 单会话手动检查点数量帽(对齐 journal REWIND_BUDGET_LIMIT / 工作区检查点
+/// 栈深先例);save_checkpoint 落盘后按 saved_at 升序 LRU 淘汰超帽最旧份。
+/// 手动检查点豁免保留期清理,本帽是其唯一总量边界(防无上界增长)。
+pub const MAX_CHECKPOINTS_PER_SESSION: usize = 32;
+
 // =============================================================================
 // 保留期(与 UI 下拉共用标签)
 // =============================================================================
@@ -358,7 +363,49 @@ impl SnapshotStore {
         }
         let target = dir.join(&name);
         std::fs::rename(&tmp, &target).map_err(|e| format!("rename failed: {e}"))?;
+        // 数量帽:超 MAX_CHECKPOINTS_PER_SESSION 按 saved_at 升序淘汰最旧
+        // (LRU;淘汰失败不回滚本次写入,仅 warn——帽是增长边界不是一致性闸)。
+        // 刚写入的本次落盘不入淘汰候选:同秒防覆盖会复用被删槽位的 saved_at,
+        // 若不排除,新写文件可能被自己的淘汰逻辑选中(自删)。
+        let all: Vec<_> = self
+            .list_checkpoints(session_id)
+            .into_iter()
+            .filter(|s| s.saved_at != saved_at)
+            .collect();
+        if all.len() >= MAX_CHECKPOINTS_PER_SESSION {
+            let excess = all.len() - MAX_CHECKPOINTS_PER_SESSION + 1;
+            for stale in all.iter().take(excess) {
+                if let Some(parent) = self.locate_checkpoint_file(session_id, stale.saved_at) {
+                    if std::fs::remove_file(&parent).is_err() {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            saved_at = stale.saved_at,
+                            "checkpoint cap eviction failed; will retry on next save"
+                        );
+                    }
+                }
+            }
+        }
         Ok((saved_at, target))
+    }
+
+    /// 定位某检查点文件的完整路径(遍历日期分片;帽淘汰用)
+    fn locate_checkpoint_file(&self, session_id: &str, saved_at: u64) -> Option<PathBuf> {
+        if !Self::safe_session_id(session_id) {
+            return None;
+        }
+        let name = format!("checkpoint_{session_id}_{saved_at}.json");
+        for y in numeric_subdirs(&self.root) {
+            for m in numeric_subdirs(&y.path()) {
+                for d in numeric_subdirs(&m.path()) {
+                    let path = d.path().join(&name);
+                    if path.exists() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// 列出某会话的全部手动检查点(遍历日期分片,按 `saved_at` 升序)
@@ -776,6 +823,39 @@ mod tests {
         assert_eq!(snap.label, None);
         assert_eq!(snap.engine_version, None);
         assert!(!snap.manual);
+    }
+
+    #[test]
+    fn test_checkpoint_cap_evicts_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path().join("snapshots"));
+        store.ensure_dir();
+        let msgs = vec![record(0, "user", "x")];
+        // 写帽值+2 份:总量恒帽、最新两份必存活(LRU 语义)。
+        // 行为级断言:秒级时钟下 34 连打会同秒冲突,防覆盖递增+淘汰交互
+        // 不承诺逐份确定性(同秒复用槽位属正常回收),只承诺总量边界。
+        let mut ids = Vec::new();
+        for i in 0..(MAX_CHECKPOINTS_PER_SESSION + 2) {
+            let (id, _) = store
+                .save_checkpoint("s_cap", "general", &msgs, &format!("cp{i}"), i as u64)
+                .unwrap();
+            ids.push(id);
+        }
+        let list = store.list_checkpoints("s_cap");
+        assert_eq!(list.len(), MAX_CHECKPOINTS_PER_SESSION, "总量恒帽");
+        let last = ids[ids.len() - 1];
+        assert!(
+            store.load_checkpoint("s_cap", last).is_some(),
+            "最新一份必存活"
+        );
+        // label 级恰淘汰 2 份(saved_at 同秒防覆盖会复用被删槽位——id 级计数
+        // 在复用下失真,label 唯一不受影响)
+        let kept: std::collections::HashSet<_> =
+            list.iter().filter_map(|s| s.label.clone()).collect();
+        let gone = (0..MAX_CHECKPOINTS_PER_SESSION + 2)
+            .filter(|i| !kept.contains(&format!("cp{i}")))
+            .count();
+        assert_eq!(gone, 2, "恰淘汰 2 份");
     }
 
     #[test]
