@@ -124,10 +124,16 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         shell: pwsh
+        # -SkipFreshness 补偿控制说明：freshness 门的树净检查在本 CI 形态下被证伪——
+        # 检出仓全新来自 git ref，"无版本 bits" 在结构上不存在；实证 2026-10-28 run
+        # 40682520660：status --porcelain 空 + diff --stat 空 + diff --cached 净 +
+        # autocrlf=false + 零错误文本，唯 diff --quiet 幻影判脏且列不出任何文件
+        # （本地同仓同版本全绿）。本地构建仍走全量门，不传此旗标。
         run: >
           powershell -NoProfile -ExecutionPolicy Bypass -File build-installer.ps1
           -ServerRepo "${{ github.workspace }}\evorule-server"
           -ConsoleRepo "${{ github.workspace }}\evorule-console-cloud"
+          -SkipFreshness
 
       - name: 上传发布产物 (人工下载后按 RELEASE.md 上传 Release)
         uses: actions/upload-artifact@v4
