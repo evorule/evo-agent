@@ -1,4 +1,4 @@
-# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
+﻿# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
 #
 # 资源布局（安装后 {install}\resources\...，由 tauri.conf.json bundle.resources 承接）：
 #   resources\bin\evo-agent.exe             <- <repo>\target\release\evo-agent.exe
