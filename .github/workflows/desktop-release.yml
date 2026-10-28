@@ -48,11 +48,12 @@ jobs:
           repository: evorule/evorule-console-cloud
           path: evorule-console-cloud
 
-      # 根仓声明面 SSOT (THIRD-PARTY-NOTICES.md + LICENSES/third-party/), 钉 SHA
+      # 根仓声明面 SSOT (THIRD-PARTY-NOTICES.md + LICENSES/third-party/)
+      # 浮动 main（原钉 5560fe9 于 2026-10-28 主仓换基后成死锚，desktop 构建断链；
+      #   与 server/console-cloud 浮动口径统一）
       - uses: actions/checkout@v4
         with:
           repository: evorule/evorule
-          ref: 5560fe93c2443c1d985d21b534535b241333cffd
           path: evorule
 
       - uses: dtolnay/rust-toolchain@stable
