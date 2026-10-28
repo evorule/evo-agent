@@ -645,6 +645,8 @@ pub fn schema() -> Vec<SettingEntry> {
             scope: "window",
         },
         SettingEntry {
+            key: "longSession.compaction.keepRounds",            kind: SettingType::Number,            default: json!(6),            enum_values: None,            range: Some([2, 50]),            category: "长会话",            description: "主动压缩时保留的最近对话轮数（这些轮次全量保真，构成近期工作记忆；更早的轮次进入滚动摘要）。默认 6" ,            scope: "window",        },
+        SettingEntry {
             key: "mentions.maxFileLines",
             kind: SettingType::Number,
             default: json!(600),
@@ -1007,7 +1009,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 58); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo;批K 段5 httpRequest;批K 段7 askUser;workbench.uiFontSize;M4 workspaceUndo)
+        assert_eq!(settings.len(), 59); // 计数锁:新增键须同步(scheme 单源纪律;B22 memory_recall/audit_query/eventLedger;B23 mcpServer.enabled;O-487② memory_tombstone;批K editFile;批K 段2 webFetch/webSearch;批K 段3 codeSearch;批K 段4 todo;批K 段5 httpRequest;批K 段7 askUser;workbench.uiFontSize;M4 workspaceUndo;第五批 compaction.keepRounds)
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
         assert_eq!(settings["editor.wordWrap"], json!("off"));
@@ -1058,7 +1060,7 @@ mod tests {
         // problems.* 诊断面 2 键(问题面板/编辑器校验开关)
         assert_eq!(settings["problems.json.validate"], json!(true));
         assert_eq!(settings["problems.markdown.lint"], json!(true));
-        // longSession.compaction.* 3 键:默认关+70%+20 条(启用属 LLM
+        // longSession.compaction.* 4 键:默认关+70%+20 条+保留 6 轮(启用属 LLM
         // 精力开销,缺省走被动裁剪)
         assert_eq!(settings["longSession.compaction.enabled"], json!(false));
         assert_eq!(settings["longSession.compaction.thresholdPct"], json!(70));
@@ -1066,6 +1068,7 @@ mod tests {
             settings["longSession.compaction.maxClearToolResults"],
             json!(20)
         );
+        assert_eq!(settings["longSession.compaction.keepRounds"], json!(6));
         // mentions.* @上下文引用 2 键(B13 消费:文件降级大纲/终端尾部行数)
         assert_eq!(settings["mentions.maxFileLines"], json!(600));
         assert_eq!(settings["mentions.terminalLines"], json!(200));

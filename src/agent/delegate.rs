@@ -150,6 +150,10 @@ pub struct DelegateContext {
     /// 治理门禁段（Some = 下放给每个子 runner 的 S2 槽位;serve 构造点传入,
     /// CLI 路径 None = 子代理与 CLI 主路径同口径无治理段）
     pub governance_segment: Option<String>,
+
+    /// 项目记忆段(AGENTS.md 层级;serve 构造点传入——子代理与主 runner
+    /// 同源注入,None=不注入。CLI 主路径无此段,子代理同口径)
+    pub agents_md_segment: Option<String>,
     /// 记忆下放开关（true = `def.memory` 有声明的子代理装配 MemoryManager
     /// 全量召回面;默认 false = 子代理无状态执行器,任务域自包含）
     pub propagate_memory: bool,
@@ -181,6 +185,7 @@ impl DelegateContext {
             workdir: None,
             journal_dir: None,
             governance_segment: None,
+            agents_md_segment: None,
             propagate_memory: false,
             step_timeout_override: None,
             spawn_ledger: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -191,6 +196,12 @@ impl DelegateContext {
     /// 主 runner 同源治理段算好后传入）
     pub fn with_governance_segment(mut self, segment: Option<String>) -> Self {
         self.governance_segment = segment;
+        self
+    }
+
+    /// 注入项目记忆段(AGENTS.md 层级;与主 runner 同源,None=不注入)
+    pub fn with_agents_md_segment(mut self, segment: Option<String>) -> Self {
+        self.agents_md_segment = segment;
         self
     }
 
@@ -368,6 +379,11 @@ impl DelegateContext {
         // 主路径同口径。治理段为全局纪律前馈,子代理无豁免理由）
         if let Some(gs) = &self.governance_segment {
             runner = runner.with_governance_segment(Some(gs.clone()));
+        }
+        // 项目记忆段下放(与主 runner 同源;AGENTS.md 层级注入子代理
+        // system prompt 静态区槽位)
+        if let Some(seg) = &self.agents_md_segment {
+            runner = runner.with_agents_md_segment(Some(seg.clone()));
         }
         // 记忆声明下放（上下文开关 × def.memory 声明双条件;子代理默认
         // 无状态执行器,显式开启+定义声明才装配召回面,ns=定义声明域,
@@ -548,9 +564,23 @@ impl DelegateContext {
         &self,
         tasks: Vec<(String, String)>,
     ) -> Vec<Result<String, String>> {
+        self.delegate_parallel_with_context(
+            tasks
+                .into_iter()
+                .map(|(agent_type, task)| (agent_type, task, None))
+                .collect(),
+        )
+        .await
+    }
+
+    /// 带父上下文摘要的并行委托(其余同 [`Self::delegate_parallel`])
+    pub async fn delegate_parallel_with_context(
+        &self,
+        tasks: Vec<(String, String, Option<String>)>,
+    ) -> Vec<Result<String, String>> {
         let futures: Vec<_> = tasks
             .into_iter()
-            .map(|(agent_type, task)| {
+            .map(|(agent_type, task, context)| {
                 let ctx = self.increment_depth();
                 let sem = ctx.max_concurrent.clone();
                 async move {
@@ -562,7 +592,8 @@ impl DelegateContext {
                             }
                         };
                     }
-                    ctx.delegate(&agent_type, &task).await
+                    ctx.delegate_with_context(&agent_type, &task, context.as_deref())
+                        .await
                 }
             })
             .collect();
@@ -585,9 +616,23 @@ impl DelegateContext {
     ///
     /// 第一个完成子 agent 的 `Result<String, String>`。
     pub async fn delegate_race(&self, tasks: Vec<(String, String)>) -> Result<String, String> {
+        self.delegate_race_with_context(
+            tasks
+                .into_iter()
+                .map(|(agent_type, task)| (agent_type, task, None))
+                .collect(),
+        )
+        .await
+    }
+
+    /// 带父上下文摘要的竞速委托(其余同 [`Self::delegate_race`])
+    pub async fn delegate_race_with_context(
+        &self,
+        tasks: Vec<(String, String, Option<String>)>,
+    ) -> Result<String, String> {
         let futures: Vec<DelegateFuture> = tasks
             .into_iter()
-            .map(|(agent_type, task)| {
+            .map(|(agent_type, task, context)| {
                 let ctx = self.increment_depth();
                 Box::pin(async move {
                     if let Some(sem) = ctx.max_concurrent.clone() {
@@ -598,7 +643,8 @@ impl DelegateContext {
                             }
                         };
                     }
-                    ctx.delegate(&agent_type, &task).await
+                    ctx.delegate_with_context(&agent_type, &task, context.as_deref())
+                        .await
                 }) as Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
             })
             .collect();
@@ -778,6 +824,16 @@ mod tests {
         let child = ctx.increment_depth();
         assert_eq!(child.governance_segment.as_deref(), Some("seg"));
         assert!(Arc::ptr_eq(&ctx.spawn_ledger, &child.spawn_ledger));
+    }
+
+    #[test]
+    fn test_agents_md_segment_builder() {
+        // 项目记忆段下放:builder 注入+clone 延续(与治理段同款口径)
+        let ctx = make_ctx().with_agents_md_segment(Some("# notes".to_string()));
+        assert_eq!(ctx.agents_md_segment.as_deref(), Some("# notes"));
+        let child = ctx.increment_depth();
+        assert_eq!(child.agents_md_segment.as_deref(), Some("# notes"));
+        assert!(make_ctx().agents_md_segment.is_none());
     }
 
     #[test]

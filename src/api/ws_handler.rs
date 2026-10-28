@@ -902,9 +902,9 @@ async fn construct_runner(
         // 用户 hooks(交互批 第二批)
         .with_user_hooks(user_hooks)
         // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
-        .with_agents_md_segment(crate::agent::runner::load_agents_md_segment(
-            state.workdir(),
-        ))
+        .with_agents_md_segment(
+            crate::agent::runner::load_agents_md_segment(state.workdir()).clone(),
+        )
         // M5-a:注入生效能力边界(声明重绑工具面 + 会话边界段/边界事实)
         .with_capability_boundary(capability_boundary)
         // 挂 filtered toolkit(同 HTTP 端点口径,见 run_agent)
@@ -938,6 +938,11 @@ async fn construct_runner(
         .with_workspace_checkpoint(state.workdir())
         // 查账工具族接线（PR-11a）：以本会话态重绑 filtered 内查账工具实例
         .wire_accounting(state.workdir())
+        // B21 D3:主动压缩策略(longSession.compaction.* 设置映射;与 HTTP
+        // run/stream 端点同口径——此前 WS 主聊天面未接线,设置开了也不生效)
+        .with_compaction_policy(crate::agent::runner::CompactionPolicy::from_settings(
+            &merged_settings,
+        ))
         // B2:注入 skills manifest(read_skill 已注册进 filtered,清单喂 S4b 槽位)
         .with_skills(resolved_skills)
         // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位,不再内嵌基底)
@@ -951,6 +956,10 @@ async fn construct_runner(
                 state.evorule_client().clone(),
             )
             .with_journal_dir(state.workdir().join("data").join("sessions"))
+            // 项目记忆段下放(与主 runner 同源)
+            .with_agents_md_segment(crate::agent::runner::load_agents_md_segment(
+                state.workdir(),
+            ))
             // 子代理工具契约:union toolkit 快照下放(delegate 内部按子定义
             // def.tools 白名单过滤——此前子代理零工具契约=纯文本执行器)
             .with_toolkit((*state.toolkit()).clone(), state.workdir())
@@ -1167,6 +1176,17 @@ pub fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json:
             "question_id": question_id,
             "answered": answered,
             "timed_out": timed_out,
+        }),
+        // 主动压缩观测帧(前端一次性提示;与 journal compaction_performed 同源)
+        Ok(AgentEvent::CompactionPerformed {
+            before_chars,
+            after_chars,
+            summary_generated,
+        }) => serde_json::json!({
+            "type": "CompactionPerformed",
+            "before_chars": before_chars,
+            "after_chars": after_chars,
+            "summary_generated": summary_generated,
         }),
         Err(err) => serde_json::json!({
             "type": "Error",
@@ -1535,6 +1555,11 @@ mod tests {
                 vec!["search".to_string()],
             ))),
             Err(AgentError::Internal("stream broke".to_string())),
+            Ok(AgentEvent::CompactionPerformed {
+                before_chars: 5000,
+                after_chars: 1200,
+                summary_generated: true,
+            }),
         ]
     }
 

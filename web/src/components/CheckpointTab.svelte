@@ -28,6 +28,12 @@
   let armTimer = $state(null);
   // 恢复结果摘要(最近一次恢复/回滚)
   let lastResult = $state(null);
+  // 滚动摘要(压缩产物查看)
+  let rollingSummary = $state(null);
+  let rollingGen = $state(null);
+  let compactBusy = $state(false);
+  // 差异查看(检查点 vs 当前 / 版本 a vs b)
+  let diffView = $state(null);
 
   function disarm() {
     if (armTimer) clearTimeout(armTimer);
@@ -59,14 +65,67 @@
     loading = true;
     err = '';
     try {
-      const [cp, ver] = await Promise.all([listCheckpoints($sessionId), listSessionVersions($sessionId)]);
+      const [cp, ver, comp] = await Promise.all([
+        listCheckpoints($sessionId),
+        listSessionVersions($sessionId),
+        getCompaction($sessionId).catch(() => null),
+      ]);
       checkpoints = cp.checkpoints || [];
       versions = ver.versions || [];
       latest = ver.latest || 0;
+      const rs = comp?.rolling_summary;
+      rollingSummary = rs && typeof rs === 'object' ? (rs.summary_text || null) : null;
+      rollingGen = rs && typeof rs === 'object' ? (rs.gen ?? null) : null;
     } catch (e) {
       err = String(e?.message || e);
     } finally {
       loading = false;
+    }
+  }
+
+  async function runCompact() {
+    if (!$sessionId || compactBusy) return;
+    compactBusy = true;
+    err = '';
+    note = '';
+    try {
+      const r = await compactSession($sessionId);
+      note = r.summary_generated
+        ? `已压缩 · 滚动摘要 gen${r.gen} · 保真比 ${(Number(r.fidelity_ratio) * 100).toFixed(0)}%`
+        : '压缩完成（摘要未生成，工具结果降压已生效）';
+      await refresh();
+    } catch (e) {
+      err = String(e?.message || e);
+    } finally {
+      compactBusy = false;
+    }
+  }
+
+  async function showCheckpointDiff(cp) {
+    if (!$sessionId || busy) return;
+    err = '';
+    try {
+      const r = await getCheckpointDiff($sessionId, cp.cp_id);
+      diffView = {
+        title: `差异:检查点「${cp.label ?? cp.cp_id}」(v${r.cp_version}) vs 当前(v${r.current_version})`,
+        body: JSON.stringify(r.diff, null, 1),
+      };
+    } catch (e) {
+      err = String(e?.message || e);
+    }
+  }
+
+  async function showVersionDiff(v) {
+    if (!$sessionId || busy) return;
+    err = '';
+    try {
+      const r = await getVersionDiff($sessionId, v.version, latest);
+      diffView = {
+        title: `差异:v${v.version} vs 当前 v${latest}`,
+        body: JSON.stringify(r.diff, null, 1),
+      };
+    } catch (e) {
+      err = String(e?.message || e);
     }
   }
 
@@ -157,6 +216,9 @@
       disabled={busy || !$sessionId}
     />
     <button class="take" onClick={takeCheckpoint} disabled={busy || !$sessionId}>打点</button>
+    <button class="compact" onClick={runCompact} disabled={busy || compactBusy || !$sessionId}>
+      {compactBusy ? '压缩中…' : '压缩'}
+    </button>
     <button class="refresh" onClick={refresh} disabled={busy || !$sessionId}>刷新</button>
   </div>
   {#if !$sessionId}
@@ -164,6 +226,16 @@
   {:else}
     {#if err}<div class="err">{err}</div>{/if}
     {#if note}<div class="note">{note}</div>{/if}
+
+    {#if diffView}
+      <div class="diff-panel">
+        <div class="diff-title">
+          <span>{diffView.title}</span>
+          <button class="ghost" onclick={() => (diffView = null)}>关闭</button>
+        </div>
+        <pre class="diff-body">{diffView.body}</pre>
+      </div>
+    {/if}
 
     <div class="section-title">检查点({checkpoints.length})</div>
     {#if checkpoints.length === 0}
@@ -175,6 +247,7 @@
             <div class="row">
               <span class="label">{cp.label ?? '(未命名)'}</span>
               <span class="meta">{fmtTime(cp.saved_at)} · {cp.count} 条 · 引擎 v{cp.engine_version ?? '—'}</span>
+              <button class="ghost" onclick={() => showCheckpointDiff(cp)} disabled={busy}>差异</button>
               <button
                 class="danger"
                 class:armed={armed === `restore:${cp.cp_id}`}
@@ -189,6 +262,11 @@
       </ul>
     {/if}
 
+    {#if rollingSummary}
+      <div class="section-title">滚动摘要(gen{rollingGen ?? '—'})</div>
+      <div class="rolling">{rollingSummary}</div>
+    {/if}
+
     <div class="section-title">引擎版本时间线(最新 v{latest})</div>
     {#if versions.length === 0}
       <div class="empty">引擎账为空——回合开始后此处显示可回滚的版本链。</div>
@@ -200,6 +278,7 @@
               <span class="label">v{v.version}</span>
               <span class="meta">{v.facts} 条事实</span>
               {#if v.version !== latest}
+                <button class="ghost" onclick={() => showVersionDiff(v)} disabled={busy}>差异</button>
                 <button
                   class="danger"
                   class:armed={armed === `rewind:${v.version}`}
@@ -254,6 +333,43 @@
   button:disabled {
     opacity: 0.5;
     cursor: default;
+  }
+  button.compact {
+    background: var(--bg-btn, #2a2a2a);
+  }
+  .rolling {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 11px;
+    color: var(--fg-dim, #999);
+    border: 1px dashed var(--border-dim, #333);
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+  }
+  .diff-panel {
+    border: 1px solid var(--border, #333);
+    border-radius: 4px;
+    padding: 8px;
+    margin: 8px 0;
+  }
+  .diff-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--fg, #ddd);
+    margin-bottom: 6px;
+  }
+  .diff-body {
+    max-height: 260px;
+    overflow: auto;
+    font-size: 11px;
+    color: var(--fg-dim, #999);
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
   button.take {
     background: var(--accent, #b8860b);
