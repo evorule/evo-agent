@@ -148,11 +148,9 @@ pub fn default_safe_toolkit_with_shell(
 ) -> Result<ToolHandler, String> {
     // 档位解析(container 档先配置校验后探测;探测进程内一次落账)
     let resolution = match shell {
-        None => shell_exec::resolve_sandbox_tier(
-            crate::config::ShellSandboxMode::None,
-            None,
-            false,
-        )?,
+        None => {
+            shell_exec::resolve_sandbox_tier(crate::config::ShellSandboxMode::None, None, false)?
+        }
         Some(cfg) => shell_exec::resolve_sandbox_tier(
             cfg.sandbox,
             cfg.container.as_deref(),
@@ -171,7 +169,12 @@ pub fn default_safe_toolkit_with_shell(
             tracing::debug!("shell sandbox posture: tier-3 (default none mode)");
         }
     }
-    Ok(default_safe_toolkit_core(workdir, read_root, profile, &resolution))
+    Ok(default_safe_toolkit_core(
+        workdir,
+        read_root,
+        profile,
+        &resolution,
+    ))
 }
 
 /// 安全默认工具集核心装配(全部档位共用的单一构造路径;档位差异只作用于

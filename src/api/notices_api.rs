@@ -280,4 +280,68 @@ mod tests {
         assert!(serialized.contains("/notices-static/showcases/x.html"));
         fs::remove_dir_all(&dir).ok();
     }
+
+    // ===== 公开静态面收敛验收(bin 装配同款:/notices-static → ServeDir(assets))=====
+
+    mod static_face {
+        use super::*;
+        use axum::{http::Request, routing::get};
+        use tower::ServiceExt;
+
+        /// bin serve 装配同款形态:nest_service(ServeDir(assets_root))
+        fn test_app(assets_root: &Path) -> axum::Router {
+            axum::Router::new()
+                .route("/health", get(|| async { "ok" }))
+                .nest_service(
+                    "/notices-static",
+                    tower_http::services::ServeDir::new(assets_root),
+                )
+        }
+
+        async fn status_for(app: axum::Router, uri: &str) -> u16 {
+            app.oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+        }
+
+        #[tokio::test]
+        async fn public_face_serves_assets_and_rejects_traversal() {
+            let dir = tmpdir("static");
+            let assets = notices_assets_dir(&dir);
+            fs::create_dir_all(&assets).unwrap();
+            fs::write(assets.join("hello.html"), "<html>ok</html>").unwrap();
+            // 边界外文件:同属 data/notices 树,但不在 assets 挂载根内
+            fs::create_dir_all(dir.join("data").join("notices")).unwrap();
+            fs::write(dir.join("data").join("notices").join("notices.json"), "[]").unwrap();
+
+            let app = test_app(&assets);
+            // 免鉴权公开面:发布者主动放置的公开物,浏览器直链可取
+            assert_eq!(
+                status_for(app.clone(), "/notices-static/hello.html").await,
+                200
+            );
+            // 目录收敛边界:挂载根外文件(含同树上层的 notices.json)不可达
+            assert_eq!(
+                status_for(app.clone(), "/notices-static/notices.json").await,
+                404
+            );
+            // 穿越载荷:URL 编码的 .. 不得逃出挂载根
+            assert_eq!(
+                status_for(app.clone(), "/notices-static/%2e%2e/notices.json").await,
+                404
+            );
+            assert_eq!(
+                status_for(app, "/notices-static/../../secret.txt").await,
+                404
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
 }

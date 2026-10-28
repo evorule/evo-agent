@@ -60,10 +60,23 @@ confidence-threshold = 0.93
 [advisories]
 version = 2
 yanked = "warn"
-# bare-metal 已弃用归档（RUSTSEC-2026-0110，unmaintained 类）：cortex-m 0.7 生态
-# 传递依赖，无安全升级路径（官方迁移指引 critical-section 属 cortex-m 大版本
-# 迁移范畴）；当前仅 evorule-mcu 仿真固件 dev/示例链引入，非生产服务面，豁免。
-ignore = ["RUSTSEC-2026-0110"]
+# git2 0.20（RUSTSEC-2026-0183 / RUSTSEC-2026-0184，soundness 类）：修复在 0.21，
+# 跨大版本升级需代码改造（本仓 src/git 面深度使用 diff/statuses/checkout/commit
+# 全套 API），不宜混入功能批；豁免至 git2 0.21 升级批落地后摘除。
+# protobuf 2.x（RUSTSEC-2024-0437，vulnerability 类，递归解析栈溢出）：修复在
+# 3.7.2 跨大版本，唯一依赖方 prometheus 0.13.4 钉死 2.x，本地无动手项；敞口
+# 受限——仅用于 metrics exposition 编码输出侧，无不可信 protobuf 解析输入面；
+# 解除条件：prometheus 升级后随版解除。
+# paste（RUSTSEC-2024-0436，unmaintained 类）：官方已归档，无安全升级路径；
+# 依赖方（pulp/rav1e/tokenizers）全在 fastembed 生态上游，宏展开类无运行时
+# 敞口；解除条件：fastembed 上游迁移后随版解除。
+# （2026-10-28 顺手摘除已失效的 RUSTSEC-2026-0110 豁免：advisory DB 中已无匹配。）
+ignore = [
+    "RUSTSEC-2026-0183",
+    "RUSTSEC-2026-0184",
+    "RUSTSEC-2024-0437",
+    "RUSTSEC-2024-0436",
+]
 
 # ---------------------------------------------------------------------------
 # 依赖关系: 重复版本警告；通配符依赖拒绝

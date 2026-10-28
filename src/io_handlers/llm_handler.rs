@@ -1303,8 +1303,10 @@ mod tests {
     /// 显式声明从被静默忽略转为生效）。
     #[test]
     fn test_from_config_consumes_timeout_secs() {
-        let mut cfg = crate::config::LlmConfig::default();
-        cfg.timeout_secs = 11;
+        let cfg = crate::config::LlmConfig {
+            timeout_secs: 11,
+            ..Default::default()
+        };
         let h = LlmHandler::from_config(&cfg);
         assert_eq!(h.request_timeout_secs, 11);
     }

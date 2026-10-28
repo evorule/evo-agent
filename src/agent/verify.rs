@@ -110,6 +110,9 @@ pub struct CommandOutput {
 }
 
 /// 命令执行注入 trait(生产=tokio 进程 spawn;测试=打桩)
+// async_trait 展开体自带 #[must_use](Future)与返回 Result 的 must_use 语义
+// 重叠,新 clippy 判 double_must_use;属性出自宏展开,调用侧无法定向压制。
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait CommandRunner: Send + Sync {
     /// 执行一条 shell 命令(超时/输出截断由实现保证与 shell_exec 同级口径)
@@ -357,10 +360,10 @@ fn render_observation(v: &CommandVerdict, passed: usize, escalate: bool) -> Stri
         }
     }
     if escalate {
-        text.push_str(&format!(
+        text.push_str(
             "\nverify: fix loop limit reached (max consecutive failed verdicts) — \
-             surface this to the user for manual review instead of retrying blindly."
-        ));
+             surface this to the user for manual review instead of retrying blindly.",
+        );
     }
     text
 }

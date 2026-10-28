@@ -311,7 +311,7 @@ async fn test_openai_tools_payload_dynamic_service_schema_carries_parameters() {
 
 #[tokio::test]
 async fn test_openai_tools_payload_excludes_unwired_placeholders() {
-    use crate::builtin_tools::todo::{TodoReadTool, TodoState, TodoWriteTool};
+    use crate::builtin_tools::todo::{TodoState, TodoWriteTool};
     use std::sync::Arc;
 
     let mut handler = make_handler_with(&["echo"]);

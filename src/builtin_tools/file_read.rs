@@ -294,9 +294,8 @@ mod tests {
         // 行为变更(2026-10-26):超限文件不再死报错,返回首段+truncated 标记
         // (主流 Read 工具形态;agent 按返回的 next_offset 渐进续读)
         let v = result.unwrap();
-        assert_eq!(
+        assert!(
             v.get("truncated").unwrap().as_bool().unwrap(),
-            true,
             "超限文件首段读取应标记 truncated"
         );
         assert_eq!(v.get("offset").unwrap().as_i64().unwrap(), 0);
@@ -317,17 +316,16 @@ mod tests {
         let result = tool.call_sync(&Value::Object({
             let mut m = serde_json::Map::new();
             m.insert("path".to_string(), Value::from("seg.txt"));
-            m.insert("offset".to_string(), Value::from(5 as i64));
-            m.insert("length".to_string(), Value::from(4 as i64));
+            m.insert("offset".to_string(), Value::from(5_i64));
+            m.insert("length".to_string(), Value::from(4_i64));
             m
         }));
         let v = result.unwrap();
         assert_eq!(v.get("content").unwrap().as_str().unwrap(), "5678");
         assert_eq!(v.get("offset").unwrap().as_i64().unwrap(), 5);
         assert_eq!(v.get("read_bytes").unwrap().as_i64().unwrap(), 4);
-        assert_eq!(
+        assert!(
             v.get("truncated").unwrap().as_bool().unwrap(),
-            true,
             "文件尾还有内容,应标记 truncated 并给出续读游标"
         );
         assert_eq!(v.get("next_offset").unwrap().as_i64().unwrap(), 9);
@@ -360,7 +358,7 @@ mod tests {
         let result = tool.call_sync(&Value::Object({
             let mut m = serde_json::Map::new();
             m.insert("path".to_string(), Value::from("tiny.txt"));
-            m.insert("offset".to_string(), Value::from(100 as i64));
+            m.insert("offset".to_string(), Value::from(100_i64));
             m
         }));
         let v = result.unwrap();

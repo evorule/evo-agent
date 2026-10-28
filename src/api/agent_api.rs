@@ -6,7 +6,10 @@
 use axum::{
     extract::State,
     http::StatusCode,
-    response::{sse::{Event, KeepAlive, Sse}, IntoResponse},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     Json, Router,
 };
 use futures_core::Stream;
@@ -1056,10 +1059,7 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .merge(mcp_server_routes(mcp_server_exposed))
         // auth ticket 换票端点:Bearer 换一次性短票(WS/SSE query 通行用),
         // 消费式校验执法在 auth_middleware
-        .route(
-            "/api/auth/ticket",
-            axum::routing::post(issue_auth_ticket),
-        )
+        .route("/api/auth/ticket", axum::routing::post(issue_auth_ticket))
         .with_state(state)
         // G7:鉴权中间件(对 /health、/metrics 豁免)
         .layer(axum::middleware::from_fn_with_state(

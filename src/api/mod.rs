@@ -26,6 +26,7 @@ pub mod metrics;
 pub mod notices_api;
 pub mod orchestration_api;
 pub mod pty_api;
+pub mod rate_limit;
 pub mod serve_tools;
 pub mod session_index;
 pub mod settings;

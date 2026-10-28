@@ -167,6 +167,11 @@ enum Command {
         #[arg(long)]
         no_auth: bool,
 
+        /// 禁用 serve 面限流(缺省 200 req/s per-IP,对标 evorule-server
+        /// 生产档;本地压测/网关前置双层限流时可显式豁免)
+        #[arg(long)]
+        no_rate_limit: bool,
+
         /// B 批「读宽写窄」:读域根(可选,绝对路径)——读面工具
         /// (file_read/file_list/search_files/grep_files)相对该根解析,
         /// 写面(file_write 族)仍限 workdir;缺省=读写同域(行为不变)。
@@ -439,6 +444,7 @@ fn main() -> ExitCode {
             port,
             auth_token,
             no_auth,
+            no_rate_limit,
             read_root,
             agent_root,
         } => run_with_big_stack(move || {
@@ -451,6 +457,7 @@ fn main() -> ExitCode {
                 port,
                 &auth_token,
                 no_auth,
+                no_rate_limit,
                 read_root.as_deref(),
                 agent_root.as_deref(),
             )
@@ -780,7 +787,7 @@ fn cmd_run(
                     // 治理段:CLI 主路径无 S2 段,子代理同口径 None(delegate
                     // 字段文档口径);serve 三面才存在治理段下放。
                     .with_journal_dir(workdir.join("data").join("sessions"))
-                    .with_workspace_checkpoint(&workdir)
+                    .with_workspace_checkpoint(workdir)
                     .with_delegate_context(
                         evo_agent::agent::delegate::DelegateContext::new(
                             agent_name,
@@ -1196,7 +1203,7 @@ async fn patrol_build_runner(
         // 步级 journal 缺位。目录随 serve 约定(<workdir>/data/sessions);
         // run_streaming_inner 打开失败 fail-soft,与 serve 同语义。
         .with_journal_dir(workdir.join("data").join("sessions"))
-        .with_workspace_checkpoint(&workdir)
+        .with_workspace_checkpoint(workdir)
         // 查账工具族接线（PR-11a）：以本会话态重绑 union 内查账工具实例
         .wire_accounting(workdir);
     // 人工审查开合(2026-09-28):巡视为无人值守场景,决策端统一 PolicyApproval
@@ -2139,12 +2146,15 @@ fn cmd_config(workdir: &Path) -> ExitCode {
 /// 显式 `--no-auth` 保留为本地开发豁免旗标(告警但不拦)。
 ///
 /// 优雅关闭:Ctrl+C / SIGTERM → 停止接受新连接,等待在途请求完成。
+// CLI 旗标直映射(参数与 serve 子命令旗标一一对应),不打包 struct。
+#[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     workdir: &Path,
     host: &str,
     port: u16,
     auth_tokens: &[String],
     no_auth: bool,
+    no_rate_limit: bool,
     read_root: Option<&Path>,
     agent_root: Option<&Path>,
 ) -> ExitCode {
@@ -2769,6 +2779,33 @@ fn cmd_serve(
         // 既有 layer 约束),子路由自带 14MB 限层与同款 G7 鉴权
         .merge(agent_api::upload_router_with_auth(state, auth_config).layer(cors_layer));
 
+    // serve 面限流(对标 evorule-server 生产档 200 req/s per-IP;--no-rate-limit
+    // 豁免)。GovernorLayer 泛型不可存 Option 变量,server 同款 match 分支装配;
+    // 启动调用须 with_connect_info(PeerIpKeyExtractor 依赖)。触发 429 仅
+    // abuse 级流量(200+ 持续 req/s 单 IP),工作台/SSE/WS 合法流量不受影响。
+    let app = if no_rate_limit {
+        eprintln!("[rate-limit] disabled (--no-rate-limit)");
+        app
+    } else {
+        match evo_agent::api::rate_limit::resolve_governor_config(
+            evo_agent::api::rate_limit::DEFAULT_RATE_LIMIT_PER_SEC,
+            evo_agent::api::rate_limit::DEFAULT_RATE_LIMIT_BURST,
+        ) {
+            Some(cfg) => {
+                eprintln!(
+                    "[rate-limit] enabled: {} req/s per-IP (burst={})",
+                    evo_agent::api::rate_limit::DEFAULT_RATE_LIMIT_PER_SEC,
+                    evo_agent::api::rate_limit::DEFAULT_RATE_LIMIT_BURST
+                );
+                app.layer(tower_governor::GovernorLayer::new(cfg))
+            }
+            None => {
+                eprintln!("[rate-limit] config resolved to None; disabled");
+                app
+            }
+        }
+    };
+
     // console 审计页 sidecar 自动拉起(仅 dev 形态;产物已静态托管时跳过,fail-soft)。
     // workbench.console_dir 配置 console-cloud 仓目录且产物缺位时,serve 启动期
     // 探测端口,未监听则拉起 vite dev;未配置/目录无效/拉起失败仅告警。
@@ -2881,10 +2918,14 @@ fn cmd_serve(
         if let Some(ledger) = &gov_ledger_o482 {
             ledger.ensure_gov_session_now().await;
         }
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .expect("server error");
+        axum::serve(
+            listener,
+            // ConnectInfo 注入:serve 面限流按客户端 IP 限速(PeerIpKeyExtractor 依赖)
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server error");
     });
 
     // B16:退出前全量断开 MCP server(close → kill 子进程,防泄漏)

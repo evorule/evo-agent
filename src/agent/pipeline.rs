@@ -1368,13 +1368,7 @@ mod tests {
             dir.path(),
             vec![crate::agent::user_hooks::HookRule {
                 tool: "grep_files".into(),
-                command: {
-                    if cfg!(target_os = "windows") {
-                        "echo ran > hook_ran.txt".to_string()
-                    } else {
-                        "echo ran > hook_ran.txt".to_string()
-                    }
-                },
+                command: "echo ran > hook_ran.txt".to_string(),
                 timeout_secs: Some(15),
             }],
         );

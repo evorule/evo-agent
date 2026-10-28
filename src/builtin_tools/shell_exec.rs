@@ -1542,10 +1542,7 @@ impl ShellExecTool {
                     ExecBackend::Local => {
                         obj.insert("sandbox".to_string(), Value::from("none"));
                         if let Some(reason) = &self.sandbox_downgrade {
-                            obj.insert(
-                                "sandbox_reason".to_string(),
-                                Value::from(reason.clone()),
-                            );
+                            obj.insert("sandbox_reason".to_string(), Value::from(reason.clone()));
                         }
                     }
                 }
@@ -2767,17 +2764,22 @@ mod tests {
 
         // container:强制档——容器名缺失/daemon 缺失均 fail-fast(显式意志
         // 不满足 = 拒绝,不静默裸跑)
-        let err =
-            resolve_sandbox_tier(crate::config::ShellSandboxMode::Container, None, true)
-                .unwrap_err();
+        let err = resolve_sandbox_tier(crate::config::ShellSandboxMode::Container, None, true)
+            .unwrap_err();
         assert!(err.contains("shell.container"), "got: {err}");
-        let err =
-            resolve_sandbox_tier(crate::config::ShellSandboxMode::Container, Some("dev"), false)
-                .unwrap_err();
+        let err = resolve_sandbox_tier(
+            crate::config::ShellSandboxMode::Container,
+            Some("dev"),
+            false,
+        )
+        .unwrap_err();
         assert!(err.contains("docker daemon"), "got: {err}");
-        let r =
-            resolve_sandbox_tier(crate::config::ShellSandboxMode::Container, Some("dev"), true)
-                .unwrap();
+        let r = resolve_sandbox_tier(
+            crate::config::ShellSandboxMode::Container,
+            Some("dev"),
+            true,
+        )
+        .unwrap();
         assert_eq!(r.container.as_deref(), Some("dev"));
         assert!(r.downgrade_reason.is_none());
 
@@ -2793,9 +2795,8 @@ mod tests {
             r.downgrade_reason.unwrap().contains("shell.container"),
             "auto downgrade reason must name the missing config"
         );
-        let r =
-            resolve_sandbox_tier(crate::config::ShellSandboxMode::Auto, Some("dev"), false)
-                .unwrap();
+        let r = resolve_sandbox_tier(crate::config::ShellSandboxMode::Auto, Some("dev"), false)
+            .unwrap();
         assert!(r.container.is_none());
         assert!(
             r.downgrade_reason.unwrap().contains("docker daemon"),
@@ -2803,9 +2804,8 @@ mod tests {
         );
 
         // appcontainer:期3 待 spike,显式报错(不猜、不回落)
-        let err =
-            resolve_sandbox_tier(crate::config::ShellSandboxMode::AppContainer, None, true)
-                .unwrap_err();
+        let err = resolve_sandbox_tier(crate::config::ShellSandboxMode::AppContainer, None, true)
+            .unwrap_err();
         assert!(err.contains("not yet implemented"), "got: {err}");
     }
 
@@ -2844,7 +2844,9 @@ mod tests {
             container: "dev".to_string(),
         });
         let marked = tool
-            .mark_audit(Ok(serde_json::json!({"status": "ok", "backend": "docker-exec"})))
+            .mark_audit(Ok(
+                serde_json::json!({"status": "ok", "backend": "docker-exec"}),
+            ))
             .unwrap();
         assert_eq!(
             marked.get("sandbox").and_then(|v| v.as_str()),
@@ -2857,9 +2859,10 @@ mod tests {
     fn test_trusted_profile_stamp_coexists_with_sandbox_mark() {
         // G1 既有 execution_profile 打标与 E-2 sandbox 章并存(tier-1 装配形态:
         // DockerExec + SandboxTrusted;此处 Local+Trusted 只验共存)
-        let tool = ShellExecTool::new()
-            .with_execution_profile(ExecutionProfile::SandboxTrusted);
-        let marked = tool.mark_audit(Ok(serde_json::json!({"status": "ok"}))).unwrap();
+        let tool = ShellExecTool::new().with_execution_profile(ExecutionProfile::SandboxTrusted);
+        let marked = tool
+            .mark_audit(Ok(serde_json::json!({"status": "ok"})))
+            .unwrap();
         assert_eq!(
             marked.get("execution_profile").and_then(|v| v.as_str()),
             Some("sandbox-trusted")

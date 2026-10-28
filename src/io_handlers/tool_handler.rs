@@ -604,20 +604,6 @@ mod tests {
 
     // === 接线状态查询（清债批 2026-10-25:占位不进 LLM 契约面） ===
 
-    /// 占位探针:is_wired=false 的最小桩(模拟 unwired() 构造的占位形态)
-    struct UnwiredProbe;
-
-    #[async_trait::async_trait]
-    impl ToolFunction for UnwiredProbe {
-        async fn call(&self, _args: &Value) -> IoResult {
-            Err("placeholder (not wired)".to_string())
-        }
-
-        fn is_wired(&self) -> bool {
-            false
-        }
-    }
-
     #[test]
     fn test_is_wired_defaults_true_for_plain_tools() {
         // 缺省 true:普通工具(EchoTool 未 override)零改动外溢

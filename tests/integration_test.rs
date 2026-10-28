@@ -2041,8 +2041,10 @@ async fn test_zero_step_timeout_does_not_kill_the_step() {
     let client = EvoruleApiClient::new(&server.url());
     let llm = LlmHandler::new("mock-model", &format!("http://{llm_addr}"))
         .with_retry_config(0, 0.001, 0.01);
-    let mut config = AgentConfig::default();
-    config.step_timeout = std::time::Duration::ZERO;
+    let config = AgentConfig {
+        step_timeout: std::time::Duration::ZERO,
+        ..Default::default()
+    };
     let mut runner = AgentRunner::new(config, client).with_llm_handler(llm);
 
     let result = runner.run("trigger slow llm").await;

@@ -67,7 +67,7 @@ fn root_locks() -> &'static Mutex<HashMap<PathBuf, &'static Mutex<()>>> {
 
 fn lock_for(root: &Path) -> MutexGuard<'static, ()> {
     let map: &mut HashMap<_, _> = &mut root_locks().lock().unwrap_or_else(|p| p.into_inner());
-    let lock: &'static Mutex<()> = *map
+    let lock: &'static Mutex<()> = map
         .entry(root.to_path_buf())
         .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))));
     lock.lock().unwrap_or_else(|p| p.into_inner())

@@ -1261,10 +1261,8 @@ mod tests {
         assert!(cfg.shell.container.is_none());
 
         // 显式档位 + 容器名
-        let cfg: Config = toml::from_str(
-            "[shell]\nsandbox = \"container\"\ncontainer = \"dev\"\n",
-        )
-        .unwrap();
+        let cfg: Config =
+            toml::from_str("[shell]\nsandbox = \"container\"\ncontainer = \"dev\"\n").unwrap();
         assert!(matches!(cfg.shell.sandbox, ShellSandboxMode::Container));
         assert_eq!(cfg.shell.container.as_deref(), Some("dev"));
 

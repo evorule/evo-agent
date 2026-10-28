@@ -104,7 +104,6 @@ fn outcome_json(outcome: &UndoOutcome) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io_handlers::tool_handler::ToolFunction as _;
 
     fn temp_store() -> (tempfile::TempDir, Arc<CheckpointStore>) {
         let dir = tempfile::tempdir().unwrap();

@@ -2192,7 +2192,7 @@ impl AgentRunner {
     /// - 快照仓库常驻(pre-capture/post-commit 双段钩子在 run_pipeline)
     /// - verify 配置在场( from_definition 装载)时合成生产编排器(命令在
     ///   agent workdir 执行,与 shell_exec 同级安全口径)
-    /// 未接线(默认)=两钩子零开销跳过,行为与既有完全一致(缺省不变式)
+    ///   未接线(默认)=两钩子零开销跳过,行为与既有完全一致(缺省不变式)
     pub fn with_workspace_checkpoint(mut self, workdir: &std::path::Path) -> Self {
         self.checkpoint = Some(std::sync::Arc::new(
             crate::agent::workspace_checkpoint::CheckpointStore::new(
@@ -8627,11 +8627,9 @@ impl AgentRunner {
                                                                vorch.run_pending(journal.as_deref()).await
                                                            {
                                                                if !report.observation.is_empty() {
-                                                                   if let Some(last) = messages.last_mut() {
-                                                                       if let Message::Tool { content, .. } = last {
-                                                                           content.push('\n');
-                                                                           content.push_str(&report.observation);
-                                                                       }
+                                                                   if let Some(Message::Tool { content, .. }) = messages.last_mut() {
+                                                                       content.push('\n');
+                                                                       content.push_str(&report.observation);
                                                                    }
                                                                }
                                                                if report.escalate {

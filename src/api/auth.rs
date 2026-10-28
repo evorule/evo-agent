@@ -513,11 +513,10 @@ mod tests {
     fn test_ticket_store_expired_entry_rejected() {
         // 过期判定:消费时 issued_at 距今超过 TTL 即拒(构造回拨账本直接验证)
         let store = TicketStore::default();
-        store
-            .tickets
-            .lock()
-            .unwrap()
-            .insert("stale".to_string(), Instant::now() - TICKET_TTL - Duration::from_secs(1));
+        store.tickets.lock().unwrap().insert(
+            "stale".to_string(),
+            Instant::now() - TICKET_TTL - Duration::from_secs(1),
+        );
         assert!(!store.consume("stale"), "expired ticket must be rejected");
     }
 
