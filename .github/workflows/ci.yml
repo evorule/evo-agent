@@ -2,6 +2,9 @@
 #
 # Coverage:
 # - lint: cargo fmt --check + cargo clippy (all targets)
+#   + cargo check on the opt-in `semantic` feature (keeps the feature-gated
+#   fastembed face from rotting unseen; default graph stays zero-onnx --
+#   the contract phase asserts that independently)
 # - verify: verify.ps1 on Linux + Windows (build + test + secret scan
 #   + dependency-contract assertion) and doc tests
 # - web-test: workbench frontend unit tests (vitest)
@@ -42,6 +45,14 @@ jobs:
 
       - name: cargo clippy (all targets)
         run: cargo clippy --all-targets
+
+      # Feature-gated compile face: fastembed sits behind the opt-in
+      # `semantic` feature, so the default CI graph never compiles it.
+      # Check it here (type-check only, no codegen) so interface drift
+      # cannot rot the gated code unseen. Type-check keeps this cheap;
+      # the default graph stays zero-onnx regardless (contract phase).
+      - name: cargo check (semantic feature)
+        run: cargo check --features semantic
 
   verify:
     name: verify (${{ matrix.name }})
