@@ -34,6 +34,13 @@ jobs:
     needs: dist-gate
     runs-on: windows-latest
     steps:
+      # Windows runner 的 Git for Windows 默认 core.autocrlf=true：检出 CRLF 化 +
+      # diff 时与 LF blob 对拍会产生行尾幻影（freshness 门 2026-10-28 实证：
+      # git diff --quiet 判脏而 --stat 列空）。全局关掉，检出即与 blob 一致。
+      - name: Set core.autocrlf false (runner default true causes eol phantoms)
+        run: git config --global core.autocrlf false
+        shell: pwsh
+
       - uses: actions/checkout@v4
         with:
           path: evo-agent
