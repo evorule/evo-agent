@@ -58,6 +58,9 @@ pub struct OrchestrationNode {
     /// 派生落账时间(unix ms;根节点无)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spawned_at: Option<u64>,
+    /// 委托窗口 token 累计(delegate 节点且有埋点时携带;spawn/根节点无)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<u64>,
     /// 状态:done | failed | unknown(journal 尾部推断,v1 允许 unknown)
     pub status: String,
 }
@@ -97,6 +100,9 @@ pub struct OrchestrationLink {
     pub kind: String,
     /// 深度(根 = 0)
     pub depth: u32,
+    /// 委托窗口 token 累计(delegate 且有埋点时携带;serde 跳过 None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<u64>,
 }
 
 /// `GET /api/orchestration/sessions`(全局模式)响应
@@ -149,6 +155,8 @@ pub(crate) struct SpawnAnchor {
     pub ts: u64,
     /// 父 journal 内 seq(时序)
     pub seq: u64,
+    /// 委托窗口 token 累计(delegate 专属;spawn 链/未接线埋点=None)
+    pub tokens_used: Option<u64>,
 }
 
 /// 扫描单份 journal 内全部派生锚(按 seq 升序;parent 即 journal 归属会话)
@@ -160,6 +168,7 @@ pub(crate) fn scan_spawn_anchors(journal: &[JournalLine], parent_sid: &str) -> V
                 child_session_id,
                 agent_type,
                 depth,
+                tokens_used,
                 ..
             } => Some(SpawnAnchor {
                 parent: parent_sid.to_string(),
@@ -169,6 +178,7 @@ pub(crate) fn scan_spawn_anchors(journal: &[JournalLine], parent_sid: &str) -> V
                 depth: u32::try_from(*depth).unwrap_or(u32::MAX),
                 ts: line.ts,
                 seq: line.seq,
+                tokens_used: *tokens_used,
             }),
             JournalEvent::SessionSpawned {
                 parent,
@@ -182,6 +192,7 @@ pub(crate) fn scan_spawn_anchors(journal: &[JournalLine], parent_sid: &str) -> V
                 depth: *depth,
                 ts: line.ts,
                 seq: line.seq,
+                tokens_used: None,
             }),
             _ => None,
         })
@@ -219,6 +230,7 @@ pub(crate) fn build_tree(
         kind: None,
         depth: 0,
         spawned_at: None,
+        tokens_used: None,
         status: root_status.to_string(),
     }];
     let mut sorted: Vec<&SpawnAnchor> = anchors.iter().collect();
@@ -236,6 +248,7 @@ pub(crate) fn build_tree(
             kind: Some(a.kind.to_string()),
             depth: a.depth,
             spawned_at: Some(a.ts),
+            tokens_used: a.tokens_used,
             status: status_of(&a.child),
         });
         edges.push(OrchestrationEdge {
@@ -312,6 +325,7 @@ pub async fn list_orchestration_sessions(
                         agent_type: a.agent_type,
                         kind: a.kind.to_string(),
                         depth: a.depth,
+                        tokens_used: a.tokens_used,
                     });
                 }
             }
@@ -373,6 +387,7 @@ mod tests {
             depth,
             ts: 1000 + seq,
             seq,
+            tokens_used: None,
         }
     }
 
@@ -429,6 +444,7 @@ mod tests {
                 depth: 1,
                 ts: 20,
                 seq: 2,
+                tokens_used: None,
             }
         );
         assert_eq!(anchors[1].child, "c2");

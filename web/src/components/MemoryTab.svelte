@@ -6,7 +6,13 @@
      对应端点,本面板不硬造;数据源 best-effort 同步,失败呈本地缓存。 -->
 <script>
   import { sessionId, sessions } from '../lib/stores.js';
-  import { listSessionEvents, listUserNotes, putUserNote, deleteUserNote } from '../lib/api.js';
+  import {
+    listSessionEvents,
+    listUserNotes,
+    putUserNote,
+    deleteUserNote,
+    browseMemory,
+  } from '../lib/api.js';
   import AuditBadge from './AuditBadge.svelte';
   import AuditCard from './AuditCard.svelte';
   import { auditState, badgeStatus, factForMemoryEvent } from '../lib/audit.js';
@@ -111,9 +117,51 @@
     armDelete(key);
   }
 
+  // ===== 跨会话记忆浏览(只读投影;scope 白名单 stable/candidates/handovers) =====
+  let browseScope = $state('stable');
+  let browseEntries = $state([]);
+  let browseLoading = $state(false);
+  let browseErr = $state('');
+
+  async function refreshBrowse() {
+    if (!$sessionId) return;
+    browseLoading = true;
+    browseErr = '';
+    try {
+      const r = await browseMemory(noteAgentType(), browseScope);
+      browseEntries = r.entries || [];
+    } catch (e) {
+      browseErr = String(e?.message || e);
+    } finally {
+      browseLoading = false;
+    }
+  }
+
+  function switchScope(s) {
+    if (s === browseScope) return;
+    browseScope = s;
+    refreshBrowse();
+  }
+
+  /** path 尾段作展示键(shared.{ns}.stable.llm.m2 → stable.llm.m2 相对尾段) */
+  function shortPath(p) {
+    if (typeof p !== 'string') return '—';
+    const prefix = `shared.${noteAgentType()}.`;
+    return p.startsWith(prefix) ? p.slice(prefix.length) : p;
+  }
+
+  function browseSummary(v) {
+    if (v == null) return '';
+    let text = typeof v === 'string' ? v : JSON.stringify(v);
+    return text.length > 110 ? `${text.slice(0, 110)}…` : text;
+  }
+
   $effect(() => {
-    // 会话切换:笔记区随动(事件区由既有 loadedFor 机制驱动)
-    if ($sessionId) refreshNotes();
+    // 会话切换:笔记区随动(事件区由既有 loadedFor 机制驱动);浏览区懒加载
+    if ($sessionId) {
+      refreshNotes();
+      refreshBrowse();
+    }
     return () => {
       if (armTimer) clearTimeout(armTimer);
     };
@@ -260,6 +308,42 @@
       {/if}
     {:else}
       <div class="notes-empty">未连接会话——笔记写入需挂在当前会话账上(审计可溯源),先选择或新建会话。</div>
+    {/if}
+  </div>
+
+  <div class="notes browse">
+    <div class="notes-head">
+      <span class="notes-title">跨会话记忆</span>
+      <span class="notes-hint">只读投影(最新版本视图,墓碑已抑制)——写入面仅限上方用户笔记</span>
+      <span class="notes-spacer"></span>
+      {#each ['stable', 'knowledge_candidates', 'handovers'] as s}
+        <button
+          class="scope-btn"
+          class:active={browseScope === s}
+          onclick={() => switchScope(s)}
+          disabled={browseLoading || !$sessionId}
+        >
+          {s === 'stable' ? '长期事实' : s === 'knowledge_candidates' ? '知识候选' : '交接档'}
+        </button>
+      {/each}
+    </div>
+    {#if !$sessionId}
+      <div class="notes-empty">未连接会话。</div>
+    {:else if browseErr}
+      <div class="notes-err">{browseErr}</div>
+    {:else if browseLoading}
+      <div class="notes-empty">正在加载…</div>
+    {:else if browseEntries.length === 0}
+      <div class="notes-empty">该分区暂无跨会话记忆。</div>
+    {:else}
+      <ul class="notes-list">
+        {#each browseEntries as en (en.path)}
+          <li class="note-row">
+            <span class="note-key mono browse-path" title={en.path}>{shortPath(en.path)}</span>
+            <span class="note-value">{browseSummary(en.value)}</span>
+          </li>
+        {/each}
+      </ul>
     {/if}
   </div>
 
@@ -450,6 +534,35 @@
     color: var(--fg-muted, #888);
     font-size: var(--fs-xs);
     padding: 4px 0 8px;
+  }
+  /* 跨会话浏览区 */
+  .browse {
+    max-height: 38%;
+  }
+  .notes-spacer {
+    flex: 1;
+  }
+  .scope-btn {
+    font-size: 11px;
+    padding: 2px 10px;
+    cursor: pointer;
+    background: var(--bg-btn, #2a2a2a);
+    color: var(--fg, #ddd);
+    border: 1px solid var(--border, #3a3a3a);
+    border-radius: 4px;
+  }
+  .scope-btn.active {
+    background: var(--accent, #b8860b);
+    border-color: var(--accent, #b8860b);
+    color: #111;
+    font-weight: 600;
+  }
+  .scope-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .browse-path {
+    max-width: 260px;
   }
   .mem-head {
     display: flex;

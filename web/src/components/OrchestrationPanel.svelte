@@ -23,7 +23,15 @@
   }
   function nodeSub(n) {
     if (n.parent === null || n.parent === undefined) return n.session_id;
-    return n.temp ? '实时通道' : n.session_id;
+    if (n.temp) return '实时通道';
+    // 委托窗口 token 归账可见(delegate 节点且有埋点;B25 观测面)
+    const tok =
+      n.tokens_used == null
+        ? ''
+        : n.tokens_used >= 1000
+          ? ` · ${(n.tokens_used / 1000).toFixed(1)}k tok`
+          : ` · ${n.tokens_used} tok`;
+    return `${n.session_id}${tok}`;
   }
 
   // 挂载/换线自动加载一次(按会话 id 防重入环;刷新按钮走显式通道)
