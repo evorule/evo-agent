@@ -73,7 +73,7 @@ pub struct LlmConfig {
     /// 与 executor_url 同一缺省语义);出站 Authorization: Bearer 携带,
     /// 执行体校验匹配即放行。None/空 = 不发送(dev 兼容)。
     ///
-    /// 缺陷修复(EVA2-A101,2026-10-29 桌面 v0.5.1 装机实测发现):此前仅
+    /// 缺陷修复(Z-EXEC-1,2026-10-29 桌面 v0.5.1 装机实测发现):此前仅
     /// llm_handler/with_defaults 与 web_search 直读 env,而 from_config/admin
     /// 模型清单中继消费的 config.executor_token 在桌面部署(模板不含该键、
     /// 壳仅 env 注入)恒为 None——出站裸奔,执行体 401
@@ -1431,7 +1431,7 @@ max_retries = 7
 
     #[test]
     fn test_llm_executor_token_env_fallback_and_toml_override() {
-        // EVA2-A101 入场券:executor_token 的缺省解析必须与 executor_url 同语义——
+        // Z-EXEC-1 入场券:executor_token 的缺省解析必须与 executor_url 同语义——
         // toml 未声明 → env `EVORULE_LLM_EXECUTOR_TOKEN` 回落(桌面壳注入面);
         // toml 显式声明 → 声明值优先。此前 admin 中继/from_config 消费面恒 None,
         // 桌面部署出站裸奔 401。
