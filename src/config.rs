@@ -68,10 +68,17 @@ pub struct LlmConfig {
     /// `EVORULE_LLM_EXECUTOR_URL`,再回落 `http://127.0.0.1:9130/llm/execute`
     #[serde(default = "LlmConfig::default_executor_url")]
     pub executor_url: String,
-    /// 执行体调用方令牌(SG-1 件1 配套):env `EVORULE_LLM_EXECUTOR_TOKEN` 优先,
-    /// toml `[llm] executor_token` 兜底;出站 Authorization: Bearer 携带,
+    /// 执行体调用方令牌(SG-1 件1 配套):toml `[llm] executor_token` 显式声明
+    /// 优先,未声明时回落 env `EVORULE_LLM_EXECUTOR_TOKEN`(桌面壳编排注入面,
+    /// 与 executor_url 同一缺省语义);出站 Authorization: Bearer 携带,
     /// 执行体校验匹配即放行。None/空 = 不发送(dev 兼容)。
-    #[serde(default)]
+    ///
+    /// 缺陷修复(EVA2-A101,2026-10-29 桌面 v0.5.1 装机实测发现):此前仅
+    /// llm_handler/with_defaults 与 web_search 直读 env,而 from_config/admin
+    /// 模型清单中继消费的 config.executor_token 在桌面部署(模板不含该键、
+    /// 壳仅 env 注入)恒为 None——出站裸奔,执行体 401
+    /// 「caller token missing or mismatched」,模型清单与对话全灭。
+    #[serde(default = "LlmConfig::default_executor_token")]
     pub executor_token: Option<String>,
     /// 请求超时(秒)
     #[serde(default = "default_llm_timeout")]
@@ -108,6 +115,13 @@ impl LlmConfig {
     pub fn default_executor_url() -> String {
         std::env::var("EVORULE_LLM_EXECUTOR_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:9130/llm/execute".to_string())
+    }
+    /// 默认执行体调用方令牌:env `EVORULE_LLM_EXECUTOR_TOKEN`,未设/空白 = None
+    pub fn default_executor_token() -> Option<String> {
+        std::env::var("EVORULE_LLM_EXECUTOR_TOKEN")
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
     }
 }
 
@@ -346,7 +360,7 @@ impl Default for LlmConfig {
             model: Self::default_model(),
             api_base: Self::default_api_base(),
             executor_url: Self::default_executor_url(),
-            executor_token: None,
+            executor_token: Self::default_executor_token(),
             timeout_secs: default_llm_timeout(),
             max_retries: default_max_retries(),
             max_tokens: None,
@@ -795,6 +809,7 @@ impl Config {
             merge_field(table, "model", &mut self.llm.model)?;
             merge_field(table, "api_base", &mut self.llm.api_base)?;
             merge_field(table, "executor_url", &mut self.llm.executor_url)?;
+            merge_field(table, "executor_token", &mut self.llm.executor_token)?;
             merge_field(table, "timeout_secs", &mut self.llm.timeout_secs)?;
             merge_field(table, "max_retries", &mut self.llm.max_retries)?;
             merge_field(table, "max_tokens", &mut self.llm.max_tokens)?;
@@ -1194,7 +1209,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// 配置解析涉及的全部环境变量名(测试隔离用)
-    const LLM_ENV_NAMES: [&str; 17] = [
+    const LLM_ENV_NAMES: [&str; 18] = [
         "MINIMAX_API_KEY",
         "MINIMAX_MODEL",
         "MINIMAX_API_BASE",
@@ -1212,6 +1227,7 @@ mod tests {
         "EVO_AGENT_LLM__MAX_RETRIES",
         "EVO_AGENT_EVORULE__SERVICE_TOOLS",
         "EVO_AGENT_MCP__SERVERS",
+        "EVORULE_LLM_EXECUTOR_TOKEN",
     ];
 
     /// 删除全部 LLM 相关环境变量(防本机环境泄漏进测试),返回原值快照供恢复
@@ -1371,7 +1387,9 @@ model = "gpt-4o"
         // 「字段在结构体上存在、toml 值被静默忽略」这类配置面缺陷复发
         let _lock = ENV_LOCK.lock().unwrap();
         let exec_snap = std::env::var("EVORULE_LLM_EXECUTOR_URL").ok();
+        let tok_snap = std::env::var("EVORULE_LLM_EXECUTOR_TOKEN").ok();
         std::env::remove_var("EVORULE_LLM_EXECUTOR_URL");
+        std::env::remove_var("EVORULE_LLM_EXECUTOR_TOKEN");
         let tmp = tempfile::tempdir().unwrap();
         let toml_path = tmp.path().join("evo-agent.toml");
         std::fs::write(
@@ -1383,6 +1401,7 @@ api_key = "k1"
 model = "m1"
 api_base = "https://api.example.com/v1"
 executor_url = "http://127.0.0.1:9999/llm/execute"
+executor_token = "tok-mixed"
 timeout_secs = 11
 max_retries = 7
 "#,
@@ -1396,12 +1415,66 @@ max_retries = 7
         assert_eq!(cfg.llm.model, "m1");
         assert_eq!(cfg.llm.api_base, "https://api.example.com/v1");
         assert_eq!(cfg.llm.executor_url, "http://127.0.0.1:9999/llm/execute");
+        assert_eq!(cfg.llm.executor_token, Some("tok-mixed".to_string()));
         assert_eq!(cfg.llm.timeout_secs, 11);
         assert_eq!(cfg.llm.max_retries, 7);
 
         match exec_snap {
             Some(v) => std::env::set_var("EVORULE_LLM_EXECUTOR_URL", v),
             None => std::env::remove_var("EVORULE_LLM_EXECUTOR_URL"),
+        }
+        match tok_snap {
+            Some(v) => std::env::set_var("EVORULE_LLM_EXECUTOR_TOKEN", v),
+            None => std::env::remove_var("EVORULE_LLM_EXECUTOR_TOKEN"),
+        }
+    }
+
+    #[test]
+    fn test_llm_executor_token_env_fallback_and_toml_override() {
+        // EVA2-A101 入场券:executor_token 的缺省解析必须与 executor_url 同语义——
+        // toml 未声明 → env `EVORULE_LLM_EXECUTOR_TOKEN` 回落(桌面壳注入面);
+        // toml 显式声明 → 声明值优先。此前 admin 中继/from_config 消费面恒 None,
+        // 桌面部署出站裸奔 401。
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tok_snap = std::env::var("EVORULE_LLM_EXECUTOR_TOKEN").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("evo-agent.toml");
+
+        // ① env 回落:toml 无 executor_token → Some(env 值)
+        std::env::set_var("EVORULE_LLM_EXECUTOR_TOKEN", "env-token-1");
+        std::fs::write(&toml_path, "[llm]\nmodel = \"m1\"\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.merge_from_file(&toml_path).unwrap();
+        assert_eq!(cfg.llm.executor_token, Some("env-token-1".to_string()));
+
+        // ② toml 显式声明优先
+        std::fs::write(
+            &toml_path,
+            "[llm]\nmodel = \"m1\"\nexecutor_token = \"toml-token-2\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.merge_from_file(&toml_path).unwrap();
+        assert_eq!(cfg.llm.executor_token, Some("toml-token-2".to_string()));
+
+        // ③ env 空白串 = 未设(None,防壳误传空值出站空 Bearer)
+        std::env::set_var("EVORULE_LLM_EXECUTOR_TOKEN", "   ");
+        let mut cfg = Config::default();
+        cfg.merge_from_file(&toml_path).unwrap();
+        assert_eq!(cfg.llm.executor_token, Some("toml-token-2".to_string()));
+        std::fs::write(&toml_path, "[llm]\nmodel = \"m1\"\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.merge_from_file(&toml_path).unwrap();
+        assert_eq!(cfg.llm.executor_token, None);
+
+        // ④ env 未设 → None
+        std::env::remove_var("EVORULE_LLM_EXECUTOR_TOKEN");
+        let cfg = LlmConfig::default();
+        assert_eq!(cfg.executor_token, None);
+
+        match tok_snap {
+            Some(v) => std::env::set_var("EVORULE_LLM_EXECUTOR_TOKEN", v),
+            None => std::env::remove_var("EVORULE_LLM_EXECUTOR_TOKEN"),
         }
     }
 
