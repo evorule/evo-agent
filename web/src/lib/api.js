@@ -301,6 +301,41 @@ export function restoreCheckpoint(sid, cpId) {
   }).then(unwrap);
 }
 
+// ===== 记忆用户主权面(stable.user.* 用户笔记;跨会话持久,召回权威最高) =====
+
+/** 用户笔记列表({count, notes:[{key,value,fact_id,version}]};null 墓碑已抑制) */
+export function listUserNotes(agentType) {
+  return fetch(`/agents/${encodeURIComponent(agentType)}/memory/user-notes`, { headers: headers() }).then(unwrap);
+}
+
+/** 写/更新用户笔记(服务端强制 stable.user 域;账面挂 sessionId 供审计) */
+export function putUserNote(agentType, key, value, sessionId) {
+  return fetch(
+    `/agents/${encodeURIComponent(agentType)}/memory/user-notes/${encodeURIComponent(key)}`,
+    {
+      method: 'PUT',
+      headers: headers(true),
+      body: JSON.stringify({ value, session_id: sessionId }),
+    }
+  ).then(unwrap);
+}
+
+/** 删除用户笔记(null 墓碑,latest-wins 视图抑制;账面挂 sessionId 供审计) */
+export function deleteUserNote(agentType, key, sessionId) {
+  return fetch(
+    `/agents/${encodeURIComponent(agentType)}/memory/user-notes/${encodeURIComponent(key)}?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'DELETE', headers: headers() }
+  ).then(unwrap);
+}
+
+/** 跨会话记忆浏览(scope=stable|knowledge_candidates|handovers;只读) */
+export function browseMemory(agentType, scope = 'stable') {
+  return fetch(
+    `/agents/${encodeURIComponent(agentType)}/memory/browse?scope=${encodeURIComponent(scope)}`,
+    { headers: headers() }
+  ).then(unwrap);
+}
+
 /** S5:会话模型清单(执行体白名单中继;{ready, models, current[, note]}) */
 export function getLlmModels() {
   return fetch('/admin/llm-models', { headers: headers() }).then(unwrap);

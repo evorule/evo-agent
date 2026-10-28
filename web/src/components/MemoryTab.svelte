@@ -5,8 +5,8 @@
      (content/因果链/实体/来源)。写面(单条删除等 HumanGate 通道)无
      对应端点,本面板不硬造;数据源 best-effort 同步,失败呈本地缓存。 -->
 <script>
-  import { sessionId } from '../lib/stores.js';
-  import { listSessionEvents } from '../lib/api.js';
+  import { sessionId, sessions } from '../lib/stores.js';
+  import { listSessionEvents, listUserNotes, putUserNote, deleteUserNote } from '../lib/api.js';
   import AuditBadge from './AuditBadge.svelte';
   import AuditCard from './AuditCard.svelte';
   import { auditState, badgeStatus, factForMemoryEvent } from '../lib/audit.js';
@@ -20,6 +20,104 @@
   // audit-one-click:记忆条目挂共享审计徽章——有 fact_id 的条目按链上
   // 存证绿/灰,点开同款报告卡(按 fact_id 直查,不走消息映射)。
   let auditCardEntry = $state(null);
+
+  // ===== 用户笔记(记忆用户主权面:stable.user.* 跨会话持久,召回权威最高) =====
+  let notes = $state([]);
+  let notesErr = $state('');
+  let notesBusy = $state(false);
+  let newKey = $state('');
+  let newValue = $state('');
+  // 内联编辑态(key → 草稿文本);null = 无编辑行
+  let editingKey = $state(null);
+  let editDraft = $state('');
+  // 删除两段式确认(3 秒回弹,同检查点 tab 形态)
+  let armedKey = $state(null);
+  let armTimer = $state(null);
+
+  /** 当前会话的 agent_type(sessions 索引回查;user-notes 端点按类型解析
+   *  namespace,与事件端点的服务端同源解析口径一致) */
+  function noteAgentType() {
+    const s = $sessions.find((x) => x.session_id === $sessionId);
+    return s?.agent_type || 'general';
+  }
+
+  async function refreshNotes() {
+    if (!$sessionId) return;
+    notesErr = '';
+    try {
+      const r = await listUserNotes(noteAgentType());
+      notes = r.notes || [];
+    } catch (e) {
+      notesErr = String(e?.message || e);
+    }
+  }
+
+  async function addNote() {
+    const key = newKey.trim();
+    if (!key || !newValue.trim() || notesBusy) return;
+    notesBusy = true;
+    notesErr = '';
+    try {
+      await putUserNote(noteAgentType(), key, newValue.trim(), $sessionId);
+      newKey = '';
+      newValue = '';
+      await refreshNotes();
+    } catch (e) {
+      notesErr = String(e?.message || e);
+    } finally {
+      notesBusy = false;
+    }
+  }
+
+  async function saveEdit(key) {
+    if (notesBusy) return;
+    notesBusy = true;
+    notesErr = '';
+    try {
+      await putUserNote(noteAgentType(), key, editDraft, $sessionId);
+      editingKey = null;
+      editDraft = '';
+      await refreshNotes();
+    } catch (e) {
+      notesErr = String(e?.message || e);
+    } finally {
+      notesBusy = false;
+    }
+  }
+
+  function armDelete(key) {
+    if (armTimer) clearTimeout(armTimer);
+    armedKey = key;
+    armTimer = setTimeout(() => (armedKey = null), 3000);
+  }
+
+  async function removeNote(key) {
+    if (notesBusy) return;
+    notesBusy = true;
+    notesErr = '';
+    try {
+      await deleteUserNote(noteAgentType(), key, $sessionId);
+      armedKey = null;
+      await refreshNotes();
+    } catch (e) {
+      notesErr = String(e?.message || e);
+    } finally {
+      notesBusy = false;
+    }
+  }
+
+  function onDelClick(key) {
+    if (armedKey === key) return removeNote(key);
+    armDelete(key);
+  }
+
+  $effect(() => {
+    // 会话切换:笔记区随动(事件区由既有 loadedFor 机制驱动)
+    if ($sessionId) refreshNotes();
+    return () => {
+      if (armTimer) clearTimeout(armTimer);
+    };
+  });
 
   function evBadge(ev) {
     const has = factForMemoryEvent($auditState, ev?.fact_id) != null;
@@ -88,7 +186,85 @@
 </script>
 
 <div class="mem">
+  <div class="notes">
+    <div class="notes-head">
+      <span class="notes-title">用户笔记</span>
+      <span class="notes-hint">跨会话持久 · 召回面最高权威(agent 不可改写,遗忘权在您)</span>
+    </div>
+    {#if notesErr}<div class="notes-err">{notesErr}</div>{/if}
+    {#if $sessionId}
+      {#if notes.length > 0}
+        <ul class="notes-list">
+          {#each notes as n (n.key)}
+            <li class="note-row">
+              {#if editingKey === n.key}
+                <div class="note-edit">
+                  <textarea
+                    class="note-value-input"
+                    rows="2"
+                    bind:value={editDraft}
+                    disabled={notesBusy}
+                  ></textarea>
+                  <div class="note-actions">
+                    <button class="primary" onclick={() => saveEdit(n.key)} disabled={notesBusy}>保存</button>
+                    <button onclick={() => (editingKey = null)} disabled={notesBusy}>取消</button>
+                  </div>
+                </div>
+              {:else}
+                <span class="note-key mono">{n.key}</span>
+                <span class="note-value">{n.value}</span>
+                <span class="note-spacer"></span>
+                <button
+                  class="ghost"
+                  onclick={() => {
+                    editingKey = n.key;
+                    editDraft = typeof n.value === 'string' ? n.value : JSON.stringify(n.value);
+                  }}
+                  disabled={notesBusy}>编辑</button
+                >
+                <button
+                  class="danger"
+                  class:armed={armedKey === n.key}
+                  onclick={() => onDelClick(n.key)}
+                  disabled={notesBusy}
+                >
+                  {armedKey === n.key ? '确认删除?' : '删除'}
+                </button>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <div class="notes-empty">暂无笔记——写下项目约定、偏好或长期有效的指令,它们在所有会话的召回面以最高权重生效。</div>
+      {/if}
+      {#if editingKey === null}
+        <div class="note-add">
+          <input
+            class="note-key-input mono"
+            placeholder="键(如 coding-style)"
+            bind:value={newKey}
+            maxlength="96"
+            disabled={notesBusy}
+          />
+          <input
+            class="note-value-input"
+            placeholder="笔记内容…"
+            bind:value={newValue}
+            onkeydown={(e) => e.key === 'Enter' && addNote()}
+            disabled={notesBusy}
+          />
+          <button class="primary" onclick={addNote} disabled={notesBusy || !newKey.trim() || !newValue.trim()}>
+            添加
+          </button>
+        </div>
+      {/if}
+    {:else}
+      <div class="notes-empty">未连接会话——笔记写入需挂在当前会话账上(审计可溯源),先选择或新建会话。</div>
+    {/if}
+  </div>
+
   <div class="mem-head">
+    <span class="notes-title">会话记忆事件</span>
     <input
       class="mem-filter"
       type="text"
@@ -154,6 +330,126 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
+  }
+  /* ===== 用户笔记区 ===== */
+  .notes {
+    border-bottom: 1px solid var(--border);
+    padding: var(--sp-xs) var(--sp-sm) var(--sp-sm);
+    flex-shrink: 0;
+    max-height: 45%;
+    overflow-y: auto;
+  }
+  .notes-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-sm);
+    margin-bottom: 6px;
+  }
+  .notes-title {
+    font-weight: 600;
+    font-size: var(--fs-xs);
+  }
+  .notes-hint {
+    font-size: 11px;
+    color: var(--fg-muted, #888);
+  }
+  .notes-list {
+    list-style: none;
+    margin: 0 0 8px;
+    padding: 0;
+  }
+  .note-row {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--sp-sm);
+    padding: 4px 0;
+    border-bottom: 1px dashed var(--border-dim, #262626);
+  }
+  .note-key {
+    color: var(--accent, #b8860b);
+    min-width: 110px;
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .note-value {
+    flex: 1;
+    min-width: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: var(--fs-xs);
+  }
+  .note-spacer {
+    flex: 0;
+  }
+  .note-edit {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .note-actions {
+    display: flex;
+    gap: 6px;
+  }
+  .note-add {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+  }
+  .note-key-input {
+    width: 160px;
+    flex-shrink: 0;
+  }
+  .note-value-input {
+    flex: 1;
+    min-width: 0;
+  }
+  .note-key-input,
+  .note-value-input {
+    font-size: var(--fs-xs);
+    padding: 3px var(--sp-sm);
+    background: var(--bg-input, #1c1c1c);
+    color: var(--fg, #ddd);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+  .notes button {
+    font-size: 11px;
+    padding: 2px 10px;
+    cursor: pointer;
+    background: var(--bg-btn, #2a2a2a);
+    color: var(--fg, #ddd);
+    border: 1px solid var(--border, #3a3a3a);
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .notes button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .notes button.primary {
+    background: var(--accent, #b8860b);
+    border-color: var(--accent, #b8860b);
+    color: #111;
+    font-weight: 600;
+  }
+  .notes button.danger.armed {
+    background: #8b2020;
+    border-color: #c04040;
+    color: #fff;
+  }
+  .notes-err {
+    color: #e07070;
+    font-size: 11px;
+    padding: 2px 0;
+  }
+  .notes-empty {
+    color: var(--fg-muted, #888);
+    font-size: var(--fs-xs);
+    padding: 4px 0 8px;
   }
   .mem-head {
     display: flex;

@@ -818,6 +818,20 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/sessions/{id}/checkpoints/{cp_id}/restore",
             axum::routing::post(restore_session_checkpoint),
         )
+        // 记忆用户主权面:用户笔记读写删(仅 stable.user 域,服务端拼 path)
+        // + 跨会话记忆浏览(只读,前缀白名单制)
+        .route(
+            "/agents/{type}/memory/user-notes",
+            axum::routing::get(list_user_notes),
+        )
+        .route(
+            "/agents/{type}/memory/user-notes/{key}",
+            axum::routing::put(put_user_note).delete(delete_user_note),
+        )
+        .route(
+            "/agents/{type}/memory/browse",
+            axum::routing::get(browse_memory),
+        )
         // 工作台配置(快照保留期;展示层,不触引擎面)
         .route(
             "/api/workbench/config",
@@ -2898,6 +2912,222 @@ async fn restore_session_checkpoint(
         "label": snap.label,
         "restored_version": actual,
         "messages": snap.messages,
+    })))
+}
+
+// =============================================================================
+// 记忆用户主权面:用户笔记(stable.user.*)读写 + 跨会话记忆浏览(只读)
+// =============================================================================
+
+/// 用户笔记 key 校验 + 服务端 path 合成。
+///
+/// key 白名单 [A-Za-z0-9_-](1-96 字符);path 由服务端拼 `stable.user.` 前缀
+/// ——调用方在协议上无法触达用户域之外的任何记忆区(跨域写拒的结构形态)。
+fn user_note_path(namespace: &str, key: &str) -> Result<String, (StatusCode, String)> {
+    let ok = !key.is_empty()
+        && key.len() <= 96
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid note key '{key}': use 1-96 chars [A-Za-z0-9_-]"),
+        ));
+    }
+    Ok(format!("shared.{namespace}.stable.user.{key}"))
+}
+
+/// append-only 共享事实 → latest-wins 视图(同 path 取最高版本;null 墓碑抑制)
+fn latest_wins_view(
+    facts: Vec<crate::api::evorule_client::SharedFactEntry>,
+) -> Vec<crate::api::evorule_client::SharedFactEntry> {
+    let mut best: std::collections::HashMap<String, crate::api::evorule_client::SharedFactEntry> =
+        std::collections::HashMap::new();
+    for f in facts {
+        match best.get(&f.path) {
+            Some(cur) if cur.version >= f.version => {}
+            _ => {
+                best.insert(f.path.clone(), f);
+            }
+        }
+    }
+    let mut view: Vec<_> = best.into_values().filter(|f| !f.value.is_null()).collect();
+    view.sort_by_key(|f| f.path.clone());
+    view
+}
+
+/// 用户笔记列表(跨会话持久;墓碑抑制后的当前视图)
+async fn list_user_notes(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(agent_type): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+    let prefix = format!("shared.{namespace}.stable.user.");
+    let facts = state
+        .evorule_client()
+        .get_shared_facts(Some(&prefix))
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let notes: Vec<serde_json::Value> = latest_wins_view(facts)
+        .into_iter()
+        .map(|f| {
+            serde_json::json!({
+                "key": f.path.rsplit('.').next().unwrap_or(""),
+                "path": f.path,
+                "value": f.value,
+                "fact_id": f.fact_id,
+                "version": f.version,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "agent_type": agent_type,
+        "namespace": namespace,
+        "count": notes.len(),
+        "notes": notes,
+    })))
+}
+
+/// 用户笔记写/更新请求体
+#[derive(Debug, serde::Deserialize)]
+struct UserNoteRequest {
+    /// 笔记正文(用户主权域直写;source 落 user,权威权重最高)
+    value: String,
+    /// 账面归属会话(审计可溯源;笔记写动作挂当前会话账)
+    session_id: String,
+}
+
+/// 用户笔记写/更新(用户主权域直写,免审;跨域写在服务端 path 合成处结构性拒绝)
+async fn put_user_note(
+    State(state): State<AgentApiState>,
+    axum::extract::Path((agent_type, key)): axum::extract::Path<(String, String)>,
+    Json(body): Json<UserNoteRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+    let path = user_note_path(&namespace, &key)?;
+    if body.value.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "note value must not be empty (use DELETE to remove a note)".to_string(),
+        ));
+    }
+    if body.session_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "session_id is required (the write lands on that session's ledger for auditability)"
+                .to_string(),
+        ));
+    }
+    let mut mem =
+        crate::agent::memory::MemoryManager::new(&namespace, state.evorule_client().clone())
+            .with_session_id(&body.session_id);
+    // set_scoped:MemoryRecord 序列化落账,B5 外部通道自动标 source=user
+    // (权威权重 1.0,召回面最高;stable.llm/system 域由 DomainForbidden 拒绝)
+    let outcome = mem
+        .set_scoped(
+            crate::agent::memory::MemoryScope::Shared,
+            &format!("stable.user.{key}"),
+            &body.value,
+        )
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let fact_id = match outcome {
+        crate::agent::memory::PersistOutcome::Persisted { fact_id } => fact_id,
+        crate::agent::memory::PersistOutcome::CacheOnly => None,
+    };
+    Ok(Json(serde_json::json!({
+        "key": key,
+        "path": path,
+        "persisted": fact_id,
+        "source": "user",
+    })))
+}
+
+/// 用户笔记删除(null 墓碑;latest-wins 视图抑制,append-only 原值永在账)
+async fn delete_user_note(
+    State(state): State<AgentApiState>,
+    axum::extract::Path((agent_type, key)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+    let path = user_note_path(&namespace, &key)?;
+    let session_id = q.get("session_id").cloned().unwrap_or_default();
+    if session_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "session_id query param is required (tombstone lands on that session's ledger)"
+                .to_string(),
+        ));
+    }
+    // 存在性核对(与 memory_tombstone 工具同语义:不存在的 path 落 null=凭空造账,拒绝)
+    let facts = state
+        .evorule_client()
+        .get_shared_facts(Some(&path))
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if !facts.iter().any(|f| f.path == path) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("note '{key}' not found (tombstoning a non-existent path would create a phantom entry)"),
+        ));
+    }
+    let fact_id = state
+        .evorule_client()
+        .update_payload(&session_id, &path, &serde_json::json!(null))
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "key": key,
+        "path": path,
+        "status": "tombstoned",
+        "fact_id": fact_id,
+    })))
+}
+
+/// 跨会话记忆浏览(只读投影;scope 前缀白名单制——用户可读,写面仅限用户域)
+async fn browse_memory(
+    State(state): State<AgentApiState>,
+    axum::extract::Path(agent_type): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let namespace = resolve_memory_namespace(&state, &agent_type);
+    let scope = q.get("scope").map(String::as_str).unwrap_or("stable");
+    // 前缀白名单:只读面开放非会话私域的三类;写面仅 stable.user(见 put_user_note)
+    let sub = match scope {
+        "stable" => "stable.",
+        "knowledge_candidates" => "knowledge_candidates.",
+        "handovers" => "handovers.",
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid scope '{other}': use stable | knowledge_candidates | handovers"),
+            ))
+        }
+    };
+    let prefix = format!("shared.{namespace}.{sub}");
+    let facts = state
+        .evorule_client()
+        .get_shared_facts(Some(&prefix))
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let entries: Vec<serde_json::Value> = latest_wins_view(facts)
+        .into_iter()
+        .map(|f| {
+            serde_json::json!({
+                "path": f.path,
+                "value": f.value,
+                "fact_id": f.fact_id,
+                "version": f.version,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "agent_type": agent_type,
+        "namespace": namespace,
+        "scope": scope,
+        "count": entries.len(),
+        "entries": entries,
     })))
 }
 
