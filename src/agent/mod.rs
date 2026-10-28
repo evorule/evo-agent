@@ -43,6 +43,7 @@ pub mod session_spawn_tool;
 pub mod skill_store;
 pub mod skills_mirror;
 pub mod stagnation;
+pub mod steering;
 pub mod summarizer;
 pub mod summary_fidelity;
 pub mod tool_intent;

@@ -1210,6 +1210,9 @@ pub struct AgentRunner {
     /// usage 真值计数器共享句柄（与 ContextWindowManager 内计数器同源状态）：
     /// 每次 LLM 响应喂入 provider 真值 → 压缩决策真值驱动 + 收尾三元组输出
     usage_counter: Option<std::sync::Arc<crate::agent::usage_counter::UsageAwareTokenCounter>>,
+    /// 交互式步间隙引导源（REPL 显式接线;None = 非交互路径,步间隙 drain 零开销零差异）:
+    /// 每次 LLM 步开始前 drain 排队注记,并入权威历史 + journal 留痕
+    steering: Option<std::sync::Arc<crate::agent::steering::SteeringSource>>,
     /// G10:上下文摘要器(记忆压缩)
     ///
     /// `Some` 时,裁剪掉的消息会送给摘要 LLM 生成摘要,替换 `[earlier N messages trimmed]` 提示。
@@ -1482,6 +1485,7 @@ impl AgentRunner {
             summary_model: None,
             context_window: None,
             usage_counter: None,
+            steering: None,
             summarizer: None,
             cancel_token: CancellationToken::new(),
             output_validator: None,
@@ -2449,6 +2453,16 @@ impl AgentRunner {
     /// None=不启用,manual/auto 档与未接线面行为零变化)
     pub fn with_runaway_policy(mut self, policy: Option<RunawayPolicy>) -> Self {
         self.runaway_policy = policy;
+        self
+    }
+
+    /// 交互式步间隙引导源接线（REPL 显式 opt-in;不接线 = None = 零差异）:
+    /// 步间隙 drain 排队注记并入权威历史,journal 留痕 + Info 回显
+    pub fn with_steering(
+        mut self,
+        src: std::sync::Arc<crate::agent::steering::SteeringSource>,
+    ) -> Self {
+        self.steering = Some(src);
         self
     }
 
@@ -4298,6 +4312,7 @@ impl AgentRunner {
                 execution_profile: None,
                 context_window,
                 usage_counter: Some(usage_counter),
+                steering: None,
                 summarizer: summarizer.clone(),
                 compaction_policy: None,
                 cancel_token: CancellationToken::new(),
@@ -7742,6 +7757,25 @@ impl AgentRunner {
                                            return;
                                        }
                                        yield Ok(AgentEvent::Step { step: step_count });
+
+                                       // 交互式步间隙引导注记 drain(REPL 显式接线;None=零开销零差异):
+                                       // 当前工具步不被打断,排队输入在下一模型调用前并入权威历史
+                                       if let Some(src) = &runner.steering {
+                                           while let Some(note) = src.try_recv() {
+                                               messages.push(crate::agent::translator::Message::User {
+                                                   content: format!("[steering note] {note}"),
+                                                   images: Vec::new(),
+                                               });
+                                               if let Some(j) = &journal {
+                                                   if let Err(e) = j.steering_note(&note) {
+                                                       tracing::warn!(session_id = %session_id, error = %e, "steering note journal write failed");
+                                                   }
+                                               }
+                                               yield Ok(AgentEvent::Info(format!(
+                                                   "steering note injected: {note}"
+                                               )));
+                                           }
+                                       }
 
                                        // PerReactRound:处理前刷写上一轮缓冲的消息
                                        if matches!(runner.message_persist_mode, MessagePersistMode::PerReactRound) {

@@ -312,6 +312,12 @@ enum Command {
         /// 加载失败则首次输入创建新 session。
         #[arg(long)]
         session: Option<String>,
+
+        /// 任务进行中可注入指令:轮内键入的行排队为引导注记,在工具步间隙
+        /// 并入对话(带可见回显;审批/问答等待期与轮结束后的首行输入会被
+        /// 回显并按引导注记处理)。缺省关闭,关闭时行为与现状逐字节一致。
+        #[arg(long)]
+        steering: bool,
     },
 
     /// G14:回放指定 session 的记忆事件链("则灵"生活回放)
@@ -535,12 +541,14 @@ fn main() -> ExitCode {
             agent,
             auto_approve_candidates,
             session,
+            steering,
         } => run_with_big_stack(move || {
             cmd_repl(
                 &cli.workdir,
                 agent.as_deref(),
                 auto_approve_candidates,
                 session.as_deref(),
+                steering,
                 cli.no_preflight,
             )
         }),
@@ -3465,6 +3473,7 @@ fn cmd_repl(
     agent: Option<&str>,
     auto_approve_candidates: bool,
     session: Option<&str>,
+    steering: bool,
     no_preflight: bool,
 ) -> ExitCode {
     use rustyline::error::ReadlineError;
@@ -3559,6 +3568,12 @@ fn cmd_repl(
 
     eprintln!("evo-agent REPL (agent: '{}')", agent_name);
     eprintln!("type /exit to quit, /session to show session ID, /rewind <version> to rollback");
+    if steering {
+        eprintln!(
+            "steering on: lines typed while a run is in progress queue as notes and are \
+             injected between tool steps"
+        );
+    }
     if resumed_session_id.is_some() {
         eprintln!("[repl] continuing from existing session");
     } else {
@@ -3566,6 +3581,15 @@ fn cmd_repl(
     }
 
     let mut current_session: Option<String> = resumed_session_id;
+
+    // 交互式步间隙引导源(--steering 显式 opt-in;关闭=None=零开销零差异)
+    let steering_src = if steering {
+        Some(std::sync::Arc::new(
+            evo_agent::agent::steering::SteeringSource::spawn(),
+        ))
+    } else {
+        None
+    };
 
     // REPL 共享环境(每轮稳定参数打包)
     let env = ReplEnv {
@@ -3576,6 +3600,7 @@ fn cmd_repl(
         workdir,
         auto_approve_candidates,
         session_file: &session_file,
+        steering: steering_src.as_ref(),
     };
 
     // 5. REPL 主循环
@@ -3671,6 +3696,18 @@ struct ReplEnv<'a> {
     workdir: &'a Path,
     auto_approve_candidates: bool,
     session_file: &'a Path,
+    /// 交互式步间隙引导源(--steering 显式 opt-in;None=关闭,轮内不挂读者)
+    steering: Option<&'a std::sync::Arc<evo_agent::agent::steering::SteeringSource>>,
+}
+
+/// 轮级 gate 守卫:构造时 begin_turn(挂读者+开门),Drop 时 end_turn(关门,
+/// 滞留读者至多再收一行即回类为下轮预注记退出)——所有退出路径统一收口。
+struct SteeringTurnGuard<'a>(&'a evo_agent::agent::steering::SteeringSource);
+
+impl Drop for SteeringTurnGuard<'_> {
+    fn drop(&mut self) {
+        self.0.end_turn();
+    }
 }
 
 /// G15:执行一轮 REPL 对话
@@ -3697,6 +3734,7 @@ fn run_repl_turn(
         workdir,
         auto_approve_candidates,
         session_file,
+        steering,
     } = *env;
 
     // 构造 tool_handler + llm_handler + runner(每轮重建,因为 run_streaming/run_continuation 消费 self)
@@ -3818,7 +3856,7 @@ fn run_repl_turn(
             None,
         )
     };
-    let runner = runner
+    let mut runner = runner
         .with_approval_callback(callback)
         .with_runaway_policy(runaway_policy)
         // 批K 段7:人在环问答端(REPL 交互)——stdin 编号问答;无人值守旗标/档位下
@@ -3829,6 +3867,10 @@ fn run_repl_turn(
                     || def.approval_mode.as_deref() == Some("auto_policy"),
             },
         ));
+    // 交互式步间隙引导接线:仅 --steering 显式开启;关闭时不挂源,行为不变
+    if let Some(s) = steering {
+        runner = runner.with_steering(s.clone());
+    }
 
     // G6:Ctrl+C → cancel_token
     let cancel_token = runner.cancel_token().clone();
@@ -3837,6 +3879,12 @@ fn run_repl_turn(
             eprintln!("\n[Ctrl+C received, cancelling current turn...]");
             cancel_token.cancel();
         }
+    });
+
+    // 轮级引导生命周期:本轮进门开闸挂读者;守卫 Drop 在所有退出路径统一收口
+    let _steering_turn = steering.map(|s| {
+        s.begin_turn();
+        SteeringTurnGuard(s)
     });
 
     let event_stream = if let Some(sid) = current_session.clone() {
@@ -3913,6 +3961,10 @@ fn run_repl_turn(
                     alternative,
                     ..
                 }) => {
+                    // 审批提示即将占用 stdin:引导读者让位(挂起,滞留行回显弃置)
+                    if let Some(s) = steering {
+                        s.pause_for_stdin_owner();
+                    }
                     eprintln!("\n[approval required] tool: {}", tool_name);
                     eprintln!("  command: {}", command);
                     eprintln!("  risk: {}", risk);
@@ -3925,6 +3977,10 @@ fn run_repl_turn(
                     approved,
                     ..
                 }) => {
+                    // 审批已决:重新开门,滞留引导读者继续排队
+                    if let Some(s) = steering {
+                        s.resume_after_stdin_owner();
+                    }
                     if approved {
                         eprintln!("[approved: {}]", tool_name);
                     } else {
@@ -3932,12 +3988,21 @@ fn run_repl_turn(
                     }
                 }
                 // 批K 段7:问答交互提示由 CliAskUser(stdin)负责,此处只收结果帧
-                Ok(AgentEvent::AskUser { .. }) => {}
+                Ok(AgentEvent::AskUser { .. }) => {
+                    // 问答提示即将占用 stdin:引导读者让位(挂起,滞留行回显弃置)
+                    if let Some(s) = steering {
+                        s.pause_for_stdin_owner();
+                    }
+                }
                 Ok(AgentEvent::AskUserResult {
                     answered,
                     timed_out,
                     ..
                 }) => {
+                    // 问答已决:重新开门,滞留引导读者继续排队
+                    if let Some(s) = steering {
+                        s.resume_after_stdin_owner();
+                    }
                     if answered {
                         eprintln!("[answer delivered]");
                     } else if timed_out {

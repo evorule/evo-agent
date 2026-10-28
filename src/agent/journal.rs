@@ -96,7 +96,7 @@ pub struct TodoItemSnapshot {
     pub priority: String,
 }
 
-/// journal 事件(21 种;schema 终版 = ATIF 映射表 §二增补)
+/// journal 事件(追加式演进;schema 终版 = ATIF 映射表 §二增补)
 ///
 /// 序列化形态:`{"type":"<event>","payload":{...}}`(adjacently tagged,
 /// 与文件行内 seq/ts 平铺后即全行)
@@ -567,6 +567,13 @@ pub enum JournalEvent {
         verdict: String,
         /// 输出全文 digest(evorule-hash 口径)
         output_digest: String,
+    },
+    /// 用户在任务进行中注入的引导注记(交互式步间隙排队注入):runner 在下一
+    /// 步开始前把原文作为 user 注记并入权威历史;载荷=用户原文逐字节保真,
+    /// 不脱敏(与命令事实链同口径)。观测面,不参与步映射。
+    SteeringNote {
+        /// 注入原文
+        text: String,
     },
 }
 
@@ -1320,6 +1327,13 @@ impl JournalWriter {
             seq,
         );
         Ok(seq)
+    }
+
+    /// 交互式步间隙引导注记落账(原文逐字节保真;观测面,不参与步映射)
+    pub fn steering_note(&self, text: &str) -> Result<u64, JournalError> {
+        self.push(JournalEvent::SteeringNote {
+            text: text.to_string(),
+        })
     }
 
     /// sediment 结果落 journal（受信通道持久化信号 + 沉淀结果对账依据）
