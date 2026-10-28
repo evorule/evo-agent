@@ -14,7 +14,8 @@
 //!
 //! - Streamable HTTP 单一 endpoint `POST /mcp`;响应为单 JSON(规范允许的
 //!   合法响应形态;SSE 流响应不做,诚实边界)
-//! - 协议版本 `2024-11-05`(与 client 面共用 [`PROTOCOL_VERSION`])
+//! - 协议版本 `2025-06-18`(与 client 面共用 [`PROTOCOL_VERSION`];
+//!   initialize 按规范协商:客户端请求的支持版本原样回显,不支持则返回最新)
 //! - 业务错误走 MCP `result.isError=true` 形态;协议错误(未知方法/解析
 //!   失败)走 JSON-RPC error
 //! - `enabled=false`(缺省)时不挂载路由 → 404,fail-closed
@@ -55,19 +56,28 @@ pub async fn mcp_post(State(state): State<AgentApiState>, body: String) -> Respo
             debug!(method = %method, "MCP server notification received");
             StatusCode::ACCEPTED.into_response()
         }
-        "initialize" => Json(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "protocolVersion": PROTOCOL_VERSION,
-                "serverInfo": {
-                    "name": "evo-agent",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": {"tools": {}},
-            }
-        }))
-        .into_response(),
+        "initialize" => {
+            // 版本协商(规范语义):客户端请求的支持版本原样回显;不支持/
+            // 缺失则返回服务端最新版本(客户端据此决定继续或断开)
+            let requested = req["params"]["protocolVersion"].as_str();
+            let negotiated = match requested {
+                Some(v) if v == PROTOCOL_VERSION || v == "2024-11-05" => v,
+                _ => PROTOCOL_VERSION,
+            };
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": negotiated,
+                    "serverInfo": {
+                        "name": "evo-agent",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": {"tools": {}},
+                }
+            }))
+            .into_response()
+        }
         "tools/list" => match tools_view(&state) {
             Ok(tools) => Json(json!({
                 "jsonrpc": "2.0",
@@ -273,6 +283,41 @@ mod tests {
         assert_eq!(v["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(v["result"]["serverInfo"]["name"], "evo-agent");
         assert_eq!(v["result"]["capabilities"]["tools"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_negotiates_supported_client_version() {
+        // 规范语义:客户端请求的支持版本原样回显(2025-06-18 与旧版
+        // 2024-11-05 均受支持);不支持版本回落服务端最新
+        let resp = mcp_post(
+            State(state_with_toolkit()),
+            post_body(
+                "initialize",
+                json!(1),
+                json!({"protocolVersion": "2024-11-05"}),
+            ),
+        )
+        .await;
+        let v = parse_json(resp).await;
+        assert_eq!(
+            v["result"]["protocolVersion"], "2024-11-05",
+            "旧客户端请求受支持版本应原样回显"
+        );
+
+        let resp = mcp_post(
+            State(state_with_toolkit()),
+            post_body(
+                "initialize",
+                json!(2),
+                json!({"protocolVersion": "1999-01-01"}),
+            ),
+        )
+        .await;
+        let v = parse_json(resp).await;
+        assert_eq!(
+            v["result"]["protocolVersion"], PROTOCOL_VERSION,
+            "不支持版本回落服务端最新"
+        );
     }
 
     #[tokio::test]
