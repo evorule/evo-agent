@@ -422,6 +422,177 @@ pub fn remove_custom_provider(paths: &ResolvedPaths, name: &str) -> Result<(), S
     custom_providers_store(paths, &list)
 }
 
+// ---- 模型准入参数化（桌面部署域）：配置面写入 + 白名单正本再生 ----
+//
+// 语义与 ops 侧 sync-model-admission.ps1 同构（配置面管清单、翻译器生成
+// 正本、执法仍在引擎+执行体双层）：保存 key/自定义服务时把该服务的模型
+// 并入准入配置并再生正本；引擎 hot-reload + 插件物料热重载（10s）自动
+// 生效，无需重启。本域治理根 = `<server_home>\agent-governance`。
+
+fn governance_root(paths: &ResolvedPaths) -> PathBuf {
+    paths.evorule_server_home.join("agent-governance")
+}
+
+pub fn model_admission_path(paths: &ResolvedPaths) -> PathBuf {
+    governance_root(paths).join("model-admission.json")
+}
+
+fn allowlist_rule_path(paths: &ResolvedPaths) -> PathBuf {
+    governance_root(paths)
+        .join("rules")
+        .join("00_constraint_model_allowlist.json")
+}
+
+/// 从白名单正本提取准入清单（出厂种子/翻译器产物同构；防御性解析——
+/// 找 in 域 values 节点，找不到返回空）
+fn parse_rule_values(rule: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(transforms) = rule.get("transform").and_then(|v| v.as_array()) {
+        for t in transforms {
+            if let Some(inner) = t.pointer("/params/domain/inner").and_then(|v| v.as_array()) {
+                for node in inner {
+                    if node.get("type").and_then(|v| v.as_str()) == Some("not") {
+                        if let Some(values) =
+                            node.pointer("/inner/values").and_then(|v| v.as_array())
+                        {
+                            for v in values {
+                                if let Some(m) = v.as_str() {
+                                    out.push(m.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn bump_patch_version(version: &str) -> String {
+    match version.split('.').collect::<Vec<_>>()[..] {
+        [maj, min, pat] => format!("{maj}.{min}.{}", pat.parse::<u64>().unwrap_or(0) + 1),
+        _ => "1.2.1".to_string(),
+    }
+}
+
+fn write_atomic(path: &std::path::Path, content: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, content).map_err(|e| format!("write {}: {e}", path.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
+}
+
+/// 把模型并入部署准入配置并再生白名单正本（版本 patch+1，原子写）。
+/// 引擎 hot-reload + 插件物料热重载（10s）自动生效；返回真正新增的模型。
+/// 不做移除（准入只增不移；收缩属部署治理操作，走配置文件手工编辑）。
+pub fn admit_models(paths: &ResolvedPaths, models: &[String]) -> Result<Vec<String>, String> {
+    let models: Vec<String> = models
+        .iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect();
+    if models.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rule_path = allowlist_rule_path(paths);
+    let rule: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&rule_path).map_err(|e| format!("read allowlist rule: {e}"))?,
+    )
+    .map_err(|e| format!("parse allowlist rule: {e}"))?;
+    let version = rule
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("1.2.0")
+        .to_string();
+    let mut current = parse_rule_values(&rule);
+    let mut added = Vec::new();
+    for m in &models {
+        if !current.iter().any(|e| e == m) {
+            current.push(m.clone());
+            added.push(m.clone());
+        }
+    }
+    if added.is_empty() {
+        return Ok(added);
+    }
+    let next_version = bump_patch_version(&version);
+    let mut next = rule.clone();
+    if let Some(obj) = next.as_object_mut() {
+        obj.insert("version".to_string(), serde_json::json!(next_version));
+    }
+    let values_json =
+        serde_json::Value::Array(current.iter().map(|m| serde_json::json!(m)).collect());
+    let reason = format!(
+        "会话模型不在本工作区准入白名单（仅允许 {}；由 model-admission.json 参数化生成）",
+        current.join("、")
+    );
+    if let Some(transforms) = next
+        .pointer_mut("/transform")
+        .and_then(|v| v.as_array_mut())
+    {
+        for t in transforms.iter_mut() {
+            if let Some(inner) = t
+                .pointer_mut("/params/domain/inner")
+                .and_then(|v| v.as_array_mut())
+            {
+                for node in inner.iter_mut() {
+                    if node.get("type").and_then(|v| v.as_str()) == Some("not") {
+                        if let Some(inner2) = node.pointer_mut("/inner") {
+                            if let Some(obj) = inner2.as_object_mut() {
+                                obj.insert("values".to_string(), values_json.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(params) = t.pointer_mut("/params").and_then(|v| v.as_object_mut()) {
+                if params.contains_key("reason") {
+                    params.insert("reason".to_string(), serde_json::json!(reason));
+                }
+            }
+        }
+    }
+    write_atomic(
+        &rule_path,
+        &serde_json::to_string_pretty(&next).map_err(|e| e.to_string())?,
+    )?;
+    write_atomic(
+        &model_admission_path(paths),
+        &serde_json::to_string_pretty(&serde_json::json!({ "allowed": current }))
+            .map_err(|e| e.to_string())?,
+    )?;
+    Ok(added)
+}
+
+/// 保存 key 后的准入跟随（保存已成功；准入失败只留痕不回滚 key）
+fn admit_for_provider_after_key_save(paths: &ResolvedPaths, name: &str) {
+    let models: Vec<String> = match catalog_entry(name) {
+        Some(e) => e.models.iter().map(|s| s.to_string()).collect(),
+        None => custom_providers_load(paths)
+            .ok()
+            .and_then(|list| list.into_iter().find(|c| c.name == name).map(|c| c.models))
+            .unwrap_or_default(),
+    };
+    if models.is_empty() {
+        return;
+    }
+    match admit_models(paths, &models) {
+        Ok(added) if !added.is_empty() => {
+            eprintln!(
+                "[wizard] provider '{name}' admission follow-up: +{}",
+                added.join(",")
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("[wizard] provider '{name}' admission follow-up failed (key saved): {e}")
+        }
+    }
+}
+
 /// 编排层合并视图条目（内置 + 自定义；目录序在前）
 #[derive(Clone, Debug)]
 pub struct OwnedProvider {
@@ -544,7 +715,10 @@ pub fn wizard_save_provider_key(
     name: String,
     key: String,
 ) -> Result<(), String> {
-    save_provider_key(&sup.paths, &name, &key)
+    save_provider_key(&sup.paths, &name, &key)?;
+    // 准入跟随：该服务的模型并入部署白名单（参数化配置面；失败只留痕不回滚）
+    admit_for_provider_after_key_save(&sup.paths, &name);
+    Ok(())
 }
 
 /// 自定义服务清单（向导自定义区消费；损坏显式报错不静默）
@@ -561,7 +735,10 @@ pub fn wizard_save_custom_provider(
     sup: tauri::State<'_, SupHandle>,
     provider: CustomProvider,
 ) -> Result<(), String> {
-    save_custom_provider(&sup.paths, &provider)
+    save_custom_provider(&sup.paths, &provider)?;
+    // 准入跟随：自定义服务的模型并入部署白名单
+    admit_for_provider_after_key_save(&sup.paths, &provider.name);
+    Ok(())
 }
 
 /// 移除自定义服务
@@ -961,6 +1138,86 @@ mod tests {
             save_custom_provider(&paths, &no_models).is_err(),
             "空 models"
         );
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn admit_models_unions_seeds_and_bumps_version() {
+        let mut paths = scratch_paths("admit");
+        // 隔离部署域：server home 指向一次性目录 + 出厂种子正本（v1.2.0 四模型）
+        let home = paths.data_dir.join("server-home");
+        std::fs::create_dir_all(home.join("agent-governance").join("rules")).unwrap();
+        let seed = serde_json::json!({
+            "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
+            "kind": "rule_set",
+            "id": "com.evorule.constraint.model_allowlist",
+            "version": "1.2.0",
+            "metadata": {"tier": "constraint", "title": "seed"},
+            "transform": [{"type": "enforce", "params": {"domain": {"type": "all", "inner": [
+                {"type": "instruction", "instruction_type": "call_external"},
+                {"type": "not", "inner": {"type": "in", "path": "instruction.params.model",
+                 "values": ["MiniMax-M2.5", "MiniMax-M3"], "on_missing": "error"}}]},
+                "reason": "会话模型不在本工作区准入白名单（仅允许 MiniMax-M2.5、MiniMax-M3）"}}]
+        });
+        std::fs::write(
+            home.join("agent-governance")
+                .join("rules")
+                .join("00_constraint_model_allowlist.json"),
+            serde_json::to_string_pretty(&seed).unwrap(),
+        )
+        .unwrap();
+        paths.evorule_server_home = home.clone();
+
+        // 并入新模型：正本 values 扩 + 版本 patch+1 + 配置面同落 + reason 随动
+        let added = admit_models(
+            &paths,
+            &[
+                "glm-4.6".to_string(),
+                "MiniMax-M2.5".to_string(),
+                "new-model".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            added,
+            vec!["glm-4.6".to_string(), "new-model".to_string()],
+            "已准入模型不重复计入"
+        );
+        let rule: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                home.join("agent-governance")
+                    .join("rules")
+                    .join("00_constraint_model_allowlist.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rule["version"], serde_json::json!("1.2.1"));
+        let values = parse_rule_values(&rule);
+        for m in ["MiniMax-M2.5", "MiniMax-M3", "glm-4.6", "new-model"] {
+            assert!(values.contains(&m.to_string()), "missing {m}");
+        }
+        assert!(rule["transform"][0]["params"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("glm-4.6"));
+        let admission: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(model_admission_path(&paths)).unwrap())
+                .unwrap();
+        assert_eq!(admission["allowed"].as_array().unwrap().len(), 4);
+        // 再并入同模型：零新增，版本不再跳
+        let added2 = admit_models(&paths, &["glm-4.6".to_string()]).unwrap();
+        assert!(added2.is_empty());
+        let rule2: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                home.join("agent-governance")
+                    .join("rules")
+                    .join("00_constraint_model_allowlist.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rule2["version"], serde_json::json!("1.2.1"));
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 
