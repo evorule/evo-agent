@@ -2,7 +2,7 @@
   "$schema": "https://evorule.org/schemas/rule_set/v1.0.json",
   "kind": "rule_set",
   "id": "com.evorule.constraint.model_allowlist",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "metadata": {
     "tier": "constraint",
     "title": "会话模型准入白名单",
@@ -25,17 +25,21 @@
                 "type": "in",
                 "path": "instruction.params.model",
                 "values": [
-                  "MiniMax-M2.5",
-                  "MiniMax-M3",
-                  "glm-4.6",
-                  "glm-4.5-air"
+                  "MiniMax-M2.5","MiniMax-M3",
+                  "deepseek-chat","deepseek-reasoner",
+                  "kimi-k3.1-pro","kimi-k3.1-pro-highspeed","kimi-k2.7-code",
+                  "glm-5.3","glm-5.3-flash","glm-5.3-flashx","glm-4.6","glm-4.5-air",
+                  "doubao-seed-2-1-pro-260915","doubao-seed-2-1-lite-260915",
+                  "step-5-preview","step-3.7-flash",
+                  "qwen3-max","qwen-plus",
+                  "gpt-6.1-sol","gpt-6.1-terra"
                 ],
                 "on_missing": "error"
               }
             }
           ]
         },
-        "reason": "会话模型不在本工作区准入白名单（仅允许 MiniMax-M2.5、MiniMax-M3、glm-4.6、glm-4.5-air）"
+        "reason": "会话模型不在本工作区准入白名单（仅允许 MiniMax-M2.5/M3、deepseek-chat/reasoner、kimi-k3.1-pro(-highspeed)/kimi-k2.7-code、glm-5.3(-flash/-flashx)/glm-4.6/glm-4.5-air、doubao-seed-2-1-pro/lite-260915、step-5-preview/step-3.7-flash、qwen3-max/qwen-plus、gpt-6.1-sol/gpt-6.1-terra）"
       }
     }
   ]

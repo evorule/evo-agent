@@ -243,21 +243,50 @@ pub const PROVIDERS: &[ProviderEntry] = &[
         name: "kimi",
         display: "Kimi",
         execute_url: "https://api.moonshot.cn/v1/chat/completions",
-        models: &["kimi-k2-0905-preview", "kimi-latest"],
+        // k2/kimi-latest 已下线退役（2026-01 kimi-latest 停服、10-31 起 k2 系
+        // 新用户停售），目录换当前在售阵容；k3.1-pro 原生视觉
+        models: &["kimi-k3.1-pro", "kimi-k3.1-pro-highspeed", "kimi-k2.7-code"],
     },
     ProviderEntry {
         name: "zhipu",
         display: "智谱 GLM",
         // coding 套餐端点（token plan key 在标准 /api/paas/v4 会报 1113 余额
-        // 错误；本目录按套餐端点配置，标准计费 key 需自行改回标准端点）
+        // 错误；本目录按套餐端点配置，标准计费 key 需自行改回标准端点）。
+        // 套餐内确认支持 glm-5.3 / glm-5.3-flash（原生多模态）/ glm-5.3-flashx
         execute_url: "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
-        models: &["glm-4.6", "glm-4.5-air"],
+        models: &[
+            "glm-5.3",
+            "glm-5.3-flash",
+            "glm-5.3-flashx",
+            "glm-4.6",
+            "glm-4.5-air",
+        ],
+    },
+    ProviderEntry {
+        name: "doubao",
+        display: "豆包",
+        // 火山方舟 OpenAI 兼容端点；ARK_API_KEY 在方舟控制台 apikey 页创建
+        execute_url: "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+        models: &["doubao-seed-2-1-pro-260915", "doubao-seed-2-1-lite-260915"],
+    },
+    ProviderEntry {
+        name: "stepfun",
+        display: "阶跃",
+        execute_url: "https://api.stepfun.com/v1/chat/completions",
+        // step-5-preview 旗舰（文本/图片/视频输入）；step-3.7-flash 高速多模态
+        models: &["step-5-preview", "step-3.7-flash"],
     },
     ProviderEntry {
         name: "qwen",
         display: "通义千问",
         execute_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
         models: &["qwen3-max", "qwen-plus"],
+    },
+    ProviderEntry {
+        name: "openai",
+        display: "OpenAI",
+        execute_url: "https://api.openai.com/v1/chat/completions",
+        models: &["gpt-6.1-sol", "gpt-6.1-terra"],
     },
 ];
 
