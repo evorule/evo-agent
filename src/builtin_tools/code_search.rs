@@ -14,9 +14,9 @@
 //!
 //! ## 范围裁剪（v1:只做 lexical 结构面）
 //! B14 的 semantic/hybrid 模式**不进 agent 工具面**:语义面装配 fastembed
-//! 本地嵌入模型（`index.semantic.enabled` 显式开启,部署面默认关）,本机无
-//! GPU 场景内存吃紧属硬约束;hybrid 的词法侧即 grep_core 文件聚合,与
-//! `grep_files` 重复。工具恒走符号图谱（纯 CPU、零模型依赖、零外发）。
+//! 本地嵌入模型（`semantic` feature 按需编译,`index.semantic.enabled` 显式
+//! 开启,部署面默认关）,本机无 GPU 场景内存吃紧属硬约束;hybrid 的词法侧即
+//! grep_core 文件聚合,与 `grep_files` 重复。工具恒走符号图谱（纯 CPU、零模型依赖、零外发）。
 //!
 //! ## 接线双态（audit_query_tool 同款占位/重绑惯例）
 //! - 启动期 `default_safe_toolkit` 注册占位（`unwired()`）:调用 fail-visible

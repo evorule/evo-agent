@@ -2565,12 +2565,15 @@ fn cmd_serve(
                 Ok(svc) => {
                     // B14 v1.x 语义面:index.semantic.enabled 开启时装配 fastembed
                     // 本地嵌入器(all-MiniLM-L6-v2 q8,缓存 ~/.evo-agent/models)。
+                    // fastembed 为 `semantic` feature 按需编译,缺省构建不含——无
+                    // feature 构建下开关开启时明示降级纯结构面(不静默吞开关)。
                     // fail-soft:模型加载失败(首启下载网络不通等)仅降级纯结构面,
                     // 不阻塞 serve;重开开关重启自愈。
                     let semantic = merged
                         .get("index.semantic.enabled")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    #[cfg(feature = "semantic")]
                     let svc = match (semantic, evo_agent::index::embedder::default_model_dir()) {
                         (true, Ok(dir)) => {
                             match evo_agent::index::embedder::FastembedEmbedder::new(&dir) {
@@ -2595,6 +2598,17 @@ fn cmd_serve(
                             svc
                         }
                         (false, _) => svc,
+                    };
+                    #[cfg(not(feature = "semantic"))]
+                    let svc = {
+                        if semantic {
+                            eprintln!(
+                                "[index] semantic enabled but this build excludes the `semantic` \
+                                 feature (structure-only mode); rebuild with --features semantic \
+                                 to enable local embeddings"
+                            );
+                        }
+                        svc
                     };
                     let svc = std::sync::Arc::new(svc);
                     // 启动对账(全盘哈希+解析可能秒级):后台线程执行,不阻塞 bind;

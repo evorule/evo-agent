@@ -4,6 +4,14 @@ version = "0.4.0"
 edition = "2021"
 description = "Evo-Agent - AI Agent orchestration layer using evorule HTTP API"
 license = "AGPL-3.0-or-later"
+
+# 语义面按需编译:fastembed 传递引入 ort/onnxruntime/tokenizers 类本地模型栈,
+# 缺省构建(CI/发布)零引入(零本地模型硬约束);仅显式 --features semantic 的
+# 开发构建编译。settings 开关 index.semantic.enabled 在无此 feature 的构建中
+# fail-visible 明示并降级纯结构面。
+[features]
+semantic = ["dep:fastembed"]
+
 [dependencies]
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -119,7 +127,7 @@ git2 = "0.20"
 tree-sitter = "0.27.1"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
-fastembed = "7.1.1"
+fastembed = { version = "7.1.1", optional = true }
 
 # E-2 期3:AppContainer OS 低盒(仅 Windows 生效;Linux CI 不编译此依赖)
 [target.'cfg(windows)'.dependencies]

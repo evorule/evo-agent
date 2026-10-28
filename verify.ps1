@@ -178,6 +178,28 @@ if (Test-Phase 'contract') {
     } else {
         Write-Host "PASS: dependency contract (no main-repo deps -- decoupled)"
     }
+
+    # Zero local-model hard constraint: default builds must not pull the
+    # ort/onnxruntime/tokenizers local-model stack. fastembed is allowed only
+    # via the opt-in `semantic` feature; assert the default dependency graph
+    # stays clean of it and its transitive model-runtime crates.
+    $treeOut = & cargo tree -e normal
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "FAIL: cargo tree failed (exit $LASTEXITCODE)"
+        $failed = $true
+    } else {
+        $modelHits = @($treeOut | Where-Object {
+            $_ -match '(fastembed|\bort\b|ort-sys|onnxruntime|tokenizers|hf-hub)'
+        })
+        if ($modelHits.Count -gt 0) {
+            foreach ($h in $modelHits) { Write-Host "FAIL: local-model crate in default graph: $h" }
+            Write-Host "  (fastembed is allowed only via the opt-in 'semantic' feature;"
+            Write-Host "   default and release builds must stay free of ort/onnx/tokenizers.)"
+            $failed = $true
+        } else {
+            Write-Host "PASS: zero local-model crates in default dependency graph"
+        }
+    }
 }
 
 if ($failed) { Write-Host "== RESULT: FAIL =="; exit 1 }

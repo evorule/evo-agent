@@ -681,7 +681,7 @@ pub fn schema() -> Vec<SettingEntry> {
             enum_values: None,
             range: None,
             category: "工作台",
-            description: "语义面向量检索（mode=semantic/hybrid，依赖 index.enabled）。首次启用将下载本地嵌入模型 all-MiniLM-L6-v2 q8（约 24MB，来源 HuggingFace，缓存于 ~/.evo-agent/models，之后离线运行）；重启生效",
+            description: "语义面向量检索（mode=semantic/hybrid，依赖 index.enabled）。需本地嵌入模型 all-MiniLM-L6-v2 q8（首次启用下载约 24MB，来源 HuggingFace，缓存于 ~/.evo-agent/models，之后离线运行）；仅含 semantic feature 的构建可用，缺省构建开启时明示降级纯结构面；重启生效",
             scope: "window",
         },
     ]

@@ -1935,7 +1935,7 @@ impl ShellExecTool {
                 {
                     let _ = program;
                     return Err(
-                        "appcontainer lowbox face is windows-only (sandbox phase 3)".to_string(),
+                        "appcontainer lowbox face is windows-only (sandbox phase 3)".to_string()
                     );
                 }
             }

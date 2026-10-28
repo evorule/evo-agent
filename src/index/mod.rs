@@ -10,7 +10,8 @@
 //! - [`chunker`]：工作区遍历（双层 ignore）+ 内容哈希；
 //! - [`symbols`]：tree-sitter 符号抽取 + chunk 切分；
 //! - [`graph`]：PageRank 图谱检索排序；
-//! - [`embedder`]：语义面文本嵌入器抽象（fastembed 实现随 PR-5b 落地）；
+//! - [`embedder`]：语义面文本嵌入器抽象（fastembed 实现按 `semantic` feature
+//!   按需编译，缺省构建不编译）；
 //! - [`search_api`]：HTTP 处理器；本文件承载 [`IndexService`] 编排层。
 //!
 //! 治理面：serve 本地后台行为，无 agent 工具执行、无 shell/写
