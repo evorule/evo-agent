@@ -23,6 +23,7 @@ SELF_EXEMPT = {
     "AGENTS.md",
     os.path.join("scripts", "public_face_scan.py"),
     os.path.join("scripts", "public-face-baseline.txt"),
+    os.path.join("scripts", "public-face-words.txt"),
     os.path.join(".github", "workflows", "public-face.yml"),
 }
 
