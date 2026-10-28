@@ -1635,7 +1635,12 @@ async fn run_agent(
                 state.evorule_client.clone(),
             )
             .with_journal_dir(state.workdir.join("data").join("sessions"))
-            .with_governance_segment(governance_segment.clone()),
+            .with_governance_segment(governance_segment.clone())
+            // 子代理工具契约:union toolkit 快照下放(此前 react 面子代理
+            // 零工具契约=纯文本执行器)
+            .with_toolkit((*state.toolkit()).clone(), &state.workdir)
+            // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
+            .with_token_counter(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
         );
 
     // 改消费流式 ReAct 回路(delegate 同款修法,bb172b2 先例)——
@@ -2005,7 +2010,13 @@ async fn run_agent_stream(
             state.definitions().clone(),
             state.evorule_client.clone(),
         )
-        .with_journal_dir(state.workdir.join("data").join("sessions")),
+        .with_journal_dir(state.workdir.join("data").join("sessions"))
+        // 子代理工具契约:union toolkit 快照下放(此前 SSE 面子代理零工具契约)
+        .with_toolkit((*state.toolkit()).clone(), &state.workdir)
+        // 治理段同源下放(下方主 runner 消费同源值)
+        .with_governance_segment(governance_segment.clone())
+        // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
+        .with_token_counter(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
     )
     // 查账工具族接线（PR-11a）：以本会话态重绑 handler 内查账工具实例
     .wire_accounting(&state.workdir)

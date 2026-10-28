@@ -407,6 +407,10 @@ pub enum JournalEvent {
         depth: usize,
         /// 委托任务文本 digest（evorule-hash 口径,与 args_digest 同源）
         task_digest: String,
+        /// 本委托窗口内的上下文 token 累计（子 runner LLM 真值差值;
+        /// None=未接线埋点。serde default 兼容既有 journal 行）
+        #[serde(default)]
+        tokens_used: Option<u64>,
     },
     /// 崩溃标记(P2 resume 检测到尾部无 turn_ended 后补写,运行时不写)
     SessionCrashed {
@@ -1597,12 +1601,14 @@ impl JournalWriter {
         agent_type: &str,
         depth: usize,
         task_digest: &str,
+        tokens_used: Option<u64>,
     ) -> Result<u64, JournalError> {
         self.push(JournalEvent::DelegateSpawned {
             child_session_id: child_session_id.to_string(),
             agent_type: agent_type.to_string(),
             depth,
             task_digest: task_digest.to_string(),
+            tokens_used,
         })
     }
 
@@ -1719,12 +1725,14 @@ pub fn scan_delegate_spawns(journal: &[JournalLine]) -> Vec<DelegateSpawnRecord>
                 agent_type,
                 depth,
                 task_digest,
+                tokens_used,
             } => Some(DelegateSpawnRecord {
                 seq: line.seq,
                 child_session_id: child_session_id.clone(),
                 agent_type: agent_type.clone(),
                 depth: *depth,
                 task_digest: task_digest.clone(),
+                tokens_used: *tokens_used,
             }),
             _ => None,
         })
@@ -1744,6 +1752,8 @@ pub struct DelegateSpawnRecord {
     pub depth: usize,
     /// 委托任务文本 digest
     pub task_digest: String,
+    /// 本委托窗口内的上下文 token 累计（None=未接线埋点或旧记录）
+    pub tokens_used: Option<u64>,
 }
 
 /// turn 守卫:优雅终止路径显式 `end(status, steps, duration)`;异常终止路径
@@ -3091,7 +3101,13 @@ mod tests {
             )
             .unwrap();
         let spawn_seq = w
-            .delegate_spawned("child-9", "researcher", 1, &evorule_digest("do research"))
+            .delegate_spawned(
+                "child-9",
+                "researcher",
+                1,
+                &evorule_digest("do research"),
+                Some(1234),
+            )
             .unwrap();
         let result_seq = w.tool_result(&call_id, "ok", "done", None).unwrap();
         assert!(
@@ -3110,11 +3126,13 @@ mod tests {
                 agent_type,
                 depth,
                 task_digest,
+                tokens_used,
             } => {
                 assert_eq!(child_session_id, "child-9");
                 assert_eq!(agent_type, "researcher");
                 assert_eq!(*depth, 1);
                 assert_eq!(task_digest, &evorule_digest("do research"));
+                assert_eq!(*tokens_used, Some(1234), "窗口 token 归账随事件落账");
             }
             other => panic!("expected delegate_spawned, got {other:?}"),
         }
@@ -3122,6 +3140,19 @@ mod tests {
             matches!(&lines[2].event, JournalEvent::ToolResult { call_id: c, status, .. } if *c == call_id && status == "ok"),
             "尾事件=配对 tool_result"
         );
+    }
+
+    /// 旧账兼容——无 tokens_used 键的历史 delegate_spawned 行反序列化缺省 None
+    #[test]
+    fn test_delegate_spawned_legacy_line_without_tokens() {
+        let line = r#"{"seq":1,"ts":1000,"type":"delegate_spawned","payload":{"child_session_id":"c-old","agent_type":"worker","depth":1,"task_digest":"blake3:dd"}}"#;
+        let parsed = decode_line(line).unwrap();
+        match parsed.event {
+            JournalEvent::DelegateSpawned { tokens_used, .. } => {
+                assert_eq!(tokens_used, None, "历史行无该键=None,零破坏");
+            }
+            other => panic!("expected delegate_spawned, got {other:?}"),
+        }
     }
 
     /// 旧账兼容——无 execution_profile 键的历史行反序列化缺省 None
@@ -3169,11 +3200,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let w = JournalWriter::open(dir.path(), "s-scan-spawn").unwrap();
         let _guard = w.begin_turn("g").unwrap();
-        w.delegate_spawned("c1", "planner", 1, &evorule_digest("t1"))
+        w.delegate_spawned("c1", "planner", 1, &evorule_digest("t1"), None)
             .unwrap();
         w.llm_called_react("m", None, None, Some(10), 2, "resp")
             .unwrap();
-        w.delegate_spawned("c2", "worker", 1, &evorule_digest("t2"))
+        w.delegate_spawned("c2", "worker", 1, &evorule_digest("t2"), None)
             .unwrap();
         w.end_turn("success", 3, 100).unwrap();
         let lines = read_all(&JournalWriter::path_for(dir.path(), "s-scan-spawn")).unwrap();

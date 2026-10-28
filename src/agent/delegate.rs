@@ -40,6 +40,9 @@ pub struct SpawnRecord {
     pub depth: usize,
     /// 委托任务文本 digest（evorule-hash 口径）
     pub task_digest: String,
+    /// 本委托窗口内的上下文 token 累计（子 runner LLM 真值;None=上下文
+    /// 未接线埋点。并行委托窗口重叠时为近似值,串行（默认）精确）
+    pub tokens_used: Option<u64>,
 }
 
 /// spawn 账共享句柄类型（整棵委托树同一本账:DelegateContext clone 共享
@@ -370,6 +373,10 @@ impl DelegateContext {
             let mut stream = runner.run_streaming(task.to_string(), Vec::new());
             let mut final_result: Option<crate::agent::runner::AgentResult> = None;
             let mut stream_err: Option<String> = None;
+            // 本委托窗口 token 归账基线（子 runner 每次 LLM 调用后累加,
+            // Done 时以差值落 SpawnRecord;未接线埋点时恒 0-0=None 语义）
+            let tokens_start = self.token_total();
+            let mut spawn_record_idx: Option<usize> = None;
             while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
                 match ev {
                     Ok(crate::agent::runner::AgentEvent::Done(r)) => {
@@ -381,11 +388,13 @@ impl DelegateContext {
                         // 写账时 drain 落事件;先记后亡的取消分支也留锚——
                         // 记录语义="实际创建的子会话")
                         if let Ok(mut ledger) = self.spawn_ledger.lock() {
+                            spawn_record_idx = Some(ledger.len());
                             ledger.push(SpawnRecord {
                                 child_session_id: session_id,
                                 agent_type: agent_type.to_string(),
                                 depth: self.current_depth + 1,
                                 task_digest: crate::agent::journal::evorule_digest(task),
+                                tokens_used: None,
                             });
                         }
                     }
@@ -393,6 +402,15 @@ impl DelegateContext {
                     Err(e) => {
                         // 流式实现中 Err 后仍会跟 Done(error)；记录并以 Done 为权威终态
                         stream_err = Some(e.to_string());
+                    }
+                }
+            }
+
+            // 窗口闭合归账（Done/流级错/无终态均记——差值落回本委托的账目行）
+            if let Some(idx) = spawn_record_idx {
+                if let Ok(mut ledger) = self.spawn_ledger.lock() {
+                    if let Some(rec) = ledger.get_mut(idx) {
+                        rec.tokens_used = Some(self.token_total().saturating_sub(tokens_start));
                     }
                 }
             }
@@ -645,12 +663,14 @@ mod tests {
                 agent_type: "planner".to_string(),
                 depth: 1,
                 task_digest: "blake3:aa".to_string(),
+                tokens_used: None,
             });
             ledger.push(SpawnRecord {
                 child_session_id: "c2".to_string(),
                 agent_type: "worker".to_string(),
                 depth: 1,
                 task_digest: "blake3:bb".to_string(),
+                tokens_used: None,
             });
         }
         let drained = ctx.drain_spawn_records();
@@ -674,6 +694,7 @@ mod tests {
                 agent_type: "worker".to_string(),
                 depth: 2,
                 task_digest: "blake3:cc".to_string(),
+                tokens_used: None,
             });
         }
         let drained = parent.drain_spawn_records();

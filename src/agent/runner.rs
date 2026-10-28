@@ -1938,9 +1938,13 @@ impl AgentRunner {
             return;
         };
         for r in records {
-            if let Err(e) =
-                j.delegate_spawned(&r.child_session_id, &r.agent_type, r.depth, &r.task_digest)
-            {
+            if let Err(e) = j.delegate_spawned(
+                &r.child_session_id,
+                &r.agent_type,
+                r.depth,
+                &r.task_digest,
+                r.tokens_used,
+            ) {
                 warn!(error = %e, "delegate_spawned journal failed");
             }
         }

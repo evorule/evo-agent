@@ -2301,6 +2301,7 @@ mod tests {
             agent_type: "researcher".into(),
             depth: 1,
             task_digest: "blake3:bb".into(),
+            tokens_used: None,
         });
         j.push(JE::ToolResult {
             call_id: "t1".into(),
