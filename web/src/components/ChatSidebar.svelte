@@ -1362,11 +1362,6 @@
                     ⚠ 该目标在工作区边界之外。调整:点顶部「工作区」按钮扩大范围后新建会话;或把文件放进当前工作区。
                   </div>
                 {/if}
-                {#if text.includes('sandbox boundary')}
-                  <div class="boundary-hint">
-                    ⚠ 该目标在工作区边界之外。调整:点顶部「工作区」按钮扩大范围后新建会话;或把文件放进当前工作区。
-                  </div>
-                {/if}
                 {#if text.length > TOOL_RESULT_CAP && !fullResults.has(m.id)}
                   <pre class="tool-payload mono">{text.slice(0, TOOL_RESULT_CAP)}</pre>
                   <button
