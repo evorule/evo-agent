@@ -51,7 +51,7 @@ pub struct SedimentConfig {
     /// 是否启用知识候选提取（会话收尾巩固管线最小版）
     ///
     /// 会话收尾时在摘要/事实/事件产物之外，增一次 sidecar LLM 调用提取
-    /// 知识候选（fact/procedure/heuristic/narrative/model 五类），落
+    /// 知识候选（七类=rule 仓内置域 schema 谱系），落
     /// `shared.{ns}.knowledge_candidates.{event_id}`（MemoryEvent，
     /// kind=Custom("knowledge_candidate")，即知识候选事件类型的 serde 映射）。
     pub enable_knowledge_extraction: bool,
@@ -677,7 +677,7 @@ pub(crate) async fn consolidate_knowledge_candidates(
             .collect::<Vec<_>>()
             .join("\n");
         let prompt = format!(
-            "以下同主题知识候选经确定性聚类判为可合并。请合并/去重/抽象为一条语义候选,输出 JSON。\n\n候选:\n{corpus}\n\n输出 JSON 格式:\n{{\"title\":\"合并后标题\",\"body\":\"自包含合并正文(须覆盖各候选要点)\",\"knowledge_kind\":\"五类之一\",\"confidence\":0.8}}\n\n只输出 JSON,不要输出其他内容。"
+            "以下同主题知识候选经确定性聚类判为可合并。请合并/去重/抽象为一条语义候选,输出 JSON。\n\n候选:\n{corpus}\n\n输出 JSON 格式:\n{{\"title\":\"合并后标题\",\"body\":\"自包含合并正文(须覆盖各候选要点)\",\"knowledge_kind\":\"七类之一\",\"confidence\":0.8}}\n\n只输出 JSON,不要输出其他内容。"
         );
         let mut params_map = serde_json::Map::new();
         params_map.insert(
@@ -816,7 +816,7 @@ fn knowledge_proposed_marker_key(candidate_event_id: &str) -> String {
 ///    巩固路 CC- 产物同资格）；
 /// 2. 达标门双条件：confidence ≥ `knowledge_propose_min_confidence` 且
 ///    无 proposed 标记（幂等）；
-/// 3. 逐条 propose（确定性 entry_id slug；五类直映 `builtin:knowledge/{kind}`，
+/// 3. 逐条 propose（确定性 entry_id slug；七类直映 `builtin:knowledge/{kind}`，
 ///    payload 形态沿 memory.rs 晋升门先例：statement/title/confidence）；
 /// 4. 成功即落 proposed 标记+回执 Draft 入 result；失败 warn 保持原态，
 ///    绝不阻塞会话收尾。
@@ -1201,26 +1201,37 @@ fn sanitize_model_id(model: &str) -> String {
 // 启动时知识库为空，第一个实例只能编译期内置，未来 Active 条目反哺提示词
 // 属后续批次。
 
-/// 知识候选五类（与 evorule-rule 内置域 schema 五件一一对应）
-const KNOWLEDGE_KINDS: &[&str] = &["fact", "procedure", "heuristic", "narrative", "model"];
+/// 知识候选七类（与 evorule-rule 内置域 schema 七件一一对应；2026-10-29 第六件
+/// verdict、第七件 preference——rule 仓 55cdaa0 系批准）
+const KNOWLEDGE_KINDS: &[&str] = &[
+    "fact",
+    "procedure",
+    "heuristic",
+    "narrative",
+    "model",
+    "verdict",
+    "preference",
+];
 
 /// 提取系统提示（对齐 EventExtractor 纪律：只提取对话中明确存在的
 /// 信息，输出 JSON，无候选返回空列表）
 const KNOWLEDGE_EXTRACTION_SYSTEM_PROMPT: &str = "\
 你是一个知识候选提取助手。你的任务是从对话中识别值得沉淀为可复用知识的片段,提取为结构化候选。\n\
 \n\
-知识分五类:\n\
+知识分七类:\n\
 - fact: 客观事实(某配置项含义/某接口行为/某约束存在)\n\
 - procedure: 操作步骤(如何完成某任务的步骤序列)\n\
 - heuristic: 经验法则(什么情况下用什么方法更好/避坑经验)\n\
 - narrative: 叙事性知识(决策背景/来龙去脉)\n\
 - model: 概念模型(对某事物的结构化理解,如某机制的工作原理)\n\
+- preference: 用户偏好(用户明确表达的持久喜好/厌恶/约定,应影响后续行为;\n\
+  只提取用户本人明确说出的偏好,不得从行为推断)\n\
 \n\
 严格约束:\n\
 1. 只提取对话中明确存在的信息,不能编造或臆测\n\
 2. 每条候选必须自包含(脱离对话上下文仍可读)\n\
 3. 输出必须是 JSON 格式,不要输出自然语言解释\n\
-4. knowledge_kind 只能取五类之一\n\
+4. knowledge_kind 只能取七类之一\n\
 5. 如果对话中没有值得沉淀的知识,返回 {\"candidates\": []}";
 
 /// model 类知识示例——提示词模板的「第一个实例」（自举）
@@ -1229,7 +1240,7 @@ const MODEL_EXAMPLE: &str = r#"{"knowledge_kind":"model","title":"规则条目�
 /// 单条知识候选 LLM 输出结构
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct KnowledgeCandidateOut {
-    /// 知识类别（五类之一；越界候选在解析后丢弃）
+    /// 知识类别（七类之一；越界候选在解析后丢弃）
     pub knowledge_kind: String,
     /// 候选标题（自包含短语）
     pub title: String,
@@ -1318,7 +1329,7 @@ pub fn mark_llm_generated(mut event: MemoryEvent) -> MemoryEvent {
 /// 2. 无 auditor → 跳过 + warn（纪律①：无审计通路不提取，不直连 provider）；
 /// 3. 整会话一次 sidecar LLM 调用（purpose=knowledge_candidate_extraction，
 ///    prompt/response 全文入审计链）；
-/// 4. 解析候选（五类越界/正文空丢弃）；
+/// 4. 解析候选（七类越界/正文空丢弃）；
 /// 5. 每候选一个 MemoryEvent 写入 `shared.{ns}.knowledge_candidates.{event_id}`
 ///    （event_id 前缀 KC-，与事件提取 E- 风格对齐）+ __memory__ 证据链双写。
 async fn extract_knowledge_candidates(
@@ -1387,7 +1398,7 @@ async fn extract_knowledge_candidates(
         serde_json::json!(0.0), // temperature=0 保证最大确定性（对齐事件提取）
     );
     // max_tokens: 1024 同族截断风险（Battle B r5：候选提取 JSON 在 column 2267
-    // EOF）——知识候选五类提取输出较长，4096 给足余量
+    // EOF）——知识候选七类提取输出较长，4096 给足余量
     params_map.insert("max_tokens".to_string(), serde_json::json!(4096));
     params_map.insert(
         "messages".to_string(),
@@ -1449,7 +1460,7 @@ async fn extract_knowledge_candidates(
 fn parse_knowledge_candidates(json_str: &str) -> Result<Vec<KnowledgeCandidateOut>, String> {
     let out: KnowledgeExtractionOut =
         serde_json::from_str(json_str).map_err(|e| format!("parse candidates JSON: {}", e))?;
-    // 逐条过滤：五类越界/正文空 → 丢弃（治理口径：越界候选将来过不了
+    // 逐条过滤：七类越界/正文空 → 丢弃（治理口径：越界候选将来过不了
     // A2-3 契约校验，直接在提取面拒收并留 warn）
     let kept: Vec<KnowledgeCandidateOut> = out
         .candidates
@@ -2660,6 +2671,79 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[tokio::test]
+    async fn test_knowledge_propose_preference_kind_maps_to_builtin_shell() {
+        // 第七谱系 preference：候选直映 builtin:knowledge/preference
+        // （rule 仓第七壳批准后治理契约校验放行；本测锚定直映关系）
+        let mut server = mockito::Server::new_async().await;
+        let client = crate::api::evorule_client::EvoruleApiClient::new(&server.url());
+        let llm = LlmHandler::mock(r#"{}"#);
+        let auditor = AuditedLlm::new(make_test_client(), llm);
+        let mut mgr = MemoryManager::new("ns", make_test_client()).with_session_id("s-pref");
+        let cfg = SedimentConfig {
+            enable_knowledge_propose: true,
+            knowledge_propose_dataset: Some("tb-contracts".to_string()),
+            knowledge_propose_min_confidence: 0.7,
+            ..Default::default()
+        };
+        let facts = serde_json::json!([
+            {
+                "fact_id": 9,
+                "path": "shared.ns.knowledge_candidates.KC-s-pref-200-0",
+                "source_session_id": 1,
+                "version": 1,
+                "value": {
+                    "event_id": "KC-s-pref-200-0",
+                    "event_type": {"kind": "Custom", "subtype": "knowledge_candidate"},
+                    "confidence": 0.8,
+                    "content": {
+                        "knowledge_kind": "preference",
+                        "title": "提交信息用英文",
+                        "body": "用户偏好:本项目的提交信息用英文,遵循 conventional commits"
+                    }
+                }
+            }
+        ]);
+        let _m_get = server
+            .mock(
+                "GET",
+                "/api/shared/facts?prefix=shared.ns.knowledge_candidates.",
+            )
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(facts.to_string())
+            .create_async()
+            .await;
+        let m_invoke = server
+            .mock("POST", "/api/services/knowledge-propose/invoke")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "entry": {"schema_ref": "builtin:knowledge/preference"},
+            })))
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(r#"{"entry_id":"kc-pref","lifecycle":"Draft","version":1}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _m_marker = server
+            .mock("POST", "/api/sessions/s-pref/payload")
+            .with_status(200)
+            .create_async()
+            .await;
+        let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
+            memory: &mut mgr,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: Some(&auditor),
+            journal_lines: Vec::new(),
+        };
+        let mut result = SedimentResult::default();
+        consolidate_knowledge_candidates(&mut deps, &cfg, "s-pref", &mut result).await;
+        // invoke 的 PartialJson 匹配即断言:preference 直映第七壳
     }
 
     #[test]
