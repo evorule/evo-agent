@@ -569,24 +569,40 @@
   // 按组键记忆,用户手动开合覆写默认。
   const expandedGroups = new SvelteSet();
   const turnLayout = $derived.by(() => {
-    const isActivity = (m) =>
-      m.kind === 'tool' || (m.kind === 'assistant' && !(m.text || '').trim());
+    // 归组判定按「连续 agent 活动段」两遍扫描:段内最后一条带正文的
+    // assistant 是回答(single 留框外),其余(tool/纯思考/带中间陈述的
+    // 思考步)全进过程框。背景:MiniMax-M3 型推理模型每个思考步都带
+    // 中间陈述文本,旧判定(仅无正文 assistant 算活动)把它们全部散开
+    // 成 N 个「已深度思考」框(真机实锤=7 步 7 框撑爆对话区)。
     const out = [];
     let buf = null;
+    const flushBuf = (closed) => {
+      if (!buf) return;
+      let answerIdx = -1;
+      for (let i = buf.items.length - 1; i >= 0; i--) {
+        const m = buf.items[i];
+        if (m.kind === 'assistant' && (m.text || '').trim()) { answerIdx = i; break; }
+      }
+      const boxed = buf.items.filter((_, i) => i !== answerIdx);
+      if (boxed.length) {
+        out.push({ type: 'process', key: `p${boxed[0].id}`, items: boxed, closed });
+      }
+      if (answerIdx >= 0) {
+        out.push({ type: 'single', key: `m${buf.items[answerIdx].id}`, m: buf.items[answerIdx] });
+      }
+      buf = null;
+    };
     for (const m of visibleMessages) {
-      if (isActivity(m)) {
-        if (!buf) {
-          buf = { type: 'process', key: `p${m.id}`, items: [], closed: false };
-          out.push(buf);
-        }
+      if (m.kind === 'tool' || m.kind === 'assistant') {
+        if (!buf) buf = { items: [] };
         buf.items.push(m);
       } else {
-        if (buf) buf.closed = true;
-        buf = null;
+        flushBuf(true);
         out.push({ type: 'single', key: `m${m.id}`, m });
       }
     }
-    // 末尾未闭合段=进行中的实时活动,保持框内展开
+    // 末尾未闭合段=进行中的实时活动,保持框内展开(closed=false)
+    flushBuf(false);
     return out;
   });
   function toggleGroup(key) {
