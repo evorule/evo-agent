@@ -389,6 +389,70 @@ fn configured_providers(paths: &ResolvedPaths) -> Vec<(crate::wizard::OwnedProvi
         .collect()
 }
 
+/// 路由表模型冲突收口：同一模型被多个 provider 声明时，执行体对重复声明
+/// 整表拒绝（fail-closed，防凭据串号）。壳侧生成配置前去重——用户自定义
+/// provider 优先（显式配置压过内置缺省），其余按声明序先到先得；模型被
+/// 完全遮蔽的条目整条退出路由表。剔除与丢弃均留痕日志。
+fn dedupe_model_conflicts(
+    mut providers: Vec<(crate::wizard::OwnedProvider, String)>,
+) -> Vec<(crate::wizard::OwnedProvider, String)> {
+    let catalog = crate::wizard::catalog_providers();
+    let builtin_names: std::collections::HashSet<&str> =
+        catalog.iter().map(|p| p.name.as_str()).collect();
+    // 消解顺序：自定义在前，内置在后；同层内保持原声明序
+    let custom_order: Vec<usize> = providers
+        .iter()
+        .enumerate()
+        .filter(|(_, (p, _))| !builtin_names.contains(p.name.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    let builtin_order: Vec<usize> = providers
+        .iter()
+        .enumerate()
+        .filter(|(_, (p, _))| builtin_names.contains(p.name.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut removed_dupes: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    let mut keep = vec![true; providers.len()];
+    for i in custom_order.into_iter().chain(builtin_order) {
+        let original_len = providers[i].0.models.len();
+        let (p, _) = &mut providers[i];
+        let mut kept = Vec::with_capacity(original_len);
+        for m in std::mem::take(&mut p.models) {
+            if claimed.insert(m.clone()) {
+                kept.push(m);
+            } else {
+                removed_dupes.push(format!("{}/{}", p.name, m));
+            }
+        }
+        p.models = kept;
+        if p.models.is_empty() && original_len > 0 {
+            keep[i] = false;
+            dropped.push(providers[i].0.name.clone());
+        }
+    }
+    if !removed_dupes.is_empty() {
+        eprintln!(
+            "[orch] duplicate model declarations removed from route table (custom providers take precedence, then declaration order): {}",
+            removed_dupes.join(", ")
+        );
+    }
+    for name in &dropped {
+        eprintln!(
+            "[orch] provider {name} removed from route table: all its models are covered by higher-priority declarations"
+        );
+    }
+    providers
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(p, _)| p)
+        .collect()
+}
+
 /// 壳生成的执行体运行时配置（每次拉起覆写）。动态值——监听端口/引擎地址/
 /// 白名单物料绝对路径——不允许静态模板承载；key 与调用方令牌一律走 env，
 /// 不进本文件。server_auth_token 置空：本拓扑下执行体只被 serve 调用
@@ -418,7 +482,7 @@ fn write_ai_plugin_config(
         "llm_timeout_ms": 60000,
         "model_allowlist_path": allowlist.display().to_string(),
     });
-    let providers = configured_providers(paths);
+    let providers = dedupe_model_conflicts(configured_providers(paths));
     if !providers.is_empty() {
         cfg["llm_providers"] = serde_json::Value::Array(
             providers
@@ -826,6 +890,95 @@ mod tests {
         assert_eq!(mine["api_key_env"], "EVORULE_AI_PLUGIN_LLM_KEY_MYPROV");
         // 零落盘红线：自定义 key 本体不入配置文件
         assert!(!raw.contains("sk-custom"));
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    /// 模型冲突收口：同一模型被自定义与内置 provider 同时声明时，路由表
+    /// 不得出现重复模型——自定义优先（用户显式配置压过内置缺省），冲突
+    /// 模型从内置条目剔除，其余模型保留。
+    #[test]
+    fn ai_plugin_config_dedupes_model_conflicts_custom_wins() {
+        let paths = scratch_paths("prov-conflict");
+        let custom = serde_json::json!([{
+            "name": "myprov",
+            "display": "My Provider",
+            "execute_url": "https://api.example.com/v1/chat/completions",
+            "models": ["MiniMax-M3", "model-x"]
+        }]);
+        std::fs::write(
+            paths.app_config_dir.join("llm-custom-providers.json"),
+            custom.to_string(),
+        )
+        .unwrap();
+        let keys_dir = paths.app_config_dir.join("llm-keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+        std::fs::write(keys_dir.join("minimax.txt"), "sk-mm-test\n").unwrap();
+        std::fs::write(keys_dir.join("myprov.txt"), "sk-custom\n").unwrap();
+        write_ai_plugin_config(&paths, 19135, 18080).unwrap();
+        let raw = std::fs::read_to_string(paths.runtime_dir.join("ai-plugin.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let providers = v["llm_providers"].as_array().expect("providers emitted");
+        let models_of = |name: &str| -> Vec<String> {
+            providers
+                .iter()
+                .find(|p| p["name"] == name)
+                .expect("provider present")["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m.as_str().unwrap().to_string())
+                .collect()
+        };
+        // 冲突模型归自定义；内置条目剔除冲突模型、保留其余
+        assert_eq!(models_of("myprov"), vec!["MiniMax-M3", "model-x"]);
+        let mm = models_of("minimax");
+        assert!(!mm.contains(&"MiniMax-M3".to_string()), "冲突模型须从内置条目剔除");
+        assert!(mm.contains(&"MiniMax-M2.5".to_string()), "非冲突模型保留");
+        // 整表无重复模型（执行体对重复声明 fail-closed）
+        let mut all: Vec<&str> = Vec::new();
+        for p in providers {
+            for m in p["models"].as_array().unwrap() {
+                let m = m.as_str().unwrap();
+                assert!(!all.contains(&m), "model {m} declared twice");
+                all.push(m);
+            }
+        }
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    /// 内置 provider 的全部模型被自定义覆盖时，该内置条目整条退出路由表
+    /// （空 models 条目无意义，徒增消费方歧义）。
+    #[test]
+    fn ai_plugin_config_drops_builtin_entry_fully_shadowed_by_custom() {
+        let paths = scratch_paths("prov-shadow");
+        let custom = serde_json::json!([{
+            "name": "myprov",
+            "display": "My Provider",
+            "execute_url": "https://api.example.com/v1/chat/completions",
+            "models": ["MiniMax-M2.5", "MiniMax-M3"]
+        }]);
+        std::fs::write(
+            paths.app_config_dir.join("llm-custom-providers.json"),
+            custom.to_string(),
+        )
+        .unwrap();
+        let keys_dir = paths.app_config_dir.join("llm-keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+        std::fs::write(keys_dir.join("minimax.txt"), "sk-mm-test\n").unwrap();
+        std::fs::write(keys_dir.join("myprov.txt"), "sk-custom\n").unwrap();
+        write_ai_plugin_config(&paths, 19136, 18080).unwrap();
+        let raw = std::fs::read_to_string(paths.runtime_dir.join("ai-plugin.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let providers = v["llm_providers"].as_array().expect("providers emitted");
+        assert!(
+            providers.iter().all(|p| p["name"] != "minimax"),
+            "被完全遮蔽的内置条目须整条退出路由表"
+        );
+        let mine = providers
+            .iter()
+            .find(|p| p["name"] == "myprov")
+            .expect("custom provider keeps all models");
+        assert_eq!(mine["models"].as_array().unwrap().len(), 2);
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 
