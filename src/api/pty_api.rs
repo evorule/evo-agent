@@ -45,6 +45,9 @@ pub struct PtyWsQuery {
     pub cols: Option<u16>,
     /// 初始行数
     pub rows: Option<u16>,
+    /// 会话工作区(可选;web 端与 agent WS 同源携带)——终端 cwd 跟随会话
+    /// 工作区(与写工具族/checkpoint 同根);非绝对路径升级期即拒
+    pub workspace: Option<String>,
 }
 
 /// `GET /api/pty/ws` — WS 升级
@@ -57,6 +60,18 @@ pub async fn pty_ws(
     let cols = query.cols.unwrap_or(80).clamp(2, 500);
     let rows = query.rows.unwrap_or(24).clamp(2, 300);
 
+    // 会话工作区(可选):fail-visible——非绝对路径在升级期即拒(400),
+    // 与 agent WS upgrade 校验同口径,不让坏值漏进 spawn 才报错
+    if let Some(ws) = &query.workspace {
+        if !std::path::Path::new(ws).is_absolute() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "workspace must be an absolute path".to_string(),
+            )
+                .into_response();
+        }
+    }
+
     // 并发护栏(第 9 个拒绝)
     if !state.pty_registry().try_acquire() {
         return (
@@ -66,8 +81,16 @@ pub async fn pty_ws(
             .into_response();
     }
 
-    ws.max_message_size(WS_MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_socket(socket, state, term_id, cols, rows))
+    ws.max_message_size(WS_MAX_MESSAGE_BYTES).on_upgrade(move |socket| {
+        handle_socket(
+            socket,
+            state,
+            term_id,
+            cols,
+            rows,
+            query.workspace.map(std::path::PathBuf::from),
+        )
+    })
 }
 
 async fn handle_socket(
@@ -76,6 +99,7 @@ async fn handle_socket(
     term_id: String,
     cols: u16,
     rows: u16,
+    workspace: Option<std::path::PathBuf>,
 ) {
     let (mut sink, mut stream) = socket.split();
 
@@ -87,9 +111,13 @@ async fn handle_socket(
         .unwrap_or("auto")
         .to_string();
     let shell = session::discover_shell(&shell_override);
-    // 终端 cwd 跟随 agent 工作区根(--agent-root 优先,缺省=workdir)——
+    // 终端 cwd 跟随会话工作区(与写工具族/checkpoint 同根统一解析);
+    // 未声明回落 agent 工作区根(--agent-root 优先,缺省=workdir)——
     // 桌面形态 workdir=runtime,用户终端应落在用户工作区而非编排目录
-    let workdir = state.agent_workspace_root().to_path_buf();
+    let workdir = crate::api::serve_tools::session_workspace_root(
+        workspace.as_deref(),
+        state.agent_workspace_root(),
+    );
 
     let handle = match session::spawn_session(&shell, &workdir, cols, rows) {
         Ok(h) => h,

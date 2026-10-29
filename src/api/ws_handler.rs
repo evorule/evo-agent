@@ -935,9 +935,14 @@ async fn construct_runner(
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源;
         // run_streaming_inner 内按会话创建 {sid}.jsonl)
         .with_journal_dir(state.workdir().join("data").join("sessions"))
-        // checkpoint 仓库跟随 agent 工作区根(--agent-root 优先,缺省=workdir;
-        // 与 undo 工具 store/toolkit 构建期绑定同 root,不落 runtime)
-        .with_workspace_checkpoint(state.agent_workspace_root())
+        // checkpoint 仓库跟随会话工作区(与写工具族 apply_workspace_boundary
+        // 同根统一解析);未声明会话工作区时回落 agent 工作区根(--agent-root
+        // 优先,缺省=workdir;与 undo 工具 store/toolkit 构建期绑定同 root,
+        // 不落 runtime)
+        .with_workspace_checkpoint(&crate::api::serve_tools::session_workspace_root(
+            workspace.map(std::path::Path::new),
+            state.agent_workspace_root(),
+        ))
         // 查账工具族接线（PR-11a）：以本会话态重绑 filtered 内查账工具实例
         .wire_accounting(state.workdir())
         // B21 D3:主动压缩策略(longSession.compaction.* 设置映射;与 HTTP

@@ -991,9 +991,38 @@ pub fn apply_workspace_boundary(
     Ok(())
 }
 
+/// 会话工作区根统一解析:checkpoint 仓库根/PTY cwd 与写工具族(能力边界经
+/// [`apply_workspace_boundary`] 重锚)同根不变式——声明会话工作区时优先,
+/// 未声明回落 agent 工作区根(--agent-root 优先,缺省=workdir)。
+pub fn session_workspace_root(
+    workspace: Option<&std::path::Path>,
+    agent_workspace_root: &std::path::Path,
+) -> std::path::PathBuf {
+    workspace
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| agent_workspace_root.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 会话工作区根解析不变式:声明会话工作区时优先(与写工具族重锚同根)。
+    #[test]
+    fn session_workspace_root_prefers_session_workspace() {
+        let root = session_workspace_root(
+            Some(std::path::Path::new("D:\\proj\\demo")),
+            std::path::Path::new("D:\\agent-root"),
+        );
+        assert_eq!(root, std::path::PathBuf::from("D:\\proj\\demo"));
+    }
+
+    /// 未声明会话工作区时回落 agent 工作区根(缺省行为零变化)。
+    #[test]
+    fn session_workspace_root_falls_back_to_agent_root() {
+        let root = session_workspace_root(None, std::path::Path::new("D:\\agent-root"));
+        assert_eq!(root, std::path::PathBuf::from("D:\\agent-root"));
+    }
 
     fn make_clients() -> (WorkspaceApiClient, EvoruleApiClient) {
         (

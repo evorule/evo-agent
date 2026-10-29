@@ -46,10 +46,15 @@ export function getActiveTerminal() {
   return null;
 }
 
-function ptyUrl(termId, cols, rows, authq) {
+export function ptyUrl(termId, cols, rows, authq) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  let url = `${proto}://${location.host}/api/pty/ws?term=${encodeURIComponent(termId)}&cols=${cols}&rows=${rows}`;
+  // 会话工作区:与 agent WS 同源(localStorage evo_workspace)——终端 cwd
+  // 与写工具族/checkpoint 同根;缺省不携带=serve agent-root 行为零变化。
+  const workspace = localStorage.getItem('evo_workspace');
+  if (workspace) url += `&workspace=${encodeURIComponent(workspace)}`;
   // G16 换票:authq = `&ticket=...`(Bearer 换一次性短票;?token= 恒 401)
-  return `${proto}://${location.host}/api/pty/ws?term=${encodeURIComponent(termId)}&cols=${cols}&rows=${rows}${authq || ''}`;
+  return url + (authq || '');
 }
 
 /** 预取下一个实例 id(视图层先渲染槽位再创建,防 DOM 换键重建) */
