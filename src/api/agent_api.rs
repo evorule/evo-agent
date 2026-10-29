@@ -347,6 +347,25 @@ pub fn read_llm_state_model(workdir: &std::path::Path) -> Option<String> {
         .map(String::from)
 }
 
+/// serve 面状态根接线:read-root / agent-root 独立注入,互不条件嵌套。
+/// 桌面壳只传 --agent-root 不传 --read-root——若 agent-root 注入被
+/// read-root 缺席阻断,state.agent_root() 恒 None,checkpoint/边界根回落
+/// runtime,与 undo 工具 store(toolkit 构建期绑 agent_root)分叉。
+pub fn wire_state_roots(
+    state: AgentApiState,
+    read_root: Option<std::path::PathBuf>,
+    agent_root: Option<std::path::PathBuf>,
+) -> AgentApiState {
+    let state = match read_root {
+        Some(rr) => state.with_read_root(rr),
+        None => state,
+    };
+    match agent_root {
+        Some(ar) => state.with_agent_root(ar),
+        None => state,
+    }
+}
+
 /// S5-b: 原子写持久化模型名(tmp+rename,父目录确保;与 settings save_atomic 同款)
 fn write_llm_state_model(workdir: &std::path::Path, model: &str) -> Result<(), String> {
     let path = llm_state_path(workdir)?;
@@ -650,6 +669,16 @@ impl AgentApiState {
     /// 38 号方案 X:agent 能力边界根(None=未显式指定,语义=workdir)
     pub fn agent_root(&self) -> Option<&std::path::Path> {
         self.agent_root.as_deref()
+    }
+
+    /// agent 工作区根:agent 语义面(checkpoint 仓库/PTY cwd/能力边界)的
+    /// 基准根。--agent-root 优先,未指定回落 workdir(行为零变化)。
+    /// 桌面 serve 形态 workdir=runtime(编排基础设施)与用户工作区解耦,
+    /// agent 语义面必须跟随本根——否则落 runtime 指向不存在路径
+    /// (fail-visible),且与 undo 工具 store(toolkit 构建期绑 agent_root)
+    /// 分叉成两套快照栈。
+    pub fn agent_workspace_root(&self) -> &std::path::Path {
+        self.agent_root.as_deref().unwrap_or(&self.workdir)
     }
 
     /// E1:获取 WorkspaceApiClient 的引用(规则工具依赖)
@@ -1579,7 +1608,7 @@ async fn run_agent(
     // B 批「读宽写窄」:读域根经 state 注入(--read-root);请求带 workspace 时
     // 声明优先,read_root 不参与(workspace=请求级完整意志,同域边界)
     // 38 号方案 X:能力边界根优先取 --agent-root(缺省=workdir)
-    let boundary_root = state.agent_root().unwrap_or(state.workdir());
+    let boundary_root = state.agent_workspace_root();
     let capability_boundary = crate::api::serve_tools::wire_capability_boundary_with_read_root(
         &mut filtered,
         &def,
@@ -1694,7 +1723,7 @@ async fn run_agent(
         .with_metrics(state.metrics.clone())
         // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
         .with_journal_dir(state.workdir.join("data").join("sessions"))
-        .with_workspace_checkpoint(&state.workdir)
+        .with_workspace_checkpoint(state.agent_workspace_root())
         // B21 D3:注入主动压缩策略(longSession.compaction.* 设置映射;
         // CLI 面不读设置=None=不启用,行为零变化)
         .with_compaction_policy(crate::agent::runner::CompactionPolicy::from_settings(
@@ -2031,7 +2060,7 @@ async fn run_agent_stream(
     }
     // M5-a:能力边界接线(同 run_agent 口径;B 批「读宽写窄」读域根经 state 注入)
     // 38 号方案 X:能力边界根优先取 --agent-root(缺省=workdir)
-    let boundary_root = state.agent_root().unwrap_or(state.workdir());
+    let boundary_root = state.agent_workspace_root();
     let capability_boundary = crate::api::serve_tools::wire_capability_boundary_with_read_root(
         &mut filtered,
         &def,
@@ -2107,7 +2136,7 @@ async fn run_agent_stream(
     .with_metrics(state.metrics.clone())
     // B21 PR-1:注入 journal 目录 — 会话事件流落盘(会话唯一真相源)
     .with_journal_dir(state.workdir.join("data").join("sessions"))
-    .with_workspace_checkpoint(&state.workdir)
+    .with_workspace_checkpoint(state.agent_workspace_root())
     // B21 D3:注入主动压缩策略(longSession.compaction.* 设置映射;同 run_agent 口径)
     .with_compaction_policy(crate::agent::runner::CompactionPolicy::from_settings(
         &merged_settings,
@@ -3260,7 +3289,7 @@ async fn spawn_background_task(
     .with_agents_md_segment(agents_md)
     .with_governance_segment(governance_segment)
     .with_journal_dir(state.workdir.join("data").join("sessions"))
-    .with_workspace_checkpoint(&state.workdir)
+    .with_workspace_checkpoint(state.agent_workspace_root())
     .with_compaction_policy(crate::agent::runner::CompactionPolicy::from_settings(
         &merged_settings,
     ))
@@ -4282,6 +4311,45 @@ mod tests {
         // 默认态(未注入):api_key 为空(from_config 视为未配置,不误用占位符)
         let fresh = make_test_state();
         assert!(fresh.llm_config().api_key.is_empty());
+    }
+
+    #[test]
+    fn test_agent_workspace_root_resolution() {
+        // 桌面 serve 形态:workdir=runtime(编排基础设施)与 --agent-root=
+        // 用户工作区解耦。checkpoint 仓库/PTY cwd 等 agent 语义面的基准根
+        // 解析规则:agent_root 优先,未指定回落 workdir(行为零变化)。
+        let state = make_test_state();
+        assert_eq!(state.agent_workspace_root(), state.workdir());
+
+        let agent_root = std::path::PathBuf::from("Z:\\fake-agent-root");
+        let state = make_test_state().with_agent_root(agent_root.clone());
+        assert_eq!(state.agent_workspace_root(), agent_root.as_path());
+    }
+
+    #[test]
+    fn test_serve_state_root_wiring_independent() {
+        // 连带根因锚:--agent-root 注入不得被 --read-root 缺席阻断——
+        // 桌面壳只传 --agent-root 不传 --read-root,旧实现把 with_agent_root
+        // 嵌套在 read_root 分支内,致 state.agent_root() 恒 None,checkpoint/
+        // 边界根回落 runtime(与 undo 工具 store 的 agent_root 分叉)。
+        let base = make_test_state();
+        let ar = std::path::PathBuf::from("Z:\\fake-agent-root");
+
+        // agent-root 单独在场(桌面壳实际形态):必须注入生效
+        let wired = wire_state_roots(base.clone(), None, Some(ar.clone()));
+        assert_eq!(wired.agent_root(), Some(ar.as_path()));
+        assert!(wired.read_root().is_none());
+
+        // 双根同传:两者都生效
+        let rr = std::path::PathBuf::from("Z:\\fake-read-root");
+        let wired = wire_state_roots(base.clone(), Some(rr.clone()), Some(ar.clone()));
+        assert_eq!(wired.agent_root(), Some(ar.as_path()));
+        assert_eq!(wired.read_root(), Some(rr.as_path()));
+
+        // 双根皆缺:零变化
+        let wired = wire_state_roots(base, None, None);
+        assert!(wired.agent_root().is_none());
+        assert!(wired.read_root().is_none());
     }
 
     #[test]

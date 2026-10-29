@@ -2710,14 +2710,9 @@ fn cmd_serve(
     // serve 面各请求路径的 handler 构造与 CLI 共用同一解析产物,
     // 不再绕过配置体系直读裸环境变量
     .with_llm_config(config.llm.clone());
-    // B 批「读宽写窄」:注入读域根(--read-root;None=读写同域零变化)——
-    // 会话期 wire 面消费此值合成边界自报(工具绑定已在启动期 toolkit 完成)
-    if let Some(rr) = read_root_buf {
-        state = state.with_read_root(rr);
-        if let Some(ar) = &agent_root_buf {
-            state = state.with_agent_root(ar.clone());
-        }
-    }
+    // 状态根接线:read-root / agent-root 独立注入(桌面壳只传 --agent-root,
+    // 注入不得被 read-root 缺席阻断;缺省 None=零变化)
+    state = evo_agent::api::agent_api::wire_state_roots(state, read_root_buf, agent_root_buf);
     // B16:MCP 管理器+配置存储成对注入(mcp_enabled 时;None = /api/mcp/* 503)
     if mcp_enabled {
         state = state.with_mcp(mcp_manager.clone(), mcp_store.clone());

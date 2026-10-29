@@ -87,7 +87,9 @@ async fn handle_socket(
         .unwrap_or("auto")
         .to_string();
     let shell = session::discover_shell(&shell_override);
-    let workdir = state.workdir().to_path_buf();
+    // 终端 cwd 跟随 agent 工作区根(--agent-root 优先,缺省=workdir)——
+    // 桌面形态 workdir=runtime,用户终端应落在用户工作区而非编排目录
+    let workdir = state.agent_workspace_root().to_path_buf();
 
     let handle = match session::spawn_session(&shell, &workdir, cols, rows) {
         Ok(h) => h,
