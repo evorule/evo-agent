@@ -2169,7 +2169,10 @@ service_tools = ["config_persist", "rule_sandbox"]
             crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR
         );
         // 显式 read_write → 全域(与写工具族 with_writable_dir(".") 同源)
-        assert_eq!(super::checkpoint_writable_dir(Some(&boundary_of_mode("read_write"))), ".");
+        assert_eq!(
+            super::checkpoint_writable_dir(Some(&boundary_of_mode("read_write"))),
+            "."
+        );
     }
 
     #[tokio::test]
