@@ -8709,7 +8709,7 @@ impl AgentRunner {
                                                                res.map(|(o, _)| o)
                                                            }
                                                        };
-                                                       let outcome = match outcome_res {
+                                                       let mut outcome = match outcome_res {
                                                            Ok(o) => o,
                                                            Err(e) => {
                                                                warn!(
@@ -8770,6 +8770,36 @@ impl AgentRunner {
                                                                continue;
                                                            }
                                                        };
+                                                                                                              // 逐调用停滞检测(F2 空转克星):汇聚点观察(工具,参数,结果);
+                                                       // 覆盖 Done 与两阶段审批两路,每调用恰一次;标记随 tool 消息回喂(fail-visible)
+                                                       let stagnation_verdict = runner.stagnation.observe(
+                                                           &tc.name,
+                                                           &tc.arguments.to_string(),
+                                                           &outcome.final_result.to_string(),
+                                                       );
+                                                       match stagnation_verdict {
+                                                           StagnationVerdict::Normal => {}
+                                                           StagnationVerdict::Warning { repeat_count } => {
+                                                               warn!(%session_id, tool = %tc.name, repeat_count, "stagnation warning (F2)");
+                                                               runner.pending_note_feed = true;
+                                                               if let Some(obj) = outcome.final_result.as_object_mut() {
+                                                                   obj.insert(
+                                                                       "stagnation".to_string(),
+                                                                       serde_json::json!(STAGNATION_WARNING_MARK),
+                                                                   );
+                                                               }
+                                                           }
+                                                           StagnationVerdict::Exhausted => {
+                                                               warn!(%session_id, tool = %tc.name, "stagnation EXHAUSTED (F2)——按 H2 阻塞收尾指引");
+                                                               runner.pending_note_feed = true;
+                                                               if let Some(obj) = outcome.final_result.as_object_mut() {
+                                                                   obj.insert(
+                                                                       "stagnation".to_string(),
+                                                                       serde_json::json!(STAGNATION_EXHAUSTED_MARK),
+                                                                   );
+                                                               }
+                                                           }
+                                                       }
                                                        // 审批事件已在上面的两阶段流程中即时 yield
                                                        // (ApprovalRequired 先于决策、ApprovalResult 随决定)
                                                        // 记录 tool_calls(回合级汇总,Done/审计消费)+ tool 消息持久化
@@ -8784,10 +8814,14 @@ impl AgentRunner {
                                                            raw_content.push_str(&adv);
                                                        }
                                                        // 轮级序列循环标记:随本轮首个 tool_result 回喂(fail-visible,
-                                                       // 终止行为零变化——max_steps 仍为最终兜底)
+                                                       // 终止行为零变化——max_steps 仍为最终兜底);
+                                                       // 结果体已含逐调用停滞标记时让位(避免同一 tool_result 叠两种标记)
                                                        if let Some(mark) = seq_mark.take() {
-                                                           raw_content.push('\n');
-                                                           raw_content.push_str(mark);
+                                                           let dominated = outcome.final_result.get("stagnation").is_some();
+                                                           if !dominated {
+                                                               raw_content.push('\n');
+                                                               raw_content.push_str(mark);
+                                                           }
                                                        }
                                                        // B1:旁路图片提取+瘦身(指纹替换 base64),
                                                        // journal/回喂/持久化三面统一用瘦身后文本

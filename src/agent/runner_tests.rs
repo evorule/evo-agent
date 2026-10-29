@@ -4810,6 +4810,93 @@ async fn b16_mcp_g8_approval_timeout_auto_denies() {
     assert_eq!(record["reason"], "timeout");
 }
 
+/// 流式停滞测试:固定返回工具(每次调用同参同果)
+struct FixedProbeTool;
+
+#[async_trait::async_trait]
+impl ToolFunction for FixedProbeTool {
+    async fn call(&self, _args: &Value) -> IoResult {
+        Ok(serde_json::json!({"output": "probe_result"}))
+    }
+}
+
+/// 流式本地工具循环:同一调用+同一结果在单轮内连击 3 次,
+/// 第 3 次观察应注入停滞警告标记(随 tool_result 回喂)。
+/// 轮级序列检测按轮观察,单轮内永不触发——本测试的触发者
+/// 只可能是逐调用停滞观察,判别精确。
+#[tokio::test]
+async fn test_streaming_local_loop_injects_stagnation_warning_on_repeated_identical_calls() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+
+    let create_mock = server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 99}"#)
+        .create_async()
+        .await;
+
+    // 单个 call_external 请求事件(无 id 字段→request_id=None,免 io_response)
+    let sse_body = "data: {\"type\":\"IoRequest\",\"io_type\":\"call_external\",\"params\":{}}\n\n";
+    server
+        .mock("GET", "/api/sessions/99/events")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", "/api/sessions/99/command")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    // LLM mock:每轮恒返回单轮内 3 个相同调用(数组形态,经文本回退解析)
+    let llm = LlmHandler::mock(
+        r#"[{"name":"probe_reader","parameters":{}},{"name":"probe_reader","parameters":{}},{"name":"probe_reader","parameters":{}}]"#,
+    );
+
+    let mut tools = BTreeMap::new();
+    tools.insert(
+        "probe_reader".to_string(),
+        Arc::new(FixedProbeTool) as Arc<dyn ToolFunction>,
+    );
+    let handler = ToolHandler::with_functions(tools);
+
+    let runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_llm_handler(llm)
+        .with_tool_handler(handler);
+
+    let stream = runner.run_streaming("hello".to_string(), Vec::new());
+    let mut stream = stream;
+
+    let mut tool_results: Vec<(String, Value)> = Vec::new();
+    while let Some(event) = stream.next().await {
+        if let Ok(AgentEvent::ToolResult { name, result }) = event {
+            tool_results.push((name, result));
+            if tool_results.len() >= 3 {
+                break;
+            }
+        }
+    }
+
+    create_mock.assert_async().await;
+    assert!(
+        tool_results.len() >= 3,
+        "应至少产出 3 个工具结果事件,实际 {}",
+        tool_results.len()
+    );
+    assert_eq!(tool_results[2].0, "probe_reader");
+    let third = tool_results[2].1.to_string();
+    assert!(
+        third.contains(STAGNATION_WARNING_MARK),
+        "第 3 次同调用+同结果观察应注入停滞警告标记,实际: {third}"
+    );
+}
+
 // ---- B1 多模态上行:旁路图片提取/还原/窗口预算 测试组 ----
 
 /// 最小合法 PNG 字节(魔数 8 字节 + 体)
