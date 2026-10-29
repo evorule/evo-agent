@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "evo-agent-desktop"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "rand 0.8.8",
  "reqwest 0.12.28",
