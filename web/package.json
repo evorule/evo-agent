@@ -1,7 +1,7 @@
 {
   "name": "@evorule/evo-agent-workbench",
   "private": true,
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "evo-agent IDE workbench — Trae-style layout with evorule governance overlay",
   "license": "AGPL-3.0-or-later",
   "type": "module",
