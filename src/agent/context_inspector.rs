@@ -171,6 +171,40 @@ pub struct I2Verdict {
     pub rationale: String,
 }
 
+/// I2 判定分布计数面:让「未判定(uncertain/未裁)」与「判定为良性(benign)」
+/// 在审计聚合面上显式可分——语义精判 fail-soft,uncertain 不改 agent 行为,
+/// 但「冲突未被拦」不等于「无冲突」,聚合面必须让这一形态可见(逐条明细在
+/// journal I2ScanReport 权威面,本计数面供 ATIF/报告快速读取)。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct I2VerdictSummary {
+    pub total: usize,
+    pub contradiction: usize,
+    pub benign: usize,
+    pub uncertain: usize,
+    /// 语义精判未执行(None:第二级通路关闭/sidecar 不可用)——与 uncertain
+    /// (已执行但无法判定)分列
+    pub unadjudicated: usize,
+}
+
+/// 逐条判定分布聚合(纯函数)
+pub fn i2_verdict_summary(conflicts: &[I2ConflictRecord]) -> I2VerdictSummary {
+    let mut s = I2VerdictSummary {
+        total: conflicts.len(),
+        ..Default::default()
+    };
+    for c in conflicts {
+        match c.semantic_verdict.as_ref() {
+            None => s.unadjudicated += 1,
+            Some(v) => match v.verdict.as_str() {
+                "contradiction" => s.contradiction += 1,
+                "benign" => s.benign += 1,
+                _ => s.uncertain += 1,
+            },
+        }
+    }
+    s
+}
+
 /// 语义精判用途标签(AuditedLlm 审计链命令事实;journal LlmCalled.purpose
 /// 同值——sidecar 用途不映射 ATIF 步,既有口径)
 pub const I2_SEMANTIC_PURPOSE: &str = "i2_semantic";
@@ -791,5 +825,45 @@ mod tests {
                     && tokens.as_ref().map(|t| t.total) == Some(15)
         );
         assert!(ok, "LlmCalled(i2_semantic) 含 token 账面");
+    }
+}
+
+#[cfg(test)]
+mod verdict_summary_tests {
+    use super::*;
+
+    #[test]
+    fn verdict_summary_buckets_all_four_states() {
+        let rec = |v: Option<&str>| I2ConflictRecord {
+            kind: "deny_vs_affirmation".into(),
+            token: "t".into(),
+            section_a: "a".into(),
+            section_b: "b".into(),
+            excerpt_a: "x".into(),
+            excerpt_b: "y".into(),
+            semantic_verdict: v.map(|verdict| I2Verdict {
+                verdict: verdict.to_string(),
+                rationale: String::new(),
+            }),
+        };
+        let conflicts = vec![
+            rec(Some("contradiction")),
+            rec(Some("benign")),
+            rec(Some("uncertain")),
+            rec(None),
+            rec(Some("contradiction")),
+        ];
+        let s = i2_verdict_summary(&conflicts);
+        assert_eq!(s.total, 5);
+        assert_eq!(s.contradiction, 2);
+        assert_eq!(s.benign, 1);
+        assert_eq!(s.uncertain, 1);
+        assert_eq!(s.unadjudicated, 1);
+    }
+
+    #[test]
+    fn verdict_summary_empty_is_all_zero() {
+        let s = i2_verdict_summary(&[]);
+        assert_eq!(s, I2VerdictSummary::default());
     }
 }
