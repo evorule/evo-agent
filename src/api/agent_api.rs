@@ -1625,6 +1625,10 @@ async fn run_agent(
         crate::api::ws_handler::resolve_approval_mode(&state, def.approval_mode.as_deref());
     // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
     let agents_md = crate::agent::runner::load_agents_md_segment(state.workdir());
+    // checkpoint 写域与写面工具同源:def move 前捕获声明边界判据(同
+    // approval_mode 捕获先例);read_write 声明下仓库随写工具族全域(".")
+    let checkpoint_writable =
+        crate::api::serve_tools::checkpoint_writable_dir(def.capability_boundary.as_ref());
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),
@@ -1725,10 +1729,13 @@ async fn run_agent(
         .with_journal_dir(state.workdir.join("data").join("sessions"))
         // checkpoint 仓库跟随会话工作区(与写工具族 apply_workspace_boundary
         // 同根统一解析);未声明回落 agent 工作区根
-        .with_workspace_checkpoint(&crate::api::serve_tools::session_workspace_root(
-            req.workspace.as_deref().map(std::path::Path::new),
-            state.agent_workspace_root(),
-        ))
+        .with_workspace_checkpoint_writable(
+            &crate::api::serve_tools::session_workspace_root(
+                req.workspace.as_deref().map(std::path::Path::new),
+                state.agent_workspace_root(),
+            ),
+            checkpoint_writable,
+        )
         // B21 D3:注入主动压缩策略(longSession.compaction.* 设置映射;
         // CLI 面不读设置=None=不启用,行为零变化)
         .with_compaction_policy(crate::agent::runner::CompactionPolicy::from_settings(
@@ -2087,6 +2094,10 @@ async fn run_agent_stream(
         crate::api::ws_handler::build_approval_callback(&state, resolved_mode.as_deref());
     // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
     let agents_md = crate::agent::runner::load_agents_md_segment(state.workdir());
+    // checkpoint 写域与写面工具同源:def move 前捕获声明边界判据(同
+    // approval_mode 捕获先例);read_write 声明下仓库随写工具族全域(".")
+    let checkpoint_writable =
+        crate::api::serve_tools::checkpoint_writable_dir(def.capability_boundary.as_ref());
     let runner = AgentRunner::from_definition(
         def,
         state.evorule_client.clone(),

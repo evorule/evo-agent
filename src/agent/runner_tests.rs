@@ -25,6 +25,24 @@ fn make_test_client() -> EvoruleApiClient {
     EvoruleApiClient::new("http://localhost:8080")
 }
 
+/// 快照仓库写域与写面工具同源:缺省入口绑 workspace 子域(缺省不变式);
+/// 显式变体供调用方按声明能力边界下传全域(".")——serve 面 read_write
+/// 声明下写工具族全域可写,仓库随行同域,消除口径告警
+#[test]
+fn workspace_checkpoint_writable_dir_variant() {
+    // 缺省入口:workspace 子域,行为零变化
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client())
+        .with_workspace_checkpoint(std::path::Path::new("."));
+    let store = runner.checkpoint.as_ref().expect("checkpoint wired");
+    assert_eq!(store.writable_dir(), std::path::Path::new("workspace"));
+
+    // 显式变体:全域写域原样下传
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client())
+        .with_workspace_checkpoint_writable(std::path::Path::new("."), ".");
+    let store = runner.checkpoint.as_ref().expect("checkpoint wired");
+    assert_eq!(store.writable_dir(), std::path::Path::new("."));
+}
+
 #[test]
 fn test_agent_config_default() {
     let config = AgentConfig::default();

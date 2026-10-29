@@ -2250,12 +2250,24 @@ impl AgentRunner {
     /// - verify 配置在场( from_definition 装载)时合成生产编排器(命令在
     ///   agent workdir 执行,与 shell_exec 同级安全口径)
     ///   未接线(默认)=两钩子零开销跳过,行为与既有完全一致(缺省不变式)
-    pub fn with_workspace_checkpoint(mut self, workdir: &std::path::Path) -> Self {
+    pub fn with_workspace_checkpoint(self, workdir: &std::path::Path) -> Self {
+        self.with_workspace_checkpoint_writable(
+            workdir,
+            crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR,
+        )
+    }
+
+    /// 写域显式变体:调用方按声明能力边界指定快照仓库写域——serve 面
+    /// `read_write` 声明下写工具族绑 sandbox_root 全域("."),仓库随行
+    /// 同域,消除「工具全域可写 vs 仓库仅 workspace 子域」的口径分裂;
+    /// 缺省入口保持 workspace 子域不变。
+    pub fn with_workspace_checkpoint_writable(
+        mut self,
+        workdir: &std::path::Path,
+        writable_dir: &str,
+    ) -> Self {
         self.checkpoint = Some(std::sync::Arc::new(
-            crate::agent::workspace_checkpoint::CheckpointStore::new(
-                workdir,
-                crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR,
-            ),
+            crate::agent::workspace_checkpoint::CheckpointStore::new(workdir, writable_dir),
         ));
         if let Some(cfg) = self.verify_config.take() {
             let shell_runner = crate::agent::verify::ShellCommandRunner::new(workdir);

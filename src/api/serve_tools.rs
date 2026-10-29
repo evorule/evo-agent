@@ -910,6 +910,19 @@ pub fn wire_capability_boundary_with_read_root(
     effective
 }
 
+/// checkpoint 快照仓库写域与写面工具同源:显式能力边界为 read_write 时,
+/// 写工具族已按 sandbox_root 全域可写("."),仓库随行同域;未声明/只读=
+/// 缺省 workspace 子域(缺省不变式)。判据取**声明**边界——合成生效边界
+/// 在未声明时也会产出 read_write 形态,但工具面未经重绑,不构成全域口径。
+pub fn checkpoint_writable_dir(
+    declared: Option<&crate::agent::definition::CapabilityBoundary>,
+) -> &'static str {
+    match declared {
+        Some(b) if !b.is_read_only() => ".",
+        _ => crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR,
+    }
+}
+
 // =============================================================================
 // B2 skills 装配:声明解析 + read_skill 注册(serve/CLI/delegate 共用)
 // =============================================================================
@@ -2132,6 +2145,31 @@ service_tools = ["config_persist", "rule_sandbox"]
             "no-declaration must keep startup binding: {:?}",
             res.err()
         );
+    }
+
+    #[test]
+    fn checkpoint_writable_dir_follows_declared_boundary() {
+        fn boundary_of_mode(mode: &str) -> CapabilityBoundary {
+            CapabilityBoundary {
+                mode: mode.to_string(),
+                sandbox_root: std::path::PathBuf::from("."),
+                read_root: None,
+                tools: vec![],
+            }
+        }
+        // 未声明 → 缺省 workspace 子域(缺省不变式;此时工具面未经重绑,
+        // 不因合成边界形态误判全域)
+        assert_eq!(
+            super::checkpoint_writable_dir(None),
+            crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR
+        );
+        // 显式只读 → 缺省子域
+        assert_eq!(
+            super::checkpoint_writable_dir(Some(&boundary_of_mode("read_only"))),
+            crate::builtin_tools::file_write::DEFAULT_WRITABLE_DIR
+        );
+        // 显式 read_write → 全域(与写工具族 with_writable_dir(".") 同源)
+        assert_eq!(super::checkpoint_writable_dir(Some(&boundary_of_mode("read_write"))), ".");
     }
 
     #[tokio::test]
