@@ -3,7 +3,8 @@
 <!-- F1 底部状态栏(22px 全宽,纯读态+入口跳转):
      左=git 分支(点击→SCM)+代理运行态点;右=行列·编码·语言·连接态·
      通知铃铛(F2 下拉面板:最近 20 条+全部已读+清空)·版本号。
-     数据源零新增后端:全部前端既有 store/光标位/包版本。 -->
+     数据源零新增后端:全部前端既有 store/光标位/包版本;版本面桌面形态
+     经 tauri 桥取壳版本(=安装版本),package.json 回落。 -->
 <script>
   import { onMount } from 'svelte';
   import {
@@ -29,7 +30,15 @@
     approvalPresetView,
   } from '../lib/approval.js';
   import { workspaceLabel } from '../lib/workspace.js';
+  import { detectShellVersion } from '../lib/shellVersion.js';
   import { version } from '../../package.json';
+
+  // 版本面:桌面形态优先壳版本(=安装版本,tauri.conf.json 同源),构建期
+  // package.json 仅回落(浏览器形态)。壳版本不可得时静默维持回落。
+  let displayVersion = version;
+  detectShellVersion().then((v) => {
+    if (v) displayVersion = v;
+  });
 
   let panelOpen = false;
   let bellEl = null;
@@ -158,7 +167,7 @@
       </svg>
       {#if unread > 0}<span class="badge">{unread > 99 ? '99+' : unread}</span>{/if}
     </button>
-    <span class="sb-item ver" title="工作台版本">v{version}</span>
+    <span class="sb-item ver" title="工作台版本">v{displayVersion}</span>
   </div>
 
   {#if panelOpen}

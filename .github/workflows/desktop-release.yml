@@ -79,7 +79,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: 核对 tag 版本 = tauri.conf.json 版本
+      - name: 核对 tag 版本 = tauri.conf.json 版本 + 版本面一致性
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         working-directory: evo-agent/desktop
@@ -87,7 +87,16 @@ jobs:
           $tag = "${{ github.ref_name }}" -replace '^evo-agent-desktop-v',''
           $ver = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           Write-Host "tag=evo-agent-desktop-v$tag  tauri.conf.json=$ver"
-          if ($tag -ne $ver) { throw "tag 版本($tag) != tauri.conf.json 版本($ver); 发版前先统一四处版本号 (RELEASE.md)" }
+          if ($tag -ne $ver) { throw "tag 版本($tag) != tauri.conf.json 版本($ver); 发版前先统一版本面 (RELEASE.md)" }
+          # 版本面一致性:壳 manifest 与 UI 构建期回落源必须与 tauri.conf.json 同版——
+          # 状态栏桌面形态取壳版本,浏览器形态回落 web/package.json,二者都须等于安装版本
+          $cargoVer = ([regex]::Match((Get-Content src-tauri/Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
+          $shellPkgVer = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $webPkgVer = (Get-Content ../web/package.json -Raw | ConvertFrom-Json).version
+          Write-Host "src-tauri/Cargo.toml=$cargoVer  desktop/package.json=$shellPkgVer  web/package.json=$webPkgVer"
+          if ($cargoVer -ne $ver) { throw "src-tauri/Cargo.toml 版本($cargoVer) != tauri.conf.json 版本($ver)" }
+          if ($shellPkgVer -ne $ver) { throw "desktop/package.json 版本($shellPkgVer) != tauri.conf.json 版本($ver)" }
+          if ($webPkgVer -ne $ver) { throw "web/package.json 版本($webPkgVer) != tauri.conf.json 版本($ver); 工作台版本回落源须与安装版本一致" }
 
       - name: 构建 evorule-server 引擎
         run: cargo build --release --bin evorule-server

@@ -268,6 +268,8 @@ export async function sendMessage(content, mentions = [], opts = {}) {
   turnErrorText = null;
   stepCount.set(0);
   turnActive.set(true);
+  // 回合起点重置引擎活性时钟(陈旧时间戳会令琥珀停滞提示在零帧窗口误报)
+  lastEngineEventAt.set(Date.now());
   // S3:对话模式 wire-only 提示块(气泡仍显示原文;仅强化先确认后变更的
   // man-in-loop 姿态,不触碰审批链语义)
   // 计划模式(交互批):wire-only 引导 + 结构化 mode 字段上行——服务端
@@ -426,6 +428,8 @@ function sendResume() {
   turnErrorText = null;
   stepCount.set(0);
   turnActive.set(true);
+  // 回合起点重置引擎活性时钟(resume 后引擎加载历史+续完中断轮,零帧窗口)
+  lastEngineEventAt.set(Date.now());
   ws.send(JSON.stringify({ type: 'resume' }));
 }
 
@@ -461,6 +465,8 @@ function handleFrame(f) {
           turnErrorText = null;
           stepCount.set(0);
           turnActive.set(true);
+          // 回合起点重置引擎活性时钟(统一不变式:回合活跃⇒时钟新鲜)
+          lastEngineEventAt.set(Date.now());
           ws.send(
             JSON.stringify({
               type: 'message',
