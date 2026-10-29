@@ -128,7 +128,10 @@ enum ClientMessage {
 enum WsEvent {
     /// Agent 事件(或流级错误)
     Agent(Result<AgentEvent, AgentError>),
-    /// 当前轮次结束(事件流耗尽)
+    /// 轮次终端态已送达客户端(Done/Error/流错误之后)——此刻即可接受
+    /// 下一条用户消息;索引/快照等善后由 TurnEnd 异步跟进,不卡新轮
+    TurnDone,
+    /// 当前轮次结束(事件流耗尽;善后完成)
     TurnEnd,
 }
 
@@ -218,7 +221,8 @@ async fn handle_ws(
 
     // Agent 事件 channel:spawned task → 主循环
     // event_tx 由主循环持有(用于 spawn 时 clone),不 drop,所以 recv() 只在
-    // spawned task 结束且无更多 clone 时返回 None。用 WsEvent::TurnEnd 显式标记轮次结束。
+    // spawned task 结束且无更多 clone 时返回 None。用 WsEvent::TurnDone
+    // (终端态放行)与 WsEvent::TurnEnd(善后完成)显式标记轮次收尾两段。
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<WsEvent>(128);
 
     // 文件系统事件广播(连接级订阅;连接建立后发生的变更可见,不补发历史)
@@ -310,6 +314,11 @@ async fn handle_ws(
                                                    // 主循环已退出(receiver drop),停止转发
                                                    return;
                                                }
+                                           }
+                                           // 终端态先行放行:Done/Error 帧已转发,新消息
+                                           // 即刻可入;索引/快照善后随 TurnEnd 异步完成
+                                           if let Err(e) = tx.send(WsEvent::TurnDone).await {
+                                               debug!(error = %e, "TurnDone send failed; main ws loop already exited");
                                            }
                                            // 事件流结束 → 发 TurnEnd 信号
                                            if let Err(e) = tx.send(WsEvent::TurnEnd).await {
@@ -435,6 +444,10 @@ async fn handle_ws(
                                                            return;
                                                        }
                                                    }
+                                                   // 终端态先行放行(与主聊天面同口径)
+                                                   if let Err(e) = tx.send(WsEvent::TurnDone).await {
+                                                       debug!(error = %e, "TurnDone send failed; main ws loop already exited");
+                                                   }
                                                    // 事件流结束 → 发 TurnEnd 信号
                                                    if let Err(e) = tx.send(WsEvent::TurnEnd).await {
                                                        debug!(error = %e, "TurnEnd send failed; main ws loop already exited");
@@ -553,10 +566,16 @@ async fn handle_ws(
                                    break;
                                }
                            }
-                           Some(WsEvent::TurnEnd) => {
-                               // 当前轮次的事件流耗尽 → 清理状态
+                           Some(WsEvent::TurnDone) => {
+                               // 终端态已送达客户端 → 即刻放行下一轮(索引/快照
+                               // 善后不再卡住 turn_active)
                                turn_active = false;
                                current_cancel = None;
+                               debug!("G16: turn done; accepting new messages");
+                           }
+                           Some(WsEvent::TurnEnd) => {
+                               // 轮次收尾善后(turn_active/current_cancel 已在
+                               // TurnDone 释放;此处仅做记录与快照)
                                info!("G16: turn ended");
                                // 会话索引:续用会话(重连恢复/多轮)无 SessionCreated 事件,
                                // 以 TurnEnd 补记录刷新 last_active(读时去重合并)。
@@ -1883,6 +1902,62 @@ mod tests {
         } else {
             panic!("expected Text frame, got: {:?}", frame);
         }
+
+        let _ = ws_stream.close(None).await;
+    }
+
+    #[tokio::test]
+    async fn test_ws_tcp_new_message_accepted_after_terminal_frame() {
+        // 收尾竞态回归:上一轮终端帧(Error)送达客户端后,紧随的下一条
+        // message 不得被「a turn is already active」挡下——turn 放行
+        // (TurnDone)先于索引/快照善后(TurnEnd)。引擎不可达 → 每轮
+        // 快速失败,Error 帧即终端态。
+        let state = make_test_state();
+        let (addr, _handle) = start_test_server(state, None).await;
+
+        let url = format!("ws://{}/api/sessions/new/ws?agent_type=test", addr);
+        let (mut ws_stream, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("WS upgrade should succeed");
+
+        let send_message = |content: &str| {
+            let msg = serde_json::json!({"type":"message","content":content});
+            tokio_tungstenite::tungstenite::Message::Text(msg.to_string())
+        };
+
+        // 第一轮:失败(引擎不可达)→ Error 终端帧
+        ws_stream.send(send_message("first turn")).await.unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), ws_stream.next())
+            .await
+            .expect("first turn should produce a frame within 10s");
+        let first_text = match first.unwrap().unwrap() {
+            tungstenite::Message::Text(t) => t,
+            other => panic!("expected Text frame, got: {:?}", other),
+        };
+        let first_v: serde_json::Value = serde_json::from_str(&first_text).unwrap();
+        assert_eq!(first_v["type"], "Error", "first frame: {}", first_text);
+        assert!(
+            !first_text.contains("already active"),
+            "first turn must fail on the engine, not on the gate: {}",
+            first_text
+        );
+
+        // 第二轮:终端帧后立即再发 → 放行(错误来自引擎,不是并发闸)
+        ws_stream.send(send_message("second turn")).await.unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(10), ws_stream.next())
+            .await
+            .expect("second turn should produce a frame within 10s");
+        let second_text = match second.unwrap().unwrap() {
+            tungstenite::Message::Text(t) => t,
+            other => panic!("expected Text frame, got: {:?}", other),
+        };
+        let second_v: serde_json::Value = serde_json::from_str(&second_text).unwrap();
+        assert_eq!(second_v["type"], "Error", "second frame: {}", second_text);
+        assert!(
+            !second_text.contains("already active"),
+            "new message after terminal frame must not be gated by turn_active: {}",
+            second_text
+        );
 
         let _ = ws_stream.close(None).await;
     }
