@@ -1349,6 +1349,10 @@ pub struct AgentRunner {
     /// 进展停滞检测器(F2 空转克星)。跨轮持续观察
     /// (工具名,参数,结果)三元组,连续重复→警告→按 H2 阻塞收尾
     stagnation: crate::agent::stagnation::StagnationDetector,
+    /// 轮级序列循环检测(补停滞检测三盲区——结果抖动/ABA 交替/轮级组合
+    /// 重复;指纹 result-free,滑动窗判重复与交替)。streaming react 循环
+    /// 每轮工具调用定型处 observe,标记复用两级软指引。
+    sequence_loop: crate::agent::stagnation::SequenceLoopDetector,
     /// 管道入口类标记(delegate 统一装配批;默认 React 主路径)
     ///
     /// CallerContext.entry 的 runner 侧单一来源:execute_tool_call_gated /
@@ -1523,6 +1527,7 @@ impl AgentRunner {
             acceptance_command: None,
             acceptance_generation: false,
             stagnation: crate::agent::stagnation::StagnationDetector::new(),
+            sequence_loop: crate::agent::stagnation::SequenceLoopDetector::new(),
             pipeline_entry: crate::agent::pipeline::PipelineEntry::React,
             assembly_scope_focus: false,
             i2_verdict_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -4370,6 +4375,7 @@ impl AgentRunner {
                 // ——缺省不变式,子代理行为与 G4 前完全一致)
                 acceptance_generation: false,
                 stagnation: crate::agent::stagnation::StagnationDetector::new(),
+                sequence_loop: crate::agent::stagnation::SequenceLoopDetector::new(),
                 pipeline_entry,
                 assembly_scope_focus,
                 i2_verdict_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -7852,6 +7858,9 @@ impl AgentRunner {
                                                let mut react_round: u32 = 0;
                                                // 输出门禁（server io_guard）拒绝收尾的纠偏重试计数
                                                let mut guard_rejections: u32 = 0;
+                                               // 轮级序列循环检测:Warning/Exhausted 待注入标记,
+                                               // 随本轮首个 tool_result 回喂(or_insert,per-tool 标记优先)
+                                               let mut seq_mark: Option<&'static str> = None;
                                                'react: loop {
                                                    // H3 预算看门狗:全局时限触达=合法停机
                                                    // 面之三——不依赖 LLM 合作,镜像 max_steps 熔断全序列
@@ -8382,6 +8391,33 @@ impl AgentRunner {
                                                    .map(|tcs| !tcs.is_empty())
                                                    .unwrap_or(false);
 
+                                               // 轮级序列循环检测(执行前观察;指纹 result-free 免疫
+                                               // 结果抖动,滑动窗判立即重复与 ABA 交替;标记复用两级
+                                               // 软指引随本轮首个 tool_result 回喂——终止行为零变化,
+                                               // max_steps 仍为最终兜底)
+                                               if has_tool_calls {
+                                                   if let Some(tcs) = &full_tool_calls {
+                                                       let fp = crate::agent::stagnation::round_fingerprint(
+                                                           &tcs.iter()
+                                                               .map(|tc| (tc.name.clone(), tc.arguments.clone()))
+                                                               .collect::<Vec<_>>(),
+                                                       );
+                                                       match runner.sequence_loop.observe_round(&fp) {
+                                                           StagnationVerdict::Normal => {}
+                                                           StagnationVerdict::Warning { repeat_count } => {
+                                                               warn!(%session_id, repeat_count, "sequence loop warning (轮级序列重复)");
+                                                               runner.pending_note_feed = true;
+                                                               seq_mark = Some(STAGNATION_WARNING_MARK);
+                                                           }
+                                                           StagnationVerdict::Exhausted => {
+                                                               warn!(%session_id, "sequence loop EXHAUSTED (轮级序列重复)——按 H2 阻塞收尾指引");
+                                                               runner.pending_note_feed = true;
+                                                               seq_mark = Some(STAGNATION_EXHAUSTED_MARK);
+                                                           }
+                                                       }
+                                                   }
+                                               }
+
                // 持久化 assistant 消息(同 handle_call_external)
                                                                                // G11(S1 双路径收敛):无 tool_calls 收尾前做结构化输出
                                                                                // 校验——语义与非流式 run() :3365 完全一致:
@@ -8746,6 +8782,12 @@ impl AgentRunner {
                                                        if let Some(adv) = write_advisory {
                                                            raw_content.push('\n');
                                                            raw_content.push_str(&adv);
+                                                       }
+                                                       // 轮级序列循环标记:随本轮首个 tool_result 回喂(fail-visible,
+                                                       // 终止行为零变化——max_steps 仍为最终兜底)
+                                                       if let Some(mark) = seq_mark.take() {
+                                                           raw_content.push('\n');
+                                                           raw_content.push_str(mark);
                                                        }
                                                        // B1:旁路图片提取+瘦身(指纹替换 base64),
                                                        // journal/回喂/持久化三面统一用瘦身后文本
