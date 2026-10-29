@@ -1,6 +1,6 @@
 [package]
 name = "evo-agent-desktop"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 description = "evo-agent desktop shell"
 license = "AGPL-3.0-or-later"
