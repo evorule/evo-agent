@@ -617,11 +617,11 @@ pub fn schema() -> Vec<SettingEntry> {
         SettingEntry {
             key: "longSession.compaction.enabled",
             kind: SettingType::Boolean,
-            default: json!(false),
+            default: json!(true),
             enum_values: None,
             range: None,
             category: "长会话",
-            description: "长会话主动压缩：上下文用量达到阈值比例时，把近期轮次之外的早期对话生成滚动摘要，并清除区内大块工具结果原文（被清原文以 [cleared: 工具名] 引用替代，完整留存于会话 journal 可查；被动裁剪仍为最后防线）。默认关闭——被动裁剪（机器确定性面）为缺省路径，需要 LLM 摘要压缩时在此显式开启",
+            description: "长会话主动压缩：上下文用量达到阈值比例时，把近期轮次之外的早期对话生成滚动摘要，并清除区内大块工具结果原文（被清原文以 [cleared: 工具名] 引用替代，完整留存于会话 journal 可查；被动裁剪仍为最后防线）。默认开启——长会话保真（近摘要区全量保真+滚动摘要前置）；显式关闭后回落为仅被动裁剪",
             scope: "window",
         },
         SettingEntry {
@@ -1060,9 +1060,9 @@ mod tests {
         // problems.* 诊断面 2 键(问题面板/编辑器校验开关)
         assert_eq!(settings["problems.json.validate"], json!(true));
         assert_eq!(settings["problems.markdown.lint"], json!(true));
-        // longSession.compaction.* 4 键:默认关+70%+20 条+保留 6 轮(启用属 LLM
-        // 精力开销,缺省走被动裁剪)
-        assert_eq!(settings["longSession.compaction.enabled"], json!(false));
+        // longSession.compaction.* 4 键:默认开+70%+20 条+保留 6 轮(长会话
+        // 保真;显式 false 优先于默认,关闭后回落被动裁剪)
+        assert_eq!(settings["longSession.compaction.enabled"], json!(true));
         assert_eq!(settings["longSession.compaction.thresholdPct"], json!(70));
         assert_eq!(
             settings["longSession.compaction.maxClearToolResults"],

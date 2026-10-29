@@ -10274,9 +10274,11 @@ pub struct CompactionPolicy {
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
-            // 默认关:被动裁剪(机器确定性面)为缺省路径;LLM 滚动摘要属
-            // LLM 精力开销,需要时由工作台设置显式开启
-            enabled: false,
+            // 默认开（长会话保真）：主动压缩为 serve 面缺省路径，近摘要区
+            // 全量保真+滚动摘要前置，防逼近窗口上限才被动裁剪丢上下文。
+            // 用户显式声明（longSession.compaction.enabled=false）优先于默认；
+            // CLI 路径不注入本策略（Option None=不启用），行为零变化。
+            enabled: true,
             threshold_pct: 70,
             max_clear_tool_results: 20,
             keep_rounds: COMPACTION_KEEP_ROUNDS,
