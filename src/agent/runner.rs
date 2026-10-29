@@ -6102,11 +6102,13 @@ impl AgentRunner {
 
     /// G13:并行执行多个 tool_calls
     ///
-    /// - 所有工具=管道并行实例并行执行(`futures::future::join_all`,PR-3 起
-    ///   无任何门禁豁免——治理级工具同样走完整管道,临时加固已随本体修复移除)
-    /// - active 工具(返回非 proposal)的结果存入缓存,后续 call_service 命中
-    ///   缓存走缓存收口路径(①-⑤⑧照常仅⑦免重执行)
-    /// - candidate 工具(返回 proposal)的结果**不**缓存,留给 call_service 走审批
+    /// 读写分级调度（manifest `side_effect` 分组判据）：
+    /// - 只读工具（显式标定 ReadOnly）并行预执行（`join_all`，受
+    ///   `max_parallel_tools` 帽分块）；未标定工具保守落串行组
+    /// - 其余（写面/进程/交互/未标定）按原始顺序串行执行
+    /// - candidate 先例不动：所有组仍走管道预执行出 proposal（不缓存留
+    ///   审批），裁决经共享 Mutex 串行
+    /// - 结果按原始 tool_calls 顺序归位返回
     ///
     /// 返回 `Vec<(tool_name, args_clone, result)>`,按原始 tool_calls 顺序。
     async fn execute_tools_parallel(
@@ -6118,22 +6120,50 @@ impl AgentRunner {
             %session_id,
             count = tool_calls.len(),
             max_parallel = self.config.max_parallel_tools,
-            "G13: executing tool calls in parallel (pipeline preflight instances)"
+            "G13: executing tool calls (read/write classified scheduling)"
         );
 
-        // 构造 futures:每个 tool_call 一个管道并行实例
-        let futures: Vec<_> = tool_calls
-            .iter()
-            .map(|tc| async move {
-                let name = tc.name.clone();
-                let args = tc.arguments.clone();
-                let result = self.execute_single_tool(tc).await;
-                (name, args, result)
-            })
-            .collect();
+        let effect_of = |name: &str| {
+            crate::agent::tool_manifest::lookup_static(name)
+                .map(|m| m.side_effect)
+                .unwrap_or(crate::agent::tool_manifest::EffectClass::Mutating)
+        };
+        let (parallel_idx, serial_idx) = partition_tool_calls(tool_calls, effect_of);
 
-        // 并行执行(join_all 保证顺序与输入一致;裁决阶段经共享 Mutex 串行)
-        let results = futures_util::future::join_all(futures).await;
+        let mut slots: Vec<Option<(String, Value, Value)>> =
+            tool_calls.iter().map(|_| None).collect();
+
+        // 串行组:写面/进程/交互/未标定——按原始顺序逐个执行
+        for &i in &serial_idx {
+            let tc = &tool_calls[i];
+            let result = self.execute_single_tool(tc).await;
+            slots[i] = Some((tc.name.clone(), tc.arguments.clone(), result));
+        }
+
+        // 并行组:只读显式标定者——受帽分块 join_all
+        let cap = self.config.max_parallel_tools.max(1);
+        for chunk in parallel_idx.chunks(cap) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|&i| {
+                    let tc = &tool_calls[i];
+                    async move {
+                        let result = self.execute_single_tool(tc).await;
+                        (i, tc.name.clone(), tc.arguments.clone(), result)
+                    }
+                })
+                .collect();
+            let chunk_results = futures_util::future::join_all(futures).await;
+            for (i, name, args, result) in chunk_results {
+                slots[i] = Some((name, args, result));
+            }
+        }
+
+        // 结果按原始顺序归位
+        let results: Vec<(String, Value, Value)> = slots
+            .into_iter()
+            .map(|s| s.expect("every tool_call slot filled"))
+            .collect();
 
         // 缓存 active 工具结果(非 proposal)——缓存键=「已过门禁的证据」
         for (name, args, result) in &results {
@@ -9841,6 +9871,26 @@ fn plan_mode_allowlist_blocked(plan_mode: bool, tool_name: &str) -> Option<Strin
     Some(format!(
         "{{\"status\":\"plan_mode_blocked\",\"tool\":\"{tool_name}\",\"note\":\"计划模式下仅允许只读探查(file_read/file_list/search_files/grep_files/code_search)、plan_submit 与 ask_user;请继续只读探查,或用 plan_submit 提交结构化计划收束本回合。\"}}"
     ))
+}
+
+/// 读写分级分组纯函数（并行调度批）：按 manifest `side_effect` 把一轮
+/// tool_calls 分为 (并行索引组, 串行索引组)，两组各自保持原始相对顺序。
+/// 分组判据经 `effect_of` 闭包注入（调用方以 `lookup_static` 查表，未标定
+/// 一律 Mutating=保守串行，缺省不变式）。
+fn partition_tool_calls(
+    tool_calls: &[crate::agent::translator::ToolCall],
+    effect_of: impl Fn(&str) -> crate::agent::tool_manifest::EffectClass,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut parallel = Vec::new();
+    let mut serial = Vec::new();
+    for (i, tc) in tool_calls.iter().enumerate() {
+        if effect_of(&tc.name) == crate::agent::tool_manifest::EffectClass::ReadOnly {
+            parallel.push(i);
+        } else {
+            serial.push(i);
+        }
+    }
+    (parallel, serial)
 }
 
 /// 思考留痕入参收敛:空串归一为 None(非思考模型零增量,记录不带空字段)

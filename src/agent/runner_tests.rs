@@ -25,6 +25,42 @@ fn make_test_client() -> EvoruleApiClient {
     EvoruleApiClient::new("http://localhost:8080")
 }
 
+#[test]
+fn test_partition_tool_calls_readonly_parallel_mutating_serial() {
+    // 读写分级分组纯函数（并行调度批）：只读索引组并行（保原序）、
+    // 其余串行（保原序）；未标定工具保守落串行组（缺省不变式）。
+    use crate::agent::translator::ToolCall;
+    let calls = vec![
+        ToolCall {
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path": "a"}),
+            id: None,
+        },
+        ToolCall {
+            name: "file_write".into(),
+            arguments: serde_json::json!({"path": "b"}),
+            id: None,
+        },
+        ToolCall {
+            name: "grep_files".into(),
+            arguments: serde_json::json!({"q": "x"}),
+            id: None,
+        },
+        ToolCall {
+            name: "not_a_tool".into(),
+            arguments: serde_json::json!({}),
+            id: None,
+        },
+    ];
+    let (parallel, serial) = partition_tool_calls(&calls, |name| {
+        crate::agent::tool_manifest::lookup_static(name)
+            .map(|m| m.side_effect)
+            .unwrap_or(crate::agent::tool_manifest::EffectClass::Mutating)
+    });
+    assert_eq!(parallel, vec![0, 2], "只读组保原序");
+    assert_eq!(serial, vec![1, 3], "串行组保原序;未标定保守串行");
+}
+
 /// 快照仓库写域与写面工具同源:缺省入口绑 workspace 子域(缺省不变式);
 /// 显式变体供调用方按声明能力边界下传全域(".")——serve 面 read_write
 /// 声明下写工具族全域可写,仓库随行同域,消除口径告警
@@ -2499,25 +2535,27 @@ async fn delegate_path_union_escalation_denied_at_focus_stage() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_g13_parallel_faster_than_serial() {
-    // 3 个工具各 sleep 100ms:串行 ~300ms,并行 ~100ms
+    // 3 个只读工具各 sleep 100ms:串行 ~300ms,并行 ~100ms。
+    // 读写分级批:mock 工具名用静态表已标定 ReadOnly 的真名——
+    // 未标定名会保守落串行组(缺省不变式),并行断言无从成立。
     let delay_ms = 100;
     let mut tools: BTreeMap<String, Arc<dyn ToolFunction>> = BTreeMap::new();
     tools.insert(
-        "t1".to_string(),
+        "file_read".to_string(),
         Arc::new(DelayedTool {
             delay_ms,
             label: "1".to_string(),
         }),
     );
     tools.insert(
-        "t2".to_string(),
+        "file_list".to_string(),
         Arc::new(DelayedTool {
             delay_ms,
             label: "2".to_string(),
         }),
     );
     tools.insert(
-        "t3".to_string(),
+        "grep_files".to_string(),
         Arc::new(DelayedTool {
             delay_ms,
             label: "3".to_string(),
@@ -2528,17 +2566,17 @@ async fn test_g13_parallel_faster_than_serial() {
 
     let tool_calls = vec![
         ToolCall {
-            name: "t1".to_string(),
+            name: "file_read".to_string(),
             arguments: serde_json::json!({}),
             id: None,
         },
         ToolCall {
-            name: "t2".to_string(),
+            name: "file_list".to_string(),
             arguments: serde_json::json!({}),
             id: None,
         },
         ToolCall {
-            name: "t3".to_string(),
+            name: "grep_files".to_string(),
             arguments: serde_json::json!({}),
             id: None,
         },

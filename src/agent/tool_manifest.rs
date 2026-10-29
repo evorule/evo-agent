@@ -171,6 +171,20 @@ impl TimeoutClass {
     }
 }
 
+/// 副作用分级（并行调度分组判据）：manifest 层显式标定，调度层据此分组。
+///
+/// 缺省不变式：未标定一律 [`EffectClass::Mutating`]（保守串行）——并行
+/// 只认显式 ReadOnly；标定扩面走静态表逐件落位 + 数量锁测试 diff 审。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectClass {
+    /// 纯读/无外部可观测写效应（文件读/检索/查账/记忆读/网络取读等），
+    /// 可并行预执行（受 `max_parallel_tools` 帽）
+    ReadOnly,
+    /// 写面/进程/交互阻塞/未标定（保守串行）
+    Mutating,
+}
+
 /// agentTools.* 开关绑定（从 serve_tools TOOL_SWITCH_KEYS 迁移，快照测试锁等价）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwitchBinding {
@@ -284,6 +298,8 @@ pub struct ToolManifest {
     pub sandbox_scope: SandboxScope,
     /// 超时档（执行路径按此分派，见 [`TimeoutClass::duration`]）
     pub timeout_class: TimeoutClass,
+    /// 副作用分级（并行调度分组判据；缺省 Mutating=保守串行）
+    pub side_effect: EffectClass,
 }
 
 impl ToolManifest {
@@ -443,6 +459,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
         default_switch: None,
         sandbox_scope: SandboxScope::HostSandboxed,
         timeout_class: TimeoutClass::Default,
+        side_effect: EffectClass::Mutating,
     }
 }
 
@@ -560,6 +577,18 @@ fn builtin_manifests() -> Vec<ToolManifest> {
     ]
     .into_iter()
     .map(|mut m| {
+        // 读写分级（并行调度分组判据）：只读族显式标 ReadOnly，其余缺省
+        // Mutating（保守串行）。web_fetch/http_get 语义取读但为 candidate
+        // 审批模式——分级不影响其审批臂，只影响并行预执行分组。
+        match m.name.as_str() {
+            "file_read" | "image_load" | "file_list" | "search_files" | "grep_files"
+            | "code_search" | "git_status" | "git_diff" | "git_log" | "query_journal"
+            | "query_trace" | "read_back" | "diff_runs" | "read_skill" | "memory_recall"
+            | "audit_query" | "todo_read" | "handover_read" | "web_search" => {
+                m.side_effect = EffectClass::ReadOnly;
+            }
+            _ => {}
+        }
         // 分级/审批/开关/超时的现状如实盘点（设计档 §3.1 派生关系）
         match m.name.as_str() {
             // 哨兵：规则正本 00_constraint_tool_intent_adjudication 已有
@@ -721,6 +750,16 @@ const RULE_P2_ADJUDICATED_TOOLS: &[&str] = &[
     "bundle_import",
 ];
 
+/// 规则族只读工具（读写分级标定；读面语义有正本注释背书——why/order 查账
+/// 因果查询面「全部只读」+ publish_list/publish_queue_get「读面语义」）
+const READ_ONLY_RULE_TOOLS: &[&str] = &[
+    "explain_denial",
+    "causal_order",
+    "lineage_of",
+    "publish_list",
+    "publish_queue_get",
+];
+
 /// 规则工具 manifest（59 条 = 透传 49 + 本地逻辑 7 + why/order 3，名称集合与
 /// rule_tool_specs() 相等——测试锁）
 fn rule_manifests() -> Vec<ToolManifest> {
@@ -739,6 +778,9 @@ fn rule_manifests() -> Vec<ToolManifest> {
             }
             if GOVERNANCE_WRITE_TOOLS.contains(&name) {
                 m.default_switch = sw(SWITCH_GOVERNANCE_WRITE, true);
+            }
+            if READ_ONLY_RULE_TOOLS.contains(&name) {
+                m.side_effect = EffectClass::ReadOnly;
             }
             m
         })
@@ -765,18 +807,22 @@ fn rule_manifests() -> Vec<ToolManifest> {
         if GOVERNANCE_WRITE_TOOLS.contains(&name) {
             m.default_switch = sw(SWITCH_GOVERNANCE_WRITE, true);
         }
+        if READ_ONLY_RULE_TOOLS.contains(&name) {
+            m.side_effect = EffectClass::ReadOnly;
+        }
         manifests.push(m);
     }
     // why/order 3（rule_tools::why_tools::register 的注册名，PR-11b 查账
     // 因果查询面）——全部只读，Standard（免裁决但落账）+AutoPolicy（免审）
     // +无开关（不进 GOVERNANCE_SNAPSHOT/SWITCH_SNAPSHOT，快照面零变化）
     for name in ["explain_denial", "causal_order", "lineage_of"] {
-        let m = base(
+        let mut m = base(
             name,
             ToolSource::RuleLocal,
             SpecSource::Rule,
             vec![CapDomain::Governance],
         );
+        m.side_effect = EffectClass::ReadOnly;
         manifests.push(m);
     }
     manifests
@@ -844,6 +890,15 @@ fn memory_manifests() -> Vec<ToolManifest> {
             vec![CapDomain::Memory],
         ),
     ]
+    .into_iter()
+    .map(|mut m| {
+        // 读写分级：记忆检索/读取两件纯读（并行调度分组判据）
+        if m.name == MEMORY_SEARCH_TOOL || m.name == MEMORY_GET_TOOL {
+            m.side_effect = EffectClass::ReadOnly;
+        }
+        m
+    })
+    .collect()
 }
 
 /// 全部静态 manifest（102 条；测试锁数量/唯一名/双侧集合相等）
@@ -935,6 +990,8 @@ pub fn dynamic_manifest(
         default_switch,
         sandbox_scope: SandboxScope::HostSandboxed,
         timeout_class: TimeoutClass::Default,
+        // 动态源（MCP/服务代理）无静态标定：保守 Mutating（缺省不变式）
+        side_effect: EffectClass::Mutating,
     })
 }
 
@@ -1104,6 +1161,51 @@ mod tests {
                 serde_json::from_str(&json).unwrap_or_else(|e| panic!("{}: {e}", m.name));
             assert_eq!(back, m, "{}: roundtrip mismatch", m.name);
         }
+    }
+
+    #[test]
+    fn test_effect_class_calibration_locked() {
+        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=26；
+        // 未标定一律 Mutating（保守串行，缺省不变式）。扩标须 diff 审改数。
+        let all = static_manifests();
+        let readonly: Vec<&str> = all
+            .iter()
+            .filter(|m| m.side_effect == EffectClass::ReadOnly)
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(readonly.len(), 26, "ReadOnly 标定数锁: {:?}", readonly);
+        let look = |n: &str| lookup_static(n).unwrap().side_effect;
+        // 内置只读族抽样
+        assert_eq!(look("file_read"), EffectClass::ReadOnly);
+        assert_eq!(look("grep_files"), EffectClass::ReadOnly);
+        assert_eq!(look("memory_recall"), EffectClass::ReadOnly);
+        assert_eq!(look("todo_read"), EffectClass::ReadOnly);
+        assert_eq!(look("handover_read"), EffectClass::ReadOnly);
+        assert_eq!(look("web_search"), EffectClass::ReadOnly);
+        // memory 只读两件
+        assert_eq!(
+            look(crate::agent::memory_tool::MEMORY_SEARCH_TOOL),
+            EffectClass::ReadOnly
+        );
+        assert_eq!(
+            look(crate::agent::memory_tool::MEMORY_GET_TOOL),
+            EffectClass::ReadOnly
+        );
+        // 规则只读五件
+        assert_eq!(look("explain_denial"), EffectClass::ReadOnly);
+        assert_eq!(look("causal_order"), EffectClass::ReadOnly);
+        assert_eq!(look("lineage_of"), EffectClass::ReadOnly);
+        assert_eq!(look("publish_list"), EffectClass::ReadOnly);
+        assert_eq!(look("publish_queue_get"), EffectClass::ReadOnly);
+        // 写面/进程/交互/委托/未标定 = Mutating
+        assert_eq!(look("file_write"), EffectClass::Mutating);
+        assert_eq!(look("edit_file"), EffectClass::Mutating);
+        assert_eq!(look("shell_exec"), EffectClass::Mutating);
+        assert_eq!(look("git_commit"), EffectClass::Mutating);
+        assert_eq!(look("ask_user"), EffectClass::Mutating);
+        assert_eq!(look("todo_write"), EffectClass::Mutating);
+        assert_eq!(look("delegate"), EffectClass::Mutating);
+        assert_eq!(look("rule_create"), EffectClass::Mutating);
     }
 
     // ---------- 派生等价快照（防迁移丢失） ----------
