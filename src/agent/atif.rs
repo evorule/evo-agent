@@ -720,6 +720,10 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                         &mut total_completion,
                     );
                 }
+                // 判定分布计数面:「未判定/未裁」与「判定为良性」在聚合面
+                // 显式可分(fail-soft 的 uncertain 不改行为,但审计面必须可见)
+                let verdict_summary =
+                    crate::agent::context_inspector::i2_verdict_summary(conflicts);
                 steps.push(AtifStep {
                     step_id: next_step_id,
                     timestamp: Some(iso8601_from_unix_ms(line.ts)),
@@ -730,7 +734,15 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                     observation: Some(AtifObservation {
                         results: vec![AtifObservationResult {
                             source_call_id: None,
-                            content: Some(format!("round={} conflicts={}", round, conflicts.len())),
+                            content: Some(format!(
+                                "round={} conflicts={} verdicts={{contradiction:{}, benign:{}, uncertain:{}, unadjudicated:{}}}",
+                                round,
+                                conflicts.len(),
+                                verdict_summary.contradiction,
+                                verdict_summary.benign,
+                                verdict_summary.uncertain,
+                                verdict_summary.unadjudicated
+                            )),
                         }],
                     }),
                     metrics: None,
@@ -738,6 +750,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
                         "context_management": {
                             "type": "i2_scan_report",
                             "round": round,
+                            "verdict_summary": verdict_summary,
                             "conflicts": conflicts
                         }
                     })),
@@ -1838,6 +1851,17 @@ mod tests {
         // system + user + i2_scan_report-system(turn 内无 LLM 步,agent 步不产生)
         assert_eq!(t.steps.len(), 3);
         let cs = &t.steps[2];
+        // 判定分布计数面随步出证:unadjudicated(语义级未裁)与 benign 分列
+        let cm = cs
+            .extra
+            .as_ref()
+            .expect("context_management extra")
+            .get("context_management")
+            .unwrap();
+        let vs = cm.get("verdict_summary").expect("verdict_summary");
+        assert_eq!(vs.get("total").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(vs.get("unadjudicated").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(vs.get("benign").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(cs.source, "system");
         assert_eq!(
             cs.extra,
@@ -1845,6 +1869,13 @@ mod tests {
                 "context_management": {
                     "type": "i2_scan_report",
                     "round": 1,
+                    "verdict_summary": {
+                        "total": 1,
+                        "contradiction": 0,
+                        "benign": 0,
+                        "uncertain": 0,
+                        "unadjudicated": 1
+                    },
                     "conflicts": [{
                         "kind": "deny_vs_capability",
                         "token": "web_search",
