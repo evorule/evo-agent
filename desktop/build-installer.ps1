@@ -79,6 +79,9 @@ if (-not $SkipCollect) {
         # 依赖,仅 node: 内建)+vendor(7.7MB 自足)；与 sync-service-tools.ps1 的
         # $ExternalPackages 登记列表联动（四联映射：随包↔白名单↔壳拉起↔接线模板）
         @{ Src = (Join-Path $ServerRepo "plugins\codegraph-bridge");          Dst = "resources\evorule-server\plugins\codegraph-bridge" },
+        # ai-plugin 服务面（基线接线批 2026-10-30）：exe 已走 bin 对；plugin.json
+        # 单文件入包供服务面注册（ai_plugin_chat 对账可见）。口契约=9130（壳钉口）
+        @{ Src = (Join-Path $ServerRepo "plugins\ai-plugin\plugin.json");     Dst = "resources\evorule-server\plugins\ai-plugin\plugin.json" },
         @{ Src = (Join-Path $repoRoot "desktop\templates\plugins-manifest.json"); Dst = "resources\evorule-server\plugins-manifest-template.json" }
     )
 

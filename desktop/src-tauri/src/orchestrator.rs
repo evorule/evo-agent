@@ -305,33 +305,32 @@ fn spawn_engine(
     Ok(engine)
 }
 
-/// codegraph-bridge sidecar 接线（可选组件，发版面验收机制档 §4 闸 3）：
-/// 资产（安装 resources 下 server.mjs+清单模板）与 node 运行时双条件启用；
-/// 任一缺位 = fail-soft 降级（引擎无 --plugins → 对账面自然缺十项 + serve
-/// 点名摘要可见），不阻断全链。sidecar 固定口 9150（plugin.json base_url
-/// 静态契约，server 仓零改）；被占 = 降级并留痕。
-/// 清单模板占位符 {{CODEGRAPH_BRIDGE_PLUGIN_JSON}} 替换为装机绝对路径后
-/// 写 runtime 副本，引擎 spawn 时以 --plugins 传入。
+/// codegraph-bridge sidecar 拉起（可选组件，发版面验收机制档 §4 闸 3）：
+/// 资产（安装 resources 下 server.mjs）与 node 运行时双条件启用；任一缺位
+/// = fail-soft 降级（包名记入 excluded → 清单剔除 → 对账面自然缺十项 +
+/// serve 点名摘要可见），不阻断全链。sidecar 固定口 9150（plugin.json
+/// base_url 静态契约，server 仓零改）；被占 = 降级并留痕。
+/// 清单装配与拉起解耦：本函数只管进程，收录资格经 excluded 交给
+/// prepare_plugins_manifest 统一裁决。
 fn prepare_codegraph_bridge(
     ctx: &LaunchContext,
     log: &mut impl Write,
-) -> Result<(Option<Child>, Option<PathBuf>), String> {
+    excluded: &mut Vec<String>,
+) -> Result<Option<Child>, String> {
     let paths = ctx.paths;
     let bridge_dir = paths
         .evorule_server_home
         .join("plugins")
         .join("codegraph-bridge");
     let server_mjs = bridge_dir.join("server.mjs");
-    let template = paths
-        .evorule_server_home
-        .join("plugins-manifest-template.json");
-    if !server_mjs.is_file() || !template.is_file() {
+    if !server_mjs.is_file() {
         writeln!(
             log,
             "[orch] codegraph-bridge assets missing; skipping (dev hand-wired setups unaffected)"
         )
         .ok();
-        return Ok((None, None));
+        excluded.push("codegraph-bridge".to_string());
+        return Ok(None);
     }
     if !port_bindable(9150) {
         writeln!(
@@ -339,7 +338,8 @@ fn prepare_codegraph_bridge(
             "[orch] codegraph-bridge port 9150 occupied; codegraph services unavailable"
         )
         .ok();
-        return Ok((None, None));
+        excluded.push("codegraph-bridge".to_string());
+        return Ok(None);
     }
     let Some(node) = which_node() else {
         writeln!(
@@ -347,19 +347,9 @@ fn prepare_codegraph_bridge(
             "[orch] node runtime not found; codegraph services unavailable (install Node.js to enable)"
         )
         .ok();
-        return Ok((None, None));
+        excluded.push("codegraph-bridge".to_string());
+        return Ok(None);
     };
-    // 清单占位符替换 → runtime 副本（装机绝对路径运行期才知道）
-    let raw = std::fs::read_to_string(&template).map_err(|e| e.to_string())?;
-    let plugin_json = server_mjs
-        .with_file_name("plugin.json")
-        .display()
-        .to_string()
-        .replace('\\', "/");
-    let filled = raw.replace("{{CODEGRAPH_BRIDGE_PLUGIN_JSON}}", &plugin_json);
-    std::fs::create_dir_all(&paths.runtime_dir).map_err(|e| e.to_string())?;
-    let manifest = paths.runtime_dir.join("plugins-manifest.json");
-    std::fs::write(&manifest, filled).map_err(|e| e.to_string())?;
     let out_log = open_append(&paths.logs_dir.join("codegraph-bridge.log"))?;
     let out_log_err = open_append(&paths.logs_dir.join("codegraph-bridge.log"))?;
     let child = Command::new(&node)
@@ -378,7 +368,72 @@ fn prepare_codegraph_bridge(
         child.id()
     )
     .ok();
-    Ok((Some(child), Some(manifest)))
+    Ok(Some(child))
+}
+
+/// 外部插件包清单装配（发版面验收机制档 §4 闸 3 泛化）：读安装面清单模板
+/// （plugins-manifest-template.json，随包收集），逐包按装机在位性决定收录
+/// ——plugin.json 缺位、enabled=false 或前置条件失败（sidecar 拉起失败/
+/// 执行体口偏离静态契约）→ 条目剔除 + 日志留痕（可见失败，不收编未随包的
+/// 幽灵服务）；全部剔除 = 引擎不带 --plugins（与未配置同语义）。
+/// manifest 路径由包名派生（plugins\<pkg>\plugin.json 装机绝对路径，正斜杠），
+/// runtime 副本落盘后由引擎 spawn 以 --plugins 传入。
+fn prepare_plugins_manifest(
+    ctx: &LaunchContext,
+    log: &mut impl Write,
+    excluded: &[String],
+) -> Result<Option<PathBuf>, String> {
+    let paths = ctx.paths;
+    let template = paths
+        .evorule_server_home
+        .join("plugins-manifest-template.json");
+    if !template.is_file() {
+        writeln!(log, "[orch] plugins manifest template missing; engine runs without --plugins").ok();
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&template).map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let Some(entries) = v.get("plugins").and_then(|p| p.as_object()) else {
+        writeln!(log, "[orch] plugins manifest template malformed; engine runs without --plugins").ok();
+        return Ok(None);
+    };
+    let mut filled = serde_json::Map::new();
+    for name in entries.keys() {
+        let plugin_json = paths
+            .evorule_server_home
+            .join("plugins")
+            .join(name)
+            .join("plugin.json");
+        let enabled = entries
+            .get(name)
+            .and_then(|e| e.get("enabled"))
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false);
+        if !enabled || !plugin_json.is_file() || excluded.iter().any(|x| x == name) {
+            writeln!(
+                log,
+                "[orch] plugin {name} not eligible (disabled/assets/preconditions); excluded from manifest"
+            )
+            .ok();
+            continue;
+        }
+        let manifest_path = plugin_json.display().to_string().replace('\\', "/");
+        filled.insert(
+            name.clone(),
+            serde_json::json!({ "enabled": true, "manifest": manifest_path }),
+        );
+    }
+    if filled.is_empty() {
+        writeln!(log, "[orch] no external packages eligible; engine runs without --plugins").ok();
+        return Ok(None);
+    }
+    let out = serde_json::json!({ "plugins": serde_json::Value::Object(filled.clone()) });
+    std::fs::create_dir_all(&paths.runtime_dir).map_err(|e| e.to_string())?;
+    let manifest = paths.runtime_dir.join("plugins-manifest.json");
+    std::fs::write(&manifest, serde_json::to_string_pretty(&out).unwrap())
+        .map_err(|e| e.to_string())?;
+    writeln!(log, "[orch] plugins manifest assembled ({} packages)", filled.len()).ok();
+    Ok(Some(manifest))
 }
 
 /// node 可执行探测（PATH 顺序首个命中；None = 装机缺 Node.js 运行时）。
@@ -720,18 +775,34 @@ fn write_runtime_file(
     .map_err(|e| format!("write runtime.json: {e}"))
 }
 
-/// 全链拉起（初始启动与整组重启共用）：engine → 探测 → 执行体（可选）→
-/// 探测 → serve → 探测 → runtime.json。执行体为可选组件：exe/key 缺位或
-/// 健康失败一律降级不阻断（LLM 不可用，工作台其余功能照常）。
+/// 全链拉起（初始启动与整组重启共用）：外部包清单装配 → engine（带
+/// --plugins）→ 探测 → 执行体（可选）→ 探测 → serve → 探测 → runtime.json。
+/// 执行体为可选组件：exe/key 缺位或健康失败一律降级不阻断（LLM 不可用，
+/// 工作台其余功能照常）。
 fn start_group(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, String> {
-    let (last_serve, last_engine, last_exec) = last_ports(ctx.paths);
+    let (last_serve, last_engine, _) = last_ports(ctx.paths);
     let serve_port = sticky_or_free(last_serve, &[])?;
     let engine_port = sticky_or_free(last_engine, &[serve_port])?;
-    let executor_port = sticky_or_free(last_exec, &[serve_port, engine_port])?;
+    // 执行体口优先钉 plugin.json base_url 静态契约 9130（服务面对账以
+    // plugin.json 为准，同 sidecar 固定口 9150 语义）；被占/撞兄弟口回落
+    // 新口——LLM 功能经 ai_plugin_port 直连不受影响，仅服务面从清单剔除。
+    let executor_port = if port_bindable(9130) && serve_port != 9130 && engine_port != 9130 {
+        9130
+    } else {
+        pick_free_port(&[serve_port, engine_port])?
+    };
 
-    // codegraph-bridge 先行拉起并生成 runtime 清单——引擎 spawn 时带 --plugins
-    let (codegraph, codegraph_manifest) = prepare_codegraph_bridge(ctx, log)?;
-    let mut engine = spawn_engine(ctx, engine_port, codegraph_manifest.as_deref())?;
+    // 外部包接线（闸 3 泛化）：sidecar 先拉起定收录资格；执行体预检一次两用
+    // （清单收录条件 + 后续 spawn，避免重复日志与重复读 key）；清单装配后
+    // 引擎 spawn 带 --plugins。
+    let mut excluded: Vec<String> = Vec::new();
+    let codegraph = prepare_codegraph_bridge(ctx, log, &mut excluded)?;
+    let executor_key = llm_executor_ready(ctx, log);
+    if executor_key.is_none() || executor_port != 9130 {
+        excluded.push("ai-plugin".to_string());
+    }
+    let plugins_manifest = prepare_plugins_manifest(ctx, log, &excluded)?;
+    let mut engine = spawn_engine(ctx, engine_port, plugins_manifest.as_deref())?;
     if !health::wait_healthy(engine_port, "/api/health", Duration::from_secs(30)) {
         let _ = engine.kill();
         return Err(format!("engine health check timeout (port {engine_port})"));
@@ -740,7 +811,7 @@ fn start_group(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, Str
 
     let mut ai_plugin = None;
     let mut ai_plugin_port = None;
-    if let Some(key) = llm_executor_ready(ctx, log) {
+    if let Some(key) = executor_key {
         match spawn_ai_plugin(ctx, executor_port, engine_port, &key) {
             Ok(mut child) => {
                 if health::wait_healthy(executor_port, "/health", Duration::from_secs(15)) {
