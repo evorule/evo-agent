@@ -1665,6 +1665,10 @@ async fn run_agent(
             state.definitions().clone(),
             state.evorule_client.clone(),
         )
+        // LLM handler 同源下放(子代理与主 runner 同口径,防 4096 硬兜底)
+        .with_llm_handler(crate::io_handlers::LlmHandler::from_config(
+            &state.llm_config(),
+        ))
         .with_journal_dir(state.workdir.join("data").join("sessions")),
     )
     // 查账工具族接线（PR-11a）：以本会话态重绑 handler 内查账工具实例
@@ -1750,6 +1754,10 @@ async fn run_agent(
                 state.definitions.clone(),
                 state.evorule_client.clone(),
             )
+            // LLM handler 同源下放(子代理与主 runner 同口径,防 4096 硬兜底)
+            .with_llm_handler(crate::io_handlers::LlmHandler::from_config(
+                &state.llm_config(),
+            ))
             .with_journal_dir(state.workdir.join("data").join("sessions"))
             .with_governance_segment(governance_segment.clone())
             // 子代理工具契约:union toolkit 快照下放(此前 react 面子代理
@@ -2130,6 +2138,10 @@ async fn run_agent_stream(
             state.definitions().clone(),
             state.evorule_client.clone(),
         )
+        // LLM handler 同源下放(子代理与主 runner 同口径,防 4096 硬兜底)
+        .with_llm_handler(crate::io_handlers::LlmHandler::from_config(
+            &state.llm_config(),
+        ))
         .with_journal_dir(state.workdir.join("data").join("sessions"))
         // 项目记忆段下放(与主 runner 同源)
         .with_agents_md_segment(agents_md.clone())

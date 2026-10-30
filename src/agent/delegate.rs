@@ -164,6 +164,11 @@ pub struct DelegateContext {
     pub step_timeout_override: Option<std::time::Duration>,
     /// spawn 账（子会话锚记录;clone 共享同一 Arc,父 runner drain 落账）
     pub(crate) spawn_ledger: SpawnLedger,
+
+    /// 子代理 LLM handler 下放（Some = 子 runner 覆盖 with_defaults 缺省,
+    /// 携带统一解析产物含 [llm] max_tokens;None = 既有行为 with_defaults,
+    /// 4096 硬兜底会被推理模型思考吃满 → content 空响应被误读为完成）
+    pub(crate) llm_handler: Option<crate::io_handlers::LlmHandler>,
 }
 
 impl DelegateContext {
@@ -189,6 +194,7 @@ impl DelegateContext {
             propagate_memory: false,
             step_timeout_override: None,
             spawn_ledger: Arc::new(std::sync::Mutex::new(Vec::new())),
+            llm_handler: None,
         }
     }
 
@@ -255,6 +261,24 @@ impl DelegateContext {
             .as_ref()
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    /// 子代理 LLM handler 下放(builder 风格;主构造点统一传入统一解析产物,
+    /// 与主 runner 的 handler 同源——env 优先、toml 兜底)
+    pub fn with_llm_handler(mut self, handler: crate::io_handlers::LlmHandler) -> Self {
+        self.llm_handler = Some(handler);
+        self
+    }
+
+    /// 子 runner llm_handler 接线(构造点下放 Some 时覆盖 with_defaults 缺省)
+    fn wire_llm_handler(
+        &self,
+        runner: crate::agent::runner::AgentRunner,
+    ) -> crate::agent::runner::AgentRunner {
+        match &self.llm_handler {
+            Some(h) => runner.with_llm_handler(h.clone()),
+            None => runner,
+        }
     }
 
     /// Set delegate depth
@@ -368,6 +392,9 @@ impl DelegateContext {
             crate::agent::runner::AgentRunner::new(config, self.evorule_client.clone())
                 .with_delegate_pipeline_entry()
                 .with_assembly_scope_focus();
+        // LLM handler 下放接线(构造点 Some 时覆盖 with_defaults 缺省——
+        // 统一解析产物随子代理同源,防 4096 硬兜底截断推理模型思考)
+        let mut runner = self.wire_llm_handler(runner);
         if let Some(counter) = &self.token_counter {
             runner = runner.with_token_counter(counter.clone());
         }
@@ -734,6 +761,38 @@ mod tests {
         assert_eq!(ctx.parent_agent_type, "parent");
         assert_eq!(ctx.max_depth, DEFAULT_MAX_DELEGATE_DEPTH);
         assert!(ctx.max_concurrent.is_none());
+    }
+
+    // ===== LLM handler 下放接线(配置兜底 max_tokens 防回归) =====
+
+    #[test]
+    fn sub_runner_inherits_llm_max_tokens_config() {
+        // 构造点下放的 handler 必须原样落到子 runner——统一解析产物
+        // ([llm] max_tokens)随行,否则子 runner 落 with_defaults 4096 硬兜底
+        let mut cfg = crate::config::LlmConfig::default();
+        cfg.max_tokens = Some(32768);
+        let ctx = make_ctx()
+            .with_llm_handler(crate::io_handlers::LlmHandler::from_config(&cfg));
+        let runner = ctx.wire_llm_handler(crate::agent::runner::AgentRunner::new(
+            crate::agent::runner::AgentConfig::default(),
+            make_test_client(),
+        ));
+        assert_eq!(
+            runner.llm_handler_config_max_tokens_for_test(),
+            Some(32768),
+            "子 runner 必须携带构造点下放的 [llm] max_tokens 配置兜底"
+        );
+    }
+
+    #[test]
+    fn sub_runner_without_handler_keeps_default_fallback() {
+        // None = 既有行为零变化(with_defaults,4096 硬兜底)
+        let ctx = make_ctx();
+        let runner = ctx.wire_llm_handler(crate::agent::runner::AgentRunner::new(
+            crate::agent::runner::AgentConfig::default(),
+            make_test_client(),
+        ));
+        assert_eq!(runner.llm_handler_config_max_tokens_for_test(), None);
     }
 
     #[test]

@@ -177,6 +177,8 @@ fn test_merge_delegate_tool() {
         step_timeout_override: None,
         // spawn 账(测试空账)
         spawn_ledger: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        // LLM handler 下放(测试不注入)
+        llm_handler: None,
     };
 
     let args = serde_json::json!({"query": "test"});

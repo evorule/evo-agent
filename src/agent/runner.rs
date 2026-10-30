@@ -1900,6 +1900,14 @@ impl AgentRunner {
         self
     }
 
+    /// 测试观测口:llm_handler 的配置兜底 max_tokens(None = with_defaults
+    /// 缺省 4096 生效)。构造点接线防回归测试消费——主回合/子代理 runner
+    /// 必须携带统一解析产物,推理模型思考吃满 4096 会产出空响应被误读为完成。
+    #[cfg(test)]
+    pub(crate) fn llm_handler_config_max_tokens_for_test(&self) -> Option<u64> {
+        self.llm_handler.config_max_tokens_for_test()
+    }
+
     /// TODO: doc
     pub fn with_tool_handler(mut self, tool_handler: ToolHandler) -> Self {
         self.tool_handler = tool_handler;

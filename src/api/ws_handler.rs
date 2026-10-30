@@ -944,6 +944,12 @@ async fn construct_runner(
     let (approval_callback, runaway_policy) =
         build_approval_callback(state, resolved_mode.as_deref());
     let mut runner = AgentRunner::new(config, state.evorule_client().clone())
+        // LLM handler 统一解析产物下放(与 HTTP 端点/CLI 同口径:env 优先、
+        // toml 兜底)——缺这步 runner 落 with_defaults 4096 硬兜底,推理模型
+        // 思考吃满后 content 空响应被误读为正常完成(UI 永挂「运行中」)
+        .with_llm_handler(crate::io_handlers::LlmHandler::from_config(
+            &state.llm_config(),
+        ))
         // 用户 hooks(交互批 第二批)
         .with_user_hooks(user_hooks)
         // 39 号项 A:项目记忆段(AGENTS.md 层级,随 serve workdir 解析)
@@ -1010,6 +1016,10 @@ async fn construct_runner(
                 state.definitions().clone(),
                 state.evorule_client().clone(),
             )
+            // LLM handler 同源下放(子代理与主 runner 同口径,防 4096 硬兜底)
+            .with_llm_handler(crate::io_handlers::LlmHandler::from_config(
+                &state.llm_config(),
+            ))
             .with_journal_dir(state.workdir().join("data").join("sessions"))
             // 项目记忆段下放(与主 runner 同源)
             .with_agents_md_segment(crate::agent::runner::load_agents_md_segment(
@@ -1414,6 +1424,62 @@ mod tests {
         std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
         std::fs::write(&settings_path, r#"{"approval.mode.shellExec": "yolo"}"#).unwrap();
         assert_eq!(resolve_approval_mode(&state, None), None);
+    }
+
+    // ===== WS 主回合 runner LLM 配置兜底接线 =====
+
+    #[tokio::test]
+    async fn construct_runner_carries_llm_max_tokens_config() {
+        // 每轮 fresh runner 的 llm_handler 必须携带统一解析产物
+        // ([llm] max_tokens):缺这步接线 runner 落 with_defaults 4096 硬兜底,
+        // 推理模型思考吃满后 content 空响应被误读为正常完成
+        let dir = tempfile::tempdir().unwrap();
+        // 自管定义目录(cargo test cwd 下 rules/agents 不存在;内嵌最小定义
+        // 保持测试密封性)。memory=none 绕开 sediment 装配链(测试环境无
+        // LLM 侧依赖),断点目标=构造点 llm_handler 接线,与定义无关
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("researcher.json"),
+            r#"{
+              "agent_type": "researcher",
+              "version": "0.1.0",
+              "description": "construct-runner wiring test agent",
+              "license": "AGPL-3.0-or-later",
+              "system_prompt": "test",
+              "model": "MiniMax-M2.5",
+              "temperature": 0.3,
+              "max_steps": 3,
+              "context_window_tokens": 204800,
+              "step_timeout_secs": 60,
+              "tools": ["file_read"],
+              "memory": {"type": "none", "namespace": "researcher"}
+            }"#,
+        )
+        .unwrap();
+        let mut cfg = crate::config::LlmConfig::default();
+        cfg.max_tokens = Some(32768);
+        let state = AgentApiState::new_with_metrics(
+            crate::agent::AgentDefinitionManager::new(agents_dir),
+            EvoruleApiClient::new("http://localhost:0"),
+            std::sync::Arc::new(crate::api::metrics::Metrics::new().unwrap()),
+            dir.path().to_path_buf(),
+            std::sync::Arc::new(crate::api::workspace_client::WorkspaceApiClient::new(
+                "http://localhost:0",
+            )),
+            std::sync::Arc::new(std::sync::RwLock::new(
+                crate::io_handlers::tool_handler::ToolHandler::new(),
+            )),
+        )
+        .with_llm_config(cfg);
+        let runner = construct_runner(&state, "researcher", None)
+            .await
+            .expect("construct runner");
+        assert_eq!(
+            runner.llm_handler_config_max_tokens_for_test(),
+            Some(32768),
+            "WS 主回合 runner 必须携带 [llm] max_tokens 配置兜底"
+        );
     }
 
     // ===== ClientMessage 反序列化测试 =====

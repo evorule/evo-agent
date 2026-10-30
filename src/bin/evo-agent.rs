@@ -910,7 +910,7 @@ fn cmd_run(
         // delegate 内部按子定义 def.tools 白名单过滤)
         let delegate_toolkit = tool_handler.clone();
 
-        AgentRunner::from_definition(def.clone(), client.clone(), tool_handler, Some(llm_handler))
+        AgentRunner::from_definition(def.clone(), client.clone(), tool_handler, Some(llm_handler.clone()))
             .await
             .map(|r| {
                 r.with_capability_boundary(capability_boundary)
@@ -932,6 +932,9 @@ fn cmd_run(
                             mgr.clone(),
                             client.clone(),
                         )
+                        // LLM handler 同源下放(主 runner 同款统一解析产物;
+                        // 子代理同口径防 4096 硬兜底截断推理模型思考)
+                        .with_llm_handler(llm_handler)
                         .with_journal_dir(workdir.join("data").join("sessions"))
                         // 子代理工具契约(此前 CLI run 子代理零工具契约=
                         // 纯文本执行器,与 serve 面 B25 缺陷同源)
@@ -3334,6 +3337,8 @@ fn cmd_workflow(
     let union_toolkit =
         evo_agent::api::serve_tools::build_union_toolkit(workdir, &ws_client, &client);
     let mut ctx = DelegateContext::new("workflow_root", definitions, client.clone())
+        // LLM handler 统一解析产物下放(与 CLI run 主路径同口径,防 4096 硬兜底)
+        .with_llm_handler(evo_agent::io_handlers::LlmHandler::from_config(&config.llm))
         .with_toolkit(union_toolkit, workdir)
         .with_max_depth(max_depth)
         // 子代理事件流与主会话同目录落账(serve 面同口径;未接线时子代理

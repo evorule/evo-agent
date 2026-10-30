@@ -227,6 +227,14 @@ impl LlmHandler {
         self
     }
 
+    /// 测试观测口:配置兜底 max_tokens 当前值(None = 4096 硬兜底生效)。
+    /// 构造点接线防回归测试消费(主回合/子代理 runner 的 handler 必须
+    /// 携带统一解析产物,缺省 with_defaults 落 4096 会被推理模型思考吃满)。
+    #[cfg(test)]
+    pub(crate) fn config_max_tokens_for_test(&self) -> Option<u64> {
+        self.config_max_tokens
+    }
+
     /// 主模型名(getter;G4 判据生成落账记录生成模型用)
     pub fn default_model(&self) -> &str {
         &self.default_model
