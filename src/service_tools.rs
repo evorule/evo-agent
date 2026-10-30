@@ -98,6 +98,11 @@ pub async fn register_service_tools(
         .map_err(|e| format!("服务发现失败（GET /api/services）: {e}"))?;
 
     let mut registered = 0usize;
+    // 启动点名探针：缺失/sensitive/重名逐类收集，循环后输出结构化汇总，
+    // 供装机面 fresh-install 点名与 CI 冒烟断言（B-051）
+    let mut missing: Vec<&str> = Vec::new();
+    let mut skipped_sensitive: Vec<&str> = Vec::new();
+    let mut skipped_duplicate: Vec<&str> = Vec::new();
     for want in whitelist {
         let Some(info) = services.as_array().and_then(|arr| {
             arr.iter()
@@ -106,16 +111,19 @@ pub async fn register_service_tools(
             eprintln!(
                 "[service-tools] 跳过白名单项 '{want}'：不在服务对账清单（GET /api/services）"
             );
+            missing.push(want);
             continue;
         };
         if info["sensitive"].as_bool() == Some(true) {
             eprintln!(
                 "[service-tools] 跳过服务 '{want}'：sensitive 服务禁止直调（须走会话审计链）"
             );
+            skipped_sensitive.push(want);
             continue;
         }
         if handler.has_tool(want) {
             eprintln!("[service-tools] 跳过服务 '{want}'：与本地工具重名（本地工具优先）");
+            skipped_duplicate.push(want);
             continue;
         }
         let description = info["description"].as_str().unwrap_or("").to_string();
@@ -159,6 +167,34 @@ pub async fn register_service_tools(
         );
         registered += 1;
     }
+    // 结构化点名摘要：无论绿红都输出一行，fresh-install/CI 可直接断言
+    // 「注册 N/M」；缺失与跳过分类点名，装机面缺失即肉眼可见（消灭静默缺席）
+    let mut summary = format!(
+        "[service-tools] 点名：注册 {registered}/{}",
+        whitelist.len()
+    );
+    if !missing.is_empty() {
+        summary.push_str(&format!(
+            "，缺失 {}（{}）",
+            missing.len(),
+            missing.join(", ")
+        ));
+    }
+    if !skipped_sensitive.is_empty() {
+        summary.push_str(&format!(
+            "，sensitive 跳过 {}（{}）",
+            skipped_sensitive.len(),
+            skipped_sensitive.join(", ")
+        ));
+    }
+    if !skipped_duplicate.is_empty() {
+        summary.push_str(&format!(
+            "，重名跳过 {}（{}）",
+            skipped_duplicate.len(),
+            skipped_duplicate.join(", ")
+        ));
+    }
+    eprintln!("{summary}");
     Ok(registered)
 }
 

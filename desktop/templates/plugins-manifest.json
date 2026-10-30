@@ -1,0 +1,8 @@
+{
+  "plugins": {
+    "codegraph-bridge": {
+      "enabled": true,
+      "manifest": "{{CODEGRAPH_BRIDGE_PLUGIN_JSON}}"
+    }
+  }
+}

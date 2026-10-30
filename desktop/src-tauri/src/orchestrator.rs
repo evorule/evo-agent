@@ -45,6 +45,8 @@ pub struct Runtime {
     /// LLM 执行体（可选组件：exe+key 双条件启用；未启用 = None）
     pub ai_plugin: Option<Child>,
     pub ai_plugin_port: Option<u16>,
+    /// codegraph-bridge sidecar（可选组件：资产+node 双条件启用；未启用 = None）
+    pub codegraph: Option<Child>,
 }
 
 /// 一次拉起所需的全部输入（job 由守护方持有，跨重启复用）。
@@ -247,7 +249,11 @@ pub fn prepare_workspace(ctx: &LaunchContext, log: &mut impl Write) -> Result<()
     )
 }
 
-fn spawn_engine(ctx: &LaunchContext, engine_port: u16) -> Result<Child, String> {
+fn spawn_engine(
+    ctx: &LaunchContext,
+    engine_port: u16,
+    plugins_manifest: Option<&Path>,
+) -> Result<Child, String> {
     let paths = ctx.paths;
     let engine_wal = paths.data_dir.join("engine-wal");
     std::fs::create_dir_all(&engine_wal).map_err(|e| e.to_string())?;
@@ -280,7 +286,13 @@ fn spawn_engine(ctx: &LaunchContext, engine_port: u16) -> Result<Child, String> 
         .arg(paths.engine_data_dir.join("memory"))
         .args(["--wal-dir"])
         .arg(&engine_wal)
-        .args(ctx.engine_extra_args)
+        .args(ctx.engine_extra_args);
+    // 外部插件包清单（可选）：runtime 生成副本（装机绝对路径运行期才知道），
+    // 引擎装载后其 plugin.json 服务派生进对账面（codegraph 十项随发版面）
+    if let Some(m) = plugins_manifest {
+        engine_cmd.args(["--plugins"]).arg(m);
+    }
+    engine_cmd
         .stdout(Stdio::from(engine_log))
         .stderr(Stdio::from(engine_log_err))
         .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
@@ -291,6 +303,100 @@ fn spawn_engine(ctx: &LaunchContext, engine_port: u16) -> Result<Child, String> 
         ctx.job.assign_pid(engine.id());
     }
     Ok(engine)
+}
+
+/// codegraph-bridge sidecar 接线（可选组件，design-45 §4 闸 3）：
+/// 资产（安装 resources 下 server.mjs+清单模板）与 node 运行时双条件启用；
+/// 任一缺位 = fail-soft 降级（引擎无 --plugins → 对账面自然缺十项 + serve
+/// 点名摘要可见），不阻断全链。sidecar 固定口 9150（plugin.json base_url
+/// 静态契约，server 仓零改）；被占 = 降级并留痕。
+/// 清单模板占位符 {{CODEGRAPH_BRIDGE_PLUGIN_JSON}} 替换为装机绝对路径后
+/// 写 runtime 副本，引擎 spawn 时以 --plugins 传入。
+fn prepare_codegraph_bridge(
+    ctx: &LaunchContext,
+    log: &mut impl Write,
+) -> Result<(Option<Child>, Option<PathBuf>), String> {
+    let paths = ctx.paths;
+    let bridge_dir = paths
+        .evorule_server_home
+        .join("plugins")
+        .join("codegraph-bridge");
+    let server_mjs = bridge_dir.join("server.mjs");
+    let template = paths
+        .evorule_server_home
+        .join("plugins-manifest-template.json");
+    if !server_mjs.is_file() || !template.is_file() {
+        writeln!(
+            log,
+            "[orch] codegraph-bridge assets missing; skipping (dev hand-wired setups unaffected)"
+        )
+        .ok();
+        return Ok((None, None));
+    }
+    if !port_bindable(9150) {
+        writeln!(
+            log,
+            "[orch] codegraph-bridge port 9150 occupied; codegraph services unavailable"
+        )
+        .ok();
+        return Ok((None, None));
+    }
+    let Some(node) = which_node() else {
+        writeln!(
+            log,
+            "[orch] node runtime not found; codegraph services unavailable (install Node.js to enable)"
+        )
+        .ok();
+        return Ok((None, None));
+    };
+    // 清单占位符替换 → runtime 副本（装机绝对路径运行期才知道）
+    let raw = std::fs::read_to_string(&template).map_err(|e| e.to_string())?;
+    let plugin_json = server_mjs
+        .with_file_name("plugin.json")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let filled = raw.replace("{{CODEGRAPH_BRIDGE_PLUGIN_JSON}}", &plugin_json);
+    std::fs::create_dir_all(&paths.runtime_dir).map_err(|e| e.to_string())?;
+    let manifest = paths.runtime_dir.join("plugins-manifest.json");
+    std::fs::write(&manifest, filled).map_err(|e| e.to_string())?;
+    let out_log = open_append(&paths.logs_dir.join("codegraph-bridge.log"))?;
+    let out_log_err = open_append(&paths.logs_dir.join("codegraph-bridge.log"))?;
+    let child = Command::new(&node)
+        .arg(&server_mjs)
+        .current_dir(&bridge_dir)
+        .env("CODEGRAPH_BRIDGE_HOST", "127.0.0.1")
+        .env("CODEGRAPH_BRIDGE_PORT", "9150")
+        .stdout(Stdio::from(out_log))
+        .stderr(Stdio::from(out_log_err))
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .map_err(|e| format!("spawn codegraph-bridge: {e}"))?;
+    writeln!(
+        log,
+        "[orch] codegraph-bridge sidecar spawned on 127.0.0.1:9150 (pid {})",
+        child.id()
+    )
+    .ok();
+    Ok((Some(child), Some(manifest)))
+}
+
+/// node 可执行探测（PATH 顺序首个命中；None = 装机缺 Node.js 运行时）。
+fn which_node() -> Option<PathBuf> {
+    let out = Command::new("where.exe")
+        .arg("node")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&out.stdout)
+        .ok()?
+        .lines()
+        .next()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
 }
 
 /// 用户工作文件夹偏好(38 号方案 X):向导/设置保存于壳配置目录的
@@ -623,7 +729,9 @@ fn start_group(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, Str
     let engine_port = sticky_or_free(last_engine, &[serve_port])?;
     let executor_port = sticky_or_free(last_exec, &[serve_port, engine_port])?;
 
-    let mut engine = spawn_engine(ctx, engine_port)?;
+    // codegraph-bridge 先行拉起并生成 runtime 清单——引擎 spawn 时带 --plugins
+    let (codegraph, codegraph_manifest) = prepare_codegraph_bridge(ctx, log)?;
+    let mut engine = spawn_engine(ctx, engine_port, codegraph_manifest.as_deref())?;
     if !health::wait_healthy(engine_port, "/api/health", Duration::from_secs(30)) {
         let _ = engine.kill();
         return Err(format!("engine health check timeout (port {engine_port})"));
@@ -668,6 +776,7 @@ fn start_group(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, Str
         engine: Some(engine),
         ai_plugin,
         ai_plugin_port,
+        codegraph,
     };
     write_runtime_file(
         ctx.paths,
@@ -716,20 +825,31 @@ pub fn graceful_stop(
     engine: &mut Option<Child>,
     serve: &mut Option<Child>,
     ai_plugin: &mut Option<Child>,
+    codegraph: &mut Option<Child>,
     timeout: Duration,
 ) {
-    for slot in [engine.as_ref(), serve.as_ref(), ai_plugin.as_ref()]
-        .into_iter()
-        .flatten()
+    for slot in [
+        engine.as_ref(),
+        serve.as_ref(),
+        ai_plugin.as_ref(),
+        codegraph.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         send_ctrl_c(slot.id());
     }
     let start = Instant::now();
     loop {
-        let all_gone = [engine.as_mut(), serve.as_mut(), ai_plugin.as_mut()]
-            .into_iter()
-            .flatten()
-            .all(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(true));
+        let all_gone = [
+            engine.as_mut(),
+            serve.as_mut(),
+            ai_plugin.as_mut(),
+            codegraph.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(true));
         if all_gone {
             return;
         }
@@ -745,6 +865,9 @@ pub fn graceful_stop(
         let _ = c.kill();
     }
     if let Some(c) = ai_plugin {
+        let _ = c.kill();
+    }
+    if let Some(c) = codegraph {
         let _ = c.kill();
     }
 }

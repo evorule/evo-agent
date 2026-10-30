@@ -74,7 +74,12 @@ if (-not $SkipCollect) {
         @{ Src = (Join-Path $repoRoot "web\dist");                            Dst = "resources\evo-agent\web\dist" },
         @{ Src = (Join-Path $ServerRepo "resources");                         Dst = "resources\evorule-server\resources" },
         @{ Src = (Join-Path $ServerRepo "rules");                             Dst = "resources\evorule-server\rules" },
-        @{ Src = (Join-Path $repoRoot "desktop\installer-assets\agent-governance\rules\00_constraint_model_allowlist.json"); Dst = "resources\evorule-server\agent-governance\rules\00_constraint_model_allowlist.json" }
+        @{ Src = (Join-Path $repoRoot "desktop\installer-assets\agent-governance\rules\00_constraint_model_allowlist.json"); Dst = "resources\evorule-server\agent-governance\rules\00_constraint_model_allowlist.json" },
+        # 外部插件包随发版（A 方向裁定 2026-10-30）：目录资产=server.mjs(零外部
+        # 依赖,仅 node: 内建)+vendor(7.7MB 自足)；与 sync-service-tools.ps1 的
+        # $ExternalPackages 登记列表联动（四联映射：随包↔白名单↔壳拉起↔接线模板）
+        @{ Src = (Join-Path $ServerRepo "plugins\codegraph-bridge");          Dst = "resources\evorule-server\plugins\codegraph-bridge" },
+        @{ Src = (Join-Path $repoRoot "desktop\templates\plugins-manifest.json"); Dst = "resources\evorule-server\plugins-manifest-template.json" }
     )
 
     foreach ($p in $pairs) {
@@ -85,6 +90,14 @@ if (-not $SkipCollect) {
         if (Test-Path $dst -PathType Container) { Remove-Item $dst -Recurse -Force }
         Copy-Item $p.Src $dst -Recurse -Force
         Write-Host "collected $($p.Src) -> $dst"
+    }
+
+    # 外部插件包瘦身：node_modules（开发依赖,server.mjs 仅用 node: 内建,装机
+    # 不需要）与服务化脚本（nssm 形态,桌面装机由壳拉起,不装系统服务）不入包
+    $cgDst = Join-Path $srcTauri "resources\evorule-server\plugins\codegraph-bridge"
+    foreach ($junk in @("node_modules", "start.ps1", "install-service.ps1", "fix-and-start.ps1")) {
+        $j = Join-Path $cgDst $junk
+        if (Test-Path $j) { Remove-Item $j -Recurse -Force; Write-Host "pruned $junk from codegraph-bridge" }
     }
 
     # 发版模板（唯一源）：desktop\templates\evo-agent.toml；仓根 evo-agent.toml
