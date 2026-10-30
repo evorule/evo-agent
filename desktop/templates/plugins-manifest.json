@@ -1,6 +1,7 @@
 {
   "plugins": {
     "codegraph-bridge": { "enabled": true },
-    "ai-plugin": { "enabled": true }
+    "ai-plugin": { "enabled": true },
+    "wasm-host": { "enabled": true }
   }
 }

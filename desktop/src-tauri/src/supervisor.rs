@@ -448,6 +448,7 @@ impl Supervisor {
                 &mut rt.serve,
                 &mut rt.ai_plugin,
                 &mut rt.codegraph,
+                &mut rt.wasm_host,
                 GRACEFUL_TIMEOUT,
             );
         }
@@ -471,6 +472,7 @@ impl Supervisor {
                 &mut rt.serve,
                 &mut rt.ai_plugin,
                 &mut rt.codegraph,
+                &mut rt.wasm_host,
                 GRACEFUL_TIMEOUT,
             );
         }

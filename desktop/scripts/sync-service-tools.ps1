@@ -44,7 +44,7 @@ $names = foreach ($f in $declFiles) {
 # 清单决定，收编未随包的服务=装机启动期整列 missing 点名（可见噪音）。
 # 随发版外部包在此显式登记；新增包须同步 build-installer.ps1 collect
 # 收编 + orchestrator 拉起（四联映射，发版面验收机制档 §4 闸 1）。
-$ExternalPackages = @("codegraph-bridge", "ai-plugin")
+$ExternalPackages = @("codegraph-bridge", "ai-plugin", "wasm-host")
 
 $pluginFiles = Get-ChildItem (Join-Path $ServerRepo "plugins") -Directory |
     Where-Object { $ExternalPackages -contains $_.Name } |

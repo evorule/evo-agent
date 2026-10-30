@@ -80,6 +80,9 @@ Assert-Fresh "evorule-server.exe(engine)" `
 Assert-Fresh "evorule-ai-plugin.exe(执行体)" `
     (Join-Path $ServerRepo "plugins\ai-plugin\target\release\evorule-ai-plugin.exe") `
     (Head-Time $ServerRepo "plugins/ai-plugin")
+Assert-Fresh "evorule-wasm-host.exe(UDF 宿)" `
+    (Join-Path $ServerRepo "plugins\wasm-host\target\release\evorule-wasm-host.exe") `
+    (Head-Time $ServerRepo "plugins/wasm-host")
 $distNewest = Newest-Under (Join-Path $RepoRoot "web\dist")
 if ($distNewest) {
     Assert-Fresh ("web/dist({0})" -f $distNewest.Name) $distNewest.FullName (Head-Time $RepoRoot "web")

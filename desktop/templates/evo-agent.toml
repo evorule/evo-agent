@@ -157,6 +157,11 @@ service_tools = [
   "sampling_service",
   "shadow_ik_solver",
   "template_render",
+  "udf_date_diff_days",
+  "udf_finance_tax_bracket",
+  "udf_finance_tax_calc",
+  "udf_finance_tax_calc_as",
+  "udf_text_normalize",
 ]
 
 # 工作台附加配置:serve 启动期自动拉起 console 审计页(审计深链数据源)

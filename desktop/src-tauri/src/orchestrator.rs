@@ -47,6 +47,8 @@ pub struct Runtime {
     pub ai_plugin_port: Option<u16>,
     /// codegraph-bridge sidecar（可选组件：资产+node 双条件启用；未启用 = None）
     pub codegraph: Option<Child>,
+    /// wasm-host sidecar（可选组件：资产四件+9140 契约口；未启用 = None）
+    pub wasm_host: Option<Child>,
 }
 
 /// 一次拉起所需的全部输入（job 由守护方持有，跨重启复用）。
@@ -371,6 +373,69 @@ fn prepare_codegraph_bridge(
     Ok(Some(child))
 }
 
+/// wasm-host sidecar 拉起（可选组件，发版面验收机制档 §4 闸 3）：exe 型外部
+/// 包，资产四件（exe + plugin.json + trusted-keys.json + wasm 模块目录非空）
+/// 与固定口 9140（plugin.json base_url 静态契约）双闸；任一缺位 = fail-soft
+/// 降级（包名记入 excluded → 清单剔除 + 日志留痕），不阻断全链。签名策略走
+/// 缺省 Enforce（fail-closed），零 env 装机布局自洽——wasm 模块目录与 host
+/// 目录为兄弟位置，`../wasm` 缺省相对寻址天然命中。
+fn prepare_wasm_host(
+    ctx: &LaunchContext,
+    log: &mut impl Write,
+    excluded: &mut Vec<String>,
+) -> Result<Option<Child>, String> {
+    let paths = ctx.paths;
+    let host_dir = paths.evorule_server_home.join("plugins").join("wasm-host");
+    let wasm_dir = paths.evorule_server_home.join("plugins").join("wasm");
+    let exe = host_dir.join("evorule-wasm-host.exe");
+    let assets = [
+        exe.clone(),
+        host_dir.join("plugin.json"),
+        host_dir.join("trusted-keys.json"),
+    ];
+    let modules_ready = std::fs::read_dir(&wasm_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().extension().map(|x| x == "wasm").unwrap_or(false))
+        })
+        .unwrap_or(false);
+    if assets.iter().any(|p| !p.is_file()) || !modules_ready {
+        writeln!(
+            log,
+            "[orch] wasm-host assets missing (exe/plugin.json/trusted-keys/wasm modules); skipping"
+        )
+        .ok();
+        excluded.push("wasm-host".to_string());
+        return Ok(None);
+    }
+    if !port_bindable(9140) {
+        writeln!(
+            log,
+            "[orch] wasm-host port 9140 occupied; udf services unavailable"
+        )
+        .ok();
+        excluded.push("wasm-host".to_string());
+        return Ok(None);
+    }
+    let out_log = open_append(&paths.logs_dir.join("wasm-host.log"))?;
+    let out_log_err = open_append(&paths.logs_dir.join("wasm-host.log"))?;
+    let child = Command::new(&exe)
+        .current_dir(&host_dir)
+        .stdout(Stdio::from(out_log))
+        .stderr(Stdio::from(out_log_err))
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .map_err(|e| format!("spawn wasm-host: {e}"))?;
+    writeln!(
+        log,
+        "[orch] wasm-host sidecar spawned on 127.0.0.1:9140 (pid {})",
+        child.id()
+    )
+    .ok();
+    Ok(Some(child))
+}
+
 /// 外部插件包清单装配（发版面验收机制档 §4 闸 3 泛化）：读安装面清单模板
 /// （plugins-manifest-template.json，随包收集），逐包按装机在位性决定收录
 /// ——plugin.json 缺位、enabled=false 或前置条件失败（sidecar 拉起失败/
@@ -388,13 +453,21 @@ fn prepare_plugins_manifest(
         .evorule_server_home
         .join("plugins-manifest-template.json");
     if !template.is_file() {
-        writeln!(log, "[orch] plugins manifest template missing; engine runs without --plugins").ok();
+        writeln!(
+            log,
+            "[orch] plugins manifest template missing; engine runs without --plugins"
+        )
+        .ok();
         return Ok(None);
     }
     let raw = std::fs::read_to_string(&template).map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let Some(entries) = v.get("plugins").and_then(|p| p.as_object()) else {
-        writeln!(log, "[orch] plugins manifest template malformed; engine runs without --plugins").ok();
+        writeln!(
+            log,
+            "[orch] plugins manifest template malformed; engine runs without --plugins"
+        )
+        .ok();
         return Ok(None);
     };
     let mut filled = serde_json::Map::new();
@@ -424,7 +497,11 @@ fn prepare_plugins_manifest(
         );
     }
     if filled.is_empty() {
-        writeln!(log, "[orch] no external packages eligible; engine runs without --plugins").ok();
+        writeln!(
+            log,
+            "[orch] no external packages eligible; engine runs without --plugins"
+        )
+        .ok();
         return Ok(None);
     }
     let out = serde_json::json!({ "plugins": serde_json::Value::Object(filled.clone()) });
@@ -432,7 +509,12 @@ fn prepare_plugins_manifest(
     let manifest = paths.runtime_dir.join("plugins-manifest.json");
     std::fs::write(&manifest, serde_json::to_string_pretty(&out).unwrap())
         .map_err(|e| e.to_string())?;
-    writeln!(log, "[orch] plugins manifest assembled ({} packages)", filled.len()).ok();
+    writeln!(
+        log,
+        "[orch] plugins manifest assembled ({} packages)",
+        filled.len()
+    )
+    .ok();
     Ok(Some(manifest))
 }
 
@@ -797,6 +879,7 @@ fn start_group(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, Str
     // 引擎 spawn 带 --plugins。
     let mut excluded: Vec<String> = Vec::new();
     let codegraph = prepare_codegraph_bridge(ctx, log, &mut excluded)?;
+    let wasm_host = prepare_wasm_host(ctx, log, &mut excluded)?;
     let executor_key = llm_executor_ready(ctx, log);
     if executor_key.is_none() || executor_port != 9130 {
         excluded.push("ai-plugin".to_string());
@@ -848,6 +931,7 @@ fn start_group(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, Str
         ai_plugin,
         ai_plugin_port,
         codegraph,
+        wasm_host,
     };
     write_runtime_file(
         ctx.paths,
@@ -897,6 +981,7 @@ pub fn graceful_stop(
     serve: &mut Option<Child>,
     ai_plugin: &mut Option<Child>,
     codegraph: &mut Option<Child>,
+    wasm_host: &mut Option<Child>,
     timeout: Duration,
 ) {
     for slot in [
@@ -904,6 +989,7 @@ pub fn graceful_stop(
         serve.as_ref(),
         ai_plugin.as_ref(),
         codegraph.as_ref(),
+        wasm_host.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -917,6 +1003,7 @@ pub fn graceful_stop(
             serve.as_mut(),
             ai_plugin.as_mut(),
             codegraph.as_mut(),
+            wasm_host.as_mut(),
         ]
         .into_iter()
         .flatten()
@@ -939,6 +1026,9 @@ pub fn graceful_stop(
         let _ = c.kill();
     }
     if let Some(c) = codegraph {
+        let _ = c.kill();
+    }
+    if let Some(c) = wasm_host {
         let _ = c.kill();
     }
 }
@@ -1126,7 +1216,10 @@ mod tests {
         // 冲突模型归自定义；内置条目剔除冲突模型、保留其余
         assert_eq!(models_of("myprov"), vec!["MiniMax-M3", "model-x"]);
         let mm = models_of("minimax");
-        assert!(!mm.contains(&"MiniMax-M3".to_string()), "冲突模型须从内置条目剔除");
+        assert!(
+            !mm.contains(&"MiniMax-M3".to_string()),
+            "冲突模型须从内置条目剔除"
+        );
         assert!(mm.contains(&"MiniMax-M2.5".to_string()), "非冲突模型保留");
         // 整表无重复模型（执行体对重复声明 fail-closed）
         let mut all: Vec<&str> = Vec::new();

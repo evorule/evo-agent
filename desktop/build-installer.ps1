@@ -82,6 +82,13 @@ if (-not $SkipCollect) {
         # ai-plugin 服务面（基线接线批 2026-10-30）：exe 已走 bin 对；plugin.json
         # 单文件入包供服务面注册（ai_plugin_chat 对账可见）。口契约=9130（壳钉口）
         @{ Src = (Join-Path $ServerRepo "plugins\ai-plugin\plugin.json");     Dst = "resources\evorule-server\plugins\ai-plugin\plugin.json" },
+        # wasm-host 随发版（外部包接线批二 2026-10-30）：exe/plugin.json/trusted-keys
+        # 三件入包 + plugins\wasm 模块资产（*.wasm+*.wasm.sig+*.plugin-module.json）；
+        # 缺省签名策略 enforce（fail-closed），信任锚与 .sig 配对出厂。口契约=9140
+        @{ Src = (Join-Path $ServerRepo "plugins\wasm-host\target\release\evorule-wasm-host.exe"); Dst = "resources\evorule-server\plugins\wasm-host\evorule-wasm-host.exe" },
+        @{ Src = (Join-Path $ServerRepo "plugins\wasm-host\plugin.json");     Dst = "resources\evorule-server\plugins\wasm-host\plugin.json" },
+        @{ Src = (Join-Path $ServerRepo "plugins\wasm-host\trusted-keys.json"); Dst = "resources\evorule-server\plugins\wasm-host\trusted-keys.json" },
+        @{ Src = (Join-Path $ServerRepo "plugins\wasm");                      Dst = "resources\evorule-server\plugins\wasm" },
         @{ Src = (Join-Path $repoRoot "desktop\templates\plugins-manifest.json"); Dst = "resources\evorule-server\plugins-manifest-template.json" }
     )
 
