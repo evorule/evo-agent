@@ -305,7 +305,7 @@ fn spawn_engine(
     Ok(engine)
 }
 
-/// codegraph-bridge sidecar 接线（可选组件，design-45 §4 闸 3）：
+/// codegraph-bridge sidecar 接线（可选组件，发版面验收机制档 §4 闸 3）：
 /// 资产（安装 resources 下 server.mjs+清单模板）与 node 运行时双条件启用；
 /// 任一缺位 = fail-soft 降级（引擎无 --plugins → 对账面自然缺十项 + serve
 /// 点名摘要可见），不阻断全链。sidecar 固定口 9150（plugin.json base_url
