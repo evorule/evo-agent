@@ -74,6 +74,24 @@ govS4Notify.subscribe((n) => {
   }
 });
 
+// 审批卡生命周期:轮次终止(活跃→不活跃边沿)时,所有未决审批卡就地转
+// 「已随轮次结束失效」终态——轮次已收尾,等待中的审批请求不可能再被
+// agent 消费(引擎对迟到提交回 409 no_pending_item)。含手动复位运行态:
+// 用户复位即视为本轮终止,未决卡一并回收。
+let prevTurnActiveForApprovals = false;
+turnActive.subscribe((active) => {
+  if (prevTurnActiveForApprovals && !active) expirePendingApprovals();
+  prevTurnActiveForApprovals = active;
+});
+
+function expirePendingApprovals() {
+  for (const m of get(messages)) {
+    if (m.kind === 'approval' && m.proposalId && !m.decision) {
+      updateMessage(m.id, { decision: 'expired' });
+    }
+  }
+}
+
 /**
  * 死会话自愈升级(B17 持久会话):引擎侧会话失效后不再裸新建丢上下文——
  * 取历史(REST transcript:活投影→本地快照两级,与 serve 同口径)合成
@@ -645,7 +663,20 @@ function handleFrame(f) {
         `${f.command || ''}(风险 ${f.risk ?? '?'})等待人工确认`,
       );
       break;
-    case 'ApprovalResult':
+    case 'ApprovalResult': {
+      // 审批卡生命周期:引擎侧超时/通道关闭自动拒绝时,把对应未决审批卡
+      // 就地转「超时自动拒绝」终态(按工具名匹配最近一张未决卡)——用户
+      // 面对的不再是可点击的僵尸卡
+      if (!f.approved && f.auto_rejected) {
+        const list = get(messages);
+        for (let i = list.length - 1; i >= 0; i--) {
+          const m = list[i];
+          if (m.kind === 'approval' && m.toolName === f.tool_name && m.proposalId && !m.decision) {
+            updateMessage(m.id, { decision: 'timeout' });
+            break;
+          }
+        }
+      }
       pushMessage({
         kind: 'info',
         text: `审批结果:${f.approved ? '已批准' : '已拒绝'}(工具 ${f.tool_name})`,
@@ -661,6 +692,7 @@ function handleFrame(f) {
         `工具 ${f.tool_name}`,
       );
       break;
+    }
     case 'AskUser':
       // 批K 段7 人在环问答卡:点选/输入走新增 POST /answer 通道(二阶段
       // 校验在工具侧,非法回答 fail-visible 回喂,agent 自行澄清续跑)

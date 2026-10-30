@@ -19,6 +19,7 @@
     transcriptHasMore,
     loadOlderTranscript,
     openGuideTab,
+    pushPanelEvent,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
   // Svelte 5 不深度代理原生 Set(add/delete 不触发重渲染,点击开合会失明),
@@ -455,6 +456,28 @@
     $turnActive ? Math.floor((nowTick - $lastEngineEventAt) / 1000) : 0
   );
   const engineStalled = $derived(stallSeconds >= 10);
+
+  // ===== 停摆看门狗:turn 活跃且引擎事件停滞超阈值 → 非阻断提示+双按钮 =====
+  // 每帧都刷新活性时钟,长构建/长思考不误伤;仅真静默才触发。
+  // 「保持等待」本次轮内消除提示;「复位状态」仅前端复位运行态解禁输入
+  // (不杀引擎任务、不伪造终态——引擎真在跑时,下一帧到达自动重同步)。
+  const STALL_WATCHDOG_SECS = 180;
+  const watchdogStalled = $derived($turnActive && stallSeconds >= STALL_WATCHDOG_SECS);
+  let watchdogDismissed = $state(false);
+  let prevTurnActiveWatch = $state(false);
+  $effect(() => {
+    const active = $turnActive;
+    if (active && !prevTurnActiveWatch) watchdogDismissed = false; // 新轮开始清抑制
+    prevTurnActiveWatch = active;
+  });
+  function keepWaitingStall() {
+    watchdogDismissed = true;
+  }
+  function resetStallState() {
+    turnActive.set(false);
+    watchdogDismissed = false;
+    pushPanelEvent('sys', { label: 'WatchdogReset', detail: '手动复位运行状态(前端视角,引擎任务未终止)' });
+  }
 
   /** 命令入口:聚焦输入框并打开 @ 弹层(空查询=快捷项视角) */
   function openMentionPopup() {
@@ -1025,7 +1048,9 @@
 
   // 治理叠加:审批决定走既有 G8 /approve 通道(60s 超时自动拒绝)
   function decideApproval(m, approved) {
-    if (!m.proposalId || m.decision === 'sending' || m.decision === 'sent') return;
+    // 终态卡(超时自动拒绝/随轮次失效)不可再提交;sending/sent 防重复提交
+    if (!m.proposalId || m.decision === 'sending' || m.decision === 'sent' ||
+        m.decision === 'timeout' || m.decision === 'expired') return;
     if (!$sessionId) {
       updateMessage(m.id, { decision: 'error', errText: '会话未建立,无法提交审批' });
       return;
@@ -1036,8 +1061,8 @@
       .catch((err) => {
         const status = err?.status;
         const text =
-          status === 404
-            ? '审批已失效(60 秒超时自动拒绝,或该会话无待审批项)'
+          status === 409
+            ? '审批项已失效(无对应待审批项)'
             : status === 400
               ? `审批被拒:${String(err?.message || err)}`
               : `提交失败:${String(err?.message || err)}`;
@@ -1442,6 +1467,10 @@
             <div class="ap-foot">审批提交中…</div>
           {:else if m.decision === 'sent'}
             <div class="ap-ok">已提交{m.sentApproved ? '批准' : '拒绝'},等待 agent 执行结果…</div>
+          {:else if m.decision === 'timeout'}
+            <div class="ap-err">审批已超时:60 秒未处理,已自动拒绝</div>
+          {:else if m.decision === 'expired'}
+            <div class="ap-err">审批项已随轮次结束失效</div>
           {:else}
             <div class="ap-actions">
               <button class="ap-btn approve" onclick={() => decideApproval(m, true)}>批准</button>
@@ -1911,6 +1940,15 @@
     {#if engineStalled}
       <div class="heartbeat-stall" role="status">
         ⚠ 引擎已 {stallSeconds}s 无事件返回——长程工具或引擎停滞;持续无响应可中断后重试
+      </div>
+    {/if}
+    {#if watchdogStalled && !watchdogDismissed}
+      <div class="watchdog-stall" role="alert">
+        <span>⚠ 引擎无响应已超 {stallSeconds} 秒,疑似轮次停滞</span>
+        <div class="wd-actions">
+          <button class="wd-btn" onclick={keepWaitingStall}>保持等待</button>
+          <button class="wd-btn warn" onclick={resetStallState}>复位状态</button>
+        </div>
       </div>
     {/if}
   </div>
@@ -3282,6 +3320,36 @@
     color: var(--warning);
     padding: 4px 0 0;
     border-top: 1px solid var(--border);
+  }
+  .watchdog-stall {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: var(--fs-2xs);
+    color: var(--warning);
+    padding: 6px 8px;
+    margin-top: 4px;
+    border: 1px solid var(--warning);
+    border-radius: 6px;
+  }
+  .wd-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .wd-btn {
+    font-size: var(--fs-2xs);
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text, inherit);
+    cursor: pointer;
+  }
+  .wd-btn.warn {
+    border-color: var(--warning);
+    color: var(--warning);
   }
   .user-col {
     display: flex;
