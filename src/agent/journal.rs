@@ -290,6 +290,21 @@ pub enum JournalEvent {
         /// 成立;消费方勿按字段名解读为 call_id 集合)
         cleared_call_ids: Vec<String>,
     },
+    /// 请求体超限触发的紧急裁剪（死亡线恢复路径；与阈值驱动的
+    /// CompactionPerformed 区分：本事件仅在 LLM 出站被承载方以 413 类
+    /// 拒绝后、裁剪重试前落账，口径为全量消息字符数）。
+    EmergencyTrimPerformed {
+        /// 裁剪前全量消息字符数（与 compaction 落账同口径）
+        before_chars: usize,
+        /// 裁剪后全量消息字符数
+        after_chars: usize,
+        /// 折叠为占位的工具结果条数
+        elided_tool_results: usize,
+        /// 收敛为单行决策记录的审批往返条数
+        folded_approvals: usize,
+        /// 是否触发了整段历史压缩兜底层
+        history_compacted: bool,
+    },
     /// 会话沉淀结果落账：sediment 四项持久化结果进步级账面。
     /// CacheOnly 事实仅本地 cache、由 B3 对账补偿——落账后「沉淀成功与否」有对账依据，
     /// ATIF 导出 context_management 段随之充实（F-902 同精神）。
@@ -1327,6 +1342,24 @@ impl JournalWriter {
             seq,
         );
         Ok(seq)
+    }
+
+    /// 请求体超限紧急裁剪落账（死亡线恢复路径审计同权）
+    pub fn emergency_trim_performed(
+        &self,
+        before_chars: usize,
+        after_chars: usize,
+        elided_tool_results: usize,
+        folded_approvals: usize,
+        history_compacted: bool,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::EmergencyTrimPerformed {
+            before_chars,
+            after_chars,
+            elided_tool_results,
+            folded_approvals,
+            history_compacted,
+        })
     }
 
     /// 交互式步间隙引导注记落账(原文逐字节保真;观测面,不参与步映射)

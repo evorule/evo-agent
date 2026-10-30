@@ -417,6 +417,8 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
         match &line.event {
             // 步间隙引导注记:轨迹注解而非对话步,不映射为轨迹步
             JournalEvent::SteeringNote { .. } => continue,
+            // 请求体超限紧急裁剪:故障恢复观测面,非对话步,不映射为轨迹步
+            JournalEvent::EmergencyTrimPerformed { .. } => continue,
             JournalEvent::TurnStarted { goal, .. } => {
                 // 轮界:上一个 agent 步必已随 turn_ended 收步;开用户步
                 let message = match user_msgs.get(user_ordinal) {

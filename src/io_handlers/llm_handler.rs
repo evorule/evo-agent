@@ -177,6 +177,19 @@ pub struct LlmHandler {
     /// `mode="direct"` 显式启用,execute/execute_stream 分派直连传输)。
     /// 分派收在 handler 内部——IoDispatcher/runner/audited_llm 零感知。
     direct: Option<super::llm_direct::DirectLlmConfig>,
+    /// 脚本式 mock 状态(测试装置):按调用次序吐预置结果并记录每次收到的
+    /// 请求参数。None = 非脚本 mock,短路分支不触碰。
+    mock_script: Option<std::sync::Arc<std::sync::Mutex<MockScriptState>>>,
+}
+
+/// 脚本式 mock 状态(测试装置):`steps` 按次序消费(Err = 流式错误串,
+/// Ok = 正常响应内容),耗尽后请求一律报错——防测试静默放行多余调用;
+/// `observed_params` 记录每次 execute_stream 收到的完整请求参数,
+/// 供测试断言「第二次调用的 messages 已被裁剪」等请求侧形态。
+#[derive(Debug, Default)]
+pub struct MockScriptState {
+    steps: std::collections::VecDeque<Result<String, String>>,
+    observed_params: Vec<Value>,
 }
 
 impl LlmHandler {
@@ -197,6 +210,7 @@ impl LlmHandler {
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             config_max_tokens: None,
             direct: None,
+            mock_script: None,
         }
     }
 
@@ -246,6 +260,7 @@ impl LlmHandler {
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             config_max_tokens: None,
             direct: None,
+            mock_script: None,
         }
     }
 
@@ -276,6 +291,7 @@ impl LlmHandler {
             } else {
                 None
             },
+            mock_script: None,
         };
         // [llm] timeout_secs 显式声明即生效（此前被静默忽略）；
         // 0（未显式配置）保持内建缺省——接通前后未配置用户行为不变。
@@ -388,7 +404,42 @@ impl LlmHandler {
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             config_max_tokens: None,
             direct: None,
+            mock_script: None,
         }
+    }
+
+    /// 脚本式 mock(测试装置):按调用次序吐预置结果——`Err(错误串)` 模拟
+    /// 流式调用失败(如请求体超限拒绝),`Ok(内容)` 模拟正常响应;耗尽后
+    /// 再来的请求一律报 "mock script exhausted"(防测试静默放行多余调用)。
+    /// 每次调用收到的请求参数经 `mock_observed_params` 可回读。
+    pub fn mock_scripted(steps: Vec<Result<String, String>>) -> Self {
+        Self {
+            default_model: "mock".to_string(),
+            executor_url: "mock://".to_string(),
+            executor_token: None,
+            mock_content: None,
+            max_retries: 0,
+            base_backoff_secs: DEFAULT_BASE_BACKOFF_SECS,
+            max_backoff_secs: DEFAULT_MAX_BACKOFF_SECS,
+            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            config_max_tokens: None,
+            direct: None,
+            mock_script: Some(std::sync::Arc::new(std::sync::Mutex::new(
+                MockScriptState {
+                    steps: steps.into(),
+                    observed_params: Vec::new(),
+                },
+            ))),
+        }
+    }
+
+    /// 回读脚本式 mock 记录的历次请求参数(快照;仅脚本 mock 有记录)。
+    pub fn mock_observed_params(&self) -> Vec<Value> {
+        self.mock_script
+            .as_ref()
+            .map(|s| s.lock().unwrap().observed_params.clone())
+            .unwrap_or_default()
     }
 
     /// Returns true if this handler is a mock (skips HTTP).
@@ -563,12 +614,45 @@ impl LlmHandler {
 
         let executor_url = self.executor_url.clone();
         let mock_content = self.mock_content.clone();
+        let mock_script = self.mock_script.clone();
         let executor_token = self.executor_token.clone();
         // 超时值提升为局部量（stream! 块内不持有 &self）
         let connect_secs = self.connect_timeout_secs;
         let request_secs = self.request_timeout_secs;
+        // 脚本 mock 记录请求参数用(stream! 块 'static 约束,参数须 owned 进块)
+        let script_params = params.clone();
 
         Box::pin(stream! {
+            // === 脚本式 mock(测试装置):按脚本次序吐错误或正常响应 ===
+            if let Some(script) = &mock_script {
+                // lock 收敛在同步块(guard 不跨 yield,保 stream Send)
+                let step = {
+                    let mut st = script.lock().unwrap();
+                    st.observed_params.push(script_params.clone());
+                    st.steps.pop_front()
+                };
+                match step {
+                    Some(Err(e)) => {
+                        yield Err::<StreamChunk, String>(e);
+                        return;
+                    }
+                    Some(Ok(content)) => {
+                        yield Ok(StreamChunk::Delta(content.clone()));
+                        yield Ok(StreamChunk::Done(LlmResponse {
+                            content,
+                            tool_calls: None,
+                            finish_reason: Some("stop".to_string()),
+                            token_usage: None,
+                        }));
+                        return;
+                    }
+                    None => {
+                        yield Err::<StreamChunk, String>("mock script exhausted".to_string());
+                        return;
+                    }
+                }
+            }
+
             // === Mock 短路 ===
             if let Some(content) = &mock_content {
                 yield Ok(StreamChunk::Delta(content.clone()));

@@ -5371,3 +5371,583 @@ fn frontmatter_plain_keys_still_parse() {
     assert_eq!(fm.name.as_deref(), Some("demo"));
     assert_eq!(fm.description.as_deref(), Some("plain text"));
 }
+
+// ===== 请求体超限恢复路径:识别 → 紧急裁剪 → 重试一次 → fail-visible =====
+
+fn wire_messages_bytes(params: &Value) -> usize {
+    params
+        .get("messages")
+        .map(|m| serde_json::to_string(m).unwrap().len())
+        .unwrap_or(0)
+}
+
+/// 首发请求体超限(413 类错误)→ 触发紧急裁剪 → 第二发调用发生且请求体
+/// 显著变小 → 成功收轮。当前实现直接终轮(零裁剪零重试)= 红。
+#[tokio::test]
+async fn test_payload_limit_retry_after_emergency_trim() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let session_id = "s413a";
+
+    // 单个 call_external 请求事件(无 id 字段→request_id=None,免 io_response)
+    // + Stable 终态事件(驱动成功收尾;Stable 收尾回读 state 取最终产出)
+    let sse_body = concat!(
+        "data: {\"type\":\"IoRequest\",\"io_type\":\"call_external\",\"params\":{}}\n\n",
+        "data: {\"type\":\"Stable\"}\n\n",
+    );
+    let _events_mock = server
+        .mock(
+            "GET",
+            format!("/api/sessions/{session_id}/events").as_str(),
+        )
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let _command_mock = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/command").as_str(),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    // 带大体积 tool 消息的历史(200KB 入史,经回读截断 48KB 仍显著大于占位)
+    let big_tool_text = "x".repeat(200_000);
+    let state = serde_json::json!({
+        "payload": {
+            "__memory__": {
+                "default": {
+                    "session_s413a": {
+                        "messages": {
+                            "0": {
+                                "idx": 0,
+                                "role": "system",
+                                "content": "You are helpful",
+                                "timestamp": 1000
+                            },
+                            "1": {
+                                "idx": 1,
+                                "role": "user",
+                                "content": "read the file",
+                                "timestamp": 1001
+                            },
+                            "2": {
+                                "idx": 2,
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {"tool_name": "file_read", "args": {"path": "big.txt"}}
+                                ],
+                                "timestamp": 1002
+                            },
+                            "3": {
+                                "idx": 3,
+                                "role": "tool",
+                                "tool_name": "file_read",
+                                "content": big_tool_text,
+                                "timestamp": 1003
+                            },
+                            "4": {
+                                "idx": 4,
+                                "role": "user",
+                                "content": "wrap up",
+                                "timestamp": 1004
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let _state_mock = server
+        .mock("GET", format!("/api/sessions/{session_id}/state").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(state.to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _payload_mock = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/payload").as_str(),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"success":true,"fact_id":1}"#)
+        .create_async()
+        .await;
+
+    let llm = LlmHandler::mock_scripted(vec![
+        Err("LLM API error (413 Payload Too Large): length limit exceeded".to_string()),
+        Ok("recovered".to_string()),
+    ]);
+    let llm_probe = llm.clone();
+    let mem = crate::agent::memory::MemoryManager::new("default", client.clone());
+    let runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_memory(mem)
+        .with_llm_handler(llm);
+
+    let stream = runner.run_continuation(
+        session_id.to_string(),
+        "continue".to_string(),
+        Vec::new(),
+    );
+    let mut stream = stream;
+
+    let mut final_done: Option<AgentResult> = None;
+    let mut saw_error = false;
+    let mut guard = 0;
+    while let Some(event) = stream.next().await {
+        guard += 1;
+        match event {
+            Ok(AgentEvent::Done(r)) => {
+                final_done = Some(r);
+                break;
+            }
+            Ok(AgentEvent::Error(e)) => {
+                saw_error = true;
+                let _ = e;
+            }
+            Err(e) => {
+                saw_error = true;
+                let _ = e;
+            }
+            _ => {}
+        }
+        if guard > 200 {
+            break;
+        }
+    }
+
+    // 期待:两发调用,第二发请求体被裁剪,轮成功收束
+    let observed = llm_probe.mock_observed_params();
+    assert_eq!(
+        observed.len(),
+        2,
+        "应发生恰好两次 LLM 调用(首发+裁剪后重试),实际 {} 次; saw_error={saw_error}",
+        observed.len()
+    );
+    let first = wire_messages_bytes(&observed[0]);
+    let second = wire_messages_bytes(&observed[1]);
+    assert!(
+        first > 40_000,
+        "首发应携带未裁剪的大体积历史,实际 {first} 字节"
+    );
+    assert!(
+        second < first / 2,
+        "第二发应被紧急裁剪(至少减半): first={first}, second={second}"
+    );
+    let done = final_done.expect("应收到 Done 事件收轮");
+    assert!(done.success, "裁剪重试后应成功收轮,实际 error={:?}", done.error);
+}
+
+/// 二次仍超限 → fail-visible:Error 事件携带新开会话指引,轮终止形态
+/// 与现行一致(Done(error))。
+#[tokio::test]
+async fn test_payload_limit_second_failure_fails_visible() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let session_id = "s413b";
+
+    // 带可裁剪的大体积历史(否则首发裁剪无收益即终局,第二发不发生)
+    let big_tool_text = "x".repeat(200_000);
+    let state = serde_json::json!({
+        "payload": {
+            "__memory__": {
+                "default": {
+                    "session_s413b": {
+                        "messages": {
+                            "0": {
+                                "idx": 0,
+                                "role": "system",
+                                "content": "You are helpful",
+                                "timestamp": 1000
+                            },
+                            "1": {
+                                "idx": 1,
+                                "role": "user",
+                                "content": "read the file",
+                                "timestamp": 1001
+                            },
+                            "2": {
+                                "idx": 2,
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {"tool_name": "file_read", "args": {"path": "big.txt"}}
+                                ],
+                                "timestamp": 1002
+                            },
+                            "3": {
+                                "idx": 3,
+                                "role": "tool",
+                                "tool_name": "file_read",
+                                "content": big_tool_text,
+                                "timestamp": 1003
+                            },
+                            "4": {
+                                "idx": 4,
+                                "role": "user",
+                                "content": "wrap up",
+                                "timestamp": 1004
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let _state_mock = server
+        .mock("GET", format!("/api/sessions/{session_id}/state").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(state.to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _payload_mock = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/payload").as_str(),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"success":true,"fact_id":1}"#)
+        .create_async()
+        .await;
+    let _events_mock = server
+        .mock(
+            "GET",
+            format!("/api/sessions/{session_id}/events").as_str(),
+        )
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(concat!(
+            "data: {\"type\":\"IoRequest\",\"io_type\":\"call_external\",\"params\":{}}\n\n",
+            "data: {\"type\":\"Stable\"}\n\n",
+        ))
+        .create_async()
+        .await;
+    let _command_mock = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/command").as_str(),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let llm = LlmHandler::mock_scripted(vec![
+        Err("LLM API error (413 Payload Too Large): length limit exceeded".to_string()),
+        Err("LLM API error (413 Payload Too Large): length limit exceeded".to_string()),
+    ]);
+    let llm_probe = llm.clone();
+    let mem = crate::agent::memory::MemoryManager::new("default", client.clone());
+    let runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_memory(mem)
+        .with_llm_handler(llm);
+
+    let stream = runner.run_continuation(
+        session_id.to_string(),
+        "continue".to_string(),
+        Vec::new(),
+    );
+    let mut stream = stream;
+
+    let mut error_text = String::new();
+    let mut final_done: Option<AgentResult> = None;
+    let mut guard = 0;
+    while let Some(event) = stream.next().await {
+        guard += 1;
+        match event {
+            Ok(AgentEvent::Error(e)) => error_text.push_str(&e.to_string()),
+            Err(e) => error_text.push_str(&e.to_string()),
+            Ok(AgentEvent::Done(r)) => {
+                final_done = Some(r);
+                break;
+            }
+            _ => {}
+        }
+        if guard > 200 {
+            break;
+        }
+    }
+
+    // 恰两次调用(裁剪后重试一次,不再更多)
+    let observed = llm_probe.mock_observed_params();
+    assert_eq!(observed.len(), 2, "重试一次后必须止步,实际 {} 次", observed.len());
+    // fail-visible:指引明确
+    assert!(
+        error_text.contains("413") || error_text.contains("Payload Too Large"),
+        "错误面应保留原始错误信息: {error_text}"
+    );
+    assert!(
+        error_text.contains("新开会话"),
+        "fail-visible 文案应携带新开会话指引: {error_text}"
+    );
+    let done = final_done.expect("应收到 Done 事件收轮");
+    assert!(!done.success, "二次超限应失败收轮");
+}
+
+/// 非 413 类错误行为零变化(回归):不裁剪、不重试,直接现行终局。
+#[tokio::test]
+async fn test_non_payload_error_no_trim_no_retry() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let session_id = "s500";
+
+    let _state_mock = server
+        .mock("GET", format!("/api/sessions/{session_id}/state").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"payload":{}}"#)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _payload_mock = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/payload").as_str(),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"success":true,"fact_id":1}"#)
+        .create_async()
+        .await;
+    let _events_mock = server
+        .mock(
+            "GET",
+            format!("/api/sessions/{session_id}/events").as_str(),
+        )
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("data: {\"type\":\"IoRequest\",\"io_type\":\"call_external\",\"params\":{}}\n\n")
+        .create_async()
+        .await;
+    let _command_mock = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/command").as_str(),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let llm = LlmHandler::mock_scripted(vec![Err(
+        "LLM API error (500 Internal Server Error): boom".to_string(),
+    )]);
+    let llm_probe = llm.clone();
+    let mem = crate::agent::memory::MemoryManager::new("default", client.clone());
+    let runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_memory(mem)
+        .with_llm_handler(llm);
+
+    let stream = runner.run_continuation(
+        session_id.to_string(),
+        "continue".to_string(),
+        Vec::new(),
+    );
+    let mut stream = stream;
+
+    let mut error_text = String::new();
+    let mut final_done: Option<AgentResult> = None;
+    let mut guard = 0;
+    while let Some(event) = stream.next().await {
+        guard += 1;
+        match event {
+            Ok(AgentEvent::Error(e)) => error_text.push_str(&e.to_string()),
+            Err(e) => error_text.push_str(&e.to_string()),
+            Ok(AgentEvent::Done(r)) => {
+                final_done = Some(r);
+                break;
+            }
+            _ => {}
+        }
+        if guard > 200 {
+            break;
+        }
+    }
+
+    // 仅一次调用,无裁剪无重试(现行行为)
+    let observed = llm_probe.mock_observed_params();
+    assert_eq!(observed.len(), 1, "非 413 错误不得触发重试,实际 {} 次", observed.len());
+    assert!(
+        !error_text.contains("新开会话"),
+        "非 413 错误不应携带裁剪指引: {error_text}"
+    );
+    let done = final_done.expect("应收到 Done 事件收轮");
+    assert!(!done.success);
+    assert!(
+        done.error.as_deref().unwrap_or_default().contains("500"),
+        "现行错误透传面保持: {:?}",
+        done.error
+    );
+}
+
+/// 413 类错误识别:三种形态取或,非 413 不误伤
+#[test]
+fn test_payload_limit_error_detection() {
+    assert!(super::is_payload_limit_error(
+        "LLM API error (413 Payload Too Large): body"
+    ));
+    assert!(super::is_payload_limit_error(
+        "Failed to buffer the request body: length limit exceeded"
+    ));
+    assert!(super::is_payload_limit_error("HTTP 413 from upstream"));
+    assert!(!super::is_payload_limit_error(
+        "LLM API error (500 Internal Server Error): boom"
+    ));
+    assert!(!super::is_payload_limit_error("connection reset"));
+    assert!(!super::is_payload_limit_error(""));
+}
+
+/// 紧急裁剪①+③组合语义:近程边界以同一 KEEP_ROUNDS 计,①的可折叠区与③的
+/// 压缩区重合——最老工具结果先折叠、随中段一并被整段占位吸收;近程轮保真
+#[test]
+fn test_emergency_trim_folds_oldest_and_compacts_keeps_recent_rounds() {
+    use super::{emergency_trim_for_payload_limit, EMERGENCY_TRIM_KEEP_ROUNDS};
+    let big = |n: usize| "y".repeat(n);
+    // 3 个 user 轮(> KEEP_ROUNDS):第一个 tool 落在可折叠区/压缩区,
+    // 后两个落在近程保留区
+    let mut msgs = vec![
+        Message::System {
+            content: "sys".into(),
+        },
+    ];
+    for i in 0..(EMERGENCY_TRIM_KEEP_ROUNDS + 1) {
+        msgs.push(Message::User {
+            content: format!("u{i}"),
+            images: vec![],
+        });
+        msgs.push(Message::Assistant {
+            content: format!("a{i}"),
+            tool_calls: None,
+        });
+        msgs.push(Message::Tool {
+            content: big(if i == 0 { 50_000 } else { 40_000 }),
+            tool_name: "file_read".into(),
+            images: vec![],
+        });
+    }
+
+    let report = emergency_trim_for_payload_limit(&mut msgs);
+
+    // ①层确实执行(elided_tool_results 如实落账),但折叠产出被③吸收
+    assert_eq!(report.elided_tool_results, 1);
+    assert!(report.history_compacted, "user 轮数 > KEEP_ROUNDS 时③必触发");
+    // 中段(u0,a0,tool0 共 3 条)替换为单条占位:10 - 3 + 1 = 8
+    assert_eq!(msgs.len(), 8, "实际: {msgs:?}");
+    assert!(matches!(&msgs[0], Message::System { content } if content == "sys"));
+    assert!(
+        matches!(&msgs[1], Message::System { content }
+            if content == "[history compacted due to request body limit: 3 messages removed]"),
+        "应有整段压缩占位: {:?}",
+        msgs[1]
+    );
+    assert!(!msgs.iter().any(|m| m.content().contains("u0")), "最老轮被压缩");
+    // 近程两轮完整保留,工具结果保真(40_000)
+    let tools: Vec<&str> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            Message::Tool { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tools.len(), 2);
+    assert!(tools.iter().all(|c| c.len() == 40_000), "近程内工具结果保真");
+    assert!(report.after_chars < report.before_chars);
+}
+
+/// 紧急裁剪②层:审批往返 User 轮收敛为单行决策记录
+#[test]
+fn test_emergency_trim_folds_approval_roundtrips() {
+    use super::emergency_trim_for_payload_limit;
+    let approval_payload = r#"{"proposal_id": "p1", "tool": "file_write", "decision": "approved", "reason": "ok", "padding": ""}"#
+        .replace("ok", &"x".repeat(30_000));
+    let mut msgs = vec![
+        Message::System {
+            content: "sys".into(),
+        },
+        Message::User {
+            content: approval_payload,
+            images: vec![],
+        },
+        Message::User {
+            content: "normal user turn".into(),
+            images: vec![],
+        },
+    ];
+    let report = emergency_trim_for_payload_limit(&mut msgs);
+    assert_eq!(report.folded_approvals, 1);
+    match &msgs[1] {
+        Message::User { content, images } => {
+            assert!(content.starts_with("[approval roundtrip elided:"));
+            assert!(content.contains("decision: approved"), "{content}");
+            assert!(images.is_empty(), "旁路图连带清空");
+        }
+        other => panic!("expected User, got {other:?}"),
+    }
+    // 普通用户轮不动
+    match &msgs[2] {
+        Message::User { content, .. } if content == "normal user turn" => {}
+        other => panic!("normal user turn must stay, got {other:?}"),
+    }
+}
+
+/// 紧急裁剪③层:整段压缩兜底(system 保留 + 最近轮保留,中段占位,轮界完整)
+#[test]
+fn test_emergency_trim_history_compaction_keeps_recent_rounds() {
+    use super::{emergency_trim_for_payload_limit, EMERGENCY_TRIM_KEEP_ROUNDS};
+    let mut msgs = vec![Message::System {
+        content: "sys".into(),
+    }];
+    for i in 0..(EMERGENCY_TRIM_KEEP_ROUNDS + 2) {
+        msgs.push(Message::User {
+            content: format!("u{i}"),
+            images: vec![],
+        });
+        msgs.push(Message::Assistant {
+            content: "x".repeat(10_000),
+            tool_calls: None,
+        });
+    }
+    let report = emergency_trim_for_payload_limit(&mut msgs);
+    assert!(report.history_compacted, "多轮场景应触发③层兜底");
+    // system 保留
+    assert!(matches!(&msgs[0], Message::System { content } if content == "sys"));
+    // 中段整段替换为单条占位 + 最近 KEEP_ROUNDS 轮保留
+    assert!(msgs.len() < 10, "中段应被压缩,实际 {} 条", msgs.len());
+    assert!(
+        msgs.iter().any(|m| matches!(m,
+            Message::System { content }
+            if content.starts_with("[history compacted due to request body limit:")
+        )),
+        "应有整段压缩占位"
+    );
+    // 最近轮的 user 内容完整保留
+    assert!(
+        msgs.iter().any(|m| matches!(m,
+            Message::User { content, .. }
+            if content == &format!("u{}", EMERGENCY_TRIM_KEEP_ROUNDS + 1)
+        )),
+        "最近轮保留"
+    );
+    assert!(
+        !msgs.iter().any(|m| matches!(m,
+            Message::User { content, .. }
+            if content == "u0"
+        )),
+        "最老轮被压缩"
+    );
+    // assistant↔tool 配对完整性:不存在未获应答的悬挂(本场景无 tool_calls,天然成立;
+    // 轮界切分保证有 tool_calls 场景同轮不破)
+}

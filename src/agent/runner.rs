@@ -8128,6 +8128,27 @@ impl AgentRunner {
                                                    info!(dropped = dropped_images, "B1: window image budget enforced");
                                                }
 
+                                               // 流式累积量(声明在重试编排外,每圈发起前重置):
+                                               // 思考留痕:流式所有 reasoning(真流式帧/legacy 整包
+                                               // 合成/终帧安全网补发)统一经 ThinkingDelta 下行,
+                                               // 此处随步累积,随 assistant 消息持久化(仅展示链路)
+                                               let mut full_content = String::new();
+                                               let mut full_reasoning = String::new();
+                                               // 以下三项跨圈存活(重试终局后仍需读取),圈首重置;
+                                               // 延迟初始化,首圈圈首赋值先于一切读取
+                                               let mut full_tool_calls: Option<Vec<crate::agent::translator::ToolCall>>;
+                                               let mut finish_reason: Option<String>;
+                                               // B21:provider token 真值(Done chunk 采集,llm_called 埋点消费)
+                                               let mut react_tokens: Option<crate::agent::translator::TokenUsage>;
+                                               // G17:LLM 流式调用计时(每圈新鲜计时,成功/失败指标均在出圈后/Err 臂读取)
+                                               let mut llm_start;
+
+                                               // 请求体超限恢复编排(只加不改):首发被承载方以 413 类
+                                               // 拒绝时,对发送副本紧急裁剪后重试一次;仍超限 fail-visible
+                                               // (错误面附新开会话指引,轮终止形态与现行一致)。
+                                               // 非 413 错误与成功路径行为零变化。
+                                               let mut payload_retry_used = false;
+                                               'payload_attempt: loop {
                                                let serde_messages = match serde_json::to_value(&messages_to_send) {
                                                    Ok(v) => v,
                                                    Err(e) => {
@@ -8167,18 +8188,14 @@ impl AgentRunner {
                                                let call_params_json = Value::Object(call_params);
 
                                                // G1:启动流式 LLM 调用
-                                               // G17:LLM 流式调用计时(在 loop 前后记录,Err 分支单独记录)
-                                               let llm_start = std::time::Instant::now();
+                                               // G17:LLM 流式调用计时(每圈新鲜计时,Err 分支单独记录)
+                                               llm_start = std::time::Instant::now();
                                                let mut llm_stream = runner.llm_handler.execute_stream(&call_params_json);
-                                               let mut full_content = String::new();
-                                               // 思考留痕:流式所有 reasoning(真流式帧/legacy 整包
-                                               // 合成/终帧安全网补发)统一经 ThinkingDelta 下行,
-                                               // 此处随步累积,随 assistant 消息持久化(仅展示链路)
-                                               let mut full_reasoning = String::new();
-                                               let mut full_tool_calls: Option<Vec<crate::agent::translator::ToolCall>> = None;
-                                               let mut finish_reason: Option<String> = None;
-                                               // B21:provider token 真值(Done chunk 采集,llm_called 埋点消费)
-                                               let mut react_tokens: Option<crate::agent::translator::TokenUsage> = None;
+                                               full_content.clear();
+                                               full_reasoning.clear();
+                                               full_tool_calls = None;
+                                               finish_reason = None;
+                                               react_tokens = None;
 
                                                // G6:LLM 流式输出期间也监听取消(token-by-token 响应)
                                                loop {
@@ -8283,6 +8300,43 @@ impl AgentRunner {
                                                            if let Some(m) = &runner.metrics {
                                                                m.observe_llm_call(model, llm_start.elapsed(), false);
                                                            }
+                                                           // 请求体超限恢复:首发命中且未用过重试
+                                                           // → 发送副本紧急裁剪(journal 审计同权落账)后重试一次
+                                                           if is_payload_limit_error(&e) && !payload_retry_used {
+                                                               payload_retry_used = true;
+                                                               let report = emergency_trim_for_payload_limit(&mut messages_to_send);
+                                                               if let Some(j) = &journal {
+                                                                   if let Err(je) = j.emergency_trim_performed(
+                                                                       report.before_chars,
+                                                                       report.after_chars,
+                                                                       report.elided_tool_results,
+                                                                       report.folded_approvals,
+                                                                       report.history_compacted,
+                                                                   ) {
+                                                                       tracing::warn!(session_id = %session_id, error = %je, "emergency_trim_performed journal failed (best-effort)");
+                                                                   }
+                                                               }
+                                                               info!(
+                                                                   session_id = %session_id,
+                                                                   before = report.before_chars,
+                                                                   after = report.after_chars,
+                                                                   elided_tool_results = report.elided_tool_results,
+                                                                   folded_approvals = report.folded_approvals,
+                                                                   history_compacted = report.history_compacted,
+                                                                   "payload limit hit: emergency trim applied, retrying once"
+                                                               );
+                                                               if report.after_chars < report.before_chars {
+                                                                   continue 'payload_attempt;
+                                                               }
+                                                               // 裁剪无收益(无可折叠)→ 下方现行终局(fail-visible 文案兜住)
+                                                           }
+                                                           // 413 类终局错误面附新开会话指引(fail-visible);
+                                                           // 非 413 错误串零变化
+                                                           let e = if is_payload_limit_error(&e) {
+                                                               format!("{e}{}", PAYLOAD_LIMIT_FAIL_VISIBLE_HINT)
+                                                           } else {
+                                                               e
+                                                           };
                                                            // 提交 error io_response 防止 evorule 卡死
                                                            if let Some(rid) = request_id {
                                                                let err_resp = serde_json::json!({"content": "", "error": &e});
@@ -8310,6 +8364,10 @@ impl AgentRunner {
                                                            return;
                                                        }
                                                    }
+                                               }
+                                               // 消费循环正常完成 → 出重试编排(除 fail-visible 终局
+                                               // return 外的唯一出口)
+                                               break 'payload_attempt;
                                                }
 
                                                // G17:记录 LLM 流式调用成功指标(正常完成)
@@ -10453,6 +10511,143 @@ fn clear_tool_results(region: &[Message], max_clear: usize) -> (Vec<Message>, us
         }
     }
     (out, cleared)
+}
+
+/// 413 类错误识别(请求体超限恢复路径):错误串含 `413` / `Payload Too Large` /
+/// `length limit exceeded` 任一即命中——同时覆盖承载方缺省体限拒绝与上游
+/// provider 同类拒绝(错误串透传形态)。非 413 类错误行为零变化。
+pub(crate) fn is_payload_limit_error(e: &str) -> bool {
+    e.contains("413")
+        || e.contains("Payload Too Large")
+        || e.contains("length limit exceeded")
+}
+
+/// 413 类错误 fail-visible 指引(死亡线终局文案;与 UI 面一致的中文口径)
+pub(crate) const PAYLOAD_LIMIT_FAIL_VISIBLE_HINT: &str =
+    "\n\n请求体超出承载上限且自动裁剪未能恢复;请将关键产出留存后新开会话。";
+
+/// 紧急裁剪兜底保留轮数(近程工作记忆保真:最近 2 轮完整 ReAct 往返)
+const EMERGENCY_TRIM_KEEP_ROUNDS: usize = 2;
+
+/// 紧急裁剪报告(落账口径)
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct EmergencyTrimReport {
+    /// 裁剪前全量消息字符数(与 compaction 落账同口径)
+    pub before_chars: usize,
+    /// 裁剪后全量消息字符数
+    pub after_chars: usize,
+    /// 折叠为占位的工具结果条数
+    pub elided_tool_results: usize,
+    /// 收敛为单行决策记录的审批往返条数
+    pub folded_approvals: usize,
+    /// 是否触发了整段历史压缩兜底层
+    pub history_compacted: bool,
+}
+
+/// 审批往返形态识别(保守判定):User 轮 content 为含审批留痕键的 JSON
+/// 载荷(human 批准/拒绝经 io 通道回传的往返形态)。
+fn is_approval_roundtrip(content: &str) -> bool {
+    let t = content.trim_start();
+    t.starts_with('{') && t.contains("\"proposal_id\"") && t.contains("\"decision\"")
+}
+
+/// 请求体超限紧急裁剪(纯函数,只作用于发送副本):三层依序执行,每层
+/// 尽可能压,裁后重试一次,仍超限走 fail-visible——引擎侧无承载限确切值
+/// 可判「仍超限」,三层一次性上齐是确定性边界。
+///
+/// 1. 折叠最老工具结果:近程边界(最近 KEEP_ROUNDS 轮)之前的 tool 消息
+///    content 替换为占位(消息数/角色不变,旁路图连带清空防预算门被架空);
+/// 2. 折叠审批往返:审批留痕 JSON 载荷收敛为单行决策记录(决策语义保留,
+///    不自动批准任何待审项);
+/// 3. 整段压缩兜底:system 全保留 + 最近 KEEP_ROUNDS 轮保留,中段替换为
+///    单条占位(轮界切分,不破 assistant↔tool 配对)。
+///
+/// 注:两处近程边界以同一 KEEP_ROUNDS 计,①的可折叠区与③的压缩区重合——
+/// ③触发时①的折叠产出随中段被整段占位吸收;①保留独立执行作为③未来收紧
+/// 触发条件时的兜底,elided_tool_results 仍如实落账供观测。
+pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> EmergencyTrimReport {
+    let count_chars = |ms: &[Message]| ms.iter().map(|m| m.content().len()).sum::<usize>();
+    let mut report = EmergencyTrimReport {
+        before_chars: count_chars(messages),
+        ..Default::default()
+    };
+
+    // 近程边界:system 段之后,倒数第 KEEP_ROUNDS 个 user 轮起点
+    let system_end = messages
+        .iter()
+        .take_while(|m| matches!(m, Message::System { .. }))
+        .count();
+    let user_idxs: Vec<usize> = messages[system_end..]
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, Message::User { .. }))
+        .map(|(i, _)| i + system_end)
+        .collect();
+    let recent_start = if user_idxs.len() > EMERGENCY_TRIM_KEEP_ROUNDS {
+        user_idxs[user_idxs.len() - EMERGENCY_TRIM_KEEP_ROUNDS]
+    } else {
+        system_end
+    };
+
+    // ①折叠近程边界之前的大体积工具结果(空结果不动,零收益)
+    for m in messages.iter_mut().take(recent_start) {
+        if let Message::Tool {
+            content,
+            tool_name: _,
+            images,
+        } = m
+        {
+            let n = content.len();
+            if n == 0 {
+                continue;
+            }
+            *content = format!("[tool result elided: {n} bytes]");
+            *images = Vec::new();
+            report.elided_tool_results += 1;
+        }
+    }
+
+    // ②审批往返收敛为单行决策记录
+    for m in messages.iter_mut() {
+        if let Message::User { content, images } = m {
+            if is_approval_roundtrip(content) {
+                let n = content.len();
+                let decision = serde_json::from_str::<serde_json::Value>(content)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("decision")
+                            .and_then(|d| d.as_str().map(str::to_string))
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                *content =
+                    format!("[approval roundtrip elided: {n} bytes; decision: {decision}]");
+                *images = Vec::new();
+                report.folded_approvals += 1;
+            }
+        }
+    }
+
+    // ③整段压缩兜底(轮界切分,不破配对)
+    if let Some((sys_end, split)) =
+        compaction_region_bounds(messages, EMERGENCY_TRIM_KEEP_ROUNDS)
+    {
+        if split > sys_end {
+            let elided = split - sys_end;
+            messages.drain(sys_end..split);
+            messages.insert(
+                sys_end,
+                Message::System {
+                    content: format!(
+                        "[history compacted due to request body limit: {elided} messages removed]"
+                    ),
+                },
+            );
+            report.history_compacted = true;
+        }
+    }
+
+    report.after_chars = count_chars(messages);
+    report
 }
 
 #[cfg(test)]
