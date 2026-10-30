@@ -22,6 +22,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use serde_json::Value;
 
+use crate::api::api_core::ApiError;
 use crate::api::evorule_client::EvoruleApiClient;
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::{ToolFunction, ToolHandler};
@@ -64,6 +65,43 @@ struct ServiceProxyTool {
     service_name: String,
 }
 
+/// 服务发现瞬态重试退避表（毫秒）：覆盖 sidecar 启动竞态——agent 先于
+/// server 完成监听起跑时，首次 GET /api/services 连接失败属就绪期瞬态，
+/// 有限退避重试（总等待 ≤3.5s）后即达稳态；耗尽仍失败 = 真降级，走
+/// 注册失败留痕路径。仅对连接/超时形态重试；HTTP 状态错误（401/403/
+/// 500）= server 在但拒绝，重试无益，立即失败。
+const DISCOVERY_RETRY_DELAYS_MS: [u64; 3] = [500, 1000, 2000];
+
+/// GET /api/services 就绪感知发现：瞬态失败按退避表重试，其余即时失败。
+async fn list_services_with_readiness_retry(
+    ev: &EvoruleApiClient,
+    delays_ms: &[u64],
+) -> Result<Value, String> {
+    let mut attempt = 0usize;
+    loop {
+        match ev.list_services().await {
+            Ok(v) => return Ok(v),
+            Err(ApiError::HttpError(e)) if e.is_connect() || e.is_timeout() => {
+                let Some(delay) = delays_ms.get(attempt) else {
+                    return Err(format!(
+                        "服务发现失败（GET /api/services）: {e}（重试 {} 次后仍连接失败）",
+                        delays_ms.len()
+                    ));
+                };
+                attempt += 1;
+                eprintln!(
+                    "[service-tools] server 未就绪（连接失败），{delay}ms 后重试（{attempt}/{}）",
+                    delays_ms.len()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
+            }
+            Err(e) => {
+                return Err(format!("服务发现失败（GET /api/services）: {e}"));
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ToolFunction for ServiceProxyTool {
     async fn call(&self, args: &Value) -> IoResult {
@@ -89,13 +127,20 @@ pub async fn register_service_tools(
     ev: &EvoruleApiClient,
     whitelist: &[String],
 ) -> Result<usize, String> {
+    register_service_tools_with_delays(handler, ev, whitelist, &DISCOVERY_RETRY_DELAYS_MS).await
+}
+
+/// 注册主体（发现步重试退避表参数化：测试注入空表验证即时 fail-fast）。
+async fn register_service_tools_with_delays(
+    handler: &mut ToolHandler,
+    ev: &EvoruleApiClient,
+    whitelist: &[String],
+    discovery_retry_delays_ms: &[u64],
+) -> Result<usize, String> {
     if whitelist.is_empty() {
         return Ok(0);
     }
-    let services = ev
-        .list_services()
-        .await
-        .map_err(|e| format!("服务发现失败（GET /api/services）: {e}"))?;
+    let services = list_services_with_readiness_retry(ev, discovery_retry_delays_ms).await?;
 
     let mut registered = 0usize;
     // 启动点名探针：缺失/sensitive/重名逐类收集，循环后输出结构化汇总，
@@ -221,7 +266,8 @@ mod tests {
 
     #[test]
     fn discovery_failure_is_fail_fast() {
-        // 不可达 base_url → 服务发现显式失败（不静默吞掉）
+        // 不可达 base_url → 服务发现显式失败（不静默吞掉）；注入空退避表
+        // 验证重试耗尽后即时失败（缺省退避表的耗尽语义由就绪重试用例覆盖）
         let mut handler = ToolHandler::new();
         let ev = EvoruleApiClient::new("http://127.0.0.1:1");
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -229,10 +275,11 @@ mod tests {
             .build()
             .unwrap();
         let err = rt
-            .block_on(register_service_tools(
+            .block_on(register_service_tools_with_delays(
                 &mut handler,
                 &ev,
                 &["finance_config_get".to_string()],
+                &[],
             ))
             .unwrap_err();
         assert!(err.contains("服务发现失败"), "应 fail-fast: {err}");
@@ -250,7 +297,6 @@ mod tests {
     fn spawn_http_fixture(
         responses: Vec<(u16, &'static str)>,
     ) -> (String, Arc<std::sync::Mutex<Vec<CapturedRequest>>>) {
-        use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -258,53 +304,109 @@ mod tests {
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
         std::thread::spawn(move || {
-            for (status, body) in responses {
-                let (stream, _) = listener.accept().unwrap();
-                let mut stream = stream;
-                let path;
-                let mut req_body = Vec::new();
-                {
-                    let mut reader = BufReader::new(&stream);
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    path = line
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or_default()
-                        .to_string();
-                    let mut content_length = 0usize;
-                    loop {
-                        let mut h = String::new();
-                        reader.read_line(&mut h).unwrap();
-                        if h.trim().is_empty() {
-                            break;
-                        }
-                        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
-                            content_length = v.trim().parse().unwrap_or(0);
-                        }
-                    }
-                    if content_length > 0 {
-                        req_body = vec![0u8; content_length];
-                        reader.read_exact(&mut req_body).unwrap();
-                    }
-                }
-                captured_clone.lock().unwrap().push(CapturedRequest {
-                    path,
-                    body: String::from_utf8_lossy(&req_body).into_owned(),
-                });
-                let reason = match status {
-                    200 => "OK",
-                    _ => "Internal Server Error",
-                };
-                let resp = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
-                stream.flush().unwrap();
-            }
+            accept_and_respond(listener, responses, &captured_clone);
         });
         (format!("http://{addr}"), captured)
+    }
+
+    /// 延迟监听 fixture：复现 sidecar 启动竞态——客户端先起跑连接（监听
+    /// 不在场 → 连接拒绝），`delay_ms` 后监听就位。返回 base_url。
+    fn spawn_delayed_http_fixture(delay_ms: u64, responses: Vec<(u16, &'static str)>) -> String {
+        use std::net::TcpListener;
+
+        // 先占坑得确定空闲端口再释放（重 bind 同端口模拟「尚未监听」窗口）
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let listener = TcpListener::bind(addr)
+                .expect("delayed fixture re-bind failed (port taken over?)");
+            accept_and_respond(listener, responses, &std::sync::Mutex::new(Vec::new()));
+        });
+        format!("http://{addr}")
+    }
+
+    /// 顺序应答循环（监听器在手后逐请求 accept+应答+捕获）
+    fn accept_and_respond(
+        listener: std::net::TcpListener,
+        responses: Vec<(u16, &'static str)>,
+        captured: &std::sync::Mutex<Vec<CapturedRequest>>,
+    ) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        for (status, body) in responses {
+            let (stream, _) = listener.accept().unwrap();
+            let mut stream = stream;
+            let path;
+            let mut req_body = Vec::new();
+            {
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                path = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let mut content_length = 0usize;
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).unwrap();
+                    if h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    req_body = vec![0u8; content_length];
+                    reader.read_exact(&mut req_body).unwrap();
+                }
+            }
+            captured.lock().unwrap().push(CapturedRequest {
+                path,
+                body: String::from_utf8_lossy(&req_body).into_owned(),
+            });
+            let reason = match status {
+                200 => "OK",
+                _ => "Internal Server Error",
+            };
+            let resp = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        }
+    }
+
+    #[test]
+    fn discovery_readiness_retry_succeeds_after_delayed_listen() {
+        // 启动竞态复现：server 延迟 300ms 才监听，首次 GET 连接失败（瞬态），
+        // 就绪等待重试后注册成功（缺省退避表 500ms 首试即落在就绪窗口内）
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let base = spawn_delayed_http_fixture(
+            300,
+            vec![(
+                200,
+                r#"[{"name":"late_svc","source":"native","sensitive":false,"description":"延迟就绪服务"}]"#,
+            )],
+        );
+        let mut handler = ToolHandler::new();
+        let ev = EvoruleApiClient::new(&base);
+        let n = rt
+            .block_on(register_service_tools(
+                &mut handler,
+                &ev,
+                &["late_svc".to_string()],
+            ))
+            .unwrap();
+        assert_eq!(n, 1, "就绪等待后应注册成功");
+        assert!(handler.has_tool("late_svc"), "服务工具应在场");
     }
 
     #[test]

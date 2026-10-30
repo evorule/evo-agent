@@ -889,6 +889,9 @@ fn cmd_run(
             );
         }
 
+        // 启动期事件槽:服务工具注册降级等事实收集处(随会话 journal 落账)
+        let mut startup_service_events: Vec<evo_agent::agent::journal::JournalEvent> = Vec::new();
+
         // 服务消费桥:按白名单把 server 插件服务注册为代理工具
         // (发现失败降级继续并明示影响,不阻塞 agent 主流程)
         if !config.evorule.service_tools.is_empty() {
@@ -901,7 +904,14 @@ fn cmd_run(
             {
                 Ok(n) => eprintln!("[service-tools] {n} service tool(s) registered"),
                 Err(e) => {
-                    eprintln!("[service-tools] 服务工具注册失败,本次运行无服务工具: {e}")
+                    eprintln!("[service-tools] 服务工具注册失败,本次运行无服务工具: {e}");
+                    // 降级事实进会话 journal(审计链可回放;消灭仅 stdout 一句的静默降级)
+                    startup_service_events.push(
+                        evo_agent::agent::journal::JournalEvent::ServiceToolsDegraded {
+                            reason: e.clone(),
+                            whitelist: config.evorule.service_tools.len(),
+                        },
+                    );
                 }
             }
         }
@@ -913,7 +923,7 @@ fn cmd_run(
         AgentRunner::from_definition(def.clone(), client.clone(), tool_handler, Some(llm_handler.clone()))
             .await
             .map(|r| {
-                r.with_capability_boundary(capability_boundary)
+                let mut runner = r.with_capability_boundary(capability_boundary)
                     // 定义级显式声明的执行环境 profile 随 tool_result 落账;
                     // 未声明=None=落账无标记(缺省语义零变化)
                     .with_execution_profile_marker(def.execution_profile.as_deref())
@@ -944,7 +954,12 @@ fn cmd_run(
                             std::sync::atomic::AtomicU64::new(0),
                         )),
                     )
-                    .wire_accounting(workdir)
+                    .wire_accounting(workdir);
+                // 启动期事实入链:注册降级等事件随本会话 journal 落账
+                for ev in startup_service_events.iter() {
+                    runner = runner.with_startup_event(ev.clone());
+                }
+                runner
             })
     });
     let runner = match runner_result {

@@ -1391,6 +1391,9 @@ pub struct AgentRunner {
     /// 注入;CLI run 纯路径无 journal=只 warn 不落账)。G10 摘要替换时
     /// 自动对照落 summary_fidelity_scan 事件。
     active_journal: Option<std::sync::Arc<crate::agent::journal::JournalWriter>>,
+    /// 启动期事件槽(with_startup_event 注入):服务工具注册降级等启动期
+    /// 事实,journal 在手后逐条落账(先于首轮);缺省空=零影响(缺省不变式)
+    startup_events: Vec<crate::agent::journal::JournalEvent>,
     /// 查账工具族（PR-11a）：会话 journal 上下文共享槽——wire_accounting
     /// 重绑的查账工具实例经此感知当前会话（journal_dir 未启用=槽保持
     /// None，query_journal 如实报错）
@@ -1535,6 +1538,7 @@ impl AgentRunner {
             pending_note_feed: false,
             advised_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
             todo_state: None,
+            startup_events: Vec::new(),
             active_journal: None,
             accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
             chain: None,
@@ -2254,6 +2258,14 @@ impl AgentRunner {
     /// 唯一真相源;不注入(默认)行为零变化。
     pub fn with_journal_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.journal_dir = Some(dir);
+        self
+    }
+
+    /// 注入启动期事件(journal 在手后落账,先于首轮;观测面)。服务消费桥
+    /// 注册失败等启动期事实经此随会话 journal 入链——注册发生在 runner
+    /// 构造之前,调用方收集事实后经本槽转交。缺省空=行为零变化。
+    pub fn with_startup_event(mut self, event: crate::agent::journal::JournalEvent) -> Self {
+        self.startup_events.push(event);
         self
     }
 
@@ -4388,6 +4400,8 @@ impl AgentRunner {
                 assembly_scope_focus,
                 i2_verdict_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 semantic_i2_enabled,
+                // 启动期事件槽:子代理恒空(降级事实属父会话启动上下文,不跨链传递)
+                startup_events: Vec::new(),
                 active_journal: None,
                 accounting_journal: std::sync::Arc::new(std::sync::RwLock::new(None)),
                 chain: Some(chain.clone()),
@@ -7261,6 +7275,17 @@ impl AgentRunner {
                                };
                            // 摘要保真对照(交付物 B):journal 写者克隆挂 runner(摘要替换时落账)
                            runner.active_journal = journal.clone();
+                           // 启动期事实落账(with_startup_event 注入;先于首轮,
+                           // 回放面从账首即可见本次运行的启动期环境事实)
+                           if !runner.startup_events.is_empty() {
+                               if let Some(j) = &journal {
+                                   for ev in runner.startup_events.iter() {
+                                       if let Err(e) = j.write_event(ev.clone()) {
+                                           warn!(error = %e, "startup event journal write failed");
+                                       }
+                                   }
+                               }
+                           }
                            // 自主交接 PR-H2/H3:handover 双工具+session_spawn 会话期重绑
                            // (与 run() 同钩位补挂——此前流式路径漏挂,handover 工具在 serve
                            // 流式会话恒 unwired;journal 在手后透传,派生/停链语义事件可落账)

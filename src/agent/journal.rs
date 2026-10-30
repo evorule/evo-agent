@@ -590,6 +590,15 @@ pub enum JournalEvent {
         /// 注入原文
         text: String,
     },
+    /// 服务工具注册降级落账:启动期服务消费桥注册失败(服务发现失败等整体
+    /// 降级形态)时随该会话 journal 落账,使「本次运行无服务工具」从仅
+    /// stdout 一句的静默降级升为审计链可回放事实。观测面,不参与步映射。
+    ServiceToolsDegraded {
+        /// 降级原因(服务发现失败详情)
+        reason: String,
+        /// 白名单规模(降级前的期望注册面;空白名单不注册不发请求,不落本事件)
+        whitelist: usize,
+    },
 }
 
 /// 单行 journal 记录(读侧重放消费形态)
@@ -1367,6 +1376,12 @@ impl JournalWriter {
         self.push(JournalEvent::SteeringNote {
             text: text.to_string(),
         })
+    }
+
+    /// 启动期事件落账(调用方构造的 JournalEvent 直写;服务工具注册降级
+    /// 等启动期事实经此入链。观测面,不参与步映射)
+    pub fn write_event(&self, event: JournalEvent) -> Result<u64, JournalError> {
+        self.push(event)
     }
 
     /// sediment 结果落 journal（受信通道持久化信号 + 沉淀结果对账依据）
@@ -2318,6 +2333,34 @@ mod tests {
                 assert_eq!(full_json, &long_json);
             }
             other => panic!("expected policy_review_sealed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn service_tools_degraded_roundtrip_via_file() {
+        // 启动期降级事实落账:write_event 经文件回读原样(链哈希段完整,
+        // 审计链可回放——服务工具注册失败不再只是 stdout 一句)
+        let dir = std::env::temp_dir().join(format!("jf-svcdeg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-svcdeg").unwrap();
+            w.write_event(JournalEvent::ServiceToolsDegraded {
+                reason: "服务发现失败（GET /api/services）: connection refused".into(),
+                whitelist: 3,
+            })
+            .unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-svcdeg")).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].hashes.is_some(), "链哈希段应完整");
+        match &lines[0].event {
+            JournalEvent::ServiceToolsDegraded { reason, whitelist } => {
+                assert!(reason.contains("服务发现失败"), "原因全文保真: {reason}");
+                assert_eq!(*whitelist, 3);
+            }
+            other => panic!("expected service_tools_degraded, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

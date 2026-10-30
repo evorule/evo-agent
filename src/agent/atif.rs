@@ -419,6 +419,8 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             JournalEvent::SteeringNote { .. } => continue,
             // 请求体超限紧急裁剪:故障恢复观测面,非对话步,不映射为轨迹步
             JournalEvent::EmergencyTrimPerformed { .. } => continue,
+            // 服务工具注册降级:启动期环境事实,非对话步,不映射为轨迹步
+            JournalEvent::ServiceToolsDegraded { .. } => continue,
             JournalEvent::TurnStarted { goal, .. } => {
                 // 轮界:上一个 agent 步必已随 turn_ended 收步;开用户步
                 let message = match user_msgs.get(user_ordinal) {
