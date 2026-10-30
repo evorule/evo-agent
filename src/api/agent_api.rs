@@ -2330,7 +2330,9 @@ pub struct AnswerRequest {
 /// - `approved:true` → 带已批准状态重新调用工具
 /// - 其他 → 返回 `{"status":"rejected"}`
 ///
-/// 200 = 审批结果已送达;404 = session 不在等待审批(已超时/不存在/未触发审批)。
+/// 200 = 审批结果已送达;409 = session 无待审批项(已超时清理/未触发审批/
+/// 轮次已收尾)——响应体带机器可读码 `no_pending_item`,前端据此拆分
+/// 「无待审批项」与「超时自动拒绝」两种失效语义,不再两义混载。
 async fn approve_agent(
     State(state): State<AgentApiState>,
     axum::extract::Path(_agent_type): axum::extract::Path<String>,
@@ -2350,9 +2352,10 @@ async fn approve_agent(
             session_id = %req.session_id,
             "G8: approval requested but session not pending (timed out / not found / no approval needed)"
         );
+        // 机器可读码:前端审批卡按此转「无待审批项」终态,与超时自动拒绝区分
         return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "session not pending approval"})),
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "no_pending_item"})),
         ));
     };
 
@@ -5878,8 +5881,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_approve_unknown_session_returns_404() {
-        // 不在等待审批的 session → 404
+    async fn test_approve_unknown_session_returns_conflict_with_code() {
+        // 不在等待审批的 session → 409 + 机器可读码 no_pending_item
+        // (前端据此与「超时自动拒绝」拆分语义,不再两义混载)
         let state = make_test_state();
         let app = router(state);
 
@@ -5896,7 +5900,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "no_pending_item");
     }
 
     #[tokio::test]
@@ -6005,7 +6014,7 @@ mod tests {
             .unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
 
-        // 第二次 approve 同一 session → 404(已移除)
+        // 第二次 approve 同一 session → 409 no_pending_item(已移除)
         let body2 = serde_json::json!({"session_id": "approval-session-003", "approved": false});
         let r2 = app
             .oneshot(
@@ -6018,7 +6027,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(r2.status(), StatusCode::NOT_FOUND);
+        assert_eq!(r2.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

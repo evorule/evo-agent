@@ -305,26 +305,10 @@ async fn handle_ws(
                                            runner.run_streaming(content, images)
                                        };
 
-                                       // spawn task:把事件流转发到 channel
+                                       // spawn task:转发事件流到 channel(转发泵保证
+                                       // 客户端必收终态帧,见 forward_turn_events)
                                        let tx = event_tx.clone();
-                                       tokio::spawn(async move {
-                                           let mut stream = event_stream;
-                                           while let Some(ev) = stream.next().await {
-                                               if tx.send(WsEvent::Agent(ev)).await.is_err() {
-                                                   // 主循环已退出(receiver drop),停止转发
-                                                   return;
-                                               }
-                                           }
-                                           // 终端态先行放行:Done/Error 帧已转发,新消息
-                                           // 即刻可入;索引/快照善后随 TurnEnd 异步完成
-                                           if let Err(e) = tx.send(WsEvent::TurnDone).await {
-                                               debug!(error = %e, "TurnDone send failed; main ws loop already exited");
-                                           }
-                                           // 事件流结束 → 发 TurnEnd 信号
-                                           if let Err(e) = tx.send(WsEvent::TurnEnd).await {
-                                               debug!(error = %e, "TurnEnd send failed; main ws loop already exited");
-                                           }
-                                       });
+                                       tokio::spawn(forward_turn_events(tx, event_stream));
                                    }
                                    Ok(ClientMessage::Interrupt) => {
                                        if let Some(cancel) = &current_cancel {
@@ -436,23 +420,7 @@ async fn handle_ws(
                                                info!(session_id = %sid, "G16: crash-resume turn");
                                                let event_stream = runner.resume_crashed(sid);
                                                let tx = event_tx.clone();
-                                               tokio::spawn(async move {
-                                                   let mut stream = event_stream;
-                                                   while let Some(ev) = stream.next().await {
-                                                       if tx.send(WsEvent::Agent(ev)).await.is_err() {
-                                                           // 主循环已退出(receiver drop),停止转发
-                                                           return;
-                                                       }
-                                                   }
-                                                   // 终端态先行放行(与主聊天面同口径)
-                                                   if let Err(e) = tx.send(WsEvent::TurnDone).await {
-                                                       debug!(error = %e, "TurnDone send failed; main ws loop already exited");
-                                                   }
-                                                   // 事件流结束 → 发 TurnEnd 信号
-                                                   if let Err(e) = tx.send(WsEvent::TurnEnd).await {
-                                                       debug!(error = %e, "TurnEnd send failed; main ws loop already exited");
-                                                   }
-                                               });
+                                               tokio::spawn(forward_turn_events(tx, event_stream));
                                            }
                                            None => {
                                                let _ = send_ws_json(
@@ -662,6 +630,64 @@ async fn handle_ws(
 // =============================================================================
 // 辅助函数
 // =============================================================================
+
+/// 轮次事件流转发泵：把 runner 事件流逐个转发到 WS 主循环通道，流收尾时
+/// 保证「客户端必收恰一个终态帧」不变式——若整条流从未产出 Done/Error
+/// 终态事件，合成一帧失败 Done 补发。无终态帧时前端「运行中」永挂、输入
+/// 被禁，用户失去全部处置抓手；合成帧让前端以诚实失败复位（轮次循环若
+/// 真在跑，下一帧到达时前端状态自然重同步）。合成时 warn 留痕（含会话
+/// 线索与已转发事件数），供现场按日志回捕静默收尾路径。
+/// 收尾信号按既有口径：TurnDone 先行放行下一轮，TurnEnd 供索引/快照善后。
+async fn forward_turn_events(
+    tx: tokio::sync::mpsc::Sender<WsEvent>,
+    mut stream: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<AgentEvent, AgentError>> + Send>,
+    >,
+) {
+    let mut terminal_seen = false;
+    let mut forwarded = 0usize;
+    let mut session_hint: Option<String> = None;
+    while let Some(ev) = stream.next().await {
+        match &ev {
+            Ok(AgentEvent::SessionCreated { session_id, .. }) => {
+                session_hint = Some(session_id.clone());
+            }
+            Ok(AgentEvent::Done(_)) | Ok(AgentEvent::Error(_)) | Err(_) => {
+                terminal_seen = true;
+            }
+            _ => {}
+        }
+        forwarded += 1;
+        if tx.send(WsEvent::Agent(ev)).await.is_err() {
+            // 主循环已退出(receiver drop),停止转发
+            return;
+        }
+    }
+    if !terminal_seen {
+        warn!(
+            session_id = session_hint.as_deref().unwrap_or("-"),
+            forwarded, "turn stream ended without terminal event; synthesizing failed Done frame"
+        );
+        let _ = tx
+            .send(WsEvent::Agent(Ok(AgentEvent::Done(
+                crate::agent::runner::AgentResult::error(
+                    "turn ended without terminal event".to_string(),
+                    0,
+                    0,
+                ),
+            ))))
+            .await;
+    }
+    // 终端态先行放行:Done/Error 帧已转发,新消息即刻可入;
+    // 索引/快照善后随 TurnEnd 异步完成
+    if let Err(e) = tx.send(WsEvent::TurnDone).await {
+        debug!(error = %e, "TurnDone send failed; main ws loop already exited");
+    }
+    // 事件流结束 → 发 TurnEnd 信号
+    if let Err(e) = tx.send(WsEvent::TurnEnd).await {
+        debug!(error = %e, "TurnEnd send failed; main ws loop already exited");
+    }
+}
 
 /// G8 审批决策端三态路由（2026-09-26 设计/2026-10-15 实施）
 ///
@@ -1245,6 +1271,89 @@ pub fn agent_event_json_line(event: Result<AgentEvent, AgentError>, pretty: bool
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    // ===== 轮次终态帧保证(转发泵兜底) =====
+
+    /// 构造 mock 事件流(测试辅助)
+    fn mock_turn_stream(
+        events: Vec<Result<AgentEvent, AgentError>>,
+    ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<AgentEvent, AgentError>> + Send>>
+    {
+        Box::pin(futures_util::stream::iter(events))
+    }
+
+    #[tokio::test]
+    async fn turn_stream_without_terminal_event_gets_synthetic_failed_done() {
+        // 流产出普通事件后自然收尾(无 Done/Error)——转发泵必须补发合成
+        // 失败 Done,否则前端「运行中」永挂、输入被禁
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WsEvent>(16);
+        forward_turn_events(
+            tx,
+            mock_turn_stream(vec![
+                Ok(AgentEvent::Step { step: 1 }),
+                Ok(AgentEvent::Step { step: 2 }),
+            ]),
+        )
+        .await;
+        let mut done_frames = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let WsEvent::Agent(Ok(AgentEvent::Done(r))) = ev {
+                done_frames.push(r);
+            }
+        }
+        assert_eq!(done_frames.len(), 1, "exactly one synthetic terminal frame");
+        assert!(!done_frames[0].success);
+        assert_eq!(
+            done_frames[0].error.as_deref(),
+            Some("turn ended without terminal event")
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_stream_with_terminal_done_is_not_duplicated() {
+        // 正常 Done 收尾 → 原样转发恰一次,不追加合成帧
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WsEvent>(16);
+        forward_turn_events(
+            tx,
+            mock_turn_stream(vec![
+                Ok(AgentEvent::Step { step: 1 }),
+                Ok(AgentEvent::Done(
+                    crate::agent::runner::AgentResult::success("ok".to_string(), 1, 100, vec![]),
+                )),
+            ]),
+        )
+        .await;
+        let mut done_frames = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let WsEvent::Agent(Ok(AgentEvent::Done(r))) = ev {
+                done_frames.push(r);
+            }
+        }
+        assert_eq!(done_frames.len(), 1, "no duplicate terminal frame");
+        assert!(done_frames[0].success);
+    }
+
+    #[tokio::test]
+    async fn turn_stream_ending_with_error_event_counts_as_terminal() {
+        // 流级错误(Err)也是终态帧:收尾不追加合成帧,Error 原样转发
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WsEvent>(16);
+        forward_turn_events(
+            tx,
+            mock_turn_stream(vec![Err(AgentError::Internal("boom".into()))]),
+        )
+        .await;
+        let mut error_frames = 0;
+        let mut done_frames = 0;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                WsEvent::Agent(Err(_)) => error_frames += 1,
+                WsEvent::Agent(Ok(AgentEvent::Done(_))) => done_frames += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(error_frames, 1);
+        assert_eq!(done_frames, 0, "error is terminal; no synthetic frame");
+    }
 
     // ===== 审批档位解析单源测试(定义级优先/设置键回落/未知值保守) =====
 
