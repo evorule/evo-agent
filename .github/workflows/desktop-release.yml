@@ -73,6 +73,9 @@ jobs:
           workspaces: evorule-server/plugins/ai-plugin -> target
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: evorule-server/plugins/wasm-host -> target
+      - uses: Swatinem/rust-cache@v2
+        with:
           workspaces: evo-agent -> target
 
       - uses: actions/setup-node@v4
@@ -105,6 +108,17 @@ jobs:
       - name: 构建 evorule-ai-plugin
         run: cargo build --release
         working-directory: evorule-server/plugins/ai-plugin
+
+      - name: 构建 evorule-wasm-host
+        run: cargo build --release
+        working-directory: evorule-server/plugins/wasm-host
+
+      # 供给装机信任锚：trusted-keys.json 被 gitignore（本地生成物语义），CI 检出
+      # 天然缺失；demo-2026 为公开演示钥，复制 demo 模板即开箱即试 UDF（enforce
+      # 模式验签通过），生产环境用户须自行 keygen 生成正式钥匙并登记
+      - name: 供给 wasm-host 装机信任锚 (demo 模板复制)
+        run: Copy-Item trusted-keys.demo.json trusted-keys.json
+        working-directory: evorule-server/plugins/wasm-host
 
       - name: 构建 evo-agent
         run: cargo build --release
