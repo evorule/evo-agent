@@ -162,6 +162,9 @@ fn render_service_catalog_from(names: &[&str]) -> Option<String> {
         }
     }
     out.push_str("## 成本纪律\n");
+    // 外判禁令（外判立法随批）：与 server 侧输出门禁
+    // deterministic_compute 域特征表配套——prompt 侧预防 + 运行时侧检测。
+    out.push_str("- 外判禁令：数值/公式/量纲/日期时长类问题禁止心算，必须走确定性服务。\n");
     out.push_str("- 便宜信息源优先：目录/描述/本地计算可答的，不调外部服务；同类需求先小后大。\n");
     out.push_str("- 大结果守则：工具返回超限会被自动引用化（落盘+指纹+分页取回 tool_result_fetch）；预判大结果时直接带 offset/max_chars 分页取用，勿一次性全量拉取。");
     Some(out)
@@ -709,8 +712,12 @@ mod tests {
             n_row.find("numeric_decimal_eval").unwrap()
                 < n_row.find("numeric_fin_interest").unwrap()
         );
-        // 尾注成本纪律段
+        // 尾注成本纪律段（首条=外判禁令，外判立法 v0.8.0 随批）
         assert!(out.contains("## 成本纪律\n"));
+        assert!(
+            out.contains("- 外判禁令：数值/公式/量纲/日期时长类问题禁止心算，必须走确定性服务。\n"),
+            "成本纪律段必须含外判禁令首条: {out}"
+        );
         assert!(out.ends_with("勿一次性全量拉取。"));
     }
 
