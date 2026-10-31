@@ -165,6 +165,20 @@ jobs:
           path: evo-agent/desktop/target/release/bundle/updater/*
           if-no-files-found: error
 
+      # 装机冒烟验收（发版面验收机制闸 4 的 CI 化）。NSIS setup.exe 已在 workspace
+      # （upload-artifact 只取 bundle/updater/*，不冲突），直接对本机静默装→
+      # 起壳→五口/服务面/验签全链断言；脚本 try/finally 自清理零遗留。
+      - name: 装机冒烟验收 (fresh-install smoke)
+        shell: pwsh
+        working-directory: evo-agent/desktop
+        run: |
+          $setup = Get-ChildItem "target/release/bundle/nsis/*_x64-setup.exe" |
+            Select-Object -First 1
+          if (-not $setup) {
+            throw "setup exe not found under target/release/bundle/nsis"
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fresh-install-smoke.ps1 -SetupPath $setup.FullName
+
   # Distribution-compliance gate (reusable workflow, pinned to root-repo commit)
   dist-gate:
     name: dist compliance gate
