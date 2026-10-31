@@ -510,6 +510,9 @@ impl EvoruleApiClient {
     }
 
     /// 向会话提交一条业务指令（POST command）。
+    ///
+    /// 门禁拒形态（HTTP 200 + `{"success":false,...}`，指令不进引擎）显式报错
+    /// [`ApiError::Rejected`]——消费面不依赖状态码单判据。
     pub async fn submit_command(&self, session_id: &str, command: &Value) -> Result<(), ApiError> {
         let url = format!(
             "{}/api/sessions/{}/command",
@@ -524,17 +527,26 @@ impl EvoruleApiClient {
             .json(&body)
             .send()
             .await?;
-        self.core.check_response_full(resp).await?;
+        let resp = self.core.check_response_full(resp).await?;
 
+        let result: Value = resp.json().await?;
+        Self::check_command_ack(&result)?;
         Ok(())
     }
 
     /// 提交指令并同步等待结论（POST command?wait=true）。
     ///
-    /// 响应 JSON 形态：`{success, fact_id, accepted: Option<bool>, violation?, code?}`——
+    /// 响应 JSON 形态：`{success, fact_id, accepted: Option<bool>, violation?, code?,
+    /// pending_request_id?}`——
     /// `accepted=true/false` = 结论已落链（受理/被 enforce 拦截）；
     /// `accepted` 缺失或 null = 等待窗口内结论未落定（WAIT_TIMEOUT 降级，
-    /// 或旧版 server 无 wait 支持），调用方应回退既有轮询判据。
+    /// 或旧版 server 无 wait 支持），调用方应回退既有轮询判据；
+    /// `pending_request_id` = 受理后进入外判执行时 pending IoRequest 的 fact_id
+    /// （io_response 回参所需 request_id，非 SSE 消费路径单请求闭合回路、
+    /// 免审计投影二次取回；旧版 server 或非 IoRequest 结论无此字段）。
+    ///
+    /// 门禁拒形态（HTTP 200 + `{"success":false,...}`）显式报错
+    /// [`ApiError::Rejected`]；结论形态（success=true）原样返回由调用方判定。
     pub async fn submit_command_wait(
         &self,
         session_id: &str,
@@ -556,7 +568,21 @@ impl EvoruleApiClient {
         let resp = self.core.check_response_full(resp).await?;
 
         let result: Value = resp.json().await?;
+        Self::check_command_ack(&result)?;
         Ok(result)
+    }
+
+    /// 指令提交响应的门禁拒判据：HTTP 200 + `{"success":false,...}`（Ack 拒形态，
+    /// 指令不进引擎）显式报错——状态码单判据下的双盲缺口补齐。
+    fn check_command_ack(body: &Value) -> Result<(), ApiError> {
+        if body.get("success") == Some(&Value::Bool(false)) {
+            let message = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("command rejected by gate");
+            return Err(ApiError::Rejected(message.to_string()));
+        }
+        Ok(())
     }
 
     /// 回应会话的 IO 请求（POST io_response），`error` 非空表示 IO 执行失败。
@@ -1862,6 +1888,88 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("timed out"), "msg: {msg}");
         assert!(msg.contains("abandoned"), "msg: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_submit_command_body_rejection_surfaces() {
+        // 门禁拒形态：HTTP 200 + success:false（指令不进引擎）——状态码单判据下
+        // 静默穿透，消费面必须在响应体上显式报错
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/sessions/s1/command")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"success":false,"message":"instruction missing required param: messages","fact_id":null,"code":null}"#,
+            )
+            .create_async()
+            .await;
+        let client = EvoruleApiClient::new(&server.url());
+        match client
+            .submit_command("s1", &serde_json::json!({"type": "call_external", "params": {}}))
+            .await
+        {
+            Err(ApiError::Rejected(message)) => {
+                assert!(
+                    message.contains("messages"),
+                    "门禁拒详情应透出 server 文案，得到: {message:?}"
+                );
+            }
+            other => panic!("应为 ApiError::Rejected，得到: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_command_wait_body_rejection_surfaces() {
+        // wait 路径同判据：Ack 拒形态（success:false）显式报错，
+        // 结论形态（success=true）原样透传由调用方判定
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/sessions/s1/command")
+            .match_query(mockito::Matcher::UrlEncoded("wait".into(), "true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"success":false,"message":"instruction missing required param: messages","fact_id":null,"code":null}"#,
+            )
+            .create_async()
+            .await;
+        let client = EvoruleApiClient::new(&server.url());
+        match client
+            .submit_command_wait("s1", &serde_json::json!({"type": "call_external", "params": {}}))
+            .await
+        {
+            Err(ApiError::Rejected(message)) => {
+                assert!(
+                    message.contains("messages"),
+                    "门禁拒详情应透出 server 文案，得到: {message:?}"
+                );
+            }
+            other => panic!("应为 ApiError::Rejected，得到: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_command_wait_passes_verdict_through() {
+        // 结论形态守门：success=true 原样透传（含 pending_request_id），调用方判结论
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/sessions/s1/command")
+            .match_query(mockito::Matcher::UrlEncoded("wait".into(), "true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"success":true,"message":"Command processed","fact_id":10,"accepted":true,"violation":null,"code":null,"pending_request_id":11}"#,
+            )
+            .create_async()
+            .await;
+        let client = EvoruleApiClient::new(&server.url());
+        let result = client
+            .submit_command_wait("s1", &serde_json::json!({"type": "noop"}))
+            .await
+            .expect("verdict form must pass through");
+        assert_eq!(result["accepted"], serde_json::json!(true));
+        assert_eq!(result["pending_request_id"], serde_json::json!(11));
     }
 
     #[tokio::test]

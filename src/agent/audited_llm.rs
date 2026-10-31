@@ -78,6 +78,9 @@ fn is_transient_setup_error(err: &ApiError) -> bool {
     match err {
         ApiError::ApiError { status, .. } => *status >= 500,
         ApiError::SessionNotFound | ApiError::InvalidVersion(_) => false,
+        // 业务面拒绝（HTTP 200 + success:false）：门禁判定确定性结果，
+        // 重试不会成功，同 4xx 语义不重试
+        ApiError::Rejected(_) => false,
         ApiError::HttpError(_) | ApiError::InvalidResponse | ApiError::SerializationError(_) => {
             true
         }

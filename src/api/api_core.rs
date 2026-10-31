@@ -22,6 +22,10 @@ pub enum ApiError {
         /// 错误详情（server error 字段或响应体）。
         message: String,
     },
+    /// server 返回 2xx 但业务面拒绝（如指令提交门禁拒：HTTP 200 + success:false，
+    /// 指令不进引擎）——状态码单判据下会静默穿透，消费面须读响应体显式报错。
+    #[error("Request rejected: {0}")]
+    Rejected(String),
     /// 响应体结构不符合预期契约。
     #[error("Invalid response format")]
     InvalidResponse,
