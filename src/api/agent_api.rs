@@ -782,6 +782,8 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         .route("/metrics", axum::routing::get(metrics_handler))
         // 运行体身份查询(与启动横幅共享正本;鉴权内)
         .route("/version", axum::routing::get(get_version))
+        // agent 工作区根只读查询(工作台显示当前生效的工作文件夹落点;鉴权内)
+        .route("/workspace-info", axum::routing::get(get_workspace_info))
         // 凭据可视化:LLM 配置只读状态(脱敏,响应体不携带任何密钥内容)
         .route("/admin/llm-status", axum::routing::get(get_llm_status))
         .route("/admin/llm-models", axum::routing::get(get_llm_models))
@@ -1213,6 +1215,19 @@ async fn metrics_handler(State(state): State<AgentApiState>) -> String {
 /// 鉴权内(不进 PUBLIC_PATHS——workdir 绝对路径不出无鉴权面)。
 async fn get_version(State(state): State<AgentApiState>) -> Json<RuntimeIdentity> {
     Json(crate::api::serve_tools::runtime_identity(state.workdir()))
+}
+
+/// agent 工作区根只读查询端点(工作台「工作文件夹」指示器消费面)
+///
+/// 路由:`GET /workspace-info` → `{"workspace_root": "<绝对路径>"}`。
+/// 返回 [`AgentApiState::agent_workspace_root`] 当前生效值(--agent-root 优先,
+/// 缺省回落 workdir)。前端会话级 `workspace` 声明(WS query/REST run/PTY)
+/// 优先于此值,本端点只呈现未声明时的缺省落点。
+/// 鉴权内(不进 PUBLIC_PATHS——绝对路径不出无鉴权面,与 /version 同语义)。
+async fn get_workspace_info(State(state): State<AgentApiState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "workspace_root": state.agent_workspace_root().display().to_string()
+    }))
 }
 
 /// LLM 配置只读状态端点(脱敏)
@@ -4360,6 +4375,44 @@ mod tests {
         let agent_root = std::path::PathBuf::from("Z:\\fake-agent-root");
         let state = make_test_state().with_agent_root(agent_root.clone());
         assert_eq!(state.agent_workspace_root(), agent_root.as_path());
+    }
+
+    #[tokio::test]
+    async fn test_workspace_info_returns_effective_root() {
+        // GET /workspace-info 呈现 agent_workspace_root 当前生效值:
+        // 未注入 agent_root → 回落 workdir;--agent-root 在场 → 注入值。
+        async fn fetch(state: AgentApiState) -> serde_json::Value {
+            let app = router(state);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/workspace-info")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        // 未注入:回落 workdir(测试态=一次性 tempdir)
+        let state = make_test_state();
+        let expected = state.agent_workspace_root().display().to_string();
+        let v = fetch(state).await;
+        assert_eq!(v["workspace_root"], serde_json::Value::String(expected));
+
+        // --agent-root 在场:呈现注入值(桌面壳形态)
+        let ar = std::path::PathBuf::from("Z:\\fake-agent-root");
+        let v = fetch(make_test_state().with_agent_root(ar.clone())).await;
+        assert_eq!(
+            v["workspace_root"],
+            serde_json::Value::String(ar.display().to_string())
+        );
     }
 
     #[test]
