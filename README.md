@@ -1,119 +1,48 @@
 # Evo-Agent
 
-> 可信 AI 工作站 —— 在 evorule 确定性执行引擎之上，为开发者和企业提供基于规则约束的 AI Agent 编排层。
+**Evo-Agent — a trustworthy AI workstation**: rule-constrained AI Agent orchestration on top of the evorule deterministic execution engine, where every execution leaves an auditable Fact chain.
 
-[![CI](https://github.com/evorule/evo-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/evorule/evo-agent/actions/workflows/ci.yml)
-[![Rust](https://img.shields.io/badge/rust-1.74%2B-orange.svg)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.0-green.svg)](Cargo.toml)
+[![CI][badge-ci]][ci] [![License][badge-license]][license-file]
 
 ---
 
-## 定位
+## Positioning
 
-**Evo-Agent = LLM 大脑 + 工具手脚 + 持久记忆 + 规则约束，执行过程通过 evorule 引擎留下可审计的 Fact 链。**
+**Evo-Agent = LLM brain + tool hands + persistent memory + rule constraints; the execution process leaves an auditable Fact chain through the evorule engine.**
 
-它不重新发明状态机，也不内嵌 LLM 客户端。所有 LLM 调用、工具调用、记忆读写都转成 evorule 的 `IoRequest` 事件，由 evorule 反应器负责执行、回滚、审计 —— Agent 层只关心"下一步该干什么"。
+It does not reinvent state machines, and it does not embed an LLM client. All LLM calls, tool calls, and memory reads/writes become evorule `IoRequest` events; the evorule reactor handles execution, rollback, and audit — the agent layer only decides "what to do next". Mechanism and application stay in separate processes talking over a single HTTP contract, so the determinism / auditability boundary is never polluted by business logic.
 
-### 三种 AI 角色
+### Three AI roles
 
-| 角色 | 说明 | 对应 Agent |
-|------|------|------------|
-| **规则创建助手** | 自然语言 → JSON 规则（LLM 生成 + G1-G7 校验 + 热重载） | `rule-copilot` |
-| **AI 执行器** | 通过 `call_external` 执行 LLM/工具调用，受规则约束 | `general` / `researcher` |
-| **对话管理入口** | 自然语言管理规则生命周期（创建/提交/激活/归档） | `rule-copilot` |
+| Role | Description | Agents |
+|------|-------------|--------|
+| **Rule-creation assistant** | natural language → JSON rules (LLM-generated, schema-validated, hot-reloaded) | `rule-copilot` |
+| **AI executor** | performs LLM/tool calls via `call_external`, constrained by rules | `general` / `researcher` |
+| **Conversation management entry** | manages rule lifecycles in natural language (create/submit/activate/archive) | `rule-copilot` |
 
-### 30 秒看一眼
+### 30-second look
 
-![evo-agent CLI 概览](docs/evo-agent-cli.gif)
+![evo-agent CLI overview](docs/evo-agent-cli.gif)
 
-*真实终端录制：`evo-agent list` / `tools show` / `validate` / `tools list` —— 15 个内置工具的 3 层安全模型（active 白名单 / candidate 待批 / blocked 永不）。*
+*Real terminal recording: `evo-agent list` / `tools show` / `validate` / `tools list` — the 3-tier security model (active whitelist / candidate pending / blocked never) of the 15 built-in tools.*
 
----
+### Which entry point do you need?
 
-## 核心特性
-
-| 特性 | 说明 |
-|------|------|
-| **完整 Fact 闭环** | 每次 LLM 调用、工具调用、记忆读写都生成可审计 Fact，支持 rewind / replay / diff |
-| **三层记忆** | 共享记忆（`shared.{ns}.{key}`）/ 会话记忆 / 短期消息，跨会话可追溯 |
-| **跨会话共享事实** | `SharedFactsLog` WAL 持久化 + rollup 标记 + 按 ID 审计回溯 |
-| **记忆事件链** | 结构化事件提取 + 因果链 + 确定性回放（`replay` 命令） |
-| **会话沉淀** | 会话结束时自动写入摘要 + 稳定事实到共享空间 |
-| **工具注册中心** | `ToolRegistry` + `ToolFunction` trait，任何 `async fn(JsonValue) -> Result<JsonValue, String>` 都能注册 |
-| **3 层安全模型** | active（白名单）/ candidate（待批）/ blocked（永不），含 SSRF 防护 + 工作目录沙箱 |
-| **规则管理工具集** | 59 个工具（spec 数，测试锁定；serve 面默认暴露 62 = 内置 17 + 规则 45，sandbox/dataset/publish/production 共 14 个为已定义未入 serve 面的高级工具）：workspace 2 + rule 12 + translate 3 + audit 4 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + facts/version 1 + fact 追溯 2 + debug 观测 3 + hit-stats 2 + skill 装配 1 + meta 1 + evolution 2 + why/order 3 + verdict_submit 1 |
-| **工作流引擎** | DAG 拓扑编排多 Agent，同层并行 + 跨层串行 + 模板渲染 |
-| **MCP 客户端** | 接入 Model Context Protocol 工具生态（stdio 传输） |
-| **上下文窗口管理** | 按 token 数裁剪历史消息，保留 system + 最近若干轮 |
-| **审批系统** | CLI 交互审批 / HTTP 回调审批 / 自动批准三种模式 |
-| **HTTP + WebSocket + SSE** | REST API 启动 Agent，SSE 流式输出，WebSocket 双向通信 |
-| **REPL 交互模式** | 对话式复用同一 session，支持 `/rewind` 回滚 |
-| **可插拔 LLM/工具** | `LlmHandler` / `ToolHandler` trait，接入 OpenAI / MiniMax / DeepSeek 等 |
-| **零 unsafe** | `#![forbid(unsafe_code)]` 全栈适用 |
+| I want to… | Use |
+|---|---|
+| A ready-to-run desktop app | **Desktop shell** — installers on the [evo-agent-desktop Releases](https://github.com/evorule/evo-agent-desktop/releases) page |
+| A CLI agent in my terminal | **CLI** — this repo, `cargo build` (below) |
+| HTTP API + built-in Web IDE workbench | **serve mode** — `evo-agent serve`, the workbench is hosted by the same process |
 
 ---
 
-## 架构：2-Loop 解耦
+## Quick Start
 
-Evo-Agent 是独立的应用层，通过 HTTP API 与 evorule 引擎对话：
+Prerequisites: Rust 1.74+, a running evorule-server (default `http://127.0.0.1:18080`), and an LLM provider API key.
 
-```
-┌──────────────────────────────┐         ┌──────────────────────────────┐
-│  Evo-Agent (应用层)           │         │  evorule-server (机制层)      │
-│                              │         │                              │
-│  ┌──────────────────────┐    │         │  ┌──────────────────────┐    │
-│  │  Application Loop    │    │         │  │  Reactor Loop        │    │
-│  │                      │    │         │  │                      │    │
-│  │  for step in 0..N:   │    │         │  │  drain command       │    │
-│  │    LLM call  ───┐    │    │  HTTP   │    │  stable detect       │    │
-│  │    parse resp   │    │    │ ──────> │    │  block on cmd_rx     │    │
-│  │    handle io_   │    │    │ <────── │    │  while pending_io=0: │    │
-│  │      request    │    │    │   SSE   │    │    execute_transition│    │
-│  │    POST io_resp │    │    │         │    │                      │    │
-│  └──────────────────────┘    │         │  └──────────────────────┘    │
-│           ▲                  │         │           │                  │
-│           │                  │         │           ▼                  │
-│  ┌────────┴─────────┐        │         │  ┌──────────────────────┐    │
-│  │ MemoryManager    │        │         │  │ FactsLog (append)    │    │
-│  │ ToolRegistry     │        │         │  │ + causal chain       │    │
-│  │ AgentDefinition  │        │         │  │ + WAL + SharedFacts  │    │
-│  │ ContextWindow    │        │         │  └──────────────────────┘    │
-│  │ WorkflowEngine   │        │         │                              │
-│  │ McpClient        │        │         │                              │
-│  └──────────────────┘        │         │                              │
-└──────────────────────────────┘         └──────────────────────────────┘
-```
+### 5-minute demo (one command)
 
-**为什么分开？** 把"机制"和"应用"塞进同一个进程，会导致确定性、可审计性、可形式化验证的边界污染。EvoRule 的 TCB 永远只做加减与因果链，EvoAgent 的所有业务逻辑都在它之外。HTTP 是它们的唯一契约。
-
----
-
-## 快速开始
-### 使用建议（避免大工作区超时）
-
-- **用独立 workdir 跑真实任务**：不要把源码仓（含 `target/` 等编译产物）直接当 agent 工作目录；
-  建议 `evo-agent run --workdir <你的项目目录>` 指向干净的项目目录。
-- **读文件优先 `file_read`**，列目录用 `file_list`；只有在不确定文件位置时才用 `search_files` / `grep_files`。
-- **全树搜索默认排除大目录**：`search_files` / `grep_files` 默认跳过 `target` / `node_modules` / `.git` / `.evo-trash` / `data`；
-  还可传 `exclude`（search_files）或 `excludeGlobs`（grep_files）追加排除，例如 `["vendor", "dist"]`。
-- **上下文窗口已显式配置**：各 agent 定义 `agents/<name>.json` 已声明 `context_window_tokens = 32768`
-  （MiniMax-M2.5 支持 204800），长任务历史不易被裁剪；可按模型实际能力调整。
-- **workspace 目录跨会话持久**：agent 可写目录（`workspace/`）在会话结束后不自动清理；
-  自动化脚本、批跑驱动或测试装置复用同一目录前，请先显式清场（删除上轮产物）或改用独立
-  workdir——残留文件会静默改变后续运行的前提（如「文件已存在」「读到上轮内容」），使断言
-  与实验结论失真。
-
-
-### 前置条件
-
-- Rust 1.74+
-- 运行中的 evorule-server（默认 `http://127.0.0.1:18080`）
-- LLM provider 的 API key
-
-### 5 分钟 Demo（一条命令）
-
-准备一个 MiniMax API key（或 DeepSeek），然后：
+Prepare a MiniMax API key (or DeepSeek), then:
 
 ```bash
 # Windows (PowerShell)
@@ -125,474 +54,131 @@ export MINIMAX_API_KEY=your-api-key
 ./demo.sh
 ```
 
-脚本自动完成：下载并启动 evorule-server（Gitee Release 整包，端口 18080，随机 token 认证）→ 写入项目配置 → 构建 → 跑一笔费用登记会话（LLM + 工具调用全部转为可审计 Fact）→ 调用 `audit/verify` 验证 Fact 哈希链并打印完整审计报告。完成后浏览器打开 http://localhost:18080 可查看审计页。重置：删除 `.demo/` 目录即可。
+The script automatically: downloads and starts a pinned evorule-server release (resolved via the Gitee release API at runtime; port 18080, random token auth) → writes the project config → builds → runs an expense-registration session (LLM + tool calls all become auditable Facts) → calls `audit/verify` to check the Fact hash chain and print a full audit report. Open http://localhost:18080 in a browser afterwards to see the audit page. Reset by deleting the `.demo/` directory.
 
-### 依赖契约
+### Dependency contract
 
-evo-agent 自 2026-09-20 起与 evorule 仓完全解耦：Cargo 依赖面仅第三方 crates，
-不引用任何 `evorule-*` crate，与 evorule-server 的交互只走 HTTP/WS 协议——clone 本仓后直接构建：
+Since 2026-09-20 evo-agent is fully decoupled from the evorule repo: the Cargo dependency surface is third-party crates only — no `evorule-*` crate dependencies; all interaction with evorule-server goes over HTTP/WS. Clone and build directly:
 
 ```bash
-git clone https://gitee.com/evorule/evo-agent.git
+git clone https://github.com/evorule/evo-agent.git
 cd evo-agent
-cargo build          # 依赖自动从 crates.io 解析
+cargo build          # dependencies resolve from crates.io automatically
 ```
 
-- **禁止 `evorule-*` 依赖**：本仓是 Agent 编排层，不依赖 evorule 仓机制层代码（TCB / Reactor）；
-  `verify.ps1` 第 4 步（依赖契约断言）会在 Cargo.toml 出现任何 `evorule-*` 依赖时判 FAIL。
-- 运行时仍需一个可达的 evorule-server 实例（见下节）。
+`verify.ps1` asserts this contract: any `evorule-*` dependency appearing in Cargo.toml fails the check. A reachable evorule-server instance is still required at runtime.
 
-### 启动 evorule-server
+### Start evorule-server
 
 ```bash
 cd ../evorule-server
 cargo build --release
 
-# 基础启动（审计 / 记忆 / 时间机器 / 规则热重载）
+# basic start (audit / memory / time machine / rule hot-reload)
 ./target/release/evorule-server --addr 127.0.0.1:18080 --wal-dir ./data/wal
 
-# 若需 rule-copilot / general / researcher 通过 call_external 调用外部服务，
-# 必须额外挂载服务注册表并放行本机回环（详见 evorule-server/README.md）：
+# for rule-copilot / general / researcher to reach external services via
+# call_external, also mount the service registry and allow loopback
+# (see the evorule-server README):
 ./target/release/evorule-server --addr 127.0.0.1:18080 --wal-dir ./data/wal \
   --service-registry ./service_registry.json --allow-loopback
 ```
 
-> 角色 1/3（`call_external`）在 evorule-server 侧已就绪：挂载 `service_registry.json` 后即可跑通。仓库内置 `echo_server.py` + `dev-start.sh` 演示环境，参考 evorule-server 实战指南。
+> Consumable services come from three sources: server built-ins (native), external plugin packs (separate service processes with a `plugin.json` manifest — see evorule-server `docs/PLUGIN_GUIDE.md`), and registry bindings. At startup the agent discovers available services via the service-reconciliation endpoint and registers configured ones as local tools; services declaring parameter contracts get tool schemas generated automatically so the LLM can call them with real arguments.
 
-> **外部插件包生态**：evo-agent 可消费的服务来自三种来源——server 内置（native）、外部插件包（独立服务进程 + `plugin.json` 声明清单，规范见 evorule-server 仓 `docs/PLUGIN_GUIDE.md`）、注册表绑定（registry）。agent 启动期经服务对账端点发现可用服务，按配置白名单注册为本地工具；声明了参数契约的服务会自动生成工具 schema，LLM 可带参真实调用。
-
-### 启动 Evo-Agent HTTP API
+### Start the Evo-Agent HTTP API
 
 ```bash
 cargo run --release -- serve --port 8081
 ```
 
-> #### ⚠️ 生产行为变更（SG-0 fail-closed）
+> **Production behavior change — fail-closed by default.** `serve` no longer silently disables auth. Without any auth configuration the behavior splits by bind address:
 >
-> `serve` 的鉴权缺省**不再**是「静默 disabled」。无任何鉴权配置时按绑定面分流：
->
-> | 鉴权配置 | 绑定 | 行为 |
+> | Auth config | Bind | Behavior |
 > |---|---|---|
-> | 已配 token（`--auth-token` / `evo-agent.toml` `[auth]` / `EVO_AGENT_AUTH__TOKENS`） | 任意 | 正常放行 |
-> | 显式 `--no-auth` | 任意 | 豁免拒起 + 显著告警（本地开发用） |
-> | 无 token（缺省） | 回环（`127.0.0.1` / `::1` / `localhost`） | 降级放行 + **显著告警** |
-> | 无 token（缺省） | 非回环（`0.0.0.0` / `::` / 具体 IP） | **拒起，exit 1** |
+> | token configured (`--auth-token` / `evo-agent.toml` `[auth]` / `EVO_AGENT_AUTH__TOKENS`) | any | normal operation |
+> | explicit `--no-auth` | any | exempted start with a prominent warning (local development) |
+> | no token (default) | loopback (`127.0.0.1` / `::1` / `localhost`) | degraded start + **prominent warning** |
+> | no token (default) | non-loopback (`0.0.0.0` / `::` / a specific IP) | **refuses to start, exit 1** |
 >
-> **升级影响**：把 agent API 暴露到回环之外**必须**配 token，否则进程拒绝启动。
-> 原本依赖裸 `serve --port 8081` 的本机/内网部署，升级后会看到显著告警——
-> 这是预期行为；确认「仅本机可达 + 明知无鉴权」可显式加 `--no-auth` 消除告警。
->
-> 启动横幅的守卫标签按**实际**状态渲染：鉴权关闭时显示 `(OPEN, NO AUTH)`，
-> 不再出现「横幅标 `(auth)`、实际却全开」的误导。详见 `docs/API.md` §1。
+> Exposing the agent API beyond loopback **requires** a token. The startup banner's guard label renders the **actual** state (auth off shows `(OPEN, NO AUTH)`). Details in [docs/API.md](docs/API.md).
 
-### 打开工作台（Web IDE）
+### Open the workbench (Web IDE)
 
-serve 同时托管内置的 IDE 工作台（Trae 式布局：左文件树 / 中编辑器 / 右对话侧栏 / 底部审计抽屉），风格与 evorule 设计体系一致：
+`serve` also hosts the built-in IDE workbench (file tree left / editor center / chat sidebar right / audit drawer bottom):
 
 ```bash
-# 首次使用先构建前端（产物在 web/dist，已 gitignore）
+# build the frontend once (output in web/dist, gitignored)
 npm --prefix web install && npm --prefix web run build
 
 cargo run --release -- serve --port 8081
-# 浏览器打开 http://127.0.0.1:8081/ 即工作台
+# open http://127.0.0.1:8081/
 ```
 
-- 右侧对话侧栏直连 agent 会话（WS 双向流，见 API.md §6），真实模型流式回复
-- 会话生命周期：会话为运行时实体——引擎服务重启或会话闲置 30 分钟被 TTL 回收后，向旧会话发送消息将触发前端自动新建会话并明示（重发即可继续）
-- 对话历史：「历史」面板列出近期会话（serve 本地索引），点击恢复完整消息记录（见 API.md §11），离开工作台再回来历史完整可见；每轮结束自动落本地消息快照（`data/snapshots/YYYY/MM/DD/`），引擎会话闲置 30 分钟被 TTL 回收后恢复自动回落快照并明示来源；「历史」面板顶部可配置快照保留期（1 天/1 个月/3 个月/半年/1 年/长期，缺省 3 个月，见 API.md §11.3）。快照为展示层非权威副本，审计真相源仍是 evorule FactsLog（永不删除）
-- 左侧文件树浏览工作目录（懒加载展开），点击文件在中栏编辑器打开
-- **语言服务器接入（LSP）**：打开 `.rs`/`.ts`/`.js` 文件自动接入对应语言服务器（rust-analyzer / typescript-language-server，PATH 检测，缺失灰置并给安装引导），提供补全 / hover / 跳转定义 / 文档符号 / 实时诊断（进问题面板与顶栏计数，与 JSON/Markdown 校验同源）；崩溃自动退避重启（60s 窗口 3 次），超限出横幅并可在命令面板 `LSP: 重启` 恢复；设置 `lsp.enabled` 总开关；语言服务器经本地 stdio 通信、零外发（见 docs/TELEMETRY.md）
-- **任务运行**：工作区 `.evo/tasks.json` 定义任务（对齐 VS Code 字段名的简化集），底部「输出」面板多通道呈现（系统流水+每任务通道，file:line:col 错误行点击直达编辑器，内置 rustc/tsc 错误解析进问题面板）；首跑确认框列明命令原文（一次性信任）；**任务永不自动运行**、仅由人的显式动作发起（命令原文全留痕治理日志）；两段式取消（优雅→超时强杀树）；Ctrl+Shift+B 运行生成任务
-- **集成终端**：底部「终端」tab，xterm 6 多实例（chips 切换/新建/关闭/清屏），真实 PTY（Windows PowerShell→CMD→Git Bash 发现序，unix `$SHELL`；`terminal.shell` 可指定）；选区 Ctrl+C=复制否则中断、Ctrl+F 查找、右键/粘贴、中文宽度修正、WebGL 渲染；输出风暴背压不卡 UI；关闭/断连即回收进程树；**治理分级（人机双轨）**：终端是用户自有通道——会话创建/关闭留痕治理日志（审计 tab 可见），会话内命令不经过审批（UI 明示）；agent 的命令执行仍走既有三层审批，两通道互不相通
-- 编辑器多 tab（Monaco 内核），`Ctrl+S` 保存落盘——与 agent 写文件走同一 file 工具实现（同 workdir 沙箱与安全校验，见 API.md §7）
-- 底部多 tab 面板（中栏底部、拖拽调高、可折叠）：「输出」呈现系统事件流水、「审计」呈现当前会话治理事件流（工具调用/审批/错误）并提供「在审计页查看」深链跳转 console 审计页（`?session=<id>` 定位；默认 `http://localhost:5174`，localStorage `evo_console_origin` 可改）；控制台日志/时光机器/记忆为占位待后续阶段（集成终端与问题面板已上线，见上）。深链点击前自动探活——console 未运行时就地明示引导，不跳死链
-- **console 审计页自动拉起（可选配置）**：在 `evo-agent.toml` 配置 `[workbench] console_dir = "<console-cloud 仓目录>"`（可选 `console_port`，缺省 5174）后，serve 启动期检测该端口未监听时自动以子进程拉起 console dev server（fail-soft：目录无效/依赖缺失/端口占用仅告警；子进程输出落 `data/console_sidecar.log`）。缺省不配置 = 无任何副作用
-- 审批卡交互：agent 触发候选工具审批时，对话侧栏审批卡可直接「批准/拒绝」（走 §4.4 既有审批通道，60s 超时自动拒绝；WS 审批帧两阶段时序见 API.md §12.2）
-- **agent 产物协作编辑**：agent `file_write` 写文件成功后，产物自动在编辑器打开并登记（对话侧栏出现「agent 产物」卡，可随时点回编辑器）；编辑器顶部出现产物条——「查看与草稿差异」切 diff 视图（左=agent 草稿基线、右=当前可编辑），直接增删改，`Ctrl+S` 保存即定稿（产物条与产物卡实时显示草稿/已定稿状态与时间）；草稿基线与定稿留痕为工作台展示层记录（localStorage，不入审计链），按会话持久化、切会话自动载入
-- 顶栏治理徽标：白名单（agent 工具数）+ 信号（当前会话违规信号累计，见 API.md §12.1），均 fail-soft
-- 未构建前端时 serve 自动降级为纯 API 模式，不影响既有用法
+The chat sidebar connects directly to agent sessions (bidirectional WebSocket with real model streaming); files open in the Monaco-based multi-tab editor; tool-approval cards can be approved/rejected in place; agent-written artifacts open for collaborative diff editing; the bottom panel hosts output/audit tabs plus an integrated terminal and task runner (human-only channels — session/terminal commands are user-owned and logged, while agent command execution keeps its own three-tier approval). Without a frontend build, `serve` degrades to pure API mode automatically. Full protocol: [docs/WORKBENCH_API.md](docs/WORKBENCH_API.md).
 
-### 跑一个 Agent
+### Run an agent
 
 ```bash
 curl -X POST http://127.0.0.1:8081/agents/researcher/run \
   -H "Content-Type: application/json" \
-  -d '{"agent_type": "researcher", "goal": "总结当前目录的 README"}'
+  -d '{"agent_type": "researcher", "goal": "Summarize the README in this directory"}'
 ```
 
 ---
 
-## CLI 用法
-
-```text
-evo-agent run <goal>                    # 跑 agent（给一个 goal + 可选 agent 类型）
-evo-agent list                           # 列出 agents/ 目录下的所有 agent
-evo-agent tools list                     # 列出 15 个内置工具（3 层安全模型）
-evo-agent tools show <name>              # 显示单个工具的 active/candidate/blocked 详情
-evo-agent validate <agent>               # 校验 agent.json 是否合法
-evo-agent config                         # 显示合并后的配置
-evo-agent serve --port 8081              # 启动 HTTP server（启动期预载校验全部 agent 档案，坏档案 fail-fast）
-evo-agent patrol --session <id> --workspace <ws_id>  # 进化巡视（一次性任务，见下文）
-evo-agent workflow <workflow_id>         # 执行多 agent DAG 工作流（--plan-execute 走 plan-execute 全链路）
-evo-agent repl                           # REPL 交互模式（复用同一 session）
-evo-agent replay --session <id>          # 回放 session 的记忆事件链
-```
-
-### patrol（进化巡视任务模式）
-
-一次性自进化巡视：**信号探查 → agent 起草 → 闸门一证据组装 → 治理链提名 → 结构化 JSON 巡视报告**。触发器在本进程（可由 cron/运维脚本按需调起），server 侧零自治循环——每次调用只执行一次。
+## Installation
 
 ```bash
-# 巡视指定会话的进化信号,有信号则自动完成起草与提名(默认 rule-copilot 档案)
-evo-agent patrol --session 42 --workspace 01ABC...
-
-# 巡视报告追加写入文件(调度器按时间序列归档)
-evo-agent patrol --session 42 --workspace 01ABC... --out patrol-report.jsonl
+cargo build --release                      # build the binary
+cargo install --path .                     # install `evo-agent` onto PATH
 ```
 
-行为语义：
-
-- **无信号**：零动作静默退出（exit 0），报告 `status=no_signal`（一行 JSON 打印到 stdout，供调度器消费）。
-- **有信号**：轮A agent 拉取信号明细并起草约束层草稿（rule_create → rule_submit → rule_versions），进程侧组装闸门一沙盒证据（数据集 → 沙盒 → 关闭），轮B agent 携证据调用 `rule_promote` 提名进入人审队列；报告 `status=nominated` 含 `queue_id`。草稿必须是 **enforce 拦截型**（`transform` 条目 `type=enforce`，`params` 必含 `domain` 与非空 `reason`，拦截条件写在 `params.domain` 内，严禁条目级 `condition` 等未知键）——提取后先经提交期结构校验（与 server schema 门禁同口径），失败即 fail-fast 落报告退出（报告 `error` 字段携带校验错误、`draft_json` 留存原始草稿），不带病进入轮B与提交链路。
-- **重复提名**：同一目标规则的提名已存在（pending 待审或 published 已发布）时，server 侧双态去重门禁拒绝（409），报告 `status=duplicate_rejected`——提名权仍在人审闭环内，agent 面无审批通道。
-
-### run
-
-```bash
-# 用 researcher agent 跑任务
-MINIMAX_API_KEY=sk-... \
-  evo-agent run "总结一下 README" -a researcher
-
-# 流式输出（token-by-token）
-evo-agent run "分析代码结构" -a researcher --stream
-
-# 自动批准 candidate 工具
-evo-agent run "执行构建脚本" -a general --auto-approve-candidates
-```
-
-### repl
-
-```bash
-evo-agent repl -a general
-# > 帮我查看当前目录结构
-# > /session        # 显示当前 session ID
-# > /rewind 3       # 回滚到版本 3
-# > /exit
-```
-
-### replay
-
-```bash
-# 回放全部事件（按时间线）
-evo-agent replay --session 123
-
-# 从 E005 沿因果链回溯
-evo-agent replay --session 123 --event E005
-
-# 回放某实体的所有事件
-evo-agent replay --session 123 --entity pet_doudou
-
-# LLM 自然语言叙述（temperature=0，事实不变）
-evo-agent replay --session 123 --narrate
-```
-
-### workflow
-
-```json
-// rules/workflows/research_and_write.json
-{
-  "workflow_id": "research_and_write",
-  "nodes": [
-    { "id": "research", "agent_type": "researcher", "task": "调研 Rust 异步生态", "depends_on": [] },
-    { "id": "write", "agent_type": "general", "task_template": "基于调研结果写报告：\n{research}", "depends_on": ["research"] }
-  ],
-  "output_node": "write"
-}
-```
-
-```bash
-evo-agent workflow research_and_write
-
-# 公式计算场景（v1.3）：LLM 节点只采集参数，求和/工期/日均/钳制全部由
-# compute 纯函数确定性核算（见 rules/workflows/budget_review.json）
-evo-agent workflow budget_review
-
-# 缴税通知单场景：compute 承担简单封闭计算（应税所得核定）；税档级联走
-# UDF 宏（call_service）、文档生成走 template_render——三者选型边界见
-# evorule-server docs/WASM_UDF_GUIDE.md §5.1（见 rules/workflows/tax_statement.json）
-```
-
-工作流 DSL 支持 workflow_dag v1.0/v1.1/v1.2/v1.3 四版本并存（按文档形态自动分派）：
-v1.1 节点级条件分支 `run_when`（求值为假跳过，豁免级联）；v1.2 新增有界循环
-`loops`（加载时静态展开为线性副本链，展开后仍是纯 DAG）与纯函数节点 `compute`
-（封闭目录 `strcmp`/`numeric_cmp`/`regex_match`，不经 LLM、无 IO、无副作用，
-典型用法为循环收敛门控：结果与上一轮一致即提前退出）；v1.3 将 compute 封闭
-目录扩展至 27 种（算术/字符串/日期/逻辑四族），同输入必同输出、全部 fail-fast
-（除零/溢出/越界/日期域外/词表外即节点失败终止），典型用法为公式计算场景：
-LLM 节点只采集参数，算术全部由 compute 节点确定性核算（示例
-`rules/workflows/budget_review.json`）。
-
-执行失败或预算耗尽时由外层驱动循环（`src/agent/driver.rs`）按 replan 判定函数
-决定是否触发重规划：丢弃式重规划——失败摘要 + 计划结构喂给 planner 产出下一版
-PlanFact，物化后全新执行（已执行结果不注入），replan 硬上限默认 3 次
-（`--max-replan`/`--max-wall-ms`/`--max-tokens` 可调，后者为累计 token 预算，
-不指定不限）。plan-execute 全链路（planner 先产计划
-再执行）加 `--plan-execute`：
-
-```bash
-# PlanExecute 模式：载入工作流作为 planning probe（单 planner 节点），
-# 其输出解析为 PlanFact v1 → 物化 → 执行
-evo-agent workflow research_plan --plan-execute
-
-# Dsl 模式：手写 workflow 即 v1 计划直接执行；失败触发 replan 时
-# 由 planner 产出 PlanFact v2 修复重跑（见 rules/workflows/replan_drill.json）
-evo-agent workflow replan_drill
-
-# D-01 enforce 演练：节点 model 非白名单 → TCB 门产生 Violation →
-# 驱动判别后终止整个循环且不 replan（宪法违规一票否决，§9.5.1-B）
-evo-agent workflow enforce_drill
-
-# replan 硬上限防抖演练：合规节点成功后接必败节点，--max-replan 0
-# 使判定序第 1 步（硬上限）直接终止并显式传播错误
-evo-agent workflow ok_then_fail_drill --max-replan 0
-
-# planner 重试演练（真实 LLM E2E 场景 E 入口）：planner 首答非法 JSON →
-# 提取错误反馈重试 → 反馈分支输出合法 PlanFact → v1 物化执行成功
-evo-agent workflow retry_drill --plan-execute
-```
-
-执行成功时输出统计行（Phase 2 起含成本埋点）：
-
-```text
-=== workflow 'research_plan' done (plan_versions=1 replans=0 nodes_executed=3
-wall_ms=81234 repeated_nodes=0 tokens_used=18745 replan_tokens=0) ===
-```
-
-- `repeated_nodes`：replan 产物中与已执行节点（同 id 同 agent_type）的幂等重复
-  计数——warn 放行（丢弃式接受重复成本）；PlanFact 中声明 `file_write`/`shell_exec`
-  写类工具的节点则直接拒绝提交（防御深度二道闸）
-- `tokens_used`：全程 LLM token 消耗（provider `usage` 汇总，仅供观测）
-- `replan_tokens`：v2+ 各版执行 + replan planner 调用自身消耗（重复执行成本上界，
-  为增量式 replan 策略积累判定数据）
-
-planner 产出的 PlanFact 若无法解析为 JSON，驱动会带提取错误反馈重试 1 次
-（全程硬上限 2 次 planner 调用），仍失败则整体终止，不猜测不静默。
-
-#### workflow 任务标记（协作留痕）
-
-workflow 执行时驱动会创建一个标记会话（`initial_content={"kind":"workflow_run",
-"workflow_id":...}`），每个节点执行成功后向该会话提交一条中性完成信号
-`set meta_signal.node_done=<node_id>`（信号提交失败即终止工作流——留痕是硬义务）。
-信号本身不含任何任务语义；「节点完成→任务标记」的裁决完全在规则层：
-治理规则（如 `rules/governance/collab_task_marks.json`，业务规则 branch 壳+set，
-部署到 server 规则目录后生效）监听信号并将 `meta_task.due_diligence_done` /
-`meta_task.implemented` / `meta_task.closed` 等标记写入会话状态。机制层生产信号、
-规则层裁决标记，二者分离——调整协作纪律只需改规则，零发版。示例工作流
-`collab_dd_impl_close`（尽调→实施→核收三节点）即按此协作纪律运行。
-
-#### 协作验收规则（协作纪律强制）
-
-约束层的处置决策同样上移规则层：`rules/governance/00_constraint_collab_acceptance.json`
-（宪法级约束，`tier="constraint"`，经治理链晋升发布）含三条 enforce 哨兵——
-R1 边界强制（工具意图 `meta_tool.pending_target_scope=out_of_sandbox` 即 Halted）、
-R2 实施前置（`meta_workflow.phase=implementation` 要求 `meta_task.due_diligence_done`
-已置——未尽调不得实施）、R3 核收前置（`phase=closure` 要求 `meta_task.implemented`
-已置——未实施不得核收）。违规指令被引擎丢弃并发射 Violation（归因 rule_index+reason）。
-
-机制层配合：runner 对 file 类工具调用先解析目标落点为规范字段
-`meta_tool.pending_target_scope`（vs 能力边界沙箱根）并随指令进链由 R1 裁决，
-handler 内联沙箱检查保留为兜底防线；workflow 引擎对每个 LLM 节点 delegate 前
-向标记会话提交阶段信号 `set meta_workflow.phase=<node_id>`（R2/R3 裁决前置条件），
-节点成功后即时提交完成信号打标（下一节点的门可见前置标记）——门/打标严格配对。
-被拦即 `enforce violation:` 错误终止（不 replan）；规则未部署时意图 set 照常留痕、
-内联兜底拒绝，双层各司其职。
+For a packaged desktop application (no Rust toolchain needed), use the [evo-agent-desktop](https://github.com/evorule/evo-agent-desktop/releases) installers.
 
 ---
 
-## Agent 定义
+## Usage
 
-Agent 配置从 `agents/{type}.json` 加载：
+Curated CLI selection — the complete command reference lives in [docs/CLI.md](docs/CLI.md).
 
-```json
-{
-  "agent_type": "researcher",
-  "version": "0.1.0",
-  "description": "研究型 Agent",
-  "system_prompt": "You are a careful research assistant.",
-  "model": "MiniMax-M2.5",
-  "temperature": 0.3,
-  "max_steps": 20,
-  "step_timeout_secs": 60,
-  "tools": ["file_read", "search_files", "file_list"],
-  "memory": {
-    "type": "persistent",
-    "namespace": "researcher",
-    "message_persist": { "mode": "every_message" },
-    "max_session_summaries": 3,
-    "max_injected_events": 5,
-    "enable_event_extraction": true
-  },
-  "context_window_tokens": 32768,
-  "parallel_tools": 1
-}
+```bash
+evo-agent run "Summarize the README" -a researcher      # run an agent
+evo-agent repl -a general                               # interactive REPL on one session
+evo-agent patrol --session 42 --workspace 01ABC...      # one-shot evolution patrol
 ```
 
-### 内置 Agent
+```bash
+evo-agent workflow research_and_write      # multi-agent DAG workflow
+evo-agent workflow budget_review           # LLM nodes collect parameters; compute pure
+                                           #   functions do the deterministic math (v1.3)
+```
 
-| Agent | 说明 | 工具 |
-|-------|------|------|
-| `general` | 通用 Agent — 文件操作 + Shell + Web + 规则消费与起草（白名单 28 工具，含 `evolution_signals` 只读信号感知） | file_*（6）, search_files, grep_files, git_status/diff/log, shell_exec, http_get, rule_list/get/versions/version_get/validate/create/update/submit, knowledge_datasets/search/entry_get, audit_get, meta_summary, evolution_signals |
-| `researcher` | 研究 Agent — 只读搜索 | file_read, search_files, file_list |
-| `rule-copilot` | 规则协作 Agent — 23 个规则管理工具（白名单，实测） | ws_list, ws_create, rule_list/get/create/update/versions/version_get/submit/activate/block/archive/fork/reload, rule_to_transform, rule_to_conditional, rule_validate, audit_get, audit_verify, session_rewind, meta_summary, evolution_signals, rule_promote |
+The workflow DSL supports workflow_dag v1.0–v1.3 side by side (conditional branching, bounded loops, pure-function `compute` nodes with a closed 27-function directory — deterministic, fail-fast). On failure the driver can trigger discard-style replanning (hard cap 3 by default; `--plan-execute` enables the full plan-execute pipeline). Full semantics and drills: [docs/CLI.md](docs/CLI.md).
 
----
+### Memory
 
-## 记忆系统
+| Tier | Path format | Purpose | Lifetime |
+|------|-------------|---------|----------|
+| Shared memory | `shared.{ns}.{key}` | cross-session shared knowledge | permanent (WAL persisted) |
+| Session memory | `{ns}.sessions.{sid}.{key}` | per-session private state | during session |
+| Short-term messages | `{ns}.sessions.{sid}.messages.{idx}` | conversation history | during session |
 
-### 三层记忆
-
-| 层级 | 路径格式 | 用途 | 生命周期 |
-|------|----------|------|----------|
-| 共享记忆 | `shared.{ns}.{key}` | 跨会话共享知识 | 永久（WAL 持久化） |
-| 会话记忆 | `{ns}.sessions.{sid}.{key}` | 单会话私有状态 | 会话期间 |
-| 短期消息 | `{ns}.sessions.{sid}.messages.{idx}` | 对话历史 | 会话期间 |
-
-所有记忆通过 `POST /api/sessions/{id}/payload` 写入 evorule，记忆本身就是 Fact，可回放、可审计。
-
-### 跨会话共享事实
-
-当 session 写入 `shared.*` 路径的 PayloadUpdate 时，evorule-server 同步广播到 `SharedFactsLog`：
-
-- **WAL 持久化**：重启后自动恢复历史共享事实 + 元数据
-- **Rollup 标记**：已合并的旧事实从 prefix 查询中过滤，但 `fact_by_id` 仍可访问（审计可追溯）
-- **来源追踪**：每条共享事实记录 `source_session_id`
-
-### 记忆事件链
-
-会话运行期间，`EventExtractor` 从对话中提取结构化事件：
-
-- 实体（Entity）：人物、地点、物品等
-- 事件（Event）：带因果链的 `cause_fact_id` 锚点
-- 叙事（Narrative）：LLM 生成的自然语言描述
-
-会话结束时通过 `replay` 命令回放，支持按事件 ID、实体、方向（backward/forward）筛选。
-
-### 会话沉淀
-
-会话结束（Stable/Error 分支）时自动完成三级沉淀：
-
-1. **当前级**：messages 已由 `MessagePersistMode` 在运行时逐条写入
-2. **中期级**：整会话摘要写入 `shared.{ns}.sessions.{sid}.summary`
-3. **长期级**：稳定事实写入 `shared.{ns}.stable.{key}`
+All memory is written through `POST /api/sessions/{id}/payload` into evorule — memory itself is Fact: replayable and auditable. Writes to `shared.*` paths broadcast to the server-side `SharedFactsLog` (WAL persistence + rollup marks + source tracking), and a structured event chain (entities / events with causal anchors / narratives) supports deterministic `replay` after the session.
 
 ---
 
-## 工具系统
+## Configuration
 
-### 3 层安全模型
+Four-layer config loading (low → high priority; later layers override):
 
-| 层级 | 行为 | 示例 |
-|------|------|------|
-| **ACTIVE** | 直接执行，无需审批 | file_read/file_list/file_write/file_create/file_move/file_delete, search_files/grep_files, git_status/git_diff/git_log/git_stage/git_commit, shell_exec（8 命令白名单）, http_get（6 主机白名单） |
-| **CANDIDATE** | LLM 想用 → 返回 proposal → 用户审批 → 执行 | rm, mv, sed, chmod 等 20 个 shell 命令，任意公开 HTTP host |
-| **BLOCKED** | 永不批准 | sudo, python, bash, curl, kill 等 35 个逃逸命令，SSRF 黑名单 IP 段 |
-
-### 内置工具（15 个）
-
-| 工具 | 说明 |
-|------|------|
-| `file_read` / `file_list` / `file_write` / `file_create` / `file_move` / `file_delete` | 文件 I/O（工作目录沙箱，拒绝 `..` / 绝对路径 / symlink 逃逸） |
-| `search_files` / `grep_files` | 按内容搜索文件 |
-| `shell_exec` | 执行 Shell 命令（8 active + 20 candidate + 35 blocked 三层） |
-| `http_get` | HTTP GET 请求（6 主机白名单 + SSRF 防护） |
-| `git_status` / `git_diff` / `git_log` / `git_stage` / `git_commit` | git 只读 + 安全写（暂存/提交，拒绝危险 flag） |
-
-### 治理写权开关（agentTools.governanceWrite）
-
-治理写权默认**全开**（`true`，向后兼容，LLM 自运行的前提）。敏感领域部署（政府/军工/金融/医疗等）可在工作台设置一键关闭：
-
-| 配置 | 效果 |
-|------|------|
-| `agentTools.governanceWrite = true`（默认） | 46 个规则工具全量，现状零变化 |
-| `agentTools.governanceWrite = false` | **21 个治理写工具整体下线**（rule 写 8 + rule_promote + ws_create + sandbox_start/close + dataset_create + publish ×5 + bundle_export/bundle_import/bundle_import_dry_run），连 LLM 的工具 spec 都不出现（能力面不存在，非"调用被拒"）；25 个只读工具保留（查询/审计/knowledge/skill 装配/meta/evolution_signals/translate/validate 等） |
-
-说明：键为 `application` 作用域，**工作区层不可覆盖**（防项目级配置私自扩权 agent 工具面）；关闭后 LLM 仍可辅助「人起草」（rule_to_transform / rule_to_conditional / rule_validate 纯计算，不出网不落盘），提交/晋升/发布权回到人（console-cloud 审批流）。真正的保密企业通常跑内网自有模型、数据不出内网，此开关默认不干预其全开形态。
-
-### 动态源工具开关（agentTools.mcp / agentTools.serviceProxy）
-
-MCP 远端工具与服务代理工具为运行期动态注册（非静态工具面），各绑一个来源级总开关，默认**全开**（向后兼容，现状零变化）：
-
-| 配置 | 效果 |
-|------|------|
-| `agentTools.mcp = true`（默认） | `mcp.servers` 配置握手注册的 MCP 远端工具全量可用 |
-| `agentTools.mcp = false` | **MCP 动态工具整体下线**，连 LLM 的工具 spec 都不出现 |
-| `agentTools.serviceProxy = true`（默认） | 治理服务对账注册的服务代理工具全量可用 |
-| `agentTools.serviceProxy = false` | **服务代理工具整体下线**，连 LLM 的工具 spec 都不出现 |
-
-说明：与治理写开关同作用域语义（`application`，工作区层不可覆盖）；工具要进入某个 agent 的会话仍须其 `def.tools` 逐名声明——开关是来源级总闸，`def.tools` 是会话级聚焦。
-
-### 动态源工具裁决分级（agentTools.mcpAdjudication / agentTools.serviceProxyAdjudication）
-
-动态源工具的裁决分级独立于开关（开关管**在场性**，分级管**裁决性**，两键正交）。默认 **`sensitive`**：每次调用事前提交意图、经治理规则裁决并留账（意图必报）；人工分级后可降 `standard`（免意图裁决直执行，可执行性不变）：
-
-| 配置 | 效果 |
-|------|------|
-| `agentTools.mcpAdjudication = "sensitive"`（默认） | MCP 动态工具每次调用事前意图裁决留账 |
-| `agentTools.mcpAdjudication = "standard"` | MCP 动态工具免意图裁决直执行 |
-| `agentTools.serviceProxyAdjudication = "sensitive"`（默认） | 服务代理工具每次调用事前意图裁决留账 |
-| `agentTools.serviceProxyAdjudication = "standard"` | 服务代理工具免意图裁决直执行 |
-
-说明：同 `application` 作用域；分级键只作用于动态源条目——静态工具的治理分级以静态表为准，不受此键影响。
-
-### 规则管理工具集（52 个）
-
-通过 `rule_management_toolkit` / `full_rule_toolkit` 组装，用于 `rule-copilot` Agent：
-
-| 类别 | 工具数 | 说明 |
-|------|--------|------|
-| workspace | 2 | ws_list, ws_create |
-| rule | 12 | rule_list, rule_get, rule_create, rule_update, rule_versions, rule_version_get, rule_submit, rule_activate, rule_block, rule_archive, rule_fork, rule_reload |
-| translate | 3 | rule_to_transform, rule_to_conditional, rule_validate |
-| audit | 4 | audit_get, audit_verify, session_rewind, audit_export |
-| sandbox | 5 | 沙盒编排（fork + 合成数据 + 测试报告） |
-| dataset | 2 | 数据集管理 |
-| publish | 5 | 发布队列 + 三级权限 |
-| production | 2 | 生产环境管理 |
-| bundles | 5 | 规则包导入/列出/回滚 |
-| knowledge | 3 | 知识库检索 |
-| hit-stats | 2 | hit_stats（规则命中统计清单）+ hit_stats_series（单规则跨版本切片），均只读 |
-| skill 装配 | 1 | skill_pack_to_bundle（skill 规则壳 → 执行域快照包桥接，crate 算哈希+结构预检；恒出未验证 fail 包，pass 重出包走治理域通路） |
-| meta | 1 | meta_summary（L2 约束清单摘要） |
-| evolution | 2 | evolution_signals（进化信号拉取）+ rule_promote（约束层晋升提名） |
-| why/order | 3 | explain_denial（拒因解释+规则正本对账；io_guard 保留值拒因经事实自带命中记录闭环自证）+ causal_order（两事实因果序，链式哈希序）+ lineage_of（规则谱系=版本链+晋升账拼接），均只读 |
-
-### MCP 工具接入
-
-通过 MCP 客户端接入外部工具生态：
+1. **Defaults** — `Config::default()` in code
+2. **User config** — `~/.config/evo-agent/config.toml` (Linux/macOS) or `%APPDATA%\evo-agent\config.toml` (Windows)
+3. **Project config** — `./evo-agent.toml`
+4. **Environment variables** — `EVO_AGENT_*` prefix, `__` separating section/field
 
 ```toml
-# evo-agent.toml
-[[mcp.servers]]
-name = "filesystem"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-```
-
-MCP 工具自动注册为 `mcp_{server}_{tool}` 前缀，纳入 ToolHandler 统一管理。
-
----
-
-## 配置
-
-4 层配置加载（优先级低 → 高，后者覆盖前者）：
-
-1. **默认值** — 代码中 `Config::default()`
-2. **用户配置** — `~/.config/evo-agent/config.toml`（Linux/macOS）或 `%APPDATA%\evo-agent\config.toml`（Windows）
-3. **项目配置** — `./evo-agent.toml`
-4. **环境变量** — `EVO_AGENT_*` 前缀，`__` 分隔 section/field
-
-```toml
-# evo-agent.toml 示例
+# evo-agent.toml example
 [llm]
 provider = "minimax"
 api_key = "${ENV:MINIMAX_API_KEY}"
@@ -613,306 +199,61 @@ host = "127.0.0.1"
 port = 8081
 ```
 
-`api_key` 字段支持 `${ENV:VAR_NAME}` 占位符，加载时展开为环境变量值。
+`api_key` supports the `${ENV:VAR_NAME}` placeholder, expanded at load time.
+
+**Authentication**: HTTP clients read `EVORULE_SERVICE_TOKEN` (service identity; may write the protected `stable.llm` / `stable.system` domains) first, falling back to `EVORULE_AUTH_TOKEN` (user identity); when both are missing no auth header is sent (the server must be in dev mode).
 
 ---
 
-## HTTP API
+## Documentation
 
-### Evo-Agent 自有 API
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET` | `/health` `/metrics` `/version` | 健康检查 / Prometheus 指标 / 运行体身份 |
-| `GET` | `/admin/llm-status` | LLM 配置只读状态（脱敏） |
-| `GET` | `/agents` `/agents/{type}` | 列出所有 Agent / 查看定义 |
-| `POST` | `/agents/{type}/run` | 启动一个 Agent 运行（同步） |
-| `POST` | `/agents/{type}/run/stream` | SSE 流式执行 |
-| `POST` | `/agents/{type}/cancel` `/agents/{type}/approve` | 取消 / 审批 |
-| `GET` | `/agents/{type}/memory/evidence` `/agents/{type}/memory/recall` | 记忆证据 / 语义召回 |
-| `GET` | `/api/sessions` `/api/sessions/{id}/transcript` `/api/sessions/{id}/ws` | 会话索引 / 消息历史 / WebSocket |
-| `GET` | `/api/sessions/{id}/events` `/api/sessions/{id}/replay` `/api/sessions/{id}/evolution-signals` | 记忆事件 / 因果回放 / 进化信号 |
-| `GET\|PUT` | `/api/workbench/config` `/api/workbench/settings` `GET /api/workbench/settings/schema` | 工作台配置 / 设置 / 设置 schema |
-| `GET/POST/PUT` | `/api/files/*` | 文件面（list/read/write/create/move/replace/search） |
-| `GET/POST` | `/api/git/*` | Git 面（status/diff/stage/unstage/commit/discard/identity） |
-| `POST` | `/ops/{operation}` | 运行时运维操作 |
-
-完整端点清单与协议见 [docs/API.md](docs/API.md)。
-
-### 通过 ApiCore 透传到 evorule-server
-
-两个 client（`EvoruleApiClient` + `WorkspaceApiClient`）共享 `ApiCore`（base_url + reqwest Client + Bearer auth），统一错误为 `ApiError`。
-
-认证 token 构造时读取：`EVORULE_SERVICE_TOKEN`（service 身份，可写受保护域 `stable.llm`/`stable.system`）优先，缺省回退 `EVORULE_AUTH_TOKEN`（user 身份）；均缺失时不发 auth header（server 须为 dev mode）。
+- [docs/API.md](docs/API.md) — full HTTP API reference (endpoints, WebSocket, auth model)
+- [docs/WORKBENCH_API.md](docs/WORKBENCH_API.md) — Web IDE workbench protocol
+- [docs/CLI.md](docs/CLI.md) — complete CLI reference: run/repl/replay/patrol/workflow semantics, DSL versions, replan/plan-execute
+- [docs/TOOLS.md](docs/TOOLS.md) — complete tool-system reference: 3-tier security model, built-in 15, rule-management toolkit (52), source switches and adjudication tiers, per-agent whitelists
+- [docs/approval-policy.md](docs/approval-policy.md) — tool approval policy
+- [docs/security/THREAT_MODEL.md](docs/security/THREAT_MODEL.md) — threat model
+- [docs/TELEMETRY.md](docs/TELEMETRY.md) — telemetry transparency statement
+- [docs/RELEASE_PROCESS.md](docs/RELEASE_PROCESS.md) — release process
+- [CHANGELOG.md](CHANGELOG.md) — release history
 
 ---
 
-## 接入真实 LLM
+## Security
 
-实现 `LlmHandler` trait 即可接入任意 LLM provider：
+**3-tier security model** — every tool call is classified:
 
-```rust
-use evo_agent::io_handlers::LlmHandler;
-use async_trait::async_trait;
-use serde_json::{json, Value};
+| Tier | Behavior | Examples |
+|------|----------|----------|
+| **ACTIVE** | executes directly, no approval | file_read/file_list/file_write/file_create/file_move/file_delete, search_files/grep_files, git_status/git_diff/git_log/git_stage/git_commit, shell_exec (8-command whitelist), http_get (6-host whitelist) |
+| **CANDIDATE** | LLM wants it → proposal → user approval → executes | rm, mv, sed, chmod and 20 shell commands; any public HTTP host |
+| **BLOCKED** | never approved | sudo, python, bash, curl, kill and 35 escape-class commands; SSRF blacklisted IP ranges |
 
-pub struct OpenAIHandler {
-    api_key: String,
-    base_url: String,
-}
+Additional layers: working-directory sandbox for all file tools (rejects `..` / absolute paths / symlink escapes), SSRF protection on HTTP, source-level switches for dynamic tools (MCP / service proxy) with independent adjudication tiers (default `sensitive`: every call is intent-adjudicated by governance rules and leaves an account entry — see [docs/TOOLS.md](docs/TOOLS.md)), and a governance-write switch that can take all 21 rule-write tools offline for sensitive deployments. Tool totals: 59 by spec count (test-locked); the default serve surface exposes 62 = 17 built-in + 45 rule tools.
 
-#[async_trait]
-impl LlmHandler for OpenAIHandler {
-    async fn call(
-        &self,
-        model: &str,
-        system_prompt: &str,
-        messages: Vec<Value>,
-        tools: Vec<Value>,
-    ) -> Result<Value, String> {
-        let client = reqwest::Client::new();
-        let body = json!({
-            "model": model,
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                ...messages,
-            ],
-            "tools": tools,
-        });
-        let resp = client
-            .post(&format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json::<Value>()
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(resp)
-    }
-}
-```
-
-内置支持 OpenAI 兼容 API（MiniMax / DeepSeek / OpenAI），通过 `LlmConfig` 配置 provider / api_key / model / api_base。
+**Zero unsafe**: `#![forbid(unsafe_code)]` is enforced in all modules.
 
 ---
 
-## 测试
+## Contributing
 
-```bash
-# 单元 + 集成测试
-cargo test --workspace
-
-# 只跑集成（mockito mock evorule-server）
-cargo test --test integration_test
-
-# 真实 evorule-server 端到端
-# 1. 启动 evorule-server
-# 2. cargo test -- --ignored --test-threads=1
-```
-
-集成测试用 `mockito` mock evorule-server，覆盖：
-- `auto_recall`（启动时拉取 shared facts）
-- ReAct 主循环的 SSE 事件驱动
-- 工具调用闭环
-- 错误处理路径
+See [CONTRIBUTING.md](CONTRIBUTING.md). Tests: `cargo test --workspace` (integration tests mock evorule-server with `mockito`; end-to-end against a real server: `cargo test -- --ignored --test-threads=1`).
 
 ---
 
-## 本地运维：服务稳定化（看门狗 + 开机自启）
+## Related projects
 
-evorule 生态本地开发涉及三个常驻服务：evorule-server（18080）、evo-agent serve（8081）、console 审计页 dev server（5174）。`scripts/ops/` 提供一套与仓库一同演进的运维脚本族，解决四类常见不稳定：进程挂在终端/会话后台作业下（会话结束服务陪葬）、关终端或重启电脑后服务消失、进程崩溃无人拉起、重启时漏带 LLM 密钥导致假性「LLM 失联」。
-
-| 文件 | 作用 |
-|------|------|
-| `_common.ps1` | 共享工具：配置加载 / HTTP+TCP 探活 / 轮询等待 / 分离启动 / 日志 |
-| `start-evorule-server.ps1` | 幂等拉起 evorule-server（探活通过即跳过） |
-| `start-evo-agent-serve.ps1` | 幂等拉起 serve，自动注入 `.env` 环境变量（LLM 密钥等，日志只回显键名不回显值） |
-| `start-console.ps1` | 幂等拉起 console dev server |
-| `watchdog-check.ps1` | 单次巡检：三服务探活，不通则拉起（互斥锁防重叠）；手动运行即为「一键全启」 |
-| `install-watchdog-task.ps1` | 注册 Windows 计划任务 `EvoruleOpsWatchdog`（用户登录触发 + 每 1 小时巡检自愈） |
-| `ops.local.example.json` | 本机配置模板（入库，中性路径示例） |
-
-### 首次启用
-
-```powershell
-# 1. 复制模板为本机配置（已被 .gitignore 忽略，不入库），按本机实际路径修改 exe/args/workdir/env_file
-Copy-Item scripts\ops\ops.local.example.json scripts\ops\ops.local.json
-
-# 2. 注册计划任务（登录自启 + 每分钟巡检；重复注册用 -Force 覆盖，卸载见下）
-pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\ops\install-watchdog-task.ps1
-
-# 3. 卸载看门狗
-Unregister-ScheduledTask -TaskName EvoruleOpsWatchdog -Confirm:$false
-```
-
-设计要点：
-- **分离启动**：服务以脱离调用方的独立进程运行（隐藏窗口），不再挂在终端/会话后台作业下
-- **幂等**：所有启动脚本探活通过即跳过，可随时手动重跑；`watchdog-check.ps1` 即「一键全启」
-- **密钥双保险**：serve 自身启动时自动加载 workdir（或 exe 目录）下的 `.env`（已设置的环境变量优先，不覆盖；`src/dotenv.rs` 零依赖最小实现），密钥全缺失时启动期打印醒目 WARNING——即使绕过运维脚本裸启动也不会「LLM 失联」；脚本侧 `.env` 注入作为第二层保障
-- **密钥安全**：`.env` 注入只回显键名；`ops.local.json` 与日志目录均在 gitignore 内，密钥不进 git
-- **日志**：每次启动的 stdout/stderr 落 `log_dir`（上一份轮转为 `*.prev`），巡检动作落 `watchdog.log`
-- **边界**：纯运维层工具，不触碰 evorule 引擎执行面（哈希链 / Fact / 审计语义零依赖）
-
----
-
-## 目录结构
-
-```
-evo-agent/
-├── Cargo.toml
-├── README.md
-├── CHANGELOG.md
-├── LICENSE
-├── NOTICE.md                        # 许可与依赖声明
-├── verify.ps1                       # 一键验证（build/test/防泄漏/布局断言）
-├── agents/                          # Agent 定义
-│   ├── general.json
-│   ├── researcher.json
-│   └── rule-copilot.json
-├── config-examples/                 # 配置示例
-├── docs/
-│   ├── API.md
-│   ├── RELEASE_PROCESS.md           # 发布流程
-│   ├── TELEMETRY.md                 # 遥测透明度声明
-│   └── security/                    # 安全设计文档
-├── src/
-│   ├── lib.rs                       # 入口 + 公共契约面登记
-│   ├── config.rs                    # 4 层配置加载
-│   ├── json_convert.rs              # serde ↔ tcb::JsonValue 转换
-│   ├── io_handler.rs                # I/O handler 基类 trait
-│   ├── io_dispatcher.rs             # I/O 分发器
-│   ├── agent/
-│   │   ├── runner.rs                # ReAct 主循环
-│   │   ├── audited_llm.rs           # 审计链内 LLM 执行桥（sidecar 会话协议）
-│   │   ├── memory.rs                # 三层记忆管理
-│   │   ├── memory_event/            # 结构化记忆事件 + 因果链 + 回放
-│   │   │   ├── entity.rs            #   实体定义
-│   │   │   ├── event.rs             #   事件定义
-│   │   │   ├── evidence.rs          #   证据伴随
-│   │   │   ├── extraction.rs        #   事件提取
-│   │   │   ├── replay.rs            #   确定性回放
-│   │   │   └── store.rs             #   事件存储
-│   │   ├── definition.rs            # Agent 配置加载
-│   │   ├── tool_registry.rs         # 工具注册中心
-│   │   ├── translator.rs            # LLM 响应解析
-│   │   ├── delegate.rs              # Agent 嵌套上下文
-│   │   ├── workflow.rs              # DAG 工作流引擎(compute 纯函数节点内联求值)
-│   │   ├── materializer.rs          # workflow_dag v1.2 物化器(loop 静态展开)
-│   │   ├── replan.rs                # replan 触发判定纯函数 + 预算结构
-│   │   ├── driver.rs                # plan-execute 外层驱动循环(计划→执行→replan 重跑)
-│   │   ├── context_window.rs        # 上下文窗口裁剪
-│   │   ├── summarizer.rs            # 会话摘要
-│   │   ├── sediment.rs              # 会话沉淀通道
-│   │   ├── approval.rs              # 工具审批系统
-│   │   ├── callback.rs              # 事件回调链
-│   │   ├── output_validator.rs      # JSON Schema 输出校验
-│   │   └── mod.rs
-│   ├── api/
-│   │   ├── api_core.rs              # 共享 HTTP 基建（ApiCore + ApiError）
-│   │   ├── evorule_client.rs        # evorule-server 端点客户端
-│   │   ├── workspace_client.rs      # workspace 服务客户端
-│   │   ├── agent_api.rs             # 自有 HTTP 路由(/agents/* 与 /api/*)
-│   │   ├── serve_tools.rs           # serve 模式工具注册
-│   │   ├── ws_handler.rs            # WebSocket 双向流
-│   │   ├── auth.rs                  # Bearer 认证
-│   │   ├── metrics.rs               # Prometheus 指标
-│   │   └── mod.rs
-│   ├── builtin_tools/               # 15 个内置工具
-│   │   ├── file_read.rs / file_list.rs / file_write.rs / file_create.rs / file_move.rs / file_delete.rs
-│   │   ├── search_files.rs / grep_files.rs
-│   │   ├── shell_exec.rs            # 3 层命令安全模型(8 active / 20 candidate / 35 blocked)
-│   │   ├── http_get.rs              # 6 active hosts + SSRF 防护
-│   │   ├── git_tools.rs             # git_status / git_diff / git_log / git_stage / git_commit
-│   │   ├── fs_safety.rs             # 沙箱路径校验(绝对路径/../symlink 逃逸)
-│   │   ├── delegate_tool.rs         # Agent 委托工具
-│   │   └── mod.rs
-│   ├── rule_tools/                  # 45 个规则管理工具
-│   │   ├── workspace_tools.rs       #   workspace 2 个
-│   │   ├── rule_tools.rs            #   rule CRUD 12 个
-│   │   ├── translate_tools.rs       #   规则转换 3 个
-│   │   ├── audit_tools.rs           #   审计 3 个
-│   │   ├── sandbox_tools.rs         #   沙盒 5 个
-│   │   ├── dataset_tools.rs         #   数据集 2 个
-│   │   ├── publish_tools.rs         #   发布 5 个
-│   │   ├── production_tools.rs      #   生产 2 个
-│   │   └── mod.rs
-│   ├── mcp/                         # MCP 客户端
-│   │   ├── client.rs                #   JSON-RPC 2.0 客户端
-│   │   ├── transport.rs             #   stdio 传输
-│   │   ├── tool_adapter.rs          #   MCP → ToolFunction 适配
-│   │   └── mod.rs
-│   ├── io_handlers/                 # LLM/Tool 抽象层
-│   │   ├── llm_handler.rs
-│   │   ├── tool_handler.rs
-│   │   └── mod.rs
-│   └── bin/
-│       └── evo-agent.rs             # CLI 入口
-├── scripts/
-│   └── ops/                         # 本地运维脚本族（看门狗/自启/一键拉起，见「本地运维」章节）
-└── tests/
-    ├── integration_test.rs          # mockito 端到端测试
-    └── llm_real_smoke.py            # 真实 LLM 冒烟脚本
-```
-
----
-
-## 当前状态 / 已知限制
-
-基于 2026-09 完成度核查：
-
-**已就绪（曾被报告误判为"未修"的项）**
-
-| 项 | 状态 | 说明 |
-|----|------|------|
-| 共享事实广播（原 L-1） | ✅ | evorule-server `session_payload` handler 已实现 `shared.*` → `SharedFactsLog::append` 广播 |
-| rollup 标记（原 L-3） | ✅ | evo-agent `mark_shared_facts_rollup` + server 端点均就绪，`facts_by_path_prefix` 过滤 `rolled_up` |
-| 共享路径格式（L-2）/ 上下文窗口字段（L-4）/ sediment 写入前缀（L-6） | ✅ | evo-agent 侧均已修复，与 recall 三前缀完全匹配 |
-| 记忆召回顺序（C2） | ✅ | `runner.rs` 已修复：recall 在 `build_system_prompt` 之前 |
-| 角色 1/3 `call_external` | ✅ | evorule-server 侧就绪，挂载 `service_registry.json` + `--allow-loopback` 即可跑通（已端到端验证） |
-| IDE 工作台 UI 联调 | ✅ | 内置工作台（文件树/编辑器/对话侧栏/审计抽屉）+ Git 面 + 设置面已实现并托管于 serve |
-
-**仍未完成 / 设计取舍**
-
-| 项 | 状态 | 说明 |
-|----|------|------|
-| 集群协作（E2 / cluster） | ❌ 设计移除 | 多 reactor 协作原语已移出机制层，定位为应用层功能；evorule-server 路由已无 cluster 端点 |
-| Runner 拆分（Phase 2） | ⏳ | `runner.rs` 仍为约 4000 行单文件，未拆为子模块 |
-| 编译告警 | ⚠️ | 主体为 `missing_docs`；另有少量 clippy 代码质量 lint 待清理 |
-
-> 规则管理工具集总数为 **52 个**（workspace 2 + rule 12 + translate 3 + audit 4 + sandbox 5 + dataset 2 + publish 5 + production 2 + bundles 5 + knowledge 3 + hit-stats 2 + skill 装配 1 + meta 1 + evolution 2 + why/order 3），上文[核心特性](#核心特性)与[工具系统](#工具系统)的拆分表已据实校正。
-
-## 依赖关系
-
-```toml
-reqwest = "0.12"              # HTTP 客户端
-axum = "0.8"                  # HTTP 服务（含 WebSocket）
-tokio = "1"                   # 异步运行时
-serde / serde_json = "1"      # JSON 序列化
-clap = "4"                    # CLI 参数解析
-tracing = "0.1"               # 结构化日志
-prometheus = "0.13"           # 指标
-jsonschema = "0.21"           # JSON Schema 校验
-rustyline = "14"              # REPL 行编辑
-```
-
-依赖面仅第三方 crates（自 2026-09-20 起，不含任何 `evorule-*` 依赖）；
-与 evorule-server 之间只有 HTTP/WS 协议契约。
-
-**零 unsafe**：`#![forbid(unsafe_code)]` 在所有 module 强制。
-
----
-
-## 相关项目
-
-- [evorule](https://gitee.com/evorule/evorule) — 反应式执行引擎（tier0/tier1/tier2）
-- [evorule-server](https://gitee.com/evorule/evorule-server) — HTTP 服务 + Workspace + 沙盒 + 发布队列
+- [evorule](https://github.com/evorule/evorule) — the reactive execution engine
+- [evorule-server](https://github.com/evorule/evorule-server) — HTTP server + workspace + sandbox + publish queue
 
 ---
 
 ## License
 
-[AGPL-3.0](LICENSE) — EvoRule dual-license: closed-source use via [DUAL_LICENSE.md](DUAL_LICENSE.md) / [FREE_COMMERCIAL_LICENSE.md](FREE_COMMERCIAL_LICENSE.md) (free for eligible entities) / [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) (paid). Constitution `core_eval.json` is CC0-1.0. Commercial inquiries: evorulelab@gmail.com.
+[AGPL-3.0-or-later](LICENSE) — EvoRule dual-license: closed-source use via [DUAL_LICENSE.md](DUAL_LICENSE.md) / [FREE_COMMERCIAL_LICENSE.md](FREE_COMMERCIAL_LICENSE.md) (free for eligible entities) / [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) (paid). Constitution `core_eval.json` is CC0-1.0. Commercial inquiries: evorulelab@gmail.com.
 
-
+<!-- Badge definitions (reference style) -->
+[badge-ci]: https://github.com/evorule/evo-agent/actions/workflows/ci.yml/badge.svg
+[ci]: https://github.com/evorule/evo-agent/actions/workflows/ci.yml
+[badge-license]: https://img.shields.io/badge/License-AGPL--3.0--or--later-blue
+[license-file]: ./LICENSE
