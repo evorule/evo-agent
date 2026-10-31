@@ -42,6 +42,7 @@ param(
     [switch]$SkipFreshness,
     [string]$ServerRepo = "",
     [string]$ConsoleRepo = "",
+    [string]$InspectorRepo = "",
     [string]$UpdateUrlBase = "",
     [string]$ReleaseNotes = ""
 )
@@ -52,6 +53,9 @@ $srcTauri = Join-Path $desktop "src-tauri"
 $repoRoot = Split-Path $desktop -Parent
 if (-not $ServerRepo) { $ServerRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-server" }
 if (-not $ConsoleRepo) { $ConsoleRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-console-cloud" }
+# inspector 仓同理（-InspectorRepo，默认同级 evorule-context-inspector）；
+# exe 由此仓构建产物收集，plugin.json 取 server 仓布局面（双源一致，SSOT 布局面）。
+if (-not $InspectorRepo) { $InspectorRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-context-inspector" }
 
 if (-not $SkipCollect) {
     # 新鲜度门（发版前置红线）:产物须新于源码最后提交(先定稿提交、再 release
@@ -89,6 +93,14 @@ if (-not $SkipCollect) {
         @{ Src = (Join-Path $ServerRepo "plugins\wasm-host\plugin.json");     Dst = "resources\evorule-server\plugins\wasm-host\plugin.json" },
         @{ Src = (Join-Path $ServerRepo "plugins\wasm-host\trusted-keys.json"); Dst = "resources\evorule-server\plugins\wasm-host\trusted-keys.json" },
         @{ Src = (Join-Path $ServerRepo "plugins\wasm");                      Dst = "resources\evorule-server\plugins\wasm" },
+        # context-inspector 随发版（B-053c 2026-10-31）：exe 取 inspector 仓构建
+        # 产物（path 依赖 evorule/evorule-hash 等三仓并置，CI 检出布局见
+        # desktop-release.yml）；plugin.json 取 server 仓布局面（与 inspector 仓
+        # 根双源一致）。口契约=19100（admin 服务面）+19101（逐会话代理基址，
+        # 本批仅占位预检，绑定接线为后续增量）。锚点流自持（Ed25519 出厂
+        # 自生成于运行期 data 目录），无需 trusted-keys 等价物
+        @{ Src = (Join-Path $InspectorRepo "target\release\evorule-context-inspector.exe"); Dst = "resources\evorule-server\plugins\evorule-context-inspector\evorule-context-inspector.exe" },
+        @{ Src = (Join-Path $ServerRepo "plugins\evorule-context-inspector\plugin.json"); Dst = "resources\evorule-server\plugins\evorule-context-inspector\plugin.json" },
         @{ Src = (Join-Path $repoRoot "desktop\templates\plugins-manifest.json"); Dst = "resources\evorule-server\plugins-manifest-template.json" }
     )
 

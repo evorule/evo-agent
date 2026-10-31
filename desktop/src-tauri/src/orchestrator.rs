@@ -49,6 +49,9 @@ pub struct Runtime {
     pub codegraph: Option<Child>,
     /// wasm-host sidecar（可选组件：资产四件+9140 契约口；未启用 = None）
     pub wasm_host: Option<Child>,
+    /// context-inspector sidecar（可选组件：资产两件+19100/19101 契约口；
+    /// 未启用 = None。B-053c 2026-10-31）
+    pub inspector: Option<Child>,
 }
 
 /// 一次拉起所需的全部输入（job 由守护方持有，跨重启复用）。
@@ -430,6 +433,80 @@ fn prepare_wasm_host(
     writeln!(
         log,
         "[orch] wasm-host sidecar spawned on 127.0.0.1:9140 (pid {})",
+        child.id()
+    )
+    .ok();
+    Ok(Some(child))
+}
+
+/// context-inspector 拉起资格预检（paths 级，可测）：manifest 型外部包
+/// （B-053c 2026-10-31），资产两件（exe + plugin.json；锚点流自持 Ed25519
+/// 运行期自生成，无需 trusted-keys 等价物）与双契约口 19100（admin 服务面，
+/// plugin.json base_url）+19101（逐会话代理基址）齐备 → 返回 exe 路径；
+/// 任一缺位 = fail-soft 降级（包名记入 excluded → 清单剔除 + 日志留痕），
+/// 不阻断全链。MITM 绑定接线为后续增量——未绑定态 admin 服务面
+/// （/services/context_*）照常可用。
+fn inspector_ready(
+    paths: &ResolvedPaths,
+    log: &mut impl Write,
+    excluded: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let host_dir = paths
+        .evorule_server_home
+        .join("plugins")
+        .join("evorule-context-inspector");
+    let exe = host_dir.join("evorule-context-inspector.exe");
+    let assets = [exe.clone(), host_dir.join("plugin.json")];
+    if assets.iter().any(|p| !p.is_file()) {
+        writeln!(
+            log,
+            "[orch] context-inspector assets missing (exe/plugin.json); skipping"
+        )
+        .ok();
+        excluded.push("evorule-context-inspector".to_string());
+        return None;
+    }
+    if !port_bindable(19100) || !port_bindable(19101) {
+        writeln!(
+            log,
+            "[orch] context-inspector port 19100/19101 occupied; context services unavailable"
+        )
+        .ok();
+        excluded.push("evorule-context-inspector".to_string());
+        return None;
+    }
+    Some(exe)
+}
+
+/// context-inspector sidecar 拉起：资格经 inspector_ready 统一裁决，本函数
+/// 只管进程。--inspector-log-dir 指向运行数据目录（WAL=inspector.log +
+/// 锚点流 anchors.jsonl 自生成，重启存活；不传 = 仅内存模式重启丢链，
+/// 装机形态不取）。
+fn prepare_inspector(
+    ctx: &LaunchContext,
+    log: &mut impl Write,
+    excluded: &mut Vec<String>,
+) -> Result<Option<Child>, String> {
+    let Some(exe) = inspector_ready(ctx.paths, log, excluded) else {
+        return Ok(None);
+    };
+    let host_dir = exe.parent().expect("exe under host dir").to_path_buf();
+    let log_dir = ctx.paths.data_dir.join("inspector-data");
+    std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
+    let out_log = open_append(&ctx.paths.logs_dir.join("context-inspector.log"))?;
+    let out_log_err = open_append(&ctx.paths.logs_dir.join("context-inspector.log"))?;
+    let child = Command::new(&exe)
+        .args(["--inspector-log-dir"])
+        .arg(&log_dir)
+        .current_dir(&host_dir)
+        .stdout(Stdio::from(out_log))
+        .stderr(Stdio::from(out_log_err))
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .map_err(|e| format!("spawn context-inspector: {e}"))?;
+    writeln!(
+        log,
+        "[orch] context-inspector sidecar spawned on 127.0.0.1:19100 (pid {})",
         child.id()
     )
     .ok();
@@ -880,6 +957,7 @@ fn start_group(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, Str
     let mut excluded: Vec<String> = Vec::new();
     let codegraph = prepare_codegraph_bridge(ctx, log, &mut excluded)?;
     let wasm_host = prepare_wasm_host(ctx, log, &mut excluded)?;
+    let inspector = prepare_inspector(ctx, log, &mut excluded)?;
     let executor_key = llm_executor_ready(ctx, log);
     if executor_key.is_none() || executor_port != 9130 {
         excluded.push("ai-plugin".to_string());
@@ -932,6 +1010,7 @@ fn start_group(ctx: &LaunchContext, log: &mut impl Write) -> Result<Runtime, Str
         ai_plugin_port,
         codegraph,
         wasm_host,
+        inspector,
     };
     write_runtime_file(
         ctx.paths,
@@ -982,6 +1061,7 @@ pub fn graceful_stop(
     ai_plugin: &mut Option<Child>,
     codegraph: &mut Option<Child>,
     wasm_host: &mut Option<Child>,
+    inspector: &mut Option<Child>,
     timeout: Duration,
 ) {
     for slot in [
@@ -990,6 +1070,7 @@ pub fn graceful_stop(
         ai_plugin.as_ref(),
         codegraph.as_ref(),
         wasm_host.as_ref(),
+        inspector.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -1004,6 +1085,7 @@ pub fn graceful_stop(
             ai_plugin.as_mut(),
             codegraph.as_mut(),
             wasm_host.as_mut(),
+            inspector.as_mut(),
         ]
         .into_iter()
         .flatten()
@@ -1029,6 +1111,9 @@ pub fn graceful_stop(
         let _ = c.kill();
     }
     if let Some(c) = wasm_host {
+        let _ = c.kill();
+    }
+    if let Some(c) = inspector {
         let _ = c.kill();
     }
 }
@@ -1302,6 +1387,41 @@ mod tests {
         // 损坏 → 全空（不改变选口行为）
         std::fs::write(paths.data_dir.join("runtime.json"), "{not json").unwrap();
         assert_eq!(last_ports(&paths), (None, None, None));
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    // === context-inspector 拉起资格（B-053c：资产两件 + 19100/19101 双口闸） ===
+
+    #[test]
+    fn inspector_assets_missing_excluded() {
+        let paths = scratch_paths("insp-missing");
+        let mut excluded = Vec::new();
+        let mut log: Vec<u8> = Vec::new();
+        let ready = inspector_ready(&paths, &mut log, &mut excluded);
+        assert!(ready.is_none());
+        assert_eq!(excluded, vec!["evorule-context-inspector".to_string()]);
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn inspector_port_occupied_excluded() {
+        let paths = scratch_paths("insp-port");
+        let host_dir = paths
+            .evorule_server_home
+            .join("plugins")
+            .join("evorule-context-inspector");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        std::fs::write(host_dir.join("evorule-context-inspector.exe"), b"stub").unwrap();
+        std::fs::write(host_dir.join("plugin.json"), "{}").unwrap();
+        // 占死 admin 契约口 19100 → 资产虽齐仍降级（fail-soft，可见留痕）。
+        // bind 失败（本机驻留已占 19100）= 同样落占口降级分支，断言不变
+        let held = TcpListener::bind(("127.0.0.1", 19100));
+        let mut excluded = Vec::new();
+        let mut log: Vec<u8> = Vec::new();
+        let ready = inspector_ready(&paths, &mut log, &mut excluded);
+        assert!(ready.is_none());
+        assert_eq!(excluded, vec!["evorule-context-inspector".to_string()]);
+        drop(held);
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 }

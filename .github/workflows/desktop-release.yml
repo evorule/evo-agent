@@ -63,6 +63,19 @@ jobs:
           repository: evorule/evorule
           path: evorule
 
+      # context-inspector 仓（B-053c 2026-10-31）：随发版 exe 构建源；其
+      # path 依赖 ../evorule/{evorule-reactor,evorule-governance,evorule-tcb}
+      # 命中上方 evorule 检出，../evorule-hash 为独立仓须并置检出（浮动 main
+      # 与各仓同口径），同级布局天然满足 Cargo path 寻址
+      - uses: actions/checkout@v4
+        with:
+          repository: evorule/evorule-context-inspector
+          path: evorule-context-inspector
+      - uses: actions/checkout@v4
+        with:
+          repository: evorule/evorule-hash
+          path: evorule-hash
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -74,6 +87,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: evorule-server/plugins/wasm-host -> target
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: evorule-context-inspector -> target
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: evo-agent -> target
@@ -119,6 +135,10 @@ jobs:
       - name: 供给 wasm-host 装机信任锚 (demo 模板复制)
         run: Copy-Item trusted-keys.demo.json trusted-keys.json
         working-directory: evorule-server/plugins/wasm-host
+
+      - name: 构建 evorule-context-inspector
+        run: cargo build --release --bin evorule-context-inspector
+        working-directory: evorule-context-inspector
 
       - name: 构建 evo-agent
         run: cargo build --release

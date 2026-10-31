@@ -1,10 +1,10 @@
 # fresh-install-smoke.ps1 — 装机冒烟验收（发版面验收机制闸 4 的 CI 化）
 #
 # 对 build 产物 setup.exe 做「装机 → 起壳 → 服务面 → 清理」全链冒烟：
-#   1. 静默安装到临时目录          2. 关键件 8 项在位
-#   3. 壳拉起五进程编排            4. wasm-host 9140 验签五 UDF verified
-#   5. codegraph 9150 健康         6. engine 服务面五 UDF 注册
-#   7. ai-plugin 无 key 环境预期剔除（可见失败语义）
+#   1. 静默安装到临时目录          2. 关键件 10 项在位
+#   3. 壳拉起六进程编排            4. wasm-host 9140 验签五 UDF verified
+#   5. codegraph 9150 健康         6. context-inspector 19100 服务面
+#   7. engine 服务面五 UDF 注册    8. ai-plugin 无 key 环境预期剔除（可见失败语义）
 # 任何一步失败即 exit 1（fail-closed）；无论成败均清理进程与目录。
 #
 # 用法: powershell -File fresh-install-smoke.ps1 -SetupPath <setup.exe>
@@ -43,7 +43,9 @@ try {
         "resources\evorule-server\plugins\wasm-host\evorule-wasm-host.exe",
         "resources\evorule-server\plugins\wasm-host\plugin.json",
         "resources\evorule-server\plugins\wasm-host\trusted-keys.json",
-        "resources\evorule-server\plugins\wasm\udf_finance_tax_calc.wasm"
+        "resources\evorule-server\plugins\wasm\udf_finance_tax_calc.wasm",
+        "resources\evorule-server\plugins\evorule-context-inspector\evorule-context-inspector.exe",
+        "resources\evorule-server\plugins\evorule-context-inspector\plugin.json"
     )
     foreach ($rel in $keyFiles) {
         $full = Join-Path $install $rel
@@ -86,7 +88,19 @@ try {
     if (-not $cgOk) { throw "codegraph :9150 not healthy within 30s" }
     Write-Host "[smoke] codegraph 9150: OK"
 
-    # ---- 6. engine service surface: five UDFs registered -------------------
+    # ---- 6. context-inspector 19100 admin service surface -------------------
+    $deadline = (Get-Date).AddSeconds(30)
+    $ciOk = $false
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:19100/health" -UseBasicParsing -TimeoutSec 3
+            if ($r.StatusCode -eq 200) { $ciOk = $true; break }
+        } catch { Start-Sleep -Seconds 3 }
+    }
+    if (-not $ciOk) { throw "context-inspector :19100 not healthy within 30s" }
+    Write-Host "[smoke] context-inspector 19100: OK"
+
+    # ---- 7. engine service surface: five UDFs registered -------------------
     $runtime = Join-Path $dataDir "runtime.json"
     if (-not (Test-Path $runtime)) { throw "runtime.json missing under $dataDir" }
     $rt = Get-Content $runtime -Raw | ConvertFrom-Json
@@ -107,7 +121,7 @@ try {
     if ($udfs.Count -lt 5) { throw "engine :$enginePort service surface has $($udfs.Count) udf_* entries, expect >= 5" }
     Write-Host "[smoke] engine :$enginePort service surface: $($udfs.Count) UDFs [$($udfs -join ', ')]"
 
-    # ---- 7. ai-plugin expected exclusion (no key on CI runner) --------------
+    # ---- 8. ai-plugin expected exclusion (no key on CI runner) --------------
     $manifestPath = Join-Path $dataDir "plugins-manifest.json"
     if (Test-Path $manifestPath) {
         $mf = Get-Content $manifestPath -Raw | ConvertFrom-Json
@@ -119,6 +133,7 @@ try {
         }
         if ($pkgNames -notcontains "wasm-host") { throw "wasm-host missing from plugins manifest" }
         if ($pkgNames -notcontains "codegraph-bridge") { throw "codegraph-bridge missing from plugins manifest" }
+        if ($pkgNames -notcontains "evorule-context-inspector") { throw "evorule-context-inspector missing from plugins manifest" }
     } else {
         throw "plugins-manifest.json missing under $dataDir"
     }
