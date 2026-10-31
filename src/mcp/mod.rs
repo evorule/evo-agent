@@ -78,6 +78,7 @@
 //! ```
 
 pub mod client;
+pub mod gov_source;
 pub mod manager;
 pub mod server;
 pub mod spawn_gate;
