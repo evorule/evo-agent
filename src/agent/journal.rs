@@ -599,6 +599,23 @@ pub enum JournalEvent {
         /// 白名单规模(降级前的期望注册面;空白名单不注册不发请求,不落本事件)
         whitelist: usize,
     },
+    /// 超大工具结果引用化落账:结果全文超回喂上限时落盘到引用文件
+    /// (tool_results/ 目录,原文完整保留),messages/会话记忆只携带结构化
+    /// 引用块(指纹+头尾摘要+取回指引)。本事件记录引用关系供对账回放:
+    /// 按 ref_id 可从引用文件取回原文,content_digest 可验证完整性。
+    /// 观测面,不参与步映射。
+    ToolResultOffloaded {
+        /// 配对的调用 id(与 tool_invoked/tool_result 同键)
+        call_id: String,
+        /// 引用 id(=引用文件 stem;tool_result_fetch 取回键)
+        ref_id: String,
+        /// 引用文件相对路径(相对 journal 目录)
+        path: String,
+        /// 原文全文字节数
+        size_bytes: usize,
+        /// 原文全文 digest(evorule-hash 口径)
+        content_digest: String,
+    },
 }
 
 /// 单行 journal 记录(读侧重放消费形态)
@@ -2361,6 +2378,45 @@ mod tests {
                 assert_eq!(*whitelist, 3);
             }
             other => panic!("expected service_tools_degraded, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tool_result_offloaded_event_roundtrip() {
+        // 超大工具结果引用化对账事件:落账+读回+链哈希完整(观测面)
+        let dir = std::env::temp_dir().join(format!("jf-tro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-tro").unwrap();
+            w.write_event(JournalEvent::ToolResultOffloaded {
+                call_id: "call-42".into(),
+                ref_id: "call-42-1700000000000000000".into(),
+                path: "tool_results/call-42-1700000000000000000.txt".into(),
+                size_bytes: 1234567,
+                content_digest: "blake3:aa".into(),
+            })
+            .unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-tro")).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].hashes.is_some(), "链哈希段应完整");
+        match &lines[0].event {
+            JournalEvent::ToolResultOffloaded {
+                call_id,
+                ref_id,
+                path,
+                size_bytes,
+                content_digest,
+            } => {
+                assert_eq!(call_id, "call-42");
+                assert_eq!(ref_id, "call-42-1700000000000000000");
+                assert_eq!(path, "tool_results/call-42-1700000000000000000.txt");
+                assert_eq!(*size_bytes, 1234567);
+                assert_eq!(content_digest, "blake3:aa");
+            }
+            other => panic!("expected tool_result_offloaded, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

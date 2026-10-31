@@ -5953,3 +5953,100 @@ fn test_emergency_trim_history_compaction_keeps_recent_rounds() {
     // assistant↔tool 配对完整性:不存在未获应答的悬挂(本场景无 tool_calls,天然成立;
     // 轮界切分保证有 tool_calls 场景同轮不破)
 }
+
+// ---- 超大工具结果引用化出站门 ----
+
+fn gate_test_runner(dir: &std::path::Path) -> AgentRunner {
+    AgentRunner::new(AgentConfig::default(), make_test_client())
+        .with_journal_dir(dir.to_path_buf())
+}
+
+fn gate_temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("gate-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn gate_passthrough_below_threshold() {
+    // 未超限原样:字节级现行为不变(基线保护),不落盘
+    let dir = gate_temp_dir("passthrough");
+    let runner = gate_test_runner(&dir);
+    let raw = "x".repeat(1000);
+    assert_eq!(runner.gate_tool_result(raw.clone(), "file_read", None), raw);
+    assert!(!dir.join("tool_results").exists(), "未超限不应落盘");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gate_offloads_oversized_result_with_reference_block() {
+    // 超限:原文完整落盘+引用块(指纹/bytes/head/tail/取回指引)
+    let dir = gate_temp_dir("offload");
+    let runner = gate_test_runner(&dir);
+    let raw = format!(
+        "HEAD-{}\n{}\nTAIL-{}",
+        "a".repeat(2500),
+        "y".repeat(60000),
+        "z".repeat(1500)
+    );
+    let out = runner.gate_tool_result(raw.clone(), "audit_get", Some("call-42"));
+    assert!(out.starts_with("[TOOL_RESULT_REF]"), "引用块形态: {}", &out[..out.len().min(80)]);
+    assert!(out.contains("ref_id: call-42-"));
+    assert!(out.contains("tool: audit_get"));
+    assert!(out.contains(&format!("bytes: {}", raw.len())));
+    let dg = crate::agent::journal::evorule_digest(&raw);
+    assert!(out.contains(&format!("digest: {dg}")), "指纹应与原文复算一致");
+    assert!(out.contains("HEAD-a"), "头摘要保真");
+    assert!(out.contains("\nzzz"), "尾摘要保真(尾部 1000 chars 全 z 段)");
+    assert!(out.contains("tool_result_fetch"), "取回指引在场");
+    // 引用文件存在且原文逐字节完整
+    let tr = dir.join("tool_results");
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&tr)
+        .unwrap()
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<Vec<_>, std::io::Error>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1, "应恰好一个引用文件");
+    let written = std::fs::read_to_string(entries.pop().unwrap()).unwrap();
+    assert_eq!(written, raw, "引用文件应与原文逐字节一致");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gate_falls_back_to_truncation_without_journal_dir() {
+    // journal 目录未启用:降级为既有截断(fail-soft),不引用化
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    let raw = "x".repeat(60000);
+    let out = runner.gate_tool_result(raw, "t", None);
+    assert!(out.contains("[truncated"), "无 journal 目录应降级截断");
+    assert!(!out.starts_with("[TOOL_RESULT_REF]"));
+}
+
+#[test]
+fn tool_result_fetch_reads_window_and_rejects_bad_refs() {
+    let dir = gate_temp_dir("fetch");
+    let runner = gate_test_runner(&dir);
+    let tr = dir.join("tool_results");
+    std::fs::create_dir_all(&tr).unwrap();
+    let body = "0123456789".repeat(30); // 300 chars
+    std::fs::write(tr.join("call1-123.txt"), &body).unwrap();
+    // 正常窗口:offset/max_chars 字符口径,元数据可对账指纹
+    let v = runner.execute_tool_result_fetch(&serde_json::json!({
+        "ref_id": "call1-123", "offset": 10u64, "max_chars": 5u64
+    }));
+    assert_eq!(v["content"], "01234");
+    assert_eq!(v["total_bytes"], body.len());
+    assert_eq!(v["digest"], crate::agent::journal::evorule_digest(&body));
+    assert_eq!(v["returned"], 5);
+    // 缺 ref_id → 结构化错误
+    let v = runner.execute_tool_result_fetch(&serde_json::json!({}));
+    assert!(v["error"].as_str().unwrap().contains("ref_id"));
+    // 非法字符(路径穿越形态)→ fail-closed 拒绝
+    let v = runner.execute_tool_result_fetch(&serde_json::json!({"ref_id": "../../evil"}));
+    assert!(v["error"].as_str().unwrap().contains("invalid"));
+    // 不存在的 ref → not found
+    let v = runner.execute_tool_result_fetch(&serde_json::json!({"ref_id": "nope-1"}));
+    assert!(v["error"].as_str().unwrap().contains("not found"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

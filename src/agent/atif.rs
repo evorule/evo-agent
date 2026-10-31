@@ -421,6 +421,8 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             JournalEvent::EmergencyTrimPerformed { .. } => continue,
             // 服务工具注册降级:启动期环境事实,非对话步,不映射为轨迹步
             JournalEvent::ServiceToolsDegraded { .. } => continue,
+            // 超大工具结果引用化:落盘对账事实,非对话步,不映射为轨迹步
+            JournalEvent::ToolResultOffloaded { .. } => continue,
             JournalEvent::TurnStarted { goal, .. } => {
                 // 轮界:上一个 agent 步必已随 turn_ended 收步;开用户步
                 let message = match user_msgs.get(user_ordinal) {

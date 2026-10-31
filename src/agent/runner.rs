@@ -107,6 +107,60 @@ fn truncate_tool_result(raw: String, max_chars: usize) -> String {
     format!("{}{}{}", head_str, marker, tail_str)
 }
 
+// ---- 超大工具结果引用化出站门 ----
+
+/// 引用块头尾摘要保留量(chars;head/tail 之间以标记行分隔)
+const TOOL_RESULT_REF_HEAD_CHARS: usize = 2000;
+const TOOL_RESULT_REF_TAIL_CHARS: usize = 1000;
+/// 引用文件目录名(相对 journal 目录;与 {session_id}.jsonl 同根)
+const TOOL_RESULTS_DIR: &str = "tool_results";
+/// 引用取回工具名(保留名)。runner 直拦不进管道:只读本地无副作用,
+/// manifest 静态表不加条目(102 数量锁快照不破);发现/契约面由引用块
+/// 尾部指引(「调用 tool_result_fetch 工具,按 ref_id 分页读取」)承载。
+const TOOL_RESULT_FETCH_TOOL: &str = "tool_result_fetch";
+/// 取回单窗缺省 chars(上限=引用化阈值 tool_result_max_chars,窗口不二次引用化)
+const TOOL_RESULT_FETCH_DEFAULT_CHARS: usize = 20000;
+/// ref_id 段字符白名单(文件名安全;其余替换下划线)
+fn sanitize_ref_segment(call_id: &str) -> String {
+    let cleaned: String = call_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let mut s: String = cleaned.chars().take(80).collect();
+    if s.is_empty() {
+        s.push_str("call");
+    }
+    s
+}
+
+/// 构造超大工具结果的引用块(纯函数;LLM 可见面)。原文完整保留在引用文件,
+/// messages/会话记忆只携带本块:指纹可验证、头尾可判性、按 ref_id 可取回。
+fn build_tool_result_reference(
+    raw: &str,
+    ref_id: &str,
+    tool_name: &str,
+    rel_path: &str,
+    digest: &str,
+) -> String {
+    let total_chars = raw.chars().count();
+    let head: String = raw.chars().take(TOOL_RESULT_REF_HEAD_CHARS).collect();
+    let tail_start = total_chars.saturating_sub(TOOL_RESULT_REF_TAIL_CHARS);
+    let tail: String = raw.chars().skip(tail_start).collect();
+    format!(
+        "[TOOL_RESULT_REF]\n\
+         ref_id: {ref_id}\n\
+         tool: {tool_name}\n\
+         bytes: {}\n\
+         digest: {digest}\n\
+         path: {rel_path}\n\
+         head:\n{head}\n...[head/tail elided {} chars]...\ntail:\n{tail}\n\
+         (完整结果已落盘。需要更多内容时调用 tool_result_fetch 工具,按 ref_id 分页读取。)",
+        raw.len(),
+        total_chars
+            .saturating_sub(TOOL_RESULT_REF_HEAD_CHARS + TOOL_RESULT_REF_TAIL_CHARS)
+    )
+}
+
 // ---- B1 多模态上行:旁路图片提取/还原/窗口预算 ----
 
 /// B1:单图 base64 字符上限(2 MB;解码后约 1.5 MB,本机内存约束下的单图口径)
@@ -2267,6 +2321,125 @@ impl AgentRunner {
     pub fn with_startup_event(mut self, event: crate::agent::journal::JournalEvent) -> Self {
         self.startup_events.push(event);
         self
+    }
+
+    /// 超大工具结果引用化出站门:结果超过回喂上限时原文落盘到
+    /// `{journal_dir}/tool_results/`(完整保留),回喂与持久化两面统一改为
+    /// 携带结构化引用块(指纹+头尾摘要+取回指引),journal 落对账事件。
+    /// fail-soft:journal 目录未启用或落盘失败时降级为截断回喂(既有行为)。
+    /// 未超限原样归还(字节级现行为不变)。
+    fn gate_tool_result(&self, raw: String, tool_name: &str, call_id: Option<&str>) -> String {
+        // 快路径:未超限原样(truncate 同口径)
+        if raw.len() <= self.tool_result_max_chars && raw.chars().count() <= self.tool_result_max_chars
+        {
+            return raw;
+        }
+        let Some(dir) = &self.journal_dir else {
+            return truncate_tool_result(raw, self.tool_result_max_chars);
+        };
+        match self.offload_tool_result(&raw, tool_name, call_id, dir) {
+            Ok(reference) => reference,
+            Err(e) => {
+                tracing::warn!(
+                    tool = %tool_name,
+                    size_bytes = raw.len(),
+                    error = %e,
+                    "tool result offload failed; falling back to truncation"
+                );
+                truncate_tool_result(raw, self.tool_result_max_chars)
+            }
+        }
+    }
+
+    /// 引用化落盘执行:写引用文件+journal 对账事件+构造引用块。
+    /// 成功返回引用块全文;任何一步失败返回 Err(调用方降级截断)。
+    fn offload_tool_result(
+        &self,
+        raw: &str,
+        tool_name: &str,
+        call_id: Option<&str>,
+        dir: &std::path::Path,
+    ) -> Result<String, std::io::Error> {
+        let tool_results = dir.join(TOOL_RESULTS_DIR);
+        std::fs::create_dir_all(&tool_results)?;
+        // ref_id = 净化 call_id 段 + 纳秒时间戳(保唯一保序;=引用文件 stem)
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let ref_id = format!("{}-{}", sanitize_ref_segment(call_id.unwrap_or("call")), nanos);
+        let file_name = format!("{ref_id}.txt");
+        std::fs::write(tool_results.join(&file_name), raw)?;
+        let rel_path = format!("{TOOL_RESULTS_DIR}/{file_name}");
+        let digest = crate::agent::journal::evorule_digest(raw);
+        // journal 对账事件(fail-soft:落账失败不影响引用块生效)
+        if let Some(j) = self.active_journal.as_deref() {
+            let _ = j.write_event(crate::agent::journal::JournalEvent::ToolResultOffloaded {
+                call_id: call_id.unwrap_or_default().to_string(),
+                ref_id: ref_id.clone(),
+                path: rel_path.clone(),
+                size_bytes: raw.len(),
+                content_digest: digest.clone(),
+            });
+        }
+        Ok(build_tool_result_reference(
+            raw, &ref_id, tool_name, &rel_path, &digest,
+        ))
+    }
+
+    /// 引用取回执行(tool_result_fetch 保留名;只读本地无副作用)。
+    /// 按 ref_id 从引用文件分页读取字符窗口,返回窗口+元数据
+    /// (total_bytes/digest 可对账引用块指纹)。ref_id 白名单校验+
+    /// canonicalize 目录包含校验(路径逃逸 fail-closed)。
+    fn execute_tool_result_fetch(&self, args: &Value) -> Value {
+        let Some(dir) = &self.journal_dir else {
+            return serde_json::json!({"error": "tool_results unavailable (journal dir disabled)"});
+        };
+        let Some(ref_id) = args.get("ref_id").and_then(|v| v.as_str()) else {
+            return serde_json::json!({"error": "missing required param: ref_id"});
+        };
+        if ref_id.is_empty()
+            || !ref_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return serde_json::json!({"error": "invalid ref_id", "ref_id": ref_id});
+        }
+        let tool_results = dir.join(TOOL_RESULTS_DIR);
+        let path = tool_results.join(format!("{ref_id}.txt"));
+        // canonical 包含校验(fail-closed:任何解析失败=拒绝)
+        let (Ok(canon), Ok(canon_dir)) = (path.canonicalize(), tool_results.canonicalize()) else {
+            return serde_json::json!({"error": "ref not found", "ref_id": ref_id});
+        };
+        if !canon.starts_with(&canon_dir) {
+            return serde_json::json!({"error": "invalid ref_id (path escape rejected)"});
+        }
+        let Ok(raw) = std::fs::read_to_string(&canon) else {
+            return serde_json::json!({"error": "ref unreadable", "ref_id": ref_id});
+        };
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let max_chars = args
+            .get("max_chars")
+            .and_then(|v| v.as_u64())
+            .map(|v| (v as usize).min(self.tool_result_max_chars))
+            .unwrap_or(TOOL_RESULT_FETCH_DEFAULT_CHARS)
+            .max(1);
+        let total_chars = raw.chars().count();
+        let start = offset.min(total_chars);
+        let end = (start + max_chars).min(total_chars);
+        let window: String = raw.chars().skip(start).take(end - start).collect();
+        serde_json::json!({
+            "ref_id": ref_id,
+            "total_bytes": raw.len(),
+            "digest": crate::agent::journal::evorule_digest(&raw),
+            "offset": start,
+            "max_chars": max_chars,
+            "returned": window.chars().count(),
+            "content": window,
+        })
     }
 
     /// 写面撤销批:一次接线两钩子(快照仓库 + 自验证门禁;两钩子同点不同
@@ -5117,18 +5290,21 @@ impl AgentRunner {
             std::path::Path::new(B1_IMAGES_DIR),
         );
         let raw_content = extracted_raw.clone();
+        // 引用化出站门:超限结果原文落盘+引用块,回喂/持久化两面统一携带
+        // (原文完整保留在引用文件;未超限原样,行为不变)
+        let gated_content = self.gate_tool_result(raw_content.clone(), tool_name, None);
         let tool_msg = Message::Tool {
-            content: truncate_tool_result(raw_content.clone(), self.tool_result_max_chars),
+            content: gated_content.clone(),
             tool_name: tool_name.to_string(),
             images: tool_images,
         };
         messages.push(tool_msg);
-        // P0: 持久化 tool 消息
+        // P0: 持久化 tool 消息(引用块;完整原文在引用文件,journal 有对账事件)
         self.persist_message(
             session_id,
             tool_idx,
             Message::Tool {
-                content: raw_content,
+                content: gated_content,
                 tool_name: tool_name.to_string(),
                 images: Vec::new(),
             },
@@ -5227,6 +5403,12 @@ impl AgentRunner {
         journal: Option<&crate::agent::journal::JournalWriter>,
         precomputed: Option<Value>,
     ) -> Result<(Value, Option<Value>), AgentError> {
+        // 引用取回保留名直拦(先于管道):只读本地无副作用,不经治理八阶段;
+        // 审计面照常由外层 tool_invoked/tool_result 落账。并行臂不拦——
+        // 不在聚焦面会被②结构化拒绝(fail-visible),LLM 单独重调即可。
+        if tool_name == TOOL_RESULT_FETCH_TOOL {
+            return Ok((self.execute_tool_result_fetch(args), None));
+        }
         // 一管道(工具面统一架构 §3.2):本函数为管道的薄翻译层——
         // 八阶段(①查表②聚焦③意图④裁决⑤审批⑥沙箱位⑦执行⑧落账)由
         // ToolExecutionPipeline 执行;治理拦截两态 JSON 文案/裁决 fail-closed
@@ -8929,11 +9111,15 @@ impl AgentRunner {
                                                                warn!(%session_id, call_id = %cid, error = %e, "tool_result journal failed");
                                                            }
                                                        }
+                                                       // 引用化出站门:超限结果原文落盘+引用块,
+                                                       // 回喂/持久化两面统一携带(原文在引用文件)
+                                                       let gated_content = runner.gate_tool_result(
+                                                           raw_content.clone(),
+                                                           &tc.name,
+                                                           j_call_id.as_deref(),
+                                                       );
                                                        let tool_msg = Message::Tool {
-                                                           content: truncate_tool_result(
-                                                               raw_content.clone(),
-                                                               runner.tool_result_max_chars,
-                                                           ),
+                                                           content: gated_content.clone(),
                                                            tool_name: tc.name.clone(),
                                                            images: tool_images,
                                                        };
@@ -8943,7 +9129,7 @@ impl AgentRunner {
                                                                &session_id,
                                                                tool_idx,
                                                                Message::Tool {
-                                                                   content: raw_content,
+                                                                   content: gated_content,
                                                                    tool_name: tc.name.clone(),
                                                                    images: Vec::new(),
                                                                },
@@ -9482,11 +9668,15 @@ impl AgentRunner {
                                                    raw_content.push('\n');
                                                    raw_content.push_str(&adv);
                                                }
+                                               // 引用化出站门:超限结果原文落盘+引用块,
+                                               // 回喂/持久化两面统一携带(原文在引用文件)
+                                               let gated_content = runner.gate_tool_result(
+                                                   raw_content.clone(),
+                                                   &tool_name,
+                                                   j_call_id.as_deref(),
+                                               );
                                                let tool_msg = Message::Tool {
-                                                   content: truncate_tool_result(
-                                                       raw_content.clone(),
-                                                       runner.tool_result_max_chars,
-                                                   ),
+                                                   content: gated_content.clone(),
                                                    tool_name: tool_name.clone(),
                                                    images: tool_images,
                                                };
@@ -9496,7 +9686,7 @@ impl AgentRunner {
                                                        &session_id,
                                                        tool_idx,
                                                        Message::Tool {
-                                                           content: raw_content,
+                                                           content: gated_content,
                                                            tool_name: tool_name.clone(),
                                                            images: Vec::new(),
                                                        },
