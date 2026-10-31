@@ -51,9 +51,13 @@ mod tests {
     #[test]
     fn test_readme_tool_count_locked() {
         // 门禁增强:README 规则工具集计数与 rule_tool_specs 实际数量锁定,防文档漂移
+        // (README 已随 F0 面批改为英文叙述式计数)
         let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
             .expect("read README.md");
-        let expected = format!("**规则管理工具集** | {} 个工具", rule_tool_specs().len());
+        let expected = format!(
+            "Tool totals: {} by spec count (test-locked)",
+            rule_tool_specs().len()
+        );
         assert!(
             readme.contains(&expected),
             "README 工具计数与实际不一致,期望包含: {expected}"

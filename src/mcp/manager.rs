@@ -79,6 +79,10 @@ impl McpManager {
         &self,
         cfg: &McpServerConfig,
     ) -> Result<(std::sync::Arc<McpClient>, Vec<McpToolSpec>), String> {
+        // 拉起装载门（来源认证面）：未登记 server 在此拒载（fail-visible 落
+        // Failed 态），不会进入任何 spawn/注册路径
+        super::spawn_gate::ensure_spawn_allowed(&cfg.name, &cfg.command, &cfg.args)?;
+
         self.set_entry(
             cfg.name.clone(),
             McpServerEntry {

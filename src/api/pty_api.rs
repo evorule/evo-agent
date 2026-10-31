@@ -81,16 +81,17 @@ pub async fn pty_ws(
             .into_response();
     }
 
-    ws.max_message_size(WS_MAX_MESSAGE_BYTES).on_upgrade(move |socket| {
-        handle_socket(
-            socket,
-            state,
-            term_id,
-            cols,
-            rows,
-            query.workspace.map(std::path::PathBuf::from),
-        )
-    })
+    ws.max_message_size(WS_MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| {
+            handle_socket(
+                socket,
+                state,
+                term_id,
+                cols,
+                rows,
+                query.workspace.map(std::path::PathBuf::from),
+            )
+        })
 }
 
 async fn handle_socket(

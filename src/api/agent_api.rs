@@ -2185,6 +2185,15 @@ async fn run_agent_stream(
         req.workspace.as_deref().map(std::path::Path::new),
         state.agent_workspace_root(),
     ))
+    // checkpoint 写域与写面工具同源(与 run_agent 口径一致;未接线曾致
+    // 判据捕获后未消费的 unused 告警)
+    .with_workspace_checkpoint_writable(
+        &crate::api::serve_tools::session_workspace_root(
+            req.workspace.as_deref().map(std::path::Path::new),
+            state.agent_workspace_root(),
+        ),
+        checkpoint_writable,
+    )
     // B21 D3:注入主动压缩策略(longSession.compaction.* 设置映射;同 run_agent 口径)
     .with_compaction_policy(crate::agent::runner::CompactionPolicy::from_settings(
         &merged_settings,

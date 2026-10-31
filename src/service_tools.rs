@@ -85,11 +85,7 @@ const SERVICE_CATALOG_DOMAINS: &[(&str, &str, &str)] = &[
     ("grav", "引力相对论", "史瓦西半径、近日点进动、光线偏折"),
     ("fluid", "流体力学", "伯努利、连续性、静水压"),
     ("quantum", "量子力学", "无限深势阱、谐振子"),
-    (
-        "gnss",
-        "卫星导航",
-        "钟差/相对论漂移/偏心率改正/出厂预偏置",
-    ),
+    ("gnss", "卫星导航", "钟差/相对论漂移/偏心率改正/出厂预偏置"),
     ("metrology", "计量", "测量不确定度传播"),
     (
         "geometry",
@@ -149,7 +145,9 @@ fn render_service_catalog_from(names: &[&str]) -> Option<String> {
         names.len(),
         groups.len()
     );
-    out.push_str("数值/公式/量纲/单位换算/期限/校验类问题：先查下目录调服务，不要心算，不要手算近似值。\n");
+    out.push_str(
+        "数值/公式/量纲/单位换算/期限/校验类问题：先查下目录调服务，不要心算，不要手算近似值。\n",
+    );
     for (key, (meta, mut services)) in groups {
         services.sort_unstable();
         let list = services.join(", ");
@@ -447,8 +445,8 @@ mod tests {
         drop(probe);
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            let listener = TcpListener::bind(addr)
-                .expect("delayed fixture re-bind failed (port taken over?)");
+            let listener =
+                TcpListener::bind(addr).expect("delayed fixture re-bind failed (port taken over?)");
             accept_and_respond(listener, responses, &std::sync::Mutex::new(Vec::new()));
         });
         format!("http://{addr}")

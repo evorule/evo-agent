@@ -1906,7 +1906,10 @@ mod tests {
             .await;
         let client = EvoruleApiClient::new(&server.url());
         match client
-            .submit_command("s1", &serde_json::json!({"type": "call_external", "params": {}}))
+            .submit_command(
+                "s1",
+                &serde_json::json!({"type": "call_external", "params": {}}),
+            )
             .await
         {
             Err(ApiError::Rejected(message)) => {
@@ -1936,7 +1939,10 @@ mod tests {
             .await;
         let client = EvoruleApiClient::new(&server.url());
         match client
-            .submit_command_wait("s1", &serde_json::json!({"type": "call_external", "params": {}}))
+            .submit_command_wait(
+                "s1",
+                &serde_json::json!({"type": "call_external", "params": {}}),
+            )
             .await
         {
             Err(ApiError::Rejected(message)) => {

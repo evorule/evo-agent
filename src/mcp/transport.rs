@@ -94,11 +94,18 @@ impl StdioTransport {
     /// `command` 如 `"npx"`,`args` 如 `["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]`。
     /// 子进程的 stderr 会被丢弃(不 pipe,继承父进程;如需捕获可后续扩展)。
     pub async fn spawn(command: &str, args: &[&str]) -> Result<Self, String> {
-        let mut child = tokio::process::Command::new(command)
-            .args(args)
+        // 最小环境（凭据外泄面收窄）：env_clear 后仅注入最小安全集，
+        // MCP server 所需业务键经 mcp.toml env 显式声明（见 spawn_with_env）
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args)
             .stdin(StdIo::piped())
             .stdout(StdIo::piped())
             .stderr(StdIo::null())
+            .env_clear();
+        for (k, v) in super::spawn_gate::minimal_spawn_env(&HashMap::new()) {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("spawn MCP server '{}' failed: {}", command, e))?;
 
@@ -134,12 +141,15 @@ impl StdioTransport {
         args: &[&str],
         env: &HashMap<String, String>,
     ) -> Result<Self, String> {
+        // 最小环境 + mcp.toml env 显式增量（env_clear 后注入；
+        // 业务/凭据键不经此通道——显式声明是唯一扩面手段）
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
             .stdin(StdIo::piped())
             .stdout(StdIo::piped())
-            .stderr(StdIo::null());
-        for (k, v) in env {
+            .stderr(StdIo::null())
+            .env_clear();
+        for (k, v) in super::spawn_gate::minimal_spawn_env(env) {
             cmd.env(k, v);
         }
         let mut child = cmd

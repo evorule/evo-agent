@@ -124,7 +124,13 @@ const TOOL_RESULT_FETCH_DEFAULT_CHARS: usize = 20000;
 fn sanitize_ref_segment(call_id: &str) -> String {
     let cleaned: String = call_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let mut s: String = cleaned.chars().take(80).collect();
     if s.is_empty() {
@@ -156,8 +162,7 @@ fn build_tool_result_reference(
          head:\n{head}\n...[head/tail elided {} chars]...\ntail:\n{tail}\n\
          (完整结果已落盘。需要更多内容时调用 tool_result_fetch 工具,按 ref_id 分页读取。)",
         raw.len(),
-        total_chars
-            .saturating_sub(TOOL_RESULT_REF_HEAD_CHARS + TOOL_RESULT_REF_TAIL_CHARS)
+        total_chars.saturating_sub(TOOL_RESULT_REF_HEAD_CHARS + TOOL_RESULT_REF_TAIL_CHARS)
     )
 }
 
@@ -2330,7 +2335,8 @@ impl AgentRunner {
     /// 未超限原样归还(字节级现行为不变)。
     fn gate_tool_result(&self, raw: String, tool_name: &str, call_id: Option<&str>) -> String {
         // 快路径:未超限原样(truncate 同口径)
-        if raw.len() <= self.tool_result_max_chars && raw.chars().count() <= self.tool_result_max_chars
+        if raw.len() <= self.tool_result_max_chars
+            && raw.chars().count() <= self.tool_result_max_chars
         {
             return raw;
         }
@@ -2367,7 +2373,11 @@ impl AgentRunner {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
-        let ref_id = format!("{}-{}", sanitize_ref_segment(call_id.unwrap_or("call")), nanos);
+        let ref_id = format!(
+            "{}-{}",
+            sanitize_ref_segment(call_id.unwrap_or("call")),
+            nanos
+        );
         let file_name = format!("{ref_id}.txt");
         std::fs::write(tool_results.join(&file_name), raw)?;
         let rel_path = format!("{TOOL_RESULTS_DIR}/{file_name}");
@@ -2417,10 +2427,7 @@ impl AgentRunner {
         let Ok(raw) = std::fs::read_to_string(&canon) else {
             return serde_json::json!({"error": "ref unreadable", "ref_id": ref_id});
         };
-        let offset = args
-            .get("offset")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let max_chars = args
             .get("max_chars")
             .and_then(|v| v.as_u64())
@@ -10749,9 +10756,7 @@ fn clear_tool_results(region: &[Message], max_clear: usize) -> (Vec<Message>, us
 /// `length limit exceeded` 任一即命中——同时覆盖承载方缺省体限拒绝与上游
 /// provider 同类拒绝(错误串透传形态)。非 413 类错误行为零变化。
 pub(crate) fn is_payload_limit_error(e: &str) -> bool {
-    e.contains("413")
-        || e.contains("Payload Too Large")
-        || e.contains("length limit exceeded")
+    e.contains("413") || e.contains("Payload Too Large") || e.contains("length limit exceeded")
 }
 
 /// 413 类错误 fail-visible 指引(死亡线终局文案;与 UI 面一致的中文口径)
@@ -10851,8 +10856,7 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
                             .and_then(|d| d.as_str().map(str::to_string))
                     })
                     .unwrap_or_else(|| "unknown".to_string());
-                *content =
-                    format!("[approval roundtrip elided: {n} bytes; decision: {decision}]");
+                *content = format!("[approval roundtrip elided: {n} bytes; decision: {decision}]");
                 *images = Vec::new();
                 report.folded_approvals += 1;
             }
@@ -10860,9 +10864,7 @@ pub(crate) fn emergency_trim_for_payload_limit(messages: &mut Vec<Message>) -> E
     }
 
     // ③整段压缩兜底(轮界切分,不破配对)
-    if let Some((sys_end, split)) =
-        compaction_region_bounds(messages, EMERGENCY_TRIM_KEEP_ROUNDS)
-    {
+    if let Some((sys_end, split)) = compaction_region_bounds(messages, EMERGENCY_TRIM_KEEP_ROUNDS) {
         if split > sys_end {
             let elided = split - sys_end;
             messages.drain(sys_end..split);

@@ -771,8 +771,7 @@ mod tests {
         // ([llm] max_tokens)随行,否则子 runner 落 with_defaults 4096 硬兜底
         let mut cfg = crate::config::LlmConfig::default();
         cfg.max_tokens = Some(32768);
-        let ctx = make_ctx()
-            .with_llm_handler(crate::io_handlers::LlmHandler::from_config(&cfg));
+        let ctx = make_ctx().with_llm_handler(crate::io_handlers::LlmHandler::from_config(&cfg));
         let runner = ctx.wire_llm_handler(crate::agent::runner::AgentRunner::new(
             crate::agent::runner::AgentConfig::default(),
             make_test_client(),

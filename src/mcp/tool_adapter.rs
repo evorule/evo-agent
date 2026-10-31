@@ -377,6 +377,13 @@ async fn connect_and_register_one(
     tool_handler: &mut crate::io_handlers::tool_handler::ToolHandler,
     server_cfg: &crate::config::McpServerConfig,
 ) -> Result<usize, String> {
+    // 拉起装载门（来源认证面）：与 serve 面 manager 同一闸口
+    crate::mcp::spawn_gate::ensure_spawn_allowed(
+        &server_cfg.name,
+        &server_cfg.command,
+        &server_cfg.args,
+    )?;
+
     let args: Vec<&str> = server_cfg.args.iter().map(|s| s.as_str()).collect();
 
     let transport = if server_cfg.env.is_empty() {

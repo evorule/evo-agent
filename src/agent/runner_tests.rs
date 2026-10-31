@@ -5473,10 +5473,7 @@ async fn test_payload_limit_retry_after_emergency_trim() {
         "data: {\"type\":\"Stable\"}\n\n",
     );
     let _events_mock = server
-        .mock(
-            "GET",
-            format!("/api/sessions/{session_id}/events").as_str(),
-        )
+        .mock("GET", format!("/api/sessions/{session_id}/events").as_str())
         .with_status(200)
         .with_header("content-type", "text/event-stream")
         .with_body(sse_body)
@@ -5570,11 +5567,8 @@ async fn test_payload_limit_retry_after_emergency_trim() {
         .with_memory(mem)
         .with_llm_handler(llm);
 
-    let stream = runner.run_continuation(
-        session_id.to_string(),
-        "continue".to_string(),
-        Vec::new(),
-    );
+    let stream =
+        runner.run_continuation(session_id.to_string(), "continue".to_string(), Vec::new());
     let mut stream = stream;
 
     let mut final_done: Option<AgentResult> = None;
@@ -5621,7 +5615,11 @@ async fn test_payload_limit_retry_after_emergency_trim() {
         "第二发应被紧急裁剪(至少减半): first={first}, second={second}"
     );
     let done = final_done.expect("应收到 Done 事件收轮");
-    assert!(done.success, "裁剪重试后应成功收轮,实际 error={:?}", done.error);
+    assert!(
+        done.success,
+        "裁剪重试后应成功收轮,实际 error={:?}",
+        done.error
+    );
 }
 
 /// 二次仍超限 → fail-visible:Error 事件携带新开会话指引,轮终止形态
@@ -5700,10 +5698,7 @@ async fn test_payload_limit_second_failure_fails_visible() {
         .create_async()
         .await;
     let _events_mock = server
-        .mock(
-            "GET",
-            format!("/api/sessions/{session_id}/events").as_str(),
-        )
+        .mock("GET", format!("/api/sessions/{session_id}/events").as_str())
         .with_status(200)
         .with_header("content-type", "text/event-stream")
         .with_body(concat!(
@@ -5732,11 +5727,8 @@ async fn test_payload_limit_second_failure_fails_visible() {
         .with_memory(mem)
         .with_llm_handler(llm);
 
-    let stream = runner.run_continuation(
-        session_id.to_string(),
-        "continue".to_string(),
-        Vec::new(),
-    );
+    let stream =
+        runner.run_continuation(session_id.to_string(), "continue".to_string(), Vec::new());
     let mut stream = stream;
 
     let mut error_text = String::new();
@@ -5760,7 +5752,12 @@ async fn test_payload_limit_second_failure_fails_visible() {
 
     // 恰两次调用(裁剪后重试一次,不再更多)
     let observed = llm_probe.mock_observed_params();
-    assert_eq!(observed.len(), 2, "重试一次后必须止步,实际 {} 次", observed.len());
+    assert_eq!(
+        observed.len(),
+        2,
+        "重试一次后必须止步,实际 {} 次",
+        observed.len()
+    );
     // fail-visible:指引明确
     assert!(
         error_text.contains("413") || error_text.contains("Payload Too Large"),
@@ -5800,10 +5797,7 @@ async fn test_non_payload_error_no_trim_no_retry() {
         .create_async()
         .await;
     let _events_mock = server
-        .mock(
-            "GET",
-            format!("/api/sessions/{session_id}/events").as_str(),
-        )
+        .mock("GET", format!("/api/sessions/{session_id}/events").as_str())
         .with_status(200)
         .with_header("content-type", "text/event-stream")
         .with_body("data: {\"type\":\"IoRequest\",\"io_type\":\"call_external\",\"params\":{}}\n\n")
@@ -5828,11 +5822,8 @@ async fn test_non_payload_error_no_trim_no_retry() {
         .with_memory(mem)
         .with_llm_handler(llm);
 
-    let stream = runner.run_continuation(
-        session_id.to_string(),
-        "continue".to_string(),
-        Vec::new(),
-    );
+    let stream =
+        runner.run_continuation(session_id.to_string(), "continue".to_string(), Vec::new());
     let mut stream = stream;
 
     let mut error_text = String::new();
@@ -5856,7 +5847,12 @@ async fn test_non_payload_error_no_trim_no_retry() {
 
     // 仅一次调用,无裁剪无重试(现行行为)
     let observed = llm_probe.mock_observed_params();
-    assert_eq!(observed.len(), 1, "非 413 错误不得触发重试,实际 {} 次", observed.len());
+    assert_eq!(
+        observed.len(),
+        1,
+        "非 413 错误不得触发重试,实际 {} 次",
+        observed.len()
+    );
     assert!(
         !error_text.contains("新开会话"),
         "非 413 错误不应携带裁剪指引: {error_text}"
@@ -5895,11 +5891,9 @@ fn test_emergency_trim_folds_oldest_and_compacts_keeps_recent_rounds() {
     let big = |n: usize| "y".repeat(n);
     // 3 个 user 轮(> KEEP_ROUNDS):第一个 tool 落在可折叠区/压缩区,
     // 后两个落在近程保留区
-    let mut msgs = vec![
-        Message::System {
-            content: "sys".into(),
-        },
-    ];
+    let mut msgs = vec![Message::System {
+        content: "sys".into(),
+    }];
     for i in 0..(EMERGENCY_TRIM_KEEP_ROUNDS + 1) {
         msgs.push(Message::User {
             content: format!("u{i}"),
@@ -5920,7 +5914,10 @@ fn test_emergency_trim_folds_oldest_and_compacts_keeps_recent_rounds() {
 
     // ①层确实执行(elided_tool_results 如实落账),但折叠产出被③吸收
     assert_eq!(report.elided_tool_results, 1);
-    assert!(report.history_compacted, "user 轮数 > KEEP_ROUNDS 时③必触发");
+    assert!(
+        report.history_compacted,
+        "user 轮数 > KEEP_ROUNDS 时③必触发"
+    );
     // 中段(u0,a0,tool0 共 3 条)替换为单条占位:10 - 3 + 1 = 8
     assert_eq!(msgs.len(), 8, "实际: {msgs:?}");
     assert!(matches!(&msgs[0], Message::System { content } if content == "sys"));
@@ -5930,7 +5927,10 @@ fn test_emergency_trim_folds_oldest_and_compacts_keeps_recent_rounds() {
         "应有整段压缩占位: {:?}",
         msgs[1]
     );
-    assert!(!msgs.iter().any(|m| m.content().contains("u0")), "最老轮被压缩");
+    assert!(
+        !msgs.iter().any(|m| m.content().contains("u0")),
+        "最老轮被压缩"
+    );
     // 近程两轮完整保留,工具结果保真(40_000)
     let tools: Vec<&str> = msgs
         .iter()
@@ -5940,7 +5940,10 @@ fn test_emergency_trim_folds_oldest_and_compacts_keeps_recent_rounds() {
         })
         .collect();
     assert_eq!(tools.len(), 2);
-    assert!(tools.iter().all(|c| c.len() == 40_000), "近程内工具结果保真");
+    assert!(
+        tools.iter().all(|c| c.len() == 40_000),
+        "近程内工具结果保真"
+    );
     assert!(report.after_chars < report.before_chars);
 }
 
@@ -6032,8 +6035,7 @@ fn test_emergency_trim_history_compaction_keeps_recent_rounds() {
 // ---- 超大工具结果引用化出站门 ----
 
 fn gate_test_runner(dir: &std::path::Path) -> AgentRunner {
-    AgentRunner::new(AgentConfig::default(), make_test_client())
-        .with_journal_dir(dir.to_path_buf())
+    AgentRunner::new(AgentConfig::default(), make_test_client()).with_journal_dir(dir.to_path_buf())
 }
 
 fn gate_temp_dir(tag: &str) -> std::path::PathBuf {
@@ -6066,12 +6068,19 @@ fn gate_offloads_oversized_result_with_reference_block() {
         "z".repeat(1500)
     );
     let out = runner.gate_tool_result(raw.clone(), "audit_get", Some("call-42"));
-    assert!(out.starts_with("[TOOL_RESULT_REF]"), "引用块形态: {}", &out[..out.len().min(80)]);
+    assert!(
+        out.starts_with("[TOOL_RESULT_REF]"),
+        "引用块形态: {}",
+        &out[..out.len().min(80)]
+    );
     assert!(out.contains("ref_id: call-42-"));
     assert!(out.contains("tool: audit_get"));
     assert!(out.contains(&format!("bytes: {}", raw.len())));
     let dg = crate::agent::journal::evorule_digest(&raw);
-    assert!(out.contains(&format!("digest: {dg}")), "指纹应与原文复算一致");
+    assert!(
+        out.contains(&format!("digest: {dg}")),
+        "指纹应与原文复算一致"
+    );
     assert!(out.contains("HEAD-a"), "头摘要保真");
     assert!(out.contains("\nzzz"), "尾摘要保真(尾部 1000 chars 全 z 段)");
     assert!(out.contains("tool_result_fetch"), "取回指引在场");

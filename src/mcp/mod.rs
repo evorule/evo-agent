@@ -80,6 +80,7 @@
 pub mod client;
 pub mod manager;
 pub mod server;
+pub mod spawn_gate;
 pub mod store;
 pub mod tool_adapter;
 pub mod transport;

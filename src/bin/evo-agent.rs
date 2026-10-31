@@ -920,47 +920,51 @@ fn cmd_run(
         // delegate 内部按子定义 def.tools 白名单过滤)
         let delegate_toolkit = tool_handler.clone();
 
-        AgentRunner::from_definition(def.clone(), client.clone(), tool_handler, Some(llm_handler.clone()))
-            .await
-            .map(|r| {
-                let mut runner = r.with_capability_boundary(capability_boundary)
-                    // 定义级显式声明的执行环境 profile 随 tool_result 落账;
-                    // 未声明=None=落账无标记(缺省语义零变化)
-                    .with_execution_profile_marker(def.execution_profile.as_deref())
-                    // CLI run 主路径 delegate+journal 接线——serve 面
-                    // (agent_api.rs run 端点)完整先例的镜像。此前 CLI 只接
-                    // capability_boundary+wire_accounting:general.json 等声明了
-                    // "delegate" 工具但执行能力未注册(tool_call 无处解析),
-                    // journal=None(子轨迹无账)——CLI/serve 不对称。
-                    // 治理段:CLI 主路径无 S2 段,子代理同口径 None(delegate
-                    // 字段文档口径);serve 三面才存在治理段下放。
-                    .with_journal_dir(workdir.join("data").join("sessions"))
-                    .with_workspace_checkpoint(workdir)
-                    .with_delegate_context(
-                        evo_agent::agent::delegate::DelegateContext::new(
-                            agent_name,
-                            mgr.clone(),
-                            client.clone(),
-                        )
-                        // LLM handler 同源下放(主 runner 同款统一解析产物;
-                        // 子代理同口径防 4096 硬兜底截断推理模型思考)
-                        .with_llm_handler(llm_handler)
-                        .with_journal_dir(workdir.join("data").join("sessions"))
-                        // 子代理工具契约(此前 CLI run 子代理零工具契约=
-                        // 纯文本执行器,与 serve 面 B25 缺陷同源)
-                        .with_toolkit(delegate_toolkit, workdir)
-                        // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
-                        .with_token_counter(std::sync::Arc::new(
-                            std::sync::atomic::AtomicU64::new(0),
-                        )),
+        AgentRunner::from_definition(
+            def.clone(),
+            client.clone(),
+            tool_handler,
+            Some(llm_handler.clone()),
+        )
+        .await
+        .map(|r| {
+            let mut runner = r
+                .with_capability_boundary(capability_boundary)
+                // 定义级显式声明的执行环境 profile 随 tool_result 落账;
+                // 未声明=None=落账无标记(缺省语义零变化)
+                .with_execution_profile_marker(def.execution_profile.as_deref())
+                // CLI run 主路径 delegate+journal 接线——serve 面
+                // (agent_api.rs run 端点)完整先例的镜像。此前 CLI 只接
+                // capability_boundary+wire_accounting:general.json 等声明了
+                // "delegate" 工具但执行能力未注册(tool_call 无处解析),
+                // journal=None(子轨迹无账)——CLI/serve 不对称。
+                // 治理段:CLI 主路径无 S2 段,子代理同口径 None(delegate
+                // 字段文档口径);serve 三面才存在治理段下放。
+                .with_journal_dir(workdir.join("data").join("sessions"))
+                .with_workspace_checkpoint(workdir)
+                .with_delegate_context(
+                    evo_agent::agent::delegate::DelegateContext::new(
+                        agent_name,
+                        mgr.clone(),
+                        client.clone(),
                     )
-                    .wire_accounting(workdir);
-                // 启动期事实入链:注册降级等事件随本会话 journal 落账
-                for ev in startup_service_events.iter() {
-                    runner = runner.with_startup_event(ev.clone());
-                }
-                runner
-            })
+                    // LLM handler 同源下放(主 runner 同款统一解析产物;
+                    // 子代理同口径防 4096 硬兜底截断推理模型思考)
+                    .with_llm_handler(llm_handler)
+                    .with_journal_dir(workdir.join("data").join("sessions"))
+                    // 子代理工具契约(此前 CLI run 子代理零工具契约=
+                    // 纯文本执行器,与 serve 面 B25 缺陷同源)
+                    .with_toolkit(delegate_toolkit, workdir)
+                    // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
+                    .with_token_counter(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
+                )
+                .wire_accounting(workdir);
+            // 启动期事实入链:注册降级等事件随本会话 journal 落账
+            for ev in startup_service_events.iter() {
+                runner = runner.with_startup_event(ev.clone());
+            }
+            runner
+        })
     });
     let runner = match runner_result {
         Ok(r) => r,
