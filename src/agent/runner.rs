@@ -3444,6 +3444,8 @@ impl AgentRunner {
             }
             _ => None,
         };
+        // S2d 服务目录段(service_tools 注册面渲染;None=零注册静默跳过)
+        let service_catalog_segment = crate::service_tools::render_service_catalog();
         let system_prompt = self
             .assembly
             .assemble(
@@ -3464,6 +3466,9 @@ impl AgentRunner {
                 self.agents_md_segment.as_deref(),
                 // 批K 段4:S3c_todo 槽位内容物(开关单键双绑;None=静默跳过)
                 self.todo_summary_segment().as_deref(),
+                // S2d 服务目录槽位内容物(注册面启动期渲染,每轮重渲染
+                // 字节级一致;None=静默跳过)
+                service_catalog_segment.as_deref(),
             )
             .map_err(AgentError::Internal)?;
 
@@ -7311,6 +7316,9 @@ impl AgentRunner {
                                }
                                _ => None,
                            };
+                           // S2d 服务目录段(同 run() 组装点口径)
+                           let service_catalog_segment =
+                               crate::service_tools::render_service_catalog();
                            let system_prompt = match runner.assembly.assemble(
                                &runner.config.system_prompt,
                                runner.config.identity_segment.as_deref(),
@@ -7329,6 +7337,7 @@ impl AgentRunner {
                                // 批K 段4:S3c_todo 槽位内容物(每轮装配重建——
                                // 状态锚定不靠消息历史;None=静默跳过)
                                runner.todo_summary_segment().as_deref(),
+                               service_catalog_segment.as_deref(),
                            ) {
                                Ok(p) => p,
                                Err(e) => {

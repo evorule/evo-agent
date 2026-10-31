@@ -59,6 +59,130 @@ pub fn service_parameters(name: &str) -> Option<serde_json::Value> {
     parameters().read().ok()?.get(name).cloned()
 }
 
+/// 服务能力目录域场景表（静态策展）：前缀 → (显示名, 典型触发场景)。
+/// 命中规则：最长已知前缀优先（`numeric_unit_*` 命中「单位换算」而非
+/// 「数值计算」）；无命中 → 服务名首 `_` 前段作组键、无场景文案
+/// （前向兼容新族，零改码）。
+const SERVICE_CATALOG_DOMAINS: &[(&str, &str, &str)] = &[
+    (
+        "numeric",
+        "数值计算",
+        "高精度十进制/有理数运算、数论、金融利息与摊销、量纲求值——禁止心算",
+    ),
+    ("numeric_unit", "单位换算", "度量衡换算（率显式提供）"),
+    ("unit", "单位换算", "度量衡换算（率显式提供）"),
+    (
+        "inference",
+        "规则推理与量纲",
+        "规则读写集/环路/冲突/前向后向链/反事实/量纲验证",
+    ),
+    (
+        "mechanics",
+        "力学",
+        "牛顿第二定律、匀速运动学、动量冲量、机械能、电路欧姆/电阻、PID",
+    ),
+    ("physics", "物理仿真", "有界重力带仿真、总机械能"),
+    ("grav", "引力相对论", "史瓦西半径、近日点进动、光线偏折"),
+    ("fluid", "流体力学", "伯努利、连续性、静水压"),
+    ("quantum", "量子力学", "无限深势阱、谐振子"),
+    (
+        "gnss",
+        "卫星导航",
+        "钟差/相对论漂移/偏心率改正/出厂预偏置",
+    ),
+    ("metrology", "计量", "测量不确定度传播"),
+    (
+        "geometry",
+        "几何校核",
+        "碰撞/间隙/遮挡/等距投影/管路走线/图样审计",
+    ),
+    ("checksum", "校验码", "Luhn/ISBN/IBAN 校验"),
+    ("gov", "治理统计", "比例分摊、聚合、时间窗（时长/重叠）"),
+    ("cny", "人民币大写", "金额转中文大写"),
+    ("legal", "法务期限", "期限起算与届满"),
+    ("indicator", "技术指标", "SMA/EMA/MACD/RSI"),
+    ("export", "文档导出", "PDF/XLSX/DOCX 生成"),
+    ("template", "模板渲染", "模板填充实例化"),
+    (
+        "browser",
+        "浏览器操作",
+        "网页导航/取文/截图/表单/网络观测（交互类，非计算）",
+    ),
+];
+
+/// 服务名的目录组键：最长已知前缀命中 → (前缀, Some((显示名, 场景)))；
+/// 无命中 → 首 `_` 前段 + None。
+fn catalog_group_of(name: &str) -> (&str, Option<(&'static str, &'static str)>) {
+    let mut best: Option<(&'static str, &'static str, &'static str)> = None;
+    for (prefix, display, scenario) in SERVICE_CATALOG_DOMAINS {
+        let hit = name == *prefix
+            || (name.len() > prefix.len()
+                && name.starts_with(prefix)
+                && name.as_bytes()[prefix.len()] == b'_');
+        if hit && best.map_or(true, |(bp, _, _)| prefix.len() > bp.len()) {
+            best = Some((prefix, display, scenario));
+        }
+    }
+    match best {
+        Some((p, d, s)) => (p, Some((d, s))),
+        None => (name.split('_').next().unwrap_or(name), None),
+    }
+}
+
+/// 确定性纯渲染：紧凑两段制（域行 name-only + 成本纪律尾注）。
+/// 三级全排序（组间组键序 + 组内服务名序，BTreeMap/字节序）⇒ 同输入
+/// 逐字节同输出，跨轮前缀缓存成立。
+fn render_service_catalog_from(names: &[&str]) -> Option<String> {
+    use std::collections::BTreeMap;
+
+    if names.is_empty() {
+        return None;
+    }
+    let mut groups: BTreeMap<&str, (Option<(&'static str, &'static str)>, Vec<&str>)> =
+        BTreeMap::new();
+    for name in names {
+        let (key, meta) = catalog_group_of(name);
+        groups.entry(key).or_insert((meta, Vec::new())).1.push(name);
+    }
+    let mut out = format!(
+        "## 服务能力目录（确定性计算与操作面，共 {} 件 / {} 域）\n",
+        names.len(),
+        groups.len()
+    );
+    out.push_str("数值/公式/量纲/单位换算/期限/校验类问题：先查下目录调服务，不要心算，不要手算近似值。\n");
+    for (key, (meta, mut services)) in groups {
+        services.sort_unstable();
+        let list = services.join(", ");
+        match meta {
+            Some((display, scenario)) => out.push_str(&format!(
+                "- {display}（{key}_*，{} 件，{scenario}）：{list}\n",
+                services.len()
+            )),
+            None => out.push_str(&format!("- {key}（{} 件）：{list}\n", services.len())),
+        }
+    }
+    out.push_str("## 成本纪律\n");
+    out.push_str("- 便宜信息源优先：目录/描述/本地计算可答的，不调外部服务；同类需求先小后大。\n");
+    out.push_str("- 大结果守则：工具返回超限会被自动引用化（落盘+指纹+分页取回 tool_result_fetch）；预判大结果时直接带 offset/max_chars 分页取用，勿一次性全量拉取。");
+    Some(out)
+}
+
+/// 渲染服务能力目录段（system_prompt 常驻能力锚 + 成本纪律尾注）。
+///
+/// 数据源 = 服务描述注册表（启动期注册面写定后只读）：只列实际注册可调用
+/// 的服务（sensitive/缺失/重名服务已被注册面过滤，天然不入目录）。内容只取
+/// 服务名——描述不重复进目录（tools array 已带完整 function schema 与描述）。
+/// 空注册表（零服务部署/注册失败）→ None → 配方槽位静默跳过（fail-soft，
+/// 目录缺失不阻塞会话）。
+pub fn render_service_catalog() -> Option<String> {
+    let map = descriptions().read().ok()?;
+    if map.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = map.keys().map(String::as_str).collect();
+    render_service_catalog_from(&names)
+}
+
 /// 服务代理工具：`call` = `POST /api/services/{name}/invoke`(args 原样透传)
 struct ServiceProxyTool {
     ev: EvoruleApiClient,
@@ -547,5 +671,74 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("empty description"), "应报空描述拒绝: {err}");
         assert!(!handler.has_tool("nodesc_svc"), "被拒服务不应注册为工具");
+    }
+
+    // —— 服务能力目录渲染（纯函数面，与全局注册表无关）——
+
+    #[test]
+    fn service_catalog_groups_sorted_and_known_domains_annotated() {
+        let out = render_service_catalog_from(&[
+            "checksum_luhn",
+            "numeric_decimal_eval",
+            "numeric_unit_convert",
+            "numeric_fin_interest",
+            "browser_navigate",
+            "zzdemo_echo",
+        ])
+        .unwrap();
+        // 头两行：件数/域数与先查目录指引
+        assert!(
+            out.starts_with("## 服务能力目录（确定性计算与操作面，共 6 件 / 5 域）\n"),
+            "目录头形态不符: {out}"
+        );
+        // 组间字典序：browser < checksum < numeric < numeric_unit < zzdemo
+        let b = out.find("- 浏览器操作").unwrap();
+        let c = out.find("- 校验码").unwrap();
+        let n = out.find("- 数值计算").unwrap();
+        let u = out.find("- 单位换算").unwrap();
+        let z = out.find("- zzdemo").unwrap();
+        assert!(b < c && c < n && n < u && u < z, "组间应按组键字典序");
+        // 最长已知前缀命中：numeric_unit_* 归「单位换算」而非「数值计算」
+        assert!(out.contains("- 数值计算（numeric_*，2 件，高精度"));
+        assert!(out.contains("- 单位换算（numeric_unit_*，1 件，度量衡换算"));
+        // 未知前缀回落：组键原样、无场景文案
+        assert!(out.contains("- zzdemo（1 件）：zzdemo_echo"));
+        // 组内字典序
+        let n_row = &out[n..u];
+        assert!(
+            n_row.find("numeric_decimal_eval").unwrap()
+                < n_row.find("numeric_fin_interest").unwrap()
+        );
+        // 尾注成本纪律段
+        assert!(out.contains("## 成本纪律\n"));
+        assert!(out.ends_with("勿一次性全量拉取。"));
+    }
+
+    #[test]
+    fn service_catalog_byte_stability_two_calls_identical() {
+        let names = ["gov_ratio", "gov_time_window", "indicator_sma", "qqx_y"];
+        let a = render_service_catalog_from(&names).unwrap();
+        let b = render_service_catalog_from(&names).unwrap();
+        assert_eq!(a, b, "同输入必须逐字节同输出（跨轮前缀缓存前提）");
+    }
+
+    #[test]
+    fn service_catalog_empty_names_is_none() {
+        assert!(render_service_catalog_from(&[]).is_none());
+    }
+
+    #[test]
+    fn service_catalog_global_registry_path_renders() {
+        // 全局面：注册表非空即渲染且含注册服务名；两次调用逐字节一致
+        // （每轮重渲染稳定性）。空表→None 语义由纯函数空输入用例覆盖
+        // （全局表为进程级共享态，此处只验在场路径）。
+        descriptions()
+            .write()
+            .unwrap()
+            .insert("zzcat_only".to_string(), "目录渲染占位服务".to_string());
+        let out = render_service_catalog().expect("注册表非空应渲染");
+        assert!(out.contains("## 服务能力目录"));
+        assert!(out.contains("zzcat_only"));
+        assert_eq!(out, render_service_catalog().unwrap());
     }
 }

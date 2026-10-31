@@ -221,8 +221,8 @@ fn test_effective_params_records_assembly_recipe_triple() {
     let command = runner.build_call_external_command("sys", "goal", None);
     let eff = &command["params"]["effective_params"];
     assert_eq!(eff["assembly_protocol_version"], "assembly-v3");
-    // 默认配方(AgentRunner::new → default_executor → recipe-v1.2,S2c_agents_md 静态区槽位增补)
-    assert_eq!(eff["assembly_recipe_version"], "recipe-v1.2");
+    // 默认配方(AgentRunner::new → default_executor → recipe-v1.3,S2d_catalog 服务目录槽位增补)
+    assert_eq!(eff["assembly_recipe_version"], "recipe-v1.3");
     let hash = eff["assembly_recipe_hash"].as_str().unwrap();
     assert!(hash.starts_with("blake3:"));
     assert_eq!(hash.len(), "blake3:".len() + 64);
@@ -246,10 +246,10 @@ fn test_assembly_recipe_hash_deterministic_and_content_bound() {
     assert_eq!(hash_a, command_hash(&b), "同配方必须产生同一指纹(确定性)");
 
     // 配方内容变更(不改码):bump recipe_version → 指纹随之变化
-    // (默认现 recipe-v1.2;演示 bump 取 v1.3 保持内容寻址差异)
+    // (默认现 recipe-v1.3;演示 bump 取 v1.4 保持内容寻址差异)
     let mut c = AgentRunner::new(AgentConfig::default(), make_test_client());
     let bumped = crate::agent::assembly::AssemblyRecipe {
-        recipe_version: "recipe-v1.3".to_string(),
+        recipe_version: "recipe-v1.4".to_string(),
         ..Default::default()
     };
     c.assembly = crate::agent::assembly::AssemblyExecutor::new(bumped);
@@ -3125,6 +3125,81 @@ async fn test_capability_boundary_sent_in_create_session() {
         "run_streaming should yield SessionCreated"
     );
     create_mock.assert_async().await;
+}
+
+/// S2d 服务目录接线：注册服务后 run_streaming 组装的 system_prompt
+/// （随 command 载荷上行）必须含目录段+成本纪律段。未注册路径不含目录
+/// 的负向语义由单元面组合覆盖（空注册表→None + 槽位静默跳过），此处
+/// 不做端到端负断言——全局注册表为进程级共享态，并行测试下负断言会
+/// 被其他用例的注册污染。
+#[tokio::test]
+async fn test_run_streaming_system_prompt_carries_service_catalog_after_registration() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+
+    server
+        .mock("GET", "/api/services")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"name":"numeric_decimal_eval","source":"native","sensitive":false,"description":"数值求值"},
+{"name":"checksum_luhn","source":"native","sensitive":false,"description":"Luhn 校验"}]"#,
+        )
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 91}"#)
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", "/api/sessions/91/events")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("")
+        .create_async()
+        .await;
+
+    // 目录段+成本纪律段同帧在场——system prompt 随 command 载荷上行
+    // （recall 断言先例同款;create_session 载荷仅含 initial_content 边界/角色）
+    let command_mock = server
+        .mock("POST", "/api/sessions/91/command")
+        .match_body(mockito::Matcher::Regex(
+            "(?s)服务能力目录.*成本纪律".to_string(),
+        ))
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let mut runner = AgentRunner::new(AgentConfig::default(), client.clone());
+    let n = crate::service_tools::register_service_tools(
+        &mut runner.tool_handler,
+        &client,
+        &[
+            "numeric_decimal_eval".to_string(),
+            "checksum_luhn".to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2, "两件白名单服务应注册成功");
+
+    // 消费流至枯竭（cap 防挂）——保证 command 载荷确实上行后再断言
+    let mut stream = runner.run_streaming("hello".to_string(), Vec::new());
+    let mut event_count = 0;
+    while let Some(_event) = stream.next().await {
+        event_count += 1;
+        if event_count > 50 {
+            break;
+        }
+    }
+
+    command_mock.assert_async().await;
 }
 
 /// C2:验证 run() 中 recall 在 build_system_prompt 之前（召回内容进入 system_prompt）

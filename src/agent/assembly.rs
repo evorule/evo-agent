@@ -25,8 +25,10 @@ use serde::{Deserialize, Serialize};
 /// 批K 段4 增补 S3c_todo 槽位——optional 槽,无 todo 态时逐字节等价 v1.0；
 /// recipe-v1.2 = 增补 S2c_agents_md 槽位——项目记忆段(AGENTS.md 层级)
 /// 从 system prompt 尾段挪入静态区(知识契约之后、记忆召回之前),optional
-/// 槽,无段时逐字节等价 v1.1;动态区(recall/todo)集中尾置的前缀稳定前提）
-pub const DEFAULT_RECIPE_VERSION: &str = "recipe-v1.2";
+/// 槽,无段时逐字节等价 v1.1;动态区(recall/todo)集中尾置的前缀稳定前提；
+/// recipe-v1.3 = 增补 S2d_catalog 槽位——服务能力目录段(静态区尾槽,
+/// 项目记忆之后、记忆召回之前),optional 槽,注册表空时逐字节等价 v1.2）
+pub const DEFAULT_RECIPE_VERSION: &str = "recipe-v1.3";
 
 /// 槽位来源白名单（执行器只认这些来源;新增来源 = 执行器升级 = major）
 pub const SLOT_SOURCES: &[&str] = &[
@@ -34,6 +36,7 @@ pub const SLOT_SOURCES: &[&str] = &[
     "governance_segment",
     "knowledge_segment",
     "agents_md",
+    "service_catalog",
     "recall",
     "todo_summary",
     "definition.capability_boundary.awareness_segment",
@@ -252,6 +255,26 @@ fn default_slots() -> Vec<SlotSpec> {
             // (recall/todo)集中尾置。超限裁剪由装载器负责并带标注,槽内
             // 不再裁剪;None/空 = 未启用,槽位静默跳过 = 既有 agent 逐字节
             // 零影响(recipe-v1.2 minor 增补的等价性依据)
+            degradable: false,
+            optional: true,
+            enabled: true,
+            budget: None,
+            degradation_order: None,
+            sections: None,
+            separator: Some("\n\n".to_string()),
+            role: None,
+            trim: None,
+        },
+        SlotSpec {
+            id: "S2d_catalog".to_string(),
+            source: "service_catalog".to_string(),
+            // 服务能力目录段:紧凑按域分组+典型触发场景+成本纪律尾注——
+            // LLM 侧能力锚常驻(确定性服务发现主修)。内容=启动期注册面
+            // 渲染(service_tools 注册表只含实际注册可调用服务),进程内
+            // 跨轮字节级稳定(三级全排序);静态区尾槽(项目记忆之后、记忆
+            // 召回之前)——被动前缀缓存命中段因此延长到静态头+项目记忆
+            // +服务目录。None/空 = 服务注册为空,槽位静默跳过 = 既有
+            // agent 逐字节零影响(minor 增补的等价性依据)
             degradable: false,
             optional: true,
             enabled: true,
@@ -700,6 +723,8 @@ impl AssemblyExecutor {
     ///   数据集,槽位跳过 = 既有定义零影响)
     /// - `todo_summary`:S3c_todo 源(None = 无清单/开关关,槽位静默跳过;
     ///   runner 侧确定性渲染,小体量不占记忆预算)
+    /// - `service_catalog`:S2d_catalog 源(None/空 = 服务注册为空,槽位
+    ///   静默跳过;service_tools 启动期注册面渲染,进程内跨轮字节级稳定)
     ///
     /// Err 仅当配方声明了执行器不认识的预算基准(budget.base——validate 白名单
     /// 应已拦截,此处运行时兜底 fail-fast),不做静默降级。
@@ -719,6 +744,7 @@ impl AssemblyExecutor {
         knowledge_segment: Option<&str>,
         agents_md: Option<&str>,
         todo_summary: Option<&str>,
+        service_catalog: Option<&str>,
     ) -> Result<String, String> {
         let mut prompt = String::new();
         for slot in &self.recipe.slots {
@@ -768,6 +794,19 @@ impl AssemblyExecutor {
                 // 缓存跨轮命中的前提。None/空 = 未启用,槽位静默跳过
                 "agents_md" => {
                     if let Some(seg) = agents_md {
+                        if !seg.trim().is_empty() {
+                            let sep = slot.separator.as_deref().unwrap_or("\n\n");
+                            prompt.push_str(sep);
+                            prompt.push_str(seg);
+                        }
+                    }
+                }
+                // S2d_catalog:服务能力目录段(紧凑按域分组+典型触发场景+
+                // 成本纪律尾注;service_tools 启动期注册面渲染,内容只含
+                // 实际注册可调用服务)。None/空 = 注册为空,槽位静默跳过 =
+                // 既有 agent 逐字节零影响
+                "service_catalog" => {
+                    if let Some(seg) = service_catalog {
                         if !seg.trim().is_empty() {
                             let sep = slot.separator.as_deref().unwrap_or("\n\n");
                             prompt.push_str(sep);
@@ -864,7 +903,7 @@ mod tests {
     #[test]
     fn test_default_recipe_matches_current_hardcoded_values() {
         let r = AssemblyRecipe::default();
-        assert_eq!(r.recipe_version, "recipe-v1.2");
+        assert_eq!(r.recipe_version, "recipe-v1.3");
         let ids: Vec<&str> = r.slots.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -873,6 +912,7 @@ mod tests {
                 "S2_governance",
                 "S2b_knowledge",
                 "S2c_agents_md",
+                "S2d_catalog",
                 "S3_memory",
                 "S3c_todo",
                 "S4_boundary",
@@ -902,8 +942,18 @@ mod tests {
         assert!(s2c.enabled);
         assert!(s2c.budget.is_none());
         assert_eq!(s2c.separator.as_deref(), Some("\n\n"));
+        // S2d 服务目录段:静态区尾槽(项目记忆之后、记忆召回之前;默认启用,
+        // 目录空=槽位静默跳过;旧自定义配方无此槽=兼容)
+        let s2d = &r.slots[4];
+        assert_eq!(s2d.id, "S2d_catalog");
+        assert_eq!(s2d.source, "service_catalog");
+        assert!(s2d.optional);
+        assert!(!s2d.degradable);
+        assert!(s2d.enabled);
+        assert!(s2d.budget.is_none());
+        assert_eq!(s2d.separator.as_deref(), Some("\n\n"));
         // S3 记忆区:C3 默认 0.25 + clamp(0.1,0.5) + 降级序 stable>summaries>events + notices 置前
-        let s3 = &r.slots[4];
+        let s3 = &r.slots[5];
         assert_eq!(s3.source, "recall");
         assert!(s3.degradable);
         let b = s3.budget.as_ref().unwrap();
@@ -917,7 +967,7 @@ mod tests {
         assert!(s3.sections.unwrap().notices_first);
         // S3c todo 清单摘要(批K 段4):optional + 不可降级 + "\n\n"(清单空/开关关
         // =槽位静默跳过,既有 agent 逐字节零影响)
-        let s3c = &r.slots[5];
+        let s3c = &r.slots[6];
         assert_eq!(s3c.id, "S3c_todo");
         assert_eq!(s3c.source, "todo_summary");
         assert!(s3c.optional);
@@ -926,16 +976,16 @@ mod tests {
         assert!(s3c.budget.is_none());
         assert_eq!(s3c.separator.as_deref(), Some("\n\n"));
         // S4 边界段:optional + "\n\n"
-        assert!(r.slots[6].optional);
-        assert_eq!(r.slots[6].separator.as_deref(), Some("\n\n"));
-        // S4b:B2 启用(optional + skills 未声明时跳过 = 预留期行为逐字节一致)
-        assert!(r.slots[7].enabled);
-        assert!(r.slots[6].optional);
+        assert!(r.slots[7].optional);
         assert_eq!(r.slots[7].separator.as_deref(), Some("\n\n"));
+        // S4b:B2 启用(optional + skills 未声明时跳过 = 预留期行为逐字节一致)
+        assert!(r.slots[8].enabled);
+        assert!(r.slots[7].optional);
+        assert_eq!(r.slots[8].separator.as_deref(), Some("\n\n"));
         // S5 任务:user 角色
-        assert_eq!(r.slots[8].role.as_deref(), Some("user"));
+        assert_eq!(r.slots[9].role.as_deref(), Some("user"));
         // S7 裁剪:KeepSystemKeepLast + buffer 5% + hint 15
-        let t = r.slots[10].trim.as_ref().unwrap();
+        let t = r.slots[11].trim.as_ref().unwrap();
         assert_eq!(t.strategy, "KeepSystemKeepLast");
         assert_eq!(t.buffer_pct, 5);
         assert_eq!(t.hint_budget_tokens, 15);
@@ -979,6 +1029,7 @@ mod tests {
                 Some("KNOW"),
                 Some("AGENTSMD"),
                 Some("TODO"),
+                None,
             )
             .unwrap();
         let know = out.find("KNOW").expect("knowledge segment present");
@@ -1030,6 +1081,7 @@ mod tests {
                 Some("KNOW"),
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(out.starts_with("BASE"));
@@ -1053,6 +1105,7 @@ mod tests {
                 None,
                 None,
                 Some("GOV"),
+                None,
                 None,
                 None,
                 None,
@@ -1274,6 +1327,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1290,6 +1344,7 @@ mod tests {
                 Some(&mem),
                 &recall,
                 60,
+                None,
                 None,
                 None,
                 None,
@@ -1326,6 +1381,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1355,6 +1411,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(out_none, "base");
@@ -1368,6 +1425,7 @@ mod tests {
                 &Default::default(),
                 0,
                 Some("【能力边界声明】boundary"),
+                None,
                 None,
                 None,
                 None,
@@ -1389,6 +1447,7 @@ mod tests {
                 None,
                 &Default::default(),
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -1426,6 +1485,7 @@ mod tests {
                 None,
                 Some("【清单】- [*] t1 先做"),
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1448,6 +1508,7 @@ mod tests {
                 &Default::default(),
                 0,
                 Some("【能力边界声明】boundary"),
+                None,
                 None,
                 None,
                 None,
@@ -1484,6 +1545,7 @@ mod tests {
                 None,
                 &Default::default(),
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -1529,6 +1591,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(out.starts_with("base\n\n"));
@@ -1558,6 +1621,7 @@ mod tests {
                 0,
                 Some("【能力边界声明】boundary"),
                 Some(&skills),
+                None,
                 None,
                 None,
                 None,
@@ -1601,6 +1665,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(out, "base");
@@ -1620,6 +1685,7 @@ mod tests {
                 0,
                 None,
                 Some(&[]),
+                None,
                 None,
                 None,
                 None,
@@ -1682,6 +1748,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         // 显式兼容口径(base=total_window,历史行为)
@@ -1701,6 +1768,7 @@ mod tests {
                 Some(&mem),
                 &recall,
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -1763,6 +1831,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         // 新配方:加载 → validate → 字段落位
@@ -1788,6 +1857,7 @@ mod tests {
                 None,
                 &Default::default(),
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -1898,6 +1968,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         let stable_pos = out1
@@ -1923,6 +1994,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(out2.contains("## Handoff Base"));
@@ -1937,6 +2009,7 @@ mod tests {
                 None,
                 &RecallContext::default(),
                 8192,
+                None,
                 None,
                 None,
                 None,
@@ -2044,6 +2117,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -2087,6 +2161,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -2119,5 +2194,112 @@ mod tests {
             identity_pos < l2_pos && anchor_pos < l2_pos,
             "v2 结构预期:身份段/北极星锚 前于治理门禁段(S2 前移已落地)"
         );
+    }
+
+    // ---- S2d 服务目录段 ----
+
+    /// 目录槽位:Some 形态必须落在 agents_md(静态区尾)之后、todo(动态尾区)
+    /// 之前;None 形态 = 目录空,槽位静默跳过(输出逐字节可预期)
+    #[test]
+    fn test_assemble_service_catalog_slot_order() {
+        let executor = AssemblyExecutor::new(AssemblyRecipe::default());
+        let out = executor
+            .assemble(
+                "BASE",
+                None,
+                None,
+                None,
+                &RecallContext::default(),
+                0,
+                None,
+                None,
+                None,
+                Some("GOV"),
+                Some("KNOW"),
+                Some("AGENTSMD"),
+                Some("TODO"),
+                Some("## 服务能力目录\nCATALOG"),
+            )
+            .unwrap();
+        let agents = out.find("AGENTSMD").expect("agents md segment present");
+        let catalog = out.find("CATALOG").expect("catalog segment present");
+        let todo = out.find("TODO").expect("todo summary present");
+        assert!(agents < catalog, "目录段必须位于项目记忆之后(静态区内)");
+        assert!(catalog < todo, "目录段必须位于动态尾区之前");
+        let out_none = executor
+            .assemble(
+                "BASE",
+                None,
+                None,
+                None,
+                &RecallContext::default(),
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("AGENTSMD"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(out_none, "BASE\n\nAGENTSMD");
+    }
+
+    /// 目录槽位:配方声明 enabled=false → 硬关(有目录数据也不注入)
+    #[test]
+    fn test_assemble_service_catalog_disabled_hard_off() {
+        let mut recipe = AssemblyRecipe::default();
+        for s in &mut recipe.slots {
+            if s.id == "S2d_catalog" {
+                s.enabled = false;
+            }
+        }
+        let out = AssemblyExecutor::new(recipe)
+            .assemble(
+                "base",
+                None,
+                None,
+                None,
+                &RecallContext::default(),
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("CATALOG"),
+            )
+            .unwrap();
+        assert_eq!(out, "base");
+    }
+
+    /// 旧自定义配方(无 S2d 槽)仍合法:目录数据在场也不注入(槽位驱动,非数据驱动)
+    #[test]
+    fn test_recipe_without_catalog_slot_stays_valid() {
+        let mut recipe = AssemblyRecipe::default();
+        recipe.slots.retain(|s| s.id != "S2d_catalog");
+        let out = AssemblyExecutor::new(recipe)
+            .assemble(
+                "base",
+                None,
+                None,
+                None,
+                &RecallContext::default(),
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("AGENTSMD"),
+                None,
+                Some("CATALOG"),
+            )
+            .unwrap();
+        assert_eq!(out, "base\n\nAGENTSMD");
     }
 }
