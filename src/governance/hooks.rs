@@ -42,19 +42,30 @@ pub(crate) struct GovDraft {
     pub actor: GovActor,
     pub summary: String,
     pub refs: GovRefs,
+    /// 结构化摘要面（第七类 mcp_spawn 消费；既有六类恒 None）
+    pub payload: Option<serde_json::Value>,
 }
 
-/// fire-and-forget 写入（未初始化=CLI/测试 no-op）
+/// fire-and-forget 写入（未初始化=CLI/测试 no-op；无 tokio runtime 的调用面
+/// 如实降级 no-op——best-effort 纪律：出证绝不 panic 阻断事件源）
 fn fire(draft: GovDraft) {
     if let Some(ledger) = current_ledger() {
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!(
+                kind = draft.kind.path_segment(),
+                "gov_ledger: no tokio runtime in caller context, event dropped (best-effort)"
+            );
+            return;
+        }
         tokio::spawn(async move {
             let _ = ledger
-                .record(
+                .record_with_payload(
                     draft.kind,
                     &draft.session_id,
                     draft.actor,
                     clamp_summary(draft.summary),
                     draft.refs,
+                    draft.payload,
                 )
                 .await;
         });
@@ -75,6 +86,7 @@ pub(crate) fn approval_requested_draft(req: &ApprovalRequest) -> GovDraft {
             approval_id: Some(req.proposal_id.clone()),
             ..Default::default()
         },
+        payload: None,
     }
 }
 
@@ -102,6 +114,7 @@ pub(crate) fn approval_resolved_draft(req: &ApprovalRequest, d: &ApprovalDecisio
             approval_id: Some(req.proposal_id.clone()),
             ..Default::default()
         },
+        payload: None,
     }
 }
 
@@ -135,6 +148,7 @@ pub(crate) fn policy_verdict_draft(
             approval_id: Some(req.proposal_id.clone()),
             ..Default::default()
         },
+        payload: None,
     }
 }
 
@@ -145,6 +159,7 @@ pub(crate) fn s4_publish_draft(session_id: &str, path: &str) -> GovDraft {
         actor: GovActor::User,
         summary: format!("产物定稿：{path}"),
         refs: GovRefs::default(),
+        payload: None,
     }
 }
 
@@ -157,6 +172,7 @@ pub(crate) fn ai_commit_draft(detail: &str) -> GovDraft {
         actor: GovActor::User,
         summary: format!("AI commit message 生成：{detail}"),
         refs: GovRefs::default(),
+        payload: None,
     }
 }
 
@@ -181,6 +197,7 @@ pub(crate) fn terminal_session_draft(
         actor: GovActor::User,
         summary,
         refs: GovRefs::default(),
+        payload: None,
     }
 }
 
@@ -198,12 +215,173 @@ pub(crate) fn journal_milestone_draft(
             journal_seq: Some(journal_seq),
             ..Default::default()
         },
+        payload: None,
     }
 }
 
 // =============================================================================
 // 薄钩子（事件源调用面）
 // =============================================================================
+
+/// MCP spawn 治理事实的 verdict 维度（装载门判定/生命周期收割共用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpSpawnVerdict {
+    /// 装载门命中放行
+    Allow,
+    /// warn 迁移档放行（未登记）
+    AllowWarn,
+    /// enforce 拒载（负向事实同权出证）
+    Reject,
+    /// 生命周期触限收割
+    Reap,
+}
+
+impl McpSpawnVerdict {
+    /// 事件与摘要的 verdict 码（allow/allow_warn/reject/reap）
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::AllowWarn => "allow_warn",
+            Self::Reject => "reject",
+            Self::Reap => "reap",
+        }
+    }
+}
+
+/// MCP spawn 治理事实载荷（装载门/生命周期监控采集的短标识符集合；
+/// args 前缀形态摘要非全量——隐私边界：patterns/通配形态，不存运行期实参全文）
+pub struct McpSpawnFacts {
+    /// server 名称（会话关联域 `mcp:{name}` 的查询键）
+    pub server_name: String,
+    /// 拉起命令（观测原文）
+    pub command: String,
+    /// args 前缀形态摘要（patterns/通配形态，非运行期实参全文）
+    pub args_prefix: Option<Vec<String>>,
+    /// 批准条目身份键（命中时携带；未登记/收割缺省 None）
+    pub server_key: Option<String>,
+    /// 审批锚（生效条目携带；未登记缺省 None）
+    pub approval_ref: Option<String>,
+    /// 清单来源（governance | local | local_fallback；收割事件可缺省）
+    pub source: Option<String>,
+    /// 策略档（enforce | warn；收割事件可缺省）
+    pub policy: Option<String>,
+}
+
+pub(crate) fn mcp_spawn_draft(facts: &McpSpawnFacts, verdict: McpSpawnVerdict) -> GovDraft {
+    let mut key_disp = facts.server_key.as_deref().unwrap_or("-").to_string();
+    if key_disp.len() > 20 {
+        key_disp = format!("{}…", &key_disp[..20]);
+    }
+    let summary = format!(
+        "server '{}' spawn {}（source={}，key={}，policy={}）",
+        facts.server_name,
+        verdict.as_str(),
+        facts.source.as_deref().unwrap_or("-"),
+        key_disp,
+        facts.policy.as_deref().unwrap_or("-"),
+    );
+    GovDraft {
+        kind: GovEventKind::McpSpawn,
+        // 会话关联域=server（per-server 查询键；非 agent 会话——terminal 先例同款扩展）
+        session_id: format!("mcp:{}", facts.server_name),
+        actor: GovActor::Agent,
+        summary,
+        refs: GovRefs {
+            approval_id: facts.approval_ref.clone(),
+            ..Default::default()
+        },
+        payload: Some(serde_json::json!({
+            "server_name": facts.server_name,
+            "command": facts.command,
+            "args_prefix": facts.args_prefix,
+            "server_key": facts.server_key,
+            "approval_ref": facts.approval_ref,
+            "verdict": verdict.as_str(),
+            "source": facts.source,
+            "policy": facts.policy,
+        })),
+    }
+}
+
+/// MCP spawn 治理事实（薄钩子：fire-and-forget；未初始化=no-op，失败=留痕不阻断——
+/// 与提案回流同款 fail-soft 红线：出证绝不影响 spawn 判定本身）
+pub fn mcp_spawn(facts: &McpSpawnFacts, verdict: McpSpawnVerdict) {
+    fire(mcp_spawn_draft(facts, verdict));
+}
+
+#[cfg(test)]
+mod mcp_spawn_tests {
+    use super::*;
+
+    fn facts() -> McpSpawnFacts {
+        McpSpawnFacts {
+            server_name: "fs".to_string(),
+            command: "npx".to_string(),
+            args_prefix: Some(vec!["-y".to_string(), "@scope/srv-*".to_string()]),
+            server_key: Some("blake3:aa".to_string()),
+            approval_ref: Some("org.evorule.mcp.servers/blake3:aa@v1".to_string()),
+            source: Some("governance".to_string()),
+            policy: Some("enforce".to_string()),
+        }
+    }
+
+    #[test]
+    fn mcp_spawn_draft_maps_all_four_verdicts() {
+        for (v, code) in [
+            (McpSpawnVerdict::Allow, "allow"),
+            (McpSpawnVerdict::AllowWarn, "allow_warn"),
+            (McpSpawnVerdict::Reject, "reject"),
+            (McpSpawnVerdict::Reap, "reap"),
+        ] {
+            let d = mcp_spawn_draft(&facts(), v);
+            assert!(matches!(d.kind, GovEventKind::McpSpawn));
+            assert_eq!(d.session_id, "mcp:fs");
+            assert!(matches!(d.actor, GovActor::Agent));
+            assert!(
+                d.summary.contains(code),
+                "summary must carry verdict: {}",
+                d.summary
+            );
+            assert_eq!(
+                d.refs.approval_id.as_deref(),
+                Some("org.evorule.mcp.servers/blake3:aa@v1")
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_spawn_payload_carries_structured_digest() {
+        let d = mcp_spawn_draft(&facts(), McpSpawnVerdict::Allow);
+        let payload = d.payload.expect("payload present");
+        assert_eq!(payload["server_name"], "fs");
+        assert_eq!(payload["verdict"], "allow");
+        assert_eq!(payload["server_key"], "blake3:aa");
+        assert_eq!(payload["policy"], "enforce");
+        // 隐私边界：args 前缀形态摘要（patterns），非运行期实参全文
+        assert_eq!(
+            payload["args_prefix"],
+            serde_json::json!(["-y", "@scope/srv-*"])
+        );
+    }
+
+    #[test]
+    fn mcp_spawn_minimal_facts_render_with_placeholders() {
+        // 收割事件：command/清单来源不可得——占位符渲染不 panic
+        let f = McpSpawnFacts {
+            server_name: "x".to_string(),
+            command: String::new(),
+            args_prefix: None,
+            server_key: None,
+            approval_ref: None,
+            source: None,
+            policy: None,
+        };
+        let d = mcp_spawn_draft(&f, McpSpawnVerdict::Reap);
+        assert!(d.summary.contains("source=-"));
+        assert!(d.refs.approval_id.is_none());
+        assert!(d.payload.is_some());
+    }
+}
 
 /// 审批卡请求（G8 审批链，装饰器入口）
 pub fn approval_requested(req: &ApprovalRequest) {
@@ -247,6 +425,7 @@ pub(crate) fn dap_session_draft(action: TerminalAction, detail: &str) -> GovDraf
         actor: GovActor::User,
         summary: format!("调试适配器会话{verb}（{detail}）"),
         refs: GovRefs::default(),
+        payload: None,
     }
 }
 

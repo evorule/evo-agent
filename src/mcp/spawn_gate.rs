@@ -379,6 +379,17 @@ pub(crate) fn gate(
     let matched = allowlist.and_then(|list| list.matches(command, args));
     let allowed = matched.is_some();
     let args_json = serde_json::to_string(args).unwrap_or_default();
+    // 治理事实出证（P2c：判定落定后 fire-and-forget——不参与判定，fail-soft
+    // 同提案回流红线；未初始化=no-op）。verdict 三态：命中/warn 未登记/拒载。
+    let governance_facts = crate::governance::hooks::McpSpawnFacts {
+        server_name: server_name.to_string(),
+        command: command.to_string(),
+        args_prefix: Some(args.iter().take(8).map(|s| s.to_string()).collect()),
+        server_key: matched.and_then(|e| e.server_key.clone()),
+        approval_ref: matched.and_then(|e| e.approval_ref.clone()),
+        source: Some(origin.to_string()),
+        policy: Some(policy.to_string()),
+    };
     let server_key = matched
         .and_then(|e| e.server_key.clone())
         .unwrap_or_default();
@@ -410,6 +421,10 @@ pub(crate) fn gate(
             verdict = "allow_warn",
             "MCP spawn gate: 未登记 server（warn 迁移档放行并留痕）"
         );
+        crate::governance::hooks::mcp_spawn(
+            &governance_facts,
+            crate::governance::hooks::McpSpawnVerdict::AllowWarn,
+        );
         Ok(GateOutcome::AllowedUnlistedWarn)
     } else {
         tracing::warn!(
@@ -423,6 +438,10 @@ pub(crate) fn gate(
             "MCP spawn gate: 未登记 server 拒载（enforce；登记走治理批准清单 \
              org.evorule.mcp.servers，或用户级 .evorule/mcp-allowlist.json \
              本地兜底，或显式切换 warn 迁移档）"
+        );
+        crate::governance::hooks::mcp_spawn(
+            &governance_facts,
+            crate::governance::hooks::McpSpawnVerdict::Reject,
         );
         Err(format!(
             "MCP server `{server_name}` 未在拉起批准清单（command `{command}`，来源 {origin}）；\

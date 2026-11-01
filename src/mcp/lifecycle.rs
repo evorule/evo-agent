@@ -217,6 +217,19 @@ fn reap(
         detail = %reason.detail(),
         "MCP lifecycle: 生命周期策略触限，收割 server 进程树"
     );
+    // 治理事实出证（收割与拉生死同链；command/清单来源在监控层不可得，缺省）
+    crate::governance::hooks::mcp_spawn(
+        &crate::governance::hooks::McpSpawnFacts {
+            server_name: server_name.to_string(),
+            command: String::new(),
+            args_prefix: None,
+            server_key: None,
+            approval_ref: None,
+            source: None,
+            policy: None,
+        },
+        crate::governance::hooks::McpSpawnVerdict::Reap,
+    );
     close();
     let _ = reap_tx.send(ReapNotice {
         server_name: server_name.to_string(),

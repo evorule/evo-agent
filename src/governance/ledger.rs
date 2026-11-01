@@ -38,7 +38,7 @@ pub const GOV_CALLER_ROLE: Option<&str> = None;
 const SESSION_SETUP_RETRIES: u32 = 3;
 const SESSION_SETUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// 治理事件类型（v1 收录六类，事件类型清单）
+/// 治理事件类型（v1 收录七类，事件类型清单）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GovEventKind {
@@ -58,6 +58,9 @@ pub enum GovEventKind {
     B21JournalMilestone,
     /// AI commit message 生成（record-only：动作+耗时+产物长度；生成绝不自动提交）
     AiCommit,
+    /// MCP server 拉起/收割治理事实（治理原生线：verdict 四态维度
+    /// allow/allow_warn/reject/reap，生死同链；record-only）
+    McpSpawn,
 }
 
 /// terminal 会话动作（create/close 拆两路径段，查询面单段精确）
@@ -84,6 +87,7 @@ impl GovEventKind {
             Self::DapSession(TerminalAction::Close) => "dap_session_close",
             Self::B21JournalMilestone => "b21_journal_milestone",
             Self::AiCommit => "ai_commit",
+            Self::McpSpawn => "mcp_spawn",
         }
     }
 }
@@ -116,8 +120,15 @@ pub struct GovRefs {
 }
 
 /// 治理事件 value schema
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `payload`（2026-11-01 第七类事件扩展，additive-optional）：结构化摘要面
+/// （短标识符键值，非全文——全文走 refs 指针）。旧读取方 serde 忽略未知
+/// 字段，向后兼容；六类既有事件恒 None。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GovEvent {
+    /// 结构化摘要（可选；mcp_spawn 携带 server_key/verdict/source 等短字段）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
     /// 事件 id：`G` + 6 位零填充进程内序号（示例 `G000123`）
     pub event_id: String,
     /// 事件类型（六类 kind，路径段由 [`GovEventKind::path_segment`] 承载）
@@ -238,6 +249,20 @@ impl GovLedger {
         summary: String,
         refs: GovRefs,
     ) -> Result<GovEvent, ApiError> {
+        self.record_with_payload(kind, session_id, actor, summary, refs, None)
+            .await
+    }
+
+    /// 记录带结构化摘要面的事件（第七类 mcp_spawn 消费；additive-optional）
+    pub async fn record_with_payload(
+        &self,
+        kind: GovEventKind,
+        session_id: &str,
+        actor: GovActor,
+        summary: String,
+        refs: GovRefs,
+        payload: Option<serde_json::Value>,
+    ) -> Result<GovEvent, ApiError> {
         let seq = self.seq.next();
         let event = GovEvent {
             event_id: gov_event_id(seq),
@@ -247,6 +272,7 @@ impl GovLedger {
             actor,
             summary,
             refs,
+            payload,
         };
         // 路径在此处用本地 seq 构造（并发下 peek 会串号）
         let path = gov_event_path(self.ns, &kind, event.ts, seq);
@@ -326,7 +352,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn path_construction_covers_all_six_kinds() {
+    fn path_construction_covers_all_seven_kinds() {
         let ts = 1_790_400_000u64;
         let cases = [
             (
@@ -404,12 +430,14 @@ mod tests {
                 approval_id: Some("A-17".to_string()),
                 fact_id: None,
             },
+            payload: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         // 回读一致（先反序列化再检查键集——from_value 消费 value）
         let back: GovEvent = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(back, event);
-        // 隐私边界：value 仅含 schema 七键（摘要+引用级；键序按 Map 排序比较）
+        // 隐私边界：value 仅含 schema 七键（摘要+引用级；payload 缺省 None 不序列化；
+        // 键序按 Map 排序比较）
         let keys: Vec<&str> = value
             .as_object()
             .unwrap()
@@ -445,6 +473,7 @@ mod tests {
             actor: GovActor::Agent,
             summary: "terminal session opened".to_string(),
             refs: GovRefs::default(),
+            payload: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert!(value["refs"].as_object().unwrap().is_empty());
