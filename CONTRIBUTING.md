@@ -73,8 +73,7 @@
 
 ## 🐛 Reporting Bugs
 
-Use [Gitee Issues](https://gitee.com/evorulelab/evorule/issues) (preferred) or
-GitHub Issues for international contributors.
+Use [GitHub Issues](https://github.com/evorule/evorule/issues).
 
 **Report template**:
 ```markdown
@@ -117,7 +116,7 @@ Also use Issues with the `enhancement` label.
 
 ### Workflow
 
-1. **Fork the repo** → create a fork under your Gitee/GitHub account
+1. **Fork the repo** → create a fork under your GitHub account
 2. **Create a branch**: `git checkout -b feature/your-feature-name`
 3. **Write code + write tests** — coverage must not drop
 4. **Local validation**:
@@ -127,7 +126,7 @@ Also use Issues with the `enhancement` label.
    cargo clippy --workspace -- -D warnings   # 0 warnings required
    ```
 5. **Push**: `git push origin feature/your-feature-name`
-6. **Open PR** on Gitee (or GitHub), fill in the PR template
+6. **Open PR** on GitHub, fill in the PR template
 7. **Sign CLA** (see below)
 8. **Wait for review** — maintainers reply within 7 days
 
@@ -247,9 +246,9 @@ All `.rs` files must include the SPDX header:
 
 ## 📞 Contact
 
-- **Gitee**: https://gitee.com/evorulelab/evorule/issues
+- **GitHub**: https://github.com/evorule/evorule/issues
 - **Email**: evorulelab@gmail.com
-- **Org**: [EvoRule Lab](https://gitee.com/evorulelab)
+- **Org**: [EvoRule Lab](https://github.com/evorule)
 
 ---
 
