@@ -259,29 +259,30 @@ pub(crate) fn configure_orphan_proofing(cmd: &mut tokio::process::Command) {
 /// spawn 后的孤儿兜底收尾：assign job（Windows）/无操作（Unix）。
 /// 返回值在 Windows 侧为必须**持有至 transport 销毁**的 job 句柄
 /// （句柄关闭 = `KILL_ON_JOB_CLOSE` 收割整棵进程树）。
+#[cfg(windows)]
 pub(crate) fn finish_orphan_proofing(
     child: &tokio::process::Child,
-) -> Result<Option<super::lifecycle::job::JobHandle>, String> {
-    #[cfg(windows)]
-    {
-        let raw = child
-            .raw_handle()
-            .ok_or_else(|| "MCP child missing process handle".to_string())?;
-        let job = job::create_kill_on_close()?;
-        // SAFETY（job 模块治理内）：raw_handle 的裸指针即进程 HANDLE
-        let raw_handle = windows::Win32::Foundation::HANDLE(raw as _);
-        job.assign(raw_handle)?;
-        let pid = child
-            .id()
-            .ok_or_else(|| "MCP child missing pid".to_string())?;
-        job.resume_process_threads(pid);
-        Ok(Some(job))
-    }
-    #[cfg(unix)]
-    {
-        let _ = child;
-        Ok(None)
-    }
+) -> Result<Option<job::JobHandle>, String> {
+    let raw = child
+        .raw_handle()
+        .ok_or_else(|| "MCP child missing process handle".to_string())?;
+    let job = job::create_kill_on_close()?;
+    // SAFETY（job 模块治理内）：raw_handle 的裸指针即进程 HANDLE
+    let raw_handle = windows::Win32::Foundation::HANDLE(raw as _);
+    job.assign(raw_handle)?;
+    let pid = child
+        .id()
+        .ok_or_else(|| "MCP child missing pid".to_string())?;
+    job.resume_process_threads(pid);
+    Ok(Some(job))
+}
+
+/// Unix side: no Job Object to assign; orphan protection is the process
+/// group set up in `configure_orphan_proofing`, so this is a no-op.
+#[cfg(unix)]
+pub(crate) fn finish_orphan_proofing(child: &tokio::process::Child) -> Result<Option<()>, String> {
+    let _ = child;
+    Ok(None)
 }
 
 /// Windows Job Object 封装（孤儿兜底的 OS 层机制）

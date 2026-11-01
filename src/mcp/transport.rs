@@ -137,7 +137,10 @@ impl StdioTransport {
             .spawn()
             .map_err(|e| format!("spawn MCP server '{}' failed: {}", command, e))?;
         // assign Job（Windows）并恢复挂起线程；句柄由 transport 持有至销毁
+        #[cfg(windows)]
         let job = super::lifecycle::finish_orphan_proofing(&child)?;
+        #[cfg(unix)]
+        super::lifecycle::finish_orphan_proofing(&child)?;
 
         let stdin = child
             .stdin
