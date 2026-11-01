@@ -24,7 +24,7 @@ cd "$(dirname "$0")"
 
 PROVIDER="${PROVIDER:-minimax}"
 # evorule-server release to fetch (pinned for reproducibility).
-# SERVER_VERSION=latest resolves the newest Gitee release at runtime.
+# SERVER_VERSION=latest resolves the newest GitHub release at runtime.
 SERVER_VERSION="${SERVER_VERSION:-v0.10.0}"
 DEMO_DIR=".demo"
 SERVER_DIR="$DEMO_DIR/server"
@@ -69,22 +69,22 @@ else
   if [ ! -x "$SERVER_DIR/evorule-server" ]; then
     RESOLVED_VERSION="$SERVER_VERSION"
     if [ "$RESOLVED_VERSION" = "latest" ]; then
-      echo "resolving latest evorule-server release from Gitee..."
-      RESOLVED_VERSION=$(curl -s "https://gitee.com/api/v5/repos/evorule/evorule-server/releases/latest" \
+      echo "resolving latest evorule-server release from GitHub..."
+      RESOLVED_VERSION=$(curl -s "https://api.github.com/repos/evorule/evorule-server/releases/latest" \
         | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)
       if [ -z "$RESOLVED_VERSION" ]; then
-        echo "FAIL: could not resolve latest release from Gitee API" >&2
+        echo "FAIL: could not resolve latest release from GitHub API" >&2
         exit 1
       fi
       echo "  latest = $RESOLVED_VERSION"
     fi
-    echo "downloading evorule-server $RESOLVED_VERSION from Gitee..."
+    echo "downloading evorule-server $RESOLVED_VERSION from GitHub..."
     mkdir -p "$DEMO_DIR"
-    # Gitee Release asset names carry the version without the "v" prefix
+    # GitHub Release asset names carry the version without the "v" prefix
     # (tag v0.10.0 -> asset evorule-server-0.10.0-linux64.tar.gz)
     ASSET_VER="${RESOLVED_VERSION#v}"
     curl -L -o "$DEMO_DIR/server.tar.gz" \
-      "https://gitee.com/evorule/evorule-server/releases/download/$RESOLVED_VERSION/evorule-server-$ASSET_VER-linux64.tar.gz"
+      "https://github.com/evorule/evorule-server/releases/download/$RESOLVED_VERSION/evorule-server-$ASSET_VER-linux64.tar.gz"
     mkdir -p "$SERVER_DIR"
     tar -xzf "$DEMO_DIR/server.tar.gz" -C "$SERVER_DIR"
     rm -f "$DEMO_DIR/server.tar.gz"
