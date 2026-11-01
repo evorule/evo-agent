@@ -58,6 +58,9 @@ pub struct McpServerEntry {
     pub client: Option<std::sync::Arc<McpClient>>,
     /// tools/list 发现的工具清单(connected 态填充,状态面/工具树数据源)
     pub tools: Vec<McpToolSpec>,
+    /// 生命周期收割通知端（资源边界设计（L1）；策略激活时 Some——serve 重启监督
+    /// 经 [`McpManager::take_reap_receivers`] 取走消费）
+    pub reap_rx: Option<tokio::sync::mpsc::UnboundedReceiver<super::lifecycle::ReapNotice>>,
 }
 
 /// serve 级 MCP 管理器
@@ -89,19 +92,30 @@ impl McpManager {
                 status: McpServerStatus::Starting,
                 client: None,
                 tools: Vec::new(),
+                reap_rx: None,
             },
         );
 
         let result = self.connect_inner(cfg).await;
         match &result {
-            Ok((client, tools)) => self.set_entry(
-                cfg.name.clone(),
-                McpServerEntry {
-                    status: McpServerStatus::Connected,
-                    client: Some(client.clone()),
-                    tools: tools.clone(),
-                },
-            ),
+            Ok((client, tools)) => {
+                // 生命周期监控（资源边界设计（L1）；策略全关=不启用零开销=现行为）
+                let policy = super::lifecycle::LifecyclePolicy::from_config(cfg);
+                let reap_rx = if policy.is_active() {
+                    Some(client.enable_lifecycle(&cfg.name, policy))
+                } else {
+                    None
+                };
+                self.set_entry(
+                    cfg.name.clone(),
+                    McpServerEntry {
+                        status: McpServerStatus::Connected,
+                        client: Some(client.clone()),
+                        tools: tools.clone(),
+                        reap_rx,
+                    },
+                )
+            }
             Err(error) => self.set_entry(
                 cfg.name.clone(),
                 McpServerEntry {
@@ -110,10 +124,42 @@ impl McpManager {
                     },
                     client: None,
                     tools: Vec::new(),
+                    reap_rx: None,
                 },
             ),
         }
         result
+    }
+
+    /// 取走全部生命周期收割通知接收端（资源边界设计（L1）；serve 启动期一次性
+    /// 取走交给重启监督任务——取走后条目内不再持有，避免双消费者）
+    /// 按名取单个生命周期收割通知端（重启监督在重启成功后取新 client 的
+    /// 新监控端，维持监督链不断）
+    pub fn take_reap_receiver(
+        &self,
+        name: &str,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<super::lifecycle::ReapNotice>> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get_mut(name)
+            .and_then(|e| e.reap_rx.take())
+    }
+
+    pub fn take_reap_receivers(
+        &self,
+    ) -> Vec<(
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<super::lifecycle::ReapNotice>,
+    )> {
+        let mut entries = self.entries.lock().unwrap();
+        let mut out = Vec::new();
+        for (name, entry) in entries.iter_mut() {
+            if let Some(rx) = entry.reap_rx.take() {
+                out.push((name.clone(), rx));
+            }
+        }
+        out
     }
 
     /// 连接实现(按 transport 分派 + 握手 + 发现,整体受 timeout_secs 约束)
@@ -247,6 +293,7 @@ impl McpManager {
                                     status: McpServerStatus::Failed { error: e },
                                     client: None,
                                     tools: Vec::new(),
+                                    reap_rx: None,
                                 },
                             );
                         }
@@ -287,6 +334,7 @@ impl McpManager {
                         status: v.status.clone(),
                         client: v.client.clone(),
                         tools: v.tools.clone(),
+                        reap_rx: None,
                     },
                 )
             })
@@ -313,6 +361,7 @@ impl McpManager {
                 },
                 client: None,
                 tools: Vec::new(),
+                reap_rx: None,
             },
         );
     }
@@ -338,6 +387,7 @@ mod tests {
             transport: None,
             url: None,
             headers: None,
+            ..Default::default()
         }
     }
 

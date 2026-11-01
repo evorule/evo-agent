@@ -2684,6 +2684,90 @@ fn cmd_serve(
         "[tools] union toolkit assembled: {} tool(s)",
         toolkit_tool_count
     );
+    // 资源边界设计（L1）：生命周期收割通知 → 退避重启监督。restart_on_reap 显式
+    // 开启才自动重启（重走装载门=许可重新核验 + toolkit 写锁内重注册——写锁
+    // 为同步 guard，不跨 await 持有）；缺省=收割落 failed 态等待运维处置。
+    // 重启成功后取新 client 的监控端，维持监督链不断。
+    {
+        let cfgs: Vec<evo_agent::config::McpServerConfig> = mcp_cfgs.servers.clone();
+        for (name, mut reap_rx) in mcp_manager.take_reap_receivers() {
+            let manager = mcp_manager.clone();
+            let toolkit = toolkit.clone();
+            let Some(cfg) = cfgs.iter().find(|c| c.name == name).cloned() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                loop {
+                    let Some(notice) = reap_rx.recv().await else {
+                        return;
+                    };
+                    eprintln!(
+                        "[mcp] server '{}' reaped ({}); {}",
+                        notice.server_name,
+                        notice.reason.detail(),
+                        if cfg.restart_on_reap {
+                            "backoff restart scheduled"
+                        } else {
+                            "awaiting operator action (restart_on_reap disabled)"
+                        }
+                    );
+                    if !cfg.restart_on_reap {
+                        continue;
+                    }
+                    let mut backoff = evo_agent::mcp::lifecycle::Backoff::new();
+                    let mut rearmed = false;
+                    while !rearmed {
+                        let wait = backoff.next_delay();
+                        eprintln!(
+                            "[mcp] restarting '{}' in {}s (gate re-checked on restart)",
+                            cfg.name,
+                            wait.as_secs()
+                        );
+                        tokio::time::sleep(wait).await;
+                        match manager.connect_server(&cfg).await {
+                            Ok((client, tools)) => {
+                                let registered = {
+                                    let Ok(mut guard) = toolkit.write() else {
+                                        eprintln!("[mcp] toolkit lock poisoned, restart aborted");
+                                        break;
+                                    };
+                                    evo_agent::mcp::register_client_tools(
+                                        &mut guard,
+                                        &cfg.name,
+                                        &client,
+                                        &tools,
+                                        &cfg.always_allow,
+                                        cfg.timeout_secs,
+                                    )
+                                };
+                                match registered {
+                                    Ok(n) => {
+                                        eprintln!(
+                                            "[mcp] server '{}' restarted, {n} tool(s) re-registered",
+                                            cfg.name
+                                        );
+                                        rearmed = true;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[mcp] restart re-register failed: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[mcp] restart connect failed: {e}");
+                            }
+                        }
+                    }
+                    // 取重启后新 client 的监控端（connect_server 已重建监控）；
+                    // 取不到=server 已不在运行态，监督链终止
+                    match manager.take_reap_receiver(&cfg.name) {
+                        Some(new_rx) => reap_rx = new_rx,
+                        None => return,
+                    }
+                }
+            });
+        }
+    }
     // G17:构造共享 metrics(供 /metrics 端点 + runner 插桩共用)
     let metrics = match evo_agent::Metrics::new() {
         Ok(m) => std::sync::Arc::new(m),

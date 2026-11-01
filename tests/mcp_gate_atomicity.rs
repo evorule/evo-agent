@@ -37,6 +37,7 @@ fn probe_cfg() -> McpServerConfig {
         transport: None,
         url: None,
         headers: None,
+        ..Default::default()
     }
 }
 

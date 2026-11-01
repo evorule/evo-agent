@@ -551,7 +551,7 @@ impl Default for AgentsConfig {
 /// args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 /// env = { GITHUB_TOKEN = "ghp_..." }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct McpServerConfig {
     /// server 名称(用于工具名前缀 `mcp_{name}_{tool}`)
     pub name: String,
@@ -587,6 +587,21 @@ pub struct McpServerConfig {
     /// `${ENV_VAR}` 引用,连接时展开,缺变量 fail-closed 报错)
     #[serde(default)]
     pub headers: Option<HashMap<String, String>>,
+    /// 生命周期策略（资源边界设计（L1），运维面参数不进治理清单）：空闲收割秒数
+    /// （无在途请求且超窗即收割进程树；缺省关=现行为）
+    #[serde(default)]
+    pub max_idle_secs: Option<u64>,
+    /// 生命周期策略：硬寿命上界秒数（进程存活超限即收割；缺省关=现行为）
+    #[serde(default)]
+    pub max_lifetime_secs: Option<u64>,
+    /// 生命周期策略：连续请求失败计数阈值（达到即判定挂死并收割；缺省 0=关。
+    /// 注：精确超时分类在各调用外层，此处以连续失败为挂死信号，如实近似）
+    #[serde(default)]
+    pub hang_threshold: Option<u32>,
+    /// 生命周期策略：触限收割后自动退避重启（1s/2s/4s…封顶 60s；缺省 false=
+    /// 收割后落 failed 态等待运维处置。重启重走装载门——许可重新核验）
+    #[serde(default)]
+    pub restart_on_reap: bool,
 }
 
 impl McpServerConfig {

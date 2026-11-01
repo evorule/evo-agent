@@ -34,6 +34,12 @@ pub struct McpClient {
     transport: Arc<dyn McpTransport>,
     /// `initialize` 握手返回的 server info(含 server 名称/版本/能力)
     server_info: Value,
+    /// 生命周期跟踪面（资源边界设计（L1））：最后请求 unix 秒
+    activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// 在途请求计数（空闲判定要求为零）
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// 连续请求失败计数（成功重置；挂死判定信号，如实近似）
+    hang: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::fmt::Debug for McpClient {
@@ -76,7 +82,75 @@ impl McpClient {
         Ok(Self {
             transport,
             server_info: result,
+            activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default(),
+            )),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            hang: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         })
+    }
+
+    /// 生命周期跟踪请求路径（资源边界设计（L1））：活动时间/在途计数/连续失败计数
+    /// 由此统一维护；monitor 据此执行空闲/挂死判定
+    async fn request_tracked(&self, method: &str, params: Value) -> Result<Value, String> {
+        use std::sync::atomic::Ordering;
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let result = self.transport.request(method, params).await;
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default(),
+            Ordering::Relaxed,
+        );
+        match &result {
+            Ok(_) => self.hang.store(0, Ordering::Relaxed),
+            Err(_) => {
+                self.hang.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+
+    /// 启动生命周期监控（资源边界设计（L1）；策略全关=无操作零开销=现行为）
+    ///
+    /// 触限动作=收割（close transport 杀进程树）+ 结构化事件 + 通知；返回通知
+    /// 接收端供 manager/serve 重启监督消费——不消费时通知被丢弃（fail-soft：
+    /// 收割本身不受影响）。
+    pub fn enable_lifecycle(
+        &self,
+        server_name: &str,
+        policy: super::lifecycle::LifecyclePolicy,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<super::lifecycle::ReapNotice> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if !policy.is_active() {
+            return rx;
+        }
+        let close_transport: std::sync::Arc<dyn Fn() + Send + Sync> = {
+            let transport = self.transport.clone();
+            std::sync::Arc::new(move || {
+                let transport = transport.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = transport.close().await {
+                        tracing::warn!(error = %e, "MCP lifecycle reap close failed");
+                    }
+                });
+            })
+        };
+        super::lifecycle::spawn_monitor(
+            server_name.to_string(),
+            policy,
+            self.activity.clone(),
+            self.in_flight.clone(),
+            self.hang.clone(),
+            close_transport,
+            tx,
+        );
+        rx
     }
 
     /// 只读访问 server info(initialize 握手返回值)
@@ -94,8 +168,7 @@ impl McpClient {
     /// 返回 server 暴露的所有工具的 spec。
     pub async fn list_tools(&self) -> Result<Vec<McpToolSpec>, String> {
         let result = self
-            .transport
-            .request("tools/list", serde_json::json!({}))
+            .request_tracked("tools/list", serde_json::json!({}))
             .await?;
 
         let tools = result
@@ -134,8 +207,7 @@ impl McpClient {
     /// 若无 text 内容,返回空字符串。
     pub async fn call_tool(&self, name: &str, arguments: &Value) -> Result<String, String> {
         let result = self
-            .transport
-            .request(
+            .request_tracked(
                 "tools/call",
                 serde_json::json!({
                     "name": name,
@@ -166,8 +238,7 @@ impl McpClient {
         arguments: &Value,
     ) -> Result<McpToolResult, String> {
         let result = self
-            .transport
-            .request(
+            .request_tracked(
                 "tools/call",
                 serde_json::json!({
                     "name": name,
@@ -201,8 +272,7 @@ impl McpClient {
     /// server 不支持资源能力时按协议返回错误——错误原文透传（不静默空数组）。
     pub async fn list_resources(&self) -> Result<Vec<Value>, String> {
         let result = self
-            .transport
-            .request("resources/list", serde_json::json!({}))
+            .request_tracked("resources/list", serde_json::json!({}))
             .await?;
         result
             .get("resources")
@@ -213,8 +283,7 @@ impl McpClient {
 
     /// 读取资源内容（`resources/read`；text 资源取 text，blob 返回 base64 原样）
     pub async fn read_resource(&self, uri: &str) -> Result<Value, String> {
-        self.transport
-            .request("resources/read", serde_json::json!({ "uri": uri }))
+        self.request_tracked("resources/read", serde_json::json!({ "uri": uri }))
             .await?
             .get("contents")
             .cloned()
@@ -224,8 +293,7 @@ impl McpClient {
     /// 列出 server 提示（`prompts/list`）
     pub async fn list_prompts(&self) -> Result<Vec<Value>, String> {
         let result = self
-            .transport
-            .request("prompts/list", serde_json::json!({}))
+            .request_tracked("prompts/list", serde_json::json!({}))
             .await?;
         result
             .get("prompts")
@@ -236,12 +304,11 @@ impl McpClient {
 
     /// 取提示（`prompts/get`；args 为该 prompt 声明的入参）
     pub async fn get_prompt(&self, name: &str, args: &Value) -> Result<Value, String> {
-        self.transport
-            .request(
-                "prompts/get",
-                serde_json::json!({ "name": name, "arguments": args }),
-            )
-            .await
+        self.request_tracked(
+            "prompts/get",
+            serde_json::json!({ "name": name, "arguments": args }),
+        )
+        .await
     }
 
     /// 关闭底层传输层

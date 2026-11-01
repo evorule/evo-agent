@@ -210,6 +210,15 @@ pub struct McpPutServer {
     timeout_secs: u64,
     #[serde(default)]
     always_allow: Vec<String>,
+    /// 生命周期策略（资源边界设计（L1），运维面参数；缺省全关=现行为）
+    #[serde(default)]
+    max_idle_secs: Option<u64>,
+    #[serde(default)]
+    max_lifetime_secs: Option<u64>,
+    #[serde(default)]
+    hang_threshold: Option<u32>,
+    #[serde(default)]
+    restart_on_reap: bool,
     /// 传输方式(B23):省略=stdio;streamable_http 需配合 url
     #[serde(default)]
     transport: Option<String>,
@@ -272,6 +281,10 @@ pub async fn put_servers(
                 transport: s.transport,
                 url: s.url,
                 headers: s.headers,
+                max_idle_secs: s.max_idle_secs,
+                max_lifetime_secs: s.max_lifetime_secs,
+                hang_threshold: s.hang_threshold,
+                restart_on_reap: s.restart_on_reap,
             }
         })
         .collect();
@@ -465,6 +478,7 @@ mod tests {
             transport: transport.map(|s| s.to_string()),
             url: url.map(|s| s.to_string()),
             headers: None,
+            ..Default::default()
         };
         let one = |s: McpServerConfig| McpConfig { servers: vec![s] };
         // 缺省 stdio:command 必填

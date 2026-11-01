@@ -95,6 +95,7 @@ mod tests {
             transport: None,
             url: None,
             headers: None,
+            ..Default::default()
         }
     }
 

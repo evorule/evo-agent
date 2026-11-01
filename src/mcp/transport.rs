@@ -86,6 +86,11 @@ pub struct StdioTransport {
     /// 等待响应的 channel:id → oneshot sender
     /// 用 std::sync::Mutex(锁内无 await,持有时间极短)
     pending: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<PendingResult>>>>,
+    /// 孤儿兜底 job 句柄（Windows，资源边界设计（L1））：持有至 transport 销毁——
+    /// 句柄关闭即 `KILL_ON_JOB_CLOSE` 收割整棵进程树；显式 close 路径先行
+    /// kill，此处为非优雅退出的双保险
+    #[cfg(windows)]
+    _job: Option<super::lifecycle::job::JobHandle>,
 }
 
 impl StdioTransport {
@@ -94,20 +99,45 @@ impl StdioTransport {
     /// `command` 如 `"npx"`,`args` 如 `["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]`。
     /// 子进程的 stderr 会被丢弃(不 pipe,继承父进程;如需捕获可后续扩展)。
     pub async fn spawn(command: &str, args: &[&str]) -> Result<Self, String> {
+        Self::spawn_stdio(command, args, &HashMap::new()).await
+    }
+
+    /// spawn 时附带环境变量(用于 MCP server 需要 token 等场景)
+    ///
+    /// `env` 会合并到子进程环境(不覆盖父进程未列出的变量)。
+    pub async fn spawn_with_env(
+        command: &str,
+        args: &[&str],
+        env: &HashMap<String, String>,
+    ) -> Result<Self, String> {
+        Self::spawn_stdio(command, args, env).await
+    }
+
+    /// 共享 spawn 核心：最小环境 + 孤儿兜底装配（资源边界设计（L1））
+    async fn spawn_stdio(
+        command: &str,
+        args: &[&str],
+        env: &HashMap<String, String>,
+    ) -> Result<Self, String> {
         // 最小环境（凭据外泄面收窄）：env_clear 后仅注入最小安全集，
-        // MCP server 所需业务键经 mcp.toml env 显式声明（见 spawn_with_env）
+        // MCP server 所需业务键经 mcp.toml env 显式声明（扩面唯一通道）
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
             .stdin(StdIo::piped())
             .stdout(StdIo::piped())
             .stderr(StdIo::null())
             .env_clear();
-        for (k, v) in super::spawn_gate::minimal_spawn_env(&HashMap::new()) {
+        for (k, v) in super::spawn_gate::minimal_spawn_env(env) {
             cmd.env(k, v);
         }
+        // 孤儿兜底（无条件，防御性新增）：kill_on_drop + Windows CREATE_SUSPENDED
+        // 起手 / Unix 进程组（见 lifecycle::configure_orphan_proofing）
+        super::lifecycle::configure_orphan_proofing(&mut cmd);
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("spawn MCP server '{}' failed: {}", command, e))?;
+        // assign Job（Windows）并恢复挂起线程；句柄由 transport 持有至销毁
+        let job = super::lifecycle::finish_orphan_proofing(&child)?;
 
         let stdin = child
             .stdin
@@ -130,51 +160,8 @@ impl StdioTransport {
             stdin: Mutex::new(stdin),
             next_id: AtomicU64::new(1),
             pending,
-        })
-    }
-
-    /// spawn 时附带环境变量(用于 MCP server 需要 token 等场景)
-    ///
-    /// `env` 会合并到子进程环境(不覆盖父进程未列出的变量)。
-    pub async fn spawn_with_env(
-        command: &str,
-        args: &[&str],
-        env: &HashMap<String, String>,
-    ) -> Result<Self, String> {
-        // 最小环境 + mcp.toml env 显式增量（env_clear 后注入；
-        // 业务/凭据键不经此通道——显式声明是唯一扩面手段）
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
-            .stdin(StdIo::piped())
-            .stdout(StdIo::piped())
-            .stderr(StdIo::null())
-            .env_clear();
-        for (k, v) in super::spawn_gate::minimal_spawn_env(env) {
-            cmd.env(k, v);
-        }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("spawn MCP server '{}' failed: {}", command, e))?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "MCP child has no stdin".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "MCP child has no stdout".to_string())?;
-
-        let pending: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<PendingResult>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let pending_clone = pending.clone();
-        tokio::spawn(reader_loop(stdout, pending_clone));
-
-        Ok(Self {
-            child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
-            next_id: AtomicU64::new(1),
-            pending,
+            #[cfg(windows)]
+            _job: job,
         })
     }
 }

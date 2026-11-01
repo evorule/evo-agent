@@ -398,6 +398,14 @@ async fn connect_and_register_one(
     };
 
     let client = Arc::new(McpClient::connect(Arc::new(transport)).await?);
+    // 生命周期监控（资源边界设计（L1）；策略全关=不启用=现行为）。CLI 单发路径无
+    // 重启监督——收割通知端就地丢弃（fail-soft：收割与事件面不受影响）
+    {
+        let policy = super::lifecycle::LifecyclePolicy::from_config(server_cfg);
+        if policy.is_active() {
+            let _ = client.enable_lifecycle(&server_cfg.name, policy);
+        }
+    }
 
     let tools = client.list_tools().await?;
     register_client_tools(
@@ -642,6 +650,7 @@ mod tests {
                 transport: None,
                 url: None,
                 headers: None,
+                ..Default::default()
             }],
         };
         let count = register_mcp_tools(&mut handler, &config).await;
