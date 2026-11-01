@@ -75,7 +75,7 @@ pub const SHELL_NET_COMMANDS: &[&str] = &[
 
 /// 目标域白名单（小写；域后缀匹配＝条目 + 全部子域）
 ///
-/// 初始值＝参赛线与施工基础设施实测依赖域（pip/github/HF/crates/npm/gitee
+/// 初始值＝参赛线与施工基础设施实测依赖域（pip/github/HF/crates/npm
 /// 镜像）；observe 缺省下随误伤数据回填演化（io_guard 同纪律）。
 pub const SHELL_NET_ALLOWED_DOMAINS: &[&str] = &[
     // PyPI（pip 安装）
@@ -95,8 +95,6 @@ pub const SHELL_NET_ALLOWED_DOMAINS: &[&str] = &[
     "static.crates.io",
     // npm
     "registry.npmjs.org",
-    // Gitee（国内镜像）
-    "gitee.com",
     // 测试对照域（不敏感）
     "example.com",
 ];
