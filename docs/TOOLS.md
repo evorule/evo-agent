@@ -104,6 +104,41 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 
 MCP tools are registered automatically with the `mcp_{server}_{tool}` prefix and managed uniformly via the ToolHandler.
 
+### Spawn governance (allowlist gate)
+
+Every stdio MCP server launch passes a source-authentication gate before the process
+is spawned. The trusted list can come from two sources, in priority order:
+
+1. **Governance list (recommended)**: the approved entries of the governed dataset
+   `org.evorule.mcp.servers` on an EvoRule governance service. Approval goes through
+   the dataset lifecycle (human approve action fills the attribution and promotes the
+   entry); the executor pulls the effective list as a snapshot bundle and caches it
+   in-process with a TTL. Unlisted servers observed at the gate are automatically
+   proposed into the governance dataset as Draft entries (fire-and-forget; a proposal
+   failure never affects the spawn decision).
+2. **Local allowlist file**: `~/.evorule/mcp-allowlist.json` (override with
+   `EVORULE_MCP_ALLOWLIST`) - the authority when governance is not configured, and
+   the explicit fallback when it is unreachable or stale (every downgrade is logged
+   with its reason and duration; a missing file means deny-all under `enforce`).
+
+Policy: `EVORULE_MCP_SPAWN_POLICY` = `enforce` (default, unlisted = reject) or
+`warn` (explicit migration mode, allow + log). Matching is command-exact plus
+per-segment prefix wildcard; package runners (npx/uvx/node/python/...) must carry a
+non-empty `args_pattern`.
+
+Governance-source environment variables (all optional; the governance list requires
+URL and pull key, the proposal channel additionally requires the propose key):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `EVORULE_MCP_GOV_URL` | empty | Governance service base URL, e.g. `http://127.0.0.1:18081` |
+| `EVORULE_MCP_GOV_API_KEY` | empty | `X-Api-Key` with `pull` scope for the effective-list snapshot |
+| `EVORULE_MCP_GOV_PROPOSE_KEY` | empty | `X-Api-Key` with `entries:propose` scope for the auto-proposal channel |
+| `EVORULE_MCP_GOV_DATASET` | `org.evorule.mcp.servers` | Governed dataset id |
+| `EVORULE_MCP_GOV_TTL_SECS` | `300` (clamped 5..=3600) | Freshness window of the cached list |
+| `EVORULE_MCP_SPAWN_POLICY` | `enforce` | Unlisted-server disposition |
+| `EVORULE_MCP_ALLOWLIST` | `~/.evorule/mcp-allowlist.json` | Local allowlist file path |
+
 ## Built-in agents and tool whitelists
 
 Agent profiles load from `agents/{type}.json`:

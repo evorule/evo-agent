@@ -42,6 +42,17 @@ const BARE_INTERPRETERS: &[&str] = &["npx", "uvx", "node", "python", "python3", 
 /// 的领域 schema 锚；与治理侧约定常量镜像对齐）
 pub(crate) const MCP_SERVER_SCHEMA_REF: &str = "builtin:mcp/server";
 
+/// MCP 拉起批准清单数据集约定 id（与治理侧约定常量镜像对齐；提案上行与
+/// 生效清单拉取共用）
+pub(crate) const MCP_SERVERS_DATASET_ID: &str = "org.evorule.mcp.servers";
+
+/// 裸解释器判定（提案上行消费：裸解释器的提案必须携带本次观测参数段锁包）
+pub(crate) fn is_bare_interpreter(command: &str) -> bool {
+    BARE_INTERPRETERS
+        .iter()
+        .any(|i| command.eq_ignore_ascii_case(i))
+}
+
 /// 批准条目身份键：command+args_pattern 的规范哈希（治理资产域条目指纹：
 /// serde_json canonical 紧凑输入 + `blake3:` 前缀 + evorule-hash
 /// `json_digest`+`prefixed` 原语）。
@@ -290,13 +301,15 @@ pub(crate) fn spawn_policy() -> String {
 /// 单 server 装载门总入口（调用方一行接入）：治理清单优先 → 降级本地文件 →
 /// 按 env 策略判定。每一步来源选择显式留痕（降级原因/时长不静默）；
 /// 清单解析失败 = 两种档位下均连接失败（配置损坏必须大声）。
+/// 未登记 server 的观测在判定后转治理提案（提案回流，fail-soft：独立线程
+/// fire-and-forget，判定路径零等待零依赖）。
 pub(crate) fn ensure_spawn_allowed(
     server_name: &str,
     command: &str,
     args: &[String],
 ) -> Result<(), String> {
     let policy = spawn_policy();
-    match super::gov_source::availability() {
+    let result = match super::gov_source::availability() {
         super::gov_source::Availability::Governance(snapshot) => gate(
             server_name,
             command,
@@ -330,10 +343,30 @@ pub(crate) fn ensure_spawn_allowed(
             let list = SpawnAllowlist::load()?;
             gate(server_name, command, args, &policy, Some(&list), "local")
         }
+    };
+    // 提案回流钩子：warn 放行的未登记 / enforce 拒载的未登记，都是「第一次
+    // 使用即产生提案」的观测点（治理清单命中放行则无提案语义）。
+    match &result {
+        Err(_) => super::gov_proposal::maybe_propose(server_name, command, args, "enforce 拒载"),
+        Ok(GateOutcome::AllowedUnlistedWarn) => {
+            super::gov_proposal::maybe_propose(server_name, command, args, "warn 迁移档放行")
+        }
+        Ok(GateOutcome::Allowed) => {}
     }
+    // 调用方契约保持 Result<(), _>：判定结论仅供提案钩子消费
+    result.map(|_| ())
 }
 
-/// 装载门判定（单 server）：Ok=放行；Err=拒载（消息含原因与处置指引）。
+/// 装载门判定结论（Ok 内载荷，提案回流钩子消费）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateOutcome {
+    /// 名单命中放行
+    Allowed,
+    /// warn 迁移档下未登记放行（留痕 + 提案上行钩子）
+    AllowedUnlistedWarn,
+}
+
+/// 装载门判定（单 server）：Ok(结论)=放行；Err=拒载（消息含原因与处置指引）。
 /// 每次判定发结构化事件（治理事实挂点：来源/条目身份键/审批锚/判定/理由）。
 pub(crate) fn gate(
     server_name: &str,
@@ -342,7 +375,7 @@ pub(crate) fn gate(
     policy: &str,
     allowlist: Option<&SpawnAllowlist>,
     origin: &str,
-) -> Result<(), String> {
+) -> Result<GateOutcome, String> {
     let matched = allowlist.and_then(|list| list.matches(command, args));
     let allowed = matched.is_some();
     let args_json = serde_json::to_string(args).unwrap_or_default();
@@ -365,7 +398,7 @@ pub(crate) fn gate(
             verdict = "allow",
             "MCP spawn gate: approved"
         );
-        Ok(())
+        Ok(GateOutcome::Allowed)
     } else if policy == "warn" {
         tracing::warn!(
             target: "mcp_spawn_gate",
@@ -377,7 +410,7 @@ pub(crate) fn gate(
             verdict = "allow_warn",
             "MCP spawn gate: 未登记 server（warn 迁移档放行并留痕）"
         );
-        Ok(())
+        Ok(GateOutcome::AllowedUnlistedWarn)
     } else {
         tracing::warn!(
             target: "mcp_spawn_gate",

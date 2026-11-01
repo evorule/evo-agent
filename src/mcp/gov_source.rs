@@ -34,7 +34,7 @@ use evorule_bundle::{DatasetBundle, EntryKind};
 
 use super::spawn_gate::{
     canonical_server_key, validate_approval_entry, AllowlistEntry, SpawnAllowlist,
-    MCP_SERVER_SCHEMA_REF,
+    MCP_SERVERS_DATASET_ID, MCP_SERVER_SCHEMA_REF,
 };
 
 /// 治理源快照（批准清单 + 包内容哈希=版本标记，变更可观测）
@@ -79,7 +79,7 @@ impl GovConfig {
         let dataset_id = std::env::var("EVORULE_MCP_GOV_DATASET")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "org.evorule.mcp.servers".to_string());
+            .unwrap_or_else(|| MCP_SERVERS_DATASET_ID.to_string());
         let ttl_secs = std::env::var("EVORULE_MCP_GOV_TTL_SECS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
