@@ -190,6 +190,10 @@ fn smoke_serve_with_stdio_mcp_reaches_listening_and_client_face_works() {
     };
 
     // 起真实 serve 二进制（stdout/stderr 继承，失败现场随 cargo test 输出可见）
+    // --no-preflight：冒烟目标是 MCP stdio 链路，而启动 preflight（INV-6 fail-fast）
+    // 会探默认配置面下游（evorule-server/llm-executor），无下游环境（CI runner/
+    // 干净本机）serve 起不来直接退出——测试自足场景走逃生口，preflight 本体
+    // 由 doctor 与 run/patrol/schedule 各自覆盖。
     let child = Command::new(env!("CARGO_BIN_EXE_evo-agent"))
         .args([
             "serve",
@@ -200,7 +204,12 @@ fn smoke_serve_with_stdio_mcp_reaches_listening_and_client_face_works() {
             "--port",
             &port.to_string(),
             "--no-auth",
+            "--no-preflight",
         ])
+        // MCP 治理面（spawn 批准清单 fail-closed）会拒绝拉起未登记的本地
+        // mock server——测试自足场景显式切 warn 迁移档（治理面提示的处置
+        // 路径之一；allowlist 登记/治理审批链是生产面路径，不适合测试）。
+        .env("EVORULE_MCP_SPAWN_POLICY", "warn")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
