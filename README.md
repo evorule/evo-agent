@@ -54,7 +54,7 @@ export MINIMAX_API_KEY=your-api-key
 ./demo.sh
 ```
 
-The script automatically: downloads and starts a pinned evorule-server release (resolved via the Gitee release API at runtime; port 18080, random token auth) → writes the project config → builds → runs an expense-registration session (LLM + tool calls all become auditable Facts) → calls `audit/verify` to check the Fact hash chain and print a full audit report. Open http://localhost:18080 in a browser afterwards to see the audit page. Reset by deleting the `.demo/` directory.
+The script automatically: downloads and starts a pinned evorule-server release (resolved via the GitHub release API at runtime; port 18080, random token auth) → writes the project config → builds → runs an expense-registration session (LLM + tool calls all become auditable Facts) → calls `audit/verify` to check the Fact hash chain and print a full audit report. Open http://localhost:18080 in a browser afterwards to see the audit page. Reset by deleting the `.demo/` directory.
 
 ### Dependency contract
 
