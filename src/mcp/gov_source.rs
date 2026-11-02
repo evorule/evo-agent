@@ -105,14 +105,36 @@ struct GovState {
     snapshot: Option<GovSnapshot>,
     last_success: Option<Instant>,
     last_error: Option<String>,
+    /// 降级起点（冷启动=构造即降级；成功后清空，再失败重新起算）
+    degraded_since: Option<Instant>,
 }
 
 impl GovCache {
     pub(crate) fn new(cfg: GovConfig) -> Self {
         Self {
             cfg,
-            state: Mutex::new(GovState::default()),
+            state: Mutex::new(GovState {
+                degraded_since: Some(Instant::now()),
+                ..Default::default()
+            }),
         }
+    }
+
+    /// 治理不可达持续时长（design-57 降级时限判定输入）：
+    /// None = 治理源新鲜（未降级）；Some = 冷启动从未成功或最近一次成功后
+    /// 持续失败的时长
+    pub(crate) fn degraded_duration(&self) -> Option<Duration> {
+        let st = self.state.lock().unwrap();
+        if st
+            .last_success
+            .map_or(false, |t| t.elapsed() <= self.cfg.ttl)
+        {
+            return None;
+        }
+        Some(
+            st.degraded_since
+                .map_or_else(|| Duration::from_secs(0), |t| t.elapsed()),
+        )
     }
 
     /// 当前可用性（只读快照，不触网络）
@@ -168,6 +190,7 @@ impl GovCache {
                 }
                 st.last_error = None;
                 st.last_success = Some(Instant::now());
+                st.degraded_since = None;
                 st.snapshot = Some(new);
                 true
             }
@@ -184,6 +207,9 @@ impl GovCache {
                         error = %e,
                         "MCP 治理批准清单尚未成功拉取（持续降级本地文件）"
                     );
+                }
+                if st.degraded_since.is_none() {
+                    st.degraded_since = Some(Instant::now());
                 }
                 st.last_error = Some(e);
                 false
@@ -225,6 +251,19 @@ pub(crate) fn global() -> Option<&'static GovCache> {
         })
     })
     .as_deref()
+}
+
+/// 治理源是否已配置（URL+KEY 齐全；降级时限判定只对已配置面生效）
+pub(crate) fn configured() -> bool {
+    GovConfig::from_env().is_some()
+}
+
+/// 治理不可达持续时长（design-57 降级时限判定输入；None=未降级）
+pub(crate) fn degraded_duration() -> Option<Duration> {
+    match global() {
+        None => None,
+        Some(cache) => cache.degraded_duration(),
+    }
 }
 
 /// 装载门入口：治理源可用性判定（未配置 = 本地文件即权威）

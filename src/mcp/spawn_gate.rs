@@ -309,6 +309,43 @@ pub(crate) fn ensure_spawn_allowed(
     args: &[String],
 ) -> Result<(), String> {
     let policy = spawn_policy();
+    // 无人值守防护层 T₀：pack 绑定进程的启动装载（一次性）
+    super::gov_pack::startup_load_once();
+    // 降级时限（授权必有界不变式，连接维度）：治理不可达持续超 TTL = 冻结
+    // 新 spawn（已建立连接不中断；恢复连接自动解冻）。未配置治理源不适用
+    // （纯本地文件形态无降级概念）。
+    if super::gov_source::configured() {
+        let degraded = super::gov_source::degraded_duration();
+        let ttl = super::gov_pack::degrade_ttl();
+        if super::gov_pack::frozen(degraded, ttl) {
+            tracing::warn!(
+                target: "mcp_spawn_gate",
+                server = %server_name,
+                degraded_secs = degraded.map(|d| d.as_secs()).unwrap_or(0),
+                ttl_secs = ttl.as_secs(),
+                verdict = "reject",
+                reason = "frozen_degraded",
+                "MCP spawn gate: 治理连接丢失超降级时限，新 spawn 冻结（任务报告应标注）"
+            );
+            crate::governance::hooks::mcp_spawn(
+                &crate::governance::hooks::McpSpawnFacts {
+                    server_name: server_name.to_string(),
+                    command: command.to_string(),
+                    args_prefix: Some(args.iter().take(8).map(|s| s.to_string()).collect()),
+                    server_key: None,
+                    approval_ref: None,
+                    source: Some("frozen".to_string()),
+                    policy: Some(policy.as_str().to_string()),
+                },
+                crate::governance::hooks::McpSpawnVerdict::Reject,
+            );
+            return Err(format!(
+                "MCP server `{server_name}` 拉起被治理降级时限冻结：治理连接丢失超过 {}s，无人值守期间停止发起新 spawn（已建立连接不中断）。恢复治理连接后自动解冻",
+                ttl.as_secs()
+            ));
+        }
+    }
+    let pack_mode = super::gov_pack::pack_ref().is_some();
     let result = match super::gov_source::availability() {
         super::gov_source::Availability::Governance(snapshot) => gate(
             server_name,
@@ -344,14 +381,89 @@ pub(crate) fn ensure_spawn_allowed(
             gate(server_name, command, args, &policy, Some(&list), "local")
         }
     };
+    // 能力包组合（T₀，pack 模式二次闸）：清单命中后必须在任务能力包内且
+    // 未过期；包外/包未就绪/已过期一律拒载（fail-closed）并留阻塞事件（任务
+    // 报告标注）。治理清单已批准=无提案语义（提案面向未登记面；包外是授权
+    // 面收紧，治理面更新能力包后下轮生效）。
+    let mut result = result;
+    if pack_mode {
+        if let Ok((outcome, server_key)) = &result {
+            if *outcome == GateOutcome::Allowed {
+                let composed = super::gov_pack::compose(
+                    true,
+                    super::gov_pack::current_pack().as_deref(),
+                    server_key.as_deref(),
+                );
+                match composed {
+                    super::gov_pack::PackComposed::Allowed => {}
+                    reason => {
+                        let detail = match reason {
+                            super::gov_pack::PackComposed::Expired => {
+                                "任务能力包已过期（TTL 到期自动收缩）"
+                            }
+                            super::gov_pack::PackComposed::NotAuthorized => {
+                                "任务能力包未就绪（拉取失败/未配置，fail-closed）"
+                            }
+                            _ => "server 不在任务能力包内",
+                        };
+                        tracing::warn!(
+                            target: "mcp_spawn_gate",
+                            server = %server_name,
+                            detail = detail,
+                            verdict = "reject",
+                            reason = "pack",
+                            "MCP spawn gate: 清单命中但任务能力包未授权，拒载"
+                        );
+                        crate::governance::hooks::mcp_spawn(
+                            &crate::governance::hooks::McpSpawnFacts {
+                                server_name: server_name.to_string(),
+                                command: command.to_string(),
+                                args_prefix: Some(
+                                    args.iter().take(8).map(|s| s.to_string()).collect(),
+                                ),
+                                server_key: server_key.clone(),
+                                approval_ref: None,
+                                source: Some("pack".to_string()),
+                                policy: Some(policy.as_str().to_string()),
+                            },
+                            crate::governance::hooks::McpSpawnVerdict::Reject,
+                        );
+                        return Err(format!(
+                            "MCP server `{server_name}` 不在任务能力包授权内（{detail}）；该能力已受阻——用已授权能力继续或干净收尾，治理面更新能力包后下轮生效"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // 治理事实出证（P2c，终态）：pack 组合可能把清单命中改写为 pack 拒载——
+    // 出证必须在终态落定后（allow/allow_warn/reject[frozen/pack/list]）。
+    if let Ok((outcome, key)) = &result {
+        let facts = crate::governance::hooks::McpSpawnFacts {
+            server_name: server_name.to_string(),
+            command: command.to_string(),
+            args_prefix: Some(args.iter().take(8).map(|s| s.to_string()).collect()),
+            server_key: key.clone(),
+            approval_ref: None,
+            source: None, // 来源已随 gate 内事件留痕；此处仅终态补充
+            policy: Some(policy.as_str().to_string()),
+        };
+        let v = match outcome {
+            GateOutcome::Allowed => crate::governance::hooks::McpSpawnVerdict::Allow,
+            GateOutcome::AllowedUnlistedWarn => {
+                crate::governance::hooks::McpSpawnVerdict::AllowWarn
+            }
+        };
+        crate::governance::hooks::mcp_spawn(&facts, v);
+    }
     // 提案回流钩子：warn 放行的未登记 / enforce 拒载的未登记，都是「第一次
     // 使用即产生提案」的观测点（治理清单命中放行则无提案语义）。
     match &result {
         Err(_) => super::gov_proposal::maybe_propose(server_name, command, args, "enforce 拒载"),
-        Ok(GateOutcome::AllowedUnlistedWarn) => {
+        Ok((GateOutcome::AllowedUnlistedWarn, _)) => {
             super::gov_proposal::maybe_propose(server_name, command, args, "warn 迁移档放行")
         }
-        Ok(GateOutcome::Allowed) => {}
+        Ok((GateOutcome::Allowed, _)) => {}
     }
     // 调用方契约保持 Result<(), _>：判定结论仅供提案钩子消费
     result.map(|_| ())
@@ -375,21 +487,10 @@ pub(crate) fn gate(
     policy: &str,
     allowlist: Option<&SpawnAllowlist>,
     origin: &str,
-) -> Result<GateOutcome, String> {
+) -> Result<(GateOutcome, Option<String>), String> {
     let matched = allowlist.and_then(|list| list.matches(command, args));
     let allowed = matched.is_some();
     let args_json = serde_json::to_string(args).unwrap_or_default();
-    // 治理事实出证（P2c：判定落定后 fire-and-forget——不参与判定，fail-soft
-    // 同提案回流红线；未初始化=no-op）。verdict 三态：命中/warn 未登记/拒载。
-    let governance_facts = crate::governance::hooks::McpSpawnFacts {
-        server_name: server_name.to_string(),
-        command: command.to_string(),
-        args_prefix: Some(args.iter().take(8).map(|s| s.to_string()).collect()),
-        server_key: matched.and_then(|e| e.server_key.clone()),
-        approval_ref: matched.and_then(|e| e.approval_ref.clone()),
-        source: Some(origin.to_string()),
-        policy: Some(policy.to_string()),
-    };
     let server_key = matched
         .and_then(|e| e.server_key.clone())
         .unwrap_or_default();
@@ -409,7 +510,10 @@ pub(crate) fn gate(
             verdict = "allow",
             "MCP spawn gate: approved"
         );
-        Ok(GateOutcome::Allowed)
+        Ok((
+            GateOutcome::Allowed,
+            matched.and_then(|e| e.server_key.clone()),
+        ))
     } else if policy == "warn" {
         tracing::warn!(
             target: "mcp_spawn_gate",
@@ -421,11 +525,7 @@ pub(crate) fn gate(
             verdict = "allow_warn",
             "MCP spawn gate: 未登记 server（warn 迁移档放行并留痕）"
         );
-        crate::governance::hooks::mcp_spawn(
-            &governance_facts,
-            crate::governance::hooks::McpSpawnVerdict::AllowWarn,
-        );
-        Ok(GateOutcome::AllowedUnlistedWarn)
+        Ok((GateOutcome::AllowedUnlistedWarn, None))
     } else {
         tracing::warn!(
             target: "mcp_spawn_gate",
@@ -438,10 +538,6 @@ pub(crate) fn gate(
             "MCP spawn gate: 未登记 server 拒载（enforce；登记走治理批准清单 \
              org.evorule.mcp.servers，或用户级 .evorule/mcp-allowlist.json \
              本地兜底，或显式切换 warn 迁移档）"
-        );
-        crate::governance::hooks::mcp_spawn(
-            &governance_facts,
-            crate::governance::hooks::McpSpawnVerdict::Reject,
         );
         Err(format!(
             "MCP server `{server_name}` 未在拉起批准清单（command `{command}`，来源 {origin}）；\

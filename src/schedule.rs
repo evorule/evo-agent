@@ -215,6 +215,11 @@ pub struct ScheduleJob {
     /// 单次触发超时秒（缺省 600）
     #[serde(default = "default_job_timeout")]
     pub timeout_secs: u64,
+    /// 能力包 task_ref（无人值守防护层 design-57 T₀；缺省无=不启用能力包
+    /// 门组合）。值=治理面 `org.evorule.mcp.packs` 数据集条目 id（task_ref），
+    /// fire_job 经 env 注入 run 子进程，装载门按 pack∩list 双闸判定
+    #[serde(default)]
+    pub pack_ref: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -401,6 +406,11 @@ pub fn fire_job(exe: &Path, workdir: &Path, job: &ScheduleJob) -> Result<i32, St
             }
             cmd.arg("--").arg(job.goal.as_deref().unwrap_or(""));
         }
+    }
+    // 无人值守防护层（design-57 T₀）：pack 绑定的任务把 task_ref 注入子进程
+    // env——run 进程的装载门按 pack∩list 双闸判定，提案回流携带 task_ref
+    if let Some(pack_ref) = job.pack_ref.as_deref().filter(|s| !s.trim().is_empty()) {
+        cmd.env("EVORULE_MCP_PACK_REF", pack_ref);
     }
     // 超时强杀：timeout_secs（缺省 600s）到点强杀子进程——否则单个挂死任务
     // 会以阻塞等待方式永久卡死 run_loop，后续所有分钟的调度全部停摆，恰是
@@ -602,6 +612,7 @@ mod tests {
             workspace: Some("ws".into()),
             enabled: true,
             timeout_secs: 60,
+            pack_ref: None,
         }];
         // 上一 tick=10:00（已含该分钟），现在=10:05：错过 10:02/10:04，当前 10:05 不匹配
         let acts = plan_tick(&jobs, Some("2026-10-22T10:00"), "2026-10-22T10:05");
@@ -625,6 +636,7 @@ mod tests {
             workspace: Some("ws".into()),
             enabled: true,
             timeout_secs: 60,
+            pack_ref: None,
         }];
         let acts = plan_tick(&jobs, None, "2026-10-22T10:05");
         assert_eq!(acts.len(), 1);
@@ -645,6 +657,7 @@ mod tests {
             workspace: None,
             enabled: true,
             timeout_secs: 60,
+            pack_ref: None,
         });
         assert!(c.validate().is_err());
         c.jobs[0].cron = "*/5 * * * *".into();

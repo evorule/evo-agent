@@ -38,6 +38,7 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use super::gov_pack::pack_ref;
 use super::spawn_gate::{
     canonical_server_key, is_bare_interpreter, validate_approval_entry, MCP_SERVERS_DATASET_ID,
 };
@@ -154,7 +155,9 @@ fn send_proposal(
         "{}/v1/invoke/propose_mcp_server",
         cfg.base_url.trim_end_matches('/')
     );
-    let payload = serde_json::json!({
+    // 无人值守阻塞标记（design-57）：pack 绑定进程把 task_ref 带上提案——
+    // 批准队列按任务关联过滤/排序（审批疲劳对症）
+    let mut payload = serde_json::json!({
         "dataset_id": cfg.dataset_id,
         "command": command,
         "args_pattern": args_pattern,
@@ -162,6 +165,9 @@ fn send_proposal(
         "source_session_id": server_name,
         "cause": cause,
     });
+    if let Some(task_ref) = pack_ref() {
+        payload["task_ref"] = serde_json::Value::String(task_ref);
+    }
     let client = match reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(5))

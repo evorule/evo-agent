@@ -78,6 +78,7 @@
 //! ```
 
 pub mod client;
+pub mod gov_pack;
 pub mod gov_proposal;
 pub mod gov_source;
 pub mod lifecycle;
