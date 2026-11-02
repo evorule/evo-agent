@@ -99,7 +99,7 @@ impl StdioTransport {
     /// `command` 如 `"npx"`,`args` 如 `["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]`。
     /// 子进程的 stderr 会被丢弃(不 pipe,继承父进程;如需捕获可后续扩展)。
     pub async fn spawn(command: &str, args: &[&str]) -> Result<Self, String> {
-        Self::spawn_stdio(command, args, &HashMap::new()).await
+        Self::spawn_stdio(command, args, &HashMap::new(), &Default::default()).await
     }
 
     /// spawn 时附带环境变量(用于 MCP server 需要 token 等场景)
@@ -110,14 +110,27 @@ impl StdioTransport {
         args: &[&str],
         env: &HashMap<String, String>,
     ) -> Result<Self, String> {
-        Self::spawn_stdio(command, args, env).await
+        Self::spawn_stdio(command, args, env, &Default::default()).await
     }
 
-    /// 共享 spawn 核心：最小环境 + 孤儿兜底装配（资源边界设计（L1））
+    /// spawn 时附带环境变量与资源限额（资源边界设计 L2：Job Object 内存上界/
+    /// CPU 速率硬帽；缺省限额=不启用）
+    pub async fn spawn_with_env_and_limits(
+        command: &str,
+        args: &[&str],
+        env: &HashMap<String, String>,
+        limits: &super::lifecycle::ResourceLimits,
+    ) -> Result<Self, String> {
+        Self::spawn_stdio(command, args, env, limits).await
+    }
+
+    /// 共享 spawn 核心：最小环境 + 孤儿兜底装配 + 可选资源限额（资源边界
+    /// 设计 L1/L2 同一 Job 承载）
     async fn spawn_stdio(
         command: &str,
         args: &[&str],
         env: &HashMap<String, String>,
+        limits: &super::lifecycle::ResourceLimits,
     ) -> Result<Self, String> {
         // 最小环境（凭据外泄面收窄）：env_clear 后仅注入最小安全集，
         // MCP server 所需业务键经 mcp.toml env 显式声明（扩面唯一通道）
@@ -136,9 +149,10 @@ impl StdioTransport {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("spawn MCP server '{}' failed: {}", command, e))?;
-        // assign Job（Windows）并恢复挂起线程；句柄由 transport 持有至销毁
+        // assign Job（Windows）并恢复挂起线程；句柄由 transport 持有至销毁。
+        // 资源限额（L2）在同一 Job 上叠加：内存上界/CPU 速率硬帽
         #[cfg(windows)]
-        let job = super::lifecycle::finish_orphan_proofing(&child)?;
+        let job = super::lifecycle::finish_orphan_proofing(&child, limits)?;
 
         let stdin = child
             .stdin

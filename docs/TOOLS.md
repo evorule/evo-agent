@@ -138,6 +138,17 @@ URL and pull key, the proposal channel additionally requires the propose key):
 | `EVORULE_MCP_GOV_TTL_SECS` | `300` (clamped 5..=3600) | Freshness window of the cached list |
 | `EVORULE_MCP_SPAWN_POLICY` | `enforce` | Unlisted-server disposition |
 | `EVORULE_MCP_ALLOWLIST` | `~/.evorule/mcp-allowlist.json` | Local allowlist file path |
+| `EVORULE_MCP_DEGRADE_TTL_SECS` | `1800` (clamped 60..=86400) | Freeze window: new spawns stop after the governance source stays unreachable this long |
+
+Per-server resource limits (`.evo/mcp.toml`, Windows Job Object based,
+default off - limit values are server-specific, so they are always
+explicit): `max_memory_mb` (job memory ceiling; exceeding it fails
+allocations and the server exits through the normal failure path),
+`cpu_rate_percent` (hard CPU cap 1..=100, throttling not killing),
+`max_idle_secs` / `max_lifetime_secs` / `hang_threshold` (lifecycle
+ceiling), `restart_on_reap` (backoff restart after a policy reap - a
+restart re-walks the spawn gate). See [deploy-containers.md](deploy-containers.md)
+for the container-isolation deployment shape.
 
 ## Built-in agents and tool whitelists
 

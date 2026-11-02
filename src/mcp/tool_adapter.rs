@@ -387,12 +387,21 @@ async fn connect_and_register_one(
     let args: Vec<&str> = server_cfg.args.iter().map(|s| s.as_str()).collect();
 
     let transport = if server_cfg.env.is_empty() {
-        crate::mcp::transport::StdioTransport::spawn(&server_cfg.command, &args).await?
+        let limits = super::lifecycle::ResourceLimits::from_config(server_cfg);
+        crate::mcp::transport::StdioTransport::spawn_with_env_and_limits(
+            &server_cfg.command,
+            &args,
+            &Default::default(),
+            &limits,
+        )
+        .await?
     } else {
-        crate::mcp::transport::StdioTransport::spawn_with_env(
+        let limits = super::lifecycle::ResourceLimits::from_config(server_cfg);
+        crate::mcp::transport::StdioTransport::spawn_with_env_and_limits(
             &server_cfg.command,
             &args,
             &server_cfg.env,
+            &limits,
         )
         .await?
     };

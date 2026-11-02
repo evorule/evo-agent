@@ -219,6 +219,11 @@ pub struct McpPutServer {
     hang_threshold: Option<u32>,
     #[serde(default)]
     restart_on_reap: bool,
+    /// 资源限额（资源边界设计 L2；缺省关）
+    #[serde(default)]
+    max_memory_mb: Option<u64>,
+    #[serde(default)]
+    cpu_rate_percent: Option<u32>,
     /// 传输方式(B23):省略=stdio;streamable_http 需配合 url
     #[serde(default)]
     transport: Option<String>,
@@ -285,6 +290,8 @@ pub async fn put_servers(
                 max_lifetime_secs: s.max_lifetime_secs,
                 hang_threshold: s.hang_threshold,
                 restart_on_reap: s.restart_on_reap,
+                max_memory_mb: s.max_memory_mb,
+                cpu_rate_percent: s.cpu_rate_percent,
             }
         })
         .collect();
