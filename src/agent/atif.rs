@@ -423,6 +423,9 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             JournalEvent::ServiceToolsDegraded { .. } => continue,
             // 超大工具结果引用化:落盘对账事实,非对话步,不映射为轨迹步
             JournalEvent::ToolResultOffloaded { .. } => continue,
+            // MCP 能力未授权阻塞:无人值守防护层启动期环境事实,非对话步,
+            // 不映射为轨迹步(治理面共享账本已有同源事实)
+            JournalEvent::McpCapabilityBlocked { .. } => continue,
             JournalEvent::TurnStarted { goal, .. } => {
                 // 轮界:上一个 agent 步必已随 turn_ended 收步;开用户步
                 let message = match user_msgs.get(user_ordinal) {

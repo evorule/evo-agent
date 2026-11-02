@@ -616,6 +616,18 @@ pub enum JournalEvent {
         /// 原文全文 digest(evorule-hash 口径)
         content_digest: String,
     },
+    /// MCP 能力未授权阻塞落账(无人值守防护层):pack 绑定任务的装载门拒载
+    /// (包外/包未就绪/过期/降级冻结)时随会话 journal 落账,使「此路径阻塞」
+    /// 在任务报告显式可见(治理面更新能力包/恢复连接后下轮生效)。
+    /// 观测面,不参与步映射。
+    McpCapabilityBlocked {
+        /// server 名称(会话关联域 `mcp:{name}`)
+        server: String,
+        /// 阻塞原因(装载门拒载原文,含处置指引)
+        reason: String,
+        /// 任务标识(pack 绑定任务)
+        task_ref: String,
+    },
 }
 
 /// 单行 journal 记录(读侧重放消费形态)
