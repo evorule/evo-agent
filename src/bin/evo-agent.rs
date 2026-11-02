@@ -879,6 +879,7 @@ fn cmd_run(
 
         // G12:连接配置的 MCP server,把它们的工具注册到 tool_handler
         // (async:每个 server spawn 子进程 + initialize 握手 + tools/list 发现工具)
+        let mut startup_service_events: Vec<evo_agent::agent::journal::JournalEvent> = Vec::new();
         if !config.mcp.servers.is_empty() {
             let connected =
                 evo_agent::mcp::register_mcp_tools(&mut tool_handler, &config.mcp).await;
@@ -887,6 +888,27 @@ fn cmd_run(
                 connected,
                 config.mcp.servers.len()
             );
+            // 无人值守防护层(设计-57 会话面):pack 绑定任务的能力阻塞标注——
+            // 任务报告显式可见(「能力未授权,已提案,此路径阻塞」)
+            let pack_task_ref = std::env::var("EVORULE_MCP_PACK_REF")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            if let Some(task_ref) = pack_task_ref {
+                for srv in &config.mcp.servers {
+                    if let Err(reason) =
+                        evo_agent::mcp::spawn_gate::probe_allowance(&srv.command, &srv.args)
+                    {
+                        eprintln!("[mcp] server '{}' blocked: {reason}", srv.name);
+                        startup_service_events.push(
+                            evo_agent::agent::journal::JournalEvent::McpCapabilityBlocked {
+                                server: srv.name.clone(),
+                                reason,
+                                task_ref: task_ref.clone(),
+                            },
+                        );
+                    }
+                }
+            }
         }
 
         // 启动期事件槽:服务工具注册降级等事实收集处(随会话 journal 落账)

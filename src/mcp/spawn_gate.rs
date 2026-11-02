@@ -469,6 +469,73 @@ pub(crate) fn ensure_spawn_allowed(
     result.map(|_| ())
 }
 
+/// 只读探测（零副作用：不发事实/不提案/不触发装载/不触发启动加载）——判定
+/// 指定 command/args 在当前条件下是否被装载门放行。失败=拒载（消息含原因
+/// 与处置指引）。供启动期会话报告面消费（任务报告标注「能力未授权，已提案，
+/// 此路径阻塞」）。
+///
+/// 决策逻辑与 [`ensure_spawn_allowed`] 同源同序（降级冻结/来源选择/清单门/
+/// pack 组合），但不发治理事实、不回流提案、不触发 pack 启动加载。两处修改
+/// 须同步（文件内注释互指）。
+pub fn probe_allowance(command: &str, args: &[String]) -> Result<(), String> {
+    let policy = spawn_policy();
+    // 降级时限
+    if super::gov_source::configured() {
+        let degraded = super::gov_source::degraded_duration();
+        let ttl = super::gov_pack::degrade_ttl();
+        if super::gov_pack::frozen(degraded, ttl) {
+            return Err("治理连接丢失超降级时限，新 spawn 冻结（恢复治理连接后自动解冻）".into());
+        }
+    }
+    let pack_mode = super::gov_pack::pack_ref().is_some();
+    let result = match super::gov_source::availability() {
+        super::gov_source::Availability::Governance(snapshot) => gate(
+            "probe",
+            command,
+            args,
+            &policy,
+            Some(&snapshot.allow),
+            "governance",
+        ),
+        super::gov_source::Availability::Fallback { .. } => {
+            let list = SpawnAllowlist::load()?;
+            gate(
+                "probe",
+                command,
+                args,
+                &policy,
+                Some(&list),
+                "local_fallback",
+            )
+        }
+        super::gov_source::Availability::NotConfigured => {
+            let list = SpawnAllowlist::load()?;
+            gate("probe", command, args, &policy, Some(&list), "local")
+        }
+    };
+    // pack 组合（与 ensure 同序）
+    if pack_mode {
+        if let Ok((GateOutcome::Allowed, key)) = &result {
+            let composed = super::gov_pack::compose(
+                true,
+                super::gov_pack::current_pack().as_deref(),
+                key.as_deref(),
+            );
+            match composed {
+                super::gov_pack::PackComposed::Allowed => {}
+                super::gov_pack::PackComposed::Expired => {
+                    return Err("任务能力包已过期（TTL 到期自动收缩）".into());
+                }
+                super::gov_pack::PackComposed::NotAuthorized => {
+                    return Err("任务能力包未就绪（拉取失败/未配置）".into());
+                }
+                _ => return Err("server 不在任务能力包内".into()),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 装载门判定结论（Ok 内载荷，提案回流钩子消费）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GateOutcome {
