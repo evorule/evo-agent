@@ -69,7 +69,8 @@ try {
         } catch { }
     }
     if (-not $health) { throw "wasm-host :9140 not healthy within 90s" }
-    $mods = $health.integrity.PSObject.Properties
+    # PSObject.Properties 返回内部集合，.Count 走成员枚举（每成员 1）——@() 强转取真实数目
+    $mods = @($health.integrity.PSObject.Properties)
     if ($mods.Count -lt 5) { throw "wasm-host integrity modules = $($mods.Count), expect >= 5" }
     $unverified = @($mods | Where-Object { $_.Value.state -ne 'verified' })
     if ($unverified.Count -gt 0) {
@@ -105,7 +106,8 @@ try {
     $runtime = Join-Path $dataDir "runtime.json"
     if (-not (Test-Path $runtime)) { throw "runtime.json missing under $dataDir" }
     $rt = Get-Content $runtime -Raw | ConvertFrom-Json
-    $enginePort = $rt.engine_port
+    # runtime.json 为嵌套结构（orchestrator.rs last_ports：serve.port / engine.port / llm_executor.port）
+    $enginePort = $rt.engine.port
     if (-not $enginePort) { throw "engine_port missing in runtime.json" }
     $deadline = (Get-Date).AddSeconds(30)
     $udfs = @()
