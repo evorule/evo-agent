@@ -1,4 +1,4 @@
-﻿# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
+# NSIS 安装包构建脚本：收集内嵌资源 → tauri build → 更新三件套归集。
 #
 # 资源布局（安装后 {install}\resources\...，由 tauri.conf.json bundle.resources 承接）：
 #   resources\bin\evo-agent.exe             <- <repo>\target\release\evo-agent.exe
@@ -185,7 +185,7 @@ if (-not $SkipCollect) {
 |---|---|
 | 产品版本 | $version |
 | 构建 commit（evo-agent 仓） | $commitSha |
-| 源码仓库（权威源） | <https://gitee.com/evorule/evo-agent> |
+| 源码仓库（权威源） | <https://github.com/evorule/evo-agent> |
 | 源码仓库（GitHub 镜像） | <https://github.com/evorule/evo-agent> |
 | 源码 tarball | $srcTarballName（随发布 Release 附件分发） |
 | 源码 tarball SHA256 | $srcSha |
@@ -199,8 +199,8 @@ if (-not $SkipCollect) {
 ## 内嵌组件
 
 - evo-agent（本机智能体外壳）与 sdk：本仓（上表构建 commit）
-- evorule-server 引擎 / evorule-ai-plugin：<https://gitee.com/evorule/evorule-server>
-- console 用户面板（如随包分发）：<https://gitee.com/evorule/evorule-console-cloud>
+- evorule-server 引擎 / evorule-ai-plugin：<https://github.com/evorule/evorule-server>
+- console 用户面板（如随包分发）：<https://github.com/evorule/evorule-console-cloud>
 
 ## 第三方组件
 
