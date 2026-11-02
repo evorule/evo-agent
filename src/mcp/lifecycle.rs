@@ -67,6 +67,31 @@ impl LifecyclePolicy {
     }
 }
 
+/// 资源限额（资源边界设计 L2；运维面参数全部缺省关——限额数值强依赖 server
+/// 形态，瞎设缺省=误杀；显式声明是唯一扩面通道，与 mcp.toml env 同纪律）。
+/// Windows=Job Object 精确承载；Unix 侧资源限额缺位（平台差如实声明，
+/// 孤儿兜底/进程组不受影响）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// Job 内存上界（MB；超限=分配失败，server 自行失败退出由既有失败路径接管）
+    pub max_memory_mb: Option<u64>,
+    /// CPU 速率硬帽（百分比 1..=100；超限=节流不杀）
+    pub cpu_rate_percent: Option<u32>,
+}
+
+impl ResourceLimits {
+    pub fn from_config(cfg: &crate::config::McpServerConfig) -> Self {
+        Self {
+            max_memory_mb: cfg.max_memory_mb,
+            cpu_rate_percent: cfg.cpu_rate_percent,
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.max_memory_mb.is_some() || self.cpu_rate_percent.is_some()
+    }
+}
+
 /// 退避序列：1s、2s、4s…封顶 60s（crash loop 不风暴）；成功稳定后 [`Backoff::reset`]
 #[derive(Debug)]
 pub struct Backoff {
@@ -262,13 +287,13 @@ pub(crate) fn configure_orphan_proofing(cmd: &mut tokio::process::Command) {
 #[cfg(windows)]
 pub(crate) fn finish_orphan_proofing(
     child: &tokio::process::Child,
+    limits: &ResourceLimits,
 ) -> Result<Option<job::JobHandle>, String> {
-    #[cfg(windows)]
     {
         let raw = child
             .raw_handle()
             .ok_or_else(|| "MCP child missing process handle".to_string())?;
-        let job = job::create_kill_on_close()?;
+        let job = job::create(limits.max_memory_mb, limits.cpu_rate_percent)?;
         // SAFETY（job 模块治理内）：raw_handle 的裸指针即进程 HANDLE
         let raw_handle = windows::Win32::Foundation::HANDLE(raw as _);
         job.assign(raw_handle)?;
@@ -278,17 +303,17 @@ pub(crate) fn finish_orphan_proofing(
         job.resume_process_threads(pid);
         Ok(Some(job))
     }
-    #[cfg(unix)]
-    {
-        let _ = child;
-        Ok(None)
-    }
 }
 
 /// Unix 侧无 Job Object——孤儿兜底=进程组 + kill_on_drop（见
 /// configure_orphan_proofing）；无句柄需要 transport 持有。
 #[cfg(not(windows))]
-pub(crate) fn finish_orphan_proofing(_child: &tokio::process::Child) -> Result<Option<()>, String> {
+pub(crate) fn finish_orphan_proofing(
+    _child: &tokio::process::Child,
+    _limits: &ResourceLimits,
+) -> Result<Option<()>, String> {
+    // Unix 资源限额缺位（平台差如实声明；setrlimit 需 pre_exec unsafe 面，
+    // 与本仓 unsafe 治理冲突，留平台差文档）——进程组+kill_on_drop 照常
     Ok(None)
 }
 
@@ -302,9 +327,11 @@ pub(crate) fn finish_orphan_proofing(_child: &tokio::process::Child) -> Result<O
 pub(crate) mod job {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectCpuRateControlInformation,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
     };
 
     /// Job 句柄（持有至 transport 销毁；Send+Sync 供 transport 结构体持有）
@@ -371,14 +398,23 @@ pub(crate) mod job {
         }
     }
 
-    /// 创建带 `KILL_ON_JOB_CLOSE` 的 job：job 句柄关闭（含父进程消亡）即
-    /// 收割整棵进程树——非优雅退出的孤儿兜底机制
-    pub(crate) fn create_kill_on_close() -> Result<JobHandle, String> {
+    /// 创建 job：`KILL_ON_JOB_CLOSE` 恒开（孤儿兜底，L1）；可选叠加资源限额
+    /// （L2）——内存上界（超限=进程分配失败自行失败退出）与 CPU 速率硬帽
+    /// （超限=节流不杀）。
+    pub(crate) fn create(
+        max_memory_mb: Option<u64>,
+        cpu_rate_percent: Option<u32>,
+    ) -> Result<JobHandle, String> {
         unsafe {
             let handle = CreateJobObjectW(None, None)
                 .map_err(|e| format!("CreateJobObjectW failed: {e}"))?;
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if let Some(mb) = max_memory_mb {
+                info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                info.ProcessMemoryLimit =
+                    mb.saturating_mul(1024 * 1024).min(u32::MAX as u64) as usize;
+            }
             SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
@@ -386,6 +422,23 @@ pub(crate) mod job {
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
             .map_err(|e| format!("SetInformationJobObject failed: {e}"))?;
+            if let Some(percent) = cpu_rate_percent {
+                let rate = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+                    ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
+                        | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+                    Anonymous: windows::Win32::System::JobObjects::
+                        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0 {
+                            CpuRate: percent.clamp(1, 100) * 100,
+                        },
+                };
+                SetInformationJobObject(
+                    handle,
+                    JobObjectCpuRateControlInformation,
+                    &rate as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+                )
+                .map_err(|e| format!("SetInformationJobObject (cpu rate) failed: {e}"))?;
+            }
             Ok(JobHandle(handle))
         }
     }

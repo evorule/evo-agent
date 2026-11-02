@@ -598,6 +598,15 @@ pub struct McpServerConfig {
     /// 注：精确超时分类在各调用外层，此处以连续失败为挂死信号，如实近似）
     #[serde(default)]
     pub hang_threshold: Option<u32>,
+    /// 资源限额（资源边界设计 L2，Windows Job Object 精确承载）：Job 内存上界
+    /// MB——超限=server 分配失败自行退出，由既有失败路径接管；缺省关=现行为
+    /// （限额数值强依赖 server 形态，显式声明是唯一扩面通道）
+    #[serde(default)]
+    pub max_memory_mb: Option<u64>,
+    /// 资源限额：CPU 速率硬帽百分比 1..=100（超限=节流不杀；Unix 侧缺位，
+    /// 平台差如实声明）；缺省关=现行为
+    #[serde(default)]
+    pub cpu_rate_percent: Option<u32>,
     /// 生命周期策略：触限收割后自动退避重启（1s/2s/4s…封顶 60s；缺省 false=
     /// 收割后落 failed 态等待运维处置。重启重走装载门——许可重新核验）
     #[serde(default)]
