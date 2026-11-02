@@ -11,7 +11,13 @@
 
 param(
     [ValidateSet("all", "build", "test-compile", "test-run", "scan", "contract")]
-    [string]$Phase = "all"
+    [string]$Phase = "all",
+    # Extra args forwarded verbatim to `cargo test` in the test-run phase
+    # (e.g. --lib / --test <name>). CI splits the linux test-run into one
+    # step per test binary: when a runner death blanks a step, the blank
+    # step itself names the culprit binary (2026-10-31/11-02 freeze wave:
+    # whole-log blobs lost with the runner, nothing attributable).
+    [string[]]$CargoArgs = @()
 )
 
 $ErrorActionPreference = "Continue"
@@ -61,8 +67,9 @@ if (Test-Phase 'test-run') {
     # stream is still kept in memory for the failure-detail tail below
     # (buffered-only output was the blind spot that hid the hang).
     $testLog = New-Object System.Collections.Generic.List[string]
+    $cargoArgsCmd = ($CargoArgs -join ' ')
     if ($isWin) {
-        cargo test 2>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $testLog.Add($l) }
+        cargo test @CargoArgs 2>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $testLog.Add($l) }
     } else {
         # Resource watchdog (2026-10-22, permanent sentinel): a background
         # loop streams a snapshot every 15s (loadavg / mem / disk / top-mem
@@ -75,7 +82,7 @@ if (Test-Phase 'test-run') {
         # the watchdog's last streamed snapshots bracket it with the
         # resource curve and the culprit's process tree, even if the runner
         # itself dies and the final log upload is lost.
-        bash -c '
+        $inner = '
             ( while true; do
                   echo "=== WD $(date -u +%H:%M:%S) load=$(cat /proc/loadavg) ==="
                   free -m | sed -n 2p
@@ -84,11 +91,12 @@ if (Test-Phase 'test-run') {
                   echo "=== procs evo_agent=$(pgrep -c -f evo_agent) npm_or_node=$(pgrep -c -f "npm|node") sh=$(pgrep -c -x sh) total=$(ps -e --no-headers | wc -l)"
                   sleep 15
               done ) & WD=$!
-            timeout --kill-after=30 2100 cargo test 2>&1
+            timeout --kill-after=30 2100 cargo test __CARGO_ARGS__ 2>&1
             RC=$?
             kill $WD 2>/dev/null
             exit $RC
-        ' 2>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $testLog.Add($l) }
+        '.Replace('__CARGO_ARGS__', $cargoArgsCmd)
+        bash -c $inner 2>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $testLog.Add($l) }
         if ($LASTEXITCODE -eq 124) { Write-Host "TIMEOUT: cargo test after 35 min" }
     }
     $testLog | Select-String -Pattern "^test result"
