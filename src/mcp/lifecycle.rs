@@ -259,9 +259,10 @@ pub(crate) fn configure_orphan_proofing(cmd: &mut tokio::process::Command) {
 /// spawn 后的孤儿兜底收尾：assign job（Windows）/无操作（Unix）。
 /// 返回值在 Windows 侧为必须**持有至 transport 销毁**的 job 句柄
 /// （句柄关闭 = `KILL_ON_JOB_CLOSE` 收割整棵进程树）。
+#[cfg(windows)]
 pub(crate) fn finish_orphan_proofing(
     child: &tokio::process::Child,
-) -> Result<Option<super::lifecycle::job::JobHandle>, String> {
+) -> Result<Option<job::JobHandle>, String> {
     #[cfg(windows)]
     {
         let raw = child
@@ -282,6 +283,13 @@ pub(crate) fn finish_orphan_proofing(
         let _ = child;
         Ok(None)
     }
+}
+
+/// Unix 侧无 Job Object——孤儿兜底=进程组 + kill_on_drop（见
+/// configure_orphan_proofing）；无句柄需要 transport 持有。
+#[cfg(not(windows))]
+pub(crate) fn finish_orphan_proofing(_child: &tokio::process::Child) -> Result<Option<()>, String> {
+    Ok(None)
 }
 
 /// Windows Job Object 封装（孤儿兜底的 OS 层机制）
