@@ -62,6 +62,9 @@ pub struct Supervisor {
     pub serve_token: String,
     pub engine_token: String,
     pub executor_token: String,
+    /// service 身份令牌（sediment 受信通道写受保护域用；仅 env 注入
+    /// server+serve，与执行体令牌同款纪律）
+    pub service_token: String,
     pub version: String,
     pub job: Arc<JobHandle>,
     pub window: WebviewWindow,
@@ -76,7 +79,7 @@ pub enum Decision {
 }
 
 impl Supervisor {
-    #[allow(clippy::too_many_arguments)] // 九项输入均为编排必需，结构体化反增噪音
+    #[allow(clippy::too_many_arguments)] // 十项输入均为编排必需，结构体化反增噪音
     pub fn new(
         paths: ResolvedPaths,
         console: Console,
@@ -84,6 +87,7 @@ impl Supervisor {
         serve_token: String,
         engine_token: String,
         executor_token: String,
+        service_token: String,
         version: String,
         window: WebviewWindow,
         nav_port: Arc<RwLock<Option<u16>>>,
@@ -105,6 +109,7 @@ impl Supervisor {
             serve_token,
             engine_token,
             executor_token,
+            service_token,
             version,
             job,
             window,
@@ -129,6 +134,7 @@ impl Supervisor {
             serve_token: &self.serve_token,
             engine_token: &self.engine_token,
             executor_token: &self.executor_token,
+            service_token: &self.service_token,
             version: &self.version,
             job: &self.job,
             self_assigned: self.self_assigned,

@@ -64,6 +64,10 @@ pub struct LaunchContext<'a> {
     /// 执行体调用方令牌（每次壳启动随机生成；仅 env 注入双方进程，
     /// 不落盘/不进命令行/不进日志——与 engine token 同款纪律）
     pub executor_token: &'a str,
+    /// service 身份令牌（每次壳启动随机生成；仅 env 注入 server+serve
+    /// 双侧，不落盘/不进命令行/不进日志——sediment 受信通道写受保护域用；
+    /// serve 侧捕获后即从自身 env 面清除，工作区子进程不可见）
+    pub service_token: &'a str,
     pub version: &'a str,
     pub job: &'a Arc<JobHandle>,
     /// 自收编是否成功（决定子进程要不要逐个收编）
@@ -270,6 +274,9 @@ fn spawn_engine(
     // 命令行参数对本机所有进程可读,令牌上账面即暴露。
     engine_cmd
         .env("EVORULE_AUTH_TOKEN", ctx.engine_token)
+        // service 身份令牌：server 侧登记为受信服务管道 token（受保护域
+        // stable.llm/stable.system 可写）；同为 env 注入不走命令行
+        .env("EVORULE_SERVICE_TOKEN", ctx.service_token)
         .args([
             "--profile",
             "development",
@@ -667,12 +674,21 @@ fn spawn_serve(
         .arg(&paths.runtime_dir)
         .args(["--agent-root"])
         .arg(&agent_root)
+        // 读写同根：读面四工具（file_read/file_list/grep_files/glob_files）
+        // 绑 agent_root——file_write 产物可读回；runtime 编排面（toml/logs）
+        // 退出读沙箱（安全增益）。写面仍限 workdir，读宽写窄语义不变。
+        .args(["--read-root"])
+        .arg(&agent_root)
         .env(
             "EVO_AGENT_EVORULE__BASE_URL",
             format!("http://127.0.0.1:{engine_port}"),
         )
         .env("EVO_AGENT_EVORULE__API_KEY", ctx.engine_token)
         .env("EVORULE_AUTH_TOKEN", ctx.engine_token)
+        // service 身份令牌：serve 的受信内部通道（sediment→stable.llm 等）
+        // 以此写 evorule；serve 启动期捕获进 ApiCore 后即从 env 面清除，
+        // python_exec/shell_exec 等工作区子进程不可见
+        .env("EVORULE_SERVICE_TOKEN", ctx.service_token)
         .stdout(Stdio::from(serve_log))
         .stderr(Stdio::from(serve_log_err))
         .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);

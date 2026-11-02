@@ -17,6 +17,32 @@ use serde_json::{json, Value};
 /// 审批卡代码摘要上限(bytes,防巨型 code 撑爆审批卡)
 const PROPOSAL_SUMMARY_BYTES: usize = 200;
 
+/// 既有硬编码解释器路径(存在性探测保留:本机缺省行为零变化)
+const LEGACY_PYTHON_PATH: &str = r"D:\Python312\python.exe";
+
+/// python 解释器路径解析:
+/// `EVO_AGENT_PYTHON` env > 既有硬编码路径(存在性探测) > PATH `python`
+///
+/// 本机缺省行为零变化(既有安装路径存在时仍优先使用);其他机器从
+/// spawn 必炸变为可用(回落 PATH 查找)。env 覆盖为显式声明通道。
+fn python_exe() -> String {
+    python_exe_with(std::env::var("EVO_AGENT_PYTHON").ok().as_deref())
+}
+
+/// `python_exe` 的可测变体:env 值由参数注入(避免测试改进程 env)
+fn python_exe_with(env_override: Option<&str>) -> String {
+    if let Some(p) = env_override {
+        let p = p.trim();
+        if !p.is_empty() {
+            return p.to_string();
+        }
+    }
+    if std::path::Path::new(LEGACY_PYTHON_PATH).exists() {
+        return LEGACY_PYTHON_PATH.to_string();
+    }
+    "python".to_string()
+}
+
 /// 一次性执行一段 Python 代码(candidate 全审批)
 ///
 /// G1 执行环境 profile:[`ExecutionProfile::Workbench`](缺省)维持 candidate
@@ -62,7 +88,7 @@ impl ToolFunction for PythonExecTool {
         if code.len() > 64 * 1024 {
             return Err("code 超过 64KB 限制".to_string());
         }
-        let out = tokio::process::Command::new(r"D:\Python312\python.exe")
+        let out = tokio::process::Command::new(python_exe())
             .arg("-c")
             .arg(code)
             .output()
@@ -147,5 +173,20 @@ mod tests {
         assert!(PythonExecTool::default()
             .evaluate_proposal(&json!({"code": "1"}))
             .is_some());
+    }
+
+    /// 解释器路径解析次序:env 显式覆盖 > 硬编码存在性探测 > PATH python
+    #[test]
+    fn test_python_exe_resolution_order() {
+        // env 显式覆盖最优先(不去探测文件系统)
+        assert_eq!(
+            python_exe_with(Some("C:\\custom\\py.exe")),
+            "C:\\custom\\py.exe"
+        );
+        // 空白 env 视为未设,回落既有解析链
+        assert_eq!(python_exe_with(Some("   ")), python_exe_with(None));
+        // 无 env:硬编码存在→硬编码;不存在→PATH python(两分支都合法)
+        let fallback = python_exe_with(None);
+        assert!(fallback == LEGACY_PYTHON_PATH || fallback == "python");
     }
 }

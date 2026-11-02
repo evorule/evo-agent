@@ -181,6 +181,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let engine_token = orchestrator::gen_token();
             // 执行体调用方令牌：serve 与 LLM 执行体共享，仅 env 注入双方
             let executor_token = orchestrator::gen_token();
+            // service 身份令牌：serve 受信内部通道（sediment→stable.llm 等
+            // 受保护域）写 evorule 用，仅 env 注入 server+serve 双侧——
+            // 与其余三枚同款纪律（不落盘/不进命令行/不进日志）
+            let service_token = orchestrator::gen_token();
 
             // 窗口尺寸记忆：缺省 1280×800，最小 960×600
             // 无边框窗口(decorations=false):去原生标题栏,工作台 header 即顶栏
@@ -220,6 +224,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 serve_token,
                 engine_token,
                 executor_token,
+                service_token,
                 version,
                 win.clone(),
                 nav_port.clone(),

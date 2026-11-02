@@ -787,6 +787,10 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         // 凭据可视化:LLM 配置只读状态(脱敏,响应体不携带任何密钥内容)
         .route("/admin/llm-status", axum::routing::get(get_llm_status))
         .route("/admin/llm-models", axum::routing::get(get_llm_models))
+        .route(
+            "/admin/memory-health",
+            axum::routing::get(get_memory_health),
+        )
         .route("/admin/llm-model", axum::routing::post(post_llm_model))
         // G1:serve 日志环形缓冲尾部(纯内存,进程重启即清;前端控制台日志 tab 轮询)
         .route("/admin/logs", axum::routing::get(get_admin_logs))
@@ -1226,8 +1230,27 @@ async fn get_version(State(state): State<AgentApiState>) -> Json<RuntimeIdentity
 /// 鉴权内(不进 PUBLIC_PATHS——绝对路径不出无鉴权面,与 /version 同语义)。
 async fn get_workspace_info(State(state): State<AgentApiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "workspace_root": state.agent_workspace_root().display().to_string()
+        "workspace_root": state.agent_workspace_root().display().to_string(),
+        // 读面四工具生效根（--read-root；缺省回落 workdir）——读写根一致性
+        // 的 UI 可见面（读写同根=正常形态；分离=读宽写窄部署形态）
+        "read_root": state
+            .read_root()
+            .unwrap_or_else(|| state.workdir())
+            .display()
+            .to_string(),
     }))
+}
+
+/// 记忆持久化健康端点（403 可观测面）
+///
+/// 路由：`GET /admin/memory-health` → 进程级持久化失败计数快照
+/// （`persist_failures_total` / `persist_forbidden_total` /
+/// `persist_consecutive_failures` / `last_persist_failure`）。
+/// sediment 受信通道写 evorule 失败（403=受保护域身份不足、
+/// unreachable=server 停机）在此可轮询/可告警——修复前该面只有
+/// tracing::warn 单通道，UI 与巡检不可见。零密钥内容。
+async fn get_memory_health() -> Json<serde_json::Value> {
+    Json(crate::agent::memory::persist_health_snapshot())
 }
 
 /// LLM 配置只读状态端点(脱敏)

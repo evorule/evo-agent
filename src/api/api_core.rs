@@ -53,6 +53,16 @@ pub struct ApiCore {
     /// Optional Bearer token for HTTP API auth.
     /// B5-server：`EVORULE_SERVICE_TOKEN` 优先，缺省回退 `EVORULE_AUTH_TOKEN`。
     auth_token: Option<String>,
+    /// Service-identity token（受信内部通道专用，B5-server 消费面）。
+    ///
+    /// 与 `auth_token` 分离的按通道分身：`auth_token` 保持 user 身份（agent
+    /// 工具面同权调用），本字段仅由受信内部通道（sediment / rollup / event
+    /// flush 等）经 [`Self::service_auth_header`] 显式选用——LLM 驱动的普通
+    /// 调用不获得受保护域（`stable.llm` / `stable.system`）写权限。
+    /// 解析仅认 `EVORULE_SERVICE_TOKEN`（显式 config key 不压它，与
+    /// `auth_token` 的优先级链不同）；未设置时 `service_auth_header` 回落
+    /// `auth_token` = 现状语义零变化。
+    service_token: Option<String>,
 }
 
 impl ApiCore {
@@ -89,12 +99,18 @@ impl ApiCore {
             std::env::var("EVORULE_SERVICE_TOKEN").ok(),
             std::env::var("EVORULE_AUTH_TOKEN").ok(),
         );
+        // service 分身独立解析：仅认 EVORULE_SERVICE_TOKEN，显式 config key
+        // 不压它（显式 key 是 user 身份声明，不应吞掉受信通道凭据）
+        let service_token = std::env::var("EVORULE_SERVICE_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
 
         Self {
             base_url: base_url.to_string(),
             client,
             stream_client,
             auth_token,
+            service_token,
         }
     }
 
@@ -123,6 +139,20 @@ impl ApiCore {
         match &self.auth_token {
             Some(token) => req.header("Authorization", format!("Bearer {}", token)),
             None => req,
+        }
+    }
+
+    /// Attach **service-identity** auth header to a request builder.
+    ///
+    /// 受信内部通道（sediment / rollup / event flush）专用：service token
+    /// 在场时以 service 身份发送（server 侧放行受保护域 `stable.llm` /
+    /// `stable.system` 写）；未设置时回落 `auth_header` 同款 user 身份——
+    /// 即未注入 service token 的部署保持现状（403 由 server 拒、调用侧
+    /// best-effort 降级 CacheOnly），行为零变化。
+    pub(crate) fn service_auth_header(&self, req: RequestBuilder) -> RequestBuilder {
+        match &self.service_token {
+            Some(token) => req.header("Authorization", format!("Bearer {}", token)),
+            None => self.auth_header(req),
         }
     }
 

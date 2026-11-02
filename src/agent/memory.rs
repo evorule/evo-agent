@@ -22,6 +22,103 @@ use crate::agent::memory_event::evidence::{BatchVerifyReport, MemoryEvidence};
 use crate::agent::translator::Message;
 use crate::api::evorule_client::EvoruleApiClient;
 
+// ---------------------------------------------------------------------------
+// 持久化失败观测面（进程级，403 可告警）
+// ---------------------------------------------------------------------------
+
+/// 持久化失败分类（403 单列——受信通道身份不足的标志性形态）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistFailureClass {
+    /// server 403 拒绝（受保护域身份不足 / 鉴权失败）
+    Forbidden,
+    /// 传输层不可达（server 停机/网络断）
+    Unreachable,
+    /// 其余（4xx/5xx/解码等）
+    Other,
+}
+
+impl PersistFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            PersistFailureClass::Forbidden => "forbidden_403",
+            PersistFailureClass::Unreachable => "unreachable",
+            PersistFailureClass::Other => "other",
+        }
+    }
+}
+
+/// 最近一次持久化失败（class + unix 秒）
+#[derive(Debug, Clone)]
+pub struct LastPersistFailure {
+    /// 失败类别（`PersistFailureClass::as_str` 产出：forbidden_403 / unreachable / other）
+    pub class: &'static str,
+    /// 失败发生时刻（unix 秒）
+    pub at: u64,
+}
+
+static PERSIST_FAILURES_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERSIST_FORBIDDEN_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERSIST_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static LAST_PERSIST_FAILURE: std::sync::Mutex<Option<LastPersistFailure>> =
+    std::sync::Mutex::new(None);
+
+/// 记一次持久化失败（set_scoped / set_scoped_with_source 的 CacheOnly 路径）
+fn record_persist_failure(class: PersistFailureClass) {
+    use std::sync::atomic::Ordering::Relaxed;
+    PERSIST_FAILURES_TOTAL.fetch_add(1, Relaxed);
+    if class == PersistFailureClass::Forbidden {
+        PERSIST_FORBIDDEN_TOTAL.fetch_add(1, Relaxed);
+    }
+    PERSIST_CONSECUTIVE_FAILURES.fetch_add(1, Relaxed);
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut guard) = LAST_PERSIST_FAILURE.lock() {
+        *guard = Some(LastPersistFailure {
+            class: class.as_str(),
+            at,
+        });
+    }
+}
+
+/// 记一次持久化成功（连续失败计数清零；总数/最近失败保持累计语义）
+fn record_persist_success() {
+    PERSIST_CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 持久化健康快照（`GET /admin/memory-health` 消费面，零密钥内容）
+pub fn persist_health_snapshot() -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let last = LAST_PERSIST_FAILURE
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
+    serde_json::json!({
+        "persist_failures_total": PERSIST_FAILURES_TOTAL.load(Relaxed),
+        "persist_forbidden_total": PERSIST_FORBIDDEN_TOTAL.load(Relaxed),
+        "persist_consecutive_failures": PERSIST_CONSECUTIVE_FAILURES.load(Relaxed),
+        "last_persist_failure": last.map(|f| serde_json::json!({
+            "class": f.class,
+            "at_unix": f.at,
+        })),
+    })
+}
+
+/// ApiError → 失败分类（403 单列；reqwest 传输错=不可达；余=other）
+fn classify_persist_failure(err: &crate::api::api_core::ApiError) -> PersistFailureClass {
+    match err {
+        crate::api::api_core::ApiError::ApiError { status: 403, .. } => {
+            PersistFailureClass::Forbidden
+        }
+        crate::api::api_core::ApiError::HttpError(_) => PersistFailureClass::Unreachable,
+        _ => PersistFailureClass::Other,
+    }
+}
+
+
 /// 内存操作错误
 #[derive(Debug)]
 pub enum MemoryError {
@@ -1415,6 +1512,7 @@ impl MemoryManager {
         if let Err(e) = &fact_id {
             // 不静默：持久化失败意味着该写入在 evorule 侧不可见，
             // cache 与真相源开始漂移，必须留痕（返回值同时携带 CacheOnly）
+            record_persist_failure(classify_persist_failure(e));
             tracing::warn!(
                 session_id = %session_id,
                 path = %path,
@@ -1423,6 +1521,7 @@ impl MemoryManager {
             );
             return Ok(PersistOutcome::CacheOnly);
         }
+        record_persist_success();
 
         Ok(PersistOutcome::Persisted {
             // 挂账一闭环：server 响应携带 fact_id（证据链上游锚点）
@@ -1462,15 +1561,20 @@ impl MemoryManager {
         let cache_key = self.cache_key_for(&scope, key);
         self.cache.insert(cache_key, record.clone());
 
-        // 受信通道返回 PersistOutcome 供调用方区分（与 set() 同契约）
+        // 受信通道返回 PersistOutcome 供调用方区分（与 set() 同契约）。
+        // 鉴权走 service 分身（update_payload_service）：stable.llm 等
+        // 受保护域的 user 身份写入会被 server 403 拒——受信内部通道
+        // （sediment/rollup）持 service token 写入；未配置时回落 user
+        // 身份=现状（CacheOnly 降级可观测，见 persist_health_snapshot）
         let session_id = self.session_id_for_scope(&scope)?;
         let path = self.build_path_scoped(&scope, key);
         let payload_value = serde_json::to_value(&record)?;
         let fact_id = self
             .evorule_client
-            .update_payload(&session_id, &path, &payload_value)
+            .update_payload_service(&session_id, &path, &payload_value)
             .await;
         if let Err(e) = &fact_id {
+            record_persist_failure(classify_persist_failure(e));
             tracing::warn!(
                 session_id = %session_id,
                 path = %path,
@@ -1479,6 +1583,7 @@ impl MemoryManager {
             );
             return Ok(PersistOutcome::CacheOnly);
         }
+        record_persist_success();
         Ok(PersistOutcome::Persisted {
             fact_id: fact_id.unwrap_or(None),
         })

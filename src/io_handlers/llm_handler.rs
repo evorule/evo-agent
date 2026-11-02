@@ -1290,6 +1290,26 @@ impl IoHandler for LlmHandler {
             return Ok(response.clone());
         }
 
+        // 脚本式 mock 短路(与非流式 stream 路径同构:按脚本次序吐结果;
+        // 仅测试装置可达——mock_script 只能经 mock_scripted 构造)
+        if let Some(script) = &self.mock_script {
+            let step = {
+                let mut st = script.lock().unwrap();
+                st.observed_params.push(params.clone());
+                st.steps.pop_front()
+            };
+            return match step {
+                Some(Ok(content)) => Ok(serde_json::json!({
+                    "content": content,
+                    "tool_calls": null,
+                    "finish_reason": "stop",
+                    "token_usage": null,
+                })),
+                Some(Err(e)) => Err(e),
+                None => Err("mock script exhausted".to_string()),
+            };
+        }
+
         let body = self.build_request_body(params)?;
         let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
         debug!(model = model, "ready to invoke LLM API");

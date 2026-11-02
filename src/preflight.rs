@@ -10,7 +10,7 @@
 //!
 //! - [`PreflightScope::Quick`]:启动期快检(①②③④;探活并行,单探 3s 超时,
 //!   总预算 ≤5s),由 Run/Serve/Repl/Schedule/Patrol 五入口统一调用;
-//! - [`PreflightScope::Full`]:doctor 七项全量体检(①-⑦,串行逐项)。
+//! - [`PreflightScope::Full`]:doctor 全量体检(①-⑧,串行逐项)。
 //!
 //! 检查项(编号即契约):
 //! ① config 四层合成+validate(`Config::load` 严格档强制;此处出脱敏摘要)
@@ -23,6 +23,10 @@
 //! ⑥ workdir 可写(Full)
 //! ⑦ 流式端点形态(信息项 Warn 级,永不 Fail;流式不可用时执行体回落
 //!    legacy 整包路径,行为兼容)
+//! ⑧ 受信通道身份姿态(Full;信息项——`EVORULE_SERVICE_TOKEN` 在场性:
+//!    缺席时受信内部通道(sediment→stable.llm)回落 user 身份,server 开
+//!    鉴权则受保护域写入被 403 拒、降级 cache-only。姿态检查零网络动作,
+//!    实际成败计数看运行面 `GET /admin/memory-health`)
 //!
 //! 边界纪律:探活为本模块独立实现,不借用 `io_handlers::LlmHandler`(该文件
 //! 零改动);凭据面只出「存在性」,零密钥内容(与 `LlmStatusSnapshot` 脱敏
@@ -184,11 +188,12 @@ pub async fn run_preflight(cfg: &Config, workdir: &Path, scope: PreflightScope) 
     // ④ LLM 凭据存在性(按 mode 分语义;当前恒 relay 档)
     checks.push(check_llm_credentials(cfg));
 
-    // ⑤⑥⑦ Full 独有
+    // ⑤⑥⑦⑧ Full 独有
     if scope == PreflightScope::Full {
         checks.push(check_default_agent(cfg, workdir));
         checks.push(check_workdir_writable(workdir));
         checks.push(probe_stream_endpoint(cfg).await);
+        checks.push(check_auth_identity(std::env::var("EVORULE_SERVICE_TOKEN").ok()));
     }
 
     PreflightReport { checks }
@@ -404,6 +409,32 @@ async fn probe_stream_endpoint(cfg: &Config) -> PreflightCheck {
 // 小工具
 // ---------------------------------------------------------------------------
 
+/// ⑧ 受信通道身份姿态(Full;信息项,永不 Fail)
+///
+/// `EVORULE_SERVICE_TOKEN` 在场=受信内部通道(sediment→stable.llm 受保护域)
+/// 具备 service 身份;缺席=回落 user 身份,server 开鉴权时受保护域写入被
+/// 403 拒、调用侧 best-effort 降级 cache-only(可观测面=`/admin/memory-health`
+/// 的 persist_forbidden_total)。纯姿态检查:只看凭据在场性,零密钥内容、
+/// 零网络动作——实际持久化成败由运行面计数器承载,本项不重复判。
+fn check_auth_identity(service_env: Option<String>) -> PreflightCheck {
+    const NAME: &str = "trusted-channel-identity";
+    match service_env.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(_) => pass(
+            NAME,
+            "EVORULE_SERVICE_TOKEN set (trusted internal channels hold service \
+             identity for protected-domain writes)"
+                .to_string(),
+        ),
+        None => warn(
+            NAME,
+            "EVORULE_SERVICE_TOKEN unset — trusted internal channels (sediment → \
+             stable.llm) fall back to user identity; a server with auth enabled \
+             will reject protected-domain writes with 403 (cache-only degradation). \
+             Informational for local no-auth dev servers.".to_string(),
+        ),
+    }
+}
+
 /// 执行体端点 → 流式端点 URL(与 llm_handler 执行体→流式推导同形:
 /// 剥 `/llm/execute` 后缀拼 `/llm/execute-stream`;不以该后缀收尾返回 None)。
 /// 独立实现——llm_handler 零改动纪律。
@@ -547,7 +578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_full_seven_checks_order() {
+    async fn test_full_eight_checks_order() {
         let mut cfg = base_cfg();
         cfg.evorule.base_url = dead_url(1, "");
         cfg.llm.executor_url = dead_url(1, "/llm/execute");
@@ -564,11 +595,27 @@ mod tests {
                 "agent-default",
                 "workdir-writable",
                 "llm-stream-endpoint",
+                "trusted-channel-identity",
             ]
         );
         assert!(report.has_fail());
         // ⑥ workdir 可写:临时目录应过
         assert_eq!(report.checks[5].verdict, PreflightVerdict::Pass);
+        // ⑧ 身份姿态:信息项,任一 verdict 都不得 Fail
+        assert_ne!(report.checks[7].verdict, PreflightVerdict::Fail);
+    }
+
+    #[test]
+    fn test_auth_identity_check_shapes() {
+        let set = check_auth_identity(Some("svc-token".to_string()));
+        assert_eq!(set.verdict, PreflightVerdict::Pass);
+        assert!(set.detail.contains("service identity"), "{}", set.detail);
+        let unset = check_auth_identity(None);
+        assert_eq!(unset.verdict, PreflightVerdict::Warn);
+        assert!(unset.detail.contains("403"), "{}", unset.detail);
+        // 空串=缺席语义
+        let blank = check_auth_identity(Some("   ".to_string()));
+        assert_eq!(blank.verdict, PreflightVerdict::Warn);
     }
 
     #[tokio::test]
