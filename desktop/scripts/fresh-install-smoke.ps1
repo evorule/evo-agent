@@ -37,8 +37,9 @@ try {
     # ---- 2. key files in place ---------------------------------------------
     $keyFiles = @(
         "evo-agent-desktop.exe",
-        "resources\evorule-server\evorule-server.exe",
-        "resources\evorule-server\plugins\ai-plugin\evorule-ai-plugin.exe",
+        "resources\bin\evo-agent.exe",
+        "resources\bin\evorule-server.exe",
+        "resources\bin\evorule-ai-plugin.exe",
         "resources\evorule-server\plugins\ai-plugin\plugin.json",
         "resources\evorule-server\plugins\wasm-host\evorule-wasm-host.exe",
         "resources\evorule-server\plugins\wasm-host\plugin.json",
