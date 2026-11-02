@@ -81,6 +81,7 @@ pub mod client;
 pub mod gov_pack;
 pub mod gov_proposal;
 pub mod gov_source;
+pub mod inspect;
 pub mod lifecycle;
 pub mod manager;
 pub mod server;
@@ -90,6 +91,10 @@ pub mod tool_adapter;
 pub mod transport;
 
 pub use client::{McpClient, McpToolSpec};
+pub use inspect::{
+    inspect, load_extension_rules, propose_with_report, report_with_hash, verify_report_hash,
+    CompiledRule, InspectTarget, InspectionOutput, IocHit, LlmAdvisory, ScanReport,
+};
 pub use manager::{McpManager, McpServerEntry, McpServerStatus};
 pub use store::McpConfigStore;
 pub use tool_adapter::{mcp_tool_name, register_client_tools, register_mcp_tools, McpToolAdapter};

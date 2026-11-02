@@ -50,6 +50,7 @@
 //! evo-agent tools list
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -359,6 +360,51 @@ enum Command {
         #[arg(long, short = 'a')]
         agent: Option<String>,
     },
+
+    /// Inspect an MCP server's declared tool surface (controlled spawn:
+    /// initialize + tools/list, then immediate harvest - nothing registered,
+    /// nothing callable). Runs the deterministic IOC scanner over the observed
+    /// tools and prints the signed scan report as JSON on stdout (logs go to
+    /// stderr). Explicit invocation IS the consent expression: this path does
+    /// not consult the spawn allowlist gate, but the load gate's
+    /// minimal-environment discipline applies. The report never changes
+    /// permission semantics - findings go to the report (and optionally, with
+    /// --propose, to the governance proposal) for the human approver.
+    McpInspect {
+        /// Server name in the workdir MCP config (.evo/mcp.toml, falling back
+        /// to the evo-agent.toml [mcp] section). Mutually exclusive with
+        /// --command. Only stdio servers are inspectable.
+        #[arg(long, conflicts_with = "command")]
+        server: Option<String>,
+
+        /// Command to spawn (e.g. npx). Mutually exclusive with --server.
+        #[arg(long)]
+        command: Option<String>,
+
+        /// Argument segment (repeat the flag: --arg -y --arg @scope/server)
+        #[arg(long = "arg")]
+        args: Vec<String>,
+
+        /// Ops extension IOC rules file (JSON array of
+        /// {id,category,severity,pattern}); file digest is pinned into the
+        /// report provenance
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        rules: Option<PathBuf>,
+
+        /// Overall inspection timeout in seconds (spawn + handshake + listing)
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+
+        /// Attach the scan report to a governance proposal (requires
+        /// EVORULE_MCP_GOV_URL + EVORULE_MCP_GOV_PROPOSE_KEY; proposal rules
+        /// are the same as the automatic spawn gate path)
+        #[arg(long)]
+        propose: bool,
+
+        /// Also write the scan report JSON to this file
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -570,6 +616,26 @@ fn main() -> ExitCode {
             verify,
             agent.as_deref(),
         ),
+        Command::McpInspect {
+            server,
+            command,
+            args,
+            rules,
+            timeout,
+            propose,
+            out,
+        } => run_with_big_stack(move || {
+            cmd_mcp_inspect(
+                &cli.workdir,
+                server.as_deref(),
+                command.as_deref(),
+                &args,
+                rules.as_deref(),
+                timeout,
+                propose,
+                out.as_deref(),
+            )
+        }),
     }
 }
 
@@ -723,6 +789,159 @@ fn startup_preflight(
 }
 
 /// doctor 子命令:Full 八项全量体检,只报告不代修;任一 FAIL → 退出码 1。
+/// mcp-inspect 子命令:检视式 spawn(受控拉起 -> initialize + tools/list ->
+/// 立即收割,不注册不提供调用)+ 确定性 IOC 扫描,输出带完整性哈希的扫描
+/// 报告(JSON,stdout;日志走 stderr)。显式执行即意愿表达,不走拉起批准
+/// 清单装载门;最小环境纪律复用 StdioTransport spawn 核心。报告只进报告
+/// 与提案,不改变任何许可语义(机器提议,人工批准)。
+fn cmd_mcp_inspect(
+    workdir: &Path,
+    server: Option<&str>,
+    command: Option<&str>,
+    args: &[String],
+    rules_path: Option<&Path>,
+    timeout_secs: u64,
+    propose: bool,
+    out_path: Option<&Path>,
+) -> ExitCode {
+    // Target resolution: exactly one of --server / --command (clap guards
+    // conflicts; both absent is a usage error).
+    let target = match (server, command) {
+        (Some(name), None) => {
+            let cfgs = evo_agent::mcp::McpConfigStore::new(
+                workdir,
+                evo_agent::config::McpConfig::default(),
+            )
+            .load();
+            match cfgs.servers.iter().find(|s| s.name == name) {
+                Some(cfg)
+                    if cfg.transport.is_none() || cfg.transport.as_deref() == Some("stdio") =>
+                {
+                    if cfg.disabled {
+                        eprintln!("error: server `{name}` is disabled in the MCP config");
+                        return ExitCode::from(2);
+                    }
+                    evo_agent::mcp::InspectTarget {
+                        server_name: cfg.name.clone(),
+                        command: cfg.command.clone(),
+                        args: cfg.args.clone(),
+                        env: cfg.env.clone(),
+                    }
+                }
+                Some(_) => {
+                    eprintln!(
+                        "error: server `{name}` uses a remote transport; only stdio servers are inspectable"
+                    );
+                    return ExitCode::from(2);
+                }
+                None => {
+                    eprintln!(
+                        "error: server `{name}` not found in the MCP config ({} server(s) configured)",
+                        cfgs.servers.len()
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        (None, Some(cmd)) => evo_agent::mcp::InspectTarget {
+            server_name: cmd.to_string(),
+            command: cmd.to_string(),
+            args: args.to_vec(),
+            env: HashMap::new(),
+        },
+        _ => {
+            eprintln!("error: exactly one of --server <name> or --command <cmd> is required");
+            return ExitCode::from(2);
+        }
+    };
+    // Ops extension rules (optional): compiled rules + file digest pinned
+    // into the report provenance.
+    let extra_rules = rules_path.map(|p| {
+        evo_agent::mcp::load_extension_rules(p).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        })
+    });
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let inspection = runtime.block_on(async {
+        let span = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            evo_agent::mcp::inspect(&target, extra_rules),
+        )
+        .await;
+        match span {
+            Ok(inner) => inner,
+            Err(_) => Err(format!(
+                "inspection timed out after {timeout_secs}s (target harvested)"
+            )),
+        }
+    });
+    // Reader tasks are per-transport; the harvest above closed the transport
+    // before this point. Give the runtime a moment to retire the stdout
+    // reader loop (EOF race) before shutdown.
+    runtime.block_on(async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    });
+    let output = match inspection {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("error: inspection failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // Machine-readable report on stdout; human summary on stderr.
+    let pretty =
+        serde_json::to_string_pretty(&output.report_value).unwrap_or_else(|_| "{}".to_string());
+    println!("{pretty}");
+    let hits = output
+        .report_value
+        .get("ioc_hits")
+        .and_then(|v| v.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+    eprintln!(
+        "[mcp-inspect] server=`{}` tools_listed={} ioc_hits={}",
+        target.server_name,
+        output.tools.len(),
+        hits
+    );
+    if let Some(path) = out_path {
+        if let Err(e) = std::fs::write(path, &pretty) {
+            eprintln!("error: write report file {}: {e}", path.display());
+            return ExitCode::from(1);
+        }
+        eprintln!("[mcp-inspect] report written to {}", path.display());
+    }
+    if propose {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        let result = runtime
+            .block_on(evo_agent::mcp::propose_with_report(
+                &target,
+                output.report_value.clone(),
+                None,
+            ))
+            .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default());
+        let _ = runtime; // keep the runtime alive until the proposal completes
+        match result {
+            Ok(body) => {
+                eprintln!("[mcp-inspect] proposal outcome:\n{body}");
+            }
+            Err(e) => {
+                eprintln!("error: proposal failed: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// doctor 子命令:Full 七项全量体检,只报告不代修;任一 FAIL → 退出码 1。
 /// 人读渲染恒走 stderr;`--json` 时机器可读报告走 stdout(对齐 Run 子命令
 /// stdout 纯 JSON 惯例)。不受 `--no-preflight` 影响(doctor 本体即体检)。
 fn cmd_doctor(workdir: &Path, json: bool) -> ExitCode {
