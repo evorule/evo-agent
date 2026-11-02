@@ -2,7 +2,7 @@
 //
 // - 端点来源：shell.toml [update].endpoints 非空时完全覆盖，空时用
 //   tauri.conf.json plugins.updater.endpoints（=GitHub Releases 稳定
-//   latest 资产 URL，随最新发布自动追踪；Gitee 为人工下载主渠道，更新器
+//   latest 资产 URL，随最新发布自动追踪；GitHub 为唯一发布渠道，更新器
 //   不可达时 fail-soft 落手动下载）
 // - 全流程 fail-soft：任何失败只记 shell.log，壳主功能不受影响；
 //   手动检查场景另加原生报错对话框

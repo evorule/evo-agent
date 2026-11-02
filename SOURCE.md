@@ -14,7 +14,7 @@
 |---|---|
 | 版本 | v0.4.0 |
 | 发布 tag | `v0.4.0`（随下个发布打 tag；打包时以本次发布对应的值覆盖） |
-| 源码归档（Gitee，main 分支） | <https://gitee.com/evorule/evo-agent/repository/archive/main.zip> |
+| 源码归档（GitHub，main 分支） | <https://github.com/evorule/evo-agent/archive/refs/heads/main.zip> |
 | 源码归档（GitHub 镜像，main 分支） | <https://github.com/evorule/evo-agent/archive/refs/heads/main.tar.gz> |
 | 源码 tarball SHA256 | 见发布 Release 说明的 `sha256-checks.txt` |
 
@@ -22,7 +22,7 @@
 
 ## 获取与校验方式
 
-1. **本仓**：<https://gitee.com/evorule/evo-agent>（权威源；GitHub 为镜像）
+1. **本仓**：<https://github.com/evorule/evo-agent>（权威源）
 2. **按 tag 取归档**：上表任一归档链接，或 `git clone` 后 `git checkout <tag>`
 3. **完整性校验**：下载归档后计算 SHA256，与发布 Release 说明中 `sha256-checks.txt` 记录值比对，一致即证明与发布产物同源
 

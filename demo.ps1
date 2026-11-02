@@ -28,7 +28,7 @@ param(
     # for China-mainland keys.
     [string]$ApiBase = "",
     # evorule-server release to fetch (pinned for reproducibility).
-    # "latest" resolves the newest Gitee release at runtime.
+    # "latest" resolves the newest GitHub release at runtime.
     [string]$ServerVersion = "v0.10.0",
     # Port for the demo evorule-server instance (default matches the
     # deployment default; override when the default is occupied).
@@ -76,22 +76,22 @@ if ($serverUp) {
     if (-not (Test-Path (Join-Path $serverDir "evorule-server.exe"))) {
         $resolvedVersion = $ServerVersion
         if ($resolvedVersion -eq "latest") {
-            Write-Host "resolving latest evorule-server release from Gitee..."
-            $rel = Invoke-RestMethod -Uri "https://gitee.com/api/v5/repos/evorule/evorule-server/releases/latest" -UseBasicParsing
+            Write-Host "resolving latest evorule-server release from GitHub..."
+            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/evorule/evorule-server/releases/latest" -UseBasicParsing
             if (-not $rel.tag_name) {
-                Write-Host "FAIL: could not resolve latest release from Gitee API"
+                Write-Host "FAIL: could not resolve latest release from GitHub API"
                 exit 1
             }
             $resolvedVersion = $rel.tag_name
             Write-Host "  latest = $resolvedVersion"
         }
-        Write-Host "downloading evorule-server $resolvedVersion from Gitee..."
+        Write-Host "downloading evorule-server $resolvedVersion from GitHub..."
         New-Item -ItemType Directory -Force -Path $demoDir | Out-Null
-        # Gitee Release asset names carry the version without the "v" prefix
+        # GitHub Release asset names carry the version without the "v" prefix
         # (tag v0.10.0 -> asset evorule-server-0.10.0-win64.zip)
         $ver = $resolvedVersion.TrimStart("v")
         $zip = Join-Path $demoDir "evorule-server-$ver-win64.zip"
-        $dl = "https://gitee.com/evorule/evorule-server/releases/download/$resolvedVersion/evorule-server-$ver-win64.zip"
+        $dl = "https://github.com/evorule/evorule-server/releases/download/$resolvedVersion/evorule-server-$ver-win64.zip"
         Invoke-WebRequest -Uri $dl -OutFile $zip -UseBasicParsing
         Expand-Archive -Path $zip -DestinationPath $serverDir -Force
         Remove-Item $zip

@@ -63,7 +63,6 @@ pub const ACTIVE_HOSTS: &[&str] = &[
     "api.github.com",
     "objects.githubusercontent.com",
     "gitlab.com",
-    "gitee.com",
     "npmjs.com",
     "registry.npmjs.org",
     "pypi.org",

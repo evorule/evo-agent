@@ -70,7 +70,7 @@
 
 ## 🐛 报告 Bug
 
-使用 [Gitee Issues](https://gitee.com/evorulelab/evorule/issues)。
+使用 [GitHub Issues](https://github.com/evorule/evorule/issues)。
 
 **报告模板**:
 ```markdown
@@ -97,7 +97,7 @@
 
 ## 💡 功能建议
 
-也用 [Gitee Issues](https://gitee.com/evorulelab/evorule/issues),标签 `enhancement`。
+也用 [GitHub Issues](https://github.com/evorule/evorule/issues),标签 `enhancement`。
 
 **建议模板**:
 ```markdown
@@ -113,7 +113,7 @@
 
 ### 流程
 
-1. **Fork 仓库** → 在你的 Gitee 账号下创建 fork
+1. **Fork 仓库** → 在你的 GitHub 账号下创建 fork
 2. **创建分支**:`git checkout -b feature/your-feature-name`
 3. **写代码 + 写测试** — 测试覆盖率不掉
 4. **本地验证**:
@@ -123,7 +123,7 @@
    cargo clippy --workspace -- -D warnings   # 0 warnings 才能合
    ```
 5. **推送**:`git push origin feature/your-feature-name`
-6. **创建 PR** 到 Gitee,填写 PR 模板
+6. **创建 PR** 到 GitHub,填写 PR 模板
 7. **CLA 签署**(见下)
 8. **等 review** — 维护者会在 7 天内回复
 
@@ -242,9 +242,9 @@ cargo kani -p evorule-tcb --features kani   # 在 evorule 仓执行
 
 ## 📞 联系方式
 
-- **Gitee**: https://gitee.com/evorulelab/evorule/issues
+- **GitHub**: https://github.com/evorule/evorule/issues
 - **邮箱**: evorulelab@gmail.com
-- **组织**: [EvoRule Lab](https://gitee.com/evorulelab)
+- **组织**: [EvoRule Lab](https://github.com/evorule)
 
 ---
 

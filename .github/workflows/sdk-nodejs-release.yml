@@ -3,8 +3,8 @@
 #
 # npm 发布 workflow — sdk/nodejs (evo-agent-node)
 #
-# 触发: 推送 evo-agent-node-v* tag (tag 须已同步到 github 侧; gitee 为主仓,
-#   github 承担发布执行, 与 evorule / evorule-server 仓 release 链同构)
+# Trigger: push evo-agent-node-v* tag (GitHub is the sole primary repo; same
+#   release chain as the evorule / evorule-server repos)
 # 产物: npm registry 上的 evo-agent-node 包 (cargo publish 同款纪律: 发版必须
 #   同步 npm)。包为零依赖纯 JS client, npm 自动随附仓内 LICENSE (AGPL-3.0-or-later)。
 #
