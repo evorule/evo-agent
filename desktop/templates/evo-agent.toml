@@ -165,6 +165,11 @@ service_tools = [
   "udf_finance_tax_calc",
   "udf_finance_tax_calc_as",
   "udf_text_normalize",
+  "verification_fsm_deadlock",
+  "verification_fsm_equivalence",
+  "verification_fsm_language_inclusion",
+  "verification_fsm_reachability",
+  "verification_sat_solve",
 ]
 
 # 工作台附加配置:serve 启动期自动拉起 console 审计页(审计深链数据源)
