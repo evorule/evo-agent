@@ -613,7 +613,8 @@ impl ContextSummarizer {
     /// # 返回值
     ///
     /// - `Ok(out)`:摘要 + 稳定事实（stable_facts 可能为空）
-    /// - `Err(e)`:LLM 调用或 JSON 解析失败，调用方应 best-effort 跳过
+    /// - `Err(e)`:LLM 调用或 JSON 解析失败（解析失败先经截断修复、
+    ///   再单次重试双兜底，仍败才 Err），调用方应 best-effort 跳过
     ///
     /// # 参数
     ///
@@ -657,26 +658,76 @@ impl ContextSummarizer {
             "messages".to_string(),
             serde_json::Value::Array(messages_vec),
         );
-        let params_json = serde_json::Value::Object(params_map);
-        let params = params_json.clone();
+        let params = serde_json::Value::Object(params_map);
 
-        // 调用 LLM（经审计链或直连，见 call_llm 分流说明）
-        let result = self.call_llm("session_summary", &params).await?;
+        // 解析失败双兜底:截断修复(零成本确定性)→ 单次 LLM 重试。
+        // 失败形态实测为 max_tokens 半途 EOF 与偶发格式噪音——截断修复
+        // 先兜(免二次调用),仍败再重试一次全新调用;传输失败不在
+        // 重试面(保持既有行为,如实 Err 由调用方 best-effort 跳过)。
+        let mut last_err = String::new();
+        for attempt in 0..2 {
+            // 调用 LLM(经审计链或直连,见 call_llm 分流说明)
+            let result = self.call_llm("session_summary", &params).await?;
 
-        // 解析响应为 LlmResponse
-        let response: LlmResponse = serde_json::from_str(&result.to_string())
-            .map_err(|e| format!("parse session summary LLM response: {}", e))?;
+            // 解析响应为 LlmResponse
+            let response: LlmResponse = match serde_json::from_str(&result.to_string()) {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = format!("parse session summary LLM response: {}", e);
+                    if attempt == 0 {
+                        tracing::warn!(
+                            error = %err,
+                            "summarize_session: wrapper parse failed, retrying once"
+                        );
+                        last_err = err;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
 
-        // 从可能包含 markdown 代码块的文本中提取 JSON
-        let json_str = extract_json_from_text(&response.content);
-        let out: SessionSummaryOut = serde_json::from_str(&json_str).map_err(|e| {
-            format!(
-                "parse session summary JSON: {} (raw: {})",
-                e, response.content
-            )
-        })?;
-
-        Ok(out)
+            // 从可能包含 markdown 代码块的文本中提取 JSON;
+            // 截断修复兜底:半途 EOF 的 JSON 先修复再解析
+            let json_str = extract_json_from_text(&response.content);
+            let mut repaired = false;
+            let parsed =
+                serde_json::from_str::<SessionSummaryOut>(&json_str).or_else(|first| {
+                    for cand in repair_truncated_json(&json_str) {
+                        if let Ok(out) = serde_json::from_str::<SessionSummaryOut>(&cand) {
+                            repaired = true;
+                            return Ok(out);
+                        }
+                    }
+                    Err(first)
+                });
+            match parsed {
+                Ok(out) => {
+                    if repaired {
+                        tracing::warn!(
+                            "summarize_session: truncated summary JSON repaired \
+                             (partial content kept)"
+                        );
+                    }
+                    return Ok(out);
+                }
+                Err(e) => {
+                    let err = format!(
+                        "parse session summary JSON: {} (raw: {})",
+                        e, response.content
+                    );
+                    if attempt == 0 {
+                        tracing::warn!(
+                            error = %err,
+                            "summarize_session: content parse failed, retrying once"
+                        );
+                        last_err = err;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Err(last_err)
     }
 
     /// C4 第三级:把多条旧摘要合并为一条 rollup 摘要
@@ -786,6 +837,79 @@ fn extract_json_from_text(text: &str) -> String {
     }
 
     trimmed.to_string()
+}
+
+/// 截断修复:对半途 EOF 的 JSON 文本做字符串感知的括号闭合 + 尾元素修剪
+///
+/// 产出零到多个候选修复文本,由调用方逐个尝试解析(全部经真实 parse 验证,
+/// 不保证语义完整——截断丢失的内容不可恢复,只保住已完整的部分)。
+/// 候选生成策略:
+/// 1. 值字符串半途截断 → 补闭合引号后逐层闭合括号
+/// 2. 尾元素残缺(键/值/嵌套结构写到一半)→ 回退到最后一个安全点
+///    (最后一个闭合括号之后 / 最后一个逗号之前),剪掉残缺尾元素后闭合
+/// 3. 兜底:非字符串态直接逐层闭合(数值截断等场景)
+///
+/// 失败形态锚:max_tokens 半途 EOF(实测 col 1523/1905/2221 形态),
+/// 修复目标是保住已完整的前缀内容,与单次 LLM 重试构成双兜底。
+fn repair_truncated_json(text: &str) -> Vec<String> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+    // 最后一个安全截断点:(字节位置, 此刻的括号栈快照)
+    let mut safe: Option<(usize, Vec<char>)> = None;
+
+    for (i, ch) in text.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => stack.push(ch),
+            '}' | ']' => {
+                stack.pop();
+                safe = Some((i + ch.len_utf8(), stack.clone()));
+            }
+            ',' => safe = Some((i, stack.clone())),
+            _ => {}
+        }
+    }
+
+    let close = |s: &mut String, snap: &[char]| {
+        for c in snap.iter().rev() {
+            s.push(if *c == '{' { '}' } else { ']' });
+        }
+    };
+
+    let mut candidates: Vec<String> = Vec::new();
+    // 候选一:字符串感知闭合(值字符串半途 EOF)
+    if in_string {
+        let mut s = text.to_string();
+        s.push('"');
+        close(&mut s, &stack);
+        candidates.push(s);
+    }
+    // 候选二:尾元素修剪(回退到最后安全点)
+    if let Some((cut, snap)) = &safe {
+        let mut s = text[..*cut].to_string();
+        close(&mut s, snap);
+        candidates.push(s);
+    }
+    // 候选三:兜底直接闭合(非字符串态;含数值截断场景)
+    if !stack.is_empty() && !in_string {
+        let mut s = text.to_string();
+        close(&mut s, &stack);
+        candidates.push(s);
+    }
+    candidates
 }
 
 #[cfg(test)]
@@ -1197,6 +1321,74 @@ mod tests {
         let s = ContextSummarizer::new(llm, None);
         let result = s.summarize_session("User: hi").await.unwrap();
         assert_eq!(result.stable_facts[0].confidence, 0.0);
+    }
+
+    // ========== 截断修复 + 单次重试双兜底测试 ==========
+
+    #[test]
+    fn repair_truncated_json_mid_string_value() {
+        // 值字符串半途 EOF:补引号+闭合括号后可解析,保住已完整键值
+        let cands = repair_truncated_json(r#"{"summary":"部分摘"#);
+        let ok = cands
+            .iter()
+            .find_map(|c| serde_json::from_str::<SessionSummaryOut>(c).ok());
+        assert!(ok.is_some(), "candidates: {cands:?}");
+        assert_eq!(ok.unwrap().summary, "部分摘");
+    }
+
+    #[test]
+    fn repair_truncated_json_prunes_partial_fact() {
+        // stable_facts 数组内元素写到一半:修剪残缺元素保住完整前缀
+        let text = r#"{"summary":"s","stable_facts":[{"key":"a","value":"完整","#;
+        let cands = repair_truncated_json(text);
+        let ok = cands
+            .iter()
+            .find_map(|c| serde_json::from_str::<SessionSummaryOut>(c).ok());
+        assert!(ok.is_some(), "candidates: {cands:?}");
+        let out = ok.unwrap();
+        assert_eq!(out.summary, "s");
+        assert_eq!(out.stable_facts.len(), 1);
+        assert_eq!(out.stable_facts[0].key, "a");
+    }
+
+    #[test]
+    fn repair_truncated_json_no_candidates_for_garbage() {
+        // 非 JSON 文本:无候选(调用方走 LLM 重试兜底)
+        assert!(repair_truncated_json("not json at all").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_summarize_session_truncated_json_repaired_without_retry() {
+        // 半途 EOF 的截断响应:截断修复直接救回(无需第二次 LLM 调用)——
+        // 脚本只给一步,若发生第二次调用会 "mock script exhausted" 报错
+        let llm = LlmHandler::mock_scripted(vec![Ok(r#"{"summary":"截断摘"#.to_string())]);
+        let s = ContextSummarizer::new(llm, None);
+        let result = s.summarize_session("User: hi").await.unwrap();
+        assert_eq!(result.summary, "截断摘");
+        assert!(result.stable_facts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_summarize_session_retry_recovers_from_bad_first_response() {
+        // 首次响应非 JSON、重试响应正常:单次重试兜底生效
+        let llm = LlmHandler::mock_scripted(vec![
+            Ok("not json at all".to_string()),
+            Ok(r#"{"summary":"重试后摘要","stable_facts":[]}"#.to_string()),
+        ]);
+        let s = ContextSummarizer::new(llm, None);
+        let result = s.summarize_session("User: hi").await.unwrap();
+        assert_eq!(result.summary, "重试后摘要");
+    }
+
+    #[tokio::test]
+    async fn test_summarize_session_retry_exhausted_returns_error() {
+        // 两次都失败:如实 Err(不无限重试)
+        let llm = LlmHandler::mock_scripted(vec![
+            Ok("bad one".to_string()),
+            Ok("bad two".to_string()),
+        ]);
+        let s = ContextSummarizer::new(llm, None);
+        assert!(s.summarize_session("User: hi").await.is_err());
     }
 
     // ========== C4: rollup_summaries 测试 ==========

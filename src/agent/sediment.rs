@@ -1405,50 +1405,61 @@ async fn extract_knowledge_candidates(
         serde_json::Value::Array(messages_vec),
     );
 
-    // sidecar 审计调用：prompt/response 全文入 evorule 审计链（纪律①）
-    let audited_result = match auditor
-        .execute(
-            "knowledge_candidate_extraction",
-            &serde_json::Value::Object(params_map),
-        )
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                session_id = %session_id,
-                "sediment: knowledge candidate extraction LLM call failed"
-            );
-            return;
-        }
-    };
-
-    // 解析审计回包（形态与直连一致：LlmResponse JSON → content → 内嵌 JSON）
-    let response: crate::agent::translator::LlmResponse =
-        match serde_json::from_str(&audited_result.to_string()) {
-            Ok(r) => r,
+    // sidecar 审计调用：prompt/response 全文入 evorule 审计链（纪律①）。
+    // 解析失败/空响应 → 单次重试（重试仍败才弃，warn 留痕）；
+    // 审计通路传输失败不在重试面（保持既有行为）。
+    let params = serde_json::Value::Object(params_map);
+    let mut candidates: Option<Vec<KnowledgeCandidateOut>> = None;
+    for attempt in 0..2 {
+        let audited_result = match auditor
+            .execute("knowledge_candidate_extraction", &params)
+            .await
+        {
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     session_id = %session_id,
-                    "sediment: parse audited LLM response failed"
+                    "sediment: knowledge candidate extraction LLM call failed"
                 );
                 return;
             }
         };
-    let json_str = extract_json_from_text(&response.content);
-    let candidates = match parse_knowledge_candidates(&json_str) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                session_id = %session_id,
-                "sediment: parse knowledge candidates failed"
-            );
-            return;
+
+        // 解析审计回包（形态与直连一致：LlmResponse JSON → content → 内嵌 JSON；
+        // 空响应在此表现为 content 为空 → 解析失败）
+        let parsed = (|| {
+            let response: crate::agent::translator::LlmResponse =
+                serde_json::from_str(&audited_result.to_string())
+                    .map_err(|e| format!("parse audited LLM response: {}", e))?;
+            let json_str = extract_json_from_text(&response.content);
+            parse_knowledge_candidates(&json_str)
+        })();
+
+        match parsed {
+            Ok(c) => {
+                candidates = Some(c);
+                break;
+            }
+            Err(e) => {
+                if attempt == 0 {
+                    tracing::warn!(
+                        error = %e,
+                        session_id = %session_id,
+                        "sediment: knowledge candidate parse failed, retrying once"
+                    );
+                    continue;
+                }
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session_id,
+                    "sediment: parse knowledge candidates failed (retry exhausted)"
+                );
+                return;
+            }
         }
-    };
+    }
+    let Some(candidates) = candidates else { return; };
     if candidates.is_empty() {
         return; // 无候选是正常路径
     }
@@ -2603,6 +2614,92 @@ mod tests {
         let result = sediment(&mut deps, &cfg, "s1", &messages).await;
         assert!(result.knowledge_candidates.is_empty());
         m1.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_knowledge_extraction_retry_recovers_from_empty_response() {
+        // 空响应(EOF col 0 形态)→ 单次重试 → 正常候选:重试兜底生效。
+        // sidecar 四端点各命中 2 次(两次审计调用);重试成功后 payload 写 1 次
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("test", client).with_session_id("s1");
+        let llm = LlmHandler::mock_scripted(vec![
+            Ok(String::new()),
+            Ok(
+                r#"{"candidates":[{"knowledge_kind":"fact","title":"重试候选","body":"重试后的正文","tags":["t"],"confidence":0.8}]}"#
+                    .to_string(),
+            ),
+        ]);
+        let auditor = AuditedLlm::new(EvoruleApiClient::new(&server.url()), llm);
+        let cfg = SedimentConfig {
+            namespace: "test".to_string(),
+            min_messages_for_extraction: 1,
+            ..Default::default()
+        };
+        let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
+            memory: &mut memory,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: Some(&auditor),
+            journal_lines: Vec::new(),
+        };
+        let messages = vec![Message::User {
+            content: "第一条".to_string(),
+            images: Vec::new(),
+        }];
+        // sidecar 协议四端点 ×2(两次审计调用)
+        let create_mock = server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"session_id":41}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let sse = concat!(
+            "data: {\"type\":\"IoRequest\",\"id\":7}\n\n",
+            "data: {\"type\":\"Stable\"}\n\n"
+        );
+        let events_mock = server
+            .mock("GET", "/api/sessions/41/events")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .expect(2)
+            .create_async()
+            .await;
+        let command_mock = server
+            .mock("POST", "/api/sessions/41/command")
+            .with_status(200)
+            .with_body("{}")
+            .expect(2)
+            .create_async()
+            .await;
+        let io_response_mock = server
+            .mock("POST", "/api/sessions/41/io_response")
+            .with_status(200)
+            .with_body("{}")
+            .expect(2)
+            .create_async()
+            .await;
+        // 重试成功后候选落账(单条 payload 写入)
+        let payload_mock = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let mut result = SedimentResult::default();
+        extract_knowledge_candidates(&mut deps, &cfg, "s1", &messages, &mut result).await;
+        assert_eq!(result.knowledge_candidates.len(), 1);
+        create_mock.assert_async().await;
+        events_mock.assert_async().await;
+        command_mock.assert_async().await;
+        io_response_mock.assert_async().await;
+        payload_mock.assert_async().await;
     }
 
     #[tokio::test]

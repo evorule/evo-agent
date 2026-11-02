@@ -686,6 +686,42 @@ impl EvoruleApiClient {
         Ok(body.get("fact_id").and_then(|f| f.as_u64()))
     }
 
+    /// `update_payload` 的受信内部通道变体（service 身份）。
+    ///
+    /// 与 [`Self::update_payload`] 唯一差异=鉴权头走
+    /// [`ApiCore::service_auth_header`]（service token 在场时以 service 身份
+    /// 发送，未设置时回落 user 身份=现状语义零变化）。供 sediment（LLM 提取
+    /// → `stable.llm.*` 受保护域）等受信管道使用；agent 工具面（LLM 可驱动）
+    /// 一律走 `update_payload`（user 身份，受保护域写入被 server 403 拒——
+    /// 权限分层红线，不得为绕过 403 把工具面也切到本变体）。
+    pub async fn update_payload_service(
+        &self,
+        session_id: &str,
+        path: &str,
+        value: &Value,
+    ) -> Result<Option<u64>, ApiError> {
+        let url = format!(
+            "{}/api/sessions/{}/payload",
+            self.core.base_url(),
+            session_id
+        );
+
+        let body = serde_json::json!({
+            "path": path,
+            "value": value,
+        });
+
+        let resp = self
+            .core
+            .service_auth_header(self.core.client().post(&url))
+            .json(&body)
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        Ok(body.get("fact_id").and_then(|f| f.as_u64()))
+    }
+
     /// 批量更新会话 payload（跨仓挂账二随动：一次 HTTP 写入多条）
     ///
     /// server `/api/sessions/{id}/payloads`——预校验整批拒绝

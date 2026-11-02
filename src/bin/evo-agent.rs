@@ -155,9 +155,9 @@ enum Command {
     /// 显示合并后的配置(default + user + project + env)
     Config,
 
-    /// 启动依赖全量体检(doctor):七项检查(config / evorule-server 探活 /
+    /// 启动依赖全量体检(doctor):八项检查(config / evorule-server 探活 /
     /// LLM 执行体探活 / LLM 凭据 / default agent 装载 / workdir 可写 /
-    /// 流式端点形态)。任一 FAIL 项 → 退出码 1;人读渲染恒走 stderr,
+    /// 流式端点形态 / 受信通道身份)。任一 FAIL 项 → 退出码 1;人读渲染恒走 stderr,
     /// `--json` 时机器可读报告走 stdout。不受 `--no-preflight` 影响
     /// (doctor 本体即体检)
     Doctor {
@@ -722,7 +722,7 @@ fn startup_preflight(
     Ok(())
 }
 
-/// doctor 子命令:Full 七项全量体检,只报告不代修;任一 FAIL → 退出码 1。
+/// doctor 子命令:Full 八项全量体检,只报告不代修;任一 FAIL → 退出码 1。
 /// 人读渲染恒走 stderr;`--json` 时机器可读报告走 stdout(对齐 Run 子命令
 /// stdout 纯 JSON 惯例)。不受 `--no-preflight` 影响(doctor 本体即体检)。
 fn cmd_doctor(workdir: &Path, json: bool) -> ExitCode {
@@ -2591,6 +2591,25 @@ fn cmd_serve(
         }
         None => None,
     };
+    // 读写根一致性断言（fail-visible warn）：agent_root（写边界/工具沙箱根）
+    // 不在 read_root（读面四工具根）之内 = file_write 产物 file_read 读不回
+    // 的断层形态。warn 留痕不拒启——单传 --agent-root 的既有部署形态行为
+    // 零变化；桌面壳恒同根双传（--read-root == --agent-root）不触本告警。
+    if let (Some(rr), Some(ar)) = (read_root_buf.as_deref(), agent_root_buf.as_deref()) {
+        let inside = std::fs::canonicalize(ar)
+            .map(|c| c.starts_with(rr))
+            .unwrap_or(false);
+        if !inside {
+            eprintln!(
+                "[serve] WARNING: agent-root '{}' is outside read-root '{}' — \
+                 files written under the agent workspace will NOT be readable via \
+                 file_read/file_list; pass the same root to --read-root for \
+                 read-write same-root semantics",
+                ar.display(),
+                rr.display()
+            );
+        }
+    }
     let workspace_client = std::sync::Arc::new(WorkspaceApiClient::new(evorule_client.base_url()));
     // 38 号方案 X:工具沙箱根=agent_root(缺省=workdir,行为零变化)——
     // 编排基础设施(toml/junction/dist/rules/会话持久化)仍在 workdir,
@@ -3233,6 +3252,7 @@ fn cmd_serve(
     eprintln!("  POST /agents/{{type}}/run/stream   ({guard}, SSE)");
     eprintln!("  POST /agents/{{type}}/cancel       ({guard})");
     eprintln!("  POST /agents/{{type}}/approve      ({guard}, G8)");
+    eprintln!("  GET  /admin/memory-health     ({guard}, sediment 持久化健康)");
     eprintln!("press Ctrl+C to shut down");
 
     runtime.block_on(async {
@@ -3278,6 +3298,12 @@ fn evorule_client_from(config: &evo_agent::config::Config) -> EvoruleApiClient {
     }
     let mut client =
         EvoruleApiClient::with_auth_token(&config.evorule.base_url, Some(&config.evorule.api_key));
+    // 防泄漏硬闸：service token 已被 ApiCore 捕获为字段，随即从进程 env
+    // 面清除——python_exec / shell_exec / PTY / MCP 等一切工作区子进程
+    // 全量继承父 env，service token 绝不可达（受信凭据红线）；MCP
+    // spawn_gate 的 env 剔除保持为纵深。本工厂是五入口（run/serve/repl/
+    // schedule/patrol）唯一 client 构造点，且各入口均在启动期一次性调用。
+    std::env::remove_var("EVORULE_SERVICE_TOKEN");
     // 引擎 pending 预算基准装配:提交面护栏/耗时预警/启动断言共用基准值
     // (0=禁用预防层;缺省 60=对齐引擎官方缺省)。
     client.set_engine_io_budget(config.evorule.engine_io_timeout_secs);
