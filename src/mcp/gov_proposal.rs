@@ -155,7 +155,7 @@ fn send_proposal(
         "{}/v1/invoke/propose_mcp_server",
         cfg.base_url.trim_end_matches('/')
     );
-    // 无人值守阻塞标记（design-57）：pack 绑定进程把 task_ref 带上提案——
+    // 无人值守阻塞标记（无人值守防护层设计）：pack 绑定进程把 task_ref 带上提案——
     // 批准队列按任务关联过滤/排序（审批疲劳对症）
     let mut payload = serde_json::json!({
         "dataset_id": cfg.dataset_id,

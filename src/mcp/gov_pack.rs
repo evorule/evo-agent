@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 EvoRule Project
 // This file is part of EvoRule, licensed under GNU Affero General Public License v3 or later.
-//! MCP 任务能力包执行面（无人值守防护层 design-57 T₀ 的门组合半边）
+//! MCP 任务能力包执行面（无人值守防护层 无人值守防护层设计 T₀ 的门组合半边）
 //!
 //! pack 绑定的 run 进程：按 task_ref 从治理面拉取能力包（与生效清单同一
 //! pull 通路+同一 pull key），装载门判定收窄为 **pack∩list 双闸**——
@@ -18,7 +18,7 @@
 //!
 //! 治理不可达持续超过 `EVORULE_MCP_DEGRADE_TTL_SECS`（缺省 1800）后，
 //! 装载门**冻结新 spawn**（已建立连接不中断）：无限期降级运行=违反授权
-//! 必有界不变式。TTL 内照常走降级文件形态（design-55 件 A）。
+//! 必有界不变式。TTL 内照常走降级文件形态（spawn 约束设计 件 A）。
 //!
 //! ## fail-soft 红线
 //!
