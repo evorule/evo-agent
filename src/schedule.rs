@@ -215,7 +215,7 @@ pub struct ScheduleJob {
     /// 单次触发超时秒（缺省 600）
     #[serde(default = "default_job_timeout")]
     pub timeout_secs: u64,
-    /// 能力包 task_ref（无人值守防护层 design-57 T₀；缺省无=不启用能力包
+    /// 能力包 task_ref（无人值守防护层 无人值守防护层设计 T₀；缺省无=不启用能力包
     /// 门组合）。值=治理面 `org.evorule.mcp.packs` 数据集条目 id（task_ref），
     /// fire_job 经 env 注入 run 子进程，装载门按 pack∩list 双闸判定
     #[serde(default)]
@@ -407,7 +407,7 @@ pub fn fire_job(exe: &Path, workdir: &Path, job: &ScheduleJob) -> Result<i32, St
             cmd.arg("--").arg(job.goal.as_deref().unwrap_or(""));
         }
     }
-    // 无人值守防护层（design-57 T₀）：pack 绑定的任务把 task_ref 注入子进程
+    // 无人值守防护层（无人值守防护层设计 T₀）：pack 绑定的任务把 task_ref 注入子进程
     // env——run 进程的装载门按 pack∩list 双闸判定，提案回流携带 task_ref
     if let Some(pack_ref) = job.pack_ref.as_deref().filter(|s| !s.trim().is_empty()) {
         cmd.env("EVORULE_MCP_PACK_REF", pack_ref);

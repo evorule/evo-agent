@@ -120,7 +120,7 @@ impl GovCache {
         }
     }
 
-    /// 治理不可达持续时长（design-57 降级时限判定输入）：
+    /// 治理不可达持续时长（无人值守防护层设计 降级时限判定输入）：
     /// None = 治理源新鲜（未降级）；Some = 冷启动从未成功或最近一次成功后
     /// 持续失败的时长
     pub(crate) fn degraded_duration(&self) -> Option<Duration> {
@@ -258,7 +258,7 @@ pub(crate) fn configured() -> bool {
     GovConfig::from_env().is_some()
 }
 
-/// 治理不可达持续时长（design-57 降级时限判定输入；None=未降级）
+/// 治理不可达持续时长（无人值守防护层设计 降级时限判定输入；None=未降级）
 pub(crate) fn degraded_duration() -> Option<Duration> {
     match global() {
         None => None,
