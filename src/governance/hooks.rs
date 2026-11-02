@@ -365,6 +365,25 @@ mod mcp_spawn_tests {
     }
 
     #[test]
+    fn mcp_spawn_pack_reject_carries_task_marker() {
+        let f = McpSpawnFacts {
+            server_name: "fs".to_string(),
+            command: "npx".to_string(),
+            args_prefix: None,
+            server_key: Some("blake3:aa".to_string()),
+            approval_ref: None,
+            source: Some("pack".to_string()),
+            policy: Some("enforce".to_string()),
+        };
+        let d = mcp_spawn_draft(&f, McpSpawnVerdict::Reject);
+        assert_eq!(d.session_id, "mcp:fs");
+        let payload = d.payload.expect("payload");
+        assert_eq!(payload["verdict"], "reject");
+        assert_eq!(payload["source"], "pack");
+        assert_eq!(payload["server_key"], "blake3:aa");
+    }
+
+    #[test]
     fn mcp_spawn_minimal_facts_render_with_placeholders() {
         // 收割事件：command/清单来源不可得——占位符渲染不 panic
         let f = McpSpawnFacts {
