@@ -193,7 +193,9 @@ pub async fn run_preflight(cfg: &Config, workdir: &Path, scope: PreflightScope) 
         checks.push(check_default_agent(cfg, workdir));
         checks.push(check_workdir_writable(workdir));
         checks.push(probe_stream_endpoint(cfg).await);
-        checks.push(check_auth_identity(std::env::var("EVORULE_SERVICE_TOKEN").ok()));
+        checks.push(check_auth_identity(
+            std::env::var("EVORULE_SERVICE_TOKEN").ok(),
+        ));
     }
 
     PreflightReport { checks }
@@ -418,7 +420,10 @@ async fn probe_stream_endpoint(cfg: &Config) -> PreflightCheck {
 /// 零网络动作——实际持久化成败由运行面计数器承载,本项不重复判。
 fn check_auth_identity(service_env: Option<String>) -> PreflightCheck {
     const NAME: &str = "trusted-channel-identity";
-    match service_env.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    match service_env
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         Some(_) => pass(
             NAME,
             "EVORULE_SERVICE_TOKEN set (trusted internal channels hold service \
@@ -430,7 +435,8 @@ fn check_auth_identity(service_env: Option<String>) -> PreflightCheck {
             "EVORULE_SERVICE_TOKEN unset — trusted internal channels (sediment → \
              stable.llm) fall back to user identity; a server with auth enabled \
              will reject protected-domain writes with 403 (cache-only degradation). \
-             Informational for local no-auth dev servers.".to_string(),
+             Informational for local no-auth dev servers."
+                .to_string(),
         ),
     }
 }

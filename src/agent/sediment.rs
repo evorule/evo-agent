@@ -1459,7 +1459,9 @@ async fn extract_knowledge_candidates(
             }
         }
     }
-    let Some(candidates) = candidates else { return; };
+    let Some(candidates) = candidates else {
+        return;
+    };
     if candidates.is_empty() {
         return; // 无候选是正常路径
     }

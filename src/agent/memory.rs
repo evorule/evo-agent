@@ -57,8 +57,7 @@ pub struct LastPersistFailure {
 }
 
 static PERSIST_FAILURES_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PERSIST_FORBIDDEN_TOTAL: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static PERSIST_FORBIDDEN_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PERSIST_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static LAST_PERSIST_FAILURE: std::sync::Mutex<Option<LastPersistFailure>> =
@@ -92,10 +91,7 @@ fn record_persist_success() {
 /// 持久化健康快照（`GET /admin/memory-health` 消费面，零密钥内容）
 pub fn persist_health_snapshot() -> serde_json::Value {
     use std::sync::atomic::Ordering::Relaxed;
-    let last = LAST_PERSIST_FAILURE
-        .lock()
-        .ok()
-        .and_then(|g| g.clone());
+    let last = LAST_PERSIST_FAILURE.lock().ok().and_then(|g| g.clone());
     serde_json::json!({
         "persist_failures_total": PERSIST_FAILURES_TOTAL.load(Relaxed),
         "persist_forbidden_total": PERSIST_FORBIDDEN_TOTAL.load(Relaxed),
@@ -117,7 +113,6 @@ fn classify_persist_failure(err: &crate::api::api_core::ApiError) -> PersistFail
         _ => PersistFailureClass::Other,
     }
 }
-
 
 /// 内存操作错误
 #[derive(Debug)]

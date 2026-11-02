@@ -690,16 +690,15 @@ impl ContextSummarizer {
             // 截断修复兜底:半途 EOF 的 JSON 先修复再解析
             let json_str = extract_json_from_text(&response.content);
             let mut repaired = false;
-            let parsed =
-                serde_json::from_str::<SessionSummaryOut>(&json_str).or_else(|first| {
-                    for cand in repair_truncated_json(&json_str) {
-                        if let Ok(out) = serde_json::from_str::<SessionSummaryOut>(&cand) {
-                            repaired = true;
-                            return Ok(out);
-                        }
+            let parsed = serde_json::from_str::<SessionSummaryOut>(&json_str).or_else(|first| {
+                for cand in repair_truncated_json(&json_str) {
+                    if let Ok(out) = serde_json::from_str::<SessionSummaryOut>(&cand) {
+                        repaired = true;
+                        return Ok(out);
                     }
-                    Err(first)
-                });
+                }
+                Err(first)
+            });
             match parsed {
                 Ok(out) => {
                     if repaired {
@@ -1383,10 +1382,8 @@ mod tests {
     #[tokio::test]
     async fn test_summarize_session_retry_exhausted_returns_error() {
         // 两次都失败:如实 Err(不无限重试)
-        let llm = LlmHandler::mock_scripted(vec![
-            Ok("bad one".to_string()),
-            Ok("bad two".to_string()),
-        ]);
+        let llm =
+            LlmHandler::mock_scripted(vec![Ok("bad one".to_string()), Ok("bad two".to_string())]);
         let s = ContextSummarizer::new(llm, None);
         assert!(s.summarize_session("User: hi").await.is_err());
     }
