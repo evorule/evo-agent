@@ -472,7 +472,11 @@ fn elided_preview(text: &str, span_start: usize, span_end: usize) -> (String, bo
     let mut end = span_end;
     let mut m = 0;
     while end < text.len() && m < LINE_WINDOW_CHARS {
-        let step = text[end..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+        let step = text[end..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
         if step == 0 {
             break;
         }
@@ -1093,7 +1097,10 @@ mod tests {
             .expect("small.txt should match");
         let small_hits = small["hits"].as_array().unwrap();
         assert_eq!(small_hits[0]["preview"], "NEEDLE inline");
-        assert!(small_hits[0].get("elided").is_none(), "正常行不应有 elided 字段");
+        assert!(
+            small_hits[0].get("elided").is_none(),
+            "正常行不应有 elided 字段"
+        );
     }
 
     #[test]
