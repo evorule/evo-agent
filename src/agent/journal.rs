@@ -616,6 +616,20 @@ pub enum JournalEvent {
         /// 原文全文 digest(evorule-hash 口径)
         content_digest: String,
     },
+    /// 超大工具结果降级截断落账:引用化不可用(journal 目录未启用或
+    /// 落盘失败)而回落截断回喂时留痕,使「降级截断发生了」在观测面
+    /// 可审计(与引用化成功的 ToolResultOffloaded 区分)。
+    /// 观测面,不参与步映射。
+    ToolResultTruncated {
+        /// 工具名
+        tool: String,
+        /// 原文全文字节数
+        size_bytes: usize,
+        /// 生效的回喂上限(chars)
+        max_chars: usize,
+        /// 降级原因(journal_disabled | offload_failed)
+        reason: String,
+    },
     /// MCP 能力未授权阻塞落账(无人值守防护层):pack 绑定任务的装载门拒载
     /// (包外/包未就绪/过期/降级冻结)时随会话 journal 落账,使「此路径阻塞」
     /// 在任务报告显式可见(治理面更新能力包/恢复连接后下轮生效)。
@@ -2429,6 +2443,42 @@ mod tests {
                 assert_eq!(content_digest, "blake3:aa");
             }
             other => panic!("expected tool_result_offloaded, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tool_result_truncated_event_roundtrip() {
+        // 降级截断对账事件:落账+读回+链哈希完整(观测面)
+        let dir = std::env::temp_dir().join(format!("jf-trt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-trt").unwrap();
+            w.write_event(JournalEvent::ToolResultTruncated {
+                tool: "audit_get".into(),
+                size_bytes: 1234567,
+                max_chars: 48000,
+                reason: "offload_failed".into(),
+            })
+            .unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-trt")).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].hashes.is_some(), "链哈希段应完整");
+        match &lines[0].event {
+            JournalEvent::ToolResultTruncated {
+                tool,
+                size_bytes,
+                max_chars,
+                reason,
+            } => {
+                assert_eq!(tool, "audit_get");
+                assert_eq!(*size_bytes, 1234567);
+                assert_eq!(*max_chars, 48000);
+                assert_eq!(reason, "offload_failed");
+            }
+            other => panic!("expected tool_result_truncated, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -38,6 +38,8 @@
 
 ### 🐛 修复
 
+- **`grep_files` 巨行回灌收紧** — 单行超过 64 KB 的命中（如 data/snapshots 类单行 MB 级 JSON）不再整行进 `preview`，改回匹配点前后各 200 chars 窗口（头尾省略号 + `LINE_ELIDED` 标记 + `lineBytes`/`fileBytes` 伴生字段），定位信息（`line`/`col`/`endCol`）完整保留；巨匹配自身超界时头尾各取窗口半径、中段 `MATCH_ELIDED` 省略，保证输出有界。正常行输出零变化（无新增字段）
+
 - **`llm.executor_url` 配置键生效** — 该键在 `LlmConfig` 上有字段、字段文档有承诺，但 toml 合并清单缺项且 `${ENV:VAR}` 占位符解析未覆盖该字段，配置文件声明被静默忽略、执行体端点恒为缺省值。修复后字段文档声明的三级回落契约完整生效：配置文件显式值 > env `EVORULE_LLM_EXECUTOR_URL`（配置未声明时经缺省函数回落）> 缺省本机执行体端点；`${ENV:VAR}` 占位符同步支持（严格模式 env 未设置时装载报错，宽松模式空串降级）；装载期新增 `http://`/`https://` 前缀校验（严格与宽松同口径，与 `evorule.base_url` 同族），格式错误在启动时拦截而非运行期重试空转。新增 llm 段全字段 round-trip 测试锁：后续给 `LlmConfig` 增字段时若遗漏合并清单，测试即红，防同类「字段存在但配置值被静默忽略」缺陷复发
 
 - **会话版本每轮权威校正（WS `Done` 回执新增 `actual_version`）** — 流式每轮收尾时查询服务端会话权威版本并随回执下发，工作台以权威值校正本地轮次指针；此前仅回滚（rewind）时校正，正常轮进的本地指针存在近似漂移窗口。权威查询失败时回执不带该字段，工作台退回本地递增（fail-soft，行为与既往一致）
@@ -51,6 +53,8 @@
 - **bundle 导出证据闸收紧为 sandbox:-only** — `bundle_export` 工具的前置形状校验（与治理域导出端点同口径）不再接受 `human:<actor>` 人工降级标记：自由文本 actor 可被任意伪造，构成无沙盒验证的 pass 证据导出面。verdict=pass 的 subset 现仅接受 `sandbox:<id>` 机器背书（沙盒报告引用，导入侧可深度校验存在性与报告一致性）；工具 spec 描述与错误文案随动，新增 human: 前缀拒绝回归测试
 
 ### 🆕 新增
+
+- **工具结果降级截断 journal 留痕（`tool_result_truncated`）** — 超大工具结果在引用化不可用（journal 目录未启用或落盘失败）回落截断回喂时，随会话 journal 落 `ToolResultTruncated` 事件（工具名/原文字节数/生效回喂上限/降级原因 `journal_disabled`|`offload_failed`），降级截断从静默变为可审计；观测面事件，不参与步映射
 
 - **判定事实演示 agent 定义（verdict-demo）** — `agents/` 新增最小演示定义：单工具面 verdict_submit，由 LLM 自行执行语义判定并以结构化判定事实登记（提案通路口径：入账一律草案态，晋升走机器行权通路）；配合判定事实消费规则可完成「判定→登记→激活→规则条件消费」端到端演示
 
