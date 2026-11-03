@@ -6108,6 +6108,65 @@ fn gate_falls_back_to_truncation_without_journal_dir() {
 }
 
 #[test]
+fn gate_offload_failure_records_truncation_event() {
+    // 落盘失败降级截断:journal 落 ToolResultTruncated(offload_failed),
+    // 使降级路径在观测面可审计(而非静默)
+    let dir = gate_temp_dir("offload-fail");
+    let mut runner = gate_test_runner(&dir);
+    // tool_results 位置放普通文件 → create_dir_all 失败 → 降级截断
+    std::fs::write(dir.join("tool_results"), b"not-a-dir").unwrap();
+    runner.active_journal = Some(std::sync::Arc::new(
+        crate::agent::journal::JournalWriter::open(&dir, "s-trunc1").unwrap(),
+    ));
+    let raw = "x".repeat(60000);
+    let out = runner.gate_tool_result(raw, "audit_get", Some("call-7"));
+    assert!(out.contains("[truncated"), "落盘失败应降级截断");
+    assert!(!out.starts_with("[TOOL_RESULT_REF]"));
+    let path = crate::agent::journal::JournalWriter::path_for(&dir, "s-trunc1");
+    let lines = crate::agent::journal::read_all(&path).unwrap();
+    let hit = lines.iter().any(|l| {
+        matches!(
+            &l.event,
+            crate::agent::journal::JournalEvent::ToolResultTruncated {
+                tool,
+                size_bytes,
+                max_chars,
+                reason,
+            } if tool == "audit_get"
+                && *size_bytes == 60000
+                && *max_chars == 48000
+                && reason == "offload_failed"
+        )
+    });
+    assert!(hit, "降级截断应落 ToolResultTruncated(offload_failed)");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gate_journal_disabled_records_truncation_event() {
+    // journal 目录未启用降级截断:事件面留痕(journal_disabled)
+    let dir = gate_temp_dir("no-journal");
+    let mut runner = AgentRunner::new(AgentConfig::default(), make_test_client());
+    runner.active_journal = Some(std::sync::Arc::new(
+        crate::agent::journal::JournalWriter::open(&dir, "s-trunc2").unwrap(),
+    ));
+    let raw = "x".repeat(60000);
+    let out = runner.gate_tool_result(raw, "grep_files", None);
+    assert!(out.contains("[truncated"), "无 journal 目录应降级截断");
+    let path = crate::agent::journal::JournalWriter::path_for(&dir, "s-trunc2");
+    let lines = crate::agent::journal::read_all(&path).unwrap();
+    let hit = lines.iter().any(|l| {
+        matches!(
+            &l.event,
+            crate::agent::journal::JournalEvent::ToolResultTruncated { tool, reason, .. }
+                if tool == "grep_files" && reason == "journal_disabled"
+        )
+    });
+    assert!(hit, "降级截断应落 ToolResultTruncated(journal_disabled)");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn tool_result_fetch_reads_window_and_rejects_bad_refs() {
     let dir = gate_temp_dir("fetch");
     let runner = gate_test_runner(&dir);

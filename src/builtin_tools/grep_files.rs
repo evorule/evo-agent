@@ -62,6 +62,16 @@ pub const MAX_MAX_RESULTS: usize = 20_000;
 /// 硬超时:超时即停止遍历,返回已收集的 partial 结果(truncated+timedOut)
 pub const TIMEOUT_SECS: u64 = 30;
 
+/// 单行回灌字节帽:命中行超过此长度时不整行回灌 preview,改回
+/// 匹配点前后窗口(定位信息 line/col/endCol 保留;preview 头尾省略号+
+/// LINE_ELIDED 标记+lineBytes/fileBytes 字段)。防 data/snapshots 类
+/// 单行 MB 级 JSON 一次命中即撑爆工具结果。
+pub const LINE_MAX_BYTES: usize = 64 * 1024;
+
+/// 超长行 preview 窗口半径(chars;命中 span 前后各取;
+/// 巨匹配自身超 2×半径时头尾各取半径,中段省略)
+const LINE_WINDOW_CHARS: usize = 200;
+
 /// 出厂默认排除集(始终叠加;与 watcher 排除目录对齐)
 /// 注:不含 `data/` —— 该名字与源码子目录(如 src/agent/data)冲突,
 /// 名字级剪枝会误杀已入库文件;大 data 目录由调用方显式传 excludeGlobs。
@@ -339,9 +349,12 @@ fn visit_entry(
         .strip_prefix(&capture.env.root)
         .unwrap_or(entry.path());
     let rel_display = rel.to_string_lossy().replace('\\', "/");
+    // 文件大小(超长行 preview 伴生字段;metadata 失败记 0 不阻断搜索)
+    let file_len = entry.metadata().map(|m| m.len()).unwrap_or(0);
     let mut sink = HitSink {
         capture,
         rel: rel_display,
+        file_len,
     };
     // 单文件搜索失败(权限/占用)跳过该文件,不中断整体
     let _ = searcher.search_path(&capture.env.matcher, entry.path(), &mut sink);
@@ -355,6 +368,8 @@ fn visit_entry(
 struct HitSink<'a> {
     capture: &'a Arc<Capture>,
     rel: String,
+    /// 命中文件字节数(超长行 preview 伴生字段)
+    file_len: u64,
 }
 
 impl Sink for HitSink<'_> {
@@ -398,7 +413,29 @@ impl Sink for HitSink<'_> {
                 // char 偏移(0-based):regex 匹配边界天然对齐 char boundary
                 hit.insert("col".to_string(), json!(text[..s].chars().count()));
                 hit.insert("endCol".to_string(), json!(text[..e].chars().count()));
-                hit.insert("preview".to_string(), json!(text));
+                if text.len() > LINE_MAX_BYTES {
+                    // 超长行:不整行回灌,窗口+省略标记+伴生字段
+                    let (window, head_cut, tail_cut) = elided_preview(&text, s, e);
+                    let mut preview = String::new();
+                    if head_cut {
+                        preview.push('…');
+                    }
+                    preview.push_str(&window);
+                    if tail_cut {
+                        preview.push('…');
+                    }
+                    preview.push_str(&format!(
+                        " [LINE_ELIDED lineBytes={} fileBytes={}]",
+                        text.len(),
+                        self.file_len
+                    ));
+                    hit.insert("elided".to_string(), json!(true));
+                    hit.insert("lineBytes".to_string(), json!(text.len()));
+                    hit.insert("fileBytes".to_string(), json!(self.file_len));
+                    hit.insert("preview".to_string(), json!(preview));
+                } else {
+                    hit.insert("preview".to_string(), json!(text));
+                }
                 Value::Object(hit)
             })
             .collect();
@@ -414,6 +451,53 @@ impl Sink for HitSink<'_> {
         }
         Ok(true)
     }
+}
+
+/// 超长行 preview 窗口:匹配 span(byte 索引,char 对齐)前后各
+/// LINE_WINDOW_CHARS chars;巨匹配自身超 2×半径时头尾各取半径、中段
+/// 省略标记,保证窗口有界。返回 (窗口文本, 头部截断, 尾部截断)。
+fn elided_preview(text: &str, span_start: usize, span_end: usize) -> (String, bool, bool) {
+    let mut start = span_start;
+    let mut n = 0;
+    while start > 0 && n < LINE_WINDOW_CHARS {
+        let prev = text[..start]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        start = prev;
+        n += 1;
+    }
+    let head_cut = start > 0;
+    let mut end = span_end;
+    let mut m = 0;
+    while end < text.len() && m < LINE_WINDOW_CHARS {
+        let step = text[end..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+        if step == 0 {
+            break;
+        }
+        end += step;
+        m += 1;
+    }
+    let tail_cut = end < text.len();
+    let mut out = String::new();
+    out.push_str(&text[start..span_start]);
+    let span = &text[span_start..span_end];
+    if span.chars().count() > LINE_WINDOW_CHARS * 2 {
+        let head: String = span.chars().take(LINE_WINDOW_CHARS).collect();
+        let tail: String = {
+            let mut t: Vec<char> = span.chars().rev().take(LINE_WINDOW_CHARS).collect();
+            t.reverse();
+            t.into_iter().collect()
+        };
+        out.push_str(&head);
+        out.push_str("…[MATCH_ELIDED]…");
+        out.push_str(&tail);
+    } else {
+        out.push_str(span);
+    }
+    out.push_str(&text[span_end..end]);
+    (out, head_cut, tail_cut)
 }
 
 /// 去掉行尾 \r\n(grep-searcher 行缓冲含终止符;列偏移按展示内容计)
@@ -966,6 +1050,81 @@ mod tests {
             "col must be char offset, not byte offset"
         );
         assert_eq!(hits[0]["endCol"], 8);
+    }
+
+    #[test]
+    fn test_oversized_line_elided_preview() {
+        // 单行超 LINE_MAX_BYTES:不整行回灌——窗口+省略号+LINE_ELIDED 标记
+        // +lineBytes/fileBytes 伴生字段;定位信息(line/col/endCol)保留
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{}NEEDLE{}", "a".repeat(40000), "b".repeat(30000));
+        std::fs::write(dir.path().join("big.jsonl"), &(line.clone() + "\n")).unwrap();
+        // 对照:正常行不受影响(无 elided 字段,preview 整行)
+        std::fs::write(dir.path().join("small.txt"), "NEEDLE inline\n").unwrap();
+
+        let out = grep(dir.path(), literal_args("NEEDLE")).unwrap();
+        let groups = out["groups"].as_array().unwrap();
+        let big = groups
+            .iter()
+            .find(|g| g["path"] == "big.jsonl")
+            .expect("big.jsonl should match");
+        let hits = big["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["elided"], true);
+        assert_eq!(hits[0]["lineBytes"], line.len());
+        assert_eq!(hits[0]["fileBytes"], (line.len() + 1) as u64);
+        // 定位信息保留:col/endCol 是 char 偏移
+        assert_eq!(hits[0]["col"], 40000);
+        assert_eq!(hits[0]["endCol"], 40006);
+        let preview = hits[0]["preview"].as_str().unwrap();
+        assert!(preview.contains("NEEDLE"), "匹配点应在窗口内");
+        assert!(preview.starts_with('…'), "头部截断应有省略号");
+        assert!(
+            preview.contains("… [LINE_ELIDED lineBytes="),
+            "尾部截断省略号+标记: {preview}"
+        );
+        assert!(preview.contains(&format!("fileBytes={}]", line.len() + 1)));
+        // 窗口有界:头尾各 200 chars + 标记,远小于原文
+        assert!(preview.chars().count() < 600, "preview 应有界");
+
+        let small = groups
+            .iter()
+            .find(|g| g["path"] == "small.txt")
+            .expect("small.txt should match");
+        let small_hits = small["hits"].as_array().unwrap();
+        assert_eq!(small_hits[0]["preview"], "NEEDLE inline");
+        assert!(small_hits[0].get("elided").is_none(), "正常行不应有 elided 字段");
+    }
+
+    #[test]
+    fn test_oversized_line_multibyte_window() {
+        // 多字节超长行:窗口按 char 边界切,不撕裂 UTF-8
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{}NEEDLE{}", "界".repeat(25000), "界".repeat(25000));
+        std::fs::write(dir.path().join("cn.jsonl"), &(line + "\n")).unwrap();
+        let out = grep(dir.path(), literal_args("NEEDLE")).unwrap();
+        let hits = out["groups"][0]["hits"].as_array().unwrap();
+        assert_eq!(hits[0]["elided"], true);
+        let preview = hits[0]["preview"].as_str().unwrap();
+        assert!(preview.contains("NEEDLE"));
+        assert!(preview.contains("[LINE_ELIDED"));
+        assert!(preview.starts_with('…'));
+        assert!(preview.contains("… [LINE_ELIDED"));
+        // 窗口半径 char 数有界(≤ 半径×2 + span + 标记)
+        assert!(preview.chars().count() < 600);
+    }
+
+    #[test]
+    fn test_elided_preview_caps_giant_match_span() {
+        // 巨匹配自身(span > 2×半径):头尾各取半径,中段 MATCH_ELIDED
+        let text = format!("{}{}{}", "x".repeat(10), "M".repeat(5000), "y".repeat(10));
+        let (window, head_cut, tail_cut) = elided_preview(&text, 10, 10 + 5000);
+        assert!(!head_cut, "前缀仅 10 chars(小于半径)不截头");
+        assert!(!tail_cut, "后缀仅 10 chars(小于半径)不截尾");
+        assert!(window.contains("[MATCH_ELIDED]"));
+        assert!(window.starts_with('x'));
+        assert!(window.ends_with('y'));
+        assert!(window.chars().count() < 700, "巨匹配窗口应有界");
     }
 
     #[test]

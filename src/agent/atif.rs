@@ -423,6 +423,8 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             JournalEvent::ServiceToolsDegraded { .. } => continue,
             // 超大工具结果引用化:落盘对账事实,非对话步,不映射为轨迹步
             JournalEvent::ToolResultOffloaded { .. } => continue,
+            // 超大工具结果降级截断:观测面留痕,非对话步,不映射为轨迹步
+            JournalEvent::ToolResultTruncated { .. } => continue,
             // MCP 能力未授权阻塞:无人值守防护层启动期环境事实,非对话步,
             // 不映射为轨迹步(治理面共享账本已有同源事实)
             JournalEvent::McpCapabilityBlocked { .. } => continue,

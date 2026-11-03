@@ -2341,6 +2341,7 @@ impl AgentRunner {
             return raw;
         }
         let Some(dir) = &self.journal_dir else {
+            self.record_tool_result_truncated(tool_name, raw.len(), "journal_disabled");
             return truncate_tool_result(raw, self.tool_result_max_chars);
         };
         match self.offload_tool_result(&raw, tool_name, call_id, dir) {
@@ -2352,8 +2353,23 @@ impl AgentRunner {
                     error = %e,
                     "tool result offload failed; falling back to truncation"
                 );
+                self.record_tool_result_truncated(tool_name, raw.len(), "offload_failed");
                 truncate_tool_result(raw, self.tool_result_max_chars)
             }
+        }
+    }
+
+    /// 降级截断记账(fail-soft:落账失败不影响截断回喂生效):
+    /// 引用化不可用(journal 目录未启用/落盘失败)而回落截断时,
+    /// 观测面留痕使「截断发生了」在 journal 可审计。
+    fn record_tool_result_truncated(&self, tool_name: &str, size_bytes: usize, reason: &str) {
+        if let Some(j) = self.active_journal.as_deref() {
+            let _ = j.write_event(crate::agent::journal::JournalEvent::ToolResultTruncated {
+                tool: tool_name.to_string(),
+                size_bytes,
+                max_chars: self.tool_result_max_chars,
+                reason: reason.to_string(),
+            });
         }
     }
 
