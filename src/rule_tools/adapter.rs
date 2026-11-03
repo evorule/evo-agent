@@ -802,14 +802,51 @@ pub static AUDIT_GET: EndpointBinding = EndpointBinding {
     name: "audit_get",
     client: ClientKind::Evorule,
     path: "/api/sessions/{session_id}/audit",
-    description: "Get the audit report for a session.",
-    params: &[ParamBinding {
-        name: "session_id",
-        loc: Loc::Path,
-        required: true,
-        description: "Session id.",
-        ..PARAM_DEFAULTS
-    }],
+    description: "Get the audit report for a session. Default is summary mode: \
+                  entries carry hash/causal metadata only (no fact payload), \
+                  filtered to [from_fact, to_fact] then the first `limit` entries, \
+                  with total_in_range/returned/truncated paging fields. \
+                  Set full=true for the complete report (backward compatible).",
+    params: &[
+        ParamBinding {
+            name: "session_id",
+            loc: Loc::Path,
+            required: true,
+            description: "Session id.",
+            ..PARAM_DEFAULTS
+        },
+        ParamBinding {
+            name: "from_fact",
+            kind: ParamKind::Int,
+            loc: Loc::Query,
+            non_negative: true,
+            description: "Start fact id (inclusive). Default: from the beginning.",
+            ..PARAM_DEFAULTS
+        },
+        ParamBinding {
+            name: "to_fact",
+            kind: ParamKind::Int,
+            loc: Loc::Query,
+            non_negative: true,
+            description: "End fact id (inclusive). Default: to the end.",
+            ..PARAM_DEFAULTS
+        },
+        ParamBinding {
+            name: "limit",
+            kind: ParamKind::Int,
+            loc: Loc::Query,
+            non_negative: true,
+            description: "Max entries returned in summary mode (default 200, max 10000).",
+            ..PARAM_DEFAULTS
+        },
+        ParamBinding {
+            name: "full",
+            kind: ParamKind::Bool,
+            loc: Loc::Query,
+            description: "Set true to return the full report (no paging, fact payloads included).",
+            ..PARAM_DEFAULTS
+        },
+    ],
     ..BINDING_DEFAULTS
 };
 
@@ -1726,6 +1763,37 @@ mod tests {
         let (path, body) = build_request_parts(&AUDIT_GET, &args).unwrap();
         assert_eq!(path, "/api/sessions/s1/audit");
         assert_eq!(body, None);
+    }
+
+    #[test]
+    fn test_audit_get_query_paging_params() {
+        // 分页/摘要参数按声明序拼接；可选项缺省跳过
+        let args = serde_json::json!({
+            "session_id": "s1",
+            "from_fact": 5,
+            "to_fact": 40,
+            "limit": 100,
+            "full": true
+        });
+        let (path, body) = build_request_parts(&AUDIT_GET, &args).unwrap();
+        assert_eq!(
+            path,
+            "/api/sessions/s1/audit?from_fact=5&to_fact=40&limit=100&full=true"
+        );
+        assert_eq!(body, None);
+
+        // 只带部分参数：其余缺省不拼接
+        let args = serde_json::json!({ "session_id": "s1", "limit": 1 });
+        let (path, _) = build_request_parts(&AUDIT_GET, &args).unwrap();
+        assert_eq!(path, "/api/sessions/s1/audit?limit=1");
+    }
+
+    #[tokio::test]
+    async fn test_audit_get_negative_paging_param_rejected() {
+        let tool = PassthroughTool::new(&make_ws(), &make_ev(), &AUDIT_GET);
+        let args = serde_json::json!({ "session_id": "s1", "from_fact": -1 });
+        let err = tool.call(&args).await.unwrap_err();
+        assert_eq!(err, "from_fact must be non-negative");
     }
 
     #[test]
