@@ -114,13 +114,19 @@ if (-not $SkipCollect) {
         Write-Host "collected $($p.Src) -> $dst"
     }
 
-    # 外部插件包瘦身：node_modules（开发依赖,server.mjs 仅用 node: 内建,装机
-    # 不需要）与服务化脚本（nssm 形态,桌面装机由壳拉起,不装系统服务）不入包
+    # 外部插件包处置：源码树的开发态 node_modules 不入包（依赖面不确定），
+    # 装机包所需生产依赖由 npm ci --omit=dev 确定性重建——vendor\codegraph
+    # 提取管线依赖 web-tree-sitter 等第三方包，并非仅 node: 内建（v0.5.6
+    # 装机即死于 MODULE_NOT_FOUND、9150 never up，codegraph-bridge.log 实锤）；
+    # 服务化脚本（nssm 形态，桌面装机由壳拉起，不装系统服务）不入包。
     $cgDst = Join-Path $srcTauri "resources\evorule-server\plugins\codegraph-bridge"
     foreach ($junk in @("node_modules", "start.ps1", "install-service.ps1", "fix-and-start.ps1")) {
         $j = Join-Path $cgDst $junk
         if (Test-Path $j) { Remove-Item $j -Recurse -Force; Write-Host "pruned $junk from codegraph-bridge" }
     }
+    Write-Host "installing production node deps for codegraph-bridge"
+    $npmOut = cmd /c "cd /d `"$cgDst`" && npm ci --omit=dev 2>&1"
+    if ($LASTEXITCODE -ne 0) { throw "npm ci failed for codegraph-bridge: $npmOut" }
 
     # 发版模板（唯一源）：desktop\templates\evo-agent.toml；仓根 evo-agent.toml
     # 是开发本地配置（gitignore），不再是发版源。收集前先过 SSOT 校验——
