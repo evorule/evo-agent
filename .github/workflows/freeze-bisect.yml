@@ -35,7 +35,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ubuntu-latest-slim1
+          key: ubuntu-24.04-slim1
 
       - name: free runner disk (ubuntu)
         shell: bash
