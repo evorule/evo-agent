@@ -16,6 +16,10 @@ on:
         description: 'bucket label shown in the job name'
         required: false
         default: 'bucket'
+      mode:
+        description: 'direct | direct-pwsh | verify-machinery'
+        required: false
+        default: 'direct'
 jobs:
   bisect:
     name: bisect ${{ inputs.label }}
@@ -46,6 +50,7 @@ jobs:
           cargo test --lib --no-run -j2
 
       - name: run lib subset with resource watchdog
+        if: inputs.mode != 'direct-pwsh' && inputs.mode != 'verify-machinery'
         shell: bash
         run: |
           ( while true; do
@@ -61,3 +66,26 @@ jobs:
           kill $WD 2>/dev/null
           echo "SUBSET_EXIT=$RC"
           exit $RC
+
+      # Discriminator A: plain cargo test under a pwsh step shell (no
+      # verify.ps1, no bash -c bridge) -- isolates the step-shell variable.
+      - name: run lib subset (pwsh step shell, plain cargo)
+        if: inputs.mode == 'direct-pwsh'
+        shell: pwsh
+        run: |
+          $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h /
+          timeout --kill-after=30 3300 cargo test --lib -- ${{ inputs.libtest_args }} 2>&1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "== after =="; free -m; df -h /
+
+      # Discriminator B: the exact verify.ps1 machinery the CI verify job uses
+      # (pwsh bridge + internal watchdog + internal timeout) -- if the freeze
+      # follows this mode and not the others, the machinery is the trigger.
+      - name: run via verify.ps1 machinery (mirrors ci.yml verify steps)
+        if: inputs.mode == 'verify-machinery'
+        shell: pwsh
+        run: |
+          $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h /
+          ./verify.ps1 -Phase test-run -CargoArgs --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "== after =="; free -m; df -h /
