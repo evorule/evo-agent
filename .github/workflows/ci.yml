@@ -295,6 +295,11 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
+      # Workflow-level env prune: ci.yml is the only workflow that sets
+      # CARGO_TERM_COLOR: always at the workflow level (the green bisect
+      # vehicle never had it). Job-level override isolates it as the last
+      # concrete workflow-level difference.
+      CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v4
 
