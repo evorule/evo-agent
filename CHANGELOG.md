@@ -54,6 +54,8 @@
 
 ### 🆕 新增
 
+- **伴跑证书消费端接通（启动期快照呈现）** — agent 启动期经既有 evorule 服务客户端单向只读拉取一次 `GET /api/companion/status`，把「规则集已认证/未认证/伴跑不可达」如实呈现到两处：①会话 journal 新增 `companion_cert_observed`/`companion_cert_unreachable` 两个观测面事件（规则集版本/认证两级/严重级/伴随域链 seq/观测时刻全字段，审计链可回放，不参与步映射）；②system prompt 服务能力目录尾段追加「伴跑证书（启动期快照，非实时）」事实行（已认证 clean=版本+链 seq；有发现=severity 如实；未认证/伴跑未启用=如实呈现；不可达=「伴跑状态不可知」）。单向只读——只 GET 不切伴跑启停（干预权留管理面），纯事实陈述不改变任何执行分支；server 停机/未装配/旧版降级继续，不阻塞启动（fail-soft）。journal 新旧账回放兼容以测试钉死
+
 - **工具结果降级截断 journal 留痕（`tool_result_truncated`）** — 超大工具结果在引用化不可用（journal 目录未启用或落盘失败）回落截断回喂时，随会话 journal 落 `ToolResultTruncated` 事件（工具名/原文字节数/生效回喂上限/降级原因 `journal_disabled`|`offload_failed`），降级截断从静默变为可审计；观测面事件，不参与步映射
 
 - **判定事实演示 agent 定义（verdict-demo）** — `agents/` 新增最小演示定义：单工具面 verdict_submit，由 LLM 自行执行语义判定并以结构化判定事实登记（提案通路口径：入账一律草案态，晋升走机器行权通路）；配合判定事实消费规则可完成「判定→登记→激活→规则条件消费」端到端演示

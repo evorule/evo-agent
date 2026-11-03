@@ -599,6 +599,28 @@ pub enum JournalEvent {
         /// 白名单规模(降级前的期望注册面;空白名单不注册不发请求,不落本事件)
         whitelist: usize,
     },
+    /// 伴跑证书观测(启动期快照;单向只读 GET /api/companion/status 进程
+    /// 生命周期一次拉取,快照为启动期事实、非实时)。观测面,不参与步映射。
+    CompanionCertObserved {
+        /// 当前规则集版本(server latest_version;None=server 未报告)
+        ruleset_version: Option<String>,
+        /// 当前版本是否在伴跑认证集
+        certified: bool,
+        /// 当前版本是否 clean 认证(认证且无发现)
+        clean: bool,
+        /// 最近一次分析严重级(仅当分析报告版本与当前版本同源时携带)
+        severity: Option<String>,
+        /// 伴随域哈希链当前 seq
+        chain_seq: Option<u64>,
+        /// 快照观测时刻(unix 秒)
+        observed_at: u64,
+    },
+    /// 伴跑状态不可达降级(server 连接失败/503 未装配/404 旧版;agent 启动
+    /// 不受阻,prompt 如实呈现「伴跑状态不可知」)。观测面,不参与步映射。
+    CompanionCertUnreachable {
+        /// 不可达原因(错误详情,可诊断)
+        reason: String,
+    },
     /// 超大工具结果引用化落账:结果全文超回喂上限时落盘到引用文件
     /// (tool_results/ 目录,原文完整保留),messages/会话记忆只携带结构化
     /// 引用块(指纹+头尾摘要+取回指引)。本事件记录引用关系供对账回放:
@@ -2405,6 +2427,102 @@ mod tests {
             }
             other => panic!("expected service_tools_degraded, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn companion_cert_events_roundtrip_via_file() {
+        // 伴跑消费端启动期事实落账:两变体经文件回读原样(链哈希段完整,
+        // 审计链可回放——证书观测与不可达降级均入账)
+        let dir = std::env::temp_dir().join(format!("jf-compcert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-compcert").unwrap();
+            w.write_event(JournalEvent::CompanionCertObserved {
+                ruleset_version: Some("438e4c9c".into()),
+                certified: true,
+                clean: true,
+                severity: Some("clean".into()),
+                chain_seq: Some(42),
+                observed_at: 1_799_999_999,
+            })
+            .unwrap();
+            w.write_event(JournalEvent::CompanionCertUnreachable {
+                reason: "伴跑状态不可达（GET /api/companion/status）: connection refused".into(),
+            })
+            .unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-compcert")).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| l.hashes.is_some()), "链哈希段应完整");
+        match &lines[0].event {
+            JournalEvent::CompanionCertObserved {
+                ruleset_version,
+                certified,
+                clean,
+                severity,
+                chain_seq,
+                observed_at,
+            } => {
+                assert_eq!(ruleset_version.as_deref(), Some("438e4c9c"));
+                assert!(*certified);
+                assert!(*clean);
+                assert_eq!(severity.as_deref(), Some("clean"));
+                assert_eq!(*chain_seq, Some(42));
+                assert_eq!(*observed_at, 1_799_999_999);
+            }
+            other => panic!("expected companion_cert_observed, got {other:?}"),
+        }
+        match &lines[1].event {
+            JournalEvent::CompanionCertUnreachable { reason } => {
+                assert!(
+                    reason.contains("connection refused"),
+                    "原因全文保真: {reason}"
+                );
+            }
+            other => panic!("expected companion_cert_unreachable, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_replay_compat_old_file_with_new_enum() {
+        // 回放兼容钉死:旧 journal 文件(仅含升级前既有变体)+新枚举反序列化
+        // 不炸;升级后进程把新变体追加进同一账面,回放仍完整(旧账+新变体共存)
+        let dir = std::env::temp_dir().join(format!("jf-compcmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            // 旧形态账面:只有升级前既有变体(等价于旧版本进程写出的 journal)
+            let w = JournalWriter::open(&dir, "s-compcmd").unwrap();
+            w.write_event(JournalEvent::ServiceToolsDegraded {
+                reason: "服务发现失败（GET /api/services）: connection refused".into(),
+                whitelist: 3,
+            })
+            .unwrap();
+        }
+        let path = JournalWriter::path_for(&dir, "s-compcmd");
+        let lines = read_all(&path).unwrap();
+        assert_eq!(lines.len(), 1, "旧账新枚举回放不炸");
+        assert!(matches!(
+            lines[0].event,
+            JournalEvent::ServiceToolsDegraded { .. }
+        ));
+        {
+            // 升级后进程:启动期新变体追加进旧账,读取端(新枚举)回放不炸
+            let w = JournalWriter::open(&dir, "s-compcmd").unwrap();
+            w.write_event(JournalEvent::CompanionCertUnreachable {
+                reason: "伴跑状态不可达（GET /api/companion/status）: connection refused".into(),
+            })
+            .unwrap();
+        }
+        let lines = read_all(&path).unwrap();
+        assert_eq!(lines.len(), 2, "旧账+新变体共存回放");
+        assert!(matches!(
+            lines[1].event,
+            JournalEvent::CompanionCertUnreachable { .. }
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

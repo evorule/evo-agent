@@ -938,6 +938,49 @@ fn cmd_run(
             }
         }
 
+        // 伴跑消费端:启动期一次拉取伴跑证书状态(单向只读 GET /api/companion/
+        // status;快照为进程生命周期事实、非实时;绝不经此面切 A/B——干预权
+        // 留管理面)。降级 fail-soft:server 停机/503 未装配/404 旧版落降级
+        // 事件 + prompt 如实行「伴跑状态不可知」,不阻塞 agent 启动。
+        match client.get_companion_status().await {
+            Ok(v) => {
+                let observed_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let snap =
+                    evo_agent::api::evorule_client::companion_snapshot_from_status(&v, observed_at);
+                eprintln!(
+                    "[companion] cert observed: version={:?} certified={} clean={}",
+                    snap.ruleset_version, snap.certified, snap.clean
+                );
+                // 证书事实行进 system prompt 服务能力目录(纯事实陈述,非行为指令)
+                evo_agent::service_tools::store_companion_cert_line(Some(
+                    evo_agent::service_tools::companion_cert_line_from(&snap),
+                ));
+                startup_service_events.push(
+                    evo_agent::agent::journal::JournalEvent::CompanionCertObserved {
+                        ruleset_version: snap.ruleset_version.clone(),
+                        certified: snap.certified,
+                        clean: snap.clean,
+                        severity: snap.severity.clone(),
+                        chain_seq: snap.chain_seq,
+                        observed_at: snap.observed_at,
+                    },
+                );
+            }
+            Err(e) => {
+                let reason = format!("伴跑状态不可达（GET /api/companion/status）: {e}");
+                eprintln!("[companion] {reason}（降级继续，不阻塞启动）");
+                evo_agent::service_tools::store_companion_cert_line(Some(
+                    "companion: 伴跑状态不可知".into(),
+                ));
+                startup_service_events.push(
+                    evo_agent::agent::journal::JournalEvent::CompanionCertUnreachable { reason },
+                );
+            }
+        }
+
         // delegate 工具契约源:union toolkit 快照(from_definition 消费原值前克隆;
         // delegate 内部按子定义 def.tools 白名单过滤)
         let delegate_toolkit = tool_handler.clone();
