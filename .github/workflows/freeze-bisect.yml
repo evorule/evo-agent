@@ -1,9 +1,9 @@
-# Temporary diagnostic workflow (freeze bisection). Dispatch-only: never runs
-# on push/PR, never intended to merge to main -- delete the branch when the
-# bisection concludes. Purpose: run a subset of the lib test binary on an
-# ubuntu hosted runner to determine which subset freezes the runner VM.
-# Healthy subset => green with logs; killer subset => the run is reaped with
-# the test step in flight (~50 min wall), which is the attribution signal.
+# Freeze-bisection and keep-warm workflow. Dispatch-only for bisection probes
+# (never runs on push/PR); the nightly schedule refreshes the ubuntu
+# verify-cache pool and doubles as a freeze sentinel. Purpose: run a subset of
+# the lib test binary on an ubuntu hosted runner. Healthy subset => green with
+# logs; freeze wave => the run is reaped with the test step in flight
+# (~50 min wall), which is the attribution signal.
 name: freeze-bisect
 on:
   workflow_dispatch:
@@ -20,6 +20,13 @@ on:
         description: 'direct | direct-pwsh | verify-machinery'
         required: false
         default: 'direct'
+  # Keep-warm (2026-11-03): the ubuntu verify pool went stale once every run
+  # that could have refreshed it died first, and stale restores make jobs slow
+  # enough to hit the ~50-minute hosted-runner wall. This nightly full-lib run
+  # refreshes the ubuntu-probe-fresh0 pool and doubles as a freeze sentinel:
+  # if it ever goes red with a ~50-minute wall and lost logs, the wave is back.
+  schedule:
+    - cron: '30 19 * * *'
 jobs:
   bisect:
     name: bisect ${{ inputs.label }}
