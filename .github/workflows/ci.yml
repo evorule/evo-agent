@@ -175,6 +175,49 @@ jobs:
         run: cargo test --doc
 
   # ==========================================================================
+  # verify-compile: Linux compile sentinel (build + test-compile only, ~12 min).
+  # Compile phases only, no test execution -- the hosted-runner freeze strikes
+  # only the long test-run phase (never a compile phase in every recorded
+  # event), so this job sits structurally outside the death zone and stays a
+  # permanent, reliable Linux compile gate: any windows-green/linux-red
+  # cross-platform break (e.g. a missing cfg gate) fails here on the PR,
+  # independent of the unreliable full ubuntu verify.
+  # ==========================================================================
+  verify-compile:
+    name: verify-compile (ubuntu-latest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-compile-sentinel-slim1
+
+      - name: free runner disk (ubuntu)
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af || true
+
+      - name: compile gate (build + all test binaries)
+        shell: pwsh
+        run: |
+          $env:CARGO_BUILD_JOBS = '2'
+          Write-Host "== before =="; free -m; df -h /
+          ./verify.ps1 -Phase build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./verify.ps1 -Phase test-compile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "== after =="; free -m; df -h /
+
+  # ==========================================================================
   # web-test：工作台前端单测门禁（vitest,与 Rust 面同门禁）。
   # ==========================================================================
   web-test:
