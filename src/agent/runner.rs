@@ -3554,6 +3554,8 @@ impl AgentRunner {
         // session_id 在手;run 纯路径无 journal,传 None——语义事件缺席如实
         // 降级,调用镜像 tool_invoked/tool_result 仍在)
         self.register_session_scoped_handover_tools(&session_id, None);
+        // Z-B109-E01 选项①:底座包驱动侧生成(定义未声明时查表补位,零 LLM)
+        self.derive_handoff_package().await;
         // 批K 段4:todo 族会话期重绑(run 纯路径无 journal,同 None 口径)
         self.register_session_scoped_todo_tools(None);
         // 跨源批 D:技能双层注册同步(声明面真账镜像+正文本地索引;
@@ -4250,6 +4252,29 @@ impl AgentRunner {
                 forget = forget_declared,
                 "memory write tools registered (session-scoped)"
             );
+        }
+    }
+
+    /// 交接底座包驱动侧生成(Z-B109-E01 选项①,查表零 LLM):定义未声明
+    /// handoff 时,从 PR-H2 交接档 shared facts 查最新完整一档,确定性映射
+    /// 为底座包注入 config.handoff——底座层与滚动摘要(语义面)分层配对,
+    /// 消灭「摘要注入中而底座缺位」的单腿降级 warn。显式声明优先(不覆盖);
+    /// fail-soft:无档/残档/账本不可达=保持 None(装配期 pairing 断言照旧
+    /// warn,诚实降级);memory 未启用跳过(namespace 无权威源)。
+    async fn derive_handoff_package(&mut self) {
+        if self.config.handoff.is_some() {
+            return;
+        }
+        let (namespace, client) = match self.memory.as_ref() {
+            Some(mem) => (mem.namespace().to_string(), mem.evorule_client.clone()),
+            None => return,
+        };
+        if let Some(pkg) =
+            crate::agent::handover_tool::handoff_package_from_latest_handover(&namespace, &client)
+                .await
+        {
+            info!(goal = %pkg.goal, "handoff base package derived from latest handover doc");
+            self.config.handoff = Some(pkg);
         }
     }
 
@@ -7504,6 +7529,8 @@ impl AgentRunner {
                            // (与 run() 同钩位补挂——此前流式路径漏挂,handover 工具在 serve
                            // 流式会话恒 unwired;journal 在手后透传,派生/停链语义事件可落账)
                            runner.register_session_scoped_handover_tools(&session_id, journal.clone());
+                           // Z-B109-E01 选项①:底座包驱动侧生成(定义未声明时查表补位,零 LLM)
+                           runner.derive_handoff_package().await;
                            // 批K 段4:todo 族会话期重绑(journal 在手——G15 续跑
                            // 回放最新 todo_updated 重建清单;写侧 todo_updated
                            // 语义事件经 journal 落账)

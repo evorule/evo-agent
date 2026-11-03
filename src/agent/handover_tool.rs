@@ -252,6 +252,97 @@ pub(crate) async fn handover_read_exec(
     Ok(out)
 }
 
+/// 交接底座包驱动侧生成器（Z-B109-E01 选项①）：从本 namespace 交接档
+/// shared facts 查最新一档，确定性映射为 `HandoffPackage`（纯查表，零 LLM）。
+///
+/// 语义：底座层（确定性）与滚动摘要（语义面）分层配对——定义未声明
+/// handoff 时由此补位，消灭「摘要注入中而底座缺位」的单腿降级。
+/// fail-soft：无档/残档/账本不可达 = 返回 None（调用方保持未声明态，
+/// 装配期 pairing 断言照旧 warn——诚实降级，不静默造底座）。
+pub(crate) async fn handoff_package_from_latest_handover(
+    namespace: &str,
+    client: &EvoruleApiClient,
+) -> Option<crate::agent::definition::HandoffPackage> {
+    let prefix = format!("shared.{namespace}.handovers.");
+    let facts = client.get_shared_facts(Some(&prefix)).await.ok()?;
+    let doc = latest_complete_handover_doc(&facts)?;
+    Some(handover_doc_to_package(doc))
+}
+
+/// 交接档选取（纯函数）：字典序最大 id（构词保证=时间序最新）且 schema
+/// 完整（残档不采用——读工具面已 fail-visible 警示残档，底座层宁缺毋滥）。
+fn latest_complete_handover_doc(
+    facts: &[crate::api::evorule_client::SharedFactEntry],
+) -> Option<&Value> {
+    facts
+        .iter()
+        .max_by(|a, b| a.path.cmp(&b.path))
+        .filter(|f| handover_schema_missing(&f.value).is_empty())
+        .map(|f| &f.value)
+}
+
+/// 交接档 → 底座包确定性映射（纯函数）：
+/// - `goal` → goal（schema 已保证非空）；
+/// - `done` → milestone_current（字符串直取；数组取末项=最近完成）；
+/// - `todo_next` → next_step（字符串直取；数组取首项=下一动作）；
+/// - `anchors` → verified_facts（数组逐条；对象展平 `k = v`；上限 20 条
+///   防巨锚爆底座）；
+/// - `env_state`/`verification` 无底座对应槽，不映射（底座只收可复用面，
+///   环境快照属当程语境）；`dead_ends` 交接档 schema 无此面，保持空——
+///   失败教训回喂走双通道笔记既有通道，不在此重复。
+fn handover_doc_to_package(doc: &Value) -> crate::agent::definition::HandoffPackage {
+    let non_empty_str = |v: Option<&Value>| {
+        v.and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let milestone_current = non_empty_str(doc.get("done")).or_else(|| {
+        doc.get("done")
+            .and_then(|x| x.as_array())
+            .and_then(|a| a.last())
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
+    let next_step = non_empty_str(doc.get("todo_next")).or_else(|| {
+        doc.get("todo_next")
+            .and_then(|x| x.as_array())
+            .and_then(|a| a.first())
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
+    let verified_facts = match doc.get("anchors") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .take(20)
+            .map(str::to_string)
+            .collect(),
+        Some(Value::Object(map)) => map
+            .iter()
+            .take(20)
+            .map(|(k, v)| match v.as_str() {
+                Some(s) => format!("{k} = {s}"),
+                None => format!("{k} = {v}"),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    crate::agent::definition::HandoffPackage {
+        goal: non_empty_str(doc.get("goal")).unwrap_or_default(),
+        milestone_current,
+        next_step,
+        verified_facts,
+        dead_ends: Vec::new(),
+    }
+}
+
 /// `handover_write` 执行器（占位/接线双态；会话期重绑——session_id 在手）
 pub struct HandoverWriteTool {
     namespace: Option<String>,
@@ -352,6 +443,86 @@ impl ToolFunction for HandoverReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::evorule_client::SharedFactEntry;
+
+    fn fact(path: &str, value: Value) -> SharedFactEntry {
+        SharedFactEntry {
+            fact_id: 0,
+            path: path.to_string(),
+            value,
+            source_session_id: 0,
+            version: 1,
+            origin_fact_id: None,
+        }
+    }
+
+    fn complete_doc() -> Value {
+        json!({
+            "goal": "deliver v0.6.0", "done": "CI chain green",
+            "todo_next": "upload installer",
+            "anchors": {"main_sha": "4be4bc8"}, "env_state": {"os": "win"},
+            "verification": "smoke passed",
+        })
+    }
+
+    #[test]
+    fn latest_complete_handover_picks_newest_and_rejects_incomplete() {
+        let older = fact(
+            "shared.demo.handovers.handover-20261102-000000",
+            complete_doc(),
+        );
+        let newer_incomplete = fact(
+            "shared.demo.handovers.handover-20261103-120000",
+            json!({ "goal": "g" }), // 残档:缺 5 必填
+        );
+        let newest_complete = fact(
+            "shared.demo.handovers.handover-20261103-130000",
+            complete_doc(),
+        );
+        // 最新残档不采用,回退到最新完整档
+        let facts = vec![older.clone(), newer_incomplete.clone(), newest_complete];
+        let picked = latest_complete_handover_doc(&facts);
+        assert_eq!(
+            picked.and_then(|v| v["goal"].as_str()),
+            Some("deliver v0.6.0")
+        );
+        // 全残/空 → None
+        assert!(latest_complete_handover_doc(&[]).is_none());
+        let only_incomplete = vec![newer_incomplete];
+        assert!(latest_complete_handover_doc(&only_incomplete).is_none());
+        // 唯一完整档直取
+        let only_older = vec![older];
+        assert!(latest_complete_handover_doc(&only_older).is_some());
+    }
+
+    #[test]
+    fn handover_doc_to_package_maps_scalar_fields() {
+        let pkg = handover_doc_to_package(&complete_doc());
+        assert_eq!(pkg.goal, "deliver v0.6.0");
+        assert_eq!(pkg.milestone_current.as_deref(), Some("CI chain green"));
+        assert_eq!(pkg.next_step.as_deref(), Some("upload installer"));
+        assert_eq!(pkg.verified_facts, vec!["main_sha = 4be4bc8".to_string()]);
+        assert!(pkg.dead_ends.is_empty());
+    }
+
+    #[test]
+    fn handover_doc_to_package_array_and_object_variants() {
+        let mut doc = complete_doc();
+        doc["done"] = json!(["milestone A", "milestone B"]); // 数组取末项
+        doc["todo_next"] = json!(["first step", "second step"]); // 数组取首项
+        doc["anchors"] = json!(["anchor 1", "anchor 2"]); // 数组逐条
+        let pkg = handover_doc_to_package(&doc);
+        assert_eq!(pkg.milestone_current.as_deref(), Some("milestone B"));
+        assert_eq!(pkg.next_step.as_deref(), Some("first step"));
+        assert_eq!(
+            pkg.verified_facts,
+            vec!["anchor 1".to_string(), "anchor 2".to_string()]
+        );
+        // anchors 超限:上限 20 条防巨锚爆底座
+        let mut many = complete_doc();
+        many["anchors"] = json!((1..=30).map(|i| format!("a{i}")).collect::<Vec<_>>());
+        assert_eq!(handover_doc_to_package(&many).verified_facts.len(), 20);
+    }
 
     #[test]
     fn handover_schema_missing_detects_missing_and_empty() {
