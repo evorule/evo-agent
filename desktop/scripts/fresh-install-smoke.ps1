@@ -133,7 +133,9 @@ try {
     Write-Host "[smoke] engine :$enginePort /api/health: OK"
 
     # ---- 8. ai-plugin expected exclusion (no key on CI runner) --------------
-    $manifestPath = Join-Path $dataDir "plugins-manifest.json"
+    # 落点=runtime_dir（shell_config.rs:241：runtime_dir = data_dir\runtime；
+    # orchestrator.rs:593 写入该目录），非 data_dir 顶层
+    $manifestPath = Join-Path $dataDir "runtime\plugins-manifest.json"
     if (Test-Path $manifestPath) {
         $mf = Get-Content $manifestPath -Raw | ConvertFrom-Json
         $pkgNames = @($mf.plugins.PSObject.Properties.Name)
