@@ -42,6 +42,48 @@ pub fn service_description(name: &str) -> Option<String> {
     descriptions().read().ok()?.get(name).cloned()
 }
 
+/// 伴跑证书事实行槽位：启动期观测（GET /api/companion/status 快照）写入，
+/// 渲染期只读。None=未观测（目录段不出现证书行，目录其余内容零变化）。
+static COMPANION_CERT_LINE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+fn companion_cert_line_slot() -> &'static RwLock<Option<String>> {
+    COMPANION_CERT_LINE.get_or_init(|| RwLock::new(None))
+}
+
+/// 启动期写入伴跑证书事实行（观测成功与不可达降级都写——降级行如实
+/// 呈现「伴跑状态不可知」）。进程生命周期一次，写入后只读（快照语义）。
+pub fn store_companion_cert_line(line: Option<String>) {
+    if let Ok(mut slot) = companion_cert_line_slot().write() {
+        *slot = line;
+    }
+}
+
+/// 伴跑证书事实行渲染（纯函数，确定性；输入=启动期快照投影）。
+///
+/// 形态：已认证 clean=「已认证 clean（链 seq=N）」；已认证有发现=
+/// 「已认证，存在发现（severity=X）」；未认证（含 B 态关闭/版本未报告）=
+/// 如实「未经伴跑认证」。事实陈述，非行为指令——不改变 agent 执行分支。
+pub fn companion_cert_line_from(
+    snap: &crate::api::evorule_client::CompanionCertSnapshot,
+) -> String {
+    if !snap.enabled {
+        return "companion: 伴跑未启用（当前规则集未经伴跑认证）".into();
+    }
+    let seq = snap
+        .chain_seq
+        .map(|n| format!("（链 seq={n}）"))
+        .unwrap_or_default();
+    match (&snap.ruleset_version, snap.certified, snap.clean) {
+        (Some(v), true, true) => format!("companion: 规则集 {v} 已认证 clean{seq}"),
+        (Some(v), true, false) => {
+            let sev = snap.severity.clone().unwrap_or_else(|| "warn".into());
+            format!("companion: 规则集 {v} 已认证，存在发现（severity={sev}）{seq}")
+        }
+        (Some(v), false, _) => format!("companion: 规则集 {v} 未经伴跑认证{seq}"),
+        (None, _, _) => format!("companion: 当前规则集未经伴跑认证{seq}"),
+    }
+}
+
 /// 服务参数契约注册表：注册时缓存对账清单的 `parameters`
 /// （OpenAI function parameters 子集；插件包 plugin.json 声明 →
 /// server 对账透传 → 本表缓存）。
@@ -175,13 +217,29 @@ fn render_service_catalog_from(names: &[&str]) -> Option<String> {
 /// 服务名——描述不重复进目录（tools array 已带完整 function schema 与描述）。
 /// 空注册表（零服务部署/注册失败）→ None → 配方槽位静默跳过（fail-soft，
 /// 目录缺失不阻塞会话）。
+///
+/// 伴跑证书事实行（启动期快照，非实时）：已观测时追加为目录尾段独立小节；
+/// 零服务但证书已观测时仍渲染（证书段独立成立，同样 fail-soft）。
 pub fn render_service_catalog() -> Option<String> {
+    let cert_line = companion_cert_line_slot()
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
     let map = descriptions().read().ok()?;
-    if map.is_empty() {
-        return None;
-    }
     let names: Vec<&str> = map.keys().map(String::as_str).collect();
-    render_service_catalog_from(&names)
+    let catalog = render_service_catalog_from(&names);
+    match (catalog, cert_line) {
+        (None, None) => None,
+        (None, Some(line)) => Some(format!("## 伴跑证书（启动期快照，非实时）\n- {line}\n")),
+        (Some(cat), None) => Some(cat),
+        (Some(mut cat), Some(line)) => {
+            if !cat.ends_with('\n') {
+                cat.push('\n');
+            }
+            cat.push_str(&format!("\n## 伴跑证书（启动期快照，非实时）\n- {line}\n"));
+            Some(cat)
+        }
+    }
 }
 
 /// 服务代理工具：`call` = `POST /api/services/{name}/invoke`(args 原样透传)
@@ -745,5 +803,101 @@ mod tests {
         assert!(out.contains("## 服务能力目录"));
         assert!(out.contains("zzcat_only"));
         assert_eq!(out, render_service_catalog().unwrap());
+    }
+
+    #[test]
+    fn companion_cert_line_shapes_deterministic() {
+        // 三形态事实行（纯函数确定性）：clean 认证 / 认证有发现 / 未认证
+        // （B 态关闭走 enabled=false 臂）——事实陈述，同输入逐字节同输出
+        use crate::api::evorule_client::CompanionCertSnapshot;
+        let clean = companion_cert_line_from(&CompanionCertSnapshot {
+            enabled: true,
+            ruleset_version: Some("438e4c9c".into()),
+            certified: true,
+            clean: true,
+            severity: Some("clean".into()),
+            chain_seq: Some(42),
+            observed_at: 1_799_999_999,
+        });
+        assert_eq!(
+            clean,
+            "companion: 规则集 438e4c9c 已认证 clean（链 seq=42）"
+        );
+        assert_eq!(
+            clean,
+            companion_cert_line_from(&CompanionCertSnapshot {
+                enabled: true,
+                ruleset_version: Some("438e4c9c".into()),
+                certified: true,
+                clean: true,
+                severity: Some("clean".into()),
+                chain_seq: Some(42),
+                observed_at: 1_799_999_999,
+            }),
+            "同输入逐字节同输出"
+        );
+        let findings = companion_cert_line_from(&CompanionCertSnapshot {
+            enabled: true,
+            ruleset_version: Some("vB".into()),
+            certified: true,
+            clean: false,
+            severity: Some("alert".into()),
+            chain_seq: Some(43),
+            observed_at: 1,
+        });
+        assert_eq!(
+            findings,
+            "companion: 规则集 vB 已认证，存在发现（severity=alert）（链 seq=43）"
+        );
+        let uncertified = companion_cert_line_from(&CompanionCertSnapshot {
+            enabled: true,
+            ruleset_version: Some("vC".into()),
+            certified: false,
+            clean: false,
+            severity: None,
+            chain_seq: Some(44),
+            observed_at: 1,
+        });
+        assert_eq!(
+            uncertified,
+            "companion: 规则集 vC 未经伴跑认证（链 seq=44）"
+        );
+        let disabled = companion_cert_line_from(&CompanionCertSnapshot {
+            enabled: false,
+            ruleset_version: None,
+            certified: false,
+            clean: false,
+            severity: None,
+            chain_seq: None,
+            observed_at: 1,
+        });
+        assert_eq!(disabled, "companion: 伴跑未启用（当前规则集未经伴跑认证）");
+    }
+
+    #[test]
+    fn service_catalog_appends_companion_cert_line() {
+        // 证书事实行注入：已观测时追加为目录尾段独立小节；两次调用逐字节
+        // 一致（跨轮前缀缓存前提）。收尾清槽防全局态泄漏他测。
+        store_companion_cert_line(Some(
+            "companion: 规则集 vA 已认证 clean（链 seq=42）".into(),
+        ));
+        descriptions()
+            .write()
+            .unwrap()
+            .insert("zzcat_cert".to_string(), "目录渲染占位服务".to_string());
+        let out = render_service_catalog().expect("注册表非空应渲染");
+        assert!(
+            out.contains("## 伴跑证书（启动期快照，非实时）"),
+            "证书小节在场: {out}"
+        );
+        assert!(
+            out.contains("- companion: 规则集 vA 已认证 clean（链 seq=42）"),
+            "证书事实行在场: {out}"
+        );
+        assert_eq!(out, render_service_catalog().unwrap(), "两次调用逐字节一致");
+        // 清槽：未观测语义=目录段不出现证书行
+        store_companion_cert_line(None);
+        let out = render_service_catalog().unwrap();
+        assert!(!out.contains("伴跑证书"), "清槽后证书段退场: {out}");
     }
 }

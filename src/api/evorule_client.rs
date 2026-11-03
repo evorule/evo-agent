@@ -89,6 +89,72 @@ pub struct SessionMetadata {
     pub is_finished: bool,
 }
 
+/// 伴跑证书启动期快照（GET /api/companion/status 的客户端投影）。
+///
+/// 启动期一次拉取，快照为进程生命周期事实、非实时（观测语义明示）；
+/// 消费面纯呈现（journal 落账 + prompt 事实行），不改变执行分支。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompanionCertSnapshot {
+    /// B 态总开关（server 侧 enabled；false=伴跑未启用，如实呈现未认证）
+    pub enabled: bool,
+    /// 当前规则集版本（server latest_version；None=server 未报告）
+    pub ruleset_version: Option<String>,
+    /// 当前版本是否在伴跑认证集
+    pub certified: bool,
+    /// 当前版本是否 clean 认证（认证且无发现）
+    pub clean: bool,
+    /// 最近一次分析严重级（仅当分析报告版本与当前版本同源时携带）
+    pub severity: Option<String>,
+    /// 伴随域哈希链当前 seq
+    pub chain_seq: Option<u64>,
+    /// 快照观测时刻（unix 秒）
+    pub observed_at: u64,
+}
+
+/// 从 companion status 响应投影证书快照（纯函数，确定性）。
+///
+/// 字段缺失按缺省语义兜底：enabled 缺省 false、版本/seq 缺省 None=如实
+/// 未知；severity 只在 last_report 内层报告的 ruleset_version 与当前
+/// latest_version 同源时携带（旧版本报告不冒充当前版本）。
+pub fn companion_snapshot_from_status(v: &Value, observed_at: u64) -> CompanionCertSnapshot {
+    let enabled = v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false);
+    let ruleset_version = v
+        .get("latest_version")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let in_list = |key: &str| -> bool {
+        let Some(ver) = ruleset_version.as_deref() else {
+            return false;
+        };
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().any(|i| i.as_str() == Some(ver)))
+            .unwrap_or(false)
+    };
+    let certified = in_list("certified_versions");
+    let clean = in_list("clean_versions");
+    let severity = v.get("last_report").and_then(|r| {
+        let report_version = r
+            .pointer("/report/ruleset_version")
+            .and_then(|x| x.as_str());
+        let sev = r.get("severity").and_then(|x| x.as_str());
+        match (report_version, sev) {
+            (Some(rv), Some(s)) if Some(rv) == ruleset_version.as_deref() => Some(s.to_string()),
+            _ => None,
+        }
+    });
+    let chain_seq = v.pointer("/chain/seq").and_then(|x| x.as_u64());
+    CompanionCertSnapshot {
+        enabled,
+        ruleset_version,
+        certified,
+        clean,
+        severity,
+        chain_seq,
+        observed_at,
+    }
+}
+
 impl EvoruleApiClient {
     /// Create new API client.
     /// If `EVORULE_AUTH_TOKEN` env var is set, use it as Bearer token.
@@ -255,6 +321,22 @@ impl EvoruleApiClient {
     /// 对账（lineage_of 第二账数据源）。
     pub async fn get_l2_inventory(&self) -> Result<Value, ApiError> {
         let url = self.core.url("/api/rules/l2-inventory");
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// GET /api/companion/status —— 伴跑证书状态只读拉取（伴跑消费端）。
+    ///
+    /// 单向只读：只 GET status，不经此面切换伴跑启停（干预权留管理面）。
+    /// 错误口径与 list_services 同（check_response_full）：server 停机=
+    /// 传输错误、未装配=503、旧版无路由=404，由调用方统一按降级处理。
+    pub async fn get_companion_status(&self) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/companion/status");
         let resp = self
             .core
             .auth_header(self.core.client().get(&url))
@@ -1859,6 +1941,71 @@ mod tests {
         super::shrink_io_response_for_submit(&mut resp);
         let after = serde_json::to_string(&resp).unwrap();
         assert_eq!(before, after, "小载荷零改写");
+    }
+
+    #[test]
+    fn companion_snapshot_projection_certified_clean() {
+        // 已认证 clean:版本命中认证集+clean 集,severity 同源携带,seq 投影
+        let v = serde_json::json!({
+            "enabled": true,
+            "state": "certified",
+            "latest_version": "vA",
+            "certified_versions": ["vA", "vOld"],
+            "clean_versions": ["vA"],
+            "last_report": {
+                "report": {"ruleset_version": "vA", "rule_count": 12},
+                "report_json_digest": "blake3:aa",
+                "chain_seq": 7,
+                "severity": "clean"
+            },
+            "chain": {"seq": 42, "kind": "companion-hash-chain-v1", "verified": true}
+        });
+        let snap = super::companion_snapshot_from_status(&v, 1_799_999_999);
+        assert!(snap.enabled);
+        assert_eq!(snap.ruleset_version.as_deref(), Some("vA"));
+        assert!(snap.certified);
+        assert!(snap.clean);
+        assert_eq!(snap.severity.as_deref(), Some("clean"));
+        assert_eq!(snap.chain_seq, Some(42));
+        assert_eq!(snap.observed_at, 1_799_999_999);
+    }
+
+    #[test]
+    fn companion_snapshot_projection_stale_report_severity_withheld() {
+        // 旧版本报告不冒充当前版本:latest_version 与 last_report 内层版本
+        // 不同源 → severity 如实缺省(未认证/重分析窗口语义)
+        let v = serde_json::json!({
+            "enabled": true,
+            "latest_version": "vB",
+            "certified_versions": [],
+            "clean_versions": [],
+            "last_report": {
+                "report": {"ruleset_version": "vA"},
+                "chain_seq": 7,
+                "severity": "clean"
+            },
+            "chain": {"seq": 43}
+        });
+        let snap = super::companion_snapshot_from_status(&v, 1);
+        assert_eq!(snap.ruleset_version.as_deref(), Some("vB"));
+        assert!(!snap.certified);
+        assert!(!snap.clean);
+        assert_eq!(snap.severity, None, "旧版本报告 severity 不得携带");
+        assert_eq!(snap.chain_seq, Some(43));
+    }
+
+    #[test]
+    fn companion_snapshot_projection_missing_fields_fail_soft_defaults() {
+        // 字段缺失/形态异常兜底:enabled 缺省 false、版本/seq 如实未知——
+        // 投影不炸不猜(确定性,消费端降级呈现路径的输入面)
+        let snap = super::companion_snapshot_from_status(&serde_json::json!({}), 5);
+        assert!(!snap.enabled);
+        assert_eq!(snap.ruleset_version, None);
+        assert!(!snap.certified);
+        assert!(!snap.clean);
+        assert_eq!(snap.severity, None);
+        assert_eq!(snap.chain_seq, None);
+        assert_eq!(snap.observed_at, 5);
     }
     use super::*;
 
