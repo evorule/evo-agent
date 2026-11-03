@@ -89,6 +89,11 @@ jobs:
             name: windows-latest
             tests: true
     runs-on: ${{ matrix.os }}
+    # Hard cap (2026-11-02): a stuck test-run used to hang until the hosted
+    # runner was reaped server-side (~45 min after the runner went silent,
+    # whole log blob lost). With a job cap, an alive-but-stuck runner fails
+    # AT the step with its streamed log preserved.
+    timeout-minutes: 60
     env:
       # Resource guard: a full debug build of this repo produces ~9.4 GB
       # of target artifacts, which sits right at the ubuntu runner disk
@@ -149,14 +154,69 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
 
-      - name: verify 3/5 test-run
-        if: matrix.tests
+      # Binary-split test-run (2026-11-02): the 10-31/11-02 freeze wave died
+      # with the runner itself (~45 min into the single test-run step, whole
+      # log blob lost with the agent -- nothing attributable). Same commit
+      # runs the FULL suite green on a local linux box (4-core-pinned, real
+      # python/node, flat memory). Splitting linux test-run into one step
+      # per test binary turns the next blank step into an attribution: the
+      # step whose conclusion goes null IS the culprit binary. Windows keeps
+      # the combined step (it passes in ~8 min).
+      - name: verify 3/5 test-run (windows combined)
+        if: matrix.tests && runner.os == 'Windows'
         shell: pwsh
         run: |
-          if ($IsLinux) { $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h / }
           ./verify.ps1 -Phase test-run
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($IsLinux) { Write-Host "== after =="; free -m; df -h / }
+
+      - name: verify 3/5a test-run lib
+        if: matrix.tests && runner.os == 'Linux'
+        shell: pwsh
+        run: |
+          $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h /
+          ./verify.ps1 -Phase test-run -CargoArgs --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "== after =="; free -m; df -h /
+
+      - name: verify 3/5b test-run integration_test
+        if: matrix.tests && runner.os == 'Linux'
+        shell: pwsh
+        run: |
+          $env:CARGO_BUILD_JOBS = '2'
+          ./verify.ps1 -Phase test-run -CargoArgs --test integration_test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: verify 3/5c test-run io_contract_e2e
+        if: matrix.tests && runner.os == 'Linux'
+        shell: pwsh
+        run: |
+          $env:CARGO_BUILD_JOBS = '2'
+          ./verify.ps1 -Phase test-run -CargoArgs --test io_contract_e2e
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: verify 3/5d test-run mcp_gate_atomicity
+        if: matrix.tests && runner.os == 'Linux'
+        shell: pwsh
+        run: |
+          $env:CARGO_BUILD_JOBS = '2'
+          ./verify.ps1 -Phase test-run -CargoArgs --test mcp_gate_atomicity
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: verify 3/5e test-run o511_stack_repro
+        if: matrix.tests && runner.os == 'Linux'
+        shell: pwsh
+        run: |
+          $env:CARGO_BUILD_JOBS = '2'
+          ./verify.ps1 -Phase test-run -CargoArgs --test o511_stack_repro
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: verify 3/5f test-run serve_mcp_smoke
+        if: matrix.tests && runner.os == 'Linux'
+        shell: pwsh
+        run: |
+          $env:CARGO_BUILD_JOBS = '2'
+          ./verify.ps1 -Phase test-run -CargoArgs --test serve_mcp_smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: verify 4/5 secret scan
         shell: pwsh
