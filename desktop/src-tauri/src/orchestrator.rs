@@ -700,6 +700,12 @@ fn spawn_serve(
             "EVORULE_LLM_EXECUTOR_URL",
             format!("http://127.0.0.1:{p}/llm/execute"),
         );
+    } else {
+        // 执行体缺席（无 key 环境）：serve preflight 对 llm-executor 项 fail-closed
+        // 会退出进程——与「执行体可选、LLM 不可用不阻断全链」的编排语义
+        // （上方 prepare 系列注释）相悖。此形态 bypass preflight，LLM 失败
+        // 在调用时可见（visible-failure semantics，smoke 第 8 步预期口径）。
+        serve_cmd.arg("--no-preflight");
     }
     let serve = serve_cmd
         .spawn()
