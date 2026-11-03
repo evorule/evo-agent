@@ -20,6 +20,15 @@ on:
         description: 'direct | direct-pwsh | verify-machinery'
         required: false
         default: 'direct'
+  # Merge-ref probe, arm B (2026-11-03): identical to arm A (self-filtered
+  # pull_request trigger running the full lib on the merge ref) plus
+  # GIT_TERMINAL_PROMPT=0 / GIT_ASKPASS=/bin/true in the job env. If the
+  # hang is a git credential/network wait, this run fails fast with the
+  # culprit test named in a surviving log instead of hanging.
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/freeze-bisect.yml
 jobs:
   bisect:
     name: bisect ${{ inputs.label }}
@@ -28,6 +37,13 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
+      # Credential-wait hypothesis (arm B): if the merge-ref hang is a git
+      # network/credential wait (the only git subprocess surface is
+      # src/git/mod.rs), these make git fail fast instead of blocking
+      # forever -- converting an unkillable hang into an attributed,
+      # logged test failure.
+      GIT_TERMINAL_PROMPT: 0
+      GIT_ASKPASS: /bin/true
     steps:
       - uses: actions/checkout@v4
 
