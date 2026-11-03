@@ -103,8 +103,12 @@ try {
     Write-Host "[smoke] context-inspector 19100: OK"
 
     # ---- 7. engine service surface: five UDFs registered -------------------
+    # runtime.json 由编排链尾写出（lib.rs：engine→serve 探测→runtime.json），
+    # 壳启动后需等编排完成——与第 4-6 步同款 deadline 等待，90s 覆盖冷启动
     $runtime = Join-Path $dataDir "runtime.json"
-    if (-not (Test-Path $runtime)) { throw "runtime.json missing under $dataDir" }
+    $rtDeadline = (Get-Date).AddSeconds(90)
+    while (-not (Test-Path $runtime) -and (Get-Date) -lt $rtDeadline) { Start-Sleep -Seconds 3 }
+    if (-not (Test-Path $runtime)) { throw "runtime.json missing under $dataDir (orchestration not complete within 90s)" }
     $rt = Get-Content $runtime -Raw | ConvertFrom-Json
     # runtime.json 为嵌套结构（orchestrator.rs last_ports：serve.port / engine.port / llm_executor.port）
     $enginePort = $rt.engine.port
