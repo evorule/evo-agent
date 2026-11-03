@@ -113,20 +113,24 @@ try {
     # runtime.json 为嵌套结构（orchestrator.rs last_ports：serve.port / engine.port / llm_executor.port）
     $enginePort = $rt.engine.port
     if (-not $enginePort) { throw "engine_port missing in runtime.json" }
+    # ---- 7. engine service surface reachable (orchestration complete) ------
+    # 说明：udf_* 服务经 wasm-host 插件自有面（:9140/services）暴露，不进
+    # engine /api/services 对账清单（该清单=native+registry；desktop 侧
+    # service-tools 白名单 145 项亦无 udf_；run 41596263340 实测 0 条）。
+    # UDF 实载查验由第 3 步承担（wasm-host 5 modules verified）。
     $deadline = (Get-Date).AddSeconds(30)
-    $udfs = @()
+    $svcCount = 0
     while ((Get-Date) -lt $deadline) {
         try {
             $svc = (Invoke-WebRequest -Uri "http://127.0.0.1:$enginePort/api/services" -UseBasicParsing -TimeoutSec 5).Content |
                 ConvertFrom-Json -AsHashtable
-            $names = @($svc | ForEach-Object { $_.name })
-            $udfs = @($names | Where-Object { $_ -like "udf_*" })
-            if ($udfs.Count -ge 5) { break }
+            $svcCount = @($svc).Count
+            if ($svcCount -gt 0) { break }
         } catch { }
         Start-Sleep -Seconds 3
     }
-    if ($udfs.Count -lt 5) { throw "engine :$enginePort service surface has $($udfs.Count) udf_* entries, expect >= 5" }
-    Write-Host "[smoke] engine :$enginePort service surface: $($udfs.Count) UDFs [$($udfs -join ', ')]"
+    if ($svcCount -lt 1) { throw "engine :$enginePort /api/services empty or unreachable" }
+    Write-Host "[smoke] engine :$enginePort service surface: $svcCount services"
 
     # ---- 8. ai-plugin expected exclusion (no key on CI runner) --------------
     $manifestPath = Join-Path $dataDir "plugins-manifest.json"
