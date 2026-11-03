@@ -24,6 +24,7 @@
 
 use crate::agent::audited_llm::AuditedLlm;
 use crate::agent::journal::{JournalEvent, JournalLine};
+use crate::agent::json_repair::from_str_with_repair;
 use crate::agent::memory::{MemoryManager, MemoryRecord, MemoryScope, PersistOutcome};
 use crate::agent::memory_event::event::{EventSource, EventType, MemoryEvent};
 use crate::agent::memory_event::extraction::{extract_json_from_text, EventExtractor};
@@ -157,6 +158,9 @@ pub struct SedimentResult {
     /// 会话收尾补写成功的离线积压事件数（CacheOnly→Persisted 对账闭环;
     /// 0=无积压或补写失败——与 stable_facts_cache_only 同款防虚报口径）
     pub flushed_events: usize,
+    /// LLM 输出 JSON 解析最终失败计数（截断修复兜底后仍失败——候选/
+    /// 合并产物丢账留痕，与 warn 日志对账；修复生效不在此列）
+    pub json_parse_failures: usize,
     /// S-5 收尾批：成功提议到治理数据集的候选 event_id 列表
     /// （Draft 回执=提议凭据；失败/不达标候选不在此列，保持原态下批重试）
     pub knowledge_proposed: Vec<String>,
@@ -589,8 +593,11 @@ fn default_consolidation_kind() -> String {
 }
 
 fn parse_consolidation(json_str: &str) -> Result<ConsolidationOut, String> {
-    let out: ConsolidationOut =
-        serde_json::from_str(json_str).map_err(|e| format!("parse consolidation JSON: {}", e))?;
+    let (out, repaired) = from_str_with_repair::<ConsolidationOut>(json_str)
+        .map_err(|e| format!("parse consolidation JSON: {}", e))?;
+    if repaired {
+        tracing::warn!("sediment: truncated consolidation JSON repaired (partial content kept)");
+    }
     if out.title.trim().is_empty() || out.body.trim().is_empty() {
         return Err("consolidation empty title/body".to_string());
     }
@@ -725,6 +732,7 @@ pub(crate) async fn consolidate_knowledge_candidates(
                     error = %e,
                     "sediment: consolidation parse failed (cluster skipped)"
                 );
+                result.json_parse_failures += 1;
                 continue;
             }
         };
@@ -1455,6 +1463,7 @@ async fn extract_knowledge_candidates(
                     session_id = %session_id,
                     "sediment: parse knowledge candidates failed (retry exhausted)"
                 );
+                result.json_parse_failures += 1;
                 return;
             }
         }
@@ -1470,9 +1479,15 @@ async fn extract_knowledge_candidates(
 }
 
 /// 解析 LLM 输出为候选列表（纯函数，单测覆盖）
+///
+/// 截断兜底：LLM 输出超 max_tokens 时 JSON 半途 EOF——直接解析整包失败
+/// 即候选静默丢失，先经确定性截断修复保住已完整的前缀候选。
 fn parse_knowledge_candidates(json_str: &str) -> Result<Vec<KnowledgeCandidateOut>, String> {
-    let out: KnowledgeExtractionOut =
-        serde_json::from_str(json_str).map_err(|e| format!("parse candidates JSON: {}", e))?;
+    let (out, repaired) = from_str_with_repair::<KnowledgeExtractionOut>(json_str)
+        .map_err(|e| format!("parse candidates JSON: {}", e))?;
+    if repaired {
+        tracing::warn!("sediment: truncated candidates JSON repaired (partial content kept)");
+    }
     // 逐条过滤：七类越界/正文空 → 丢弃（治理口径：越界候选将来过不了
     // A2-3 契约校验，直接在提取面拒收并留 warn）
     let kept: Vec<KnowledgeCandidateOut> = out
@@ -2476,6 +2491,116 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(parse_knowledge_candidates("{}").unwrap().is_empty());
+    }
+
+    // ===== 截断修复（max_tokens 半途 EOF 的确定性兜底） =====
+
+    #[test]
+    fn test_parse_knowledge_candidates_truncated_json_repaired() {
+        // 值字符串半途截断形态（输出超 max_tokens 在字符串中间被切）：
+        // 已完整的前缀候选必须经修复保留，而非整包解析失败静默丢失
+        let json = concat!(
+            r#"{"candidates":[{"knowledge_kind":"heuristic","title":"完整候选","body":"完整自包含正文","tags":["t"],"confidence":0.8},"#,
+            r#"{"knowledge_kind":"fact","title":"部分截"#
+        );
+        let out = parse_knowledge_candidates(json).unwrap();
+        assert_eq!(out.len(), 1, "截断 JSON 修复后应保住已完整的前缀候选");
+        assert_eq!(out[0].title, "完整候选");
+    }
+
+    #[test]
+    fn test_parse_consolidation_truncated_json_repaired() {
+        // 巩固合并输出同族截断形态：值字符串半途 EOF → 闭合修复保留部分内容
+        let json = r#"{"title":"合并后标题","body":"自包含正文前半被截"#;
+        let out = parse_consolidation(json).unwrap();
+        assert_eq!(out.title, "合并后标题");
+        assert!(!out.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_knowledge_extraction_truncated_json_repaired() {
+        // 全链路：LLM 输出超限截断 → 解析点修复兜底 → 前缀候选照常落账
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("test", client).with_session_id("s1");
+        let truncated = r#"{"candidates":[{"knowledge_kind":"heuristic","title":"完整候选","body":"完整自包含正文","tags":["t"],"confidence":0.8},{"knowledge_kind":"fact","title":"部分截"#;
+        // 重试面同形态（修复生效时首次即成功，第二次脚本不会被消费）
+        let llm =
+            LlmHandler::mock_scripted(vec![Ok(truncated.to_string()), Ok(truncated.to_string())]);
+        let auditor = AuditedLlm::new(EvoruleApiClient::new(&server.url()), llm);
+        let cfg = SedimentConfig {
+            namespace: "test".to_string(),
+            min_messages_for_extraction: 1,
+            ..Default::default()
+        };
+        let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
+            memory: &mut memory,
+            summarizer: None,
+            extractor: None,
+            event_store: None,
+            auditor: Some(&auditor),
+            journal_lines: Vec::new(),
+        };
+        let messages = vec![Message::User {
+            content: "第一条".to_string(),
+            images: Vec::new(),
+        }];
+        // 修复生效 ⇒ 单次审计调用即成功（四端点各命中 1 次）
+        let create_mock = server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"session_id":41}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let sse = concat!(
+            "data: {\"type\":\"IoRequest\",\"id\":7}\n\n",
+            "data: {\"type\":\"Stable\"}\n\n"
+        );
+        let events_mock = server
+            .mock("GET", "/api/sessions/41/events")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .expect(1)
+            .create_async()
+            .await;
+        let command_mock = server
+            .mock("POST", "/api/sessions/41/command")
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let io_response_mock = server
+            .mock("POST", "/api/sessions/41/io_response")
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        // 修复保住的前缀候选照常写入共享账本（单条 payload 写入）
+        let payload_mock = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let mut result = SedimentResult::default();
+        extract_knowledge_candidates(&mut deps, &cfg, "s1", &messages, &mut result).await;
+        assert_eq!(
+            result.knowledge_candidates.len(),
+            1,
+            "截断输出经修复后前缀候选应落账"
+        );
+        create_mock.assert_async().await;
+        events_mock.assert_async().await;
+        command_mock.assert_async().await;
+        io_response_mock.assert_async().await;
+        payload_mock.assert_async().await;
     }
 
     #[tokio::test]

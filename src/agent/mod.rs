@@ -24,6 +24,7 @@ pub mod evid;
 pub mod handover_tool;
 pub mod journal;
 pub mod journal_anchor;
+pub mod json_repair;
 pub mod judge_guard;
 pub mod lexstore;
 pub mod materializer;

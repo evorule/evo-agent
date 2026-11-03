@@ -45,33 +45,13 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::agent::audited_llm::AuditedLlm;
+use crate::agent::json_repair::{adaptive_max_tokens, repair_truncated_json};
 use crate::agent::translator::{LlmResponse, Message};
 use crate::io_handler::IoHandler;
 use crate::io_handlers::LlmHandler;
 
 /// G10:摘要触发的最小裁剪消息数(Q9 Strategy B,默认 5)
 pub const DEFAULT_SUMMARY_THRESHOLD: usize = 5;
-
-/// G10:摘要最小 token 数(输入极小时的下限;长会话截断缺陷修复后实际值随输入规模自适应)
-///
-/// 缺陷背景:固定 512 在长会话(51k token prompt)下必然截断——模型对长输入
-/// 倾向更长的输出且可能夹杂格式噪音,512 上限把摘要硬截在半句。
-/// 修复=`adaptive_max_tokens()` 按输入规模放大,512 保留为下限。
-const SUMMARY_MAX_TOKENS: u64 = 512;
-
-/// 摘要 max_tokens 自适应上限(防长输入下 512 硬截断)
-const SUMMARY_MAX_TOKENS_CAP: u64 = 8192;
-
-/// 按输入规模自适应摘要 max_tokens
-///
-/// - 输入 token 估算 = 字符数 / 3(中英混合粗估)
-/// - max_tokens = clamp(估算值 / 4, 512, 8192):摘要长度随输入次线性增长,
-///   /4 给足 JSON 结构与格式噪音余量;下限 512 保证小会话完整表述,
-///   上限 8192 封顶防成本失控
-fn adaptive_max_tokens(input_chars: usize) -> u64 {
-    let est_input_tokens = (input_chars / 3) as u64;
-    (est_input_tokens / 4).clamp(SUMMARY_MAX_TOKENS, SUMMARY_MAX_TOKENS_CAP)
-}
 
 /// C1:整会话摘要 + 稳定事实 LLM 输出结构
 ///
@@ -838,79 +818,6 @@ fn extract_json_from_text(text: &str) -> String {
     trimmed.to_string()
 }
 
-/// 截断修复:对半途 EOF 的 JSON 文本做字符串感知的括号闭合 + 尾元素修剪
-///
-/// 产出零到多个候选修复文本,由调用方逐个尝试解析(全部经真实 parse 验证,
-/// 不保证语义完整——截断丢失的内容不可恢复,只保住已完整的部分)。
-/// 候选生成策略:
-/// 1. 值字符串半途截断 → 补闭合引号后逐层闭合括号
-/// 2. 尾元素残缺(键/值/嵌套结构写到一半)→ 回退到最后一个安全点
-///    (最后一个闭合括号之后 / 最后一个逗号之前),剪掉残缺尾元素后闭合
-/// 3. 兜底:非字符串态直接逐层闭合(数值截断等场景)
-///
-/// 失败形态锚:max_tokens 半途 EOF(实测 col 1523/1905/2221 形态),
-/// 修复目标是保住已完整的前缀内容,与单次 LLM 重试构成双兜底。
-fn repair_truncated_json(text: &str) -> Vec<String> {
-    let mut stack: Vec<char> = Vec::new();
-    let mut in_string = false;
-    let mut escape = false;
-    // 最后一个安全截断点:(字节位置, 此刻的括号栈快照)
-    let mut safe: Option<(usize, Vec<char>)> = None;
-
-    for (i, ch) in text.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if in_string {
-            match ch {
-                '\\' => escape = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' | '[' => stack.push(ch),
-            '}' | ']' => {
-                stack.pop();
-                safe = Some((i + ch.len_utf8(), stack.clone()));
-            }
-            ',' => safe = Some((i, stack.clone())),
-            _ => {}
-        }
-    }
-
-    let close = |s: &mut String, snap: &[char]| {
-        for c in snap.iter().rev() {
-            s.push(if *c == '{' { '}' } else { ']' });
-        }
-    };
-
-    let mut candidates: Vec<String> = Vec::new();
-    // 候选一:字符串感知闭合(值字符串半途 EOF)
-    if in_string {
-        let mut s = text.to_string();
-        s.push('"');
-        close(&mut s, &stack);
-        candidates.push(s);
-    }
-    // 候选二:尾元素修剪(回退到最后安全点)
-    if let Some((cut, snap)) = &safe {
-        let mut s = text[..*cut].to_string();
-        close(&mut s, snap);
-        candidates.push(s);
-    }
-    // 候选三:兜底直接闭合(非字符串态;含数值截断场景)
-    if !stack.is_empty() && !in_string {
-        let mut s = text.to_string();
-        close(&mut s, &stack);
-        candidates.push(s);
-    }
-    candidates
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,29 +926,6 @@ mod tests {
     #[test]
     fn test_default_threshold_is_5() {
         assert_eq!(DEFAULT_SUMMARY_THRESHOLD, 5);
-    }
-
-    // ========== adaptive_max_tokens 测试 ==========
-
-    #[test]
-    fn test_adaptive_max_tokens_small_input_floors_at_512() {
-        // 小输入(甚至 0 字符)→ 下限 512
-        assert_eq!(adaptive_max_tokens(0), 512);
-        assert_eq!(adaptive_max_tokens(3000), 512); // est 1000 tok / 4 = 250 → 512
-    }
-
-    #[test]
-    fn test_adaptive_max_tokens_scales_with_input() {
-        // 51k token 级输入(长会话实测场景):~153k 字符 → est 51000 /4 = 12750 → 封顶 8192
-        assert_eq!(adaptive_max_tokens(153_000), 8192);
-        // 中等输入:60k 字符 → est 20000 /4 = 5000
-        assert_eq!(adaptive_max_tokens(60_000), 5000);
-    }
-
-    #[test]
-    fn test_adaptive_max_tokens_caps_at_8192() {
-        // 超大输入 → 上限 8192(防成本失控)
-        assert_eq!(adaptive_max_tokens(10_000_000), 8192);
     }
 
     // ========== summarize_dropped 测试 ==========
@@ -1327,7 +1211,7 @@ mod tests {
     #[test]
     fn repair_truncated_json_mid_string_value() {
         // 值字符串半途 EOF:补引号+闭合括号后可解析,保住已完整键值
-        let cands = repair_truncated_json(r#"{"summary":"部分摘"#);
+        let cands: Vec<String> = repair_truncated_json(r#"{"summary":"部分摘"#).collect();
         let ok = cands
             .iter()
             .find_map(|c| serde_json::from_str::<SessionSummaryOut>(c).ok());
@@ -1339,7 +1223,7 @@ mod tests {
     fn repair_truncated_json_prunes_partial_fact() {
         // stable_facts 数组内元素写到一半:修剪残缺元素保住完整前缀
         let text = r#"{"summary":"s","stable_facts":[{"key":"a","value":"完整","#;
-        let cands = repair_truncated_json(text);
+        let cands: Vec<String> = repair_truncated_json(text).collect();
         let ok = cands
             .iter()
             .find_map(|c| serde_json::from_str::<SessionSummaryOut>(c).ok());
@@ -1353,7 +1237,8 @@ mod tests {
     #[test]
     fn repair_truncated_json_no_candidates_for_garbage() {
         // 非 JSON 文本:无候选(调用方走 LLM 重试兜底)
-        assert!(repair_truncated_json("not json at all").is_empty());
+        let cands: Vec<String> = repair_truncated_json("not json at all").collect();
+        assert!(cands.is_empty());
     }
 
     #[tokio::test]
