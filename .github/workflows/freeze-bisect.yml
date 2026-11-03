@@ -1,9 +1,9 @@
-# Temporary diagnostic workflow (freeze bisection). Dispatch-only: never runs
-# on push/PR, never intended to merge to main -- delete the branch when the
-# bisection concludes. Purpose: run a subset of the lib test binary on an
-# ubuntu hosted runner to determine which subset freezes the runner VM.
-# Healthy subset => green with logs; killer subset => the run is reaped with
-# the test step in flight (~50 min wall), which is the attribution signal.
+# Freeze-bisection diagnostic workflow. Dispatch probes never run on push;
+# the pull_request trigger below runs this workflow on the merge ref -- the
+# one context where the CI verify job hangs -- and only when this workflow
+# file itself changes, so each probe push is a self-triggering one-shot.
+# Healthy run => green with logs; freeze wave => reaped with the test step
+# in flight (~50 min wall), which is the attribution signal.
 name: freeze-bisect
 on:
   workflow_dispatch:
@@ -20,6 +20,16 @@ on:
         description: 'direct | direct-pwsh | verify-machinery'
         required: false
         default: 'direct'
+  # Merge-ref probe (2026-11-03): pull_request runs execute on the merge ref
+  # by default. The CI verify job has hung in lib only in this context (3/3,
+  # across pool states) while dispatch-on-main runs of the identical suite
+  # and machinery never do; this trigger reproduces the suspect checkout
+  # form in this controlled vehicle. Inputs are empty in this context, so
+  # the direct mode runs the full lib suite.
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/freeze-bisect.yml
 jobs:
   bisect:
     name: bisect ${{ inputs.label }}
