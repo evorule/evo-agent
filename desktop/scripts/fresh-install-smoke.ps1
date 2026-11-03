@@ -104,11 +104,11 @@ try {
 
     # ---- 7. engine service surface: five UDFs registered -------------------
     # runtime.json 由编排链尾写出（lib.rs：engine→serve 探测→runtime.json），
-    # 壳启动后需等编排完成——与第 4-6 步同款 deadline 等待，90s 覆盖冷启动
+    # 壳启动后需等编排完成——与第 4-6 步同款 deadline 等待，180s 覆盖 CI 冷启动
     $runtime = Join-Path $dataDir "runtime.json"
-    $rtDeadline = (Get-Date).AddSeconds(90)
+    $rtDeadline = (Get-Date).AddSeconds(180)
     while (-not (Test-Path $runtime) -and (Get-Date) -lt $rtDeadline) { Start-Sleep -Seconds 3 }
-    if (-not (Test-Path $runtime)) { throw "runtime.json missing under $dataDir (orchestration not complete within 90s)" }
+    if (-not (Test-Path $runtime)) { throw "runtime.json missing under $dataDir (orchestration not complete within 180s)" }
     $rt = Get-Content $runtime -Raw | ConvertFrom-Json
     # runtime.json 为嵌套结构（orchestrator.rs last_ports：serve.port / engine.port / llm_executor.port）
     $enginePort = $rt.engine.port
@@ -147,6 +147,21 @@ try {
 
     Write-Host "[smoke] ALL CHECKS PASSED"
     exit 0
+} catch {
+    # 失败现场保留：dump 壳/引擎日志尾段到 CI 输出（finally 的清理会毁掉现场，
+    # 不可诊断=每轮死因只能猜——run 41568353520 教训）
+    Write-Host "[smoke] FAILED: $($_.Exception.Message)"
+    $logDir = Join-Path $dataDir "logs"
+    if (Test-Path $logDir) {
+        foreach ($lf in Get-ChildItem $logDir -Filter *.log -ErrorAction SilentlyContinue) {
+            Write-Host "===== $($lf.Name) (tail 40) ====="
+            Get-Content $lf.FullName -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+        }
+    } else {
+        Write-Host "[smoke] no logs dir under $dataDir"
+        if (Test-Path $dataDir) { Get-ChildItem $dataDir -Recurse -ErrorAction SilentlyContinue | Select-Object -First 20 | ForEach-Object { Write-Host "  $($_.FullName)" } }
+    }
+    exit 1
 } finally {
     Stop-SmokeShell
     Start-Sleep -Seconds 2
