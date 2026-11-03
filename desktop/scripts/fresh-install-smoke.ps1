@@ -1,10 +1,10 @@
-# fresh-install-smoke.ps1 — 装机冒烟验收（发版面验收机制闸 4 的 CI 化）
+﻿# fresh-install-smoke.ps1 — 装机冒烟验收（发版面验收机制闸 4 的 CI 化）
 #
 # 对 build 产物 setup.exe 做「装机 → 起壳 → 服务面 → 清理」全链冒烟：
 #   1. 静默安装到临时目录          2. 关键件 10 项在位
 #   3. 壳拉起六进程编排            4. wasm-host 9140 验签五 UDF verified
 #   5. codegraph 9150 健康         6. context-inspector 19100 服务面
-#   7. engine 服务面五 UDF 注册    8. ai-plugin 无 key 环境预期剔除（可见失败语义）
+#   7. engine 健康面可达            8. ai-plugin 无 key 环境预期剔除（可见失败语义）
 # 任何一步失败即 exit 1（fail-closed）；无论成败均清理进程与目录。
 #
 # 用法: powershell -File fresh-install-smoke.ps1 -SetupPath <setup.exe>
@@ -102,7 +102,7 @@ try {
     if (-not $ciOk) { throw "context-inspector :19100 not healthy within 30s" }
     Write-Host "[smoke] context-inspector 19100: OK"
 
-    # ---- 7. engine service surface: five UDFs registered -------------------
+    # ---- 7. engine health reachable (orchestration complete) ---------------
     # runtime.json 由编排链尾写出（lib.rs：engine→serve 探测→runtime.json），
     # 壳启动后需等编排完成——与第 4-6 步同款 deadline 等待，180s 覆盖 CI 冷启动
     $runtime = Join-Path $dataDir "runtime.json"
@@ -113,24 +113,24 @@ try {
     # runtime.json 为嵌套结构（orchestrator.rs last_ports：serve.port / engine.port / llm_executor.port）
     $enginePort = $rt.engine.port
     if (-not $enginePort) { throw "engine_port missing in runtime.json" }
-    # ---- 7. engine service surface reachable (orchestration complete) ------
-    # 说明：udf_* 服务经 wasm-host 插件自有面（:9140/services）暴露，不进
-    # engine /api/services 对账清单（该清单=native+registry；desktop 侧
-    # service-tools 白名单 145 项亦无 udf_；run 41596263340 实测 0 条）。
-    # UDF 实载查验由第 3 步承担（wasm-host 5 modules verified）。
+    # ---- 7. engine health reachable -----------------------------------------
+    # 说明：装机冒烟的本职=安装完整性（进程起得来、HTTP 面活着），不背书
+    # 服务目录内容。/api/services 在 fresh install 上合法为空（清单=
+    # native+registry 绑定，装机首启无绑定；run 41596263340/41601796694
+    # 两轮实测 0 条）；服务目录正确性属 evorule-server 仓自身测试面。
+    # udf_* 服务经 wasm-host 插件自有面（:9140/services）暴露，实载查验
+    # 由第 3 步承担（wasm-host 5 modules verified）。
     $deadline = (Get-Date).AddSeconds(30)
-    $svcCount = 0
+    $engineOk = $false
     while ((Get-Date) -lt $deadline) {
         try {
-            $svc = (Invoke-WebRequest -Uri "http://127.0.0.1:$enginePort/api/services" -UseBasicParsing -TimeoutSec 5).Content |
-                ConvertFrom-Json -AsHashtable
-            $svcCount = @($svc).Count
-            if ($svcCount -gt 0) { break }
+            $h = Invoke-WebRequest -Uri "http://127.0.0.1:$enginePort/api/health" -UseBasicParsing -TimeoutSec 5
+            if ($h.StatusCode -eq 200) { $engineOk = $true; break }
         } catch { }
         Start-Sleep -Seconds 3
     }
-    if ($svcCount -lt 1) { throw "engine :$enginePort /api/services empty or unreachable" }
-    Write-Host "[smoke] engine :$enginePort service surface: $svcCount services"
+    if (-not $engineOk) { throw "engine :$enginePort /api/health not reachable within 30s" }
+    Write-Host "[smoke] engine :$enginePort /api/health: OK"
 
     # ---- 8. ai-plugin expected exclusion (no key on CI runner) --------------
     $manifestPath = Join-Path $dataDir "plugins-manifest.json"
