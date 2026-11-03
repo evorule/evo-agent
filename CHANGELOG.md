@@ -38,6 +38,8 @@
 
 ### 🐛 修复
 
+- **知识候选/巩固提取截断修复兜底（静默丢账→确定性挽回）** — 会话沉淀两处 LLM 输出解析点（知识候选提取、候选巩固合并）此前直接 `serde_json::from_str`，输出超 `max_tokens` 半途截断（值字符串中途 EOF）时整包解析失败、候选静默丢失。修复后先经确定性截断修复兜底再判失败：截断修复与 `max_tokens` 自适应从容错正本仓提取为公共模块 `agent::json_repair`（`repair_truncated_json`/`adaptive_max_tokens` 随迁，新增 `from_str_with_repair` 解析+兜底统一入口，摘要路径改引共享件零行为变化）；截断修复本身增强——安全截断点由「仅回退最后一个」扩展为「从最后向前逐个回退」，末元素中途截断且元素内部含逗号时不再保留无法解析的残缺尾元素、保住已完整的前缀元素。`SedimentResult` 新增 `json_parse_failures` 计数：修复兜底后仍解析失败的最终丢账留痕（与 warn 日志对账），修复生效不计数
+
 - **`grep_files` 巨行回灌收紧** — 单行超过 64 KB 的命中（如 data/snapshots 类单行 MB 级 JSON）不再整行进 `preview`，改回匹配点前后各 200 chars 窗口（头尾省略号 + `LINE_ELIDED` 标记 + `lineBytes`/`fileBytes` 伴生字段），定位信息（`line`/`col`/`endCol`）完整保留；巨匹配自身超界时头尾各取窗口半径、中段 `MATCH_ELIDED` 省略，保证输出有界。正常行输出零变化（无新增字段）
 
 - **`llm.executor_url` 配置键生效** — 该键在 `LlmConfig` 上有字段、字段文档有承诺，但 toml 合并清单缺项且 `${ENV:VAR}` 占位符解析未覆盖该字段，配置文件声明被静默忽略、执行体端点恒为缺省值。修复后字段文档声明的三级回落契约完整生效：配置文件显式值 > env `EVORULE_LLM_EXECUTOR_URL`（配置未声明时经缺省函数回落）> 缺省本机执行体端点；`${ENV:VAR}` 占位符同步支持（严格模式 env 未设置时装载报错，宽松模式空串降级）；装载期新增 `http://`/`https://` 前缀校验（严格与宽松同口径，与 `evorule.base_url` 同族），格式错误在启动时拦截而非运行期重试空转。新增 llm 段全字段 round-trip 测试锁：后续给 `LlmConfig` 增字段时若遗漏合并清单，测试即红，防同类「字段存在但配置值被静默忽略」缺陷复发
