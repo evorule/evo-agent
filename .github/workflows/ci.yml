@@ -169,54 +169,58 @@ jobs:
           ./verify.ps1 -Phase test-run
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Direct-bash test-run (2026-11-03): the per-binary split above kept
+      # the pwsh -> verify.ps1 invocation for the linux steps, and the job
+      # kept hanging in pull_request context (3/3 across cache pool states)
+      # while a controlled probe running the exact same suite on the same
+      # merge ref, same warm pool, as a native bash step with a timeout
+      # wrapper completed green every time (11-12 min). These steps now use
+      # that exact proven shape; verify.ps1 remains canonical for windows
+      # and for local one-shot runs.
       - name: verify 3/5a test-run lib
         if: matrix.tests && runner.os == 'Linux'
-        shell: pwsh
+        shell: bash
         run: |
-          $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h /
-          ./verify.ps1 -Phase test-run -CargoArgs --lib
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Host "== after =="; free -m; df -h /
+          echo "== before =="; free -m; df -h /
+          timeout --kill-after=30 2100 cargo test --lib -j2 2>&1
+          RC=$?
+          echo "== after == exit=$RC"; free -m; df -h /
+          exit $RC
 
       - name: verify 3/5b test-run integration_test
         if: matrix.tests && runner.os == 'Linux'
-        shell: pwsh
+        shell: bash
         run: |
-          $env:CARGO_BUILD_JOBS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs --test integration_test
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          timeout --kill-after=30 2100 cargo test --test integration_test -j2 2>&1
+          exit $?
 
       - name: verify 3/5c test-run io_contract_e2e
         if: matrix.tests && runner.os == 'Linux'
-        shell: pwsh
+        shell: bash
         run: |
-          $env:CARGO_BUILD_JOBS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs --test io_contract_e2e
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          timeout --kill-after=30 2100 cargo test --test io_contract_e2e -j2 2>&1
+          exit $?
 
       - name: verify 3/5d test-run mcp_gate_atomicity
         if: matrix.tests && runner.os == 'Linux'
-        shell: pwsh
+        shell: bash
         run: |
-          $env:CARGO_BUILD_JOBS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs --test mcp_gate_atomicity
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          timeout --kill-after=30 2100 cargo test --test mcp_gate_atomicity -j2 2>&1
+          exit $?
 
       - name: verify 3/5e test-run o511_stack_repro
         if: matrix.tests && runner.os == 'Linux'
-        shell: pwsh
+        shell: bash
         run: |
-          $env:CARGO_BUILD_JOBS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs --test o511_stack_repro
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          timeout --kill-after=30 2100 cargo test --test o511_stack_repro -j2 2>&1
+          exit $?
 
       - name: verify 3/5f test-run serve_mcp_smoke
         if: matrix.tests && runner.os == 'Linux'
-        shell: pwsh
+        shell: bash
         run: |
-          $env:CARGO_BUILD_JOBS = '2'
-          ./verify.ps1 -Phase test-run -CargoArgs --test serve_mcp_smoke
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          timeout --kill-after=30 2100 cargo test --test serve_mcp_smoke -j2 2>&1
+          exit $?
 
       - name: verify 4/5 secret scan
         shell: pwsh
