@@ -358,14 +358,53 @@ fn spawn_engine(
     std::fs::create_dir_all(&paths.engine_data_dir).map_err(|e| e.to_string())?;
     let engine_log = open_append(&paths.logs_dir.join("engine.log"))?;
     let engine_log_err = open_append(&paths.logs_dir.join("engine.log"))?;
+    let mut engine_cmd = build_engine_command(
+        paths,
+        engine_port,
+        ctx.engine_token,
+        ctx.service_token,
+        ctx.engine_extra_args,
+        plugins_manifest,
+    );
+    engine_cmd
+        .stdout(Stdio::from(engine_log))
+        .stderr(Stdio::from(engine_log_err))
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    let engine = engine_cmd
+        .spawn()
+        .map_err(|e| format!("spawn evorule-server: {e}"))?;
+    if !ctx.self_assigned {
+        ctx.job.assign_pid(engine.id());
+    }
+    Ok(engine)
+}
+
+/// engine 命令构造（与拉起分离，供契约测试检视参数面/env 面；与
+/// build_serve_command 同款纪律——鉴权令牌只经 env 载体传递，命令行对本机
+/// 所有进程可读，令牌上账面即暴露）。
+///
+/// 伴跑上行武装门（B-130 W1/W2）：data_dir 下 service_registry.json 在位
+/// = armed——传 `--service-registry` 挂服务注册表，并注入伴跑上行 env 三件
+/// （URL 指引擎自身端口过统一鉴权通道 / KEY 复用 engine_token / DATASET 固定
+/// governance 数据集）；缺位 = 缺省关（B-127 D5 语义保留），不注册不注入，
+/// 上行自然无落点。registry 文件解析失败由 engine 侧 fail-fast 拒启。
+fn build_engine_command(
+    paths: &ResolvedPaths,
+    engine_port: u16,
+    engine_token: &str,
+    service_token: &str,
+    engine_extra_args: &[String],
+    plugins_manifest: Option<&Path>,
+) -> Command {
+    let engine_wal = paths.data_dir.join("engine-wal");
     let mut engine_cmd = Command::new(&paths.evorule_server_exe);
     // 安全令牌走环境变量注入(引擎支持 EVORULE_AUTH_TOKEN),不经进程命令行——
     // 命令行参数对本机所有进程可读,令牌上账面即暴露。
     engine_cmd
-        .env("EVORULE_AUTH_TOKEN", ctx.engine_token)
+        .env("EVORULE_AUTH_TOKEN", engine_token)
         // service 身份令牌：server 侧登记为受信服务管道 token（受保护域
         // stable.llm/stable.system 可写）；同为 env 注入不走命令行
-        .env("EVORULE_SERVICE_TOKEN", ctx.service_token)
+        .env("EVORULE_SERVICE_TOKEN", service_token)
         .args([
             "--profile",
             "development",
@@ -387,23 +426,26 @@ fn spawn_engine(
         .arg(paths.engine_data_dir.join("memory"))
         .args(["--wal-dir"])
         .arg(&engine_wal)
-        .args(ctx.engine_extra_args);
+        .args(engine_extra_args);
     // 外部插件包清单（可选）：runtime 生成副本（装机绝对路径运行期才知道），
     // 引擎装载后其 plugin.json 服务派生进对账面（codegraph 十项随发版面）
     if let Some(m) = plugins_manifest {
         engine_cmd.args(["--plugins"]).arg(m);
     }
-    engine_cmd
-        .stdout(Stdio::from(engine_log))
-        .stderr(Stdio::from(engine_log_err))
-        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    let engine = engine_cmd
-        .spawn()
-        .map_err(|e| format!("spawn evorule-server: {e}"))?;
-    if !ctx.self_assigned {
-        ctx.job.assign_pid(engine.id());
+    // 伴跑上行武装门：registry 缺位 = 缺省关（B-127 D5 语义保留）
+    let registry = paths.data_dir.join("service_registry.json");
+    if registry.is_file() {
+        engine_cmd
+            .arg("--service-registry")
+            .arg(&registry)
+            .env(
+                "EVORULE_COMPANION_UPLINK_URL",
+                format!("http://127.0.0.1:{engine_port}"),
+            )
+            .env("EVORULE_COMPANION_UPLINK_KEY", engine_token)
+            .env("EVORULE_COMPANION_UPLINK_DATASET", "companion-governance");
     }
-    Ok(engine)
+    engine_cmd
 }
 
 /// codegraph-bridge sidecar 拉起（可选组件，发版面验收机制档 §4 闸 3）：
@@ -1355,6 +1397,77 @@ mod tests {
         assert_eq!(
             env_val("EVORULE_LLM_EXECUTOR_TOKEN").as_deref(),
             Some("exec-token-secret")
+        );
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    /// engine spawn 契约（B-130 W1/W2 伴跑上行武装门）：registry 在位=armed
+    /// （`--service-registry` 挂账 + 伴跑上行 env 三件；KEY 复用 engine_token
+    /// 且不经命令行）；缺位=缺省关（B-127 D5 语义），零注入。
+    #[test]
+    fn engine_spawn_registry_gate_armed_vs_disarmed() {
+        let paths = scratch_paths("engine-registry");
+        let build = |paths: &ResolvedPaths| {
+            build_engine_command(
+                paths,
+                18081,
+                "engine-token-secret",
+                "svc-token-secret",
+                &[],
+                None,
+            )
+        };
+        let args_of = |cmd: &Command| -> Vec<String> {
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let env_val = |cmd: &Command, k: &str| -> Option<String> {
+            cmd.get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(k))
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+        // ① registry 缺位 = disarmed：无 --service-registry、无上行 env、令牌不上命令行
+        let cmd = build(&paths);
+        let args = args_of(&cmd);
+        assert!(!args.iter().any(|a| a == "--service-registry"), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.contains("token-secret")),
+            "token must never travel on the command line: {args:?}"
+        );
+        assert!(env_val(&cmd, "EVORULE_COMPANION_UPLINK_URL").is_none());
+        assert!(env_val(&cmd, "EVORULE_COMPANION_UPLINK_KEY").is_none());
+        assert!(env_val(&cmd, "EVORULE_COMPANION_UPLINK_DATASET").is_none());
+        // ② registry 在位 = armed：挂账 + env 三件
+        std::fs::write(
+            paths.data_dir.join("service_registry.json"),
+            r#"{"version":1,"services":[]}"#,
+        )
+        .unwrap();
+        let cmd = build(&paths);
+        let args = args_of(&cmd);
+        let ri = args
+            .iter()
+            .position(|a| a == "--service-registry")
+            .expect("armed must carry --service-registry");
+        assert!(args[ri + 1].ends_with("service_registry.json"));
+        assert_eq!(
+            env_val(&cmd, "EVORULE_COMPANION_UPLINK_URL").as_deref(),
+            Some("http://127.0.0.1:18081")
+        );
+        assert_eq!(
+            env_val(&cmd, "EVORULE_COMPANION_UPLINK_KEY").as_deref(),
+            Some("engine-token-secret")
+        );
+        assert_eq!(
+            env_val(&cmd, "EVORULE_COMPANION_UPLINK_DATASET").as_deref(),
+            Some("companion-governance")
+        );
+        // KEY 不上命令行（env 载体纪律）
+        assert!(
+            !args.iter().any(|a| a.contains("token-secret")),
+            "token must never travel on the command line: {args:?}"
         );
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }
