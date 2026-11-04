@@ -294,6 +294,8 @@ impl EventExtractor {
                \"tags\": [\"important\"]\n\
              }}\n\n\
              可用的 event_type kind: Conversation, Relationship, Milestone, Habit, Health, EmotionEvent, Location, Item, IOTrigger, SystemObservation, Custom\n\
+             kind 必须严格使用上述 11 值之一(大小写敏感,禁止自造):\n\
+             反例:对话中出现系统/工具内容的结构名或请求名(如 xxxRequest/xxxCheck)时,一律提取为 {{\"kind\": \"SystemObservation\"}} 并把原文名记入 content.summary,禁止用作 kind\n\
              subtype 必须严格使用下表枚举值之一(大小写敏感,禁止自造):\n\
              - Conversation: FirstInteraction|Apology|Confession|Farewell|Conflict|Reconciliation|Routine\n\
              - Relationship: Met|BecameClose|DriftedApart|Reconnected|Lost\n\
@@ -355,6 +357,20 @@ impl EventExtractor {
         let json_str = extract_json_from_text(&response.content);
         let extracted: ExtractedEvent = serde_json::from_str(&json_str)
             .map_err(|e| format!("parse extracted event: {} (raw: {})", e, response.content))?;
+
+        // 未知 kind 兜底观测：解析已成功（事件不再丢失），但事件类型为兜底
+        // 形态时 warn 留痕——带原 JSON 摘录（截 512 字符）供对账与审计，
+        // 防静默无账（与 sediment 聚合面的 unknown_kind_events 计数对账）
+        if let EventType::Custom(s) = &extracted.event_type {
+            if let Some(raw_kind) = s.strip_prefix("unrecognized_kind:") {
+                let excerpt: String = json_str.chars().take(512).collect();
+                tracing::warn!(
+                    raw_kind = %raw_kind,
+                    raw_json = %excerpt,
+                    "event extraction: unknown kind salvaged as Custom"
+                );
+            }
+        }
 
         // 如果是 Custom("none"),表示无事件
         if let EventType::Custom(ref s) = extracted.event_type {
@@ -554,6 +570,26 @@ mod tests {
         assert!((event.confidence - 0.8).abs() < 0.01);
         assert!(event.emotion.is_some());
         assert!(!event.tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_extract_unknown_kind_salvaged_not_lost() {
+        // 模型自造 kind（实录形态）不再触发解析失败丢事件：解析即成功，
+        // 事件以 Custom 兜底形态存活（raw 字面保留可审计）
+        let mock_response = r#"{"event_type":{"kind":"ContextMechanismSelfCheckRequest"},"entities":[],"content":{"summary":"上下文自检"},"emotion":null,"tags":[]}"#;
+        let extractor = EventExtractor::with_defaults(LlmHandler::mock(mock_response));
+
+        let result = extractor
+            .extract_from_conversation("记住这件事,系统做了上下文自检", None, "E042", 1000)
+            .await
+            .unwrap();
+
+        let event = result.expect("salvaged event must survive extraction");
+        assert_eq!(event.event_id, "E042");
+        assert_eq!(
+            event.event_type,
+            EventType::Custom("unrecognized_kind:ContextMechanismSelfCheckRequest".to_string())
+        );
     }
 
     #[tokio::test]

@@ -248,7 +248,9 @@ impl MemoryEvent {
 /// - 枚举值是开放集合,`Custom(String)` 保留扩展
 /// - 不与 evorule 的 ControlFlowType/IOType 重叠
 /// - serde 表示:`{"kind": "Conversation", "subtype": "Farewell"}`
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// - 反序列化手写实现：未知字符串 kind 确定性兜底为
+///   `Custom("unrecognized_kind:<raw>")`（raw 字面保留可审计）；Serialize 零变化
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "kind", content = "subtype")]
 pub enum EventType {
     /// 对话事件
@@ -273,6 +275,79 @@ pub enum EventType {
     SystemObservation,
     /// 自定义(业务扩展)
     Custom(String),
+}
+
+/// 11 个合法 kind 名（与变体一一对应；提取提示词面 kind 清单同源）
+const LEGAL_EVENT_KINDS: &[&str] = &[
+    "Conversation",
+    "Relationship",
+    "Milestone",
+    "Habit",
+    "Health",
+    "EmotionEvent",
+    "Location",
+    "Item",
+    "IOTrigger",
+    "SystemObservation",
+    "Custom",
+];
+
+/// 严格解析孪生（derive 语义保持器）：合法 kind 的解析行为与 derive
+/// Deserialize 完全一致——未知 kind 兜底只发生在 kind 名层面，
+/// 合法 kind 上的畸形 subtype 仍报错不兜底。
+#[derive(Deserialize)]
+#[serde(tag = "kind", content = "subtype")]
+enum EventTypeStrict {
+    Conversation(ConversationSubtype),
+    Relationship(RelationshipSubtype),
+    Milestone(MilestoneSubtype),
+    Habit(HabitSubtype),
+    Health(HealthSubtype),
+    EmotionEvent,
+    Location(LocationSubtype),
+    Item(ItemSubtype),
+    IOTrigger(IOTriggerSubtype),
+    SystemObservation,
+    Custom(String),
+}
+
+impl From<EventTypeStrict> for EventType {
+    fn from(v: EventTypeStrict) -> Self {
+        match v {
+            EventTypeStrict::Conversation(s) => EventType::Conversation(s),
+            EventTypeStrict::Relationship(s) => EventType::Relationship(s),
+            EventTypeStrict::Milestone(s) => EventType::Milestone(s),
+            EventTypeStrict::Habit(s) => EventType::Habit(s),
+            EventTypeStrict::Health(s) => EventType::Health(s),
+            EventTypeStrict::EmotionEvent => EventType::EmotionEvent,
+            EventTypeStrict::Location(s) => EventType::Location(s),
+            EventTypeStrict::Item(s) => EventType::Item(s),
+            EventTypeStrict::IOTrigger(s) => EventType::IOTrigger(s),
+            EventTypeStrict::SystemObservation => EventType::SystemObservation,
+            EventTypeStrict::Custom(s) => EventType::Custom(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EventType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        // 未知字符串 kind → 确定性兜底为 Custom（raw 字面保留可审计，同一
+        // 输入恒得同一串；不做任何猜测归一——不按命名模式映射到既有变体）。
+        // kind 非字符串 / 缺失 / 非 object → 落入严格解析报错（类型错是
+        // 请求面问题，不兜底）。
+        if let Some(kind) = value.get("kind").and_then(|k| k.as_str()) {
+            if !LEGAL_EVENT_KINDS.contains(&kind) {
+                return Ok(EventType::Custom(format!("unrecognized_kind:{kind}")));
+            }
+        }
+        EventTypeStrict::deserialize(value)
+            .map(EventType::from)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl EventType {
@@ -634,6 +709,53 @@ mod tests {
         );
         assert_eq!(EventType::SystemObservation.kind_str(), "SystemObservation");
         assert_eq!(EventType::Custom("x".into()).kind_str(), "Custom");
+    }
+
+    // ---- 未知 kind 兜底（确定性 Custom salvage；不做任何猜测归一）----
+
+    #[test]
+    fn test_event_type_unknown_kind_salvaged_as_custom() {
+        // 模型自造枚举名（实录形态）→ 解析即成功不再丢事件；raw 字面保留
+        // 在 Custom 串内可审计，kind_str() 走 Custom 分支
+        let json = r#"{"kind":"ContextMechanismSelfCheckRequest"}"#;
+        let de: EventType = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            de,
+            EventType::Custom("unrecognized_kind:ContextMechanismSelfCheckRequest".to_string())
+        );
+        assert_eq!(de.kind_str(), "Custom");
+    }
+
+    #[test]
+    fn test_event_type_unknown_kind_snake_case_salvaged() {
+        // 实录主形态：蛇形命名自造 kind；subtype 不强行并入 Custom 串
+        // （防语义混淆，原始内容由 warn 摘录承载）
+        let json = r#"{"kind":"context_mechanism_self_check_requested","subtype":"ctx"}"#;
+        let de: EventType = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            de,
+            EventType::Custom("unrecognized_kind:context_mechanism_self_check_requested".to_string())
+        );
+    }
+
+    #[test]
+    fn test_event_type_non_string_kind_still_errors() {
+        // kind 非字符串=类型错（请求面问题），维持报错不兜底
+        assert!(serde_json::from_str::<EventType>(r#"{"kind":42}"#).is_err());
+        assert!(serde_json::from_str::<EventType>(r#"{"kind":["x"]}"#).is_err());
+        // 无 kind 字段维持报错
+        assert!(serde_json::from_str::<EventType>(r#"{"subtype":"Farewell"}"#).is_err());
+        // 非 object 维持报错
+        assert!(serde_json::from_str::<EventType>(r#""Conversation""#).is_err());
+    }
+
+    #[test]
+    fn test_event_type_legal_kind_malformed_subtype_still_errors() {
+        // 兜底面=仅未知 kind 名；合法 kind 上的畸形 subtype 仍报错
+        assert!(serde_json::from_str::<EventType>(
+            r#"{"kind":"Conversation","subtype":"BogusSubtype"}"#
+        )
+        .is_err());
     }
 
     #[test]
