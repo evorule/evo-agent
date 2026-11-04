@@ -6,7 +6,8 @@
 // - evorule-server：`--profile development` 跳过生产五条件门（缺省 production
 //   漏配即拒启）；`--addr 127.0.0.1:P`；`--auth-token`；`--wal-dir` 配齐后
 //   会话跨重启存活。
-// - evo-agent serve：`serve --host --port --auth-token --workdir`；config 从
+// - evo-agent serve：`serve --host --port --workdir`；鉴权令牌经 env 注入
+//   （EVO_AGENT_AUTH__ENABLED / EVO_AGENT_AUTH__TOKENS，不经命令行）；config 从
 //   `{workdir}/evo-agent.toml` 读；agents.dir 支持绝对路径（agents 目录为空
 //   即拒起，故壳生成的 toml 必须写绝对路径）；工作台静态资源硬编码相对
 //   workdir（`{workdir}/web/dist`），以 junction 指向产品资源根。
@@ -655,11 +656,48 @@ fn spawn_serve(
     let paths = ctx.paths;
     let serve_log = open_append(&paths.logs_dir.join("serve.log"))?;
     let serve_log_err = open_append(&paths.logs_dir.join("serve.log"))?;
-    let mut serve_cmd = Command::new(&paths.evo_agent_exe);
+    let mut serve_cmd = build_serve_command(
+        paths,
+        serve_port,
+        engine_port,
+        ai_plugin_port,
+        ctx.serve_token,
+        ctx.engine_token,
+        ctx.executor_token,
+        ctx.service_token,
+    );
+    serve_cmd
+        .stdout(Stdio::from(serve_log))
+        .stderr(Stdio::from(serve_log_err))
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    let serve = serve_cmd
+        .spawn()
+        .map_err(|e| format!("spawn evo-agent serve: {e}"))?;
+    if !ctx.self_assigned {
+        ctx.job.assign_pid(serve.id());
+    }
+    Ok(serve)
+}
+
+/// serve 命令构造（与拉起分离，供契约测试检视参数面/env 面）：鉴权令牌
+/// 只经 env 载体传递——命令行对本机所有进程可读，令牌上账面即暴露；
+/// serve 侧固化进 auth_config 后即清除自身 env 副本（引擎令牌同款纪律）。
+#[allow(clippy::too_many_arguments)] // 令牌四枚+端口三枚均为编排必需，结构体化反增噪音
+fn build_serve_command(
+    paths: &ResolvedPaths,
+    serve_port: u16,
+    engine_port: u16,
+    ai_plugin_port: Option<u16>,
+    serve_token: &str,
+    engine_token: &str,
+    executor_token: &str,
+    service_token: &str,
+) -> Command {
     // 38 号方案 X:agent 能力边界根(用户工作文件夹)与编排 workdir(runtime)
     // 解耦——用户文件夹缺省自动创建,用户在向导/设置里改过则以偏好为准
     let agent_root = workspace_pref(&paths.app_config_dir).unwrap_or_else(default_agent_root);
     let _ = std::fs::create_dir_all(&agent_root);
+    let mut serve_cmd = Command::new(&paths.evo_agent_exe);
     serve_cmd
         .args([
             "serve",
@@ -667,8 +705,6 @@ fn spawn_serve(
             "127.0.0.1",
             "--port",
             &serve_port.to_string(),
-            "--auth-token",
-            ctx.serve_token,
             "--workdir",
         ])
         .arg(&paths.runtime_dir)
@@ -683,18 +719,19 @@ fn spawn_serve(
             "EVO_AGENT_EVORULE__BASE_URL",
             format!("http://127.0.0.1:{engine_port}"),
         )
-        .env("EVO_AGENT_EVORULE__API_KEY", ctx.engine_token)
-        .env("EVORULE_AUTH_TOKEN", ctx.engine_token)
+        .env("EVO_AGENT_EVORULE__API_KEY", engine_token)
+        .env("EVORULE_AUTH_TOKEN", engine_token)
         // service 身份令牌：serve 的受信内部通道（sediment→stable.llm 等）
         // 以此写 evorule；serve 启动期捕获进 ApiCore 后即从 env 面清除，
         // python_exec/shell_exec 等工作区子进程不可见
-        .env("EVORULE_SERVICE_TOKEN", ctx.service_token)
-        .stdout(Stdio::from(serve_log))
-        .stderr(Stdio::from(serve_log_err))
-        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        .env("EVORULE_SERVICE_TOKEN", service_token)
+        // serve 鉴权令牌：经 env 载体传递，命令行零出现（serve 侧读入
+        // auth_config 后即从 env 面清除，子进程不可见）
+        .env("EVO_AGENT_AUTH__ENABLED", "true")
+        .env("EVO_AGENT_AUTH__TOKENS", serve_token);
     // 执行体调用方令牌恒注入（无执行体时无害闲置）；端点仅在执行体在位时
     // 覆盖缺省 9130——serve 侧 env 优先链已就绪
-    serve_cmd.env("EVORULE_LLM_EXECUTOR_TOKEN", ctx.executor_token);
+    serve_cmd.env("EVORULE_LLM_EXECUTOR_TOKEN", executor_token);
     if let Some(p) = ai_plugin_port {
         serve_cmd.env(
             "EVORULE_LLM_EXECUTOR_URL",
@@ -707,13 +744,7 @@ fn spawn_serve(
         // 在调用时可见（visible-failure semantics，smoke 第 8 步预期口径）。
         serve_cmd.arg("--no-preflight");
     }
-    let serve = serve_cmd
-        .spawn()
-        .map_err(|e| format!("spawn evo-agent serve: {e}"))?;
-    if !ctx.self_assigned {
-        ctx.job.assign_pid(serve.id());
-    }
-    Ok(serve)
+    serve_cmd
 }
 
 /// 已配置 key 的 provider 合并视图（内置目录+自定义；自定义清单损坏=留痕
@@ -1184,6 +1215,59 @@ mod tests {
         assert!(v.get("llm_api_key").is_none());
         assert!(v.get("EVORULE_AI_PLUGIN_CALLER_TOKEN").is_none());
         assert!(v.get("EVORULE_AI_PLUGIN_LLM_API_KEY").is_none());
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    /// serve spawn 契约：鉴权令牌只经 env 载体传递（serve 侧固化后自清），
+    /// 命令行零出现——命令行对本机所有进程可读，令牌上账面即暴露。
+    #[test]
+    fn serve_spawn_carries_auth_token_via_env_not_command_line() {
+        let paths = scratch_paths("serve-env");
+        // 重定向 agent 能力边界根到临时目录（workspace_pref 命中偏好文件，
+        // 免测试触碰真实 Documents 缺省根）
+        std::fs::write(
+            paths.app_config_dir.join("agent-workspace.txt"),
+            paths.data_dir.join("ws-root").to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        let cmd = build_serve_command(
+            &paths,
+            18441,
+            18442,
+            Some(19131),
+            "serve-token-secret",
+            "engine-token-secret",
+            "exec-token-secret",
+            "svc-token-secret",
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a.contains("token-secret")),
+            "token must never travel on the command line: {args:?}"
+        );
+        let env_val = |k: &str| -> Option<String> {
+            cmd.get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(k))
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(env_val("EVO_AGENT_AUTH__ENABLED").as_deref(), Some("true"));
+        assert_eq!(
+            env_val("EVO_AGENT_AUTH__TOKENS").as_deref(),
+            Some("serve-token-secret")
+        );
+        // 既有 env 载体不回归（service 身份令牌/执行体调用方令牌）
+        assert_eq!(
+            env_val("EVORULE_SERVICE_TOKEN").as_deref(),
+            Some("svc-token-secret")
+        );
+        assert_eq!(
+            env_val("EVORULE_LLM_EXECUTOR_TOKEN").as_deref(),
+            Some("exec-token-secret")
+        );
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 

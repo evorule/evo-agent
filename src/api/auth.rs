@@ -275,6 +275,18 @@ pub fn decide_auth_posture(auth_enabled: bool, explicit_no_auth: bool, host: &st
     }
 }
 
+/// env 载体的鉴权配置固化后清除（serve 启动路径专用）。
+///
+/// `EVO_AGENT_AUTH__TOKENS` / `EVO_AGENT_AUTH__ENABLED` 在配置装载期被
+/// 消费进 [`AuthConfig`]（env 优先级高于配置文件），serve 侧鉴权配置固化
+/// （auth_config 构建）后进程环境里的 token 副本即无消费方——清除它，使
+/// serve 期内 spawn 的一切工作区子进程（shell_exec/python_exec/MCP/docker）
+/// 不经继承 env 见到 token。与 `EVORULE_SERVICE_TOKEN` 的捕获即清纪律同款。
+pub fn scrub_auth_env() {
+    std::env::remove_var("EVO_AGENT_AUTH__TOKENS");
+    std::env::remove_var("EVO_AGENT_AUTH__ENABLED");
+}
+
 /// 从请求中提取 Bearer token(仅 Authorization 头)
 ///
 /// 长效 token 只允许走头;query 不再是 token 通道(见 [`extract_ticket`])。

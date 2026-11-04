@@ -36,6 +36,10 @@
 
 ## [Unreleased]
 
+### 🔄 变更
+
+- **桌面壳向 serve 传递鉴权令牌改经环境变量（收敛命令行暴露面）** — 桌面壳此前经命令行参数 `--auth-token` 向 serve 传递鉴权令牌，而本机所有进程可读任意进程的命令行，令牌上命令行即等于本机可见。现改为环境变量载体（`EVO_AGENT_AUTH__ENABLED` / `EVO_AGENT_AUTH__TOKENS`）注入，serve 侧鉴权配置固化后立即清除自身环境变量副本（与 service 身份令牌的捕获即清纪律同款），serve 期内启动的一切工作区子进程（shell_exec/python_exec/MCP 等）不再经继承环境变量见到令牌。CLI `--auth-token` 参数保留不变（手动/CLI 用户面）；工作台前端取令牌路径（webview 初始化脚本注入）零变化
+
 ### 🐛 修复
 
 - **事件提取未知 `kind` 确定性兜底（丢事件 → Custom 形态存活 + 计数对账）** — 事件提取的 LLM 输出中 `event_type.kind` 此前严格限定 11 个合法枚举名，模型自造枚举名（如把系统/工具内容的结构名/请求名当作 kind）时 serde 整包拒收、该事件静默丢失。修复后 `EventType` 反序列化改手写实现：未知字符串 `kind` 确定性兜底为 `Custom("unrecognized_kind:<raw>")`（raw 字面保留可审计，同一输入恒得同一串；不做任何猜测归一——不按命名模式映射到既有变体）；`kind` 非字符串或缺字段维持报错不兜底（类型错是请求面问题）。合法 kind 的解析行为零变化（严格解析孪生保持 derive 语义），`Serialize`/`kind_str()` 零变化，兜底事件照常回放。提取提示词 `kind` 面同步加固：与 `subtype` 同强度的「大小写敏感,禁止自造」禁令 + 反例 few-shot（结构名/请求名一律提取为 `SystemObservation` 并把原文名记入 `content.summary`）。`SedimentResult` 新增 `unknown_kind_events` 计数：兜底事件存活留痕（提取面 warn 带原 JSON 512 字符摘录，聚合面计数对账），「形态异常但成功」不再静默无账
