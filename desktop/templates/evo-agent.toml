@@ -13,12 +13,11 @@ model = "MiniMax-M3"
 # 单回输出上限:推理模型(M3)的推理计入输出配额,4096 硬帽会被纯推理吃满
 # 导致回合被截断误判完成——长回合 agentic 场景须放开(2026-10-25)
 max_tokens = 32768
-# 预算基数口径：记忆区预算默认以输入侧为基数（input = 总窗扣除 25% 响应预留 = 750000；
-# 默认配方记忆区预算 = 750000 × 0.25 = 187500 token）。如需沿用旧总窗口径（记忆区 51200），
-# 在 definition 装配配方记忆槽显式声明 base = "total_window"（向后兼容保留）
-# MiniMax-M3 满窗 1M（保障 512K）：按用户裁定取满窗——M3 费用无负担，跑时
-# 不多开窗口/并发会话，防本机内存吃紧被撑爆
-context_window_tokens = 1000000  # M3 满窗 1M（用户裁定 2026-10-16）；换模型须同步修改
+# 预算基数口径：记忆区预算默认以输入侧为基数（input = 总窗扣除 25% 响应预留；
+# 如默认 general 定义 1M 窗则 input=750000、默认配方记忆区预算=750000×0.25=187500 token）。
+# 总窗口径由 agent definition（agents/*.json 的 context_window_tokens）单源声明；
+# 如需沿用旧总窗口径（记忆区 51200），在 definition 装配配方记忆槽显式声明
+# base = "total_window"（向后兼容保留）
 api_base = "https://api.minimaxi.com/v1/text/chatcompletion_v2"
 
 [evorule]
