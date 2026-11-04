@@ -2601,8 +2601,11 @@ service_tools = ["config_persist", "rule_sandbox"]
         // def.tools 白名单过滤出的 per-agent 面必须继承 docker-exec 后端
         // (register_entry_from 经 Arc 克隆共享执行器实例)。判别器与 docker
         // 环境解耦:良性命令若仍走宿主后端会本机执行;走容器后端则宿主侧
-        // 程序=docker CLI——docker 缺席时以 spawn 失败形态暴露,在位时以
-        // backend 执行事实暴露。两臂均证明后端已随过滤面继承。
+        // 程序=docker CLI——docker 缺席时以 spawn 失败形态暴露,在位且
+        // daemon 正常时以 backend 执行事实暴露,在位但 daemon 挂起时以
+        // 工具级超时形态暴露(能挂起在 docker 上恰说明宿主侧程序是
+        // docker CLI;托管 runner 的 Docker Desktop 服务慢启/半挂即此
+        // 形态)。三臂均证明后端已随过滤面继承。
         let mut union = ToolHandler::new();
         union.register_static(
             "shell_exec",
@@ -2630,8 +2633,9 @@ service_tools = ["config_persist", "rule_sandbox"]
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
-                    msg.contains("failed to spawn 'docker'"),
-                    "host-side program must be the docker CLI (backend inherited), got: {msg}"
+                    msg.contains("failed to spawn 'docker'") || msg.contains("timed out after"),
+                    "host-side program must be the docker CLI (backend inherited — spawn \
+                     failure or daemon-hang tool timeout), got: {msg}"
                 );
             }
         }
