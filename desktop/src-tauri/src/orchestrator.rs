@@ -164,6 +164,84 @@ fn ensure_junction(link: &Path, target: &Path) -> Result<(), String> {
     }
 }
 
+// ===== 部署侧扩展区（部署副本所有权保护）=====
+//
+// 部署副本（装机 resources\evo-agent\evo-agent.toml）尾部可携带用户追加的
+// 扩展内容。规范：扩展块以下方标记行起（整行 trim 后全等），自标记行至文件
+// 末尾整体归部署侧；块外严格按发版模板（再生链唯一落点=仓内模板，本就
+// 不写部署面）。安装/更新链按模板覆盖部署副本，扩展块两段保护：
+//   ① 覆盖前 stash：update.rs 在 NSIS 启动前把标记块抄入壳配置目录
+//     （deploy-extensions.bak，装机会外幸存）；
+//   ② 启动期 merge：prepare_workspace 在生成 runtime 配置前把 stash 幂等
+//     合回部署副本（副本已带标记行 = 已落，不重复追加）——in-app 更新与
+//     后续手动重装两条覆盖路径都被 startup merge 兜住。
+// 标记块含注释行/表格段均原样搬运，不做语义解析。
+
+/// 部署侧扩展区标记行（部署副本 toml 尾部；扩展块自本行起至文件末尾）。
+pub(crate) const DEPLOY_MARKER: &str = "# ===== 部署侧扩展区（更新链原样保留，勿改模板段） =====";
+
+/// 提取部署副本尾部的部署侧扩展块（标记行起至文件末尾，字节级原样——
+/// 含行尾形态与注释行）。None = 无标记行（全新模板形态）。
+fn extract_deploy_marker(content: &str) -> Option<&str> {
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        if line.trim() == DEPLOY_MARKER {
+            return Some(&content[offset..]);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// 覆盖前 stash 部署侧扩展块到壳配置目录（返回 true=已 stash）。
+/// 副本缺失/无标记块/写失败均为显式 Result，由调用方按自身日志纪律留痕。
+pub(crate) fn stash_deploy_extensions(
+    installed_toml: &Path,
+    stash_path: &Path,
+) -> Result<bool, String> {
+    let content = match std::fs::read_to_string(installed_toml) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    let Some(block) = extract_deploy_marker(&content) else {
+        return Ok(false);
+    };
+    std::fs::write(stash_path, block).map_err(|e| format!("write stash: {e}"))?;
+    Ok(true)
+}
+
+/// 启动期把 stash 的部署侧扩展块幂等合回部署副本（返回 true=本次合入）。
+/// 副本已带标记行 = 不重复追加；副本缺失（全新机）/stash 缺失/空 = 跳过。
+pub(crate) fn merge_deploy_extensions(
+    installed_toml: &Path,
+    stash_path: &Path,
+) -> Result<bool, String> {
+    let Ok(stash) = std::fs::read_to_string(stash_path) else {
+        return Ok(false);
+    };
+    if stash.trim().is_empty() {
+        return Ok(false);
+    }
+    let content = match std::fs::read_to_string(installed_toml) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    if content
+        .split_inclusive('\n')
+        .any(|l| l.trim() == DEPLOY_MARKER)
+    {
+        return Ok(false);
+    }
+    let mut out = content;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&stash);
+    std::fs::write(installed_toml, &out).map_err(|e| format!("write deployed toml: {e}"))?;
+    Ok(true)
+}
+
 /// 壳生成的 serve 工作配置。
 ///
 /// 基座 = 用户 evo-agent.toml 透传（查找序：产品资源根 → 壳配置目录；LLM key
@@ -250,6 +328,16 @@ pub fn prepare_workspace(ctx: &LaunchContext, log: &mut impl Write) -> Result<()
         &paths.runtime_dir.join("web").join("dist"),
         &paths.evo_agent_home.join("web").join("dist"),
     )?;
+    // 部署侧扩展块先合回部署副本，再生成 runtime 配置——基座透传当轮
+    // 即带上扩展内容（stash/merge 细节见 DEPLOY_MARKER 规范块）
+    match merge_deploy_extensions(
+        &paths.evo_agent_home.join("evo-agent.toml"),
+        &paths.app_config_dir.join("deploy-extensions.bak"),
+    ) {
+        Ok(true) => writeln!(log, "[orch] deployed extension block re-applied").ok(),
+        Ok(false) => None,
+        Err(e) => writeln!(log, "[orch] deployed extensions merge failed: {e}").ok(),
+    };
     write_runtime_config(
         &paths.runtime_dir,
         &paths.evo_agent_home,
@@ -1268,6 +1356,85 @@ mod tests {
             env_val("EVORULE_LLM_EXECUTOR_TOKEN").as_deref(),
             Some("exec-token-secret")
         );
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    /// 部署侧扩展块提取三态：无标记块 / 有标记块（含注释行，原样搬运）/
+    /// CRLF 形态（字节级保真）。
+    #[test]
+    fn deploy_marker_extract_three_states() {
+        assert_eq!(extract_deploy_marker("a = 1\nb = 2\n"), None);
+        let with_block = concat!(
+            "a = 1\n",
+            "# ===== 部署侧扩展区（更新链原样保留，勿改模板段） =====\n",
+            "# user note line\n",
+            "[my_ext]\nk = \"v\"\n",
+        );
+        let got = extract_deploy_marker(with_block).unwrap();
+        assert_eq!(got, &with_block[6..]);
+        let crlf = concat!(
+            "a = 1\r\n",
+            "# ===== 部署侧扩展区（更新链原样保留，勿改模板段） =====\r\n",
+            "[my_ext]\r\nk = 1\r\n",
+        );
+        assert_eq!(extract_deploy_marker(crlf).unwrap(), &crlf[7..]);
+    }
+
+    /// merge 幂等性三态：无 stash 跳过 / 已带标记块不重复追加 /
+    /// 缺标记块则块前补空行追加且原内容不动。
+    #[test]
+    fn deploy_marker_merge_idempotent_and_append() {
+        let dir =
+            std::env::temp_dir().join(format!("evo-shell-deploy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml_p = dir.join("deployed.toml");
+        let stash_p = dir.join("stash.bak");
+        // ① 无 stash = 跳过，副本不动
+        std::fs::write(&toml_p, "a = 1\n").unwrap();
+        assert!(!merge_deploy_extensions(&toml_p, &stash_p).unwrap());
+        assert_eq!(std::fs::read_to_string(&toml_p).unwrap(), "a = 1\n");
+        // ② 已带标记块 = 不重复追加
+        let with_marker = format!("a = 1\n\n{DEPLOY_MARKER}\n[my_ext]\nk = 1\n");
+        std::fs::write(&stash_p, format!("{DEPLOY_MARKER}\n[my_ext]\nk = 1\n")).unwrap();
+        std::fs::write(&toml_p, &with_marker).unwrap();
+        assert!(!merge_deploy_extensions(&toml_p, &stash_p).unwrap());
+        assert_eq!(std::fs::read_to_string(&toml_p).unwrap(), with_marker);
+        // ③ 缺标记块 = 块前补空行追加，模板段原样在前
+        std::fs::write(&toml_p, "a = 1\n").unwrap();
+        assert!(merge_deploy_extensions(&toml_p, &stash_p).unwrap());
+        let after = std::fs::read_to_string(&toml_p).unwrap();
+        assert!(after.starts_with("a = 1\n"));
+        assert!(after.contains(&format!("\n\n{DEPLOY_MARKER}\n")));
+        assert!(after.ends_with("k = 1\n"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 安装/覆盖路径演练（真实发版模板参与）：部署副本带扩展块 → 覆盖前
+    /// stash → 部署副本被模板整写（模拟 NSIS 覆盖）→ 启动期合回 → 扩展
+    /// 保留、模板段原样在前；二次启动 = 幂等不重复。
+    #[test]
+    fn deploy_marker_survives_install_overwrite_drill() {
+        let paths = scratch_paths("deploy-drill");
+        let template = include_str!("../../templates/evo-agent.toml");
+        let deployed = paths.evo_agent_home.join("evo-agent.toml");
+        std::fs::create_dir_all(&paths.evo_agent_home).unwrap();
+        let mut old = String::from(template);
+        old.push_str(DEPLOY_MARKER);
+        old.push_str("\n# local note\n[my_ext]\nplus = true\n");
+        std::fs::write(&deployed, &old).unwrap();
+        let stash = paths.app_config_dir.join("deploy-extensions.bak");
+        // 更新链：覆盖前 stash
+        assert!(stash_deploy_extensions(&deployed, &stash).unwrap());
+        // NSIS 覆盖：部署副本被整写为全新模板
+        std::fs::write(&deployed, template).unwrap();
+        // 启动期：幂等合回
+        assert!(merge_deploy_extensions(&deployed, &stash).unwrap());
+        let after = std::fs::read_to_string(&deployed).unwrap();
+        assert!(after.starts_with(template), "template section untouched");
+        assert!(after.contains(DEPLOY_MARKER));
+        assert!(after.contains("plus = true"), "extension preserved");
+        // 二次启动 = 幂等
+        assert!(!merge_deploy_extensions(&deployed, &stash).unwrap());
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 

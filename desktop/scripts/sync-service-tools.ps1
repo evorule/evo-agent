@@ -8,6 +8,9 @@
 # 用法：
 #   缺省   = 再生成 desktop\templates\evo-agent.toml 的 service_tools 段（排序去重）
 #   -Check = 只校验不落盘：漂移即 exit 1（清单漂移构建必红，杜绝复发）
+#   部署副本（装机 resources\evo-agent\evo-agent.toml）尾部若带「部署侧扩展区」
+#   标记块，由壳侧更新链覆盖前 stash+启动期合回保护——本脚本只管仓内模板
+#   （唯一落点 desktop\templates\），不写部署面，与标记块无关。
 param(
     # 缺省=本仓同级的 evorule-server 目录（与 build-installer.ps1 同款解析）
     [string]$ServerRepo = "",

@@ -90,7 +90,36 @@ fn run_inner(app: &AppHandle, sup: &Arc<Supervisor>, manual: bool) -> Result<(),
     // NSIS 安装器启动前、本进程退出前的优雅停钩子（不退出、杀子进程、
     // 防守护线程重启；进程结束由 KILL_ON_JOB_CLOSE 兜底）
     let sup_for_exit = sup.clone();
-    builder = builder.on_before_exit(Box::new(move || sup_for_exit.stop_for_update()));
+    builder = builder.on_before_exit(Box::new(move || {
+        // 覆盖安装发生前，把部署副本的部署侧扩展块 stash 进壳配置目录
+        // （装机会外幸存），下次启动由 prepare_workspace 幂等合回——部署侧
+        // 扩展不随模板覆盖丢失。失败 fail-soft（shell.log 留痕，不阻断更新）。
+        let stash = || -> std::io::Result<()> {
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(sup_for_exit.paths.logs_dir.join("shell.log"))?;
+            use std::io::Write;
+            match crate::orchestrator::stash_deploy_extensions(
+                &sup_for_exit.paths.evo_agent_home.join("evo-agent.toml"),
+                &sup_for_exit
+                    .paths
+                    .app_config_dir
+                    .join("deploy-extensions.bak"),
+            ) {
+                Ok(true) => writeln!(log, "[update] deployed extension block stashed pre-install"),
+                Ok(false) => Ok(()),
+                Err(e) => writeln!(log, "[update] stash deployed extensions failed: {e}"),
+            }
+        };
+        if let Err(e) = stash() {
+            log_line(
+                &sup_for_exit.paths.logs_dir.join("shell.log"),
+                &format!("[update] stash extensions io error: {e}"),
+            );
+        }
+        sup_for_exit.stop_for_update();
+    }));
     builder = builder.timeout(CHECK_TIMEOUT);
     let updater = builder.build().map_err(|e| format!("init updater: {e}"))?;
 
