@@ -36,6 +36,10 @@
 
 ## [Unreleased]
 
+### 🆕 新增
+
+- **文件二进制原样流端点 `GET /api/files/raw`（媒体预览通道）** — 工作台文件面此前仅有 `read_file` 文本通道（UTF-8 解码，供编辑器），二进制文件（视频/图片/字幕）经该通道会被 UTF-8 替换破坏且不可逆，媒体预览无法消费。新端点直出磁盘字节：seek+定长流式回（大体量不整读内存）；单段 Range/后缀段 → 206（`content-range`/`content-length` 三面一致），多段与越界 → 416（`bytes */total` + 空体，对齐静态层语义），HEAD 同头零体，`If-None-Match` 命中 → 304；Content-Type 显式表（`.mp4`→`video/mp4`、`.ass`→`text/x-ssa`、`.srt`→`application/x-subrip` 等，未知扩展回落 `application/octet-stream`，不带 charset 后缀）。路径安全同面（同一 canonicalize+沙箱边界+`..`/绝对路径拒绝，错误语义同 `read_file`：404 不存在/400 越界/400 目录非文件），`X-Evo-Workspace` 工作区重锚与 G16 鉴权同面
+
 ### 🔄 变更
 
 - **桌面壳向 serve 传递鉴权令牌改经环境变量（收敛命令行暴露面）** — 桌面壳此前经命令行参数 `--auth-token` 向 serve 传递鉴权令牌，而本机所有进程可读任意进程的命令行，令牌上命令行即等于本机可见。现改为环境变量载体（`EVO_AGENT_AUTH__ENABLED` / `EVO_AGENT_AUTH__TOKENS`）注入，serve 侧鉴权配置固化后立即清除自身环境变量副本（与 service 身份令牌的捕获即清纪律同款），serve 期内启动的一切工作区子进程（shell_exec/python_exec/MCP 等）不再经继承环境变量见到令牌。CLI `--auth-token` 参数保留不变（手动/CLI 用户面）；工作台前端取令牌路径（webview 初始化脚本注入）零变化
