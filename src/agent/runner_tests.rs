@@ -6193,3 +6193,82 @@ fn tool_result_fetch_reads_window_and_rejects_bad_refs() {
     assert!(v["error"].as_str().unwrap().contains("not found"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 心跳弃轮必须终结会话内在途的悬挂 io_request:
+/// 引擎反应器对 pending io 门控(新命令只入队不执行),弃轮若不
+/// 收敛悬挂请求,后续每一轮都会以同样的心跳死法循环。
+/// 场景镜像真实死亡形态:SSE 连接保持打开但引擎零事件,
+/// 会话历史中存在一条无应答 IoRequest。
+#[tokio::test]
+async fn heartbeat_abort_terminates_pending_io_request() {
+    use futures_util::StreamExt;
+
+    let mut server = mockito::Server::new_async().await;
+    let sid = "sess-hb-abort";
+    let hist_path = format!("/api/sessions/{sid}/history");
+    let events_path = format!("/api/sessions/{sid}/events");
+    let command_path = format!("/api/sessions/{sid}/command");
+    let io_resp_path = format!("/api/sessions/{sid}/io_response");
+
+    // 会话历史:一条无应答 IoRequest(引擎侧悬挂请求)
+    let history = serde_json::json!([
+        { "type": "IoRequest", "id": 41, "io_type": "call_external",
+          "params": {}, "version": 3 },
+    ]);
+    server
+        .mock("GET", hist_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(history.to_string())
+        .create_async()
+        .await;
+
+    // SSE:连接保持打开但零事件(引擎被悬挂 io 门控的真实形态)
+    server
+        .mock("GET", events_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(|_w| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            Ok(())
+        })
+        .create_async()
+        .await;
+
+    // 命令受理应答
+    server
+        .mock("POST", command_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{\"success\":true}")
+        .create_async()
+        .await;
+
+    // 断言目标:心跳弃轮必须把悬挂请求以 error io_response 终结
+    let io_terminal = server
+        .mock("POST", io_resp_path.as_str())
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({ "request_id": 41 }),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let runner = AgentRunner::new(AgentConfig::default(), client);
+    set_test_heartbeat_timeout(1);
+
+    let mut stream = runner.run_continuation(sid.to_string(), "please continue".into(), Vec::new());
+    let mut saw_done = false;
+    while let Some(ev) = stream.next().await {
+        if let Ok(AgentEvent::Done(_)) = ev {
+            saw_done = true;
+        }
+    }
+    set_test_heartbeat_timeout(0);
+
+    assert!(saw_done, "turn must end with Done on heartbeat abort");
+    io_terminal.assert();
+}

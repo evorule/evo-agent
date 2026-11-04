@@ -34,6 +34,29 @@ use crate::builtin_tools::ask_user::{
 /// 事件判定死锁,中止当前 turn(①重试等待=第一窗后回到 select 再等)。
 const HEARTBEAT_TIMEOUT_SECS: u64 = 60;
 
+/// 心跳窗测试覆写(仅测试编译面存在;0=用缺省值)。流式循环经
+/// `heartbeat_timeout_secs()` 统一读取,生产路径恒为缺省值。
+#[cfg(test)]
+static TEST_HEARTBEAT_TIMEOUT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_test_heartbeat_timeout(secs: u64) {
+    TEST_HEARTBEAT_TIMEOUT_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 心跳窗取值:测试覆写非零时优先,否则缺省 60s。
+fn heartbeat_timeout_secs() -> u64 {
+    #[cfg(test)]
+    {
+        let t = TEST_HEARTBEAT_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        if t > 0 {
+            return t;
+        }
+    }
+    HEARTBEAT_TIMEOUT_SECS
+}
+
 /// F-302:组装策略版本——组装行为(分层方式/预算口径/记忆注入)的协议级版本标识。
 /// 版本变更=组装行为变更=历史重建需切版本（RL-B3 落地）。
 /// v2:组装路径由配方数据驱动(AssemblyExecutor 取代硬编码分层),配方三元落账链上。
@@ -8027,16 +8050,65 @@ impl AgentRunner {
                                        None => break,
                                    },
                                    _ = tokio::time::sleep(Duration::from_secs(
-                                       HEARTBEAT_TIMEOUT_SECS,
+                                       heartbeat_timeout_secs(),
                                    )) => {
                                        heartbeat_misses += 1;
                                        if heartbeat_misses >= 2 {
                                            warn!(%session_id, misses = heartbeat_misses,
         "heartbeat lost (no engine event within {}s x2); aborting turn",
-                                               HEARTBEAT_TIMEOUT_SECS);
+                                               heartbeat_timeout_secs());
+                                           // 悬挂 io_request 终结:引擎反应器对 pending io
+                                           // 门控(新命令只入队不执行),弃轮若不收敛,后续
+                                           // 每一轮都会以同样的心跳死法循环。发现路径与
+                                           // crash 复活对账同源(会话历史取无应答请求),
+                                           // 镜像取消路径的 error 终结先例;best-effort,
+                                           // 失败不阻断弃轮收尾。
+                                           match runner
+                                               .evorule_client
+                                               .get_session_history(&session_id)
+                                               .await
+                                           {
+                                               Ok(history) => {
+                                                   if let Some((rid, io_type, _params)) =
+                                                       Self::plan_pending_resolution(&history)
+                                                   {
+                                                       let reason = format!(
+                                                           "heartbeat lost: no engine event within {}s (x2); pending io_request terminally answered by turn abort",
+                                                           heartbeat_timeout_secs() * 2,
+                                                       );
+                                                       match runner
+                                                           .evorule_client
+                                                           .submit_io_response(
+                                                               &session_id,
+                                                               rid,
+                                                               &serde_json::json!({
+                                                                   "error": reason,
+                                                               }),
+                                                               Some(reason.as_str()),
+                                                           )
+                                                           .await
+                                                       {
+                                                           Ok(_) => {
+                                                               info!(%session_id, request_id = rid,
+                                                                   io_type = %io_type,
+                                                                   "heartbeat abort: pending io_request terminally answered");
+                                                           }
+                                                           Err(e) => {
+                                                               warn!(%session_id, request_id = rid,
+                                                                   error = %e,
+                                                                   "heartbeat abort: terminal io_response submit failed (best-effort)");
+                                                           }
+                                                       }
+                                                   }
+                                               }
+                                               Err(e) => {
+                                                   warn!(%session_id, error = %e,
+                                                       "heartbeat abort: session history fetch failed; cannot reconcile pending io");
+                                               }
+                                           }
                                            yield Ok(AgentEvent::Error(AgentError::Internal(format!(
                                                "heartbeat lost: no engine event within {}s (retried once); turn aborted, please retry",
-                                               HEARTBEAT_TIMEOUT_SECS * 2,
+                                               heartbeat_timeout_secs() * 2,
                                            ))));
                                            let duration = start_time.elapsed().as_millis() as u64;
                                            if let Some(g) = turn_guard.take() {
@@ -8056,7 +8128,7 @@ impl AgentRunner {
                                        // ①同等待重试 1 次:回到 select 再等一个心跳窗
                                        info!(%session_id, misses = heartbeat_misses,
                                            "no engine event within {}s, retrying wait (recovery step 1)",
-                                           HEARTBEAT_TIMEOUT_SECS);
+                                           heartbeat_timeout_secs());
                                        continue;
                                    },
                                    _ = cancel_token.cancelled() => {
