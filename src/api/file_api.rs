@@ -11,6 +11,8 @@
 //!   (union toolkit 内**同一实例**)
 //! - `GET /api/files/read?path=` → [`FileReadTool`](crate::builtin_tools::file_read::FileReadTool)
 //!   (union toolkit 内**同一实例**)
+//! - `GET /api/files/raw?path=`  → 二进制原样流(见 [`raw_file`];媒体预览消费,
+//!   Range/HEAD/304 支持的同语义静态服务面)
 //! - `PUT /api/files/write`      → [`FileWriteTool`](crate::builtin_tools::file_write::FileWriteTool)
 //!   (同实现,`writable_dir="."`:人工编辑面 = workdir 全域)
 //! - `POST /api/files/create`    → [`FileCreateTool`](crate::builtin_tools::file_create::FileCreateTool)
@@ -43,12 +45,15 @@
 //!   人(项目方)在本机本就有完整文件系统权限,workdir 沙箱对人是 UX 边界
 //!   (防误操作出 workdir),不是安全边界。
 
+use axum::body::Body;
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::response::Response;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tokio::io::{AsyncSeekExt, SeekFrom};
 
 use crate::api::agent_api::AgentApiState;
 use crate::api::human_gate::{ensure_write_allowed, CallerIdentity};
@@ -345,6 +350,280 @@ pub async fn read_file(
         call_toolkit_tool(&state, "file_read", Value::Object(args)).await?
     };
     Ok(Json(v))
+}
+
+/// `GET /api/files/raw` 查询参数(与 read_file 同形)
+#[derive(Debug, Deserialize)]
+pub struct RawQuery {
+    /// 相对 workdir 的文件路径
+    pub path: String,
+}
+
+/// Range 解析结果:全量 / 可满足单段(含起止,闭区间)/ 不可满足。
+/// 语义对齐 tower-http ServeDir 观察行为(静态层同款):
+/// - 多段(`,`)→ 不可满足(416,静态层观察同款拒绝文案);
+/// - 畸形(非数字 / 前大后小 / 无 `bytes=` 前缀)→ 忽略,按 200 全量回;
+/// - 后缀 `-n`:`n=0` → 416;`n≥total` → 整文件;
+/// - `start≥total` → 416;`end≥total` 钳到 `total-1`。
+enum RawRangeOutcome {
+    Full,
+    Part { start: u64, end_incl: u64 },
+    Unsatisfiable,
+}
+
+fn parse_raw_range(raw: Option<&HeaderValue>, total: u64) -> RawRangeOutcome {
+    let Some(hv) = raw else {
+        return RawRangeOutcome::Full;
+    };
+    let Ok(s) = hv.to_str() else {
+        return RawRangeOutcome::Full;
+    };
+    let Some(spec) = s.trim().strip_prefix("bytes=") else {
+        return RawRangeOutcome::Full;
+    };
+    let spec = spec.trim();
+    if spec.contains(',') {
+        return RawRangeOutcome::Unsatisfiable;
+    }
+    if total == 0 {
+        // 空文件:任何 Range 无可满足语义,回 200 全量(空体)
+        return RawRangeOutcome::Full;
+    }
+    let Some((a, b)) = spec.split_once('-') else {
+        return RawRangeOutcome::Full;
+    };
+    let (a, b) = (a.trim(), b.trim());
+    match (a.is_empty(), b.is_empty()) {
+        (false, false) => {
+            let (Ok(start), Ok(end)) = (a.parse::<u64>(), b.parse::<u64>()) else {
+                return RawRangeOutcome::Full;
+            };
+            if start > end {
+                return RawRangeOutcome::Full;
+            }
+            if start >= total {
+                return RawRangeOutcome::Unsatisfiable;
+            }
+            RawRangeOutcome::Part {
+                start,
+                end_incl: end.min(total - 1),
+            }
+        }
+        (false, true) => {
+            let Ok(start) = a.parse::<u64>() else {
+                return RawRangeOutcome::Full;
+            };
+            if start >= total {
+                return RawRangeOutcome::Unsatisfiable;
+            }
+            RawRangeOutcome::Part {
+                start,
+                end_incl: total - 1,
+            }
+        }
+        (true, false) => {
+            let Ok(n) = b.parse::<u64>() else {
+                return RawRangeOutcome::Full;
+            };
+            if n == 0 {
+                return RawRangeOutcome::Unsatisfiable;
+            }
+            let n = n.min(total);
+            RawRangeOutcome::Part {
+                start: total - n,
+                end_incl: total - 1,
+            }
+        }
+        (true, true) => RawRangeOutcome::Full,
+    }
+}
+
+/// raw 端点 Content-Type 映射(显式表,不带 charset 后缀——媒体面消费
+/// 精确匹配;未知扩展一律 `application/octet-stream`,浏览器自行嗅探拒判)。
+fn raw_content_type(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("mp4") | Some("m4v") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        Some("mkv") => "video/x-matroska",
+        Some("avi") => "video/x-msvideo",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        Some("ico") => "image/x-icon",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("flac") => "audio/flac",
+        Some("ogg") => "audio/ogg",
+        Some("txt") => "text/plain",
+        Some("md") => "text/markdown",
+        Some("json") => "application/json",
+        Some("js") | Some("mjs") => "text/javascript",
+        Some("css") => "text/css",
+        Some("html") | Some("htm") => "text/html",
+        Some("xml") => "application/xml",
+        Some("ass") | Some("ssa") => "text/x-ssa",
+        Some("srt") => "application/x-subrip",
+        Some("vtt") => "text/vtt",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// IMF-fixdate(HTTP-date)格式化(Last-Modified / Date 语义)
+fn http_date(t: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(t)
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
+}
+
+/// raw 端点的文件体流:seek 到起点 + take 定长 + ReaderStream 流式回。
+/// 显式设了 Content-Length 头,流长与头必须一致(静态服务同款契约)。
+async fn raw_stream_body(path: &Path, start: u64, len: u64) -> Result<Body, (StatusCode, String)> {
+    let mut f = tokio::fs::File::open(path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("open failed: {e}"),
+        )
+    })?;
+    if start > 0 {
+        f.seek(SeekFrom::Start(start)).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("seek failed: {e}"),
+            )
+        })?;
+    }
+    Ok(Body::from_stream(tokio_util::io::ReaderStream::new(
+        tokio::io::AsyncReadExt::take(f, len),
+    )))
+}
+
+/// `GET /api/files/raw?path=` —— 文件二进制原样流(媒体预览通道)
+///
+/// 与 `read_file` 的分工:`read_file` 走 file 工具文本通道(UTF-8 解码,
+/// 供编辑器);本端点直出磁盘字节(供 `<video>`/`<img>`/字幕原样消费,
+/// 二进制经文本通道会被 UTF-8 替换破坏,不可逆)。
+///
+/// 路径安全同面:`resolve_existing`(同一 canonicalize + 沙箱边界 + `..`/
+/// 绝对路径拒绝),`X-Evo-Workspace` 重锚语义同 `read_file`;鉴权同面
+/// (G16 中间件,Bearer)。
+///
+/// 行为契约(对齐静态层 Range 观察):200 全量 / 206 单段(含后缀段)/
+/// 416(多段、越界、后缀 0)+ `content-range: bytes */total` + 空体 /
+/// HEAD 同头零体 / If-None-Match 命中 → 304 / 目录与非常规文件 → 400
+/// (`not a regular file`)/ 不存在 → 404 / 缺参 → 400(Query 反序列化拒)。
+pub async fn raw_file(
+    State(state): State<AgentApiState>,
+    method: Method,
+    Query(q): Query<RawQuery>,
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, String)> {
+    let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
+    let canonical = crate::builtin_tools::fs_safety::resolve_existing(&root, &q.path)
+        .map_err(|e| (err_status(&e), e))?;
+    let meta = std::fs::metadata(&canonical).map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("path does not exist: '{}' ({e})", q.path),
+        )
+    })?;
+    if !meta.is_file() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("path is not a regular file: '{}'", q.path),
+        ));
+    }
+    let total = meta.len();
+    let mtime = meta.modified().ok();
+    let etag = match mtime {
+        Some(t) => format!(
+            "\"{}-{}\"",
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            total
+        ),
+        None => String::new(),
+    };
+
+    // 条件请求:If-None-Match 命中(精确 / W/ 前缀 / *)→ 304 零体
+    if let (Some(inm), false) = (headers.get(header::IF_NONE_MATCH), etag.is_empty()) {
+        if let Ok(inm_s) = inm.to_str() {
+            let hit = inm_s.trim() == "*"
+                || inm_s
+                    .split(',')
+                    .map(|t| t.trim().trim_start_matches("W/"))
+                    .any(|t| t == etag);
+            if hit {
+                let mut builder = Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(header::ETAG, &etag);
+                if let Some(t) = mtime {
+                    builder = builder.header(header::LAST_MODIFIED, http_date(t));
+                }
+                return builder
+                    .body(Body::empty())
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            }
+        }
+    }
+
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, raw_content_type(&canonical))
+        .header(header::ACCEPT_RANGES, "bytes");
+    if !etag.is_empty() {
+        builder = builder.header(header::ETAG, &etag);
+    }
+    if let Some(t) = mtime {
+        builder = builder.header(header::LAST_MODIFIED, http_date(t));
+    }
+    let head_only = method == Method::HEAD;
+
+    match parse_raw_range(headers.get(header::RANGE), total) {
+        RawRangeOutcome::Unsatisfiable => builder
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+            .header(header::CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        RawRangeOutcome::Part { start, end_incl } => {
+            let len = end_incl - start + 1;
+            let body = if head_only {
+                Body::empty()
+            } else {
+                raw_stream_body(&canonical, start, len).await?
+            };
+            builder
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end_incl}/{total}"),
+                )
+                .header(header::CONTENT_LENGTH, len.to_string())
+                .body(body)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+        RawRangeOutcome::Full => {
+            let body = if head_only {
+                Body::empty()
+            } else {
+                raw_stream_body(&canonical, 0, total).await?
+            };
+            builder
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, total.to_string())
+                .body(body)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
 }
 
 /// `PUT /api/files/write` —— 写文件(委托 file_write 实现,`writable_dir="."`)
@@ -866,6 +1145,349 @@ mod tests {
         assert!(resp.is_ok(), "write should succeed, got: {:?}", resp.err());
         let written = std::fs::read_to_string(dir_canon.join("notes/todo.md")).unwrap();
         assert_eq!(written, "- [ ] item");
+    }
+
+    // =========================================================================
+    // raw 端点(媒体二进制原样流)
+    // =========================================================================
+
+    /// 构造含非 UTF-8 字节的测试二进制(0xFF/0xFE/0x00 混合 + ftyp 前缀形)
+    fn raw_test_bytes(n: usize) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00, 0x00, 0x20];
+        v.extend_from_slice(b"ftypisom");
+        for i in 0..n {
+            v.push(0xFF - (i % 256) as u8);
+        }
+        v
+    }
+
+    fn range_headers(spec: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::RANGE,
+            HeaderValue::from_str(spec).unwrap(),
+        );
+        h
+    }
+
+    async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    /// 200 全量:磁盘字节逐字节相同(非 UTF-8 字节不被破坏)+ 正确头
+    #[tokio::test]
+    async fn test_raw_file_streams_bytes_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let bytes = raw_test_bytes(300);
+        std::fs::write(dir_canon.join("clip.mp4"), &bytes).unwrap();
+        let state = anonymous_state(&dir_canon);
+        let resp = raw_file(
+            State(state),
+            Method::GET,
+            Query(RawQuery {
+                path: "clip.mp4".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        assert_eq!(resp.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+        assert!(resp.headers().get(header::LAST_MODIFIED).is_some());
+        let body = body_bytes(resp).await;
+        assert_eq!(body, bytes, "raw 端点必须逐字节相同");
+    }
+
+    /// 206 单段:content-range / content-length / 体长三面正确
+    #[tokio::test]
+    async fn test_raw_file_range_206() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let bytes = raw_test_bytes(300);
+        std::fs::write(dir_canon.join("clip.mp4"), &bytes).unwrap();
+        let state = anonymous_state(&dir_canon);
+        let resp = raw_file(
+            State(state),
+            Method::GET,
+            Query(RawQuery {
+                path: "clip.mp4".to_string(),
+            }),
+            range_headers("bytes=0-99"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_RANGE).unwrap(),
+            format!("bytes 0-99/{}", bytes.len()).as_str()
+        );
+        assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "100");
+        let body = body_bytes(resp).await;
+        assert_eq!(body.len(), 100);
+        assert_eq!(body, bytes[..100]);
+    }
+
+    /// 后缀段:bytes=-50 → 206 指向末尾;end 越界钳制;后缀≥total → 整文件
+    #[tokio::test]
+    async fn test_raw_file_suffix_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let bytes = raw_test_bytes(100);
+        std::fs::write(dir_canon.join("clip.mp4"), &bytes).unwrap();
+        let state = anonymous_state(&dir_canon);
+        let resp = raw_file(
+            State(state.clone()),
+            Method::GET,
+            Query(RawQuery {
+                path: "clip.mp4".to_string(),
+            }),
+            range_headers("bytes=-50"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let body = body_bytes(resp).await;
+        assert_eq!(body, bytes[bytes.len() - 50..]);
+        // end 越界钳制到 total-1
+        let resp = raw_file(
+            State(state.clone()),
+            Method::GET,
+            Query(RawQuery {
+                path: "clip.mp4".to_string(),
+            }),
+            range_headers(&format!("bytes=0-{}", bytes.len() + 500)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(resp).await.len(), bytes.len());
+        // 后缀 ≥ total → 整文件
+        let resp = raw_file(
+            State(state),
+            Method::GET,
+            Query(RawQuery {
+                path: "clip.mp4".to_string(),
+            }),
+            range_headers("bytes=-99999"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_RANGE).unwrap(),
+            format!("bytes 0-{}/{}", bytes.len() - 1, bytes.len()).as_str()
+        );
+    }
+
+    /// 416 三型:越界 start / 后缀 0 / 多段;content-range: bytes */total + 空体
+    #[tokio::test]
+    async fn test_raw_file_unsatisfiable_416() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let bytes = raw_test_bytes(50);
+        std::fs::write(dir_canon.join("clip.mp4"), &bytes).unwrap();
+        let state = anonymous_state(&dir_canon);
+        for spec in ["bytes=9999999999-", "bytes=-0", "bytes=0-9,20-29"] {
+            let resp = raw_file(
+                State(state.clone()),
+                Method::GET,
+                Query(RawQuery {
+                    path: "clip.mp4".to_string(),
+                }),
+                range_headers(spec),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE, "{spec}");
+            assert_eq!(
+                resp.headers().get(header::CONTENT_RANGE).unwrap(),
+                format!("bytes */{}", bytes.len()).as_str()
+            );
+            assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "0");
+            assert!(body_bytes(resp).await.is_empty());
+        }
+    }
+
+    /// HEAD:同头零体;If-None-Match 命中 → 304
+    #[tokio::test]
+    async fn test_raw_file_head_and_304() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let bytes = raw_test_bytes(80);
+        std::fs::write(dir_canon.join("clip.mp4"), &bytes).unwrap();
+        let state = anonymous_state(&dir_canon);
+        let resp = raw_file(
+            State(state.clone()),
+            Method::HEAD,
+            Query(RawQuery {
+                path: "clip.mp4".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_LENGTH).unwrap(),
+            bytes.len().to_string().as_str()
+        );
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(body_bytes(resp).await.is_empty());
+        // 条件请求:回传 ETag → 304
+        let mut h = HeaderMap::new();
+        h.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+        let resp = raw_file(
+            State(state),
+            Method::GET,
+            Query(RawQuery {
+                path: "clip.mp4".to_string(),
+            }),
+            h,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert!(body_bytes(resp).await.is_empty());
+    }
+
+    /// 错误语义:目录 400(not a regular file)/ 不存在 404 / 越界与绝对路径 400
+    #[tokio::test]
+    async fn test_raw_file_error_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        std::fs::create_dir_all(dir_canon.join("sub")).unwrap();
+        let state = anonymous_state(&dir_canon);
+        // 目录 → 400 + not a regular file
+        let err = raw_file(
+            State(state.clone()),
+            Method::GET,
+            Query(RawQuery {
+                path: "sub".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("not a regular file"), "{}", err.1);
+        // 不存在 → 404
+        let err = raw_file(
+            State(state.clone()),
+            Method::GET,
+            Query(RawQuery {
+                path: "__missing__.bin".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        // 越界 .. → 400 + not allowed
+        let err = raw_file(
+            State(state.clone()),
+            Method::GET,
+            Query(RawQuery {
+                path: "../../x".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("not allowed"), "{}", err.1);
+        // 绝对路径 → 400
+        let err = raw_file(
+            State(state),
+            Method::GET,
+            Query(RawQuery {
+                path: r"C:\Windows\System32\drivers\etc\hosts".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// Content-Type 显式表:.ass/.srt 字幕精确值 + 未知扩展回落
+    #[test]
+    fn test_raw_content_type_map() {
+        assert_eq!(raw_content_type(Path::new("a.ass")), "text/x-ssa");
+        assert_eq!(raw_content_type(Path::new("b.SRT")), "application/x-subrip");
+        assert_eq!(raw_content_type(Path::new("c.vtt")), "text/vtt");
+        assert_eq!(
+            raw_content_type(Path::new("d.xyz")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            raw_content_type(Path::new("noext")),
+            "application/octet-stream"
+        );
+    }
+
+    /// Range 解析单元:畸形回落全量(200)与空文件语义
+    #[test]
+    fn test_parse_raw_range_edge() {
+        use RawRangeOutcome::*;
+        let mk = |s: &str| HeaderValue::from_str(s).unwrap();
+        // 畸形:非数字 / 前大后小 / 无前缀 → 全量
+        assert!(matches!(parse_raw_range(None, 100), Full));
+        let h = mk("bytes=abc");
+        assert!(matches!(parse_raw_range(Some(&h), 100), Full));
+        let h = mk("bytes=9-3");
+        assert!(matches!(parse_raw_range(Some(&h), 100), Full));
+        let h = mk("chunks=0-9");
+        assert!(matches!(parse_raw_range(Some(&h), 100), Full));
+        // 空文件 → 全量
+        let h = mk("bytes=0-");
+        assert!(matches!(parse_raw_range(Some(&h), 0), Full));
+        // 钳制与后缀
+        let h = mk("bytes=95-200");
+        match parse_raw_range(Some(&h), 100) {
+            Part { start, end_incl } => {
+                assert_eq!((start, end_incl), (95, 99));
+            }
+            _ => panic!("expected Part"),
+        }
+        let h = mk("bytes=-7");
+        match parse_raw_range(Some(&h), 100) {
+            Part { start, end_incl } => {
+                assert_eq!((start, end_incl), (93, 99));
+            }
+            _ => panic!("expected Part"),
+        }
     }
 
     /// 构造 human 身份(写面放行)的 handler 级 AgentApiState

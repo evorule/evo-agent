@@ -935,6 +935,12 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
             "/api/files/read",
             axum::routing::get(crate::api::file_api::read_file),
         )
+        // 文件二进制原样流(媒体预览通道):磁盘字节直出,Range/HEAD/304
+        // 同语义静态服务面;路径安全/鉴权/工作区重锚同 read_file
+        .route(
+            "/api/files/raw",
+            axum::routing::get(crate::api::file_api::raw_file),
+        )
         .route(
             "/api/files/write",
             axum::routing::put(crate::api::file_api::write_file),
