@@ -734,7 +734,9 @@ mod tests {
         let de: EventType = serde_json::from_str(json).unwrap();
         assert_eq!(
             de,
-            EventType::Custom("unrecognized_kind:context_mechanism_self_check_requested".to_string())
+            EventType::Custom(
+                "unrecognized_kind:context_mechanism_self_check_requested".to_string()
+            )
         );
     }
 
