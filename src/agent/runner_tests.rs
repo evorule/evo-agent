@@ -5771,6 +5771,268 @@ async fn test_payload_limit_second_failure_fails_visible() {
     assert!(!done.success, "二次超限应失败收轮");
 }
 
+/// 收尾 io_response 提交体不得携带整史 messages 快照。
+///
+/// 背景缺陷:call_external 收尾把完整消息历史(可达 MB 级)塞进 io_response,
+/// 引擎侧对该键零消费(merge 规则纯透存),却会累计顶爆请求体上限→每轮 413。
+/// 消息史的权威通道=本地权威面+flush_messages 逐条入链,io_response 只需
+/// content/tool_calls/is_finished/token_usage。现状实现带 messages 键=红。
+#[tokio::test]
+async fn test_final_io_response_omits_message_history() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let session_id = "s-iors-clean";
+
+    // 多轮历史(4 条 45KB tool 结果,单条低于回读截断帽,总量 ~180KB)——
+    // 若实现仍回灌 messages,提交体必显著超过 10KB;干净提交仅数百字节
+    let big_tool_text = "y".repeat(45_000);
+    let state = serde_json::json!({
+        "payload": {
+            "llm_response": {"content": "final answer"},
+            "__memory__": {
+                "default": {
+                    "session_s-iors-clean": {
+                        "messages": {
+                            "0": {"idx": 0, "role": "system", "content": "You are helpful", "timestamp": 1000},
+                            "1": {"idx": 1, "role": "user", "content": "read the file", "timestamp": 1001},
+                            "2": {"idx": 2, "role": "assistant", "content": "", "tool_calls": [
+                                {"tool_name": "file_read", "args": {"path": "big1.txt"}}
+                            ], "timestamp": 1002},
+                            "3": {"idx": 3, "role": "tool", "tool_name": "file_read", "content": big_tool_text, "timestamp": 1003},
+                            "4": {"idx": 4, "role": "assistant", "content": "", "tool_calls": [
+                                {"tool_name": "file_read", "args": {"path": "big2.txt"}}
+                            ], "timestamp": 1004},
+                            "5": {"idx": 5, "role": "tool", "tool_name": "file_read", "content": big_tool_text, "timestamp": 1005},
+                            "6": {"idx": 6, "role": "assistant", "content": "", "tool_calls": [
+                                {"tool_name": "file_read", "args": {"path": "big3.txt"}}
+                            ], "timestamp": 1006},
+                            "7": {"idx": 7, "role": "tool", "tool_name": "file_read", "content": big_tool_text, "timestamp": 1007},
+                            "8": {"idx": 8, "role": "assistant", "content": "", "tool_calls": [
+                                {"tool_name": "file_read", "args": {"path": "big4.txt"}}
+                            ], "timestamp": 1008},
+                            "9": {"idx": 9, "role": "tool", "tool_name": "file_read", "content": big_tool_text, "timestamp": 1009},
+                            "10": {"idx": 10, "role": "user", "content": "wrap up", "timestamp": 1010}
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let _state_mock = server
+        .mock("GET", format!("/api/sessions/{session_id}/state").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(state.to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _payload_mock = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/payload").as_str(),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"success":true,"fact_id":1}"#)
+        .create_async()
+        .await;
+    let _events_mock = server
+        .mock("GET", format!("/api/sessions/{session_id}/events").as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(concat!(
+            "data: {\"type\":\"IoRequest\",\"id\":1,\"io_type\":\"call_external\",\"params\":{}}\n\n",
+            "data: {\"type\":\"Stable\"}\n\n",
+        ))
+        .create_async()
+        .await;
+    let _command_mock = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/command").as_str(),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    // 双口互斥断言(mockito 多口重叠时匹配次序不定,两口必须按
+    // Content-Length 位数互斥):夹具历史总量 ~180KB——若实现仍回灌
+    // 整史 messages,提交体 ≥10KB(5 位以上),命中大体哨兵口(期望 0 次);
+    // 干净提交(仅 content/tool_calls/is_finished,数百字节)命中兜底口。
+    let big_body_sentinel = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/io_response").as_str(),
+        )
+        .match_header(
+            "content-length",
+            mockito::Matcher::Regex(r"^\d{5,}$".to_string()),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .expect(0)
+        .create_async()
+        .await;
+    let catch_all = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/io_response").as_str(),
+        )
+        .match_header(
+            "content-length",
+            mockito::Matcher::Regex(r"^\d{1,4}$".to_string()),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+
+    let llm = LlmHandler::mock_scripted(vec![Ok("final answer".to_string())]);
+    let mem = crate::agent::memory::MemoryManager::new("default", client.clone());
+    let runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_memory(mem)
+        .with_llm_handler(llm);
+
+    let stream =
+        runner.run_continuation(session_id.to_string(), "continue".to_string(), Vec::new());
+    let mut stream = stream;
+    let mut final_done: Option<AgentResult> = None;
+    let mut guard = 0;
+    while let Some(event) = stream.next().await {
+        guard += 1;
+        if let Ok(AgentEvent::Done(r)) = event {
+            final_done = Some(r);
+            break;
+        }
+        if guard > 200 {
+            break;
+        }
+    }
+    let done = final_done.expect("正常收尾应收到 Done 事件");
+    assert!(done.success, "无故障路径应成功收轮");
+
+    catch_all.assert_async().await;
+    big_body_sentinel.assert_async().await;
+}
+
+/// 收尾 io_response 提交被引擎拒(413 请求体超限)时不得裸退:
+/// 必须补交 error io_response(防引擎 io_request 悬挂)+完整收尾
+/// (Error 事件+turn_ended(error)+flush+tool_traces+Done 失败收轮)。
+/// 现状实现仅 yield Err 后裸 return(零日志零收尾)= 红。
+#[tokio::test]
+async fn test_final_io_response_submit_rejection_completes_turn() {
+    let mut server = mockito::Server::new_async().await;
+    let client = EvoruleApiClient::new(&server.url());
+    let session_id = "s-iors-413";
+
+    let state = serde_json::json!({
+        "payload": {
+            "llm_response": {"content": ""},
+            "__memory__": {
+                "default": {
+                    "session_s-iors-413": {
+                        "messages": {
+                            "0": {"idx": 0, "role": "system", "content": "You are helpful", "timestamp": 1000},
+                            "1": {"idx": 1, "role": "user", "content": "wrap up", "timestamp": 1001}
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let _state_mock = server
+        .mock("GET", format!("/api/sessions/{session_id}/state").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(state.to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _payload_mock = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/payload").as_str(),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"success":true,"fact_id":1}"#)
+        .create_async()
+        .await;
+    let _events_mock = server
+        .mock("GET", format!("/api/sessions/{session_id}/events").as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(concat!(
+            "data: {\"type\":\"IoRequest\",\"id\":1,\"io_type\":\"call_external\",\"params\":{}}\n\n",
+            "data: {\"type\":\"Stable\"}\n\n",
+        ))
+        .create_async()
+        .await;
+    let _command_mock = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/command").as_str(),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    // 引擎侧 413(请求体超限)拒绝一切 io_response 提交。
+    // 期望 2 次:①最终 content 提交(被拒) ②失败路径补交 error io_response(best-effort)
+    let io_resp_mock = server
+        .mock(
+            "POST",
+            format!("/api/sessions/{session_id}/io_response").as_str(),
+        )
+        .with_status(413)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":"payload too large"}"#)
+        .expect(2)
+        .create_async()
+        .await;
+
+    let llm = LlmHandler::mock_scripted(vec![Ok("final answer".to_string())]);
+    let mem = crate::agent::memory::MemoryManager::new("default", client.clone());
+    let runner = AgentRunner::new(AgentConfig::default(), client)
+        .with_memory(mem)
+        .with_llm_handler(llm);
+
+    let stream =
+        runner.run_continuation(session_id.to_string(), "continue".to_string(), Vec::new());
+    let mut stream = stream;
+    let mut error_text = String::new();
+    let mut final_done: Option<AgentResult> = None;
+    let mut guard = 0;
+    while let Some(event) = stream.next().await {
+        guard += 1;
+        match event {
+            Ok(AgentEvent::Error(e)) => error_text.push_str(&e.to_string()),
+            Err(e) => error_text.push_str(&e.to_string()),
+            Ok(AgentEvent::Done(r)) => {
+                final_done = Some(r);
+                break;
+            }
+            _ => {}
+        }
+        if guard > 200 {
+            break;
+        }
+    }
+
+    let done = final_done.expect("提交被拒也必须完整收轮(Done 事件),不得裸退");
+    assert!(!done.success, "提交被拒应失败收轮");
+    assert!(
+        error_text.contains("413"),
+        "错误面应携带引擎拒绝状态: {error_text}"
+    );
+    io_resp_mock.assert_async().await;
+}
+
 /// 非 413 类错误行为零变化(回归):不裁剪、不重试,直接现行终局。
 #[tokio::test]
 async fn test_non_payload_error_no_trim_no_retry() {

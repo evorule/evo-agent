@@ -5298,12 +5298,23 @@ impl AgentRunner {
             }
         }
 
-        // core_eval v0.3.1:merge 规则引用 __exec__.payload.llm_response.messages
-        // 作为下一轮 call_external 的消息历史,缺失会导致 "path resolution failed"。
-        // 返回完整消息历史(含本轮 assistant 回复),保持 TCB 侧历史连续。
-        let result_messages = serde_json::to_value(messages)
-            .map_err(|e| AgentError::Internal(format!("serialize result messages: {}", e)))?;
-
+        // 【根因注释:io_response 不携带消息史快照(2026-11 定谳,防回归勿删)】
+        // 历史上此处曾把整份 messages 塞进 io_response 提交体,源于对引擎
+        // merge 规则的过时认知("core_eval v0.3.1 引用 llm_response.messages,
+        // 缺失会 path resolution failed")。现行规则集(v0.4.x+)对该键零引用:
+        // ①merge 规则只透存 llm_response 整体,不读 messages;②下一轮
+        // io_request.messages 由本 runner 每轮自构造(build_call_external_command),
+        // 与引擎侧透存值无关;③agent 下游只消费 llm_response.content。
+        // 冗余快照的代价:消息史随会话线性增长(实测 1.7MB),把恒定小体量
+        // 的收尾提交体顶爆引擎请求体上限(1MB)→每轮 413→会话软死且失败
+        // 零日志。消息史的权威通道=本地权威面+flush_messages 逐条入链
+        // (含 413 逐条降级),不依赖本提交体。
+        //
+        // 【未来新大字段处理方法论】向跨进程提交体新增大体积字段前,先核
+        // 引擎消费面定谳"透存 vs 读取":纯透存→去冗余不送(本例);确需
+        // 引擎消费→显式立法引用(规则层/接口契约登记该路径),并评估体量
+        // 上限。禁止对审计面数据做截断降级来"绕过"请求体上限——截断破坏
+        // 确定性/可回放/可审计三性,是已否决的错误路径。
         Ok(serde_json::json!({
             "content": final_content,
             "tool_calls": effective_tool_calls,
@@ -5312,7 +5323,6 @@ impl AgentRunner {
             // provider usage 透传进 io_response result，runner 累加点据此计数
             // （此前在此处被丢弃，埋点恒 0——E2E 场景 A 实测暴露后修复）
             "token_usage": llm_response.token_usage.clone(),
-            "messages": result_messages,
         }))
     }
 
@@ -7451,6 +7461,7 @@ impl AgentRunner {
                                })
                                .await
                                {
+                                   warn!(error = %e, "io-contract negotiation failed before session creation");
                                    yield Err(AgentError::EvoruleError(format!(
                                        "io-contract negotiation failed: {e}"
                                    )));
@@ -7473,6 +7484,7 @@ impl AgentRunner {
                                        id
                                    }
                                    Err(e) => {
+                                       warn!(error = %e, "create_session failed in streaming path");
                                        yield Err(AgentError::EvoruleError(e.to_string()));
                                        return;
                                    }
@@ -7942,6 +7954,7 @@ impl AgentRunner {
                            let mut event_stream = match runner.evorule_client.subscribe_events(&session_id).await {
                                Ok(s) => s,
                                Err(e) => {
+                                   warn!(%session_id, error = %e, "subscribe_events failed");
                                    yield Err(AgentError::EvoruleError(e.to_string()));
                                    return;
                                }
@@ -8002,6 +8015,7 @@ impl AgentRunner {
                                let command = runner
                                    .build_call_external_command(&system_prompt, &goal, runner.openai_tools_payload());
                                if let Err(e) = runner.evorule_client.submit_command(&session_id, &command).await {
+                                   warn!(%session_id, error = %e, "submit_command (call_external) failed");
                                    yield Err(AgentError::EvoruleError(e.to_string()));
                                    return;
                                }
@@ -9455,13 +9469,16 @@ impl AgentRunner {
                                                if let Some(rid) = request_id {
                                                    let tool_calls_json: serde_json::Value = serde_json::Value::Null;
                                                    let is_finished = matches!(finish_reason.as_deref(), Some("stop") | Some("end_turn"));
+                                                   // 【io_response 不携带消息史快照——机制定谳与非流式
+                                                   // 路径同源,完整根因与方法论见 handle_call_external
+                                                   // 尾部注释】历史快照曾致提交体随会话增长(实测
+                                                   // 1.7MB)顶爆引擎请求体上限(1MB)→每轮 413→会话
+                                                   // 软死且失败零日志。消息史权威通道=本地权威面
+                                                   // +flush_messages 逐条入链,不经本提交体。
                                                    let resp = serde_json::json!({
                                                        "content": full_content,
                                                        "tool_calls": tool_calls_json,
                                                        "is_finished": is_finished,
-                                                       // core_eval v0.3.1:merge 规则引用 llm_response.messages
-                                                       "messages": serde_json::to_value(&messages)
-                                                           .unwrap_or(serde_json::Value::Null),
                                                    });
                                                    if let Err(e) = runner.evorule_client
                                                        .submit_io_response(&session_id, rid, &resp, None)
@@ -9504,7 +9521,68 @@ impl AgentRunner {
                                                            yield Err(AgentError::EvoruleError(err_str));
                                                            return;
                                                        }
-                                                       yield Err(AgentError::EvoruleError(e.to_string()));
+                                                       // 【提交失败完整收尾(2026-11 修复,防回归勿删)】
+                                                       // 典型场景:引擎 RequestBodyLimitLayer 拒 413
+                                                       // (请求体超限)。旧实现此处 yield Err 后裸
+                                                       // return——引擎 io_request 悬挂、turn 不落账、
+                                                       // 零日志零 Done,用户侧表现为会话静默软死,
+                                                       // 根因(整史 messages 冗余,见上文注释)只能靠
+                                                       // 逐层考古。现对齐 max_steps/LLM 流失败臂先例:
+                                                       // 补交 error io_response 防悬挂(best-effort,
+                                                       // error 标记不触输出门禁)+Error 事件+turn 结束
+                                                       // +flush+tool_traces+Done,失败可见可诊断。
+                                                       let status = match &e {
+                                                           ApiError::ApiError { status, .. } => Some(*status),
+                                                           _ => None,
+                                                       };
+                                                       let request_bytes = serde_json::to_vec(&resp)
+                                                           .map(|b| b.len())
+                                                           .unwrap_or(0);
+                                                       warn!(
+                                                           %session_id,
+                                                           request_id = rid,
+                                                           error_status = status,
+                                                           request_bytes,
+                                                           error = %e,
+                                                           "final io_response submit failed; completing turn with error"
+                                                       );
+                                                       let err_str = e.to_string();
+                                                       if let Err(ie) = runner.evorule_client
+                                                           .submit_io_response(
+                                                               &session_id,
+                                                               rid,
+                                                               &serde_json::json!({"content": "", "error": &err_str}),
+                                                               Some(err_str.as_str()),
+                                                           )
+                                                           .await
+                                                       {
+                                                           warn!(
+                                                               %session_id,
+                                                               request_id = rid,
+                                                               error = %ie,
+                                                               "error io_response follow-up submit also failed"
+                                                           );
+                                                       }
+                                                       yield Ok(AgentEvent::Error(
+                                                           AgentError::EvoruleError(err_str.clone()),
+                                                       ));
+                                                       let duration = start_time.elapsed().as_millis() as u64;
+                                                       if let Some(g) = turn_guard.take() {
+                                                           g.end("error", step_count as u64, duration);
+                                                       }
+                                                       if let Err(fe) = runner.flush_messages(&session_id).await {
+                                                           warn!(
+                                                               %session_id,
+                                                               error = %fe,
+                                                               "flush_messages during failure wrap-up failed"
+                                                           );
+                                                       }
+                                                       runner.submit_tool_traces(&session_id).await;
+                                                       yield Ok(AgentEvent::Done(AgentResult::error(
+                                                           AgentError::EvoruleError(err_str).to_string(),
+                                                           step_count,
+                                                           duration,
+                                                       )));
                                                        return;
                                                    }
                                                }
@@ -9901,6 +9979,7 @@ impl AgentRunner {
                                                        .submit_io_response(&session_id, rid, &result_value, None)
                                                        .await
                                                    {
+                                                       warn!(%session_id, request_id = rid, error = %e, "call_service io_response submit failed");
                                                        yield Err(AgentError::EvoruleError(e.to_string()));
                                                        return;
                                                    }
@@ -9977,6 +10056,7 @@ impl AgentRunner {
                                        let state = match runner.evorule_client.get_state(&session_id).await {
                                            Ok(s) => s,
                                            Err(e) => {
+                                               warn!(%session_id, error = %e, "get_state at Stable failed");
                                                yield Err(AgentError::EvoruleError(e.to_string()));
                                                return;
                                            }
