@@ -2837,6 +2837,12 @@ fn cmd_serve(
     // (router_with_auth 接管所有权),横幅不能再借用它。
     let auth_enabled = auth_config.enabled();
 
+    // env 载体的鉴权配置已固化(env 优先级在配置装载期消费进 auth_config)——
+    // 此刻清除进程环境内的 token 副本,serve 期内 spawn 的工作区子进程
+    // (shell_exec/python_exec/MCP/docker)不经继承 env 见到 token
+    // (与 EVORULE_SERVICE_TOKEN 捕获即清同款纪律)。
+    evo_agent::api::auth::scrub_auth_env();
+
     // 3.1 SG-0 fail-closed:无任何鉴权配置不再是「静默 disabled」。
     //     改造前此处只有一行 `[auth] HTTP API authentication disabled`,而下方横幅
     //     仍把每个端点标成 `(auth)` —— 横幅与事实相反,且裸 `serve --port 8081`
