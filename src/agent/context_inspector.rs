@@ -177,9 +177,13 @@ pub struct I2Verdict {
 /// journal I2ScanReport 权威面,本计数面供 ATIF/报告快速读取)。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct I2VerdictSummary {
+    /// 进入判定的冲突记录总数（逐条明细在 journal I2ScanReport 权威面）
     pub total: usize,
+    /// 判定为真矛盾（contradiction）的记录数
     pub contradiction: usize,
+    /// 判定为良性共存（benign：辖域不同/词形撞车）的记录数
     pub benign: usize,
+    /// 已执行精判但无法判定（uncertain）的记录数
     pub uncertain: usize,
     /// 语义精判未执行(None:第二级通路关闭/sidecar 不可用)——与 uncertain
     /// (已执行但无法判定)分列

@@ -157,7 +157,7 @@ fn catalog_group_of(name: &str) -> (&str, Option<(&'static str, &'static str)>) 
             || (name.len() > prefix.len()
                 && name.starts_with(prefix)
                 && name.as_bytes()[prefix.len()] == b'_');
-        if hit && best.map_or(true, |(bp, _, _)| prefix.len() > bp.len()) {
+        if hit && best.is_none_or(|(bp, _, _)| prefix.len() > bp.len()) {
             best = Some((prefix, display, scenario));
         }
     }
@@ -176,8 +176,9 @@ fn render_service_catalog_from(names: &[&str]) -> Option<String> {
     if names.is_empty() {
         return None;
     }
-    let mut groups: BTreeMap<&str, (Option<(&'static str, &'static str)>, Vec<&str>)> =
-        BTreeMap::new();
+    type CatalogGroups<'a> =
+        BTreeMap<&'a str, (Option<(&'static str, &'static str)>, Vec<&'a str>)>;
+    let mut groups: CatalogGroups = BTreeMap::new();
     for name in names {
         let (key, meta) = catalog_group_of(name);
         groups.entry(key).or_insert((meta, Vec::new())).1.push(name);

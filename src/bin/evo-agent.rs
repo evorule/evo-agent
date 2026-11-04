@@ -826,6 +826,7 @@ fn startup_preflight(
 /// 报告(JSON,stdout;日志走 stderr)。显式执行即意愿表达,不走拉起批准
 /// 清单装载门;最小环境纪律复用 StdioTransport spawn 核心。报告只进报告
 /// 与提案,不改变任何许可语义(机器提议,人工批准)。
+#[allow(clippy::too_many_arguments)] // 子命令旗标逐一平铺,与 clap 字段一一对应,收拢反损调用点对位可读性
 fn cmd_mcp_inspect(
     workdir: &Path,
     server: Option<&str>,
