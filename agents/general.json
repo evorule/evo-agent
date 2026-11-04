@@ -28,6 +28,7 @@
     "query_trace",
     "read_back",
     "diff_runs",
+    "tool_result_fetch",
     "shell_exec",
     "http_get",
     "ask_user",
