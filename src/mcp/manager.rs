@@ -175,23 +175,15 @@ impl McpManager {
                 "stdio" => {
                     let args: Vec<&str> = cfg.args.iter().map(|s| s.as_str()).collect();
                     let limits = super::lifecycle::ResourceLimits::from_config(cfg);
-                    std::sync::Arc::new(if cfg.env.is_empty() {
+                    std::sync::Arc::new(
                         StdioTransport::spawn_with_env_and_limits(
                             &cfg.command,
                             &args,
                             &cfg.env,
                             &limits,
                         )
-                        .await?
-                    } else {
-                        StdioTransport::spawn_with_env_and_limits(
-                            &cfg.command,
-                            &args,
-                            &cfg.env,
-                            &limits,
-                        )
-                        .await?
-                    })
+                        .await?,
+                    )
                 }
                 "streamable_http" => {
                     let url = cfg.url.as_deref().unwrap_or("");

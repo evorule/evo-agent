@@ -1457,8 +1457,10 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let mut cfg = crate::config::LlmConfig::default();
-        cfg.max_tokens = Some(32768);
+        let cfg = crate::config::LlmConfig {
+            max_tokens: Some(32768),
+            ..Default::default()
+        };
         let state = AgentApiState::new_with_metrics(
             crate::agent::AgentDefinitionManager::new(agents_dir),
             EvoruleApiClient::new("http://localhost:0"),

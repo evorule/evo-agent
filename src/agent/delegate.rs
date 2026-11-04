@@ -388,10 +388,9 @@ impl DelegateContext {
         // 聚焦快照=装配面（注册面本身）——LLM 契约面（messages 侧 tools
         // payload，同为注册面）与管道②聚焦允许面同源，静态表不再自动
         // 进入子代理允许面（union 提权面在装配期收口）。
-        let mut runner =
-            crate::agent::runner::AgentRunner::new(config, self.evorule_client.clone())
-                .with_delegate_pipeline_entry()
-                .with_assembly_scope_focus();
+        let runner = crate::agent::runner::AgentRunner::new(config, self.evorule_client.clone())
+            .with_delegate_pipeline_entry()
+            .with_assembly_scope_focus();
         // LLM handler 下放接线(构造点 Some 时覆盖 with_defaults 缺省——
         // 统一解析产物随子代理同源,防 4096 硬兜底截断推理模型思考)
         let mut runner = self.wire_llm_handler(runner);
@@ -769,8 +768,10 @@ mod tests {
     fn sub_runner_inherits_llm_max_tokens_config() {
         // 构造点下放的 handler 必须原样落到子 runner——统一解析产物
         // ([llm] max_tokens)随行,否则子 runner 落 with_defaults 4096 硬兜底
-        let mut cfg = crate::config::LlmConfig::default();
-        cfg.max_tokens = Some(32768);
+        let cfg = crate::config::LlmConfig {
+            max_tokens: Some(32768),
+            ..Default::default()
+        };
         let ctx = make_ctx().with_llm_handler(crate::io_handlers::LlmHandler::from_config(&cfg));
         let runner = ctx.wire_llm_handler(crate::agent::runner::AgentRunner::new(
             crate::agent::runner::AgentConfig::default(),

@@ -385,7 +385,6 @@ pub(crate) fn ensure_spawn_allowed(
     // 未过期；包外/包未就绪/已过期一律拒载（fail-closed）并留阻塞事件（任务
     // 报告标注）。治理清单已批准=无提案语义（提案面向未登记面；包外是授权
     // 面收紧，治理面更新能力包后下轮生效）。
-    let mut result = result;
     if pack_mode {
         if let Ok((outcome, server_key)) = &result {
             if *outcome == GateOutcome::Allowed {

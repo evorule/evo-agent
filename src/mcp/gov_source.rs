@@ -125,10 +125,7 @@ impl GovCache {
     /// 持续失败的时长
     pub(crate) fn degraded_duration(&self) -> Option<Duration> {
         let st = self.state.lock().unwrap();
-        if st
-            .last_success
-            .map_or(false, |t| t.elapsed() <= self.cfg.ttl)
-        {
+        if st.last_success.is_some_and(|t| t.elapsed() <= self.cfg.ttl) {
             return None;
         }
         Some(
