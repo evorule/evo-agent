@@ -35,6 +35,7 @@ pub mod budget_report;
 pub mod builtin_tools;
 pub mod config;
 pub mod dap;
+pub mod detect;
 pub mod dotenv;
 pub mod git;
 pub mod governance;

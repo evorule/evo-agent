@@ -1,0 +1,95 @@
+{
+  "version": "1.0.0",
+  "rules": [
+    {
+      "rule_id": "mcp-call-rate",
+      "scope": {
+        "source": "session_journal",
+        "event": "tool_invoked",
+        "tool_prefix": "mcp_"
+      },
+      "predicate": {
+        "type": "count_over_window",
+        "threshold": 50,
+        "window_secs": 300,
+        "group_by_tool": true
+      },
+      "severity": "warning",
+      "rationale": "单 server 工具调用频次异常（业界 SIEM 超量调用基线的确定性化；按工具分组即按 server 主体计数）"
+    },
+    {
+      "rule_id": "tool-failure-cluster",
+      "scope": {
+        "source": "session_journal",
+        "event": "tool_result",
+        "ok": false
+      },
+      "predicate": {
+        "type": "count_over_window",
+        "threshold": 5,
+        "window_secs": 120,
+        "group_by_tool": true
+      },
+      "severity": "warning",
+      "rationale": "连续调用失败聚类（同工具短窗高密失败=配置漂移/权限退化/目标异常的可观测先兆）"
+    },
+    {
+      "rule_id": "approval-denied-retry",
+      "scope": {
+        "source": "session_journal"
+      },
+      "predicate": {
+        "type": "sequence_contains",
+        "sequence": [
+          {
+            "event": "approval_resolved",
+            "ok": false
+          },
+          {
+            "event": "tool_invoked",
+            "same_tool_as_previous": true
+          }
+        ]
+      },
+      "severity": "warning",
+      "rationale": "审批拒绝后同工具重试簇（拒绝后立即同工具再试=绕过审批意图的形态信号；处置仍归人工）"
+    },
+    {
+      "rule_id": "credential-field-touch",
+      "scope": {
+        "source": "session_journal"
+      },
+      "predicate": {
+        "type": "sequence_contains",
+        "sequence": [
+          {
+            "event": "approval_requested",
+            "payload_any": [
+              "api_key",
+              "access_token",
+              "secret",
+              "password",
+              "private key"
+            ]
+          }
+        ]
+      },
+      "severity": "warning",
+      "rationale": "凭据相关字段触达（观测面=审批命令载荷；工具参数在 journal 只存 digest，审批载荷是唯一明文面；与 egress 守卫的人工复核面互补）"
+    },
+    {
+      "rule_id": "spawn-reject-retry-storm",
+      "scope": {
+        "source": "session_journal",
+        "event": "mcp_capability_blocked"
+      },
+      "predicate": {
+        "type": "count_over_window",
+        "threshold": 3,
+        "window_secs": 600
+      },
+      "severity": "warning",
+      "rationale": "spawn 拒载后高频重试（能力未授权的服务反复尝试拉起=治理门被探测的形态信号；依赖 mcp_capability_blocked 落账面）"
+    }
+  ]
+}

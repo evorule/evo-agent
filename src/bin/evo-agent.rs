@@ -405,6 +405,30 @@ enum Command {
         #[arg(long, value_hint = ValueHint::FilePath)]
         out: Option<PathBuf>,
     },
+
+    /// Run behavior detection rules over a session journal (batch, zero hot
+    /// path). Deterministic predicates (count-over-window / sequence /
+    /// numeric-field) evaluate the journal stream and print the detection
+    /// report as JSON on stdout (logs go to stderr). Hits are FINDINGS only -
+    /// nothing is blocked or auto-handled; disposal stays with the human.
+    /// The built-in baseline ruleset ships with the binary; --rules loads a
+    /// custom ruleset, pinned by content hash into the report. Exit code
+    /// reflects operational success only - hits do not fail the command.
+    Detect {
+        /// Session id (journal resolved at data/sessions/{session}.jsonl
+        /// under the workdir, same sanitization as the writer side)
+        #[arg(long)]
+        session: String,
+
+        /// Detection ruleset file (JSON {version, rules}); omit for the
+        /// built-in baseline ruleset
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        rules: Option<PathBuf>,
+
+        /// Also write the detection report JSON to this file
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -636,6 +660,14 @@ fn main() -> ExitCode {
                 out.as_deref(),
             )
         }),
+        Command::Detect {
+            session,
+            rules,
+            out,
+        } => {
+            // 检测命中是发现不是失败——退出码只反映操作成败（文件缺失/规则非法）。
+            cmd_detect(&cli.workdir, &session, rules.as_deref(), out.as_deref())
+        }
     }
 }
 
@@ -938,6 +970,83 @@ fn cmd_mcp_inspect(
             }
         }
     }
+    ExitCode::SUCCESS
+}
+
+/// detect 子命令:行为检测规则跑批(离线批处理,零热路径)——对一份会话
+/// journal 跑确定性谓词评估,检测报告 JSON 走 stdout(日志走 stderr,与
+/// mcp-inspect 同惯例)。命中=发现不是失败:退出码只反映操作成败
+/// (journal 缺失/规则集非法=2;评估/落盘故障=1);规则集显式文件优先,
+/// 缺省=内置基线(内容哈希钉桩随报告)。
+fn cmd_detect(workdir: &Path, session: &str, rules: Option<&Path>, out: Option<&Path>) -> ExitCode {
+    let ruleset = match rules {
+        Some(path) => match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| evo_agent::detect::parse_ruleset(&raw).map_err(|e| e.to_string()))
+        {
+            Ok(rs) => rs,
+            Err(e) => {
+                eprintln!("error: ruleset {}: {e}", path.display());
+                return ExitCode::from(2);
+            }
+        },
+        None => evo_agent::detect::baseline_ruleset(),
+    };
+    let path = workdir.join("data").join("sessions").join(format!(
+        "{}.jsonl",
+        evo_agent::agent::journal::sanitize_session_id(session)
+    ));
+    if !path.exists() {
+        eprintln!("error: journal not found: {}", path.display());
+        return ExitCode::from(2);
+    }
+    let lines = match evo_agent::agent::journal::read_all_tolerant(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: read journal {}: {e}", path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let report = match evo_agent::detect::evaluate(&ruleset, session, &lines) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: evaluate: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // 命中告警=结构化留痕(发现面;处置永远人工——与提案审批同信任模型)
+    for hit in &report.hits {
+        let seqs: Vec<u64> = hit.evidence.iter().map(|e| e.seq).collect();
+        tracing::warn!(
+            target: "behavior_detect",
+            rule_id = %hit.rule_id,
+            severity = %hit.severity,
+            evidence_seqs = ?seqs,
+            "behavior rule hit: {}", hit.detail
+        );
+    }
+    let value = match evo_agent::detect::report_with_hash(&report) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: pin report hash: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let rendered = serde_json::to_string_pretty(&value).unwrap_or_default();
+    println!("{rendered}");
+    if let Some(out) = out {
+        if let Err(e) = std::fs::write(out, rendered.as_bytes()) {
+            eprintln!("error: write report {}: {e}", out.display());
+            return ExitCode::from(1);
+        }
+        eprintln!("[detect] report written to {}", out.display());
+    }
+    eprintln!(
+        "[detect] {} events scanned, {} rule(s) fired, {} clean",
+        report.events_scanned,
+        report.hits.len(),
+        report.rules_clean.len()
+    );
     ExitCode::SUCCESS
 }
 
