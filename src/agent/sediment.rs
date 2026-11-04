@@ -161,6 +161,10 @@ pub struct SedimentResult {
     /// LLM 输出 JSON 解析最终失败计数（截断/非法转义修复兜底后仍失败——
     /// 候选/合并/摘要产物丢账留痕，与 warn 日志对账；修复生效不在此列）
     pub json_parse_failures: usize,
+    /// 未知事件 kind 兜底计数：模型输出枚举名外的 kind 串被确定性兜底为
+    /// Custom 存活（raw 保留在 Custom 串内）——与提取面 warn 日志对账，
+    /// 防「解析成功但形态异常」静默无账
+    pub unknown_kind_events: usize,
     /// S-5 收尾批：成功提议到治理数据集的候选 event_id 列表
     /// （Draft 回执=提议凭据；失败/不达标候选不在此列，保持原态下批重试）
     pub knowledge_proposed: Vec<String>,
@@ -1619,6 +1623,12 @@ async fn extract_and_store_events(
             .await
         {
             Ok(Some(event)) => {
+                // 未知 kind 兜底对账：事件以 Custom 兜底形态存活（提取面已
+                // warn 留痕原 JSON 摘录），此处计数使「形态异常但成功」可对账
+                if matches!(&event.event_type, EventType::Custom(s) if s.starts_with("unrecognized_kind:"))
+                {
+                    result.unknown_kind_events += 1;
+                }
                 let key = format!("events.{}", event.event_id);
                 let value = match serde_json::to_string(&event) {
                     Ok(v) => v,
@@ -2417,6 +2427,52 @@ mod tests {
         // E17 主断言：事件被提取并写入（修复前 result.events 恒为空）
         assert_eq!(result.events.len(), 1, "关键词触发的事件应被提取");
         assert!(result.events[0].starts_with("E-s1-"));
+        m1.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_sediment_counts_unknown_kind_salvage() {
+        // 未知 kind 兜底计数：解析成功但事件类型为兜底形态 → 计入
+        // unknown_kind_events（与提取面 warn 日志对账，防「形态异常但
+        // 成功」静默无账）；事件本身存活不丢
+        let mut server = mockito::Server::new_async().await;
+        use crate::api::evorule_client::EvoruleApiClient;
+        use crate::io_handlers::LlmHandler;
+        let client = EvoruleApiClient::new(&server.url());
+        let mut memory = MemoryManager::new("test", client).with_session_id("s1");
+
+        let cfg = SedimentConfig {
+            namespace: "test".to_string(),
+            ..Default::default()
+        };
+        let mock_response = r#"{"event_type":{"kind":"ContextMechanismSelfCheckRequest"},"entities":[],"content":{"summary":"上下文自检"},"emotion":null,"tags":[]}"#;
+        let mut extractor = EventExtractor::with_defaults(LlmHandler::mock(mock_response));
+        let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
+            memory: &mut memory,
+            summarizer: None,
+            extractor: Some(&mut extractor),
+            event_store: None,
+            auditor: None,
+            journal_lines: Vec::new(),
+        };
+        let messages = vec![Message::User {
+            content: "记住这件事,系统做了上下文自检".to_string(),
+            images: Vec::new(),
+        }];
+        let m1 = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .with_status(200)
+            .match_body(mockito::Matcher::Regex(
+                r#"unrecognized_kind:ContextMechanismSelfCheckRequest"#.to_string(),
+            ))
+            .create_async()
+            .await;
+
+        let result = sediment(&mut deps, &cfg, "s1", &messages).await;
+
+        assert_eq!(result.events.len(), 1, "兜底事件应存活不丢");
+        assert_eq!(result.unknown_kind_events, 1, "未知 kind 兜底计入计数");
         m1.assert_async().await;
     }
 
