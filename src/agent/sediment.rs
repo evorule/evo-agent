@@ -158,8 +158,8 @@ pub struct SedimentResult {
     /// 会话收尾补写成功的离线积压事件数（CacheOnly→Persisted 对账闭环;
     /// 0=无积压或补写失败——与 stable_facts_cache_only 同款防虚报口径）
     pub flushed_events: usize,
-    /// LLM 输出 JSON 解析最终失败计数（截断修复兜底后仍失败——候选/
-    /// 合并产物丢账留痕，与 warn 日志对账；修复生效不在此列）
+    /// LLM 输出 JSON 解析最终失败计数（截断/非法转义修复兜底后仍失败——
+    /// 候选/合并/摘要产物丢账留痕，与 warn 日志对账；修复生效不在此列）
     pub json_parse_failures: usize,
     /// S-5 收尾批：成功提议到治理数据集的候选 event_id 列表
     /// （Draft 回执=提议凭据；失败/不达标候选不在此列，保持原态下批重试）
@@ -290,7 +290,15 @@ pub async fn sediment(
                     }
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "sediment: summarize_session failed"),
+            Err(e) => {
+                // 摘要丢账计数:解析面失败(截断/非法转义修复 + 单次重试后
+                // 仍败)计入 json_parse_failures,与候选面同口径——静默
+                // 丢账升为可对账计数;传输失败(LLM 调用报错)不在此列
+                if e.starts_with("parse session summary") {
+                    result.json_parse_failures += 1;
+                }
+                tracing::warn!(error = %e, "sediment: summarize_session failed");
+            }
         }
     }
 
@@ -2319,6 +2327,41 @@ mod tests {
         assert!(!result.summary_written);
         assert!(result.stable_facts.is_empty());
         assert!(!result.rollup_done);
+    }
+
+    #[tokio::test]
+    async fn test_sediment_counts_summary_parse_failures() {
+        // 摘要丢账计数：summarize_session 解析面失败（修复兜底 + 单次重试后
+        // 仍败）计入 json_parse_failures——静默丢账升为可对账计数
+        use crate::agent::summarizer::ContextSummarizer;
+        use crate::api::evorule_client::EvoruleApiClient;
+        use crate::io_handlers::LlmHandler;
+        let client = EvoruleApiClient::new("http://localhost:8080");
+        let mut memory = MemoryManager::new("test", client).with_session_id("s1");
+        let summarizer = ContextSummarizer::new(LlmHandler::mock("not json at all"), None);
+        let cfg = SedimentConfig {
+            namespace: "test".to_string(),
+            ..Default::default()
+        };
+        let mut deps = SedimentDeps {
+            available_tools: Vec::new(),
+            memory: &mut memory,
+            summarizer: Some(&summarizer),
+            extractor: None,
+            event_store: None,
+            auditor: None,
+            journal_lines: Vec::new(),
+        };
+        let messages = vec![Message::User {
+            content: "hello".to_string(),
+            images: Vec::new(),
+        }];
+        let result = sediment(&mut deps, &cfg, "s1", &messages).await;
+        assert!(!result.summary_written);
+        assert_eq!(
+            result.json_parse_failures, 1,
+            "summary parse failure counted (transport errors excluded)"
+        );
     }
 
     // ===== R07（E17 接线）：事件提取 → shared.{ns}.events.* =====

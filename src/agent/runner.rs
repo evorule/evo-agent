@@ -3231,6 +3231,22 @@ impl AgentRunner {
             // B22-C T4:会话终态事件与 sediment 并联(结构化面 vs 叙事面分工;
             // summary_ref v1 恒 null——SedimentResult 无摘要路径字段,v1.x 扩展)
             if let Some(ledger) = &self.event_ledger {
+                // 配额丢账持久记账(末轮兜底):会话终态无下一轮重置点,
+                // 末轮超配额丢弃数在此落账后再记终态事件
+                let elided = ledger.take_turn_elided().await;
+                if elided > 0 {
+                    if let Some(j) = journal {
+                        if let Err(e) =
+                            j.write_event(crate::agent::journal::JournalEvent::ToolEventsElided {
+                                turn: self.session_turns,
+                                count: elided,
+                                quota: crate::agent::event_ledger::DEFAULT_TURN_QUOTA,
+                            })
+                        {
+                            warn!(error = %e, "tool events elided journal failed");
+                        }
+                    }
+                }
                 ledger.record_session_end(self.session_turns).await;
             }
             if let Some(j) = journal {
@@ -7564,6 +7580,28 @@ impl AgentRunner {
                            // runner 自有轮计数——journal 缺席的 CLI 纯路径照常成立)
                            runner.session_turns = runner.session_turns.saturating_add(1);
                            if let Some(ledger) = &runner.event_ledger {
+                               // 配额丢账持久记账:上一轮超配额丢弃数随 journal
+                               // 落账(观测面;与工具结果 elided 落账同口径——
+                               // 丢弃不再只是进程内 warn)。取走即清零,随后
+                               // begin_turn 重置配额
+                               let elided = ledger.take_turn_elided().await;
+                               if elided > 0 {
+                                   if let Some(j) = &journal {
+                                       if let Err(e) = j.write_event(
+                                           crate::agent::journal::JournalEvent::ToolEventsElided {
+                                               turn: runner.session_turns.saturating_sub(1),
+                                               count: elided,
+                                               quota: crate::agent::event_ledger::DEFAULT_TURN_QUOTA,
+                                           },
+                                       ) {
+                                           warn!(
+                                               %session_id,
+                                               error = %e,
+                                               "tool events elided journal failed"
+                                           );
+                                       }
+                                   }
+                               }
                                ledger.begin_turn(runner.session_turns).await;
                            }
                            // 自主交接 PR-H3:链熔断观察窗挂接(仅派生子会话携带 chain_watch

@@ -45,7 +45,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::agent::audited_llm::AuditedLlm;
-use crate::agent::json_repair::{adaptive_max_tokens, repair_truncated_json};
+use crate::agent::json_repair::{adaptive_max_tokens, from_str_with_repair};
 use crate::agent::translator::{LlmResponse, Message};
 use crate::io_handler::IoHandler;
 use crate::io_handlers::LlmHandler;
@@ -667,24 +667,16 @@ impl ContextSummarizer {
             };
 
             // 从可能包含 markdown 代码块的文本中提取 JSON;
-            // 截断修复兜底:半途 EOF 的 JSON 先修复再解析
+            // 截断/非法转义修复兜底:半途 EOF 或含非法转义的 JSON
+            // 先修复再解析(共享容错入口,与候选提取/巩固同口径)
             let json_str = extract_json_from_text(&response.content);
-            let mut repaired = false;
-            let parsed = serde_json::from_str::<SessionSummaryOut>(&json_str).or_else(|first| {
-                for cand in repair_truncated_json(&json_str) {
-                    if let Ok(out) = serde_json::from_str::<SessionSummaryOut>(&cand) {
-                        repaired = true;
-                        return Ok(out);
-                    }
-                }
-                Err(first)
-            });
+            let parsed = from_str_with_repair::<SessionSummaryOut>(&json_str);
             match parsed {
-                Ok(out) => {
+                Ok((out, repaired)) => {
                     if repaired {
                         tracing::warn!(
-                            "summarize_session: truncated summary JSON repaired \
-                             (partial content kept)"
+                            "summarize_session: malformed summary JSON repaired \
+                             (truncation or invalid escape; partial content kept)"
                         );
                     }
                     return Ok(out);
@@ -821,6 +813,7 @@ fn extract_json_from_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::json_repair::repair_truncated_json;
     use crate::agent::translator::ToolCall;
     use serde_json::json;
 
@@ -1262,6 +1255,20 @@ mod tests {
         let s = ContextSummarizer::new(llm, None);
         let result = s.summarize_session("User: hi").await.unwrap();
         assert_eq!(result.summary, "重试后摘要");
+    }
+
+    #[tokio::test]
+    async fn test_summarize_session_invalid_escape_repaired_without_retry() {
+        // 非法转义响应（反斜杠后跟非合法转义字符的 Windows 路径类内容）：
+        // 转义字面化修复直接救回（无需第二次 LLM 调用）——脚本只给一步，
+        // 若发生第二次调用会 "mock script exhausted" 报错
+        let llm = LlmHandler::mock_scripted(vec![Ok(
+            r#"{"summary":"工作目录 D:\资料\备份","stable_facts":[]}"#.to_string(),
+        )]);
+        let s = ContextSummarizer::new(llm, None);
+        let result = s.summarize_session("User: hi").await.unwrap();
+        assert_eq!(result.summary, r"工作目录 D:\资料\备份");
+        assert!(result.stable_facts.is_empty());
     }
 
     #[tokio::test]

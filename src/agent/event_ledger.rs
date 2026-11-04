@@ -16,7 +16,9 @@
 //! effects 反向链真实成立；轨道首事件为根（cause=None）。
 //!
 //! 配额/开关：每轮工具事件最多
-//! [`DEFAULT_TURN_QUOTA`] 条（超限丢弃 + 每轮一次 warn 留痕，里程碑重置）；
+//! [`DEFAULT_TURN_QUOTA`] 条（超限丢弃 + 每轮一次 warn 留痕，里程碑重置；
+//! 超限丢弃数另有计数，由 runner 在轮顶重置/会话终态取走随 journal 持久
+//! 记账——配额丢弃从进程内 warn 升为审计链可回放事实）；
 //! 进程级开关 [`event_ledger_enabled`]（serve 启动期自 settings
 //! `agentTools.eventLedger` 安装，CLI 不 init 缺省开）。
 
@@ -229,6 +231,10 @@ struct LedgerInner {
     prev_fact: Option<FactId>,
     turn_written: usize,
     turn_warned: bool,
+    /// 本轮超配额丢弃的工具事件数（与 turn_written 同生命周期，begin_turn
+    /// 重置；由 runner 经 [`EventLedger::take_turn_elided`] 取走随 journal
+    /// 持久记账）
+    turn_dropped: usize,
     /// 开具/注入待办（写入失败传感器置位；下一次 persist 前置重开具重注入）
     needs_ensure: bool,
 }
@@ -303,6 +309,8 @@ impl LedgerInner {
     /// T1 配额闸（每轮 [`DEFAULT_TURN_QUOTA`] 条；超限丢弃 + 每轮一次 warn）
     fn try_admit_tool_event(&mut self) -> bool {
         if self.turn_written >= DEFAULT_TURN_QUOTA {
+            // 超限丢弃留痕：丢账计数 + 每轮一次 warn（丢弃语义/配额不动）
+            self.turn_dropped += 1;
             if !self.turn_warned {
                 self.turn_warned = true;
                 tracing::warn!(
@@ -407,6 +415,7 @@ impl EventLedger {
                 prev_fact: None,
                 turn_written: 0,
                 turn_warned: false,
+                turn_dropped: 0,
                 needs_ensure: false,
             }),
             gov_session_path: OnceLock::new(),
@@ -441,11 +450,19 @@ impl EventLedger {
         let mut g = self.inner.lock().await;
         g.turn_written = 0;
         g.turn_warned = false;
+        g.turn_dropped = 0;
         if turn == 1 || turn.is_multiple_of(MILESTONE_EVERY_TURNS) {
             let seq = g.next_seq();
             let event = build_milestone_event(seq, turn, now_secs());
             g.persist(event, self.gov_session_path.get()).await;
         }
+    }
+
+    /// 取走并清零本轮超配额丢弃计数（配额丢账持久记账的取数口：runner
+    /// 在轮顶重置前/会话终态取走，随 journal 落 `ToolEventsElided`）
+    pub async fn take_turn_elided(&self) -> usize {
+        let mut g = self.inner.lock().await;
+        std::mem::take(&mut g.turn_dropped)
     }
 
     /// T1 工具调用完成（成败皆记；配额内准入，返回是否实际落链）
@@ -558,6 +575,7 @@ mod tests {
             prev_fact: None,
             turn_written: 0,
             turn_warned: false,
+            turn_dropped: 0,
             needs_ensure: false,
         };
         let admitted: Vec<bool> = (0..7).map(|_| inner.try_admit_tool_event()).collect();
@@ -593,6 +611,36 @@ mod tests {
         // 低频事件不受工具配额约束
         assert!(ledger.record_approval("A-1", "approved").await);
         assert!(ledger.record_session_end(3).await);
+    }
+
+    #[tokio::test]
+    async fn tool_event_drops_counted_and_drained_for_accounting() {
+        // 配额丢账计数：超配额丢弃数可取走（take 语义：取走即清零），
+        // begin_turn 重置后新一轮从零计——为 journal 持久记账供数
+        let ledger = EventLedger::new(
+            MemoryEventStore::new("agent_test", dead_client()),
+            "agent_test",
+            dead_client(),
+        );
+        ledger.set_session_id("sess-el-elided").await;
+        for _ in 0..(DEFAULT_TURN_QUOTA + 2) {
+            let _ = ledger.record_tool_completion("echo", true, 1, None).await;
+        }
+        assert_eq!(ledger.take_turn_elided().await, 2, "excess drops counted");
+        assert_eq!(
+            ledger.take_turn_elided().await,
+            0,
+            "take drains the counter"
+        );
+        // 下一轮重置：配额内丢弃为零
+        ledger.begin_turn(2).await;
+        assert_eq!(ledger.take_turn_elided().await, 0);
+        let _ = ledger.record_tool_completion("echo", true, 1, None).await;
+        assert_eq!(
+            ledger.take_turn_elided().await,
+            0,
+            "within quota = no drops counted"
+        );
     }
 
     #[test]
@@ -667,6 +715,7 @@ mod tests {
             prev_fact: None,
             turn_written: 0,
             turn_warned: false,
+            turn_dropped: 0,
             needs_ensure: false,
         };
         // 传感器：写入失败（fact_id=0）武装自愈待办

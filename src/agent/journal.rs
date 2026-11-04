@@ -652,6 +652,19 @@ pub enum JournalEvent {
         /// 降级原因(journal_disabled | offload_failed)
         reason: String,
     },
+    /// 工具事件超配额丢弃落账：每轮工具事件超过配额（见 event ledger 的
+    /// per-turn quota）时超出部分不落事件轨道，本事件把「第 turn 轮丢弃了
+    /// count 条」随 journal 持久记账（落账时机 = 下一轮轮顶重置时 / 会话
+    /// 终态兜底）——配额丢弃从仅进程内 warn 升为审计链可回放事实。
+    /// 观测面事件，不参与步映射（ServiceToolsDegraded 同款先例）。
+    ToolEventsElided {
+        /// 丢弃发生的轮序号（runner 轮计数）
+        turn: u64,
+        /// 本轮超配额未落账的工具事件数
+        count: usize,
+        /// 生效的每轮配额
+        quota: usize,
+    },
     /// MCP 能力未授权阻塞落账(无人值守防护层):pack 绑定任务的装载门拒载
     /// (包外/包未就绪/过期/降级冻结)时随会话 journal 落账,使「此路径阻塞」
     /// 在任务报告显式可见(治理面更新能力包/恢复连接后下轮生效)。
@@ -2482,6 +2495,36 @@ mod tests {
                 );
             }
             other => panic!("expected companion_cert_unreachable, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_events_elided_roundtrip_via_file() {
+        // 配额丢账持久记账：write_event 经文件回读原样（链哈希段完整，
+        // 审计链可回放——超配额丢弃不再只是进程内 warn）
+        let dir = std::env::temp_dir().join(format!("jf-toolelided-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-toolelided").unwrap();
+            w.write_event(JournalEvent::ToolEventsElided {
+                turn: 3,
+                count: 2,
+                quota: 5,
+            })
+            .unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-toolelided")).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].hashes.is_some(), "链哈希段应完整");
+        match &lines[0].event {
+            JournalEvent::ToolEventsElided { turn, count, quota } => {
+                assert_eq!(*turn, 3);
+                assert_eq!(*count, 2);
+                assert_eq!(*quota, 5);
+            }
+            other => panic!("expected tool_events_elided, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
