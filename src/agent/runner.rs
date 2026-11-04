@@ -5506,8 +5506,10 @@ impl AgentRunner {
         precomputed: Option<Value>,
     ) -> Result<(Value, Option<Value>), AgentError> {
         // 引用取回保留名直拦(先于管道):只读本地无副作用,不经治理八阶段;
-        // 审计面照常由外层 tool_invoked/tool_result 落账。并行臂不拦——
-        // 不在聚焦面会被②结构化拒绝(fail-visible),LLM 单独重调即可。
+        // 审计面照常由外层 tool_invoked/tool_result 落账。本工具现已挂
+        // 契约面(manifest+默认工具集注册+agent 白名单),但本拦截仍是唯一真
+        // 执行点(持有 journal_dir 会话态);注册的 stub 仅并行臂路径可达,
+        // fail-visible 提示后 LLM 单独重调即至此。
         if tool_name == TOOL_RESULT_FETCH_TOOL {
             return Ok((self.execute_tool_result_fetch(args), None));
         }

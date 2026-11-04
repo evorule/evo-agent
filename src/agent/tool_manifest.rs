@@ -463,7 +463,7 @@ fn base(name: &str, source: ToolSource, spec: SpecSource, domains: Vec<CapDomain
     }
 }
 
-/// 内置工具 manifest（37 条，与 default_tool_specs 名称集合相等——测试锁）
+/// 内置工具 manifest（39 条，与 default_tool_specs 名称集合相等——测试锁）
 fn builtin_manifests() -> Vec<ToolManifest> {
     use CapDomain::*;
     let b = |name: &str, domains: Vec<CapDomain>| -> ToolManifest {
@@ -521,6 +521,18 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         b("query_trace", vec![Governance]),
         b("read_back", vec![FsRead, Governance]),
         b("diff_runs", vec![Governance]),
+        // 超大结果取回件(只读本地无副作用)。执行真源=runner 保留名
+        // 直拦(execute_tool_result_fetch,先于管道);本表条目+默认工具集注册
+        // 仅为 LLM 契约面可见性(修复「引用块指引调用一个 schema 里不存在
+        // 的工具」)。stub 仅并行臂路径可达,fail-visible 后单独重调走真执行。
+        // 域=纯 Governance(与 query_journal 族同科:读 journal 落盘件,工具
+        // 无 path 参数、不走路径沙箱重绑,文件面由 runner canonical 包含校验
+        // 自防,不进 SANDBOX_CAPABLE_TOOLS)。
+        {
+            let mut m = b("tool_result_fetch", vec![Governance]);
+            m.side_effect = EffectClass::ReadOnly;
+            m
+        },
         // read_skill 按 agent definition skills 声明注册（非 default_safe_toolkit
         // 静态注册），spec 常驻 default_tool_specs；来源标 Skill。
         base(
@@ -901,7 +913,7 @@ fn memory_manifests() -> Vec<ToolManifest> {
     .collect()
 }
 
-/// 全部静态 manifest（102 条；测试锁数量/唯一名/双侧集合相等）
+/// 全部静态 manifest（105 条；测试锁数量/唯一名/双侧集合相等）
 ///
 /// C1 性能收口（PR-3 顺手）：静态表在首次访问后经 OnceLock 缓存——
 /// 构造函数为纯函数（无常量/无环境依赖），行为零变化（调用面拿到的
@@ -1054,9 +1066,24 @@ mod tests {
         //   （批K 段7 人在环 ask_user +1：内置 35→36，数量锁 101→102）
         //   （写面撤销批 workspace_undo +1：内置 36→37，数量锁 102→103）
         //   （交互批 计划模式 plan_submit +1：内置 37→38，数量锁 103→104）
-        assert_eq!(builtin_manifests().len(), 38);
+        //   （取回件 tool_result_fetch +1：内置 38→39，数量锁 104→105）
+        assert_eq!(builtin_manifests().len(), 39);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 104);
+        assert_eq!(all().len(), 105);
+    }
+
+    #[test]
+    fn test_tool_result_fetch_manifest_present() {
+        // 超大结果取回件挂契约面——manifest 在册(ReadOnly 只读分级,
+        // 并行调度分组判据)+ spec 在册(名称集合双侧相等锁的内置侧)
+        let m = lookup_static("tool_result_fetch").expect("manifest registered");
+        assert_eq!(m.side_effect, EffectClass::ReadOnly);
+        assert!(
+            crate::builtin_tools::default_tool_specs()
+                .iter()
+                .any(|s| s.name == "tool_result_fetch"),
+            "spec present in default_tool_specs"
+        );
     }
 
     #[test]
@@ -1165,7 +1192,7 @@ mod tests {
 
     #[test]
     fn test_effect_class_calibration_locked() {
-        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=26；
+        // 读写分级标定锁（并行调度分组判据）：只读族显式标定数=27；
         // 未标定一律 Mutating（保守串行，缺省不变式）。扩标须 diff 审改数。
         let all = static_manifests();
         let readonly: Vec<&str> = all
@@ -1173,7 +1200,7 @@ mod tests {
             .filter(|m| m.side_effect == EffectClass::ReadOnly)
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(readonly.len(), 26, "ReadOnly 标定数锁: {:?}", readonly);
+        assert_eq!(readonly.len(), 27, "ReadOnly 标定数锁: {:?}", readonly);
         let look = |n: &str| lookup_static(n).unwrap().side_effect;
         // 内置只读族抽样
         assert_eq!(look("file_read"), EffectClass::ReadOnly);
@@ -1182,6 +1209,7 @@ mod tests {
         assert_eq!(look("todo_read"), EffectClass::ReadOnly);
         assert_eq!(look("handover_read"), EffectClass::ReadOnly);
         assert_eq!(look("web_search"), EffectClass::ReadOnly);
+        assert_eq!(look("tool_result_fetch"), EffectClass::ReadOnly);
         // memory 只读两件
         assert_eq!(
             look(crate::agent::memory_tool::MEMORY_SEARCH_TOOL),

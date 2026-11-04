@@ -83,6 +83,7 @@ pub mod shell_exec;
 pub mod shell_net_guard;
 pub mod skill_read;
 pub mod todo;
+pub mod tool_result_fetch;
 pub mod web_fetch;
 pub mod web_search;
 pub mod workspace_undo;
@@ -429,12 +430,54 @@ fn default_safe_toolkit_core(
         crate::builtin_tools::plan_submit::PLAN_SUBMIT_TOOL,
         Arc::new(crate::builtin_tools::plan_submit::PlanSubmitTool::new()),
     );
+    // 超大结果取回件契约面挂载。执行真源=runner 保留名直拦
+    // (runner.rs execute_tool_result_fetch,先于管道,持有 journal_dir
+    // 会话态);本注册仅为 LLM 契约面可见性——schema 可见模型才敢调
+    // (修复「引用块指引调用一个 schema 里不存在的工具」)。stub 仅并行
+    // 预取臂路径可达,fail-visible 后单独重调即走真执行;只读无副作用。
+    handler.register_static(
+        "tool_result_fetch",
+        Arc::new(tool_result_fetch::ToolResultFetchStub),
+    );
     handler
 }
 
 /// 列出默认工具集中所有工具的 spec(给 LLM 看)
 pub fn default_tool_specs() -> Vec<ToolSpec> {
     vec![
+        // 超大结果取回件(只读本地;真执行=runner 保留名直拦,
+        // 此处 spec 仅为 LLM 契约面可见性,参数语义与 runner 实现一致)
+        ToolSpec {
+            name: "tool_result_fetch".to_string(),
+            description: "Fetch a window of an offloaded (oversized) tool result by \
+                          reference. When a tool result exceeds the feed limit it is \
+                          offloaded to disk and replaced by a reference block; use its \
+                          ref_id here and page through with offset/max_chars. Read-only."
+                .to_string(),
+            parameters: vec![
+                ParameterSpec {
+                    name: "ref_id".to_string(),
+                    r#type: "string".to_string(),
+                    description: "Reference id from the tool-result reference block"
+                        .to_string(),
+                    required: true,
+                },
+                ParameterSpec {
+                    name: "offset".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Character offset to start reading from (default 0)"
+                        .to_string(),
+                    required: false,
+                },
+                ParameterSpec {
+                    name: "max_chars".to_string(),
+                    r#type: "integer".to_string(),
+                    description: "Max characters to return (capped by the tool-result limit)"
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
         ToolSpec {
             name: "file_read".to_string(),
             description: "Read a text file's content. Path is relative to workdir; \
@@ -1622,6 +1665,18 @@ mod tests {
         )
         .expect("none-mode resolution is infallible");
         assert!(handler.has_tool("shell_exec"));
+    }
+
+    #[test]
+    fn test_tool_result_fetch_in_default_toolkit() {
+        // 超大结果取回件挂默认工具集(LLM 契约面可见;真执行=runner
+        // 保留名直拦,本注册的 stub 仅并行臂路径可达)
+        let handler = default_safe_toolkit_with_profile(
+            Path::new("."),
+            Path::new("."),
+            shell_exec::ExecutionProfile::Workbench,
+        );
+        assert!(handler.has_tool("tool_result_fetch"));
     }
 
     #[test]
