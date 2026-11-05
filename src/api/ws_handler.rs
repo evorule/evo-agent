@@ -795,10 +795,19 @@ pub(crate) fn build_approval_callback(
         }
     }
     // B22:manual 档审批卡接治理留痕装饰器(approval_requested/resolved 入
-    // gov 账本;auto_policy 判定式无人工卡不接——高频排除)
+    // gov 账本;auto_policy 判定式无人工卡不接——高频排除)。
+    // 分级判定面:TieredApproval 装饰在治理留痕内层、人工窗外层——
+    // 工作区 allowlist(.evo/approval-allowlist.json)T0 命中静默批准
+    // (留痕照产),deny/危险守卫/无命中透传人工窗(现状行为零变化);
+    // allowlist 文件缺失时装饰器整体旁路,缺省不变式成立。
     (
         Arc::new(crate::governance::GovAuditedApproval::new(Arc::new(
-            crate::agent::approval::HttpApproval::new(state.pending_approvals().clone()),
+            crate::agent::approval_tier::TieredApproval::new(
+                Arc::new(crate::agent::approval::HttpApproval::new(
+                    state.pending_approvals().clone(),
+                )),
+                state.workdir(),
+            ),
         ))),
         None,
     )
