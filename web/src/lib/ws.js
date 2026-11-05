@@ -27,6 +27,7 @@ import {
   fsEvents,
   refreshGitStatus,
   govS4Notify,
+  workspaceEpoch,
 } from './stores.js';
 import {
   refreshOrchestration,
@@ -36,7 +37,8 @@ import {
   applySpawnResult,
   orchestration,
 } from './orchestration.js';
-import { getTranscript, wsAuthQuery } from './api.js';
+import { getTranscript, wsAuthQuery, approveProposal } from './api.js';
+import { evaluateAutoApproval, clearSessionMemory, loadAllowlist } from './approvalMemory.js';
 import { assembleContext } from './mentions.js';
 import { looksLikeDeadSession, buildRebuildBlock, lastUserTextOf } from './sessionRebuild.js';
 import { push as pushNotification } from './notifications.js';
@@ -84,10 +86,37 @@ turnActive.subscribe((active) => {
   prevTurnActiveForApprovals = active;
 });
 
+// 工作区放行清单加载:启动即拉一次,工作区切换(纪元自增)后重锚重拉;
+// 失败 fail-soft 置空清单(守卫仍生效,命中项继续走人工审批)。
+workspaceEpoch.subscribe(() => {
+  loadAllowlist();
+});
+
+// 自动批准提案登记:结果帧已并入回执行,不再追加重复的「审批结果」信息条。
+const autoApprovedProposals = new Set();
+
+/** 最近一条自动批准回执(按工具名倒扫;结果帧缺提案 id 时的去重判定) */
+function lastAutoReceiptFor(toolName) {
+  const list = get(messages);
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (
+      m.kind === 'approval_receipt' &&
+      m.toolName === toolName &&
+      typeof m.scope === 'string' &&
+      m.scope.startsWith('auto')
+    ) {
+      return m;
+    }
+  }
+  return null;
+}
+
 function expirePendingApprovals() {
   for (const m of get(messages)) {
     if (m.kind === 'approval' && m.proposalId && !m.decision) {
-      updateMessage(m.id, { decision: 'expired' });
+      // 离场语义:终态同样收敛为单行回执,不留整卡
+      updateMessage(m.id, { kind: 'approval_receipt', decision: 'expired' });
     }
   }
 }
@@ -365,6 +394,7 @@ export function newSession() {
   messages.set([]);
   transcriptHasMore.set(false);
   clearArtifacts();
+  clearSessionMemory(); // 会话记忆随引擎会话清空(工作区放行清单保留)
   connect('new');
 }
 
@@ -641,8 +671,45 @@ function handleFrame(f) {
       fsEvents.set(f.events || { added: [], updated: [], removed: [], moved: [] });
       refreshGitStatus(800);
       break;
-    case 'ApprovalRequired':
-      // 治理叠加:审批卡按钮走既有 G8 /approve 通道
+    case 'ApprovalRequired': {
+      // 治理叠加:审批决策走既有 G8 /approve 通道。会话记忆/工作区放行清单
+      // 命中的重复同类命令按既有授权自动批准(危险子命令守卫永不自动批);
+      // 未命中或守卫命中 → 走三选一审批卡(人工必问)。
+      const verdict = evaluateAutoApproval(f.tool_name, f.command);
+      if (verdict === 'session' || verdict === 'workspace') {
+        const scope = verdict === 'session' ? 'auto-session' : 'auto-workspace';
+        const receiptId = pushMessage({
+          kind: 'approval_receipt',
+          toolName: f.tool_name,
+          command: f.command,
+          risk: f.risk,
+          scope,
+          decision: 'sending',
+        });
+        autoApprovedProposals.add(f.proposal_id);
+        approveProposal('general', get(sessionId), true, f.proposal_id)
+          .then(() => updateMessage(receiptId, { decision: 'sent' }))
+          .catch((err) => {
+            // 自动批准失败(提案失效/通道错误)→ 回退为待批卡,用户手动处置
+            autoApprovedProposals.delete(f.proposal_id);
+            updateMessage(receiptId, {
+              kind: 'approval',
+              decision: 'error',
+              errText: `自动批准失败,请手动处置:${String(err?.message || err)}`,
+            });
+          });
+        pushPanelEvent('gov', {
+          label: 'ApprovalAuto',
+          detail: `${f.tool_name}(risk ${f.risk ?? '?'}) 按既有授权自动批准:${f.command || ''}`,
+          level: 'ok',
+        });
+        pushNotification(
+          'info',
+          `已自动批准:${f.tool_name}`,
+          `${f.command || ''}(按你之前的授权)`,
+        );
+        break;
+      }
       pushMessage({
         kind: 'approval',
         toolName: f.tool_name,
@@ -650,6 +717,7 @@ function handleFrame(f) {
         risk: f.risk,
         alternative: f.alternative,
         proposalId: f.proposal_id,
+        guardDeny: verdict === 'deny',
       });
       pushPanelEvent('gov', {
         label: 'ApprovalRequired',
@@ -663,6 +731,7 @@ function handleFrame(f) {
         `${f.command || ''}(风险 ${f.risk ?? '?'})等待人工确认`,
       );
       break;
+    }
     case 'ApprovalResult': {
       // 审批卡生命周期:引擎侧超时/通道关闭自动拒绝时,把对应未决审批卡
       // 就地转「超时自动拒绝」终态(按工具名匹配最近一张未决卡)——用户
@@ -672,18 +741,27 @@ function handleFrame(f) {
         for (let i = list.length - 1; i >= 0; i--) {
           const m = list[i];
           if (m.kind === 'approval' && m.toolName === f.tool_name && m.proposalId && !m.decision) {
-            updateMessage(m.id, { decision: 'timeout' });
+            updateMessage(m.id, { kind: 'approval_receipt', decision: 'timeout' });
             break;
           }
         }
       }
-      pushMessage({
-        kind: 'info',
-        text: `审批结果:${f.approved ? '已批准' : '已拒绝'}(工具 ${f.tool_name})`,
-      });
+      // 离场语义:自动批准的提案,结果已并入回执行,不再追加重复的
+      // 「审批结果」信息条(结果帧可能不带提案 id,按工具名+自动批准回执
+      // 匹配最近一条;判定失败只多一行信息条,不丢事实)
+      const isAuto = f.proposal_id
+        ? autoApprovedProposals.has(f.proposal_id)
+        : lastAutoReceiptFor(f.tool_name) != null;
+      if (f.proposal_id) autoApprovedProposals.delete(f.proposal_id);
+      if (!isAuto) {
+        pushMessage({
+          kind: 'info',
+          text: `审批结果:${f.approved ? '已批准' : '已拒绝'}(工具 ${f.tool_name})`,
+        });
+      }
       pushPanelEvent('gov', {
         label: 'ApprovalResult',
-        detail: `${f.tool_name} ${f.approved ? '已批准' : `已拒绝${f.auto_rejected ? '(超时自动)' : ''}`}`,
+        detail: `${f.tool_name} ${f.approved ? '已批准' : `已拒绝${f.auto_rejected ? '(超时自动)' : ''}`}${isAuto ? '(自动批准)' : ''}`,
         level: f.approved ? 'ok' : 'warn',
       });
       pushNotification(

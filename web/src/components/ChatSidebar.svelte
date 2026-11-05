@@ -36,6 +36,14 @@
     approvalPresetWrites,
     approvalPresetView,
   } from '../lib/approval.js';
+  import {
+    recordSessionAllow,
+    addWorkspaceAllow,
+    isAutoDeny,
+    approvalReceiptText,
+    aggregateSummary,
+    AGGREGATE_THRESHOLD,
+  } from '../lib/approvalMemory.js';
   import { switchWorkspace } from '../lib/workspace.js';
   import DirectoryBrowser from './DirectoryBrowser.svelte';
   import { chatWidth } from '../lib/layout.js';
@@ -575,6 +583,38 @@
   const visibleMessages = $derived(
     $messages.length > renderCount ? $messages.slice($messages.length - renderCount) : $messages,
   );
+
+  // ---- 未决审批卡聚合(决策即离场配套):同屏未决卡超过阈值时收敛为
+  // 一张汇总卡,杜绝待批卡刷屏;「逐项处理」展开为逐张卡。已决策消息
+  // (回执行)不计入。聚合态随未决数回落阈值自动解除。 ----
+  let aggregateOpen = $state(false);
+  const layoutMessages = $derived.by(() => {
+    const pending = visibleMessages.filter(
+      (m) => m.kind === 'approval' && m.proposalId && !m.decision,
+    );
+    if (pending.length <= AGGREGATE_THRESHOLD || aggregateOpen) return visibleMessages;
+    const ids = new Set(pending.map((m) => m.id));
+    const agg = { id: pending[0].id, kind: 'approval_aggregate', items: pending };
+    const out = [];
+    let inserted = false;
+    for (const m of visibleMessages) {
+      if (ids.has(m.id)) {
+        if (!inserted) {
+          out.push(agg); // 汇总卡落在第一张未决卡原位
+          inserted = true;
+        }
+        continue;
+      }
+      out.push(m);
+    }
+    return out;
+  });
+  $effect(() => {
+    const pendingCount = $messages.filter(
+      (m) => m.kind === 'approval' && m.proposalId && !m.decision,
+    ).length;
+    if (pendingCount <= AGGREGATE_THRESHOLD) aggregateOpen = false;
+  });
   // 换线/新建即复位渲染窗(防旧会话窗口状态串台)
   $effect(() => {
     void $sessionId;
@@ -615,7 +655,7 @@
       }
       buf = null;
     };
-    for (const m of visibleMessages) {
+    for (const m of layoutMessages) {
       if (m.kind === 'tool' || m.kind === 'assistant') {
         if (!buf) buf = { items: [] };
         buf.items.push(m);
@@ -1046,8 +1086,12 @@
     if (btn?.dataset?.mdCopy) copyChatCode(btn.dataset.mdCopy, btn);
   }
 
-  // 治理叠加:审批决定走既有 G8 /approve 通道(60s 超时自动拒绝)
-  function decideApproval(m, approved) {
+  // 治理叠加:审批决定走既有 G8 /approve 通道(60s 超时自动拒绝)。
+  // 三选一档位 scope:'once'(仅此一次,现行为)|'session'(本会话内允许,
+  // 同工具同前缀命令会话内免批)|'workspace'(本工作区始终允许,写入
+  // 工作区放行清单跨会话生效)。决策即离场:提交瞬间卡片原位转为单行
+  // 回执(不置灰不折叠),失败回退为待批卡。
+  function decideApproval(m, approved, scope = 'once') {
     // 终态卡(超时自动拒绝/随轮次失效)不可再提交;sending/sent 防重复提交
     if (!m.proposalId || m.decision === 'sending' || m.decision === 'sent' ||
         m.decision === 'timeout' || m.decision === 'expired') return;
@@ -1055,9 +1099,25 @@
       updateMessage(m.id, { decision: 'error', errText: '会话未建立,无法提交审批' });
       return;
     }
-    updateMessage(m.id, { decision: 'sending', errText: null });
+    updateMessage(m.id, {
+      kind: 'approval_receipt',
+      decision: 'sending',
+      scope: approved ? scope : null,
+      sentApproved: approved,
+      errText: null,
+    });
+    if (approved && scope === 'session') recordSessionAllow(m.toolName, m.command);
+    if (approved && scope === 'workspace') {
+      addWorkspaceAllow(m.toolName, m.command).catch((err) => {
+        pushPanelEvent('gov', {
+          label: 'ApprovalAllowlist',
+          detail: `工作区放行清单写入失败:${String(err?.message || err)}`,
+          level: 'warn',
+        });
+      });
+    }
     approveProposal('general', $sessionId, approved, m.proposalId)
-      .then(() => updateMessage(m.id, { decision: 'sent', sentApproved: approved }))
+      .then(() => updateMessage(m.id, { decision: 'sent' }))
       .catch((err) => {
         const status = err?.status;
         const text =
@@ -1068,6 +1128,21 @@
               : `提交失败:${String(err?.message || err)}`;
         updateMessage(m.id, { decision: 'error', errText: text });
       });
+  }
+
+  /** 回执行符号:✓ 决策成功 / ✗ 拒绝·失败·超时 / ⋯ 提交中 */
+  function approvalReceiptMark(m) {
+    if (m?.decision === 'sending') return '⋯';
+    if (m?.decision === 'sent') return m.sentApproved ? '✓' : '✗';
+    if (m?.decision === 'error' || m?.decision === 'timeout' || m?.decision === 'expired') {
+      return '✗';
+    }
+    return '⋯';
+  }
+
+  /** 汇总卡「全部批准」:逐项按仅此一次提交(危险子命令守卫不拦显式点击) */
+  function approveAggregateAll(m) {
+    for (const it of m.items ?? []) decideApproval(it, true, 'once');
   }
 
   // 批K 段7 人在环问答:回答走新增 POST /answer 通道(二阶段校验在工具侧,
@@ -1476,10 +1551,49 @@
               <button class="ap-btn approve" onclick={() => decideApproval(m, true)}>批准</button>
               <button class="ap-btn reject" onclick={() => decideApproval(m, false)}>拒绝</button>
             </div>
+            {#if m.guardDeny}
+              <div class="ap-alt">含删除/推送/网络外发等危险子命令,仅支持本次决策,不做会话/工作区记忆。</div>
+            {:else}
+              <div class="ap-scope-row">
+                <span class="ap-scope-hint">重复同类命令免批:</span>
+                <button
+                  class="ap-btn scope"
+                  onclick={() => decideApproval(m, true, 'session')}
+                  title="本会话内,同工具同前缀的命令不再询问(新建会话即失效)"
+                >本会话内允许</button>
+                <button
+                  class="ap-btn scope"
+                  onclick={() => decideApproval(m, true, 'workspace')}
+                  title="写入工作区放行清单(.evo/approval-allowlist.json),跨会话生效;危险子命令仍必问"
+                >本工作区始终允许</button>
+              </div>
+            {/if}
             {#if m.decision === 'error' && m.errText}
               <div class="ap-err">{m.errText}</div>
             {/if}
           {/if}
+        </div>
+      {:else if m.kind === 'approval_receipt'}
+        <div class="approval-receipt mono" title={m.command}>
+          <span
+            class="ar-mark"
+            class:ok={m.decision === 'sent' && m.sentApproved}
+            class:bad={m.decision === 'error' || m.decision === 'timeout' || m.decision === 'expired' || (m.decision === 'sent' && m.sentApproved === false)}
+          >{approvalReceiptMark(m)}</span>
+          <span class="ar-text">{approvalReceiptText(m)}</span>
+        </div>
+      {:else if m.kind === 'approval_aggregate'}
+        <div class="approval-card aggregate">
+          <div class="ap-head">待批汇总 · {m.items.length} 项:{aggregateSummary(m.items)}</div>
+          <div class="ap-items">
+            {#each m.items as it (it.id)}
+              <div class="ap-item mono" title={it.command}>{it.toolName} · {it.command}</div>
+            {/each}
+          </div>
+          <div class="ap-actions">
+            <button class="ap-btn approve" onclick={() => approveAggregateAll(m)}>全部批准</button>
+            <button class="ap-btn" onclick={() => (aggregateOpen = true)}>逐项处理</button>
+          </div>
         </div>
       {:else if m.kind === 'ask_user'}
         <div class="ask-card">
@@ -2795,6 +2909,64 @@
   .ap-err {
     margin-top: var(--sp-xs);
     color: var(--danger);
+  }
+  /* 三选一:会话记忆/工作区放行档位行(主决策行下方的免批授权) */
+  .ap-scope-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--sp-sm);
+    margin-top: var(--sp-xs);
+  }
+  .ap-scope-hint {
+    color: var(--text-muted);
+    font-size: var(--fs-2xs);
+  }
+  .ap-btn.scope {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+  }
+  .ap-btn.scope:hover {
+    color: var(--text-primary);
+    border-color: var(--brand);
+  }
+  /* 决策即离场:原位单行回执(约一行文本高,不可展开成卡) */
+  .approval-receipt {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-sm);
+    padding: 2px var(--sp-sm);
+    border-left: 2px solid var(--border);
+    color: var(--text-muted);
+    font-size: var(--fs-2xs);
+    line-height: 1.6;
+  }
+  .approval-receipt .ar-mark {
+    flex-shrink: 0;
+    font-weight: var(--fw-sb);
+  }
+  .approval-receipt .ar-mark.ok {
+    color: var(--success);
+  }
+  .approval-receipt .ar-mark.bad {
+    color: var(--danger);
+  }
+  .approval-receipt .ar-text {
+    word-break: break-all;
+  }
+  /* 未决卡聚合汇总卡(>阈值时替代逐张待批卡) */
+  .approval-card.aggregate .ap-items {
+    margin: var(--sp-xs) 0;
+    max-height: 9em;
+    overflow-y: auto;
+  }
+  .approval-card.aggregate .ap-item {
+    padding: 2px 0;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   /* 批K 段7 人在环问答卡(形态同构审批卡;选项按钮+自由文本输入) */
   .ask-card {
