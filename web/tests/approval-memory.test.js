@@ -36,7 +36,7 @@ beforeEach(() => {
 
 describe('normalizeCommand / commandPrefix', () => {
   it('归一化:去首尾空白+内部折叠+小写', () => {
-    expect(normalizeCommand('  FIND   D:\\knowledge  ')).toBe('find d:\\knowledge');
+    expect(normalizeCommand('  FIND   docs  ')).toBe('find docs');
     expect(normalizeCommand(null)).toBe('');
   });
 
@@ -50,7 +50,7 @@ describe('normalizeCommand / commandPrefix', () => {
 describe('isAutoDeny 危险子命令守卫', () => {
   it('删除/推送/网络外发命中守卫', () => {
     expect(isAutoDeny('rm -rf build')).toBe(true);
-    expect(isAutoDeny('Remove-Item D:\\x')).toBe(true);
+    expect(isAutoDeny('Remove-Item old')).toBe(true);
     expect(isAutoDeny('git push origin main')).toBe(true);
     expect(isAutoDeny('git reset --hard HEAD~1')).toBe(true);
     expect(isAutoDeny('curl https://example.com')).toBe(true);
@@ -58,7 +58,7 @@ describe('isAutoDeny 危险子命令守卫', () => {
   });
 
   it('只读/常规命令不命中', () => {
-    expect(isAutoDeny('find D:\\knowledge -name *.md')).toBe(false);
+    expect(isAutoDeny('find src -name *.md')).toBe(false);
     expect(isAutoDeny('python scripts/seed.py')).toBe(false);
     expect(isAutoDeny('git status')).toBe(false);
     expect(isAutoDeny('git add -A')).toBe(false);
@@ -72,9 +72,9 @@ describe('isAutoDeny 危险子命令守卫', () => {
 
 describe('会话记忆三档判定', () => {
   it('无记忆 → ask;登记后同 (tool, prefix) → session', () => {
-    expect(autoApprovalVerdict('shell_exec', 'find D:\\knowledge', [])).toBe('ask');
-    recordSessionAllow('shell_exec', 'find D:\\knowledge -name *.md');
-    expect(autoApprovalVerdict('shell_exec', 'find D:\\src', [])).toBe('session');
+    expect(autoApprovalVerdict('shell_exec', 'find docs', [])).toBe('ask');
+    recordSessionAllow('shell_exec', 'find src -name *.md');
+    expect(autoApprovalVerdict('shell_exec', 'find src', [])).toBe('session');
   });
 
   it('工具名不同不命中;同前缀同类命中(首词元前缀语义)', () => {
@@ -143,7 +143,7 @@ describe('工作区放行清单读写', () => {
       content: JSON.stringify({ version: 1, allow: [{ tool: 'shell_exec', prefix: 'find' }] }),
     });
     await loadAllowlist();
-    expect(evaluateAutoApproval('shell_exec', 'find D:\\x')).toBe('workspace');
+    expect(evaluateAutoApproval('shell_exec', 'find x')).toBe('workspace');
     expect(evaluateAutoApproval('shell_exec', 'curl http://x')).toBe('deny');
   });
 });
