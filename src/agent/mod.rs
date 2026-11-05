@@ -8,6 +8,7 @@ pub mod adjudication;
 pub mod adjudicator;
 pub mod approval;
 pub mod approval_policy;
+pub mod approval_tier;
 pub mod assembly;
 pub mod atif;
 pub mod audit_query_tool;
