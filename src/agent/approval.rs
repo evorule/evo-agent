@@ -114,7 +114,7 @@ pub struct CliApproval {
 impl ApprovalCallback for CliApproval {
     async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision {
         if self.auto_approve {
-            info!(tool = %req.tool_name, command = %req.command, "auto-approved candidate tool");
+            warn!(tool = %req.tool_name, command = %req.command, "auto-approved candidate tool");
             return ApprovalDecision {
                 approved: true,
                 approver: "cli-user".to_string(),
@@ -376,6 +376,59 @@ impl ApprovalCallback for RedLineGuardApproval {
             }
             let mut d = self.inner.request_approval(req).await;
             d.reason = format!("{} [exemption_overridden:{}]", d.reason, red.as_str());
+            return d;
+        }
+        self.inner.request_approval(req).await
+    }
+}
+
+/// 自动决策守卫前置闸(危险操作永不自动批准——判定端侧守卫,与 /approve
+/// decision_scope 端点守卫同族双端)
+///
+/// 判定式决策端([`PolicyApproval`],无人值守)对守卫面命中的提案不自动批准,
+/// 回落人工决策端(REPL=stdin 交互确认 / serve=审批卡 60s 窗超时自动拒 /
+/// CLI 无人值守=stdin EOF 拒绝),命中告警 warn! 留痕。守卫面窄覆盖,与服务端
+/// 守卫同表同口径:
+/// - `python_exec`:代码命中逃逸意图静态检测(写面/网络/进程外,
+///   [`crate::agent::approval_tier::hits_escape_intent`])
+/// - `shell_exec`:命令命中危险子命令守卫表(空命令从严,
+///   [`crate::agent::approval_tier::hits_auto_deny_guard`])
+/// - 其余工具不在此守卫面:file 族等写面候选工具的提案无 command 字段
+///   (解析后为空串,守卫表按命中处理),按工具名窄覆盖才不误伤 auto 档
+///   文件操作;其自动语义由 T0/T1 写面判据承担
+pub struct AutoDecisionGuardApproval {
+    /// 常规判定端(auto_policy 判定式)
+    inner: Arc<dyn ApprovalCallback>,
+    /// 守卫命中时的回落决策端(stdin 交互 / 审批卡 / DenyAll——按执行面装配)
+    manual: Arc<dyn ApprovalCallback>,
+}
+
+impl AutoDecisionGuardApproval {
+    /// 构造(inner=常规判定端;manual=守卫命中回落决策端)
+    pub fn new(inner: Arc<dyn ApprovalCallback>, manual: Arc<dyn ApprovalCallback>) -> Self {
+        Self { inner, manual }
+    }
+}
+
+#[async_trait]
+impl ApprovalCallback for AutoDecisionGuardApproval {
+    async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision {
+        let guarded = match req.tool_name.as_str() {
+            "python_exec" => {
+                let code = req.args.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                crate::agent::approval_tier::hits_escape_intent(code)
+            }
+            "shell_exec" => crate::agent::approval_tier::hits_auto_deny_guard(&req.command),
+            _ => false,
+        };
+        if guarded {
+            warn!(
+                tool = %req.tool_name,
+                command = %req.command,
+                "auto decision guard hit: dangerous proposal never auto-approved, downgraded to manual approval"
+            );
+            let mut d = self.manual.request_approval(req).await;
+            d.reason = format!("[auto_decision_guard] {}", d.reason);
             return d;
         }
         self.inner.request_approval(req).await
@@ -683,6 +736,130 @@ mod tests {
             .await;
         assert!(d.approved);
         assert!(d.reason.contains("exemption_overridden:red_line.delete"));
+    }
+
+    // ===== AutoDecisionGuardApproval 测试(危险操作永不自动批准) =====
+
+    fn guard_req(tool: &str, args: serde_json::Value, command: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            session_id: "s1".to_string(),
+            tool_name: tool.to_string(),
+            args,
+            command: command.to_string(),
+            risk: "high".to_string(),
+            alternative: String::new(),
+            proposal_id: new_proposal_id(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auto_decision_guard_blocks_python_escape() {
+        // python 代码命中逃逸意图(网络外发) → 回落人工决策端,不自动批
+        let cb = AutoDecisionGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll));
+        let d = cb
+            .request_approval(&guard_req(
+                "python_exec",
+                json!({"code": "import socket\ns=socket.socket()"}),
+                "",
+            ))
+            .await;
+        assert!(!d.approved, "escape-intent code must not be auto-approved");
+        assert!(
+            d.reason.contains("auto_decision_guard"),
+            "reason: {}",
+            d.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_decision_guard_blocks_dangerous_shell() {
+        // shell 危险子命令守卫表命中 → 回落人工
+        let cb = AutoDecisionGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll));
+        let d = cb
+            .request_approval(&guard_req(
+                "shell_exec",
+                json!({"command": "rm -rf /tmp/x"}),
+                "rm -rf /tmp/x",
+            ))
+            .await;
+        assert!(
+            !d.approved,
+            "guarded shell command must not be auto-approved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_decision_guard_blocks_empty_shell_command() {
+        // 空 shell 命令从严按守卫处理(与守卫表同口径)
+        let cb = AutoDecisionGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll));
+        let d = cb
+            .request_approval(&guard_req("shell_exec", json!({}), ""))
+            .await;
+        assert!(!d.approved);
+    }
+
+    #[tokio::test]
+    async fn test_auto_decision_guard_passes_benign_proposals() {
+        // 良性 python/shell 提案照常走判定式放行,理由不带守卫标记
+        let cb = AutoDecisionGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll));
+        let py = cb
+            .request_approval(&guard_req("python_exec", json!({"code": "print(1)"}), ""))
+            .await;
+        assert!(py.approved);
+        assert_eq!(py.approver, "auto_policy");
+        assert!(!py.reason.contains("auto_decision_guard"));
+        let sh = cb
+            .request_approval(&guard_req(
+                "shell_exec",
+                json!({"command": "cargo test"}),
+                "cargo test",
+            ))
+            .await;
+        assert!(sh.approved);
+        assert_eq!(sh.approver, "auto_policy");
+    }
+
+    #[tokio::test]
+    async fn test_auto_decision_guard_narrow_scope_other_tools() {
+        // 守卫面窄覆盖:file 族提案(无 command 字段)不误伤——auto 档文件
+        // 操作照常判定式放行
+        let cb = AutoDecisionGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll));
+        let d = cb
+            .request_approval(&guard_req("file_delete", json!({"path": "a.txt"}), ""))
+            .await;
+        assert!(
+            d.approved,
+            "non-guarded tools must pass through: {}",
+            d.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redline_plus_guard_composition_blocks_escape() {
+        // 装配形态镜像:RedLineGuard(Guard(Policy, manual), manual)——
+        // 逃逸提案过红线闸后仍被守卫拦截回落人工
+        let manual: Arc<dyn ApprovalCallback> = Arc::new(DenyAll);
+        let cb = RedLineGuardApproval::new(
+            Arc::new(AutoDecisionGuardApproval::new(
+                Arc::new(PolicyApproval),
+                manual.clone(),
+            )),
+            manual,
+            false,
+        );
+        let d = cb
+            .request_approval(&guard_req(
+                "python_exec",
+                json!({"code": "open('x','w').write('y')"}),
+                "",
+            ))
+            .await;
+        assert!(!d.approved);
+        assert!(
+            d.reason.contains("auto_decision_guard"),
+            "reason: {}",
+            d.reason
+        );
     }
 
     // ===== strip_approved_flag 测试 =====

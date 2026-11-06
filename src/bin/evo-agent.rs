@@ -1392,7 +1392,12 @@ fn cmd_run(
             .unwrap_or(false);
         (
             std::sync::Arc::new(evo_agent::agent::approval::RedLineGuardApproval::new(
-                std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+                std::sync::Arc::new(evo_agent::agent::approval::AutoDecisionGuardApproval::new(
+                    std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+                    std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                        auto_approve: false,
+                    }),
+                )),
                 std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                     auto_approve: false,
                 }),
@@ -1465,6 +1470,13 @@ fn cmd_run(
         ));
 
     // 6. 跑
+    if approval_auto || auto_approve_candidates {
+        // 无人值守启动横幅:自动批准态显著告警(对齐 auth fail-closed 告警形态;
+        // 守卫面命中提案仍会回落 stdin 人工确认)
+        eprintln!(
+            "[!] auto-approve mode active: candidate proposals are approved without confirmation; escape-intent and guarded proposals fall back to manual approval"
+        );
+    }
     eprintln!(
         "running agent '{}' with goal: {}{}",
         runner.agent_type(),
@@ -1781,7 +1793,12 @@ async fn patrol_build_runner(
     Ok(runner
         .with_approval_callback(std::sync::Arc::new(
             evo_agent::agent::approval::RedLineGuardApproval::new(
-                std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+                // 自动决策守卫前置闸:逃逸意图/危险子命令提案回落 DenyAll
+                // (无人值守无人工可回落,保守拒绝)
+                std::sync::Arc::new(evo_agent::agent::approval::AutoDecisionGuardApproval::new(
+                    std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+                    std::sync::Arc::new(evo_agent::agent::approval::DenyAll),
+                )),
                 std::sync::Arc::new(evo_agent::agent::approval::DenyAll),
                 override_flag,
             ),
@@ -4338,8 +4355,30 @@ fn run_repl_turn(
         std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback>,
         Option<evo_agent::agent::runner::RunawayPolicy>,
     ) = if auto_approve_candidates || def.approval_mode.as_deref() == Some("auto_policy") {
+        // 红线豁免前置闸+自动决策守卫(REPL 补齐与 run 面同口径的双层包裹:
+        // 此前裸 PolicyApproval 连红线回落都缺失);守卫命中→stdin 交互确认
+        let override_flag = evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
+            .map(|s| {
+                s.merged()
+                    .0
+                    .get("approval.exemptionOverride")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let manual: std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback> =
+            std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
+                auto_approve: false,
+            });
         (
-            std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+            std::sync::Arc::new(evo_agent::agent::approval::RedLineGuardApproval::new(
+                std::sync::Arc::new(evo_agent::agent::approval::AutoDecisionGuardApproval::new(
+                    std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
+                    manual.clone(),
+                )),
+                manual,
+                override_flag,
+            )),
             None,
         )
     } else if approval_policy_mode_resolved(def, workdir) {
@@ -4406,6 +4445,12 @@ fn run_repl_turn(
                     || def.approval_mode.as_deref() == Some("auto_policy"),
             },
         ));
+    if auto_approve_candidates || def.approval_mode.as_deref() == Some("auto_policy") {
+        // 无人值守启动横幅:自动批准态显著告警(对齐 run 面同款横幅)
+        eprintln!(
+            "[!] auto-approve mode active: candidate proposals are approved without confirmation; escape-intent and guarded proposals fall back to manual approval"
+        );
+    }
     // 交互式步间隙引导接线:仅 --steering 显式开启;关闭时不挂源,行为不变
     if let Some(s) = steering {
         runner = runner.with_steering(s.clone());

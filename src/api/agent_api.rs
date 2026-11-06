@@ -1730,13 +1730,20 @@ async fn run_agent(
         Some("auto_policy") => {
             // 红线豁免前置闸(与 WS 面同口径):命中且未显式关闭时回落人工审批卡
             let override_flag = crate::api::ws_handler::approval_exemption_override(&state);
-            let guarded = crate::agent::approval::RedLineGuardApproval::new(
-                std::sync::Arc::new(crate::agent::approval::PolicyApproval),
+            // 自动决策守卫前置闸:逃逸意图/危险子命令提案永不自动批准,回落审批卡
+            // (60s 窗超时自动拒,保守安全)
+            let manual: std::sync::Arc<dyn crate::agent::approval::ApprovalCallback> =
                 std::sync::Arc::new(crate::governance::GovAuditedApproval::new(
                     std::sync::Arc::new(crate::agent::approval::HttpApproval::new(
                         state.pending_approvals().clone(),
                     )),
+                ));
+            let guarded = crate::agent::approval::RedLineGuardApproval::new(
+                std::sync::Arc::new(crate::agent::approval::AutoDecisionGuardApproval::new(
+                    std::sync::Arc::new(crate::agent::approval::PolicyApproval),
+                    manual.clone(),
                 )),
+                manual,
                 override_flag,
             );
             let callback: std::sync::Arc<dyn crate::agent::approval::ApprovalCallback> =
