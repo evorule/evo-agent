@@ -183,3 +183,43 @@ fn run_inner(app: &AppHandle, sup: &Arc<Supervisor>, manual: bool) -> Result<(),
     set_tray_tooltip(app, "evo-agent");
     result.map_err(|e| format!("download/install failed: {e}"))
 }
+
+#[cfg(test)]
+mod installer_hooks_guard_tests {
+    // The NSIS installer rescue hook (deployed toml migration backup) is
+    // wired via tauri.conf.json bundle.windows.nsis.installerHooks and runs
+    // PREINSTALL - before the installer copies the shipped resources tree
+    // over the deployed copy (this includes silent /UPDATE upgrades started
+    // by the in-app updater). These assertions keep the wiring and the hook
+    // body from being silently unwired, which would reintroduce silent loss
+    // of user-deployed agent configuration on upgrades.
+
+    #[test]
+    fn installer_hooks_wired_and_rescue_copy_present() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
+        let conf = std::fs::read_to_string(manifest).expect("tauri.conf.json readable");
+        assert!(
+            conf.contains("installerHooks"),
+            "tauri.conf.json must wire bundle.windows.nsis.installerHooks"
+        );
+
+        let hooks = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("installer-hooks.nsi");
+        let body = std::fs::read_to_string(hooks).expect("installer-hooks.nsi readable");
+        assert!(
+            body.contains("NSIS_HOOK_PREINSTALL"),
+            "PREINSTALL hook must be defined"
+        );
+        assert!(
+            body.contains("resources") && body.contains("evo-agent.toml"),
+            "hook must reference the deployed toml source path"
+        );
+        assert!(
+            body.contains("deployed-toml-migration-backup.toml"),
+            "hook must write the migration backup copy"
+        );
+        assert!(
+            body.contains("APPDATA"),
+            "backup must land outside the install directory so it survives reinstalls"
+        );
+    }
+}
