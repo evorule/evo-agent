@@ -834,17 +834,44 @@ pub(crate) fn classify_provider_test(
     if let Some(e) = err_msg {
         return (false, Some("provider_error".to_string()), Some(e), None);
     }
-    let reply = parsed
+    let msg = parsed
         .get("choices")
         .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|s| s.as_str())
-        .map(str::to_string);
+        .and_then(|c| c.get("message"));
+    // content 双形状：string 或多模态部件数组（[{type:text,text:..},..] 拼接 text）——
+    // 部分 provider（多模态/工具调用形态）以数组回复。
+    let reply = match msg.and_then(|m| m.get("content")) {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Array(parts)) => Some(
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join(""),
+        ),
+        _ => None,
+    };
+    // 思考型模型在 tiny max_tokens 下可能只回 reasoning_content（content 空串）：
+    // 连通性/鉴权/模型三要素已获验证，判 ok 带思考头样本（不误报 shape）。
+    let reasoning_head = msg
+        .and_then(|m| m.get("reasoning_content"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.chars().take(60).collect::<String>())
+            }
+        });
     match reply {
         Some(t) if !t.trim().is_empty() => {
             let head: String = t.chars().take(60).collect();
             (true, None, None, Some(head))
+        }
+        _ if reasoning_head.is_some() => {
+            let head = reasoning_head.expect("checked above");
+            (true, None, None, Some(format!("[thinking] {head}")))
         }
         _ => (
             false,
@@ -883,7 +910,7 @@ pub async fn wizard_test_provider(
     let body = serde_json::json!({
         "model": req.model.trim(),
         "messages": [{ "role": "user", "content": "Reply with exactly: OK" }],
-        "max_tokens": 16,
+        "max_tokens": 512,
         "stream": false,
     });
     let client = match reqwest::Client::builder()
@@ -1272,5 +1299,19 @@ mod tests {
         // 200 + 无文本 → shape
         let (ok, class, _, _) = classify_provider_test(200, r#"{"choices":[]}"#);
         assert!(!ok && class.as_deref() == Some("shape"));
+        // 200 + 思考型模型（content 空串+reasoning_content 非空）→ ok（思考头样本）
+        // （思考系列模型在 tiny max_tokens 下思考耗尽配额，content 为空串，
+        //   连通性/鉴权/模型三要素已获验证——判 ok，reply 带思考头样本供人工核）
+        let (ok, class, _, reply) = classify_provider_test(
+            200,
+            r#"{"choices":[{"message":{"content":"","reasoning_content":"已思考：用户要求回复 OK"}}]}"#,
+        );
+        assert!(ok && class.is_none() && reply.as_deref().is_some_and(|t| t.contains("已思考")));
+        // 200 + content 数组（多模态部件形态）→ 拼接 text 判 ok
+        let (ok, class, _, reply) = classify_provider_test(
+            200,
+            r#"{"choices":[{"message":{"content":[{"type":"text","text":"O"},{"type":"text","text":"K"}]}}]}"#,
+        );
+        assert!(ok && class.is_none() && reply.as_deref() == Some("OK"));
     }
 }
