@@ -138,6 +138,30 @@ describe('工作区放行清单读写', () => {
     expect(JSON.parse(disk[ALLOWLIST_PATH]).allow.length).toBe(2);
   });
 
+  it('addWorkspaceAllow:读-改-写保全未知字段(deny/tier/workspace_root 原样回写)', async () => {
+    // 批②后端分级判定面同写此文件:追加 allow 项不得覆盖丢后端字段
+    const disk = {};
+    readFile.mockImplementation(async (p) => ({ content: disk[p] ?? '' }));
+    writeFile.mockImplementation(async (p, c) => {
+      disk[p] = c;
+    });
+    disk[ALLOWLIST_PATH] = JSON.stringify({
+      version: 1,
+      workspace_root: 'D:/demo',
+      allow: [{ tool: 'shell_exec', prefix: 'find' }],
+      deny: [{ tool: 'shell_exec', prefix: 'rm ' }],
+    });
+    await addWorkspaceAllow('python_exec', 'python x.py');
+    const doc = JSON.parse(disk[ALLOWLIST_PATH]);
+    expect(doc.version).toBe(1);
+    expect(doc.workspace_root).toBe('D:/demo');
+    expect(doc.deny).toEqual([{ tool: 'shell_exec', prefix: 'rm ' }]);
+    expect(doc.allow).toEqual([
+      { tool: 'shell_exec', prefix: 'find' },
+      { tool: 'python_exec', prefix: 'python' },
+    ]);
+  });
+
   it('evaluateAutoApproval 用内存镜像判定', async () => {
     readFile.mockResolvedValue({
       content: JSON.stringify({ version: 1, allow: [{ tool: 'shell_exec', prefix: 'find' }] }),
@@ -159,6 +183,9 @@ describe('回执与汇总文案', () => {
     expect(
       approvalReceiptText({ toolName: 'shell_exec', command: 'find x', decision: 'sent', sentApproved: true, scope: 'auto-workspace' }),
     ).toBe('shell_exec · find x · 已自动批准(本工作区始终允许)');
+    expect(
+      approvalReceiptText({ toolName: 'shell_exec', command: 'find x', decision: 'sent', sentApproved: true, scope: 'workspace-allowlist' }),
+    ).toBe('shell_exec · find x · 已批准(工作区清单)');
     expect(
       approvalReceiptText({ toolName: 'python_exec', command: 'p x', decision: 'sent', sentApproved: false }),
     ).toBe('python_exec · p x · 已拒绝');

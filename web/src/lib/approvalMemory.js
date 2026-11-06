@@ -9,8 +9,8 @@
 //   提交,引擎侧提案生命周期与审计留痕不变。
 // - 危险子命令(删除/移动/远端推送/网络外发/进程与凭据面)永不自动批准——
 //   只响应显式点击,守卫优先于一切记忆与清单。
-// - 工作区放行清单是前端展示层配置(整体覆盖读-改-写);后端分级判定面
-//   后续接手时沿用同一路径与 deny 优先语义。
+// - 工作区放行清单与后端分级判定面共用(读-改-写保全未知字段);后端
+//   扩展 deny/tier/workspace_root 字段沿用同一路径与 deny 优先语义。
 
 import { writable, get } from 'svelte/store';
 import { readFile, writeFile } from './api.js';
@@ -84,15 +84,22 @@ export function clearSessionMemory() {
 export const workspaceAllowlist = writable([]);
 
 async function readAllowlistFromDisk() {
+  const doc = await readAllowlistDoc();
+  const allow = Array.isArray(doc?.allow)
+    ? doc.allow.filter((e) => e && e.tool && e.prefix)
+    : [];
+  return allow;
+}
+
+/** 盘上清单原文读取(读-改-写保真基底;文件不存在/解析失败/通道错误 → null)。
+ *  批②起后端分级判定面同写此文件(deny/tier/workspace_root 字段),
+ *  前端追加放行项时必须整文档原样回写,不得覆盖为 {version,allow} 二件。 */
+async function readAllowlistDoc() {
   try {
     const res = await readFile(ALLOWLIST_PATH);
-    const doc = JSON.parse(res?.content ?? '{}');
-    const allow = Array.isArray(doc?.allow)
-      ? doc.allow.filter((e) => e && e.tool && e.prefix)
-      : [];
-    return allow;
+    return JSON.parse(res?.content ?? '{}');
   } catch {
-    return []; // 文件不存在/解析失败/通道错误 → 空清单(守卫仍生效,fail-soft)
+    return null;
   }
 }
 
@@ -103,11 +110,15 @@ export async function loadAllowlist() {
   return allow;
 }
 
-/** 追加工作区放行项并落盘(读-改-写整体覆盖;同项幂等;失败抛错由调用方留痕) */
+/** 追加工作区放行项并落盘(读-改-写保真:deny/tier/workspace_root 等未知
+ *  字段原样回写;同项幂等;失败抛错由调用方留痕) */
 export async function addWorkspaceAllow(tool, command) {
   const prefix = commandPrefix(command);
   if (!tool || !prefix) throw new Error('放行项不完整:工具与前缀均不可为空');
-  const current = await readAllowlistFromDisk();
+  const doc = await readAllowlistDoc();
+  const current = Array.isArray(doc?.allow)
+    ? doc.allow.filter((e) => e && e.tool && e.prefix)
+    : [];
   if (current.some((e) => e.tool === tool && e.prefix === prefix)) {
     workspaceAllowlist.set(current);
     return current;
@@ -115,7 +126,7 @@ export async function addWorkspaceAllow(tool, command) {
   const next = [...current, { tool, prefix }];
   await writeFile(
     ALLOWLIST_PATH,
-    JSON.stringify({ version: 1, allow: next }, null, 2) + '\n',
+    JSON.stringify({ ...doc, version: 1, allow: next }, null, 2) + '\n',
   );
   workspaceAllowlist.set(next);
   return next;
@@ -162,7 +173,9 @@ export function approvalReceiptText(m) {
           ? '已批准(本会话内允许)'
           : m?.scope === 'workspace'
             ? '已批准(本工作区始终允许)'
-            : '已批准';
+            : m?.scope === 'workspace-allowlist'
+              ? '已批准(工作区清单)'
+              : '已批准';
   return `${tool} · ${cmdShow} · ${tail}`;
 }
 

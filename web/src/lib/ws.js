@@ -690,6 +690,14 @@ function handleFrame(f) {
         approveProposal('general', get(sessionId), true, f.proposal_id)
           .then(() => updateMessage(receiptId, { decision: 'sent' }))
           .catch((err) => {
+            // 409 no_pending_item = 后端已决(批② T0 allowlist 静默批准先决,
+            // 提案已出待决集):改判「后端已决」静默收卡——回执定稿 sent,
+            // 自动批准登记保留,随后 ApprovalResult 帧按既有去重并入,
+            // 不再报错误回执噪声
+            if (err?.status === 409 && String(err?.message || '').includes('no_pending_item')) {
+              updateMessage(receiptId, { decision: 'sent' });
+              return;
+            }
             // 自动批准失败(提案失效/通道错误)→ 回退为待批卡,用户手动处置
             autoApprovedProposals.delete(f.proposal_id);
             updateMessage(receiptId, {
@@ -746,6 +754,24 @@ function handleFrame(f) {
           }
         }
       }
+      // 批② T0:后端 allowlist 静默批准(approver=workspace-allowlist)——
+      // 前端会话记忆/清单镜像未命中(未加载/加载失败)时会已推待批卡,
+      // 此处按工具名收卡转「已批准(工作区清单)」回执,不留可点击僵尸卡
+      if (f.approved && f.approver === 'workspace-allowlist') {
+        const list = get(messages);
+        for (let i = list.length - 1; i >= 0; i--) {
+          const m = list[i];
+          if (m.kind === 'approval' && m.toolName === f.tool_name && m.proposalId && !m.decision) {
+            updateMessage(m.id, {
+              kind: 'approval_receipt',
+              decision: 'sent',
+              sentApproved: true,
+              scope: 'workspace-allowlist',
+            });
+            break;
+          }
+        }
+      }
       // 离场语义:自动批准的提案,结果已并入回执行,不再追加重复的
       // 「审批结果」信息条(结果帧可能不带提案 id,按工具名+自动批准回执
       // 匹配最近一条;判定失败只多一行信息条,不丢事实)
@@ -754,9 +780,11 @@ function handleFrame(f) {
         : lastAutoReceiptFor(f.tool_name) != null;
       if (f.proposal_id) autoApprovedProposals.delete(f.proposal_id);
       if (!isAuto) {
+        const outcome =
+          f.approved && f.approver === 'workspace-allowlist' ? '已批准(工作区清单)' : f.approved ? '已批准' : '已拒绝';
         pushMessage({
           kind: 'info',
-          text: `审批结果:${f.approved ? '已批准' : '已拒绝'}(工具 ${f.tool_name})`,
+          text: `审批结果:${outcome}(工具 ${f.tool_name})`,
         });
       }
       pushPanelEvent('gov', {
