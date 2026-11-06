@@ -20,6 +20,10 @@ AGENTS_DIR = REPO / "agents"
 REQUIRED_SECTIONS = ["定位", "前置依赖", "作业流程", "质量判据", "闸提示", "边界"]
 KNOWN_SKILLS = {"video-producer", "video-reviewer", "video-taste", "video-intake",
                 "video-narration", "video-delivery",
+                "video-enhance-chain", "video-editing",
+                "video-research", "video-proposal", "video-asset-gen",
+                "video-avatar", "video-screendemo",
+                "video-corpus-retrieval", "video-localization",
                 "evorule-deliverable", "git-discipline",
                 "evorule-deterministic-compute", "evorule-deep-research"}
 
@@ -47,7 +51,12 @@ def collect_cards():
 def test_card_structure():
     """每张卡：frontmatter 平铺 name+description + 六节齐。"""
     cards = collect_cards()
-    assert 4 <= len(cards) <= 6, f"卡数量 {len(cards)} 不在 B1 判据带 4-6"
+    # B1 首波=6 张共享卡（判据带 4-6）；族群专属卡续批（统帅 2026-11-06 令「3」）后总面 15 张
+    assert 6 <= len(cards) <= 22, f"卡数量 {len(cards)} 不在共享+专属总面带内"
+    shared_core = {"producer-card.md", "reviewer-card.md", "taste-card.md",
+                   "intake-card.md", "narration-card.md", "delivery-card.md"}
+    names = {c.name for c in cards}
+    assert shared_core <= names, f"共享卡六张必须齐（缺 {shared_core - names}）"
     for card in cards:
         text = card.read_text(encoding="utf-8")
         fm, body = parse_frontmatter(text)
@@ -91,7 +100,7 @@ def test_registry_consistency():
 
 
 def test_video_cards_registered():
-    """六张视频卡全部注册进 general.json（卡注册判据）。"""
+    """全部视频卡注册进 general.json（卡注册判据）。"""
     data = json.loads((AGENTS_DIR / "general.json").read_text(encoding="utf-8"))
     reg = {s["name"] for s in data.get("skills", [])}
     for card in collect_cards():

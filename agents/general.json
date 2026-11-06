@@ -108,6 +108,42 @@
     {
       "name": "video-delivery",
       "path": "skills/video/delivery-card.md"
+    },
+    {
+      "name": "video-enhance-chain",
+      "path": "skills/video/enhance-chain-card.md"
+    },
+    {
+      "name": "video-editing",
+      "path": "skills/video/editing-card.md"
+    },
+    {
+      "name": "video-research",
+      "path": "skills/video/research-card.md"
+    },
+    {
+      "name": "video-proposal",
+      "path": "skills/video/proposal-card.md"
+    },
+    {
+      "name": "video-asset-gen",
+      "path": "skills/video/asset-gen-card.md"
+    },
+    {
+      "name": "video-avatar",
+      "path": "skills/video/avatar-card.md"
+    },
+    {
+      "name": "video-screendemo",
+      "path": "skills/video/screendemo-card.md"
+    },
+    {
+      "name": "video-corpus-retrieval",
+      "path": "skills/video/corpus-retrieval-card.md"
+    },
+    {
+      "name": "video-localization",
+      "path": "skills/video/localization-card.md"
     }
   ],
   "memory": {
