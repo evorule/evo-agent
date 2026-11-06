@@ -2467,7 +2467,8 @@ async fn approve_agent(
         .map(|s| !s.is_empty() && s != "manual")
         .unwrap_or(false);
     if auto_scope && req.approved {
-        let guarded = if pending.request.tool_name == "python_exec" {
+        // 守卫命中原因(类别+片段)随 400 体外发,让前端/审计知道「为何拒」
+        let guard_reason: Option<(String, String)> = if pending.request.tool_name == "python_exec" {
             // python 代码不走 shell 守卫表(shell 语义对代码内容误报,见
             // approval_tier verdict 文档);逃逸意图检测承担同类职责
             let code = pending
@@ -2476,20 +2477,27 @@ async fn approve_agent(
                 .get("code")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            crate::agent::approval_tier::hits_escape_intent(code)
+            crate::agent::approval_tier::escape_intent_reason(code)
+                .map(|r| (r.category.to_string(), r.matched))
+        } else if crate::agent::approval_tier::hits_auto_deny_guard(&pending.request.command) {
+            Some(("shell-guard".to_string(), pending.request.command.clone()))
         } else {
-            crate::agent::approval_tier::hits_auto_deny_guard(&pending.request.command)
+            None
         };
-        if guarded {
+        if let Some((category, matched)) = guard_reason {
             warn!(
                 session_id = %req.session_id,
                 tool = %pending.request.tool_name,
+                category = %category,
+                matched = %matched,
                 "G8: auto-scope approval denied by guard (dangerous command never auto-approved)"
             );
             let body = serde_json::json!({
                 "error": "auto_decision_guard_hit",
                 "session_id": req.session_id,
                 "tool_name": pending.request.tool_name,
+                "reason_category": category,
+                "matched": matched,
             });
             if let Ok(mut map) = state.pending_approvals.lock() {
                 map.insert(req.session_id.clone(), pending);

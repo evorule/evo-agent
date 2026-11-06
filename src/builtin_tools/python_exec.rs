@@ -167,25 +167,34 @@ impl ToolFunction for PythonExecTool {
             code.to_string()
         };
         let sandboxed = self.workdir.is_some();
-        let escape = crate::agent::approval_tier::hits_escape_intent(code);
+        // 原因类别判定(与布尔门同源):risk 携带类别+命中片段,让审批卡上
+        // 「为何必问」可读可审
+        let escape = crate::agent::approval_tier::escape_intent_reason(code);
         let (risk, alternative) = match (sandboxed, escape) {
-            (true, false) => (
+            (true, None) => (
                 "workspace sandboxed execution (cwd anchored to the workspace); pure compute, \
                  no network/process/file-write escape intent detected — workspace allowlist may \
-                 auto-approve",
+                 auto-approve"
+                    .to_string(),
                 "write results to workspace files via file_write, or run shell commands via \
-                 shell_exec with an allowlisted command",
+                 shell_exec with an allowlisted command"
+                    .to_string(),
             ),
-            (_, true) => (
-                "escape intent detected in code (file write / network access / spawning host \
-                 processes) — always requires manual approval",
+            (_, Some(reason)) => (
+                format!(
+                    "escape intent detected in code: {} (matched: \"{}\") — always requires \
+                     manual approval",
+                    reason.category, reason.matched
+                ),
                 "keep the code to pure computation within the workspace sandbox, or request \
-                 explicit permission for the escape operation",
+                 explicit permission for the escape operation"
+                    .to_string(),
             ),
-            (false, false) => (
+            (false, None) => (
                 "arbitrary code execution on the host (runs outside the workspace sandbox, no \
-                 command allowlist)",
-                "run the code yourself, or use shell_exec with an allowlisted command",
+                 command allowlist)"
+                    .to_string(),
+                "run the code yourself, or use shell_exec with an allowlisted command".to_string(),
             ),
         };
         Some(json!({
@@ -232,6 +241,24 @@ mod tests {
         assert!(PythonExecTool::default()
             .evaluate_proposal(&json!({"code": "1"}))
             .is_some());
+    }
+
+    /// 逃逸提案卡 risk 携带原因类别+命中片段(可读可审,沙箱审计批)
+    #[test]
+    fn test_escape_proposal_risk_carries_reason() {
+        let tool = PythonExecTool::new();
+        let p = tool
+            .evaluate_proposal(&json!({"code": "import socket\ns = socket.socket()"}))
+            .expect("escape code must propose");
+        let risk = p.get("risk").and_then(|v| v.as_str()).expect("risk str");
+        assert!(risk.contains("network"), "risk: {}", risk);
+        assert!(risk.contains("import socket"), "risk: {}", risk);
+        // 纯计算沙箱内:风险文案不含逃逸字样(基线零变化)
+        let p2 = tool
+            .evaluate_proposal(&json!({"code": "print(1)"}))
+            .expect("pure compute must propose");
+        let risk2 = p2.get("risk").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(!risk2.contains("escape intent"), "risk: {}", risk2);
     }
 
     /// 解释器路径解析次序:env 显式覆盖 > 硬编码存在性探测 > PATH python
