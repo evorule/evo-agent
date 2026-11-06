@@ -223,3 +223,33 @@ mod installer_hooks_guard_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod uninstall_hooks_guard_tests {
+    // The PREUNINSTALL hook backs up the deployed toml (covering manual
+    // uninstalls, where the app-level exit stash cannot run) and removes
+    // runtime-created leftovers under the resources tree so no non-empty
+    // directories survive the uninstall. These assertions pin the macro.
+
+    #[test]
+    fn uninstall_hooks_backup_and_cleanup_present() {
+        let hooks = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("installer-hooks.nsi");
+        let body = std::fs::read_to_string(&hooks).expect("installer-hooks.nsi readable");
+        assert!(
+            body.contains("NSIS_HOOK_PREUNINSTALL"),
+            "PREUNINSTALL hook must be defined"
+        );
+        assert!(
+            body.contains("deployed-toml-uninstall-backup.toml"),
+            "hook must back up the deployed toml on uninstall"
+        );
+        assert!(
+            body.contains("resources\\console"),
+            "hook must clean the console leftovers"
+        );
+        assert!(
+            body.contains("resources\\evo-agent"),
+            "hook must clean the evo-agent resources leftovers"
+        );
+    }
+}
