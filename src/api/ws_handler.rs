@@ -766,13 +766,19 @@ pub(crate) fn build_approval_callback(
     if mode == Some("auto_policy") || mode == Some("yolo") {
         // 全自动+审计档(§3.4 yolo = auto_policy 判定式语义别名):红线豁免
         // 前置闸:豁免清单适用于所有档位——命中且未显式关闭时
-        // 回落人工审批卡(无人值守场景 60s 窗超时自动拒,保守安全)
+        // 回落人工审批卡(无人值守场景 60s 窗超时自动拒,保守安全);
+        // 自动决策守卫前置闸:逃逸意图/危险子命令提案永不自动批准,同样回落审批卡
         let override_flag = approval_exemption_override(state);
-        let guarded = crate::agent::approval::RedLineGuardApproval::new(
-            Arc::new(crate::agent::approval::PolicyApproval),
+        let manual: Arc<dyn crate::agent::approval::ApprovalCallback> =
             Arc::new(crate::governance::GovAuditedApproval::new(Arc::new(
                 crate::agent::approval::HttpApproval::new(state.pending_approvals().clone()),
-            ))),
+            )));
+        let guarded = crate::agent::approval::RedLineGuardApproval::new(
+            Arc::new(crate::agent::approval::AutoDecisionGuardApproval::new(
+                Arc::new(crate::agent::approval::PolicyApproval),
+                manual.clone(),
+            )),
+            manual,
             override_flag,
         );
         return (Arc::new(guarded), None);

@@ -62,8 +62,9 @@ pub mod workspace_checkpoint;
 pub mod writeback;
 
 pub use approval::{
-    new_proposal_id, ApprovalCallback, ApprovalDecision, ApprovalRequest, AutoApprove, CliApproval,
-    DenyAll, HttpApproval, PendingApproval, PolicyApproval, HTTP_APPROVAL_TIMEOUT_SECS,
+    new_proposal_id, ApprovalCallback, ApprovalDecision, ApprovalRequest, AutoApprove,
+    AutoDecisionGuardApproval, CliApproval, DenyAll, HttpApproval, PendingApproval, PolicyApproval,
+    HTTP_APPROVAL_TIMEOUT_SECS,
 };
 pub use approval_policy::{
     hits_red_line, ApprovalPolicyFile, AuditedReviewInvoker, ConditionJudgement, PolicyFileError,
