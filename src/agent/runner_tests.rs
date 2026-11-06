@@ -6145,6 +6145,89 @@ fn test_payload_limit_error_detection() {
     assert!(!super::is_payload_limit_error(""));
 }
 
+/// 会话收尾幽灵 tool_call 过滤:stop 终态携带 args 非对象的尾随 tool_call
+/// 按 provider 协议噪音丢弃(实测 relay 在最终 content 响应中偶发 args:null);
+/// args 合法对象照常保留;非 stop 终态(tool_calls 轮)不过滤——真实缺参错误
+/// 仍走执行报错回喂的既有重试流
+#[test]
+fn test_ghost_tool_call_filter_drops_null_args_on_stop() {
+    use crate::agent::translator::ToolCall;
+    use serde_json::json;
+    let tc = |name: &str, args: Value| ToolCall {
+        name: name.to_string(),
+        arguments: args,
+        id: None,
+    };
+    // stop 终态 + args:null → 丢弃,列表归 None
+    let (out, dropped) =
+        super::filter_ghost_tool_calls(Some("stop"), Some(vec![tc("file_write", Value::Null)]));
+    assert_eq!(dropped, 1);
+    assert!(out.is_none(), "all-ghost list must collapse to None");
+    // end_turn 同口径(provider 形终止码)
+    let (out, dropped) = super::filter_ghost_tool_calls(
+        Some("end_turn"),
+        Some(vec![tc("a", Value::Null), tc("b", Value::Null)]),
+    );
+    assert_eq!(dropped, 2);
+    assert!(out.is_none());
+    // 混合列表:仅丢幽灵帧,合法帧保留
+    let (out, dropped) = super::filter_ghost_tool_calls(
+        Some("stop"),
+        Some(vec![
+            tc("ghost", Value::Null),
+            tc("real", json!({"path": "a"})),
+        ]),
+    );
+    assert_eq!(dropped, 1);
+    let kept = out.expect("valid call must survive");
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].name, "real");
+    // 非对象 args(字符串/数组)同判协议噪音
+    let (_, dropped) = super::filter_ghost_tool_calls(
+        Some("stop"),
+        Some(vec![tc("s", json!("str")), tc("arr", json!([1]))]),
+    );
+    assert_eq!(dropped, 2);
+    // 合法对象 args 不误伤
+    let (out, dropped) =
+        super::filter_ghost_tool_calls(Some("stop"), Some(vec![tc("ok", json!({}))]));
+    assert_eq!(dropped, 0);
+    assert_eq!(out.expect("object args must survive").len(), 1);
+    // tool_calls 终态(工具轮):args:null 不过滤——缺参属真实模型错误,
+    // 执行报错回喂是既有纠错流,防御面仅收尾终态
+    let (out, dropped) =
+        super::filter_ghost_tool_calls(Some("tool_calls"), Some(vec![tc("mid", Value::Null)]));
+    assert_eq!(dropped, 0);
+    assert_eq!(out.expect("mid-round calls untouched").len(), 1);
+    // 无 tool_calls / 无 finish_reason:零变化
+    let (out, dropped) = super::filter_ghost_tool_calls(Some("stop"), None);
+    assert_eq!(dropped, 0);
+    assert!(out.is_none());
+    let (out, dropped) = super::filter_ghost_tool_calls(None, Some(vec![tc("x", Value::Null)]));
+    assert_eq!(dropped, 0);
+    assert!(out.is_some());
+}
+
+/// 上游 invalid params 类拒绝识别(会话收尾降级兜底):2013 码或
+/// invalid+param 组合命中;其他错误不误伤
+#[test]
+fn test_invalid_params_rejection_detection() {
+    assert!(super::is_invalid_params_rejection(
+        "LLM API error (400): base_resp 2013: invalid params"
+    ));
+    assert!(super::is_invalid_params_rejection(
+        "provider rejected: code 2013"
+    ));
+    assert!(super::is_invalid_params_rejection(
+        "Invalid request: missing required parameter"
+    ));
+    assert!(!super::is_invalid_params_rejection(
+        "LLM API error (500 Internal Server Error): boom"
+    ));
+    assert!(!super::is_invalid_params_rejection("connection reset"));
+    assert!(!super::is_invalid_params_rejection(""));
+}
+
 /// 紧急裁剪①+③组合语义:近程边界以同一 KEEP_ROUNDS 计,①的可折叠区与③的
 /// 压缩区重合——最老工具结果先折叠、随中段一并被整段占位吸收;近程轮保真
 #[test]
