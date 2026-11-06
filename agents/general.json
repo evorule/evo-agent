@@ -84,6 +84,30 @@
     {
       "name": "evorule-deep-research",
       "path": "skills/evorule-deep-research/SKILL.md"
+    },
+    {
+      "name": "video-producer",
+      "path": "skills/video/producer-card.md"
+    },
+    {
+      "name": "video-reviewer",
+      "path": "skills/video/reviewer-card.md"
+    },
+    {
+      "name": "video-taste",
+      "path": "skills/video/taste-card.md"
+    },
+    {
+      "name": "video-intake",
+      "path": "skills/video/intake-card.md"
+    },
+    {
+      "name": "video-narration",
+      "path": "skills/video/narration-card.md"
+    },
+    {
+      "name": "video-delivery",
+      "path": "skills/video/delivery-card.md"
     }
   ],
   "memory": {
