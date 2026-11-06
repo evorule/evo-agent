@@ -862,23 +862,30 @@ pub fn apply_capability_boundary(
         if has("file_create") {
             handler.register_static(
                 "file_create",
-                std::sync::Arc::new(crate::builtin_tools::file_create::FileCreateTool::new(
-                    root.clone(),
-                )),
+                std::sync::Arc::new(
+                    crate::builtin_tools::file_create::FileCreateTool::new(root.clone())
+                        // 与 file_write/edit_file 同根(声明契约:写面全族
+                        // read_write 模式下 sandbox_root 全域可写)
+                        .with_writable_dir("."),
+                ),
             );
         }
         if has("file_move") {
             handler.register_static(
                 "file_move",
-                std::sync::Arc::new(crate::builtin_tools::file_move::FileMoveTool::new(
-                    root.clone(),
-                )),
+                std::sync::Arc::new(
+                    crate::builtin_tools::file_move::FileMoveTool::new(root.clone())
+                        .with_writable_dir("."),
+                ),
             );
         }
         if has("file_delete") {
             handler.register_static(
                 "file_delete",
-                std::sync::Arc::new(crate::builtin_tools::file_delete::FileDeleteTool::new(root)),
+                std::sync::Arc::new(
+                    crate::builtin_tools::file_delete::FileDeleteTool::new(root)
+                        .with_writable_dir("."),
+                ),
             );
         }
     }
@@ -2434,6 +2441,89 @@ service_tools = ["config_persist", "rule_sandbox"]
             ok.err()
         );
         assert!(root.join("direct.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_apply_read_write_declaration_enables_full_domain_write_family() {
+        // 写面全族一致性:read_write 声明下 file_create/file_move/file_delete
+        // 与 file_write 同为 writable_dir="."(声明契约见 apply_capability_boundary
+        // doc;此前仅 file_write/edit_file 重绑,create/move/delete 仍限
+        // workspace/ 子目录——同一沙箱根内写面自相矛盾:file_write 能写根下
+        // direct.txt,file_create 对同路径报 outside writable dir)
+        let declared_dir = tempfile::tempdir().unwrap();
+        let root = declared_dir.path().canonicalize().unwrap();
+
+        // 对照:缺省实例(writable_dir=workspace)根下 create 被拒
+        let mut default_handler = ToolHandler::new();
+        default_handler.register_static(
+            "file_create",
+            std::sync::Arc::new(crate::builtin_tools::file_create::FileCreateTool::new(
+                root.clone(),
+            )),
+        );
+        let denied = default_handler
+            .execute_by_name("file_create", &serde_json::json!({"path": "fresh.txt"}))
+            .await;
+        assert!(
+            denied.is_err(),
+            "default binding must confine creates to workspace/"
+        );
+
+        // read_write 声明 apply 后:全族根下操作成功
+        let mut handler = ToolHandler::new();
+        handler.register_static(
+            "file_create",
+            std::sync::Arc::new(crate::builtin_tools::file_create::FileCreateTool::new(
+                root.clone(),
+            )),
+        );
+        handler.register_static(
+            "file_move",
+            std::sync::Arc::new(crate::builtin_tools::file_move::FileMoveTool::new(
+                root.clone(),
+            )),
+        );
+        handler.register_static(
+            "file_delete",
+            std::sync::Arc::new(crate::builtin_tools::file_delete::FileDeleteTool::new(
+                root.clone(),
+            )),
+        );
+        let b = make_boundary(
+            "read_write",
+            root.clone(),
+            &["file_create", "file_move", "file_delete"],
+        );
+        apply_capability_boundary(&mut handler, Some(&b));
+
+        handler
+            .execute_by_name("file_create", &serde_json::json!({"path": "fresh.txt"}))
+            .await
+            .expect("read_write declaration implies full-domain create");
+        assert!(root.join("fresh.txt").exists());
+
+        handler
+            .execute_by_name(
+                "file_move",
+                &serde_json::json!({"path": "fresh.txt", "target_dir": "."}),
+            )
+            .await
+            .expect_err("duplicate target must still be rejected");
+        // rename 同目录移动到新名(move 工具自身语义,另行覆盖;此处只证
+        // 根下路径可解析——workspace 限制已解除)
+        std::fs::write(root.join("movable.txt"), b"x").unwrap();
+        handler
+            .execute_by_name(
+                "file_move",
+                &serde_json::json!({"path": "movable.txt", "target_dir": "."}),
+            )
+            .await
+            .expect_err("duplicate target (movable.txt -> movable.txt) rejected");
+        handler
+            .execute_by_name("file_delete", &serde_json::json!({"path": "fresh.txt"}))
+            .await
+            .expect("read_write declaration implies full-domain delete");
+        assert!(!root.join("fresh.txt").exists());
     }
 
     // ===== P2 沙箱根映射(apply_workspace_boundary)=====
