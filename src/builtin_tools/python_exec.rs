@@ -203,6 +203,10 @@ impl ToolFunction for PythonExecTool {
             "description": format!("execute Python code: {summary}"),
             "risk": risk,
             "alternative": alternative,
+            // 宿主任意代码执行上下文(机器可读,决策端红线按执行面判定):
+            // 未装配 workspace 沙箱=落宿主解释器任意执行;装配=workspace
+            // cwd 锚定;sandbox-trusted 档不出提案(上方提前返回),天然不触发
+            "host_execution": self.workdir.is_none(),
         }))
     }
 }
@@ -325,6 +329,32 @@ mod tests {
             risk.contains("runs outside the workspace sandbox"),
             "risk: {risk}"
         );
+    }
+
+    /// 提案携带宿主执行上下文标记(机器可读,决策端红线按执行面判定):
+    /// 未装配 workdir=true;装配 workdir=false
+    #[test]
+    fn test_proposal_carries_host_execution_context() {
+        let host = PythonExecTool::new()
+            .evaluate_proposal(&json!({"code": "print(1)"}))
+            .expect("host proposal");
+        assert_eq!(
+            host.get("host_execution").and_then(|v| v.as_bool()),
+            Some(true),
+            "unsandboxed proposal must be flagged host_execution"
+        );
+        let dir = std::env::temp_dir().join(format!("evo-py-sbx-d-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sandboxed = PythonExecTool::new()
+            .with_workdir(&dir)
+            .evaluate_proposal(&json!({"code": "print(1)"}))
+            .expect("sandboxed proposal");
+        assert_eq!(
+            sandboxed.get("host_execution").and_then(|v| v.as_bool()),
+            Some(false),
+            "workspace-anchored proposal must not be flagged host_execution"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// spawn cwd 锚定:相对路径写落 workdir(沙箱执行实证)

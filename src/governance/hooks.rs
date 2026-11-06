@@ -514,6 +514,7 @@ mod tests {
             risk: "低".to_string(),
             alternative: String::new(),
             proposal_id: "ap-18f3".to_string(),
+            host_execution: false,
         }
     }
 
