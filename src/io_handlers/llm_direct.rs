@@ -550,8 +550,21 @@ pub(crate) fn execute_stream(
             }
         }
         if !saw_done {
-            yield Err("direct 流式响应未含 [DONE] 终止符(连接提前关闭)".to_string());
-            return;
+            // MiniMax-M3 实测（2026-11-06）：其 SSE 流以 finish_reason 末帧
+            // （文本回合="stop"，工具回合="tool_calls"）收尾后直接关连接，不发
+            // OpenAI 式 [DONE] 哨兵——ai-plugin 判例（plugins/ai-plugin/src/lib.rs
+            // §1453「流自然收尾不发 [DONE] 亦成立」）的更严实现：
+            // 流完整性协议信号 = finish_reason（模型回合终结宣告）。
+            // - finish 在场：流完整，Warn 声明 MiniMax 形态（可观测，不吞不瞒）
+            // - finish 缺失：fail-visible Err（真断连/截断流，增量可能不完整；
+            //   禁止吞成假成功——调用方按约定回落非流式 execute）
+            if acc_finish.is_none() {
+                yield Err("direct 流式响应提前关闭(finish_reason 缺失,增量可能不完整)".to_string());
+                return;
+            }
+            yield Ok(StreamChunk::Warn(
+                "provider 未发 [DONE],按 finish_reason 判定流完整".to_string(),
+            ));
         }
 
         // === [DONE] 后合成完整 LlmResponse 终帧(聚合自全部增量) ===
@@ -1046,6 +1059,117 @@ mod tests {
         assert_eq!(r.finish_reason.as_deref(), Some("stop"));
         assert_eq!(r.tool_calls, None);
         assert_eq!(r.token_usage.map(|u| u.total_tokens), Some(2));
+    }
+
+    /// MiniMax-M3 流形态（2026-11-06 实测抓帧）:无 [DONE] 哨兵、finish_reason
+    /// 末帧收口后直关连接 → 按 finish_reason 判流完整:Done 到达 + Warn 声明
+    #[tokio::test]
+    async fn test_direct_stream_minimax_no_done_accepted() {
+        let mut server = mockito::Server::new_async().await;
+        let sse_body = concat!(
+            "data: {\"id\":\"a\",\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"delta\":{\"content\":\"OK\",\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"id\":\"a\",\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"message\":{\"content\":\"OK\",\"role\":\"assistant\"}}],\"usage\":{\"total_tokens\":5}}\n\n",
+        );
+        let _m = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse_body)
+            .create_async()
+            .await;
+
+        let cfg = DirectLlmConfig { api_key: "k".into(), api_base: server.url() };
+        let body = serde_json::json!({"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}]});
+        use futures_util::StreamExt;
+        let mut stream = execute_stream(body, cfg, direct_retry_params_for_test());
+        let mut saw_warn = false;
+        let mut done: Option<LlmResponse> = None;
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                StreamChunk::Warn(w) => {
+                    assert!(w.contains("[DONE]"));
+                    saw_warn = true;
+                }
+                StreamChunk::Delta(t) => assert_eq!(t, "OK"),
+                StreamChunk::Done(r) => done = Some(r),
+                other => panic!("unexpected chunk: {:?}", other),
+            }
+        }
+        assert!(saw_warn, "Warn 必达(声明 MiniMax 形态)");
+        let r = done.expect("Done 帧必达");
+        assert_eq!(r.content, "OK");
+        assert_eq!(r.finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// 截断流（真断连）:有增量但 finish_reason 缺失 → fail-visible Err，
+    /// 禁止吞成假成功（B 方案灵魂判据:A 方案的吞截断洞被本测钉死）
+    #[tokio::test]
+    async fn test_direct_stream_truncated_no_finish_errors() {
+        let mut server = mockito::Server::new_async().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n\n",
+            // 连接提前关闭:无 finish 帧、无 [DONE]
+        );
+        let _m = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse_body)
+            .create_async()
+            .await;
+
+        let cfg = DirectLlmConfig { api_key: "k".into(), api_base: server.url() };
+        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+        use futures_util::StreamExt;
+        let mut stream = execute_stream(body, cfg, direct_retry_params_for_test());
+        let mut got_err = false;
+        while let Some(item) = stream.next().await {
+            if item.is_err() {
+                let msg = item.unwrap_err();
+                assert!(msg.contains("finish_reason 缺失"), "err: {msg}");
+                got_err = true;
+            }
+        }
+        assert!(got_err, "截断流必须 Err(fail-visible)");
+    }
+
+    /// MiniMax 工具调用流:finish_reason="tool_calls" + 末帧 message.tool_calls
+    /// → Done 聚合 tool_calls 完整(工具回合收口判据与文本回合同路)
+    #[tokio::test]
+    async fn test_direct_stream_minimax_tool_calls_finish() {
+        let mut server = mockito::Server::new_async().await;
+        let sse_body = concat!(
+            "data: {\"id\":\"a\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\": \\\"Tok\"}}]}}]}\n\n",
+            "data: {\"id\":\"a\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"yo\\\"}\"}}]}}]}\n\n",
+            "data: {\"id\":\"a\",\"choices\":[{\"finish_reason\":\"tool_calls\",\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\": \\\"Tokyo\\\"}\"},\"index\":0}]}}]}\n\n",
+        );
+        let _m = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse_body)
+            .create_async()
+            .await;
+
+        let cfg = DirectLlmConfig { api_key: "k".into(), api_base: server.url() };
+        let body = serde_json::json!({"model":"MiniMax-M3","messages":[{"role":"user","content":"weather?"}]});
+        use futures_util::StreamExt;
+        let mut stream = execute_stream(body, cfg, direct_retry_params_for_test());
+        let mut done: Option<LlmResponse> = None;
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                StreamChunk::Done(r) => done = Some(r),
+                StreamChunk::Warn(_) => {}
+                StreamChunk::ToolCallDelta { .. } => {}
+                other => panic!("unexpected chunk: {:?}", other),
+            }
+        }
+        let r = done.expect("Done 帧必达");
+        assert_eq!(r.finish_reason.as_deref(), Some("tool_calls"));
+        let tcs = r.tool_calls.expect("tool_calls 必达");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "get_weather");
+        assert_eq!(tcs[0].arguments["city"], "Tokyo");
     }
 
     /// 等价性双跑(本批灵魂判据):同一 goal 经 relay(mock 执行体)与
