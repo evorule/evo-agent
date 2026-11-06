@@ -41,6 +41,10 @@ pub struct ApprovalRequest {
     pub alternative: String,
     /// 提案 ID(审批链留痕主键,由 parse 时自动生成)
     pub proposal_id: String,
+    /// 宿主任意代码执行上下文(提案侧携带:python_exec 未装配 workspace
+    /// 沙箱为 true,其余 false)——决策端红线原语按执行面判定
+    /// `red_line.host_code_execution`,静态逃逸检测绕过形态由本面兜底
+    pub host_execution: bool,
 }
 
 /// 生成新的提案 ID(`ap-` 前缀 + 纳秒时间戳十六进制,如 `ap-18f3a2...`)
@@ -362,7 +366,7 @@ impl RedLineGuardApproval {
 #[async_trait]
 impl ApprovalCallback for RedLineGuardApproval {
     async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision {
-        let red_line = crate::agent::approval_policy::hits_red_line(&req.tool_name, &req.args);
+        let red_line = crate::agent::approval_policy::hits_red_line_for_request(req);
         if let Some(red) = red_line {
             if !self.exemption_override {
                 info!(
@@ -499,6 +503,13 @@ pub fn parse_approval_request(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(new_proposal_id),
+        // 宿主任意代码执行上下文:提案侧机器可读标记(python_exec 未装配
+        // workspace 沙箱为 true),决策端红线按执行面判定;缺省 false(兼容
+        // 遗留提案形态零变化)
+        host_execution: result_json
+            .get("host_execution")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -601,6 +612,7 @@ mod tests {
             risk: "high".to_string(),
             alternative: "".to_string(),
             proposal_id: "ap-1".to_string(),
+            host_execution: false,
         };
         let decision = cb.request_approval(&req).await;
         assert!(decision.approved);
@@ -620,6 +632,7 @@ mod tests {
             risk: "high".to_string(),
             alternative: "".to_string(),
             proposal_id: "ap-1".to_string(),
+            host_execution: false,
         };
         let decision = cb.request_approval(&req).await;
         assert!(!decision.approved);
@@ -640,6 +653,7 @@ mod tests {
             risk: "medium".to_string(),
             alternative: "".to_string(),
             proposal_id: "ap-1".to_string(),
+            host_execution: false,
         };
         let decision = cb.request_approval(&req).await;
         assert!(decision.approved);
@@ -661,6 +675,7 @@ mod tests {
             risk: "medium: executes a shell command".to_string(),
             alternative: String::new(),
             proposal_id: new_proposal_id(),
+            host_execution: false,
         };
         let d = cb.request_approval(&req).await;
         assert!(d.approved);
@@ -687,6 +702,7 @@ mod tests {
             risk: "high".to_string(),
             alternative: String::new(),
             proposal_id: new_proposal_id(),
+            host_execution: false,
         }
     }
 
@@ -713,6 +729,52 @@ mod tests {
             .await;
         assert!(!d.approved);
         assert!(d.reason.contains("red_line.data_exfiltration"));
+    }
+
+    #[tokio::test]
+    async fn test_redline_guard_host_code_execution_forced_manual() {
+        // python_exec 未装配 workspace 沙箱(提案 host_execution=true)=宿主
+        // 任意代码执行,任何档位强制人工——判定式端(PolicyApproval)不得放行
+        let cb = RedLineGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll), false);
+        let mut req = redline_req("python_exec", json!({"code": "print(1)"}));
+        req.host_execution = true;
+        let d = cb.request_approval(&req).await;
+        assert!(!d.approved, "host code execution must not be auto-approved");
+        assert!(
+            d.reason.contains("red_line.host_code_execution"),
+            "reason: {}",
+            d.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redline_guard_workspace_anchored_python_not_host_redline() {
+        // workspace 沙箱锚定(host_execution=false):不触发宿主执行红线,
+        // 判定式端照常放行(逃逸意图仍由守卫面恒必问)
+        let cb = RedLineGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll), false);
+        let req = redline_req("python_exec", json!({"code": "print(1)"}));
+        let d = cb.request_approval(&req).await;
+        assert!(
+            d.approved,
+            "workspace-anchored python is not the host red line"
+        );
+        assert!(!d.reason.contains("red_line."), "reason: {}", d.reason);
+    }
+
+    #[tokio::test]
+    async fn test_redline_guard_host_code_override_proceeds_with_marker() {
+        // 显式豁免(exemptionOverride=true):按判定放行,理由必带标记(审计强化)
+        let cb = RedLineGuardApproval::new(Arc::new(PolicyApproval), Arc::new(DenyAll), true);
+        let mut req = redline_req("python_exec", json!({"code": "print(1)"}));
+        req.host_execution = true;
+        let d = cb.request_approval(&req).await;
+        assert!(d.approved);
+        assert!(
+            d.reason
+                .contains("exemption_overridden:red_line.host_code_execution"),
+            "reason: {}",
+            d.reason
+        );
     }
 
     #[tokio::test]
@@ -749,6 +811,7 @@ mod tests {
             risk: "high".to_string(),
             alternative: String::new(),
             proposal_id: new_proposal_id(),
+            host_execution: false,
         }
     }
 
@@ -901,6 +964,7 @@ mod tests {
             risk: "medium".to_string(),
             alternative: "".to_string(),
             proposal_id: "ap-1".to_string(),
+            host_execution: false,
         };
 
         // 模拟 runner 等待审批
@@ -947,6 +1011,7 @@ mod tests {
             risk: "medium".to_string(),
             alternative: "".to_string(),
             proposal_id: "ap-2".to_string(),
+            host_execution: false,
         };
 
         let approval_clone = HttpApproval {
@@ -994,6 +1059,7 @@ mod tests {
             risk: "medium".to_string(),
             alternative: "".to_string(),
             proposal_id: "ap-3".to_string(),
+            host_execution: false,
         };
 
         let result = approval.request_approval(&req).await;
@@ -1023,6 +1089,7 @@ mod tests {
             risk: "medium".to_string(),
             alternative: "".to_string(),
             proposal_id: "ap-5".to_string(),
+            host_execution: false,
         };
 
         // 启动等待后移除并 drop sender
@@ -1058,6 +1125,7 @@ mod tests {
             risk: "medium".to_string(),
             alternative: "".to_string(),
             proposal_id: "ap-4".to_string(),
+            host_execution: false,
         };
 
         // 启动等待(不发送结果,只检查 pending 是否被填充)

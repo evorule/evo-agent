@@ -216,7 +216,7 @@ impl ApprovalCallback for PolicyReview {
     async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision {
         // 1. 红线豁免：默认任何档位强制人工；用户显式关闭（override=true）
         //    仅解除强制，评审留痕必须携带 exemption_overridden 标记
-        let red_line = hits_red_line(&req.tool_name, &req.args);
+        let red_line = hits_red_line_for_request(req);
         if red_line.is_some() && !self.exemption_override {
             info!(
                 tool = %req.tool_name,
@@ -550,6 +550,10 @@ pub enum RedLine {
     DataExfiltration,
     /// 改治理配置文件本身（自我扩权防护——条件文件/设置文件任何档位下必经人工）
     GovernanceConfigWrite,
+    /// 宿主任意代码执行（python_exec 未装配 workspace 沙箱即落宿主解释器，
+    /// 无白名单可比 shell_exec——静态逃逸检测可被动态构造绕过，故按操作面
+    /// 而非代码内容判定；sandbox-trusted 档不出提案，本红线天然不触发）
+    HostCodeExecution,
 }
 
 impl RedLine {
@@ -560,6 +564,7 @@ impl RedLine {
             Self::RemotePush => "red_line.remote_push",
             Self::DataExfiltration => "red_line.data_exfiltration",
             Self::GovernanceConfigWrite => "red_line.governance_config_write",
+            Self::HostCodeExecution => "red_line.host_code_execution",
         }
     }
 }
@@ -625,6 +630,31 @@ fn command_hits_exfil(command: &str) -> bool {
 fn command_hits_push(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     lower.contains("git") && lower.split_whitespace().any(|w| w == "push")
+}
+
+/// 宿主任意代码执行红线判定原语：按操作面（工具+执行上下文）而非代码内容判定
+///
+/// python_exec 未装配 workspace 沙箱（提案 `host_execution=true`）即落宿主
+/// 解释器任意执行——代码内容的静态逃逸检测（`hits_escape_intent`）只覆盖
+/// 已知形态，动态构造（exec/eval/拼接导入）可绕过；红线以操作面兜底。
+/// 纯函数、零 IO；`approval.exemptionOverride` 语义由决策端消费方实现。
+pub fn host_code_execution_red_line(tool: &str, host_execution: bool) -> Option<RedLine> {
+    if tool == "python_exec" && host_execution {
+        Some(RedLine::HostCodeExecution)
+    } else {
+        None
+    }
+}
+
+/// 决策端入口：红线判定（操作面清单 + 宿主任意代码执行）同源同口径
+///
+/// [`hits_red_line`] 覆盖参数形态可判定的清单；宿主代码执行由提案携带的
+/// 执行上下文（`host_execution`）判定，随 [`crate::agent::approval::ApprovalRequest`]
+/// 到达决策端。所有运行时决策端（红线前置闸/policy 评审前置闸）一律走本
+/// 入口，禁止各端自行拼装口径。
+pub fn hits_red_line_for_request(req: &crate::agent::approval::ApprovalRequest) -> Option<RedLine> {
+    hits_red_line(&req.tool_name, &req.args)
+        .or_else(|| host_code_execution_red_line(&req.tool_name, req.host_execution))
 }
 
 /// 红线豁免判定原语：操作是否命中默认强制人工审批清单
@@ -713,6 +743,40 @@ max_actions_per_run = 200
     fn red_line_delete_always_hits() {
         assert_eq!(
             hits_red_line("file_delete", &json!({"path": "a.txt"})),
+            Some(RedLine::IrreversibleDelete)
+        );
+    }
+
+    #[test]
+    fn host_code_execution_red_line_by_surface() {
+        // 宿主任意代码执行:按操作面判定(工具+执行上下文),与代码内容无关
+        assert_eq!(
+            host_code_execution_red_line("python_exec", true),
+            Some(RedLine::HostCodeExecution)
+        );
+        // workspace 沙箱锚定不触发
+        assert_eq!(host_code_execution_red_line("python_exec", false), None);
+        // 其他工具不在此面
+        assert_eq!(host_code_execution_red_line("shell_exec", true), None);
+        assert_eq!(
+            RedLine::HostCodeExecution.as_str(),
+            "red_line.host_code_execution"
+        );
+    }
+
+    #[test]
+    fn red_line_for_request_combines_surface_and_context() {
+        let mut req = review_req("python_exec", "", json!({"code": "print(1)"}));
+        assert_eq!(hits_red_line_for_request(&req), None);
+        req.host_execution = true;
+        assert_eq!(
+            hits_red_line_for_request(&req),
+            Some(RedLine::HostCodeExecution)
+        );
+        // 参数形态清单判定同入口可达(同源同口径)
+        let del = review_req("file_delete", "", json!({"path": "a.txt"}));
+        assert_eq!(
+            hits_red_line_for_request(&del),
             Some(RedLine::IrreversibleDelete)
         );
     }
@@ -926,6 +990,7 @@ max_actions_per_run = 200
             risk: "medium".to_string(),
             alternative: String::new(),
             proposal_id: "ap-test".to_string(),
+            host_execution: false,
         }
     }
 

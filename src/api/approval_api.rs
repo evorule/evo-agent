@@ -26,7 +26,9 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::agent::approval_policy::{hits_red_line, ApprovalPolicyFile, PolicyFileError};
+use crate::agent::approval_policy::{
+    hits_red_line, host_code_execution_red_line, ApprovalPolicyFile, PolicyFileError,
+};
 use crate::api::agent_api::AgentApiState;
 
 /// 条件文件路径:{workdir}/.evo/approval-policy.toml(与 serve/CLI 接线层同源)
@@ -42,6 +44,10 @@ pub struct TrialBody {
     /// 操作参数(与运行时 ApprovalRequest.args 同形态,如 {"command": "..."})
     #[serde(default)]
     pub args: Value,
+    /// 宿主任意代码执行上下文(python_exec 未装配 workspace 沙箱为 true,
+    /// 与运行时提案 JSON 同名同义;缺省 false 与运行时缺省一致)
+    #[serde(default)]
+    pub host_execution: bool,
 }
 
 /// 机械预检结果(工作台渲染三色:forced_manual=红/reviewed=黄/fallback_manual=灰)
@@ -64,6 +70,7 @@ fn trial(
     override_flag: bool,
     tool: &str,
     args: &Value,
+    host_execution: bool,
 ) -> TrialOutcome {
     let limits = policy.map(|p| {
         (
@@ -72,7 +79,8 @@ fn trial(
         )
     });
 
-    let red_line = hits_red_line(tool, args);
+    let red_line =
+        hits_red_line(tool, args).or_else(|| host_code_execution_red_line(tool, host_execution));
     let conditions: Vec<String> = policy
         .map(|p| p.conditions_for(tool).to_vec())
         .unwrap_or_default();
@@ -206,7 +214,13 @@ pub async fn trial_judge(
             Err(e) => (None, Some(e.to_string())),
         };
 
-    let mut outcome = trial(policy.as_ref(), override_flag, &body.tool, &body.args);
+    let mut outcome = trial(
+        policy.as_ref(),
+        override_flag,
+        &body.tool,
+        &body.args,
+        body.host_execution,
+    );
     if let Some(err) = parse_error {
         outcome.status = "file_invalid";
         outcome.note = format!("条件文件解析失败({err})——policy 档运行时 fail-visible 降级 manual");

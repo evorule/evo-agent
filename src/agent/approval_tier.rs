@@ -1193,6 +1193,7 @@ mod tests {
             risk: "high".to_string(),
             alternative: String::new(),
             proposal_id: "ap-1".to_string(),
+            host_execution: false,
         }
     }
 
@@ -1277,6 +1278,7 @@ mod tests {
             risk: "high".to_string(),
             alternative: String::new(),
             proposal_id: "ap-py-1".to_string(),
+            host_execution: false,
         }
     }
 

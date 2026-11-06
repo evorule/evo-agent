@@ -6181,6 +6181,26 @@ impl AgentRunner {
                 )
                 .await;
             let translated = Self::translate_pipeline_outcome(outcome, tool_name);
+            // 决策面与帧对账:重执行失败不得把已做出的决策吞成流级 Err——
+            // 那会让流式面 ApprovalResult 帧随 `if let Ok` 分支丢失(Required
+            // 无 Result,前端/回放帧数对账断裂),且审批留痕/审计挂接一并缺席。
+            // 错误以工具结果对象形态回喂(与执行臂 Err 回喂的 tool 消息内容
+            // 同构:{"error":..,"tool_name":..}),决策帧照发。
+            let translated: Result<Value, AgentError> = match translated {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    warn!(
+                        %session_id,
+                        tool = %tool_name,
+                        error = %e,
+                        "approved re-execution failed; feeding error back as tool result (decision frame preserved)"
+                    );
+                    Ok(serde_json::json!({
+                        "error": e.to_string(),
+                        "tool_name": tool_name,
+                    }))
+                }
+            };
             // B22-C T1:批准重执行的工具完成事件(成败皆记;拒绝不记——
             // 决定面由 T3 覆盖,与 gated 收口拒绝语义一致)
             if let Some(ledger) = &self.event_ledger {

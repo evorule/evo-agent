@@ -4458,6 +4458,7 @@ mod tests {
             risk: "high".to_string(),
             alternative: String::new(),
             proposal_id: proposal_id.to_string(),
+            host_execution: false,
         }
     }
 

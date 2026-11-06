@@ -67,9 +67,10 @@ pub use approval::{
     HTTP_APPROVAL_TIMEOUT_SECS,
 };
 pub use approval_policy::{
-    hits_red_line, ApprovalPolicyFile, AuditedReviewInvoker, ConditionJudgement, PolicyFileError,
-    PolicyJudgement, PolicyLimits, PolicyReview, PolicyReviewInvoker, RedLine, ReviewVerdict,
-    ToolGroupPolicy, POLICY_REVIEW_APPROVER, POLICY_REVIEW_PURPOSE, POLICY_REVIEW_TIMEOUT_SECS,
+    hits_red_line, hits_red_line_for_request, host_code_execution_red_line, ApprovalPolicyFile,
+    AuditedReviewInvoker, ConditionJudgement, PolicyFileError, PolicyJudgement, PolicyLimits,
+    PolicyReview, PolicyReviewInvoker, RedLine, ReviewVerdict, ToolGroupPolicy,
+    POLICY_REVIEW_APPROVER, POLICY_REVIEW_PURPOSE, POLICY_REVIEW_TIMEOUT_SECS,
     REVIEW_SYSTEM_PROMPT,
 };
 pub use assembly::{AssemblyRecipe, DEFAULT_RECIPE_VERSION};

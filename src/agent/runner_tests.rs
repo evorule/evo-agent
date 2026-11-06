@@ -6617,3 +6617,48 @@ async fn heartbeat_abort_terminates_pending_io_request() {
     assert!(saw_done, "turn must end with Done on heartbeat abort");
     io_terminal.assert();
 }
+
+// ===== 审批决策面与帧对账 =====
+
+/// 决策已做出后重执行失败,决策面不得随流级 Err 丢失:
+/// resolve_approval 必须返回 Ok(approval_flow=Some) + 错误以工具结果形态
+/// 回喂(与执行臂 Err 回喂内容同构),流式面 ApprovalResult 帧随 Ok 照发。
+#[tokio::test]
+async fn resolve_approval_keeps_decision_when_reexec_fails() {
+    let runner = AgentRunner::new(AgentConfig::default(), make_test_client())
+        .with_approval_callback(Arc::new(crate::agent::approval::AutoApprove));
+    let req = crate::agent::approval::ApprovalRequest {
+        session_id: "t-resolve".into(),
+        tool_name: "no_such_tool_for_reexec_probe".into(),
+        args: serde_json::json!({"x": 1}),
+        command: String::new(),
+        risk: "test".into(),
+        alternative: String::new(),
+        proposal_id: crate::agent::approval::new_proposal_id(),
+        host_execution: false,
+    };
+    let out = runner
+        .resolve_approval(
+            "t-resolve",
+            &req.tool_name.clone(),
+            &req.args.clone(),
+            req.clone(),
+            None,
+        )
+        .await;
+    let o = out.expect("decision made: resolve_approval must not collapse into stream Err");
+    let (req0, decision) = o
+        .approval_flow
+        .expect("approval_flow must carry the decision for the stream frame");
+    assert!(decision.approved);
+    assert_eq!(req0.proposal_id, req.proposal_id);
+    let s = o.final_result.to_string();
+    assert!(
+        s.contains("error"),
+        "re-exec error must be fed back as tool result: {s}"
+    );
+    assert!(
+        o.approval_record.is_some(),
+        "approval record must be attached for the audit chain"
+    );
+}
