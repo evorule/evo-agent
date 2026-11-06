@@ -38,6 +38,7 @@
 
 ### 🆕 新增
 
+- **安装器（NSIS）PREINSTALL 保护钩子：升级/重装前自动备份用户部署配置** — 覆盖安装（含应用内静默更新）会用新包内的 `resources\evo-agent\evo-agent.toml` 覆盖部署副本，用户自行追加的扩展配置随之丢失。安装器现于文件拷贝前检测该文件：存在则完整备份到 `%APPDATA%\evo-agent-desktop\deployed-toml-migration-backup.toml`（安装目录外，重装不灭失；不经自动合并，供人工比对与恢复，应用侧启动期合回机制不受影响）
 - **文件二进制原样流端点 `GET /api/files/raw`（媒体预览通道）** — 工作台文件面此前仅有 `read_file` 文本通道（UTF-8 解码，供编辑器），二进制文件（视频/图片/字幕）经该通道会被 UTF-8 替换破坏且不可逆，媒体预览无法消费。新端点直出磁盘字节：seek+定长流式回（大体量不整读内存）；单段 Range/后缀段 → 206（`content-range`/`content-length` 三面一致），多段与越界 → 416（`bytes */total` + 空体，对齐静态层语义），HEAD 同头零体，`If-None-Match` 命中 → 304；Content-Type 显式表（`.mp4`→`video/mp4`、`.ass`→`text/x-ssa`、`.srt`→`application/x-subrip` 等，未知扩展回落 `application/octet-stream`，不带 charset 后缀）。路径安全同面（同一 canonicalize+沙箱边界+`..`/绝对路径拒绝，错误语义同 `read_file`：404 不存在/400 越界/400 目录非文件），`X-Evo-Workspace` 工作区重锚与 G16 鉴权同面
 
 ### 🔄 变更
