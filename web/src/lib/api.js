@@ -433,8 +433,11 @@ export function llmModelsNoteFromError(message) {
   return s;
 }
 
-/** 审批决定(G8 既有通道;approved=true 批准 / false 拒绝) */
-export function approveProposal(agentType, sessionId, approved, proposalId) {
+/** 审批决定(G8 既有通道;approved=true 批准 / false 拒绝)。
+ *  decisionScope(可选):自动批路径必带('auto-session'/'auto-workspace')——
+ *  后端对 auto 类批准复核危险命令守卫表,命中拒绝(审批保持,可人工);
+ *  人工点击不传(缺省 manual,不受限)。 */
+export function approveProposal(agentType, sessionId, approved, proposalId, decisionScope) {
   return fetch(`/agents/${encodeURIComponent(agentType)}/approve`, {
     method: 'POST',
     headers: headers(true),
@@ -443,6 +446,7 @@ export function approveProposal(agentType, sessionId, approved, proposalId) {
       approved,
       proposal_id: proposalId,
       reason: '工作台审批',
+      ...(decisionScope ? { decision_scope: decisionScope } : {}),
     }),
   }).then(unwrap);
 }

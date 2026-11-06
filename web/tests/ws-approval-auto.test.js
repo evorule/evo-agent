@@ -102,6 +102,28 @@ describe('自动批准 POST 409 no_pending_item 静默收卡(后端 T0 已决)',
     expect(msgOf('approval')).toHaveLength(0); // 无错误回执/待批卡
   });
 
+  it('自动批提交携带 decision_scope(后端守卫第二层的协议面)', async () => {
+    // 工作区清单命中 → scope='auto-workspace' 必须随 /approve 提交——
+    // 后端对 auto 类批准复核危险命令守卫表(双端同表镜像,守卫纵深)
+    workspaceAllowlist.set([{ tool: 'shell_exec', prefix: 'find' }]);
+    approveProposal.mockResolvedValueOnce();
+    MockWebSocket.last.deliver({
+      type: 'ApprovalRequired',
+      tool_name: 'shell_exec',
+      command: 'find src -name x',
+      risk: 'low',
+      proposal_id: 'p-scope',
+    });
+    await flush();
+    expect(approveProposal).toHaveBeenCalledWith(
+      'general',
+      null,
+      true,
+      'p-scope',
+      'auto-workspace',
+    );
+  });
+
   it('409 后 ApprovalResult 帧:自动批准登记保留,不重复信息条', async () => {
     workspaceAllowlist.set([{ tool: 'shell_exec', prefix: 'find' }]);
     approveProposal.mockRejectedValueOnce(

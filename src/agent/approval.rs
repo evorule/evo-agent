@@ -88,6 +88,9 @@ pub struct PendingApproval {
     pub tx: oneshot::Sender<ApprovalDecision>,
     /// 等待中的提案 ID
     pub proposal_id: String,
+    /// 等待中的提案原文快照(/approve 端点消费:自动决策守卫按工具/命令
+    /// 复核危险守卫表,防止客户端会话记忆旁路 T2 恒压;人工决策不受限)
+    pub request: ApprovalRequest,
 }
 
 /// 审批回调 trait — 不同运行模式不同实现
@@ -201,6 +204,7 @@ impl ApprovalCallback for HttpApproval {
                 PendingApproval {
                     tx,
                     proposal_id: req.proposal_id.clone(),
+                    request: req.clone(),
                 },
             );
         }

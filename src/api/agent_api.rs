@@ -2363,6 +2363,11 @@ pub struct ApproveRequest {
     pub approver_token: Option<String>,
     /// 审批理由(可选,随决定写入审批留痕)
     pub reason: Option<String>,
+    /// 决策来源标记(可选):`auto-session`/`auto-workspace`=会话记忆/工作区
+    /// 放行清单命中的自动批准(前端短路提交);缺省或 `manual`=人工点击。
+    /// auto 类批准在危险守卫表命中时被拒绝(危险命令永不自动批准——审批
+    /// 保持等待,可人工处置);人工决策不受限。
+    pub decision_scope: Option<String>,
 }
 
 /// 批K 段7:问答回传请求的 body
@@ -2441,6 +2446,48 @@ async fn approve_agent(
                     "session_id": req.session_id,
                 })),
             ));
+        }
+    }
+
+    // 自动决策守卫:会话记忆/工作区清单自动批(auto scope)对守卫表命中的
+    // 命令永不送达——客户端记忆不得旁路 T2 恒压(危险子命令守卫/逃逸意图
+    // 检测,与前端会话记忆守卫同族镜像,双端同表);人工点击(缺省)不受限。
+    // 拒绝时 pending 放回,审批保持等待(可人工处置),语义同 proposal_id
+    // mismatch;未知 scope 值从严按 auto 处理(保守方向)。
+    let auto_scope = req
+        .decision_scope
+        .as_deref()
+        .map(|s| !s.is_empty() && s != "manual")
+        .unwrap_or(false);
+    if auto_scope && req.approved {
+        let guarded = if pending.request.tool_name == "python_exec" {
+            // python 代码不走 shell 守卫表(shell 语义对代码内容误报,见
+            // approval_tier verdict 文档);逃逸意图检测承担同类职责
+            let code = pending
+                .request
+                .args
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            crate::agent::approval_tier::hits_escape_intent(code)
+        } else {
+            crate::agent::approval_tier::hits_auto_deny_guard(&pending.request.command)
+        };
+        if guarded {
+            warn!(
+                session_id = %req.session_id,
+                tool = %pending.request.tool_name,
+                "G8: auto-scope approval denied by guard (dangerous command never auto-approved)"
+            );
+            let body = serde_json::json!({
+                "error": "auto_decision_guard_hit",
+                "session_id": req.session_id,
+                "tool_name": pending.request.tool_name,
+            });
+            if let Ok(mut map) = state.pending_approvals.lock() {
+                map.insert(req.session_id.clone(), pending);
+            }
+            return Err((StatusCode::BAD_REQUEST, Json(body)));
         }
     }
 
@@ -4368,6 +4415,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
     // G4 测试需要 AgentResult 构造 Done 帧
+    use crate::agent::approval::ApprovalRequest;
     use crate::agent::AgentResult;
 
     fn make_test_state() -> AgentApiState {
@@ -4383,6 +4431,37 @@ mod tests {
             Arc::new(WorkspaceApiClient::new("http://localhost:8080")),
             Arc::new(std::sync::RwLock::new(ToolHandler::new())),
         )
+    }
+
+    /// 构造 /approve 测试用 pending 提案快照(参数=提案 ID/工具/命令)
+    fn test_pending_request(proposal_id: &str, tool: &str, command: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            session_id: "sess".to_string(),
+            tool_name: tool.to_string(),
+            args: serde_json::json!({}),
+            command: command.to_string(),
+            risk: "high".to_string(),
+            alternative: String::new(),
+            proposal_id: proposal_id.to_string(),
+        }
+    }
+
+    /// 插入 pending 审批项(tests 通用)
+    fn insert_pending(
+        state: &AgentApiState,
+        session_id: &str,
+        request: ApprovalRequest,
+    ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+        state.pending_approvals.lock().unwrap().insert(
+            session_id.to_string(),
+            PendingApproval {
+                tx,
+                proposal_id: request.proposal_id.clone(),
+                request,
+            },
+        );
+        rx
     }
 
     #[test]
@@ -6015,17 +6094,11 @@ mod tests {
     async fn test_approve_registered_session_delivers_decision() {
         // 手动往 ApprovalStore 插入一个 pending 项,验证 /approve 能送达决定
         let state = make_test_state();
-        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
-        {
-            let mut map = state.pending_approvals.lock().unwrap();
-            map.insert(
-                "approval-session-001".to_string(),
-                PendingApproval {
-                    tx,
-                    proposal_id: "ap-001".to_string(),
-                },
-            );
-        }
+        let rx = insert_pending(
+            &state,
+            "approval-session-001",
+            test_pending_request("ap-001", "shell_exec", "find src"),
+        );
         let app = router(state);
 
         let body = serde_json::json!({
@@ -6060,13 +6133,10 @@ mod tests {
     async fn test_approve_delivers_denial() {
         // 验证 approved:false 也能正确送达
         let state = make_test_state();
-        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
-        state.pending_approvals.lock().unwrap().insert(
-            "approval-session-002".to_string(),
-            PendingApproval {
-                tx,
-                proposal_id: "ap-002".to_string(),
-            },
+        let rx = insert_pending(
+            &state,
+            "approval-session-002",
+            test_pending_request("ap-002", "shell_exec", "find src"),
         );
         let app = router(state);
 
@@ -6092,13 +6162,10 @@ mod tests {
     async fn test_approve_removes_session_from_store() {
         // /approve 后 session 应从 store 移除(再次 approve 同一 session → 404)
         let state = make_test_state();
-        let (tx, _rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
-        state.pending_approvals.lock().unwrap().insert(
-            "approval-session-003".to_string(),
-            PendingApproval {
-                tx,
-                proposal_id: "ap-003".to_string(),
-            },
+        let _rx = insert_pending(
+            &state,
+            "approval-session-003",
+            test_pending_request("ap-003", "shell_exec", "find src"),
         );
         let app = router(state.clone());
 
@@ -6137,13 +6204,10 @@ mod tests {
     async fn test_approve_route_registered() {
         // 验证 /approve 路由已注册:对已注册 session 发 POST 应返回 200(非 405 Method Not Allowed)
         let state = make_test_state();
-        let (tx, _rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
-        state.pending_approvals.lock().unwrap().insert(
-            "route-test-sess".to_string(),
-            PendingApproval {
-                tx,
-                proposal_id: "ap-route".to_string(),
-            },
+        let _rx = insert_pending(
+            &state,
+            "route-test-sess",
+            test_pending_request("ap-route", "shell_exec", "find src"),
         );
         let app = router(state);
 
@@ -6193,13 +6257,10 @@ mod tests {
     async fn test_approve_without_token_degrades_to_unverified() {
         // 未携带 approver_token → 审批照常送达,审批人记 unverified
         let state = make_test_state();
-        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
-        state.pending_approvals.lock().unwrap().insert(
-            "unverified-sess".to_string(),
-            PendingApproval {
-                tx,
-                proposal_id: "ap-uv".to_string(),
-            },
+        let rx = insert_pending(
+            &state,
+            "unverified-sess",
+            test_pending_request("ap-uv", "shell_exec", "find src"),
         );
         let app = router(state);
 
@@ -6227,13 +6288,10 @@ mod tests {
     async fn test_approve_token_verify_failure_degrades_to_unverified() {
         // approver_token 校验失败(服务不可达)→ 不阻断审批,降级 unverified
         let state = make_test_state();
-        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
-        state.pending_approvals.lock().unwrap().insert(
-            "badtoken-sess".to_string(),
-            PendingApproval {
-                tx,
-                proposal_id: "ap-bt".to_string(),
-            },
+        let rx = insert_pending(
+            &state,
+            "badtoken-sess",
+            test_pending_request("ap-bt", "shell_exec", "find src"),
         );
         let app = router(state);
 
@@ -6279,13 +6337,10 @@ mod tests {
             crate::agent::AgentDefinitionManager::with_default_dir(),
             EvoruleApiClient::new(&server.url()),
         );
-        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
-        state.pending_approvals.lock().unwrap().insert(
-            "verify-sess".to_string(),
-            PendingApproval {
-                tx,
-                proposal_id: "ap-vf".to_string(),
-            },
+        let rx = insert_pending(
+            &state,
+            "verify-sess",
+            test_pending_request("ap-vf", "shell_exec", "find src"),
         );
         let app = router(state);
 
@@ -6316,13 +6371,10 @@ mod tests {
     async fn test_approve_proposal_id_mismatch_returns_400_and_keeps_pending() {
         // 提案 ID 不匹配 → 400,且 pending 保留(可携带正确 ID 重试成功)
         let state = make_test_state();
-        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
-        state.pending_approvals.lock().unwrap().insert(
-            "mismatch-sess".to_string(),
-            PendingApproval {
-                tx,
-                proposal_id: "ap-correct".to_string(),
-            },
+        let rx = insert_pending(
+            &state,
+            "mismatch-sess",
+            test_pending_request("ap-correct", "shell_exec", "find src"),
         );
         let app = router(state.clone());
 
@@ -6376,6 +6428,168 @@ mod tests {
         assert_eq!(r2.status(), StatusCode::OK);
         let decision = rx.await.unwrap();
         assert!(decision.approved);
+    }
+
+    // ===== 自动决策守卫(auto scope 危险命令永不自动批准) =====
+
+    #[tokio::test]
+    async fn test_approve_auto_scope_guard_blocks_dangerous_command() {
+        // 会话记忆自动批(auto-session)对守卫表命中命令 → 400 拒绝,
+        // pending 放回(审批保持等待,人工仍可处置)
+        let state = make_test_state();
+        let rx = insert_pending(
+            &state,
+            "guard-sess",
+            test_pending_request("ap-guard", "shell_exec", "rm -rf build"),
+        );
+        let app = router(state.clone());
+
+        let body = serde_json::json!({
+            "session_id": "guard-sess",
+            "approved": true,
+            "proposal_id": "ap-guard",
+            "decision_scope": "auto-session",
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/agents/general/approve")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // pending 必须放回:后续人工决策(不带 scope)可送达
+        assert!(
+            state
+                .pending_approvals
+                .lock()
+                .unwrap()
+                .contains_key("guard-sess"),
+            "guarded auto approval must keep pending for manual handling"
+        );
+
+        let manual = serde_json::json!({
+            "session_id": "guard-sess",
+            "approved": true,
+            "proposal_id": "ap-guard",
+        });
+        let r2 = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/agents/general/approve")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(manual.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        let decision = rx.await.unwrap();
+        assert!(decision.approved);
+        assert_eq!(decision.approver, "unverified");
+    }
+
+    #[tokio::test]
+    async fn test_approve_auto_scope_guard_allows_safe_command() {
+        // 自动批对未命中守卫表的安全命令正常送达
+        let state = make_test_state();
+        let rx = insert_pending(
+            &state,
+            "guard-safe-sess",
+            test_pending_request("ap-safe", "shell_exec", "find src"),
+        );
+        let app = router(state);
+
+        let body = serde_json::json!({
+            "session_id": "guard-safe-sess",
+            "approved": true,
+            "proposal_id": "ap-safe",
+            "decision_scope": "auto-session",
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/agents/general/approve")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decision = rx.await.unwrap();
+        assert!(decision.approved);
+    }
+
+    #[tokio::test]
+    async fn test_approve_manual_click_bypasses_guard() {
+        // 人工点击(缺省无 scope)对危险命令不受限——守卫只管自动决策
+        let state = make_test_state();
+        let rx = insert_pending(
+            &state,
+            "manual-sess",
+            test_pending_request("ap-manual", "shell_exec", "rm -rf build"),
+        );
+        let app = router(state);
+
+        let body = serde_json::json!({
+            "session_id": "manual-sess",
+            "approved": true,
+            "proposal_id": "ap-manual",
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/agents/general/approve")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decision = rx.await.unwrap();
+        assert!(decision.approved);
+    }
+
+    #[tokio::test]
+    async fn test_approve_auto_scope_guard_blocks_python_escape() {
+        // python_exec 的自动批守卫走逃逸意图检测(args.code),不走 shell 守卫表
+        let state = make_test_state();
+        let mut request = test_pending_request("ap-py", "python_exec", "");
+        request.args = serde_json::json!({"code": "open('C:/Users/x/secret','w')"});
+        let rx = insert_pending(&state, "py-guard-sess", request);
+        let app = router(state);
+
+        let body = serde_json::json!({
+            "session_id": "py-guard-sess",
+            "approved": true,
+            "proposal_id": "ap-py",
+            "decision_scope": "auto-workspace",
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/agents/general/approve")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // rx 未消费:tx 仍在(pending 放回)。drop 显式收尾避免悬置告警
+        drop(rx);
     }
 
     // ===== E2: 记忆证据/召回 query DTO 反序列化测试 =====

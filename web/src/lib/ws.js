@@ -687,7 +687,10 @@ function handleFrame(f) {
           decision: 'sending',
         });
         autoApprovedProposals.add(f.proposal_id);
-        approveProposal('general', get(sessionId), true, f.proposal_id)
+        // 自动批提交带决策来源标记:后端对 auto 类批准复核危险命令守卫表
+        // (与 evaluateAutoApproval 的 isAutoDeny 同表镜像),命中 400 且审批
+        // 保持——守卫纵深第二层,双端同表
+        approveProposal('general', get(sessionId), true, f.proposal_id, scope)
           .then(() => updateMessage(receiptId, { decision: 'sent' }))
           .catch((err) => {
             // 409 no_pending_item = 后端已决(批② T0 allowlist 静默批准先决,
