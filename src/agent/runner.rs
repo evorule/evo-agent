@@ -8657,6 +8657,22 @@ impl AgentRunner {
                                                            full_content = resp.content.clone();
                                                            full_tool_calls = resp.tool_calls.clone();
                                                            finish_reason = resp.finish_reason.clone();
+                                                           // 会话收尾幽灵 tool_call 过滤(噪音防御,
+                                                           // 见 filter_ghost_tool_calls 注释)
+                                                           let (filtered, dropped_ghosts) =
+                                                               filter_ghost_tool_calls(
+                                                                   finish_reason.as_deref(),
+                                                                   full_tool_calls.take(),
+                                                               );
+                                                           if dropped_ghosts > 0 {
+                                                               warn!(
+                                                                   %session_id,
+                                                                   dropped = dropped_ghosts,
+                                                                   finish = %finish_reason.clone().unwrap_or_default(),
+                                                                   "dropped trailing tool_call(s) with non-object arguments on stop-finish response (provider protocol noise)"
+                                                               );
+                                                           }
+                                                           full_tool_calls = filtered;
                                                            last_llm_content = full_content.clone();
                                                            // B21:采集 provider token 真值
                                                            react_tokens = resp.token_usage.clone();
@@ -8737,6 +8753,70 @@ impl AgentRunner {
                                                            } else {
                                                                e
                                                            };
+                                                           // 会话收尾降级兜底:上游 invalid params 拒绝且
+                                                           // 上一轮已有非空最终内容时——答案已产出(幽灵
+                                                           // tool_call 错误回喂是主要成因,噪音防御见 Done
+                                                           // 臂过滤),turn 按 success+warning 收口而非 error,
+                                                           // 不把已完成的回答埋进失败终态
+                                                           if is_invalid_params_rejection(&e)
+                                                               && !last_llm_content.is_empty()
+                                                           {
+                                                               warn!(
+                                                                   %session_id,
+                                                                   error = %e,
+                                                                   "upstream rejected the follow-up request (invalid params); finalizing with last LLM content (success + warning)"
+                                                               );
+                                                               let mut submit_ok = true;
+                                                               if let Some(rid) = request_id {
+                                                                   let resp = serde_json::json!({
+                                                                       "content": last_llm_content,
+                                                                       "tool_calls": serde_json::Value::Null,
+                                                                       "is_finished": true,
+                                                                   });
+                                                                   if let Err(ie) = runner
+                                                                       .evorule_client
+                                                                       .submit_io_response(
+                                                                           &session_id, rid, &resp, None,
+                                                                       )
+                                                                       .await
+                                                                   {
+                                                                       warn!(
+                                                                           %session_id,
+                                                                           request_id = rid,
+                                                                           error = %ie,
+                                                                           "io_response (downgraded finalize) submit failed; falling back to error terminal"
+                                                                       );
+                                                                       submit_ok = false;
+                                                                   }
+                                                               }
+                                                               if submit_ok {
+                                                                   yield Ok(AgentEvent::Info(
+                                                                       "warning: follow-up request was rejected by the provider; finalized with the last model response"
+                                                                           .to_string(),
+                                                                   ));
+                                                                   let duration =
+                                                                       start_time.elapsed().as_millis() as u64;
+                                                                   if let Some(g) = turn_guard.take() {
+                                                                       g.end("success", step_count as u64, duration);
+                                                                   }
+                                                                   if let Err(fe) = runner.flush_messages(&session_id).await {
+                                                                       warn!(%session_id, error = %fe, "flush_messages during downgraded wrap-up failed");
+                                                                   }
+                                                                   runner.submit_tool_traces(&session_id).await;
+                                                                   let mut result = AgentResult::success(
+                                                                       last_llm_content.clone(),
+                                                                       step_count,
+                                                                       duration,
+                                                                       tool_calls.clone(),
+                                                                   );
+                                                                   result.tokens = runner
+                                                                       .usage_counter
+                                                                       .as_ref()
+                                                                       .map(|c| c.snapshot());
+                                                                   yield Ok(AgentEvent::Done(result));
+                                                                   return;
+                                                               }
+                                                           }
                                                            // 提交 error io_response 防止 evorule 卡死
                                                            if let Some(rid) = request_id {
                                                                let err_resp = serde_json::json!({"content": "", "error": &e});
@@ -10992,6 +11072,45 @@ fn clear_tool_results(region: &[Message], max_clear: usize) -> (Vec<Message>, us
 /// provider 同类拒绝(错误串透传形态)。非 413 类错误行为零变化。
 pub(crate) fn is_payload_limit_error(e: &str) -> bool {
     e.contains("413") || e.contains("Payload Too Large") || e.contains("length limit exceeded")
+}
+
+/// 会话收尾幽灵 tool_call 过滤(纯函数):stop/end_turn 终态响应携带 args
+/// 非对象的尾随 tool_call 视为 provider 协议噪音(实测 relay 在最终 content
+/// 响应中偶发 args:null 帧)——丢弃,不执行不回喂,会话按正常收尾落账。
+/// 此前该帧照常执行→工具报 missing required arg→错误结果回喂→provider
+/// 以 invalid params 拒→turn 以 success:false 收口(最终答案其实已产出)。
+/// args 为合法对象(含空对象)照常保留(真实工具意图不在此防御面);
+/// 非 stop 终态(工具轮)不过滤——缺参属真实模型错误,执行报错回喂是
+/// 既有纠错流。返回(过滤后列表,丢弃帧数);全丢时列表归 None。
+pub(crate) fn filter_ghost_tool_calls(
+    finish_reason: Option<&str>,
+    tool_calls: Option<Vec<crate::agent::translator::ToolCall>>,
+) -> (Option<Vec<crate::agent::translator::ToolCall>>, usize) {
+    if !matches!(finish_reason, Some("stop") | Some("end_turn")) {
+        return (tool_calls, 0);
+    }
+    match tool_calls {
+        Some(tcs) => {
+            let before = tcs.len();
+            let kept: Vec<_> = tcs
+                .into_iter()
+                .filter(|tc| tc.arguments.is_object())
+                .collect();
+            let dropped = before - kept.len();
+            let out = if kept.is_empty() { None } else { Some(kept) };
+            (out, dropped)
+        }
+        None => (None, 0),
+    }
+}
+
+/// 上游 invalid params 类拒绝识别(会话收尾降级兜底):错误串含 provider
+/// 无效请求码 `2013`(实测 base_resp)或 `invalid`+`param` 组合即命中。
+/// 仅用于「最终内容已产出」场景的收尾降级(幽灵 tool_call 错误回喂是
+/// 主要成因),不参与其他错误路径判定。
+pub(crate) fn is_invalid_params_rejection(e: &str) -> bool {
+    let l = e.to_lowercase();
+    l.contains("2013") || (l.contains("invalid") && l.contains("param"))
 }
 
 /// 413 类错误 fail-visible 指引(死亡线终局文案;与 UI 面一致的中文口径)
