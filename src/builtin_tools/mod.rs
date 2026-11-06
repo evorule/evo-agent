@@ -543,7 +543,10 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "file_write".to_string(),
             description: "Write content to a file in the writable subdir. \
-                          **ONLY writes to ./workspace/** (configurable). \
+                          **ONLY writes inside the writable root** — `./workspace/` by \
+                          default; the whole sandbox root when a read_write capability \
+                          boundary is declared (the write family file_write/edit_file/\
+                          file_create/file_move/file_delete always shares one root). \
                           Cannot overwrite existing files unless `overwrite=true`. \
                           Cannot create parent dirs unless `create_parents=true`. \
                           Max content size 1MB."
@@ -631,7 +634,10 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "file_create".to_string(),
             description: "Create an empty file or a directory in the writable subdir. \
-                          **ONLY creates inside ./workspace/** (configurable). \
+                          **ONLY creates inside the writable root** — `./workspace/` by \
+                          default; the whole sandbox root when a read_write capability \
+                          boundary is declared (the write family file_write/edit_file/\
+                          file_create/file_move/file_delete always shares one root). \
                           Rejects duplicates, Windows reserved names (CON/NUL/COM1-9/LPT1-9), \
                           illegal filename characters and trailing dot/space. \
                           Parent dirs are only created with `create_parents=true`. \
@@ -662,7 +668,9 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "file_move".to_string(),
             description: "Move or rename a file/directory (rename = same-directory move). \
-                          **ONLY moves entries inside ./workspace/** (configurable). \
+                          **ONLY moves entries inside the writable root** — `./workspace/` \
+                          by default; the whole sandbox root when a read_write capability \
+                          boundary is declared (same root as file_write/file_create). \
                           Source and target dir must exist; duplicate target names are rejected. \
                           Requires user approval: a candidate call returns a needs_approval \
                           proposal and waits for the user's decision."
