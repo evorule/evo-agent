@@ -175,7 +175,9 @@ export function approvalReceiptText(m) {
             ? '已批准(本工作区始终允许)'
             : m?.scope === 'workspace-allowlist'
               ? '已批准(工作区清单)'
-              : '已批准';
+              : m?.scope === 'in-workspace'
+                ? '已批准(工作区内)'
+                : '已批准';
   return `${tool} · ${cmdShow} · ${tail}`;
 }
 

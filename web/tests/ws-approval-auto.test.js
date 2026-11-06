@@ -189,3 +189,34 @@ describe('approver=workspace-allowlist 回执映射(后端 T0 静默批准)', ()
     expect(infos[0].text).toBe('审批结果:已批准(工具 shell_exec)');
   });
 });
+
+describe('approver=in-workspace 回执映射(B-156 判据②后端工作区内写默认 T0)', () => {
+  it('pending 卡收场转「已批准(工作区内)」回执,不留僵尸卡', async () => {
+    // 判据②是后端默认规则,前端记忆/清单镜像均不命中→必先推待批卡
+    MockWebSocket.last.deliver({
+      type: 'ApprovalRequired',
+      tool_name: 'file_create',
+      command: 'src/lib.rs',
+      risk: 'high',
+      proposal_id: 'c2-1',
+    });
+    MockWebSocket.last.deliver({
+      type: 'ApprovalResult',
+      tool_name: 'file_create',
+      approved: true,
+      approver: 'in-workspace',
+      auto_rejected: false,
+      proposal_id: 'c2-1',
+    });
+    await flush();
+    expect(msgOf('approval')).toHaveLength(0); // 卡已收,不留僵尸
+    const receipts = msgOf('approval_receipt');
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0].scope).toBe('in-workspace');
+    expect(receipts[0].decision).toBe('sent');
+    expect(receipts[0].sentApproved).toBe(true);
+    const infos = msgOf('info').filter((m) => String(m.text).startsWith('审批结果'));
+    expect(infos).toHaveLength(1);
+    expect(infos[0].text).toBe('审批结果:已批准(工作区内)(工具 file_create)');
+  });
+});
