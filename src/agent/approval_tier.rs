@@ -298,20 +298,54 @@ fn open_call_is_write(normalized: &str) -> bool {
     false
 }
 
-/// python code 逃逸意图静态检测（纯函数）：文件写面 / 网络外发 / 进程外
-/// 逃逸三类，任一命中即判逃逸（设计 §四：沙箱内=T0 可自动，逃逸意图=T2）。
-/// 输入为原始 code；归一化在函数内完成。空 code 不判逃逸（走无命中必问）。
-pub fn hits_escape_intent(code: &str) -> bool {
+/// 逃逸意图命中原因(原因类别+命中片段):供 python_exec 提案卡 risk 与
+/// 决策端守卫拒绝理由消费,让「为何必问」可读可审(类别=写面/网络外发/
+/// 进程外逃逸,片段=命中的静态标记或 open( 写模式判定描述)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscapeIntentReason {
+    /// 类别:`write`=文件写面 / `network`=网络外发 / `process`=进程外逃逸
+    pub category: &'static str,
+    /// 命中片段(静态标记原文或 open( 写模式判定描述)
+    pub matched: String,
+}
+
+/// python code 逃逸意图原因判定(纯函数):文件写面/网络外发/进程外逃逸
+/// 三类按 写面→网络→进程外 优先序,返回首个命中原因;无命中 None。
+/// 输入为原始 code;归一化在函数内完成。空 code 不判(走无命中必问)。
+/// 子串匹配保守从严语义与原检测一致(注释与字符串字面量命中同判,误报
+/// 方向=必问)。
+pub fn escape_intent_reason(code: &str) -> Option<EscapeIntentReason> {
     let n = normalize(code);
     if n.is_empty() {
-        return false;
+        return None;
     }
     if open_call_is_write(&n) {
-        return true;
+        return Some(EscapeIntentReason {
+            category: "write",
+            matched: "open(..., write-mode)".to_string(),
+        });
     }
-    ESCAPE_WRITE_MARKERS.iter().any(|m| n.contains(m))
-        || ESCAPE_NETWORK_MARKERS.iter().any(|m| n.contains(m))
-        || ESCAPE_PROCESS_MARKERS.iter().any(|m| n.contains(m))
+    const TABLES: [(&str, &[&str]); 3] = [
+        ("write", ESCAPE_WRITE_MARKERS),
+        ("network", ESCAPE_NETWORK_MARKERS),
+        ("process", ESCAPE_PROCESS_MARKERS),
+    ];
+    for (category, markers) in TABLES {
+        if let Some(m) = markers.iter().find(|m| n.contains(*m)) {
+            return Some(EscapeIntentReason {
+                category,
+                matched: (*m).to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// python code 逃逸意图静态检测(布尔门):文件写面/网络外发/进程外逃逸
+/// 三类任一命中即判逃逸(设计 §四:沙箱内=T0 可自动,逃逸意图=T2)。
+/// 判定与 [`escape_intent_reason`] 同源;需要「为何命中」时用原因判定。
+pub fn hits_escape_intent(code: &str) -> bool {
+    escape_intent_reason(code).is_some()
 }
 
 // =============================================================================
@@ -978,6 +1012,38 @@ mod tests {
             "import pandas as pd\nprint(pd.DataFrame())"
         ));
         assert!(!hits_escape_intent(""));
+    }
+
+    // ===== 逃逸意图原因类别（提案卡/守卫拒绝理由可读可审）=====
+
+    #[test]
+    fn test_escape_intent_reason_categories() {
+        // 写面:open( 写模式判定 + 写面标记两路
+        let w = escape_intent_reason("open('out.txt', 'w').write(x)").expect("write hit");
+        assert_eq!(w.category, "write");
+        assert_eq!(w.matched, "open(..., write-mode)");
+        let w2 = escape_intent_reason("Path(x).write_text('y')").expect("write marker hit");
+        assert_eq!(w2.category, "write");
+        assert_eq!(w2.matched, ".write_text(");
+        // 网络:命中片段=具体标记
+        let n = escape_intent_reason("import socket\ns = socket.socket()").expect("network hit");
+        assert_eq!(n.category, "network");
+        assert_eq!(n.matched, "import socket");
+        // 进程外
+        let p = escape_intent_reason("import subprocess").expect("process hit");
+        assert_eq!(p.category, "process");
+        assert_eq!(p.matched, "import subprocess");
+        // 优先序:写面 → 网络 → 进程外
+        let mix = escape_intent_reason("import socket\nopen('a', 'w')").expect("mixed hit");
+        assert_eq!(mix.category, "write");
+        // 无命中/空串
+        assert!(escape_intent_reason("print(1)").is_none());
+        assert!(escape_intent_reason("").is_none());
+        // 布尔门与原因判定同源
+        assert_eq!(
+            hits_escape_intent("import httpx"),
+            escape_intent_reason("import httpx").is_some()
+        );
     }
 
     // ===== python_exec T0 通道（verdict 专用分支）=====
