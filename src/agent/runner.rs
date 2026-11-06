@@ -6186,6 +6186,7 @@ impl AgentRunner {
             // 无 Result,前端/回放帧数对账断裂),且审批留痕/审计挂接一并缺席。
             // 错误以工具结果对象形态回喂(与执行臂 Err 回喂的 tool 消息内容
             // 同构:{"error":..,"tool_name":..}),决策帧照发。
+            let reexec_error = translated.as_ref().err().map(|e| e.to_string());
             let translated: Result<Value, AgentError> = match translated {
                 Ok(v) => Ok(v),
                 Err(e) => {
@@ -6202,19 +6203,19 @@ impl AgentRunner {
                 }
             };
             // B22-C T1:批准重执行的工具完成事件(成败皆记;拒绝不记——
-            // 决定面由 T3 覆盖,与 gated 收口拒绝语义一致)
+            // 决定面由 T3 覆盖,与 gated 收口拒绝语义一致);成败按重执行
+            // 原始结果记账(帧面折算不影响账面真实性)
             if let Some(ledger) = &self.event_ledger {
                 let duration_ms = reexec_started.elapsed().as_millis() as u64;
-                match &translated {
-                    Ok(_) => {
+                match &reexec_error {
+                    None => {
                         ledger
                             .record_tool_completion(tool_name, true, duration_ms, None)
                             .await;
                     }
-                    Err(e) => {
-                        let err = e.to_string();
+                    Some(err) => {
                         ledger
-                            .record_tool_completion(tool_name, false, duration_ms, Some(&err))
+                            .record_tool_completion(tool_name, false, duration_ms, Some(err))
                             .await;
                     }
                 }
