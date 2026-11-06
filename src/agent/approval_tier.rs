@@ -18,7 +18,7 @@
 //! ```json
 //! {
 //!   "version": 1,
-//!   "workspace_root": "D:\\knowledge",
+//!   "workspace_root": "D:\\demo",
 //!   "allow": [
 //!     { "tool": "shell_exec", "prefix": "find ", "tier": "T0" },
 //!     { "tool": "shell_exec", "prefix": "git ", "tier": "T0",
