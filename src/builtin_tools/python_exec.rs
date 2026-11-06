@@ -8,11 +8,22 @@
 //! 任意代码执行（out-of-process、无命令白名单可比 shell_exec）——安全模型上
 //! 属 candidate 全审批：任何调用都经 [`PythonExecTool::evaluate_proposal`]
 //! 出 needs_approval 提案交用户批准后执行，无 active 直跑名单。
+//!
+//! ## P0 沙箱收权（design §四）
+//!
+//! 装配 workdir（toolkit 主装配面注入）后：spawn 锚定 `current_dir(workdir)`
+//! （workspace 沙箱执行，相对路径读写不出界），结果带 `sandbox=workspace-cwd`
+//! 审计标记；提案 risk 文案按逃逸意图静态检测（共用判定面
+//! `crate::agent::approval_tier::hits_escape_intent`，与决策端同源）实际
+//! 分级——沙箱内纯计算=T0 eligible（决策端 allowlist 命中即静默批准），
+//! 逃逸意图=恒必问。未装配 workdir（G1 profile 重建先例）保持宿主 cwd
+//! 历史行为（缺省不变式）。
 
 use crate::io_handler::IoResult;
 use crate::io_handlers::tool_handler::ToolFunction;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 /// 审批卡代码摘要上限(bytes,防巨型 code 撑爆审批卡)
 const PROPOSAL_SUMMARY_BYTES: usize = 200;
@@ -49,9 +60,16 @@ fn python_exe_with(env_override: Option<&str>) -> String {
 /// 全审批历史行为;[`ExecutionProfile::SandboxTrusted`](一次性隔离环境)下
 /// python 是任务本体——不再出提案直接执行,执行仍全量落 tool_trace/journal
 /// (审计同权),结果带 execution_profile 标记。
+///
+/// P0 沙箱收权(design §四):装配 workdir 后 spawn 锚定 `current_dir(workdir)`
+/// (workspace 沙箱执行,相对路径读写不出界);提案 risk 文案按逃逸意图静态
+/// 检测结论实际分级——沙箱内纯计算=T0 eligible(allowlist 可自动批准),
+/// 检测到逃逸意图(写面/网络/进程外)=恒必问。
 pub struct PythonExecTool {
     /// 执行环境 profile(G1;缺省 Workbench = 历史行为)
     profile: crate::builtin_tools::shell_exec::ExecutionProfile,
+    /// workspace 沙箱根(P0 收权;None = 未装配,继承宿主 cwd 历史行为)
+    workdir: Option<PathBuf>,
 }
 
 impl Default for PythonExecTool {
@@ -65,6 +83,7 @@ impl PythonExecTool {
     pub fn new() -> Self {
         Self {
             profile: crate::builtin_tools::shell_exec::ExecutionProfile::Workbench,
+            workdir: None,
         }
     }
 
@@ -74,6 +93,12 @@ impl PythonExecTool {
         profile: crate::builtin_tools::shell_exec::ExecutionProfile,
     ) -> Self {
         self.profile = profile;
+        self
+    }
+
+    /// 装配 workspace 沙箱根(P0 收权:spawn cwd 锚定,相对路径读写不出界)
+    pub fn with_workdir(mut self, dir: &Path) -> Self {
+        self.workdir = Some(dir.to_path_buf());
         self
     }
 }
@@ -88,12 +113,18 @@ impl ToolFunction for PythonExecTool {
         if code.len() > 64 * 1024 {
             return Err("code 超过 64KB 限制".to_string());
         }
-        let out = tokio::process::Command::new(python_exe())
-            .arg("-c")
-            .arg(code)
-            .output()
-            .await
-            .map_err(|e| format!("spawn python 失败: {e}"))?;
+        let out = {
+            let mut cmd = tokio::process::Command::new(python_exe());
+            cmd.arg("-c").arg(code);
+            // P0 沙箱收权:装配 workdir 即锚定 workspace 沙箱执行(相对路径
+            // 读写不出界);未装配时继承宿主 cwd(缺省不变式)
+            if let Some(dir) = &self.workdir {
+                cmd.current_dir(dir);
+            }
+            cmd.output()
+                .await
+                .map_err(|e| format!("spawn python 失败: {e}"))?
+        };
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         let ok = out.status.success();
@@ -107,12 +138,20 @@ impl ToolFunction for PythonExecTool {
         if self.profile == crate::builtin_tools::shell_exec::ExecutionProfile::SandboxTrusted {
             result["execution_profile"] = json!(self.profile.as_str());
         }
+        // P0 沙箱收权:装配 workdir 的执行带 sandbox 标记(审计可解释性)
+        if self.workdir.is_some() {
+            result["sandbox"] = json!("workspace-cwd");
+        }
         Ok(result)
     }
 
     /// 管道⑤评估钩子:任意代码执行无安全子集可言(shell_exec 尚有白名单),
     /// Workbench 档任何调用都出提案——code 缺参时返回 None 由执行体如实报错;
     /// G1:sandbox-trusted 档不出提案(隔离环境内 python 是任务本体,直跑落账)
+    ///
+    /// P0 沙箱收权:risk 文案按逃逸意图静态检测结论实际分级(设计 §四
+    /// 可解释性=信任面)——沙箱内纯计算=T0 eligible(allowlist 可自动批准),
+    /// 逃逸意图(写面/网络/进程外)=恒必问。
     fn evaluate_proposal(&self, args: &Value) -> Option<Value> {
         let code = args.get("code").and_then(|v| v.as_str())?;
         if self.profile == crate::builtin_tools::shell_exec::ExecutionProfile::SandboxTrusted {
@@ -127,14 +166,34 @@ impl ToolFunction for PythonExecTool {
         } else {
             code.to_string()
         };
+        let sandboxed = self.workdir.is_some();
+        let escape = crate::agent::approval_tier::hits_escape_intent(code);
+        let (risk, alternative) = match (sandboxed, escape) {
+            (true, false) => (
+                "workspace sandboxed execution (cwd anchored to the workspace); pure compute, \
+                 no network/process/file-write escape intent detected — workspace allowlist may \
+                 auto-approve",
+                "write results to workspace files via file_write, or run shell commands via \
+                 shell_exec with an allowlisted command",
+            ),
+            (_, true) => (
+                "escape intent detected in code (file write / network access / spawning host \
+                 processes) — always requires manual approval",
+                "keep the code to pure computation within the workspace sandbox, or request \
+                 explicit permission for the escape operation",
+            ),
+            (false, false) => (
+                "arbitrary code execution on the host (runs outside the workspace sandbox, no \
+                 command allowlist)",
+                "run the code yourself, or use shell_exec with an allowlisted command",
+            ),
+        };
         Some(json!({
             "status": "needs_approval",
             "category": "candidate",
             "description": format!("execute Python code: {summary}"),
-            "risk": "arbitrary code execution on the host (runs outside the \
-                     workspace sandbox, no command allowlist)",
-            "alternative": "run the code yourself, or use shell_exec with an \
-                            allowlisted command",
+            "risk": risk,
+            "alternative": alternative,
         }))
     }
 }
@@ -188,5 +247,87 @@ mod tests {
         // 无 env:硬编码存在→硬编码;不存在→PATH python(两分支都合法)
         let fallback = python_exe_with(None);
         assert!(fallback == LEGACY_PYTHON_PATH || fallback == "python");
+    }
+
+    // ===== P0 沙箱收权 =====
+
+    /// 提案 risk 文案实际分级:沙箱内纯计算=T0 eligible 文案
+    #[test]
+    fn test_proposal_sandbox_clean_risk_grading() {
+        let dir = std::env::temp_dir().join(format!("evo-py-sbx-a-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = PythonExecTool::new().with_workdir(&dir);
+        let p = tool
+            .evaluate_proposal(&json!({"code": "print(sum(range(10)))"}))
+            .expect("workbench must propose");
+        let risk = p.get("risk").and_then(|v| v.as_str()).unwrap();
+        assert!(risk.contains("sandboxed execution"), "risk: {risk}");
+        assert!(risk.contains("allowlist may auto-approve"), "risk: {risk}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 提案 risk 文案实际分级:逃逸意图(网络/写面/进程)=恒必问文案
+    #[test]
+    fn test_proposal_escape_risk_grading() {
+        let dir = std::env::temp_dir().join(format!("evo-py-sbx-b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = PythonExecTool::new().with_workdir(&dir);
+        for code in [
+            "import requests\nprint(requests.get(u))",
+            "open('x.txt', 'w').write(d)",
+            "import subprocess\nsubprocess.run(x)",
+        ] {
+            let p = tool
+                .evaluate_proposal(&json!({ "code": code }))
+                .expect("workbench must propose");
+            let risk = p.get("risk").and_then(|v| v.as_str()).unwrap();
+            assert!(risk.contains("escape intent detected"), "risk: {risk}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未装配 workdir:提案维持宿主执行历史文案(缺省不变式)
+    #[test]
+    fn test_proposal_unsandboxed_risk_unchanged() {
+        let tool = PythonExecTool::new();
+        let p = tool
+            .evaluate_proposal(&json!({"code": "print(1)"}))
+            .expect("workbench must propose");
+        let risk = p.get("risk").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            risk.contains("runs outside the workspace sandbox"),
+            "risk: {risk}"
+        );
+    }
+
+    /// spawn cwd 锚定:相对路径写落 workdir(沙箱执行实证)
+    #[tokio::test]
+    async fn test_call_anchors_workdir() {
+        let dir = std::env::temp_dir().join(format!("evo-py-sbx-c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = PythonExecTool::new().with_workdir(&dir);
+        let out = tool
+            .call(&json!({"code": "import os; print(os.getcwd())"}))
+            .await
+            .expect("call ok");
+        let stdout = out.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            stdout.contains(dir.file_name().unwrap().to_string_lossy().as_ref())
+                || stdout
+                    .to_lowercase()
+                    .contains(&dir.to_string_lossy().to_lowercase()),
+            "cwd must anchor to workdir, got: {stdout}"
+        );
+        // 相对路径写落 workdir(不出界)
+        let out = tool
+            .call(&json!({"code": "open('sbx_probe.txt', 'w').write('ok')"}))
+            .await
+            .expect("call ok");
+        assert!(out.get("ok").and_then(|v| v.as_bool()).unwrap_or(false));
+        assert!(
+            dir.join("sbx_probe.txt").is_file(),
+            "write must land in workdir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

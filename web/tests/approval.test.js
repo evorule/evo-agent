@@ -213,7 +213,30 @@ describe('approvalPresetWrites(批B 四档预设写入序列)', () => {
   });
 
   it('未知预设 → 空序列(零写入)', () => {
-    expect(approvalPresetWrites('yolo')).toEqual([]);
+    expect(approvalPresetWrites('nonexistent-preset')).toEqual([]);
+  });
+});
+
+describe('approvalPresetWrites(批③ 三档 permission mode)', () => {
+  it('plan → mode=plan+豁免复位 false(只读陪跑,全部写操作必问)', () => {
+    expect(approvalPresetWrites('plan')).toEqual([
+      ['approval.mode.shellExec', 'plan'],
+      ['approval.exemptionOverride', false],
+    ]);
+  });
+
+  it('workspace → mode=workspace+豁免复位 false(工作区内自动,缺省档)', () => {
+    expect(approvalPresetWrites('workspace')).toEqual([
+      ['approval.mode.shellExec', 'workspace'],
+      ['approval.exemptionOverride', false],
+    ]);
+  });
+
+  it('yolo → mode=yolo+豁免复位 false(全自动+审计;红线豁免不随档位静默开启)', () => {
+    expect(approvalPresetWrites('yolo')).toEqual([
+      ['approval.mode.shellExec', 'yolo'],
+      ['approval.exemptionOverride', false],
+    ]);
   });
 });
 
@@ -251,8 +274,39 @@ describe('approvalPresetView(批B 两键实况反查展示)', () => {
     expect(approvalPresetView('policy', true).preset).toBe('custom');
   });
 
-  it('未设/未知 mode → serve 缺省 manual 展示(preset=null)', () => {
-    expect(approvalPresetView(undefined, false)).toEqual({ preset: null, label: '手动审批', exempt: false });
-    expect(approvalPresetView('yolo', false).preset).toBeNull();
+  it('未设/未知 mode → serve 缺省 workspace 语义展示(批③缺省档)', () => {
+    expect(approvalPresetView(undefined, false)).toEqual({
+      preset: 'workspace',
+      label: '工作区内自动',
+      exempt: false,
+    });
+    expect(approvalPresetView('unknown-mode', false).preset).toBe('workspace');
+  });
+});
+
+describe('approvalPresetView(批③ 三档 permission mode 展示)', () => {
+  it('plan → 只读陪跑', () => {
+    expect(approvalPresetView('plan', false)).toEqual({
+      preset: 'plan',
+      label: '只读陪跑',
+      exempt: false,
+    });
+  });
+
+  it('workspace → 工作区内自动(缺省档;豁免带角标)', () => {
+    expect(approvalPresetView('workspace', false)).toEqual({
+      preset: 'workspace',
+      label: '工作区内自动',
+      exempt: false,
+    });
+    expect(approvalPresetView('workspace', true).label).toBe('工作区内自动(红线豁免)');
+  });
+
+  it('yolo → 全自动+审计', () => {
+    expect(approvalPresetView('yolo', false)).toEqual({
+      preset: 'yolo',
+      label: '全自动+审计',
+      exempt: false,
+    });
   });
 });

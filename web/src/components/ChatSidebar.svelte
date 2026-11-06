@@ -315,11 +315,12 @@
   let approvalErr = $state('');
   let approvalBusy = $state(false);
 
+  // 三档 permission mode(design-78 §3.4;旧四档 manual/auto/full/custom
+  // 仍兼容解析——approvalPresetView 旧值回显,但菜单主映射收敛三档)
   const APPROVAL_PRESETS = [
-    { id: 'manual', label: '手动审批', desc: '每次人工确认;红线强制' },
-    { id: 'auto', label: '自动审批', desc: '无人值守判定放行+留痕;红线仍强制人工' },
-    { id: 'full', label: '完全访问', desc: '红线类操作交评审判定(需确认)' },
-    { id: 'custom', label: '自定义配置', desc: '对照条件文件评审判定' },
+    { id: 'plan', label: '只读陪跑', desc: '全部写操作必问;规划与审阅' },
+    { id: 'workspace', label: '工作区内自动', desc: '低风险静默+逃逸必问;缺省档' },
+    { id: 'yolo', label: '全自动+审计', desc: '全部静默执行+事后审计留痕' },
   ];
 
   let approvalView = $derived(
@@ -1108,7 +1109,10 @@
     });
     if (approved && scope === 'session') recordSessionAllow(m.toolName, m.command);
     if (approved && scope === 'workspace') {
-      addWorkspaceAllow(m.toolName, m.command).catch((err) => {
+      // python_exec 提案无 command 字段——放行条目以工具名自匹配
+      // (后端判定基底 "python_exec <code>" 头部 token;沙箱内纯计算才可
+      // 自动批准,逃逸意图恒必问由决策端守卫承担)
+      addWorkspaceAllow(m.toolName, m.command || m.toolName).catch((err) => {
         pushPanelEvent('gov', {
           label: 'ApprovalAllowlist',
           detail: `工作区放行清单写入失败:${String(err?.message || err)}`,

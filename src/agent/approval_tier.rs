@@ -42,6 +42,15 @@
 //!    会话记忆承担，后端不重复做双决策；
 //! 4. 无命中 → 必问（现状行为）。
 //!
+//! ### python_exec 专用通道（P0 沙箱收权，设计 §四）
+//!
+//! `python_exec` 提案无 command 字段（code 摘要在 description），判定基底由
+//! 装饰器组装为 `python_exec <code>`：deny 通配可匹配代码内容；shell 守卫表
+//! 不适用（`del`/`rm` 等 shell 语义对 python code 误报），由逃逸意图静态
+//! 检测（[`hits_escape_intent`]：文件写面/网络外发/进程外逃逸）承担同类
+//! 职责——逃逸意图=恒必问，沙箱内（cwd 锚定 workdir 执行）纯计算+allowlist
+//! 条目命中=T0 可自动（条目 prefix="python_exec" 即命中头部 token）。
+//!
 //! ## 归一化（设计 §3.5 prefix 归一化）
 //!
 //! 命令与前缀两侧同规则：去首尾空白 + 内部空白折叠 + 统一小写 +
@@ -200,6 +209,111 @@ pub fn hits_auto_deny_guard(command: &str) -> bool {
 }
 
 // =============================================================================
+// python_exec 逃逸意图静态检测（P0 沙箱收权，设计 §四）
+// =============================================================================
+
+/// 文件写面意图子串（归一化后小写匹配；读不拦——沙箱承诺覆盖写面+网络，
+/// 读出界与 shell_exec allowlist 现状同口径）。
+const ESCAPE_WRITE_MARKERS: &[&str] = &[
+    ".write_text(",
+    ".write_bytes(",
+    ".write(",
+    "writelines(",
+    "shutil.",
+    "os.remove",
+    "os.unlink",
+    "os.rename",
+    "os.replace",
+    "os.mkdir",
+    "os.makedirs",
+    "os.rmdir",
+    "os.truncate",
+    "path.write", // pathlib Path.write_* 兜底
+];
+
+/// 网络外发意图子串（import/调用双覆盖；子串匹配保守从严——注释与字符串
+/// 字面量命中同判，误报方向=必问）。
+const ESCAPE_NETWORK_MARKERS: &[&str] = &[
+    "import socket",
+    "from socket",
+    "socket.",
+    "import requests",
+    "from requests",
+    "import urllib",
+    "from urllib",
+    "urllib.",
+    "urlopen",
+    "http.client",
+    "import ftplib",
+    "import smtplib",
+    "import telnetlib",
+    "import aiohttp",
+    "import httpx",
+    "requests.get",
+    "requests.post",
+    "requests.put",
+    "requests.delete",
+];
+
+/// 进程外逃逸意图子串（拉起宿主任意进程=逃出 python 沙箱控制面）。
+const ESCAPE_PROCESS_MARKERS: &[&str] = &[
+    "import subprocess",
+    "from subprocess",
+    "subprocess.",
+    "os.system",
+    "os.popen",
+    "os.exec",
+    "os.spawn",
+    "pty.spawn",
+    "commands.getoutput",
+];
+
+/// `open(` 写模式判定：窗口内显式读模式（无逗号=单参默认读 / `,` 后随
+/// "r"/"rb"/"rt" 字面量）放行；显式写模式（w/a/x/+）或变量模式（无法静态
+/// 判定）一律按写意图命中（保守从严，误报方向=必问）。
+fn open_call_is_write(normalized: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(pos) = normalized[search_from..].find("open(") {
+        let start = search_from + pos;
+        // 窗口：open( 后 80 字符内找首个闭括号（嵌套按窗口截断，保守覆盖）
+        let window_end = (start + 5 + 80).min(normalized.len());
+        let window = &normalized[start + 5..window_end];
+        let close = window.find(')').unwrap_or(window.len());
+        let args = &window[..close];
+        if !args.contains(',') {
+            // 单参数 = 默认读模式
+            search_from = start + 5;
+            continue;
+        }
+        let read_mode = ["\"r\"", "'r'", "\"rb\"", "'rb'", "\"rt\"", "'rt'"]
+            .iter()
+            .any(|m| args.contains(m));
+        if read_mode {
+            search_from = start + 5;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// python code 逃逸意图静态检测（纯函数）：文件写面 / 网络外发 / 进程外
+/// 逃逸三类，任一命中即判逃逸（设计 §四：沙箱内=T0 可自动，逃逸意图=T2）。
+/// 输入为原始 code；归一化在函数内完成。空 code 不判逃逸（走无命中必问）。
+pub fn hits_escape_intent(code: &str) -> bool {
+    let n = normalize(code);
+    if n.is_empty() {
+        return false;
+    }
+    if open_call_is_write(&n) {
+        return true;
+    }
+    ESCAPE_WRITE_MARKERS.iter().any(|m| n.contains(m))
+        || ESCAPE_NETWORK_MARKERS.iter().any(|m| n.contains(m))
+        || ESCAPE_PROCESS_MARKERS.iter().any(|m| n.contains(m))
+}
+
+// =============================================================================
 // allowlist 配置面（per-workspace，schema 兼容前端写入形态）
 // =============================================================================
 
@@ -315,6 +429,12 @@ pub enum AskReason {
 }
 
 /// 分级判定（纯函数，按模块头判定序）
+///
+/// `python_exec` 走专用通道（P0 沙箱收权，设计 §四）：判定基底由调用方
+/// 组装为 `python_exec <code>`（自匹配 token+代码原文）——deny 通配可匹配
+/// 代码内容；shell 危险子命令守卫表不适用（`del`/`rm` 等 shell 语义对
+/// python code 误报），由 [`hits_escape_intent`] 承担同类职责：逃逸意图
+/// （写面/网络/进程外）=恒必问，沙箱内纯计算+allowlist 条目命中=T0 可自动。
 pub fn verdict(tool: &str, command: &str, allowlist: &AllowlistFile) -> TierVerdict {
     // 1. deny 恒压过 allow
     for d in &allowlist.deny {
@@ -325,6 +445,33 @@ pub fn verdict(tool: &str, command: &str, allowlist: &AllowlistFile) -> TierVerd
                 },
             };
         }
+    }
+    if tool == "python_exec" {
+        // 2'. 逃逸意图静态检测（代码级，配置不可放宽）
+        if hits_escape_intent(command) {
+            return TierVerdict::Ask {
+                reason: AskReason::Guard,
+            };
+        }
+        // 3'. allow 条目（tool 相等 + 词元边界前缀匹配；前端「本工作区始终
+        // 允许」写入形态 prefix="python_exec" 即命中代码基底头部 token）
+        for e in &allowlist.allow {
+            if e.tool == tool && prefix_matches(command, &e.prefix) {
+                return match e.tier.as_deref() {
+                    None | Some("T0") | Some("t0") => TierVerdict::Auto {
+                        tier: "T0",
+                        matched: e.prefix.clone(),
+                    },
+                    Some(other) => TierVerdict::Ask {
+                        reason: AskReason::Tier(other.to_string()),
+                    },
+                };
+            }
+        }
+        // 4'. 无命中
+        return TierVerdict::Ask {
+            reason: AskReason::NoMatch,
+        };
     }
     // 2. 危险子命令硬守卫（代码级，配置不可放宽）
     if hits_auto_deny_guard(command) {
@@ -414,7 +561,21 @@ impl ApprovalCallback for TieredApproval {
                 return self.inner.request_approval(req).await;
             }
         };
-        match verdict(&req.tool_name, &req.command, &allowlist) {
+        // python_exec 判定基底组装（P0 沙箱收权）：自匹配 token+code 原文——
+        // deny 通配可匹配代码内容；前端放行条目 prefix="python_exec" 命中头部
+        // token。code 缺失/为空时不组 token（空基底不命中条目→必问，防空执行
+        // 静默批）。其余工具用提案 command 原样。
+        let base_command = if req.tool_name == "python_exec" {
+            let code = req.args.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            if code.is_empty() {
+                String::new()
+            } else {
+                format!("python_exec {code}")
+            }
+        } else {
+            req.command.clone()
+        };
+        match verdict(&req.tool_name, &base_command, &allowlist) {
             TierVerdict::Auto { tier, matched } => {
                 let reason = format!(
                     "allowlist {} match: tool={} prefix={:?} (workspace approval allowlist)",
@@ -614,18 +775,148 @@ mod tests {
 
     #[test]
     fn test_verdict_empty_command_never_auto() {
-        // 无 command 字段的提案(如 python_exec/http_get)永不匹配 → 空命令按
+        // 无 command 字段的提案(如 http_get/file_* 类)永不匹配 → 空命令按
         // 守卫处理(必问,不自动批)
         let al = allowlist(
-            json!([{ "tool": "python_exec", "prefix": "python scripts/" }]),
+            json!([{ "tool": "http_get", "prefix": "python scripts/" }]),
+            json!([]),
+        );
+        assert_eq!(
+            verdict("http_get", "", &al),
+            TierVerdict::Ask {
+                reason: AskReason::Guard
+            }
+        );
+    }
+
+    // ===== python_exec 逃逸意图静态检测（P0 沙箱收权）=====
+
+    #[test]
+    fn test_escape_intent_network() {
+        assert!(hits_escape_intent("import requests\nprint(1)"));
+        assert!(hits_escape_intent("import socket\ns = socket.socket()"));
+        assert!(hits_escape_intent("from urllib.request import urlopen"));
+        assert!(hits_escape_intent("import httpx"));
+        assert!(hits_escape_intent("data = urllib.parse.quote(x)"));
+    }
+
+    #[test]
+    fn test_escape_intent_process() {
+        assert!(hits_escape_intent(
+            "import subprocess\nsubprocess.run(['ls'])"
+        ));
+        assert!(hits_escape_intent("os.system('dir')"));
+        assert!(hits_escape_intent("import subprocess"));
+    }
+
+    #[test]
+    fn test_escape_intent_write() {
+        assert!(hits_escape_intent("open('out.txt', 'w').write(x)"));
+        assert!(hits_escape_intent("open(p, mode)")); // 变量模式=无法判定,保守命中
+        assert!(hits_escape_intent("Path(x).write_text('y')"));
+        assert!(hits_escape_intent("import shutil\nshutil.rmtree(d)"));
+        assert!(hits_escape_intent("os.remove(f)"));
+    }
+
+    #[test]
+    fn test_escape_intent_read_and_compute_pass() {
+        // 读模式与纯计算不判逃逸（沙箱内=T0 eligible）
+        assert!(!hits_escape_intent("data = open('in.csv').read()"));
+        assert!(!hits_escape_intent("f = open('a.txt', 'r')"));
+        assert!(!hits_escape_intent(
+            "import json\nprint(json.dumps({'a': 1}))"
+        ));
+        assert!(!hits_escape_intent("import math\nprint(math.sqrt(2))"));
+        assert!(!hits_escape_intent(
+            "import pandas as pd\nprint(pd.DataFrame())"
+        ));
+        assert!(!hits_escape_intent(""));
+    }
+
+    // ===== python_exec T0 通道（verdict 专用分支）=====
+
+    /// 基底组装:python_exec 判定基底="python_exec "+code(装饰器组装,测试同款)
+    fn py_base(code: &str) -> String {
+        format!("python_exec {code}")
+    }
+
+    #[test]
+    fn test_verdict_python_exec_sandbox_clean_auto() {
+        let al = allowlist(
+            json!([{ "tool": "python_exec", "prefix": "python_exec" }]),
+            json!([]),
+        );
+        // 纯计算+条目命中 → T0 静默批准
+        assert!(matches!(
+            verdict("python_exec", &py_base("print(sum(range(10)))"), &al),
+            TierVerdict::Auto { .. }
+        ));
+    }
+
+    #[test]
+    fn test_verdict_python_exec_escape_always_ask() {
+        let al = allowlist(
+            json!([{ "tool": "python_exec", "prefix": "python_exec" }]),
+            json!([]),
+        );
+        // 逃逸意图(网络/进程/写面)恒必问——守卫压过 allow 配置
+        for code in [
+            "import requests\nr = requests.get(u)",
+            "import subprocess\nsubprocess.run(x)",
+            "open('x.txt', 'w').write(d)",
+        ] {
+            assert_eq!(
+                verdict("python_exec", &py_base(code), &al),
+                TierVerdict::Ask {
+                    reason: AskReason::Guard
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_verdict_python_exec_no_entry_ask() {
+        let al = allowlist(
+            json!([{ "tool": "shell_exec", "prefix": "find " }]),
+            json!([]),
+        );
+        // 沙箱内但无条目 → 必问(不自动批)
+        assert_eq!(
+            verdict("python_exec", &py_base("print(1)"), &al),
+            TierVerdict::Ask {
+                reason: AskReason::NoMatch
+            }
+        );
+    }
+
+    #[test]
+    fn test_verdict_python_exec_empty_code_ask() {
+        // 空 code(无 code 字段)不判逃逸,装饰器空基底不命中条目 → 必问(防空执行静默批)
+        let al = allowlist(
+            json!([{ "tool": "python_exec", "prefix": "python_exec" }]),
             json!([]),
         );
         assert_eq!(
             verdict("python_exec", "", &al),
             TierVerdict::Ask {
-                reason: AskReason::Guard
+                reason: AskReason::NoMatch
             }
         );
+    }
+
+    #[test]
+    fn test_verdict_python_exec_deny_on_code_content() {
+        let al = allowlist(
+            json!([{ "tool": "python_exec", "prefix": "python_exec" }]),
+            json!([{ "tool": "*", "pattern": "*evorule-seed*" }]),
+        );
+        // deny 恒压:代码内容命中 deny 模式 → 必问
+        assert!(matches!(
+            verdict("python_exec", &py_base("print('evorule-seed')"), &al),
+            TierVerdict::Ask {
+                reason: AskReason::Deny { .. }
+            }
+        ));
     }
 
     // ===== schema 兼容(前端写入形态) =====
@@ -759,6 +1050,59 @@ mod tests {
         let d = dec.request_approval(&req("shell_exec", "cargo test")).await;
         assert!(d.approved);
         assert_eq!(d.approver, "auto");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== python_exec 装饰器通道（P0 沙箱收权）=====
+
+    fn py_req(code: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            session_id: "s1".to_string(),
+            tool_name: "python_exec".to_string(),
+            args: json!({"code": code}),
+            command: String::new(), // python_exec 提案无 command 字段
+            risk: "high".to_string(),
+            alternative: String::new(),
+            proposal_id: "ap-py-1".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decorator_python_exec_sandbox_clean_auto() {
+        let dir = std::env::temp_dir().join(format!("evo-al-dec-py-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".evo")).unwrap();
+        std::fs::write(
+            dir.join(".evo").join("approval-allowlist.json"),
+            r#"{"version":1,"allow":[{"tool":"python_exec","prefix":"python_exec"}]}"#,
+        )
+        .unwrap();
+        // 沙箱内纯计算+条目命中 → 静默批准(inner=DenyAll 证明未走人工窗)
+        let dec = TieredApproval::new(Arc::new(DenyAll), &dir);
+        let d = dec.request_approval(&py_req("print(sum(range(10)))")).await;
+        assert!(d.approved);
+        assert_eq!(d.approver, "workspace-allowlist");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_decorator_python_exec_escape_forces_manual() {
+        let dir = std::env::temp_dir().join(format!("evo-al-dec-pye-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".evo")).unwrap();
+        std::fs::write(
+            dir.join(".evo").join("approval-allowlist.json"),
+            r#"{"version":1,"allow":[{"tool":"python_exec","prefix":"python_exec"}]}"#,
+        )
+        .unwrap();
+        // 逃逸意图(网络/写面)→ 透传人工窗(DenyAll 拒)
+        let dec = TieredApproval::new(Arc::new(DenyAll), &dir);
+        let d = dec
+            .request_approval(&py_req("import requests\nprint(requests.get(u))"))
+            .await;
+        assert!(!d.approved);
+        let d = dec
+            .request_approval(&py_req("open('x','w').write(d)"))
+            .await;
+        assert!(!d.approved);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

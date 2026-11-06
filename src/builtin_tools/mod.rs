@@ -290,7 +290,8 @@ fn default_safe_toolkit_core(
     // ——宿主回落保持调用方分类基线,低盒路径边界语义自带;超时对齐 600s)/
     // tier-3 裸跑(缺省 = 现行为)。python_exec 不随动:无容器/低盒后端,仍在
     // 宿主执行,分类基线维持调用方 profile(隔离边界只覆盖 shell_exec 执行体,
-    // 不放宽)
+    // 不放宽)——P0 沙箱收权后 python_exec 装配 workdir 做 cwd 锚定(workspace
+    // 沙箱执行),OS 级隔离边界仍只覆盖 shell_exec
     let mut shell_tool = shell_exec::ShellExecTool::new()
         .with_workdir(&workdir_buf)
         .with_execution_profile(profile);
@@ -324,7 +325,13 @@ fn default_safe_toolkit_core(
     );
     handler.register_static(
         "python_exec",
-        Arc::new(python_exec::PythonExecTool::new().with_execution_profile(profile)),
+        // P0 沙箱收权:python_exec 装配 workdir(spawn cwd 锚定 workspace
+        // 沙箱执行+提案 risk 文案实际分级;决策端 T0 通道见 approval_tier)
+        Arc::new(
+            python_exec::PythonExecTool::new()
+                .with_execution_profile(profile)
+                .with_workdir(&workdir_buf),
+        ),
     );
     handler.register_static(
         "git_status",

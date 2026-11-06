@@ -719,7 +719,13 @@ pub(crate) fn approval_exemption_override(state: &AgentApiState) -> bool {
 /// 审批档位解析单源:定义级 `approval_mode` 优先;未指定时回落设置键
 /// `approval.mode.shellExec`(每工具组档位=设置键的接线——shell_exec 为
 /// candidate 主面,其设置档位充作会话缺省档位);两级均未指定 → None
-/// (manual 缺省)。未知设置值不计(回落 None,门禁语义保守)
+/// (manual 缺省)。未知设置值不计(回落 None,门禁语义保守)。
+///
+/// 分级设计 §3.4 三档 permission mode(批③):`plan`(只读陪跑,全部写操作
+/// 必问)/ `workspace`(工作区内自动,缺省语义——TieredApproval allowlist
+/// T0 静默+其余必问;与 manual 同装配,allowlist 缺失时旁路=manual 原行为)
+/// / `yolo`(全自动+审计,判定式静默+留痕)。旧值 manual/policy/auto_policy
+/// 兼容不动;设置值未设时装配面即为 workspace 语义(缺省档落地,行为零漂移)。
 pub(crate) fn resolve_approval_mode(
     state: &AgentApiState,
     def_mode: Option<&str>,
@@ -734,7 +740,7 @@ pub(crate) fn resolve_approval_mode(
         .unwrap_or("")
         .trim();
     match v {
-        "manual" | "auto_policy" | "policy" => Some(v.to_string()),
+        "manual" | "auto_policy" | "policy" | "plan" | "workspace" | "yolo" => Some(v.to_string()),
         _ => None,
     }
 }
@@ -747,8 +753,19 @@ pub(crate) fn build_approval_callback(
     Option<crate::agent::runner::RunawayPolicy>,
 ) {
     use crate::agent::approval_policy::{ApprovalPolicyFile, AuditedReviewInvoker, PolicyReview};
-    if mode == Some("auto_policy") {
-        // 红线豁免前置闸:豁免清单适用于所有档位——命中且未显式关闭时
+    if mode == Some("plan") {
+        // 只读陪跑档(设计 §3.4):全部写操作必问——人工窗直连(无 Tiered
+        // 分级,allowlist 不参与自动批准),治理留痕照产(决策可回放)。
+        return (
+            Arc::new(crate::governance::GovAuditedApproval::new(Arc::new(
+                crate::agent::approval::HttpApproval::new(state.pending_approvals().clone()),
+            ))),
+            None,
+        );
+    }
+    if mode == Some("auto_policy") || mode == Some("yolo") {
+        // 全自动+审计档(§3.4 yolo = auto_policy 判定式语义别名):红线豁免
+        // 前置闸:豁免清单适用于所有档位——命中且未显式关闭时
         // 回落人工审批卡(无人值守场景 60s 窗超时自动拒,保守安全)
         let override_flag = approval_exemption_override(state);
         let guarded = crate::agent::approval::RedLineGuardApproval::new(
@@ -796,6 +813,7 @@ pub(crate) fn build_approval_callback(
     }
     // B22:manual 档审批卡接治理留痕装饰器(approval_requested/resolved 入
     // gov 账本;auto_policy 判定式无人工卡不接——高频排除)。
+    // 分级设计 §3.4:workspace(工作区内自动,缺省语义)与 manual 同装配。
     // 分级判定面:TieredApproval 装饰在治理留痕内层、人工窗外层——
     // 工作区 allowlist(.evo/approval-allowlist.json)T0 命中静默批准
     // (留痕照产),deny/危险守卫/无命中透传人工窗(现状行为零变化);
@@ -1428,10 +1446,23 @@ mod tests {
             resolve_approval_mode(&state, None),
             Some("manual".to_string())
         );
-        // 用户手写未知值:不计,回落 None(manual 缺省,门禁保守)
+        // 三档值透传(plan/workspace/yolo)
         let settings_path = dir.path().join("data").join("workbench_settings.json");
         std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
-        std::fs::write(&settings_path, r#"{"approval.mode.shellExec": "yolo"}"#).unwrap();
+        for v in ["plan", "workspace", "yolo"] {
+            std::fs::write(
+                &settings_path,
+                format!(r#"{{"approval.mode.shellExec": "{v}"}}"#),
+            )
+            .unwrap();
+            assert_eq!(resolve_approval_mode(&state, None), Some(v.to_string()));
+        }
+        // 用户手写未知值:不计,回落 None(manual 缺省,门禁保守)
+        std::fs::write(
+            &settings_path,
+            r#"{"approval.mode.shellExec": "bogus-mode"}"#,
+        )
+        .unwrap();
         assert_eq!(resolve_approval_mode(&state, None), None);
     }
 
