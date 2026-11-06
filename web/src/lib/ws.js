@@ -757,7 +757,9 @@ function handleFrame(f) {
       // 批② T0:后端 allowlist 静默批准(approver=workspace-allowlist)——
       // 前端会话记忆/清单镜像未命中(未加载/加载失败)时会已推待批卡,
       // 此处按工具名收卡转「已批准(工作区清单)」回执,不留可点击僵尸卡
-      if (f.approved && f.approver === 'workspace-allowlist') {
+      // B-156 判据②:后端工作区内写默认 T0(approver=in-workspace)——
+      // 同理收卡转「已批准(工作区内)」回执
+      if (f.approved && (f.approver === 'workspace-allowlist' || f.approver === 'in-workspace')) {
         const list = get(messages);
         for (let i = list.length - 1; i >= 0; i--) {
           const m = list[i];
@@ -766,7 +768,7 @@ function handleFrame(f) {
               kind: 'approval_receipt',
               decision: 'sent',
               sentApproved: true,
-              scope: 'workspace-allowlist',
+              scope: f.approver,
             });
             break;
           }
@@ -781,7 +783,13 @@ function handleFrame(f) {
       if (f.proposal_id) autoApprovedProposals.delete(f.proposal_id);
       if (!isAuto) {
         const outcome =
-          f.approved && f.approver === 'workspace-allowlist' ? '已批准(工作区清单)' : f.approved ? '已批准' : '已拒绝';
+          f.approved && f.approver === 'workspace-allowlist'
+            ? '已批准(工作区清单)'
+            : f.approved && f.approver === 'in-workspace'
+              ? '已批准(工作区内)'
+              : f.approved
+                ? '已批准'
+                : '已拒绝';
         pushMessage({
           kind: 'info',
           text: `审批结果:${outcome}(工具 ${f.tool_name})`,

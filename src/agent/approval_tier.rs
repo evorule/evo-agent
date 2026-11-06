@@ -68,6 +68,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::agent::approval::{ApprovalCallback, ApprovalDecision, ApprovalRequest};
@@ -314,6 +315,70 @@ pub fn hits_escape_intent(code: &str) -> bool {
 }
 
 // =============================================================================
+// 判据②：工作区内写面 T0（设计 §3.2 T0 判据②，默认规则不依赖 allowlist）
+// =============================================================================
+
+/// 判据②覆盖的写面 candidate 工具（有 evaluate_proposal 提案的写面工具；
+/// edit_file 恒不出提案不进审批链，不在其列）。
+const FILE_WRITE_TOOLS: &[&str] = &["file_create", "file_delete", "file_move"];
+
+/// 提取写面提案涉及的全部路径（工具无路径字段/不在覆盖面 → None）。
+/// file_move 源（path）与目标目录（target_dir）都要∈工作区根；
+/// new_name 含路径分隔符或 ".." 视为目标出界（保守从严，误报方向=必问）。
+fn file_write_paths(tool: &str, args: &Value) -> Option<Vec<String>> {
+    if !FILE_WRITE_TOOLS.contains(&tool) {
+        return None;
+    }
+    let mut paths = Vec::new();
+    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+        paths.push(p.to_string());
+    }
+    if tool == "file_move" {
+        if let Some(t) = args.get("target_dir").and_then(|v| v.as_str()) {
+            paths.push(t.to_string());
+        }
+        if let Some(n) = args.get("new_name").and_then(|v| v.as_str()) {
+            if n.contains('/') || n.contains('\\') || n.contains("..") {
+                paths.push(n.to_string()); // 名字带路径=按出界处理
+            }
+        }
+    }
+    if paths.is_empty() {
+        None
+    } else {
+        Some(paths)
+    }
+}
+
+/// 路径∈工作区根判定（纯函数，不碰盘——目标可能尚不存在）：相对路径按
+/// root.join 解析；组件级归一（`.` 跳过、`..` 弹栈，弹空=越出根=出界）；
+/// 绝对路径归一后组件前缀比对（非字符串前缀，防 `D:\demo2` 误判入
+/// `D:\demo`）。windows 盘符大小写差异按字面（与执行器同源语义）。
+fn in_workspace(path: &str, root: &Path) -> bool {
+    use std::path::{Component, PathBuf};
+    let p = Path::new(path);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.join(p)
+    };
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if stack.pop().is_none() {
+                    return false; // 越出根
+                }
+            }
+            other => stack.push(other.as_os_str().to_os_string()),
+        }
+    }
+    let norm = stack.iter().fold(PathBuf::new(), |acc, s| acc.join(s));
+    norm.starts_with(root)
+}
+
+// =============================================================================
 // allowlist 配置面（per-workspace，schema 兼容前端写入形态）
 // =============================================================================
 
@@ -513,6 +578,8 @@ pub struct TieredApproval {
     inner: Arc<dyn ApprovalCallback>,
     /// allowlist 文件路径（每次决策现读——前端「本工作区始终允许」落盘即时生效）
     allowlist_path: PathBuf,
+    /// 工作区根（判据②路径∈根判定用；与 allowlist 根同源）
+    workspace_root: PathBuf,
 }
 
 impl TieredApproval {
@@ -521,6 +588,7 @@ impl TieredApproval {
         Self {
             inner,
             allowlist_path: allowlist_path(workdir),
+            workspace_root: workdir.to_path_buf(),
         }
     }
 
@@ -528,7 +596,13 @@ impl TieredApproval {
     pub fn with_path(inner: Arc<dyn ApprovalCallback>, path: PathBuf) -> Self {
         Self {
             inner,
-            allowlist_path: path,
+            allowlist_path: path.clone(),
+            // 测试装配：根取 allowlist 文件的父目录的父目录（.evo/ 上一级）
+            workspace_root: path
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or(Path::new("/"))
+                .to_path_buf(),
         }
     }
 }
@@ -536,6 +610,79 @@ impl TieredApproval {
 #[async_trait]
 impl ApprovalCallback for TieredApproval {
     async fn request_approval(&self, req: &ApprovalRequest) -> ApprovalDecision {
+        // ===== 判据②（设计 §3.2 T0 判据②）：工作区内写面默认 T0 =====
+        // 默认规则不依赖 allowlist 配置（文件缺失时依然生效——本批行为变更
+        // 点：默认档下工作区内写由「弹卡」变「静默」，项目方开工令授权）；
+        // deny 恒压在其前（文件可读时）；任一路径出界=逃逸意图恒必问（配置
+        // 不可放宽，与 python_exec 逃逸通道同哲学）；allowlist 文件损坏/不可
+        // 读 → 保守旁路人工（与既有链一致，deny 不可知不放行）。
+        // 档位自动正确性：本装饰器仅在 workspace/manual 档装配——plan 档
+        // 人工窗直连（全必问）、yolo 档判定式装配（全静默），判据②不越档。
+        if let Some(paths) = file_write_paths(&req.tool_name, &req.args) {
+            // 逃逸意图：任一路径出界 → 恒必问
+            if paths.iter().any(|p| !in_workspace(p, &self.workspace_root)) {
+                info!(
+                    session = %req.session_id,
+                    tool = %req.tool_name,
+                    command = %req.command,
+                    "tier T2: write outside workspace root (escape intent), forced manual approval"
+                );
+                return self.inner.request_approval(req).await;
+            }
+            // deny 恒压：判定基底=工具名+路径串（deny 通配可匹配路径内容）
+            match std::fs::read_to_string(&self.allowlist_path) {
+                Ok(text) => match serde_json::from_str::<AllowlistFile>(&text) {
+                    Ok(al) if al.version == 1 => {
+                        let base = format!("{} {}", req.tool_name, paths.join(" "));
+                        for d in &al.deny {
+                            if (d.tool == "*" || d.tool == req.tool_name)
+                                && pattern_matches(&d.pattern, &base)
+                            {
+                                info!(
+                                    session = %req.session_id,
+                                    tool = %req.tool_name,
+                                    command = %req.command,
+                                    pattern = %d.pattern,
+                                    "tier T2: deny pattern hit on in-workspace write, forced manual approval"
+                                );
+                                return self.inner.request_approval(req).await;
+                            }
+                        }
+                    }
+                    _ => {
+                        warn!(path = %self.allowlist_path.display(),
+                              "approval-allowlist.json unsupported/parse failed; in-workspace write bypassed to manual");
+                        return self.inner.request_approval(req).await;
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // 缺席→无 deny 面，直批
+                Err(e) => {
+                    warn!(path = %self.allowlist_path.display(), error = %e,
+                          "approval-allowlist.json unreadable; in-workspace write bypassed to manual");
+                    return self.inner.request_approval(req).await;
+                }
+            }
+            // 工作区内写 → T0 静默批准（留痕照产：装饰在 GovAuditedApproval 内层）
+            info!(
+                session = %req.session_id,
+                tool = %req.tool_name,
+                command = %req.command,
+                proposal_id = %req.proposal_id,
+                "tier T0: in-workspace write auto-approved (design criterion 2)"
+            );
+            return ApprovalDecision {
+                approved: true,
+                approver: "in-workspace".to_string(),
+                verified: false,
+                reason: format!(
+                    "in-workspace write (design criterion 2): tool={} paths={:?} all inside workspace root",
+                    req.tool_name, paths
+                ),
+                auto_rejected: false,
+                verdict_json: None,
+            };
+        }
+        // ===== 原有 allowlist 判定链（shell/python 面）=====
         // 文件读取与判定均同步轻量（小 JSON），不跨 await 持锁
         let text = match std::fs::read_to_string(&self.allowlist_path) {
             Ok(t) => t,
@@ -1103,6 +1250,140 @@ mod tests {
             .request_approval(&py_req("open('x','w').write(d)"))
             .await;
         assert!(!d.approved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== 判据②：工作区内写面默认 T0（设计 §3.2）=====
+
+    #[test]
+    fn test_in_workspace_path_normalization() {
+        let root = Path::new("D:/demo/ws");
+        // 相对路径=join 根内
+        assert!(in_workspace("a/b.txt", root));
+        assert!(in_workspace("D:/demo/ws/x.txt", root));
+        // 绝对出界（前缀字符串相似但组件不同）
+        assert!(!in_workspace("D:/demo/ws2/x.txt", root));
+        assert!(!in_workspace("D:/other/x.txt", root));
+        // .. 逃逸（相对越根）
+        assert!(!in_workspace("../../x", root));
+        // .. 折叠后仍在根内
+        assert!(in_workspace("a/../b.txt", root));
+        // 根自身
+        assert!(in_workspace("", root));
+    }
+
+    #[test]
+    fn test_file_write_paths_extraction() {
+        assert!(file_write_paths("shell_exec", &json!({"command": "ls"})).is_none());
+        assert!(file_write_paths("file_create", &json!({})).is_none());
+        assert_eq!(
+            file_write_paths("file_create", &json!({"path": "a.txt"})).unwrap(),
+            vec!["a.txt".to_string()]
+        );
+        // file_move：源+目标目录；new_name 带路径=按出界处理
+        assert_eq!(
+            file_write_paths(
+                "file_move",
+                &json!({"path": "a.txt", "target_dir": "sub", "new_name": "b.txt"})
+            )
+            .unwrap(),
+            vec!["a.txt".to_string(), "sub".to_string()]
+        );
+        assert!(file_write_paths(
+            "file_move",
+            &json!({"path": "a.txt", "target_dir": "sub", "new_name": "../b.txt"})
+        )
+        .unwrap()
+        .contains(&"../b.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_criterion2_in_workspace_write_auto_approved() {
+        let dir = std::env::temp_dir().join(format!("evo-al-c2-in-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // allowlist 文件缺席 → 判据②依然生效（默认规则不依赖配置）
+        let dec = TieredApproval::new(Arc::new(DenyAll), &dir);
+        let mut r = req("file_create", "");
+        r.args = json!({"path": "src/lib.rs"});
+        let d = dec.request_approval(&r).await;
+        assert!(d.approved);
+        assert_eq!(d.approver, "in-workspace");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_criterion2_escape_forced_manual() {
+        let dir = std::env::temp_dir().join(format!("evo-al-c2-esc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dec = TieredApproval::new(Arc::new(DenyAll), &dir);
+        // 绝对出界
+        let mut r = req("file_create", "");
+        r.args = json!({"path": "C:/Windows/evil.txt"});
+        assert!(!dec.request_approval(&r).await.approved);
+        // .. 越根逃逸
+        let mut r = req("file_delete", "");
+        r.args = json!({"path": "../../keep.txt"});
+        assert!(!dec.request_approval(&r).await.approved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_criterion2_deny_overrides_in_workspace() {
+        let dir = std::env::temp_dir().join(format!("evo-al-c2-deny-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".evo")).unwrap();
+        std::fs::write(
+            dir.join(".evo").join("approval-allowlist.json"),
+            r#"{"version":1,"allow":[],"deny":[{"tool":"*","pattern":"*secret*"}]}"#,
+        )
+        .unwrap();
+        let dec = TieredApproval::new(Arc::new(DenyAll), &dir);
+        let mut r = req("file_create", "");
+        r.args = json!({"path": "docs/secret-plan.md"});
+        assert!(!dec.request_approval(&r).await.approved); // deny 压判据②
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_criterion2_corrupt_allowlist_bypasses_to_manual() {
+        let dir = std::env::temp_dir().join(format!("evo-al-c2-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".evo")).unwrap();
+        std::fs::write(dir.join(".evo").join("approval-allowlist.json"), "{broken").unwrap();
+        let dec = TieredApproval::new(Arc::new(DenyAll), &dir);
+        let mut r = req("file_create", "");
+        r.args = json!({"path": "a.txt"});
+        assert!(!dec.request_approval(&r).await.approved); // deny 不可知→保守人工
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_criterion2_file_move_target_outside_forced_manual() {
+        let dir = std::env::temp_dir().join(format!("evo-al-c2-mv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dec = TieredApproval::new(Arc::new(DenyAll), &dir);
+        // 源∈根、目标目录出界 → 恒必问
+        let mut r = req("file_move", "");
+        r.args = json!({"path": "a.txt", "target_dir": "../outside", "new_name": "a.txt"});
+        assert!(!dec.request_approval(&r).await.approved);
+        // 源+目标都∈根 → T0
+        let mut r = req("file_move", "");
+        r.args = json!({"path": "a.txt", "target_dir": "sub", "new_name": "b.txt"});
+        let d = dec.request_approval(&r).await;
+        assert!(d.approved);
+        assert_eq!(d.approver, "in-workspace");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_criterion2_non_file_tool_unchanged() {
+        let dir = std::env::temp_dir().join(format!("evo-al-c2-non-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // shell 面：allowlist 缺席 → 原链 NotFound 旁路人工（判据②不越面）
+        let dec = TieredApproval::new(Arc::new(DenyAll), &dir);
+        assert!(
+            !dec.request_approval(&req("shell_exec", "cargo test"))
+                .await
+                .approved
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
