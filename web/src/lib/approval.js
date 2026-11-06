@@ -98,7 +98,8 @@ export function trialStatusView(status) {
   }
 }
 
-// ---- 审批档位选择器(批B):四档快捷预设,底层=既有两键(mode+豁免覆盖) ----
+// ---- 审批档位选择器(批B:四档快捷预设;批③:三档
+// permission mode 主映射) ----
 //
 // 静态路由层无放行权:本组函数只产出「设置键写入序列」,决策端/红线闸/审计链
 // 零触碰。「完全访问」=auto_policy+豁免开启,调用方必须先过确认条(FULL_ACCESS_CONFIRM)
@@ -112,11 +113,28 @@ export const APPROVAL_EXEMPTION_KEY = 'approval.exemptionOverride';
 export const FULL_ACCESS_CONFIRM =
   '确认开启完全访问?红线类操作(删除文件/推送远端/数据外发/修改治理配置文件)将不再强制人工确认,由评审自动判定,留痕携带豁免标记。';
 
-/** 四档预设 → 两键写入序列(纯函数,vitest 锁)。
- *  manual/auto 复位豁免(安全向);full 开豁免(调用方先过确认);
- *  custom 只写 mode——豁免不动,条件文件由用户在审批策略分区自管。 */
+/** 三档 permission mode → 两键写入序列(纯函数,vitest 锁)。
+ *  批③:plan(只读陪跑,全部写操作必问)/ workspace(工作区内
+ *  自动,缺省档)/ yolo(全自动+审计)。workspace 复位豁免(安全向);
+ *  yolo 同 auto_policy(豁免不动——确认条仅在 full 预设,red line 豁免
+ *  不随档位静默开启);旧值 manual/auto/full/custom 兼容保留。 */
 export function approvalPresetWrites(preset) {
   switch (preset) {
+    case 'plan':
+      return [
+        [APPROVAL_MODE_KEY, 'plan'],
+        [APPROVAL_EXEMPTION_KEY, false],
+      ];
+    case 'workspace':
+      return [
+        [APPROVAL_MODE_KEY, 'workspace'],
+        [APPROVAL_EXEMPTION_KEY, false],
+      ];
+    case 'yolo':
+      return [
+        [APPROVAL_MODE_KEY, 'yolo'],
+        [APPROVAL_EXEMPTION_KEY, false],
+      ];
     case 'manual':
       return [
         [APPROVAL_MODE_KEY, 'manual'],
@@ -140,10 +158,17 @@ export function approvalPresetWrites(preset) {
 }
 
 /** 两键实况 → 档位展示(纯函数,vitest 锁):主键映射+豁免角标。
- *  未设/未知 mode → serve 缺省 manual(preset=null 表示未显式写入过)。 */
+ *  三档主映射(plan/workspace/yolo)+旧值兼容回显(manual/auto/full/custom);
+ *  未设/未知 mode → serve 缺省 workspace 语义(preset='workspace' 缺省档)。 */
 export function approvalPresetView(mode, exemption) {
   const exempt = !!exemption;
   switch (mode) {
+    case 'plan':
+      return { preset: 'plan', label: '只读陪跑', exempt };
+    case 'workspace':
+      return { preset: 'workspace', label: exempt ? '工作区内自动(红线豁免)' : '工作区内自动', exempt };
+    case 'yolo':
+      return { preset: 'yolo', label: exempt ? '全自动(红线豁免)' : '全自动+审计', exempt };
     case 'manual':
       return { preset: 'manual', label: exempt ? '手动审批(红线豁免)' : '手动审批', exempt };
     case 'auto_policy':
@@ -151,6 +176,6 @@ export function approvalPresetView(mode, exemption) {
     case 'policy':
       return { preset: 'custom', label: exempt ? '自定义配置(红线豁免)' : '自定义配置', exempt };
     default:
-      return { preset: null, label: '手动审批', exempt };
+      return { preset: 'workspace', label: '工作区内自动', exempt };
   }
 }
