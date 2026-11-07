@@ -13,6 +13,7 @@ import {
   gitStatus as fetchGitStatus,
   gitDiff,
 } from './api.js';
+import { shouldRouteToMediaStage } from './media-stage.js';
 import { userLayerDoc } from './settings.js';
 
 /** 连接状态: connecting | online | offline */
@@ -251,6 +252,9 @@ export async function openFile(path, reveal = null) {
     if (reveal) pendingReveal.set({ path, ...reveal });
     return null;
   }
+  // 媒体二进制不走文本读取(UTF-8 解码会不可逆破坏字节):按扩展名路由
+  // 到媒体视图 tab,内容由 MediaStage 组件经 /api/files/raw 按需拉取
+  if (shouldRouteToMediaStage(path)) return openMediaTab(path);
   try {
     const res = await readFile(path);
     const content = res.content ?? '';
@@ -264,6 +268,27 @@ export async function openFile(path, reveal = null) {
     activePath.set(path);
     return msg;
   }
+}
+
+/** 媒体视图 tab(kind:'media'):二进制内容不进 tab store,由 MediaStage
+ *  组件挂载时经 /api/files/raw 自取(64MB 上限内 blob 化,超限显式降级)。 */
+export function openMediaTab(path) {
+  const name = path.split('/').pop() || path;
+  let existing = null;
+  tabs.update((list) => {
+    existing = findTab(list, path) || null;
+    return list;
+  });
+  if (existing) {
+    activePath.set(path);
+    return null;
+  }
+  tabs.update((list) => [
+    ...list,
+    { path, name, kind: 'media', content: '', dirty: false, error: null },
+  ]);
+  activePath.set(path);
+  return null;
 }
 
 /** 确保全局 tab 存在(不激活主组;分屏副组开文件用)。返回 tab 对象或错误占位 */

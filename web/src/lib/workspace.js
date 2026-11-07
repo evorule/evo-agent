@@ -105,7 +105,9 @@ export function workspaceLabel(path) {
 export async function switchWorkspace(raw, confirmFn = () => Promise.resolve(true)) {
   const chk = validateWorkspaceInput(raw);
   if (!chk.ok) return { ok: false, error: chk.error };
-  const fileTabs = get(tabs).filter((t) => t && !t.kind);
+  // 媒体视图 tab 同样随工作区关闭:其内容按路径从当前工作区根拉取,
+  // 切换后旧路径指向新根的异物,必须随普通文件 tab 一并关闭
+  const fileTabs = get(tabs).filter((t) => t && (!t.kind || t.kind === 'media'));
   if (fileTabs.some((t) => t.dirty)) {
     const go = await confirmFn('切换工作区将关闭已打开的文件,未保存的修改将丢失。继续切换?');
     if (!go) return { ok: false, cancelled: true };

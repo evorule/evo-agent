@@ -21,6 +21,7 @@
   import SettingsEditor from './SettingsEditor.svelte';
   import GuidePanel from './GuidePanel.svelte';
   import HomeView from './HomeView.svelte';
+  import MediaStage from './MediaStage.svelte';
   import {
     tabs,
     activePath,
@@ -92,6 +93,9 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
   let diffEl;
   let settingsEl;
   let guideEl;
+  let mediaEl;
+  /** 媒体视图当前路径(空串=非媒体 tab;条件挂载 MediaStage,切走即卸载回收) */
+  let activeMediaPath = '';
   let editor = null;
   let diffEditor = null;
   let welcomeModel = null;
@@ -240,6 +244,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
     if (diffEl) diffEl.style.display = which === 'diff' ? '' : 'none';
     if (settingsEl) settingsEl.style.display = which === 'settings' ? '' : 'none';
     if (guideEl) guideEl.style.display = which === 'guide' ? '' : 'none';
+    if (mediaEl) mediaEl.style.display = which === 'media' ? '' : 'none';
   }
 
   // 设置 JSON Schema:仅在用户层设置 tab 激活期间挂载(fileMatch 限定该虚拟 URI,
@@ -399,6 +404,8 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
     } else {
       unmountSettingsSchema();
     }
+    // 媒体视图路径每轮先清空(仅 media 分支回填):切走即条件卸载组件
+    activeMediaPath = '';
     if (!path) {
       editor.setModel(welcomeModel);
       showHost('edit');
@@ -421,6 +428,14 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
       // 使用指南:非 Monaco 特殊 tab,渲染指南组件(不建 model)
       cursorPos.set(null); // F1 状态栏:无编辑器光标
       showHost('guide');
+      return;
+    }
+    if (tab.kind === 'media') {
+      // 媒体视图:非 Monaco 特殊 tab,二进制内容由 MediaStage 自取
+      // (组件条件挂载于 activeMediaPath,切走/关闭即卸载并回收 objectURL)
+      cursorPos.set(null); // F1 状态栏:无编辑器光标
+      activeMediaPath = tab.path;
+      showHost('media');
       return;
     }
     if (tab.error) {
@@ -880,7 +895,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
       </button>
     </div>
   {/if}
-  <div class="editor-host" bind:this={editorEl} data-zone="editor" style:display={showHome || mdPreviewOn ? 'none' : ''}></div>
+  <div class="editor-host" bind:this={editorEl} data-zone="editor" style:display={showHome || mdPreviewOn || activeMediaPath ? 'none' : ''}></div>
   {#if mdPreviewOn}
     <div class="md-preview" data-zone="editor">{@html mdPreviewHtml}</div>
   {/if}
@@ -890,6 +905,12 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
   </div>
   <div class="editor-host guide-host" bind:this={guideEl} style="display:none" data-zone="editor">
     <GuidePanel />
+  </div>
+  <!-- 媒体视图宿主:条件挂载 MediaStage(activeMediaPath 空=卸载,回收 objectURL) -->
+  <div class="editor-host media-host" bind:this={mediaEl} style="display:none" data-zone="editor">
+    {#if activeMediaPath}
+      <MediaStage path={activeMediaPath} />
+    {/if}
   </div>
   <!-- 批 I 段 3:首页工作区卡(无打开 tab 时;宿主与 Monaco 同栖互斥显示) -->
   <div class="home-host" style:display={showHome ? 'flex' : 'none'} data-zone="editor">
