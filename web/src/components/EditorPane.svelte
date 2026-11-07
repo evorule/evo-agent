@@ -22,6 +22,7 @@
   import GuidePanel from './GuidePanel.svelte';
   import HomeView from './HomeView.svelte';
   import MediaStage from './MediaStage.svelte';
+  import StructuredView from './StructuredView.svelte';
   import {
     tabs,
     activePath,
@@ -118,9 +119,18 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
   let mdPreviewHtml = '';
   /** 当前激活 tab 是否 Markdown 文件(预览钮可见性) */
   $: isMd = ($activePath || '').toLowerCase().endsWith('.md');
+  /** v1.5 结构化视图:JSON 走键树/摘要卡,SVG 走图像预览——均为 opt-in
+   *  toggle(不劫持路由,本体保持可编辑);数据源=tab 内存 content,零网络 */
+  let structuredOn = false;
+  let svgPreviewOn = false;
+  let svgPreviewUrl = '';
+  $: isJson = ($activePath || '').toLowerCase().endsWith('.json');
+  $: isSvg = ($activePath || '').toLowerCase().endsWith('.svg');
   /** H2 面包屑:仅真实文件 tab 显示(设置页/diff/错误占位不显) */
   $: crumbTab = $activePath ? $tabs.find((t) => t.path === $activePath) || null : null;
   $: crumbPath = crumbTab && !crumbTab.kind && !crumbTab.error ? crumbTab.path : '';
+  /** 结构化视图数据源:激活 tab 内存 content(零网络) */
+  $: activeTabContent = crumbTab ? crumbTab.content ?? '' : '';
   /** 批 I 段 3:无打开 tab = 首页态(工作区卡替代欢迎编辑器;Monaco 宿主
    *  保持挂载仅隐藏,实例/undo 栈不销毁)。
    *  批 J1 补:tab 栏常驻「首页」chip——任意 tab 态可一键返回首页
@@ -495,6 +505,42 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
     mdPreviewHtml = t ? marked.parse(t.content ?? '', { async: false }) : '';
   }
 
+  /** JSON 结构化视图开关(StructuredView 自行解析渲染;切走即卸载) */
+  function toggleStructured() {
+    structuredOn = !structuredOn;
+  }
+
+  /** SVG 图像预览开关:内存 content 直接 Blob 化(零网络),旧 URL 即刻回收 */
+  function toggleSvgPreview() {
+    if (svgPreviewOn) {
+      svgPreviewOn = false;
+      if (svgPreviewUrl) {
+        URL.revokeObjectURL(svgPreviewUrl);
+        svgPreviewUrl = '';
+      }
+      return;
+    }
+    const p = get(activePath);
+    const t = get(tabs).find((x) => x.path === p);
+    if (!t) return;
+    const blob = new Blob([t.content ?? ''], { type: 'image/svg+xml' });
+    if (svgPreviewUrl) URL.revokeObjectURL(svgPreviewUrl);
+    svgPreviewUrl = URL.createObjectURL(blob);
+    svgPreviewOn = true;
+  }
+
+  /** 预览族统一复位(切 tab/关 tab):回收 svg 预览 URL */
+  function resetPreviewModes() {
+    structuredOn = false;
+    if (svgPreviewOn) {
+      svgPreviewOn = false;
+      if (svgPreviewUrl) {
+        URL.revokeObjectURL(svgPreviewUrl);
+        svgPreviewUrl = '';
+      }
+    }
+  }
+
   // 消费一次性定位信号(B2 全局搜索跳转等):信号目标与当前激活 tab 及
   // 显示中 model 一致时 revealLineInCenter+选区+聚焦,消费即清(幂等)。
   // 双入口:activePath 切换渲染后探一次 + pendingReveal 变化时触发,
@@ -688,6 +734,7 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
       homeActive = false; // 激活任意具体路径即离开首页态(goHome 自身先 null 后置 true,顺序保证)
       diffOn = false; // 切 tab 回到编辑模式
       mdPreviewOn = false; // 预览态随 tab 切换退出(重进可再开)
+      resetPreviewModes(); // v1.5 结构化/SVG 预览随 tab 切换退出并回收 URL
       renderActive(p);
       maybeConsumeReveal();
     });
@@ -873,6 +920,26 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
           {mdPreviewOn ? '返回编辑' : '预览'}
         </button>
       {/if}
+      {#if isJson && !isMd}
+        <button
+          class="md-preview-toggle"
+          class:on={structuredOn}
+          title="结构化视图(键树+摘要卡,渲染当前内容)"
+          onclick={toggleStructured}
+        >
+          {structuredOn ? '返回编辑' : '结构化'}
+        </button>
+      {/if}
+      {#if isSvg && !isMd}
+        <button
+          class="md-preview-toggle"
+          class:on={svgPreviewOn}
+          title="SVG 图像预览(渲染当前内容)"
+          onclick={toggleSvgPreview}
+        >
+          {svgPreviewOn ? '返回编辑' : '预览'}
+        </button>
+      {/if}
     {/if}
     {#if saveError}
       <div class="save-error" title={saveError}>保存失败</div>
@@ -895,9 +962,19 @@ Powered by *EvoRule* —— evorule 治理内核驱动(agent 会话 / 审批 / �
       </button>
     </div>
   {/if}
-  <div class="editor-host" bind:this={editorEl} data-zone="editor" style:display={showHome || mdPreviewOn || activeMediaPath ? 'none' : ''}></div>
+  <div class="editor-host" bind:this={editorEl} data-zone="editor" style:display={showHome || mdPreviewOn || structuredOn || svgPreviewOn || activeMediaPath ? 'none' : ''}></div>
   {#if mdPreviewOn}
     <div class="md-preview" data-zone="editor">{@html mdPreviewHtml}</div>
+  {/if}
+  {#if structuredOn}
+    <div class="structured-host" data-zone="editor">
+      <StructuredView content={activeTabContent} />
+    </div>
+  {/if}
+  {#if svgPreviewOn && svgPreviewUrl}
+    <div class="svg-preview" data-zone="editor">
+      <img src={svgPreviewUrl} alt="SVG 预览" />
+    </div>
   {/if}
   <div class="editor-host diff-host" bind:this={diffEl} style="display:none" data-zone="editor"></div>
   <div class="editor-host settings-host" bind:this={settingsEl} style="display:none" data-zone="editor">

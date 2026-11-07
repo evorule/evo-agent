@@ -19,6 +19,8 @@ const CATEGORY_BY_EXT = {
   ogg: 'audio',
   m4a: 'audio',
   aac: 'audio',
+  glb: 'model',
+  gltf: 'model',
   png: 'image',
   jpg: 'image',
   jpeg: 'image',

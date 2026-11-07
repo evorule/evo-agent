@@ -144,6 +144,15 @@
       ondblclick={resetView}
     />
     <div class="ms-hint">scroll = zoom · drag = pan · double-click = reset</div>
+  {:else if category === 'model'}
+    <div class="ms-card ms-error">
+      <div class="ms-title">3D model preview is not built in yet</div>
+      <div class="ms-sub">
+        {path} · {sizeBytes} bytes · rendering glTF assets needs a three.js
+        dependency introduction (queued as a separate batch); use an external
+        viewer meanwhile.
+      </div>
+    </div>
   {/if}
 </div>
 

@@ -45,6 +45,12 @@ describe('mediaCategoryFor', () => {
     expect(mediaCategoryFor('.hidden.png')).toBe('image');
     expect(mediaCategoryFor('clip.unknownext')).toBeNull();
   });
+
+  it('routes 3D model binaries to the explicit model category', () => {
+    expect(mediaCategoryFor('scene.glb')).toBe('model');
+    expect(mediaCategoryFor('asset.gltf')).toBe('model');
+    expect(shouldRouteToMediaStage('scene.glb')).toBe(true);
+  });
 });
 
 describe('shouldRouteToMediaStage', () => {
