@@ -102,6 +102,7 @@ service_tools = [
   "geometry_figure_audit",
   "geometry_iso_project",
   "geometry_occlusion_check",
+  "geometry_safe_zone_check",
   "geometry_tube_route",
   "gnss_clock_total",
   "gnss_eccentricity_correction",
@@ -172,4 +173,6 @@ service_tools = [
   "verification_fsm_language_inclusion",
   "verification_fsm_reachability",
   "verification_sat_solve",
+  "video_service_skeleton_probe",
+  "video_timeline_consistency_check",
 ]
