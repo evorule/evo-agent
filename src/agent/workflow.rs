@@ -2322,7 +2322,10 @@ mod tests {
             crate::agent::journal::read_all(&JournalWriter::path_for(&dir, &sid2)).unwrap();
         // B-172:恢复代账本为 New 模式开新档,账首落身份锚(粒 1/2 未重执行)
         assert_eq!(lines2.len(), 2, "身份锚 + 粒 3 检查点=零重执行");
-        assert!(matches!(lines2[0].event, JournalEvent::SessionOpened { .. }));
+        assert!(matches!(
+            lines2[0].event,
+            JournalEvent::SessionOpened { .. }
+        ));
         match &lines2[1].event {
             JournalEvent::NodeCheckpointed { node_id, .. } => assert_eq!(node_id, "n3"),
             other => panic!("expected node_checkpointed, got {other:?}"),
