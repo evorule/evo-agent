@@ -1040,6 +1040,8 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             JournalEvent::FileCheckpointTaken { .. } => {}
             JournalEvent::FileCheckpointRestored { .. } => {}
             JournalEvent::VerifyRan { .. } => {}
+            // B-172 开档身份锚:观测面,不参与步映射
+            JournalEvent::SessionOpened { .. } => {}
         }
     }
     // 流末悬挂 agent 步(无 turn_ended 尾:crash/截断场景)

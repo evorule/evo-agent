@@ -7567,19 +7567,52 @@ impl AgentRunner {
                            // B21 PR-1:journal 会话事件流(serve 注入 journal_dir 时启用)。
                            // 打开失败 fail-soft 降级为无 journal 会话(warn 留痕,不阻塞主流程
                            // ——与 metrics/tool_traces 同风格);读侧 seq 连续性校验 fail-visible。
+                           // B-172 分流:Fresh=新会话开新档(New 模式:撞号 fail-fast+身份锚);
+                           // Continuation/CrashResume=同会话续跑(Resume 模式:锚校验,旧档容忍)
                            let journal: Option<std::sync::Arc<crate::agent::journal::JournalWriter>> =
                                match &runner.journal_dir {
-                                   Some(dir) => match crate::agent::journal::JournalWriter::open(dir, &session_id)
-                                   {
-                                       Ok(w) => Some(std::sync::Arc::new(w)),
-                                       // 同会话已有活跃写者=继续运行只会交错损坏账面,
-                                       // 此特定错误 fail-fast 上浮(其余 IO 错误保持 fail-soft 降级)
-                                       Err(crate::agent::journal::JournalError::WriterActive(sid)) => {
-                                           yield Err(AgentError::Internal(format!(
-                                               "session '{sid}' already has an active journal writer (并发双写防护;等先前运行收尾后再续跑)"
-                                           )));
-                                           return;
-                                       }
+                                   Some(dir) => {
+                                       let (mode, identity) = if recovery == RecoveryMode::Fresh {
+                                           (
+                                               crate::agent::journal::OpenMode::New,
+                                               crate::agent::journal::SessionIdentity {
+                                                   agent: Some("react".to_string()),
+                                                   model: Some(runner.config.model.clone()),
+                                                   temperature: Some(runner.config.temperature as f64),
+                                               },
+                                           )
+                                       } else {
+                                           (
+                                               crate::agent::journal::OpenMode::Resume,
+                                               crate::agent::journal::SessionIdentity::default(),
+                                           )
+                                       };
+                                       match crate::agent::journal::JournalWriter::open_with_mode(
+                                           dir, &session_id, mode, identity,
+                                       ) {
+                                           Ok(w) => Some(std::sync::Arc::new(w)),
+                                           // 同会话已有活跃写者=继续运行只会交错损坏账面,
+                                           // 此特定错误 fail-fast 上浮(其余 IO 错误保持 fail-soft 降级)
+                                           Err(crate::agent::journal::JournalError::WriterActive(sid)) => {
+                                               yield Err(AgentError::Internal(format!(
+                                                   "session '{sid}' already has an active journal writer (并发双写防护;等先前运行收尾后再续跑)"
+                                               )));
+                                               return;
+                                           }
+                                           // B-172:撞号/锚失配 = 续写只会混账,与 WriterActive
+                                           // 同级 fail-fast 上浮(报错信息含处置指引)
+                                           Err(crate::agent::journal::JournalError::ForeignSession {
+                                               session_id: sid,
+                                               path,
+                                           }) => {
+                                               yield Err(AgentError::Internal(format!(
+                                                   "session '{sid}' journal foreign session guard tripped (ledger at {}): \
+                                                    new-run on existing non-empty ledger or identity mismatch - \
+                                                    同会话续跑请用 resume 入口,异会话请人工归档旧账后重试",
+                                                   path.display()
+                                               )));
+                                               return;
+                                           }
                                        Err(e) => {
                                            warn!(
                                                %session_id,
@@ -7587,6 +7620,7 @@ impl AgentRunner {
                                                "B21: journal open failed, session runs without journal"
                                            );
                                            None
+                                       }
                                        }
                                    },
                                    None => None,

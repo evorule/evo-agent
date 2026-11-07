@@ -103,6 +103,26 @@ pub struct TodoItemSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum JournalEvent {
+    /// 会话开档身份锚(B-172):New 模式开新档时首事件落账;Resume 续写不重落。
+    /// 双职责:①异会话撞号/文件身份错位的可诊断锚(Resume 打开时校验
+    /// session_id 一致性,失配 fail-fast);②账本时代判据(agent/model/温度
+    /// 档位供分析器分代)。None 字段不入行;旧档无本事件容忍(缺省不变式)。
+    /// 观测面,不参与步映射。
+    SessionOpened {
+        /// 引擎会话 id(与文件名同源;Resume 校验一致性主键)
+        session_id: String,
+        /// 开档墙钟(unix ms;与行级 ts 同源冗余,单事件取证免跨行)
+        opened_ts: u64,
+        /// agent 标识(react/plan-execute/planrun 等;None=调用方未声明)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// 主模型名(开档时的采样模型档位)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// 采样温度档位
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        temperature: Option<f64>,
+    },
     /// 轮开始(一轮 = 一次用户 goal 驱动的 run_streaming;G15 续跑同文件续轮)
     TurnStarted {
         /// 轮序号(journal 内从 1 递增)
@@ -758,6 +778,43 @@ pub enum JournalError {
     /// 事件序列化失败
     #[error("journal encode: {0}")]
     Encode(String),
+    /// 会话身份失配(B-172):New 模式遇已存在非空档(异会话撞号)或 Resume
+    /// 模式档内身份锚与会话号不一致(文件与身份错位)。fail-fast 不盲追加
+    /// ——撞号盲追加会使异时代账目混入同档,污染审计链与恢复面。同会话
+    /// 续跑请用 Resume 语义;异会话请人工归档/改名处置旧账。
+    #[error("journal foreign session: '{session_id}' at {path} (id collision or identity mismatch; use Resume mode for same-session continuation, or archive the stale ledger manually)")]
+    ForeignSession {
+        /// 打开时声明的会话号
+        session_id: String,
+        /// 撞号/失配的账本文件路径
+        path: PathBuf,
+    },
+}
+
+/// journal 开档模式(B-172 异会话撞号防护):
+/// - `New`:新会话开新档。目标档已存在且非空 = 异会话撞号,fail-fast
+///   (`ForeignSession`)——server 会话号计数器重置后新会号撞旧档时,续写
+///   会把异时代账目混入同档;开新档成功后首事件落 `session_opened` 身份锚。
+/// - `Resume`:同会话续跑/旁挂锚写(既有 open 语义,G15 续跑同文件续写)。
+///   有档续写、无档新建;档首若为身份锚则校验会话号一致性,旧档无锚容忍
+///   (向后兼容缺省不变式)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    /// 新会话开新档(撞号 fail-fast + 身份锚落账)
+    New,
+    /// 续跑/旁挂锚写(既有 open 语义)
+    Resume,
+}
+
+/// New 模式开档身份载荷(落 `session_opened` 锚;None 字段不入行,旧流兼容)
+#[derive(Debug, Clone, Default)]
+pub struct SessionIdentity {
+    /// agent 标识(react / plan-execute / planrun 等;None=未声明)
+    pub agent: Option<String>,
+    /// 主模型名(开档时的采样模型档位)
+    pub model: Option<String>,
+    /// 采样温度档位
+    pub temperature: Option<f64>,
 }
 
 /// 平铺编码+链哈希:先产不含哈希字段的平铺行(即 content 输入),再追加三元组。
@@ -903,11 +960,39 @@ impl Drop for JournalWriter {
 }
 
 impl JournalWriter {
-    /// 打开(或续接)会话 journal;已有文件恢复 last_seq/轮数(G15 续跑同文件续写)。
+    /// 打开(或续接)会话 journal;既有语义(Resume 模式,G15 续跑同文件续写)。
     /// 既有文件 seq 不连续 = 日志损坏,open 即失败(fail-visible)。
     pub fn open(dir: &Path, session_id: &str) -> Result<JournalWriter, JournalError> {
+        Self::open_with_mode(
+            dir,
+            session_id,
+            OpenMode::Resume,
+            SessionIdentity::default(),
+        )
+    }
+
+    /// 分模式打开(B-172):`OpenMode::New` 供新会话开新档(撞号 fail-fast +
+    /// 身份锚落账),`OpenMode::Resume` 为既有续写语义(旧档容忍)。
+    pub fn open_with_mode(
+        dir: &Path,
+        session_id: &str,
+        mode: OpenMode,
+        identity: SessionIdentity,
+    ) -> Result<JournalWriter, JournalError> {
         std::fs::create_dir_all(dir)?;
         let path = Self::path_for(dir, session_id);
+        // New 模式撞号闸:已存在非空档 = 异会话撞号(或误以 New 开档),
+        // fail-fast 不盲追加;空档/无档正常开档。闸在写者注册表与读档扫描
+        // 之前,被拒的 open 零副作用(不建写句柄/不动账面)
+        if mode == OpenMode::New && path.exists() {
+            let existing_len = std::fs::metadata(&path)?.len();
+            if existing_len > 0 {
+                return Err(JournalError::ForeignSession {
+                    session_id: session_id.to_string(),
+                    path,
+                });
+            }
+        }
         let mut last_seq = 0u64;
         let mut turn_count = 0u64;
         let mut recovered_tail: Option<String> = None;
@@ -929,6 +1014,9 @@ impl JournalWriter {
                 .map(|pos| pos + 1)
                 .unwrap_or(0);
             let mut chained_prev: Option<String> = None;
+            // B-172 锚校验:档首若为 session_opened 身份锚,会话号与入参不符
+            // = 文件与身份错位,fail-fast;旧档无锚容忍(缺省不变式)
+            let mut anchor_checked = false;
             let raw_lines: Vec<String> = String::from_utf8_lossy(&bytes[..valid_len])
                 .lines()
                 .map(str::to_string)
@@ -939,6 +1027,21 @@ impl JournalWriter {
                     continue;
                 }
                 let parsed = decode_line(line)?;
+                if !anchor_checked {
+                    anchor_checked = true;
+                    if let JournalEvent::SessionOpened {
+                        session_id: anchored,
+                        ..
+                    } = &parsed.event
+                    {
+                        if *anchored != session_id {
+                            return Err(JournalError::ForeignSession {
+                                session_id: session_id.to_string(),
+                                path,
+                            });
+                        }
+                    }
+                }
                 if parsed.seq != expected {
                     return Err(JournalError::SeqGap {
                         expected,
@@ -1034,6 +1137,21 @@ impl JournalWriter {
             registry_key,
             file_path: path,
         };
+        // B-172:New 模式开新档首事件落身份锚(先于 tail_hung 崩溃标记——
+        // New 模式档必空,tail_hung 恒 false,锚恒为 seq1)
+        if mode == OpenMode::New {
+            let opened_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            writer.push(JournalEvent::SessionOpened {
+                session_id: session_id.to_string(),
+                opened_ts,
+                agent: identity.agent,
+                model: identity.model,
+                temperature: identity.temperature,
+            })?;
+        }
         if tail_hung && !last_was_crash {
             writer.push(JournalEvent::SessionCrashed {
                 reason: "unclean_tail".to_string(),
@@ -2210,7 +2328,13 @@ pub fn gc_wire_blobs(
         }
         stats.bytes_after += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         if !expired_infos.is_empty() {
-            let w = JournalWriter::open(path.parent().unwrap_or(Path::new(".")), &stem)?;
+            // B-172:gc 补落账为既有账面续写(Resume 模式;档内身份锚如在则校验)
+            let w = JournalWriter::open_with_mode(
+                path.parent().unwrap_or(Path::new(".")),
+                &stem,
+                OpenMode::Resume,
+                SessionIdentity::default(),
+            )?;
             for (round, hash, len) in &expired_infos {
                 w.wire_blob_expired(*round, hash, *len)?;
             }
@@ -3758,5 +3882,200 @@ mod tests {
         }
         let r = JournalWriter::open(dir.path(), "s-runaway-anchor").unwrap();
         assert_eq!(r.replay_runaway_actions(), 50);
+    }
+
+    // ===== B-172：journal 异会话撞号防护（New/Resume 双模 + 身份锚） =====
+
+    #[test]
+    fn test_open_new_fails_fast_on_existing_nonempty_file() {
+        // 撞号场景:New 模式遇已存在非空档 = 异会话撞号,fail-fast
+        // (ForeignSession),不再盲追加;被拒的 open 账面零扰动
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let w = JournalWriter::open(dir.path(), "s-collide").unwrap();
+            w.tool_invoked("shell_exec", &serde_json::json!({"c": 1}), None)
+                .unwrap();
+        }
+        let before =
+            crate::agent::journal::read_all(&JournalWriter::path_for(dir.path(), "s-collide"))
+                .unwrap();
+        let err = JournalWriter::open_with_mode(
+            dir.path(),
+            "s-collide",
+            OpenMode::New,
+            SessionIdentity::default(),
+        )
+        .err()
+        .expect("New mode on non-empty ledger must fail");
+        assert!(
+            matches!(err, JournalError::ForeignSession { .. }),
+            "expected ForeignSession, got {err:?}"
+        );
+        let after =
+            crate::agent::journal::read_all(&JournalWriter::path_for(dir.path(), "s-collide"))
+                .unwrap();
+        assert_eq!(before.len(), after.len(), "被拒的 open 不得追加/截断账面");
+    }
+
+    #[test]
+    fn test_open_new_writes_identity_anchor_and_resume_green() {
+        // New 开新档:首事件 = session_opened 身份锚(agent/model/温度入账);
+        // default identity 的 None 字段不入行(skip_serializing_if 旧流兼容形态);
+        // 同会话 Resume 重开:锚校验通过续写,seq 连续
+        let dir = tempfile::tempdir().unwrap();
+        let identity = SessionIdentity {
+            agent: Some("react".into()),
+            model: Some("MiniMax-M3".into()),
+            temperature: Some(0.2),
+        };
+        {
+            let w = JournalWriter::open_with_mode(dir.path(), "s-anchor", OpenMode::New, identity)
+                .unwrap();
+            w.tool_invoked("shell_exec", &serde_json::json!({"c": 1}), None)
+                .unwrap();
+        }
+        let lines =
+            crate::agent::journal::read_all(&JournalWriter::path_for(dir.path(), "s-anchor"))
+                .unwrap();
+        assert_eq!(lines.len(), 2, "session_opened 锚 + tool_invoked");
+        match &lines[0].event {
+            JournalEvent::SessionOpened {
+                session_id,
+                agent,
+                model,
+                temperature,
+                ..
+            } => {
+                assert_eq!(session_id, "s-anchor");
+                assert_eq!(agent.as_deref(), Some("react"));
+                assert_eq!(model.as_deref(), Some("MiniMax-M3"));
+                assert_eq!(*temperature, Some(0.2));
+            }
+            other => panic!("first event must be session_opened, got {other:?}"),
+        }
+        let dir2 = tempfile::tempdir().unwrap();
+        {
+            let _w = JournalWriter::open_with_mode(
+                dir2.path(),
+                "s-anchor2",
+                OpenMode::New,
+                SessionIdentity::default(),
+            )
+            .unwrap();
+        }
+        let raw =
+            std::fs::read_to_string(JournalWriter::path_for(dir2.path(), "s-anchor2")).unwrap();
+        assert!(raw.contains("session_opened"), "raw: {raw}");
+        assert!(!raw.contains("\"model\""), "None 字段不得入行: {raw}");
+        assert!(!raw.contains("\"temperature\""), "None 字段不得入行: {raw}");
+        // Resume 同会话绿:链三查+锚校验通过,续写顺延
+        let w2 = JournalWriter::open_with_mode(
+            dir.path(),
+            "s-anchor",
+            OpenMode::Resume,
+            SessionIdentity::default(),
+        )
+        .unwrap();
+        w2.tool_invoked("shell_exec", &serde_json::json!({"c": 2}), None)
+            .unwrap();
+        let lines =
+            crate::agent::journal::read_all(&JournalWriter::path_for(dir.path(), "s-anchor"))
+                .unwrap();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2].seq, 3);
+    }
+
+    #[test]
+    fn test_resume_tolerates_legacy_file_without_anchor() {
+        // 旧档容忍(缺省不变式=现行为):无身份锚的旧格式档 Resume 打开照常续写。
+        // 旧档轮界闭合(turn_started+turn_ended,不触尾部悬挂补写)
+        let dir = tempfile::tempdir().unwrap();
+        let path = JournalWriter::path_for(dir.path(), "s-legacy");
+        let l1 = encode_line(
+            1,
+            1_000,
+            &JournalEvent::TurnStarted {
+                turn_seq: 1,
+                goal: "legacy goal".into(),
+            },
+        )
+        .unwrap();
+        let l2 = encode_line(
+            2,
+            1_100,
+            &JournalEvent::TurnEnded {
+                status: "success".into(),
+                steps: 1,
+                duration_ms: 100,
+            },
+        )
+        .unwrap();
+        std::fs::write(&path, format!("{l1}\n{l2}\n")).unwrap();
+        let w = JournalWriter::open_with_mode(
+            dir.path(),
+            "s-legacy",
+            OpenMode::Resume,
+            SessionIdentity::default(),
+        )
+        .unwrap();
+        w.tool_invoked("shell_exec", &serde_json::json!({"c": 1}), None)
+            .unwrap();
+        let lines = crate::agent::journal::read_all(&path).unwrap();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2].seq, 3);
+    }
+
+    #[test]
+    fn test_resume_anchor_mismatch_fails_fast() {
+        // 锚失配:档内 session_opened 的会话号与打开入参不符 = 文件与身份
+        // 错位,fail-fast(ForeignSession)
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _w = JournalWriter::open_with_mode(
+                dir.path(),
+                "sess-real",
+                OpenMode::New,
+                SessionIdentity::default(),
+            )
+            .unwrap();
+        }
+        // 改名模拟「文件与身份错位」
+        std::fs::rename(
+            JournalWriter::path_for(dir.path(), "sess-real"),
+            JournalWriter::path_for(dir.path(), "sess-alias"),
+        )
+        .unwrap();
+        let err = JournalWriter::open_with_mode(
+            dir.path(),
+            "sess-alias",
+            OpenMode::Resume,
+            SessionIdentity::default(),
+        )
+        .err()
+        .expect("Resume on mismatched anchor must fail");
+        assert!(
+            matches!(err, JournalError::ForeignSession { .. }),
+            "expected ForeignSession, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_open_new_allows_missing_or_empty_file() {
+        // New 模式:无档/空档 = 正常开档(既有空档不误报撞号)
+        let dir = tempfile::tempdir().unwrap();
+        let path = JournalWriter::path_for(dir.path(), "s-empty");
+        std::fs::write(&path, "").unwrap();
+        let w = JournalWriter::open_with_mode(
+            dir.path(),
+            "s-empty",
+            OpenMode::New,
+            SessionIdentity::default(),
+        )
+        .unwrap();
+        w.tool_invoked("shell_exec", &serde_json::json!({"c": 1}), None)
+            .unwrap();
+        let lines = crate::agent::journal::read_all(&path).unwrap();
+        assert_eq!(lines.len(), 2, "session_opened 锚 + tool_invoked");
+        assert!(matches!(lines[0].event, JournalEvent::SessionOpened { .. }));
     }
 }

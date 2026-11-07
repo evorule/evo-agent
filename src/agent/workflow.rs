@@ -45,7 +45,9 @@ use serde::{Deserialize, Serialize};
 use jsonschema::Validator;
 
 use crate::agent::delegate::DelegateContext;
-use crate::agent::journal::{evorule_digest, JournalEvent, JournalLine, JournalWriter};
+use crate::agent::journal::{
+    evorule_digest, JournalEvent, JournalLine, JournalWriter, OpenMode, SessionIdentity,
+};
 
 /// 条件谓词(workflow_dag v1.1 `run_when.op` 最小集,冻结于该版本)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -741,8 +743,19 @@ impl WorkflowEngine {
             *slot = match self.ctx.journal_dir.clone() {
                 Some(dir) => {
                     let sid = Self::bootstrap_session_id(workflow_id);
-                    let writer = JournalWriter::open(&dir, &sid)
-                        .map_err(|e| format!("run ledger open failed (session '{sid}'): {e}"))?;
+                    // B-172:run 级账本自举会话号带唯一指纹,恒为新档(New 模式;
+                    // 撞号 fail-fast 兜底指纹失效场景)
+                    let writer = JournalWriter::open_with_mode(
+                        &dir,
+                        &sid,
+                        OpenMode::New,
+                        SessionIdentity {
+                            agent: Some("planrun".to_string()),
+                            model: None,
+                            temperature: None,
+                        },
+                    )
+                    .map_err(|e| format!("run ledger open failed (session '{sid}'): {e}"))?;
                     RunLedgerSlot::Ready(writer)
                 }
                 None => RunLedgerSlot::Disabled,
@@ -2278,7 +2291,9 @@ mod tests {
         let sid = find_planrun_sid(&dir).expect("run ledger session must exist");
         let path = JournalWriter::path_for(&dir, &sid);
         let lines = crate::agent::journal::read_all(&path).unwrap();
-        assert_eq!(lines.len(), 3, "连续跑:三粒各一条检查点");
+        // B-172:New 模式开档账首落 session_opened 身份锚,其后三粒各一条检查点
+        assert_eq!(lines.len(), 4, "身份锚 + 三粒各一条检查点");
+        assert!(matches!(lines[0].event, JournalEvent::SessionOpened { .. }));
         let cut = lines
             .iter()
             .position(
@@ -2305,8 +2320,10 @@ mod tests {
         let sid2 = engine2.run_ledger_session_id().unwrap();
         let lines2 =
             crate::agent::journal::read_all(&JournalWriter::path_for(&dir, &sid2)).unwrap();
-        assert_eq!(lines2.len(), 1, "恢复代只落粒 3 检查点=零重执行");
-        match &lines2[0].event {
+        // B-172:恢复代账本为 New 模式开新档,账首落身份锚(粒 1/2 未重执行)
+        assert_eq!(lines2.len(), 2, "身份锚 + 粒 3 检查点=零重执行");
+        assert!(matches!(lines2[0].event, JournalEvent::SessionOpened { .. }));
+        match &lines2[1].event {
             JournalEvent::NodeCheckpointed { node_id, .. } => assert_eq!(node_id, "n3"),
             other => panic!("expected node_checkpointed, got {other:?}"),
         }
