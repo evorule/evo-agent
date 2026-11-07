@@ -136,6 +136,15 @@ export function readFile(path) {
   }).then(unwrap);
 }
 
+/** 原始字节端点(GET /api/files/raw):返回未解包的 Response,由调用方
+ *  决定 blob()(媒体)或 text()(JSON 视图)——不可走 unwrap(它强制
+ *  resp.json(),会把二进制当 JSON 解)。 */
+export function fetchRaw(path) {
+  return fetch(`/api/files/raw?path=${encodeURIComponent(path)}`, {
+    headers: fileHeaders(),
+  });
+}
+
 /** 写文件(整体覆盖;serve 侧固定 overwrite=true + create_parents=true) */
 export function writeFile(path, content) {
   return fetch('/api/files/write', {
