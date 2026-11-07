@@ -87,6 +87,7 @@ service_tools = [
   "codegraph_node",
   "codegraph_search",
   "codegraph_status",
+  "color_contrast_ratio_eval",
   "config_persist",
   "context_reconcile",
   "context_session_health",
@@ -173,6 +174,8 @@ service_tools = [
   "verification_fsm_language_inclusion",
   "verification_fsm_reachability",
   "verification_sat_solve",
+  "video_frame_sequence_eval",
   "video_service_skeleton_probe",
   "video_timeline_consistency_check",
+  "video_track_consistency_eval",
 ]
