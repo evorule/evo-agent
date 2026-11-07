@@ -343,16 +343,6 @@ pub fn read_provider_key(paths: &ResolvedPaths, name: &str) -> Option<String> {
     None
 }
 
-/// 编排层消费：全部已配置的 (name, key) 列表（内置目录+自定义，目录序优先）。
-/// 自定义清单损坏 → Err（调用方须显式留痕后降级，不静默吞掉）。
-pub fn read_provider_keys(paths: &ResolvedPaths) -> Result<Vec<(String, String)>, String> {
-    let all = read_all_providers(paths)?;
-    Ok(all
-        .into_iter()
-        .filter_map(|p| read_provider_key(paths, &p.name).map(|k| (p.name, k)))
-        .collect())
-}
-
 // ---- 自定义 provider（OpenAI 兼容；与内置目录同 key 存储与执法面） ----
 
 pub const CUSTOM_PROVIDERS_FILE: &str = "llm-custom-providers.json";
@@ -1111,11 +1101,15 @@ mod tests {
             read_provider_key(&paths, "minimax").as_deref(),
             Some("sk-legacy-minimax")
         );
-        // 编排层清单：目录序、含回落项
-        let keys = read_provider_keys(&paths).unwrap();
-        assert_eq!(keys.len(), 2);
-        assert_eq!(keys[0].0, "minimax");
-        assert_eq!(keys[1].0, "deepseek");
+        // 目录序 + 仅含已配置 key 的 provider 子集（原聚合清单语义：目录
+        // 序优先、回落项计入，两者已在上方逐项断言）
+        let keyed: Vec<String> = read_all_providers(&paths)
+            .unwrap()
+            .into_iter()
+            .filter(|p| read_provider_key(&paths, &p.name).is_some())
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(keyed, vec!["minimax".to_string(), "deepseek".to_string()]);
         std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 
