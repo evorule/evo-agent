@@ -1310,6 +1310,53 @@ fn cmd_run(
             }
         }
 
+        // 伴跑只读观测工具族：LLM 经此主动查询伴跑呈现面（状态/提案/覆盖率
+        // 三只读 GET；装配期动态注册，manifest=Standard+ReadOnly+AutoPolicy）。
+        // 干预面（A/B 切换/审批/驳回/重试）永不注册——人在环不可破。server
+        // 不可达时调用期 fail-visible，注册无条件（工具面常在）。
+        {
+            use evo_agent::agent::tool_manifest::{dynamic_manifest, ToolSource};
+            use evo_agent::builtin_tools::companion_observe::{
+                CompanionObserveTool, COMPANION_COVERAGE_TOOL, COMPANION_PROPOSALS_TOOL,
+                COMPANION_STATUS_TOOL,
+            };
+            let ev_arc = std::sync::Arc::new(client.clone());
+            let observe_tools: Vec<(&str, CompanionObserveTool)> = vec![
+                (
+                    COMPANION_STATUS_TOOL,
+                    CompanionObserveTool::status(ev_arc.clone()),
+                ),
+                (
+                    COMPANION_PROPOSALS_TOOL,
+                    CompanionObserveTool::proposals(ev_arc.clone()),
+                ),
+                (
+                    COMPANION_COVERAGE_TOOL,
+                    CompanionObserveTool::coverage(ev_arc.clone()),
+                ),
+            ];
+            for (name, tool) in observe_tools {
+                let description =
+                    evo_agent::builtin_tools::companion_observe::tool_description(match name {
+                        COMPANION_PROPOSALS_TOOL => "proposals",
+                        COMPANION_COVERAGE_TOOL => "coverage",
+                        _ => "status",
+                    });
+                match dynamic_manifest(
+                    name,
+                    ToolSource::CompanionObserve,
+                    description,
+                    serde_json::json!({ "type": "object", "properties": {} }),
+                ) {
+                    Ok(manifest) => tool_handler.register(manifest, std::sync::Arc::new(tool)),
+                    Err(e) => {
+                        // 注册失败明示（manifest 硬规则拦下=契约面缺陷），不静默
+                        eprintln!("[companion] 观测工具 '{name}' 注册失败: {e}");
+                    }
+                }
+            }
+        }
+
         // delegate 工具契约源:union toolkit 快照(from_definition 消费原值前克隆;
         // delegate 内部按子定义 def.tools 白名单过滤)
         let delegate_toolkit = tool_handler.clone();

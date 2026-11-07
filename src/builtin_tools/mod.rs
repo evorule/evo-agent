@@ -61,6 +61,7 @@ pub mod appcontainer;
 pub mod ask_user;
 pub mod build_check;
 pub mod code_search;
+pub mod companion_observe;
 pub mod delegate_tool;
 pub mod edit_file;
 pub mod exfil_scan;

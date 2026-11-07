@@ -76,6 +76,9 @@ pub enum ToolSource {
     Skill,
     /// 服务代理（evorule-server 插件服务，发现期动态注册）
     ServiceProxy,
+    /// 伴跑只读观测（evorule-server 伴跑状态机呈现面，装配期动态注册；
+    /// 三只读 GET：状态/提案清单/覆盖率——干预面不经此通道）
+    CompanionObserve,
     /// MCP 远端工具（握手后 tools/list 动态注册）
     Mcp,
 }
@@ -989,6 +992,14 @@ pub fn dynamic_manifest(
             sw(AGENT_TOOLS_SERVICE_PROXY, true),
             ApprovalPolicy::AutoPolicy,
         ),
+        // 伴跑只读观测：零写路径 GET 面（干预权留管理面，LLM 只可看不可动）；
+        // Standard 免裁决 + AutoPolicy 直通（对齐 audit_query 只读先例）；
+        // 不做开关绑定（只读观测恒可用，server 不可达时调用期 fail-visible）
+        ToolSource::CompanionObserve => (
+            vec![CapDomain::Governance],
+            None,
+            ApprovalPolicy::AutoPolicy,
+        ),
         // G8 接合：MCP 工具缺省 candidate 全审批
         // （ManualDefault——首次调用出 needs_approval 提案过 G8）；白名单直跑
         // 由注册层按 `mcp.servers[].always_allow` 覆写为 AutoPolicy（见
@@ -1008,13 +1019,24 @@ pub fn dynamic_manifest(
             parameters,
         },
         capability_domains: domains,
-        adjudication_class: AdjudicationClass::Sensitive,
+        // 伴跑只读观测 = Standard 免裁决（零写路径 GET 面，对齐 audit_query
+        // 只读先例）；其余动态源维持 Sensitive（意图必报）
+        adjudication_class: if source == ToolSource::CompanionObserve {
+            AdjudicationClass::Standard
+        } else {
+            AdjudicationClass::Sensitive
+        },
         approval_policy,
         default_switch,
         sandbox_scope: SandboxScope::HostSandboxed,
         timeout_class: TimeoutClass::Default,
-        // 动态源（MCP/服务代理）无静态标定：保守 Mutating（缺省不变式）
-        side_effect: EffectClass::Mutating,
+        // 动态源（MCP/服务代理）无静态标定：保守 Mutating（缺省不变式）；
+        // 伴跑只读观测显式标 ReadOnly（纯 GET 零写路径，并行预执行安全）
+        side_effect: if source == ToolSource::CompanionObserve {
+            EffectClass::ReadOnly
+        } else {
+            EffectClass::Mutating
+        },
     })
 }
 
