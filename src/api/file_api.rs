@@ -478,12 +478,8 @@ fn raw_content_type(path: &Path) -> &'static str {
         Some("pdf") => "application/pdf",
         Some("glb") => "model/gltf-binary",
         Some("gltf") => "model/gltf+json",
-        Some("xlsx") => {
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        }
-        Some("docx") => {
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        }
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
     }
