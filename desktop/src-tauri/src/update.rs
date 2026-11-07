@@ -22,7 +22,15 @@ use tauri_plugin_updater::UpdaterExt;
 
 use crate::supervisor::Supervisor;
 
+/// 版本检查超时：latest.json 是 KB 级小请求，30s 足够；超时即放弃本轮
+/// 检查（fail-soft 落 shell.log）。由调用点 [`tokio::time::timeout`] 单独
+/// 施加——插件 builder 的 timeout 语义是 check 与 download 共用一把
+/// reqwest 总请求超时，若把 30s 直接给 builder，数十 MB 级安装包的
+/// 下载在慢速直连下恒超时（下载失败的唯一痕迹只有一行 shell.log）。
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// 下载+安装总超时：安装包数十 MB 级，须容忍慢速直连（GitHub 下载常态
+/// 数分钟到十几分钟）；30 分钟覆盖到 ~30KB/s 持续带宽。
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 fn log_line(paths: &std::path::Path, msg: &str) {
     if let Some(dir) = paths.parent() {
@@ -120,12 +128,25 @@ fn run_inner(app: &AppHandle, sup: &Arc<Supervisor>, manual: bool) -> Result<(),
         }
         sup_for_exit.stop_for_update();
     }));
-    builder = builder.timeout(CHECK_TIMEOUT);
+    // timeout 放开到下载级（见 DOWNLOAD_TIMEOUT 常量注释）；检查侧的 30s
+    // 由下方调用点 tokio::time::timeout 单独包裹恢复
+    builder = builder.timeout(DOWNLOAD_TIMEOUT);
     let updater = builder.build().map_err(|e| format!("init updater: {e}"))?;
 
-    // 检查：None = 无新版（插件内置 semver 比较已拒绝 ≤ 当前版本）
-    let update = tauri::async_runtime::block_on(updater.check())
-        .map_err(|e| format!("check failed: {e}"))?;
+    // 检查：None = 无新版（插件内置 semver 比较已拒绝 ≤ 当前版本）。
+    // CHECK_TIMEOUT 在调用点施加（下载级 builder 超时不反噬检查响应性）
+    let checked = tauri::async_runtime::block_on(async {
+        tokio::time::timeout(CHECK_TIMEOUT, updater.check()).await
+    });
+    let update = match checked {
+        Ok(inner) => inner.map_err(|e| format!("check failed: {e}"))?,
+        Err(_) => {
+            return Err(format!(
+                "check timed out after {}s",
+                CHECK_TIMEOUT.as_secs()
+            ));
+        }
+    };
     let Some(update) = update else {
         log_line(&shell_log, "[update] up-to-date");
         if manual {
@@ -182,6 +203,27 @@ fn run_inner(app: &AppHandle, sup: &Arc<Supervisor>, manual: bool) -> Result<(),
     // 失败恢复托盘 tooltip，报错留痕（壳照常运行）
     set_tray_tooltip(app, "evo-agent");
     result.map_err(|e| format!("download/install failed: {e}"))
+}
+
+#[cfg(test)]
+mod update_timeout_guard_tests {
+    use super::{CHECK_TIMEOUT, DOWNLOAD_TIMEOUT};
+
+    #[test]
+    fn check_timeout_must_stay_below_download_timeout() {
+        // 历史缺陷：30s 总超时同时作用 check 与 download（插件共用一把
+        // reqwest 总请求超时），数十 MB 级安装包在慢速直连下下载恒超时。
+        // 检查侧超时必须在调用点单独包裹且远小于下载侧预算；下载侧预算
+        // 须覆盖慢速直连（<30KB/s 持续带宽 × 15 分钟以上）。
+        assert!(
+            CHECK_TIMEOUT < DOWNLOAD_TIMEOUT,
+            "check timeout must be applied at the call site, below the download budget"
+        );
+        assert!(
+            DOWNLOAD_TIMEOUT.as_secs() >= 15 * 60,
+            "download budget must cover slow direct connections"
+        );
+    }
 }
 
 #[cfg(test)]

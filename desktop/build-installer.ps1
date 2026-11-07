@@ -43,6 +43,7 @@ param(
     [string]$ServerRepo = "",
     [string]$ConsoleRepo = "",
     [string]$InspectorRepo = "",
+    [string]$EvoruleRepo = "",
     [string]$UpdateUrlBase = "",
     [string]$ReleaseNotes = ""
 )
@@ -56,6 +57,10 @@ if (-not $ConsoleRepo) { $ConsoleRepo = Join-Path (Split-Path $repoRoot -Parent)
 # inspector 仓同理（-InspectorRepo，默认同级 evorule-context-inspector）；
 # exe 由此仓构建产物收集，plugin.json 取 server 仓布局面（双源一致，SSOT 布局面）。
 if (-not $InspectorRepo) { $InspectorRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule-context-inspector" }
+# 内核仓（-EvoruleRepo，默认同级 evorule）：inspector 的 Cargo path 依赖
+# （../evorule/{reactor,governance,tcb}）命中其检出=inspector exe 的编译输入，
+# freshness 干净度门与其 SOURCE.md 溯源行共用此路径。
+if (-not $EvoruleRepo) { $EvoruleRepo = Join-Path (Split-Path $repoRoot -Parent) "evorule" }
 
 if (-not $SkipCollect) {
     # 新鲜度门（发版前置红线）:产物须新于源码最后提交(先定稿提交、再 release
@@ -64,7 +69,8 @@ if (-not $SkipCollect) {
     if (-not $SkipFreshness) {
         & powershell -NoProfile -ExecutionPolicy Bypass -File `
             (Join-Path $desktop "scripts\check-build-freshness.ps1") `
-            -RepoRoot $repoRoot -ServerRepo $ServerRepo -ConsoleRepo $ConsoleRepo
+            -RepoRoot $repoRoot -ServerRepo $ServerRepo -ConsoleRepo $ConsoleRepo `
+            -InspectorRepo $InspectorRepo -EvoruleRepo $EvoruleRepo
         if ($LASTEXITCODE -ne 0) {
             throw "build freshness gate failed(见上;先重建再打包,-SkipFreshness 仅限本地调试)"
         }
@@ -167,6 +173,20 @@ if (-not $SkipCollect) {
     # 入口在 SOURCE.md 内嵌组件表列明。
     $version = (Get-Content (Join-Path $srcTauri "tauri.conf.json") -Raw | ConvertFrom-Json).version
     $commitSha = (git -C $repoRoot rev-parse HEAD).Trim()
+    # 内嵌组件构建溯源（§P 禁单换配套的可追溯面）：浮动 main 检出每版摄入的
+    # 上游 commit 必须落在产物声明面里，否则「这一包装的是哪天的 server」
+    # 只能靠 CI run 时间窗倒推。检出缺位/非 git 目录如实标注，不静默。
+    function Repo-Head([string]$repo) {
+        if (-not $repo -or -not (Test-Path $repo)) { return "(not checked out)" }
+        $sha = & git -C $repo rev-parse HEAD 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $sha) { return "(unknown)" }
+        return $sha.Trim()
+    }
+    $serverSha = Repo-Head $ServerRepo
+    $consoleSha = Repo-Head $ConsoleRepo
+    $inspectorSha = Repo-Head $InspectorRepo
+    $evoruleSha = Repo-Head $EvoruleRepo
+    $hashSha = Repo-Head (Join-Path (Split-Path $repoRoot -Parent) "evorule-hash")
     $srcTgz = Join-Path $desktop "target\release\bundle\updater\evo-agent-desktop-$version-source.tar.gz"
     New-Item -ItemType Directory -Force -Path (Split-Path $srcTgz) | Out-Null
     git -C $repoRoot archive --format=tar.gz --prefix="evo-agent-desktop-$version/" -o $srcTgz HEAD
@@ -204,8 +224,13 @@ if (-not $SkipCollect) {
 ## 内嵌组件
 
 - evo-agent（本机智能体外壳）与 sdk：本仓（上表构建 commit）
-- evorule-server 引擎 / evorule-ai-plugin：<https://github.com/evorule/evorule-server>
-- console 用户面板（如随包分发）：<https://github.com/evorule/evorule-console-cloud>
+
+| 组件 | 源码仓库 | 构建 commit（浮动 main 检出 HEAD） |
+|---|---|---|
+| evorule-server 引擎 / ai-plugin / wasm-host / codegraph-bridge | <https://github.com/evorule/evorule-server> | $serverSha |
+| evorule-context-inspector | <https://github.com/evorule/evorule-context-inspector> | $inspectorSha |
+| console 用户面板（如随包分发） | <https://github.com/evorule/evorule-console-cloud> | $consoleSha |
+| inspector 编译依赖检出（编译输入，不直接入包） | <https://github.com/evorule/evorule> · <https://github.com/evorule/evorule-hash> | $evoruleSha · $hashSha |
 
 ## 第三方组件
 
@@ -249,6 +274,10 @@ if ($setup.Name -notmatch '^evo-agent-desktop_(.+)_x64-setup\.exe$') {
     throw "unexpected setup name: $($setup.Name)"
 }
 $version = $Matches[1]
+if (-not $ReleaseNotes) {
+    # 缺省更新说明=一行版本标识（空 notes 会让更新确认弹窗说明段恒空白）
+    $ReleaseNotes = "evo-agent Desktop v$version"
+}
 if (-not $UpdateUrlBase) {
     # 缺省=按本版 tag 的 GitHub Releases permalink（见文件头注释：latest.json
     # 内 url 必须钉本版 tag，更新器入口端点才可用 latest 自动追踪）

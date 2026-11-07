@@ -106,16 +106,19 @@ jobs:
           $tag = "${{ github.ref_name }}" -replace '^evo-agent-desktop-v',''
           $ver = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           Write-Host "tag=evo-agent-desktop-v$tag  tauri.conf.json=$ver"
-          if ($tag -ne $ver) { throw "tag 版本($tag) != tauri.conf.json 版本($ver); 发版前先统一版本面 (RELEASE.md)" }
+          if ($tag -ne $ver) { throw "tag 版本($tag) != tauri.conf.json 版本($ver); 发版前先统一版本面 (desktop/RELEASE.md)" }
           # 版本面一致性:壳 manifest 与 UI 构建期回落源必须与 tauri.conf.json 同版——
-          # 状态栏桌面形态取壳版本,浏览器形态回落 web/package.json,二者都须等于安装版本
+          # 状态栏桌面形态取壳版本,浏览器形态回落 web/package.json,二者都须等于安装版本;
+          # Cargo.lock 是 cargo 构建的真实版本输入(漏 bump 时 CI 仍按旧版构建并重写 lock)
           $cargoVer = ([regex]::Match((Get-Content src-tauri/Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
           $shellPkgVer = (Get-Content package.json -Raw | ConvertFrom-Json).version
           $webPkgVer = (Get-Content ../web/package.json -Raw | ConvertFrom-Json).version
-          Write-Host "src-tauri/Cargo.toml=$cargoVer  desktop/package.json=$shellPkgVer  web/package.json=$webPkgVer"
+          $lockVer = ([regex]::Match((Get-Content Cargo.lock -Raw), 'name = "evo-agent-desktop"\s*\r?\nversion = "([^"]+)"')).Groups[1].Value
+          Write-Host "src-tauri/Cargo.toml=$cargoVer  desktop/package.json=$shellPkgVer  web/package.json=$webPkgVer  desktop/Cargo.lock=$lockVer"
           if ($cargoVer -ne $ver) { throw "src-tauri/Cargo.toml 版本($cargoVer) != tauri.conf.json 版本($ver)" }
           if ($shellPkgVer -ne $ver) { throw "desktop/package.json 版本($shellPkgVer) != tauri.conf.json 版本($ver)" }
           if ($webPkgVer -ne $ver) { throw "web/package.json 版本($webPkgVer) != tauri.conf.json 版本($ver); 工作台版本回落源须与安装版本一致" }
+          if ($lockVer -ne $ver) { throw "desktop/Cargo.lock 版本($lockVer) != tauri.conf.json 版本($ver); bump 后须重新生成 lock 并提交" }
 
       - name: 构建 evorule-server 引擎
         run: cargo build --release --bin evorule-server
@@ -167,27 +170,19 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         shell: pwsh
-        # -SkipFreshness 补偿控制说明：freshness 门的树净检查在本 CI 形态下被证伪——
-        # 检出仓全新来自 git ref，"无版本 bits" 在结构上不存在；实证 2026-10-28 run
-        # 40682520660：status --porcelain 空 + diff --stat 空 + diff --cached 净 +
-        # autocrlf=false + 零错误文本，唯 diff --quiet 幻影判脏且列不出任何文件
-        # （本地同仓同版本全绿）。本地构建仍走全量门，不传此旗标。
+        # freshness 门在 CI 全量生效（2026-11-07 回收 -SkipFreshness 旁路：
+        # 旁路原始理由=autocrlf 行尾幻影，已随步骤 1 全局 autocrlf=false 根治；
+        # 若 CI 复现幻影判脏，构建红 + [freshness-diag] 诊断段会打印 diff/stat
+        # 与行尾配置取证，勿再无证旁路——先取证后裁定）
         run: >
           powershell -NoProfile -ExecutionPolicy Bypass -File build-installer.ps1
           -ServerRepo "${{ github.workspace }}\evorule-server"
           -ConsoleRepo "${{ github.workspace }}\evorule-console-cloud"
-          -SkipFreshness
 
-      - name: 上传发布产物 (人工下载后按 RELEASE.md 上传 Release)
-        uses: actions/upload-artifact@v4
-        with:
-          name: evo-agent-desktop-release
-          path: evo-agent/desktop/target/release/bundle/updater/*
-          if-no-files-found: error
-
-      # 装机冒烟验收（发版面验收机制闸 4 的 CI 化）。NSIS setup.exe 已在 workspace
-      # （upload-artifact 只取 bundle/updater/*，不冲突），直接对本机静默装→
-      # 起壳→五口/服务面/验签全链断言；脚本 try/finally 自清理零遗留。
+      # 装机冒烟验收（发版面验收机制闸 4 的 CI 化）。NSIS setup.exe 已在 workspace，
+      # 直接对本机静默装→起壳→五口/服务面/验签全链断言；脚本 try/finally 自清理
+      # 零遗留。置于 artifact 上传之前：冒烟红 = run 红 = 产物不可取用（冒烟不绿
+      # 不出包，防止红态产物被人工作为发版候选）。
       - name: 装机冒烟验收 (fresh-install smoke)
         shell: pwsh
         working-directory: evo-agent/desktop
@@ -199,7 +194,18 @@ jobs:
           }
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fresh-install-smoke.ps1 -SetupPath $setup.FullName
 
-  # Distribution-compliance gate (reusable workflow, pinned to root-repo commit)
+      - name: 上传发布产物 (人工下载后按 desktop/RELEASE.md 上传 Release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: evo-agent-desktop-release
+          path: evo-agent/desktop/target/release/bundle/updater/*
+          if-no-files-found: error
+
+  # Distribution-compliance gate (reusable workflow, pinned to root-repo commit).
+  # 维护锚（2026-11-07 核验）：a3aa299 = dist-gate.yml 引入提交且该文件此后零演进，
+  # 现为 evorule/main 可达祖先。每次主仓涉及 .github/workflows/dist-gate.yml 的
+  # 变更后须手工重钉本行——钉 SHA 是 reusable workflow 供应链惯例，漂移即
+  # 「not our ref」构建红（dispatch 路径无独立报警，红即知）。
   dist-gate:
     name: dist compliance gate
     permissions:
