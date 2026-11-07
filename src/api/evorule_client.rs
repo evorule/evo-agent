@@ -346,6 +346,35 @@ impl EvoruleApiClient {
         resp.json().await.map_err(|_| ApiError::InvalidResponse)
     }
 
+    /// GET /api/companion/proposals —— 伴跑提案清单只读拉取（LLM 观测面）。
+    ///
+    /// 单向只读：只 GET 清单，不经此面审批/驳回/重试（干预权留管理面）。
+    /// 错误口径同 get_companion_status。
+    pub async fn get_companion_proposals(&self) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/companion/proposals");
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// GET /api/companion/coverage —— 规则集覆盖率快照只读拉取（LLM 观测面）。
+    ///
+    /// 单向只读。错误口径同 get_companion_status。
+    pub async fn get_companion_coverage(&self) -> Result<Value, ApiError> {
+        let url = self.core.url("/api/companion/coverage");
+        let resp = self
+            .core
+            .auth_header(self.core.client().get(&url))
+            .send()
+            .await?;
+        let resp = self.core.check_response_full(resp).await?;
+        resp.json().await.map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// GET /api/sessions/{id}/evolution-signals —— 进化信号只读聚合（自进化）
     ///
     /// 返回 `{session_id, total_violations, signals:[{kind,rule_ref,reason_summary,
