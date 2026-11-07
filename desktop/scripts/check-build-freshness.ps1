@@ -11,7 +11,9 @@
 param(
     [Parameter(Mandatory = $true)] [string]$RepoRoot,
     [Parameter(Mandatory = $true)] [string]$ServerRepo,
-    [string]$ConsoleRepo = ""
+    [string]$ConsoleRepo = "",
+    [string]$InspectorRepo = "",
+    [string]$EvoruleRepo = ""
 )
 
 # 不设 ErrorActionPreference=Stop:PS5.1 下原生命令(git)的 stderr 提示
@@ -69,6 +71,11 @@ function Newest-Under([string]$dir) {
 Assert-Clean "evo-agent" $RepoRoot
 Assert-Clean "evorule-server" $ServerRepo
 if ($ConsoleRepo -and (Test-Path $ConsoleRepo)) { Assert-Clean "console-cloud" $ConsoleRepo }
+# context-inspector（2026-10-31 入包，B-053c）与内核仓（inspector 的 Cargo
+# path 依赖检出=其编译输入）随门覆盖——2026-11-07 补门（此前门清单未跟上
+# 入包面，脏树 inspector exe 可静默过门）
+if ($InspectorRepo -and (Test-Path $InspectorRepo)) { Assert-Clean "context-inspector" $InspectorRepo }
+if ($EvoruleRepo -and (Test-Path $EvoruleRepo)) { Assert-Clean "evorule(kernel)" $EvoruleRepo }
 
 # ② 新鲜度(编译输入路径收窄)
 Assert-Fresh "evo-agent.exe(serve)" `
@@ -83,6 +90,9 @@ Assert-Fresh "evorule-ai-plugin.exe(执行体)" `
 Assert-Fresh "evorule-wasm-host.exe(UDF 宿)" `
     (Join-Path $ServerRepo "plugins\wasm-host\target\release\evorule-wasm-host.exe") `
     (Head-Time $ServerRepo "plugins/wasm-host")
+Assert-Fresh "evorule-context-inspector.exe(会话检视)" `
+    (Join-Path $InspectorRepo "target\release\evorule-context-inspector.exe") `
+    (Head-Time $InspectorRepo @("src", "Cargo.toml", "Cargo.lock"))
 $distNewest = Newest-Under (Join-Path $RepoRoot "web\dist")
 if ($distNewest) {
     Assert-Fresh ("web/dist({0})" -f $distNewest.Name) $distNewest.FullName (Head-Time $RepoRoot "web")
