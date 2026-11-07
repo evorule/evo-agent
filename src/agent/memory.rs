@@ -63,14 +63,24 @@ static PERSIST_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU64 =
 static LAST_PERSIST_FAILURE: std::sync::Mutex<Option<LastPersistFailure>> =
     std::sync::Mutex::new(None);
 
-/// 记一次持久化失败（set_scoped / set_scoped_with_source 的 CacheOnly 路径）
-fn record_persist_failure(class: PersistFailureClass) {
+/// 连续持久化失败的告警升级阈值：恰跨过时 error! 一次（每轮失败回目
+/// 一个响点，不按次刷屏）。更低级别保持逐次 warn 留痕。
+const PERSIST_ESCALATION_THRESHOLD: u64 = 3;
+
+/// 告警升级判定（纯函数便于测试：恰在阈值时 true，越过与未到均 false）
+fn persist_escalation_due(consecutive: u64) -> bool {
+    consecutive == PERSIST_ESCALATION_THRESHOLD
+}
+
+/// 记一次持久化失败（set_scoped / set_scoped_with_source 的 CacheOnly 路径），
+/// 返回自上次成功以来的连续失败次数（供调用方做告警升级判定）
+fn record_persist_failure(class: PersistFailureClass) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     PERSIST_FAILURES_TOTAL.fetch_add(1, Relaxed);
     if class == PersistFailureClass::Forbidden {
         PERSIST_FORBIDDEN_TOTAL.fetch_add(1, Relaxed);
     }
-    PERSIST_CONSECUTIVE_FAILURES.fetch_add(1, Relaxed);
+    let consecutive = PERSIST_CONSECUTIVE_FAILURES.fetch_add(1, Relaxed) + 1;
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -81,6 +91,7 @@ fn record_persist_failure(class: PersistFailureClass) {
             at,
         });
     }
+    consecutive
 }
 
 /// 记一次持久化成功（连续失败计数清零；总数/最近失败保持累计语义）
@@ -1507,13 +1518,22 @@ impl MemoryManager {
         if let Err(e) = &fact_id {
             // 不静默：持久化失败意味着该写入在 evorule 侧不可见，
             // cache 与真相源开始漂移，必须留痕（返回值同时携带 CacheOnly）
-            record_persist_failure(classify_persist_failure(e));
+            let consecutive = record_persist_failure(classify_persist_failure(e));
             tracing::warn!(
                 session_id = %session_id,
                 path = %path,
                 error = %e,
+                consecutive,
                 "memory persist to evorule failed; cache may drift from source of truth"
             );
+            if persist_escalation_due(consecutive) {
+                tracing::error!(
+                    session_id = %session_id,
+                    path = %path,
+                    consecutive,
+                    "memory persist to evorule failing repeatedly; the cache is accumulating drift - poll /admin/memory-health for counters"
+                );
+            }
             return Ok(PersistOutcome::CacheOnly);
         }
         record_persist_success();
@@ -1569,13 +1589,22 @@ impl MemoryManager {
             .update_payload_service(&session_id, &path, &payload_value)
             .await;
         if let Err(e) = &fact_id {
-            record_persist_failure(classify_persist_failure(e));
+            let consecutive = record_persist_failure(classify_persist_failure(e));
             tracing::warn!(
                 session_id = %session_id,
                 path = %path,
                 error = %e,
+                consecutive,
                 "memory persist to evorule failed; cache may drift from source of truth"
             );
+            if persist_escalation_due(consecutive) {
+                tracing::error!(
+                    session_id = %session_id,
+                    path = %path,
+                    consecutive,
+                    "memory persist to evorule failing repeatedly; the cache is accumulating drift - poll /admin/memory-health for counters"
+                );
+            }
             return Ok(PersistOutcome::CacheOnly);
         }
         record_persist_success();
@@ -4997,6 +5026,18 @@ mod tests {
             .expect("non-stable allowed");
         let ck = mgr.cache_key_for(&MemoryScope::Shared, "sessions.s1.summary");
         assert_eq!(mgr.cache.get(&ck).unwrap().source, None);
+    }
+
+    #[test]
+    fn persist_escalation_only_at_threshold_crossing() {
+        // 告警升级恰跨阈值一响:未到与越过均不升级(防按次刷屏);
+        // 升级面=/admin/memory-health 计数器的日志层响点
+        assert!(!persist_escalation_due(0));
+        assert!(!persist_escalation_due(1));
+        assert!(!persist_escalation_due(2));
+        assert!(persist_escalation_due(3));
+        assert!(!persist_escalation_due(4));
+        assert!(!persist_escalation_due(30));
     }
 
     #[tokio::test]
