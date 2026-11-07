@@ -5,10 +5,13 @@
   import { fsEvents, workspaceEpoch } from '../lib/stores.js';
   import { listDir, fetchRaw } from '../lib/api.js';
   import { EventTail } from '../lib/event-tail.js';
+  import { buildProgress } from '../lib/stores.js';
+  import { mergeProgressEvents } from '../lib/progress-events.js';
 
   /** 制作进度实时面板:尾随 <project>/build.progress.ndjson(events/1.0
-   *  NDJSON,engine 构建旁挂)。通道=fs_events 触发 + raw 端点 Range 游标
-   *  增量(零新宿主端点,空闲零轮询);offline/waiting 显态不静默。 */
+   *  NDJSON,engine 构建旁挂)。双通道冗余:v2 WS typed 帧(宿主已解析,
+   *  主通道)+ v1 fs_events 触发 + Range 游标尾随(兜底);按 seq 去重
+   *  使重复投递无害;offline/waiting 显态不静默。 */
 
   const MAX_SHOWN = 50;
 
@@ -86,6 +89,16 @@
     tail.noteFsEvent(paths);
   });
 
+  // v2 typed 帧桥(主通道):宿主已解析的事件按 seq 合并(与尾随通道
+  // 冗余投递因去重无害);帧到达即 following(观察链路活着)
+  const unsubBp = buildProgress.subscribe((frame) => {
+    if (!frame || !tail) return;
+    buildProgress.set(null);
+    if (frame.path !== tail.path) return;
+    tailState = 'following';
+    events = mergeProgressEvents(events, frame.events, MAX_SHOWN);
+  });
+
   // 工作区切换:路径基准重锚,旧尾随作废重新发现
   const unsubEpoch = workspaceEpoch.subscribe((n) => {
     epoch = n;
@@ -108,6 +121,7 @@
     discover();
     return () => {
       unsubFs();
+      unsubBp();
       unsubEpoch();
       if (tail) tail.stop();
     };

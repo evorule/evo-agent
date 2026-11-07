@@ -68,6 +68,60 @@ pub struct FsEventBatch {
     pub moved: Vec<MovedPath>,
 }
 
+/// 进度事件文件名(engine 构建旁挂,与 build/ 平级)
+pub const PROGRESS_FILENAME: &str = "build.progress.ndjson";
+/// 单帧携带的事件条数上限(观察通道,防超长构建撑爆 WS 帧)
+const PROGRESS_FRAME_MAX_EVENTS: usize = 100;
+
+/// 进度事件 typed 帧构造(v2 观察通道):批内任一路径命中进度事件文件
+/// (added/updated/moved.to)→ 全量读盘解析 NDJSON,回传
+/// `{"type":"build_progress","path","total_events","events":[末 N 条]}`。
+/// 无状态设计:进度文件体量小(逐构建事件),全读优于维护游标态;
+/// 观察通道宽容语义——读盘/解析失败一律 None(不推帧),绝不影响
+/// fs_events 主链与任何构建语义。
+pub fn build_progress_frame(
+    workdir: &std::path::Path,
+    batch: &FsEventBatch,
+) -> Option<serde_json::Value> {
+    let mut hit = None;
+    for p in batch.added.iter().chain(batch.updated.iter()) {
+        if p.ends_with(PROGRESS_FILENAME) {
+            hit = Some(p.clone());
+            break;
+        }
+    }
+    if hit.is_none() {
+        for m in &batch.moved {
+            if m.to.ends_with(PROGRESS_FILENAME) {
+                hit = Some(m.to.clone());
+                break;
+            }
+        }
+    }
+    let rel = hit?;
+    let text = std::fs::read_to_string(workdir.join(&rel)).ok()?;
+    let mut events: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            serde_json::from_str(trimmed).ok()
+        })
+        .collect();
+    let total = events.len();
+    if total > PROGRESS_FRAME_MAX_EVENTS {
+        events = events.split_off(total - PROGRESS_FRAME_MAX_EVENTS);
+    }
+    Some(serde_json::json!({
+        "type": "build_progress",
+        "path": rel,
+        "total_events": total,
+        "events": events,
+    }))
+}
+
 impl FsEventBatch {
     /// 空批(不发布)
     pub fn is_empty(&self) -> bool {
@@ -354,6 +408,48 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn build_progress_frame_parses_caps_and_stays_tolerant() {
+        let dir = std::env::temp_dir().join(format!("bp-frame-{}", std::process::id()));
+        let rel = "video_engine/projects/demo/build.progress.ndjson";
+        let full = dir.join(rel);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        let mut body = String::new();
+        for i in 1..=105 {
+            body.push_str(&format!("{{\"seq\":{i}}}\n"));
+        }
+        body.push_str("not json\n");
+        std::fs::write(&full, body).unwrap();
+
+        let batch = FsEventBatch {
+            updated: vec![rel.to_string()],
+            ..Default::default()
+        };
+        let frame = build_progress_frame(&dir, &batch).expect("progress batch must yield a frame");
+        assert_eq!(frame["type"], "build_progress");
+        assert_eq!(frame["path"], rel);
+        // 105 行中 1 行非 JSON 被丢 → 105 条;帧裁剪至末 100 条
+        assert_eq!(frame["total_events"], 105);
+        let evs = frame["events"].as_array().unwrap();
+        assert_eq!(evs.len(), 100);
+        assert_eq!(evs[0]["seq"], 6);
+        assert_eq!(evs[99]["seq"], 105);
+
+        // 非进度批 → None(不推帧)
+        let other = FsEventBatch {
+            updated: vec!["src/main.rs".to_string()],
+            ..Default::default()
+        };
+        assert!(build_progress_frame(&dir, &other).is_none());
+        // 文件缺失 → None(观察语义宽容,不惊扰主链)
+        let ghost = FsEventBatch {
+            updated: vec!["ghost/build.progress.ndjson".to_string()],
+            ..Default::default()
+        };
+        assert!(build_progress_frame(&dir, &ghost).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn wd() -> PathBuf {
         PathBuf::from("/work")
