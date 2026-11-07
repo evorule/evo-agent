@@ -76,6 +76,17 @@ if (-not $SkipCollect) {
         }
     }
 
+    # 服务白名单现场再生成（模板 := 本次构建所用引擎检出的 SSOT）：白名单
+    # 与引擎天然同批（配套 §P 语义）。置于 freshness 门之后——门先验源码
+    # 树纯净，再生成的模板属构建派生件，不入干净度判定面（2026-11-07 发版
+    # 双败实证：静态模板追逐浮动 server main 是竞态输家，检出与对照之间
+    # 的任何上游推送都让漂移闸误伤发版）。
+    & powershell -NoProfile -ExecutionPolicy Bypass -File `
+        (Join-Path $desktop "scripts\sync-service-tools.ps1") -ServerRepo $ServerRepo
+    if ($LASTEXITCODE -ne 0) {
+        throw "service_tools sync failed (SSOT regeneration)"
+    }
+
     $pairs = @(
         @{ Src = (Join-Path $repoRoot "target\release\evo-agent.exe");        Dst = "resources\bin\evo-agent.exe" },
         @{ Src = (Join-Path $ServerRepo "target\release\evorule-server.exe"); Dst = "resources\bin\evorule-server.exe" },

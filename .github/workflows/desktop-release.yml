@@ -164,17 +164,10 @@ jobs:
         working-directory: evo-agent/desktop
         run: npm ci
 
-      # 服务白名单现场再生成（B-191 发版双败实证）：静态模板追逐浮动 server
-      # main 的 SSOT 是竞态输家——检出时刻与对照时刻之间的任何上游推送都会
-      # 让 fail-closed 漂移闸误伤发版。此处对刚检出的引擎树现场 sync，模板 :=
-      # 本次构建引擎的 SSOT，白名单与引擎天然同批（配套 §P 语义）；仓库内
-      # 模板由常规 sync 批跟随刷新，CI 不依赖其现势。
-      - name: 服务白名单现场再生成 (template := checked-out engine SSOT)
-        shell: pwsh
-        working-directory: evo-agent/desktop
-        run: >
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync-service-tools.ps1
-          -ServerRepo "${{ github.workspace }}\evorule-server"
+      # （B-191 第三轮教训：服务白名单的现场再生成放在本 workflow 层会让
+      # regenerated tracked 文件弄脏树、被 freshness 干净度门正确拦截——
+      # 该再生成已移入 build-installer.ps1 内部、置于 freshness 门之后，
+      # 白名单属构建派生件，不进干净度判定面。）
 
       - name: 安装包构建 (freshness 门 + collect + 五件套 + SSOT 校验 + tauri build + 三件套)
         working-directory: evo-agent/desktop
