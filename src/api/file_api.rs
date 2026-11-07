@@ -438,8 +438,10 @@ fn parse_raw_range(raw: Option<&HeaderValue>, total: u64) -> RawRangeOutcome {
     }
 }
 
-/// raw 端点 Content-Type 映射(显式表,不带 charset 后缀——媒体面消费
-/// 精确匹配;未知扩展一律 `application/octet-stream`,浏览器自行嗅探拒判)。
+/// raw 端点 Content-Type 映射(显式表,不用 mime_guess——其结果随 OS 注册表
+/// 漂移且把 .ass 误判音频,违反确定性)。契约:文本类与 json 显式带
+/// `; charset=utf-8`,媒体类(model/video/audio/image)一律不带 charset;
+/// 未知扩展一律 `application/octet-stream`(浏览器自行嗅探拒判)。
 fn raw_content_type(path: &Path) -> &'static str {
     let ext = path
         .extension()
@@ -451,6 +453,7 @@ fn raw_content_type(path: &Path) -> &'static str {
         Some("mov") => "video/quicktime",
         Some("mkv") => "video/x-matroska",
         Some("avi") => "video/x-msvideo",
+        Some("m4a") => "audio/mp4",
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
@@ -462,9 +465,9 @@ fn raw_content_type(path: &Path) -> &'static str {
         Some("wav") => "audio/wav",
         Some("flac") => "audio/flac",
         Some("ogg") => "audio/ogg",
-        Some("txt") => "text/plain",
-        Some("md") => "text/markdown",
-        Some("json") => "application/json",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("md") => "text/markdown; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
         Some("js") | Some("mjs") => "text/javascript",
         Some("css") => "text/css",
         Some("html") | Some("htm") => "text/html",
@@ -473,6 +476,15 @@ fn raw_content_type(path: &Path) -> &'static str {
         Some("srt") => "application/x-subrip",
         Some("vtt") => "text/vtt",
         Some("pdf") => "application/pdf",
+        Some("glb") => "model/gltf-binary",
+        Some("gltf") => "model/gltf+json",
+        Some("xlsx") => {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        }
+        Some("docx") => {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        }
+        Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
     }
 }
@@ -578,7 +590,9 @@ pub async fn raw_file(
 
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, raw_content_type(&canonical))
-        .header(header::ACCEPT_RANGES, "bytes");
+        .header(header::ACCEPT_RANGES, "bytes")
+        // 对齐静态层观察形态:媒体已压缩,再缓存/再编码都会破坏 Range 语义
+        .header(header::CACHE_CONTROL, "no-cache");
     if !etag.is_empty() {
         builder = builder.header(header::ETAG, &etag);
     }
@@ -1236,6 +1250,11 @@ mod tests {
             format!("bytes 0-99/{}", bytes.len()).as_str()
         );
         assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "100");
+        // 对齐静态层观察形态:no-cache(媒体已压缩,缓存副本会破坏 Range 语义)
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
         let body = body_bytes(resp).await;
         assert_eq!(body.len(), 100);
         assert_eq!(body, bytes[..100]);
@@ -1441,7 +1460,8 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
-    /// Content-Type 显式表:.ass/.srt 字幕精确值 + 未知扩展回落
+    /// Content-Type 显式表:.ass/.srt 字幕精确值 + 未知扩展回落 +
+    /// 文本类 charset 契约 + 3D/表格/音频媒体扩展(对齐上游规格 §3)
     #[test]
     fn test_raw_content_type_map() {
         assert_eq!(raw_content_type(Path::new("a.ass")), "text/x-ssa");
@@ -1455,6 +1475,32 @@ mod tests {
             raw_content_type(Path::new("noext")),
             "application/octet-stream"
         );
+        // 文本类与 json 必须显式 charset=utf-8(规格约束行)
+        assert_eq!(
+            raw_content_type(Path::new("n.txt")),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            raw_content_type(Path::new("r.md")),
+            "text/markdown; charset=utf-8"
+        );
+        assert_eq!(
+            raw_content_type(Path::new("x.json")),
+            "application/json; charset=utf-8"
+        );
+        // 媒体类一律不带 charset
+        assert_eq!(raw_content_type(Path::new("v.m4a")), "audio/mp4");
+        assert_eq!(raw_content_type(Path::new("s.glb")), "model/gltf-binary");
+        assert_eq!(raw_content_type(Path::new("s.gltf")), "model/gltf+json");
+        assert_eq!(
+            raw_content_type(Path::new("t.xlsx")),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        assert_eq!(
+            raw_content_type(Path::new("t.docx")),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        );
+        assert_eq!(raw_content_type(Path::new("m.wasm")), "application/wasm");
     }
 
     /// Range 解析单元:畸形回落全量(200)与空文件语义
