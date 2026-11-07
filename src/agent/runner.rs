@@ -6700,6 +6700,15 @@ impl AgentRunner {
     }
 
     async fn execute_tool_request(&self, params: &Value) -> Result<Value, AgentError> {
+        // 引用取回保留名在此同步直拦(与 gated 入口同一语义):流式循环缓存
+        // 未命中臂与并行臂均经管道⑦按名解析到注册 stub,此前恒返回 reserved-
+        // name 指引;指引所称「单独重发」仍走本通路=死循环,取回通路整体
+        // 不可达。只读本地无副作用,不经治理八阶段,审计照常由外层落账;
+        // 真执行器持有 journal_dir 会话态,故仍由 runner 直执行不经 ToolHandler。
+        if params.get("tool_name").and_then(|v| v.as_str()) == Some(TOOL_RESULT_FETCH_TOOL) {
+            let args = params.get("args").cloned().unwrap_or(Value::Null);
+            return Ok(self.execute_tool_result_fetch(&args));
+        }
         // Real call through ToolHandler (60s timeout, tool_not_found detection).
         // Replaces the previous stub that returned a hardcoded "Simulated tool result".
         self.tool_handler
