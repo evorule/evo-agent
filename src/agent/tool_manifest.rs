@@ -491,6 +491,10 @@ fn builtin_manifests() -> Vec<ToolManifest> {
         // 免裁决(纯读),不进 GOVERNANCE_SNAPSHOT
         b("code_search", vec![FsRead]),
         b("shell_exec", vec![Process]),
+        // 工作区构建反馈回路:按需结构化构建诊断(命令固定不可传参=无模型
+        // 可控命令面;但构建执行工作区 build script,审批档与命令族同档
+        // ManualDefault=candidate,人工默认否决点在场;超时 Long=构建类)
+        b("build_check", vec![Process]),
         b("http_get", vec![Network]),
         // 批K 段2:网络面第二件——网页抓取取读(复用 http_get host 分类/
         // SSRF/重定向/负面域全部防线;candidate host 同 http_get 审批语义)
@@ -656,6 +660,13 @@ fn builtin_manifests() -> Vec<ToolManifest> {
             // （执行体 evaluate_proposal 全审批，无 active 名单）
             "shell_exec" | "http_get" | "web_fetch" => {
                 m.approval_policy = ApprovalPolicy::ManualDefault;
+            }
+            // build_check:命令固定但构建执行工作区 build script(模型可先写
+            // build.rs 再触发),审批档与命令族同档 candidate;冷 target 全量
+            // check 留量,超时标 Long(构建类)
+            "build_check" => {
+                m.approval_policy = ApprovalPolicy::ManualDefault;
+                m.timeout_class = TimeoutClass::Long;
             }
             "python_exec" => {
                 m.approval_policy = ApprovalPolicy::ManualDefault;
@@ -1067,9 +1078,10 @@ mod tests {
         //   （写面撤销批 workspace_undo +1：内置 36→37，数量锁 102→103）
         //   （交互批 计划模式 plan_submit +1：内置 37→38，数量锁 103→104）
         //   （取回件 tool_result_fetch +1：内置 38→39，数量锁 104→105）
-        assert_eq!(builtin_manifests().len(), 39);
+        //   （工作区构建反馈回路 build_check +1：内置 39→40，数量锁 105→106）
+        assert_eq!(builtin_manifests().len(), 40);
         assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 105);
+        assert_eq!(all().len(), 106);
     }
 
     #[test]

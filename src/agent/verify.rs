@@ -19,6 +19,14 @@
 //! - 缺省无 `verify` 块 = 门禁不存在(零行为变化,缺省不变式)。
 //! - 短路:多条命令顺序执行,首个含 Error 的命令后停(同族命令后跑无增量)。
 //! - 超时/spawn 失败 = verdict `unknown` 显式回喂(不假装通过、不静默)。
+//! - 判定真值表:matched Error 诊断 > 0 = `fail`;零 Error 且 exit 0 = `pass`;
+//!   其余(非零退出/未知退出码且零诊断) = `unknown`——manifest 级失败、
+//!   非 Rust 工作区跑 cargo 等"命令跑了但判定无法达成"的情形如实回喂,
+//!   不假装通过。
+//! - 增量回流:同命令连续两次 fail 只回喂**新增** Error 行(persisting/
+//!   resolved 计数随附;全量清单可经 `build_check` 工具按需取回),基线在
+//!   pass 时清零(下一波 fail 重新全量列出)。journal 入账始终全量计数,
+//!   增量只作用于回喂呈现面。
 //! - 输出帽:stdout/err 合计 256KB;错误行集 50 条 + truncated 标记。
 //! - 连续 fail 计数达 `max_verdicts_per_turn`(缺省 3)= 显式上抛人审
 //!   (对齐 PolicyReview max_corrections 精神,fail-visible 不再静默循环)。
@@ -133,6 +141,19 @@ struct CommandVerdict {
     output_digest: String,
 }
 
+/// 判定真值表(单一事实源,verify 门禁与 build_check 工具共享):
+/// matched Error 诊断 > 0 → `fail`;零 Error 且 exit 0 → `pass`;
+/// 其余(非零退出/未知退出码且零诊断)→ `unknown`。
+pub(crate) fn classify_verdict(exit_code: Option<i32>, error_count: usize) -> &'static str {
+    if error_count > 0 {
+        "fail"
+    } else if exit_code == Some(0) {
+        "pass"
+    } else {
+        "unknown"
+    }
+}
+
 /// 轮末 verify 执行报告(回喂块 + 入账要素 + 上抛信号)
 #[derive(Debug, Clone)]
 pub struct VerdictReport {
@@ -144,12 +165,15 @@ pub struct VerdictReport {
     pub escalate: bool,
 }
 
-/// 自验证编排器(pending 标志 + 延迟执行 + 短路 + 帽 + 上限)
+/// 自验证编排器(pending 标志 + 延迟执行 + 短路 + 帽 + 上限 + 增量基线)
 pub struct VerifyOrchestrator {
     config: VerifyConfig,
     runner: Arc<dyn CommandRunner>,
     pending: AtomicBool,
     consecutive_fails: AtomicU32,
+    /// 增量回流基线:命令名 → 上次 fail 的 Error 行集(渲染形)。
+    /// fail 时写入、pass 时清除(下一波 fail 重新全量列出)。
+    last_errors: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 impl VerifyOrchestrator {
@@ -160,6 +184,7 @@ impl VerifyOrchestrator {
             runner,
             pending: AtomicBool::new(false),
             consecutive_fails: AtomicU32::new(0),
+            last_errors: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -233,6 +258,25 @@ impl VerifyOrchestrator {
             );
         }
 
+        // 增量回流基线:fail 写入本轮行集(下轮 diff),pass 清零(下波全量)
+        let prev = {
+            let mut map = self
+                .last_errors
+                .lock()
+                .expect("verify baseline mutex poisoned");
+            let prev = map.get(&v.name).cloned();
+            match v.verdict.as_str() {
+                "fail" => {
+                    map.insert(v.name.clone(), v.error_lines.clone());
+                }
+                "pass" => {
+                    map.remove(&v.name);
+                }
+                _ => {}
+            }
+            prev
+        };
+
         // 连续 fail 计数与上抛判定
         let mut escalate = false;
         if v.verdict == "fail" {
@@ -243,29 +287,16 @@ impl VerifyOrchestrator {
         }
 
         Some(VerdictReport {
-            observation: render_observation(&v, passed, escalate),
+            observation: render_observation(&v, passed, escalate, prev.as_deref()),
             verdict: v.verdict.clone(),
             escalate,
         })
     }
 }
 
-/// 单命令判定:输出行经 matcher 解析,Error 级(severity==8)存在性布尔判定
+/// 单命令判定:输出行经 matcher 解析,Error 级(severity==8)存在性布尔判定;
+/// verdict 由 [`classify_verdict`] 真值表统一裁决(含零诊断非零退出→unknown)
 fn build_command_verdict(cmd: &VerifyCommandConfig, out: &CommandOutput) -> CommandVerdict {
-    if out.timed_out || out.exit_code.is_none() {
-        return CommandVerdict {
-            name: cmd.name.clone(),
-            command: cmd.command.clone(),
-            exit_code: out.exit_code,
-            verdict: "unknown".to_string(),
-            error_lines: Vec::new(),
-            errors_truncated: false,
-            error_count: 0,
-            diags_digest: crate::agent::journal::evorule_digest(""),
-            output_digest: crate::agent::journal::evorule_digest(&combined_output(out)),
-        };
-    }
-
     let mut error_lines: Vec<String> = Vec::new();
     let mut error_count = 0usize;
     let mut truncated = false;
@@ -292,7 +323,7 @@ fn build_command_verdict(cmd: &VerifyCommandConfig, out: &CommandOutput) -> Comm
         }
     }
 
-    let verdict = if error_count > 0 { "fail" } else { "pass" };
+    let verdict = classify_verdict(out.exit_code, error_count);
     let diags_text = error_lines.join("\n");
     CommandVerdict {
         name: cmd.name.clone(),
@@ -321,12 +352,24 @@ fn combined_output(out: &CommandOutput) -> String {
     s
 }
 
-/// 回喂块渲染(结构化诊断行集 + 指引;全过=一句话)
-fn render_observation(v: &CommandVerdict, passed: usize, escalate: bool) -> String {
+/// 回喂块渲染(结构化诊断行集 + 指引;全过=一句话;fail 走增量回流)
+/// `prev` = 该命令上一轮 fail 的行集(None=本会话首轮,全量列出)
+fn render_observation(
+    v: &CommandVerdict,
+    passed: usize,
+    escalate: bool,
+    prev: Option<&[String]>,
+) -> String {
     let mut text = String::new();
     match v.verdict.as_str() {
         "pass" => {
             text.push_str(&format!("verify: {passed} command(s) passed"));
+            if let Some(prev) = prev {
+                let resolved = prev.iter().filter(|l| !v.error_lines.contains(l)).count();
+                if resolved > 0 {
+                    text.push_str(&format!("; resolved {resolved} error(s) since last check"));
+                }
+            }
         }
         "fail" => {
             text.push_str(&format!(
@@ -334,29 +377,70 @@ fn render_observation(v: &CommandVerdict, passed: usize, escalate: bool) -> Stri
                 v.command,
                 v.exit_code.unwrap_or(-1)
             ));
-            text.push_str(&format!(
-                "errors: {}{}\n",
-                v.error_count,
-                if v.errors_truncated {
-                    " (truncated: showing first 50)"
+            let fresh: Vec<&String> = match prev {
+                None => v.error_lines.iter().collect(),
+                Some(prev) => v.error_lines.iter().filter(|l| !prev.contains(l)).collect(),
+            };
+            let (persisting, resolved) = match prev {
+                None => (0usize, 0usize),
+                Some(prev) => (
+                    v.error_lines.iter().filter(|l| prev.contains(l)).count(),
+                    prev.iter().filter(|l| !v.error_lines.contains(l)).count(),
+                ),
+            };
+            if prev.is_some() && fresh.is_empty() {
+                // 零新增:计数回喂+指路 build_check 取全量(重复整表回灌是
+                // 上下文预算的主要税源;上一轮清单仍在会话历史里)
+                text.push_str(&format!(
+                    "no new errors since last verification: {} persisting, {} resolved; \
+                     run the build_check tool for the full current list\n",
+                    persisting, resolved
+                ));
+            } else {
+                if prev.is_some() {
+                    text.push_str(&format!(
+                        "new errors: {} (persisting: {}, resolved: {})\n",
+                        fresh.len(),
+                        persisting,
+                        resolved
+                    ));
                 } else {
-                    ""
+                    text.push_str(&format!(
+                        "errors: {}{}\n",
+                        v.error_count,
+                        if v.errors_truncated {
+                            " (truncated: showing first 50)"
+                        } else {
+                            ""
+                        }
+                    ));
                 }
-            ));
-            for l in &v.error_lines {
-                text.push_str(l);
-                text.push('\n');
+                for l in fresh {
+                    text.push_str(l);
+                    text.push('\n');
+                }
             }
             text.push_str(
                 "Fix the errors above; saving the fix will trigger automatic re-verification.",
             );
         }
         _ => {
-            text.push_str(&format!(
-                "verify: UNKNOWN (command '{}' did not complete; timed out or failed to launch). \
-                 Verification could not run — treat this as unverified, not passed.",
-                v.command
-            ));
+            if v.exit_code.is_some() {
+                // 命令完成但零可解析诊断(如非 Rust 工作区跑 cargo):
+                // 一行如实回喂,不假装通过也不刷屏
+                text.push_str(&format!(
+                    "verify: unverified (command '{}' exited non-zero with no parseable \
+                     diagnostics — the workspace may not match this checker); \
+                     treat the change as unverified.",
+                    v.command
+                ));
+            } else {
+                text.push_str(&format!(
+                    "verify: UNKNOWN (command '{}' did not complete; timed out or failed to launch). \
+                     Verification could not run — treat this as unverified, not passed.",
+                    v.command
+                ));
+            }
         }
     }
     if escalate {
@@ -710,5 +794,119 @@ mod tests {
         assert_eq!(v.verdict, "fail");
         assert_eq!(v.error_count, 1);
         assert!(v.error_lines[0].starts_with("web/src/main.ts:3:7 error[TS2322]"));
+    }
+
+    #[tokio::test]
+    async fn zero_matched_errors_nonzero_exit_is_unknown() {
+        // cargo 在非 Rust 工作区/manifest 级失败:非零退出+零可解析诊断
+        // = unknown(不假装通过),回喂一行 unverified 短文案
+        let orch = VerifyOrchestrator::new(
+            config(vec![("c", "cargo check", "$rustc")]),
+            Arc::new(StubRunner::new(vec![Ok(CommandOutput {
+                exit_code: Some(101),
+                stdout: "error: could not find `Cargo.toml` in `D:/docs`".to_string(),
+                stderr: String::new(),
+                timed_out: false,
+            })])),
+        );
+        orch.note_write_success();
+        let report = orch.run_pending(None).await.unwrap();
+        assert_eq!(report.verdict, "unknown");
+        assert!(report.observation.contains("no parseable diagnostics"));
+        assert!(!report.escalate);
+    }
+
+    #[tokio::test]
+    async fn incremental_fail_lists_only_new_errors_after_baseline() {
+        let orch = VerifyOrchestrator::new(
+            config(vec![("c", "cargo check", "$rustc")]),
+            Arc::new(StubRunner::new(vec![
+                ok_output("src/a.rs:1:1: error[E0308]: boom\nsrc/b.rs:2:1: error[E0499]: bar"),
+                ok_output("src/a.rs:1:1: error[E0308]: boom"), // b 已修,a 仍在
+            ])),
+        );
+        orch.note_write_success();
+        let first = orch.run_pending(None).await.unwrap();
+        assert!(first.observation.contains("errors: 2"));
+        assert!(first.observation.contains("src/a.rs:1:1"));
+        assert!(first.observation.contains("src/b.rs:2:1"));
+
+        orch.note_write_success();
+        let second = orch.run_pending(None).await.unwrap();
+        assert_eq!(second.verdict, "fail");
+        // 只列新增(本轮为零),persisting/resolved 计数随附
+        assert!(second
+            .observation
+            .contains("no new errors since last verification"));
+        assert!(second.observation.contains("1 persisting, 1 resolved"));
+        assert!(second.observation.contains("build_check"));
+        assert!(!second.observation.contains("src/a.rs:1:1 error"));
+    }
+
+    #[tokio::test]
+    async fn incremental_fail_lists_new_errors_with_counts() {
+        let orch = VerifyOrchestrator::new(
+            config(vec![("c", "cargo check", "$rustc")]),
+            Arc::new(StubRunner::new(vec![
+                ok_output("src/a.rs:1:1: error[E0308]: boom"),
+                ok_output("src/a.rs:1:1: error[E0308]: boom\nsrc/c.rs:5:1: error[E0382]: new one"),
+            ])),
+        );
+        orch.note_write_success();
+        assert!(orch.run_pending(None).await.unwrap().verdict == "fail");
+        orch.note_write_success();
+        let second = orch.run_pending(None).await.unwrap();
+        assert!(second
+            .observation
+            .contains("new errors: 1 (persisting: 1, resolved: 0)"));
+        assert!(second.observation.contains("src/c.rs:5:1 error[E0382]"));
+        assert!(!second
+            .observation
+            .contains("new errors: 1 (persisting: 1, resolved: 0)\nsrc/a.rs"));
+    }
+
+    #[tokio::test]
+    async fn pass_clears_baseline_next_fail_is_full_list() {
+        let orch = VerifyOrchestrator::new(
+            config(vec![("c", "cargo check", "$rustc")]),
+            Arc::new(StubRunner::new(vec![
+                ok_output("src/a.rs:1:1: error[E0308]: boom"),
+                ok_output("all good"),
+                ok_output("src/a.rs:1:1: error[E0308]: boom"),
+            ])),
+        );
+        orch.note_write_success();
+        assert_eq!(orch.run_pending(None).await.unwrap().verdict, "fail");
+        orch.note_write_success();
+        let pass_report = orch.run_pending(None).await.unwrap();
+        assert_eq!(pass_report.verdict, "pass");
+        // pass 回喂带 resolved 计数
+        assert!(pass_report.observation.contains("resolved 1 error(s)"));
+        orch.note_write_success();
+        // 基线已清零:同一条错误重新全量列出(非增量)
+        let third = orch.run_pending(None).await.unwrap();
+        assert!(third.observation.contains("errors: 1"));
+        assert!(third.observation.contains("src/a.rs:1:1"));
+    }
+
+    #[tokio::test]
+    async fn unknown_never_escalates_and_nonzero_without_diags_counts_no_fail() {
+        // unknown 既不计 fail 连击也不清零——非 Rust 工作区的反复写不触上抛
+        let out = Ok(CommandOutput {
+            exit_code: Some(1),
+            stdout: "'cargo' is not recognized as an internal or external command".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        });
+        let orch = VerifyOrchestrator::new(
+            config(vec![("c", "cargo check", "$rustc")]),
+            Arc::new(StubRunner::new((0..5).map(|_| out.clone()).collect())),
+        );
+        for _ in 0..5 {
+            orch.note_write_success();
+            let r = orch.run_pending(None).await.unwrap();
+            assert_eq!(r.verdict, "unknown");
+            assert!(!r.escalate);
+        }
     }
 }

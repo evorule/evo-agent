@@ -30,6 +30,7 @@
     "diff_runs",
     "tool_result_fetch",
     "shell_exec",
+    "build_check",
     "http_get",
     "ask_user",
     "python_exec",
@@ -97,5 +98,15 @@
     "enable_event_extraction": true,
     "summary_model": "MiniMax-M3",
     "lex_store": "data/lex/general.db"
+  },
+  "verify": {
+    "commands": [
+      {
+        "name": "cargo-check",
+        "command": "cargo check --message-format=short",
+        "matcher": "$rustc",
+        "timeout_secs": 120
+      }
+    ]
   }
 }
