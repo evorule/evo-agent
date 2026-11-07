@@ -127,6 +127,9 @@ pub enum JournalEvent {
         tokens_est: Option<u64>,
         /// 本轮送入 LLM 的消息数
         request: usize,
+        /// 实际采样温度(同 input 参数逐调用真值;None=未记录/旧文件兼容)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        temperature: Option<f64>,
         /// assistant 全文摘要(截 200 字符)
         response: String,
     },
@@ -1324,6 +1327,7 @@ impl JournalWriter {
     }
 
     /// llm_called(主循环 react 用途;provider token 真值优先,tokens_est 兜底)
+    #[allow(clippy::too_many_arguments)] // 落账事件字段平铺,拆参反损可读性
     pub fn llm_called_react(
         &self,
         model: &str,
@@ -1332,6 +1336,7 @@ impl JournalWriter {
         tokens_est: Option<u64>,
         request_messages: usize,
         response_content: &str,
+        temperature: Option<f64>,
     ) -> Result<u64, JournalError> {
         self.llm_called(
             model,
@@ -1340,6 +1345,7 @@ impl JournalWriter {
             tokens,
             tokens_est,
             request_messages,
+            temperature,
             response_content,
         )
     }
@@ -1355,6 +1361,7 @@ impl JournalWriter {
         tokens: Option<TokenRecord>,
         tokens_est: Option<u64>,
         request_messages: usize,
+        temperature: Option<f64>,
         response_content: &str,
     ) -> Result<u64, JournalError> {
         self.push(JournalEvent::LlmCalled {
@@ -1364,6 +1371,7 @@ impl JournalWriter {
             tokens,
             tokens_est,
             request: request_messages,
+            temperature,
             response: truncate_text(response_content, 200),
         })
     }
@@ -3198,6 +3206,7 @@ mod tests {
                 }),
                 tokens_est: Some(160),
                 request: 7,
+                temperature: None,
                 response: "assistant 全文摘要".into(),
             },
             JE::ToolInvoked {
@@ -3284,6 +3293,39 @@ mod tests {
             assert_eq!(parsed.seq, i as u64 + 1);
             assert_eq!(parsed.ts, 1000 + i as u64);
             assert_eq!(&parsed.event, ev, "roundtrip mismatch at variant {i}");
+        }
+    }
+
+    #[test]
+    fn llm_called_temperature_legacy_line_compat() {
+        // 运行元数据锚兼容面:旧 journal 行(无 temperature 字段)→ 反序列化
+        // 成功且 None=未记录;新形态真值 roundtrip 保真(跨版本读回不断)
+        let legacy_line = r#"{"seq":1,"ts":1000,"type":"llm_called","payload":{"model":"glm-5.3","purpose":"react","evorule_request_id":42,"tokens":null,"tokens_est":160,"request":7,"response":"legacy"}}"#;
+        let parsed = decode_line(legacy_line).unwrap();
+        match parsed.event {
+            JE::LlmCalled { temperature, .. } => {
+                assert!(temperature.is_none(), "旧行无 temperature → None=未记录");
+            }
+            other => panic!("expected LlmCalled, got {other:?}"),
+        }
+
+        let new_ev = JE::LlmCalled {
+            model: "glm-5.3".into(),
+            purpose: "react".into(),
+            evorule_request_id: Some(42),
+            tokens: None,
+            tokens_est: Some(160),
+            request: 7,
+            temperature: Some(0.2),
+            response: "new".into(),
+        };
+        let line = encode_line(1, 1000, &new_ev).unwrap();
+        let parsed = decode_line(&line).unwrap();
+        match parsed.event {
+            JE::LlmCalled { temperature, .. } => {
+                assert_eq!(temperature, Some(0.2), "新形态真值落账保真");
+            }
+            other => panic!("expected LlmCalled, got {other:?}"),
         }
     }
 
@@ -3574,7 +3616,7 @@ mod tests {
         let _guard = w.begin_turn("g").unwrap();
         w.delegate_spawned("c1", "planner", 1, &evorule_digest("t1"), None)
             .unwrap();
-        w.llm_called_react("m", None, None, Some(10), 2, "resp")
+        w.llm_called_react("m", None, None, Some(10), 2, "resp", None)
             .unwrap();
         w.delegate_spawned("c2", "worker", 1, &evorule_digest("t2"), None)
             .unwrap();
@@ -3611,7 +3653,7 @@ mod tests {
         {
             let w = JournalWriter::open(dir.path(), "s-rewind-full").unwrap();
             let g = w.begin_turn("g").unwrap();
-            w.llm_called_react("m", None, None, Some(10), 1, "resp")
+            w.llm_called_react("m", None, None, Some(10), 1, "resp", None)
                 .unwrap();
             g.end("success", 1, 10);
         }
@@ -3648,7 +3690,7 @@ mod tests {
             let w = JournalWriter::open(dir.path(), "s-rewind-progress").unwrap();
             w.rewind_budget_consumed(2).unwrap();
             let g = w.begin_turn("g").unwrap();
-            w.llm_called_react("m", None, None, Some(10), 1, "resp")
+            w.llm_called_react("m", None, None, Some(10), 1, "resp", None)
                 .unwrap();
             g.end("success", 1, 10);
         }
@@ -3663,7 +3705,7 @@ mod tests {
         {
             let w = JournalWriter::open(dir.path(), "s-runaway-zero").unwrap();
             let g = w.begin_turn("g").unwrap();
-            w.llm_called_react("m", None, None, Some(10), 1, "resp")
+            w.llm_called_react("m", None, None, Some(10), 1, "resp", None)
                 .unwrap();
             g.end("success", 1, 10);
         }

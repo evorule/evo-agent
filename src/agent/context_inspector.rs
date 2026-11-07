@@ -356,6 +356,7 @@ where
                                 tokens,
                                 None,
                                 1,
+                                None,
                                 &truncate_chars(&content, 200),
                             );
                         }

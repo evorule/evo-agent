@@ -1497,6 +1497,8 @@ fn test_agent_event_all_variants() {
         session_id: "s1".to_string(),
         memory_enabled: false,
         constitution: None,
+        model: None,
+        temperature: None,
     };
     assert!(matches!(e, AgentEvent::SessionCreated { session_id, .. } if session_id == "s1"));
 
