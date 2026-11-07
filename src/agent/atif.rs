@@ -1413,6 +1413,7 @@ mod tests {
             tokens: tok(520, 80),
             tokens_est: None,
             request: 3,
+            temperature: None,
             response: "我去查".into(),
         });
         let t3 = j.push(JE::ToolInvoked {
@@ -1436,6 +1437,7 @@ mod tests {
             tokens: tok(600, 44),
             tokens_est: None,
             request: 6,
+            temperature: None,
             response: "答案是".into(),
         });
         j.push(JE::TurnEnded {
@@ -1554,6 +1556,7 @@ mod tests {
             tokens: None,
             tokens_est: Some(100),
             request: 3,
+            temperature: None,
             response: "读一下".into(),
         });
         j.push(JE::ToolInvoked {
@@ -1656,6 +1659,7 @@ mod tests {
             tokens: tok(100, 10),
             tokens_est: None,
             request: 2,
+            temperature: None,
             response: "第一轮:去列表".into(),
         });
         j.push(JE::ToolInvoked {
@@ -1678,6 +1682,7 @@ mod tests {
             tokens: tok(120, 8),
             tokens_est: None,
             request: 4,
+            temperature: None,
             response: "完成".into(),
         });
         j.push(JE::TurnEnded {
@@ -1735,6 +1740,7 @@ mod tests {
             tokens: tok(10, 5),
             tokens_est: None,
             request: 2,
+            temperature: None,
             response: "r".into(),
         });
         // sidecar 调用不映射为步
@@ -1745,6 +1751,7 @@ mod tests {
             tokens: tok(51_044, 512),
             tokens_est: None,
             request: 40,
+            temperature: None,
             response: "summary".into(),
         });
         j.push(JE::PolicyJudged {
@@ -1793,6 +1800,7 @@ mod tests {
             tokens: tok(1, 1),
             tokens_est: None,
             request: 2,
+            temperature: None,
             response: "r".into(),
         });
         j.push(JE::CompactionPerformed {
@@ -1969,6 +1977,7 @@ mod tests {
             tokens: tok(1, 1),
             tokens_est: None,
             request: 2,
+            temperature: None,
             response: "r".into(),
         });
         // 调用后无 tool_result(崩溃/截断场景)
@@ -2023,6 +2032,7 @@ mod tests {
             tokens: tok(1, 1),
             tokens_est: None,
             request: 2,
+            temperature: None,
             response: "r".into(),
         });
         j.push(JE::TurnEnded {
@@ -2071,6 +2081,7 @@ mod tests {
             tokens: tok(1, 1),
             tokens_est: None,
             request: 2,
+            temperature: None,
             response: "a1".into(),
         });
         j.push(JE::TurnEnded {
@@ -2097,6 +2108,7 @@ mod tests {
             tokens: tok(1, 1),
             tokens_est: None,
             request: 4,
+            temperature: None,
             response: "a2".into(),
         });
         j.push(JE::TurnEnded {
@@ -2155,6 +2167,7 @@ mod tests {
             tokens: tok(1, 1),
             tokens_est: None,
             request: 2,
+            temperature: None,
             response: "r".into(),
         });
         j.push(JE::ToolRetried {
@@ -2195,6 +2208,7 @@ mod tests {
             tokens: tok(1, 1),
             tokens_est: None,
             request: 2,
+            temperature: None,
             response: "r".into(),
         });
         j.push(JE::ToolInvoked {
@@ -2262,6 +2276,7 @@ mod tests {
             tokens: tok(5, 5),
             tokens_est: None,
             request: 2,
+            temperature: None,
             response: "r".into(),
         });
         j.push(JE::TurnEnded {

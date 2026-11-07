@@ -171,7 +171,8 @@ mod tests {
                 completion: 0,
                 total: t,
             });
-            w.llm_called_react("m", None, tokens, *est, 3, "r").unwrap();
+            w.llm_called_react("m", None, tokens, *est, 3, "r", None)
+                .unwrap();
         }
     }
 

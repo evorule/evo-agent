@@ -417,6 +417,8 @@ mod tests {
             session_id: "s1".to_string(),
             memory_enabled: false,
             constitution: None,
+            model: None,
+            temperature: None,
         };
         chain.dispatch(&event).await;
 
@@ -436,6 +438,8 @@ mod tests {
                 session_id: "s1".to_string(),
                 memory_enabled: false,
                 constitution: None,
+                model: None,
+                temperature: None,
             })
             .await;
         chain.dispatch(&AgentEvent::Step { step: 1 }).await;
@@ -458,6 +462,8 @@ mod tests {
             session_id: "s1".to_string(),
             memory_enabled: false,
             constitution: None,
+            model: None,
+            temperature: None,
         };
         // Should not panic
         chain.dispatch(&event).await;
@@ -511,6 +517,8 @@ mod tests {
             session_id: "s1".to_string(),
             memory_enabled: false,
             constitution: None,
+            model: None,
+            temperature: None,
         };
         // Should not panic
         chain.dispatch(&event).await;
@@ -530,6 +538,8 @@ mod tests {
                 session_id: "s1".to_string(),
                 memory_enabled: false,
                 constitution: None,
+                model: None,
+                temperature: None,
             },
             AgentEvent::Step { step: 1 },
             AgentEvent::LlmDelta {
@@ -587,6 +597,8 @@ mod tests {
             session_id: "s1".to_string(),
             memory_enabled: false,
             constitution: None,
+            model: None,
+            temperature: None,
         })
         .await;
         cb.on_event(&AgentEvent::Step { step: 1 }).await;

@@ -2659,14 +2659,27 @@ fn agent_event_to_sse(event: Result<AgentEvent, AgentError>) -> Result<Event, In
             session_id,
             memory_enabled,
             constitution,
-        }) => Event::default().event("session_created").data(
-            serde_json::json!({
+            model,
+            temperature,
+        }) => {
+            // 运行元数据锚:model/temperature 无值时省略字段,与旧流字节兼容
+            let mut v = serde_json::json!({
                 "session_id": session_id,
                 "memory_enabled": memory_enabled,
                 "constitution": constitution,
-            })
-            .to_string(),
-        ),
+            });
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(m) = model {
+                    obj.insert("model".to_string(), serde_json::Value::String(m));
+                }
+                if let Some(t) = temperature {
+                    obj.insert("temperature".to_string(), serde_json::json!(t));
+                }
+            }
+            Event::default()
+                .event("session_created")
+                .data(v.to_string())
+        }
         Ok(AgentEvent::Step { step }) => Event::default()
             .event("step")
             .data(serde_json::json!({ "step": step }).to_string()),
@@ -4672,7 +4685,15 @@ mod tests {
         let writer = JournalWriter::open(&sessions, "atif-e2e").unwrap();
         let _guard = writer.begin_turn("查询股价").unwrap();
         writer
-            .llm_called_react("test-model", Some(100), None, Some(1000), 3, "调用工具查价")
+            .llm_called_react(
+                "test-model",
+                Some(100),
+                None,
+                Some(1000),
+                3,
+                "调用工具查价",
+                None,
+            )
             .unwrap();
         let call_id = writer
             .tool_invoked(
@@ -5408,6 +5429,8 @@ mod tests {
                 session_id: "sess-run-1".to_string(),
                 memory_enabled: false,
                 constitution: None,
+                model: None,
+                temperature: None,
             }),
             Ok(AgentEvent::Done(AgentResult::success(
                 "ok".to_string(),
@@ -5563,12 +5586,17 @@ mod tests {
             session_id: "s-123".to_string(),
             memory_enabled: false,
             constitution: Some("pass@2".to_string()),
+            model: Some("MiniMax-M3".to_string()),
+            temperature: Some(0.2),
         }))
         .unwrap();
         let s = format!("{:?}", ev);
         assert!(s.contains("session_created"));
         assert!(s.contains("s-123"));
         assert!(s.contains("memory_enabled"));
+        // 运行元数据锚入帧:漂移/回归实测按 model×temperature 分桶凭据
+        assert!(s.contains("MiniMax-M3"));
+        assert!(s.contains("0.2"));
     }
 
     #[test]

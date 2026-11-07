@@ -910,6 +910,11 @@ pub enum AgentEvent {
         /// 宪法审查结论(过审凭据 "pass@<规则集版本>";违反定义在加载期
         /// fail-fast 不会到达会话建立,故运行期恒为过审值;None=旧版兼容)
         constitution: Option<String>,
+        /// 运行模型标识(跨批对比锚:漂移/回归实测按模型分桶的凭据;
+        /// None=旧事件流兼容形态;序列化走手动映射,无值时省略字段)
+        model: Option<String>,
+        /// 采样温度(同上;None=未记录)
+        temperature: Option<f64>,
     },
     /// 进入第 N 步
     Step {
@@ -7837,6 +7842,10 @@ impl AgentRunner {
                                    constitution: Some(
                                        crate::agent::definition::AgentDefinition::constitution_pass_mark(),
                                    ),
+                                   // 运行元数据锚:同输入不同温度不可复现,跨批对比
+                                   // 必须按 model×temperature 分桶(观测面缺陷修复)
+                                   model: Some(runner.config.model.clone()),
+                                   temperature: Some(runner.config.temperature as f64),
                                });
 
                                // 3. auto_recall(best-effort,不阻塞流)
@@ -8921,6 +8930,7 @@ impl AgentRunner {
                                                        Some(tokens_est),
                                                        messages_to_send.len(),
                                                        &full_content,
+                                                       Some(react_temperature),
                                                    ) {
                                                        warn!(%session_id, error = %e, "B21: llm_called journal failed");
                                                    }

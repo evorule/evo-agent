@@ -2132,6 +2132,7 @@ mod tests {
                     tokens: None,
                     tokens_est: Some(100),
                     request: 3,
+                    temperature: None,
                     response: "r".into(),
                 },
                 hashes: None,

@@ -1163,12 +1163,26 @@ pub fn agent_event_to_json(event: Result<AgentEvent, AgentError>) -> serde_json:
             session_id,
             memory_enabled,
             constitution,
-        }) => serde_json::json!({
-            "type": "SessionCreated",
-            "session_id": session_id,
-            "memory_enabled": memory_enabled,
-            "constitution": constitution,
-        }),
+            model,
+            temperature,
+        }) => {
+            // 运行元数据锚:model/temperature 无值时省略字段,与旧流字节兼容
+            let mut v = serde_json::json!({
+                "type": "SessionCreated",
+                "session_id": session_id,
+                "memory_enabled": memory_enabled,
+                "constitution": constitution,
+            });
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(m) = model {
+                    obj.insert("model".to_string(), serde_json::Value::String(m));
+                }
+                if let Some(t) = temperature {
+                    obj.insert("temperature".to_string(), serde_json::json!(t));
+                }
+            }
+            v
+        }
         Ok(AgentEvent::Step { step }) => serde_json::json!({
             "type": "Step",
             "step": step,
@@ -1633,11 +1647,34 @@ mod tests {
             session_id: "s-42".to_string(),
             memory_enabled: true,
             constitution: Some("pass@2".to_string()),
+            model: Some("MiniMax-M3".to_string()),
+            temperature: Some(0.2),
         }));
         assert_eq!(v["type"], "SessionCreated");
         assert_eq!(v["session_id"], "s-42");
         assert_eq!(v["memory_enabled"], true);
         assert_eq!(v["constitution"], "pass@2", "审查结论入站外面");
+        // 运行元数据锚入帧:漂移/回归实测按 model×temperature 分桶凭据
+        assert_eq!(v["model"], "MiniMax-M3");
+        assert_eq!(v["temperature"], 0.2);
+    }
+
+    #[test]
+    fn test_event_to_json_session_created_legacy_shape() {
+        // 旧事件流兼容形态:model/temperature 无值时省略字段(帧字节与旧版一致)
+        let v = agent_event_to_json(Ok(AgentEvent::SessionCreated {
+            session_id: "s-42".to_string(),
+            memory_enabled: true,
+            constitution: Some("pass@2".to_string()),
+            model: None,
+            temperature: None,
+        }));
+        assert_eq!(v["type"], "SessionCreated");
+        assert!(v.get("model").is_none(), "None 时不得出现 model 键");
+        assert!(
+            v.get("temperature").is_none(),
+            "None 时不得出现 temperature 键"
+        );
     }
 
     #[test]
@@ -1749,6 +1786,8 @@ mod tests {
                 session_id: "s-iso".to_string(),
                 memory_enabled: true,
                 constitution: Some("pass@2".to_string()),
+                model: None,
+                temperature: None,
             }),
             Ok(AgentEvent::Step { step: 1 }),
             Ok(AgentEvent::LlmDelta {
