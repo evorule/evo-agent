@@ -6539,6 +6539,46 @@ fn tool_result_fetch_reads_window_and_rejects_bad_refs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn tool_result_fetch_reaches_real_executor_via_service_pipeline() {
+    // 流式循环缓存未命中臂与并行臂经管道⑦按名解析到注册 stub,此前恒返回
+    // reserved-name 指引;而指引所称「单独重发走直拦」在同通路并不成立
+    // (重发仍走管道),取回通路整体不可达。修复=服务管道通路与 gated 入口
+    // 同语义:保留名在此路由到真执行器(持有 journal_dir 会话态)。
+    let dir = gate_temp_dir("fetch-pipeline");
+    let runner = gate_test_runner(&dir);
+    let tr = dir.join("tool_results");
+    std::fs::create_dir_all(&tr).unwrap();
+    let body = "0123456789".repeat(30);
+    std::fs::write(tr.join("call1-123.txt"), &body).unwrap();
+    // 与流式/并行管道⑦同一入口(call_service),非 gated 直拦路径
+    let v = runner
+        .execute_tool_request(&serde_json::json!({
+            "tool_name": "tool_result_fetch",
+            "args": {"ref_id": "call1-123", "offset": 10u64, "max_chars": 5u64}
+        }))
+        .await
+        .expect("pipeline-path fetch must not error");
+    assert_eq!(
+        v["content"], "01234",
+        "service-pipeline path must return the real content window, not the reserved-name stub rejection"
+    );
+    assert!(v.get("error").is_none(), "unexpected error: {v}");
+    // 非法 ref 同通路走真执行器的 fail-closed(非 stub 文案)
+    let v = runner
+        .execute_tool_request(&serde_json::json!({
+            "tool_name": "tool_result_fetch",
+            "args": {"ref_id": "../../evil"}
+        }))
+        .await
+        .unwrap();
+    assert!(
+        v["error"].as_str().unwrap().contains("invalid"),
+        "invalid ref must hit the real executor's fail-closed, got: {v}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 心跳弃轮必须终结会话内在途的悬挂 io_request:
 /// 引擎反应器对 pending io 门控(新命令只入队不执行),弃轮若不
 /// 收敛悬挂请求,后续每一轮都会以同样的心跳死法循环。
