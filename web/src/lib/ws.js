@@ -25,6 +25,7 @@ import {
   clearArtifacts,
   openFile,
   fsEvents,
+  buildProgress,
   refreshGitStatus,
   govS4Notify,
   workspaceEpoch,
@@ -670,6 +671,11 @@ function handleFrame(f) {
       // 触发防抖刷新(B3;800ms 合并突发事件)
       fsEvents.set(f.events || { added: [], updated: [], removed: [], moved: [] });
       refreshGitStatus(800);
+      break;
+    case 'build_progress':
+      // v2 typed 观察帧:宿主已解析好的进度事件(相对 workdir 路径);
+      // 制作进度面板订阅合并,一次性信号(契约同 fsEvents)
+      buildProgress.set({ path: f.path || '', events: f.events || [], total: f.total_events || 0 });
       break;
     case 'ApprovalRequired': {
       // 治理叠加:审批决策走既有 G8 /approve 通道。会话记忆/工作区放行清单

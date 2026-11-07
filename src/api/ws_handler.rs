@@ -605,6 +605,17 @@ async fn handle_ws(
                                    warn!("G16: failed to send fs_events frame, client may have disconnected");
                                    break;
                                }
+                               // v2 typed 观察通道:批内命中进度事件文件 → 追加
+                               // 结构化 build_progress 帧(全量解析;观察语义宽容
+                               // ——None 即不推,绝不影响 fs_events 主链)
+                               if let Some(frame) =
+                                   crate::api::fs_watch::build_progress_frame(state.workdir(), &batch)
+                               {
+                                   if send_ws_json(&mut sender, frame).await.is_err() {
+                                       warn!("failed to send build_progress frame, client may have disconnected");
+                                       break;
+                                   }
+                               }
                            }
                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                // 设计取舍:不补发——跳过落后量,前端手动刷新兜底

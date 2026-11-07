@@ -334,6 +334,11 @@ export function closeTab(path) {
  *  {added:[], updated:[], removed:[], moved:[{from,to}]}(相对 workdir 路径) */
 export const fsEvents = writable(null);
 
+/** 制作进度 typed 帧(ws build_progress 帧投影;制作进度面板订阅合并)。
+ *  值被消费后由订阅方置 null(一次性信号,契约同 fsEvents),形如
+ *  {path, events:[events/1.0], total}(宿主已解析,相对 workdir 路径) */
+export const buildProgress = writable(null);
+
 /** H2 文件树定位信号(面包屑/命令共用):{path}(相对 workdir 的文件或目录)。
  *  消费方 Explorer:切到文件树视图 + 逐级展开祖先 + 滚动定位+闪烁;消费即清 */
 export const pendingTreeReveal = writable(null);
