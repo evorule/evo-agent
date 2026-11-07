@@ -50,7 +50,7 @@
 use serde_json::{json, Value};
 
 use crate::agent::delegate::DelegateContext;
-use crate::agent::journal::{read_all_tolerant, JournalWriter};
+use crate::agent::journal::{read_all_tolerant, JournalWriter, OpenMode, SessionIdentity};
 use crate::agent::materializer::materialize_plan_fact;
 use crate::agent::replan::{
     lookup_agent_type, lookup_node_atomic, parse_failed_node_id, should_replan, BudgetCounters,
@@ -670,7 +670,21 @@ pub async fn run_plan_loop_with_resume(
                     Some(sid) => sid.clone(),
                     None => WorkflowEngine::new_run_session_id(&initial_id),
                 };
-                let writer = JournalWriter::open(&dir, &sid)
+                // B-172 分流:恢复路径(run_session_id 在场)=Resume 续写同会话;
+                // 全新 run=New 开新档(撞号 fail-fast+身份锚)
+                let (mode, identity) = if run_session_id.is_some() {
+                    (OpenMode::Resume, SessionIdentity::default())
+                } else {
+                    (
+                        OpenMode::New,
+                        SessionIdentity {
+                            agent: Some("plan-execute".to_string()),
+                            model: None,
+                            temperature: None,
+                        },
+                    )
+                };
+                let writer = JournalWriter::open_with_mode(&dir, &sid, mode, identity)
                     .map_err(|e| format!("run ledger open failed (session '{sid}'): {e}"))?;
                 finish.attach(&writer);
                 engine = engine.with_run_journal(writer.clone());
@@ -1079,8 +1093,14 @@ pub async fn run_plan_execute(
     let plan_resume = match resume_session {
         Some(sid) => {
             let r = build_plan_loop_resume(&sessions_dir, sid)?;
-            let writer = JournalWriter::open(&sessions_dir, sid)
-                .map_err(|e| format!("run journal reopen failed ('{sid}'): {e}"))?;
+            // B-172:恢复装配恒为同会话续跑(Resume 模式:锚校验,旧档容忍)
+            let writer = JournalWriter::open_with_mode(
+                &sessions_dir,
+                sid,
+                OpenMode::Resume,
+                SessionIdentity::default(),
+            )
+            .map_err(|e| format!("run journal reopen failed ('{sid}'): {e}"))?;
             let replay_seq = writer
                 .read_lines()
                 .ok()
@@ -2123,7 +2143,9 @@ mod tests {
             .expect("engine bootstrapped session id surfaced");
         let path = JournalWriter::path_for(&dir, &sid);
         let lines = read_all(&path).unwrap();
-        assert_eq!(lines.len(), 3, "连续跑:三粒各一条检查点");
+        // B-172:New 模式开档账首落 session_opened 身份锚,其后三粒各一条检查点
+        assert_eq!(lines.len(), 4, "身份锚 + 三粒各一条检查点");
+        assert!(matches!(lines[0].event, JournalEvent::SessionOpened { .. }));
 
         // 崩溃模拟:截断到 n3 检查点之前(粒 2 完成后进程死亡)
         let cut = lines

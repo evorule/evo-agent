@@ -3474,10 +3474,13 @@ async fn spawn_background_task(
     let child_runner = factory(&child_id);
     let goal = body.goal.clone();
     let child_for_drain = child_id.clone();
-    // 派生锚落父 journal(B25 谱系面/任务列表数据源;直发路径与工具路径同账)
-    if let Ok(j) = crate::agent::journal::JournalWriter::open(
+    // 派生锚落父 journal(B25 谱系面/任务列表数据源;直发路径与工具路径同账)。
+    // B-172:旁挂锚写=既有续写语义(Resume 模式,旧档容忍)
+    if let Ok(j) = crate::agent::journal::JournalWriter::open_with_mode(
         &state.workdir.join("data").join("sessions"),
         &body.session_id,
+        crate::agent::journal::OpenMode::Resume,
+        crate::agent::journal::SessionIdentity::default(),
     ) {
         if let Err(e) = j.session_spawned(&body.session_id, &child_id, 1) {
             tracing::warn!(error = %e, "background spawn anchor journal failed");
