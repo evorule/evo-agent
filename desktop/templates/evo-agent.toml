@@ -6,6 +6,9 @@
 # （server 仓 plugins/*/official_native_services.json 并集）再生成，
 # build-installer 内嵌 -Check 校验，漂移即构建红。
 # 动态值（端口/引擎地址/令牌/key）一律由壳在运行期 env 注入，不入本模板。
+# workbench.console_dir 不入发版模板（公开部署零耦合）：console 通道由壳
+# 运行期按安装布局探测解析（resources\console 在位即启用），serve 侧该键
+# 缺省空 = 不启用；开发者本机路径不得随包分发（2026-11-07 去私货）。
 
 [llm]
 provider = "minimax"
@@ -170,7 +173,3 @@ service_tools = [
   "verification_fsm_reachability",
   "verification_sat_solve",
 ]
-
-# 工作台附加配置:serve 启动期自动拉起 console 审计页(审计深链数据源)
-[workbench]
-console_dir = "D:\\evorule-console-cloud"
