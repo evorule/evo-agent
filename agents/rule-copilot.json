@@ -49,5 +49,15 @@
     "type": "none",
     "namespace": "rule-copilot",
     "summary_model": "MiniMax-M2.5"
+  },
+  "verify": {
+    "commands": [
+      {
+        "name": "cargo-check",
+        "command": "cargo check --message-format=short",
+        "matcher": "$rustc",
+        "timeout_secs": 120
+      }
+    ]
   }
 }

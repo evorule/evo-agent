@@ -886,6 +886,12 @@ impl AgentDefinition {
             cfg.validate()
                 .map_err(AgentDefinitionError::InvalidDefinition)?;
         }
+        // verify 块门卫(fail-fast 提前到装载点;runner 构造点保留同判据,
+        // 双口共享单一 ValidateConfig::validate 实现)
+        if let Some(v) = &self.verify {
+            v.validate()
+                .map_err(AgentDefinitionError::InvalidDefinition)?;
+        }
         // M5-a:capability_boundary 语义门卫(单一事实源 + 模式/工具一致性)
         if let Some(b) = &self.capability_boundary {
             if b.mode != "read_only" && b.mode != "read_write" {

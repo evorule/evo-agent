@@ -59,6 +59,7 @@ pub mod accounting;
 #[cfg(windows)]
 pub mod appcontainer;
 pub mod ask_user;
+pub mod build_check;
 pub mod code_search;
 pub mod delegate_tool;
 pub mod edit_file;
@@ -311,6 +312,12 @@ fn default_safe_toolkit_core(
         shell_tool = shell_tool.with_sandbox_downgrade_reason(Some(reason.clone()));
     }
     handler.register_static("shell_exec", Arc::new(shell_tool));
+    // 工作区构建反馈回路:按需结构化构建诊断(命令固定不可传参;与写触发
+    // 的 verify 门禁互补——那边轮末自动跑,这边模型按需查现状/取全量清单)
+    handler.register_static(
+        build_check::BUILD_CHECK_TOOL,
+        Arc::new(build_check::BuildCheckTool::wired(&workdir_buf)),
+    );
     handler.register_static("http_get", Arc::new(http_get::HttpGetTool::new()));
     // 批K 段2:网络面第二/三件——网页抓取取读(http_get 防线全量复用)与
     // 互联网搜索(ai-plugin 中继,Brave key 归边 ai-plugin 侧)
@@ -851,6 +858,19 @@ pub fn default_tool_specs() -> Vec<ToolSpec> {
                     required: true,
                 },
             ],
+        },
+        ToolSpec {
+            name: "build_check".to_string(),
+            description: "Run a workspace build check (cargo check) and return STRUCTURED \
+                          diagnostics instead of raw build output: {verdict, counts, \
+                          diagnostics: [{path, line, col, severity, code, message}]}, capped \
+                          at 50 entries. Use this to see the current error/warning list for \
+                          the workspace on demand (e.g. before editing, or when the \
+                          write-triggered verification summary points here). Takes no \
+                          arguments; the command and workspace are fixed. In a non-Rust \
+                          workspace it returns verdict=unknown instead of pretending success."
+                .to_string(),
+            parameters: vec![],
         },
         ToolSpec {
             name: "http_get".to_string(),
