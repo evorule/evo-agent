@@ -806,7 +806,11 @@ pub static AUDIT_GET: EndpointBinding = EndpointBinding {
                   entries carry hash/causal metadata only (no fact payload), \
                   filtered to [from_fact, to_fact] then the first `limit` entries, \
                   with total_in_range/returned/truncated paging fields. \
-                  Set full=true for the complete report (backward compatible).",
+                  Set full=true for the complete report with fact payloads; \
+                  without paging params it returns the whole chain (backward \
+                  compatible), and with explicit from_fact/to_fact/limit it \
+                  windows the full report (same filtering semantics, paging \
+                  fields included) - prefer explicit windows on large sessions.",
     params: &[
         ParamBinding {
             name: "session_id",
