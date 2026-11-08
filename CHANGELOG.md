@@ -34,6 +34,47 @@
 
 ---
 
+## [0.7.0] - 2026-11-08
+
+### Skills: governed supply-chain hardening
+
+- Skill ledger moved to a hash-chained append-only journal (`registry.chain.jsonl` as the
+  source of truth; `registry.json` becomes a materialized cache). Out-of-band snapshot edits
+  are detected, reported, and healed on the next save; mid-chain tampering fails visible;
+  torn tails from crashes are truncated with a warning.
+- Boot-scoped ed25519 signatures: the desktop shell provisions a one-shot per-boot key via
+  env; the journal records a signed session anchor and every following record must carry a
+  valid signature (unsigned mode preserved for bare-serve installs).
+- `read_skill` verifies pinned content hashes at load time; the management face recomputes
+  per-skill drift (`content_matches`) — content changed after approval can no longer be
+  served or pass unnoticed.
+- Approval gates: optional privileged-token class (`[auth] human_tokens` — approval/revoke/
+  import restricted to human tokens), human-gate ledger records with identity and token
+  class attribution, U+FFFD encoding-corruption rejection, leak-screen quotation and
+  path-fragment exemptions, frontmatter/directory name parity on the scan path.
+- Revoked-name import rejection now points at the restore path (put the file back and
+  re-approve); the skill registry file is closed to the file face (management endpoints only).
+- Freshness stamps: env-sensitive skills record an environment fingerprint at approval;
+  environment drift surfaces a re-verification notice in the manifest segment with a user
+  switch (`skills.freshnessNotices`, default on).
+- New endpoints: `POST /api/skills/export` (governed promotion bundles) and `GET /api/meta`
+  (serve-face route self-description).
+- Bundled skill-authoring guide refreshed (restore path, verification behavior, freshness
+  declarations, troubleshooting).
+
+### Agent
+
+- Step timeout floor derived from the LLM worst-case budget; approval escape-intent window
+  slicing on character boundaries; companion read-only observation tools.
+
+### Web
+
+- Shot preview card and proxy playback fallback.
+
+### CI
+
+- Ubuntu runner freeze probes (image pool / thread caps) and license-gate retry handling.
+
 ## [Unreleased]
 
 ### 🆕 新增
