@@ -82,7 +82,7 @@ jobs:
           # phase inside verify.ps1 -- passive snapshots at zero risk; if
           # the freeze ever recurs, its streamed resource curve and the
           # culprit's process tree are captured right up to the death.
-          - os: ubuntu-24.04
+          - os: ubuntu-22.04
             name: ubuntu-latest
             tests: true
           - os: windows-latest
