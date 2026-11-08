@@ -597,8 +597,33 @@ fn render_skills_manifest(skills: &[crate::agent::definition::SkillManifestEntry
 
 /// 渲染降级停用通知（会话创建装配链的哈希失配名单——降级回喂会话，
 /// 终结「改完文件没重批 → 下会话技能凭空消失」的静默失忆）
+/// 渲染新鲜度提示（env-sensitive 技能的批准环境 ≠ 当前环境——复验提醒,
+/// 不降级不拒读;与完整性正交。文本不回显环境指纹——prompt 注入面卫生）
+pub fn render_skills_env_notice(stale: &[String]) -> String {
+    format!(
+        "【技能环境提示】以下技能（已声明 env-sensitive）核验于旧环境，当轮引用其结论前须重新实测：{}",
+        stale.join("、")
+    )
+}
+
 pub fn render_skills_downgraded_notice(downgraded: &[String]) -> String {
     format!("【技能停用通知】以下技能因批准后内容变动已被停用（正门与 read_skill 均不可用），重新走 approve 审批后恢复：{}", downgraded.join("、"))
+}
+
+#[cfg(test)]
+mod env_notice_tests {
+    use super::*;
+
+    #[test]
+    fn test_render_skills_env_notice_lists_names_without_fingerprint() {
+        let notice = render_skills_env_notice(&["fact-a".to_string(), "fact-b".to_string()]);
+        assert!(notice.contains("fact-a、fact-b"));
+        assert!(notice.contains("重新实测"), "must demand re-verification");
+        assert!(
+            !notice.contains("blake3"),
+            "must not echo fingerprint details"
+        );
+    }
 }
 
 /// 渲染交接底座包为 S3 槽内 "## Handoff Base" 结构化块(上下文延续归一件)

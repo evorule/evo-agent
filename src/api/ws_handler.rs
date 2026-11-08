@@ -1053,14 +1053,32 @@ async fn construct_runner(
         ))
         // B2:注入 skills manifest(read_skill 已注册进 filtered,清单喂 S4b 槽位)
         .with_skills(resolved_skills)
-        // 降级回喂:会话创建装配链的哈希失配名单以停用通知进清单段——
-        // 降级不再静默(此前只进服务日志,agent 当会话毫无感知)
-        .with_skills_notice(if merged_skills.downgraded.is_empty() {
-            None
-        } else {
-            Some(crate::agent::assembly::render_skills_downgraded_notice(
-                &merged_skills.downgraded,
-            ))
+        // 降级回喂 + 新鲜度提示:会话创建装配链的两类名单进清单段——
+        // 降级不再静默(此前只进服务日志);env-sensitive 技能环境失配出复验
+        // 提示(与完整性正交,不降级)。开关:workbench 设置 skills.freshnessNotices
+        // (缺省 true;false 关闭新鲜度提示,降级通知不受此开关影响)
+        .with_skills_notice({
+            let mut notices: Vec<String> = Vec::new();
+            if !merged_skills.downgraded.is_empty() {
+                notices.push(crate::agent::assembly::render_skills_downgraded_notice(
+                    &merged_skills.downgraded,
+                ));
+            }
+            let freshness_on = merged_settings
+                .get("skills")
+                .and_then(|s| s.get("freshnessNotices"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if freshness_on && !merged_skills.env_stale.is_empty() {
+                notices.push(crate::agent::assembly::render_skills_env_notice(
+                    &merged_skills.env_stale,
+                ));
+            }
+            if notices.is_empty() {
+                None
+            } else {
+                Some(notices.join("' + BSN + BSN + '"))
+            }
         })
         // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位,不再内嵌基底)
         .with_governance_segment(governance_segment.clone())

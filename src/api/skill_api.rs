@@ -741,12 +741,19 @@ pub async fn approve_skill(
             }),
         )
     })?;
+    // O-638② 新鲜度面：批准即核验——账本记环境指纹 + 正文的 env-sensitive 声明
+    let env_sensitive = parse_skill_frontmatter(&content)
+        .map(|fm| fm.env_sensitive)
+        .unwrap_or(false);
+    let env_fp = crate::agent::skill_store::env_fingerprint(state.workdir());
     registry.approve(
         &req.name,
         s.path.clone(),
         level,
         content_hash.clone(),
         &operator,
+        env_fp,
+        env_sensitive,
     );
     registry.save().map_err(|e| {
         (
@@ -972,7 +979,14 @@ pub fn merged_manifest_for_session(
     let project_dir = project_skills_dir(state);
     let registry_path = registry_path(state);
     let mut registry = SkillRegistry::load(&registry_path)?;
-    let merged = merge_skill_manifest(declared, &user_dir, Some(&project_dir), &mut registry)?;
+    let env_fp = crate::agent::skill_store::env_fingerprint(state.workdir());
+    let merged = merge_skill_manifest(
+        declared,
+        &user_dir,
+        Some(&project_dir),
+        &mut registry,
+        env_fp.as_deref(),
+    )?;
     // 失配降级等账本变更落盘（无变更时也幂等重写，量小无碍）
     registry.save()?;
     Ok((merged, registry_path))
@@ -1715,6 +1729,51 @@ mod tests {
             .with_human_tokens(vec!["human-token".to_string()]);
         let state = make_state(workdir).with_auth_config(auth.clone());
         crate::api::agent_api::router_with_auth(state, auth)
+    }
+
+    #[tokio::test]
+    async fn test_approve_records_env_stamp_for_sensitive_skills() {
+        // O-638②:env-sensitive 技能批准时账本记环境指纹(Some)与声明(true);
+        // 非 sensitive 技能指纹照记但声明为 false
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "data/skills",
+            "fact",
+            "---
+name: fact
+description: d
+env-sensitive: true
+---
+A",
+        );
+        write_skill(
+            tmp.path(),
+            "data/skills",
+            "howto",
+            "---
+name: howto
+description: d
+---
+B",
+        );
+        let app = human_router(tmp.path().to_path_buf());
+        for name in ["fact", "howto"] {
+            let (status, _) = post(
+                app.clone(),
+                "/api/skills/approve",
+                serde_json::json!({"name": name, "level": "user"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let reg = SkillRegistry::load(&tmp.path().join("data/skills/registry.json")).unwrap();
+        let fact = reg.find("fact", SkillLevel::User).unwrap();
+        assert!(fact.env_sensitive);
+        assert!(fact.env_fp.is_some(), "env fingerprint must be stamped");
+        let howto = reg.find("howto", SkillLevel::User).unwrap();
+        assert!(!howto.env_sensitive);
+        assert!(howto.env_fp.is_some());
     }
 
     #[tokio::test]

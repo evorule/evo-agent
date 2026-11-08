@@ -109,6 +109,14 @@ pub struct RegistryEntry {
     /// 批准者（v1 无操作者身份体系，缺省 `local-operator`）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_by: Option<String>,
+    /// 批准时刻的环境指纹（O-638② 新鲜度面；None=未采集/旧账本条目——
+    /// 无戳不提示，首次重批后自然获得）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_fp: Option<String>,
+    /// 正文 frontmatter `env-sensitive: true` 声明（记录环境事实的技能才做
+    /// 环境失配提示；缺省 false=零噪音）
+    #[serde(default)]
+    pub env_sensitive: bool,
 }
 
 /// registry.json 顶层形态
@@ -199,6 +207,8 @@ impl SkillRegistry {
         level: SkillLevel,
         content_hash: String,
         approved_by: &str,
+        env_fp: Option<String>,
+        env_sensitive: bool,
     ) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -210,6 +220,8 @@ impl SkillRegistry {
             e.content_hash = Some(content_hash);
             e.approved_at = Some(now);
             e.approved_by = Some(approved_by.to_string());
+            e.env_fp = env_fp;
+            e.env_sensitive = env_sensitive;
             return;
         }
         self.entries.push(RegistryEntry {
@@ -220,6 +232,8 @@ impl SkillRegistry {
             content_hash: Some(content_hash),
             approved_at: Some(now),
             approved_by: Some(approved_by.to_string()),
+            env_fp,
+            env_sensitive,
         });
     }
 
@@ -364,6 +378,7 @@ pub fn merge_skill_manifest(
     user_dir: &Path,
     project_dir: Option<&Path>,
     registry: &mut SkillRegistry,
+    env_fp: Option<&str>,
 ) -> Result<MergedSkills, String> {
     let scanned_user = scan_skills_dir(user_dir, SkillLevel::User)?;
     let scanned_project = match project_dir {
@@ -376,6 +391,9 @@ pub fn merge_skill_manifest(
     let mut candidates: Vec<(String, PathBuf, String)> = Vec::new();
     // 降级名单（回喂会话：清单段标「因内容变动已停用」，终结静默失忆）
     let mut downgraded: Vec<String> = Vec::new();
+    // 新鲜度提示名单（O-638②：env-sensitive 技能的批准环境 ≠ 当前环境——
+    // 提示复验,不降级不拒读;与完整性正交）
+    let mut env_stale: Vec<String> = Vec::new();
     for scanned in scanned_user.iter().chain(scanned_project.iter()) {
         let Some(entry) = registry.find(&scanned.name, scanned.level) else {
             continue; // 计算态 discovered（账本无行）
@@ -397,6 +415,14 @@ pub fn merge_skill_manifest(
             registry.downgrade(&scanned.name, scanned.level);
             downgraded.push(scanned.name.clone());
             continue;
+        }
+        // 环境失配比对（仅 env-sensitive 技能;双 Some 才可比,旧条目无戳不提示）
+        if entry.env_sensitive {
+            if let (Some(stamped), Some(current_fp)) = (&entry.env_fp, env_fp) {
+                if stamped != current_fp {
+                    env_stale.push(scanned.name.clone());
+                }
+            }
         }
         candidates.push((scanned.name.clone(), scanned.path.clone(), current));
     }
@@ -460,6 +486,7 @@ pub fn merge_skill_manifest(
         manifest: merged,
         content_hashes,
         downgraded,
+        env_stale,
     })
 }
 
@@ -471,6 +498,9 @@ pub struct MergedSkills {
     pub manifest: Vec<SkillManifestEntry>,
     /// 本次会话创建因哈希失配被降级的技能名单（回喂会话用——降级不再静默）
     pub downgraded: Vec<String>,
+    /// env-sensitive 技能的批准环境 ≠ 当前环境名单（新鲜度提示——复验提醒,
+    /// 不降级;与完整性正交）
+    pub env_stale: Vec<String>,
     /// 注册 active 项的钉死哈希（name → `blake3:<hex>`）
     pub content_hashes: std::collections::BTreeMap<String, String>,
 }
@@ -479,6 +509,31 @@ fn is_active(registry: &SkillRegistry, name: &str, level: SkillLevel) -> bool {
     registry
         .find(name, level)
         .is_some_and(|e| e.status == SkillStatus::Active)
+}
+
+/// 环境指纹（O-638② 新鲜度面）：hash(主机名 | serve 版本 | engine 版本)。
+/// runtime.json 缺失/无版本字段时省略 engine 分量；主机名取 COMPUTERNAME/
+/// HOSTNAME。任一途径都保证至少主机名分量 → 实际恒 Some。
+pub fn env_fingerprint(workdir: &Path) -> Option<String> {
+    let host = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()?;
+    let serve = env!("CARGO_PKG_VERSION").to_string();
+    let engine = std::fs::read_to_string(workdir.join("runtime.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("version")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        });
+    let material = match engine {
+        Some(e) => format!("{host}|{serve}|{e}"),
+        None => format!("{host}|{serve}"),
+    };
+    Some(evorule_hash::prefixed(&evorule_hash::digest(
+        material.as_bytes(),
+    )))
 }
 
 /// SKILL.md 文件内容 blake3（evorule-hash `digest`；B 族纪律禁自写 blake3）
@@ -675,6 +730,73 @@ mod tests {
     // ---- 扫描正反例 ----
 
     #[test]
+    fn test_merge_flags_env_stale_only_for_sensitive_and_mismatched() {
+        // O-638②:env-sensitive 技能的批准环境 ≠ 当前环境 → env_stale 名单;
+        // 非 sensitive 失配不进名单(零噪音);环境一致不进名单
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("data/skills");
+        let md_a = write_skill(
+            &user_dir,
+            "fact-a",
+            "---
+name: fact-a
+description: d
+env-sensitive: true
+---
+A",
+        );
+        let md_b = write_skill(
+            &user_dir,
+            "howto-b",
+            "---
+name: howto-b
+description: d
+---
+B",
+        );
+        let mut reg = SkillRegistry::load(&tmp.path().join("registry.json")).unwrap();
+        reg.approve(
+            "fact-a",
+            md_a.clone(),
+            SkillLevel::User,
+            hash_skill_file_prefixed(&md_a).unwrap(),
+            "op",
+            Some("OLD-ENV".to_string()),
+            true,
+        );
+        reg.approve(
+            "howto-b",
+            md_b.clone(),
+            SkillLevel::User,
+            hash_skill_file_prefixed(&md_b).unwrap(),
+            "op",
+            Some("OLD-ENV".to_string()),
+            false,
+        );
+
+        let merged =
+            merge_skill_manifest(vec![], &user_dir, None, &mut reg, Some("NEW-ENV")).unwrap();
+        assert_eq!(
+            merged.env_stale,
+            vec!["fact-a".to_string()],
+            "sensitive+mismatch must be flagged"
+        );
+
+        let merged2 =
+            merge_skill_manifest(vec![], &user_dir, None, &mut reg, Some("OLD-ENV")).unwrap();
+        assert!(
+            merged2.env_stale.is_empty(),
+            "matching env must not be flagged"
+        );
+
+        let merged3 = merge_skill_manifest(vec![], &user_dir, None, &mut reg, None).unwrap();
+        assert!(
+            merged3.env_stale.is_empty(),
+            "unknown env must not be flagged (no false positives)"
+        );
+    }
+
+    #[test]
     fn test_scan_rejects_frontmatter_name_mismatch() {
         // 防钓鱼名一致性(与 import 同判据):目录名是注册/approve 的键,声明名
         // 是 read_skill 的门面,不一致即钓鱼形态——候选整条出局
@@ -823,6 +945,8 @@ B",
             SkillLevel::User,
             hash.clone(),
             "local-operator",
+            None,
+            false,
         );
         reg.save().unwrap();
 
@@ -844,7 +968,15 @@ B",
 
         // re-approve = 重新激活（幂等路径）
         let mut reg5 = reg4.clone();
-        reg5.approve("s", skill_md, SkillLevel::User, hash, "local-operator");
+        reg5.approve(
+            "s",
+            skill_md,
+            SkillLevel::User,
+            hash,
+            "local-operator",
+            None,
+            false,
+        );
         assert_eq!(
             reg5.find("s", SkillLevel::User).unwrap().status,
             SkillStatus::Active
@@ -886,6 +1018,7 @@ B",
             &user_dir,
             None,
             &mut reg,
+            None,
         )
         .unwrap();
         assert_eq!(merged.len(), 1);
@@ -910,6 +1043,8 @@ B",
             SkillLevel::User,
             hash_skill_file_prefixed(&user_md).unwrap(),
             "op",
+            None,
+            false,
         );
         reg.approve(
             "s",
@@ -917,11 +1052,13 @@ B",
             SkillLevel::Project,
             hash_skill_file_prefixed(&proj_md).unwrap(),
             "op",
+            None,
+            false,
         );
 
         let MergedSkills {
             manifest: merged, ..
-        } = merge_skill_manifest(vec![], &user_dir, Some(&project_dir), &mut reg).unwrap();
+        } = merge_skill_manifest(vec![], &user_dir, Some(&project_dir), &mut reg, None).unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(
             merged[0].path, proj_md,
@@ -945,6 +1082,8 @@ B",
             SkillLevel::User,
             hash_skill_file_prefixed(&act_md).unwrap(),
             "op",
+            None,
+            false,
         );
         reg.approve(
             "r1",
@@ -952,12 +1091,14 @@ B",
             SkillLevel::User,
             hash_skill_file_prefixed(&rev_md).unwrap(),
             "op",
+            None,
+            false,
         );
         reg.revoke("r1", SkillLevel::User);
 
         let MergedSkills {
             manifest: merged, ..
-        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
+        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg, None).unwrap();
         let names: Vec<&str> = merged.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, vec!["a1"], "discovered/revoked must be excluded");
         let _ = disc_md;
@@ -977,6 +1118,8 @@ B",
             SkillLevel::User,
             hash_skill_file_prefixed(&md).unwrap(),
             "op",
+            None,
+            false,
         );
 
         // 批准后偷换内容
@@ -984,7 +1127,7 @@ B",
 
         let MergedSkills {
             manifest: merged, ..
-        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
+        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg, None).unwrap();
         assert!(
             merged.is_empty(),
             "mismatched skill must leave the manifest"
@@ -1007,10 +1150,12 @@ B",
             SkillLevel::User,
             hash_skill_file_prefixed(&user_dir.join("s/SKILL.md")).unwrap(),
             "op",
+            None,
+            false,
         );
         let MergedSkills {
             manifest: merged, ..
-        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
+        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg, None).unwrap();
         assert_eq!(merged.len(), 1);
     }
 
@@ -1026,11 +1171,13 @@ B",
             SkillLevel::User,
             hash_skill_file_prefixed(&user_dir.join("s/SKILL.md")).unwrap(),
             "op",
+            None,
+            false,
         );
 
         let MergedSkills {
             manifest: merged, ..
-        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
+        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg, None).unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].description, "stable");
         assert_eq!(
@@ -1046,7 +1193,7 @@ B",
         std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
         std::fs::write(&bad, "x").unwrap(); // 文件冒充目录
         let mut reg = SkillRegistry::load(&tmp.path().join("registry.json")).unwrap();
-        let err = merge_skill_manifest(vec![], &bad, None, &mut reg).unwrap_err();
+        let err = merge_skill_manifest(vec![], &bad, None, &mut reg, None).unwrap_err();
         assert!(
             err.contains("fail-fast"),
             "directory-level failure must fail-fast"
