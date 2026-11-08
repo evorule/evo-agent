@@ -787,7 +787,7 @@ pub struct AgentDefinition {
     /// 跳过,绝不阻断会话)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge_datasets: Option<Vec<String>>,
-    /// 跑中自审自检器配置(design-79 P-B/P-C;可选,None(缺省)=机制不存在,
+    /// 跑中自审自检器配置(可选,None(缺省)=机制不存在,
     /// 既有定义零影响)。声明后 runner 步界按周期触发 evorule-server
     /// trace-audit 只读服务族,结论落 journal SelfAudit 账(观测面;inject
     /// 显式开启才经系统消息分区注入对话)。装载期 validate fail-fast
@@ -919,7 +919,7 @@ impl AgentDefinition {
             v.validate()
                 .map_err(AgentDefinitionError::InvalidDefinition)?;
         }
-        // 自审自检器门卫(design-79 P-B:fail-fast 同口径)
+        // 自审自检器门卫(fail-fast 同口径)
         if let Some(sa) = &self.self_audit {
             sa.validate()
                 .map_err(AgentDefinitionError::InvalidDefinition)?;
@@ -1341,7 +1341,7 @@ impl AgentDefinition {
             // 治理知识数据集声明直拷(声明面数据,同身份段口径——声明即生效;
             // 拉取渲染在 runner 组装期做,运行时产物不进 definition)
             knowledge_datasets: self.knowledge_datasets.clone(),
-            // 跑中自审自检器配置直拷(design-79 P-B;None=机制不存在)
+            // 跑中自审自检器配置直拷(None=机制不存在)
             self_audit: self.self_audit.clone(),
         }
     }
@@ -2064,7 +2064,7 @@ mod tests {
         assert!(def.validate().is_ok());
     }
 
-    // ===== 自审自检器 def 门卫(design-79 P-B) =====
+    // ===== 自审自检器 def 门卫 =====
 
     #[test]
     fn test_self_audit_default_zero_change_and_direct_copy() {

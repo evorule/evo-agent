@@ -555,7 +555,7 @@ pub struct AgentConfig {
     pub i2_lexicon: Option<crate::agent::context_inspector::I2Lexicon>,
     /// 全局时限预算秒(H3 看门狗;None=不启用——既有定义零影响)
     pub wall_clock_budget_secs: Option<u64>,
-    /// 跑中自审自检器配置(design-79 P-B;None=机制不存在=既有定义零影响。
+    /// 跑中自审自检器配置(None=机制不存在=既有定义零影响。
     /// 声明后 inner 步界按周期触发 trace-audit 只读服务族,结论落 journal
     /// SelfAudit 账;帧捕获在外层 wrapper 面)
     pub self_audit: Option<crate::agent::self_audit::SelfAuditConfig>,
@@ -8355,7 +8355,7 @@ impl AgentRunner {
                                        }
                                        yield Ok(AgentEvent::Step { step: step_count });
 
-                                       // 跑中自审自检器（design-79 P-B/P-C）：步界
+                                       // 跑中自审自检器（周期步界触发+服务调用）：步界
                                        // 安全点统一检查点（引擎步界与本地 ReAct
                                        // 回喂步界共用同一 helper；cfg None=零开销）。
                                        crate::agent::self_audit::audit_checkpoint(
@@ -8494,7 +8494,7 @@ impl AgentRunner {
                                                            round = react_round,
                                                            "本地 ReAct 回喂:工具结果已入列,发起下一轮 LLM 调用"
                                                        );
-                                                       // 跑中自审自检器（design-79 P-B/P-C）：
+                                                       // 跑中自审自检器（react 回喂循环步界）：
                                                        // 本地 ReAct 回喂步界安全点（CLI run
                                                        // 主路径的每轮 LLM 前界；与引擎步界
                                                        // 共用检查点）。
