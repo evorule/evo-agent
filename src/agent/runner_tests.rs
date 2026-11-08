@@ -862,6 +862,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         north_star: None,
         handoff: None,
         knowledge_datasets: None,
+        self_audit: None,
     }
 }
 

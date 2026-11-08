@@ -2054,6 +2054,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             north_star: None,
             handoff: None,
             knowledge_datasets: None,
+            self_audit: None,
         }
     }
 

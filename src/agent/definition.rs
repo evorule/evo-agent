@@ -779,6 +779,12 @@ pub struct AgentDefinition {
     /// 跳过,绝不阻断会话)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge_datasets: Option<Vec<String>>,
+    /// 跑中自审自检器配置(design-79 P-B;可选,None(缺省)=机制不存在,
+    /// 既有定义零影响)。声明后 runner 步界按周期触发 evorule-server
+    /// trace-audit 只读服务族,结论落 journal SelfAudit 账(观测面,不回喂)。
+    /// 装载期 validate fail-fast(every_n_steps=0/空 scope 拒)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_audit: Option<crate::agent::self_audit::SelfAuditConfig>,
 }
 
 /// 交接底座包(上下文延续归一件:确定性包=底座,sidecar 摘要=语义面)。
@@ -902,6 +908,11 @@ impl AgentDefinition {
         // 双口共享单一 ValidateConfig::validate 实现)
         if let Some(v) = &self.verify {
             v.validate()
+                .map_err(AgentDefinitionError::InvalidDefinition)?;
+        }
+        // 自审自检器门卫(design-79 P-B:fail-fast 同口径)
+        if let Some(sa) = &self.self_audit {
+            sa.validate()
                 .map_err(AgentDefinitionError::InvalidDefinition)?;
         }
         // M5-a:capability_boundary 语义门卫(单一事实源 + 模式/工具一致性)
@@ -1319,6 +1330,8 @@ impl AgentDefinition {
             // 治理知识数据集声明直拷(声明面数据,同身份段口径——声明即生效;
             // 拉取渲染在 runner 组装期做,运行时产物不进 definition)
             knowledge_datasets: self.knowledge_datasets.clone(),
+            // 跑中自审自检器配置直拷(design-79 P-B;None=机制不存在)
+            self_audit: self.self_audit.clone(),
         }
     }
 }
@@ -2040,6 +2053,52 @@ mod tests {
         assert!(def.validate().is_ok());
     }
 
+    // ===== 自审自检器 def 门卫(design-79 P-B) =====
+
+    #[test]
+    fn test_self_audit_default_zero_change_and_direct_copy() {
+        // 缺省:无 self_audit 字段 = None,validate 放行,to_agent_config 不带
+        let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null}"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert!(def.self_audit.is_none());
+        assert!(def.validate().is_ok());
+        assert!(def.to_agent_config().self_audit.is_none());
+
+        // 显式声明:直拷进 AgentConfig
+        let json_on = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null,"self_audit":{"every_n_steps":10}}"#;
+        let def_on: AgentDefinition = serde_json::from_str(json_on).expect("parse");
+        let sa = def_on.self_audit.as_ref().expect("self_audit parsed");
+        assert_eq!(sa.every_n_steps, Some(10));
+        assert!(sa.scope.is_none());
+        assert!(def_on.validate().is_ok());
+        let cfg = def_on.to_agent_config();
+        assert_eq!(cfg.self_audit, def_on.self_audit);
+
+        // scope 声明也直拷
+        let json_scope = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null,"self_audit":{"every_n_steps":5,"scope":"D:/work/task"}}"#;
+        let def_scope: AgentDefinition = serde_json::from_str(json_scope).expect("parse");
+        let sa = def_scope.self_audit.as_ref().expect("self_audit parsed");
+        assert_eq!(sa.every_n_steps, Some(5));
+        assert_eq!(sa.scope.as_deref(), Some("D:/work/task"));
+    }
+
+    #[test]
+    fn test_self_audit_validate_fail_fast() {
+        // every_n_steps=0 装载期拒
+        let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null,"self_audit":{"every_n_steps":0}}"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert!(def
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("every_n_steps"));
+
+        // 空 scope 装载期拒
+        let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null,"self_audit":{"every_n_steps":5,"scope":"  "}}"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert!(def.validate().unwrap_err().to_string().contains("scope"));
+    }
+
     #[test]
     fn test_validate_accepts_production_agents() {
         // 三个生产 agent 定义必须通过门卫(防门卫误伤真资产)
@@ -2114,6 +2173,7 @@ mod tests {
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,
+            self_audit: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
@@ -2492,6 +2552,7 @@ mod tests {
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,
+            self_audit: None,
             max_parallel_tools: 1,
             capability_boundary: Some(CapabilityBoundary {
                 mode: mode.to_string(),
@@ -2757,6 +2818,7 @@ mod tests {
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,
+            self_audit: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
@@ -2998,6 +3060,7 @@ mod tests {
             i2_lexicon: None,
             wall_clock_budget_secs: None,
             knowledge_datasets: None,
+            self_audit: None,
             max_parallel_tools: 1,
             capability_boundary: None,
             approval_mode: None,
