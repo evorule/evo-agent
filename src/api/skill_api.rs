@@ -23,7 +23,7 @@
 //! 工作台管理 UI 留 IDE 化批；本面 REST 即可操作（curl / REST 消费面先例充分）。
 //! 鉴权随路由面（`/api/skills*` 不进 PUBLIC_PATHS，默认 Bearer token 内）。
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::Extension, extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -33,7 +33,9 @@ use crate::agent::skill_store::{
     scan_skills_dir, SkillLevel, SkillRegistry, SkillStatus,
 };
 use crate::api::agent_api::AgentApiState;
-use crate::api::human_gate::CallerIdentity;
+use crate::api::human_gate::{
+    ensure_privileged, ensure_write_allowed, CallerClass, CallerIdentity,
+};
 
 /// 用户级 skill 目录（serve workdir 相对，运行时资产，gitignore 管辖）
 pub fn user_skills_dir(state: &AgentApiState) -> std::path::PathBuf {
@@ -179,22 +181,37 @@ pub struct SkillImportResult {
 /// - HumanGate：写面语义，落人工账（op="skills_import"）
 pub async fn import_skills(
     State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
     Json(req): Json<SkillImportRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // 写面人工账（对齐 file_api gate_write 语义）
+    // 写面人工账（对齐 file_api gate_write 语义）。身份取**计算值**
+    // （auth enabled = human）：账本不再写死 anonymous（算而不记）——
+    // identity 回答「过没过鉴权」，class 回答「特权/操作者 token」。
     let identity = crate::api::human_gate::ensure_write_allowed(state.auth_config());
-    let gate = |outcome: &str| {
+    let Ok(identity) = identity else {
         state.human_gate().record(
             "skills_import",
             CallerIdentity::Anonymous,
             &req.path,
-            outcome,
+            "denied",
         );
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": crate::api::human_gate::anonymous_write_denied() })),
+        ));
     };
-    if let Err(e) = identity {
-        gate("denied");
+    // 特权面门（[auth] human_tokens 非空时,操作者类 token 不得批量导入）
+    if let Err(e) = ensure_privileged(state.auth_config(), class) {
+        state
+            .human_gate()
+            .record_class("skills_import", identity, class, &req.path, "denied");
         return Err((e.0, Json(serde_json::json!({ "error": e.1 }))));
     }
+    let gate = |outcome: &str| {
+        state
+            .human_gate()
+            .record_class("skills_import", identity, class, &req.path, outcome);
+    };
 
     // bundle 路径越界守卫（工作区内；canonicalize 防穿越）
     let bundle_path = state.workdir().join(&req.path);
@@ -564,10 +581,46 @@ pub async fn list_pending_skills(
 /// - 技术词命中 → 200 + warnings（可批，警告随响应留痕）
 /// - 未知 name/level → 404；frontmatter 不可解析 → 422
 /// - 幂等：重复 approve 重算哈希更新时间戳（内容更新后重新走审批即此路径）
+/// - HumanGate：写面 + 特权面（[auth] human_tokens 非空时仅特权 token 可批），
+///   审批/拒绝均落人工账（identity=鉴权态，class=特权/操作者 token）
 pub async fn approve_skill(
     State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
     Json(req): Json<SkillNameRequest>,
 ) -> Result<Json<ApproveResponse>, (StatusCode, Json<LeakRejectResponse>)> {
+    let ledger = |outcome: &str, class: CallerClass| {
+        state.human_gate().record_class(
+            "skills_approve",
+            crate::api::human_gate::caller_identity(state.auth_config()),
+            class,
+            &format!("{} ({})", req.name, req.level),
+            outcome,
+        );
+    };
+    // 写面门（auth disabled = anonymous 只读,审批属写面一律拒;拒绝本身留痕）
+    if ensure_write_allowed(state.auth_config()).is_err() {
+        ledger("denied", class);
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(LeakRejectResponse {
+                rejected: false,
+                reason: crate::api::human_gate::anonymous_write_denied(),
+                hits: Vec::new(),
+            }),
+        ));
+    }
+    // 特权面门（类别闸开启时,操作者类 token 不得自批——人工把关的机制强制点）
+    if let Err(e) = ensure_privileged(state.auth_config(), class) {
+        ledger("denied", class);
+        return Err((
+            e.0,
+            Json(LeakRejectResponse {
+                rejected: false,
+                reason: e.1,
+                hits: Vec::new(),
+            }),
+        ));
+    }
     let Some(level) = level_from_str(&req.level) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -699,6 +752,7 @@ pub async fn approve_skill(
         warnings = warnings.len(),
         "skill approved (registration gate passed)"
     );
+    ledger("ok", class);
     Ok(Json(ApproveResponse {
         name: req.name,
         level: req.level,
@@ -711,10 +765,43 @@ pub async fn approve_skill(
 /// `POST /api/skills/revoke` — 状态置 revoked（账本保留历史行）
 ///
 /// 账本无行但目录扫到 → 写 revoked 行（显式拒绝记录）；两者皆无 → 404。
+/// HumanGate：写面 + 特权面（同 approve），动作落人工账。
 pub async fn revoke_skill(
     State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
     Json(req): Json<SkillNameRequest>,
 ) -> Result<Json<RevokeResponse>, (StatusCode, Json<LeakRejectResponse>)> {
+    let ledger = |outcome: &str, class: CallerClass| {
+        state.human_gate().record_class(
+            "skills_revoke",
+            crate::api::human_gate::caller_identity(state.auth_config()),
+            class,
+            &format!("{} ({})", req.name, req.level),
+            outcome,
+        );
+    };
+    if ensure_write_allowed(state.auth_config()).is_err() {
+        ledger("denied", class);
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(LeakRejectResponse {
+                rejected: false,
+                reason: crate::api::human_gate::anonymous_write_denied(),
+                hits: Vec::new(),
+            }),
+        ));
+    }
+    if let Err(e) = ensure_privileged(state.auth_config(), class) {
+        ledger("denied", class);
+        return Err((
+            e.0,
+            Json(LeakRejectResponse {
+                rejected: false,
+                reason: e.1,
+                hits: Vec::new(),
+            }),
+        ));
+    }
     let Some(level) = level_from_str(&req.level) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -751,6 +838,7 @@ pub async fn revoke_skill(
     registry.revoke(&req.name, level);
     registry.save().map_err(internal_err)?;
     tracing::info!(skill = %req.name, level = %req.level, "skill revoked");
+    ledger("ok", class);
     Ok(Json(RevokeResponse {
         name: req.name,
         level: req.level,
@@ -877,7 +965,9 @@ mod tests {
     }
 
     async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
-        get_authed(app, uri, None).await
+        // 默认带 token:auth-disabled router 忽略该头(语义不变),auth-enabled
+        // router(写面测试转 human_router 后)凭它通过中间件
+        get_authed(app, uri, Some("test-token")).await
     }
 
     /// 带认证的 GET(human_router 测试用)
@@ -909,25 +999,8 @@ mod tests {
         uri: &str,
         json: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(uri)
-                    .header("content-type", "application/json")
-                    .body(Body::from(json.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = resp.status();
-        let body = serde_json::from_slice(
-            &axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap_or(serde_json::Value::Null);
-        (status, body)
+        // 默认带 token(理由同 get):disabled router 忽略;human_router 凭它过闸
+        post_authed(app, uri, json, "test-token").await
     }
 
     const CLEAN_SKILL: &str = "---\nname: git-discipline\ndescription: git 纪律指引\n---\n# 正文\n先 git status 再 commit。\n";
@@ -973,7 +1046,7 @@ mod tests {
     async fn test_approve_then_inventory_active() {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "data/skills", "git-discipline", CLEAN_SKILL);
-        let app = router(make_state(tmp.path().to_path_buf()));
+        let app = human_router(tmp.path().to_path_buf());
 
         let (status, body) = post(
             app.clone(),
@@ -1036,7 +1109,7 @@ mod tests {
     #[tokio::test]
     async fn test_approve_unknown_name_and_bad_level() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = router(make_state(tmp.path().to_path_buf()));
+        let app = human_router(tmp.path().to_path_buf());
 
         let (status, body) = post(
             app.clone(),
@@ -1068,7 +1141,7 @@ mod tests {
                 "成，请放心使用。\n"
             ),
         );
-        let app = router(make_state(tmp.path().to_path_buf()));
+        let app = human_router(tmp.path().to_path_buf());
 
         let (status, body) = post(
             app,
@@ -1097,7 +1170,7 @@ mod tests {
             "tech",
             "---\nname: tech\ndescription: d\n---\nLLM 按以下步骤调用本 skill。\n",
         );
-        let app = router(make_state(tmp.path().to_path_buf()));
+        let app = human_router(tmp.path().to_path_buf());
 
         let (status, body) = post(
             app,
@@ -1119,7 +1192,7 @@ mod tests {
     async fn test_reapprove_is_idempotent_and_revoked_can_reactivate() {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "data/skills", "s", CLEAN_SKILL);
-        let app = router(make_state(tmp.path().to_path_buf()));
+        let app = human_router(tmp.path().to_path_buf());
         let req = serde_json::json!({"name": "s", "level": "user"});
 
         // 首批 + 重复 approve（幂等）
@@ -1149,7 +1222,7 @@ mod tests {
     async fn test_revoke_unknown_name_404_and_project_level_flow() {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), ".evo/skills", "proj-skill", CLEAN_SKILL);
-        let app = router(make_state(tmp.path().to_path_buf()));
+        let app = human_router(tmp.path().to_path_buf());
 
         // 未知名 revoke → 404
         let (status, _) = post(
@@ -1206,7 +1279,7 @@ mod tests {
         // active 项(经 REST approve)→ 进 manifest + read_skill 可读
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "data/skills", "git-discipline", CLEAN_SKILL);
-        let app = router(make_state(tmp.path().to_path_buf()));
+        let app = human_router(tmp.path().to_path_buf());
         let (status, _) = post(
             app,
             "/api/skills/approve",
@@ -1262,7 +1335,7 @@ mod tests {
         // 同名冲突:declaration > 用户级注册项(高优先保留 + warn 不 fail-fast)
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "data/skills", "git-discipline", CLEAN_SKILL);
-        let app = router(make_state(tmp.path().to_path_buf()));
+        let app = human_router(tmp.path().to_path_buf());
         let (status, _) = post(
             app,
             "/api/skills/approve",
@@ -1295,7 +1368,7 @@ mod tests {
         // 项目级 active 项同样进 manifest(两级目录均扫描)
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), ".evo/skills", "proj-flow", CLEAN_SKILL);
-        let app = router(make_state(tmp.path().to_path_buf()));
+        let app = human_router(tmp.path().to_path_buf());
         let (status, _) = post(
             app,
             "/api/skills/approve",
@@ -1525,5 +1598,91 @@ mod tests {
             !tmp.path().join("data/skills/should-not-land").exists(),
             "denied import must not touch skills dir"
         );
+    }
+    // =========================================================================
+    // 特权面门（[auth] human_tokens）：操作者类不得自批，账本记 class
+    // =========================================================================
+
+    fn privileged_router(workdir: std::path::PathBuf) -> axum::Router {
+        let auth = crate::api::auth::AuthConfig::new(vec!["op-token".to_string()], true)
+            .with_human_tokens(vec!["human-token".to_string()]);
+        let state = make_state(workdir).with_auth_config(auth.clone());
+        crate::api::agent_api::router_with_auth(state, auth)
+    }
+
+    #[tokio::test]
+    async fn test_privileged_gate_blocks_operator_self_approval() {
+        // 类别闸开启:操作者 token approve = 403(人工把关机制强制),特权 token 过;
+        // 拒绝与放行均落人工账(identity=human + class=operator/privileged)
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "data/skills", "s", CLEAN_SKILL);
+        let app = privileged_router(tmp.path().to_path_buf());
+
+        let (status, body) = post_authed(
+            app.clone(),
+            "/api/skills/approve",
+            serde_json::json!({"name": "s", "level": "user"}),
+            "op-token",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "operator token must not self-approve: {body}"
+        );
+        assert!(body["reason"]
+            .as_str()
+            .unwrap()
+            .contains("privileged token"));
+
+        let (status, body) = post_authed(
+            app,
+            "/api/skills/approve",
+            serde_json::json!({"name": "s", "level": "user"}),
+            "human-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "human token must pass: {body}");
+        assert_eq!(body["status"], "active");
+
+        let ledger =
+            std::fs::read_to_string(tmp.path().join("data/human_gate_ledger.jsonl")).unwrap();
+        let rows: Vec<serde_json::Value> = ledger
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let denied = rows
+            .iter()
+            .find(|r| r["op"] == "skills_approve" && r["outcome"] == "denied")
+            .unwrap();
+        assert_eq!(denied["class"], "operator");
+        assert_eq!(denied["identity"], "human");
+        let ok = rows
+            .iter()
+            .find(|r| r["op"] == "skills_approve" && r["outcome"] == "ok")
+            .unwrap();
+        assert_eq!(ok["class"], "privileged");
+    }
+
+    #[tokio::test]
+    async fn test_approve_ledger_records_class_without_gate() {
+        // 类别闸关闭(human_tokens 空):approve 照常放行,人工账记 identity=human
+        // + class=privileged(旧版行为),approve/revoke 不再是账本盲区
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "data/skills", "s", CLEAN_SKILL);
+        let app = human_router(tmp.path().to_path_buf());
+        let (status, _) = post(
+            app,
+            "/api/skills/approve",
+            serde_json::json!({"name": "s", "level": "user"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ledger =
+            std::fs::read_to_string(tmp.path().join("data/human_gate_ledger.jsonl")).unwrap();
+        let row: serde_json::Value = serde_json::from_str(ledger.lines().last().unwrap()).unwrap();
+        assert_eq!(row["op"], "skills_approve");
+        assert_eq!(row["identity"], "human");
+        assert_eq!(row["class"], "privileged");
     }
 }

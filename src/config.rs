@@ -491,9 +491,11 @@ impl Default for LoggingConfig {
 /// [auth]
 /// enabled = true
 /// tokens = ["secret-token-1", "secret-token-2"]
+/// human_tokens = ["the-human-token"]   # 可选;非空时技能注册面仅收特权 token
 /// ```
 ///
-/// 环境变量:`EVO_AGENT_AUTH__ENABLED=true`、`EVO_AGENT_AUTH__TOKENS=t1,t2`
+/// 环境变量:`EVO_AGENT_AUTH__ENABLED=true`、`EVO_AGENT_AUTH__TOKENS=t1,t2`、
+/// `EVO_AGENT_AUTH__HUMAN_TOKENS=h1,h2`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AuthConfigFile {
     /// 是否启用鉴权(默认 false,开发模式)
@@ -502,12 +504,17 @@ pub struct AuthConfigFile {
     /// 合法 token 列表
     #[serde(default)]
     pub tokens: Vec<String>,
+    /// 特权（人工）token 列表:非空时技能注册面(approve/revoke/import)仅收
+    /// 本列表 token(人工把关的机制强制开关;空=闸关闭,行为与旧版一致)
+    #[serde(default)]
+    pub human_tokens: Vec<String>,
 }
 
 impl AuthConfigFile {
     /// 转换为 API 层的 `AuthConfig`
     pub fn to_auth_config(&self) -> crate::api::auth::AuthConfig {
         crate::api::auth::AuthConfig::new(self.tokens.clone(), self.enabled)
+            .with_human_tokens(self.human_tokens.clone())
     }
 }
 
@@ -887,6 +894,7 @@ impl Config {
         if let Some(table) = value.get("auth").and_then(|v| v.as_table()) {
             merge_field(table, "enabled", &mut self.auth.enabled)?;
             merge_field(table, "tokens", &mut self.auth.tokens)?;
+            merge_field(table, "human_tokens", &mut self.auth.human_tokens)?;
         }
         if let Some(table) = value.get("mcp").and_then(|v| v.as_table()) {
             merge_field(table, "servers", &mut self.mcp.servers)?;
@@ -984,6 +992,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("EVO_AGENT_AUTH__TOKENS") {
             self.auth.tokens = v.split(',').map(|s| s.trim().to_string()).collect();
+        }
+        if let Ok(v) = std::env::var("EVO_AGENT_AUTH__HUMAN_TOKENS") {
+            self.auth.human_tokens = v.split(',').map(|s| s.trim().to_string()).collect();
         }
     }
 

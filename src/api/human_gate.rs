@@ -35,6 +35,11 @@ const ANONYMOUS_WRITE_DENIED: &str =
 Start the serve with `--auth-token <secret>` (or set [auth] in the config file) \
 and send `Authorization: Bearer <token>` from the client.";
 
+/// anonymous 写面拒绝文案（ensure_write_allowed 错误路径需要重复携带时用）
+pub fn anonymous_write_denied() -> String {
+    ANONYMOUS_WRITE_DENIED.to_string()
+}
+
 /// HTTP 层可见的调用者身份（llm 身份只在 agent 面，不出现在本判定）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallerIdentity {
@@ -49,6 +54,33 @@ impl CallerIdentity {
         match self {
             CallerIdentity::Human => "human",
             CallerIdentity::Anonymous => "anonymous",
+        }
+    }
+}
+
+/// token 类别（特权闸开启时的两级区分;闸关闭全部为特权=旧版行为）
+///
+/// - `Privileged`：特权列表内的人工 token（或鉴权关闭/闸关闭态的合法调用）
+/// - `Operator`：合法但非特权列表的 token（agent 运行时/工具链持有的那把）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerClass {
+    Privileged,
+    Operator,
+}
+
+impl CallerClass {
+    pub fn from_flag(privileged: bool) -> Self {
+        if privileged {
+            CallerClass::Privileged
+        } else {
+            CallerClass::Operator
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CallerClass::Privileged => "privileged",
+            CallerClass::Operator => "operator",
         }
     }
 }
@@ -70,6 +102,28 @@ pub fn ensure_write_allowed(auth: &AuthConfig) -> Result<CallerIdentity, (Status
             Err((StatusCode::FORBIDDEN, ANONYMOUS_WRITE_DENIED.to_string()))
         }
     }
+}
+
+/// 特权面准入门（技能注册面 approve/revoke/import 等人工把关动作）：
+/// 类别闸开启时非特权 token 一律 403；闸关闭（`[auth] human_tokens` 未配）
+/// 全放行 = 旧版行为，部署侧随时可单独收紧。
+pub fn ensure_privileged(
+    auth: &AuthConfig,
+    class: CallerClass,
+) -> Result<(), (StatusCode, String)> {
+    if class == CallerClass::Privileged {
+        return Ok(());
+    }
+    if !auth.privileged_gate_active() {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        "this management action is reserved for the privileged token: add the \
+         caller's token to [auth] human_tokens (config) to grant human approval \
+         rights; the regular token is operator-class and cannot self-approve"
+            .to_string(),
+    ))
 }
 
 /// 人工审计账（JSONL 追加写；独立于 agent 审计链）
@@ -98,10 +152,35 @@ impl HumanGateLedger {
             "identity": identity.as_str(),
             "outcome": outcome,
         });
+        self.write_line(entry);
+    }
+
+    /// 落一条带类别的记录（注册面管理动作专用：identity 回答「auth 与否」，
+    /// class 回答「特权/操作者 token」——两者合起来才能归因人工把关）
+    pub fn record_class(
+        &self,
+        op: &str,
+        identity: CallerIdentity,
+        class: CallerClass,
+        path: &str,
+        outcome: &str,
+    ) {
+        let entry = serde_json::json!({
+            "ts": unix_now(),
+            "op": op,
+            "path": path,
+            "identity": identity.as_str(),
+            "class": class.as_str(),
+            "outcome": outcome,
+        });
+        self.write_line(entry);
+    }
+
+    fn write_line(&self, entry: serde_json::Value) {
+        let line = entry.to_string();
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let line = entry.to_string();
         let _guard = self.sink.lock();
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)

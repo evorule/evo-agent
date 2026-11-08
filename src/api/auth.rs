@@ -101,6 +101,11 @@ pub struct AuthConfig {
     current_tokens: Arc<Vec<String>>,
     /// 上轮轮换前的 token 列表(过渡期仍可使用,用于无缝轮换)
     previous_tokens: Arc<Vec<String>>,
+    /// 特权（人工）token 列表。非空且鉴权启用时,只有本列表中的 token 视为
+    /// 特权类（CallerClass::Privileged）,其余合法 token 为操作者类——技能
+    /// 注册面（approve/revoke/import）按特权类收紧,人工把关自此有机制强制。
+    /// 空 = 类别闸关闭,全部合法 token 均为特权类（与旧版行为逐字节一致）。
+    human_tokens: Arc<Vec<String>>,
     /// 是否启用鉴权(false 时跳过检查)
     enabled: bool,
     /// 一次性短期 ticket 存储(WS/SSE 浏览器建连换票面)
@@ -116,6 +121,7 @@ impl AuthConfig {
         Self {
             current_tokens: Arc::new(tokens),
             previous_tokens: Arc::new(Vec::new()),
+            human_tokens: Arc::new(Vec::new()),
             enabled,
             tickets: TicketStore::default(),
         }
@@ -126,14 +132,35 @@ impl AuthConfig {
         Self {
             current_tokens: Arc::new(Vec::new()),
             previous_tokens: Arc::new(Vec::new()),
+            human_tokens: Arc::new(Vec::new()),
             enabled: false,
             tickets: TicketStore::default(),
         }
     }
 
+    /// 绑定特权（人工）token 列表(类别闸开关;空列表 = 关闭)
+    pub fn with_human_tokens(mut self, tokens: Vec<String>) -> Self {
+        self.human_tokens = Arc::new(tokens);
+        self
+    }
+
     /// 是否已启用鉴权
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// 类别闸是否生效（启用鉴权且配置了特权 token 列表）
+    pub fn privileged_gate_active(&self) -> bool {
+        self.enabled && !self.human_tokens.is_empty()
+    }
+
+    /// 该 token 是否特权类。类别闸关闭时恒 true(与旧版行为一致);
+    /// 一次性 ticket 通路不经此处判定(换票面默认操作者类)。
+    pub fn is_privileged(&self, token: &str) -> bool {
+        if !self.privileged_gate_active() {
+            return true;
+        }
+        self.human_tokens.iter().any(|t| Self::ct_eq(token, t))
     }
 
     /// 轮换 token:将 current_tokens 移入 previous_tokens,设置新的 current_tokens
@@ -146,6 +173,7 @@ impl AuthConfig {
         Self {
             current_tokens: Arc::new(new_tokens),
             previous_tokens: self.current_tokens.clone(),
+            human_tokens: self.human_tokens.clone(),
             enabled: self.enabled,
             tickets: TicketStore::default(),
         }
@@ -192,6 +220,12 @@ impl AuthConfig {
             }
         }
         for t in self.previous_tokens.iter() {
+            if Self::ct_eq(token, t) {
+                found = true;
+            }
+        }
+        // 特权（人工）token 本身就是合法凭据（类别闸只区分权限,不否定鉴权）
+        for t in self.human_tokens.iter() {
             if Self::ct_eq(token, t) {
                 found = true;
             }
@@ -284,6 +318,7 @@ pub fn decide_auth_posture(auth_enabled: bool, explicit_no_auth: bool, host: &st
 /// 不经继承 env 见到 token。与 `EVORULE_SERVICE_TOKEN` 的捕获即清纪律同款。
 pub fn scrub_auth_env() {
     std::env::remove_var("EVO_AGENT_AUTH__TOKENS");
+    std::env::remove_var("EVO_AGENT_AUTH__HUMAN_TOKENS");
     std::env::remove_var("EVO_AGENT_AUTH__ENABLED");
 }
 
@@ -331,19 +366,29 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    // 未启用鉴权 → 放行
+    // 未启用鉴权 → 放行（类别注入特权：类别闸要求鉴权启用,关闭态无类别之分）
     if !auth_config.enabled {
+        req.extensions_mut()
+            .insert(crate::api::human_gate::CallerClass::Privileged);
         return Ok(next.run(req).await);
     }
 
     let via = if let Some(token) = extract_bearer(&req) {
         if auth_config.validate(&token) {
+            // 类别随请求注入（类别闸关闭恒特权=旧版行为;闸开启时仅特权列表通过）
+            req.extensions_mut()
+                .insert(crate::api::human_gate::CallerClass::from_flag(
+                    auth_config.is_privileged(&token),
+                ));
             AuthVia::Bearer
         } else {
             return Err(StatusCode::UNAUTHORIZED);
         }
     } else if let Some(ticket) = extract_ticket(&req) {
         if auth_config.consume_ticket(&ticket) {
+            // 换票面（浏览器建连）默认操作者类,不随票据提权
+            req.extensions_mut()
+                .insert(crate::api::human_gate::CallerClass::Operator);
             AuthVia::Ticket
         } else {
             return Err(StatusCode::UNAUTHORIZED);
