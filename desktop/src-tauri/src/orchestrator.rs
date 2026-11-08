@@ -777,6 +777,18 @@ pub(crate) fn default_agent_root() -> PathBuf {
     PathBuf::from(home).join("Documents").join("evo-agent")
 }
 
+/// 本引导的期刊签名种子（hex 32B；OnceLock 随壳进程存续——serve 崩溃重启
+/// 复用同钥，桌面重启换钥=旧钥天然退役）。私钥只在壳/serve 进程内存，
+/// 不落盘、不进命令行。
+fn journal_signing_seed_hex() -> &'static str {
+    static SEED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SEED.get_or_init(|| {
+        let mut buf = [0u8; 32];
+        getrandom::getrandom(&mut buf).expect("os rng unavailable");
+        buf.iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
+
 fn spawn_serve(
     ctx: &LaunchContext,
     serve_port: u16,
