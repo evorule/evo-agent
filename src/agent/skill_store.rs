@@ -321,7 +321,8 @@ pub fn scan_skills_dir(dir: &Path, level: SkillLevel) -> Result<Vec<ScannedSkill
     Ok(out)
 }
 
-/// 两源合并 → 生效 manifest 清单（会话创建装配链与未来 IDE 挂接点共用——机制只建一次）
+/// 两源合并 → 生效 manifest 清单 + 注册项钉死哈希表（会话创建装配链与未来
+/// IDE 挂接点共用——机制只建一次）
 ///
 /// 优先级：definition 声明 > 项目级 active > 用户级 active；同名取高优先 + warn
 /// （显式人工动作压倒自动发现；不 fail-fast——目录内容不因优先级语义而炸会话创建）。
@@ -329,20 +330,25 @@ pub fn scan_skills_dir(dir: &Path, level: SkillLevel) -> Result<Vec<ScannedSkill
 /// active 项重算哈希（evorule-hash `digest`），失配 = 自动降级 discovered + warn +
 /// 写回账本（防「批准后偷换内容」）。discovered/revoked 项不进清单。
 ///
+/// 哈希表 = 进清单的注册 active 项（name → 钉死哈希），供 read_skill 读时核验
+/// （被声明项同名压过的行不出表——声明项人工把关、不验哈希）。
+///
 /// Err 仅目录级失败（目录不可读）——单 skill 问题见 `scan_skills_dir`（跳过 + warn）。
 pub fn merge_skill_manifest(
     declared: Vec<SkillManifestEntry>,
     user_dir: &Path,
     project_dir: Option<&Path>,
     registry: &mut SkillRegistry,
-) -> Result<Vec<SkillManifestEntry>, String> {
+) -> Result<MergedSkills, String> {
     let scanned_user = scan_skills_dir(user_dir, SkillLevel::User)?;
     let scanned_project = match project_dir {
         Some(d) => scan_skills_dir(d, SkillLevel::Project)?,
         None => Vec::new(),
     };
 
-    // 账本核对：active 项重算哈希，失配降级（写回账本由调用方 save）
+    // 账本核对：active 项重算哈希，失配降级（写回账本由调用方 save）；
+    // 通过核对者记候选哈希（含路径，声明项压名后按 (name, path) 剔除）
+    let mut candidates: Vec<(String, PathBuf, String)> = Vec::new();
     for scanned in scanned_user.iter().chain(scanned_project.iter()) {
         let Some(entry) = registry.find(&scanned.name, scanned.level) else {
             continue; // 计算态 discovered（账本无行）
@@ -362,7 +368,9 @@ pub fn merge_skill_manifest(
                  discovered (re-approve after reviewing the new content)"
             );
             registry.downgrade(&scanned.name, scanned.level);
+            continue;
         }
+        candidates.push((scanned.name.clone(), scanned.path.clone(), current));
     }
 
     // 组装 manifest：优先级序遍历，同名取高优先 + warn
@@ -413,7 +421,27 @@ pub fn merge_skill_manifest(
             );
         }
     }
-    Ok(merged)
+    // 哈希表：候选注册项中真正进清单的（按 (name, path) 对齐；被声明项
+    // 同名压过的行不出表）
+    let content_hashes: std::collections::BTreeMap<String, String> = candidates
+        .into_iter()
+        .filter(|(name, path, _)| merged.iter().any(|m| &m.name == name && &m.path == path))
+        .map(|(name, _, hash)| (name, hash))
+        .collect();
+    Ok(MergedSkills {
+        manifest: merged,
+        content_hashes,
+    })
+}
+
+/// 两源合并产物：生效 manifest 清单 + 注册项钉死哈希表
+/// （哈希表供 `SkillReadTool` 读时核验；声明面项不入表 = 不验）
+#[derive(Debug, Clone, Default)]
+pub struct MergedSkills {
+    /// 进清单的生效项（definition 声明 > 项目级 active > 用户级 active）
+    pub manifest: Vec<SkillManifestEntry>,
+    /// 注册 active 项的钉死哈希（name → `blake3:<hex>`）
+    pub content_hashes: std::collections::BTreeMap<String, String>,
 }
 
 fn is_active(registry: &SkillRegistry, name: &str, level: SkillLevel) -> bool {
@@ -756,7 +784,9 @@ mod tests {
         .unwrap();
 
         let mut reg = SkillRegistry::load(&tmp.path().join("registry.json")).unwrap();
-        let merged = merge_skill_manifest(
+        let MergedSkills {
+            manifest: merged, ..
+        } = merge_skill_manifest(
             vec![manifest("s", declared_path.clone())],
             &user_dir,
             None,
@@ -794,7 +824,9 @@ mod tests {
             "op",
         );
 
-        let merged = merge_skill_manifest(vec![], &user_dir, Some(&project_dir), &mut reg).unwrap();
+        let MergedSkills {
+            manifest: merged, ..
+        } = merge_skill_manifest(vec![], &user_dir, Some(&project_dir), &mut reg).unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(
             merged[0].path, proj_md,
@@ -828,7 +860,9 @@ mod tests {
         );
         reg.revoke("r1", SkillLevel::User);
 
-        let merged = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
+        let MergedSkills {
+            manifest: merged, ..
+        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
         let names: Vec<&str> = merged.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, vec!["a1"], "discovered/revoked must be excluded");
         let _ = disc_md;
@@ -853,7 +887,9 @@ mod tests {
         // 批准后偷换内容
         std::fs::write(&md, "---\nname: s\ndescription: v2-swapped\n---\nEVIL").unwrap();
 
-        let merged = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
+        let MergedSkills {
+            manifest: merged, ..
+        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
         assert!(
             merged.is_empty(),
             "mismatched skill must leave the manifest"
@@ -877,7 +913,9 @@ mod tests {
             hash_skill_file_prefixed(&user_dir.join("s/SKILL.md")).unwrap(),
             "op",
         );
-        let merged = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
+        let MergedSkills {
+            manifest: merged, ..
+        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
         assert_eq!(merged.len(), 1);
     }
 
@@ -895,7 +933,9 @@ mod tests {
             "op",
         );
 
-        let merged = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
+        let MergedSkills {
+            manifest: merged, ..
+        } = merge_skill_manifest(vec![], &user_dir, None, &mut reg).unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].description, "stable");
         assert_eq!(

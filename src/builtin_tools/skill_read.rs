@@ -29,6 +29,10 @@ use crate::io_handlers::tool_handler::ToolFunction;
 pub struct SkillReadTool {
     /// 声明表:name → SKILL.md 绝对路径
     skills: BTreeMap<String, PathBuf>,
+    /// 钉死哈希:name → `blake3:<hex>`(批准时刻落账)。仅在场的项做**读时核验**
+    /// ——正文自批准后被改动即拒读,逼出「改动→重新审批」;无钉哈希的声明项
+    /// (definition 直配,人工把关)不验,B2 语义不变。
+    pinned_hashes: BTreeMap<String, String>,
     max_bytes: u64,
 }
 
@@ -40,8 +44,16 @@ impl SkillReadTool {
                 .iter()
                 .map(|e| (e.name.clone(), e.path.clone()))
                 .collect(),
+            pinned_hashes: BTreeMap::new(),
             max_bytes: crate::builtin_tools::file_read::DEFAULT_MAX_BYTES,
         }
+    }
+
+    /// 绑定批准时刻钉死的哈希表(会话创建装配链由注册账本核对后传入;
+    /// 缺省空表 = 全员不验,声明面语义保持)
+    pub fn with_pinned_hashes(mut self, hashes: &BTreeMap<String, String>) -> Self {
+        self.pinned_hashes = hashes.clone();
+        self
     }
 
     /// 设置最大文件大小(字节)
@@ -100,7 +112,23 @@ impl SkillReadTool {
                 self.max_bytes
             ));
         }
-        let content = std::fs::read_to_string(path)
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("read failed (binary or permission?): {}", e))?;
+        // 读时核验:正文与批准时刻钉死的哈希失配即拒读(fail-visible)——
+        // 审批钉住内容,任何读取都验钉;改动后未重新审批就进不来正文,
+        // 逼出「改动 → 重新审批」(O 族技能供应链登记面:哈希只在会话创建
+        // 一点核验的 TOCTOU 缺口的读取面闭环)
+        if let Some(pinned) = self.pinned_hashes.get(name) {
+            let actual = evorule_hash::prefixed(&evorule_hash::digest(&bytes));
+            if actual != *pinned {
+                return Err(format!(
+                    "skill '{}' content changed since approval (hash mismatch: pinned {}, actual {}); \
+                     re-approve via the skills management face before loading",
+                    name, pinned, actual
+                ));
+            }
+        }
+        let content = String::from_utf8(bytes)
             .map_err(|e| format!("read failed (binary or permission?): {}", e))?;
 
         let mut map = serde_json::Map::new();
@@ -209,6 +237,33 @@ mod tests {
         let tool = SkillReadTool::new(&[entry("d", sub, "desc")]);
         let err = tool.call_sync(&args("d")).unwrap_err();
         assert!(err.contains("not a regular file"), "got: {}", err);
+    }
+
+    /// 读时验哈希:正文自批准后被改动即拒读(fail-visible),逼出「改动→重新审批」;
+    /// 无钉哈希的声明项不验(B2 语义不变)
+    #[test]
+    fn test_read_refuses_content_changed_since_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_skill(dir.path(), "a/SKILL.md", "---\nname: a\n---\nA");
+        let pinned = crate::agent::skill_store::hash_skill_file_prefixed(&p).unwrap();
+        let pinned_map = BTreeMap::from([("a".to_string(), pinned)]);
+        let tool =
+            SkillReadTool::new(&[entry("a", p.clone(), "d")]).with_pinned_hashes(&pinned_map);
+
+        // 原文可读
+        assert!(tool.call_sync(&args("a")).is_ok());
+
+        // 批准后偷换内容 → 读时拒
+        std::fs::write(&p, "---\nname: a\n---\nB").unwrap();
+        let err = tool.call_sync(&args("a")).unwrap_err();
+        assert!(
+            err.contains("changed since approval"),
+            "must refuse tampered content: {err}"
+        );
+
+        // 无钉哈希(声明面)不验
+        let free = SkillReadTool::new(&[entry("a", p, "d")]);
+        assert!(free.call_sync(&args("a")).is_ok());
     }
 
     /// spec 形态:read_skill 在静态目录中,参数仅 skill_name(必填)
