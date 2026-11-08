@@ -426,6 +426,10 @@ pub struct SkillFrontmatter {
     pub name: Option<String>,
     /// frontmatter description(manifest 渲染用;缺省 = 声明缺失,加载期 warn)
     pub description: Option<String>,
+    /// 环境敏感性声明(`env-sensitive: true`):记录环境事实(音色清单/引擎
+    /// 版本/能力可用性等)的技能置位——账本记批准时环境指纹,会话创建
+    /// 比对失配即出复验提示(O-638② 新鲜度面;缺省 false=零噪音)
+    pub env_sensitive: bool,
 }
 
 /// 轻量 frontmatter 解析(照 skill-adapter 正则行解析口径,不引 YAML 依赖:
@@ -476,6 +480,10 @@ pub fn parse_skill_frontmatter(content: &str) -> Result<SkillFrontmatter, String
         match k.trim() {
             "name" => fm.name = Some(value),
             "description" => fm.description = Some(value),
+            // 环境敏感性开关(两种拼法同认;值 true/1/yes 视为开)
+            "env-sensitive" | "env_sensitive" => {
+                fm.env_sensitive = matches!(value.to_lowercase().as_str(), "true" | "1" | "yes");
+            }
             _ => {}
         }
     }
