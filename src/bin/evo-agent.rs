@@ -5353,6 +5353,7 @@ mod run_policy_gate_tests {
             identity_segment: None,
             north_star: None,
             handoff: None,
+            self_audit: None,
         }
     }
 }
