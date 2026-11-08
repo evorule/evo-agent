@@ -2887,6 +2887,11 @@ fn cmd_serve(
         .unwrap_or_else(|_| "http://127.0.0.1:9130/llm/execute".to_string());
     eprintln!("[llm] LLM executor (SG-1 relay): {}", executor_url);
 
+    // 2.6 技能期刊签名引导密钥：壳经 env 载体交接（纵深加固 v2）,固化进
+    //     进程内存（OnceLock）；env 副本随 scrub_auth_env 清除——私钥只
+    //     存在于壳/serve 进程内存，文件系统攻击者不可读
+    evo_agent::agent::journal_signing::init_from_env();
+
     // 3. G7:构造鉴权配置
     //    优先级:--no-auth > --auth-token > 配置文件/环境变量
     let auth_config = if no_auth {

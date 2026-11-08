@@ -1733,30 +1733,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_approve_records_env_stamp_for_sensitive_skills() {
-        // O-638②:env-sensitive 技能批准时账本记环境指纹(Some)与声明(true);
+        // env-sensitive 技能批准时账本记环境指纹(Some)与声明(true);
         // 非 sensitive 技能指纹照记但声明为 false
         let tmp = tempfile::tempdir().unwrap();
-        write_skill(
-            tmp.path(),
-            "data/skills",
-            "fact",
-            "---
-name: fact
-description: d
-env-sensitive: true
----
-A",
-        );
-        write_skill(
-            tmp.path(),
-            "data/skills",
-            "howto",
-            "---
-name: howto
-description: d
----
-B",
-        );
+        let fa = fixture("fact", "A", "env-sensitive: true");
+        let fb = fixture("howto", "B", "");
+        write_skill(tmp.path(), "data/skills", "fact", &fa);
+        write_skill(tmp.path(), "data/skills", "howto", &fb);
         let app = human_router(tmp.path().to_path_buf());
         for name in ["fact", "howto"] {
             let (status, _) = post(
@@ -1774,6 +1757,11 @@ B",
         let howto = reg.find("howto", SkillLevel::User).unwrap();
         assert!(!howto.env_sensitive);
         assert!(howto.env_fp.is_some());
+    }
+
+    fn fixture(name: &str, last: &str, extra: &str) -> String {
+        // SKILL.md 文件内容 = 真换行（rust 源内以转义序列书写）
+        format!("---\nname: {name}\ndescription: d\n{extra}\n---\n{last}")
     }
 
     #[tokio::test]

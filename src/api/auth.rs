@@ -320,6 +320,9 @@ pub fn scrub_auth_env() {
     std::env::remove_var("EVO_AGENT_AUTH__TOKENS");
     std::env::remove_var("EVO_AGENT_AUTH__HUMAN_TOKENS");
     std::env::remove_var("EVO_AGENT_AUTH__ENABLED");
+    // 技能期刊签名引导密钥：serve 侧固化进进程内存后,env 副本即清
+    // （工作区子进程不可见——与令牌同纪律）
+    std::env::remove_var("EVO_AGENT_JOURNAL__SIGNING_KEY");
 }
 
 /// 从请求中提取 Bearer token(仅 Authorization 头)
