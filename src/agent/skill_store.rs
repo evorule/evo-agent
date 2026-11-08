@@ -125,43 +125,308 @@ struct RegistryFile {
     skills: Vec<RegistryEntry>,
 }
 
-/// 注册账本（`<skills 根>/registry.json`）
+// =============================================================================
+// 期刊层（账本纵深加固条目）：registry.chain.jsonl = 唯一事实源，registry.json = 物化快照
+// =============================================================================
+
+/// 期刊文件名（与快照同目录）
+pub const JOURNAL_FILE: &str = "registry.chain.jsonl";
+
+/// 创世记录的前向哈希占位（链头无前驱）
+const JOURNAL_GENESIS_PREV: &str = "genesis";
+
+/// 账本动作（期刊基本单元；全部幂等——任意前缀重放收敛到同一状态，
+/// 这是「期刊先行 + 崩溃后按期刊重放自愈」正确性的前提）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+pub enum JournalAction {
+    /// 引导：期刊首次物化时锚定当时全量状态（迁移记录；此后动作逐条入刊）
+    Bootstrap { entries: Vec<RegistryEntry> },
+    /// 批准（幂等 upsert，载荷=落账后的完整行——重放所需全部结果字段，
+    /// 缺一字段即重放态≠快照=永久漂移假阳性）
+    Approve { entry: RegistryEntry },
+    /// 撤销
+    Revoke { name: String, level: SkillLevel },
+    /// 失配降级
+    Downgrade { name: String, level: SkillLevel },
+}
+
+/// 期刊记录：hash = prefixed(blake3(prev_hash || canonical(record)))——链式绑定
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalRecord {
+    pub seq: u64,
+    pub prev_hash: String,
+    #[serde(flatten)]
+    pub action: JournalAction,
+    pub hash: String,
+}
+
+/// 记录哈希（canonical = serde_json 固定键序;B 族纪律禁自写 blake3）
+fn journal_record_hash(seq: u64, prev_hash: &str, action: &JournalAction) -> String {
+    let body = serde_json::json!({ "seq": seq, "prev_hash": prev_hash, "action": action });
+    evorule_hash::prefixed(&evorule_hash::digest(body.to_string().as_bytes()))
+}
+
+/// 重放单条动作到条目集
+fn apply_action(entries: &mut Vec<RegistryEntry>, action: &JournalAction) {
+    match action {
+        JournalAction::Bootstrap { entries: e } => *entries = e.clone(),
+        JournalAction::Approve { entry } => {
+            if let Some(x) = entries
+                .iter_mut()
+                .find(|x| x.name == entry.name && x.level == entry.level)
+            {
+                *x = entry.clone();
+            } else {
+                entries.push(entry.clone());
+            }
+        }
+        JournalAction::Revoke { name, level } => {
+            if let Some(x) = entries
+                .iter_mut()
+                .find(|x| x.name == *name && x.level == *level)
+            {
+                x.status = SkillStatus::Revoked;
+            }
+        }
+        JournalAction::Downgrade { name, level } => {
+            if let Some(x) = entries
+                .iter_mut()
+                .find(|x| x.name == *name && x.level == *level)
+            {
+                x.status = SkillStatus::Discovered;
+            }
+        }
+    }
+}
+
+/// 期刊行追加（append + fsync——期刊先行的持久化保证）
+fn append_journal_line(path: &Path, rec: &JournalRecord) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("skill journal '{}' append failed: {}", path.display(), e))?;
+    let line =
+        serde_json::to_string(rec).map_err(|e| format!("skill journal serialize failed: {}", e))?;
+    writeln!(f, "{line}").map_err(|e| format!("skill journal write failed: {}", e))?;
+    f.sync_all()
+        .map_err(|e| format!("skill journal sync failed: {}", e))?;
+    Ok(())
+}
+
+fn journal_path_for(snapshot: &Path) -> PathBuf {
+    snapshot
+        .parent()
+        .map(|d| d.join(JOURNAL_FILE))
+        .unwrap_or_else(|| PathBuf::from(JOURNAL_FILE))
+}
+
+/// 期刊与快照的条目集等价（按 (name, level) 键对齐后全字段比较——排序无关）
+fn entries_equal_sorted(a: &[RegistryEntry], b: &[RegistryEntry]) -> bool {
+    let mut sa = a.to_vec();
+    let mut sb = b.to_vec();
+    let key = |v: &RegistryEntry| {
+        (
+            v.name.clone(),
+            v.level.as_str().to_string(),
+            v.path.to_string_lossy().to_string(),
+        )
+    };
+    sa.sort_by_key(key);
+    sb.sort_by_key(key);
+    // RegistryEntry 无 PartialEq 派生——逐字段比（路径用 to_string_lossy 归一）
+    sa.len() == sb.len()
+        && sa.iter().zip(sb.iter()).all(|(x, y)| {
+            x.name == y.name
+                && x.level == y.level
+                && x.status == y.status
+                && x.path.to_string_lossy() == y.path.to_string_lossy()
+                && x.content_hash == y.content_hash
+                && x.approved_at == y.approved_at
+                && x.approved_by == y.approved_by
+                && x.env_fp == y.env_fp
+                && x.env_sensitive == y.env_sensitive
+        })
+}
+
+/// 注册账本（`<skills 根>/registry.json` = 物化快照；`registry.chain.jsonl` = 期刊真源）
 ///
-/// 并发口径：serve 单进程、审批低频，原子写（临时文件 + rename）即可，
-/// 无锁机制（设计档 §4.2）。
+/// 并发口径：serve 单进程、审批低频；期刊追加与快照重写置于同一互斥段
+/// （save 内），进程级串行足够（设计档 §4.2）。
+///
+/// 纵深语义（账本纵深加固条目）：旁路手改快照在 load 被检测（drift 标记）并在下一次
+/// save 自愈覆写——手改产物失效且留痕；期刊中段篡改 = fail-visible 硬错。
+/// 诚实天花板：同权限攻击者整体一致重写「期刊+快照」不可检（无签名），
+/// 根治 = 壳侧签名（设计稿 §1.4 v2）。
 #[derive(Debug, Clone)]
 pub struct SkillRegistry {
     path: PathBuf,
+    journal_path: PathBuf,
     entries: Vec<RegistryEntry>,
+    /// 期刊尾 (seq, hash)；None = 期刊未物化（首次动作时引导）
+    journal_tail: Option<(u64, String)>,
+    /// 待入刊动作（save 时 flush：期刊先行，快照随后）
+    pending: Vec<JournalAction>,
+    /// 快照与期刊重放态漂移（旁路手改证据；load 只标记，自愈在写面 save）
+    drift: bool,
 }
 
 impl SkillRegistry {
-    /// 加载账本。文件缺失 = 空账本（首次运行常态）；JSON 损坏 = Err
-    /// fail-visible（门禁不可静默降级，H 族）。
+    /// 加载账本。期刊在 = 校验链+重放为真源（快照漂移只标记,自愈在写面
+    /// save）；期刊缺 = 快照为真（首个动作时引导物化期刊）；两者皆缺 =
+    /// 空账本。损坏 = Err fail-visible（门禁不可静默降级，H 族）。
     pub fn load(path: &Path) -> Result<Self, String> {
-        if !path.exists() {
-            return Ok(Self {
+        let journal_path = journal_path_for(path);
+        let journal_live = journal_path.exists()
+            && std::fs::metadata(&journal_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+        if journal_live {
+            let (entries, tail) = Self::load_journal(&journal_path)?;
+            let mut reg = Self {
                 path: path.to_path_buf(),
+                journal_path,
+                entries: entries.clone(),
+                journal_tail: Some(tail),
+                pending: Vec::new(),
+                drift: false,
+            };
+            // 快照漂移检测（只标记——GET 只读;自愈在写面 save 覆写快照）
+            if path.exists() {
+                let snap = std::fs::read_to_string(path).map_err(|e| {
+                    format!("skill registry '{}' unreadable: {}", path.display(), e)
+                })?;
+                let file: RegistryFile = serde_json::from_str(&snap).map_err(|e| {
+                    format!(
+                        "skill registry '{}' corrupt (fix or delete the file): {}",
+                        path.display(),
+                        e
+                    )
+                })?;
+                if !entries_equal_sorted(&file.skills, &entries) {
+                    reg.drift = true;
+                    tracing::warn!(
+                        "skill registry snapshot drifted from journal;                          heal on next save (out-of-band edit detected)"
+                    );
+                }
+            }
+            Ok(reg)
+        } else if path.exists() {
+            // 旧版升级/无期刊态：快照为真；首个动作时引导物化期刊
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| format!("skill registry '{}' unreadable: {}", path.display(), e))?;
+            let file: RegistryFile = serde_json::from_str(&content).map_err(|e| {
+                format!(
+                    "skill registry '{}' corrupt (fix or delete the file): {}",
+                    path.display(),
+                    e
+                )
+            })?;
+            Ok(Self {
+                path: path.to_path_buf(),
+                journal_path,
+                entries: file.skills,
+                journal_tail: None,
+                pending: Vec::new(),
+                drift: false,
+            })
+        } else {
+            Ok(Self {
+                path: path.to_path_buf(),
+                journal_path,
                 entries: Vec::new(),
-            });
+                journal_tail: None,
+                pending: Vec::new(),
+                drift: false,
+            })
         }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("skill registry '{}' unreadable: {}", path.display(), e))?;
-        let file: RegistryFile = serde_json::from_str(&content).map_err(|e| {
+    }
+
+    /// 期刊校验 + 重放：seq 连续、前向链绑定、逐记录哈希核对；
+    /// 末行解析失败 = 追加撕裂（崩溃伪影）截断恢复；中段损坏 = Err（篡改特征）
+    fn load_journal(journal_path: &Path) -> Result<(Vec<RegistryEntry>, (u64, String)), String> {
+        let content = std::fs::read_to_string(journal_path).map_err(|e| {
             format!(
-                "skill registry '{}' corrupt (fix or delete the file): {}",
-                path.display(),
+                "skill journal '{}' unreadable: {}",
+                journal_path.display(),
                 e
             )
         })?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            entries: file.skills,
-        })
+        let total = content.lines().count();
+        let mut records: Vec<JournalRecord> = Vec::new();
+        for (idx, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<JournalRecord>(line) {
+                Ok(r) => records.push(r),
+                Err(e) => {
+                    if idx + 1 == total {
+                        tracing::warn!(
+                            "skill journal '{}' tail torn (crash during append); truncated",
+                            journal_path.display()
+                        );
+                        break;
+                    }
+                    return Err(format!(
+                        "skill journal '{}' corrupt at line {} (mid-journal damage): {}",
+                        journal_path.display(),
+                        idx + 1,
+                        e
+                    ));
+                }
+            }
+        }
+        let mut prev = JOURNAL_GENESIS_PREV.to_string();
+        let mut entries: Vec<RegistryEntry> = Vec::new();
+        for (want, r) in records.iter().enumerate() {
+            let want = want as u64;
+            if r.seq != want {
+                return Err(format!(
+                    "skill journal '{}' seq discontinuity at {} (expected {}, got {})",
+                    journal_path.display(),
+                    r.seq,
+                    want,
+                    r.seq
+                ));
+            }
+            if r.prev_hash != prev {
+                return Err(format!(
+                    "skill journal '{}' chain broken at seq {} (prev_hash mismatch)",
+                    journal_path.display(),
+                    r.seq
+                ));
+            }
+            let expect = journal_record_hash(r.seq, &r.prev_hash, &r.action);
+            if expect != r.hash {
+                return Err(format!(
+                    "skill journal '{}' record hash mismatch at seq {} (tampered?)",
+                    journal_path.display(),
+                    r.seq
+                ));
+            }
+            apply_action(&mut entries, &r.action);
+            prev = r.hash.clone();
+        }
+        let tail = records
+            .last()
+            .map(|r| (r.seq, r.hash.clone()))
+            .unwrap_or((0, JOURNAL_GENESIS_PREV.to_string()));
+        Ok((entries, tail))
     }
 
-    /// 原子写（临时文件 + rename；rename 在 Windows 上覆盖已存在目标）
-    pub fn save(&self) -> Result<(), String> {
+    /// 快照与期刊是否存在漂移（旁路手改证据；save 后清除）
+    pub fn journal_drift(&self) -> bool {
+        self.drift
+    }
+
+    /// 持久化：待刷动作先入期刊（fsync），随后重写快照（物化缓存）。
+    /// 崩溃窗：期刊已落、快照未落 → 下次 load 按期刊重放自愈（动作保留）；
+    /// 反向顺序会丢已批动作，故顺序不可颠倒。无待刷动作 = 仅重写快照
+    /// （漂移自愈位）。原子写（临时文件 + rename；Windows rename 可覆盖目标）。
+    pub fn save(&mut self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 format!(
@@ -170,6 +435,38 @@ impl SkillRegistry {
                     e
                 )
             })?;
+        }
+        if !self.pending.is_empty() {
+            if self.journal_tail.is_none() {
+                // 首次物化：引导记录锚定当前全量态（已含待刷动作的效果），
+                // 待刷清单随之消费——个体动作史让位于迁移记录（设计稿 §1.2）
+                let action = JournalAction::Bootstrap {
+                    entries: self.entries.clone(),
+                };
+                let hash = journal_record_hash(0, JOURNAL_GENESIS_PREV, &action);
+                let rec = JournalRecord {
+                    seq: 0,
+                    prev_hash: JOURNAL_GENESIS_PREV.to_string(),
+                    action,
+                    hash: hash.clone(),
+                };
+                append_journal_line(&self.journal_path, &rec)?;
+                self.journal_tail = Some((0, hash));
+                self.pending.clear();
+            } else {
+                for action in self.pending.drain(..) {
+                    let (seq, prev) = self.journal_tail.clone().unwrap();
+                    let hash = journal_record_hash(seq + 1, &prev, &action);
+                    let rec = JournalRecord {
+                        seq: seq + 1,
+                        prev_hash: prev.clone(),
+                        action: action.clone(),
+                        hash: hash.clone(),
+                    };
+                    append_journal_line(&self.journal_path, &rec)?;
+                    self.journal_tail = Some((seq + 1, hash));
+                }
+            }
         }
         let json = serde_json::to_string_pretty(&RegistryFile {
             skills: self.entries.clone(),
@@ -180,6 +477,7 @@ impl SkillRegistry {
             .map_err(|e| format!("skill registry tmp write failed: {}", e))?;
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| format!("skill registry rename failed: {}", e))?;
+        self.drift = false;
         Ok(())
     }
 
@@ -222,6 +520,8 @@ impl SkillRegistry {
             e.approved_by = Some(approved_by.to_string());
             e.env_fp = env_fp;
             e.env_sensitive = env_sensitive;
+            let entry = e.clone();
+            self.pending.push(JournalAction::Approve { entry });
             return;
         }
         self.entries.push(RegistryEntry {
@@ -235,6 +535,11 @@ impl SkillRegistry {
             env_fp,
             env_sensitive,
         });
+        let entry = self
+            .find(name, level)
+            .cloned()
+            .expect("entry just upserted must exist");
+        self.pending.push(JournalAction::Approve { entry });
     }
 
     /// 撤销：置 revoked（保留历史行便于审计回看）；无行时 no-op
@@ -242,13 +547,23 @@ impl SkillRegistry {
     pub fn revoke(&mut self, name: &str, level: SkillLevel) {
         if let Some(e) = self.find_mut(name, level) {
             e.status = SkillStatus::Revoked;
+            self.pending.push(JournalAction::Revoke {
+                name: name.to_string(),
+                level,
+            });
         }
     }
 
     /// 失配降级：active → discovered（保留旧哈希供审计回看「批准时的内容已变」）
     fn downgrade(&mut self, name: &str, level: SkillLevel) {
-        if let Some(e) = self.find_mut(name, level) {
-            e.status = SkillStatus::Discovered;
+        if self.find(name, level).is_some() {
+            if let Some(e) = self.find_mut(name, level) {
+                e.status = SkillStatus::Discovered;
+            }
+            self.pending.push(JournalAction::Downgrade {
+                name: name.to_string(),
+                level,
+            });
         }
     }
 
@@ -728,6 +1043,241 @@ mod tests {
     }
 
     // ---- 扫描正反例 ----
+
+    // =========================================================================
+    // 期刊层（账本纵深加固条目）：重放/漂移自愈/篡改硬错/撕裂恢复/引导迁移
+    // =========================================================================
+
+    #[test]
+    fn test_journal_replays_across_reload() {
+        // 批准+落盘 → 全新 load 重放期刊 → 状态一致;撤销+落盘 → 重放得 revoked
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("registry.json");
+        let md = write_skill(
+            &tmp.path().join("data/skills"),
+            "s",
+            "---\nname: s\ndescription: d\n---\nA",
+        );
+        let hash = hash_skill_file_prefixed(&md).unwrap();
+
+        let mut reg = SkillRegistry::load(&reg_path).unwrap();
+        reg.approve(
+            "s",
+            md.clone(),
+            SkillLevel::User,
+            hash.clone(),
+            "op",
+            None,
+            false,
+        );
+        reg.save().unwrap();
+
+        let reg2 = SkillRegistry::load(&reg_path).unwrap();
+        assert!(!reg2.journal_drift());
+        assert_eq!(
+            reg2.find("s", SkillLevel::User).unwrap().status,
+            SkillStatus::Active
+        );
+        assert_eq!(reg2.entries.len(), 1);
+        assert!(
+            reg_path.parent().unwrap().join(JOURNAL_FILE).exists(),
+            "journal must materialize"
+        );
+
+        let mut reg3 = reg2.clone();
+        reg3.revoke("s", SkillLevel::User);
+        reg3.save().unwrap();
+        let reg4 = SkillRegistry::load(&reg_path).unwrap();
+        assert_eq!(
+            reg4.find("s", SkillLevel::User).unwrap().status,
+            SkillStatus::Revoked
+        );
+    }
+
+    #[test]
+    fn test_journal_detects_snapshot_drift_and_heals_on_save() {
+        // 旁路手改快照 → load 标记漂移 + 期刊真源在内存生效 → save 自愈覆写快照
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("registry.json");
+        let md = write_skill(
+            &tmp.path().join("data/skills"),
+            "s",
+            "---\nname: s\ndescription: d\n---\nA",
+        );
+        let mut reg = SkillRegistry::load(&reg_path).unwrap();
+        reg.approve(
+            "s",
+            md.clone(),
+            SkillLevel::User,
+            hash_skill_file_prefixed(&md).unwrap(),
+            "op",
+            None,
+            false,
+        );
+        reg.save().unwrap();
+
+        // 旁路手改快照（伪造 revoked 行 + 塞入假行）
+        let mut file: RegistryFile =
+            serde_json::from_str(&std::fs::read_to_string(&reg_path).unwrap()).unwrap();
+        file.skills[0].status = SkillStatus::Revoked;
+        file.skills.push(RegistryEntry {
+            name: "smuggled".to_string(),
+            path: PathBuf::from("x"),
+            level: SkillLevel::User,
+            status: SkillStatus::Active,
+            content_hash: None,
+            approved_at: None,
+            approved_by: None,
+            env_fp: None,
+            env_sensitive: false,
+        });
+        std::fs::write(&reg_path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+
+        let reg2 = SkillRegistry::load(&reg_path).unwrap();
+        assert!(reg2.journal_drift(), "out-of-band edit must be flagged");
+        assert_eq!(
+            reg2.find("s", SkillLevel::User).unwrap().status,
+            SkillStatus::Active,
+            "journal truth wins"
+        );
+        assert!(
+            reg2.find("smuggled", SkillLevel::User).is_none(),
+            "smuggled row must not survive replay"
+        );
+
+        // 写面自愈:快照被期刊态覆写
+        let mut reg3 = reg2.clone();
+        reg3.save().unwrap();
+        let reg4 = SkillRegistry::load(&reg_path).unwrap();
+        assert!(!reg4.journal_drift(), "healed on save");
+        assert!(reg4.find("smuggled", SkillLevel::User).is_none());
+    }
+
+    #[test]
+    fn test_journal_mid_chain_tamper_fails_visible() {
+        // 中段记录被改（报文伪造）→ 哈希核对失配 → fail-visible 拒载
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("registry.json");
+        let md = write_skill(
+            &tmp.path().join("data/skills"),
+            "s",
+            "---\nname: s\ndescription: d\n---\nA",
+        );
+        let mut reg = SkillRegistry::load(&reg_path).unwrap();
+        reg.approve(
+            "s",
+            md.clone(),
+            SkillLevel::User,
+            hash_skill_file_prefixed(&md).unwrap(),
+            "op",
+            None,
+            false,
+        );
+        reg.save().unwrap();
+        reg.revoke("s", SkillLevel::User);
+        reg.save().unwrap();
+
+        let jp = reg_path.parent().unwrap().join(JOURNAL_FILE);
+        let content = std::fs::read_to_string(&jp).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        assert!(lines.len() >= 2);
+        let mut rec: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        rec["name"] = serde_json::json!("forged");
+        lines[1] = serde_json::to_string(&rec).unwrap();
+        std::fs::write(&jp, lines.join("\n")).unwrap();
+
+        let err = SkillRegistry::load(&reg_path).unwrap_err();
+        assert!(
+            err.contains("hash mismatch") || err.contains("chain broken"),
+            "mid-chain tamper must fail visible: {err}"
+        );
+    }
+
+    #[test]
+    fn test_journal_torn_tail_recovers() {
+        // 末行撕裂（追加中途崩溃）→ 截断恢复（warn），前缀状态完好
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("registry.json");
+        let md = write_skill(
+            &tmp.path().join("data/skills"),
+            "s",
+            "---\nname: s\ndescription: d\n---\nA",
+        );
+        let mut reg = SkillRegistry::load(&reg_path).unwrap();
+        reg.approve(
+            "s",
+            md.clone(),
+            SkillLevel::User,
+            hash_skill_file_prefixed(&md).unwrap(),
+            "op",
+            None,
+            false,
+        );
+        reg.save().unwrap();
+
+        let jp = reg_path.parent().unwrap().join(JOURNAL_FILE);
+        let mut content = std::fs::read_to_string(&jp).unwrap();
+        content.push_str("{\"seq\":1,\"prev_h"); // 半行
+        std::fs::write(&jp, content).unwrap();
+
+        let reg2 = SkillRegistry::load(&reg_path).unwrap();
+        assert!(!reg2.journal_drift());
+        assert_eq!(
+            reg2.entries.len(),
+            1,
+            "torn tail truncated, prefix preserved"
+        );
+    }
+
+    #[test]
+    fn test_journal_bootstrap_migrates_legacy_snapshot() {
+        // 旧版升级:只有快照无期刊 → load 读快照 → 首动作物化期刊(引导记录)
+        // → 全新 load 重放一致
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("registry.json");
+        let md = write_skill(
+            &tmp.path().join("data/skills"),
+            "legacy",
+            "---\nname: legacy\ndescription: d\n---\nL",
+        );
+        let legacy = RegistryFile {
+            skills: vec![RegistryEntry {
+                name: "legacy".to_string(),
+                path: md.clone(),
+                level: SkillLevel::User,
+                status: SkillStatus::Active,
+                content_hash: Some(hash_skill_file_prefixed(&md).unwrap()),
+                approved_at: Some(1),
+                approved_by: Some("legacy-op".to_string()),
+                env_fp: None,
+                env_sensitive: false,
+            }],
+        };
+        std::fs::write(&reg_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let mut reg = SkillRegistry::load(&reg_path).unwrap();
+        assert!(!reg.journal_drift());
+        reg.approve(
+            "legacy",
+            md.clone(),
+            SkillLevel::User,
+            hash_skill_file_prefixed(&md).unwrap(),
+            "op",
+            None,
+            false,
+        );
+        reg.save().unwrap();
+        assert!(reg_path.parent().unwrap().join(JOURNAL_FILE).exists());
+
+        let reg2 = SkillRegistry::load(&reg_path).unwrap();
+        assert!(!reg2.journal_drift());
+        let e = reg2.find("legacy", SkillLevel::User).unwrap();
+        assert_eq!(
+            e.approved_by.as_deref(),
+            Some("op"),
+            "replayed approve must win"
+        );
+    }
 
     #[test]
     fn test_merge_flags_env_stale_only_for_sensitive_and_mismatched() {
