@@ -16,7 +16,7 @@ description: 创建、修改、撤销宿主技能（SKILL.md）的正确通道�
 | 注册账本 | `<serve workdir>/data/skills/registry.json` |
 | 管理面端点 | `/api/skills`、`/api/skills/pending`、`/api/skills/approve`、`/api/skills/revoke`、`/api/skills/import`（**都在 serve.port**） |
 | 文件面端点 | `/api/files/read`、`PUT /api/files/write`、`DELETE /api/files`、`/api/files/list` |
-| 审计留痕 | `<serve workdir>/data/human_gate_ledger.jsonl`（每个写面操作一行；身份字段当前版本不区分人工与 agent 发起） |
+| 审计留痕 | `<serve workdir>/data/human_gate_ledger.jsonl`（approve/revoke/import 亦落账；identity=鉴权态、class=特权/操作者 token，两字段合看才可归因） |
 
 **注意**：`/api/services` 在 **engine.port**，`/api/skills` 在 **serve.port**，两者不同，跨端口一律 404。端口从 `runtime.json` 读，不要写死。
 
@@ -41,13 +41,21 @@ description: 创建、修改、撤销宿主技能（SKILL.md）的正确通道�
 
 **也可以走 import**（`POST /api/skills/import`，body `{"path":"<workdir 内 bundle 相对路径>"}`，bundle 格式 `{"skills":[{"name","level","body"}]}`）——它会自动落盘并留痕，且**拒绝覆盖任何 active/revoked 同名行**。import 只适合批量导入或首次创建。
 
-### 2.3 撤销与恢复
+### 2.3 晋升导出（runtime → 部署面）
+
+```
+POST /api/skills/export  body={name, level}
+```
+
+返回 import 同构 bundle（导出前重算哈希核对，失配拒绝）——人工复核后可收编进 definition/部署层。仅 active 项可导出。
+
+### 2.4 撤销与恢复
 
 ```
 POST /api/skills/revoke body={name,level}
 ```
 
-撤销后该技能不进会话技能清单（`read_skill` 读不到）。**恢复**：把 SKILL.md 放回原注册路径，直接重新 approve 即幂等重激活，不必走 import。
+撤销后该技能不进会话技能清单（`read_skill` 读不到）。**恢复**：把 SKILL.md 放回原注册路径，直接重新 approve 即幂等重激活，不必走 import。撤销后同名 import 会被拒（报错即指此恢复路径）；**不要删除技能目录**——删了目录 approve 就没有可扫的候选，只能走账本外手段（已封路）。
 
 ## 3. 硬性前置：frontmatter 与命名
 
@@ -55,14 +63,14 @@ POST /api/skills/revoke body={name,level}
 - 首行必须是 `---` frontmatter 围栏，含 `name:` 与 `description:`；围栏不闭合会被**拒绝**
 - 轻量 frontmatter 解析器**只认平铺 `key: value`**；嵌套块、列表行会被跳过并告警
 - `name` 建议用 `[a-zA-Z0-9][a-zA-Z0-9_-]*`，且**目录名 = frontmatter name = 声明名**（不一致会被 import 判为钓鱼而拒）
-- 泄露检查两级：**署名族**（宣称本文由模型自动写就之类表述）→ approve **硬拦 422**；**技术词**（如 agent、prompt、上下文窗口）→ 仅 warning，不拦。注意：**正文里引用这些词面也会被命中**，写示例时必须绕开字面量（改用转述，如本条这样写）。
+- 泄露检查两级：**署名族**（宣称本文由模型自动写就之类表述）→ approve **硬拦 422**；**技术词**（如 agent、prompt、上下文窗口）→ 仅 warning，不拦。豁免语义：命中词面**整体包在「」引号内**（举例/转述语境）降级为警告不硬拦；命中处紧邻路径字符（自家安装根等路径片段）不再告警。仍是转述最稳——引号豁免只覆盖词面被完整括起的行。
 
 ## 4. 实测踩坑清单
 
-1. **撤销后同名重建有死锁坑**：若撤销后**删除了技能目录**，import 同名会被拒（报错让你「先撤销」，但已经撤销过了），approve 又因目录已删扫描不到 → 双拒。**正确做法：不要删目录**；已撤销的技能恢复 = 放回 SKILL.md 直接重新 approve。删除后想重建同名的场景当前无官方解（已知限制，管理面指引待改进）。
-2. **管理面不察觉篡改**：`GET /api/skills` 读的是账本里的旧哈希，**从不重算文件**。文件被改后管理面仍显示 active、哈希不变。哈希失配只在新会话创建时降级。所以**改完文件必须自己重新 approve**，否则下次会话创建时该技能会静默降级为 discovered。
-3. **approve 不校验正文完整性**：乱码字符（U+FFFD）不会被拦，approve 照样 200。**写入后必须自己回读检查**。
-4. **端口分裂**：`/api/skills*` 与 `/api/files*` 在 serve.port；`/api/services` 在 engine.port。
+1. **撤销后同名重建曾是无解死锁**（import 拒、approve 404，报错曾指向死路）。现版已治理：撤销行重导入的报错直接指明恢复路径——**放回 SKILL.md 重新 approve**。纪律不变：**不要删技能目录**；注册账本（registry.json）已被文件面封路（写/删一律 403），手工清账本这条路已不存在。
+2. **改完必须重新 approve（机制已双向收紧）**：管理面 `GET /api/skills` 会对 active 项重算盘上哈希并暴露 `content_matches` 标记；`read_skill` 装载时也核验钉死哈希，失配直接拒读。改完不重批 = 下次会话创建降级停用（清单段会以停用通知明示），且未重批前正文读不出来。
+3. **乱码字符（U+FFFD）批准面已拒收**：approve 检出替换字符直接 422。写入后回读自查仍是好习惯——闸拦的是批准，不救你的时间。
+4. **端口分裂（已有自描述口）**：`GET /api/meta` 返回本面路由族清单并指明其余面在 runtime.json 的对应端口；`/api/skills*` 与 `/api/files*` 在 serve.port，`/api/services` 在 engine.port，跨端口一律 404。
 5. **写面工具沙箱隔离**：agent 侧 `file_write`/`file_delete` 的可写域与技能目录可能不重叠，直接写会报 `outside writable_dir` 或 `parent dir (..) not allowed`。走宿主 `/api/files/*` HTTP 面可解。
 6. **技能清单是会话创建时注入的**：新建的技能**当次会话不出现**在【可用技能清单】里，需新会话才可见；`read_skill` 同理。
 7. **代码执行工具可能被审批策略拒绝**：需要写文件或调管理面时，优先走宿主 HTTP API（file/skills 面），不要依赖代码执行工具。
@@ -78,6 +86,7 @@ POST /api/skills/revoke body={name,level}
 
 ## 6. 红线
 
-- 不绕过门禁直写技能文件而不留痕；不经 import 改同名技能；**不手工编辑注册账本文件**（账本只应由宿主管理面写）。
+- 不绕过门禁直写技能文件而不留痕；不经 import 改同名技能；**不手工编辑注册账本文件**（文件面已封路,写删 403;账本只由管理面写）。
+- 部署侧配置 `[auth] human_tokens` 后,approve/revoke/import 仅收特权 token——操作者 token 调用会得到 403 与配置指引,这是人工把关的机制强制,不是故障。
 - 改内容后不重新 approve（会导致下会话静默降级）。
 - 不把「文件已写」当作「技能已生效」——生效判据是 `status=active` + 哈希一致。
