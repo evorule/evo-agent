@@ -284,6 +284,56 @@ pub fn render_report(step: usize, services: &Value) -> String {
     )
 }
 
+/// 步界自审检查点（run_streaming 步界统一入口；引擎 IoRequest 步界与本地
+/// ReAct 回喂步界共用）：触发判定→五件只读服务直调→注入判定（P-C，缺省
+/// 关）→journal 落账。全链 best-effort：任何失败降级不杀 run。
+#[allow(clippy::too_many_arguments)]
+pub async fn audit_checkpoint(
+    client: &EvoruleApiClient,
+    frame_buffer: &std::sync::Arc<SelfAuditFrameBuffer>,
+    messages: &mut Vec<crate::agent::translator::Message>,
+    journal: &Option<std::sync::Arc<crate::agent::journal::JournalWriter>>,
+    session_id: &str,
+    step_count: usize,
+) {
+    if !frame_buffer.enabled() {
+        return;
+    }
+    let Some(sa_cfg) = frame_buffer.config() else {
+        return;
+    };
+    if !should_trigger(sa_cfg, step_count) {
+        return;
+    }
+    let frames = frame_buffer.snapshot();
+    let frames_count = frames.len();
+    let audit_started = std::time::Instant::now();
+    let services = invoke_audit_services(client, sa_cfg, &frames).await;
+    let audit_ms = audit_started.elapsed().as_millis() as u64;
+    // P-C 注入机制面（缺省关=只落账不回喂）：模板渲染+同结论去重后经
+    // 系统消息分区注入对话，LLM 下轮可见。
+    let mut injected = false;
+    if sa_cfg.inject == Some(true) {
+        let report = render_report(step_count, &services);
+        if frame_buffer.report_changed(&report) {
+            messages.push(crate::agent::translator::Message::System { content: report });
+            injected = true;
+        }
+    }
+    if let Some(j) = journal {
+        if let Err(e) = j.record_self_audit(
+            "periodic",
+            step_count as u64,
+            frames_count,
+            audit_ms,
+            injected,
+            services,
+        ) {
+            tracing::warn!(session_id = %session_id, error = %e, "self_audit journal write failed (ignored)");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
