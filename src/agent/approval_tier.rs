@@ -1325,13 +1325,24 @@ mod tests {
 
     #[test]
     fn test_in_workspace_path_normalization() {
+        // 平台分档（2026-11-08）：Windows 盘符路径在 Unix 是合法相对组件，
+        // 归一化语义不同——字面量按平台取，断言结构对称
+        #[cfg(windows)]
         let root = Path::new("D:/demo/ws");
+        #[cfg(unix)]
+        let root = Path::new("/demo/ws");
+        #[cfg(windows)]
+        let (in_root, near_miss, other_root) =
+            ("D:/demo/ws/x.txt", "D:/demo/ws2/x.txt", "D:/other/x.txt");
+        #[cfg(unix)]
+        let (in_root, near_miss, other_root) =
+            ("/demo/ws/x.txt", "/demo/ws2/x.txt", "/other/x.txt");
         // 相对路径=join 根内
         assert!(in_workspace("a/b.txt", root));
-        assert!(in_workspace("D:/demo/ws/x.txt", root));
+        assert!(in_workspace(in_root, root));
         // 绝对出界（前缀字符串相似但组件不同）
-        assert!(!in_workspace("D:/demo/ws2/x.txt", root));
-        assert!(!in_workspace("D:/other/x.txt", root));
+        assert!(!in_workspace(near_miss, root));
+        assert!(!in_workspace(other_root, root));
         // .. 逃逸（相对越根）
         assert!(!in_workspace("../../x", root));
         // .. 折叠后仍在根内
@@ -1384,9 +1395,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("evo-al-c2-esc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dec = TieredApproval::new(Arc::new(DenyAll), &dir);
-        // 绝对出界
+        // 绝对出界（平台分档：Windows 盘符路径在 Unix 是相对组件，判不出界）
         let mut r = req("file_create", "");
-        r.args = json!({"path": "C:/Windows/evil.txt"});
+        #[cfg(windows)]
+        let evil_abs = json!({"path": "C:/Windows/evil.txt"});
+        #[cfg(unix)]
+        let evil_abs = json!({"path": "/etc/evil.txt"});
+        r.args = evil_abs;
         assert!(!dec.request_approval(&r).await.approved);
         // .. 越根逃逸
         let mut r = req("file_delete", "");

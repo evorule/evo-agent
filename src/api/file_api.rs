@@ -1442,13 +1442,15 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("not allowed"), "{}", err.1);
-        // 绝对路径 → 400
+        // 绝对路径 → 400（平台分档：Windows 盘符路径在 Unix 是合法相对组件，非绝对）
+        #[cfg(windows)]
+        let evil_abs = r"C:\Windows\System32\drivers\etc\hosts".to_string();
+        #[cfg(unix)]
+        let evil_abs = "/etc/shadow".to_string();
         let err = raw_file(
             State(state),
             Method::GET,
-            Query(RawQuery {
-                path: r"C:\Windows\System32\drivers\etc\hosts".to_string(),
-            }),
+            Query(RawQuery { path: evil_abs }),
             HeaderMap::new(),
         )
         .await
