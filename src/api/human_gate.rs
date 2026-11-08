@@ -64,11 +64,14 @@ impl CallerIdentity {
 /// - `Operator`：合法但非特权列表的 token（agent 运行时/工具链持有的那把）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallerClass {
+    /// 特权列表内的人工 token（或鉴权关闭/特权闸关闭态的一切合法调用）。
     Privileged,
+    /// 合法但非特权列表的 token（agent 运行时/工具链持有的那把）。
     Operator,
 }
 
 impl CallerClass {
+    /// 按特权闸判定结果归类（true=特权，false=运营）。
     pub fn from_flag(privileged: bool) -> Self {
         if privileged {
             CallerClass::Privileged
@@ -77,6 +80,7 @@ impl CallerClass {
         }
     }
 
+    /// 线格式标签（审计/日志面字符串形态）。
     pub fn as_str(self) -> &'static str {
         match self {
             CallerClass::Privileged => "privileged",
