@@ -28,9 +28,15 @@ fn make_test_client() -> EvoruleApiClient {
 #[test]
 fn test_derive_step_timeout_floor() {
     // 缺省(未启用)=原值零变化
-    assert_eq!(AgentRunner::derive_step_timeout_floor(300, 7217, false), 300);
+    assert_eq!(
+        AgentRunner::derive_step_timeout_floor(300, 7217, false),
+        300
+    );
     // 启用且低于预算=推导到预算下限
-    assert_eq!(AgentRunner::derive_step_timeout_floor(300, 7217, true), 7217);
+    assert_eq!(
+        AgentRunner::derive_step_timeout_floor(300, 7217, true),
+        7217
+    );
     // 启用但已高于预算=保持原值(不降)
     assert_eq!(
         AgentRunner::derive_step_timeout_floor(8000, 7217, true),
