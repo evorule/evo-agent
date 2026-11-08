@@ -532,6 +532,9 @@ pub struct AgentConfig {
     /// B2:skills 生效清单(None = 无技能,manifest 槽位静默跳过 = 现状行为;
     /// serve/CLI 层 wire_skills 从 def.skills 解析注入)
     pub skills: Option<Vec<crate::agent::definition::SkillManifestEntry>>,
+    /// 技能停用通知（会话创建装配链的哈希失配降级名单;None=无。S4b manifest
+    /// 槽内追加渲染——降级不再静默,agent 当会话即知「哪些技能没了、怎么恢复」）
+    pub skills_notice: Option<String>,
     /// F-101:身份资产段(None = S1 槽仅基底块 = 现状行为;声明后 S1 槽内
     /// 拼接序 = 基底块→身份段)
     pub identity_segment: Option<String>,
@@ -577,6 +580,7 @@ impl Default for AgentConfig {
             capability_boundary: None,
             assembly: None,
             skills: None,
+            skills_notice: None,
             identity_segment: None,
             north_star: None,
             handoff: None,
@@ -2795,6 +2799,12 @@ impl AgentRunner {
         self
     }
 
+    /// 技能停用通知注入(serve 会话创建装配链传入;None=无通知)
+    pub fn with_skills_notice(mut self, notice: Option<String>) -> Self {
+        self.config.skills_notice = notice;
+        self
+    }
+
     /// 治理门禁段注入(serve 三路径构造期传入;None=CLI 纯基底,S2 槽位
     /// 缺席合法)。段内容=serve_tools::build_governance_segment 纯构造产物。
     pub fn with_governance_segment(mut self, segment: Option<String>) -> Self {
@@ -3524,6 +3534,7 @@ impl AgentRunner {
                 self.max_context_tokens,
                 boundary_segment.as_deref(),
                 self.config.skills.as_deref(),
+                self.config.skills_notice.as_deref(),
                 self.config.handoff.as_ref(),
                 self.config.governance_segment.as_deref(),
                 knowledge_segment.as_deref(),
@@ -7462,6 +7473,7 @@ impl AgentRunner {
                                runner.max_context_tokens,
                                boundary_segment.as_deref(),
                                runner.config.skills.as_deref(),
+                               runner.config.skills_notice.as_deref(),
                                runner.config.handoff.as_ref(),
                                runner.config.governance_segment.as_deref(),
                                knowledge_segment.as_deref(),

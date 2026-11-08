@@ -1290,6 +1290,8 @@ impl AgentDefinition {
             // B2:skills 生效清单不在 to_agent_config 复制——由 serve/CLI 层
             // wire_skills 统一解析注入(单一事实源,与边界同口径)
             skills: None,
+            // 停用通知同 skills:由 serve 会话创建装配链注入(降级回喂)
+            skills_notice: None,
             // F-101:身份资产段直拷(定义内容面,与 system_prompt 同族——
             // 无缺省合成,声明即生效)
             identity_segment: self.identity_segment.clone(),

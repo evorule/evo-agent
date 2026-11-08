@@ -1053,6 +1053,15 @@ async fn construct_runner(
         ))
         // B2:注入 skills manifest(read_skill 已注册进 filtered,清单喂 S4b 槽位)
         .with_skills(resolved_skills)
+        // 降级回喂:会话创建装配链的哈希失配名单以停用通知进清单段——
+        // 降级不再静默(此前只进服务日志,agent 当会话毫无感知)
+        .with_skills_notice(if merged_skills.downgraded.is_empty() {
+            None
+        } else {
+            Some(crate::agent::assembly::render_skills_downgraded_notice(
+                &merged_skills.downgraded,
+            ))
+        })
         // S2 治理门禁段(v2 前移批:治理段进组装层独立槽位,不再内嵌基底)
         .with_governance_segment(governance_segment.clone())
         // serve 面 delegate 执行能力接线(B25 批顺手修,CLI run 主路径同款镜像;

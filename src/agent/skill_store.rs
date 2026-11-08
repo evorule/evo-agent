@@ -298,6 +298,22 @@ pub fn scan_skills_dir(dir: &Path, level: SkillLevel) -> Result<Vec<ScannedSkill
         }];
         match crate::agent::definition::resolve_skill_manifest_entries(&candidates) {
             Ok(resolved) => {
+                // 防钓鱼名一致性（与 import 通路同判据）：frontmatter 声明名
+                // 与目录名不一致 = 候选不合格（目录名是注册/approve 的键,声明名
+                // 是 read_skill 的门面,两者打架即钓鱼形态）
+                let fm_name = parse_frontmatter_name(&skill_md);
+                if let Some(declared) = &fm_name {
+                    if declared != &name {
+                        tracing::warn!(
+                            skill = %name,
+                            declared = %declared,
+                            dir = %dir.display(),
+                            "skill scan: frontmatter name mismatches directory name; \
+                             candidate rejected (anti-phishing, same check as import)"
+                        );
+                        continue;
+                    }
+                }
                 let e = &resolved[0];
                 out.push(ScannedSkill {
                     name,
@@ -319,6 +335,15 @@ pub fn scan_skills_dir(dir: &Path, level: SkillLevel) -> Result<Vec<ScannedSkill
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+/// 读 SKILL.md frontmatter 的声明 name（None=缺失/不可解析;与 B2 解析器同口径,
+/// 失败不另立错误——防钓鱼一致性只在「声明了名字」时才判）
+fn parse_frontmatter_name(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    crate::agent::definition::parse_skill_frontmatter(&content)
+        .ok()?
+        .name
 }
 
 /// 两源合并 → 生效 manifest 清单 + 注册项钉死哈希表（会话创建装配链与未来
@@ -349,6 +374,8 @@ pub fn merge_skill_manifest(
     // 账本核对：active 项重算哈希，失配降级（写回账本由调用方 save）；
     // 通过核对者记候选哈希（含路径，声明项压名后按 (name, path) 剔除）
     let mut candidates: Vec<(String, PathBuf, String)> = Vec::new();
+    // 降级名单（回喂会话：清单段标「因内容变动已停用」，终结静默失忆）
+    let mut downgraded: Vec<String> = Vec::new();
     for scanned in scanned_user.iter().chain(scanned_project.iter()) {
         let Some(entry) = registry.find(&scanned.name, scanned.level) else {
             continue; // 计算态 discovered（账本无行）
@@ -368,6 +395,7 @@ pub fn merge_skill_manifest(
                  discovered (re-approve after reviewing the new content)"
             );
             registry.downgrade(&scanned.name, scanned.level);
+            downgraded.push(scanned.name.clone());
             continue;
         }
         candidates.push((scanned.name.clone(), scanned.path.clone(), current));
@@ -431,6 +459,7 @@ pub fn merge_skill_manifest(
     Ok(MergedSkills {
         manifest: merged,
         content_hashes,
+        downgraded,
     })
 }
 
@@ -440,6 +469,8 @@ pub fn merge_skill_manifest(
 pub struct MergedSkills {
     /// 进清单的生效项（definition 声明 > 项目级 active > 用户级 active）
     pub manifest: Vec<SkillManifestEntry>,
+    /// 本次会话创建因哈希失配被降级的技能名单（回喂会话用——降级不再静默）
+    pub downgraded: Vec<String>,
     /// 注册 active 项的钉死哈希（name → `blake3:<hex>`）
     pub content_hashes: std::collections::BTreeMap<String, String>,
 }
@@ -539,8 +570,13 @@ const LEAK_WARN_PATTERNS: &[&str] = &[
     "上下文窗口",
 ];
 
-/// 泄露检查：正文逐行匹配（大小写不敏感 contains；初版小集合字面口径，
-/// 可预期不误伤——正则泛化等真实误报样本出现再加）
+/// 泄露检查：正文逐行匹配（大小写不敏感 contains）+ 两类实测误报豁免：
+/// - **引用豁免**：命中词面整体包在「」引号内 = 文档在举例/转述而非署名，
+///   硬拦降级为警告（skill-authoring 类「教什么不能写」的正文才可能合法
+///   携带这些词面；非引号内的真实署名表述不受影响）
+/// - **路径词豁免**：警告级词命中处紧邻路径字符（`-`/`/`/`\`/`.`/数字等）
+///   = 命中的是路径/标识符片段（自家安装根 `…-agent-desktop` 即此形态），
+///   整行跳过（硬拦面不做路径豁免——路径里不该出现署名词面）
 pub fn check_skill_leaks(content: &str) -> Vec<LeakHit> {
     let mut hits = Vec::new();
     for (idx, raw_line) in content.lines().enumerate() {
@@ -548,14 +584,22 @@ pub fn check_skill_leaks(content: &str) -> Vec<LeakHit> {
         let mut hard_hit: Option<&str> = None;
         let mut warn_hit: Option<&str> = None;
         for p in LEAK_HARD_PATTERNS {
-            if lower.contains(p) {
-                hard_hit = Some(p);
+            if let Some(pos) = find_hit_position(&lower, p) {
+                if is_quoted_context(&lower, pos, p.len()) {
+                    // 引用豁免：降级为警告（保留可见性,不做硬拦）
+                    warn_hit = Some(p);
+                } else {
+                    hard_hit = Some(p);
+                }
                 break;
             }
         }
-        if hard_hit.is_none() {
+        if hard_hit.is_none() && warn_hit.is_none() {
             for p in LEAK_WARN_PATTERNS {
-                if lower.contains(p) {
+                if let Some(pos) = find_hit_position(&lower, p) {
+                    if is_path_fragment(&lower, pos, p.len()) {
+                        continue;
+                    }
                     warn_hit = Some(p);
                     break;
                 }
@@ -576,6 +620,36 @@ pub fn check_skill_leaks(content: &str) -> Vec<LeakHit> {
         }
     }
     hits
+}
+
+/// 大小写不敏感地定位首个命中位置（多字节安全：按字节下标返回,仅在
+/// char 边界成立——patterns 均为 ASCII 或 CJK 词面,与源串同编码）
+fn find_hit_position(lower_line: &str, pattern: &str) -> Option<usize> {
+    lower_line.find(pattern)
+}
+
+/// 命中片段是否整体包在「」引号内（文档引用/举例语境）
+fn is_quoted_context(lower_line: &str, start: usize, len: usize) -> bool {
+    let before = &lower_line[..start];
+    let after = &lower_line[start + len..];
+    before.contains('「') && after.contains('」')
+}
+
+/// 命中片段两侧是否紧邻路径/标识符字符（路径片段 = 产品名/目录名的一部分）
+fn is_path_fragment(line: &str, start: usize, len: usize) -> bool {
+    const PATH_CHARS: &[char] = &[
+        '-', '_', '/', '\\', '.', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    ];
+    let before_ok = start > 0
+        && line[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || PATH_CHARS.contains(&c));
+    let after_ok = line[start + len..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || PATH_CHARS.contains(&c));
+    before_ok || after_ok
 }
 
 #[cfg(test)]
@@ -601,6 +675,27 @@ mod tests {
     // ---- 扫描正反例 ----
 
     #[test]
+    fn test_scan_rejects_frontmatter_name_mismatch() {
+        // 防钓鱼名一致性(与 import 同判据):目录名是注册/approve 的键,声明名
+        // 是 read_skill 的门面,不一致即钓鱼形态——候选整条出局
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "innocent-name",
+            "---
+name: smuggled
+description: d
+---
+B",
+        );
+        let scanned = scan_skills_dir(tmp.path(), SkillLevel::User).unwrap();
+        assert!(
+            scanned.is_empty(),
+            "mismatched-name candidate must be rejected"
+        );
+    }
+
+    #[test]
     fn test_scan_subdirectory_style_discovers_skills() {
         let tmp = tempfile::tempdir().unwrap();
         let p = write_skill(
@@ -611,7 +706,7 @@ mod tests {
         write_skill(
             tmp.path(),
             "pdf-tools",
-            "---\nname: pdf\ndescription: PDF 处理\n---\nB",
+            "---\nname: pdf-tools\ndescription: PDF 处理\n---\nB",
         );
 
         let mut scanned = scan_skills_dir(tmp.path(), SkillLevel::User).unwrap();
