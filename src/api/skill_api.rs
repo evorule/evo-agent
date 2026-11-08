@@ -168,8 +168,10 @@ pub struct SkillImportResult {
 ///
 /// - bundle 路径必须在工作区内（canonicalize 越界拒；对齐 B7 文件面语义）
 /// - name 非法（含路径分隔/穿越）→ 该项 rejected；frontmatter 不可解析 → rejected
-/// - 同名同 level 账本行已 active/revoked → rejected（已审批内容不静默覆盖；
-///   先 revoke 或改名）——discovered（账本无行）允许重导入覆盖（内容更新语义）
+/// - 同名同 level 账本行已 active/revoked → rejected（已审批内容不静默覆盖）：
+///   active 行指路「先 revoke 或改名」；revoked 行指路「SKILL.md 放回原注册路径
+///   重新 approve 恢复」（撤销幂等，「先撤销」解不了锁=死路指引）
+///   ——discovered（账本无行/失配降级行）允许重导入覆盖（内容更新语义）
 /// - HumanGate：写面语义，落人工账（op="skills_import"）
 pub async fn import_skills(
     State(state): State<AgentApiState>,
@@ -301,21 +303,22 @@ pub async fn import_skills(
                 continue;
             }
         }
-        // 已审批内容保护
+        // 已审批内容保护（active = 可撤销后换名重建；revoked = 指明恢复路径，
+        // 不指向「先撤销」死路——撤销是幂等的，重复 revoke 解不了锁）
         if let Some(row) = registry.find(&entry.name, level) {
-            if matches!(row.status, SkillStatus::Active | SkillStatus::Revoked) {
-                item(
-                    "rejected",
-                    String::new(),
-                    Some(format!(
-                        "skill '{}' is {} — revoke it first or use another name (approved content is not silently overwritten)",
-                        entry.name,
-                        match row.status {
-                            SkillStatus::Active => "active",
-                            _ => "revoked",
-                        }
-                    )),
-                );
+            let reject_reason = match row.status {
+                SkillStatus::Active => Some(format!(
+                    "skill '{}' is active — revoke it first or use another name (approved content is not silently overwritten)",
+                    entry.name
+                )),
+                SkillStatus::Revoked => Some(format!(
+                    "skill '{}' is revoked — to restore it, put its SKILL.md back at the registered path and approve again; revoked names cannot be re-imported (approved content is not silently overwritten)",
+                    entry.name
+                )),
+                SkillStatus::Discovered => None,
+            };
+            if let Some(reason) = reject_reason {
+                item("rejected", String::new(), Some(reason));
                 continue;
             }
         }
@@ -1332,6 +1335,54 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("active"));
+    }
+
+    #[tokio::test]
+    async fn test_import_revoked_name_points_to_restore_path() {
+        // 撤销行重导入 = rejected，且报错指向恢复路径（放回文件重新 approve），
+        // 不再指向「先撤销」死路（撤销幂等，重复 revoke 解不了锁）
+        let tmp = tempfile::tempdir().unwrap();
+        let app = human_router(tmp.path().to_path_buf());
+        write_skill(tmp.path(), "data/skills", "s", CLEAN_SKILL);
+        let req = serde_json::json!({"name": "s", "level": "user"});
+        let (status, _) = post_authed(
+            app.clone(),
+            "/api/skills/approve",
+            req.clone(),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) =
+            post_authed(app.clone(), "/api/skills/revoke", req.clone(), "test-token").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let rel = write_bundle(
+            tmp.path(),
+            "data/skills/revoked.bundle.json",
+            serde_json::json!({
+                "skills": [{"name": "s", "level": "user", "body": CLEAN_SKILL.replace("git-discipline", "s")}]
+            }),
+        );
+        let (_, body) = post_authed(
+            app,
+            "/api/skills/import",
+            serde_json::json!({"path": rel}),
+            "test-token",
+        )
+        .await;
+        assert_eq!(body["imported"], 0);
+        assert_eq!(body["results"][0]["status"], "rejected");
+        let reason = body["results"][0]["reason"].as_str().unwrap();
+        assert!(reason.contains("revoked"), "got: {reason}");
+        assert!(
+            reason.contains("approve again"),
+            "must point to restore path: {reason}"
+        );
+        assert!(
+            !reason.contains("revoke it first"),
+            "must not point to dead end: {reason}"
+        );
     }
 
     #[tokio::test]
