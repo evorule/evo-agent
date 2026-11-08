@@ -939,7 +939,7 @@ async fn construct_runner(
     };
     let merged_skills =
         match crate::api::skill_api::merged_manifest_for_session(state, declared_skills) {
-            Ok((manifest, _registry_path)) => manifest,
+            Ok((merged, _registry_path)) => merged,
             Err(e) => {
                 error!(
                     agent_type = %agent_type,
@@ -949,18 +949,21 @@ async fn construct_runner(
                 return None;
             }
         };
-    let resolved_skills =
-        match crate::api::serve_tools::wire_skills(&mut filtered, Some(merged_skills)) {
-            Ok(skills) => skills,
-            Err(e) => {
-                error!(
-                    agent_type = %agent_type,
-                    error = %e,
-                    "skills wiring failed; rejecting runner construction"
-                );
-                return None;
-            }
-        };
+    let resolved_skills = match crate::api::serve_tools::wire_skills_with_hashes(
+        &mut filtered,
+        Some(merged_skills.manifest),
+        &merged_skills.content_hashes,
+    ) {
+        Ok(skills) => skills,
+        Err(e) => {
+            error!(
+                agent_type = %agent_type,
+                error = %e,
+                "skills wiring failed; rejecting runner construction"
+            );
+            return None;
+        }
+    };
     // S2 治理门禁段(S2 前移批):三段合并构造,经 runner 配置进组装层
     // (v2 序=权威紧跟 S1 身份段之后;不再改写 def.system_prompt——K-17②)
     let governance_segment =

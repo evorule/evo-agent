@@ -968,6 +968,17 @@ pub fn wire_skills(
     handler: &mut ToolHandler,
     manifest: Option<Vec<crate::agent::definition::SkillManifestEntry>>,
 ) -> Result<Option<Vec<crate::agent::definition::SkillManifestEntry>>, String> {
+    wire_skills_with_hashes(handler, manifest, &std::collections::BTreeMap::new())
+}
+
+/// [`wire_skills`] 的哈希核验变体:带注册项钉死哈希表时,read_skill 对在表
+/// 项做**读时核验**(正文自批准后被改动即拒读,逼出「改动→重新审批」);
+/// 无哈希的声明面路径(CLI/delegate)走 [`wire_skills`] 空表,语义不变。
+pub fn wire_skills_with_hashes(
+    handler: &mut ToolHandler,
+    manifest: Option<Vec<crate::agent::definition::SkillManifestEntry>>,
+    content_hashes: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<Vec<crate::agent::definition::SkillManifestEntry>>, String> {
     let Some(resolved) = manifest else {
         return Ok(None);
     };
@@ -976,9 +987,10 @@ pub fn wire_skills(
     }
     handler.register_static(
         "read_skill",
-        std::sync::Arc::new(crate::builtin_tools::skill_read::SkillReadTool::new(
-            &resolved,
-        )),
+        std::sync::Arc::new(
+            crate::builtin_tools::skill_read::SkillReadTool::new(&resolved)
+                .with_pinned_hashes(content_hashes),
+        ),
     );
     Ok(Some(resolved))
 }

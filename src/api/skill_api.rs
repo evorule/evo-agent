@@ -75,6 +75,10 @@ pub struct SkillView {
     /// 批准者（缺省 local-operator）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approved_by: Option<String>,
+    /// 盘上正文与钉死哈希是否一致（仅 active 项计算；None=非 active 或文件不可读）
+    /// ——管理面只读暴露失配，不在此降级（状态迁移仍在会话创建/重批）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_matches: Option<bool>,
 }
 
 /// GET /api/skills 响应（管理面权威全清单）
@@ -433,6 +437,15 @@ fn build_inventory(state: &AgentApiState) -> Result<SkillInventoryResponse, Stri
             ),
             None => (SkillStatus::Discovered, None, None, None),
         };
+        // active 项重算盘上哈希暴露失配（只读面不降级——状态迁移在会话创建/重批;
+        // 防偷换承诺在管理面兑现,文件不可读 = None 不装知道）
+        let content_matches = if status == SkillStatus::Active {
+            hash_skill_file_prefixed(&s.path)
+                .ok()
+                .map(|actual| Some(actual) == content_hash)
+        } else {
+            None
+        };
         views.push(SkillView {
             name: s.name.clone(),
             level: s.level.as_str().to_string(),
@@ -442,6 +455,7 @@ fn build_inventory(state: &AgentApiState) -> Result<SkillInventoryResponse, Stri
             content_hash,
             approved_at,
             approved_by,
+            content_matches,
         });
     };
     for s in &scanned_user {
@@ -466,6 +480,7 @@ fn build_inventory(state: &AgentApiState) -> Result<SkillInventoryResponse, Stri
                 content_hash: e.content_hash.clone(),
                 approved_at: e.approved_at,
                 approved_by: e.approved_by.clone(),
+                content_matches: None,
             });
         }
     }
@@ -763,25 +778,21 @@ pub fn skills_routes() -> axum::Router<AgentApiState> {
 }
 
 /// 会话创建装配链入口（PR-3 接线用）：扫描 + 账本核对 + 两源合并的
-/// serve 侧封装（目录解析单点；merge 为纯函数，IDE 挂接未来直接调它）
+/// serve 侧封装（目录解析单点；merge 为纯函数，IDE 挂接未来直接调它）。
+/// 返回合并产物（manifest + 注册项钉死哈希表，哈希供 read_skill 读时核验）
+/// 与账本路径。
 pub fn merged_manifest_for_session(
     state: &AgentApiState,
     declared: Vec<crate::agent::definition::SkillManifestEntry>,
-) -> Result<
-    (
-        Vec<crate::agent::definition::SkillManifestEntry>,
-        std::path::PathBuf,
-    ),
-    String,
-> {
+) -> Result<(crate::agent::skill_store::MergedSkills, std::path::PathBuf), String> {
     let user_dir = user_skills_dir(state);
     let project_dir = project_skills_dir(state);
     let registry_path = registry_path(state);
     let mut registry = SkillRegistry::load(&registry_path)?;
-    let manifest = merge_skill_manifest(declared, &user_dir, Some(&project_dir), &mut registry)?;
+    let merged = merge_skill_manifest(declared, &user_dir, Some(&project_dir), &mut registry)?;
     // 失配降级等账本变更落盘（无变更时也幂等重写，量小无碍）
     registry.save()?;
-    Ok((manifest, registry_path))
+    Ok((merged, registry_path))
 }
 
 #[cfg(test)]
@@ -988,6 +999,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_inventory_flags_hash_mismatch_without_downgrade() {
+        // 管理面重算哈希暴露失配（content_matches=false），但 GET 是只读面：
+        // 状态不降级、账本哈希不动（状态迁移仍归会话创建/重批）
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "data/skills", "s", CLEAN_SKILL);
+        let app = router(make_state(tmp.path().to_path_buf()));
+        let (_, b) = post(
+            app.clone(),
+            "/api/skills/approve",
+            serde_json::json!({"name": "s", "level": "user"}),
+        )
+        .await;
+        let pinned = b["content_hash"].as_str().unwrap().to_string();
+
+        // 批准后偷换内容
+        std::fs::write(
+            tmp.path().join("data/skills/s/SKILL.md"),
+            "---\nname: s\ndescription: d\n---\nTAMPERED\n",
+        )
+        .unwrap();
+
+        let (_, inv) = get(app, "/api/skills").await;
+        let s = &inv["skills"][0];
+        assert_eq!(s["status"], "active", "GET 只读面不降级");
+        assert_eq!(s["content_hash"], pinned.as_str(), "账本哈希不动");
+        assert_eq!(
+            s["content_matches"], false,
+            "必须暴露失配标记（此前管理面从不重算，看不出篡改）"
+        );
+    }
+
+    #[tokio::test]
     async fn test_approve_unknown_name_and_bad_level() {
         let tmp = tempfile::tempdir().unwrap();
         let app = router(make_state(tmp.path().to_path_buf()));
@@ -1143,10 +1186,15 @@ mod tests {
         declared: Vec<crate::agent::definition::SkillManifestEntry>,
     ) -> (bool, Vec<crate::agent::definition::SkillManifestEntry>) {
         let state = make_state(workdir.to_path_buf());
-        let (manifest, reg_path) = merged_manifest_for_session(&state, declared).unwrap();
+        let (merged, reg_path) = merged_manifest_for_session(&state, declared).unwrap();
         assert!(reg_path.ends_with("registry.json"));
         let mut handler = crate::io_handlers::tool_handler::ToolHandler::new();
-        let resolved = crate::api::serve_tools::wire_skills(&mut handler, Some(manifest)).unwrap();
+        let resolved = crate::api::serve_tools::wire_skills_with_hashes(
+            &mut handler,
+            Some(merged.manifest),
+            &merged.content_hashes,
+        )
+        .unwrap();
         (handler.has_tool("read_skill"), resolved.unwrap_or_default())
     }
 
