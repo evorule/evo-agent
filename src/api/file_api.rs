@@ -286,6 +286,29 @@ fn gate_write(
     }
 }
 
+/// 技能注册账本（`skills/registry.json`）封路：账本是三态+哈希钉死机制的
+/// 信任根，只应由技能管理面（approve/revoke + 失配降级）写入。文件面
+/// （file_api/内置写删工具之外这条 HTTP 通路）直接落一行 403，结构上
+/// 堵死「绕过管理面手改账本」的旁路。SKILL.md 正文不在封路范围——
+/// 「写正文 + 重新 approve」就是同名更新的正路。
+fn deny_skill_ledger(path: &str) -> Result<(), (StatusCode, String)> {
+    let p = std::path::Path::new(path);
+    let is_ledger = p.file_name().is_some_and(|f| f == "registry.json")
+        && p.parent()
+            .and_then(|d| d.file_name())
+            .is_some_and(|d| d == "skills");
+    if is_ledger {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "the skill registry (skills/registry.json) is managed exclusively by \
+             the /api/skills management endpoints (approve/revoke) and cannot be \
+             written or deleted through the file face"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// 写面操作结局落人工账(执行成功 ok / 失败 error)
 fn record_outcome(
     state: &AgentApiState,
@@ -647,6 +670,7 @@ pub async fn write_file(
     Json(body): Json<WriteBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
+    deny_skill_ledger(&body.path)?;
     let identity = gate_write(&state, "file_write", &body.path)?;
     let tool = FileWriteTool::new(root).with_writable_dir(".");
     let mut args = serde_json::Map::new();
@@ -949,6 +973,7 @@ pub async fn delete_file(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
+    deny_skill_ledger(&q.path)?;
     let identity = gate_write(&state, "file_delete", &q.path)?;
     let _guard = tree_mutation_lock().lock().await;
     let tool = FileDeleteTool::new(root).with_writable_dir(".");
@@ -2359,5 +2384,87 @@ mod tests {
         let (status, msg) = not_dir.expect_err("file path must be rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("not a directory"), "got: {msg}");
+    }
+    #[tokio::test]
+    async fn test_skill_ledger_denied_on_file_face() {
+        // 技能注册账本封路:文件面拒写/拒删 skills/registry.json(信任根只归
+        // 管理面);SKILL.md 正文不受影响——「写正文+重新 approve」是更新正路
+        let tmp = tempfile::tempdir().unwrap();
+        use tower::ServiceExt as _;
+        let auth = crate::api::auth::AuthConfig::new(vec!["test-token".to_string()], true);
+        let state = crate::api::agent_api::AgentApiState::new_with_metrics(
+            crate::agent::AgentDefinitionManager::with_default_dir(),
+            crate::api::evorule_client::EvoruleApiClient::new("http://localhost:8080"),
+            std::sync::Arc::new(crate::api::metrics::Metrics::new().unwrap()),
+            tmp.path().to_path_buf(),
+            std::sync::Arc::new(crate::api::workspace_client::WorkspaceApiClient::new(
+                "http://localhost:8080",
+            )),
+            std::sync::Arc::new(std::sync::RwLock::new(
+                crate::io_handlers::tool_handler::ToolHandler::new(),
+            )),
+        );
+        let app = crate::api::agent_api::router_with_auth(state, auth);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/files/write")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(
+                        serde_json::json!({"path": "data/skills/registry.json", "content": "{}"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("management endpoints"));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/files?path=data%2Fskills%2Fregistry.json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // SKILL.md 正文可写(更新正路不受影响)
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/files/write")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "path": "data/skills/demo/SKILL.md",
+                            "content": "---
+name: demo
+description: d
+---
+body"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
