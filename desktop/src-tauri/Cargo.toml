@@ -13,6 +13,10 @@ crate-type = ["rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+
+# 技能期刊签名引导密钥源（壳每次启动生成一次性种子经 env 交接 serve）
+getrandom = "0.2"
+
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"

@@ -13,6 +13,11 @@ license = "AGPL-3.0-or-later"
 semantic = ["dep:fastembed"]
 
 [dependencies]
+
+# 技能期刊签名（B-3 v2：壳生成一次性引导密钥经 env 交接，私钥只存在于
+# 壳/serve 进程内存——同用户文件系统攻击者不可读，期刊记录可验不可伪造）
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",

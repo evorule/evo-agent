@@ -858,7 +858,12 @@ fn build_serve_command(
         // serve 鉴权令牌：经 env 载体传递，命令行零出现（serve 侧读入
         // auth_config 后即从 env 面清除，子进程不可见）
         .env("EVO_AGENT_AUTH__ENABLED", "true")
-        .env("EVO_AGENT_AUTH__TOKENS", serve_token);
+        .env("EVO_AGENT_AUTH__TOKENS", serve_token)
+        // 技能期刊签名引导密钥（纵深加固 v2）：壳每次启动生成一次性 32B
+        // 种子,私钥只存在于壳/serve 进程内存（env 载体交接,serve 侧固化后
+        // 即清 env）——同用户文件系统攻击者不可读,期刊记录可验不可伪造。
+        // 跨 serve 重启复用同一引导密钥（OnceLock 随壳进程存续）
+        .env("EVO_AGENT_JOURNAL__SIGNING_KEY", journal_signing_seed_hex());
     // 执行体调用方令牌恒注入（无执行体时无害闲置）；端点仅在执行体在位时
     // 覆盖缺省 9130——serve 侧 env 优先链已就绪
     serve_cmd.env("EVORULE_LLM_EXECUTOR_TOKEN", executor_token);
