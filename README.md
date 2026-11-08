@@ -211,6 +211,7 @@ port = 8081
 - [docs/WORKBENCH_API.md](docs/WORKBENCH_API.md) — Web IDE workbench protocol
 - [docs/CLI.md](docs/CLI.md) — complete CLI reference: run/repl/replay/patrol/workflow semantics, DSL versions, replan/plan-execute
 - [docs/TOOLS.md](docs/TOOLS.md) — complete tool-system reference: 3-tier security model, built-in 15, rule-management toolkit (52), source switches and adjudication tiers, per-agent whitelists
+- [docs/SKILLS.md](docs/SKILLS.md) — skills system reference: governed supply chain (declared + registered paths), three-state ledger with journal and boot-scoped signing, approval gates, freshness stamps, operations and troubleshooting
 - [docs/approval-policy.md](docs/approval-policy.md) — tool approval policy
 - [docs/security/THREAT_MODEL.md](docs/security/THREAT_MODEL.md) — threat model
 - [docs/TELEMETRY.md](docs/TELEMETRY.md) — telemetry transparency statement
