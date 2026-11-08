@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 EvoRule Project -->
 <script>
-  import { MEDIA_BLOB_LIMIT, isOversize, mediaCategoryFor } from '../lib/media-stage.js';
+  import { MEDIA_BLOB_LIMIT, isOversize, mediaCategoryFor, resolvePlaybackTarget } from '../lib/media-stage.js';
   import { fetchRaw } from '../lib/api.js';
 
   /** 媒体视图主体:按扩展名分类消费 /api/files/raw 的原始字节。
@@ -47,7 +47,21 @@
       return;
     }
     try {
-      const resp = await fetchRaw(p);
+      // 播放目标裁定:mov/mkv/avi 先 HEAD 探 .preview.mp4 代理,有则切,无则显态
+      const target = await resolvePlaybackTarget(p, async (probePath) => {
+        const head = await fetchRaw(probePath, {}, 'HEAD');
+        const ct = (head.headers.get('content-type') || '').toLowerCase();
+        return { ok: head.ok, playable: ct === 'video/mp4' };
+      });
+      if (target.target === 'error') {
+        status = 'error';
+        errorText =
+          target.reason === 'proxy-not-playable'
+            ? `transcoded proxy ${target.proxy} exists but is not a playable video`
+            : `${p} can't be decoded in-editor (mov/mkv/avi) and no ${target.proxy} proxy found — generate one to enable preview`;
+        return;
+      }
+      const resp = await fetchRaw(target.path);
       if (!resp.ok) {
         let msg = '';
         try {
