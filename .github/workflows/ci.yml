@@ -171,16 +171,12 @@ jobs:
 
       - name: verify 3/5a test-run lib
         if: matrix.tests && runner.os == 'Linux'
-        shell: bash
+        shell: pwsh
         run: |
-          export CARGO_BUILD_JOBS=2
-          echo "== before =="; free -m; df -h /
-          # 15 分钟硬超时护栏:超时立即断言并倾出日志尾部(挂点=最后一个已启动测试行)
-          timeout 900 pwsh -File ./verify.ps1 -Phase test-run -CargoArgs --lib 2>&1 | tee /tmp/verify_5a.log
-          code=${PIPESTATUS[0]}
-          tail -n 5 /tmp/verify_5a.log
-          echo "== after =="; free -m; df -h /
-          exit $code
+          $env:CARGO_BUILD_JOBS = '2'; Write-Host "== before =="; free -m; df -h /
+          ./verify.ps1 -Phase test-run -CargoArgs --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "== after =="; free -m; df -h /
 
       - name: verify 3/5b test-run integration_test
         if: matrix.tests && runner.os == 'Linux'
