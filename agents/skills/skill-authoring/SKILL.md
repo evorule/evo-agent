@@ -84,7 +84,21 @@ POST /api/skills/revoke body={name,level}
 - `data/human_gate_ledger.jsonl` → 有本次操作的留痕
 - 临时文件（bundle、备份）已清理
 
-## 6. 红线
+## 6. 记录环境事实的技能：env-sensitive 声明
+
+技能正文若记录**会随环境变化的事实**（音色清单、引擎版本、能力可用性、端口面现状等），应在 frontmatter 声明：
+
+```
+---
+name: my-skill
+description: ...
+env-sensitive: true
+---
+```
+
+声明后：批准时账本自动记录环境指纹；环境变化后该技能会在清单段收到「核验于旧环境」的复验提示（不降级不拒读）。**刷新**=同内容重新 approve（幂等，刷新指纹）。用户开关：workbench 设置 `skills.freshnessNotices`（缺省开；关=只静默不提示，声明仍有效）。
+
+## 7. 红线
 
 - 不绕过门禁直写技能文件而不留痕；不经 import 改同名技能；**不手工编辑注册账本文件**（文件面已封路,写删 403;账本只由管理面写）。
 - 部署侧配置 `[auth] human_tokens` 后,approve/revoke/import 仅收特权 token——操作者 token 调用会得到 403 与配置指引,这是人工把关的机制强制,不是故障。
