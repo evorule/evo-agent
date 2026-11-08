@@ -1136,6 +1136,8 @@ pub fn router_with_auth(state: AgentApiState, auth_config: crate::api::auth::Aut
         // skills 注册审批管理面(C 形态):全清单/待审预览/批准/撤销 —— 定义期
         // 供应链准入,留痕在 registry.json 账本(不走会话期 ApprovalCallback)
         .merge(crate::api::skill_api::skills_routes())
+        // 服务面自描述(多端口面路由表;此前调用方定位端点归属全靠试错)
+        .route("/api/meta", axum::routing::get(meta))
         // B23:MCP server 暴露面(enabled=false → 空 Router,/mcp 404 fail-closed)
         .merge(mcp_server_routes(mcp_server_exposed))
         // auth ticket 换票端点:Bearer 换一次性短票(WS/SSE query 通行用),
@@ -6736,4 +6738,33 @@ mod tests {
         assert_eq!(json["total_violations"], 3);
         assert!(json["signals"].is_array());
     }
+}
+
+/// `GET /api/meta` — 服务面自描述（路由族 + 端口面归属）
+///
+/// 桌面宿主多进程多端口（serve/engine/llm_executor 各持不同 API 面）,
+/// 调用方此前定位端点归属全靠试错。本端点回答「我这张面有什么」;
+/// 其余面的落点看 runtime.json 对应进程条目,跨端口调用一律 404。
+async fn meta() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "face": "serve (agent API)",
+        "routes": {
+            "/api/skills": "skill inventory (GET) — states: discovered/active/revoked",
+            "/api/skills/pending": "discovered skills awaiting approval (GET, body included)",
+            "/api/skills/approve": "approve a skill (POST {name, level}) — gated",
+            "/api/skills/revoke": "revoke a skill (POST {name, level}) — gated",
+            "/api/skills/import": "import a skill-pack bundle (POST {path}) — write-gated",
+            "/api/skills/export": "export an approved skill as an import-format bundle (POST {name, level})",
+            "/api/files/write": "file write (PUT {path, content})",
+            "/api/files": "file delete (DELETE ?path=)",
+            "/api/files/read|raw|list|search": "file read/raw/list/search",
+            "/api/agents/{type}/run|run/stream": "agent run / SSE stream",
+            "/api/auth/ticket": "one-shot ticket for ws/sse",
+            "/health, /metrics, /version": "ops endpoints"
+        },
+        "notes": [
+            "this face is the agent serve; other API families (native services, llm executor) live on separate ports listed in runtime.json (engine / llm_executor entries) - cross-port calls return 404",
+            "all routes require the bearer token unless listed in PUBLIC_PATHS"
+        ]
+    }))
 }

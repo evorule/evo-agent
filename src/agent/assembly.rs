@@ -591,7 +591,14 @@ fn render_skills_manifest(skills: &[crate::agent::definition::SkillManifestEntry
         seg.push_str(&s.description);
     }
     seg.push_str("\n按需装载，不要一次性全部读取。");
+    seg.push_str("\n注：清单自本次会话创建时生效；会话中新建或修改的技能，自下次会话起出现。");
     seg
+}
+
+/// 渲染降级停用通知（会话创建装配链的哈希失配名单——降级回喂会话，
+/// 终结「改完文件没重批 → 下会话技能凭空消失」的静默失忆）
+pub fn render_skills_downgraded_notice(downgraded: &[String]) -> String {
+    format!("【技能停用通知】以下技能因批准后内容变动已被停用（正门与 read_skill 均不可用），重新走 approve 审批后恢复：{}", downgraded.join("、"))
 }
 
 /// 渲染交接底座包为 S3 槽内 "## Handoff Base" 结构化块(上下文延续归一件)
@@ -739,6 +746,7 @@ impl AssemblyExecutor {
         total_window: usize,
         boundary_segment: Option<&str>,
         skills: Option<&[crate::agent::definition::SkillManifestEntry]>,
+        skills_notice: Option<&str>,
         handoff: Option<&crate::agent::definition::HandoffPackage>,
         governance_segment: Option<&str>,
         knowledge_segment: Option<&str>,
@@ -874,12 +882,22 @@ impl AssemblyExecutor {
                 // S4b_skills:技能 manifest 段(B2)——声明面人工把关后,LLM 侧
                 // 能力锚常驻+read_skill 按需装载正文的渐进披露读法
                 "manifest" => {
+                    let mut seg = String::new();
                     if let Some(skills) = skills {
                         if !skills.is_empty() {
-                            let sep = slot.separator.as_deref().unwrap_or("\n\n");
-                            prompt.push_str(sep);
-                            prompt.push_str(&render_skills_manifest(skills));
+                            seg.push_str(&render_skills_manifest(skills));
                         }
+                    }
+                    if let Some(notice) = skills_notice {
+                        if !seg.is_empty() {
+                            seg.push_str("\n\n");
+                        }
+                        seg.push_str(notice);
+                    }
+                    if !seg.is_empty() {
+                        let sep = slot.separator.as_deref().unwrap_or("\n\n");
+                        prompt.push_str(sep);
+                        prompt.push_str(&seg);
                     }
                 }
                 // S5_task/S6_summary/S7_history:messages 面槽位,不在
@@ -1024,6 +1042,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 Some("GOV"),
                 Some("KNOW"),
@@ -1076,6 +1095,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 Some("GOV"),
                 Some("KNOW"),
@@ -1103,6 +1123,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 Some("GOV"),
                 None,
@@ -1322,6 +1343,7 @@ mod tests {
                 8192,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1346,6 +1368,7 @@ mod tests {
                 60,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1376,6 +1399,7 @@ mod tests {
                 0,
                 Some(&boundary.awareness_segment()),
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1406,6 +1430,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1426,6 +1451,7 @@ mod tests {
                 0,
                 Some("【能力边界声明】boundary"),
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1449,6 +1475,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1480,6 +1507,7 @@ mod tests {
                 0,
                 Some("【能力边界声明】boundary"),
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1509,6 +1537,7 @@ mod tests {
                 0,
                 Some("【能力边界声明】boundary"),
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1547,6 +1576,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1586,6 +1616,7 @@ mod tests {
                 0,
                 None,
                 Some(&skills),
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1598,7 +1629,7 @@ mod tests {
         assert!(out.contains("【可用技能清单】以下技能可经 read_skill 工具装载正文："));
         assert!(out.contains("\n- pdf-processing: 提取 PDF 文本/表格并生成摘要"));
         assert!(out.contains("\n- git-discipline: 提交前先看 diff"));
-        assert!(out.ends_with("\n按需装载，不要一次性全部读取。"));
+        assert!(out.ends_with("\n按需装载，不要一次性全部读取。\n注：清单自本次会话创建时生效；会话中新建或修改的技能，自下次会话起出现。"));
     }
 
     /// manifest 槽位:紧随边界段之后(同为稳定尾注位,语义分层:能力锚在边界锚后)
@@ -1621,6 +1652,7 @@ mod tests {
                 0,
                 Some("【能力边界声明】boundary"),
                 Some(&skills),
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1660,6 +1692,7 @@ mod tests {
                 0,
                 None,
                 Some(&skills),
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1685,6 +1718,7 @@ mod tests {
                 0,
                 None,
                 Some(&[]),
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1743,6 +1777,7 @@ mod tests {
                 8192,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1770,6 +1805,7 @@ mod tests {
                 8192,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1826,6 +1862,7 @@ mod tests {
                 8192,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1859,6 +1896,7 @@ mod tests {
                 8192,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -1963,6 +2001,7 @@ mod tests {
                 8192,
                 None,
                 None,
+                None, // skills_notice
                 Some(&handoff),
                 None,
                 None,
@@ -1989,6 +2028,7 @@ mod tests {
                 8192,
                 None,
                 None,
+                None, // skills_notice
                 Some(&handoff),
                 None,
                 None,
@@ -2011,6 +2051,7 @@ mod tests {
                 8192,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -2112,6 +2153,7 @@ mod tests {
                 8192,
                 Some(&boundary.awareness_segment()),
                 Some(&skills),
+                None, // skills_notice
                 Some(&handoff),
                 None,
                 None,
@@ -2156,6 +2198,7 @@ mod tests {
                 8192,
                 Some(&boundary.awareness_segment()),
                 Some(&skills),
+                None, // skills_notice
                 Some(&handoff),
                 Some(&governance),
                 None,
@@ -2213,6 +2256,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 Some("GOV"),
                 Some("KNOW"),
@@ -2236,6 +2280,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -2266,6 +2311,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,
@@ -2292,6 +2338,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None, // skills_notice
                 None,
                 None,
                 None,

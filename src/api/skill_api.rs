@@ -676,6 +676,19 @@ pub async fn approve_skill(
         )
     })?;
 
+    // 编码完整性闸：正文含 U+FFFD 替换字符 = 写入面已发生编码损坏——
+    // 哈希会忠实钉住损坏内容（完整性≠正确性）,批准前拒收并指明修法
+    if content.contains("\u{FFFD}") {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(LeakRejectResponse {
+                rejected: true,
+                reason: "content contains U+FFFD replacement characters (encoding corruption); rewrite the file before approving".to_string(),
+                hits: Vec::new(),
+            }),
+        ));
+    }
+
     // 泄露检查（两级分级）：硬拦命中 → 422 + 明细
     let hits = check_skill_leaks(&content);
     let hard: Vec<_> = hits
@@ -866,6 +879,85 @@ pub fn skills_routes() -> axum::Router<AgentApiState> {
         .route("/api/skills/approve", post(approve_skill))
         .route("/api/skills/revoke", post(revoke_skill))
         .route("/api/skills/import", post(import_skills))
+        .route("/api/skills/export", post(export_skill))
+}
+
+/// `POST /api/skills/export` — 导出已批准技能为 import 同构 bundle
+///
+/// 晋升通路（runtime→部署面）的受治理出口：返回体即 `POST /api/skills/import`
+/// 可直接消费的 `{skills:[{name,level,body}]}` 形态,人工复核后可原样收编进
+/// definition/部署层。仅 active 项可导出（导出前重算哈希核对——不外发与
+/// 账本不符的内容）。
+#[derive(Debug, Deserialize)]
+pub struct SkillExportRequest {
+    /// 技能名
+    pub name: String,
+    /// 来源级："user" | "project"
+    pub level: String,
+}
+
+pub async fn export_skill(
+    State(state): State<AgentApiState>,
+    Json(req): Json<SkillExportRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(level) = level_from_str(&req.level) else {
+        return Err(bad_request(format!(
+            "unknown level '{}' (must be 'user' or 'project')",
+            req.level
+        )));
+    };
+    let dir = match level {
+        SkillLevel::User => user_skills_dir(&state),
+        SkillLevel::Project => project_skills_dir(&state),
+    };
+    let _ = dir;
+    let registry = SkillRegistry::load(&registry_path(&state)).map_err(internal_err_json)?;
+    let Some(entry) = registry.find(&req.name, level) else {
+        return Err(not_found(format!("skill '{}' not registered", req.name)));
+    };
+    if entry.status != SkillStatus::Active {
+        return Err(bad_request(format!(
+            "skill '{}' is {} — only active skills can be exported",
+            req.name,
+            entry.status.as_str()
+        )));
+    }
+    let current = hash_skill_file_prefixed(&entry.path).map_err(internal_err_json)?;
+    if entry
+        .content_hash
+        .as_deref()
+        .is_some_and(|pinned| pinned != current)
+    {
+        return Err(bad_request(
+            "skill content changed since approval — re-approve before exporting".to_string(),
+        ));
+    }
+    let body = std::fs::read_to_string(&entry.path)
+        .map_err(|e| internal_err_json(format!("skill file unreadable: {}", e)))?;
+    Ok(Json(serde_json::json!({
+        "skills": [{ "name": req.name, "level": req.level.as_str(), "body": body }]
+    })))
+}
+
+fn bad_request(reason: String) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": reason })),
+    )
+}
+
+fn not_found(reason: String) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": reason })),
+    )
+}
+
+fn internal_err_json(e: String) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": e })),
+    )
 }
 
 /// 会话创建装配链入口（PR-3 接线用）：扫描 + 账本核对 + 两源合并的
@@ -1005,6 +1097,11 @@ mod tests {
 
     const CLEAN_SKILL: &str = "---\nname: git-discipline\ndescription: git 纪律指引\n---\n# 正文\n先 git status 再 commit。\n";
 
+    /// 目录名对齐的夹具（扫描路径防钓鱼名一致性要求 frontmatter name=目录名）
+    fn clean_skill_named(name: &str) -> String {
+        CLEAN_SKILL.replace("git-discipline", name)
+    }
+
     #[tokio::test]
     async fn test_list_skills_empty_workdir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1079,7 +1176,7 @@ mod tests {
         // 管理面重算哈希暴露失配（content_matches=false），但 GET 是只读面：
         // 状态不降级、账本哈希不动（状态迁移仍归会话创建/重批）
         let tmp = tempfile::tempdir().unwrap();
-        write_skill(tmp.path(), "data/skills", "s", CLEAN_SKILL);
+        write_skill(tmp.path(), "data/skills", "s", &clean_skill_named("s"));
         let app = human_router(tmp.path().to_path_buf());
         let (_, b) = post(
             app.clone(),
@@ -1191,7 +1288,7 @@ mod tests {
     #[tokio::test]
     async fn test_reapprove_is_idempotent_and_revoked_can_reactivate() {
         let tmp = tempfile::tempdir().unwrap();
-        write_skill(tmp.path(), "data/skills", "s", CLEAN_SKILL);
+        write_skill(tmp.path(), "data/skills", "s", &clean_skill_named("s"));
         let app = human_router(tmp.path().to_path_buf());
         let req = serde_json::json!({"name": "s", "level": "user"});
 
@@ -1221,7 +1318,12 @@ mod tests {
     #[tokio::test]
     async fn test_revoke_unknown_name_404_and_project_level_flow() {
         let tmp = tempfile::tempdir().unwrap();
-        write_skill(tmp.path(), ".evo/skills", "proj-skill", CLEAN_SKILL);
+        write_skill(
+            tmp.path(),
+            ".evo/skills",
+            "proj-skill",
+            &clean_skill_named("proj-skill"),
+        );
         let app = human_router(tmp.path().to_path_buf());
 
         // 未知名 revoke → 404
@@ -1367,7 +1469,12 @@ mod tests {
     async fn test_assembly_project_level_active_enters_manifest() {
         // 项目级 active 项同样进 manifest(两级目录均扫描)
         let tmp = tempfile::tempdir().unwrap();
-        write_skill(tmp.path(), ".evo/skills", "proj-flow", CLEAN_SKILL);
+        write_skill(
+            tmp.path(),
+            ".evo/skills",
+            "proj-flow",
+            &clean_skill_named("proj-flow"),
+        );
         let app = human_router(tmp.path().to_path_buf());
         let (status, _) = post(
             app,
@@ -1464,7 +1571,7 @@ mod tests {
         // 不再指向「先撤销」死路（撤销幂等，重复 revoke 解不了锁）
         let tmp = tempfile::tempdir().unwrap();
         let app = human_router(tmp.path().to_path_buf());
-        write_skill(tmp.path(), "data/skills", "s", CLEAN_SKILL);
+        write_skill(tmp.path(), "data/skills", "s", &clean_skill_named("s"));
         let req = serde_json::json!({"name": "s", "level": "user"});
         let (status, _) = post_authed(
             app.clone(),
@@ -1615,7 +1722,7 @@ mod tests {
         // 类别闸开启:操作者 token approve = 403(人工把关机制强制),特权 token 过;
         // 拒绝与放行均落人工账(identity=human + class=operator/privileged)
         let tmp = tempfile::tempdir().unwrap();
-        write_skill(tmp.path(), "data/skills", "s", CLEAN_SKILL);
+        write_skill(tmp.path(), "data/skills", "s", &clean_skill_named("s"));
         let app = privileged_router(tmp.path().to_path_buf());
 
         let (status, body) = post_authed(
@@ -1669,7 +1776,7 @@ mod tests {
         // 类别闸关闭(human_tokens 空):approve 照常放行,人工账记 identity=human
         // + class=privileged(旧版行为),approve/revoke 不再是账本盲区
         let tmp = tempfile::tempdir().unwrap();
-        write_skill(tmp.path(), "data/skills", "s", CLEAN_SKILL);
+        write_skill(tmp.path(), "data/skills", "s", &clean_skill_named("s"));
         let app = human_router(tmp.path().to_path_buf());
         let (status, _) = post(
             app,
