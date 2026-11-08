@@ -7,6 +7,8 @@
   import { EventTail } from '../lib/event-tail.js';
   import { buildProgress } from '../lib/stores.js';
   import { mergeProgressEvents } from '../lib/progress-events.js';
+  import { extractAssetEvent, buildAssetPath, previewKindFor } from '../lib/progress-assets.js';
+  import ShotPreviewCard from './ShotPreviewCard.svelte';
 
   /** 制作进度实时面板:尾随 <project>/build.progress.ndjson(events/1.0
    *  NDJSON,engine 构建旁挂)。双通道冗余:v2 WS typed 帧(宿主已解析,
@@ -24,6 +26,14 @@
   let discoveryNote = $state('');
   let epoch = $state(0);
   let tail = null;
+  let tailPath = $state(''); // 当前尾随的 ndjson 工作区路径(产物路径归一的基准)
+
+  // 镜头预览卡派生面:最新可预览产物事件 × ndjson 基准 → 工作区路径
+  const assetEvent = $derived(extractAssetEvent(events));
+  const assetWsPath = $derived(
+    assetEvent ? buildAssetPath(tailPath, assetEvent.asset.path) : null
+  );
+  const assetKind = $derived(assetEvent ? previewKindFor(assetEvent.asset.kind) : null);
 
   async function discover() {
     discoveryNote = '';
@@ -44,6 +54,7 @@
     }
     events = [];
     cursor = 0;
+    tailPath = path;
     selected = path.startsWith('video_engine/projects/') && path.endsWith('/build.progress.ndjson')
       ? path.split('/')[2]
       : '';
@@ -112,6 +123,7 @@
     }
     events = [];
     selected = '';
+    tailPath = '';
     tailState = 'idle';
     cursor = 0;
     discover();
@@ -166,6 +178,9 @@
     <div class="bp-banner bp-warn">连接中断(连续失败达阈值)——事件不补发;恢复靠「重试」或下一个文件事件。</div>
   {:else if tailState === 'waiting'}
     <div class="bp-banner">等待事件文件出现(engine 构建时重建)…</div>
+  {/if}
+  {#if assetWsPath && assetEvent}
+    <ShotPreviewCard path={assetWsPath} kind={assetKind} bytes={assetEvent.asset.bytes ?? 0} />
   {/if}
   <div class="bp-list">
     {#each events as e}

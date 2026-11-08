@@ -51,3 +51,48 @@ export function shouldRouteToMediaStage(path) {
 export function isOversize(sizeBytes) {
   return typeof sizeBytes === 'number' && sizeBytes > MEDIA_BLOB_LIMIT;
 }
+
+/** 浏览器原生解不了的容器黑名单(mov/mkv/avi):Blob URL 给到 <video> 会
+ *  静默黑屏——显态裁定,不许走「能播就播」的侥幸路径。mp4/webm 直连。 */
+export const UNPLAYABLE_VIDEO_EXTS = ['mov', 'mkv', 'avi'];
+
+/** 该路径是否为黑名单容器(大小写不敏感,兼 / \ 分隔) */
+export function isUnplayableVideo(path) {
+  const name = String(path || '').split(/[\\/]/).pop() || '';
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0) return false;
+  return UNPLAYABLE_VIDEO_EXTS.includes(name.slice(dot + 1).toLowerCase());
+}
+
+/** 黑名单容器的代理播放路径:<stem>.preview.mp4(与源文件同目录) */
+export function proxyPathFor(path) {
+  const p = String(path || '').replace(/\\/g, '/');
+  const dot = p.lastIndexOf('.');
+  const stem = dot > p.lastIndexOf('/') ? p.slice(0, dot) : p;
+  return `${stem}.preview.mp4`;
+}
+
+/** 播放目标裁定(纯函数,探测经注入的 checker 可测)。
+ *  返回 {target:'original', path} 直连 |
+ *        {target:'proxy', path, originalPath} 切代理 |
+ *        {target:'error', path, proxy, reason} 显态报错。
+ *  checker(path) → {ok: HTTP 2xx?, playable: Content-Type 为 video/mp4?}。 */
+export async function resolvePlaybackTarget(path, checker) {
+  if (!isUnplayableVideo(path)) {
+    return { target: 'original', path };
+  }
+  const proxy = proxyPathFor(path);
+  let probe;
+  try {
+    probe = await checker(proxy);
+  } catch {
+    probe = { ok: false };
+  }
+  if (!probe || !probe.ok) {
+    return { target: 'error', path, proxy, reason: 'no-proxy' };
+  }
+  if (!probe.playable) {
+    return { target: 'error', path, proxy, reason: 'proxy-not-playable' };
+  }
+  return { target: 'proxy', path: proxy, originalPath: path };
+}
