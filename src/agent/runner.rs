@@ -8343,60 +8343,18 @@ impl AgentRunner {
                                        }
                                        yield Ok(AgentEvent::Step { step: step_count });
 
-                                       // 跑中自审自检器(design-79 P-B):步界安全点周期触发,
-                                       // 只读服务族顺序直调,结论落 journal SelfAudit 账
-                                       // (观测面,不回喂不杀 run;cfg None = 零开销直返)。
-                                       if frame_buffer.enabled() {
-                                           if let Some(sa_cfg) = frame_buffer.config() {
-                                               if crate::agent::self_audit::should_trigger(
-                                                   sa_cfg,
-                                                   step_count,
-                                               ) {
-                                                   let frames = frame_buffer.snapshot();
-                                                   let frames_count = frames.len();
-                                                   let audit_started = std::time::Instant::now();
-                                                   let services =
-                                                       crate::agent::self_audit::invoke_audit_services(
-                                                           &runner.evorule_client,
-                                                           sa_cfg,
-                                                           &frames,
-                                                       )
-                                                       .await;
-                                                   let audit_ms =
-                                                       audit_started.elapsed().as_millis() as u64;
-                                                   // P-C 注入机制面(缺省关=只落账不回喂):
-                                                   // 模板渲染+同结论去重后经系统消息
-                                                   // 分区注入对话,LLM 下轮可见。
-                                                   let mut injected = false;
-                                                   if sa_cfg.inject == Some(true) {
-                                                       let report =
-                                                           crate::agent::self_audit::render_report(
-                                                               step_count, &services,
-                                                           );
-                                                       if frame_buffer.report_changed(&report) {
-                                                           messages.push(
-                                                               crate::agent::translator::Message::System {
-                                                                   content: report,
-                                                               },
-                                                           );
-                                                           injected = true;
-                                                       }
-                                                   }
-                                                   if let Some(j) = &journal {
-                                                       if let Err(e) = j.record_self_audit(
-                                                           "periodic",
-                                                           step_count as u64,
-                                                           frames_count,
-                                                           audit_ms,
-                                                           injected,
-                                                           services,
-                                                       ) {
-                                                           tracing::warn!(session_id = %session_id, error = %e, "self_audit journal write failed (ignored)");
-                                                       }
-                                                   }
-                                               }
-                                           }
-                                       }
+                                       // 跑中自审自检器（design-79 P-B/P-C）：步界
+                                       // 安全点统一检查点（引擎步界与本地 ReAct
+                                       // 回喂步界共用同一 helper；cfg None=零开销）。
+                                       crate::agent::self_audit::audit_checkpoint(
+                                           &runner.evorule_client,
+                                           &frame_buffer,
+                                           &mut messages,
+                                           &journal,
+                                           &session_id,
+                                           step_count,
+                                       )
+                                       .await;
 
                                        // 交互式步间隙引导注记 drain(REPL 显式接线;None=零开销零差异):
                                        // 当前工具步不被打断,排队输入在下一模型调用前并入权威历史
@@ -8524,6 +8482,19 @@ impl AgentRunner {
                                                            round = react_round,
                                                            "本地 ReAct 回喂:工具结果已入列,发起下一轮 LLM 调用"
                                                        );
+                                                       // 跑中自审自检器（design-79 P-B/P-C）：
+                                                       // 本地 ReAct 回喂步界安全点（CLI run
+                                                       // 主路径的每轮 LLM 前界；与引擎步界
+                                                       // 共用检查点）。
+                                                       crate::agent::self_audit::audit_checkpoint(
+                                                           &runner.evorule_client,
+                                                           &frame_buffer,
+                                                           &mut messages,
+                                                           &journal,
+                                                           &session_id,
+                                                           step_count,
+                                                       )
+                                                       .await;
                                                    }
                                                    react_round += 1;
                                                    let model: &str = react_model.as_str();
