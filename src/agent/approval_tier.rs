@@ -276,9 +276,13 @@ fn open_call_is_write(normalized: &str) -> bool {
     let mut search_from = 0;
     while let Some(pos) = normalized[search_from..].find("open(") {
         let start = search_from + pos;
-        // 窗口：open( 后 80 字符内找首个闭括号（嵌套按窗口截断，保守覆盖）
-        let window_end = (start + 5 + 80).min(normalized.len());
-        let window = &normalized[start + 5..window_end];
+        // 窗口：open( 后 80 字符内找首个闭括号（嵌套按窗口截断，保守覆盖）。
+        // 截断位按字符边界取（第 81 个字符的字节位，不足 80 字符取到串尾）——
+        // 多字节文本按裸字节偏移切 &str，截断点会落在汉字等字符的中间
+        // 字节上直接 panic，中止承载判定链的整个执行线程。
+        let body = &normalized[start + 5..];
+        let window_end = body.char_indices().nth(80).map_or(body.len(), |(i, _)| i);
+        let window = &body[..window_end];
         let close = window.find(')').unwrap_or(window.len());
         let args = &window[..close];
         if !args.contains(',') {
@@ -1129,6 +1133,41 @@ mod tests {
             TierVerdict::Ask {
                 reason: AskReason::Deny { .. }
             }
+        ));
+    }
+
+    // ===== 回归:open( 窗口截断必须按字符边界(多字节文本)=====
+
+    #[test]
+    fn test_escape_intent_open_window_multibyte_char_boundary() {
+        // open( 窗口按 80 字符截断;归一化文本含中文时若按裸字节偏移切
+        // &str,截断点会落入 3 字节汉字的中间字节 → 直接 panic。回归锚:
+        // 30 个汉字使字节偏移 start+5+80 恰落入第 27 个汉字内部。
+        // 读模式 + 中文填充跨窗口边界 → 不 panic 且正确判读模式放行
+        let read_pad = format!("open('{}', 'r')", "汉".repeat(30));
+        assert!(!hits_escape_intent(&read_pad));
+        // 同形态写模式 → 正确判写意图(语义不受窗口算法影响)
+        let write_pad = format!("open('{}', 'w')", "汉".repeat(30));
+        assert!(hits_escape_intent(&write_pad));
+        // 逗号与读模式声明全部在 80 字节之外的纯汉字填充形态
+        let wide_pad = format!("open({}x, 'r')", "世".repeat(40));
+        assert!(!hits_escape_intent(&wide_pad));
+    }
+
+    #[test]
+    fn test_verdict_python_exec_chinese_code_no_panic() {
+        // 生产 panic 形态:python_exec 判定基底(自匹配 token+code 原文)
+        // 叠加中文 code,逃逸检测窗口字节截断落汉字中间 → 承载循环的
+        // 线程 panic → 整轮不可恢复中止。回归锚:判定链对多字节 code
+        // 不 panic,且读模式 code 照常走 allow 匹配。
+        let al = allowlist(
+            json!([{ "tool": "python_exec", "prefix": "python_exec" }]),
+            json!([]),
+        );
+        let code = format!("print(open('{}', 'r').read())", "世".repeat(30));
+        assert!(matches!(
+            verdict("python_exec", &py_base(&code), &al),
+            TierVerdict::Auto { .. }
         ));
     }
 
