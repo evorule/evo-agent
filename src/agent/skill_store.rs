@@ -940,9 +940,15 @@ fn is_active(registry: &SkillRegistry, name: &str, level: SkillLevel) -> bool {
 /// runtime.json 缺失/无版本字段时省略 engine 分量；主机名取 COMPUTERNAME/
 /// HOSTNAME。任一途径都保证至少主机名分量 → 实际恒 Some。
 pub fn env_fingerprint(workdir: &Path) -> Option<String> {
+    // 主机名三分量跨平台取源：Windows=COMPUTERNAME（env），多数
+    // Unix=HOSTNAME（env），容器/CI runner 两者皆无时读 /etc/hostname
+    // 文件——三者皆缺（罕见）才返回 None
     let host = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()?;
+        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
     let serve = env!("CARGO_PKG_VERSION").to_string();
     let engine = std::fs::read_to_string(workdir.join("runtime.json"))
         .ok()
@@ -1443,6 +1449,20 @@ mod tests {
                 || err.contains("hash mismatch"),
             "tampered sig must fail visible: {err}"
         );
+    }
+
+    #[test]
+    fn test_env_fingerprint_returns_some_cross_platform() {
+        // 跨平台核验：主机名三分量取源（env×2 + /etc/hostname）至少其一可得,
+        // Windows 与 Linux runner 均恒 Some（B-1 在 ubuntu CI 的 None 即红根因）
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            env_fingerprint(tmp.path()).is_some(),
+            "host component must resolve on this platform"
+        );
+        let fp1 = env_fingerprint(tmp.path()).unwrap();
+        let fp2 = env_fingerprint(tmp.path()).unwrap();
+        assert_eq!(fp1, fp2, "fingerprint must be stable within one boot");
     }
 
     #[test]
