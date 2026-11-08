@@ -700,12 +700,13 @@ pub enum JournalEvent {
         /// 任务标识(pack 绑定任务)
         task_ref: String,
     },
-    /// 周期自审结论落账(run 面自审自检器,def `self_audit` 开关,缺省关=
+    /// 自审结论落账(run 面自审自检器,def `self_audit` 开关,缺省关=
     /// 本事件不存在):步界触发时调 evorule-server trace-audit 只读服务族,
     /// 结论装配方入账。services 为逐件压缩摘要(单件失败记 error,审计
     /// 只读非关键路径)。观测面,不参与步映射。
     SelfAudit {
-        /// 触发形态(v1 仅 "periodic";阶段锚候规划工件批次)
+        /// 触发形态("periodic"=周期兜底;"stage"=阶段锚精确命中,
+        /// def `self_audit.stages[].at_step` 预声明步号)
         trigger: String,
         /// 触发时步数(Step 事件序,从 1 起)
         step: u64,
@@ -717,6 +718,15 @@ pub enum JournalEvent {
         /// false = 只落账不回喂)
         #[serde(default)]
         injected: bool,
+        /// 命中的阶段锚 id(trigger=stage 时为阶段 id;periodic = None。
+        /// 存量旧账无此字段)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage: Option<String>,
+        /// 自审配置对账锚(def `self_audit` 序列化体的 evorule-hash 口径
+        /// digest,字节级对账——journal 与定义版本可离线互证;存量旧账无
+        /// 此字段)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_hash: Option<String>,
         /// 逐件结论摘要(键=entropy_w4/entropy_w10/density/era_split/
         /// era_mixing_sentinel/out_of_scope_writes;值=服务出参压缩体或
         /// {error}|{skipped:true})
@@ -1283,7 +1293,10 @@ impl JournalWriter {
         self.push_with(|_| event)
     }
 
-    /// 周期自审结论落账(run 面自审自检器;调用方 best-effort,失败仅 warn)
+    /// 自审结论落账(run 面自审自检器;调用方 best-effort,失败仅 warn)。
+    /// stage=命中的阶段锚 id(trigger=stage;periodic 传 None);plan_hash=
+    /// def 自审配置对账锚。
+    #[allow(clippy::too_many_arguments)]
     pub fn record_self_audit(
         &self,
         trigger: &str,
@@ -1291,6 +1304,8 @@ impl JournalWriter {
         frames_count: usize,
         duration_ms: u64,
         injected: bool,
+        stage: Option<&str>,
+        plan_hash: Option<&str>,
         services: serde_json::Value,
     ) -> Result<u64, JournalError> {
         self.push(JournalEvent::SelfAudit {
@@ -1299,6 +1314,8 @@ impl JournalWriter {
             frames_count,
             duration_ms,
             injected,
+            stage: stage.map(str::to_string),
+            plan_hash: plan_hash.map(str::to_string),
             services,
         })
     }
@@ -2527,6 +2544,82 @@ pub fn verify_journal_file(path: &std::path::Path) -> Result<JournalVerifyReport
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_self_audit_stage_fields_and_backcompat() {
+        // 新账:stage/plan_hash 落账回环;旧账(无该二字段)解析 = None
+        // (serde default,账本单调兼容——D1 阶段锚批不破坏存量账)
+        let dir = std::env::temp_dir().join(format!("jf-sa-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let w = JournalWriter::open(&dir, "s-sa").unwrap();
+            w.record_self_audit(
+                "stage",
+                3,
+                12,
+                45,
+                false,
+                Some("setup"),
+                Some("blake3:abc"),
+                serde_json::json!({ "entropy_w4": { "value": 0.5 } }),
+            )
+            .unwrap();
+            w.record_self_audit(
+                "periodic",
+                5,
+                20,
+                60,
+                true,
+                None,
+                Some("blake3:abc"),
+                serde_json::json!({}),
+            )
+            .unwrap();
+        }
+        let lines = read_all(&JournalWriter::path_for(&dir, "s-sa")).unwrap();
+        assert_eq!(lines.len(), 2);
+        match &lines[0].event {
+            JournalEvent::SelfAudit {
+                trigger,
+                stage,
+                plan_hash,
+                ..
+            } => {
+                assert_eq!(trigger, "stage");
+                assert_eq!(stage.as_deref(), Some("setup"));
+                assert_eq!(plan_hash.as_deref(), Some("blake3:abc"));
+            }
+            other => panic!("expected self_audit, got {other:?}"),
+        }
+        match &lines[1].event {
+            JournalEvent::SelfAudit { stage, .. } => assert!(stage.is_none()),
+            other => panic!("expected self_audit, got {other:?}"),
+        }
+        // 旧账事件(无 stage/plan_hash)解析 = None(serde default)
+        let old = serde_json::json!({
+            "type": "self_audit",
+            "payload": {
+                "trigger": "periodic",
+                "step": 2,
+                "frames_count": 1,
+                "duration_ms": 1,
+                "injected": false,
+                "services": {}
+            }
+        });
+        let event: JournalEvent = serde_json::from_value(old).unwrap();
+        match event {
+            JournalEvent::SelfAudit {
+                stage, plan_hash, ..
+            } => {
+                assert!(stage.is_none(), "旧账无 stage 字段 = None");
+                assert!(plan_hash.is_none(), "旧账无 plan_hash 字段 = None");
+            }
+            other => panic!("expected self_audit, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_unclean_tail_appends_crash_marker() {

@@ -788,10 +788,11 @@ pub struct AgentDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge_datasets: Option<Vec<String>>,
     /// 跑中自审自检器配置(可选,None(缺省)=机制不存在,
-    /// 既有定义零影响)。声明后 runner 步界按周期触发 evorule-server
-    /// trace-audit 只读服务族,结论落 journal SelfAudit 账(观测面;inject
-    /// 显式开启才经系统消息分区注入对话)。装载期 validate fail-fast
-    /// (every_n_steps=0/空 scope 拒)。
+    /// 既有定义零影响)。声明后 runner 步界触发 trace-audit 只读服务族
+    /// (阶段锚 stages[].at_step 精确优先+周期 every_n_steps 兜底),结论落
+    /// journal SelfAudit 账(观测面;inject 显式开启才经系统消息分区注入
+    /// 对话)。装载期 validate fail-fast(every_n_steps=0/空 scope/at_step=0/
+    /// 重复 at_step 拒)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_audit: Option<crate::agent::self_audit::SelfAuditConfig>,
 }
@@ -2108,6 +2109,31 @@ mod tests {
         let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null,"self_audit":{"every_n_steps":5,"scope":"  "}}"#;
         let def: AgentDefinition = serde_json::from_str(json).expect("parse");
         assert!(def.validate().unwrap_err().to_string().contains("scope"));
+    }
+
+    #[test]
+    fn test_self_audit_stages_gate_and_direct_copy() {
+        // at_step=0 装载期拒
+        let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null,"self_audit":{"stages":[{"id":"setup","at_step":0}]}}"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert!(def.validate().unwrap_err().to_string().contains("at_step"));
+
+        // 重复 at_step 装载期拒
+        let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null,"self_audit":{"stages":[{"id":"a","at_step":3},{"id":"b","at_step":3}]}}"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert!(def.validate().unwrap_err().to_string().contains("at_step"));
+
+        // 合法 stages 声明:validate 放行,直拷进 AgentConfig(含 goal_text)
+        let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null,"self_audit":{"stages":[{"id":"setup","at_step":2,"goal_text":"install deps"},{"id":"verify","at_step":9}]}}"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert!(def.validate().is_ok());
+        let sa = def.self_audit.as_ref().expect("self_audit parsed");
+        assert_eq!(sa.stages.len(), 2);
+        assert_eq!(sa.stages[0].id, "setup");
+        assert_eq!(sa.stages[0].at_step, 2);
+        assert_eq!(sa.stages[0].goal_text.as_deref(), Some("install deps"));
+        assert_eq!(sa.stages[1].goal_text, None);
+        assert_eq!(def.to_agent_config().self_audit, def.self_audit);
     }
 
     #[test]
