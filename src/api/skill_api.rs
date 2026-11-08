@@ -1080,7 +1080,7 @@ mod tests {
         // 状态不降级、账本哈希不动（状态迁移仍归会话创建/重批）
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "data/skills", "s", CLEAN_SKILL);
-        let app = router(make_state(tmp.path().to_path_buf()));
+        let app = human_router(tmp.path().to_path_buf());
         let (_, b) = post(
             app.clone(),
             "/api/skills/approve",
