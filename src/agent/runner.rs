@@ -1690,6 +1690,18 @@ impl AgentRunner {
         &self.cancel_token
     }
 
+    /// 步超时预算下限推导决策(纯函数,可测)
+    ///
+    /// enabled 且 configured 非零小于预算时返回预算下限,否则原值返回。
+    /// 零值(不限步超时)永不推导;configured ≥ 预算时保持原值(不降)。
+    fn derive_step_timeout_floor(configured_secs: u64, budget_secs: u64, enabled: bool) -> u64 {
+        if enabled && configured_secs > 0 && configured_secs < budget_secs {
+            budget_secs
+        } else {
+            configured_secs
+        }
+    }
+
     /// 从 `AgentDefinition` + 预组装的组件构造一个**完整可跑**的 AgentRunner
     ///
     /// 责任:
@@ -1737,7 +1749,7 @@ impl AgentRunner {
         // 违反=拒建,错误明示规则名)
         def.validate_assembly_binding()
             .map_err(|e| AgentError::Internal(e.to_string()))?;
-        let config = def.to_agent_config();
+        let mut config = def.to_agent_config();
 
         // B2:skills 声明接线(read_skill 注册 + manifest 槽位源;声明时刻=
         // 人工把关,路径由系统解析,LLM 无法用 read_skill 读任意文件)。
@@ -1854,6 +1866,27 @@ impl AgentRunner {
 
         // 4. LLM handler(默认从 env 读)
         let llm = llm_handler.unwrap_or_else(LlmHandler::with_defaults);
+
+        // 动态推导(可选,缺省零变化):定义显式开启 step_timeout_floor_from_budget
+        // 且 step_timeout 非零小于 LLM 最坏预算时,生效步超时推导到预算下限——
+        // 防「step_timeout 先炸报 call_external timeout 掩盖 LLM 慢真因」在
+        // 长跑收尾段误伤(任务本体已交付却 fail-visible 退出)。推导决策落
+        // 日志可回放(审计同权);缺省不推导,特例仅经显式声明激活。
+        // 推导后下方失配断言自然静默(同源 worst_case_budget_secs)。
+        let derived = Self::derive_step_timeout_floor(
+            config.step_timeout.as_secs(),
+            llm.worst_case_budget_secs(),
+            def.step_timeout_floor_from_budget == Some(true),
+        );
+        if derived != config.step_timeout.as_secs() {
+            tracing::warn!(
+                from_secs = config.step_timeout.as_secs(),
+                to_secs = derived,
+                "step_timeout below LLM worst-case budget: derived up to budget \
+                 (step_timeout_floor_from_budget=true in agent definition)"
+            );
+            config.step_timeout = std::time::Duration::from_secs(derived);
+        }
 
         // step_timeout ≥ LLM 最坏预算断言（预算失配会让 step_timeout 先炸,
         // 掩盖 LLM 端点慢的真因——错误归因指向编排层）。

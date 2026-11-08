@@ -635,6 +635,18 @@ pub struct AgentDefinition {
     pub max_steps: usize,
     /// Step timeout in seconds
     pub step_timeout_secs: u64,
+    /// 步超时预算下限动态推导开关(可选,缺省 None=false=现行为零变化)
+    ///
+    /// true 且 step_timeout 非零小于 LLM 最坏预算(request_timeout×attempts
+    /// +backoff+margin)时,装配期把生效步超时推导到预算下限——防「step_timeout
+    /// 先炸报 call_external timeout 掩盖 LLM 慢真因」在长跑收尾段误伤
+    /// (任务本体已交付却 fail-visible 退出,退出码不可信)。推导决策落日志
+    /// 可回放;显式声明激活,缺省值=现行为。
+    ///
+    /// 生效面=`AgentRunner::from_definition` 装配点(run/CLI),与既有步预算
+    /// 失配断言同面;serve 会话与 delegate 子代理装配面不消费本开关。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_timeout_floor_from_budget: Option<bool>,
     /// Available tool list
     pub tools: Vec<String>,
     #[serde(default)]
@@ -1955,6 +1967,19 @@ mod tests {
         assert!(matches!(result, Err(AgentDefinitionError::NotFound(_))));
     }
 
+    #[test]
+    fn test_step_timeout_floor_from_budget_parse() {
+        // 缺省(字段缺席)=None=现行为零变化
+        let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null}"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert_eq!(def.step_timeout_floor_from_budget, None);
+
+        // 显式 true=声明激活
+        let json_on = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null,"step_timeout_floor_from_budget":true}"#;
+        let def_on: AgentDefinition = serde_json::from_str(json_on).expect("parse");
+        assert_eq!(def_on.step_timeout_floor_from_budget, Some(true));
+    }
+
     // ===== 门卫负向用例(P2-M7 前置补丁,2026-08-27) =====
 
     #[test]
@@ -2078,6 +2103,7 @@ mod tests {
             temperature: 0.8,
             max_steps: 15,
             step_timeout_secs: 45,
+            step_timeout_floor_from_budget: None,
             tools: vec!["write_file".to_string()],
             memory: MemoryConfig::default(),
             output_format: None,
@@ -2455,6 +2481,7 @@ mod tests {
             temperature: 0.5,
             max_steps: 1,
             step_timeout_secs: 1,
+            step_timeout_floor_from_budget: None,
             tools: tools.into_iter().map(String::from).collect(),
             memory: MemoryConfig::default(),
             output_format: None,
@@ -2719,6 +2746,7 @@ mod tests {
             temperature: 0.5,
             max_steps: 1,
             step_timeout_secs: 1,
+            step_timeout_floor_from_budget: None,
             tools: vec![],
             memory: MemoryConfig::default(),
             output_format: None,
@@ -2959,6 +2987,7 @@ mod tests {
             temperature: 0.5,
             max_steps: 1,
             step_timeout_secs: 1,
+            step_timeout_floor_from_budget: None,
             tools: vec![],
             memory: MemoryConfig::default(),
             output_format: None,

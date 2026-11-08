@@ -26,6 +26,21 @@ fn make_test_client() -> EvoruleApiClient {
 }
 
 #[test]
+fn test_derive_step_timeout_floor() {
+    // 缺省(未启用)=原值零变化
+    assert_eq!(AgentRunner::derive_step_timeout_floor(300, 7217, false), 300);
+    // 启用且低于预算=推导到预算下限
+    assert_eq!(AgentRunner::derive_step_timeout_floor(300, 7217, true), 7217);
+    // 启用但已高于预算=保持原值(不降)
+    assert_eq!(
+        AgentRunner::derive_step_timeout_floor(8000, 7217, true),
+        8000
+    );
+    // 零值(不限步超时)永不推导
+    assert_eq!(AgentRunner::derive_step_timeout_floor(0, 7217, true), 0);
+}
+
+#[test]
 fn test_partition_tool_calls_readonly_parallel_mutating_serial() {
     // 读写分级分组纯函数（并行调度批）：只读索引组并行（保原序）、
     // 其余串行（保原序）；未标定工具保守落串行组（缺省不变式）。
@@ -822,6 +837,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         temperature: 0.5,
         max_steps: 5,
         step_timeout_secs: 30,
+        step_timeout_floor_from_budget: None,
         tools,
         memory: MemoryConfig::default(), // type = "none"
         output_format: None,

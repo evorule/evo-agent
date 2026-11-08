@@ -2035,6 +2035,7 @@ service_tools = ["config_persist", "rule_sandbox"]
             temperature: 0.7,
             max_steps: 5,
             step_timeout_secs: 30,
+            step_timeout_floor_from_budget: None,
             tools: tools.iter().map(|s| s.to_string()).collect(),
             memory: Default::default(),
             output_format: None,
