@@ -17,6 +17,9 @@
 //!   （`/api/services/` 前缀）；
 //! - **落账**：结论装配方 self_audit journal 事件（确定性摘要，大数组
 //!   截断标记）；审计只读非关键路径——任何服务失败降级落账，不杀 run；
+//! - **回喂**：缺省不回喂（观测面）；def `self_audit.inject` 显式开启后
+//!   触发时把固定模板报告经系统消息分区注入对话（同结论去重 + 大小上限
+//!   锁死，报告带 detour≠drift 定性、只描述差口不替决策）；
 //! - **缺省不变式**：`self_audit` 字段缺省 None = 帧缓冲零采集、零触发、
 //!   零事件（序列化面无字段）。
 //!
@@ -45,6 +48,12 @@ pub struct SelfAuditConfig {
     /// 为 base_dir=scope（执行体帧写路径为字面量，非链接形态）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// 结论注入开关（P-C 注入机制面；None/false[缺省] = 只落账不回喂 =
+    /// P-B 行为零变化；true = 触发时把固定模板报告经系统消息分区注入对话，
+    /// 同结论去重 + 报告体大小上限锁死）。注入文本模板固定（LLM 不可参与
+    /// 结论计算，报告只描述差口不替决策，带 detour≠drift 定性）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject: Option<bool>,
 }
 
 impl SelfAuditConfig {
@@ -83,6 +92,8 @@ pub fn should_trigger(cfg: &SelfAuditConfig, step: usize) -> bool {
 pub struct SelfAuditFrameBuffer {
     cfg: Option<SelfAuditConfig>,
     frames: std::sync::Mutex<Vec<Value>>,
+    /// 上次渲染报告（P-C 注入去重状态；None = 尚未渲染过）
+    last_report: std::sync::Mutex<Option<String>>,
 }
 
 impl SelfAuditFrameBuffer {
@@ -91,6 +102,7 @@ impl SelfAuditFrameBuffer {
         Self {
             cfg,
             frames: std::sync::Mutex::new(Vec::new()),
+            last_report: std::sync::Mutex::new(None),
         }
     }
 
@@ -121,6 +133,17 @@ impl SelfAuditFrameBuffer {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// P-C 注入去重判定：报告与上次渲染不同（或首次）= true 并记录；
+    /// 相同 = false（同结论不重复注入，频控面）。仅注入开启时调用。
+    pub fn report_changed(&self, report: &str) -> bool {
+        let mut g = self.last_report.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = g.as_deref() != Some(report);
+        if changed {
+            *g = Some(report.to_string());
+        }
+        changed
     }
 }
 
@@ -239,6 +262,28 @@ pub async fn invoke_audit_services(
     Value::Object(out)
 }
 
+/// 注入报告体字符上限（模板锁死纪律：报告为确定性摘要，全量可由帧流
+/// 离线重算；超限截断标记收尾）
+const REPORT_CAP_CHARS: usize = 4000;
+
+/// P-C 注入报告渲染（模板固定，LLM 不可参与结论计算）：头部定性
+/// （只读观测面 + detour≠drift + 只描述差口不替决策）+ services 摘要体。
+pub fn render_report(step: usize, services: &Value) -> String {
+    let body = serde_json::to_string_pretty(services).unwrap_or_else(|_| "{}".to_string());
+    let body: String = if body.chars().count() > REPORT_CAP_CHARS {
+        let cut: String = body.chars().take(REPORT_CAP_CHARS).collect();
+        format!("{cut}\n__truncated__")
+    } else {
+        body
+    };
+    format!(
+        "[self-audit] periodic self-audit report (step {step})\n\
+         Read-only observation: the findings below are deterministic trace-audit\n\
+         results, not LLM-generated. detour != drift: benign detours are not\n\
+         defects. Findings describe gaps only; the decision remains yours.\n{body}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -248,6 +293,7 @@ mod tests {
         SelfAuditConfig {
             every_n_steps: n,
             scope: None,
+            inject: None,
         }
     }
 
@@ -274,6 +320,7 @@ mod tests {
         let bad = SelfAuditConfig {
             every_n_steps: Some(1),
             scope: Some("  ".to_string()),
+            inject: None,
         };
         let err = bad.validate().expect_err("空 scope 必须拒");
         assert!(err.contains("scope"));
@@ -290,6 +337,45 @@ mod tests {
         let c = cfg(Some(7));
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(s, r#"{"every_n_steps":7}"#);
+        // inject 缺省 None：序列化无字段
+        assert!(!s.contains("inject"));
+        let c_inject = SelfAuditConfig {
+            every_n_steps: Some(7),
+            scope: None,
+            inject: Some(true),
+        };
+        let s2 = serde_json::to_string(&c_inject).unwrap();
+        assert_eq!(s2, r#"{"every_n_steps":7,"inject":true}"#);
+    }
+
+    #[test]
+    fn test_render_report_fixed_template_and_cap() {
+        let services = serde_json::json!({ "entropy_w4": { "value": 0.5 } });
+        let r1 = render_report(5, &services);
+        let r2 = render_report(5, &services);
+        assert_eq!(r1, r2, "同输入同输出（模板锁死）");
+        assert!(r1.contains("detour != drift"), "定性行必须存在");
+        assert!(r1.contains("step 5"));
+        assert!(r1.contains("entropy_w4"));
+        // 超限截断：大数组撑爆报告体
+        let big: Vec<Value> = (0..5000)
+            .map(|i| serde_json::json!({ "p": format!("D:/x/{i}") }))
+            .collect();
+        let huge = serde_json::json!({ "out_of_scope_writes": { "writes": big } });
+        let r = render_report(1, &huge);
+        // 报告体=头部模板+截断到 4000 的 JSON 体+截断标记
+        assert!(r.chars().count() < REPORT_CAP_CHARS + 512, "截断生效");
+        assert!(r.ends_with("__truncated__"));
+        assert!(r.starts_with("[self-audit]"), "头部模板保留");
+    }
+
+    #[test]
+    fn test_report_changed_dedup() {
+        let buf = SelfAuditFrameBuffer::new(Some(cfg(Some(5))));
+        assert!(buf.report_changed("A"), "首次 = 变更");
+        assert!(!buf.report_changed("A"), "同结论去重");
+        assert!(buf.report_changed("B"), "结论变化 = 再注入");
+        assert!(!buf.report_changed("B"));
     }
 
     #[test]

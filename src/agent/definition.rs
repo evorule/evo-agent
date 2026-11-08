@@ -787,10 +787,11 @@ pub struct AgentDefinition {
     /// 跳过,绝不阻断会话)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge_datasets: Option<Vec<String>>,
-    /// 跑中自审自检器配置(design-79 P-B;可选,None(缺省)=机制不存在,
+    /// 跑中自审自检器配置(design-79 P-B/P-C;可选,None(缺省)=机制不存在,
     /// 既有定义零影响)。声明后 runner 步界按周期触发 evorule-server
-    /// trace-audit 只读服务族,结论落 journal SelfAudit 账(观测面,不回喂)。
-    /// 装载期 validate fail-fast(every_n_steps=0/空 scope 拒)。
+    /// trace-audit 只读服务族,结论落 journal SelfAudit 账(观测面;inject
+    /// 显式开启才经系统消息分区注入对话)。装载期 validate fail-fast
+    /// (every_n_steps=0/空 scope 拒)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_audit: Option<crate::agent::self_audit::SelfAuditConfig>,
 }

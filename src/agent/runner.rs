@@ -8376,12 +8376,31 @@ impl AgentRunner {
                                                        .await;
                                                    let audit_ms =
                                                        audit_started.elapsed().as_millis() as u64;
+                                                   // P-C 注入机制面(缺省关=只落账不回喂):
+                                                   // 模板渲染+同结论去重后经系统消息
+                                                   // 分区注入对话,LLM 下轮可见。
+                                                   let mut injected = false;
+                                                   if sa_cfg.inject == Some(true) {
+                                                       let report =
+                                                           crate::agent::self_audit::render_report(
+                                                               step_count, &services,
+                                                           );
+                                                       if frame_buffer.report_changed(&report) {
+                                                           messages.push(
+                                                               crate::agent::translator::Message::System {
+                                                                   content: report,
+                                                               },
+                                                           );
+                                                           injected = true;
+                                                       }
+                                                   }
                                                    if let Some(j) = &journal {
                                                        if let Err(e) = j.record_self_audit(
                                                            "periodic",
                                                            step_count as u64,
                                                            frames_count,
                                                            audit_ms,
+                                                           injected,
                                                            services,
                                                        ) {
                                                            tracing::warn!(session_id = %session_id, error = %e, "self_audit journal write failed (ignored)");
