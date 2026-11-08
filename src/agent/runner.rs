@@ -555,6 +555,10 @@ pub struct AgentConfig {
     pub i2_lexicon: Option<crate::agent::context_inspector::I2Lexicon>,
     /// 全局时限预算秒(H3 看门狗;None=不启用——既有定义零影响)
     pub wall_clock_budget_secs: Option<u64>,
+    /// 跑中自审自检器配置(design-79 P-B;None=机制不存在=既有定义零影响。
+    /// 声明后 inner 步界按周期触发 trace-audit 只读服务族,结论落 journal
+    /// SelfAudit 账;帧捕获在外层 wrapper 面)
+    pub self_audit: Option<crate::agent::self_audit::SelfAuditConfig>,
 }
 
 impl Default for AgentConfig {
@@ -588,6 +592,7 @@ impl Default for AgentConfig {
             knowledge_datasets: None,
             i2_lexicon: None,
             wall_clock_budget_secs: None,
+            self_audit: None,
         }
     }
 }
@@ -7289,17 +7294,23 @@ impl AgentRunner {
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         let callbacks = self.event_callbacks.clone();
         let hooks = self.user_hooks.clone();
+        // P-B 自审自检器:帧缓冲同 run_streaming 口径(wrapper 采集/inner 触发)
+        let frame_buffer = std::sync::Arc::new(
+            crate::agent::self_audit::SelfAuditFrameBuffer::new(self.config.self_audit.clone()),
+        );
         let inner = self.run_streaming_inner(
             String::new(),
             Some(session_id.clone()),
             RecoveryMode::CrashResume,
             Vec::new(),
+            frame_buffer.clone(),
         );
         Box::pin(async_stream::stream! {
             let mut inner = inner;
             while let Some(result) = inner.next().await {
                 if let Ok(ref event) = result {
                     callbacks.dispatch(event).await;
+                    frame_buffer.capture(event);
                 }
                 yield result;
             }
@@ -7351,7 +7362,18 @@ impl AgentRunner {
         // G18:提取回调链(Arc clone),在 inner stream 之外包装 dispatch
         let callbacks = self.event_callbacks.clone();
         let hooks = self.user_hooks.clone();
-        let inner = self.run_streaming_inner(goal, None, RecoveryMode::Fresh, images);
+        // P-B 自审自检器:帧缓冲 wrapper 采集 / inner 触发消费(Arc 共享,
+        // 同任务串行访问);cfg None(缺省)= 零采集零触发
+        let frame_buffer = std::sync::Arc::new(
+            crate::agent::self_audit::SelfAuditFrameBuffer::new(self.config.self_audit.clone()),
+        );
+        let inner = self.run_streaming_inner(
+            goal,
+            None,
+            RecoveryMode::Fresh,
+            images,
+            frame_buffer.clone(),
+        );
         Box::pin(async_stream::stream! {
             let mut inner = inner;
             let mut hooks_session: Option<String> = None;
@@ -7362,6 +7384,8 @@ impl AgentRunner {
                         hooks_session = Some(session_id.clone());
                     }
                     callbacks.dispatch(event).await;
+                    // P-B:dispatch 后帧捕获(帧同构面单一事实源 agent_event_to_json)
+                    frame_buffer.capture(event);
                 }
                 yield result;
             }
@@ -7400,17 +7424,23 @@ impl AgentRunner {
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         // G18:提取回调链(Arc clone),在 inner stream 之外包装 dispatch
         let callbacks = self.event_callbacks.clone();
+        // P-B 自审自检器:帧缓冲同 run_streaming 口径(wrapper 采集/inner 触发)
+        let frame_buffer = std::sync::Arc::new(
+            crate::agent::self_audit::SelfAuditFrameBuffer::new(self.config.self_audit.clone()),
+        );
         let inner = self.run_streaming_inner(
             user_input,
             Some(session_id),
             RecoveryMode::Continuation,
             images,
+            frame_buffer.clone(),
         );
         Box::pin(async_stream::stream! {
             let mut inner = inner;
             while let Some(result) = inner.next().await {
                 if let Ok(ref event) = result {
                     callbacks.dispatch(event).await;
+                    frame_buffer.capture(event);
                 }
                 yield result;
             }
@@ -7430,6 +7460,7 @@ impl AgentRunner {
         existing_session_id: Option<String>,
         recovery: RecoveryMode,
         user_images: Vec<crate::agent::translator::UserImageRef>,
+        frame_buffer: std::sync::Arc<crate::agent::self_audit::SelfAuditFrameBuffer>,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send>> {
         Box::pin(stream! {
                            let mut runner = self;
@@ -8323,6 +8354,42 @@ impl AgentRunner {
                                            return;
                                        }
                                        yield Ok(AgentEvent::Step { step: step_count });
+
+                                       // 跑中自审自检器(design-79 P-B):步界安全点周期触发,
+                                       // 只读服务族顺序直调,结论落 journal SelfAudit 账
+                                       // (观测面,不回喂不杀 run;cfg None = 零开销直返)。
+                                       if frame_buffer.enabled() {
+                                           if let Some(sa_cfg) = frame_buffer.config() {
+                                               if crate::agent::self_audit::should_trigger(
+                                                   sa_cfg,
+                                                   step_count,
+                                               ) {
+                                                   let frames = frame_buffer.snapshot();
+                                                   let frames_count = frames.len();
+                                                   let audit_started = std::time::Instant::now();
+                                                   let services =
+                                                       crate::agent::self_audit::invoke_audit_services(
+                                                           &runner.evorule_client,
+                                                           sa_cfg,
+                                                           &frames,
+                                                       )
+                                                       .await;
+                                                   let audit_ms =
+                                                       audit_started.elapsed().as_millis() as u64;
+                                                   if let Some(j) = &journal {
+                                                       if let Err(e) = j.record_self_audit(
+                                                           "periodic",
+                                                           step_count as u64,
+                                                           frames_count,
+                                                           audit_ms,
+                                                           services,
+                                                       ) {
+                                                           tracing::warn!(session_id = %session_id, error = %e, "self_audit journal write failed (ignored)");
+                                                       }
+                                                   }
+                                               }
+                                           }
+                                       }
 
                                        // 交互式步间隙引导注记 drain(REPL 显式接线;None=零开销零差异):
                                        // 当前工具步不被打断,排队输入在下一模型调用前并入权威历史

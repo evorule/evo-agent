@@ -700,6 +700,24 @@ pub enum JournalEvent {
         /// 任务标识(pack 绑定任务)
         task_ref: String,
     },
+    /// 周期自审结论落账(run 面自审自检器,def `self_audit` 开关,缺省关=
+    /// 本事件不存在):步界触发时调 evorule-server trace-audit 只读服务族,
+    /// 结论装配方入账。services 为逐件压缩摘要(单件失败记 error,审计
+    /// 只读非关键路径)。观测面,不参与步映射。
+    SelfAudit {
+        /// 触发形态(v1 仅 "periodic";阶段锚候规划工件批次)
+        trigger: String,
+        /// 触发时步数(Step 事件序,从 1 起)
+        step: u64,
+        /// 触发时帧缓冲条数(事件帧同构面)
+        frames_count: usize,
+        /// 自审耗时毫秒(服务直调总和)
+        duration_ms: u64,
+        /// 逐件结论摘要(键=entropy_w4/entropy_w10/density/era_split/
+        /// era_mixing_sentinel/out_of_scope_writes;值=服务出参压缩体或
+        /// {error}|{skipped:true})
+        services: serde_json::Value,
+    },
 }
 
 /// 单行 journal 记录(读侧重放消费形态)
@@ -1259,6 +1277,24 @@ impl JournalWriter {
 
     fn push(&self, event: JournalEvent) -> Result<u64, JournalError> {
         self.push_with(|_| event)
+    }
+
+    /// 周期自审结论落账(run 面自审自检器;调用方 best-effort,失败仅 warn)
+    pub fn record_self_audit(
+        &self,
+        trigger: &str,
+        step: u64,
+        frames_count: usize,
+        duration_ms: u64,
+        services: serde_json::Value,
+    ) -> Result<u64, JournalError> {
+        self.push(JournalEvent::SelfAudit {
+            trigger: trigger.to_string(),
+            step,
+            frames_count,
+            duration_ms,
+            services,
+        })
     }
 
     /// turn 开始:写 turn_started,返回轮守卫(drop 未显式 end 时补写 aborted)
