@@ -1149,6 +1149,14 @@ fn cmd_run(
         }
     };
 
+    // 无人值守预检:policy 评审档在 run 面拒启——评审调用走 LLM 且不受步预算
+    // 约束,端点慢时段无界挂起,而 run 面无人工可回落;启动期 fail-fast 并指向
+    // 判定式档位(auto_policy)。attended 评审走 serve 面(有会话面人工兜底)。
+    if let Some(msg) = run_policy_gate_reject(approval_mode_resolved(&def, workdir).as_deref()) {
+        eprintln!("{msg}");
+        return ExitCode::from(2);
+    }
+
     // 人工审查开合(2026-09-28):def move 前捕获审批模式(auto_policy → PolicyApproval)
     let approval_auto = def.approval_mode.as_deref() == Some("auto_policy");
 
@@ -1559,14 +1567,12 @@ fn cmd_run(
 }
 
 /// 档位解析单源(与 serve 面同口径):定义级优先,未指定回落设置键
-/// approval.mode.shellExec(manual/auto_policy/policy 之外不计)。
-/// 返回是否解析为 policy 档。
-fn approval_policy_mode_resolved(
+/// approval.mode.shellExec(仅 manual/auto_policy/policy 三值计入,其余不算)。
+fn approval_mode_resolved(
     def: &evo_agent::agent::definition::AgentDefinition,
     workdir: &Path,
-) -> bool {
-    let def_mode = def.approval_mode.clone();
-    match def_mode {
+) -> Option<String> {
+    match def.approval_mode.clone() {
         Some(m) => Some(m),
         None => evo_agent::api::settings::WorkbenchSettingsStore::new(workdir)
             .ok()
@@ -1579,8 +1585,31 @@ fn approval_policy_mode_resolved(
             })
             .filter(|v| v == "manual" || v == "auto_policy" || v == "policy"),
     }
-    .as_deref()
-        == Some("policy")
+}
+
+/// 返回是否解析为 policy 档。
+fn approval_policy_mode_resolved(
+    def: &evo_agent::agent::definition::AgentDefinition,
+    workdir: &Path,
+) -> bool {
+    approval_mode_resolved(def, workdir).as_deref() == Some("policy")
+}
+
+/// run 面无人值守预检:policy 评审档拒启文案单源(返回 Some=拒启)。
+/// policy 档评审调用走 LLM(仅受 request_timeout 约束,不受步预算/护栏约束),
+/// 端点慢时段会无界挂起;run 面无人工可回落,启动期 fail-fast 并指向判定式
+/// 档位(auto_policy,零 LLM 评审调用)。attended 评审走 serve 面。
+fn run_policy_gate_reject(resolved_mode: Option<&str>) -> Option<&'static str> {
+    if resolved_mode == Some("policy") {
+        Some(concat!(
+            "error: unattended run does not support approval_mode='policy': ",
+            "policy review invokes the LLM without a step budget and can hang ",
+            "indefinitely; set approval_mode='auto_policy' for unattended runs, ",
+            "or run via 'serve' for attended policy review",
+        ))
+    } else {
+        None
+    }
 }
 
 /// 解析 agent 产出中的围栏 JSON 代码块(取最后一个 ```json 或 ``` 围栏块)
@@ -5228,5 +5257,102 @@ mod patrol_parse_tests {
             extract_keyed_value("TEST_CASE={\"a\": \"b\"};", "TEST_CASE").as_deref(),
             Some("{\"a\": \"b\"}")
         );
+    }
+}
+
+#[cfg(test)]
+mod run_policy_gate_tests {
+    use super::*;
+
+    /// policy 评审档拒启,文案指向判定式档位 auto_policy
+    #[test]
+    fn test_run_policy_gate_rejects_policy() {
+        let msg = run_policy_gate_reject(Some("policy")).expect("policy 档应拒启");
+        assert!(msg.contains("auto_policy"), "文案应指向 auto_policy: {msg}");
+    }
+
+    /// 判定式档位(无人值守合法档)零变化放行
+    #[test]
+    fn test_run_policy_gate_allows_auto_policy() {
+        assert!(run_policy_gate_reject(Some("auto_policy")).is_none());
+    }
+
+    /// 人工档放行
+    #[test]
+    fn test_run_policy_gate_allows_manual() {
+        assert!(run_policy_gate_reject(Some("manual")).is_none());
+    }
+
+    /// 未解析出档位放行(门只认解析结果,过滤面归解析单源)
+    #[test]
+    fn test_run_policy_gate_allows_none() {
+        assert!(run_policy_gate_reject(None).is_none());
+    }
+
+    /// 解析单源:定义级 policy 档在设置键缺省下仍解析为 policy
+    #[test]
+    fn test_approval_mode_resolved_def_level_wins() {
+        let def = def_with_mode(Some("policy"));
+        let tmp = std::env::temp_dir().join("run-policy-gate-def-win");
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(
+            approval_mode_resolved(&def, &tmp).as_deref(),
+            Some("policy")
+        );
+    }
+
+    /// 解析单源:未声明档位 → 回落设置库缺省(实测=manual,非 policy)→ 门放行,
+    /// 存量 def 启动零行为变化
+    #[test]
+    fn test_approval_mode_resolved_none_when_unset() {
+        let def = def_with_mode(None);
+        let tmp = std::env::temp_dir().join("run-policy-gate-unset");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let resolved = approval_mode_resolved(&def, &tmp);
+        assert_ne!(
+            resolved.as_deref(),
+            Some("policy"),
+            "缺省回落不得解析为 policy: {resolved:?}"
+        );
+        assert!(
+            run_policy_gate_reject(resolved.as_deref()).is_none(),
+            "缺省回落档位必须放行: {resolved:?}"
+        );
+    }
+
+    /// 最小 agent 定义夹具(字段面与加载期缺省一致)
+    fn def_with_mode(mode: Option<&str>) -> evo_agent::agent::definition::AgentDefinition {
+        evo_agent::agent::definition::AgentDefinition {
+            agent_type: "gate-test".to_string(),
+            version: "1.0.0".to_string(),
+            description: String::new(),
+            system_prompt: String::new(),
+            model: "test-model".to_string(),
+            temperature: 0.5,
+            max_steps: 5,
+            step_timeout_secs: 30,
+            step_timeout_floor_from_budget: None,
+            tools: Vec::new(),
+            memory: evo_agent::agent::definition::MemoryConfig::default(),
+            http_get_allowed_hosts: None,
+            http_get_config: None,
+            execution_profile: None,
+            output_format: None,
+            context_window_tokens: None,
+            acceptance_command: None,
+            acceptance_generation: None,
+            verify: None,
+            i2_lexicon: None,
+            wall_clock_budget_secs: None,
+            knowledge_datasets: None,
+            max_parallel_tools: 1,
+            capability_boundary: None,
+            approval_mode: mode.map(str::to_string),
+            assembly: None,
+            skills: None,
+            identity_segment: None,
+            north_star: None,
+            handoff: None,
+        }
     }
 }
