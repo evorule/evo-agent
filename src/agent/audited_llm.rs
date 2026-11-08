@@ -56,7 +56,8 @@ use serde_json::Value;
 /// 单次审计调用的整体超时（含建会话 + LLM 执行 + 协议回路）
 ///
 /// 主流程 step_timeout 默认量级参考；摘要类调用输入较大，取 90s。
-/// 该超时作用于每个等待点（HTTP 请求 / 下一个事件），并非全周期硬上限。
+/// 该超时作用于每个等待点（HTTP 请求 / 下一个事件 / 本地 LLM 执行），
+/// 并非全周期硬上限。
 pub const DEFAULT_AUDITED_CALL_TIMEOUT_SECS: u64 = 90;
 
 /// F2（audit-chain 专项 2026-08-28）：建链阶段（create_session / subscribe_events）
@@ -155,6 +156,13 @@ impl AuditedLlm {
         self
     }
 
+    /// 评审调用 model 键取源（与主流程同源：handler 缺省模型）。评审
+    /// params 必带 model——服务端 call_external 规则要求
+    /// instruction.params.model，缺失即 TCB 拒、评审静默降级人工。
+    pub fn review_model(&self) -> String {
+        self.llm.default_model().to_string()
+    }
+
     /// 在审计链内执行一次 LLM 调用
     ///
     /// - `purpose`：用途标签（summarize / session_summary / rollup /
@@ -224,8 +232,18 @@ impl AuditedLlm {
                     info!(%session_id, request_id, purpose, "audited_llm: executing LLM locally");
 
                     // 本地执行；失败也要把错误写进 io_response 再返回，
-                    // 保证引擎状态机能收尾（不留悬空 IoRequest）
-                    let exec_result = self.llm.execute(params).await;
+                    // 保证引擎状态机能收尾（不留悬空 IoRequest）。
+                    // 本地执行段同样受整体预算约束（LLM handler 自带
+                    // request_timeout×重试可达 7217s 量级，远超本预算——
+                    // 不加罩则评审等审计调用在该段实质无界）。
+                    let exec_result =
+                        match tokio::time::timeout(deadline, self.llm.execute(params)).await {
+                            Ok(r) => r,
+                            Err(_) => Err(format!(
+                                "local LLM execution exceeded {}s audited-call budget",
+                                self.timeout_secs
+                            )),
+                        };
                     let (response_value, error_msg): (serde_json::Value, Option<String>) =
                         match &exec_result {
                             Ok(v) => (v.clone(), None),
@@ -294,6 +312,7 @@ fn build_call_external_command(purpose: &str, params: &Value) -> Result<serde_js
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::agent::approval_policy::PolicyReviewInvoker;
     use serde_json::json;
 
     fn tcb(v: &serde_json::Value) -> Value {
@@ -382,6 +401,138 @@ mod tests {
         }));
         let result = audited.execute("summarize", &params).await.unwrap();
         assert!(result.to_string().contains("hello summary"));
+
+        create_mock.assert_async().await;
+        events_mock.assert_async().await;
+        command_mock.assert_async().await;
+        io_response_mock.assert_async().await;
+    }
+
+    /// 本地 LLM 执行段超出审计调用预算时，错误经 io_response 落引擎
+    /// （引擎收尾不留悬空），execute 返回 Err。
+    #[tokio::test]
+    async fn test_execute_local_llm_budget_guard() {
+        let mut server = mockito::Server::new_async().await;
+        // 执行体端点挂死：接受连接后永不响应（远超 1s 审计预算）→ 预算罩先断
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llm_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((_sock, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+            }
+        });
+        let audited = AuditedLlm::new(
+            EvoruleApiClient::new(&server.url()),
+            LlmHandler::new("test-model", &format!("http://{llm_addr}")),
+        )
+        .with_timeout_secs(1);
+
+        let create_mock = server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"session_id":88}"#)
+            .create_async()
+            .await;
+        let sse = concat!(
+            "data: {\"type\":\"IoRequest\",\"id\":9}\n\n",
+            "data: {\"type\":\"Stable\"}\n\n"
+        );
+        let events_mock = server
+            .mock("GET", "/api/sessions/88/events")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create_async()
+            .await;
+        let command_mock = server
+            .mock("POST", "/api/sessions/88/command")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        // 预算超时错误必须经 io_response 落引擎（引擎收尾不留悬空 IoRequest）
+        let io_response_mock = server
+            .mock("POST", "/api/sessions/88/io_response")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "error": "local LLM execution exceeded 1s audited-call budget"
+            })))
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let params = tcb(&json!({
+            "model": "test-model",
+            "temperature": 0.0,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        let result = audited.execute("approval_review", &params).await;
+        assert!(result.is_err(), "预算罩必须断");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("local LLM execution exceeded"),
+            "预算超时错误信息: {err}"
+        );
+
+        create_mock.assert_async().await;
+        events_mock.assert_async().await;
+        command_mock.assert_async().await;
+        io_response_mock.assert_async().await;
+    }
+
+    /// 评审 invoker 产物 params 必带 model 键（服务端 call_external 规则
+    /// 要求 instruction.params.model，缺失即 TCB 拒、评审静默降级人工——
+    /// G 臂废跑实录真因回归）。
+    #[tokio::test]
+    async fn test_review_invoker_params_carry_model() {
+        let mut server = mockito::Server::new_async().await;
+        let audited = AuditedLlm::new(
+            EvoruleApiClient::new(&server.url()),
+            LlmHandler::mock(r#"{"decision":"approve"}"#),
+        );
+
+        let create_mock = server
+            .mock("POST", "/api/sessions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"session_id":89}"#)
+            .create_async()
+            .await;
+        let sse = concat!(
+            "data: {\"type\":\"IoRequest\",\"id\":3}\n\n",
+            "data: {\"type\":\"Stable\"}\n\n"
+        );
+        let events_mock = server
+            .mock("GET", "/api/sessions/89/events")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create_async()
+            .await;
+        let command_mock = server
+            .mock("POST", "/api/sessions/89/command")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "instruction": {
+                    "type": "call_external",
+                    "params": {"model": "mock", "audit_purpose": "policy_review"}
+                }
+            })))
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        let io_response_mock = server
+            .mock("POST", "/api/sessions/89/io_response")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let invoker = crate::agent::approval_policy::AuditedReviewInvoker::new(audited);
+        let out = invoker.review("payload").await.unwrap();
+        assert_eq!(out, r#"{"decision":"approve"}"#);
 
         create_mock.assert_async().await;
         events_mock.assert_async().await;

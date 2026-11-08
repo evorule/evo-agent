@@ -152,8 +152,11 @@ impl AuditedReviewInvoker {
 impl PolicyReviewInvoker for AuditedReviewInvoker {
     async fn review(&self, user_payload: &str) -> Result<String, String> {
         // temperature=0 保证评审最大确定性；messages 形状与 core_eval 规则
-        // 引用的 instruction.params.messages 契约一致
+        // 引用的 instruction.params.messages 契约一致。model 键必带（服务端
+        // call_external 规则要求 instruction.params.model，缺失即 TCB 拒、
+        // 评审静默降级人工——o31 实录真因）。
         let params = serde_json::json!({
+            "model": self.audited.review_model(),
             "messages": [
                 { "role": "system", "content": REVIEW_SYSTEM_PROMPT },
                 { "role": "user", "content": user_payload },
