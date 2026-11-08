@@ -434,7 +434,7 @@ pub fn export(sources: AtifSources<'_>) -> Result<AtifTrajectory, AtifExportErro
             // 不映射为轨迹步(治理面共享账本已有同源事实)
             JournalEvent::McpCapabilityBlocked { .. } => continue,
             // 周期自审结论:观测面留痕(判据确定性可由帧流离线重算),非对话
-            // 步,不映射为轨迹步(design-79 P-B)
+            // 步,不映射为轨迹步(自审观测面)
             JournalEvent::SelfAudit { .. } => continue,
             JournalEvent::TurnStarted { goal, .. } => {
                 // 轮界:上一个 agent 步必已随 turn_ended 收步;开用户步
