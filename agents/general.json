@@ -85,6 +85,10 @@
     {
       "name": "evorule-deep-research",
       "path": "skills/evorule-deep-research/SKILL.md"
+    },
+    {
+      "name": "skill-authoring",
+      "path": "skills/skill-authoring/SKILL.md"
     }
   ],
   "memory": {
