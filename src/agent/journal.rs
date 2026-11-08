@@ -713,6 +713,10 @@ pub enum JournalEvent {
         frames_count: usize,
         /// 自审耗时毫秒(服务直调总和)
         duration_ms: u64,
+        /// 本次是否注入对话(def `self_audit.inject` 开启且报告与上次不同;
+        /// false = 只落账不回喂)
+        #[serde(default)]
+        injected: bool,
         /// 逐件结论摘要(键=entropy_w4/entropy_w10/density/era_split/
         /// era_mixing_sentinel/out_of_scope_writes;值=服务出参压缩体或
         /// {error}|{skipped:true})
@@ -1286,6 +1290,7 @@ impl JournalWriter {
         step: u64,
         frames_count: usize,
         duration_ms: u64,
+        injected: bool,
         services: serde_json::Value,
     ) -> Result<u64, JournalError> {
         self.push(JournalEvent::SelfAudit {
@@ -1293,6 +1298,7 @@ impl JournalWriter {
             step,
             frames_count,
             duration_ms,
+            injected,
             services,
         })
     }
