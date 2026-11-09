@@ -3763,7 +3763,120 @@ impl AgentRunner {
         // success+空 content 收尾（伪成功会让调用方以 exit 0 误判整轮工作完成）。
         let mut rewound_awaiting_work = false;
         let mut last_rewind_version: Option<u64> = None;
-        while let Some(event) = event_stream.next().await {
+        // 修订⑦心跳保活(event 等待点,非流式镜像):60s 无引擎事件记一次失联,
+        // 三级恢复梯位与流式主循环同款——①重试等待→②通道重建(仅一次/run;
+        // broadcast 不重放历史,重建窗内已发事件不可恢复,由后续心跳与③对账兜底)
+        // →③弃轮收尾(悬挂 io_request 终结对账+flush/sediment/tool_traces+
+        // fail-visible 错误终态)。裸 while 等待原本无任何超时,引擎静默即永久
+        // 挂起(delegate 面同此暴露)。LLM 通道挂起由 HTTP 超时兜底,不在此处。
+        let mut heartbeat_misses: u32 = 0;
+        let mut stream_rebuilt = false;
+        loop {
+            let event_opt = tokio::select! {
+                ev = event_stream.next() => ev,
+                _ = tokio::time::sleep(Duration::from_secs(heartbeat_timeout_secs())) => {
+                    heartbeat_misses += 1;
+                    if heartbeat_misses < 2 {
+                        info!(%session_id, misses = heartbeat_misses,
+                            "no engine event within {}s, retrying wait (recovery step 1)",
+                            heartbeat_timeout_secs());
+                        continue;
+                    }
+                    // ②通道重建(三级恢复第 2 级):仅一次/run。
+                    if !stream_rebuilt {
+                        stream_rebuilt = true;
+                        warn!(%session_id, misses = heartbeat_misses,
+                            "heartbeat lost (x2): rebuilding engine event stream (recovery step 2)");
+                        match self.evorule_client.subscribe_events(&session_id).await {
+                            Ok(es) => {
+                                event_stream = es;
+                                heartbeat_misses = 0;
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(%session_id, error = %e,
+                                    "event stream rebuild failed; proceeding to run abort (recovery step 3)");
+                            }
+                        }
+                    }
+                    // ③弃轮收尾:悬挂 io_request 终结(fail-visible,防同死法循环),
+                    // 与流式弃轮同源对账;best-effort,失败不阻断收尾。
+                    warn!(%session_id, misses = heartbeat_misses,
+                        "heartbeat lost (no engine event within {}s x2 after rebuild); aborting run",
+                        heartbeat_timeout_secs());
+                    match self.evorule_client.get_session_history(&session_id).await {
+                        Ok(history) => {
+                            if let Some((rid, io_type, _params)) =
+                                Self::plan_pending_resolution(&history)
+                            {
+                                let reason = format!(
+                                    "heartbeat lost: no engine event within {}s (x2); pending io_request terminally answered by run abort",
+                                    heartbeat_timeout_secs() * 2,
+                                );
+                                match self
+                                    .evorule_client
+                                    .submit_io_response(
+                                        &session_id,
+                                        rid,
+                                        &serde_json::json!({
+                                            "error": reason,
+                                        }),
+                                        Some(reason.as_str()),
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        info!(%session_id, request_id = rid, io_type = %io_type,
+                                            "heartbeat abort: pending io_request terminally answered");
+                                    }
+                                    Err(e) => {
+                                        warn!(%session_id, request_id = rid, error = %e,
+                                            "heartbeat abort: terminal io_response submit failed (best-effort)");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(%session_id, error = %e,
+                                "heartbeat abort: session history fetch failed; cannot reconcile pending io");
+                        }
+                    }
+                    let duration = start_time.elapsed().as_millis() as u64;
+                    if let Err(e) = self.flush_messages(&session_id).await {
+                        tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                    }
+                    if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
+                        tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                    }
+                    self.submit_tool_traces(&session_id).await;
+                    return Ok(AgentResult::error(
+                        "heartbeat lost: engine unresponsive, run aborted".to_string(),
+                        step_count,
+                        duration,
+                    ));
+                }
+                _ = self.cancel_token.cancelled() => {
+                    // 取消挂起等待(心跳窗内亦可取消):镜像事件边界的取消清理序列
+                    info!(%session_id, "Cancellation requested during event wait, cleaning up");
+                    if let Err(e) = self.flush_messages(&session_id).await {
+                        tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");
+                    }
+                    if let Err(e) = self.sediment_session(&session_id, &messages, None).await {
+                        tracing::warn!(session_id = %session_id, error = %e, "sediment_session failed");
+                    }
+                    self.submit_tool_traces(&session_id).await;
+                    let duration = start_time.elapsed().as_millis() as u64;
+                    return Ok(AgentResult::cancelled_result(
+                        tool_calls.clone(),
+                        step_count,
+                        duration,
+                    ));
+                }
+            };
+            // 流结束(None)=引擎事件流自然关闭,走既有断流收尾路径
+            let Some(event) = event_opt else { break };
+            // 心跳恢复:任一引擎事件到达即重置失联计数(修订⑦)
+            heartbeat_misses = 0;
             // G6:取消检查(event 边界 — 即使 LLM 调用已返回,也在此处响应取消)
             if self.cancel_token.is_cancelled() {
                 info!(%session_id, "Cancellation requested at event boundary, cleaning up");
@@ -8228,11 +8341,14 @@ impl AgentRunner {
                                (None, _) => RunawayGuard::new(u32::MAX),
                            };
                            // 修订⑦心跳保活(event 等待点):60s 无引擎事件记一次失联,
-                           // 重试等待 1 次后仍失联(连续 2 次=120s)即判定引擎死锁,
-                           // 中止当前 turn 走恢复(三级恢复 v1:①重试等待已做;②修正
-                           // 重查 policy 在引擎等待点无对应语义,v1 记偏离;③暂停等人
-                           // =中止收尾)。LLM 通道挂起由 HTTP 超时兜底,不在此处。
+                           // 重试等待 1 次后仍失联(连续 2 次=120s)触发三级恢复:
+                           // ②通道重建(仅一次/流——订阅面静默失效时救活;broadcast
+                           // 不重放历史,重建窗内已发事件不可恢复,由后续心跳与
+                           // ③的对账兜底)→重建后仍连续 2 窗失联即判定引擎死锁,
+                           // 中止当前 turn 走弃轮收尾(③升级人工=fail-visible 终态,
+                           // 人可重试)。LLM 通道挂起由 HTTP 超时兜底,不在此处。
                            let mut heartbeat_misses: u32 = 0;
+                           let mut stream_rebuilt = false;
                            loop {
                                let event = tokio::select! {
                                    ev = event_stream.next() => match ev {
@@ -8244,9 +8360,34 @@ impl AgentRunner {
                                    )) => {
                                        heartbeat_misses += 1;
                                        if heartbeat_misses >= 2 {
+                                           // ②通道重建(三级恢复第 2 级):仅一次/流。
                                            warn!(%session_id, misses = heartbeat_misses,
-        "heartbeat lost (no engine event within {}s x2); aborting turn",
-                                               heartbeat_timeout_secs());
+                                               "heartbeat lost (x2): rebuilding engine event stream (recovery step 2)");
+                                           yield Ok(AgentEvent::Info(format!(
+                                               "heartbeat lost: no engine event within {}s (x2); rebuilding engine event stream (recovery step 2)",
+                                               heartbeat_timeout_secs(),
+                                           )));
+                                           if stream_rebuilt {
+                                               warn!(%session_id,
+                                                   "event stream already rebuilt; proceeding to turn abort (recovery step 3)");
+                                           } else {
+                                               stream_rebuilt = true;
+                                               match runner
+                                                   .evorule_client
+                                                   .subscribe_events(&session_id)
+                                                   .await
+                                               {
+                                                   Ok(es) => {
+                                                       event_stream = es;
+                                                       heartbeat_misses = 0;
+                                                       continue;
+                                                   }
+                                                   Err(e) => {
+                                                       warn!(%session_id, error = %e,
+                                                           "event stream rebuild failed; proceeding to turn abort (recovery step 3)");
+                                                   }
+                                               }
+                                           }
                                            // 悬挂 io_request 终结:引擎反应器对 pending io
                                            // 门控(新命令只入队不执行),弃轮若不收敛,后续
                                            // 每一轮都会以同样的心跳死法循环。发现路径与

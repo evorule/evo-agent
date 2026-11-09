@@ -6737,6 +6737,8 @@ async fn tool_result_fetch_reaches_real_executor_via_service_pipeline() {
 #[tokio::test]
 async fn heartbeat_abort_terminates_pending_io_request() {
     use futures_util::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     let mut server = mockito::Server::new_async().await;
     let sid = "sess-hb-abort";
@@ -6758,12 +6760,16 @@ async fn heartbeat_abort_terminates_pending_io_request() {
         .create_async()
         .await;
 
-    // SSE:连接保持打开但零事件(引擎被悬挂 io 门控的真实形态)
+    // SSE:连接保持打开但零事件(引擎被悬挂 io 门控的真实形态);
+    // 首订与重建订阅均命中此 mock(静默),梯位走满后弃轮
+    let event_hits = Arc::new(AtomicUsize::new(0));
+    let event_hits_for_mock = event_hits.clone();
     server
         .mock("GET", events_path.as_str())
         .with_status(200)
         .with_header("content-type", "text/event-stream")
-        .with_chunked_body(|_w| {
+        .with_chunked_body(move |_w| {
+            event_hits_for_mock.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_secs(3));
             Ok(())
         })
@@ -6793,19 +6799,389 @@ async fn heartbeat_abort_terminates_pending_io_request() {
 
     let client = EvoruleApiClient::new(&server.url());
     let runner = AgentRunner::new(AgentConfig::default(), client);
+    let _hb_lock = heartbeat_override_lock();
     set_test_heartbeat_timeout(1);
 
     let mut stream = runner.run_continuation(sid.to_string(), "please continue".into(), Vec::new());
     let mut saw_done = false;
+    let mut saw_rebuild_info = false;
     while let Some(ev) = stream.next().await {
-        if let Ok(AgentEvent::Done(_)) = ev {
-            saw_done = true;
+        match ev {
+            Ok(AgentEvent::Done(_)) => saw_done = true,
+            Ok(AgentEvent::Info(msg)) => {
+                if msg.contains("rebuilding engine event stream") {
+                    saw_rebuild_info = true;
+                }
+            }
+            _ => {}
         }
     }
     set_test_heartbeat_timeout(0);
 
     assert!(saw_done, "turn must end with Done on heartbeat abort");
+    assert!(
+        saw_rebuild_info,
+        "recovery step 2 (event stream rebuild) must be announced via Info before abort"
+    );
+    // 三级恢复梯位:连续 2 窗失联触发通道重建(第二次订阅),重建后再
+    // 连续 2 窗仍死才弃轮——events 端点必须恰被命中 2 次。
+    assert_eq!(
+        event_hits.load(Ordering::SeqCst),
+        2,
+        "event stream must be re-subscribed exactly once (recovery step 2) before abort"
+    );
     io_terminal.assert();
+}
+
+/// 三级恢复②通道重建成功路径:SSE 订阅静默失效(连接活着但引擎零事件)
+/// 后,第二次订阅收到 Stable 即应救活 turn——不弃轮、不终结悬挂 io,
+/// 任务正常收尾。与弃轮测试(重建后仍死)互补,共同锁死梯位语义。
+#[tokio::test]
+async fn heartbeat_rebuild_recovers_silent_stream() {
+    use futures_util::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut server = mockito::Server::new_async().await;
+    let sid = "sess-hb-rebuild-ok";
+    let hist_path = format!("/api/sessions/{sid}/history");
+    let events_path = format!("/api/sessions/{sid}/events");
+    let command_path = format!("/api/sessions/{sid}/command");
+    let state_path = format!("/api/sessions/{sid}/state");
+
+    server
+        .mock("GET", hist_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    // SSE:第一次订阅静默挂住(订阅面失效形态),重建后的第二次订阅
+    // 立即送出 Stable——恢复第 2 级救活
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_mock = attempts.clone();
+    server
+        .mock("GET", events_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(move |w| {
+            let n = attempts_for_mock.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                Ok(())
+            } else {
+                w.write_all(b"data: {\"type\":\"Stable\"}\n\n")?;
+                Ok(())
+            }
+        })
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", command_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{\"success\":true}")
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", state_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"payload":{"llm_response":{"content":"recovered via rebuilt stream"}}}"#)
+        .create_async()
+        .await;
+
+    // 恢复成功即不应终结任何 io_request(没有悬挂请求,更不应误发)
+    let io_hits = Arc::new(AtomicUsize::new(0));
+    let io_hits_for_mock = io_hits.clone();
+    let io_resp_path = format!("/api/sessions/{sid}/io_response");
+    server
+        .mock("POST", io_resp_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_chunked_body(move |w| {
+            io_hits_for_mock.fetch_add(1, Ordering::SeqCst);
+            w.write_all(b"{}")?;
+            Ok(())
+        })
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let runner = AgentRunner::new(AgentConfig::default(), client);
+    let _hb_lock = heartbeat_override_lock();
+    set_test_heartbeat_timeout(1);
+
+    let mut stream = runner.run_continuation(sid.to_string(), "please continue".into(), Vec::new());
+    let mut done_success = false;
+    let mut saw_rebuild_info = false;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            Ok(AgentEvent::Done(res)) => done_success = res.success,
+            Ok(AgentEvent::Info(msg)) => {
+                if msg.contains("rebuilding engine event stream") {
+                    saw_rebuild_info = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    set_test_heartbeat_timeout(0);
+
+    assert!(saw_rebuild_info, "rebuild must be announced via Info");
+    assert!(
+        done_success,
+        "rebuilt stream must carry the turn to a successful Done"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "exactly one rebuild subscription expected"
+    );
+    assert_eq!(
+        io_hits.load(Ordering::SeqCst),
+        0,
+        "no io_response must be sent on recovery"
+    );
+}
+
+/// 非流式 run() 心跳保活镜像:引擎静默时三级恢复梯位走满后必须
+/// fail-visible 收尾(error 结果),且悬挂 io_request 以 error 终结,
+/// 不得永久挂起(裸 while 等待的历史缺陷)。
+#[tokio::test]
+async fn run_heartbeat_abort_terminates_pending_io_request() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut server = mockito::Server::new_async().await;
+    // run() 自建会话:create_session mock 返回 session_id=777,后续端点
+    // 一律按数字 id 落路径(run() 不再使用假名)
+    let sid = "777";
+    let hist_path = format!("/api/sessions/{sid}/history");
+    let events_path = format!("/api/sessions/{sid}/events");
+    let command_path = format!("/api/sessions/{sid}/command");
+    let io_resp_path = format!("/api/sessions/{sid}/io_response");
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 777}"#)
+        .create_async()
+        .await;
+
+    // run() 前导 auto_recall 拉共享事实(硬失败点)——空清单直通
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"/api/shared/facts.*".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    // run() 前导会话不变量自检(GET,硬失败点)
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"/api/sessions/(777|778)/invariants.*".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 777, "structural_invariant_violations": []}"#)
+        .create_async()
+        .await;
+
+    let history = serde_json::json!([
+        { "type": "IoRequest", "id": 41, "io_type": "call_external",
+          "params": {}, "version": 3 },
+    ]);
+    server
+        .mock("GET", hist_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(history.to_string())
+        .create_async()
+        .await;
+
+    // SSE:两次订阅(首订+重建)均静默——梯位走满,弃轮收尾
+    let event_hits = Arc::new(AtomicUsize::new(0));
+    let event_hits_for_mock = event_hits.clone();
+    server
+        .mock("GET", events_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(move |_w| {
+            event_hits_for_mock.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            Ok(())
+        })
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", command_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{\"success\":true}")
+        .create_async()
+        .await;
+
+    let io_terminal = server
+        .mock("POST", io_resp_path.as_str())
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({ "request_id": 41 }),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let mut runner = AgentRunner::new(AgentConfig::default(), client);
+    let _hb_lock = heartbeat_override_lock();
+    set_test_heartbeat_timeout(1);
+
+    let result = runner
+        .run("goal")
+        .await
+        .expect("run must return Ok result on heartbeat abort");
+    set_test_heartbeat_timeout(0);
+
+    assert!(!result.success, "heartbeat abort must fail visibly");
+    let err = result.error.as_deref().unwrap_or("");
+    assert!(
+        err.contains("heartbeat"),
+        "error must name the cause: {err:?}"
+    );
+    assert_eq!(
+        event_hits.load(Ordering::SeqCst),
+        2,
+        "event stream must be re-subscribed exactly once (recovery step 2) before abort"
+    );
+    io_terminal.assert();
+}
+
+/// 非流式 run() 心跳保活镜像——恢复第 2 级成功路径:重建订阅收到
+/// Stable 即救活,run 以 success 收尾(不弃轮)。
+#[tokio::test]
+async fn run_heartbeat_rebuild_recovers_silent_stream() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut server = mockito::Server::new_async().await;
+    // run() 自建会话:create_session mock 返回 session_id=778,后续端点
+    // 一律按数字 id 落路径
+    let sid = "778";
+    let events_path = format!("/api/sessions/{sid}/events");
+    let command_path = format!("/api/sessions/{sid}/command");
+    let state_path = format!("/api/sessions/{sid}/state");
+
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 778}"#)
+        .create_async()
+        .await;
+
+    // run() 前导 auto_recall 拉共享事实(硬失败点)——空清单直通
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"/api/shared/facts.*".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    // run() 前导会话不变量自检(GET,硬失败点)
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"/api/sessions/(777|778)/invariants.*".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 778, "structural_invariant_violations": []}"#)
+        .create_async()
+        .await;
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_mock = attempts.clone();
+    server
+        .mock("GET", events_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(move |w| {
+            let n = attempts_for_mock.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                Ok(())
+            } else {
+                w.write_all(b"data: {\"type\":\"Stable\"}\n\n")?;
+                Ok(())
+            }
+        })
+        .create_async()
+        .await;
+
+    server
+        .mock("POST", command_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{\"success\":true}")
+        .create_async()
+        .await;
+
+    server
+        .mock("GET", state_path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"payload":{"llm_response":{"content":"recovered via rebuilt stream"}}}"#)
+        .create_async()
+        .await;
+
+    let client = EvoruleApiClient::new(&server.url());
+    let mut runner = AgentRunner::new(AgentConfig::default(), client);
+    let _hb_lock = heartbeat_override_lock();
+    set_test_heartbeat_timeout(1);
+
+    let result = runner
+        .run("goal")
+        .await
+        .expect("run must succeed after stream rebuild");
+    set_test_heartbeat_timeout(0);
+
+    assert!(
+        result.success,
+        "rebuilt stream must carry the run to success"
+    );
+    assert_eq!(result.content, "recovered via rebuilt stream");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "exactly one rebuild subscription expected"
+    );
+}
+
+/// set_test_heartbeat_timeout 是进程级全局覆写,而 tokio 测试默认并行
+/// ——心跳族测试互相竞争会把彼此的覆写清零(1s→60s 挂起 240s)。
+/// 用互斥锁串行化心跳族测试的全局覆写窗口。
+static HEARTBEAT_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn heartbeat_override_lock() -> impl Drop {
+    // 测试 panic 中毒不串联:取锁失败时直接复用毒锁内的守卫
+    HEARTBEAT_OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ===== 审批决策面与帧对账 =====
