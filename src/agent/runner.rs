@@ -3517,8 +3517,19 @@ impl AgentRunner {
     /// 回喂循环;首轮返回 tool_calls 的任务会在 Stable 终止(此时按编排断裂
     /// 指纹显式判错,不再假绿)。生产多轮工具任务一律走 [`Self::run_streaming`]
     /// (本地回喂循环);本方法仅保留给 mock 引擎测试面与单轮纯文本场景。
+    ///
+    /// 自审接线:引擎步界挂与 [`Self::run_streaming`] 同位的
+    /// `audit_checkpoint`(Step 帧同构采集+触发判定+只读服务直调+注入面)。
+    /// 帧面边界:本路径无 AgentEvent 流,仅步界 Step 帧可同构采集(LLM/工具
+    /// 轨迹帧以流式路径为正本);journal 沿本路径既有口径(无 journal,
+    /// SelfAudit 落账缺席,服务调用/注入面不受影响)。缺省关:cfg None =
+    /// 零采集零触发零开销。
     pub async fn run(&mut self, goal: &str) -> Result<AgentResult, AgentError> {
         let start_time = std::time::Instant::now();
+        // 自审自检器:帧缓冲同 run_streaming 口径(cfg None 缺省=零采集)
+        let self_audit_frames = std::sync::Arc::new(
+            crate::agent::self_audit::SelfAuditFrameBuffer::new(self.config.self_audit.clone()),
+        );
 
         // B3: 召回前按节流间隔校验 cache 与真相源漂移（server wins 对齐）
         if let Some(mem) = self.memory.as_mut() {
@@ -3791,6 +3802,20 @@ impl AgentRunner {
                             duration,
                         ));
                     }
+
+                    // 跑中自审自检器（非流式引擎步界）：与 run_streaming 引擎
+                    // 步界同位同构（Step 帧采集+检查点）；cfg None=零开销，
+                    // journal 沿本路径 None 口径（无 journal，落账缺席）。
+                    self_audit_frames.capture(&AgentEvent::Step { step: step_count });
+                    crate::agent::self_audit::audit_checkpoint(
+                        &self.evorule_client,
+                        &self_audit_frames,
+                        &mut messages,
+                        &None,
+                        &session_id,
+                        step_count,
+                    )
+                    .await;
 
                     // PerReactRound 模式：IoRequest 处理前刷写上一轮缓冲的消息
                     if matches!(self.message_persist_mode, MessagePersistMode::PerReactRound) {

@@ -3309,6 +3309,127 @@ async fn test_run_recall_before_prompt() {
     command_mock.assert_async().await;
 }
 
+// ----- 自审自检器（非流式 run 路径接线）：引擎步界检查点 -----
+
+/// 构造非流式 run() 测试底座：单事件 SSE（IoRequest 无 id）+ 会话面 mocks。
+/// 返回 (server, 自审四服务端点 mock)（entropy w4/w10 共用 entropy mock）。
+async fn run_selfaudit_harness() -> (
+    mockito::ServerGuard,
+    mockito::Mock,
+    mockito::Mock,
+    mockito::Mock,
+    mockito::Mock,
+) {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("POST", "/api/sessions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"session_id": 99}"#)
+        .create_async()
+        .await;
+    let sse_body = "data: {\"type\":\"IoRequest\",\"io_type\":\"call_external\",\"params\":{}}\n\n";
+    server
+        .mock("GET", "/api/sessions/99/events")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    server
+        .mock("POST", "/api/sessions/99/command")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    // persist_message(system+user)+flush_messages 共用 payload 端点
+    server
+        .mock("POST", "/api/sessions/99/payload")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    // auto_recall（Err 即终止 run,必须放行）
+    server
+        .mock("GET", "/api/shared/facts?prefix=shared.default.")
+        .with_status(200)
+        .with_body("[]")
+        .create_async()
+        .await;
+    // 自审四服务端点（entropy w4/w10 同端点两发；scope 缺省 None=第五件跳过）
+    let entropy = server
+        .mock("POST", "/api/services/trace_behavior_entropy/invoke")
+        .expect(2)
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let density = server
+        .mock("POST", "/api/services/trace_approval_density/invoke")
+        .expect(1)
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let era_split = server
+        .mock("POST", "/api/services/trace_era_split/invoke")
+        .expect(1)
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let sentinel = server
+        .mock("POST", "/api/services/trace_era_mixing_sentinel/invoke")
+        .expect(1)
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    (server, entropy, density, era_split, sentinel)
+}
+
+#[tokio::test]
+async fn test_run_self_audit_checkpoint_fires_at_step_boundary() {
+    let (_server, entropy, density, era_split, sentinel) = run_selfaudit_harness().await;
+    let client = EvoruleApiClient::new(&_server.url());
+    let config = AgentConfig {
+        self_audit: Some(crate::agent::self_audit::SelfAuditConfig {
+            every_n_steps: Some(1),
+            scope: None,
+            inject: None,
+            stages: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    let mut runner = AgentRunner::new(config, client).with_llm_handler(LlmHandler::mock("done"));
+
+    let result = runner.run("test goal").await;
+    assert!(result.is_ok(), "run() should not return Err");
+
+    // 步界检查点真触发：四服务端点全部命中（entropy 含 w4/w10 两发）
+    entropy.assert();
+    density.assert();
+    era_split.assert();
+    sentinel.assert();
+}
+
+#[tokio::test]
+async fn test_run_self_audit_default_off_zero_invocation() {
+    let (_server, entropy, density, era_split, sentinel) = run_selfaudit_harness().await;
+    let client = EvoruleApiClient::new(&_server.url());
+    let mut runner =
+        AgentRunner::new(AgentConfig::default(), client).with_llm_handler(LlmHandler::mock("done"));
+
+    let result = runner.run("test goal").await;
+    assert!(result.is_ok(), "run() should not return Err");
+
+    // 缺省关不变式：cfg None = 零服务调用（零采集零触发）
+    assert!(!entropy.matched());
+    assert!(!density.matched());
+    assert!(!era_split.matched());
+    assert!(!sentinel.matched());
+}
+
 // ----- D-01 二次保险 + 降级兜底（收官遗留 B2：Halted get_state 兜底降级）-----
 
 #[tokio::test]
