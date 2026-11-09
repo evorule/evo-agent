@@ -118,6 +118,96 @@ fn stream_fallback_disabled_by_env(env_value: Option<String>) -> bool {
     env_value.as_deref() == Some("1")
 }
 
+/// 413 紧急裁剪（o19 治本面）：执行体体限拒绝时对请求体做有损裁剪后重试。
+/// 策略=削内容峰值、不删消息条数（审计链完整性优先）：messages 内
+/// content/text 字符串超阈值截到首 8K+尾 2K 并插裁剪标记；有界轮次循环。
+pub(crate) fn emergency_trim_body(body: &mut serde_json::Value, target_bytes: usize) -> bool {
+    let mut trimmed_any = false;
+    for round in 0..4u32 {
+        let size = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
+        if size <= target_bytes {
+            break;
+        }
+        let (threshold, head, tail) = if round == 0 {
+            (1024 * 100, 8 * 1024, 2 * 1024)
+        } else {
+            (1024 * 10, 1024, 256)
+        };
+        let mut cut = false;
+        if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            for msg in msgs.iter_mut() {
+                cut |= _trim_content_strings(msg, threshold, head, tail);
+            }
+        }
+        if !cut {
+            break;
+        }
+        trimmed_any = true;
+    }
+    trimmed_any
+}
+
+fn _trim_content_strings(
+    v: &mut serde_json::Value,
+    threshold: usize,
+    head: usize,
+    tail: usize,
+) -> bool {
+    let mut cut = false;
+    match v {
+        serde_json::Value::Object(obj) => {
+            for (k, val) in obj.iter_mut() {
+                match k.as_str() {
+                    "content" | "text" => match val {
+                        serde_json::Value::String(text) => {
+                            cut |= _cut_long_string(text, threshold, head, tail);
+                        }
+                        serde_json::Value::Array(parts) => {
+                            for part in parts.iter_mut() {
+                                if let Some(serde_json::Value::String(ts)) = part.get_mut("text") {
+                                    cut |= _cut_long_string(ts, threshold, head, tail);
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {
+                        if val.is_object() || val.is_array() {
+                            cut |= _trim_content_strings(val, threshold, head, tail);
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for x in arr.iter_mut() {
+                cut |= _trim_content_strings(x, threshold, head, tail);
+            }
+        }
+        _ => {}
+    }
+    cut
+}
+
+fn _cut_long_string(s: &mut String, threshold: usize, head: usize, tail: usize) -> bool {
+    if s.len() <= threshold {
+        return false;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= head + tail {
+        return false;
+    }
+    let h: String = chars[..head].iter().collect();
+    let t: String = chars[chars.len() - tail..].iter().collect();
+    *s = format!(
+        "{}...[TRIMMED {} chars]...{}",
+        h,
+        chars.len() - head - tail,
+        t
+    );
+    true
+}
+
 /// 传输类断链判定(断链回落整包重试的触发面)。
 ///
 /// 仅传输完整性失败可在未下行内容增量时安全回落(重放无重复):
@@ -743,6 +833,8 @@ impl LlmHandler {
             // fail-visible);内容增量已下行不回落(重放必然重复正文)。 ===
             let mut streamed_content = false;
             let mut fallback_reason: Option<String> = None;
+            // o19: 413 -> trim -> fallback to legacy with the trimmed body
+            let mut trim_fallback_body: Option<serde_json::Value> = None;
             'stream_attempt: {
                 if let Some(stream_url) = stream_url {
                     match build_request(&stream_url).send().await {
@@ -769,6 +861,26 @@ impl LlmHandler {
                                 status = %resp.status(),
                                 "执行体流式端点不可用,回落整包路径(负缓存记账,后续不再探测该端点)"
                             );
+                        }
+                        Ok(resp) if resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+                            && !streamed_content =>
+                        {
+                            let mut trimmed = body.clone();
+                            if emergency_trim_body(&mut trimmed, 0) {
+                                trim_fallback_body = Some(trimmed);
+                                fallback_reason = Some(
+                                    "413 body limit: request trimmed, falling back to legacy"
+                                        .to_string(),
+                                );
+                                break 'stream_attempt;
+                            }
+                            let text = resp.text().await.unwrap_or_default();
+                            yield Err(format!(
+                                "LLM API error ({}): {}",
+                                reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+                                text
+                            ));
+                            return;
                         }
                         Ok(resp) if !resp.status().is_success() => {
                             let status = resp.status();
@@ -884,14 +996,41 @@ impl LlmHandler {
                 );
             }
 
+            // o19: the 413-trim fallback body flows into the legacy path here
+            let build_request = |url: &str| {
+                let payload = trim_fallback_body.as_ref().unwrap_or(&body);
+                let mut req = client.post(url).json(payload);
+                if let Some(tok) = &executor_token {
+                    req = req.header("Authorization", format!("Bearer {tok}"));
+                }
+                req
+            };
+
             // === legacy 整包路径(执行体聚合结果,四/五键 JSON) ===
-            let resp = match build_request(&executor_url).send().await {
+            let mut resp = match build_request(&executor_url).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     yield Err(format!("LLM stream request failed: {}", e));
                     return;
                 }
             };
+            if resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+                let mut trimmed = body.clone();
+                if emergency_trim_body(&mut trimmed, 0) {
+                    warn!("executor 413: request body trimmed, retrying once");
+                    let mut req = client.post(&executor_url).json(&trimmed);
+                    if let Some(tok) = &executor_token {
+                        req = req.header("Authorization", format!("Bearer {tok}"));
+                    }
+                    resp = match req.send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            yield Err(format!("LLM stream request failed: {}", e));
+                            return;
+                        }
+                    };
+                }
+            }
 
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -1398,7 +1537,7 @@ impl IoHandler for LlmHandler {
             };
         }
 
-        let body = self.build_request_body(params)?;
+        let mut body = self.build_request_body(params)?;
         let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
         debug!(model = model, "ready to invoke LLM API");
 
@@ -1445,6 +1584,27 @@ impl IoHandler for LlmHandler {
                 Ok(resp) => {
                     let status = resp.status();
                     let error_text = resp.text().await.unwrap_or_default();
+                    // o19 治本面：413=体限拒绝 → 紧急裁剪请求体（削内容峰值不删
+                    // 条数）→ 单次重试；仍 413 则 fail-visible（裁剪标记随重试
+                    // 请求如实上行，审计可辨）。
+                    if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+                        && attempt == 0
+                        && emergency_trim_body(&mut body, 0)
+                    {
+                        warn!("LLM API 413: request body trimmed, retrying once");
+                        let result = self.do_http_call(&body).await;
+                        match result {
+                            Ok(resp2) if resp2.status().is_success() => {
+                                return self.parse_success_response(resp2).await;
+                            }
+                            Ok(resp2) => {
+                                let st = resp2.status();
+                                let txt = resp2.text().await.unwrap_or_default();
+                                return Err(format!("LLM API error ({}): {}", st, txt));
+                            }
+                            Err(e) => return Err(format!("LLM API request failed: {}", e)),
+                        }
+                    }
                     if attempt == self.max_retries && is_retryable_status(status) {
                         warn!(
                             attempt,
@@ -3044,5 +3204,143 @@ mod config_max_tokens_tests {
             serde_json::json!(1024),
             "请求级显式值压过配置兜底"
         );
+    }
+
+    // ========== o19 治本面：413 紧急裁剪 ==========
+
+    #[test]
+    fn test_emergency_trim_body_cuts_large_content_and_keeps_count() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "A".repeat(200_000)},
+                {"role": "assistant", "content":
+                    [{"type": "text", "text": "B".repeat(150_000)}]},
+                {"role": "user", "content": "ok"}
+            ]
+        });
+        let trimmed = emergency_trim_body(&mut body, 50_000);
+        assert!(trimmed, "超目标体积应发生裁剪");
+        let msgs = body["messages"].as_array().expect("messages 仍在");
+        assert_eq!(msgs.len(), 4, "消息条数不减（审计链完整性优先）");
+        let c0 = msgs[1]["content"].as_str().unwrap();
+        assert!(c0.contains("[TRIMMED"), "裁剪标记在场: {}", &c0[..60]);
+        assert!(c0.starts_with("AAAA"));
+        let size = serde_json::to_string(&body).unwrap().len();
+        assert!(size <= 50_000, "裁剪后体积落目标: {size}");
+    }
+
+    #[test]
+    fn test_emergency_trim_body_no_trimmable_returns_false() {
+        let mut body = serde_json::json!({
+            "messages": [{"role": "user", "content": "短内容"}]
+        });
+        assert!(!emergency_trim_body(&mut body, 10));
+        assert_eq!(body["messages"][0]["content"], "短内容");
+    }
+
+    #[tokio::test]
+    async fn test_legacy_413_trims_and_retries_once() {
+        let mut server = mockito::Server::new_async().await;
+        let big = "A".repeat(200_000);
+        // 第一发：大 body 撞 413（正则锚=大内容前缀）；第二发：裁剪后 body 含 TRIMMED 标记
+        let _m413 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex("AAAA".to_string()))
+            .with_status(413)
+            .with_body("payload too large")
+            .expect(1)
+            .create_async()
+            .await;
+        let _mok = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex("TRIMMED".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"content":"ok","tool_calls":null,"finish_reason":"stop","token_usage":null}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let handler = LlmHandler::new("m", &server.url());
+        let params = serde_json::json!({
+            "messages": [{"role": "user", "content": big}]
+        });
+        let result = handler
+            .execute(&params)
+            .await
+            .expect("413 裁剪重试后应成功");
+        assert_eq!(result["content"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_stream_413_falls_back_to_legacy_with_trimmed_body() {
+        let mut server = mockito::Server::new_async().await;
+        let big = "A".repeat(200_000);
+        // 流式端点第一发 413 → 裁剪后回落 legacy 整包（含 TRIMMED 标记）→ 200
+        let _m413 = server
+            .mock("POST", "/llm/execute-stream")
+            .match_body(mockito::Matcher::Regex("AAAA".to_string()))
+            .with_status(413)
+            .with_body("payload too large")
+            .expect(1)
+            .create_async()
+            .await;
+        let _mlegacy = server
+            .mock("POST", "/llm/execute")
+            .match_body(mockito::Matcher::Regex("TRIMMED".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"content":"ok","tool_calls":null,"finish_reason":"stop","token_usage":null}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let executor_url = format!("{}/llm/execute", server.url());
+        let handler = LlmHandler::new("m", &executor_url);
+        let params = serde_json::json!({
+            "messages": [{"role": "user", "content": big}]
+        });
+        let mut stream = handler.execute_stream(&params);
+        let mut got_done = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamChunk::Done(resp)) => {
+                    got_done = true;
+                    assert_eq!(resp.content, "ok");
+                }
+                Err(e) => panic!("413 裁剪回落后不应报错: {e}"),
+                Ok(_) => {}
+            }
+        }
+        assert!(got_done, "应有 Done 终帧");
+    }
+
+    #[test]
+    fn test_probe_wire_body_shape() {
+        let handler = LlmHandler::new("m", "http://127.0.0.1:1");
+        let params = serde_json::json!({
+            "messages": [{"role": "user", "content": "A".repeat(200_000)}]
+        });
+        let body = handler.build_request_body(&params).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        println!(
+            "WIRE msgs len={} keys={:?}",
+            msgs.len(),
+            msgs[0].as_object().map(|o| o.keys().collect::<Vec<_>>())
+        );
+        println!(
+            "WIRE content is_string={} len={}",
+            msgs[0]["content"].is_string(),
+            msgs[0]["content"].as_str().map(|s| s.len()).unwrap_or(0)
+        );
+        let mut b2 = body.clone();
+        let trimmed = emergency_trim_body(&mut b2, 0);
+        println!("trim returned {}", trimmed);
     }
 }
