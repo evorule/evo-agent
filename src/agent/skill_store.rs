@@ -141,18 +141,37 @@ const JOURNAL_GENESIS_PREV: &str = "genesis";
 #[serde(tag = "action", rename_all = "lowercase")]
 pub enum JournalAction {
     /// 引导：期刊首次物化时锚定当时全量状态（迁移记录；此后动作逐条入刊）
-    Bootstrap { entries: Vec<RegistryEntry> },
+    Bootstrap {
+        /// 引导时锚定的全量技能行集（此后快照以此行集为起点重放）
+        entries: Vec<RegistryEntry>,
+    },
     /// 批准（幂等 upsert，载荷=落账后的完整行——重放所需全部结果字段，
     /// 缺一字段即重放态≠快照=永久漂移假阳性）
-    Approve { entry: RegistryEntry },
+    Approve {
+        /// 批准落账后的完整技能行（含全部结果字段，重放直接整行替换）
+        entry: RegistryEntry,
+    },
     /// 撤销
-    Revoke { name: String, level: SkillLevel },
+    Revoke {
+        /// 被撤销的技能名
+        name: String,
+        /// 被撤销的技能级
+        level: SkillLevel,
+    },
     /// 失配降级
-    Downgrade { name: String, level: SkillLevel },
+    Downgrade {
+        /// 被降级的技能名
+        name: String,
+        /// 降级后落入的技能级
+        level: SkillLevel,
+    },
     /// 引导期锚（B-3 v2）：本引导首次写期刊时落——携带本引导公钥指纹,
     /// 锚之后的所有记录必须可验签（私钥只在本引导壳/serve 进程内存）；
     /// 重放对本变体无状态效果
-    SessionStart { pk_fp: String },
+    SessionStart {
+        /// 本引导公钥指纹（ed25519，锚后记录验签的信任根）
+        pk_fp: String,
+    },
 }
 
 /// 期刊记录：hash = prefixed(blake3(prev_hash || canonical(record)))——链式绑定；
@@ -160,11 +179,16 @@ pub enum JournalAction {
 /// hash 绑载荷与链位,签名绑 hash = 传递性覆盖全记录）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalRecord {
+    /// 单调递增记录序号（重放顺序与链位对账依据）
     pub seq: u64,
+    /// 前驱记录哈希（链头无前驱时为创世占位）
     pub prev_hash: String,
+    /// 账本动作载荷（flatten 进记录顶层）
     #[serde(flatten)]
     pub action: JournalAction,
+    /// 本记录链哈希（prefixed(blake3(prev_hash || canonical(record)))）
     pub hash: String,
+    /// 引导私钥对 hash 的 ed25519 签名（签名模式启用时落）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
 }

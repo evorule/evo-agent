@@ -903,6 +903,7 @@ pub struct SkillExportRequest {
     pub level: String,
 }
 
+/// 处理 `POST /api/skills/export`：按名+级导出已批准技能，导出前重算哈希核对账本
 pub async fn export_skill(
     State(state): State<AgentApiState>,
     Json(req): Json<SkillExportRequest>,
