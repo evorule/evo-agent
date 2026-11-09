@@ -844,6 +844,7 @@ fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
         max_steps: 5,
         step_timeout_secs: 30,
         step_timeout_floor_from_budget: None,
+        approval_wait_timeout_secs: None,
         tools,
         memory: MemoryConfig::default(), // type = "none"
         output_format: None,

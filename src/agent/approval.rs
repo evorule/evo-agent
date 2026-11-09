@@ -112,6 +112,56 @@ pub trait ApprovalCallback: Send + Sync {
 pub struct CliApproval {
     /// `--auto-approve-candidates` 时为 true,跳过交互直接批准
     pub auto_approve: bool,
+    /// 无人值守审批等待上限(秒,可选):Some(n)=等待 n 秒未决自动拒绝
+    /// (deny 默认向,绝不自动批准,决策 approver=auto+auto_rejected 标记
+    /// +reason 落账,镜像 [`HttpApproval`] 超时裁决形态);None(缺省)=交互
+    /// 现行为(stdin 无限等待,既有调用零变化)
+    pub timeout_secs: Option<u64>,
+}
+
+/// CLI 审批输入结果透传(交互现行为形态)
+fn cli_user_decision(approved: bool) -> ApprovalDecision {
+    ApprovalDecision {
+        approved,
+        approver: "cli-user".to_string(),
+        verified: false,
+        reason: String::new(),
+        auto_rejected: false,
+        verdict_json: None,
+    }
+}
+
+/// CLI 审批等待裁决:输入结果透传;声明等待上限的无人值守窗口,等待超限
+/// 未决 → 自动拒绝(deny 默认向,绝不 auto-approve)+告警决策留痕
+async fn resolve_cli_approval(
+    wait: impl std::future::Future<Output = bool>,
+    timeout: Option<Duration>,
+    tool_name: &str,
+) -> ApprovalDecision {
+    match timeout {
+        Some(d) => match tokio::time::timeout(d, wait).await {
+            Ok(approved) => cli_user_decision(approved),
+            Err(_) => {
+                warn!(
+                    tool = %tool_name,
+                    timeout_secs = d.as_secs(),
+                    "approval wait timeout: auto-denied (deny-default), unattended window"
+                );
+                ApprovalDecision {
+                    approved: false,
+                    approver: "auto".to_string(),
+                    verified: false,
+                    reason: format!(
+                        "timeout: approval wait exceeded {}s, auto-denied (deny-default direction, unattended window)",
+                        d.as_secs()
+                    ),
+                    auto_rejected: true,
+                    verdict_json: None,
+                }
+            }
+        },
+        None => cli_user_decision(wait.await),
+    }
 }
 
 #[async_trait]
@@ -134,33 +184,29 @@ impl ApprovalCallback for CliApproval {
         let risk = req.risk.clone();
         let alternative = req.alternative.clone();
         let tool_name = req.tool_name.clone();
+        let timeout_secs = self.timeout_secs;
 
-        let approved = tokio::task::spawn_blocking(move || {
-            eprintln!("\n⚠️  Tool approval required:");
-            eprintln!("  tool: {}", tool_name);
-            eprintln!("  command: {}", command);
-            eprintln!("  risk: {}", risk);
-            if !alternative.is_empty() {
-                eprintln!("  alternative: {}", alternative);
-            }
-            eprint!("Approve? [y/N] ");
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-            let mut input = String::new();
-            let _ = std::io::stdin().read_line(&mut input);
-            input.trim().eq_ignore_ascii_case("y")
-        })
-        .await
-        .unwrap_or(false);
+        let wait = async move {
+            tokio::task::spawn_blocking(move || {
+                eprintln!("\n⚠️  Tool approval required:");
+                eprintln!("  tool: {}", tool_name);
+                eprintln!("  command: {}", command);
+                eprintln!("  risk: {}", risk);
+                if !alternative.is_empty() {
+                    eprintln!("  alternative: {}", alternative);
+                }
+                eprint!("Approve? [y/N] ");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let mut input = String::new();
+                let _ = std::io::stdin().read_line(&mut input);
+                input.trim().eq_ignore_ascii_case("y")
+            })
+            .await
+            .unwrap_or(false)
+        };
 
-        ApprovalDecision {
-            approved,
-            approver: "cli-user".to_string(),
-            verified: false,
-            reason: String::new(),
-            auto_rejected: false,
-            verdict_json: None,
-        }
+        resolve_cli_approval(wait, timeout_secs.map(Duration::from_secs), &req.tool_name).await
     }
 }
 
@@ -644,7 +690,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_cli_approval_auto_approve_decision_fields() {
-        let cb = CliApproval { auto_approve: true };
+        let cb = CliApproval {
+            auto_approve: true,
+            timeout_secs: None,
+        };
         let req = ApprovalRequest {
             session_id: "s1".to_string(),
             tool_name: "shell_exec".to_string(),
@@ -660,6 +709,67 @@ mod tests {
         assert_eq!(decision.approver, "cli-user");
         assert!(!decision.verified);
         assert!(!decision.auto_rejected);
+    }
+
+    // ===== 无人值守审批等待看护(等待上限,超时自动拒绝 deny 默认向) =====
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cli_approval_wait_timeout_auto_denies() {
+        // 等待输入永不决(模拟无人值守窗口无人应答) → 超时自动拒绝
+        let decision = resolve_cli_approval(
+            std::future::pending::<bool>(),
+            Some(Duration::from_secs(1)),
+            "shell_exec",
+        )
+        .await;
+        assert!(!decision.approved, "timeout must deny (deny-default)");
+        assert_eq!(decision.approver, "auto");
+        assert!(
+            decision.auto_rejected,
+            "timeout auto-rejection must be flagged"
+        );
+        assert!(
+            decision.reason.contains("timeout"),
+            "reason must be recorded for audit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_approval_no_timeout_passthrough_preserves_behavior() {
+        // None=交互现行为:输入结果透传,决策身份与标记零变化
+        let approved = resolve_cli_approval(std::future::ready(true), None, "shell_exec").await;
+        assert!(approved.approved);
+        assert_eq!(approved.approver, "cli-user");
+        assert!(!approved.auto_rejected);
+        assert_eq!(approved.reason, "");
+
+        let denied = resolve_cli_approval(std::future::ready(false), None, "shell_exec").await;
+        assert!(!denied.approved);
+        assert_eq!(denied.approver, "cli-user");
+        // 用户显式拒绝 ≠ 超时自动裁决,auto_rejected 不打标
+        assert!(!denied.auto_rejected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cli_approval_wait_timeout_wired_via_request_approval() {
+        // 接线面守卫:声明等待上限的 CliApproval 走真实 request_approval 路径
+        // 不再无限挂起(stdin 空读或超时两条路都收敛为拒绝)
+        let cb = CliApproval {
+            auto_approve: false,
+            timeout_secs: Some(1),
+        };
+        let req = ApprovalRequest {
+            session_id: "s1".to_string(),
+            tool_name: "shell_exec".to_string(),
+            args: json!({}),
+            command: "rm -r calc-kit".to_string(),
+            risk: "high".to_string(),
+            alternative: "".to_string(),
+            proposal_id: "ap-1".to_string(),
+            host_execution: false,
+        };
+        let decision = cb.request_approval(&req).await;
+        assert!(!decision.approved);
     }
 
     // ===== PolicyApproval 测试(人工审查开合) =====
