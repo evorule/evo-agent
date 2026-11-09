@@ -38,12 +38,11 @@ pub const POLICY_REVIEW_APPROVER: &str = "policy-review";
 /// 独立性保证：杜绝自我审批偏袒）
 pub const REVIEW_SYSTEM_PROMPT: &str = r#"你是审批评审员。对照以下逐条条件判定该操作是否可放行。只依据给定操作详情与条件判定，不推测意图。
 
-判定依据分三源，优先级从高到低：
+判定依据分两源，优先级从高到低：
 1. 拒绝规则：操作详情命中拒绝规则（含红线类操作）即拒绝，任何其他来源不可覆盖；
-2. 会话内批准先例：与本次任务中人类已批准的同类先例一致的操作可参照放行（若提供）；
-3. 预置条件：对条件清单逐条判定。
+2. 预置条件：对条件清单逐条判定。
 
-每条条件输出 pass（true=符合 / false=不符合 / null=无法判定）与 evidence（判定依据摘要）；存在无法判定的条件时 verdict 置为 abstained。输出且仅输出一个 JSON 对象，格式：
+条件清单只含自然语言条件——机械可核验条件（白名单/排除/外部验证器）已由系统先行裁决并给出证据，不在你的判定范围内。每条条件输出 pass（true=符合 / false=不符合 / null=无法判定）与 evidence（判定依据摘要）；存在无法判定的条件时 verdict 置为 abstained。输出且仅输出一个 JSON 对象，格式：
 {"conditions":[{"id":1,"pass":true,"evidence":"..."}],"verdict":"approved|rejected|abstained","reason":"总体判定理由"}"#;
 
 /// 条件判定项（评审员输出契约）
@@ -175,25 +174,35 @@ impl PolicyReviewInvoker for AuditedReviewInvoker {
 /// policy 档评审式决策端
 ///
 /// 流程：红线豁免检查（命中且未显式关闭→强制人工）→ 条件清单拉取
-/// （空清单 fail-visible 降级人工）→ 修正重查上限检查 → 独立评审调用
-/// （30s 超时）→ 判定 JSON 解析+三态机械重算 → 分派。任何判定不可信
-/// 环节（超时/调用失败/解析失败/条件弃权）一律降级人工，绝不静默放行。
+/// （空清单 fail-visible 降级人工）→ 修正重查上限检查 → 三层判定管线：
+/// ①机械层（match/exclude 条目零 LLM 求值，任一不符→拒绝并回喂修正指令，
+/// 跳过后层）→ ②验证层（verify 条目 serve 侧执行，exit 0=符合 / 非 0=不符 /
+/// spawn 失败与超时=判定不可信降级人工）→ ③LLM 兜底层（仅存自然语言条件时
+/// 调用独立评审，30s 超时；全机械全过=零 LLM 快路径）。任何判定不可信环节
+/// （超时/调用失败/解析失败/条件弃权）一律降级人工，绝不静默放行。
 pub struct PolicyReview {
     policy: ApprovalPolicyFile,
     exemption_override: bool,
     invoker: Arc<dyn PolicyReviewInvoker>,
     fallback: Arc<dyn ApprovalCallback>,
     corrections: Mutex<HashMap<String, u32>>,
+    /// 会话工作区根（verify 条目的执行工作目录；None=verify 条目视为不可
+    /// 执行→降级人工，fail-closed）
+    workdir: Option<std::path::PathBuf>,
+    /// verify 条目执行通道（生产=tokio 进程 spawn；测试=打桩）
+    verify_executor: Arc<dyn VerifyExecutor>,
 }
 
 impl PolicyReview {
     /// 构造（policy=条件文件解析结果；invoker=评审通道；fallback=降级人工端；
-    /// exemption_override=用户显式关闭红线强制——留痕必带 exemption_overridden 标记）
+    /// exemption_override=用户显式关闭红线强制——留痕必带 exemption_overridden
+    /// 标记；workdir=会话工作区根，None 时 verify 条目降级人工）
     pub fn new(
         policy: ApprovalPolicyFile,
         invoker: Arc<dyn PolicyReviewInvoker>,
         fallback: Arc<dyn ApprovalCallback>,
         exemption_override: bool,
+        workdir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             policy,
@@ -201,7 +210,18 @@ impl PolicyReview {
             invoker,
             fallback,
             corrections: Mutex::new(HashMap::new()),
+            verify_executor: match &workdir {
+                Some(w) => Arc::new(ProcessVerifyExecutor::new(w)),
+                None => Arc::new(UnboundVerifyExecutor),
+            },
+            workdir,
         }
+    }
+
+    /// 注入自定义验证器执行通道（测试打桩面；生产构造用缺省即可）
+    pub fn with_verify_executor(mut self, executor: Arc<dyn VerifyExecutor>) -> Self {
+        self.verify_executor = executor;
+        self
     }
 
     /// 修正重查指纹键（同会话+同工具+同命令的重查共享计数）
@@ -211,6 +231,68 @@ impl PolicyReview {
 
     fn corrections_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, u32>> {
         self.corrections.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 豁免覆盖标记（红线命中且 override=true 时 reason 尾缀）
+    fn override_marker(&self, req: &ApprovalRequest) -> String {
+        let red_line = hits_red_line_for_request(req);
+        if red_line.is_some() {
+            format!(
+                " [exemption_overridden:{}]",
+                red_line.map(|r| r.as_str()).unwrap_or("")
+            )
+        } else {
+            String::new()
+        }
+    }
+
+    /// 机械/验证层拒绝分派（修正指令携未符合条目 evidence；修正计数+1；
+    /// 判定全文 seal 留痕——验证器结论可跨重启回放核验）
+    async fn reject_mechanical(
+        &self,
+        req: &ApprovalRequest,
+        mech: &[MechEntry],
+        key: &str,
+    ) -> ApprovalDecision {
+        let marker = self.override_marker(req);
+        info!(
+            tool = %req.tool_name,
+            proposal_id = %req.proposal_id,
+            verdict = "rejected",
+            override_flag = self.exemption_override,
+            request = %serde_json::to_string(&req.args).unwrap_or_default(),
+            judgement = "(mechanical evaluation, no LLM call)",
+            "policy review judged"
+        );
+        crate::governance::hooks::policy_verdict(
+            req,
+            "rejected",
+            &mech_summary(mech),
+            self.exemption_override,
+        );
+        let verdict_seal = serde_json::json!({
+            "proposal_id": req.proposal_id,
+            "tool": req.tool_name,
+            "verdict": "rejected",
+            "exemption_override": self.exemption_override,
+            "request": serde_json::to_string(&req.args).unwrap_or_default(),
+            "judgement": { "mechanical": true },
+            "mechanical": mech.iter().map(|e| e.to_json()).collect::<Vec<_>>(),
+        })
+        .to_string();
+        *self.corrections_lock().entry(key.to_string()).or_insert(0) += 1;
+        ApprovalDecision {
+            approved: false,
+            approver: POLICY_REVIEW_APPROVER.to_string(),
+            verified: false,
+            reason: format!(
+                "policy-review: 条件未全部符合，请修正操作后重试。未符合条目：{}{}",
+                mech_failures(mech),
+                marker
+            ),
+            auto_rejected: false,
+            verdict_json: Some(verdict_seal),
+        }
     }
 }
 
@@ -254,60 +336,186 @@ impl ApprovalCallback for PolicyReview {
             return self.fallback.request_approval(req).await;
         }
 
-        // 4. 独立评审调用（30s 超时；失败/超时=判定不可信→降级人工）
-        let payload = build_review_payload(req, conditions);
-        let raw = match tokio::time::timeout(
-            Duration::from_secs(POLICY_REVIEW_TIMEOUT_SECS),
-            self.invoker.review(&payload),
-        )
-        .await
-        {
-            Ok(Ok(raw)) => raw,
-            Ok(Err(e)) => {
-                warn!(tool = %req.tool_name, error = %e, "policy review invocation failed, fallback to manual");
-                return self.fallback.request_approval(req).await;
+        // 4. 机械层（零 LLM）：match/exclude 条目逐条求值；NL/verify 条目归后层
+        let mut mech: Vec<MechEntry> = Vec::new();
+        let mut failed: Vec<MechEntry> = Vec::new();
+        let mut nl: Vec<(u32, String)> = Vec::new();
+        let mut verify_conds: Vec<(u32, &VerifySpec)> = Vec::new();
+        for (i, cond) in conditions.iter().enumerate() {
+            let id = (i + 1) as u32;
+            match cond {
+                PolicyCondition::Natural(s) => nl.push((id, s.clone())),
+                PolicyCondition::Match { patterns, .. } => {
+                    let (pass, evidence) = eval_match(patterns, &req.args);
+                    let e = MechEntry {
+                        id,
+                        kind: "match",
+                        pass,
+                        evidence,
+                    };
+                    if !e.pass {
+                        failed.push(e.clone());
+                    }
+                    mech.push(e);
+                }
+                PolicyCondition::Exclude { terms, .. } => {
+                    let (pass, evidence) = eval_exclude(terms, &req.args);
+                    let e = MechEntry {
+                        id,
+                        kind: "exclude",
+                        pass,
+                        evidence,
+                    };
+                    if !e.pass {
+                        failed.push(e.clone());
+                    }
+                    mech.push(e);
+                }
+                PolicyCondition::Verify { spec, .. } => verify_conds.push((id, spec)),
             }
-            Err(_) => {
+        }
+        if !failed.is_empty() {
+            // 任一机械不符 → Rejected（修正指令携该条 evidence，计数+1，
+            // 跳过验证层与 LLM 兜底层）
+            return self.reject_mechanical(req, &mech, &key).await;
+        }
+
+        // 5. 验证层：逐条执行 verify 命令（不经 shell，workdir=会话工作区根；
+        //    exit 0=符合 / exit≠0=不符 / spawn 失败与超时=判定不可信降级人工）
+        for (id, spec) in verify_conds {
+            if self.workdir.is_none() {
                 warn!(
                     tool = %req.tool_name,
-                    timeout_secs = POLICY_REVIEW_TIMEOUT_SECS,
-                    "policy review timed out, fallback to manual"
+                    "policy review: verify condition present but no workdir bound, fallback to manual"
                 );
                 return self.fallback.request_approval(req).await;
             }
-        };
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(spec.timeout_secs),
+                self.verify_executor.run(&spec.argv),
+            )
+            .await;
+            let entry = match outcome {
+                Err(_) => {
+                    warn!(
+                        tool = %req.tool_name,
+                        timeout_secs = spec.timeout_secs,
+                        "policy review verify command timed out, fallback to manual"
+                    );
+                    return self.fallback.request_approval(req).await;
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        tool = %req.tool_name,
+                        error = %e,
+                        "policy review verify command failed to run, fallback to manual"
+                    );
+                    return self.fallback.request_approval(req).await;
+                }
+                Ok(Ok(out)) => {
+                    let pass = out.exit_code == 0;
+                    let evidence = if pass {
+                        "verifier exit 0".to_string()
+                    } else {
+                        format!(
+                            "verifier exit {}；输出尾段: {}",
+                            out.exit_code, out.output_tail
+                        )
+                    };
+                    MechEntry {
+                        id,
+                        kind: "verify",
+                        pass,
+                        evidence,
+                    }
+                }
+            };
+            if !entry.pass {
+                // 验证器只能收紧判定（不符→Rejected），永远不能放宽——
+                // 外部锚点是「修正到符合」的 serve 侧实证，不是旁路
+                failed.push(entry.clone());
+                mech.push(entry);
+                return self.reject_mechanical(req, &mech, &key).await;
+            }
+            mech.push(entry);
+        }
 
-        // 5. 判定解析+三态机械重算（解析失败=判定不可信→降级人工）
-        let judgement = match parse_judgement(&raw) {
-            Ok(j) => j,
-            Err(e) => {
-                warn!(tool = %req.tool_name, error = %e, "policy review judgement unparseable, fallback to manual");
-                return self.fallback.request_approval(req).await;
+        // 6. LLM 兜底层：仅存自然语言条件时调用（payload 只含 NL 条件+已通过
+        //    机械条目证据摘要）；全机械全过=零 LLM 快路径，评审 invoker 零调用
+        let fast_path = nl.is_empty();
+        let payload = if fast_path {
+            String::new()
+        } else {
+            build_review_payload(req, &nl, &mech)
+        };
+        let raw = if fast_path {
+            String::new()
+        } else {
+            // 独立评审调用（30s 超时；失败/超时=判定不可信→降级人工）
+            match tokio::time::timeout(
+                Duration::from_secs(POLICY_REVIEW_TIMEOUT_SECS),
+                self.invoker.review(&payload),
+            )
+            .await
+            {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(e)) => {
+                    warn!(tool = %req.tool_name, error = %e, "policy review invocation failed, fallback to manual");
+                    return self.fallback.request_approval(req).await;
+                }
+                Err(_) => {
+                    warn!(
+                        tool = %req.tool_name,
+                        timeout_secs = POLICY_REVIEW_TIMEOUT_SECS,
+                        "policy review timed out, fallback to manual"
+                    );
+                    return self.fallback.request_approval(req).await;
+                }
             }
         };
-        let verdict = judgement.recomputed_verdict();
+        // 判定解析+三态机械重算（解析失败=判定不可信→降级人工）；
+        // 机械重算逻辑对 NL 子集不变（评审自报 verdict 不作数）
+        let judgement = if fast_path {
+            None
+        } else {
+            match parse_judgement(&raw) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    warn!(tool = %req.tool_name, error = %e, "policy review judgement unparseable, fallback to manual");
+                    return self.fallback.request_approval(req).await;
+                }
+            }
+        };
+        let verdict = judgement
+            .as_ref()
+            .map(|j| j.recomputed_verdict())
+            .unwrap_or(ReviewVerdict::Approved);
 
-        // 6. 留痕：判定请求与全文进 serve 侧结构化日志（封存面）；决策摘要随
+        // 7. 留痕：判定请求与全文进 serve 侧结构化日志（封存面）；决策摘要随
         //    ApprovalDecision.reason 进 tool_trace approval 子对象入审计链
+        let args_summary = serde_json::to_string(&req.args).unwrap_or_default();
         info!(
             tool = %req.tool_name,
             proposal_id = %req.proposal_id,
             verdict = verdict.as_str(),
             override_flag = self.exemption_override,
-            request = %payload,
-            judgement = %raw,
+            request = %if fast_path { &args_summary } else { &payload },
+            judgement = %if fast_path { "(mechanical evaluation, no LLM call)" } else { &raw },
             "policy review judged"
         );
         // B22:policy_verdict 治理事件（三态判定+判定依据摘要——serve 侧封存
         // 锚点的持久化镜像，best-effort 不阻断分派）
-        let conditions_summary = if matches!(verdict, ReviewVerdict::Approved) {
-            summary_of(&judgement)
-        } else {
-            format!(
-                "{}；总体理由：{}",
-                failures_of(&judgement),
-                judgement.reason
-            )
+        let conditions_summary = match &judgement {
+            None => mech_summary(&mech),
+            Some(j) if matches!(verdict, ReviewVerdict::Approved) => {
+                format!("{}；{}", mech_summary(&mech), summary_of(j))
+            }
+            Some(j) => format!(
+                "{}；{}；总体理由：{}",
+                mech_summary(&mech),
+                failures_of(j),
+                j.reason
+            ),
         };
         crate::governance::hooks::policy_verdict(
             req,
@@ -317,19 +525,25 @@ impl ApprovalCallback for PolicyReview {
         );
 
         // 判定全文封存 JSON（随 ApprovalDecision 下行，runner 落账 journal——
-        // 进程日志与 gov 摘要镜像之外的跨重启回放权威面）
+        // 进程日志与 gov 摘要镜像之外的跨重启回放权威面；mechanical 数组
+        // 记录机械/验证层逐条结论，「是验证器说的，不是评审说的」可核验）
+        let seal_judgement = match &judgement {
+            Some(_) => serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.clone())),
+            None => serde_json::json!({ "mechanical": true }),
+        };
         let verdict_seal = serde_json::json!({
             "proposal_id": req.proposal_id,
             "tool": req.tool_name,
             "verdict": verdict.as_str(),
             "exemption_override": self.exemption_override,
-            "request": payload,
-            "judgement": serde_json::from_str::<serde_json::Value>(&raw)
-                .unwrap_or_else(|_| serde_json::Value::String(raw.clone())),
+            "request": if fast_path { args_summary } else { payload.clone() },
+            "judgement": seal_judgement,
+            "mechanical": mech.iter().map(|e| e.to_json()).collect::<Vec<_>>(),
         })
         .to_string();
 
-        // 7. 分派
+        // 8. 分派
         let marker = if red_line.is_some() {
             format!(
                 " [exemption_overridden:{}]",
@@ -341,29 +555,37 @@ impl ApprovalCallback for PolicyReview {
         match verdict {
             ReviewVerdict::Approved => {
                 self.corrections_lock().remove(&key);
+                let approver_prefix = if fast_path {
+                    "policy-review[mechanical]"
+                } else {
+                    "policy-review"
+                };
+                let detail = match &judgement {
+                    Some(j) => summary_of(j),
+                    None => mech_summary(&mech),
+                };
                 ApprovalDecision {
                     approved: true,
                     approver: POLICY_REVIEW_APPROVER.to_string(),
                     verified: false,
-                    reason: format!(
-                        "policy-review: {} 条件全部符合{}",
-                        summary_of(&judgement),
-                        marker
-                    ),
+                    reason: format!("{approver_prefix}: {detail} 条件全部符合{}", marker),
                     auto_rejected: false,
                     verdict_json: Some(verdict_seal.clone()),
                 }
             }
             ReviewVerdict::Rejected => {
                 *self.corrections_lock().entry(key).or_insert(0) += 1;
+                let j = judgement
+                    .as_ref()
+                    .expect("rejected verdict must carry judgement");
                 ApprovalDecision {
                     approved: false,
                     approver: POLICY_REVIEW_APPROVER.to_string(),
                     verified: false,
                     reason: format!(
                         "policy-review: 条件未全部符合，请修正操作后重试。未符合条目：{}；总体理由：{}{}",
-                        failures_of(&judgement),
-                        judgement.reason,
+                        failures_of(j),
+                        j.reason,
                         marker
                     ),
                     auto_rejected: false,
@@ -397,8 +619,14 @@ fn parse_judgement(raw: &str) -> Result<PolicyJudgement, String> {
     serde_json::from_str(&candidate).map_err(|e| format!("judgement parse: {e}"))
 }
 
-/// 组装评审请求（操作详情+条件清单——不含 agent 对话上下文与执行意图）
-fn build_review_payload(req: &ApprovalRequest, conditions: &[String]) -> String {
+/// 组装评审请求（操作详情+自然语言条件清单+已通过机械条目证据摘要——
+/// 不含 agent 对话上下文与执行意图；机械/验证条目已由系统先行裁决，
+/// 不进条件清单，评审员只判 NL 子集）
+fn build_review_payload(
+    req: &ApprovalRequest,
+    nl_conditions: &[(u32, String)],
+    passed_mech: &[MechEntry],
+) -> String {
     let args_summary = serde_json::to_string(&req.args).unwrap_or_default();
     let mut payload = String::with_capacity(1024);
     payload.push_str("【操作详情】\n");
@@ -407,8 +635,14 @@ fn build_review_payload(req: &ApprovalRequest, conditions: &[String]) -> String 
     payload.push_str(&format!("风险说明：{}\n", req.risk));
     payload.push_str(&format!("参数：{}\n", args_summary));
     payload.push_str("\n【条件清单】\n");
-    for (i, c) in conditions.iter().enumerate() {
-        payload.push_str(&format!("{}. {}\n", i + 1, c));
+    for (id, text) in nl_conditions {
+        payload.push_str(&format!("#{id}. {text}\n"));
+    }
+    if !passed_mech.is_empty() {
+        payload.push_str("\n【已由系统机械核验通过的条目】（无需你判定）\n");
+        for e in passed_mech {
+            payload.push_str(&format!("#{}[{}] {}\n", e.id, e.kind, e.evidence));
+        }
     }
     payload
 }
@@ -442,16 +676,417 @@ fn failures_of(j: &PolicyJudgement) -> String {
         .join("；")
 }
 
+// ===== 条件类型扩展（字符串|表联合形态：机械层/验证层/LLM 兜底层三属） =====
+
+/// 外部验证器超时缺省值（秒，对表 verify.rs 同族缺省）
+pub const VERIFY_DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// 外部验证器超时上限（秒，超限装载期拒绝）
+pub const VERIFY_MAX_TIMEOUT_SECS: u64 = 600;
+/// 验证器输出尾段证据帽（字符；修正指令只携带尾段，防巨型构建日志刷屏）
+const VERIFY_EVIDENCE_TAIL_CHARS: usize = 1000;
+
+/// 条件条目（字符串 | 表联合形态，向后兼容）
+///
+/// - 字符串形态：自然语言条件 → LLM 评审兜底层（行为与条件类型扩展前逐位一致）
+/// - 表形态：可机械核验的结构化条件，三选一：
+///   `match`（白名单 glob，零 LLM 快路径）/ `exclude`（词法排除）/
+///   `verify`（serve 侧执行外部验证器，exit 0=符合）
+///
+/// 全 fail-closed：装载期校验（未知键/混用/元字符/超上限一律拒载），
+/// 判定期任何不可信环节降级人工，绝不静默放行。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolicyCondition {
+    /// 自然语言条件（LLM 评审兜底层）
+    Natural(String),
+    /// 白名单模式（机械层：操作详情叶子串须命中至少一个 glob，零命中=不符）
+    Match {
+        /// 人类可读描述
+        text: String,
+        /// 白名单 glob 模式（归一化小写 + `*` 通配）
+        patterns: Vec<String>,
+    },
+    /// 词法排除（机械层：任一叶子串含排除词=不符，零命中=符合）
+    Exclude {
+        /// 人类可读描述
+        text: String,
+        /// 排除词（子串包含判定，大小写归一）
+        terms: Vec<String>,
+    },
+    /// 外部可执行验证锚点（验证层：serve 侧执行验证命令，不经 shell）
+    Verify {
+        /// 人类可读描述
+        text: String,
+        /// 验证命令规格（argv+超时）
+        spec: VerifySpec,
+    },
+}
+
+impl PolicyCondition {
+    /// 条件类别标识（留痕/试判定用）
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Natural(_) => "natural",
+            Self::Match { .. } => "match",
+            Self::Exclude { .. } => "exclude",
+            Self::Verify { .. } => "verify",
+        }
+    }
+
+    /// 人类可读描述（评审 payload 与留痕用）
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Natural(s) => s,
+            Self::Match { text, .. } | Self::Exclude { text, .. } | Self::Verify { text, .. } => {
+                text
+            }
+        }
+    }
+
+    /// 机械实判（match/exclude 条目专用；其余形态返回 None——
+    /// verify 条目由验证层执行、NL 条目交 LLM 兜底）
+    pub fn evaluate_mechanical(&self, args: &serde_json::Value) -> Option<(bool, String)> {
+        match self {
+            Self::Match { patterns, .. } => Some(eval_match(patterns, args)),
+            Self::Exclude { terms, .. } => Some(eval_exclude(terms, args)),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyCondition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = toml::Value::deserialize(deserializer)?;
+        PolicyCondition::from_raw(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl PolicyCondition {
+    /// 装载期形态裁决（fail-fast：未知键/空声明/混用一律拒绝，不猜）
+    fn from_raw(raw: toml::Value) -> Result<Self, String> {
+        match raw {
+            toml::Value::String(s) => Ok(PolicyCondition::Natural(s)),
+            toml::Value::Table(t) => {
+                for k in t.keys() {
+                    if !matches!(k.as_str(), "text" | "match" | "exclude" | "verify") {
+                        return Err(format!(
+                            "unknown condition field '{k}' (accepted: text / match / exclude / verify)"
+                        ));
+                    }
+                }
+                let sc: StructuredCondition =
+                    StructuredCondition::deserialize(toml::Value::Table(t))
+                        .map_err(|e| format!("condition: {e}"))?;
+                if sc.verify.is_some() && (!sc.match_patterns.is_empty() || !sc.exclude.is_empty())
+                {
+                    return Err(
+                        "verify cannot be combined with match/exclude in the same condition"
+                            .to_string(),
+                    );
+                }
+                if let Some(spec) = sc.verify {
+                    return Ok(PolicyCondition::Verify {
+                        text: sc.text,
+                        spec,
+                    });
+                }
+                if !sc.match_patterns.is_empty() {
+                    return Ok(PolicyCondition::Match {
+                        text: sc.text,
+                        patterns: sc.match_patterns,
+                    });
+                }
+                if !sc.exclude.is_empty() {
+                    return Ok(PolicyCondition::Exclude {
+                        text: sc.text,
+                        terms: sc.exclude,
+                    });
+                }
+                Err("condition table must declare one of match / exclude / verify".to_string())
+            }
+            _ => Err("condition must be a string or a table".to_string()),
+        }
+    }
+}
+
+/// 结构化条件中间形态（装载期解析目标，裁决后归入 [`PolicyCondition`] 变体）
+#[derive(Debug, Clone, Deserialize)]
+struct StructuredCondition {
+    /// 人类可读描述（必填）
+    text: String,
+    /// 白名单 glob 模式（TOML 键 `match` 为 Rust 关键字，rename）
+    #[serde(default, rename = "match")]
+    match_patterns: Vec<String>,
+    /// 词法排除词
+    #[serde(default)]
+    exclude: Vec<String>,
+    /// 外部验证器
+    #[serde(default)]
+    verify: Option<VerifySpec>,
+}
+
+/// 外部验证器规格（serve 侧执行；不经 shell——字符串形态装载期切分为 argv
+/// 并做元字符校验，杜绝注入）
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifySpec {
+    /// 验证命令 argv（精确形态）
+    pub argv: Vec<String>,
+    /// 超时秒数（缺省 [`VERIFY_DEFAULT_TIMEOUT_SECS`]，上限 [`VERIFY_MAX_TIMEOUT_SECS`]）
+    pub timeout_secs: u64,
+}
+
+impl<'de> Deserialize<'de> for VerifySpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            cmd: RawCmd,
+            #[serde(default = "default_verify_timeout")]
+            timeout_secs: u64,
+        }
+        fn default_verify_timeout() -> u64 {
+            VERIFY_DEFAULT_TIMEOUT_SECS
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.timeout_secs > VERIFY_MAX_TIMEOUT_SECS {
+            return Err(serde::de::Error::custom(format!(
+                "verify.timeout_secs {} exceeds cap {VERIFY_MAX_TIMEOUT_SECS}",
+                raw.timeout_secs
+            )));
+        }
+        let argv = raw.cmd.into_argv().map_err(serde::de::Error::custom)?;
+        Ok(VerifySpec {
+            argv,
+            timeout_secs: raw.timeout_secs,
+        })
+    }
+}
+
+/// verify.cmd 原始形态（数组=精确 argv；字符串=按空白切分）
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawCmd {
+    Argv(Vec<String>),
+    Line(String),
+}
+
+impl RawCmd {
+    fn into_argv(self) -> Result<Vec<String>, String> {
+        match self {
+            Self::Argv(items) => {
+                if items.is_empty() {
+                    return Err("verify.cmd array must not be empty".to_string());
+                }
+                if items.iter().any(|s| s.trim().is_empty()) {
+                    return Err("verify.cmd contains an empty argument".to_string());
+                }
+                Ok(items)
+            }
+            Self::Line(s) => {
+                let tokens: Vec<String> = s.split_whitespace().map(|t| t.to_string()).collect();
+                if tokens.is_empty() {
+                    return Err("verify.cmd is empty".to_string());
+                }
+                // 不经 shell 执行：串形态含 shell 元字符=拒载（fail-fast 杜绝注入）
+                if tokens.iter().any(|t| t.contains(['|', ';', '&', '>', '<'])) {
+                    return Err(
+                        "verify.cmd contains shell metacharacters ('|' ';' '&' '>' '<'); \
+                         commands run without a shell — pass an argv array instead"
+                            .to_string(),
+                    );
+                }
+                Ok(tokens)
+            }
+        }
+    }
+}
+
+/// 验证器单条执行产出（Ok=进程完成，exit code 可判；Err=spawn/等待失败）
+#[derive(Debug, Clone)]
+pub struct VerifyOutput {
+    /// 进程退出码（Ok 路径恒有值）
+    pub exit_code: i32,
+    /// 输出尾段（stdout+stderr 合并，截取尾部作证据）
+    pub output_tail: String,
+}
+
+/// 验证器执行通道抽象（生产=tokio 进程 spawn；测试=打桩）
+// async_trait 展开体的 must_use 语义重叠压制（同 PolicyReviewInvoker 先例）
+#[allow(clippy::double_must_use)]
+#[async_trait]
+pub trait VerifyExecutor: Send + Sync {
+    /// 执行一条验证命令（argv 已装载期校验；工作目录由实现自带）
+    async fn run(&self, argv: &[String]) -> Result<VerifyOutput, String>;
+}
+
+/// 生产 [`VerifyExecutor`]：不经 shell 直接 spawn argv
+/// （工作目录=会话工作区根；超时由决策端包裹——超时 drop 本 future，
+/// kill_on_drop 负责终止进程）
+pub struct ProcessVerifyExecutor {
+    workdir: std::path::PathBuf,
+}
+
+impl ProcessVerifyExecutor {
+    /// 构造（workdir = 验证命令的执行工作目录）
+    pub fn new(workdir: &Path) -> Self {
+        Self {
+            workdir: workdir.to_path_buf(),
+        }
+    }
+}
+
+#[async_trait]
+impl VerifyExecutor for ProcessVerifyExecutor {
+    async fn run(&self, argv: &[String]) -> Result<VerifyOutput, String> {
+        let Some(program) = argv.first() else {
+            return Err("verify argv is empty".to_string());
+        };
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(&argv[1..])
+            .current_dir(&self.workdir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("verify command spawn failed: {e}"))?;
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| format!("verify command wait failed: {e}"))?;
+        let exit_code = out
+            .status
+            .code()
+            .ok_or_else(|| "verify command terminated by signal".to_string())?;
+        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+        let tail: String = combined
+            .chars()
+            .rev()
+            .take(VERIFY_EVIDENCE_TAIL_CHARS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        Ok(VerifyOutput {
+            exit_code,
+            output_tail: tail.trim().to_string(),
+        })
+    }
+}
+
+/// 未绑定工作区的缺省执行通道——恒 Err（fail-closed 兜底；正常路径
+/// workdir=None 时验证层在此之前已降级人工，本臂不可达）
+struct UnboundVerifyExecutor;
+
+#[async_trait]
+impl VerifyExecutor for UnboundVerifyExecutor {
+    async fn run(&self, _argv: &[String]) -> Result<VerifyOutput, String> {
+        Err("verify executor has no workdir bound".to_string())
+    }
+}
+
+/// 白名单模式机械求值：操作详情叶子串（复用红线同款递归原语）须命中
+/// 至少一个 glob（归一化小写 + `*` 通配，词元边界同 approval_tier 族）；
+/// 零命中=不符（fail-closed）
+fn eval_match(patterns: &[String], args: &serde_json::Value) -> (bool, String) {
+    let mut leaves = Vec::new();
+    collect_strings(args, &mut leaves);
+    for p in patterns {
+        for leaf in &leaves {
+            if crate::agent::approval_tier::pattern_matches(p, leaf) {
+                return (true, format!("命中白名单模式 \"{p}\"（操作串 \"{leaf}\"）"));
+            }
+        }
+    }
+    (
+        false,
+        format!(
+            "操作详情叶子串均未命中白名单模式（patterns: {}）",
+            patterns.join(", ")
+        ),
+    )
+}
+
+/// 词法排除机械求值：任一叶子串含排除词=不符；零命中=符合
+fn eval_exclude(terms: &[String], args: &serde_json::Value) -> (bool, String) {
+    let mut leaves = Vec::new();
+    collect_strings(args, &mut leaves);
+    for leaf in &leaves {
+        let norm = crate::agent::approval_tier::normalize(leaf);
+        for t in terms {
+            if norm.contains(&crate::agent::approval_tier::normalize(t)) {
+                return (false, format!("命中排除词 \"{t}\"（操作串 \"{leaf}\"）"));
+            }
+        }
+    }
+    (true, "无排除词命中".to_string())
+}
+
+/// 机械/验证层单条求值结果（留痕 seal 的 mechanical 数组要素）
+#[derive(Debug, Clone)]
+struct MechEntry {
+    id: u32,
+    kind: &'static str,
+    pass: bool,
+    evidence: String,
+}
+
+impl MechEntry {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "kind": self.kind,
+            "pass": self.pass,
+            "evidence": self.evidence,
+        })
+    }
+}
+
+/// 机械求值清单摘要（reason/治理事件摘要用）
+fn mech_summary(entries: &[MechEntry]) -> String {
+    entries
+        .iter()
+        .map(|e| {
+            format!(
+                "#{}[{}]={}",
+                e.id,
+                e.kind,
+                if e.pass { "符合" } else { "不符合" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// 未符合机械条目清单（拒绝 reason 用=修正指令主体）
+fn mech_failures(entries: &[MechEntry]) -> String {
+    entries
+        .iter()
+        .filter(|e| !e.pass)
+        .map(|e| format!("#{}[{}]（{}）", e.id, e.kind, e.evidence))
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
 /// 单工具组的审批条件清单（人类预置）
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ToolGroupPolicy {
-    /// 条件字符串清单（v1 语法：可机械核验的表达式；自然语言条件判定稳定性弱，不放开）
+    /// 条件条目清单（字符串=自然语言→LLM 兜底；表=match/exclude（机械层）
+    /// 或 verify（外部验证器）——装载期 fail-fast 校验）
     #[serde(default)]
-    pub conditions: Vec<String>,
+    pub conditions: Vec<PolicyCondition>,
 }
 
 /// 通用限制（`[policy_limits]`，所有 policy 工具共享）
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyLimits {
     /// 修正重查上限（同一操作 fail 后重查次数，超限降级 manual——防无限循环）
     #[serde(default = "default_max_corrections")]
@@ -504,6 +1139,10 @@ impl ApprovalPolicyFile {
     }
 
     /// 从 TOML 文本解析（校验入口，测试与试判定共用）
+    ///
+    /// 装载期 fail-fast：形态裁决（未知键/空声明/verify 混用）与
+    /// verify 规格（元字符/超上限）在反序列化内联校验——此处集中承接，
+    /// 任何拒绝均显式 Schema 错（不猜、不静默丢弃）
     pub fn from_toml(raw: &str) -> Result<Self, PolicyFileError> {
         let parsed: Self =
             toml::from_str(raw).map_err(|e| PolicyFileError::Schema(e.to_string()))?;
@@ -511,7 +1150,7 @@ impl ApprovalPolicyFile {
     }
 
     /// 取指定工具组的条件清单（无该组返回空切片）
-    pub fn conditions_for(&self, tool: &str) -> &[String] {
+    pub fn conditions_for(&self, tool: &str) -> &[PolicyCondition] {
         self.groups
             .get(tool)
             .map(|g| g.conditions.as_slice())
@@ -716,7 +1355,7 @@ max_actions_per_run = 200
         assert_eq!(f.groups.len(), 2);
         assert_eq!(f.conditions_for("shell_exec").len(), 2);
         assert_eq!(f.conditions_for("file_read").len(), 1);
-        assert_eq!(f.conditions_for("absent"), &[] as &[String]);
+        assert_eq!(f.conditions_for("absent"), &[] as &[PolicyCondition]);
         assert_eq!(f.policy_limits.max_corrections, 3);
         assert_eq!(f.policy_limits.max_actions_per_run, 200);
     }
@@ -909,6 +1548,7 @@ max_actions_per_run = 200
     struct MockInvoker {
         responses: Mutex<Vec<Result<String, String>>>,
         calls: std::sync::atomic::AtomicUsize,
+        payloads: Mutex<Vec<String>>,
     }
 
     impl MockInvoker {
@@ -916,7 +1556,17 @@ max_actions_per_run = 200
             Arc::new(Self {
                 responses: Mutex::new(responses),
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                payloads: Mutex::new(Vec::new()),
             })
+        }
+        fn count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn recorded_payloads(&self) -> Vec<String> {
+            self.payloads
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
         }
     }
 
@@ -925,6 +1575,10 @@ max_actions_per_run = 200
         async fn review(&self, payload: &str) -> Result<String, String> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert!(!payload.contains("对话历史"), "评审请求不得携带对话上下文");
+            self.payloads
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(payload.to_string());
             self.responses
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1015,6 +1669,7 @@ max_actions_per_run = 200
             invoker,
             fallback.clone() as Arc<dyn ApprovalCallback>,
             false,
+            None,
         );
         review.request_approval(req).await
     }
@@ -1153,6 +1808,7 @@ max_actions_per_run = 200
             MockInvoker::new(vec![]),
             FallbackSpy::new() as Arc<dyn ApprovalCallback>,
             false,
+            None,
         );
         let d = review
             .request_approval(&review_req(
@@ -1175,6 +1831,7 @@ max_actions_per_run = 200
             ]),
             FallbackSpy::new() as Arc<dyn ApprovalCallback>,
             false,
+            None,
         );
         let req = review_req(
             "shell_exec",
@@ -1215,6 +1872,7 @@ max_actions_per_run = 200
             invoker,
             FallbackSpy::new() as Arc<dyn ApprovalCallback>,
             true,
+            None,
         );
         let d = review
             .request_approval(&review_req(
@@ -1244,9 +1902,532 @@ max_actions_per_run = 200
             "cargo build",
             serde_json::json!({"command": "cargo build"}),
         );
-        let payload = build_review_payload(&req, &["仅白名单 cargo 命令".to_string()]);
+        let payload = build_review_payload(
+            &req,
+            &[(1, "仅白名单 cargo 命令".to_string())],
+            &[MechEntry {
+                id: 2,
+                kind: "match",
+                pass: true,
+                evidence: "命中白名单模式 \"cargo*\"".to_string(),
+            }],
+        );
         assert!(payload.contains("cargo build"));
         assert!(payload.contains("仅白名单 cargo 命令"));
+        assert!(payload.contains("#2[match]"), "已通过机械条目证据随附");
         assert!(!payload.contains("message"));
+    }
+
+    // ===== 条件类型扩展（机械层/验证层/零 LLM 快路径） =====
+
+    use std::sync::atomic::AtomicUsize;
+
+    fn policy_from(toml_src: &str) -> ApprovalPolicyFile {
+        ApprovalPolicyFile::from_toml(toml_src).unwrap()
+    }
+
+    /// verify 打桩执行器：按序返回预设产出（Err=spawn/等待失败），记录调用数
+    struct StubExecutor {
+        outputs: Mutex<Vec<Result<VerifyOutput, String>>>,
+        calls: AtomicUsize,
+    }
+
+    impl StubExecutor {
+        fn new(outputs: Vec<Result<VerifyOutput, String>>) -> Arc<Self> {
+            Arc::new(Self {
+                outputs: Mutex::new(outputs),
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl VerifyExecutor for StubExecutor {
+        async fn run(&self, _argv: &[String]) -> Result<VerifyOutput, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.outputs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop()
+                .unwrap_or_else(|| Err("stub executor exhausted".to_string()))
+        }
+    }
+
+    /// 永挂起执行器（超时路径打桩——start_paused 虚拟时钟下超时闸先行收敛）
+    struct PendingExecutor;
+
+    #[async_trait]
+    impl VerifyExecutor for PendingExecutor {
+        async fn run(&self, _argv: &[String]) -> Result<VerifyOutput, String> {
+            std::future::pending().await
+        }
+    }
+
+    fn verify_only_policy() -> ApprovalPolicyFile {
+        policy_from(
+            "[shell_exec]\nconditions = [{ text = \"工作区构建通过\", verify = { cmd = [\"cargo\", \"check\"], timeout_secs = 1 } }]",
+        )
+    }
+
+    fn build_review(
+        policy: ApprovalPolicyFile,
+        invoker: Arc<dyn PolicyReviewInvoker>,
+        fallback: Arc<FallbackSpy>,
+        executor: Arc<dyn VerifyExecutor>,
+    ) -> PolicyReview {
+        PolicyReview::new(
+            policy,
+            invoker,
+            fallback as Arc<dyn ApprovalCallback>,
+            false,
+            Some(std::path::PathBuf::from(".")),
+        )
+        .with_verify_executor(executor)
+    }
+
+    #[test]
+    fn schema_accepts_structured_conditions_and_defaults() {
+        let f = policy_from(
+            r#"[shell_exec]
+conditions = [
+  "仅工作区内路径",
+  { text = "白名单", match = ["cargo*"] },
+  { text = "禁外发", exclude = ["curl"] },
+  { text = "构建过", verify = { cmd = "cargo check", timeout_secs = 180 } },
+]"#,
+        );
+        let conds = f.conditions_for("shell_exec");
+        assert_eq!(conds.len(), 4);
+        assert_eq!(conds[0].kind(), "natural");
+        assert_eq!(conds[1].kind(), "match");
+        assert_eq!(conds[2].kind(), "exclude");
+        assert_eq!(conds[3].kind(), "verify");
+        // 字符串 cmd 装载期切分为 argv
+        match &conds[3] {
+            PolicyCondition::Verify { spec, .. } => {
+                assert_eq!(spec.argv, vec!["cargo", "check"]);
+                assert_eq!(spec.timeout_secs, 180);
+            }
+            other => panic!("expected verify, got {other:?}"),
+        }
+        // timeout 缺省 120（对表 verify.rs 同族缺省）
+        let f2 = policy_from(
+            "[shell_exec]\nconditions = [{ text = \"x\", verify = { cmd = [\"ls\"] } }]",
+        );
+        match &f2.conditions_for("shell_exec")[0] {
+            PolicyCondition::Verify { spec, .. } => {
+                assert_eq!(spec.timeout_secs, VERIFY_DEFAULT_TIMEOUT_SECS)
+            }
+            other => panic!("expected verify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_rejects_unknown_condition_field() {
+        let err = ApprovalPolicyFile::from_toml(
+            "[shell_exec]\nconditions = [{ text = \"x\", whitelist = [\"a\"] }]",
+        )
+        .unwrap_err();
+        assert!(matches!(err, PolicyFileError::Schema(_)));
+        assert!(err.to_string().contains("unknown condition field"));
+    }
+
+    #[test]
+    fn schema_rejects_verify_mixed_with_match() {
+        let err = ApprovalPolicyFile::from_toml(
+            "[shell_exec]\nconditions = [{ text = \"x\", match = [\"a*\"], verify = { cmd = [\"cargo\", \"check\"] } }]",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn schema_rejects_empty_condition_table() {
+        let err = ApprovalPolicyFile::from_toml("[shell_exec]\nconditions = [{ text = \"x\" }]")
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must declare one of match / exclude / verify"));
+    }
+
+    #[test]
+    fn schema_rejects_shell_metacharacters_in_cmd_string() {
+        for bad in [
+            "cargo check | head",
+            "cargo check; rm -rf",
+            "cargo check > out.txt",
+            "a & b",
+            "cargo check <in",
+        ] {
+            let src = format!(
+                "[shell_exec]\nconditions = [{{ text = \"x\", verify = {{ cmd = \"{bad}\" }} }}]"
+            );
+            let err = ApprovalPolicyFile::from_toml(&src).unwrap_err();
+            assert!(
+                err.to_string().contains("metacharacters"),
+                "case: {bad}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_rejects_timeout_over_cap() {
+        let err = ApprovalPolicyFile::from_toml(
+            "[shell_exec]\nconditions = [{ text = \"x\", verify = { cmd = [\"cargo\", \"check\"], timeout_secs = 601 } }]",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds cap"));
+    }
+
+    #[test]
+    fn schema_rejects_unknown_policy_limits_key() {
+        let err = ApprovalPolicyFile::from_toml(
+            "[shell_exec]\nconditions = [\"a\"]\n[policy_limits]\nmax_corrections = 3\nbogus = 1",
+        )
+        .unwrap_err();
+        assert!(matches!(err, PolicyFileError::Schema(_)));
+    }
+
+    #[test]
+    fn match_condition_truth_table() {
+        let cond = PolicyCondition::Match {
+            text: "白名单".to_string(),
+            patterns: vec!["cargo build*".to_string(), "git status".to_string()],
+        };
+        // 命中（glob 通配 + 归一化）
+        let (pass, ev) = cond
+            .evaluate_mechanical(&json!({"command": "cargo build --release"}))
+            .unwrap();
+        assert!(pass);
+        assert!(ev.contains("cargo build"));
+        // 整串模式无通配=全等（词元边界：statusx 不得命中 status）
+        let (pass, _) = cond
+            .evaluate_mechanical(&json!({"command": "git statusx"}))
+            .unwrap();
+        assert!(!pass);
+        // 零命中=不符（fail-closed）
+        let (pass, _) = cond
+            .evaluate_mechanical(&json!({"command": "rm -rf /"}))
+            .unwrap();
+        assert!(!pass);
+        // 叶子串递归收集（数组/嵌套参数形状）
+        let (pass, _) = cond
+            .evaluate_mechanical(&json!({"commands": ["echo hi", "git status"]}))
+            .unwrap();
+        assert!(pass);
+        // 大小写/空白归一
+        let (pass, _) = cond
+            .evaluate_mechanical(&json!({"command": "  CARGO   BUILD "}))
+            .unwrap();
+        assert!(pass);
+    }
+
+    #[test]
+    fn exclude_condition_truth_table() {
+        let cond = PolicyCondition::Exclude {
+            text: "禁外发".to_string(),
+            terms: vec!["git push".to_string(), "curl".to_string()],
+        };
+        // 命中排除词=不符
+        let (pass, ev) = cond
+            .evaluate_mechanical(&json!({"command": "git push origin main"}))
+            .unwrap();
+        assert!(!pass);
+        assert!(ev.contains("git push"));
+        let (pass, _) = cond
+            .evaluate_mechanical(&json!({"command": "curl http://x"}))
+            .unwrap();
+        assert!(!pass);
+        // 零命中=符合
+        let (pass, _) = cond
+            .evaluate_mechanical(&json!({"command": "cargo check"}))
+            .unwrap();
+        assert!(pass);
+        // 非字符串叶子忽略
+        let (pass, _) = cond.evaluate_mechanical(&json!({"count": 3})).unwrap();
+        assert!(pass);
+    }
+
+    #[tokio::test]
+    async fn verify_exit_zero_passes_zero_llm_fast_path() {
+        let invoker = MockInvoker::new(vec![]);
+        let fallback = FallbackSpy::new();
+        let exec = StubExecutor::new(vec![Ok(VerifyOutput {
+            exit_code: 0,
+            output_tail: String::new(),
+        })]);
+        let review = build_review(
+            verify_only_policy(),
+            invoker.clone() as Arc<dyn PolicyReviewInvoker>,
+            fallback.clone(),
+            exec.clone() as Arc<dyn VerifyExecutor>,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "shell_exec",
+                "cargo build",
+                json!({"command": "cargo build"}),
+            ))
+            .await;
+        assert!(d.approved);
+        assert!(
+            d.reason.contains("policy-review[mechanical]"),
+            "reason: {}",
+            d.reason
+        );
+        // 零 LLM 快路径：评审 invoker 零调用
+        assert_eq!(invoker.count(), 0);
+        assert_eq!(fallback.count(), 0);
+        assert_eq!(exec.count(), 1);
+        // seal mechanical 数组：验证器结论可跨重启回放核验
+        let v: serde_json::Value =
+            serde_json::from_str(d.verdict_json.as_deref().unwrap()).unwrap();
+        assert_eq!(v["mechanical"][0]["kind"], "verify");
+        assert_eq!(v["mechanical"][0]["pass"], true);
+        assert_eq!(v["verdict"], "approved");
+    }
+
+    #[tokio::test]
+    async fn verify_nonzero_exit_rejects_with_output_tail() {
+        let invoker = MockInvoker::new(vec![]);
+        let fallback = FallbackSpy::new();
+        let exec = StubExecutor::new(vec![Ok(VerifyOutput {
+            exit_code: 101,
+            output_tail: "error[E0308]: mismatched types".to_string(),
+        })]);
+        let review = build_review(
+            verify_only_policy(),
+            invoker.clone() as Arc<dyn PolicyReviewInvoker>,
+            fallback.clone(),
+            exec.clone() as Arc<dyn VerifyExecutor>,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "shell_exec",
+                "cargo build",
+                json!({"command": "cargo build"}),
+            ))
+            .await;
+        assert!(!d.approved);
+        assert_eq!(d.approver, "policy-review");
+        // 修正指令携 exit code+输出尾段
+        assert!(
+            d.reason.contains("verifier exit 101"),
+            "reason: {}",
+            d.reason
+        );
+        assert!(d.reason.contains("mismatched types"));
+        assert!(d.reason.contains("修正"));
+        // LLM 兜底层被跳过
+        assert_eq!(invoker.count(), 0);
+        assert_eq!(fallback.count(), 0);
+        let v: serde_json::Value =
+            serde_json::from_str(d.verdict_json.as_deref().unwrap()).unwrap();
+        assert_eq!(v["verdict"], "rejected");
+        assert_eq!(v["mechanical"][0]["pass"], false);
+    }
+
+    #[tokio::test]
+    async fn verify_spawn_failure_falls_back_to_manual() {
+        let invoker = MockInvoker::new(vec![]);
+        let fallback = FallbackSpy::new();
+        let exec = StubExecutor::new(vec![Err("spawn failed".to_string())]);
+        let review = build_review(
+            verify_only_policy(),
+            invoker.clone() as Arc<dyn PolicyReviewInvoker>,
+            fallback.clone(),
+            exec.clone() as Arc<dyn VerifyExecutor>,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "shell_exec",
+                "cargo build",
+                json!({"command": "cargo build"}),
+            ))
+            .await;
+        // 判定不可信 → 降级人工（绝不静默放行）
+        assert_eq!(d.approver, "manual-fallback");
+        assert_eq!(fallback.count(), 1);
+        assert_eq!(invoker.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn verify_timeout_falls_back_to_manual() {
+        let invoker = MockInvoker::new(vec![]);
+        let fallback = FallbackSpy::new();
+        let review = build_review(
+            verify_only_policy(),
+            invoker.clone() as Arc<dyn PolicyReviewInvoker>,
+            fallback.clone(),
+            Arc::new(PendingExecutor) as Arc<dyn VerifyExecutor>,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "shell_exec",
+                "cargo build",
+                json!({"command": "cargo build"}),
+            ))
+            .await;
+        assert_eq!(d.approver, "manual-fallback");
+        assert_eq!(fallback.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn verify_without_workdir_falls_back_to_manual() {
+        let invoker = MockInvoker::new(vec![]);
+        let fallback = FallbackSpy::new();
+        let review = PolicyReview::new(
+            verify_only_policy(),
+            invoker.clone() as Arc<dyn PolicyReviewInvoker>,
+            fallback.clone() as Arc<dyn ApprovalCallback>,
+            false,
+            None,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "shell_exec",
+                "cargo build",
+                json!({"command": "cargo build"}),
+            ))
+            .await;
+        assert_eq!(d.approver, "manual-fallback");
+        assert_eq!(fallback.count(), 1);
+        assert_eq!(invoker.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn all_mechanical_conditions_pass_zero_llm() {
+        let invoker = MockInvoker::new(vec![]);
+        let fallback = FallbackSpy::new();
+        let review = build_review(
+            policy_from(
+                "[shell_exec]\nconditions = [{ text = \"白名单\", match = [\"cargo*\"] }, { text = \"禁外发\", exclude = [\"git push\"] }]",
+            ),
+            invoker.clone() as Arc<dyn PolicyReviewInvoker>,
+            fallback.clone(),
+            Arc::new(PendingExecutor) as Arc<dyn VerifyExecutor>,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "shell_exec",
+                "cargo check",
+                json!({"command": "cargo check"}),
+            ))
+            .await;
+        assert!(d.approved);
+        assert!(d.reason.contains("[mechanical]"));
+        assert_eq!(invoker.count(), 0);
+        assert_eq!(fallback.count(), 0);
+        let v: serde_json::Value =
+            serde_json::from_str(d.verdict_json.as_deref().unwrap()).unwrap();
+        let kinds: Vec<&str> = v["mechanical"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["match", "exclude"]);
+    }
+
+    #[tokio::test]
+    async fn mixed_list_payload_contains_only_nl_conditions() {
+        let invoker = MockInvoker::new(vec![Ok(judgement_json(&[Some(true)], "ok"))]);
+        let fallback = FallbackSpy::new();
+        let review = build_review(
+            policy_from(
+                "[shell_exec]\nconditions = [{ text = \"白名单限定\", match = [\"cargo*\"] }, \"仅工作区内路径\"]",
+            ),
+            invoker.clone() as Arc<dyn PolicyReviewInvoker>,
+            fallback.clone(),
+            Arc::new(PendingExecutor) as Arc<dyn VerifyExecutor>,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "shell_exec",
+                "cargo check",
+                json!({"command": "cargo check"}),
+            ))
+            .await;
+        assert!(d.approved);
+        // LLM 兜底层被调用，但 payload 只含 NL 条目+已通过机械条目证据摘要
+        assert_eq!(invoker.count(), 1);
+        let payloads = invoker.recorded_payloads();
+        assert!(
+            payloads[0].contains("仅工作区内路径"),
+            "NL 条目必须在清单内"
+        );
+        assert!(payloads[0].contains("已由系统机械核验通过的条目"));
+        assert!(payloads[0].contains("#1[match]"), "机械条目以证据摘要出现");
+        assert!(
+            !payloads[0].contains("白名单限定"),
+            "机械条件文本不进条件清单"
+        );
+        // 放行 reason 携两段摘要
+        assert!(d.reason.contains("#1=符合"));
+    }
+
+    #[tokio::test]
+    async fn mechanical_fail_skips_verify_and_llm() {
+        let invoker = MockInvoker::new(vec![]);
+        let fallback = FallbackSpy::new();
+        let exec = StubExecutor::new(vec![Ok(VerifyOutput {
+            exit_code: 0,
+            output_tail: String::new(),
+        })]);
+        let review = build_review(
+            policy_from(
+                "[shell_exec]\nconditions = [{ text = \"白名单限定\", match = [\"cargo*\"] }, { text = \"构建过\", verify = { cmd = [\"cargo\", \"check\"] } }]",
+            ),
+            invoker.clone() as Arc<dyn PolicyReviewInvoker>,
+            fallback.clone(),
+            exec.clone() as Arc<dyn VerifyExecutor>,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "shell_exec",
+                "git status",
+                json!({"command": "git status"}),
+            ))
+            .await;
+        assert!(!d.approved);
+        assert!(d.reason.contains("#1[match]"), "reason: {}", d.reason);
+        // 机械不符短路：验证层与 LLM 兜底层都不发生
+        assert_eq!(exec.count(), 0);
+        assert_eq!(invoker.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn red_line_beats_whitelist_match() {
+        // 白名单 match 本应命中 git push——但红线闸先于一切机械判定，
+        // 白名单不可放宽红线：仍强制人工
+        let invoker = MockInvoker::new(vec![]);
+        let fallback = FallbackSpy::new();
+        let review = build_review(
+            policy_from("[shell_exec]\nconditions = [{ text = \"git 操作\", match = [\"git*\"] }]"),
+            invoker.clone() as Arc<dyn PolicyReviewInvoker>,
+            fallback.clone(),
+            Arc::new(PendingExecutor) as Arc<dyn VerifyExecutor>,
+        );
+        let d = review
+            .request_approval(&review_req(
+                "shell_exec",
+                "git push origin main",
+                json!({"command": "git push origin main"}),
+            ))
+            .await;
+        assert_eq!(d.approver, "manual-fallback");
+        assert_eq!(fallback.count(), 1);
+        assert_eq!(invoker.count(), 0);
+    }
+
+    #[test]
+    fn review_system_prompt_two_sources_no_history_precedent() {
+        // 死条目修正：载荷从不提供会话内批准先例，判定依据收缩为两源
+        assert!(!REVIEW_SYSTEM_PROMPT.contains("先例"));
+        assert!(REVIEW_SYSTEM_PROMPT.contains("两源"));
+        assert!(REVIEW_SYSTEM_PROMPT.contains("机械可核验条件"));
     }
 }

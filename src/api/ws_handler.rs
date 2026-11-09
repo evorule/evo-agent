@@ -815,6 +815,8 @@ pub(crate) fn build_approval_callback(
                             ),
                         ))),
                         override_flag,
+                        // verify 条目的执行工作目录=会话工作区根(serve 侧独占)
+                        Some(state.workdir().to_path_buf()),
                     )),
                     Some(runaway),
                 );

@@ -10926,7 +10926,11 @@ impl RunawayPolicy {
             restate_conditions: f
                 .groups
                 .iter()
-                .flat_map(|(name, g)| g.conditions.iter().map(move |c| format!("[{name}] {c}")))
+                .flat_map(|(name, g)| {
+                    g.conditions
+                        .iter()
+                        .map(move |c| format!("[{name}] {}", c.text()))
+                })
                 .collect(),
         }
     }
