@@ -1160,6 +1160,10 @@ fn cmd_run(
     // 人工审查开合(2026-09-28):def move 前捕获审批模式(auto_policy → PolicyApproval)
     let approval_auto = def.approval_mode.as_deref() == Some("auto_policy");
 
+    // 审批挂起看护:def move 前捕获审批等待超时秒数(无人值守面 deny 默认向;
+    // None = 交互现行为不变,秒数到时由 resolve_cli_approval 竞速裁决)。
+    let approval_wait_timeout = def.approval_wait_timeout_secs;
+
     // 3. evorule + workspace 客户端(规则管理工具依赖 workspace API)
     let client = evorule_client_from(&config);
     let ws_client = WorkspaceApiClient::new(&config.evorule.base_url);
@@ -1451,10 +1455,12 @@ fn cmd_run(
                     std::sync::Arc::new(evo_agent::agent::approval::PolicyApproval),
                     std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                         auto_approve: false,
+                        timeout_secs: approval_wait_timeout,
                     }),
                 )),
                 std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                     auto_approve: false,
+                    timeout_secs: approval_wait_timeout,
                 }),
                 override_flag,
             )),
@@ -1486,6 +1492,7 @@ fn cmd_run(
                         ),
                         std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                             auto_approve: false,
+                            timeout_secs: approval_wait_timeout,
                         }),
                         override_flag,
                     )),
@@ -1500,6 +1507,7 @@ fn cmd_run(
                 (
                     std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                         auto_approve: false,
+                        timeout_secs: approval_wait_timeout,
                     }),
                     None,
                 )
@@ -1509,6 +1517,7 @@ fn cmd_run(
         (
             std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                 auto_approve: false,
+                timeout_secs: approval_wait_timeout,
             }),
             None,
         )
@@ -4450,6 +4459,7 @@ fn run_repl_turn(
         let manual: std::sync::Arc<dyn evo_agent::agent::approval::ApprovalCallback> =
             std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                 auto_approve: false,
+                timeout_secs: None,
             });
         (
             std::sync::Arc::new(evo_agent::agent::approval::RedLineGuardApproval::new(
@@ -4488,6 +4498,7 @@ fn run_repl_turn(
                         ),
                         std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                             auto_approve: false,
+                            timeout_secs: None,
                         }),
                         override_flag,
                     )),
@@ -4502,6 +4513,7 @@ fn run_repl_turn(
                 (
                     std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                         auto_approve: false,
+                        timeout_secs: None,
                     }),
                     None,
                 )
@@ -4511,6 +4523,7 @@ fn run_repl_turn(
         (
             std::sync::Arc::new(evo_agent::agent::approval::CliApproval {
                 auto_approve: false,
+                timeout_secs: None,
             }),
             None,
         )
@@ -5332,6 +5345,7 @@ mod run_policy_gate_tests {
             max_steps: 5,
             step_timeout_secs: 30,
             step_timeout_floor_from_budget: None,
+            approval_wait_timeout_secs: None,
             tools: Vec::new(),
             memory: evo_agent::agent::definition::MemoryConfig::default(),
             http_get_allowed_hosts: None,

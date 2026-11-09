@@ -731,6 +731,15 @@ pub struct AgentDefinition {
     ///   serve 侧独占读取,加载失败同样 fail-visible 降级 manual
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
+    /// 无人值守审批等待上限(可选;CLI run 档审批挂起看护)。None(缺省)=
+    /// 交互现行为(stdin 无限等待,既有定义零变化);显式声明秒数后,CLI 档
+    /// 审批提示(真红线升级人工/降级人工/交互 candidate)超过该秒数未决 →
+    /// 自动拒绝(deny 默认向,绝不自动批准,决策 approver=auto+
+    /// auto_rejected 标记+reason 落账)。仅作用于 CLI run 档 stdin 等待;
+    /// serve 面 HTTP 审批已有 60 秒等待窗不受影响。校验:Some(0) 非法
+    /// fail-fast
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_wait_timeout_secs: Option<u64>,
     /// 执行环境 profile(G1,可选):环境决定 shell_exec/python_exec 的安全
     /// 分类基线——"workbench"(缺省)= host 工作台人在环基线,行为零变化;
     /// "sandbox-trusted" = 一次性隔离执行环境(评测沙箱/容器/VM),环境本身
@@ -913,6 +922,14 @@ impl AgentDefinition {
         if let Some(cfg) = &self.http_get_config {
             cfg.validate()
                 .map_err(AgentDefinitionError::InvalidDefinition)?;
+        }
+        // 无人值守审批等待上限门卫:Some(0)=等待零秒即裁决,形同误配
+        if self.approval_wait_timeout_secs == Some(0) {
+            return Err(AgentDefinitionError::InvalidDefinition(
+                "approval_wait_timeout_secs must be at least 1 second \
+                 (0 would auto-deny every approval immediately)"
+                    .to_string(),
+            ));
         }
         // verify 块门卫(fail-fast 提前到装载点;runner 构造点保留同判据,
         // 双口共享单一 ValidateConfig::validate 实现)
@@ -2137,6 +2154,44 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_zero_approval_wait_timeout() {
+        // Some(0)=等待零秒即裁决,形同误配(每次审批立即自动拒绝),fail-fast
+        let mk = |v: &str| {
+            r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"approval_wait_timeout_secs":"#.to_string()
+                + v
+                + r#","tools":[],"output_format":null}"#
+        };
+        let def: AgentDefinition = serde_json::from_str(&mk("0")).expect("parse");
+        assert!(def
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("approval_wait_timeout_secs"));
+
+        // 正值合法
+        let def: AgentDefinition = serde_json::from_str(&mk("60")).expect("parse");
+        assert!(def.validate().is_ok());
+    }
+
+    #[test]
+    fn test_approval_wait_timeout_default_none_and_roundtrip() {
+        // 缺省不变式:未声明=None(既有定义零变化),序列化零外显
+        let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"tools":[],"output_format":null}"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert_eq!(def.approval_wait_timeout_secs, None);
+        let out = serde_json::to_value(&def).expect("serialize");
+        assert!(
+            out.get("approval_wait_timeout_secs").is_none(),
+            "absent field must stay absent in serialized output"
+        );
+
+        // 声明后解析保真
+        let json = r#"{"agent_type":"x","version":"1","description":"","system_prompt":"","model":"m","temperature":0.5,"max_steps":1,"step_timeout_secs":1,"approval_wait_timeout_secs":120,"tools":[],"output_format":null}"#;
+        let def: AgentDefinition = serde_json::from_str(json).expect("parse");
+        assert_eq!(def.approval_wait_timeout_secs, Some(120));
+    }
+
+    #[test]
     fn test_validate_accepts_production_agents() {
         // 三个生产 agent 定义必须通过门卫(防门卫误伤真资产)
         let dir = PathBuf::from("agents");
@@ -2200,6 +2255,7 @@ mod tests {
             max_steps: 15,
             step_timeout_secs: 45,
             step_timeout_floor_from_budget: None,
+            approval_wait_timeout_secs: None,
             tools: vec!["write_file".to_string()],
             memory: MemoryConfig::default(),
             output_format: None,
@@ -2579,6 +2635,7 @@ mod tests {
             max_steps: 1,
             step_timeout_secs: 1,
             step_timeout_floor_from_budget: None,
+            approval_wait_timeout_secs: None,
             tools: tools.into_iter().map(String::from).collect(),
             memory: MemoryConfig::default(),
             output_format: None,
@@ -2845,6 +2902,7 @@ mod tests {
             max_steps: 1,
             step_timeout_secs: 1,
             step_timeout_floor_from_budget: None,
+            approval_wait_timeout_secs: None,
             tools: vec![],
             memory: MemoryConfig::default(),
             output_format: None,
@@ -3087,6 +3145,7 @@ mod tests {
             max_steps: 1,
             step_timeout_secs: 1,
             step_timeout_floor_from_budget: None,
+            approval_wait_timeout_secs: None,
             tools: vec![],
             memory: MemoryConfig::default(),
             output_format: None,
