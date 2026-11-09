@@ -1495,6 +1495,8 @@ fn cmd_run(
                             timeout_secs: approval_wait_timeout,
                         }),
                         override_flag,
+                        // verify 条目的执行工作目录=会话工作区根(CLI 与 serve 同口径)
+                        Some(workdir.to_path_buf()),
                     )),
                     Some(runaway),
                 )
@@ -4501,6 +4503,8 @@ fn run_repl_turn(
                             timeout_secs: None,
                         }),
                         override_flag,
+                        // verify 条目的执行工作目录=会话工作区根(CLI 与 serve 同口径)
+                        Some(workdir.to_path_buf()),
                     )),
                     Some(runaway),
                 )
