@@ -456,6 +456,7 @@ pub(crate) fn build_journal_digest(session_id: &str, lines: &[JournalLine]) -> S
                 status,
                 steps,
                 duration_ms,
+                ..
             } => ended = Some((status.as_str(), *steps, *duration_ms)),
             _ => {}
         }
@@ -2190,6 +2191,7 @@ mod tests {
                     status: "success".into(),
                     steps: 2,
                     duration_ms: 800,
+                    reason: None,
                 },
                 hashes: None,
             },

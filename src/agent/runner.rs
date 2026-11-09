@@ -8302,7 +8302,14 @@ impl AgentRunner {
                                            ))));
                                            let duration = start_time.elapsed().as_millis() as u64;
                                            if let Some(g) = turn_guard.take() {
-                                               g.end("heartbeat_lost", step_count as u64, duration);
+                                               g.end_with_reason(
+                                               "heartbeat_lost",
+                                               step_count as u64,
+                                               duration,
+                                               Some(
+                                                   "engine heartbeat lost: no engine event within 120s (x2); turn aborted",
+                                               ),
+                                           );
                                            }
                                            if let Err(e) = runner.flush_messages(&session_id).await {
                                                tracing::warn!(session_id = %session_id, error = %e, "flush_messages failed; buffered messages not yet persisted");

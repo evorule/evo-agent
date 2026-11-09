@@ -372,12 +372,16 @@ pub enum JournalEvent {
     },
     /// 轮收尾(优雅终止路径显式写;异常路径由 TurnEndGuard drop 补写 aborted)
     TurnEnded {
-        /// success|error|cancelled|aborted
+        /// success|error|cancelled|aborted|heartbeat_lost
         status: String,
         /// 本轮步数
         steps: u64,
         /// 本轮时长(ms)
         duration_ms: u64,
+        /// 可选终止原因（主动中止路径如实带因，如心跳超时;panic/早退的
+        /// drop 补写路径为 None——有因/无因即可区分两类 abort）
+        #[serde(default)]
+        reason: Option<String>,
     },
     /// 摘要保真对照（规格修正批交付物 B）：G10 摘要替换后，被裁剪消息
     /// 确定性锚点 vs 摘要文本的命中对照落账（I2ScanReport 同款形态；
@@ -1362,6 +1366,18 @@ impl JournalWriter {
         steps: u64,
         duration_ms: u64,
     ) -> Result<u64, JournalError> {
+        self.end_turn_with_reason(status, steps, duration_ms, None)
+    }
+
+    /// 带终止原因的轮收尾（HOST-D012 治理面：主动中止路径如实带因，用户与
+    /// 智能体侧可分辨「心跳超时中止」与「panic 早退补写」两类 abort）
+    pub fn end_turn_with_reason(
+        &self,
+        status: &str,
+        steps: u64,
+        duration_ms: u64,
+        reason: Option<&str>,
+    ) -> Result<u64, JournalError> {
         let open = {
             let mut g = self.core.lock().unwrap_or_else(|p| p.into_inner());
             let open = g.turn_open;
@@ -1375,6 +1391,7 @@ impl JournalWriter {
             status: status.to_string(),
             steps,
             duration_ms,
+            reason: reason.map(|s| s.to_string()),
         })
     }
 
@@ -2114,8 +2131,21 @@ impl TurnEndGuard {
     }
 
     /// 显式收尾(消费守卫;此后 drop 不再补写)
-    pub fn end(mut self, status: &str, steps: u64, duration_ms: u64) {
-        let _ = self.writer.end_turn(status, steps, duration_ms);
+    pub fn end(self, status: &str, steps: u64, duration_ms: u64) {
+        self.end_with_reason(status, steps, duration_ms, None);
+    }
+
+    /// 带终止原因的显式收尾（主动中止路径如实带因）
+    pub fn end_with_reason(
+        mut self,
+        status: &str,
+        steps: u64,
+        duration_ms: u64,
+        reason: Option<&str>,
+    ) {
+        let _ = self
+            .writer
+            .end_turn_with_reason(status, steps, duration_ms, reason);
         // take() 而非 move 字段:TurnEndGuard 实现 Drop,整体消费路径上
         // 不可部分移出字段(E0509);take 后 drop 兜底路径不受影响
         if let Some(mut watch) = self.chain_watch.take() {
@@ -3531,6 +3561,7 @@ mod tests {
                 status: "success".into(),
                 steps: 5,
                 duration_ms: 1234,
+                reason: None,
             },
             JE::SessionCrashed {
                 reason: "stream error".into(),
@@ -3726,9 +3757,50 @@ mod tests {
             JE::TurnEnded {
                 status: "cancelled".into(),
                 steps: 4,
-                duration_ms: 500
+                duration_ms: 500,
+                reason: None
             }
         );
+    }
+
+    #[test]
+    fn turn_guard_end_with_reason_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = JournalWriter::open(dir.path(), "s-reason").unwrap();
+        {
+            let g = w.begin_turn("goal").unwrap();
+            g.end_with_reason(
+                "heartbeat_lost",
+                3,
+                120_000,
+                Some("engine heartbeat lost: no engine event within 120s (x2); turn aborted"),
+            );
+        }
+        let lines = read_all(&JournalWriter::path_for(dir.path(), "s-reason")).unwrap();
+        match &lines[1].event {
+            JE::TurnEnded { status, reason, .. } => {
+                assert_eq!(status, "heartbeat_lost");
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("engine heartbeat lost: no engine event within 120s (x2); turn aborted")
+                );
+            }
+            other => panic!("期望 TurnEnded: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_ended_without_reason_deserializes_compat() {
+        // 旧账本行（reason 字段缺位）仍可反序列化——serde(default) 兼容
+        let raw = serde_json::json!({
+            "type": "turn_ended",
+            "payload": {"status": "aborted", "steps": 2, "duration_ms": 50}
+        });
+        let ev: JournalEvent = serde_json::from_value(raw).expect("旧记录须可解析");
+        match ev {
+            JE::TurnEnded { reason, .. } => assert!(reason.is_none()),
+            other => panic!("期望 TurnEnded: {other:?}"),
+        }
     }
 
     #[test]
@@ -3746,7 +3818,8 @@ mod tests {
             JE::TurnEnded {
                 status: "aborted".into(),
                 steps: 0,
-                duration_ms: 0
+                duration_ms: 0,
+                reason: None,
             }
         );
     }
@@ -4142,6 +4215,7 @@ mod tests {
                 status: "success".into(),
                 steps: 1,
                 duration_ms: 100,
+                reason: None,
             },
         )
         .unwrap();
