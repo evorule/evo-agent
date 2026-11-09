@@ -429,6 +429,7 @@ mod tests {
                     status: "success".into(),
                     steps: 3,
                     duration_ms: 9,
+                    reason: None,
                 },
             ),
         ];
@@ -462,6 +463,7 @@ mod tests {
                     status: "success".into(),
                     steps: 1,
                     duration_ms: 1,
+                    reason: None,
                 },
             ),
             line(
@@ -471,6 +473,7 @@ mod tests {
                     status: "error".into(),
                     steps: 2,
                     duration_ms: 2,
+                    reason: None,
                 },
             ),
         ];

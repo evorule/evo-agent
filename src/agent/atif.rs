@@ -1449,6 +1449,7 @@ mod tests {
             status: "success".into(),
             steps: 2,
             duration_ms: 5_000,
+            reason: None,
         });
 
         let audit = vec![
@@ -1581,6 +1582,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 100,
+            reason: None,
         });
 
         let mut asst = msg(1, "assistant", "读一下");
@@ -1694,6 +1696,7 @@ mod tests {
             status: "success".into(),
             steps: 2,
             duration_ms: 10,
+            reason: None,
         });
         let mut asst0 = msg(1, "assistant", "第一轮:去列表");
         asst0.tool_calls = Some(json!([
@@ -1768,6 +1771,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 10,
+            reason: None,
         });
         let transcript = vec![msg(0, "system", "sys"), msg(1, "user", "g")];
         let src = AtifSources {
@@ -1817,6 +1821,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 10,
+            reason: None,
         });
         let src = AtifSources {
             session_id: "s",
@@ -1866,6 +1871,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 10,
+            reason: None,
         });
         let src = AtifSources {
             session_id: "s",
@@ -1935,6 +1941,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 10,
+            reason: None,
         });
         let src = AtifSources {
             session_id: "s",
@@ -2044,6 +2051,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 1,
+            reason: None,
         });
         j.push(JE::SessionCrashed {
             reason: "stream error".into(),
@@ -2093,6 +2101,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 1,
+            reason: None,
         });
         j.push(JE::SessionCrashed {
             reason: "unclean_tail".into(),
@@ -2120,6 +2129,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 1,
+            reason: None,
         });
         let transcript = vec![
             msg(0, "system", "sys"),
@@ -2184,6 +2194,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 1,
+            reason: None,
         });
         let transcript = vec![msg(0, "system", "sys"), msg(1, "user", "g")];
         let src = AtifSources {
@@ -2242,6 +2253,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 1,
+            reason: None,
         });
         let transcript = vec![
             msg(0, "system", "sys"),
@@ -2288,6 +2300,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 1,
+            reason: None,
         });
         let audit = vec![json!({
             "type": "IoResponse", "id": 4u64, "request_id": 3u64,
@@ -2383,6 +2396,7 @@ mod tests {
             status: "success".into(),
             steps: 1,
             duration_ms: 10,
+            reason: None,
         });
         let transcript = vec![msg(0, "system", "sys"), msg(1, "user", "delegate a task")];
         let mk = || AtifSources {
@@ -2437,6 +2451,7 @@ mod tests {
             status: "success".into(),
             steps: 0,
             duration_ms: 1,
+            reason: None,
         });
         let transcript = vec![msg(0, "system", "sys"), msg(1, "user", "g")];
         let mk = |parent: Option<String>| AtifSources {
