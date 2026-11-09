@@ -2024,6 +2024,7 @@ service_tools = ["config_persist", "rule_sandbox"]
 
     fn make_def(tools: &[&str], boundary: Option<CapabilityBoundary>) -> AgentDefinition {
         AgentDefinition {
+            plan_confirmation: false,
             http_get_allowed_hosts: None,
             http_get_config: None,
             execution_profile: None,

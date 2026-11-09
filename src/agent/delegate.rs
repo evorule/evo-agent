@@ -107,6 +107,17 @@ pub fn digest_delegate_result(child_sid: &str, agent_type: &str, content: &str) 
     )
 }
 
+/// 计划确认门审批通道载体（newtype：审批回调 trait 非 Debug，而
+/// DelegateContext 派生 Debug/Clone——手写 Debug 占位保持派生可用）
+#[derive(Clone)]
+pub struct PlanApprovalGate(pub std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>);
+
+impl std::fmt::Debug for PlanApprovalGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PlanApprovalGate(<callback>)")
+    }
+}
+
 /// Delegate context
 #[derive(Debug, Clone)]
 pub struct DelegateContext {
@@ -162,6 +173,10 @@ pub struct DelegateContext {
     /// 值。`None` = 定义值零变化;仅 serve plan_execute 构造点传入,CLI/react
     /// 路径不触）
     pub step_timeout_override: Option<std::time::Duration>,
+    /// 计划确认门审批通道（装配点按 run 锚定 def 的 plan_confirmation 决定
+    /// 是否注入；None = 既有行为零变化。Some = PlanExecute 全新 run 计划 v1
+    /// 物化并落检查点后、执行前经本通道出卡人工确认，拒绝/超时 = 任务终止）
+    pub plan_approval: Option<PlanApprovalGate>,
     /// spawn 账（子会话锚记录;clone 共享同一 Arc,父 runner drain 落账）
     pub(crate) spawn_ledger: SpawnLedger,
 
@@ -193,6 +208,7 @@ impl DelegateContext {
             agents_md_segment: None,
             propagate_memory: false,
             step_timeout_override: None,
+            plan_approval: None,
             spawn_ledger: Arc::new(std::sync::Mutex::new(Vec::new())),
             llm_handler: None,
         }
@@ -202,6 +218,16 @@ impl DelegateContext {
     /// 主 runner 同源治理段算好后传入）
     pub fn with_governance_segment(mut self, segment: Option<String>) -> Self {
         self.governance_segment = segment;
+        self
+    }
+
+    /// 注入计划确认门审批通道（Some = PlanExecute 全新 run 出卡确认；
+    /// None = 既有行为零变化）
+    pub fn with_plan_approval(
+        mut self,
+        approval: std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>,
+    ) -> Self {
+        self.plan_approval = Some(PlanApprovalGate(approval));
         self
     }
 

@@ -3966,6 +3966,12 @@ fn cmd_workflow(
 
     // 4. 构造 DelegateContext
     let definitions = AgentDefinitionManager::new(config.agents.dir.clone());
+    // 计划确认门（可选启动事前人工确认）：workflow_root def 声明
+    // plan_confirmation=true 时 PlanExecute 全新 run 出卡确认（stdin y/N，
+    // deny/超时=任务终止）；缺省/缺档零变化。def 值须在 definitions 被
+    // move 进 DelegateContext 前取出。
+    let plan_confirmation_required =
+        matches!(definitions.load("workflow_root"), Ok(d) if d.plan_confirmation);
     let client = evorule_client_from(&config);
     // 注入 union toolkit + 工作目录——委托子代理按 def.tools 白名单获得
     // 工具契约与能力边界，多轮工具回喂在流式 ReAct 循环完成（此前委托 runner
@@ -3984,6 +3990,14 @@ fn cmd_workflow(
         .with_journal_dir(workdir.join("data").join("sessions"))
         // 委托窗口 token 归账(差值随 SpawnRecord 落 journal)
         .with_token_counter(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+    if plan_confirmation_required {
+        ctx = ctx.with_plan_approval(std::sync::Arc::new(
+            evo_agent::agent::approval::CliApproval {
+                auto_approve: false,
+                timeout_secs: None,
+            },
+        ));
+    }
     if max_concurrent > 0 {
         ctx = ctx.with_max_concurrent_delegates(max_concurrent);
     }
@@ -5340,6 +5354,7 @@ mod run_policy_gate_tests {
     /// 最小 agent 定义夹具(字段面与加载期缺省一致)
     fn def_with_mode(mode: Option<&str>) -> evo_agent::agent::definition::AgentDefinition {
         evo_agent::agent::definition::AgentDefinition {
+            plan_confirmation: false,
             agent_type: "gate-test".to_string(),
             version: "1.0.0".to_string(),
             description: String::new(),

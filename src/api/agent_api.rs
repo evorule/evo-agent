@@ -1987,6 +1987,17 @@ async fn run_plan_execute_request(
     // 粒执行器步超时请求级覆写(秒→Duration;0=不限步超时，与定义面
     // 校验语义一致;None = 粒定义值零变化)
     let step_timeout_override = req.step_timeout_secs.map(std::time::Duration::from_secs);
+    // 计划确认门（可选启动事前人工确认）：run 锚定 def（workflow_root）声明
+    // plan_confirmation=true 且全新 run 时，计划 v1 落检查点后经 serve HTTP
+    // 审批卡出卡（共享 pending map，approve 端点裁决）；拒绝/超时=任务终止。
+    // 缺省/缺档 = 通道不注入，既有行为零变化。恢复路径在驱动内不触发。
+    let plan_approval = match state.definitions.load("workflow_root") {
+        Ok(def) if def.plan_confirmation => Some(std::sync::Arc::new(
+            crate::agent::approval::HttpApproval::new(state.pending_approvals().clone()),
+        )
+            as std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>),
+        _ => None,
+    };
     let run = crate::agent::driver::run_plan_execute(
         state.evorule_client.clone(),
         state.definitions.clone(),
@@ -2000,6 +2011,7 @@ async fn run_plan_execute_request(
         req.container.clone(), // 判据 v0：run 请求容器名透传（P1 执行桥同源）
         req.resume_session_id.as_deref(), // 恢复旗标（None = 全新跑）
         step_timeout_override, // 粒执行器步超时覆写（None = 定义值零变化）
+        plan_approval,         // 计划确认门通道（None = 缺省关，既有行为零变化）
     )
     .await;
     let (outcome, marks_session) = match run {

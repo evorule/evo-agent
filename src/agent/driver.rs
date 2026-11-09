@@ -315,6 +315,94 @@ pub async fn run_plan_loop(
     .await
 }
 
+/// 计划确认门（可选启动事前人工确认；缺省关 = 零行为变化）：PlanExecute
+/// 全新 run 计划 v1 物化并落检查点后、首版执行前，经注入审批通道出卡
+/// （CLI stdin y/N / serve HTTP 审批卡）。deny 默认向：拒绝/超时 = 任务
+/// 终止 fail-visible，绝不自动继续；批准 = 正常执行。落账复用既有
+/// approval_requested/approval_resolved 事件（无账域跳过落账，门裁决仍生效）。
+async fn plan_confirmation_gate(
+    approval: &std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>,
+    journal: Option<&JournalWriter>,
+    session_id: &str,
+    wf: &Workflow,
+    goal: Option<&str>,
+) -> Result<(), String> {
+    use crate::agent::approval::{new_proposal_id, ApprovalRequest};
+    let summary = plan_confirmation_summary(wf, goal);
+    let proposal_id = new_proposal_id();
+    let req = ApprovalRequest {
+        session_id: session_id.to_string(),
+        tool_name: "plan_confirmation".to_string(),
+        args: serde_json::json!({
+            "goal": goal.unwrap_or_default(),
+            "nodes": wf.nodes.len(),
+        }),
+        command: summary.clone(),
+        risk: "unattended execution: plan is about to run without further human gate".to_string(),
+        alternative: String::new(),
+        proposal_id: proposal_id.clone(),
+        host_execution: false,
+    };
+    if let Some(j) = journal {
+        if let Err(e) = j.approval_requested(&proposal_id, "plan_confirmation", &summary) {
+            tracing::warn!(error = %e, "plan confirmation gate: journal write failed (best-effort)");
+        }
+    }
+    tracing::info!(
+        session = %session_id,
+        proposal = %proposal_id,
+        nodes = wf.nodes.len(),
+        "plan confirmation gate: awaiting human decision"
+    );
+    let decision = approval.request_approval(&req).await;
+    if let Some(j) = journal {
+        let verdict = if decision.approved {
+            "approved"
+        } else {
+            "rejected"
+        };
+        if let Err(e) = j.approval_resolved(&proposal_id, verdict) {
+            tracing::warn!(error = %e, "plan confirmation gate: journal write failed (best-effort)");
+        }
+    }
+    if decision.approved {
+        tracing::info!(session = %session_id, "plan confirmed by {}", decision.approver);
+        Ok(())
+    } else {
+        Err(format!(
+            "plan not confirmed (approver={}, reason={}) - task terminated before execution",
+            decision.approver, decision.reason
+        ))
+    }
+}
+
+/// 计划摘要渲染（审批卡/落账载荷；截 256 字符，与 journal 审批载荷口径一致）
+fn plan_confirmation_summary(wf: &Workflow, goal: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(g) = goal {
+        parts.push(format!("goal: {g}"));
+    }
+    parts.push(format!("plan v1 ({} nodes):", wf.nodes.len()));
+    for n in &wf.nodes {
+        parts.push(format!(
+            "  - {} [{}]",
+            n.id,
+            if n.compute.is_some() {
+                "compute"
+            } else {
+                n.agent_type.as_str()
+            },
+        ));
+    }
+    let full = parts.join("\n");
+    if full.chars().count() <= 256 {
+        full
+    } else {
+        let cut: String = full.chars().take(253).collect();
+        format!("{cut}...")
+    }
+}
+
 /// 驱动终态落账守卫:任意出口(Ok/Err/`?` 传播)落地 plan_loop_finished——
 /// 扫尾面凭终态事件把已终局 run 排除出可恢复列表(无终态且计划检查点在账
 /// = 中断 run)。Ok 路径先 [`Self::finish_ok`] 再返回;其余出口 drop 落
@@ -714,6 +802,26 @@ pub async fn run_plan_loop_with_resume(
         )?;
     }
 
+    // 计划确认门：装配点按 run 锚定 def 的 plan_confirmation 注入审批通道
+    // （with_plan_approval）→ PlanExecute 全新 run 在计划 v1 落检查点后、
+    // 执行环路前出卡人工确认。deny 默认向（拒绝/超时 = 任务终止）；
+    // Dsl（手写 workflow 人工已审）与恢复路径不触发；未注入 = 既有行为零变化。
+    if mode == PlanMode::PlanExecute && resumed_state.is_none() {
+        if let Some(gate) = &ctx.plan_approval {
+            let gate_sid = run_session_id
+                .clone()
+                .unwrap_or_else(|| WorkflowEngine::new_run_session_id(&initial_id));
+            plan_confirmation_gate(
+                &gate.0,
+                run_journal.as_ref(),
+                &gate_sid,
+                &cur_wf,
+                goal.as_deref(),
+            )
+            .await?;
+        }
+    }
+
     loop {
         // 每版 = 全新 execute（丢弃式 D-02：v(n) 结果不注入 v(n+1)，results 表随栈帧析构）
         // 恢复首版 = execute_with_resume(粒级种子):已完成粒零重执行
@@ -1084,6 +1192,7 @@ pub async fn run_plan_execute(
     container: Option<String>,
     resume_session: Option<&str>,
     step_timeout_override: Option<std::time::Duration>,
+    plan_approval: Option<std::sync::Arc<dyn crate::agent::approval::ApprovalCallback>>,
 ) -> Result<(PlanLoopOutcome, String), String> {
     let sessions_dir = workdir.join("data").join("sessions");
     // 恢复装配:回放最新计划检查点+其后检查点尾段;锚不齐/blob 缺失/hash
@@ -1171,6 +1280,9 @@ pub async fn run_plan_execute(
         .with_journal_dir(sessions_dir)
         .with_governance_segment(governance_segment)
         .with_step_timeout_override(step_timeout_override);
+    if let Some(cb) = plan_approval {
+        ctx = ctx.with_plan_approval(cb);
+    }
     if max_concurrent > 0 {
         ctx = ctx.with_max_concurrent_delegates(max_concurrent);
     }
@@ -1948,6 +2060,118 @@ mod tests {
             EvoruleApiClient::new("http://127.0.0.1:1"),
         )
         .with_journal_dir(dir.to_path_buf())
+    }
+
+    // ----- 计划确认门（可选启动事前人工确认；缺省关 = 零行为变化）-----
+
+    struct StaticGateDecision(crate::agent::approval::ApprovalDecision);
+
+    #[async_trait::async_trait]
+    impl crate::agent::approval::ApprovalCallback for StaticGateDecision {
+        async fn request_approval(
+            &self,
+            _req: &crate::agent::approval::ApprovalRequest,
+        ) -> crate::agent::approval::ApprovalDecision {
+            self.0.clone()
+        }
+    }
+
+    fn gate_cb(approved: bool) -> std::sync::Arc<dyn crate::agent::approval::ApprovalCallback> {
+        std::sync::Arc::new(StaticGateDecision(
+            crate::agent::approval::ApprovalDecision {
+                approved,
+                approver: if approved { "cli-user" } else { "auto" }.to_string(),
+                verified: false,
+                reason: if approved { "ok" } else { "not now" }.to_string(),
+                auto_rejected: !approved,
+                verdict_json: None,
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn plan_gate_approve_ok_and_journaled() {
+        let dir = resume_test_dir("gate-approve");
+        let sid = "gate-approve-run";
+        let writer =
+            JournalWriter::open_with_mode(&dir, sid, OpenMode::New, SessionIdentity::default())
+                .unwrap();
+        let wf = resume_chain_wf();
+        plan_confirmation_gate(&gate_cb(true), Some(&writer), sid, &wf, Some("goal"))
+            .await
+            .expect("approve passes the gate");
+        let lines = read_all(&JournalWriter::path_for(&dir, sid)).unwrap();
+        assert!(
+            lines.iter().any(|l| matches!(&l.event,
+                JournalEvent::ApprovalRequested { tool, .. } if tool == "plan_confirmation")),
+            "approval_requested 落账"
+        );
+        assert!(
+            lines.iter().any(|l| matches!(&l.event,
+                JournalEvent::ApprovalResolved { decision, .. } if decision == "approved")),
+            "approval_resolved=approved 落账"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_gate_deny_terminates_fail_visible() {
+        let dir = resume_test_dir("gate-deny");
+        let sid = "gate-deny-run";
+        let writer =
+            JournalWriter::open_with_mode(&dir, sid, OpenMode::New, SessionIdentity::default())
+                .unwrap();
+        let wf = resume_chain_wf();
+        let err = plan_confirmation_gate(&gate_cb(false), Some(&writer), sid, &wf, None)
+            .await
+            .expect_err("deny terminates before execution");
+        assert!(
+            err.contains("plan not confirmed"),
+            "deny 默认向 fail-visible: {err}"
+        );
+        assert!(err.contains("approver=auto"), "决策者身份入错误面: {err}");
+        let lines = read_all(&JournalWriter::path_for(&dir, sid)).unwrap();
+        assert!(
+            lines.iter().any(|l| matches!(&l.event,
+                JournalEvent::ApprovalResolved { decision, .. } if decision == "rejected")),
+            "approval_resolved=rejected 落账"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_gate_no_journal_still_gates() {
+        // 无账域(journal None):门裁决仍生效,落账面跳过(best-effort)
+        let wf = resume_chain_wf();
+        plan_confirmation_gate(&gate_cb(true), None, "no-journal", &wf, None)
+            .await
+            .expect("approve passes without journal");
+        let err = plan_confirmation_gate(&gate_cb(false), None, "no-journal", &wf, None)
+            .await
+            .expect_err("deny terminates without journal");
+        assert!(err.contains("plan not confirmed"));
+    }
+
+    #[test]
+    fn plan_gate_summary_truncates_to_journal_payload_budget() {
+        let mut wf = resume_chain_wf();
+        for i in 0..40 {
+            wf.nodes.push(compute_node(
+                &format!("node-{i}-{}", "x".repeat(20)),
+                &["n1"],
+                ComputeSpec::Concat {
+                    inputs: vec![ComputeInput::Empty, ComputeInput::Empty],
+                },
+            ));
+        }
+        let goal = Some("a long goal ".repeat(30).trim().to_string());
+        let s = plan_confirmation_summary(&wf, goal.as_deref());
+        assert!(
+            s.chars().count() <= 256,
+            "摘要截 256 与 journal 审批载荷口径一致"
+        );
+        assert!(s.ends_with("..."));
+        let short = plan_confirmation_summary(&resume_chain_wf(), Some("goal"));
+        assert!(!short.ends_with("..."), "短摘要不截断");
+        assert!(short.contains("plan v1 (3 nodes):"));
     }
 
     fn compute_node(id: &str, deps: &[&str], spec: ComputeSpec) -> WorkflowNode {
