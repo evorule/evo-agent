@@ -740,6 +740,14 @@ pub struct AgentDefinition {
     /// fail-fast
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_wait_timeout_secs: Option<u64>,
+    /// 计划确认门(可选):PlanExecute 任务启动事前人工确认。true = 计划 v1
+    /// 物化并落检查点后、首版执行前,经审批通道出卡(CLI stdin y/N / serve
+    /// HTTP 审批卡),拒绝或超时 = 任务终止(deny 默认向,绝不自动继续);
+    /// 缺省 false = 既有行为零变化。载体 = run 锚定 def(装配点读
+    /// workflow_root def,缺档视同 false——门关闭零外显)。Dsl 模式(手写
+    /// workflow 装载时人工已审)与恢复路径不触发。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan_confirmation: bool,
     /// 执行环境 profile(G1,可选):环境决定 shell_exec/python_exec 的安全
     /// 分类基线——"workbench"(缺省)= host 工作台人在环基线,行为零变化;
     /// "sandbox-trusted" = 一次性隔离执行环境(评测沙箱/容器/VM),环境本身
@@ -1429,6 +1437,27 @@ mod tests {
             "tools": []
         }"#
         .to_string()
+    }
+
+    /// 计划确认门:缺省 false(既有行为零变化+序列化零外显)+显式声明 true 往返
+    #[test]
+    fn plan_confirmation_defaults_false_and_roundtrips() {
+        let def: AgentDefinition = serde_json::from_str(&minimal_def_json()).unwrap();
+        assert!(!def.plan_confirmation, "缺省 false = 既有行为零变化");
+        let json = serde_json::to_value(&def).unwrap();
+        assert!(json.get("plan_confirmation").is_none(), "缺省序列化零外显");
+        let declared = minimal_def_json().replace(
+            "\"tools\": []",
+            "\"tools\": [], \"plan_confirmation\": true",
+        );
+        let def2: AgentDefinition = serde_json::from_str(&declared).unwrap();
+        assert!(def2.plan_confirmation, "显式声明 true 加载");
+        let out = serde_json::to_value(&def2).unwrap();
+        assert_eq!(
+            out.get("plan_confirmation"),
+            Some(&serde_json::Value::Bool(true)),
+            "声明 true 序列化在场"
+        );
     }
 
     /// F-101:identity_segment 可选(旧定义 JSON 加载零变化)+声明后加载与
@@ -2243,6 +2272,7 @@ mod tests {
     #[test]
     fn test_to_agent_config() {
         let def = AgentDefinition {
+            plan_confirmation: false,
             http_get_allowed_hosts: None,
             http_get_config: None,
             execution_profile: None,
@@ -2623,6 +2653,7 @@ mod tests {
     #[test]
     fn test_capability_boundary_validate_rejections() {
         let mk = |mode: &str, root: &str, tools: Vec<&str>, btools: Vec<&str>| AgentDefinition {
+            plan_confirmation: false,
             http_get_allowed_hosts: None,
             http_get_config: None,
             execution_profile: None,
@@ -2890,6 +2921,7 @@ mod tests {
     #[test]
     fn test_max_parallel_tools_skipped_when_default_in_serialization() {
         let def = AgentDefinition {
+            plan_confirmation: false,
             http_get_allowed_hosts: None,
             http_get_config: None,
             execution_profile: None,
@@ -3133,6 +3165,7 @@ mod tests {
         let dir = make_tmp_dir();
         let skill_path = write_skill_md(dir.path(), "a/SKILL.md", SAMPLE_SKILL_MD);
         let empty_name = AgentDefinition {
+            plan_confirmation: false,
             http_get_allowed_hosts: None,
             http_get_config: None,
             execution_profile: None,
@@ -3176,6 +3209,7 @@ mod tests {
             .contains("name"));
 
         let dup = AgentDefinition {
+            plan_confirmation: false,
             skills: Some(vec![
                 SkillEntry {
                     name: "a".into(),

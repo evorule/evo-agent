@@ -196,6 +196,8 @@ fn test_merge_delegate_tool() {
         agents_md_segment: None,
         // 步超时覆写(测试不覆写)
         step_timeout_override: None,
+        // 计划确认门(测试不注入)
+        plan_approval: None,
         // spawn 账(测试空账)
         spawn_ledger: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         // LLM handler 下放(测试不注入)
@@ -832,6 +834,7 @@ use crate::agent::definition::MemoryConfig;
 
 fn make_def_with_tools(tools: Vec<String>) -> AgentDefinition {
     AgentDefinition {
+        plan_confirmation: false,
         http_get_allowed_hosts: None,
         http_get_config: None,
         execution_profile: None,
