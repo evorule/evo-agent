@@ -810,7 +810,9 @@ pub static AUDIT_GET: EndpointBinding = EndpointBinding {
                   without paging params it returns the whole chain (backward \
                   compatible), and with explicit from_fact/to_fact/limit it \
                   windows the full report (same filtering semantics, paging \
-                  fields included) - prefer explicit windows on large sessions.",
+                  fields included) - prefer explicit windows on large sessions. \n                  NOTE: fact_id values are global audit-chain ids (sparse,
+                  non-sequential, may include the u64::MAX-1 sentinel) - they
+                  are NOT entry positions; use them verbatim when calling \n                  explain_denial / causal_order.",
     params: &[
         ParamBinding {
             name: "session_id",

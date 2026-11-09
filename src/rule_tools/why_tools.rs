@@ -156,7 +156,7 @@ impl ToolFunction for ExplainDenialTool {
             .iter()
             .find(|e| e.get("fact_id").and_then(|v| v.as_u64()) == Some(fact_id))
             .ok_or_else(|| {
-                format!("fact {fact_id} not found in session {session_id} audit chain")
+                format!("fact {fact_id} not found in session {session_id} audit chain (fact_id is the global chain id, not the entry position - use the fact_id values returned by audit_get verbatim)")
             })?;
         let fact_type = target
             .get("fact_type")
