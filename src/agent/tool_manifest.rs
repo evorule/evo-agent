@@ -786,7 +786,7 @@ const READ_ONLY_RULE_TOOLS: &[&str] = &[
     "publish_queue_get",
 ];
 
-/// 规则工具 manifest（59 条 = 透传 49 + 本地逻辑 7 + why/order 3，名称集合与
+/// 规则工具 manifest（60 条 = 透传 50 + 本地逻辑 7 + why/order 3，名称集合与
 /// rule_tool_specs() 相等——测试锁）
 fn rule_manifests() -> Vec<ToolManifest> {
     let mut manifests: Vec<ToolManifest> = crate::rule_tools::adapter::ALL_TRANSPARENT_BINDINGS
@@ -1102,8 +1102,8 @@ mod tests {
         //   （取回件 tool_result_fetch +1：内置 38→39，数量锁 104→105）
         //   （工作区构建反馈回路 build_check +1：内置 39→40，数量锁 105→106）
         assert_eq!(builtin_manifests().len(), 40);
-        assert_eq!(rule_manifests().len(), 59);
-        assert_eq!(all().len(), 106);
+        assert_eq!(rule_manifests().len(), 60);
+        assert_eq!(all().len(), 107);
     }
 
     #[test]

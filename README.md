@@ -230,7 +230,7 @@ port = 8081
 | **CANDIDATE** | LLM wants it → proposal → user approval → executes | rm, mv, sed, chmod and 20 shell commands; any public HTTP host |
 | **BLOCKED** | never approved | sudo, python, bash, curl, kill and 35 escape-class commands; SSRF blacklisted IP ranges |
 
-Additional layers: working-directory sandbox for all file tools (rejects `..` / absolute paths / symlink escapes), SSRF protection on HTTP, source-level switches for dynamic tools (MCP / service proxy) with independent adjudication tiers (default `sensitive`: every call is intent-adjudicated by governance rules and leaves an account entry — see [docs/TOOLS.md](docs/TOOLS.md)), and a governance-write switch that can take all 21 rule-write tools offline for sensitive deployments. Tool totals: 59 by spec count (test-locked); the default serve surface exposes 62 = 17 built-in + 45 rule tools.
+Additional layers: working-directory sandbox for all file tools (rejects `..` / absolute paths / symlink escapes), SSRF protection on HTTP, source-level switches for dynamic tools (MCP / service proxy) with independent adjudication tiers (default `sensitive`: every call is intent-adjudicated by governance rules and leaves an account entry — see [docs/TOOLS.md](docs/TOOLS.md)), and a governance-write switch that can take all 21 rule-write tools offline for sensitive deployments. Tool totals: 60 by spec count (test-locked); the default serve surface exposes 63 = 17 built-in + 46 rule tools.
 
 **Zero unsafe**: `#![forbid(unsafe_code)]` is enforced in all modules.
 
