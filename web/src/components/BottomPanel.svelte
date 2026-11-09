@@ -18,6 +18,7 @@
   import TimeTravelTab from './TimeTravelTab.svelte';
   import CheckpointTab from './CheckpointTab.svelte';
   import BuildProgressTab from './BuildProgressTab.svelte';
+  import PipelineTab from './PipelineTab.svelte';
   import Divider from './Divider.svelte';
   import { panelHeight, setPanelHeight, PANEL_MIN, PANEL_DEFAULT } from '../lib/layout.js';
   import { taskChannelIds, taskBufferVersion, taskLines, clearTaskChannel } from '../lib/tasks.js';
@@ -34,6 +35,7 @@
     { id: 'memory', label: '记忆' },
     { id: 'checkpoint', label: '检查点' },
     { id: 'buildprogress', label: '制作进度' },
+    { id: 'pipeline', label: '制作看板' },
   ];
 
   // 开合状态已提升为全局 store(命令面板 Ctrl+J 可切换);激活 tab 同为全局 store。
@@ -221,6 +223,8 @@
         <CheckpointTab />
       {:else if $panelTab === 'buildprogress'}
         <BuildProgressTab />
+      {:else if $panelTab === 'pipeline'}
+        <PipelineTab />
       {:else if $panelTab === 'audit'}
         <div class="audit-head">
           <span class="audit-note">当前会话治理事件流(展示层视图;权威审计链以审计页为准)</span>
