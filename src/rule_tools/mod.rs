@@ -5,7 +5,7 @@
 //! 规则管理工具集 —— 把 WorkspaceApiClient/EvoruleApiClient 封装成 ToolFunction 工具
 //!
 //! 组装结构（理顺批 P1 适配器化后）：
-//! - 49 个纯透传工具 → `adapter` 表驱动（ALL_TRANSPARENT_BINDINGS 声明式映射）；
+//! - 50 个纯透传工具 → `adapter` 表驱动（ALL_TRANSPARENT_BINDINGS 声明式映射）；
 //! - 7 个本地逻辑工具（audit_verify / bundle_export / skill_pack_to_bundle /
 //!   meta_summary / evolution_signals / rule_promote / verdict_submit）→
 //!   `local_handlers` 统一外置；
@@ -45,7 +45,7 @@ mod tests {
     #[test]
     fn test_rule_tool_specs_count() {
         let specs = rule_tool_specs();
-        assert_eq!(specs.len(), 59, "expected 59 rule tool specs");
+        assert_eq!(specs.len(), 60, "expected 60 rule tool specs");
     }
 
     #[test]

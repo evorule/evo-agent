@@ -1150,7 +1150,7 @@ mod tests {
         let (ws, ev) = make_clients();
         let union = build_union_toolkit(Path::new("."), &ws, &ev);
         let all = all_rule_tool_names();
-        assert_eq!(all.len(), 59, "rule tool spec count drift");
+        assert_eq!(all.len(), 60, "rule tool spec count drift");
         let mut settings = serde_json::Map::new();
         settings.insert(
             "agentTools.governanceWrite".to_string(),
@@ -1170,8 +1170,8 @@ mod tests {
             .collect();
         assert_eq!(
             keep.len(),
-            37,
-            "readonly surface must keep exactly 37 tools"
+            38,
+            "readonly surface must keep exactly 38 tools"
         );
         // 37 只读 spec 中不在 serve union 面者本就不被 serve(与开关无关),
         // 只断言 union 内只读工具全保留

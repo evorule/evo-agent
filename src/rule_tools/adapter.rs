@@ -342,8 +342,27 @@ impl ToolFunction for PassthroughTool {
                     .await
             }
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| _diagnose_asset_absence(&e.to_string()))?;
         Ok(result)
+    }
+}
+
+/// 治理/知识资产缺席自诊断（D003/D004 显示层）：桌面执行侧装机未承载
+/// 治理 workspace 与知识数据资产时，治理面工具的 404 响应转写为结构化
+/// 自诊断（fail-visible 且指明正道），不再以裸 404 误导排查方向。
+/// 命中判据=服务端错误文案（workspace not found / 数据集不存在），
+/// 其余错误原样透传。
+fn _diagnose_asset_absence(err: &str) -> String {
+    if err.contains("workspace not found") {
+        format!(
+            "{err}。诊断：治理面未部署于本装机——不存在任何治理 workspace。\
+             写规则的正道=治理侧立法流程（规则经 Draft→候选→激活，激活永远人审）；\
+             执行侧生效规则只读面=rules_effective_list 工具。"
+        )
+    } else if err.contains("数据集不存在") {
+        format!("{err}。诊断：知识/数据资产未承载于本装机（资产承载形态候治理部署裁决）。")
+    } else {
+        err.to_string()
     }
 }
 
@@ -730,6 +749,16 @@ pub static RULE_FORK: EndpointBinding = EndpointBinding {
             ..PARAM_DEFAULTS
         },
     ],
+    ..BINDING_DEFAULTS
+};
+
+/// 执行侧生效规则只读面（GET /api/rules）：core_eval 宪法 + rules_dir
+/// 业务规则的合并视图——治理 workspace 面未部署时装机上真实可解析的规则面。
+pub static RULES_EFFECTIVE_LIST: EndpointBinding = EndpointBinding {
+    name: "rules_effective_list",
+    path: "/api/rules",
+    description: "List the execution-side effective rules (core_eval constitution +                   rules_dir business rules, merged). Read-only view of what the                   engine actually enforces. Note: this file-driven surface has no                   workspace namespace; for governance-workspace rule legislation                   use rule_list/rule_create (requires a provisioned governance                   workspace).",
+    params: &[],
     ..BINDING_DEFAULTS
 };
 
@@ -1616,6 +1645,7 @@ pub static ALL_TRANSPARENT_BINDINGS: &[&EndpointBinding] = &[
     &RULE_ARCHIVE,
     &RULE_FORK,
     &RULE_RELOAD,
+    &RULES_EFFECTIVE_LIST,
     // translate 3
     &RULE_TO_TRANSFORM,
     &RULE_TO_CONDITIONAL,
@@ -1699,7 +1729,7 @@ mod tests {
 
     #[test]
     fn test_all_bindings_count_and_names_unique() {
-        assert_eq!(ALL_TRANSPARENT_BINDINGS.len(), 49);
+        assert_eq!(ALL_TRANSPARENT_BINDINGS.len(), 50);
         let mut names: Vec<&str> = ALL_TRANSPARENT_BINDINGS.iter().map(|b| b.name).collect();
         names.sort_unstable();
         names.dedup();
@@ -1714,6 +1744,38 @@ mod tests {
                 "{} path placeholders inconsistent with Path params",
                 b.name
             );
+        }
+    }
+
+    #[test]
+    fn test_diagnose_workspace_absence_appends_guidance() {
+        let err = "HTTP 404: {\"message\":\"workspace not found: default\"}";
+        let out = _diagnose_asset_absence(err);
+        assert!(out.contains("治理面未部署"), "{out}");
+        assert!(out.contains("rules_effective_list"), "{out}");
+        assert!(out.starts_with(err), "原始错误保留在头部");
+    }
+
+    #[test]
+    fn test_diagnose_dataset_absence_appends_note() {
+        let err = "HTTP 404: 数据集不存在（workspace 259 查询失败）";
+        let out = _diagnose_asset_absence(err);
+        assert!(out.contains("知识/数据资产未承载"), "{out}");
+        assert!(out.starts_with(err));
+    }
+
+    #[test]
+    fn test_unrelated_errors_pass_through() {
+        for err in [
+            "HTTP 500: internal",
+            "workspace not found: 保留原文前缀也应带诊断", // 该命中项应有诊断
+        ] {
+            let out = _diagnose_asset_absence(err);
+            if err.contains("workspace not found") {
+                assert!(out.contains("治理面未部署"), "{out}");
+            } else {
+                assert_eq!(out, err);
+            }
         }
     }
 
