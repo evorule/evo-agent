@@ -22,6 +22,7 @@
     pushPanelEvent,
     connBanner,
     stepCount,
+    sessionTokens,
   } from '../lib/stores.js';
   import { sendMessage, interrupt, newSession, openSession, resumeSession } from '../lib/ws.js';
   // Svelte 5 不深度代理原生 Set(add/delete 不触发重渲染,点击开合会失明),
@@ -680,6 +681,92 @@
     const mm = String(d.getMinutes()).padStart(2, '0');
     return `${hh}:${mm}`;
   }
+
+  // ---- 对话内搜索(已加载内存消息;消息级定位+短暂高亮) ----
+  let chatSearchOpen = $state(false);
+  let chatSearchQuery = $state('');
+  let chatSearchIdx = $state(0);
+  let highlightMsgId = $state(null);
+
+  function toggleChatSearch() {
+    chatSearchOpen = !chatSearchOpen;
+    if (!chatSearchOpen) {
+      chatSearchQuery = '';
+      chatSearchIdx = 0;
+      highlightMsgId = null;
+    }
+  }
+
+  /** 搜索文本聚合(用户/助手正文+思考+工具名/参数/结果头+回执命令) */
+  function msgSearchText(m) {
+    const parts = [];
+    if (m.text) parts.push(m.text);
+    if (m.thinking) parts.push(m.thinking);
+    if (m.name) parts.push(m.name);
+    if (m.args) parts.push(String(m.args));
+    if (m.result) parts.push(String(m.result).slice(0, 2000));
+    if (m.toolName) parts.push(m.toolName);
+    if (m.command) parts.push(m.command);
+    return parts.join('\n').toLowerCase();
+  }
+
+  const chatSearchMatches = $derived.by(() => {
+    const q = chatSearchQuery.trim().toLowerCase();
+    if (!chatSearchOpen || !q) return [];
+    return $messages.filter((m) => msgSearchText(m).includes(q)).map((m) => m.id);
+  });
+
+  /** 逐条导航(dir=±1):循环游标+扩窗+滚动定位+短暂高亮 */
+  function stepChatSearch(dir) {
+    const ids = chatSearchMatches;
+    if (!ids.length) return;
+    chatSearchIdx = (chatSearchIdx + dir + ids.length) % ids.length;
+    const id = ids[chatSearchIdx];
+    const allIdx = $messages.findIndex((m) => m.id === id);
+    if (allIdx >= 0) {
+      const visibleStart = $messages.length - renderCount;
+      if (allIdx < visibleStart) {
+        renderCount = Math.min($messages.length, $messages.length - allIdx + 50);
+      }
+    }
+    highlightMsgId = id;
+    tick().then(() => {
+      const el = document.querySelector(`[data-msg-id="${id}"]`);
+      el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      setTimeout(() => {
+        if (highlightMsgId === id) highlightMsgId = null;
+      }, 1600);
+    });
+  }
+
+  // ---- 对话导出(当前已加载消息 → Markdown 下载) ----
+  function exportChatMarkdown() {
+    const arr = $messages;
+    if (!arr.length) return;
+    const lines = ['# evo-agent 会话导出', '', `- 导出时间:${new Date().toLocaleString()}`, `- 消息数:${arr.length}`, ''];
+    for (const m of arr) {
+      const ts = typeof m.ts === 'number' ? ` (${formatClock(m.ts)})` : '';
+      if (m.kind === 'user') {
+        lines.push(`## 用户${ts}`, '', m.text || '', '');
+      } else if (m.kind === 'assistant') {
+        lines.push(`## agent${ts}`, '', m.text || (m.thinking ? '_(仅思考)_' : ''), '');
+      } else if (m.kind === 'tool') {
+        const head = toolCallSummary(m.name, m.args);
+        lines.push(`- **工具** ${m.name}${head ? ` — ${head}` : ''}${m.tookMs !== undefined ? `(${formatTook(m.tookMs)})` : ''}`, '');
+      } else if (m.kind === 'approval_receipt') {
+        lines.push(`- **审批** ${approvalReceiptText(m)}`, '');
+      } else if (m.kind === 'error') {
+        lines.push(`> ⚠ 错误:${m.text}`, '');
+      }
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `evo-chat-${$sessionId || 'session'}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
   async function onLoadOlder() {
     if (loadingOlder) return;
     loadingOlder = true;
@@ -1251,10 +1338,45 @@
       {#if $sessionId}
         <button class="new-btn" onclick={() => askResume()} title="恢复当前崩溃会话(加载历史并续完中断轮)">恢复</button>
       {/if}
+      <button class="new-btn" class:active={chatSearchOpen} onclick={toggleChatSearch} title="搜索对话内容(已加载部分)">搜索</button>
+      <button class="new-btn" onclick={exportChatMarkdown} title="把当前会话导出为 Markdown 文件下载">导出</button>
       <button class="new-btn" onclick={openGuideTab} title="系统性使用说明:工作区边界/审批模式/回复阅读/常见问题">指南</button>
       <button class="new-btn" onclick={newSession} title="断开并新建会话">新建会话</button>
     </div>
   </div>
+  {#if chatSearchOpen}
+    <div class="chat-search-bar">
+      <input
+        class="cs-input mono"
+        placeholder="搜索已加载的对话内容…"
+        bind:value={chatSearchQuery}
+        onkeydown={(e) => {
+          if (e.key === 'Enter') { e.preventDefault(); stepChatSearch(e.shiftKey ? -1 : 1); }
+          if (e.key === 'Escape') { chatSearchOpen = false; }
+        }}
+      />
+      <span class="cs-count mono">
+        {#if chatSearchQuery.trim()}
+          {chatSearchMatches.length ? `${chatSearchIdx + 1}/${chatSearchMatches.length}` : '无匹配'}
+        {/if}
+      </span>
+      <button
+        type="button"
+        class="cs-btn"
+        onclick={() => stepChatSearch(-1)}
+        disabled={!chatSearchMatches.length}
+        title="上一个匹配"
+      >▲</button>
+      <button
+        type="button"
+        class="cs-btn"
+        onclick={() => stepChatSearch(1)}
+        disabled={!chatSearchMatches.length}
+        title="下一个匹配"
+      >▼</button>
+      <button type="button" class="cs-btn" onclick={() => (chatSearchOpen = false)} title="关闭搜索">×</button>
+    </div>
+  {/if}
 
   {#if showHistory}
     <div class="session-list">
@@ -1354,7 +1476,7 @@
       </button>
     {/if}
     {#snippet renderReceiptRow(r)}
-      <div class="approval-receipt mono" title={r.command}>
+      <div class="approval-receipt mono" data-msg-id={r.id} class:msg-hl={highlightMsgId === r.id} title={r.command}>
         <span
           class="ar-mark"
           class:ok={r.decision === 'sent' && r.sentApproved}
@@ -1366,7 +1488,7 @@
 
     {#snippet renderMsg(m, meta = null)}
       {#if m.kind === 'user'}
-        <div class="row user">
+        <div class="row user" data-msg-id={m.id} class:msg-hl={highlightMsgId === m.id}>
           <div class="user-col">
             <div class="bubble user-bubble">{m.text}{#if showTimestamps && m.ts}<span class="msg-ts mono">{formatClock(m.ts)}</span>{/if}</div>
             {#if (m.mentions && m.mentions.length > 0) || (m.dropped && m.dropped.length > 0)}
@@ -1393,7 +1515,7 @@
           </div>
         </div>
       {:else if m.kind === 'assistant'}
-        <div class="row">
+        <div class="row" data-msg-id={m.id} class:msg-hl={highlightMsgId === m.id}>
           <div class="assistant-col">
             {#if m.thinking}
               <div class="thinking-card" class:streaming={m.thinkingStreaming} class:expanded={thinkingOpen(m)}>
@@ -1461,7 +1583,7 @@
           </div>
         </div>
       {:else if m.kind === 'tool'}
-        <div class="tool-card" class:running={m.running} class:open={expandedTools.has(m.id)}>
+        <div class="tool-card" data-msg-id={m.id} class:msg-hl={highlightMsgId === m.id} class:running={m.running} class:open={expandedTools.has(m.id)}>
           <div
             class="tool-head"
             role="button"
@@ -2118,6 +2240,12 @@
         <span class="token-est {tokenLevel(estimateComposerTokens(draft, $composerMentions))}">
           ≈ {estimateComposerTokens(draft, $composerMentions)} tokens{#if $composerMentions.some((m) => m.type === 'file')}&nbsp;·&nbsp;含引用{/if}
         </span>
+        {#if $sessionTokens.total > 0}
+          <span
+            class="token-est"
+            title="本会话累计(provider 真值):prompt {$sessionTokens.prompt} + completion {$sessionTokens.completion}"
+          >· Σ {$sessionTokens.total} tokens</span>
+        {/if}
         {#if tokenLevel(estimateComposerTokens(draft, $composerMentions)) === 'over'}
           <span class="token-est-hint">引用体积较大，可删除部分引用 chip</span>
         {/if}
@@ -2934,6 +3062,61 @@
     margin-left: 2px;
   }
   /* 动作/结果两段式小节标题与截断徽标 */
+  /* 对话内搜索条:header 下方一条式(输入+计数+导航+关闭) */
+  .chat-search-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-xs);
+    padding: 4px var(--sp-sm);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-card);
+  }
+  .chat-search-bar .cs-input {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-page);
+    color: var(--fg, var(--text-primary));
+    padding: 3px 8px;
+    font-size: var(--fs-xs);
+    outline: none;
+  }
+  .chat-search-bar .cs-input:focus {
+    border-color: var(--brand);
+  }
+  .chat-search-bar .cs-count {
+    flex-shrink: 0;
+    font-size: var(--fs-2xs);
+    color: var(--text-muted);
+    min-width: 44px;
+    text-align: center;
+  }
+  .chat-search-bar .cs-btn {
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-secondary);
+    border-radius: 4px;
+    padding: 2px 7px;
+    cursor: pointer;
+    font-size: var(--fs-2xs);
+  }
+  .chat-search-bar .cs-btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+  .chat-search-bar .cs-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  /* 搜索定位闪烁高亮(消息级,1.6s 自动消退) */
+  .msg-hl {
+    background: rgba(31, 111, 235, 0.14);
+    box-shadow: 0 0 0 2px rgba(31, 111, 235, 0.35);
+    border-radius: var(--r-sm);
+    transition: box-shadow var(--tr-fast), background var(--tr-fast);
+  }
   /* 尾随流段:running 工具卡的观察态输出(权威结果到达即切换);
      stderr 分色红调,与 stdout 默认色一眼区分 */
   .tool-payload.stream {

@@ -49,6 +49,9 @@ export const lastEngineEventAt = writable(Date.now());
 /** 当前轮次步数(Step 事件累计) */
 export const stepCount = writable(0);
 
+/** 本会话 token 累计(provider 真值,Done 帧自带 tokens 透传;新建会话清零) */
+export const sessionTokens = writable({ prompt: 0, completion: 0, total: 0 });
+
 /** 消息列表。元素: {id, kind, ...}
  *  kind: user | assistant | tool | info | error | approval */
 export const messages = writable([]);
