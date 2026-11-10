@@ -46,7 +46,7 @@
 //!   (防误操作出 workdir),不是安全边界。
 
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Json;
@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncSeekExt, SeekFrom};
 
 use crate::api::agent_api::AgentApiState;
-use crate::api::human_gate::{ensure_write_allowed, CallerIdentity};
+use crate::api::human_gate::{ensure_write_allowed, CallerClass, CallerIdentity};
 use crate::api::serve_tools::simplify_verbatim;
 use crate::builtin_tools::file_create::FileCreateTool;
 use crate::builtin_tools::file_delete::FileDeleteTool;
@@ -274,13 +274,14 @@ fn gate_write(
     state: &AgentApiState,
     op: &str,
     path: &str,
+    class: CallerClass,
 ) -> Result<CallerIdentity, (StatusCode, String)> {
     match ensure_write_allowed(state.auth_config()) {
         Ok(identity) => Ok(identity),
         Err(e) => {
             state
                 .human_gate()
-                .record(op, CallerIdentity::Anonymous, path, "denied");
+                .record_class(op, CallerIdentity::Anonymous, class, path, "denied");
             Err(e)
         }
     }
@@ -310,15 +311,22 @@ fn deny_skill_ledger(path: &str) -> Result<(), (StatusCode, String)> {
 }
 
 /// 写面操作结局落人工账(执行成功 ok / 失败 error)
+///
+/// class 随行（token 拓扑归因面）：privileged=UI token / operator=非 UI
+/// token（外部工具链等）——「谁在写」在账本级可判别（agent 经 HTTP 的
+/// 写入不再与 UI 写入同貌）。
 fn record_outcome(
     state: &AgentApiState,
     op: &str,
     identity: CallerIdentity,
+    class: CallerClass,
     path: &str,
     result: &Result<Value, (StatusCode, String)>,
 ) {
     let outcome = if result.is_ok() { "ok" } else { "error" };
-    state.human_gate().record(op, identity, path, outcome);
+    state
+        .human_gate()
+        .record_class(op, identity, class, path, outcome);
 }
 
 /// `GET /api/files/list` —— 列目录(委托 file_list 工具)
@@ -666,12 +674,13 @@ pub async fn raw_file(
 /// 错误 → 403(anonymous)/ 400(路径越界 / 内容过大)。
 pub async fn write_file(
     State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
     headers: HeaderMap,
     Json(body): Json<WriteBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
     deny_skill_ledger(&body.path)?;
-    let identity = gate_write(&state, "file_write", &body.path)?;
+    let identity = gate_write(&state, "file_write", &body.path, class)?;
     let tool = FileWriteTool::new(root).with_writable_dir(".");
     let mut args = serde_json::Map::new();
     args.insert("path".to_string(), Value::from(body.path.as_str()));
@@ -682,7 +691,7 @@ pub async fn write_file(
         .call(&Value::Object(args))
         .await
         .map_err(|e| (err_status(&e), e));
-    record_outcome(&state, "file_write", identity, &body.path, &result);
+    record_outcome(&state, "file_write", identity, class, &body.path, &result);
     result.map(Json)
 }
 
@@ -697,6 +706,7 @@ pub async fn write_file(
 /// 错误 → 403(anonymous)/ 400(base64 非法)/ 413(超 10MB)。
 pub async fn upload_file(
     State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
     Json(body): Json<UploadBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let clean = sanitize_upload_name(&body.name);
@@ -704,7 +714,7 @@ pub async fn upload_file(
         "{UPLOAD_DIR}/{}-{clean}",
         chrono::Utc::now().format("%Y%m%d-%H%M%S%3f")
     );
-    let identity = gate_write(&state, "file_upload", &rel)?;
+    let identity = gate_write(&state, "file_upload", &rel, class)?;
     // base64 长度预检(解码前粗检,防无谓大分配)+ 解码后精确校验
     if body.data_base64.len() > UPLOAD_MAX_BYTES / 3 * 4 + 4 {
         return Err((
@@ -748,7 +758,7 @@ pub async fn upload_file(
                     )
                 })
         });
-    record_outcome(&state, "file_upload", identity, &rel, &result);
+    record_outcome(&state, "file_upload", identity, class, &rel, &result);
     result.map(Json)
 }
 
@@ -908,11 +918,12 @@ pub async fn browse_dirs(
 /// 错误 → 403(anonymous)/ 409(已存在)/ 400(越界 / 保留名 / 非法字符 / kind 非法)。
 pub async fn create_file(
     State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
     headers: HeaderMap,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
-    let identity = gate_write(&state, "file_create", &body.path)?;
+    let identity = gate_write(&state, "file_create", &body.path, class)?;
     let _guard = tree_mutation_lock().lock().await;
     let tool = FileCreateTool::new(root).with_writable_dir(".");
     let mut args = serde_json::Map::new();
@@ -925,7 +936,7 @@ pub async fn create_file(
         .call(&Value::Object(args))
         .await
         .map_err(|e| (err_status(&e), e));
-    record_outcome(&state, "file_create", identity, &body.path, &result);
+    record_outcome(&state, "file_create", identity, class, &body.path, &result);
     result.map(Json)
 }
 
@@ -937,11 +948,12 @@ pub async fn create_file(
 /// 错误 → 403(anonymous)/ 404(源或目标目录不存在)/ 400(越界 / 保留名 / 移入自身子树)。
 pub async fn move_file(
     State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
     headers: HeaderMap,
     Json(body): Json<MoveBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
-    let identity = gate_write(&state, "file_move", &body.path)?;
+    let identity = gate_write(&state, "file_move", &body.path, class)?;
     let _guard = tree_mutation_lock().lock().await;
     let tool = FileMoveTool::new(root).with_writable_dir(".");
     let mut args = serde_json::Map::new();
@@ -957,7 +969,7 @@ pub async fn move_file(
         .call(&Value::Object(args))
         .await
         .map_err(|e| (err_status(&e), e));
-    record_outcome(&state, "file_move", identity, &body.path, &result);
+    record_outcome(&state, "file_move", identity, class, &body.path, &result);
     result.map(Json)
 }
 
@@ -969,12 +981,13 @@ pub async fn move_file(
 /// 错误 → 403(anonymous)/ 404(目标不存在)/ 400(越界 / 守护目标)。
 pub async fn delete_file(
     State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
     Query(q): Query<DeleteQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let root = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
     deny_skill_ledger(&q.path)?;
-    let identity = gate_write(&state, "file_delete", &q.path)?;
+    let identity = gate_write(&state, "file_delete", &q.path, class)?;
     let _guard = tree_mutation_lock().lock().await;
     let tool = FileDeleteTool::new(root).with_writable_dir(".");
     let mut args = serde_json::Map::new();
@@ -983,7 +996,7 @@ pub async fn delete_file(
         .call(&Value::Object(args))
         .await
         .map_err(|e| (err_status(&e), e));
-    record_outcome(&state, "file_delete", identity, &q.path, &result);
+    record_outcome(&state, "file_delete", identity, class, &q.path, &result);
     result.map(Json)
 }
 
@@ -1033,6 +1046,7 @@ pub async fn search_files(
 /// 错误 → 403(anonymous 写)/ 404(dir 不存在)/ 400(缺 replacement / 非法正则 / glob / 参数非法)。
 pub async fn replace_files(
     State(state): State<AgentApiState>,
+    Extension(class): Extension<CallerClass>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -1042,7 +1056,7 @@ pub async fn replace_files(
     // (本操作无单一路径语义;params 进 blocking 闭包前先取出)
     let query_selector = params.search.query.clone();
     if params.apply {
-        gate_write(&state, "files_replace", &query_selector)?;
+        gate_write(&state, "files_replace", &query_selector, class)?;
     }
     let workdir = resolve_fs_root(&state, headers.get(WORKSPACE_HEADER))?;
     // G13:apply=true 在 replace_core 内部 blocking_lock 持树写锁,
@@ -1064,6 +1078,7 @@ pub async fn replace_files(
             &state,
             "files_replace",
             CallerIdentity::Human,
+            class,
             &query_selector,
             &result,
         );
@@ -1176,7 +1191,13 @@ mod tests {
             path: "notes/todo.md".to_string(),
             content: "- [ ] item".to_string(),
         };
-        let resp = write_file(State(state), HeaderMap::new(), Json(body)).await;
+        let resp = write_file(
+            State(state),
+            Extension(CallerClass::Privileged),
+            HeaderMap::new(),
+            Json(body),
+        )
+        .await;
         assert!(resp.is_ok(), "write should succeed, got: {:?}", resp.err());
         let written = std::fs::read_to_string(dir_canon.join("notes/todo.md")).unwrap();
         assert_eq!(written, "- [ ] item");
@@ -1612,6 +1633,7 @@ mod tests {
         let state = anonymous_state(&dir_canon); // auth disabled = anonymous
         let resp = write_file(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(WriteBody {
                 path: "should-not-exist.txt".to_string(),
@@ -1652,6 +1674,7 @@ mod tests {
         let state = anonymous_state(&dir_canon);
         let (status, _) = create_file(
             State(state.clone()),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(CreateBody {
                 path: "new.txt".to_string(),
@@ -1663,6 +1686,7 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         let (status, _) = delete_file(
             State(state),
+            Extension(CallerClass::Privileged),
             Query(DeleteQuery {
                 path: "keep.txt".to_string(),
             }),
@@ -1687,6 +1711,7 @@ mod tests {
         let state = human_state(&dir_canon);
         let resp = create_file(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(CreateBody {
                 path: "ledgertest/a.md".to_string(),
@@ -1705,6 +1730,55 @@ mod tests {
         assert_eq!(entry["path"], "ledgertest/a.md");
     }
 
+    /// 类别归因面（token 拓扑）：特权闸开启时，非特权 token 的写面操作
+    /// 账本行携带 class=operator、特权 token 携带 class=privileged——
+    /// 「谁在写」在账本级可判别（外部工具链写入不再与 UI 同貌）。
+    #[tokio::test]
+    async fn test_ledger_records_class_for_file_writes() {
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let auth = crate::api::auth::AuthConfig::new(
+            vec!["ui-token".to_string(), "ops-token".to_string()],
+            true,
+        )
+        .with_human_tokens(vec!["ui-token".to_string()]);
+        let app = crate::api::agent_api::router_with_auth(
+            mutation_state(&dir_canon).with_auth_config(auth.clone()),
+            auth,
+        );
+        for (token, path) in [("ui-token", "cls/ui.md"), ("ops-token", "cls/ops.md")] {
+            let req = Request::builder()
+                .method("PUT")
+                .uri("/api/files/write")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"path": path, "content": "x"}).to_string(),
+                ))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{token} write should pass");
+        }
+        let ledger = std::fs::read_to_string(dir_canon.join("data/human_gate_ledger.jsonl"))
+            .expect("writes must be recorded");
+        let classes: Vec<String> = ledger
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["op"] == "file_write")
+            .map(|e| e["class"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            classes,
+            vec!["privileged", "operator"],
+            "两类写入的 class 判别: {classes:?}"
+        );
+    }
+
     /// replace apply=true 属写面:anonymous 403;预览(apply=false)匿名可通
     #[tokio::test]
     async fn test_anonymous_replace_apply_denied_preview_allowed() {
@@ -1718,6 +1792,7 @@ mod tests {
         // 预览只读:匿名放行
         let preview = replace_files(
             State(state.clone()),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(serde_json::json!({ "query": "foo", "replacement": "bar" })),
         )
@@ -1731,6 +1806,7 @@ mod tests {
         // apply=true:匿名 403,文件未被改写
         let (status, _) = replace_files(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(serde_json::json!({
                 "query": "foo",
@@ -1775,6 +1851,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = create_file(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(CreateBody {
                 path: "notes/todo.md".to_string(),
@@ -1798,6 +1875,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = create_file(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(CreateBody {
                 path: "docs/guides".to_string(),
@@ -1824,10 +1902,21 @@ mod tests {
                 kind: None,
             })
         };
-        let _ = create_file(State(state.clone()), HeaderMap::new(), mk_body())
-            .await
-            .unwrap();
-        let second = create_file(State(state), HeaderMap::new(), mk_body()).await;
+        let _ = create_file(
+            State(state.clone()),
+            Extension(CallerClass::Privileged),
+            HeaderMap::new(),
+            mk_body(),
+        )
+        .await
+        .unwrap();
+        let second = create_file(
+            State(state),
+            Extension(CallerClass::Privileged),
+            HeaderMap::new(),
+            mk_body(),
+        )
+        .await;
         let (status, msg) = second.expect_err("duplicate create must fail");
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(msg.contains("already exists"), "got: {msg}");
@@ -1843,6 +1932,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = create_file(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(CreateBody {
                 path: "../escape.txt".to_string(),
@@ -1867,6 +1957,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = move_file(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(MoveBody {
                 path: "src/a.txt".to_string(),
@@ -1893,6 +1984,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = move_file(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(MoveBody {
                 path: "nope.txt".to_string(),
@@ -1917,6 +2009,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = delete_file(
             State(state),
+            Extension(CallerClass::Privileged),
             Query(DeleteQuery {
                 path: "gone.txt".to_string(),
             }),
@@ -1943,6 +2036,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = delete_file(
             State(state),
+            Extension(CallerClass::Privileged),
             Query(DeleteQuery {
                 path: "nope.txt".to_string(),
             }),
@@ -1963,6 +2057,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = delete_file(
             State(state),
+            Extension(CallerClass::Privileged),
             Query(DeleteQuery {
                 path: ".".to_string(),
             }),
@@ -2066,6 +2161,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = replace_files(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(serde_json::json!({
                 "query": "foo",
@@ -2102,6 +2198,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = replace_files(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(serde_json::json!({
                 "query": "foo",
@@ -2131,6 +2228,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = replace_files(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(serde_json::json!({ "query": "x" })),
         )
@@ -2150,6 +2248,7 @@ mod tests {
         let state = mutation_state(&dir_canon);
         let resp = replace_files(
             State(state),
+            Extension(CallerClass::Privileged),
             HeaderMap::new(),
             Json(serde_json::json!({ "query": "(", "isRegex": true, "replacement": "x" })),
         )
@@ -2217,6 +2316,7 @@ mod tests {
         // write:写进工作区(写面走 HumanGate,mutation_state=human)
         let resp = write_file(
             State(state.clone()),
+            Extension(CallerClass::Privileged),
             ws_headers(&ws_canon),
             Json(WriteBody {
                 path: "new-in-ws.txt".to_string(),

@@ -61,6 +61,9 @@ pub struct LaunchContext<'a> {
     pub console: &'a Console,
     pub engine_extra_args: &'a [String],
     pub serve_token: &'a str,
+    /// 运营类第二令牌：进 serve 鉴权列表但不注入 webview——持此令牌的调用
+    /// 落 operator 类（特权闸开启时管理面 403）。不落盘/不进命令行/不进日志。
+    pub ops_token: &'a str,
     pub engine_token: &'a str,
     /// 执行体调用方令牌（每次壳启动随机生成；仅 env 注入双方进程，
     /// 不落盘/不进命令行/不进日志——与 engine token 同款纪律）
@@ -804,6 +807,7 @@ fn spawn_serve(
         engine_port,
         ai_plugin_port,
         ctx.serve_token,
+        ctx.ops_token,
         ctx.engine_token,
         ctx.executor_token,
         ctx.service_token,
@@ -831,6 +835,7 @@ fn build_serve_command(
     engine_port: u16,
     ai_plugin_port: Option<u16>,
     serve_token: &str,
+    ops_token: &str,
     engine_token: &str,
     executor_token: &str,
     service_token: &str,
@@ -868,9 +873,18 @@ fn build_serve_command(
         // python_exec/shell_exec 等工作区子进程不可见
         .env("EVORULE_SERVICE_TOKEN", service_token)
         // serve 鉴权令牌：经 env 载体传递，命令行零出现（serve 侧读入
-        // auth_config 后即从 env 面清除，子进程不可见）
+        // auth_config 后即从 env 面清除，子进程不可见）。token 拓扑面：
+        // 两把令牌——serve_token（UI 令牌,注入 webview,特权类）+ ops_token
+        // （运营类,不注入 webview,外部工具链用）
         .env("EVO_AGENT_AUTH__ENABLED", "true")
-        .env("EVO_AGENT_AUTH__TOKENS", serve_token)
+        .env(
+            "EVO_AGENT_AUTH__TOKENS",
+            format!("{serve_token},{ops_token}"),
+        )
+        // 特权闸缺省启用（治理面缺省收紧裁定）：仅 UI 令牌持特权类——
+        // approve/revoke/import 等管理动作仅特权 token 可调,运营类令牌
+        // 一律 403。纯 web（非壳）部署不带此 env=闸关（opt-in 手册化）
+        .env("EVO_AGENT_AUTH__HUMAN_TOKENS", serve_token)
         // 技能期刊签名引导密钥（纵深加固 v2）：壳每次启动生成一次性 32B
         // 种子,私钥只存在于壳/serve 进程内存（env 载体交接,serve 侧固化后
         // 即清 env）——同用户文件系统攻击者不可读,期刊记录可验不可伪造。
@@ -1383,6 +1397,7 @@ mod tests {
             18442,
             Some(19131),
             "serve-token-secret",
+            "ops-token-secret",
             "engine-token-secret",
             "exec-token-secret",
             "svc-token-secret",
@@ -1404,6 +1419,11 @@ mod tests {
         assert_eq!(env_val("EVO_AGENT_AUTH__ENABLED").as_deref(), Some("true"));
         assert_eq!(
             env_val("EVO_AGENT_AUTH__TOKENS").as_deref(),
+            Some("serve-token-secret,ops-token-secret")
+        );
+        // 特权闸缺省启用：UI 令牌持特权类（token 拓扑面）
+        assert_eq!(
+            env_val("EVO_AGENT_AUTH__HUMAN_TOKENS").as_deref(),
             Some("serve-token-secret")
         );
         // 既有 env 载体不回归（service 身份令牌/执行体调用方令牌）
