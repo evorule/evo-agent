@@ -33,6 +33,7 @@ pub mod lexstore;
 pub mod materializer;
 pub mod memory;
 pub mod memory_event;
+pub(crate) mod memory_prefix_index;
 pub mod memory_recall_tool;
 pub mod memory_tombstone_tool;
 pub mod memory_tool;

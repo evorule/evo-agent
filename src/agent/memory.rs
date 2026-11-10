@@ -1376,6 +1376,10 @@ pub struct MemoryManager {
     cache_verify_interval_secs: u64,
     /// B3：上次成功校验的时间戳（server 不可达时不更新，下次召回立即重试）
     last_cache_verify: Option<std::time::Instant>,
+    /// 共享记忆前缀索引的进程内状态（enabled/dirty 两枚软标志；Arc 跨克隆
+    /// 共享，Mutex 同款理由——axum State 要求 Sync）。纯性能层：任何索引
+    /// 故障只降级回既有扫描路径，不得改变读写结果。
+    prefix_index: std::sync::Arc<crate::agent::memory_prefix_index::PrefixIndexState>,
 }
 
 /// 投影读取的三种结果（改进1：读路径"投影优先 + cache 离线兜底"）
@@ -1412,6 +1416,9 @@ impl MemoryManager {
             ),
             cache_verify_interval_secs: 300,
             last_cache_verify: None,
+            prefix_index: std::sync::Arc::new(
+                crate::agent::memory_prefix_index::PrefixIndexState::default(),
+            ),
         }
     }
 
@@ -1630,6 +1637,15 @@ impl MemoryManager {
             return Ok(PersistOutcome::CacheOnly);
         }
         record_persist_success();
+        // 前缀索引维护（fail-soft：索引任何故障不得影响本次写入结果）
+        if matches!(scope, MemoryScope::Shared) {
+            self.maintain_shared_prefix_index(
+                &session_id,
+                crate::agent::memory_prefix_index::PrefixIndexOp::Insert,
+                key,
+            )
+            .await;
+        }
 
         Ok(PersistOutcome::Persisted {
             // 挂账一闭环：server 响应携带 fact_id（证据链上游锚点）
@@ -1701,6 +1717,15 @@ impl MemoryManager {
             return Ok(PersistOutcome::CacheOnly);
         }
         record_persist_success();
+        // 前缀索引维护（fail-soft：受信通道写入同样入册）
+        if matches!(scope, MemoryScope::Shared) {
+            self.maintain_shared_prefix_index(
+                &session_id,
+                crate::agent::memory_prefix_index::PrefixIndexOp::Insert,
+                key,
+            )
+            .await;
+        }
         Ok(PersistOutcome::Persisted {
             fact_id: fact_id.unwrap_or(None),
         })
@@ -1911,10 +1936,34 @@ impl MemoryManager {
         // （与 project_scoped/get_scoped 的 Shared 读同源；防御性修复——
         // 当前无生产调用方，但不修则下次接线即复发 E2 同款不一致）
         if matches!(scope, MemoryScope::Shared) {
-            let Ok(facts) = self.evorule_client.get_shared_facts(Some(&base)).await else {
+            // 前缀索引快路径（纯性能层）：索引在场且一致 → 区间定向读取；
+            // 否则回退下方命名空间全量扫描（fail-soft：索引任何故障都不得
+            // 改变本查询的正确结果）
+            let probe = self
+                .probe_shared_prefix_index(&session_id, prefix, &base)
+                .await;
+            if let crate::agent::memory_prefix_index::PrefixIndexProbe::Hit(out) = probe {
+                return Ok(out);
+            }
+            // 统一回退形态：命名空间全量扫描 + 客户端前缀过滤（服务端 path
+            // 前缀过滤与键前缀过滤同构，结果等价；重建需要整册键集，故扫描
+            // 不收窄到查询前缀）
+            let rebuild = matches!(
+                probe,
+                crate::agent::memory_prefix_index::PrefixIndexProbe::MissRebuildable
+            );
+            let ns_base = format!("shared.{}.", self.namespace);
+            let Ok(facts) = self.evorule_client.get_shared_facts(Some(&ns_base)).await else {
                 return Ok(Vec::new()); // fail-open（D-B1-5）
             };
-            let out: Vec<MemoryRecord> = latest_entries_by_path(facts)
+            let mut entries = latest_entries_by_path(facts);
+            if rebuild {
+                // 从扫描结果重建索引（修复面；整册键集，与查询前缀无关）
+                self.rebuild_shared_prefix_index(&session_id, &entries)
+                    .await;
+            }
+            entries.retain(|(fact, _)| fact.path.starts_with(&base));
+            let out: Vec<MemoryRecord> = entries
                 .into_iter()
                 .filter_map(|(_, record)| record)
                 .filter(|record| !self.is_expired(record))
@@ -1951,6 +2000,273 @@ impl MemoryManager {
             }
         }
         Ok(out)
+    }
+
+    // ===== 共享记忆前缀索引（纯性能层；fail-soft）=====
+
+    /// 前缀索引快路径探测：读索引 → sanity → 版本守卫 → 区间选择 → 定向读取。
+    ///
+    /// 三态出口（fail-soft 契约）：
+    /// - `Hit`：索引可用且一致，结果与既有全量扫描逐条全等（同集合同排序）；
+    /// - `MissRebuildable`：索引缺席/损坏/版本漂移/一致性失效 → 调用方回退
+    ///   命名空间全量扫描并从扫描结果重建索引（修复面）；
+    /// - `MissQuiet`：索引读/定向读/版本端点故障或区间超上限 → 调用方回退
+    ///   扫描但**不写索引**（避免故障窗口内的写风暴，索引保持原样）。
+    ///
+    /// 禁用（维护写失败后的粘性降级）与脏态（维护曾被跳过）在入口短路：
+    /// 零索引读，直接回退。
+    async fn probe_shared_prefix_index(
+        &self,
+        session_id: &str,
+        prefix: &str,
+        _base: &str,
+    ) -> crate::agent::memory_prefix_index::PrefixIndexProbe {
+        use crate::agent::memory_prefix_index::{
+            prefix_key_range, range_worth_indexing, shared_index_path, PrefixIndexPayload,
+            PrefixIndexProbe,
+        };
+        use std::sync::atomic::Ordering;
+
+        if !self.prefix_index.enabled.load(Ordering::Relaxed) {
+            return PrefixIndexProbe::MissQuiet; // 粘性禁用：零索引交互
+        }
+        if self.prefix_index.dirty.load(Ordering::Relaxed) {
+            return PrefixIndexProbe::MissRebuildable; // 维护曾被跳过：建册交由重建
+        }
+        let index_path = shared_index_path(&self.namespace);
+
+        // 读索引记录（会话 payload；多版本取最新，服务端按版本升序返回）
+        let payload: Option<PrefixIndexPayload> = match self
+            .evorule_client
+            .get_facts(session_id, Some(&index_path))
+            .await
+        {
+            Ok(facts) => facts
+                .into_iter()
+                .rfind(|f| f.path == index_path)
+                .and_then(|f| serde_json::from_value::<PrefixIndexPayload>(f.value).ok())
+                .filter(|p| p.is_sane()),
+            Err(_) => return PrefixIndexProbe::MissQuiet,
+        };
+        let Some(payload) = payload else {
+            // 册缺席（首次部署形态 → 重建建册）或形态损坏（外来数据占据/
+            // 键序破坏 → 重建覆盖修复）
+            return PrefixIndexProbe::MissRebuildable;
+        };
+
+        // 新鲜度守卫：共享账本版本号漂移 = 存在旁路写者 → 必须重建；
+        // 版本端点故障 → 安静回退不写
+        let Ok(version) = self.evorule_client.get_shared_facts_version().await else {
+            return PrefixIndexProbe::MissQuiet;
+        };
+        let Some(current_version) = version.get("version").and_then(|v| v.as_u64()) else {
+            return PrefixIndexProbe::MissQuiet;
+        };
+        if payload.shared_version != Some(current_version) {
+            return PrefixIndexProbe::MissRebuildable;
+        }
+
+        // O(log n) 区间选择
+        let (start, end) = prefix_key_range(&payload.keys, prefix);
+        let range_len = end.saturating_sub(start);
+        if range_len == 0 {
+            return PrefixIndexProbe::Hit(Vec::new());
+        }
+        if !range_worth_indexing(range_len) {
+            // 大区间逐键往返劣化 → 性能层让位既有扫描（索引本身健康，
+            // 无需重建写）
+            return PrefixIndexProbe::MissQuiet;
+        }
+
+        // 定向读取：区间内逐键拉取该键全部版本事实
+        let mut collected: Vec<(
+            crate::api::evorule_client::SharedFactEntry,
+            Option<MemoryRecord>,
+        )> = Vec::new();
+        let mut inconsistent = false;
+        for key in &payload.keys[start..end] {
+            let key_path = format!("shared.{}.{key}", self.namespace);
+            match self.evorule_client.get_shared_facts(Some(&key_path)).await {
+                Ok(key_facts) => {
+                    // 精确过滤：本键读取只认精确路径（防邻键事实混入）
+                    let exact: Vec<_> = key_facts
+                        .into_iter()
+                        .filter(|f| f.path == key_path)
+                        .collect();
+                    if exact.is_empty() {
+                        // 索引声称在场但账面零事实 → 一致性失效（修复面）
+                        inconsistent = true;
+                    }
+                    collected.extend(latest_entries_by_path(exact));
+                }
+                Err(_) => return PrefixIndexProbe::MissQuiet,
+            }
+        }
+        if inconsistent {
+            return PrefixIndexProbe::MissRebuildable;
+        }
+
+        // 组装：复刻既有全量扫描的输出语义——新鲜度优先倒序稳定排序
+        // （无时间戳沉底；并列保持键序 = 路径序），墓碑/不可解析丢弃、
+        // 过期过滤与既有路径完全一致
+        let mut with_ts: Vec<(
+            crate::api::evorule_client::SharedFactEntry,
+            Option<MemoryRecord>,
+            u64,
+        )> = collected
+            .into_iter()
+            .map(|(fact, record)| {
+                let ts = record.as_ref().map(|rec| rec.timestamp).unwrap_or(0);
+                (fact, record, ts)
+            })
+            .collect();
+        with_ts.sort_by_key(|(_, _, ts)| std::cmp::Reverse(*ts));
+        let out: Vec<MemoryRecord> = with_ts
+            .into_iter()
+            .filter_map(|(_, record, _)| record)
+            .filter(|record| !self.is_expired(record))
+            .collect();
+        PrefixIndexProbe::Hit(out)
+    }
+
+    /// 从命名空间扫描结果重建索引记录（修复面）。
+    ///
+    /// 只收「存活可见键」（最新版非墓碑、可解析、未过期）；载荷携带当前
+    /// 共享账本版本号作守卫锚。任何故障只降级、绝不向调用方传播：
+    /// 版本端点失败 → 不写（以未知账面状态建册会伪造一致性）并置脏；
+    /// 索引写失败 → 本实例粘性禁用 + 置脏。
+    async fn rebuild_shared_prefix_index(
+        &self,
+        session_id: &str,
+        entries: &[(
+            crate::api::evorule_client::SharedFactEntry,
+            Option<MemoryRecord>,
+        )],
+    ) {
+        use crate::agent::memory_prefix_index::{shared_index_path, PrefixIndexPayload};
+        use std::sync::atomic::Ordering;
+
+        if !self.prefix_index.enabled.load(Ordering::Relaxed) {
+            return; // 已禁用：零索引写
+        }
+        let Ok(version) = self.evorule_client.get_shared_facts_version().await else {
+            self.prefix_index.dirty.store(true, Ordering::Relaxed);
+            return;
+        };
+        let Some(current_version) = version.get("version").and_then(|v| v.as_u64()) else {
+            self.prefix_index.dirty.store(true, Ordering::Relaxed);
+            return;
+        };
+        let ns_prefix = format!("shared.{}.", self.namespace);
+        let keys: Vec<String> = entries
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .as_ref()
+                    .map(|record| !self.is_expired(record))
+                    .unwrap_or(false)
+            })
+            .filter_map(|(fact, _)| fact.path.strip_prefix(&ns_prefix).map(str::to_string))
+            .collect();
+        let payload = PrefixIndexPayload::new_shared(keys, current_version);
+        let Ok(value) = serde_json::to_value(&payload) else {
+            self.prefix_index.enabled.store(false, Ordering::Relaxed);
+            return;
+        };
+        let index_path = shared_index_path(&self.namespace);
+        match self
+            .evorule_client
+            .update_payload(session_id, &index_path, &value)
+            .await
+        {
+            Ok(_) => {
+                self.prefix_index.dirty.store(false, Ordering::Relaxed);
+            }
+            Err(e) => {
+                self.prefix_index.enabled.store(false, Ordering::Relaxed);
+                self.prefix_index.dirty.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    session_id = %session_id,
+                    path = %index_path,
+                    error = %e,
+                    "memory prefix index rebuild write failed; index disabled for this instance"
+                );
+            }
+        }
+    }
+
+    /// 写入面索引维护：落账成功后对服务端索引记录做读-改-写。
+    ///
+    /// fail-soft 契约（任何分支都不影响主写入结果）：
+    /// - 禁用/脏态 → 让位（脏态下建册统一由查询期重建完成）；
+    /// - 索引读失败 → 置脏不写（查询回退重建）；
+    /// - 册缺席 + 入册 → 不凭空造册（无法知晓未入册的既有键，造册会永久
+    ///   遮蔽它们）→ 置脏，交由查询期从扫描结果建册；册缺席 + 出册 → 册本
+    ///   无此键，无需处理；
+    /// - 键无变化（幂等）→ 跳过写；
+    /// - 索引写失败 → 本实例粘性禁用 + 置脏。
+    async fn maintain_shared_prefix_index(
+        &self,
+        session_id: &str,
+        op: crate::agent::memory_prefix_index::PrefixIndexOp,
+        key: &str,
+    ) {
+        use crate::agent::memory_prefix_index::{
+            shared_index_path, PrefixIndexOp, PrefixIndexPayload,
+        };
+        use std::sync::atomic::Ordering;
+
+        if !self.prefix_index.enabled.load(Ordering::Relaxed)
+            || self.prefix_index.dirty.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let index_path = shared_index_path(&self.namespace);
+        let Ok(facts) = self
+            .evorule_client
+            .get_facts(session_id, Some(&index_path))
+            .await
+        else {
+            self.prefix_index.dirty.store(true, Ordering::Relaxed);
+            return;
+        };
+        let existing = facts
+            .into_iter()
+            .rfind(|f| f.path == index_path)
+            .and_then(|f| serde_json::from_value::<PrefixIndexPayload>(f.value).ok())
+            .filter(|p| p.is_sane());
+        let Some(mut payload) = existing else {
+            if matches!(op, PrefixIndexOp::Insert) {
+                self.prefix_index.dirty.store(true, Ordering::Relaxed);
+            }
+            return;
+        };
+        let before = payload.keys.clone();
+        match op {
+            PrefixIndexOp::Insert => payload.insert_key(key),
+            PrefixIndexOp::Remove => payload.remove_key(key),
+        }
+        if payload.keys == before {
+            return; // 幂等无变化：跳过写
+        }
+        let Ok(value) = serde_json::to_value(&payload) else {
+            self.prefix_index.enabled.store(false, Ordering::Relaxed);
+            return;
+        };
+        if let Err(e) = self
+            .evorule_client
+            .update_payload(session_id, &index_path, &value)
+            .await
+        {
+            self.prefix_index.enabled.store(false, Ordering::Relaxed);
+            self.prefix_index.dirty.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                session_id = %session_id,
+                path = %index_path,
+                error = %e,
+                "memory prefix index maintenance write failed; index disabled for this instance"
+            );
+        }
     }
 
     /// 旧版 remove（向后兼容，默认 Session scope）
@@ -1998,6 +2314,18 @@ impl MemoryManager {
                 PersistOutcome::CacheOnly
             }
         };
+        // 墓碑成功落账 → 前缀索引进册键出册（fail-soft：索引任何故障不得
+        // 影响本次墓碑结果；CacheOnly=墓碑未达 server，键仍存在，索引不动）
+        if matches!(persist, PersistOutcome::Persisted { .. })
+            && matches!(scope, MemoryScope::Shared)
+        {
+            self.maintain_shared_prefix_index(
+                &session_id,
+                crate::agent::memory_prefix_index::PrefixIndexOp::Remove,
+                key,
+            )
+            .await;
+        }
         Ok((removed, persist))
     }
 
@@ -7456,5 +7784,988 @@ mod tests {
         // Reject 模式：不进原文，显式标记
         assert!(!prompt.contains("forbidden token"));
         assert!(prompt.contains("[safety audit rejected this record]"));
+    }
+
+    // =====================================================================
+    // 共享记忆前缀索引（有序键索引性能层；fail-soft 回退 + 重建）
+    // 索引任何故障只降级回既有扫描路径，不得改变读写结果。
+    // =====================================================================
+
+    use crate::agent::memory_prefix_index as pidx;
+    use crate::api::evorule_client::SharedFactEntry;
+
+    fn pidx_shared_fact(
+        fact_id: u64,
+        path: &str,
+        version: u64,
+        value: serde_json::Value,
+    ) -> SharedFactEntry {
+        SharedFactEntry {
+            fact_id,
+            path: path.to_string(),
+            value,
+            source_session_id: 1,
+            version,
+            origin_fact_id: None,
+        }
+    }
+
+    fn pidx_record_value(key: &str, value: &str, ts: u64) -> serde_json::Value {
+        serde_json::json!({"key": key, "value": value, "timestamp": ts})
+    }
+
+    fn pidx_session_fact_json(fact_id: u64, path: &str, value: serde_json::Value) -> String {
+        serde_json::json!([{
+            "fact_id": fact_id,
+            "path": path,
+            "version": 1,
+            "value": value,
+        }])
+        .to_string()
+    }
+
+    fn pidx_shared_fact_json(
+        fact_id: u64,
+        path: &str,
+        version: u64,
+        value: serde_json::Value,
+    ) -> String {
+        serde_json::json!([{
+            "fact_id": fact_id,
+            "path": path,
+            "value": value,
+            "source_session_id": 1,
+            "version": version,
+        }])
+        .to_string()
+    }
+
+    async fn pidx_index_record_mock(
+        server: &mut mockito::Server,
+        payload: serde_json::Value,
+    ) -> mockito::Mock {
+        server
+            .mock(
+                "GET",
+                format!(
+                    "/api/sessions/s1/facts?prefix={}",
+                    pidx::shared_index_path("test")
+                )
+                .as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(pidx_session_fact_json(
+                900,
+                &pidx::shared_index_path("test"),
+                payload,
+            ))
+            .create_async()
+            .await
+    }
+
+    // ---- 纯函数：前缀区间选择（O(log n) 二分，starts_with 等价语义）----
+
+    #[test]
+    fn pidx_range_empty_prefix_covers_all() {
+        let keys: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(pidx::prefix_key_range(&keys, ""), (0, 3));
+    }
+
+    #[test]
+    fn pidx_range_exact_key_includes_longer_siblings() {
+        // 前缀语义 = starts_with：精确键与其扩展键（topic2 / topic.sub）同属区间
+        let keys: Vec<String> = ["alpha", "topic", "topic.sub", "topic2", "zzz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(pidx::prefix_key_range(&keys, "topic"), (1, 4));
+    }
+
+    #[test]
+    fn pidx_range_no_match_is_empty() {
+        let keys: Vec<String> = ["alpha", "beta"].iter().map(|s| s.to_string()).collect();
+        // 词典中位之后无匹配
+        assert_eq!(pidx::prefix_key_range(&keys, "gamma"), (2, 2));
+        // 词典头部之前无匹配
+        assert_eq!(pidx::prefix_key_range(&keys, "aa"), (0, 0));
+    }
+
+    #[test]
+    fn pidx_range_mid_prefix_slices_middle() {
+        let keys: Vec<String> = [
+            "events.e1",
+            "stable.alpha.a",
+            "stable.alpha.b",
+            "stable.beta.a",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(pidx::prefix_key_range(&keys, "stable.alpha."), (1, 3));
+    }
+
+    #[test]
+    fn pidx_range_multibyte_prefix_no_byte_arithmetic() {
+        // 多字节 UTF-8 前缀：实现不得依赖「末字节 +1」式上界算术（增量可产生
+        // 非法 UTF-8），二分 starts_with 语义天然免疫
+        let keys: Vec<String> = ["东x", "中a", "中b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(pidx::prefix_key_range(&keys, "中"), (1, 3));
+    }
+
+    // ---- 纯函数：索引载荷（有序键 + sanity）----
+
+    #[test]
+    fn pidx_payload_roundtrip_and_sane() {
+        let p = pidx::PrefixIndexPayload::new_shared(vec!["a".into(), "b".into()], 7);
+        assert!(p.is_sane());
+        let v = serde_json::to_value(&p).unwrap();
+        let p2: pidx::PrefixIndexPayload = serde_json::from_value(v).unwrap();
+        assert!(p2.is_sane());
+        assert_eq!(p2.keys, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(p2.shared_version, Some(7));
+    }
+
+    #[test]
+    fn pidx_payload_sanity_rejects_corrupt_shapes() {
+        // 非本索引种类（外来数据占据索引路径的形态）
+        let mut p = pidx::PrefixIndexPayload::new_shared(vec!["a".into()], 1);
+        p.kind = "other".into();
+        assert!(!p.is_sane());
+        // 键未排序（内部一致性破坏）
+        let p: pidx::PrefixIndexPayload = serde_json::from_value(serde_json::json!({
+            "kind": pidx::PREFIX_INDEX_KIND, "scope": "shared", "v": 1,
+            "keys": ["b", "a"], "shared_version": 1
+        }))
+        .unwrap();
+        assert!(!p.is_sane());
+        // 键重复
+        let p: pidx::PrefixIndexPayload = serde_json::from_value(serde_json::json!({
+            "kind": pidx::PREFIX_INDEX_KIND, "scope": "shared", "v": 1,
+            "keys": ["a", "a"], "shared_version": 1
+        }))
+        .unwrap();
+        assert!(!p.is_sane());
+        // 缺少共享账本版本号（新鲜度守卫失效面）
+        let mut p = pidx::PrefixIndexPayload::new_shared(vec!["a".into()], 1);
+        p.shared_version = None;
+        assert!(!p.is_sane());
+    }
+
+    #[test]
+    fn pidx_payload_insert_keeps_sorted_and_deduped() {
+        let mut p = pidx::PrefixIndexPayload::new_shared(Vec::new(), 0);
+        for k in ["m", "a", "z", "a", "b"] {
+            p.insert_key(k);
+        }
+        assert_eq!(
+            p.keys,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "m".to_string(),
+                "z".to_string()
+            ]
+        );
+        assert!(p.is_sane());
+    }
+
+    #[test]
+    fn pidx_payload_remove_keeps_sorted_and_idempotent() {
+        let mut p = pidx::PrefixIndexPayload::new_shared(
+            vec!["a".into(), "b".into(), "m".into(), "z".into()],
+            0,
+        );
+        p.remove_key("m");
+        p.remove_key("not-present"); // 幂等无操作
+        assert_eq!(
+            p.keys,
+            vec!["a".to_string(), "b".to_string(), "z".to_string()]
+        );
+        assert!(p.is_sane());
+    }
+
+    #[test]
+    fn pidx_range_worth_indexing_boundaries() {
+        assert!(pidx::range_worth_indexing(1));
+        assert!(pidx::range_worth_indexing(
+            pidx::PREFIX_INDEX_MAX_TARGETED_READS
+        ));
+        // 空区间走 Hit(空) 直返，不经此判断
+        assert!(!pidx::range_worth_indexing(0));
+        // 超上限回退既有扫描（大区间逐键往返劣化面）
+        assert!(!pidx::range_worth_indexing(
+            pidx::PREFIX_INDEX_MAX_TARGETED_READS + 1
+        ));
+    }
+
+    #[test]
+    fn pidx_index_path_lives_outside_user_reachable_space() {
+        // 索引路径位于命名空间层段：会话键嵌在 session_{sid}. 之下、消息键在
+        // .messages. 之下、共享键在 shared. 根之下——任何用户记忆键在结构上
+        // 都不可达索引路径（零碰撞前提）
+        let p = pidx::shared_index_path("ns1");
+        assert_eq!(p, "__memory__.ns1.__prefix_index__.shared");
+        assert!(!p.starts_with("shared."));
+        assert!(!p.starts_with("__memory__.ns1.session_"));
+    }
+
+    // ---- 维护面：set_scoped / remove_scoped 与索引的联动 ----
+
+    #[tokio::test]
+    async fn pidx_set_scoped_shared_updates_index_with_sorted_keys() {
+        let mut server = mockito::Server::new_async().await;
+        // 索引记录在场（keys=["alpha"]）→ RMW 插入 "topic" 后应写出有序键
+        let _index_get = pidx_index_record_mock(
+            &mut server,
+            serde_json::json!({
+                "kind": pidx::PREFIX_INDEX_KIND, "scope": "shared", "v": 1,
+                "keys": ["alpha"], "shared_version": 42
+            }),
+        )
+        .await;
+        let record_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": "shared.test.topic"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":11}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let index_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": pidx::shared_index_path("test"),
+                "value": {"keys": ["alpha", "topic"]}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":12}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let outcome = mgr
+            .set_scoped(MemoryScope::Shared, "topic", "v")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PersistOutcome::Persisted { .. }),
+            "记录写必须成功: {outcome:?}"
+        );
+        index_post.assert_async().await;
+        record_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pidx_tombstone_removes_key_from_index() {
+        let mut server = mockito::Server::new_async().await;
+        let _index_get = pidx_index_record_mock(
+            &mut server,
+            serde_json::json!({
+                "kind": pidx::PREFIX_INDEX_KIND, "scope": "shared", "v": 1,
+                "keys": ["alpha", "topic"], "shared_version": 42
+            }),
+        )
+        .await;
+        let _tombstone_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": "shared.test.topic"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":21}"#)
+            .create_async()
+            .await;
+        let index_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": pidx::shared_index_path("test"),
+                "value": {"keys": ["alpha"]}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":22}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let (_, persist) = mgr
+            .remove_scoped(MemoryScope::Shared, "topic")
+            .await
+            .unwrap();
+        assert!(
+            matches!(persist, PersistOutcome::Persisted { .. }),
+            "墓碑必须落账: {persist:?}"
+        );
+        index_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pidx_index_write_failure_never_fails_memory_write() {
+        let mut server = mockito::Server::new_async().await;
+        let _index_get = pidx_index_record_mock(
+            &mut server,
+            serde_json::json!({
+                "kind": pidx::PREFIX_INDEX_KIND, "scope": "shared", "v": 1,
+                "keys": ["alpha"], "shared_version": 42
+            }),
+        )
+        .await;
+        let _record_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": "shared.test.topic"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":31}"#)
+            .create_async()
+            .await;
+        // 索引写失败（stub 一个 500 的故障存储）
+        let index_post_fail = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": pidx::shared_index_path("test")
+            })))
+            .with_status(500)
+            .create_async()
+            .await;
+        // 禁用后的查询只走既有扫描，不再读索引
+        let index_get_after = server
+            .mock(
+                "GET",
+                format!(
+                    "/api/sessions/s1/facts?prefix={}",
+                    pidx::shared_index_path("test")
+                )
+                .as_str(),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+        // 统一回退形态：命名空间全量扫描 + 客户端前缀过滤（禁用态与回退态同构）
+        let fallback_scan = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let outcome = mgr
+            .set_scoped(MemoryScope::Shared, "topic", "v")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PersistOutcome::Persisted { .. }),
+            "索引写失败不得影响记忆写: {outcome:?}"
+        );
+        index_post_fail.assert_async().await;
+        // 维护写失败 → 本实例粘性禁用索引
+        assert!(
+            !mgr.prefix_index
+                .enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "索引写失败后必须禁用索引（fail-soft 降级面）"
+        );
+        let out = mgr
+            .project_prefix(&MemoryScope::Shared, "after")
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+        index_get_after.assert_async().await; // expect(0)：禁用后零索引读
+        fallback_scan.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pidx_cache_only_write_leaves_index_untouched() {
+        let mut server = mockito::Server::new_async().await;
+        // 记录写失败（CacheOnly）→ 索引维护根本不应被触发
+        let _record_post_fail = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": "shared.test.topic"
+            })))
+            .with_status(500)
+            .create_async()
+            .await;
+        let index_get = server
+            .mock(
+                "GET",
+                format!(
+                    "/api/sessions/s1/facts?prefix={}",
+                    pidx::shared_index_path("test")
+                )
+                .as_str(),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let outcome = mgr
+            .set_scoped(MemoryScope::Shared, "topic", "v")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PersistOutcome::CacheOnly),
+            "记录写失败应返回 CacheOnly: {outcome:?}"
+        );
+        index_get.assert_async().await; // expect(0)：CacheOnly 不碰索引
+    }
+
+    #[tokio::test]
+    async fn pidx_set_scoped_without_existing_index_defers_to_rebuild() {
+        let mut server = mockito::Server::new_async().await;
+        // 索引缺席（首次部署形态）：维护不凭空造册（避免覆盖既有键），
+        // 置 dirty → 后续查询走全量扫描并从扫描结果建册
+        let _index_get_absent = server
+            .mock(
+                "GET",
+                format!(
+                    "/api/sessions/s1/facts?prefix={}",
+                    pidx::shared_index_path("test")
+                )
+                .as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+        let _record_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": "shared.test.topic"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":41}"#)
+            .create_async()
+            .await;
+        let index_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": pidx::shared_index_path("test")
+            })))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let outcome = mgr
+            .set_scoped(MemoryScope::Shared, "topic", "v")
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PersistOutcome::Persisted { .. }));
+        index_post.assert_async().await; // expect(0)：缺席时不造册
+        assert!(
+            mgr.prefix_index
+                .dirty
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "缺席建册被推迟时必须置 dirty（查询回退面）"
+        );
+    }
+
+    // ---- 回退 + 重建：索引缺失/损坏/版本漂移/读故障 ----
+
+    /// 命名空间夹具：alpha 与 beta 各一枚可见键（alpha 较新 → 既有新鲜度
+    /// 优先倒序语义下 alpha 在前，与断言序一致）
+    fn pidx_ns_fixture_facts() -> Vec<SharedFactEntry> {
+        vec![
+            pidx_shared_fact(
+                101,
+                "shared.test.stable.alpha.a",
+                1,
+                pidx_record_value("stable.alpha.a", "va", 1_700_000_001),
+            ),
+            pidx_shared_fact(
+                102,
+                "shared.test.stable.beta.b",
+                1,
+                pidx_record_value("stable.beta.b", "vb", 1_700_000_000),
+            ),
+        ]
+    }
+
+    async fn pidx_mock_ns_scan(server: &mut mockito::Server) -> mockito::Mock {
+        let body = serde_json::to_string(
+            &pidx_ns_fixture_facts()
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "fact_id": f.fact_id, "path": f.path, "value": f.value,
+                        "source_session_id": f.source_session_id, "version": f.version,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await
+    }
+
+    async fn pidx_mock_version(server: &mut mockito::Server, version: u64) -> mockito::Mock {
+        server
+            .mock("GET", "/api/shared/facts/version")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"{{"version":{version},"history_len":99}}"#))
+            .create_async()
+            .await
+    }
+
+    #[tokio::test]
+    async fn pidx_missing_index_falls_back_and_rebuilds() {
+        let mut server = mockito::Server::new_async().await;
+        let _index_get_absent = server
+            .mock(
+                "GET",
+                format!(
+                    "/api/sessions/s1/facts?prefix={}",
+                    pidx::shared_index_path("test")
+                )
+                .as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+        let _ns_scan = pidx_mock_ns_scan(&mut server).await;
+        let _version = pidx_mock_version(&mut server, 42).await;
+        // 重建写：键集 = 扫描可见键有序列表
+        let index_rebuild_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": pidx::shared_index_path("test"),
+                "value": {"keys": ["stable.alpha.a", "stable.beta.b"]}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":51}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let out = mgr
+            .project_prefix(&MemoryScope::Shared, "stable.")
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2, "回退扫描结果必须正确: {out:?}");
+        assert_eq!(out[0].key, "stable.alpha.a");
+        assert_eq!(out[1].key, "stable.beta.b");
+        index_rebuild_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pidx_corrupt_index_falls_back_and_rebuilds() {
+        let mut server = mockito::Server::new_async().await;
+        // 索引路径被外来数据占据（非索引形态）→ 判损坏
+        let _index_get_corrupt =
+            pidx_index_record_mock(&mut server, serde_json::json!({"totally": "unrelated"})).await;
+        let _ns_scan = pidx_mock_ns_scan(&mut server).await;
+        let _version = pidx_mock_version(&mut server, 42).await;
+        let index_rebuild_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": pidx::shared_index_path("test")
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":52}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let out = mgr
+            .project_prefix(&MemoryScope::Shared, "stable.")
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2, "损坏索引不得影响结果正确性: {out:?}");
+        index_rebuild_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pidx_version_mismatch_rebuilds_from_scan() {
+        let mut server = mockito::Server::new_async().await;
+        // 索引在场但共享账本版本号已漂移（他方旁路写者）→ 必须重建
+        let _index_get_stale = pidx_index_record_mock(
+            &mut server,
+            serde_json::json!({
+                "kind": pidx::PREFIX_INDEX_KIND, "scope": "shared", "v": 1,
+                "keys": ["ghost"], "shared_version": 41
+            }),
+        )
+        .await;
+        let _version = pidx_mock_version(&mut server, 42).await;
+        let _ns_scan = pidx_mock_ns_scan(&mut server).await;
+        let index_rebuild_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": pidx::shared_index_path("test")
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":53}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let out = mgr
+            .project_prefix(&MemoryScope::Shared, "stable.")
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2, "版本漂移必须回退重建且结果正确: {out:?}");
+        index_rebuild_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pidx_version_endpoint_down_answers_from_scan_without_writes() {
+        let mut server = mockito::Server::new_async().await;
+        let _index_get = pidx_index_record_mock(
+            &mut server,
+            serde_json::json!({
+                "kind": pidx::PREFIX_INDEX_KIND, "scope": "shared", "v": 1,
+                "keys": ["ghost"], "shared_version": 41
+            }),
+        )
+        .await;
+        let _version_down = server
+            .mock("GET", "/api/shared/facts/version")
+            .with_status(500)
+            .create_async()
+            .await;
+        let _ns_scan = pidx_mock_ns_scan(&mut server).await;
+        // 版本端点故障 → 只回答不写索引（避免故障窗口写风暴）
+        let index_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": pidx::shared_index_path("test")
+            })))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let out = mgr
+            .project_prefix(&MemoryScope::Shared, "stable.")
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2, "版本端点故障不得影响结果: {out:?}");
+        index_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pidx_index_read_transport_error_answers_from_scan_without_writes() {
+        let mut server = mockito::Server::new_async().await;
+        let _index_get_down = server
+            .mock(
+                "GET",
+                format!(
+                    "/api/sessions/s1/facts?prefix={}",
+                    pidx::shared_index_path("test")
+                )
+                .as_str(),
+            )
+            .with_status(500)
+            .create_async()
+            .await;
+        let _ns_scan = pidx_mock_ns_scan(&mut server).await;
+        let index_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": pidx::shared_index_path("test")
+            })))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let out = mgr
+            .project_prefix(&MemoryScope::Shared, "stable.")
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2, "索引读故障不得影响结果: {out:?}");
+        index_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pidx_index_claims_absent_record_repairs_via_rebuild() {
+        let mut server = mockito::Server::new_async().await;
+        // 索引在查询前缀区间内声称 "stable.beta.ghost" 在场，但服务端该 path
+        // 零事实 → 一致性失效，回退全量扫描（结果正确）+ 重建（出册幽灵键）
+        let _index_get = pidx_index_record_mock(
+            &mut server,
+            serde_json::json!({
+                "kind": pidx::PREFIX_INDEX_KIND, "scope": "shared", "v": 1,
+                "keys": ["stable.beta.b", "stable.beta.ghost"], "shared_version": 42
+            }),
+        )
+        .await;
+        let _version = pidx_mock_version(&mut server, 42).await;
+        let _ghost_scan = server
+            .mock(
+                "GET",
+                "/api/shared/facts?prefix=shared.test.stable.beta.ghost",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+        // ghost 一致性失效后回退扫描：real 键仍需定向读取出结果
+        let _real_scan = server
+            .mock("GET", "/api/shared/facts?prefix=shared.test.stable.beta.b")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(pidx_shared_fact_json(
+                102,
+                "shared.test.stable.beta.b",
+                1,
+                pidx_record_value("stable.beta.b", "vb", 1_700_000_001),
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let _ns_scan = pidx_mock_ns_scan(&mut server).await;
+        let index_rebuild_post = server
+            .mock("POST", "/api/sessions/s1/payload")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "path": pidx::shared_index_path("test"),
+                "value": {"keys": ["stable.alpha.a", "stable.beta.b"]}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"fact_id":54}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mgr =
+            MemoryManager::new("test", EvoruleApiClient::new(&server.url())).with_session_id("s1");
+        let out = mgr
+            .project_prefix(&MemoryScope::Shared, "stable.beta.")
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1, "一致性失效必须回退且结果正确: {out:?}");
+        assert_eq!(out[0].key, "stable.beta.b");
+        index_rebuild_post.assert_async().await;
+    }
+
+    // ---- Parity：索引快路径 vs 既有全量扫描路径（随机化夹具黄金对比）----
+
+    #[tokio::test]
+    async fn pidx_parity_with_legacy_full_scan_randomized_fixture() {
+        let mut server_a = mockito::Server::new_async().await;
+        let mut server_b = mockito::Server::new_async().await;
+
+        // 确定性伪随机夹具（固定种子 xorshift64；无 rand 依赖）
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // 多前缀 / 多版本 / 墓碑 / 同刻时间戳 / TTL 过期；可见键集由夹具
+        // 独立推导（黄金基准），不借实现逻辑
+        let now = now_secs();
+        let fresh_base = now - 100; // TTL 内
+        let ancient_base = now - 5000; // TTL 外（过期面）
+        let prefixes = ["stable.alpha.", "stable.beta.", "events.", "sessions.s1."];
+        let mut facts: Vec<SharedFactEntry> = Vec::new();
+        // (key, value, timestamp, fact_id)——最新版本可见键的黄金基准
+        let mut visible: Vec<(String, String, u64, Option<u64>)> = Vec::new();
+        let mut fid = 100u64;
+        for pfx in prefixes {
+            for n in 0..6u64 {
+                let key = format!("{pfx}k{n}");
+                let n_versions = 1 + rnd() % 3;
+                let ancient = rnd() % 9 == 0;
+                let ts_base = if ancient {
+                    ancient_base
+                } else {
+                    fresh_base + rnd() % 5
+                };
+                let tombstone_last = rnd() % 5 == 0;
+                for v in 1..=n_versions {
+                    fid += 1;
+                    let is_last = v == n_versions;
+                    let value = if is_last && tombstone_last {
+                        serde_json::json!(null)
+                    } else {
+                        pidx_record_value(&key, &format!("v{v}"), ts_base + v)
+                    };
+                    facts.push(pidx_shared_fact(
+                        fid,
+                        &format!("shared.test.{key}"),
+                        v,
+                        value,
+                    ));
+                    if is_last && !tombstone_last && !ancient {
+                        visible.push((
+                            key.clone(),
+                            format!("v{n_versions}"),
+                            ts_base + n_versions,
+                            Some(fid),
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(!visible.is_empty(), "夹具必须有可见键");
+        let visible_keys: Vec<String> = {
+            let mut ks: Vec<String> = visible.iter().map(|(k, _, _, _)| k.clone()).collect();
+            ks.sort();
+            ks
+        };
+
+        // server A（索引快路径）：索引在场 + 版本一致 + 逐键定向读取
+        let _index_get = pidx_index_record_mock(
+            &mut server_a,
+            serde_json::json!({
+                "kind": pidx::PREFIX_INDEX_KIND, "scope": "shared", "v": 1,
+                "keys": visible_keys, "shared_version": 42
+            }),
+        )
+        .await;
+        let _version = pidx_mock_version(&mut server_a, 42).await;
+        // 每个可见键一枚定向读取 mock；首键夹带邻键事实（精确过滤面）
+        for (i, (key, _, _, _)) in visible.iter().enumerate() {
+            let mut key_facts: Vec<serde_json::Value> = facts
+                .iter()
+                .filter(|f| f.path == format!("shared.test.{key}"))
+                .map(|f| {
+                    serde_json::json!({
+                        "fact_id": f.fact_id, "path": f.path, "value": f.value,
+                        "source_session_id": f.source_session_id, "version": f.version,
+                    })
+                })
+                .collect();
+            if i + 1 < visible.len() {
+                let neighbor = &visible[i + 1].0;
+                if let Some(nf) = facts
+                    .iter()
+                    .find(|f| f.path == format!("shared.test.{neighbor}"))
+                {
+                    key_facts.push(serde_json::json!({
+                        "fact_id": nf.fact_id, "path": nf.path, "value": nf.value,
+                        "source_session_id": nf.source_session_id, "version": nf.version,
+                    }));
+                }
+            }
+            let _targeted = server_a
+                .mock(
+                    "GET",
+                    format!("/api/shared/facts?prefix=shared.test.{key}").as_str(),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(serde_json::to_string(&key_facts).unwrap())
+                .create_async()
+                .await;
+        }
+
+        // server B（既有全量扫描路径）：命名空间前缀扫描一次拉全
+        let all_facts_json: Vec<serde_json::Value> = facts
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "fact_id": f.fact_id, "path": f.path, "value": f.value,
+                    "source_session_id": f.source_session_id, "version": f.version,
+                })
+            })
+            .collect();
+        let _ns_scan = server_b
+            .mock("GET", "/api/shared/facts?prefix=shared.test.")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&all_facts_json).unwrap())
+            .create_async()
+            .await;
+
+        let mgr_a = MemoryManager::new("test", EvoruleApiClient::new(&server_a.url()))
+            .with_session_id("s1")
+            .with_ttl_secs(1000);
+        let mgr_b = MemoryManager::new("test", EvoruleApiClient::new(&server_b.url()))
+            .with_session_id("s1")
+            .with_ttl_secs(1000);
+        // B 路管理器禁用索引 → 走既有全量扫描路径（黄金参照面）
+        mgr_b
+            .prefix_index
+            .enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let queries = [
+            "",
+            "stable.",
+            "stable.alpha.",
+            "events.",
+            "sessions.",
+            "stable.alpha.k1",
+            "no-such-prefix",
+        ];
+        for q in queries {
+            let a = mgr_a.project_prefix(&MemoryScope::Shared, q).await.unwrap();
+            let b = mgr_b.project_prefix(&MemoryScope::Shared, q).await.unwrap();
+            // 黄金基准：可见键集由夹具独立推导；顺序按既有排序契约（新鲜度
+            // 优先倒序、并列保持键序）独立复算，不读实现代码
+            let mut expect: Vec<&(String, String, u64, Option<u64>)> = visible
+                .iter()
+                .filter(|(k, _, _, _)| k.starts_with(q))
+                .collect();
+            expect.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            assert_eq!(
+                a.len(),
+                expect.len(),
+                "前缀 {q:?}: 索引路长度偏离黄金基准 a={} want={}",
+                a.len(),
+                expect.len()
+            );
+            assert_eq!(b.len(), expect.len(), "前缀 {q:?}: 扫描路长度偏离黄金基准");
+            for (i, (k, v, ts, f)) in expect.iter().enumerate() {
+                assert_eq!(a[i].key, *k, "前缀 {q:?}[{i}]: 键序");
+                assert_eq!(a[i].value, *v, "键 {k}: 值");
+                assert_eq!(a[i].timestamp, *ts, "键 {k}: 时间戳");
+                assert_eq!(a[i].fact_id, *f, "键 {k}: fact_id");
+                assert_eq!(b[i].key, a[i].key, "前缀 {q:?}[{i}]: 两路键序一致");
+                assert_eq!(b[i].value, a[i].value, "键 {k}: 两路值一致");
+                assert_eq!(b[i].timestamp, a[i].timestamp, "键 {k}: 两路时间戳一致");
+                assert_eq!(b[i].fact_id, a[i].fact_id, "键 {k}: 两路 fact_id 一致");
+            }
+        }
     }
 }
