@@ -53,7 +53,9 @@
 //!
 //! - pipe / 重定向 / glob / 变量展开 — 用多次 `shell_exec` 调用组合
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -674,46 +676,90 @@ impl Drop for LiveGuard<'_> {
     }
 }
 
-/// 运行中工具输出尾随(观察态):全局单槽 tap——工具执行前安装,执行结束
-/// RAII 摘除。drain 线程读到的每段输出原样发往槽内通道(失败静默——观察
-/// 态永不影响执行);仅直跑后端开启(容器两后端二期,见立项设计稿分批)。
-/// 通道用 tokio unbounded(send 为同步方法,跨 std 线程无阻塞);环帽/节流
-/// 在 runner 接收侧做,本层零缓冲零节流。
-pub struct OutputTapGuard;
-
-static OUTPUT_TAP: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>> =
-    StdMutex::new(None);
-
-/// 安装输出尾随 tap(返回 RAII 守卫,drop 即摘除;多次安装为后装覆盖——
-/// 安装点在工具执行段,串行 ReAct 下天然单飞)
-pub fn install_output_tap(tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) -> OutputTapGuard {
-    if let Ok(mut slot) = OUTPUT_TAP.lock() {
-        *slot = Some(tx);
-    }
-    OutputTapGuard
+/// 运行中工具输出尾随(观察态):tap 归属精化形态——
+/// - `TAP_PENDING`:工具执行前的安装 FIFO(runner 逐工具 push,tool_name 随队);
+/// - 进程 spawn 成功即 `bind_pid`:从队头出队绑到 pid(`TAP_ACTIVE` map)——串行
+///   ReAct 天然一一对应,并行 call_external 按 spawn 序近似归属(消息自带
+///   tool_name,前端按名找卡纠偏);
+/// - drain/读循环按 pid 查 ACTIVE 发送(消息携带 tool_name);进程结束摘除。
+///
+/// 观察态纪律:发送失败静默、永不影响执行、不落 journal 不进账。通道 tokio
+/// unbounded(send 同步方法,跨 std 线程无阻塞);环帽/节流在 runner 接收侧。
+/// 供 shell_exec 直跑/docker 后端与 python_exec 同型共用。
+#[derive(Clone)]
+pub struct TapBinding {
+    /// 归属工具名(前端按名找卡)
+    pub tool_name: String,
+    /// 观察段通道(接收端在 runner 转发循环)
+    pub tx: tokio::sync::mpsc::UnboundedSender<TapSeg>,
 }
 
-/// 观察段发送(仅 drain 线程调用;tap 未安装/通道关闭均静默)
-fn tap_send(seg: &[u8]) {
-    if let Ok(slot) = OUTPUT_TAP.lock() {
-        if let Some(tx) = slot.as_ref() {
-            let _ = tx.send(seg.to_vec());
+/// 尾随段消息:归属(工具名)+原始字节段
+#[derive(Debug, Clone)]
+pub struct TapSeg {
+    /// 归属工具名
+    pub tool_name: String,
+    /// 原始输出字节段
+    pub seg: Vec<u8>,
+}
+
+static TAP_PENDING: StdMutex<VecDeque<TapBinding>> = StdMutex::new(VecDeque::new());
+static TAP_ACTIVE: StdMutex<BTreeMap<u32, TapBinding>> = StdMutex::new(BTreeMap::new());
+
+/// 工具执行前:安装 tap 绑定入 FIFO 队列(工具名随队;执行段结束未发生
+/// spawn 的路径——白名单拒绝/参数错——由 `unbind_pending` 清除)
+pub fn push_pending_tap(tool_name: &str, tx: tokio::sync::mpsc::UnboundedSender<TapSeg>) {
+    if let Ok(mut q) = TAP_PENDING.lock() {
+        q.push_back(TapBinding {
+            tool_name: tool_name.to_string(),
+            tx,
+        });
+    }
+}
+
+/// 清除指定工具的 pending 安装(未发生 spawn 的执行路径收尾)
+pub fn unbind_pending(tool_name: &str) {
+    if let Ok(mut q) = TAP_PENDING.lock() {
+        if let Some(pos) = q.iter().position(|b| b.tool_name == tool_name) {
+            q.remove(pos);
         }
     }
 }
 
-impl Drop for OutputTapGuard {
-    fn drop(&mut self) {
-        if let Ok(mut slot) = OUTPUT_TAP.lock() {
-            *slot = None;
+/// 进程 spawn 成功:从 pending 队头出队绑定到 pid(队列空=无尾随订阅,零开销直返)
+pub fn bind_pid(pid: u32) {
+    if let Ok(mut q) = TAP_PENDING.lock() {
+        if let Some(binding) = q.pop_front() {
+            if let Ok(mut active) = TAP_ACTIVE.lock() {
+                active.insert(pid, binding);
+            }
         }
+    }
+}
+
+/// 进程结束:摘除 pid 绑定(执行体自有的读循环收束后调用)
+pub fn unbind_pid(pid: u32) {
+    if let Ok(mut active) = TAP_ACTIVE.lock() {
+        active.remove(&pid);
+    }
+}
+
+/// 观察段发送(drain/读循环调用):按 pid 查 ACTIVE,消息自带归属;
+/// 未绑定/通道关闭均静默。pub 供 python_exec 同型读循环共用。
+pub fn tap_send_pid(pid: u32, seg: &[u8]) {
+    let binding = TAP_ACTIVE.lock().ok().and_then(|m| m.get(&pid).cloned());
+    if let Some(b) = binding {
+        let _ = b.tx.send(TapSeg {
+            tool_name: b.tool_name,
+            seg: seg.to_vec(),
+        });
     }
 }
 
 /// 排空管道到缓冲(与 `Command::output` 同语义;不排空会撑满管道死锁)。
-/// `stream_tap`=直跑后端开启尾随:分段读取逐段原样发往输出 tap(观察态,
-/// 发送失败静默),累积结果与关闭态完全一致(字节等价)。
-fn drain_pipe<R: std::io::Read>(pipe: &mut Option<R>, stream_tap: bool) -> Vec<u8> {
+/// `stream_tap`=直跑/docker 后端开启尾随:分段读取逐段按 pid 归属发往
+/// tap(观察态,发送失败静默),累积结果与关闭态完全一致(字节等价)。
+fn drain_pipe<R: std::io::Read>(pipe: &mut Option<R>, stream_tap: bool, pid: u32) -> Vec<u8> {
     let mut buf = Vec::new();
     if let Some(p) = pipe {
         if stream_tap {
@@ -722,7 +768,7 @@ fn drain_pipe<R: std::io::Read>(pipe: &mut Option<R>, stream_tap: bool) -> Vec<u
                 match std::io::Read::read(p, &mut seg) {
                     Ok(0) => break,
                     Ok(n) => {
-                        tap_send(&seg[..n]);
+                        tap_send_pid(pid, &seg[..n]);
                         buf.extend_from_slice(&seg[..n]);
                     }
                     Err(_) => break,
@@ -1258,12 +1304,19 @@ impl ShellExecTool {
             live: &self.live,
         };
 
+        // 尾随 tap 绑定(spawn 即绑:早期输出不丢;drain 线程启动前完成)
+        if stream_tap {
+            bind_pid(pid);
+        }
+
         // stdout/stderr 读者线程(与 Command::output 同语义;stream_tap=直跑
-        // 后端逐段上报输出尾随 tap)
+        // 与 docker 后端逐段按 pid 归属上报输出尾随 tap)
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
-        let stdout_reader = std::thread::spawn(move || drain_pipe(&mut stdout_pipe, stream_tap));
-        let stderr_reader = std::thread::spawn(move || drain_pipe(&mut stderr_pipe, stream_tap));
+        let stdout_reader =
+            std::thread::spawn(move || drain_pipe(&mut stdout_pipe, stream_tap, pid));
+        let stderr_reader =
+            std::thread::spawn(move || drain_pipe(&mut stderr_pipe, stream_tap, pid));
 
         // 有界等待轮询:到期即终止进程族
         let started = std::time::Instant::now();
@@ -1326,6 +1379,10 @@ impl ShellExecTool {
         };
         let stdout = stdout_reader.join().unwrap_or_default();
         let stderr = stderr_reader.join().unwrap_or_default();
+        // drain 线程已收束:摘除尾随绑定(观察段发送完结于 join 前)
+        if stream_tap {
+            unbind_pid(pid);
+        }
         let output = std::process::Output {
             status,
             stdout,
@@ -1780,7 +1837,7 @@ impl ShellExecTool {
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
 
-        match self.run_family(cmd, self.timeout, false) {
+        match self.run_family(cmd, self.timeout, true) {
             FamilyOutcome::Failed(e) => Err(format!(
                 "failed to spawn '{}': {} (is docker installed and in PATH?)",
                 argv[0], e

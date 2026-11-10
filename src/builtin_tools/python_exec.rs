@@ -121,9 +121,37 @@ impl ToolFunction for PythonExecTool {
             if let Some(dir) = &self.workdir {
                 cmd.current_dir(dir);
             }
-            cmd.output()
-                .await
-                .map_err(|e| format!("spawn python 失败: {e}"))?
+            // 输出尾随接入(观察态):spawn+分段读共享 tap 通道,累积结果与
+            // output() 全量形态字节一致(分段 read 只改读取节拍不改内容)
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            let mut child = cmd.spawn().map_err(|e| format!("spawn python 失败: {e}"))?;
+            let pid = child.id().unwrap_or(0);
+            crate::builtin_tools::shell_exec::bind_pid(pid);
+            let mut so = child.stdout.take();
+            let mut se = child.stderr.take();
+            let (stdout_buf, stderr_buf, status) = tokio::join!(
+                async {
+                    match so.as_mut() {
+                        Some(s) => drain_tapped(s, pid).await.unwrap_or_default(),
+                        None => Vec::new(),
+                    }
+                },
+                async {
+                    match se.as_mut() {
+                        Some(s) => drain_tapped(s, pid).await.unwrap_or_default(),
+                        None => Vec::new(),
+                    }
+                },
+                child.wait(),
+            );
+            crate::builtin_tools::shell_exec::unbind_pid(pid);
+            let status = status.map_err(|e| format!("wait python 失败: {e}"))?;
+            std::process::Output {
+                status,
+                stdout: stdout_buf,
+                stderr: stderr_buf,
+            }
         };
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -387,4 +415,26 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// 尾随读循环(观察态):分段读+按 pid 归属转发 tap,累积返回(与 output()
+/// 全量形态字节一致)。tokio 形态,供 python_exec 执行段 join 使用。
+async fn drain_tapped<S: tokio::io::AsyncRead + Unpin>(
+    s: &mut S,
+    pid: u32,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut seg = [0u8; 8192];
+    loop {
+        match s.read(&mut seg).await {
+            Ok(0) => break,
+            Ok(n) => {
+                crate::builtin_tools::shell_exec::tap_send_pid(pid, &seg[..n]);
+                buf.extend_from_slice(&seg[..n]);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(buf)
 }

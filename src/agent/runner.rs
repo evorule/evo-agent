@@ -9804,32 +9804,36 @@ impl AgentRunner {
                                                        let write_advisory = runner
                                                            .write_intent_advisory(&tc.name, &tc.arguments)
                                                            .await;
-                                                       // 运行中工具输出尾随(观察态,直跑后端):
-                                                       // tap 安装→chunk 转发——不落 journal 不进账,
-                                                       // 权威结果仍以 ToolResult/journal 为准;环形
-                                                       // 缓冲截尾(丢最旧)+合帧节流,慢消费者不反压执行。
-                                                       // stage_fut 收内层块:借用不跨后续 runner 可变操作
+                                                       // 运行中工具输出尾随(观察态,直跑+docker 后端与
+                                                       // python_exec 共用 tap):tap 安装→chunk 转发——
+                                                       // 不落 journal 不进账,权威结果仍以
+                                                       // ToolResult/journal 为准;环形缓冲截尾(丢最旧)
+                                                       // +合帧节流,慢消费者不反压执行。归属由 tap 绑定
+                                                       // 消息自带(tool_name),runner 不再组装。
+                                                       // stage_fut 收内层块:借用不跨后续 runner 可变操作;
+                                                       // tap 通道与节流状态提外层——Pending 臂的 resolve
+                                                       // 转发段共用同一通道(审批等待+批准后执行全覆盖)
+                                                       let (tap_tx, mut tap_rx) =
+                                                           tokio::sync::mpsc::unbounded_channel::<crate::builtin_tools::shell_exec::TapSeg>();
+                                                       crate::builtin_tools::shell_exec::push_pending_tap(&tc.name, tap_tx);
+                                                       let mut tap_open = true;
+                                                       let mut tap_ring: Vec<u8> = Vec::new();
+                                                       let mut tap_truncated = false;
+                                                       let mut tap_flush_at = std::time::Instant::now();
+                                                       const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+                                                       const TAP_RING: usize = 16 * 1024;
                                                        let outcome_res = {
-                                                           let (tap_tx, mut tap_rx) =
-                                                               tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                                                           let _output_tap = crate::builtin_tools::shell_exec::install_output_tap(tap_tx);
                                                            let mut stage_fut = std::pin::pin!(
                                                                runner.execute_tool_stage(&session_id, &tc.name, &tc.arguments, journal.as_deref())
                                                            );
-                                                           let mut tap_open = true;
-                                                           let mut tap_ring: Vec<u8> = Vec::new();
-                                                           let mut tap_truncated = false;
-                                                           let mut tap_flush_at = std::time::Instant::now();
-                                                           const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
-                                                           const TAP_RING: usize = 16 * 1024;
                                                            loop {
                                                                tokio::select! {
                                                                    biased;
                                                                    res = &mut stage_fut => break res,
                                                                    seg = tap_rx.recv(), if tap_open => {
                                                                        match seg {
-                                                                           Some(bytes) => {
-                                                                               tap_ring.extend_from_slice(&bytes);
+                                                                           Some(tapseg) => {
+                                                                               tap_ring.extend_from_slice(&tapseg.seg);
                                                                                if tap_ring.len() > TAP_RING {
                                                                                    let drop_n = tap_ring.len() - TAP_RING;
                                                                                    tap_ring.drain(..drop_n);
@@ -9840,7 +9844,7 @@ impl AgentRunner {
                                                                                    tap_ring.clear();
                                                                                    tap_flush_at = std::time::Instant::now();
                                                                                    yield Ok(AgentEvent::ToolOutputChunk {
-                                                                                       tool_name: tc.name.clone(),
+                                                                                       tool_name: tapseg.tool_name,
                                                                                        chunk: text,
                                                                                        truncated: tap_truncated,
                                                                                    });
@@ -9852,11 +9856,20 @@ impl AgentRunner {
                                                                }
                                                            }
                                                        };
+                                                       // pending 绑定生命周期覆盖到执行真结束:Done 臂
+                                                       // 清理(未 spawn 路径)/Pending 臂按决策条件清理/
+                                                       // 批准执行由 spawn 消耗——select 返回点不清(否则
+                                                       // 审批后执行段失去尾随)
                                                        // 尾随环形缓冲残余不发送:权威 ToolResult 即将
                                                        // 到达并包含全量输出,残余段重发属重复信息
                                                        let outcome_res = match outcome_res {
                                                            Err(e) => Err(e),
-                                                           Ok(ToolExecStage::Done(o)) => Ok(o),
+                                                           Ok(ToolExecStage::Done(o)) => {
+                                                               // 执行完成:非进程工具(未 spawn)或绑定已被
+                                                               // spawn 消耗,按名清理残留(幂等)
+                                                               crate::builtin_tools::shell_exec::unbind_pending(&tc.name);
+                                                               Ok(o)
+                                                           }
                                                            Ok(ToolExecStage::Pending(req)) => {
                                                                yield Ok(AgentEvent::ApprovalRequired {
                                                                    tool_name: tc.name.clone(),
@@ -9875,9 +9888,45 @@ impl AgentRunner {
                                                                        warn!(%session_id, tool = %tc.name, error = %e, "approval_requested journal failed");
                                                                    }
                                                                }
-                                                               let res = runner
-                                                                   .resolve_approval(&session_id, &tc.name, &tc.arguments, req, journal.as_deref())
-                                                                   .await;
+                                                               let res = {
+                                                                   // 审批等待+批准后执行都在 resolve 内——
+                                                                   // 尾随转发循环须包住整个 resolve 段
+                                                                   let mut resolve_fut = std::pin::pin!(
+                                                                       runner.resolve_approval(&session_id, &tc.name, &tc.arguments, req, journal.as_deref())
+                                                                   );
+                                                                   let mut resolve_ring: Vec<u8> = Vec::new();
+                                                                   let mut resolve_truncated = false;
+                                                                   let mut resolve_flush_at = std::time::Instant::now();
+                                                                   loop {
+                                                                       tokio::select! {
+                                                                           biased;
+                                                                           r = &mut resolve_fut => break r,
+                                                                           seg = tap_rx.recv(), if tap_open => {
+                                                                               match seg {
+                                                                                   Some(tapseg) => {
+                                                                                       resolve_ring.extend_from_slice(&tapseg.seg);
+                                                                                       if resolve_ring.len() > TAP_RING {
+                                                                                           let drop_n = resolve_ring.len() - TAP_RING;
+                                                                                           resolve_ring.drain(..drop_n);
+                                                                                           resolve_truncated = true;
+                                                                                       }
+                                                                                       if resolve_flush_at.elapsed() >= TAP_WINDOW && !resolve_ring.is_empty() {
+                                                                                           let text = String::from_utf8_lossy(&resolve_ring).into_owned();
+                                                                                           resolve_ring.clear();
+                                                                                           resolve_flush_at = std::time::Instant::now();
+                                                                                           yield Ok(AgentEvent::ToolOutputChunk {
+                                                                                               tool_name: tapseg.tool_name,
+                                                                                               chunk: text,
+                                                                                               truncated: resolve_truncated,
+                                                                                           });
+                                                                                       }
+                                                                                   }
+                                                                                   None => { tap_open = false; }
+                                                                               }
+                                                                           }
+                                                                       }
+                                                                   }
+                                                               };
                                                                if let Ok(o) = &res {
                                                                    if let Some((req0, decision)) = &o.approval_flow {
                                                                        yield Ok(AgentEvent::ApprovalResult {
@@ -9898,6 +9947,15 @@ impl AgentRunner {
                                                                            if let Err(e) = j.approval_resolved(&req0.proposal_id, label) {
                                                                                warn!(%session_id, error = %e, "approval_resolved journal failed");
                                                                            }
+                                                                       }
+                                                                   }
+                                                               }
+                                                               // 审批拒绝:未发生 spawn,pending 绑定滞留队头须清
+                                                               //(批准路径的绑定已被执行段 spawn 消耗)
+                                                               if let Ok(o) = &res {
+                                                                   if let Some((_, decision)) = &o.approval_flow {
+                                                                       if !decision.approved {
+                                                                           crate::builtin_tools::shell_exec::unbind_pending(&tc.name);
                                                                        }
                                                                    }
                                                                }
@@ -10511,12 +10569,61 @@ impl AgentRunner {
                                                // 写前置查询(Q2 R-4):写族意图→路径历史 advisory(执行前计算,随结果回喂)
                                                let write_advisory =
                                                    runner.write_intent_advisory(&tool_name, &args).await;
-                                               let outcome_res = match runner
-                                                   .execute_tool_stage(&session_id, &tool_name, &args, journal.as_deref())
-                                                   .await
-                                               {
+                                               // 输出尾随(同主路径形态):tap 安装+select 转发;
+                                               // 并行 call_external 下绑定按 spawn 序近似归属,
+                                               // 消息自带 tool_name,前端按名找卡纠偏
+                                               let (tap_tx, mut tap_rx) =
+                                                   tokio::sync::mpsc::unbounded_channel::<crate::builtin_tools::shell_exec::TapSeg>();
+                                               crate::builtin_tools::shell_exec::push_pending_tap(&tool_name, tap_tx);
+                                               let mut tap_open = true;
+                                               let mut tap_ring: Vec<u8> = Vec::new();
+                                               let mut tap_truncated = false;
+                                               let mut tap_flush_at = std::time::Instant::now();
+                                               const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+                                               const TAP_RING: usize = 16 * 1024;
+                                               let outcome_res = {
+                                                   let mut stage_fut = std::pin::pin!(
+                                                       runner.execute_tool_stage(&session_id, &tool_name, &args, journal.as_deref())
+                                                   );
+                                                   loop {
+                                                       tokio::select! {
+                                                           biased;
+                                                           res = &mut stage_fut => break res,
+                                                           seg = tap_rx.recv(), if tap_open => {
+                                                               match seg {
+                                                                   Some(tapseg) => {
+                                                                       tap_ring.extend_from_slice(&tapseg.seg);
+                                                                       if tap_ring.len() > TAP_RING {
+                                                                           let drop_n = tap_ring.len() - TAP_RING;
+                                                                           tap_ring.drain(..drop_n);
+                                                                           tap_truncated = true;
+                                                                       }
+                                                                       if tap_flush_at.elapsed() >= TAP_WINDOW && !tap_ring.is_empty() {
+                                                                           let text = String::from_utf8_lossy(&tap_ring).into_owned();
+                                                                           tap_ring.clear();
+                                                                           tap_flush_at = std::time::Instant::now();
+                                                                           yield Ok(AgentEvent::ToolOutputChunk {
+                                                                               tool_name: tapseg.tool_name,
+                                                                               chunk: text,
+                                                                               truncated: tap_truncated,
+                                                                           });
+                                                                       }
+                                                                   }
+                                                                   None => { tap_open = false; }
+                                                               }
+                                                           }
+                                                       }
+                                                   }
+                                               };
+                                               // 尾随环形缓冲残余不发送:权威 ToolResult 即将
+                                               // 到达并包含全量输出,残余段重发属重复信息
+                                               let outcome_res = match outcome_res {
                                                    Err(e) => Err(e),
-                                                   Ok(ToolExecStage::Done(o)) => Ok(o),
+                                                   Ok(ToolExecStage::Done(o)) => {
+                                                       // 执行完成:按名清理残留绑定(幂等)
+                                                       crate::builtin_tools::shell_exec::unbind_pending(&tool_name);
+                                                       Ok(o)
+                                                   }
                                                    Ok(ToolExecStage::Pending(req)) => {
                                                        yield Ok(AgentEvent::ApprovalRequired {
                                                            tool_name: tool_name.clone(),
@@ -10531,9 +10638,44 @@ impl AgentRunner {
                                                                warn!(%session_id, tool = %tool_name, error = %e, "approval_requested journal failed");
                                                            }
                                                        }
-                                                       let res = runner
-                                                           .resolve_approval(&session_id, &tool_name, &args, req, journal.as_deref())
-                                                           .await;
+                                                       let res = {
+                                                           // 审批等待+批准后执行的尾随转发段(同主路径)
+                                                           let mut resolve_fut = std::pin::pin!(
+                                                               runner.resolve_approval(&session_id, &tool_name, &args, req, journal.as_deref())
+                                                           );
+                                                           let mut resolve_ring: Vec<u8> = Vec::new();
+                                                           let mut resolve_truncated = false;
+                                                           let mut resolve_flush_at = std::time::Instant::now();
+                                                           loop {
+                                                               tokio::select! {
+                                                                   biased;
+                                                                   r = &mut resolve_fut => break r,
+                                                                   seg = tap_rx.recv(), if tap_open => {
+                                                                       match seg {
+                                                                           Some(tapseg) => {
+                                                                               resolve_ring.extend_from_slice(&tapseg.seg);
+                                                                               if resolve_ring.len() > TAP_RING {
+                                                                                   let drop_n = resolve_ring.len() - TAP_RING;
+                                                                                   resolve_ring.drain(..drop_n);
+                                                                                   resolve_truncated = true;
+                                                                               }
+                                                                               if resolve_flush_at.elapsed() >= TAP_WINDOW && !resolve_ring.is_empty() {
+                                                                                   let text = String::from_utf8_lossy(&resolve_ring).into_owned();
+                                                                                   resolve_ring.clear();
+                                                                                   resolve_flush_at = std::time::Instant::now();
+                                                                                   yield Ok(AgentEvent::ToolOutputChunk {
+                                                                                       tool_name: tapseg.tool_name,
+                                                                                       chunk: text,
+                                                                                       truncated: resolve_truncated,
+                                                                                   });
+                                                                               }
+                                                                           }
+                                                                           None => { tap_open = false; }
+                                                                       }
+                                                                   }
+                                                               }
+                                                           }
+                                                       };
                                                        if let Ok(o) = &res {
                                                            if let Some((req0, decision)) = &o.approval_flow {
                                                                yield Ok(AgentEvent::ApprovalResult {
@@ -10554,6 +10696,14 @@ impl AgentRunner {
                                                                    if let Err(e) = j.approval_resolved(&req0.proposal_id, label) {
                                                                        warn!(%session_id, error = %e, "approval_resolved journal failed");
                                                                    }
+                                                               }
+                                                           }
+                                                       }
+                                                       // 审批拒绝:未发生 spawn,pending 绑定滞留队头须清
+                                                       if let Ok(o) = &res {
+                                                           if let Some((_, decision)) = &o.approval_flow {
+                                                               if !decision.approved {
+                                                                   crate::builtin_tools::shell_exec::unbind_pending(&tool_name);
                                                                }
                                                            }
                                                        }
