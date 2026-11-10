@@ -1069,7 +1069,7 @@ mod tests {
     fn merged_defaults_when_no_files() {
         let (_d, store) = temp_store("defaults");
         let (settings, sources) = store.merged();
-        assert_eq!(settings.len(), 64); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 接入 +1;共享记忆读取时衰减 memory.decay.enabled/maxIdleAgeSecs 两键 +2;对话流时间戳开关 workbench.showTimestamps +1)
+        assert_eq!(settings.len(), 65); // 计数锁:新增键须同步(scheme 单源纪律;每工具组档位扩面新增 approval.mode.fileEdit/fileDelete 两键;审计摘要卡 audit_summary 接入 +1;共享记忆读取时衰减 memory.decay.enabled/maxIdleAgeSecs 两键 +2;对话流时间戳开关 workbench.showTimestamps +1)
         assert_eq!(settings["agentTools.audit_summary"], json!(false));
         assert_eq!(settings["editor.fontSize"], json!(14));
         assert_eq!(settings["editor.minimap"], json!(false)); // DC-1
