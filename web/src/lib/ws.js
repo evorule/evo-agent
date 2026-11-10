@@ -29,6 +29,7 @@ import {
   refreshGitStatus,
   govS4Notify,
   workspaceEpoch,
+  sessionTokens,
 } from './stores.js';
 import {
   refreshOrchestration,
@@ -402,6 +403,7 @@ export function newSession() {
   localStorage.removeItem('evo_session_id');
   messages.set([]);
   transcriptHasMore.set(false);
+  sessionTokens.set({ prompt: 0, completion: 0, total: 0 }); // 会话累计清零
   clearArtifacts();
   clearSessionMemory(); // 会话记忆随引擎会话清空(工作区放行清单保留)
   connect('new');
@@ -680,6 +682,14 @@ function handleFrame(f) {
         pushPanelEvent('gov', { label: 'TurnFailed', detail: String(f.error), level: 'error' });
       } else {
         pushPanelEvent('sys', { label: 'Done', detail: `本轮完成(step ${f.steps ?? '?'})` });
+      }
+      // 会话 token 累计(provider 真值,Done 帧自带 tokens;计数器未接线时字段缺省)
+      if (f.tokens && typeof f.tokens.total === 'number') {
+        sessionTokens.update((t) => ({
+          prompt: t.prompt + (f.tokens.prompt || 0),
+          completion: t.completion + (f.tokens.completion || 0),
+          total: t.total + (f.tokens.total || 0),
+        }));
       }
       refreshGovBadges(get(sessionId));
       turnActive.set(false);
